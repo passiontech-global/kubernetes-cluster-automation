@@ -49,12 +49,15 @@ func getenv(key, def string) string {
 
 func main() {
 	var metricsAddr, probeAddr string
-	var showVersion bool
+	var showVersion, leaderElect bool
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9115",
 		"address the Prometheus metrics endpoint binds to")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
 		"address the health/readiness probe endpoints bind to")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
+	flag.BoolVar(&leaderElect, "leader-elect", false,
+		"enable leader election via a coordination.k8s.io Lease — "+
+			"required when running more than one replica")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -79,9 +82,16 @@ func main() {
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
-		// 1 replica (Recreate) — leader election lease would only add
-		// RBAC + a failover blind spot.
-		LeaderElection: false,
+		// Active/passive HA (--leader-elect): every runnable is
+		// lease-gated (plain Runnables default NeedLeaderElection()=true,
+		// so `periodic` sweepers and all reconcilers only run on the
+		// leader) while informers, metrics and probes stay warm on
+		// standbys. ReleaseOnCancel hands the Lease over on graceful
+		// shutdown — rolling-update failover ~2s vs the ~15s lease
+		// timeout on crash.
+		LeaderElection:                leaderElect,
+		LeaderElectionID:              "node-automation-controller.node-ops",
+		LeaderElectionReleaseOnCancel: true,
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
 			// kube-system Role: daemonsets resourceNames
 			// [konnectivity-agent].
