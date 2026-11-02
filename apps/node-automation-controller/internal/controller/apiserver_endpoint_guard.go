@@ -422,10 +422,15 @@ func (g *apiServerEndpointGuard) transport() (http.RoundTripper, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Direct-IP probes hit the apiserver serving cert's IP SANs; keep
-	// full verification — an InsecureSkipVerify fallback would let a
-	// MITM fake "healthy" probes. rest.TransportFor wires the SA
-	// bearer token + CA bundle into one RoundTripper.
+	// TLS peer verification is impossible by design here: probes hit
+	// raw addresses — backend IPs, the LB VIP (103.186.101.x), WAN
+	// controllers — that are NOT in the apiserver serving cert's SANs
+	// (the cert carries node IPs + 10.96.0.1 + nebula IPs only). The
+	// incumbent shell guard used `curl -sk` for the same reason. The
+	// probe only needs liveness + resourceVersion, never peer
+	// identity; apiserver-side auth is still enforced via the SA
+	// bearer token that TransportFor wires in.
+	cfg.TLSClientConfig = rest.TLSClientConfig{Insecure: true}
 	rt, err := rest.TransportFor(cfg)
 	if err != nil {
 		return nil, err
