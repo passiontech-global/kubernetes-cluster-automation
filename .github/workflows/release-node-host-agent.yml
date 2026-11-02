@@ -40,6 +40,6 @@ jobs:
     uses: ./.github/workflows/release-app.yml
     with:
       app: node-host-agent
-      version: ${{ inputs.version }}
-      prerelease: ${{ inputs.prerelease }}
+      version: ${{ inputs.version || '' }}
+      prerelease: ${{ inputs.prerelease || false }}
     secrets: inherit

@@ -40,7 +40,7 @@ jobs:
     uses: ./.github/workflows/release-app.yml
     with:
       app: node-automation-controller
-      version: ${{ inputs.version }}
-      prerelease: ${{ inputs.prerelease }}
+      version: ${{ inputs.version || '' }}
+      prerelease: ${{ inputs.prerelease || false }}
       legacy_v_tags: true
     secrets: inherit
