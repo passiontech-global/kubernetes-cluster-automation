@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -329,5 +330,305 @@ func TestUnescapeMountField(t *testing.T) {
 	want := "/var/lib/dir with\tesc\nseq\\x"
 	if got != want {
 		t.Fatalf("unescapeMountField=%q want %q", got, want)
+	}
+}
+
+func TestName(t *testing.T) {
+	s, _, _ := fixture(t, fake.NewSimpleClientset())
+	if s.Name() != "sweeper" {
+		t.Fatalf("Name()=%q want %q", s.Name(), "sweeper")
+	}
+}
+
+func TestApplyDefaults(t *testing.T) {
+	// Trailing slashes must be trimmed — they would defeat the
+	// mount-boundary string compare in mountedInside.
+	s, err := New(Config{BaseDir: "/var/openebs/local/"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.cfg.BaseDir != "/var/openebs/local" {
+		t.Fatalf("BaseDir=%q want trailing slash trimmed", s.cfg.BaseDir)
+	}
+
+	s, err = New(Config{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.cfg.MinAge != defaultMinAge || s.cfg.MaxDelete != defaultMaxDelete ||
+		s.cfg.Interval != defaultInterval || s.cfg.MountsFile != defaultMountsFile ||
+		s.cfg.RequestTimeout != defaultRequestTimeout {
+		t.Fatalf("defaults not applied: %+v", s.cfg)
+	}
+	if s.cfg.statfsFn == nil || s.cfg.nowFn == nil {
+		t.Fatal("statfsFn/nowFn seams not defaulted")
+	}
+}
+
+func TestOrDash(t *testing.T) {
+	if got := orDash(""); got != "?" {
+		t.Fatalf("orDash(\"\")=%q want \"?\"", got)
+	}
+	if got := orDash("x"); got != "x" {
+		t.Fatalf("orDash(\"x\")=%q want \"x\"", got)
+	}
+}
+
+func TestUsedBytes(t *testing.T) {
+	if got, err := usedBytes(t.TempDir()); err != nil || got == 0 {
+		t.Fatalf("usedBytes(tempdir)=%d, %v want >0, nil", got, err)
+	}
+	if _, err := usedBytes(filepath.Join(t.TempDir(), "absent")); err == nil {
+		t.Fatal("usedBytes(absent) want error")
+	}
+}
+
+func TestRunSweepsOnceThenStopsOnCancel(t *testing.T) {
+	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	s.cfg.BaseDir = filepath.Join(base, "gone") // absent → cheap no-op sweep
+	s.cfg.Interval = time.Hour                  // only the immediate sweep runs
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.Run(ctx); close(done) }()
+
+	// Wait for the first sweep to complete, then cancel — Run must
+	// return promptly instead of waiting for the ticker.
+	deadline := time.After(5 * time.Second)
+	for testutil.ToFloat64(s.cycles.WithLabelValues("ok")) != 1 {
+		select {
+		case <-deadline:
+			t.Fatal("first sweep never ran")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-deadline:
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestSweepBaseDirAbsent(t *testing.T) {
+	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	s.cfg.BaseDir = filepath.Join(base, "gone")
+
+	s.Sweep(context.Background())
+
+	if got := testutil.ToFloat64(s.cycles.WithLabelValues("ok")); got != 1 {
+		t.Fatalf("cycles ok=%v want 1 (absent base dir is not an abort)", got)
+	}
+	if got := testutil.ToFloat64(s.cycles.WithLabelValues("abort")); got != 0 {
+		t.Fatalf("cycles abort=%v want 0", got)
+	}
+}
+
+func TestSweepBaseDirIsFile(t *testing.T) {
+	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	f := filepath.Join(base, "not-a-dir")
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.cfg.BaseDir = f
+
+	s.Sweep(context.Background())
+
+	if got := testutil.ToFloat64(s.cycles.WithLabelValues("ok")); got != 1 {
+		t.Fatalf("cycles ok=%v want 1 (file-as-basedir is not an abort)", got)
+	}
+}
+
+func TestListPVDirsError(t *testing.T) {
+	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	f := filepath.Join(base, "not-a-dir")
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.cfg.BaseDir = f
+	if _, err := s.listPVDirs(); err == nil {
+		t.Fatal("listPVDirs on a file want error")
+	}
+}
+
+func TestAbortWhenBaseDirUnreadable(t *testing.T) {
+	// BaseDir passes os.Stat+IsDir but ReadDir fails → fail-closed
+	// abort. Requires a non-root euid for the chmod to bite.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — permission bits are not enforced")
+	}
+	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	if err := os.Chmod(base, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(base, 0o755) })
+
+	s.Sweep(context.Background())
+
+	if got := testutil.ToFloat64(s.cycles.WithLabelValues("abort")); got != 1 {
+		t.Fatalf("cycles abort=%v want 1 (unreadable base dir)", got)
+	}
+}
+
+func TestStatfsErrorTolerated(t *testing.T) {
+	// The fixture's statfsFn always errors — the sweep must still
+	// delete orphans; statfs feeds logging/bytesFreed only.
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+	s.Sweep(context.Background())
+
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("dir present despite statfs error tolerance: %v", err)
+	}
+	if got := testutil.ToFloat64(s.cycles.WithLabelValues("ok")); got != 1 {
+		t.Fatalf("cycles ok=%v want 1", got)
+	}
+}
+
+func TestBytesFreedCounted(t *testing.T) {
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+	// statfs call order per cycle: uStart, u0 (pre-rm), u1 (post-rm),
+	// uEnd. Return a smaller value from the third call on so the
+	// post-rm measurement reports freed space.
+	var calls int
+	s.cfg.statfsFn = func(string) (uint64, error) {
+		calls++
+		if calls < 3 {
+			return 1000, nil
+		}
+		return 500, nil
+	}
+
+	s.Sweep(context.Background())
+
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("dir still present: %v", err)
+	}
+	if got := testutil.ToFloat64(s.bytesFreed); got != 500 {
+		t.Fatalf("bytesFreed=%v want 500", got)
+	}
+}
+
+func TestMountsFileUnreadableSkips(t *testing.T) {
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	s, base, mountsFile := fixture(t, fake.NewSimpleClientset(other))
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+	if err := os.Remove(mountsFile); err != nil {
+		t.Fatal(err)
+	}
+
+	s.Sweep(context.Background())
+
+	// An unreadable mount table fails closed — the dir stays.
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir removed despite unreadable mounts file: %v", err)
+	}
+	if got := skipCount(t, s, skipMountsUnread); got != 1 {
+		t.Fatalf("mounts_unreadable skips=%v want 1", got)
+	}
+}
+
+func TestReleasedPVPatchFailsSkips(t *testing.T) {
+	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "", "")
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	cs := fake.NewSimpleClientset(pv, other)
+	cs.PrependReactor("patch", "persistentvolumes",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewInternalError(errors.New("patch denied"))
+		})
+	s, base, _ := fixture(t, cs)
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+	s.Sweep(context.Background())
+
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir removed despite patch failure: %v", err)
+	}
+	if got := skipCount(t, s, skipPVPatchFailed); got != 1 {
+		t.Fatalf("pv_patch_failed skips=%v want 1", got)
+	}
+}
+
+func TestReleasedPVDeleteFailsSkips(t *testing.T) {
+	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "", "")
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	cs := fake.NewSimpleClientset(pv, other)
+	cs.PrependReactor("delete", "persistentvolumes",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewInternalError(errors.New("delete denied"))
+		})
+	s, base, _ := fixture(t, cs)
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+	s.Sweep(context.Background())
+
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir removed despite delete failure: %v", err)
+	}
+	if got := skipCount(t, s, skipPVDeleteFailed); got != 1 {
+		t.Fatalf("pv_delete_failed skips=%v want 1", got)
+	}
+}
+
+func TestReGetPVReturnsObjectSkips(t *testing.T) {
+	// PV absent from the LIST but re-GET returns an object — the dir
+	// must not be removed (fail closed on a reappearing PV).
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	cs := fake.NewSimpleClientset(other)
+	cs.PrependReactor("get", "persistentvolumes",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, mkPV(pvcUUID, "Bound",
+				corev1.PersistentVolumeReclaimDelete, "", ""), nil
+		})
+	s, base, _ := fixture(t, cs)
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+	s.Sweep(context.Background())
+
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir removed despite re-GET returning PV: %v", err)
+	}
+	if got := skipCount(t, s, skipPVStillPresent); got != 1 {
+		t.Fatalf("pv_still_present skips=%v want 1", got)
+	}
+}
+
+func TestMountEscapedPathInsideDirSkips(t *testing.T) {
+	// /proc/*/mounts octal-escapes spaces in mount points — the
+	// unescape must happen before the boundary compare.
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	s, base, mountsFile := fixture(t, fake.NewSimpleClientset(other))
+	spaceBase := filepath.Join(base, "my base")
+	if err := os.MkdirAll(spaceBase, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.cfg.BaseDir = spaceBase
+	dir := mkPVC(t, spaceBase, pvcUUID, 2*time.Hour)
+	mounts := "overlay " + strings.ReplaceAll(dir+"/inner", " ", `\040`) +
+		" overlay rw 0 0\n"
+	if err := os.WriteFile(mountsFile, []byte(mounts), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s.Sweep(context.Background())
+
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir removed despite escaped mount inside: %v", err)
+	}
+	if got := skipCount(t, s, skipMounted); got != 1 {
+		t.Fatalf("mounted skips=%v want 1", got)
 	}
 }

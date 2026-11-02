@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -279,4 +281,89 @@ func TestWebhookGuardOrphansAcrossBothKinds(t *testing.T) {
 	}
 	wgAssertNames(t, wgMutatingNames(t, cs, "cfg-m"), []string{"keep-m.example.com"})
 	wgAssertNames(t, wgValidatingNames(t, cs, "cfg-v"), []string{"keep-v.example.com"})
+}
+
+// The namespace list is the only "namespace deleted" truth — an error
+// aborts the run before anything is patched (an API flap must never
+// read as "namespace deleted").
+func TestWebhookGuardNamespaceListError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "namespaces",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	g := &webhookGuard{cs: cs}
+	if err := g.run(ctx); err == nil {
+		t.Fatal("expected error when the namespace list fails")
+	}
+}
+
+// The Service list feeds only the WARN branch: a failure degrades to
+// namespace-only checking — orphan removal must still happen.
+func TestWebhookGuardServiceListErrorStillRemovesOrphans(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cfg"},
+		Webhooks: []admissionv1.MutatingWebhook{
+			wgMutatingHook("orphan.example.com", wgSvcRef("dead-ns", "svc")),
+			wgMutatingHook("keep.example.com", wgSvcRef("alive", "svc")),
+		},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("alive"), mwc)
+	cs.PrependReactor("list", "services",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("services unreachable")
+		})
+	g := &webhookGuard{cs: cs}
+	if err := g.run(ctx); err != nil {
+		t.Fatalf("service list failure must degrade, not abort: %v", err)
+	}
+	wgAssertNames(t, wgMutatingNames(t, cs, "cfg"), []string{"keep.example.com"})
+}
+
+// A webhook-config list failure is an API flap — abort with error.
+func TestWebhookGuardWebhookConfigListErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		resource string
+	}{
+		{"mutating list fails", "mutatingwebhookconfigurations"},
+		{"validating list fails", "validatingwebhookconfigurations"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset(wgNamespace("kube-system"))
+			cs.PrependReactor("list", tc.resource,
+				func(ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("api down")
+				})
+			g := &webhookGuard{cs: cs}
+			if err := g.run(ctx); err == nil {
+				t.Fatalf("expected error when %s list fails", tc.resource)
+			}
+		})
+	}
+}
+
+// A failed /webhooks patch is surfaced as an error — silently
+// swallowing it would leave orphan entries fail-closed forever.
+func TestWebhookGuardPatchFailureReturnsError(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cfg"},
+		Webhooks: []admissionv1.MutatingWebhook{
+			wgMutatingHook("orphan.example.com", wgSvcRef("dead-ns", "svc")),
+		},
+	}
+	cs := fake.NewSimpleClientset(wgNamespace("kube-system"), mwc)
+	cs.PrependReactor("patch", "mutatingwebhookconfigurations",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	g := &webhookGuard{cs: cs}
+	err := g.run(ctx)
+	if err == nil {
+		t.Fatal("expected error when the webhook patch fails")
+	}
+	if !strings.Contains(err.Error(), "patches failed") {
+		t.Fatalf("expected the aggregated patch failure, got %v", err)
+	}
 }

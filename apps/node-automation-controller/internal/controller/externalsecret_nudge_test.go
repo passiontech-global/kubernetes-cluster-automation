@@ -1,14 +1,17 @@
 package controller
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
 	kfake "k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // ---------------------------------------------------------------------------
@@ -202,5 +205,168 @@ func TestExternalSecretNudgeDisabled(t *testing.T) {
 	}
 	if len(n.storeReady) != 0 {
 		t.Fatal("disabled module tracked store state")
+	}
+}
+
+// A ClusterSecretStore list failure is a real error — probing on a
+// partial store view could misread "vanished" as a transition.
+func TestExternalSecretNudgeStoreListError(t *testing.T) {
+	dyn := newDynFake(cssObj("css1", "False"))
+	dyn.PrependReactor("list", "clustersecretstores",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	n := newNudge(dyn, true)
+	if err := n.run(ctx); err == nil {
+		t.Fatal("expected error when the store list fails")
+	}
+}
+
+// A store pruned while absent re-seeds on reappearance: delete+recreate
+// must NOT count as a False→True recovery transition (tracked=false).
+func TestExternalSecretNudgePrunedStoreReseeds(t *testing.T) {
+	dyn := newDynFake(cssObj("css1", "False"),
+		esObj("apps", "es-stuck", "False", time.Hour))
+	n := newNudge(dyn, true)
+
+	if err := n.run(ctx); err != nil { // seed: False
+		t.Fatal(err)
+	}
+	// Store vanishes — the prune must drop it from storeReady.
+	if err := dyn.Resource(clusterSecretStoreGVR).
+		Delete(ctx, "css1", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := n.storeReady["css1"]; ok {
+		t.Fatal("vanished store not pruned from storeReady")
+	}
+
+	// Recreated already-True: first sight again — seed, no nudge.
+	if _, err := dyn.Resource(clusterSecretStoreGVR).
+		Create(ctx, cssObj("css1", "True"), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got != "" {
+		t.Fatal("recreated store treated as a recovery transition — must re-seed")
+	}
+	if r, ok := n.storeReady["css1"]; !ok || !r {
+		t.Fatal("recreated store not re-seeded as ready")
+	}
+}
+
+// The ExternalSecret list inside nudge() is a real error — the store
+// transition already consumed the mutex-protected run.
+func TestExternalSecretNudgeESListError(t *testing.T) {
+	dyn := newDynFake(cssObj("css1", "False"),
+		esObj("apps", "es-stuck", "False", time.Hour))
+	n := newNudge(dyn, true)
+	if err := n.run(ctx); err != nil { // seed
+		t.Fatal(err)
+	}
+	setStoreReady(t, dyn, "css1", "True")
+	dyn.PrependReactor("list", "externalsecrets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("es list boom")
+		})
+	if err := n.run(ctx); err == nil {
+		t.Fatal("expected error when the ExternalSecret list fails inside nudge")
+	}
+}
+
+// A Ready=False condition without a parseable lastTransitionTime falls
+// back to the object's creationTimestamp — an ES old enough is nudged.
+func TestExternalSecretNudgeReadySinceFallback(t *testing.T) {
+	es := esObj("apps", "es-stuck", "False", time.Hour)
+	// Malformed timestamp → readySince fails, creationTimestamp wins.
+	if err := unstructured.SetNestedSlice(es.Object, []any{map[string]any{
+		"type":               "Ready",
+		"status":             "False",
+		"lastTransitionTime": "not-a-timestamp",
+	}}, "status", "conditions"); err != nil {
+		t.Fatal(err)
+	}
+	es.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-time.Hour)))
+	dyn := newDynFake(cssObj("css1", "False"), es)
+	n := newNudge(dyn, true)
+
+	if err := n.run(ctx); err != nil { // seed: False
+		t.Fatal(err)
+	}
+	setStoreReady(t, dyn, "css1", "True")
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got == "" {
+		t.Fatal("old ES with malformed lastTransitionTime not nudged — creationTimestamp fallback broken")
+	}
+}
+
+// The unstructured Ready-condition helpers must tolerate absent and
+// malformed shapes (real objects in the wild are inconsistent).
+func TestReadyConditionHelpersEdgeCases(t *testing.T) {
+	bare := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "external-secrets.io/v1beta1",
+		"kind":       "ExternalSecret",
+		"metadata":   map[string]any{"name": "bare"},
+	}}
+	if s, m := readyCond(bare); s != "" || m != "" {
+		t.Fatalf("readyCond on condition-less object = %q,%q", s, m)
+	}
+	if _, ok := readySince(bare); ok {
+		t.Fatal("readySince true on condition-less object")
+	}
+	if got := readyConds(bare); len(got) != 0 {
+		t.Fatalf("readyConds on condition-less object = %v", got)
+	}
+
+	// Non-map entries inside .status.conditions are skipped.
+	junk := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"conditions": []any{"garbage", int64(42), nil},
+		},
+	}}
+	if s, _ := readyCond(junk); s != "" {
+		t.Fatalf("readyCond saw a non-map entry: %q", s)
+	}
+	if got := readyConds(junk); len(got) != 0 {
+		t.Fatalf("readyConds kept non-map entries: %v", got)
+	}
+
+	// A non-Ready condition is ignored by both helpers.
+	nonReady := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"conditions": []any{map[string]any{
+				"type": "Synced", "status": "True",
+				"lastTransitionTime": time.Now().UTC().Format(time.RFC3339),
+			}},
+		},
+	}}
+	if s, _ := readyCond(nonReady); s != "" {
+		t.Fatalf("readyCond returned a non-Ready status: %q", s)
+	}
+	if _, ok := readySince(nonReady); ok {
+		t.Fatal("readySince true for a non-Ready condition")
+	}
+
+	// Malformed lastTransitionTime → readySince false.
+	badTS := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"conditions": []any{map[string]any{
+				"type": "Ready", "status": "False",
+				"lastTransitionTime": "yesterday-ish",
+			}},
+		},
+	}}
+	if s, _ := readyCond(badTS); s != "False" {
+		t.Fatalf("readyCond = %q, want False", s)
+	}
+	if _, ok := readySince(badTS); ok {
+		t.Fatal("readySince true on malformed lastTransitionTime")
 	}
 }

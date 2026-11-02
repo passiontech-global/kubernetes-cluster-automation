@@ -375,3 +375,143 @@ func TestHelmReleaseUnlockerListError(t *testing.T) {
 		t.Fatal("expected error when every HR list fails")
 	}
 }
+
+// stuckHRFixture builds the standard due-for-unlock scene: HR stuck on
+// "in progress" past the 30m window plus a deployed + pending secret pair.
+func stuckHRFixture() (*fake.FakeDynamicClient, []runtime.Object) {
+	hr := hrObj("apps", "myapp", "v2")
+	hrTarget(hr, "apps")
+	hrReady(hr, "False", "another operation is in progress")
+	return newDynFake(hr), []runtime.Object{
+		helmRelSecret("apps", "sh.helm.release.v1.myapp.v1", "myapp", 1, "deployed"),
+		helmRelSecret("apps", "sh.helm.release.v1.myapp.v2", "myapp", 2, "pending-upgrade"),
+	}
+}
+
+// The helm-controller pod list is a real error — unlocking blind while
+// the controller might be down cannot converge.
+func TestHelmReleaseUnlockerControllerListError(t *testing.T) {
+	dyn, secrets := stuckHRFixture()
+	cs := kfake.NewSimpleClientset(secrets...)
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+	if err := u.run(ctx); err == nil {
+		t.Fatal("expected error when the helm-controller pod list fails")
+	}
+}
+
+// A release-secrets list failure is a wrapped per-HR error: logged,
+// HR skipped — the run itself stays nil and nothing is marked unlocked.
+func TestHelmReleaseUnlockerSecretsListError(t *testing.T) {
+	dyn, secrets := stuckHRFixture()
+	cs := kfake.NewSimpleClientset(secrets...)
+	cs.PrependReactor("list", "secrets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("secrets list boom")
+		})
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+	if err := u.run(ctx); err != nil {
+		t.Fatalf("a per-HR unlock failure must not error the run: %v", err)
+	}
+	if !secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
+		t.Fatal("pending secret deleted despite the failed list")
+	}
+	if _, ok := u.unlocked["apps/myapp"]; ok {
+		t.Fatal("HR marked unlocked although unlock never ran")
+	}
+}
+
+// A release secret whose version label is not an integer is skipped —
+// it must not crash the revision scan nor become the deletion target.
+func TestHelmReleaseUnlockerUnparseableVersionSkipsSecret(t *testing.T) {
+	dyn, secrets := stuckHRFixture()
+	// A newer pending secret with a garbage version label — the scan
+	// skips it and still finds the real newest pending revision.
+	bad := helmRelSecret("apps", "sh.helm.release.v1.myapp.vX", "myapp", 3, "pending-upgrade")
+	bad.Labels["version"] = "not-a-rev"
+	secrets = append(secrets, bad)
+	cs := kfake.NewSimpleClientset(secrets...)
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.vX") {
+		t.Fatal("secret with unparseable version was deleted")
+	}
+	if secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
+		t.Fatal("real newest pending secret not deleted")
+	}
+}
+
+// A failing pending-secret delete aborts that HR's unlock (logged,
+// continue) — the run stays nil and no reconcile is requested.
+func TestHelmReleaseUnlockerPendingDeleteError(t *testing.T) {
+	dyn, secrets := stuckHRFixture()
+	cs := kfake.NewSimpleClientset(secrets...)
+	cs.PrependReactor("delete", "secrets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("finalizer wedged")
+		})
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+	if err := u.run(ctx); err != nil {
+		t.Fatalf("a per-HR unlock failure must not error the run: %v", err)
+	}
+	if !secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
+		t.Fatal("pending secret vanished despite the failing delete")
+	}
+	if got := hrAnnotation(t, dyn, helmReleaseGVRs[0], "apps", "myapp", fluxReconcileAnno); got != "" {
+		t.Fatal("HR annotated although the pending secret still exists")
+	}
+	if _, ok := u.unlocked["apps/myapp"]; ok {
+		t.Fatal("HR marked unlocked although unlock failed")
+	}
+}
+
+// A failing requestedAt patch on the HR surfaces as an unlock error —
+// the secret is already gone but the HR is NOT marked unlocked (the
+// reconcile hint never landed).
+func TestHelmReleaseUnlockerAnnotateError(t *testing.T) {
+	dyn, secrets := stuckHRFixture()
+	dyn.PrependReactor("patch", "helmreleases",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("hr patch rejected")
+		})
+	cs := kfake.NewSimpleClientset(secrets...)
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+	if err := u.run(ctx); err != nil {
+		t.Fatalf("a per-HR unlock failure must not error the run: %v", err)
+	}
+	if secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
+		t.Fatal("pending secret kept although its delete succeeded")
+	}
+	if _, ok := u.unlocked["apps/myapp"]; ok {
+		t.Fatal("HR marked unlocked although the annotate failed")
+	}
+}
+
+// spec.releaseName / spec.targetNamespace drive where the release
+// secrets live; both fall back to the object meta when absent.
+func TestHRNameAndNamespaceFallbacks(t *testing.T) {
+	hr := hrObj("apps", "myapp", "v2")
+	if got := hrReleaseName(hr); got != "myapp" {
+		t.Fatalf("hrReleaseName fallback = %q, want myapp", got)
+	}
+	if got := hrTargetNS(hr); got != "apps" {
+		t.Fatalf("hrTargetNS fallback = %q, want apps", got)
+	}
+
+	hr.Object["spec"] = map[string]any{
+		"releaseName":     "customrel",
+		"targetNamespace": "target-ns",
+	}
+	if got := hrReleaseName(hr); got != "customrel" {
+		t.Fatalf("hrReleaseName = %q, want customrel", got)
+	}
+	if got := hrTargetNS(hr); got != "target-ns" {
+		t.Fatalf("hrTargetNS = %q, want target-ns", got)
+	}
+}

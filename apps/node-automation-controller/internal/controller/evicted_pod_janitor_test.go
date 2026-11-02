@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // ---------------------------------------------------------------------------
@@ -151,5 +154,43 @@ func TestEvictedPodJanitorMultipleNamespaces(t *testing.T) {
 		if epjPodExists(t, cs, p[0], p[1]) {
 			t.Fatalf("old evicted pod %s/%s not deleted", p[0], p[1])
 		}
+	}
+}
+
+// A pods list failure is a real error — the periodic wrapper meters it.
+func TestEvictedPodJanitorListError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	j := &evictedPodJanitor{cs: cs}
+	if err := j.run(ctx); err == nil {
+		t.Fatal("expected error when the pods list fails")
+	}
+}
+
+// A failed delete is tolerated (logged + metered) but still counts
+// against the per-run cap — exactly evictedPodCap attempts happen even
+// when every delete errors.
+func TestEvictedPodJanitorDeleteErrorTolerated(t *testing.T) {
+	objs := make([]runtime.Object, 0, evictedPodCap+2)
+	for i := 0; i < evictedPodCap+2; i++ {
+		objs = append(objs,
+			epjPod("a", fmt.Sprintf("evicted-%02d", i), corev1.PodFailed, "Evicted", 2*time.Hour))
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	var attempts int32
+	cs.PrependReactor("delete", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			atomic.AddInt32(&attempts, 1)
+			return true, nil, errors.New("delete rejected")
+		})
+	j := &evictedPodJanitor{cs: cs}
+	if err := j.run(ctx); err != nil {
+		t.Fatalf("pod delete failures must not error the run: %v", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != int32(evictedPodCap) {
+		t.Fatalf("expected exactly cap=%d delete attempts, got %d", evictedPodCap, got)
 	}
 }

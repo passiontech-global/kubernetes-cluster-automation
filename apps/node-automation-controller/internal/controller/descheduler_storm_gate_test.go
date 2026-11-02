@@ -1,13 +1,17 @@
 package controller
 
 import (
+	"errors"
+	"reflect"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -149,5 +153,90 @@ func TestStormGateNoDeschedulerDeployment(t *testing.T) {
 	}
 	if res.RequeueAfter != 5*time.Minute {
 		t.Fatalf("expected 5m requeue, got %s", res.RequeueAfter)
+	}
+}
+
+// condStatusMap keeps only type->status — kubelet heartbeat churn
+// (lastHeartbeatTime/reason/message) must not change the projection,
+// or every node update would enqueue a full verdict.
+func TestCondStatusMapIgnoresChurn(t *testing.T) {
+	a := node("n1", corev1.ConditionTrue, nil)
+	a.Status.Conditions[0].LastHeartbeatTime = metav1.NewTime(time.Now())
+	a.Status.Conditions[0].Reason = "KubeletReady"
+	a.Status.Conditions[0].Message = "kubelet is posting ready"
+
+	b := node("n1", corev1.ConditionTrue, nil)
+	b.Status.Conditions[0].LastHeartbeatTime = metav1.NewTime(time.Now().Add(time.Hour))
+	b.Status.Conditions[0].Reason = "OtherReason"
+	b.Status.Conditions[0].Message = "different message"
+
+	if !reflect.DeepEqual(condStatusMap(a), condStatusMap(b)) {
+		t.Fatal("condStatusMap must drop heartbeat churn fields")
+	}
+
+	// A real status change DOES change the projection.
+	b.Status.Conditions[0].Status = corev1.ConditionFalse
+	if reflect.DeepEqual(condStatusMap(a), condStatusMap(b)) {
+		t.Fatal("condStatusMap missed a status flip")
+	}
+}
+
+// taintKeys is the jqFilter projection — keys only, in order.
+func TestTaintKeys(t *testing.T) {
+	n := node("n1", corev1.ConditionTrue, nil,
+		corev1.Taint{Key: "a", Value: "1", Effect: corev1.TaintEffectNoSchedule},
+		corev1.Taint{Key: "b", Effect: corev1.TaintEffectNoExecute})
+	got := taintKeys(n)
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("taintKeys = %v, want [a b]", got)
+	}
+	if got := taintKeys(node("n2", corev1.ConditionTrue, nil)); len(got) != 0 {
+		t.Fatalf("taintKeys on untainted node = %v", got)
+	}
+}
+
+// An API failure aborts the reconcile — never a "clear" verdict on
+// empty data.
+func TestStormGateNodeListError(t *testing.T) {
+	cs := fake.NewSimpleClientset(deschedulerDeploy(1, nil))
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &deschedulerStormGate{cs: cs}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the node list fails")
+	}
+}
+
+// A failed replicas update errors the reconcile — the verdict must not
+// be swallowed.
+func TestStormGateDeployUpdateError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionFalse, nil), // storm -> want 0
+		deschedulerDeploy(1, nil))
+	cs.PrependReactor("update", "deployments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("update rejected")
+		})
+	r := &deschedulerStormGate{cs: cs}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the deployment update fails")
+	}
+}
+
+// A failed decision-annotation patch errors the reconcile — the audit
+// trail is part of the verdict.
+func TestStormGateDecisionPatchError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionFalse, nil),
+		deschedulerDeploy(1, nil))
+	cs.PrependReactor("patch", "deployments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	r := &deschedulerStormGate{cs: cs}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the decision annotation patch fails")
 	}
 }

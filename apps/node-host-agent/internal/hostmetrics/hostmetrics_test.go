@@ -225,3 +225,57 @@ func TestK0sMetricAbsentOnWorker(t *testing.T) {
 		t.Fatalf("node_k0s_config_drift=%v emitted on non-controller node", v)
 	}
 }
+
+func TestApplyDefaults(t *testing.T) {
+	c := New(Config{})
+	if c.cfg.WatchdogStateDir != defaultWatchdogStateDir {
+		t.Fatalf("WatchdogStateDir=%q want %q", c.cfg.WatchdogStateDir, defaultWatchdogStateDir)
+	}
+	if c.cfg.SysClassNet != defaultSysClassNet {
+		t.Fatalf("SysClassNet=%q want %q", c.cfg.SysClassNet, defaultSysClassNet)
+	}
+	if c.cfg.NebulaIface != defaultNebulaIface {
+		t.Fatalf("NebulaIface=%q want %q", c.cfg.NebulaIface, defaultNebulaIface)
+	}
+	if c.cfg.RouteFile != defaultRouteFile {
+		t.Fatalf("RouteFile=%q want %q", c.cfg.RouteFile, defaultRouteFile)
+	}
+	if c.cfg.K0sConfigFile != defaultK0sConfigFile {
+		t.Fatalf("K0sConfigFile=%q want %q", c.cfg.K0sConfigFile, defaultK0sConfigFile)
+	}
+	if c.cfg.K0sUnitFile != defaultK0sUnitFile {
+		t.Fatalf("K0sUnitFile=%q want %q", c.cfg.K0sUnitFile, defaultK0sUnitFile)
+	}
+	if len(c.cfg.RemovedFlags) != 1 || c.cfg.RemovedFlags[0] != "concurrent-service-syncs" {
+		t.Fatalf("RemovedFlags=%v want [concurrent-service-syncs]", c.cfg.RemovedFlags)
+	}
+}
+
+func TestRemovedFlagsCustom(t *testing.T) {
+	// A custom flag list replaces the default entirely — a config
+	// carrying the default removed flag must not drift when the custom
+	// list doesn't contain it.
+	cfg, _ := fixture(t)
+	write(t, cfg.K0sUnitFile, "[Unit]\n")
+	write(t, cfg.K0sConfigFile,
+		"spec:\n  api:\n    extraArgs:\n      concurrent-service-syncs: \"5\"\n")
+	cfg.RemovedFlags = []string{"some-other-flag"}
+	if v, ok := k0sDrift(t, New(cfg)); !ok || v != 0 {
+		t.Fatalf("drift=%v ok=%v want 0 (custom flags keep concurrent-service-syncs ignored)", v, ok)
+	}
+
+	// And the custom flag itself is honoured.
+	write(t, cfg.K0sConfigFile, "spec:\n  some-other-flag: true\n")
+	if v, ok := k0sDrift(t, New(cfg)); !ok || v != 1 {
+		t.Fatalf("drift=%v ok=%v want 1 (custom removed flag present)", v, ok)
+	}
+}
+
+func TestDescribe(t *testing.T) {
+	c := New(Config{})
+	ch := make(chan *prometheus.Desc, 8)
+	c.Describe(ch)
+	if got := len(ch); got != 4 {
+		t.Fatalf("Describe emitted %d descs want 4", got)
+	}
+}

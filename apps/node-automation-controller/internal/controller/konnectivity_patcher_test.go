@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -175,5 +176,38 @@ func TestKonnectivityPatcherRequestsDriftOnly(t *testing.T) {
 	if c.Resources.Requests.Cpu().Cmp(konnectivityWantCPU) != 0 ||
 		c.Resources.Requests.Memory().Cmp(konnectivityWantMem) != 0 {
 		t.Fatalf("requests not patched back: %+v", c.Resources.Requests)
+	}
+}
+
+// A DaemonSet get failure other than NotFound is a real error — only
+// NotFound is the "no konnectivity on this cluster" no-op.
+func TestKonnectivityPatcherGetError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		konnectivityDS("", "", ""))
+	cs.PrependReactor("get", "daemonsets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &konnectivityPatcher{cs: cs}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the daemonset get fails")
+	}
+}
+
+// A failed drift patch errors the reconcile — the metric must surface
+// a persistent failure to re-pin the requests.
+func TestKonnectivityPatcherPatchError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		konnectivityDS("", "", ""))
+	cs.PrependReactor("patch", "daemonsets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	r := &konnectivityPatcher{cs: cs}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the drift patch fails")
+	}
+	if got := getKonnectivityDS(t, cs).Spec.Template.Spec.PriorityClassName; got != "" {
+		t.Fatalf("DS mutated despite the failed patch: %q", got)
 	}
 }

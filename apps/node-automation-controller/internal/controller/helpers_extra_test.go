@@ -11,7 +11,9 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -75,6 +77,86 @@ func TestIsControlPlaneMasterLabel(t *testing.T) {
 		map[string]string{"node-role.kubernetes.io/master": ""})
 	if !isControlPlane(m) {
 		t.Fatal("master-role label not recognized as control plane")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// patchNodeTaints / taintNode / untaintNode edge cases.
+// ---------------------------------------------------------------------------
+
+func TestPatchNodeTaintsNilWritesEmptyArray(t *testing.T) {
+	// nil marshals as "taints":null — the helper must normalize to []
+	// so the merge patch clears the key instead of writing null.
+	tainted := node("n1", corev1.ConditionTrue, nil,
+		corev1.Taint{Key: "a", Effect: corev1.TaintEffectNoSchedule})
+	cs := fake.NewSimpleClientset(tainted)
+	if err := patchNodeTaints(ctx, cs, "n1", nil); err != nil {
+		t.Fatalf("patchNodeTaints(nil): %v", err)
+	}
+	got := getNode(t, cs, "n1").Spec.Taints
+	if got == nil {
+		t.Fatal("spec.taints marshaled as null, want empty array")
+	}
+	if len(got) != 0 {
+		t.Fatalf("taints not cleared: %+v", got)
+	}
+}
+
+func TestPatchNodeTaintsPatchError(t *testing.T) {
+	cs := fake.NewSimpleClientset(node("n1", corev1.ConditionTrue, nil))
+	cs.PrependReactor("patch", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	if err := patchNodeTaints(ctx, cs, "n1",
+		[]corev1.Taint{{Key: "a", Effect: corev1.TaintEffectNoSchedule}}); err == nil {
+		t.Fatal("expected error when the node patch fails")
+	}
+}
+
+func TestTaintNodeGetError(t *testing.T) {
+	// Node absent -> the get inside taintNode fails (NotFound).
+	cs := fake.NewSimpleClientset()
+	if err := taintNode(ctx, cs, "ghost", "k", "v",
+		corev1.TaintEffectNoSchedule); err == nil {
+		t.Fatal("expected error when the node does not exist")
+	}
+}
+
+func TestUntaintNodeGetErrorAndNoop(t *testing.T) {
+	cs := fake.NewSimpleClientset(node("n1", corev1.ConditionTrue, nil))
+	if err := untaintNode(ctx, cs, "ghost", "k"); err == nil {
+		t.Fatal("expected error when the node does not exist")
+	}
+	// Node exists but carries no matching taint -> clean no-op.
+	if err := untaintNode(ctx, cs, "n1", "never-was-there"); err != nil {
+		t.Fatalf("untaint of an absent key must be a no-op: %v", err)
+	}
+}
+
+func TestListNodesError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	if _, err := listNodes(ctx, cs); err == nil {
+		t.Fatal("expected error when the node list fails")
+	}
+	if _, err := countNotReadyNodes(ctx, cs); err == nil {
+		t.Fatal("expected countNotReadyNodes to propagate the list error")
+	}
+}
+
+func TestPatchNodeLabelsPatchError(t *testing.T) {
+	cs := fake.NewSimpleClientset(node("n1", corev1.ConditionTrue, nil))
+	cs.PrependReactor("patch", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	if err := patchNodeLabels(ctx, cs, "n1",
+		map[string]string{"k": "v"}); err == nil {
+		t.Fatal("expected error when the node patch fails")
 	}
 }
 

@@ -3,14 +3,17 @@ package controller
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // ---------------------------------------------------------------------------
@@ -375,5 +378,214 @@ func TestEndpointGuardRemovesNotReadyAddress(t *testing.T) {
 	}
 	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
 		t.Fatalf("annotation = %q", ep.Annotations[endpointGuardAnno])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pure helper coverage — subset/annotation/union mutations.
+// ---------------------------------------------------------------------------
+
+// endpointIPs merges addresses + notReadyAddresses, deduped and sorted.
+func TestEndpointIPSet(t *testing.T) {
+	ep := kubeEndpoints([]string{"10.0.0.3", "10.0.0.1"}, []string{"10.0.0.2"}, nil)
+	// Duplicate the IP across subsets to prove dedupe.
+	ep.Subsets = append(ep.Subsets, corev1.EndpointSubset{
+		Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}},
+	})
+	got := endpointIPs(ep)
+	want := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("endpointIPs = %v, want %v", got, want)
+	}
+}
+
+// The quarantine annotation tolerates whitespace and empty segments.
+func TestParseQuarantineAnnotation(t *testing.T) {
+	ep := kubeEndpoints(nil, nil, nil)
+	if got := parseQuarantineAnnotation(ep); len(got) != 0 {
+		t.Fatalf("absent annotation = %v", got)
+	}
+	ep.Annotations[endpointGuardAnno] = ""
+	if got := parseQuarantineAnnotation(ep); len(got) != 0 {
+		t.Fatalf("empty annotation = %v", got)
+	}
+	ep.Annotations[endpointGuardAnno] = " 10.0.0.1 , ,10.0.0.2 "
+	got := parseQuarantineAnnotation(ep)
+	if len(got) != 2 || !got["10.0.0.1"] || !got["10.0.0.2"] {
+		t.Fatalf("parseQuarantineAnnotation = %v", got)
+	}
+}
+
+// writeQuarantineAnnotation writes a sorted join and removes the key
+// entirely when the set drains.
+func TestWriteQuarantineAnnotation(t *testing.T) {
+	ep := kubeEndpoints(nil, nil, nil)
+	writeQuarantineAnnotation(ep, map[string]bool{"10.0.0.2": true, "10.0.0.1": true})
+	if got := ep.Annotations[endpointGuardAnno]; got != "10.0.0.1,10.0.0.2" {
+		t.Fatalf("annotation = %q, want sorted join", got)
+	}
+	writeQuarantineAnnotation(ep, map[string]bool{})
+	if _, ok := ep.Annotations[endpointGuardAnno]; ok {
+		t.Fatal("empty quarantine set left the annotation behind")
+	}
+}
+
+// unionIPs merges active + quarantined sources, deduped and sorted.
+func TestUnionIPs(t *testing.T) {
+	got := unionIPs([]string{"10.0.0.2", "10.0.0.1"},
+		map[string]bool{"10.0.0.3": true, "10.0.0.1": true})
+	want := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unionIPs = %v, want %v", got, want)
+	}
+}
+
+// A subset emptied by the removal is dropped entirely — the object
+// must never serialize an empty-addresses subset.
+func TestRemoveEndpointIPDropsEmptySubset(t *testing.T) {
+	ep := kubeEndpoints([]string{"10.0.0.1"}, nil, nil)
+	ep.Subsets = append(ep.Subsets, corev1.EndpointSubset{
+		Addresses: []corev1.EndpointAddress{{IP: "10.0.0.2"}},
+	})
+	removeEndpointIP(ep, "10.0.0.1")
+	if len(ep.Subsets) != 1 || ep.Subsets[0].Addresses[0].IP != "10.0.0.2" {
+		t.Fatalf("emptied subset not dropped: %+v", ep.Subsets)
+	}
+}
+
+// addEndpointIP placement: existing -> no-op; empty -> fresh subset on
+// :6443; named "https" port wins; otherwise the first subset.
+func TestAddEndpointIPPlacement(t *testing.T) {
+	// Already present — no-op.
+	ep := kubeEndpoints([]string{"10.0.0.1"}, nil, nil)
+	addEndpointIP(ep, "10.0.0.1")
+	if n := len(ep.Subsets[0].Addresses); n != 1 {
+		t.Fatalf("duplicate address appended: %d addresses", n)
+	}
+
+	// No subsets at all — a fresh subset is seeded with port 6443/https.
+	bare := kubeEndpoints(nil, nil, nil)
+	bare.Subsets = nil
+	addEndpointIP(bare, "10.0.0.9")
+	if len(bare.Subsets) != 1 || len(bare.Subsets[0].Addresses) != 1 ||
+		bare.Subsets[0].Addresses[0].IP != "10.0.0.9" {
+		t.Fatalf("empty endpoints not re-seeded: %+v", bare.Subsets)
+	}
+	if p := bare.Subsets[0].Ports[0]; p.Port != 6443 || p.Name != "https" {
+		t.Fatalf("seeded subset port = %+v, want 6443/https", p)
+	}
+
+	// A subset carrying an "https" port (any number) is the target.
+	named := &corev1.Endpoints{Subsets: []corev1.EndpointSubset{
+		{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}},
+			Ports: []corev1.EndpointPort{{Name: "https", Port: 443}},
+		},
+		{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.2"}},
+			Ports: []corev1.EndpointPort{{Name: "other", Port: 1234}},
+		},
+	}}
+	addEndpointIP(named, "10.0.0.7")
+	if n := len(named.Subsets[0].Addresses); n != 2 {
+		t.Fatalf("IP not appended to the https subset: %+v", named.Subsets)
+	}
+
+	// No https/6443 port anywhere — fall back to subset[0].
+	fallback := &corev1.Endpoints{Subsets: []corev1.EndpointSubset{
+		{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}},
+			Ports: []corev1.EndpointPort{{Name: "dns", Port: 53}},
+		},
+	}}
+	addEndpointIP(fallback, "10.0.0.8")
+	if n := len(fallback.Subsets[0].Addresses); n != 2 {
+		t.Fatalf("IP not appended to subset[0]: %+v", fallback.Subsets)
+	}
+}
+
+// removeSliceIP reports whether anything changed; addSliceIP refuses
+// duplicates.
+func TestSliceIPHelpers(t *testing.T) {
+	eps := kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"})
+
+	if removeSliceIP(eps, "10.0.0.9") {
+		t.Fatal("removeSliceIP reported a change for an absent IP")
+	}
+	if !removeSliceIP(eps, "10.0.0.1") {
+		t.Fatal("removeSliceIP reported no change for a present IP")
+	}
+	if got := sliceAddrSet(eps); got["10.0.0.1"] || !got["10.0.0.2"] {
+		t.Fatalf("slice after removal = %v", got)
+	}
+
+	if addSliceIP(eps, "10.0.0.2") {
+		t.Fatal("addSliceIP duplicated an existing IP")
+	}
+	if !addSliceIP(eps, "10.0.0.3") {
+		t.Fatal("addSliceIP refused a new IP")
+	}
+	if !sliceAddrSet(eps)["10.0.0.3"] {
+		t.Fatal("new IP not appended to the slice")
+	}
+}
+
+// An endpoint whose only address is removed is dropped from the slice.
+func TestRemoveSliceIPDropsEmptyEndpoint(t *testing.T) {
+	eps := kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"})
+	removeSliceIP(eps, "10.0.0.1")
+	if len(eps.Endpoints) != 1 {
+		t.Fatalf("emptied endpoint kept in slice: %+v", eps.Endpoints)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// run() fetch guards — the objects it cannot read veto the whole sweep.
+// ---------------------------------------------------------------------------
+
+// No default/kubernetes Endpoints object at all -> real error.
+func TestEndpointGuardMissingEndpoints(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	g := newEndpointGuard(cs, probeTable{})
+	if err := g.run(ctx); err == nil {
+		t.Fatal("expected error when the Endpoints object is missing")
+	}
+}
+
+// An EndpointSlice get failure that is NOT NotFound is a real error —
+// only NotFound is the mid-upgrade no-slice case.
+func TestEndpointGuardSliceGetError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
+	cs.PrependReactor("get", "endpointslices",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": apiHealthyProbe(100),
+		"10.0.0.2": apiHealthyProbe(100),
+	})
+	if err := g.run(ctx); err == nil {
+		t.Fatal("expected error when the EndpointSlice get fails")
+	}
+}
+
+// EndpointSlice absent entirely (NotFound) is tolerated — the guard
+// still sweeps the Endpoints object.
+func TestEndpointGuardSliceAbsent(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": apiHealthyProbe(100),
+		"10.0.0.2": apiHealthyProbe(100),
+	})
+	if err := g.run(ctx); err != nil {
+		t.Fatalf("missing EndpointSlice must not veto the run: %v", err)
+	}
+}
+
+// Zero controller IPs (empty subsets) -> clean no-op, probes skipped.
+func TestEndpointGuardNoControllerIPs(t *testing.T) {
+	cs := fake.NewSimpleClientset(kubeEndpoints(nil, nil, nil))
+	g := newEndpointGuard(cs, probeTable{}) // any probe call would error
+	if err := g.run(ctx); err != nil {
+		t.Fatalf("empty controller set must be a no-op: %v", err)
 	}
 }

@@ -3,6 +3,7 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -360,5 +361,113 @@ func TestCertManagerReaperListError(t *testing.T) {
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err == nil {
 		t.Fatal("expected error when certificate list fails")
+	}
+}
+
+// A challenge list failure is a per-item IncError + keep: the order
+// must NOT be deleted on an unreadable cross-check.
+func TestCertManagerReaperChallengeListError(t *testing.T) {
+	dyn := newFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
+	dyn.PrependReactor("list", "challenges",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("challenges unreachable")
+		})
+	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
+		resets: map[string]*certReset{}}
+	before := queueErrorCount(t, certReaperQueue)
+	if err := r.run(ctx); err != nil {
+		t.Fatalf("per-item failure must not abort the run: %v", err)
+	}
+	if !cmrOrderExists(t, dyn, "app", "order-a") {
+		t.Fatal("order deleted although the challenge cross-check failed")
+	}
+	if got := queueErrorCount(t, certReaperQueue) - before; got != 1 {
+		t.Fatalf("challenge list failure did not IncError once, delta %v", got)
+	}
+}
+
+// A failed order delete IncErrors but does NOT consume reset budget —
+// the next run retries the same order.
+func TestCertManagerReaperOrderDeleteError(t *testing.T) {
+	dyn := newFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
+	var failOnce atomic.Bool
+	failOnce.Store(true)
+	dyn.PrependReactor("delete", "orders",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			if failOnce.CompareAndSwap(true, false) {
+				return true, nil, errors.New("delete rejected")
+			}
+			return false, nil, nil
+		})
+	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
+		resets: map[string]*certReset{}}
+	before := queueErrorCount(t, certReaperQueue)
+	if err := r.run(ctx); err != nil {
+		t.Fatalf("per-item failure must not abort the run: %v", err)
+	}
+	if !cmrOrderExists(t, dyn, "app", "order-a") {
+		t.Fatal("order deleted despite the failing delete call")
+	}
+	if st := r.resets["app/tls-a"]; st == nil || st.total != 0 {
+		t.Fatalf("reset budget consumed by a failed delete: %+v", st)
+	}
+	if got := queueErrorCount(t, certReaperQueue) - before; got != 1 {
+		t.Fatalf("order delete failure did not IncError once, delta %v", got)
+	}
+
+	// Retry succeeds and now consumes the budget.
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cmrOrderExists(t, dyn, "app", "order-a") {
+		t.Fatal("order not deleted on the retry")
+	}
+	if st := r.resets["app/tls-a"]; st.total != 1 {
+		t.Fatalf("expected total=1 after the retried delete, got %+v", st)
+	}
+}
+
+// challengeLinkedToOrder: ownerReferences and the acme order-name label
+// are linkage — a linked challenge must point at THIS order; linkage-
+// free challenges fall back to the same-namespace match.
+func TestChallengeLinkedToOrder(t *testing.T) {
+	order := cmrOrder("app", "order-a", "pending", 45*time.Minute)
+
+	withLabel := func(name, orderLabel string) *unstructured.Unstructured {
+		ch := cmrChallenge("app", name, true, true, time.Hour, "")
+		if orderLabel != "" {
+			ch.SetLabels(map[string]string{"acme.cert-manager.io/order-name": orderLabel})
+		}
+		return ch
+	}
+
+	for _, tc := range []struct {
+		name string
+		ch   *unstructured.Unstructured
+		want bool
+	}{
+		{"label points at order", withLabel("ch-1", "order-a"), true},
+		{"label points elsewhere", withLabel("ch-2", "order-b"), false},
+		{"ownerRef points at order",
+			cmrChallenge("app", "ch-3", true, true, time.Hour, "order-a"), true},
+		{"ownerRef points elsewhere",
+			cmrChallenge("app", "ch-4", true, true, time.Hour, "order-b"), false},
+		{"no linkage — namespace fallback", withLabel("ch-5", ""), true},
+		{"ownerRef right + label wrong wins on ownerRef", func() *unstructured.Unstructured {
+			ch := cmrChallenge("app", "ch-6", true, true, time.Hour, "order-a")
+			ch.SetLabels(map[string]string{"acme.cert-manager.io/order-name": "order-b"})
+			return ch
+		}(), true},
+		{"ownerRef wrong + label right wins on label", func() *unstructured.Unstructured {
+			ch := cmrChallenge("app", "ch-7", true, true, time.Hour, "order-b")
+			ch.SetLabels(map[string]string{"acme.cert-manager.io/order-name": "order-a"})
+			return ch
+		}(), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := challengeLinkedToOrder(tc.ch, order); got != tc.want {
+				t.Fatalf("challengeLinkedToOrder = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

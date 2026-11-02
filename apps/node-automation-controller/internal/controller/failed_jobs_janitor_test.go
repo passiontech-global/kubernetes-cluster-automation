@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // ---------------------------------------------------------------------------
@@ -129,6 +131,40 @@ func TestFailedJobsJanitorKeepsFailedFalseAndNoCondition(t *testing.T) {
 	for _, name := range []string{"failed-false", "active", "suspended"} {
 		if !fjjJobExists(t, cs, "a", name) {
 			t.Fatalf("job %s wrongly deleted", name)
+		}
+	}
+}
+
+// A jobs list failure is a real error — the periodic wrapper meters it.
+func TestFailedJobsJanitorListError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "jobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	j := &failedJobsJanitor{cs: cs}
+	if err := j.run(ctx); err == nil {
+		t.Fatal("expected error when the jobs list fails")
+	}
+}
+
+// A failed delete is tolerated (logged) — the run still nils out and
+// the job survives for the next sweep.
+func TestFailedJobsJanitorDeleteErrorTolerated(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		failedJob("a", "old-failed", 25*time.Hour),
+		failedJob("a", "old-failed-2", 48*time.Hour))
+	cs.PrependReactor("delete", "jobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("delete rejected")
+		})
+	j := &failedJobsJanitor{cs: cs}
+	if err := j.run(ctx); err != nil {
+		t.Fatalf("job delete failures must not error the run: %v", err)
+	}
+	for _, name := range []string{"old-failed", "old-failed-2"} {
+		if !fjjJobExists(t, cs, "a", name) {
+			t.Fatalf("job %s deleted despite the failing delete call", name)
 		}
 	}
 }

@@ -2,11 +2,14 @@ package apiprober
 
 import (
 	"context"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +30,11 @@ type fakeHAProxy struct {
 	servers  map[string]string
 	order    []string
 	disabled map[string]bool
+	// failReply maps a two-word command prefix ("enable server") to a
+	// reply body — a non-empty reply makes the prober treat the command
+	// as failed and the server table is left untouched (like a real
+	// HAProxy "No such server" rejection).
+	failReply map[string]string
 }
 
 func newFakeHAProxy(t *testing.T, rows ...[2]string) *fakeHAProxy {
@@ -92,6 +100,12 @@ func (f *fakeHAProxy) handle(conn net.Conn) {
 	// "<enable|disable> server kube_apiserver/<name>" — apply like
 	// real HAProxy, empty reply = success.
 	parts := strings.Fields(cmd)
+	if len(parts) >= 2 {
+		if reply, fail := f.failReply[parts[0]+" "+parts[1]]; fail {
+			io.WriteString(conn, reply)
+			return
+		}
+	}
 	if len(parts) == 3 {
 		srv := strings.TrimPrefix(parts[2], "kube_apiserver/")
 		switch parts[0] {
@@ -535,5 +549,388 @@ func TestVIPBackendFollowsDirectControllerState(t *testing.T) {
 	p.Cycle(context.Background())
 	if got := testutil.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 1 {
 		t.Fatalf("enabled{api_datahub_lb}=%v want 1", got)
+	}
+}
+
+func countCmd(cmds []string, want string) int {
+	n := 0
+	for _, c := range cmds {
+		if c == want {
+			n++
+		}
+	}
+	return n
+}
+
+func TestName(t *testing.T) {
+	p := fixture(t, newFakeHAProxy(t), ModeDryRun, nil)
+	if p.Name() != "apiprober" {
+		t.Fatalf("Name()=%q want %q", p.Name(), "apiprober")
+	}
+}
+
+func TestCAPool(t *testing.T) {
+	// A real PEM bundle — reuse the httptest server's cert so no
+	// fixture bytes are needed.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer srv.Close()
+	pemFile := filepath.Join(t.TempDir(), "ca.pem")
+	der := srv.TLS.Certificates[0].Certificate[0]
+	if err := os.WriteFile(pemFile,
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := caPool(pemFile)
+	if err != nil || pool == nil {
+		t.Fatalf("caPool(valid) = %v, %v want non-nil pool", pool, err)
+	}
+
+	if _, err := caPool(filepath.Join(t.TempDir(), "absent.pem")); err == nil {
+		t.Fatal("caPool(missing) want error")
+	}
+
+	garbage := filepath.Join(t.TempDir(), "garbage.pem")
+	if err := os.WriteFile(garbage, []byte("not a pem"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := caPool(garbage); err == nil ||
+		!strings.Contains(err.Error(), "no certificates") {
+		t.Fatalf("caPool(garbage) err=%v want 'no certificates'", err)
+	}
+}
+
+func TestNewTLSClientBranches(t *testing.T) {
+	garbage := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(garbage, []byte("not a pem"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify-TLS + unreadable CA bundle → New fails fast.
+	_, err := New(Config{InsecureTLS: false, CAFile: garbage},
+		prometheus.NewRegistry())
+	if err == nil || !strings.Contains(err.Error(), "load CA") {
+		t.Fatalf("New(verify, bad CA) err=%v want 'load CA'", err)
+	}
+
+	// InsecureTLS → the CA file is never consulted.
+	p, err := New(Config{InsecureTLS: true, CAFile: garbage},
+		prometheus.NewRegistry())
+	if err != nil || p == nil {
+		t.Fatalf("New(insecure) = %v, %v", p, err)
+	}
+
+	// An injected HTTPClient overrides all TLS material entirely.
+	p, err = New(Config{
+		HTTPClient: newAPIStub(t).srv.Client(),
+		CAFile:     garbage, // must be ignored
+	}, prometheus.NewRegistry())
+	if err != nil || p.client == nil {
+		t.Fatalf("New(injected client) = %v, %v", p, err)
+	}
+}
+
+func TestTCPPreflightRealDial(t *testing.T) {
+	// No TCPCheck seam → the real TCP dial runs.
+	p, err := New(Config{HTTPClient: newAPIStub(t).srv.Client()},
+		prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := p.tcpPreflight(context.Background(), addr); err != nil {
+		t.Fatalf("tcpPreflight(%s) err=%v want nil", addr, err)
+	}
+	ln.Close()
+	// Nothing listens now — the dial must fail fast (conn refused).
+	if err := p.tcpPreflight(context.Background(), addr); err == nil {
+		t.Fatalf("tcpPreflight(%s) after close want error", addr)
+	}
+}
+
+func TestListRV(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"metadata":{"resourceVersion":"42"}}`)
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "https://")
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("tok-abc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// HTTPClient==nil exercises the production path: TLS client built
+	// from InsecureTLS + per-query bearer token read.
+	p, err := New(Config{InsecureTLS: true, TokenFile: tokenFile},
+		prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rv, ok := p.listRV(context.Background(), addr, "/api/v1/nodes?limit=1")
+	if !ok || rv != 42 {
+		t.Fatalf("listRV = %d, %v want 42, true", rv, ok)
+	}
+	if gotAuth != "Bearer tok-abc" {
+		t.Fatalf("Authorization=%q want %q", gotAuth, "Bearer tok-abc")
+	}
+
+	// Unreadable token file → query fails closed.
+	p.cfg.TokenFile = filepath.Join(t.TempDir(), "absent")
+	if rv, ok := p.listRV(context.Background(), addr, "/x"); ok || rv != 0 {
+		t.Fatalf("listRV(bad token) = %d, %v want 0, false", rv, ok)
+	}
+}
+
+func TestListRVFailureModes(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"non-200", http.StatusServiceUnavailable, `{"metadata":{"resourceVersion":"1"}}`},
+		{"not-json", http.StatusOK, `this is not json`},
+		{"non-numeric-rv", http.StatusOK, `{"metadata":{"resourceVersion":"abc"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			p, err := New(Config{InsecureTLS: true, TokenFile: ""},
+				prometheus.NewRegistry())
+			if err != nil {
+				t.Fatal(err)
+			}
+			rv, ok := p.listRV(context.Background(),
+				strings.TrimPrefix(srv.URL, "https://"), "/x")
+			if ok || rv != 0 {
+				t.Fatalf("listRV = %d, %v want 0, false", rv, ok)
+			}
+		})
+	}
+}
+
+// pipeDial returns a DialSocket seam answering every command with
+// `reply` over a synchronous net.Pipe (mirrors HAProxy: reply then
+// close).
+func pipeDial(reply string) func(context.Context, string) (net.Conn, error) {
+	return func(_ context.Context, _ string) (net.Conn, error) {
+		c1, c2 := net.Pipe()
+		go func() {
+			defer c2.Close()
+			buf := make([]byte, 256)
+			_, _ = c2.Read(buf) // consume the command — pipe is synchronous
+			if reply != "" {
+				_, _ = io.WriteString(c2, reply)
+			}
+		}()
+		return c1, nil
+	}
+}
+
+func TestHaproxyServerReplyHandling(t *testing.T) {
+	// Non-empty reply → error containing the HAProxy error text.
+	p, err := New(Config{
+		DialSocket: pipeDial("No such server\n"),
+		HTTPClient: newAPIStub(t).srv.Client(),
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = p.haproxyServer(context.Background(), "disable", "hub1")
+	if err == nil || !strings.Contains(err.Error(), "No such server") {
+		t.Fatalf("haproxyServer err=%v want reply text in error", err)
+	}
+
+	// Empty reply → success (HAProxy >= 2.x semantics).
+	p, err = New(Config{
+		DialSocket: pipeDial(""),
+		HTTPClient: newAPIStub(t).srv.Client(),
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.haproxyServer(context.Background(), "disable", "hub1"); err != nil {
+		t.Fatalf("haproxyServer empty-reply err=%v want nil", err)
+	}
+}
+
+func TestBackendHelpers(t *testing.T) {
+	cases := []struct {
+		b            backend
+		up, mnt, vip bool
+	}{
+		{backend{Name: "hub1", Status: "UP"}, true, false, false},
+		{backend{Name: "hub1", Status: "UP 2/3"}, true, false, false},
+		{backend{Name: "hub1", Status: "DOWN"}, false, false, false},
+		{backend{Name: "hub1", Status: "MAINT"}, false, true, false},
+		{backend{Name: "hub1", Status: "MAINT(via)"}, false, true, false},
+		{backend{Name: "api_datahub_lb", Status: "UP"}, true, false, true},
+		{backend{Name: "api_datahub_lb", Status: "MAINT"}, false, true, true},
+	}
+	for _, tc := range cases {
+		if got := tc.b.up(); got != tc.up {
+			t.Errorf("%+v.up()=%v want %v", tc.b, got, tc.up)
+		}
+		if got := tc.b.maint(); got != tc.mnt {
+			t.Errorf("%+v.maint()=%v want %v", tc.b, got, tc.mnt)
+		}
+		if got := tc.b.vip(); got != tc.vip {
+			t.Errorf("%+v.vip()=%v want %v", tc.b, got, tc.vip)
+		}
+	}
+}
+
+func TestReApplyDisableAfterHAProxyRestart(t *testing.T) {
+	// HAProxy restart forgets runtime disables — a backend we marked
+	// drained that shows UP again in `show stat` must get the disable
+	// re-applied, not be treated as newly stale.
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	bad.set(100, 200)
+	good.set(50, 50)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	if countCmd(ha.commands(), "disable server kube_apiserver/hub1") != 1 {
+		t.Fatalf("expected 1 disable, cmds=%v", ha.commands())
+	}
+
+	// Simulate the restart: HAProxy reports hub1 UP again while the
+	// prober's in-memory drained flag persists.
+	ha.mu.Lock()
+	ha.disabled["hub1"] = false
+	ha.mu.Unlock()
+	p.Cycle(context.Background())
+
+	if got := countCmd(ha.commands(), "disable server kube_apiserver/hub1"); got != 2 {
+		t.Fatalf("re-applied disable count=%d want 2, cmds=%v", got, ha.commands())
+	}
+}
+
+func TestEnableFailureKeepsDrained(t *testing.T) {
+	// If `enable server` is rejected on the socket, the backend must
+	// stay marked drained — clearing the flag would forget the wedge.
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	bad.set(100, 200)
+	good.set(50, 50)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	if !p.states["hub1"].drained {
+		t.Fatal("hub1 not marked drained after wedge")
+	}
+
+	ha.mu.Lock()
+	ha.failReply = map[string]string{"enable server": "No such server\n"}
+	ha.mu.Unlock()
+	for i := 0; i < 4; i++ { // >= RecoverCycles
+		bad.set(300+int64(i), 300)
+		p.Cycle(context.Background())
+	}
+
+	if !hasCmd(ha.commands(), "enable server kube_apiserver/hub1") {
+		t.Fatalf("enable was never attempted, cmds=%v", ha.commands())
+	}
+	if !p.states["hub1"].drained {
+		t.Fatal("drained flag cleared despite failed enable")
+	}
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "enable")); got != 0 {
+		t.Fatalf("actions enable=%v want 0 (all enables failed)", got)
+	}
+	if got := testutil.ToFloat64(p.enabled.WithLabelValues("hub1")); got != 0 {
+		t.Fatalf("enabled{hub1}=%v want 0", got)
+	}
+}
+
+func TestExternalMaintBackendRecoversToEnable(t *testing.T) {
+	// Backend found already MAINT (manual drain or agent restart lost
+	// the drained flag): fresh probes still accumulate ok-cycles and
+	// re-enable it after RecoverCycles.
+	fresh1 := newAPIStub(t)
+	fresh2 := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", fresh1.addr()},
+		[2]string{"hub2", fresh2.addr()},
+	)
+	ha.disabled["hub1"] = true // externally drained → MAINT in show stat
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	fresh1.set(50, 50)
+	fresh2.set(60, 60)
+	for i := 0; i < 3; i++ { // RecoverCycles
+		p.Cycle(context.Background())
+	}
+
+	if !hasCmd(ha.commands(), "enable server kube_apiserver/hub1") {
+		t.Fatalf("no enable for MAINT backend, cmds=%v", ha.commands())
+	}
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "enable")); got != 1 {
+		t.Fatalf("actions enable=%v want 1", got)
+	}
+}
+
+func TestVIPKeptWhenNoFreshController(t *testing.T) {
+	// sig14b least-bad: a wedged sole controller must NOT drag the VIP
+	// down — with fresh==0 the VIP is the only remaining path.
+	ctrl := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"api_datahub_ctrl", ctrl.addr()},
+		[2]string{"api_datahub_lb", "127.0.0.1:1"},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	ctrl.set(100, 200) // frozen wedge
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+
+	if hasCmd(ha.commands(), "disable server kube_apiserver/api_datahub_lb") {
+		t.Fatalf("VIP disabled with no fresh controller: %v", ha.commands())
+	}
+	if got := testutil.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 1 {
+		t.Fatalf("enabled{api_datahub_lb}=%v want 1 (least-bad)", got)
+	}
+}
+
+func TestVIPMaintReEnabledWhenControllersHealthy(t *testing.T) {
+	// A VIP found in MAINT while all direct controllers are healthy
+	// gets re-enabled — same reconcile path as external drains.
+	ctrl := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"api_datahub_ctrl", ctrl.addr()},
+		[2]string{"api_datahub_lb", "127.0.0.1:1"},
+	)
+	ha.disabled["api_datahub_lb"] = true
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	ctrl.set(50, 50)
+	p.Cycle(context.Background())
+
+	if !hasCmd(ha.commands(), "enable server kube_apiserver/api_datahub_lb") {
+		t.Fatalf("no enable for healthy VIP, cmds=%v", ha.commands())
 	}
 }

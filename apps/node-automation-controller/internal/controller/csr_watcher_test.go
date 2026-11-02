@@ -206,3 +206,38 @@ func TestCSRWatcherListError(t *testing.T) {
 		t.Fatal("expected error when CSR list fails")
 	}
 }
+
+// An UpdateApproval failure IncErrors + continues: the run stays nil
+// and the sibling CSR is still approved.
+func TestCSRWatcherApprovalErrorContinues(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		csr("csr-bad", kubeletServingSigner, "system:node:n1", time.Hour, false),
+		csr("csr-good", kubeletServingSigner, "system:node:n2", time.Hour, false),
+		node("n1", corev1.ConditionTrue, nil),
+		node("n2", corev1.ConditionTrue, nil))
+	cs.PrependReactor("update", "certificatesigningrequests",
+		func(a clienttesting.Action) (bool, runtime.Object, error) {
+			ua, ok := a.(clienttesting.UpdateAction)
+			if !ok || ua.GetSubresource() != "approval" {
+				return false, nil, nil
+			}
+			if ua.GetObject().(*certificatesv1.CertificateSigningRequest).Name == "csr-bad" {
+				return true, nil, errors.New("approval write rejected")
+			}
+			return false, nil, nil
+		})
+	w := newCSRWatcher(cs, true)
+	before := queueErrorCount(t, csrWatcherQueue)
+	if err := w.run(ctx); err != nil {
+		t.Fatalf("an approval write failure must not error the run: %v", err)
+	}
+	if ok, _ := csrApproved(t, cs, "csr-bad"); ok {
+		t.Fatal("csr-bad approved despite the failing UpdateApproval")
+	}
+	if ok, _ := csrApproved(t, cs, "csr-good"); !ok {
+		t.Fatal("csr-good skipped after the sibling approval failed")
+	}
+	if got := queueErrorCount(t, csrWatcherQueue) - before; got < 1 {
+		t.Fatalf("approval write failure did not IncError, delta %v", got)
+	}
+}

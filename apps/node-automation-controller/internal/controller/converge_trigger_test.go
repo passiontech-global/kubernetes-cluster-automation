@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"errors"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -38,6 +41,23 @@ func fireConvergeEvent(t *testing.T, r *convergeTrigger, cmNames ...string) {
 	if _, err := r.Reconcile(ctx, reconcile.Request{
 		NamespacedName: types.NamespacedName{Namespace: convergeNS, Name: cmNames[0]}}); err != nil {
 		t.Fatalf("drain: %v", err)
+	}
+}
+
+// fireConvergeEventArmOnly is fireConvergeEvent minus the drain — for
+// tests that need to drive the drain pass manually (e.g. to inspect
+// the requeue result of a failed trigger).
+func fireConvergeEventArmOnly(t *testing.T, r *convergeTrigger, cmNames ...string) {
+	t.Helper()
+	for _, name := range cmNames {
+		res, err := r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: convergeNS, Name: name}})
+		if err != nil {
+			t.Fatalf("arm %q: %v", name, err)
+		}
+		if res.RequeueAfter != convergeSettle {
+			t.Fatalf("arm %q: expected %s requeue, got %s", name, convergeSettle, res.RequeueAfter)
+		}
 	}
 }
 
@@ -342,5 +362,90 @@ func TestConvergeTriggerCreatePredicate(t *testing.T) {
 	// Delete and generic never fire.
 	if p.Delete(event.DeleteEvent{Object: newCM}) || p.Generic(event.GenericEvent{Object: newCM}) {
 		t.Fatal("delete/generic fired")
+	}
+}
+
+// A Job create failure makes trigger() report false: the drain re-arms
+// one pending name and requeues for a bounded retry — a missed trigger
+// is unsafe even though the job is idempotent.
+func TestConvergeTriggerCreateErrorReArms(t *testing.T) {
+	cs := fake.NewSimpleClientset(convergeCronJob("hub-converge"))
+	var failOnce atomic.Bool
+	failOnce.Store(true)
+	cs.PrependReactor("create", "jobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			if failOnce.CompareAndSwap(true, false) {
+				return true, nil, errors.New("create rejected")
+			}
+			return false, nil, nil
+		})
+	r := &convergeTrigger{cs: cs, pending: map[string]struct{}{}}
+
+	// Arm + drain with the create failing.
+	fireConvergeEventArmOnly(t, r, "node-config-vars-abc")
+	res, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: convergeNS, Name: "node-config-vars-abc"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RequeueAfter != convergeSettle {
+		t.Fatalf("expected %s requeue after a create failure, got %s", convergeSettle, res.RequeueAfter)
+	}
+	if len(listNodeOpsJobs(t, cs)) != 0 {
+		t.Fatal("job exists despite the failed create")
+	}
+
+	// The re-armed pending drains on the next pass — the retried
+	// create now succeeds.
+	res, err = r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: convergeNS, Name: "node-config-vars-abc"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("successful retry must not requeue, got %s", res.RequeueAfter)
+	}
+	if n := len(listNodeOpsJobs(t, cs)); n != 1 {
+		t.Fatalf("expected the retried trigger job, got %d jobs", n)
+	}
+}
+
+// A jobs list failure degrades to "nothing deduped" (bash `2>/dev/null`)
+// — the trigger job is still created.
+func TestConvergeTriggerDedupeListErrorStillCreates(t *testing.T) {
+	cs := fake.NewSimpleClientset(convergeCronJob("hub-converge"))
+	var failOnce atomic.Bool
+	failOnce.Store(true)
+	cs.PrependReactor("list", "jobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			if failOnce.CompareAndSwap(true, false) {
+				return true, nil, errors.New("jobs list boom") // dedupe call only
+			}
+			return false, nil, nil
+		})
+	r := &convergeTrigger{cs: cs, pending: map[string]struct{}{}}
+	fireConvergeEvent(t, r, "node-config-vars-abc")
+	if n := len(listNodeOpsJobs(t, cs)); n != 1 {
+		t.Fatalf("trigger job not created when the dedupe list failed (%d jobs)", n)
+	}
+}
+
+// Drained CM names that match no converge prefix produce an empty
+// target set — no job is created and nothing is re-armed.
+func TestConvergeTriggerNonConvergeNamesOnly(t *testing.T) {
+	cs := fake.NewSimpleClientset(convergeCronJob("hub-converge"))
+	r := &convergeTrigger{cs: cs, pending: map[string]struct{}{}}
+
+	fireConvergeEventArmOnly(t, r, "node-ops-operator-hooks-x1", "grafana-dashboards-9z")
+	res, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: convergeNS, Name: "node-ops-operator-hooks-x1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("non-converge drain must not requeue, got %s", res.RequeueAfter)
+	}
+	if n := len(listNodeOpsJobs(t, cs)); n != 0 {
+		t.Fatalf("non-converge CM names spawned %d jobs", n)
 	}
 }

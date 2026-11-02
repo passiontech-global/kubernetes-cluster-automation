@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -154,5 +155,123 @@ func TestSubsystemMetricsOnSharedRegistry(t *testing.T) {
 	}
 	if !strings.Contains(out, "node_host_agent_info") {
 		t.Fatalf("built-in info metric missing:\n%s", out)
+	}
+}
+
+func TestRegistryAndNodeName(t *testing.T) {
+	injected := prometheus.NewRegistry()
+	a := New(Config{NodeName: "node-x", Registry: injected})
+	if a.Registry() != injected {
+		t.Fatal("Registry() did not return the injected registry")
+	}
+	if a.NodeName() != "node-x" {
+		t.Fatalf("NodeName()=%q want %q", a.NodeName(), "node-x")
+	}
+
+	// Nil registry → a fresh one is allocated (not nil, not shared).
+	b := New(Config{})
+	if b.Registry() == nil {
+		t.Fatal("Registry() is nil with nil config registry")
+	}
+	if b.Registry() == injected {
+		t.Fatal("nil config registry should produce a fresh registry")
+	}
+}
+
+// panicOnceSubsystem panics on its first Run call and blocks on ctx
+// from the second call on — proves the supervisor recovers a panicking
+// subsystem instead of letting the goroutine die.
+type panicOnceSubsystem struct {
+	calls  atomic.Int32
+	second chan struct{} // closed on the second Run invocation
+}
+
+func (s *panicOnceSubsystem) Name() string { return "panic-once" }
+
+func (s *panicOnceSubsystem) Run(ctx context.Context) {
+	if s.calls.Add(1) == 1 {
+		panic("boom")
+	}
+	select {
+	case <-s.second:
+	default:
+		close(s.second)
+	}
+	<-ctx.Done()
+}
+
+func TestRunRecoversSubsystemPanic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sub := &panicOnceSubsystem{second: make(chan struct{})}
+	a := New(Config{
+		MetricsAddr: "127.0.0.1:0",
+		ProbeAddr:   "127.0.0.1:0",
+		Subsystems:  []Subsystem{sub},
+	})
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	// The panic is recovered synchronously — the agent must NOT have
+	// returned while the supervisor waits out its restart backoff.
+	deadline := time.After(10 * time.Second)
+	for sub.calls.Load() != 1 {
+		select {
+		case err := <-done:
+			t.Fatalf("agent exited after subsystem panic: %v", err)
+		case <-deadline:
+			t.Fatal("subsystem was never started")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	// Supervisor restart has a hard-coded 5s backoff — poll until the
+	// second Run invocation rather than sleeping a fixed interval.
+	for {
+		select {
+		case <-sub.second:
+			goto restarted
+		case err := <-done:
+			t.Fatalf("agent exited before subsystem restart: %v", err)
+		case <-deadline:
+			t.Fatal("subsystem was not restarted after panic")
+		}
+	}
+restarted:
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-deadline:
+		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+func TestRunMetricsAddrInUse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	a := New(Config{MetricsAddr: ln.Addr().String(), ProbeAddr: "127.0.0.1:0"})
+	err = a.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "metrics listener") {
+		t.Fatalf("Run err=%v want 'metrics listener' error", err)
+	}
+}
+
+func TestRunProbeAddrInUse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	a := New(Config{MetricsAddr: "127.0.0.1:0", ProbeAddr: ln.Addr().String()})
+	err = a.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "probe listener") {
+		t.Fatalf("Run err=%v want 'probe listener' error", err)
 	}
 }

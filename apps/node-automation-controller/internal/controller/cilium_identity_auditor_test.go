@@ -131,3 +131,71 @@ func TestCiliumIdentityAuditorAPIError(t *testing.T) {
 		t.Fatalf("expected IncError on API failure, delta %v", got)
 	}
 }
+
+// The endpoint list feeds the "used" set — its failure aborts rather
+// than flag every identity as orphaned on empty data.
+func TestCiliumIdentityAuditorEndpointListError(t *testing.T) {
+	dyn := newFakeDyn(ciliumAuditListKinds, ciliumIdentity("100"))
+	dyn.PrependReactor("list", "ciliumendpoints",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	a := &ciliumIdentityAuditor{cs: fake.NewSimpleClientset(), dyn: dyn}
+	before := queueErrorCount(t, ciliumAuditQueue)
+	if err := a.run(ctx); err == nil {
+		t.Fatal("expected error when the ciliumendpoint list fails")
+	}
+	if got := queueErrorCount(t, ciliumAuditQueue) - before; got != 1 {
+		t.Fatalf("expected IncError on API failure, delta %v", got)
+	}
+}
+
+// The pod annotation feed is also mandatory — same abort-on-empty rule.
+func TestCiliumIdentityAuditorPodListError(t *testing.T) {
+	dyn := newFakeDyn(ciliumAuditListKinds,
+		ciliumIdentity("100"), ciliumEndpoint("app", "cep-1", 100))
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "pods",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	a := &ciliumIdentityAuditor{cs: cs, dyn: dyn}
+	before := queueErrorCount(t, ciliumAuditQueue)
+	if err := a.run(ctx); err == nil {
+		t.Fatal("expected error when the pod list fails")
+	}
+	if got := queueErrorCount(t, ciliumAuditQueue) - before; got != 1 {
+		t.Fatalf("expected IncError on API failure, delta %v", got)
+	}
+}
+
+// .status.identity.id arrives as int64 in real objects, float64 in
+// hand-built fixtures — anything else yields "".
+func TestEndpointIdentityID(t *testing.T) {
+	withID := func(v any) *unstructured.Unstructured {
+		o := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "cilium.io/v2",
+			"kind":       "CiliumEndpoint",
+		}}
+		if v != nil {
+			_ = unstructured.SetNestedField(o.Object, v, "status", "identity", "id")
+		}
+		return o
+	}
+	for _, tc := range []struct {
+		name string
+		id   any
+		want string
+	}{
+		{"int64", int64(12345), "12345"},
+		{"float64", float64(6789), "6789"},
+		{"absent", nil, ""},
+		{"non-numeric string", "abc", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := endpointIdentityID(withID(tc.id)); got != tc.want {
+				t.Fatalf("endpointIdentityID = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

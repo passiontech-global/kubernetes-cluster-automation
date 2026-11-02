@@ -1,13 +1,16 @@
 package controller
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -196,5 +199,70 @@ func TestNodeLabelerIdempotent(t *testing.T) {
 	}
 	if n := nodePatchActions(cs); n != 2 {
 		t.Fatalf("second reconcile issued %d extra patches — not idempotent", n-2)
+	}
+}
+
+// A node list failure is a real error — labeling on a partial view
+// must not happen.
+func TestNodeLabelerListError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &nodeLabeler{cs: cs, configPath: filepath.Join(t.TempDir(), "labels.txt")}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the node list fails")
+	}
+}
+
+// A worker-role patch failure warns + continues (never hot-loops):
+// the sibling worker still gets labeled and the reconcile stays nil.
+func TestNodeLabelerWorkerPatchErrorContinues(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("w1", corev1.ConditionTrue, nil),
+		node("w2", corev1.ConditionTrue, nil))
+	cs.PrependReactor("patch", "nodes",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			if action.(ktesting.PatchAction).GetName() == "w1" {
+				return true, nil, errors.New("patch rejected")
+			}
+			return false, nil, nil
+		})
+	r := &nodeLabeler{cs: cs, configPath: filepath.Join(t.TempDir(), "labels.txt")}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatalf("per-node patch failures must not error the reconcile: %v", err)
+	}
+	if _, ok := getNode(t, cs, "w2").Labels[workerRoleLabel]; !ok {
+		t.Fatal("w2 not labeled after w1's patch failure")
+	}
+	if _, ok := getNode(t, cs, "w1").Labels[workerRoleLabel]; ok {
+		t.Fatal("w1 labeled despite the failing patch")
+	}
+}
+
+// Same warn+continue for labels.txt entries: a rejected per-node patch
+// does not stop the rest of the file.
+func TestNodeLabelerLabelsFilePatchErrorContinues(t *testing.T) {
+	cfg := writeLabelsFile(t, "passiontech.dev/workload=app w1 w2\n")
+	cs := fake.NewSimpleClientset(
+		node("w1", corev1.ConditionTrue, map[string]string{workerRoleLabel: ""}),
+		node("w2", corev1.ConditionTrue, map[string]string{workerRoleLabel: ""}))
+	cs.PrependReactor("patch", "nodes",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			if action.(ktesting.PatchAction).GetName() == "w1" {
+				return true, nil, errors.New("patch rejected")
+			}
+			return false, nil, nil
+		})
+	r := &nodeLabeler{cs: cs, configPath: cfg}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatalf("per-node patch failures must not error the reconcile: %v", err)
+	}
+	if got := getNode(t, cs, "w2").Labels["passiontech.dev/workload"]; got != "app" {
+		t.Fatalf("labels.txt entry not applied on w2 after w1's failure, got %q", got)
+	}
+	if got := getNode(t, cs, "w1").Labels["passiontech.dev/workload"]; got != "" {
+		t.Fatalf("workload label on w1 despite the failing patch: %q", got)
 	}
 }

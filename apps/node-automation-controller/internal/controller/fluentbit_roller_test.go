@@ -1,13 +1,16 @@
 package controller
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -236,5 +239,93 @@ func TestFluentBitRollerResourceVersionFallback(t *testing.T) {
 	}
 	if got := rolledHash(getPipelineSecret(t, cs)); got != "777" {
 		t.Fatalf("rolled-config-hash = %q, want the secret resourceVersion 777", got)
+	}
+}
+
+// driftedFixture wires a drifted secret + healthy nodes + a settled DS —
+// the state right before the restart patch.
+func driftedFixture() *fake.Clientset {
+	return fake.NewSimpleClientset(
+		pipelineSecret(map[string]string{"fluent.io/config-hash": "h1"}),
+		node("n1", corev1.ConditionTrue, nil),
+		fluentBitDS(2, 2, 3, 3))
+}
+
+// A secret GET that is not NotFound is a real error — only NotFound
+// is the "no pipeline on this cluster" no-op.
+func TestFluentBitRollerSecretGetError(t *testing.T) {
+	cs := driftedFixture()
+	cs.PrependReactor("get", "secrets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("etcd wedged")
+		})
+	r := &fluentBitRoller{cs: cs, enabled: true}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the secret get fails")
+	}
+}
+
+// The storm gate reads the node list — its failure must abort the roll.
+func TestFluentBitRollerNodeListError(t *testing.T) {
+	cs := driftedFixture()
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &fluentBitRoller{cs: cs, enabled: true}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the node list fails")
+	}
+}
+
+// A DaemonSet get failure aborts before any patch.
+func TestFluentBitRollerDSGetError(t *testing.T) {
+	cs := driftedFixture()
+	cs.PrependReactor("get", "daemonsets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &fluentBitRoller{cs: cs, enabled: true}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the daemonset get fails")
+	}
+}
+
+// Restart ordering: rolled-config-hash is written only AFTER the
+// rollout-restart patch succeeds — a restart failure must leave the
+// drift marker unset so the next reconcile retries.
+func TestFluentBitRollerRestartPatchErrorKeepsDriftMarker(t *testing.T) {
+	cs := driftedFixture()
+	cs.PrependReactor("patch", "daemonsets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	r := &fluentBitRoller{cs: cs, enabled: true}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the restart patch fails")
+	}
+	if got := rolledHash(getPipelineSecret(t, cs)); got != "" {
+		t.Fatal("rolled-config-hash written although the restart failed")
+	}
+}
+
+// The state patch is the last write — its failure errors the reconcile
+// even though the DS already restarted (retry is safe: the patch is
+// idempotent and restartedAt just moves forward).
+func TestFluentBitRollerStatePatchError(t *testing.T) {
+	cs := driftedFixture()
+	cs.PrependReactor("patch", "secrets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("secret patch rejected")
+		})
+	r := &fluentBitRoller{cs: cs, enabled: true}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the state patch fails")
+	}
+	if got := dsRestartedAt(getFluentBitDS(t, cs)); got == "" {
+		t.Fatal("restart patch did not land before the state patch")
+	}
+	if got := rolledHash(getPipelineSecret(t, cs)); got != "" {
+		t.Fatal("rolled-config-hash written despite the failed patch")
 	}
 }

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -154,5 +155,70 @@ func TestCiliumTaintReaperPodOnOtherNodeDoesNotCount(t *testing.T) {
 	}
 	if !hasTaint(getNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 		t.Fatal("taint reaped by a cilium pod on a different node")
+	}
+}
+
+// A pod list failure aborts the sweep — reaping on unreadable agent
+// state could drop a taint that is doing its job.
+func TestCiliumTaintReaperPodListError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint))
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &ciliumTaintReaper{cs: cs, enabled: true}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the cilium pod list fails")
+	}
+	if !hasTaint(getNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+		t.Fatal("taint removed despite the failed pod list")
+	}
+}
+
+// ciliumStaleTaints is the jqFilter projection — only agent-not-ready
+// entries, in order, duplicates included.
+func TestCiliumStaleTaints(t *testing.T) {
+	other := corev1.Taint{Key: "dedicated", Value: "db", Effect: corev1.TaintEffectNoSchedule}
+	dup := corev1.Taint{Key: ciliumNotReadyTaint, Effect: corev1.TaintEffectNoExecute}
+
+	// No cilium taint -> empty projection (unrelated taints don't count).
+	plain := node("n1", corev1.ConditionTrue, nil, other)
+	if got := ciliumStaleTaints(plain); len(got) != 0 {
+		t.Fatalf("unrelated taints leaked into projection: %+v", got)
+	}
+
+	// One cilium taint + an unrelated one -> exactly the cilium entry.
+	mixed := node("n2", corev1.ConditionTrue, nil, ciliumStaleTaint, other)
+	got := ciliumStaleTaints(mixed)
+	if len(got) != 1 || got[0].Key != ciliumNotReadyTaint {
+		t.Fatalf("expected only the cilium taint, got %+v", got)
+	}
+
+	// Two entries with the same key (different effects) are ALL kept —
+	// kubectl taint removes per-key but the projection reports entries.
+	both := node("n3", corev1.ConditionTrue, nil, ciliumStaleTaint, dup)
+	got = ciliumStaleTaints(both)
+	if len(got) != 2 {
+		t.Fatalf("expected both cilium taint entries, got %+v", got)
+	}
+}
+
+// podReadyCond mirrors the bash Ready=True probe: absent condition and
+// Ready=False both count as not ready.
+func TestPodReadyCond(t *testing.T) {
+	p := &corev1.Pod{}
+	if podReadyCond(p) {
+		t.Fatal("pod with no conditions reported ready")
+	}
+	p.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+	}
+	if podReadyCond(p) {
+		t.Fatal("Ready=False pod reported ready")
+	}
+	p.Status.Conditions[0].Status = corev1.ConditionTrue
+	if !podReadyCond(p) {
+		t.Fatal("Ready=True pod reported not ready")
 	}
 }

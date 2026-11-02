@@ -47,3 +47,44 @@ func TestIncErrorLabelNames(t *testing.T) {
 		}
 	}
 }
+
+// TestObserveAPIBackend verifies both per-backend gauges land under
+// the backend-IP label: rvGap passes through (incl. the -1 probe-fail
+// sentinel) and quarantined maps bool → 0/1.
+func TestObserveAPIBackend(t *testing.T) {
+	const ip = "10.9.9.9"
+
+	ObserveAPIBackend(ip, 137, false)
+	if got := testutil.ToFloat64(apiBackendRVGap.WithLabelValues(ip)); got != 137 {
+		t.Fatalf("rvGap = %v, want 137", got)
+	}
+	if got := testutil.ToFloat64(apiBackendQuarantined.WithLabelValues(ip)); got != 0 {
+		t.Fatalf("quarantined = %v, want 0", got)
+	}
+
+	ObserveAPIBackend(ip, -1, true)
+	if got := testutil.ToFloat64(apiBackendRVGap.WithLabelValues(ip)); got != -1 {
+		t.Fatalf("rvGap = %v, want -1 (probe failure sentinel)", got)
+	}
+	if got := testutil.ToFloat64(apiBackendQuarantined.WithLabelValues(ip)); got != 1 {
+		t.Fatalf("quarantined = %v, want 1", got)
+	}
+}
+
+// TestForgetAPIBackend prunes a backend's series when it leaves the
+// controller set so /metrics does not leak stale label values.
+func TestForgetAPIBackend(t *testing.T) {
+	const ip = "10.8.8.8"
+
+	ObserveAPIBackend(ip, 42, true)
+	ForgetAPIBackend(ip)
+
+	// DeleteLabelValues reports whether a series existed — a second
+	// Forget must find nothing.
+	if apiBackendRVGap.DeleteLabelValues(ip) {
+		t.Fatal("rvGap series still present after ForgetAPIBackend")
+	}
+	if apiBackendQuarantined.DeleteLabelValues(ip) {
+		t.Fatal("quarantined series still present after ForgetAPIBackend")
+	}
+}

@@ -1,14 +1,18 @@
 package controller
 
 import (
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 )
 
@@ -258,5 +262,80 @@ func TestCronJobCatchupInvalidScheduleSkips(t *testing.T) {
 	}
 	if len(jobs.Items) != 1 || !strings.HasPrefix(jobs.Items[0].Name, "nightly-catchup-") {
 		t.Fatalf("expected only the nightly catch-up, got %+v", jobs.Items)
+	}
+}
+
+// A jobs list failure inside deduped() degrades to "not deduped" —
+// a missed catch-up is worse than one extra idempotent Job.
+func TestCronJobCatchupDedupeListErrorStillCreates(t *testing.T) {
+	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cs := fake.NewSimpleClientset(cj)
+	var failed atomic.Bool
+	cs.PrependReactor("list", "jobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			if failed.CompareAndSwap(false, true) {
+				return true, nil, errors.New("jobs list boom") // dedupe call only
+			}
+			return false, nil, nil
+		})
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 1 {
+		t.Fatalf("catch-up job not created when dedupe list failed (%d jobs)", n)
+	}
+}
+
+// A Job create failure is metered+logged but does NOT arm the in-memory
+// daily cap — the next sweep must retry the spawn.
+func TestCronJobCatchupCreateErrorDoesNotArmCap(t *testing.T) {
+	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cs := fake.NewSimpleClientset(cj)
+	var creates int32
+	cs.PrependReactor("create", "jobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			atomic.AddInt32(&creates, 1)
+			return true, nil, errors.New("quota exhausted")
+		})
+	c := newCatchup(cs)
+	for i := 0; i < 2; i++ {
+		if err := c.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := atomic.LoadInt32(&creates); got != 2 {
+		t.Fatalf("expected a create retry on the second run (cap must stay unarmed), got %d attempts", got)
+	}
+	if len(c.lastCatchup) != 0 {
+		t.Fatal("daily cap armed despite the failed create")
+	}
+}
+
+// A JobTemplate carrying no labels/annotations at all: the spawn must
+// still stamp the missed-catchup label and the instantiate annotation
+// (maps.Clone(nil) must not leave nil maps behind).
+func TestCronJobCatchupBareJobTemplate(t *testing.T) {
+	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cj.Spec.JobTemplate.Labels = nil
+	cj.Spec.JobTemplate.Annotations = nil
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := cs.BatchV1().Jobs("ops").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("expected 1 catch-up job, got %d", len(jobs.Items))
+	}
+	j := jobs.Items[0]
+	if j.Labels[catchupLabel] != "nightly" {
+		t.Fatalf("missed-catchup label missing on bare template: %v", j.Labels)
+	}
+	if j.Annotations["cronjob.kubernetes.io/instantiate"] != "manual" {
+		t.Fatalf("instantiate annotation missing on bare template: %v", j.Annotations)
 	}
 }
