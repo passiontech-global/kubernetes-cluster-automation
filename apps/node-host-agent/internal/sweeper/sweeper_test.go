@@ -632,3 +632,129 @@ func TestMountEscapedPathInsideDirSkips(t *testing.T) {
 		t.Fatalf("mounted skips=%v want 1", got)
 	}
 }
+
+func TestNewRegisterError(t *testing.T) {
+	// A conflicting metric name in the registry makes New fail
+	// instead of leaving half-registered collectors.
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_sweeper_cycles_total",
+	}))
+	_, err := New(Config{Client: fake.NewSimpleClientset()}, reg)
+	if err == nil || !strings.Contains(err.Error(), "register sweeper metrics") {
+		t.Fatalf("New err=%v want 'register sweeper metrics'", err)
+	}
+}
+
+func TestRunTicksSweepAgain(t *testing.T) {
+	// The ticker branch: Interval small enough to fire within the
+	// test deadline — cycles accumulate, then cancel stops Run.
+	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	s.cfg.BaseDir = filepath.Join(base, "gone") // absent → cheap no-op sweep
+	s.cfg.Interval = 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.Run(ctx); close(done) }()
+
+	deadline := time.After(5 * time.Second)
+	for testutil.ToFloat64(s.cycles.WithLabelValues("ok")) < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("ticker cycles never ran")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-deadline:
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestSweepCtxCancelledInDirLoop(t *testing.T) {
+	// A cancelled ctx aborts mid-loop BEFORE any dir is examined —
+	// the per-dir ctx.Err() guard, distinct from an abort result.
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.Sweep(ctx)
+
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir removed on cancelled ctx: %v", err)
+	}
+	if got := testutil.ToFloat64(s.cycles.WithLabelValues("ok")); got != 0 {
+		t.Fatalf("cycles ok=%v want 0 (bailed before cycle end)", got)
+	}
+	if got := testutil.ToFloat64(s.cycles.WithLabelValues("abort")); got != 0 {
+		t.Fatalf("cycles abort=%v want 0", got)
+	}
+	if got := testutil.ToFloat64(s.dirsExamined); got != 0 {
+		t.Fatalf("dirsExamined=%v want 0 (bailed in the dir loop)", got)
+	}
+}
+
+func TestStatErrorOnChildDirSkips(t *testing.T) {
+	// ReadDir needs r on the base dir; DirEntry.Info lstats the child
+	// and needs x on it. A 0o400 base dir satisfies the first and
+	// fails the second → skipStatError.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — permission bits are not enforced")
+	}
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+	if err := os.Chmod(base, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(base, 0o755) })
+
+	s.Sweep(context.Background())
+
+	// Restore access before asserting the dir survived.
+	if err := os.Chmod(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir removed despite stat error: %v", err)
+	}
+	if got := skipCount(t, s, skipStatError); got != 1 {
+		t.Fatalf("stat_error skips=%v want 1", got)
+	}
+}
+
+func TestRemoveAllFailureWarns(t *testing.T) {
+	// Removing the dir needs w on the base dir — a 0o555 base makes
+	// the final rmdir fail → the WARN branch, and the cycle still
+	// completes ok (rm failures are logged, not aborts).
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — permission bits are not enforced")
+	}
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+	if err := os.Chmod(base, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(base, 0o755) })
+
+	s.Sweep(context.Background())
+
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir removed despite unwritable base dir: %v", err)
+	}
+	if got := testutil.ToFloat64(s.dirsDeleted); got != 0 {
+		t.Fatalf("dirsDeleted=%v want 0 (rm failed)", got)
+	}
+	if got := testutil.ToFloat64(s.cycles.WithLabelValues("ok")); got != 1 {
+		t.Fatalf("cycles ok=%v want 1 (rm failure is not an abort)", got)
+	}
+}

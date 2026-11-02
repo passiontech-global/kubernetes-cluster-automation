@@ -2,13 +2,16 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // kubeletDeadTaint is the NoSchedule taint the reaper applies.
@@ -226,6 +229,84 @@ func TestKubeletReaperRun(t *testing.T) {
 		}
 		if hasTaint(getNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("recovered node still tainted")
+		}
+	})
+
+	t.Run("node list error aborts the run", func(t *testing.T) {
+		cs := fake.NewSimpleClientset()
+		cs.PrependReactor("list", "nodes",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("api down")
+			})
+		r := &kubeletReaper{
+			cs:      cs,
+			probeFn: func(context.Context, string) bool { return true },
+		}
+		if err := r.run(ctx); err == nil {
+			t.Fatal("expected error when the node list fails")
+		}
+	})
+
+	t.Run("per-node sweep failure is logged, not fatal", func(t *testing.T) {
+		// w1 is listed (and probed) but vanishes before sweep's
+		// re-Get — the bash loop continued to the next node on any
+		// per-node failure, so run must return nil.
+		cs := fake.NewSimpleClientset(
+			kubeletWorker("w1", 10*time.Second),
+			kubeletWorker("w2", 10*time.Second))
+		cs.PrependReactor("get", "nodes",
+			func(a ktesting.Action) (bool, runtime.Object, error) {
+				if a.(ktesting.GetAction).GetName() == "w1" {
+					return true, nil, errors.New("node vanished")
+				}
+				return false, nil, nil
+			})
+		r := &kubeletReaper{
+			cs:      cs,
+			probeFn: func(context.Context, string) bool { return true },
+		}
+		if err := r.run(ctx); err != nil {
+			t.Fatalf("per-node sweep failure must not fail the run: %v", err)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// sweep() — patch-failure paths through untaintNode/taintNode
+// ---------------------------------------------------------------------------
+
+func TestKubeletReaperSweepPatchErrors(t *testing.T) {
+	failPatch := func(cs *fake.Clientset) {
+		cs.PrependReactor("patch", "nodes",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("patch rejected")
+			})
+	}
+
+	t.Run("probe ok + untaint patch fails", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(kubeletWorker("w1", 0, kubeletDeadTaint))
+		failPatch(cs)
+		r := &kubeletReaper{cs: cs}
+		if err := r.sweep(ctx, "w1", true); err == nil {
+			t.Fatal("expected error when the untaint patch fails")
+		}
+	})
+
+	t.Run("stale heartbeat + taint patch fails", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(kubeletWorker("w1", 300*time.Second))
+		failPatch(cs)
+		r := &kubeletReaper{cs: cs}
+		if err := r.sweep(ctx, "w1", false); err == nil {
+			t.Fatal("expected error when the taint patch fails")
+		}
+	})
+
+	t.Run("fresh heartbeat + untaint patch fails", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(kubeletWorker("w1", 10*time.Second, kubeletDeadTaint))
+		failPatch(cs)
+		r := &kubeletReaper{cs: cs}
+		if err := r.sweep(ctx, "w1", false); err == nil {
+			t.Fatal("expected error when the recovery untaint fails")
 		}
 	})
 }

@@ -240,3 +240,36 @@ func TestStormGateDecisionPatchError(t *testing.T) {
 		t.Fatal("expected error when the decision annotation patch fails")
 	}
 }
+
+// A deployment GET failure that is NOT NotFound is a real reconcile
+// error — only a missing descheduler is the benign skip.
+func TestStormGateDeployGetError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	cs.PrependReactor("get", "deployments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &deschedulerStormGate{cs: cs}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the deployment get fails")
+	}
+}
+
+// Replicas already correct but no decision annotation recorded yet:
+// the elif still annotates, and a patch failure there errors the
+// reconcile just like the scale path.
+func TestStormGateAnnotateErrorOnSteadyReplicas(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionTrue, nil), // clear verdict, want=1
+		deschedulerDeploy(1, nil))             // cur=1 -> elif branch
+	cs.PrependReactor("patch", "deployments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	r := &deschedulerStormGate{cs: cs}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the elif annotation patch fails")
+	}
+}

@@ -370,3 +370,29 @@ func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 		t.Fatal("readySince true on malformed lastTransitionTime")
 	}
 }
+
+// A per-ES patch failure is logged and the sweep continues to the
+// next ExternalSecret — it must neither error the run nor record a
+// delivered nudge.
+func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
+	dyn := newDynFake(
+		esObj("apps", "es-bad", "False", 30*time.Minute),
+		esObj("apps", "es-good", "False", 30*time.Minute))
+	dyn.PrependReactor("patch", "externalsecrets",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if pa, ok := a.(ktesting.PatchAction); ok && pa.GetName() == "es-bad" {
+				return true, nil, errors.New("patch rejected")
+			}
+			return false, nil, nil
+		})
+	n := newNudge(dyn, true)
+	if err := n.nudge(ctx); err != nil {
+		t.Fatalf("per-ES patch failure must not fail the nudge: %v", err)
+	}
+	if _, ok := n.nudged["apps/es-bad"]; ok {
+		t.Fatal("failed nudge recorded as delivered")
+	}
+	if _, ok := n.nudged["apps/es-good"]; !ok {
+		t.Fatal("healthy patch skipped after a sibling's failure")
+	}
+}

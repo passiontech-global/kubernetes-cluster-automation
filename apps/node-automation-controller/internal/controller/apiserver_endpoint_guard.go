@@ -47,10 +47,22 @@
 // breaks — the real cure stays the sig13 k0scontroller restart; this
 // module bridges the gap for new connections.
 //
+// Endpoint API version gate: core/v1 Endpoints is deprecated since
+// v1.33 — the apiserver returns a Warning header ("v1 Endpoints is
+// deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice") on
+// every get/update. The guard detects the server minor once at first
+// sweep: <1.33 (or undetectable — Endpoints works on every supported
+// version) keeps the Endpoints SSOT plus the best-effort slice
+// mirror; >=1.33 promotes the EndpointSlice to the SSOT — backend
+// set, quarantine annotation and all edits land on the slice and
+// corev1 Endpoints is never touched.
+//
 // RBAC (infrastructure/base/node-ops/node-automation-controller/rbac.yaml):
 // Role in ns default — get/update/patch on endpoints[kubernetes] and
 // endpointslices[kubernetes]; both objects are fetched by fixed name so
-// no list/watch is needed and resourceNames scoping suffices.
+// no list/watch is needed and resourceNames scoping suffices. The
+// version probe hits /version — a non-resource URL open to every
+// authenticated client.
 package controller
 
 import (
@@ -60,6 +72,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -101,6 +114,10 @@ const (
 	// this get probe+log+metrics only — editing endpoints there can only
 	// empty the set (production/cicd run a single controller).
 	endpointGuardMinBackends = 2
+	// endpointSliceSinceMinor: first Kubernetes minor where core/v1
+	// Endpoints is deprecated — the guard moves its SSOT to the
+	// EndpointSlice on >= this version.
+	endpointSliceSinceMinor = 33
 )
 
 // apiProbeResult is one backend probe outcome: the quorum (etcd) list
@@ -141,6 +158,21 @@ type apiServerEndpointGuard struct {
 	// quarantineActive switches Start to the faster re-apply cadence —
 	// set from the annotation each cycle.
 	quarantineActive bool
+	// serverMinorFn resolves the apiserver's minor version for the
+	// endpoint-API gate — test seam (fake Discovery cannot make
+	// ServerVersion fail). nil → serverMinor(g.cs).
+	serverMinorFn func() (int, error)
+	// sliceMode caches the detected endpoint API choice: nil =
+	// undetected, true = EndpointSlice SSOT (>=v1.33), false = corev1
+	// Endpoints. Cached after the first successful detection only, so
+	// a discovery flap retries next cycle.
+	sliceMode *bool
+	// memQuarantine mirrors the persisted quarantine set in memory:
+	// if the endpoints reconciler ever rebuilds the object wholesale
+	// and drops our annotation mid-incident, the guard keeps tracking
+	// (and re-pulling) the wedged IP instead of stranding it outside
+	// the set with no evidence left.
+	memQuarantine map[string]bool
 }
 
 // SetupAPIServerEndpointGuard registers the 30s wedge sweep.
@@ -186,26 +218,58 @@ func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
 func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	ep, err := g.cs.CoreV1().Endpoints(endpointGuardNS).
-		Get(ctx, endpointGuardName, metav1.GetOptions{})
-	if err != nil {
-		return err // periodic loop meters/logs — nothing to act on without it
+	useSlice, verr := g.endpointMode()
+	if verr != nil {
+		log.Error(verr, "k8s version undetectable — defaulting to corev1 Endpoints")
 	}
-	// The slice is best-effort: managed by the same endpoints
-	// reconciler, but absent on a cluster mid-upgrade it must not
-	// veto the Endpoints guard.
-	eps, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
-		Get(ctx, endpointGuardName, metav1.GetOptions{})
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			eps = nil
-		} else {
+	var ep *corev1.Endpoints
+	var eps *discoveryv1.EndpointSlice
+	var activeIPs []string
+	var quarantinedIPs map[string]bool
+	if useSlice {
+		// >=v1.33: the EndpointSlice is the SSOT (see the version-gate
+		// note above) — a missing object fails the cycle just like a
+		// missing Endpoints does on the old path.
+		s, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+			Get(ctx, endpointGuardName, metav1.GetOptions{})
+		if err != nil {
 			return err
 		}
+		eps = s
+		activeIPs = sliceIPs(eps)
+		quarantinedIPs = parseQuarantineAnnotation(eps)
+	} else {
+		e, err := g.cs.CoreV1().Endpoints(endpointGuardNS).
+			Get(ctx, endpointGuardName, metav1.GetOptions{})
+		if err != nil {
+			return err // periodic loop meters/logs — nothing to act on without it
+		}
+		ep = e
+		// The slice is best-effort: managed by the same endpoints
+		// reconciler, but absent on a cluster mid-upgrade it must not
+		// veto the Endpoints guard.
+		s, serr := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+			Get(ctx, endpointGuardName, metav1.GetOptions{})
+		if serr != nil {
+			if apierrors.IsNotFound(serr) {
+				s = nil
+			} else {
+				return serr
+			}
+		}
+		eps = s
+		activeIPs = endpointIPs(ep)
+		quarantinedIPs = parseQuarantineAnnotation(ep)
 	}
-
-	activeIPs := endpointIPs(ep)
-	quarantinedIPs := parseQuarantineAnnotation(ep)
+	// The endpoints reconciler may rebuild the SSOT object wholesale
+	// and drop our annotation — the in-memory copy keeps a quarantined
+	// backend tracked until it recovers or this pod restarts (the
+	// reconciler re-adds pulled IPs every ~10s anyway, so nothing
+	// stays quarantined by accident).
+	for ip := range g.memQuarantine {
+		quarantinedIPs[ip] = true
+	}
+	g.memQuarantine = maps.Clone(quarantinedIPs)
 	g.quarantineActive = len(quarantinedIPs) > 0
 	allIPs := unionIPs(activeIPs, quarantinedIPs)
 	if len(allIPs) == 0 {
@@ -324,62 +388,134 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 		return nil
 	}
 
-	// ---- Mutate both objects, then persist -------------------------------
-	// Endpoints first: it carries the quarantine annotation that is the
-	// SSOT for "who is pulled". If this update fails nothing was
-	// persisted and the next cycle retries the whole decision.
-	ep = ep.DeepCopy()
-	if ep.Annotations == nil {
-		ep.Annotations = map[string]string{}
-	}
-	for _, ip := range toRemove {
-		removeEndpointIP(ep, ip)
-		quarantinedIPs[ip] = true
-		log.Info("QUARANTINE: wedged apiserver pulled from kubernetes endpoints",
-			"ip", ip, "remainingHealthy", healthyActive)
-	}
-	for _, ip := range toAdd {
-		addEndpointIP(ep, ip)
-		delete(quarantinedIPs, ip)
-		log.Info("RE-ADD: recovered apiserver back in kubernetes endpoints", "ip", ip)
-	}
-	writeQuarantineAnnotation(ep, quarantinedIPs)
-	if _, err := g.cs.CoreV1().Endpoints(endpointGuardNS).
-		Update(ctx, ep, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("update endpoints/%s: %w", endpointGuardName, err)
-	}
-
-	// EndpointSlice converges to the FULL quarantine set (not just
-	// this cycle's removals) so a slice update that failed earlier is
-	// retried instead of leaving a wedged IP routable forever.
-	if eps != nil {
+	// ---- Mutate the SSOT object, then persist ------------------------------
+	// Whichever object carries the quarantine annotation is the SSOT
+	// for "who is pulled"; if its update fails nothing was persisted
+	// and the next cycle retries the whole decision.
+	if useSlice {
 		eps = eps.DeepCopy()
-		changedEPS := false
-		for ip := range quarantinedIPs {
-			if removeSliceIP(eps, ip) {
-				changedEPS = true
-			}
+		for _, ip := range toRemove {
+			removeSliceIP(eps, ip)
+			quarantinedIPs[ip] = true
+			log.Info("QUARANTINE: wedged apiserver pulled from kubernetes EndpointSlice",
+				"ip", ip, "remainingHealthy", healthyActive)
 		}
 		for _, ip := range toAdd {
-			if addSliceIP(eps, ip) {
-				changedEPS = true
-			}
+			addSliceIP(eps, ip)
+			delete(quarantinedIPs, ip)
+			log.Info("RE-ADD: recovered apiserver back in kubernetes EndpointSlice", "ip", ip)
 		}
-		if changedEPS {
-			if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
-				Update(ctx, eps, metav1.UpdateOptions{}); err != nil {
-				// Logged/metered, not returned: Endpoints already
-				// persisted the decision and the next cycle re-applies
-				// the slice diff.
-				metrics.IncError(endpointGuardQueue)
-				log.Error(err, "EndpointSlice update failed — retries next cycle")
+		writeQuarantineAnnotation(eps, quarantinedIPs)
+		if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+			Update(ctx, eps, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("update endpointslice/%s: %w", endpointGuardName, err)
+		}
+	} else {
+		ep = ep.DeepCopy()
+		if ep.Annotations == nil {
+			ep.Annotations = map[string]string{}
+		}
+		for _, ip := range toRemove {
+			removeEndpointIP(ep, ip)
+			quarantinedIPs[ip] = true
+			log.Info("QUARANTINE: wedged apiserver pulled from kubernetes endpoints",
+				"ip", ip, "remainingHealthy", healthyActive)
+		}
+		for _, ip := range toAdd {
+			addEndpointIP(ep, ip)
+			delete(quarantinedIPs, ip)
+			log.Info("RE-ADD: recovered apiserver back in kubernetes endpoints", "ip", ip)
+		}
+		writeQuarantineAnnotation(ep, quarantinedIPs)
+		if _, err := g.cs.CoreV1().Endpoints(endpointGuardNS).
+			Update(ctx, ep, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("update endpoints/%s: %w", endpointGuardName, err)
+		}
+
+		// EndpointSlice converges to the FULL quarantine set (not just
+		// this cycle's removals) so a slice update that failed earlier
+		// is retried instead of leaving a wedged IP routable forever.
+		if eps != nil {
+			eps = eps.DeepCopy()
+			changedEPS := false
+			for ip := range quarantinedIPs {
+				if removeSliceIP(eps, ip) {
+					changedEPS = true
+				}
+			}
+			for _, ip := range toAdd {
+				if addSliceIP(eps, ip) {
+					changedEPS = true
+				}
+			}
+			if changedEPS {
+				if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+					Update(ctx, eps, metav1.UpdateOptions{}); err != nil {
+					// Logged/metered, not returned: Endpoints already
+					// persisted the decision and the next cycle re-applies
+					// the slice diff.
+					metrics.IncError(endpointGuardQueue)
+					log.Error(err, "EndpointSlice update failed — retries next cycle")
+				}
 			}
 		}
 	}
+	g.memQuarantine = maps.Clone(quarantinedIPs)
 
 	log.Info("sweep done", "removed", toRemove, "readded", toAdd,
 		"quarantined", slices.Sorted(maps.Keys(quarantinedIPs)))
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint API version gate — see the header note.
+// ---------------------------------------------------------------------------
+
+// endpointMode reports whether this cluster's SSOT is the EndpointSlice
+// (true, >=v1.33) or corev1 Endpoints (false). Detection is cached
+// after the first success; a discovery error returns (false, err) and
+// retries next cycle — the caller logs it and keeps the Endpoints
+// path, which stays valid on every supported version.
+func (g *apiServerEndpointGuard) endpointMode() (bool, error) {
+	if g.sliceMode != nil {
+		return *g.sliceMode, nil
+	}
+	fn := g.serverMinorFn
+	if fn == nil {
+		fn = func() (int, error) { return serverMinor(g.cs) }
+	}
+	minor, err := fn()
+	if err != nil {
+		return false, err
+	}
+	use := minor >= endpointSliceSinceMinor
+	g.sliceMode = &use
+	return use, nil
+}
+
+// gitMinorRe extracts "vMAJOR.MINOR" from GitVersion as a last resort
+// when Version.Minor is empty or unparseable.
+var gitMinorRe = regexp.MustCompile(`^v?\d+\.(\d+)`)
+
+// serverMinor resolves the apiserver's minor version. Minor carries a
+// "+" suffix on some distros ("33+" on GKE/EKS) — leading digits win;
+// an empty/unparseable Minor falls back to GitVersion.
+func serverMinor(cs kubernetes.Interface) (int, error) {
+	v, err := cs.Discovery().ServerVersion()
+	if err != nil {
+		return 0, err
+	}
+	digits := strings.TrimRightFunc(v.Minor,
+		func(r rune) bool { return r < '0' || r > '9' })
+	if n, err := strconv.Atoi(digits); err == nil {
+		return n, nil
+	}
+	if m := gitMinorRe.FindStringSubmatch(v.GitVersion); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil {
+			return n, nil
+		}
+	}
+	return 0, fmt.Errorf("unparseable server version %+v", v)
 }
 
 // ---------------------------------------------------------------------------
@@ -486,10 +622,12 @@ func endpointIPs(ep *corev1.Endpoints) []string {
 	return slices.Sorted(maps.Keys(set))
 }
 
-// parseQuarantineAnnotation reads node.ops/quarantined-endpoints.
-func parseQuarantineAnnotation(ep *corev1.Endpoints) map[string]bool {
+// parseQuarantineAnnotation reads node.ops/quarantined-endpoints off
+// whichever object is the SSOT this cluster (Endpoints <1.33,
+// EndpointSlice >=1.33).
+func parseQuarantineAnnotation(obj metav1.Object) map[string]bool {
 	set := map[string]bool{}
-	for _, ip := range strings.Split(ep.Annotations[endpointGuardAnno], ",") {
+	for _, ip := range strings.Split(obj.GetAnnotations()[endpointGuardAnno], ",") {
 		if ip = strings.TrimSpace(ip); ip != "" {
 			set[ip] = true
 		}
@@ -497,12 +635,17 @@ func parseQuarantineAnnotation(ep *corev1.Endpoints) map[string]bool {
 	return set
 }
 
-func writeQuarantineAnnotation(ep *corev1.Endpoints, set map[string]bool) {
+func writeQuarantineAnnotation(obj metav1.Object, set map[string]bool) {
+	a := obj.GetAnnotations()
 	if len(set) == 0 {
-		delete(ep.Annotations, endpointGuardAnno)
+		delete(a, endpointGuardAnno)
 		return
 	}
-	ep.Annotations[endpointGuardAnno] = strings.Join(slices.Sorted(maps.Keys(set)), ",")
+	if a == nil {
+		a = map[string]string{}
+		obj.SetAnnotations(a)
+	}
+	a[endpointGuardAnno] = strings.Join(slices.Sorted(maps.Keys(set)), ",")
 }
 
 func unionIPs(a []string, b map[string]bool) []string {
@@ -578,6 +721,20 @@ func addEndpointIP(ep *corev1.Endpoints, ip string) {
 	}
 	ep.Subsets[idx].Addresses = append(ep.Subsets[idx].Addresses,
 		corev1.EndpointAddress{IP: ip})
+}
+
+// sliceIPs returns the sorted deduped backend IPs across all
+// EndpointSlice endpoints — Ready=false/absent entries count too (same
+// convention as Endpoints notReadyAddresses: still a controller IP,
+// still a wedge suspect).
+func sliceIPs(eps *discoveryv1.EndpointSlice) []string {
+	set := map[string]bool{}
+	for _, e := range eps.Endpoints {
+		for _, a := range e.Addresses {
+			set[a] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(set))
 }
 
 // removeSliceIP drops ip from every endpoint's addresses in the slice;

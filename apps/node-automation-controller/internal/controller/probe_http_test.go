@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -115,6 +116,17 @@ func TestFetchListRV(t *testing.T) {
 		_, err := fetchListRV(ctx, rt, "10.0.0.1", "/x")
 		if err == nil || !strings.Contains(err.Error(), "connection refused") {
 			t.Fatalf("transport error not surfaced: %v", err)
+		}
+	})
+
+	t.Run("unparseable backend IP fails request build", func(t *testing.T) {
+		rt := &stubTransport{fn: func(*http.Request) (*http.Response, error) {
+			return probeResponse(200, probeRVJSON(1)), nil
+		}}
+		// A space survives net.JoinHostPort but is rejected by
+		// http.NewRequest — the error must surface, not panic.
+		if _, err := fetchListRV(ctx, rt, "bad ip", "/x"); err == nil {
+			t.Fatal("expected URL construction error for a bad backend IP")
 		}
 	})
 }
@@ -289,6 +301,60 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 			t.Fatal("probe succeeded on a cancelled context")
 		}
 	})
+
+	// All four probes failing -> false, after the real 10s backoff
+	// gaps (~30s of wall time — the retry cadence IS the code under
+	// test; a kubelet restart must not be punished by a single blip).
+	t.Run("four consecutive failures return false", func(t *testing.T) {
+		var attempts atomic.Int32
+		cs := probeClientset(t, func(w http.ResponseWriter, r *http.Request) {
+			attempts.Add(1)
+			w.WriteHeader(200)
+			fmt.Fprint(w, "error trying to reach service")
+		})
+		r := &kubeletReaper{cs: cs}
+		done := make(chan bool, 1)
+		go func() { done <- r.probe(ctx, "w1") }()
+		select {
+		case ok := <-done:
+			if ok {
+				t.Fatal("four failed probes reported healthy")
+			}
+			if n := attempts.Load(); n != kubeletReaperProbes {
+				t.Fatalf("attempts = %d, want %d", n, kubeletReaperProbes)
+			}
+		case <-time.After(kubeletReaperProbes*kubeletReaperProbeGap + 20*time.Second):
+			t.Fatal("probe did not exhaust retries")
+		}
+	})
+
+	// A kubelet that recovers between retries is healthy on the NEXT
+	// attempt — covers success after a timer gap.
+	t.Run("recovery between retries reports healthy", func(t *testing.T) {
+		var attempts atomic.Int32
+		cs := probeClientset(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(200)
+			if attempts.Add(1) >= 2 {
+				fmt.Fprint(w, "ok")
+				return
+			}
+			fmt.Fprint(w, "error trying to reach service")
+		})
+		r := &kubeletReaper{cs: cs}
+		done := make(chan bool, 1)
+		go func() { done <- r.probe(ctx, "w1") }()
+		select {
+		case ok := <-done:
+			if !ok {
+				t.Fatal("kubelet healthy on attempt 2 reported dead")
+			}
+			if n := attempts.Load(); n != 2 {
+				t.Fatalf("attempts = %d, want 2", n)
+			}
+		case <-time.After(kubeletReaperProbeGap + 20*time.Second):
+			t.Fatal("probe did not retry")
+		}
+	})
 }
 
 func TestDeadNodeSweeperProbeHTTP(t *testing.T) {
@@ -371,7 +437,36 @@ func TestCoreDNSPanics(t *testing.T) {
 			t.Fatal("transport error reported as known")
 		}
 	})
+
+	t.Run("unbuildable request is unknown", func(t *testing.T) {
+		w, _ := newWatchdog(200, "coredns_panics_total 9\n", nil)
+		// A space in the podIP makes NewRequest reject the URL —
+		// same UNKNOWN verdict as a transport error.
+		if _, ok := w.panics(ctx, "bad ip"); ok {
+			t.Fatal("unparseable podIP reported as known")
+		}
+	})
+
+	t.Run("truncated body is unknown", func(t *testing.T) {
+		httpc := &http.Client{Transport: &stubTransport{fn: func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: 200,
+				Body:       errReadCloser{},
+				Header:     http.Header{},
+			}, nil
+		}}}
+		w := &coreDNSWatchdog{http: httpc}
+		if _, ok := w.panics(ctx, "10.9.9.9"); ok {
+			t.Fatal("body read failure reported as known")
+		}
+	})
 }
+
+// errReadCloser fails every Read — a metrics body that dies mid-stream.
+type errReadCloser struct{}
+
+func (errReadCloser) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
+func (errReadCloser) Close() error             { return nil }
 
 // ---------------------------------------------------------------------------
 // coreDNSWatchdog.logHit — pod logs arrive through a get/pods/log

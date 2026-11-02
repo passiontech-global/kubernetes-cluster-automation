@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -447,5 +448,46 @@ func TestConvergeTriggerNonConvergeNamesOnly(t *testing.T) {
 	}
 	if n := len(listNodeOpsJobs(t, cs)); n != 0 {
 		t.Fatalf("non-converge CM names spawned %d jobs", n)
+	}
+}
+
+// Nil event objects must never fire the predicate (informer edge
+// cases deliver empty events on resync boundaries).
+func TestConvergeTriggerNilEventObjects(t *testing.T) {
+	p := convergePredicates(time.Now())
+	if p.Create(event.CreateEvent{}) {
+		t.Fatal("create with nil object fired")
+	}
+	if p.Update(event.UpdateEvent{}) {
+		t.Fatal("update with nil objects fired")
+	}
+	newCM := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "2"}}
+	if p.Update(event.UpdateEvent{ObjectNew: newCM}) ||
+		p.Update(event.UpdateEvent{ObjectOld: newCM}) {
+		t.Fatal("half-nil update fired")
+	}
+}
+
+// A JobTemplate with NO labels/annotations still clones — the
+// created-by label and instantiate annotation land on a fresh map.
+func TestConvergeTriggerBareJobTemplate(t *testing.T) {
+	cj := convergeCronJob("hub-converge")
+	cj.Spec.JobTemplate.Labels = nil
+	cj.Spec.JobTemplate.Annotations = nil
+	cs := fake.NewSimpleClientset(cj)
+	r := &convergeTrigger{cs: cs, pending: map[string]struct{}{}}
+
+	if !r.trigger(ctx, logr.Discard(), "hub-converge", time.Now().Unix()) {
+		t.Fatal("trigger reported failure for a bare JobTemplate")
+	}
+	jobs := listNodeOpsJobs(t, cs)
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job, got %v", triggerJobNames(jobs))
+	}
+	if jobs[0].Labels["app.kubernetes.io/created-by"] != "node-ops-operator" {
+		t.Fatal("created-by label missing on a bare-template clone")
+	}
+	if jobs[0].Annotations["cronjob.kubernetes.io/instantiate"] != "manual" {
+		t.Fatal("instantiate annotation missing on a bare-template clone")
 	}
 }

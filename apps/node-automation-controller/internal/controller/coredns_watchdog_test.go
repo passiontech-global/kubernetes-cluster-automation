@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -10,7 +12,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // ---------------------------------------------------------------------------
@@ -423,6 +427,139 @@ func TestCoreDNSRecover(t *testing.T) {
 			t.Fatal("expected error when deploy/coredns is absent")
 		}
 	})
+}
+
+// A pod list failure is an inconclusive run, NOT an error — the next
+// minute's tick re-evaluates, so run returns nil (no retry hot loop).
+func TestCoreDNSWatchdogPodListError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	w := newCDNSWatchdog(cs)
+	if err := w.run(ctx); err != nil {
+		t.Fatalf("pod list failure must be inconclusive, got %v", err)
+	}
+}
+
+// Layer 2 skips a pod already proven stale by layer 1 AND a pod with
+// no podIP — the DNS fn must never be invoked for either.
+func TestCoreDNSWatchdogLayer2Skips(t *testing.T) {
+	ready := true
+	svc, es := cdnsProbeService("fresh-svc", "app-ns", 0, &ready)
+	cs := fake.NewSimpleClientset(
+		cdnsPod("cdns-a", "10.0.0.1"),
+		cdnsPod("cdns-b", ""), // pending — no podIP yet
+		cdnsDeployment(2, 2, nil),
+		svc, es)
+	w := newCDNSWatchdog(cs)
+	w.logHitFn = func(_ context.Context, pod string) string {
+		if pod == "cdns-a" {
+			return "Failed to watch *v1.Endpoints: Unauthorized"
+		}
+		return ""
+	}
+	dnsCalled := false
+	w.dnsFn = func(context.Context, string, string) bool {
+		dnsCalled = true
+		return true
+	}
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if dnsCalled {
+		t.Fatal("dns probe ran for a stale or IP-less pod")
+	}
+	if cdnsPodExists(t, cs, "cdns-a") {
+		t.Fatal("layer-1-stale pod not deleted")
+	}
+	if !cdnsPodExists(t, cs, "cdns-b") {
+		t.Fatal("IP-less pod touched")
+	}
+}
+
+// recover() hard-failure paths — the errors are returned so the
+// periodic wrapper meters them.
+func TestCoreDNSRecoverErrorPaths(t *testing.T) {
+	t.Run("node list failure aborts recovery", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			cdnsPod("cdns-a", "10.0.0.1"),
+			cdnsDeployment(1, 1, nil))
+		cs.PrependReactor("list", "nodes",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("api down")
+			})
+		w := newCDNSWatchdog(cs)
+		if err := w.recover(ctx, []string{"cdns-a"}, 1); err == nil {
+			t.Fatal("expected error when the node list fails")
+		}
+	})
+
+	t.Run("rollout restart patch failure errors", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			cdnsPod("cdns-a", "10.0.0.1"),
+			cdnsDeployment(1, 1, nil))
+		cs.PrependReactor("patch", "deployments",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("patch rejected")
+			})
+		w := newCDNSWatchdog(cs)
+		if err := w.recover(ctx, []string{"cdns-a"}, 1); err == nil {
+			t.Fatal("expected error when the restart patch fails")
+		}
+	})
+
+	t.Run("stale pod delete failure errors", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
+			cdnsDeployment(2, 2, nil))
+		cs.PrependReactor("delete", "pods",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("delete rejected")
+			})
+		w := newCDNSWatchdog(cs)
+		if err := w.recover(ctx, []string{"cdns-a"}, 2); err == nil {
+			t.Fatal("expected error when the pod delete fails")
+		}
+	})
+}
+
+// bash: top-8 newest BEFORE the age filter — a fresh probe service
+// sitting 9th-by-age is never even queried.
+func TestCoreDNSProbeFQDNTop8Cap(t *testing.T) {
+	ready := true
+	var objs []runtime.Object
+	for i := 0; i < 8; i++ {
+		svc, _ := cdnsProbeService(
+			fmt.Sprintf("svc-%d", i), "app-ns",
+			time.Duration(i+1)*time.Minute, &ready) // no EndpointSlice -> skip
+		objs = append(objs, svc)
+	}
+	// 9th newest: the only one with a ready endpoint — unreachable
+	// behind the top-8 cap.
+	oldSvc, oldES := cdnsProbeService("svc-9th", "app-ns", 9*time.Minute, &ready)
+	objs = append(objs, oldSvc, oldES)
+	w := newCDNSWatchdog(fake.NewSimpleClientset(objs...))
+	if got := w.probeFQDN(ctx); got != "" {
+		t.Fatalf("probeFQDN=%q, want empty (9th-newest service must be capped)", got)
+	}
+}
+
+// An EndpointSlice list failure skips that service — other candidates
+// are still considered.
+func TestCoreDNSProbeFQDNSliceListError(t *testing.T) {
+	ready := true
+	svc, _ := cdnsProbeService("fresh-svc", "app-ns", 0, &ready)
+	cs := fake.NewSimpleClientset(svc)
+	cs.PrependReactor("list", "endpointslices",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	w := newCDNSWatchdog(cs)
+	if got := w.probeFQDN(ctx); got != "" {
+		t.Fatalf("probeFQDN=%q, want empty on slice list failure", got)
+	}
 }
 
 // ---------------------------------------------------------------------------

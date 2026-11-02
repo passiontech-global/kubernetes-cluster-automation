@@ -275,3 +275,72 @@ func TestRunProbeAddrInUse(t *testing.T) {
 		t.Fatalf("Run err=%v want 'probe listener' error", err)
 	}
 }
+
+func TestUptimeZeroBeforeStart(t *testing.T) {
+	// Before Run sets a.started, the uptime GaugeFunc must report 0
+	// rather than a negative/huge value.
+	reg := prometheus.NewRegistry()
+	New(Config{Registry: reg})
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "node_host_agent_uptime_seconds" {
+			continue
+		}
+		if got := mf.Metric[0].GetGauge().GetValue(); got != 0 {
+			t.Fatalf("uptime before start=%v want 0", got)
+		}
+		return
+	}
+	t.Fatal("node_host_agent_uptime_seconds missing")
+}
+
+// earlyReturnSubsystem's Run records invocation and returns
+// immediately without waiting for ctx — the supervisor must log the
+// unexpected exit and enter the restart backoff.
+type earlyReturnSubsystem struct {
+	ran chan struct{}
+}
+
+func (s *earlyReturnSubsystem) Name() string { return "early-return" }
+func (s *earlyReturnSubsystem) Run(context.Context) {
+	select {
+	case <-s.ran:
+	default:
+		close(s.ran)
+	}
+}
+
+func TestSubsystemEarlyReturnCancelDuringBackoff(t *testing.T) {
+	// Run returns while ctx is live → supervisor enters the 5s
+	// restart backoff; cancelling during that window exits cleanly.
+	ctx, cancel := context.WithCancel(context.Background())
+	sub := &earlyReturnSubsystem{ran: make(chan struct{})}
+	a := New(Config{
+		MetricsAddr: "127.0.0.1:0",
+		ProbeAddr:   "127.0.0.1:0",
+		Subsystems:  []Subsystem{sub},
+	})
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	deadline := time.After(5 * time.Second)
+	select {
+	case <-sub.ran:
+	case <-deadline:
+		t.Fatal("subsystem was never started")
+	}
+	// The supervisor is now inside the backoff select — cancel must
+	// take the ctx.Done branch, not wait 5s.
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-deadline:
+		t.Fatal("Run did not return after cancel during backoff")
+	}
+}

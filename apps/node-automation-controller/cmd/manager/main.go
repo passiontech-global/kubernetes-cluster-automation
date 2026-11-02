@@ -143,40 +143,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	ciliumEnabled := os.Getenv("CILIUM_TAINT_REAPER_ENABLED") == "true"
-	fluentbitEnabled := os.Getenv("FLUENTBIT_ROLLER_ENABLED") == "true"
-	certReaperEnabled := os.Getenv("CERTMANAGER_REAPER_ENABLED") == "true"
-	ciliumAuditEnabled := os.Getenv("CILIUM_IDENTITY_AUDITOR_ENABLED") == "true"
-	esNudgeEnabled := os.Getenv("EXTERNALSECRET_NUDGE_ENABLED") == "true"
-	csrApproveEnabled := os.Getenv("CSR_APPROVER_ENABLED") == "true"
-	labelerPath := getenv("NODE_LABELER_CONFIG_PATH", "/etc/node-labeler/labels.txt")
+	mc := moduleConfigFromEnv()
 
-	for name, setup := range map[string]func() error{
-		"konnectivity-patcher":     func() error { return controller.SetupKonnectivityPatcher(mgr, cs) },
-		"cilium-taint-reaper":      func() error { return controller.SetupCiliumTaintReaper(mgr, cs, ciliumEnabled) },
-		"descheduler-storm-gate":   func() error { return controller.SetupDeschedulerStormGate(mgr, cs) },
-		"node-labeler":             func() error { return controller.SetupNodeLabeler(mgr, cs, labelerPath) },
-		"fluent-bit-config-roller": func() error { return controller.SetupFluentBitRoller(mgr, cs, fluentbitEnabled) },
-		"coredns-stale-watchdog":   func() error { return controller.SetupCoreDNSWatchdog(mgr, cs) },
-		"kubelet-liveness-reaper":  func() error { return controller.SetupKubeletReaper(mgr, cs) },
-		"admission-webhook-guard":  func() error { return controller.SetupWebhookGuard(mgr, cs) },
-		"partition-pod-evictor":    func() error { return controller.SetupPartitionEvictor(mgr, cs) },
-		"failed-jobs-janitor":      func() error { return controller.SetupFailedJobsJanitor(mgr, cs) },
-		"converge-trigger":         func() error { return controller.SetupConvergeTrigger(mgr, cs) },
-		"dead-node-sweeper":        func() error { return controller.SetupDeadNodeSweeper(mgr, cs, dyn) },
-		"helmrelease-unlocker":     func() error { return controller.SetupHelmReleaseUnlocker(mgr, cs, dyn) },
-		"externalsecret-nudge":     func() error { return controller.SetupExternalSecretNudge(mgr, cs, dyn, esNudgeEnabled) },
-		"evicted-pod-janitor":      func() error { return controller.SetupEvictedPodJanitor(mgr, cs) },
-		"cronjob-catchup":          func() error { return controller.SetupCronJobCatchup(mgr, cs) },
-		"certmanager-reaper":       func() error { return controller.SetupCertManagerReaper(mgr, cs, dyn, certReaperEnabled) },
-		"cilium-identity-auditor":  func() error { return controller.SetupCiliumIdentityAuditor(mgr, cs, dyn, ciliumAuditEnabled) },
-		"csr-watcher":              func() error { return controller.SetupCSRWatcher(mgr, cs, csrApproveEnabled) },
-		"apiserver-endpoint-guard": func() error { return controller.SetupAPIServerEndpointGuard(mgr, cs) },
-	} {
-		if err := setup(); err != nil {
-			log.Error(err, "unable to setup module", "module", name)
-			os.Exit(1)
-		}
+	if err := setupModules(mgr, cs, dyn, mc); err != nil {
+		os.Exit(1)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -189,9 +159,71 @@ func main() {
 	}
 
 	log.Info("starting manager", "version", version,
-		"ciliumTaintReaper", ciliumEnabled, "fluentBitRoller", fluentbitEnabled)
+		"ciliumTaintReaper", mc.ciliumEnabled, "fluentBitRoller", mc.fluentbitEnabled)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited")
 		os.Exit(1)
 	}
+}
+
+// moduleConfig holds the env-resolved feature gates and config paths
+// the modules need — the same flags the shell-operator read from its
+// ConfigMaps (see header contract).
+type moduleConfig struct {
+	ciliumEnabled      bool
+	fluentbitEnabled   bool
+	certReaperEnabled  bool
+	ciliumAuditEnabled bool
+	esNudgeEnabled     bool
+	csrApproveEnabled  bool
+	labelerPath        string
+}
+
+// moduleConfigFromEnv resolves every feature-gate env var once, after
+// the clients exist and before any module is wired.
+func moduleConfigFromEnv() moduleConfig {
+	return moduleConfig{
+		ciliumEnabled:      os.Getenv("CILIUM_TAINT_REAPER_ENABLED") == "true",
+		fluentbitEnabled:   os.Getenv("FLUENTBIT_ROLLER_ENABLED") == "true",
+		certReaperEnabled:  os.Getenv("CERTMANAGER_REAPER_ENABLED") == "true",
+		ciliumAuditEnabled: os.Getenv("CILIUM_IDENTITY_AUDITOR_ENABLED") == "true",
+		esNudgeEnabled:     os.Getenv("EXTERNALSECRET_NUDGE_ENABLED") == "true",
+		csrApproveEnabled:  os.Getenv("CSR_APPROVER_ENABLED") == "true",
+		labelerPath:        getenv("NODE_LABELER_CONFIG_PATH", "/etc/node-labeler/labels.txt"),
+	}
+}
+
+// setupModules registers every node-ops module on the manager. The map
+// (not a slice) keeps registration order deliberately random — no
+// module may rely on another being wired first.
+func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, mc moduleConfig) error {
+	log := ctrl.Log.WithName("main")
+	for name, setup := range map[string]func() error{
+		"konnectivity-patcher":     func() error { return controller.SetupKonnectivityPatcher(mgr, cs) },
+		"cilium-taint-reaper":      func() error { return controller.SetupCiliumTaintReaper(mgr, cs, mc.ciliumEnabled) },
+		"descheduler-storm-gate":   func() error { return controller.SetupDeschedulerStormGate(mgr, cs) },
+		"node-labeler":             func() error { return controller.SetupNodeLabeler(mgr, cs, mc.labelerPath) },
+		"fluent-bit-config-roller": func() error { return controller.SetupFluentBitRoller(mgr, cs, mc.fluentbitEnabled) },
+		"coredns-stale-watchdog":   func() error { return controller.SetupCoreDNSWatchdog(mgr, cs) },
+		"kubelet-liveness-reaper":  func() error { return controller.SetupKubeletReaper(mgr, cs) },
+		"admission-webhook-guard":  func() error { return controller.SetupWebhookGuard(mgr, cs) },
+		"partition-pod-evictor":    func() error { return controller.SetupPartitionEvictor(mgr, cs) },
+		"failed-jobs-janitor":      func() error { return controller.SetupFailedJobsJanitor(mgr, cs) },
+		"converge-trigger":         func() error { return controller.SetupConvergeTrigger(mgr, cs) },
+		"dead-node-sweeper":        func() error { return controller.SetupDeadNodeSweeper(mgr, cs, dyn) },
+		"helmrelease-unlocker":     func() error { return controller.SetupHelmReleaseUnlocker(mgr, cs, dyn) },
+		"externalsecret-nudge":     func() error { return controller.SetupExternalSecretNudge(mgr, cs, dyn, mc.esNudgeEnabled) },
+		"evicted-pod-janitor":      func() error { return controller.SetupEvictedPodJanitor(mgr, cs) },
+		"cronjob-catchup":          func() error { return controller.SetupCronJobCatchup(mgr, cs) },
+		"certmanager-reaper":       func() error { return controller.SetupCertManagerReaper(mgr, cs, dyn, mc.certReaperEnabled) },
+		"cilium-identity-auditor":  func() error { return controller.SetupCiliumIdentityAuditor(mgr, cs, dyn, mc.ciliumAuditEnabled) },
+		"csr-watcher":              func() error { return controller.SetupCSRWatcher(mgr, cs, mc.csrApproveEnabled) },
+		"apiserver-endpoint-guard": func() error { return controller.SetupAPIServerEndpointGuard(mgr, cs) },
+	} {
+		if err := setup(); err != nil {
+			log.Error(err, "unable to setup module", "module", name)
+			return err
+		}
+	}
+	return nil
 }

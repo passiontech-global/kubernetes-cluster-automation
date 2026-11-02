@@ -279,3 +279,51 @@ func TestDescribe(t *testing.T) {
 		t.Fatalf("Describe emitted %d descs want 4", got)
 	}
 }
+
+func TestWatchdogSkipsNonRegularAndEmptyNames(t *testing.T) {
+	cfg, dirs := fixture(t)
+	// A directory named state-* is not a latch file — skipped by the
+	// IsRegular guard.
+	if err := os.MkdirAll(filepath.Join(dirs["state"], "state-dir-latch"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A file named exactly "state-" has an empty latch name — skipped.
+	write(t, filepath.Join(dirs["state"], "state-"), "1730000000\n")
+	// A real latch alongside — still collected.
+	write(t, filepath.Join(dirs["state"], "state-real"), "1730000000\n")
+	c := New(cfg)
+
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "real"}); !ok || v != 1 {
+		t.Fatalf("watchdog_state{real}=%v ok=%v want 1", v, ok)
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "dir-latch"}); ok {
+		t.Fatal("directory named state-* emitted a series")
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": ""}); ok {
+		t.Fatal("file named 'state-' emitted a series")
+	}
+}
+
+func TestWatchdogStateDirAbsentStillEmitsSeen(t *testing.T) {
+	// If the state dir disappears (node-watchdog removed), a
+	// previously-seen latch keeps exporting 0 — ReadDir error is
+	// tolerated, not fatal.
+	cfg, dirs := fixture(t)
+	latch := filepath.Join(dirs["state"], "state-net-fail")
+	write(t, latch, "1730000000\n")
+	c := New(cfg)
+	_, _ = metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "net-fail"})
+
+	if err := os.RemoveAll(dirs["state"]); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "net-fail"})
+	if !ok || v != 0 {
+		t.Fatalf("watchdog_state after dir removal=%v ok=%v want 0", v, ok)
+	}
+}

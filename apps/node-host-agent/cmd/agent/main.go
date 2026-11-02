@@ -111,29 +111,13 @@ func kubeClient() (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(cfg)
 }
 
-func main() {
-	var metricsAddr, probeAddr string
-	var showVersion bool
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9115",
-		"address the Prometheus metrics endpoint binds to")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
-		"address the health/readiness probe endpoints bind to")
-	flag.BoolVar(&showVersion, "version", false, "print version and exit")
-	flag.Parse()
-
-	if showVersion {
-		fmt.Println(version)
-		return
-	}
-
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	nodeName := getenv("NODE_NAME", "")
-	podName := getenv("POD_NAME", "")
-	namespace := getenv("POD_NAMESPACE", "")
+// buildAgentConfig wires the environment into an agent.Config: one
+// shared registry plus the subsystem list in startup order (sweeper,
+// apiprober). hostmetrics registers on the shared registry directly.
+// The bool reports whether apiprober was enabled — it feeds the
+// startup log line only.
+func buildAgentConfig(nodeName, podName, namespace, version,
+	metricsAddr, probeAddr string) (agent.Config, bool) {
 
 	// Shared registry: subsystems + collectors register on it, the
 	// agent serves it on /metrics.
@@ -222,7 +206,7 @@ func main() {
 		}))
 	}
 
-	a := agent.New(agent.Config{
+	return agent.Config{
 		NodeName:    nodeName,
 		PodName:     podName,
 		Namespace:   namespace,
@@ -231,7 +215,36 @@ func main() {
 		ProbeAddr:   probeAddr,
 		Registry:    reg,
 		Subsystems:  subsystems,
-	})
+	}, apiproberEnabled
+}
+
+func main() {
+	var metricsAddr, probeAddr string
+	var showVersion bool
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9115",
+		"address the Prometheus metrics endpoint binds to")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
+		"address the health/readiness probe endpoints bind to")
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
+	flag.Parse()
+
+	if showVersion {
+		fmt.Println(version)
+		return
+	}
+
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	nodeName := getenv("NODE_NAME", "")
+	podName := getenv("POD_NAME", "")
+	namespace := getenv("POD_NAMESPACE", "")
+
+	cfg, apiproberEnabled := buildAgentConfig(nodeName, podName,
+		namespace, version, metricsAddr, probeAddr)
+	a := agent.New(cfg)
 
 	slog.Info("starting node-host-agent",
 		"version", version, "node", a.NodeName(), "pod", podName,

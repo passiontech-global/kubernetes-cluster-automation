@@ -471,3 +471,22 @@ func TestChallengeLinkedToOrder(t *testing.T) {
 		})
 	}
 }
+
+// Malformed condition entries (non-map elements in
+// status.conditions) are skipped, not crashed on — cert objects
+// straight from unstructured conversion can carry anything.
+func TestCertNeedsReapNonMapCondition(t *testing.T) {
+	cert := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"conditions": []any{
+				"garbage",
+				42.0,
+				true,
+				map[string]any{"type": "Other", "status": "False"},
+			},
+		},
+	}}
+	if certNeedsReap(cert) {
+		t.Fatal("non-Ready / malformed conditions influenced the verdict")
+	}
+}

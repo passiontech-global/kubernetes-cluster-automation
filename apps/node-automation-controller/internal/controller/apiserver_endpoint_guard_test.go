@@ -6,11 +6,16 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/go-logr/logr"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/version"
+	fakediscovery "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
@@ -587,5 +592,526 @@ func TestEndpointGuardNoControllerIPs(t *testing.T) {
 	g := newEndpointGuard(cs, probeTable{}) // any probe call would error
 	if err := g.run(ctx); err != nil {
 		t.Fatalf("empty controller set must be a no-op: %v", err)
+	}
+}
+
+// Backend streak state for an IP that left the controller set is
+// pruned (and its metric series forgotten) — otherwise a removed
+// backend's streak could resurface as stale evidence on re-add.
+func TestEndpointGuardPrunesDepartedBackend(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": apiHealthyProbe(100),
+		"10.0.0.2": apiHealthyProbe(100),
+	})
+	g.backends["10.9.9.9"] = &backendProbeState{} // departed controller
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := g.backends["10.9.9.9"]; ok {
+		t.Fatal("streak state for departed backend not pruned")
+	}
+}
+
+// A wedged backend while ZERO other backends are healthy this cycle
+// gets SKIP-QUARANTINE — removing it could leave the Service with no
+// routable apiserver at all.
+func TestEndpointGuardSkipsQuarantineWithNoHealthyPeer(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
+		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	probes := probeTable{
+		"10.0.0.1": {err: errors.New("dead")},
+		// gapped but under the 2-cycle latch: not wedged AND not
+		// healthy — healthyActive stays 0 while 10.0.0.1 wedges.
+		"10.0.0.2": {liveRV: 1000, cacheRV: 100},
+	}
+	g := newEndpointGuard(cs, probes)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ep := getKubeEndpoints(t, cs)
+	if got := endpointAddrSet(ep); !got["10.0.0.1"] {
+		t.Fatalf("backend quarantined with no healthy peer, addresses=%v", got)
+	}
+	if ep.Annotations[endpointGuardAnno] != "" {
+		t.Fatalf("annotation = %q, want empty", ep.Annotations[endpointGuardAnno])
+	}
+}
+
+// An Endpoints object carrying no annotations at all must still take
+// the quarantine annotation — the guard initializes the map instead
+// of failing the mutation.
+func TestEndpointGuardQuarantinesAnnotationlessEndpoints(t *testing.T) {
+	ep := kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil)
+	ep.Annotations = nil
+	cs := fake.NewSimpleClientset(ep)
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	for i := 0; i < endpointGuardErrCycles; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ep = getKubeEndpoints(t, cs)
+	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("annotation = %q, want 10.0.0.1", ep.Annotations[endpointGuardAnno])
+	}
+}
+
+// The Endpoints update is the SSOT write — its failure aborts the
+// sweep so the EndpointSlice can never converge ahead of it.
+func TestEndpointGuardEndpointsUpdateError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
+		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cs.PrependReactor("update", "endpoints",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("update rejected")
+		})
+	if err := g.run(ctx); err == nil {
+		t.Fatal("expected error when the Endpoints update fails")
+	}
+}
+
+// A failed EndpointSlice update is logged/metered but NOT returned —
+// Endpoints already persisted the verdict and the next cycle
+// re-applies the slice diff.
+func TestEndpointGuardSliceUpdateErrorTolerated(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
+		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cs.PrependReactor("update", "endpointslices",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("slice update rejected")
+		})
+	if err := g.run(ctx); err != nil {
+		t.Fatalf("slice update failure must not fail the run: %v", err)
+	}
+	// Endpoints still converged — the slice retries next cycle.
+	ep := getKubeEndpoints(t, cs)
+	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("annotation = %q", ep.Annotations[endpointGuardAnno])
+	}
+}
+
+// probe() with no usable transport fails closed (apiProbeResult.err) —
+// transport() already covers the InClusterConfig error, this covers
+// the probe() early-return on it.
+func TestEndpointGuardProbeNoTransport(t *testing.T) {
+	g := &apiServerEndpointGuard{}
+	if res := g.probe(ctx, "10.0.0.1"); res.err == nil {
+		t.Fatal("probe succeeded without any transport")
+	}
+}
+
+// Start must survive a failing sweep (metered, loop continues) AND
+// switch cadence on the quarantine flag: cycle 1 errors with the flag
+// pre-armed -> 10s quarantine interval -> cycle 2 succeeds and resets
+// to 30s. Real-timer bound: ~40s (the 30s first tick is the code
+// under test — the fake's action log is the sync point, not a sleep).
+func TestEndpointGuardStartCycles(t *testing.T) {
+	cs := fake.NewSimpleClientset() // no Endpoints -> first sweep errors
+	// probed receives each backend IP the sweep probes — a probe call
+	// is the deterministic sync point for "run() got past the
+	// fetch/decide stage" where quarantineActive is (re)assigned; the
+	// clientset action count alone can't prove the sweep finished.
+	probed := make(chan string, 8)
+	g := &apiServerEndpointGuard{
+		cs: cs,
+		probeFn: func(_ context.Context, ip string) apiProbeResult {
+			probed <- ip
+			return *apiHealthyProbe(1)
+		},
+		backends: map[string]*backendProbeState{},
+		log:      logr.Discard(),
+		// Pre-arm the quarantine cadence so the 10s re-tick is
+		// exercised after the erroring sweep.
+		quarantineActive: true,
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- g.Start(cctx) }()
+
+	waitActions := func(want int) bool {
+		dl := time.Now().Add(endpointGuardInterval + endpointGuardQuarantineInterval + 10*time.Second)
+		for time.Now().Before(dl) {
+			if len(cs.Actions()) >= want {
+				return true
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		return false
+	}
+
+	// Cycle 1 (~30s tick): missing Endpoints -> run errors -> the
+	// error is metered/logged and the loop continues on the 10s
+	// quarantine cadence.
+	if !waitActions(1) {
+		t.Fatal("first sweep never ran")
+	}
+	// Seed a lone-backend Endpoints so the second (10s-cadence) sweep
+	// reaches the probe stage — its success clears quarantineActive
+	// and resets the interval to 30s (the else branch).
+	if _, err := cs.CoreV1().Endpoints(endpointGuardNS).Create(ctx,
+		kubeEndpoints([]string{"10.0.0.1"}, nil, nil), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed endpoints: %v", err)
+	}
+	select {
+	case <-probed:
+	case <-time.After(endpointGuardInterval + endpointGuardQuarantineInterval + 10*time.Second):
+		t.Fatal("second sweep never ran on the 10s quarantine cadence")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after cancel")
+	}
+	// Safe only now: run() writes quarantineActive on the Start
+	// goroutine — the done channel gives the happens-before edge.
+	if g.quarantineActive {
+		t.Fatal("empty controller set left quarantineActive set")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint API version gate — >=v1.33 runs the EndpointSlice as SSOT.
+// ---------------------------------------------------------------------------
+
+// fakeServerVersion pins the cluster version the guard detects; the
+// fake's default (client-go's own v0.0.0-master gitVersion) parses to
+// minor 0, which is why every test above exercises the Endpoints path.
+func fakeServerVersion(cs *fake.Clientset, major, minor string) {
+	cs.Discovery().(*fakediscovery.FakeDiscovery).FakedServerVersion =
+		&version.Info{Major: major, Minor: minor}
+}
+
+// kubeSliceWithQuarantine builds the kubernetes EndpointSlice carrying
+// the quarantine annotation — the SSOT layout on >=v1.33.
+func kubeSliceWithQuarantine(ips, quarantined []string) *discoveryv1.EndpointSlice {
+	eps := kubeEndpointSlice(ips)
+	if len(quarantined) > 0 {
+		eps.Annotations = map[string]string{
+			endpointGuardAnno: strings.Join(quarantined, ","),
+		}
+	}
+	return eps
+}
+
+// actionResources tallies clientset actions per resource — used to
+// prove the slice path never touches corev1 Endpoints.
+func actionResources(cs *fake.Clientset) map[string]int {
+	out := map[string]int{}
+	for _, a := range cs.Actions() {
+		out[a.GetResource().Resource]++
+	}
+	return out
+}
+
+// serverMinor parses the fake's pinned version; "33+" (GKE/EKS) and
+// GitVersion fallback are the edge cases.
+func TestEndpointGuardServerMinor(t *testing.T) {
+	cases := []struct {
+		name    string
+		info    *version.Info
+		want    int
+		wantErr bool
+	}{
+		{"plain", &version.Info{Major: "1", Minor: "32"}, 32, false},
+		{"new minor", &version.Info{Major: "1", Minor: "33"}, 33, false},
+		{"plus suffix", &version.Info{Major: "1", Minor: "33+"}, 33, false},
+		{"git fallback", &version.Info{Major: "1", Minor: "", GitVersion: "v1.34.1+k0s.1"}, 34, false},
+		{"unparseable", &version.Info{Major: "1", Minor: "", GitVersion: "custom"}, 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset()
+			cs.Discovery().(*fakediscovery.FakeDiscovery).FakedServerVersion = tc.info
+			got, err := serverMinor(cs)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("serverMinor(%+v) = %d, want error", tc.info, got)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("serverMinor(%+v) = %d, %v; want %d", tc.info, got, err, tc.want)
+			}
+		})
+	}
+}
+
+// endpointMode caches a successful detection and retries a failed one.
+func TestEndpointGuardEndpointModeCache(t *testing.T) {
+	calls := 0
+	minor := 33
+	var fail error
+	g := &apiServerEndpointGuard{
+		serverMinorFn: func() (int, error) {
+			calls++
+			return minor, fail
+		},
+	}
+	use, err := g.endpointMode()
+	if err != nil || !use {
+		t.Fatalf("endpointMode = %v, %v; want true, nil", use, err)
+	}
+	minor = 20 // flip the source — the cached decision must not move
+	use, err = g.endpointMode()
+	if err != nil || !use {
+		t.Fatalf("cached endpointMode = %v, %v; want true, nil", use, err)
+	}
+	if calls != 1 {
+		t.Fatalf("serverMinorFn called %d times, want 1 (cached)", calls)
+	}
+
+	fail = errors.New("discovery down")
+	g2 := &apiServerEndpointGuard{
+		serverMinorFn: func() (int, error) { calls++; return 0, fail },
+	}
+	for i := 0; i < 2; i++ {
+		if use, err := g2.endpointMode(); use || err == nil {
+			t.Fatalf("endpointMode on error = %v, %v; want false, err", use, err)
+		}
+	}
+	if calls != 3 {
+		t.Fatalf("detection errors must not be cached, calls = %d", calls)
+	}
+}
+
+// sliceIPs dedupes/sorts all endpoint addresses including Ready=false.
+func TestEndpointGuardSliceIPs(t *testing.T) {
+	eps := kubeEndpointSlice([]string{"10.0.0.3", "10.0.0.1"})
+	notReady := false
+	eps.Endpoints = append(eps.Endpoints, discoveryv1.Endpoint{
+		Addresses:  []string{"10.0.0.2"},
+		Conditions: discoveryv1.EndpointConditions{Ready: &notReady},
+	})
+	// A second endpoint repeating an IP must dedupe.
+	eps.Endpoints = append(eps.Endpoints, discoveryv1.Endpoint{
+		Addresses: []string{"10.0.0.1"},
+	})
+	got := sliceIPs(eps)
+	want := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sliceIPs = %v, want %v", got, want)
+	}
+}
+
+// >=v1.33: the wedge verdict lands on the EndpointSlice — IP removed,
+// annotation recorded — while corev1 Endpoints is never even read.
+func TestEndpointGuardSliceModeQuarantine(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
+		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	fakeServerVersion(cs, "1", "33")
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	for i := 0; i < endpointGuardErrCycles; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	eps := getKubeSlice(t, cs)
+	if sliceAddrSet(eps)["10.0.0.1"] {
+		t.Fatal("wedged IP still in EndpointSlice")
+	}
+	if eps.Annotations[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("slice annotation = %q, want 10.0.0.1",
+			eps.Annotations[endpointGuardAnno])
+	}
+	// The deprecated object must stay untouched — no reads, no writes.
+	if acts := actionResources(cs)["endpoints"]; acts != 0 {
+		t.Fatalf("%d endpoints actions on the slice path, want 0", acts)
+	}
+	ep := getKubeEndpoints(t, cs)
+	if !endpointAddrSet(ep)["10.0.0.1"] {
+		t.Fatal("Endpoints object was mutated on the slice path")
+	}
+}
+
+// A quarantined slice backend probing healthy for 2 cycles is
+// re-added to the slice and dropped from its annotation.
+func TestEndpointGuardSliceModeReaddsRecovered(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeSliceWithQuarantine([]string{"10.0.0.2"}, []string{"10.0.0.1"}))
+	fakeServerVersion(cs, "1", "34")
+	probes := probeTable{
+		"10.0.0.1": apiHealthyProbe(1000),
+		"10.0.0.2": apiHealthyProbe(1000),
+	}
+	g := newEndpointGuard(cs, probes)
+	for i := 0; i < endpointGuardRecoverCyc; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	eps := getKubeSlice(t, cs)
+	if !sliceAddrSet(eps)["10.0.0.1"] {
+		t.Fatalf("recovered backend not re-added to slice: %v", sliceAddrSet(eps))
+	}
+	if _, ok := eps.Annotations[endpointGuardAnno]; ok {
+		t.Fatalf("annotation left after recovery: %q",
+			eps.Annotations[endpointGuardAnno])
+	}
+}
+
+// Missing SSOT object fails the cycle on the slice path exactly like
+// a missing Endpoints does on the old path.
+func TestEndpointGuardSliceModeMissingSlice(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	fakeServerVersion(cs, "1", "33")
+	g := newEndpointGuard(cs, probeTable{})
+	if err := g.run(ctx); err == nil {
+		t.Fatal("expected error when the EndpointSlice object is missing")
+	}
+}
+
+// Slice-path fail-closed: a wedged IP with no healthy peer is never
+// pulled — removing it would empty the slice.
+func TestEndpointGuardSliceModeKeepsSoleHealthy(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeSliceWithQuarantine([]string{"10.0.0.2"}, []string{"10.0.0.1"}))
+	fakeServerVersion(cs, "1", "33")
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": {err: errors.New("still down")},
+		"10.0.0.2": {err: errors.New("just wedged")},
+	})
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := sliceAddrSet(getKubeSlice(t, cs)); !got["10.0.0.2"] {
+		t.Fatal("sole remaining backend quarantined — slice would be empty")
+	}
+}
+
+// A slice-update failure is the SSOT write failing — it aborts the
+// cycle with an error (unlike the best-effort mirror on the old path).
+func TestEndpointGuardSliceModeUpdateError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	fakeServerVersion(cs, "1", "33")
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cs.PrependReactor("update", "endpointslices",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("update rejected")
+		})
+	if err := g.run(ctx); err == nil {
+		t.Fatal("expected error when the EndpointSlice update fails")
+	}
+}
+
+// If the reconciler rebuilds the SSOT object and drops the annotation
+// mid-incident, the in-memory copy still tracks the quarantined IP —
+// it stays probed and quarantineActive stays armed.
+func TestEndpointGuardMemQuarantineSurvivesAnnotationLoss(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
+		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	probed := map[string]int{}
+	probes := probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	}
+	g := &apiServerEndpointGuard{
+		cs: cs,
+		probeFn: func(_ context.Context, ip string) apiProbeResult {
+			probed[ip]++
+			return probes.fn(context.Background(), ip)
+		},
+		backends: map[string]*backendProbeState{},
+	}
+	// +1 cycle: quarantineActive reflects the annotation read at the
+	// START of a run, so it only arms on the cycle after the persist.
+	for i := 0; i < endpointGuardErrCycles+1; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !g.quarantineActive {
+		t.Fatal("quarantine did not arm")
+	}
+	// Simulate the reconciler rebuilding the object without the
+	// annotation (and without re-adding the pulled IP yet).
+	ep := getKubeEndpoints(t, cs)
+	ep = ep.DeepCopy()
+	delete(ep.Annotations, endpointGuardAnno)
+	if _, err := cs.CoreV1().Endpoints(endpointGuardNS).
+		Update(ctx, ep, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	probed = map[string]int{}
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !g.quarantineActive {
+		t.Fatal("memQuarantine failed to keep the pulled IP tracked")
+	}
+	if probed["10.0.0.1"] != 1 {
+		t.Fatalf("quarantined IP probed %d times, want 1", probed["10.0.0.1"])
+	}
+	// Still wedged -> the pulled IP stays out of the object.
+	if got := endpointAddrSet(getKubeEndpoints(t, cs)); got["10.0.0.1"] {
+		t.Fatal("wedged backend back in endpoints while still failing")
+	}
+}
+
+// endpointMode detection failure falls back to the Endpoints path —
+// the sweep still functions on a cluster whose /version is broken.
+func TestEndpointGuardVersionUndetectableFallsBack(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
+		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	g.serverMinorFn = func() (int, error) {
+		return 0, errors.New("version endpoint gone")
+	}
+	for i := 0; i < endpointGuardErrCycles; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ep := getKubeEndpoints(t, cs)
+	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("fallback did not run the Endpoints path, annotation = %q",
+			ep.Annotations[endpointGuardAnno])
 	}
 }

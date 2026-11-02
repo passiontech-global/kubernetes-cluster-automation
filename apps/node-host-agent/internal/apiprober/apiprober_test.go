@@ -3,6 +3,7 @@ package apiprober
 import (
 	"context"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -932,5 +934,595 @@ func TestVIPMaintReEnabledWhenControllersHealthy(t *testing.T) {
 
 	if !hasCmd(ha.commands(), "enable server kube_apiserver/api_datahub_lb") {
 		t.Fatalf("no enable for healthy VIP, cmds=%v", ha.commands())
+	}
+}
+
+// errConn is a net.Conn whose Read/Write fail with the configured
+// errors — exercises socketCmd's write/read failure paths without a
+// real socket.
+type errConn struct {
+	readErr  error
+	writeErr error
+}
+
+func (c errConn) Read([]byte) (int, error)         { return 0, c.readErr }
+func (c errConn) Write([]byte) (int, error)        { return 0, c.writeErr }
+func (c errConn) Close() error                     { return nil }
+func (c errConn) LocalAddr() net.Addr              { return nil }
+func (c errConn) RemoteAddr() net.Addr             { return nil }
+func (c errConn) SetDeadline(time.Time) error      { return nil }
+func (c errConn) SetReadDeadline(time.Time) error  { return nil }
+func (c errConn) SetWriteDeadline(time.Time) error { return nil }
+
+// rtFunc adapts a func to http.RoundTripper for transport error
+// injection.
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// errBody is a response body that fails on Read.
+type errBody struct{}
+
+func (errBody) Read([]byte) (int, error) { return 0, errors.New("body read boom") }
+func (errBody) Close() error             { return nil }
+
+func TestSocketCmdFailureModes(t *testing.T) {
+	boom := errors.New("socket boom")
+
+	t.Run("dial error", func(t *testing.T) {
+		p, err := New(Config{
+			DialSocket: func(context.Context, string) (net.Conn, error) {
+				return nil, boom
+			},
+			HTTPClient: newAPIStub(t).srv.Client(),
+		}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.socketCmd(context.Background(), "show stat"); err == nil {
+			t.Fatal("socketCmd with failing dial want error")
+		}
+	})
+
+	t.Run("write error", func(t *testing.T) {
+		p, err := New(Config{
+			DialSocket: func(context.Context, string) (net.Conn, error) {
+				return errConn{writeErr: boom}, nil
+			},
+			HTTPClient: newAPIStub(t).srv.Client(),
+		}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.socketCmd(context.Background(), "show stat"); err == nil {
+			t.Fatal("socketCmd with failing write want error")
+		}
+	})
+
+	t.Run("read error", func(t *testing.T) {
+		p, err := New(Config{
+			DialSocket: func(context.Context, string) (net.Conn, error) {
+				return errConn{readErr: boom}, nil
+			},
+			HTTPClient: newAPIStub(t).srv.Client(),
+		}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.socketCmd(context.Background(), "show stat"); err == nil {
+			t.Fatal("socketCmd with failing read want error")
+		}
+	})
+}
+
+func TestDiscoverMalformedStat(t *testing.T) {
+	mkProber := func(t *testing.T, reply string) *Prober {
+		t.Helper()
+		p, err := New(Config{
+			DialSocket:  pipeDial(reply),
+			BackendName: "kube_apiserver",
+			HTTPClient:  newAPIStub(t).srv.Client(),
+		}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	t.Run("empty reply means no header", func(t *testing.T) {
+		_, err := mkProber(t, "").discover(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "no CSV header") {
+			t.Fatalf("discover err=%v want 'no CSV header'", err)
+		}
+	})
+
+	t.Run("short row has no addr", func(t *testing.T) {
+		// Row shorter than the header: get() hits the i>=len(fields)
+		// guard and returns "" for addr.
+		csv := "# pxname,svname,status,addr\nkube_apiserver,hub1\n"
+		_, err := mkProber(t, csv).discover(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "no addr") {
+			t.Fatalf("discover err=%v want 'no addr'", err)
+		}
+	})
+}
+
+func TestSocketFlapAcrossCycles(t *testing.T) {
+	// The api-local-lb admin socket can be absent at agent start and
+	// appear later (socket appears mid-run): discover fails closed and
+	// recovers on the next cycle.
+	ha := newFakeHAProxy(t, [2]string{"hub1", "127.0.0.1:1"})
+	var sockDown atomic.Bool
+	sockDown.Store(true)
+	p, err := New(Config{
+		SocketPath:  ha.sockPath,
+		BackendName: "kube_apiserver",
+		DialSocket: func(ctx context.Context, path string) (net.Conn, error) {
+			if sockDown.Load() {
+				return nil, errors.New("admin socket gone")
+			}
+			d := net.Dialer{Timeout: time.Second}
+			return d.DialContext(ctx, "unix", path)
+		},
+		HTTPClient: newAPIStub(t).srv.Client(),
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p.Cycle(context.Background())
+	if got := testutil.ToFloat64(p.cycles.WithLabelValues("discover_fail")); got != 1 {
+		t.Fatalf("discover_fail=%v want 1 while socket absent", got)
+	}
+	if got := testutil.ToFloat64(p.backendCount); got != 0 {
+		t.Fatalf("backendCount=%v want 0", got)
+	}
+
+	// api-local-lb installed mid-run → the next cycle discovers it.
+	sockDown.Store(false)
+	p.Cycle(context.Background())
+	if got := testutil.ToFloat64(p.cycles.WithLabelValues("ok")); got != 1 {
+		t.Fatalf("cycles ok=%v want 1 after socket appeared", got)
+	}
+	if got := testutil.ToFloat64(p.backendCount); got != 1 {
+		t.Fatalf("backendCount=%v want 1", got)
+	}
+}
+
+func TestRunTicksCycles(t *testing.T) {
+	// The ticker branch: Interval small enough to fire within the
+	// test deadline — cycles accumulate, then cancel stops Run.
+	ha := newFakeHAProxy(t)
+	p := fixture(t, ha, ModeDryRun, nil)
+	p.cfg.Interval = 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { p.Run(ctx); close(done) }()
+
+	deadline := time.After(5 * time.Second)
+	for testutil.ToFloat64(p.cycles.WithLabelValues("ok")) < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("ticker cycles never ran")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-deadline:
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestCycleReturnsOnCancelledCtx(t *testing.T) {
+	// Discover succeeds, then the backend loop bails on ctx.Err() —
+	// the per-backend check, not a discover failure. The pipeDial
+	// seam ignores ctx so `show stat` still answers.
+	ha := newFakeHAProxy(t, [2]string{"hub1", "127.0.0.1:1"})
+	p := fixture(t, ha, ModeDryRun, nil)
+	p.cfg.DialSocket = pipeDial(ha.statCSV())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p.Cycle(ctx)
+
+	if got := testutil.ToFloat64(p.cycles.WithLabelValues("ok")); got != 1 {
+		t.Fatalf("cycles ok=%v want 1 (discover completed)", got)
+	}
+}
+
+func TestHaproxyServerSocketError(t *testing.T) {
+	// A dial failure inside socketCmd propagates out of haproxyServer.
+	p, err := New(Config{
+		DialSocket: func(context.Context, string) (net.Conn, error) {
+			return nil, errors.New("socket gone")
+		},
+		HTTPClient: newAPIStub(t).srv.Client(),
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.haproxyServer(context.Background(), "disable", "hub1"); err == nil {
+		t.Fatal("haproxyServer with dead socket want error")
+	}
+}
+
+func TestListRVTransportErrors(t *testing.T) {
+	boom := errors.New("transport boom")
+
+	t.Run("bad url", func(t *testing.T) {
+		p, err := New(Config{
+			HTTPClient: newAPIStub(t).srv.Client(),
+		}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A space in the host makes http.NewRequest fail before any
+		// dial — covers the request-build error return.
+		if rv, ok := p.listRV(context.Background(), "bad addr", "/x"); ok || rv != 0 {
+			t.Fatalf("listRV(bad url) = %d, %v want 0, false", rv, ok)
+		}
+	})
+
+	t.Run("roundtrip error", func(t *testing.T) {
+		p, err := New(Config{
+			HTTPClient: &http.Client{Transport: rtFunc(
+				func(*http.Request) (*http.Response, error) { return nil, boom })},
+		}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rv, ok := p.listRV(context.Background(), "127.0.0.1:6443", "/x"); ok || rv != 0 {
+			t.Fatalf("listRV(transport err) = %d, %v want 0, false", rv, ok)
+		}
+	})
+
+	t.Run("body read error", func(t *testing.T) {
+		p, err := New(Config{
+			HTTPClient: &http.Client{Transport: rtFunc(
+				func(*http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       errBody{},
+					}, nil
+				})},
+		}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rv, ok := p.listRV(context.Background(), "127.0.0.1:6443", "/x"); ok || rv != 0 {
+			t.Fatalf("listRV(body err) = %d, %v want 0, false", rv, ok)
+		}
+	})
+}
+
+func TestListRVParseAndTimeout(t *testing.T) {
+	// Inject each server client so the token-file branch is skipped —
+	// the failures under test happen after the response arrives.
+	mkProber := func(t *testing.T, body string) (*Prober, string) {
+		t.Helper()
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			io.WriteString(w, body)
+		}))
+		t.Cleanup(srv.Close)
+		p, err := New(Config{HTTPClient: srv.Client()}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p, strings.TrimPrefix(srv.URL, "https://")
+	}
+
+	t.Run("unparseable json", func(t *testing.T) {
+		p, addr := mkProber(t, `this is not json`)
+		if rv, ok := p.listRV(context.Background(), addr, "/x"); ok || rv != 0 {
+			t.Fatalf("listRV(not json) = %d, %v want 0, false", rv, ok)
+		}
+	})
+
+	t.Run("non numeric rv", func(t *testing.T) {
+		p, addr := mkProber(t, `{"metadata":{"resourceVersion":"abc"}}`)
+		if rv, ok := p.listRV(context.Background(), addr, "/x"); ok || rv != 0 {
+			t.Fatalf("listRV(non-numeric rv) = %d, %v want 0, false", rv, ok)
+		}
+	})
+
+	t.Run("non-200 with injected client", func(t *testing.T) {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer srv.Close()
+		p, err := New(Config{HTTPClient: srv.Client()}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rv, ok := p.listRV(context.Background(),
+			strings.TrimPrefix(srv.URL, "https://"), "/x"); ok || rv != 0 {
+			t.Fatalf("listRV(503) = %d, %v want 0, false", rv, ok)
+		}
+	})
+
+	t.Run("query timeout", func(t *testing.T) {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done() // hang until the client gives up
+		}))
+		defer srv.Close()
+		p, err := New(Config{HTTPClient: srv.Client()}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.cfg.QueryTimeout = 30 * time.Millisecond
+		if rv, ok := p.listRV(context.Background(),
+			strings.TrimPrefix(srv.URL, "https://"), "/x"); ok || rv != 0 {
+			t.Fatalf("listRV(timeout) = %d, %v want 0, false", rv, ok)
+		}
+	})
+}
+
+func TestNewTLSVerifyWithValidCA(t *testing.T) {
+	// Verify-TLS + a readable CA bundle → RootCAs installed, New
+	// succeeds (the remaining branch of the CA-load guard).
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer srv.Close()
+	pemFile := filepath.Join(t.TempDir(), "ca.pem")
+	der := srv.TLS.Certificates[0].Certificate[0]
+	if err := os.WriteFile(pemFile,
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(Config{InsecureTLS: false, CAFile: pemFile},
+		prometheus.NewRegistry())
+	if err != nil || p == nil {
+		t.Fatalf("New(verify, valid CA) = %v, %v", p, err)
+	}
+}
+
+func TestNewRegisterError(t *testing.T) {
+	// A conflicting metric name in the registry makes New fail
+	// instead of leaving half-registered collectors.
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_apiprober_backends",
+	}))
+	_, err := New(Config{HTTPClient: newAPIStub(t).srv.Client()}, reg)
+	if err == nil || !strings.Contains(err.Error(), "register apiprober metrics") {
+		t.Fatalf("New err=%v want 'register apiprober metrics'", err)
+	}
+}
+
+func TestDryRunEnableOnRecovery(t *testing.T) {
+	// Dry-run recovery: a MAINT backend with RecoverCycles fresh
+	// probes logs "would enable" without touching the socket.
+	fresh1 := newAPIStub(t)
+	fresh2 := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", fresh1.addr()},
+		[2]string{"hub2", fresh2.addr()},
+	)
+	ha.disabled["hub1"] = true // externally drained
+	p := fixture(t, ha, ModeDryRun, nil)
+
+	fresh1.set(50, 50)
+	fresh2.set(60, 60)
+	for i := 0; i < 3; i++ { // RecoverCycles
+		p.Cycle(context.Background())
+	}
+
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "dryrun_enable")); got < 1 {
+		t.Fatalf("dryrun_enable=%v want >=1", got)
+	}
+	for _, c := range ha.commands() {
+		if !strings.HasPrefix(c, "show stat") {
+			t.Fatalf("dry-run issued socket action: %v", ha.commands())
+		}
+	}
+}
+
+func TestEnableAfterHAProxyRestartCountsFresh(t *testing.T) {
+	// Backend we drained shows UP again (HAProxy restart forgot the
+	// disable) AND its probes recover: the successful enable path
+	// counts the backend fresh again.
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	bad.set(100, 200)
+	good.set(50, 50)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	if !p.states["hub1"].drained {
+		t.Fatal("hub1 not drained after wedge")
+	}
+
+	// HAProxy restart forgets the runtime disable → hub1 reports UP
+	// again; its probes recover at the same time.
+	ha.mu.Lock()
+	ha.disabled["hub1"] = false
+	ha.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		bad.set(300+int64(i), 300)
+		p.Cycle(context.Background())
+	}
+
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "enable")); got != 1 {
+		t.Fatalf("actions enable=%v want 1", got)
+	}
+	if p.states["hub1"].drained {
+		t.Fatal("drained flag still set after successful enable")
+	}
+}
+
+func TestDrainDisableFailureLeavesUndrained(t *testing.T) {
+	// A wedged backend whose `disable server` is rejected stays
+	// un-drained — the guard must not record an action that never
+	// happened.
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	ha.failReply = map[string]string{"disable server": "socket read only\n"}
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	bad.set(100, 200)
+	good.set(50, 50)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+
+	if !hasCmd(ha.commands(), "disable server kube_apiserver/hub1") {
+		t.Fatalf("disable never attempted, cmds=%v", ha.commands())
+	}
+	if p.states["hub1"].drained {
+		t.Fatal("drained flag set despite failed disable")
+	}
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 0 {
+		t.Fatalf("actions disable=%v want 0 (all disables failed)", got)
+	}
+}
+
+func TestReApplyDisableFailure(t *testing.T) {
+	// Drained backend shows UP again after a HAProxy restart while
+	// still wedged → re-apply is attempted; when the socket rejects
+	// it, the error branch is taken and drained stays set.
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	bad.set(100, 200)
+	good.set(50, 50)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	if countCmd(ha.commands(), "disable server kube_apiserver/hub1") != 1 {
+		t.Fatalf("expected 1 disable, cmds=%v", ha.commands())
+	}
+
+	// HAProxy restart forgets the disable AND the socket now rejects
+	// further disables; the backend is still wedged → re-apply fails.
+	ha.mu.Lock()
+	ha.disabled["hub1"] = false
+	ha.failReply = map[string]string{"disable server": "permission denied\n"}
+	ha.mu.Unlock()
+	p.Cycle(context.Background())
+
+	if got := countCmd(ha.commands(), "disable server kube_apiserver/hub1"); got != 2 {
+		t.Fatalf("re-apply attempts=%d want 2, cmds=%v", got, ha.commands())
+	}
+	if !p.states["hub1"].drained {
+		t.Fatal("drained flag cleared despite failed re-apply")
+	}
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 1 {
+		t.Fatalf("actions disable=%v want 1 (re-apply failed)", got)
+	}
+}
+
+func TestVIPDisableFailureLeavesUPEnabled(t *testing.T) {
+	// A wedged controller triggers a VIP disable, but the socket
+	// rejects it — the VIP must keep serving (enabled stays 1).
+	ctrl1 := newAPIStub(t)
+	ctrl2 := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"api_datahub_ctrl", ctrl1.addr()},
+		[2]string{"api_datahub_lb", "127.0.0.1:1"},
+		[2]string{"api_contabo_ctrl", ctrl2.addr()},
+	)
+	ha.failReply = map[string]string{"disable server": "permission denied\n"}
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	ctrl1.set(500, 500)
+	ctrl2.set(100, 3000)
+	for i := 0; i < 2; i++ {
+		p.Cycle(context.Background())
+	}
+
+	if !hasCmd(ha.commands(), "disable server kube_apiserver/api_datahub_lb") {
+		t.Fatalf("VIP disable never attempted, cmds=%v", ha.commands())
+	}
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "disable")); got != 0 {
+		t.Fatalf("VIP actions disable=%v want 0 (disable failed)", got)
+	}
+	if got := testutil.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 1 {
+		t.Fatalf("enabled{api_datahub_lb}=%v want 1 (still serving)", got)
+	}
+	if p.states["api_datahub_lb"].drained {
+		t.Fatal("VIP drained flag set despite failed disable")
+	}
+}
+
+func TestVIPEnableFailure(t *testing.T) {
+	// A MAINT VIP with healthy controllers gets an enable attempt;
+	// when the socket rejects it the VIP stays MAINT — no action
+	// recorded, flag unchanged.
+	ctrl := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"api_datahub_ctrl", ctrl.addr()},
+		[2]string{"api_datahub_lb", "127.0.0.1:1"},
+	)
+	ha.disabled["api_datahub_lb"] = true
+	ha.failReply = map[string]string{"enable server": "permission denied\n"}
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	ctrl.set(50, 50)
+	p.Cycle(context.Background())
+
+	if !hasCmd(ha.commands(), "enable server kube_apiserver/api_datahub_lb") {
+		t.Fatalf("VIP enable never attempted, cmds=%v", ha.commands())
+	}
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "enable")); got != 0 {
+		t.Fatalf("VIP actions enable=%v want 0 (enable failed)", got)
+	}
+	if got := testutil.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 0 {
+		t.Fatalf("enabled{api_datahub_lb}=%v want 0 (still MAINT)", got)
+	}
+}
+
+func TestVIPDryRunTransitions(t *testing.T) {
+	// Dry-run VIP transitions: wedge → dryrun_disable (which marks
+	// drained in memory), recovery → dryrun_enable. No real socket
+	// action is ever issued.
+	ctrl1 := newAPIStub(t)
+	ctrl2 := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"api_datahub_ctrl", ctrl1.addr()},
+		[2]string{"api_datahub_lb", "127.0.0.1:1"},
+		[2]string{"api_contabo_ctrl", ctrl2.addr()},
+	)
+	p := fixture(t, ha, ModeDryRun, nil)
+
+	ctrl1.set(500, 500)
+	ctrl2.set(100, 3000)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "dryrun_disable")); got != 1 {
+		t.Fatalf("VIP dryrun_disable=%v want 1", got)
+	}
+
+	// Controllers healthy again → the (in-memory) drained VIP is
+	// re-enabled in dry-run terms.
+	ctrl2.set(500, 500)
+	for i := 0; i < 4; i++ { // RecoverCycles=3 for the direct ctrl
+		p.Cycle(context.Background())
+	}
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "dryrun_enable")); got != 1 {
+		t.Fatalf("VIP dryrun_enable=%v want 1", got)
+	}
+	for _, c := range ha.commands() {
+		if !strings.HasPrefix(c, "show stat") {
+			t.Fatalf("dry-run issued socket action: %v", ha.commands())
+		}
 	}
 }

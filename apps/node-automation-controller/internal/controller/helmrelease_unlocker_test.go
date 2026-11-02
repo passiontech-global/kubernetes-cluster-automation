@@ -515,3 +515,28 @@ func TestHRNameAndNamespaceFallbacks(t *testing.T) {
 		t.Fatalf("hrTargetNS = %q, want target-ns", got)
 	}
 }
+
+// Release secrets with only deployed/superseded revisions — no
+// pending-* — mean the deadlock signature is absent: clean skip, no
+// delete, no annotate.
+func TestHelmReleaseUnlockerNoPendingSecret(t *testing.T) {
+	hr := hrObj("apps", "myapp", "v2")
+	hrTarget(hr, "apps")
+	cs := kfake.NewSimpleClientset(
+		helmRelSecret("apps", "sh.helm.release.v1.myapp.v1", "myapp", 1, "deployed"),
+		helmRelSecret("apps", "sh.helm.release.v1.myapp.v2", "myapp", 2, "superseded"))
+	dyn := newDynFake(hr)
+	u := newUnlocker(cs, dyn, 0, "")
+	if err := u.unlock(ctx, helmReleaseGVRs[0], hr); err != nil {
+		t.Fatalf("absent pending secret must be a clean skip: %v", err)
+	}
+	for _, name := range []string{
+		"sh.helm.release.v1.myapp.v1", "sh.helm.release.v1.myapp.v2"} {
+		if !secretExists(t, cs, "apps", name) {
+			t.Fatalf("non-pending secret %s touched", name)
+		}
+	}
+	if got := hrAnnotation(t, dyn, helmReleaseGVRs[0], "apps", "myapp", fluxReconcileAnno); got != "" {
+		t.Fatal("reconcile requested despite no pending release")
+	}
+}

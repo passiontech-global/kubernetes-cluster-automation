@@ -339,3 +339,29 @@ func TestCronJobCatchupBareJobTemplate(t *testing.T) {
 		t.Fatalf("instantiate annotation missing on bare template: %v", j.Annotations)
 	}
 }
+
+// A CronJob list failure aborts the sweep — the periodic wrapper
+// meters the error.
+func TestCronJobCatchupListError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "cronjobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	c := newCatchup(cs)
+	if err := c.run(ctx); err == nil {
+		t.Fatal("expected error when the cronjob list fails")
+	}
+}
+
+// capped lazily initializes the daily-cap map — a reconciler built
+// without Setup (e.g. an early test construct) must not panic.
+func TestCronJobCatchupCappedLazyInit(t *testing.T) {
+	c := &cronJobCatchup{} // lastCatchup nil
+	if c.capped("ops/nightly") {
+		t.Fatal("never-fired cronjob reported as capped")
+	}
+	if c.lastCatchup == nil {
+		t.Fatal("cap map not lazily initialized")
+	}
+}

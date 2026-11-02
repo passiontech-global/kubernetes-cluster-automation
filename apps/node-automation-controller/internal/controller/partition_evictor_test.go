@@ -309,3 +309,50 @@ func TestPartitionEvictorPodDeleteErrorTolerated(t *testing.T) {
 		t.Fatal("flagged node not tainted")
 	}
 }
+
+// A failed recovery-untaint is logged and the sweep continues —
+// per-node errors are never fatal (same as bash).
+func TestPartitionEvictorUntaintErrorTolerated(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("h1", corev1.ConditionTrue, nil,
+			corev1.Taint{Key: partitionTaintKey, Value: "true",
+				Effect: corev1.TaintEffectNoSchedule}))
+	cs.PrependReactor("patch", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatalf("untaint failure must not fail the run: %v", err)
+	}
+	if !hasTaint(getNode(t, cs, "h1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("taint removed despite the rejected patch")
+	}
+}
+
+// A failed partition taint is logged ("taint failed") and the node
+// still gets its pod sweep — the pod list afterwards must not be
+// skipped by the taint error.
+func TestPartitionEvictorTaintErrorStillSweepsPods(t *testing.T) {
+	objs := append(
+		[]runtime.Object{
+			pePartitionedNode("p1", "ClusterNetworkProblems", 20*time.Minute),
+			pePod("flux-system", "p1", "src-ctrl"),
+		},
+		peHealthyNodes("h", 3)...)
+	cs := fake.NewSimpleClientset(objs...)
+	cs.PrependReactor("patch", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatalf("taint failure must not fail the run: %v", err)
+	}
+	if hasTaint(getNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("taint applied despite the rejected patch")
+	}
+	if pePodExists(t, cs, "flux-system", "src-ctrl") {
+		t.Fatal("pod on partitioned node not evicted after the taint failure")
+	}
+}

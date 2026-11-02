@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -347,6 +348,131 @@ func TestDeadNodeSweeperMissingNode(t *testing.T) {
 
 	if err := s.run(ctx); err != nil {
 		t.Fatalf("missing node must be a skip, not a run failure: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// run() failure tolerances — per-node errors are logged/metered, the
+// sweep continues and still returns nil.
+// ---------------------------------------------------------------------------
+
+func TestDeadNodeSweeperNodeListError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), nil)
+	if err := s.run(ctx); err == nil {
+		t.Fatal("expected error when the node list fails")
+	}
+}
+
+func TestDeadNodeSweeperPodListError(t *testing.T) {
+	cs := fake.NewSimpleClientset(node("w1", corev1.ConditionTrue, nil))
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), nil)
+	if err := s.run(ctx); err == nil {
+		t.Fatal("expected error when the pod list fails")
+	}
+}
+
+// A Ready node carrying the taint gets untainted; a patch failure on
+// that untaint is metered and the sweep moves on (returns nil).
+func TestDeadNodeSweeperRecoveryUntaintErrorTolerated(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("w1", corev1.ConditionTrue, nil, outOfServiceTaint))
+	cs.PrependReactor("patch", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), nil)
+	if err := s.run(ctx); err != nil {
+		t.Fatalf("untaint failure must not fail the run: %v", err)
+	}
+	if !hasTaint(getNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("taint removed despite the failed patch")
+	}
+}
+
+// Pods that are not stuck (not Terminating, or Terminating with no
+// node assignment) never enter the per-node suspect map.
+func TestDeadNodeSweeperIgnoresNonStuckPods(t *testing.T) {
+	running := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "db", Name: "pg-1"},
+		Spec: corev1.PodSpec{NodeName: "w1"}}
+	ts := metav1.NewTime(time.Now().Add(-20 * time.Minute))
+	nodeless := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "db", Name: "pg-2",
+		DeletionTimestamp: &ts, Finalizers: []string{"test/stuck"}},
+	}
+	cs := fake.NewSimpleClientset(
+		node("w1", corev1.ConditionFalse, nil), running, nodeless)
+	dyn := deadNodeDynFake(selfNodeRemediation("medik8s", "w1"))
+	s := deadNodeSweeperFor(cs, dyn, nil)
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if hasTaint(getNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("node tainted without any stuck pod")
+	}
+}
+
+// A NotReady node already carrying the out-of-service taint is the
+// node controller's in-flight fencing — kept, and it does not consume
+// the per-cycle cap.
+func TestDeadNodeSweeperKeepsAlreadyFencedNode(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("w1", corev1.ConditionFalse, nil, outOfServiceTaint),
+		stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), nil)
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !hasTaint(getNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("already-fenced node's taint was dropped")
+	}
+}
+
+// A confirmed-dead node whose taint patch fails is metered+skipped —
+// the cap is not consumed, the run still returns nil.
+func TestDeadNodeSweeperTaintPatchErrorTolerated(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("w1", corev1.ConditionFalse, nil),
+		stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+	cs.PrependReactor("patch", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	dyn := deadNodeDynFake(selfNodeRemediation("medik8s", "w1"))
+	s := deadNodeSweeperFor(cs, dyn, nil)
+	if err := s.run(ctx); err != nil {
+		t.Fatalf("taint failure must not fail the run: %v", err)
+	}
+	if hasTaint(getNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		t.Fatal("taint applied despite the rejected patch")
+	}
+}
+
+// A missing medik8s CRD (NotFound/NoMatch on list) is "no evidence"
+// and the scan continues to the next GVR — other errors are real.
+func TestDeadNodeSweeperRemediationCRDMissing(t *testing.T) {
+	dyn := deadNodeDynFake()
+	dyn.PrependReactor("list", "selfnoderemediations",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(
+				schema.GroupResource{
+					Group:    selfNodeRemediationGVR.Group,
+					Resource: selfNodeRemediationGVR.Resource,
+				}, "")
+		})
+	s := deadNodeSweeperFor(fake.NewSimpleClientset(), dyn, nil)
+	fenced, err := s.hasRemediationCR(ctx, "w1")
+	if err != nil || fenced {
+		t.Fatalf("missing CRD must read as no-evidence, got fenced=%v err=%v", fenced, err)
 	}
 }
 

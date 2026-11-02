@@ -14,9 +14,8 @@ one app in this workspace, alongside the per-node host agent.
 ### node-automation-controller
 
 Lightweight Go operator (`sigs.k8s.io/controller-runtime`) that replaces
-the `shell-operator` Deployment + 10 bash hooks in
-[passiontech-fluxcd](https://github.com/passiontech-global/passiontech-fluxcd)
-(`infrastructure/base/node-ops/node-ops-operator`).
+the `shell-operator` Deployment + 10 bash hooks previously deployed at
+`infrastructure/base/node-ops/node-ops-operator`.
 
 All logic is compiled in — no shell, no `kubectl`/`jq`/`curl`/`nslookup`
 forks, no hook ConfigMap. The image is `distroless/static:nonroot`

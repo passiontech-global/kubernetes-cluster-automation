@@ -222,3 +222,37 @@ func TestPodReadyCond(t *testing.T) {
 		t.Fatal("Ready=True pod reported not ready")
 	}
 }
+
+// A node list failure aborts the whole reconcile — reaping on an
+// empty snapshot would look like "no stale taints" success.
+func TestCiliumTaintReaperNodeListError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &ciliumTaintReaper{cs: cs, enabled: true}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the node list fails")
+	}
+}
+
+// A healthy agent + stale taint, but the untaint patch is rejected —
+// the error must propagate (reconcile retries next event).
+func TestCiliumTaintReaperUntaintError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
+		ciliumPod("n1", corev1.PodRunning, true))
+	emulatePodNodeNameSelector(cs)
+	cs.PrependReactor("patch", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	r := &ciliumTaintReaper{cs: cs, enabled: true}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the untaint patch fails")
+	}
+	if !hasTaint(getNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+		t.Fatal("taint removed despite the rejected patch")
+	}
+}
