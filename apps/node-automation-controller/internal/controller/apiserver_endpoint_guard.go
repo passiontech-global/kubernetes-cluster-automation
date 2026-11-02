@@ -205,12 +205,15 @@ func SetupAPIServerEndpointGuard(mgr ctrl.Manager, cs kubernetes.Interface) erro
 	// object deliberately every sweep (it is the SSOT behind the
 	// mirror slice), which the shared client's default WarningLogger
 	// would turn into one klog line per cycle. Every other warning
-	// still delegates. Fall back to the shared client if the build
-	// fails — the guard works either way, just noisier.
-	if filtered, err := endpointsWarningClient(mgr.GetConfig()); err == nil {
-		g.cs = filtered
-	} else {
-		g.log.Error(err, "filtered clientset build failed — sharing the noisy default client")
+	// still delegates. Fall back to the shared client when the
+	// filtered one cannot be built — nil config on test doubles or a
+	// construction failure — the guard works either way, just noisier.
+	if cfg := mgr.GetConfig(); cfg != nil {
+		if filtered, err := endpointsWarningClient(cfg); err == nil {
+			g.cs = filtered
+		} else {
+			g.log.Error(err, "filtered clientset build failed — sharing the noisy default client")
+		}
 	}
 	return mgr.Add(g)
 }
@@ -228,7 +231,9 @@ func endpointsWarningClient(cfg *rest.Config) (kubernetes.Interface, error) {
 // is deprecated" (the deprecated object is written by design wherever
 // the kubernetes slice is a mirror projection). Everything else still
 // reaches the default WarningLogger.
-type endpointGuardWarnings struct{ delegate rest.WarningHandlerWithContext }
+type endpointGuardWarnings struct {
+	delegate rest.WarningHandlerWithContext
+}
 
 func (w endpointGuardWarnings) HandleWarningHeader(code int, agent, message string) {
 	w.HandleWarningHeaderWithContext(context.Background(), code, agent, message)
