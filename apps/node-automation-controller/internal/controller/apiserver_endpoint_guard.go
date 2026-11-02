@@ -57,12 +57,23 @@
 // set, quarantine annotation and all edits land on the slice and
 // corev1 Endpoints is never touched.
 //
+// The slice's NAME is not fixed though: "kubernetes" exists only where
+// the apiserver's own endpoint reconciler writes the slice (self-hosted
+// control planes). Hosted/worker-plane clusters (k0smotron children —
+// our cicd/nonprod/production) carry a generated-name slice
+// (kubernetes-xxxxx) written by the endpointslicemirroring controller
+// as a read-through projection of Endpoints/kubernetes. Discovery is
+// therefore by the kubernetes.io/service-name=kubernetes label, and a
+// mirror-managed slice is never the SSOT — edits to it are reverted on
+// the next mirror reconcile, so on hosted planes Endpoints stays the
+// SSOT regardless of the version gate.
+//
 // RBAC (infrastructure/base/node-ops/node-automation-controller/rbac.yaml):
-// Role in ns default — get/update/patch on endpoints[kubernetes] and
-// endpointslices[kubernetes]; both objects are fetched by fixed name so
-// no list/watch is needed and resourceNames scoping suffices. The
-// version probe hits /version — a non-resource URL open to every
-// authenticated client.
+// Role in ns default — get/update/patch on endpoints[kubernetes], and
+// get/list + update/patch on endpointslices WITHOUT resourceNames
+// scoping: list cannot be name-scoped and the generated slice name is
+// unknowable ahead of time. The version probe hits /version — a
+// non-resource URL open to every authenticated client.
 package controller
 
 import (
@@ -118,6 +129,15 @@ const (
 	// Endpoints is deprecated — the guard moves its SSOT to the
 	// EndpointSlice on >= this version.
 	endpointSliceSinceMinor = 33
+	// endpointSliceServiceSelector discovers the kubernetes Service's
+	// slices by label — the fixed "kubernetes" name only exists where
+	// the apiserver's own reconciler writes the slice; hosted control
+	// planes carry generated-name (kubernetes-xxxxx) mirror slices.
+	endpointSliceServiceSelector = discoveryv1.LabelServiceName + "=" + endpointGuardName
+	// endpointSliceMirrorValue is the managed-by label value marking a
+	// slice as a read-through projection of the Endpoints object — see
+	// the SSOT note in run().
+	endpointSliceMirrorValue = "endpointslicemirroring-controller.k8s.io"
 )
 
 // apiProbeResult is one backend probe outcome: the quorum (etcd) list
@@ -218,46 +238,60 @@ func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
 func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	useSlice, verr := g.endpointMode()
+	preferSlice, verr := g.endpointMode()
 	if verr != nil {
 		log.Error(verr, "k8s version undetectable — defaulting to corev1 Endpoints")
 	}
+
+	// Resolve the kubernetes endpoints objects. Two layouts exist:
+	//   self-hosted — the apiserver's own endpoint reconciler writes
+	//     BOTH endpoints/kubernetes AND a fixed-name
+	//     endpointslice/kubernetes from the same lease set.
+	//   hosted/worker plane — endpoints/kubernetes is seeded by the
+	//     platform; the ONLY slice is a generated-name mirror of it
+	//     owned by the endpointslicemirroring controller, so the slice
+	//     must be discovered by the service-name label and the
+	//     Endpoints object stays the SSOT on every version (edits to a
+	//     mirror slice are reverted on the next mirror reconcile).
+	epsList, err := g.kubernetesSlices(ctx)
+	if err != nil {
+		return fmt.Errorf("list endpointslices for %s/%s: %w",
+			endpointGuardNS, endpointGuardName, err)
+	}
+	var primary *discoveryv1.EndpointSlice
+	if len(epsList) > 0 {
+		primary = epsList[0]
+	}
+
+	// Endpoints is fetched only when it can actually be the SSOT — on a
+	// >=1.33 self-managed cluster (non-mirrored slice) the deprecated
+	// object is never touched at all.
 	var ep *corev1.Endpoints
-	var eps *discoveryv1.EndpointSlice
+	if primary == nil || mirrorManagedSlice(primary) || !preferSlice {
+		e, err := g.cs.CoreV1().Endpoints(endpointGuardNS).
+			Get(ctx, endpointGuardName, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+		case err != nil:
+			return err // periodic loop meters/logs — nothing to act on without it
+		default:
+			ep = e
+		}
+	}
+
+	useSlice := primary != nil &&
+		(ep == nil || (preferSlice && !mirrorManagedSlice(primary)))
+	if !useSlice && ep == nil {
+		return fmt.Errorf("neither endpoints/%s nor a usable endpointslice exists",
+			endpointGuardName)
+	}
+
 	var activeIPs []string
 	var quarantinedIPs map[string]bool
 	if useSlice {
-		// >=v1.33: the EndpointSlice is the SSOT (see the version-gate
-		// note above) — a missing object fails the cycle just like a
-		// missing Endpoints does on the old path.
-		s, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
-			Get(ctx, endpointGuardName, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		eps = s
-		activeIPs = sliceIPs(eps)
-		quarantinedIPs = parseQuarantineAnnotation(eps)
+		activeIPs = slicesIPs(epsList)
+		quarantinedIPs = parseQuarantineAnnotation(primary)
 	} else {
-		e, err := g.cs.CoreV1().Endpoints(endpointGuardNS).
-			Get(ctx, endpointGuardName, metav1.GetOptions{})
-		if err != nil {
-			return err // periodic loop meters/logs — nothing to act on without it
-		}
-		ep = e
-		// The slice is best-effort: managed by the same endpoints
-		// reconciler, but absent on a cluster mid-upgrade it must not
-		// veto the Endpoints guard.
-		s, serr := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
-			Get(ctx, endpointGuardName, metav1.GetOptions{})
-		if serr != nil {
-			if apierrors.IsNotFound(serr) {
-				s = nil
-			} else {
-				return serr
-			}
-		}
-		eps = s
 		activeIPs = endpointIPs(ep)
 		quarantinedIPs = parseQuarantineAnnotation(ep)
 	}
@@ -393,22 +427,36 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	// for "who is pulled"; if its update fails nothing was persisted
 	// and the next cycle retries the whole decision.
 	if useSlice {
-		eps = eps.DeepCopy()
+		copies := deepCopySlices(epsList)
+		dirty := make([]bool, len(copies))
 		for _, ip := range toRemove {
-			removeSliceIP(eps, ip)
 			quarantinedIPs[ip] = true
 			log.Info("QUARANTINE: wedged apiserver pulled from kubernetes EndpointSlice",
 				"ip", ip, "remainingHealthy", healthyActive)
+			for i := range copies {
+				if removeSliceIP(copies[i], ip) {
+					dirty[i] = true
+				}
+			}
 		}
 		for _, ip := range toAdd {
-			addSliceIP(eps, ip)
+			if i := sliceIdxForIP(copies, ip); i >= 0 && addSliceIP(copies[i], ip) {
+				dirty[i] = true
+			}
 			delete(quarantinedIPs, ip)
 			log.Info("RE-ADD: recovered apiserver back in kubernetes EndpointSlice", "ip", ip)
 		}
-		writeQuarantineAnnotation(eps, quarantinedIPs)
-		if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
-			Update(ctx, eps, metav1.UpdateOptions{}); err != nil {
-			return fmt.Errorf("update endpointslice/%s: %w", endpointGuardName, err)
+		// The primary always carries the annotation — persist it even
+		// when its endpoint set itself was unchanged this cycle.
+		writeQuarantineAnnotation(copies[0], quarantinedIPs)
+		for i, s := range copies {
+			if i > 0 && !dirty[i] {
+				continue
+			}
+			if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+				Update(ctx, s, metav1.UpdateOptions{}); err != nil {
+				return fmt.Errorf("update endpointslice/%s: %w", s.Name, err)
+			}
 		}
 	} else {
 		ep = ep.DeepCopy()
@@ -432,31 +480,38 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 			return fmt.Errorf("update endpoints/%s: %w", endpointGuardName, err)
 		}
 
-		// EndpointSlice converges to the FULL quarantine set (not just
+		// EndpointSlices converge to the FULL quarantine set (not just
 		// this cycle's removals) so a slice update that failed earlier
 		// is retried instead of leaving a wedged IP routable forever.
-		if eps != nil {
-			eps = eps.DeepCopy()
-			changedEPS := false
+		// On hosted planes the mirror controller propagates the
+		// Endpoints write itself within ~1s — this write just wins the
+		// race when propagation lags.
+		copies := deepCopySlices(epsList)
+		dirty := make([]bool, len(copies))
+		for i := range copies {
 			for ip := range quarantinedIPs {
-				if removeSliceIP(eps, ip) {
-					changedEPS = true
+				if removeSliceIP(copies[i], ip) {
+					dirty[i] = true
 				}
 			}
-			for _, ip := range toAdd {
-				if addSliceIP(eps, ip) {
-					changedEPS = true
-				}
+		}
+		for _, ip := range toAdd {
+			if i := sliceIdxForIP(copies, ip); i >= 0 && addSliceIP(copies[i], ip) {
+				dirty[i] = true
 			}
-			if changedEPS {
-				if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
-					Update(ctx, eps, metav1.UpdateOptions{}); err != nil {
-					// Logged/metered, not returned: Endpoints already
-					// persisted the decision and the next cycle re-applies
-					// the slice diff.
-					metrics.IncError(endpointGuardQueue)
-					log.Error(err, "EndpointSlice update failed — retries next cycle")
-				}
+		}
+		for i, s := range copies {
+			if !dirty[i] {
+				continue
+			}
+			if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+				Update(ctx, s, metav1.UpdateOptions{}); err != nil {
+				// Logged/metered, not returned: Endpoints already
+				// persisted the decision and the next cycle re-applies
+				// the slice diff.
+				metrics.IncError(endpointGuardQueue)
+				log.Error(err, "EndpointSlice update failed — retries next cycle",
+					"slice", s.Name)
 			}
 		}
 	}
@@ -465,6 +520,88 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	log.Info("sweep done", "removed", toRemove, "readded", toAdd,
 		"quarantined", slices.Sorted(maps.Keys(quarantinedIPs)))
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint / EndpointSlice resolution — see the header note.
+// ---------------------------------------------------------------------------
+
+// kubernetesSlices returns every EndpointSlice serving the kubernetes
+// Service, sorted by name so epsList[0] is a stable "primary" for the
+// quarantine annotation. The slice's name is fixed ("kubernetes") only
+// where the apiserver's own endpoint reconciler writes it; hosted
+// control planes carry generated-name mirror slices, so discovery goes
+// by the service-name label. Slices mid-deletion are ignored.
+func (g *apiServerEndpointGuard) kubernetesSlices(ctx context.Context) ([]*discoveryv1.EndpointSlice, error) {
+	l, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).List(ctx,
+		metav1.ListOptions{LabelSelector: endpointSliceServiceSelector})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*discoveryv1.EndpointSlice, 0, len(l.Items))
+	for i := range l.Items {
+		if l.Items[i].DeletionTimestamp == nil {
+			out = append(out, &l.Items[i])
+		}
+	}
+	slices.SortFunc(out, func(a, b *discoveryv1.EndpointSlice) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return out, nil
+}
+
+// mirrorManagedSlice reports whether the slice is generated by the
+// endpointslicemirroring controller — a read-through projection of the
+// Endpoints object (label managed-by, plus a controller ownerReference
+// onto endpoints/kubernetes as belt&braces). A mirror is never the
+// SSOT: its edits are rebuilt from the Endpoints object on the next
+// mirror reconcile.
+func mirrorManagedSlice(eps *discoveryv1.EndpointSlice) bool {
+	if eps.Labels[discoveryv1.LabelManagedBy] == endpointSliceMirrorValue {
+		return true
+	}
+	for _, r := range eps.OwnerReferences {
+		if r.Kind == "Endpoints" && r.Controller != nil && *r.Controller {
+			return true
+		}
+	}
+	return false
+}
+
+func deepCopySlices(list []*discoveryv1.EndpointSlice) []*discoveryv1.EndpointSlice {
+	out := make([]*discoveryv1.EndpointSlice, len(list))
+	for i, s := range list {
+		out[i] = s.DeepCopy()
+	}
+	return out
+}
+
+// slicesIPs unions the backend IPs across every resolved slice —
+// dual-stack clusters carry one slice per address family.
+func slicesIPs(list []*discoveryv1.EndpointSlice) []string {
+	set := map[string]bool{}
+	for _, s := range list {
+		for _, ip := range sliceIPs(s) {
+			set[ip] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(set))
+}
+
+// sliceIdxForIP picks the slice whose AddressType matches ip's family
+// (re-adds must land in the same-family slice on dual-stack clusters);
+// 0 falls back to the primary. -1 on an empty list.
+func sliceIdxForIP(list []*discoveryv1.EndpointSlice, ip string) int {
+	if len(list) == 0 {
+		return -1
+	}
+	v6 := strings.Contains(ip, ":")
+	for i, s := range list {
+		if (s.AddressType == discoveryv1.AddressTypeIPv6) == v6 {
+			return i
+		}
+	}
+	return 0
 }
 
 // ---------------------------------------------------------------------------

@@ -52,11 +52,18 @@ func kubeEndpoints(active, notReady, quarantined []string) *corev1.Endpoints {
 }
 
 // kubeEndpointSlice mirrors the discovery.k8s.io/v1 slice the apiserver
-// maintains for the kubernetes service.
+// maintains for the kubernetes service on a self-hosted control plane —
+// fixed name, apiserver-managed (not a mirror).
 func kubeEndpointSlice(ips []string) *discoveryv1.EndpointSlice {
-	eps := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
-		Namespace: endpointGuardNS, Name: endpointGuardName,
-	}}
+	eps := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: endpointGuardNS, Name: endpointGuardName,
+			Labels: map[string]string{
+				discoveryv1.LabelServiceName: endpointGuardName,
+			},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+	}
 	ready := true
 	for _, ip := range ips {
 		eps.Endpoints = append(eps.Endpoints, discoveryv1.Endpoint{
@@ -64,6 +71,21 @@ func kubeEndpointSlice(ips []string) *discoveryv1.EndpointSlice {
 			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
 		})
 	}
+	return eps
+}
+
+// kubeMirrorSlice builds the generated-name slice the
+// endpointslicemirroring controller projects from Endpoints/kubernetes
+// on hosted control planes — never the SSOT.
+func kubeMirrorSlice(name string, ips []string) *discoveryv1.EndpointSlice {
+	eps := kubeEndpointSlice(ips)
+	eps.Name = name
+	eps.Labels[discoveryv1.LabelManagedBy] = endpointSliceMirrorValue
+	owner := true
+	eps.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "v1", Kind: "Endpoints", Name: endpointGuardName,
+		Controller: &owner,
+	}}
 	return eps
 }
 
@@ -554,12 +576,12 @@ func TestEndpointGuardMissingEndpoints(t *testing.T) {
 	}
 }
 
-// An EndpointSlice get failure that is NOT NotFound is a real error —
-// only NotFound is the mid-upgrade no-slice case.
-func TestEndpointGuardSliceGetError(t *testing.T) {
+// An EndpointSlice list failure is a real error — the guard cannot
+// decide the SSOT without knowing which slices exist.
+func TestEndpointGuardSliceListError(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
-	cs.PrependReactor("get", "endpointslices",
+	cs.PrependReactor("list", "endpointslices",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
@@ -568,11 +590,11 @@ func TestEndpointGuardSliceGetError(t *testing.T) {
 		"10.0.0.2": apiHealthyProbe(100),
 	})
 	if err := g.run(ctx); err == nil {
-		t.Fatal("expected error when the EndpointSlice get fails")
+		t.Fatal("expected error when the EndpointSlice list fails")
 	}
 }
 
-// EndpointSlice absent entirely (NotFound) is tolerated — the guard
+// EndpointSlice absent entirely (empty list) is tolerated — the guard
 // still sweeps the Endpoints object.
 func TestEndpointGuardSliceAbsent(t *testing.T) {
 	cs := fake.NewSimpleClientset(
@@ -985,14 +1007,36 @@ func TestEndpointGuardSliceModeReaddsRecovered(t *testing.T) {
 	}
 }
 
-// Missing SSOT object fails the cycle on the slice path exactly like
-// a missing Endpoints does on the old path.
+// Neither endpoints object existing fails the cycle — a missing slice
+// alone falls back to Endpoints instead (below).
 func TestEndpointGuardSliceModeMissingSlice(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	fakeServerVersion(cs, "1", "33")
 	g := newEndpointGuard(cs, probeTable{})
 	if err := g.run(ctx); err == nil {
-		t.Fatal("expected error when the EndpointSlice object is missing")
+		t.Fatal("expected error when neither endpoints object exists")
+	}
+}
+
+// On >=v1.33 a missing slice drops back to the Endpoints path rather
+// than dead-looping — the deprecated object is still writable there.
+func TestEndpointGuardSliceModeFallsBackToEndpoints(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
+	fakeServerVersion(cs, "1", "33")
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	for i := 0; i < endpointGuardErrCycles; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ep := getKubeEndpoints(t, cs)
+	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("fallback did not run the Endpoints path, annotation = %q",
+			ep.Annotations[endpointGuardAnno])
 	}
 }
 
@@ -1033,6 +1077,120 @@ func TestEndpointGuardSliceModeUpdateError(t *testing.T) {
 		})
 	if err := g.run(ctx); err == nil {
 		t.Fatal("expected error when the EndpointSlice update fails")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Hosted control planes — the kubernetes slice is a generated-name mirror
+// of Endpoints/kubernetes (k0smotron & co.). Regression tests for the
+// sweep that hard-failed with `endpointslices "kubernetes" not found`.
+// ---------------------------------------------------------------------------
+
+// >=v1.33 hosted plane: the ONLY slice is a generated-name mirror owned
+// by the endpointslicemirroring controller. The guard must discover it
+// by label and run the Endpoints path — annotation + removal land on
+// Endpoints (the mirror's source of truth), the mirror slice converges.
+func TestEndpointGuardMirrorSliceEndpointsSSOT(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
+		kubeMirrorSlice("kubernetes-89b87", []string{"10.0.0.1", "10.0.0.2"}))
+	fakeServerVersion(cs, "1", "37")
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	for i := 0; i < endpointGuardErrCycles; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ep := getKubeEndpoints(t, cs)
+	if endpointAddrSet(ep)["10.0.0.1"] {
+		t.Fatal("wedged IP still in Endpoints")
+	}
+	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("annotation not on the Endpoints SSOT: %q",
+			ep.Annotations[endpointGuardAnno])
+	}
+	// The mirror slice converges too — the direct write beats the
+	// mirror controller's own resync.
+	s, err := cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+		Get(ctx, "kubernetes-89b87", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sliceAddrSet(s)["10.0.0.1"] {
+		t.Fatal("wedged IP still in the mirror slice")
+	}
+}
+
+// A generated-name slice that is NOT mirror-managed (exotic hosted
+// setup writing slices directly) still runs the slice path on >=1.33 —
+// label discovery replaces the fixed-name Get.
+func TestEndpointGuardGeneratedNameSliceSSOT(t *testing.T) {
+	eps := kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"})
+	eps.Name = "kubernetes-xy12z"
+	cs := fake.NewSimpleClientset(eps)
+	fakeServerVersion(cs, "1", "34")
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	for i := 0; i < endpointGuardErrCycles; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+		Get(ctx, "kubernetes-xy12z", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sliceAddrSet(got)["10.0.0.1"] {
+		t.Fatal("wedged IP still in the generated-name slice")
+	}
+	if got.Annotations[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("slice annotation = %q, want 10.0.0.1",
+			got.Annotations[endpointGuardAnno])
+	}
+}
+
+// Degenerate hosted state: only a mirror slice exists (its owner
+// Endpoints already gone). The guard uses what it has — the slice —
+// instead of dead-looping on the missing Endpoints.
+func TestEndpointGuardSliceOnlyFallback(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeMirrorSlice("kubernetes-89b87", []string{"10.0.0.1", "10.0.0.2"}))
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": apiHealthyProbe(100),
+		"10.0.0.2": apiHealthyProbe(100),
+	})
+	if err := g.run(ctx); err != nil {
+		t.Fatalf("slice-only cluster must not error: %v", err)
+	}
+}
+
+// A mirror slice never becomes the SSOT even on >=1.33 — its edits are
+// rebuilt from the Endpoints object on the next mirror reconcile.
+func TestEndpointGuardMirrorSliceIgnoredOnNewVersion(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
+		kubeMirrorSlice("kubernetes-89b87", []string{"10.0.0.1", "10.0.0.2"}))
+	fakeServerVersion(cs, "1", "34")
+	probed := map[string]int{}
+	g := &apiServerEndpointGuard{
+		cs: cs,
+		probeFn: func(_ context.Context, ip string) apiProbeResult {
+			probed[ip]++
+			return *apiHealthyProbe(100)
+		},
+		backends: map[string]*backendProbeState{},
+	}
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if probed["10.0.0.1"] != 1 || probed["10.0.0.2"] != 1 {
+		t.Fatalf("endpoints IPs not probed through the mirror-slice path: %v", probed)
 	}
 }
 
