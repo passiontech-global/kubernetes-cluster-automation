@@ -1,0 +1,213 @@
+// Package concourse implements the small slice of the Concourse ATC
+// API the dispatcher needs: listing pipelines and their resources to
+// build a repo -> resource index, and POSTing resource check webhooks.
+package concourse
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Resource is one Concourse resource pinned to a GitHub repo. Repo is
+// the normalized "org/repo" form produced by NormalizeRepo.
+type Resource struct {
+	Pipeline string
+	Name     string
+	Type     string
+	Repo     string
+}
+
+// Client talks to a single Concourse ATC team.
+type Client struct {
+	BaseURL      string // e.g. http://concourse-web:8080
+	Team         string
+	User         string // basic auth, parsed from LOCAL_USERS
+	Password     string
+	WebhookToken string // CI_WEBHOOK_TOKEN, sent as webhook_token=…
+
+	// HTTP is the client used for ATC calls; nil -> http.DefaultClient.
+	HTTP *http.Client
+
+	// IndexTTL bounds how long the resource index is served from
+	// cache before a refresh; zero -> 1 minute.
+	IndexTTL time.Duration
+
+	mu        sync.Mutex
+	index     []Resource
+	fetchedAt time.Time
+}
+
+func (c *Client) httpClient() *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
+	}
+	return http.DefaultClient
+}
+
+func (c *Client) ttl() time.Duration {
+	if c.IndexTTL > 0 {
+		return c.IndexTTL
+	}
+	return time.Minute
+}
+
+// Resources returns the repo -> resource index, served from a ~60s
+// cache and refreshed on a miss (absent or expired). A failed refresh
+// falls back to the stale index when one exists.
+func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.index != nil && time.Since(c.fetchedAt) < c.ttl() {
+		return c.index, nil
+	}
+	index, err := c.fetchIndex(ctx)
+	if err != nil {
+		if c.index != nil {
+			slog.Warn("resource index refresh failed — serving stale",
+				"error", err)
+			return c.index, nil
+		}
+		return nil, err
+	}
+	c.index, c.fetchedAt = index, time.Now()
+	return index, nil
+}
+
+// Refresh forces an index refetch, bypassing the TTL — used when a
+// delivery matched nothing, covering a pipeline set since the last
+// fetch. A failed refresh keeps the previous index.
+func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	index, err := c.fetchIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.index, c.fetchedAt = index, time.Now()
+	return index, nil
+}
+
+// fetchIndex lists the team's pipelines, then each pipeline's
+// resources, keeping only resources whose source points at a repo.
+func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
+	var pipelines []struct {
+		Name string `json:"name"`
+	}
+	if err := c.getJSON(ctx, c.apiPath("pipelines"), &pipelines); err != nil {
+		return nil, err
+	}
+
+	var index []Resource
+	for _, p := range pipelines {
+		var resources []struct {
+			Name   string         `json:"name"`
+			Type   string         `json:"type"`
+			Source map[string]any `json:"source"`
+		}
+		path := "pipelines/" + url.PathEscape(p.Name) + "/resources"
+		if err := c.getJSON(ctx, c.apiPath(path), &resources); err != nil {
+			// One unreadable pipeline must not lose the whole index.
+			slog.Warn("pipeline resource listing failed — skipped",
+				"pipeline", p.Name, "error", err)
+			continue
+		}
+		for _, r := range resources {
+			repo := NormalizeRepo(sourceRepo(r.Source))
+			if repo == "" {
+				continue
+			}
+			index = append(index, Resource{
+				Pipeline: p.Name,
+				Name:     r.Name,
+				Type:     r.Type,
+				Repo:     repo,
+			})
+		}
+	}
+	return index, nil
+}
+
+// CheckWebhook POSTs the resource's check webhook. The webhook_token
+// query param is the credential, so no basic auth is sent. It returns
+// the ATC status code so the caller can classify warn vs error;
+// transport errors return 0.
+func (c *Client) CheckWebhook(ctx context.Context, r Resource) (int, error) {
+	u := strings.TrimSuffix(c.BaseURL, "/") + c.apiPath(
+		"pipelines/"+url.PathEscape(r.Pipeline)+
+			"/resources/"+url.PathEscape(r.Name)+"/check/webhook") +
+		"?webhook_token=" + url.QueryEscape(c.WebhookToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body) // drain for keep-alive reuse
+	return resp.StatusCode, nil
+}
+
+// apiPath prefixes p with the team-scoped API root.
+func (c *Client) apiPath(p string) string {
+	return "/api/v1/teams/" + url.PathEscape(c.Team) + "/" + p
+}
+
+func (c *Client) getJSON(ctx context.Context, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		strings.TrimSuffix(c.BaseURL, "/")+path, nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(c.User, c.Password)
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("GET %s: unexpected status %d", path, resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// sourceRepo pulls the repo identity out of a resource's source:
+// git-type resources carry "uri", github-pr resources "repository".
+func sourceRepo(source map[string]any) string {
+	for _, k := range []string{"uri", "repository"} {
+		if v, ok := source[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// NormalizeRepo reduces a GitHub repo identifier — scp-like SSH
+// (git@github.com:org/repo.git), HTTPS URL
+// (https://github.com/org/repo[.git]) or bare "org/repo" — to the
+// lowercase "org/repo" form used for equality matching.
+func NormalizeRepo(s string) string {
+	s = strings.TrimSpace(s)
+	// Strip the "github.com" host prefix from URL/scp-like forms. The
+	// boundary check keeps lookalike hosts (e.g. "notgithub.com")
+	// from being treated as github.com.
+	if i := strings.Index(s, "github.com"); i >= 0 &&
+		(i == 0 || strings.ContainsRune("/@.", rune(s[i-1]))) {
+		s = strings.TrimLeft(s[i+len("github.com"):], ":/")
+	}
+	s = strings.TrimSuffix(s, "/")
+	s = strings.TrimSuffix(s, ".git")
+	return strings.ToLower(s)
+}

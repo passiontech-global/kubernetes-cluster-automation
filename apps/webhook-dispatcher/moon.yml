@@ -1,0 +1,35 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+language: 'go'
+layer: 'application'
+stack: 'backend'
+
+project:
+  title: 'webhook-dispatcher'
+  description: 'GitHub org webhook fan-out to Concourse resource check webhooks (push -> git, pull_request -> github-pr).'
+
+tasks:
+  build:
+    script: 'CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION:-dev}" -o bin/webhook-dispatcher ./cmd/dispatcher'
+    toolchains: 'system'
+    options:
+      # script contains an inline env assignment — must run via shell.
+      shell: true
+    inputs:
+      - '$VERSION'
+      - 'cmd/**/*.go'
+      - 'internal/**/*.go'
+      - 'go.mod'
+    outputs:
+      - 'bin/webhook-dispatcher'
+
+  image:
+    script: 'ko build --bare --sbom=none --tags "${TAGS:-latest}" ./cmd/dispatcher'
+    toolchains: 'system'
+    inputs:
+      - 'cmd/**/*.go'
+      - 'internal/**/*.go'
+      - 'go.mod'
+      - '.ko.yaml'
+    options:
+      cache: false

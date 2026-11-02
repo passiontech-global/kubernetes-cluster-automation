@@ -1,0 +1,45 @@
+name: Release webhook-dispatcher
+
+# Releases only this app — other apps in the monorepo are unaffected.
+# Pipeline lives in release-app.yml.
+#
+# Triggers:
+#   push main            changes under apps/webhook-dispatcher
+#   workflow_dispatch    gh workflow run release-webhook-dispatcher.yml [-f version=v0.1.0]
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/webhook-dispatcher/**"
+      - ".moon/**"
+      - "mise.toml"
+      - ".github/workflows/release-app.yml"
+      - ".github/workflows/release-webhook-dispatcher.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag (e.g. v0.1.0). Empty = auto semver bump"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-webhook-dispatcher
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-app.yml
+    with:
+      app: webhook-dispatcher
+      version: ${{ inputs.version || '' }}
+      prerelease: ${{ inputs.prerelease || false }}
+    secrets: inherit
