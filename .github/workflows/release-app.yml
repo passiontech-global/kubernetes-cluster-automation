@@ -53,11 +53,13 @@ jobs:
           version_in="${{ inputs.version }}"
 
           # Latest release tag for this app. Tag scheme: "<app>/vX.Y.Z";
-          # legacy_v_tags additionally considers pre-monorepo "vX.Y.Z".
-          if [ "${{ inputs.legacy_v_tags }}" = "true" ]; then
-            last_tag=$(git tag -l "$APP/v[0-9]*" -l "v[0-9]*" --sort=-v:refname | head -1)
-          else
-            last_tag=$(git tag -l "$APP/v[0-9]*" --sort=-v:refname | head -1)
+          # legacy_v_tags additionally considers pre-monorepo "vX.Y.Z"
+          # only when no "<app>/vX.Y.Z" tag exists yet (git --sort=-v:refname
+          # compares full refnames, so "v0.2.0" would otherwise sort
+          # ahead of "node-automation-controller/v0.5.0").
+          last_tag=$(git tag -l "$APP/v[0-9]*" --sort=-v:refname | head -1)
+          if [ -z "$last_tag" ] && [ "${{ inputs.legacy_v_tags }}" = "true" ]; then
+            last_tag=$(git tag -l "v[0-9]*" --sort=-v:refname | head -1)
           fi
           if [ -z "$last_tag" ]; then
             last_tag="$APP/v0.0.0"
@@ -70,9 +72,13 @@ jobs:
             rel_version="${version_in##*/}"
             case "$rel_version" in v*) ;; *) rel_version="v$rel_version" ;; esac
           else
+            # Anchor git-cliff explicitly at $last_tag..HEAD so a tag
+            # created on a multi-commit push whose HEAD did not touch
+            # apps/$APP/** is never filtered out by --include-path.
             bumped=$(git-cliff --bumped-version \
               --config "apps/$APP/cliff.toml" \
-              --include-path "apps/$APP/**")
+              --include-path "apps/$APP/**" \
+              "$last_tag..HEAD")
             rel_version="v$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' <<<"$bumped" | head -1)"
             # No new conventional commits since last tag -> git-cliff
             # echoes the same version; force a patch bump so the
@@ -86,7 +92,8 @@ jobs:
 
           git-cliff --unreleased --tag "$rel_tag" \
             --config "apps/$APP/cliff.toml" \
-            --include-path "apps/$APP/**" > changelog.md
+            --include-path "apps/$APP/**" \
+            "$last_tag..HEAD" > changelog.md
           grep -q '[^[:space:]]' changelog.md || echo "No user-facing changes." > changelog.md
           {
             echo "Range: \`$last_tag\` -> \`$rel_tag\`"

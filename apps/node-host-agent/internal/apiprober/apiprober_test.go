@@ -490,3 +490,50 @@ func TestRunLoopStopsOnCancel(t *testing.T) {
 		t.Fatal("Run did not return after cancel")
 	}
 }
+
+func TestVIPBackendFollowsDirectControllerState(t *testing.T) {
+	ctrl1 := newAPIStub(t)
+	ctrl2 := newAPIStub(t)
+	// api_datahub_lb is a VIP entry (suffix "_lb") — its address is not a
+	// valid HTTP server, verifying it is never directly probed for RV gap.
+	ha := newFakeHAProxy(t,
+		[2]string{"api_datahub_ctrl", ctrl1.addr()},
+		[2]string{"api_datahub_lb", "127.0.0.1:1"},
+		[2]string{"api_contabo_ctrl", ctrl2.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	// Phase 1: ctrl2 wedges while ctrl1 stays fresh → both ctrl2 and
+	// api_datahub_lb are disabled.
+	ctrl1.set(500, 500)
+	ctrl2.set(100, 3000)
+	for i := 0; i < 2; i++ {
+		p.Cycle(context.Background())
+	}
+	if !hasCmd(ha.commands(), "disable server kube_apiserver/api_contabo_ctrl") {
+		t.Fatalf("expected api_contabo_ctrl disable, cmds=%v", ha.commands())
+	}
+	if !hasCmd(ha.commands(), "disable server kube_apiserver/api_datahub_lb") {
+		t.Fatalf("expected api_datahub_lb disable alongside wedged ctrl, cmds=%v", ha.commands())
+	}
+	if got := testutil.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 0 {
+		t.Fatalf("enabled{api_datahub_lb}=%v want 0", got)
+	}
+
+	// Phase 2: ctrl2 recovers for RecoverCycles (3) → both ctrl2 and
+	// api_datahub_lb are re-enabled.
+	ctrl2.set(500, 500)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	if !hasCmd(ha.commands(), "enable server kube_apiserver/api_contabo_ctrl") {
+		t.Fatalf("expected api_contabo_ctrl enable, cmds=%v", ha.commands())
+	}
+	if !hasCmd(ha.commands(), "enable server kube_apiserver/api_datahub_lb") {
+		t.Fatalf("expected api_datahub_lb enable after ctrl recovery, cmds=%v", ha.commands())
+	}
+	p.Cycle(context.Background())
+	if got := testutil.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 1 {
+		t.Fatalf("enabled{api_datahub_lb}=%v want 1", got)
+	}
+}

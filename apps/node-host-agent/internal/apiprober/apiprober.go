@@ -182,6 +182,16 @@ func (b backend) up() bool { return strings.HasPrefix(b.Status, "UP") }
 // used on-disk drained-* marker files for that distinction).
 func (b backend) maint() bool { return strings.HasPrefix(b.Status, "MAINT") }
 
+// vip reports a load-balancer VIP server entry (suffix "_lb", e.g.
+// api_datahub_lb in worker api-local-lb). VIP entries round-robin
+// across multiple controllers, so their cached/live queries can land on
+// different backends and must not be probed directly or counted toward
+// the drain fence. Instead they follow sig14b semantics: disabled when
+// any direct controller is wedged while >=1 direct controller remains
+// fresh, and re-enabled when all controllers are healthy or when no
+// direct controller is usable (least-bad).
+func (b backend) vip() bool { return strings.HasSuffix(b.Name, "_lb") }
+
 // backendState tracks per-backend consecutive-cycle counters — the
 // in-memory equivalent of the shell script's $STATE_DIR files
 // (qfail-, frozen-, fail-, ok-, drained-).
@@ -497,9 +507,10 @@ func (p *Prober) Cycle(ctx context.Context) {
 	p.backendCount.Set(float64(len(backends)))
 	p.cycles.WithLabelValues("ok").Inc()
 
-	fresh := 0                 // backends fresh AND usable this cycle (drain fence)
+	fresh := 0                 // direct backends fresh AND usable this cycle (drain fence)
 	stale := map[string]bool{} // name → wedged/dead this cycle
 	statusByName := make(map[string]backend, len(backends))
+	var vips []backend
 
 	for _, b := range backends {
 		if ctx.Err() != nil {
@@ -507,6 +518,10 @@ func (p *Prober) Cycle(ctx context.Context) {
 		}
 		statusByName[b.Name] = b
 		st := p.stateFor(b.Name)
+		if b.vip() {
+			vips = append(vips, b)
+			continue
+		}
 
 		// TCP preflight: unreachable → HAProxy tcp-check owns the
 		// verdict; we neither count it fresh nor stale.
@@ -660,15 +675,70 @@ func (p *Prober) Cycle(ctx context.Context) {
 				continue
 			}
 			st.drained = true
-			fresh--
 			p.actions.WithLabelValues(name, "disable").Inc()
 			log.Info("ACTION: disabled backend — watch-cache wedge",
-				"backend", name, "backend", p.cfg.BackendName,
+				"backend", name, "haproxyBackend", p.cfg.BackendName,
 				"freshRemaining", fresh)
 		} else {
 			log.Info("DRY-RUN: would disable backend — watch-cache wedge",
 				"backend", name, "freshRemaining", fresh)
 			p.actions.WithLabelValues(name, "dryrun_disable").Inc()
+		}
+	}
+
+	// VIP phase (sig14b): *_lb entries round-robin across controllers,
+	// so when any direct controller is wedged/drained AND >=1 direct
+	// controller is fresh, disable the VIP entry so traffic goes
+	// straight to the healthy controller(s). Re-enable when all direct
+	// controllers are healthy again, or when fresh == 0 (least-bad).
+	staleCtrlCount := 0
+	for _, b := range backends {
+		if b.vip() {
+			continue
+		}
+		if stale[b.Name] || p.states[b.Name].drained {
+			staleCtrlCount++
+		}
+	}
+	wantVIPDisable := staleCtrlCount > 0 && fresh > 0
+	for _, vip := range vips {
+		st := p.states[vip.Name]
+		if wantVIPDisable {
+			if p.cfg.Mode == ModeEnforce {
+				if !st.drained || vip.up() {
+					if err := p.haproxyServer(ctx, "disable", vip.Name); err != nil {
+						log.Error("disable VIP via HAProxy socket failed",
+							"backend", vip.Name, "error", err)
+						continue
+					}
+					st.drained = true
+					p.actions.WithLabelValues(vip.Name, "disable").Inc()
+					log.Info("ACTION: disabled VIP backend — direct controller wedged while fresh controller available",
+						"backend", vip.Name, "staleCtrls", staleCtrlCount, "freshCtrls", fresh)
+				}
+			} else if !st.drained {
+				st.drained = true
+				log.Info("DRY-RUN: would disable VIP backend — direct controller wedged",
+					"backend", vip.Name, "staleCtrls", staleCtrlCount, "freshCtrls", fresh)
+				p.actions.WithLabelValues(vip.Name, "dryrun_disable").Inc()
+			}
+		} else if st.drained || vip.maint() {
+			if p.cfg.Mode == ModeEnforce {
+				if err := p.haproxyServer(ctx, "enable", vip.Name); err != nil {
+					log.Error("enable VIP via HAProxy socket failed",
+						"backend", vip.Name, "error", err)
+					continue
+				}
+				st.drained = false
+				p.actions.WithLabelValues(vip.Name, "enable").Inc()
+				log.Info("ACTION: enabled VIP backend",
+					"backend", vip.Name, "staleCtrls", staleCtrlCount, "freshCtrls", fresh)
+			} else {
+				st.drained = false
+				log.Info("DRY-RUN: would enable VIP backend",
+					"backend", vip.Name, "staleCtrls", staleCtrlCount, "freshCtrls", fresh)
+				p.actions.WithLabelValues(vip.Name, "dryrun_enable").Inc()
+			}
 		}
 	}
 
