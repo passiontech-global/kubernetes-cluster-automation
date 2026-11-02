@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -124,9 +125,20 @@ func main() {
 		log.Error(err, "unable to create clientset")
 		os.Exit(1)
 	}
+	// Dynamic client for CRD types (helmreleases, cert-manager,
+	// externalsecrets, medik8s, cilium) — no typed clients in-tree.
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		log.Error(err, "unable to create dynamic client")
+		os.Exit(1)
+	}
 
 	ciliumEnabled := os.Getenv("CILIUM_TAINT_REAPER_ENABLED") == "true"
 	fluentbitEnabled := os.Getenv("FLUENTBIT_ROLLER_ENABLED") == "true"
+	certReaperEnabled := os.Getenv("CERTMANAGER_REAPER_ENABLED") == "true"
+	ciliumAuditEnabled := os.Getenv("CILIUM_IDENTITY_AUDITOR_ENABLED") == "true"
+	esNudgeEnabled := os.Getenv("EXTERNALSECRET_NUDGE_ENABLED") == "true"
+	csrApproveEnabled := os.Getenv("CSR_APPROVER_ENABLED") == "true"
 	labelerPath := getenv("NODE_LABELER_CONFIG_PATH", "/etc/node-labeler/labels.txt")
 
 	for name, setup := range map[string]func() error{
@@ -141,6 +153,14 @@ func main() {
 		"partition-pod-evictor":    func() error { return controller.SetupPartitionEvictor(mgr, cs) },
 		"failed-jobs-janitor":      func() error { return controller.SetupFailedJobsJanitor(mgr, cs) },
 		"converge-trigger":         func() error { return controller.SetupConvergeTrigger(mgr, cs) },
+		"dead-node-sweeper":        func() error { return controller.SetupDeadNodeSweeper(mgr, cs, dyn) },
+		"helmrelease-unlocker":     func() error { return controller.SetupHelmReleaseUnlocker(mgr, cs, dyn) },
+		"externalsecret-nudge":     func() error { return controller.SetupExternalSecretNudge(mgr, cs, dyn, esNudgeEnabled) },
+		"evicted-pod-janitor":      func() error { return controller.SetupEvictedPodJanitor(mgr, cs) },
+		"cronjob-catchup":          func() error { return controller.SetupCronJobCatchup(mgr, cs) },
+		"certmanager-reaper":       func() error { return controller.SetupCertManagerReaper(mgr, cs, dyn, certReaperEnabled) },
+		"cilium-identity-auditor":  func() error { return controller.SetupCiliumIdentityAuditor(mgr, cs, dyn, ciliumAuditEnabled) },
+		"csr-watcher":              func() error { return controller.SetupCSRWatcher(mgr, cs, csrApproveEnabled) },
 	} {
 		if err := setup(); err != nil {
 			log.Error(err, "unable to setup module", "module", name)
