@@ -12,6 +12,9 @@ tasks:
   build:
     script: 'CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION:-dev}" -o bin/node-host-agent ./cmd/agent'
     toolchains: 'system'
+    options:
+      # script contains an inline env assignment — must run via shell.
+      shell: true
     inputs:
       - '$VERSION'
       - 'cmd/**/*.go'

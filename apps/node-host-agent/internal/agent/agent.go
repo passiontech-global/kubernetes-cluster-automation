@@ -1,6 +1,12 @@
 // Package agent implements the node-host-agent runtime: a per-node
 // DaemonSet process exposing node-local Prometheus metrics and
 // health probes.
+//
+// The agent owns one prometheus.Registry shared by every subsystem
+// (sweeper, apiprober, hostmetrics). Subsystems implement the
+// Subsystem interface (blocking Run loop); pure metrics exporters
+// register prometheus.Collectors on Agent.Registry() and need no
+// goroutine — they collect at scrape time.
 package agent
 
 import (
@@ -12,7 +18,19 @@ import (
 	"runtime"
 	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// Subsystem is a long-running periodic component of the agent. Run
+// must block until ctx is cancelled and must not return errors — a
+// subsystem that hits a transient failure logs and retries internally
+// (fail-closed subsystems abort their cycle, never the agent).
+type Subsystem interface {
+	Name() string
+	Run(ctx context.Context)
+}
 
 // Config carries everything the agent needs from the environment.
 type Config struct {
@@ -22,35 +40,64 @@ type Config struct {
 	Version     string // release version injected at build time
 	MetricsAddr string // listen address for /metrics
 	ProbeAddr   string // listen address for /healthz + /readyz
+
+	// Registry is the shared metrics registry; nil → a fresh
+	// prometheus.NewRegistry(). Injected in tests to isolate
+	// collectors.
+	Registry *prometheus.Registry
+	// Subsystems are started as goroutines when Run is called.
+	Subsystems []Subsystem
 }
 
 // Agent serves the metrics and probe endpoints.
 type Agent struct {
 	cfg     Config
+	reg     *prometheus.Registry
 	started time.Time
 	ready   atomic.Bool
+	info    *prometheus.GaugeVec
 }
 
-// New returns an Agent for cfg.
+// New returns an Agent for cfg and registers the built-in identity
+// metrics on cfg.Registry.
 func New(cfg Config) *Agent {
-	return &Agent{cfg: cfg}
+	reg := cfg.Registry
+	if reg == nil {
+		reg = prometheus.NewRegistry()
+	}
+	a := &Agent{cfg: cfg, reg: reg}
+
+	a.info = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_host_agent_info",
+		Help: "Static agent identity.",
+	}, []string{"node", "pod", "namespace", "version", "go_version"})
+	a.info.WithLabelValues(cfg.NodeName, cfg.PodName, cfg.Namespace,
+		cfg.Version, runtime.Version()).Set(1)
+	reg.MustRegister(a.info)
+
+	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "node_host_agent_uptime_seconds",
+		Help: "Seconds since the agent started.",
+	}, func() float64 {
+		if a.started.IsZero() {
+			return 0
+		}
+		return time.Since(a.started).Seconds()
+	}))
+	return a
 }
+
+// Registry returns the agent's shared metrics registry — subsystems
+// and scrape-time collectors register here before Run is called.
+func (a *Agent) Registry() *prometheus.Registry { return a.reg }
 
 // NodeName returns the name of the node the agent runs on.
 func (a *Agent) NodeName() string { return a.cfg.NodeName }
 
 func (a *Agent) metricsMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		fmt.Fprint(w, "# HELP node_host_agent_info Static agent identity.\n")
-		fmt.Fprint(w, "# TYPE node_host_agent_info gauge\n")
-		fmt.Fprintf(w, "node_host_agent_info{node=%q,pod=%q,namespace=%q,version=%q,go_version=%q} 1\n",
-			a.cfg.NodeName, a.cfg.PodName, a.cfg.Namespace, a.cfg.Version, runtime.Version())
-		fmt.Fprint(w, "# HELP node_host_agent_uptime_seconds Seconds since the agent started.\n")
-		fmt.Fprint(w, "# TYPE node_host_agent_uptime_seconds counter\n")
-		fmt.Fprintf(w, "node_host_agent_uptime_seconds %.3f\n", time.Since(a.started).Seconds())
-	})
+	mux.Handle("/metrics", promhttp.HandlerFor(a.reg,
+		promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError}))
 	return mux
 }
 
@@ -69,10 +116,25 @@ func (a *Agent) probeMux() *http.ServeMux {
 	return mux
 }
 
-// Run binds both listeners, marks the agent ready, then blocks until
-// ctx is cancelled or a server fails. Shutdown is graceful.
+// Run starts the configured subsystems, binds both listeners, marks
+// the agent ready, then blocks until ctx is cancelled or a server
+// fails. Shutdown is graceful.
 func (a *Agent) Run(ctx context.Context) error {
 	a.started = time.Now()
+
+	for _, sub := range a.cfg.Subsystems {
+		sub := sub
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("subsystem panicked — stopped until agent restart",
+						"subsystem", sub.Name(), "panic", r)
+				}
+			}()
+			slog.Info("subsystem started", "name", sub.Name())
+			sub.Run(ctx)
+		}()
+	}
 
 	metricsLn, err := net.Listen("tcp", a.cfg.MetricsAddr)
 	if err != nil {

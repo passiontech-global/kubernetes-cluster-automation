@@ -6,8 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func TestProbeEndpoints(t *testing.T) {
@@ -82,5 +85,74 @@ func TestRunBindsAndShutsDown(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+// stubSubsystem records that Run was invoked and blocks until ctx is
+// cancelled — the contract every subsystem implements.
+type stubSubsystem struct {
+	ran    atomic.Bool
+	doneCh chan struct{}
+}
+
+func (s *stubSubsystem) Name() string { return "stub" }
+func (s *stubSubsystem) Run(ctx context.Context) {
+	s.ran.Store(true)
+	<-ctx.Done()
+	close(s.doneCh)
+}
+
+func TestRunStartsSubsystems(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sub := &stubSubsystem{doneCh: make(chan struct{})}
+	a := New(Config{
+		MetricsAddr: "127.0.0.1:0",
+		ProbeAddr:   "127.0.0.1:0",
+		Subsystems:  []Subsystem{sub},
+	})
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	deadline := time.After(5 * time.Second)
+	for !sub.ran.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("subsystem Run was not started")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case <-sub.doneCh:
+	case <-deadline:
+		t.Fatal("subsystem Run did not return after cancel")
+	}
+	<-done
+}
+
+func TestSubsystemMetricsOnSharedRegistry(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_stub_metric",
+		Help: "test",
+	}))
+	a := New(Config{Registry: reg})
+	a.started = time.Now()
+	srv := httptest.NewServer(a.metricsMux())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	out := string(body)
+	if !strings.Contains(out, "node_host_agent_stub_metric") {
+		t.Fatalf("subsystem metric missing from /metrics:\n%s", out)
+	}
+	if !strings.Contains(out, "node_host_agent_info") {
+		t.Fatalf("built-in info metric missing:\n%s", out)
 	}
 }
