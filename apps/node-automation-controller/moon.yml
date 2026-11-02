@@ -1,0 +1,34 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+language: 'go'
+layer: 'application'
+stack: 'backend'
+
+project:
+  title: 'node-automation-controller'
+  description: 'controller-runtime operator replacing the shell-operator Deployment + bash hooks for node lifecycle automation.'
+
+tasks:
+  build:
+    script: 'CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION:-dev}" -o bin/node-automation-controller ./cmd/manager'
+    toolchains: 'system'
+    inputs:
+      - '$VERSION'
+      - 'cmd/**/*.go'
+      - 'internal/**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+    outputs:
+      - 'bin/node-automation-controller'
+
+  image:
+    script: 'ko build --bare --sbom=none --tags "${TAGS:-latest}" ./cmd/manager'
+    toolchains: 'system'
+    inputs:
+      - 'cmd/**/*.go'
+      - 'internal/**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.ko.yaml'
+    options:
+      cache: false

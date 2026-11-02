@@ -1,4 +1,17 @@
-# node-automation-controller
+# kubernetes-node-automation
+
+[Moon](https://moonrepo.dev) monorepo for node lifecycle automation on
+Kubernetes. Formerly `node-automation-controller` — the operator is now
+one app in this workspace, alongside the per-node host agent.
+
+## Apps
+
+| App | Moon project | Kind | Image |
+| --- | --- | --- | --- |
+| `apps/node-automation-controller` | `node-automation-controller` | Deployment (controller-runtime operator) | `ghcr.io/passiontech-global/node-automation-controller` |
+| `apps/node-host-agent` | `node-host-agent` | DaemonSet (per-node agent) | `ghcr.io/passiontech-global/node-host-agent` |
+
+### node-automation-controller
 
 Lightweight Go operator (`sigs.k8s.io/controller-runtime`) that replaces
 the `shell-operator` Deployment + 10 bash hooks in
@@ -9,7 +22,7 @@ All logic is compiled in — no shell, no `kubectl`/`jq`/`curl`/`nslookup`
 forks, no hook ConfigMap. The image is `distroless/static:nonroot`
 (~18MB, ~20–35MiB RAM).
 
-## Modules (ported 1:1 from the bash hooks)
+#### Modules (ported 1:1 from the bash hooks)
 
 | Module | Mode | Cadence | What it does |
 | --- | --- | --- | --- |
@@ -25,7 +38,7 @@ forks, no hook ConfigMap. The image is `distroless/static:nonroot`
 | `failed-jobs-janitor` | periodic | 60m | Delete Jobs `Failed` for >24h (cap 50/run). |
 | `converge-trigger` | watch ConfigMap (node-ops) | event | Create converge Jobs from CronJob templates when mounted ConfigMaps change (15s debounce, 120s dedupe). |
 
-## Interface contract
+#### Interface contract
 
 - Metrics: `:9115/metrics` — emits `shell_operator_hook_run_errors_total{queue}`
   (backwards-compatible with existing PrometheusRule alerts) plus
@@ -37,16 +50,59 @@ forks, no hook ConfigMap. The image is `distroless/static:nonroot`
 - Env: `CILIUM_TAINT_REAPER_ENABLED`, `FLUENTBIT_ROLLER_ENABLED`,
   `NODE_LABELER_CONFIG_PATH`.
 
+### node-host-agent
+
+Per-node agent intended to run as a DaemonSet. Currently a skeleton:
+serves `node_host_agent_info`/`node_host_agent_uptime_seconds` on
+`:9115/metrics`, probes on `:8081/healthz` + `:8081/readyz`, `--version`,
+graceful shutdown. Node identity comes from the downward API
+(`NODE_NAME`, `POD_NAME`, `POD_NAMESPACE`).
+
+## Repository layout
+
+```
+.moon/                       moon workspace config + shared tasks
+apps/
+  node-automation-controller/  moon project (own go.mod, cliff.toml, .ko.yaml, Dockerfile)
+  node-host-agent/             moon project (own go.mod, cliff.toml, .ko.yaml, Dockerfile)
+.github/workflows/
+  ci.yml                         PR gate — moon ci on affected projects
+  release-app.yml                reusable release pipeline
+  release-<app>.yml              per-app release triggers
+mise.toml                      tool pins: go, git-cliff, ko, moon
+```
+
+Each app is an independent Go module with its own dependencies, image
+build (`ko`), and release cadence.
+
 ## Development
 
 ```sh
-mise install            # go + git-cliff
-go test -race ./...
-go build -o bin/node-automation-controller ./cmd/manager
+mise install                 # go + git-cliff + ko + moon (all pinned)
+
+moon query projects          # list workspace projects
+moon run :format :vet :test  # shared tasks across all projects
+moon run node-host-agent:build
+moon run node-automation-controller:image   # ko build (needs KO_DOCKER_REPO)
 ```
 
-Releases: push conventional commits to `main` —
-`.github/workflows/release.yml` runs `git-cliff` for the semver bump,
-builds the static binary, pushes
-`ghcr.io/passiontech-global/node-automation-controller:{version,latest}`
-and creates the GitHub Release.
+Common tasks (`test`, `vet`, `format`) are defined once in
+`.moon/tasks/all.yml` and inherited by every project; `build`/`image`
+live in each app's `moon.yml`. All binaries come from mise — moon tasks
+run on the `system` toolchain.
+
+## Releases
+
+Per-app, independent of each other. Tag scheme: `<app>/vX.Y.Z`.
+
+- Push to `main` under `apps/<app>/**` → `release-<app>.yml` runs
+  automatically (other apps untouched).
+- Manual: `gh workflow run release-node-host-agent.yml` — optional
+  `-f version=v0.1.0`, `-f prerelease=true`.
+- Pipeline (`release-app.yml`): `git-cliff` semver bump over
+  conventional commits scoped to `apps/<app>` → `moon` vet/test/build →
+  `ko` pushes `ghcr.io/passiontech-global/<app>:{version,latest}` →
+  GitHub Release `<app>/vX.Y.Z`.
+
+Note: `node-automation-controller`'s pre-monorepo `vX.Y.Z` tags remain
+valid for changelog history; new tags carry the app prefix.

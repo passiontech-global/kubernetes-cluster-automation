@@ -1,0 +1,46 @@
+name: Release node-automation-controller
+
+# Releases only this app — other apps in the monorepo are unaffected.
+# Pipeline lives in release-app.yml.
+#
+# Triggers:
+#   push main            changes under apps/node-automation-controller
+#   workflow_dispatch    gh workflow run release-node-automation-controller.yml [-f version=v0.1.0]
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/node-automation-controller/**"
+      - ".moon/**"
+      - "mise.toml"
+      - ".github/workflows/release-app.yml"
+      - ".github/workflows/release-node-automation-controller.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag (e.g. v0.1.0). Empty = auto semver bump"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-node-automation-controller
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-app.yml
+    with:
+      app: node-automation-controller
+      version: ${{ inputs.version }}
+      prerelease: ${{ inputs.prerelease }}
+      legacy_v_tags: true
+    secrets: inherit

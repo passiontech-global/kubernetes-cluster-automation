@@ -1,0 +1,27 @@
+$schema: 'https://moonrepo.dev/schemas/tasks.json'
+
+# Tasks inherited by every project in the workspace. All toolchain
+# binaries (go, ko, git-cliff) are provided by mise, so tasks run on
+# the system toolchain — moon never installs tools itself.
+tasks:
+  test:
+    command: 'go test -race ./...'
+    toolchains: 'system'
+    inputs:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+
+  vet:
+    command: 'go vet ./...'
+    toolchains: 'system'
+    inputs:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+
+  format:
+    script: 'test -z "$(gofmt -l .)"'
+    toolchains: 'system'
+    inputs:
+      - '**/*.go'

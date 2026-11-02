@@ -1,0 +1,142 @@
+name: Release app (reusable)
+
+# Shared release pipeline for every app in this monorepo. Called by
+# .github/workflows/release-<app>.yml — do not run directly.
+#
+# Flow: resolve version -> git-cliff semver bump (conventional commits,
+# scoped to apps/<app>) -> moon vet/test/build -> ko push to GHCR ->
+# GitHub Release tagged "<app>/vX.Y.Z".
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: "App / moon project id (e.g. node-automation-controller)"
+        required: true
+        type: string
+      version:
+        description: "Release version (e.g. v0.1.0). Empty = auto semver bump"
+        required: false
+        default: ""
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+      legacy_v_tags:
+        description: "Also consider bare 'vX.Y.Z' tags (pre-monorepo releases)"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      APP: ${{ inputs.app }}
+      IMAGE: ghcr.io/passiontech-global/${{ inputs.app }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain (go + git-cliff + ko + moon pinned in mise.toml)
+        uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute version and changelog
+        run: |
+          set -euo pipefail
+          version_in="${{ inputs.version }}"
+
+          # Latest release tag for this app. Tag scheme: "<app>/vX.Y.Z";
+          # legacy_v_tags additionally considers pre-monorepo "vX.Y.Z".
+          if [ "${{ inputs.legacy_v_tags }}" = "true" ]; then
+            last_tag=$(git tag -l "$APP/v[0-9]*" -l "v[0-9]*" --sort=-v:refname | head -1)
+          else
+            last_tag=$(git tag -l "$APP/v[0-9]*" --sort=-v:refname | head -1)
+          fi
+          if [ -z "$last_tag" ]; then
+            last_tag="$APP/v0.0.0"
+            git tag "$last_tag" "$(git rev-list --max-parents=0 HEAD)"
+          fi
+          last_ver="${last_tag##*/}"
+
+          if [ -n "$version_in" ]; then
+            # Accept both "v0.1.0" and "<app>/v0.1.0" spellings.
+            rel_version="${version_in##*/}"
+            case "$rel_version" in v*) ;; *) rel_version="v$rel_version" ;; esac
+          else
+            bumped=$(git-cliff --bumped-version \
+              --config "apps/$APP/cliff.toml" \
+              --include-path "apps/$APP/**")
+            rel_version="v$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' <<<"$bumped" | head -1)"
+            # No new conventional commits since last tag -> git-cliff
+            # echoes the same version; force a patch bump so the
+            # release tag never collides.
+            if [ "$rel_version" = "$last_ver" ]; then
+              IFS=. read -r major minor patch <<<"${last_ver#v}"
+              rel_version="v$major.$minor.$((patch + 1))"
+            fi
+          fi
+          rel_tag="$APP/$rel_version"
+
+          git-cliff --unreleased --tag "$rel_tag" \
+            --config "apps/$APP/cliff.toml" \
+            --include-path "apps/$APP/**" > changelog.md
+          grep -q '[^[:space:]]' changelog.md || echo "No user-facing changes." > changelog.md
+          {
+            echo "Range: \`$last_tag\` -> \`$rel_tag\`"
+            echo ""
+            cat changelog.md
+          } > notes.md
+          cat notes.md
+
+          echo "REL_VERSION=$rel_version" >>"$GITHUB_ENV"
+          echo "REL_TAG=$rel_tag" >>"$GITHUB_ENV"
+
+      - name: Vet and test
+        run: moon run "$APP:vet" "$APP:test"
+
+      - name: Build static binary
+        env:
+          VERSION: ${{ env.REL_VERSION }}
+        run: |
+          moon run "$APP:build"
+          file "apps/$APP/bin/$APP"
+          "apps/$APP/bin/$APP" --version
+
+      - name: Package assets
+        run: |
+          set -euo pipefail
+          mkdir -p "apps/$APP/dist"
+          cp "apps/$APP/bin/$APP" "apps/$APP/dist/$APP-linux-x86_64"
+          tar -czf "apps/$APP/dist/$APP-linux-x86_64.tar.gz" -C "apps/$APP/bin" "$APP"
+          (cd "apps/$APP/dist" && sha256sum "$APP-linux-x86_64" "$APP-linux-x86_64.tar.gz" > SHA256SUMS.txt)
+          cat "apps/$APP/dist/SHA256SUMS.txt"
+
+      - name: Build and push GHCR image (ko, see apps/<app>/.ko.yaml)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ env.REL_VERSION }}
+          TAGS: ${{ env.REL_VERSION }},latest
+          KO_DOCKER_REPO: ${{ env.IMAGE }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          # ko publishes directly: --bare keeps the image name exactly
+          # $IMAGE (no <hash> suffix); tags come from --tags.
+          moon run "$APP:image"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REL_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          args=(--title "$APP $REL_VERSION" --notes-file notes.md)
+          [ "$REL_PRERELEASE" != "true" ] || args+=(--prerelease)
+          gh release create "$REL_TAG" "apps/$APP/dist/"* notes.md "${args[@]}"

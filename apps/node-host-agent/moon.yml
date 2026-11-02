@@ -1,0 +1,32 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+language: 'go'
+layer: 'application'
+stack: 'backend'
+
+project:
+  title: 'node-host-agent'
+  description: 'Per-node agent (DaemonSet) for the kubernetes-node-automation stack.'
+
+tasks:
+  build:
+    script: 'CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION:-dev}" -o bin/node-host-agent ./cmd/agent'
+    toolchains: 'system'
+    inputs:
+      - '$VERSION'
+      - 'cmd/**/*.go'
+      - 'internal/**/*.go'
+      - 'go.mod'
+    outputs:
+      - 'bin/node-host-agent'
+
+  image:
+    script: 'ko build --bare --sbom=none --tags "${TAGS:-latest}" ./cmd/agent'
+    toolchains: 'system'
+    inputs:
+      - 'cmd/**/*.go'
+      - 'internal/**/*.go'
+      - 'go.mod'
+      - '.ko.yaml'
+    options:
+      cache: false
