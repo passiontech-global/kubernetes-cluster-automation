@@ -248,7 +248,7 @@ func fakeDiscoveryAPIServer(t *testing.T) *httptest.Server {
 
 // With a kubeconfig pointing at the fake apiserver, main() must run the
 // entire boot path — GetConfigOrDie, NewManager, clientset + dynamic
-// client, all 20 module setups, health probes, "starting manager" —
+// client, all 21 module setups, health probes, "starting manager" —
 // then block in mgr.Start. SIGINT (what SetupSignalHandler maps to ctx
 // cancel on pod termination) must unwind it to a clean exit 0.
 func TestMainStartsManagerUntilSignal(t *testing.T) {
@@ -368,6 +368,8 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		"CILIUM_IDENTITY_AUDITOR_ENABLED",
 		"EXTERNALSECRET_NUDGE_ENABLED",
 		"CSR_APPROVER_ENABLED",
+		"CONCOURSE_JANITOR_ENABLED",
+		"CONCOURSE_JANITOR_SCRIPT_PATH",
 		"NODE_LABELER_CONFIG_PATH",
 	}
 	clear := func(t *testing.T) {
@@ -380,11 +382,15 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		clear(t)
 		mc := moduleConfigFromEnv()
 		if mc.ciliumEnabled || mc.fluentbitEnabled || mc.certReaperEnabled ||
-			mc.ciliumAuditEnabled || mc.esNudgeEnabled || mc.csrApproveEnabled {
+			mc.ciliumAuditEnabled || mc.esNudgeEnabled || mc.csrApproveEnabled ||
+			mc.concourseJanitorEnabled {
 			t.Fatalf("expected all gates disabled, got %+v", mc)
 		}
 		if mc.labelerPath != "/etc/node-labeler/labels.txt" {
 			t.Fatalf("labelerPath = %q, want default", mc.labelerPath)
+		}
+		if mc.concourseJanitorScript != "/etc/concourse-janitor/prune.sh" {
+			t.Fatalf("concourseJanitorScript = %q, want default", mc.concourseJanitorScript)
 		}
 	})
 
@@ -396,14 +402,20 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		t.Setenv("CILIUM_IDENTITY_AUDITOR_ENABLED", "true")
 		t.Setenv("EXTERNALSECRET_NUDGE_ENABLED", "true")
 		t.Setenv("CSR_APPROVER_ENABLED", "true")
+		t.Setenv("CONCOURSE_JANITOR_ENABLED", "true")
+		t.Setenv("CONCOURSE_JANITOR_SCRIPT_PATH", "/custom/prune.sh")
 		t.Setenv("NODE_LABELER_CONFIG_PATH", "/custom/labels.txt")
 		mc := moduleConfigFromEnv()
 		if !mc.ciliumEnabled || !mc.fluentbitEnabled || !mc.certReaperEnabled ||
-			!mc.ciliumAuditEnabled || !mc.esNudgeEnabled || !mc.csrApproveEnabled {
+			!mc.ciliumAuditEnabled || !mc.esNudgeEnabled || !mc.csrApproveEnabled ||
+			!mc.concourseJanitorEnabled {
 			t.Fatalf("expected all gates enabled, got %+v", mc)
 		}
 		if mc.labelerPath != "/custom/labels.txt" {
 			t.Fatalf("labelerPath = %q, want /custom/labels.txt", mc.labelerPath)
+		}
+		if mc.concourseJanitorScript != "/custom/prune.sh" {
+			t.Fatalf("concourseJanitorScript = %q, want /custom/prune.sh", mc.concourseJanitorScript)
 		}
 	})
 }
@@ -472,27 +484,29 @@ func stubDyn() *dynamicfake.FakeDynamicClient {
 	return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
 }
 
-// Every module registers exactly one runnable on the manager — 20 in
+// Every module registers exactly one runnable on the manager — 21 in
 // the map — except certmanager-reaper and cilium-identity-auditor,
-// which skip mgr.Add entirely while disabled (18 runnables then).
+// which skip mgr.Add entirely while disabled (19 runnables then).
 // The other feature flags only gate the tick body, not registration.
 func TestSetupModules(t *testing.T) {
 	t.Run("all gates enabled", func(t *testing.T) {
 		m := newStubManager()
 		mc := moduleConfig{
-			ciliumEnabled:      true,
-			fluentbitEnabled:   true,
-			certReaperEnabled:  true,
-			ciliumAuditEnabled: true,
-			esNudgeEnabled:     true,
-			csrApproveEnabled:  true,
-			labelerPath:        filepath.Join(t.TempDir(), "labels.txt"),
+			ciliumEnabled:           true,
+			fluentbitEnabled:        true,
+			certReaperEnabled:       true,
+			ciliumAuditEnabled:      true,
+			esNudgeEnabled:          true,
+			csrApproveEnabled:       true,
+			concourseJanitorEnabled: true,
+			concourseJanitorScript:  filepath.Join(t.TempDir(), "prune.sh"),
+			labelerPath:             filepath.Join(t.TempDir(), "labels.txt"),
 		}
-		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), mc); err != nil {
+		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), &rest.Config{}, mc); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
-		if len(m.added) != 20 {
-			t.Fatalf("registered %d runnables, want 20", len(m.added))
+		if len(m.added) != 21 {
+			t.Fatalf("registered %d runnables, want 21", len(m.added))
 		}
 		for i, r := range m.added {
 			if r == nil {
@@ -503,11 +517,11 @@ func TestSetupModules(t *testing.T) {
 
 	t.Run("all gates disabled", func(t *testing.T) {
 		m := newStubManager()
-		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), moduleConfig{}); err != nil {
+		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), &rest.Config{}, moduleConfig{}); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
-		if len(m.added) != 18 {
-			t.Fatalf("registered %d runnables, want 18", len(m.added))
+		if len(m.added) != 19 {
+			t.Fatalf("registered %d runnables, want 19", len(m.added))
 		}
 	})
 }
@@ -518,7 +532,7 @@ func TestSetupModulesErrorPropagates(t *testing.T) {
 	want := errors.New("manager rejected runnable")
 	m := newStubManager()
 	m.addErr = want
-	err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), moduleConfig{})
+	err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), &rest.Config{}, moduleConfig{})
 	if !errors.Is(err, want) {
 		t.Fatalf("setupModules error = %v, want %v", err, want)
 	}

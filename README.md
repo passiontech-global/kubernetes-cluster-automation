@@ -36,6 +36,7 @@ forks, no hook ConfigMap. The image is `distroless/static:nonroot`
 | `partition-pod-evictor` | periodic | 5m | Taint `node.ops/network-partitioned` + evict `flux-system` pods off nodes with NWPD partition conditions (>10m). |
 | `failed-jobs-janitor` | periodic | 60m | Delete Jobs `Failed` for >24h (cap 50/run). |
 | `converge-trigger` | watch ConfigMap (node-ops) | event | Create converge Jobs from CronJob templates when mounted ConfigMaps change (15s debounce, 120s dedupe). |
+| `concourse-workdir-janitor` | periodic | 30m | Prune shared-cache via exec + sequential land/drain/wipe of `concourse-worker` pods when work-dir exceeds the 100GiB cap or nodefs crosses 60%. **Opt-in:** `CONCOURSE_JANITOR_ENABLED=true`. |
 
 #### Interface contract
 
@@ -47,7 +48,9 @@ forks, no hook ConfigMap. The image is `distroless/static:nonroot`
 - Flags: `--metrics-bind-address` (default `:9115`),
   `--health-probe-bind-address` (default `:8081`), `--version`.
 - Env: `CILIUM_TAINT_REAPER_ENABLED`, `FLUENTBIT_ROLLER_ENABLED`,
-  `NODE_LABELER_CONFIG_PATH`.
+  `NODE_LABELER_CONFIG_PATH`, `CONCOURSE_JANITOR_ENABLED`,
+  `CONCOURSE_JANITOR_SCRIPT_PATH` (default
+  `/etc/concourse-janitor/prune.sh`).
 
 ### node-host-agent
 

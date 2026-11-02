@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -145,7 +146,7 @@ func main() {
 
 	mc := moduleConfigFromEnv()
 
-	if err := setupModules(mgr, cs, dyn, mc); err != nil {
+	if err := setupModules(mgr, cs, dyn, cfg, mc); err != nil {
 		os.Exit(1)
 	}
 
@@ -170,33 +171,38 @@ func main() {
 // the modules need — the same flags the shell-operator read from its
 // ConfigMaps (see header contract).
 type moduleConfig struct {
-	ciliumEnabled      bool
-	fluentbitEnabled   bool
-	certReaperEnabled  bool
-	ciliumAuditEnabled bool
-	esNudgeEnabled     bool
-	csrApproveEnabled  bool
-	labelerPath        string
+	ciliumEnabled           bool
+	fluentbitEnabled        bool
+	certReaperEnabled       bool
+	ciliumAuditEnabled      bool
+	esNudgeEnabled          bool
+	csrApproveEnabled       bool
+	labelerPath             string
+	concourseJanitorEnabled bool
+	concourseJanitorScript  string
 }
 
 // moduleConfigFromEnv resolves every feature-gate env var once, after
 // the clients exist and before any module is wired.
 func moduleConfigFromEnv() moduleConfig {
 	return moduleConfig{
-		ciliumEnabled:      os.Getenv("CILIUM_TAINT_REAPER_ENABLED") == "true",
-		fluentbitEnabled:   os.Getenv("FLUENTBIT_ROLLER_ENABLED") == "true",
-		certReaperEnabled:  os.Getenv("CERTMANAGER_REAPER_ENABLED") == "true",
-		ciliumAuditEnabled: os.Getenv("CILIUM_IDENTITY_AUDITOR_ENABLED") == "true",
-		esNudgeEnabled:     os.Getenv("EXTERNALSECRET_NUDGE_ENABLED") == "true",
-		csrApproveEnabled:  os.Getenv("CSR_APPROVER_ENABLED") == "true",
-		labelerPath:        getenv("NODE_LABELER_CONFIG_PATH", "/etc/node-labeler/labels.txt"),
+		ciliumEnabled:           os.Getenv("CILIUM_TAINT_REAPER_ENABLED") == "true",
+		fluentbitEnabled:        os.Getenv("FLUENTBIT_ROLLER_ENABLED") == "true",
+		certReaperEnabled:       os.Getenv("CERTMANAGER_REAPER_ENABLED") == "true",
+		ciliumAuditEnabled:      os.Getenv("CILIUM_IDENTITY_AUDITOR_ENABLED") == "true",
+		esNudgeEnabled:          os.Getenv("EXTERNALSECRET_NUDGE_ENABLED") == "true",
+		csrApproveEnabled:       os.Getenv("CSR_APPROVER_ENABLED") == "true",
+		labelerPath:             getenv("NODE_LABELER_CONFIG_PATH", "/etc/node-labeler/labels.txt"),
+		concourseJanitorEnabled: os.Getenv("CONCOURSE_JANITOR_ENABLED") == "true",
+		concourseJanitorScript: getenv("CONCOURSE_JANITOR_SCRIPT_PATH",
+			"/etc/concourse-janitor/prune.sh"),
 	}
 }
 
 // setupModules registers every node-ops module on the manager. The map
 // (not a slice) keeps registration order deliberately random — no
 // module may rely on another being wired first.
-func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, mc moduleConfig) error {
+func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, cfg *rest.Config, mc moduleConfig) error {
 	log := ctrl.Log.WithName("main")
 	for name, setup := range map[string]func() error{
 		"konnectivity-patcher":     func() error { return controller.SetupKonnectivityPatcher(mgr, cs) },
@@ -219,6 +225,10 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 		"cilium-identity-auditor":  func() error { return controller.SetupCiliumIdentityAuditor(mgr, cs, dyn, mc.ciliumAuditEnabled) },
 		"csr-watcher":              func() error { return controller.SetupCSRWatcher(mgr, cs, mc.csrApproveEnabled) },
 		"apiserver-endpoint-guard": func() error { return controller.SetupAPIServerEndpointGuard(mgr, cs) },
+		"concourse-workdir-janitor": func() error {
+			return controller.SetupConcourseWorkdirJanitor(mgr, cs, cfg,
+				mc.concourseJanitorEnabled, mc.concourseJanitorScript)
+		},
 	} {
 		if err := setup(); err != nil {
 			log.Error(err, "unable to setup module", "module", name)
