@@ -38,6 +38,15 @@
 // A quarantined backend that probes healthy for 2 consecutive cycles is
 // re-added to both objects and dropped from the annotation.
 //
+// Coverage caveats: the kube-apiserver endpoint reconciler re-adds
+// quarantined IPs every ~10s (the wedged apiserver still renews its
+// lease — writes bypass the watch cache), so while the quarantine set
+// is non-empty the guard re-applies on a faster cadence (Start, 10s).
+// And endpoint removal only affects NEW connections: pods already
+// pinned to the wedged apiserver keep their TCP stream until it
+// breaks — the real cure stays the sig13 k0scontroller restart; this
+// module bridges the gap for new connections.
+//
 // RBAC (infrastructure/base/node-ops/node-automation-controller/rbac.yaml):
 // Role in ns default — get/update/patch on endpoints[kubernetes] and
 // endpointslices[kubernetes]; both objects are fetched by fixed name so
@@ -56,6 +65,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -78,12 +88,15 @@ const (
 	// restarts and is human-readable in `kubectl describe ep kubernetes`.
 	endpointGuardAnno = "node.ops/quarantined-endpoints"
 
-	endpointGuardInterval   = 30 * time.Second
-	endpointGuardProbeTO    = 8 * time.Second // same budget as the kubelet reaper probes
-	endpointGuardRVGap      = 200             // live_rv - cache_rv at/above = lagging cache
-	endpointGuardGapCycles  = 2               // consecutive gapped cycles before wedge
-	endpointGuardFrozenCyc  = 3               // cache_rv frozen cycles (live_rv growing)
-	endpointGuardRecoverCyc = 2               // consecutive healthy cycles to re-add
+	endpointGuardInterval           = 30 * time.Second
+	endpointGuardQuarantineInterval = 10 * time.Second
+	endpointGuardRunTimeout         = 25 * time.Second
+	endpointGuardErrCycles          = 2
+	endpointGuardProbeTO            = 8 * time.Second // same budget as the kubelet reaper probes
+	endpointGuardRVGap              = 200             // live_rv - cache_rv at/above = lagging cache
+	endpointGuardGapCycles          = 2               // consecutive gapped cycles before wedge
+	endpointGuardFrozenCyc          = 3               // cache_rv frozen cycles (live_rv growing)
+	endpointGuardRecoverCyc         = 2               // consecutive healthy cycles to re-add
 	// endpointGuardMinBackends: clusters with fewer controller IPs than
 	// this get probe+log+metrics only — editing endpoints there can only
 	// empty the set (production/cicd run a single controller).
@@ -105,6 +118,7 @@ type backendProbeState struct {
 	gapStreak    int // consecutive cycles with live_rv-cache_rv >= threshold
 	frozenStreak int // consecutive cycles cache_rv flat while live_rv grew
 	okStreak     int // consecutive healthy cycles (recovery latch)
+	errStreak    int // consecutive probe transport/5xx failures
 	lastLiveRV   int64
 	lastCacheRV  int64
 	haveLast     bool
@@ -123,13 +137,50 @@ type apiServerEndpointGuard struct {
 	// backends "wedged", the last-healthy guard blocks every edit).
 	rt       http.RoundTripper
 	backends map[string]*backendProbeState
+	log      logr.Logger
+	// quarantineActive switches Start to the faster re-apply cadence —
+	// set from the annotation each cycle.
+	quarantineActive bool
 }
 
 // SetupAPIServerEndpointGuard registers the 30s wedge sweep.
 func SetupAPIServerEndpointGuard(mgr ctrl.Manager, cs kubernetes.Interface) error {
 	g := &apiServerEndpointGuard{cs: cs, backends: map[string]*backendProbeState{}}
 	g.probeFn = g.probe
-	return addPeriodic(mgr, endpointGuardQueue, endpointGuardInterval, g.run)
+	g.log = mgr.GetLogger().WithName(endpointGuardQueue)
+	return mgr.Add(g)
+}
+
+// Start implements manager.Runnable — leader-gated like every other
+// periodic module (plain Runnables default NeedLeaderElection()=true).
+// Adaptive cadence: 30s steady-state, 10s while the quarantine set is
+// non-empty (see the coverage-caveats note above: the endpoint
+// reconciler re-adds quarantined IPs every ~10s).
+func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
+	interval := endpointGuardInterval
+	for {
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+		// Per-cycle bound: sequential probes + clientset calls must
+		// never stall the loop past the interval.
+		runCtx, cancel := context.WithTimeout(ctx, endpointGuardRunTimeout)
+		err := g.run(runCtx)
+		cancel()
+		if err != nil {
+			metrics.IncError(endpointGuardQueue)
+			g.log.Error(err, "sweep failed")
+		}
+		if g.quarantineActive {
+			interval = endpointGuardQuarantineInterval
+		} else {
+			interval = endpointGuardInterval
+		}
+	}
 }
 
 func (g *apiServerEndpointGuard) run(ctx context.Context) error {
@@ -155,6 +206,7 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 
 	activeIPs := endpointIPs(ep)
 	quarantinedIPs := parseQuarantineAnnotation(ep)
+	g.quarantineActive = len(quarantinedIPs) > 0
 	allIPs := unionIPs(activeIPs, quarantinedIPs)
 	if len(allIPs) == 0 {
 		log.Info("sweep done: no controller endpoints")
@@ -178,14 +230,18 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 
 		var o outcome
 		if res.err != nil {
-			// Timeout / non-2xx = wedge signal this cycle; streaks
+			// Timeout / non-2xx: wedge signal only after
+			// endpointGuardErrCycles consecutive failures — a single
+			// WAN/TLS blip must not pull a healthy backend. Streaks
 			// reset so a flap doesn't resume mid-count on recovery.
-			o.wedged = true
+			st.errStreak++
+			o.wedged = st.errStreak >= endpointGuardErrCycles
 			st.gapStreak, st.frozenStreak, st.okStreak = 0, 0, 0
 			st.haveLast = false
 			log.Error(res.err, "backend probe failed — wedge signal", "ip", ip)
 			metrics.ObserveAPIBackend(ip, -1, quarantinedIPs[ip])
 		} else {
+			st.errStreak = 0
 			gap := res.liveRV - res.cacheRV
 			if gap >= endpointGuardRVGap {
 				st.gapStreak++
@@ -494,7 +550,7 @@ func addEndpointIP(ep *corev1.Endpoints, ip string) {
 	idx := -1
 	for i, sub := range ep.Subsets {
 		for _, p := range sub.Ports {
-			if p.Port == 443 || p.Name == "https" {
+			if p.Port == 6443 || p.Name == "https" {
 				idx = i
 				break
 			}
@@ -510,7 +566,7 @@ func addEndpointIP(ep *corev1.Endpoints, ip string) {
 		ep.Subsets = []corev1.EndpointSubset{{
 			Addresses: []corev1.EndpointAddress{{IP: ip}},
 			Ports: []corev1.EndpointPort{
-				{Name: "https", Port: 443, Protocol: corev1.ProtocolTCP},
+				{Name: "https", Port: 6443, Protocol: corev1.ProtocolTCP},
 			},
 		}}
 		return

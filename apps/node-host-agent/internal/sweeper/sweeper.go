@@ -112,6 +112,9 @@ func (c *Config) applyDefaults() {
 	if c.BaseDir == "" {
 		c.BaseDir = defaultBaseDir
 	}
+	// A trailing "/" would defeat the mount-boundary string compare
+	// (mount table entries are canonical paths).
+	c.BaseDir = strings.TrimRight(c.BaseDir, "/")
 	if c.MinAge <= 0 {
 		c.MinAge = defaultMinAge
 	}

@@ -166,20 +166,20 @@ func main() {
 	}
 
 	// --- apiprober: apiserver watch-cache wedge guard ---
-	// Enabled iff NODE_HOST_AGENT_ENABLE_APIPROBER=true, or "auto"
-	// (default) and the HAProxy admin socket exists — i.e. only on
-	// controller nodes carrying the api-local-lb sidecar.
+	// NODE_HOST_AGENT_ENABLE_APIPROBER: "auto" (default) = on — the
+	// prober meters discover_fail cycles while the api-local-lb socket
+	// is absent, so it only acts on workers carrying api-local-lb.
 	apiproberSocket := getenv("NODE_HOST_AGENT_APIPROBER_SOCKET",
-		"/run/haproxy-api-local.sock")
-	apiproberEnabled := envBool("NODE_HOST_AGENT_ENABLE_APIPROBER", false)
-	if v := getenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto"); v == "auto" {
-		_, err := os.Stat(apiproberSocket)
-		apiproberEnabled = err == nil
-	}
+		"/run/api-local-lb-admin.sock")
+	// "auto" (default) = enabled; a missing socket is NOT a startup
+	// gate — the prober self-discovers each cycle and meters
+	// discover_fail, so it also comes alive when api-local-lb is
+	// installed after this pod started. "false" disables explicitly.
+	apiproberEnabled := getenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto") != "false"
 	if apiproberEnabled {
 		pb, err := apiprober.New(apiprober.Config{
 			SocketPath:    apiproberSocket,
-			BackendName:   getenv("NODE_HOST_AGENT_APIPROBER_BACKEND", "kube_apiserver"),
+			BackendName:   getenv("NODE_HOST_AGENT_APIPROBER_BACKEND", "api_local_back"),
 			Interval:      envDuration("NODE_HOST_AGENT_APIPROBER_INTERVAL", 30*time.Second),
 			Mode:          getenv("NODE_HOST_AGENT_APIPROBER_MODE", apiprober.ModeDryRun),
 			GapMin:        envInt64("NODE_HOST_AGENT_APIPROBER_GAP_MIN", 10000),
@@ -198,7 +198,7 @@ func main() {
 			// (swap to /api/v1/namespaces/default/services?limit=1
 			// if the cluster doesn't serve leases under core/v1).
 			LivePath: getenv("NODE_HOST_AGENT_APIPROBER_LIVE_PATH",
-				"/api/v1/namespaces/default/leases?limit=1"),
+				"/api/v1/nodes?limit=1"),
 			CachePath: getenv("NODE_HOST_AGENT_APIPROBER_CACHE_PATH",
 				"/api/v1/nodes?limit=1&resourceVersion=0"),
 		}, reg)

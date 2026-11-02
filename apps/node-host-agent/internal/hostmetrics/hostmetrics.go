@@ -33,6 +33,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -185,7 +186,10 @@ func (c *Collector) collectNebula(ch chan<- prometheus.Metric) {
 		return // interface absent → metrics absent (documented choice)
 	}
 	up := 0.0
-	if strings.TrimSpace(string(oper)) == "up" {
+	switch strings.TrimSpace(string(oper)) {
+	// TUN devices (neb1 is nebula's tun) often report "unknown" rather
+	// than "up" — the link exists and is administratively up.
+	case "up", "unknown":
 		up = 1
 	}
 	ch <- prometheus.MustNewConstMetric(c.descNebUp,
@@ -222,7 +226,12 @@ func (c *Collector) collectK0sDrift(ch chan<- prometheus.Metric) {
 		if err := yaml.Unmarshal(data, &parsed); err == nil {
 			drift = 0
 			for _, flag := range c.cfg.RemovedFlags {
-				if strings.Contains(string(data), flag) {
+				// Anchored key match (same shape as the canonical
+				// grep "^[[:space:]]*flag[[:space:]]*:") — a substring
+				// match would fire on the name inside a comment or a
+				// value.
+				re := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(flag) + `\s*:`)
+				if re.Match(data) {
 					drift = 1
 					break
 				}

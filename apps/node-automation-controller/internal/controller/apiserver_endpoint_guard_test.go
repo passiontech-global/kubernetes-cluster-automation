@@ -189,8 +189,9 @@ func TestEndpointGuardQuarantineOnFrozenCache(t *testing.T) {
 	}
 }
 
-// A probe transport error (timeout / 5xx) is a wedge verdict in the
-// same cycle — no streak required.
+// A probe transport error (timeout / 5xx) wedges only after
+// endpointGuardErrCycles consecutive failures — a single blip is not
+// a verdict.
 func TestEndpointGuardQuarantineOnProbeError(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
@@ -200,8 +201,10 @@ func TestEndpointGuardQuarantineOnProbeError(t *testing.T) {
 		"10.0.0.2": apiHealthyProbe(1000),
 	}
 	g := newEndpointGuard(cs, probes)
-	if err := g.run(ctx); err != nil {
-		t.Fatal(err)
+	for i := 0; i < endpointGuardErrCycles; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
 	ep := getKubeEndpoints(t, cs)
 	if endpointAddrSet(ep)["10.0.0.1"] {
@@ -357,8 +360,10 @@ func TestEndpointGuardRemovesNotReadyAddress(t *testing.T) {
 		"10.0.0.2": apiHealthyProbe(500),
 	}
 	g := newEndpointGuard(cs, probes)
-	if err := g.run(ctx); err != nil {
-		t.Fatal(err)
+	for i := 0; i < endpointGuardErrCycles; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
 	ep := getKubeEndpoints(t, cs)
 	for _, sub := range ep.Subsets {

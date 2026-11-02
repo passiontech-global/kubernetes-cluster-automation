@@ -125,14 +125,31 @@ func (a *Agent) Run(ctx context.Context) error {
 	for _, sub := range a.cfg.Subsystems {
 		sub := sub
 		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("subsystem panicked — stopped until agent restart",
-						"subsystem", sub.Name(), "panic", r)
-				}
-			}()
 			slog.Info("subsystem started", "name", sub.Name())
-			sub.Run(ctx)
+			for {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							slog.Error("subsystem panicked — restarting",
+								"subsystem", sub.Name(), "panic", r)
+						}
+					}()
+					sub.Run(ctx)
+				}()
+				if ctx.Err() != nil {
+					return
+				}
+				// Run returned while ctx is live (panic recovered, or
+				// a silent early return) — restart after backoff
+				// instead of letting the subsystem die invisibly.
+				slog.Error("subsystem exited unexpectedly — restarting",
+					"subsystem", sub.Name())
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+				}
+			}
 		}()
 	}
 

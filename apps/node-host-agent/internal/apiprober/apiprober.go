@@ -67,8 +67,8 @@ const (
 
 // Defaults mirror the shell script + the api-local-lb sidecar.
 const (
-	defaultSocketPath    = "/run/haproxy-api-local.sock"
-	defaultBackendName   = "kube_apiserver"
+	defaultSocketPath    = "/run/api-local-lb-admin.sock"
+	defaultBackendName   = "api_local_back"
 	defaultInterval      = 30 * time.Second
 	defaultGapMin        = int64(10000)
 	defaultFailCycles    = 2
@@ -78,8 +78,10 @@ const (
 	defaultQueryTimeout  = 12 * time.Second // curl --max-time 12
 	defaultTokenFile     = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	defaultCAFile        = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	// LivePath is a consistent (etcd) read — no resourceVersion.
-	defaultLivePath = "/api/v1/namespaces/default/leases?limit=1"
+	// LivePath is a consistent (etcd) read — no resourceVersion. The
+	// nodes list is used because the SA has nodes get,list and
+	// /api/v1 has no leases resource (Lease is coordination.k8s.io).
+	defaultLivePath = "/api/v1/nodes?limit=1"
 	// CachePath is served from the apiserver watch-cache (rv=0).
 	defaultCachePath = "/api/v1/nodes?limit=1&resourceVersion=0"
 )
@@ -169,6 +171,16 @@ type backend struct {
 // admin-disabled server reports MAINT — it must not count toward the
 // drain fence even if its API probes are fresh.
 func (b backend) up() bool { return strings.HasPrefix(b.Status, "UP") }
+
+// maint reports an admin-disabled server (disable via socket, or the
+// disable restored from server-state-file after a HAProxy restart).
+// Treated like a drain for the recovery path: a backend stays
+// re-enableable after RecoverCycles fresh probes even when the
+// process-memory drained flag was lost to an agent restart — the
+// alternative is a healthy apiserver stranded in MAINT forever.
+// Caveat: this also undoes deliberate manual drains (the shell guard
+// used on-disk drained-* marker files for that distinction).
+func (b backend) maint() bool { return strings.HasPrefix(b.Status, "MAINT") }
 
 // backendState tracks per-backend consecutive-cycle counters — the
 // in-memory equivalent of the shell script's $STATE_DIR files
@@ -574,9 +586,10 @@ func (p *Prober) Cycle(ctx context.Context) {
 				"frozen", st.frozen, "frozenCycles", p.cfg.FrozenCycles)
 		default:
 			st.ok++
-			if st.drained {
+			if st.drained || b.maint() {
 				// Re-enable only after RecoverCycles consecutive
-				// fresh cycles.
+				// fresh cycles (drained by us, or admin-disabled
+				// externally — reconciled the same way).
 				if st.ok >= p.cfg.RecoverCycles {
 					if p.cfg.Mode == ModeEnforce {
 						if err := p.haproxyServer(ctx, "enable", b.Name); err != nil {
