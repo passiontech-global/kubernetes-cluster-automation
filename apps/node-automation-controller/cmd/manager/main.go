@@ -171,6 +171,7 @@ func main() {
 		"certmanager-reaper":       func() error { return controller.SetupCertManagerReaper(mgr, cs, dyn, certReaperEnabled) },
 		"cilium-identity-auditor":  func() error { return controller.SetupCiliumIdentityAuditor(mgr, cs, dyn, ciliumAuditEnabled) },
 		"csr-watcher":              func() error { return controller.SetupCSRWatcher(mgr, cs, csrApproveEnabled) },
+		"apiserver-endpoint-guard": func() error { return controller.SetupAPIServerEndpointGuard(mgr, cs) },
 	} {
 		if err := setup(); err != nil {
 			log.Error(err, "unable to setup module", "module", name)

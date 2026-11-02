@@ -75,25 +75,25 @@ func TestConvergeTriggerPrefixClassification(t *testing.T) {
 		wantJobs []string // expected "<cj>-trigger-" name prefixes
 	}{
 		{
-			name:     "api-lb-guard-files targets only api-lb-guard-converge",
+			name:     "api-lb-guard-files targets hub-converge",
 			cm:       "api-lb-guard-files-7f9b",
-			cronjobs: []string{"api-lb-guard-converge"},
-			wantJobs: []string{"api-lb-guard-converge"},
+			cronjobs: allConvergeCronJobs,
+			wantJobs: allConvergeCronJobs,
 		},
 		{
-			name:     "node-config-vars targets all four converge cronjobs",
+			name:     "node-config-vars targets hub-converge",
 			cm:       "node-config-vars-abc12",
 			cronjobs: allConvergeCronJobs,
 			wantJobs: allConvergeCronJobs,
 		},
 		{
-			name:     "node-config-playbooks targets all four",
+			name:     "node-config-playbooks targets hub-converge",
 			cm:       "node-config-playbooks-abc",
 			cronjobs: allConvergeCronJobs,
 			wantJobs: allConvergeCronJobs,
 		},
 		{
-			name:     "node-watchdog-scripts targets all four",
+			name:     "node-watchdog-scripts targets hub-converge",
 			cm:       "node-watchdog-scripts-abc",
 			cronjobs: allConvergeCronJobs,
 			wantJobs: allConvergeCronJobs,
@@ -138,7 +138,9 @@ func TestConvergeTriggerPrefixClassification(t *testing.T) {
 }
 
 // One Flux commit touching two CMs lands in the same settle window —
-// the drain computes the UNION of targets and fires each once.
+// the drain computes the UNION of targets and fires each once. After
+// the 4-way converge consolidation every watched prefix maps to the
+// same hub-converge CronJob, so the union is exactly one job.
 func TestConvergeTriggerBatchUnion(t *testing.T) {
 	cs := fake.NewSimpleClientset(cronJobObjs(allConvergeCronJobs...)...)
 	r := &convergeTrigger{cs: cs, pending: map[string]struct{}{}}
@@ -146,7 +148,7 @@ func TestConvergeTriggerBatchUnion(t *testing.T) {
 	fireConvergeEvent(t, r, "node-config-vars-abc", "api-lb-guard-files-xyz")
 
 	jobs := listNodeOpsJobs(t, cs)
-	// all-4 ∪ {api-lb-guard-converge} = 4 distinct jobs, not 5.
+	// {hub-converge} ∪ {hub-converge} = 1 job, not 2.
 	if len(jobs) != len(allConvergeCronJobs) {
 		t.Fatalf("expected %d jobs from the union, got %d: %v",
 			len(allConvergeCronJobs), len(jobs), triggerJobNames(jobs))
@@ -162,18 +164,17 @@ func TestConvergeTriggerBatchUnion(t *testing.T) {
 	}
 }
 
-// A target CronJob absent on this cluster is skipped without error and
-// does not stop the remaining targets.
+// A target CronJob absent on this cluster is skipped without error
+// (hub-converge may not be rolled out yet on a cluster mid-migration).
 func TestConvergeTriggerMissingCronJob(t *testing.T) {
-	cs := fake.NewSimpleClientset(
-		cronJobObjs("hub-converge", "api-lb-guard-converge")...)
+	cs := fake.NewSimpleClientset() // no converge cronjobs at all
 	r := &convergeTrigger{cs: cs, pending: map[string]struct{}{}}
 
 	fireConvergeEvent(t, r, "node-config-vars-abc")
 
 	jobs := listNodeOpsJobs(t, cs)
-	if len(jobs) != 2 {
-		t.Fatalf("expected 2 jobs for the existing cronjobs, got %d: %v",
+	if len(jobs) != 0 {
+		t.Fatalf("expected no jobs without the hub-converge cronjob, got %d: %v",
 			len(jobs), triggerJobNames(jobs))
 	}
 }
@@ -221,19 +222,18 @@ func TestConvergeTriggerOldJobNotDeduped(t *testing.T) {
 	}
 }
 
-// Dedupe is per-CronJob via the "<cj>-trigger-" name prefix: a young
-// trigger job for api-lb-guard-converge suppresses only that target —
-// hub-converge still fires.
+// Dedupe matches on the "<cj>-trigger-" name prefix: a young trigger
+// job left behind by a removed sibling cronjob (nebula-hub-converge
+// pre-consolidation) must NOT suppress hub-converge.
 func TestConvergeTriggerDedupeIsPerCronJob(t *testing.T) {
 	young := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: convergeNS, Name: "api-lb-guard-converge-trigger-333",
+			Namespace: convergeNS, Name: "nebula-hub-converge-trigger-333",
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-10 * time.Second)),
 		},
 	}
 	cs := fake.NewSimpleClientset(
 		convergeCronJob("hub-converge"),
-		convergeCronJob("api-lb-guard-converge"),
 		young)
 	r := &convergeTrigger{cs: cs, pending: map[string]struct{}{}}
 
@@ -241,23 +241,17 @@ func TestConvergeTriggerDedupeIsPerCronJob(t *testing.T) {
 
 	jobs := listNodeOpsJobs(t, cs)
 	if len(jobs) != 2 {
-		t.Fatalf("expected the old api-lb job + one new hub job, got %v",
+		t.Fatalf("expected the old sibling job + one new hub job, got %v",
 			triggerJobNames(jobs))
 	}
-	hub, apiLB := false, false
+	hub := false
 	for _, j := range jobs {
 		if strings.HasPrefix(j.Name, "hub-converge-trigger-") {
 			hub = true
 		}
-		if strings.HasPrefix(j.Name, "api-lb-guard-converge-trigger-") {
-			apiLB = true
-		}
 	}
 	if !hub {
 		t.Fatalf("hub-converge not triggered: %v", triggerJobNames(jobs))
-	}
-	if !apiLB {
-		t.Fatalf("pre-existing api-lb-guard trigger job gone?: %v", triggerJobNames(jobs))
 	}
 }
 

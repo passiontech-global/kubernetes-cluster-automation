@@ -5,9 +5,10 @@
 // instead of waiting for the 6h schedule.
 //
 //	node-config-vars* / node-config-playbooks* / node-watchdog-scripts*
-//	    -> ALL of hub-converge, nebula-hub-converge,
-//	       controller-watchdog-converge, api-lb-guard-converge
-//	api-lb-guard-files* -> api-lb-guard-converge only
+//	    / api-lb-guard-files*
+//	    -> hub-converge (the 3 sibling cronjobs nebula-hub-converge,
+//	       controller-watchdog-converge, api-lb-guard-converge were
+//	       merged into hub-converge — one playbook, tagged plays)
 //	other CMs           -> ignored
 //
 // Dedupe: skip a CronJob when a <cj>-trigger-* Job is still Active or
@@ -39,12 +40,11 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 )
 
-// allConvergeCronJobs is the "all" target set from the bash mapping.
+// allConvergeCronJobs is the "all" target set — since the 4-way
+// converge consolidation every watched CM prefix triggers the single
+// merged hub-converge CronJob (tagged plays replaced the 3 siblings).
 var allConvergeCronJobs = []string{
 	"hub-converge",
-	"nebula-hub-converge",
-	"controller-watchdog-converge",
-	"api-lb-guard-converge",
 }
 
 const (
@@ -127,12 +127,11 @@ func (r *convergeTrigger) Reconcile(ctx context.Context, req reconcile.Request) 
 		switch {
 		case strings.HasPrefix(cm, "node-config-vars"),
 			strings.HasPrefix(cm, "node-config-playbooks"),
-			strings.HasPrefix(cm, "node-watchdog-scripts"):
+			strings.HasPrefix(cm, "node-watchdog-scripts"),
+			strings.HasPrefix(cm, "api-lb-guard-files"):
 			for _, c := range allConvergeCronJobs {
 				cjs[c] = struct{}{}
 			}
-		case strings.HasPrefix(cm, "api-lb-guard-files"):
-			cjs["api-lb-guard-converge"] = struct{}{}
 		default:
 			log.Info("skip event: not a converge ConfigMap", "configmap", cm)
 		}
