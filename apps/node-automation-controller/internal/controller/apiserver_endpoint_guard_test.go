@@ -1249,6 +1249,35 @@ func TestEndpointGuardMemQuarantineSurvivesAnnotationLoss(t *testing.T) {
 	}
 }
 
+// The dedicated clientset's WarningHandler drops ONLY the Endpoints
+// deprecation header — deliberate writes must stay silent, everything
+// else delegates to the default logger.
+func TestEndpointGuardWarningFilter(t *testing.T) {
+	var forwarded []string
+	filter := endpointGuardWarnings{delegate: recordingWarnings{&forwarded}}
+	filter.HandleWarningHeader(299, "",
+		"v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice")
+	if len(forwarded) != 0 {
+		t.Fatalf("deprecation warning leaked to delegate: %v", forwarded)
+	}
+	filter.HandleWarningHeader(299, "", "some other deprecation")
+	filter.HandleWarningHeader(299, "", "v1 Secrets is deprecated")
+	if len(forwarded) != 2 {
+		t.Fatalf("unrelated warnings swallowed: %v", forwarded)
+	}
+}
+
+// recordingWarnings captures delegated warnings for the filter test.
+type recordingWarnings struct{ got *[]string }
+
+func (r recordingWarnings) HandleWarningHeader(_ int, _ string, message string) {
+	*r.got = append(*r.got, message)
+}
+
+func (r recordingWarnings) HandleWarningHeaderWithContext(_ context.Context, _ int, _ string, message string) {
+	*r.got = append(*r.got, message)
+}
+
 // endpointMode detection failure falls back to the Endpoints path —
 // the sweep still functions on a cluster whose /version is broken.
 func TestEndpointGuardVersionUndetectableFallsBack(t *testing.T) {

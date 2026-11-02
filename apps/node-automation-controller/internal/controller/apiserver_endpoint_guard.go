@@ -200,8 +200,48 @@ func SetupAPIServerEndpointGuard(mgr ctrl.Manager, cs kubernetes.Interface) erro
 	g := &apiServerEndpointGuard{cs: cs, backends: map[string]*backendProbeState{}}
 	g.probeFn = g.probe
 	g.log = mgr.GetLogger().WithName(endpointGuardQueue)
+	// Dedicated clientset filtering the "v1 Endpoints is deprecated"
+	// 299 warning: on hosted planes the guard writes the deprecated
+	// object deliberately every sweep (it is the SSOT behind the
+	// mirror slice), which the shared client's default WarningLogger
+	// would turn into one klog line per cycle. Every other warning
+	// still delegates. Fall back to the shared client if the build
+	// fails — the guard works either way, just noisier.
+	if filtered, err := endpointsWarningClient(mgr.GetConfig()); err == nil {
+		g.cs = filtered
+	} else {
+		g.log.Error(err, "filtered clientset build failed — sharing the noisy default client")
+	}
 	return mgr.Add(g)
 }
+
+// endpointsWarningClient clones cfg into a clientset whose
+// WarningHandler drops only the apiserver's Endpoints deprecation
+// header — the guard's corev1 Endpoints reads/writes are intentional.
+func endpointsWarningClient(cfg *rest.Config) (kubernetes.Interface, error) {
+	cfg = rest.CopyConfig(cfg)
+	cfg.WarningHandler = endpointGuardWarnings{delegate: rest.WarningLogger{}}
+	return kubernetes.NewForConfig(cfg)
+}
+
+// endpointGuardWarnings suppresses exactly one warning: "v1 Endpoints
+// is deprecated" (the deprecated object is written by design wherever
+// the kubernetes slice is a mirror projection). Everything else still
+// reaches the default WarningLogger.
+type endpointGuardWarnings struct{ delegate rest.WarningHandlerWithContext }
+
+func (w endpointGuardWarnings) HandleWarningHeader(code int, agent, message string) {
+	w.HandleWarningHeaderWithContext(context.Background(), code, agent, message)
+}
+
+func (w endpointGuardWarnings) HandleWarningHeaderWithContext(ctx context.Context, code int, agent, message string) {
+	if code == 299 && strings.Contains(message, "v1 Endpoints is deprecated") {
+		return
+	}
+	w.delegate.HandleWarningHeaderWithContext(ctx, code, agent, message)
+}
+
+var _ rest.WarningHandlerWithContext = endpointGuardWarnings{}
 
 // Start implements manager.Runnable — leader-gated like every other
 // periodic module (plain Runnables default NeedLeaderElection()=true).
