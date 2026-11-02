@@ -134,7 +134,7 @@ func (r *convergeTrigger) Reconcile(ctx context.Context, req reconcile.Request) 
 		case strings.HasPrefix(cm, "api-lb-guard-files"):
 			cjs["api-lb-guard-converge"] = struct{}{}
 		default:
-			log.Info("skip event: khong phai ConfigMap converge", "configmap", cm)
+			log.Info("skip event: not a converge ConfigMap", "configmap", cm)
 		}
 	}
 	targets := slices.Sorted(maps.Keys(cjs))
@@ -172,7 +172,7 @@ func (r *convergeTrigger) trigger(ctx context.Context, log logr.Logger, cjName s
 	if err != nil {
 		// bash skips on ANY get failure — absent on this cluster or an
 		// API blip, either way nothing to clone.
-		log.Info("skip: cronjob khong ton tai tren cluster nay", "cronjob", cjName, "error", err)
+		log.Info("skip: cronjob does not exist on this cluster", "cronjob", cjName, "error", err)
 		return true
 	}
 
@@ -183,7 +183,7 @@ func (r *convergeTrigger) trigger(ctx context.Context, log logr.Logger, cjName s
 	jobs, err := r.cs.BatchV1().Jobs(convergeNS).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		// bash `2>/dev/null`: list failure = empty dedupe list, still create.
-		log.Info("WARN: list jobs that bai — bo qua dedupe", "cronjob", cjName, "error", err)
+		log.Info("WARN: list jobs failed — skipping dedupe", "cronjob", cjName, "error", err)
 	} else {
 		for i := range jobs.Items {
 			j := &jobs.Items[i]
@@ -191,11 +191,11 @@ func (r *convergeTrigger) trigger(ctx context.Context, log logr.Logger, cjName s
 				continue
 			}
 			if j.Status.Active > 0 {
-				log.Info("skip: da co trigger dang running", "cronjob", cjName, "job", j.Name)
+				log.Info("skip: a trigger is already running", "cronjob", cjName, "job", j.Name)
 				return true
 			}
 			if age := time.Since(j.CreationTimestamp.Time); age < convergeDedupeWin {
-				log.Info("skip: da co trigger moi tao", "cronjob", cjName,
+				log.Info("skip: a trigger was just created", "cronjob", cjName,
 					"job", j.Name, "age", age.Round(time.Second))
 				return true
 			}
@@ -228,7 +228,7 @@ func (r *convergeTrigger) trigger(ctx context.Context, log logr.Logger, cjName s
 	}
 	if _, err := r.cs.BatchV1().Jobs(convergeNS).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		metrics.IncError("converge-trigger")
-		log.Error(err, "ERR: tao job trigger that bai", "cronjob", cjName)
+		log.Error(err, "ERR: create trigger job failed", "cronjob", cjName)
 		return false
 	}
 	log.Info("TRIGGER job", "job", job.Name, "cronjob", cjName)

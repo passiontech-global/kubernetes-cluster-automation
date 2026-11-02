@@ -83,7 +83,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 			// bash exit "$failed" here — the metric must surface a
 			// persistent patch failure even though the sweep continues.
 			metrics.IncError("node-labeler")
-			log.Info("WARN: khong label duoc worker role cho node", "node", n.Name, "error", err)
+			log.Info("WARN: cannot label worker role on node", "node", n.Name, "error", err)
 			continue
 		}
 		log.Info("labeled worker role", "node", n.Name, "label", workerRoleLabel+"=")
@@ -108,7 +108,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 			if err != nil {
 				// Likely a deleted node still listed in labels.txt —
 				// warn and move on, never hot-loop (bash exit 0).
-				log.Info("WARN: khong get duoc node", "node", name, "label", label, "error", err)
+				log.Info("WARN: cannot get node", "node", name, "label", label, "error", err)
 				continue
 			}
 			if node.Labels[key] == val {
@@ -116,7 +116,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 			}
 			if err := patchNodeLabels(ctx, r.cs, name, map[string]string{key: val}); err != nil {
 				metrics.IncError("node-labeler")
-				log.Info("WARN: khong label duoc node", "node", name, "label", label, "error", err)
+				log.Info("WARN: cannot label node", "node", name, "label", label, "error", err)
 				continue
 			}
 			log.Info("labeled", "node", name, "label", label)

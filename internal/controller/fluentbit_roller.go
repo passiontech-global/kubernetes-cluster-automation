@@ -61,7 +61,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	// rolled-config-hash annotation even without a secret event.
 	res := ctrl.Result{RequeueAfter: 30 * time.Minute}
 	if !r.enabled {
-		log.Info("skip: FLUENTBIT_ROLLER_ENABLED != true (cluster khong co fluentbit component)")
+		log.Info("skip: FLUENTBIT_ROLLER_ENABLED != true (cluster has no fluentbit component)")
 		return res, nil
 	}
 
@@ -96,7 +96,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 		return ctrl.Result{}, err
 	}
 	if notReady > 0 {
-		log.Info("node(s) khong Ready — skip roll, cho cluster on dinh", "notReady", notReady)
+		log.Info("node(s) not Ready — skip roll, wait for cluster to stabilize", "notReady", notReady)
 		return res, nil
 	}
 
@@ -110,7 +110,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	// do not use daemonSetSettled, which is stricter).
 	if ds.Generation != ds.Status.ObservedGeneration ||
 		ds.Status.UpdatedNumberScheduled != ds.Status.DesiredNumberScheduled {
-		log.Info("rollout dang chay — skip",
+		log.Info("rollout in progress — skip",
 			"generation", ds.Generation, "observed", ds.Status.ObservedGeneration,
 			"updated", ds.Status.UpdatedNumberScheduled, "desired", ds.Status.DesiredNumberScheduled)
 		return res, nil
