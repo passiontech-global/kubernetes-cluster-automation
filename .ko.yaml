@@ -1,0 +1,14 @@
+# ko build config — replaces the Dockerfile for image builds in CI.
+# Same base + nonroot user + version ldflag as Dockerfile.
+#
+# VERSION is read from the environment at build time (ko templating):
+#   VERSION=v1.2.3 KO_DOCKER_REPO=ghcr.io/passiontech-global/node-automation-controller \
+#     ko build --sbom=none --tags "$VERSION,latest" ./cmd/manager
+defaultBaseImage: gcr.io/distroless/static:nonroot
+builds:
+  - id: node-automation-controller
+    main: ./cmd/manager
+    ldflags:
+      - "-s"
+      - "-w"
+      - "-X main.version={{ .Env.VERSION }}"

@@ -1,0 +1,153 @@
+name: Release node-automation-controller
+
+# Test -> auto semver bump (git-cliff over conventional commits) ->
+# static Go build -> push image to GHCR -> GitHub Release.
+#
+# Triggers:
+#   push main            every merge/commit to main releases automatically
+#   workflow_dispatch    gh workflow run release.yml [-f version=v0.1.0]
+#   repository_dispatch  event_type=build-release, client_payload={version,prerelease}
+#
+# Versioning: empty version -> auto semver bump via git-cliff
+# (feat->minor, fix/perf/refactor/docs/test->patch, BREAKING/!->major).
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag (e.g. v0.1.0). Empty = auto semver bump"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [build-release]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-node-automation-controller
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/passiontech-global/node-automation-controller
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve event parameters
+        id: vars
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          version=""
+          prerelease="false"
+          if [ "$GITHUB_EVENT_NAME" = "repository_dispatch" ]; then
+            version=$(jq -r '.version // ""' <<<"$PAYLOAD")
+            prerelease=$(jq -r '.prerelease // false' <<<"$PAYLOAD")
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+            prerelease="${{ inputs.prerelease }}"
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >>"$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain (go + git-cliff pinned in mise.toml)
+        uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute version and changelog
+        run: |
+          set -euo pipefail
+          version_in="${{ steps.vars.outputs.version }}"
+
+          last_tag=$(git tag --sort=-v:refname | head -1 || true)
+          if [ -z "$last_tag" ]; then
+            last_tag="v0.0.0"
+            git tag v0.0.0 "$(git rev-list --max-parents=0 HEAD)"
+          fi
+
+          if [ -n "$version_in" ]; then
+            rel_version="$version_in"
+          else
+            rel_version=$(mise exec -- git-cliff --bumped-version --config cliff.toml)
+            # No new conventional commits since last tag -> git-cliff
+            # echoes the same version; force a patch bump so the
+            # release tag never collides.
+            if [ "$rel_version" = "$last_tag" ]; then
+              IFS=. read -r major minor patch <<<"${last_tag#v}"
+              rel_version="v$major.$minor.$((patch + 1))"
+            fi
+          fi
+
+          mise exec -- git-cliff --unreleased --tag "$rel_version" --config cliff.toml > changelog.md
+          grep -q '[^[:space:]]' changelog.md || echo "No user-facing changes." > changelog.md
+          {
+            echo "Range: \`$last_tag\` -> \`$rel_version\`"
+            echo ""
+            cat changelog.md
+          } > notes.md
+          cat notes.md
+
+          echo "REL_VERSION=$rel_version" >>"$GITHUB_ENV"
+          echo "REL_PRERELEASE=${{ steps.vars.outputs.prerelease }}" >>"$GITHUB_ENV"
+
+      - name: Vet and test
+        run: |
+          mise exec -- go vet ./...
+          mise exec -- go test -race ./...
+
+      - name: Build static binary
+        run: |
+          mise exec -- env CGO_ENABLED=0 go build -trimpath \
+            -ldflags="-s -w -X main.version=$REL_VERSION" \
+            -o bin/node-automation-controller ./cmd/manager
+          file bin/node-automation-controller
+          ./bin/node-automation-controller --version
+
+      - name: Package assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp bin/node-automation-controller "dist/node-automation-controller-linux-x86_64"
+          tar -czf "dist/node-automation-controller-linux-x86_64.tar.gz" -C bin node-automation-controller
+          (cd dist && sha256sum node-automation-controller-linux-x86_64 node-automation-controller-linux-x86_64.tar.gz > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - name: Build and push GHCR image (ko, see .ko.yaml)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          # ko publishes directly: --bare keeps the image name exactly
+          # $IMAGE (no manager-<hash> suffix); tags come from --tags.
+          VERSION="$REL_VERSION" KO_DOCKER_REPO="$IMAGE" \
+            mise exec -- ko build --bare --sbom=none \
+            --tags "$REL_VERSION,latest" ./cmd/manager
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          args=(--title "node-automation-controller $REL_VERSION" --notes-file notes.md)
+          [ "$REL_PRERELEASE" != "true" ] || args+=(--prerelease)
+          gh release create "$REL_VERSION" dist/* notes.md "${args[@]}"
