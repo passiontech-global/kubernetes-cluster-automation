@@ -13,6 +13,12 @@
 //     may be watched.
 //   - `name` everywhere is the legacy shell-operator queue name so
 //     metrics.IncError(name) keeps the alert contract.
+//   - Error-metric ownership: Periodic.Start IncErrors the queue for
+//     any error fn RETURNS, so a module must never IncError an error
+//     it returns — that double-counts. IncError inside a module is
+//     reserved for tolerated sub-operation failures the run absorbs
+//     (logs, continues, and ultimately returns nil) — without it
+//     those failures would go uncounted.
 //   - Periodic modules register through AddPeriodic; event-driven
 //     modules register a reconciler and use Result.RequeueAfter as the
 //     old crontab safety-net.
@@ -43,7 +49,11 @@ import (
 // ---------------------------------------------------------------------------
 
 // Periodic replaces a shell-operator `schedule:` binding — a
-// manager.Runnable that ticks fn on interval.
+// manager.Runnable that ticks fn on interval. Start owns run-level
+// error accounting: every non-nil fn return IncErrors p.Name exactly
+// once, so fn must NOT IncError errors it returns (double-count) —
+// only tolerated sub-operation failures that the run absorbs (log +
+// continue, nil return) may IncError from inside fn.
 type Periodic struct {
 	Name     string
 	Interval time.Duration

@@ -83,12 +83,21 @@ type webhookGuard struct {
 	// with 0 Ready endpoints. A sighting that disappears (endpoints
 	// back, entry removed) resets the streak.
 	deadSince map[string]time.Time
+	// brokenEmitted is the ledger of WebhookCircuitBroken label tuples
+	// ("kind/config/webhook") currently held at =1. Each sweep
+	// rebuilds it from the triples it re-asserted; a tuple not
+	// re-seen — config deleted, recreated without the annotation,
+	// entry pruned by the orphan sweep — gets its series deleted via
+	// DeleteLabelValues instead of pinning the alert forever (same
+	// seen-set hygiene as the cert drift auditor).
+	brokenEmitted map[string]bool
 }
 
 // SetupWebhookGuard registers the 5-minute sweep (was crontab */5).
 func SetupWebhookGuard(mgr ctrl.Manager, cs kubernetes.Interface) error {
 	g := &webhookGuard{cs: cs, nowFn: time.Now,
-		deadSince: map[string]time.Time{}}
+		deadSince:     map[string]time.Time{},
+		brokenEmitted: map[string]bool{}}
 	return shared.AddPeriodic(mgr, webhookGuardQueue, 5*time.Minute, g.run)
 }
 
@@ -270,6 +279,9 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context) error {
 	if g.deadSince == nil {
 		g.deadSince = map[string]time.Time{}
 	}
+	if g.brokenEmitted == nil {
+		g.brokenEmitted = map[string]bool{}
+	}
 
 	ready, err := g.readyEndpointCounts(ctx)
 	if err != nil {
@@ -289,12 +301,15 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context) error {
 	// seen marks the deadSince keys still under evaluation — streaks
 	// for entries gone since the last sweep are pruned below.
 	seen := map[string]bool{}
+	// emitted collects the WebhookCircuitBroken label tuples
+	// re-asserted at =1 this sweep — the new brokenEmitted ledger.
+	emitted := map[string]bool{}
 	var failed []string
 	for i := range mwcs.Items {
 		cfg := &mwcs.Items[i]
 		payload, trips, recovered := g.circuitPatch(log, webhookKindMutating,
 			cfg.Name, cfg.Annotations[webhookCircuitAnno],
-			mutHookViews(cfg.Webhooks), cfg.Webhooks, ready, now, seen)
+			mutHookViews(cfg.Webhooks), cfg.Webhooks, ready, now, seen, emitted)
 		if payload == nil {
 			continue
 		}
@@ -304,13 +319,13 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context) error {
 			failed = append(failed, cfg.Name)
 			continue
 		}
-		circuitMetrics(webhookKindMutating, cfg.Name, trips, recovered)
+		circuitMetrics(emitted, webhookKindMutating, cfg.Name, trips, recovered)
 	}
 	for i := range vwcs.Items {
 		cfg := &vwcs.Items[i]
 		payload, trips, recovered := g.circuitPatch(log, webhookKindValidating,
 			cfg.Name, cfg.Annotations[webhookCircuitAnno],
-			valHookViews(cfg.Webhooks), cfg.Webhooks, ready, now, seen)
+			valHookViews(cfg.Webhooks), cfg.Webhooks, ready, now, seen, emitted)
 		if payload == nil {
 			continue
 		}
@@ -320,8 +335,24 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context) error {
 			failed = append(failed, cfg.Name)
 			continue
 		}
-		circuitMetrics(webhookKindValidating, cfg.Name, trips, recovered)
+		circuitMetrics(emitted, webhookKindValidating, cfg.Name, trips, recovered)
 	}
+
+	// Prune broken series whose label tuple was not re-seen — a config
+	// deleted while broken, recreated without the annotation, or an
+	// entry removed must not pin circuit_broken=1 forever. Keys are
+	// "kind/config/webhook"; all three are DNS-1123 identifiers so "/"
+	// is unambiguous (same SplitN convention as the PDB watchdog).
+	for k := range g.brokenEmitted {
+		if emitted[k] {
+			continue
+		}
+		if parts := strings.SplitN(k, "/", 3); len(parts) == 3 {
+			metrics.WebhookCircuitBroken.
+				DeleteLabelValues(parts[0], parts[1], parts[2])
+		}
+	}
+	g.brokenEmitted = emitted
 
 	for k := range g.deadSince {
 		if !seen[k] {
@@ -409,12 +440,15 @@ func valHookViews(ws []admissionv1.ValidatingWebhook) []hookView {
 // circuit-broken annotation (merge-patch null removes the key when the
 // set empties). hooks views the config's live webhook list; raw is
 // that same list re-serialized wholesale into the patch (merge
-// semantics replace arrays). Returns nil payload when nothing changed;
-// trips/recovered are the names whose metric updates the caller must
-// apply only after the patch lands.
+// semantics replace arrays). emitted records the WebhookCircuitBroken
+// label tuples re-asserted at =1 this sweep — the caller rebuilds the
+// guard's series ledger from it and prunes whatever was not re-seen.
+// Returns nil payload when nothing changed; trips/recovered are the
+// names whose metric updates the caller must apply only after the
+// patch lands.
 func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal string,
 	hooks []hookView, raw any, ready map[string]int, now time.Time,
-	seen map[string]bool) ([]byte, []string, []string) {
+	seen, emitted map[string]bool) ([]byte, []string, []string) {
 
 	broken := parseCircuitAnnotation(annoVal)
 	// present holds every live sub-webhook name — the staleness check
@@ -457,6 +491,7 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 				changed = true
 			}
 			metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, h.name).Set(1)
+			emitted[key] = true
 		case svcReady == 0 && failClosed(h.fp):
 			seen[key] = true
 			first, ok := g.deadSince[key]
@@ -489,7 +524,7 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 	for name := range broken {
 		if !present[name] {
 			delete(broken, name)
-			metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, name).Set(0)
+			metrics.WebhookCircuitBroken.DeleteLabelValues(kind, cfgName, name)
 			changed = true
 			log.Info("CIRCUIT-CLEAN: annotation entry has no live webhook — dropping",
 				"kind", kind, "config", cfgName, "webhook", name)
@@ -516,14 +551,18 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 
 // circuitMetrics applies the trip/recovery side-effects — called only
 // after the config patch landed, so a failed patch retries next sweep
-// without double-counting trips.
-func circuitMetrics(kind, cfgName string, trips, recovered []string) {
+// without double-counting trips. A tripped series is recorded in
+// emitted (the sweep's new ledger); a recovered one is deleted
+// outright — a cleared breaker emits no series, not a 0, and the
+// sweep-end ledger rebuild drops it for good.
+func circuitMetrics(emitted map[string]bool, kind, cfgName string, trips, recovered []string) {
 	for _, n := range trips {
 		metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, n).Set(1)
+		emitted[kind+"/"+cfgName+"/"+n] = true
 		metrics.WebhookCircuitBreakerTripsTotal.WithLabelValues(kind, cfgName).Inc()
 	}
 	for _, n := range recovered {
-		metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, n).Set(0)
+		metrics.WebhookCircuitBroken.DeleteLabelValues(kind, cfgName, n)
 	}
 }
 

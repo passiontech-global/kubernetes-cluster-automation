@@ -139,12 +139,12 @@ func TestCiliumIdentityAuditorAPIError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	a := &ciliumIdentityAuditor{cs: fake.NewSimpleClientset(), dyn: dyn}
-	before := testutil.QueueErrorCount(t, ciliumAuditQueue)
+	// run() only returns the error — run-level IncError is the
+	// periodic wrapper's job (proven end-to-end by shared's
+	// TestPeriodicErrorIncrementsErrorMetric), so this test asserts
+	// the return, not the counter.
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when identity list fails")
-	}
-	if got := testutil.QueueErrorCount(t, ciliumAuditQueue) - before; got != 1 {
-		t.Fatalf("expected IncError on API failure, delta %v", got)
 	}
 }
 
@@ -157,12 +157,8 @@ func TestCiliumIdentityAuditorEndpointListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	a := &ciliumIdentityAuditor{cs: fake.NewSimpleClientset(), dyn: dyn}
-	before := testutil.QueueErrorCount(t, ciliumAuditQueue)
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when the ciliumendpoint list fails")
-	}
-	if got := testutil.QueueErrorCount(t, ciliumAuditQueue) - before; got != 1 {
-		t.Fatalf("expected IncError on API failure, delta %v", got)
 	}
 }
 
@@ -176,12 +172,8 @@ func TestCiliumIdentityAuditorPodListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	a := &ciliumIdentityAuditor{cs: cs, dyn: dyn}
-	before := testutil.QueueErrorCount(t, ciliumAuditQueue)
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when the pod list fails")
-	}
-	if got := testutil.QueueErrorCount(t, ciliumAuditQueue) - before; got != 1 {
-		t.Fatalf("expected IncError on API failure, delta %v", got)
 	}
 }
 

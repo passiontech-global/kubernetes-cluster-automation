@@ -2123,6 +2123,44 @@ func corruptImageWaitingReason(r string) bool {
 	return false
 }
 
+// normalizeCRIImageName rewrites a kubelet-reported image spec into
+// the canonical ref containerd's CRI plugin stored it under. `ctr
+// images rm` does zero normalization — it matches the image store's
+// name verbatim — while the CRI plugin canonicalizes at pull time
+// (distribution/reference splitDockerDomain):
+//   - first path segment without '.'/':' that isn't "localhost" is a
+//     repo path component, not a registry → prepend "docker.io/";
+//   - a single-segment repo path under docker.io gets "library/"
+//     inserted (nginx → docker.io/library/nginx) — private-registry
+//     single-segment paths are left alone;
+//   - a name:tag@sha256:… ref canonicalizes to name@sha256:… (the
+//     digest wins, the tag is dropped — only a ':' after the last '/'
+//     is a tag; a registry port like host:5000/… is not).
+//
+// Already-canonical refs pass through unchanged (idempotent).
+func normalizeCRIImageName(spec string) string {
+	name, digest := spec, ""
+	if i := strings.IndexByte(spec, '@'); i >= 0 {
+		name, digest = spec[:i], spec[i:]
+		if j := strings.LastIndexByte(name, ':'); j > strings.LastIndexByte(name, '/') {
+			name = name[:j]
+		}
+	}
+	domain, rest := "", name
+	if i := strings.IndexByte(name, '/'); i >= 0 {
+		if head := name[:i]; strings.ContainsAny(head, ".:") || head == "localhost" {
+			domain, rest = head, name[i+1:]
+		}
+	}
+	if domain == "" {
+		domain, rest = "docker.io", name
+	}
+	if domain == "docker.io" && !strings.ContainsRune(rest, '/') {
+		rest = "library/" + rest
+	}
+	return domain + "/" + rest + digest
+}
+
 // checkCtrImages scans this node's pods for containers stuck Waiting
 // on a corrupted containerd layer/content-store error and removes the
 // broken image (`k0s ctr images rm --sync`) so kubelet's next pull
@@ -2131,6 +2169,22 @@ func corruptImageWaitingReason(r string) bool {
 // unlike the restart checks there is no consecutive gate: the 15m
 // last-ctr-image-rm budget alone bounds the churn, and one spend
 // covers the whole batch of matching images found in a cycle.
+//
+// Two containerd quirks shape the rm set:
+//   - cs.Image is the SPEC name the pod asked for, but the CRI plugin
+//     normalized it at pull (docker.io/ + library/ insertion, digest
+//     canonicalization). `ctr images rm` matches store names verbatim
+//     and exits 0 with only a warning on a miss — an unnormalized
+//     "nginx:1.25" rm silently no-ops while the corrupt record stays.
+//     Every spec is run through normalizeCRIImageName first.
+//   - The image store keeps one record per ref: the tag record and the
+//     repoDigest record (cs.ImageID, e.g. docker.io/library/nginx@…)
+//     are separate entries. Removing only the tag leaves the digest
+//     record resolvable, so both are removed per corrupted container.
+//
+// Normalization is preferred over `ctr images ls` reconciliation —
+// one exec per ref keeps the seam shape; a normalized name that still
+// isn't in the store just makes ctr warn and exit 0 (accepted).
 func (h *Hygiene) checkCtrImages(ctx context.Context, pods []corev1.Pod,
 	apiOK, workerActive bool) {
 	if !workerActive {
@@ -2143,7 +2197,7 @@ func (h *Hygiene) checkCtrImages(ctx context.Context, pods []corev1.Pod,
 		h.cycles.WithLabelValues(checkCtrImages, "abort").Inc()
 		return
 	}
-	// Dedupe images across pods and statuses — several containers
+	// Dedupe refs across pods and statuses — several containers
 	// pinned to one corrupted image need a single rm, not one each.
 	seen := map[string]bool{}
 	for i := range pods {
@@ -2157,7 +2211,10 @@ func (h *Hygiene) checkCtrImages(ctx context.Context, pods []corev1.Pod,
 				continue
 			}
 			if cs.Image != "" {
-				seen[cs.Image] = true
+				seen[normalizeCRIImageName(cs.Image)] = true
+			}
+			if cs.ImageID != "" {
+				seen[normalizeCRIImageName(cs.ImageID)] = true
 			}
 		}
 	}

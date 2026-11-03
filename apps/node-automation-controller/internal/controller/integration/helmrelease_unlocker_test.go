@@ -477,6 +477,28 @@ func TestHelmReleaseUnlockerPendingDeleteError(t *testing.T) {
 	}
 }
 
+// A tolerated per-HR unlock failure is absorbed by the run (logged +
+// continue, nil return) — it never reaches the periodic wrapper, so
+// run() itself must IncError the queue once to keep it on the alert
+// path.
+func TestHelmReleaseUnlockerUnlockFailureIncError(t *testing.T) {
+	dyn, secrets := stuckHRFixture()
+	cs := kfake.NewSimpleClientset(secrets...)
+	cs.PrependReactor("delete", "secrets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("finalizer wedged")
+		})
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+
+	before := testutil.ReconcileErrorCount(t, helmUnlockQueue)
+	if err := u.run(ctx); err != nil {
+		t.Fatalf("a per-HR unlock failure must not error the run: %v", err)
+	}
+	if got := testutil.ReconcileErrorCount(t, helmUnlockQueue); got != before+1 {
+		t.Fatalf("tolerated unlock failure did not IncError: got %v, want %v", got, before+1)
+	}
+}
+
 // A failing requestedAt patch on the HR surfaces as an unlock error —
 // the secret is already gone but the HR is NOT marked unlocked (the
 // reconcile hint never landed).

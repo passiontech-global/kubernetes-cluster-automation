@@ -649,6 +649,53 @@ func TestRunOnlineOnlySuccessNoError(t *testing.T) {
 	}
 }
 
+func TestCallTimeoutBoundsCommandCtx(t *testing.T) {
+	// CallTimeout caps every spawned command's ctx — the
+	// controllerhygiene guard relies on it to keep ~12 sequential
+	// etcdctl calls near its own run budget instead of ~2h at the
+	// 10m interactive default.
+	for _, tc := range []struct {
+		name string
+		call time.Duration
+		want time.Duration
+	}{
+		{"explicit cap", 42 * time.Second, 42 * time.Second},
+		{"default", 0, defaultCallTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeEtcd{
+				healthy: true,
+				statusJSON: []string{
+					statusJSON(100, 1000, 800),
+					statusJSON(100, 850, 800),
+					statusJSON(100, 850, 800),
+				},
+			}
+			base := f.run
+			var worst time.Duration
+			cfg := testRig(f, &fakeStarter{calls: &f.calls}, "")
+			cfg.CallTimeout = tc.call
+			cfg.CmdRunner = func(ctx context.Context, name string,
+				args ...string) ([]byte, error) {
+				d, ok := ctx.Deadline()
+				if !ok {
+					t.Error("command ctx carries no deadline")
+				} else if rem := time.Until(d); rem > worst {
+					worst = rem
+				}
+				return base(ctx, name, args...)
+			}
+			var out strings.Builder
+			if err := Run(context.Background(), cfg, &out); err != nil {
+				t.Fatalf("Run err=%v want nil:\n%s", err, out.String())
+			}
+			if worst == 0 || worst > tc.want {
+				t.Fatalf("command ctx deadline %s — want <= %s", worst, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunStatusFailureFatal(t *testing.T) {
 	// Under set -e the bash died on the very first endpoint status —
 	// the port does too.

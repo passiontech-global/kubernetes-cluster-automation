@@ -24,7 +24,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/testutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 )
 
@@ -291,7 +290,9 @@ func TestCertDriftAuditorPrunesDroppedAnnotation(t *testing.T) {
 	}
 }
 
-// A webhook-config list failure is a real error (IncError) — but it
+// A webhook-config list failure propagates as the run's error (the
+// periodic wrapper owns IncError — shared's
+// TestPeriodicErrorIncrementsErrorMetric proves that path) — but it
 // must NOT blind the independent TLS-expiry audit, which still runs.
 func TestCertDriftAuditorWebhookListError(t *testing.T) {
 	fixedNow := time.Now().Truncate(time.Second) // x509 serializes cert times at second precision
@@ -303,12 +304,8 @@ func TestCertDriftAuditorWebhookListError(t *testing.T) {
 		})
 	a := newCertDriftAuditor(cs, newFakeDyn(cdaListKinds), fixedNow)
 
-	before := testutil.QueueErrorCount(t, certDriftQueue)
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when the webhook config list fails")
-	}
-	if got := testutil.QueueErrorCount(t, certDriftQueue) - before; got != 1 {
-		t.Fatalf("expected IncError on webhook list failure, delta %v", got)
 	}
 	if got := promtestutil.ToFloat64(
 		metrics.TLSSecretDaysToExpiry.WithLabelValues("app", "tls-a")); got != 10 {
@@ -402,7 +399,8 @@ func TestCertDriftAuditorTLSPrunesDeletedSecret(t *testing.T) {
 	}
 }
 
-// A TLS-secret list failure is a real error and IncErrors the queue.
+// A TLS-secret list failure propagates as the run's error — the
+// periodic wrapper owns the IncError for it.
 func TestCertDriftAuditorTLSListError(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	cs.PrependReactor("list", "secrets",
@@ -411,12 +409,8 @@ func TestCertDriftAuditorTLSListError(t *testing.T) {
 		})
 	a := newCertDriftAuditor(cs, newFakeDyn(cdaListKinds), time.Now())
 
-	before := testutil.QueueErrorCount(t, certDriftQueue)
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when the tls secret list fails")
-	}
-	if got := testutil.QueueErrorCount(t, certDriftQueue) - before; got != 1 {
-		t.Fatalf("expected IncError on secret list failure, delta %v", got)
 	}
 }
 

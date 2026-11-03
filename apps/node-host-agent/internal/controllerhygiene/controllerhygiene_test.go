@@ -1001,6 +1001,11 @@ func TestEtcdGuardNospaceTriggers(t *testing.T) {
 	if !g.rescues[0].OnlineOnly {
 		t.Fatal("rescue ran without OnlineOnly — offline path allowed")
 	}
+	if g.rescues[0].CallTimeout != defaultEtcdGuardCallTimeout {
+		t.Fatalf("rescue CallTimeout=%v want %v (the short guard cap, "+
+			"not etcdrescue's 10m interactive default)",
+			g.rescues[0].CallTimeout, defaultEtcdGuardCallTimeout)
+	}
 	if g.rescues[0].K0sDir != e.h.cfg.K0sDir {
 		t.Fatalf("rescue K0sDir=%q want %q", g.rescues[0].K0sDir, e.h.cfg.K0sDir)
 	}
@@ -1033,6 +1038,14 @@ func TestEtcdGuardSizeTriggers(t *testing.T) {
 	}
 	if !g.rescues[0].OnlineOnly {
 		t.Fatal("rescue ran without OnlineOnly")
+	}
+	// dbSize already decided the trigger — the alarm-list probe is
+	// skipped, so only `endpoint status` ran (hung-etcd probe
+	// halving).
+	if len(g.ctlCalls) != 1 ||
+		!strings.Contains(strings.Join(g.ctlCalls[0], " "), "endpoint status") {
+		t.Fatalf("etcdctl calls=%v want status only (alarm probe skipped)",
+			g.ctlCalls)
 	}
 }
 
@@ -1070,5 +1083,138 @@ func TestEtcdGuardStatusErrorNoop(t *testing.T) {
 	if g.purges != 0 || len(g.rescues) != 0 {
 		t.Fatalf("unparseable status triggered remediation: purges=%d rescues=%d",
 			g.purges, len(g.rescues))
+	}
+}
+
+// watchdogLog returns the appended watchdog log file.
+func watchdogLog(t *testing.T, e *env) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(e.state), "watchdog.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestEtcdGuardRunCtxBounded(t *testing.T) {
+	// Both remediation steps must run under a bounded ctx — the
+	// guard budget (~10m), never the process-lifetime ctx.
+	e := fixture(t)
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(defaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.h.cfg.K0sDir = e.mkEtcdHost(t)
+	e.h.cfg.etcdctlFn = g.ctl
+	var purgeDL, rescueDL time.Time
+	e.h.cfg.evpurgeRunFn = func(ctx context.Context, _ evpurge.Config,
+		_ time.Time, _ io.Writer) error {
+		g.purges++
+		d, ok := ctx.Deadline()
+		if !ok {
+			t.Error("evpurge ctx carries no deadline")
+			return nil
+		}
+		purgeDL = d
+		return nil
+	}
+	e.h.cfg.etcdRescueFn = func(ctx context.Context,
+		cfg etcdrescue.Config, _ io.Writer) error {
+		g.rescues = append(g.rescues, cfg)
+		d, ok := ctx.Deadline()
+		if !ok {
+			t.Error("rescue ctx carries no deadline")
+			return nil
+		}
+		rescueDL = d
+		return nil
+	}
+	e.h.Cycle(context.Background())
+	for _, d := range []time.Time{purgeDL, rescueDL} {
+		rem := time.Until(d)
+		if rem > defaultEtcdGuardBudget || rem < defaultEtcdGuardBudget-time.Minute {
+			t.Fatalf("remediation ctx deadline in %s — want ~%s out",
+				rem, defaultEtcdGuardBudget)
+		}
+	}
+}
+
+func TestEtcdGuardBudgetExhaustedDefers(t *testing.T) {
+	// evpurge stalls until its ctx dies: the 80ms parent deadline
+	// stands in for the guard budget (gctx inherits the earlier of
+	// the two, and its Err() is still DeadlineExceeded). The guard
+	// must abort cleanly — budget stays spent, the rescue is not
+	// spawned on a dead ctx, and the deferral is logged.
+	e := fixture(t)
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(defaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.h.cfg.K0sDir = e.mkEtcdHost(t)
+	e.h.cfg.etcdctlFn = g.ctl
+	e.h.cfg.evpurgeRunFn = func(ctx context.Context, _ evpurge.Config,
+		_ time.Time, _ io.Writer) error {
+		g.purges++
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	e.h.cfg.etcdRescueFn = func(context.Context,
+		etcdrescue.Config, io.Writer) error {
+		g.rescues = append(g.rescues, etcdrescue.Config{})
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	e.h.Cycle(ctx)
+	if g.purges != 1 {
+		t.Fatalf("evpurge runs=%d want 1", g.purges)
+	}
+	if len(g.rescues) != 0 {
+		t.Fatal("rescue spawned on an already-dead guard ctx")
+	}
+	// The rate budget stays spent — a timeout defers to the next
+	// window, it does not refund.
+	if v := e.h.readEpoch(filepath.Join(e.state, fileRateEtcdGuard)); v == 0 {
+		t.Fatal("last-etcd-guard budget not spent")
+	}
+	if log := watchdogLog(t, e); !strings.Contains(log, "budget") ||
+		!strings.Contains(log, "deferred") {
+		t.Fatalf("exhausted budget not logged clearly:\n%s", log)
+	}
+}
+
+func TestRunCycleDeadlineAbortsStall(t *testing.T) {
+	// A hung etcdctl blocks its seam until the cycle ctx dies —
+	// the per-cycle deadline must interrupt the stall, propagate
+	// into the child call, and get logged.
+	e := fixture(t)
+	e.h.cfg.CycleTimeout = 60 * time.Millisecond
+	e.h.cfg.K0sDir = e.mkEtcdHost(t)
+	var once sync.Once
+	started := make(chan struct{})
+	var sawErr error
+	e.h.cfg.etcdctlFn = func(ctx context.Context, _ ...string) ([]byte, error) {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+		sawErr = ctx.Err()
+		return nil, ctx.Err()
+	}
+	e.h.cfg.evpurgeRunFn = func(context.Context, evpurge.Config,
+		time.Time, io.Writer) error {
+		return nil
+	}
+	e.h.cfg.etcdRescueFn = func(context.Context,
+		etcdrescue.Config, io.Writer) error {
+		return nil
+	}
+	start := time.Now()
+	e.h.runCycle(context.Background())
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("cycle ran %s — deadline did not abort the stall", took)
+	}
+	<-started // runCycle returned → the seam was called and released
+	if sawErr == nil {
+		t.Fatal("stalled child never saw the ctx cancellation")
+	}
+	if log := watchdogLog(t, e); !strings.Contains(log, "cycle deadline") {
+		t.Fatalf("cycle deadline not logged:\n%s", log)
 	}
 }

@@ -183,6 +183,10 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 		}
 		acted, err := u.unlock(ctx, gvr, hr)
 		if err != nil {
+			// Tolerated per-HR failure: the run absorbs it (logs +
+			// continues, returns nil) so it never reaches the
+			// wrapper — IncError here keeps it on the alert path.
+			metrics.IncError(helmUnlockQueue)
 			log.Error(err, "helmrelease unlock failed", "hr", key)
 			continue // per-HR failures must not starve the rest
 		}

@@ -59,6 +59,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -91,8 +92,14 @@ const (
 
 // Defaults mirror the shell scripts + the DaemonSet host mounts.
 const (
-	defaultInterval     = 60 * time.Second // merged timer cadence
-	minUptimeSeconds    = 1200             // WD_REQUIRES: uptime
+	defaultInterval = 60 * time.Second // merged timer cadence
+	// Per-cycle hard bound (Config.CycleTimeout): Run drives Cycle
+	// synchronously inside the ticker loop, so without it one
+	// stalled child starves the restart-critical wedge/TTL checks
+	// for as long as the child hangs. Sized well above a normal
+	// cycle (seconds) plus the etcdguard budget.
+	defaultCycleTimeout = 15 * time.Minute
+	minUptimeSeconds    = 1200 // WD_REQUIRES: uptime
 	defaultStateDir     = "/host/var/lib/node-watchdog"
 	defaultLogFile      = "/host/var/log/node-watchdog.log"
 	defaultProcRoot     = "/proc" // hostPID:true makes pod /proc == host /proc
@@ -153,6 +160,19 @@ const (
 	defaultEtcdGuardMinRun = time.Hour         // last-etcd-guard budget
 	defaultEtcdctlBudget   = 60 * time.Second  // ctx cap per etcdctl call
 	etcdctlCmdTimeout      = "30s"             // etcdctl --command-timeout
+	// Bound on the whole evpurge+rescue remediation block: evpurge
+	// is unbounded pagination + delete work at the apiserver's pace
+	// and the rescue is ~12 sequential etcdctl calls — driven by
+	// the process-lifetime ctx, a degraded backend could stall one
+	// (synchronous) cycle for hours. Both steps are idempotent and
+	// last-etcd-guard is spent up front, so exhausting this only
+	// defers the remainder to the next EtcdGuardMinRun window.
+	defaultEtcdGuardBudget = 10 * time.Minute
+	// Each rescue-spawned command gets a far shorter cap than
+	// etcdrescue's defaultCallTimeout (10m — sized for an operator
+	// at a shell): ~12 sequential calls then stay near the guard
+	// budget instead of ~2h.
+	defaultEtcdGuardCallTimeout = time.Minute
 	// eventStaleAge is the apiserver's own 1h event TTL — anything
 	// older is GC debt the purge may safely delete (fresh, debuggable
 	// events survive the guard's evpurge pass).
@@ -229,6 +249,12 @@ var (
 type Config struct {
 	Enabled  bool          // false → Run idles until ctx done
 	Interval time.Duration // guard cycle cadence (60s)
+	// CycleTimeout is the per-Cycle deadline Run applies around each
+	// Cycle: every spawned command and HTTP probe is ctx-aware, so
+	// a stalled check is aborted instead of starving the
+	// restart-critical guards past this bound on any tick.
+	// <=0 → defaultCycleTimeout (15m).
+	CycleTimeout time.Duration
 	// WatchdogStateDir holds state-*/last-*/consecutive-*/oomloop-*
 	// files — the shared node-watchdog state dir contract.
 	WatchdogStateDir string
@@ -254,9 +280,11 @@ type Config struct {
 	AdminCert       string // fallback client-cert triple
 	AdminKey        string
 	AdminCA         string
-	// InsecureTLS mirrors `curl -sk` (k0s apiserver certs do not
-	// carry 127.0.0.1 SANs reliably); CA pinning only applies when
-	// false.
+	// InsecureTLS mirrors `curl -sk`; CA pinning only applies when
+	// false. (Upstream k0s apiserver certs ALWAYS carry IP SAN
+	// 127.0.0.1, so verify works against the loopback endpoint —
+	// the missing-SAN caveat applies to the kubelet serving cert,
+	// see workerhygiene, not to this one.)
 	InsecureTLS  bool
 	APIPath      string        // LIST path returning .metadata.resourceVersion
 	QueryTimeout time.Duration // per-query deadline
@@ -357,6 +385,9 @@ type Config struct {
 func (c *Config) applyDefaults() {
 	if c.Interval <= 0 {
 		c.Interval = defaultInterval
+	}
+	if c.CycleTimeout <= 0 {
+		c.CycleTimeout = defaultCycleTimeout
 	}
 	if c.WatchdogStateDir == "" {
 		c.WatchdogStateDir = defaultStateDir
@@ -714,7 +745,7 @@ func (h *Hygiene) Run(ctx context.Context) {
 	if h.feederActive() {
 		go h.runFeeder(ctx)
 	}
-	h.Cycle(ctx)
+	h.runCycle(ctx)
 	t := time.NewTicker(h.cfg.Interval)
 	defer t.Stop()
 	for {
@@ -722,8 +753,28 @@ func (h *Hygiene) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			h.Cycle(ctx)
+			h.runCycle(ctx)
 		}
+	}
+}
+
+// runCycle executes one Cycle under the per-cycle deadline
+// (Config.CycleTimeout). Run calls Cycle synchronously inside the
+// ticker loop, so without the bound a single hung child — a
+// degraded apiserver/etcd, a dead network path — would starve the
+// restart-critical wedge/TTL checks for as long as it hangs. Every
+// spawned command and HTTP probe is CommandContext/request-ctx
+// aware, so cancellation actually interrupts the stall. Hitting
+// the deadline is a degraded cycle, not a failure — it is logged
+// so a silently-starved guard shows up in the watchdog tail.
+func (h *Hygiene) runCycle(ctx context.Context) {
+	cctx, cancel := context.WithTimeout(ctx, h.cfg.CycleTimeout)
+	defer cancel()
+	h.Cycle(cctx)
+	if errors.Is(cctx.Err(), context.DeadlineExceeded) {
+		h.appendLogWarn(fmt.Sprintf(
+			"controllerhygiene: cycle deadline %s exceeded — "+
+				"stalled check(s) aborted", h.cfg.CycleTimeout))
 	}
 }
 
@@ -1378,11 +1429,13 @@ func (h *Hygiene) listRV(ctx context.Context, endpoint string, cached bool) (int
 // defrag + alarm disarm) sat behind manual CLI commands. The guard
 // automates that: every cycle on hosts whose K0sDir carries
 // bin/etcdctl + pki/etcd/ca.crt (kine hosts have neither and no-op
-// silently) it reads `endpoint status -w json` + `alarm list` and
-// exports the db-size / nospace gauges. A NOSPACE alarm or dbSize >=
-// EtcdDBSizeLimit spends the last-etcd-guard budget (EtcdGuardMinRun,
-// 1h) on evpurge.Run + etcdrescue.Run with OnlineOnly — the offline
-// defrag stops k0scontroller and is NEVER a background action.
+// silently) it reads `endpoint status -w json` — plus `alarm list`
+// while under the size trigger — and exports the db-size / nospace
+// gauges. A NOSPACE alarm or dbSize >= EtcdDBSizeLimit spends the
+// last-etcd-guard budget (EtcdGuardMinRun, 1h) on evpurge.Run +
+// etcdrescue.Run with OnlineOnly, all inside a bounded ctx — the
+// offline defrag stops k0scontroller and is NEVER a background
+// action.
 
 // checkEtcdQuota runs one etcdguard cycle.
 func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
@@ -1406,17 +1459,28 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	h.etcdDBSize.Set(float64(dbSize))
 	h.etcdDBUse.Set(float64(dbUse))
 
-	nospace, err := h.etcdNospaceArmed(ctx)
-	if err != nil {
-		// A failed alarm read must not hide a real alarm — treat
-		// the size signal as authoritative this cycle, surface the
-		// error once in the log, and LEAVE the gauge at its last
-		// value rather than force-clearing a possibly-armed alarm.
-		h.appendLogWarn(fmt.Sprintf("etcdguard: alarm list failed: %v", err))
-	} else if nospace {
-		h.etcdNospace.Set(1)
-	} else {
-		h.etcdNospace.Set(0)
+	// The alarm-list probe only runs while dbSize is below the
+	// trigger: over-limit the action decision is already made, so a
+	// second etcdctl would only double the routine probe cost —
+	// against a hung etcd each call can burn its whole command
+	// timeout. A skipped probe leaves the nospace gauge at its last
+	// value, the same "keep last, never force-clear a
+	// possibly-armed alarm" semantics as a probe error.
+	var nospace bool
+	if dbSize < h.cfg.EtcdDBSizeLimit {
+		ns, aerr := h.etcdNospaceArmed(ctx)
+		if aerr != nil {
+			// A failed alarm read must not hide a real alarm —
+			// treat the size signal as authoritative this cycle,
+			// surface the error once in the log, and LEAVE the
+			// gauge at its last value.
+			h.appendLogWarn(fmt.Sprintf("etcdguard: alarm list failed: %v", aerr))
+		} else if ns {
+			nospace = true
+			h.etcdNospace.Set(1)
+		} else {
+			h.etcdNospace.Set(0)
+		}
 	}
 
 	var reason string
@@ -1446,11 +1510,21 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	h.rateSpend(h.cfg.WatchdogStateDir, fileRateEtcdGuard)
 	out := &guardLogWriter{h: h}
 
+	// The whole remediation runs under a bounded ctx: evpurge is
+	// unbounded pagination + delete work against a possibly
+	// degraded apiserver and the rescue is ~12 sequential etcdctl
+	// calls — on the process-lifetime ctx either could stall this
+	// (synchronous) cycle for hours. Both steps are idempotent and
+	// the rate budget was already spent, so exhausting the deadline
+	// only defers the remainder to the next EtcdGuardMinRun window.
+	gctx, gcancel := context.WithTimeout(ctx, defaultEtcdGuardBudget)
+	defer gcancel()
+
 	// Stale apiserver events are the classic quota-filler after a
 	// control-plane outage — purge first so the rescue's compaction
 	// has garbage to drop. Cutoff keeps the apiserver's own 1h event
 	// TTL: only GC debt is deleted, fresh events survive.
-	perr := h.cfg.evpurgeRunFn(ctx, evpurge.Config{
+	perr := h.cfg.evpurgeRunFn(gctx, evpurge.Config{
 		API:      "https://" + h.cfg.SelfEndpoint,
 		CAFile:   h.cfg.AdminCA,
 		CertFile: h.cfg.AdminCert,
@@ -1460,17 +1534,34 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	if perr != nil {
 		h.appendLogWarn(fmt.Sprintf("etcdguard: evpurge failed: %v", perr))
 	}
-	rerr := h.cfg.etcdRescueFn(ctx, etcdrescue.Config{
-		K0sDir:   h.cfg.K0sDir,
-		Endpoint: h.cfg.EtcdEndpoint,
-		// OnlineOnly: this is background auto-maintenance — the
-		// systemctl-stop + standalone-etcd defrag would take the
-		// control plane down and stays a manual rescue-etcd action.
-		OnlineOnly: true,
-	}, out)
-	out.flush()
-	if rerr != nil {
-		h.appendLogWarn(fmt.Sprintf("etcdguard: rescue incomplete: %v", rerr))
+	// A dead gctx here means evpurge (or a cancelled parent) ate
+	// the whole budget — spawn no further calls that can only fail;
+	// the rescue is idempotent and retries in the next window.
+	if gctx.Err() == nil {
+		rerr := h.cfg.etcdRescueFn(gctx, etcdrescue.Config{
+			K0sDir:   h.cfg.K0sDir,
+			Endpoint: h.cfg.EtcdEndpoint,
+			// OnlineOnly: this is background auto-maintenance — the
+			// systemctl-stop + standalone-etcd defrag would take the
+			// control plane down and stays a manual rescue-etcd
+			// action.
+			OnlineOnly: true,
+			// The guard is a loop, not an operator: cap each spawned
+			// command far below etcdrescue's interactive default
+			// (defaultCallTimeout = 10m) so ~12 sequential calls
+			// stay near the guard budget instead of ~2h.
+			CallTimeout: defaultEtcdGuardCallTimeout,
+		}, out)
+		out.flush()
+		if rerr != nil {
+			h.appendLogWarn(fmt.Sprintf("etcdguard: rescue incomplete: %v", rerr))
+		}
+	}
+	if errors.Is(gctx.Err(), context.DeadlineExceeded) {
+		h.appendLogWarn(fmt.Sprintf(
+			"etcdguard: run budget (%s) exhausted — remaining steps "+
+				"deferred to the next %s window",
+			defaultEtcdGuardBudget, h.cfg.EtcdGuardMinRun))
 	}
 	h.actions.WithLabelValues(checkEtcd, "evpurge_rescue").Inc()
 	h.cycles.WithLabelValues(checkEtcd, "ok").Inc()

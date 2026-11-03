@@ -537,6 +537,10 @@ func TestWebhookCircuitBreakerTripsAfterThreshold(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	g := wgBreakerGuard(cs, &now)
 	patches := wgPatchCounter(cs)
+	t.Cleanup(func() {
+		metrics.WebhookCircuitBroken.DeleteLabelValues(
+			webhookKindMutating, "cb-mwc", "dead.example.com")
+	})
 	tripsBefore := wgTripCount(t, webhookKindMutating, "cb-mwc")
 
 	// First sighting — recorded, not tripped.
@@ -639,7 +643,9 @@ func TestWebhookCircuitBreakerPatchContents(t *testing.T) {
 
 // Recovery: once the Service reports a Ready endpoint the breaker
 // restores failurePolicy=Fail, clears the now-empty annotation and
-// drops the gauge back to 0. Exercised on the validating kind.
+// deletes the gauge series outright — a cleared breaker emits no
+// series, not a 0 (DeleteLabelValues doubles as the exists-probe).
+// Exercised on the validating kind.
 func TestWebhookCircuitBreakerRecoversAndClears(t *testing.T) {
 	vwc := &admissionv1.ValidatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: "cb-vwc"},
@@ -686,8 +692,11 @@ func TestWebhookCircuitBreakerRecoversAndClears(t *testing.T) {
 	if anno, ok := wgValidatingAnno(t, cs, "cb-vwc"); ok {
 		t.Fatalf("annotation must be removed when empty, still %q", anno)
 	}
-	if got := wgBrokenGauge(t, webhookKindValidating, "cb-vwc", "dead.example.com"); got != 0 {
-		t.Fatalf("WebhookCircuitBroken = %v, want 0 after recovery", got)
+	// The probe runs before any WithLabelValues read — the gauge call
+	// itself would recreate the series at 0 and mask the deletion.
+	if metrics.WebhookCircuitBroken.DeleteLabelValues(
+		webhookKindValidating, "cb-vwc", "dead.example.com") {
+		t.Fatal("recovery must delete the WebhookCircuitBroken series, not park it at 0")
 	}
 	if got := wgTripCount(t, webhookKindValidating, "cb-vwc"); got != tripsAfterTrip {
 		t.Fatalf("recovery must not count as a trip: %v != %v", got, tripsAfterTrip)
@@ -843,6 +852,10 @@ func TestWebhookCircuitBreakerPatchFailureDoesNotAbort(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
+	t.Cleanup(func() {
+		metrics.WebhookCircuitBroken.DeleteLabelValues(
+			webhookKindMutating, "cb-m-ok", "dead-m.example.com")
+	})
 	now := time.Unix(1_700_000_000, 0)
 	g := wgBreakerGuard(cs, &now)
 	if err := g.run(ctx); err != nil {
@@ -889,6 +902,10 @@ func TestWebhookCircuitBreakerDropsStaleAnnotationNames(t *testing.T) {
 		wgEndpointSlice("backend", "dead-svc", 0, 1),
 		mwc)
 	g := &webhookGuard{cs: cs}
+	t.Cleanup(func() {
+		metrics.WebhookCircuitBroken.DeleteLabelValues(
+			webhookKindMutating, "cb-stale", "still-dead.example.com")
+	})
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -896,5 +913,144 @@ func TestWebhookCircuitBreakerDropsStaleAnnotationNames(t *testing.T) {
 	if !ok || anno != "still-dead.example.com" {
 		t.Fatalf("annotation = %q (present=%v), want %q",
 			anno, ok, "still-dead.example.com")
+	}
+}
+
+// A webhook config DELETED while circuit-broken must not pin the alert
+// forever — the sweep prunes every WebhookCircuitBroken series whose
+// kind/config/webhook tuple it did not re-see.
+// DeleteLabelValues doubles as the exists-probe: it reports whether a
+// series was still registered (and removes it if so).
+func TestWebhookCircuitBreakerPrunesSeriesForDeletedConfig(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-deleted"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		mwc)
+	now := time.Unix(1_700_000_000, 0)
+	g := wgBreakerGuard(cs, &now)
+	t.Cleanup(func() {
+		metrics.WebhookCircuitBroken.DeleteLabelValues(
+			webhookKindMutating, "cb-deleted", "dead.example.com")
+	})
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(webhookDeadThreshold + time.Minute)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgBrokenGauge(t, webhookKindMutating, "cb-deleted", "dead.example.com"); got != 1 {
+		t.Fatalf("precondition: WebhookCircuitBroken = %v, want 1", got)
+	}
+
+	// The whole config vanishes — the next sweep never re-sees the
+	// tuple, so its =1 series must be deleted, not left firing.
+	if err := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
+		Delete(ctx, "cb-deleted", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete config: %v", err)
+	}
+	now = now.Add(time.Minute)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.WebhookCircuitBroken.DeleteLabelValues(
+		webhookKindMutating, "cb-deleted", "dead.example.com") {
+		t.Fatal("WebhookCircuitBroken series for a deleted config must be pruned")
+	}
+}
+
+// A config recreated under the SAME name but without the
+// circuit-broken annotation — the outage resolved before GitOps
+// reapplied it — must not inherit the old object's =1 series: the
+// sweep that no longer re-sees a broken tuple prunes it.
+// (A recreated config whose backend is STILL dead legitimately
+// re-trips the same sweep — deadSince deliberately survives a trip so
+// a failed patch retries immediately — so the healthy-backend case is
+// the one that proves the prune.)
+func TestWebhookCircuitBreakerPrunesSeriesForRecreatedConfig(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-recreated"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		mwc)
+	now := time.Unix(1_700_000_000, 0)
+	g := wgBreakerGuard(cs, &now)
+	t.Cleanup(func() {
+		metrics.WebhookCircuitBroken.DeleteLabelValues(
+			webhookKindMutating, "cb-recreated", "dead.example.com")
+	})
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(webhookDeadThreshold + time.Minute)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgBrokenGauge(t, webhookKindMutating, "cb-recreated", "dead.example.com"); got != 1 {
+		t.Fatalf("precondition: WebhookCircuitBroken = %v, want 1", got)
+	}
+
+	// Delete + recreate under the same name with failurePolicy=Fail
+	// and no annotation — and the Service is healthy again by then
+	// (the fix and the re-apply land together).
+	if err := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
+		Delete(ctx, "cb-recreated", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete config: %v", err)
+	}
+	fresh := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-recreated"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	if _, err := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
+		Create(ctx, fresh, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("recreate config: %v", err)
+	}
+	if _, err := cs.DiscoveryV1().EndpointSlices("backend").Update(ctx,
+		wgEndpointSlice("backend", "dead-svc", 1, 0), metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update slice: %v", err)
+	}
+	now = now.Add(time.Minute)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if metrics.WebhookCircuitBroken.DeleteLabelValues(
+		webhookKindMutating, "cb-recreated", "dead.example.com") {
+		t.Fatal("WebhookCircuitBroken series for a recreated (un-annotated) config must be pruned")
+	}
+	if got := wgMutatingFP(t, cs, "cb-recreated", "dead.example.com"); got != admissionv1.Fail {
+		t.Fatalf("recreated webhook keeps its declared policy, failurePolicy=%q", got)
+	}
+	if anno, ok := wgMutatingAnno(t, cs, "cb-recreated"); ok {
+		t.Fatalf("recreated config must not carry the annotation, still %q", anno)
 	}
 }

@@ -125,17 +125,15 @@ func (a *certDriftAuditor) run(ctx context.Context) error {
 	}
 
 	// The two audits are independent: a broken webhook list must not
-	// blind the TLS-expiry gauge (and vice versa). Both report through
-	// IncError; the first error propagates so the periodic wrapper
-	// logs it.
+	// blind the TLS-expiry gauge (and vice versa). The first error
+	// propagates — the periodic wrapper owns run-level IncError, so
+	// this run() must not count the error it returns (double-count).
 	var firstErr error
 	if err := a.auditWebhookCABundles(ctx); err != nil {
-		metrics.IncError(certDriftQueue)
 		log.Error(err, "webhook ca-bundle audit failed")
 		firstErr = err
 	}
 	if err := a.auditTLSSecrets(ctx); err != nil {
-		metrics.IncError(certDriftQueue)
 		log.Error(err, "tls secret expiry audit failed")
 		if firstErr == nil {
 			firstErr = err
