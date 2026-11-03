@@ -227,7 +227,13 @@ func main() {
 	}
 
 	log.Info("starting manager", "version", version,
-		"ciliumTaintReaper", mc.ciliumEnabled, "fluentBitRoller", mc.fluentbitEnabled)
+		"ciliumTaintReaper", mc.ciliumEnabled, "fluentBitRoller", mc.fluentbitEnabled,
+		"certManagerReaper", mc.certReaperEnabled, "ciliumAudit", mc.ciliumAuditEnabled,
+		"externalSecretNudge", mc.esNudgeEnabled, "csrApprove", mc.csrApproveEnabled,
+		"concourseJanitor", mc.concourseJanitorEnabled,
+		"corednsPatcher", mc.corednsPatcherEnabled,
+		"metricsServerPatcher", mc.metricsServerPatcherEnabled,
+		"cfTunnelWatchdog", mc.cfTunnelWatchdogEnabled)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited")
 		os.Exit(1)

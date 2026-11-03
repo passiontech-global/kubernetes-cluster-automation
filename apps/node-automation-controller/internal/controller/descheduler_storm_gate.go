@@ -141,7 +141,9 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	deploy, err := r.cs.AppsV1().Deployments("kube-system").
 		Get(ctx, "descheduler", metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return res, nil // no descheduler on this cluster
+		log.Info("SKIP: no descheduler deployment on this cluster",
+			"verdict", verdict)
+		return res, nil
 	}
 	if err != nil {
 		metrics.IncError("descheduler-storm-gate")

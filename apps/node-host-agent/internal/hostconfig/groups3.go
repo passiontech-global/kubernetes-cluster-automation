@@ -119,29 +119,29 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 		slog.Info("swap: removing wrong-size inactive file", "path", path,
 			"size", fi.Size(), "want", wantBytes)
 		if err := os.Remove(dst); err != nil {
-			slog.Error("swap: remove wrong-size file", "path", path, "err", err)
+			slog.Error("swap: remove wrong-size file", "path", path, "error", err)
 			return
 		}
 		exists = false
 	}
 	if !exists {
 		if _, err := r.run(ctx, "fallocate", "-l", fmt.Sprintf("%dM", mb), path); err != nil {
-			slog.Warn("swap: fallocate failed — dd fallback", "path", path, "err", err)
+			slog.Warn("swap: fallocate failed — dd fallback", "path", path, "error", err)
 			if _, derr := r.run(ctx, "dd", "if=/dev/zero", "of="+path, "bs=1M",
 				fmt.Sprintf("count=%d", mb), "status=none"); derr != nil {
-				slog.Error("swap: dd create failed", "path", path, "err", derr)
+				slog.Error("swap: dd create failed", "path", path, "error", derr)
 				return
 			}
 		}
 	}
 	if err := os.Chmod(dst, 0o600); err != nil {
-		slog.Error("swap: chmod 0600 failed", "path", path, "err", err)
+		slog.Error("swap: chmod 0600 failed", "path", path, "error", err)
 		return
 	}
 	out, _ := r.run(ctx, "blkid", "-o", "value", "-s", "TYPE", path)
 	if strings.TrimSpace(out) != "swap" {
 		if _, err := r.run(ctx, "mkswap", path); err != nil {
-			slog.Error("swap: mkswap failed", "path", path, "err", err)
+			slog.Error("swap: mkswap failed", "path", path, "error", err)
 			return
 		}
 	}
@@ -240,7 +240,7 @@ func (c *cyc) hubMetricsNodeExporter() {
 	if !(fileExistsNoRoot(local) && sha256FileOK(local, sum)) {
 		if err := nexpDownload(ctx, url, local, sum); err != nil {
 			slog.Error("hub-metrics-fw: node_exporter deb download failed",
-				"url", url, "err", err)
+				"url", url, "error", err)
 			return
 		}
 	}
@@ -249,7 +249,7 @@ func (c *cyc) hubMetricsNodeExporter() {
 	if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 		"apt-get", "install", "-y", "/tmp/"+file); err != nil {
 		slog.Error("hub-metrics-fw: node_exporter deb install failed",
-			"deb", "/tmp/"+file, "err", err)
+			"deb", "/tmp/"+file, "error", err)
 	}
 }
 
@@ -294,8 +294,8 @@ func nexpDownload(ctx context.Context, url, dst, wantSHA256 string) error {
 }
 
 // hubMetricsExtraPorts — hub_metrics_extra_ports from cluster.yaml
-// (e.g. 2380 kine /metrics, 2381; KHONG bat tren cicd — etcd owns 2380
-// there). Numeric entries only.
+// (e.g. 2380 kine /metrics, 2381; do NOT enable on cicd — etcd owns
+// 2380 there). Numeric entries only.
 func (c *cyc) hubMetricsExtraPorts() []string {
 	var out []string
 	for _, it := range c.vl("hub_metrics_extra_ports") {
@@ -406,16 +406,16 @@ func (c *cyc) groupAPILBVM() {
 	// container's haproxy uid on every boot (/run is tmpfs — docker
 	// auto-creating it root:root crash-loops the VIP).
 	r.writeManaged("/etc/tmpfiles.d/api-lb-guard.conf",
-		[]byte(fmt.Sprintf(`# api-lb-guard: bind-mount source cho haproxy admin socket.
-# owner 99 = uid user `+"`haproxy`"+` trong image haproxy:*-alpine.
+		[]byte(fmt.Sprintf(`# api-lb-guard: bind-mount source for the haproxy admin socket.
+# owner 99 = uid of the `+"`haproxy`"+` user in the haproxy:*-alpine image.
 d %s 0755 99 99 -
 `, sockDir)), 0o644)
 	if err := os.MkdirAll(r.hp(sockDir), 0o755); err == nil {
 		if err := os.Chown(r.hp(sockDir), 99, 99); err != nil {
-			slog.Warn("api-lb-vm: chown 99 sock dir failed", "dir", sockDir, "err", err)
+			slog.Warn("api-lb-vm: chown 99 sock dir failed", "dir", sockDir, "error", err)
 		}
 	} else {
-		slog.Error("api-lb-vm: sock dir create failed", "dir", sockDir, "err", err)
+		slog.Error("api-lb-vm: sock dir create failed", "dir", sockDir, "error", err)
 	}
 
 	// journald persistence — the only drain-audit history on these
@@ -423,8 +423,8 @@ d %s 0755 99 99 -
 	// journals under a stale machine-id dir, orphaned on next boot).
 	r.ensureDir("/etc/systemd/journald.conf.d", 0o755)
 	jch, _ := r.writeManaged("/etc/systemd/journald.conf.d/50-api-lb-guard.conf",
-		[]byte(`# api-lb-guard: persistent journal de audit lich su drain cua
-# guard qua reboot. Cap 500M: VM chi chay haproxy + agent, log nho.
+		[]byte(`# api-lb-guard: persistent journal to audit guard drain
+# history across reboots. 500M cap: the VM only runs haproxy + agent.
 [Journal]
 Storage=persistent
 SystemMaxUse=500M
@@ -456,7 +456,7 @@ for f in /var/log/journal/*/*.journal; do
   base=$(basename "$f")
   dest="/var/log/journal/$mid/$base"
   [ -e "$dest" ] && dest="/var/log/journal/$mid/orphan-$base"
-  mv "$f" "$dest" || echo "WARN: khong move duoc $f"
+  mv "$f" "$dest" || echo "WARN: could not move $f"
 done`, mid))
 	}
 
@@ -464,18 +464,18 @@ done`, mid))
 
 	// guard conf (lbg_* host-var parity).
 	conf := fmt.Sprintf(`# /etc/api-backend-guard.conf — managed by node-host-agent hostconfig
-# (port of hub_converge.yaml api_lb_guard scope). KHONG sua tay —
-# converge ghi de. Sua vars api_lb_guard_vms trong vars/cluster.yaml.
+# (port of hub_converge.yaml api_lb_guard scope). Do NOT edit by hand —
+# converge overwrites. Edit the api_lb_guard_vms vars in vars/cluster.yaml.
 MODE=%s
 
-# "haproxy_server_name=ip:port" — name PHAI trung `+"`server <name>`"+` line
-# trong backend %s cua haproxy tren VM nay.
+# "haproxy_server_name=ip:port" — name MUST match the `+"`server <name>`"+`
+# line in backend %s of the haproxy on this VM.
 API_BACKENDS="%s"
 
 HAPROXY_BACKEND=%s
-# Disable/enable duoc ap len TAT CA backends nay (controller wedge don
-# ca api lane lan konnectivity tunnel — su co 2026-10-07). Server khong
-# ton tai trong 1 backend la no-op.
+# Disable/enable applies to ALL these backends (a wedged controller
+# drains both the api lane and the konnectivity tunnel — incident
+# 2026-10-07). A server missing from a backend is a no-op.
 HAPROXY_BACKENDS="%s"
 HAPROXY_SOCKET=%s
 
@@ -494,7 +494,7 @@ CA_FILE=/etc/api-backend-guard/ca.crt
 	// explicitly so a drifted 0755 credential dir is re-tightened.
 	r.ensureDir("/etc/api-backend-guard", 0o700)
 	if err := os.Chmod(r.hp("/etc/api-backend-guard"), 0o700); err != nil {
-		slog.Warn("api-lb-vm: chmod 0700 credential dir failed", "err", err)
+		slog.Warn("api-lb-vm: chmod 0700 credential dir failed", "error", err)
 	}
 	r.writeManaged("/etc/api-backend-guard.conf", []byte(conf), 0o644)
 
@@ -526,7 +526,7 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 	out, err := r.run(ctx, "docker", "inspect", container)
 	if err != nil {
 		slog.Error("api-lb-vm: docker inspect failed — skipping haproxy converge",
-			"container", container, "err", err)
+			"container", container, "error", err)
 		return
 	}
 	var ins []lbgInspect
@@ -551,7 +551,7 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 	// ansible assert parity.
 	if composeFile == "" || cfgPath == "" {
 		slog.Error("api-lb-vm: cannot locate compose file or haproxy.cfg — "+
-			"kiem tra tay VM nay", "container", container,
+			"check this VM manually", "container", container,
 			"compose", composeFile, "cfg", cfgPath)
 		return
 	}
@@ -560,11 +560,11 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 	cfgChanged := false
 	if b, err := os.ReadFile(r.hp(cfgPath)); err == nil &&
 		!strings.Contains(string(b), "stats socket") {
-		nb := "# BEGIN api-lb-guard: admin socket cho guard drain backend\n" +
+		nb := "# BEGIN api-lb-guard: admin socket for guard backend drain\n" +
 			"global\n" +
 			"    stats socket /run/haproxy/admin.sock mode 660 level admin\n" +
 			"    stats timeout 30s\n" +
-			"# END api-lb-guard: admin socket cho guard drain backend\n" +
+			"# END api-lb-guard: admin socket for guard backend drain\n" +
 			string(b)
 		cfgChanged, _ = r.writeManaged(cfgPath, []byte(nb), 0o644)
 	}
@@ -587,7 +587,7 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 			"-v", cfgPath+":/tmp/haproxy.cfg:ro",
 			image, "haproxy", "-c", "-f", "/tmp/haproxy.cfg"); err != nil {
 			slog.Error("api-lb-vm: haproxy -c failed — not recreating/restarting",
-				"err", err)
+				"error", err)
 			return
 		}
 	}
@@ -615,117 +615,122 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 		"socket", socket)
 }
 
-// ---------- Phase 3: kine.service (tach kine khoi k0scontroller) ----------
+// ---------- Phase 3: kine.service (split kine out of k0scontroller) ----------
 //
-// Kine embedded trong k0scontroller chia cgroup + lifecycle voi
-// apiserver: mot kine OOM (catch-up storm sau compact) keo ca
-// controller vao metastable OOM loop (incident 2026-10-02 —
-// /swapfile-kine la band-aid cho dung chung cgroup do). Tach kine
-// thanh unit systemd RIENG co MemoryMax/GOMEMLIMIT boundary rieng:
-// kine OOM chi kine bi kill+restart, apiserver mat storage tam thoi
-// nhung khong bi keo theo. k0scontroller ket noi qua kine socket —
-// Before= dam bao storage len truoc apiserver.
+// Kine embedded in k0scontroller shares cgroup + lifecycle with the
+// apiserver: one kine OOM (catch-up storm after compact) drags the
+// whole controller into a metastable OOM loop (incident 2026-10-02 —
+// /swapfile-kine is the band-aid for that shared cgroup). Splitting
+// kine into its OWN systemd unit with its own MemoryMax/GOMEMLIMIT
+// boundary means a kine OOM only kills+restarts kine — the apiserver
+// loses storage temporarily but is not dragged down with it.
+// k0scontroller connects over the kine socket — Before= guarantees
+// storage is up before the apiserver.
 //
-// Gate tuyet doi: chi chay khi NodeName nam trong kine_service_hosts
-// (defaults.yaml khai [] => hoan toan off cho den khi cluster.yaml
-// list host cutover). Node khong duoc list thi khong touch gi het.
+// Hard gate: only runs when NodeName is listed in kine_service_hosts
+// (defaults.yaml declares [] => fully off until cluster.yaml lists
+// cutover hosts). An unlisted node is never touched.
 
 func (c *cyc) groupKineService() {
 	r, ctx := c.r, c.ctx
 	if !containsSS(c.vs("kine_service_hosts"), r.cfg.NodeName) {
-		// NB: khong co rollback — unlist host chi ngung converge, unit
-		// dang chay van tiep tuc (co y: khong bao gio giet datastore
-		// apiserver chi vi host bi go khoi list).
+		// NB: no rollback — unlisting a host only stops converge, a
+		// running unit keeps running (deliberate: never kill the
+		// apiserver datastore just because a host left the list).
 		return
 	}
 
-	// Contract defaults.yaml: kine_endpoint rong = khong render unit.
-	// kine khong co DSN se fallback sqlite tren unix socket ma
-	// apiserver tro toi -> datastore trong (data loss). Fail closed:
-	// giu nguyen last-good, canh bao de operator sua vars.
+	// defaults.yaml contract: empty kine_endpoint = do not render the
+	// unit. A kine with no DSN falls back to sqlite on the unix socket
+	// the apiserver points at -> empty datastore (data loss). Fail
+	// closed: keep last-good, warn so the operator fixes the vars.
 	ep := c.v("kine_endpoint")
 	if ep == "" || ep == "None" {
-		slog.Warn("kine.service: kine_endpoint khong duoc cau hinh — bo qua converge")
+		slog.Warn("kine.service: kine_endpoint not configured — skipping converge")
 		return
 	}
 
-	// /usr/local/bin/kine pinned qua sha256 — pin thieu thi fail
-	// closed ke ca khi file da ton tai (khong bao gio start mot
-	// binary khong xac thuc duoc).
+	// /usr/local/bin/kine is sha256-pinned — a missing pin fails
+	// closed even when the file already exists (never start a binary
+	// that cannot be verified).
 	binPath := "/usr/local/bin/kine"
 	url, sum := c.v("kine_bin_url"), c.v("kine_bin_sha256")
 	if url == "" || url == "None" || sum == "" || sum == "None" {
-		slog.Error("kine.service: thieu pin kine_bin_url+kine_bin_sha256 — khong converge")
+		slog.Error("kine.service: missing kine_bin_url+kine_bin_sha256 pins — not converging")
 		return
 	}
 	binChanged := false
 	if !r.fileExists(binPath) || !sha256FileOK(r.hp(binPath), sum) {
 		if err := download(ctx, url, r.hp(binPath), sum); err != nil {
-			slog.Error("kine.service: kine binary download", "url", url, "err", err)
+			slog.Error("kine.service: kine binary download", "url", url, "error", err)
 			return
 		}
 		binChanged = true
 	}
-	// Mode drift enforce ca khi hash da dung — binary 0644 khong
-	// exec duoc.
+	// Enforce mode drift even when the hash already matches — a 0644
+	// binary cannot exec.
 	if err := os.Chmod(r.hp(binPath), 0o755); err != nil {
-		slog.Error("kine.service: chmod kine binary", "err", err)
+		slog.Error("kine.service: chmod kine binary", "error", err)
 		return
 	}
 
-	// /etc/kine 0700 + kine.env 0600 — DSN chua DB password nen khong
-	// duoc embed vao unit file (unit 0644 doc duoc boi moi user).
+	// /etc/kine 0700 + kine.env 0600 — the DSN carries the DB password
+	// so it must not be embedded in the unit file (a 0644 unit is
+	// readable by every user).
 	r.ensureDir("/etc/kine", 0o700)
 	if err := os.Chmod(r.hp("/etc/kine"), 0o700); err != nil {
-		slog.Warn("kine.service: chmod 0700 /etc/kine", "err", err)
+		slog.Warn("kine.service: chmod 0700 /etc/kine", "error", err)
 	}
 	envChanged, _ := r.writeManaged("/etc/kine/kine.env",
 		[]byte("# Managed by node-config-agent - kine datastore endpoint (KINE_ENDPOINT)\n"+
 			"KINE_ENDPOINT="+ep+"\n"), 0o600)
-	// writeManaged giu mode cu cua file ton tai — kine.env chua mat
-	// khau nen luon enforce lai 0600.
+	// writeManaged preserves an existing file's mode — kine.env holds
+	// a password so always re-enforce 0600.
 	if err := os.Chmod(r.hp("/etc/kine/kine.env"), 0o600); err != nil {
-		slog.Warn("kine.service: chmod 0600 kine.env", "err", err)
+		slog.Warn("kine.service: chmod 0600 kine.env", "error", err)
 	}
 
-	// Defaults mirror invocation k0s dung cho embedded kine:
+	// Defaults mirror the invocation k0s uses for embedded kine:
 	// --listen-address=unix://<KineSocketPath> + --metrics-bind-address
 	// =:2380 (HUBMETRICS whitelist + hub-kine-metrics ServiceMonitor).
 	listen := defStr(c.v("kine_listen_address"), "unix:///run/k0s/kine.sock")
 	metrics := defStr(c.v("kine_metrics_bind_address"), ":2380")
-	// unix socket: /run la tmpfs — tao parent dir truoc start (dir do
-	// k0scontroller tao, ma no start SAU vi Before=), va cho socket
-	// bind xong moi thoa Before= (Type=simple danh "started" ngay khi
-	// exec -> k0scontroller co the chay khi socket chua ton tai).
+	// unix socket: /run is tmpfs — create the parent dir before start
+	// (k0scontroller creates that dir, but it starts AFTER because of
+	// Before=), and wait for the socket bind before Before= is
+	// satisfied (Type=simple counts "started" at exec -> k0scontroller
+	// could start while the socket does not exist yet).
 	execPre, execPost := "", ""
 	if sock := strings.TrimPrefix(listen, "unix://"); sock != listen {
 		execPre = "ExecStartPre=/usr/bin/mkdir -p " + filepath.Dir(sock) + "\n"
 		execPost = "ExecStartPost=/bin/sh -c 'i=0; while [ ! -S " + sock +
 			" ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done'\n"
 	}
-	unitChanged, _ := r.writeManaged("/etc/systemd/system/kine.service", []byte(fmt.Sprintf(`# Managed by node-config-agent - Phase 3: tach kine khoi k0scontroller.
-# Boundary cgroup RIENG: kine OOM khong keo apiserver vao OOM loop
-# (su co 2026-10-02). GOMEMLIMIT 1500MiB < MemoryMax 2G de Go GC danh
-# truoc khi cham cgroup limit; GOGC=50 giam heap growth giua 2 chu ky.
+	unitChanged, _ := r.writeManaged("/etc/systemd/system/kine.service", []byte(fmt.Sprintf(`# Managed by node-config-agent - Phase 3: kine split out of k0scontroller.
+# SEPARATE cgroup boundary: a kine OOM does not drag apiserver into
+# the OOM loop (incident 2026-10-02). GOMEMLIMIT 1500MiB < MemoryMax 2G
+# so Go GC fires before hitting the cgroup limit; GOGC=50 slows heap
+# growth between cycles.
 [Unit]
 Description=kine (etcd3 API shim -> external datastore)
 Documentation=file:/etc/kine/kine.env
 After=network-online.target
 Wants=network-online.target
-# Storage phai len TRUOC k0scontroller — apiserver khong boot khi
-# endpoint chet.
+# Storage must come up BEFORE k0scontroller — apiserver will not boot
+# with a dead endpoint.
 Before=k0scontroller.service
 
 [Service]
 Environment=GOMEMLIMIT=1500MiB
 Environment=GOGC=50
-# KINE_ENDPOINT nam trong /etc/kine/kine.env (0600, chua DB password).
+# KINE_ENDPOINT lives in /etc/kine/kine.env (0600, holds DB password).
 EnvironmentFile=/etc/kine/kine.env
 %s%sExecStart=/usr/local/bin/kine --listen-address=%s --metrics-bind-address=%s
 MemoryMax=2G
 MemorySwapMax=0
-# OOMScoreAdjust am: kernel kill cac process khac truoc kine (data-path
-# cua apiserver); CPUWeight cao giu kine duoi ap luc CPU.
+# OOMScoreAdjust negative: the kernel kills other processes before
+# kine (apiserver data-path); high CPUWeight protects kine under CPU
+# pressure.
 OOMScoreAdjust=-500
 CPUWeight=2000
 Restart=always
@@ -738,9 +743,9 @@ WantedBy=multi-user.target
 		r.daemonReload(ctx)
 	}
 	r.ensureService(ctx, "kine.service", true, true)
-	// start la no-op tren unit dang chay — binary/env/unit moi chi co
-	// tac dung sau restart nen moi thay doi input deu restart (pattern
-	// y nhu groupAPILB cfgChanged||nftChanged).
+	// start is a no-op on a running unit — a new binary/env/unit only
+	// takes effect after restart, so every input change restarts
+	// (same pattern as groupAPILB cfgChanged||nftChanged).
 	if binChanged || envChanged || unitChanged {
 		r.restartService(ctx, "kine.service")
 	}

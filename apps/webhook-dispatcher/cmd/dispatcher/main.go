@@ -122,9 +122,13 @@ func main() {
 	}
 	go func() {
 		<-ctx.Done()
+		slog.Info("shutdown signal received — draining connections")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("graceful shutdown failed — connections dropped",
+				"error", err)
+		}
 	}()
 
 	slog.Info("starting webhook-dispatcher",

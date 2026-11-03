@@ -891,7 +891,7 @@ func writeFileAtomic(path string, data []byte) error {
 func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
 	f := dir + "/apibe-gap-" + dashedIP(b.Addr)
 	if err := writeFileAtomic(f, []byte(strconv.FormatInt(gap, 10)+"\n")); err != nil {
-		slog.Info("watchdog gap file write failed", "file", f, "error", err)
+		slog.Warn("watchdog gap file write failed", "file", f, "error", err)
 	}
 }
 
@@ -904,7 +904,7 @@ func (p *Prober) latchStale(dir string, b backend) {
 	}
 	if err := writeFileAtomic(f,
 		[]byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n")); err != nil {
-		slog.Info("watchdog stale latch write failed", "file", f, "error", err)
+		slog.Warn("watchdog stale latch write failed", "file", f, "error", err)
 	}
 }
 
@@ -914,7 +914,7 @@ func (p *Prober) latchStale(dir string, b backend) {
 func (p *Prober) clearStale(dir string, b backend) {
 	f := dir + "/state-apiserver-backend-stale-" + dashedIP(b.Addr)
 	if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
-		slog.Info("watchdog stale latch remove failed", "file", f, "error", err)
+		slog.Warn("watchdog stale latch remove failed", "file", f, "error", err)
 	}
 }
 
@@ -933,6 +933,8 @@ func (p *Prober) pruneWatchdogFiles(dir string, backends []backend) {
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		slog.Warn("watchdog state dir scan failed — stale files not pruned",
+			"dir", dir, "error", err)
 		return
 	}
 	for _, e := range entries {
@@ -947,7 +949,10 @@ func (p *Prober) pruneWatchdogFiles(dir string, backends []backend) {
 			continue
 		}
 		if !keep[suffix] {
-			_ = os.Remove(dir + "/" + name)
+			if err := os.Remove(dir + "/" + name); err != nil {
+				slog.Warn("watchdog stale file prune failed",
+					"file", name, "dir", dir, "error", err)
+			}
 		}
 	}
 }

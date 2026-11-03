@@ -82,6 +82,7 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 		return err // periodic wrapper IncErrors catchupQueue
 	}
 
+	spawned := 0
 	for i := range cronjobs.Items {
 		cj := &cronjobs.Items[i]
 		if cj.Spec.Suspend != nil && *cj.Spec.Suspend {
@@ -106,7 +107,9 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 		if c.deduped(ctx, log, cj) {
 			continue
 		}
-		c.spawn(ctx, log, cj, key)
+		if c.spawn(ctx, log, cj, key) {
+			spawned++
+		}
 	}
 	// Drop daily-cap entries for CronJobs that no longer exist — the
 	// map is otherwise append-only per opted-in job ever caught up.
@@ -122,7 +125,7 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 		}
 	}
 	c.mu.Unlock()
-	log.Info("sweep done")
+	log.Info("sweep done", "spawned", spawned)
 	return nil
 }
 
@@ -202,8 +205,8 @@ func (c *cronJobCatchup) capped(key string) bool {
 // DeepCopy'd, cronjob.kubernetes.io/instantiate: manual stamped),
 // plus the missed-catchup label that powers dedupe. A create failure
 // is metered+logged but does not abort the sweep or arm the daily
-// cap — the next tick retries.
-func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1.CronJob, key string) {
+// cap — the next tick retries. Reports whether the Job was created.
+func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1.CronJob, key string) bool {
 	labels := maps.Clone(cj.Spec.JobTemplate.Labels)
 	if labels == nil {
 		labels = map[string]string{}
@@ -225,9 +228,9 @@ func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1
 	}
 	if _, err := c.cs.BatchV1().Jobs(cj.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		metrics.IncError(catchupQueue)
-		log.Error(err, "ERR: create catch-up job failed",
+		log.Error(err, "create catch-up job failed",
 			"cronjob", cj.Namespace+"/"+cj.Name)
-		return
+		return false
 	}
 	c.mu.Lock()
 	c.lastCatchup[key] = time.Now().UTC().Format("2006-01-02")
@@ -235,4 +238,5 @@ func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1
 	log.Info("CATCHUP job", "job", job.Name,
 		"cronjob", cj.Namespace+"/"+cj.Name,
 		"lastSchedule", cj.Status.LastScheduleTime)
+	return true
 }

@@ -30,7 +30,7 @@ func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
 		return 1
 	}
 	host, _ := os.Hostname()
-	fmt.Fprintf(out, "== kine DB probe tren %s (runtime=%s) ==\n",
+	fmt.Fprintf(out, "== kine DB probe on %s (runtime=%s) ==\n",
 		host, k.cfg.Runtime)
 
 	res := k.runProbeChecks(ctx)
@@ -48,13 +48,13 @@ func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
 		res.pgName, res.pgbName), res.checks[checkContainers] == 1)
 	check(fmt.Sprintf("pgbouncer %s wire probe (startup -> auth request)",
 		k.cfg.WireAddr), res.checks[checkWire] == 1)
-	check("e2e auth qua pooler (kine path: client->pooler->backend)",
+	check("e2e auth via pooler (kine path: client->pooler->backend)",
 		res.checks[checkE2EAuth] == 1)
-	check(fmt.Sprintf("backend auth: POSTGRES_USER=%s login duoc postgres",
+	check(fmt.Sprintf("backend auth: POSTGRES_USER=%s postgres login works",
 		res.envUser), res.checks[checkBackendEnv] == 1)
-	check(fmt.Sprintf("pgbouncer log sach (server_login_retry/auth fail = %d)",
+	check(fmt.Sprintf("pgbouncer log clean (server_login_retry/auth fail = %d)",
 		res.logErrs), res.checks[checkLogErrors] == 1)
-	check("SHOW POOLS: db postgres co server conn (sv_*>0)",
+	check("SHOW POOLS: db postgres has server conn (sv_*>0)",
 		res.checks[checkPools] == 1)
 	check(fmt.Sprintf("revision horizon (head=%s compact_rev=%s live_tup=%s)",
 		intOrNA(res.revSeen, res.head),
@@ -65,15 +65,15 @@ func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
 	fmt.Fprintln(out)
 	if fail == 0 {
 		fmt.Fprintln(out,
-			"ALL OK — update an toan. Van nen verify api: kubectl get nodes")
+			"ALL OK — update is safe. Still verify the api: kubectl get nodes")
 		return 0
 	}
-	fmt.Fprintln(out, "CO CHECK FAIL — KHONG coi update la xong.")
+	fmt.Fprintln(out, "CHECKS FAILED — do NOT treat the update as done.")
 	fmt.Fprintln(out,
-		"Neu backend_auth fail: .env doi nhung role DB cu -> fix:")
+		"If backend_auth fails: .env rotated but old DB roles remain -> fix:")
 	fmt.Fprintf(out,
 		"  %s exec %s psql -U postgres -d postgres \\\n"+
-			"    -c \"ALTER ROLE <user> WITH PASSWORD '<POSTGRES_PASSWORD moi>'\"\n",
+			"    -c \"ALTER ROLE <user> WITH PASSWORD '<NEW_POSTGRES_PASSWORD>'\"\n",
 		k.cfg.Runtime, res.pgName)
 	return 1
 }

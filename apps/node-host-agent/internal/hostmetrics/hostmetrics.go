@@ -329,11 +329,11 @@ func New(cfg Config) *Collector {
 		[]string{"target"}, nil)
 	c.descWatchdogLegacy = prometheus.NewDesc(
 		"node_watchdog_state",
-		"Signal dang active tren node-watchdog (1 = state file ton tai).",
+		"Signal currently active on node-watchdog (1 = state file exists).",
 		[]string{"signal"}, nil)
 	c.descEgressRelayLegacy = prometheus.NewDesc(
 		"node_watchdog_egress_relay",
-		"Egress target dang route qua overlay relay (1) hay direct (0).",
+		"Egress target currently routed via overlay relay (1) or direct (0).",
 		[]string{"target"}, nil)
 
 	c.descMeta = map[*prometheus.Desc]descMeta{}
@@ -345,7 +345,7 @@ func New(cfg Config) *Collector {
 		{c.descWatchdog, "node_host_agent_watchdog_state",
 			"node-watchdog state-* latch present (1) or previously seen and cleared (0)."},
 		{c.descWatchdogLegacy, "node_watchdog_state",
-			"Signal dang active tren node-watchdog (1 = state file ton tai)."},
+			"Signal currently active on node-watchdog (1 = state file exists)."},
 		{c.descNebUp, "node_host_agent_nebula_interface_up",
 			"Nebula interface operstate is up (emitted only when the interface exists)."},
 		{c.descNebRoute, "node_host_agent_nebula_route_present",
@@ -365,7 +365,7 @@ func New(cfg Config) *Collector {
 		{c.descEgressRelay, "node_overlay_egress_relay_active",
 			"Egress target currently routed via the overlay relay (1) or direct underlay (0)."},
 		{c.descEgressRelayLegacy, "node_watchdog_egress_relay",
-			"Egress target dang route qua overlay relay (1) hay direct (0)."},
+			"Egress target currently routed via overlay relay (1) or direct (0)."},
 	} {
 		c.descMeta[d.desc] = descMeta{name: d.name, help: d.help}
 	}

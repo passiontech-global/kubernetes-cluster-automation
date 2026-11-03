@@ -232,7 +232,7 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 			h.rateSpend(h.cfg.WatchdogStateDir, fileRateRestart)
 			h.ctrReset(fileCtrGap)
 			if err := h.cfg.restartFn(ctx, h.cfg.RestartUnit); err != nil {
-				h.appendLog(fmt.Sprintf(
+				h.appendLogWarn(fmt.Sprintf(
 					"suspect: restart %s failed: %v", h.cfg.RestartUnit, err))
 			}
 			h.actions.WithLabelValues(checkHub, "restart_controller").Inc()
@@ -300,7 +300,7 @@ func (h *Hygiene) deadFallback(ctx context.Context) {
 		h.rateSpend(h.cfg.WatchdogStateDir, fileRateRestart)
 		h.ctrReset(fileCtrDead)
 		if err := h.cfg.restartFn(ctx, h.cfg.RestartUnit); err != nil {
-			h.appendLog(fmt.Sprintf(
+			h.appendLogWarn(fmt.Sprintf(
 				"suspect: restart %s failed: %v", h.cfg.RestartUnit, err))
 		}
 		h.actions.WithLabelValues(checkHub, "restart_controller").Inc()

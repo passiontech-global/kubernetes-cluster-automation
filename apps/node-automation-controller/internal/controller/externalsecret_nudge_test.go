@@ -223,9 +223,10 @@ func TestExternalSecretNudgeStoreListError(t *testing.T) {
 	}
 }
 
-// Cluster co flag bat nhung ESO CRDs chua cai (opt-in truoc rollout)
-// -> List 404 "could not find the requested resource" — phai skip
-// lang, khong duoc dem la loi periodic run.
+// Cluster has the flag enabled but the ESO CRDs are not installed
+// yet (opt-in before the rollout) -> List 404 "could not find the
+// requested resource" — must skip quietly, must not count as a
+// periodic run error.
 func TestExternalSecretNudgeCRDsAbsent(t *testing.T) {
 	dyn := newDynFake(cssObj("css1", "False"))
 	dyn.PrependReactor("list", "clustersecretstores",

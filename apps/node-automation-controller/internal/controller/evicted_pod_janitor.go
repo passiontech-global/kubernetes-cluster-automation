@@ -111,6 +111,7 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 	pods = nil
 
 	background := metav1.DeletePropagationBackground
+	deleted, failed := 0, 0
 	for _, t := range targets {
 		log.Info(fmt.Sprintf("DELETE %s/%s on %s: reason=%s age=%dh",
 			t.ns, t.name, t.node, t.reason, t.ageHours))
@@ -118,11 +119,14 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 			metav1.DeleteOptions{PropagationPolicy: &background}); err != nil {
 			metrics.IncError(evictedPodQueue)
 			log.Error(err, "pod delete failed", "pod", t.ns+"/"+t.name)
+			failed++
+			continue
 		}
+		deleted++
 	}
 	if capped {
 		log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", evictedPodCap))
 	}
-	log.Info("sweep done")
+	log.Info("sweep done", "deleted", deleted, "failed", failed)
 	return nil
 }

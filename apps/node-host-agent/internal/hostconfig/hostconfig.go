@@ -327,20 +327,25 @@ func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode)
 			mode = st.Mode().Perm()
 		}
 	} else if !os.IsNotExist(err) {
+		slog.Warn("hostconfig: write managed file failed", "path", path, "error", err)
+		return false, err
+	}
+	fail := func(err error) (bool, error) {
+		slog.Warn("hostconfig: write managed file failed", "path", path, "error", err)
 		return false, err
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return false, err
+		return fail(err)
 	}
 	tmp := dst + ".hostconfig.tmp"
 	if err := os.WriteFile(tmp, content, mode); err != nil {
-		return false, err
+		return fail(err)
 	}
 	if err := os.Chmod(tmp, mode); err != nil {
-		return false, err
+		return fail(err)
 	}
 	if err := os.Rename(tmp, dst); err != nil {
-		return false, err
+		return fail(err)
 	}
 	r.writes.WithLabelValues(path).Inc()
 	slog.Info("hostconfig: wrote managed file", "path", path)
@@ -354,9 +359,11 @@ func (r *Reconciler) removeManaged(path string) (bool, error) {
 		return false, nil
 	}
 	if fi.IsDir() {
+		slog.Warn("hostconfig: remove refused — path is a dir", "path", path)
 		return false, fmt.Errorf("removeManaged: %s is a dir", path)
 	}
 	if err := os.Remove(dst); err != nil {
+		slog.Warn("hostconfig: remove file failed", "path", path, "error", err)
 		return false, err
 	}
 	slog.Info("hostconfig: removed file", "path", path)
@@ -364,7 +371,11 @@ func (r *Reconciler) removeManaged(path string) (bool, error) {
 }
 
 func (r *Reconciler) ensureDir(path string, mode os.FileMode) error {
-	return os.MkdirAll(r.hp(path), mode)
+	if err := os.MkdirAll(r.hp(path), mode); err != nil {
+		slog.Warn("hostconfig: ensure dir failed", "path", path, "error", err)
+		return err
+	}
+	return nil
 }
 
 func (r *Reconciler) fileExists(path string) bool {
@@ -390,7 +401,7 @@ func (r *Reconciler) render(name string, ctx map[string]any) ([]byte, error) {
 func (r *Reconciler) daemonReload(ctx context.Context) {
 	r.actions.WithLabelValues("daemon-reload").Inc()
 	if _, err := r.run(ctx, "systemctl", "daemon-reload"); err != nil {
-		slog.Warn("daemon-reload failed", "err", err)
+		slog.Warn("hostconfig: daemon-reload failed", "error", err)
 	}
 }
 
@@ -407,25 +418,46 @@ func (r *Reconciler) serviceState(ctx context.Context, unit string) string {
 // ensureService ports systemd_service enabled+state.
 func (r *Reconciler) ensureService(ctx context.Context, unit string, enable, start bool) {
 	if enable {
-		r.run(ctx, "systemctl", "enable", unit)
+		r.enableService(ctx, unit)
 	}
 	if start {
-		r.run(ctx, "systemctl", "start", unit)
+		r.startService(ctx, unit)
 	} else {
-		r.run(ctx, "systemctl", "stop", unit)
+		r.stopService(ctx, unit)
+	}
+}
+
+func (r *Reconciler) enableService(ctx context.Context, unit string) {
+	r.actions.WithLabelValues("enable:" + unit).Inc()
+	if _, err := r.run(ctx, "systemctl", "enable", unit); err != nil {
+		slog.Warn("hostconfig: enable failed", "unit", unit, "error", err)
+	}
+}
+
+func (r *Reconciler) startService(ctx context.Context, unit string) {
+	r.actions.WithLabelValues("start:" + unit).Inc()
+	if _, err := r.run(ctx, "systemctl", "start", unit); err != nil {
+		slog.Warn("hostconfig: start failed", "unit", unit, "error", err)
+	}
+}
+
+func (r *Reconciler) stopService(ctx context.Context, unit string) {
+	r.actions.WithLabelValues("stop:" + unit).Inc()
+	if _, err := r.run(ctx, "systemctl", "stop", unit); err != nil {
+		slog.Warn("hostconfig: stop failed", "unit", unit, "error", err)
 	}
 }
 
 func (r *Reconciler) restartService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("restart:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "restart", unit); err != nil {
-		slog.Warn("restart failed", "unit", unit, "err", err)
+		slog.Warn("hostconfig: restart failed", "unit", unit, "error", err)
 	}
 }
 
 func (r *Reconciler) reloadService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("reload:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "reload", unit); err != nil {
-		slog.Warn("reload failed", "unit", unit, "err", err)
+		slog.Warn("hostconfig: reload failed", "unit", unit, "error", err)
 	}
 }

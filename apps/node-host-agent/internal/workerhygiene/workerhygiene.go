@@ -118,7 +118,7 @@ const (
 	defaultStuckWedgeAge      = 30 * time.Minute // shell STUCK_WEDGE_S=1800
 	defaultKubeletWatchMinAge = 15 * time.Minute // shell KUBELET_WATCH_MIN_AGE_S=900
 	defaultMaxForceDelete     = 5                // bounds per-cycle churn (shell used 3; 5 keeps parity headroom)
-	defaultMaxCtrTaskClean    = 5                // shell cap 5/lan
+	defaultMaxCtrTaskClean    = 5                // shell cap 5 per cycle
 	defaultMaxShimKill        = 10               // shell cap 5; 10 bounds orphan-shim storms with headroom
 	defaultConsecNeeded       = 2                // shell CONSEC_NEEDED=2
 	defaultMinRestartInterval = 30 * time.Minute // shell MIN_RESTART_INTERVAL_S=1800
@@ -541,11 +541,19 @@ func (h *Hygiene) Run(ctx context.Context) {
 	// The tick self-gates on kubeletFeederActive() each round, so a
 	// node dropped from systemd_watchdog_hosts (unit file pruned) or
 	// a WD_SIG_KUBELET_WATCHDOG=off conf rewrite idles without an
-	// agent restart.
-	go h.runKubeletFeeder(ctx)
+	// agent restart. The wait makes Run's return coincide with the
+	// feeder's exit — a restarted Run must never stack a second
+	// feeder, and callers may tear down cfg paths on return.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		h.runKubeletFeeder(ctx)
+	}()
 	h.Cycle(ctx)
 	t := time.NewTicker(h.cfg.Interval)
 	defer t.Stop()
+	defer wg.Wait()
 	for {
 		select {
 		case <-ctx.Done():
@@ -724,9 +732,13 @@ func (h *Hygiene) stateEnter(name, extra string) {
 	// that then sits at 0 forever (seenStates never drops keys).
 	tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		slog.Warn("workerhygiene: state latch write failed",
+			"subsystem", "workerhygiene", "state", name, "path", p, "error", err)
 		return
 	}
 	if err := os.Rename(tmp, p); err != nil {
+		slog.Warn("workerhygiene: state latch write failed",
+			"subsystem", "workerhygiene", "state", name, "path", p, "error", err)
 		return
 	}
 	if extra != "" {
@@ -744,6 +756,8 @@ func (h *Hygiene) stateExit(name string) {
 		return
 	}
 	if err := os.Remove(p); err != nil {
+		slog.Warn("workerhygiene: state latch remove failed",
+			"subsystem", "workerhygiene", "state", name, "path", p, "error", err)
 		return
 	}
 	h.appendLog(fmt.Sprintf("STATE-EXIT: %s", name))
@@ -763,11 +777,16 @@ func (h *Hygiene) rateOK(name string, interval time.Duration) bool {
 	return h.cfg.nowFn().Unix()-last >= int64(interval.Seconds())
 }
 
-// rateSpend writes the current epoch to the budget file.
+// rateSpend writes the current epoch to the budget file. A failed
+// write loses the spend — the next check sees the budget as
+// unspent — so the operator gets a Warn, not silence.
 func (h *Hygiene) rateSpend(name string) {
 	p := filepath.Join(h.cfg.WatchdogStateDir, name)
 	content := strconv.FormatInt(h.cfg.nowFn().Unix(), 10) + "\n"
-	_ = os.WriteFile(p, []byte(content), 0o644)
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		slog.Warn("workerhygiene: rate budget write failed",
+			"subsystem", "workerhygiene", "budget", name, "path", p, "error", err)
+	}
 }
 
 // rateTrySpend is the atomic check+spend used for the budgets two
@@ -1613,7 +1632,7 @@ func (h *Hygiene) checkKubeletWatchWedge(ctx context.Context, pods []corev1.Pod,
 		}
 		if nstale == len(h.cfg.APIBackends) {
 			h.appendLog(fmt.Sprintf(
-				"suspect: kubelet-watch-wedge unseen=%d nhung %d/%d api backend stale — upstream wedge, skip restart k0sworker",
+				"suspect: kubelet-watch-wedge unseen=%d but %d/%d api backend stale — upstream wedge, skip restart k0sworker",
 				missing, nstale, len(h.cfg.APIBackends)))
 			h.cycles.WithLabelValues(checkWatch, "ok").Inc()
 			return
@@ -1927,21 +1946,21 @@ func (h *Hygiene) checkCilium(ctx context.Context, apiOK, workerActive bool) {
 	switch {
 	case !apiOK:
 		h.appendLog(fmt.Sprintf(
-			"suspect: cilium-agent-down healthz fail %dx nhung API unreachable — skip kill (agent van khong sync duoc du restart)",
+			"suspect: cilium-agent-down healthz fail %dx but API unreachable — skip kill (agent still cannot sync even after restart)",
 			h.ciliumFails))
 	case h.ciliumFails >= h.cfg.ConsecNeeded &&
 		h.rateOK("last-cilium-restart", h.cfg.MinRestartInterval) &&
 		!h.stateExists("node-overloaded"):
 		if h.killCiliumAgent(tasks) {
 			h.appendLog(fmt.Sprintf(
-				"ACTION: killed cilium-agent container - healthz down %dx (kubelet se restart)",
+				"ACTION: killed cilium-agent container - healthz down %dx (kubelet will restart)",
 				h.ciliumFails))
 			h.rateSpend("last-cilium-restart")
 			h.ciliumFails = 0
 			h.actions.WithLabelValues(checkCilium, "sigkill").Inc()
 		} else {
 			h.appendLog(fmt.Sprintf(
-				"suspect: cilium-agent-down healthz fail %dx, khong co task running de kill (kubelet tu retry)",
+				"suspect: cilium-agent-down healthz fail %dx, no running task to kill (kubelet retries itself)",
 				h.ciliumFails))
 		}
 	default:
@@ -1998,27 +2017,27 @@ func (h *Hygiene) checkCiliumInitStuck(ctx context.Context, apiOK, workerActive 
 	switch {
 	case !apiOK:
 		h.appendLog(fmt.Sprintf(
-			"suspect: cilium-init-stuck init_eps=%d %dx nhung API unreachable — skip kill (agent van khong resync duoc du restart)",
+			"suspect: cilium-init-stuck init_eps=%d %dx but API unreachable — skip kill (agent still cannot resync even after restart)",
 			initEps, h.ciliumInitFails))
 	case h.stateExists("node-overloaded"):
 		h.appendLog(fmt.Sprintf(
-			"suspect: cilium-init-stuck init_eps=%d %dx nhung node overloaded — skip kill",
+			"suspect: cilium-init-stuck init_eps=%d %dx but node overloaded — skip kill",
 			initEps, h.ciliumInitFails))
 	case !h.rateOK("last-cilium-restart", h.cfg.MinRestartInterval):
 		h.appendLog(fmt.Sprintf(
-			"suspect: cilium-init-stuck init_eps=%d %dx nhung restart cooldown — skip kill",
+			"suspect: cilium-init-stuck init_eps=%d %dx but restart cooldown — skip kill",
 			initEps, h.ciliumInitFails))
 	default:
 		if h.killCiliumAgent(tasks) {
 			h.appendLog(fmt.Sprintf(
-				"ACTION: killed cilium-agent container - init_eps=%d %dx (kubelet se restart -> informer resync)",
+				"ACTION: killed cilium-agent container - init_eps=%d %dx (kubelet will restart -> informer resync)",
 				initEps, h.ciliumInitFails))
 			h.rateSpend("last-cilium-restart")
 			h.ciliumInitFails = 0
 			h.actions.WithLabelValues(checkCiliumInit, "sigkill").Inc()
 		} else {
 			h.appendLog(fmt.Sprintf(
-				"suspect: cilium-init-stuck init_eps=%d %dx, khong co task running de kill (kubelet tu retry)",
+				"suspect: cilium-init-stuck init_eps=%d %dx, no running task to kill (kubelet retries itself)",
 				initEps, h.ciliumInitFails))
 		}
 	}

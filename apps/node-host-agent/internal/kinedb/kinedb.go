@@ -809,10 +809,16 @@ func readIntFile(path string) (int64, error) {
 }
 
 func writeIntFile(path string, v int64) {
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
-	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(v, 10)+"\n"), 0o644); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		slog.Warn("kinedb state file write failed", "file", path, "error", err)
 		return
 	}
-	_ = os.Rename(tmp, path)
+	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
+	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(v, 10)+"\n"), 0o644); err != nil {
+		slog.Warn("kinedb state file write failed", "file", path, "error", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		slog.Warn("kinedb state file write failed", "file", path, "error", err)
+	}
 }

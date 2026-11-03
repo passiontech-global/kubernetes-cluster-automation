@@ -56,7 +56,7 @@ func TestRunK0sDriftCLIFindings(t *testing.T) {
 	}
 	// The removed flag must not double-report as an extra key.
 	if strings.Contains(out,
-		"khong co trong expected: concurrent-service-syncs") {
+		"not in expected set: concurrent-service-syncs") {
 		t.Fatalf("removed flag double-counted as extra:\n%s", out)
 	}
 }
@@ -73,7 +73,7 @@ func TestRunK0sDriftCLIMissingKey(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("exit=%d want 1:\n%s", code, out)
 	}
-	if !strings.Contains(out, "thieu tren node:") ||
+	if !strings.Contains(out, "missing on node:") ||
 		!strings.Contains(out, "kube-api-qps") {
 		t.Fatalf("missing-key line absent:\n%s", out)
 	}
@@ -135,7 +135,7 @@ func TestRunK0sDriftCLICustomSets(t *testing.T) {
 		t.Fatalf("custom removed flag not flagged:\n%s", got)
 	}
 	// "a" present → only "b" is missing.
-	if !strings.Contains(got, "thieu tren node: b") {
+	if !strings.Contains(got, "missing on node: b") {
 		t.Fatalf("missing-key b absent:\n%s", got)
 	}
 	// The default removed flag must not fire when overridden.

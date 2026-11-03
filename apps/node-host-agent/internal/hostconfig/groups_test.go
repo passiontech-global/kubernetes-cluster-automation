@@ -435,7 +435,7 @@ func TestCoreDNSWorkerStub(t *testing.T) {
 
 	want := `# Managed by node-config-agent (T9) - local stub, domain-aware
 # routing: test.internal -> mesh resolvers; "." -> public
-# upstreams roi moi toi mesh (rescue qua tinc).
+# upstreams, then the mesh (rescue via tinc).
 test.internal {
     bind 127.0.0.1
     forward . 172.29.0.10 {
@@ -1415,9 +1415,10 @@ kine_endpoint: "postgres://x"
 	}
 }
 
-// Contract defaults.yaml: kine_endpoint rong = khong render unit —
-// kine khong co DSN se fallback sqlite tren socket apiserver tro toi
-// (data loss), nen host listed nhung endpoint trong thi fail closed.
+// defaults.yaml contract: empty kine_endpoint = do not render the
+// unit — a kine with no DSN falls back to sqlite on the socket the
+// apiserver points at (data loss), so a listed host with an empty
+// endpoint fails closed.
 func TestKineServiceSkipsEmptyEndpoint(t *testing.T) {
 	vars := writeVarsDir(t, `kine_service_hosts: [node-a]
 kine_bin_url: "https://example/kine"

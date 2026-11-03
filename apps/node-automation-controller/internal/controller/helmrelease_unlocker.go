@@ -146,6 +146,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 		}
 	}
 	if len(due) == 0 {
+		log.Info("sweep done", "stuck", len(stuck))
 		return nil
 	}
 	sort.Strings(due)
@@ -162,6 +163,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 		return nil
 	}
 
+	unlocked := 0
 	for _, key := range due {
 		hr := stuck[key]
 		if last, ok := u.unlocked[key]; ok && now.Sub(last) < helmUnlockCooldown {
@@ -178,7 +180,9 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 			continue // per-HR failures must not starve the rest
 		}
 		u.unlocked[key] = now
+		unlocked++
 	}
+	log.Info("sweep done", "due", len(due), "unlocked", unlocked)
 	return nil
 }
 

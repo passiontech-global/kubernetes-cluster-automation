@@ -89,7 +89,8 @@ func (r *konnectivityPatcher) Reconcile(ctx context.Context, _ reconcile.Request
 		return res, nil
 	}
 
-	log.Info("requests/priorityClassName drifted - rollout settled, patching")
+	log.Info("PATCH: requests/priorityClassName drifted — rollout settled, restoring pinned spec",
+		"daemonset", "kube-system/konnectivity-agent")
 	if _, err := r.cs.AppsV1().DaemonSets("kube-system").Patch(ctx,
 		"konnectivity-agent", types.StrategicMergePatchType,
 		konnectivityPatch, metav1.PatchOptions{}); err != nil {

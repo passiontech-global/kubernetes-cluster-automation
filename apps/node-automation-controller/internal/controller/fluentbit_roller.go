@@ -76,6 +76,8 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 		// Enabled cluster but no pipeline secret — bash's set -e made
 		// this an error+metric; surface it the same way.
 		metrics.IncError("fluent-bit-config-roller")
+		log.Info("WARN: pipeline secret fluent-system/passiontech-pipeline " +
+			"missing — config drift untracked")
 		return res, nil
 	}
 	if err != nil {
@@ -90,6 +92,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	}
 	cur := sec.Annotations["passiontech.dev/rolled-config-hash"]
 	if hash == cur {
+		log.Info("config already rolled — nothing to do", "hash", hash)
 		return res, nil
 	}
 	log.Info("config drift", "hash", hash, "rolled", cur)
@@ -140,6 +143,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 		metrics.IncError("fluent-bit-config-roller")
 		return ctrl.Result{}, err
 	}
-	log.Info("rolled fluent-bit for config", "hash", hash)
+	log.Info("ROLL: restarted fluent-bit for config",
+		"daemonset", "fluent-system/fluent-bit", "hash", hash)
 	return res, nil
 }

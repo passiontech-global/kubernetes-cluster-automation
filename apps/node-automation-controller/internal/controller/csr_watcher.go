@@ -63,7 +63,7 @@ func (w *csrWatcher) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	approved := 0
+	approved, pending := 0, 0
 	for i := range list.Items {
 		csr := &list.Items[i]
 		if csr.Spec.SignerName != kubeletServingSigner {
@@ -75,6 +75,7 @@ func (w *csrWatcher) run(ctx context.Context) error {
 		if time.Since(csr.CreationTimestamp.Time) <= csrMinAge {
 			continue
 		}
+		pending++
 		if !w.approve {
 			if _, ok := w.warned[csr.Name]; !ok {
 				w.warned[csr.Name] = struct{}{}
@@ -130,7 +131,7 @@ func (w *csrWatcher) run(ctx context.Context) error {
 			delete(w.reported, name)
 		}
 	}
-	log.Info("sweep done", "approved", approved)
+	log.Info("sweep done", "pending", pending, "approved", approved)
 	return nil
 }
 

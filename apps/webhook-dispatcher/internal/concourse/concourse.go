@@ -86,6 +86,7 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 	if err != nil {
 		if c.index != nil {
 			slog.Warn("resource index refresh failed — serving stale",
+				"concourse_url", c.BaseURL, "team", c.Team,
 				"error", err)
 			return c.index, nil
 		}
@@ -137,6 +138,7 @@ func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 		if err := c.getJSON(ctx, c.apiPath(path), &resources); err != nil {
 			// One unreadable pipeline must not lose the whole index.
 			slog.Warn("pipeline resource listing failed — skipped",
+				"concourse_url", c.BaseURL, "team", c.Team,
 				"pipeline", p.Name, "error", err)
 			continue
 		}

@@ -144,7 +144,8 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 		metrics.IncError("coredns-patcher")
 		return ctrl.Result{}, err
 	}
-	log.Info("coredns drifted - patching")
+	log.Info("PATCH: coredns drifted — restoring pinned spec",
+		"deployment", "kube-system/coredns", "wantReplicas", wantReplicas)
 	if _, err := r.cs.AppsV1().Deployments("kube-system").Patch(ctx,
 		"coredns", types.StrategicMergePatchType,
 		patch, metav1.PatchOptions{}); err != nil {

@@ -88,10 +88,11 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 
 	stores, err := n.dyn.Resource(clusterSecretStoreGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		// ESO CRDs absent tren cluster nay (flag bat nhung operator
-		// chua cai — vd component opt-in truoc khi ESO rollout xong).
-		// Khong phai loi van hanh — skip lang thay vi spam
-		// "could not find the requested resource" moi 10 phut.
+		// ESO CRDs absent on this cluster (flag enabled but the
+		// operator is not installed yet — e.g. a component opted in
+		// before the ESO rollout finished). Not an operational
+		// error — skip quietly instead of spamming "could not find
+		// the requested resource" every 10 minutes.
 		if apierrors.IsNotFound(err) {
 			log.Info("skip: external-secrets CRDs not installed")
 			return nil
@@ -122,6 +123,7 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 		}
 	}
 	if !recovered {
+		log.Info("sweep done", "stores", len(stores.Items), "storeRecovered", false)
 		return nil
 	}
 	return n.nudge(ctx)
@@ -153,6 +155,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context) error {
 			delete(n.nudged, key)
 		}
 	}
+	nudgedNow := 0
 	for i := range list.Items {
 		es := &list.Items[i]
 		key := es.GetNamespace() + "/" + es.GetName()
@@ -185,8 +188,10 @@ func (n *externalSecretNudge) nudge(ctx context.Context) error {
 			continue // per-ES failures must not starve the rest
 		}
 		n.nudged[key] = now
+		nudgedNow++
 		log.Info("ACTION: force-sync ExternalSecret", "es", key)
 	}
+	log.Info("sweep done", "nudged", nudgedNow)
 	return nil
 }
 

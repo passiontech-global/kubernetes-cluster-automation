@@ -38,16 +38,16 @@ func TestRunCheckCLIAllOK(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"== kine DB probe tren ",
+		"== kine DB probe on ",
 		"(runtime=podman)",
 		"  OK   containers kine-postgres + kine-pgbouncer running",
 		"  OK   pgbouncer 127.0.0.1:6432 wire probe",
-		"  OK   e2e auth qua pooler",
-		"  OK   backend auth: POSTGRES_USER=postgres login duoc postgres",
-		"  OK   pgbouncer log sach (server_login_retry/auth fail = 0)",
-		"  OK   SHOW POOLS: db postgres co server conn (sv_*>0)",
+		"  OK   e2e auth via pooler",
+		"  OK   backend auth: POSTGRES_USER=postgres postgres login works",
+		"  OK   pgbouncer log clean (server_login_retry/auth fail = 0)",
+		"  OK   SHOW POOLS: db postgres has server conn (sv_*>0)",
 		"  OK   revision horizon (head=1000 compact_rev=200 live_tup=290)",
-		"ALL OK — update an toan.",
+		"ALL OK — update is safe.",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("output missing %q:\n%s", want, got)
@@ -77,9 +77,9 @@ func TestRunCheckCLIFailures(t *testing.T) {
 	got := out.String()
 	for _, want := range []string{
 		"  FAIL pgbouncer 127.0.0.1:6432 wire probe",
-		"  FAIL pgbouncer log sach (server_login_retry/auth fail = 2)",
+		"  FAIL pgbouncer log clean (server_login_retry/auth fail = 2)",
 		"  FAIL SHOW POOLS:",
-		"CO CHECK FAIL — KHONG coi update la xong.",
+		"CHECKS FAILED — do NOT treat the update as done.",
 		"ALTER ROLE <user> WITH PASSWORD",
 	} {
 		if !strings.Contains(got, want) {

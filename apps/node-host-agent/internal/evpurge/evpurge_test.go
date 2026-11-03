@@ -95,10 +95,10 @@ func TestRunPurgesStaleEvents(t *testing.T) {
 	}
 	got := out.String()
 	// 3 stale events (old-1, old-2, bad); at-cutoff and new-1 survive.
-	if !strings.Contains(got, "cần xoá: 3") {
+	if !strings.Contains(got, "to delete: 3") {
 		t.Fatalf("output missing list count:\n%s", got)
 	}
-	if !strings.Contains(got, "đã xoá=2 lỗi=1") {
+	if !strings.Contains(got, "deleted=2 errors=1") {
 		t.Fatalf("output missing delete tally:\n%s", got)
 	}
 	deleted := fake.deletedPaths()
@@ -130,7 +130,7 @@ func TestRunContinuesAllPages(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Future cutoff deletes every event on both pages (5 total).
-	if !strings.Contains(out.String(), "cần xoá: 5") {
+	if !strings.Contains(out.String(), "to delete: 5") {
 		t.Fatalf("pagination missed:\n%s", out.String())
 	}
 	if len(fake.deletedPaths()) != 5 {

@@ -22,6 +22,7 @@ package watchdogconf
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -245,7 +246,7 @@ func num(v string, def float64) float64 {
 
 // Load parses the conf at path. A missing file returns an empty
 // Config and nil error — the watchdog's documented behaviour
-// ("Node khong co file nay -> moi module tu skip theo defaults").
+// ("node has no conf file -> every module self-skips to defaults").
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -448,7 +449,10 @@ func NewReloader(path string, initial *Config) *Reloader {
 func (r *Reloader) Get() *Config {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if c, err := Load(r.Path); err == nil && c != nil {
+	if c, err := Load(r.Path); err != nil {
+		slog.Warn("watchdogconf: reload failed — keeping last good config",
+			"subsystem", "watchdogconf", "path", r.Path, "error", err)
+	} else if c != nil {
 		r.cfg = c
 	}
 	return r.cfg

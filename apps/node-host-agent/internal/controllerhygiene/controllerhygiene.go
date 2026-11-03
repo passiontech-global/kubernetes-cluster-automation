@@ -656,9 +656,23 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 // Best-effort: an unwritable log file never fails a check.
 func (h *Hygiene) appendLog(msg string) {
 	slog.Info(msg, "subsystem", "controllerhygiene")
+	h.writeLogFile(msg)
+}
+
+// appendLogWarn is appendLog for failure/degraded paths — the file
+// line is identical (NPD contract), the slog mirror is Warn-level.
+func (h *Hygiene) appendLogWarn(msg string) {
+	slog.Warn(msg, "subsystem", "controllerhygiene")
+	h.writeLogFile(msg)
+}
+
+func (h *Hygiene) writeLogFile(msg string) {
 	f, err := os.OpenFile(h.cfg.WatchdogLogFile,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
+		slog.Warn("controllerhygiene: watchdog log file unwritable",
+			"file", h.cfg.WatchdogLogFile, "error", err,
+			"subsystem", "controllerhygiene")
 		return
 	}
 	defer f.Close()
@@ -682,9 +696,14 @@ func (h *Hygiene) writeEpochFile(path string) {
 	content := strconv.FormatInt(h.cfg.nowFn().Unix(), 10) + "\n"
 	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		slog.Warn("controllerhygiene: state file write failed",
+			"path", path, "error", err, "subsystem", "controllerhygiene")
 		return
 	}
-	_ = os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		slog.Warn("controllerhygiene: state file install failed",
+			"path", path, "error", err, "subsystem", "controllerhygiene")
+	}
 }
 
 // stateEnter creates state-<name> only when absent and logs the
@@ -712,6 +731,9 @@ func (h *Hygiene) stateExit(name string) {
 		return
 	}
 	if err := os.Remove(p); err != nil {
+		slog.Warn("controllerhygiene: state latch remove failed",
+			"state", name, "path", p, "error", err,
+			"subsystem", "controllerhygiene")
 		return
 	}
 	h.appendLog(fmt.Sprintf("STATE-EXIT: %s", name))
@@ -750,6 +772,8 @@ func (h *Hygiene) ctrInc(name string) int {
 	n++
 	content := strconv.Itoa(n) + "\n"
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		slog.Warn("controllerhygiene: counter file write failed",
+			"path", p, "error", err, "subsystem", "controllerhygiene")
 		return 0
 	}
 	return n
@@ -789,8 +813,11 @@ func removeStateFile(dir, name string) error {
 
 // writeState writes a bookkeeping file under the state dir.
 func (h *Hygiene) writeState(name, content string) {
-	_ = os.WriteFile(filepath.Join(h.cfg.WatchdogStateDir, name),
-		[]byte(content+"\n"), 0o644)
+	p := filepath.Join(h.cfg.WatchdogStateDir, name)
+	if err := os.WriteFile(p, []byte(content+"\n"), 0o644); err != nil {
+		slog.Warn("controllerhygiene: state file write failed",
+			"path", p, "error", err, "subsystem", "controllerhygiene")
+	}
 }
 
 // --- /proc helpers ---

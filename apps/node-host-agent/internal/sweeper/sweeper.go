@@ -468,7 +468,7 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 		log.Info("DELETE: PV absent, dir older than min age",
 			"dir", dirPath, "pv", name)
 		if err := os.RemoveAll(dirPath); err != nil {
-			log.Error("WARN: rm failed", "dir", name, "error", err)
+			log.Error("rm dir failed", "dir", name, "error", err)
 			continue
 		}
 		ndel++

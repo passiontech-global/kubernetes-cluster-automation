@@ -424,9 +424,13 @@ func (n *NetHealth) stateEnter(name, extra string) {
 	content := strconv.FormatInt(n.cfg.nowFn().Unix(), 10) + "\n"
 	tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		slog.Warn("nethealth: state latch write failed",
+			"subsystem", "nethealth", "state", name, "path", p, "error", err)
 		return
 	}
 	if err := os.Rename(tmp, p); err != nil {
+		slog.Warn("nethealth: state latch write failed",
+			"subsystem", "nethealth", "state", name, "path", p, "error", err)
 		return
 	}
 	if extra != "" {
@@ -442,6 +446,8 @@ func (n *NetHealth) stateExit(name string) {
 		return
 	}
 	if err := os.Remove(p); err != nil {
+		slog.Warn("nethealth: state latch remove failed",
+			"subsystem", "nethealth", "state", name, "path", p, "error", err)
 		return
 	}
 	n.appendLog(fmt.Sprintf("STATE-EXIT: %s", name))
@@ -462,7 +468,10 @@ func (n *NetHealth) rateOK(name string, interval time.Duration) bool {
 func (n *NetHealth) rateSpend(name string) {
 	p := filepath.Join(n.cfg.WatchdogStateDir, name)
 	content := strconv.FormatInt(n.cfg.nowFn().Unix(), 10) + "\n"
-	_ = os.WriteFile(p, []byte(content), 0o644)
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		slog.Warn("nethealth: rate budget write failed",
+			"subsystem", "nethealth", "budget", name, "path", p, "error", err)
+	}
 }
 
 // readFile returns trimmed file content, "" on any error.
@@ -654,7 +663,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		}
 		if fails < n.cfg.ConsecNeeded && curIP == "" {
 			n.appendLog(fmt.Sprintf(
-				"suspect: dns-resolve %s fail qua resolv.conf (check %d/%d)",
+				"suspect: dns-resolve %s fail via resolv.conf (check %d/%d)",
 				e.Name, fails, n.cfg.ConsecNeeded))
 			continue
 		}
@@ -682,7 +691,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 				n.actions.WithLabelValues(checkDNSFB, "pin").Inc()
 			} else if curIP == "" {
 				n.appendLog(fmt.Sprintf(
-					"suspect: dns-fallback %s — moi candidate deu unreachable, khong pin",
+					"suspect: dns-fallback %s — all candidates unreachable, not pinning",
 					e.Name))
 			}
 			// Dead pin with no replacement → keep it (a pinned dead
@@ -748,11 +757,11 @@ func (n *NetHealth) checkCoreDNSStub(ctx context.Context) {
 		return
 	}
 	if !n.rateOK("last-coredns-restart", corednsRestartInterval) {
-		n.appendLog("suspect: coredns stub dead nhung restart cooldown (<5m), skip")
+		n.appendLog("suspect: coredns stub dead but restart cooldown (<5m), skip")
 		n.cycles.WithLabelValues(checkCoreDNS, "ok").Inc()
 		return
 	}
-	n.appendLog("ACTION: restarting coredns - stub dead nhung resolv.conf tro 127.0.0.1")
+	n.appendLog("ACTION: restarting coredns - stub dead but resolv.conf points at 127.0.0.1")
 	n.rateSpend("last-coredns-restart")
 	if err := n.cfg.Systemd.Restart(ctx, "coredns.service"); err != nil {
 		n.appendLog(fmt.Sprintf("coredns restart failed: %v", err))
@@ -873,7 +882,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 			if t != table {
 				n.ipRuleDel1500(ctx, r, []int{t})
 				n.appendLog(fmt.Sprintf(
-					"cleanup: egress %s rule lookup %d stale (table hien tai %d)", r, t, table))
+					"cleanup: egress %s rule lookup %d stale (current table %d)", r, t, table))
 			}
 		}
 		// Drift heal: live rule must match committed state (up/down
@@ -917,7 +926,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 					_ = os.WriteFile(icmpBlk,
 						[]byte(strconv.FormatInt(n.cfg.nowFn().Unix(), 10)+"\n"), 0o644)
 					n.appendLog(fmt.Sprintf(
-						"egress %s: ICMP blocked nhung tcp/%s song — tinh direct (provider chan ICMP?)", r, port))
+						"egress %s: ICMP blocked but tcp/%s alive — treat as direct (provider blocks ICMP?)", r, port))
 				}
 			}
 			if hadRule {
@@ -978,7 +987,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 		_ = os.Remove(f)
 		delete(n.egressCtr, ip)
 		n.appendLog(fmt.Sprintf(
-			"cleanup: egress state/rule cho %s (khong con trong OVERLAY_EGRESS_RELAYS)", ip))
+			"cleanup: egress state/rule for %s (no longer in OVERLAY_EGRESS_RELAYS)", ip))
 	}
 	n.cycles.WithLabelValues(checkEgress, "ok").Inc()
 }
@@ -1072,7 +1081,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 	dpFail := false // dataplane-dead counts its own counter
 	switch {
 	case !n.udpSocketBound(wd.NebulaPort):
-		reason = fmt.Sprintf("nebula-no-socket udp/%d chua bound", wd.NebulaPort)
+		reason = fmt.Sprintf("nebula-no-socket udp/%d not bound", wd.NebulaPort)
 	case !n.hasIPv4Addr(ctx, wd.NebulaDev):
 		reason = fmt.Sprintf("nebula-no-tun-addr dev=%s", wd.NebulaDev)
 	case wd.NebulaStatsURL != "" &&
@@ -1139,7 +1148,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 		}
 		if len(slowpath) > 0 {
 			n.appendLog(fmt.Sprintf(
-				"suspect: nebula-dataplane-slowpath (reroute qua site xa) %s",
+				"suspect: nebula-dataplane-slowpath (reroute via remote site) %s",
 				strings.Join(slowpath, " ")))
 			n.stateEnter("nebula-slowpath", strings.Join(slowpath, " "))
 		} else {
@@ -1244,7 +1253,7 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 		return
 	}
 	if !n.cfg.Systemd.IsActive(ctx, "fail2ban.service") {
-		n.appendLog("suspect: fail2ban-down (unit co nhung service khong active)")
+		n.appendLog("suspect: fail2ban-down (unit exists but service inactive)")
 		n.stateEnter("fail2ban-down", "service=inactive")
 	} else {
 		n.stateExit("fail2ban-down")

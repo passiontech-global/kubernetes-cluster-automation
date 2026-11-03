@@ -127,7 +127,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		}
 	}
 	if len(orphans) == 0 {
-		log.Info("cilium identities clean", "total", len(idNames))
+		log.Info("sweep done: identities clean", "total", len(idNames))
 		return nil
 	}
 	sort.Strings(orphans)

@@ -44,14 +44,14 @@ var conditionDefs = []conditionDef{
 	{
 		typ:            "NodeOverloaded",
 		defaultReason:  "NodeLoadNormal",
-		defaultMessage: "node khong qua tai (load15 <= 4xCPU)",
+		defaultMessage: "node not overloaded (load15 <= 4xCPU)",
 		problemReason:  "NodeOverloadedDetected",
 		stateKey:       "node-overloaded",
 	},
 	{
 		typ:            "WatchdogStale",
 		defaultReason:  "WatchdogFresh",
-		defaultMessage: "node-watchdog chay gan day (last-run < 20 phut)",
+		defaultMessage: "node-watchdog ran recently (last-run < 20 min)",
 		problemReason:  "WatchdogStaleDetected",
 		// no stateKey — evaluated by watchdogStale() from installed/last-run
 	},
@@ -65,14 +65,14 @@ var conditionDefs = []conditionDef{
 	{
 		typ:            "CiliumInitStuck",
 		defaultReason:  "CiliumEndpointsReady",
-		defaultMessage: "khong co cilium endpoint keo init (informer binh thuong)",
+		defaultMessage: "no cilium endpoint stuck in init (informer healthy)",
 		problemReason:  "CiliumInitStuckDetected",
 		stateKey:       "cilium-init-stuck",
 	},
 	{
 		typ:            "KubeletRuntimeStall",
 		defaultReason:  "KubeletRuntimeOk",
-		defaultMessage: "khong co phantom-pods wedge (ctr song, tasks > 0)",
+		defaultMessage: "no phantom-pods wedge (ctr alive, tasks > 0)",
 		problemReason:  "KubeletRuntimeStallDetected",
 		stateKey:       "kubelet-runtime-stall",
 		altStateKey:    "kubelet-healthz-down",
@@ -80,28 +80,28 @@ var conditionDefs = []conditionDef{
 	{
 		typ:            "DnsFallbackActive",
 		defaultReason:  "DnsDirectOk",
-		defaultMessage: "DNS qua resolv.conf binh thuong, khong co /etc/hosts pin",
+		defaultMessage: "DNS via resolv.conf healthy, no /etc/hosts pin",
 		problemReason:  "DnsFallbackEngaged",
 		stateKey:       "dns-fallback",
 	},
 	{
 		typ:            "DnsResolvStale",
 		defaultReason:  "DnsResolvFresh",
-		defaultMessage: "DNS pods (nld/coredns) co resolv.conf khop host",
+		defaultMessage: "DNS pods (nld/coredns) resolv.conf matches host",
 		problemReason:  "DnsResolvStaleDetected",
 		stateKey:       "dns-resolv-stale",
 	},
 	{
 		typ:            "PodTeardownWedged",
 		defaultReason:  "PodTeardownOk",
-		defaultMessage: "khong co pod Terminating keo dai voi task con sot",
+		defaultMessage: "no long-Terminating pod with leftover task",
 		problemReason:  "PodTeardownWedgedDetected",
 		stateKey:       "pod-teardown-wedged",
 	},
 	{
 		typ:            "KubeletWatchWedge",
 		defaultReason:  "KubeletWatchOk",
-		defaultMessage: "kubelet nhan pod assignment binh thuong (khong co unseen pod)",
+		defaultMessage: "kubelet receives pod assignment normally (no unseen pod)",
 		problemReason:  "KubeletWatchWedgeDetected",
 		stateKey:       "kubelet-watch-wedge",
 	},
@@ -199,10 +199,10 @@ func (r *Reporter) evalConditions() []condEval {
 			if stale, age := r.watchdogStale(); stale {
 				res.status = corev1.ConditionTrue
 				res.reason = d.problemReason
-				// check-watchdog-fresh.sh echo verbatim — NHC/SNR and
-				// runbooks match on this string.
+				// Ported from check-watchdog-fresh.sh's echo — NHC/SNR
+				// and runbooks historically matched on that string.
 				res.message = fmt.Sprintf(
-					"node-watchdog khong ghi heartbeat %ds (timer dead hoac run fail)", age)
+					"node-watchdog missed heartbeat %ds (timer dead or run failed)", age)
 			}
 		} else if key, since, ok := r.firstLatch(d.stateKey, d.altStateKey); ok {
 			res.status = corev1.ConditionTrue

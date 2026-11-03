@@ -278,22 +278,22 @@ func (c *cyc) groupPulls() {
 	r.ensureDir("/etc/k0s/containerd.d", 0o755)
 	r.writeManaged("/etc/k0s/containerd.d/90-parallel-pulls.toml", []byte(fmt.Sprintf(
 		`# Managed by node-config-agent - T7 parallel image pulls.
-# Cap concurrent layer downloads khi kubelet da tat
-# serializeImagePulls — gioi han bandwidth pull storm;
-# ket hop maxParallelImagePulls=%s o kubelet.
+# Cap concurrent layer downloads now that kubelet has
+# serializeImagePulls off — bounds pull-storm bandwidth;
+# pairs with maxParallelImagePulls=%s at the kubelet.
 [plugins.'io.containerd.cri.v1.images']
   max_concurrent_downloads = %s
 `, maxPar, dl)), 0o644)
 	r.writeManaged("/etc/k0s/containerd.d/91-registry-mirror.toml", []byte(
 		`# Managed by node-config-agent - T7 spegel P2P mirror prep.
-# Spegel init container ghi /etc/containerd/certs.d/*/hosts.toml
-# (mirror http://<node-ip>:30020); containerd chi doc certs.d khi
-# config_path duoc khai — drop-in nay la prerequisite. Mirror loi
-# -> containerd tu fallback upstream (khong SPOF).
+# The spegel init container writes /etc/containerd/certs.d/*/hosts.toml
+# (mirror http://<node-ip>:30020); containerd only reads certs.d when
+# config_path is declared — this drop-in is the prerequisite. Mirror
+# failure -> containerd falls back upstream itself (no SPOF).
 [plugins.'io.containerd.cri.v1.images']
-  # Bat buoc false de node serve unpacked layers cho peers qua
-  # spegel (default upstream da la false; khai tuong minh de chan
-  # truong hop distro/config khac bat len).
+  # Must stay false for the node to serve unpacked layers to peers
+  # via spegel (upstream default is already false; declared
+  # explicitly to guard against a distro/config that flips it on).
   discard_unpacked_layers = false
 [plugins.'io.containerd.cri.v1.images'.registry]
   config_path = '/etc/containerd/certs.d'
@@ -310,8 +310,8 @@ func (c *cyc) groupNodeCPU() {
 	if c.worker() && !c.t.AmLighthouse {
 		r.ensureDir("/etc/systemd/system/k0sworker.service.d", 0o755)
 		if ch, _ := r.writeManaged("/etc/systemd/system/k0sworker.service.d/20-wait-nodeip.conf",
-			[]byte(`# Managed by node-config-agent - T8: cho marker IP len neb1 truoc khi
-# k0sworker bind --node-ip (nebula Before=k0sworker).
+			[]byte(`# Managed by node-config-agent - T8: wait for the marker IP
+# on neb1 before k0sworker binds --node-ip (nebula Before=k0sworker).
 [Unit]
 After=nebula@interdc.service
 Wants=nebula@interdc.service
@@ -412,7 +412,7 @@ func (c *cyc) groupCoreDNS() {
 		resolvers := strings.Join(t.DNSResolvers, " ")
 		corefile = fmt.Sprintf(`# Managed by node-config-agent (T9) - local stub, domain-aware
 # routing: %s -> mesh resolvers; "." -> public
-# upstreams roi moi toi mesh (rescue qua tinc).
+# upstreams, then the mesh (rescue via tinc).
 %s {
     bind 127.0.0.1
     forward . %s {
@@ -442,7 +442,7 @@ func (c *cyc) groupCoreDNS() {
 				cfgChanged = true
 			}
 		} else {
-			slog.Error("T9: zone file render", "err", err)
+			slog.Error("T9: zone file render", "error", err)
 		}
 	}
 	if ch, _ := r.writeManaged("/etc/coredns/Corefile", []byte(corefile), 0o644); ch {
@@ -525,8 +525,8 @@ func (c *cyc) writeResolvConf(isHub bool, pub1 string) {
 	}
 	var rc strings.Builder
 	if isHub {
-		fmt.Fprintf(&rc, `# Managed by hub_converge.yaml - coredns local truoc,
-# %s + hub resolver khac la failback khi stub chet.
+		fmt.Fprintf(&rc, `# Managed by hub_converge.yaml - local coredns first,
+# %s + another hub resolver as fallback when the stub dies.
 nameserver 127.0.0.1
 nameserver %s
 
@@ -540,8 +540,8 @@ nameserver %s
 			}
 		}
 	} else {
-		fmt.Fprintf(&rc, `# Managed by node-config-agent (T9) - coredns stub truoc,
-# %s + mesh resolver la failback khi stub chet.
+		fmt.Fprintf(&rc, `# Managed by node-config-agent (T9) - coredns stub first,
+# %s + mesh resolver as fallback when the stub dies.
 nameserver 127.0.0.1
 nameserver %s
 nameserver %s
@@ -643,7 +643,7 @@ func (c *cyc) renderZoneFile() ([]byte, error) {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "$TTL %s\n", ttl)
-	fmt.Fprintf(&b, "@   IN SOA ns1.%s. admin.%s. (\n        %d ; serial=hash(records), chi doi khi noi dung doi\n        60 15 604800 30 )\n",
+	fmt.Fprintf(&b, "@   IN SOA ns1.%s. admin.%s. (\n        %d ; serial=hash(records), changes only when content changes\n        60 15 604800 30 )\n",
 		zone, zone, c.zoneSerial())
 	b.WriteString("\n") // {% set _hubs %} line
 	for i := range hubs {
@@ -655,8 +655,8 @@ func (c *cyc) renderZoneFile() ([]byte, error) {
 	}
 	b.WriteString("\n") // {% endfor %}
 	b.WriteString("; service records: interdc_dns_zone.yaml\n")
-	b.WriteString("; (KHONG dung '#' — parser zone cua coredns/miekg khong chap nhan\n")
-	b.WriteString("; '#' lam comment, chi ';' — \"not a TTL\" crashloop 2026-09-16)\n")
+	b.WriteString("; (do NOT use '#' — the coredns/miekg zone parser does not accept\n")
+	b.WriteString("; '#' as a comment, only ';' — \"not a TTL\" crashloop 2026-09-16)\n")
 	c.eachZoneRecord(func(name, ip string) {
 		b.WriteString("\n\n")
 		fmt.Fprintf(&b, "%-30s IN A %s\n", name, ip)
@@ -739,7 +739,7 @@ func (c *cyc) corednsInstallBinary() {
 			return
 		}
 	} else if err := download(c.ctx, url, local, sum); err != nil {
-		slog.Error("T9: coredns download", "err", err)
+		slog.Error("T9: coredns download", "error", err)
 		return
 	}
 	_ = untarInstall(local, "coredns", c.r.hp("/usr/local/bin/coredns"), 0o755)
@@ -759,8 +759,8 @@ func (c *cyc) groupBwAudit() {
 	}
 	nft := fmt.Sprintf(`# Managed by node-config-agent - per-peer bandwidth accounting on
 # %s.
-# Counter-only + policy accept: khong the lam dut traffic.
-# Xem: nft list table inet interdc_acct
+# Counter-only + policy accept: cannot break traffic.
+# Inspect: nft list table inet interdc_acct
 destroy table inet interdc_acct
 table inet interdc_acct {
     chain input {
@@ -789,7 +789,7 @@ func (c *cyc) groupSecurity() {
 		}
 		b, err := r.render("fail2ban-cluster.conf.j2", c.tplCtx())
 		if err != nil {
-			slog.Error("fail2ban render", "err", err)
+			slog.Error("fail2ban render", "error", err)
 			return
 		}
 		r.ensureDir("/etc/fail2ban/jail.d", 0o755)
@@ -834,7 +834,7 @@ ClientAliveCountMax 2
 			if _, err := r.run(ctx, "sshd", "-t"); err == nil {
 				r.restartService(ctx, "ssh.service")
 			} else {
-				slog.Error("sshd -t failed — not restarting", "err", err)
+				slog.Error("sshd -t failed — not restarting", "error", err)
 			}
 		}
 		if out, err := r.run(ctx, "sshd", "-T", "-C", "user=root,host=localhost,addr=127.0.0.1"); err == nil &&
@@ -904,7 +904,7 @@ func (c *cyc) groupAPILB() {
 	tctx := c.tplCtx() // includes api_lb_probe_reachable (names)
 	cfg, err := r.render("api-local-lb.haproxy.cfg.j2", tctx)
 	if err != nil {
-		slog.Error("T12 render", "err", err)
+		slog.Error("T12 render", "error", err)
 		return
 	}
 	// haproxy install only when missing or wrong pinned version.
@@ -923,11 +923,14 @@ func (c *cyc) groupAPILB() {
 		r.ensureDir("/var/lib/node-watchdog", 0o755)
 		if !(fileExistsNoRoot(local) && sha256FileOK(local, c.v("api_lb_haproxy_deb_sha256"))) {
 			if err := download(ctx, c.v("api_lb_haproxy_deb_url"), local, c.v("api_lb_haproxy_deb_sha256")); err != nil {
-				slog.Error("T12: haproxy deb download", "err", err)
+				slog.Error("T12: haproxy deb download", "error", err)
 				return
 			}
 		}
-		r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", hostDeb)
+		if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+			"apt-get", "install", "-y", hostDeb); err != nil {
+			slog.Warn("T12: haproxy deb install failed", "deb", hostDeb, "error", err)
+		}
 	}
 	// distro haproxy.service ships /etc/haproxy/haproxy.cfg (:80
 	// frontend) — A1 runs a dedicated unit; keep the distro one off.
@@ -936,7 +939,7 @@ func (c *cyc) groupAPILB() {
 	cfgChanged, _ := r.writeManaged("/etc/haproxy/api-local-lb.cfg", cfg, 0o644)
 	// validate cfg before touching the unit (ansible fails the run).
 	if _, err := r.run(ctx, "/usr/sbin/haproxy", "-c", "-f", "/etc/haproxy/api-local-lb.cfg"); err != nil {
-		slog.Error("T12: haproxy -c failed", "err", err)
+		slog.Error("T12: haproxy -c failed", "error", err)
 		return
 	}
 	// Root-netns DNAT (pod host-netns consumers). FAIL-OPEN via
@@ -950,11 +953,12 @@ func (c *cyc) groupAPILB() {
 			fmt.Fprintf(&rules, "        ip daddr %s tcp dport %s dnat to 127.0.0.1:%s\n", vip, p, p)
 		}
 		nft := fmt.Sprintf(`# Managed by node-config-agent - root-netns DNAT %s -> 127.0.0.1
-# (T12: :6443 + moi port trong api_lb_extra_lanes, Phase 1.3/2).
-# Nap/xoa boi api-local-lb.service.
-# skuid exempt: "haproxy" = outbound backend conns cua chinh LB (anti-
-# loop); 65534 = nobody — konnectivity-agent/pod host-netns chay
-# uid nay phai di thang VIP ra backend that, khong dnat vao loopback.
+# (T12: :6443 + every port in api_lb_extra_lanes, Phase 1.3/2).
+# Loaded/removed by api-local-lb.service.
+# skuid exempt: "haproxy" = the LB's own outbound backend conns (anti-
+# loop); 65534 = nobody — konnectivity-agent/pod host-netns run as
+# this uid and must go straight through the VIP to the real backend,
+# not dnat to loopback.
 destroy table ip api_local_dnat
 table ip api_local_dnat {
     chain output {
@@ -966,7 +970,7 @@ table ip api_local_dnat {
 `, vip, rules.String())
 		nftChanged, _ = r.writeManaged("/etc/api-local-dnat.nft", []byte(nft), 0o644)
 		if _, err := r.run(ctx, "nft", "-c", "-f", "/etc/api-local-dnat.nft"); err != nil {
-			slog.Error("T12: nft ruleset failed nft -c", "err", err)
+			slog.Error("T12: nft ruleset failed nft -c", "error", err)
 			return
 		}
 	}
@@ -976,7 +980,7 @@ table ip api_local_dnat {
 	r.removeManaged("/etc/nftables.d/api-lb-dnat.nft")
 	unit, err := r.render("api-local-lb.service.j2", tctx)
 	if err != nil {
-		slog.Error("T12 unit render", "err", err)
+		slog.Error("T12 unit render", "error", err)
 		return
 	}
 	uch, _ := r.writeManaged("/etc/systemd/system/api-local-lb.service", unit, 0o644)
@@ -991,7 +995,7 @@ table ip api_local_dnat {
 	// pinning against a dead LB kills the node's API path entirely.
 	probe := `timeout 15 bash -c 'until timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/6443" 2>/dev/null; do sleep 0.3; done'`
 	if _, err := r.run(ctx, "sh", "-c", probe); err != nil {
-		slog.Error("T12: 127.0.0.1:6443 not serving in 15s — /etc/hosts NOT pinned", "err", err)
+		slog.Error("T12: 127.0.0.1:6443 not serving in 15s — /etc/hosts NOT pinned", "error", err)
 		return
 	}
 	c.pinHosts()

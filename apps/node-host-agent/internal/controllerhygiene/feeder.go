@@ -117,7 +117,7 @@ func (h *Hygiene) runFeeder(ctx context.Context) {
 
 		if doFeed {
 			if err := h.cfg.notifyFn("WATCHDOG=1"); err != nil {
-				h.appendLog(fmt.Sprintf(
+				h.appendLogWarn(fmt.Sprintf(
 					"feeder: sd_notify FAIL (%v) — running remediation gates (loud death instead of masking the watchdog)",
 					err))
 				h.runRemediate(ctx)
@@ -224,7 +224,7 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 		if h.cfg.probeFn(ctx, peer) {
 			h.appendLog(fmt.Sprintf("G4: peer %s alive — wedge is local-only", peer))
 		} else {
-			h.appendLog(fmt.Sprintf(
+			h.appendLogWarn(fmt.Sprintf(
 				"G4 WARNING: peer %s ALSO not answering — both controllers may be triggering; restarting anyway (local is dead)",
 				peer))
 		}
@@ -254,14 +254,14 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 	// second restart inside the 1800s window. FeederStateDir may not
 	// exist yet (mkdir -p parity) — create it so the mark lands.
 	if err := os.MkdirAll(cfg.FeederStateDir, 0o755); err != nil {
-		h.appendLog(fmt.Sprintf("G6: mkdir %s failed: %v — restart skipped (budget file must exist)",
+		h.appendLogWarn(fmt.Sprintf("G6: mkdir %s failed: %v — restart skipped (budget file must exist)",
 			cfg.FeederStateDir, err))
 		return
 	}
 	h.appendLog("G6: all gates passed — systemctl restart " + unit)
 	h.writeEpochFile(lastPath)
 	if err := h.cfg.restartFn(ctx, unit); err != nil {
-		h.appendLog(fmt.Sprintf("G6: restart %s FAIL: %v (budget spent)", unit, err))
+		h.appendLogWarn(fmt.Sprintf("G6: restart %s FAIL: %v (budget spent)", unit, err))
 		return
 	}
 	h.appendLog(fmt.Sprintf(

@@ -200,7 +200,7 @@ func bindInNetns(nsPath string) (int, error) {
 		}
 		slog.Error("route-guard: setns restore failed — parking "+
 			"thread in the host netns and exiting the guard goroutine",
-			"err", rerr, "subsystem", "nethealth")
+			"error", rerr, "subsystem", "nethealth")
 		runtime.Goexit()
 		panic("unreachable")
 	}

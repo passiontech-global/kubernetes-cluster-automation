@@ -91,7 +91,7 @@ func RunK0sDriftCLI(cfg K0sDriftConfig, out io.Writer) int {
 	findings := scanK0sDrift(data, parsed, parseOK,
 		removedRe, expected, cfg.ExpectedKeys)
 	if len(findings) == 0 {
-		fmt.Fprintln(out, "check-k0s-drift: OK (khong drift)")
+		fmt.Fprintln(out, "check-k0s-drift: OK (no drift)")
 		return 0
 	}
 
@@ -113,25 +113,25 @@ func RunK0sDriftCLI(cfg K0sDriftConfig, out io.Writer) int {
 	}
 	if unreadable {
 		fmt.Fprintf(out,
-			"DRIFT %s: khong doc duoc / parse duoc k0s.yaml\n",
+			"DRIFT %s: cannot read / parse k0s.yaml\n",
 			cfg.ConfigFile)
 	}
 	if len(extra) > 0 {
 		slices.Sort(extra)
 		fmt.Fprintf(out,
-			"DRIFT %s: key co tren node ma khong co trong expected: %s\n",
+			"DRIFT %s: key present on node but not in expected set: %s\n",
 			cfg.ConfigFile, strings.Join(extra, " "))
 	}
 	if len(missing) > 0 {
 		fmt.Fprintf(out,
-			"DRIFT %s: key co trong expected ma thieu tren node: %s\n",
+			"DRIFT %s: key in expected set but missing on node: %s\n",
 			cfg.ConfigFile, strings.Join(missing, " "))
 	}
 	slices.Sort(removed)
 	for _, flag := range removed {
 		fmt.Fprintf(out,
-			"REMOVED-FLAG %s: k0s.yaml van con '%s' "+
-				"(da xoa -> component se crashloop sau upgrade)\n",
+			"REMOVED-FLAG %s: k0s.yaml still has '%s' "+
+				"(removed upstream -> component will crashloop after upgrade)\n",
 			cfg.ConfigFile, flag)
 	}
 	return 1

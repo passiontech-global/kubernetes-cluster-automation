@@ -15,8 +15,8 @@
 //
 // and prints the script's output strings:
 //
-//	cần xoá: <N>
-//	đã xoá=<ok> lỗi=<err>
+//	to delete: <N>
+//	deleted=<ok> errors=<err>
 package evpurge
 
 import (
@@ -140,7 +140,7 @@ type eventList struct {
 
 // Run lists every event older than cutoff, deletes them through the
 // worker pool and prints the script's two summary lines to out.
-// Per-event DELETE failures are counted in lỗi, not returned — only
+// Per-event DELETE failures are counted in errors, not returned — only
 // fatal problems (TLS setup, a failed LIST page) produce an error,
 // matching the script which exits 0 regardless of err count.
 func Run(ctx context.Context, cfg Config, cutoff time.Time, out io.Writer) error {
@@ -153,9 +153,9 @@ func Run(ctx context.Context, cfg Config, cutoff time.Time, out io.Writer) error
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "cần xoá: %d\n", len(paths))
+	fmt.Fprintf(out, "to delete: %d\n", len(paths))
 	ok, errs := deleteAll(ctx, client, cfg.API, paths, cfg.Workers)
-	fmt.Fprintf(out, "đã xoá=%d lỗi=%d\n", ok, errs)
+	fmt.Fprintf(out, "deleted=%d errors=%d\n", ok, errs)
 	return nil
 }
 
@@ -218,7 +218,7 @@ func listStale(ctx context.Context, client *http.Client,
 // deleteAll is the script's ThreadPoolExecutor(WORKERS) map — one
 // shared client, N workers pulling delete paths off a channel.
 // A DELETE counts as ok on any 2xx; a transport error or non-2xx
-// status counts as lỗi (the script's `except: err += 1`).
+// status counts as errors (the script's `except: err += 1`).
 func deleteAll(ctx context.Context, client *http.Client, base string,
 	paths []string, workers int) (ok, errs int) {
 	jobs := make(chan string)

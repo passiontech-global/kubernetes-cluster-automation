@@ -28,13 +28,16 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 )
 
 const (
-	partitionTaintKey = "node.ops/network-partitioned"
-	partitionMinAge   = 600 * time.Second // condition True >10m before evicting
-	partitionPodNS    = "flux-system"
-	partitionEvictCap = 8 // bound churn per run
+	partitionEvictorQueue = "partition-pod-evictor"
+	partitionTaintKey     = "node.ops/network-partitioned"
+	partitionMinAge       = 600 * time.Second // condition True >10m before evicting
+	partitionPodNS        = "flux-system"
+	partitionEvictCap     = 8 // bound churn per run
 )
 
 // partitionCondTypes covers upstream NWPD K8sExporter plurals and the
@@ -53,7 +56,7 @@ type partitionEvictor struct {
 // SetupPartitionEvictor registers the 5-minute sweep (was crontab */5).
 func SetupPartitionEvictor(mgr ctrl.Manager, cs kubernetes.Interface) error {
 	e := &partitionEvictor{cs: cs}
-	return addPeriodic(mgr, "partition-pod-evictor", 5*time.Minute, e.run)
+	return addPeriodic(mgr, partitionEvictorQueue, 5*time.Minute, e.run)
 }
 
 // nodePartitioned reports whether any NWPD network condition has been
@@ -93,6 +96,7 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		n := &nodes[i]
 		if hasTaint(n.Spec.Taints, partitionTaintKey) && !flagged[n.Name] {
 			if err := untaintNode(ctx, e.cs, n.Name, partitionTaintKey); err != nil {
+				metrics.IncError(partitionEvictorQueue)
 				log.Error(err, "untaint failed", "node", n.Name)
 				continue
 			}
@@ -125,6 +129,7 @@ loop:
 		node := byName[name]
 		if !hasTaint(node.Spec.Taints, partitionTaintKey) {
 			if err := taintNode(ctx, e.cs, name, partitionTaintKey, "true", corev1.TaintEffectNoSchedule); err != nil {
+				metrics.IncError(partitionEvictorQueue)
 				log.Error(err, "taint failed", "node", name)
 			} else {
 				log.Info(fmt.Sprintf("TAINT %s: network partitioned -> NoSchedule", name))
@@ -134,6 +139,7 @@ loop:
 			FieldSelector: "spec.nodeName=" + name,
 		})
 		if err != nil {
+			metrics.IncError(partitionEvictorQueue)
 			log.Error(err, "list pods failed", "node", name, "namespace", partitionPodNS)
 			continue
 		}
@@ -144,6 +150,7 @@ loop:
 			}
 			log.Info(fmt.Sprintf("EVICT %s/%s off %s (partitioned)", p.Namespace, p.Name, name))
 			if err := e.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
+				metrics.IncError(partitionEvictorQueue)
 				log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name)
 			}
 			evicted++ // bash counts the attempt against the cap too

@@ -68,22 +68,30 @@ func SetupCFTunnelProxyWatchdog(mgr ctrl.Manager, cs kubernetes.Interface, enabl
 }
 
 func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {
-	if err := w.resyncUnreadyProxies(ctx); err != nil {
+	log := logf.FromContext(ctx)
+	resynced, err := w.resyncUnreadyProxies(ctx)
+	if err != nil {
 		return err
 	}
-	return w.clearStaleStall(ctx)
+	cleared, err := w.clearStaleStall(ctx)
+	if err != nil {
+		return err
+	}
+	log.Info("sweep done", "resyncedSlices", resynced, "stallCleared", cleared)
+	return nil
 }
 
 // resyncUnreadyProxies is check 1: any Running proxy pod whose Ready
 // condition isn't True forces a resync event on every EndpointSlice
-// of the headless proxy Service.
-func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) error {
+// of the headless proxy Service. Returns how many slices got the
+// resync annotation (0 when every proxy pod is already ready).
+func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, error) {
 	log := logf.FromContext(ctx)
 	pods, err := w.cs.CoreV1().Pods(w.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: cfTunnelProxyPodSelector,
 	})
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("list proxy pods in %s: %w", w.namespace, err)
 	}
 	notReady := 0
 	for i := range pods.Items {
@@ -93,15 +101,15 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) error 
 		}
 	}
 	if notReady == 0 {
-		log.Info("all proxy pods ready")
-		return nil
+		log.Info("all proxy pods ready", "namespace", w.namespace)
+		return 0, nil
 	}
 	epsList, err := w.cs.DiscoveryV1().EndpointSlices(w.namespace).List(ctx,
 		metav1.ListOptions{
 			LabelSelector: discoveryv1.LabelServiceName + "=" + cfTunnelProxySliceService,
 		})
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("list proxy endpointslices in %s: %w", w.namespace, err)
 	}
 	// kubectl annotate --overwrite: merge patch sets/replaces the key.
 	patch := []byte(fmt.Sprintf(
@@ -111,27 +119,31 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) error 
 		if _, err := w.cs.DiscoveryV1().EndpointSlices(w.namespace).Patch(ctx,
 			epsList.Items[i].Name, types.MergePatchType,
 			patch, metav1.PatchOptions{}); err != nil {
-			return err
+			return 0, fmt.Errorf("resync patch endpointslice/%s: %w",
+				epsList.Items[i].Name, err)
 		}
 	}
-	log.Info("forced proxy config resync",
-		"notReadyPods", notReady, "slices", len(epsList.Items))
-	return nil
+	log.Info("ACTION: forced proxy config resync",
+		"namespace", w.namespace, "notReadyPods", notReady,
+		"slices", len(epsList.Items))
+	return len(epsList.Items), nil
 }
 
 // clearStaleStall is check 2: drop a lingering
 // Progressing/ProgressDeadlineExceeded status condition so helm can
 // upgrade again. Missing deployment = cluster without the release —
-// quiet no-op (the shell's `2>/dev/null || true`).
-func (w *cfTunnelProxyWatchdog) clearStaleStall(ctx context.Context) error {
+// quiet no-op (the shell's `2>/dev/null || true`). Reports whether a
+// condition was removed.
+func (w *cfTunnelProxyWatchdog) clearStaleStall(ctx context.Context) (bool, error) {
 	log := logf.FromContext(ctx)
 	d, err := w.cs.AppsV1().Deployments(w.namespace).
 		Get(ctx, cfTunnelProxyDeployName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, fmt.Errorf("get deployment %s/%s: %w",
+			w.namespace, cfTunnelProxyDeployName, err)
 	}
 	idx := -1
 	for i, c := range d.Status.Conditions {
@@ -142,17 +154,20 @@ func (w *cfTunnelProxyWatchdog) clearStaleStall(ctx context.Context) error {
 		}
 	}
 	if idx < 0 {
-		return nil
+		return false, nil
 	}
 	patch := []byte(fmt.Sprintf(
 		`[{"op":"remove","path":"/status/conditions/%d"}]`, idx))
 	if _, err := w.cs.AppsV1().Deployments(w.namespace).Patch(ctx,
 		cfTunnelProxyDeployName, types.JSONPatchType, patch,
 		metav1.PatchOptions{}, "status"); err != nil {
-		return err
+		return false, fmt.Errorf("patch deployment %s/%s status: %w",
+			w.namespace, cfTunnelProxyDeployName, err)
 	}
-	log.Info("cleared stale ProgressDeadlineExceeded condition")
-	return nil
+	log.Info("CLEAR: removed stale ProgressDeadlineExceeded condition — "+
+		"helm can upgrade again",
+		"deployment", w.namespace+"/"+cfTunnelProxyDeployName)
+	return true, nil
 }
 
 // podReady reports whether the pod's Ready condition is True — a

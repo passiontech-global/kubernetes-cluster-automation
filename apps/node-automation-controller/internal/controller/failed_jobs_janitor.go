@@ -21,9 +21,12 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 )
 
 const (
+	failedJobQueue  = "failed-jobs-janitor"
 	failedJobMaxAge = 24 * time.Hour
 	failedJobCap    = 50 // bound delete churn per run
 )
@@ -35,7 +38,7 @@ type failedJobsJanitor struct {
 // SetupFailedJobsJanitor registers the hourly sweep (was crontab 17 * * * *).
 func SetupFailedJobsJanitor(mgr ctrl.Manager, cs kubernetes.Interface) error {
 	j := &failedJobsJanitor{cs: cs}
-	return addPeriodic(mgr, "failed-jobs-janitor", 60*time.Minute, j.run)
+	return addPeriodic(mgr, failedJobQueue, 60*time.Minute, j.run)
 }
 
 func (j *failedJobsJanitor) run(ctx context.Context) error {
@@ -83,16 +86,21 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 	jobs = nil
 
 	background := metav1.DeletePropagationBackground
+	deleted, failed := 0, 0
 	for _, t := range targets {
 		log.Info(fmt.Sprintf("DELETE %s/%s: Failed for %dh", t.ns, t.name, t.ageHours))
 		if err := j.cs.BatchV1().Jobs(t.ns).Delete(ctx, t.name,
 			metav1.DeleteOptions{PropagationPolicy: &background}); err != nil {
+			metrics.IncError(failedJobQueue)
 			log.Error(err, "job delete failed", "job", t.ns+"/"+t.name)
+			failed++
+			continue
 		}
+		deleted++
 	}
 	if capped {
 		log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", failedJobCap))
 	}
-	log.Info("sweep done")
+	log.Info("sweep done", "deleted", deleted, "failed", failed)
 	return nil
 }

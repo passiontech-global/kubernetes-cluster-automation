@@ -80,6 +80,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 		metrics.IncError("node-labeler")
 		return ctrl.Result{}, err
 	}
+	labeled := 0
 	for i := range nodes {
 		n := &nodes[i]
 		if isControlPlane(n) {
@@ -95,6 +96,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 			log.Info("WARN: cannot label worker role on node", "node", n.Name, "error", err)
 			continue
 		}
+		labeled++
 		log.Info("labeled worker role", "node", n.Name, "label", workerRoleLabel+"=")
 	}
 
@@ -102,6 +104,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 	// without a pod restart. Missing or empty file => nothing to do.
 	data, err := os.ReadFile(r.configPath)
 	if err != nil || len(data) == 0 {
+		log.Info("sweep done", "labeled", labeled)
 		return res, nil
 	}
 	// (c) each line: <key=val> <node1> <node2> ...
@@ -128,8 +131,10 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 				log.Info("WARN: cannot label node", "node", name, "label", label, "error", err)
 				continue
 			}
+			labeled++
 			log.Info("labeled", "node", name, "label", label)
 		}
 	}
+	log.Info("sweep done", "labeled", labeled)
 	return res, nil
 }

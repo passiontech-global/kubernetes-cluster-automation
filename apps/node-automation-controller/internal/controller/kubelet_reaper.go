@@ -104,6 +104,7 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 		return nil
 	}
 
+	sweepErrs := 0
 	for i := range nodes {
 		n := &nodes[i]
 		if isControlPlane(n) {
@@ -112,10 +113,18 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 		if err := r.sweep(ctx, n, ok[n.Name]); err != nil {
 			// Best-effort per node — like the bash loop a failure on
 			// one node must not skip the rest of the sweep.
+			sweepErrs++
 			log.Error(err, "sweep failed — node skipped", "node", n.Name)
 		}
 	}
-	log.Info("sweep done")
+	healthy := 0
+	for _, o := range ok {
+		if o {
+			healthy++
+		}
+	}
+	log.Info("sweep done", "probed", len(ok), "healthy", healthy,
+		"sweepErrors", sweepErrs)
 	return nil
 }
 

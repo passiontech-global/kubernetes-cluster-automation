@@ -28,6 +28,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -193,7 +194,7 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	}
 
 	if len(stale) == 0 {
-		log.Info("coredns fresh", "replicas", len(podIP))
+		log.Info("sweep done: coredns fresh", "replicas", len(podIP))
 		return nil
 	}
 	suspects := make([]string, 0, len(stale))
@@ -214,7 +215,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 	log := logf.FromContext(ctx)
 	deploy, err := w.cs.AppsV1().Deployments(corednsNS).Get(ctx, "coredns", metav1.GetOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("get deployment %s/coredns: %w", corednsNS, err)
 	}
 	// Cooldown lives on Deployment metadata — patching it does not
 	// roll the pods (unlike a pod-template annotation).
@@ -232,7 +233,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 	// only slows recovery during a cluster storm.
 	notReady, err := countNotReadyNodes(ctx, w.cs)
 	if err != nil {
-		return err
+		return fmt.Errorf("count not-ready nodes (storm gate): %w", err)
 	}
 	if notReady > 0 {
 		metrics.IncError(corednsQueue)
@@ -268,7 +269,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 		}
 		if _, err := w.cs.AppsV1().Deployments(corednsNS).Patch(ctx, "coredns",
 			types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil {
-			return err
+			return fmt.Errorf("rollout-restart patch deployment %s/coredns: %w", corednsNS, err)
 		}
 	} else {
 		// Delete only the stale pods — healthy replicas keep serving.
@@ -276,7 +277,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 		for _, name := range suspects {
 			if err := w.cs.CoreV1().Pods(corednsNS).Delete(ctx, name,
 				metav1.DeleteOptions{}); err != nil {
-				return err
+				return fmt.Errorf("delete stale pod %s/%s: %w", corednsNS, name, err)
 			}
 		}
 	}
@@ -292,7 +293,11 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 	}
 	_, err = w.cs.AppsV1().Deployments(corednsNS).Patch(ctx, "coredns",
 		types.MergePatchType, patch, metav1.PatchOptions{})
-	return err
+	if err != nil {
+		return fmt.Errorf("stamp cooldown annotation on deployment %s/coredns: %w", corednsNS, err)
+	}
+	log.Info("sweep done: stale coredns recovery issued")
+	return nil
 }
 
 // logHit returns the first last-10m log line matching the informer

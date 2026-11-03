@@ -147,7 +147,8 @@ func (r *metricsServerPatcher) Reconcile(ctx context.Context, _ reconcile.Reques
 		metrics.IncError("metrics-server-patcher")
 		return ctrl.Result{}, err
 	}
-	log.Info("metrics-server drifted - patching")
+	log.Info("PATCH: metrics-server drifted — restoring pinned spec",
+		"deployment", "kube-system/metrics-server", "wantReplicas", wantReplicas)
 	if _, err := r.cs.AppsV1().Deployments("kube-system").Patch(ctx,
 		"metrics-server", types.StrategicMergePatchType,
 		patch, metav1.PatchOptions{}); err != nil {

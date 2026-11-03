@@ -30,7 +30,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 )
+
+const webhookGuardQueue = "admission-webhook-guard"
 
 type webhookGuard struct {
 	cs kubernetes.Interface
@@ -39,7 +43,7 @@ type webhookGuard struct {
 // SetupWebhookGuard registers the 5-minute sweep (was crontab */5).
 func SetupWebhookGuard(mgr ctrl.Manager, cs kubernetes.Interface) error {
 	g := &webhookGuard{cs: cs}
-	return addPeriodic(mgr, "admission-webhook-guard", 5*time.Minute, g.run)
+	return addPeriodic(mgr, webhookGuardQueue, 5*time.Minute, g.run)
 }
 
 // webhookPatch is one queued replace of /webhooks on a single config
@@ -75,6 +79,7 @@ func (g *webhookGuard) run(ctx context.Context) error {
 	services := map[string]bool{}
 	svcList, err := g.cs.CoreV1().Services(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
+		metrics.IncError(webhookGuardQueue)
 		log.Info("WARN: cannot list services — skipping service check (namespace check still runs)", "error", err)
 		haveSvc = false
 	} else {
@@ -134,7 +139,7 @@ func (g *webhookGuard) run(ctx context.Context) error {
 	}
 
 	if len(patches) == 0 {
-		log.Info("OK: no orphan admission webhooks")
+		log.Info("sweep done: no orphan admission webhooks")
 		return nil
 	}
 
@@ -154,7 +159,8 @@ func (g *webhookGuard) run(ctx context.Context) error {
 	if failed {
 		return fmt.Errorf("some webhook config patches failed — orphan webhooks may remain")
 	}
-	log.Info("done: removed orphan webhook entries (namespace deleted)")
+	log.Info("sweep done: removed orphan webhook entries (namespace deleted)",
+		"configsPatched", len(patches))
 	return nil
 }
 

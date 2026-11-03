@@ -27,7 +27,7 @@ func (r *Reconciler) Cycle(ctx context.Context) {
 	t, err := topology.Load(topology.Config{VarsDir: r.cfg.VarsDir, NodeName: r.cfg.NodeName, NowFn: r.cfg.NowFn})
 	if err != nil {
 		r.cycles.WithLabelValues("load", "error").Inc()
-		slog.Error("hostconfig: topology load failed", "err", err)
+		slog.Error("hostconfig: topology load failed", "error", err)
 		return
 	}
 	for _, e := range t.Errors {
@@ -49,7 +49,7 @@ func (r *Reconciler) Cycle(ctx context.Context) {
 	c.group("swap", c.groupSwap)                   // node_tuning_swap.yaml
 	c.group("hub-metrics-fw", c.groupHubMetricsFW) // node_exporter_hub.yaml (standalone)
 	c.group("api-lb-vm", c.groupAPILBVM)           // api_lb_guard.yaml converge
-	c.group("kine", c.groupKineService)            // Phase 3: tach kine.service doc lap
+	c.group("kine", c.groupKineService)            // Phase 3: kine.service split into its own unit
 	c.group("verify", c.groupVerify)
 	// Vars lazily resolve during the groups too — eval failures and
 	// reference cycles land in Vars.Errors (fail-closed Undefined).
@@ -111,7 +111,7 @@ func (c *cyc) groupBase() {
 		{"/etc/sysctl.d/99-tcp-keepalive.conf", c.sysctlPairs("tcp_keepalive_sysctls"),
 			"# Managed by node-config-agent - TCP keepalive (meta-conn zombie cleanup)\n"},
 		{"/etc/sysctl.d/99-interdc-bbr.conf", c.sysctlPairs("bbr_sysctls"),
-			"# Managed by node-config-agent - BBR+fq cho duong trunk interdc\n"},
+			"# Managed by node-config-agent - BBR+fq for the interdc trunk path\n"},
 		{"/etc/sysctl.d/99-k8s-network-tuning.conf", c.t16Pairs(),
 			"# Managed by node-config-agent - T16 network/sysctl tuning\n"},
 	} {
@@ -120,7 +120,7 @@ func (c *cyc) groupBase() {
 		}
 	}
 	if ch, _ := r.writeManaged("/etc/modules-load.d/interdc-bbr.conf",
-		[]byte("# Managed by node-config-agent - BBR cho duong trunk interdc\ntcp_bbr\n"), 0o644); ch {
+		[]byte("# Managed by node-config-agent - BBR for the interdc trunk path\ntcp_bbr\n"), 0o644); ch {
 		changed = true
 	}
 	r.run(ctx, "modprobe", "tcp_bbr")
@@ -190,16 +190,17 @@ func (c *cyc) selfStageBinary() {
 	if err != nil || src == "" {
 		src = "/node-host-agent" // container image path (fallback)
 	}
-	// os.Executable bao "<path> (deleted)" khi binary bi replace
-	// in-place — bo suffix va fallback ve path DS ship khi src khong
-	// doc duoc (cung quy tac resolveLocalBinary cho hubsync mirror).
+	// os.Executable reports "<path> (deleted)" when the binary was
+	// replaced in-place — strip the suffix and fall back to the path
+	// the DS ships when src is unreadable (same rule
+	// resolveLocalBinary uses for the hubsync mirror).
 	src = strings.TrimSuffix(src, " (deleted)")
 	srcb, err := os.ReadFile(src)
 	if err != nil && src != "/node-host-agent" {
 		srcb, err = os.ReadFile("/node-host-agent")
 	}
 	if err != nil {
-		slog.Error("self-stage: cannot read running binary", "path", src, "err", err)
+		slog.Error("self-stage: cannot read running binary", "path", src, "error", err)
 		return
 	}
 	dst := "/usr/local/bin/node-host-agent"
@@ -209,18 +210,18 @@ func (c *cyc) selfStageBinary() {
 		// drifted mode: the hostPath consumer needs the exec bit.
 		if fi, serr := os.Stat(r.hp(dst)); serr == nil && fi.Mode().Perm() != 0o755 {
 			if cerr := os.Chmod(r.hp(dst), 0o755); cerr != nil {
-				slog.Error("self-stage: chmod 0755 failed", "err", cerr)
+				slog.Error("self-stage: chmod 0755 failed", "error", cerr)
 			}
 		}
 		return
 	}
 	if _, err := r.writeManaged(dst, srcb, 0o755); err != nil {
-		slog.Error("self-stage: install agent binary on host failed", "err", err)
+		slog.Error("self-stage: install agent binary on host failed", "error", err)
 		return
 	}
 	// writeManaged preserves a pre-existing file's mode — force 0755.
 	if err := os.Chmod(r.hp(dst), 0o755); err != nil {
-		slog.Error("self-stage: chmod 0755 failed", "err", err)
+		slog.Error("self-stage: chmod 0755 failed", "error", err)
 	}
 }
 
@@ -322,8 +323,14 @@ func (c *cyc) groupNLD() {
 				fi, _ := os.Lstat(dst)
 				if fi == nil || fi.Mode()&os.ModeSymlink == 0 ||
 					func() bool { l, _ := os.Readlink(dst); return l != "/run/systemd/resolve/resolv.conf" }() {
-					os.Remove(dst)
-					os.Symlink("/run/systemd/resolve/resolv.conf", dst)
+					if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+						slog.Warn("T4: resolv.conf remove before repoint failed",
+							"path", dst, "error", err)
+					}
+					if err := os.Symlink("/run/systemd/resolve/resolv.conf", dst); err != nil {
+						slog.Warn("T4: resolv.conf symlink repoint failed",
+							"path", dst, "error", err)
+					}
 				}
 			}
 		}
@@ -380,7 +387,7 @@ func (c *cyc) applyNftUnit(name, path string, content []byte, desc string) {
 	// the run here and the unit keeps serving the LAST GOOD file.
 	if _, err := r.run(ctx, "nft", "-c", "-f", path); err != nil {
 		slog.Error("nft ruleset failed nft -c — boot unit left on last good file",
-			"path", path, "err", err)
+			"path", path, "error", err)
 		return
 	}
 	unitPath := "/etc/systemd/system/" + name + ".service"
@@ -401,11 +408,11 @@ WantedBy=multi-user.target
 	if ch || uch {
 		r.daemonReload(ctx)
 	}
-	r.run(ctx, "systemctl", "enable", name+".service")
+	r.enableService(ctx, name+".service")
 	if ch {
-		r.run(ctx, "systemctl", "restart", name+".service")
+		r.restartService(ctx, name+".service")
 	} else {
-		r.run(ctx, "systemctl", "start", name+".service")
+		r.startService(ctx, name+".service")
 	}
 }
 
@@ -481,7 +488,7 @@ func (c *cyc) groupNebula() {
 	// render config.yaml
 	rendered, err := c.nebulaConfig()
 	if err != nil {
-		slog.Error("T5b: render nebula config", "err", err)
+		slog.Error("T5b: render nebula config", "error", err)
 		return
 	}
 	oldCfg, _ := os.ReadFile(r.hp("/etc/nebula/" + net + "/config.yaml"))
@@ -498,7 +505,7 @@ func (c *cyc) groupNebula() {
 	for _, name := range []string{"nebula-up.sh", "nebula-down.sh"} {
 		b, err := c.r.render(name+".j2", tctx)
 		if err != nil {
-			slog.Error("T5b render", "tpl", name, "err", err)
+			slog.Error("T5b render", "tpl", name, "error", err)
 			continue
 		}
 		r.writeManaged("/etc/nebula/"+net+"/"+name, b, 0o755)
@@ -509,16 +516,16 @@ func (c *cyc) groupNebula() {
 Description=Nebula overlay network (%%i)
 Wants=network-online.target
 After=network-online.target
-# Marker IP (k8s --node-ip) nam tren neb1 — k0sworker cho addr qua
-# drop-in cua T8. Nebula phai len TRUOC k0sworker.
+# Marker IP (k8s --node-ip) lives on neb1 — k0sworker waits for the
+# addr via the T8 drop-in. Nebula must come up BEFORE k0sworker.
 Before=k0sworker.service
 
 [Service]
 Type=notify
 ExecStart=/usr/local/bin/nebula -config /etc/nebula/%%i/config.yaml
-# ExecReload=SIGHUP: nebula >=1.9 hot-reload duoc pki creds,
+# ExecReload=SIGHUP: nebula >=1.9 hot-reloads pki creds,
 # lighthouse.*, firewall, punchy, tun.unsafe_routes, logging,
-# preferred_ranges — tunnels khong dut.
+# preferred_ranges — tunnels do not drop.
 ExecReload=/bin/kill -HUP $MAINPID
 ExecStartPost=/etc/nebula/%%i/nebula-up.sh
 ExecStopPost=/etc/nebula/%%i/nebula-down.sh
@@ -539,7 +546,7 @@ WantedBy=multi-user.target
 	// ansible: `nebula -test` validates before start — failure aborts,
 	// so the broken config must not reach a (re)start.
 	if _, err := r.run(ctx, "nebula", "-config", "/etc/nebula/"+net+"/config.yaml", "-test"); err != nil {
-		slog.Error("T5b: nebula -test failed — not starting/reloading", "err", err)
+		slog.Error("T5b: nebula -test failed — not starting/reloading", "error", err)
 		return
 	}
 	r.ensureService(ctx, unit, true, true)
@@ -589,11 +596,11 @@ func (c *cyc) nebulaInstallBinary() {
 			return
 		}
 	} else if err := download(ctx, url, local, sum); err != nil {
-		slog.Error("T5b: nebula tarball download", "err", err)
+		slog.Error("T5b: nebula tarball download", "error", err)
 		return
 	}
 	if err := untarInstall(local, "nebula", r.hp("/usr/local/bin/nebula"), 0o755); err != nil {
-		slog.Error("T5b: nebula install", "err", err)
+		slog.Error("T5b: nebula install", "error", err)
 		return
 	}
 	_ = untarInstall(local, "nebula-cert", r.hp("/usr/local/bin/nebula-cert"), 0o755)
@@ -1008,10 +1015,10 @@ func (c *cyc) groupWatchdog() {
 	var b strings.Builder
 	b.WriteString(`# Managed by node-config-agent - node-watchdog sig5 probe
 # targets: public IP remote (table 100) + tunnel marker IP
-# remote (table 101 = duong pod-traffic that qua mesh);
+# remote (table 101 = pod-traffic path through the mesh);
 # OVERLAY_EGRESS_RELAYS: fallback relay IPs (relay_mode=fallback)
-# ma node nay consume — watchdog toggle ip rule theo probe
-# underlay truc tiep.
+# this node consumes — watchdog toggles ip rule based on the
+# direct-underlay probe.
 `)
 	fmt.Fprintf(&b, "OVERLAY_PROBE_TARGETS=\"%s\"\n", strings.Join(t.ProbeTargets, " "))
 	fmt.Fprintf(&b, "OVERLAY_PROBE_MARKERS=\"%s\"\n", strings.Join(t.ProbeMarkers, " "))
@@ -1285,7 +1292,7 @@ func (c *cyc) pruneLegacyWatchdog() {
 	// module lib dir (lib.sh + modules/*.sh) — removeManaged refuses
 	// dirs on purpose, this one is pruned wholesale.
 	if err := os.RemoveAll(r.hp("/usr/local/lib/node-watchdog")); err != nil {
-		slog.Warn("prune watchdog lib dir failed", "err", err)
+		slog.Warn("prune watchdog lib dir failed", "error", err)
 	}
 	if removed {
 		r.daemonReload(ctx)
@@ -1311,8 +1318,8 @@ func (c *cyc) controllerTuning() {
 	}
 	c.ctrlDropIn("k0scontroller_memory_max_by_host", "50-memory-guard.conf", func(v string) []byte {
 		return []byte(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
-# cgroup OOM boundary cho k0scontroller (OOMPolicy=continue).
-# MemorySwapMax=0: cam unit swap.
+# cgroup OOM boundary for k0scontroller (OOMPolicy=continue).
+# MemorySwapMax=0: forbid the unit from swapping.
 [Service]
 MemoryMax=` + v + `
 MemorySwapMax=0
@@ -1321,7 +1328,7 @@ OOMPolicy=continue
 	})
 	c.ctrlDropIn("k0scontroller_go_memlimit_by_host", "51-go-memlimit.conf", func(v string) []byte {
 		return []byte(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
-# GOMEMLIMIT soft-cap heap cua MOI Go child trong unit. GOGC=50.
+# GOMEMLIMIT soft-caps the heap of EVERY Go child in the unit. GOGC=50.
 [Service]
 Environment=GOMEMLIMIT=` + v + `
 Environment=GOGC=50
@@ -1332,7 +1339,7 @@ Environment=GOGC=50
 		r.ensureDir("/etc/systemd/system/"+d, 0o755)
 		if ch, _ := r.writeManaged("/etc/systemd/system/"+d+"/10-cpuweight.conf",
 			[]byte(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
-# Giu sshd responsive khi control plane saturates CPU.
+# Keep sshd responsive when the control plane saturates CPU.
 [Service]
 CPUWeight=10000
 `), 0o644); ch {

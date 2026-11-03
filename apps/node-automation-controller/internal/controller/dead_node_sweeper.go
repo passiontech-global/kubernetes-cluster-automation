@@ -119,6 +119,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	}
 	nodeByName := make(map[string]*corev1.Node, len(nodes))
 	hasNotReady := false
+	untainted := 0
 	for i := range nodes {
 		n := &nodes[i]
 		nodeByName[n.Name] = n
@@ -134,6 +135,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 				metrics.IncError(deadNodeSweeperQueue)
 				continue
 			}
+			untainted++
 			log.Info("UNTAINT: node Ready again -> out-of-service removed", "node", n.Name)
 		}
 	}
@@ -149,7 +151,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// and the all-Ready happy path never consumes it. A stuck pod on
 	// a since-deleted node could only produce a skip-log anyway.
 	if !hasNotReady {
-		log.Info("sweep done")
+		log.Info("sweep done", "untainted", untainted)
 		return nil
 	}
 
@@ -184,7 +186,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// release the full PodList before they run.
 	pods = nil
 	if len(stuck) == 0 {
-		log.Info("sweep done")
+		log.Info("sweep done", "untainted", untainted)
 		return nil
 	}
 
@@ -251,7 +253,8 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 			"(pods force-deleted, volumes detached by node controller)",
 			"node", nodeName, "stuckPods", count)
 	}
-	log.Info("sweep done", "tainted", tainted)
+	log.Info("sweep done", "tainted", tainted, "untainted", untainted,
+		"stuckNodes", len(stuck))
 	return nil
 }
 

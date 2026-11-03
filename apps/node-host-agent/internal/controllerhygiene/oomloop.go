@@ -182,7 +182,7 @@ func (h *Hygiene) setAdj(comm string, adj int) {
 		[]byte(strconv.Itoa(adj)), 0o644); err != nil {
 		// A swallowed write failure leaves the shield half-applied
 		// and invisible — surface it once per call (per cycle).
-		h.appendLog(fmt.Sprintf(
+		h.appendLogWarn(fmt.Sprintf(
 			"oomloop: write oom_score_adj=%d comm=%s pid=%d failed: %v",
 			adj, comm, pid, err))
 	}

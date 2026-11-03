@@ -153,15 +153,15 @@ func TestAllConditionDefaults(t *testing.T) {
 	e := fixture(t)
 	e.cycle()
 	want := map[corev1.NodeConditionType][2]string{
-		"NodeOverloaded":      {"NodeLoadNormal", "node khong qua tai (load15 <= 4xCPU)"},
-		"WatchdogStale":       {"WatchdogFresh", "node-watchdog chay gan day (last-run < 20 phut)"},
+		"NodeOverloaded":      {"NodeLoadNormal", "node not overloaded (load15 <= 4xCPU)"},
+		"WatchdogStale":       {"WatchdogFresh", "node-watchdog ran recently (last-run < 20 min)"},
 		"CiliumAgentDown":     {"CiliumAgentUp", "cilium-agent healthz OK"},
-		"CiliumInitStuck":     {"CiliumEndpointsReady", "khong co cilium endpoint keo init (informer binh thuong)"},
-		"KubeletRuntimeStall": {"KubeletRuntimeOk", "khong co phantom-pods wedge (ctr song, tasks > 0)"},
-		"DnsFallbackActive":   {"DnsDirectOk", "DNS qua resolv.conf binh thuong, khong co /etc/hosts pin"},
-		"DnsResolvStale":      {"DnsResolvFresh", "DNS pods (nld/coredns) co resolv.conf khop host"},
-		"PodTeardownWedged":   {"PodTeardownOk", "khong co pod Terminating keo dai voi task con sot"},
-		"KubeletWatchWedge":   {"KubeletWatchOk", "kubelet nhan pod assignment binh thuong (khong co unseen pod)"},
+		"CiliumInitStuck":     {"CiliumEndpointsReady", "no cilium endpoint stuck in init (informer healthy)"},
+		"KubeletRuntimeStall": {"KubeletRuntimeOk", "no phantom-pods wedge (ctr alive, tasks > 0)"},
+		"DnsFallbackActive":   {"DnsDirectOk", "DNS via resolv.conf healthy, no /etc/hosts pin"},
+		"DnsResolvStale":      {"DnsResolvFresh", "DNS pods (nld/coredns) resolv.conf matches host"},
+		"PodTeardownWedged":   {"PodTeardownOk", "no long-Terminating pod with leftover task"},
+		"KubeletWatchWedge":   {"KubeletWatchOk", "kubelet receives pod assignment normally (no unseen pod)"},
 		"KernelDeadlock":      {"KernelHasNoDeadlock", "kernel has no deadlock"},
 		"ReadonlyFilesystem":  {"FilesystemIsNotReadOnly", "Filesystem is not read-only"},
 	}
@@ -347,7 +347,7 @@ func TestWatchdogStaleCondition(t *testing.T) {
 	if c.Status != corev1.ConditionTrue || c.Reason != "WatchdogStaleDetected" {
 		t.Fatalf("stale: got {%s %s}", c.Status, c.Reason)
 	}
-	wantMsg := "node-watchdog khong ghi heartbeat 1300s (timer dead hoac run fail)"
+	wantMsg := "node-watchdog missed heartbeat 1300s (timer dead or run failed)"
 	if c.Message != wantMsg {
 		t.Fatalf("message = %q, want %q", c.Message, wantMsg)
 	}

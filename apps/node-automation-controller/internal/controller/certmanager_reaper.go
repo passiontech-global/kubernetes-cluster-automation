@@ -86,6 +86,7 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 		return err
 	}
 	seen := map[string]bool{}
+	candidates, reset := 0, 0
 	for i := range certs.Items {
 		cert := &certs.Items[i]
 		key := cert.GetNamespace() + "/" + cert.GetName()
@@ -107,7 +108,10 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 		if !needsReap {
 			continue
 		}
-		r.reapCert(ctx, cert)
+		candidates++
+		if r.reapCert(ctx, cert) {
+			reset++
+		}
 	}
 	// Drop budgets for Certificates that vanished — the map is
 	// otherwise append-only per cert ever reaped.
@@ -116,7 +120,7 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 			delete(r.resets, key)
 		}
 	}
-	log.Info("sweep done")
+	log.Info("sweep done", "candidates", candidates, "ordersReset", reset)
 	return nil
 }
 
@@ -148,8 +152,9 @@ func certNeedsReap(cert *unstructured.Unstructured) bool {
 
 // reapCert finds the cert's stuck pending Order, verifies a Challenge
 // is genuinely wedged (not just slow), applies the reset budget, then
-// deletes the Order so cert-manager recreates it.
-func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Unstructured) {
+// deletes the Order so cert-manager recreates it. Reports whether an
+// Order was actually deleted.
+func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Unstructured) bool {
 	log := logf.FromContext(ctx)
 	ns, name := cert.GetNamespace(), cert.GetName()
 	key := ns + "/" + name
@@ -159,7 +164,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	if err != nil {
 		metrics.IncError(certReaperQueue)
 		log.Error(err, "order list failed", "cert", key)
-		return
+		return false
 	}
 	var stuck *unstructured.Unstructured
 	for i := range orders.Items {
@@ -174,7 +179,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		break
 	}
 	if stuck == nil {
-		return
+		return false
 	}
 
 	// Budget gate before the challenge call — no API work when the
@@ -192,11 +197,11 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 				"continuing would burn the ACME rate limit",
 				"cert", key, "resets", st.total)
 		}
-		return
+		return false
 	}
 	if !st.last.IsZero() && time.Since(st.last) < certReaperMinGap {
 		log.Info("SKIP: reset rate-limited (max 1/hour)", "cert", key)
-		return
+		return false
 	}
 
 	chals, err := r.dyn.Resource(challengeGVR).Namespace(ns).
@@ -204,12 +209,12 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	if err != nil {
 		metrics.IncError(certReaperQueue)
 		log.Error(err, "challenge list failed", "cert", key)
-		return
+		return false
 	}
 	if !stuckChallengeForOrder(stuck, chals.Items) {
 		log.Info("KEEP: pending order but no wedged challenge — "+
 			"issuance still progressing", "cert", key, "order", stuck.GetName())
-		return
+		return false
 	}
 
 	log.Info("RESET: deleting stuck pending Order — cert-manager recreates fresh",
@@ -218,10 +223,11 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		Delete(ctx, stuck.GetName(), metav1.DeleteOptions{}); err != nil {
 		metrics.IncError(certReaperQueue)
 		log.Error(err, "order delete failed", "cert", key, "order", stuck.GetName())
-		return
+		return false
 	}
 	st.total++
 	st.last = time.Now()
+	return true
 }
 
 // stuckChallengeForOrder reports whether any Challenge in the
