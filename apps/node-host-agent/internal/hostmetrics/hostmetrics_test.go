@@ -295,6 +295,91 @@ func TestK0sMetricAbsentOnWorker(t *testing.T) {
 	}
 }
 
+func TestWatchdogTmpStateFileIgnored(t *testing.T) {
+	cfg, dirs := fixture(t)
+	// The atomic-write tmp name ".tmp-state-x" (apiprober's
+	// writeFileAtomic, workerhygiene's stateEnter) must NOT register
+	// a watchdog_state series — the old "state-x.tmp" shape would
+	// have cut to a phantom "x.tmp" latch that then sits at 0 forever.
+	write(t, filepath.Join(dirs["state"], ".tmp-state-atomic"), "1730000000\n")
+	write(t, filepath.Join(dirs["state"], "state-real"), "1730000000\n")
+	c := New(cfg)
+
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "real"}); !ok || v != 1 {
+		t.Fatalf("watchdog_state{real}=%v ok=%v want 1", v, ok)
+	}
+	for _, st := range []string{"atomic", ".tmp-state-atomic", "state-atomic"} {
+		if _, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+			map[string]string{"node": "node-a", "state": st}); ok {
+			t.Fatalf("tmp file emitted watchdog_state{state=%s}", st)
+		}
+	}
+}
+
+func TestK0sDriftDuplicateRemovedFlagsDeduped(t *testing.T) {
+	// A duplicated flag in the config list must emit ONE finding —
+	// the precompiled map keys dedupe. Duplicate identical series
+	// would make prometheus Gather fail outright (metricValue's
+	// Gather → t.Fatal covers that).
+	cfg, _ := fixture(t)
+	write(t, cfg.K0sUnitFile, "[Unit]\n")
+	write(t, cfg.K0sConfigFile, k0sCleanYAML("concurrent-service-syncs"))
+	cfg.RemovedFlags = []string{"concurrent-service-syncs", "concurrent-service-syncs"}
+	c := New(cfg)
+	if v, ok := k0sDrift(t, c, "removed-flag", "concurrent-service-syncs"); !ok || v != 1 {
+		t.Fatalf("removed-flag=%v ok=%v want 1 (single finding)", v, ok)
+	}
+}
+
+// bumpMtime forces a distinct mtime so the k0s.yaml stat cache sees
+// the file as changed — same-second writes can alias otherwise.
+func bumpMtime(t *testing.T, path string) {
+	t.Helper()
+	mt := time.Now().Add(time.Hour)
+	if err := os.Chtimes(path, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestK0sConfigCacheRevalidates(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.K0sUnitFile, "[Unit]\n")
+	write(t, cfg.K0sConfigFile, k0sCleanYAML())
+	c := New(cfg)
+
+	// First scrape loads the file; unchanged mtime+size would serve
+	// the cache — findings stay consistent across scrapes.
+	if v, ok := k0sDrift(t, c, "none", "none"); !ok || v != 0 {
+		t.Fatalf("clean config none=%v ok=%v want 0", v, ok)
+	}
+	if v, ok := k0sDrift(t, c, "none", "none"); !ok || v != 0 {
+		t.Fatalf("second scrape none=%v ok=%v want 0", v, ok)
+	}
+
+	// Content change + bumped mtime → the next scrape re-reads.
+	write(t, cfg.K0sConfigFile, k0sCleanYAML("bogus-extra-flag"))
+	bumpMtime(t, cfg.K0sConfigFile)
+	if v, ok := k0sDrift(t, c, "extra-key", "bogus-extra-flag"); !ok || v != 1 {
+		t.Fatalf("extra-key=%v ok=%v want 1 after config change", v, ok)
+	}
+
+	// File gone → unreadable finding, never a stale cached parse.
+	if err := os.Remove(cfg.K0sConfigFile); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := k0sDrift(t, c, "unreadable", "k0s.yaml"); !ok || v != 1 {
+		t.Fatalf("unreadable=%v ok=%v want 1 after file removal", v, ok)
+	}
+
+	// Restored → findings track the new file again.
+	write(t, cfg.K0sConfigFile, k0sCleanYAML())
+	bumpMtime(t, cfg.K0sConfigFile)
+	if v, ok := k0sDrift(t, c, "none", "none"); !ok || v != 0 {
+		t.Fatalf("restored config none=%v ok=%v want 0", v, ok)
+	}
+}
+
 func TestApplyDefaults(t *testing.T) {
 	c := New(Config{})
 	if c.cfg.WatchdogStateDir != defaultWatchdogStateDir {

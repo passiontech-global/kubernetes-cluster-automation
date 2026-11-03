@@ -471,6 +471,43 @@ func TestAbortWhenBaseDirUnreadable(t *testing.T) {
 	}
 }
 
+func TestZeroDirsSkipsPVList(t *testing.T) {
+	// No pvc-* candidates on disk → the whole-cluster PV List is
+	// skipped entirely; the reactor fails the test if it ever runs.
+	cs := fake.NewSimpleClientset()
+	listed := 0
+	cs.PrependReactor("list", "persistentvolumes",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			listed++
+			return true, nil, errors.New("PV list must not be called")
+		})
+	s, base, _ := fixture(t, cs)
+	// Non-candidates don't defeat the early return: a non-pvc dir and
+	// a pvc-* FILE (dirs only, like the shell glob).
+	if err := os.MkdirAll(filepath.Join(base, "quota.lock"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "pvc-not-a-dir"),
+		[]byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s.Sweep(context.Background())
+
+	if listed != 0 {
+		t.Fatalf("PV list calls=%d want 0 (no pvc-* dirs)", listed)
+	}
+	if got := testutil.ToFloat64(s.cycles.WithLabelValues("ok")); got != 1 {
+		t.Fatalf("cycles ok=%v want 1", got)
+	}
+	if got := testutil.ToFloat64(s.cycles.WithLabelValues("abort")); got != 0 {
+		t.Fatalf("cycles abort=%v want 0", got)
+	}
+	if got := testutil.ToFloat64(s.dirsExamined); got != 0 {
+		t.Fatalf("dirsExamined=%v want 0", got)
+	}
+}
+
 func TestStatfsErrorTolerated(t *testing.T) {
 	// The fixture's statfsFn always errors — the sweep must still
 	// delete orphans; statfs feeds logging/bytesFreed only.

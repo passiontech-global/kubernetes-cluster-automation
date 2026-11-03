@@ -119,8 +119,10 @@ func envList(key string) []string {
 }
 
 // kubeClient builds the in-cluster clientset (SA token), falling back
-// to $KUBECONFIG for out-of-cluster runs.
-func kubeClient() (kubernetes.Interface, error) {
+// to $KUBECONFIG for out-of-cluster runs. A var (not a plain func) so
+// tests can stub the factory — csOnce's single-build behaviour is
+// only observable through it.
+var kubeClient = func() (kubernetes.Interface, error) {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		if kc := os.Getenv("KUBECONFIG"); kc != "" {
@@ -146,9 +148,21 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 	reg := prometheus.NewRegistry()
 	var subsystems []agent.Subsystem
 
+	// One clientset for the whole process: each NewForConfig builds
+	// its own http.Transport + TLS pool, so sweeper and workerhygiene
+	// share a lazily-built client instead of carrying two pools.
+	var cs kubernetes.Interface
+	var csErr error
+	csOnce := func() (kubernetes.Interface, error) {
+		if cs == nil && csErr == nil {
+			cs, csErr = kubeClient()
+		}
+		return cs, csErr
+	}
+
 	// --- sweeper: openebs orphan pvc-* dir cleanup ---
 	if envBool("NODE_HOST_AGENT_ENABLE_SWEEPER", true) {
-		cs, err := kubeClient()
+		cs, err := csOnce()
 		if err != nil {
 			// Not fatal: the metrics/probe endpoints and other
 			// subsystems still serve; the sweeper simply does not run.
@@ -247,7 +261,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			slog.Error("workerhygiene disabled: node name empty " +
 				"(NODE_HOST_AGENT_NODE_NAME/NODE_NAME unset)")
 		default:
-			cs, err := kubeClient()
+			cs, err := csOnce()
 			if err != nil {
 				slog.Error("workerhygiene disabled: cannot build kubernetes client",
 					"error", err)

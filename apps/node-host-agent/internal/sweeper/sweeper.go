@@ -304,6 +304,15 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 		s.cycles.WithLabelValues("abort").Inc()
 		return
 	}
+	if len(dirs) == 0 {
+		// No pvc-* candidates on disk → nothing can match a PV, so
+		// skip the whole-cluster PV list entirely (the common case:
+		// orphan dirs are the exception, not the norm).
+		s.dirsExamined.Set(0)
+		s.cycles.WithLabelValues("ok").Inc()
+		log.Info("sweep done", "dirs", 0, "deleted", 0)
+		return
+	}
 	apiCtx, cancel := s.apiCtx(ctx)
 	pvList, err := s.cfg.Client.CoreV1().PersistentVolumes().
 		List(apiCtx, metav1.ListOptions{})

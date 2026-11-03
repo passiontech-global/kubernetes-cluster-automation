@@ -1743,3 +1743,229 @@ func TestDashedIP(t *testing.T) {
 		t.Fatalf("dashedIP=%q want 10-0-0-1", got)
 	}
 }
+
+// --- stale-backend pruning (p.states + per-backend metric series) ---
+// Series counts go through testutil.CollectAndCount rather than
+// ToFloat64 — a WithLabelValues probe would re-create the very series
+// the prune is supposed to have deleted.
+
+func TestPruneStaleBackendsRemovesStateAndSeries(t *testing.T) {
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	// One healthy cycle seeds rvGap{hub1}/enabled{hub1}; then query
+	// failures wedge hub1 → probeFailures{hub1,query},
+	// actions{hub1,disable} and a drained states entry.
+	bad.set(100, 900)
+	good.set(50, 50)
+	p.Cycle(context.Background())
+	bad.setFail(true)
+	p.Cycle(context.Background())
+	p.Cycle(context.Background()) // qfail #2 → DEAD → disable
+
+	if _, ok := p.states["hub1"]; !ok {
+		t.Fatal("hub1 states entry missing before retire")
+	}
+	if testutil.CollectAndCount(p.probeFailures) != 1 ||
+		testutil.CollectAndCount(p.actions) != 1 {
+		t.Fatal("expected one hub1 probeFailures/actions series before retire")
+	}
+
+	// Retire hub1 from api-local-lb — the next discovery sees hub2 only.
+	ha.mu.Lock()
+	delete(ha.servers, "hub1")
+	ha.order = []string{"hub2"}
+	ha.mu.Unlock()
+	p.Cycle(context.Background())
+
+	if _, ok := p.states["hub1"]; ok {
+		t.Fatal("stale hub1 states entry survived prune")
+	}
+	if got := testutil.CollectAndCount(p.rvGap); got != 1 {
+		t.Fatalf("rvGap series=%d want 1 (hub2 only)", got)
+	}
+	if got := testutil.CollectAndCount(p.enabled); got != 1 {
+		t.Fatalf("enabled series=%d want 1 (hub2 only)", got)
+	}
+	// The two-label vecs must lose every series whose backend label
+	// matches — DeletePartialMatch coverage.
+	if got := testutil.CollectAndCount(p.probeFailures); got != 0 {
+		t.Fatalf("probeFailures series=%d want 0 after prune", got)
+	}
+	if got := testutil.CollectAndCount(p.actions); got != 0 {
+		t.Fatalf("actions series=%d want 0 after prune", got)
+	}
+}
+
+func TestPruneStaleBackendsSkippedOnEmptyOrFailedDiscovery(t *testing.T) {
+	// A transient socket error or an empty scan must not wipe state the
+	// next good cycle still needs — the len(backends)>0 gate.
+	seed := func(p *Prober) {
+		p.states["gone"] = &backendState{drained: true}
+		p.rvGap.WithLabelValues("gone").Set(7)
+		p.enabled.WithLabelValues("gone").Set(0)
+		p.probeFailures.WithLabelValues("gone", "query").Inc()
+		p.actions.WithLabelValues("gone", "disable").Inc()
+	}
+	assertKept := func(t *testing.T, p *Prober) {
+		t.Helper()
+		if _, ok := p.states["gone"]; !ok {
+			t.Fatal("states entry pruned on a non-discovery cycle")
+		}
+		for name, vec := range map[string]prometheus.Collector{
+			"rvGap":         p.rvGap,
+			"enabled":       p.enabled,
+			"probeFailures": p.probeFailures,
+			"actions":       p.actions,
+		} {
+			if got := testutil.CollectAndCount(vec); got != 1 {
+				t.Fatalf("%s series=%d want 1 kept", name, got)
+			}
+		}
+	}
+
+	t.Run("empty discovery", func(t *testing.T) {
+		ha := newFakeHAProxy(t) // header only — zero kube_apiserver rows
+		p := fixture(t, ha, ModeDryRun, nil)
+		seed(p)
+		p.Cycle(context.Background())
+		assertKept(t, p)
+	})
+
+	t.Run("failed discovery", func(t *testing.T) {
+		p, err := New(Config{
+			DialSocket: func(context.Context, string) (net.Conn, error) {
+				return nil, errors.New("admin socket gone")
+			},
+			HTTPClient: newAPIStub(t).srv.Client(),
+		}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		seed(p)
+		p.Cycle(context.Background())
+		assertKept(t, p)
+	})
+}
+
+func TestPruneStaleBackendsKeepsVIP(t *testing.T) {
+	// *_lb VIP entries are part of the live discovery set — pruning on
+	// direct backends only (the pruneWatchdogFiles filter) would drop
+	// the VIP's drained flag and enabled series every cycle.
+	ctrl := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"api_datahub_ctrl", ctrl.addr()},
+		[2]string{"api_datahub_lb", "127.0.0.1:1"},
+	)
+	p := fixture(t, ha, ModeDryRun, nil)
+
+	ctrl.set(50, 50)
+	p.Cycle(context.Background())
+
+	if _, ok := p.states["api_datahub_lb"]; !ok {
+		t.Fatal("VIP states entry pruned while still in discovery")
+	}
+	if got := testutil.CollectAndCount(p.enabled); got != 2 {
+		t.Fatalf("enabled series=%d want 2 (ctrl + VIP)", got)
+	}
+}
+
+func TestListRVSendsPartialObjectMetadataAccept(t *testing.T) {
+	var gotAccept string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAccept = r.Header.Get("Accept")
+		io.WriteString(w, `{"metadata":{"resourceVersion":"42"}}`)
+	}))
+	defer srv.Close()
+	p, err := New(Config{HTTPClient: srv.Client()}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rv, ok := p.listRV(context.Background(),
+		strings.TrimPrefix(srv.URL, "https://"), "/api/v1/nodes?limit=1")
+	if !ok || rv != 42 {
+		t.Fatalf("listRV = %d, %v want 42, true", rv, ok)
+	}
+	const want = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
+	if gotAccept != want {
+		t.Fatalf("Accept=%q want %q", gotAccept, want)
+	}
+}
+
+// readTracker wraps a reader, recording total bytes consumed — proves
+// listRV drains the response body to EOF past the 1 MiB decode cap so
+// keep-alive can reuse the connection.
+type readTracker struct {
+	r     io.Reader
+	total int64
+}
+
+func (t *readTracker) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	t.total += int64(n)
+	return n, err
+}
+
+func (t *readTracker) Close() error { return nil }
+
+func TestListRVDrainsBodyPastReadCap(t *testing.T) {
+	// Valid JSON up front, then >1 MiB of trailing whitespace (legal
+	// for json.Unmarshal): the capped read captures the document and
+	// the drain must consume the rest to EOF.
+	payload := `{"metadata":{"resourceVersion":"42"}}` +
+		strings.Repeat(" ", 2<<20)
+	body := &readTracker{r: strings.NewReader(payload)}
+	p, err := New(Config{
+		HTTPClient: &http.Client{Transport: rtFunc(
+			func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					Header:        make(http.Header),
+					Body:          body,
+					ContentLength: int64(len(payload)),
+				}, nil
+			})},
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rv, ok := p.listRV(context.Background(), "127.0.0.1:6443", "/x")
+	if !ok || rv != 42 {
+		t.Fatalf("listRV = %d, %v want 42, true", rv, ok)
+	}
+	if body.total != int64(len(payload)) {
+		t.Fatalf("body read %d/%d bytes — tail past the cap not drained",
+			body.total, len(payload))
+	}
+}
+
+func TestNewClonesDefaultTransport(t *testing.T) {
+	// The production client must keep DefaultTransport's dialer /
+	// keep-alive defaults — a bare &http.Transport{} has
+	// IdleConnTimeout=0 (idle TLS conns pin buffers forever) and no
+	// dialer. TLSClientConfig must survive the clone's field
+	// assignment too.
+	p, err := New(Config{InsecureTLS: true, TokenFile: ""},
+		prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, ok := p.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport %T want *http.Transport", p.client.Transport)
+	}
+	if tr.DialContext == nil {
+		t.Fatal("DialContext nil — transport not cloned from DefaultTransport")
+	}
+	if tr.IdleConnTimeout != 90*time.Second {
+		t.Fatalf("IdleConnTimeout=%v want 90s", tr.IdleConnTimeout)
+	}
+	if tr.TLSClientConfig == nil || !tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("TLSClientConfig lost on the cloned transport")
+	}
+}

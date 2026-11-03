@@ -269,9 +269,20 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// node match is re-checked per pod — the fake clientset ignores
 	// selectors, and a wrong match is a wrong kill.
 	pods, apiOK := h.listNodePods(ctx)
-	h.checkPodTeardown(ctx, pods, apiOK)
+	// The containerd task map reads EVERY task dir's config.json —
+	// build it lazily, at most once per cycle, shared between the
+	// teardown and dns checks. Most cycles neither needs it (no pod
+	// Terminating, no dns-pod running) so it stays unbuilt.
+	var tasks map[string][]ctrTask
+	tasksOnce := func() map[string][]ctrTask {
+		if tasks == nil {
+			tasks = h.buildTaskMap()
+		}
+		return tasks
+	}
+	h.checkPodTeardown(ctx, pods, apiOK, tasksOnce)
 	h.checkKonnectivity(ctx, pods)
-	h.checkDNSResolvDrift(pods, apiOK)
+	h.checkDNSResolvDrift(pods, apiOK, tasksOnce)
 }
 
 // listNodePods lists pods scheduled to this node; apiOK=false means
@@ -334,7 +345,11 @@ func (h *Hygiene) stateEnter(name, extra string) {
 		return
 	}
 	content := strconv.FormatInt(h.cfg.nowFn().Unix(), 10) + "\n"
-	tmp := p + ".tmp"
+	// Tmp name mirrors apiprober's writeFileAtomic: a leading dot
+	// keeps it out of hostmetrics' state-* scan — a "state-<n>.tmp"
+	// file would register a phantom "<n>.tmp" watchdog_state series
+	// that then sits at 0 forever (seenStates never drops keys).
+	tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
 		return
 	}
@@ -576,14 +591,17 @@ func (h *Hygiene) forceDeletePod(ctx context.Context, p *corev1.Pod) error {
 		})
 }
 
-func (h *Hygiene) checkPodTeardown(ctx context.Context, pods []corev1.Pod, apiOK bool) {
+func (h *Hygiene) checkPodTeardown(ctx context.Context, pods []corev1.Pod,
+	apiOK bool, tasksOnce func() map[string][]ctrTask) {
 	if !apiOK {
 		// Inconclusive — shell "exit 0" semantics: abort silently,
 		// keep counters and latches (no state_exit flap on API blip).
 		h.cycles.WithLabelValues(checkTeardown, "abort").Inc()
 		return
 	}
-	tasks := h.buildTaskMap()
+	// The task map is only worth building once a Terminating pod
+	// exists — with none, the whole loop below is a no-op.
+	var tasks map[string][]ctrTask
 	now := h.cfg.nowFn()
 	wedged := 0
 	ndel := 0
@@ -591,6 +609,9 @@ func (h *Hygiene) checkPodTeardown(ctx context.Context, pods []corev1.Pod, apiOK
 		p := &pods[i]
 		if p.DeletionTimestamp == nil {
 			continue
+		}
+		if tasks == nil {
+			tasks = tasksOnce()
 		}
 		uid := string(p.UID)
 		age := now.Sub(p.DeletionTimestamp.Time)
@@ -839,7 +860,8 @@ func pausePIDOf(tasks []ctrTask) int {
 	return 0
 }
 
-func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool) {
+func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
+	tasksOnce func() map[string][]ctrTask) {
 	if !apiOK {
 		// Same inconclusive rule as teardown: a failed LIST keeps
 		// counters and the latch (no flap on API blip).
@@ -847,15 +869,20 @@ func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool) {
 		return
 	}
 	hostNS, _ := nameserverSet(h.cfg.HostResolvConf)
-	tasks := h.buildTaskMap()
 
 	var stale []dnsStale
 	if len(hostNS) > 0 { // empty host set → nothing to compare (shell parity)
+		// Task map is built only when a Running dns-pod actually
+		// needs its pause pid looked up.
+		var tasks map[string][]ctrTask
 		for i := range pods {
 			p := &pods[i]
 			if p.Status.Phase != corev1.PodRunning ||
 				!dnsPodRe.MatchString(p.Name) {
 				continue
+			}
+			if tasks == nil {
+				tasks = tasksOnce()
 			}
 			pid := pausePIDOf(tasks[string(p.UID)])
 			if pid == 0 {

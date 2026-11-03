@@ -255,9 +255,15 @@ func New(cfg Config, reg prometheus.Registerer) (*Prober, error) {
 			}
 			tlsCfg.RootCAs = pool
 		}
-		p.client = &http.Client{
-			Transport: &http.Transport{TLSClientConfig: tlsCfg},
-		}
+		// Clone DefaultTransport rather than hand-rolling one: a bare
+		// &http.Transport{} loses the dialer/keep-alive defaults —
+		// IdleConnTimeout=0 would pin TLS read/write buffers on every
+		// idle conn forever, and ForceAttemptHTTP2=false falls back
+		// to HTTP/1.1.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig = tlsCfg
+		tr.IdleConnTimeout = 90 * time.Second
+		p.client = &http.Client{Transport: tr}
 	}
 
 	p.rvGap = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -407,8 +413,12 @@ func (p *Prober) discover(ctx context.Context) ([]backend, error) {
 		if addr == "" {
 			return nil, fmt.Errorf("show stat: server %s has no addr column value", svname)
 		}
+		// svname is a substring of the whole `show stat` buffer —
+		// clone it before it becomes a p.states map key / Prometheus
+		// label value, or every unique name pins the multi-KB CSV on
+		// the heap forever.
 		backends = append(backends, backend{
-			Name: svname, Addr: addr, Status: get("status"),
+			Name: strings.Clone(svname), Addr: addr, Status: get("status"),
 		})
 	}
 	if header == nil {
@@ -444,6 +454,12 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 	if err != nil {
 		return 0, false
 	}
+	// Ask for object metadata only — both probe paths are nodes LISTs,
+	// and with resourceVersion=0 the watch-cache ignores limit=1, so
+	// without this header every cycle decodes the entire NodeList
+	// (and truncates at the read cap once it exceeds 1 MiB).
+	req.Header.Set("Accept",
+		"application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1")
 	// Token re-read per query — the SA token is projected and rotates.
 	if p.cfg.TokenFile != "" && p.cfg.HTTPClient == nil {
 		tok, err := os.ReadFile(p.cfg.TokenFile)
@@ -458,10 +474,14 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 		return 0, false
 	}
 	defer resp.Body.Close()
+	// A metadata-only list is a few hundred bytes — the 1 MiB cap is
+	// a safety bound only. Drain any tail to EOF so keep-alive can
+	// reuse the connection.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return 0, false
 	}
+	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return 0, false
 	}
@@ -615,6 +635,31 @@ func (p *Prober) stateFor(name string) *backendState {
 		p.states[name] = st
 	}
 	return st
+}
+
+// pruneStaleBackends drops in-memory probe state and every
+// per-backend metric series for names no longer present in
+// discovery — a backend retired from api-local-lb would otherwise
+// pin its p.states entry and its label values on the registry
+// forever. Only runs when discovery returned rows — never on
+// discover failure or an empty backend list.
+func (p *Prober) pruneStaleBackends(backends []backend) {
+	live := make(map[string]bool, len(backends))
+	for _, b := range backends {
+		live[b.Name] = true
+	}
+	for name := range p.states {
+		if live[name] {
+			continue
+		}
+		delete(p.states, name)
+		p.rvGap.DeleteLabelValues(name)
+		p.enabled.DeleteLabelValues(name)
+		// probeFailures/actions carry a second label (phase|action)
+		// — drop every series whose backend label matches.
+		p.probeFailures.DeletePartialMatch(prometheus.Labels{"backend": name})
+		p.actions.DeletePartialMatch(prometheus.Labels{"backend": name})
+	}
 }
 
 // Cycle runs one detection+guard round — the shell script body.
@@ -898,10 +943,14 @@ func (p *Prober) Cycle(ctx context.Context) {
 		p.enabled.WithLabelValues(b.Name).Set(v)
 	}
 
-	// Prune compat files for backends that left discovery — only when
+	// Prune state for backends that left discovery — only when
 	// discover returned rows (never on discover_fail/empty: a failed
-	// or empty scan must not wipe latches the shell side still reads).
-	if wdir != "" && len(backends) > 0 {
-		p.pruneWatchdogFiles(wdir, backends)
+	// or empty scan must not wipe latches/counters/metric series the
+	// next good scan still needs).
+	if len(backends) > 0 {
+		p.pruneStaleBackends(backends)
+		if wdir != "" {
+			p.pruneWatchdogFiles(wdir, backends)
+		}
 	}
 }

@@ -136,8 +136,24 @@ func (c *Config) applyDefaults() {
 type Collector struct {
 	cfg Config
 
+	// Hoisted out of the scrape path in New(): drift regexes are
+	// compiled once and the expected-KCM set is built once — the
+	// per-scrape work left in collectK0sDrift is a stat + map lookups.
+	removedFlagRe map[string]*regexp.Regexp
+	expectedKCM   map[string]bool
+
 	mu         sync.Mutex
 	seenStates map[string]bool
+
+	// k0s.yaml cache, guarded by mu: the file changes on k0s upgrades
+	// (rare), not per-scrape — a stat+mtime+size check gates the
+	// re-read/re-parse. A failed stat serves no stale data.
+	k0sLoaded bool
+	k0sMtime  time.Time
+	k0sSize   int64
+	k0sData   []byte
+	k0sParsed map[string]any
+	k0sOK     bool
 
 	descWatchdog    *prometheus.Desc
 	descNebUp       *prometheus.Desc
@@ -150,6 +166,20 @@ type Collector struct {
 func New(cfg Config) *Collector {
 	cfg.applyDefaults()
 	c := &Collector{cfg: cfg, seenStates: map[string]bool{}}
+	c.removedFlagRe = make(map[string]*regexp.Regexp, len(cfg.RemovedFlags))
+	for _, flag := range cfg.RemovedFlags {
+		// Anchored key match (same shape as the canonical
+		// grep "^[[:space:]]*flag[[:space:]]*:") over the raw file —
+		// a removed flag may hide in ANY extraArgs block
+		// (api/controllerManager/scheduler), and a substring match
+		// would fire on comments or values.
+		c.removedFlagRe[flag] = regexp.MustCompile(
+			`(?m)^\s*` + regexp.QuoteMeta(flag) + `\s*:`)
+	}
+	c.expectedKCM = make(map[string]bool, len(cfg.ExpectedKCMArgs))
+	for _, k := range cfg.ExpectedKCMArgs {
+		c.expectedKCM[k] = true
+	}
 	c.descWatchdog = prometheus.NewDesc(
 		"node_host_agent_watchdog_state",
 		"node-watchdog state-* latch present (1) or previously seen and cleared (0).",
@@ -429,6 +459,32 @@ func kcmExtraArgKeys(parsed map[string]any) []string {
 	return keys
 }
 
+// k0sConfig returns the raw bytes and parsed form of k0s.yaml,
+// re-reading only when the file's mtime+size changed since the last
+// scrape. ok=false means the file was unreadable or unparseable at
+// read time — the caller keeps the old drift=1 "unreadable" finding.
+func (c *Collector) k0sConfig() (data []byte, parsed map[string]any, ok bool) {
+	fi, err := os.Stat(c.cfg.K0sConfigFile)
+	if err != nil {
+		return nil, nil, false // gone/un-statable → never serve cache
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.k0sLoaded && fi.ModTime().Equal(c.k0sMtime) && fi.Size() == c.k0sSize {
+		return c.k0sData, c.k0sParsed, c.k0sOK
+	}
+	data, err = os.ReadFile(c.cfg.K0sConfigFile)
+	var p map[string]any
+	ok = err == nil && yaml.Unmarshal(data, &p) == nil
+	c.k0sLoaded = true
+	c.k0sMtime = fi.ModTime()
+	c.k0sSize = fi.Size()
+	c.k0sData = data
+	c.k0sParsed = p
+	c.k0sOK = ok
+	return data, p, ok
+}
+
 // collectK0sDrift emits node_k0s_config_drift{reason,key} on
 // controller nodes (detected via the k0scontroller.service unit file).
 // One series per finding at value 1; a clean config emits
@@ -440,35 +496,22 @@ func (c *Collector) collectK0sDrift(ch chan<- prometheus.Metric) {
 	}
 	type finding struct{ reason, key string }
 	var findings []finding
-	data, err := os.ReadFile(c.cfg.K0sConfigFile)
-	var parsed map[string]any
-	if err != nil || yaml.Unmarshal(data, &parsed) != nil {
+	data, parsed, ok := c.k0sConfig()
+	if !ok {
 		findings = append(findings, finding{"unreadable", "k0s.yaml"})
 	} else {
-		removed := make(map[string]bool, len(c.cfg.RemovedFlags))
-		for _, flag := range c.cfg.RemovedFlags {
-			removed[flag] = true
-			// Anchored key match (same shape as the canonical
-			// grep "^[[:space:]]*flag[[:space:]]*:") over the raw
-			// file — a removed flag may hide in ANY extraArgs
-			// block (api/controllerManager/scheduler), and a
-			// substring match would fire on comments or values.
-			re := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(flag) + `\s*:`)
+		for flag, re := range c.removedFlagRe {
 			if re.Match(data) {
 				findings = append(findings, finding{"removed-flag", flag})
 			}
 		}
 		nodeKeys := kcmExtraArgKeys(parsed)
 		nodeSet := make(map[string]bool, len(nodeKeys))
-		expected := make(map[string]bool, len(c.cfg.ExpectedKCMArgs))
-		for _, k := range c.cfg.ExpectedKCMArgs {
-			expected[k] = true
-		}
 		for _, k := range nodeKeys {
 			nodeSet[k] = true
 			// A removed flag found in extraArgs reports only under
 			// removed-flag — no double counting as extra-key.
-			if !expected[k] && !removed[k] {
+			if _, isRemoved := c.removedFlagRe[k]; !c.expectedKCM[k] && !isRemoved {
 				findings = append(findings, finding{"extra-key", k})
 			}
 		}

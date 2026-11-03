@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"os"
 	"os/exec"
@@ -10,6 +11,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestGetenv(t *testing.T) {
@@ -461,4 +465,75 @@ users:
 			t.Fatalf("subsystems=%d want 0 (apiprober setup failed, not fatal)", len(cfg.Subsystems))
 		}
 	})
+}
+
+// stubKubeClient swaps the package-level client factory for a counter
+// stub — csOnce's single-build behaviour is only observable through it.
+func stubKubeClient(t *testing.T,
+	fn func() (kubernetes.Interface, error)) *int {
+	t.Helper()
+	calls := new(int)
+	orig := kubeClient
+	kubeClient = func() (kubernetes.Interface, error) {
+		(*calls)++
+		return fn()
+	}
+	t.Cleanup(func() { kubeClient = orig })
+	return calls
+}
+
+// enableBothKubeConsumers is the env set where sweeper AND
+// workerhygiene each reach their csOnce call.
+func enableBothKubeConsumers(t *testing.T) {
+	t.Helper()
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+	t.Setenv("KUBECONFIG", "")
+	t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "true")
+	t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "false")
+	t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "false")
+	t.Setenv("NODE_HOST_AGENT_ENABLE_HYGIENE", "true")
+}
+
+// TestCsOnceSharesOneClientset: sweeper and workerhygiene both consume
+// csOnce — the clientset is built exactly once for the process.
+func TestCsOnceSharesOneClientset(t *testing.T) {
+	calls := stubKubeClient(t, func() (kubernetes.Interface, error) {
+		return fake.NewSimpleClientset(), nil
+	})
+	enableBothKubeConsumers(t)
+
+	cfg, _ := buildAgentConfig("node-a", "p", "ns", "v",
+		"127.0.0.1:0", "127.0.0.1:0")
+
+	if *calls != 1 {
+		t.Fatalf("kubeClient calls=%d want 1 (shared clientset)", *calls)
+	}
+	names := []string{}
+	for _, s := range cfg.Subsystems {
+		names = append(names, s.Name())
+	}
+	if len(names) != 2 || names[0] != "sweeper" || names[1] != "workerhygiene" {
+		t.Fatalf("subsystems=%v want [sweeper workerhygiene]", names)
+	}
+}
+
+// TestCsOnceErrorNotRetried: a failed first build is cached — the
+// second consumer sees the same error without re-attempting (and
+// neither subsystem aborts the agent).
+func TestCsOnceErrorNotRetried(t *testing.T) {
+	calls := stubKubeClient(t, func() (kubernetes.Interface, error) {
+		return nil, errors.New("no config")
+	})
+	enableBothKubeConsumers(t)
+
+	cfg, _ := buildAgentConfig("node-a", "p", "ns", "v",
+		"127.0.0.1:0", "127.0.0.1:0")
+
+	if *calls != 1 {
+		t.Fatalf("kubeClient calls=%d want 1 (error cached, not retried)", *calls)
+	}
+	if len(cfg.Subsystems) != 0 {
+		t.Fatalf("subsystems=%d want 0 (client build failed)", len(cfg.Subsystems))
+	}
 }

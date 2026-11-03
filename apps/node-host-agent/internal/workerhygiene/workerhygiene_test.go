@@ -674,3 +674,122 @@ func TestName(t *testing.T) {
 		t.Fatalf("Name()=%q want workerhygiene", e.h.Name())
 	}
 }
+
+// --- lazy shared task map (tasksOnce) ---
+
+// sig0Probe wraps the fixture killFn to count kill(pid,0) liveness
+// probes — pidLive is invoked ONLY from buildTaskMap, so the count is
+// (task dirs with init.pid) x (buildTaskMap runs this cycle).
+func sig0Probe(e *env) *int {
+	calls := new(int)
+	orig := e.h.cfg.killFn
+	e.h.cfg.killFn = func(pid int, sig syscall.Signal) error {
+		if sig == 0 {
+			(*calls)++
+		}
+		return orig(pid, sig)
+	}
+	return calls
+}
+
+func TestTaskMapBuiltOnceSharedAcrossChecks(t *testing.T) {
+	e := fixture(t)
+	sig0 := sig0Probe(e)
+	// One live task dir → one liveness probe per buildTaskMap run.
+	e.mkProc(t, 8001, "S", "", "")
+	e.mkTask(t, uidA, "pause", 8001)
+
+	// checkPodTeardown needs the map: a Terminating pod exists
+	// (too young to delete — the build is gated on Terminating alone).
+	p := terminatingPod(e, "stuck", "default", uidB, 5*time.Minute)
+	if _, err := e.cs.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// checkDNSResolvDrift needs it too: hostNS set + a Running dns pod.
+	writeFile(t, e.resv, "nameserver 10.96.0.10\n")
+	d := dnsPod(e, "node-local-dns-abc12", uidA)
+	if _, err := e.cs.CoreV1().Pods("kube-system").Create(context.Background(), d, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.h.Cycle(context.Background())
+
+	if *sig0 != 1 {
+		t.Fatalf("liveness probes=%d want 1 (task map built once, "+
+			"shared between teardown and dns checks)", *sig0)
+	}
+	if n := len(deleteActions(e.cs)); n != 0 {
+		t.Fatalf("deletes=%d want 0 (terminating pod too young)", n)
+	}
+}
+
+func TestTaskMapNotBuiltWithoutTriggers(t *testing.T) {
+	e := fixture(t)
+	sig0 := sig0Probe(e)
+	e.mkProc(t, 8001, "S", "", "")
+	e.mkTask(t, uidA, "pause", 8001)
+	writeFile(t, e.resv, "nameserver 10.96.0.10\n")
+	// A Running pod that is neither Terminating nor a dns-pod name —
+	// the common idle cycle: the task map must stay unbuilt.
+	ordinary := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ordinary-app", Namespace: "default", UID: types.UID(uidB),
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	if _, err := e.cs.CoreV1().Pods("default").Create(context.Background(), ordinary, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.h.Cycle(context.Background())
+
+	if *sig0 != 0 {
+		t.Fatalf("liveness probes=%d want 0 (task map never built)", *sig0)
+	}
+}
+
+func TestTaskMapNotBuiltWhenHostResolvEmpty(t *testing.T) {
+	e := fixture(t)
+	sig0 := sig0Probe(e)
+	e.mkProc(t, 8001, "S", "", "")
+	e.mkTask(t, uidA, "pause", 8001)
+	// resolv.conf absent → hostNS empty → the dns check never reaches
+	// the pause-pid lookup even with a Running dns pod.
+	d := dnsPod(e, "node-local-dns-abc12", uidA)
+	if _, err := e.cs.CoreV1().Pods("kube-system").Create(context.Background(), d, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.h.Cycle(context.Background())
+
+	if *sig0 != 0 {
+		t.Fatalf("liveness probes=%d want 0 (empty hostNS gates the build)", *sig0)
+	}
+}
+
+// --- atomic stateEnter tmp naming ---
+
+func TestStateEnterAtomicTmpLeavesNoResidue(t *testing.T) {
+	e := fixture(t)
+	// A stale tmp file from a crashed earlier write shares the
+	// ".tmp-" prefix — the next stateEnter overwrites+renames it,
+	// leaving exactly the latch. The old "state-<n>.tmp" shape would
+	// have surfaced as a phantom hostmetrics watchdog_state series.
+	writeFile(t, filepath.Join(e.state, ".tmp-state-x"), "stale\n")
+
+	e.h.stateEnter("x", "")
+
+	entries, err := os.ReadDir(e.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{}
+	for _, en := range entries {
+		names = append(names, en.Name())
+	}
+	if len(names) != 1 || names[0] != "state-x" {
+		t.Fatalf("state dir after stateEnter=%v want [state-x] "+
+			"(tmp residue or wrong latch name)", names)
+	}
+}
