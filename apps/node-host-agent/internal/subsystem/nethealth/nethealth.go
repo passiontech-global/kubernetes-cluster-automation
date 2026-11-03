@@ -63,8 +63,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/systemd"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // Defaults mirror the shell modules + DaemonSet host mounts.

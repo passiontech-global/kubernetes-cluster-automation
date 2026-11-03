@@ -80,7 +80,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // Mode values — the shell script's dry-run default is preserved.

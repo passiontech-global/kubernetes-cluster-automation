@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/topology"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 // Target is one SSH-converge destination. Source flags are OR-merged

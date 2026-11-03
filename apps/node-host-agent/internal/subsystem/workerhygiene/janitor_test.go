@@ -13,7 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/systemd"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
 // jenv is the janitor fixture: tempdir state dir + fake procfs + a

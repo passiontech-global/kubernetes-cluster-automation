@@ -16,8 +16,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/etcdrescue"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/evpurge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdrescue"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
 )
 
 // env is the fixture: tempdir host trees + stubbed externals + a

@@ -54,7 +54,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostconfig"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 )
 
 const (

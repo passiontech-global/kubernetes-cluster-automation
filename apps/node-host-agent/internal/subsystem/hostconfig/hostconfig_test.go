@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/topology"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 type fakeRunner struct{ calls []string }

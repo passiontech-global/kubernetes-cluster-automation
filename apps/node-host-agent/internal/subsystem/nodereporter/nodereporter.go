@@ -41,7 +41,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/systemd"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
 // Defaults mirror the removed NPD config and the DaemonSet host mounts.

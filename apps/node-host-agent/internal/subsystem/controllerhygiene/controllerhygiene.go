@@ -79,9 +79,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/etcdrescue"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/evpurge"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/journalwatch"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdrescue"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
 )
 
 // Autofix modes — the shell *_AUTOFIX knobs are preserved verbatim:

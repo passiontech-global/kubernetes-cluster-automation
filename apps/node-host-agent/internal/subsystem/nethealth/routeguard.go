@@ -74,7 +74,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 const (

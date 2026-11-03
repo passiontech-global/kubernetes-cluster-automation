@@ -24,7 +24,7 @@
 // touched — deleting a last-* file would silently bypass cooldowns.
 //
 // B. Legacy/ghost systemd units — pruneLegacyWatchdog
-// (internal/hostconfig) removes the retired shell-watchdog unit
+// (internal/subsystem/hostconfig) removes the retired shell-watchdog unit
 // FILES, but systemd keeps runtime records: `Loaded: not-found
 // Active: failed` ghosts that never age out, and the occasional
 // not-found-but-active ghost still running retired code (the stray
@@ -53,7 +53,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/systemd"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
 const (

@@ -32,7 +32,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/topology"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 const (

@@ -108,9 +108,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/journalwatch"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/systemd"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // Defaults mirror the shell modules + the DaemonSet host mounts.

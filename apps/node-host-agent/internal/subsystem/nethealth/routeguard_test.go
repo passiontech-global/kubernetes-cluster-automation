@@ -14,7 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // --- netlink message decoding ---

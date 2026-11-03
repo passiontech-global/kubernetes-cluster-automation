@@ -23,13 +23,13 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/concourseinit"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/etcdrescue"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/evpurge"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostconfig"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostmetrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/kinedb"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/topology"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/concourseinit"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdrescue"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostconfig"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/kinedb"
 )
 
 // dispatch runs a subcommand selected by argv[0]/argv[1] and returns

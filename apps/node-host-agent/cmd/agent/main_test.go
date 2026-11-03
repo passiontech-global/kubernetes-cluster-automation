@@ -21,10 +21,10 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/apiprober"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostconfig"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/topology"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/apiprober"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 )
 
 func TestGetenv(t *testing.T) {
