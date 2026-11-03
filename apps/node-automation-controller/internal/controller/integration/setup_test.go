@@ -37,6 +37,10 @@ func TestSetupPeriodicModules(t *testing.T) {
 			func(m manager.Manager) error {
 				return SetupCertDriftAuditor(m, cs, testutil.StubDyn(), true)
 			}},
+		{"velero-backup-auditor", 15 * time.Minute,
+			func(m manager.Manager) error {
+				return SetupVeleroBackupAuditor(m, cs, testutil.StubDyn(), true)
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := testutil.NewStubManager()
@@ -72,6 +76,9 @@ func TestSetupFeatureFlagVariants(t *testing.T) {
 		}},
 		{"cert-drift-auditor", func(m manager.Manager) error {
 			return SetupCertDriftAuditor(m, cs, testutil.StubDyn(), false)
+		}},
+		{"velero-backup-auditor", func(m manager.Manager) error {
+			return SetupVeleroBackupAuditor(m, cs, testutil.StubDyn(), false)
 		}},
 	} {
 		t.Run(tc.name+"-disabled", func(t *testing.T) {

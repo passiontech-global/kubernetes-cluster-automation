@@ -255,7 +255,12 @@ func main() {
 		"clusterHealthProbes", mc.clusterHealthProbesEnabled,
 		"volumeAttachmentCleaner", mc.volumeAttachmentCleanerEnabled,
 		"pdbWatchdog", mc.pdbWatchdogEnabled,
-		"certDriftAuditor", mc.certDriftAuditorEnabled)
+		"certDriftAuditor", mc.certDriftAuditorEnabled,
+		"apiServiceGuard", mc.apiServiceGuardEnabled,
+		"zombieSidecarReaper", mc.zombieSidecarReaperEnabled,
+		"orphanEndpointSliceCleaner", mc.orphanEndpointSliceEnabled,
+		"statefulSetOnDeleteRoller", mc.statefulSetRollerEnabled,
+		"veleroBackupAuditor", mc.veleroBackupAuditorEnabled)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited")
 		os.Exit(1)
@@ -289,6 +294,11 @@ type moduleConfig struct {
 	volumeAttachmentCleanerEnabled bool
 	pdbWatchdogEnabled             bool
 	certDriftAuditorEnabled        bool
+	apiServiceGuardEnabled         bool
+	zombieSidecarReaperEnabled     bool
+	orphanEndpointSliceEnabled     bool
+	statefulSetRollerEnabled       bool
+	veleroBackupAuditorEnabled     bool
 }
 
 // moduleConfigFromEnv resolves every feature-gate env var once, after
@@ -329,6 +339,11 @@ func moduleConfigFromEnv() moduleConfig {
 		volumeAttachmentCleanerEnabled: os.Getenv("VOLUMEATTACHMENT_CLEANER_ENABLED") != "false",
 		pdbWatchdogEnabled:             os.Getenv("PDB_WATCHDOG_ENABLED") != "false",
 		certDriftAuditorEnabled:        os.Getenv("CERT_DRIFT_AUDITOR_ENABLED") != "false",
+		apiServiceGuardEnabled:         os.Getenv("APISERVICE_GUARD_ENABLED") != "false",
+		zombieSidecarReaperEnabled:     os.Getenv("ZOMBIE_SIDECAR_REAPER_ENABLED") != "false",
+		orphanEndpointSliceEnabled:     os.Getenv("ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED") != "false",
+		statefulSetRollerEnabled:       os.Getenv("STATEFULSET_ONDELETE_ROLLER_ENABLED") != "false",
+		veleroBackupAuditorEnabled:     os.Getenv("VELERO_BACKUP_AUDITOR_ENABLED") != "false",
 	}
 }
 
@@ -357,10 +372,13 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 				mc.cfTunnelWatchdogEnabled, mc.cfTunnelWatchdogNamespace,
 				mc.cfTunnelWatchdogInterval)
 		},
+		"statefulset-ondelete-roller": func() error {
+			return system.SetupStatefulSetOnDeleteRoller(mgr, cs, mc.statefulSetRollerEnabled)
+		},
 
 		// internal/controller/node — node lifecycle and health sweeps.
 		"cilium-taint-reaper":     func() error { return node.SetupCiliumTaintReaper(mgr, cs, mc.ciliumEnabled) },
-		"descheduler-storm-gate":  func() error { return node.SetupDeschedulerStormGate(mgr, cs) },
+		"descheduler-storm-gate":  func() error { return node.SetupDeschedulerStormGate(mgr, cs, dyn) },
 		"node-labeler":            func() error { return node.SetupNodeLabeler(mgr, cs, mc.labelerPath) },
 		"kubelet-liveness-reaper": func() error { return node.SetupKubeletReaper(mgr, cs) },
 		"partition-pod-evictor":   func() error { return node.SetupPartitionEvictor(mgr, cs) },
@@ -371,17 +389,26 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 		// internal/controller/apiserver — apiserver integrity guards.
 		"admission-webhook-guard":  func() error { return apiserver.SetupWebhookGuard(mgr, cs) },
 		"apiserver-endpoint-guard": func() error { return apiserver.SetupAPIServerEndpointGuard(mgr, cs) },
+		"apiservice-guard": func() error {
+			return apiserver.SetupAPIServiceGuard(mgr, cs, dyn, mc.apiServiceGuardEnabled)
+		},
 
 		// internal/controller/janitor — resource cleanup sweeps.
 		"failed-jobs-janitor": func() error { return janitor.SetupFailedJobsJanitor(mgr, cs) },
 		"evicted-pod-janitor": func() error { return janitor.SetupEvictedPodJanitor(mgr, cs) },
 		"cronjob-catchup":     func() error { return janitor.SetupCronJobCatchup(mgr, cs) },
 		"concourse-workdir-janitor": func() error {
-			return janitor.SetupConcourseWorkdirJanitor(mgr, cs,
+			return janitor.SetupConcourseWorkdirJanitor(mgr, cs, dyn,
 				mc.concourseJanitorEnabled)
 		},
 		"volumeattachment-cleaner": func() error {
 			return janitor.SetupVolumeAttachmentCleaner(mgr, cs, mc.volumeAttachmentCleanerEnabled)
+		},
+		"zombie-sidecar-reaper": func() error {
+			return janitor.SetupZombieSidecarReaper(mgr, cs, dyn, mc.zombieSidecarReaperEnabled)
+		},
+		"orphan-endpointslice-cleaner": func() error {
+			return janitor.SetupOrphanEndpointSliceCleaner(mgr, cs, dyn, mc.orphanEndpointSliceEnabled)
 		},
 
 		// internal/controller/integration — third-party controller
@@ -392,6 +419,9 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 		"cilium-identity-auditor": func() error { return integration.SetupCiliumIdentityAuditor(mgr, cs, dyn, mc.ciliumAuditEnabled) },
 		"cert-drift-auditor": func() error {
 			return integration.SetupCertDriftAuditor(mgr, cs, dyn, mc.certDriftAuditorEnabled)
+		},
+		"velero-backup-auditor": func() error {
+			return integration.SetupVeleroBackupAuditor(mgr, cs, dyn, mc.veleroBackupAuditorEnabled)
 		},
 
 		// internal/controller/health — cluster health probes.

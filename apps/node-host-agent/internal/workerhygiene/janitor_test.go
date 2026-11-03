@@ -439,3 +439,26 @@ func TestJanitorRunDisabledIdles(t *testing.T) {
 		t.Fatal("disabled janitor Run did not return on ctx cancel")
 	}
 }
+
+// The wave-2 latches (A4/B1/B4/A2) must be registered in
+// knownLatchNames — sweepLatches deletes unregistered state-* files
+// immediately, so a missing entry would eat the latch the moment a
+// check writes it.
+func TestJanitorNewWave2LatchesAreKnown(t *testing.T) {
+	e := jfixture(t)
+	for _, n := range []string{
+		"kubelet-syncloop-down", "containerd-sock-down",
+		"cilium-envoy-down", "cilium-mtu-drift", "zombie-storm",
+	} {
+		writeFile(t, filepath.Join(e.state, "state-"+n), "1\n")
+	}
+	e.j.Sweep(context.Background())
+	for _, n := range []string{
+		"kubelet-syncloop-down", "containerd-sock-down",
+		"cilium-envoy-down", "cilium-mtu-drift", "zombie-storm",
+	} {
+		if !fileExists(filepath.Join(e.state, "state-"+n)) {
+			t.Fatalf("registered latch state-%s was reaped as unknown", n)
+		}
+	}
+}

@@ -341,6 +341,8 @@ func TestSelfHealActionReasons(t *testing.T) {
 		{"FailedCreatePodSandBox: Allocating IPv4: no more IPs available", "CiliumIPAMExhausted"},
 		{"ACTION: removed corrupted image registry.local/app@sha256:dead - content digest not found", "CorruptedImageRemoved"},
 		{"ACTION: removed corrupted image docker.io/library/nginx:1.25 - failed to extract layer", "CorruptedImageRemoved"},
+		{"ACTION zombie-storm: pod_uid=11111111-2222-3333-4444-555555555555 zombies=640 ppid=777", "ZombieProcessStorm"},
+		{"ACTION cilium-mtu-drift: cilium=1500 nebula=1300", "CiliumMTUExceedsOverlay"},
 	}
 	for _, l := range lines {
 		e.appendLog(t, l.msg)

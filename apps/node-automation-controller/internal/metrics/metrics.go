@@ -134,6 +134,89 @@ var KCMWorkqueueFrozen = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while KCM renews its Lease but stops reconciling objects.",
 }, []string{"reason"})
 
+// ---------------------------------------------------------------------------
+// Waves 1-3 operations metrics (2.1-2.7 + A/B/C groups).
+// ---------------------------------------------------------------------------
+
+// APIServiceUnavailable marks (1) aggregated APIServices whose
+// Available=False condition persisted past the guard threshold
+// (apiservice-guard, 2.3).
+var APIServiceUnavailable = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_apiservice_unavailable",
+	Help: "1 while the aggregated APIService reports Available=False past the audit threshold.",
+}, []string{"name", "service_namespace", "service_name"})
+
+// WebhookCABundleDaysToExpiry exposes days until each webhook
+// clientConfig.caBundle certificate expires (cert-drift-auditor, 2.4).
+var WebhookCABundleDaysToExpiry = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_webhook_ca_bundle_days_to_expiry",
+	Help: "Days until the clientConfig.caBundle certificate of the named sub-webhook expires.",
+}, []string{"kind", "name", "webhook"})
+
+// TrustBundleDaysToExpiry exposes days until the earliest certificate
+// in a trust-bundle ConfigMap/Secret expires (cert-drift-auditor, 2.4).
+var TrustBundleDaysToExpiry = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_trust_bundle_days_to_expiry",
+	Help: "Days until the earliest certificate in the trust bundle expires.",
+}, []string{"namespace", "name"})
+
+// UnmeshedPods marks (1) Running Pods that should carry a linkerd-proxy
+// sidecar but do not (unmeshed-pod-auditor, 2.2).
+var UnmeshedPods = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_unmeshed_pods",
+	Help: "1 while the Pod runs without the injected linkerd-proxy sidecar despite injection being enabled.",
+}, []string{"namespace", "pod"})
+
+// UnmeshedPodsRecreatedTotal counts unmeshed Pods deleted for
+// re-creation once the injector webhook is healthy again.
+var UnmeshedPodsRecreatedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_unmeshed_pods_recreated_total",
+	Help: "Unmeshed Pods deleted so their controller recreates them with the sidecar.",
+}, []string{"namespace"})
+
+// ZombieSidecarPodsReapedTotal counts Job Pods reaped because the
+// linkerd sidecar kept them Running after the app exited (B2).
+var ZombieSidecarPodsReapedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_zombie_sidecar_pods_reaped_total",
+	Help: "Job Pods reaped while a lingering sidecar kept them Running after the app terminated.",
+}, []string{"namespace"})
+
+// OrphanEndpointSlicesCleanedTotal counts EndpointSlices deleted after
+// their parent Service disappeared (orphan-endpointslice-cleaner, C4).
+var OrphanEndpointSlicesCleanedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_orphan_endpointslices_cleaned_total",
+	Help: "Orphaned EndpointSlices reaped after their Service no longer exists.",
+}, []string{"namespace"})
+
+// FluxSourceReconcilesTriggeredTotal counts reconcile requests patched
+// onto Flux source objects when a consumer reported a stale/missing
+// artifact (Flux source healer, C1).
+var FluxSourceReconcilesTriggeredTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_flux_source_reconciles_triggered_total",
+	Help: "reconcile.fluxcd.io/requestedAt nudges applied to Flux source objects.",
+}, []string{"kind", "namespace", "name"})
+
+// StatefulSetOnDeletePodsRolledTotal counts Pods deleted by the opt-in
+// OnDelete rolling helper (statefulset-ondelete-roller, C2).
+var StatefulSetOnDeletePodsRolledTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_statefulset_ondelete_pods_rolled_total",
+	Help: "StatefulSet Pods deleted one-at-a-time to complete an OnDelete update.",
+}, []string{"namespace", "statefulset"})
+
+// VeleroSchedulePaused marks (1) velero.io Schedules left paused past
+// the audit threshold (velero-backup-auditor, C3).
+var VeleroSchedulePaused = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_velero_schedule_paused",
+	Help: "1 while the Velero Schedule has spec.paused=true past the audit threshold.",
+}, []string{"namespace", "schedule"})
+
+// VeleroBackupEmptyOrErrored marks (1) Schedules whose latest Backup
+// completed with zero items/bytes or non-zero errors/warnings (C3).
+var VeleroBackupEmptyOrErrored = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_velero_backup_empty_or_errored",
+	Help: "1 while the Schedule's latest Backup completed empty/errored/warned.",
+}, []string{"namespace", "schedule", "reason"})
+
 // queues are the legacy shell-operator queue names — pre-instantiated
 // at 0 so /metrics always exposes every series (an empty CounterVec
 // emits nothing, and shell-operator emitted its counters eagerly).
@@ -142,6 +225,7 @@ var queues = []string{
 	"node-labeler", "fluent-bit-config-roller", "coredns-stale-watchdog",
 	"kubelet-liveness-reaper", "admission-webhook-guard",
 	"partition-pod-evictor", "failed-jobs-janitor",
+	"concourse-workdir-janitor",
 	// remediation modules (v0.2.0)
 	"dead-node-sweeper", "helmrelease-unlocker", "externalsecret-nudge",
 	"evicted-pod-janitor", "cronjob-catchup", "certmanager-reaper",
@@ -155,6 +239,10 @@ var queues = []string{
 	// self-healing / gray-failure defense modules
 	"pdb-deadlock-watchdog", "volumeattachment-cleaner",
 	"cert-drift-auditor",
+	// waves 1-3 operations modules
+	"apiservice-guard", "zombie-sidecar-reaper",
+	"orphan-endpointslice-cleaner", "statefulset-ondelete-roller",
+	"velero-backup-auditor",
 }
 
 func init() {
@@ -166,7 +254,14 @@ func init() {
 		PDBDrainBlocked, StuckTerminatingResources,
 		HelmHookJobsCleanedTotal, VolumeAttachmentsCleanedTotal,
 		WebhookCABundleMismatch, TLSSecretDaysToExpiry,
-		KCMWorkqueueFrozen)
+		KCMWorkqueueFrozen,
+		APIServiceUnavailable, WebhookCABundleDaysToExpiry,
+		TrustBundleDaysToExpiry, UnmeshedPods,
+		UnmeshedPodsRecreatedTotal, ZombieSidecarPodsReapedTotal,
+		OrphanEndpointSlicesCleanedTotal,
+		FluxSourceReconcilesTriggeredTotal,
+		StatefulSetOnDeletePodsRolledTotal, VeleroSchedulePaused,
+		VeleroBackupEmptyOrErrored)
 	for _, q := range queues {
 		hookRunErrors.WithLabelValues(q)
 		reconcileErrors.WithLabelValues(q)

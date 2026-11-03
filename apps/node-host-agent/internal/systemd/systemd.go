@@ -22,6 +22,7 @@
 package systemd
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -30,6 +31,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -62,6 +64,13 @@ type Config struct {
 	// argv BEFORE RunCmd sees it, so a fake runner observes the exact
 	// production command line.
 	RunCmd func(ctx context.Context, argv []string) (string, error)
+	// RunCmdCombined is RunCmd with the child's STDERR folded into
+	// the returned output — ExecCombined's seam. Needed for probes
+	// whose evidence lives on stderr (journalctl prints
+	// "File ... is corrupt" to stderr, not stdout). nil →
+	// exec.CommandContext writing both streams into one capped
+	// buffer.
+	RunCmdCombined func(ctx context.Context, argv []string) (string, error)
 	// ProcUptimeFile is read by ActiveAge to turn the unit's
 	// monotonic-since-boot activation timestamp into an age.
 	ProcUptimeFile string
@@ -95,6 +104,46 @@ func (c *Config) applyDefaults() {
 			return string(out), cmd.Wait()
 		}
 	}
+	if c.RunCmdCombined == nil {
+		c.RunCmdCombined = func(ctx context.Context, argv []string) (string, error) {
+			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+			// Both streams share one capped sink — the child never
+			// blocks on an unread stderr pipe, and output over the
+			// cap is swallowed (same budget as the stdout path).
+			var buf cappedBuffer
+			cmd.Stdout = &buf
+			cmd.Stderr = &buf
+			// Run waits for the copy goroutines — buf is complete
+			// once it returns (partial output alongside an error,
+			// same contract as the stdout path).
+			err := cmd.Run()
+			return buf.String(), err
+		}
+	}
+}
+
+// cappedBuffer is a goroutine-safe io.Writer retaining at most
+// maxCmdOutputBytes — the combined runner's stdout+stderr sink
+// (exec copies each stream on its own goroutine; excess is
+// swallowed so the child still exits cleanly).
+type cappedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.buf.Len() < maxCmdOutputBytes {
+		b.buf.Write(p)
+	}
+	return len(p), nil
+}
+
+func (b *cappedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // Client runs host systemd commands.
@@ -113,14 +162,32 @@ func New(cfg Config) *Client {
 // share the same nsenter path. ctx is additionally bounded by
 // Config.Timeout.
 func (c *Client) Exec(ctx context.Context, name string, args ...string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+	defer cancel()
+	return c.cfg.RunCmd(cctx, c.hostArgv(name, args))
+}
+
+// ExecCombined is Exec with the child's STDERR folded into the
+// returned output — for probes whose evidence lives off stdout
+// (journalctl reports corrupt journal files on STDERR; a
+// stdout-only capture makes the "corrupt" substring check dead
+// code). Callers that only want stdout keep Exec — the signature
+// contract is unchanged.
+func (c *Client) ExecCombined(ctx context.Context, name string, args ...string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+	defer cancel()
+	return c.cfg.RunCmdCombined(cctx, c.hostArgv(name, args))
+}
+
+// hostArgv applies the nsenter host-namespace wrap — shared by
+// Exec and ExecCombined.
+func (c *Client) hostArgv(name string, args []string) []string {
 	argv := append([]string{name}, args...)
 	if c.cfg.HostRoot != "/" {
 		argv = append([]string{"nsenter", "-t", "1",
 			"-m", "-u", "-i", "-n", "-p", "--"}, argv...)
 	}
-	cctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
-	defer cancel()
-	return c.cfg.RunCmd(cctx, argv)
+	return argv
 }
 
 func (c *Client) systemctl(ctx context.Context, args ...string) (string, error) {
@@ -360,10 +427,17 @@ func (c *Client) DaemonReload(ctx context.Context) error {
 
 // Journal mirrors `journalctl -u <unit> --since <since> --no-pager` —
 // the shared k0sworker -10min snapshot the runner dumped once per
-// watchdog run for modules 05/06. A journald error returns the error
-// with whatever partial output came back (empty is fine — callers
-// count grep hits, an empty journal means zero hits, and a fetch
-// failure is logged, never fatal).
+// watchdog run for modules 05/06. Stderr is folded in via
+// ExecCombined: journald reports corrupt journal files on STDERR
+// ("File /var/log/journal/... is corrupt") and the A5 integrity
+// check's "corrupt" substring test is dead code without it — the
+// extra diagnostic lines can't false-positive the 05/06 signature
+// greps (they match k0sworker log content, not journalctl notices).
+// A journald error returns the error with whatever partial output
+// came back (empty is fine — callers count grep hits, an empty
+// journal means zero hits, and a fetch failure is logged, never
+// fatal).
 func (c *Client) Journal(ctx context.Context, unit, since string) (string, error) {
-	return c.Exec(ctx, "journalctl", "-u", unit, "--since", since, "--no-pager")
+	return c.ExecCombined(ctx, "journalctl",
+		"-u", unit, "--since", since, "--no-pager")
 }

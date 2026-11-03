@@ -936,3 +936,105 @@ func TestConntrackFlushOnNebulaRestart(t *testing.T) {
 		t.Fatalf("stale udp/53 conntrack not flushed, cmds=%v", e.cmds)
 	}
 }
+
+// --- B3: per-peer nebula udp/<port> conntrack flush ---
+
+// countCmds returns how many recorded host commands contain sub.
+func countCmds(e *env, sub string) int {
+	n := 0
+	for _, c := range e.cmds {
+		if strings.Contains(strings.Join(c, " "), sub) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestNebulaIsolatedFlushesPeerConntrack(t *testing.T) {
+	e := nebulaEnv(t, nil)
+	// Every underlay probe target dead → dataplane isolated. Only the
+	// peer underlay IPs (OVERLAY_PROBE_TARGETS) are flushed — marker
+	// IPs are overlay addresses conntrack never records.
+	for _, ip := range []string{"10.8.0.1", "10.8.0.2", "10.8.1.1", "10.8.1.2"} {
+		e.pingOK[ip+"|false"] = false
+	}
+	e.n.Cycle(context.Background())
+	if !stateExists(e, "nebula-isolated") {
+		t.Fatal("isolated latch missing on dataplane dead")
+	}
+	for _, ip := range []string{"10.8.0.1", "10.8.0.2"} {
+		if !e.cmdRan("conntrack -D -p udp --dport 45670 -d " + ip) {
+			t.Fatalf("no per-peer conntrack flush for %s, cmds=%v", ip, e.cmds)
+		}
+	}
+	if e.cmdRan("-d 10.8.1.1") || e.cmdRan("-d 10.8.1.2") {
+		t.Fatalf("marker (overlay) IPs flushed — only underlay peers allowed, cmds=%v", e.cmds)
+	}
+	// Edge-only: a second cycle still isolated must NOT re-flush.
+	e.cmds = nil
+	e.n.Cycle(context.Background())
+	if got := countCmds(e, "conntrack -D -p udp --dport 45670 -d"); got != 0 {
+		t.Fatalf("peer flush re-ran while already isolated (%d flushes), cmds=%v", got, e.cmds)
+	}
+}
+
+func TestEgressSwitchFlushesPeerConntrack(t *testing.T) {
+	e := overlayEnv(t, nil)
+	e.cmdReply["rule list pref 1500"] = ""
+	// Underlay dead → committed state flips direct -> relay; the
+	// peer's udp/<nebula-port> conntrack gets flushed.
+	e.tcpOK["8.8.8.8:53"] = false
+	e.pingOK["8.8.8.8|true"] = false
+	e.n.Cycle(context.Background())
+	if got := readFile(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
+		t.Fatalf("committed=%q want relay", got)
+	}
+	if !e.cmdRan("conntrack -D -p udp --dport 45670 -d 8.8.8.8") {
+		t.Fatalf("no per-peer conntrack flush on egress switch, cmds=%v", e.cmds)
+	}
+}
+
+func TestEgressRecoveryFlushesPeerConntrack(t *testing.T) {
+	e := overlayEnv(t, nil)
+	e.cmdReply["rule list pref 1500"] = "1500:\tfrom all to 8.8.8.8 lookup 100\n"
+	writeFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
+	e.pingOK["8.8.8.8|true"] = true // underlay back
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background()) // 2nd fresh probe → flip to direct
+	if got := readFile(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "direct" {
+		t.Fatalf("committed=%q want direct", got)
+	}
+	if !e.cmdRan("conntrack -D -p udp --dport 45670 -d 8.8.8.8") {
+		t.Fatalf("no per-peer conntrack flush on egress recovery, cmds=%v", e.cmds)
+	}
+}
+
+func TestPeerConntrackFlushHonoursNebulaPort(t *testing.T) {
+	e := overlayEnv(t, func(wd *watchdogconf.Config) {
+		wd.NebulaPort = 45671
+	})
+	e.cmdReply["rule list pref 1500"] = ""
+	e.tcpOK["8.8.8.8:53"] = false
+	e.pingOK["8.8.8.8|true"] = false
+	e.n.Cycle(context.Background())
+	if !e.cmdRan("conntrack -D -p udp --dport 45671 -d 8.8.8.8") {
+		t.Fatalf("flush used wrong port, cmds=%v", e.cmds)
+	}
+}
+
+func TestPeerConntrackFlushBestEffort(t *testing.T) {
+	e := overlayEnv(t, nil)
+	e.cmdReply["rule list pref 1500"] = ""
+	e.tcpOK["8.8.8.8:53"] = false
+	e.pingOK["8.8.8.8|true"] = false
+	e.cmdFail["conntrack"] = true // binary absent → skip, never fail
+	e.n.Cycle(context.Background())
+	// The relay commit still lands — a missing conntrack binary must
+	// never block the path switch.
+	if got := readFile(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
+		t.Fatalf("committed=%q want relay", got)
+	}
+	if !strings.Contains(logLines(t, e), "flush 8.8.8.8 skipped") {
+		t.Fatalf("missing flush-skip log:\n%s", logLines(t, e))
+	}
+}

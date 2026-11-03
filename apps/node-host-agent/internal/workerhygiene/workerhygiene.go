@@ -102,6 +102,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -176,21 +177,48 @@ const (
 	defaultAPIFallbackURL = "https://localhost:7443/livez"
 	kubeletWdProbeTimeout = 5 * time.Second
 	apiLivezProbeTimeout  = 5 * time.Second
+	// A4 (PLEG/containerd probes), A3 (ingest GC), A2 (zombie
+	// storm), A5 (journald integrity), B1 (cilium-envoy), B4 (MTU
+	// drift) — defaults mirror the same /host mount convention.
+	defaultKubeletSyncloopURL  = "https://127.0.0.1:10250/healthz/syncloop"
+	defaultContainerdSocket    = "/host/run/k0s/containerd/containerd.sock"
+	defaultCiliumEnvoyReadyURL = "http://127.0.0.1:9964/ready"
+	defaultCtrIngestDir        = "/host/var/lib/k0s/containerd/io.containerd.content.v1.content/ingest"
+	defaultK0sDataDir          = "/host/var/lib/k0s"
+	defaultSysClassNet         = "/sys/class/net"
+	defaultNebulaIface         = "neb1"
+	defaultCiliumIface         = "cilium_net"
+	defaultCiliumRuntimeConfig = "/host/run/cilium/state/agent-runtime-config.json"
+	unixSockProbeTimeout       = 5 * time.Second
+	zombieStormThreshold       = 500 // <defunct> children of one parent = storm
+	ctrIngestMaxAge            = 3 * time.Hour
+	ctrIngestScanInterval      = 6 * time.Hour
+	k0sDiskHighWatermark       = 0.75
+	// journaldVacuumInterval bounds how often the A5 remedy runs —
+	// journalctl --rotate is cheap but --vacuum-time does real IO.
+	journaldVacuumInterval = 30 * time.Minute
 )
 
 // Check names — prometheus `check` label + log context.
 const (
-	checkTeardown   = "pod-teardown"
-	checkKonn       = "konnectivity"
-	checkDNS        = "dns-resolv"
-	checkStall      = "kubelet-stall"
-	checkWatch      = "kubelet-watch-wedge"
-	checkCtrTasks   = "ctr-tasks"
-	checkCilium     = "cilium"
-	checkCiliumInit = "cilium-init-stuck"
-	checkCtrImages  = "ctr-image-healer" // 37
-	checkCiliumIPAM = "cilium-ipam"      // 38
-	checkKubeletWd  = "kubelet-watchdog" // T15 feeder + remediate
+	checkTeardown    = "pod-teardown"
+	checkKonn        = "konnectivity"
+	checkDNS         = "dns-resolv"
+	checkStall       = "kubelet-stall"
+	checkWatch       = "kubelet-watch-wedge"
+	checkCtrTasks    = "ctr-tasks"
+	checkCilium      = "cilium"
+	checkCiliumInit  = "cilium-init-stuck"
+	checkCtrImages   = "ctr-image-healer"   // 37
+	checkCiliumIPAM  = "cilium-ipam"        // 38
+	checkKubeletWd   = "kubelet-watchdog"   // T15 feeder + remediate
+	checkSyncloop    = "kubelet-syncloop"   // A4 PLEG probe
+	checkCtrSock     = "containerd-sock"    // A4 socket hang probe
+	checkIngestGC    = "ctr-ingest-gc"      // 39 (A3)
+	checkZombieStorm = "zombie-storm"       // A2
+	checkJournald    = "journald-integrity" // A5
+	checkCiliumEnvoy = "cilium-envoy"       // B1
+	checkCiliumMTU   = "cilium-mtu"         // B4
 )
 
 // Config carries the hygiene knobs — all test-injectable.
@@ -253,6 +281,22 @@ type Config struct {
 	ConsecNeeded       int           // consecutive suspect cycles before action
 	MinRestartInterval time.Duration // rate-limit budget for recreating actions
 	ProbeGap           time.Duration // sleep between probe retries (05/32)
+	// Wave-2 checks: A4 syncloop/containerd probes, A3 ingest GC,
+	// A2 zombie storm, A5 journald integrity, B1 cilium-envoy, B4
+	// MTU drift — all default-injected like the other knobs.
+	KubeletSyncloopURL    string        // kubelet :10250 /healthz/syncloop (PLEG)
+	ContainerdSocket      string        // containerd grpc unix socket under /host/run
+	CiliumEnvoyReadyURL   string        // cilium-envoy admin :9964/ready
+	CtrIngestDir          string        // containerd content ingest dir (39)
+	K0sDataDir            string        // /var/lib/k0s — disk-high ingest-GC trigger
+	SysClassNet           string        // /sys/class/net — MTU reads (B4)
+	NebulaIface           string        // overlay iface MTU baseline (neb1 = 1300)
+	CiliumIface           string        // cilium host iface (cilium_net)
+	CiliumRuntimeConfig   string        // agent-runtime-config.json MTU fallback
+	ZombieStormThreshold  int           // defunct children of one parent → storm
+	CtrIngestMaxAge       time.Duration // ingest dir mtime older than → stale (3h)
+	CtrIngestScanInterval time.Duration // periodic rescan even under disk WM (6h)
+	K0sDiskHighWatermark  float64       // /var/lib/k0s used ratio triggering GC
 
 	// killFn delivers signals — seam for tests (SIGKILL on pause /
 	// proxy-agent/shim/cilium pids, and signal-0 liveness probes).
@@ -273,11 +317,33 @@ type Config struct {
 	// journalFn returns the k0sworker journal window — the runner's
 	// shared -10min snapshot (05/06). nil → Systemd.Journal.
 	journalFn func(ctx context.Context) (string, error)
+	// journalAnyFn is the A5 second probe — `journalctl -n 1
+	// --no-pager` with NO unit filter. An empty k0sworker window is
+	// only corruption evidence when journald ITSELF has nothing (or
+	// only corrupt warnings) to say — a quiet unit on a healthy
+	// journald must not trigger the rotate+vacuum remedy. nil →
+	// Systemd.ExecCombined (stderr folded in — journald's own
+	// diagnostics, e.g. "File ... is corrupt", never reach stdout).
+	journalAnyFn func(ctx context.Context) (string, error)
 	// probeBodyOK does one GET and reports whether the trimmed body is
 	// exactly "ok" — the :10248 healthz contract (curl -s body compare
 	// parity: a wedged kubelet can still answer HTTP with a non-ok
 	// body, so any-HTTP-code-alive is not enough here). Seam.
 	probeBodyOK func(ctx context.Context, url string, timeout time.Duration) bool
+	// probeHTTPStatus does one GET and returns the status code — the
+	// probeHTTP variant for endpoints where the CODE is the verdict
+	// (syncloop 500 vs healthz 200, envoy /ready 503). Seam.
+	probeHTTPStatus func(ctx context.Context, url string, timeout time.Duration) (int, error)
+	// probeUnixSock connects to a unix socket under a deadline — the
+	// containerd-socket hang probe (A4). Seam.
+	probeUnixSock func(ctx context.Context, socket string, timeout time.Duration) error
+	// statfsFn reads fs usage for the ingest-GC disk trigger (A3).
+	// Seam for tests (default unix.Statfs).
+	statfsFn func(string, *unix.Statfs_t) error
+	// ctrRmIngest removes one stale ingest ref — `k0s ctr -n k8s.io
+	// content ingest rm <ref>` via the systemd exec wrapper (A3).
+	// nil → Systemd.Exec default. Seam.
+	ctrRmIngest func(ctx context.Context, ref string) error
 }
 
 func (c *Config) applyDefaults() {
@@ -358,6 +424,45 @@ func (c *Config) applyDefaults() {
 	}
 	if c.APIFallbackURL == "" {
 		c.APIFallbackURL = defaultAPIFallbackURL
+	}
+	if c.KubeletSyncloopURL == "" {
+		c.KubeletSyncloopURL = defaultKubeletSyncloopURL
+	}
+	if c.ContainerdSocket == "" {
+		c.ContainerdSocket = defaultContainerdSocket
+	}
+	if c.CiliumEnvoyReadyURL == "" {
+		c.CiliumEnvoyReadyURL = defaultCiliumEnvoyReadyURL
+	}
+	if c.CtrIngestDir == "" {
+		c.CtrIngestDir = defaultCtrIngestDir
+	}
+	if c.K0sDataDir == "" {
+		c.K0sDataDir = defaultK0sDataDir
+	}
+	if c.SysClassNet == "" {
+		c.SysClassNet = defaultSysClassNet
+	}
+	if c.NebulaIface == "" {
+		c.NebulaIface = defaultNebulaIface
+	}
+	if c.CiliumIface == "" {
+		c.CiliumIface = defaultCiliumIface
+	}
+	if c.CiliumRuntimeConfig == "" {
+		c.CiliumRuntimeConfig = defaultCiliumRuntimeConfig
+	}
+	if c.ZombieStormThreshold <= 0 {
+		c.ZombieStormThreshold = zombieStormThreshold
+	}
+	if c.CtrIngestMaxAge <= 0 {
+		c.CtrIngestMaxAge = ctrIngestMaxAge
+	}
+	if c.CtrIngestScanInterval <= 0 {
+		c.CtrIngestScanInterval = ctrIngestScanInterval
+	}
+	if c.K0sDiskHighWatermark <= 0 {
+		c.K0sDiskHighWatermark = k0sDiskHighWatermark
 	}
 	if c.killFn == nil {
 		c.killFn = func(pid int, sig syscall.Signal) error {
@@ -446,6 +551,16 @@ func (c *Config) applyDefaults() {
 			return sd.Journal(ctx, "k0sworker.service", journalWindow)
 		}
 	}
+	if c.journalAnyFn == nil {
+		sd := c.Systemd
+		c.journalAnyFn = func(ctx context.Context) (string, error) {
+			if sd == nil {
+				return "", nil
+			}
+			return sd.ExecCombined(ctx,
+				"journalctl", "-n", "1", "--no-pager")
+		}
+	}
 	if c.probeBodyOK == nil {
 		// kubelet :10248 contract (curl -s parity): the healthz port is
 		// unauthenticated plaintext and the body must be exactly "ok" —
@@ -467,6 +582,56 @@ func (c *Config) applyDefaults() {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			return strings.TrimSpace(string(body)) == "ok"
+		}
+	}
+	if c.probeHTTPStatus == nil {
+		// Same insecure-TLS transport as probeHTTP — the status code
+		// is the verdict (syncloop 500, envoy /ready 503).
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
+		tr.IdleConnTimeout = 90 * time.Second
+		client := &http.Client{Transport: tr}
+		c.probeHTTPStatus = func(ctx context.Context, url string, timeout time.Duration) (int, error) {
+			pctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
+			if err != nil {
+				return 0, err
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+			return resp.StatusCode, nil
+		}
+	}
+	if c.probeUnixSock == nil {
+		c.probeUnixSock = func(ctx context.Context, socket string, timeout time.Duration) error {
+			d := net.Dialer{Timeout: timeout}
+			conn, err := d.DialContext(ctx, "unix", socket)
+			if err != nil {
+				return err
+			}
+			// A successful dial IS the verdict — a close error
+			// (e.g. the peer reset first) must not downgrade it.
+			_ = conn.Close()
+			return nil
+		}
+	}
+	if c.statfsFn == nil {
+		c.statfsFn = unix.Statfs
+	}
+	if c.ctrRmIngest == nil {
+		sd := c.Systemd
+		c.ctrRmIngest = func(ctx context.Context, ref string) error {
+			if sd == nil {
+				return fmt.Errorf("no systemd client wired")
+			}
+			_, err := sd.Exec(ctx,
+				"k0s", "ctr", "-n", "k8s.io", "content", "ingest", "rm", ref)
+			return err
 		}
 	}
 }
@@ -508,6 +673,11 @@ var (
 		`content digest sha256:[0-9a-f]+: not found|` +
 			`failed to extract layer|` +
 			`parent snapshot .* does not exist`)
+	// Pod UID inside a /proc/<pid>/cgroup path — kubepods slices
+	// embed it with underscores
+	// (kubepods-burstable-pod<8_4_4_4_12>.slice), some runtimes keep
+	// dashes; both normalize to the dashed form.
+	podUIDCgroupRe = regexp.MustCompile(`pod([0-9a-fA-F_-]{36})`)
 )
 
 // Hygiene runs the worker checks on one ticker.
@@ -536,6 +706,27 @@ type Hygiene struct {
 	kubeletFeederWasActive bool
 	taskMapBuilds          int // buildTaskMap invocation count (tests)
 
+	// Wave-2 counters/state: A4 syncloop + containerd-sock, A3
+	// ingest GC, A2 zombie storm (per-parent streaks), A5 journald,
+	// B1 cilium-envoy, B4 MTU drift.
+	syncloopFails int
+	ctrsockFails  int
+	envoyFails    int
+	journaldFails int
+	// zombieStreaks counts consecutive cycles each parent has
+	// produced > ZombieStormThreshold defunct children (A2). Keyed
+	// by zombieParent (pid + stat starttime), NOT raw pid — a pid
+	// recycled between cycles must not inherit a dead process's
+	// streak and hold the latch open for a storm that is over.
+	zombieStreaks map[zombieParent]int
+	// ciliumAgentKilled is set by killCiliumAgent — B1 restarts
+	// cilium-envoy the same cycle so its xDS listener can't hold a
+	// stale socket across the agent restart.
+	ciliumAgentKilled bool
+	// lastIngestScan is the last time the ingest GC walked the
+	// ingest dir — the 6h periodic trigger (A3).
+	lastIngestScan time.Time
+
 	// rateMu serialises rate-budget check+spend pairs: the feeder
 	// goroutine (remediate G5/G6) and Cycle checks compete for the
 	// shared "last-restart" budget — an unlocked check-then-spend
@@ -547,12 +738,14 @@ type Hygiene struct {
 	actions         *prometheus.CounterVec // check, action
 	ciliumAllocated prometheus.Gauge       // cilium IPAM allocated IPs (38)
 	ciliumLeaked    prometheus.Gauge       // allocated − in-use (38)
+	// ctrIngestsCleaned counts ingest dirs removed by the A3 GC.
+	ctrIngestsCleaned prometheus.Counter
 }
 
 // New returns a Hygiene and registers its metrics on reg.
 func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	cfg.applyDefaults()
-	h := &Hygiene{cfg: cfg}
+	h := &Hygiene{cfg: cfg, zombieStreaks: map[zombieParent]int{}}
 
 	h.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_workerhygiene_cycles_total",
@@ -571,10 +764,15 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		Name: "node_host_agent_workerhygiene_cilium_leaked_ips",
 		Help: "Allocated cilium IPs not held by a non-hostNetwork Running pod on this node (leaked).",
 	})
+	h.ctrIngestsCleaned = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "node_host_agent_workerhygiene_ctr_ingests_cleaned_total",
+		Help: "Stale containerd content ingest dirs removed by the ingest GC (39).",
+	})
 
 	if reg != nil {
 		for _, c := range []prometheus.Collector{
 			h.cycles, h.actions, h.ciliumAllocated, h.ciliumLeaked,
+			h.ctrIngestsCleaned,
 		} {
 			if err := reg.Register(c); err != nil {
 				return nil, fmt.Errorf("register workerhygiene metrics: %w", err)
@@ -705,6 +903,9 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 			workerActive = active
 		}
 	}
+	// B1: an agent kill this cycle also restarts cilium-envoy — the
+	// flag is reset before any check runs.
+	h.ciliumAgentKilled = false
 	sigOn := func(name string) bool {
 		return h.cfg.Watchdog == nil || h.cfg.Watchdog.SignalEnabled(name)
 	}
@@ -730,8 +931,17 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	run(checkDNS, func() {
 		h.checkDNSResolvDrift(pods, apiOK, tasksOnce, workerActive)
 	})
+	run(checkSyncloop, func() {
+		h.checkKubeletSyncloop(ctx, workerActive)
+	})
+	run(checkCtrSock, func() {
+		h.checkContainerdSock(ctx, workerActive)
+	})
 	run(checkCtrTasks, func() {
 		h.checkCtrTasks(ctx, workerActive)
+	})
+	run(checkIngestGC, func() {
+		h.checkCtrIngestGC(ctx, workerActive)
 	})
 	run(checkCilium, func() {
 		h.checkCilium(ctx, apiOK, workerActive)
@@ -744,6 +954,18 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	})
 	run(checkCiliumIPAM, func() {
 		h.checkCiliumIPAM(ctx, pods, apiOK, workerActive)
+	})
+	run(checkCiliumEnvoy, func() {
+		h.checkCiliumEnvoy(ctx, workerActive)
+	})
+	run(checkCiliumMTU, func() {
+		h.checkCiliumMTU(workerActive)
+	})
+	run(checkZombieStorm, func() {
+		h.checkZombieStorm(workerActive)
+	})
+	run(checkJournald, func() {
+		h.checkJournaldIntegrity(ctx, workerActive)
 	})
 }
 
@@ -1973,12 +2195,12 @@ func (h *Hygiene) stateFileExists(name string) bool {
 
 // --- Check: cilium (32-cilium.sh + 35-cilium-init-stuck.sh) ---
 
-// ciliumAgentTasks finds cilium-agent containerd tasks by container
-// name annotation — the Go port of
-// `ctr containers ls 'labels."io.kubernetes.container.name"=="cilium-agent"'`.
+// ciliumNamedTasks finds containerd tasks of one cilium container
+// (cilium-agent / cilium-envoy) by container-name annotation — the
+// Go port of `ctr containers ls 'labels."io.kubernetes.container.name"=="<name>"'`.
 // reachable=false means the task root itself is unreadable (ctr
 // unreachable parity: inconclusive, keep counters/latches).
-func (h *Hygiene) ciliumAgentTasks() (tasks []ctrTask, reachable bool) {
+func (h *Hygiene) ciliumNamedTasks(name string) (tasks []ctrTask, reachable bool) {
 	if _, err := os.ReadDir(h.cfg.CtrTaskRoot); err != nil {
 		h.appendLog(fmt.Sprintf(
 			"suspect: ctr task root %s unreadable: %v — cilium checks inconclusive",
@@ -2000,7 +2222,7 @@ func (h *Hygiene) ciliumAgentTasks() (tasks []ctrTask, reachable bool) {
 				continue
 			}
 			nm := containerNameRe.FindSubmatch(cfgData)
-			if nm == nil || string(nm[1]) != "cilium-agent" {
+			if nm == nil || string(nm[1]) != name {
 				continue
 			}
 			t := ctrTask{}
@@ -2016,22 +2238,39 @@ func (h *Hygiene) ciliumAgentTasks() (tasks []ctrTask, reachable bool) {
 	return tasks, true
 }
 
-// killCiliumAgent SIGKILLs every live cilium-agent init pid — `ctr
-// tasks kill -s SIGKILL` parity. true = at least one task killed
-// (a dead task can't be signalled; kubelet retries on its own).
-func (h *Hygiene) killCiliumAgent(tasks []ctrTask) bool {
+// ciliumAgentTasks is the cilium-agent specialization kept for the
+// 32/35 call sites.
+func (h *Hygiene) ciliumAgentTasks() (tasks []ctrTask, reachable bool) {
+	return h.ciliumNamedTasks("cilium-agent")
+}
+
+// killNamedTasks SIGKILLs every live init pid of the named
+// container — `ctr tasks kill -s SIGKILL` parity. true = at least
+// one task killed (a dead task can't be signalled; kubelet retries
+// on its own).
+func (h *Hygiene) killNamedTasks(tasks []ctrTask, name string) bool {
 	killed := false
 	for _, t := range tasks {
 		if t.live && t.pid > 0 {
 			if err := h.cfg.killFn(t.pid, syscall.SIGKILL); err != nil {
 				h.appendLog(fmt.Sprintf(
-					"suspect: kill cilium-agent pid=%d failed: %v", t.pid, err))
+					"suspect: kill %s pid=%d failed: %v", name, t.pid, err))
 			} else {
 				killed = true
 			}
 		}
 	}
 	return killed
+}
+
+// killCiliumAgent SIGKILLs the cilium-agent tasks and flags the
+// kill so the B1 check restarts cilium-envoy the same cycle.
+func (h *Hygiene) killCiliumAgent(tasks []ctrTask) bool {
+	if h.killNamedTasks(tasks, "cilium-agent") {
+		h.ciliumAgentKilled = true
+		return true
+	}
+	return false
 }
 
 // checkCilium — sig9: cilium-agent :9879 healthz down → latch
@@ -2823,4 +3062,597 @@ func (h *Hygiene) resetFailedK0sWorker(ctx context.Context) {
 			"kubelet-remediate: reset-failed k0sworker failed: %v (%s)",
 			err, strings.TrimSpace(out)))
 	}
+}
+
+// --- Check: kubelet syncloop / containerd socket (A4) ---
+// 05's :10250 /healthz probe can stay green through a PLEG freeze —
+// kubelet exposes /healthz/syncloop specifically for the sync loop
+// (returns 500 the moment PLEG dies). The containerd unix socket is
+// the other half: a hung containerd wedges PLEG while every HTTP
+// endpoint still answers. Both are latch-only signals — the shared
+// restart machinery (05/T15) does the remediation.
+
+func (h *Hygiene) checkKubeletSyncloop(ctx context.Context, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkSyncloop, "gated").Inc()
+		return
+	}
+	var lastErr error
+	alive := false
+	for i := 0; i < probeAttempts; i++ {
+		code, err := h.cfg.probeHTTPStatus(ctx,
+			h.cfg.KubeletSyncloopURL, probeTimeout)
+		if err == nil && code == http.StatusOK {
+			alive = true
+			break
+		}
+		lastErr = err
+		if lastErr == nil {
+			// A non-200 answer carries no Go error — record the
+			// code or the latch extra reads "last_err=<nil>".
+			lastErr = fmt.Errorf("syncloop status %d", code)
+		}
+		if i+1 < probeAttempts {
+			select {
+			case <-ctx.Done():
+				h.cycles.WithLabelValues(checkSyncloop, "abort").Inc()
+				return
+			case <-time.After(h.cfg.ProbeGap):
+			}
+		}
+	}
+	if alive {
+		h.syncloopFails = 0
+		h.stateExit("kubelet-syncloop-down")
+		h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
+		return
+	}
+	h.syncloopFails++
+	if h.syncloopFails >= h.cfg.ConsecNeeded {
+		h.stateEnter("kubelet-syncloop-down",
+			fmt.Sprintf("pleg-frozen last_err=%v", lastErr))
+	} else {
+		h.appendLog(fmt.Sprintf(
+			"suspect: kubelet-syncloop-down /healthz/syncloop fail (PLEG?) err=%v (check %d/%d)",
+			lastErr, h.syncloopFails, h.cfg.ConsecNeeded))
+	}
+	h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
+}
+
+func (h *Hygiene) checkContainerdSock(ctx context.Context, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCtrSock, "gated").Inc()
+		return
+	}
+	err := h.cfg.probeUnixSock(ctx, h.cfg.ContainerdSocket, unixSockProbeTimeout)
+	if err == nil {
+		h.ctrsockFails = 0
+		h.stateExit("containerd-sock-down")
+		h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
+		return
+	}
+	h.ctrsockFails++
+	if h.ctrsockFails >= h.cfg.ConsecNeeded {
+		h.stateEnter("containerd-sock-down",
+			fmt.Sprintf("probe_err=%v", err))
+	} else {
+		h.appendLog(fmt.Sprintf(
+			"suspect: containerd-sock-down %s probe fail: %v (check %d/%d)",
+			h.cfg.ContainerdSocket, err, h.ctrsockFails, h.cfg.ConsecNeeded))
+	}
+	h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
+}
+
+// --- Check: containerd stale ingest GC (A3 — 39-ctr-ingest-gc) ---
+// A hard-reboot or OOM mid-pull leaves ingest dirs containerd never
+// reaps; kubelet's ImageGC can't see them because the lease is
+// orphaned. Runs when /var/lib/k0s is >75% full OR every 6h; ingest
+// dirs with mtime >3h (no legitimate pull survives that) are removed
+// via `ctr content ingest rm`, with a direct dir rm as fallback.
+
+func (h *Hygiene) checkCtrIngestGC(ctx context.Context, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkIngestGC, "gated").Inc()
+		return
+	}
+	var st unix.Statfs_t
+	diskHigh := false
+	if err := h.cfg.statfsFn(h.cfg.K0sDataDir, &st); err == nil && st.Blocks > 0 {
+		used := float64(st.Blocks-st.Bavail) / float64(st.Blocks)
+		diskHigh = used > h.cfg.K0sDiskHighWatermark
+	}
+	due := h.cfg.nowFn().Sub(h.lastIngestScan) >= h.cfg.CtrIngestScanInterval
+	if !diskHigh && !due {
+		h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
+		return
+	}
+	entries, err := os.ReadDir(h.cfg.CtrIngestDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Absent dir = nothing to scan — stamp like a clean
+			// walk so the 6h cadence still applies.
+			h.lastIngestScan = h.cfg.nowFn()
+			h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
+			return
+		}
+		// A transient read failure must NOT stamp lastIngestScan —
+		// stamping here would defer the retry by a full
+		// CtrIngestScanInterval (6h).
+		h.appendLog(fmt.Sprintf(
+			"suspect: ctr ingest dir %s unreadable: %v — ingest GC skipped",
+			h.cfg.CtrIngestDir, err))
+		h.cycles.WithLabelValues(checkIngestGC, "abort").Inc()
+		return
+	}
+	h.lastIngestScan = h.cfg.nowFn()
+	now := h.cfg.nowFn()
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if n >= h.cfg.MaxCtrTaskClean {
+			h.appendLog(fmt.Sprintf(
+				"suspect: ctr-ingest-gc still pending cap=%d", h.cfg.MaxCtrTaskClean))
+			break
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		age := now.Sub(fi.ModTime())
+		if age < h.cfg.CtrIngestMaxAge {
+			continue
+		}
+		ref := e.Name()
+		d := filepath.Join(h.cfg.CtrIngestDir, ref)
+		if rerr := h.cfg.ctrRmIngest(ctx, ref); rerr != nil {
+			h.appendLog(fmt.Sprintf(
+				"suspect: ctr content ingest rm %s failed: %v — removing dir directly", ref, rerr))
+		}
+		if _, serr := os.Stat(d); serr == nil {
+			if rerr := os.RemoveAll(d); rerr != nil {
+				h.appendLog(fmt.Sprintf(
+					"suspect: rm orphan ingest dir %s failed: %v", d, rerr))
+				continue
+			}
+		}
+		h.appendLog(fmt.Sprintf(
+			"ACTION: ctr-ingest-gc removed stale ingest %s (age=%.1fh disk_high=%v)",
+			ref, age.Hours(), diskHigh))
+		n++
+		h.ctrIngestsCleaned.Inc()
+		h.actions.WithLabelValues(checkIngestGC, "ingest_rm").Inc()
+	}
+	h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
+}
+
+// --- Check: zombie storm (A2) ---
+// A container without an init reaper (or a wedged shim) leaves
+// hundreds of <defunct> processes under one parent. One parent with
+// >ZombieStormThreshold zombies for ConsecNeeded cycles = a storm:
+// the pod UID is recovered from the parent's cgroup and reported to
+// node-watchdog.log for the nodereporter ZombieProcessStorm Event.
+
+// procStatStatePPID parses /proc/<pid>/stat for state + ppid — the
+// fields right after the LAST ')' (comm can hold spaces/parens).
+func (h *Hygiene) procStatStatePPID(pid int) (state string, ppid int, ok bool) {
+	data, err := os.ReadFile(h.procFile(pid, "stat"))
+	if err != nil {
+		return "", 0, false
+	}
+	s := string(data)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 {
+		return "", 0, false
+	}
+	f := strings.Fields(s[i+1:])
+	if len(f) < 2 { // f[0]=state, f[1]=ppid
+		return "", 0, false
+	}
+	p, err := strconv.Atoi(f[1])
+	if err != nil || p < 0 {
+		return "", 0, false
+	}
+	return f[0], p, true
+}
+
+// podUIDForPID extracts the pod UID owning a pid via
+// /proc/<pid>/cgroup — kubepods slices embed the uid with
+// underscores; normalized to the dashed form. The parse assumes
+// the cgroup-v2 unified hierarchy (the `0::/kubepods...` line and
+// kubepods*.slice naming — k0s hosts are v2; on v1 the per-
+// hierarchy lines differ and pod_uid resolves "unknown").
+func (h *Hygiene) podUIDForPID(pid int) string {
+	data, err := os.ReadFile(h.procFile(pid, "cgroup"))
+	if err != nil {
+		return "unknown"
+	}
+	if m := podUIDCgroupRe.FindSubmatch(data); m != nil {
+		return strings.ReplaceAll(string(m[1]), "_", "-")
+	}
+	return "unknown"
+}
+
+// zombieParent keys one storm streak: pid alone lies after PID
+// reuse — the /proc/<pid>/stat starttime (field 22, jiffies since
+// boot) tags the process generation so a recycled ppid restarts at
+// streak 0 instead of inheriting a dead parent's count and holding
+// the latch open for a storm that ended with it. An unreadable
+// starttime leaves the zero value — streaks then merge on pid
+// alone (same as the pre-key behaviour: the pid still has to stay
+// over threshold to accumulate).
+type zombieParent struct {
+	pid   int
+	start string // /proc/<pid>/stat field 22
+}
+
+// procStartTime reads /proc/<pid>/stat field 22 (starttime) — the
+// generation tag inside zombieParent. "" when the stat is
+// unreadable or truncated (the parent exited mid-sweep).
+func (h *Hygiene) procStartTime(pid int) string {
+	data, err := os.ReadFile(h.procFile(pid, "stat"))
+	if err != nil {
+		return ""
+	}
+	s := string(data)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 {
+		return ""
+	}
+	// Fields after ')' start at field 3: f[0]=state, f[1]=ppid,
+	// … f[19]=starttime (field 22).
+	f := strings.Fields(s[i+1:])
+	if len(f) <= 19 {
+		return ""
+	}
+	return f[19]
+}
+
+func (h *Hygiene) checkZombieStorm(workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkZombieStorm, "gated").Inc()
+		return
+	}
+	byPPID := map[int]int{}
+	for _, pid := range h.procPIDs() {
+		state, ppid, ok := h.procStatStatePPID(pid)
+		if !ok || state != "Z" {
+			continue
+		}
+		byPPID[ppid]++
+	}
+	// Resolve each parent once — one extra stat read per parent,
+	// not per zombie.
+	parents := map[int]zombieParent{}
+	keyOf := func(ppid int) zombieParent {
+		k, ok := parents[ppid]
+		if !ok {
+			k = zombieParent{pid: ppid, start: h.procStartTime(ppid)}
+			parents[ppid] = k
+		}
+		return k
+	}
+	storm := false
+	for parent, streak := range h.zombieStreaks {
+		if _, ok := byPPID[parent.pid]; !ok || keyOf(parent.pid) != parent {
+			delete(h.zombieStreaks, parent) // parent gone or pid recycled — streak dead
+		} else if streak >= h.cfg.ConsecNeeded {
+			storm = true
+		}
+	}
+	for ppid, n := range byPPID {
+		key := keyOf(ppid)
+		if n <= h.cfg.ZombieStormThreshold {
+			delete(h.zombieStreaks, key)
+			continue
+		}
+		h.zombieStreaks[key]++
+		switch streak := h.zombieStreaks[key]; {
+		case streak == h.cfg.ConsecNeeded:
+			storm = true
+			uid := h.podUIDForPID(ppid)
+			// NPD contract: nodereporter maps this line to the
+			// ZombieProcessStorm Event + problem_counter. Logged
+			// on streak ENTRY only — repeating it every cycle while
+			// the storm persists would spawn a fresh K8s Event per
+			// interval (the !stateExists gating checkCiliumMTU
+			// uses).
+			h.appendLog(fmt.Sprintf(
+				"ACTION zombie-storm: pod_uid=%s zombies=%d ppid=%d", uid, n, ppid))
+		case streak > h.cfg.ConsecNeeded:
+			storm = true // latched storm continues — no repeated ACTION line
+		default:
+			h.appendLog(fmt.Sprintf(
+				"suspect: zombie-storm ppid=%d zombies=%d (check %d/%d)",
+				ppid, n, streak, h.cfg.ConsecNeeded))
+		}
+	}
+	if storm {
+		h.stateEnter("zombie-storm", "")
+	} else {
+		h.stateExit("zombie-storm")
+	}
+	h.cycles.WithLabelValues(checkZombieStorm, "ok").Inc()
+}
+
+// --- Check: journald integrity (A5) ---
+// After a hard-reboot (SNR) journald's binary files corrupt at the
+// tail: `journalctl -u k0sworker` errors, prints "corrupt", or
+// returns abnormally empty while the unit is active — which also
+// blinds the 05/06 journal-signature checks. The remedy is the
+// operator's rotate+vacuum, bounded by a rate budget.
+
+func (h *Hygiene) checkJournaldIntegrity(ctx context.Context, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkJournald, "gated").Inc()
+		return
+	}
+	out, err := h.cfg.journalFn(ctx)
+	corrupt := err != nil ||
+		strings.Contains(strings.ToLower(out), "corrupt")
+	empty := err == nil && strings.TrimSpace(out) == ""
+	if empty {
+		// "No k0sworker lines in 10m" is ambiguous — a
+		// healthy-but-quiet unit hits the same branch as real
+		// corruption, and remediating it would rotate+vacuum every
+		// cooldown forever. Second probe: the UNFILTERED journal.
+		// Any line means journald is fine and the unit is just
+		// silent; an error, an empty reply, or a "corrupt" warning
+		// is journald-level anomaly — only then remediate.
+		unfiltered, uerr := h.cfg.journalAnyFn(ctx)
+		if uerr == nil && strings.TrimSpace(unfiltered) != "" &&
+			!strings.Contains(strings.ToLower(unfiltered), "corrupt") {
+			empty = false
+		}
+	}
+	switch {
+	case corrupt, empty:
+		h.journaldFails++
+		if h.journaldFails < h.cfg.ConsecNeeded {
+			h.appendLog(fmt.Sprintf(
+				"suspect: journald-integrity journal corrupt=%v empty=%v err=%v while k0sworker active (check %d/%d)",
+				corrupt, empty, err, h.journaldFails, h.cfg.ConsecNeeded))
+			h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+			return
+		}
+	default:
+		h.journaldFails = 0
+		h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+		return
+	}
+	if h.cfg.Systemd == nil {
+		h.cycles.WithLabelValues(checkJournald, "gated").Inc()
+		return
+	}
+	if !h.rateTrySpend("last-journald-vacuum", journaldVacuumInterval) {
+		h.appendLog("suspect: journald-integrity confirmed but vacuum " +
+			"cooldown active — skip")
+		h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+		return
+	}
+	h.appendLog(fmt.Sprintf(
+		"ACTION: journalctl --rotate --vacuum-time=3d - journal corrupt=%v empty=%v err=%v for active k0sworker",
+		corrupt, empty, err))
+	if jout, jerr := h.cfg.Systemd.Exec(ctx,
+		"journalctl", "--rotate", "--vacuum-time=3d"); jerr != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: journalctl --rotate --vacuum-time=3d failed: %v (%s)",
+			jerr, strings.TrimSpace(jout)))
+	} else {
+		h.actions.WithLabelValues(checkJournald, "rotate_vacuum").Inc()
+	}
+	h.journaldFails = 0
+	h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+}
+
+// --- Check: cilium-envoy readiness + agent healthz (2.5 & B1) ---
+// From cilium 1.16 the L7/xDS listener lives in a separate
+// cilium-envoy container: an agent restart (sig9/15) can strand it
+// holding a stale unix socket — L3/L4 still flows while Gateway API
+// traffic 503s. The check probes the envoy admin port and reads the
+// agent's /v1/healthz subsystem states for evidence; the kill fires
+// when the agent was SIGKILLed this cycle or envoy stays unready
+// for ConsecNeeded cycles.
+
+// ciliumUnhealthySubsystems lists healthz subsystem paths whose
+// state is neither Ok nor Disabled — nested maps are walked so
+// {"cluster":{"cilium":{"state":"Failure"}}} resolves too.
+func ciliumUnhealthySubsystems(body []byte) []string {
+	var v any
+	if json.Unmarshal(body, &v) != nil {
+		return nil
+	}
+	var bad []string
+	var walk func(path string, n any)
+	walk = func(path string, n any) {
+		m, ok := n.(map[string]any)
+		if !ok {
+			return
+		}
+		if s, ok := m["state"].(string); ok && s != "Ok" && s != "Disabled" {
+			bad = append(bad, path+"="+s)
+		}
+		for k, c := range m {
+			child := k
+			if path != "" {
+				child = path + "." + k
+			}
+			walk(child, c)
+		}
+	}
+	walk("", v)
+	sort.Strings(bad)
+	return bad
+}
+
+func (h *Hygiene) checkCiliumEnvoy(ctx context.Context, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCiliumEnvoy, "gated").Inc()
+		return
+	}
+	tasks, reachable := h.ciliumNamedTasks("cilium-envoy")
+	if !reachable {
+		h.cycles.WithLabelValues(checkCiliumEnvoy, "abort").Inc()
+		return
+	}
+	if len(tasks) == 0 {
+		// No cilium-envoy container — older cilium or no L7 proxy:
+		// clear any stale latch like checkCilium does.
+		h.envoyFails = 0
+		h.stateExit("cilium-envoy-down")
+		h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+		return
+	}
+	// 2.5: subsystem/datapath health off the agent socket is
+	// evidence only — an unreadable socket must not block the envoy
+	// verdict (the admin port is the primary signal).
+	if body, err := h.cfg.unixGet(ctx, h.cfg.CiliumSocket, "/v1/healthz"); err == nil {
+		if bad := ciliumUnhealthySubsystems(body); len(bad) > 0 {
+			h.appendLog(fmt.Sprintf(
+				"suspect: cilium subsystem health degraded: %s",
+				strings.Join(bad, ",")))
+		}
+	}
+	// Trigger 1: the agent was SIGKILLed this cycle — envoy may hold
+	// the stale socket, restart it alongside (B1).
+	if h.ciliumAgentKilled {
+		h.killCiliumEnvoy(tasks, "cilium-agent restarted this cycle")
+		h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+		return
+	}
+	code, err := h.cfg.probeHTTPStatus(ctx,
+		h.cfg.CiliumEnvoyReadyURL, ciliumProbeTime)
+	if err == nil && code == http.StatusOK {
+		h.envoyFails = 0
+		h.stateExit("cilium-envoy-down")
+		h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+		return
+	}
+	h.envoyFails++
+	if h.envoyFails < h.cfg.ConsecNeeded {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-envoy-down ready probe code=%d err=%v (check %d/%d)",
+			code, err, h.envoyFails, h.cfg.ConsecNeeded))
+		h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+		return
+	}
+	h.stateEnter("cilium-envoy-down",
+		fmt.Sprintf("ready_probe_fails=%d", h.envoyFails))
+	h.killCiliumEnvoy(tasks,
+		fmt.Sprintf("unready %d consecutive cycles", h.envoyFails))
+	h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+}
+
+// killCiliumEnvoy restarts the envoy container through its init
+// pids — kubelet rebuilds it like the agent path. The dedicated
+// budget keeps envoy kills from eating the agent's restart rate.
+func (h *Hygiene) killCiliumEnvoy(tasks []ctrTask, why string) {
+	if !h.rateTrySpend("last-cilium-envoy-restart", h.cfg.MinRestartInterval) {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-envoy kill skipped (%s) — restart cooldown (<30m)", why))
+		return
+	}
+	if h.killNamedTasks(tasks, "cilium-envoy") {
+		h.appendLog(fmt.Sprintf(
+			"ACTION: killed cilium-envoy container - %s (kubelet will restart -> xDS resync)", why))
+		h.envoyFails = 0
+		h.actions.WithLabelValues(checkCiliumEnvoy, "sigkill").Inc()
+	} else {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-envoy kill skipped (%s) — no running task to kill", why))
+	}
+}
+
+// --- Check: MTU drift, cilium datapath vs overlay (B4) ---
+// A pod created before the MTU change keeps MTU 1500 while the
+// overlay neb1 is 1300 — the bpf policy-route then returns
+// FRAG_NEEDED and the flow dies after SYN-ACK. Latch +
+// ACTION cilium-mtu-drift: so nodereporter raises
+// CiliumMTUExceedsOverlay.
+
+func mtuOfIface(sysnet, iface string) (int64, bool) {
+	data, err := os.ReadFile(filepath.Join(sysnet, iface, "mtu"))
+	if err != nil {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// runtimeConfigMTU reads the cilium MTU out of
+// agent-runtime-config.json — the fallback when cilium_net has no
+// sysfs entry. The key is searched recursively through maps AND
+// arrays (versions nest it differently); with several `mtu` keys
+// the MAX wins — deterministic (Go map order makes a "first
+// match" walk unstable), and the drift check wants the worst-case
+// datapath MTU anyway.
+func runtimeConfigMTU(path string) (int64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	var v any
+	if json.Unmarshal(data, &v) != nil {
+		return 0, false
+	}
+	var vals []int64
+	var walk func(n any)
+	walk = func(n any) {
+		switch t := n.(type) {
+		case map[string]any:
+			for k, val := range t {
+				if strings.EqualFold(k, "mtu") {
+					if f, isNum := val.(float64); isNum {
+						vals = append(vals, int64(f))
+					}
+				}
+				walk(val)
+			}
+		case []any:
+			for _, val := range t {
+				walk(val)
+			}
+		}
+	}
+	walk(v)
+	if len(vals) == 0 {
+		return 0, false
+	}
+	return slices.Max(vals), true
+}
+
+func (h *Hygiene) checkCiliumMTU(workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCiliumMTU, "gated").Inc()
+		return
+	}
+	neb, nebOK := mtuOfIface(h.cfg.SysClassNet, h.cfg.NebulaIface)
+	cil, cilOK := mtuOfIface(h.cfg.SysClassNet, h.cfg.CiliumIface)
+	if !cilOK {
+		cil, cilOK = runtimeConfigMTU(h.cfg.CiliumRuntimeConfig)
+	}
+	if !nebOK || !cilOK {
+		// No overlay or no cilium datapath to compare — a drift
+		// latch from before must not linger.
+		h.stateExit("cilium-mtu-drift")
+		h.cycles.WithLabelValues(checkCiliumMTU, "ok").Inc()
+		return
+	}
+	if cil > neb {
+		if !h.stateExists("cilium-mtu-drift") {
+			h.stateEnter("cilium-mtu-drift",
+				fmt.Sprintf("cilium=%d nebula=%d", cil, neb))
+			// NPD contract: nodereporter maps this line to the
+			// CiliumMTUExceedsOverlay Event + problem_counter.
+			h.appendLog(fmt.Sprintf(
+				"ACTION cilium-mtu-drift: cilium=%d nebula=%d", cil, neb))
+		}
+	} else {
+		h.stateExit("cilium-mtu-drift")
+	}
+	h.cycles.WithLabelValues(checkCiliumMTU, "ok").Inc()
 }

@@ -31,10 +31,17 @@ func newDynFake(objs ...runtime.Object) *fake.FakeDynamicClient {
 	return fake.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{
-			helmReleaseGVRs[0]:    "HelmReleaseList",
-			helmReleaseGVRs[1]:    "HelmReleaseList",
-			clusterSecretStoreGVR: "ClusterSecretStoreList",
-			externalSecretGVR:     "ExternalSecretList",
+			helmReleaseGVRs[0]:               "HelmReleaseList",
+			helmReleaseGVRs[1]:               "HelmReleaseList",
+			clusterSecretStoreGVR:            "ClusterSecretStoreList",
+			externalSecretGVR:                "ExternalSecretList",
+			fluxKustomizationGVR:             "KustomizationList",
+			fluxSourceGVRs["HelmChart"]:      "HelmChartList",
+			fluxSourceGVRs["GitRepository"]:  "GitRepositoryList",
+			fluxSourceGVRs["HelmRepository"]: "HelmRepositoryList",
+			fluxSourceGVRs["OCIRepository"]:  "OCIRepositoryList",
+			veleroScheduleGVR:                "ScheduleList",
+			veleroBackupGVR:                  "BackupList",
 		},
 		objs...)
 }
@@ -521,8 +528,10 @@ func TestHelmReleaseUnlockerAnnotateError(t *testing.T) {
 	}
 }
 
-// spec.releaseName / spec.targetNamespace drive where the release
-// secrets live; both fall back to the object meta when absent.
+// spec.releaseName / spec.targetNamespace / spec.storageNamespace
+// drive where the release secrets live: storageNamespace wins (flux
+// stores them there when set), targetNamespace is next, the HR's own
+// namespace is the last fallback.
 func TestHRNameAndNamespaceFallbacks(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
 	if got := hrReleaseName(hr); got != "myapp" {
@@ -541,6 +550,13 @@ func TestHRNameAndNamespaceFallbacks(t *testing.T) {
 	}
 	if got := hrTargetNS(hr); got != "target-ns" {
 		t.Fatalf("hrTargetNS = %q, want target-ns", got)
+	}
+
+	// storageNamespace outranks targetNamespace — the release secrets
+	// live there, so that is where the unlock must look.
+	hr.Object["spec"].(map[string]any)["storageNamespace"] = "storage-ns"
+	if got := hrTargetNS(hr); got != "storage-ns" {
+		t.Fatalf("hrTargetNS = %q, want storage-ns (storageNamespace precedence)", got)
 	}
 }
 
@@ -778,5 +794,165 @@ func TestJobFailedCondition(t *testing.T) {
 				t.Fatalf("jobFailed = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2.1 — node.ops/last-helm-unlock persistence & C1 — flux source healer
+// ---------------------------------------------------------------------------
+
+func fluxSourceObj(kind, apiVersion, ns, name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": apiVersion,
+		"kind":       kind,
+		"metadata":   map[string]any{"namespace": ns, "name": name},
+	}}
+}
+
+func hrChartRef(hr *unstructured.Unstructured, kind, ns, name string) {
+	spec, _, _ := unstructured.NestedMap(hr.Object, "spec")
+	if spec == nil {
+		spec = map[string]any{}
+	}
+	ref := map[string]any{"kind": kind, "name": name}
+	if ns != "" {
+		ref["namespace"] = ns
+	}
+	spec["chartRef"] = ref
+	hr.Object["spec"] = spec
+}
+
+func ksObj(ns, name string, staleMsg string, failingFor time.Duration) *unstructured.Unstructured {
+	k := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+		"kind":       "Kustomization",
+		"metadata":   map[string]any{"namespace": ns, "name": name},
+	}}
+	hrReady(k, "False", staleMsg)
+	k.Object["status"].(map[string]any)["conditions"].([]any)[0].(map[string]any)["lastTransitionTime"] = time.Now().Add(-failingFor).UTC().Format(time.RFC3339)
+	return k
+}
+
+// The persisted node.ops/last-helm-unlock stamp IS the cooldown: with
+// an empty in-RAM ledger (post-restart) an HR still inside 24h is
+// alerted, not re-unlocked.
+func TestHelmReleaseUnlockerPersistedCooldown(t *testing.T) {
+	hr := hrObj("apps", "myapp", "v2")
+	hrTarget(hr, "apps")
+	hrReady(hr, "False", "another operation is in progress")
+	hr.SetAnnotations(map[string]string{
+		helmLastUnlockAnno: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+	})
+	dyn := newDynFake(hr)
+	cs := kfake.NewSimpleClientset(
+		helmRelSecret("apps", "sh.helm.release.v1.myapp.v1", "myapp", 1, "deployed"),
+		helmRelSecret("apps", "sh.helm.release.v1.myapp.v2", "myapp", 2, "pending-upgrade"))
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+
+	before := testutil.ReconcileErrorCount(t, helmUnlockQueue)
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
+		t.Fatal("secret deleted inside the persisted 24h cooldown")
+	}
+	if got := testutil.ReconcileErrorCount(t, helmUnlockQueue); got != before+1 {
+		t.Fatalf("persisted-cooldown alert did not IncError: got %v, want %v", got, before+1)
+	}
+}
+
+// A successful unlock stamps BOTH reconcile.fluxcd.io/requestedAt and
+// node.ops/last-helm-unlock on the HR.
+func TestHelmReleaseUnlockerStampsLastUnlockAnnotation(t *testing.T) {
+	dyn, secrets := stuckHRFixture()
+	cs := kfake.NewSimpleClientset(secrets...)
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := hrAnnotation(t, dyn, helmReleaseGVRs[0], "apps", "myapp", helmLastUnlockAnno)
+	if got == "" {
+		t.Fatal("node.ops/last-helm-unlock not persisted on unlock")
+	}
+	if _, err := time.Parse(time.RFC3339, got); err != nil {
+		t.Fatalf("last-helm-unlock %q is not RFC3339: %v", got, err)
+	}
+}
+
+// C1 — an HR Ready=False >=15m on "artifact not found" nudges its
+// chartRef HelmChart source: requestedAt + last-source-nudge land and
+// the counter increments. A stale message on a fresh failure does not.
+func TestFluxSourceHealerHelmRelease(t *testing.T) {
+	hr := hrObj("apps", "myapp", "v2")
+	hrReady(hr, "False", "HelmChart 'flux-system/apps-myapp' artifact not found")
+	hrChartRef(hr, "HelmChart", "flux-system", "apps-myapp")
+	// A sibling HR failing for a non-artifact reason — untouched.
+	other := hrObj("apps", "other", "v2")
+	hrReady(other, "False", "rendering failed: values.schema violation")
+	// A fresh artifact failure (<15m) — still inside flux's retry, not ours.
+	fresh := hrObj("apps", "fresh", "v2")
+	fresh.Object["status"] = map[string]any{"conditions": []any{map[string]any{
+		"type": "Ready", "status": "False",
+		"message":            "artifact not found",
+		"lastTransitionTime": time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+	}}}
+	hrChartRef(fresh, "HelmChart", "flux-system", "apps-fresh")
+	src := fluxSourceObj("HelmChart", "source.toolkit.fluxcd.io/v1",
+		"flux-system", "apps-myapp")
+	srcFresh := fluxSourceObj("HelmChart", "source.toolkit.fluxcd.io/v1",
+		"flux-system", "apps-fresh")
+	dyn := newDynFake(hr, other, fresh, src, srcFresh)
+	u := newUnlocker(kfake.NewSimpleClientset(), dyn, 0, "")
+
+	before := promtestutil.ToFloat64(metrics.FluxSourceReconcilesTriggeredTotal.
+		WithLabelValues("HelmChart", "flux-system", "apps-myapp"))
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := hrAnnotation(t, dyn, fluxSourceGVRs["HelmChart"], "flux-system",
+		"apps-myapp", fluxReconcileAnno); got == "" {
+		t.Fatal("HelmChart source not stamped with requestedAt")
+	}
+	if got := hrAnnotation(t, dyn, fluxSourceGVRs["HelmChart"], "flux-system",
+		"apps-myapp", fluxLastNudgeAnno); got == "" {
+		t.Fatal("HelmChart source not stamped with last-source-nudge")
+	}
+	if got := hrAnnotation(t, dyn, fluxSourceGVRs["HelmChart"], "flux-system",
+		"apps-fresh", fluxReconcileAnno); got != "" {
+		t.Fatal("fresh artifact failure nudged its source — 15m gate broken")
+	}
+	if got := promtestutil.ToFloat64(metrics.FluxSourceReconcilesTriggeredTotal.
+		WithLabelValues("HelmChart", "flux-system", "apps-myapp")) - before; got != 1 {
+		t.Fatalf("FluxSourceReconcilesTriggeredTotal delta = %v, want 1", got)
+	}
+}
+
+// C1 — Kustomization with spec.sourceRef GitRepository gets the same
+// treatment, and the 30m per-source cooldown blocks a repeat nudge.
+func TestFluxSourceHealerKustomization(t *testing.T) {
+	k := ksObj("apps", "root", "failed to fetch artifact: revision not found", 30*time.Minute)
+	k.Object["spec"] = map[string]any{
+		"sourceRef": map[string]any{"kind": "GitRepository", "name": "flux-system"},
+	}
+	src := fluxSourceObj("GitRepository", "source.toolkit.fluxcd.io/v1",
+		"apps", "flux-system")
+	dyn := newDynFake(k, src)
+	u := newUnlocker(kfake.NewSimpleClientset(), dyn, 0, "")
+
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stamp := hrAnnotation(t, dyn, fluxSourceGVRs["GitRepository"], "apps",
+		"flux-system", fluxReconcileAnno)
+	if stamp == "" {
+		t.Fatal("GitRepository source not stamped")
+	}
+	// Second sweep inside the 30m cooldown → stamp must not change.
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := hrAnnotation(t, dyn, fluxSourceGVRs["GitRepository"], "apps",
+		"flux-system", fluxReconcileAnno); got != stamp {
+		t.Fatal("source re-nudged inside the 30m per-source cooldown")
 	}
 }

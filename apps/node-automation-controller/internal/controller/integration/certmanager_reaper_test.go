@@ -3,6 +3,7 @@ package integration
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,7 +43,8 @@ var cmrListKinds = map[schema.GroupVersionResource]string{
 
 // cmrCert builds an unstructured Certificate. readyStatus is the Ready
 // condition's status string ("" = no conditions); renewalTime is an
-// RFC3339 spec.renewalTime ("" = absent).
+// RFC3339 status.renewalTime ("" = absent) — where cert-manager
+// actually publishes the next renewal.
 func cmrCert(ns, name, readyStatus, renewalTime string) *unstructured.Unstructured {
 	o := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "cert-manager.io/v1",
@@ -56,7 +58,7 @@ func cmrCert(ns, name, readyStatus, renewalTime string) *unstructured.Unstructur
 		}, "status", "conditions")
 	}
 	if renewalTime != "" {
-		_ = unstructured.SetNestedField(o.Object, renewalTime, "spec", "renewalTime")
+		_ = unstructured.SetNestedField(o.Object, renewalTime, "status", "renewalTime")
 	}
 	return o
 }
@@ -522,5 +524,117 @@ func TestCertNeedsReapNonMapCondition(t *testing.T) {
 	}}
 	if certNeedsReap(cert) {
 		t.Fatal("non-Ready / malformed conditions influenced the verdict")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2.1 — reset budget annotation persistence
+// ---------------------------------------------------------------------------
+
+func cmrCertAnnotation(t *testing.T, dyn *dynamicfake.FakeDynamicClient, ns, name, anno string) string {
+	t.Helper()
+	u, err := dyn.Resource(certificateGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get certificate %s/%s: %v", ns, name, err)
+	}
+	return u.GetAnnotations()[anno]
+}
+
+// Every consumed reset is persisted on the Certificate
+// ("<total>,<lastRFC3339>") so a restart cannot refund the budget.
+func TestCertManagerReaperPersistsResetAnnotation(t *testing.T) {
+	dyn := newFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
+	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
+		resets: map[string]*certReset{}}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := cmrCertAnnotation(t, dyn, "app", "tls-a", acmeResetsAnno)
+	total, _, ok := strings.Cut(got, ",")
+	if !ok || total != "1" {
+		t.Fatalf("acme-resets annotation = %q, want \"1,<RFC3339>\"", got)
+	}
+}
+
+// Restart simulation: a fresh reaper (empty r.resets) hydrates the
+// exhausted budget from the annotation and refuses immediately.
+func TestCertManagerReaperHydratesBudgetFromAnnotation(t *testing.T) {
+	cert := cmrCert("app", "tls-a", "False", "")
+	cert.SetAnnotations(map[string]string{
+		acmeResetsAnno: fmt.Sprintf("%d,%s", certReaperMaxReset,
+			time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339)),
+	})
+	dyn := newFakeDyn(cmrListKinds,
+		cert,
+		cmrOrder("app", "order-a", "pending", 45*time.Minute),
+		cmrChallenge("app", "ch-a", true, true, time.Hour, "order-a"))
+	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
+		resets: map[string]*certReset{}}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !cmrOrderExists(t, dyn, "app", "order-a") {
+		t.Fatal("order deleted although the persisted budget is exhausted")
+	}
+	if st := r.resets["app/tls-a"]; st == nil || st.total != certReaperMaxReset {
+		t.Fatalf("budget not hydrated from annotation: %+v", st)
+	}
+}
+
+// A healed cert clears BOTH the map entry and the annotation — its
+// next renewal cycle starts with a full budget again.
+func TestCertManagerReaperClearsPersistedBudgetOnHeal(t *testing.T) {
+	cert := cmrCert("app", "tls-ok", "True",
+		time.Now().Add(30*24*time.Hour).UTC().Format(time.RFC3339))
+	cert.SetAnnotations(map[string]string{acmeResetsAnno: "2,2026-01-01T00:00:00Z"})
+	dyn := newFakeDyn(cmrListKinds, cert)
+	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
+		resets: map[string]*certReset{}}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := cmrCertAnnotation(t, dyn, "app", "tls-ok", acmeResetsAnno); got != "" {
+		t.Fatalf("acme-resets annotation not cleared on heal: %q", got)
+	}
+}
+
+// certResetFromAnnotation: valid formats hydrate, malformed values
+// degrade to a zero budget (never MORE resets than recorded). The two
+// halves hydrate independently — a malformed total does not poison a
+// parseable timestamp and vice versa; both failure modes stay
+// conservative (a zero total re-earns resets one at a time, a parsed
+// "last" can only rate-limit, never refund).
+func TestCertResetFromAnnotation(t *testing.T) {
+	parse := func(v string) *certReset {
+		c := cmrCert("app", "c", "False", "")
+		if v != "" {
+			c.SetAnnotations(map[string]string{acmeResetsAnno: v})
+		}
+		return certResetFromAnnotation(c)
+	}
+	if st := parse(""); st.total != 0 || !st.last.IsZero() {
+		t.Fatalf("absent annotation hydrated to %+v", st)
+	}
+	for _, tc := range []struct {
+		in        string
+		wantTotal int
+		wantLast  bool // a timestamp hydrated into st.last
+	}{
+		{"2,2026-11-04T00:00:00Z", 2, true},
+		{"garbage", 0, false},               // no comma — whole value dropped
+		{"2", 0, false},                     // total without the last half
+		{"x,2026-11-04T00:00:00Z", 0, true}, // bad total, valid time still parses
+		{"-3,2026-11-04T00:00:00Z", 0, true},
+		{"2,not-a-time", 2, false}, // good total, timestamp half dropped
+		{"2,2026-11-04T00:00:00Z,trailing", 2, false},
+	} {
+		st := parse(tc.in)
+		if st.total != tc.wantTotal || (st.total < 0 || st.total > certReaperMaxReset) {
+			t.Fatalf("annotation %q hydrated total=%d, want %d", tc.in, st.total, tc.wantTotal)
+		}
+		if gotLast := !st.last.IsZero(); gotLast != tc.wantLast {
+			t.Fatalf("annotation %q hydrated last=%v, want present=%v",
+				tc.in, st.last, tc.wantLast)
+		}
 	}
 }

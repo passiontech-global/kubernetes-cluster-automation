@@ -1,11 +1,17 @@
 package hostmetrics
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
 	"math"
+	"math/big"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -25,6 +31,7 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		"sysnet":  filepath.Join(root, "net"),
 		"k0s":     filepath.Join(root, "k0s"),
 		"systemd": filepath.Join(root, "systemd", "system"),
+		"proc":    filepath.Join(root, "proc"),
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -55,6 +62,17 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		FileNRFile:         filepath.Join(root, "file-nr"),
 		SockstatFile:       filepath.Join(root, "sockstat"),
 		FilesystemTargets:  []string{"/fake/etc", "/fake/k0s"},
+		// Wave-2 sources under root — never the real /proc or /sys:
+		// an fdinfo/zombie sweep of the live host would leak real
+		// series into the scrape assertions.
+		ProcRoot:                filepath.Join(root, "proc"),
+		HostRoot:                filepath.Join(root, "hostroot"),
+		InotifyMaxInstancesFile: filepath.Join(root, "max_user_instances"),
+		InotifyMaxWatchesFile:   filepath.Join(root, "max_user_watches"),
+		InotifyScanInterval:     60 * time.Second,
+		CgroupRoot:              filepath.Join(root, "cgroup"),
+		CiliumRuntimeConfig:     filepath.Join(root, "agent-runtime-config.json"),
+		PKICertPaths:            []string{filepath.Join(root, "pki")},
 		// Default stub: returns no result — the real 0.3 cpu-s
 		// busy-loop would otherwise spin once per collector instance
 		// (~20 concurrent goroutines during a suite run).
@@ -561,8 +579,8 @@ func TestDescribe(t *testing.T) {
 	// 10 base descs + the 2 legacy prom_emit aliases
 	// (node_watchdog_state, node_watchdog_egress_relay) + 16
 	// gray-failure telemetry descs (H1/H2/H3/H6/H7).
-	if got := len(ch); got != 28 {
-		t.Fatalf("Describe emitted %d descs want 28", got)
+	if got := len(ch); got != 34 {
+		t.Fatalf("Describe emitted %d descs want 34", got)
 	}
 }
 
@@ -1535,6 +1553,366 @@ func TestWriteTextfileIncludesGrayFailureMetrics(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("textfile missing %q\n%s", want, text)
+		}
+	}
+}
+
+// --- Wave-2 tests: 2.4 PKI certs, A1 inotify, A2 zombie/cgroup, B4 MTU ---
+
+// mkTestCertPEM generates a throwaway self-signed cert expiring at
+// notAfter — enough for the pki-cert-days-left parse path.
+func mkTestCertPEM(t *testing.T, notAfter time.Time) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              notAfter,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl,
+		&key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func TestPKICertDaysLeft(t *testing.T) {
+	cfg, _ := fixture(t)
+	pkiDir := cfg.PKICertPaths[0]
+	if err := os.MkdirAll(pkiDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(pkiDir, "ca.crt"),
+		string(mkTestCertPEM(t, time.Now().Add(40*24*time.Hour))))
+	write(t, filepath.Join(pkiDir, "notacert.key"), "PRIVATE KEY")
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_pki_cert_days_left",
+		map[string]string{"node": "node-a",
+			"path": filepath.Join(pkiDir, "ca.crt")})
+	if !ok {
+		t.Fatal("pki_cert_days_left{ca.crt} absent")
+	}
+	if got < 39 || got > 41 {
+		t.Fatalf("days_left=%v want ~40", got)
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_pki_cert_days_left",
+		map[string]string{"node": "node-a",
+			"path": filepath.Join(pkiDir, "notacert.key")}); ok {
+		t.Fatal("non-cert file must not emit a series")
+	}
+}
+
+func TestPKICertDaysLeftStandaloneFile(t *testing.T) {
+	cfg, _ := fixture(t)
+	f := filepath.Join(t.TempDir(), "kubelet-client-current.pem")
+	write(t, f, string(mkTestCertPEM(t, time.Now().Add(10*24*time.Hour))))
+	cfg.PKICertPaths = []string{f}
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_pki_cert_days_left",
+		map[string]string{"node": "node-a", "path": f})
+	if !ok || got < 9 || got > 11 {
+		t.Fatalf("single-file PKI source: days=%v ok=%v want ~10", got, ok)
+	}
+}
+
+// TestPKICertPathLabelLeadingSlash pins the {path} label shape:
+// HostRoot="/" (standalone) must emit the SAME series a pod with
+// HostRoot="/host" does — TrimPrefix would otherwise strip the
+// leading slash and split the series by run mode.
+func TestPKICertPathLabelLeadingSlash(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.HostRoot = "/"
+	pkiDir := t.TempDir()
+	write(t, filepath.Join(pkiDir, "ca.crt"),
+		string(mkTestCertPEM(t, time.Now().Add(40*24*time.Hour))))
+	cfg.PKICertPaths = []string{pkiDir}
+	c := New(cfg)
+	want := filepath.Join(pkiDir, "ca.crt") // absolute, leading slash kept
+	if _, ok := metricValue(t, c, "node_host_agent_pki_cert_days_left",
+		map[string]string{"node": "node-a", "path": want}); !ok {
+		t.Fatalf("series with path=%s absent — leading slash must be kept", want)
+	}
+}
+
+// TestPKICertDaysLeftExpiredFloors: an expired cert's negative
+// days-left must floor (−1.9d → −2), not truncate toward zero.
+func TestPKICertDaysLeftExpiredFloors(t *testing.T) {
+	cfg, _ := fixture(t)
+	pkiDir := cfg.PKICertPaths[0]
+	if err := os.MkdirAll(pkiDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// ~45h past expiry → −1.875d.
+	write(t, filepath.Join(pkiDir, "expired.crt"),
+		string(mkTestCertPEM(t, time.Now().Add(-45*time.Hour))))
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_pki_cert_days_left",
+		map[string]string{"node": "node-a",
+			"path": filepath.Join(pkiDir, "expired.crt")})
+	if !ok || got != -2 {
+		t.Fatalf("days_left=%v ok=%v want -2 (floor, not truncation)", got, ok)
+	}
+}
+
+// mkFdLink creates a fake /proc/<pid>/fd/<fd> symlink with the
+// given target — the fd symlink carries the fd TYPE, which is how
+// sweepInotify counts inotify instances (anon_inode:inotify).
+func mkFdLink(t *testing.T, proc string, pid, fd int, target string) {
+	t.Helper()
+	d := filepath.Join(proc, strconv.Itoa(pid), "fd")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(d, strconv.Itoa(fd))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// mkFdinfo writes a fake /proc/<pid>/fdinfo/<fd> with n inotify wd
+// lines AND the matching fd symlink pointing at
+// anon_inode:inotify — a real inotify fd carries both; the
+// instance count comes from the symlink, the watch count from
+// fdinfo.
+func mkFdinfo(t *testing.T, proc string, pid, fd, n int) {
+	t.Helper()
+	mkFdLink(t, proc, pid, fd, "anon_inode:inotify")
+	d := filepath.Join(proc, strconv.Itoa(pid), "fdinfo")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	b.WriteString("pos:\t0\nflags:\t02004000\n")
+	for i := 0; i < n; i++ {
+		b.WriteString(fmt.Sprintf("inotify wd:%d ino:1 sdev:8 mask:1 ignored_mask:0 fhandle-bytes:8 fhandle-type:1 f_handle:xx\n", i))
+	}
+	if err := os.WriteFile(filepath.Join(d, strconv.Itoa(fd)),
+		[]byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInotifyRatios(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.InotifyMaxInstancesFile, "10\n")
+	write(t, cfg.InotifyMaxWatchesFile, "100\n")
+	mkFdinfo(t, cfg.ProcRoot, 111, 3, 5)  // 1 fd, 5 watches
+	mkFdinfo(t, cfg.ProcRoot, 111, 4, 5)  // another fd → 2 inst
+	mkFdinfo(t, cfg.ProcRoot, 222, 6, 10) // other pid → 3rd inst
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_inotify_instances_used_ratio",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 0.3 {
+		t.Fatalf("instances ratio=%v ok=%v want 0.3", got, ok)
+	}
+	got, ok = metricValue(t, c, "node_host_agent_inotify_watches_used_ratio",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 0.2 {
+		t.Fatalf("watches ratio=%v ok=%v want 0.2", got, ok)
+	}
+}
+
+func TestInotifyCacheServesWithinInterval(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.InotifyMaxInstancesFile, "10\n")
+	mkFdinfo(t, cfg.ProcRoot, 111, 3, 1)
+	c := New(cfg)
+	if got, _ := metricValue(t, c, "node_host_agent_inotify_instances_used_ratio",
+		map[string]string{"node": "node-a"}); got != 0.1 {
+		t.Fatalf("first scrape=%v want 0.1", got)
+	}
+	// More fds appear — the cached sweep must still answer 0.1.
+	mkFdinfo(t, cfg.ProcRoot, 111, 9, 1)
+	if got, _ := metricValue(t, c, "node_host_agent_inotify_instances_used_ratio",
+		map[string]string{"node": "node-a"}); got != 0.1 {
+		t.Fatalf("cached scrape=%v want 0.1", got)
+	}
+}
+
+// TestInotifyZeroWatchInstanceCounts covers the leak the metric
+// exists for: an inotify_init() fd holding ZERO watches emits no
+// identifying line in fdinfo — the instance must still count (the
+// fd symlink carries the type), else a zero-watch leak reads ~0
+// while the host hits max_user_instances.
+func TestInotifyZeroWatchInstanceCounts(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.InotifyMaxInstancesFile, "10\n")
+	write(t, cfg.InotifyMaxWatchesFile, "100\n")
+	// fd 3: leaked inotify group — symlink present, NO fdinfo at
+	// all (not even a header): instance, 0 watches.
+	mkFdLink(t, cfg.ProcRoot, 111, 3, "anon_inode:inotify")
+	// fd 4: a socket fd — must not count as an instance.
+	mkFdLink(t, cfg.ProcRoot, 111, 4, "socket:[12345]")
+	// fd 5: another inotify group, fdinfo present but zero wd
+	// lines — also a zero-watch instance.
+	mkFdinfo(t, cfg.ProcRoot, 111, 5, 0)
+	// fd 6: normal inotify group with 2 watches.
+	mkFdinfo(t, cfg.ProcRoot, 111, 6, 2)
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_inotify_instances_used_ratio",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 0.3 {
+		t.Fatalf("instances ratio=%v ok=%v want 0.3 (3 inotify fds incl. 2 zero-watch)", got, ok)
+	}
+	got, ok = metricValue(t, c, "node_host_agent_inotify_watches_used_ratio",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 0.02 {
+		t.Fatalf("watches ratio=%v ok=%v want 0.02 (2 watches)", got, ok)
+	}
+}
+
+func TestZombieCount(t *testing.T) {
+	cfg, _ := fixture(t)
+	for _, pid := range []int{301, 302} {
+		d := filepath.Join(cfg.ProcRoot, strconv.Itoa(pid))
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		write(t, filepath.Join(d, "stat"),
+			fmt.Sprintf("%d (x) Z 1 0 0", pid))
+	}
+	d := filepath.Join(cfg.ProcRoot, "303")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(d, "stat"), "303 (y) S 1 0 0")
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_processes_zombie_count",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 2 {
+		t.Fatalf("zombie_count=%v ok=%v want 2", got, ok)
+	}
+}
+
+func TestCgroupPidsRatio(t *testing.T) {
+	cfg, _ := fixture(t)
+	d := filepath.Join(cfg.CgroupRoot, "system.slice/k0sworker.service")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(d, "pids.current"), "900\n")
+	write(t, filepath.Join(d, "pids.max"), "1024\n")
+	// "max" (unlimited) must emit no ratio — not a fake 0.
+	d2 := filepath.Join(cfg.CgroupRoot, "kubepods.slice")
+	if err := os.MkdirAll(d2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(d2, "pids.current"), "50\n")
+	write(t, filepath.Join(d2, "pids.max"), "max\n")
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_cgroup_pids_used_ratio",
+		map[string]string{"node": "node-a",
+			"slice": "system.slice/k0sworker.service"})
+	if !ok || got != 900.0/1024.0 {
+		t.Fatalf("pids ratio=%v ok=%v want %v", got, ok, 900.0/1024.0)
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_cgroup_pids_used_ratio",
+		map[string]string{"node": "node-a", "slice": "kubepods.slice"}); ok {
+		t.Fatal("pids.max=max must emit no ratio")
+	}
+}
+
+func TestMTUDrift(t *testing.T) {
+	cfg, dirs := fixture(t)
+	for _, n := range []string{"neb1", "cilium_net"} {
+		if err := os.MkdirAll(filepath.Join(dirs["sysnet"], n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	write(t, filepath.Join(dirs["sysnet"], "cilium_net", "mtu"), "1500\n")
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_mtu_drift",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 1 {
+		t.Fatalf("mtu_drift=%v ok=%v want 1", got, ok)
+	}
+	write(t, filepath.Join(dirs["sysnet"], "cilium_net", "mtu"), "1300\n")
+	got, ok = metricValue(t, c, "node_host_agent_mtu_drift",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 0 {
+		t.Fatalf("aligned MTUs: drift=%v ok=%v want 0", got, ok)
+	}
+}
+
+func TestMTUDriftRuntimeConfigFallback(t *testing.T) {
+	cfg, dirs := fixture(t)
+	if err := os.MkdirAll(filepath.Join(dirs["sysnet"], "neb1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	write(t, cfg.CiliumRuntimeConfig, `{"mtu":1500}`)
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_mtu_drift",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 1 {
+		t.Fatalf("runtime-config fallback: drift=%v ok=%v want 1", got, ok)
+	}
+}
+
+// TestRuntimeConfigMTUMaxDeterministic pins the multi-mtu
+// behaviour: several `mtu`-keyed values (nested maps AND arrays)
+// must resolve to the MAX — a "first match" walk is unstable
+// under Go's random map iteration order.
+func TestRuntimeConfigMTUMaxDeterministic(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.CiliumRuntimeConfig,
+		`{"a":{"mtu":1300},"list":[{"mtu":1400},{"mtu":1500}],"z":{"MTU":900}}`)
+	got, ok := runtimeConfigMTU(cfg.CiliumRuntimeConfig)
+	if !ok || got != 1500 {
+		t.Fatalf("runtimeConfigMTU=%v,%v want 1500,true (max of all mtu keys)", got, ok)
+	}
+}
+
+func TestMTUDriftAbsentWhenNoSources(t *testing.T) {
+	cfg, _ := fixture(t)
+	c := New(cfg)
+	if _, ok := metricValue(t, c, "node_host_agent_mtu_drift",
+		map[string]string{"node": "node-a"}); ok {
+		t.Fatal("no neb1/cilium source → series must be absent")
+	}
+}
+
+func TestWriteTextfileIncludesNewMetrics(t *testing.T) {
+	cfg, dirs := fixture(t)
+	pkiDir := cfg.PKICertPaths[0]
+	if err := os.MkdirAll(pkiDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(pkiDir, "ca.crt"),
+		string(mkTestCertPEM(t, time.Now().Add(40*24*time.Hour))))
+	write(t, cfg.InotifyMaxInstancesFile, "10\n")
+	write(t, cfg.InotifyMaxWatchesFile, "100\n")
+	for _, n := range []string{"neb1", "cilium_net"} {
+		if err := os.MkdirAll(filepath.Join(dirs["sysnet"], n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	write(t, filepath.Join(dirs["sysnet"], "cilium_net", "mtu"), "1500\n")
+	c := New(cfg)
+	out := filepath.Join(t.TempDir(), "textfile")
+	if err := c.WriteTextfile(out); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(out, "node-watchdog.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"node_host_agent_pki_cert_days_left",
+		"node_host_agent_inotify_instances_used_ratio",
+		"node_host_agent_inotify_watches_used_ratio",
+		"node_host_agent_processes_zombie_count",
+		"node_host_agent_mtu_drift",
+	} {
+		if !strings.Contains(string(data), name) {
+			t.Fatalf("textfile missing %s:\n%s", name, data)
 		}
 	}
 }

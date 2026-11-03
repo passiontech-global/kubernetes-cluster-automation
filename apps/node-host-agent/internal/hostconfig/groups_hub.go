@@ -119,7 +119,7 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 		// file is live swap — removing/recreating an ACTIVE swapfile
 		// pulls the kernel's swap target out from under it. Skip the
 		// cycle instead of guessing inactive.
-		slog.Warn("swap: swapon --show failed — cannot determine active state; skipping cycle",
+		c.err("swap: swapon --show failed — cannot determine active state; skipping cycle",
 			"path", path, "error", activeErr)
 		return
 	}
@@ -137,29 +137,31 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 		slog.Info("swap: removing wrong-size inactive file", "path", path,
 			"size", fi.Size(), "want", wantBytes)
 		if err := os.Remove(dst); err != nil {
-			slog.Error("swap: remove wrong-size file", "path", path, "error", err)
+			c.err("swap: remove wrong-size file", "path", path, "error", err)
 			return
 		}
 		exists = false
 	}
 	if !exists {
 		if _, err := r.run(ctx, "fallocate", "-l", fmt.Sprintf("%dM", mb), path); err != nil {
+			// Best-effort primary path — dd below is the fallback;
+			// only its failure counts.
 			slog.Warn("swap: fallocate failed — dd fallback", "path", path, "error", err)
 			if _, derr := r.run(ctx, "dd", "if=/dev/zero", "of="+path, "bs=1M",
 				fmt.Sprintf("count=%d", mb), "status=none"); derr != nil {
-				slog.Error("swap: dd create failed", "path", path, "error", derr)
+				c.err("swap: dd create failed", "path", path, "error", derr)
 				return
 			}
 		}
 	}
 	if err := os.Chmod(dst, 0o600); err != nil {
-		slog.Error("swap: chmod 0600 failed", "path", path, "error", err)
+		c.err("swap: chmod 0600 failed", "path", path, "error", err)
 		return
 	}
 	out, _ := r.run(ctx, "blkid", "-o", "value", "-s", "TYPE", path)
 	if strings.TrimSpace(out) != "swap" {
 		if _, err := r.run(ctx, "mkswap", path); err != nil {
-			slog.Error("swap: mkswap failed", "path", path, "error", err)
+			c.err("swap: mkswap failed", "path", path, "error", err)
 			return
 		}
 	}
@@ -167,6 +169,8 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 	want := path + " none swap sw 0 0"
 	fstab, fstabErr := os.ReadFile(r.hp("/etc/fstab"))
 	if fstabErr != nil && !os.IsNotExist(fstabErr) {
+		// Best-effort pre-warning — a failed fstab write is counted
+		// by writeManaged's noteErr below.
 		slog.Warn("swap: cannot read /etc/fstab — swap fstab entry will fail",
 			"error", fstabErr)
 	}
@@ -185,7 +189,7 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 	}
 	if !active {
 		if _, err := r.run(ctx, "swapon", path); err != nil {
-			slog.Warn("swap: swapon failed — file exists but swap not active",
+			c.err("swap: swapon failed — file exists but swap not active",
 				"path", path, "error", err)
 		}
 	}
@@ -194,7 +198,7 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 			"vm.swappiness = "+sw+"\n"), 0o644)
 	r.actions.WithLabelValues("sysctl -w vm.swappiness").Inc()
 	if _, err := r.run(ctx, "sysctl", "-w", "vm.swappiness="+sw); err != nil {
-		slog.Warn("swap: sysctl -w vm.swappiness failed — drop-in converged, live value unchanged",
+		c.err("swap: sysctl -w vm.swappiness failed — drop-in converged, live value unchanged",
 			"value", sw, "error", err)
 	}
 }
@@ -267,7 +271,7 @@ func (c *cyc) hubMetricsNodeExporter() {
 	local := r.hp("/tmp/" + file)
 	if !(fileExistsNoRoot(local) && sha256FileOK(local, sum)) {
 		if err := nexpDownload(ctx, url, local, sum); err != nil {
-			slog.Error("hub-metrics-fw: node_exporter deb download failed",
+			c.err("hub-metrics-fw: node_exporter deb download failed",
 				"url", url, "error", err)
 			return
 		}
@@ -276,7 +280,7 @@ func (c *cyc) hubMetricsNodeExporter() {
 	// included); the runner sees host paths, not HostRoot-joined.
 	if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 		"apt-get", "install", "-y", "/tmp/"+file); err != nil {
-		slog.Error("hub-metrics-fw: node_exporter deb install failed",
+		c.err("hub-metrics-fw: node_exporter deb install failed",
 			"deb", "/tmp/"+file, "error", err)
 	}
 }
@@ -440,10 +444,12 @@ d %s 0755 99 99 -
 `, sockDir)), 0o644)
 	if err := os.MkdirAll(r.hp(sockDir), 0o755); err == nil {
 		if err := os.Chown(r.hp(sockDir), 99, 99); err != nil {
-			slog.Warn("api-lb-vm: chown 99 sock dir failed", "dir", sockDir, "error", err)
+			c.err("api-lb-vm: chown 99 sock dir failed — docker creates "+
+				"the bind source root:root and the VIP crash-loops",
+				"dir", sockDir, "error", err)
 		}
 	} else {
-		slog.Error("api-lb-vm: sock dir create failed", "dir", sockDir, "error", err)
+		c.err("api-lb-vm: sock dir create failed", "dir", sockDir, "error", err)
 	}
 
 	// journald persistence — the only drain-audit history on these
@@ -468,14 +474,19 @@ SystemMaxUse=500M
 		}
 		if err := os.MkdirAll(r.hp("/var/log/journal/"+mid), 0o755); err == nil {
 			if err := os.Chmod(r.hp("/var/log/journal/"+mid), 0o2755); err != nil {
+				// Best-effort — the dir exists; drifted perms only
+				// weaken the audit-history setup, not the guard.
 				slog.Warn("api-lb-vm: chmod journal dir failed",
 					"dir", "/var/log/journal/"+mid, "error", err)
 			}
 			if _, err := r.run(ctx, "chgrp", "systemd-journal", "/var/log/journal/"+mid); err != nil {
+				// Best-effort — same audit-history rationale.
 				slog.Warn("api-lb-vm: chgrp journal dir failed",
 					"dir", "/var/log/journal/"+mid, "error", err)
 			}
 		} else {
+			// Best-effort — journald persistence only carries the
+			// drain-audit history; the guard itself still converges.
 			slog.Warn("api-lb-vm: journal dir create failed — journald persistence may not take effect",
 				"dir", "/var/log/journal/"+mid, "error", err)
 		}
@@ -531,7 +542,8 @@ CA_FILE=/etc/api-backend-guard/ca.crt
 	// explicitly so a drifted 0755 credential dir is re-tightened.
 	r.ensureDir("/etc/api-backend-guard", 0o700)
 	if err := os.Chmod(r.hp("/etc/api-backend-guard"), 0o700); err != nil {
-		slog.Warn("api-lb-vm: chmod 0700 credential dir failed", "error", err)
+		c.err("api-lb-vm: chmod 0700 credential dir failed — guard token left readable",
+			"error", err)
 	}
 	r.writeManaged("/etc/api-backend-guard.conf", []byte(conf), 0o644)
 
@@ -562,18 +574,18 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 	r, ctx := c.r, c.ctx
 	out, err := r.run(ctx, "docker", "inspect", container)
 	if err != nil {
-		slog.Error("api-lb-vm: docker inspect failed — skipping haproxy converge",
+		c.err("api-lb-vm: docker inspect failed — skipping haproxy converge",
 			"container", container, "error", err)
 		return
 	}
 	var ins []lbgInspect
 	if err := json.Unmarshal([]byte(out), &ins); err != nil {
-		slog.Error("api-lb-vm: docker inspect unparseable — skipping haproxy converge",
+		c.err("api-lb-vm: docker inspect unparseable — skipping haproxy converge",
 			"container", container, "error", err)
 		return
 	}
 	if len(ins) == 0 {
-		slog.Error("api-lb-vm: docker inspect returned no containers — skipping haproxy converge",
+		c.err("api-lb-vm: docker inspect returned no containers — skipping haproxy converge",
 			"container", container)
 		return
 	}
@@ -592,7 +604,7 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 	}
 	// ansible assert parity.
 	if composeFile == "" || cfgPath == "" {
-		slog.Error("api-lb-vm: cannot locate compose file or haproxy.cfg — "+
+		c.err("api-lb-vm: cannot locate compose file or haproxy.cfg — "+
 			"check this VM manually", "container", container,
 			"compose", composeFile, "cfg", cfgPath)
 		return
@@ -601,6 +613,8 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 
 	cfgChanged := false
 	if b, err := os.ReadFile(r.hp(cfgPath)); err != nil {
+		// Best-effort precondition — the definitive signal (admin
+		// socket absent after the wait below) is what counts.
 		slog.Warn("api-lb-vm: cannot read haproxy.cfg — stats socket not ensured",
 			"path", cfgPath, "error", err)
 	} else if !strings.Contains(string(b), "stats socket") {
@@ -615,6 +629,7 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 
 	composeChanged := false
 	if cb, err := os.ReadFile(r.hp(composeFile)); err != nil {
+		// Best-effort precondition — same socket-wait signal below.
 		slog.Warn("api-lb-vm: cannot read compose file — /run/haproxy mount not ensured",
 			"path", composeFile, "error", err)
 	} else {
@@ -633,7 +648,7 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 		if out, err := r.run(ctx, "docker", "run", "--rm",
 			"-v", cfgPath+":/tmp/haproxy.cfg:ro",
 			image, "haproxy", "-c", "-f", "/tmp/haproxy.cfg"); err != nil {
-			slog.Error("api-lb-vm: haproxy -c failed — not recreating/restarting",
+			c.err("api-lb-vm: haproxy -c failed — not recreating/restarting",
 				"cfg", cfgPath, "out", out, "error", err)
 			return
 		}
@@ -644,12 +659,12 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 		if _, err := r.run(ctx, "sh", "-c",
 			fmt.Sprintf("cd %s && docker compose -f %s up -d",
 				sq(composeDir), sq(composeFile))); err != nil {
-			slog.Warn("api-lb-vm: docker compose up failed — admin socket will not appear",
+			c.err("api-lb-vm: docker compose up failed — admin socket will not appear",
 				"compose", composeFile, "error", err)
 		}
 	case cfgChanged:
 		if _, err := r.run(ctx, "docker", "restart", container); err != nil {
-			slog.Warn("api-lb-vm: docker restart failed — config change not applied",
+			c.err("api-lb-vm: docker restart failed — config change not applied",
 				"container", container, "error", err)
 		}
 	}
@@ -664,7 +679,7 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	slog.Warn("api-lb-vm: haproxy admin socket did not appear in 30s — guard drains will fail",
+	c.err("api-lb-vm: haproxy admin socket did not appear in 30s — guard drains will fail",
 		"socket", socket, "container", container)
 }
 
@@ -707,7 +722,7 @@ func (c *cyc) etcdctlInstallBinary() {
 	tgz := defStr(c.v("etcdctl_tgz_file"), pathpkg.Base(url))
 	if ver == "" || ver == "None" || url == "" || url == "None" ||
 		sum == "" || sum == "None" {
-		slog.Error("etcdctl: missing etcdctl_version+etcdctl_tgz_{url,sha256} pins — not converging")
+		c.err("etcdctl: missing etcdctl_version+etcdctl_tgz_{url,sha256} pins — not converging")
 		return
 	}
 	bin := "/var/lib/k0s/bin/etcdctl"
@@ -720,22 +735,24 @@ func (c *cyc) etcdctlInstallBinary() {
 		// same contract as T5b/T9: verify the STAGED file every run —
 		// a corrupted/operator-swapped tarball must not install.
 		if !sha256FileOK(local, sum) {
-			slog.Error("etcdctl: staged tgz sha256 mismatch — not installing",
+			c.err("etcdctl: staged tgz sha256 mismatch — not installing",
 				"file", local, "sha256", sum)
 			return
 		}
 	} else if err := download(ctx, url, local, sum); err != nil {
-		slog.Error("etcdctl: tgz download", "url", url, "file", local, "error", err)
+		c.err("etcdctl: tgz download", "url", url, "file", local, "error", err)
 		return
 	}
 	// /var/lib/k0s/bin exists on every k0s host, but untarInstall does
 	// not create parents — keep the install self-contained.
 	if err := r.ensureDir("/var/lib/k0s/bin", 0o755); err != nil {
+		// ensureDir already counted the failure via noteErr — log
+		// context only, do not count the same fault twice.
 		slog.Error("etcdctl: ensure k0s bin dir", "error", err)
 		return
 	}
 	if err := untarInstall(local, "etcdctl", r.hp(bin), 0o755); err != nil {
-		slog.Error("etcdctl: install", "file", local, "dst", bin, "error", err)
+		c.err("etcdctl: install", "file", local, "dst", bin, "error", err)
 	}
 }
 
@@ -770,7 +787,7 @@ func (c *cyc) groupKineService() {
 	// closed: keep last-good, warn so the operator fixes the vars.
 	ep := c.v("kine_endpoint")
 	if ep == "" || ep == "None" {
-		slog.Warn("kine.service: kine_endpoint not configured — skipping converge")
+		c.err("kine.service: kine_endpoint not configured — skipping converge")
 		return
 	}
 
@@ -780,13 +797,13 @@ func (c *cyc) groupKineService() {
 	binPath := "/usr/local/bin/kine"
 	url, sum := c.v("kine_bin_url"), c.v("kine_bin_sha256")
 	if url == "" || url == "None" || sum == "" || sum == "None" {
-		slog.Error("kine.service: missing kine_bin_url+kine_bin_sha256 pins — not converging")
+		c.err("kine.service: missing kine_bin_url+kine_bin_sha256 pins — not converging")
 		return
 	}
 	binChanged := false
 	if !r.fileExists(binPath) || !sha256FileOK(r.hp(binPath), sum) {
 		if err := download(ctx, url, r.hp(binPath), sum); err != nil {
-			slog.Error("kine.service: kine binary download", "url", url, "error", err)
+			c.err("kine.service: kine binary download", "url", url, "error", err)
 			return
 		}
 		binChanged = true
@@ -794,7 +811,7 @@ func (c *cyc) groupKineService() {
 	// Enforce mode drift even when the hash already matches — a 0644
 	// binary cannot exec.
 	if err := os.Chmod(r.hp(binPath), 0o755); err != nil {
-		slog.Error("kine.service: chmod kine binary", "path", binPath, "error", err)
+		c.err("kine.service: chmod kine binary", "path", binPath, "error", err)
 		return
 	}
 
@@ -803,7 +820,8 @@ func (c *cyc) groupKineService() {
 	// readable by every user).
 	r.ensureDir("/etc/kine", 0o700)
 	if err := os.Chmod(r.hp("/etc/kine"), 0o700); err != nil {
-		slog.Warn("kine.service: chmod 0700 /etc/kine", "path", "/etc/kine", "error", err)
+		c.err("kine.service: chmod 0700 /etc/kine — endpoint dir left readable",
+			"path", "/etc/kine", "error", err)
 	}
 	envChanged, _ := r.writeManaged("/etc/kine/kine.env",
 		[]byte("# Managed by node-config-agent - kine datastore endpoint (KINE_ENDPOINT)\n"+
@@ -811,7 +829,8 @@ func (c *cyc) groupKineService() {
 	// writeManaged preserves an existing file's mode — kine.env holds
 	// a password so always re-enforce 0600.
 	if err := os.Chmod(r.hp("/etc/kine/kine.env"), 0o600); err != nil {
-		slog.Warn("kine.service: chmod 0600 kine.env", "path", "/etc/kine/kine.env", "error", err)
+		c.err("kine.service: chmod 0600 kine.env — DB password file left readable",
+			"path", "/etc/kine/kine.env", "error", err)
 	}
 
 	// Defaults mirror the invocation k0s uses for embedded kine:

@@ -63,6 +63,29 @@
 //     /proc/1/net/sockstat → node_host_agent_filefd_* +
 //     node_host_agent_sockstat_* — fd exhaustion and orphan/TIME_WAIT
 //     pileups present as accept/connect flakes.
+//   - On-disk PKI cert expiry (2.4): *.crt/*.pem under the k0s/kine
+//     PKI dirs → node_host_agent_pki_cert_days_left{path} — the
+//     apiserver/etcd/kubelet-client certs expire silently; a lapsed
+//     cert surfaces as a control-plane outage weeks after the
+//     warning should have fired.
+//   - inotify pressure (A1/H8): /proc/[0-9]*/fdinfo sweep (cached
+//     60s — a full walk per scrape is too heavy) vs
+//     /proc/sys/fs/inotify/max_user_{instances,watches} →
+//     node_host_agent_inotify_{instances,watches}_used_ratio. An
+//     inotify-instance leak presents as `too many open files` while
+//     fs.file-nr is nearly empty; over 80% the top 3 holder PIDs are
+//     logged once per episode.
+//   - zombie + cgroup pids pressure (A2): state Z entries under
+//     ProcRoot → node_host_agent_processes_zombie_count, and
+//     pids.current/pids.max of the k0s/kubepods slices →
+//     node_host_agent_cgroup_pids_used_ratio{slice} — pids.max
+//     exhaustion is `fork: resource temporarily unavailable` while
+//     CPU looks idle.
+//   - MTU drift (B4): cilium_net MTU (sysfs, falling back to
+//     agent-runtime-config.json) vs the nebula overlay MTU →
+//     node_host_agent_mtu_drift = 1 when the pod datapath MTU
+//     exceeds the overlay's — packets then die silently on
+//     FRAG_NEEDED (1300-byte neb1 vs 1500 pods).
 //
 // Emission policy (documented choice): watchdog_state emits for every
 // latch ever observed (1 while latched, 0 after clear). The
@@ -79,9 +102,13 @@ package hostmetrics
 
 import (
 	"bufio"
+	"cmp"
+	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -129,6 +156,20 @@ const (
 	cpuDeliveredTarget    = 0.3
 	cpuDeliveredMaxWall   = 60 * time.Second
 	defaultCPUDeliveredIn = 2 * time.Minute
+	// A1 inotify + A2 zombie/pids + B4 MTU-drift sources. ProcRoot is
+	// plain /proc (hostPID:true makes the pod's /proc the host's);
+	// the inotify fdinfo sweep is cached — walking every fdinfo file
+	// per scrape is too heavy on a busy node.
+	defaultProcRoot            = "/proc"
+	defaultInotifyScanInterval = 60 * time.Second
+	defaultInotifyMaxInstFile  = "/proc/sys/fs/inotify/max_user_instances"
+	defaultInotifyMaxWatchFile = "/proc/sys/fs/inotify/max_user_watches"
+	defaultCgroupRoot          = "/sys/fs/cgroup"
+	defaultCiliumIface         = "cilium_net"
+	// inotifyWarnRatio is the fill ratio that logs the top-3 holder
+	// report — early enough to find the leaker before
+	// max_user_instances is hit.
+	inotifyWarnRatio = 0.80
 )
 
 // nebulaCertWarnDays mirrors module 13-nebula-health: fewer than this
@@ -156,6 +197,26 @@ var defaultRemovedFlags = []string{"concurrent-service-syncs"}
 // k0s data dir, the OpenEBS local-path provisioner root).
 var defaultFilesystemTargets = []string{
 	"/host/etc", "/host/var/lib/k0s", "/var/openebs/local",
+}
+
+// defaultPKIHostPaths are the PKI sources scanned for *.crt/*.pem —
+// host-relative, joined under HostRoot: the k0s apiserver+etcd cert
+// dirs, the kubelet client bundle (a single file), and the kine
+// etcd-pki dir on standalone DB VMs.
+var defaultPKIHostPaths = []string{
+	"var/lib/k0s/pki",
+	"var/lib/k0s/pki/etcd",
+	"var/lib/k0s/kubelet/pki/kubelet-client-current.pem",
+	"etc/kine/pki",
+}
+
+// defaultCgroupPidsSlices are the cgroup-v2 dirs whose
+// pids.current/pids.max feed the pids-used-ratio gauge (A2) — the
+// k0s units plus the whole pod workload slice.
+var defaultCgroupPidsSlices = []string{
+	"system.slice/k0sworker.service",
+	"system.slice/k0scontroller.service",
+	"kubepods.slice",
 }
 
 // defaultExpectedKCMArgs is the expected key set of
@@ -210,6 +271,39 @@ type Config struct {
 	// FilesystemTargets are the mounts statfs'd per scrape for the
 	// inode gauges (H3) and the hung-mount probe (H7).
 	FilesystemTargets []string
+	// HostRoot prefixes host-side paths that live under the
+	// DaemonSet's host-fs mount (PKI dirs, the cilium runtime
+	// config) — "/host" in the pod, "/" standalone. Empty
+	// auto-detects: "/host" when that dir exists, else "/".
+	HostRoot string
+	// PKICertPaths are the cert sources (2.4): each entry is either
+	// a directory scanned one level deep for *.crt/*.pem files or a
+	// single cert file — default the k0s/kine PKI paths under
+	// HostRoot. The {path} label carries the HostRoot-relative path
+	// so the series reads identically on pods and standalone hosts.
+	PKICertPaths []string
+	// ProcRoot is the host /proc — the inotify fdinfo and zombie
+	// scans walk it (hostPID:true makes the pod's /proc the host's).
+	ProcRoot string
+	// InotifyScanInterval caches the fdinfo sweep — one full
+	// /proc/*/fdinfo walk is too expensive to run per scrape.
+	InotifyScanInterval time.Duration
+	// InotifyMaxInstancesFile/InotifyMaxWatchesFile are the
+	// /proc/sys/fs/inotify/max_user_* limits the used ratios divide
+	// by.
+	InotifyMaxInstancesFile string
+	InotifyMaxWatchesFile   string
+	// CgroupRoot is the cgroup-v2 mount; CgroupPidsSlices are the
+	// cgroup-relative dirs whose pids.current/pids.max feed
+	// node_host_agent_cgroup_pids_used_ratio{slice}.
+	CgroupRoot       string
+	CgroupPidsSlices []string
+	// CiliumIface is the cilium host-side interface for the B4 MTU
+	// drift check vs NebulaIface; CiliumRuntimeConfig is the
+	// fallback MTU source (agent-runtime-config.json under
+	// HostRoot).
+	CiliumIface         string
+	CiliumRuntimeConfig string
 
 	// nowFn supplies the current time — seam for tests.
 	nowFn func() time.Time
@@ -288,6 +382,47 @@ func (c *Config) applyDefaults() {
 	if c.fsProbeTimeout <= 0 {
 		c.fsProbeTimeout = defaultFSProbeTimeout
 	}
+	if c.HostRoot == "" {
+		// Auto-detect: "/host" when the DaemonSet mount is there,
+		// "/" otherwise (standalone systemd binary on the host).
+		if fi, err := os.Stat("/host"); err == nil && fi.IsDir() {
+			c.HostRoot = "/host"
+		} else {
+			c.HostRoot = "/"
+		}
+	}
+	if len(c.PKICertPaths) == 0 {
+		c.PKICertPaths = make([]string, 0, len(defaultPKIHostPaths))
+		for _, p := range defaultPKIHostPaths {
+			c.PKICertPaths = append(c.PKICertPaths,
+				filepath.Join(c.HostRoot, p))
+		}
+	}
+	if c.ProcRoot == "" {
+		c.ProcRoot = defaultProcRoot
+	}
+	if c.InotifyScanInterval <= 0 {
+		c.InotifyScanInterval = defaultInotifyScanInterval
+	}
+	if c.InotifyMaxInstancesFile == "" {
+		c.InotifyMaxInstancesFile = defaultInotifyMaxInstFile
+	}
+	if c.InotifyMaxWatchesFile == "" {
+		c.InotifyMaxWatchesFile = defaultInotifyMaxWatchFile
+	}
+	if c.CgroupRoot == "" {
+		c.CgroupRoot = defaultCgroupRoot
+	}
+	if len(c.CgroupPidsSlices) == 0 {
+		c.CgroupPidsSlices = defaultCgroupPidsSlices
+	}
+	if c.CiliumIface == "" {
+		c.CiliumIface = defaultCiliumIface
+	}
+	if c.CiliumRuntimeConfig == "" {
+		c.CiliumRuntimeConfig = filepath.Join(c.HostRoot,
+			"run/cilium/state/agent-runtime-config.json")
+	}
 }
 
 // Collector implements prometheus.Collector — all reads happen at
@@ -348,6 +483,15 @@ type Collector struct {
 	descSockTCPTW      *prometheus.Desc
 	descSockUsed       *prometheus.Desc
 
+	// Wave-2 additions: 2.4 PKI certs, A1 inotify, A2 zombie/cgroup
+	// pids, B4 MTU drift.
+	descPKIDays        *prometheus.Desc
+	descInotifyInst    *prometheus.Desc
+	descInotifyWatches *prometheus.Desc
+	descZombies        *prometheus.Desc
+	descCgroupPids     *prometheus.Desc
+	descMTUDrift       *prometheus.Desc
+
 	// Legacy node-watchdog aliases — the prom_emit textfile series
 	// the fluxcd PrometheusRules still alert on
 	// (node_watchdog_state{signal}, node_watchdog_egress_relay{target}).
@@ -383,6 +527,25 @@ type Collector struct {
 	// stall logs once per mount per episode instead of once per
 	// scrape for the whole outage.
 	fsStalledLogged map[string]bool
+
+	// inotify sweep cache (mu): the /proc/*/fdinfo walk is done at
+	// most once per InotifyScanInterval — the scrape serves the
+	// cached result.
+	inoAt          time.Time
+	inoInstances   uint64
+	inoWatches     uint64
+	inoTop         []inotifyConsumer
+	inoWarnedInst  bool // edge-triggered >80% Warn per episode
+	inoWarnedWatch bool
+}
+
+// inotifyConsumer is one process's inotify footprint — kept for the
+// top-3 holder report when a used ratio crosses the warn line.
+type inotifyConsumer struct {
+	pid       int
+	name      string
+	instances uint64
+	watches   uint64
 }
 
 // New returns the Collector. Register it on the agent's registry.
@@ -523,6 +686,32 @@ func New(cfg Config) *Collector {
 		"sockstat 'sockets: used' — total sockets in use across protocols.",
 		[]string{"node"}, nil)
 
+	// Wave-2 gray-failure telemetry — same node-label convention.
+	c.descPKIDays = prometheus.NewDesc(
+		"node_host_agent_pki_cert_days_left",
+		"Days until the earliest notAfter of the on-disk PKI cert at this path (emitted only when a cert parses).",
+		[]string{"node", "path"}, nil)
+	c.descInotifyInst = prometheus.NewDesc(
+		"node_host_agent_inotify_instances_used_ratio",
+		"inotify fds in use / max_user_instances (emitted only when the limit parses and is > 0).",
+		[]string{"node"}, nil)
+	c.descInotifyWatches = prometheus.NewDesc(
+		"node_host_agent_inotify_watches_used_ratio",
+		"inotify watches in use / max_user_watches (emitted only when the limit parses and is > 0).",
+		[]string{"node"}, nil)
+	c.descZombies = prometheus.NewDesc(
+		"node_host_agent_processes_zombie_count",
+		"Processes in state Z under the host proc root (emitted only when the scan succeeds).",
+		[]string{"node"}, nil)
+	c.descCgroupPids = prometheus.NewDesc(
+		"node_host_agent_cgroup_pids_used_ratio",
+		"pids.current / pids.max of the slice (emitted only when both files parse and max > 0).",
+		[]string{"node", "slice"}, nil)
+	c.descMTUDrift = prometheus.NewDesc(
+		"node_host_agent_mtu_drift",
+		"cilium datapath MTU exceeds the nebula overlay MTU (1 = drift; emitted only when both MTUs resolve).",
+		[]string{"node"}, nil)
+
 	c.descMeta = map[*prometheus.Desc]descMeta{}
 	for _, d := range []struct {
 		desc *prometheus.Desc
@@ -585,6 +774,18 @@ func New(cfg Config) *Collector {
 			"sockstat TCP tw — TCP sockets in TIME_WAIT."},
 		{c.descSockUsed, "node_host_agent_sockstat_sockets_used",
 			"sockstat 'sockets: used' — total sockets in use."},
+		{c.descPKIDays, "node_host_agent_pki_cert_days_left",
+			"Days until the earliest notAfter of the on-disk PKI cert at this path."},
+		{c.descInotifyInst, "node_host_agent_inotify_instances_used_ratio",
+			"inotify fds in use / max_user_instances."},
+		{c.descInotifyWatches, "node_host_agent_inotify_watches_used_ratio",
+			"inotify watches in use / max_user_watches."},
+		{c.descZombies, "node_host_agent_processes_zombie_count",
+			"Processes in state Z under the host proc root."},
+		{c.descCgroupPids, "node_host_agent_cgroup_pids_used_ratio",
+			"pids.current / pids.max of the slice."},
+		{c.descMTUDrift, "node_host_agent_mtu_drift",
+			"cilium datapath MTU exceeds the nebula overlay MTU (1 = drift)."},
 	} {
 		c.descMeta[d.desc] = descMeta{name: d.name, help: d.help}
 	}
@@ -629,6 +830,12 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.descSockTCPOrphan
 	ch <- c.descSockTCPTW
 	ch <- c.descSockUsed
+	ch <- c.descPKIDays
+	ch <- c.descInotifyInst
+	ch <- c.descInotifyWatches
+	ch <- c.descZombies
+	ch <- c.descCgroupPids
+	ch <- c.descMTUDrift
 }
 
 // Collect implements prometheus.Collector.
@@ -657,6 +864,11 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.collectFilesystem(ch)
 	c.collectFileFD(ch)
 	c.collectSockstat(ch)
+	c.collectPKICerts(ch)
+	c.collectInotify(ch)
+	c.collectZombies(ch)
+	c.collectCgroupPids(ch)
+	c.collectMTUDrift(ch)
 }
 
 // collectWatchdog scans state-* latch files. certDays/certOK fold the
@@ -1579,6 +1791,365 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.descSockTCPTW,
 			prometheus.GaugeValue, tcpTW, c.cfg.NodeName)
 	}
+}
+
+// --- 2.4: on-disk PKI cert expiry ---
+
+// pkiCertFiles expands one PKICertPaths entry: a directory yields
+// its *.crt/*.pem children one level deep, a regular file is taken
+// as-is.
+func pkiCertFiles(path string) []string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	if !fi.IsDir() {
+		return []string{path}
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil
+	}
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if n := e.Name(); strings.HasSuffix(n, ".crt") || strings.HasSuffix(n, ".pem") {
+			files = append(files, filepath.Join(path, n))
+		}
+	}
+	sort.Strings(files)
+	return files
+}
+
+// pemDaysLeft returns days until the EARLIEST notAfter of any cert
+// block in the PEM data — a bundle file exports its worst member.
+// ok=false when no block parses.
+func pemDaysLeft(data []byte, now int64) (float64, bool) {
+	var min time.Time
+	ok := false
+	for rest := data; ; {
+		var b *pem.Block
+		b, rest = pem.Decode(rest)
+		if b == nil {
+			break
+		}
+		cert, err := x509.ParseCertificate(b.Bytes)
+		if err != nil {
+			continue // a non-cert PEM block must not kill the file
+		}
+		if !ok || cert.NotAfter.Before(min) {
+			min, ok = cert.NotAfter, true
+		}
+	}
+	if !ok {
+		return 0, false
+	}
+	// math.Floor, not truncation: -1.9d must read -2, not -1 — an
+	// already-expired cert rounds AWAY from zero like the positive
+	// side does toward it.
+	return math.Floor(float64(min.Unix()-now) / 86400), true
+}
+
+// collectPKICerts emits days-left per cert file — absent when no
+// cert under the source parses (same no-fake-0 rule as the nebula
+// cert gauge). The path label strips the HostRoot mount prefix so
+// pods and standalone hosts emit identical series.
+func (c *Collector) collectPKICerts(ch chan<- prometheus.Metric) {
+	now := c.cfg.nowFn().Unix()
+	for _, src := range c.cfg.PKICertPaths {
+		for _, f := range pkiCertFiles(src) {
+			data, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			days, ok := pemDaysLeft(data, now)
+			if !ok {
+				continue
+			}
+			// Keep the leading slash: HostRoot="/" strips it while
+			// HostRoot="/host" leaves it — the label must read
+			// identically on pods and standalone hosts.
+			label := strings.TrimPrefix(f, c.cfg.HostRoot)
+			if !strings.HasPrefix(label, "/") {
+				label = "/" + label
+			}
+			ch <- prometheus.MustNewConstMetric(c.descPKIDays,
+				prometheus.GaugeValue, days, c.cfg.NodeName, label)
+		}
+	}
+}
+
+// --- A1: inotify instances/watches pressure ---
+var pidDirRe = regexp.MustCompile(`^[0-9]+$`)
+
+// inotifyFDTarget is the /proc/<pid>/fd/<fd> symlink target the
+// kernel gives an inotify group fd — the same source
+// node_exporter/procfs uses to count instances.
+const inotifyFDTarget = "anon_inode:inotify"
+
+// sweepInotify walks every /proc/<pid>/fd/* counting inotify
+// INSTANCES by fd symlink target and WATCHES by `inotify wd:` lines
+// in the matching fdinfo file. The symlink read is mandatory: an
+// inotify group holding ZERO watches emits no identifying line in
+// fdinfo — the classic inotify_init() fd leak (exactly what the
+// instances-used ratio exists to catch) is invisible to any
+// fdinfo-only count while the host races max_user_instances.
+func (c *Collector) sweepInotify() (inst, watch uint64, top []inotifyConsumer) {
+	pids, err := os.ReadDir(c.cfg.ProcRoot)
+	if err != nil {
+		return 0, 0, nil
+	}
+	cons := map[int]*inotifyConsumer{}
+	for _, p := range pids {
+		if !p.IsDir() || !pidDirRe.MatchString(p.Name()) {
+			continue
+		}
+		pid, _ := strconv.Atoi(p.Name())
+		fds, err := os.ReadDir(filepath.Join(c.cfg.ProcRoot, p.Name(), "fd"))
+		if err != nil {
+			continue
+		}
+		for _, fd := range fds {
+			target, err := os.Readlink(filepath.Join(
+				c.cfg.ProcRoot, p.Name(), "fd", fd.Name()))
+			if err != nil || target != inotifyFDTarget {
+				continue
+			}
+			// fdinfo may be absent or unreadable for a raced fd —
+			// the instance still counts, with zero watches.
+			var w uint64
+			if data, rerr := os.ReadFile(filepath.Join(
+				c.cfg.ProcRoot, p.Name(), "fdinfo", fd.Name())); rerr == nil {
+				w = uint64(strings.Count(string(data), "inotify wd:"))
+			}
+			inst++
+			watch += w
+			cc := cons[pid]
+			if cc == nil {
+				cc = &inotifyConsumer{pid: pid}
+				cons[pid] = cc
+			}
+			cc.instances++
+			cc.watches += w
+		}
+	}
+	for _, cc := range cons {
+		data, err := os.ReadFile(filepath.Join(
+			c.cfg.ProcRoot, strconv.Itoa(cc.pid), "comm"))
+		if err == nil {
+			cc.name = strings.TrimSpace(string(data))
+		}
+	}
+	all := make([]inotifyConsumer, 0, len(cons))
+	for _, cc := range cons {
+		all = append(all, *cc)
+	}
+	slices.SortFunc(all, func(a, b inotifyConsumer) int {
+		if a.watches != b.watches {
+			return cmp.Compare(b.watches, a.watches)
+		}
+		return cmp.Compare(a.pid, b.pid)
+	})
+	if len(all) > 3 {
+		all = all[:3]
+	}
+	return inst, watch, all
+}
+
+// inotifySnapshot returns the cached sweep, re-walking the procfs
+// at most once per InotifyScanInterval.
+func (c *Collector) inotifySnapshot() (uint64, uint64, []inotifyConsumer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.nowFn().Sub(c.inoAt) < c.cfg.InotifyScanInterval {
+		return c.inoInstances, c.inoWatches, c.inoTop
+	}
+	c.inoInstances, c.inoWatches, c.inoTop = c.sweepInotify()
+	c.inoAt = c.cfg.nowFn()
+	return c.inoInstances, c.inoWatches, c.inoTop
+}
+
+// warnInotifyTop edge-logs the top-3 holder report once per
+// over-threshold episode (the fsStalledLogged pattern).
+func (c *Collector) warnInotifyTop(kind string, over bool,
+	top []inotifyConsumer) {
+	c.mu.Lock()
+	var warned *bool
+	if kind == "instances" {
+		warned = &c.inoWarnedInst
+	} else {
+		warned = &c.inoWarnedWatch
+	}
+	was := *warned
+	*warned = over
+	c.mu.Unlock()
+	if !over || was {
+		return
+	}
+	parts := make([]string, 0, len(top))
+	for _, p := range top {
+		parts = append(parts, fmt.Sprintf("pid=%d %s instances=%d watches=%d",
+			p.pid, p.name, p.instances, p.watches))
+	}
+	slog.Warn("hostmetrics: inotify "+kind+" above "+
+		strconv.FormatFloat(inotifyWarnRatio*100, 'f', -1, 64)+
+		"% of the limit — top holders: "+strings.Join(parts, "; "),
+		"subsystem", "hostmetrics", "kind", kind)
+}
+
+// collectInotify emits the two fill ratios — each only when its own
+// limit file parses (same per-source rule as conntrack).
+func (c *Collector) collectInotify(ch chan<- prometheus.Metric) {
+	inst, watch, top := c.inotifySnapshot()
+	maxI, instOK := readUintFile(c.cfg.InotifyMaxInstancesFile)
+	maxW, watchOK := readUintFile(c.cfg.InotifyMaxWatchesFile)
+	if instOK && maxI > 0 {
+		r := float64(inst) / float64(maxI)
+		ch <- prometheus.MustNewConstMetric(c.descInotifyInst,
+			prometheus.GaugeValue, r, c.cfg.NodeName)
+		c.warnInotifyTop("instances", r >= inotifyWarnRatio, top)
+	}
+	if watchOK && maxW > 0 {
+		r := float64(watch) / float64(maxW)
+		ch <- prometheus.MustNewConstMetric(c.descInotifyWatches,
+			prometheus.GaugeValue, r, c.cfg.NodeName)
+		c.warnInotifyTop("watches", r >= inotifyWarnRatio, top)
+	}
+}
+
+// --- A2: zombie count + cgroup pids pressure ---
+
+// collectZombies counts state Z processes under ProcRoot — the
+// state char sits right after the LAST ')' because comm can
+// contain spaces and parens (same trick as workerhygiene's
+// pidLive). Emits only when the proc root scans.
+func (c *Collector) collectZombies(ch chan<- prometheus.Metric) {
+	entries, err := os.ReadDir(c.cfg.ProcRoot)
+	if err != nil {
+		return
+	}
+	var n float64
+	for _, e := range entries {
+		if !e.IsDir() || !pidDirRe.MatchString(e.Name()) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(c.cfg.ProcRoot, e.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		s := string(data)
+		if i := strings.LastIndexByte(s, ')'); i >= 0 {
+			if f := strings.Fields(s[i+1:]); len(f) > 0 && f[0] == "Z" {
+				n++
+			}
+		}
+	}
+	ch <- prometheus.MustNewConstMetric(c.descZombies,
+		prometheus.GaugeValue, n, c.cfg.NodeName)
+}
+
+// collectCgroupPids emits pids.current/pids.max per slice — a
+// missing or non-numeric ("max") limit yields no ratio (never a
+// fake 0). The pids.current/pids.max filenames are cgroup-v2
+// unified-hierarchy only — k0s hosts are v2; on a v1 host the
+// files simply don't exist and no series emits.
+func (c *Collector) collectCgroupPids(ch chan<- prometheus.Metric) {
+	for _, slice := range c.cfg.CgroupPidsSlices {
+		cur, ok := readUintFile(filepath.Join(
+			c.cfg.CgroupRoot, slice, "pids.current"))
+		if !ok {
+			continue
+		}
+		mx, ok := readUintFile(filepath.Join(
+			c.cfg.CgroupRoot, slice, "pids.max"))
+		if !ok || mx == 0 {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(c.descCgroupPids,
+			prometheus.GaugeValue, float64(cur)/float64(mx),
+			c.cfg.NodeName, slice)
+	}
+}
+
+// --- B4: MTU drift (cilium datapath vs nebula overlay) ---
+
+// mtuOfIface parses /sys/class/net/<iface>/mtu.
+func mtuOfIface(sysnet, iface string) (int64, bool) {
+	v, ok := readUintFile(filepath.Join(sysnet, iface, "mtu"))
+	if !ok {
+		return 0, false
+	}
+	return int64(v), true
+}
+
+// jsonFindInts collects EVERY numeric value of a key named `key`
+// (case-insensitive) under decoded JSON — maps AND arrays are
+// descended. The cilium runtime config nests its MTU differently
+// across agent versions and may carry several `mtu` keys; a
+// "first match" walk is nondeterministic because Go map iteration
+// order is random.
+func jsonFindInts(v any, key string, out *[]int64) {
+	switch n := v.(type) {
+	case map[string]any:
+		for k, val := range n {
+			if strings.EqualFold(k, key) {
+				if f, ok := val.(float64); ok {
+					*out = append(*out, int64(f))
+				}
+			}
+			jsonFindInts(val, key, out)
+		}
+	case []any:
+		for _, val := range n {
+			jsonFindInts(val, key, out)
+		}
+	}
+}
+
+// runtimeConfigMTU is the fallback MTU source when the cilium_net
+// interface is absent: agent-runtime-config.json under HostRoot.
+// With several `mtu` keys the MAX wins — deterministic, and the
+// drift check wants the worst-case datapath MTU anyway.
+func runtimeConfigMTU(path string) (int64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	var v any
+	if json.Unmarshal(data, &v) != nil {
+		return 0, false
+	}
+	var vals []int64
+	jsonFindInts(v, "mtu", &vals)
+	if len(vals) == 0 {
+		return 0, false
+	}
+	return slices.Max(vals), true
+}
+
+// collectMTUDrift emits 1 when the pod-datapath MTU exceeds the
+// overlay's — a pod holding MTU 1500 dies silently on FRAG_NEEDED
+// through neb1 (1300). Both sides must resolve; else absent.
+func (c *Collector) collectMTUDrift(ch chan<- prometheus.Metric) {
+	neb, ok := mtuOfIface(c.cfg.SysClassNet, c.cfg.NebulaIface)
+	if !ok {
+		return
+	}
+	cil, ok := mtuOfIface(c.cfg.SysClassNet, c.cfg.CiliumIface)
+	if !ok {
+		cil, ok = runtimeConfigMTU(c.cfg.CiliumRuntimeConfig)
+	}
+	if !ok {
+		return
+	}
+	drift := 0.0
+	if cil > neb {
+		drift = 1
+	}
+	ch <- prometheus.MustNewConstMetric(c.descMTUDrift,
+		prometheus.GaugeValue, drift, c.cfg.NodeName)
 }
 
 // --- node-exporter textfile rendering (standalone prom_emit port) ---

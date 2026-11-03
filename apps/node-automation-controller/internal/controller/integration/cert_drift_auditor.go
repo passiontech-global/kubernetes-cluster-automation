@@ -22,6 +22,16 @@
 //     the secrets cert-manager does NOT manage (hand-installed vendor
 //     certs, bootstrap PKI) that have no Certificate object to alert
 //     through. Negative days = already expired.
+//  3. Webhook caBundle expiry — every clientConfig.caBundle of every
+//     webhook entry (annotated or not) feeds days-to-expiry, and an
+//     EMPTY bundle on a service-targeted entry with
+//     failurePolicy=Fail flags mismatch=1 (an apiserver that cannot
+//     verify TLS + fail-closed = admission outage).
+//  4. Linkerd trust bundles — ConfigMap
+//     linkerd/linkerd-identity-trust-roots (ca-bundle.crt) and any
+//     Secret in namespace linkerd carrying ca.crt/crt.pem (Opaque
+//     included, e.g. linkerd-identity-issuer) get days-to-expiry of
+//     the earliest cert in the bundle.
 //
 // Series lifecycle: both gauges keep a seen-set — secrets deleted and
 // webhook entries/annotations removed since the last sweep get their
@@ -69,11 +79,18 @@ type webhookMetricKey struct{ kind, name, webhook string }
 type secretMetricKey struct{ namespace, name string }
 
 // webhookEntry flattens the two webhook entry types (MutatingWebhook /
-// ValidatingWebhook share WebhookClientConfig) down to the pair this
+// ValidatingWebhook share WebhookClientConfig) down to the fields this
 // audit compares.
 type webhookEntry struct {
 	name     string
 	caBundle []byte
+	// service non-nil means the entry targets an in-cluster Service
+	// (vs a url clientConfig) — the only shape where a caBundle is
+	// strictly required.
+	service *admissionv1.ServiceReference
+	// fail resolves spec.failurePolicy == Fail — nil counts too:
+	// the API default IS Fail.
+	fail bool
 }
 
 type certDriftAuditor struct {
@@ -89,6 +106,10 @@ type certDriftAuditor struct {
 	seenWebhooks map[webhookMetricKey]bool
 	// seenSecrets: same lifecycle for the TLS-expiry gauge.
 	seenSecrets map[secretMetricKey]bool
+	// seenWebhookExpiry / seenTrustBundles: same lifecycle for the
+	// caBundle days-to-expiry and linkerd trust-bundle gauges.
+	seenWebhookExpiry map[webhookMetricKey]bool
+	seenTrustBundles  map[secretMetricKey]bool
 }
 
 // SetupCertDriftAuditor registers the 15m sweep — or nothing when the
@@ -101,11 +122,13 @@ func SetupCertDriftAuditor(mgr ctrl.Manager, cs kubernetes.Interface,
 		return nil
 	}
 	a := &certDriftAuditor{
-		cs:           cs,
-		dyn:          dyn,
-		nowFn:        time.Now,
-		seenWebhooks: map[webhookMetricKey]bool{},
-		seenSecrets:  map[secretMetricKey]bool{},
+		cs:                cs,
+		dyn:               dyn,
+		nowFn:             time.Now,
+		seenWebhooks:      map[webhookMetricKey]bool{},
+		seenSecrets:       map[secretMetricKey]bool{},
+		seenWebhookExpiry: map[webhookMetricKey]bool{},
+		seenTrustBundles:  map[secretMetricKey]bool{},
 	}
 	return shared.AddPeriodic(mgr, certDriftQueue, 15*time.Minute, a.run)
 }
@@ -123,8 +146,14 @@ func (a *certDriftAuditor) run(ctx context.Context) error {
 	if a.seenSecrets == nil {
 		a.seenSecrets = map[secretMetricKey]bool{}
 	}
+	if a.seenWebhookExpiry == nil {
+		a.seenWebhookExpiry = map[webhookMetricKey]bool{}
+	}
+	if a.seenTrustBundles == nil {
+		a.seenTrustBundles = map[secretMetricKey]bool{}
+	}
 
-	// The two audits are independent: a broken webhook list must not
+	// The audits are independent: a broken webhook list must not
 	// blind the TLS-expiry gauge (and vice versa). The first error
 	// propagates — the periodic wrapper owns run-level IncError, so
 	// this run() must not count the error it returns (double-count).
@@ -135,6 +164,12 @@ func (a *certDriftAuditor) run(ctx context.Context) error {
 	}
 	if err := a.auditTLSSecrets(ctx); err != nil {
 		log.Error(err, "tls secret expiry audit failed")
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if err := a.auditTrustBundles(ctx); err != nil {
+		log.Error(err, "linkerd trust-bundle audit failed")
 		if firstErr == nil {
 			firstErr = err
 		}
@@ -159,45 +194,82 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 	}
 
 	current := map[webhookMetricKey]bool{}
+	currentExpiry := map[webhookMetricKey]bool{}
 	for i := range mutating.Items {
 		m := &mutating.Items[i]
 		a.auditOneWebhookConfig(ctx, "MutatingWebhookConfiguration",
-			m.Name, m.Annotations, mutatingEntries(m.Webhooks), current)
+			m.Name, m.Annotations, mutatingEntries(m.Webhooks), current, currentExpiry)
 	}
 	for i := range validating.Items {
 		v := &validating.Items[i]
 		a.auditOneWebhookConfig(ctx, "ValidatingWebhookConfiguration",
-			v.Name, v.Annotations, validatingEntries(v.Webhooks), current)
+			v.Name, v.Annotations, validatingEntries(v.Webhooks), current, currentExpiry)
 	}
 
 	// Prune series for entries no longer covered — a webhook entry
-	// deleted or an annotation removed must not pin drift=1 forever.
+	// deleted or an annotation removed must not pin drift=1 (or a
+	// dead expiry figure) forever.
 	for k := range a.seenWebhooks {
 		if !current[k] {
 			metrics.WebhookCABundleMismatch.DeleteLabelValues(k.kind, k.name, k.webhook)
 		}
 	}
+	for k := range a.seenWebhookExpiry {
+		if !currentExpiry[k] {
+			metrics.WebhookCABundleDaysToExpiry.DeleteLabelValues(k.kind, k.name, k.webhook)
+		}
+	}
 	a.seenWebhooks = current
+	a.seenWebhookExpiry = currentExpiry
 	return nil
 }
 
-// auditOneWebhookConfig resolves the config's cainjector source and
-// diffs every covered webhook entry's caBundle against it. The
-// cainjector annotations cover the WHOLE config (every entry gets the
-// CA written), so entries only fall outside the audit when the config
-// carries no inject annotation at all. When the source cannot be
+// auditOneWebhookConfig runs the two annotation-independent checks on
+// EVERY entry first — caBundle expiry (days-until-NotAfter) and the
+// empty-bundle fail-closed flag — then the cainjector drift diff for
+// configs carrying an inject annotation. When the source cannot be
 // resolved (annotation malformed, Certificate/Secret missing), the
-// config's previously-emitted series are carried forward into
+// config's previously-emitted drift series are carried forward into
 // `current` — a transient lookup failure must not flap an active
 // drift alert off.
 func (a *certDriftAuditor) auditOneWebhookConfig(ctx context.Context,
 	kind, cfgName string, annos map[string]string,
-	entries []webhookEntry, current map[webhookMetricKey]bool) {
+	entries []webhookEntry, current, currentExpiry map[webhookMetricKey]bool) {
 	log := logf.FromContext(ctx)
 
+	// 2.4 — full surface: expiry + empty-bundle checks apply with or
+	// without a cainjector annotation — a hand-managed webhook
+	// expires/breaks identically.
+	for _, e := range entries {
+		k := webhookMetricKey{kind, cfgName, e.name}
+		if len(e.caBundle) == 0 {
+			// A service-targeted entry with NO caBundle cannot be
+			// verified by the apiserver — with failurePolicy=Fail
+			// every call errors: an outage signature, flagged as
+			// mismatch=1. url-targeted entries legitimately carry
+			// no bundle (public CA), so they skip.
+			if e.service != nil && e.fail {
+				current[k] = true
+				metrics.WebhookCABundleMismatch.
+					WithLabelValues(k.kind, k.name, k.webhook).Set(1)
+				log.Info("webhook entry has empty caBundle with failurePolicy=Fail — admission calls will fail",
+					"kind", kind, "config", cfgName, "webhook", e.name)
+			}
+			continue
+		}
+		if days, ok := earliestCertExpiryDays(e.caBundle, a.nowFn()); ok {
+			currentExpiry[k] = true
+			metrics.WebhookCABundleDaysToExpiry.
+				WithLabelValues(k.kind, k.name, k.webhook).Set(days)
+		} else {
+			log.Info("skip: caBundle carries no parseable X.509 PEM",
+				"kind", kind, "config", cfgName, "webhook", e.name)
+		}
+	}
+
 	// The cainjector annotations cover the WHOLE config — without one,
-	// no entry is injected, so the config drops out of the audit and
-	// any previously-emitted series prunes. Distinguish this from
+	// no entry is injected, so the config drops out of the drift diff
+	// and any previously-emitted series prunes. Distinguish this from
 	// "annotated but the source is unresolvable" below: the former is
 	// a clean exit, the latter is "can't tell".
 	hasInjectAnno := strings.TrimSpace(annos[injectCAFromAnno]) != "" ||
@@ -249,7 +321,12 @@ func (a *certDriftAuditor) injectionCA(ctx context.Context,
 			log.Info("skip: malformed inject-ca-from annotation",
 				"kind", kind, "config", cfgName, "value", ref)
 		} else {
-			secretName := a.certSecretName(ctx, ns, name)
+			secretName, resolved := a.certSecretName(ctx, ns, name)
+			if !resolved {
+				// Unresolvable source — "can't tell". The caller's
+				// carry-forward keeps any emitted series alive.
+				return nil, false
+			}
 			return a.secretCA(ctx, ns, secretName, kind, cfgName)
 		}
 	}
@@ -270,27 +347,29 @@ func (a *certDriftAuditor) injectionCA(ctx context.Context,
 // certSecretName resolves the Secret a Certificate writes to:
 // spec.secretName, falling back to the Certificate's own name (the
 // de-facto convention and the required fallback when the Certificate
-// object or cert-manager CRDs are absent).
-func (a *certDriftAuditor) certSecretName(ctx context.Context, ns, certName string) string {
+// object or cert-manager CRDs are absent). ok=false means "can't
+// resolve": a transient API/RBAC failure must NOT guess the name
+// convention — a same-named unrelated Secret would fabricate drift
+// (or hide a real one).
+func (a *certDriftAuditor) certSecretName(ctx context.Context, ns, certName string) (string, bool) {
 	cert, err := a.dyn.Resource(certificateGVR).Namespace(ns).
 		Get(ctx, certName, metav1.GetOptions{})
 	if err != nil {
 		// Only a genuine absence falls back to the name convention;
-		// a transient API/RBAC failure could resolve to a Secret of
-		// the same name holding a DIFFERENT CA → false drift.
+		// every other failure is unresolvable, not a fallback.
 		if apierrors.IsNotFound(err) {
-			return certName
+			return certName, true
 		}
 		logf.FromContext(ctx).Error(err,
-			"certificate get failed — keeping cert name (may be wrong)",
+			"certificate get failed — injection source unresolvable",
 			"cert", ns+"/"+certName)
-		return certName
+		return "", false
 	}
 	if sn, _, _ := unstructured.NestedString(
 		cert.Object, "spec", "secretName"); sn != "" {
-		return sn
+		return sn, true
 	}
-	return certName
+	return certName, true
 }
 
 // secretCA fetches the CA bytes from the injection-source Secret —
@@ -328,10 +407,18 @@ func splitNSName(ref string) (ns, name string, ok bool) {
 	return parts[0], parts[1], true
 }
 
+// webhookFails resolves failurePolicy — nil means the API default,
+// which IS Fail.
+func webhookFails(fp *admissionv1.FailurePolicyType) bool {
+	return fp == nil || *fp == admissionv1.Fail
+}
+
 func mutatingEntries(ws []admissionv1.MutatingWebhook) []webhookEntry {
 	out := make([]webhookEntry, 0, len(ws))
 	for _, w := range ws {
-		out = append(out, webhookEntry{name: w.Name, caBundle: w.ClientConfig.CABundle})
+		out = append(out, webhookEntry{
+			name: w.Name, caBundle: w.ClientConfig.CABundle,
+			service: w.ClientConfig.Service, fail: webhookFails(w.FailurePolicy)})
 	}
 	return out
 }
@@ -339,7 +426,9 @@ func mutatingEntries(ws []admissionv1.MutatingWebhook) []webhookEntry {
 func validatingEntries(ws []admissionv1.ValidatingWebhook) []webhookEntry {
 	out := make([]webhookEntry, 0, len(ws))
 	for _, w := range ws {
-		out = append(out, webhookEntry{name: w.Name, caBundle: w.ClientConfig.CABundle})
+		out = append(out, webhookEntry{
+			name: w.Name, caBundle: w.ClientConfig.CABundle,
+			service: w.ClientConfig.Service, fail: webhookFails(w.FailurePolicy)})
 	}
 	return out
 }
@@ -398,4 +487,114 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	}
 	a.seenSecrets = current
 	return nil
+}
+
+// earliestCertExpiryDays returns days until the earliest NotAfter
+// across every CERTIFICATE PEM block in the bundle — a bundle is as
+// dead as its first-to-expire cert for alerting purposes. ok=false
+// when nothing parses.
+func earliestCertExpiryDays(bundle []byte, now time.Time) (float64, bool) {
+	var earliest *time.Time
+	rest := bundle
+	for len(rest) > 0 {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		t := cert.NotAfter
+		if earliest == nil || t.Before(*earliest) {
+			earliest = &t
+		}
+	}
+	if earliest == nil {
+		return 0, false
+	}
+	return earliest.Sub(now).Hours() / 24, true
+}
+
+// ---------------------------------------------------------------------------
+// Check D — linkerd trust-bundle expiry (2.4)
+// ---------------------------------------------------------------------------
+
+const (
+	linkerdNS            = "linkerd"
+	linkerdTrustRootsCM  = "linkerd-identity-trust-roots"
+	linkerdTrustRootsKey = "ca-bundle.crt"
+)
+
+// auditTrustBundles exports days-to-expiry for the linkerd trust
+// surface: the linkerd-identity-trust-roots ConfigMap
+// (ca-bundle.crt) plus every Secret in namespace linkerd carrying a
+// ca.crt or crt.pem key — linkerd-identity-issuer is a plain Opaque
+// Secret (not kubernetes.io/tls), which is exactly why the TLS-secret
+// audit above cannot see it. An expired trust root wedges every new
+// proxy handshake (no mTLS) while existing connections still work —
+// the classic "mesh died silently" failure.
+func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
+	current := map[secretMetricKey]bool{}
+
+	// The trust-roots ConfigMap is optional — clusters without
+	// linkerd (or a differently-named install) simply skip.
+	cm, err := a.cs.CoreV1().ConfigMaps(linkerdNS).
+		Get(ctx, linkerdTrustRootsCM, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		a.emitTrustBundle(ctx, linkerdNS, linkerdTrustRootsCM,
+			[]byte(cm.Data[linkerdTrustRootsKey]), current)
+	case !apierrors.IsNotFound(err):
+		return fmt.Errorf("get linkerd trust-roots configmap: %w", err)
+	}
+
+	secrets, err := a.cs.CoreV1().Secrets(linkerdNS).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list linkerd secrets: %w", err)
+	}
+	for i := range secrets.Items {
+		s := &secrets.Items[i]
+		// Concatenate every bundle key — earliest expiry across
+		// ca.crt + crt.pem is what the gauge reports.
+		var bundle []byte
+		for _, key := range []string{"ca.crt", "crt.pem"} {
+			bundle = append(bundle, s.Data[key]...)
+		}
+		if len(bundle) == 0 {
+			continue
+		}
+		a.emitTrustBundle(ctx, s.Namespace, s.Name, bundle, current)
+	}
+
+	// Prune series for bundles deleted since the last sweep — the
+	// same seen-set lifecycle as the other two gauges.
+	for k := range a.seenTrustBundles {
+		if !current[k] {
+			metrics.TrustBundleDaysToExpiry.DeleteLabelValues(k.namespace, k.name)
+		}
+	}
+	a.seenTrustBundles = current
+	return nil
+}
+
+// emitTrustBundle parses the earliest cert expiry out of a PEM bundle
+// and lands it on the gauge — unparseable bundles log + emit nothing.
+func (a *certDriftAuditor) emitTrustBundle(ctx context.Context, ns, name string,
+	bundle []byte, current map[secretMetricKey]bool) {
+	if len(bundle) == 0 {
+		return
+	}
+	days, ok := earliestCertExpiryDays(bundle, a.nowFn())
+	if !ok {
+		logf.FromContext(ctx).Info("skip: trust bundle carries no parseable X.509 PEM",
+			"object", ns+"/"+name)
+		return
+	}
+	current[secretMetricKey{ns, name}] = true
+	metrics.TrustBundleDaysToExpiry.WithLabelValues(ns, name).Set(days)
 }

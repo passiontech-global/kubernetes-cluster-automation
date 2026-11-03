@@ -139,6 +139,15 @@ func concourseWorkerInit(ctx context.Context, args []string) int {
 	return 0
 }
 
+// convergeHostRoot/convergeRunner wire the production standalone
+// contract ("/" + DirectRunner) — tests stub both to run a scripted
+// converge against a tempdir host root instead of exec'ing real
+// host commands.
+var (
+	convergeHostRoot = "/"
+	convergeRunner   = func() hostconfig.Runner { return hostconfig.DirectRunner{} }
+)
+
 // convergeOnce runs exactly one hostconfig cycle on the host — the
 // systemd timer / manual "converge now" entrypoint for standalone
 // targets (DirectRunner: already inside the host namespaces).
@@ -170,10 +179,10 @@ func convergeOnce(ctx context.Context, args []string) int {
 		Enabled:        true,
 		NodeName:       nn,
 		Hostname:       hostname,
-		HostRoot:       "/",
+		HostRoot:       convergeHostRoot,
 		VarsDir:        *varsDir,
 		NebulaCertsDir: *certsDir,
-		Runner:         hostconfig.DirectRunner{},
+		Runner:         convergeRunner(),
 	}, nil)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "converge-once:", err)
@@ -181,11 +190,15 @@ func convergeOnce(ctx context.Context, args []string) int {
 	}
 	slog.Info("converge-once starting",
 		"node", nn, "varsDir", *varsDir, "certsDir", *certsDir)
-	hc.Cycle(ctx)
-	// hostconfig.Cycle is void — per-group failures only surface via
-	// internal metrics (unexported, registered on a nil registry here)
-	// and logs, so there is no cheap failure signal to map onto a
-	// non-zero exit for ansible changed_when/CI.
+	// CycleWithErrors counts topology/vars failures, group
+	// write/command errors and panics — a non-zero count means the
+	// converge did not fully apply, so the timer/CI caller gets a
+	// non-zero exit (ansible failed_when parity).
+	if errs := hc.CycleWithErrors(ctx); errs > 0 {
+		slog.Error("converge-once finished with errors",
+			"node", nn, "errors", errs)
+		return 1
+	}
 	return 0
 }
 

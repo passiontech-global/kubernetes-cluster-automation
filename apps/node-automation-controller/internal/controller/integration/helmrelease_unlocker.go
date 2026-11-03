@@ -24,8 +24,20 @@
 // retried release — helm cannot re-run a hook while its old Job still
 // exists ("cannot re-use a name that is still in use").
 //
+// Flux source artifact healer (C1): a HelmRelease OR Kustomization
+// stuck Ready=False >=15m on a stale-artifact signature ("artifact
+// not found", "failed to fetch", "chart pull error", "failed to
+// untar") is almost always a source-controller cache problem, not a
+// consumer problem — the fix is stamping
+// reconcile.fluxcd.io/requestedAt on the SOURCE object (HelmChart,
+// GitRepository, HelmRepository, OCIRepository), which refetches the
+// artifact. node.ops/last-source-nudge on the source caps this at
+// once per source per 30m across all consumers.
+//
 // Guards:
-//   - max one unlock per HR per 24h (in-memory);
+//   - max one unlock per HR per 24h (in-memory ledger AND the
+//     persisted node.ops/last-helm-unlock annotation — a restart
+//     wipes the ledger but must not refund the cooldown);
 //   - skip+warn while a helm-controller pod (flux-system,
 //     app.kubernetes.io/name=helm-controller) is CrashLoopBackOff —
 //     deleting secrets cannot converge without a working controller;
@@ -45,6 +57,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -67,6 +80,18 @@ const (
 	helmControllerNS   = "flux-system"
 	helmControllerSel  = "app.kubernetes.io/name=helm-controller"
 	fluxReconcileAnno  = "reconcile.fluxcd.io/requestedAt"
+	// helmLastUnlockAnno persists the last unlock moment on the HR —
+	// the 24h cooldown survives operator restarts where the unlocked
+	// ledger cannot.
+	helmLastUnlockAnno = "node.ops/last-helm-unlock"
+	// fluxLastNudgeAnno is the per-source 30m cooldown stamp written
+	// onto the Flux source object by the artifact healer.
+	fluxLastNudgeAnno = "node.ops/last-source-nudge"
+	// artifactStuckMinAge: a consumer Ready=False on an artifact-
+	// fetch signature this long is a stale source cache, not a
+	// transient fetch retry.
+	artifactStuckMinAge = 15 * time.Minute
+	sourceNudgeCooldown = 30 * time.Minute // max 1 nudge per Flux source
 )
 
 // helmReleaseGVRs tried in order — v2 on current flux, v2beta2 on
@@ -75,6 +100,22 @@ const (
 var helmReleaseGVRs = []schema.GroupVersionResource{
 	{Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"},
 	{Group: "helm.toolkit.fluxcd.io", Version: "v2beta2", Resource: "helmreleases"},
+}
+
+// fluxKustomizationGVR is the second consumer kind the artifact
+// healer scans (kustomize-controller owns the same stale-artifact
+// failure class as helm-controller).
+var fluxKustomizationGVR = schema.GroupVersionResource{
+	Group: "kustomize.toolkit.fluxcd.io", Version: "v1", Resource: "kustomizations"}
+
+// fluxSourceGVRs maps the sourceRef kinds flux consumers carry to
+// their source.toolkit.fluxcd.io/v1 GVRs — the objects a stale-
+// artifact nudge actually lands on.
+var fluxSourceGVRs = map[string]schema.GroupVersionResource{
+	"HelmChart":      {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmcharts"},
+	"GitRepository":  {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "gitrepositories"},
+	"HelmRepository": {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmrepositories"},
+	"OCIRepository":  {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "ocirepositories"},
 }
 
 type helmReleaseUnlocker struct {
@@ -151,28 +192,55 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 			due = append(due, key)
 		}
 	}
-	if len(due) == 0 {
-		log.Info("sweep done", "stuck", len(stuck))
-		return nil
-	}
 	sort.Strings(due)
 
-	// helm-controller crashlooping → the unlock cannot converge
-	// (someone must finish the rollback after the pending secret is
-	// deleted). Warn and abort; the next tick re-evaluates.
-	down, err := u.helmControllerDown(ctx)
-	if err != nil {
-		return err
-	}
-	if down {
-		log.Info("SKIP: helm-controller pod CrashLoopBackOff — unlock would not converge", "due", due)
-		return nil
+	var firstErr error
+	unlocked := 0
+	if len(due) > 0 {
+		// helm-controller crashlooping → the unlock cannot converge
+		// (someone must finish the rollback after the pending secret
+		// is deleted). Warn and abort; the next tick re-evaluates.
+		down, err := u.helmControllerDown(ctx)
+		switch {
+		case err != nil:
+			// Report, but don't blind the C1 source healer below —
+			// it reads different resources than the pod list.
+			firstErr = err
+		case down:
+			log.Info("SKIP: helm-controller pod CrashLoopBackOff — unlock would not converge", "due", due)
+		default:
+			unlocked = u.unlockDue(ctx, gvr, stuck, due, now)
+		}
 	}
 
+	// C1 — stale-artifact source healing is independent of the
+	// in-progress unlock path: it scans the same HR list plus
+	// Kustomizations and must run on every sweep.
+	if err := u.healArtifactSources(ctx, list); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	log.Info("sweep done", "stuck", len(stuck), "due", len(due), "unlocked", unlocked)
+	return firstErr
+}
+
+// unlockDue runs the unlock pass over the due HRs — cooldown check,
+// pending-secret delete, reconcile stamp — and returns how many HRs
+// were actually unlocked.
+func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVersionResource,
+	stuck map[string]*unstructured.Unstructured, due []string, now time.Time) int {
+	log := logf.FromContext(ctx)
 	unlocked := 0
 	for _, key := range due {
 		hr := stuck[key]
-		if last, ok := u.unlocked[key]; ok && now.Sub(last) < helmUnlockCooldown {
+		// The cooldown reads the wider of the in-RAM ledger and the
+		// persisted node.ops/last-helm-unlock stamp — an operator
+		// restart empties the ledger but must not refund the 24h.
+		last, ok := u.unlocked[key]
+		if t, hasAnno := helmLastUnlock(hr); hasAnno && t.After(last) {
+			last, ok = t, true
+		}
+		if ok && now.Sub(last) < helmUnlockCooldown {
+			u.unlocked[key] = last // fold the persisted stamp into the ledger
 			// Still/again stuck inside the cooldown: the previous
 			// unlock did NOT resolve it — page instead of churning
 			// secrets every tick.
@@ -200,8 +268,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 		u.unlocked[key] = now
 		unlocked++
 	}
-	log.Info("sweep done", "due", len(due), "unlocked", unlocked)
-	return nil
+	return unlocked
 }
 
 // listHelmReleases returns the HR list and the GVR that answered — v2
@@ -322,10 +389,14 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	}
 
 	// reconcile.fluxcd.io/requestedAt is flux's "reconcile now" hint —
-	// only the value changing matters; RFC3339 is the convention.
+	// only the value changing matters; RFC3339 is the convention. The
+	// same patch persists node.ops/last-helm-unlock so the 24h
+	// cooldown survives an operator restart.
+	now := time.Now().UTC().Format(time.RFC3339)
 	patch, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{"annotations": map[string]string{
-			fluxReconcileAnno: time.Now().UTC().Format(time.RFC3339),
+			fluxReconcileAnno:  now,
+			helmLastUnlockAnno: now,
 		}},
 	})
 	if err != nil {
@@ -392,6 +463,231 @@ func jobFailed(j *batchv1.Job) bool {
 	return false
 }
 
+// helmLastUnlock reads the persisted node.ops/last-helm-unlock stamp
+// — the durable half of the 24h cooldown, surviving operator restarts
+// where the in-memory ledger cannot.
+func helmLastUnlock(hr *unstructured.Unstructured) (time.Time, bool) {
+	v := hr.GetAnnotations()[helmLastUnlockAnno]
+	if v == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// ---------------------------------------------------------------------------
+// C1 — Flux source artifact cache healer
+// ---------------------------------------------------------------------------
+
+// artifactFailMsgs are the Ready=False message fragments marking a
+// stale artifact on the SOURCE side — refetching the source is the
+// fix, not churning the consumer's own backoff.
+var artifactFailMsgs = []string{
+	"artifact not found", "failed to fetch", "chart pull error", "failed to untar",
+}
+
+// fluxSourceRef is a resolved source object coordinates tuple.
+type fluxSourceRef struct{ kind, namespace, name string }
+
+// healArtifactSources scans every HelmRelease (already listed by the
+// caller) and every Kustomization for the stale-artifact signature,
+// resolves each consumer's Flux source, and stamps
+// reconcile.fluxcd.io/requestedAt on it — source-controller refetches
+// the artifact, which is what actually unstucks the consumer. The
+// node.ops/last-source-nudge stamp on the source caps this at once
+// per source per 30m across ALL consumers pointing at it.
+func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
+	hrs *unstructured.UnstructuredList) error {
+	log := logf.FromContext(ctx)
+	kustomizations, err := u.dyn.Resource(fluxKustomizationGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			kustomizations = nil // pre-v1 flux — the HR half still runs
+		} else {
+			return fmt.Errorf("list kustomizations: %w", err)
+		}
+	}
+	nudged := 0
+	for i := range hrs.Items {
+		hr := &hrs.Items[i]
+		if !fluxArtifactStale(hr) {
+			continue
+		}
+		if ref, ok := hrSourceRef(hr); ok &&
+			u.nudgeSource(ctx, ref, consumerID("HelmRelease", hr)) {
+			nudged++
+		}
+		if hcRef, ok := hrStatusHelmChartRef(hr); ok &&
+			u.nudgeSource(ctx, hcRef, consumerID("HelmRelease", hr)) {
+			nudged++
+		}
+	}
+	if kustomizations != nil {
+		for i := range kustomizations.Items {
+			k := &kustomizations.Items[i]
+			if !fluxArtifactStale(k) {
+				continue
+			}
+			if ref, ok := ksSourceRef(k); ok &&
+				u.nudgeSource(ctx, ref, consumerID("Kustomization", k)) {
+				nudged++
+			}
+		}
+	}
+	log.Info("flux artifact-source sweep done", "sourcesNudged", nudged)
+	return nil
+}
+
+// fluxArtifactStale is the stale-artifact signature: a non-suspended
+// consumer Ready=False continuously for >=15m with a message pointing
+// at the source's artifact (not the consumer's own logic).
+func fluxArtifactStale(o *unstructured.Unstructured) bool {
+	if suspended, _, _ := unstructured.NestedBool(o.Object, "spec", "suspend"); suspended {
+		return false // suspended objects are parked, not broken
+	}
+	status, msg := readyCond(o)
+	if status != "False" {
+		return false
+	}
+	lower := strings.ToLower(msg)
+	hit := false
+	for _, s := range artifactFailMsgs {
+		if strings.Contains(lower, s) {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		return false
+	}
+	since, ok := readySince(o)
+	if !ok {
+		since = o.GetCreationTimestamp().Time
+	}
+	return time.Since(since) >= artifactStuckMinAge
+}
+
+// hrSourceRef resolves the source a HelmRelease pulls its artifact
+// from: spec.chartRef (v2 — HelmChart/OCIRepository) or the legacy
+// spec.chart.spec.sourceRef (HelmRepository/GitRepository). The
+// namespace defaults to the HR's own (flux convention).
+func hrSourceRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
+	kind, _, _ := unstructured.NestedString(hr.Object, "spec", "chartRef", "kind")
+	name, _, _ := unstructured.NestedString(hr.Object, "spec", "chartRef", "name")
+	ns, _, _ := unstructured.NestedString(hr.Object, "spec", "chartRef", "namespace")
+	if kind == "" || name == "" {
+		kind, _, _ = unstructured.NestedString(
+			hr.Object, "spec", "chart", "spec", "sourceRef", "kind")
+		name, _, _ = unstructured.NestedString(
+			hr.Object, "spec", "chart", "spec", "sourceRef", "name")
+		ns, _, _ = unstructured.NestedString(
+			hr.Object, "spec", "chart", "spec", "sourceRef", "namespace")
+	}
+	if kind == "" || name == "" {
+		return fluxSourceRef{}, false
+	}
+	if ns == "" {
+		ns = hr.GetNamespace()
+	}
+	return fluxSourceRef{kind: kind, namespace: ns, name: name}, true
+}
+
+// hrStatusHelmChartRef resolves the synthesized HelmChart recorded in
+// status.helmChart ("<namespace>/<name>") when the HelmRelease uses
+// spec.chart.spec.sourceRef (not spec.chartRef: HelmChart), so both the
+// upstream repository and the HelmChart artifact are nudged.
+func hrStatusHelmChartRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
+	if cKind, _, _ := unstructured.NestedString(hr.Object, "spec", "chartRef", "kind"); cKind == "HelmChart" {
+		return fluxSourceRef{}, false
+	}
+	hc, _, _ := unstructured.NestedString(hr.Object, "status", "helmChart")
+	ns, name, ok := strings.Cut(hc, "/")
+	if !ok || ns == "" || name == "" {
+		return fluxSourceRef{}, false
+	}
+	return fluxSourceRef{kind: "HelmChart", namespace: ns, name: name}, true
+}
+
+// ksSourceRef is spec.sourceRef on a Kustomization — same flux
+// convention (namespace defaults to the object's own).
+func ksSourceRef(k *unstructured.Unstructured) (fluxSourceRef, bool) {
+	kind, _, _ := unstructured.NestedString(k.Object, "spec", "sourceRef", "kind")
+	name, _, _ := unstructured.NestedString(k.Object, "spec", "sourceRef", "name")
+	ns, _, _ := unstructured.NestedString(k.Object, "spec", "sourceRef", "namespace")
+	if kind == "" || name == "" {
+		return fluxSourceRef{}, false
+	}
+	if ns == "" {
+		ns = k.GetNamespace()
+	}
+	return fluxSourceRef{kind: kind, namespace: ns, name: name}, true
+}
+
+// consumerID renders the complaining consumer for log lines.
+func consumerID(kind string, o *unstructured.Unstructured) string {
+	return kind + " " + o.GetNamespace() + "/" + o.GetName()
+}
+
+// nudgeSource stamps reconcile.fluxcd.io/requestedAt + the
+// node.ops/last-source-nudge cooldown onto a Flux source object.
+// Failures are per-source: IncError + false, never an aborted sweep.
+func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
+	ref fluxSourceRef, consumer string) bool {
+	log := logf.FromContext(ctx)
+	key := ref.namespace + "/" + ref.name
+	gvr, ok := fluxSourceGVRs[ref.kind]
+	if !ok {
+		log.Info("skip: source kind is not a nudgeable Flux source",
+			"kind", ref.kind, "consumer", consumer)
+		return false
+	}
+	src, err := u.dyn.Resource(gvr).Namespace(ref.namespace).
+		Get(ctx, ref.name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("skip: flux source gone",
+				"kind", ref.kind, "source", key, "consumer", consumer)
+			return false
+		}
+		metrics.IncError(helmUnlockQueue)
+		log.Error(err, "flux source get failed", "kind", ref.kind, "source", key)
+		return false
+	}
+	if ts := src.GetAnnotations()[fluxLastNudgeAnno]; ts != "" {
+		if t, err := time.Parse(time.RFC3339, ts); err == nil &&
+			time.Since(t) < sourceNudgeCooldown {
+			log.Info("skip: source nudged inside cooldown",
+				"kind", ref.kind, "source", key,
+				"ago", time.Since(t).Truncate(time.Minute))
+			return false
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"annotations": map[string]string{
+			fluxReconcileAnno: now,
+			fluxLastNudgeAnno: now,
+		}},
+	})
+	if err != nil {
+		return false
+	}
+	if _, err := u.dyn.Resource(gvr).Namespace(ref.namespace).Patch(ctx, ref.name,
+		types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		metrics.IncError(helmUnlockQueue)
+		log.Error(err, "flux source nudge patch failed", "kind", ref.kind, "source", key)
+		return false
+	}
+	metrics.FluxSourceReconcilesTriggeredTotal.
+		WithLabelValues(ref.kind, ref.namespace, ref.name).Inc()
+	log.Info("ACTION: requested flux source reconcile — consumer reports a stale artifact",
+		"kind", ref.kind, "source", key, "consumer", consumer)
+	return true
+}
+
 // hrReleaseName is spec.releaseName, falling back to the object name —
 // the label helm puts on its release secrets.
 func hrReleaseName(hr *unstructured.Unstructured) string {
@@ -401,9 +697,14 @@ func hrReleaseName(hr *unstructured.Unstructured) string {
 	return hr.GetName()
 }
 
-// hrTargetNS is spec.targetNamespace (where the release secrets live),
-// falling back to the HR's own namespace.
+// hrTargetNS resolves where the release secrets live:
+// spec.storageNamespace first (helm-controller stores release secrets
+// there when set), then spec.targetNamespace, then the HR's own
+// namespace — mirroring flux's own precedence.
 func hrTargetNS(hr *unstructured.Unstructured) string {
+	if ns, _, _ := unstructured.NestedString(hr.Object, "spec", "storageNamespace"); ns != "" {
+		return ns
+	}
 	if ns, _, _ := unstructured.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
 		return ns
 	}

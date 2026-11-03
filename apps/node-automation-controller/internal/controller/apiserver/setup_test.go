@@ -21,6 +21,10 @@ func TestSetupPeriodicModules(t *testing.T) {
 	}{
 		{"admission-webhook-guard", 5 * time.Minute,
 			func(m manager.Manager) error { return SetupWebhookGuard(m, cs) }},
+		{"apiservice-guard", 5 * time.Minute,
+			func(m manager.Manager) error {
+				return SetupAPIServiceGuard(m, cs, testutil.StubDyn(), true)
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := testutil.NewStubManager()
@@ -52,5 +56,19 @@ func TestSetupAPIServerEndpointGuard(t *testing.T) {
 	}
 	if g.probeFn == nil {
 		t.Fatal("probeFn seam not wired to g.probe")
+	}
+}
+
+// apiservice-guard skips mgr.Add entirely when disabled
+// (APISERVICE_GUARD_ENABLED=false) — same contract as
+// cert-drift-auditor: no Periodic, no tick.
+func TestSetupAPIServiceGuardDisabled(t *testing.T) {
+	m := testutil.NewStubManager()
+	if err := SetupAPIServiceGuard(m, fake.NewSimpleClientset(),
+		testutil.StubDyn(), false); err != nil {
+		t.Fatalf("disabled setup must return nil, got %v", err)
+	}
+	if len(m.Added) != 0 {
+		t.Fatalf("disabled module registered %d runnables, want 0", len(m.Added))
 	}
 }

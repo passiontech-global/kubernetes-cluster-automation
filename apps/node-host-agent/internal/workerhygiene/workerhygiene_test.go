@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -48,6 +51,12 @@ type env struct {
 	sdcmds   [][]string
 	sdReply  map[string]string
 	probes   map[string]error // url → error (nil = healthy)
+	status   map[string]int   // url → canned HTTP status for probeHTTPStatus
+	sockErrs map[string]error // unix socket path → dial error
+	diskUsed float64          // /var/lib/k0s fill ratio for statfsFn
+	ingest   string           // CtrIngestDir
+	sysnet   string           // SysClassNet
+	ciliumRt string           // CiliumRuntimeConfig
 	bodyOK   map[string]bool  // :10248 healthz body=="ok" canned answers
 	unixBody []byte
 	unixErr  error
@@ -89,11 +98,13 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 	t.Helper()
 	root := t.TempDir()
 	e := &env{
-		live:    map[int]bool{},
-		now:     time.Now(),
-		sdReply: map[string]string{},
-		probes:  map[string]error{},
-		bodyOK:  map[string]bool{},
+		live:     map[int]bool{},
+		now:      time.Now(),
+		sdReply:  map[string]string{},
+		probes:   map[string]error{},
+		status:   map[string]int{},
+		sockErrs: map[string]error{},
+		bodyOK:   map[string]bool{},
 	}
 	e.state = filepath.Join(root, "watchdog")
 	e.proc = filepath.Join(root, "proc")
@@ -102,7 +113,10 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 	e.resv = filepath.Join(root, "resolv.conf")
 	e.unit = filepath.Join(root, "k0sworker.service")
 	e.kubepods = filepath.Join(root, "kubeletpods")
-	for _, d := range []string{e.state, e.proc, e.ctr, e.sb, e.kubepods} {
+	e.ingest = filepath.Join(root, "ingest")
+	e.sysnet = filepath.Join(root, "sysnet")
+	e.ciliumRt = filepath.Join(root, "agent-runtime-config.json")
+	for _, d := range []string{e.state, e.proc, e.ctr, e.sb, e.kubepods, e.ingest, e.sysnet} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -117,7 +131,12 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 	// host clock. ActiveEnterTimestampMonotonic is µs since boot:
 	// uptimeµs - 1h → a 1h-old (settled) unit.
 	writeFile(t, filepath.Join(e.proc, "uptime"), "7200.5 0\n")
+	// RunCmd AND RunCmdCombined share the same fake — the journald
+	// probes (Journal/journalAnyFn via ExecCombined) must observe
+	// the canned replies too, and a nil combined seam would exec
+	// REAL journalctl on the test host.
 	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: e.sdRun,
+		RunCmdCombined: e.sdRun,
 		ProcUptimeFile: filepath.Join(e.proc, "uptime")})
 	// k0sworker is active and settled — the restart checks need both.
 	e.sdReply["systemctl is-active k0sworker.service"] = "active\n"
@@ -145,6 +164,13 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		MaxShimKill:        10,
 		ConsecNeeded:       2,
 		MinRestartInterval: 30 * time.Minute,
+		// Wave-2 knobs: paths under the fixture root, never the real
+		// /sys or /var/lib/k0s.
+		CtrIngestDir:         e.ingest,
+		K0sDataDir:           filepath.Join(root, "k0sdata"),
+		SysClassNet:          e.sysnet,
+		CiliumRuntimeConfig:  e.ciliumRt,
+		ZombieStormThreshold: 500,
 	}, prometheus.NewRegistry())
 	if err != nil {
 		t.Fatal(err)
@@ -177,6 +203,33 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 	}
 	h.cfg.journalFn = func(_ context.Context) (string, error) {
 		return e.journal, nil
+	}
+	// Wave-2 seams: status-code probes default 200 (healthy) unless
+	// probes[url] errors or status[url] overrides; the unix socket
+	// probe answers from sockErrs (nil = connects); statfs reports
+	// e.diskUsed of 100 blocks.
+	h.cfg.probeHTTPStatus = func(_ context.Context, url string, _ time.Duration) (int, error) {
+		if err := e.probes[url]; err != nil {
+			return 0, err
+		}
+		if s, ok := e.status[url]; ok {
+			return s, nil
+		}
+		return 200, nil
+	}
+	h.cfg.probeUnixSock = func(_ context.Context, socket string, _ time.Duration) error {
+		return e.sockErrs[socket]
+	}
+	h.cfg.statfsFn = func(_ string, st *unix.Statfs_t) error {
+		st.Blocks = 100
+		st.Bavail = uint64(100 - int(e.diskUsed*100))
+		return nil
+	}
+	h.cfg.ctrRmIngest = func(_ context.Context, ref string) error {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.sdcmds = append(e.sdcmds, []string{"ctr", "ingest", "rm", ref})
+		return nil
 	}
 	e.h = h
 	return e
@@ -2293,4 +2346,480 @@ func TestParseCiliumIPAMShapes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- Wave-2 tests: A4 syncloop + containerd-sock ---
+
+func TestSyncloopDownLatchesOnPLEGFreeze(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 500
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.h.stateExists("kubelet-syncloop-down") {
+		t.Fatal("state-kubelet-syncloop-down should latch after 2 failed syncloop probes")
+	}
+	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 200
+	e.h.Cycle(context.Background())
+	if e.h.stateExists("kubelet-syncloop-down") {
+		t.Fatal("recovery should clear the syncloop latch")
+	}
+}
+
+// TestSyncloopNon200LogsStatusCode: a non-200 answer carries no Go
+// error — the suspect/latch lines must still record the code, not
+// "last_err=<nil>".
+func TestSyncloopNon200LogsStatusCode(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 500
+	e.h.Cycle(context.Background()) // streak 1 → suspect line
+	if got := logLines(t, e); !strings.Contains(got, "status 500") {
+		t.Fatalf("suspect line must carry the HTTP code, got:\n%s", got)
+	}
+	e.h.Cycle(context.Background()) // streak 2 → latch
+	if !e.h.stateExists("kubelet-syncloop-down") {
+		t.Fatal("latch expected after ConsecNeeded failed probes")
+	}
+	if got := logLines(t, e); strings.Contains(got, "last_err=<nil>") {
+		t.Fatalf("latch extra must record the code, got:\n%s", got)
+	}
+}
+
+func TestSyncloopFailClosedWhenActiveCheckErrors(t *testing.T) {
+	e := fixture(t)
+	// Force the Active() error path: no is-active reply leaves the
+	// fake answering ENOENT — the gate is wired but unverifiable,
+	// so worker checks must gate off (fail closed). The syncloop
+	// probe is ALSO failing — if the gate didn't hold, two cycles
+	// would latch kubelet-syncloop-down.
+	delete(e.sdReply, "systemctl is-active k0sworker.service")
+	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 500
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if e.h.stateExists("kubelet-syncloop-down") {
+		t.Fatal("no latch may be written while the unit state is unknown")
+	}
+}
+
+func TestContainerdSockDownLatches(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.sockErrs[e.h.cfg.ContainerdSocket] = fmt.Errorf("connection refused")
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.h.stateExists("containerd-sock-down") {
+		t.Fatal("state-containerd-sock-down should latch after 2 socket failures")
+	}
+	e.sockErrs[e.h.cfg.ContainerdSocket] = nil
+	e.h.Cycle(context.Background())
+	if e.h.stateExists("containerd-sock-down") {
+		t.Fatal("recovery should clear the containerd-sock latch")
+	}
+}
+
+// --- A3: ingest GC ---
+
+func TestCtrIngestGCCleansStaleDirs(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.diskUsed = 0.90 // above the 75% watermark
+	stale := filepath.Join(e.ingest, "deadbeefref")
+	if err := os.MkdirAll(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-4 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale ingest dir should be removed, stat err=%v", err)
+	}
+	if !e.sdRan("ctr ingest rm deadbeefref") {
+		t.Fatal("ctr ingest rm should run for the stale ref")
+	}
+	got, err := counterValue(e.h.ctrIngestsCleaned)
+	if err != nil || got != 1 {
+		t.Fatalf("ctr_ingests_cleaned_total=%v err=%v want 1", got, err)
+	}
+}
+
+func TestCtrIngestGCSkipsFreshDirsWhenDiskLow(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.diskUsed = 0.10
+	// first cycle marks lastIngestScan (due on start); make a fresh
+	// dir and verify a second cycle under low disk skips it.
+	e.h.Cycle(context.Background())
+	fresh := filepath.Join(e.ingest, "stillpulling")
+	if err := os.MkdirAll(fresh, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatal("fresh ingest dir must not be removed")
+	}
+}
+
+// TestCtrIngestGCFailedScanRetriesNextCycle: a transient ReadDir
+// failure must NOT stamp lastIngestScan — stamping would defer the
+// retry by a full 6h CtrIngestScanInterval. The next cycle after
+// the dir recovers must still scan (disk below the watermark, so
+// only the unstamped due-check lets it in).
+func TestCtrIngestGCFailedScanRetriesNextCycle(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.diskUsed = 0.10 // below watermark — only `due` triggers a scan
+	// Break the ingest dir: a plain FILE where a dir is expected →
+	// ReadDir errors (ENOTDIR, not IsNotExist) → abort, no stamp.
+	if err := os.RemoveAll(e.ingest); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, e.ingest, "not a dir")
+	e.h.Cycle(context.Background())
+	// Repair the dir with one stale ingest — if the failed scan
+	// had stamped lastIngestScan this cycle would be not-due and
+	// skip the cleanup.
+	if err := os.Remove(e.ingest); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(e.ingest, "deadbeefref")
+	if err := os.MkdirAll(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-4 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("failed scan must not defer retry — stale dir should be removed, stat err=%v", err)
+	}
+}
+
+// --- A2: zombie storm ---
+
+// mkZombieProc writes a Z-state stat for pid whose parent is ppid.
+func mkZombieProc(t *testing.T, e *env, pid, ppid int) {
+	t.Helper()
+	d := filepath.Join(e.proc, fmt.Sprint(pid))
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stat := fmt.Sprintf("%d (defunct) Z %d 0 0 0", pid, ppid)
+	if err := os.WriteFile(filepath.Join(d, "stat"), []byte(stat), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestZombieStormLatchesAndLogsAction(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.h.cfg.ZombieStormThreshold = 3 // fake proc trees are small
+	uid := "11111111_2222_3333_4444_555555555555"
+	parent := filepath.Join(e.proc, "777")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cg := "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod" + uid + ".slice/cri-containerd-x.scope\n"
+	if err := os.WriteFile(filepath.Join(parent, "cgroup"), []byte(cg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for pid := 800; pid < 805; pid++ {
+		mkZombieProc(t, e, pid, 777)
+	}
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.h.stateExists("zombie-storm") {
+		t.Fatal("state-zombie-storm should latch after 2 storm cycles")
+	}
+	data, err := os.ReadFile(e.h.cfg.WatchdogLogFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "ACTION zombie-storm: pod_uid=11111111-2222-3333-4444-555555555555 zombies=5"
+	if !strings.Contains(string(data), want) {
+		t.Fatalf("log should contain %q; got:\n%s", want, data)
+	}
+}
+
+// mkParentProc writes a LIVE parent's stat under ProcRoot with the
+// given starttime (field 22) — the streak key's generation tag, so
+// tests can simulate PID reuse by rewriting start.
+func mkParentProc(t *testing.T, e *env, pid int, starttime string) {
+	t.Helper()
+	// Fields after ')' start at field 3: f[0]=state … f[19]=
+	// starttime (field 22) — 20 fields total.
+	writeFile(t, filepath.Join(e.proc, fmt.Sprint(pid), "stat"),
+		fmt.Sprintf("%d (parent) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 %s",
+			pid, starttime))
+}
+
+// TestZombieStormActionLoggedOncePerEpisode: while the storm
+// persists the latch holds but the ACTION line must NOT repeat —
+// every repeat becomes a fresh K8s Event via nodereporter.
+func TestZombieStormActionLoggedOncePerEpisode(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.h.cfg.ZombieStormThreshold = 3
+	mkParentProc(t, e, 777, "111111")
+	for pid := 800; pid < 805; pid++ {
+		mkZombieProc(t, e, pid, 777)
+	}
+	for i := 0; i < 4; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.h.stateExists("zombie-storm") {
+		t.Fatal("storm latch should hold while the storm persists")
+	}
+	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 1 {
+		t.Fatalf("ACTION zombie-storm logged %d times over 4 storm cycles, want 1", n)
+	}
+}
+
+// TestZombieStormPIDReuseResetsStreak: streaks key on (ppid,
+// starttime) — a recycled ppid starts at 0 instead of inheriting
+// the dead parent's count and holding a dead latch open.
+func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.h.cfg.ZombieStormThreshold = 3
+	mkParentProc(t, e, 777, "111111")
+	for pid := 800; pid < 805; pid++ {
+		mkZombieProc(t, e, pid, 777)
+	}
+	e.h.Cycle(context.Background()) // streak 1
+	e.h.Cycle(context.Background()) // streak 2 → ACTION + latch
+	if !e.h.stateExists("zombie-storm") {
+		t.Fatal("latch expected after 2 storm cycles")
+	}
+	// pid 777 is RECYCLED — same ppid, different starttime. The
+	// dead parent's streak must not carry: the new generation
+	// restarts at streak 1, the latch drops, no second ACTION yet.
+	mkParentProc(t, e, 777, "222222")
+	e.h.Cycle(context.Background())
+	if e.h.stateExists("zombie-storm") {
+		t.Fatal("recycled ppid must not inherit the dead parent's streak")
+	}
+	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 1 {
+		t.Fatalf("ACTION zombie-storm count=%d want 1", n)
+	}
+	// The new generation earns its own streak — latch + ACTION
+	// again on its own entry.
+	e.h.Cycle(context.Background())
+	if !e.h.stateExists("zombie-storm") {
+		t.Fatal("recycled parent's own streak should re-latch")
+	}
+	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 2 {
+		t.Fatalf("recycled parent logs its own ACTION on streak entry; count=%d want 2", n)
+	}
+}
+
+// --- A5: journald integrity ---
+
+func TestJournaldCorruptionRotates(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.journal = "File corruption detected at /var/log/journal/x.journal"
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.sdRan("journalctl --rotate --vacuum-time=3d") {
+		t.Fatal("corrupt journal should trigger rotate --vacuum-time=3d")
+	}
+}
+
+func TestJournaldEmptyWhileActiveRotates(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.journal = "" // abnormally empty
+	// …and the unfiltered `journalctl -n 1` probe errors too (no
+	// sdReply → ENOENT) — journald itself is anomalous, so the
+	// empty k0sworker window counts as corruption evidence.
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.sdRan("journalctl --rotate --vacuum-time=3d") {
+		t.Fatal("empty journal for active unit should trigger rotate")
+	}
+}
+
+// TestJournaldEmptyAndUnfilteredEmptyRotates: same remediation when
+// the second probe answers but the whole journal is silent.
+func TestJournaldEmptyAndUnfilteredEmptyRotates(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.journal = ""
+	e.sdReply["journalctl -n 1"] = "" // journald answers — with nothing
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.sdRan("journalctl --rotate --vacuum-time=3d") {
+		t.Fatal("journald-wide silence should trigger rotate")
+	}
+}
+
+// TestJournaldQuietUnitHealthyJournaldNoRotate is the false-
+// positive guard: an empty k0sworker window is only corruption
+// evidence when journald ITSELF is anomalous. A healthy-but-quiet
+// unit (journald returns real entries unfiltered) must NOT spend
+// the rotate+vacuum remedy every cooldown.
+func TestJournaldQuietUnitHealthyJournaldNoRotate(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.journal = "" // no k0sworker lines in 10m — just a quiet unit
+	e.sdReply["journalctl -n 1"] =
+		"May 01 12:00:00 node-a systemd[1]: Started Daily Cleanup.\n"
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if e.sdRan("journalctl --rotate --vacuum-time=3d") {
+		t.Fatal("quiet unit on a healthy journald must not trigger rotate+vacuum")
+	}
+	if !e.sdRan("journalctl -n 1 --no-pager") {
+		t.Fatal("the unfiltered journald probe should have run for the empty case")
+	}
+}
+
+// --- B1: cilium-envoy ---
+
+// mkCiliumContainer registers a cilium container task dir named
+// like the container (cilium-agent / cilium-envoy) with a live pid.
+func mkCiliumContainer(t *testing.T, e *env, name string, pid int) {
+	t.Helper()
+	d := filepath.Join(e.ctr, "id-"+name)
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"labels":{"io.kubernetes.container.name":"` + name + `"}}`
+	if err := os.WriteFile(filepath.Join(d, "config.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d, "init.pid"), []byte(fmt.Sprint(pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.live[pid] = true
+}
+
+func TestCiliumEnvoyUnreadyKillAfterConsec(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	mkCiliumContainer(t, e, "cilium-envoy", 555)
+	e.status["http://127.0.0.1:9964/ready"] = 503
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.h.stateExists("cilium-envoy-down") {
+		t.Fatal("state-cilium-envoy-down should latch after 2 unready cycles")
+	}
+	found := false
+	for _, k := range e.kills {
+		if k.pid == 555 && k.sig == syscall.SIGKILL {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("envoy pid should be SIGKILLed after ConsecNeeded unready cycles")
+	}
+}
+
+func TestCiliumEnvoyKilledWithAgent(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	mkCiliumContainer(t, e, "cilium-agent", 444)
+	mkCiliumContainer(t, e, "cilium-envoy", 555)
+	e.probes["http://127.0.0.1:9879/healthz"] = fmt.Errorf("down")
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	killed := map[int]bool{}
+	for _, k := range e.kills {
+		if k.sig == syscall.SIGKILL {
+			killed[k.pid] = true
+		}
+	}
+	if !killed[444] || !killed[555] {
+		t.Fatalf("agent kill must restart envoy too; kills=%v", e.kills)
+	}
+}
+
+// --- B4: MTU drift ---
+
+func TestCiliumMTUDriftLatchesAndLogs(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
+	writeFile(t, filepath.Join(e.sysnet, "cilium_net", "mtu"), "1500\n")
+	e.h.Cycle(context.Background())
+	if !e.h.stateExists("cilium-mtu-drift") {
+		t.Fatal("state-cilium-mtu-drift should latch when cilium_mtu > neb1")
+	}
+	data, err := os.ReadFile(e.h.cfg.WatchdogLogFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "ACTION cilium-mtu-drift: cilium=1500 nebula=1300") {
+		t.Fatalf("log missing drift ACTION line:\n%s", data)
+	}
+	// Drift fixed → latch clears.
+	writeFile(t, filepath.Join(e.sysnet, "cilium_net", "mtu"), "1300\n")
+	e.h.Cycle(context.Background())
+	if e.h.stateExists("cilium-mtu-drift") {
+		t.Fatal("latch should clear once MTUs align")
+	}
+}
+
+func TestCiliumMTURuntimeConfigFallback(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
+	writeFile(t, e.ciliumRt, `{"mtu":1500,"other":1}`)
+	e.h.Cycle(context.Background())
+	if !e.h.stateExists("cilium-mtu-drift") {
+		t.Fatal("runtime-config MTU 1500 > neb1 1300 should latch drift")
+	}
+}
+
+// TestRuntimeConfigMTUMaxDeterministic pins the multi-mtu
+// behaviour: several `mtu`-keyed values (nested maps AND arrays)
+// must resolve to the MAX — a "first match" walk is unstable
+// under Go's random map iteration order.
+func TestRuntimeConfigMTUMaxDeterministic(t *testing.T) {
+	e := fixture(t)
+	writeFile(t, e.ciliumRt,
+		`{"a":{"mtu":1300},"list":[{"mtu":1400},{"mtu":1500}],"z":{"MTU":900}}`)
+	got, ok := runtimeConfigMTU(e.ciliumRt)
+	if !ok || got != 1500 {
+		t.Fatalf("runtimeConfigMTU=%v,%v want 1500,true (max of all mtu keys)", got, ok)
+	}
+}
+
+// TestProbeUnixSockDefaultReturnsNilOnConnect: a successful dial IS
+// the verdict — conn.Close()'s error must not leak into the result.
+func TestProbeUnixSockDefaultReturnsNilOnConnect(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "probe.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	c := Config{}
+	c.applyDefaults()
+	if err := c.probeUnixSock(context.Background(), sock, time.Second); err != nil {
+		t.Fatalf("successful unix dial want nil, got %v", err)
+	}
+}
+
+// counterValue reads a prometheus.Counter for tests.
+func counterValue(c prometheus.Counter) (float64, error) {
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		return 0, err
+	}
+	return m.GetCounter().GetValue(), nil
 }

@@ -81,7 +81,10 @@ const (
 //	  pod-teardown-wedged (36), konnectivity-ip-mismatch (30),
 //	  dns-resolv-stale (33), kubelet-runtime-stall (05),
 //	  kubelet-watch-wedge (06), cilium-agent-down (32),
-//	  cilium-init-stuck (35), kubelet-healthz-down (T15 remediate)
+//	  cilium-init-stuck (35), kubelet-healthz-down (T15 remediate),
+//	  kubelet-syncloop-down / containerd-sock-down (A4),
+//	  cilium-envoy-down (B1), cilium-mtu-drift (B4),
+//	  zombie-storm (A2)
 //	nethealth: dns-fallback (20), nebula-isolated/-degraded/-slowpath/
 //	  -siteedge (13), fail2ban-down (50), clock-unsync (H1),
 //	  conntrack-pressure (H2)
@@ -116,6 +119,11 @@ var knownLatchNames = map[string]bool{
 	"k0scontroller-oom-loop":   true,
 	"node-overloaded":          true,
 	"nebula-cert-expiring":     true,
+	"kubelet-syncloop-down":    true, // A4
+	"containerd-sock-down":     true, // A4
+	"cilium-envoy-down":        true, // B1
+	"cilium-mtu-drift":         true, // B4
+	"zombie-storm":             true, // A2
 }
 
 // knownLatchPrefixes — parameterized latch families whose suffix is

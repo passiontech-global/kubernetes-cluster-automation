@@ -2,6 +2,7 @@ package integration
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -50,6 +51,31 @@ func esObj(ns, name, ready string, failingFor time.Duration) *unstructured.Unstr
 			}},
 		},
 	}}
+}
+
+// esStoreRef points the ES's spec.secretStoreRef at a store — the
+// state-based nudge gate reads it. kind "" exercises ESO's real
+// default (namespaced SecretStore), which never qualifies — only an
+// explicit kind=ClusterSecretStore does.
+func esStoreRef(es *unstructured.Unstructured, kind, name string) {
+	ref := map[string]any{"name": name}
+	if kind != "" {
+		ref["kind"] = kind
+	}
+	_ = unstructured.SetNestedMap(es.Object, ref, "spec", "secretStoreRef")
+}
+
+// esDataFromStoreRef appends a spec.dataFrom[] entry whose
+// sourceRef.storeRef overrides the store for that pull — the second
+// store-reference shape the v1beta1 CRD carries.
+func esDataFromStoreRef(es *unstructured.Unstructured, kind, name string) {
+	ref := map[string]any{"name": name}
+	if kind != "" {
+		ref["kind"] = kind
+	}
+	_ = unstructured.SetNestedSlice(es.Object, []any{
+		map[string]any{"sourceRef": map[string]any{"storeRef": ref}},
+	}, "spec", "dataFrom")
 }
 
 func esAnnotation(t *testing.T, dyn *fake.FakeDynamicClient, gvr schema.GroupVersionResource, ns, name, anno string) string {
@@ -341,7 +367,7 @@ func TestExternalSecretNudgePrunesNudgedLedger(t *testing.T) {
 	n.nudged["apps/es-healed"] = stale  // healed → prune, nothing re-adds
 	n.nudged["apps/es-gone"] = fresh    // vanished → prune
 
-	if err := n.nudge(ctx); err != nil {
+	if err := n.nudge(ctx, true); err != nil { // edge path — all stuck ESs eligible
 		t.Fatal(err)
 	}
 	if _, ok := n.nudged["apps/es-gone"]; ok {
@@ -440,7 +466,7 @@ func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 			return false, nil, nil
 		})
 	n := newNudge(dyn, true)
-	if err := n.nudge(ctx); err != nil {
+	if err := n.nudge(ctx, true); err != nil {
 		t.Fatalf("per-ES patch failure must not fail the nudge: %v", err)
 	}
 	if _, ok := n.nudged["apps/es-bad"]; ok {
@@ -448,5 +474,94 @@ func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 	}
 	if _, ok := n.nudged["apps/es-good"]; !ok {
 		t.Fatal("healthy patch skipped after a sibling's failure")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// State-based nudge + persisted cooldown (2.1)
+// ---------------------------------------------------------------------------
+
+// No False→True edge needed: a store reporting Ready=True from first
+// sight nudges every stuck ES whose spec.secretStoreRef points at it —
+// the stuck state itself is the trigger after a controller restart
+// wiped the edge bookkeeping.
+func TestExternalSecretNudgeStateBasedWithoutEdge(t *testing.T) {
+	stuck := esObj("apps", "es-stuck", "False", time.Hour)
+	esStoreRef(stuck, "ClusterSecretStore", "css1")
+	other := esObj("apps", "es-other-store", "False", time.Hour)
+	esStoreRef(other, "ClusterSecretStore", "css-gone") // refs an untracked store
+	namespaced := esObj("apps", "es-namespaced", "False", time.Hour)
+	esStoreRef(namespaced, "SecretStore", "css1") // namespaced store — can't tell
+	defaulted := esObj("apps", "es-default-kind", "False", time.Hour)
+	esStoreRef(defaulted, "", "css1") // kind unset — ESO default is SecretStore, not CSS
+	broken := esObj("apps", "es-broken-store", "False", time.Hour)
+	esStoreRef(broken, "ClusterSecretStore", "css2") // store still False
+	// No top-level secretStoreRef at all — the ES only pulls via a
+	// dataFrom sourceRef.storeRef override pointing at the ready CSS.
+	viaDataFrom := esObj("apps", "es-via-datafrom", "False", time.Hour)
+	esDataFromStoreRef(viaDataFrom, "ClusterSecretStore", "css1")
+	// Default store healthy but a dataFrom override still hangs off
+	// the BROKEN store — nudging could never succeed, don't churn.
+	mixedBroken := esObj("apps", "es-mixed-broken", "False", time.Hour)
+	esStoreRef(mixedBroken, "ClusterSecretStore", "css1")
+	esDataFromStoreRef(mixedBroken, "ClusterSecretStore", "css2")
+	// Default store healthy but a dataFrom override is namespaced —
+	// can't tell → conservative skip.
+	mixedNamespaced := esObj("apps", "es-mixed-namespaced", "False", time.Hour)
+	esStoreRef(mixedNamespaced, "ClusterSecretStore", "css1")
+	esDataFromStoreRef(mixedNamespaced, "SecretStore", "ss-ns")
+	dyn := newDynFake(
+		cssObj("css1", "True"), cssObj("css2", "False"),
+		stuck, other, namespaced, defaulted, broken,
+		viaDataFrom, mixedBroken, mixedNamespaced)
+	n := newNudge(dyn, true)
+
+	if err := n.run(ctx); err != nil { // seeds both stores, no edge
+		t.Fatal(err)
+	}
+	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got == "" {
+		t.Fatal("stuck ES on a Ready=True store not nudged without an edge")
+	}
+	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esLastNudgeAnno); got == "" {
+		t.Fatal("node.ops/last-es-nudge not persisted alongside force-sync")
+	}
+	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-via-datafrom", esForceSyncAnno); got == "" {
+		t.Fatal("ES whose only store ref is a dataFrom CSS override not nudged")
+	}
+	for _, name := range []string{
+		"es-other-store", "es-namespaced", "es-default-kind", "es-broken-store",
+		"es-mixed-broken", "es-mixed-namespaced"} {
+		if got := esAnnotation(t, dyn, externalSecretGVR, "apps", name, esForceSyncAnno); got != "" {
+			t.Fatalf("ES %s nudged although its referenced store is not Ready=True", name)
+		}
+	}
+}
+
+// The persisted stamp IS the cooldown: an ES force-synced 30m ago by
+// a previous controller run (in-RAM ledger empty after restart) is
+// not re-stamped even on a fresh recovery edge; a stamp older than
+// the cooldown is overwritten.
+func TestExternalSecretNudgePersistedCooldown(t *testing.T) {
+	recent := esObj("apps", "es-recent", "False", 2*time.Hour)
+	esStoreRef(recent, "ClusterSecretStore", "css1")
+	recent.SetAnnotations(map[string]string{
+		esForceSyncAnno: fmt.Sprintf("%d", time.Now().Add(-30*time.Minute).Unix()),
+	})
+	stale := esObj("apps", "es-stale", "False", 2*time.Hour)
+	esStoreRef(stale, "ClusterSecretStore", "css1")
+	stale.SetAnnotations(map[string]string{
+		esLastNudgeAnno: time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339),
+	})
+	dyn := newDynFake(cssObj("css1", "True"), recent, stale)
+	n := newNudge(dyn, true)
+
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-recent", esLastNudgeAnno); got != "" {
+		t.Fatal("ES re-stamped inside the persisted 1h cooldown")
+	}
+	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stale", esForceSyncAnno); got == "" {
+		t.Fatal("ES with a stale last-es-nudge stamp not re-nudged")
 	}
 }

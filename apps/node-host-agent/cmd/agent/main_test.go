@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/apiprober"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostconfig"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/topology"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
 )
@@ -780,14 +782,49 @@ func TestDispatchConvergeOnceArgParsing(t *testing.T) {
 			t.Fatalf("converge-once %s=(%d,%v) want (0,true)", h, code, handled)
 		}
 	}
-	// A vars dir without the topology files → the cycle logs the
-	// load error and the command still exits 0 (converge is
-	// best-effort — same contract as the periodic subsystem).
+	// A vars dir without the topology files → the cycle counts the
+	// load error and the command exits 1 (converge-once reports
+	// errs > 0 — same contract as nebula-sign on missing vars).
 	dir := t.TempDir()
 	code, handled := dispatch([]string{"nha", "converge-once",
 		"--vars-dir=" + dir, "--node-name=testnode"})
+	if !handled || code != 1 {
+		t.Fatalf("converge-once=(%d,%v) want (1,true)", code, handled)
+	}
+}
+
+// quietRunner answers every host command with empty output + nil
+// error — the scriptedRunner equivalent for the converge-once clean
+// path (a node absent from the registry self-gates every group).
+type quietRunner struct{}
+
+func (quietRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	return "", nil
+}
+
+func TestDispatchConvergeOnceCleanExit0(t *testing.T) {
+	// Stub the host seams: a tempdir host root + a runner that never
+	// fails, so a fully self-gating converge reports errs==0 and the
+	// command exits 0 (the timer/CI "converged" contract).
+	oldRoot, oldRunner := convergeHostRoot, convergeRunner
+	defer func() { convergeHostRoot, convergeRunner = oldRoot, oldRunner }()
+	convergeHostRoot = t.TempDir()
+	convergeRunner = func() hostconfig.Runner { return quietRunner{} }
+
+	dir := t.TempDir()
+	for name, content := range map[string]string{
+		"interdc_nodes.yaml": "{}\n",
+		"cluster.yaml":       "{}\n",
+		"defaults.yaml":      "interdc_nebula_enabled: false\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, handled := dispatch([]string{"nha", "converge-once",
+		"--vars-dir=" + dir, "--node-name=testnode"})
 	if !handled || code != 0 {
-		t.Fatalf("converge-once=(%d,%v) want (0,true)", code, handled)
+		t.Fatalf("converge-once clean=(%d,%v) want (0,true)", code, handled)
 	}
 }
 

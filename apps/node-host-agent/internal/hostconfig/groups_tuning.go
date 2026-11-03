@@ -210,7 +210,7 @@ func (c *cyc) groupPulls() {
 	for _, p := range units {
 		b, err := os.ReadFile(r.hp(p))
 		if err != nil {
-			slog.Warn("T7: cannot read unit — skipping pull-flag converge",
+			c.err("T7: cannot read unit — skipping pull-flag converge",
 				"path", p, "error", err)
 			continue
 		}
@@ -249,7 +249,7 @@ func (c *cyc) groupPulls() {
 	if cfgPath != "" && r.fileExists(cfgPath) {
 		kf, err := os.ReadFile(r.hp(cfgPath))
 		if err != nil {
-			slog.Warn("T7: kubelet config unreadable — skipping live patch",
+			c.err("T7: kubelet config unreadable — skipping live patch",
 				"path", cfgPath, "error", err)
 		} else {
 			s := string(kf)
@@ -337,6 +337,9 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip addr show dev neb1 | grep -
 			[]byte("# Managed by node-config-agent - T10 CPU starvation protection\n[Service]\nCPUWeight="+w+"\n"), 0o644); ch {
 			r.daemonReload(ctx)
 			if _, err := r.run(ctx, "systemctl", "set-property", "k0sworker.service", "CPUWeight="+w); err != nil {
+				// Best-effort live apply — the declared state is on
+				// disk; the agent never restarts k0s so the drop-in
+				// lands at the next natural restart.
 				slog.Warn("T10: set-property failed — drop-in applies at next restart",
 					"unit", "k0sworker.service", "value", w, "error", err)
 			}
@@ -352,6 +355,7 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip addr show dev neb1 | grep -
 			[]byte("# Managed by node-config-agent - T10 nebula CPU bound\n[Service]\nCPUQuota="+quota+"\n"), 0o644); ch {
 			r.daemonReload(ctx)
 			if _, err := r.run(ctx, "systemctl", "set-property", "nebula@interdc.service", "CPUQuota="+quota); err != nil {
+				// Best-effort live apply — same drop-in contract.
 				slog.Warn("T10: set-property failed — drop-in applies at next restart",
 					"unit", "nebula@interdc.service", "value", quota, "error", err)
 			}
@@ -453,7 +457,7 @@ func (c *cyc) groupCoreDNS() {
 				cfgChanged = true
 			}
 		} else {
-			slog.Error("T9: zone file render", "zone", zone, "error", err)
+			c.err("T9: zone file render", "zone", zone, "error", err)
 		}
 	}
 	if ch, _ := r.writeManaged("/etc/coredns/Corefile", []byte(corefile), 0o644); ch {
@@ -505,7 +509,7 @@ WantedBy=multi-user.target
 			}
 		}
 		if !ok {
-			slog.Error("T9/hub: coredns did not answer — resolv.conf NOT repointed",
+			c.err("T9/hub: coredns did not answer — resolv.conf NOT repointed",
 				"query", "ns1."+zone, "error", lastErr)
 			return
 		}
@@ -513,13 +517,13 @@ WantedBy=multi-user.target
 		// Worker: stub must answer the internal zone before resolv.conf
 		// repoints at it (single-shot, ansible failed_when parity).
 		if out, err := r.run(ctx, "dig", "@127.0.0.1", c.v("cp_endpoint"), "+short", "+time=3", "+tries=1"); err != nil || strings.TrimSpace(out) == "" {
-			slog.Error("T9: stub does not answer cp_endpoint — resolv.conf NOT repointed",
+			c.err("T9: stub does not answer cp_endpoint — resolv.conf NOT repointed",
 				"cp_endpoint", c.v("cp_endpoint"), "out", strings.TrimSpace(out), "error", err)
 			return
 		}
 		if fb := c.vs("cp_endpoint_fallback_names"); len(fb) > 0 {
 			if out, err := r.run(ctx, "dig", "@127.0.0.1", fb[0], "+short", "+time=3", "+tries=1"); err != nil || strings.TrimSpace(out) == "" {
-				slog.Error("T9: stub fails external recursion — resolv.conf NOT repointed",
+				c.err("T9: stub fails external recursion — resolv.conf NOT repointed",
 					"name", fb[0], "out", strings.TrimSpace(out), "error", err)
 				return
 			}
@@ -751,16 +755,16 @@ func (c *cyc) corednsInstallBinary() {
 	if fileExistsNoRoot(local) {
 		// ansible: sha256sum -c every run when outdated.
 		if !sha256FileOK(local, sum) {
-			slog.Error("T9: staged coredns tgz sha256 mismatch — not installing",
+			c.err("T9: staged coredns tgz sha256 mismatch — not installing",
 				"file", local, "sha256", sum)
 			return
 		}
 	} else if err := download(c.ctx, url, local, sum); err != nil {
-		slog.Error("T9: coredns download", "url", url, "file", local, "error", err)
+		c.err("T9: coredns download", "url", url, "file", local, "error", err)
 		return
 	}
 	if err := untarInstall(local, "coredns", c.r.hp("/usr/local/bin/coredns"), 0o755); err != nil {
-		slog.Warn("T9: coredns install failed — stub will not run",
+		c.err("T9: coredns install failed — stub will not run",
 			"file", local, "error", err)
 	}
 }
@@ -807,13 +811,13 @@ func (c *cyc) groupSecurity() {
 		if out, _ := r.run(ctx, "dpkg-query", "-W", "-f=${db:Status-Status}", "fail2ban"); out != "installed" {
 			if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 				"apt-get", "install", "-y", "fail2ban"); err != nil {
-				slog.Warn("security: fail2ban install failed — jail will not apply",
+				c.err("security: fail2ban install failed — jail will not apply",
 					"error", err)
 			}
 		}
 		b, err := r.render("fail2ban-cluster.conf.j2", c.tplCtx())
 		if err != nil {
-			slog.Error("fail2ban render", "error", err)
+			c.err("fail2ban render", "error", err)
 			return
 		}
 		r.ensureDir("/etc/fail2ban/jail.d", 0o755)
@@ -835,7 +839,7 @@ func (c *cyc) groupSecurity() {
 		r.removeManaged("/etc/fail2ban/jail.d/cluster.conf")
 		if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 			"apt-get", "purge", "-y", "fail2ban"); err != nil {
-			slog.Warn("security: fail2ban purge failed — package remains",
+			c.err("security: fail2ban purge failed — package remains",
 				"error", err)
 		}
 	}
@@ -862,16 +866,18 @@ ClientAliveCountMax 2
 			if out, err := r.run(ctx, "sshd", "-t"); err == nil {
 				r.restartService(ctx, "ssh.service")
 			} else {
-				slog.Error("sshd -t failed — not restarting ssh.service",
+				c.err("sshd -t failed — not restarting ssh.service",
 					"path", "/etc/ssh/sshd_config.d/00-passiontech-hardening.conf",
 					"out", out, "error", err)
 			}
 		}
 		if out, err := r.run(ctx, "sshd", "-T", "-C", "user=root,host=localhost,addr=127.0.0.1"); err != nil {
+			// Best-effort verify only — a failed probe proves nothing
+			// about the applied config.
 			slog.Warn("ssh-hardening: sshd -T failed — cannot verify effective config",
 				"error", err)
 		} else if !strings.Contains(out, "passwordauthentication no") {
-			slog.Warn("ssh-hardening: passwordauthentication still enabled — drop-in not effective",
+			c.err("ssh-hardening: passwordauthentication still enabled — drop-in not effective",
 				"path", "/etc/ssh/sshd_config.d/00-passiontech-hardening.conf")
 		}
 	} else if _, u := c.t.Vars.Get("ssh_hardening_enabled").(topology.Undefined); !u {
@@ -881,7 +887,7 @@ ClientAliveCountMax 2
 			if _, err := r.run(ctx, "sshd", "-t"); err == nil {
 				r.restartService(ctx, "ssh.service")
 			} else {
-				slog.Warn("ssh-hardening: sshd -t failed — drop-in removal not active until restart",
+				c.err("ssh-hardening: sshd -t failed — drop-in removal not active until restart",
 					"error", err)
 			}
 		}
@@ -935,13 +941,15 @@ func (c *cyc) groupAPILB() {
 				"host", string(m[1]), "cp_endpoint", c.v("cp_endpoint"))
 		}
 	} else {
+		// Best-effort preflight — a static-IP kubelet is legitimate;
+		// the pin checks below are the group's real signal.
 		slog.Warn("T12: kubelet.conf unreadable — skipping server-URL check",
 			"path", "/var/lib/k0s/kubelet.conf", "error", err)
 	}
 	tctx := c.tplCtx() // includes api_lb_probe_reachable (names)
 	cfg, err := r.render("api-local-lb.haproxy.cfg.j2", tctx)
 	if err != nil {
-		slog.Error("T12 render", "error", err)
+		c.err("T12 render", "error", err)
 		return
 	}
 	// haproxy install only when missing or wrong pinned version.
@@ -960,14 +968,14 @@ func (c *cyc) groupAPILB() {
 		r.ensureDir("/var/lib/node-watchdog", 0o755)
 		if !(fileExistsNoRoot(local) && sha256FileOK(local, c.v("api_lb_haproxy_deb_sha256"))) {
 			if err := download(ctx, c.v("api_lb_haproxy_deb_url"), local, c.v("api_lb_haproxy_deb_sha256")); err != nil {
-				slog.Error("T12: haproxy deb download",
+				c.err("T12: haproxy deb download",
 					"url", c.v("api_lb_haproxy_deb_url"), "deb", hostDeb, "error", err)
 				return
 			}
 		}
 		if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 			"apt-get", "install", "-y", hostDeb); err != nil {
-			slog.Warn("T12: haproxy deb install failed — continuing with installed version",
+			c.err("T12: haproxy deb install failed — continuing with installed version",
 				"deb", hostDeb, "error", err)
 		}
 	}
@@ -978,7 +986,7 @@ func (c *cyc) groupAPILB() {
 	cfgChanged, _ := r.writeManaged("/etc/haproxy/api-local-lb.cfg", cfg, 0o644)
 	// validate cfg before touching the unit (ansible fails the run).
 	if out, err := r.run(ctx, "/usr/sbin/haproxy", "-c", "-f", "/etc/haproxy/api-local-lb.cfg"); err != nil {
-		slog.Error("T12: haproxy -c failed — not starting/restarting api-local-lb",
+		c.err("T12: haproxy -c failed — not starting/restarting api-local-lb",
 			"conf", "/etc/haproxy/api-local-lb.cfg", "out", out, "error", err)
 		return
 	}
@@ -989,7 +997,7 @@ func (c *cyc) groupAPILB() {
 	if vip := c.v("api_lb_vip_ip"); vip != "" && vip != "None" {
 		if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 			"apt-get", "install", "-y", "nftables"); err != nil {
-			slog.Warn("T12: nftables install failed — nft -c may fail below",
+			c.err("T12: nftables install failed — nft -c may fail below",
 				"error", err)
 		}
 		var rules strings.Builder
@@ -1014,7 +1022,7 @@ table ip api_local_dnat {
 `, vip, rules.String())
 		nftChanged, _ = r.writeManaged("/etc/api-local-dnat.nft", []byte(nft), 0o644)
 		if out, err := r.run(ctx, "nft", "-c", "-f", "/etc/api-local-dnat.nft"); err != nil {
-			slog.Error("T12: nft ruleset failed nft -c — DNAT not applied",
+			c.err("T12: nft ruleset failed nft -c — DNAT not applied",
 				"path", "/etc/api-local-dnat.nft", "vip", vip,
 				"out", out, "error", err)
 			return
@@ -1026,7 +1034,7 @@ table ip api_local_dnat {
 	r.removeManaged("/etc/nftables.d/api-lb-dnat.nft")
 	unit, err := r.render("api-local-lb.service.j2", tctx)
 	if err != nil {
-		slog.Error("T12 unit render", "error", err)
+		c.err("T12 unit render", "error", err)
 		return
 	}
 	uch, _ := r.writeManaged("/etc/systemd/system/api-local-lb.service", unit, 0o644)
@@ -1041,7 +1049,7 @@ table ip api_local_dnat {
 	// pinning against a dead LB kills the node's API path entirely.
 	probe := `timeout 15 bash -c 'until timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/6443" 2>/dev/null; do sleep 0.3; done'`
 	if _, err := r.run(ctx, "sh", "-c", probe); err != nil {
-		slog.Error("T12: 127.0.0.1:6443 not serving in 15s — /etc/hosts NOT pinned", "error", err)
+		c.err("T12: 127.0.0.1:6443 not serving in 15s — /etc/hosts NOT pinned", "error", err)
 		return
 	}
 	c.pinHosts()
@@ -1139,7 +1147,7 @@ func (c *cyc) blockInHosts(mark, block string) {
 func (c *cyc) removeFromHosts(mark string) {
 	hosts, err := os.ReadFile(c.r.hp("/etc/hosts"))
 	if err != nil {
-		slog.Warn("T12: cannot read /etc/hosts — managed block not removed",
+		c.err("T12: cannot read /etc/hosts — managed block not removed",
 			"mark", mark, "error", err)
 		return
 	}
@@ -1166,6 +1174,8 @@ func (c *cyc) unpinHosts() {
 
 // ---------- verify (informational) ----------
 
+// groupVerify is the informational tail group (ansible debug/assert
+// parity) — its probes only log; they never count a group error.
 func (c *cyc) groupVerify() {
 	if out, err := c.r.run(c.ctx, "getent", "ahosts", c.v("cp_endpoint")); err == nil {
 		slog.Info("hostconfig verify: cp_endpoint resolves", "getent", out)

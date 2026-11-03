@@ -516,6 +516,107 @@ func TestCycleSecretFailureScopesAPILB(t *testing.T) {
 	}
 }
 
+// TestCycleTargetUpGauge: target_up is 1 on a successful converge and
+// 0 on failure or a missing guard secret (2.6 — HubsyncTargetDown
+// alert source).
+func TestCycleTargetUpGauge(t *testing.T) {
+	dialer := newFakeDialer()
+	dialer.err = map[string]error{"10.0.0.15": exitErr{255}}
+	reg := prometheus.NewRegistry()
+	s, err := New(testConfig(t, newClientsetWithSecret(), dialer, []byte("bin")), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Cycle(context.Background())
+
+	up := gatherVec(t, reg, "node_host_agent_hubsync_target_up")
+	if up[labelKey("target", "db-vm")] != 0 {
+		t.Fatalf("target_up{db-vm} = %v want 0 (dial failed)", up[labelKey("target", "db-vm")])
+	}
+	for _, name := range []string{"hub-controller-01", "lanit-hub-01",
+		"lanit-hub-02", "api-lb-vm"} {
+		if up[labelKey("target", name)] != 1 {
+			t.Fatalf("target_up{%s} = %v want 1", name, up[labelKey("target", name)])
+		}
+	}
+
+	// Missing guard secret → the api-lb target reads 0 while the
+	// converged targets stay 1.
+	dialer2 := newFakeDialer()
+	reg2 := prometheus.NewRegistry()
+	s2, err := New(testConfig(t, fake.NewSimpleClientset(), dialer2, []byte("bin")), reg2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.Cycle(context.Background())
+	up2 := gatherVec(t, reg2, "node_host_agent_hubsync_target_up")
+	if up2[labelKey("target", "api-lb-vm")] != 0 {
+		t.Fatalf("target_up{api-lb-vm} = %v want 0 (secret missing)",
+			up2[labelKey("target", "api-lb-vm")])
+	}
+	if up2[labelKey("target", "db-vm")] != 1 {
+		t.Fatalf("target_up{db-vm} = %v want 1", up2[labelKey("target", "db-vm")])
+	}
+}
+
+// TestCycleParseErrorClearsTargetUp: a loadTargets parse failure
+// must drive every last-known target_up series to 0 — a stale 1
+// would report "up" forever while nothing converges.
+func TestCycleParseErrorClearsTargetUp(t *testing.T) {
+	// Copy the fixture vars into a scratch dir so the parse can be
+	// broken between cycles.
+	vars := t.TempDir()
+	for _, name := range []string{"defaults.yaml", "cluster.yaml", "interdc_nodes.yaml"} {
+		b, err := os.ReadFile(path.Join("testdata/vars", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path.Join(vars, name), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dialer := newFakeDialer()
+	reg := prometheus.NewRegistry()
+	cfg := testConfig(t, newClientsetWithSecret(), dialer, []byte("bin"))
+	cfg.VarsDir = vars
+	s, err := New(cfg, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Cycle(context.Background())
+	up := gatherVec(t, reg, "node_host_agent_hubsync_target_up")
+	for _, name := range []string{"hub-controller-01", "lanit-hub-01",
+		"lanit-hub-02", "api-lb-vm", "db-vm"} {
+		if up[labelKey("target", name)] != 1 {
+			t.Fatalf("target_up{%s} = %v want 1 before the parse break", name,
+				up[labelKey("target", name)])
+		}
+	}
+
+	// Break the parse — Load fails on a missing interdc_nodes.yaml —
+	// then re-cycle: no dials, every known target reads down.
+	if err := os.Remove(path.Join(vars, "interdc_nodes.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	s.Cycle(context.Background())
+	if got := len(dialer.dials()); got != 5 {
+		t.Fatalf("dialed during parse-error cycle: %d dials", got-5)
+	}
+	cycles := gatherVec(t, reg, "node_host_agent_hubsync_cycles_total")
+	if cycles[labelKey("target", "all", "result", "parse_error")] != 1 {
+		t.Fatalf("cycles{all,parse_error} = %v want 1",
+			cycles[labelKey("target", "all", "result", "parse_error")])
+	}
+	up = gatherVec(t, reg, "node_host_agent_hubsync_target_up")
+	for _, name := range []string{"hub-controller-01", "lanit-hub-01",
+		"lanit-hub-02", "api-lb-vm", "db-vm"} {
+		if up[labelKey("target", name)] != 0 {
+			t.Fatalf("target_up{%s} = %v stayed stale after parse error", name,
+				up[labelKey("target", name)])
+		}
+	}
+}
+
 // TestNebulaCertsFilter: the certs mirror carries only cert/key
 // material — the pod's certs and vars dirs are the same projected
 // volume, so cluster.yaml/defaults.yaml must not be duplicated into

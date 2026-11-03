@@ -259,6 +259,45 @@ func TestCertDriftAuditorUnresolvedSourceKeepsSeries(t *testing.T) {
 	}
 }
 
+// A transient Certificate Get failure must NOT fall back to the
+// name convention: a same-named Secret holding a DIFFERENT CA would
+// fabricate a drift verdict (or mask a real one). "Can't resolve"
+// carries the emitted series forward like any other unresolvable
+// source.
+func TestCertDriftAuditorCertGetErrorCarriesSeries(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		caSecret("cert-ns", "real-secret", "ca.crt", caBundleA),
+		// The trap: a Secret named after the Certificate whose bundle
+		// matches the webhook — a name-convention fallback would read
+		// it and clear a REAL drift alert.
+		caSecret("cert-ns", "my-cert", "ca.crt", caBundleB),
+		mutatingCfg("mwc", map[string]string{
+			injectCAFromAnno: "cert-ns/my-cert",
+		}, mutHook("hook.example.com", caBundleB)))
+	dyn := newFakeDyn(cdaListKinds,
+		cdaCertificate("cert-ns", "my-cert", "real-secret"))
+	a := newCertDriftAuditor(cs, dyn, time.Now())
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := caMismatch("MutatingWebhookConfiguration", "mwc", "hook.example.com"); got != 1 {
+		t.Fatalf("mismatch=%v, want 1 before the API failure", got)
+	}
+
+	// Certificates unreachable (RBAC, transient API) — NOT NotFound.
+	dyn.PrependReactor("get", "certificates",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := caMismatch("MutatingWebhookConfiguration", "mwc", "hook.example.com"); got != 1 {
+		t.Fatalf("drift series flapped on a transient certificate get failure: %v", got)
+	}
+}
+
 // Dropping the inject annotation makes the entry uncovered — its
 // series is pruned on the next sweep.
 func TestCertDriftAuditorPrunesDroppedAnnotation(t *testing.T) {
@@ -436,5 +475,137 @@ func TestSplitNSName(t *testing.T) {
 					tc.ref, ns, name, ok, tc.ns, tc.name, tc.ok)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2.4 — full certificate surface: webhook caBundle expiry + trust bundles
+// ---------------------------------------------------------------------------
+
+func caExpiryGauge(kind, cfg, hook string) float64 {
+	return promtestutil.ToFloat64(
+		metrics.WebhookCABundleDaysToExpiry.WithLabelValues(kind, cfg, hook))
+}
+
+func trustBundleGauge(ns, name string) float64 {
+	return promtestutil.ToFloat64(
+		metrics.TrustBundleDaysToExpiry.WithLabelValues(ns, name))
+}
+
+// mutHookSvc builds a MutatingWebhook entry targeting a Service — the
+// shape where a caBundle is strictly required.
+func mutHookSvc(name string, ca []byte, fp *admissionv1.FailurePolicyType) admissionv1.MutatingWebhook {
+	return admissionv1.MutatingWebhook{
+		Name: name,
+		ClientConfig: admissionv1.WebhookClientConfig{
+			CABundle: ca,
+			Service:  &admissionv1.ServiceReference{Name: "svc", Namespace: "app", Port: ptr443()},
+		},
+		FailurePolicy: fp,
+	}
+}
+
+func ptr443() *int32 { p := int32(443); return &p }
+
+// Every entry's caBundle feeds the expiry gauge even without a
+// cainjector annotation — the earliest cert in the bundle wins.
+func TestCertDriftAuditorWebhookBundleExpiry(t *testing.T) {
+	fixedNow := time.Now().Truncate(time.Second)
+	bundle := makeCertPEM(t, fixedNow.Add(20*24*time.Hour))
+	oldest := append(append([]byte{}, makeCertPEM(t, fixedNow.Add(5*24*time.Hour))...), bundle...)
+	cs := fake.NewSimpleClientset(
+		mutatingCfg("unannotated-mwc", nil, mutHook("hook-a.example.com", oldest)),
+		validatingCfg("unannotated-vwc", nil, valHook("hook-b.example.com", bundle)))
+	a := newCertDriftAuditor(cs, newFakeDyn(cdaListKinds), fixedNow)
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := caExpiryGauge("MutatingWebhookConfiguration", "unannotated-mwc", "hook-a.example.com"); got != 5 {
+		t.Fatalf("mwc days=%v, want 5 (earliest cert in bundle)", got)
+	}
+	if got := caExpiryGauge("ValidatingWebhookConfiguration", "unannotated-vwc", "hook-b.example.com"); got != 20 {
+		t.Fatalf("vwc days=%v, want 20", got)
+	}
+}
+
+// An EMPTY caBundle on a service-targeted entry with
+// failurePolicy=Fail (explicit or API-default nil) is an outage
+// signature → mismatch=1. failurePolicy=Ignore and url-targeted
+// entries stay quiet.
+func TestCertDriftAuditorWebhookEmptyBundleFailClosed(t *testing.T) {
+	ignore := admissionv1.Ignore
+	fail := admissionv1.Fail
+	cs := fake.NewSimpleClientset(
+		mutatingCfg("mwc", nil,
+			mutHookSvc("fail.example.com", nil, &fail),
+			mutHookSvc("default-fail.example.com", nil, nil), // nil = API-default Fail
+			mutHookSvc("ignore.example.com", nil, &ignore),
+			mutHook("url.example.com", nil), // url clientConfig — no service
+		))
+	a := newCertDriftAuditor(cs, newFakeDyn(cdaListKinds), time.Now())
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := caMismatch("MutatingWebhookConfiguration", "mwc", "fail.example.com"); got != 1 {
+		t.Fatalf("empty-bundle Fail entry mismatch=%v, want 1", got)
+	}
+	if got := caMismatch("MutatingWebhookConfiguration", "mwc", "default-fail.example.com"); got != 1 {
+		t.Fatalf("empty-bundle default-Fail entry mismatch=%v, want 1", got)
+	}
+	for _, hook := range []string{"ignore.example.com", "url.example.com"} {
+		if metrics.WebhookCABundleMismatch.DeleteLabelValues(
+			"MutatingWebhookConfiguration", "mwc", hook) {
+			t.Fatalf("hook %s produced a mismatch series — only service+Fail may flag", hook)
+		}
+	}
+}
+
+// The linkerd trust surface: trust-roots ConfigMap + Opaque
+// linkerd-identity-issuer Secret both land on the gauge with the
+// earliest cert expiry; an unrelated secret without bundle keys does
+// not.
+func TestCertDriftAuditorTrustBundles(t *testing.T) {
+	fixedNow := time.Now().Truncate(time.Second)
+	cs := fake.NewSimpleClientset(
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "linkerd", Name: "linkerd-identity-trust-roots"},
+			Data: map[string]string{
+				"ca-bundle.crt": string(makeCertPEM(t, fixedNow.Add(40*24*time.Hour))),
+			},
+		},
+		&corev1.Secret{ // Opaque issuer — invisible to the TLS-secret audit
+			ObjectMeta: metav1.ObjectMeta{Namespace: "linkerd", Name: "linkerd-identity-issuer"},
+			Type:       corev1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				"crt.pem": makeCertPEM(t, fixedNow.Add(7*24*time.Hour)),
+			},
+		},
+		&corev1.Secret{ // no bundle keys — skipped
+			ObjectMeta: metav1.ObjectMeta{Namespace: "linkerd", Name: "unrelated"},
+			Data:       map[string][]byte{"other": []byte("x")},
+		},
+		&corev1.Secret{ // bundle keys but outside linkerd — skipped
+			ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "s"},
+			Data:       map[string][]byte{"ca.crt": makeCertPEM(t, fixedNow.Add(9*24*time.Hour))},
+		})
+	a := newCertDriftAuditor(cs, newFakeDyn(cdaListKinds), fixedNow)
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := trustBundleGauge("linkerd", "linkerd-identity-trust-roots"); got != 40 {
+		t.Fatalf("trust-roots days=%v, want 40", got)
+	}
+	if got := trustBundleGauge("linkerd", "linkerd-identity-issuer"); got != 7 {
+		t.Fatalf("issuer days=%v, want 7", got)
+	}
+	for _, key := range [][2]string{
+		{"linkerd", "unrelated"}, {"other-ns", "s"},
+	} {
+		if metrics.TrustBundleDaysToExpiry.DeleteLabelValues(key[0], key[1]) {
+			t.Fatalf("non-bundle object %s/%s produced an expiry series", key[0], key[1])
+		}
 	}
 }

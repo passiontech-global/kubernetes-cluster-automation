@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -247,6 +248,20 @@ type Reconciler struct {
 	writes  *prometheus.CounterVec // file
 	actions *prometheus.CounterVec // action
 	lastOK  prometheus.Gauge
+
+	// cur is the cycle currently running (nil between cycles) — the
+	// managed-op helpers below attribute their failures to it so a
+	// group that hits a write/command error is marked "error" and
+	// CycleWithErrors reports it. Cycles run on a single goroutine.
+	cur *cyc
+}
+
+// noteErr attributes a managed-operation failure to the active
+// cycle. No-op outside a converge (r.cur == nil) and on nil error.
+func (r *Reconciler) noteErr(err error) {
+	if err != nil && r.cur != nil {
+		r.cur.errs++
+	}
 }
 
 func New(cfg Config, reg prometheus.Registerer) (*Reconciler, error) {
@@ -342,10 +357,12 @@ func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode)
 		}
 	} else if !os.IsNotExist(err) {
 		slog.Warn("hostconfig: read managed file failed", "path", path, "error", err)
+		r.noteErr(err)
 		return false, err
 	}
 	fail := func(err error) (bool, error) {
 		slog.Warn("hostconfig: write managed file failed", "path", path, "error", err)
+		r.noteErr(err)
 		return false, err
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
@@ -378,10 +395,13 @@ func (r *Reconciler) removeManaged(path string) (bool, error) {
 	}
 	if fi.IsDir() {
 		slog.Warn("hostconfig: remove refused — path is a dir", "path", path)
-		return false, fmt.Errorf("removeManaged: %s is a dir", path)
+		err := fmt.Errorf("removeManaged: %s is a dir", path)
+		r.noteErr(err)
+		return false, err
 	}
 	if err := os.Remove(dst); err != nil {
 		slog.Warn("hostconfig: remove file failed", "path", path, "error", err)
+		r.noteErr(err)
 		return false, err
 	}
 	slog.Info("hostconfig: removed file", "path", path)
@@ -391,6 +411,7 @@ func (r *Reconciler) removeManaged(path string) (bool, error) {
 func (r *Reconciler) ensureDir(path string, mode os.FileMode) error {
 	if err := os.MkdirAll(r.hp(path), mode); err != nil {
 		slog.Warn("hostconfig: ensure dir failed", "path", path, "error", err)
+		r.noteErr(err)
 		return err
 	}
 	return nil
@@ -399,6 +420,40 @@ func (r *Reconciler) ensureDir(path string, mode os.FileMode) error {
 func (r *Reconciler) fileExists(path string) bool {
 	_, err := os.Stat(r.hp(path))
 	return err == nil
+}
+
+// watchdogStateDir is the shared latch dir every subsystem writes
+// state-*/last-* files into (nethealth latches, workerhygiene rate
+// budgets) — groupWatchdog ensures it on the converge path.
+const watchdogStateDir = "/var/lib/node-watchdog"
+
+// rateOK mirrors nethealth's last-* rate-limit budget: true while
+// the latch file is absent, unparseable, or older than interval.
+// The name MUST keep the last-* prefix — the workerhygiene janitor
+// only sweeps state-* latches and deliberately never touches last-*
+// budget files (deleting one would silently bypass cooldowns).
+func (r *Reconciler) rateOK(name string, interval time.Duration) bool {
+	data, err := os.ReadFile(r.hp(watchdogStateDir + "/" + name))
+	if err != nil {
+		return true
+	}
+	last, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return true
+	}
+	return r.cfg.NowFn().Unix()-last >= int64(interval.Seconds())
+}
+
+// rateSpend stamps a last-* budget latch with the current epoch
+// (nethealth rateSpend parity: the spend is recorded on the action
+// attempt, so a failing remediation cannot spam retries every cycle).
+func (r *Reconciler) rateSpend(name string) {
+	p := r.hp(watchdogStateDir + "/" + name)
+	content := strconv.FormatInt(r.cfg.NowFn().Unix(), 10) + "\n"
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		slog.Warn("hostconfig: rate budget write failed",
+			"budget", name, "path", p, "error", err)
+	}
 }
 
 // render renders an embedded .j2 template against ctx. Lookup hooks
@@ -425,6 +480,7 @@ func (r *Reconciler) daemonReload(ctx context.Context) {
 	r.actions.WithLabelValues("daemon-reload").Inc()
 	if _, err := r.run(ctx, "systemctl", "daemon-reload"); err != nil {
 		slog.Warn("hostconfig: daemon-reload failed", "error", err)
+		r.noteErr(err)
 	}
 }
 
@@ -454,6 +510,7 @@ func (r *Reconciler) enableService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("enable:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "enable", unit); err != nil {
 		slog.Warn("hostconfig: enable failed", "unit", unit, "error", err)
+		r.noteErr(err)
 	}
 }
 
@@ -461,6 +518,7 @@ func (r *Reconciler) startService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("start:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "start", unit); err != nil {
 		slog.Warn("hostconfig: start failed", "unit", unit, "error", err)
+		r.noteErr(err)
 	}
 }
 
@@ -468,6 +526,7 @@ func (r *Reconciler) stopService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("stop:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "stop", unit); err != nil {
 		slog.Warn("hostconfig: stop failed", "unit", unit, "error", err)
+		r.noteErr(err)
 	}
 }
 
@@ -475,6 +534,7 @@ func (r *Reconciler) restartService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("restart:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "restart", unit); err != nil {
 		slog.Warn("hostconfig: restart failed", "unit", unit, "error", err)
+		r.noteErr(err)
 	}
 }
 
@@ -482,5 +542,6 @@ func (r *Reconciler) reloadService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("reload:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "reload", unit); err != nil {
 		slog.Warn("hostconfig: reload failed", "unit", unit, "error", err)
+		r.noteErr(err)
 	}
 }

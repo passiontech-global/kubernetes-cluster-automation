@@ -19,6 +19,22 @@
 // post-incident debugging; passiontech.dev/storm-gate-hold=true is a
 // manual hold (game-day/runbook) that skips scaling. An API failure
 // aborts the reconcile — never a "clear" verdict on empty data.
+//
+// 2.7 — Cluster Maintenance Mutex. On top of the storm signals the
+// gate also holds the descheduler at 0 while any deliberate
+// maintenance is in flight, because rebalancing mid-maintenance
+// fights the operator doing the work:
+//
+//	a) any node spec.unschedulable — a cordon/drain is running;
+//	b) DaemonSet kube-system/kured carrying the
+//	   weave.works/kured-node-lock annotation — a reboot drain in
+//	   progress;
+//	c) an autopilot.k0sproject.io/v1beta2 Plan exists whose
+//	   status.state is neither Schedulable nor Completed — a k0s
+//	   cluster upgrade is in flight.
+//
+// concourse-workdir-janitor shares the same three signals (it defers
+// its worker wipe cycle entirely) — keep the checks in sync.
 package node
 
 import (
@@ -33,8 +49,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -51,7 +71,23 @@ import (
 const (
 	stormGateHoldAnno     = "passiontech.dev/storm-gate-hold"
 	stormGateDecisionAnno = "passiontech.dev/storm-gate-decision"
+
+	// kuredLockAnno is the reboot-coordination lock kured holds
+	// while a node drains for its reboot window (2.7 signal b).
+	kuredLockAnno = "weave.works/kured-node-lock"
+	// kuredDaemonSet is where the lock annotation lives.
+	kuredDaemonSetNS   = "kube-system"
+	kuredDaemonSetName = "kured"
 )
+
+// autopilotPlanGVR is the k0s autopilot Plan resource — a Plan in a
+// non-terminal state means a cluster upgrade is in flight (2.7
+// signal c).
+var autopilotPlanGVR = schema.GroupVersionResource{
+	Group:    "autopilot.k0sproject.io",
+	Version:  "v1beta2",
+	Resource: "plans",
+}
 
 // stormConds mirrors STORM_CONDS (see package comment for sources).
 var stormConds = []corev1.NodeConditionType{
@@ -68,9 +104,12 @@ var stormTaints = []string{
 
 type deschedulerStormGate struct {
 	cs kubernetes.Interface
+	// dyn reads the autopilot Plan CR for maintenance-mutex
+	// signal (c) — no typed client exists for it.
+	dyn dynamic.Interface
 }
 
-func SetupDeschedulerStormGate(mgr ctrl.Manager, cs kubernetes.Interface) error {
+func SetupDeschedulerStormGate(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("descheduler-storm-gate").
 		// Watches with a single fixed workqueue key, not For(): the
@@ -93,7 +132,8 @@ func SetupDeschedulerStormGate(mgr ctrl.Manager, cs kubernetes.Interface) error 
 					if !ok1 || !ok2 {
 						return true
 					}
-					return !reflect.DeepEqual(condStatusMap(oldN), condStatusMap(newN)) ||
+					return oldN.Spec.Unschedulable != newN.Spec.Unschedulable ||
+						!reflect.DeepEqual(condStatusMap(oldN), condStatusMap(newN)) ||
 						!reflect.DeepEqual(taintKeys(oldN), taintKeys(newN))
 				},
 				// Node add/remove changes the storm verdict too.
@@ -101,7 +141,7 @@ func SetupDeschedulerStormGate(mgr ctrl.Manager, cs kubernetes.Interface) error 
 				DeleteFunc:  func(event.DeleteEvent) bool { return true },
 				GenericFunc: func(event.GenericEvent) bool { return true },
 			})).
-		Complete(&deschedulerStormGate{cs: cs})
+		Complete(&deschedulerStormGate{cs: cs, dyn: dyn})
 }
 
 func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -113,12 +153,24 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		metrics.IncError("descheduler-storm-gate")
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
+	if len(nodes) == 0 {
+		// An empty-but-successful node list is an apiserver/RBAC
+		// flap, never a real cluster — without this gate the scan
+		// below yields a "clear" verdict and scales the descheduler
+		// back up on blind data (same fail-closed posture as the
+		// statefulset-ondelete-roller's nodesSafe check).
+		metrics.IncError("descheduler-storm-gate")
+		return ctrl.Result{}, fmt.Errorf("empty node list (API flap) — refusing to compute a verdict")
+	}
 
-	var notReady, bad, tainted []string
+	var notReady, bad, tainted, cordoned []string
 	for i := range nodes {
 		n := &nodes[i]
 		if !shared.NodeReady(n) {
 			notReady = append(notReady, n.Name)
+		}
+		if n.Spec.Unschedulable {
+			cordoned = append(cordoned, n.Name)
 		}
 		for _, c := range n.Status.Conditions {
 			if c.Status == corev1.ConditionTrue &&
@@ -133,9 +185,19 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		}
 	}
 
+	// 2.7 maintenance mutex (signals b + c — signal a is the
+	// `cordoned` list above): deliberate maintenance gates the
+	// descheduler exactly like a storm does.
+	maintenance, err := r.maintenanceEvidence(ctx)
+	if err != nil {
+		metrics.IncError("descheduler-storm-gate")
+		return ctrl.Result{}, err
+	}
+
 	want := int32(1)
 	verdict := "clear"
-	if len(notReady) > 0 || len(bad) > 0 || len(tainted) > 0 {
+	if len(notReady) > 0 || len(bad) > 0 || len(tainted) > 0 ||
+		len(cordoned) > 0 || len(maintenance) > 0 {
 		want, verdict = 0, "storm"
 	}
 
@@ -163,16 +225,18 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		cur = *deploy.Spec.Replicas
 		curStr = strconv.Itoa(int(cur))
 	}
-	decision := fmt.Sprintf("%s verdict=%s want=%d cur=%s not_ready=[%s] bad=[%s] tainted=[%s]",
+	decision := fmt.Sprintf("%s verdict=%s want=%d cur=%s not_ready=[%s] bad=[%s] tainted=[%s] cordoned=[%s] maintenance=[%s]",
 		time.Now().UTC().Format(time.RFC3339), verdict, want, curStr,
 		strings.Join(notReady, "\n"), strings.Join(bad, "\n"),
-		strings.Join(tainted, "\n"))
+		strings.Join(tainted, "\n"), strings.Join(cordoned, "\n"),
+		strings.Join(maintenance, "\n"))
 
 	switch {
 	case cur != want:
 		log.Info("storm-gate: scaling replicas",
 			"verdict", verdict, "from", curStr, "to", want,
-			"notReady", notReady, "bad", bad, "tainted", tainted)
+			"notReady", notReady, "bad", bad, "tainted", tainted,
+			"cordoned", cordoned, "maintenance", maintenance)
 		w := want
 		deploy.Spec.Replicas = &w
 		if _, err := r.cs.AppsV1().Deployments("kube-system").
@@ -198,6 +262,65 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 			"verdict", verdict, "replicas", want)
 	}
 	return res, nil
+}
+
+// ---------------------------------------------------------------------------
+// 2.7 — Cluster Maintenance Mutex (signals b + c; signal a is the
+// spec.unschedulable scan inside Reconcile). Keep in sync with the
+// copy inside concourse-workdir-janitor.
+// ---------------------------------------------------------------------------
+
+// maintenanceEvidence returns the human-readable evidence strings for
+// maintenance-mutex signals (b) kured lock and (c) active autopilot
+// Plan — an empty slice means "no maintenance in flight". A missing
+// kured DaemonSet or an absent autopilot CRD is not evidence; real
+// API failures are errors — a "clear" verdict must never be computed
+// on blind data.
+func (r *deschedulerStormGate) maintenanceEvidence(ctx context.Context) ([]string, error) {
+	var ev []string
+
+	// (b) kured holding its node-lock annotation means a reboot
+	// drain is in progress right now.
+	ds, err := r.cs.AppsV1().DaemonSets(kuredDaemonSetNS).
+		Get(ctx, kuredDaemonSetName, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		// kured not installed on this cluster — no signal.
+	case err != nil:
+		return nil, fmt.Errorf("get daemonset %s/%s (maintenance mutex): %w",
+			kuredDaemonSetNS, kuredDaemonSetName, err)
+	default:
+		if v := ds.Annotations[kuredLockAnno]; v != "" {
+			ev = append(ev, "kured-lock="+v)
+		}
+	}
+
+	// (c) Any autopilot Plan outside its terminal states means a
+	// k0s upgrade is in flight. An absent CRD is not evidence —
+	// clusters without autopilot skip quietly. A missing dynamic
+	// client is a wiring bug, not "no signal" — unverifiable fails
+	// closed like every other check in this function.
+	if r.dyn == nil {
+		return nil, fmt.Errorf("no dynamic client — autopilot plan check unverifiable (maintenance mutex)")
+	}
+	plans, err := r.dyn.Resource(autopilotPlanGVR).
+		List(ctx, metav1.ListOptions{})
+	switch {
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		// autopilot CRD not installed — no signal.
+	case err != nil:
+		return nil, fmt.Errorf("list autopilot plans (maintenance mutex): %w", err)
+	default:
+		for i := range plans.Items {
+			state, _, _ := unstructured.NestedString(
+				plans.Items[i].Object, "status", "state")
+			if state != "Schedulable" && state != "Completed" {
+				ev = append(ev, fmt.Sprintf("plan=%s state=%s",
+					plans.Items[i].GetName(), state))
+			}
+		}
+	}
+	return ev, nil
 }
 
 // condStatusMap is the jqFilter projection: condition type -> status,

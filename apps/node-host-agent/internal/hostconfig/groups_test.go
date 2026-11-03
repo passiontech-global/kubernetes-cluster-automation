@@ -14,6 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/topology"
 )
@@ -125,7 +128,11 @@ func loadCyc(t *testing.T, r *Reconciler, varsDir, node string) *cyc {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &cyc{r: r, ctx: context.Background(), t: topo}
+	c := &cyc{r: r, ctx: context.Background(), t: topo}
+	// Same attribution CycleWithErrors sets up: managed-op helper
+	// failures count against this cycle.
+	r.cur = c
+	return c
 }
 
 func hostWrite(t *testing.T, r *Reconciler, path, content string) {
@@ -1813,5 +1820,225 @@ kine_endpoint: "postgres://x"
 	c.groupKineService()
 	if !hostExists(r, "/etc/systemd/system/kine.service") {
 		t.Fatal("unit not written on a listed host")
+	}
+}
+
+// ---------- CycleWithErrors / per-group error accounting (2.6) ----------
+
+// cleanCycleFixture returns a Reconciler + runner whose groups all
+// self-gate or succeed under a tempdir HostRoot, so CycleWithErrors
+// reports 0 and lastOK is stamped.
+func cleanCycleFixture(t *testing.T) (*Reconciler, *scriptedRunner) {
+	t.Helper()
+	vars := writeVarsDir(t, "interdc_nebula_enabled: false\n")
+	sr := &scriptedRunner{
+		res: map[string]string{
+			"/usr/local/bin/coredns -version":               "CoreDNS-1.14.7",
+			"dig @127.0.0.1":                                "10.0.1.10",
+			"dpkg-query -W -f=${db:Status-Status} fail2ban": "installed",
+			"sshd -T": "passwordauthentication no",
+		},
+		errs: map[string]bool{},
+	}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		DownloadDir: t.TempDir(), Runner: sr,
+		NowFn: func() time.Time { return time.Unix(1_700_000_000, 0) }}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r, sr
+}
+
+func TestCycleWithErrorsCleanCycleStampsLastOK(t *testing.T) {
+	r, _ := cleanCycleFixture(t)
+	if got := r.CycleWithErrors(context.Background()); got != 0 {
+		t.Fatalf("clean cycle returned %d errors", got)
+	}
+	if got := testutil.ToFloat64(r.lastOK); got != 1_700_000_000 {
+		t.Fatalf("lastOK = %v, want NowFn unix", got)
+	}
+}
+
+func TestCycleWithErrorsTopologyLoadFailure(t *testing.T) {
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: t.TempDir(), // missing interdc_nodes.yaml/cluster.yaml
+		Runner:  sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.CycleWithErrors(context.Background()); got == 0 {
+		t.Fatal("topology load failure must count as an error")
+	}
+}
+
+func TestCycleWithErrorsCountsGroupErrors(t *testing.T) {
+	r, sr := cleanCycleFixture(t)
+	// daemon-reload runs when the nodelocaldns nft+unit change —
+	// failing it is a command error attributed to that group only.
+	sr.errs["systemctl daemon-reload"] = true
+	got := r.CycleWithErrors(context.Background())
+	// EXACT count — one noteErr per daemonReload invocation:
+	// nodelocaldns nft apply + nodeip_cpu nebula drop-in. (coredns
+	// self-gates here: nebula disabled → derive() leaves no
+	// DNSResolvers.) A regression that counts a fault twice (or
+	// skips one) moves this number.
+	if got != 2 {
+		t.Fatalf("cycle returned %d errors, want exactly 2 "+
+			"(daemon-reload x nodelocaldns/nodeip_cpu)", got)
+	}
+	if got := testutil.ToFloat64(r.cycles.WithLabelValues("nodelocaldns", "error")); got != 1 {
+		t.Fatalf("cycles{nodelocaldns,error} = %v want 1", got)
+	}
+	// Errors attribute per group: a clean group still reads "ok".
+	if got := testutil.ToFloat64(r.cycles.WithLabelValues("base", "ok")); got != 1 {
+		t.Fatalf("cycles{base,ok} = %v want 1 (error mis-attributed)", got)
+	}
+	if got := testutil.ToFloat64(r.lastOK); got != 0 {
+		t.Fatalf("lastOK stamped on a failed cycle: %v", got)
+	}
+}
+
+func TestGroupRecordsOkErrorPanic(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+
+	c.group("g-ok", func() {})
+	if got := testutil.ToFloat64(r.cycles.WithLabelValues("g-ok", "ok")); got != 1 {
+		t.Fatalf("cycles{g-ok,ok} = %v want 1", got)
+	}
+	if c.errs != 0 {
+		t.Fatalf("errs = %d after clean group", c.errs)
+	}
+
+	c.group("g-err", func() { c.err("boom") })
+	if got := testutil.ToFloat64(r.cycles.WithLabelValues("g-err", "error")); got != 1 {
+		t.Fatalf("cycles{g-err,error} = %v want 1", got)
+	}
+	if c.errs != 1 {
+		t.Fatalf("errs = %d after failing group", c.errs)
+	}
+
+	c.group("g-panic", func() { panic("test panic") })
+	if got := testutil.ToFloat64(r.cycles.WithLabelValues("g-panic", "panic")); got != 1 {
+		t.Fatalf("cycles{g-panic,panic} = %v want 1", got)
+	}
+	if c.errs != 2 {
+		t.Fatalf("errs = %d after panicking group", c.errs)
+	}
+	// later groups still run after a panic.
+	c.group("g-after", func() {})
+	if got := testutil.ToFloat64(r.cycles.WithLabelValues("g-after", "ok")); got != 1 {
+		t.Fatalf("cycles{g-after,ok} = %v want 1", got)
+	}
+}
+
+func TestGroupWriteFailureCountedViaHelper(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	hr := t.TempDir()
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: hr,
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// /etc is a regular FILE — writeManaged's MkdirAll must fail.
+	if err := os.WriteFile(filepath.Join(hr, "etc"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.group("g-write", func() {
+		if _, werr := r.writeManaged("/etc/x.conf", []byte("y"), 0o644); werr == nil {
+			t.Error("writeManaged unexpectedly succeeded")
+		}
+	})
+	if got := testutil.ToFloat64(r.cycles.WithLabelValues("g-write", "error")); got != 1 {
+		t.Fatalf("cycles{g-write,error} = %v want 1", got)
+	}
+}
+
+// ---------- journald integrity (A5, groupBase) ----------
+
+func journaldEnv(t *testing.T, res map[string]string, errs map[string]bool) (*cyc, *Reconciler, *scriptedRunner) {
+	t.Helper()
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: res, errs: errs}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	return loadCyc(t, r, vars, "node-b"), r, sr
+}
+
+func TestJournaldCorruptOutputRotates(t *testing.T) {
+	c, _, sr := journaldEnv(t, map[string]string{
+		"journalctl -n 5": "File corruption detected at /var/log/journal/x/system.journal:0 (of 20971520 bytes, 0%)",
+	}, map[string]bool{})
+	// groupBase runs the probe; corrupted output must trigger the
+	// rotate+vacuum remediation.
+	c.groupBase()
+	if len(sr.callsMatching("journalctl --rotate --vacuum-time=3d")) == 0 {
+		t.Fatalf("corrupt journal not remediated: %v", sr.callsMatching("journalctl"))
+	}
+}
+
+func TestJournaldAbnormallyEmptyRotates(t *testing.T) {
+	// journalctl answers but returns nothing while journal files are
+	// on disk — post-hard-reboot truncated/misindexed journal.
+	c, r, sr := journaldEnv(t, map[string]string{}, map[string]bool{})
+	if err := os.MkdirAll(filepath.Join(r.cfg.HostRoot, "/var/log/journal/machine-x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(r.cfg.HostRoot,
+		"/var/log/journal/machine-x/system.journal"), []byte("journal"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c.groupBase()
+	if len(sr.callsMatching("journalctl --rotate --vacuum-time=3d")) == 0 {
+		t.Fatalf("abnormally empty journal not remediated: %v", sr.callsMatching("journalctl"))
+	}
+}
+
+func TestJournaldHealthyNoRotate(t *testing.T) {
+	c, _, sr := journaldEnv(t, map[string]string{
+		"journalctl -n 5": "Oct 01 10:00:00 node-b systemd[1]: Started node-host-agent.service",
+	}, map[string]bool{})
+	c.groupBase()
+	if len(sr.callsMatching("journalctl --rotate")) > 0 {
+		t.Fatalf("healthy journal rotated: %v", sr.callsMatching("journalctl"))
+	}
+}
+
+func TestJournaldMissingBinaryNoRotate(t *testing.T) {
+	// journalctl absent → probe errors with empty output; that is not
+	// corruption evidence (rotating would fail anyway) — no action.
+	c, _, sr := journaldEnv(t, map[string]string{}, map[string]bool{"journalctl": true})
+	c.groupBase()
+	if len(sr.callsMatching("--rotate")) > 0 {
+		t.Fatalf("rotate attempted without journalctl: %v", sr.callsMatching("journalctl"))
+	}
+}
+
+func TestJournaldRotateRateLimited(t *testing.T) {
+	// A persistently-corrupt probe must not re-run rotate+vacuum every
+	// cycle — the last-journald-rotate latch caps it to once per
+	// cooldown window (a false positive would otherwise pin errs and
+	// hammer the journal on every converge).
+	c, _, sr := journaldEnv(t, map[string]string{
+		"journalctl -n 5": "File corruption detected at /var/log/journal/x/system.journal:0 (of 20971520 bytes, 0%)",
+	}, map[string]bool{})
+	c.groupBase()
+	c.groupBase()
+	if got := len(sr.callsMatching("journalctl --rotate --vacuum-time=3d")); got != 1 {
+		t.Fatalf("rotate ran %d times, want 1 (cooldown latch)", got)
 	}
 }

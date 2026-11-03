@@ -810,7 +810,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 			// Newly written pins mean DNS was dead — conntrack
 			// entries learned on the broken path blackhole lookups
 			// until expiry unless flushed now.
-			n.flushStaleUDPConntrack(ctx)
+			n.flushStaleUDPConntrack(ctx, checkDNSFB)
 		}
 		n.stateEnter("dns-fallback", "")
 	} else {
@@ -818,7 +818,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 			n.appendLog("ACTION: /etc/hosts dns-fallback block removed (DNS OK)")
 			// Unpin is a DNS-path transition too — replies for the
 			// restored resolver may sit in stale udp/53 entries.
-			n.flushStaleUDPConntrack(ctx)
+			n.flushStaleUDPConntrack(ctx, checkDNSFB)
 		}
 		n.stateExit("dns-fallback")
 	}
@@ -882,7 +882,7 @@ func (n *NetHealth) checkCoreDNSStub(ctx context.Context) {
 		n.appendLog(fmt.Sprintf("coredns restart failed: %v", err))
 	} else {
 		n.actions.WithLabelValues(checkCoreDNS, "restart").Inc()
-		n.flushStaleUDPConntrack(ctx)
+		n.flushStaleUDPConntrack(ctx, checkCoreDNS)
 	}
 	n.cycles.WithLabelValues(checkCoreDNS, "ok").Inc()
 }
@@ -1016,16 +1016,30 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 		// Drift heal: live rule must match committed state (up/down
 		// scripts can delete rules behind our back).
 		if live != comm {
+			var herr error
 			if comm == "relay" {
-				_, _ = n.ip(ctx, "rule", "add", "pref", "1500", "to",
+				_, herr = n.ip(ctx, "rule", "add", "pref", "1500", "to",
 					r+"/32", "lookup", strconv.Itoa(table))
 			} else {
-				_, _ = n.ip(ctx, "rule", "del", "pref", "1500", "to",
+				_, herr = n.ip(ctx, "rule", "del", "pref", "1500", "to",
 					r+"/32", "lookup", strconv.Itoa(table))
 			}
-			n.appendLog(fmt.Sprintf(
-				"ACTION: heal egress %s rule -> %s table %d (was %s)", r, comm, table, live))
-			live = comm
+			if herr != nil {
+				// Heal failed — leave `live` as probed so the probe
+				// window and the relay-dead check below see the real
+				// rule state; the drift is retried next cycle.
+				n.appendLog(fmt.Sprintf(
+					"suspect: heal egress %s rule -> %s table %d failed: %v",
+					r, comm, table, herr))
+			} else {
+				n.appendLog(fmt.Sprintf(
+					"ACTION: heal egress %s rule -> %s table %d (was %s)", r, comm, table, live))
+				live = comm
+				// B3: the rule change just switched the underlay path for
+				// this peer — drop its stale nebula-udp conntrack so the
+				// re-handshake happens on the new path now.
+				n.flushPeerNebulaConntrack(ctx, checkEgress, r)
+			}
 		}
 		// Probe the underlay under SO_MARK 0x2000 → pref 1390 → main
 		// table, unaffected by the relay rule.
@@ -1088,6 +1102,10 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 					n.actions.WithLabelValues(checkEgress, "rule_del").Inc()
 				}
 				live = probe
+				// B3: committed state just flipped — this peer's
+				// udp/<nebula-port> conntrack entries still pin the
+				// old path; flush only this peer's entries.
+				n.flushPeerNebulaConntrack(ctx, checkEgress, r)
 			} else {
 				n.appendLog(fmt.Sprintf(
 					"suspect: egress %s probe=%s cur=%s (check %d/%d)", r, probe, comm, ctr, need))
@@ -1176,7 +1194,7 @@ func (n *NetHealth) nebulaRestart(ctx context.Context) {
 	n.actions.WithLabelValues(checkNebula, "restart").Inc()
 	// DNS flows pinned to conntrack entries through the dead tunnel
 	// stay blackholed until expiry — flush them now.
-	n.flushStaleUDPConntrack(ctx)
+	n.flushStaleUDPConntrack(ctx, checkNebula)
 }
 
 // rmFiles removes every state-dir file matching glob — the module's
@@ -1315,6 +1333,19 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 			dpFail = true
 			n.nebulaDeg = 0
 			n.stateExit("nebula-degraded")
+			if !n.stateExists("nebula-isolated") {
+				// B3: on the isolation edge the conntrack entries
+				// learned on the dead path keep the tunnel blackholed
+				// — drop each affected peer's udp/<nebula-port>
+				// entries to force re-handshake immediately. The peer
+				// set is the FULL known set on purpose: whole-node
+				// isolation means every peer's conntrack is stale.
+				// NB: the disk latch means the edge won't refire
+				// after an agent restart while already isolated —
+				// acceptable (restart clears in-memory state but the
+				// stale flows have long expired by then).
+				n.flushPeerNebulaConntrack(ctx, checkNebula, nebulaPeerUnderlayIPs(wd)...)
+			}
 			n.stateEnter("nebula-isolated", "dataplane dead")
 		case dpTotal-dpAlive >= 2 || mkTotal-mkAlive >= 2:
 			n.nebulaDeg++
@@ -1609,14 +1640,73 @@ func (n *NetHealth) checkConntrack(ctx context.Context) {
 	n.cycles.WithLabelValues(checkCT, "ok").Inc()
 }
 
+// flushPeerNebulaConntrack drops stale udp/<nebula-port> conntrack
+// entries bound to specific peer underlay IPs — B3: after a peer
+// becomes isolated (state-nebula-isolated) or its egress path just
+// switched (overlay-egress direct↔relay), conntrack entries learned
+// on the dead path pin the tunnel until expiry. Deleting only the
+// affected peers' entries forces an immediate Nebula re-handshake on
+// the new path without touching healthy peers' flows.
+// Best-effort like flushStaleUDPConntrack — a missing conntrack
+// binary or a denied delete logs and moves on, never fails a cycle.
+// check attributes the flush to the calling check (conntrack-guard
+// is only the table-pressure probe).
+func (n *NetHealth) flushPeerNebulaConntrack(ctx context.Context, check string, peers ...string) {
+	port := n.cfg.Watchdog.NebulaPort
+	if port <= 0 {
+		port = 45670
+	}
+	dport := strconv.Itoa(port)
+	seen := map[string]bool{}
+	for _, p := range peers {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		// Both tuple directions must go: `-d <peer>` evicts flows WE
+		// initiated toward the peer; `-s <peer>` evicts peer-initiated
+		// flows (orig src=peer -> our IP:<port>) whose surviving reply
+		// direction would otherwise keep our outbound packets pinned
+		// on the dead path. Same runMountCmd seam as
+		// flushStaleUDPConntrack — the host's conntrack binary on the
+		// real conntrack table; each delete is independently
+		// best-effort (no-match is a fine "failure").
+		for _, sel := range [][]string{{"-d", p}, {"-s", p}} {
+			args := append([]string{"conntrack", "-D", "-p", "udp",
+				"--dport", dport}, sel...)
+			out, err := n.cfg.runMountCmd(ctx, args)
+			if err != nil {
+				n.appendLog(fmt.Sprintf("conntrack nebula-peer flush %s skipped: %v (%s) [%s]",
+					p, err, trimRunErr(out), sel[0]))
+				continue
+			}
+			n.actions.WithLabelValues(check, "flush_peer").Inc()
+		}
+		n.appendLog(fmt.Sprintf(
+			"ACTION: flushed stale udp/%d conntrack entries for peer %s", port, p))
+	}
+}
+
+// nebulaPeerUnderlayIPs returns the peer underlay IPs the watchdog
+// conf knows about — OVERLAY_PROBE_TARGETS (remote public IPs probed
+// through the tunnel) plus OVERLAY_EGRESS_RELAYS (relay peers). These
+// are the -d destinations conntrack records for udp/<nebula-port>
+// flows; marker IPs are overlay addresses conntrack never sees.
+func nebulaPeerUnderlayIPs(wd *watchdogconf.Config) []string {
+	out := append([]string{}, wd.OverlayProbeTargets...)
+	return append(out, wd.OverlayEgressRelays...)
+}
+
 // flushStaleUDPConntrack drops stale udp/53 conntrack entries after
 // a DNS-path transition (dns-fallback pins written, coredns-stub or
 // nebula@ just restarted). NATed DNS replies bound to a now-dead
 // endpoint's conntrack entry keep blackholing lookups until the
 // entry expires — deleting them makes the fix effective immediately.
 // Best-effort only: a missing conntrack binary or a denied delete
-// logs and moves on, it never fails the cycle.
-func (n *NetHealth) flushStaleUDPConntrack(ctx context.Context) {
+// logs and moves on, it never fails the cycle. check attributes the
+// flush to the calling check.
+func (n *NetHealth) flushStaleUDPConntrack(ctx context.Context, check string) {
 	// runMountCmd (nsenter -t 1 -m -n) is required — runHostCmd only
 	// joins the host NET namespace, so `conntrack` would resolve
 	// against the container image (which does not ship
@@ -1629,6 +1719,6 @@ func (n *NetHealth) flushStaleUDPConntrack(ctx context.Context) {
 			err, trimRunErr(out)))
 		return
 	}
-	n.actions.WithLabelValues(checkCT, "flush").Inc()
+	n.actions.WithLabelValues(check, "flush").Inc()
 	n.appendLog("ACTION: flushed stale udp/53 conntrack entries")
 }

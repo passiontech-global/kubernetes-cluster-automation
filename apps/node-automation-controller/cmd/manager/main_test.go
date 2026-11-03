@@ -390,6 +390,11 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		"VOLUMEATTACHMENT_CLEANER_ENABLED",
 		"PDB_WATCHDOG_ENABLED",
 		"CERT_DRIFT_AUDITOR_ENABLED",
+		"APISERVICE_GUARD_ENABLED",
+		"ZOMBIE_SIDECAR_REAPER_ENABLED",
+		"ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED",
+		"STATEFULSET_ONDELETE_ROLLER_ENABLED",
+		"VELERO_BACKUP_AUDITOR_ENABLED",
 	}
 	clear := func(t *testing.T) {
 		for _, k := range keys {
@@ -417,6 +422,12 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		if !mc.volumeAttachmentCleanerEnabled || !mc.pdbWatchdogEnabled ||
 			!mc.certDriftAuditorEnabled {
 			t.Fatalf("expected self-healing modules default-on, got %+v", mc)
+		}
+		// The wave 1-3 operations modules default ON the same way.
+		if !mc.apiServiceGuardEnabled || !mc.zombieSidecarReaperEnabled ||
+			!mc.orphanEndpointSliceEnabled || !mc.statefulSetRollerEnabled ||
+			!mc.veleroBackupAuditorEnabled {
+			t.Fatalf("expected wave 1-3 modules default-on, got %+v", mc)
 		}
 		if mc.corednsZoneWhen != "DoNotSchedule" {
 			t.Fatalf("corednsZoneWhen = %q, want DoNotSchedule", mc.corednsZoneWhen)
@@ -489,6 +500,11 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		t.Setenv("VOLUMEATTACHMENT_CLEANER_ENABLED", "false")
 		t.Setenv("PDB_WATCHDOG_ENABLED", "false")
 		t.Setenv("CERT_DRIFT_AUDITOR_ENABLED", "false")
+		t.Setenv("APISERVICE_GUARD_ENABLED", "false")
+		t.Setenv("ZOMBIE_SIDECAR_REAPER_ENABLED", "false")
+		t.Setenv("ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED", "false")
+		t.Setenv("STATEFULSET_ONDELETE_ROLLER_ENABLED", "false")
+		t.Setenv("VELERO_BACKUP_AUDITOR_ENABLED", "false")
 		mc := moduleConfigFromEnv()
 		if mc.corednsPatcherEnabled || mc.metricsServerPatcherEnabled ||
 			mc.cfTunnelWatchdogEnabled || mc.clusterHealthProbesEnabled {
@@ -497,6 +513,11 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		if mc.volumeAttachmentCleanerEnabled || mc.pdbWatchdogEnabled ||
 			mc.certDriftAuditorEnabled {
 			t.Fatalf("explicit false must disable the self-healing modules, got %+v", mc)
+		}
+		if mc.apiServiceGuardEnabled || mc.zombieSidecarReaperEnabled ||
+			mc.orphanEndpointSliceEnabled || mc.statefulSetRollerEnabled ||
+			mc.veleroBackupAuditorEnabled {
+			t.Fatalf("explicit false must disable the wave 1-3 modules, got %+v", mc)
 		}
 		if mc.corednsZoneWhen != "ScheduleAnyway" || mc.corednsZoneMinDomains != 0 {
 			t.Fatalf("zone override not applied: %q/%d",
@@ -585,14 +606,16 @@ func stubDyn() *dynamicfake.FakeDynamicClient {
 	return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
 }
 
-// Every module registers exactly one runnable on the manager — 27 in
-// the map — except the eleven gate-skippers (certmanager-reaper,
+// Every module registers exactly one runnable on the manager — 32 in
+// the map — except the sixteen gate-skippers (certmanager-reaper,
 // cilium-identity-auditor, cilium-taint-reaper, fluent-bit-config-roller,
 // coredns-patcher, metrics-server-patcher, cf-tunnel-proxy-watchdog,
-// cluster-health-probes, pdb-deadlock-watchdog,
-// volumeattachment-cleaner, cert-drift-auditor), which skip mgr.Add
-// entirely while disabled (16 runnables then). The other feature flags
-// only gate the tick body, not registration.
+// statefulset-ondelete-roller, cluster-health-probes,
+// pdb-deadlock-watchdog, volumeattachment-cleaner,
+// zombie-sidecar-reaper, orphan-endpointslice-cleaner,
+// cert-drift-auditor, apiservice-guard, velero-backup-auditor), which
+// skip mgr.Add entirely while disabled (16 runnables then). The other
+// feature flags only gate the tick body, not registration.
 func TestSetupModules(t *testing.T) {
 	t.Run("all gates enabled", func(t *testing.T) {
 		m := newStubManager()
@@ -616,12 +639,17 @@ func TestSetupModules(t *testing.T) {
 			volumeAttachmentCleanerEnabled: true,
 			pdbWatchdogEnabled:             true,
 			certDriftAuditorEnabled:        true,
+			apiServiceGuardEnabled:         true,
+			zombieSidecarReaperEnabled:     true,
+			orphanEndpointSliceEnabled:     true,
+			statefulSetRollerEnabled:       true,
+			veleroBackupAuditorEnabled:     true,
 		}
 		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), mc); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
-		if len(m.added) != 27 {
-			t.Fatalf("registered %d runnables, want 27", len(m.added))
+		if len(m.added) != 32 {
+			t.Fatalf("registered %d runnables, want 32", len(m.added))
 		}
 		for i, r := range m.added {
 			if r == nil {

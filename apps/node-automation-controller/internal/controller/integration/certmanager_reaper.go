@@ -6,7 +6,7 @@
 // re-checking. The upstream fix is to delete the Order — cert-manager
 // recreates it fresh and issuance proceeds.
 //
-// Candidacy: a Certificate that is Ready=False or has spec.renewalTime
+// Candidacy: a Certificate that is Ready=False or has status.renewalTime
 // within the next 7d, owning an Order pending >30m, cross-checked
 // against a Challenge that is presented+processing with no state
 // transition for >30m. Deleting the Order is the reset.
@@ -16,16 +16,27 @@
 // exhausted the reaper stops acting on that cert and surfaces an error
 // (a cert that burns through 3 resets has a config problem — continuing
 // would burn the ACME rate limit). Per-item failures log + continue.
+//
+// Budget persistence: the counter lives in memory AND in the
+// node.ops/acme-order-resets annotation ("<total>,<lastRFC3339>") on
+// the Certificate itself — a controller restart cannot refund resets
+// and hammer the ACME rate limit. A cert that heals (Ready=True and
+// no longer a reap candidate) gets both halves wiped so its next
+// renewal cycle starts with a full budget.
 package integration
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -41,6 +52,10 @@ const (
 	certRenewalWindow  = 7 * 24 * time.Hour // renewalTime within this window = candidate
 	certReaperMinGap   = time.Hour          // max 1 order reset per cert per hour
 	certReaperMaxReset = 3                  // stop acting after N resets on the same cert
+	// acmeResetsAnno persists the per-cert reset budget on the
+	// Certificate — "<total>,<lastRFC3339>" — so the 3-per-cycle cap
+	// survives controller restarts.
+	acmeResetsAnno = "node.ops/acme-order-resets"
 )
 
 var (
@@ -52,9 +67,12 @@ var (
 		Group: "acme.cert-manager.io", Version: "v1", Resource: "challenges"}
 )
 
-// certReset is the per-certificate reset budget tracked in memory
-// (cleared when the cert reports Ready=True, on cert deletion, or on
-// operator restart — all bias conservative).
+// certReset is the per-certificate reset budget tracked in memory.
+// The node.ops/acme-order-resets annotation on the Certificate is the
+// durable half — hydrated into this map on first sight after a
+// restart, written back on every reset, and wiped together with the
+// map entry when the cert reports Ready=True and is no longer a reap
+// candidate (all biases stay conservative).
 type certReset struct {
 	total  int
 	last   time.Time
@@ -95,16 +113,25 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 		seen[key] = true
 		needsReap := certNeedsReap(cert)
 		// A cert back to Ready=True earned a clean slate — drop its
-		// reset budget so a few stuck-issuance episodes spread over
-		// months cannot refuse it forever without a restart. The
-		// needsReap guard is load-bearing: a renewal-window candidate
-		// reports Ready=True the whole time its Order wedges (the old
-		// cert is still valid), so clearing on Ready alone would wipe
-		// the budget every sweep and defeat both the hourly gap and
-		// the 3-reset cap.
-		if _, tracked := r.resets[key]; tracked && !needsReap {
-			if status, _ := readyCond(cert); status == "True" {
-				delete(r.resets, key)
+		// reset budget (memory AND persisted annotation) so a few
+		// stuck-issuance episodes spread over months cannot refuse it
+		// forever without a restart. The needsReap guard is load-
+		// bearing: a renewal-window candidate reports Ready=True the
+		// whole time its Order wedges (the old cert is still valid),
+		// so clearing on Ready alone would wipe the budget every
+		// sweep and defeat both the hourly gap and the 3-reset cap.
+		// The hasAnno half covers the post-restart case where the
+		// memory ledger is empty but the Certificate still carries
+		// the annotation.
+		_, tracked := r.resets[key]
+		hasAnno := cert.GetAnnotations()[acmeResetsAnno] != ""
+		if !needsReap && certReady(cert) && (tracked || hasAnno) {
+			delete(r.resets, key)
+			if hasAnno {
+				if err := r.patchResetsAnnotation(ctx, cert, nil); err != nil {
+					metrics.IncError(certReaperQueue)
+					log.Error(err, "acme-resets annotation clear failed", "cert", key)
+				}
 			}
 		}
 		if !needsReap {
@@ -126,9 +153,16 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 	return nil
 }
 
+// certReady reports whether the Certificate's Ready condition is True.
+func certReady(cert *unstructured.Unstructured) bool {
+	status, _ := readyCond(cert)
+	return status == "True"
+}
+
 // certNeedsReap mirrors the bash filter: Ready=False OR renewalTime
 // within 7d — a healthy cert with no upcoming renewal cannot have a
-// stuck issuance worth resetting.
+// stuck issuance worth resetting. cert-manager publishes the next
+// renewal under STATUS.renewalTime (spec carries no such field).
 func certNeedsReap(cert *unstructured.Unstructured) bool {
 	if conds, found, _ := unstructured.NestedSlice(
 		cert.Object, "status", "conditions"); found {
@@ -143,7 +177,7 @@ func certNeedsReap(cert *unstructured.Unstructured) bool {
 		}
 	}
 	if rt, found, _ := unstructured.NestedString(
-		cert.Object, "spec", "renewalTime"); found {
+		cert.Object, "status", "renewalTime"); found {
 		if t, err := time.Parse(time.RFC3339, rt); err == nil &&
 			!t.After(time.Now().Add(certRenewalWindow)) {
 			return true
@@ -185,10 +219,12 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	}
 
 	// Budget gate before the challenge call — no API work when the
-	// cert is already refused.
+	// cert is already refused. A restart empties r.resets, so the
+	// first sight of a cert hydrates the budget back from its
+	// persisted annotation — the 3-per-cycle cap survives restarts.
 	st := r.resets[key]
 	if st == nil {
-		st = &certReset{}
+		st = certResetFromAnnotation(cert)
 		r.resets[key] = st
 	}
 	if st.total >= certReaperMaxReset {
@@ -231,7 +267,60 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	}
 	st.total++
 	st.last = time.Now()
+	// Persist the consumed reset immediately — a controller restart
+	// between sweeps must not refund it. Best-effort: the Order is
+	// already deleted, so a failed write is flagged, not fatal.
+	if err := r.patchResetsAnnotation(ctx, cert, st); err != nil {
+		metrics.IncError(certReaperQueue)
+		log.Error(err, "acme-resets annotation write failed", "cert", key)
+	}
 	return true
+}
+
+// certResetFromAnnotation hydrates the reset budget from the
+// node.ops/acme-order-resets annotation ("<total>,<lastRFC3339>") on
+// the Certificate. Malformed values hydrate to a zero budget — the
+// reaper then re-earns its stamps one reset at a time, never the
+// other way around.
+func certResetFromAnnotation(cert *unstructured.Unstructured) *certReset {
+	st := &certReset{}
+	v := cert.GetAnnotations()[acmeResetsAnno]
+	if v == "" {
+		return st
+	}
+	total, last, ok := strings.Cut(v, ",")
+	if !ok {
+		return st
+	}
+	if n, err := strconv.Atoi(total); err == nil && n > 0 {
+		st.total = n
+	}
+	if t, err := time.Parse(time.RFC3339, last); err == nil {
+		st.last = t
+	}
+	return st
+}
+
+// patchResetsAnnotation merge-patches node.ops/acme-order-resets on
+// the Certificate: "<total>,<lastRFC3339>" while st is non-nil, null
+// (annotation removed) when the cert healed and the budget resets.
+func (r *certManagerReaper) patchResetsAnnotation(ctx context.Context,
+	cert *unstructured.Unstructured, st *certReset) error {
+	var value any // nil → "annotation":null — merge-patch delete
+	if st != nil {
+		value = fmt.Sprintf("%d,%s", st.total, st.last.UTC().Format(time.RFC3339))
+	}
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"annotations": map[string]any{
+			acmeResetsAnno: value,
+		}},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = r.dyn.Resource(certificateGVR).Namespace(cert.GetNamespace()).
+		Patch(ctx, cert.GetName(), types.MergePatchType, patch, metav1.PatchOptions{})
+	return err
 }
 
 // stuckChallengeForOrder reports whether any Challenge in the

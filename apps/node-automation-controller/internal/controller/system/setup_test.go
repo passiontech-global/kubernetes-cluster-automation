@@ -33,6 +33,10 @@ func TestSetupPeriodicModules(t *testing.T) {
 				return SetupCFTunnelProxyWatchdog(m, cs, true,
 					"cloudflare-tunnel-system", 5*time.Minute)
 			}},
+		{"statefulset-ondelete-roller", 10 * time.Minute,
+			func(m manager.Manager) error {
+				return SetupStatefulSetOnDeleteRoller(m, cs, true)
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := testutil.NewStubManager()
@@ -64,6 +68,9 @@ func TestSetupFeatureFlagVariants(t *testing.T) {
 		}},
 		{"fluent-bit-config-roller", func(m manager.Manager) error {
 			return SetupFluentBitRoller(m, cs, false)
+		}},
+		{"statefulset-ondelete-roller", func(m manager.Manager) error {
+			return SetupStatefulSetOnDeleteRoller(m, cs, false)
 		}},
 	} {
 		t.Run(tc.name+"-disabled", func(t *testing.T) {

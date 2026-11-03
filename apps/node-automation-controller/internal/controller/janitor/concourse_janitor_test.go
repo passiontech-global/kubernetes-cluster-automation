@@ -13,9 +13,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 )
@@ -104,6 +106,27 @@ func cjLocalUsers() *corev1.Secret {
 
 var cjPodsGVR = schema.GroupVersionResource{Version: "v1", Resource: "pods"}
 
+// cjPlanDynFake returns a dynamic fake that knows the PlanList kind
+// for the maintenance-mutex autopilot check.
+func cjPlanDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			cjAutopilotPlanGVR: "PlanList",
+		},
+		objs...)
+}
+
+// cjAutopilotPlan builds a Plan CR in `state`.
+func cjAutopilotPlan(name, state string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "autopilot.k0sproject.io/v1beta2",
+		"kind":       "Plan",
+		"metadata":   map[string]any{"name": name},
+		"status":     map[string]any{"state": state},
+	}}
+}
+
 // cjReplaceOnDelete makes the fake apiserver behave like the
 // StatefulSet controller + init-rm: deleting a worker pod instantly
 // installs a successor (same node) with a fresh UID, Ready when the
@@ -128,11 +151,13 @@ func cjReplaceOnDelete(cs *fake.Clientset, events *[]string, ready bool) {
 
 // cjTestJanitor builds a janitor with shrunk timeouts — every poll
 // fires immediately on the first check; timeouts only matter for the
-// failure tests.
+// failure tests. dyn is an empty autopilot-aware fake — tests that
+// exercise the maintenance mutex install a real Plan themselves.
 func cjTestJanitor(cs *fake.Clientset, st nodeStatsReader, atc atcIface) *concourseWorkdirJanitor {
 	return &concourseWorkdirJanitor{
 		cs: cs, stats: st, atc: atc,
 		enabled:        true,
+		dyn:            cjPlanDynFake(),
 		runTimeout:     10 * time.Second,
 		reqTimeout:     10 * time.Second,
 		drainTimeout:   50 * time.Millisecond,
@@ -162,6 +187,78 @@ func TestConcourseJanitorDisabled(t *testing.T) {
 	j := &concourseWorkdirJanitor{enabled: false}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// 2.7 maintenance mutex — any positive signal defers the whole wipe
+// cycle before ATC login: no land, no stats, no delete. Signals
+// tested: cordoned node, kured lock annotation, active autopilot plan.
+func TestConcourseJanitorMaintenanceMutexDefers(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		objs  []runtime.Object
+		plans []runtime.Object
+	}{
+		{"cordoned node", []runtime.Object{func() *corev1.Node {
+			n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "w1"}}
+			n.Spec.Unschedulable = true
+			return n
+		}()}, nil},
+		{"kured lock", []runtime.Object{&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "kube-system", Name: "kured",
+			Annotations: map[string]string{cjKuredLockAnno: "w1"}}}}, nil},
+		{"active plan", nil,
+			[]runtime.Object{cjAutopilotPlan("autopilot", "InProgress")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []string
+			objs := append([]runtime.Object{
+				cjWorkerSTS(1),
+				cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+				cjLocalUsers(),
+			}, tc.objs...)
+			cs := fake.NewSimpleClientset(objs...)
+			j := cjTestJanitor(cs,
+				&cjFakeStats{events: &events, calls: map[string]int{},
+					fn: func(string, int) (int64, int64, int64, error) {
+						return 160 * gib, 200 * gib, 10 * gib, nil // would wipe
+					}},
+				&cjFakeATC{events: &events, states: map[string]string{}})
+			j.dyn = cjPlanDynFake(tc.plans...)
+			if err := j.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if len(events) != 0 {
+				t.Fatalf("wipe cycle ran during maintenance: events %v", events)
+			}
+			if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-0" {
+				t.Fatalf("pod replaced during maintenance (uid %s)", got)
+			}
+		})
+	}
+}
+
+// A nil dynamic client makes the autopilot mutex check unverifiable —
+// the run errors like any other check failure: "unknown" must mean
+// "no", never a silent "no signal".
+func TestConcourseJanitorNilDynFailsClosed(t *testing.T) {
+	var events []string
+	cs := fake.NewSimpleClientset(
+		cjWorkerSTS(1),
+		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjLocalUsers())
+	j := cjTestJanitor(cs,
+		&cjFakeStats{events: &events, calls: map[string]int{},
+			fn: func(string, int) (int64, int64, int64, error) {
+				return 160 * gib, 200 * gib, 10 * gib, nil // would wipe
+			}},
+		&cjFakeATC{events: &events, states: map[string]string{}})
+	j.dyn = nil // wiring bug — must not read as "no maintenance"
+	if err := j.run(ctx); err == nil {
+		t.Fatal("expected error when dyn is nil")
+	}
+	if len(events) != 0 {
+		t.Fatalf("wipe cycle ran with an unverifiable mutex check: %v", events)
 	}
 }
 

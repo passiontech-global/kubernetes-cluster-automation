@@ -1,0 +1,422 @@
+package apiserver
+
+import (
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	admissionv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+)
+
+// ---------------------------------------------------------------------------
+// Builders (up-prefixed to stay unique across sibling test files)
+// ---------------------------------------------------------------------------
+
+func upNamespace(name, inject string) *corev1.Namespace {
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	if inject != "" {
+		ns.Annotations = map[string]string{linkerdInjectKey: inject}
+	}
+	return ns
+}
+
+func upOwner() metav1.OwnerReference {
+	return metav1.OwnerReference{Kind: "ReplicaSet", Name: "rs-x",
+		Controller: ptr.To(true)}
+}
+
+// upPod builds a Running, owned, old-enough pod in ns with one app
+// container and no sidecar — the unmeshed candidate shape.
+func upPod(ns, name string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: name,
+			OwnerReferences:   []metav1.OwnerReference{upOwner()},
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+// upInjectorCfg builds a healthy MutatingWebhookConfiguration whose
+// linkerd-proxy-injector entry fails closed against linkerd/linkerd-proxy-injector.
+func upInjectorCfg() *admissionv1.MutatingWebhookConfiguration {
+	return &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "linkerd-proxy-injector-webhook-config"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "linkerd-proxy-injector.linkerd.io",
+			FailurePolicy: ptr.To(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("linkerd", "linkerd-proxy-injector"),
+			},
+		}},
+	}
+}
+
+// upReadySlice gives linkerd/linkerd-proxy-injector one Ready endpoint.
+func upReadySlice() *discoveryv1.EndpointSlice {
+	return &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "linkerd", Name: "linkerd-proxy-injector-abc",
+			Labels: map[string]string{
+				discoveryv1.LabelServiceName: "linkerd-proxy-injector",
+			},
+		},
+		Endpoints: []discoveryv1.Endpoint{{
+			Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true)},
+		}},
+	}
+}
+
+func upPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
+	t.Helper()
+	_, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+	return err == nil
+}
+
+func upGuard(cs *fake.Clientset) *webhookGuard {
+	return &webhookGuard{cs: cs, nowFn: time.Now,
+		unmeshedEmitted: map[string]bool{}}
+}
+
+// ---------------------------------------------------------------------------
+// Audit (gauge)
+// ---------------------------------------------------------------------------
+
+// A Running pod in an inject=enabled namespace without the sidecar
+// exports the gauge; ns-level opt-in fires even when the pod carries
+// no annotation at all.
+func TestUnmeshedAuditFlagsUnmeshedPod(t *testing.T) {
+	metrics.UnmeshedPods.DeleteLabelValues("meshed", "web-abc")
+	t.Cleanup(func() { metrics.UnmeshedPods.DeleteLabelValues("meshed", "web-abc") })
+
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("plain", ""),
+		upPod("meshed", "web-abc"),
+		upPod("plain", "other-abc"))
+	g := upGuard(cs)
+
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.ToFloat64(
+		metrics.UnmeshedPods.WithLabelValues("meshed", "web-abc")); got != 1 {
+		t.Fatalf("unmeshed gauge = %v, want 1", got)
+	}
+	if got := ptestutil.ToFloat64(
+		metrics.UnmeshedPods.WithLabelValues("plain", "other-abc")); got != 0 {
+		t.Fatalf("plain-namespace pod flagged: %v", got)
+	}
+}
+
+// The skip matrix — hostNetwork, Job/CronJob children, explicit
+// opt-out and sidecar'd pods are never flagged.
+func TestUnmeshedAuditSkips(t *testing.T) {
+	hostNet := upPod("meshed", "hostnet")
+	hostNet.Spec.HostNetwork = true
+
+	jobPod := upPod("meshed", "job-pod")
+	jobPod.OwnerReferences = []metav1.OwnerReference{{
+		Kind: "Job", Name: "j", Controller: ptr.To(true)}}
+
+	optedOut := upPod("meshed", "opted-out")
+	optedOut.Annotations = map[string]string{linkerdInjectKey: "disabled"}
+
+	meshed := upPod("meshed", "meshed")
+	meshed.Spec.Containers = append(meshed.Spec.Containers,
+		corev1.Container{Name: linkerdProxyContainer})
+
+	initMeshed := upPod("meshed", "init-meshed")
+	initMeshed.Spec.InitContainers = []corev1.Container{{Name: linkerdProxyContainer}}
+
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		hostNet, jobPod, optedOut, meshed, initMeshed)
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.unmeshedEmitted) != 0 {
+		t.Fatalf("skippable pods flagged: %v", g.unmeshedEmitted)
+	}
+}
+
+// Pod-level inject=enabled opts in even inside a plain namespace;
+// pod-level inject=disabled opts out inside an enabled namespace.
+func TestUnmeshedAuditPodDirectiveOverridesNamespace(t *testing.T) {
+	podEnabled := upPod("plain", "pod-enabled")
+	podEnabled.Annotations = map[string]string{linkerdInjectKey: "enabled"}
+	nsEnabledPodDisabled := upPod("meshed", "ns-enabled-pod-disabled")
+	nsEnabledPodDisabled.Annotations = map[string]string{linkerdInjectKey: "disabled"}
+
+	metrics.UnmeshedPods.DeleteLabelValues("plain", "pod-enabled")
+	t.Cleanup(func() {
+		metrics.UnmeshedPods.DeleteLabelValues("plain", "pod-enabled")
+	})
+
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("plain", ""),
+		podEnabled, nsEnabledPodDisabled)
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.ToFloat64(
+		metrics.UnmeshedPods.WithLabelValues("plain", "pod-enabled")); got != 1 {
+		t.Fatalf("pod-level enabled not flagged: %v", got)
+	}
+	if g.unmeshedEmitted["meshed/ns-enabled-pod-disabled"] {
+		t.Fatal("pod-level disabled flagged inside an enabled ns")
+	}
+}
+
+// A pending pod is out of scope — only Running pods are audited.
+func TestUnmeshedAuditSkipsNonRunning(t *testing.T) {
+	pending := upPod("meshed", "pending")
+	pending.Status.Phase = corev1.PodPending
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		pending)
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.unmeshedEmitted) != 0 {
+		t.Fatalf("pending pod flagged: %v", g.unmeshedEmitted)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Remediation
+// ---------------------------------------------------------------------------
+
+// Healthy injector + remediation on: unmeshed, owned, old pods are
+// deleted — capped at 2 per cycle — and counted.
+func TestUnmeshedRemediationDeletesUpToTwo(t *testing.T) {
+	metrics.UnmeshedPodsRecreatedTotal.DeleteLabelValues("meshed")
+	t.Cleanup(func() {
+		metrics.UnmeshedPodsRecreatedTotal.DeleteLabelValues("meshed")
+	})
+
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		upPod("meshed", "web-a"), upPod("meshed", "web-b"), upPod("meshed", "web-c"))
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deleted := 0
+	for _, n := range []string{"web-a", "web-b", "web-c"} {
+		if !upPodExists(t, cs, "meshed", n) {
+			deleted++
+		}
+	}
+	if deleted != unmeshedDeleteCap {
+		t.Fatalf("deleted %d pods, want cap of %d", deleted, unmeshedDeleteCap)
+	}
+	if got := ptestutil.ToFloat64(
+		metrics.UnmeshedPodsRecreatedTotal.WithLabelValues("meshed")); got != 2 {
+		t.Fatalf("recreated counter = %v, want 2", got)
+	}
+}
+
+// A circuit-broken (Ignore) injector means pods recreate unmeshed
+// again — remediation must stay off even though endpoints are up.
+func TestUnmeshedRemediationSkipsBrokenInjector(t *testing.T) {
+	broken := upInjectorCfg()
+	broken.Webhooks[0].FailurePolicy = ptr.To(admissionv1.Ignore)
+	broken.Annotations = map[string]string{
+		webhookCircuitAnno: "linkerd-proxy-injector.linkerd.io"}
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		broken, upReadySlice(),
+		upPod("meshed", "web-a"))
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !upPodExists(t, cs, "meshed", "web-a") {
+		t.Fatal("pod deleted while the injector is circuit-broken")
+	}
+}
+
+// Zero Ready endpoints behind the injector Service — the webhook is
+// not provably healthy, so nothing is deleted.
+func TestUnmeshedRemediationSkipsDeadEndpoints(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), // no EndpointSlice at all
+		upPod("meshed", "web-a"))
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !upPodExists(t, cs, "meshed", "web-a") {
+		t.Fatal("pod deleted with 0 ready injector endpoints")
+	}
+}
+
+// A lookalike webhook name must not satisfy the injector health
+// check — the match is exact, not substring.
+func TestUnmeshedInjectorHealthRequiresExactName(t *testing.T) {
+	lookalike := upInjectorCfg()
+	lookalike.Webhooks[0].Name = "acme-linkerd-proxy-injector.example.com"
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		lookalike, upReadySlice(),
+		upPod("meshed", "web-a"))
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !upPodExists(t, cs, "meshed", "web-a") {
+		t.Fatal("pod deleted — a lookalike webhook name satisfied injector health")
+	}
+}
+
+// UNMESHED_POD_REMEDIATION_ENABLED=false pins the auditor to
+// gauge-only even with a healthy injector.
+func TestUnmeshedRemediationDisabledByEnv(t *testing.T) {
+	t.Setenv("UNMESHED_POD_REMEDIATION_ENABLED", "false")
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		upPod("meshed", "web-a"))
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !upPodExists(t, cs, "meshed", "web-a") {
+		t.Fatal("pod deleted with remediation disabled")
+	}
+}
+
+// Deletion requires a CONTROLLER owner AND >2m of age: a fresh
+// unmeshed pod, an orphan (no ownerReferences) and a pod with only
+// a bare (non-controller) ownerReference are flagged but never
+// deleted.
+func TestUnmeshedRemediationRequiresOwnerAndAge(t *testing.T) {
+	fresh := upPod("meshed", "fresh")
+	fresh.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Minute))
+	orphan := upPod("meshed", "orphan")
+	orphan.OwnerReferences = nil
+	bareOwner := upPod("meshed", "bare-owner")
+	bareOwner.OwnerReferences = []metav1.OwnerReference{
+		{Kind: "ReplicaSet", Name: "rs-x"}} // controller flag unset
+
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		fresh, orphan, bareOwner)
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"fresh", "orphan", "bare-owner"} {
+		if !upPodExists(t, cs, "meshed", n) {
+			t.Fatalf("pod %s deleted — age/owner gate failed", n)
+		}
+	}
+	if len(g.unmeshedEmitted) != 3 {
+		t.Fatalf("fresh/orphan/bare-owner pods not flagged: %v", g.unmeshedEmitted)
+	}
+}
+
+// A pod already terminating needs no second delete — its replacement
+// re-admits meshed — and a mirror pod (controller ownerReference of
+// kind Node) only reflects a static manifest: deleting it changes
+// nothing. Both still count in the gauge but are never touched.
+func TestUnmeshedRemediationSkipsTerminatingAndMirror(t *testing.T) {
+	terminating := upPod("meshed", "terminating")
+	termAt := metav1.NewTime(time.Now())
+	terminating.DeletionTimestamp = &termAt
+
+	mirror := upPod("meshed", "mirror")
+	mirror.OwnerReferences = []metav1.OwnerReference{{
+		Kind: "Node", Name: "worker-1", Controller: ptr.To(true)}}
+
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		terminating, mirror)
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"terminating", "mirror"} {
+		if !upPodExists(t, cs, "meshed", n) {
+			t.Fatalf("pod %s deleted — terminating/mirror skip failed", n)
+		}
+	}
+	if len(g.unmeshedEmitted) != 2 {
+		t.Fatalf("terminating/mirror pods not flagged: %v", g.unmeshedEmitted)
+	}
+}
+
+// A persistently failing delete must not storm the API: the sweep
+// gives up after unmeshedDeleteAttempts and retries next cycle.
+func TestUnmeshedRemediationCapsDeleteAttempts(t *testing.T) {
+	objs := []runtime.Object{
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice()}
+	for i := 0; i < 8; i++ {
+		objs = append(objs, upPod("meshed", fmt.Sprintf("web-%d", i)))
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	deletes := 0
+	cs.PrependReactor("delete", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			deletes++
+			return true, nil, errors.New("apiserver wedged")
+		})
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if deletes != unmeshedDeleteAttempts {
+		t.Fatalf("delete attempts = %d, want cap of %d",
+			deletes, unmeshedDeleteAttempts)
+	}
+	for i := 0; i < 8; i++ {
+		if !upPodExists(t, cs, "meshed", fmt.Sprintf("web-%d", i)) {
+			t.Fatalf("pod web-%d deleted through the failing reactor", i)
+		}
+	}
+}

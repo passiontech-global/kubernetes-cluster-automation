@@ -25,6 +25,28 @@
 // node.ops/circuit-broken-webhooks annotation on the config; when the
 // Service reports >= 1 Ready endpoint again the declared Fail policy
 // is restored and the annotation shrinks (removed when empty).
+//
+// 2.2 — unmeshed-pod-auditor + post-circuit-breaker healer. Pods
+// created while the C1 breaker held linkerd-proxy-injector open run
+// WITHOUT their linkerd-proxy sidecar: no mTLS, invisible to service
+// mesh policy, and permanently unmeshed (injection happens at admit
+// time — nothing re-injects a running pod). Each sweep audits Running
+// Pods whose Namespace OR the Pod itself opts into injection
+// (linkerd.io/inject=enabled, minus hostNetwork pods, Job/CronJob
+// children and explicit inject=disabled opt-outs) and exports
+// node_automation_unmeshed_pods{namespace,pod} for every pod missing
+// the linkerd-proxy container+initContainer. When the injector
+// webhook is provably healthy again — not circuit-broken, failurePolicy
+// still Fail, Ready endpoints > 0 — and UNMESHED_POD_REMEDIATION_ENABLED
+// is not "false", the auditor deletes up to 2 unmeshed pods per cycle
+// (only pods >2m old, not already terminating, with a non-Node
+// controller ownerReference, so a controller recreates them meshed;
+// at most 4 delete attempts so a persistently failing apiserver
+// cannot turn the sweep into an API storm) and counts
+// node_automation_unmeshed_pods_recreated_total.
+// Pods are list/watch-locked in the manager cache (kube-system +
+// k8s-app=cilium only), so the audit reads through the direct
+// clientset exactly like every other module.
 package apiserver
 
 import (
@@ -40,6 +62,7 @@ import (
 
 	"github.com/go-logr/logr"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -71,6 +94,32 @@ const (
 	// forms matching webhookPatch.mutating.
 	webhookKindMutating   = "mutating"
 	webhookKindValidating = "validating"
+
+	// linkerdInjectKey is the label/annotation both linkerd and this
+	// auditor read on Namespaces and Pods: enabled opts in, disabled
+	// opts out.
+	linkerdInjectKey = "linkerd.io/inject"
+	// linkerdProxyContainer is the sidecar name injection adds — a
+	// pod carrying it in containers OR initContainers counts as
+	// meshed.
+	linkerdProxyContainer = "linkerd-proxy"
+	// linkerdInjectorWebhook is the injector's full sub-webhook name
+	// inside the MutatingWebhookConfiguration — matched exactly so a
+	// similarly-named webhook (e.g. "acme-linkerd-proxy-injector.example.com")
+	// can never impersonate the health signal.
+	linkerdInjectorWebhook = "linkerd-proxy-injector.linkerd.io"
+	// unmeshedMinPodAge: a pod must be this old before deletion —
+	// younger pods may simply be mid-admission/mid-start.
+	unmeshedMinPodAge = 2 * time.Minute
+	// unmeshedDeleteCap bounds successful remediation per cycle — the
+	// owner controller recreates each pod, so slow rolling is safer
+	// than a sweep-wide delete burst.
+	unmeshedDeleteCap = 2
+	// unmeshedDeleteAttempts bounds delete ATTEMPTS per cycle —
+	// without it a persistently failing delete (RBAC drift, an
+	// apiserver in partial outage) would be retried for every
+	// candidate, turning the sweep itself into an API storm.
+	unmeshedDeleteAttempts = 4
 )
 
 type webhookGuard struct {
@@ -91,6 +140,10 @@ type webhookGuard struct {
 	// DeleteLabelValues instead of pinning the alert forever (same
 	// seen-set hygiene as the cert drift auditor).
 	brokenEmitted map[string]bool
+	// unmeshedEmitted is the same ledger for UnmeshedPods
+	// ("namespace/pod") — deleted pods and pods that gained the
+	// sidecar get their series pruned each sweep.
+	unmeshedEmitted map[string]bool
 }
 
 // SetupWebhookGuard registers the 5-minute sweep (was crontab */5).
@@ -98,8 +151,9 @@ func SetupWebhookGuard(mgr ctrl.Manager, cs kubernetes.Interface) error {
 	logf.Log.WithName(webhookGuardQueue).Info("registered",
 		"interval", 5*time.Minute, "circuitBreaker", circuitBreakerEnabled())
 	g := &webhookGuard{cs: cs, nowFn: time.Now,
-		deadSince:     map[string]time.Time{},
-		brokenEmitted: map[string]bool{}}
+		deadSince:       map[string]time.Time{},
+		brokenEmitted:   map[string]bool{},
+		unmeshedEmitted: map[string]bool{}}
 	return shared.AddPeriodic(mgr, webhookGuardQueue, 5*time.Minute, g.run)
 }
 
@@ -119,15 +173,17 @@ type webhookPatch struct {
 }
 
 func (g *webhookGuard) run(ctx context.Context) error {
-	// The orphan sweep and the circuit breaker are independent duties —
-	// a failure in one must never skip the other, so both run and their
-	// errors join (nil+nil → nil).
+	// The orphan sweep, the circuit breaker and the unmeshed-pod
+	// auditor are independent duties — a failure in one must never
+	// skip the others, so all run and their errors join
+	// (nil+nil+nil → nil).
 	orphanErr := g.sweepOrphans(ctx)
 	var breakerErr error
 	if circuitBreakerEnabled() {
 		breakerErr = g.sweepCircuitBreaker(ctx)
 	}
-	return errors.Join(orphanErr, breakerErr)
+	unmeshedErr := g.sweepUnmeshedPods(ctx)
+	return errors.Join(orphanErr, breakerErr, unmeshedErr)
 }
 
 func (g *webhookGuard) sweepOrphans(ctx context.Context) error {
@@ -603,4 +659,255 @@ func svcRefString(ref *admissionv1.ServiceReference) string {
 		return "<none>"
 	}
 	return ref.Namespace + "/" + ref.Name
+}
+
+// ---------------------------------------------------------------------------
+// 2.2 — unmeshed-pod-auditor + post-circuit-breaker pod healer.
+// ---------------------------------------------------------------------------
+
+// unmeshedRemediationEnabled reads the kill-switch every run — an env
+// flip takes effect on the next sweep without a code change (same
+// pattern as circuitBreakerEnabled).
+func unmeshedRemediationEnabled() bool {
+	return os.Getenv("UNMESHED_POD_REMEDIATION_ENABLED") != "false"
+}
+
+// sweepUnmeshedPods audits Running Pods that opted into linkerd
+// injection (namespace OR pod linkerd.io/inject=enabled) but carry no
+// linkerd-proxy container or initContainer — the signature of a pod
+// admitted while the C1 breaker held the injector open. The gauge is
+// exported unconditionally; deletion additionally requires the
+// injector webhook provably healthy and the remediation flag on.
+func (g *webhookGuard) sweepUnmeshedPods(ctx context.Context) error {
+	log := logf.FromContext(ctx)
+	if g.unmeshedEmitted == nil {
+		// Lazily arm for direct-constructed fixtures — Setup always
+		// initializes.
+		g.unmeshedEmitted = map[string]bool{}
+	}
+
+	// The namespace census carries the ns-level inject=enabled
+	// opt-in. An empty list is an API flap — a pod whose namespace
+	// cannot be checked must never be classified, so abort the
+	// audit before anything is emitted or deleted.
+	nsList, err := g.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list namespaces — unmeshed audit skipped: %w", err)
+	}
+	if len(nsList.Items) == 0 {
+		return fmt.Errorf("empty namespace list (API flap) — unmeshed audit skipped")
+	}
+	nsInject := make(map[string]string, len(nsList.Items))
+	for _, ns := range nsList.Items {
+		nsInject[ns.Name] = injectDirective(ns.Labels, ns.Annotations)
+	}
+	nsList = nil
+
+	// Server-side phase filter (the informer cache is list/watch-
+	// locked to kube-system cilium pods, so this goes through cs like
+	// every other module); the in-code phase check stays because
+	// fake clientsets ignore field selectors.
+	pods, err := g.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+		FieldSelector: "status.phase=Running",
+	})
+	if err != nil {
+		return fmt.Errorf("list pods — unmeshed audit skipped: %w", err)
+	}
+
+	now := g.now()
+	emitted := map[string]bool{}
+	var candidates []*corev1.Pod
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.Status.Phase != corev1.PodRunning {
+			continue // mirrors the FieldSelector for fake clients
+		}
+		if !podWantsMesh(p, nsInject[p.Namespace]) {
+			continue
+		}
+		if podHasSidecar(p) {
+			continue
+		}
+		emitted[p.Namespace+"/"+p.Name] = true
+		metrics.UnmeshedPods.WithLabelValues(p.Namespace, p.Name).Set(1)
+		log.Info("UNMESHED: pod running without linkerd-proxy sidecar",
+			"pod", p.Namespace+"/"+p.Name)
+		// Deletion requires a CONTROLLER owner (a bare ownerReference
+		// proves nothing is recreating the pod) that is not a Node —
+		// mirror pods only reflect a static manifest, deleting one
+		// changes nothing — and the pod must not already be
+		// terminating: its replacement gets the sidecar at admission,
+		// so a second delete buys nothing.
+		if owner := metav1.GetControllerOf(p); owner != nil &&
+			owner.Kind != "Node" &&
+			p.DeletionTimestamp.IsZero() &&
+			now.Sub(p.CreationTimestamp.Time) >= unmeshedMinPodAge {
+			candidates = append(candidates, p)
+		}
+	}
+	pods = nil
+
+	// Prune series for pods that vanished or gained the sidecar —
+	// same DeleteLabelValues hygiene as brokenEmitted.
+	for k := range g.unmeshedEmitted {
+		if emitted[k] {
+			continue
+		}
+		if parts := strings.SplitN(k, "/", 2); len(parts) == 2 {
+			metrics.UnmeshedPods.DeleteLabelValues(parts[0], parts[1])
+		}
+	}
+	g.unmeshedEmitted = emitted
+
+	if len(candidates) == 0 {
+		return nil
+	}
+	if !unmeshedRemediationEnabled() {
+		log.Info("unmeshed remediation disabled (UNMESHED_POD_REMEDIATION_ENABLED=false)",
+			"candidates", len(candidates))
+		return nil
+	}
+
+	// Remediation only runs when the injector is provably back: the
+	// webhook not circuit-broken, its declared Fail policy intact,
+	// and >= 1 Ready endpoint behind its Service. An unverifiable
+	// answer fails closed — a wrong "healthy" verdict deletes pods
+	// that would only be recreated unmeshed again.
+	healthy, err := g.linkerdInjectorHealthy(ctx)
+	if err != nil {
+		metrics.IncError(webhookGuardQueue)
+		log.Info("WARN: injector health unverifiable — remediation skipped (fail closed)",
+			"error", err, "candidates", len(candidates))
+		return nil
+	}
+	if !healthy {
+		log.Info("injector webhook not healthy — remediation deferred",
+			"candidates", len(candidates))
+		return nil
+	}
+
+	// Deterministic order so the cap picks the same pods.
+	slices.SortFunc(candidates, func(a, b *corev1.Pod) int {
+		return strings.Compare(a.Namespace+"/"+a.Name, b.Namespace+"/"+b.Name)
+	})
+	deleted, attempts := 0, 0
+	for _, p := range candidates {
+		if deleted >= unmeshedDeleteCap || attempts >= unmeshedDeleteAttempts {
+			break
+		}
+		attempts++
+		log.Info("DELETE: unmeshed pod — owner controller recreates it meshed",
+			"pod", p.Namespace+"/"+p.Name,
+			"age", now.Sub(p.CreationTimestamp.Time).Truncate(time.Second))
+		if err := g.cs.CoreV1().Pods(p.Namespace).
+			Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
+			log.Error(err, "unmeshed pod delete failed", "pod", p.Namespace+"/"+p.Name)
+			metrics.IncError(webhookGuardQueue)
+			continue
+		}
+		metrics.UnmeshedPodsRecreatedTotal.WithLabelValues(p.Namespace).Inc()
+		deleted++
+	}
+	log.Info("unmeshed audit done", "unmeshed", len(emitted),
+		"candidates", len(candidates), "deleted", deleted)
+	return nil
+}
+
+// podWantsMesh reports whether the pod opted into linkerd injection:
+// the pod's own linkerd.io/inject directive decides first (disabled
+// opts out even inside an enabled namespace, enabled opts in even
+// inside a disabled one); when the pod says nothing the namespace
+// directive applies.
+func podWantsMesh(p *corev1.Pod, nsDirective string) bool {
+	if p.Spec.HostNetwork {
+		return false // hostNetwork pods are never injected
+	}
+	for _, ref := range p.OwnerReferences {
+		if ref.Kind == "Job" || ref.Kind == "CronJob" {
+			return false // batch pods are never injected
+		}
+	}
+	switch d := injectDirective(p.Labels, p.Annotations); {
+	case d == "disabled":
+		return false
+	case d == "enabled":
+		return true
+	default:
+		return nsDirective == "enabled"
+	}
+}
+
+// podHasSidecar reports whether the pod carries a linkerd-proxy
+// container or initContainer — the injection signature.
+func podHasSidecar(p *corev1.Pod) bool {
+	for _, c := range p.Spec.Containers {
+		if c.Name == linkerdProxyContainer {
+			return true
+		}
+	}
+	for _, c := range p.Spec.InitContainers {
+		if c.Name == linkerdProxyContainer {
+			return true
+		}
+	}
+	return false
+}
+
+// injectDirective reads linkerd.io/inject from an object's labels and
+// annotations — annotations are checked BEFORE labels and the first
+// recognized directive wins (linkerd's own precedence); an absent or
+// unrecognized annotation value falls through to the label check, and
+// no directive anywhere returns "".
+func injectDirective(labels, annotations map[string]string) string {
+	for _, m := range []map[string]string{annotations, labels} {
+		switch m[linkerdInjectKey] {
+		case "disabled":
+			return "disabled"
+		case "enabled":
+			return "enabled"
+		}
+	}
+	return ""
+}
+
+// linkerdInjectorHealthy reports whether the linkerd-proxy-injector
+// mutating webhook is fully back: not circuit-broken, failurePolicy
+// still Fail (a tripped breaker leaves Ignore behind), and >= 1 Ready
+// endpoint behind its backend Service. Any measurement failure is a
+// real error — the caller treats "cannot verify" as "not healthy".
+func (g *webhookGuard) linkerdInjectorHealthy(ctx context.Context) (bool, error) {
+	ready, err := g.readyEndpointCounts(ctx)
+	if err != nil {
+		return false, err
+	}
+	mwcs, err := g.cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Errorf("list mutatingwebhookconfigurations — injector health unknown: %w", err)
+	}
+	found := false
+	for i := range mwcs.Items {
+		cfg := &mwcs.Items[i]
+		broken := parseCircuitAnnotation(cfg.Annotations[webhookCircuitAnno])
+		for _, w := range cfg.Webhooks {
+			if w.Name != linkerdInjectorWebhook {
+				continue // exact match — a lookalike name is not the injector
+			}
+			found = true
+			if broken[w.Name] || !failClosed(w.FailurePolicy) {
+				continue // circuit-broken (or manually set to Ignore)
+			}
+			if w.ClientConfig.Service == nil {
+				continue
+			}
+			svc := w.ClientConfig.Service.Namespace + "/" + w.ClientConfig.Service.Name
+			if ready[svc] > 0 {
+				return true, nil
+			}
+		}
+	}
+	if !found {
+		logf.FromContext(ctx).Info("injector health: no linkerd-proxy-injector webhook found")
+	}
+	return false, nil
 }

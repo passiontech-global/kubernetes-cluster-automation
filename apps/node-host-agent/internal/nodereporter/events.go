@@ -70,6 +70,8 @@ var logRules = []logRule{
 	{"ConntrackPressure", regexp.MustCompile(`STATE-ENTER: conntrack-pressure|nf_conntrack.*table full`)},
 	{"CiliumIPAMExhausted", regexp.MustCompile(`STATE-ENTER: cilium-ipam-exhausted|no more IPs available`)},
 	{"CorruptedImageRemoved", regexp.MustCompile(`ACTION: removed corrupted image`)},
+	{"ZombieProcessStorm", regexp.MustCompile(`ACTION:? *zombie-storm:`)},
+	{"CiliumMTUExceedsOverlay", regexp.MustCompile(`ACTION:? *cilium-mtu-drift:`)},
 }
 
 // maxEventNote caps the Event note — the apiserver validates the

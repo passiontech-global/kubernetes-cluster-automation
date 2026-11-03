@@ -25,7 +25,7 @@ func TestStormGateScalesDownAndBack(t *testing.T) {
 		node("n1", corev1.ConditionTrue, nil),
 		node("n2", corev1.ConditionFalse, nil), // storm
 		deschedulerDeploy(1, nil))
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
@@ -57,7 +57,7 @@ func TestStormGateHold(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		node("n1", corev1.ConditionFalse, nil),
 		deschedulerDeploy(1, map[string]string{stormGateHoldAnno: "true"}))
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}

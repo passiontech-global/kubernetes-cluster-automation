@@ -75,6 +75,23 @@
 //
 // The whole run is bounded by context.WithTimeout(cjRunTimeout) — the
 // replacement for the CronJob's activeDeadlineSeconds=11400.
+//
+// 2.7 — Cluster Maintenance Mutex: the whole wipe cycle defers while
+// deliberate maintenance is in flight — replacing a worker pod
+// mid-drain/upgrade fights the operator doing the work and can wedge
+// a PDB for hours. Same three signals as descheduler-storm-gate
+// (keep the checks in sync):
+//
+//	a) any node spec.unschedulable — a cordon/drain is running;
+//	b) DaemonSet kube-system/kured carrying the
+//	   weave.works/kured-node-lock annotation — a reboot drain in
+//	   progress;
+//	c) an autopilot.k0sproject.io/v1beta2 Plan exists whose
+//	   status.state is neither Schedulable nor Completed — a k0s
+//	   cluster upgrade is in flight.
+//
+// A check that cannot be evaluated (API failure) errors the run —
+// the wipe is destructive enough that "unknown" must mean "no".
 package janitor
 
 import (
@@ -91,9 +108,13 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/shared"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -122,7 +143,22 @@ const (
 	cjATCTimeout     = 15 * time.Second
 	cjFastPoll       = 5 * time.Second  // uid/delete waits (bash `sleep 5`)
 	cjSlowPoll       = 10 * time.Second // drain/ready waits (bash `sleep 10`)
+
+	// cjKuredLockAnno is the reboot-coordination lock kured holds
+	// while a node drains for its reboot window (2.7 signal b).
+	cjKuredLockAnno      = "weave.works/kured-node-lock"
+	cjKuredDaemonSetNS   = "kube-system"
+	cjKuredDaemonSetName = "kured"
 )
+
+// cjAutopilotPlanGVR is the k0s autopilot Plan resource — a Plan in a
+// non-terminal state means a cluster upgrade is in flight (2.7
+// signal c).
+var cjAutopilotPlanGVR = schema.GroupVersionResource{
+	Group:    "autopilot.k0sproject.io",
+	Version:  "v1beta2",
+	Resource: "plans",
+}
 
 // nodeStatsReader reads kubelet stats/summary through the apiserver
 // node proxy. Missing counters return -1 so callers can distinguish
@@ -146,6 +182,9 @@ type concourseWorkdirJanitor struct {
 	atc     atcIface
 	enabled bool
 	mu      sync.Mutex
+	// dyn reads the autopilot Plan CR for maintenance-mutex
+	// signal (c) — no typed client exists for it.
+	dyn dynamic.Interface
 
 	// Timeouts/polls are fields (initialised from the consts) only so
 	// tests can shrink them; production values match the bash ones.
@@ -163,12 +202,13 @@ type concourseWorkdirJanitor struct {
 // CronJob schedule `7,37 * * * *`). With enabled=false the tick only
 // logs and returns nil — the module stays wired uniformly across
 // clusters with and without Concourse (CONCOURSE_JANITOR_ENABLED).
-func SetupConcourseWorkdirJanitor(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
+func SetupConcourseWorkdirJanitor(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, enabled bool) error {
 	j := &concourseWorkdirJanitor{
 		cs:      cs,
 		stats:   &kubeletStatsReader{cs: cs},
 		atc:     newATCClient(cjATCBase, &http.Client{Timeout: cjATCTimeout}),
 		enabled: enabled,
+		dyn:     dyn,
 
 		runTimeout:     cjRunTimeout,
 		reqTimeout:     cjReqTimeout,
@@ -190,6 +230,19 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+
+	// 2.7 maintenance mutex — defer the whole wipe cycle while any
+	// deliberate maintenance is in flight (cordon/drain, kured
+	// reboot lock, autopilot upgrade). An unverifiable check errors
+	// the run: the wipe is destructive enough that "unknown" must
+	// mean "no".
+	if held, why, err := j.maintenanceHeld(ctx); err != nil {
+		return err
+	} else if held {
+		log.Info(fmt.Sprintf(
+			"DEFER: cluster maintenance in progress (%s) — wipe cycle skipped", why))
+		return nil
+	}
 
 	// Whole-run bound — replaces the CronJob's activeDeadlineSeconds.
 	ctx, cancel := context.WithTimeout(ctx, j.runTimeout)
@@ -638,6 +691,78 @@ func (r *kubeletStatsReader) Summary(ctx context.Context, node string) (nodefsUs
 		return *p
 	}
 	return deref(s.Node.FS.UsedBytes), deref(s.Node.FS.CapacityBytes), deref(s.Node.Runtime.ImageFS.UsedBytes), nil
+}
+
+// ---------------------------------------------------------------------------
+// 2.7 — Cluster Maintenance Mutex. Keep in sync with the copy inside
+// descheduler-storm-gate.
+// ---------------------------------------------------------------------------
+
+// maintenanceHeld reports whether deliberate cluster maintenance is
+// in flight — the wipe cycle defers entirely while any signal holds:
+//
+//	a) any node spec.unschedulable — a cordon/drain is running;
+//	b) DaemonSet kube-system/kured holding weave.works/kured-node-lock;
+//	c) an autopilot Plan whose status.state is neither Schedulable
+//	   nor Completed — a k0s upgrade in flight.
+//
+// Returns (held, human-readable why, error). A missing kured
+// DaemonSet or absent autopilot CRD is not evidence; real API
+// failures are errors — "cannot verify" must never read as "clear".
+func (j *concourseWorkdirJanitor) maintenanceHeld(ctx context.Context) (bool, string, error) {
+	// (a) cordon/drain in progress.
+	nodes, err := shared.ListNodes(ctx, j.cs)
+	if err != nil {
+		return false, "", fmt.Errorf("list nodes (maintenance mutex): %w", err)
+	}
+	for i := range nodes {
+		if nodes[i].Spec.Unschedulable {
+			return true, "node " + nodes[i].Name + " unschedulable", nil
+		}
+	}
+
+	// (b) kured holding its node-lock annotation means a reboot
+	// drain is in progress right now.
+	ds, err := j.cs.AppsV1().DaemonSets(cjKuredDaemonSetNS).
+		Get(ctx, cjKuredDaemonSetName, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		// kured not installed on this cluster — no signal.
+	case err != nil:
+		return false, "", fmt.Errorf("get daemonset %s/%s (maintenance mutex): %w",
+			cjKuredDaemonSetNS, cjKuredDaemonSetName, err)
+	default:
+		if v := ds.Annotations[cjKuredLockAnno]; v != "" {
+			return true, "kured lock held by " + v, nil
+		}
+	}
+
+	// (c) Any autopilot Plan outside its terminal states means a
+	// k0s upgrade is in flight. An absent CRD is not evidence. A
+	// missing dynamic client is a wiring bug, not "no signal" —
+	// unverifiable fails closed like every other check here (the
+	// run aborts, the wipe defers).
+	if j.dyn == nil {
+		return false, "", fmt.Errorf("no dynamic client — autopilot plan check unverifiable (maintenance mutex)")
+	}
+	plans, err := j.dyn.Resource(cjAutopilotPlanGVR).
+		List(ctx, metav1.ListOptions{})
+	switch {
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		// autopilot CRD not installed — no signal.
+	case err != nil:
+		return false, "", fmt.Errorf("list autopilot plans (maintenance mutex): %w", err)
+	default:
+		for i := range plans.Items {
+			state, _, _ := unstructured.NestedString(
+				plans.Items[i].Object, "status", "state")
+			if state != "Schedulable" && state != "Completed" {
+				return true, fmt.Sprintf("autopilot plan %s state=%s",
+					plans.Items[i].GetName(), state), nil
+			}
+		}
+	}
+	return false, "", nil
 }
 
 // ---------------------------------------------------------------------------

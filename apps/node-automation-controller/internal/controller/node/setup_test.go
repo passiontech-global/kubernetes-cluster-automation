@@ -92,7 +92,7 @@ func TestSetupBuilderModules(t *testing.T) {
 		setup func(manager.Manager) error
 	}{
 		{"descheduler-storm-gate", func(m manager.Manager) error {
-			return SetupDeschedulerStormGate(m, cs)
+			return SetupDeschedulerStormGate(m, cs, testutil.StubDyn())
 		}},
 		{"node-labeler", func(m manager.Manager) error {
 			return SetupNodeLabeler(m, cs, "labels.txt")
@@ -131,7 +131,7 @@ func TestSetupAddErrorPropagates(t *testing.T) {
 // but not on kubelet heartbeat churn.
 func TestSetupStormGatePredicate(t *testing.T) {
 	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return SetupDeschedulerStormGate(m, fake.NewSimpleClientset())
+		return SetupDeschedulerStormGate(m, fake.NewSimpleClientset(), testutil.StubDyn())
 	})
 
 	if !p.Create(event.CreateEvent{Object: node("n1", corev1.ConditionTrue, nil)}) {
@@ -311,7 +311,7 @@ func TestSetupSweepModulesFixedKey(t *testing.T) {
 			return SetupNodeLabeler(m, fake.NewSimpleClientset(), "labels.txt")
 		}, "node-labeler-sweep"},
 		{"descheduler-storm-gate", func(m manager.Manager) error {
-			return SetupDeschedulerStormGate(m, fake.NewSimpleClientset())
+			return SetupDeschedulerStormGate(m, fake.NewSimpleClientset(), testutil.StubDyn())
 		}, "descheduler-storm-gate-sweep"},
 		{"cilium-taint-reaper", func(m manager.Manager) error {
 			return SetupCiliumTaintReaper(m, fake.NewSimpleClientset(), true)

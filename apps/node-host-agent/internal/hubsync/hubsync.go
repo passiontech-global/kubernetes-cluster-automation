@@ -238,7 +238,13 @@ type Syncer struct {
 	syncedWhileHeld bool // a cycle already ran since the lease was acquired
 	keyReady        bool // converge SSH key observed at least once (latched)
 
+	// lastTargets caches the target names of the last successful
+	// loadTargets — a parse failure must drive every known
+	// target_up{...} series to 0 instead of leaving stale 1s.
+	lastTargets []string
+
 	lastSuccess *prometheus.GaugeVec   // labels: target
+	targetUp    *prometheus.GaugeVec   // labels: target
 	cycles      *prometheus.CounterVec // labels: target, result
 }
 
@@ -274,13 +280,17 @@ func New(cfg Config, reg prometheus.Registerer) (*Syncer, error) {
 		Name: "node_host_agent_hubsync_last_success_seconds",
 		Help: "Unix time of the last fully successful converge per target.",
 	}, []string{"target"})
+	s.targetUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_host_agent_hubsync_target_up",
+		Help: "1 when the last converge of the target succeeded; 0 on failure or missing secret.",
+	}, []string{"target"})
 	s.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_hubsync_cycles_total",
 		Help: "Converge cycles per target by result (ok|error|parse_error|secret_error).",
 	}, []string{"target", "result"})
 
 	if reg != nil {
-		for _, c := range []prometheus.Collector{s.lastSuccess, s.cycles} {
+		for _, c := range []prometheus.Collector{s.lastSuccess, s.targetUp, s.cycles} {
 			if err := reg.Register(c); err != nil {
 				return nil, fmt.Errorf("register hubsync metrics: %w", err)
 			}

@@ -264,13 +264,56 @@ func TestJournal(t *testing.T) {
 	f := newFake()
 	f.reply["journalctl -u k0sworker.service --since -10 min --no-pager"] =
 		"Jan 01 00:00:00 node k0sworker[1]: line\n"
-	c := New(Config{HostRoot: "/", RunCmd: f.run})
+	c := New(Config{HostRoot: "/", RunCmd: f.run, RunCmdCombined: f.run})
 	out, err := c.Journal(context.Background(), "k0sworker.service", "-10 min")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "line") {
 		t.Fatalf("journal out=%q", out)
+	}
+}
+
+// TestJournalFoldsStderr: journald reports corrupt files on STDERR —
+// the snapshot must carry it (ExecCombined/RunCmdCombined), or the
+// integrity check's "corrupt" substring test never fires.
+func TestJournalFoldsStderr(t *testing.T) {
+	combined := newFake()
+	combined.reply["journalctl -u k0sworker.service --since -10 min --no-pager"] =
+		"File /var/log/journal/a.journal is corrupt, ignoring journal files.\n"
+	stdoutOnlyCalled := false
+	c := New(Config{
+		HostRoot: "/",
+		RunCmd: func(context.Context, []string) (string, error) {
+			stdoutOnlyCalled = true
+			return "", nil
+		},
+		RunCmdCombined: combined.run,
+	})
+	out, err := c.Journal(context.Background(), "k0sworker.service", "-10 min")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdoutOnlyCalled {
+		t.Fatal("Journal must use the combined runner — stderr evidence is lost on Exec")
+	}
+	if !strings.Contains(out, "corrupt") {
+		t.Fatalf("journal out=%q want the stderr corruption notice", out)
+	}
+}
+
+// TestExecCombinedWrapsNsenter: the combined runner sees the same
+// host-namespace wrapping Exec applies.
+func TestExecCombinedWrapsNsenter(t *testing.T) {
+	f := newFake()
+	c := New(Config{HostRoot: "/host", RunCmdCombined: f.run})
+	if _, err := c.ExecCombined(context.Background(),
+		"journalctl", "-n", "1", "--no-pager"); err != nil {
+		t.Fatal(err)
+	}
+	want := "nsenter -t 1 -m -u -i -n -p -- journalctl -n 1 --no-pager"
+	if len(f.cmds) != 1 || strings.Join(f.cmds[0], " ") != want {
+		t.Fatalf("argv=%v want [%s]", f.cmds, want)
 	}
 }
 

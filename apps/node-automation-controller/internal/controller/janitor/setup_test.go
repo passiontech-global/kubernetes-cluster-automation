@@ -29,6 +29,18 @@ func TestSetupPeriodicModules(t *testing.T) {
 			func(m manager.Manager) error {
 				return SetupVolumeAttachmentCleaner(m, cs, true)
 			}},
+		{"concourse-workdir-janitor", 30 * time.Minute,
+			func(m manager.Manager) error {
+				return SetupConcourseWorkdirJanitor(m, cs, testutil.StubDyn(), true)
+			}},
+		{"zombie-sidecar-reaper", 5 * time.Minute,
+			func(m manager.Manager) error {
+				return SetupZombieSidecarReaper(m, cs, testutil.StubDyn(), true)
+			}},
+		{"orphan-endpointslice-cleaner", 15 * time.Minute,
+			func(m manager.Manager) error {
+				return SetupOrphanEndpointSliceCleaner(m, cs, testutil.StubDyn(), true)
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := testutil.NewStubManager()
@@ -50,5 +62,33 @@ func TestSetupVolumeAttachmentCleanerDisabled(t *testing.T) {
 	}
 	if len(m.Added) != 0 {
 		t.Fatalf("disabled module registered %d runnables, want 0", len(m.Added))
+	}
+}
+
+// The wave-2/3 janitor modules skip mgr.Add entirely when disabled —
+// same contract as volumeattachment-cleaner.
+func TestSetupWaveModulesDisabled(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	for _, tc := range []struct {
+		name  string
+		setup func(manager.Manager) error
+	}{
+		{"zombie-sidecar-reaper", func(m manager.Manager) error {
+			return SetupZombieSidecarReaper(m, cs, testutil.StubDyn(), false)
+		}},
+		{"orphan-endpointslice-cleaner", func(m manager.Manager) error {
+			return SetupOrphanEndpointSliceCleaner(m, cs, testutil.StubDyn(), false)
+		}},
+	} {
+		t.Run(tc.name+"-disabled", func(t *testing.T) {
+			m := testutil.NewStubManager()
+			if err := tc.setup(m); err != nil {
+				t.Fatalf("disabled setup must return nil, got %v", err)
+			}
+			if len(m.Added) != 0 {
+				t.Fatalf("disabled module registered %d runnables, want 0",
+					len(m.Added))
+			}
+		})
 	}
 }

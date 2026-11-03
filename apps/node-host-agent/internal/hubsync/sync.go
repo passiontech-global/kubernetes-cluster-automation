@@ -30,7 +30,17 @@ func (s *Syncer) Cycle(ctx context.Context) {
 	if err != nil {
 		s.cfg.Log.Error("hubsync: target aggregation failed", "error", err)
 		s.cycles.WithLabelValues("all", "parse_error").Inc()
+		// Nothing converged this cycle — every last-known target
+		// reads down until a good parse runs again, otherwise
+		// target_up{...}=1 stays stale forever.
+		for _, name := range s.lastTargets {
+			s.targetUp.WithLabelValues(name).Set(0)
+		}
 		return
+	}
+	s.lastTargets = s.lastTargets[:0]
+	for _, t := range targets {
+		s.lastTargets = append(s.lastTargets, t.Name)
 	}
 
 	var token, ca []byte
@@ -57,6 +67,7 @@ func (s *Syncer) Cycle(ctx context.Context) {
 			s.cfg.Log.Error("hubsync: api-lb target skipped — guard credentials unavailable",
 				"target", t.Name, "ip", t.IP)
 			s.cycles.WithLabelValues(t.Name, "secret_error").Inc()
+			s.targetUp.WithLabelValues(t.Name).Set(0)
 			skipped++
 			continue
 		}
@@ -64,11 +75,13 @@ func (s *Syncer) Cycle(ctx context.Context) {
 			s.cfg.Log.Error("hubsync: target converge failed",
 				"target", t.Name, "ip", t.IP, "error", err)
 			s.cycles.WithLabelValues(t.Name, "error").Inc()
+			s.targetUp.WithLabelValues(t.Name).Set(0)
 			failed++
 			continue
 		}
 		s.cycles.WithLabelValues(t.Name, "ok").Inc()
 		s.lastSuccess.WithLabelValues(t.Name).SetToCurrentTime()
+		s.targetUp.WithLabelValues(t.Name).Set(1)
 		s.cfg.Log.Info("hubsync: target converged", "target", t.Name, "ip", t.IP)
 		converged++
 	}

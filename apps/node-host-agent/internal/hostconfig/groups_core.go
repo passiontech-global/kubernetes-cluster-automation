@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -24,18 +25,39 @@ var templates embed.FS
 
 // Cycle runs one full converge (all groups, playbook order).
 func (r *Reconciler) Cycle(ctx context.Context) {
+	_ = r.CycleWithErrors(ctx)
+}
+
+// CycleWithErrors runs one full converge and returns the number of
+// errors observed: topology load/derivation errors, lazy vars
+// resolution failures, per-group write/command/render errors and
+// panics. A clean cycle (errs == 0) stamps lastOK
+// (node_host_agent_hostconfig_last_success_seconds); converge-once
+// maps a non-zero count onto exit 1 while the daemon path keeps the
+// old fire-and-forget Cycle behaviour.
+func (r *Reconciler) CycleWithErrors(ctx context.Context) int {
 	start := time.Now()
 	t, err := topology.Load(topology.Config{VarsDir: r.cfg.VarsDir, NodeName: r.cfg.NodeName, NowFn: r.cfg.NowFn})
 	if err != nil {
 		r.cycles.WithLabelValues("load", "error").Inc()
 		slog.Error("hostconfig: topology load failed",
 			"varsDir", r.cfg.VarsDir, "node", r.cfg.NodeName, "error", err)
-		return
-	}
-	for _, e := range t.Errors {
-		slog.Error("hostconfig: topology", "node", r.cfg.NodeName, "error", e)
+		return 1
 	}
 	c := &cyc{r: r, ctx: ctx, t: t}
+	// Managed-op helpers (writeManaged/removeManaged/ensureDir/
+	// systemctl actions) attribute their failures to the active cycle
+	// via r.cur — cycles run on a single goroutine.
+	prev := r.cur
+	r.cur = c
+	defer func() { r.cur = prev }()
+	// t.Errors already carries the load-time vars eval failures
+	// (topology.Load appends Vars.Errors) — remember the prefix length
+	// so the lazy group-time resolutions below don't double count.
+	varsSeen := len(t.Vars.Errors())
+	for _, e := range t.Errors {
+		c.err("hostconfig: topology", "node", r.cfg.NodeName, "error", e)
+	}
 	// Order mirrors node_tuning.yaml + hub_converge.yaml.
 	c.group("base", c.groupBase)                   // T1/T2/A4/T16 + hostname pin
 	c.group("resolved", c.groupResolved)           // T3
@@ -56,24 +78,50 @@ func (r *Reconciler) Cycle(ctx context.Context) {
 	c.group("verify", c.groupVerify)
 	// Vars lazily resolve during the groups too — eval failures and
 	// reference cycles land in Vars.Errors (fail-closed Undefined).
-	for _, e := range t.Vars.Errors() {
-		slog.Error("hostconfig: vars resolution", "error", e)
+	for _, e := range t.Vars.Errors()[varsSeen:] {
+		c.err("hostconfig: vars resolution", "error", e)
+	}
+	if c.errs == 0 {
+		r.lastOK.Set(float64(r.cfg.NowFn().Unix()))
 	}
 	slog.Info("hostconfig: cycle done",
-		"node", r.cfg.NodeName, "elapsed", time.Since(start).Round(time.Second).String())
+		"node", r.cfg.NodeName, "errors", c.errs,
+		"elapsed", time.Since(start).Round(time.Second).String())
+	return c.errs
 }
 
 type cyc struct {
-	r   *Reconciler
-	ctx context.Context
-	t   *topology.Topology
+	r    *Reconciler
+	ctx  context.Context
+	t    *topology.Topology
+	errs int // errors observed so far this cycle (all groups + vars)
 }
 
+// err logs at Error level AND marks the current cycle (and the group
+// it is running inside) failed — the channel every failure a group
+// surfaces reports through so the cycles metric and converge-once's
+// exit code see it.
+func (c *cyc) err(msg string, args ...any) {
+	c.errs++
+	slog.Error(msg, args...)
+}
+
+// group runs one converge group and records the outcome:
+// cycles{name,"ok"} when the group observed no error, {"error"} when
+// it did, {"panic"} when it panicked (a panic also counts toward the
+// cycle's error total).
 func (c *cyc) group(name string, fn func()) {
+	before := c.errs
 	defer func() {
 		if rec := recover(); rec != nil {
+			c.err("hostconfig group panicked", "group", name, "panic", rec)
 			c.r.cycles.WithLabelValues(name, "panic").Inc()
-			slog.Error("hostconfig group panicked", "group", name, "panic", rec)
+			return
+		}
+		if c.errs > before {
+			c.r.cycles.WithLabelValues(name, "error").Inc()
+		} else {
+			c.r.cycles.WithLabelValues(name, "ok").Inc()
 		}
 	}()
 	fn()
@@ -128,21 +176,23 @@ func (c *cyc) groupBase() {
 		changed = true
 	}
 	if _, err := r.run(ctx, "modprobe", "tcp_bbr"); err != nil {
-		slog.Warn("base: modprobe failed — BBR unavailable until the module loads",
+		c.err("base: modprobe failed — BBR unavailable until the module loads",
 			"module", "tcp_bbr", "error", err)
 	}
 	if _, err := r.run(ctx, "modprobe", "nf_conntrack"); err != nil {
-		slog.Warn("base: modprobe failed — conntrack sysctls may not apply",
+		c.err("base: modprobe failed — conntrack sysctls may not apply",
 			"module", "nf_conntrack", "error", err)
 	}
 	if changed {
 		r.actions.WithLabelValues("sysctl --system").Inc()
 		if _, err := r.run(ctx, "sysctl", "--system"); err != nil {
-			slog.Warn("base: sysctl --system failed — new sysctl files written but not applied",
+			c.err("base: sysctl --system failed — new sysctl files written but not applied",
 				"error", err)
 		}
 	}
-	// A4 assert: effective == expected (informational fail like ansible).
+	// A4 assert: effective == expected (informational fail like
+	// ansible) — best-effort verify; the apply failures above are
+	// what count the group error.
 	out, _ := r.run(ctx, "sysctl", "-n", "net.ipv4.tcp_congestion_control", "net.core.default_qdisc")
 	lines := strings.Fields(out)
 	want := []string{c.sysctlVal("bbr_sysctls", 0), c.sysctlVal("bbr_sysctls", 1)}
@@ -168,6 +218,8 @@ TasksMax=infinity
 	// hostname -> 127.0.1.1 in /etc/hosts (lineinfile parity).
 	hosts, hostsErr := os.ReadFile(r.hp("/etc/hosts"))
 	if hostsErr != nil && !os.IsNotExist(hostsErr) {
+		// Best-effort pre-warning only — the writeManaged failure
+		// below is what counts the group error.
 		slog.Warn("base: cannot read /etc/hosts — hostname pin update will fail",
 			"error", hostsErr)
 	}
@@ -186,12 +238,78 @@ TasksMax=infinity
 		r.writeManaged("/etc/hosts", nh, 0o644)
 	}
 
+	// A5 (lightweight hostconfig half — workerhygiene owns the
+	// unit-scoped probe): journald integrity. A corrupt journal or an
+	// abnormally empty read while journal files exist on disk (post
+	// hard-reboot truncation) means logging is silently dead; rotate
+	// + vacuum so journald recovers.
+	c.journaldIntegrity()
+
 	// Self-stage the agent binary on the host for hostPath-mounted
 	// consumers (concourse-worker-init Cach A mounts
 	// /usr/local/bin/node-host-agent hostPath:File read-only). The
 	// standalone systemd deployment ships the binary by other means.
 	if !r.cfg.Standalone {
 		c.selfStageBinary()
+	}
+}
+
+// journaldRotateCooldown caps how often journaldIntegrity may run
+// rotate+vacuum (last-journald-rotate latch in the watchdog state
+// dir — last-* names are janitor-safe).
+const journaldRotateCooldown = time.Hour
+
+// journaldIntegrity is the cheap journald probe groupBase runs every
+// cycle: `journalctl` reporting corruption, or returning nothing at
+// all while journal files are on disk, triggers a best-effort
+// `journalctl --rotate --vacuum-time=3d`. A missing journalctl or a
+// failed read without corruption markers is NOT treated as corrupt —
+// the tool may simply be absent (minimal image) and rotating would
+// fail anyway.
+func (c *cyc) journaldIntegrity() {
+	r, ctx := c.r, c.ctx
+	out, err := r.run(ctx, "journalctl", "-n", "5", "-q", "--no-pager")
+	low := strings.ToLower(out)
+	corrupt := strings.Contains(low, "corrupt") ||
+		strings.Contains(low, "invalid object") ||
+		strings.Contains(low, "failed to open journal")
+	if !corrupt && err == nil && strings.TrimSpace(out) == "" {
+		// Abnormally empty read: journal files exist on disk but the
+		// journal returns no entries at all.
+		for _, pat := range []string{
+			"/var/log/journal/*/*.journal*",
+			"/run/log/journal/*/*.journal*",
+		} {
+			if m, gerr := filepath.Glob(r.hp(pat)); gerr == nil && len(m) > 0 {
+				corrupt = true
+				break
+			}
+		}
+	}
+	if !corrupt {
+		return
+	}
+	// Cooldown latch like nethealth's last-* budgets: a persistently
+	// corrupt (or false-positive) probe would otherwise re-run
+	// rotate+vacuum — and re-fail — every cycle, pinning errs and
+	// hammering the journal on every converge. The last-* name is
+	// janitor-safe (only state-* latches are swept).
+	if !r.rateOK("last-journald-rotate", journaldRotateCooldown) {
+		slog.Warn("base: journald journal still corrupt — rotate+vacuum in cooldown, skipping",
+			"cooldown", journaldRotateCooldown.String())
+		return
+	}
+	slog.Warn("base: journald journal corrupt/abnormally empty — rotating + vacuuming",
+		"action", "journalctl --rotate --vacuum-time=3d",
+		"probe_out", out)
+	r.actions.WithLabelValues("journalctl --rotate --vacuum-time=3d").Inc()
+	// Spend on the attempt: a failing rotate retries next cycle no
+	// more than once per cooldown window.
+	r.ensureDir(watchdogStateDir, 0o755)
+	r.rateSpend("last-journald-rotate")
+	if vout, verr := r.run(ctx, "journalctl", "--rotate", "--vacuum-time=3d"); verr != nil {
+		c.err("base: journalctl rotate/vacuum failed",
+			"out", vout, "error", verr)
 	}
 }
 
@@ -218,7 +336,7 @@ func (c *cyc) selfStageBinary() {
 		srcb, err = os.ReadFile("/node-host-agent")
 	}
 	if err != nil {
-		slog.Error("self-stage: cannot read running binary", "path", src, "error", err)
+		c.err("self-stage: cannot read running binary", "path", src, "error", err)
 		return
 	}
 	dst := "/usr/local/bin/node-host-agent"
@@ -228,18 +346,21 @@ func (c *cyc) selfStageBinary() {
 		// drifted mode: the hostPath consumer needs the exec bit.
 		if fi, serr := os.Stat(r.hp(dst)); serr == nil && fi.Mode().Perm() != 0o755 {
 			if cerr := os.Chmod(r.hp(dst), 0o755); cerr != nil {
-				slog.Error("self-stage: chmod 0755 failed", "path", dst, "error", cerr)
+				c.err("self-stage: chmod 0755 failed", "path", dst, "error", cerr)
 			}
 		}
 		return
 	}
 	if _, err := r.writeManaged(dst, srcb, 0o755); err != nil {
-		slog.Error("self-stage: install agent binary on host failed", "path", dst, "error", err)
+		// writeManaged already counted the failure via noteErr —
+		// log context only, do not count the same fault twice.
+		slog.Error("self-stage: install agent binary on host failed",
+			"path", dst, "error", err)
 		return
 	}
 	// writeManaged preserves a pre-existing file's mode — force 0755.
 	if err := os.Chmod(r.hp(dst), 0o755); err != nil {
-		slog.Error("self-stage: chmod 0755 failed", "path", dst, "error", err)
+		c.err("self-stage: chmod 0755 failed", "path", dst, "error", err)
 	}
 }
 
@@ -326,6 +447,8 @@ func (c *cyc) groupNLD() {
 	if out, err := r.run(ctx, "ss", "-lntu"); err == nil {
 		stubListening = regexp.MustCompile(`127\.0\.0\.5[34]:53`).MatchString(out)
 	} else {
+		// Best-effort detection — a failed probe leaves
+		// stubListening=false and the rest of T4 still converges.
 		slog.Warn("T4: ss -lntu failed — cannot detect resolved stub listener; continuing",
 			"error", err)
 	}
@@ -336,7 +459,7 @@ func (c *cyc) groupNLD() {
 		refuse := false
 		if stubListening {
 			if !r.fileExists("/run/systemd/resolve/resolv.conf") {
-				slog.Error("T4: resolved stub listening but no real resolv.conf — refusing to disable stub",
+				c.err("T4: resolved stub listening but no real resolv.conf — refusing to disable stub",
 					"path", "/run/systemd/resolve/resolv.conf")
 				refuse = true
 			} else {
@@ -346,11 +469,13 @@ func (c *cyc) groupNLD() {
 				if fi == nil || fi.Mode()&os.ModeSymlink == 0 ||
 					func() bool { l, _ := os.Readlink(dst); return l != "/run/systemd/resolve/resolv.conf" }() {
 					if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+						// Best-effort pre-clean — a failed remove is
+						// covered by the Symlink error counted below.
 						slog.Warn("T4: resolv.conf remove before repoint failed",
 							"path", dst, "error", err)
 					}
 					if err := os.Symlink("/run/systemd/resolve/resolv.conf", dst); err != nil {
-						slog.Warn("T4: resolv.conf symlink repoint failed",
+						c.err("T4: resolv.conf symlink repoint failed — DNS not repointed",
 							"path", dst, "error", err)
 					}
 				}
@@ -408,7 +533,7 @@ func (c *cyc) applyNftUnit(name, path string, content []byte, desc string) {
 	// ansible: nft -c -f <file> after deploy — an invalid ruleset fails
 	// the run here and the unit keeps serving the LAST GOOD file.
 	if out, err := r.run(ctx, "nft", "-c", "-f", path); err != nil {
-		slog.Error("nft ruleset failed nft -c — boot unit left on last good file",
+		c.err("nft ruleset failed nft -c — boot unit left on last good file",
 			"path", path, "unit", name+".service", "out", out, "error", err)
 		return
 	}
@@ -468,11 +593,11 @@ func (c *cyc) groupNebula() {
 	}
 	// T5b: kernel TUN device required (ansible assert).
 	if fi, err := os.Stat("/dev/net/tun"); err != nil {
-		slog.Error("T5b: /dev/net/tun stat failed — modprobe tun before nebula",
+		c.err("T5b: /dev/net/tun stat failed — modprobe tun before nebula",
 			"error", err)
 		return
 	} else if fi.Mode()&os.ModeCharDevice == 0 {
-		slog.Error("T5b: /dev/net/tun is not a char device — modprobe tun before nebula")
+		c.err("T5b: /dev/net/tun is not a char device — modprobe tun before nebula")
 		return
 	}
 	c.nebulaInstallBinary()
@@ -485,6 +610,9 @@ func (c *cyc) groupNebula() {
 			if _, err := os.Stat(p); err == nil {
 				b, err := os.ReadFile(p)
 				if err != nil {
+					// Best-effort read — "unreadable" degrades to
+					// "missing", and the missing-cert error below
+					// is what counts the group.
 					slog.Warn("T5b: cert file unreadable — treated as missing",
 						"path", p, "error", err)
 				}
@@ -506,7 +634,7 @@ func (c *cyc) groupNebula() {
 	if !r.fileExists(keyPath) {
 		if _, err := r.run(ctx, "nebula-cert", "keygen", "-out-key", keyPath,
 			"-out-pub", "/etc/nebula/"+net+"/host.pub"); err != nil {
-			slog.Warn("T5b: nebula-cert keygen failed — nebula will not start without a key",
+			c.err("T5b: nebula-cert keygen failed — nebula will not start without a key",
 				"key", keyPath, "error", err)
 		}
 	}
@@ -514,14 +642,14 @@ func (c *cyc) groupNebula() {
 		ch, _ := r.writeManaged("/etc/nebula/"+net+"/host.crt", []byte(hostCert), 0o644)
 		certChanged = certChanged || ch
 	} else {
-		slog.Warn("T5b: signed cert not in vars CM — nebula will not start",
+		c.err("T5b: signed cert not in vars CM — nebula will not start",
 			"cert", "nebula-"+t.MeshName+".crt")
 	}
 
 	// render config.yaml
 	rendered, err := c.nebulaConfig()
 	if err != nil {
-		slog.Error("T5b: render nebula config", "error", err)
+		c.err("T5b: render nebula config", "error", err)
 		return
 	}
 	oldCfg, _ := os.ReadFile(r.hp("/etc/nebula/" + net + "/config.yaml"))
@@ -538,7 +666,7 @@ func (c *cyc) groupNebula() {
 	for _, name := range []string{"nebula-up.sh", "nebula-down.sh"} {
 		b, err := c.r.render(name+".j2", tctx)
 		if err != nil {
-			slog.Error("T5b render", "tpl", name, "error", err)
+			c.err("T5b render", "tpl", name, "error", err)
 			continue
 		}
 		r.writeManaged("/etc/nebula/"+net+"/"+name, b, 0o755)
@@ -579,7 +707,7 @@ WantedBy=multi-user.target
 	// ansible: `nebula -test` validates before start — failure aborts,
 	// so the broken config must not reach a (re)start.
 	if out, err := r.run(ctx, "nebula", "-config", "/etc/nebula/"+net+"/config.yaml", "-test"); err != nil {
-		slog.Error("T5b: nebula -test failed — not starting/reloading",
+		c.err("T5b: nebula -test failed — not starting/reloading",
 			"config", "/etc/nebula/"+net+"/config.yaml", "unit", unit,
 			"out", out, "error", err)
 		return
@@ -626,19 +754,22 @@ func (c *cyc) nebulaInstallBinary() {
 		// ansible: sha256sum -c on the STAGED file every run — a
 		// corrupted/operator-swapped tarball must not install.
 		if !sha256FileOK(local, sum) {
-			slog.Error("T5b: staged nebula tarball sha256 mismatch — not installing",
+			c.err("T5b: staged nebula tarball sha256 mismatch — not installing",
 				"file", local, "sha256", sum)
 			return
 		}
 	} else if err := download(ctx, url, local, sum); err != nil {
-		slog.Error("T5b: nebula tarball download", "url", url, "file", local, "error", err)
+		c.err("T5b: nebula tarball download", "url", url, "file", local, "error", err)
 		return
 	}
 	if err := untarInstall(local, "nebula", r.hp("/usr/local/bin/nebula"), 0o755); err != nil {
-		slog.Error("T5b: nebula install", "file", local, "error", err)
+		c.err("T5b: nebula install", "file", local, "error", err)
 		return
 	}
 	if err := untarInstall(local, "nebula-cert", r.hp("/usr/local/bin/nebula-cert"), 0o755); err != nil {
+		// Best-effort companion binary — the nebula binary itself is
+		// installed above; a missing key only errors when keygen is
+		// actually needed (counted at the keygen call site).
 		slog.Warn("T5b: nebula-cert install failed — keygen unavailable",
 			"file", local, "error", err)
 	}
@@ -891,6 +1022,8 @@ func (c *cyc) nebulaRouting() {
 				slog.Info("T5b/hub: pruning hairpin route via mesh IP",
 					"target", tgt, "via", m[1])
 				if _, err := r.run(ctx, "ip", "route", "del", tgt+"/32", "table", "main"); err != nil {
+					// Best-effort prune — the live ip-rule converge
+					// below still routes the target correctly.
 					slog.Warn("T5b/hub: hairpin route delete failed",
 						"target", tgt, "error", err)
 				}
@@ -1127,6 +1260,8 @@ func (c *cyc) groupWatchdog() {
 	if f, err := os.OpenFile(r.hp("/var/log/node-watchdog.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 		_ = f.Close()
 	} else {
+		// Best-effort compat file — the Go subsystems write state
+		// latches, not this log; a create failure is not counted.
 		slog.Warn("watchdog: cannot create log file — state consumers may miss it",
 			"path", "/var/log/node-watchdog.log", "error", err)
 	}
@@ -1322,6 +1457,8 @@ func (c *cyc) pruneLegacyWatchdog() {
 	// module lib dir (lib.sh + modules/*.sh) — removeManaged refuses
 	// dirs on purpose, this one is pruned wholesale.
 	if err := os.RemoveAll(r.hp("/usr/local/lib/node-watchdog")); err != nil {
+		// Best-effort sweep of retired files — leftover shell libs
+		// are inert, so a failed prune only warns.
 		slog.Warn("prune watchdog lib dir failed",
 			"path", "/usr/local/lib/node-watchdog", "error", err)
 	}

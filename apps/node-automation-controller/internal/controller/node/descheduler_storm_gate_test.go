@@ -9,11 +9,44 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
+
+// stormGateDynFake returns a dynamic fake that knows the PlanList
+// kind for the maintenance-mutex autopilot check.
+func stormGateDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			autopilotPlanGVR: "PlanList",
+		},
+		objs...)
+}
+
+// autopilotPlan builds a Plan CR in `state` — "" renders no status at
+// all (a brand-new Plan before the controller writes one).
+func autopilotPlan(name, state string) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "autopilot.k0sproject.io/v1beta2",
+		"kind":       "Plan",
+		"metadata":   map[string]any{"name": name},
+	}}
+	if state != "" {
+		u.Object["status"] = map[string]any{"state": state}
+	}
+	return u
+}
+
+func kuredDaemonSet(annos map[string]string) *appsv1.DaemonSet {
+	return &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "kube-system", Name: "kured", Annotations: annos}}
+}
 
 func getDescheduler(t *testing.T, cs *fake.Clientset) *appsv1.Deployment {
 	t.Helper()
@@ -40,7 +73,7 @@ func TestStormGateScalesDownOnStormCondition(t *testing.T) {
 		withStormCond(node("n1", corev1.ConditionTrue, nil),
 			corev1.NodeMemoryPressure),
 		deschedulerDeploy(1, nil))
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +91,7 @@ func TestStormGateScalesDownOnStormTaint(t *testing.T) {
 			Effect: corev1.TaintEffectNoSchedule,
 		}),
 		deschedulerDeploy(1, nil))
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +111,7 @@ func TestStormGateIgnoresNonStormSignals(t *testing.T) {
 		corev1.NodeCondition{Type: corev1.NodePIDPressure, Status: corev1.ConditionTrue})
 	cs := fake.NewSimpleClientset(n, deschedulerDeploy(1, nil))
 
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +127,7 @@ func TestStormGateDecisionAnnotatedOnce(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		node("n1", corev1.ConditionTrue, nil),
 		deschedulerDeploy(1, nil))
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
@@ -132,7 +165,7 @@ func TestStormGateHoldOnlyWhenTrue(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		node("n1", corev1.ConditionFalse, nil),
 		deschedulerDeploy(1, map[string]string{stormGateHoldAnno: "false"}))
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +179,7 @@ func TestStormGateNoDeschedulerDeployment(t *testing.T) {
 	// reconcile is a clean no-op.
 	cs := fake.NewSimpleClientset(
 		node("n1", corev1.ConditionFalse, nil))
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	res, err := r.Reconcile(ctx, reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -195,6 +228,35 @@ func TestTaintKeys(t *testing.T) {
 	}
 }
 
+// An empty-but-successful node list is an apiserver/RBAC flap, not a
+// healthy cluster — the reconcile errors instead of scaling the
+// descheduler up on blind data.
+func TestStormGateEmptyNodeList(t *testing.T) {
+	cs := fake.NewSimpleClientset(deschedulerDeploy(1, nil))
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error on an empty node list")
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 1 {
+		t.Fatalf("replicas changed on blind data: %d", got)
+	}
+}
+
+// A nil dynamic client makes the autopilot check unverifiable —
+// fail closed like any other check error, never "no signal".
+func TestStormGateNilDynFailsClosed(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	r := &deschedulerStormGate{cs: cs} // dyn nil — wiring bug
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when dyn is nil")
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 1 {
+		t.Fatalf("replicas changed on an unverifiable mutex check: %d", got)
+	}
+}
+
 // An API failure aborts the reconcile — never a "clear" verdict on
 // empty data.
 func TestStormGateNodeListError(t *testing.T) {
@@ -203,7 +265,7 @@ func TestStormGateNodeListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
@@ -219,7 +281,7 @@ func TestStormGateDeployUpdateError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("update rejected")
 		})
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the deployment update fails")
 	}
@@ -235,7 +297,7 @@ func TestStormGateDecisionPatchError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the decision annotation patch fails")
 	}
@@ -251,7 +313,7 @@ func TestStormGateDeployGetError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the deployment get fails")
 	}
@@ -268,8 +330,110 @@ func TestStormGateAnnotateErrorOnSteadyReplicas(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
-	r := &deschedulerStormGate{cs: cs}
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the elif annotation patch fails")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2.7 — Cluster Maintenance Mutex
+// ---------------------------------------------------------------------------
+
+// Signal (a): a cordoned node is deliberate maintenance — the
+// descheduler must stay at 0.
+func TestStormGateScalesDownOnUnschedulableNode(t *testing.T) {
+	n := node("w1", corev1.ConditionTrue, nil)
+	n.Spec.Unschedulable = true
+	cs := fake.NewSimpleClientset(n, deschedulerDeploy(1, nil))
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 0 {
+		t.Fatalf("expected scale to 0 while a node is cordoned, got %d", got)
+	}
+}
+
+// Signal (b): kured holding its node-lock annotation means a reboot
+// drain is in progress — the descheduler stays at 0.
+func TestStormGateScalesDownOnKuredLock(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil),
+		kuredDaemonSet(map[string]string{kuredLockAnno: "w1"}))
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 0 {
+		t.Fatalf("expected scale to 0 while kured holds the lock, got %d", got)
+	}
+}
+
+// Signal (c): an autopilot Plan outside its terminal states means a
+// k0s upgrade is in flight — the descheduler stays at 0.
+func TestStormGateScalesDownOnActivePlan(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	dyn := stormGateDynFake(autopilotPlan("autopilot", "InProgress"))
+	r := &deschedulerStormGate{cs: cs, dyn: dyn}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 0 {
+		t.Fatalf("expected scale to 0 while an autopilot plan runs, got %d", got)
+	}
+}
+
+// Terminal plan states are NOT maintenance — Schedulable/Completed
+// plans must not gate the descheduler.
+func TestStormGateTerminalPlansAreClear(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil),
+		kuredDaemonSet(nil)) // kured present but holding no lock
+	dyn := stormGateDynFake(
+		autopilotPlan("old", "Completed"),
+		autopilotPlan("idle", "Schedulable"))
+	r := &deschedulerStormGate{cs: cs, dyn: dyn}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 1 {
+		t.Fatalf("terminal plan states must not scale, replicas=%d", got)
+	}
+}
+
+// A plan with no status.state yet is not provably terminal — fail
+// closed, it gates like an active upgrade.
+func TestStormGateStatelessPlanIsStorm(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	dyn := stormGateDynFake(autopilotPlan("autopilot", ""))
+	r := &deschedulerStormGate{cs: cs, dyn: dyn}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 0 {
+		t.Fatalf("a status-less plan must fail closed to storm, got %d", got)
+	}
+}
+
+// A maintenance-check failure errors the reconcile — never a "clear"
+// verdict on blind data.
+func TestStormGateMaintenanceCheckError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil))
+	cs.PrependReactor("get", "daemonsets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the kured get fails")
 	}
 }
