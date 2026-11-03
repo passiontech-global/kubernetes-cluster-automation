@@ -792,6 +792,13 @@ func mergeStatic(backends []backend, static []StaticBackend) []backend {
 		if sb.Name == "" || sb.Addr == "" || seen[sb.Name] {
 			continue
 		}
+		// Char-spray guard: a jinja-scalar var that resolved to a
+		// STRING reaches the caller as rune-by-rune elements — skip
+		// anything that can't be a real backend name/addr.
+		if len(sb.Name) < 2 ||
+			strings.ContainsAny(sb.Name+sb.Addr, " \t'\"[]{}(),") {
+			continue
+		}
 		seen[sb.Name] = true
 		backends = append(backends, backend{
 			Name: sb.Name, Addr: withDefaultPort(sb.Addr), Status: "UP",
