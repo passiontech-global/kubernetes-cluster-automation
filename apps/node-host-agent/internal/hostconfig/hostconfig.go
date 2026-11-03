@@ -189,6 +189,11 @@ type Config struct {
 	HTTPTimeout        time.Duration
 	// DownloadDir caches fetched archives (nebula/coredns/haproxy deb).
 	DownloadDir string
+	// Standalone marks the on-host systemd deployment (hub/infra/API-LB
+	// VMs — HostRoot "/"). Derived from HostRoot in applyDefaults; a
+	// test may force it true with a sandboxed HostRoot to exercise the
+	// standalone-only groups.
+	Standalone bool
 }
 
 func (c *Config) applyDefaults() {
@@ -221,6 +226,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.NodeName == "" {
 		c.NodeName = c.Hostname
+	}
+	if c.HostRoot == "/" {
+		c.Standalone = true
 	}
 }
 

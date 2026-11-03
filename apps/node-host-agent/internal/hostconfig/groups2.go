@@ -912,14 +912,22 @@ func (c *cyc) groupAPILB() {
 	ver := c.v("api_lb_haproxy_version")
 	if !strings.Contains(out, "install ok installed") ||
 		(ver != "" && !strings.Contains(out, ver)) {
-		local := filepath.Join(r.cfg.DownloadDir, c.v("api_lb_haproxy_deb_file"))
-		if !fileExistsNoRoot(local) {
+		// The deb must live on a host-visible path: download() writes
+		// in the container mount ns while apt-get runs via nsenter in
+		// the host's — /tmp/hostconfig doesn't exist there. The
+		// watchdog state dir is mounted rw in the DS and already
+		// ensured by groupWatchdog; on standalone hp() is identity.
+		debFile := c.v("api_lb_haproxy_deb_file")
+		hostDeb := "/var/lib/node-watchdog/" + debFile
+		local := r.hp(hostDeb)
+		r.ensureDir("/var/lib/node-watchdog", 0o755)
+		if !(fileExistsNoRoot(local) && sha256FileOK(local, c.v("api_lb_haproxy_deb_sha256"))) {
 			if err := download(ctx, c.v("api_lb_haproxy_deb_url"), local, c.v("api_lb_haproxy_deb_sha256")); err != nil {
 				slog.Error("T12: haproxy deb download", "err", err)
 				return
 			}
 		}
-		r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", local)
+		r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", hostDeb)
 	}
 	// distro haproxy.service ships /etc/haproxy/haproxy.cfg (:80
 	// frontend) — A1 runs a dedicated unit; keep the distro one off.

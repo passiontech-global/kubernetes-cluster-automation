@@ -1,0 +1,12 @@
+# Fixture — mirrors the node_exporter_extra_hosts + api_lb_guard_vms
+# sections of playbooks/vars/cluster.yaml. api-lb-vm is intentionally
+# in BOTH lists to exercise the by-IP dedup merge.
+node_exporter_extra_hosts:
+  - { name: api-lb-vm, ip: "10.0.0.14" } # api_lb VM — haproxy VIP front
+  - { name: db-vm, ip: "10.0.0.15", kine_db: true } # kine backend VM
+api_lb_guard_vms:
+  - name: api-lb-vm
+    ip: "10.0.0.14"
+    haproxy_backend: kubeAPI_backend
+    api_backends: "k0s-controller-01=10.0.0.25:6443"
+    mode: enforce

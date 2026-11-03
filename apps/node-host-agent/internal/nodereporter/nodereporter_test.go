@@ -22,24 +22,46 @@ import (
 // env is the shared fixture: tempdir watchdog state dir + log file, a
 // fake clientset holding one Node, and a controllable clock.
 type env struct {
-	r   *Reporter
-	cs  *fake.Clientset
-	reg *prometheus.Registry
-	dir string // WatchdogStateDir
-	log string // WatchdogLogFile
-	now time.Time
+	r      *Reporter
+	cs     *fake.Clientset
+	reg    *prometheus.Registry
+	dir    string // WatchdogStateDir
+	log    string // WatchdogLogFile
+	kmsg   string // KmsgFile
+	mounts string // ProcMountsFile
+	uptime string // ProcUptimeFile
+	root   string // HostRoot
+	now    time.Time
 }
 
 func fixture(t *testing.T, objs ...runtime.Object) *env {
 	t.Helper()
 	root := t.TempDir()
 	e := &env{
-		dir: filepath.Join(root, "watchdog"),
-		log: filepath.Join(root, "node-watchdog.log"),
-		now: time.Now().Truncate(time.Second),
+		dir:    filepath.Join(root, "watchdog"),
+		log:    filepath.Join(root, "node-watchdog.log"),
+		kmsg:   filepath.Join(root, "kmsg"),
+		mounts: filepath.Join(root, "mounts"),
+		uptime: filepath.Join(root, "uptime"),
+		root:   root,
+		now:    time.Now().Truncate(time.Second),
 	}
 	if err := os.MkdirAll(e.dir, 0o755); err != nil {
 		t.Fatal(err)
+	}
+	// Keep every cycle hermetic: the kmsg tail and the journal seam
+	// default to empty sources under t.TempDir, never the real host
+	// /dev/kmsg or journalctl.
+	for _, f := range []struct{ path, body string }{
+		{e.mounts, "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n" +
+			"/dev/vda1 / ext4 rw,relatime 0 0\n" +
+			"/dev/vdb1 /var/lib/k0s ext4 rw,relatime 0 0\n"},
+		{e.uptime, "3600.00 7200.00\n"},
+		{e.kmsg, ""}, // present-but-empty → kernel monitor tails it, no journald fallback
+	} {
+		if err := os.WriteFile(f.path, []byte(f.body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if len(objs) == 0 {
 		objs = []runtime.Object{&corev1.Node{
@@ -53,6 +75,11 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		Client:           e.cs,
 		WatchdogStateDir: e.dir,
 		WatchdogLogFile:  e.log,
+		HostRoot:         e.root,
+		KmsgFile:         e.kmsg,
+		ProcMountsFile:   e.mounts,
+		ProcUptimeFile:   e.uptime,
+		journalFetch:     func(context.Context, ...string) (string, error) { return "", nil },
 		nowFn:            func() time.Time { return e.now },
 	}, e.reg)
 	if err != nil {
@@ -119,9 +146,10 @@ func TestNewRequiresClientAndNode(t *testing.T) {
 	}
 }
 
-// TestAllNineDefaults: empty state dir → all 9 conditions False with
-// the exact default Reason/Message ported from the NPD JSON.
-func TestAllNineDefaults(t *testing.T) {
+// TestAllConditionDefaults: empty state dir → all conditions False
+// with the exact default Reason/Message ported from the NPD JSON —
+// the 9 watchdog latches plus the two NPD monitor conditions.
+func TestAllConditionDefaults(t *testing.T) {
 	e := fixture(t)
 	e.cycle()
 	want := map[corev1.NodeConditionType][2]string{
@@ -134,6 +162,8 @@ func TestAllNineDefaults(t *testing.T) {
 		"DnsResolvStale":      {"DnsResolvFresh", "DNS pods (nld/coredns) co resolv.conf khop host"},
 		"PodTeardownWedged":   {"PodTeardownOk", "khong co pod Terminating keo dai voi task con sot"},
 		"KubeletWatchWedge":   {"KubeletWatchOk", "kubelet nhan pod assignment binh thuong (khong co unseen pod)"},
+		"KernelDeadlock":      {"KernelHasNoDeadlock", "kernel has no deadlock"},
+		"ReadonlyFilesystem":  {"FilesystemIsNotReadOnly", "Filesystem is not read-only"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {
@@ -336,26 +366,29 @@ func TestWatchdogStaleCondition(t *testing.T) {
 }
 
 // TestZeroChurn: repeated cycles with unchanged latches must not
-// PATCH the node again; a change PATCHes exactly once more.
+// PATCH the node again; a change PATCHes exactly once more. The NPD
+// conditions live in a second patch, so the first cycle patches
+// twice (watchdog conditions + NPD conditions), then a watchdog
+// latch change adds one.
 func TestZeroChurn(t *testing.T) {
 	e := fixture(t)
 	e.cycle()
-	if n := e.patches(); n != 1 {
-		t.Fatalf("first cycle: %d patches, want 1", n)
+	if n := e.patches(); n != 2 {
+		t.Fatalf("first cycle: %d patches, want 2", n)
 	}
 	e.cycle()
 	e.cycle()
-	if n := e.patches(); n != 1 {
-		t.Fatalf("unchanged cycles: %d patches, want 1 (zero-churn)", n)
+	if n := e.patches(); n != 2 {
+		t.Fatalf("unchanged cycles: %d patches, want 2 (zero-churn)", n)
 	}
 	e.writeFile("state-node-overloaded", "1700000002")
 	e.cycle()
-	if n := e.patches(); n != 2 {
-		t.Fatalf("after latch: %d patches, want 2", n)
+	if n := e.patches(); n != 3 {
+		t.Fatalf("after latch: %d patches, want 3", n)
 	}
 	e.cycle()
-	if n := e.patches(); n != 2 {
-		t.Fatalf("after stable latch: %d patches, want 2", n)
+	if n := e.patches(); n != 3 {
+		t.Fatalf("after stable latch: %d patches, want 3", n)
 	}
 }
 
@@ -372,6 +405,11 @@ func TestSeedFromLiveNode(t *testing.T) {
 			Message: d.defaultMessage,
 		})
 	}
+	node.Status.Conditions = append(node.Status.Conditions,
+		corev1.NodeCondition{Type: "KernelDeadlock", Status: corev1.ConditionFalse,
+			Reason: kernelDeadlockDefaultReason, Message: kernelDeadlockDefaultMsg},
+		corev1.NodeCondition{Type: "ReadonlyFilesystem", Status: corev1.ConditionFalse,
+			Reason: readonlyDefaultReason, Message: readonlyDefaultMsg})
 	e := fixture(t, node)
 	e.cycle()
 	if n := e.patches(); n != 0 {
@@ -386,13 +424,13 @@ func TestMessageOnlyNoChurn(t *testing.T) {
 	e := fixture(t)
 	e.writeFile("state-node-overloaded", "1700000001")
 	e.cycle()
-	if n := e.patches(); n != 1 {
-		t.Fatalf("first cycle: %d patches", n)
+	if n := e.patches(); n != 2 {
+		t.Fatalf("first cycle: %d patches, want 2 (watchdog + npd)", n)
 	}
 	e.writeFile("state-node-overloaded", "1700000009")
 	e.cycle()
-	if n := e.patches(); n != 1 {
-		t.Fatalf("message-only change: %d patches, want 1", n)
+	if n := e.patches(); n != 2 {
+		t.Fatalf("message-only change: %d patches, want 2", n)
 	}
 }
 
@@ -450,5 +488,60 @@ func TestTransitionTimes(t *testing.T) {
 	// The never-touched condition kept its original LTT.
 	if ltt := e.cond(t, "CiliumAgentDown").LastTransitionTime.Time; !ltt.Equal(lttOther) {
 		t.Fatalf("untouched condition LTT moved: %v -> %v", lttOther, ltt)
+	}
+}
+
+// TestKubeletRuntimeStallDualLatch: the T15 kubelet watchdog latches
+// state-kubelet-healthz-down when the restart budget is exhausted —
+// KubeletRuntimeStall must trip on it (the NHC
+// k0sworker-remediate-exhausted rule) exactly as on
+// state-kubelet-runtime-stall. The primary latch wins the message.
+func TestKubeletRuntimeStallDualLatch(t *testing.T) {
+	e := fixture(t)
+	e.writeFile("state-kubelet-healthz-down", "1700000005\n")
+	e.cycle()
+
+	c := e.cond(t, "KubeletRuntimeStall")
+	if c.Status != corev1.ConditionTrue || c.Reason != "KubeletRuntimeStallDetected" {
+		t.Fatalf("KubeletRuntimeStall = {%s %s}, want True/KubeletRuntimeStallDetected",
+			c.Status, c.Reason)
+	}
+	if c.Message != "watchdog state kubelet-healthz-down active since 1700000005" {
+		t.Fatalf("unexpected message %q", c.Message)
+	}
+	if got := e.gauge("KubeletRuntimeStall", "KubeletRuntimeStallDetected"); got != 1 {
+		t.Fatalf("problem_gauge = %v, want 1", got)
+	}
+
+	// Both latches → the primary key's message wins (evaluated
+	// directly — the zero-churn patch gate keeps the OLD message on
+	// the node while Status/Reason stay True/Detected, so the live
+	// object can't observe this).
+	e.writeFile("state-kubelet-runtime-stall", "1700000001\n")
+	for _, ev := range e.r.evalConditions() {
+		if ev.def.typ == "KubeletRuntimeStall" &&
+			ev.message != "watchdog state kubelet-runtime-stall active since 1700000001" {
+			t.Fatalf("primary latch lost the eval message: %q", ev.message)
+		}
+	}
+	e.cycle()
+
+	// Secondary latch removed but primary still latched → stays True;
+	// removing both flips back to the default.
+	if err := os.Remove(filepath.Join(e.dir, "state-kubelet-healthz-down")); err != nil {
+		t.Fatal(err)
+	}
+	e.cycle()
+	if c := e.cond(t, "KubeletRuntimeStall"); c.Status != corev1.ConditionTrue {
+		t.Fatalf("cleared alt latch: KubeletRuntimeStall = %s, want True", c.Status)
+	}
+	if err := os.Remove(filepath.Join(e.dir, "state-kubelet-runtime-stall")); err != nil {
+		t.Fatal(err)
+	}
+	e.cycle()
+	c = e.cond(t, "KubeletRuntimeStall")
+	if c.Status != corev1.ConditionFalse || c.Reason != "KubeletRuntimeOk" {
+		t.Fatalf("all latches cleared: KubeletRuntimeStall = {%s %s}, want False/KubeletRuntimeOk",
+			c.Status, c.Reason)
 	}
 }

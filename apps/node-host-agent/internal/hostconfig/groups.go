@@ -35,17 +35,20 @@ func (r *Reconciler) Cycle(ctx context.Context) {
 	}
 	c := &cyc{r: r, ctx: ctx, t: t}
 	// Order mirrors node_tuning.yaml + hub_converge.yaml.
-	c.group("base", c.groupBase)          // T1/T2/A4/T16 + hostname pin
-	c.group("resolved", c.groupResolved)  // T3
-	c.group("nodelocaldns", c.groupNLD)   // T4
-	c.group("nebula", c.groupNebula)      // T5b
-	c.group("watchdog", c.groupWatchdog)  // T6 (+T15/systemd watchdog)
-	c.group("imagepulls", c.groupPulls)   // T7 + T17
-	c.group("nodeip_cpu", c.groupNodeCPU) // T8 + T10
-	c.group("coredns", c.groupCoreDNS)    // T9 (stub + hub)
-	c.group("bwaudit", c.groupBwAudit)    // T11
-	c.group("security", c.groupSecurity)  // fail2ban + sshd hardening
-	c.group("apilb", c.groupAPILB)        // T12 (incl. fallback-map strip)
+	c.group("base", c.groupBase)                   // T1/T2/A4/T16 + hostname pin
+	c.group("resolved", c.groupResolved)           // T3
+	c.group("nodelocaldns", c.groupNLD)            // T4
+	c.group("nebula", c.groupNebula)               // T5b
+	c.group("watchdog", c.groupWatchdog)           // T6 (+T15/systemd watchdog)
+	c.group("imagepulls", c.groupPulls)            // T7 + T17
+	c.group("nodeip_cpu", c.groupNodeCPU)          // T8 + T10
+	c.group("coredns", c.groupCoreDNS)             // T9 (stub + hub)
+	c.group("bwaudit", c.groupBwAudit)             // T11
+	c.group("security", c.groupSecurity)           // fail2ban + sshd hardening
+	c.group("apilb", c.groupAPILB)                 // T12 (incl. fallback-map strip)
+	c.group("swap", c.groupSwap)                   // node_tuning_swap.yaml
+	c.group("hub-metrics-fw", c.groupHubMetricsFW) // node_exporter_hub.yaml (standalone)
+	c.group("api-lb-vm", c.groupAPILBVM)           // api_lb_guard.yaml converge
 	c.group("verify", c.groupVerify)
 	// Vars lazily resolve during the groups too — eval failures and
 	// reference cycles land in Vars.Errors (fail-closed Undefined).
@@ -430,23 +433,19 @@ func (c *cyc) groupNebula() {
 	cfgChanged = ch
 	needRestart := cfgChanged && c.nebulaNeedsRestart(oldCfg, rendered)
 
-	// overlay state file + hook scripts + units
+	// overlay state file + hook scripts + units. The route-guard
+	// script+unit are NOT rendered here anymore — the whole resident
+	// watchdog stack is retired (pruneLegacyWatchdog sweeps it; the
+	// agent's own converge heals rules/routes every cycle).
 	r.writeManaged("/etc/nebula/"+net+"/overlay", []byte(t.Overlay+"\n"), 0o644)
 	tctx := c.tplCtx()
-	guardScriptChanged := false
-	for _, name := range []string{"nebula-up.sh", "nebula-down.sh", "nebula-route-guard.sh"} {
+	for _, name := range []string{"nebula-up.sh", "nebula-down.sh"} {
 		b, err := c.r.render(name+".j2", tctx)
 		if err != nil {
 			slog.Error("T5b render", "tpl", name, "err", err)
 			continue
 		}
-		dest := "/etc/nebula/" + net + "/" + name
-		if name == "nebula-route-guard.sh" {
-			dest = "/usr/local/sbin/nebula-route-guard.sh"
-		}
-		if ch, _ := r.writeManaged(dest, b, 0o755); ch && name == "nebula-route-guard.sh" {
-			guardScriptChanged = true
-		}
+		r.writeManaged("/etc/nebula/"+net+"/"+name, b, 0o755)
 	}
 	uch, _ := r.writeManaged("/etc/systemd/system/"+unit,
 		[]byte(fmt.Sprintf(`# Managed by node-config-agent
@@ -473,22 +472,7 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 `)), 0o644)
-	guch, _ := r.writeManaged("/etc/systemd/system/nebula-route-guard.service",
-		[]byte(fmt.Sprintf(`# Managed by node-config-agent
-[Unit]
-Description=Nebula overlay route/rule guard (netlink monitor, <500ms restore)
-After=%s
-BindsTo=%s
-
-[Service]
-ExecStart=/usr/local/sbin/nebula-route-guard.sh
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-`, unit, unit)), 0o644)
-	if uch || guch {
+	if uch {
 		r.daemonReload(ctx)
 	}
 
@@ -510,14 +494,6 @@ WantedBy=multi-user.target
 		} else {
 			r.reloadService(ctx, unit)
 		}
-	}
-	// Guard is a resident process: script/unit drift => restarted,
-	// no drift => started (no-op). BindsTo means a nebula restart may
-	// have taken it down — ensure covers that too.
-	if guardScriptChanged || guch {
-		r.restartService(ctx, "nebula-route-guard.service")
-	} else {
-		r.ensureService(ctx, "nebula-route-guard.service", true, true)
 	}
 
 	// policy routing converge (live, no daemon restart needed).
@@ -785,6 +761,10 @@ func (c *cyc) tableMark() string {
 	return p
 }
 
+// hairpinViaRe extracts the first `via <ipv4>` next-hop from
+// `ip -o route get` output.
+var hairpinViaRe = regexp.MustCompile(`\bvia\s+([0-9.]+)`)
+
 // nebulaRouting ports the live ip rule/route/nft converge of T5b
 // (tasks/interdc_nebula.yaml: mangle fwmark, populate overlay tables,
 // flip ip rules to nebula, nebnat SNAT). SNAT/route source is the
@@ -800,6 +780,35 @@ func (c *cyc) nebulaRouting() {
 	pubIP := nodeIPStr(t.Node, "ip") // interdc_nebula_node.ip (public)
 	mkIP := t.Markers[t.MeshName]    // registry marker
 	nodeIPV := nodeIP(c)             // --node-ip or hub marker
+
+	// Hub hairpin prune (hub_converge.yaml, incident 2026-09-16): a
+	// stale static route in table main sending a target IP via ANOTHER
+	// mesh node's public IP blackholes the direct edge — packets hairpin
+	// through that node where rule 1500 sucks them into the tunnel.
+	if t.AmLighthouse {
+		meshIPs := map[string]bool{}
+		for _, k := range t.Nodes.Keys() {
+			nv, _ := t.Nodes.Get(k)
+			if om, ok := nv.(*topology.OMap); ok {
+				if ip := nodeIPStr(om, "ip"); ip != "" {
+					meshIPs[ip] = true
+				}
+			}
+		}
+		for _, tgt := range t.Targets {
+			out, err := r.run(ctx, "ip", "-o", "route", "get", tgt, "mark", "0x1000")
+			if err != nil {
+				continue
+			}
+			m := hairpinViaRe.FindStringSubmatch(out)
+			if m != nil && meshIPs[m[1]] {
+				slog.Info("T5b/hub: pruning hairpin route via mesh IP",
+					"target", tgt, "via", m[1])
+				r.run(ctx, "ip", "route", "del", tgt+"/32", "table", "main")
+			}
+		}
+	}
+
 	// fwmark for transport
 	for _, p := range []string{"dport", "sport"} {
 		for _, chain := range []string{"OUTPUT", "PREROUTING"} {
@@ -931,6 +940,10 @@ func nodeIP(c *cyc) string {
 func (c *cyc) groupWatchdog() {
 	r, ctx, t := c.r, c.ctx, c.t
 	_ = ctx
+	// The retired shell watchdog stack is pruned on EVERY node class —
+	// infra VMs off-registry carried kine-db-*/api-backend-guard units
+	// too, so gating on worker()/Found would never sweep them.
+	c.pruneLegacyWatchdog()
 	if !c.worker() && !t.Found {
 		return
 	}
@@ -1018,14 +1031,10 @@ func (c *cyc) groupWatchdog() {
 	}
 	r.writeManaged("/etc/node-watchdog.conf", []byte(b.String()), 0o644)
 
-	// watchdog scripts mirror from CM mount (optional).
-	if st, err := os.Stat(r.cfg.WatchdogScriptsDir); err == nil && st.IsDir() {
-		c.installWatchdogScripts()
-	}
-	// The shell watchdog timer is retired on EVERY converged node —
-	// independent of whether the scripts CM is mounted.
-	c.retireShellWatchdog()
-	// log file + textfile dir + units + installed marker + timer.
+	// log file + textfile dir + state dir + installed marker — still
+	// converged: nethealth latches state-*/egress-state-* files in the
+	// state dir and hostmetrics/node-exporter read them (the conf +
+	// routes/state files stay; only the shell stack dies).
 	if f, err := os.OpenFile(r.hp("/var/log/node-watchdog.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 		_ = f.Close()
 	}
@@ -1035,7 +1044,7 @@ func (c *cyc) groupWatchdog() {
 		r.writeManaged("/var/lib/node-watchdog/installed",
 			[]byte(fmt.Sprint(c.r.cfg.NowFn().Unix())), 0o644)
 	}
-	c.systemdWatchdog()
+	c.controllerTuning()
 }
 
 // apilbWatchdogVars resolves the watchdog's api-lb knobs the way
@@ -1100,76 +1109,123 @@ func defStr(v, d string) string {
 	return v
 }
 
-// installWatchdogScripts mirrors scripts/watchdog/{lib.sh,modules/*.sh}
-// + scripts/*.sh from the CM dir onto the host, pruning stale modules.
-func (c *cyc) installWatchdogScripts() {
-	src := c.r.cfg.WatchdogScriptsDir
-	dstLib := "/usr/local/lib/node-watchdog"
-	c.r.ensureDir(dstLib+"/modules", 0o755)
-	keep := map[string]bool{}
-	copy := func(srcRel, dst string, mode os.FileMode) {
-		b, err := os.ReadFile(src + "/" + srcRel)
-		if err != nil {
-			return
-		}
-		c.r.writeManaged(dst, b, mode)
-	}
-	copy("scripts/watchdog/lib.sh", dstLib+"/lib.sh", 0o644)
-	entries, _ := os.ReadDir(src + "/scripts/watchdog/modules")
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sh") {
-			continue
-		}
-		keep[e.Name()] = true
-		copy("scripts/watchdog/modules/"+e.Name(), dstLib+"/modules/"+e.Name(), 0o755)
-	}
-	// prune host modules not in CM
-	if he, err := os.ReadDir(c.r.hp(dstLib + "/modules")); err == nil {
-		for _, e := range he {
-			if !keep[e.Name()] {
-				os.Remove(c.r.hp(dstLib + "/modules/" + e.Name()))
-			}
-		}
-	}
-	copy("scripts/node-watchdog.sh", "/usr/local/sbin/node-watchdog.sh", 0o755)
+// legacyWatchdogUnits — retired shell-watchdog units, stopped+disabled
+// before their unit FILES are removed. Includes the first Go port's
+// *-restart OnFailure units and both node-watchdog-failed spellings
+// (ansible-installed plain name, spec's @-template name).
+var legacyWatchdogUnits = []string{
+	"node-watchdog.timer",
+	"node-watchdog.service",
+	"node-watchdog-failed.service",
+	"node-watchdog-failed@.service",
+	"k0sworker-watchdog.service",
+	"k0sworker-watchdog-restart.service",
+	"k0scontroller-watchdog.service",
+	"k0scontroller-watchdog-restart.service",
+	"k0s-apiserver-wedge-probe.timer",
+	"k0s-apiserver-wedge-probe.service",
+	"k0s-kine-pool-probe.timer",
+	"k0s-kine-pool-probe.service",
+	"k0s-oomloop-probe.timer",
+	"k0s-oomloop-probe.service",
+	"nebula-route-guard.service",
+	"api-backend-guard.timer",
+	"api-backend-guard.service",
+	"kine-db-probe.timer",
+	"kine-db-probe.service",
+	"kine-compact-guard.timer",
+	"kine-compact-guard.service",
+	"kine-db-maint.timer",
+	"kine-db-maint.service",
 }
 
-// retireShellWatchdog stops+disables the periodic shell watchdog and
-// removes its units. Every module is a Go subsystem now — letting the
-// timer run would double consecutive-* counters and race on
-// /etc/hosts and ip rule with the agent's own converge.
-func (c *cyc) retireShellWatchdog() {
+// legacyWatchdogDropins — k0s drop-ins of the dead WatchdogSec design
+// (10-watchdog.conf is the ansible-era name, 40-watchdog.conf the
+// restart-loop variant this port already purged).
+var legacyWatchdogDropins = []string{
+	"/etc/systemd/system/k0sworker.service.d/10-watchdog.conf",
+	"/etc/systemd/system/k0sworker.service.d/40-watchdog.conf",
+	"/etc/systemd/system/k0scontroller.service.d/10-watchdog.conf",
+	"/etc/systemd/system/k0scontroller.service.d/40-watchdog.conf",
+}
+
+// legacyWatchdogScripts — every shell script the stack dropped in
+// /usr/local/sbin (worker feeder/remediate, controller feeder/
+// remediate/probes, infra-VM kine guards, api-backend-guard, and the
+// route guard this port used to render).
+var legacyWatchdogScripts = []string{
+	"/usr/local/sbin/node-watchdog.sh",
+	"/usr/local/sbin/k0s-kubelet-watchdog.sh",
+	"/usr/local/sbin/k0sworker-remediate.sh",
+	"/usr/local/sbin/k0s-systemd-watchdog-feeder.sh",
+	"/usr/local/sbin/k0scontroller-remediate.sh",
+	"/usr/local/sbin/k0s-apiserver-wedge-probe.sh",
+	"/usr/local/sbin/k0s-kine-pool-probe.sh",
+	"/usr/local/sbin/k0s-oomloop-probe.sh",
+	"/usr/local/sbin/kine-db-probe.sh",
+	"/usr/local/sbin/kine-compact-guard.sh",
+	"/usr/local/sbin/kine-db-maint.sh",
+	"/usr/local/sbin/api-backend-guard.sh",
+	"/usr/local/sbin/nebula-route-guard.sh",
+}
+
+// pruneLegacyWatchdog stops, disables and deletes the whole retired
+// shell watchdog stack — timers/services, drop-ins, scripts and the
+// /usr/local/lib/node-watchdog module dir. Every module is a Go
+// subsystem now (apiprober/nethealth/workerhygiene/controllerhygiene),
+// so leftover units would double consecutive-* counters and race the
+// agent's own converge on /etc/hosts and ip rule. Idempotent:
+// systemctl disable + removeManaged are no-ops when already gone.
+// /etc/node-watchdog.conf and /etc/nebula/<net>/* are NOT touched —
+// still rendered and consumed by the Go subsystems.
+func (c *cyc) pruneLegacyWatchdog() {
 	r, ctx := c.r, c.ctx
-	r.run(ctx, "systemctl", "disable", "--now", "node-watchdog.timer")
-	for _, p := range []string{
-		"/etc/systemd/system/node-watchdog.timer",
-		"/etc/systemd/system/node-watchdog.service",
-		"/etc/systemd/system/node-watchdog-failed.service",
-	} {
+	for _, u := range legacyWatchdogUnits {
+		r.run(ctx, "systemctl", "disable", "--now", u)
+	}
+	removed := false
+	for _, u := range legacyWatchdogUnits {
+		if ch, _ := r.removeManaged("/etc/systemd/system/" + u); ch {
+			removed = true
+		}
+	}
+	for _, p := range legacyWatchdogDropins {
 		if ch, _ := r.removeManaged(p); ch {
-			r.daemonReload(ctx)
+			removed = true
 		}
+	}
+	for _, s := range legacyWatchdogScripts {
+		r.removeManaged(s)
+	}
+	// module lib dir (lib.sh + modules/*.sh) — removeManaged refuses
+	// dirs on purpose, this one is pruned wholesale.
+	if err := os.RemoveAll(r.hp("/usr/local/lib/node-watchdog")); err != nil {
+		slog.Warn("prune watchdog lib dir failed", "err", err)
+	}
+	if removed {
+		r.daemonReload(ctx)
+	}
+	// stale prom of the shell emitter — standalone hosts keep theirs
+	// (hostmetrics still reads state latches from the same dir).
+	if !r.cfg.Standalone {
+		r.removeManaged("/var/lib/node-exporter/textfile/node-watchdog.prom")
 	}
 }
 
-// systemdWatchdog ports T15 (worker feeder Option D) + the controller
-// variant (memory guard, go memlimit, sshd CPUWeight, probes).
-func (c *cyc) systemdWatchdog() {
-	r, ctx := c.r, c.ctx
-	inWorkerList := containsSS(c.vs("systemd_watchdog_hosts"), c.r.cfg.NodeName)
-	inCtrlList := containsSS(c.vs("controller_systemd_watchdog_hosts"), c.r.cfg.NodeName)
-
-	// always purge the dangerous legacy drop-in.
-	if c.worker() {
-		if ch, _ := r.removeManaged("/etc/systemd/system/k0sworker.service.d/40-watchdog.conf"); ch {
-			r.daemonReload(ctx)
-		}
+// controllerTuning keeps the k0scontroller cgroup drop-ins that used
+// to ride along in systemd-watchdog-controller.yaml — they are node
+// tuning, not watchdog units: the MemoryMax/OOMPolicy boundary is
+// what the oomloop guard's design assumes (boot peak swap-out instead
+// of OOM-kill), and the sshd CPUWeight keeps SSH responsive under
+// control-plane churn. Per-host maps converge both ways (absent host
+// => drop-in removed).
+func (c *cyc) controllerTuning() {
+	r := c.r
+	if !c.controller() {
+		return
 	}
-	if c.controller() {
-		r.removeManaged("/etc/systemd/system/k0scontroller.service.d/40-watchdog.conf")
-		// memory guard + go memlimit drop-ins (per-host maps).
-		c.ctrlDropIn("k0scontroller_memory_max_by_host", "50-memory-guard.conf", func(v string) []byte {
-			return []byte(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
+	c.ctrlDropIn("k0scontroller_memory_max_by_host", "50-memory-guard.conf", func(v string) []byte {
+		return []byte(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
 # cgroup OOM boundary cho k0scontroller (OOMPolicy=continue).
 # MemorySwapMax=0: cam unit swap.
 [Service]
@@ -1177,194 +1233,26 @@ MemoryMax=` + v + `
 MemorySwapMax=0
 OOMPolicy=continue
 `)
-		})
-		c.ctrlDropIn("k0scontroller_go_memlimit_by_host", "51-go-memlimit.conf", func(v string) []byte {
-			return []byte(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
+	})
+	c.ctrlDropIn("k0scontroller_go_memlimit_by_host", "51-go-memlimit.conf", func(v string) []byte {
+		return []byte(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
 # GOMEMLIMIT soft-cap heap cua MOI Go child trong unit. GOGC=50.
 [Service]
 Environment=GOMEMLIMIT=` + v + `
 Environment=GOGC=50
 `)
-		})
-		// sshd CPUWeight=10000 (controller responsiveness under churn).
-		for _, d := range []string{"ssh.service.d", "ssh@.service.d", "sshd.service.d"} {
-			r.ensureDir("/etc/systemd/system/"+d, 0o755)
-			if ch, _ := r.writeManaged("/etc/systemd/system/"+d+"/10-cpuweight.conf",
-				[]byte(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
+	})
+	// sshd CPUWeight=10000 (controller responsiveness under churn).
+	for _, d := range []string{"ssh.service.d", "ssh@.service.d", "sshd.service.d"} {
+		r.ensureDir("/etc/systemd/system/"+d, 0o755)
+		if ch, _ := r.writeManaged("/etc/systemd/system/"+d+"/10-cpuweight.conf",
+			[]byte(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
 # Giu sshd responsive khi control plane saturates CPU.
 [Service]
 CPUWeight=10000
 `), 0o644); ch {
-				r.daemonReload(ctx)
-			}
+			r.daemonReload(c.ctx)
 		}
-	}
-
-	type wdUnit struct {
-		svcName    string
-		scriptDest string
-		scriptSrc  string
-		svc        string
-		restartSvc string
-		restartScr string
-	}
-	var units []wdUnit
-	if c.worker() && inWorkerList {
-		units = append(units, wdUnit{"k0sworker-watchdog", "/usr/local/sbin/k0s-kubelet-watchdog.sh",
-			"scripts/k0s-kubelet-watchdog.sh",
-			`# Managed by node-config-agent - T15 kubelet watchdog (Option D)
-[Unit]
-Description=kubelet watchdog feeder - restarts k0sworker when kubelet wedges
-After=k0sworker.service
-PartOf=k0sworker.service
-OnFailure=k0sworker-watchdog-restart.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/sbin/k0s-kubelet-watchdog.sh
-WatchdogSec=60s
-NotifyAccess=main
-Restart=always
-RestartSec=10s
-CPUWeight=500
-TimeoutStartSec=2min
-
-[Install]
-WantedBy=multi-user.target
-`, "/usr/local/sbin/k0sworker-remediate.sh",
-			`# Managed by node-config-agent - T15 kubelet watchdog (Option D)
-[Unit]
-Description=remediate k0sworker after kubelet watchdog trigger
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/k0sworker-remediate.sh
-TimeoutStartSec=2min
-`})
-	}
-	if c.controller() && inCtrlList {
-		units = append(units, wdUnit{"k0scontroller-watchdog", "/usr/local/sbin/k0s-systemd-watchdog-feeder.sh",
-			"scripts/k0s-systemd-watchdog-feeder.sh",
-			`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
-[Unit]
-Description=k0s controller watchdog feeder - restarts k0scontroller when apiserver wedges
-After=k0scontroller.service
-PartOf=k0scontroller.service
-OnFailure=k0scontroller-watchdog-restart.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/sbin/k0s-systemd-watchdog-feeder.sh
-WatchdogSec=60s
-NotifyAccess=main
-Restart=always
-RestartSec=10s
-CPUWeight=500
-TimeoutStartSec=2min
-
-[Install]
-WantedBy=multi-user.target
-`, "/usr/local/sbin/k0scontroller-remediate.sh",
-			`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
-[Unit]
-Description=remediate k0scontroller after apiserver watchdog trigger
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/k0scontroller-remediate.sh
-TimeoutStartSec=2min
-`})
-	}
-
-	// reverse-converge: units on nodes NOT in list get removed.
-	cleanup := func(name, script string) {
-		r.run(ctx, "systemctl", "disable", "--now", name+".service")
-		for _, p := range []string{"/etc/systemd/system/" + name + ".service",
-			"/etc/systemd/system/" + name + "-restart.service", script} {
-			r.removeManaged(p)
-		}
-	}
-	if c.worker() && !inWorkerList {
-		cleanup("k0sworker-watchdog", "/usr/local/sbin/k0s-kubelet-watchdog.sh")
-		r.removeManaged("/usr/local/sbin/k0sworker-remediate.sh")
-	}
-	if c.controller() && !inCtrlList {
-		cleanup("k0scontroller-watchdog", "/usr/local/sbin/k0s-systemd-watchdog-feeder.sh")
-		r.removeManaged("/usr/local/sbin/k0scontroller-remediate.sh")
-		// probe timers too
-		for _, u := range []string{"k0s-apiserver-wedge-probe", "k0s-kine-pool-probe", "k0s-oomloop-probe"} {
-			r.run(ctx, "systemctl", "disable", "--now", u+".timer", u+".service")
-			r.removeManaged("/etc/systemd/system/" + u + ".service")
-			r.removeManaged("/etc/systemd/system/" + u + ".timer")
-			r.removeManaged("/usr/local/sbin/" + u + ".sh")
-		}
-	}
-
-	changed := false
-	for _, u := range units {
-		b, err := os.ReadFile(r.cfg.WatchdogScriptsDir + "/" + u.scriptSrc)
-		if err != nil {
-			continue
-		}
-		if ch, _ := r.writeManaged(u.scriptDest, b, 0o755); ch {
-			changed = true
-		}
-		remSrc := strings.Replace(u.scriptSrc, "k0s-kubelet-watchdog.sh", "k0sworker-remediate.sh", 1)
-		remSrc = strings.Replace(remSrc, "k0s-systemd-watchdog-feeder.sh", "k0scontroller-remediate.sh", 1)
-		if rb, err := os.ReadFile(r.cfg.WatchdogScriptsDir + "/" + remSrc); err == nil {
-			if ch, _ := r.writeManaged(u.restartScr, rb, 0o755); ch {
-				changed = true
-			}
-		}
-		if ch, _ := r.writeManaged("/etc/systemd/system/"+u.svcName+".service", []byte(u.svc), 0o644); ch {
-			changed = true
-		}
-		if ch, _ := r.writeManaged("/etc/systemd/system/"+u.svcName+"-restart.service", []byte(u.restartSvc), 0o644); ch {
-			changed = true
-		}
-		r.daemonReload(ctx)
-		r.run(ctx, "systemctl", "enable", "--now", u.svcName+".service")
-		if changed {
-			r.run(ctx, "systemctl", "restart", u.svcName+".service")
-		}
-	}
-
-	// controller probe timers (fast wedge/kine pool/oomloop).
-	if c.controller() && inCtrlList {
-		for _, u := range []string{"k0s-apiserver-wedge-probe", "k0s-kine-pool-probe", "k0s-oomloop-probe"} {
-			b, err := os.ReadFile(r.cfg.WatchdogScriptsDir + "/scripts/" + u + ".sh")
-			if err != nil {
-				continue
-			}
-			r.writeManaged("/usr/local/sbin/"+u+".sh", b, 0o755)
-			timeout := "50s"
-			if u == "k0s-oomloop-probe" {
-				timeout = "30s"
-			}
-			r.writeManaged("/etc/systemd/system/"+u+".service", []byte(fmt.Sprintf(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
-[Unit]
-Description=%s (60s cycle)
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/%s.sh
-TimeoutStartSec=%s
-`, u, u, timeout)), 0o644)
-			r.writeManaged("/etc/systemd/system/"+u+".timer", []byte(fmt.Sprintf(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
-[Unit]
-Description=%s timer (60s)
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=60s
-RandomizedDelaySec=5
-
-[Install]
-WantedBy=timers.target
-`, u)), 0o644)
-			r.run(ctx, "systemctl", "enable", "--now", u+".timer")
-		}
-		r.daemonReload(ctx)
 	}
 }
 

@@ -516,8 +516,10 @@ func TestDescribe(t *testing.T) {
 	c := New(Config{})
 	ch := make(chan *prometheus.Desc, 16)
 	c.Describe(ch)
-	if got := len(ch); got != 10 {
-		t.Fatalf("Describe emitted %d descs want 10", got)
+	// 10 base descs + the 2 legacy prom_emit aliases
+	// (node_watchdog_state, node_watchdog_egress_relay).
+	if got := len(ch); got != 12 {
+		t.Fatalf("Describe emitted %d descs want 12", got)
 	}
 }
 
@@ -853,5 +855,146 @@ func TestEgressRelayGauge(t *testing.T) {
 	if v, ok := metricValue(t, c, "node_overlay_egress_relay_active",
 		map[string]string{"target": "1.1.1.1"}); !ok || v != 0 {
 		t.Fatalf("direct=%v,%v want 0", v, ok)
+	}
+}
+
+// --- legacy prom_emit aliases (node_watchdog_state /
+// node_watchdog_egress_relay — the fluxcd PrometheusRules contract) ---
+
+func TestWatchdogLegacyAlias(t *testing.T) {
+	cfg, dirs := fixture(t)
+	write(t, filepath.Join(dirs["state"], "state-fail2ban-down"), "1730000000\n")
+	c := New(cfg)
+
+	// Alias mirrors the latch with signal=state (no node label).
+	if v, ok := metricValue(t, c, "node_watchdog_state",
+		map[string]string{"signal": "fail2ban-down"}); !ok || v != 1 {
+		t.Fatalf("node_watchdog_state{fail2ban-down}=%v ok=%v want 1", v, ok)
+	}
+	// Same latch, both series live alongside each other.
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "fail2ban-down"}); !ok || v != 1 {
+		t.Fatalf("node_host_agent_watchdog_state=%v ok=%v want 1", v, ok)
+	}
+
+	// Cleared latch → the alias keeps emitting an explicit 0, same
+	// emit-0 contract as the primary series.
+	if err := os.Remove(filepath.Join(dirs["state"], "state-fail2ban-down")); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := metricValue(t, c, "node_watchdog_state",
+		map[string]string{"signal": "fail2ban-down"}); !ok || v != 0 {
+		t.Fatalf("node_watchdog_state{fail2ban-down}=%v ok=%v want 0 after clear", v, ok)
+	}
+}
+
+func TestEgressRelayLegacyAlias(t *testing.T) {
+	cfg, dirs := fixture(t)
+	cfg.EgressRelays = []string{"8.8.8.8", "1.1.1.1"}
+	write(t, filepath.Join(dirs["state"], "egress-state-8.8.8.8"), "relay\n")
+	write(t, filepath.Join(dirs["state"], "egress-state-1.1.1.1"), "direct\n")
+	c := New(cfg)
+
+	if v, ok := metricValue(t, c, "node_watchdog_egress_relay",
+		map[string]string{"target": "8.8.8.8"}); !ok || v != 1 {
+		t.Fatalf("node_watchdog_egress_relay{8.8.8.8}=%v ok=%v want 1", v, ok)
+	}
+	if v, ok := metricValue(t, c, "node_watchdog_egress_relay",
+		map[string]string{"target": "1.1.1.1"}); !ok || v != 0 {
+		t.Fatalf("node_watchdog_egress_relay{1.1.1.1}=%v ok=%v want 0", v, ok)
+	}
+}
+
+// --- WriteTextfile (standalone prom_emit port) ---
+
+func TestWriteTextfile(t *testing.T) {
+	cfg, dirs := fixture(t)
+	cfg.EgressRelays = []string{"8.8.8.8"}
+	write(t, filepath.Join(dirs["state"], "state-fail2ban-down"), "1730000000\n")
+	write(t, filepath.Join(dirs["state"], "egress-state-8.8.8.8"), "relay\n")
+	c := New(cfg)
+
+	dir := filepath.Join(t.TempDir(), "textfile")
+	if err := c.WriteTextfile(dir); err != nil {
+		t.Fatalf("WriteTextfile: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "node-watchdog.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"# HELP node_watchdog_state ",
+		"# TYPE node_watchdog_state gauge",
+		`node_watchdog_state{signal="fail2ban-down"} 1`,
+		`node_host_agent_watchdog_state{node="node-a",state="fail2ban-down"} 1`,
+		`node_watchdog_egress_relay{target="8.8.8.8"} 1`,
+		`node_overlay_egress_relay_active{target="8.8.8.8"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("textfile missing %q\n%s", want, text)
+		}
+	}
+	// Atomic contract: no staging file left behind.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() == textfileTmpName || strings.HasPrefix(e.Name(), ".tmp-") {
+			t.Fatalf("staging file left behind: %s", e.Name())
+		}
+	}
+
+	// Second render after the latch clears emits the explicit 0 —
+	// the prom_emit emit-0 alert contract.
+	if err := os.Remove(filepath.Join(dirs["state"], "state-fail2ban-down")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WriteTextfile(dir); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(filepath.Join(dir, "node-watchdog.prom"))
+	if !strings.Contains(string(data),
+		`node_watchdog_state{signal="fail2ban-down"} 0`) {
+		t.Fatalf("cleared latch did not emit 0\n%s", data)
+	}
+}
+
+func TestWriteTextfileTmpNameEscapesPromGlob(t *testing.T) {
+	// node_exporter ingests every file matching *.prom — the
+	// staging name must never match, or a partially-written file
+	// could be scraped (and ".tmp-x.prom" DOES match: * swallows
+	// the leading dot).
+	if ok, _ := filepath.Match("*.prom", textfileTmpName); ok {
+		t.Fatalf("staging name %q matches the *.prom glob", textfileTmpName)
+	}
+	if ok, _ := filepath.Match("*.prom", ".tmp-"+TextfileName); !ok {
+		t.Fatal("sanity: the old .tmp- prefix really did match *.prom")
+	}
+	if ok, _ := filepath.Match("*.prom", TextfileName); !ok {
+		t.Fatalf("final name %q must match the *.prom glob", TextfileName)
+	}
+}
+
+func TestWriteTextfileNoDuplicateSeries(t *testing.T) {
+	cfg, dirs := fixture(t)
+	cfg.EgressRelays = []string{"8.8.8.8"}
+	write(t, filepath.Join(dirs["state"], "state-a"), "1\n")
+	c := New(cfg)
+	dir := t.TempDir()
+	if err := c.WriteTextfile(dir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "node-watchdog.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A duplicated series would make node_exporter reject the whole
+	// file — each sample line must appear exactly once.
+	count := strings.Count(string(data),
+		`node_watchdog_state{signal="a"} 1`)
+	if count != 1 {
+		t.Fatalf("series emitted %d times want 1\n%s", count, data)
 	}
 }

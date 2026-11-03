@@ -1,0 +1,5 @@
+# Fixture — mirrors playbooks/defaults.yaml (only the vars hubsync reads).
+interdc_ssh_default_user: root
+interdc_ssh_user_by_site:
+  lanit: ubuntu
+interdc_nebula_enabled: true

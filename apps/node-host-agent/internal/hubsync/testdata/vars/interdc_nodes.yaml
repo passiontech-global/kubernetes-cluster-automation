@@ -1,0 +1,36 @@
+# Fixture — mirrors the interdc_nodes.yaml registry schema.
+# agent:false entries are the non-K8s converge targets; agent defaults
+# to true so bare entries are excluded.
+hub-controller-01:
+  agent: false
+  hub: true
+  ip: 10.0.0.25
+  marker_octet: 3
+  name: dc1_controller_01
+  site: datahub
+  ssh_proxyjump: "root@10.0.0.15"
+lanit-hub-01:
+  agent: false
+  hub: true
+  ip: 10.1.0.7
+  marker_octet: 4
+  name: lanit_hub_01
+  site: lanit
+lanit-hub-02:
+  agent: false
+  ip: 10.1.0.8
+  marker_octet: 5
+  name: lanit_hub_02
+  site: lanit
+  ssh_user: converge
+lanit-worker-01:
+  ip: 10.1.0.11
+  marker_octet: 11
+  name: lanit_01
+  site: lanit
+lanit-worker-02:
+  agent: true
+  ip: 10.1.0.12
+  marker_octet: 12
+  name: lanit_02
+  site: lanit

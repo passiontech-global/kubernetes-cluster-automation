@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"os"
@@ -12,10 +15,14 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/ssh"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/apiprober"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/topology"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
 )
 
 func TestGetenv(t *testing.T) {
@@ -392,7 +399,7 @@ func TestBuildAgentConfigSubsystems(t *testing.T) {
 	t.Run("all disabled", func(t *testing.T) {
 		disableAllSubsystems(t)
 		cfg, apiproberOn := buildAgentConfig("n", "p", "ns", "v",
-			"127.0.0.1:0", "127.0.0.1:0")
+			"127.0.0.1:0", "127.0.0.1:0", false)
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%d want 0", len(cfg.Subsystems))
 		}
@@ -411,7 +418,7 @@ func TestBuildAgentConfigSubsystems(t *testing.T) {
 		disableAllSubsystems(t)
 		t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "absent"))
 		t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "true")
-		cfg, _ := buildAgentConfig("n", "p", "ns", "v", "127.0.0.1:0", "127.0.0.1:0")
+		cfg, _ := buildAgentConfig("n", "p", "ns", "v", "127.0.0.1:0", "127.0.0.1:0", false)
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%d want 0 (sweeper skipped, not fatal)", len(cfg.Subsystems))
 		}
@@ -443,9 +450,12 @@ users:
 		}
 		t.Setenv("KUBECONFIG", kubeconfig)
 		t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "true")
-		cfg, _ := buildAgentConfig("n", "p", "ns", "v", "127.0.0.1:0", "127.0.0.1:0")
-		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "sweeper" {
-			t.Fatalf("subsystems=%v want [sweeper]", names)
+		cfg, _ := buildAgentConfig("n", "p", "ns", "v", "127.0.0.1:0", "127.0.0.1:0", false)
+		// hubsync joins: with a working client it is always wired in
+		// pod mode (it polls for the converge key itself).
+		if names := subsystemNames(cfg); len(names) != 2 ||
+			names[0] != "sweeper" || names[1] != "hubsync" {
+			t.Fatalf("subsystems=%v want [sweeper hubsync]", names)
 		}
 	})
 
@@ -455,7 +465,7 @@ users:
 		// itself without a socket gate.
 		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto")
 		cfg, apiproberOn := buildAgentConfig("n", "p", "ns", "v",
-			"127.0.0.1:0", "127.0.0.1:0")
+			"127.0.0.1:0", "127.0.0.1:0", false)
 		if !apiproberOn {
 			t.Fatal("apiproberEnabled=false want true (auto default)")
 		}
@@ -470,7 +480,7 @@ users:
 		// not a subsystem.
 		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "true")
 		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
-			"127.0.0.1:0", "127.0.0.1:0")
+			"127.0.0.1:0", "127.0.0.1:0", false)
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%d want 0 (hostmetrics registers on the registry)", len(cfg.Subsystems))
 		}
@@ -484,7 +494,7 @@ users:
 		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto")
 		t.Setenv("NODE_HOST_AGENT_APIPROBER_MODE", "bogus")
 		cfg, apiproberOn := buildAgentConfig("n", "p", "ns", "v",
-			"127.0.0.1:0", "127.0.0.1:0")
+			"127.0.0.1:0", "127.0.0.1:0", false)
 		if !apiproberOn {
 			t.Fatal("apiproberEnabled=false want true")
 		}
@@ -499,7 +509,7 @@ users:
 		// required.
 		t.Setenv("NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE", "true")
 		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
-			"127.0.0.1:0", "127.0.0.1:0")
+			"127.0.0.1:0", "127.0.0.1:0", false)
 		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "concourse-cache" {
 			t.Fatalf("subsystems=%v want [concourse-cache]", names)
 		}
@@ -510,7 +520,7 @@ users:
 		// NETHEALTH default true; no kube client required.
 		t.Setenv("NODE_HOST_AGENT_ENABLE_NETHEALTH", "true")
 		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
-			"127.0.0.1:0", "127.0.0.1:0")
+			"127.0.0.1:0", "127.0.0.1:0", false)
 		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "nethealth" {
 			t.Fatalf("subsystems=%v want [nethealth]", names)
 		}
@@ -522,7 +532,7 @@ users:
 		// under the test host root → stays off.
 		t.Setenv("NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE", "auto")
 		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
-			"127.0.0.1:0", "127.0.0.1:0")
+			"127.0.0.1:0", "127.0.0.1:0", false)
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%v want [] (no k0scontroller unit)", subsystemNames(cfg))
 		}
@@ -534,7 +544,7 @@ users:
 		// carries no defaults.yaml in the test environment → off.
 		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTCONFIG", "auto")
 		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
-			"127.0.0.1:0", "127.0.0.1:0")
+			"127.0.0.1:0", "127.0.0.1:0", false)
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%v want [] (no vars dir)", subsystemNames(cfg))
 		}
@@ -550,7 +560,7 @@ users:
 		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTCONFIG", "auto")
 		t.Setenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", varsDir)
 		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
-			"127.0.0.1:0", "127.0.0.1:0")
+			"127.0.0.1:0", "127.0.0.1:0", false)
 		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "hostconfig" {
 			t.Fatalf("subsystems=%v want [hostconfig]", names)
 		}
@@ -593,7 +603,7 @@ func TestCsOnceSharesOneClientset(t *testing.T) {
 	enableBothKubeConsumers(t)
 
 	cfg, _ := buildAgentConfig("node-a", "p", "ns", "v",
-		"127.0.0.1:0", "127.0.0.1:0")
+		"127.0.0.1:0", "127.0.0.1:0", false)
 
 	if *calls != 1 {
 		t.Fatalf("kubeClient calls=%d want 1 (shared clientset)", *calls)
@@ -602,8 +612,9 @@ func TestCsOnceSharesOneClientset(t *testing.T) {
 	for _, s := range cfg.Subsystems {
 		names = append(names, s.Name())
 	}
-	if len(names) != 2 || names[0] != "sweeper" || names[1] != "workerhygiene" {
-		t.Fatalf("subsystems=%v want [sweeper workerhygiene]", names)
+	if len(names) != 3 || names[0] != "sweeper" || names[1] != "workerhygiene" ||
+		names[2] != "hubsync" {
+		t.Fatalf("subsystems=%v want [sweeper workerhygiene hubsync]", names)
 	}
 }
 
@@ -617,7 +628,7 @@ func TestCsOnceErrorNotRetried(t *testing.T) {
 	enableBothKubeConsumers(t)
 
 	cfg, _ := buildAgentConfig("node-a", "p", "ns", "v",
-		"127.0.0.1:0", "127.0.0.1:0")
+		"127.0.0.1:0", "127.0.0.1:0", false)
 
 	if *calls != 1 {
 		t.Fatalf("kubeClient calls=%d want 1 (error cached, not retried)", *calls)
@@ -625,4 +636,526 @@ func TestCsOnceErrorNotRetried(t *testing.T) {
 	if len(cfg.Subsystems) != 0 {
 		t.Fatalf("subsystems=%d want 0 (client build failed)", len(cfg.Subsystems))
 	}
+}
+
+// --- standalone mode ---
+
+// TestStandaloneDefaultFlips verifies the standalone enable-set
+// inversion: with a working kube client stub and a node name, pod
+// mode builds the kube-dependent subsystems by default while
+// standalone does not — and an explicit env override still wins.
+func TestStandaloneDefaultFlips(t *testing.T) {
+	stubKubeClient(t, func() (kubernetes.Interface, error) {
+		return fake.NewSimpleClientset(), nil
+	})
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+	t.Setenv("KUBECONFIG", "")
+	t.Setenv("NODE_HOST_AGENT_NODE_NAME", "node-a")
+	t.Setenv("NODE_HOST_AGENT_WATCHDOG_CONF",
+		filepath.Join(t.TempDir(), "absent.conf"))
+	t.Setenv("NODE_HOST_AGENT_API_GUARD_CONF",
+		filepath.Join(t.TempDir(), "absent-guard.conf"))
+	t.Setenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", t.TempDir())
+	t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY",
+		filepath.Join(t.TempDir(), "absent-key"))
+	t.Setenv("NODE_HOST_AGENT_ENABLE_KINEDB", "false")
+	t.Setenv("NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE", "false")
+	t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTCONFIG", "false")
+
+	t.Run("standalone flips kube-dependent defaults off", func(t *testing.T) {
+		cfg, _ := buildAgentConfig("node-a", "p", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0", true)
+		names := subsystemNames(cfg)
+		want := map[string]bool{
+			"apiprober": true, "hostmetrics-textfile": true,
+			"nethealth": true,
+		}
+		for _, n := range names {
+			if !want[n] {
+				t.Fatalf("standalone subsystem %q not in want-set %v", n, names)
+			}
+			delete(want, n)
+		}
+		if len(want) != 0 {
+			t.Fatalf("standalone missing subsystems %v (got %v)", want, names)
+		}
+	})
+
+	t.Run("pod mode keeps kube-dependent defaults on", func(t *testing.T) {
+		cfg, _ := buildAgentConfig("node-a", "p", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0", false)
+		got := map[string]bool{}
+		for _, n := range subsystemNames(cfg) {
+			got[n] = true
+		}
+		for _, n := range []string{
+			"sweeper", "concourse-cache", "workerhygiene", "nodereporter",
+		} {
+			if !got[n] {
+				t.Fatalf("pod mode missing %q (got %v)", n, subsystemNames(cfg))
+			}
+		}
+		if got["hostmetrics-textfile"] {
+			t.Fatal("hostmetrics-textfile must not run in pod mode")
+		}
+	})
+
+	t.Run("env override still wins in standalone", func(t *testing.T) {
+		t.Setenv("NODE_HOST_AGENT_ENABLE_HYGIENE", "true")
+		cfg, _ := buildAgentConfig("node-a", "p", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0", true)
+		got := map[string]bool{}
+		for _, n := range subsystemNames(cfg) {
+			got[n] = true
+		}
+		if !got["workerhygiene"] {
+			t.Fatalf("ENABLE_HYGIENE=true ignored in standalone (got %v)",
+				subsystemNames(cfg))
+		}
+	})
+
+	t.Run("NODE_HOST_AGENT_STANDALONE env selects standalone", func(t *testing.T) {
+		t.Setenv("NODE_HOST_AGENT_STANDALONE", "1")
+		cfg, _ := buildAgentConfig("node-a", "p", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0", false)
+		got := map[string]bool{}
+		for _, n := range subsystemNames(cfg) {
+			got[n] = true
+		}
+		if got["sweeper"] || got["workerhygiene"] || got["nodereporter"] {
+			t.Fatalf("STANDALONE=1 did not flip defaults (got %v)",
+				subsystemNames(cfg))
+		}
+		if !got["hostmetrics-textfile"] {
+			t.Fatal("STANDALONE=1 did not enable the textfile writer")
+		}
+	})
+}
+
+// --- subcommand dispatch (arg-parse level) ---
+
+func TestDispatchDaemonArgs(t *testing.T) {
+	for _, argv := range [][]string{
+		{"node-host-agent"},
+		{"node-host-agent", "-version"},
+		{"node-host-agent", "--standalone", "--node-name=x"},
+	} {
+		if code, handled := dispatch(argv); handled {
+			t.Fatalf("dispatch(%v)=(%d,true) want (0,false)", argv, code)
+		}
+	}
+}
+
+func TestDispatchUnknownSubcommand(t *testing.T) {
+	code, handled := dispatch([]string{"node-host-agent", "bogus"})
+	if !handled || code != 2 {
+		t.Fatalf("dispatch(bogus)=(%d,%v) want (2,true)", code, handled)
+	}
+}
+
+func TestDispatchRuncArgv0(t *testing.T) {
+	// argv[0] "runc" selects the wrapper; runc.real does not exist in
+	// the test env so exec fails → non-zero, but dispatch handled it.
+	code, handled := dispatch([]string{"/concourse-runc/runc", "state"})
+	if !handled {
+		t.Fatal("argv0 runc was not handled")
+	}
+	if code == 0 {
+		t.Fatal("runc wrapper returned 0 without runc.real — unexpected")
+	}
+}
+
+func TestDispatchConvergeOnceArgParsing(t *testing.T) {
+	// Bad flag → exit 2; -h/--help → exit 0 (flag.ErrHelp is not an
+	// error — a user asking for usage must not fail CI/wrappers).
+	if code, handled := dispatch([]string{"nha", "converge-once", "--bogus"}); !handled || code != 2 {
+		t.Fatalf("converge-once --bogus=(%d,%v) want (2,true)", code, handled)
+	}
+	for _, h := range []string{"-h", "--help"} {
+		if code, handled := dispatch([]string{"nha", "converge-once", h}); !handled || code != 0 {
+			t.Fatalf("converge-once %s=(%d,%v) want (0,true)", h, code, handled)
+		}
+	}
+	// A vars dir without the topology files → the cycle logs the
+	// load error and the command still exits 0 (converge is
+	// best-effort — same contract as the periodic subsystem).
+	dir := t.TempDir()
+	code, handled := dispatch([]string{"nha", "converge-once",
+		"--vars-dir=" + dir, "--node-name=testnode"})
+	if !handled || code != 0 {
+		t.Fatalf("converge-once=(%d,%v) want (0,true)", code, handled)
+	}
+}
+
+func TestDispatchNebulaSignArgParsing(t *testing.T) {
+	// --ca-dir is required.
+	if code, handled := dispatch([]string{"nha", "nebula-sign"}); !handled || code != 2 {
+		t.Fatalf("nebula-sign (no ca-dir)=(%d,%v) want (2,true)", code, handled)
+	}
+	// -h exits 0 — help is a clean exit, not a usage error.
+	if code, handled := dispatch([]string{"nha", "nebula-sign", "-h"}); !handled || code != 0 {
+		t.Fatalf("nebula-sign -h=(%d,%v) want (0,true)", code, handled)
+	}
+	// Missing vars files → error exit 1 (topology.Load fails before
+	// any signing).
+	dir := t.TempDir()
+	code, handled := dispatch([]string{"nha", "nebula-sign",
+		"--vars-dir=" + dir, "--ca-dir=" + dir})
+	if !handled || code != 1 {
+		t.Fatalf("nebula-sign missing vars=(%d,%v) want (1,true)", code, handled)
+	}
+}
+
+// --- sign-job derivation + pubkey normalization ---
+
+func TestStripPubArmor(t *testing.T) {
+	bare := "QUJDREVGRw=="
+	if got := stripPubArmor(bare); got != bare {
+		t.Fatalf("bare pubkey mangled: %q", got)
+	}
+	pem := "-----BEGIN NEBULA X25519 PUBLIC KEY-----\n" + bare +
+		"\n-----END NEBULA X25519 PUBLIC KEY-----\n"
+	if got := stripPubArmor(pem); got != bare {
+		t.Fatalf("PEM strip=%q want %q", got, bare)
+	}
+	// Multi-line base64 joins.
+	multi := "-----BEGIN NEBULA X25519 PUBLIC KEY-----\nQUJD\nREVGRw==\n-----END NEBULA X25519 PUBLIC KEY-----\n"
+	if got := stripPubArmor(multi); got != bare {
+		t.Fatalf("multiline PEM strip=%q want %q", got, bare)
+	}
+}
+
+func TestBuildSignJobs(t *testing.T) {
+	dir := t.TempDir()
+	writeVars := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name),
+			[]byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeVars("defaults.yaml",
+		"interdc_nebula_enabled: true\ninterdc_marker_base: \"172.29.0\"\n")
+	writeVars("cluster.yaml", "interdc_ssh_default_user: admin\n")
+	writeVars("interdc_nodes.yaml", `hub-a:
+  name: hub-a
+  ip: 10.0.0.1
+  marker_octet: 3
+  nebula_key: UHViQQ==
+  relay:
+    - ip: 203.0.113.5
+    - 198.51.100.9
+node-b:
+  name: node-b
+  ip: 10.0.0.2
+  ssh_user: ops
+  ssh_proxyjump: admin@203.0.113.1
+`)
+
+	topo, err := topology.Load(topology.Config{VarsDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := buildSignJobs(topo, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("jobs=%d want 2", len(jobs))
+	}
+	a, b := jobs[0], jobs[1]
+	if a.IPCIDR != "172.29.0.3/24" {
+		t.Fatalf("hub-a marker=%q want 172.29.0.3/24 (marker_octet)", a.IPCIDR)
+	}
+	// Subnets: ip/32 + both relay ips/32, unique+sorted+csv.
+	if a.Subnets != "10.0.0.1/32,198.51.100.9/32,203.0.113.5/32" {
+		t.Fatalf("hub-a subnets=%q", a.Subnets)
+	}
+	if a.Pub != "UHViQQ==" {
+		t.Fatalf("hub-a pub=%q want registry nebula_key", a.Pub)
+	}
+	// node-b: no marker_octet → last octet of ip; ssh chain resolved.
+	if b.IPCIDR != "172.29.0.2/24" {
+		t.Fatalf("node-b marker=%q want 172.29.0.2/24", b.IPCIDR)
+	}
+	if b.SSHUser != "ops" || b.ProxyJump != "admin@203.0.113.1" {
+		t.Fatalf("node-b ssh=%q jump=%q", b.SSHUser, b.ProxyJump)
+	}
+	if b.Pub != "" {
+		t.Fatalf("node-b pub=%q want empty (SSH fetch path)", b.Pub)
+	}
+
+	// --node filters by registry key.
+	jobs, err = buildSignJobs(topo, "node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].Hostname != "node-b" {
+		t.Fatalf("--node filter jobs=%v", jobs)
+	}
+	if _, err := buildSignJobs(topo, "nope"); err == nil {
+		t.Fatal("unknown --node want error")
+	}
+}
+
+// --- apiprober guard-conf precedence (env → conf → default) ---
+
+func TestResolveProberInputs(t *testing.T) {
+	wdCfg, _ := watchdogconf.Parse([]byte(
+		`API_BACKENDS="wd1=10.1.0.1:6443"`))
+	guard := apiprober.GuardDefaults{
+		SocketPath:        "/run/haproxy-admin/admin.sock",
+		BackendName:       "kubeAPI_backend",
+		CompanionBackends: []string{"konnectivity_back"},
+		StaticBackends: []apiprober.StaticBackend{
+			{Name: "hub1", Addr: "10.0.0.1:6443"},
+		},
+		Mode:      "enforce",
+		TokenFile: "/etc/api-backend-guard/token",
+		CAFile:    "/etc/api-backend-guard/ca.crt",
+	}
+
+	t.Run("defaults without env or conf", func(t *testing.T) {
+		pi := resolveProberInputs(wdCfg, apiprober.GuardDefaults{})
+		if pi.socket != "/run/api-local-lb-admin.sock" ||
+			pi.backend != "api_local_back" ||
+			pi.mode != apiprober.ModeDryRun ||
+			pi.tokenFile != "/var/run/secrets/kubernetes.io/serviceaccount/token" ||
+			pi.caFile != "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt" {
+			t.Fatalf("defaults=%+v", pi)
+		}
+		// wdCfg API_BACKENDS feed StaticBackends as before.
+		if len(pi.static) != 1 || pi.static[0].Name != "wd1" {
+			t.Fatalf("static=%v want wdCfg backends", pi.static)
+		}
+	})
+
+	t.Run("guard conf fills below env", func(t *testing.T) {
+		pi := resolveProberInputs(wdCfg, guard)
+		if pi.socket != guard.SocketPath || pi.backend != guard.BackendName ||
+			pi.mode != "enforce" || pi.tokenFile != guard.TokenFile ||
+			pi.caFile != guard.CAFile {
+			t.Fatalf("guard fallback=%+v", pi)
+		}
+		if len(pi.companions) != 1 || pi.companions[0] != "konnectivity_back" {
+			t.Fatalf("companions=%v", pi.companions)
+		}
+		// Guard API_BACKENDS win over the watchdog conf's.
+		if len(pi.static) != 1 || pi.static[0].Name != "hub1" {
+			t.Fatalf("static=%v want guard backends", pi.static)
+		}
+	})
+
+	t.Run("env beats guard conf", func(t *testing.T) {
+		t.Setenv("NODE_HOST_AGENT_APIPROBER_SOCKET", "/custom.sock")
+		t.Setenv("NODE_HOST_AGENT_APIPROBER_MODE", "dry-run")
+		t.Setenv("NODE_HOST_AGENT_APIPROBER_COMPANION_BACKENDS", "extra1,extra2")
+		pi := resolveProberInputs(wdCfg, guard)
+		if pi.socket != "/custom.sock" || pi.mode != "dry-run" {
+			t.Fatalf("env override=%+v", pi)
+		}
+		if len(pi.companions) != 2 || pi.companions[0] != "extra1" {
+			t.Fatalf("env companions=%v", pi.companions)
+		}
+		// Untouched envs still see the conf layer.
+		if pi.backend != guard.BackendName || pi.tokenFile != guard.TokenFile {
+			t.Fatalf("conf layer lost under env=%+v", pi)
+		}
+	})
+}
+
+// --- kubeletWatchdogHosts ---
+
+func TestKubeletWatchdogHosts(t *testing.T) {
+	t.Run("env list wins", func(t *testing.T) {
+		t.Setenv("NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS", "a , b")
+		got := kubeletWatchdogHosts(t.TempDir(), "n")
+		if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+			t.Fatalf("env hosts=%v", got)
+		}
+	})
+
+	t.Run("systemd_watchdog_hosts from vars dir", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "interdc_nodes.yaml"),
+			[]byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "cluster.yaml"),
+			[]byte("systemd_watchdog_hosts:\n  - node-x\n  - node-y\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got := kubeletWatchdogHosts(dir, "node-a")
+		if len(got) != 2 || got[0] != "node-x" || got[1] != "node-y" {
+			t.Fatalf("vars hosts=%v", got)
+		}
+	})
+
+	t.Run("missing vars dir is nil not error", func(t *testing.T) {
+		if got := kubeletWatchdogHosts(t.TempDir(), "n"); got != nil {
+			t.Fatalf("hosts=%v want nil", got)
+		}
+	})
+}
+
+// --- resolveLocalBinary ---
+
+func TestResolveLocalBinary(t *testing.T) {
+	orig := osExecutable
+	t.Cleanup(func() { osExecutable = orig })
+
+	t.Run("env override wins", func(t *testing.T) {
+		t.Setenv("NODE_HOST_AGENT_HUBSYNC_LOCAL_BINARY", "/custom/bin")
+		if got := resolveLocalBinary(); got != "/custom/bin" {
+			t.Fatalf("env override=%q want /custom/bin", got)
+		}
+	})
+
+	t.Run("deleted suffix stripped", func(t *testing.T) {
+		real := filepath.Join(t.TempDir(), "node-host-agent")
+		if err := os.WriteFile(real, []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		osExecutable = func() (string, error) { return real + " (deleted)", nil }
+		if got := resolveLocalBinary(); got != real {
+			t.Fatalf("deleted-suffix resolve=%q want %q", got, real)
+		}
+	})
+
+	t.Run("nonexistent resolved path falls back", func(t *testing.T) {
+		osExecutable = func() (string, error) {
+			return filepath.Join(t.TempDir(), "gone") + " (deleted)", nil
+		}
+		if got := resolveLocalBinary(); got != "/node-host-agent" {
+			t.Fatalf("missing-path resolve=%q want /node-host-agent", got)
+		}
+	})
+
+	t.Run("os.Executable error falls back", func(t *testing.T) {
+		osExecutable = func() (string, error) { return "", errors.New("noexe") }
+		if got := resolveLocalBinary(); got != "/node-host-agent" {
+			t.Fatalf("error resolve=%q want /node-host-agent", got)
+		}
+	})
+}
+
+// --- kinedb / hubsync gating ---
+
+func writeEd25519Key(t *testing.T) string {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "id_ed25519")
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestKineDBGating(t *testing.T) {
+	disableAllSubsystems(t)
+	sandboxed := t.TempDir()
+	t.Setenv("NODE_HOST_AGENT_WATCHDOG_CONF", filepath.Join(sandboxed, "no.conf"))
+	t.Setenv("NODE_HOST_AGENT_API_GUARD_CONF", filepath.Join(sandboxed, "no.conf"))
+	t.Setenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", sandboxed)
+	t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", filepath.Join(sandboxed, "no-key"))
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+	t.Setenv("KUBECONFIG", "")
+
+	t.Run("auto + no detect → off", func(t *testing.T) {
+		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0", false)
+		for _, n := range subsystemNames(cfg) {
+			if n == "kinedb" {
+				t.Fatal("kinedb enabled without Detect match")
+			}
+		}
+	})
+	t.Run("true forces on", func(t *testing.T) {
+		t.Setenv("NODE_HOST_AGENT_ENABLE_KINEDB", "true")
+		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0", false)
+		got := subsystemNames(cfg)
+		if len(got) != 1 || got[0] != "kinedb" {
+			t.Fatalf("subsystems=%v want [kinedb]", got)
+		}
+	})
+}
+
+func TestHubsyncGating(t *testing.T) {
+	disableAllSubsystems(t)
+	sandboxed := t.TempDir()
+	t.Setenv("NODE_HOST_AGENT_WATCHDOG_CONF", filepath.Join(sandboxed, "no.conf"))
+	t.Setenv("NODE_HOST_AGENT_API_GUARD_CONF", filepath.Join(sandboxed, "no.conf"))
+	t.Setenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", sandboxed)
+	t.Setenv("NODE_HOST_AGENT_ENABLE_KINEDB", "false")
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+	t.Setenv("KUBECONFIG", "")
+
+	t.Run("no key → registered, polls for key", func(t *testing.T) {
+		stubKubeClient(t, func() (kubernetes.Interface, error) {
+			return fake.NewSimpleClientset(), nil
+		})
+		t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY",
+			filepath.Join(sandboxed, "absent"))
+		cfg, _ := buildAgentConfig("n", "pod-a", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0", false)
+		// The absent key is NOT a permanent gate — the secret mounts
+		// optional:true and may land after pod start; the Syncer
+		// re-checks on every trigger (skip-cycle-and-poll).
+		got := subsystemNames(cfg)
+		if len(got) != 1 || got[0] != "hubsync" {
+			t.Fatalf("subsystems=%v want [hubsync] (key-waiting mode)", got)
+		}
+	})
+
+	t.Run("key + kube client → on", func(t *testing.T) {
+		stubKubeClient(t, func() (kubernetes.Interface, error) {
+			return fake.NewSimpleClientset(), nil
+		})
+		t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", writeEd25519Key(t))
+		cfg, _ := buildAgentConfig("n", "pod-a", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0", false)
+		got := subsystemNames(cfg)
+		if len(got) != 1 || got[0] != "hubsync" {
+			t.Fatalf("subsystems=%v want [hubsync]", got)
+		}
+	})
+
+	t.Run("key + client error → skipped not fatal", func(t *testing.T) {
+		stubKubeClient(t, func() (kubernetes.Interface, error) {
+			return nil, errors.New("no config")
+		})
+		t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", writeEd25519Key(t))
+		cfg, _ := buildAgentConfig("n", "pod-a", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0", false)
+		for _, n := range subsystemNames(cfg) {
+			if n == "hubsync" {
+				t.Fatal("hubsync enabled despite client error")
+			}
+		}
+	})
+
+	t.Run("standalone never runs hubsync", func(t *testing.T) {
+		stubKubeClient(t, func() (kubernetes.Interface, error) {
+			return fake.NewSimpleClientset(), nil
+		})
+		t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", writeEd25519Key(t))
+		cfg, _ := buildAgentConfig("n", "pod-a", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0", true)
+		for _, n := range subsystemNames(cfg) {
+			if n == "hubsync" {
+				t.Fatal("hubsync ran in standalone mode")
+			}
+		}
+	})
 }

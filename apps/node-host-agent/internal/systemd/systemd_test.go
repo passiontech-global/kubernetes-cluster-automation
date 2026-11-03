@@ -3,6 +3,8 @@ package systemd
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -92,24 +94,52 @@ func TestUnitExists(t *testing.T) {
 
 func TestActiveAge(t *testing.T) {
 	f := newFake()
-	ts := time.Now().Add(-5 * time.Minute).UTC().Format("Mon 2006-01-02 15:04:05 MST")
-	f.reply["show -p ActiveEnterTimestamp --value k0sworker.service"] = ts + "\n"
-	f.reply["show -p ActiveEnterTimestamp --value dead.service"] = "\n"
-	c := New(Config{HostRoot: "/", RunCmd: f.run})
+	// Monotonic µs since boot vs /proc/uptime — the shell's method:
+	// no wall-clock string, no zone-abbrev parsing. Uptime 10000.25s,
+	// unit entered active at 7000000000µs → age ≈ 3000s.
+	uptime := filepath.Join(t.TempDir(), "uptime")
+	if err := os.WriteFile(uptime, []byte("10000.25 8000.5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.reply["show -p ActiveEnterTimestampMonotonic --value k0sworker.service"] = "7000000000\n"
+	f.reply["show -p ActiveEnterTimestampMonotonic --value dead.service"] = "0\n"
+	c := New(Config{HostRoot: "/", RunCmd: f.run, ProcUptimeFile: uptime})
 	ctx := context.Background()
 	age, err := c.ActiveAge(ctx, "k0sworker.service")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if age < 4*time.Minute || age > 6*time.Minute {
-		t.Fatalf("age=%v want ~5m", age)
+	if age < 2999*time.Second || age > 3001*time.Second {
+		t.Fatalf("age=%v want ~3000s", age)
+	}
+	// The exact argv must ask for the monotonic property — the
+	// formatted ActiveEnterTimestamp carries an unparseable local
+	// zone abbrev.
+	joined := strings.Join(f.cmds[len(f.cmds)-1], " ")
+	if !strings.Contains(joined, "ActiveEnterTimestampMonotonic --value k0sworker.service") {
+		t.Fatalf("argv=%q want the monotonic property", joined)
 	}
 	if _, err := c.ActiveAge(ctx, "dead.service"); err == nil {
-		t.Fatal("empty timestamp want error")
+		t.Fatal("zero monotonic timestamp want error")
 	}
-	f.reply["show -p ActiveEnterTimestamp --value bad.service"] = "not-a-date\n"
+	f.reply["show -p ActiveEnterTimestampMonotonic --value bad.service"] = "not-a-number\n"
 	if _, err := c.ActiveAge(ctx, "bad.service"); err == nil {
 		t.Fatal("garbage timestamp want error")
+	}
+	// Unreadable /proc/uptime → error (never settle blind).
+	c2 := New(Config{HostRoot: "/", RunCmd: f.run,
+		ProcUptimeFile: filepath.Join(t.TempDir(), "missing")})
+	if _, err := c2.ActiveAge(ctx, "k0sworker.service"); err == nil {
+		t.Fatal("missing uptime file want error")
+	}
+	// A just-started unit: mono == uptime → age clamps at 0.
+	f.reply["show -p ActiveEnterTimestampMonotonic --value fresh.service"] = "10000250000\n"
+	age, err = c.ActiveAge(ctx, "fresh.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if age < 0 || age > time.Second {
+		t.Fatalf("fresh unit age=%v want ~0", age)
 	}
 }
 

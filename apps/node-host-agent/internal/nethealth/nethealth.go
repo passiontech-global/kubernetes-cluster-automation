@@ -131,6 +131,19 @@ type Config struct {
 	ping func(ctx context.Context, ip string, count, waitSec int, marked bool) (bool, float64)
 	// probeHTTP fetches url, nil on any 2xx — used for nebula stats.
 	probeHTTP func(ctx context.Context, url string, timeout time.Duration) error
+	// routeDebounce overrides the route guard's netlink-burst
+	// debounce window (default 200ms; tests shrink it).
+	routeDebounce time.Duration
+	// routeMinRestore overrides the minimum interval between
+	// route-guard restores (default 2s; tests shrink it) — the
+	// exec-storm cap for sustained DEL-event floods.
+	routeMinRestore time.Duration
+	// openRouteSocket overrides the route guard's NETLINK_ROUTE
+	// socket factory — default binds RTMGRP_IPV4_ROUTE|RTMGRP_IPV4_RULE
+	// in the host netns: directly when the pod netns IS the host's
+	// (hostNetwork, same inode as /proc/1/ns/net), else setns into
+	// pid-1's netns (hostPID — no /host/proc mount needed).
+	openRouteSocket func() (int, error)
 }
 
 func (c *Config) applyDefaults() {
@@ -268,6 +281,11 @@ type NetHealth struct {
 
 	cycles  *prometheus.CounterVec // check, result
 	actions *prometheus.CounterVec // check, action
+
+	// routeGuardOnce keeps the route guard single-flight: a Run
+	// restart (agent panic recovery) must not spawn a second guard —
+	// that would double-bind the netlink socket and double-restore.
+	routeGuardOnce sync.Once
 }
 
 // New returns a NetHealth and registers its metrics on reg.
@@ -280,12 +298,13 @@ func New(cfg Config, reg prometheus.Registerer) (*NetHealth, error) {
 	}
 	n.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_nethealth_cycles_total",
-		Help: "Net-health check cycles by check and result (ok|abort|gated).",
+		Help: "Net-health check cycles by check and result " +
+			"(ok|abort|gated|disabled|uptime_gate|open_error|restore_error).",
 	}, []string{"check", "result"})
 	n.actions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_nethealth_actions_total",
 		Help: "Net-health remediation actions by check and action " +
-			"(pin|unpin|restart|rule_add|rule_del|kill).",
+			"(pin|unpin|restart|rule_add|rule_del|kill|restored).",
 	}, []string{"check", "action"})
 	if reg != nil {
 		for _, c := range []prometheus.Collector{n.cycles, n.actions} {
@@ -306,6 +325,12 @@ func (n *NetHealth) Run(ctx context.Context) {
 		<-ctx.Done()
 		return
 	}
+	// Route guard: netlink-driven restore of the nebula policy
+	// routing (replaces nebula-route-guard.service). Single-flight
+	// so a panic-restarted Run can't double-start it. No-ops on
+	// nodes without <HostRoot>/etc/nebula/<net>/nebula-up.sh (plain
+	// workers) or while `systemctl is-active nebula@<net>` is down.
+	n.routeGuardOnce.Do(func() { go n.routeGuard(ctx) })
 	n.Cycle(ctx)
 	t := time.NewTicker(n.cfg.Interval)
 	defer t.Stop()

@@ -13,7 +13,7 @@
 //
 //	systemctl is-active <u>        -> IsActive
 //	systemctl cat <u>              -> UnitExists (WD_REQUIRES unit:<n>)
-//	systemctl show -p ActiveEnterTimestamp --value -> ActiveAge
+//	systemctl show -p ActiveEnterTimestampMonotonic --value -> ActiveAge
 //	systemctl restart <u>          -> Restart
 //	systemctl reload-or-restart <u> -> ReloadOrRestart
 //	systemctl kill -s <SIG> <u>    -> Signal
@@ -25,7 +25,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -34,6 +36,11 @@ import (
 const (
 	defaultHostRoot = "/host"
 	defaultTimeout  = 30 * time.Second
+	// defaultProcUptimeFile: hostPID:true makes the pod's /proc the
+	// HOST /proc, so the plain path is right even when HostRoot is
+	// mounted at /host (the nsenter wrapping covers commands, not
+	// this file read).
+	defaultProcUptimeFile = "/proc/uptime"
 	// maxCmdOutputBytes caps the stdout retained per spawned command —
 	// a log storm (journalctl -10min snapshot on a sick node) must not
 	// push unbounded child output into the agent's heap. The rest is
@@ -54,6 +61,9 @@ type Config struct {
 	// argv BEFORE RunCmd sees it, so a fake runner observes the exact
 	// production command line.
 	RunCmd func(ctx context.Context, argv []string) (string, error)
+	// ProcUptimeFile is read by ActiveAge to turn the unit's
+	// monotonic-since-boot activation timestamp into an age.
+	ProcUptimeFile string
 }
 
 func (c *Config) applyDefaults() {
@@ -62,6 +72,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = defaultTimeout
+	}
+	if c.ProcUptimeFile == "" {
+		c.ProcUptimeFile = defaultProcUptimeFile
 	}
 	if c.RunCmd == nil {
 		c.RunCmd = func(ctx context.Context, argv []string) (string, error) {
@@ -146,29 +159,57 @@ func (c *Client) UnitExists(unit string) bool {
 	return err == nil
 }
 
-// ActiveAge returns how long the unit has been continuously active,
-// from ActiveEnterTimestamp — the k0sworker_settled >=180s gate: a
-// freshly restarted k0sworker gets a settle window before any new
-// restart is spent on it. Error when the unit is not active or the
-// timestamp is unreadable (both mean "not settled" to the caller).
+// ActiveAge returns how long the unit has been continuously active —
+// the k0sworker_settled >=180s gate: a freshly restarted k0sworker
+// gets a settle window before any new restart is spent on it. The
+// age comes from ActiveEnterTimestampMonotonic (µs since boot,
+// numeric and locale-free) compared against /proc/uptime — exactly
+// what the shell did. The formatted ActiveEnterTimestamp ("Sun
+// 2026-01-04 10:11:12 UTC") is NOT usable: its zone abbrev is the
+// host's local zone ("ICT", "MSK", ...), which time.Parse resolves
+// only when it happens to be a name Go knows — a silent misparse
+// under any non-UTC zone. Error when the unit is not active or
+// either clock is unreadable (both mean "not settled" to the caller).
 func (c *Client) ActiveAge(ctx context.Context, unit string) (time.Duration, error) {
-	out, err := c.systemctl(ctx, "show", "-p", "ActiveEnterTimestamp",
-		"--value", unit)
+	out, err := c.systemctl(ctx, "show", "-p",
+		"ActiveEnterTimestampMonotonic", "--value", unit)
 	if err != nil {
 		return 0, err
 	}
 	ts := strings.TrimSpace(out)
-	if ts == "" || ts == "n/a" {
-		return 0, fmt.Errorf("%s: no ActiveEnterTimestamp (not active)", unit)
+	monoUS, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil || monoUS <= 0 {
+		// 0/"n/a"/empty = never activated this boot; unparseable =
+		// unexpected systemctl output — both count as "not active".
+		return 0, fmt.Errorf("%s: unusable ActiveEnterTimestampMonotonic %q (not active)",
+			unit, ts)
 	}
-	// systemd prints e.g. "Sun 2026-01-04 10:11:12 UTC" — the Go
-	// reference layout needs the weekday abbreviated, timezone as
-	// zone name.
-	t, err := time.Parse("Mon 2006-01-02 15:04:05 MST", ts)
+	up, err := procUptimeSeconds(c.cfg.ProcUptimeFile)
 	if err != nil {
-		return 0, fmt.Errorf("%s: parse ActiveEnterTimestamp %q: %w", unit, ts, err)
+		return 0, fmt.Errorf("%s: read %s: %w", unit, c.cfg.ProcUptimeFile, err)
 	}
-	return time.Since(t), nil
+	// Same clock family (CLOCK_MONOTONIC vs boot time) — the µs
+	// rounding can push the delta a hair below zero on a unit that
+	// just started.
+	if age := up*1e6 - float64(monoUS); age > 0 {
+		return time.Duration(age) * time.Microsecond, nil
+	}
+	return 0, nil
+}
+
+// procUptimeSeconds parses the first field of /proc/uptime — seconds
+// since boot on the boot-relative timeline the kernel and systemd's
+// *Monotonic properties share.
+func procUptimeSeconds(path string) (float64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	f := strings.Fields(string(data))
+	if len(f) == 0 {
+		return 0, fmt.Errorf("empty uptime %s", path)
+	}
+	return strconv.ParseFloat(f[0], 64)
 }
 
 // Restart mirrors `systemctl restart <unit>`.

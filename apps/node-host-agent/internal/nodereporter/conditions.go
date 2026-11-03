@@ -31,6 +31,11 @@ type conditionDef struct {
 	defaultMessage string
 	problemReason  string
 	stateKey       string // latch file state-<stateKey>; "" = special probe
+	// altStateKey is an optional second latch that trips the same
+	// condition — the T15 kubelet watchdog's state-kubelet-healthz-down
+	// (restart budget exhausted) must fire KubeletRuntimeStall so the
+	// existing NHC k0sworker-remediate-exhausted rule keeps working.
+	altStateKey string
 }
 
 // conditionDefs is the 9-condition table ported from the NPD JSON —
@@ -70,6 +75,7 @@ var conditionDefs = []conditionDef{
 		defaultMessage: "khong co phantom-pods wedge (ctr song, tasks > 0)",
 		problemReason:  "KubeletRuntimeStallDetected",
 		stateKey:       "kubelet-runtime-stall",
+		altStateKey:    "kubelet-healthz-down",
 	},
 	{
 		typ:            "DnsFallbackActive",
@@ -198,15 +204,30 @@ func (r *Reporter) evalConditions() []condEval {
 				res.message = fmt.Sprintf(
 					"node-watchdog khong ghi heartbeat %ds (timer dead hoac run fail)", age)
 			}
-		} else if since, ok := r.stateFileSince(d.stateKey); ok {
+		} else if key, since, ok := r.firstLatch(d.stateKey, d.altStateKey); ok {
 			res.status = corev1.ConditionTrue
 			res.reason = d.problemReason
 			// check-watchdog-state.sh echo verbatim.
-			res.message = fmt.Sprintf("watchdog state %s active since %s", d.stateKey, since)
+			res.message = fmt.Sprintf("watchdog state %s active since %s", key, since)
 		}
 		out = append(out, res)
 	}
 	return out
+}
+
+// firstLatch probes the given latch keys in order and reports the
+// first present one's key + content — dual-latch conditions name
+// their fallback key in altStateKey (primary wins on the message).
+func (r *Reporter) firstLatch(keys ...string) (key, since string, ok bool) {
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		if s, found := r.stateFileSince(k); found {
+			return k, s, true
+		}
+	}
+	return "", "", false
 }
 
 // stateFileSince reports whether state-<key> exists, and its content

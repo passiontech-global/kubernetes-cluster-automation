@@ -54,8 +54,10 @@ package apiprober
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -67,6 +69,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -106,6 +109,9 @@ const (
 	// state-apiserver-backend-stale-<ip-dashed> (read by
 	// 06-kubelet-watch-wedge to gate k0sworker restarts).
 	defaultWatchdogStateDir = "/host/var/lib/node-watchdog"
+	// defaultGuardConfPath mirrors cmd/agent's
+	// NODE_HOST_AGENT_API_GUARD_CONF default.
+	defaultGuardConfPath = "/etc/api-backend-guard.conf"
 )
 
 // Config carries the prober's knobs — all test-injectable.
@@ -133,7 +139,25 @@ type Config struct {
 	// and merges its API_BACKENDS into the static set — hostconfig
 	// rewrites the conf mid-run, so a backend joining/leaving the
 	// list must apply next cycle, not next agent restart.
-	WatchdogSrc   *watchdogconf.Reloader
+	WatchdogSrc *watchdogconf.Reloader
+	// GuardSrc, when set, re-reads api-backend-guard.conf every
+	// cycle and overlays the keys it carries onto the
+	// startup-resolved knobs (SocketPath/BackendName/
+	// CompanionBackends/StaticBackends/Mode/TokenFile/CAFile and the
+	// GAP_MIN/FAIL_CYCLES/FROZEN_CYCLES/RECOVER_CYCLES thresholds).
+	// The conf is the managed contract on api-lb VMs — hostconfig
+	// owns the file — so a key it sets wins over the Config field;
+	// keys it does not set fall through. Required, not optional:
+	// an agent that started BEFORE hostconfig's first conf render
+	// otherwise pins the compile-time fallbacks forever (incident
+	// shape: TokenFile stuck on the nonexistent SA path → every
+	// probe qfailed → an enforce-mode guard would drain a healthy
+	// backend ~60s post-rollout). New() auto-wires a
+	// GuardReloader on NODE_HOST_AGENT_API_GUARD_CONF (default
+	// /etc/api-backend-guard.conf) when GuardSrc is nil; set an
+	// explicit GuardSrc to point elsewhere or at a path that never
+	// exists to disable the overlay.
+	GuardSrc      *GuardReloader
 	Interval      time.Duration // probe cycle
 	Mode          string        // dry-run | enforce
 	GapMin        int64         // rv-gap wedge threshold
@@ -259,7 +283,14 @@ type backendState struct {
 type Prober struct {
 	cfg    Config
 	client *http.Client
+	caKey  string // cache key of the CA bundle p.client was built with
 	states map[string]*backendState
+	// eff is the per-cycle effective view of the knobs the guard
+	// conf may carry — refreshGuard() re-derives it from GuardSrc
+	// every Cycle (and once in New so unit-test entry points that
+	// call Cycle internals directly still see sane values). Only
+	// the Cycle goroutine reads/writes it — never exported.
+	eff guardEff
 
 	rvGap         *prometheus.GaugeVec
 	enabled       *prometheus.GaugeVec
@@ -278,29 +309,31 @@ func New(cfg Config, reg prometheus.Registerer) (*Prober, error) {
 		return nil, fmt.Errorf("invalid mode %q (want %q or %q)",
 			cfg.Mode, ModeDryRun, ModeEnforce)
 	}
+	if cfg.GuardSrc == nil {
+		// Auto-wire the conf cmd/agent parses once at startup: a
+		// reloader keeps that layer live per cycle (hostconfig's
+		// first render lands AFTER the agent starts on api-lb VMs).
+		cfg.GuardSrc = NewGuardReloader(guardConfPath(), GuardDefaults{})
+	}
 	p := &Prober{cfg: cfg, states: map[string]*backendState{}}
 
 	if cfg.HTTPClient != nil {
 		p.client = cfg.HTTPClient
+	} else if cfg.InsecureTLS {
+		//nolint:gosec // explicit opt-in, mirrors curl -sk
+		p.client = &http.Client{Transport: baseTransport(
+			&tls.Config{InsecureSkipVerify: true})}
 	} else {
-		tlsCfg := &tls.Config{InsecureSkipVerify: cfg.InsecureTLS} //nolint:gosec // explicit opt-in, mirrors curl -sk
-		if !cfg.InsecureTLS && cfg.CAFile != "" {
-			pool, err := caPool(cfg.CAFile)
-			if err != nil {
-				return nil, fmt.Errorf("load CA %s: %w", cfg.CAFile, err)
-			}
-			tlsCfg.RootCAs = pool
+		cl, key, err := caClient(cfg.CAFile)
+		if err != nil {
+			return nil, err
 		}
-		// Clone DefaultTransport rather than hand-rolling one: a bare
-		// &http.Transport{} loses the dialer/keep-alive defaults —
-		// IdleConnTimeout=0 would pin TLS read/write buffers on every
-		// idle conn forever, and ForceAttemptHTTP2=false falls back
-		// to HTTP/1.1.
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.TLSClientConfig = tlsCfg
-		tr.IdleConnTimeout = 90 * time.Second
-		p.client = &http.Client{Transport: tr}
+		p.client, p.caKey = cl, key
 	}
+	// Seed the effective knobs (and pick up any GuardSrc-carried
+	// CA that differs from the startup one) so every method sees a
+	// resolved view before the first Cycle.
+	p.refreshGuard()
 
 	p.rvGap = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_host_agent_apiprober_backend_rv_gap",
@@ -362,6 +395,18 @@ func (p *Prober) Run(ctx context.Context) {
 	}
 }
 
+// baseTransport clones http.DefaultTransport with our TLS config —
+// cloning rather than hand-rolling a bare &http.Transport{} keeps
+// the dialer/keep-alive defaults (IdleConnTimeout=0 would pin TLS
+// buffers on every idle conn forever, ForceAttemptHTTP2=false falls
+// back to HTTP/1.1).
+func baseTransport(tlsCfg *tls.Config) *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = tlsCfg
+	tr.IdleConnTimeout = 90 * time.Second
+	return tr
+}
+
 func caPool(path string) (*x509.CertPool, error) {
 	pem, err := os.ReadFile(path)
 	if err != nil {
@@ -374,13 +419,154 @@ func caPool(path string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
+// caClient builds the probe http.Client for a CA path and returns a
+// cache key (path + content hash) refreshClient compares to decide
+// whether the effective CA changed. caFile="" → system roots.
+func caClient(caFile string) (*http.Client, string, error) {
+	tlsCfg := &tls.Config{}
+	key := caFile
+	if caFile != "" {
+		pool, err := caPool(caFile)
+		if err != nil {
+			return nil, "", fmt.Errorf("load CA %s: %w", caFile, err)
+		}
+		tlsCfg.RootCAs = pool
+		pem, _ := os.ReadFile(caFile) // caPool already read it OK
+		sum := sha256.Sum256(pem)
+		key = caFile + "@" + hex.EncodeToString(sum[:])
+	}
+	return &http.Client{Transport: baseTransport(tlsCfg)}, key, nil
+}
+
+// guardEff is the per-cycle effective view of the knobs
+// api-backend-guard.conf may carry (see Config.GuardSrc) — the
+// startup-resolved Config value overlaid by the live conf.
+type guardEff struct {
+	socket     string
+	backend    string
+	companions []string
+	statics    []StaticBackend
+	mode       string
+	tokenFile  string
+	caFile     string
+	gapMin     int64
+	failCycles int
+	frozen     int
+	recoverC   int
+}
+
+// refreshGuard re-reads the guard conf (GuardSrc) and re-derives
+// p.eff. Called once per Cycle — a conf written by hostconfig's
+// first converge, or edited later via api_lb_guard_vms, applies on
+// the NEXT cycle, not the next agent restart (the incident shape:
+// an agent booted before the conf existed pinned the SA-path token
+// fallback → every probe qfailed → enforce-mode drain ~60s in).
+//
+// Overlay rule: a key the conf carries wins over the startup Config
+// value (the conf is the managed contract — hostconfig owns it);
+// keys absent from the conf fall through to Config. A garbage MODE
+// degrades to the non-enforce (dry-run) paths — fail-safe.
+func (p *Prober) refreshGuard() {
+	var g GuardDefaults
+	if p.cfg.GuardSrc != nil {
+		g = p.cfg.GuardSrc.Get()
+	}
+	e := &p.eff
+	e.socket = firstNonEmpty(g.SocketPath, p.cfg.SocketPath)
+	e.backend = firstNonEmpty(g.BackendName, p.cfg.BackendName)
+	e.mode = firstNonEmpty(g.Mode, p.cfg.Mode)
+	e.tokenFile = firstNonEmpty(g.TokenFile, p.cfg.TokenFile)
+	e.caFile = firstNonEmpty(g.CAFile, p.cfg.CAFile)
+	if len(g.CompanionBackends) > 0 {
+		e.companions = g.CompanionBackends
+	} else {
+		e.companions = p.cfg.CompanionBackends
+	}
+	// Conf entries first so a same-name edit wins the dedup — a
+	// mid-run API_BACKENDS change must REPLACE the startup value,
+	// not be shadowed by it.
+	e.statics = dedupStatic(append(
+		append([]StaticBackend{}, g.StaticBackends...),
+		p.cfg.StaticBackends...))
+	e.gapMin = p.cfg.GapMin
+	if g.GapMin > 0 {
+		e.gapMin = g.GapMin
+	}
+	e.failCycles = p.cfg.FailCycles
+	if g.FailCycles > 0 {
+		e.failCycles = g.FailCycles
+	}
+	e.frozen = p.cfg.FrozenCycles
+	if g.FrozenCycles > 0 {
+		e.frozen = g.FrozenCycles
+	}
+	e.recoverC = p.cfg.RecoverCycles
+	if g.RecoverCycles > 0 {
+		e.recoverC = g.RecoverCycles
+	}
+	p.refreshClient()
+}
+
+// refreshClient rebuilds the TLS client when the effective CA
+// changed (conf edit or bundle rotation). Skipped entirely for an
+// injected HTTPClient or InsecureTLS — the -sk client never consults
+// the CA. An unreadable/invalid CA keeps the last-good client and
+// retries next cycle.
+func (p *Prober) refreshClient() {
+	if p.cfg.HTTPClient != nil || p.cfg.InsecureTLS {
+		return
+	}
+	cl, key, err := caClient(p.eff.caFile)
+	if err != nil {
+		slog.Error("apiprober: CA load failed — keeping previous TLS client",
+			"ca", p.eff.caFile, "error", err, "subsystem", "apiprober")
+		return
+	}
+	if key != p.caKey {
+		p.client, p.caKey = cl, key
+		slog.Info("apiprober: rebuilt TLS client — effective CA changed",
+			"ca", p.eff.caFile, "subsystem", "apiprober")
+	}
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// dedupStatic keeps the first entry per name — later duplicates are
+// dropped (a same-named entry present in both the startup config and
+// the live guard conf must not be double-probed; ordering decides
+// precedence, see refreshGuard).
+func dedupStatic(in []StaticBackend) []StaticBackend {
+	seen := make(map[string]bool, len(in))
+	out := in[:0]
+	for _, sb := range in {
+		if sb.Name == "" || seen[sb.Name] {
+			continue
+		}
+		seen[sb.Name] = true
+		out = append(out, sb)
+	}
+	return out
+}
+
+// guardConfPath resolves the conf path the same way cmd/agent does —
+// NODE_HOST_AGENT_API_GUARD_CONF, default /etc/api-backend-guard.conf.
+func guardConfPath() string {
+	return firstNonEmpty(os.Getenv("NODE_HOST_AGENT_API_GUARD_CONF"),
+		defaultGuardConfPath)
+}
+
 // dial connects to the HAProxy admin socket.
 func (p *Prober) dial(ctx context.Context) (net.Conn, error) {
 	if p.cfg.DialSocket != nil {
-		return p.cfg.DialSocket(ctx, p.cfg.SocketPath)
+		return p.cfg.DialSocket(ctx, p.eff.socket)
 	}
 	d := net.Dialer{Timeout: p.cfg.TCPTimeout}
-	return d.DialContext(ctx, "unix", p.cfg.SocketPath)
+	return d.DialContext(ctx, "unix", p.eff.socket)
 }
 
 // socketCmd sends one admin command and returns the response body.
@@ -438,7 +624,7 @@ func (p *Prober) discover(ctx context.Context) ([]backend, error) {
 			}
 			return fields[i]
 		}
-		if get("pxname") != p.cfg.BackendName {
+		if get("pxname") != p.eff.backend {
 			continue
 		}
 		svname := get("svname")
@@ -510,8 +696,8 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 	req.Header.Set("Accept",
 		"application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1")
 	// Token re-read per query — the SA token is projected and rotates.
-	if p.cfg.TokenFile != "" && p.cfg.HTTPClient == nil {
-		tok, err := os.ReadFile(p.cfg.TokenFile)
+	if p.eff.tokenFile != "" && p.cfg.HTTPClient == nil {
+		tok, err := os.ReadFile(p.eff.tokenFile)
 		if err != nil {
 			return 0, false
 		}
@@ -549,36 +735,54 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 	return rv, true
 }
 
-// statics returns the effective static backend set: cfg.StaticBackends
-// plus, when WatchdogSrc is wired, the conf's API_BACKENDS re-read
-// this call (the runner re-sourced the conf every run).
+// statics returns the effective static backend set: the
+// guard-conf-overlaid set (eff.statics, already deduped by name —
+// conf first) plus, when WatchdogSrc is wired, node-watchdog.conf's
+// API_BACKENDS re-read this call (the runner re-sourced the conf
+// every run).
 func (p *Prober) statics() []StaticBackend {
-	if p.cfg.WatchdogSrc == nil {
-		return p.cfg.StaticBackends
-	}
-	out := append([]StaticBackend{}, p.cfg.StaticBackends...)
-	for _, b := range p.cfg.WatchdogSrc.Get().APIBackends {
-		out = append(out, StaticBackend{Name: b.Name, Addr: b.Addr})
+	out := append([]StaticBackend{}, p.eff.statics...)
+	if p.cfg.WatchdogSrc != nil {
+		for _, b := range p.cfg.WatchdogSrc.Get().APIBackends {
+			out = append(out, StaticBackend{Name: b.Name, Addr: b.Addr})
+		}
 	}
 	return out
 }
 
 // staticAddr resolves a server name to its static-backend Addr ("" =
-// not configured).
+// not configured), normalized with the bash default port.
 func (p *Prober) staticAddr(name string) string {
 	for _, sb := range p.statics() {
 		if sb.Name == name {
-			return sb.Addr
+			return withDefaultPort(sb.Addr)
 		}
 	}
 	return ""
+}
+
+// withDefaultPort fills the port on a bare-IP/-host backend address
+// — api-backend-guard.sh defaulted API_BACKENDS entries without a
+// port to 443. A missing port made every TCP preflight fail with
+// "missing port in address" → the backend counted unreachable
+// forever, never probed.
+func withDefaultPort(addr string) string {
+	if addr == "" {
+		return addr
+	}
+	if _, _, err := net.SplitHostPort(addr); err == nil {
+		return addr
+	}
+	return net.JoinHostPort(strings.Trim(addr, "[]"), "443")
 }
 
 // mergeStatic appends StaticBackends entries missing from discovery
 // as UP servers — they take traffic via their LB so they count toward
 // the drain fence like any discovered UP backend. Entries whose name
 // discovery already returned are skipped (discovery wins — it carries
-// the live HAProxy status).
+// the live HAProxy status), and so are names already appended from
+// the static set itself — the same name in both confs must not be
+// probed twice.
 func mergeStatic(backends []backend, static []StaticBackend) []backend {
 	seen := make(map[string]bool, len(backends))
 	for _, b := range backends {
@@ -588,8 +792,9 @@ func mergeStatic(backends []backend, static []StaticBackend) []backend {
 		if sb.Name == "" || sb.Addr == "" || seen[sb.Name] {
 			continue
 		}
+		seen[sb.Name] = true
 		backends = append(backends, backend{
-			Name: sb.Name, Addr: sb.Addr, Status: "UP",
+			Name: sb.Name, Addr: withDefaultPort(sb.Addr), Status: "UP",
 		})
 	}
 	return backends
@@ -602,7 +807,7 @@ func mergeStatic(backends []backend, static []StaticBackend) []backend {
 // companion backend is ignored (the server simply doesn't exist
 // there); an error on the primary backend always propagates.
 func (p *Prober) haproxyServer(ctx context.Context, action, name string) error {
-	backends := append([]string{p.cfg.BackendName}, p.cfg.CompanionBackends...)
+	backends := append([]string{p.eff.backend}, p.eff.companions...)
 	var firstErr error
 	for i, be := range backends {
 		out, err := p.socketCmd(ctx,
@@ -780,10 +985,14 @@ func (p *Prober) Cycle(ctx context.Context) {
 	start := time.Now()
 	defer func() { p.duration.Set(time.Since(start).Seconds()) }()
 
+	// Re-read the guard conf every cycle — a conf written or edited
+	// by hostconfig mid-run applies NOW, not after a restart.
+	p.refreshGuard()
+
 	backends, err := p.discover(ctx)
 	if err != nil {
 		log.Error("cannot discover backends from HAProxy socket",
-			"socket", p.cfg.SocketPath, "error", err)
+			"socket", p.eff.socket, "error", err)
 		p.cycles.WithLabelValues("discover_fail").Inc()
 		return
 	}
@@ -832,7 +1041,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 			st.frozen = 0
 			st.ok = 0
 			p.probeFailures.WithLabelValues(b.Name, "query").Inc()
-			if st.qfail >= p.cfg.FailCycles {
+			if st.qfail >= p.eff.failCycles {
 				stale[b.Name] = true
 				log.Info("DEAD: API queries failing — apiserver stall/wedge, drain from VIP",
 					"backend", b.Name, "addr", b.Addr,
@@ -840,7 +1049,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 			} else {
 				log.Info("probe: query failed — not draining yet",
 					"backend", b.Name, "qfail", st.qfail,
-					"failCycles", p.cfg.FailCycles)
+					"failCycles", p.eff.failCycles)
 			}
 			continue
 		}
@@ -864,17 +1073,17 @@ func (p *Prober) Cycle(ctx context.Context) {
 		st.hasPrev = true
 
 		// Gap signal: rv_now - rv_cache > GapMin accumulates.
-		if gap > p.cfg.GapMin {
+		if gap > p.eff.gapMin {
 			st.fail++
 		} else {
 			st.fail = 0
 		}
 
 		switch {
-		case st.frozen >= p.cfg.FrozenCycles || st.fail >= p.cfg.FailCycles:
+		case st.frozen >= p.eff.frozen || st.fail >= p.eff.failCycles:
 			stale[b.Name] = true
 			st.ok = 0
-			if st.frozen >= p.cfg.FrozenCycles {
+			if st.frozen >= p.eff.frozen {
 				log.Info("FROZEN: rv_cache unchanged while rv_now advances — watch-cache wedge",
 					"backend", b.Name, "rvCache", rvCache, "rvNow", rvNow,
 					"frozen", st.frozen)
@@ -882,19 +1091,19 @@ func (p *Prober) Cycle(ctx context.Context) {
 				log.Info("STALE: backend serving old watch-cache",
 					"backend", b.Name, "gap", gap, "fail", st.fail)
 			}
-		case gap > p.cfg.GapMin:
+		case gap > p.eff.gapMin:
 			st.ok = 0
 			log.Info("probe: gap above threshold — not draining yet",
 				"backend", b.Name, "gap", gap, "fail", st.fail,
-				"failCycles", p.cfg.FailCycles)
+				"failCycles", p.eff.failCycles)
 		case st.frozen > 0:
 			st.ok = 0
 			log.Info("probe: rv_cache frozen while rv_now advances — accumulating",
 				"backend", b.Name, "rvCache", rvCache, "rvNow", rvNow,
-				"frozen", st.frozen, "frozenCycles", p.cfg.FrozenCycles)
+				"frozen", st.frozen, "frozenCycles", p.eff.frozen)
 		default:
 			st.ok++
-			if wdir != "" && st.ok >= p.cfg.RecoverCycles {
+			if wdir != "" && st.ok >= p.eff.recoverC {
 				// state_exit parity: the shell needed RECOVER_CYCLES
 				// consecutive fully-fresh runs before clearing the
 				// latch — one lucky probe must not unblock
@@ -908,8 +1117,8 @@ func (p *Prober) Cycle(ctx context.Context) {
 				// Re-enable only after RecoverCycles consecutive
 				// fresh cycles (drained by us, or admin-disabled
 				// externally — reconciled the same way).
-				if st.ok >= p.cfg.RecoverCycles {
-					if p.cfg.Mode == ModeEnforce {
+				if st.ok >= p.eff.recoverC {
+					if p.eff.mode == ModeEnforce {
 						if err := p.haproxyServer(ctx, "enable", b.Name); err != nil {
 							log.Error("enable via HAProxy socket failed",
 								"backend", b.Name, "error", err)
@@ -921,8 +1130,8 @@ func (p *Prober) Cycle(ctx context.Context) {
 								fresh++
 							}
 							log.Info("ACTION: enabled backend — fresh again",
-								"backend", b.Name, "backend", p.cfg.BackendName,
-								"ok", p.cfg.RecoverCycles, "gap", gap)
+								"backend", b.Name, "backend", p.eff.backend,
+								"ok", p.eff.recoverC, "gap", gap)
 						}
 					} else {
 						log.Info("DRY-RUN: would enable backend",
@@ -960,7 +1169,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 			// disables (socket state is not persistent). Re-apply
 			// while HAProxy reports the server usable again; the
 			// recovery path above re-enables via the drained flag.
-			if p.cfg.Mode == ModeEnforce && b.up() {
+			if p.eff.mode == ModeEnforce && b.up() {
 				if err := p.haproxyServer(ctx, "disable", name); err != nil {
 					log.Error("re-apply disable failed",
 						"backend", name, "error", err)
@@ -981,7 +1190,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 			p.actions.WithLabelValues(name, "fence_skip").Inc()
 			continue
 		}
-		if p.cfg.Mode == ModeEnforce {
+		if p.eff.mode == ModeEnforce {
 			if err := p.haproxyServer(ctx, "disable", name); err != nil {
 				log.Error("disable via HAProxy socket failed",
 					"backend", name, "error", err)
@@ -995,7 +1204,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 			fresh--
 			p.actions.WithLabelValues(name, "disable").Inc()
 			log.Info("ACTION: disabled backend — watch-cache wedge",
-				"backend", name, "haproxyBackend", p.cfg.BackendName,
+				"backend", name, "haproxyBackend", p.eff.backend,
 				"freshRemaining", fresh)
 		} else {
 			log.Info("DRY-RUN: would disable backend — watch-cache wedge",
@@ -1022,7 +1231,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 	for _, vip := range vips {
 		st := p.states[vip.Name]
 		if wantVIPDisable {
-			if p.cfg.Mode == ModeEnforce {
+			if p.eff.mode == ModeEnforce {
 				if !st.drained || vip.up() {
 					if err := p.haproxyServer(ctx, "disable", vip.Name); err != nil {
 						log.Error("disable VIP via HAProxy socket failed",
@@ -1041,7 +1250,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 				p.actions.WithLabelValues(vip.Name, "dryrun_disable").Inc()
 			}
 		} else if st.drained || vip.maint() {
-			if p.cfg.Mode == ModeEnforce {
+			if p.eff.mode == ModeEnforce {
 				if err := p.haproxyServer(ctx, "enable", vip.Name); err != nil {
 					log.Error("enable VIP via HAProxy socket failed",
 						"backend", vip.Name, "error", err)
@@ -1079,4 +1288,229 @@ func (p *Prober) Cycle(ctx context.Context) {
 			p.pruneWatchdogFiles(wdir, backends)
 		}
 	}
+}
+
+// --- /etc/api-backend-guard.conf (standalone api-lb-vm defaults) ---
+//
+// hostconfig renders a KEY=VALUE shell-env conf on api-lb VMs (the
+// file the retired api-backend-guard.sh sourced). The standalone
+// agent feeds it as the fallback layer below the env knobs — env →
+// guard.conf → compiled defaults — and (via Config.GuardSrc) as a
+// per-cycle live overlay so conf writes/edits take effect without
+// an agent restart. Keys:
+//
+//	HAPROXY_SOCKET   admin unix socket → SocketPath
+//	HAPROXY_BACKEND  primary backend   → BackendName
+//	HAPROXY_BACKENDS full action set   → CompanionBackends (minus the primary)
+//	API_BACKENDS     "name=ip:port" list → StaticBackends
+//	MODE             dry-run|enforce   → Mode
+//	API_TOKEN_FILE/API_CA_FILE         → TokenFile/CAFile
+//	TOKEN_FILE/CA_FILE                 → short-spelling fallback for the same
+//	GAP_MIN/FAIL_CYCLES/FROZEN_CYCLES/RECOVER_CYCLES → thresholds
+//
+// (STATE_DIR is intentionally unmapped — the Go port keeps per-
+// backend counters in memory; the watchdog compat files live in
+// WatchdogStateDir, a different dir with different contents.)
+//
+// GuardDefaults is the parsed api-backend-guard.conf — every field
+// zero means "fall through to the compiled default".
+type GuardDefaults struct {
+	SocketPath        string
+	BackendName       string
+	CompanionBackends []string
+	StaticBackends    []StaticBackend
+	Mode              string
+	TokenFile         string
+	CAFile            string
+	GapMin            int64 // GAP_MIN
+	FailCycles        int   // FAIL_CYCLES
+	FrozenCycles      int   // FROZEN_CYCLES
+	RecoverCycles     int   // RECOVER_CYCLES
+}
+
+// GuardReloader re-reads the conf on every Get — the mtime-check-
+// free equivalent of watchdogconf.Reloader (the file is a few
+// hundred bytes; a plain re-read is the simplest correct semantics).
+// A missing file yields the zero GuardDefaults (no overlay), an
+// unreadable one keeps the last good parse — the shell `source`
+// semantics were "read fresh each run". Get is safe for concurrent
+// use.
+type GuardReloader struct {
+	Path string
+
+	mu  sync.Mutex
+	cur GuardDefaults
+}
+
+// NewGuardReloader seeds the reloader with an initial parse (the
+// zero value is fine — the first Get re-reads anyway).
+func NewGuardReloader(path string, initial GuardDefaults) *GuardReloader {
+	return &GuardReloader{Path: path, cur: initial}
+}
+
+// Get returns the freshest parse of Path, falling back to the last
+// good one on read/parse errors.
+func (r *GuardReloader) Get() GuardDefaults {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.Path == "" {
+		return r.cur
+	}
+	if g, err := LoadGuardConf(r.Path); err == nil {
+		r.cur = g
+	}
+	return r.cur
+}
+
+// LoadGuardConf parses the conf at path. A missing file is NOT an
+// error (pods and non-api-lb hosts never carry it) — it returns the
+// zero GuardDefaults and nil so callers can chain env → conf →
+// default unconditionally.
+//
+// Credential keys accept BOTH spellings: API_TOKEN_FILE/API_CA_FILE
+// is the original contract (the ansible api-backend-guard.conf.j2
+// template — deployed api-lb VMs still carry it and the retired
+// shell guard sourced exactly these), TOKEN_FILE/CA_FILE the short
+// spelling the Go port's first conf renders used. The API_-
+// prefixed (original) spelling wins when both are present — it is
+// the documented contract and the one converge manages.
+func LoadGuardConf(path string) (GuardDefaults, error) {
+	var g GuardDefaults
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return g, nil
+		}
+		return g, fmt.Errorf("read %s: %w", path, err)
+	}
+	vars := parseShellKV(string(data))
+	g.SocketPath = vars["HAPROXY_SOCKET"]
+	g.BackendName = vars["HAPROXY_BACKEND"]
+	g.Mode = vars["MODE"]
+	g.TokenFile = firstNonEmpty(vars["API_TOKEN_FILE"], vars["TOKEN_FILE"])
+	g.CAFile = firstNonEmpty(vars["API_CA_FILE"], vars["CA_FILE"])
+	g.GapMin, _ = strconv.ParseInt(vars["GAP_MIN"], 10, 64)
+	g.FailCycles = atoiOr(vars["FAIL_CYCLES"])
+	g.FrozenCycles = atoiOr(vars["FROZEN_CYCLES"])
+	g.RecoverCycles = atoiOr(vars["RECOVER_CYCLES"])
+	// HAPROXY_BACKENDS names the whole action set INCLUDING the
+	// primary backend (shell parity: `for b in $HAPROXY_BACKENDS`) —
+	// the primary already acts via BackendName, so only the rest are
+	// companions (double-applying an enable/disable is a no-op but
+	// logs and metrics would double-count it).
+	for _, b := range strings.Fields(vars["HAPROXY_BACKENDS"]) {
+		if b == "" || b == g.BackendName {
+			continue
+		}
+		g.CompanionBackends = append(g.CompanionBackends, b)
+	}
+	for _, e := range strings.Fields(vars["API_BACKENDS"]) {
+		if sb, ok := parseStaticBackend(e); ok {
+			g.StaticBackends = append(g.StaticBackends, sb)
+		}
+	}
+	return g, nil
+}
+
+// atoiOr parses a small integer conf value; empty/garbage → 0
+// (fall through to the caller's default).
+func atoiOr(v string) int {
+	n, _ := strconv.Atoi(strings.TrimSpace(v))
+	return n
+}
+
+// parseStaticBackend parses one API_BACKENDS element "name=ip:port"
+// (or bare "ip:port" — Name falls back to Addr), 1:1 with
+// watchdogconf's APIBackends entries.
+func parseStaticBackend(entry string) (StaticBackend, bool) {
+	name, addr, hasEq := strings.Cut(entry, "=")
+	if !hasEq {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			return StaticBackend{}, false
+		}
+		return StaticBackend{Name: entry, Addr: entry}, true
+	}
+	name, addr = strings.TrimSpace(name), strings.TrimSpace(addr)
+	if name == "" || addr == "" {
+		return StaticBackend{}, false
+	}
+	return StaticBackend{Name: name, Addr: addr}, true
+}
+
+// parseShellKV parses shell-style KEY=VALUE lines (the same grammar
+// watchdogconf uses — quotes honoured, `#` comments, `export `
+// prefixes tolerated). Duplicated here because watchdogconf's parser
+// is package-private and the guard conf is an apiprober input.
+func parseShellKV(data string) map[string]string {
+	vars := map[string]string{}
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if v, ok := strings.CutPrefix(line, "export "); ok {
+			line = strings.TrimSpace(v)
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		vars[key] = guardScalar(guardValue(strings.TrimSpace(val)))
+	}
+	return vars
+}
+
+// guardScalar strips surrounding single/double quotes.
+func guardScalar(v string) string {
+	if len(v) >= 2 {
+		if (v[0] == '"' && v[len(v)-1] == '"') ||
+			(v[0] == '\'' && v[len(v)-1] == '\'') {
+			return v[1 : len(v)-1]
+		}
+	}
+	return v
+}
+
+// guardValue cuts a raw VALUE at the first `#` that opens a bash
+// comment — outside quotes and at a word boundary. A `#` inside
+// quotes or glued to the previous word is literal (bash `source`
+// parity — same semantics as watchdogconf's parser).
+func guardValue(val string) string {
+	var out strings.Builder
+	out.Grow(len(val))
+	var quote byte
+	wordStart := true
+	for i := 0; i < len(val); i++ {
+		ch := val[i]
+		if quote != 0 {
+			out.WriteByte(ch)
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '"', '\'':
+			quote = ch
+			wordStart = false
+			out.WriteByte(ch)
+		case ' ', '\t':
+			wordStart = true
+			out.WriteByte(ch)
+		case '#':
+			if wordStart {
+				return strings.TrimSpace(out.String())
+			}
+			out.WriteByte(ch)
+		default:
+			wordStart = false
+			out.WriteByte(ch)
+		}
+	}
+	return strings.TrimSpace(out.String())
 }

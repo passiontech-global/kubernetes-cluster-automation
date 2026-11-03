@@ -34,11 +34,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/systemd"
 )
 
 // Defaults mirror the removed NPD config and the DaemonSet host mounts.
@@ -60,6 +63,24 @@ const (
 	defaultWatchdogStateDir = "/host/var/lib/node-watchdog"
 	defaultWatchdogLogFile  = "/host/var/log/node-watchdog.log"
 	defaultEventNamespace   = "default" // node events conventionally land in default
+
+	// NPD-monitor port defaults — see npd_monitors.go. The DaemonSet
+	// runs hostPID and bind-mounts host /dev/kmsg at /dev/kmsg, so
+	// /proc/1/mounts and /proc/uptime are already the HOST tables
+	// (a container procfs would only see the pod's mount ns).
+	defaultHostRoot           = "/host" // nsenter boundary for journalctl
+	defaultKmsgFile           = "/dev/kmsg"
+	defaultProcMountsFile     = "/proc/1/mounts"
+	defaultProcUptimeFile     = "/proc/uptime"
+	defaultKubeletJournalUnit = "k0sworker.service"
+)
+
+// defaultReadonlyTargets are the host mountpoints the
+// readonly-monitor port watches; defaultReadonlyFSTypes restricts
+// the check to real disk filesystems.
+var (
+	defaultReadonlyTargets = []string{"/", "/var", "/var/lib/k0s", "/var/openebs"}
+	defaultReadonlyFSTypes = []string{"ext4", "xfs", "btrfs"}
 )
 
 // Config carries the reporter knobs — all test-injectable.
@@ -75,6 +96,19 @@ type Config struct {
 	LogLookback      time.Duration // first-scan replay window (NPD lookback parity)
 	EventDedupTTL    time.Duration // series-aggregation window per reason+message
 
+	// --- NPD monitor port (npd_monitors.go) ---
+	HostRoot           string   // host fs root mount; "/" = running on the host
+	KmsgFile           string   // kernel ring source; <HostRoot>/dev/kmsg is the fallback
+	ProcMountsFile     string   // host mount table (hostPID → /proc/1/mounts)
+	ProcUptimeFile     string   // host uptime for the kmsg first-scan lookback
+	KubeletJournalUnit string   // journald unit the kubelet-stale monitor tails
+	ReadonlyTargets    []string // mountpoints watched for unexpected ro
+	ReadonlyFSTypes    []string // fstypes the ro check applies to
+
+	// journalFetch runs `journalctl <args>` on the host (nsenter
+	// wrapper when HostRoot != "/") — nil builds the default via the
+	// systemd package; tests substitute a fake.
+	journalFetch func(ctx context.Context, args ...string) (string, error)
 	// nowFn supplies the current time — seam for tests.
 	nowFn func() time.Time
 }
@@ -101,6 +135,33 @@ func (c *Config) applyDefaults() {
 	if c.EventDedupTTL <= 0 {
 		c.EventDedupTTL = defaultEventDedupTTL
 	}
+	if c.HostRoot == "" {
+		c.HostRoot = defaultHostRoot
+	}
+	if c.KmsgFile == "" {
+		c.KmsgFile = defaultKmsgFile
+	}
+	if c.ProcMountsFile == "" {
+		c.ProcMountsFile = defaultProcMountsFile
+	}
+	if c.ProcUptimeFile == "" {
+		c.ProcUptimeFile = defaultProcUptimeFile
+	}
+	if c.KubeletJournalUnit == "" {
+		c.KubeletJournalUnit = defaultKubeletJournalUnit
+	}
+	if len(c.ReadonlyTargets) == 0 {
+		c.ReadonlyTargets = defaultReadonlyTargets
+	}
+	if len(c.ReadonlyFSTypes) == 0 {
+		c.ReadonlyFSTypes = defaultReadonlyFSTypes
+	}
+	if c.journalFetch == nil {
+		sd := systemd.New(systemd.Config{HostRoot: c.HostRoot})
+		c.journalFetch = func(ctx context.Context, args ...string) (string, error) {
+			return sd.Exec(ctx, "journalctl", args...)
+		}
+	}
 	if c.nowFn == nil {
 		c.nowFn = time.Now
 	}
@@ -124,6 +185,23 @@ type Reporter struct {
 	logScanned  bool
 	evSeq       atomic.Uint64            // event-name uniqueness suffix
 	emittedEvts map[string]*emittedEvent // dedup key → created/aggregated Event
+
+	// NPD-monitor port state (npd_monitors.go). Journal cursors are
+	// µs wall timestamps — 0 bounds the first fetch to LogLookback.
+	kubeletJournalUS int64    // kubelet-stale monitor cursor
+	kernelJournalUS  int64    // journalctl -k fallback cursor
+	kmsgJournalMode  bool     // permanent fallback once kmsg can't be opened
+	kmsgSrc          *os.File // lazily-opened O_NONBLOCK kmsg handle
+	kmsgPending      []byte   // carried partial kmsg record
+	kmsgScanned      bool     // first drain done → lookback replay disarmed
+
+	// Permanent-condition bookkeeping for the NPD monitors —
+	// KernelDeadlock latches True for the process lifetime (NPD
+	// permanent parity); ReadonlyFilesystem follows the live mounts.
+	kernelDeadlock    bool
+	kernelDeadlockMsg string
+	readonlyFS        bool
+	readonlyFSMsg     string
 }
 
 // New returns a Reporter and registers its metrics on reg. A nil
@@ -202,6 +280,29 @@ func (r *Reporter) Cycle(ctx context.Context) {
 	}
 	if err := r.syncLogEvents(ctx); err != nil {
 		slog.Error("nodereporter: event sync failed",
+			"node", r.cfg.NodeName, "error", err)
+		ok = false
+	}
+	// NPD monitor ports — each reports its own error so one sick
+	// source never starves the others; syncNPDConditions runs last so
+	// it ships whatever state the monitors computed this cycle.
+	if err := r.syncKubeletJournal(ctx); err != nil {
+		slog.Error("nodereporter: kubelet-stale journal scan failed",
+			"node", r.cfg.NodeName, "error", err)
+		ok = false
+	}
+	if err := r.syncKernelMonitor(ctx); err != nil {
+		slog.Error("nodereporter: kernel monitor failed",
+			"node", r.cfg.NodeName, "error", err)
+		ok = false
+	}
+	if err := r.syncReadonlyMounts(ctx); err != nil {
+		slog.Error("nodereporter: readonly filesystem check failed",
+			"node", r.cfg.NodeName, "error", err)
+		ok = false
+	}
+	if err := r.syncNPDConditions(ctx); err != nil {
+		slog.Error("nodereporter: npd condition sync failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}

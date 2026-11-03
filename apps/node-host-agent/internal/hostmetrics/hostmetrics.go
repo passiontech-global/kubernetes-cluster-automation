@@ -55,6 +55,7 @@ package hostmetrics
 import (
 	"bufio"
 	"encoding/pem"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -67,6 +68,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"golang.org/x/sys/unix"
 	"sigs.k8s.io/yaml"
 )
@@ -238,6 +240,21 @@ type Collector struct {
 	descF2B         *prometheus.Desc
 	descEgressRelay *prometheus.Desc
 
+	// Legacy node-watchdog aliases — the prom_emit textfile series
+	// the fluxcd PrometheusRules still alert on
+	// (node_watchdog_state{signal}, node_watchdog_egress_relay{target}).
+	// Emitted alongside the node_host_agent_* names so the same
+	// registry serves pods AND the standalone textfile writer keeps
+	// the node-exporter contract on out-of-cluster hosts.
+	descWatchdogLegacy    *prometheus.Desc
+	descEgressRelayLegacy *prometheus.Desc
+
+	// descMeta maps each desc to its fqName/help for textfile
+	// rendering — a prometheus.Metric carries the Desc but the
+	// fqName is only reachable through Desc.String(), so the writer
+	// keeps its own table.
+	descMeta map[*prometheus.Desc]descMeta
+
 	// cpu-delivered probe bookkeeping (mu): the busy-loop runs in a
 	// goroutine — a scrape triggers it and serves the last result;
 	// a scrape must never block up to ~6s on steal measurement.
@@ -310,12 +327,63 @@ func New(cfg Config) *Collector {
 		"node_overlay_egress_relay_active",
 		"Egress target currently routed via the overlay relay (1) or direct underlay (0).",
 		[]string{"target"}, nil)
+	c.descWatchdogLegacy = prometheus.NewDesc(
+		"node_watchdog_state",
+		"Signal dang active tren node-watchdog (1 = state file ton tai).",
+		[]string{"signal"}, nil)
+	c.descEgressRelayLegacy = prometheus.NewDesc(
+		"node_watchdog_egress_relay",
+		"Egress target dang route qua overlay relay (1) hay direct (0).",
+		[]string{"target"}, nil)
+
+	c.descMeta = map[*prometheus.Desc]descMeta{}
+	for _, d := range []struct {
+		desc *prometheus.Desc
+		name string
+		help string
+	}{
+		{c.descWatchdog, "node_host_agent_watchdog_state",
+			"node-watchdog state-* latch present (1) or previously seen and cleared (0)."},
+		{c.descWatchdogLegacy, "node_watchdog_state",
+			"Signal dang active tren node-watchdog (1 = state file ton tai)."},
+		{c.descNebUp, "node_host_agent_nebula_interface_up",
+			"Nebula interface operstate is up (emitted only when the interface exists)."},
+		{c.descNebRoute, "node_host_agent_nebula_route_present",
+			"A host route via the Nebula interface exists (emitted only when the interface exists)."},
+		{c.descNebCertDays, "node_host_agent_nebula_cert_days_left",
+			"Days until the nebula host certificate notAfter (emitted only when the cert parses)."},
+		{c.descK0sDrift, "node_k0s_config_drift",
+			"/etc/k0s/k0s.yaml drifted vs expected config (1=drift)."},
+		{c.descPSI, "node_watchdog_psi_cpu_some_avg60",
+			"PSI cpu some avg60 — share of time runnable tasks stalled (runner's overload signal)."},
+		{c.descCPURatio, "node_cpu_delivered_ratio",
+			"Share of 1 vCPU actually delivered by the hypervisor — busy-loop probe (~0.3 cpu-s, 1.0 = no steal)."},
+		{c.descCPUWall, "node_cpu_delivered_probe_wall_seconds",
+			"Wall-clock the cpu-delivered probe ran — abnormal growth = the probe itself stalled."},
+		{c.descF2B, "node_fail2ban_banned_ips",
+			"Currently banned IPs per fail2ban jail (emitted only when the banned file exists)."},
+		{c.descEgressRelay, "node_overlay_egress_relay_active",
+			"Egress target currently routed via the overlay relay (1) or direct underlay (0)."},
+		{c.descEgressRelayLegacy, "node_watchdog_egress_relay",
+			"Egress target dang route qua overlay relay (1) hay direct (0)."},
+	} {
+		c.descMeta[d.desc] = descMeta{name: d.name, help: d.help}
+	}
 	return c
+}
+
+// descMeta carries the fqName + help text of one descriptor — the
+// textfile writer's header lines (a Metric's Desc does not expose the
+// name programmatically).
+type descMeta struct {
+	name string
+	help string
 }
 
 // Describe implements prometheus.Collector.
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.descWatchdog
+	ch <- c.descWatchdogLegacy
 	ch <- c.descNebUp
 	ch <- c.descNebRoute
 	ch <- c.descNebCertDays
@@ -325,6 +393,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.descCPUWall
 	ch <- c.descF2B
 	ch <- c.descEgressRelay
+	ch <- c.descEgressRelayLegacy
 }
 
 // Collect implements prometheus.Collector.
@@ -428,6 +497,10 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, certDays int64,
 		}
 		ch <- prometheus.MustNewConstMetric(c.descWatchdog,
 			prometheus.GaugeValue, v, c.cfg.NodeName, name)
+		// Legacy alias: prom_emit's node_watchdog_state{signal} —
+		// the fluxcd PrometheusRules query this exact series.
+		ch <- prometheus.MustNewConstMetric(c.descWatchdogLegacy,
+			prometheus.GaugeValue, v, name)
 	}
 }
 
@@ -929,5 +1002,121 @@ func (c *Collector) collectEgressRelay(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(c.descEgressRelay,
 			prometheus.GaugeValue, v, r)
+		// Legacy alias: prom_emit's node_watchdog_egress_relay{target}.
+		ch <- prometheus.MustNewConstMetric(c.descEgressRelayLegacy,
+			prometheus.GaugeValue, v, r)
 	}
+}
+
+// --- node-exporter textfile rendering (standalone prom_emit port) ---
+
+// TextfileName is the prom file the standalone writer renders —
+// node-watchdog.prom, the same name prom_emit used.
+const TextfileName = "node-watchdog.prom"
+
+// textfileTmpName is WriteTextfile's staging name. It MUST NOT
+// match node_exporter's *.prom textfile glob — the collector would
+// ingest a partially-written file (and a ".*-name.prom" prefix
+// scheme DOES match: glob * swallows the leading dot).
+const textfileTmpName = TextfileName + ".tmp"
+
+// collectAll drains a full Collect into a slice — the textfile
+// writer's scrape (Collect pushes; a reader must consume
+// concurrently or the collector blocks on the channel).
+func (c *Collector) collectAll() []prometheus.Metric {
+	ch := make(chan prometheus.Metric, 64)
+	go func() {
+		c.Collect(ch)
+		close(ch)
+	}()
+	var out []prometheus.Metric
+	for m := range ch {
+		out = append(out, m)
+	}
+	return out
+}
+
+// WriteTextfile renders the full metric set in node-exporter
+// textfile format and atomically installs it as
+// <dir>/node-watchdog.prom (tmp + rename — node_exporter only reads
+// complete files). This is the standalone equivalent of prom_emit:
+// on out-of-cluster hosts (api-lb VMs, kine DB VM, hubs) there is no
+// Prometheus scrape, so the same series the /metrics endpoint
+// exports are dropped into the textfile dir instead.
+func (c *Collector) WriteTextfile(dir string) error {
+	series := map[string][]string{}
+	metaByName := map[string]descMeta{}
+	var names []string
+	for _, m := range c.collectAll() {
+		meta, ok := c.descMeta[m.Desc()]
+		if !ok {
+			continue
+		}
+		var dm dto.Metric
+		if err := m.Write(&dm); err != nil {
+			continue
+		}
+		if dm.Gauge == nil || dm.Gauge.Value == nil {
+			continue
+		}
+		var sb strings.Builder
+		sb.WriteString(meta.name)
+		if len(dm.Label) > 0 {
+			sb.WriteByte('{')
+			for i, l := range dm.Label {
+				if i > 0 {
+					sb.WriteByte(',')
+				}
+				sb.WriteString(l.GetName())
+				sb.WriteString(`="`)
+				sb.WriteString(escapeLabelValue(l.GetValue()))
+				sb.WriteByte('"')
+			}
+			sb.WriteByte('}')
+		}
+		sb.WriteByte(' ')
+		sb.WriteString(strconv.FormatFloat(dm.Gauge.GetValue(), 'g', -1, 64))
+		if _, seen := series[meta.name]; !seen {
+			names = append(names, meta.name)
+			metaByName[meta.name] = meta
+		}
+		series[meta.name] = append(series[meta.name], sb.String())
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	for _, name := range names {
+		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s gauge\n",
+			name, metaByName[name].help, name)
+		samples := series[name]
+		sort.Strings(samples)
+		// Dedupe identical sample lines — a duplicated series makes
+		// the textfile collector reject the WHOLE file (the same
+		// constraint prom_emit's `emitted` bookkeeping guarded).
+		last := ""
+		for _, s := range samples {
+			if s == last {
+				continue
+			}
+			last = s
+			b.WriteString(s)
+			b.WriteByte('\n')
+		}
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp := filepath.Join(dir, textfileTmpName)
+	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, TextfileName))
+}
+
+// escapeLabelValue applies the textfile-format label escaping
+// (backslash, double-quote and newline).
+func escapeLabelValue(v string) string {
+	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+	return r.Replace(v)
 }

@@ -1,0 +1,40 @@
+package hubsync
+
+import (
+	"fmt"
+	"path"
+	"strings"
+)
+
+// systemdUnit renders the remote node-host-agent.service for target
+// t — the standalone-mode unit hub_converge installed:
+//
+//	ExecStart <remote bin> --standalone --node-name=<name>
+//
+// with the host-root / vars / nebula-certs env wiring the pod's
+// DaemonSet env provides in-cluster.
+func systemdUnit(t Target, remoteBinary, remoteVarsDir, remoteCertsDir string) string {
+	return fmt.Sprintf(`[Unit]
+Description=node-host-agent (standalone host converge agent)
+Documentation=https://github.com/passiontech-global/kubernetes-node-automation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=NODE_HOST_AGENT_HOST_ROOT=/
+Environment=NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR=%s
+Environment=NODE_HOST_AGENT_NEBULA_CERTS_DIR=%s
+ExecStart=%s --standalone --node-name=%s
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+`, remoteVarsDir, remoteCertsDir, remoteBinary, t.Name)
+}
+
+// unitName derives the systemd unit name from UnitPath.
+func unitName(unitPath string) string {
+	return path.Base(strings.TrimSpace(unitPath))
+}
