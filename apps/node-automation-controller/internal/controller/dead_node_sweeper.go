@@ -137,6 +137,11 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 			log.Info("UNTAINT: node Ready again -> out-of-service removed", "node", n.Name)
 		}
 	}
+	// nodeByName holds all the node data the rest of the sweep needs —
+	// the slice copy stays reachable through it, so only the redundant
+	// slice header is dropped here (keeps the diff honest about which
+	// references are actually dead).
+	nodes = nil
 
 	// Every node Ready = nothing can be fenced this cycle, so skip
 	// the cluster-wide pod list entirely: it is by far the biggest
@@ -148,7 +153,13 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 		return nil
 	}
 
-	pods, err := s.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	// Server-side phase filter: terminal pods can never be "stuck
+	// Terminating" evidence, so they are dead weight in the biggest
+	// read this module makes. The in-code phase check stays — fake
+	// clientsets ignore field selectors and the belt costs nothing.
+	pods, err := s.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
+	})
 	if err != nil {
 		return err
 	}
@@ -157,6 +168,10 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	stuck := map[string]int{}
 	for i := range pods.Items {
 		p := &pods.Items[i]
+		if p.Status.Phase == corev1.PodSucceeded ||
+			p.Status.Phase == corev1.PodFailed {
+			continue // mirrors the FieldSelector for fake clients
+		}
 		if p.DeletionTimestamp == nil || p.Spec.NodeName == "" {
 			continue
 		}
@@ -165,6 +180,9 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 		}
 		stuck[p.Spec.NodeName]++
 	}
+	// The probes/lists/taints below only need the per-node counts —
+	// release the full PodList before they run.
+	pods = nil
 	if len(stuck) == 0 {
 		log.Info("sweep done")
 		return nil

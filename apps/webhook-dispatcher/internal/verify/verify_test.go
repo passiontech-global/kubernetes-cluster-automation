@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 	"testing"
 )
 
@@ -36,6 +37,36 @@ func TestSignature(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := Signature(tc.secret, tc.body, tc.header); got != tc.want {
 				t.Fatalf("Signature=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasValidSignatureFormat(t *testing.T) {
+	body := []byte(`{"zen":"Keep it simple."}`)
+	valid := sign("s3cret", body)
+	cases := []struct {
+		name   string
+		secret string
+		header string
+		want   bool
+	}{
+		{"well-formed", "s3cret", valid, true},
+		{"well-formed wrong sig", "s3cret", sign("other", body), true},
+		{"uppercase hex", "s3cret", "sha256=" + strings.ToUpper(valid[7:]), true},
+		{"empty secret", "", valid, false},
+		{"missing header", "s3cret", "", false},
+		{"missing sha256= prefix", "s3cret", valid[7:], false},
+		{"sha1 scheme", "s3cret", "sha1=" + valid[7:], false},
+		{"not hex", "s3cret", "sha256=" + strings.Repeat("z", 64), false},
+		{"short hex", "s3cret", "sha256=" + valid[7:20], false},
+		{"long hex", "s3cret", "sha256=" + valid[7:] + "0", false},
+		{"hex with newline", "s3cret", "sha256=" + valid[7:71] + "\n000", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := HasValidSignatureFormat(tc.secret, tc.header); got != tc.want {
+				t.Fatalf("HasValidSignatureFormat=%v want %v", got, tc.want)
 			}
 		})
 	}

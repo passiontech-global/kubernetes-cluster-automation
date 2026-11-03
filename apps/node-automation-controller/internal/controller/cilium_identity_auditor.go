@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -71,6 +72,14 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		metrics.IncError(ciliumAuditQueue)
 		return err
 	}
+	// Keep only the names — the audit never reads identity bodies, and
+	// dropping the whole UnstructuredList here lets GC reclaim it while
+	// the two cluster-wide lists below are still in flight.
+	idNames := make([]string, 0, len(ids.Items))
+	for i := range ids.Items {
+		idNames = append(idNames, ids.Items[i].GetName())
+	}
+	ids = nil
 
 	used := map[string]struct{}{}
 	eps, err := a.dyn.Resource(ciliumEndpointGVR).Namespace(metav1.NamespaceAll).
@@ -84,28 +93,41 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 			used[id] = struct{}{}
 		}
 	}
+	eps = nil // used-map extracted — release before the pod list lands
+
+	// Server-side phase filter: terminal pods hold no live endpoints, so
+	// they are dead weight in the biggest read this module makes. The
+	// in-code phase check stays — fake clientsets ignore field
+	// selectors and the belt costs nothing.
 	pods, err := a.cs.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+		List(ctx, metav1.ListOptions{
+			FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
+		})
 	if err != nil {
 		metrics.IncError(ciliumAuditQueue)
 		return err
 	}
 	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.Status.Phase == corev1.PodSucceeded ||
+			p.Status.Phase == corev1.PodFailed {
+			continue
+		}
 		if v := strings.TrimSpace(
-			pods.Items[i].Annotations[ciliumIDAnnotation]); v != "" {
+			p.Annotations[ciliumIDAnnotation]); v != "" {
 			used[v] = struct{}{}
 		}
 	}
+	pods = nil
 
 	var orphans []string
-	for i := range ids.Items {
-		name := ids.Items[i].GetName()
+	for _, name := range idNames {
 		if _, ok := used[name]; !ok {
 			orphans = append(orphans, name)
 		}
 	}
 	if len(orphans) == 0 {
-		log.Info("cilium identities clean", "total", len(ids.Items))
+		log.Info("cilium identities clean", "total", len(idNames))
 		return nil
 	}
 	sort.Strings(orphans)
@@ -118,13 +140,13 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		metrics.IncError(ciliumAuditQueue)
 		log.Info("ORPHANED cilium identities above threshold — identity "+
 			"leak, 65k range exhaustion risk (detect-only, no deletion)",
-			"orphans", len(orphans), "total", len(ids.Items),
+			"orphans", len(orphans), "total", len(idNames),
 			"threshold", ciliumOrphanMax, "sample", sample)
 		return nil
 	}
 	log.Info("orphaned cilium identities detected — below threshold, "+
 		"watching (detect-only, no deletion)",
-		"orphans", len(orphans), "total", len(ids.Items), "sample", sample)
+		"orphans", len(orphans), "total", len(idNames), "sample", sample)
 	return nil
 }
 

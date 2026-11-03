@@ -24,6 +24,7 @@ package systemd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"time"
@@ -33,6 +34,11 @@ import (
 const (
 	defaultHostRoot = "/host"
 	defaultTimeout  = 30 * time.Second
+	// maxCmdOutputBytes caps the stdout retained per spawned command —
+	// a log storm (journalctl -10min snapshot on a sick node) must not
+	// push unbounded child output into the agent's heap. The rest is
+	// drained and discarded so the child can still exit cleanly.
+	maxCmdOutputBytes = 16 << 20
 )
 
 // Config carries the exec seam — all test-injectable.
@@ -59,8 +65,20 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RunCmd == nil {
 		c.RunCmd = func(ctx context.Context, argv []string) (string, error) {
-			out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).Output()
-			return string(out), err
+			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				return "", err
+			}
+			if err := cmd.Start(); err != nil {
+				return "", err
+			}
+			out, _ := io.ReadAll(io.LimitReader(stdout, maxCmdOutputBytes))
+			_, _ = io.Copy(io.Discard, stdout) // drain so Wait cannot deadlock
+			// Partial output is returned alongside the error just
+			// like exec.Cmd.Output (callers count grep hits —
+			// truncated text is still useful evidence).
+			return string(out), cmd.Wait()
 		}
 	}
 }

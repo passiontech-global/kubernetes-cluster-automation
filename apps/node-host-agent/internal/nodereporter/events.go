@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -71,6 +72,21 @@ var logRules = []logRule{
 // message/note payload (~1KiB); watchdog lines are far shorter but a
 // garbage log line must not fail the create.
 const maxEventNote = 1024
+
+const (
+	// maxLogReadBytes bounds one tail read. The watchdog caps its own
+	// log at ~1MB, so a file far beyond that means broken rotation or
+	// a flood — the first scan jumps to the last maxLogReadBytes
+	// instead of slurping the whole file into heap.
+	maxLogReadBytes = 4 << 20
+	// maxLogPendingBytes bounds the carried partial-line buffer — a
+	// line that never terminates cannot grow the carry forever.
+	maxLogPendingBytes = 64 << 10
+	// maxEmittedEvents bounds the dedup map after TTL pruning — a
+	// flood of distinct reason+message pairs evicts oldest-first
+	// instead of growing without limit.
+	maxEmittedEvents = 1024
+)
 
 // emittedEvent tracks one created Event for series aggregation.
 type emittedEvent struct {
@@ -123,6 +139,16 @@ func (r *Reporter) readNewLogLines() ([][]byte, bool, error) {
 		r.logPending = nil
 		replay = true // retained-tail rescan → lookback filter
 	}
+	// First scan of an oversized file: jump to the last
+	// maxLogReadBytes and drop the partial line at the cut — the cap
+	// exists so a log that outgrew the ~1MB watchdog cap (broken
+	// rotation, flood) is never slurped whole into RAM.
+	midSeek := false
+	if r.logOffset == 0 && fi.Size() > maxLogReadBytes {
+		r.logOffset = fi.Size() - maxLogReadBytes
+		r.logPending = nil
+		midSeek = true
+	}
 	f, err := os.Open(r.cfg.WatchdogLogFile)
 	if err != nil {
 		return nil, replay, fmt.Errorf("open %s: %w", r.cfg.WatchdogLogFile, err)
@@ -131,7 +157,7 @@ func (r *Reporter) readNewLogLines() ([][]byte, bool, error) {
 	if _, err := f.Seek(r.logOffset, io.SeekStart); err != nil {
 		return nil, replay, fmt.Errorf("seek %s: %w", r.cfg.WatchdogLogFile, err)
 	}
-	data, err := io.ReadAll(f)
+	data, err := io.ReadAll(io.LimitReader(f, maxLogReadBytes))
 	if err != nil {
 		return nil, replay, fmt.Errorf("read %s: %w", r.cfg.WatchdogLogFile, err)
 	}
@@ -145,6 +171,16 @@ func (r *Reporter) readNewLogLines() ([][]byte, bool, error) {
 	// appended between Stat and Read aren't double-read next cycle.
 	r.logOffset += int64(len(data))
 
+	// A mid-file seek lands inside a line — discard everything up to
+	// the first newline; the head of that line was never read.
+	if midSeek {
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			data = data[i+1:]
+		} else {
+			data = nil
+		}
+	}
+
 	buf := append(r.logPending, data...)
 	r.logPending = nil
 	if len(buf) == 0 {
@@ -152,13 +188,34 @@ func (r *Reporter) readNewLogLines() ([][]byte, bool, error) {
 	}
 	last := bytes.LastIndexByte(buf, '\n')
 	if last < 0 {
-		r.logPending = buf // whole tail is one unfinished line
+		// The whole tail is one unfinished line — keep only the last
+		// maxLogPendingBytes so a never-terminated line cannot grow
+		// the carry buffer without bound.
+		if len(buf) > maxLogPendingBytes {
+			buf = buf[len(buf)-maxLogPendingBytes:]
+		}
+		r.logPending = buf
 		return nil, replay, nil
 	}
 	if rem := buf[last+1:]; len(rem) > 0 {
+		if len(rem) > maxLogPendingBytes {
+			rem = rem[len(rem)-maxLogPendingBytes:]
+		}
 		r.logPending = append([]byte(nil), rem...)
 	}
-	return bytes.Split(buf[:last], []byte("\n")), replay, nil
+	// Split in place — bytes.Split on a big chunk materialises a
+	// [][]byte header per line; IndexByte iteration avoids that.
+	var lines [][]byte
+	for rest := buf[:last]; len(rest) > 0; {
+		i := bytes.IndexByte(rest, '\n')
+		if i < 0 {
+			lines = append(lines, rest)
+			break
+		}
+		lines = append(lines, rest[:i])
+		rest = rest[i+1:]
+	}
+	return lines, replay, nil
 }
 
 // splitLogLine peels the leading timestamp token (filelog
@@ -275,12 +332,30 @@ func (r *Reporter) emitEvent(ctx context.Context, reason, note string) error {
 
 // pruneEmitted drops dedup entries past the TTL — the apiserver GCs
 // Events at ~1h, so aggregation targets older than that are gone and
-// the map would grow unboundedly otherwise.
+// the map would grow unboundedly otherwise. The map is additionally
+// hard-capped: a flood of distinct reason+message pairs evicts the
+// least-recently-observed entries first.
 func (r *Reporter) pruneEmitted() {
 	now := r.cfg.nowFn()
 	for k, e := range r.emittedEvts {
 		if now.Sub(e.at) > r.cfg.EventDedupTTL {
 			delete(r.emittedEvts, k)
+		}
+	}
+	if len(r.emittedEvts) > maxEmittedEvents {
+		// Single pass: collect (key, at), sort freshest-first, drop
+		// everything past the cap — no per-eviction map rescan.
+		type observed struct {
+			key string
+			at  time.Time
+		}
+		es := make([]observed, 0, len(r.emittedEvts))
+		for k, e := range r.emittedEvts {
+			es = append(es, observed{k, e.at})
+		}
+		slices.SortFunc(es, func(a, b observed) int { return b.at.Compare(a.at) })
+		for _, o := range es[maxEmittedEvents:] {
+			delete(r.emittedEvts, o.key)
 		}
 	}
 }

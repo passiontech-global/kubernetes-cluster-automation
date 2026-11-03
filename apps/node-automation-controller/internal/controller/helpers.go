@@ -158,10 +158,19 @@ func hasTaint(taints []corev1.Taint, key string) bool {
 // dropTaintsByKey returns taints with every entry matching key removed.
 func dropTaintsByKey(taints []corev1.Taint, key string) []corev1.Taint {
 	out := taints[:0]
+	changed := false
 	for _, t := range taints {
 		if t.Key != key {
 			out = append(out, t)
+		} else {
+			changed = true
 		}
+	}
+	if changed {
+		// Zero the tail — the filtered entries would otherwise stay
+		// reachable (and their strings uncollectable) through the
+		// shared backing array.
+		clear(taints[len(out):])
 	}
 	return out
 }

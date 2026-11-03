@@ -68,13 +68,25 @@ func New(secret string, b Backend) *Handler {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	delivery := r.Header.Get("X-GitHub-Delivery")
 	event := r.Header.Get("X-GitHub-Event")
+	sig := r.Header.Get("X-Hub-Signature-256")
+
+	// Reject missing/malformed signatures before touching the body:
+	// port scanners and unauthenticated probes must not force a body
+	// buffer allocation. The HMAC check below still runs on the full
+	// body for well-formed headers.
+	if !verify.HasValidSignatureFormat(h.secret, sig) {
+		slog.Warn("webhook rejected: bad signature",
+			"delivery", delivery, "event", event)
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return
+	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
 		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	if !verify.Signature(h.secret, body, r.Header.Get("X-Hub-Signature-256")) {
+	if !verify.Signature(h.secret, body, sig) {
 		slog.Warn("webhook rejected: bad signature",
 			"delivery", delivery, "event", event)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)

@@ -783,13 +783,9 @@ func removeStateFile(dir, name string) error {
 	return err
 }
 
-// splitLines splits text into lines without a trailing-empty artifact.
-func splitLines(text string) []string {
-	if text == "" {
-		return nil
-	}
-	return strings.Split(strings.TrimRight(text, "\n"), "\n")
-}
+// splitLines was removed: line iteration is done in place with
+// strings.Cut at each call site — no intermediate []string on
+// potentially multi-MiB journal/proc text.
 
 // writeState writes a bookkeeping file under the state dir.
 func (h *Hygiene) writeState(name, content string) {
@@ -899,6 +895,12 @@ func (h *Hygiene) pidAgeSeconds(pid int) (float64, error) {
 
 // --- external interaction defaults (all behind Config seams) ---
 
+// maxJournalBytes caps the journal text retained per read — a log
+// storm between probe cycles must not push unbounded stdout into the
+// agent's heap (the rest is drained and discarded so the child can
+// still exit cleanly).
+const maxJournalBytes = 16 << 20
+
 // journalctl is the default journal reader: `timeout 15 journalctl -u
 // <unit> --since <ts> --no-pager`. Output-only on error is NOT done
 // here — callers map errors to empty text (grep -c == 0 parity).
@@ -908,8 +910,16 @@ func journalctl(ctx context.Context, unit string, since time.Time) (string, erro
 	cmd := exec.CommandContext(cctx, "journalctl", "-u", unit,
 		"--since", since.Format("2006-01-02 15:04:05"), "--no-pager")
 	cmd.Env = scrubSystemdEnv(os.Environ())
-	out, err := cmd.Output()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		return "", err
+	}
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	out, _ := io.ReadAll(io.LimitReader(stdout, maxJournalBytes))
+	_, _ = io.Copy(io.Discard, stdout) // drain so Wait cannot deadlock
+	if err := cmd.Wait(); err != nil {
 		return "", err
 	}
 	return string(out), nil
@@ -940,6 +950,7 @@ func scrubSystemdEnv(env []string) []string {
 		}
 		out = append(out, e)
 	}
+	clear(env[len(out):]) // drop refs held by the filtered tail
 	return out
 }
 
@@ -1004,10 +1015,14 @@ func pgWireOK(ctx context.Context, hostport string) bool {
 
 // probeClient is shared by every probeAnyCode call — a fresh
 // Transport per probe would pin an idle connection (and its TLS
-// buffers) on the apiserver between cycles.
-var probeClient = &http.Client{Transport: &http.Transport{
-	TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // mirrors curl -ks
-}}
+// buffers) on the apiserver between cycles. IdleConnTimeout bounds
+// that pool (90s > the 60s cycle, so the conn is reused each probe).
+var probeClient = func() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
+	tr.IdleConnTimeout = 90 * time.Second
+	return &http.Client{Transport: tr}
+}()
 
 // probeAnyCode is the default liveness probe: ANY HTTP response code
 // means ALIVE — the shell targets a process-level wedge (event loop
@@ -1025,7 +1040,7 @@ func probeAnyCode(ctx context.Context, url string, timeout time.Duration) bool {
 		return false
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	return true
 }
 
@@ -1198,7 +1213,7 @@ func (h *Hygiene) listRV(ctx context.Context, endpoint string, cached bool) (int
 	if err != nil {
 		return 0, false
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
 		return 0, false
 	}

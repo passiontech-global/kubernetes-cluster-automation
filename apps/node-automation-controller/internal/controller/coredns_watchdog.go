@@ -109,6 +109,9 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	for _, p := range podList.Items {
 		podIP[p.Name] = p.Status.PodIP
 	}
+	// Only name->IP feeds the layers below — release the full PodList
+	// before the log streams, EndpointSlice lists and DNS probes run.
+	podList = nil
 	// Prune streaks of pods that vanished (recreates change names).
 	for name := range w.streak {
 		if _, ok := podIP[name]; !ok {
@@ -308,7 +311,9 @@ func (w *coreDNSWatchdog) logHit(ctx context.Context, pod string) string {
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for rest := string(data); rest != ""; {
+		line, after, _ := strings.Cut(rest, "\n")
+		rest = after
 		if corednsLogRE.MatchString(line) {
 			return line
 		}
@@ -328,16 +333,33 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) string {
 		return svcs.Items[i].CreationTimestamp.Time.
 			After(svcs.Items[j].CreationTimestamp.Time)
 	})
-	for i := range svcs.Items {
-		if i >= 8 { // bash: top-8 newest BEFORE the age filter
-			break
-		}
-		svc := &svcs.Items[i]
-		if time.Since(svc.CreationTimestamp.Time) >= corednsLogSinceS*time.Second {
+	type svcCand struct {
+		ns, name string
+		created  time.Time
+	}
+	n := len(svcs.Items)
+	if n > 8 { // bash: top-8 newest BEFORE the age filter
+		n = 8
+	}
+	cands := make([]svcCand, 0, n)
+	for i := 0; i < n; i++ {
+		s := &svcs.Items[i]
+		cands = append(cands, svcCand{
+			ns:      s.Namespace,
+			name:    s.Name,
+			created: s.CreationTimestamp.Time,
+		})
+	}
+	// Release the cluster-wide ServiceList before issuing per-service
+	// EndpointSlice queries.
+	svcs = nil
+
+	for _, svc := range cands {
+		if time.Since(svc.created) >= corednsLogSinceS*time.Second {
 			continue
 		}
-		eps, err := w.cs.DiscoveryV1().EndpointSlices(svc.Namespace).List(ctx,
-			metav1.ListOptions{LabelSelector: "kubernetes.io/service-name=" + svc.Name})
+		eps, err := w.cs.DiscoveryV1().EndpointSlices(svc.ns).List(ctx,
+			metav1.ListOptions{LabelSelector: "kubernetes.io/service-name=" + svc.name})
 		if err != nil {
 			continue
 		}
@@ -345,7 +367,7 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) string {
 			for _, ep := range es.Endpoints {
 				// bash: conditions.ready == true — nil does NOT count.
 				if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
-					return svc.Name + "." + svc.Namespace + ".svc.cluster.local"
+					return svc.name + "." + svc.ns + ".svc.cluster.local"
 				}
 			}
 		}

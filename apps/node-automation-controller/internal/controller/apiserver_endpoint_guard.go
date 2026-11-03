@@ -216,7 +216,7 @@ func SetupAPIServerEndpointGuard(mgr ctrl.Manager, cs kubernetes.Interface) erro
 	// filtered one cannot be built — nil config on test doubles or a
 	// construction failure — the guard works either way, just noisier.
 	if cfg := mgr.GetConfig(); cfg != nil {
-		if filtered, err := endpointsWarningClient(cfg); err == nil {
+		if filtered, err := endpointsWarningClient(cfg, cs); err == nil {
 			g.cs = filtered
 		} else {
 			g.log.Error(err, "filtered clientset build failed — sharing the noisy default client")
@@ -225,12 +225,31 @@ func SetupAPIServerEndpointGuard(mgr ctrl.Manager, cs kubernetes.Interface) erro
 	return mgr.Add(g)
 }
 
-// endpointsWarningClient clones cfg into a clientset whose
-// WarningHandler drops only the apiserver's Endpoints deprecation
-// header — the guard's corev1 Endpoints reads/writes are intentional.
-func endpointsWarningClient(cfg *rest.Config) (kubernetes.Interface, error) {
+// NewEndpointGuardWarningHandler returns the WarningHandler that drops
+// only the apiserver's "v1 Endpoints is deprecated" header — exported
+// so main can attach it to the shared rest.Config before the first
+// clientset is built. The guard then recognizes its own filter on the
+// manager config and reuses that clientset instead of paying for a
+// second http.Transport and TLS connection pool.
+func NewEndpointGuardWarningHandler() rest.WarningHandler {
+	return endpointGuardWarnings{delegate: rest.WarningLogger{}}
+}
+
+// endpointsWarningClient returns a clientset whose WarningHandler
+// drops only the apiserver's Endpoints deprecation header — the
+// guard's corev1 Endpoints reads/writes are intentional. When cfg
+// already carries the guard's filter (main wires it onto the shared
+// config before building cs), the incoming clientset is reused:
+// cloning cfg into a second clientset would duplicate the
+// http.Transport and its connection pool for zero behavioral gain.
+func endpointsWarningClient(cfg *rest.Config, cs kubernetes.Interface) (kubernetes.Interface, error) {
+	if cs != nil {
+		if _, ok := cfg.WarningHandler.(endpointGuardWarnings); ok {
+			return cs, nil
+		}
+	}
 	cfg = rest.CopyConfig(cfg)
-	cfg.WarningHandler = endpointGuardWarnings{delegate: rest.WarningLogger{}}
+	cfg.WarningHandler = NewEndpointGuardWarningHandler()
 	return kubernetes.NewForConfig(cfg)
 }
 
@@ -891,6 +910,9 @@ func removeEndpointIP(ep *corev1.Endpoints, ip string) {
 			subsets = append(subsets, sub)
 		}
 	}
+	// Zero the tail — stale subset copies would otherwise keep the
+	// dropped address strings reachable through the backing array.
+	clear(ep.Subsets[len(subsets):])
 	ep.Subsets = subsets
 }
 
@@ -901,6 +923,7 @@ func dropAddr(addrs []corev1.EndpointAddress, ip string) []corev1.EndpointAddres
 			out = append(out, a)
 		}
 	}
+	clear(addrs[len(out):])
 	return out
 }
 
@@ -972,11 +995,13 @@ func removeSliceIP(eps *discoveryv1.EndpointSlice, ip string) bool {
 				out = append(out, a)
 			}
 		}
+		clear(e.Addresses[len(out):])
 		e.Addresses = out
 		if len(e.Addresses) > 0 {
 			endpoints = append(endpoints, e)
 		}
 	}
+	clear(eps.Endpoints[len(endpoints):])
 	eps.Endpoints = endpoints
 	return changed
 }

@@ -46,8 +46,12 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 		return err
 	}
 
-	background := metav1.DeletePropagationBackground
-	deleted := 0
+	type target struct {
+		ns, name string
+		ageHours int
+	}
+	var targets []target
+	capped := false
 	for i := range jobs.Items {
 		job := &jobs.Items[i]
 		var failedAt *metav1.Time
@@ -65,16 +69,29 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 		if age <= failedJobMaxAge {
 			continue
 		}
-		if deleted >= failedJobCap {
-			log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", failedJobCap))
+		if len(targets) >= failedJobCap {
+			capped = true
 			break
 		}
-		log.Info(fmt.Sprintf("DELETE %s/%s: Failed for %dh", job.Namespace, job.Name, int(age.Hours())))
-		if err := j.cs.BatchV1().Jobs(job.Namespace).Delete(ctx, job.Name,
+		targets = append(targets, target{
+			ns:       job.Namespace,
+			name:     job.Name,
+			ageHours: int(age.Hours()),
+		})
+	}
+	// Release the cluster-wide JobList before issuing Delete calls.
+	jobs = nil
+
+	background := metav1.DeletePropagationBackground
+	for _, t := range targets {
+		log.Info(fmt.Sprintf("DELETE %s/%s: Failed for %dh", t.ns, t.name, t.ageHours))
+		if err := j.cs.BatchV1().Jobs(t.ns).Delete(ctx, t.name,
 			metav1.DeleteOptions{PropagationPolicy: &background}); err != nil {
-			log.Error(err, "job delete failed", "job", job.Namespace+"/"+job.Name)
+			log.Error(err, "job delete failed", "job", t.ns+"/"+t.name)
 		}
-		deleted++ // bash counts the attempt against the cap too
+	}
+	if capped {
+		log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", failedJobCap))
 	}
 	log.Info("sweep done")
 	return nil

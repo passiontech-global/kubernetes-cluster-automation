@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/topology"
 )
@@ -110,5 +111,75 @@ func TestPinUnpinHosts(t *testing.T) {
 	b, _ = os.ReadFile(filepath.Join(r.cfg.HostRoot, "etc/hosts"))
 	if strings.Contains(string(b), "api.test.internal") {
 		t.Fatal("pin not removed")
+	}
+}
+
+// TestDirWatcherPollChangedEdge: Poll seeds the baseline without
+// firing, latches one edge per fingerprint move, and Changed consumes
+// it exactly once — without re-hashing the dirs on the main loop.
+func TestDirWatcherPollChangedEdge(t *testing.T) {
+	dir := t.TempDir()
+	w := &DirWatcher{Dirs: []string{dir}, Period: 5 * time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Poll(ctx)
+
+	deadline := time.Now().Add(5 * time.Second)
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	waitFor("Poll first scan", func() bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.polled
+	})
+	if w.Changed() {
+		t.Fatal("Changed fired on the freshly-seeded baseline")
+	}
+
+	// A file appearing between polls must surface as exactly one edge.
+	if err := os.WriteFile(filepath.Join(dir, "vars.yaml"), []byte("a: 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("dirty latch", func() bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.dirty
+	})
+	if !w.Changed() {
+		t.Fatal("Changed lost the poll-latched edge")
+	}
+	if w.Changed() {
+		t.Fatal("Changed fired twice for one edge")
+	}
+}
+
+// TestDirWatcherChangedWithoutPoll: the pre-Poll fallback — Changed
+// compares a fresh fingerprint against the last snapshot when Poll
+// never ran (unit tests calling Changed directly).
+func TestDirWatcherChangedWithoutPoll(t *testing.T) {
+	dir := t.TempDir()
+	w := &DirWatcher{Dirs: []string{dir}}
+	if !w.Changed() {
+		t.Fatal("first Changed should report a difference vs empty baseline")
+	}
+	if w.Changed() {
+		t.Fatal("second Changed without file modifications should be false")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "x"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !w.Changed() {
+		t.Fatal("Changed missed the new file without Poll")
+	}
+	if w.Changed() {
+		t.Fatal("Changed fired twice for the same file without Poll")
 	}
 }

@@ -667,12 +667,18 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 	// Prune pin files for names removed from the map — the shell
 	// also dropped the matching dnsfb-ctr-* counter (the lg
 	// last-known-good file stays: it is still the best hint if the
-	// name ever comes back).
+	// name ever comes back). The in-memory fail counters get the
+	// same prune — otherwise a removed name's key lingers forever.
 	for _, f := range n.pinFiles() {
 		name := strings.TrimPrefix(filepath.Base(f), "dnsfb-pin-")
 		if !inMap[name] {
 			_ = os.Remove(f)
 			_ = os.Remove(filepath.Join(n.cfg.WatchdogStateDir, "dnsfb-ctr-"+name))
+		}
+	}
+	for name := range n.dnsfails {
+		if !inMap[name] {
+			delete(n.dnsfails, name)
 		}
 	}
 	// Render the managed block from the pins.

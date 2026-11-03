@@ -80,8 +80,10 @@ type DirWatcher struct {
 	Dirs   []string
 	Period time.Duration
 
-	mu   sync.Mutex // guards last — Poll writes, Changed reads
-	last string
+	mu     sync.Mutex // guards last, dirty, polled — Poll writes, Changed reads
+	last   string
+	dirty  bool // Poll-latched change edge, consumed by Changed
+	polled bool // Poll has observed the dir at least once
 }
 
 func (w *DirWatcher) fingerprint() string {
@@ -112,6 +114,14 @@ func (w *DirWatcher) Poll(ctx context.Context) {
 	if p <= 0 {
 		p = defaultWatchPoll
 	}
+	initFP := w.fingerprint()
+	w.mu.Lock()
+	if w.last == "" {
+		w.last = initFP
+	}
+	w.polled = true
+	w.mu.Unlock()
+
 	t := time.NewTicker(p)
 	defer t.Stop()
 	for {
@@ -119,28 +129,49 @@ func (w *DirWatcher) Poll(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if fp := w.fingerprint(); fp != w.snapshot() {
-				w.setLast(fp)
+			fp := w.fingerprint()
+			w.mu.Lock()
+			if fp != w.last {
+				w.dirty = true
+				w.last = fp
 			}
+			w.mu.Unlock()
 		}
 	}
 }
 
-func (w *DirWatcher) snapshot() string {
+// Changed reports a change edge. Once Poll has run it just consumes
+// the edge Poll latched — the main loop does not re-read and re-hash
+// every file a second time, and an edge observed between two Changed
+// calls is never lost. When Poll has never run (unit tests calling
+// Changed directly) it falls back to comparing a fresh fingerprint
+// against the last snapshot.
+func (w *DirWatcher) Changed() bool {
+	w.mu.Lock()
+	if w.polled {
+		d := w.dirty
+		w.dirty = false
+		w.mu.Unlock()
+		return d
+	}
+	w.mu.Unlock()
+
+	// No Poll yet — fingerprint outside the lock (dir walk + file
+	// reads) so a racing first Poll scan is not stalled on disk IO.
+	fp := w.fingerprint()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.last
-}
-
-func (w *DirWatcher) setLast(fp string) {
-	w.mu.Lock()
+	// Poll may have started meanwhile — its dirty latch is then the
+	// authoritative edge and the fingerprint is discarded.
+	if w.polled {
+		d := w.dirty
+		w.dirty = false
+		return d
+	}
+	changed := fp != w.last
 	w.last = fp
-	w.mu.Unlock()
+	return changed
 }
-
-// Changed compares the current fingerprint to the last poll result —
-// call after Poll has observed the dir at least once.
-func (w *DirWatcher) Changed() bool { return w.fingerprint() != w.snapshot() }
 
 // Config — all injectable.
 type Config struct {

@@ -277,9 +277,10 @@ func (c *Config) applyDefaults() {
 		// curl -ks parity: insecure TLS (kubelet cert SANs don't cover
 		// 127.0.0.1), and ANY HTTP response — including 401 — means
 		// the listener is alive.
-		client := &http.Client{Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // mirrors curl -ks
-		}}
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
+		tr.IdleConnTimeout = 90 * time.Second
+		client := &http.Client{Transport: tr}
 		c.probeHTTP = func(ctx context.Context, url string, timeout time.Duration) error {
 			pctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
@@ -298,10 +299,19 @@ func (c *Config) applyDefaults() {
 	}
 	if c.unixGet == nil {
 		c.unixGet = func(ctx context.Context, socket, path string) ([]byte, error) {
-			tr := &http.Transport{DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
-				d := net.Dialer{Timeout: 5 * time.Second}
-				return d.DialContext(dctx, "unix", socket)
-			}}
+			// DisableKeepAlives: the transport is built per call, so a
+			// kept-alive unix conn would pin the readLoop/writeLoop
+			// goroutines for the transport's whole IdleConnTimeout —
+			// with keep-alives off the conn closes on Body.Close and
+			// they finish immediately. Draining the body first lets
+			// the close happen promptly.
+			tr := &http.Transport{
+				DisableKeepAlives: true,
+				DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
+					d := net.Dialer{Timeout: 5 * time.Second}
+					return d.DialContext(dctx, "unix", socket)
+				},
+			}
 			cl := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 				"http://localhost"+path, nil)
@@ -314,9 +324,12 @@ func (c *Config) applyDefaults() {
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 				return nil, fmt.Errorf("cilium api %s: status %d", path, resp.StatusCode)
 			}
-			return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			return body, err
 		}
 	}
 	if c.journalFn == nil {
@@ -1205,9 +1218,13 @@ func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
 // --- shared helpers for the ported kubelet/cilium/ctr checks ---
 
 // countMatchingLines is grep -cE parity: lines matching re.
+// strings.Cut iterates in place — no giant []string allocation on
+// a multi-MiB journal snapshot.
 func countMatchingLines(re *regexp.Regexp, s string) int {
 	n := 0
-	for _, line := range strings.Split(s, "\n") {
+	for rest := s; rest != ""; {
+		line, after, _ := strings.Cut(rest, "\n")
+		rest = after
 		if re.MatchString(line) {
 			n++
 		}

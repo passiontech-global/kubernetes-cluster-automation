@@ -186,7 +186,8 @@ func (c *Client) CheckWebhook(ctx context.Context, r Resource) (int, error) {
 		return 0, err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body) // drain for keep-alive reuse
+	// Drain (bounded) so the keep-alive connection can be reused.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	return resp.StatusCode, nil
 }
 
@@ -209,7 +210,8 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		_, _ = io.Copy(io.Discard, resp.Body) // drain for keep-alive reuse
+		// Drain (bounded) so the keep-alive connection can be reused.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return fmt.Errorf("GET %s: unexpected status %d", path, resp.StatusCode)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)

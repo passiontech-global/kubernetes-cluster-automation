@@ -1026,7 +1026,8 @@ func (c *cyc) groupWatchdog() {
 	// independent of whether the scripts CM is mounted.
 	c.retireShellWatchdog()
 	// log file + textfile dir + units + installed marker + timer.
-	if _, err := os.OpenFile(r.hp("/var/log/node-watchdog.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+	if f, err := os.OpenFile(r.hp("/var/log/node-watchdog.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+		_ = f.Close()
 	}
 	r.ensureDir("/var/lib/node-exporter/textfile", 0o755)
 	r.ensureDir("/var/lib/node-watchdog", 0o755)

@@ -2,6 +2,7 @@ package hostmetrics
 
 import (
 	"encoding/pem"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -133,6 +134,75 @@ func TestWatchdogStateClearsToZero(t *testing.T) {
 		map[string]string{"node": "node-a", "state": "dns-fallback"})
 	if !ok || v != 0 {
 		t.Fatalf("cleared state=%v ok=%v want emitted 0 (emit-0 semantics)", v, ok)
+	}
+}
+
+// TestSeenStatesTTLExpiry: a cleared latch emits 0 while inside
+// seenStateTTL, then the bookkeeping entry is dropped and the series
+// disappears — the emit-0 window cannot grow seenStates forever.
+func TestSeenStatesTTLExpiry(t *testing.T) {
+	cfg, dirs := fixture(t)
+	now := time.Now()
+	cfg.nowFn = func() time.Time { return now }
+	latch := filepath.Join(dirs["state"], "state-tmp-latch")
+	write(t, latch, "1730000000\n")
+	c := New(cfg)
+	labels := map[string]string{"node": "node-a", "state": "tmp-latch"}
+
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state", labels); !ok || v != 1 {
+		t.Fatalf("latched state=%v ok=%v want 1", v, ok)
+	}
+	if err := os.Remove(latch); err != nil {
+		t.Fatal(err)
+	}
+	// First cleared scrape stamps the entry — still emits 0.
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state", labels); !ok || v != 0 {
+		t.Fatalf("cleared state=%v ok=%v want emitted 0", v, ok)
+	}
+	// Inside the TTL the emit-0 contract still holds.
+	now = now.Add(seenStateTTL - time.Minute)
+	if _, ok := metricValue(t, c, "node_host_agent_watchdog_state", labels); !ok {
+		t.Fatal("series dropped before seenStateTTL elapsed")
+	}
+	// Past the TTL the entry is evicted and the series disappears.
+	now = now.Add(2 * time.Minute)
+	if _, ok := metricValue(t, c, "node_host_agent_watchdog_state", labels); ok {
+		t.Fatal("series kept after seenStateTTL elapsed")
+	}
+	if _, ok := c.seenStates["tmp-latch"]; ok {
+		t.Fatal("expired cleared state kept in seenStates")
+	}
+}
+
+// TestSeenStatesCapEvictsOldestCleared: beyond maxSeenStates the
+// longest-cleared entries are evicted first; an active latch is
+// never evicted.
+func TestSeenStatesCapEvictsOldestCleared(t *testing.T) {
+	cfg, dirs := fixture(t)
+	now := time.Now()
+	cfg.nowFn = func() time.Time { return now }
+	write(t, filepath.Join(dirs["state"], "state-real"), "1730000000\n")
+	c := New(cfg)
+	// Pre-seed over-cap cleared entries, oldest first.
+	for i := 0; i < maxSeenStates+10; i++ {
+		c.seenStates[fmt.Sprintf("old-%03d", i)] = now.Add(-time.Duration(i+1) * time.Second)
+	}
+	labels := map[string]string{"node": "node-a", "state": "real"}
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state", labels); !ok || v != 1 {
+		t.Fatalf("latched state=%v ok=%v want 1", v, ok)
+	}
+	if got := len(c.seenStates); got > maxSeenStates {
+		t.Fatalf("seenStates = %d, want <= %d", got, maxSeenStates)
+	}
+	if ts, ok := c.seenStates["real"]; !ok || !ts.IsZero() {
+		t.Fatal("active latch missing or got a cleared timestamp")
+	}
+	// The oldest-cleared entries must have been evicted.
+	if _, ok := c.seenStates[fmt.Sprintf("old-%03d", maxSeenStates+9)]; ok {
+		t.Fatal("oldest cleared entry was not evicted")
+	}
+	if _, ok := c.seenStates["old-000"]; !ok {
+		t.Fatal("freshest cleared entry was evicted")
 	}
 }
 

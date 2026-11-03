@@ -24,3 +24,27 @@ func Signature(secret string, body []byte, header string) bool {
 	mac.Write(body)
 	return hmac.Equal(sig, mac.Sum(nil))
 }
+
+// HasValidSignatureFormat reports whether sigHeader is plausibly a
+// GitHub X-Hub-Signature-256 value — the "sha256=" prefix followed by
+// exactly 64 hex digits — and a secret is configured to check it
+// against. It is a cheap pre-filter so unsigned or malformed requests
+// can be rejected before the request body is read and allocated; the
+// constant-time Signature check still makes the final call once the
+// body is known.
+func HasValidSignatureFormat(secret, sigHeader string) bool {
+	if secret == "" {
+		return false
+	}
+	got, ok := strings.CutPrefix(sigHeader, "sha256=")
+	if !ok || len(got) != sha256.Size*2 {
+		return false
+	}
+	for i := 0; i < len(got); i++ {
+		c := got[i]
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}

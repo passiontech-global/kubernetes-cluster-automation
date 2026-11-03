@@ -281,6 +281,41 @@ func TestDNSFallbackEmptyMapCleans(t *testing.T) {
 	}
 }
 
+// TestDNSFallbackPrunesFailCounters: a name dropped from
+// DNS_FALLBACK_MAP loses its in-memory fail counter alongside the
+// pin/counter files — otherwise dnsfails grows with every map edit.
+func TestDNSFallbackPrunesFailCounters(t *testing.T) {
+	e := fixture(t, &watchdogconf.Config{
+		DNSFallback: []watchdogconf.DNSEntry{
+			{Name: "api.test.internal", Port: "6443",
+				Candidates: []string{"10.0.0.1"}},
+			{Name: "gone.test.internal", Port: "6443",
+				Candidates: []string{"10.0.0.1"}},
+		},
+	})
+	writeFile(t, e.resv, "nameserver 10.1.1.1\n")
+	// All lookups fail → both names accumulate fail counters.
+	e.n.Cycle(context.Background())
+	if len(e.n.dnsfails) != 2 {
+		t.Fatalf("dnsfails = %v, want 2 entries", e.n.dnsfails)
+	}
+
+	// Drop the second name from the map → its counter is pruned.
+	e.n.cfg.Watchdog = &watchdogconf.Config{
+		DNSFallback: []watchdogconf.DNSEntry{
+			{Name: "api.test.internal", Port: "6443",
+				Candidates: []string{"10.0.0.1"}},
+		},
+	}
+	e.n.Cycle(context.Background())
+	if _, ok := e.n.dnsfails["gone.test.internal"]; ok {
+		t.Fatal("dnsfails kept a name removed from DNS_FALLBACK_MAP")
+	}
+	if _, ok := e.n.dnsfails["api.test.internal"]; !ok {
+		t.Fatal("dnsfails lost the still-mapped name")
+	}
+}
+
 func readFileT(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)

@@ -108,6 +108,77 @@ func TestBadSignatureRejected(t *testing.T) {
 	}
 }
 
+// errReader fails if anything tries to read it and records the
+// attempt — proof the handler rejected without touching the body.
+type errReader struct{ reads int }
+
+func (r *errReader) Read([]byte) (int, error) {
+	r.reads++
+	return 0, fmt.Errorf("body must not be read")
+}
+
+func TestMalformedSignatureRejectsBeforeBodyRead(t *testing.T) {
+	// Missing or malformed signature headers are refused before the
+	// body is read — a port scanner or unauthenticated probe must not
+	// be able to force a body buffer allocation.
+	h := New(testSecret, &fakeBackend{})
+	for _, tc := range []struct {
+		name, sig string
+	}{
+		{"missing", ""},
+		{"wrong scheme", "sha1=" + strings.Repeat("0", 40)},
+		{"short hex", "sha256=abcd"},
+		{"non-hex", "sha256=" + strings.Repeat("z", 64)},
+		{"too long", "sha256=" + strings.Repeat("a", 65)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &errReader{}
+			req := httptest.NewRequest(http.MethodPost, "/webhook", body)
+			req.Header.Set("X-GitHub-Event", "push")
+			req.Header.Set("X-Hub-Signature-256", tc.sig)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status=%d want 401", rec.Code)
+			}
+			if body.reads != 0 {
+				t.Fatalf("body read %d times; want 0", body.reads)
+			}
+		})
+	}
+}
+
+func TestOversizedBodyWithoutSignatureRejected(t *testing.T) {
+	// A payload over maxBodyBytes with no signature is still a fast
+	// 401, not a 413: the format check fires before MaxBytesReader.
+	h := New(testSecret, &fakeBackend{})
+	req := httptest.NewRequest(http.MethodPost, "/webhook",
+		strings.NewReader(strings.Repeat("x", maxBodyBytes+1)))
+	req.Header.Set("X-GitHub-Event", "push")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d want 401", rec.Code)
+	}
+}
+
+func TestEmptySecretRejectsBeforeBodyRead(t *testing.T) {
+	// With no secret configured nothing can verify — even a
+	// well-formed header dies before the body read.
+	h := New("", &fakeBackend{})
+	body := &errReader{}
+	req := httptest.NewRequest(http.MethodPost, "/webhook", body)
+	req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d want 401", rec.Code)
+	}
+	if body.reads != 0 {
+		t.Fatalf("body read %d times; want 0", body.reads)
+	}
+}
+
 func TestUnhandledEventAccepted(t *testing.T) {
 	h := New(testSecret, &fakeBackend{})
 	rec := httptest.NewRecorder()

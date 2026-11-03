@@ -39,14 +39,19 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
 
 // countMatches mirrors `grep -cE '<re>'` — matching line count.
+// strings.Cut iterates in place — no giant []string allocation on a
+// multi-MiB journal snapshot.
 func countMatches(re *regexp.Regexp, text string) int {
 	n := 0
-	for _, line := range splitLines(text) {
+	for rest := text; rest != ""; {
+		line, after, _ := strings.Cut(rest, "\n")
+		rest = after
 		if re.MatchString(line) {
 			n++
 		}

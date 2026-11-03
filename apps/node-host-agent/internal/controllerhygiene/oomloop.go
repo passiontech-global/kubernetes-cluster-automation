@@ -125,7 +125,9 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 // parseOOMKill extracts the `oom_kill` counter from memory.events —
 // `awk '/^oom_kill /{print $2}'` parity.
 func parseOOMKill(events string) (int64, bool) {
-	for _, line := range splitLines(events) {
+	for rest := events; rest != ""; {
+		line, after, _ := strings.Cut(rest, "\n")
+		rest = after
 		if m := oomKillRe.FindStringSubmatch(line); m != nil {
 			v, err := strconv.ParseInt(m[1], 10, 64)
 			if err != nil {
@@ -147,7 +149,9 @@ func (h *Hygiene) pruneKills(killsPath string, now int64) int {
 	}
 	cutoff := now - int64(h.cfg.OOMLoopWindow.Seconds())
 	var kept []string
-	for _, line := range splitLines(string(data)) {
+	for rest := string(data); rest != ""; {
+		line, after, _ := strings.Cut(rest, "\n")
+		rest = after
 		ts, err := strconv.ParseInt(strings.TrimSpace(line), 10, 64)
 		if err != nil || ts < cutoff {
 			continue

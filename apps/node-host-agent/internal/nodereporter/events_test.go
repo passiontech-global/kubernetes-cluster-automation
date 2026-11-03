@@ -345,3 +345,78 @@ func TestSelfHealActionReasons(t *testing.T) {
 		}
 	}
 }
+
+// TestLogPendingCap: a line that never terminates cannot grow the
+// carry buffer without bound — only the last maxLogPendingBytes are
+// kept for the next cycle.
+func TestLogPendingCap(t *testing.T) {
+	e := fixture(t)
+	e.appendRawLog(t, strings.Repeat("x", maxLogPendingBytes+1000))
+	e.cycle()
+	if got := len(e.r.logPending); got != maxLogPendingBytes {
+		t.Fatalf("logPending = %d, want capped at %d", got, maxLogPendingBytes)
+	}
+
+	// Same cap on the partial line trailing a completed one.
+	e.appendRawLog(t, "\n"+strings.Repeat("y", maxLogPendingBytes+1000))
+	e.cycle()
+	if got := len(e.r.logPending); got != maxLogPendingBytes {
+		t.Fatalf("logPending after completed line = %d, want %d", got, maxLogPendingBytes)
+	}
+}
+
+// TestOversizedFirstScanReadsTail: an unrotated log bigger than
+// maxLogReadBytes is not slurped whole — the first scan jumps to the
+// last maxLogReadBytes, drops the cut partial line, and still finds
+// fresh events in the tail.
+func TestOversizedFirstScanReadsTail(t *testing.T) {
+	e := fixture(t)
+	fresh := e.now.Format(time.RFC3339)
+	var b strings.Builder
+	for b.Len() < maxLogReadBytes+1024 {
+		fmt.Fprintf(&b, "%s filler-%d\n", fresh, b.Len())
+	}
+	fmt.Fprintf(&b, "%s ACTION: restarting k0sworker - tail-line\n", fresh)
+	e.appendRawLog(t, b.String())
+	e.cycle()
+
+	if got := e.counter("K0sworkerRestarted"); got != 1 {
+		t.Fatalf("counter = %v, want 1 (tail line still detected)", got)
+	}
+	if n := len(eventsByReason(t, e, "K0sworkerRestarted")); n != 1 {
+		t.Fatalf("events = %d, want 1", n)
+	}
+	fi, err := os.Stat(e.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.r.logOffset != fi.Size() {
+		t.Fatalf("logOffset = %d, want file size %d (full tail consumed)", e.r.logOffset, fi.Size())
+	}
+}
+
+// TestEmittedEventsCap: after TTL pruning the dedup map is hard-capped
+// at maxEmittedEvents — the least-recently-observed entries are
+// evicted first so a flood of distinct reason+message pairs can't
+// grow the map without limit.
+func TestEmittedEventsCap(t *testing.T) {
+	e := fixture(t)
+	for i := 0; i < maxEmittedEvents+50; i++ {
+		key := fmt.Sprintf("Reason\x1fmsg-%d", i)
+		e.r.emittedEvts[key] = &emittedEvent{
+			name: "n1.ev", count: 1,
+			at: e.now.Add(-time.Duration(i) * time.Second),
+		}
+	}
+	e.r.pruneEmitted()
+	if got := len(e.r.emittedEvts); got != maxEmittedEvents {
+		t.Fatalf("emittedEvts = %d, want capped at %d", got, maxEmittedEvents)
+	}
+	if _, ok := e.r.emittedEvts["Reason\x1fmsg-0"]; !ok {
+		t.Fatal("freshest entry was evicted")
+	}
+	oldest := fmt.Sprintf("Reason\x1fmsg-%d", maxEmittedEvents+49)
+	if _, ok := e.r.emittedEvts[oldest]; ok {
+		t.Fatal("oldest entry was not evicted")
+	}
+}

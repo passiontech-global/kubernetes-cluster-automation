@@ -58,7 +58,13 @@ func (c *atcClient) login(ctx context.Context, user, pass string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Drain before Close so the keep-alive connection can be
+		// reused; bounded so a misbehaving endpoint cannot stall the
+		// return (same 64KiB cap as doJSON).
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+	}()
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("atc token: status %s", resp.Status)
 	}

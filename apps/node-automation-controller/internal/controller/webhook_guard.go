@@ -64,6 +64,7 @@ func (g *webhookGuard) run(ctx context.Context) error {
 	for _, ns := range nsList.Items {
 		namespaces[ns.Name] = true
 	}
+	nsList = nil
 	if !namespaces["kube-system"] {
 		return fmt.Errorf("kube-system absent from namespace list (API flap) — abort")
 	}
@@ -81,6 +82,7 @@ func (g *webhookGuard) run(ctx context.Context) error {
 			services[s.Namespace+"/"+s.Name] = true
 		}
 	}
+	svcList = nil
 
 	mwc, err := g.cs.AdmissionregistrationV1().MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
 	if err != nil {

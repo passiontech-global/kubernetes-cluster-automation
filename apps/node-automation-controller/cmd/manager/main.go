@@ -182,6 +182,16 @@ func main() {
 	// Direct (uncached) clientset — RBAC intentionally grants no watch
 	// on most types (pods/services/jobs/webhookconfigs/...), so all
 	// reads outside the informer types go through this.
+	//
+	// The endpoint-guard warning filter is attached BEFORE the
+	// clientset is built: the guard writes the deprecated corev1
+	// Endpoints object deliberately on hosted planes, and installing
+	// the handler on the shared config lets
+	// SetupAPIServerEndpointGuard reuse THIS clientset instead of
+	// cloning cfg into a second one — which would duplicate the
+	// http.Transport and its TLS connection pool just to silence one
+	// warning header.
+	cfg.WarningHandler = controller.NewEndpointGuardWarningHandler()
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		log.Error(err, "unable to create clientset")

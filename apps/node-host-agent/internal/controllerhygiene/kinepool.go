@@ -158,8 +158,12 @@ func (h *Hygiene) socketInodes(pid int) map[string]bool {
 //	0  1     2   3  4     5     6        7   8       9
 func countConnsToPort(table string, dbPort int, inodes map[string]bool) int {
 	n := 0
-	for i, line := range splitLines(table) {
-		if i == 0 {
+	header := true
+	for rest := table; rest != ""; {
+		line, after, _ := strings.Cut(rest, "\n")
+		rest = after
+		if header {
+			header = false
 			continue // header row
 		}
 		f := strings.Fields(line)

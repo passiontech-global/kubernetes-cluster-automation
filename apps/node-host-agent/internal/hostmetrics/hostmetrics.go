@@ -59,6 +59,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -96,6 +97,17 @@ const (
 // nebulaCertWarnDays mirrors module 13-nebula-health: fewer than this
 // many days to notAfter latches the nebula-cert-expiring signal.
 const nebulaCertWarnDays = 30
+
+const (
+	// seenStateTTL bounds how long a cleared dynamic latch keeps
+	// emitting an explicit 0 — long enough for any Prometheus
+	// for:/auto-resolve window, then the bookkeeping entry is dropped
+	// so the map cannot grow forever.
+	seenStateTTL = 6 * time.Hour
+	// maxSeenStates hard-bounds the seenStates map — the
+	// longest-cleared entries are evicted first when it overflows.
+	maxSeenStates = 256
+)
 
 // defaultRemovedFlags are k0s config keys removed upstream whose
 // presence means the rendered config drifted from the expected one.
@@ -198,8 +210,12 @@ type Collector struct {
 	removedFlagRe map[string]*regexp.Regexp
 	expectedKCM   map[string]bool
 
-	mu         sync.Mutex
-	seenStates map[string]bool
+	mu sync.Mutex
+	// seenStates tracks the emit-0 bookkeeping per dynamic latch:
+	// zero time = the latch is active on disk (or the cert-owned
+	// series is live); non-zero = the scrape that first saw it
+	// cleared — the entry emits 0 until seenStateTTL then drops.
+	seenStates map[string]time.Time
 
 	// k0s.yaml cache, guarded by mu: the file changes on k0s upgrades
 	// (rare), not per-scrape — a stat+mtime+size check gates the
@@ -236,7 +252,7 @@ type Collector struct {
 // New returns the Collector. Register it on the agent's registry.
 func New(cfg Config) *Collector {
 	cfg.applyDefaults()
-	c := &Collector{cfg: cfg, seenStates: map[string]bool{}}
+	c := &Collector{cfg: cfg, seenStates: map[string]time.Time{}}
 	c.removedFlagRe = make(map[string]*regexp.Regexp, len(cfg.RemovedFlags))
 	for _, flag := range cfg.RemovedFlags {
 		// Anchored key match (same shape as the canonical
@@ -355,14 +371,50 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, certDays int64,
 		present["nebula-cert-expiring"] = true
 	}
 	c.mu.Lock()
+	now := c.cfg.nowFn()
+	// Cleared-state bookkeeping: an entry absent from this scrape's
+	// latches is stamped with now on the first cleared scrape and
+	// dropped once it has emitted 0 for seenStateTTL. The cert-owned
+	// series counts as active while the cert parses — the signal
+	// must emit an explicit 0 from then on (alert contract), even if
+	// the cert later disappears.
+	for s, clearedAt := range c.seenStates {
+		if present[s] || (certOK && s == "nebula-cert-expiring") {
+			continue
+		}
+		if clearedAt.IsZero() {
+			c.seenStates[s] = now
+		} else if now.Sub(clearedAt) >= seenStateTTL {
+			delete(c.seenStates, s)
+		}
+	}
 	for name := range present {
-		c.seenStates[name] = true
+		c.seenStates[name] = time.Time{}
 	}
 	if certOK {
-		// Cert parsed once → the signal must emit an explicit 0 from
-		// now on (alert contract), even if the cert later disappears
-		// — the seenStates emit-0 bookkeeping covers that case.
-		c.seenStates["nebula-cert-expiring"] = true
+		c.seenStates["nebula-cert-expiring"] = time.Time{}
+	}
+	// Hard bound: a latch storm must not grow the map without limit —
+	// evict the longest-cleared entries first (active entries, zero
+	// time, are never evicted). Single pass: collect the cleared
+	// entries, sort oldest-first, delete the overflow — if the map is
+	// still over-cap afterwards it is all-active and stays so.
+	if len(c.seenStates) > maxSeenStates {
+		type clearedState struct {
+			state string
+			at    time.Time
+		}
+		var evictable []clearedState
+		for s, at := range c.seenStates {
+			if !at.IsZero() {
+				evictable = append(evictable, clearedState{s, at})
+			}
+		}
+		slices.SortFunc(evictable, func(a, b clearedState) int { return a.at.Compare(b.at) })
+		over := min(len(c.seenStates)-maxSeenStates, len(evictable))
+		for _, e := range evictable[:over] {
+			delete(c.seenStates, e.state)
+		}
 	}
 	seen := make([]string, 0, len(c.seenStates))
 	for name := range c.seenStates {

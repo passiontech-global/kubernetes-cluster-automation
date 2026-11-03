@@ -74,8 +74,12 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 		return err // periodic wrapper IncErrors evictedPodQueue
 	}
 
-	background := metav1.DeletePropagationBackground
-	deleted := 0
+	type target struct {
+		ns, name, node, reason string
+		ageHours               int
+	}
+	var targets []target
+	capped := false
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.Status.Phase != corev1.PodFailed {
@@ -91,19 +95,33 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 		if age <= evictedPodMaxAge {
 			continue // fresh eviction — keep it inspectable
 		}
-		if deleted >= evictedPodCap {
-			log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", evictedPodCap))
+		if len(targets) >= evictedPodCap {
+			capped = true
 			break
 		}
+		targets = append(targets, target{
+			ns:       pod.Namespace,
+			name:     pod.Name,
+			node:     pod.Spec.NodeName,
+			reason:   pod.Status.Reason,
+			ageHours: int(age.Hours()),
+		})
+	}
+	// Release the PodList before issuing Delete calls.
+	pods = nil
+
+	background := metav1.DeletePropagationBackground
+	for _, t := range targets {
 		log.Info(fmt.Sprintf("DELETE %s/%s on %s: reason=%s age=%dh",
-			pod.Namespace, pod.Name, pod.Spec.NodeName,
-			pod.Status.Reason, int(age.Hours())))
-		if err := j.cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
+			t.ns, t.name, t.node, t.reason, t.ageHours))
+		if err := j.cs.CoreV1().Pods(t.ns).Delete(ctx, t.name,
 			metav1.DeleteOptions{PropagationPolicy: &background}); err != nil {
 			metrics.IncError(evictedPodQueue)
-			log.Error(err, "pod delete failed", "pod", pod.Namespace+"/"+pod.Name)
+			log.Error(err, "pod delete failed", "pod", t.ns+"/"+t.name)
 		}
-		deleted++ // count the attempt against the cap too
+	}
+	if capped {
+		log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", evictedPodCap))
 	}
 	log.Info("sweep done")
 	return nil
