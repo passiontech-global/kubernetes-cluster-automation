@@ -225,10 +225,10 @@ func TestSetupFeatureFlagVariants(t *testing.T) {
 			return SetupCiliumIdentityAuditor(m, cs, stubDyn(), false)
 		}},
 		{"coredns-patcher", func(m manager.Manager) error {
-			return SetupCoreDNSPatcher(m, cs, false, "DoNotSchedule", 2)
+			return SetupCoreDNSPatcher(m, cs, false, "DoNotSchedule", 2, 4, 1)
 		}},
 		{"metrics-server-patcher", func(m manager.Manager) error {
-			return SetupMetricsServerPatcher(m, cs, false)
+			return SetupMetricsServerPatcher(m, cs, false, 3, 1)
 		}},
 		{"cf-tunnel-proxy-watchdog", func(m manager.Manager) error {
 			return SetupCFTunnelProxyWatchdog(m, cs, false,
@@ -290,10 +290,10 @@ func TestSetupBuilderModules(t *testing.T) {
 			return SetupKonnectivityPatcher(m, cs)
 		}},
 		{"coredns-patcher", func(m manager.Manager) error {
-			return SetupCoreDNSPatcher(m, cs, true, "DoNotSchedule", 2)
+			return SetupCoreDNSPatcher(m, cs, true, "DoNotSchedule", 2, 4, 1)
 		}},
 		{"metrics-server-patcher", func(m manager.Manager) error {
-			return SetupMetricsServerPatcher(m, cs, true)
+			return SetupMetricsServerPatcher(m, cs, true, 3, 1)
 		}},
 		{"descheduler-storm-gate", func(m manager.Manager) error {
 			return SetupDeschedulerStormGate(m, cs)

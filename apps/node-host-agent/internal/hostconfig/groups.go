@@ -49,6 +49,7 @@ func (r *Reconciler) Cycle(ctx context.Context) {
 	c.group("swap", c.groupSwap)                   // node_tuning_swap.yaml
 	c.group("hub-metrics-fw", c.groupHubMetricsFW) // node_exporter_hub.yaml (standalone)
 	c.group("api-lb-vm", c.groupAPILBVM)           // api_lb_guard.yaml converge
+	c.group("kine", c.groupKineService)            // Phase 3: tach kine.service doc lap
 	c.group("verify", c.groupVerify)
 	// Vars lazily resolve during the groups too — eval failures and
 	// reference cycles land in Vars.Errors (fail-closed Undefined).
@@ -165,6 +166,61 @@ TasksMax=infinity
 	} else {
 		nh := append(hosts, []byte(line+"\n")...)
 		r.writeManaged("/etc/hosts", nh, 0o644)
+	}
+
+	// Self-stage the agent binary on the host for hostPath-mounted
+	// consumers (concourse-worker-init Cach A mounts
+	// /usr/local/bin/node-host-agent hostPath:File read-only). The
+	// standalone systemd deployment ships the binary by other means.
+	if !r.cfg.Standalone {
+		c.selfStageBinary()
+	}
+}
+
+// selfStageBinary mirrors the RUNNING agent binary out to the host's
+// /usr/local/bin/node-host-agent. The DS mounts /host/usr/local rw —
+// the host copy lets concourse-worker-init run the exact same build
+// inside the worker container without baking it into the concourse
+// image. SHA256-compared every cycle; writeManaged does the atomic
+// tmp + chmod 0755 + rename so a truncated binary can never be
+// bind-mounted by the init container.
+func (c *cyc) selfStageBinary() {
+	r := c.r
+	src, err := os.Executable()
+	if err != nil || src == "" {
+		src = "/node-host-agent" // container image path (fallback)
+	}
+	// os.Executable bao "<path> (deleted)" khi binary bi replace
+	// in-place — bo suffix va fallback ve path DS ship khi src khong
+	// doc duoc (cung quy tac resolveLocalBinary cho hubsync mirror).
+	src = strings.TrimSuffix(src, " (deleted)")
+	srcb, err := os.ReadFile(src)
+	if err != nil && src != "/node-host-agent" {
+		srcb, err = os.ReadFile("/node-host-agent")
+	}
+	if err != nil {
+		slog.Error("self-stage: cannot read running binary", "path", src, "err", err)
+		return
+	}
+	dst := "/usr/local/bin/node-host-agent"
+	if old, err := os.ReadFile(r.hp(dst)); err == nil &&
+		sha256.Sum256(old) == sha256.Sum256(srcb) {
+		// host already carries this exact build — still re-tighten a
+		// drifted mode: the hostPath consumer needs the exec bit.
+		if fi, serr := os.Stat(r.hp(dst)); serr == nil && fi.Mode().Perm() != 0o755 {
+			if cerr := os.Chmod(r.hp(dst), 0o755); cerr != nil {
+				slog.Error("self-stage: chmod 0755 failed", "err", cerr)
+			}
+		}
+		return
+	}
+	if _, err := r.writeManaged(dst, srcb, 0o755); err != nil {
+		slog.Error("self-stage: install agent binary on host failed", "err", err)
+		return
+	}
+	// writeManaged preserves a pre-existing file's mode — force 0755.
+	if err := os.Chmod(r.hp(dst), 0o755); err != nil {
+		slog.Error("self-stage: chmod 0755 failed", "err", err)
 	}
 }
 
@@ -613,6 +669,7 @@ func (c *cyc) tplCtx() map[string]any {
 		"interdc_stub_public_upstream": strv("interdc_stub_public_upstream", "1.1.1.1 8.8.8.8"),
 		"cp_endpoint":                  c.v("cp_endpoint"),
 		"api_lb_backends":              c.t.Vars.Get("api_lb_backends"),
+		"api_lb_extra_lanes":           c.t.Vars.Get("api_lb_extra_lanes"),
 		"api_lb_vip_ip":                c.v("api_lb_vip_ip"),
 		"api_lb_probe_reachable":       &topology.List{V: strSliceToAny(c.probeReachable())},
 		"fail2ban_ignoreip":            c.fail2banIgnoreIP(),

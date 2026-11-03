@@ -755,46 +755,41 @@ func (c *Collector) k0sConfig() (data []byte, parsed map[string]any, ok bool) {
 	return data, p, ok
 }
 
-// collectK0sDrift emits node_k0s_config_drift{reason,key} on
-// controller nodes (detected via the k0scontroller.service unit file).
-// One series per finding at value 1; a clean config emits
-// {reason="none",key="none"} 0. Missing/unparseable k0s.yaml keeps the
-// old drift=1 semantics as {reason="unreadable",key="k0s.yaml"} 1.
-func (c *Collector) collectK0sDrift(ch chan<- prometheus.Metric) {
-	if _, err := os.Stat(c.cfg.K0sUnitFile); err != nil {
-		return // not a k0s controller → no series
+// driftFinding is one k0s config drift result — reason is
+// removed-flag / extra-key / missing-key / unreadable, key the flag
+// or extraArgs key it fired on (the metric's {reason,key} labels).
+type driftFinding struct{ reason, key string }
+
+// scanK0sDrift computes every drift finding on one read of k0s.yaml —
+// shared between the node_k0s_config_drift collector and the
+// check-k0s-drift CLI. parseOK=false (unreadable/unparseable file)
+// keeps the old drift=1 semantics as a single {unreadable,k0s.yaml}.
+func scanK0sDrift(data []byte, parsed map[string]any, parseOK bool,
+	removedRe map[string]*regexp.Regexp, expected map[string]bool,
+	expectedOrder []string) []driftFinding {
+	if !parseOK {
+		return []driftFinding{{"unreadable", "k0s.yaml"}}
 	}
-	type finding struct{ reason, key string }
-	var findings []finding
-	data, parsed, ok := c.k0sConfig()
-	if !ok {
-		findings = append(findings, finding{"unreadable", "k0s.yaml"})
-	} else {
-		for flag, re := range c.removedFlagRe {
-			if re.Match(data) {
-				findings = append(findings, finding{"removed-flag", flag})
-			}
-		}
-		nodeKeys := kcmExtraArgKeys(parsed)
-		nodeSet := make(map[string]bool, len(nodeKeys))
-		for _, k := range nodeKeys {
-			nodeSet[k] = true
-			// A removed flag found in extraArgs reports only under
-			// removed-flag — no double counting as extra-key.
-			if _, isRemoved := c.removedFlagRe[k]; !c.expectedKCM[k] && !isRemoved {
-				findings = append(findings, finding{"extra-key", k})
-			}
-		}
-		for _, k := range c.cfg.ExpectedKCMArgs {
-			if !nodeSet[k] {
-				findings = append(findings, finding{"missing-key", k})
-			}
+	var findings []driftFinding
+	for flag, re := range removedRe {
+		if re.Match(data) {
+			findings = append(findings, driftFinding{"removed-flag", flag})
 		}
 	}
-	if len(findings) == 0 {
-		ch <- prometheus.MustNewConstMetric(c.descK0sDrift,
-			prometheus.GaugeValue, 0, "none", "none")
-		return
+	nodeKeys := kcmExtraArgKeys(parsed)
+	nodeSet := make(map[string]bool, len(nodeKeys))
+	for _, k := range nodeKeys {
+		nodeSet[k] = true
+		// A removed flag found in extraArgs reports only under
+		// removed-flag — no double counting as extra-key.
+		if _, isRemoved := removedRe[k]; !expected[k] && !isRemoved {
+			findings = append(findings, driftFinding{"extra-key", k})
+		}
+	}
+	for _, k := range expectedOrder {
+		if !nodeSet[k] {
+			findings = append(findings, driftFinding{"missing-key", k})
+		}
 	}
 	sort.Slice(findings, func(i, j int) bool {
 		if findings[i].reason != findings[j].reason {
@@ -802,6 +797,25 @@ func (c *Collector) collectK0sDrift(ch chan<- prometheus.Metric) {
 		}
 		return findings[i].key < findings[j].key
 	})
+	return findings
+}
+
+// collectK0sDrift emits node_k0s_config_drift{reason,key} on
+// controller nodes (detected via the k0scontroller.service unit file).
+// One series per finding at value 1; a clean config emits
+// {reason="none",key="none"} 0.
+func (c *Collector) collectK0sDrift(ch chan<- prometheus.Metric) {
+	if _, err := os.Stat(c.cfg.K0sUnitFile); err != nil {
+		return // not a k0s controller → no series
+	}
+	data, parsed, ok := c.k0sConfig()
+	findings := scanK0sDrift(data, parsed, ok, c.removedFlagRe,
+		c.expectedKCM, c.cfg.ExpectedKCMArgs)
+	if len(findings) == 0 {
+		ch <- prometheus.MustNewConstMetric(c.descK0sDrift,
+			prometheus.GaugeValue, 0, "none", "none")
+		return
+	}
 	for _, f := range findings {
 		ch <- prometheus.MustNewConstMetric(c.descK0sDrift,
 			prometheus.GaugeValue, 1, f.reason, f.key)

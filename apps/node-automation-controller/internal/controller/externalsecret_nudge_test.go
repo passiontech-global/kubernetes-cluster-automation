@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -219,6 +220,22 @@ func TestExternalSecretNudgeStoreListError(t *testing.T) {
 	n := newNudge(dyn, true)
 	if err := n.run(ctx); err == nil {
 		t.Fatal("expected error when the store list fails")
+	}
+}
+
+// Cluster co flag bat nhung ESO CRDs chua cai (opt-in truoc rollout)
+// -> List 404 "could not find the requested resource" — phai skip
+// lang, khong duoc dem la loi periodic run.
+func TestExternalSecretNudgeCRDsAbsent(t *testing.T) {
+	dyn := newDynFake(cssObj("css1", "False"))
+	dyn.PrependReactor("list", "clustersecretstores",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(
+				clusterSecretStoreGVR.GroupResource(), "")
+		})
+	n := newNudge(dyn, true)
+	if err := n.run(ctx); err != nil {
+		t.Fatalf("absent ESO CRDs must skip cleanly, got %v", err)
 	}
 }
 

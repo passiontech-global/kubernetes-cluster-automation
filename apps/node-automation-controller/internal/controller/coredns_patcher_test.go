@@ -131,61 +131,106 @@ func TestCorednsNeedsPatch(t *testing.T) {
 		return d
 	}
 	for _, tc := range []struct {
-		name       string
-		d          *appsv1.Deployment
-		zoneWhen   string
-		minDomains int
-		drifted    bool
+		name         string
+		d            *appsv1.Deployment
+		zoneWhen     string
+		minDomains   int
+		wantReplicas int32
+		drifted      bool
 	}{
-		{"k0s baseline", corednsDeployBare(), "DoNotSchedule", 2, true},
-		{"fully pinned", corednsDeploy("DoNotSchedule", 2), "DoNotSchedule", 2, false},
+		{"k0s baseline", corednsDeployBare(), "DoNotSchedule", 2, 0, true},
+		{"fully pinned", corednsDeploy("DoNotSchedule", 2), "DoNotSchedule", 2, 0, false},
 		{"single-zone config fully pinned",
-			corednsDeploy("ScheduleAnyway", 0), "ScheduleAnyway", 0, false},
+			corednsDeploy("ScheduleAnyway", 0), "ScheduleAnyway", 0, 0, false},
+		{"replicas nil with scaling on",
+			corednsDeploy("DoNotSchedule", 2), "DoNotSchedule", 2, 4, true},
+		{"replicas pinned", mutate(func(d *appsv1.Deployment) {
+			d.Spec.Replicas = ptr.To(int32(4))
+		}), "DoNotSchedule", 2, 4, false},
+		{"replicas below wanted", mutate(func(d *appsv1.Deployment) {
+			d.Spec.Replicas = ptr.To(int32(2))
+		}), "DoNotSchedule", 2, 4, true},
+		{"replicas above wanted", mutate(func(d *appsv1.Deployment) {
+			d.Spec.Replicas = ptr.To(int32(9))
+		}), "DoNotSchedule", 2, 4, true},
+		{"replicas mismatch ignored when scaling disabled",
+			mutate(func(d *appsv1.Deployment) {
+				d.Spec.Replicas = ptr.To(int32(7))
+			}), "DoNotSchedule", 2, 0, false},
 		{"missing coredns container", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.Containers = nil
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 		{"nil probes", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.Containers[0].LivenessProbe = nil
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 		{"probe timeout drifted", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.Containers[0].ReadinessProbe.TimeoutSeconds = 1
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 		{"request cpu drifted", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU] =
 				resource.MustParse("10m")
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 		{"limit memory drifted", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory] =
 				resource.MustParse("128Mi")
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 		{"anti-affinity back", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.Affinity = &corev1.Affinity{}
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 		{"zone whenUnsatisfiable drifted", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.TopologySpreadConstraints[0].WhenUnsatisfiable =
 				corev1.ScheduleAnyway
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 		{"minDomains drifted", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.TopologySpreadConstraints[0].MinDomains = ptr.To(int32(1))
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 		{"minDomains lost", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.TopologySpreadConstraints[0].MinDomains = nil
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 		{"taints policy not Honor", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.TopologySpreadConstraints[0].NodeTaintsPolicy = nil
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 		{"hostname constraint missing", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.TopologySpreadConstraints =
 				d.Spec.Template.Spec.TopologySpreadConstraints[:1]
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 		{"wrong selector", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.TopologySpreadConstraints[1].LabelSelector.MatchLabels =
 				map[string]string{"k8s-app": "other"}
-		}), "DoNotSchedule", 2, true},
+		}), "DoNotSchedule", 2, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := corednsNeedsPatch(tc.d, tc.zoneWhen, tc.minDomains); got != tc.drifted {
+			if got := corednsNeedsPatch(tc.d, tc.zoneWhen, tc.minDomains,
+				tc.wantReplicas); got != tc.drifted {
 				t.Fatalf("corednsNeedsPatch=%v, want %v", got, tc.drifted)
+			}
+		})
+	}
+}
+
+// proportionalReplicas is the CPA "linear" ladder — floor at
+// minReplicas, ceil at totalNodes/nodesPerReplica.
+func TestProportionalReplicas(t *testing.T) {
+	for _, tc := range []struct {
+		name                        string
+		nodes, min, nodesPerReplica int
+		want                        int32
+	}{
+		{"zero nodes floors at min", 0, 4, 1, 4},
+		{"below min floors", 3, 4, 1, 4},
+		{"exact min", 4, 4, 1, 4},
+		{"above min", 9, 4, 1, 9},
+		{"ceil division rounds up", 9, 4, 2, 5},
+		{"ceil division exact", 8, 4, 2, 4},
+		{"min 1 single-zone", 5, 1, 1, 5},
+		{"zero nodesPerReplica clamped", 10, 3, 0, 10},
+		{"negative nodesPerReplica clamped", 10, 3, -2, 10},
+		{"min 0 still ceils", 2, 0, 3, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := proportionalReplicas(tc.nodes, tc.min,
+				tc.nodesPerReplica); got != tc.want {
+				t.Fatalf("proportionalReplicas=%d, want %d", got, tc.want)
 			}
 		})
 	}
@@ -210,8 +255,109 @@ func TestCoreDNSPatcherAppliesPatch(t *testing.T) {
 	if !strings.Contains(string(got), `"minDomains":2`) {
 		t.Fatalf("zone constraint missing minDomains: %s", got)
 	}
-	if corednsNeedsPatch(getCorednsDeploy(t, cs), "DoNotSchedule", 2) {
+	if strings.Contains(string(got), `"replicas"`) {
+		t.Fatalf("disabled scaling must not send replicas: %s", got)
+	}
+	if corednsNeedsPatch(getCorednsDeploy(t, cs), "DoNotSchedule", 2, 0) {
 		t.Fatal("deployment still drifted after patch")
+	}
+}
+
+// With proportional scaling on, the patch carries spec.replicas =
+// max(min, ceil(nodes/per)) — 9 nodes / per=2 ceils to 5, above the
+// min-4 floor — and the tracker state afterwards is drift-free.
+func TestCoreDNSPatcherScalesReplicas(t *testing.T) {
+	cs := fake.NewSimpleClientset(corednsDeployBare(),
+		node("n1", corev1.ConditionTrue, nil),
+		node("n2", corev1.ConditionTrue, nil),
+		node("n3", corev1.ConditionTrue, nil),
+		node("n4", corev1.ConditionTrue, nil),
+		node("n5", corev1.ConditionTrue, nil),
+		node("n6", corev1.ConditionTrue, nil),
+		node("n7", corev1.ConditionTrue, nil),
+		node("n8", corev1.ConditionTrue, nil),
+		node("n9", corev1.ConditionTrue, nil))
+	var got []byte
+	captureDeployPatch(cs, &got)
+
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
+		minReplicas: 4, nodesPerReplica: 2}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !strings.Contains(string(got), `"replicas":5`) {
+		t.Fatalf("patch missing proportional replicas: %s", got)
+	}
+	d := getCorednsDeploy(t, cs)
+	if d.Spec.Replicas == nil || *d.Spec.Replicas != 5 {
+		t.Fatalf("deployment replicas = %v, want 5", d.Spec.Replicas)
+	}
+	if corednsNeedsPatch(d, "DoNotSchedule", 2, 5) {
+		t.Fatal("deployment still drifted after patch")
+	}
+}
+
+// Fewer nodes than the floor: 2 nodes / per=1 ceils to 2, but the
+// min-4 floor wins.
+func TestCoreDNSPatcherReplicasFloor(t *testing.T) {
+	cs := fake.NewSimpleClientset(corednsDeployBare(),
+		node("n1", corev1.ConditionTrue, nil),
+		node("n2", corev1.ConditionTrue, nil))
+	var got []byte
+	captureDeployPatch(cs, &got)
+
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
+		minReplicas: 4, nodesPerReplica: 1}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !strings.Contains(string(got), `"replicas":4`) {
+		t.Fatalf("patch missing floor replicas: %s", got)
+	}
+}
+
+// minReplicas=0 disables the pin entirely — an already-pinned
+// Deployment with an odd replica count is left alone (a re-enabled
+// standalone CPA owns .spec.replicas then).
+func TestCoreDNSPatcherScalingDisabledKeepsReplicas(t *testing.T) {
+	d := corednsDeploy("DoNotSchedule", 2)
+	d.Spec.Replicas = ptr.To(int32(2))
+	cs := fake.NewSimpleClientset(d,
+		node("n1", corev1.ConditionTrue, nil),
+		node("n2", corev1.ConditionTrue, nil),
+		node("n3", corev1.ConditionTrue, nil),
+		node("n4", corev1.ConditionTrue, nil),
+		node("n5", corev1.ConditionTrue, nil),
+		node("n6", corev1.ConditionTrue, nil),
+		node("n7", corev1.ConditionTrue, nil),
+		node("n8", corev1.ConditionTrue, nil))
+	var patched bool
+	forbidDeployPatch(cs, &patched)
+
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if patched {
+		t.Fatal("disabled scaling patched .spec.replicas")
+	}
+	if *getCorednsDeploy(t, cs).Spec.Replicas != 2 {
+		t.Fatal("replicas changed while scaling disabled")
+	}
+}
+
+// A node list failure with scaling on must surface (the replica count
+// would be computed from a partial picture otherwise).
+func TestCoreDNSPatcherNodeListError(t *testing.T) {
+	cs := fake.NewSimpleClientset(corednsDeployBare())
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
+		minReplicas: 4, nodesPerReplica: 1}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the node list fails")
 	}
 }
 
@@ -264,11 +410,18 @@ func patchZoneConstraint(t *testing.T, patch []byte) map[string]any {
 }
 
 func TestCoreDNSPatcherNoOpWhenCorrect(t *testing.T) {
-	cs := fake.NewSimpleClientset(corednsDeploy("DoNotSchedule", 2))
+	// Fully pinned INCLUDING the proportional replica count — 2 nodes
+	// / per=1 ceils to 2, the min-4 floor bumps it to 4.
+	d := corednsDeploy("DoNotSchedule", 2)
+	d.Spec.Replicas = ptr.To(int32(4))
+	cs := fake.NewSimpleClientset(d,
+		node("n1", corev1.ConditionTrue, nil),
+		node("n2", corev1.ConditionTrue, nil))
 	var patched bool
 	forbidDeployPatch(cs, &patched)
 
-	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
+		minReplicas: 4, nodesPerReplica: 1}
 	res, err := r.Reconcile(ctx, reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -321,7 +474,7 @@ func TestCoreDNSPatcherPatchError(t *testing.T) {
 func TestSetupCoreDNSPatcherDisabled(t *testing.T) {
 	m := newStubManager()
 	if err := SetupCoreDNSPatcher(m, fake.NewSimpleClientset(),
-		false, "DoNotSchedule", 2); err != nil {
+		false, "DoNotSchedule", 2, 4, 1); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.added) != 0 {
@@ -334,7 +487,7 @@ func TestSetupCoreDNSPatcherDisabled(t *testing.T) {
 func TestSetupCoreDNSPatcherPredicate(t *testing.T) {
 	p := forPredicate(t, func(m manager.Manager) error {
 		return SetupCoreDNSPatcher(m, fake.NewSimpleClientset(),
-			true, "DoNotSchedule", 2)
+			true, "DoNotSchedule", 2, 4, 1)
 	})
 	coredns := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "kube-system", Name: "coredns"}}
@@ -350,5 +503,39 @@ func TestSetupCoreDNSPatcherPredicate(t *testing.T) {
 		Namespace: "default", Name: "coredns"}}
 	if p.Create(event.CreateEvent{Object: wrongNS}) {
 		t.Fatal("wrong-namespace Deployment passed the predicate")
+	}
+}
+
+// The Node watch (second watch source) drives the proportional
+// replica count: only create/delete may fire — includeUnschedulableNodes
+// counts every Node object, so updates never change the total and
+// would only add kubelet-heartbeat churn.
+func TestSetupCoreDNSPatcherNodeWatch(t *testing.T) {
+	m := newStubManager()
+	if err := SetupCoreDNSPatcher(m, fake.NewSimpleClientset(),
+		true, "DoNotSchedule", 2, 4, 1); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	srcs := controllerWatches(t, m.added[0])
+	if len(srcs) != 2 {
+		t.Fatalf("patcher registered %d watches, want 2 (Deployment + Node)", len(srcs))
+	}
+	preds, _ := kindSource(t, srcs[1])
+	if len(preds) != 1 {
+		t.Fatalf("Node watch carries %d predicates, want 1", len(preds))
+	}
+	p := preds[0]
+	n1 := node("n1", corev1.ConditionTrue, nil)
+	if !p.Create(event.CreateEvent{Object: n1}) {
+		t.Fatal("node add did not fire")
+	}
+	if !p.Delete(event.DeleteEvent{Object: n1}) {
+		t.Fatal("node delete did not fire")
+	}
+	if p.Update(updateEvent(n1, node("n1", corev1.ConditionFalse, nil))) {
+		t.Fatal("node update fired — heartbeat/cordon churn would re-reconcile constantly")
+	}
+	if p.Generic(event.GenericEvent{Object: n1}) {
+		t.Fatal("generic event fired")
 	}
 }

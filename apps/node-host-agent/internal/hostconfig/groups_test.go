@@ -1142,3 +1142,330 @@ func TestHairpinPruneOnlyOnLighthouse(t *testing.T) {
 		t.Fatalf("hairpin probe ran on non-lighthouse: %v", sr2.callsMatching("route get"))
 	}
 }
+
+// ---------- self-stage /usr/local/bin/node-host-agent ----------
+
+func TestSelfStageBinaryCopiesAndIsIdempotent(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcb, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcSum := sha256.Sum256(srcb)
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	// stale/different host binary -> must be replaced by the running build
+	hostWrite(t, r, "/usr/local/bin/node-host-agent", "stale-binary")
+
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupBase()
+
+	dst := filepath.Join(r.cfg.HostRoot, "/usr/local/bin/node-host-agent")
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("staged binary missing: %v", err)
+	}
+	if sha256.Sum256(got) != srcSum {
+		t.Fatal("staged binary sha256 != running binary")
+	}
+	if fi, err := os.Stat(dst); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("staged binary mode = %v want 0755", fi)
+	}
+	// second cycle: hash matches -> writeManaged must not rewrite
+	// (the staged content survives untouched).
+	c.groupBase()
+	got2, _ := os.ReadFile(dst)
+	if string(got2) != string(got) {
+		t.Fatal("staged binary rewritten despite matching sha256")
+	}
+}
+
+func TestSelfStageSkippedOnStandalone(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Standalone: true, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupBase()
+	if hostExists(r, "/usr/local/bin/node-host-agent") {
+		t.Fatal("binary staged on a standalone host — /host/usr/local not mounted there")
+	}
+}
+
+// ---------- Phase 1.3 + 2: api-local-dnat.nft + haproxy extra lanes ----------
+
+func laneVars(t *testing.T) string {
+	return writeVarsDir(t, `api_lb_vip_ip: "203.0.113.14"
+api_lb_haproxy_version: "2.8.16-0ubuntu0.24.04.3"
+api_lb_backends:
+  - name: api_datahub
+    addr: "10.0.1.10:6443"
+  - name: api_far
+    addr: "10.0.2.99:6443"
+    probe: true
+    backup: true
+api_lb_extra_lanes:
+  - { name: konnectivity, port: 8132 }
+  - { name: k0sjoin, port: 9443 }
+`)
+}
+
+func TestAPILBExtraLanesNftAndCfg(t *testing.T) {
+	vars := laneVars(t)
+	sr := lbRunner()
+	r := newLBHost(t, vars, sr)
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupAPILB()
+
+	nft := hostRead(t, r, "/etc/api-local-dnat.nft")
+	for _, want := range []string{
+		"destroy table ip api_local_dnat",
+		"type nat hook output priority dstnat; policy accept;",
+		`meta skuid "haproxy" accept`,
+		"meta skuid 65534 accept",
+		"ip daddr 203.0.113.14 tcp dport 6443 dnat to 127.0.0.1:6443",
+		"ip daddr 203.0.113.14 tcp dport 8132 dnat to 127.0.0.1:8132",
+		"ip daddr 203.0.113.14 tcp dport 9443 dnat to 127.0.0.1:9443",
+	} {
+		if !strings.Contains(nft, want) {
+			t.Fatalf("dnat ruleset missing %q:\n%s", want, nft)
+		}
+	}
+	cfg := hostRead(t, r, "/etc/haproxy/api-local-lb.cfg")
+	for _, want := range []string{
+		"frontend konnectivity_local",
+		"bind 127.0.0.1:8132",
+		"default_backend konnectivity_local_back",
+		"backend konnectivity_local_back",
+		"server api_datahub 10.0.1.10:8132 check inter 5s fall 2 rise 2",
+		"server api_far 10.0.2.99:8132 check inter 5s fall 2 rise 2 backup",
+		"frontend k0sjoin_local",
+		"bind 127.0.0.1:9443",
+		"backend k0sjoin_local_back",
+		"server api_datahub 10.0.1.10:9443 check inter 5s fall 2 rise 2",
+		"server api_far 10.0.2.99:9443 check inter 5s fall 2 rise 2 backup",
+		// main lane still :6443
+		"frontend api_local\n    bind 127.0.0.1:6443",
+		"server api_datahub 10.0.1.10:6443 check inter 5s fall 2 rise 2",
+	} {
+		if !strings.Contains(cfg, want) {
+			t.Fatalf("haproxy cfg missing %q:\n%s", want, cfg)
+		}
+	}
+}
+
+func TestAPILBExtraLanesProbeFiltered(t *testing.T) {
+	vars := laneVars(t)
+	sr := lbRunner()
+	// api_far probe fails -> filtered out of EVERY lane backend too.
+	sr.errs["/dev/tcp/10.0.2.99/6443"] = true
+	r := newLBHost(t, vars, sr)
+	c := loadCyc(t, r, vars, "node-b")
+	cfg, err := r.render("api-local-lb.haproxy.cfg.j2", c.tplCtx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(cfg)
+	for _, bad := range []string{
+		"server api_far 10.0.2.99:6443",
+		"server api_far 10.0.2.99:8132",
+		"server api_far 10.0.2.99:9443",
+	} {
+		if strings.Contains(s, bad) {
+			t.Fatalf("unreachable probe backend rendered in a lane (%q):\n%s", bad, s)
+		}
+	}
+	if !strings.Contains(s, "server api_datahub 10.0.1.10:8132") ||
+		!strings.Contains(s, "server api_datahub 10.0.1.10:9443") {
+		t.Fatalf("lane backends missing after probe filter:\n%s", s)
+	}
+}
+
+// ---------- Phase 3: kine.service ----------
+
+func TestKineServiceOffByDefault(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupKineService()
+	for _, p := range []string{
+		"/etc/systemd/system/kine.service", "/etc/kine/kine.env",
+		"/usr/local/bin/kine",
+	} {
+		if hostExists(r, p) {
+			t.Fatalf("%s written while node not in kine_service_hosts", p)
+		}
+	}
+	for _, call := range sr.calls {
+		if strings.Contains(call, "kine") {
+			t.Fatalf("kine touched on unlisted host: %s", call)
+		}
+	}
+}
+
+func TestKineServiceConverge(t *testing.T) {
+	bin := []byte("fake-kine-binary")
+	sum := sha256.Sum256(bin)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(bin)
+	}))
+	t.Cleanup(srv.Close)
+	vars := writeVarsDir(t, fmt.Sprintf(`kine_service_hosts: [node-a]
+kine_bin_url: "%s/kine"
+kine_bin_sha256: "%x"
+kine_endpoint: "postgres://postgres:pw@db.test.internal:6432/postgres?sslmode=disable"
+`, srv.URL, sum))
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// wrong-hash binary staged -> must be re-downloaded
+	hostWrite(t, r, "/usr/local/bin/kine", "tampered")
+
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupKineService()
+
+	gotBin, err := os.ReadFile(filepath.Join(r.cfg.HostRoot, "/usr/local/bin/kine"))
+	if err != nil || sha256.Sum256(gotBin) != sum {
+		t.Fatalf("kine binary not staged/verified: %v", err)
+	}
+	if fi, _ := os.Stat(filepath.Join(r.cfg.HostRoot, "/usr/local/bin/kine")); fi.Mode().Perm() != 0o755 {
+		t.Fatalf("kine binary mode = %v want 0755", fi)
+	}
+	env := hostRead(t, r, "/etc/kine/kine.env")
+	if !strings.Contains(env, "KINE_ENDPOINT=postgres://postgres:pw@db.test.internal:6432/postgres?sslmode=disable") {
+		t.Fatalf("kine.env missing endpoint:\n%s", env)
+	}
+	if fi, _ := os.Stat(filepath.Join(r.cfg.HostRoot, "/etc/kine/kine.env")); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("kine.env mode = %v want 0600", fi)
+	}
+	if fi, _ := os.Stat(filepath.Join(r.cfg.HostRoot, "/etc/kine")); fi.Mode().Perm() != 0o700 {
+		t.Fatalf("/etc/kine mode = %v want 0700", fi)
+	}
+	unit := hostRead(t, r, "/etc/systemd/system/kine.service")
+	for _, want := range []string{
+		"Before=k0scontroller.service",
+		"MemoryMax=2G",
+		"MemorySwapMax=0",
+		"Environment=GOMEMLIMIT=1500MiB",
+		"Environment=GOGC=50",
+		"OOMScoreAdjust=-500",
+		"CPUWeight=2000",
+		"EnvironmentFile=/etc/kine/kine.env",
+		"ExecStartPre=/usr/bin/mkdir -p /run/k0s",
+		"ExecStartPost=/bin/sh -c 'i=0; while [ ! -S /run/k0s/kine.sock ]",
+		"ExecStart=/usr/local/bin/kine --listen-address=unix:///run/k0s/kine.sock --metrics-bind-address=:2380",
+		"Restart=always",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("kine.service missing %q:\n%s", want, unit)
+		}
+	}
+	if len(sr.callsMatching("systemctl daemon-reload")) == 0 {
+		t.Fatal("daemon-reload not run after unit write")
+	}
+	if len(sr.callsMatching("systemctl enable kine.service")) == 0 ||
+		len(sr.callsMatching("systemctl start kine.service")) == 0 {
+		t.Fatal("kine.service not enabled+started")
+	}
+	// first converge changes binary/env/unit -> restart to activate.
+	if len(sr.callsMatching("systemctl restart kine.service")) == 0 {
+		t.Fatal("kine.service not restarted after input changes")
+	}
+}
+
+func TestKineServiceSkipsWithoutBinaryPins(t *testing.T) {
+	vars := writeVarsDir(t, `kine_service_hosts: [node-a]
+kine_endpoint: "postgres://x"
+`)
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupKineService()
+	if hostExists(r, "/etc/systemd/system/kine.service") {
+		t.Fatal("unit written while the kine binary is unpinned/unverifiable")
+	}
+	if len(sr.callsMatching("systemctl enable kine.service")) > 0 {
+		t.Fatal("kine.service enabled without a verified binary")
+	}
+}
+
+// Contract defaults.yaml: kine_endpoint rong = khong render unit —
+// kine khong co DSN se fallback sqlite tren socket apiserver tro toi
+// (data loss), nen host listed nhung endpoint trong thi fail closed.
+func TestKineServiceSkipsEmptyEndpoint(t *testing.T) {
+	vars := writeVarsDir(t, `kine_service_hosts: [node-a]
+kine_bin_url: "https://example/kine"
+kine_bin_sha256: "deadbeef"
+kine_endpoint: ""
+`)
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupKineService()
+	if hostExists(r, "/etc/systemd/system/kine.service") || hostExists(r, "/etc/kine/kine.env") {
+		t.Fatal("unit/env rendered with empty kine_endpoint")
+	}
+	if len(sr.callsMatching("systemctl enable kine.service")) > 0 ||
+		len(sr.callsMatching("systemctl start kine.service")) > 0 {
+		t.Fatal("kine.service enabled/started with empty kine_endpoint")
+	}
+}
+
+func TestKineServiceIdempotentNoDownload(t *testing.T) {
+	bin := []byte("fake-kine-binary")
+	sum := sha256.Sum256(bin)
+	vars := writeVarsDir(t, fmt.Sprintf(`kine_service_hosts: [node-a]
+kine_bin_url: "http://127.0.0.1:1/never-used"
+kine_bin_sha256: "%x"
+kine_endpoint: "postgres://x"
+`, sum))
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// correct binary already on host -> no fetch attempt against the
+	// (unreachable) URL.
+	if err := os.MkdirAll(filepath.Join(r.cfg.HostRoot, "/usr/local/bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(r.cfg.HostRoot, "/usr/local/bin/kine"), bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupKineService()
+	if !hostExists(r, "/etc/systemd/system/kine.service") {
+		t.Fatal("unit not written on a listed host")
+	}
+}

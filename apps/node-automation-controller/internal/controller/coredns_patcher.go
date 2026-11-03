@@ -20,6 +20,14 @@
 // nodes out of the domain calculation so DoNotSchedule can't lock
 // the rollout. The watch patches drift back in <1s; the 15m requeue
 // replaces the old hourly crontab.
+//
+// Proportional scaling (replaces cluster-proportional-autoscaler):
+// when minReplicas>0 the reconciler also pins .spec.replicas to the
+// CPA "linear" formula with includeUnschedulableNodes=true —
+// max(minReplicas, ceil(totalNodes/nodesPerReplica)) — and a Node
+// watch re-reconciles on every node add/remove. minReplicas<=0
+// disables the pin (the Deployment keeps its own .spec.replicas) so
+// a cluster can re-enable the standalone CPA without being fought.
 package controller
 
 import (
@@ -37,6 +45,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -52,27 +62,50 @@ var (
 )
 
 type corednsPatcher struct {
-	cs         kubernetes.Interface
-	zoneWhen   string
-	minDomains int
+	cs              kubernetes.Interface
+	zoneWhen        string
+	minDomains      int
+	minReplicas     int
+	nodesPerReplica int
 }
 
 // SetupCoreDNSPatcher reconciles only the coredns Deployment (the
 // informer sees every kube-system Deployment — the predicate pins
 // ns/name). Clusters without the module (enabled=false, e.g. ones
 // managing coredns themselves) skip registration entirely.
-func SetupCoreDNSPatcher(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, zoneWhen string, zoneMinDomains int) error {
+//
+// minReplicas/nodesPerReplica are the CPA-linear replica pin — see
+// proportionalReplicas. minReplicas<=0 disables the pin entirely.
+func SetupCoreDNSPatcher(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, zoneWhen string, zoneMinDomains, minReplicas, nodesPerReplica int) error {
 	if !enabled {
 		return nil
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		Named("coredns-patcher").
 		For(&appsv1.Deployment{}, builder.WithPredicates(
 			predicate.NewPredicateFuncs(func(o client.Object) bool {
 				return o.GetNamespace() == "kube-system" &&
 					o.GetName() == "coredns"
-			}))).
-		Complete(&corednsPatcher{cs: cs, zoneWhen: zoneWhen, minDomains: zoneMinDomains})
+			})))
+	if minReplicas > 0 {
+		// Node add/remove changes the proportional replica total. The
+		// formula's includeUnschedulableNodes=true counts EVERY Node
+		// object, so updates (cordon flips, ~20s kubelet heartbeats)
+		// can never change the count and must not enqueue — only
+		// create/delete fire. Collapses to one fixed key: Reconcile
+		// ignores the request name anyway. With the pin disabled the
+		// count is never read, so the watch is not registered at all.
+		b = b.Watches(&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(sweepRequests("coredns-patcher-sweep")),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc:  func(event.CreateEvent) bool { return true },
+				DeleteFunc:  func(event.DeleteEvent) bool { return true },
+				UpdateFunc:  func(event.UpdateEvent) bool { return false },
+				GenericFunc: func(event.GenericEvent) bool { return false },
+			}))
+	}
+	return b.Complete(&corednsPatcher{cs: cs, zoneWhen: zoneWhen, minDomains: zoneMinDomains,
+		minReplicas: minReplicas, nodesPerReplica: nodesPerReplica})
 }
 
 func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -89,11 +122,24 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	if !corednsNeedsPatch(d, r.zoneWhen, r.minDomains) {
-		log.Info("probes/resources/topology already pinned - nothing to do")
+	// Proportional replica pin — disabled when minReplicas<=0
+	// (wantReplicas stays 0: neither needsPatch nor the patch body
+	// touches .spec.replicas then).
+	wantReplicas := int32(0)
+	if r.minReplicas > 0 {
+		nodes, err := listNodes(ctx, r.cs)
+		if err != nil {
+			metrics.IncError("coredns-patcher")
+			return ctrl.Result{}, err
+		}
+		wantReplicas = proportionalReplicas(len(nodes), r.minReplicas, r.nodesPerReplica)
+	}
+
+	if !corednsNeedsPatch(d, r.zoneWhen, r.minDomains, wantReplicas) {
+		log.Info("probes/resources/topology/replicas already pinned - nothing to do")
 		return res, nil
 	}
-	patch, err := corednsPatchBody(r.zoneWhen, r.minDomains)
+	patch, err := corednsPatchBody(r.zoneWhen, r.minDomains, wantReplicas)
 	if err != nil {
 		metrics.IncError("coredns-patcher")
 		return ctrl.Result{}, err
@@ -115,11 +161,39 @@ func corednsMinDomainsWanted(zoneWhen string, minDomains int) bool {
 	return zoneWhen == string(corev1.DoNotSchedule) && minDomains > 0
 }
 
+// proportionalReplicas is the cluster-proportional-autoscaler
+// "linear" formula with includeUnschedulableNodes=true — every Node
+// object counts, cordoned or not:
+//
+//	replicas = max(minReplicas, ceil(totalNodes / nodesPerReplica))
+//
+// nodesPerReplica<=0 is clamped to 1 — a 0 divisor would otherwise
+// mean "one replica per node" anyway under the CPA semantics.
+func proportionalReplicas(totalNodes, minReplicas, nodesPerReplica int) int32 {
+	if nodesPerReplica <= 0 {
+		nodesPerReplica = 1
+	}
+	n := (totalNodes + nodesPerReplica - 1) / nodesPerReplica
+	if n < minReplicas {
+		n = minReplicas
+	}
+	return int32(n)
+}
+
 // corednsNeedsPatch reports whether the Deployment lacks any pinned
-// field — probe timeouts, requests/limits, cleared affinity, or the
-// two wanted spread constraints. A missing coredns container counts
-// as drifted (same as the shell's empty jsonpath probe).
-func corednsNeedsPatch(d *appsv1.Deployment, zoneWhen string, minDomains int) bool {
+// field — probe timeouts, requests/limits, cleared affinity, the two
+// wanted spread constraints, or (when proportional scaling is on,
+// wantReplicas>0) a drifted .spec.replicas. A missing coredns
+// container counts as drifted (same as the shell's empty jsonpath
+// probe).
+func corednsNeedsPatch(d *appsv1.Deployment, zoneWhen string, minDomains int, wantReplicas int32) bool {
+	// Replica drift only counts when the pin is enabled — a nil
+	// .spec.replicas defaults to 1 at the API but still means "we
+	// never pinned it", so it counts as drifted too.
+	if wantReplicas > 0 &&
+		(d.Spec.Replicas == nil || *d.Spec.Replicas != wantReplicas) {
+		return true
+	}
 	ps := d.Spec.Template.Spec
 	for i := range ps.Containers {
 		c := &ps.Containers[i]
@@ -194,7 +268,11 @@ func corednsTopologyOK(tscs []corev1.TopologySpreadConstraint, zoneWhen string, 
 // DoNotSchedule patch — leaving minDomains on a ScheduleAnyway
 // constraint that the API then rejects (the cicd shell override sent
 // "minDomains": null for the same reason).
-func corednsPatchBody(zoneWhen string, minDomains int) ([]byte, error) {
+//
+// spec.replicas is only sent when wantReplicas>0 — an omitted key
+// keeps the Deployment's current replica count under strategic
+// merge, so disabled scaling never fights an external autoscaler.
+func corednsPatchBody(zoneWhen string, minDomains int, wantReplicas int32) ([]byte, error) {
 	zone := map[string]any{
 		"maxSkew":            1,
 		"topologyKey":        "topology.kubernetes.io/zone",
@@ -208,33 +286,35 @@ func corednsPatchBody(zoneWhen string, minDomains int) ([]byte, error) {
 	} else {
 		zone["minDomains"] = nil // explicit null — deletes a stale value
 	}
-	return json.Marshal(map[string]any{
-		"spec": map[string]any{
-			"template": map[string]any{
-				"spec": map[string]any{
-					"affinity": nil,
-					"containers": []any{map[string]any{
-						"name":           "coredns",
-						"livenessProbe":  map[string]any{"timeoutSeconds": 5},
-						"readinessProbe": map[string]any{"timeoutSeconds": 5},
-						"resources": map[string]any{
-							"requests": map[string]any{"cpu": "25m", "memory": "64Mi"},
-							"limits":   map[string]any{"cpu": "300m", "memory": "256Mi"},
-						},
-					}},
-					"topologySpreadConstraints": []any{
-						zone,
-						map[string]any{
-							"maxSkew":            1,
-							"topologyKey":        "kubernetes.io/hostname",
-							"whenUnsatisfiable":  "ScheduleAnyway",
-							"nodeTaintsPolicy":   "Honor",
-							"nodeAffinityPolicy": "Honor",
-							"labelSelector":      map[string]any{"matchLabels": map[string]any{"k8s-app": "kube-dns"}},
-						},
+	spec := map[string]any{
+		"template": map[string]any{
+			"spec": map[string]any{
+				"affinity": nil,
+				"containers": []any{map[string]any{
+					"name":           "coredns",
+					"livenessProbe":  map[string]any{"timeoutSeconds": 5},
+					"readinessProbe": map[string]any{"timeoutSeconds": 5},
+					"resources": map[string]any{
+						"requests": map[string]any{"cpu": "25m", "memory": "64Mi"},
+						"limits":   map[string]any{"cpu": "300m", "memory": "256Mi"},
+					},
+				}},
+				"topologySpreadConstraints": []any{
+					zone,
+					map[string]any{
+						"maxSkew":            1,
+						"topologyKey":        "kubernetes.io/hostname",
+						"whenUnsatisfiable":  "ScheduleAnyway",
+						"nodeTaintsPolicy":   "Honor",
+						"nodeAffinityPolicy": "Honor",
+						"labelSelector":      map[string]any{"matchLabels": map[string]any{"k8s-app": "kube-dns"}},
 					},
 				},
 			},
 		},
-	})
+	}
+	if wantReplicas > 0 {
+		spec["replicas"] = wantReplicas
+	}
+	return json.Marshal(map[string]any{"spec": spec})
 }

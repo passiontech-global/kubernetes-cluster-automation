@@ -156,11 +156,19 @@ type probeResult struct {
 	revSeen   bool
 	notes     []string
 	succeeded bool
+
+	// Reporting fields for the check-kine-db CLI — names + counters
+	// the bash script interpolated into its check lines.
+	pgName  string // resolved postgres container name
+	pgbName string // resolved pgbouncer container name
+	envUser string // POSTGRES_USER read from the stack .env
+	logErrs int64  // error-line count in the pgbouncer log window
 }
 
-// probeCycle runs one full probe round and emits metrics + textfile.
-// Returns the result for tests.
-func (k *KineDB) probeCycle(ctx context.Context) *probeResult {
+// runProbeChecks executes every probe check once and fills
+// probeResult — no metrics, no textfile. probeCycle adds emission
+// on top; RunCheckCLI consumes the same result for OK/FAIL lines.
+func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
 	res := &probeResult{checks: map[string]int64{}}
 	for _, c := range probeChecks {
 		res.checks[c] = 0
@@ -169,6 +177,7 @@ func (k *KineDB) probeCycle(ctx context.Context) *probeResult {
 
 	pg := k.pgContainerName(ctx)
 	pgb := k.pgbContainerName(ctx)
+	res.pgName, res.pgbName = pg, pgb
 
 	// (a) containers running.
 	if k.containerRunning(ctx, pg) && k.containerRunning(ctx, pgb) {
@@ -186,6 +195,7 @@ func (k *KineDB) probeCycle(ctx context.Context) *probeResult {
 	}
 
 	user, pass, credOK := k.creds()
+	res.envUser = user
 	if res.checks[checkContainers] == 1 {
 		// (e) pgbouncer log scan needs no .env creds — the bash
 		// ran it whenever both containers were up.
@@ -203,6 +213,13 @@ func (k *KineDB) probeCycle(ctx context.Context) *probeResult {
 		res.checks[checkPools] == 1 &&
 		res.checks[checkBackendEnv] == 1 &&
 		res.checks[checkLogErrors] == 1
+	return res
+}
+
+// probeCycle runs one full probe round and emits metrics + textfile.
+// Returns the result for tests.
+func (k *KineDB) probeCycle(ctx context.Context) *probeResult {
+	res := k.runProbeChecks(ctx)
 
 	k.emitProbe(res)
 	sum := fmt.Sprintf(
@@ -329,7 +346,9 @@ func (k *KineDB) probeLogScan(ctx context.Context, pgb string,
 	res *probeResult, note func(string)) {
 	logs, _ := k.exec(ctx, []string{k.cfg.Runtime, "logs",
 		"--since", "301s", pgb}, "")
-	if n := len(rePGBLogErr.FindAllString(logs, -1)); n == 0 {
+	n := int64(len(rePGBLogErr.FindAllString(logs, -1)))
+	res.logErrs = n
+	if n == 0 {
 		res.checks[checkLogErrors] = 1
 	} else {
 		note(fmt.Sprintf("log-errors=%d", n))

@@ -16,6 +16,12 @@
 //     COREDNS_PATCHER_ENABLED / _ZONE_WHEN / _ZONE_MIN_DOMAINS,
 //     METRICS_SERVER_PATCHER_ENABLED, CF_TUNNEL_WATCHDOG_ENABLED /
 //     _NAMESPACE / _INTERVAL — an explicit "false" opts out.
+//   - Proportional replica pinning (replaces the
+//     cluster-proportional-autoscaler Deployments):
+//     COREDNS_MIN_REPLICAS / COREDNS_NODES_PER_REPLICA (default 4/1),
+//     METRICS_SERVER_MIN_REPLICAS / METRICS_SERVER_NODES_PER_REPLICA
+//     (default 3/1). minReplicas<=0 disables the pin and leaves
+//     .spec.replicas untouched so standalone CPA can be re-enabled.
 package main
 
 import (
@@ -232,21 +238,25 @@ func main() {
 // the modules need — the same flags the shell-operator read from its
 // ConfigMaps (see header contract).
 type moduleConfig struct {
-	ciliumEnabled               bool
-	fluentbitEnabled            bool
-	certReaperEnabled           bool
-	ciliumAuditEnabled          bool
-	esNudgeEnabled              bool
-	csrApproveEnabled           bool
-	labelerPath                 string
-	concourseJanitorEnabled     bool
-	corednsPatcherEnabled       bool
-	corednsZoneWhen             string
-	corednsZoneMinDomains       int
-	metricsServerPatcherEnabled bool
-	cfTunnelWatchdogEnabled     bool
-	cfTunnelWatchdogNamespace   string
-	cfTunnelWatchdogInterval    time.Duration
+	ciliumEnabled                bool
+	fluentbitEnabled             bool
+	certReaperEnabled            bool
+	ciliumAuditEnabled           bool
+	esNudgeEnabled               bool
+	csrApproveEnabled            bool
+	labelerPath                  string
+	concourseJanitorEnabled      bool
+	corednsPatcherEnabled        bool
+	corednsZoneWhen              string
+	corednsZoneMinDomains        int
+	corednsMinReplicas           int
+	corednsNodesPerReplica       int
+	metricsServerPatcherEnabled  bool
+	metricsServerMinReplicas     int
+	metricsServerNodesPerReplica int
+	cfTunnelWatchdogEnabled      bool
+	cfTunnelWatchdogNamespace    string
+	cfTunnelWatchdogInterval     time.Duration
 }
 
 // moduleConfigFromEnv resolves every feature-gate env var once, after
@@ -264,11 +274,15 @@ func moduleConfigFromEnv() moduleConfig {
 		// The three ported patcher/watchdog CronJobs were always-on
 		// base components — default-ON here too (explicit "false"
 		// opts a cluster out), unlike the opt-in gates above.
-		corednsPatcherEnabled:       os.Getenv("COREDNS_PATCHER_ENABLED") != "false",
-		corednsZoneWhen:             getenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule"),
-		corednsZoneMinDomains:       getenvInt("COREDNS_PATCHER_ZONE_MIN_DOMAINS", 2),
-		metricsServerPatcherEnabled: os.Getenv("METRICS_SERVER_PATCHER_ENABLED") != "false",
-		cfTunnelWatchdogEnabled:     os.Getenv("CF_TUNNEL_WATCHDOG_ENABLED") != "false",
+		corednsPatcherEnabled:        os.Getenv("COREDNS_PATCHER_ENABLED") != "false",
+		corednsZoneWhen:              getenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule"),
+		corednsZoneMinDomains:        getenvInt("COREDNS_PATCHER_ZONE_MIN_DOMAINS", 2),
+		corednsMinReplicas:           getenvInt("COREDNS_MIN_REPLICAS", 4),
+		corednsNodesPerReplica:       getenvInt("COREDNS_NODES_PER_REPLICA", 1),
+		metricsServerPatcherEnabled:  os.Getenv("METRICS_SERVER_PATCHER_ENABLED") != "false",
+		metricsServerMinReplicas:     getenvInt("METRICS_SERVER_MIN_REPLICAS", 3),
+		metricsServerNodesPerReplica: getenvInt("METRICS_SERVER_NODES_PER_REPLICA", 1),
+		cfTunnelWatchdogEnabled:      os.Getenv("CF_TUNNEL_WATCHDOG_ENABLED") != "false",
 		cfTunnelWatchdogNamespace: getenv("CF_TUNNEL_WATCHDOG_NAMESPACE",
 			"cloudflare-tunnel-system"),
 		cfTunnelWatchdogInterval: getenvDuration("CF_TUNNEL_WATCHDOG_INTERVAL",
@@ -307,10 +321,12 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 		},
 		"coredns-patcher": func() error {
 			return controller.SetupCoreDNSPatcher(mgr, cs,
-				mc.corednsPatcherEnabled, mc.corednsZoneWhen, mc.corednsZoneMinDomains)
+				mc.corednsPatcherEnabled, mc.corednsZoneWhen, mc.corednsZoneMinDomains,
+				mc.corednsMinReplicas, mc.corednsNodesPerReplica)
 		},
 		"metrics-server-patcher": func() error {
-			return controller.SetupMetricsServerPatcher(mgr, cs, mc.metricsServerPatcherEnabled)
+			return controller.SetupMetricsServerPatcher(mgr, cs, mc.metricsServerPatcherEnabled,
+				mc.metricsServerMinReplicas, mc.metricsServerNodesPerReplica)
 		},
 		"cf-tunnel-proxy-watchdog": func() error {
 			return controller.SetupCFTunnelProxyWatchdog(mgr, cs,

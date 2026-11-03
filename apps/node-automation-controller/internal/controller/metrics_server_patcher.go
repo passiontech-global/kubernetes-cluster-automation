@@ -19,10 +19,20 @@
 // args is a plain list — strategic merge would replace it anyway.
 // Watch reverts drift in <1s; the 15m requeue replaces the old hourly
 // crontab.
+//
+// Proportional scaling (replaces cluster-proportional-autoscaler):
+// when minReplicas>0 the reconciler also pins .spec.replicas to the
+// CPA "linear" formula with includeUnschedulableNodes=true —
+// max(minReplicas, ceil(totalNodes/nodesPerReplica)) — and a Node
+// watch re-reconciles on every node add/remove. minReplicas<=0
+// disables the pin (the Deployment keeps its own .spec.replicas) so
+// a cluster can re-enable the standalone CPA without being fought.
 package controller
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"slices"
 	"time"
 
@@ -36,6 +46,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -56,24 +68,47 @@ var (
 )
 
 type metricsServerPatcher struct {
-	cs kubernetes.Interface
+	cs              kubernetes.Interface
+	minReplicas     int
+	nodesPerReplica int
 }
 
 // SetupMetricsServerPatcher reconciles only the metrics-server
 // Deployment (the informer sees every kube-system Deployment — the
 // predicate pins ns/name). enabled=false skips registration entirely.
-func SetupMetricsServerPatcher(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
+//
+// minReplicas/nodesPerReplica are the CPA-linear replica pin — see
+// proportionalReplicas. minReplicas<=0 disables the pin entirely.
+func SetupMetricsServerPatcher(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, minReplicas, nodesPerReplica int) error {
 	if !enabled {
 		return nil
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		Named("metrics-server-patcher").
 		For(&appsv1.Deployment{}, builder.WithPredicates(
 			predicate.NewPredicateFuncs(func(o client.Object) bool {
 				return o.GetNamespace() == "kube-system" &&
 					o.GetName() == "metrics-server"
-			}))).
-		Complete(&metricsServerPatcher{cs: cs})
+			})))
+	if minReplicas > 0 {
+		// Node add/remove changes the proportional replica total. The
+		// formula's includeUnschedulableNodes=true counts EVERY Node
+		// object, so updates (cordon flips, ~20s kubelet heartbeats)
+		// can never change the count and must not enqueue — only
+		// create/delete fire. Collapses to one fixed key: Reconcile
+		// ignores the request name anyway. With the pin disabled the
+		// count is never read, so the watch is not registered at all.
+		b = b.Watches(&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(sweepRequests("metrics-server-patcher-sweep")),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc:  func(event.CreateEvent) bool { return true },
+				DeleteFunc:  func(event.DeleteEvent) bool { return true },
+				UpdateFunc:  func(event.UpdateEvent) bool { return false },
+				GenericFunc: func(event.GenericEvent) bool { return false },
+			}))
+	}
+	return b.Complete(&metricsServerPatcher{cs: cs,
+		minReplicas: minReplicas, nodesPerReplica: nodesPerReplica})
 }
 
 func (r *metricsServerPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -90,27 +125,75 @@ func (r *metricsServerPatcher) Reconcile(ctx context.Context, _ reconcile.Reques
 		return ctrl.Result{}, err
 	}
 
-	if !metricsServerNeedsPatch(d) {
-		log.Info("args/probes/resources/topology/tolerations already pinned - nothing to do")
+	// Proportional replica pin — disabled when minReplicas<=0
+	// (wantReplicas stays 0: neither needsPatch nor the patch body
+	// touches .spec.replicas then).
+	wantReplicas := int32(0)
+	if r.minReplicas > 0 {
+		nodes, err := listNodes(ctx, r.cs)
+		if err != nil {
+			metrics.IncError("metrics-server-patcher")
+			return ctrl.Result{}, err
+		}
+		wantReplicas = proportionalReplicas(len(nodes), r.minReplicas, r.nodesPerReplica)
+	}
+
+	if !metricsServerNeedsPatch(d, wantReplicas) {
+		log.Info("args/probes/resources/topology/tolerations/replicas already pinned - nothing to do")
 		return res, nil
+	}
+	patch, err := metricsServerPatchBody(wantReplicas)
+	if err != nil {
+		metrics.IncError("metrics-server-patcher")
+		return ctrl.Result{}, err
 	}
 	log.Info("metrics-server drifted - patching")
 	if _, err := r.cs.AppsV1().Deployments("kube-system").Patch(ctx,
 		"metrics-server", types.StrategicMergePatchType,
-		metricsServerPatch, metav1.PatchOptions{}); err != nil {
+		patch, metav1.PatchOptions{}); err != nil {
 		metrics.IncError("metrics-server-patcher")
 		return ctrl.Result{}, err
 	}
 	return res, nil
 }
 
+// metricsServerPatchBody renders the pinned CronJob patch plus the
+// proportional .spec.replicas entry. wantReplicas<=0 returns the body
+// untouched — strategic merge then leaves the Deployment's replica
+// count alone, so disabled scaling never fights a re-enabled CPA.
+func metricsServerPatchBody(wantReplicas int32) ([]byte, error) {
+	if wantReplicas <= 0 {
+		return metricsServerPatch, nil
+	}
+	var body map[string]any
+	if err := json.Unmarshal(metricsServerPatch, &body); err != nil {
+		return nil, err
+	}
+	spec, ok := body["spec"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("metricsServerPatch missing spec object")
+	}
+	spec["replicas"] = wantReplicas
+	return json.Marshal(body)
+}
+
 // metricsServerNeedsPatch reports whether the Deployment lacks any
-// pinned field. A missing metrics-server container counts as drifted
-// (same as the shell's empty jsonpath probe). The toleration guard
-// mirrors the shell's `tol_ok` probe plus the incident fix: a wildcard
-// Exists toleration (empty key tolerates EVERYTHING, incl.
-// unschedulable) is drift; an explicit not-ready entry is required.
-func metricsServerNeedsPatch(d *appsv1.Deployment) bool {
+// pinned field — args, probe timeouts, requests/limits, cleared
+// affinity, tolerations, spread constraints, or (when proportional
+// scaling is on, wantReplicas>0) a drifted .spec.replicas. A missing
+// metrics-server container counts as drifted (same as the shell's
+// empty jsonpath probe). The toleration guard mirrors the shell's
+// `tol_ok` probe plus the incident fix: a wildcard Exists toleration
+// (empty key tolerates EVERYTHING, incl. unschedulable) is drift; an
+// explicit not-ready entry is required.
+func metricsServerNeedsPatch(d *appsv1.Deployment, wantReplicas int32) bool {
+	// Replica drift only counts when the pin is enabled — a nil
+	// .spec.replicas defaults to 1 at the API but still means "we
+	// never pinned it", so it counts as drifted too.
+	if wantReplicas > 0 &&
+		(d.Spec.Replicas == nil || *d.Spec.Replicas != wantReplicas) {
+		return true
+	}
 	ps := d.Spec.Template.Spec
 	for i := range ps.Containers {
 		c := &ps.Containers[i]

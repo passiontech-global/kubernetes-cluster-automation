@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -87,6 +88,14 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 
 	stores, err := n.dyn.Resource(clusterSecretStoreGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
+		// ESO CRDs absent tren cluster nay (flag bat nhung operator
+		// chua cai — vd component opt-in truoc khi ESO rollout xong).
+		// Khong phai loi van hanh — skip lang thay vi spam
+		// "could not find the requested resource" moi 10 phut.
+		if apierrors.IsNotFound(err) {
+			log.Info("skip: external-secrets CRDs not installed")
+			return nil
+		}
 		return err
 	}
 
@@ -124,6 +133,10 @@ func (n *externalSecretNudge) nudge(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	list, err := n.dyn.Resource(externalSecretGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("skip: external-secrets CRDs not installed")
+			return nil
+		}
 		return err
 	}
 	now := time.Now()

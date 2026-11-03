@@ -614,3 +614,134 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 	slog.Warn("api-lb-vm: haproxy admin socket did not appear in 30s",
 		"socket", socket)
 }
+
+// ---------- Phase 3: kine.service (tach kine khoi k0scontroller) ----------
+//
+// Kine embedded trong k0scontroller chia cgroup + lifecycle voi
+// apiserver: mot kine OOM (catch-up storm sau compact) keo ca
+// controller vao metastable OOM loop (incident 2026-10-02 —
+// /swapfile-kine la band-aid cho dung chung cgroup do). Tach kine
+// thanh unit systemd RIENG co MemoryMax/GOMEMLIMIT boundary rieng:
+// kine OOM chi kine bi kill+restart, apiserver mat storage tam thoi
+// nhung khong bi keo theo. k0scontroller ket noi qua kine socket —
+// Before= dam bao storage len truoc apiserver.
+//
+// Gate tuyet doi: chi chay khi NodeName nam trong kine_service_hosts
+// (defaults.yaml khai [] => hoan toan off cho den khi cluster.yaml
+// list host cutover). Node khong duoc list thi khong touch gi het.
+
+func (c *cyc) groupKineService() {
+	r, ctx := c.r, c.ctx
+	if !containsSS(c.vs("kine_service_hosts"), r.cfg.NodeName) {
+		// NB: khong co rollback — unlist host chi ngung converge, unit
+		// dang chay van tiep tuc (co y: khong bao gio giet datastore
+		// apiserver chi vi host bi go khoi list).
+		return
+	}
+
+	// Contract defaults.yaml: kine_endpoint rong = khong render unit.
+	// kine khong co DSN se fallback sqlite tren unix socket ma
+	// apiserver tro toi -> datastore trong (data loss). Fail closed:
+	// giu nguyen last-good, canh bao de operator sua vars.
+	ep := c.v("kine_endpoint")
+	if ep == "" || ep == "None" {
+		slog.Warn("kine.service: kine_endpoint khong duoc cau hinh — bo qua converge")
+		return
+	}
+
+	// /usr/local/bin/kine pinned qua sha256 — pin thieu thi fail
+	// closed ke ca khi file da ton tai (khong bao gio start mot
+	// binary khong xac thuc duoc).
+	binPath := "/usr/local/bin/kine"
+	url, sum := c.v("kine_bin_url"), c.v("kine_bin_sha256")
+	if url == "" || url == "None" || sum == "" || sum == "None" {
+		slog.Error("kine.service: thieu pin kine_bin_url+kine_bin_sha256 — khong converge")
+		return
+	}
+	binChanged := false
+	if !r.fileExists(binPath) || !sha256FileOK(r.hp(binPath), sum) {
+		if err := download(ctx, url, r.hp(binPath), sum); err != nil {
+			slog.Error("kine.service: kine binary download", "url", url, "err", err)
+			return
+		}
+		binChanged = true
+	}
+	// Mode drift enforce ca khi hash da dung — binary 0644 khong
+	// exec duoc.
+	if err := os.Chmod(r.hp(binPath), 0o755); err != nil {
+		slog.Error("kine.service: chmod kine binary", "err", err)
+		return
+	}
+
+	// /etc/kine 0700 + kine.env 0600 — DSN chua DB password nen khong
+	// duoc embed vao unit file (unit 0644 doc duoc boi moi user).
+	r.ensureDir("/etc/kine", 0o700)
+	if err := os.Chmod(r.hp("/etc/kine"), 0o700); err != nil {
+		slog.Warn("kine.service: chmod 0700 /etc/kine", "err", err)
+	}
+	envChanged, _ := r.writeManaged("/etc/kine/kine.env",
+		[]byte("# Managed by node-config-agent - kine datastore endpoint (KINE_ENDPOINT)\n"+
+			"KINE_ENDPOINT="+ep+"\n"), 0o600)
+	// writeManaged giu mode cu cua file ton tai — kine.env chua mat
+	// khau nen luon enforce lai 0600.
+	if err := os.Chmod(r.hp("/etc/kine/kine.env"), 0o600); err != nil {
+		slog.Warn("kine.service: chmod 0600 kine.env", "err", err)
+	}
+
+	// Defaults mirror invocation k0s dung cho embedded kine:
+	// --listen-address=unix://<KineSocketPath> + --metrics-bind-address
+	// =:2380 (HUBMETRICS whitelist + hub-kine-metrics ServiceMonitor).
+	listen := defStr(c.v("kine_listen_address"), "unix:///run/k0s/kine.sock")
+	metrics := defStr(c.v("kine_metrics_bind_address"), ":2380")
+	// unix socket: /run la tmpfs — tao parent dir truoc start (dir do
+	// k0scontroller tao, ma no start SAU vi Before=), va cho socket
+	// bind xong moi thoa Before= (Type=simple danh "started" ngay khi
+	// exec -> k0scontroller co the chay khi socket chua ton tai).
+	execPre, execPost := "", ""
+	if sock := strings.TrimPrefix(listen, "unix://"); sock != listen {
+		execPre = "ExecStartPre=/usr/bin/mkdir -p " + filepath.Dir(sock) + "\n"
+		execPost = "ExecStartPost=/bin/sh -c 'i=0; while [ ! -S " + sock +
+			" ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done'\n"
+	}
+	unitChanged, _ := r.writeManaged("/etc/systemd/system/kine.service", []byte(fmt.Sprintf(`# Managed by node-config-agent - Phase 3: tach kine khoi k0scontroller.
+# Boundary cgroup RIENG: kine OOM khong keo apiserver vao OOM loop
+# (su co 2026-10-02). GOMEMLIMIT 1500MiB < MemoryMax 2G de Go GC danh
+# truoc khi cham cgroup limit; GOGC=50 giam heap growth giua 2 chu ky.
+[Unit]
+Description=kine (etcd3 API shim -> external datastore)
+Documentation=file:/etc/kine/kine.env
+After=network-online.target
+Wants=network-online.target
+# Storage phai len TRUOC k0scontroller — apiserver khong boot khi
+# endpoint chet.
+Before=k0scontroller.service
+
+[Service]
+Environment=GOMEMLIMIT=1500MiB
+Environment=GOGC=50
+# KINE_ENDPOINT nam trong /etc/kine/kine.env (0600, chua DB password).
+EnvironmentFile=/etc/kine/kine.env
+%s%sExecStart=/usr/local/bin/kine --listen-address=%s --metrics-bind-address=%s
+MemoryMax=2G
+MemorySwapMax=0
+# OOMScoreAdjust am: kernel kill cac process khac truoc kine (data-path
+# cua apiserver); CPUWeight cao giu kine duoi ap luc CPU.
+OOMScoreAdjust=-500
+CPUWeight=2000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`, execPre, execPost, listen, metrics)), 0o644)
+	if unitChanged {
+		r.daemonReload(ctx)
+	}
+	r.ensureService(ctx, "kine.service", true, true)
+	// start la no-op tren unit dang chay — binary/env/unit moi chi co
+	// tac dung sau restart nen moi thay doi input deu restart (pattern
+	// y nhu groupAPILB cfgChanged||nftChanged).
+	if binChanged || envChanged || unitChanged {
+		r.restartService(ctx, "kine.service")
+	}
+}

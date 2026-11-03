@@ -945,17 +945,25 @@ func (c *cyc) groupAPILB() {
 	nftChanged := false
 	if vip := c.v("api_lb_vip_ip"); vip != "" && vip != "None" {
 		r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "nftables")
-		nft := fmt.Sprintf(`# Managed by node-config-agent - root-netns DNAT %s:6443
-# -> 127.0.0.1:6443 (T12). Nap/xoa boi api-local-lb.service.
+		var rules strings.Builder
+		for _, p := range c.apiLBDnatPorts() {
+			fmt.Fprintf(&rules, "        ip daddr %s tcp dport %s dnat to 127.0.0.1:%s\n", vip, p, p)
+		}
+		nft := fmt.Sprintf(`# Managed by node-config-agent - root-netns DNAT %s -> 127.0.0.1
+# (T12: :6443 + moi port trong api_lb_extra_lanes, Phase 1.3/2).
+# Nap/xoa boi api-local-lb.service.
+# skuid exempt: "haproxy" = outbound backend conns cua chinh LB (anti-
+# loop); 65534 = nobody — konnectivity-agent/pod host-netns chay
+# uid nay phai di thang VIP ra backend that, khong dnat vao loopback.
 destroy table ip api_local_dnat
 table ip api_local_dnat {
     chain output {
         type nat hook output priority dstnat; policy accept;
         meta skuid "haproxy" accept
-        ip daddr %s tcp dport 6443 dnat to 127.0.0.1:6443
-    }
+        meta skuid 65534 accept
+%s    }
 }
-`, vip, vip)
+`, vip, rules.String())
 		nftChanged, _ = r.writeManaged("/etc/api-local-dnat.nft", []byte(nft), 0o644)
 		if _, err := r.run(ctx, "nft", "-c", "-f", "/etc/api-local-dnat.nft"); err != nil {
 			slog.Error("T12: nft ruleset failed nft -c", "err", err)
@@ -987,6 +995,37 @@ table ip api_local_dnat {
 		return
 	}
 	c.pinHosts()
+}
+
+// apiLBExtraLanes — the {name, port} entries of api_lb_extra_lanes
+// (Phase 2: extra local proxy lanes, e.g. konnectivity :8132 and
+// k0sjoin :9443). Entries missing name or port are skipped.
+func (c *cyc) apiLBExtraLanes() [][2]string {
+	var out [][2]string
+	for _, it := range c.vl("api_lb_extra_lanes") {
+		m, _ := it.(*topology.OMap)
+		if m == nil {
+			continue
+		}
+		n, p := strOf(m, "name"), strOf(m, "port")
+		if n == "" || p == "" {
+			continue
+		}
+		out = append(out, [2]string{n, p})
+	}
+	return out
+}
+
+// apiLBDnatPorts — the VIP dports redirected to 127.0.0.1: the main
+// :6443 lane plus every api_lb_extra_lanes port (deduped).
+func (c *cyc) apiLBDnatPorts() []string {
+	ports := []string{"6443"}
+	for _, lane := range c.apiLBExtraLanes() {
+		if !containsSS(ports, lane[1]) {
+			ports = append(ports, lane[1])
+		}
+	}
+	return ports
 }
 
 // probeReachable — TCP-connect preflight for `probe: true` backends;

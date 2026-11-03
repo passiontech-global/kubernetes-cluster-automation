@@ -378,7 +378,11 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		"COREDNS_PATCHER_ENABLED",
 		"COREDNS_PATCHER_ZONE_WHEN",
 		"COREDNS_PATCHER_ZONE_MIN_DOMAINS",
+		"COREDNS_MIN_REPLICAS",
+		"COREDNS_NODES_PER_REPLICA",
 		"METRICS_SERVER_PATCHER_ENABLED",
+		"METRICS_SERVER_MIN_REPLICAS",
+		"METRICS_SERVER_NODES_PER_REPLICA",
 		"CF_TUNNEL_WATCHDOG_ENABLED",
 		"CF_TUNNEL_WATCHDOG_NAMESPACE",
 		"CF_TUNNEL_WATCHDOG_INTERVAL",
@@ -411,6 +415,21 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		}
 		if mc.corednsZoneMinDomains != 2 {
 			t.Fatalf("corednsZoneMinDomains = %d, want 2", mc.corednsZoneMinDomains)
+		}
+		// Proportional replica pins default to the multi-zone values
+		// the cluster-proportional-autoscaler carried.
+		if mc.corednsMinReplicas != 4 {
+			t.Fatalf("corednsMinReplicas = %d, want 4", mc.corednsMinReplicas)
+		}
+		if mc.corednsNodesPerReplica != 1 {
+			t.Fatalf("corednsNodesPerReplica = %d, want 1", mc.corednsNodesPerReplica)
+		}
+		if mc.metricsServerMinReplicas != 3 {
+			t.Fatalf("metricsServerMinReplicas = %d, want 3", mc.metricsServerMinReplicas)
+		}
+		if mc.metricsServerNodesPerReplica != 1 {
+			t.Fatalf("metricsServerNodesPerReplica = %d, want 1",
+				mc.metricsServerNodesPerReplica)
 		}
 		if mc.cfTunnelWatchdogNamespace != "cloudflare-tunnel-system" {
 			t.Fatalf("cfTunnelWatchdogNamespace = %q, want default",
@@ -448,7 +467,13 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		t.Setenv("COREDNS_PATCHER_ENABLED", "false")
 		t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "ScheduleAnyway")
 		t.Setenv("COREDNS_PATCHER_ZONE_MIN_DOMAINS", "0")
+		// cicd single-zone pin + an explicit 0 disable (a cluster
+		// re-enabling standalone CPA sets minReplicas<=0).
+		t.Setenv("COREDNS_MIN_REPLICAS", "1")
+		t.Setenv("COREDNS_NODES_PER_REPLICA", "2")
 		t.Setenv("METRICS_SERVER_PATCHER_ENABLED", "false")
+		t.Setenv("METRICS_SERVER_MIN_REPLICAS", "0")
+		t.Setenv("METRICS_SERVER_NODES_PER_REPLICA", "5")
 		t.Setenv("CF_TUNNEL_WATCHDOG_ENABLED", "false")
 		t.Setenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "custom-ns")
 		t.Setenv("CF_TUNNEL_WATCHDOG_INTERVAL", "10m")
@@ -460,6 +485,14 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		if mc.corednsZoneWhen != "ScheduleAnyway" || mc.corednsZoneMinDomains != 0 {
 			t.Fatalf("zone override not applied: %q/%d",
 				mc.corednsZoneWhen, mc.corednsZoneMinDomains)
+		}
+		if mc.corednsMinReplicas != 1 || mc.corednsNodesPerReplica != 2 {
+			t.Fatalf("coredns proportional override not applied: %d/%d",
+				mc.corednsMinReplicas, mc.corednsNodesPerReplica)
+		}
+		if mc.metricsServerMinReplicas != 0 || mc.metricsServerNodesPerReplica != 5 {
+			t.Fatalf("metrics-server proportional override not applied: %d/%d",
+				mc.metricsServerMinReplicas, mc.metricsServerNodesPerReplica)
 		}
 		if mc.cfTunnelWatchdogNamespace != "custom-ns" {
 			t.Fatalf("cfTunnelWatchdogNamespace = %q, want custom-ns",

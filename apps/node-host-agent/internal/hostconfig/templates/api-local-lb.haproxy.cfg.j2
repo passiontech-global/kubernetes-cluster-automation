@@ -73,3 +73,22 @@ backend api_local_back
    if not (b.probe | default(false)) or b.name in (api_lb_probe_reachable | default([])) %}
     server {{ b.name }} {{ b.addr }} check inter 5s fall 2 rise 2{{ ' backup' if b.backup | default(false) }}
 {% endfor %}
+# Phase 2 — extra local lanes (api_lb_extra_lanes): moi lane la mot
+# cap frontend/backend y nhu api_local, bind 127.0.0.1:<lane.port> va
+# mirror api_lb_backends voi suffix :6443 trong addr thay bang
+# :<lane.port>. DNAT <vip>:<lane.port> -> lane nay (api-local-dnat.nft).
+{% for lane in api_lb_extra_lanes | default([])
+   if lane.name is defined and lane.port is defined %}
+frontend {{ lane.name }}_local
+    bind 127.0.0.1:{{ lane.port }}
+    mode tcp
+    default_backend {{ lane.name }}_local_back
+
+backend {{ lane.name }}_local_back
+    option tcp-check
+    tcp-check connect
+{% for b in api_lb_backends
+   if not (b.probe | default(false)) or b.name in (api_lb_probe_reachable | default([])) %}
+    server {{ b.name }} {{ b.addr | regex_replace(':6443$', ':' ~ lane.port) }} check inter 5s fall 2 rise 2{{ ' backup' if b.backup | default(false) }}
+{% endfor %}
+{% endfor %}

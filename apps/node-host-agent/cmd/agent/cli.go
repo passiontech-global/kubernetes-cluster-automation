@@ -23,7 +23,10 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/concourseinit"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/evpurge"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostconfig"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostmetrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/kinedb"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/topology"
 )
 
@@ -48,11 +51,7 @@ func dispatch(argv []string) (int, bool) {
 
 	switch argv[1] {
 	case "concourse-worker-init":
-		if err := concourseinit.WorkerInit(ctx, concourseinit.Config{}); err != nil {
-			fmt.Fprintln(os.Stderr, "concourse-worker-init:", err)
-			return 1, true
-		}
-		return 0, true
+		return concourseWorkerInit(ctx, argv[2:]), true
 	case "concourse-runc-wrapper":
 		// The subcommand word is not part of the runc argv — the
 		// wrapper forwards argv[1:] to runc.real.
@@ -62,6 +61,12 @@ func dispatch(argv []string) (int, bool) {
 		return convergeOnce(ctx, argv[2:]), true
 	case "nebula-sign":
 		return nebulaSignCmd(ctx, argv[2:]), true
+	case "purge-events":
+		return purgeEventsCmd(ctx, argv[2:]), true
+	case "check-kine-db":
+		return checkKineDBCmd(ctx, argv[2:]), true
+	case "check-k0s-drift":
+		return checkK0sDriftCmd(argv[2:]), true
 	default:
 		subcommandUsage(argv[1])
 		return 2, true
@@ -74,13 +79,57 @@ func subcommandUsage(word string) {
 
 usage:
   node-host-agent [daemon flags]            run the agent daemon
-  node-host-agent concourse-worker-init     concourse worker init-rm (init container)
+  node-host-agent concourse-worker-init [--work-dir=DIR] [--runc-dir=DIR] [--runc-source=PATH] [--wrapper-source=PATH]
+                                            concourse worker init-rm (init container)
   node-host-agent concourse-runc-wrapper    runc shim (argv[0] "runc" works too)
   node-host-agent converge-once --vars-dir=DIR [--node-name=N] [--nebula-certs-dir=DIR]
                                             one hostconfig converge on the host, then exit
   node-host-agent nebula-sign --vars-dir=DIR --ca-dir=DIR [--node=N] [--duration=8760h] [--ssh-key=PATH]
                                             sign interdc nebula host certs with the local CA
+  node-host-agent purge-events [--api=URL] [--ca=FILE] [--cert=FILE] [--key=FILE] [--workers=N] [--before=TS | RFC3339]
+                                            delete apiserver events older than the cutoff (etcd backlog GC)
+  node-host-agent check-kine-db [--env-file=FILE] [--wire-addr=HOST:PORT] [--runtime=podman|docker]
+                                            verify the kine postgres+pgbouncer stack (exit 1 on any FAIL)
+  node-host-agent check-k0s-drift [--config=FILE] [--expected-keys=a,b] [--removed-flags=x,y] [--unit-file=FILE]
+                                            report k0s.yaml extraArgs drift (removed-flag/extra-key/missing-key)
 `, word)
+}
+
+// concourseWorkerInit is the init-rm subcommand: the flags map onto
+// concourseinit.Config's path knobs so the container invocation can
+// point at its mounts (`--wrapper-source=/usr/local/bin/node-host-agent`
+// self-installs the agent as the runc wrapper even when argv[0]
+// resolves elsewhere).
+func concourseWorkerInit(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("concourse-worker-init", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	workDir := fs.String("work-dir", "",
+		"concourse work dir to soft-reset (default "+concourseinit.DefaultWorkDir+")")
+	runcDir := fs.String("runc-dir", "",
+		"emptyDir shared with the worker holding runc + runc.real (default "+
+			concourseinit.DefaultRuncDir+")")
+	runcSource := fs.String("runc-source", "",
+		"the image's real runc, copied to <runc-dir>/runc.real (default "+
+			concourseinit.DefaultRuncSource+")")
+	wrapperSource := fs.String("wrapper-source", "",
+		"binary installed as <runc-dir>/runc — the multi-call agent "+
+			"(default: os.Executable)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0 // -h/--help is a clean exit, not a usage error
+		}
+		return 2
+	}
+	if err := concourseinit.WorkerInit(ctx, concourseinit.Config{
+		WorkDir:       *workDir,
+		RuncDir:       *runcDir,
+		RuncSource:    *runcSource,
+		WrapperSource: *wrapperSource,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "concourse-worker-init:", err)
+		return 1
+	}
+	return 0
 }
 
 // convergeOnce runs exactly one hostconfig cycle on the host — the
@@ -611,4 +660,140 @@ func expandHome(p string) string {
 		}
 	}
 	return p
+}
+
+// --- purge-events: port of scripts/purge-events.py ---
+//
+// Bulk-deletes apiserver Events older than a cutoff through the
+// k0s admin client certs — run as root ON a controller node. The
+// cutoff is a flag (--before) or a bare positional RFC3339 arg, like
+// the script's sys.argv[1]; the empty default is the script's
+// "1970-01-01T00:00:00Z" (delete everything).
+func purgeEventsCmd(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("purge-events", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	api := fs.String("api", "https://127.0.0.1:6443", "apiserver base URL")
+	ca := fs.String("ca", "",
+		"CA bundle (default /var/lib/k0s/pki/ca.crt, fallback /var/lib/k0s/pki/etcd/ca.crt)")
+	cert := fs.String("cert", "/var/lib/k0s/pki/admin.crt", "client certificate")
+	key := fs.String("key", "/var/lib/k0s/pki/admin.key", "client key")
+	workers := fs.Int("workers", 8,
+		"parallel DELETE workers (drop to 2 on a weak cluster)")
+	before := fs.String("before", "",
+		"delete events created before this RFC3339 timestamp "+
+			"(positional arg also accepted; default deletes everything)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0 // -h/--help is a clean exit, not a usage error
+		}
+		return 2
+	}
+	cutStr := *before
+	if cutStr == "" && fs.NArg() > 0 {
+		cutStr = fs.Arg(0)
+	}
+	if cutStr == "" {
+		cutStr = "1970-01-01T00:00:00Z"
+	}
+	cutoff, err := time.Parse(time.RFC3339, cutStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "purge-events: bad cutoff %q: %v\n", cutStr, err)
+		return 2
+	}
+	if err := evpurge.Run(ctx, evpurge.Config{
+		API:      *api,
+		CAFile:   *ca,
+		CertFile: *cert,
+		KeyFile:  *key,
+		Workers:  *workers,
+	}, cutoff, os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, "purge-events:", err)
+		return 1
+	}
+	return 0
+}
+
+// --- check-kine-db: port of scripts/check-kine-db.sh ---
+//
+// The operator-side verify after a postgres+pgbouncer stack update
+// on the kine DB VM. Prints the script's OK/FAIL check lines and
+// exits 1 on any failure.
+func checkKineDBCmd(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("check-kine-db", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	envFile := fs.String("env-file", "/opt/apps/postgres/.env",
+		"postgres stack .env (POSTGRES_USER/POSTGRES_PASSWORD)")
+	wireAddr := fs.String("wire-addr", "127.0.0.1:6432",
+		"pgbouncer host:port for the wire probe")
+	runtime := fs.String("runtime", "",
+		"container runtime podman|docker (default: auto-detect)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0 // -h/--help is a clean exit, not a usage error
+		}
+		return 2
+	}
+	return kinedb.RunCheckCLI(ctx, kinedb.Config{
+		EnvFile:  *envFile,
+		WireAddr: *wireAddr,
+		Runtime:  *runtime,
+	}, os.Stdout)
+}
+
+// --- check-k0s-drift: on-node half of scripts/check-node-config-drift.sh ---
+//
+// Reports removed-flag / extra-key / missing-key drift between the
+// node's /etc/k0s/k0s.yaml controllerManager.extraArgs and the
+// expected set. Exit 0 clean (or not a k0s controller), 1 on drift.
+func checkK0sDriftCmd(args []string) int {
+	fs := flag.NewFlagSet("check-k0s-drift", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	config := fs.String("config", "/etc/k0s/k0s.yaml", "k0s config to scan")
+	expected := fs.String("expected-keys", "",
+		"comma-separated expected controllerManager.extraArgs keys "+
+			"(default: the repo-pinned set)")
+	removed := fs.String("removed-flags", "",
+		"comma-separated config keys removed upstream "+
+			"(default: concurrent-service-syncs)")
+	unit := fs.String("unit-file", "/etc/systemd/system/k0scontroller.service",
+		"k0s controller gate — the check only runs when this unit file "+
+			"exists (point at /dev/null to force on a non-controller)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0 // -h/--help is a clean exit, not a usage error
+		}
+		return 2
+	}
+	// Provided-vs-absent matters: --expected-keys= (explicit empty)
+	// means "no expected keys" while a missing flag means "use the
+	// repo-pinned default" — see K0sDriftConfig.
+	provided := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { provided[f.Name] = true })
+	var exp, rem []string
+	if provided["expected-keys"] {
+		exp = splitCSV(*expected)
+	}
+	if provided["removed-flags"] {
+		rem = splitCSV(*removed)
+	}
+	return hostmetrics.RunK0sDriftCLI(hostmetrics.K0sDriftConfig{
+		ConfigFile:   *config,
+		UnitFile:     *unit,
+		ExpectedKeys: exp,
+		RemovedFlags: rem,
+	}, os.Stdout)
+}
+
+// splitCSV splits a comma-separated flag value, trimming spaces and
+// dropping empty elements. Empty input yields an empty NON-nil
+// slice — callers distinguish "flag absent" (nil -> defaults) from
+// "flag provided empty" (empty set honored).
+func splitCSV(s string) []string {
+	out := []string{}
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

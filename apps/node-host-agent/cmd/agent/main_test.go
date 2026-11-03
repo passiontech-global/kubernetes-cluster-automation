@@ -807,6 +807,100 @@ func TestDispatchNebulaSignArgParsing(t *testing.T) {
 	}
 }
 
+func TestDispatchConcourseWorkerInitArgParsing(t *testing.T) {
+	if code, handled := dispatch([]string{"nha", "concourse-worker-init", "--bogus"}); !handled || code != 2 {
+		t.Fatalf("concourse-worker-init --bogus=(%d,%v) want (2,true)", code, handled)
+	}
+	if code, handled := dispatch([]string{"nha", "concourse-worker-init", "-h"}); !handled || code != 0 {
+		t.Fatalf("concourse-worker-init -h=(%d,%v) want (0,true)", code, handled)
+	}
+	// --wrapper-source pointing at a missing binary fails the
+	// install (copyFileAtomic errors) → exit 1, proving the flag
+	// reached cfg.WrapperSource. The other flags get temp dirs and a
+	// temp runc source so everything before the wrapper copy works.
+	dir := t.TempDir()
+	work := filepath.Join(dir, "work")
+	runcDir := filepath.Join(dir, "runc")
+	runcSrc := filepath.Join(dir, "runc-real")
+	for _, d := range []string{work, runcDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(runcSrc, []byte("fake-runc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	code, handled := dispatch([]string{"nha", "concourse-worker-init",
+		"--work-dir=" + work, "--runc-dir=" + runcDir,
+		"--runc-source=" + runcSrc,
+		"--wrapper-source=" + filepath.Join(dir, "no-such-binary")})
+	if !handled || code != 1 {
+		t.Fatalf("concourse-worker-init bad wrapper-source=(%d,%v) want (1,true)",
+			code, handled)
+	}
+}
+
+func TestDispatchPurgeEventsArgParsing(t *testing.T) {
+	if code, handled := dispatch([]string{"nha", "purge-events", "--bogus"}); !handled || code != 2 {
+		t.Fatalf("purge-events --bogus=(%d,%v) want (2,true)", code, handled)
+	}
+	if code, handled := dispatch([]string{"nha", "purge-events", "-h"}); !handled || code != 0 {
+		t.Fatalf("purge-events -h=(%d,%v) want (0,true)", code, handled)
+	}
+	// A malformed cutoff is a usage error before any TLS/dial work.
+	for _, argv := range [][]string{
+		{"nha", "purge-events", "not-a-timestamp"},
+		{"nha", "purge-events", "--before=not-a-timestamp"},
+	} {
+		if code, handled := dispatch(argv); !handled || code != 2 {
+			t.Fatalf("purge-events %v=(%d,%v) want (2,true)", argv[2:], code, handled)
+		}
+	}
+	// Missing PKI files → Run fails building the client → exit 1.
+	code, handled := dispatch([]string{"nha", "purge-events",
+		"--ca=/nonexistent/ca.crt", "2026-08-23T04:27:00Z"})
+	if !handled || code != 1 {
+		t.Fatalf("purge-events missing CA=(%d,%v) want (1,true)", code, handled)
+	}
+}
+
+func TestDispatchCheckKineDBArgParsing(t *testing.T) {
+	if code, handled := dispatch([]string{"nha", "check-kine-db", "--bogus"}); !handled || code != 2 {
+		t.Fatalf("check-kine-db --bogus=(%d,%v) want (2,true)", code, handled)
+	}
+	if code, handled := dispatch([]string{"nha", "check-kine-db", "-h"}); !handled || code != 0 {
+		t.Fatalf("check-kine-db -h=(%d,%v) want (0,true)", code, handled)
+	}
+}
+
+func TestDispatchCheckK0sDriftArgParsing(t *testing.T) {
+	if code, handled := dispatch([]string{"nha", "check-k0s-drift", "--bogus"}); !handled || code != 2 {
+		t.Fatalf("check-k0s-drift --bogus=(%d,%v) want (2,true)", code, handled)
+	}
+	if code, handled := dispatch([]string{"nha", "check-k0s-drift", "-h"}); !handled || code != 0 {
+		t.Fatalf("check-k0s-drift -h=(%d,%v) want (0,true)", code, handled)
+	}
+	// A nonexistent unit file gates the check off → clean exit 0 on
+	// any host (the "not a k0s controller" skip).
+	code, handled := dispatch([]string{"nha", "check-k0s-drift",
+		"--unit-file=" + filepath.Join(t.TempDir(), "no-such.service")})
+	if !handled || code != 0 {
+		t.Fatalf("check-k0s-drift no unit=(%d,%v) want (0,true)", code, handled)
+	}
+	// Missing config + present unit → unreadable drift → exit 1.
+	dir := t.TempDir()
+	unit := filepath.Join(dir, "k0scontroller.service")
+	if err := os.WriteFile(unit, []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, handled = dispatch([]string{"nha", "check-k0s-drift",
+		"--unit-file=" + unit,
+		"--config=" + filepath.Join(dir, "no-such.yaml")})
+	if !handled || code != 1 {
+		t.Fatalf("check-k0s-drift missing config=(%d,%v) want (1,true)", code, handled)
+	}
+}
+
 // --- sign-job derivation + pubkey normalization ---
 
 func TestStripPubArmor(t *testing.T) {
