@@ -109,7 +109,7 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 		if isControlPlane(n) {
 			continue
 		}
-		if err := r.sweep(ctx, n.Name, ok[n.Name]); err != nil {
+		if err := r.sweep(ctx, n, ok[n.Name]); err != nil {
 			// Best-effort per node — like the bash loop a failure on
 			// one node must not skip the rest of the sweep.
 			log.Error(err, "sweep failed — node skipped", "node", n.Name)
@@ -141,27 +141,39 @@ func (r *kubeletReaper) probe(ctx context.Context, node string) bool {
 	return false
 }
 
-// sweep applies the taint decision for one node (re-Gets the node
-// fresh, like the bash per-node kubectl get).
-func (r *kubeletReaper) sweep(ctx context.Context, name string, ok bool) error {
+// sweep applies the taint decision for one node. listed is the object
+// from this run's node list — already fresh enough to see our taint.
+// The per-node Get (the bash's `kubectl get node`) now only happens
+// when the probe FAILED: the heartbeat gate below needs a fresh read,
+// while a healthy probe with no listed taint has literally nothing to
+// decide — one fewer apiserver read per worker per cycle.
+func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool) error {
 	log := logf.FromContext(ctx)
-	node, err := r.cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+
+	if ok {
+		if hasTaint(listed.Spec.Taints, kubeletReaperTaint) {
+			// untaintNode re-Gets the node inside before patching,
+			// so a stale listed snapshot cannot remove a taint that
+			// is already gone — no separate Get needed here either.
+			if err := untaintNode(ctx, r.cs, listed.Name, kubeletReaperTaint); err != nil {
+				return err
+			}
+			log.Info("UNTAINT: kubelet :10250 ok -> taint removed", "node", listed.Name)
+		} else {
+			log.Info("OK", "node", listed.Name)
+		}
+		return nil
+	}
+
+	// Probe failed — re-Get like the bash per-node kubectl get: the
+	// heartbeat gate decides on freshness, so the listed snapshot
+	// must not stand in for it.
+	node, err := r.cs.CoreV1().Nodes().Get(ctx, listed.Name, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
 	has := hasTaint(node.Spec.Taints, kubeletReaperTaint)
-
-	if ok {
-		if has {
-			if err := untaintNode(ctx, r.cs, name, kubeletReaperTaint); err != nil {
-				return err
-			}
-			log.Info("UNTAINT: kubelet :10250 ok -> taint removed", "node", name)
-		} else {
-			log.Info("OK", "node", name)
-		}
-		return nil
-	}
+	name := listed.Name
 
 	// Probe failed — heartbeat gate: fresh Ready heartbeat = broken
 	// proxy path, not a dead kubelet. Missing condition/timestamp or

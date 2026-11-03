@@ -43,7 +43,13 @@ type fluentBitRoller struct {
 // SetupFluentBitRoller wires the fluent-bit-config-roller reconciler.
 // The informer is already field-selected to metadata.name=
 // passiontech-pipeline; the predicate also pins the namespace.
+// Disabled clusters (no fluentbit component) skip registration
+// entirely — same pattern as SetupCertManagerReaper.
 func SetupFluentBitRoller(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
+	if !enabled {
+		logf.Log.WithName("fluent-bit-config-roller").Info("disabled — module not registered")
+		return nil
+	}
 	r := &fluentBitRoller{cs: cs, enabled: enabled}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("fluent-bit-config-roller").

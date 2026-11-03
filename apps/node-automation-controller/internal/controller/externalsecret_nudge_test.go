@@ -307,6 +307,42 @@ func TestExternalSecretNudgeReadySinceFallback(t *testing.T) {
 	}
 }
 
+// The nudged ledger prunes stamps whose ES vanished or aged past the
+// 1h cooldown, keeps a live ES still inside it, and lets an expired
+// entry re-nudge a still-stuck ES.
+func TestExternalSecretNudgePrunesNudgedLedger(t *testing.T) {
+	live := esObj("apps", "es-live", "False", 30*time.Minute)
+	expired := esObj("apps", "es-expired", "False", 2*time.Hour)
+	healed := esObj("apps", "es-healed", "True", 3*time.Hour)
+	dyn := newDynFake(live, expired, healed)
+	n := newNudge(dyn, true)
+	fresh := time.Now().Add(-10 * time.Minute)
+	stale := time.Now().Add(-esNudgeCooldown - time.Minute)
+	n.nudged["apps/es-live"] = fresh    // live + inside cooldown → keep
+	n.nudged["apps/es-expired"] = stale // live + past cooldown → re-nudge
+	n.nudged["apps/es-healed"] = stale  // healed → prune, nothing re-adds
+	n.nudged["apps/es-gone"] = fresh    // vanished → prune
+
+	if err := n.nudge(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := n.nudged["apps/es-gone"]; ok {
+		t.Fatal("nudged entry for a deleted ES not pruned")
+	}
+	if _, ok := n.nudged["apps/es-healed"]; ok {
+		t.Fatal("expired entry on a healed ES not pruned")
+	}
+	if got := n.nudged["apps/es-live"]; !got.Equal(fresh) {
+		t.Fatal("live ES inside the cooldown lost/re-stamped its nudge entry")
+	}
+	if got := n.nudged["apps/es-expired"]; !got.After(stale) {
+		t.Fatal("ES past the cooldown was not re-nudged")
+	}
+	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-expired", esForceSyncAnno); got == "" {
+		t.Fatal("expired entry's ES was pruned but never re-stamped")
+	}
+}
+
 // The unstructured Ready-condition helpers must tolerate absent and
 // malformed shapes (real objects in the wild are inconsistent).
 func TestReadyConditionHelpersEdgeCases(t *testing.T) {

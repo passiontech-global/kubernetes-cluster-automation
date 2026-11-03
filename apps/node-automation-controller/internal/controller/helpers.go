@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"math/rand/v2"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -27,7 +28,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 )
@@ -44,6 +48,23 @@ type periodic struct {
 }
 
 func (p *periodic) Start(ctx context.Context) error {
+	// De-phase the sweep modules: every addPeriodic caller begins at
+	// the same startup moment, so identical NewTicker intervals would
+	// fire all modules on the same wall-clock minute — a thundering
+	// herd of LIST calls (heap burst) at every common multiple of
+	// 5/10/15/30/60m. A one-shot random phase offset uniform in
+	// [0, interval) spreads them; the first run lands in
+	// [interval, 2*interval), acceptable for crontab-equivalent
+	// sweeps. ctx is honored so shutdown is never delayed.
+	if p.interval > 0 {
+		timer := time.NewTimer(rand.N(p.interval))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
 	t := time.NewTicker(p.interval)
 	defer t.Stop()
 	for {
@@ -68,6 +89,30 @@ func addPeriodic(mgr manager.Manager, name string, interval time.Duration, fn fu
 		fn:       fn,
 		log:      mgr.GetLogger().WithName(name),
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-key watch fan-in — for full-cluster sweep reconcilers.
+// ---------------------------------------------------------------------------
+
+// fixedSweepRequest builds the single reconcile.Request for key.
+func fixedSweepRequest(key string) []reconcile.Request {
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: key}}}
+}
+
+// sweepRequests returns a handler.MapFunc that collapses every watched
+// object to one fixed workqueue key. The sweep modules ignore
+// reconcile.Request.Name entirely (a trigger only says "go sweep the
+// cluster"), so per-node For() keys fanned one informer sync into N
+// queued requests AND N independent RequeueAfter timers — every timer
+// re-running the same cluster-wide Nodes().List. One fixed key lets
+// the workqueue set-collapse the duplicate enqueues and leaves a
+// single RequeueAfter timer: 1 sweep per interval regardless of the
+// node count.
+func sweepRequests(key string) handler.MapFunc {
+	return func(context.Context, client.Object) []reconcile.Request {
+		return fixedSweepRequest(key)
+	}
 }
 
 // ---------------------------------------------------------------------------

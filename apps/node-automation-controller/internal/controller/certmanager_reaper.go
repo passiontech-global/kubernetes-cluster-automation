@@ -51,7 +51,8 @@ var (
 )
 
 // certReset is the per-certificate reset budget tracked in memory
-// (resets on operator restart, biasing conservative).
+// (cleared when the cert reports Ready=True, on cert deletion, or on
+// operator restart — all bias conservative).
 type certReset struct {
 	total  int
 	last   time.Time
@@ -84,12 +85,36 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	seen := map[string]bool{}
 	for i := range certs.Items {
 		cert := &certs.Items[i]
-		if !certNeedsReap(cert) {
+		key := cert.GetNamespace() + "/" + cert.GetName()
+		seen[key] = true
+		needsReap := certNeedsReap(cert)
+		// A cert back to Ready=True earned a clean slate — drop its
+		// reset budget so a few stuck-issuance episodes spread over
+		// months cannot refuse it forever without a restart. The
+		// needsReap guard is load-bearing: a renewal-window candidate
+		// reports Ready=True the whole time its Order wedges (the old
+		// cert is still valid), so clearing on Ready alone would wipe
+		// the budget every sweep and defeat both the hourly gap and
+		// the 3-reset cap.
+		if _, tracked := r.resets[key]; tracked && !needsReap {
+			if status, _ := readyCond(cert); status == "True" {
+				delete(r.resets, key)
+			}
+		}
+		if !needsReap {
 			continue
 		}
 		r.reapCert(ctx, cert)
+	}
+	// Drop budgets for Certificates that vanished — the map is
+	// otherwise append-only per cert ever reaped.
+	for key := range r.resets {
+		if !seen[key] {
+			delete(r.resets, key)
+		}
 	}
 	log.Info("sweep done")
 	return nil

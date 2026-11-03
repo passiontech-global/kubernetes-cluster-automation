@@ -56,7 +56,9 @@ type externalSecretNudge struct {
 	// storeReady: clustersecretstore name → last observed Ready state.
 	// Seeded on first sight; the False→True edge is what fires nudges.
 	storeReady map[string]bool
-	// nudged: ns/name → last force-sync stamp — the 1/hour rate limit.
+	// nudged: ns/name → last force-sync stamp — the 1/hour rate
+	// limit. Pruned inside nudge() once past the cooldown or when
+	// the ES vanished.
 	nudged map[string]time.Time
 }
 
@@ -125,6 +127,19 @@ func (n *externalSecretNudge) nudge(ctx context.Context) error {
 		return err
 	}
 	now := time.Now()
+	// Drop nudged entries past the cooldown or whose ExternalSecret
+	// vanished — the map only ever shrinks here (nudged is written
+	// solely in this function), same prune pattern as storeReady.
+	live := map[string]bool{}
+	for i := range list.Items {
+		es := &list.Items[i]
+		live[es.GetNamespace()+"/"+es.GetName()] = true
+	}
+	for key, last := range n.nudged {
+		if !live[key] || now.Sub(last) >= esNudgeCooldown {
+			delete(n.nudged, key)
+		}
+	}
 	for i := range list.Items {
 		es := &list.Items[i]
 		key := es.GetNamespace() + "/" + es.GetName()

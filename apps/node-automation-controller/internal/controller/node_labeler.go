@@ -26,6 +26,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -46,18 +47,26 @@ func SetupNodeLabeler(mgr ctrl.Manager, cs kubernetes.Interface, configPath stri
 	r := &nodeLabeler{cs: cs, configPath: configPath}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("node-labeler").
-		For(&corev1.Node{}, builder.WithPredicates(predicate.Funcs{
-			CreateFunc:  func(event.CreateEvent) bool { return true },
-			DeleteFunc:  func(event.DeleteEvent) bool { return true },
-			GenericFunc: func(event.GenericEvent) bool { return true },
-			// bash jqFilter='.metadata.labels' — only label drift fires.
-			UpdateFunc: func(e event.UpdateEvent) bool {
-				if e.ObjectOld == nil || e.ObjectNew == nil {
-					return false
-				}
-				return !reflect.DeepEqual(e.ObjectOld.GetLabels(), e.ObjectNew.GetLabels())
-			},
-		})).
+		// Watches with a single fixed workqueue key, not For(): the
+		// reconcile ignores req.Name and always sweeps the whole
+		// cluster, so per-node keys only produced N duplicate queued
+		// requests + N independent RequeueAfter timers per informer
+		// sync. One key collapses both to a single sweep (see
+		// sweepRequests). Predicate semantics are unchanged.
+		Watches(&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(sweepRequests("node-labeler-sweep")),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc:  func(event.CreateEvent) bool { return true },
+				DeleteFunc:  func(event.DeleteEvent) bool { return true },
+				GenericFunc: func(event.GenericEvent) bool { return true },
+				// bash jqFilter='.metadata.labels' — only label drift fires.
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					if e.ObjectOld == nil || e.ObjectNew == nil {
+						return false
+					}
+					return !reflect.DeepEqual(e.ObjectOld.GetLabels(), e.ObjectNew.GetLabels())
+				},
+			})).
 		Complete(r)
 }
 

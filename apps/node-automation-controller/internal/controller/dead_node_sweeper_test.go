@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -116,6 +117,10 @@ func TestDeadNodeSweeperTaintsFencedNode(t *testing.T) {
 func TestDeadNodeSweeperSkipsReadyNode(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		node("w1", corev1.ConditionTrue, nil),
+		// w2 keeps hasNotReady true so the pod list still runs and
+		// w1's skip comes from the in-loop Ready check, not the
+		// all-Ready early return (w2 has no stuck pods of its own).
+		node("w2", corev1.ConditionFalse, nil),
 		stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
 	// Even with a remediation CR present — a Ready node is the host
 	// watchdog's problem, never ours.
@@ -125,8 +130,10 @@ func TestDeadNodeSweeperSkipsReadyNode(t *testing.T) {
 	if err := s.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if hasTaint(getNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
-		t.Fatal("Ready node tainted — should have been skipped")
+	for _, name := range []string{"w1", "w2"} {
+		if hasTaint(getNode(t, cs, name).Spec.Taints, outOfServiceTaintKey) {
+			t.Fatalf("node %s tainted — should have been skipped", name)
+		}
 	}
 }
 
@@ -340,8 +347,11 @@ func TestDeadNodeSweeperVolumeAttachments(t *testing.T) {
 
 func TestDeadNodeSweeperMissingNode(t *testing.T) {
 	// Stuck pod references a node object the apiserver no longer has.
+	// w1 is NotReady so the pod list still runs — an all-Ready cluster
+	// exits before ever reading pods, leaving the gone-node skip
+	// branch uncovered.
 	cs := fake.NewSimpleClientset(
-		node("w1", corev1.ConditionTrue, nil),
+		node("w1", corev1.ConditionFalse, nil),
 		stuckTerminatingPod("db", "pg-0", "ghost", 20*time.Minute))
 	dyn := deadNodeDynFake()
 	s := deadNodeSweeperFor(cs, dyn, nil)
@@ -349,6 +359,52 @@ func TestDeadNodeSweeperMissingNode(t *testing.T) {
 	if err := s.run(ctx); err != nil {
 		t.Fatalf("missing node must be a skip, not a run failure: %v", err)
 	}
+}
+
+// The cluster-wide pod list is the sweep's most expensive read — it
+// is skipped entirely when every listed node is Ready (nothing could
+// be fenced anyway), and happens exactly once a NotReady node exists.
+func TestDeadNodeSweeperSkipsPodListWhenAllReady(t *testing.T) {
+	podListCount := func(cs *fake.Clientset) func() int {
+		var n int32
+		cs.PrependReactor("list", "pods",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				atomic.AddInt32(&n, 1)
+				return false, nil, nil // fall through to the tracker
+			})
+		return func() int { return int(atomic.LoadInt32(&n)) }
+	}
+
+	t.Run("all Ready -> pod list never runs", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			node("w1", corev1.ConditionTrue, nil),
+			node("w2", corev1.ConditionTrue, nil),
+			// Even a stuck pod changes nothing — the all-Ready gate
+			// fires before it can be counted.
+			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+		lists := podListCount(cs)
+		s := deadNodeSweeperFor(cs, deadNodeDynFake(), nil)
+		if err := s.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if lists() != 0 {
+			t.Fatalf("pod list ran %d times on an all-Ready cluster", lists())
+		}
+	})
+
+	t.Run("a NotReady node -> pod list runs once", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			node("w1", corev1.ConditionTrue, nil),
+			node("w2", corev1.ConditionFalse, nil))
+		lists := podListCount(cs)
+		s := deadNodeSweeperFor(cs, deadNodeDynFake(), nil)
+		if err := s.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if lists() != 1 {
+			t.Fatalf("pod list ran %d times, want exactly 1", lists())
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +425,9 @@ func TestDeadNodeSweeperNodeListError(t *testing.T) {
 }
 
 func TestDeadNodeSweeperPodListError(t *testing.T) {
-	cs := fake.NewSimpleClientset(node("w1", corev1.ConditionTrue, nil))
+	// The pod list is skipped when every node is Ready — a NotReady
+	// node is required for the sweep to reach it at all.
+	cs := fake.NewSimpleClientset(node("w1", corev1.ConditionFalse, nil))
 	cs.PrependReactor("list", "pods",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")

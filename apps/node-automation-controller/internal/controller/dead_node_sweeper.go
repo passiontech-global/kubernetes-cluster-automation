@@ -118,9 +118,13 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 		return err
 	}
 	nodeByName := make(map[string]*corev1.Node, len(nodes))
+	hasNotReady := false
 	for i := range nodes {
 		n := &nodes[i]
 		nodeByName[n.Name] = n
+		if !nodeReady(n) {
+			hasNotReady = true
+		}
 
 		// Recovery first: a node back to Ready=True must not keep
 		// the out-of-service taint or it stays unschedulable.
@@ -132,6 +136,16 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 			}
 			log.Info("UNTAINT: node Ready again -> out-of-service removed", "node", n.Name)
 		}
+	}
+
+	// Every node Ready = nothing can be fenced this cycle, so skip
+	// the cluster-wide pod list entirely: it is by far the biggest
+	// read this module makes (every pod in the cluster, deserialized)
+	// and the all-Ready happy path never consumes it. A stuck pod on
+	// a since-deleted node could only produce a skip-log anyway.
+	if !hasNotReady {
+		log.Info("sweep done")
+		return nil
 	}
 
 	pods, err := s.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})

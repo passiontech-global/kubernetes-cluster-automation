@@ -111,6 +111,25 @@ func (w *csrWatcher) run(ctx context.Context) error {
 			"csr", csr.Name,
 			"node", csr.Spec.Username[len(nodeUserPrefix):])
 	}
+	// Prune the warn-once/report-once sets for CSRs that vanished
+	// (approved/denied then garbage-collected, or deleted) — keyed by
+	// the churn-prone csr-xxxxx names, they would grow forever. The
+	// main loop breaks on the approval cap, so this needs its own
+	// pass over the full list.
+	seen := map[string]struct{}{}
+	for i := range list.Items {
+		seen[list.Items[i].Name] = struct{}{}
+	}
+	for name := range w.warned {
+		if _, ok := seen[name]; !ok {
+			delete(w.warned, name)
+		}
+	}
+	for name := range w.reported {
+		if _, ok := seen[name]; !ok {
+			delete(w.reported, name)
+		}
+	}
 	log.Info("sweep done", "approved", approved)
 	return nil
 }

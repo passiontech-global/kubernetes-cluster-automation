@@ -100,6 +100,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/client-go/transport/spdy"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -623,6 +624,28 @@ func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod
 type spdyExecutor struct {
 	cfg *rest.Config
 	cs  kubernetes.Interface
+
+	// Transport + upgrader are built ONCE and shared by every exec:
+	// remotecommand.NewSPDYExecutor derives them from the rest.Config
+	// on EACH call — a fresh http.Transport + tls.Config + connection
+	// pool per exec whose idle conns are never closed, leaking
+	// sockets and memory every time a worker pod is exec'd into.
+	// The executor itself is URL-scoped so it is still constructed
+	// per exec, but always over this shared transport pair.
+	once     sync.Once
+	rt       http.RoundTripper
+	upgrader spdy.Upgrader
+	rtErr    error
+}
+
+// transports lazily builds the shared SPDY round-tripper/upgrader —
+// the exact pair NewSPDYExecutor makes internally via
+// spdy.RoundTripperFor, except cached for the struct's lifetime.
+func (e *spdyExecutor) transports() (http.RoundTripper, spdy.Upgrader, error) {
+	e.once.Do(func() {
+		e.rt, e.upgrader, e.rtErr = spdy.RoundTripperFor(e.cfg)
+	})
+	return e.rt, e.upgrader, e.rtErr
 }
 
 func (e *spdyExecutor) ExecBash(ctx context.Context, ns, pod, container string, script []byte) (string, error) {
@@ -636,7 +659,11 @@ func (e *spdyExecutor) ExecBash(ctx context.Context, ns, pod, container string, 
 			Stderr:    true,
 			TTY:       false,
 		}, scheme.ParameterCodec)
-	ex, err := remotecommand.NewSPDYExecutor(e.cfg, http.MethodPost, req.URL())
+	rt, upgrader, err := e.transports()
+	if err != nil {
+		return "", err
+	}
+	ex, err := remotecommand.NewSPDYExecutorForTransports(rt, upgrader, http.MethodPost, req.URL())
 	if err != nil {
 		return "", err
 	}

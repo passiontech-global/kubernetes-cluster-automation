@@ -323,6 +323,63 @@ func TestCertManagerReaperResetBudgetExhausted(t *testing.T) {
 	}
 }
 
+// Ready=True earns a clean slate only once NOTHING is still pending:
+// a renewal-window candidate reports Ready=True the whole time its
+// next Order wedges (the old cert is still valid) — wiping the budget
+// there would bypass the hourly gap and the 3-reset cap every sweep.
+func TestCertManagerReaperRenewalKeepsResetBudget(t *testing.T) {
+	dyn := newFakeDyn(cmrListKinds,
+		cmrCert("app", "tls-renew", "True",
+			time.Now().Add(48*time.Hour).UTC().Format(time.RFC3339)),
+		cmrOrder("app", "order-r", "pending", 45*time.Minute),
+		cmrChallenge("app", "order-r-ch", true, true, time.Hour, "order-r"))
+	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
+		resets: map[string]*certReset{
+			"app/tls-renew": {total: certReaperMaxReset, gaveUp: true},
+		}}
+	before := queueErrorCount(t, certReaperQueue)
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !cmrOrderExists(t, dyn, "app", "order-r") {
+		t.Fatal("budget wiped for a renewal-window cert — order deleted past the cap")
+	}
+	if _, ok := r.resets["app/tls-renew"]; !ok {
+		t.Fatal("reset budget cleared while the cert is still a reap candidate")
+	}
+	if got := queueErrorCount(t, certReaperQueue) - before; got != 0 {
+		t.Fatalf("gaveUp must not re-fire IncError while the budget persists, delta %v", got)
+	}
+}
+
+// A cert recovered to Ready=True with no pending candidacy gets a
+// clean slate, and a budget for a deleted Certificate is dropped.
+func TestCertManagerReaperPrunesResetBudgets(t *testing.T) {
+	dyn := newFakeDyn(cmrListKinds,
+		cmrCert("app", "tls-ok", "True",
+			time.Now().Add(30*24*time.Hour).UTC().Format(time.RFC3339)),
+		// A second cert still Ready=False keeps its budget.
+		cmrCert("app", "pending", "False", ""))
+	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
+		resets: map[string]*certReset{
+			"app/tls-ok":  {total: certReaperMaxReset, gaveUp: true},
+			"gone/tls-x":  {total: 1},
+			"app/pending": {total: 1}, // cert exists, still failing
+		}}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.resets["app/tls-ok"]; ok {
+		t.Fatal("recovered cert kept its exhausted reset budget")
+	}
+	if _, ok := r.resets["gone/tls-x"]; ok {
+		t.Fatal("deleted cert kept its reset budget")
+	}
+	if _, ok := r.resets["app/pending"]; !ok {
+		t.Fatal("failing cert lost its reset budget")
+	}
+}
+
 // Per-item failure logs + continues: a failing orders List in ns "bad"
 // must not prevent the healthy ns "good" cert from being processed.
 func TestCertManagerReaperContinuesOnItemError(t *testing.T) {

@@ -12,8 +12,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -249,6 +251,60 @@ func TestPeriodicRunsUntilCancelled(t *testing.T) {
 	}
 }
 
+// A ctx cancelled before Start must return promptly — the random
+// phase offset must never delay shutdown by up to a full interval.
+func TestPeriodicCancelledBeforeStart(t *testing.T) {
+	pctx, cancel := context.WithCancel(ctx)
+	cancel()
+	p := &periodic{
+		name:     "test-periodic-cancelled",
+		interval: time.Hour,
+		fn: func(context.Context) error {
+			t.Error("fn ran on an already-cancelled ctx")
+			return nil
+		},
+		log: logr.Discard(),
+	}
+	done := make(chan error, 1)
+	go func() { done <- p.Start(pctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return promptly on a cancelled ctx")
+	}
+}
+
+// Cancelling mid-jitter (the uniform [0,interval) phase-offset wait
+// before the ticker starts) must abort Start immediately — not when
+// the offset would have elapsed.
+func TestPeriodicCancelDuringJitter(t *testing.T) {
+	p := &periodic{
+		name:     "test-periodic-jitter-cancel",
+		interval: time.Hour, // offset + first tick are both far out
+		fn: func(context.Context) error {
+			t.Error("fn ran")
+			return nil
+		},
+		log: logr.Discard(),
+	}
+	pctx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- p.Start(pctx) }()
+	time.Sleep(50 * time.Millisecond) // Start is in the offset wait
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel during the jitter wait did not return promptly")
+	}
+}
+
 // reconcileErrorCount reads the native error counter for module `name`
 // off the controller-runtime registry (the one metrics.init registers
 // into) — end-to-end proof the periodic loop calls IncError.
@@ -313,5 +369,36 @@ func TestPeriodicErrorIncrementsErrorMetric(t *testing.T) {
 
 	if got := reconcileErrorCount(t, "test-periodic-err"); got != before+1 {
 		t.Fatalf("error counter = %v, want %v", got, before+1)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// sweepRequests / fixedSweepRequest — fixed-key watch fan-in.
+// ---------------------------------------------------------------------------
+
+// Every object an informer could deliver must collapse to exactly one
+// request carrying the fixed key — byte-identical NamespacedNames are
+// what lets the workqueue set dedup an informer burst into one sweep.
+func TestSweepRequestsFixedKey(t *testing.T) {
+	fn := sweepRequests("test-sweep")
+	want := types.NamespacedName{Name: "test-sweep"}
+	for _, obj := range []client.Object{
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n2"}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "cilium-x", Namespace: "kube-system"}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Name: "passiontech-pipeline", Namespace: "fluent-system"}},
+	} {
+		reqs := fn(ctx, obj)
+		if len(reqs) != 1 {
+			t.Fatalf("%T %s/%s mapped to %d requests, want 1",
+				obj, obj.GetNamespace(), obj.GetName(), len(reqs))
+		}
+		if reqs[0].NamespacedName != want {
+			t.Fatalf("%T %s/%s mapped to %+v, want fixed key %q",
+				obj, obj.GetNamespace(), obj.GetName(),
+				reqs[0].NamespacedName, want)
+		}
 	}
 }

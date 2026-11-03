@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	ktesting "k8s.io/client-go/testing"
 )
 
@@ -707,5 +708,49 @@ func TestATCClientNon2xx(t *testing.T) {
 	if err := c.landWorker(ctx, "w"); err == nil ||
 		!strings.Contains(err.Error(), "500") {
 		t.Fatalf("expected status error on land, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// spdyExecutor.transports — the shared SPDY transport pair.
+// ---------------------------------------------------------------------------
+
+// transports() builds the RoundTripper+upgrader exactly once (the
+// per-exec remotecommand.NewSPDYExecutor used to leak a fresh
+// http.Transport + conn pool per worker pod) and hands the same pair
+// to every subsequent call.
+func TestSPDYExecutorTransportsCached(t *testing.T) {
+	e := &spdyExecutor{cfg: &rest.Config{Host: "https://127.0.0.1:6443"}}
+	rt1, up1, err := e.transports()
+	if err != nil {
+		t.Fatalf("transports: %v", err)
+	}
+	if rt1 == nil || up1 == nil {
+		t.Fatal("transports returned a nil leg")
+	}
+	rt2, up2, err := e.transports()
+	if err != nil {
+		t.Fatalf("second transports: %v", err)
+	}
+	if rt2 != rt1 || up2 != up1 {
+		t.Fatal("transports did not return the cached pair")
+	}
+}
+
+// A config RoundTripperFor rejects (here: unparsable CA data) keeps
+// its error cached too — the config never changes between calls, so
+// retrying could only repeat the same failure.
+func TestSPDYExecutorTransportsErrorCached(t *testing.T) {
+	e := &spdyExecutor{cfg: &rest.Config{
+		Host:            "https://127.0.0.1:6443",
+		TLSClientConfig: rest.TLSClientConfig{CAData: []byte("not-a-pem")},
+	}}
+	_, _, err1 := e.transports()
+	if err1 == nil {
+		t.Fatal("expected a transport build error for bad CA data")
+	}
+	_, _, err2 := e.transports()
+	if err2 != err1 {
+		t.Fatalf("cached error mismatch: first %v, second %v", err1, err2)
 	}
 }

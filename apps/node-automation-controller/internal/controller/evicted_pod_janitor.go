@@ -62,7 +62,14 @@ func SetupEvictedPodJanitor(mgr ctrl.Manager, cs kubernetes.Interface) error {
 func (j *evictedPodJanitor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	pods, err := j.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	// Server-side phase filter: only Failed pods can carry an
+	// eviction reason, so without this the sweep deserializes every
+	// Running/Pending pod in the cluster to throw them away below.
+	// The in-code phase check stays — fake clientsets ignore field
+	// selectors and the belt costs nothing.
+	pods, err := j.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+		FieldSelector: "status.phase=" + string(corev1.PodFailed),
+	})
 	if err != nil {
 		return err // periodic wrapper IncErrors evictedPodQueue
 	}

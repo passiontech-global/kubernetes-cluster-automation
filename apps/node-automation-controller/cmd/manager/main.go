@@ -72,6 +72,27 @@ func getenvDuration(key string, def time.Duration) time.Duration {
 	return def
 }
 
+// stripManagedFields is the shared managedFields stripper — a factory
+// product built once, not re-allocated per transformed object.
+var stripManagedFields = cache.TransformStripManagedFields()
+
+// defaultCacheTransform trims informer memory: managedFields is a
+// large chunk of every cached object and .Status.Images alone is
+// 50-80% of a Node's size — no module reads either field. Wired as
+// DefaultTransform (not a per-type ByObject.Transform) so it covers
+// the default Node informer too: Node has no ByObject entry — the
+// sweep controllers' watches create that informer from the Default*
+// settings.
+func defaultCacheTransform(obj interface{}) (interface{}, error) {
+	if _, err := stripManagedFields(obj); err != nil {
+		return nil, err
+	}
+	if n, ok := obj.(*corev1.Node); ok {
+		n.Status.Images = nil
+	}
+	return obj, nil
+}
+
 func main() {
 	var metricsAddr, probeAddr string
 	var showVersion, leaderElect bool
@@ -117,43 +138,47 @@ func main() {
 		LeaderElection:                leaderElect,
 		LeaderElectionID:              "node-automation-controller.node-ops",
 		LeaderElectionReleaseOnCancel: true,
-		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
-			// kube-system Role: daemonsets resourceNames
-			// [konnectivity-agent].
-			&appsv1.DaemonSet{}: {
-				Namespaces: map[string]cache.Config{"kube-system": {}},
-				Field: fields.SelectorFromSet(
-					fields.Set{"metadata.name": "konnectivity-agent"}),
+		Cache: cache.Options{
+			DefaultTransform: defaultCacheTransform,
+			ByObject: map[client.Object]cache.ByObject{
+				// kube-system Role: daemonsets resourceNames
+				// [konnectivity-agent].
+				&appsv1.DaemonSet{}: {
+					Namespaces: map[string]cache.Config{"kube-system": {}},
+					Field: fields.SelectorFromSet(
+						fields.Set{"metadata.name": "konnectivity-agent"}),
+				},
+				// kube-system Role: deployments get/list/watch (no
+				// resourceNames — the informer must see BOTH coredns and
+				// metrics-server; a single metadata.name field selector
+				// cannot express that, so the name pinning lives in the
+				// reconciler predicates instead).
+				&appsv1.Deployment{}: {
+					Namespaces: map[string]cache.Config{"kube-system": {}},
+				},
+				// ClusterRole: secrets resourceNames [passiontech-pipeline]
+				// (all namespaces; lives in fluent-system).
+				&corev1.Secret{}: {
+					Field: fields.SelectorFromSet(
+						fields.Set{"metadata.name": "passiontech-pipeline"}),
+				},
+				// node-ops Role: configmaps get/list/watch (converge
+				// trigger watches every CM in this namespace).
+				&corev1.ConfigMap{}: {
+					Namespaces: map[string]cache.Config{"node-ops": {}},
+				},
+				// cilium component Role: pods in kube-system — informer is
+				// only started when CILIUM_TAINT_REAPER_ENABLED=true (see
+				// SetupCiliumTaintReaper, which now returns nil before
+				// registering when disabled), so clusters without the
+				// component (and thus without pods watch RBAC) never open
+				// this watch. No other module watches Pods.
+				&corev1.Pod{}: {
+					Namespaces: map[string]cache.Config{"kube-system": {}},
+					Label:      labels.SelectorFromSet(labels.Set{"k8s-app": "cilium"}),
+				},
 			},
-			// kube-system Role: deployments get/list/watch (no
-			// resourceNames — the informer must see BOTH coredns and
-			// metrics-server; a single metadata.name field selector
-			// cannot express that, so the name pinning lives in the
-			// reconciler predicates instead).
-			&appsv1.Deployment{}: {
-				Namespaces: map[string]cache.Config{"kube-system": {}},
-			},
-			// ClusterRole: secrets resourceNames [passiontech-pipeline]
-			// (all namespaces; lives in fluent-system).
-			&corev1.Secret{}: {
-				Field: fields.SelectorFromSet(
-					fields.Set{"metadata.name": "passiontech-pipeline"}),
-			},
-			// node-ops Role: configmaps get/list/watch (converge
-			// trigger watches every CM in this namespace).
-			&corev1.ConfigMap{}: {
-				Namespaces: map[string]cache.Config{"node-ops": {}},
-			},
-			// cilium component Role: pods in kube-system — informer is
-			// only started when CILIUM_TAINT_REAPER_ENABLED=true (see
-			// SetupCiliumTaintReaper), so clusters without the
-			// component (and thus without pods watch RBAC) never open
-			// this watch.
-			&corev1.Pod{}: {
-				Namespaces: map[string]cache.Config{"kube-system": {}},
-				Label:      labels.SelectorFromSet(labels.Set{"k8s-app": "cilium"}),
-			},
-		}},
+		},
 	})
 	if err != nil {
 		log.Error(err, "unable to create manager")

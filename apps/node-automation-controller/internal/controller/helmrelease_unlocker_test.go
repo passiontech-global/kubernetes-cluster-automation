@@ -10,6 +10,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
@@ -513,6 +514,66 @@ func TestHRNameAndNamespaceFallbacks(t *testing.T) {
 	}
 	if got := hrTargetNS(hr); got != "target-ns" {
 		t.Fatalf("hrTargetNS = %q, want target-ns", got)
+	}
+}
+
+// The release-secret list is scoped server-side to this release's own
+// secrets — the same owner=helm + name=<release> pair the revision
+// scan matches on (the fake ignores selectors; assert the request).
+func TestHelmReleaseUnlockerSecretListUsesLabelSelector(t *testing.T) {
+	dyn, secrets := stuckHRFixture()
+	cs := kfake.NewSimpleClientset(secrets...)
+	var got labels.Selector
+	cs.PrependReactor("list", "secrets",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if la, ok := a.(ktesting.ListAction); ok {
+				got = la.GetListRestrictions().Labels
+			}
+			return false, nil, nil
+		})
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Empty() {
+		t.Fatal("release-secret list sent without a label selector")
+	}
+	if !got.Matches(labels.Set{"owner": "helm", "name": "myapp"}) {
+		t.Fatalf("secret list selector %q does not match this release's secrets", got)
+	}
+	if got.Matches(labels.Set{"owner": "helm", "name": "other"}) {
+		t.Fatalf("secret list selector %q is not scoped to the release", got)
+	}
+	if got.Matches(labels.Set{"name": "myapp"}) { // owner=helm required too
+		t.Fatalf("secret list selector %q dropped the owner=helm requirement", got)
+	}
+}
+
+// The unlock ledger prunes entries whose HelmRelease vanished or whose
+// stamp aged past the 24h cooldown, and keeps a live HR still inside it.
+func TestHelmReleaseUnlockerPrunesUnlockedLedger(t *testing.T) {
+	live := hrObj("apps", "myapp", "v2")
+	hrReady(live, "True", "Reconciliation finished")
+	old := hrObj("apps", "oldrel", "v2")
+	hrReady(old, "True", "Reconciliation finished")
+	dyn := newDynFake(live, old)
+	u := newUnlocker(kfake.NewSimpleClientset(), dyn, 0, "")
+	u.unlocked["apps/myapp"] = time.Now() // live HR inside cooldown → keep
+	u.unlocked["apps/gone"] = time.Now()  // HR vanished → prune
+	// Live HR past the cooldown → pruned by age, not absence.
+	u.unlocked["apps/oldrel"] = time.Now().Add(-helmUnlockCooldown - time.Minute)
+
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := u.unlocked["apps/gone"]; ok {
+		t.Fatal("unlocked entry for a deleted HR not pruned")
+	}
+	if _, ok := u.unlocked["apps/oldrel"]; ok {
+		t.Fatal("live HR's unlocked entry past the cooldown not pruned")
+	}
+	if _, ok := u.unlocked["apps/myapp"]; !ok {
+		t.Fatal("live HR inside the cooldown lost its unlock-ledger entry")
 	}
 }
 

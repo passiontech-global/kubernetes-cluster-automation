@@ -195,6 +195,77 @@ func TestCSRWatcherApprovalCap(t *testing.T) {
 	}
 }
 
+// A vanished CSR is forgotten: the warn-once set must not pin a
+// csr-xxxxx name forever — a same-named replacement warns again.
+func TestCSRWatcherPrunesWarnedForDeletedCSR(t *testing.T) {
+	old := csr("csr-1", kubeletServingSigner, "system:node:n1", time.Hour, false)
+	cs := fake.NewSimpleClientset(old)
+	w := newCSRWatcher(cs, false)
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := w.warned["csr-1"]; !ok {
+		t.Fatal("pending CSR not recorded in the warn-once set")
+	}
+	if err := cs.CertificatesV1().CertificateSigningRequests().
+		Delete(ctx, "csr-1", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := w.warned["csr-1"]; ok {
+		t.Fatal("deleted CSR still pinned in the warn-once set")
+	}
+	// Recreated under the same name: warns (re-records) again.
+	if _, err := cs.CertificatesV1().CertificateSigningRequests().
+		Create(ctx, old, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := w.warned["csr-1"]; !ok {
+		t.Fatal("recreated CSR not re-warned — stale prune kept the name")
+	}
+}
+
+// Same prune for the IncError-once set: a deleted CSR releases its
+// reported slot so a same-named replacement may report once more.
+func TestCSRWatcherPrunesReportedForDeletedCSR(t *testing.T) {
+	bad := csr("csr-evil", kubeletServingSigner,
+		"system:serviceaccount:kube-system:privesc", time.Hour, false)
+	cs := fake.NewSimpleClientset(bad)
+	w := newCSRWatcher(cs, true)
+	before := queueErrorCount(t, csrWatcherQueue)
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := w.reported["csr-evil"]; !ok {
+		t.Fatal("validation failure not recorded in reported")
+	}
+	if err := cs.CertificatesV1().CertificateSigningRequests().
+		Delete(ctx, "csr-evil", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := w.reported["csr-evil"]; ok {
+		t.Fatal("deleted CSR still pinned in reported")
+	}
+	if _, err := cs.CertificatesV1().CertificateSigningRequests().
+		Create(ctx, bad, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := queueErrorCount(t, csrWatcherQueue) - before; got != 2 {
+		t.Fatalf("recreated CSR did not re-report once, total delta %v", got)
+	}
+}
+
 func TestCSRWatcherListError(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	cs.PrependReactor("list", "certificatesigningrequests",

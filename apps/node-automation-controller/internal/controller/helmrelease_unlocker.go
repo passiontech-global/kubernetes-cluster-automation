@@ -81,6 +81,8 @@ type helmReleaseUnlocker struct {
 	firstSeen map[string]time.Time
 	// unlocked: ns/name → last successful unlock — enforces the
 	// 1-unlock/24h cap and detects "stuck again after unlock".
+	// Pruned each sweep once past the cooldown or when the HR
+	// vanished.
 	unlocked map[string]time.Time
 }
 
@@ -107,8 +109,10 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 
 	now := time.Now()
 	stuck := map[string]*unstructured.Unstructured{}
+	present := map[string]bool{} // every listed HR, stuck or not
 	for i := range list.Items {
 		hr := &list.Items[i]
+		present[hr.GetNamespace()+"/"+hr.GetName()] = true
 		if !hrStuckInProgress(hr) {
 			continue
 		}
@@ -124,6 +128,14 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	for key := range u.firstSeen {
 		if _, ok := stuck[key]; !ok {
 			delete(u.firstSeen, key)
+		}
+	}
+	// Same prune for the unlock ledger: entries past the 24h cooldown
+	// are dead weight and entries for HRs that vanished would pile up
+	// forever — the map is otherwise append-only per unlocked HR.
+	for key, last := range u.unlocked {
+		if !present[key] || now.Sub(last) >= helmUnlockCooldown {
+			delete(u.unlocked, key)
 		}
 	}
 
@@ -221,7 +233,13 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	key := hr.GetNamespace() + "/" + hr.GetName()
 	release := hrReleaseName(hr)
 
-	secrets, err := u.cs.CoreV1().Secrets(hrTargetNS(hr)).List(ctx, metav1.ListOptions{})
+	// Restrict server-side to this release's own secrets: helm
+	// release secrets embed the full compressed chart, so an
+	// unfiltered list hauls every release in the namespace across
+	// the wire. owner=helm + name=<release> is the same label pair
+	// the revision scan below matches on.
+	secrets, err := u.cs.CoreV1().Secrets(hrTargetNS(hr)).List(ctx,
+		metav1.ListOptions{LabelSelector: "owner=helm,name=" + release})
 	if err != nil {
 		return fmt.Errorf("list release secrets: %w", err)
 	}

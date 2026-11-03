@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
@@ -543,11 +545,11 @@ func stubDyn() *dynamicfake.FakeDynamicClient {
 }
 
 // Every module registers exactly one runnable on the manager — 24 in
-// the map — except the five gate-skippers (certmanager-reaper,
-// cilium-identity-auditor, coredns-patcher, metrics-server-patcher,
-// cf-tunnel-proxy-watchdog), which skip mgr.Add entirely while
-// disabled (19 runnables then). The other feature flags only gate the
-// tick body, not registration.
+// the map — except the seven gate-skippers (certmanager-reaper,
+// cilium-identity-auditor, cilium-taint-reaper, fluent-bit-config-roller,
+// coredns-patcher, metrics-server-patcher, cf-tunnel-proxy-watchdog),
+// which skip mgr.Add entirely while disabled (17 runnables then). The
+// other feature flags only gate the tick body, not registration.
 func TestSetupModules(t *testing.T) {
 	t.Run("all gates enabled", func(t *testing.T) {
 		m := newStubManager()
@@ -587,8 +589,71 @@ func TestSetupModules(t *testing.T) {
 		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), &rest.Config{}, moduleConfig{}); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
-		if len(m.added) != 19 {
-			t.Fatalf("registered %d runnables, want 19", len(m.added))
+		if len(m.added) != 17 {
+			t.Fatalf("registered %d runnables, want 17", len(m.added))
+		}
+	})
+}
+
+// The DefaultTransform wired into cache.Options must strip
+// managedFields on every cached type and additionally nil
+// .Status.Images on Nodes — the two biggest informer-memory items
+// no module reads. Other objects pass through otherwise untouched.
+func TestDefaultCacheTransform(t *testing.T) {
+	t.Run("node loses images and managedFields", func(t *testing.T) {
+		n := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:          "n1",
+				ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "kubelet"}},
+			},
+			Status: corev1.NodeStatus{
+				Images: []corev1.ContainerImage{{Names: []string{"img:latest"}}},
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		out, err := defaultCacheTransform(n)
+		if err != nil {
+			t.Fatalf("transform: %v", err)
+		}
+		got, ok := out.(*corev1.Node)
+		if !ok {
+			t.Fatalf("transformed object is %T, want *corev1.Node", out)
+		}
+		if got.Status.Images != nil {
+			t.Fatalf("Status.Images not stripped: %+v", got.Status.Images)
+		}
+		if got.GetManagedFields() != nil {
+			t.Fatalf("managedFields not stripped: %+v", got.GetManagedFields())
+		}
+		if got.Name != "n1" || len(got.Status.Conditions) != 1 {
+			t.Fatalf("transform mangled the node: %+v", got)
+		}
+	})
+
+	t.Run("non-node keeps its fields, loses managedFields", func(t *testing.T) {
+		s := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:          "passiontech-pipeline",
+				Namespace:     "fluent-system",
+				ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "fluent-operator"}},
+			},
+			Data: map[string][]byte{"k": []byte("v")},
+		}
+		out, err := defaultCacheTransform(s)
+		if err != nil {
+			t.Fatalf("transform: %v", err)
+		}
+		got, ok := out.(*corev1.Secret)
+		if !ok {
+			t.Fatalf("transformed object is %T, want *corev1.Secret", out)
+		}
+		if string(got.Data["k"]) != "v" {
+			t.Fatal("transform mangled secret data")
+		}
+		if got.GetManagedFields() != nil {
+			t.Fatal("managedFields not stripped on a non-Node object")
 		}
 	})
 }

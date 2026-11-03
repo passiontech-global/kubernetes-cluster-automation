@@ -60,9 +60,10 @@ const (
 type cronJobCatchup struct {
 	cs kubernetes.Interface
 	// lastCatchup enforces the 1-per-cronjob-per-day cap in memory —
-	// keyed "ns/name" -> "2006-01-02" (UTC). An apiserver-restart-
-	// clean map only ever re-arms early, and the Job label dedupe
-	// still guards the 24h window across restarts.
+	// keyed "ns/name" -> "2006-01-02" (UTC), pruned each sweep for
+	// CronJobs that vanished. An apiserver-restart-clean map only
+	// ever re-arms early, and the Job label dedupe still guards the
+	// 24h window across restarts.
 	mu          sync.Mutex
 	lastCatchup map[string]string
 }
@@ -107,6 +108,20 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 		}
 		c.spawn(ctx, log, cj, key)
 	}
+	// Drop daily-cap entries for CronJobs that no longer exist — the
+	// map is otherwise append-only per opted-in job ever caught up.
+	present := map[string]struct{}{}
+	for i := range cronjobs.Items {
+		cj := &cronjobs.Items[i]
+		present[cj.Namespace+"/"+cj.Name] = struct{}{}
+	}
+	c.mu.Lock()
+	for key := range c.lastCatchup {
+		if _, ok := present[key]; !ok {
+			delete(c.lastCatchup, key)
+		}
+	}
+	c.mu.Unlock()
 	log.Info("sweep done")
 	return nil
 }

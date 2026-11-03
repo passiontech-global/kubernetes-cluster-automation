@@ -340,6 +340,27 @@ func TestCronJobCatchupBareJobTemplate(t *testing.T) {
 	}
 }
 
+// The daily-cap map is pruned for CronJobs that vanished — a deleted
+// CronJob must not pin a stale cap entry forever.
+func TestCronJobCatchupPrunesCapForDeletedCronJob(t *testing.T) {
+	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchup(cs)
+	c.lastCatchup["ops/gone"] = "2000-01-01" // vanished CJ's stale entry
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.lastCatchup["ops/gone"]; ok {
+		t.Fatal("cap entry for a deleted CronJob not pruned")
+	}
+	// The live stale CronJob still spawned and re-armed today's cap —
+	// the prune must only drop absent keys.
+	today := time.Now().UTC().Format("2006-01-02")
+	if got := c.lastCatchup["ops/nightly"]; got != today {
+		t.Fatalf("live CronJob's cap entry = %q, want today's %q", got, today)
+	}
+}
+
 // A CronJob list failure aborts the sweep — the periodic wrapper
 // meters the error.
 func TestCronJobCatchupListError(t *testing.T) {

@@ -65,7 +65,7 @@ func TestFetchListRV(t *testing.T) {
 			gotURL = r.URL.String()
 			return probeResponse(200, probeRVJSON(12345)), nil
 		}}
-		rv, err := fetchListRV(ctx, rt, "10.0.0.1",
+		rv, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1",
 			"/api/v1/nodes?limit=1&resourceVersion=0")
 		if err != nil {
 			t.Fatal(err)
@@ -85,7 +85,7 @@ func TestFetchListRV(t *testing.T) {
 		rt := &stubTransport{fn: func(*http.Request) (*http.Response, error) {
 			return probeResponse(http.StatusInternalServerError, "boom"), nil
 		}}
-		_, err := fetchListRV(ctx, rt, "10.0.0.1", "/x")
+		_, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x")
 		if err == nil || !strings.Contains(err.Error(), "HTTP 500") {
 			t.Fatalf("expected HTTP 500 error, got %v", err)
 		}
@@ -95,7 +95,7 @@ func TestFetchListRV(t *testing.T) {
 		rt := &stubTransport{fn: func(*http.Request) (*http.Response, error) {
 			return probeResponse(200, "this is not json{"), nil
 		}}
-		if _, err := fetchListRV(ctx, rt, "10.0.0.1", "/x"); err == nil {
+		if _, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x"); err == nil {
 			t.Fatal("expected JSON decode error")
 		}
 	})
@@ -104,7 +104,7 @@ func TestFetchListRV(t *testing.T) {
 		rt := &stubTransport{fn: func(*http.Request) (*http.Response, error) {
 			return probeResponse(200, `{"metadata":{"resourceVersion":"abc"}}`), nil
 		}}
-		if _, err := fetchListRV(ctx, rt, "10.0.0.1", "/x"); err == nil {
+		if _, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x"); err == nil {
 			t.Fatal("expected resourceVersion parse error")
 		}
 	})
@@ -113,7 +113,7 @@ func TestFetchListRV(t *testing.T) {
 		rt := &stubTransport{fn: func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("connection refused")
 		}}
-		_, err := fetchListRV(ctx, rt, "10.0.0.1", "/x")
+		_, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x")
 		if err == nil || !strings.Contains(err.Error(), "connection refused") {
 			t.Fatalf("transport error not surfaced: %v", err)
 		}
@@ -125,10 +125,74 @@ func TestFetchListRV(t *testing.T) {
 		}}
 		// A space survives net.JoinHostPort but is rejected by
 		// http.NewRequest — the error must surface, not panic.
-		if _, err := fetchListRV(ctx, rt, "bad ip", "/x"); err == nil {
+		if _, err := fetchListRV(ctx, &http.Client{Transport: rt}, "bad ip", "/x"); err == nil {
 			t.Fatal("expected URL construction error for a bad backend IP")
 		}
 	})
+
+	t.Run("asks for PartialObjectMetadataList", func(t *testing.T) {
+		var accept string
+		rt := &stubTransport{fn: func(r *http.Request) (*http.Response, error) {
+			accept = r.Header.Get("Accept")
+			return probeResponse(200, probeRVJSON(42)), nil
+		}}
+		rv, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rv != 42 {
+			t.Fatalf("rv = %d, want 42", rv)
+		}
+		// The metadata-only envelope carries the same list-level
+		// resourceVersion — the decoder stays identical while the
+		// apiserver skips serializing full objects.
+		for _, part := range []string{"as=PartialObjectMetadataList", "g=meta.k8s.io"} {
+			if !strings.Contains(accept, part) {
+				t.Fatalf("Accept = %q, must contain %q", accept, part)
+			}
+		}
+	})
+
+	t.Run("body fully drained before close", func(t *testing.T) {
+		// An undrained body kills keep-alive on the shared transport
+		// — the drain must run on success AND on non-2xx paths.
+		for _, status := range []int{200, 500} {
+			payload := probeRVJSON(777)
+			body := &trackingBody{r: strings.NewReader(payload)}
+			rt := &stubTransport{fn: func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: status, Body: body, Header: http.Header{},
+				}, nil
+			}}
+			_, _ = fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x")
+			if !body.closed {
+				t.Fatalf("status %d: response body never closed", status)
+			}
+			if body.read != len(payload) {
+				t.Fatalf("status %d: read %d of %d body bytes — drain missing",
+					status, body.read, len(payload))
+			}
+		}
+	})
+}
+
+// trackingBody records how much of the response body was consumed
+// before Close — the keep-alive contract fetchListRV must keep.
+type trackingBody struct {
+	r      io.Reader
+	read   int
+	closed bool
+}
+
+func (t *trackingBody) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	t.read += n
+	return n, err
+}
+
+func (t *trackingBody) Close() error {
+	t.closed = true
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +264,40 @@ func TestEndpointGuardTransport(t *testing.T) {
 	g = &apiServerEndpointGuard{}
 	if _, err := g.transport(); err == nil {
 		t.Fatal("expected InClusterConfig error outside a cluster")
+	}
+}
+
+// probeClient wraps the (possibly test-injected) RoundTripper with the
+// probe timeout exactly once — the shared client is what makes the
+// drained-body keep-alive policy effective across backends.
+func TestEndpointGuardProbeClient(t *testing.T) {
+	rt := &stubTransport{fn: func(*http.Request) (*http.Response, error) {
+		return probeResponse(200, probeRVJSON(1)), nil
+	}}
+	g := &apiServerEndpointGuard{rt: rt}
+	c, err := g.probeClient()
+	if err != nil {
+		t.Fatalf("probeClient: %v", err)
+	}
+	if c.Transport != rt {
+		t.Fatal("probe client does not wrap the injected transport")
+	}
+	if c.Timeout != endpointGuardProbeTO {
+		t.Fatalf("probe client timeout = %s, want %s", c.Timeout, endpointGuardProbeTO)
+	}
+	c2, err := g.probeClient()
+	if err != nil || c2 != c {
+		t.Fatal("probeClient did not return the cached client")
+	}
+
+	// No transport and no in-cluster env -> error, and g.client stays
+	// nil so a later probe retries instead of caching a broken client.
+	g = &apiServerEndpointGuard{}
+	if _, err := g.probeClient(); err == nil {
+		t.Fatal("expected InClusterConfig error outside a cluster")
+	}
+	if g.client != nil {
+		t.Fatal("failed probeClient cached a client")
 	}
 }
 
@@ -421,6 +519,27 @@ func TestCoreDNSPanics(t *testing.T) {
 		w, _ := newWatchdog(200, "# HELP x\nother_metric 9\n", nil)
 		if sum, ok := w.panics(ctx, "10.9.9.9"); !ok || sum != 0 {
 			t.Fatalf("sum=%v ok=%v, want 0/true", sum, ok)
+		}
+	})
+
+	t.Run("line over 64KiB still scans", func(t *testing.T) {
+		// bufio.Scanner's default token cap is 64KiB — a single long
+		// line must not end the scan early (the buffer was raised to
+		// 1MiB for exactly this case).
+		w, _ := newWatchdog(200,
+			"# "+strings.Repeat("x", 200*1024)+"\ncoredns_panics_total 7\n", nil)
+		if sum, ok := w.panics(ctx, "10.9.9.9"); !ok || sum != 7 {
+			t.Fatalf("sum=%v ok=%v, want 7/true", sum, ok)
+		}
+	})
+
+	t.Run("line over 1MiB is unknown not truncated", func(t *testing.T) {
+		// Past the raised cap the scanner errors — same UNKNOWN
+		// verdict as a failed body read, never a partial sum.
+		w, _ := newWatchdog(200,
+			"coredns_panics_total 3\n# "+strings.Repeat("x", 2*1024*1024)+"\n", nil)
+		if _, ok := w.panics(ctx, "10.9.9.9"); ok {
+			t.Fatal("oversized metric line reported a known sum")
 		}
 	})
 

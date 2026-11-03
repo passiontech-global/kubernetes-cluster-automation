@@ -80,6 +80,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"net/http"
@@ -172,7 +173,13 @@ type apiServerEndpointGuard struct {
 	// shared by every backend probe — built lazily so the module still
 	// constructs outside a cluster (probes then fail closed: all
 	// backends "wedged", the last-healthy guard blocks every edit).
-	rt       http.RoundTripper
+	rt http.RoundTripper
+	// client wraps rt with the probe timeout — built once on first
+	// probe so every backend share one keep-alive pool. A fresh
+	// http.Client per request would still reuse rt's pool, but the
+	// old code also never drained resp.Body, which killed keep-alive
+	// outright; the shared client + drain keeps conns reusable.
+	client   *http.Client
 	backends map[string]*backendProbeState
 	log      logr.Logger
 	// quarantineActive switches Start to the faster re-apply cadence —
@@ -711,21 +718,37 @@ func serverMinor(cs kubernetes.Interface) (int, error) {
 // resourceVersion=0 which the apiserver answers from its watch cache —
 // the gap between them IS the wedge signal.
 func (g *apiServerEndpointGuard) probe(ctx context.Context, ip string) apiProbeResult {
-	rt, err := g.transport()
+	client, err := g.probeClient()
 	if err != nil {
 		return apiProbeResult{err: err}
 	}
-	liveRV, err := fetchListRV(ctx, rt, ip,
+	liveRV, err := fetchListRV(ctx, client, ip,
 		"/api/v1/namespaces/default/services?limit=1")
 	if err != nil {
 		return apiProbeResult{err: fmt.Errorf("live rv: %w", err)}
 	}
-	cacheRV, err := fetchListRV(ctx, rt, ip,
+	cacheRV, err := fetchListRV(ctx, client, ip,
 		"/api/v1/nodes?limit=1&resourceVersion=0")
 	if err != nil {
 		return apiProbeResult{err: fmt.Errorf("cache rv: %w", err)}
 	}
 	return apiProbeResult{liveRV: liveRV, cacheRV: cacheRV}
+}
+
+// probeClient returns the single probe http.Client (transport() +
+// the probe timeout), built once on first use — including when tests
+// inject rt directly. Sharing one client (and one drained-body
+// policy, see fetchListRV) is what makes keep-alive actually work.
+func (g *apiServerEndpointGuard) probeClient() (*http.Client, error) {
+	if g.client != nil {
+		return g.client, nil
+	}
+	rt, err := g.transport()
+	if err != nil {
+		return nil, err
+	}
+	g.client = &http.Client{Transport: rt, Timeout: endpointGuardProbeTO}
+	return g.client, nil
 }
 
 // transport lazily builds the in-cluster RoundTripper (SA bearer token
@@ -759,17 +782,32 @@ func (g *apiServerEndpointGuard) transport() (http.RoundTripper, error) {
 
 // fetchListRV GETs a core-API list path on one backend and returns the
 // list's metadata.resourceVersion. Any non-2xx is a wedge signal.
-func fetchListRV(ctx context.Context, rt http.RoundTripper, ip, path string) (int64, error) {
+//
+// The Accept header asks for a PartialObjectMetadataList: the probe
+// only needs the list RV, and on resourceVersion=0 cache reads the
+// apiserver IGNORES limit=1 — without it every probe decoded the FULL
+// NodeList (hundreds of KB–MB per backend per cycle) just to reach
+// .metadata.resourceVersion. The list-level RV sits in the same place
+// on the metadata-only envelope, so the decoder below is unchanged.
+func fetchListRV(ctx context.Context, client *http.Client, ip, path string) (int64, error) {
 	url := "https://" + net.JoinHostPort(ip, endpointGuardPort) + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
 	}
-	resp, err := (&http.Client{Transport: rt, Timeout: endpointGuardProbeTO}).Do(req)
+	req.Header.Set("Accept",
+		"application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1")
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Drain before Close — an unread body makes the connection
+		// unreusable, which silently defeated keep-alive on the
+		// shared transport (new TCP+TLS handshake per probe).
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}

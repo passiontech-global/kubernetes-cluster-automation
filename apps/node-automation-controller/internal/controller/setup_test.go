@@ -195,8 +195,10 @@ func TestSetupPeriodicModules(t *testing.T) {
 
 // Feature flags split in two: externalsecret-nudge and csr-watcher
 // register unconditionally (the flag only gates the tick body, like
-// the bash exit-early at the top of the hook), while certmanager-reaper
-// and cilium-identity-auditor skip mgr.Add entirely when disabled.
+// the bash exit-early at the top of the hook), while certmanager-reaper,
+// cilium-identity-auditor, cilium-taint-reaper and
+// fluent-bit-config-roller skip mgr.Add entirely when disabled (no
+// informer, no RequeueAfter loop).
 func TestSetupFeatureFlagVariants(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 
@@ -231,6 +233,12 @@ func TestSetupFeatureFlagVariants(t *testing.T) {
 		{"cf-tunnel-proxy-watchdog", func(m manager.Manager) error {
 			return SetupCFTunnelProxyWatchdog(m, cs, false,
 				"cloudflare-tunnel-system", 5*time.Minute)
+		}},
+		{"cilium-taint-reaper", func(m manager.Manager) error {
+			return SetupCiliumTaintReaper(m, cs, false)
+		}},
+		{"fluent-bit-config-roller", func(m manager.Manager) error {
+			return SetupFluentBitRoller(m, cs, false)
 		}},
 	} {
 		t.Run(tc.name+"-disabled", func(t *testing.T) {
@@ -296,19 +304,13 @@ func TestSetupBuilderModules(t *testing.T) {
 		{"fluent-bit-config-roller", func(m manager.Manager) error {
 			return SetupFluentBitRoller(m, cs, true)
 		}},
-		{"fluent-bit-config-roller-disabled", func(m manager.Manager) error {
-			return SetupFluentBitRoller(m, cs, false)
-		}},
 		{"converge-trigger", func(m manager.Manager) error {
 			return SetupConvergeTrigger(m, cs)
 		}},
-		// enabled adds a second source (.Watches on cilium Pods) —
-		// still one controller runnable.
+		// enabled registers two sources (.Watches on Nodes + cilium
+		// Pods) — still one controller runnable.
 		{"cilium-taint-reaper", func(m manager.Manager) error {
 			return SetupCiliumTaintReaper(m, cs, true)
-		}},
-		{"cilium-taint-reaper-disabled", func(m manager.Manager) error {
-			return SetupCiliumTaintReaper(m, cs, false)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -345,7 +347,7 @@ func TestSetupAddErrorPropagates(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // controllerWatches returns the watch sources a builder-built
-// controller registered, in registration order (For() first).
+// controller registered, in registration order.
 func controllerWatches(t *testing.T, r manager.Runnable) []source.TypedSource[reconcile.Request] {
 	t.Helper()
 	v := reflect.ValueOf(r)
@@ -385,8 +387,8 @@ func kindSource(t *testing.T, src source.TypedSource[reconcile.Request]) ([]pred
 	return preds, h
 }
 
-// forPredicate returns the first predicate installed on the For()
-// watch of a single-watch builder module.
+// forPredicate returns the first predicate installed on the only
+// watch source of a single-watch builder module.
 func forPredicate(t *testing.T, setup func(manager.Manager) error) predicate.Predicate {
 	t.Helper()
 	m := newStubManager()
@@ -487,7 +489,8 @@ func TestSetupNodeLabelerPredicate(t *testing.T) {
 
 // The cilium-taint-reaper Node predicate only fires on changes to the
 // agent-not-ready taint projection; the enabled variant additionally
-// watches kube-system cilium Pods and maps them back to their node.
+// watches kube-system cilium Pods and collapses them onto the same
+// fixed sweep key.
 func TestSetupCiliumTaintReaperWatches(t *testing.T) {
 	m := newStubManager()
 	if err := SetupCiliumTaintReaper(m, fake.NewSimpleClientset(), true); err != nil {
@@ -524,7 +527,31 @@ func TestSetupCiliumTaintReaperWatches(t *testing.T) {
 		t.Fatal("agent-not-ready taint change did not fire")
 	}
 
-	// The pod watch maps a cilium pod back to its node name.
+	// The Node watch itself enqueues the fixed sweep key — identical
+	// NamespacedNames are what the workqueue set collapses, so it must
+	// be the SAME key the pod watch below produces.
+	_, nodeH := kindSource(t, srcs[0])
+	if nodeH == nil {
+		t.Fatal("node watch has no event handler")
+	}
+	nq := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+	defer nq.ShutDown()
+	nodeH.Create(context.Background(), event.CreateEvent{
+		Object: node("n1", corev1.ConditionTrue, nil)}, nq)
+	nodeH.Create(context.Background(), event.CreateEvent{
+		Object: node("n2", corev1.ConditionFalse, nil)}, nq)
+	if nq.Len() != 1 {
+		t.Fatalf("2-node burst enqueued %d requests, want 1 (set-collapse)", nq.Len())
+	}
+	nitem, _ := nq.Get()
+	if nitem.Name != "cilium-taint-reaper-sweep" || nitem.Namespace != "" {
+		t.Fatalf("node event enqueued %+v, want fixed sweep key", nitem)
+	}
+	nq.Done(nitem)
+
+	// The pod watch maps a scheduled cilium pod onto the same fixed
+	// sweep key (it used to enqueue the pod's spec.nodeName).
 	_, h := kindSource(t, srcs[1])
 	if h == nil {
 		t.Fatal("pod watch has no event handler")
@@ -532,14 +559,17 @@ func TestSetupCiliumTaintReaperWatches(t *testing.T) {
 	q := workqueue.NewTypedRateLimitingQueue(
 		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
 	defer q.ShutDown()
+	// The pod watch enqueues the same fixed sweep key as the Node
+	// watch — the reconcile ignores the request name, so collapsing
+	// pod events onto it keeps one queued item per trigger burst.
 	h.Create(context.Background(), event.CreateEvent{
 		Object: ciliumPod("n7", corev1.PodRunning, true)}, q)
 	if q.Len() != 1 {
 		t.Fatalf("pod event enqueued %d requests, want 1", q.Len())
 	}
 	item, _ := q.Get()
-	if item.Name != "n7" || item.Namespace != "" {
-		t.Fatalf("enqueued request = %+v, want node name n7", item)
+	if item.Name != "cilium-taint-reaper-sweep" || item.Namespace != "" {
+		t.Fatalf("enqueued request = %+v, want fixed sweep key", item)
 	}
 	q.Done(item)
 
@@ -549,13 +579,62 @@ func TestSetupCiliumTaintReaperWatches(t *testing.T) {
 		t.Fatalf("nodeless pod enqueued %d requests, want 0", q.Len())
 	}
 
-	// Disabled variant: the pod informer is never wired.
+	// Disabled variant: nothing registers at all — no controller,
+	// no Node/Pod watch (covered in TestSetupFeatureFlagVariants).
 	m = newStubManager()
 	if err := SetupCiliumTaintReaper(m, fake.NewSimpleClientset(), false); err != nil {
 		t.Fatalf("disabled setup: %v", err)
 	}
-	if n := len(controllerWatches(t, m.added[0])); n != 1 {
-		t.Fatalf("disabled reaper registered %d watches, want 1", n)
+	if len(m.added) != 0 {
+		t.Fatalf("disabled reaper registered %d runnables, want 0", len(m.added))
+	}
+}
+
+// Each sweep module's Node watch maps every node event onto its own
+// fixed key — a multi-node burst must set-collapse to a single queued
+// request, and the keys must stay stable (the reconcile ignores the
+// request name; only the dedup contract matters).
+func TestSetupSweepModulesFixedKey(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(manager.Manager) error
+		key   string
+	}{
+		{"node-labeler", func(m manager.Manager) error {
+			return SetupNodeLabeler(m, fake.NewSimpleClientset(), "labels.txt")
+		}, "node-labeler-sweep"},
+		{"descheduler-storm-gate", func(m manager.Manager) error {
+			return SetupDeschedulerStormGate(m, fake.NewSimpleClientset())
+		}, "descheduler-storm-gate-sweep"},
+		{"cilium-taint-reaper", func(m manager.Manager) error {
+			return SetupCiliumTaintReaper(m, fake.NewSimpleClientset(), true)
+		}, "cilium-taint-reaper-sweep"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newStubManager()
+			if err := tc.setup(m); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+			_, h := kindSource(t, controllerWatches(t, m.added[0])[0])
+			if h == nil {
+				t.Fatal("node watch has no event handler")
+			}
+			q := workqueue.NewTypedRateLimitingQueue(
+				workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+			for _, name := range []string{"n1", "n2", "n3"} {
+				h.Create(context.Background(), event.CreateEvent{
+					Object: node(name, corev1.ConditionTrue, nil)}, q)
+			}
+			if q.Len() != 1 {
+				t.Fatalf("3-node burst enqueued %d requests, want 1 (set-collapse)", q.Len())
+			}
+			item, _ := q.Get()
+			if item.Name != tc.key || item.Namespace != "" {
+				t.Fatalf("enqueued request = %+v, want fixed key %q", item, tc.key)
+			}
+			q.Done(item)
+		})
 	}
 }
 

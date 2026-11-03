@@ -39,6 +39,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -71,26 +72,34 @@ type deschedulerStormGate struct {
 func SetupDeschedulerStormGate(mgr ctrl.Manager, cs kubernetes.Interface) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("descheduler-storm-gate").
-		For(&corev1.Node{}, builder.WithPredicates(predicate.Funcs{
-			// Fire only when the fields the verdict reads actually
-			// changed (bash jqFilter equivalent: {conds: type=status,
-			// taints: keys}). Comparing raw Status.Conditions would fire
-			// on every kubelet heartbeat — lastHeartbeatTime/Reason/
-			// Message churn constantly.
-			UpdateFunc: func(e event.UpdateEvent) bool {
-				oldN, ok1 := e.ObjectOld.(*corev1.Node)
-				newN, ok2 := e.ObjectNew.(*corev1.Node)
-				if !ok1 || !ok2 {
-					return true
-				}
-				return !reflect.DeepEqual(condStatusMap(oldN), condStatusMap(newN)) ||
-					!reflect.DeepEqual(taintKeys(oldN), taintKeys(newN))
-			},
-			// Node add/remove changes the storm verdict too.
-			CreateFunc:  func(event.CreateEvent) bool { return true },
-			DeleteFunc:  func(event.DeleteEvent) bool { return true },
-			GenericFunc: func(event.GenericEvent) bool { return true },
-		})).
+		// Watches with a single fixed workqueue key, not For(): the
+		// reconcile ignores req.Name and always sweeps the whole
+		// cluster, so per-node keys only produced N duplicate queued
+		// requests + N independent RequeueAfter timers per informer
+		// sync. One key collapses both to a single sweep (see
+		// sweepRequests). Predicate semantics are unchanged.
+		Watches(&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(sweepRequests("descheduler-storm-gate-sweep")),
+			builder.WithPredicates(predicate.Funcs{
+				// Fire only when the fields the verdict reads actually
+				// changed (bash jqFilter equivalent: {conds: type=status,
+				// taints: keys}). Comparing raw Status.Conditions would fire
+				// on every kubelet heartbeat — lastHeartbeatTime/Reason/
+				// Message churn constantly.
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					oldN, ok1 := e.ObjectOld.(*corev1.Node)
+					newN, ok2 := e.ObjectNew.(*corev1.Node)
+					if !ok1 || !ok2 {
+						return true
+					}
+					return !reflect.DeepEqual(condStatusMap(oldN), condStatusMap(newN)) ||
+						!reflect.DeepEqual(taintKeys(oldN), taintKeys(newN))
+				},
+				// Node add/remove changes the storm verdict too.
+				CreateFunc:  func(event.CreateEvent) bool { return true },
+				DeleteFunc:  func(event.DeleteEvent) bool { return true },
+				GenericFunc: func(event.GenericEvent) bool { return true },
+			})).
 		Complete(&deschedulerStormGate{cs: cs})
 }
 

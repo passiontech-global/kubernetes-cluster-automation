@@ -157,6 +157,33 @@ func TestEvictedPodJanitorMultipleNamespaces(t *testing.T) {
 	}
 }
 
+// The pods list carries a server-side status.phase=Failed field
+// selector — only Failed pods can hold an eviction reason, so
+// Running/Pending pods must never be fetched. The fake tracker
+// ignores field selectors, which is also why the in-code phase
+// check stays and this test can still delete.
+func TestEvictedPodJanitorFieldSelector(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		epjPod("a", "old-evicted", corev1.PodFailed, "Evicted", 2*time.Hour))
+	var gotFields string
+	cs.PrependReactor("list", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			gotFields = a.(ktesting.ListAction).
+				GetListRestrictions().Fields.String()
+			return false, nil, nil // fall through to the tracker
+		})
+	j := &evictedPodJanitor{cs: cs}
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if want := "status.phase=" + string(corev1.PodFailed); gotFields != want {
+		t.Fatalf("list field selector = %q, want %q", gotFields, want)
+	}
+	if epjPodExists(t, cs, "a", "old-evicted") {
+		t.Fatal("old evicted pod not deleted")
+	}
+}
+
 // A pods list failure is a real error — the periodic wrapper meters it.
 func TestEvictedPodJanitorListError(t *testing.T) {
 	cs := fake.NewSimpleClientset()
