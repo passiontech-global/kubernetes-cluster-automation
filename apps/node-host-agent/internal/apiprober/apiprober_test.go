@@ -1,11 +1,13 @@
 package apiprober
 
 import (
+	"bytes"
 	"context"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1140,6 +1142,145 @@ func TestSocketFlapAcrossCycles(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(p.backendCount); got != 1 {
 		t.Fatalf("backendCount=%v want 1", got)
+	}
+}
+
+// captureSlog swaps the default slog logger for a text handler
+// writing to the returned buffer — Cycle logs via the package
+// logger, so this sees every line. Restored on test cleanup.
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+func TestMissingSocketGatesDiscovery(t *testing.T) {
+	// api-local-lb is worker-only — on controllers the admin
+	// socket legitimately never exists. A missing socket is a
+	// gated cycle: no error, cycles{no_socket}, and the absence is
+	// logged ONCE per state-change, not once per cycle.
+	buf := captureSlog(t)
+	p, err := New(Config{
+		SocketPath:  filepath.Join(t.TempDir(), "absent.sock"),
+		BackendName: "kube_apiserver",
+		HTTPClient:  newAPIStub(t).srv.Client(),
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	if got := testutil.ToFloat64(p.cycles.WithLabelValues("no_socket")); got != 3 {
+		t.Fatalf("no_socket=%v want 3", got)
+	}
+	if got := testutil.ToFloat64(p.cycles.WithLabelValues("discover_fail")); got != 0 {
+		t.Fatalf("discover_fail=%v want 0 — a missing socket is gated, not an error", got)
+	}
+	logs := buf.String()
+	if strings.Contains(logs, "level=ERROR") {
+		t.Fatalf("missing socket logged ERROR lines:\n%s", logs)
+	}
+	if n := strings.Count(logs, "socket absent"); n != 1 {
+		t.Fatalf("socket-absent info lines=%d want 1 (log-once latch):\n%s", n, logs)
+	}
+}
+
+func TestSocketGateRecoversWhenSocketAppears(t *testing.T) {
+	// The flip side of the gate: api-local-lb installed (or the
+	// host re-roled to worker) mid-run — the socket appears, one
+	// informational line marks the transition back, and discovery
+	// resumes on the same cycle.
+	buf := captureSlog(t)
+	stub := newAPIStub(t)
+	sockPath := filepath.Join(t.TempDir(), "haproxy.sock")
+	p, err := New(Config{
+		SocketPath:  sockPath,
+		BackendName: "kube_apiserver",
+		HTTPClient:  stub.srv.Client(),
+		TCPCheck:    func(context.Context, string) error { return nil },
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p.Cycle(context.Background()) // absent → gated
+	if got := testutil.ToFloat64(p.cycles.WithLabelValues("no_socket")); got != 1 {
+		t.Fatalf("no_socket=%v want 1", got)
+	}
+
+	// The socket appears: a real listener at the configured path
+	// serving `show stat` (same fake, bound manually — the helper
+	// picks its own tempdir path).
+	f := &fakeHAProxy{
+		servers:  map[string]string{"hub1": stub.addr()},
+		order:    []string{"hub1"},
+		disabled: map[string]bool{},
+	}
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go f.handle(conn)
+		}
+	}()
+
+	p.Cycle(context.Background())
+	if got := testutil.ToFloat64(p.cycles.WithLabelValues("ok")); got != 1 {
+		t.Fatalf("cycles ok=%v want 1 after socket appeared", got)
+	}
+	if got := testutil.ToFloat64(p.backendCount); got != 1 {
+		t.Fatalf("backendCount=%v want 1", got)
+	}
+	logs := buf.String()
+	if strings.Contains(logs, "level=ERROR") {
+		t.Fatalf("socket appear cycle logged ERROR:\n%s", logs)
+	}
+	if n := strings.Count(logs, "socket absent"); n != 1 {
+		t.Fatalf("socket-absent info lines=%d want 1:\n%s", n, logs)
+	}
+	if n := strings.Count(logs, "socket present"); n != 1 {
+		t.Fatalf("socket-present info lines=%d want 1:\n%s", n, logs)
+	}
+}
+
+func TestBrokenSocketStillErrors(t *testing.T) {
+	// The gate is socket-EXISTENCE, not "path fails": a path that
+	// exists but is not a socket (or is refused/unreadable) is a
+	// real discovery failure — the dial errors, discover_fail
+	// counts and the ERROR line stays.
+	buf := captureSlog(t)
+	sockPath := filepath.Join(t.TempDir(), "not-a-socket")
+	if err := os.WriteFile(sockPath, []byte("regular file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(Config{
+		SocketPath:  sockPath,
+		BackendName: "kube_apiserver",
+		HTTPClient:  newAPIStub(t).srv.Client(),
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Cycle(context.Background())
+	if got := testutil.ToFloat64(p.cycles.WithLabelValues("discover_fail")); got != 1 {
+		t.Fatalf("discover_fail=%v want 1 — existing-but-broken socket is a real error", got)
+	}
+	if got := testutil.ToFloat64(p.cycles.WithLabelValues("no_socket")); got != 0 {
+		t.Fatalf("no_socket=%v want 0", got)
+	}
+	if logs := buf.String(); !strings.Contains(logs, "level=ERROR") {
+		t.Fatalf("broken socket produced no ERROR line:\n%s", logs)
 	}
 }
 

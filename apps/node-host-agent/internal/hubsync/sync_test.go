@@ -623,7 +623,7 @@ func TestSystemdUnitContent(t *testing.T) {
 		"/usr/local/bin/node-host-agent",
 		"/etc/node-host-agent/vars", "/etc/node-host-agent/nebula-certs")
 	for _, want := range []string{
-		"ExecStart=/usr/local/bin/node-host-agent --standalone --node-name=db-vm",
+		"ExecStart=/usr/local/bin/node-host-agent --standalone --node-name=db-vm --health-probe-bind-address=:8091",
 		"Environment=NODE_HOST_AGENT_HOST_ROOT=/",
 		"Environment=NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR=/etc/node-host-agent/vars",
 		"Environment=NODE_HOST_AGENT_NEBULA_CERTS_DIR=/etc/node-host-agent/nebula-certs",

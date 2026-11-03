@@ -297,6 +297,11 @@ type Prober struct {
 	// call Cycle internals directly still see sane values). Only
 	// the Cycle goroutine reads/writes it — never exported.
 	eff guardEff
+	// socketAbsent is the log-once latch for the missing-socket
+	// gate: the absent state logs a single informational line on
+	// the transition (and one more when the socket appears), not
+	// an ERROR per cycle. Only the Cycle goroutine touches it.
+	socketAbsent bool
 
 	rvGap         *prometheus.GaugeVec
 	enabled       *prometheus.GaugeVec
@@ -359,7 +364,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Prober, error) {
 	}, []string{"backend", "action"})
 	p.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_apiprober_cycles_total",
-		Help: "Probe cycles by result (ok|discover_fail).",
+		Help: "Probe cycles by result (ok|no_socket|discover_fail).",
 	}, []string{"result"})
 	p.backendCount = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_apiprober_backends",
@@ -1076,6 +1081,33 @@ func (p *Prober) Cycle(ctx context.Context) {
 	// Re-read the guard conf every cycle — a conf written or edited
 	// by hostconfig mid-run applies NOW, not after a restart.
 	p.refreshGuard()
+
+	// Missing-socket gate: api-local-lb is worker-only (hostconfig
+	// groupAPILB returns early on non-k0sworker hosts), so the
+	// admin socket legitimately NEVER exists on controllers — a
+	// missing socket is a quiet gated cycle, not a discovery
+	// error. Stat-then-skip keeps the real failures loud: a socket
+	// that exists but is unreadable/refused still reaches the dial
+	// below and counts discover_fail. Other stat errors fall
+	// through to the dial for the same reason. The DialSocket
+	// seam bypasses the stat — the injected dialer IS the socket
+	// contract in tests.
+	if p.cfg.DialSocket == nil {
+		if _, err := os.Stat(p.eff.socket); os.IsNotExist(err) {
+			if !p.socketAbsent {
+				log.Info("HAProxy admin socket absent — backend discovery gated (api-local-lb is worker-only)",
+					"socket", p.eff.socket)
+				p.socketAbsent = true
+			}
+			p.cycles.WithLabelValues("no_socket").Inc()
+			return
+		}
+		if p.socketAbsent {
+			log.Info("HAProxy admin socket present — resuming backend discovery",
+				"socket", p.eff.socket)
+			p.socketAbsent = false
+		}
+	}
 
 	discovered, err := p.discover(ctx)
 	if err != nil {

@@ -30,6 +30,12 @@
 //   - nethealth: DNS fallback, coredns-stub, overlay egress relays,
 //     nebula health, fail2ban (former watchdog modules 12/13/20/21/50).
 //     NODE_HOST_AGENT_ENABLE_NETHEALTH (default true).
+//   - janitor:  self-healing sweeps of the shared watchdog state dir
+//     (reaps stale state-* latches no enabled check can produce, plus
+//     known latches past 24h) and of retired shell-stack residue
+//     (reset-failed/stop on not-found ghost units, kills orphaned
+//     `ip monitor` watchers). No kube client — runs on every node
+//     class. NODE_HOST_AGENT_ENABLE_JANITOR (default true).
 //   - nodereporter: syncs watchdog state-* latches to NodeConditions,
 //     K8s Events and problem_gauge/problem_counter (replaces the NPD
 //     watchdog monitors). NODE_HOST_AGENT_ENABLE_REPORTER (default
@@ -508,8 +514,9 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 
 	// --- apiprober: apiserver watch-cache wedge guard ---
 	// "auto" (default) = enabled; a missing socket is NOT a startup
-	// gate — the prober self-discovers each cycle and meters
-	// discover_fail, so it also comes alive when api-local-lb is
+	// gate — the prober self-gates each cycle (cycles{no_socket},
+	// logged once per state-change) so it stays quiet on
+	// controllers and still comes alive when api-local-lb is
 	// installed after this pod started. "false" disables explicitly.
 	// /etc/api-backend-guard.conf is rendered by hostconfig on
 	// api-lb VMs — the fallback layer below the env vars for the
@@ -682,6 +689,28 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			slog.Error("nethealth setup failed", "error", err)
 		} else {
 			subsystems = append(subsystems, nh)
+		}
+	}
+
+	// --- janitor: watchdog-state latch reaper + retired-unit sweep ---
+	// Pure host-fs/systemd work — runs on every node class (workers,
+	// controllers, standalone hubs): the shared state dir accumulates
+	// latches from every subsystem and ghost unit records outlive the
+	// pruned unit files. No kube client needed.
+	if envBool("NODE_HOST_AGENT_ENABLE_JANITOR", true) {
+		jn, err := workerhygiene.NewJanitor(workerhygiene.JanitorConfig{
+			Enabled:          true,
+			Interval:         envDuration("NODE_HOST_AGENT_JANITOR_INTERVAL", 10*time.Minute),
+			WatchdogStateDir: watchdogStateDir,
+			WatchdogLogFile:  watchdogLogFile,
+			ProcRoot:         getenv("NODE_HOST_AGENT_PROC_ROOT", "/proc"),
+			LatchMaxAge:      envDuration("NODE_HOST_AGENT_JANITOR_LATCH_MAX_AGE", 24*time.Hour),
+			Systemd:          sdClient,
+		}, reg)
+		if err != nil {
+			slog.Error("janitor setup failed", "error", err)
+		} else {
+			subsystems = append(subsystems, jn)
 		}
 	}
 

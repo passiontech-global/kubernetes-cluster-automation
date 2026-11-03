@@ -51,6 +51,7 @@ func (r *Reconciler) Cycle(ctx context.Context) {
 	c.group("hub-metrics-fw", c.groupHubMetricsFW) // node_exporter_hub.yaml (standalone)
 	c.group("api-lb-vm", c.groupAPILBVM)           // api_lb_guard.yaml converge
 	c.group("kine", c.groupKineService)            // Phase 3: kine.service split into its own unit
+	c.group("etcdctl", c.groupEtcdctl)             // embedded-etcd controllers: /var/lib/k0s/bin/etcdctl
 	c.group("verify", c.groupVerify)
 	// Vars lazily resolve during the groups too — eval failures and
 	// reference cycles land in Vars.Errors (fail-closed Undefined).

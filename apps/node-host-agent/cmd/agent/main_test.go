@@ -268,6 +268,7 @@ func TestMainRunShutsDownOnSIGTERM(t *testing.T) {
 		"NODE_HOST_AGENT_ENABLE_REPORTER=false",
 		"NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE=false",
 		"NODE_HOST_AGENT_ENABLE_HOSTCONFIG=false",
+		"NODE_HOST_AGENT_ENABLE_JANITOR=false",
 		"KUBERNETES_SERVICE_HOST=",
 		"KUBERNETES_SERVICE_PORT=",
 		"KUBECONFIG=",
@@ -342,6 +343,7 @@ func TestMainRunListenerError(t *testing.T) {
 		"NODE_HOST_AGENT_ENABLE_REPORTER=false",
 		"NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE=false",
 		"NODE_HOST_AGENT_ENABLE_HOSTCONFIG=false",
+		"NODE_HOST_AGENT_ENABLE_JANITOR=false",
 		"KUBERNETES_SERVICE_HOST=",
 		"KUBERNETES_SERVICE_PORT=",
 		"KUBECONFIG=",
@@ -373,6 +375,7 @@ func disableAllSubsystems(t *testing.T) {
 		"NODE_HOST_AGENT_ENABLE_REPORTER",
 		"NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE",
 		"NODE_HOST_AGENT_ENABLE_HOSTCONFIG",
+		"NODE_HOST_AGENT_ENABLE_JANITOR",
 	} {
 		t.Setenv(k, "false")
 	}
@@ -669,7 +672,7 @@ func TestStandaloneDefaultFlips(t *testing.T) {
 		names := subsystemNames(cfg)
 		want := map[string]bool{
 			"apiprober": true, "hostmetrics-textfile": true,
-			"nethealth": true,
+			"nethealth": true, "janitor": true,
 		}
 		for _, n := range names {
 			if !want[n] {

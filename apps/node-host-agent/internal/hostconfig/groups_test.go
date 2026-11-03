@@ -1,6 +1,9 @@
 package hostconfig
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -1203,6 +1206,174 @@ func TestSelfStageSkippedOnStandalone(t *testing.T) {
 	c.groupBase()
 	if hostExists(r, "/usr/local/bin/node-host-agent") {
 		t.Fatal("binary staged on a standalone host — /host/usr/local not mounted there")
+	}
+}
+
+// ---------- etcdctl (embedded-etcd controllers) ----------
+
+// mkTgz builds a real .tar.gz holding member under an etcd-style top
+// dir and returns (archive bytes, sha256 hex) — the staged-download
+// fixture for etcdctl tests.
+func mkTgz(t *testing.T, member, content string) ([]byte, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "etcd-v3.7.3-linux-amd64/" + member, Mode: 0o755,
+		Size: int64(len(content)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes(), fmt.Sprintf("%x", sha256.Sum256(buf.Bytes()))
+}
+
+// etcdctlEnv fabricates an embedded-etcd controller: the k0scontroller
+// unit + pki/etcd/ca.crt that the groupEtcdctl gate composes (the same
+// pair checkEtcdQuota requires).
+func etcdctlEnv(t *testing.T, r *Reconciler) {
+	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service", "[Unit]\n")
+	hostWrite(t, r, "/var/lib/k0s/pki/etcd/ca.crt", "ca")
+}
+
+func etcdctlPins(sum string) string {
+	return fmt.Sprintf(`etcdctl_version: "3.7.3"
+etcdctl_tgz_url: "https://example.test/etcd.tgz"
+etcdctl_tgz_sha256: "%s"
+etcdctl_tgz_file: "etcd-v3.7.3-linux-amd64.tar.gz"
+`, sum)
+}
+
+func TestEtcdctlSkipsNonController(t *testing.T) {
+	vars := writeVarsDir(t, etcdctlPins("deadbeef"))
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// no k0scontroller.service + no pki — a worker/infra host.
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupEtcdctl()
+	if len(sr.callsMatching("etcdctl")) > 0 {
+		t.Fatalf("etcdctl probed on a non-controller: %v", sr.callsMatching("etcdctl"))
+	}
+	if hostExists(r, "/var/lib/k0s/bin/etcdctl") {
+		t.Fatal("etcdctl installed on a non-controller")
+	}
+}
+
+func TestEtcdctlSkipsKineHost(t *testing.T) {
+	vars := writeVarsDir(t, etcdctlPins("deadbeef"))
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// k0scontroller.service exists but no pki/etcd/ca.crt — the
+	// kine-split controller shape: not an embedded-etcd host.
+	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service", "[Unit]\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupEtcdctl()
+	if len(sr.callsMatching("etcdctl")) > 0 || hostExists(r, "/var/lib/k0s/bin/etcdctl") {
+		t.Fatal("etcdctl installed on a kine host (no embedded etcd pki)")
+	}
+}
+
+func TestEtcdctlVersionMatchSkipsDownload(t *testing.T) {
+	vars := writeVarsDir(t, etcdctlPins("deadbeef"))
+	sr := &scriptedRunner{
+		res: map[string]string{"/var/lib/k0s/bin/etcdctl version": "etcdctl version: 3.7.3"},
+	}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	etcdctlEnv(t, r)
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupEtcdctl()
+	if hostExists(r, "/var/lib/k0s/bin/etcdctl") {
+		t.Fatal("binary rewritten despite matching etcdctl version")
+	}
+}
+
+func TestEtcdctlMissingPinsFailsClosed(t *testing.T) {
+	// defaults.yaml carries no etcdctl_* vars — fail closed like kine.
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	dl := t.TempDir()
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	etcdctlEnv(t, r)
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupEtcdctl()
+	if hostExists(r, "/var/lib/k0s/bin/etcdctl") {
+		t.Fatal("etcdctl installed without pins")
+	}
+	entries, _ := os.ReadDir(dl)
+	if len(entries) > 0 {
+		t.Fatal("download attempted without sha256 pin")
+	}
+}
+
+func TestEtcdctlInstallsFromStagedTgz(t *testing.T) {
+	arc, sum := mkTgz(t, "etcdctl", "fake-etcdctl-binary")
+	vars := writeVarsDir(t, etcdctlPins(sum))
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	dl := t.TempDir()
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	etcdctlEnv(t, r)
+	if err := os.WriteFile(filepath.Join(dl, "etcd-v3.7.3-linux-amd64.tar.gz"), arc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupEtcdctl()
+	bin := filepath.Join(r.cfg.HostRoot, "/var/lib/k0s/bin/etcdctl")
+	got, err := os.ReadFile(bin)
+	if err != nil || string(got) != "fake-etcdctl-binary" {
+		t.Fatalf("etcdctl not installed from staged tgz: %v", err)
+	}
+	if fi, _ := os.Stat(bin); fi.Mode().Perm() != 0o755 {
+		t.Fatalf("etcdctl mode = %v want 0755", fi)
+	}
+}
+
+func TestEtcdctlStagedShaMismatchRefuses(t *testing.T) {
+	arc, _ := mkTgz(t, "etcdctl", "fake-etcdctl-binary")
+	vars := writeVarsDir(t, etcdctlPins("00000000"))
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	dl := t.TempDir()
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	etcdctlEnv(t, r)
+	if err := os.WriteFile(filepath.Join(dl, "etcd-v3.7.3-linux-amd64.tar.gz"), arc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupEtcdctl()
+	if hostExists(r, "/var/lib/k0s/bin/etcdctl") {
+		t.Fatal("etcdctl installed despite staged sha256 mismatch")
 	}
 }
 

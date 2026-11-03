@@ -1189,6 +1189,9 @@ func untarInstall(tgz, member, dst string, mode os.FileMode) error {
 			_, err = io.Copy(out, tr)
 			out.Close()
 			if err != nil {
+				// sweep the partial tmp — a truncated member must not
+				// linger next to the live binary.
+				os.Remove(tmp)
 				return err
 			}
 			return os.Rename(tmp, dst)

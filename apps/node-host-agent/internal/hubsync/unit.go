@@ -10,9 +10,13 @@ import (
 // t — the standalone-mode unit hub_converge installed:
 //
 //	ExecStart <remote bin> --standalone --node-name=<name>
+//	    --health-probe-bind-address=:8091
 //
 // with the host-root / vars / nebula-certs env wiring the pod's
-// DaemonSet env provides in-cluster.
+// DaemonSet env provides in-cluster. The probe bind mirrors the
+// DaemonSet arg (:8091 — :8081 is lixo-fabric's
+// --health-probe-bind-address on production hosts) so probes/metrics
+// keep one port convention across pod and standalone deployments.
 func systemdUnit(t Target, remoteBinary, remoteVarsDir, remoteCertsDir string) string {
 	return fmt.Sprintf(`[Unit]
 Description=node-host-agent (standalone host converge agent)
@@ -25,7 +29,7 @@ Type=simple
 Environment=NODE_HOST_AGENT_HOST_ROOT=/
 Environment=NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR=%s
 Environment=NODE_HOST_AGENT_NEBULA_CERTS_DIR=%s
-ExecStart=%s --standalone --node-name=%s
+ExecStart=%s --standalone --node-name=%s --health-probe-bind-address=:8091
 Restart=always
 RestartSec=10
 

@@ -616,6 +616,76 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 		"socket", socket)
 }
 
+// ---------- etcdctl (embedded-etcd controllers) ----------
+//
+// k0s extracts etcd into /var/lib/k0s/bin but does NOT ship etcdctl —
+// and both consumers look for it THERE, not in /usr/local/bin:
+// controllerhygiene's checkEtcdQuota gates on <K0sDir>/bin/etcdctl +
+// pki/etcd/ca.crt (result="no_etcdctl" on cicd's controller today) and
+// the rescue-etcd subcommand execs the same path. So the managed
+// binary goes to <k0s>/bin/etcdctl — pinning it in /usr/local/bin
+// would not re-enable the guard.
+//
+// Version MUST match the etcd k0s bundles — k0s.default ->
+// embedded-bins/Makefile.variables etcd_version in the fluxcd repo
+// (k0s v1.37.1+k0s.0 -> etcd 3.7.3). Pins: etcdctl_version +
+// etcdctl_tgz_{url,sha256,file} in defaults.yaml (synced from
+// versions.yaml pins.etcdctl-tgz — sha256 of the release tarball, not
+// of the extracted binary).
+//
+// Gate: only hosts running embedded etcd — k0scontroller.service
+// exists AND pki/etcd/ca.crt is present (the same composite
+// checkEtcdQuota requires). Kine-split controllers carry the unit but
+// not the pki dir, so they are left alone; workers and infra VMs are
+// never touched.
+func (c *cyc) groupEtcdctl() {
+	if !c.controller() ||
+		!c.r.fileExists("/var/lib/k0s/pki/etcd/ca.crt") {
+		return
+	}
+	c.etcdctlInstallBinary()
+}
+
+// etcdctlInstallBinary ports the nebula/coredns managed-binary
+// pattern: <bin> version probe -> sha256-pinned tarball (staged or
+// downloaded) -> untarInstall (tmp+rename).
+func (c *cyc) etcdctlInstallBinary() {
+	r, ctx := c.r, c.ctx
+	ver, sum, url := c.v("etcdctl_version"), c.v("etcdctl_tgz_sha256"), c.v("etcdctl_tgz_url")
+	tgz := defStr(c.v("etcdctl_tgz_file"), pathpkg.Base(url))
+	if ver == "" || ver == "None" || url == "" || url == "None" ||
+		sum == "" || sum == "None" {
+		slog.Error("etcdctl: missing etcdctl_version+etcdctl_tgz_{url,sha256} pins — not converging")
+		return
+	}
+	bin := "/var/lib/k0s/bin/etcdctl"
+	if out, err := r.run(ctx, bin, "version"); err == nil &&
+		strings.Contains(out, ver) {
+		return
+	}
+	local := filepath2(r.cfg.DownloadDir, tgz)
+	if fileExistsNoRoot(local) {
+		// same contract as T5b/T9: verify the STAGED file every run —
+		// a corrupted/operator-swapped tarball must not install.
+		if !sha256FileOK(local, sum) {
+			slog.Error("etcdctl: staged tgz sha256 mismatch — not installing", "file", local)
+			return
+		}
+	} else if err := download(ctx, url, local, sum); err != nil {
+		slog.Error("etcdctl: tgz download", "error", err)
+		return
+	}
+	// /var/lib/k0s/bin exists on every k0s host, but untarInstall does
+	// not create parents — keep the install self-contained.
+	if err := r.ensureDir("/var/lib/k0s/bin", 0o755); err != nil {
+		slog.Error("etcdctl: ensure k0s bin dir", "error", err)
+		return
+	}
+	if err := untarInstall(local, "etcdctl", r.hp(bin), 0o755); err != nil {
+		slog.Error("etcdctl: install", "error", err)
+	}
+}
+
 // ---------- Phase 3: kine.service (split kine out of k0scontroller) ----------
 //
 // Kine embedded in k0scontroller shares cgroup + lifecycle with the
