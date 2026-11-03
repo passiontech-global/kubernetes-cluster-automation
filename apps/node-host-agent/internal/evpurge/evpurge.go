@@ -154,8 +154,13 @@ func Run(ctx context.Context, cfg Config, cutoff time.Time, out io.Writer) error
 		return err
 	}
 	fmt.Fprintf(out, "to delete: %d\n", len(paths))
-	ok, errs := deleteAll(ctx, client, cfg.API, paths, cfg.Workers)
+	ok, errs, firstErr := deleteAll(ctx, client, cfg.API, paths, cfg.Workers)
 	fmt.Fprintf(out, "deleted=%d errors=%d\n", ok, errs)
+	if firstErr != "" {
+		// The tally alone cannot say WHY deletes failed — RBAC,
+		// a wedged apiserver and a 404 storm all read "errors=N".
+		fmt.Fprintf(out, "first error: %s\n", firstErr)
+	}
 	return nil
 }
 
@@ -218,9 +223,11 @@ func listStale(ctx context.Context, client *http.Client,
 // deleteAll is the script's ThreadPoolExecutor(WORKERS) map — one
 // shared client, N workers pulling delete paths off a channel.
 // A DELETE counts as ok on any 2xx; a transport error or non-2xx
-// status counts as errors (the script's `except: err += 1`).
+// status counts as errors (the script's `except: err += 1`). The
+// first failure's detail is returned for the summary — the bare
+// tally cannot distinguish RBAC denials from a wedged apiserver.
 func deleteAll(ctx context.Context, client *http.Client, base string,
-	paths []string, workers int) (ok, errs int) {
+	paths []string, workers int) (ok, errs int, firstErr string) {
 	jobs := make(chan string)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -235,6 +242,13 @@ func deleteAll(ctx context.Context, client *http.Client, base string,
 					ok++
 				} else {
 					errs++
+					if firstErr == "" {
+						if err != nil {
+							firstErr = fmt.Sprintf("%s: %v", p, err)
+						} else {
+							firstErr = fmt.Sprintf("%s: HTTP %d", p, code)
+						}
+					}
 				}
 				mu.Unlock()
 			}
@@ -248,12 +262,12 @@ func deleteAll(ctx context.Context, client *http.Client, base string,
 			// counters (workers drain the buffered sends already made).
 			close(jobs)
 			wg.Wait()
-			return ok, errs
+			return ok, errs, firstErr
 		}
 	}
 	close(jobs)
 	wg.Wait()
-	return ok, errs
+	return ok, errs, firstErr
 }
 
 func truncate(s string, n int) string {

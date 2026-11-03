@@ -124,11 +124,16 @@ func createBundle(args []string) (string, bool) {
 //   - No mounts entry with destination "/shared-cache" yet —
 //     duplicate-injection guard.
 //
-// Every failure path returns silently: the caller still execs
-// runc.real against the untouched config (fail-open).
+// Every failure path is fail-open: a one-line note goes to stderr
+// (the wrapper's only channel — the shim surfaces it in containerd
+// logs) and the caller still execs runc.real against the untouched
+// config.
 func injectSharedCacheMount(configPath, source string) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"concourse-runc-wrapper: read %s: %v — passthrough\n",
+			configPath, err)
 		return // `[ -f "$bundle/config.json" ]` failed — passthrough
 	}
 
@@ -137,6 +142,9 @@ func injectSharedCacheMount(configPath, source string) {
 	// their original formatting verbatim).
 	var spec map[string]json.RawMessage
 	if err := json.Unmarshal(data, &spec); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"concourse-runc-wrapper: parse %s: %v — passthrough\n",
+			configPath, err)
 		return // malformed JSON — never block create
 	}
 
@@ -161,6 +169,9 @@ func injectSharedCacheMount(configPath, source string) {
 	var mounts []json.RawMessage
 	if raw, ok := spec["mounts"]; ok {
 		if err := json.Unmarshal(raw, &mounts); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"concourse-runc-wrapper: parse mounts in %s: %v — passthrough\n",
+				configPath, err)
 			return
 		}
 	}
@@ -196,16 +207,25 @@ func injectSharedCacheMount(configPath, source string) {
 		Options     []string `json:"options"`
 	}{"/shared-cache", "bind", source, []string{"bind", "rw"}})
 	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"concourse-runc-wrapper: marshal injected mount: %v — passthrough\n",
+			err)
 		return
 	}
 	mounts = slices.Insert(mounts, scratch, json.RawMessage(entry))
 	newMounts, err := json.Marshal(mounts)
 	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"concourse-runc-wrapper: marshal mounts for %s: %v — passthrough\n",
+			configPath, err)
 		return
 	}
 	spec["mounts"] = newMounts
 	out, err := json.Marshal(spec)
 	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"concourse-runc-wrapper: marshal %s: %v — passthrough\n",
+			configPath, err)
 		return
 	}
 
@@ -214,10 +234,16 @@ func injectSharedCacheMount(configPath, source string) {
 	// litter runc could trip on.
 	tmp := configPath + ".tmp"
 	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"concourse-runc-wrapper: write %s: %v — passthrough\n",
+			tmp, err)
 		_ = os.Remove(tmp)
 		return
 	}
 	if err := os.Rename(tmp, configPath); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"concourse-runc-wrapper: rename %s -> %s: %v — passthrough\n",
+			tmp, configPath, err)
 		_ = os.Remove(tmp)
 	}
 }

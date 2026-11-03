@@ -24,6 +24,7 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -63,7 +64,7 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	nodes, err := shared.ListNodes(ctx, r.cs)
 	if err != nil {
-		return err
+		return fmt.Errorf("list nodes: %w", err)
 	}
 
 	// Probe all workers in parallel so >=2 wedged nodes still finish
@@ -147,8 +148,31 @@ func (r *kubeletReaper) probe(ctx context.Context, node string) bool {
 		if err == nil && strings.HasPrefix(strings.TrimSpace(string(body)), "ok") {
 			return true
 		}
+		// sweep() only sees the bool — log WHY the attempt failed
+		// (apiserver-proxy error vs. a 200 whose body isn't "ok",
+		// which means the proxy reached the wrong backend).
+		log := logf.FromContext(ctx)
+		if err != nil {
+			log.Info("WARN: kubelet healthz probe failed",
+				"node", node, "attempt", i+1, "of", kubeletReaperProbes,
+				"error", err)
+		} else {
+			log.Info("WARN: kubelet healthz probe returned non-ok body",
+				"node", node, "attempt", i+1, "of", kubeletReaperProbes,
+				"body", truncateLog(string(body), 200))
+		}
 	}
 	return false
+}
+
+// truncateLog caps a string spliced into a log value — a proxy
+// response can be an arbitrarily large error page.
+func truncateLog(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > max {
+		return s[:max] + "…"
+	}
+	return s
 }
 
 // sweep applies the taint decision for one node. listed is the object
@@ -166,7 +190,8 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 			// so a stale listed snapshot cannot remove a taint that
 			// is already gone — no separate Get needed here either.
 			if err := shared.UntaintNode(ctx, r.cs, listed.Name, kubeletReaperTaint); err != nil {
-				return err
+				return fmt.Errorf("remove taint %s on node %s: %w",
+					kubeletReaperTaint, listed.Name, err)
 			}
 			log.Info("UNTAINT: kubelet :10250 ok -> taint removed", "node", listed.Name)
 		} else {
@@ -180,7 +205,7 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	// must not stand in for it.
 	node, err := r.cs.CoreV1().Nodes().Get(ctx, listed.Name, metav1.GetOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("get node %s: %w", listed.Name, err)
 	}
 	has := shared.HasTaint(node.Spec.Taints, kubeletReaperTaint)
 	name := listed.Name
@@ -196,7 +221,8 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 		if !has {
 			if err := shared.TaintNode(ctx, r.cs, name, kubeletReaperTaint, "true",
 				corev1.TaintEffectNoSchedule); err != nil {
-				return err
+				return fmt.Errorf("taint %s on node %s: %w",
+					kubeletReaperTaint, name, err)
 			}
 			log.Info("TAINT: kubelet :10250 down + heartbeat stale/missing -> NoSchedule",
 				"node", name, "probes", kubeletReaperProbes, "heartbeatAgeS", age)
@@ -207,7 +233,8 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	}
 	if has {
 		if err := shared.UntaintNode(ctx, r.cs, name, kubeletReaperTaint); err != nil {
-			return err
+			return fmt.Errorf("remove taint %s on node %s: %w",
+				kubeletReaperTaint, name, err)
 		}
 		log.Info("UNTAINT: heartbeat fresh -> taint removed", "node", name, "heartbeatAgeS", age)
 	} else {

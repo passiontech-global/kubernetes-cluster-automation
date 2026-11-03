@@ -268,7 +268,7 @@ func (p *ConcourseCachePruner) pruneSharedCache(ctx context.Context, sc string) 
 	if !isDir(sc) {
 		return // init-rm not done yet — nothing to prune
 	}
-	p.enforcePerms(sc)
+	p.enforcePerms(sc, log)
 	eff := p.escalatedLimits(sc, log)
 
 	// go-build: stale entries + its own size cap.
@@ -366,7 +366,10 @@ func (p *ConcourseCachePruner) escalatedLimits(sc string, log *slog.Logger) Conc
 
 // enforcePerms is `chown 4294967294:4294967294 "$SC" "$SC"/* &&
 // chmod 0777` — roots only, never recursive (see header comment).
-func (p *ConcourseCachePruner) enforcePerms(sc string) {
+// Failures are best-effort like the script's `&&`, but Debug-logged:
+// a silently unenforced ownership invariant is how cache writes
+// start landing as root.
+func (p *ConcourseCachePruner) enforcePerms(sc string, log *slog.Logger) {
 	targets := []string{sc}
 	if entries, err := os.ReadDir(sc); err == nil {
 		for _, e := range entries {
@@ -377,12 +380,21 @@ func (p *ConcourseCachePruner) enforcePerms(sc string) {
 			}
 			targets = append(targets, filepath.Join(sc, e.Name()))
 		}
+	} else {
+		log.Debug("cannot list shared-cache — perms enforced on root only",
+			"dir", sc, "error", err)
 	}
 	for _, t := range targets {
 		if p.cfg.OwnerUID >= 0 || p.cfg.OwnerGID >= 0 {
-			_ = os.Chown(t, p.cfg.OwnerUID, p.cfg.OwnerGID)
+			if err := os.Chown(t, p.cfg.OwnerUID, p.cfg.OwnerGID); err != nil {
+				log.Debug("chown failed — perm invariant not enforced",
+					"path", t, "error", err)
+			}
 		}
-		_ = os.Chmod(t, p.cfg.Mode)
+		if err := os.Chmod(t, p.cfg.Mode); err != nil {
+			log.Debug("chmod failed — perm invariant not enforced",
+				"path", t, "error", err)
+		}
 	}
 }
 
@@ -402,6 +414,8 @@ func (p *ConcourseCachePruner) pruneGoBuild(ctx context.Context, sc string, cfg 
 	}
 	need := sz - cfg.GoBuildLowMark
 	var acc int64
+	var failed int
+	var lastErr error
 	for _, f := range filesByAge(dir) {
 		if ctx.Err() != nil || acc >= need {
 			break
@@ -412,7 +426,14 @@ func (p *ConcourseCachePruner) pruneGoBuild(ctx context.Context, sc string, cfg 
 		if err := os.Remove(f.path); err == nil {
 			p.filesDeleted.WithLabelValues("go-build").Inc()
 			p.bytesFreed.Add(float64(f.size))
+		} else {
+			failed++
+			lastErr = err
 		}
+	}
+	if failed > 0 {
+		log.Warn("go-build trim removals failed",
+			"files", failed, "error", lastErr)
 	}
 	log.Info("go-build trimmed",
 		"beforeGiB", float64(sz)/(1<<30),
@@ -437,8 +458,9 @@ func (p *ConcourseCachePruner) pruneAgeBucket(ctx context.Context, sc, bucket st
 // the script's `|| true`; ctx cancellation stops the walk.
 func (p *ConcourseCachePruner) deleteOldFiles(ctx context.Context, dir, bucket string, maxAge time.Duration, log *slog.Logger) {
 	now := p.cfg.nowFn()
-	var n int
+	var n, failed int
 	var bytes int64
+	var lastErr error
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
@@ -453,6 +475,9 @@ func (p *ConcourseCachePruner) deleteOldFiles(ctx context.Context, dir, bucket s
 		if err := os.Remove(path); err == nil {
 			n++
 			bytes += info.Size()
+		} else {
+			failed++
+			lastErr = err
 		}
 		return nil
 	})
@@ -461,6 +486,10 @@ func (p *ConcourseCachePruner) deleteOldFiles(ctx context.Context, dir, bucket s
 		p.bytesFreed.Add(float64(bytes))
 		log.Info("age prune", "bucket", bucket,
 			"files", n, "freedGiB", float64(bytes)/(1<<30))
+	}
+	if failed > 0 {
+		log.Warn("age prune removals failed",
+			"bucket", bucket, "files", failed, "error", lastErr)
 	}
 }
 
@@ -522,6 +551,9 @@ func (p *ConcourseCachePruner) capTopLevelDirs(ctx context.Context, sc, bucket s
 		}
 		if err := os.RemoveAll(d.path); err == nil {
 			p.bytesFreed.Add(float64(dsz))
+		} else {
+			log.Warn(bucket+": rm -rf failed — cap accounting may overshoot",
+				"dir", d.path, "error", err)
 		}
 		// freed is accumulated unconditionally — the shell did
 		// `rm -rf; freed+=dsz` without checking rm's exit.
@@ -562,12 +594,19 @@ func (p *ConcourseCachePruner) pruneNodeDeps(ctx context.Context, sc string, cfg
 			makeWritable(dpath)
 			if err := os.RemoveAll(dpath); err == nil {
 				log.Info("node-deps: aged cksum dir removed", "dir", e.Name())
+			} else {
+				log.Warn("node-deps: cksum dir removal failed",
+					"dir", e.Name(), "error", err)
 			}
 		}
+	} else {
+		log.Warn("node-deps: cannot list dir — aged cksum dirs not pruned",
+			"dir", dir, "error", err)
 	}
 
 	// Stale .lock-*/.tmp-* FILES at any depth (-mmin +60).
-	var nlocks int
+	var nlocks, lockFailed int
+	var lockErr error
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
@@ -587,11 +626,18 @@ func (p *ConcourseCachePruner) pruneNodeDeps(ctx context.Context, sc string, cfg
 			nlocks++
 			p.filesDeleted.WithLabelValues("node-deps").Inc()
 			p.bytesFreed.Add(float64(info.Size()))
+		} else {
+			lockFailed++
+			lockErr = err
 		}
 		return nil
 	})
 	if nlocks > 0 {
 		log.Info("node-deps: stale lock/tmp files removed", "files", nlocks)
+	}
+	if lockFailed > 0 {
+		log.Warn("node-deps: lock/tmp removals failed",
+			"files", lockFailed, "error", lockErr)
 	}
 
 	// Crashed <cksum>.tmp-<nanos> staging DIRS at depth 1 (snapshot
@@ -612,8 +658,14 @@ func (p *ConcourseCachePruner) pruneNodeDeps(ctx context.Context, sc string, cfg
 			makeWritable(dpath)
 			if err := os.RemoveAll(dpath); err == nil {
 				log.Info("node-deps: stale staging dir removed", "dir", e.Name())
+			} else {
+				log.Warn("node-deps: staging dir removal failed",
+					"dir", e.Name(), "error", err)
 			}
 		}
+	} else {
+		log.Warn("node-deps: cannot list dir — stale staging dirs not pruned",
+			"dir", dir, "error", err)
 	}
 
 	p.capTopLevelDirs(ctx, sc, "node-deps",

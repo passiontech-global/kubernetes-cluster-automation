@@ -17,11 +17,13 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -62,7 +64,7 @@ func (w *csrWatcher) run(ctx context.Context) error {
 	list, err := w.cs.CertificatesV1().CertificateSigningRequests().
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("list certificatesigningrequests: %w", err)
 	}
 	approved, pending := 0, 0
 	for i := range list.Items {
@@ -88,7 +90,7 @@ func (w *csrWatcher) run(ctx context.Context) error {
 		}
 		if approved >= csrMaxApprovalsRun {
 			log.Info("SKIP rest: approval cap reached",
-				"cap", csrMaxApprovalsRun)
+				"cap", csrMaxApprovalsRun, "csr", csr.Name, "pending", pending)
 			break
 		}
 		if !w.validNodeCSR(ctx, csr) {
@@ -156,7 +158,12 @@ func (w *csrWatcher) validNodeCSR(ctx context.Context,
 		return fail("username is not " + nodeUserPrefix + "<nodeName>")
 	}
 	if _, err := w.cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{}); err != nil {
-		return fail("node does not exist: " + nodeName)
+		if apierrors.IsNotFound(err) {
+			return fail("node does not exist: " + nodeName)
+		}
+		// A transient Get failure is not proof the node is absent —
+		// still fail closed, but record what actually happened.
+		return fail("node lookup failed: " + err.Error())
 	}
 	return true
 }

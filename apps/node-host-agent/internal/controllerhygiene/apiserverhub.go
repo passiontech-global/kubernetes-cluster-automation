@@ -327,6 +327,11 @@ func (h *Hygiene) checkKineTTL(ctx context.Context) {
 	now := h.cfg.nowFn()
 	kage, err := h.pidAgeSeconds(kpid)
 	if err != nil {
+		// Age unreadable → the journal window collapses to "now"
+		// and a dead TTL goes undetected — surface it.
+		h.appendLogWarn(fmt.Sprintf(
+			"suspect: kine pid=%d age unreadable: %v — TTL journal window degenerates",
+			kpid, err))
 		kage = 0
 	}
 	since := now.Add(-time.Duration(kage) * time.Second)
@@ -373,7 +378,10 @@ func (h *Hygiene) checkKineTTL(ctx context.Context) {
 				"ACTION: kill kine pid=%d — recovery probe kine-ttl-loop (rewedge=%dx, cadence %ds)",
 				kpid, rew, int(h.cfg.KineTTLCtlRestart.Seconds())))
 			h.rateSpend(h.cfg.WatchdogStateDir, fileRateTTLKill)
-			_ = h.cfg.killFn(kpid, syscall.SIGTERM) //nolint:errcheck // shell `kill` — SIGTERM best-effort
+			if err := h.cfg.killFn(kpid, syscall.SIGTERM); err != nil {
+				h.appendLogWarn(fmt.Sprintf(
+					"suspect: kill kine pid=%d failed: %v", kpid, err))
+			}
 			h.actions.WithLabelValues(checkKineTTL, "kill_kine").Inc()
 		case ModeDryRun:
 			h.appendLog(fmt.Sprintf(
@@ -395,7 +403,10 @@ func (h *Hygiene) checkKineTTL(ctx context.Context) {
 				"ACTION: kill kine pid=%d — TTL workqueue dead — k0s supervisor respawns",
 				kpid))
 			h.rateSpend(h.cfg.WatchdogStateDir, fileRateTTLKill)
-			_ = h.cfg.killFn(kpid, syscall.SIGTERM) //nolint:errcheck // shell `kill` — SIGTERM best-effort
+			if err := h.cfg.killFn(kpid, syscall.SIGTERM); err != nil {
+				h.appendLogWarn(fmt.Sprintf(
+					"suspect: kill kine pid=%d failed: %v", kpid, err))
+			}
 			h.actions.WithLabelValues(checkKineTTL, "kill_kine").Inc()
 		case ModeDryRun:
 			h.appendLog(fmt.Sprintf(

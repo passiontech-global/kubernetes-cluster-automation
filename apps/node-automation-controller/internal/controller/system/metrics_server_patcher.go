@@ -82,6 +82,7 @@ type metricsServerPatcher struct {
 // proportionalReplicas. minReplicas<=0 disables the pin entirely.
 func SetupMetricsServerPatcher(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, minReplicas, nodesPerReplica int) error {
 	if !enabled {
+		logf.Log.WithName("metrics-server-patcher").Info("disabled — module not registered")
 		return nil
 	}
 	b := ctrl.NewControllerManagedBy(mgr).
@@ -119,11 +120,13 @@ func (r *metricsServerPatcher) Reconcile(ctx context.Context, _ reconcile.Reques
 	d, err := r.cs.AppsV1().Deployments("kube-system").
 		Get(ctx, "metrics-server", metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return res, nil // cluster without the k0s metrics-server addon
+		// cluster without the k0s metrics-server addon
+		log.Info("SKIP: deployment not found", "deployment", "kube-system/metrics-server")
+		return res, nil
 	}
 	if err != nil {
 		metrics.IncError("metrics-server-patcher")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/metrics-server: %w", err)
 	}
 
 	// Proportional replica pin — disabled when minReplicas<=0
@@ -134,19 +137,20 @@ func (r *metricsServerPatcher) Reconcile(ctx context.Context, _ reconcile.Reques
 		nodes, err := shared.ListNodes(ctx, r.cs)
 		if err != nil {
 			metrics.IncError("metrics-server-patcher")
-			return ctrl.Result{}, err
+			return ctrl.Result{}, fmt.Errorf("list nodes for proportional replica count: %w", err)
 		}
 		wantReplicas = proportionalReplicas(len(nodes), r.minReplicas, r.nodesPerReplica)
 	}
 
 	if !metricsServerNeedsPatch(d, wantReplicas) {
-		log.Info("args/probes/resources/topology/tolerations/replicas already pinned - nothing to do")
+		log.Info("args/probes/resources/topology/tolerations/replicas already pinned - nothing to do",
+			"deployment", "kube-system/metrics-server", "wantReplicas", wantReplicas)
 		return res, nil
 	}
 	patch, err := metricsServerPatchBody(wantReplicas)
 	if err != nil {
 		metrics.IncError("metrics-server-patcher")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("render patch body for deployment kube-system/metrics-server: %w", err)
 	}
 	log.Info("PATCH: metrics-server drifted — restoring pinned spec",
 		"deployment", "kube-system/metrics-server", "wantReplicas", wantReplicas)
@@ -154,7 +158,7 @@ func (r *metricsServerPatcher) Reconcile(ctx context.Context, _ reconcile.Reques
 		"metrics-server", types.StrategicMergePatchType,
 		patch, metav1.PatchOptions{}); err != nil {
 		metrics.IncError("metrics-server-patcher")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("patch deployment kube-system/metrics-server: %w", err)
 	}
 	return res, nil
 }

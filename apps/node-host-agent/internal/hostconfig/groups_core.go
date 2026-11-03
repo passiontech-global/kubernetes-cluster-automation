@@ -28,11 +28,12 @@ func (r *Reconciler) Cycle(ctx context.Context) {
 	t, err := topology.Load(topology.Config{VarsDir: r.cfg.VarsDir, NodeName: r.cfg.NodeName, NowFn: r.cfg.NowFn})
 	if err != nil {
 		r.cycles.WithLabelValues("load", "error").Inc()
-		slog.Error("hostconfig: topology load failed", "error", err)
+		slog.Error("hostconfig: topology load failed",
+			"varsDir", r.cfg.VarsDir, "node", r.cfg.NodeName, "error", err)
 		return
 	}
 	for _, e := range t.Errors {
-		slog.Error("hostconfig: topology", "error", e)
+		slog.Error("hostconfig: topology", "node", r.cfg.NodeName, "error", e)
 	}
 	c := &cyc{r: r, ctx: ctx, t: t}
 	// Order mirrors node_tuning.yaml + hub_converge.yaml.
@@ -58,7 +59,8 @@ func (r *Reconciler) Cycle(ctx context.Context) {
 	for _, e := range t.Vars.Errors() {
 		slog.Error("hostconfig: vars resolution", "error", e)
 	}
-	slog.Info("hostconfig: cycle done", "elapsed", time.Since(start).Round(time.Second).String())
+	slog.Info("hostconfig: cycle done",
+		"node", r.cfg.NodeName, "elapsed", time.Since(start).Round(time.Second).String())
 }
 
 type cyc struct {
@@ -125,18 +127,28 @@ func (c *cyc) groupBase() {
 		[]byte("# Managed by node-config-agent - BBR for the interdc trunk path\ntcp_bbr\n"), 0o644); ch {
 		changed = true
 	}
-	r.run(ctx, "modprobe", "tcp_bbr")
-	r.run(ctx, "modprobe", "nf_conntrack")
+	if _, err := r.run(ctx, "modprobe", "tcp_bbr"); err != nil {
+		slog.Warn("base: modprobe failed — BBR unavailable until the module loads",
+			"module", "tcp_bbr", "error", err)
+	}
+	if _, err := r.run(ctx, "modprobe", "nf_conntrack"); err != nil {
+		slog.Warn("base: modprobe failed — conntrack sysctls may not apply",
+			"module", "nf_conntrack", "error", err)
+	}
 	if changed {
 		r.actions.WithLabelValues("sysctl --system").Inc()
-		r.run(ctx, "sysctl", "--system")
+		if _, err := r.run(ctx, "sysctl", "--system"); err != nil {
+			slog.Warn("base: sysctl --system failed — new sysctl files written but not applied",
+				"error", err)
+		}
 	}
 	// A4 assert: effective == expected (informational fail like ansible).
 	out, _ := r.run(ctx, "sysctl", "-n", "net.ipv4.tcp_congestion_control", "net.core.default_qdisc")
 	lines := strings.Fields(out)
 	want := []string{c.sysctlVal("bbr_sysctls", 0), c.sysctlVal("bbr_sysctls", 1)}
 	if len(lines) < 2 || lines[0] != want[0] || lines[1] != want[1] {
-		slog.Warn("BBR/fq not effective", "got", out)
+		slog.Warn("BBR/fq not effective — kernel values differ from rendered sysctls",
+			"got", out, "want", strings.Join(want, " "))
 	}
 
 	// T2 k0sworker limits drop-in.
@@ -154,7 +166,11 @@ TasksMax=infinity
 	}
 
 	// hostname -> 127.0.1.1 in /etc/hosts (lineinfile parity).
-	hosts, _ := os.ReadFile(r.hp("/etc/hosts"))
+	hosts, hostsErr := os.ReadFile(r.hp("/etc/hosts"))
+	if hostsErr != nil && !os.IsNotExist(hostsErr) {
+		slog.Warn("base: cannot read /etc/hosts — hostname pin update will fail",
+			"error", hostsErr)
+	}
 	hn := c.r.cfg.NodeName
 	re := regexp.MustCompile(`(?m)^\s*127\.0\.1\.1\s.*$`)
 	line := "127.0.1.1 " + hn
@@ -212,18 +228,18 @@ func (c *cyc) selfStageBinary() {
 		// drifted mode: the hostPath consumer needs the exec bit.
 		if fi, serr := os.Stat(r.hp(dst)); serr == nil && fi.Mode().Perm() != 0o755 {
 			if cerr := os.Chmod(r.hp(dst), 0o755); cerr != nil {
-				slog.Error("self-stage: chmod 0755 failed", "error", cerr)
+				slog.Error("self-stage: chmod 0755 failed", "path", dst, "error", cerr)
 			}
 		}
 		return
 	}
 	if _, err := r.writeManaged(dst, srcb, 0o755); err != nil {
-		slog.Error("self-stage: install agent binary on host failed", "error", err)
+		slog.Error("self-stage: install agent binary on host failed", "path", dst, "error", err)
 		return
 	}
 	// writeManaged preserves a pre-existing file's mode — force 0755.
 	if err := os.Chmod(r.hp(dst), 0o755); err != nil {
-		slog.Error("self-stage: chmod 0755 failed", "error", err)
+		slog.Error("self-stage: chmod 0755 failed", "path", dst, "error", err)
 	}
 }
 
@@ -309,6 +325,9 @@ func (c *cyc) groupNLD() {
 	stubListening := false
 	if out, err := r.run(ctx, "ss", "-lntu"); err == nil {
 		stubListening = regexp.MustCompile(`127\.0\.0\.5[34]:53`).MatchString(out)
+	} else {
+		slog.Warn("T4: ss -lntu failed — cannot detect resolved stub listener; continuing",
+			"error", err)
 	}
 	if c.resolvedRunning() {
 		// ansible.builtin.fail parity: stub listening but no real
@@ -317,7 +336,8 @@ func (c *cyc) groupNLD() {
 		refuse := false
 		if stubListening {
 			if !r.fileExists("/run/systemd/resolve/resolv.conf") {
-				slog.Error("T4: resolved stub listening but no real resolv.conf — refusing to disable stub")
+				slog.Error("T4: resolved stub listening but no real resolv.conf — refusing to disable stub",
+					"path", "/run/systemd/resolve/resolv.conf")
 				refuse = true
 			} else {
 				// repoint symlink
@@ -387,9 +407,9 @@ func (c *cyc) applyNftUnit(name, path string, content []byte, desc string) {
 	ch, _ := r.writeManaged(path, content, 0o644)
 	// ansible: nft -c -f <file> after deploy — an invalid ruleset fails
 	// the run here and the unit keeps serving the LAST GOOD file.
-	if _, err := r.run(ctx, "nft", "-c", "-f", path); err != nil {
+	if out, err := r.run(ctx, "nft", "-c", "-f", path); err != nil {
 		slog.Error("nft ruleset failed nft -c — boot unit left on last good file",
-			"path", path, "error", err)
+			"path", path, "unit", name+".service", "out", out, "error", err)
 		return
 	}
 	unitPath := "/etc/systemd/system/" + name + ".service"
@@ -428,10 +448,8 @@ func (c *cyc) groupNebula() {
 	if net == "" || net == "None" {
 		net = "interdc"
 	}
-	dev := c.v("interdc_nebula_dev")
-	if dev == "" || net == "None" || dev == "None" {
-		dev = "neb1"
-	}
+	// interdc_nebula_dev is resolved where it's consumed (tplCtx,
+	// nebulaRouting) — no local resolution needed here.
 	unit := "nebula@" + net + ".service"
 
 	if !enabled || !t.Found {
@@ -449,8 +467,12 @@ func (c *cyc) groupNebula() {
 		return
 	}
 	// T5b: kernel TUN device required (ansible assert).
-	if fi, err := os.Stat("/dev/net/tun"); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
-		slog.Error("T5b: /dev/net/tun missing or not a char device — modprobe tun before nebula")
+	if fi, err := os.Stat("/dev/net/tun"); err != nil {
+		slog.Error("T5b: /dev/net/tun stat failed — modprobe tun before nebula",
+			"error", err)
+		return
+	} else if fi.Mode()&os.ModeCharDevice == 0 {
+		slog.Error("T5b: /dev/net/tun is not a char device — modprobe tun before nebula")
 		return
 	}
 	c.nebulaInstallBinary()
@@ -462,6 +484,10 @@ func (c *cyc) groupNebula() {
 			p := filepath2(d, name)
 			if _, err := os.Stat(p); err == nil {
 				b, err := os.ReadFile(p)
+				if err != nil {
+					slog.Warn("T5b: cert file unreadable — treated as missing",
+						"path", p, "error", err)
+				}
 				return string(b), err == nil
 			}
 		}
@@ -478,13 +504,18 @@ func (c *cyc) groupNebula() {
 	// keypair on node when missing (key never leaves the node).
 	keyPath := "/etc/nebula/" + net + "/host.key"
 	if !r.fileExists(keyPath) {
-		r.run(ctx, "nebula-cert", "keygen", "-out-key", keyPath, "-out-pub", "/etc/nebula/"+net+"/host.pub")
+		if _, err := r.run(ctx, "nebula-cert", "keygen", "-out-key", keyPath,
+			"-out-pub", "/etc/nebula/"+net+"/host.pub"); err != nil {
+			slog.Warn("T5b: nebula-cert keygen failed — nebula will not start without a key",
+				"key", keyPath, "error", err)
+		}
 	}
 	if certOK {
 		ch, _ := r.writeManaged("/etc/nebula/"+net+"/host.crt", []byte(hostCert), 0o644)
 		certChanged = certChanged || ch
 	} else {
-		slog.Warn("T5b: signed cert nebula-" + t.MeshName + ".crt not in vars CM — nebula will not start")
+		slog.Warn("T5b: signed cert not in vars CM — nebula will not start",
+			"cert", "nebula-"+t.MeshName+".crt")
 	}
 
 	// render config.yaml
@@ -547,8 +578,10 @@ WantedBy=multi-user.target
 	wasActive := r.isActive(ctx, unit)
 	// ansible: `nebula -test` validates before start — failure aborts,
 	// so the broken config must not reach a (re)start.
-	if _, err := r.run(ctx, "nebula", "-config", "/etc/nebula/"+net+"/config.yaml", "-test"); err != nil {
-		slog.Error("T5b: nebula -test failed — not starting/reloading", "error", err)
+	if out, err := r.run(ctx, "nebula", "-config", "/etc/nebula/"+net+"/config.yaml", "-test"); err != nil {
+		slog.Error("T5b: nebula -test failed — not starting/reloading",
+			"config", "/etc/nebula/"+net+"/config.yaml", "unit", unit,
+			"out", out, "error", err)
 		return
 	}
 	r.ensureService(ctx, unit, true, true)
@@ -594,18 +627,21 @@ func (c *cyc) nebulaInstallBinary() {
 		// corrupted/operator-swapped tarball must not install.
 		if !sha256FileOK(local, sum) {
 			slog.Error("T5b: staged nebula tarball sha256 mismatch — not installing",
-				"file", local)
+				"file", local, "sha256", sum)
 			return
 		}
 	} else if err := download(ctx, url, local, sum); err != nil {
-		slog.Error("T5b: nebula tarball download", "error", err)
+		slog.Error("T5b: nebula tarball download", "url", url, "file", local, "error", err)
 		return
 	}
 	if err := untarInstall(local, "nebula", r.hp("/usr/local/bin/nebula"), 0o755); err != nil {
-		slog.Error("T5b: nebula install", "error", err)
+		slog.Error("T5b: nebula install", "file", local, "error", err)
 		return
 	}
-	_ = untarInstall(local, "nebula-cert", r.hp("/usr/local/bin/nebula-cert"), 0o755)
+	if err := untarInstall(local, "nebula-cert", r.hp("/usr/local/bin/nebula-cert"), 0o755); err != nil {
+		slog.Warn("T5b: nebula-cert install failed — keygen unavailable",
+			"file", local, "error", err)
+	}
 }
 
 // nebulaConfig renders nebula.yaml.j2 via the shared ctx.
@@ -710,24 +746,6 @@ func strSliceToAny(in []string) []any {
 // handshakes, listen, pki PATHS, lighthouse.am_lighthouse, tun minus
 // unsafe_routes.
 func (c *cyc) nebulaNeedsRestart(old, new []byte) bool {
-	parse := func(b []byte) map[string]any {
-		m := map[string]any{}
-		if len(b) == 0 {
-			return m
-		}
-		var y map[string]any
-		if v, err := topology.DecodeYAML(b); err == nil {
-			if om, ok := v.(*topology.OMap); ok {
-				for _, k := range om.Keys() {
-					vv, _ := om.Get(k)
-					y[k] = topologyPlain(vv)
-				}
-			}
-		}
-		_ = y
-		return m
-	}
-	_ = parse
 	oldV, err1 := topology.DecodeYAML(old)
 	newV, err2 := topology.DecodeYAML(new)
 	if err1 != nil || err2 != nil {
@@ -864,13 +882,18 @@ func (c *cyc) nebulaRouting() {
 		for _, tgt := range t.Targets {
 			out, err := r.run(ctx, "ip", "-o", "route", "get", tgt, "mark", "0x1000")
 			if err != nil {
+				slog.Debug("T5b/hub: hairpin probe failed — skipping target",
+					"target", tgt, "error", err)
 				continue
 			}
 			m := hairpinViaRe.FindStringSubmatch(out)
 			if m != nil && meshIPs[m[1]] {
 				slog.Info("T5b/hub: pruning hairpin route via mesh IP",
 					"target", tgt, "via", m[1])
-				r.run(ctx, "ip", "route", "del", tgt+"/32", "table", "main")
+				if _, err := r.run(ctx, "ip", "route", "del", tgt+"/32", "table", "main"); err != nil {
+					slog.Warn("T5b/hub: hairpin route delete failed",
+						"target", tgt, "error", err)
+				}
 			}
 		}
 	}
@@ -1103,6 +1126,9 @@ func (c *cyc) groupWatchdog() {
 	// routes/state files stay; only the shell stack dies).
 	if f, err := os.OpenFile(r.hp("/var/log/node-watchdog.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 		_ = f.Close()
+	} else {
+		slog.Warn("watchdog: cannot create log file — state consumers may miss it",
+			"path", "/var/log/node-watchdog.log", "error", err)
 	}
 	r.ensureDir("/var/lib/node-exporter/textfile", 0o755)
 	r.ensureDir("/var/lib/node-watchdog", 0o755)
@@ -1178,6 +1204,8 @@ func strListVar(c *cyc, name string) []string {
 		if !garbage {
 			return out
 		}
+		slog.Debug("watchdog: var list looked char-split — reparsing as scalar",
+			"var", name)
 	}
 	raw := c.v(name)
 	if raw == "" || raw == "None" {
@@ -1294,7 +1322,8 @@ func (c *cyc) pruneLegacyWatchdog() {
 	// module lib dir (lib.sh + modules/*.sh) — removeManaged refuses
 	// dirs on purpose, this one is pruned wholesale.
 	if err := os.RemoveAll(r.hp("/usr/local/lib/node-watchdog")); err != nil {
-		slog.Warn("prune watchdog lib dir failed", "error", err)
+		slog.Warn("prune watchdog lib dir failed",
+			"path", "/usr/local/lib/node-watchdog", "error", err)
 	}
 	if removed {
 		r.daemonReload(ctx)

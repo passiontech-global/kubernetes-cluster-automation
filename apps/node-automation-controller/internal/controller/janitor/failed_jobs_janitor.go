@@ -85,7 +85,7 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 
 	jobs, err := j.cs.BatchV1().Jobs(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("list jobs: %w", err)
 	}
 
 	type target struct {
@@ -131,7 +131,8 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 		if err := j.cs.BatchV1().Jobs(t.ns).Delete(ctx, t.name,
 			metav1.DeleteOptions{PropagationPolicy: &background}); err != nil {
 			metrics.IncError(failedJobQueue)
-			log.Error(err, "job delete failed", "job", t.ns+"/"+t.name)
+			log.Error(err, "job delete failed",
+				"job", t.ns+"/"+t.name, "failedForHours", t.ageHours)
 			failed++
 			continue
 		}
@@ -167,12 +168,12 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 	// list must not leave the gauge half-populated for an hour.
 	nss, err := j.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("list namespaces: %w", err)
 	}
 	pvcs, err := j.cs.CoreV1().PersistentVolumeClaims(metav1.NamespaceAll).
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("list persistentvolumeclaims: %w", err)
 	}
 
 	current := map[stuckTerminatingKey]struct{}{}

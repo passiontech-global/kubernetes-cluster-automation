@@ -81,6 +81,7 @@ import (
 	"bufio"
 	"encoding/pem"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -378,13 +379,17 @@ type Collector struct {
 	// deadline has elapsed, WITHOUT spawning another (bounds stuck
 	// goroutines at one per mount).
 	fsInflight map[string]time.Time
+	// fsStalledLogged (mu) edge-triggers the hung-mount Warn: the
+	// stall logs once per mount per episode instead of once per
+	// scrape for the whole outage.
+	fsStalledLogged map[string]bool
 }
 
 // New returns the Collector. Register it on the agent's registry.
 func New(cfg Config) *Collector {
 	cfg.applyDefaults()
 	c := &Collector{cfg: cfg, seenStates: map[string]time.Time{},
-		fsInflight: map[string]time.Time{}}
+		fsInflight: map[string]time.Time{}, fsStalledLogged: map[string]bool{}}
 	c.removedFlagRe = make(map[string]*regexp.Regexp, len(cfg.RemovedFlags))
 	for _, flag := range cfg.RemovedFlags {
 		// Anchored key match (same shape as the canonical
@@ -803,11 +808,25 @@ func (c *Collector) updateCertLatch(days int64, ok bool) {
 	case days < nebulaCertWarnDays && statErr != nil:
 		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
 		tmp = filepath.Join(dir, ".tmp-"+filepath.Base(latch))
-		if os.WriteFile(tmp, []byte(content), 0o644) == nil {
-			_ = os.Rename(tmp, latch)
+		if werr := os.WriteFile(tmp, []byte(content), 0o644); werr != nil {
+			slog.Warn("hostmetrics: nebula-cert-expiring latch write failed",
+				"subsystem", "hostmetrics", "path", latch, "error", werr)
+		} else if rerr := os.Rename(tmp, latch); rerr != nil {
+			slog.Warn("hostmetrics: nebula-cert-expiring latch install failed",
+				"subsystem", "hostmetrics", "path", latch, "error", rerr)
+		} else {
+			slog.Info("hostmetrics: nebula-cert-expiring latch set",
+				"subsystem", "hostmetrics", "daysLeft", days,
+				"warnDays", nebulaCertWarnDays, "path", latch)
 		}
 	case days >= nebulaCertWarnDays && statErr == nil:
-		_ = os.Remove(latch)
+		if rerr := os.Remove(latch); rerr != nil {
+			slog.Warn("hostmetrics: nebula-cert-expiring latch remove failed",
+				"subsystem", "hostmetrics", "path", latch, "error", rerr)
+		} else {
+			slog.Info("hostmetrics: nebula-cert-expiring latch cleared",
+				"subsystem", "hostmetrics", "daysLeft", days, "path", latch)
+		}
 	}
 }
 
@@ -980,7 +999,23 @@ func (c *Collector) k0sConfig() (data []byte, parsed map[string]any, ok bool) {
 	}
 	data, err = os.ReadFile(c.cfg.K0sConfigFile)
 	var p map[string]any
-	ok = err == nil && yaml.Unmarshal(data, &p) == nil
+	var uerr error
+	if err == nil {
+		uerr = yaml.Unmarshal(data, &p)
+	}
+	ok = err == nil && uerr == nil
+	if !ok {
+		cause := err
+		if cause == nil {
+			cause = uerr
+		}
+		// Cached per mtime+size — this fires once per file change,
+		// not once per scrape.
+		slog.Debug("hostmetrics: k0s config unreadable/unparseable — "+
+			"drift reports {unreadable,k0s.yaml}",
+			"subsystem", "hostmetrics", "path", c.cfg.K0sConfigFile,
+			"error", cause)
+	}
 	c.k0sLoaded = true
 	c.k0sMtime = fi.ModTime()
 	c.k0sSize = fi.Size()
@@ -1098,11 +1133,28 @@ func (c *Collector) updateOverloadLatch(avg60 float64) {
 	case avg60 >= psiOverloadedOn && err != nil:
 		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
 		tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
-		if os.WriteFile(tmp, []byte(content), 0o644) == nil {
-			_ = os.Rename(tmp, p)
+		if werr := os.WriteFile(tmp, []byte(content), 0o644); werr != nil {
+			slog.Warn("hostmetrics: node-overloaded latch write failed",
+				"subsystem", "hostmetrics", "path", p, "error", werr)
+		} else if rerr := os.Rename(tmp, p); rerr != nil {
+			slog.Warn("hostmetrics: node-overloaded latch install failed",
+				"subsystem", "hostmetrics", "path", p, "error", rerr)
+		} else {
+			slog.Info("hostmetrics: node-overloaded latch set — "+
+				"PSI cpu some avg60 above threshold",
+				"subsystem", "hostmetrics", "avg60", avg60,
+				"enterThreshold", psiOverloadedOn, "path", p)
 		}
 	case avg60 < psiOverloadedOff && err == nil:
-		_ = os.Remove(p)
+		if rerr := os.Remove(p); rerr != nil {
+			slog.Warn("hostmetrics: node-overloaded latch remove failed",
+				"subsystem", "hostmetrics", "path", p, "error", rerr)
+		} else {
+			slog.Info("hostmetrics: node-overloaded latch cleared — "+
+				"PSI cpu some avg60 back below threshold",
+				"subsystem", "hostmetrics", "avg60", avg60,
+				"exitThreshold", psiOverloadedOff, "path", p)
+		}
 	}
 }
 
@@ -1139,6 +1191,11 @@ func (c *Collector) maybeMeasureCPU() {
 			c.cpuRatio, c.cpuWall, c.cpuOK = ratio, wall, true
 		}
 		c.mu.Unlock()
+		if !ok {
+			slog.Warn("hostmetrics: cpu-delivered probe did not "+
+				"complete — serving previous result",
+				"subsystem", "hostmetrics")
+		}
 	}()
 }
 
@@ -1384,6 +1441,29 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 		v := 0.0
 		if stalled {
 			v = 1
+		}
+		// Edge-triggered log: a stall warns once per mount per
+		// episode (a hung mount stays stalled for the whole outage),
+		// and recovery logs once — per-scrape repeats would drown
+		// the log without adding information.
+		c.mu.Lock()
+		wasLogged := c.fsStalledLogged[mount]
+		if stalled {
+			c.fsStalledLogged[mount] = true
+		} else {
+			delete(c.fsStalledLogged, mount)
+		}
+		c.mu.Unlock()
+		switch {
+		case stalled && !wasLogged:
+			slog.Warn("hostmetrics: statfs probe exceeded deadline — "+
+				"possible hung mount",
+				"subsystem", "hostmetrics", "mount", mount,
+				"timeout", c.cfg.fsProbeTimeout)
+		case !stalled && wasLogged:
+			slog.Info("hostmetrics: statfs probe answering again — "+
+				"mount recovered",
+				"subsystem", "hostmetrics", "mount", mount)
 		}
 		ch <- prometheus.MustNewConstMetric(c.descFSProbeStalled,
 			prometheus.GaugeValue, v, c.cfg.NodeName, mount)

@@ -71,6 +71,10 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 				_, _ = f.WriteString(line)
 			}
 			_ = f.Close()
+		} else {
+			h.appendLogWarn(fmt.Sprintf(
+				"oomloop: kills file %s append failed: %v — window undercounts kills",
+				killsPath, ferr))
 		}
 		h.appendLog(fmt.Sprintf(
 			"oomloop-probe: %d new memcg OOM kill(s) in k0scontroller (cum=%d)",
@@ -163,8 +167,14 @@ func (h *Hygiene) pruneKills(killsPath string, now int64) int {
 		content = strings.Join(kept, "\n") + "\n"
 	}
 	tmp := killsPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err == nil {
-		_ = os.Rename(tmp, killsPath)
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		h.appendLogWarn(fmt.Sprintf(
+			"oomloop: kills file %s rewrite failed: %v — stale entries persist",
+			killsPath, err))
+	} else if err := os.Rename(tmp, killsPath); err != nil {
+		h.appendLogWarn(fmt.Sprintf(
+			"oomloop: kills file %s install failed: %v — stale entries persist",
+			killsPath, err))
 	}
 	return len(kept)
 }

@@ -71,7 +71,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sig := r.Header.Get("X-Hub-Signature-256")
 
 	slog.Info("webhook delivery received",
-		"remote_addr", r.RemoteAddr,
+		"remote_addr", r.RemoteAddr, "path", r.URL.Path,
 		"delivery", delivery, "event", event)
 
 	// Reject missing/malformed signatures before touching the body:
@@ -81,7 +81,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !verify.HasValidSignatureFormat(h.secret, sig) {
 		slog.Warn("webhook rejected: malformed signature",
 			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", event)
+			"delivery", delivery, "event", event,
+			"status", http.StatusUnauthorized)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
@@ -90,14 +91,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Warn("webhook rejected: body read failed",
 			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", event, "error", err)
+			"delivery", delivery, "event", event, "error", err,
+			"status", http.StatusRequestEntityTooLarge)
 		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	if !verify.Signature(h.secret, body, sig) {
 		slog.Warn("webhook rejected: signature mismatch",
 			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", event)
+			"delivery", delivery, "event", event,
+			"status", http.StatusUnauthorized)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
@@ -115,14 +118,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(body, &p); err != nil {
 		slog.Warn("webhook rejected: malformed JSON payload",
 			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", event, "error", err)
+			"delivery", delivery, "event", event, "error", err,
+			"status", http.StatusBadRequest)
 		http.Error(w, "bad payload", http.StatusBadRequest)
 		return
 	}
 	if p.Repository.FullName == "" {
 		slog.Warn("webhook rejected: missing repository.full_name",
 			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", event)
+			"delivery", delivery, "event", event,
+			"status", http.StatusBadRequest)
 		http.Error(w, "bad payload", http.StatusBadRequest)
 		return
 	}
@@ -155,7 +160,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// silently dropping the delivery.
 		slog.Error("resource index unavailable",
 			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", event, "error", err)
+			"delivery", delivery, "event", event, "error", err,
+			"status", http.StatusBadGateway)
 		http.Error(w, "resource index unavailable", http.StatusBadGateway)
 		return
 	}
@@ -185,6 +191,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"repo", res.Repo, "delivery", delivery, "error", err)
 		case status/100 == 2:
 			checked++
+			slog.Info("check webhook dispatched",
+				"pipeline", res.Pipeline, "resource", res.Name,
+				"repo", res.Repo, "delivery", delivery, "status", status)
 		case status == http.StatusUnauthorized || status == http.StatusNotFound:
 			slog.Warn("check webhook rejected",
 				"pipeline", res.Pipeline, "resource", res.Name,

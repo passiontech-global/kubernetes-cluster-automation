@@ -169,7 +169,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
 		go func() {
 			<-ctx.Done()
-			srv.Shutdown(context.Background())
+			if err := srv.Shutdown(context.Background()); err != nil {
+				slog.Error("server shutdown failed — connections dropped",
+					"server", name, "error", err)
+			}
 		}()
 		go func() {
 			slog.Info("listening", "server", name, "addr", ln.Addr().String())

@@ -95,6 +95,8 @@ type webhookGuard struct {
 
 // SetupWebhookGuard registers the 5-minute sweep (was crontab */5).
 func SetupWebhookGuard(mgr ctrl.Manager, cs kubernetes.Interface) error {
+	logf.Log.WithName(webhookGuardQueue).Info("registered",
+		"interval", 5*time.Minute, "circuitBreaker", circuitBreakerEnabled())
 	g := &webhookGuard{cs: cs, nowFn: time.Now,
 		deadSince:     map[string]time.Time{},
 		brokenEmitted: map[string]bool{}}
@@ -180,7 +182,8 @@ func (g *webhookGuard) sweepOrphans(ctx context.Context) error {
 			"op": "replace", "path": "/webhooks", "value": filtered,
 		}})
 		if err != nil {
-			log.Error(err, "marshal webhook patch", "config", cfgName)
+			log.Error(err, "marshal webhook patch",
+				"config", cfgName, "mutating", mutating)
 			return
 		}
 		patches = append(patches, webhookPatch{mutating: mutating, name: cfgName, payload: payload})
@@ -218,14 +221,20 @@ func (g *webhookGuard) sweepOrphans(ctx context.Context) error {
 
 	failed := false
 	for _, p := range patches {
-		log.Info("PATCH: replace /webhooks (drop orphan entries)", "config", p.name)
+		kind := webhookKindValidating
+		if p.mutating {
+			kind = webhookKindMutating
+		}
+		log.Info("PATCH: replace /webhooks (drop orphan entries)",
+			"kind", kind, "config", p.name)
 		if p.mutating {
 			_, err = g.cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Patch(ctx, p.name, types.JSONPatchType, p.payload, metav1.PatchOptions{})
 		} else {
 			_, err = g.cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Patch(ctx, p.name, types.JSONPatchType, p.payload, metav1.PatchOptions{})
 		}
 		if err != nil {
-			log.Error(err, "webhook config patch failed", "config", p.name)
+			log.Error(err, "webhook config patch failed",
+				"kind", kind, "config", p.name)
 			failed = true
 		}
 	}
@@ -315,7 +324,8 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context) error {
 		}
 		if _, err := g.cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
 			Patch(ctx, cfg.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
-			log.Error(err, "circuit breaker patch failed", "config", cfg.Name)
+			log.Error(err, "circuit breaker patch failed",
+				"kind", webhookKindMutating, "config", cfg.Name)
 			failed = append(failed, cfg.Name)
 			continue
 		}
@@ -331,7 +341,8 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context) error {
 		}
 		if _, err := g.cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().
 			Patch(ctx, cfg.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
-			log.Error(err, "circuit breaker patch failed", "config", cfg.Name)
+			log.Error(err, "circuit breaker patch failed",
+				"kind", webhookKindValidating, "config", cfg.Name)
 			failed = append(failed, cfg.Name)
 			continue
 		}
@@ -498,7 +509,7 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 			if !ok {
 				g.deadSince[key] = now
 				log.Info("circuit breaker: fail-closed webhook on a dead Service — tracking",
-					"config", cfgName, "webhook", h.name, "service", svc)
+					"kind", kind, "config", cfgName, "webhook", h.name, "service", svc)
 				continue
 			}
 			if now.Sub(first) < webhookDeadThreshold {

@@ -841,6 +841,111 @@ func TestSwapSkipsRecreateWhenRightSize(t *testing.T) {
 	}
 }
 
+func TestSwapSwaponProbeFailureSkipsCycle(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	// Probe failure must fail CLOSED: the wrong-size file may be an
+	// ACTIVE swapfile — removing it pulls the kernel's swap target
+	// out from under it. The whole cycle must be skipped on a
+	// failed probe, not just the remove branch.
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{
+		"swapon --show=NAME": true,
+	}}
+	r := newSwapHost(t, vars, "node-a", sr)
+	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service",
+		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s\n")
+	hostWrite(t, r, "/etc/fstab", "/dev/sda1 / ext4 defaults 0 1\n")
+	// wrong-size file on disk (2G where 12G is wanted) — the exact
+	// shape that would hit the os.Remove path on a bogus "inactive".
+	sp := filepath.Join(r.cfg.HostRoot, "/swapfile-kine")
+	f, err := os.Create(sp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(2048 * 1048576); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupSwap()
+
+	if !hostExists(r, "/swapfile-kine") {
+		t.Fatal("wrong-size swapfile removed despite failed active-state probe")
+	}
+	// the ONLY host command issued is the probe itself — nothing
+	// (create/chmod/mkswap/fstab/swapon/sysctl) may proceed.
+	if len(sr.calls) != 1 || !strings.Contains(sr.calls[0], "swapon --show") {
+		t.Fatalf("swap converge proceeded past the failed probe: %v", sr.calls)
+	}
+	if hostExists(r, "/etc/sysctl.d/99-kine-swap.conf") {
+		t.Fatal("swappiness drop-in written despite skipped cycle")
+	}
+	if strings.Contains(hostRead(t, r, "/etc/fstab"), "swapfile-kine") {
+		t.Fatal("fstab entry added despite skipped cycle")
+	}
+}
+
+func TestSwapActiveMatchExactLine(t *testing.T) {
+	// swapon --show=NAME emits one swap name per line — active-state
+	// must be an exact line match. A substring probe marks /swapfile
+	// active just because /swapfile-kine is listed, yet the two are
+	// independent swap targets.
+	vars := writeVarsDir(t, `node_exporter_extra_hosts:
+  - name: db-vm-1
+    ip: 10.9.9.9
+    kine_db: true
+`)
+	seed := func(r *Reconciler, path string, mb int64) {
+		t.Helper()
+		f, err := os.Create(filepath.Join(r.cfg.HostRoot, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(mb * 1048576); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+	}
+
+	// /swapfile probed while only /swapfile-kine is active: NOT active
+	// — the wrong-size file is recreated and swapon is issued.
+	sr := &scriptedRunner{res: map[string]string{
+		"swapon --show=NAME": "/swapfile-kine\n",
+	}, errs: map[string]bool{}}
+	r := newSwapHost(t, vars, "db-vm-1", sr)
+	hostWrite(t, r, "/etc/fstab", "")
+	seed(r, "/swapfile", 1024) // wrong size vs db default 2048
+	c := loadCyc(t, r, vars, "db-vm-1")
+	c.groupSwap()
+	fi, err := os.Stat(filepath.Join(r.cfg.HostRoot, "/swapfile"))
+	if err != nil || fi.Size() != 2048*1048576 {
+		t.Fatalf("/swapfile must be recreated at 2G — substring match marked it active: fi=%v err=%v", fi, err)
+	}
+	if len(sr.callsMatching("swapon /swapfile")) == 0 {
+		t.Fatalf("swapon /swapfile expected on inactive file: %v", sr.calls)
+	}
+
+	// /swapfile-kine listed exactly: ACTIVE — never removed, never
+	// re-swapon'd (controller wants 12G; the live 2G file stays).
+	sr2 := &scriptedRunner{res: map[string]string{
+		"swapon --show=NAME": "/swapfile\n/swapfile-kine\n",
+	}, errs: map[string]bool{}}
+	r2 := newSwapHost(t, vars, "node-a", sr2)
+	hostWrite(t, r2, "/etc/systemd/system/k0scontroller.service",
+		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s\n")
+	hostWrite(t, r2, "/etc/fstab", "/dev/sda1 / ext4 defaults 0 1\n")
+	seed(r2, "/swapfile-kine", 2048) // wrong size vs controller 12288
+	c2 := loadCyc(t, r2, vars, "node-a")
+	c2.groupSwap()
+	fi, err = os.Stat(filepath.Join(r2.cfg.HostRoot, "/swapfile-kine"))
+	if err != nil || fi.Size() != 2048*1048576 {
+		t.Fatal("active /swapfile-kine was removed/resized")
+	}
+	if len(sr2.callsMatching("swapon /swapfile-kine")) > 0 {
+		t.Fatal("swapon issued for already-active /swapfile-kine")
+	}
+}
+
 // ---------- hub-metrics-fw ----------
 
 func TestHubMetricsFWRenders(t *testing.T) {
@@ -1143,6 +1248,75 @@ func TestHairpinPruneOnlyOnLighthouse(t *testing.T) {
 	c2.nebulaRouting()
 	if len(sr2.callsMatching("route get")) > 0 {
 		t.Fatalf("hairpin probe ran on non-lighthouse: %v", sr2.callsMatching("route get"))
+	}
+}
+
+// ---------- nebula restart-vs-reload decision ----------
+
+func TestNebulaNeedsRestartDecision(t *testing.T) {
+	c := &cyc{}
+	base := `pki:
+  ca: /etc/nebula/interdc/ca.crt
+  cert: /etc/nebula/interdc/host.crt
+  key: /etc/nebula/interdc/host.key
+static_host_map:
+  "172.29.0.10": ["10.0.1.10:4242"]
+lighthouse:
+  am_lighthouse: false
+  hosts: ["172.29.0.10"]
+tun:
+  dev: neb1
+  mtu: 1300
+  unsafe_routes:
+    - route: 10.99.0.0/24
+      via: 172.29.0.10
+listen:
+  host: 0.0.0.0
+  port: 45670
+firewall:
+  outbound:
+    - port: any
+      proto: any
+      host: any
+`
+	rep := func(old, new string) string {
+		return strings.Replace(base, old, new, 1)
+	}
+	for _, tc := range []struct {
+		name string
+		old  string
+		new  string
+		want bool
+	}{
+		{"identical", base, base, false},
+		// SIGHUP-reloadable surfaces — reload only.
+		{"firewall rule change", base,
+			rep("- port: any\n      proto: any\n      host: any", "- port: 443\n      proto: tcp\n      host: any"), false},
+		{"lighthouse.hosts change", base,
+			rep(`hosts: ["172.29.0.10"]`, `hosts: ["172.29.0.10", "172.29.0.20"]`), false},
+		{"tun.unsafe_routes change", base,
+			rep("route: 10.99.0.0/24", "route: 10.98.0.0/24"), false},
+		{"top-level key reorder",
+			`firewall:
+  outbound:
+    - port: any
+      proto: any
+      host: any
+` + base[:strings.Index(base, "firewall:")], base, false},
+		// Non-reloadable surfaces — full restart.
+		{"tun.mtu change", base, rep("mtu: 1300", "mtu: 1400"), true},
+		{"tun.dev change", base, rep("dev: neb1", "dev: neb2"), true},
+		{"listen.port change", base, rep("port: 45670", "port: 45671"), true},
+		{"static_host_map change", base, rep("10.0.1.10:4242", "10.0.1.11:4242"), true},
+		{"pki path change", base, rep("interdc/host.key", "interdc/host2.key"), true},
+		{"am_lighthouse flip", base, rep("am_lighthouse: false", "am_lighthouse: true"), true},
+		{"unparseable new config", base, "{", true},
+		{"unparseable old config", "{", base, true},
+		{"empty old config (first install)", "", base, true},
+	} {
+		if got := c.nebulaNeedsRestart([]byte(tc.old), []byte(tc.new)); got != tc.want {
+			t.Errorf("%s: needsRestart=%v want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

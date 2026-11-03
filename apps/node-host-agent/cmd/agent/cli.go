@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -178,6 +179,8 @@ func convergeOnce(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "converge-once:", err)
 		return 1
 	}
+	slog.Info("converge-once starting",
+		"node", nn, "varsDir", *varsDir, "certsDir", *certsDir)
 	hc.Cycle(ctx)
 	// hostconfig.Cycle is void — per-group failures only surface via
 	// internal metrics (unexported, registered on a nil registry here)

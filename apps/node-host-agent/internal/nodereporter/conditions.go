@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -142,11 +143,13 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 	// message-only drift (e.g. the WatchdogStale age counter ticking)
 	// does not churn the API.
 	changed := false
+	var changedList []string
 	for _, e := range evals {
 		cur, ok := live[e.def.typ]
 		if !ok || cur.Status != e.status || cur.Reason != e.reason {
 			changed = true
-			break
+			changedList = append(changedList, fmt.Sprintf(
+				"%s=%s(%s)", e.def.typ, e.status, e.reason))
 		}
 	}
 	if !changed {
@@ -185,6 +188,8 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 		types.StrategicMergePatchType, payload, metav1.PatchOptions{}, "status"); err != nil {
 		return fmt.Errorf("patch node %s status: %w", r.cfg.NodeName, err)
 	}
+	slog.Info("nodereporter: node conditions updated",
+		"node", r.cfg.NodeName, "changed", changedList)
 	return nil
 }
 

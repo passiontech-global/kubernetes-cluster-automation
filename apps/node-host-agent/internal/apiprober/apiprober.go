@@ -655,7 +655,8 @@ func (p *Prober) discover(ctx context.Context) ([]backend, error) {
 				// normally (a stray server line is an ops config
 				// bug, not an apiserver outage).
 				slog.Warn("show stat: server has no addr column value and no API_BACKENDS match — skipping it",
-					"server", svname, "subsystem", "apiprober")
+					"server", svname, "backend", p.eff.backend,
+					"subsystem", "apiprober")
 				continue
 			}
 		}
@@ -701,6 +702,9 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 	req, err := http.NewRequestWithContext(qctx, http.MethodGet,
 		"https://"+addr+path, nil)
 	if err != nil {
+		slog.Debug("apiprober: query request build failed",
+			"addr", addr, "path", path, "error", err,
+			"subsystem", "apiprober")
 		return 0, false
 	}
 	// Ask for object metadata only — both probe paths are nodes LISTs,
@@ -713,6 +717,9 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 	if p.eff.tokenFile != "" && p.cfg.HTTPClient == nil {
 		tok, err := os.ReadFile(p.eff.tokenFile)
 		if err != nil {
+			slog.Debug("apiprober: token read failed — query sent no request",
+				"tokenFile", p.eff.tokenFile, "addr", addr,
+				"error", err, "subsystem", "apiprober")
 			return 0, false
 		}
 		req.Header.Set("Authorization",
@@ -720,6 +727,9 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
+		slog.Debug("apiprober: query transport failed",
+			"addr", addr, "path", path, "error", err,
+			"subsystem", "apiprober")
 		return 0, false
 	}
 	defer resp.Body.Close()
@@ -728,10 +738,16 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 	// reuse the connection.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
+		slog.Debug("apiprober: query response read failed",
+			"addr", addr, "path", path, "error", err,
+			"subsystem", "apiprober")
 		return 0, false
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		slog.Debug("apiprober: query returned non-200",
+			"addr", addr, "path", path, "status", resp.StatusCode,
+			"subsystem", "apiprober")
 		return 0, false
 	}
 	var list struct {
@@ -740,10 +756,17 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 		} `json:"metadata"`
 	}
 	if err := json.Unmarshal(body, &list); err != nil {
+		slog.Debug("apiprober: query response unmarshal failed",
+			"addr", addr, "path", path, "error", err,
+			"subsystem", "apiprober")
 		return 0, false
 	}
 	rv, err = strconv.ParseInt(list.Metadata.ResourceVersion, 10, 64)
 	if err != nil {
+		slog.Debug("apiprober: non-numeric resourceVersion in response",
+			"addr", addr, "path", path,
+			"resourceVersion", list.Metadata.ResourceVersion,
+			"error", err, "subsystem", "apiprober")
 		return 0, false
 	}
 	return rv, true
@@ -833,6 +856,9 @@ func mergeStatic(backends []backend, static []StaticBackend) []backend {
 		// anything that can't be a real backend name/addr.
 		if len(sb.Name) < 2 ||
 			strings.ContainsAny(sb.Name+sb.Addr, " \t'\"[]{}(),") {
+			slog.Warn("apiprober: skipping malformed API_BACKENDS entry",
+				"name", sb.Name, "addr", sb.Addr,
+				"subsystem", "apiprober")
 			continue
 		}
 		// Bare "ip:port" API_BACKENDS entries parse self-named
@@ -972,7 +998,9 @@ func writeFileAtomic(path string, data []byte) error {
 func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
 	f := dir + "/apibe-gap-" + dashedIP(b.Addr)
 	if err := writeFileAtomic(f, []byte(strconv.FormatInt(gap, 10)+"\n")); err != nil {
-		slog.Warn("watchdog gap file write failed", "file", f, "error", err)
+		slog.Warn("watchdog gap file write failed",
+			"file", f, "backend", b.Name, "error", err,
+			"subsystem", "apiprober")
 	}
 }
 
@@ -985,7 +1013,9 @@ func (p *Prober) latchStale(dir string, b backend) {
 	}
 	if err := writeFileAtomic(f,
 		[]byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n")); err != nil {
-		slog.Warn("watchdog stale latch write failed", "file", f, "error", err)
+		slog.Warn("watchdog stale latch write failed",
+			"file", f, "backend", b.Name, "error", err,
+			"subsystem", "apiprober")
 	}
 }
 
@@ -995,7 +1025,9 @@ func (p *Prober) latchStale(dir string, b backend) {
 func (p *Prober) clearStale(dir string, b backend) {
 	f := dir + "/state-apiserver-backend-stale-" + dashedIP(b.Addr)
 	if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
-		slog.Warn("watchdog stale latch remove failed", "file", f, "error", err)
+		slog.Warn("watchdog stale latch remove failed",
+			"file", f, "backend", b.Name, "error", err,
+			"subsystem", "apiprober")
 	}
 }
 
@@ -1015,7 +1047,7 @@ func (p *Prober) pruneWatchdogFiles(dir string, backends []backend) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		slog.Warn("watchdog state dir scan failed — stale files not pruned",
-			"dir", dir, "error", err)
+			"dir", dir, "error", err, "subsystem", "apiprober")
 		return
 	}
 	for _, e := range entries {
@@ -1032,7 +1064,8 @@ func (p *Prober) pruneWatchdogFiles(dir string, backends []backend) {
 		if !keep[suffix] {
 			if err := os.Remove(dir + "/" + name); err != nil {
 				slog.Warn("watchdog stale file prune failed",
-					"file", name, "dir", dir, "error", err)
+					"file", name, "dir", dir, "error", err,
+					"subsystem", "apiprober")
 			}
 		}
 	}
@@ -1065,6 +1098,9 @@ func (p *Prober) pruneStaleBackends(backends []backend) {
 		delete(p.states, name)
 		p.rvGap.DeleteLabelValues(name)
 		p.enabled.DeleteLabelValues(name)
+		slog.Info("apiprober: backend left HAProxy discovery — pruned "+
+			"probe state and metric series",
+			"backend", name, "subsystem", "apiprober")
 		// probeFailures/actions carry a second label (phase|action)
 		// — drop every series whose backend label matches.
 		p.probeFailures.DeletePartialMatch(prometheus.Labels{"backend": name})
@@ -1157,7 +1193,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 		// verdict; we neither count it fresh nor stale.
 		if err := p.tcpPreflight(ctx, b.Addr); err != nil {
 			log.Info("probe: unreachable — skip (haproxy health-check owns it)",
-				"backend", b.Name, "addr", b.Addr)
+				"backend", b.Name, "addr", b.Addr, "error", err)
 			p.probeFailures.WithLabelValues(b.Name, "tcp").Inc()
 			continue
 		}
@@ -1490,8 +1526,9 @@ type GuardDefaults struct {
 type GuardReloader struct {
 	Path string
 
-	mu  sync.Mutex
-	cur GuardDefaults
+	mu      sync.Mutex
+	cur     GuardDefaults
+	loadErr bool // edge-latch for the unreadable-conf Warn
 }
 
 // NewGuardReloader seeds the reloader with an initial parse (the
@@ -1501,7 +1538,9 @@ func NewGuardReloader(path string, initial GuardDefaults) *GuardReloader {
 }
 
 // Get returns the freshest parse of Path, falling back to the last
-// good one on read/parse errors.
+// good one on read/parse errors. A persistent read failure warns
+// once per episode (and logs recovery once) rather than every cycle —
+// Get runs each probe cycle.
 func (r *GuardReloader) Get() GuardDefaults {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1509,7 +1548,17 @@ func (r *GuardReloader) Get() GuardDefaults {
 		return r.cur
 	}
 	if g, err := LoadGuardConf(r.Path); err == nil {
+		if r.loadErr {
+			r.loadErr = false
+			slog.Info("apiprober: guard conf readable again",
+				"path", r.Path, "subsystem", "apiprober")
+		}
 		r.cur = g
+	} else if !r.loadErr {
+		r.loadErr = true
+		slog.Warn("apiprober: guard conf unreadable — keeping last "+
+			"good parse", "path", r.Path, "error", err,
+			"subsystem", "apiprober")
 	}
 	return r.cur
 }

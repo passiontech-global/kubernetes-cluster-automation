@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeVars(t *testing.T) string {
@@ -264,6 +265,78 @@ func TestVarsResolveFailClosed(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("eval failure not recorded: %v", topo.Vars.Errors())
+	}
+}
+
+// lookup() is fail-loud: unsupported plugins, missing terms and
+// absent env hooks all error the render — never silently emit "".
+func TestLookupFailLoud(t *testing.T) {
+	cases := []string{
+		"{{ lookup('env', 'HOME') }}",      // unsupported plugin
+		"{{ lookup('file', 'x', 'y') }}",   // file kind, nil env
+		"{{ lookup('file') }}",             // missing term
+		"{{ lookup('pipe', 'date +%s') }}", // pipe kind, nil env
+		"{{ lookup() }}",                   // no plugin name
+	}
+	for _, tpl := range cases {
+		if out, err := Render(tpl, map[string]any{}, nil); err == nil {
+			t.Fatalf("render %q succeeded with %q — must error", tpl, out)
+		}
+	}
+	// Unsupported plugin errors even when an env is wired.
+	env := NewEnv(t.TempDir(), nil)
+	if _, err := Render("{{ lookup('url', 'http://x') }}", nil, env); err == nil {
+		t.Fatal("unsupported plugin must error with env set")
+	}
+}
+
+// lookup('file', ...) resolves via Env.FileLookup — here the
+// vars-dir-rooted env Load/NewEnv build.
+func TestLookupFileViaEnv(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("s3cr3t\n"), 0o644)
+	got, err := Render("{{ lookup('file', 'secret.txt') | trim }}",
+		map[string]any{}, NewEnv(dir, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "s3cr3t" {
+		t.Fatalf("lookup file = %q", got)
+	}
+	// Missing file → render error (was silently "" when env was nil).
+	if _, err := Render("{{ lookup('file', 'nope.txt') }}",
+		map[string]any{}, NewEnv(dir, nil)); err == nil {
+		t.Fatal("missing file must error")
+	}
+	// 'date +%s' pipe lookup honours the injected clock.
+	got, err = Render("{{ lookup('pipe', 'date +%s') }}", map[string]any{},
+		NewEnv(dir, func() time.Time { return time.Unix(123, 0) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "123" {
+		t.Fatalf("pipe date = %q", got)
+	}
+	// Any other pipe command errors.
+	if _, err := Render("{{ lookup('pipe', 'rm -rf /') }}",
+		map[string]any{}, NewEnv(dir, nil)); err == nil {
+		t.Fatal("unsupported pipe command must error")
+	}
+}
+
+// A vars-file value using lookup('file', ...) resolves against the
+// vars dir through the env Load wires — end-to-end coverage.
+func TestVarsFileLookup(t *testing.T) {
+	dir := writeVars(t)
+	os.WriteFile(filepath.Join(dir, "mesh_token"), []byte("tok-1\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "cluster.yaml"),
+		[]byte("token: \"{{ lookup('file', 'mesh_token') | trim }}\"\n"), 0o644)
+	topo, err := Load(Config{VarsDir: dir, NodeName: "node-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := topo.Vars.Str("token"); got != "tok-1" {
+		t.Fatalf("token=%q errors=%v", got, topo.Vars.Errors())
 	}
 }
 

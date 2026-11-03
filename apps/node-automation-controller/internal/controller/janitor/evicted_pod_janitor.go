@@ -72,7 +72,7 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 		FieldSelector: "status.phase=" + string(corev1.PodFailed),
 	})
 	if err != nil {
-		return err // periodic wrapper IncErrors evictedPodQueue
+		return fmt.Errorf("list failed pods: %w", err) // periodic wrapper IncErrors evictedPodQueue
 	}
 
 	type target struct {
@@ -119,7 +119,8 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 		if err := j.cs.CoreV1().Pods(t.ns).Delete(ctx, t.name,
 			metav1.DeleteOptions{PropagationPolicy: &background}); err != nil {
 			metrics.IncError(evictedPodQueue)
-			log.Error(err, "pod delete failed", "pod", t.ns+"/"+t.name)
+			log.Error(err, "pod delete failed",
+				"pod", t.ns+"/"+t.name, "node", t.node, "reason", t.reason)
 			failed++
 			continue
 		}

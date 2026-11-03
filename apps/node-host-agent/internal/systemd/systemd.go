@@ -11,8 +11,8 @@
 // with a fake recorder, and that production wires to
 // exec.CommandContext. Shell parity:
 //
-//	systemctl is-active <u>        -> IsActive
-//	systemctl cat <u>              -> UnitExists (WD_REQUIRES unit:<n>)
+//	systemctl is-active <u>        -> Active / IsActive
+//	systemctl show -p LoadState <u> -> Exists / UnitExists (WD_REQUIRES unit:<n>)
 //	systemctl show -p ActiveEnterTimestampMonotonic --value -> ActiveAge
 //	systemctl restart <u>          -> Restart
 //	systemctl reload-or-restart <u> -> ReloadOrRestart
@@ -25,6 +25,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strconv"
@@ -126,15 +127,39 @@ func (c *Client) systemctl(ctx context.Context, args ...string) (string, error) 
 	return c.Exec(ctx, "systemctl", args...)
 }
 
-// IsActive mirrors `systemctl is-active <unit>`: true only on literal
+// Active mirrors `systemctl is-active <unit>`: true only on literal
 // "active" (activating/failed/inactive all count as down — the shell
-// compared the string).
-func (c *Client) IsActive(ctx context.Context, unit string) bool {
+// compared the string). Unlike IsActive it reports probe failure
+// separately: `is-active` exits non-zero for EVERY non-active state,
+// so a non-zero exit carrying a real ActiveState word on stdout is a
+// legitimate "not active", while an error with empty/unexpected
+// output means the check itself failed (dbus down, systemctl
+// missing) — callers gating protective action on the result can
+// fail closed instead of reading the failure as "down".
+func (c *Client) Active(ctx context.Context, unit string) (bool, error) {
 	out, err := c.systemctl(ctx, "is-active", unit)
-	if err != nil {
-		return false
+	switch strings.TrimSpace(out) {
+	case "active":
+		return true, nil
+	case "reloading", "activating", "deactivating", "inactive",
+		"failed", "maintenance", "unknown":
+		// A real ActiveState — the probe answered "not active".
+		return false, nil
 	}
-	return strings.TrimSpace(out) == "active"
+	if err != nil {
+		return false, fmt.Errorf("systemctl is-active %s: %w (%s)",
+			unit, err, strings.TrimSpace(out))
+	}
+	return false, fmt.Errorf("systemctl is-active %s: unexpected output %q",
+		unit, strings.TrimSpace(out))
+}
+
+// IsActive is Active with the error folded to false — legacy callers
+// that cannot use the distinction keep the old "can't ask = down"
+// semantics.
+func (c *Client) IsActive(ctx context.Context, unit string) bool {
+	active, err := c.Active(ctx, unit)
+	return err == nil && active
 }
 
 // IsEnabled mirrors `systemctl is-enabled <unit> >/dev/null` — the
@@ -144,19 +169,98 @@ func (c *Client) IsActive(ctx context.Context, unit string) bool {
 // transient, linked) — a static or templated-instance unit counts as
 // "installed" the same as enabled. Only rc!=0 (disabled, masked,
 // not-found) means off.
-func (c *Client) IsEnabled(ctx context.Context, unit string) bool {
-	_, err := c.systemctl(ctx, "is-enabled", unit)
-	return err == nil
+//
+// Enabled additionally reports probe failure: a recognized state
+// word on stdout is a real answer whatever the exit code, while an
+// error with empty/unexpected output means the check itself failed.
+// Caveat: a unit that does not exist at all produces an empty stdout
+// + error — indistinguishable from a tool failure — so not-found
+// surfaces as an error to callers using this variant (the IsEnabled
+// wrapper still folds it to false, matching the old rc!=0 test).
+func (c *Client) Enabled(ctx context.Context, unit string) (bool, error) {
+	out, err := c.systemctl(ctx, "is-enabled", unit)
+	switch strings.TrimSpace(out) {
+	case "enabled", "enabled-runtime", "static", "indirect", "alias",
+		"generated", "transient", "linked", "linked-runtime":
+		// The whole "installed" vocabulary the rc==0 test accepted.
+		return true, nil
+	case "disabled", "masked", "masked-runtime", "bad":
+		// is-enabled answered — the unit file exists but is off.
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("systemctl is-enabled %s: %w (%s)",
+			unit, err, strings.TrimSpace(out))
+	}
+	return false, fmt.Errorf("systemctl is-enabled %s: unexpected output %q",
+		unit, strings.TrimSpace(out))
 }
 
-// UnitExists mirrors `systemctl cat <unit>` — the WD_REQUIRES
-// unit:<name> gate: the unit file is loadable (installed or
-// generated), rc!=0 means absent.
+// IsEnabled is Enabled with the error folded to false.
+func (c *Client) IsEnabled(ctx context.Context, unit string) bool {
+	enabled, err := c.Enabled(ctx, unit)
+	return err == nil && enabled
+}
+
+// Exists is the error-aware UnitExists — the WD_REQUIRES unit:<name>
+// gate answered by `systemctl show -p LoadState --value <unit>`
+// instead of `systemctl cat`: cat fails identically for "unit file
+// absent" and "systemctl itself broken" (both leave stdout empty),
+// while `show` exits 0 for any unit name and reports LoadState — a
+// non-zero exit unambiguously means the probe failed.
+//
+// LoadState → answer (systemd's unit_load_state_table vocabulary).
+// "Exists" means "the manager holds a WORKING unit definition —
+// the unit is real enough to start/restart", NOT "a file sits on
+// disk": every caller gates an action (restart, down-latch, metrics
+// collection) on this answer, and states whose unit cannot be
+// started — or which the admin deliberately disabled — must not
+// read as present:
+//
+//	loaded      → true   unit definition loaded — manageable
+//	merged      → true   loaded, merged with transient config —
+//	                     cat could read it and restart works
+//	stub        → false  referenced by other units but NO
+//	                     definition — cat finds no files, start
+//	                     fails; nothing to act on
+//	not-found   → false  no unit definition
+//	bad-setting → false  file exists but fails to parse — not
+//	                     startable; a restart cannot fix it
+//	error       → false  load error — not manageable
+//	masked      → false  administratively disabled — reads
+//	                     inactive and every restart attempt fails,
+//	                     so counting it present would make callers
+//	                     fight the admin's intent each cycle
+//	"" / other  → false  empty/unrecognized word — conservative
+//	                     absent, warned below so a weird systemd
+//	                     state stays diagnosable
+func (c *Client) Exists(ctx context.Context, unit string) (bool, error) {
+	out, err := c.systemctl(ctx, "show", "-p", "LoadState", "--value", unit)
+	if err != nil {
+		return false, fmt.Errorf("systemctl show -p LoadState --value %s: %w (%s)",
+			unit, err, strings.TrimSpace(out))
+	}
+	switch state := strings.TrimSpace(out); state {
+	case "loaded", "merged":
+		return true, nil
+	case "stub", "not-found", "bad-setting", "error", "masked", "":
+		return false, nil
+	default:
+		slog.Warn("systemd: unexpected LoadState word — "+
+			"treating unit as absent this probe",
+			"subsystem", "systemd", "unit", unit, "loadstate", state)
+		return false, nil
+	}
+}
+
+// UnitExists is Exists on a bounded background context with the
+// error folded to false — kept for callers that only need the old
+// "can't ask = absent" answer.
 func (c *Client) UnitExists(unit string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.Timeout)
 	defer cancel()
-	_, err := c.systemctl(ctx, "cat", unit)
-	return err == nil
+	exists, err := c.Exists(ctx, unit)
+	return err == nil && exists
 }
 
 // ActiveAge returns how long the unit has been continuously active —

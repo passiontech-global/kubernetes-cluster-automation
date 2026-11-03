@@ -82,7 +82,10 @@ func (h *Hygiene) checkKinePool(_ context.Context) {
 			kpid, conns, h.cfg.KinePoolMaxConns, n))
 		h.rateSpend(h.cfg.WatchdogStateDir, fileRatePoolKill)
 		h.ctrReset(fileCtrPool)
-		_ = h.cfg.killFn(kpid, syscall.SIGTERM) //nolint:errcheck // shell `kill` best-effort
+		if err := h.cfg.killFn(kpid, syscall.SIGTERM); err != nil {
+			h.appendLogWarn(fmt.Sprintf(
+				"suspect: kill kine pid=%d failed: %v", kpid, err))
+		}
 		h.actions.WithLabelValues(checkKinePool, "kill_kine").Inc()
 	case ModeDryRun:
 		h.appendLog(fmt.Sprintf(

@@ -362,7 +362,15 @@ func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 		for {
 			nr, err := unix.Read(fd, buf)
 			if err != nil || nr == 0 {
-				return // err: closed/failing fd; nr==0: peer EOF
+				// err: closed/failing fd; nr==0: peer EOF. A close
+				// triggered by ctx cancel is the normal shutdown —
+				// only unexpected read failures are worth a trail.
+				if err != nil && ctx.Err() == nil {
+					slog.Debug("route-guard: netlink read failed — "+
+						"socket will reopen",
+						"subsystem", "nethealth", "error", err)
+				}
+				return
 			}
 			if scanDeleteEvents(buf[:nr]) {
 				select {
@@ -439,18 +447,40 @@ func routeGuardDebounceLoop(ctx context.Context, events <-chan struct{},
 func (n *NetHealth) restoreRouteGuard(ctx context.Context) {
 	wd := n.watchdogConf()
 	if !wd.SignalEnabled(checkRouteGuard) {
-		return // WD_SIG_ROUTE_GUARD=off kill switch
+		slog.Debug("route-guard: restore skipped — kill switch off "+
+			"(WD_SIG_ROUTE_GUARD=off)", "subsystem", "nethealth")
+		return
 	}
 	if !n.nebulaUpExists(wd) {
-		return // script gone mid-run → nothing to restore with
+		slog.Debug("route-guard: restore skipped — nebula-up.sh gone "+
+			"mid-run", "subsystem", "nethealth", "net", wd.NebulaNet)
+		return
 	}
 	// bash gate: restore only while `systemctl is-active
 	// nebula@<net>` says active — a deliberately stopped unit must
 	// not be resurrected by its own delete events (inactive,
 	// deactivating AND no-systemd all count as down; activating is
 	// the unit's own ExecStartPost job).
-	if n.cfg.Systemd == nil ||
-		!n.cfg.Systemd.IsActive(ctx, "nebula@"+wd.NebulaNet) {
+	if n.cfg.Systemd == nil {
+		slog.Debug("route-guard: restore skipped — no systemd client",
+			"subsystem", "nethealth", "unit", "nebula@"+wd.NebulaNet)
+		return
+	}
+	active, err := n.cfg.Systemd.Active(ctx, "nebula@"+wd.NebulaNet)
+	if err != nil {
+		// Fail closed: an unanswerable probe (dbus down, systemctl
+		// missing) must not resurrect a possibly-stopped unit —
+		// skip the restore this cycle.
+		slog.Warn("route-guard: restore skipped — is-active probe "+
+			"failed (fail closed)",
+			"subsystem", "nethealth", "unit", "nebula@"+wd.NebulaNet,
+			"error", err)
+		return
+	}
+	if !active {
+		slog.Debug("route-guard: restore skipped — nebula unit not "+
+			"active",
+			"subsystem", "nethealth", "unit", "nebula@"+wd.NebulaNet)
 		return
 	}
 	script := nebulaUpScript(wd.NebulaNet)

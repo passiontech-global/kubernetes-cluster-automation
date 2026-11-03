@@ -2354,22 +2354,32 @@ func toPlain(v any) any {
 
 // ---------------- lookup ----------------
 
+// doLookup mirrors ansible's lookup() — fail-loud: a lookup that
+// cannot be honoured (unknown plugin, missing term, no env hook)
+// errors the render instead of silently emitting "", which would let
+// a missing file converge to an empty config value.
 func doLookup(args []any, s *scope) (any, error) {
 	if len(args) == 0 {
-		return "", nil
+		return nil, fmt.Errorf("lookup: missing plugin name")
 	}
 	kind := stringify(args[0])
 	switch kind {
 	case "file", "ansible.builtin.file":
-		if s.env != nil && s.env.FileLookup != nil && len(args) > 1 {
-			return s.env.FileLookup(stringify(args[1]))
+		if len(args) < 2 {
+			return nil, fmt.Errorf("lookup(%q): missing file path", kind)
 		}
-		return "", nil
+		if s.env == nil || s.env.FileLookup == nil {
+			return nil, fmt.Errorf("lookup(%q): no file lookup configured", kind)
+		}
+		return s.env.FileLookup(stringify(args[1]))
 	case "pipe", "ansible.builtin.pipe":
-		if s.env != nil && s.env.PipeLookup != nil && len(args) > 1 {
-			return s.env.PipeLookup(stringify(args[1]))
+		if len(args) < 2 {
+			return nil, fmt.Errorf("lookup(%q): missing command", kind)
 		}
-		return "", nil
+		if s.env == nil || s.env.PipeLookup == nil {
+			return nil, fmt.Errorf("lookup(%q): no pipe lookup configured", kind)
+		}
+		return s.env.PipeLookup(stringify(args[1]))
 	}
-	return "", nil
+	return nil, fmt.Errorf("lookup: unsupported plugin %q", kind)
 }

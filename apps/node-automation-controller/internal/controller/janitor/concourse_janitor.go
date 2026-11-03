@@ -548,6 +548,9 @@ func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod
 	defer cancel()
 	used, capBytes, imgUsed, err := j.stats.Summary(cctx, s.node)
 	if err != nil {
+		logf.FromContext(ctx).Info(fmt.Sprintf(
+			"WARN %s: stats/summary unreadable on node %s: %v — disk unknown, fail-open",
+			pod.Name, s.node, err))
 		return s
 	}
 	if used >= 0 && capBytes > 0 {
@@ -567,9 +570,18 @@ func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod
 	case err == nil:
 		wd = s.usedGiB - int64(base)
 	case imgUsed >= 0:
+		if anno := pod.Annotations[cjBaselineAnno]; anno != "" {
+			logf.FromContext(ctx).Info(fmt.Sprintf(
+				"WARN %s: baseline annotation %q invalid — estimating from imageFs+%dGiB",
+				pod.Name, anno, cjOSBaselineGiB))
+		}
 		wd = s.usedGiB - imgUsed/gib - cjOSBaselineGiB
 	default:
-		return s // no baseline path at all → workdir unknown
+		// No baseline path at all → workdir unknown → fail-open wipe.
+		logf.FromContext(ctx).Info(fmt.Sprintf(
+			"WARN %s: no usable baseline (annotation %q, imageFs missing) — workdir unknown, fail-open",
+			pod.Name, pod.Annotations[cjBaselineAnno]))
+		return s
 	}
 	if wd < 0 {
 		wd = 0

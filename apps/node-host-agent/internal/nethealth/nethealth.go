@@ -365,6 +365,8 @@ func (n *NetHealth) Name() string { return "nethealth" }
 // Run checks immediately, then every Interval until ctx is cancelled.
 func (n *NetHealth) Run(ctx context.Context) {
 	if !n.cfg.Enabled {
+		slog.Info("nethealth disabled — idling until shutdown",
+			"subsystem", "nethealth")
 		<-ctx.Done()
 		return
 	}
@@ -454,6 +456,10 @@ func (n *NetHealth) appendLog(msg string) {
 	f, err := os.OpenFile(n.cfg.WatchdogLogFile,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
+		slog.Debug("nethealth: watchdog log file append failed — "+
+			"line kept in agent log only",
+			"subsystem", "nethealth", "path", n.cfg.WatchdogLogFile,
+			"error", err)
 		return
 	}
 	defer f.Close()
@@ -633,6 +639,10 @@ func (n *NetHealth) pinFiles() []string {
 func (n *NetHealth) renderHostsBlock(block string) (changed bool) {
 	data, err := os.ReadFile(n.cfg.HostsFile)
 	if err != nil {
+		slog.Warn("nethealth: hosts file unreadable — dns-fallback "+
+			"block left untouched",
+			"subsystem", "nethealth", "path", n.cfg.HostsFile,
+			"error", err)
 		return false
 	}
 	cur := string(data)
@@ -663,7 +673,14 @@ func (n *NetHealth) renderHostsBlock(block string) (changed bool) {
 	if next == cur {
 		return false
 	}
-	return os.WriteFile(n.cfg.HostsFile, []byte(next), 0o644) == nil
+	if err := os.WriteFile(n.cfg.HostsFile, []byte(next), 0o644); err != nil {
+		slog.Warn("nethealth: hosts file write failed — dns-fallback "+
+			"block not applied",
+			"subsystem", "nethealth", "path", n.cfg.HostsFile,
+			"error", err)
+		return false
+	}
+	return true
 }
 
 // checkDNSFallback — sig10: DNS dead → pin fallback names into the
@@ -695,7 +712,14 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		pinf := filepath.Join(n.cfg.WatchdogStateDir, "dnsfb-pin-"+e.Name)
 		resolved := ""
 		for _, server := range ns {
-			if ip, err := n.cfg.dnsProbe(ctx, server, e.Name); err == nil && ip != "" {
+			ip, err := n.cfg.dnsProbe(ctx, server, e.Name)
+			if err != nil {
+				slog.Debug("nethealth: dns probe failed",
+					"subsystem", "nethealth", "name", e.Name,
+					"nameserver", server, "error", err)
+				continue
+			}
+			if ip != "" {
 				resolved = ip
 				break
 			}
@@ -740,7 +764,12 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 				n.appendLog(fmt.Sprintf(
 					"ACTION: dns-fallback pin %s -> %s (DNS fail %dx, was '%s')",
 					e.Name, newIP, fails, curIP))
-				_ = os.WriteFile(pinf, []byte(newIP+" "+e.Name+"\n"), 0o644)
+				if err := os.WriteFile(pinf,
+					[]byte(newIP+" "+e.Name+"\n"), 0o644); err != nil {
+					n.appendLog(fmt.Sprintf(
+						"dns-fallback: pin file write failed for %s -> %s: %v",
+						e.Name, newIP, err))
+				}
 				n.actions.WithLabelValues(checkDNSFB, "pin").Inc()
 			} else if curIP == "" {
 				n.appendLog(fmt.Sprintf(
@@ -810,9 +839,35 @@ func (n *NetHealth) checkCoreDNSStub(ctx context.Context) {
 			break
 		}
 	}
-	if !loopback || n.cfg.Systemd == nil ||
-		!n.cfg.Systemd.UnitExists("coredns.service") ||
-		n.cfg.Systemd.IsActive(ctx, "coredns.service") {
+	if !loopback || n.cfg.Systemd == nil {
+		n.cycles.WithLabelValues(checkCoreDNS, "ok").Inc()
+		return
+	}
+	// Fail closed on probe errors: an unanswerable `cat`/is-active
+	// used to read as absent/active — an error now counts as
+	// present+active so a broken systemctl can never trigger (or
+	// skip-gate) a coredns restart on a lie.
+	exists, err := n.cfg.Systemd.Exists(ctx, "coredns.service")
+	if err != nil {
+		slog.Warn("nethealth: coredns existence probe failed — "+
+			"treating unit as present this cycle (fail closed)",
+			"subsystem", "nethealth", "unit", "coredns.service",
+			"error", err)
+		exists = true
+	}
+	if !exists {
+		n.cycles.WithLabelValues(checkCoreDNS, "ok").Inc()
+		return
+	}
+	active, err := n.cfg.Systemd.Active(ctx, "coredns.service")
+	if err != nil {
+		slog.Warn("nethealth: coredns is-active probe failed — "+
+			"treating unit as active this cycle (fail closed)",
+			"subsystem", "nethealth", "unit", "coredns.service",
+			"error", err)
+		active = true
+	}
+	if active {
 		n.cycles.WithLabelValues(checkCoreDNS, "ok").Inc()
 		return
 	}
@@ -834,9 +889,19 @@ func (n *NetHealth) checkCoreDNSStub(ctx context.Context) {
 
 // --- Check: overlay-egress (12-overlay-egress.sh) ---
 
-// ip runs the host `ip` tool through the runner seam.
+// ip runs the host `ip` tool through the runner seam. Failures are
+// debug-logged here so the many best-effort callers that drop the
+// error (rule adds/dels during drift heal, probe-window swaps) still
+// leave a diagnostic trail — the callers that handle the error get
+// it returned as before.
 func (n *NetHealth) ip(ctx context.Context, args ...string) (string, error) {
-	return n.cfg.runHostCmd(ctx, append([]string{"ip"}, args...))
+	out, err := n.cfg.runHostCmd(ctx, append([]string{"ip"}, args...))
+	if err != nil {
+		slog.Debug("nethealth: host ip command failed",
+			"subsystem", "nethealth", "args", args,
+			"output", trimRunErr(out), "error", err)
+	}
+	return out, err
 }
 
 // ipRuleDel1500 removes a pref-1500 rule for ip across the given
@@ -914,6 +979,8 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 
 	rules, err := n.ip(ctx, "rule", "list")
 	if err != nil {
+		n.appendLog(fmt.Sprintf(
+			"overlay-egress: ip rule list failed: %v — cycle aborted", err))
 		n.cycles.WithLabelValues(checkEgress, "abort").Inc()
 		return
 	}
@@ -1148,9 +1215,11 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 		reason = fmt.Sprintf("nebula-no-socket udp/%d not bound", wd.NebulaPort)
 	case !n.hasIPv4Addr(ctx, wd.NebulaDev):
 		reason = fmt.Sprintf("nebula-no-tun-addr dev=%s", wd.NebulaDev)
-	case wd.NebulaStatsURL != "" &&
-		n.cfg.probeHTTP(ctx, wd.NebulaStatsURL, 5*time.Second) != nil:
-		reason = fmt.Sprintf("nebula-stats-dead %s", wd.NebulaStatsURL)
+	case wd.NebulaStatsURL != "":
+		if err := n.cfg.probeHTTP(ctx, wd.NebulaStatsURL, 5*time.Second); err != nil {
+			reason = fmt.Sprintf("nebula-stats-dead %s: %v",
+				wd.NebulaStatsURL, err)
+		}
 	}
 
 	// Dataplane probes — ONLY while nebula is the active overlay.
@@ -1312,11 +1381,34 @@ var (
 // latch; per-jail banned counts go to fail2ban-banned for the
 // node_fail2ban_banned_ips metric.
 func (n *NetHealth) checkFail2ban(ctx context.Context) {
-	if n.cfg.Systemd == nil || !n.cfg.Systemd.UnitExists("fail2ban.service") {
+	if n.cfg.Systemd == nil {
 		n.cycles.WithLabelValues(checkF2B, "gated").Inc()
 		return
 	}
-	if !n.cfg.Systemd.IsActive(ctx, "fail2ban.service") {
+	// Fail closed like coredns-stub: a failed existence probe counts
+	// as present (the check still runs its other evidence — the
+	// banned-metrics collector below does not need systemd), and a
+	// failed is-active leaves the down-latch untouched rather than
+	// entering or clearing it on a guess.
+	exists, err := n.cfg.Systemd.Exists(ctx, "fail2ban.service")
+	if err != nil {
+		slog.Warn("nethealth: fail2ban existence probe failed — "+
+			"treating unit as present this cycle (fail closed)",
+			"subsystem", "nethealth", "unit", "fail2ban.service",
+			"error", err)
+		exists = true
+	}
+	if !exists {
+		n.cycles.WithLabelValues(checkF2B, "gated").Inc()
+		return
+	}
+	active, err := n.cfg.Systemd.Active(ctx, "fail2ban.service")
+	if err != nil {
+		slog.Warn("nethealth: fail2ban is-active probe failed — "+
+			"down-latch left unchanged this cycle (fail closed)",
+			"subsystem", "nethealth", "unit", "fail2ban.service",
+			"error", err)
+	} else if !active {
 		n.appendLog("suspect: fail2ban-down (unit exists but service inactive)")
 		n.stateEnter("fail2ban-down", "service=inactive")
 	} else {
@@ -1327,6 +1419,9 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 	if err != nil {
 		// Client missing/failed → remove the metric file (no stale
 		// series — absent, not 0).
+		n.appendLog(fmt.Sprintf(
+			"fail2ban: fail2ban-client status failed: %v (%s) — banned metrics dropped",
+			err, trimRunErr(out)))
 		_ = os.Remove(bannedFile)
 		n.cycles.WithLabelValues(checkF2B, "ok").Inc()
 		return
@@ -1490,6 +1585,9 @@ func (n *NetHealth) checkConntrack(ctx context.Context) {
 	used, errU := strconv.ParseFloat(usedStr, 64)
 	max, errM := strconv.ParseFloat(maxStr, 64)
 	if errU != nil || errM != nil || max <= 0 {
+		n.appendLog(fmt.Sprintf(
+			"conntrack-guard: unparseable conntrack values count=%q max=%q — cycle aborted",
+			usedStr, maxStr))
 		n.cycles.WithLabelValues(checkCT, "abort").Inc()
 		return
 	}

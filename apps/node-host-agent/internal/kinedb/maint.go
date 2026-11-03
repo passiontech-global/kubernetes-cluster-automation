@@ -54,9 +54,9 @@ func (k *KineDB) maintCycle(ctx context.Context) *maintResult {
 	pg := k.pgContainerName(ctx)
 	switch {
 	case !credOK:
-		note("missing .env creds")
+		note(fmt.Sprintf("missing .env creds (%s)", k.cfg.EnvFile))
 	case !k.containerRunning(ctx, pg):
-		note("postgres container down")
+		note(fmt.Sprintf("postgres container %s down", pg))
 	default:
 		k.maintRun(ctx, pg, user, pass, res, note)
 	}
@@ -81,7 +81,7 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 		"-qc", fmt.Sprintf("REINDEX TABLE CONCURRENTLY %s", k.cfg.Table)), ""); err == nil {
 		res.okReindex = true
 	} else {
-		note("reindex-fail")
+		note(fmt.Sprintf("reindex-fail: %v", err))
 	}
 
 	// (b) sizes + dead-tuple estimate from pg_stat_user_tables.
@@ -99,10 +99,10 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 			res.indexBytes = idx
 			res.deadPct = deadTuplePct(dead, live)
 		} else {
-			note("sizes-unparsed")
+			note(fmt.Sprintf("sizes-unparsed: %v", perr))
 		}
 	} else {
-		note("sizes-fail")
+		note(fmt.Sprintf("sizes-fail: %v", err))
 	}
 
 	// (c) pg_repack ONLY when the heap is genuinely bloated —
@@ -111,16 +111,24 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 		res.heapBytes <= k.cfg.RepackMinHeapBytes {
 		return
 	}
-	repackBin, _ := k.exec(ctx, []string{k.cfg.Runtime, "exec", pg,
+	repackBin, rerr := k.exec(ctx, []string{k.cfg.Runtime, "exec", pg,
 		"sh", "-c", repackGlob}, "")
+	if rerr != nil {
+		// A failed lookup reads identically to "no binary
+		// installed" below — record which it was.
+		note(fmt.Sprintf("repack-lookup-fail: %v", rerr))
+	}
 	repackBin = strings.TrimSpace(repackBin)
 	if repackBin == "" {
 		res.repackState = "no-binary"
-		note("repack-needed-no-binary")
+		note(fmt.Sprintf(
+			"repack-needed-no-binary (heap=%dB dead=%d%%)", res.heapBytes, res.deadPct))
 		return
 	}
-	_, _ = k.exec(ctx, k.psqlArgs(pg, user, pass, false,
-		"-qc", "CREATE EXTENSION IF NOT EXISTS pg_repack"), "")
+	if _, err := k.exec(ctx, k.psqlArgs(pg, user, pass, false,
+		"-qc", "CREATE EXTENSION IF NOT EXISTS pg_repack"), ""); err != nil {
+		note(fmt.Sprintf("repack-ext-fail: %v", err))
+	}
 	if _, err := k.execLong(ctx, []string{k.cfg.Runtime, "exec",
 		"-e", "PGPASSWORD=" + pass, pg, repackBin,
 		"-h", "127.0.0.1", "-U", user, "-d", "postgres",
@@ -130,7 +138,7 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 	} else {
 		res.okRepack = false
 		res.repackState = "fail"
-		note("repack-fail")
+		note(fmt.Sprintf("repack-fail: %v", err))
 	}
 }
 

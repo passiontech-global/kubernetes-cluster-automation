@@ -294,6 +294,9 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 	uStart, err := s.cfg.statfsFn(s.cfg.BaseDir)
 	if err == nil {
 		log.Info("nodefs used before sweep", "gib", float64(uStart)/(1<<30))
+	} else {
+		log.Debug("nodefs statfs failed — before/after usage unavailable",
+			"base", s.cfg.BaseDir, "error", err)
 	}
 
 	// PV list once per cycle. An empty list while pvc-* dirs exist on
@@ -369,6 +372,13 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 			// Bound/Available/Retain → dir in use or owned data, skip.
 			if pv.Status.Phase != corev1.VolumeReleased ||
 				pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimDelete {
+				// The steady state for every dir bound to a live PV —
+				// Debug, not Info, or a healthy node would log every
+				// pvc-* dir every cycle.
+				log.Debug("SKIP: PV exists, not Released+Delete — dir in use",
+					"dir", name, "pv", name,
+					"phase", pv.Status.Phase,
+					"reclaimPolicy", pv.Spec.PersistentVolumeReclaimPolicy)
 				s.skips.WithLabelValues(skipPVInUse).Inc()
 				continue
 			}
@@ -433,6 +443,8 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 			Get(apiCtx, name, metav1.GetOptions{})
 		cancel()
 		if err == nil {
+			log.Info("SKIP: PV still present on re-GET — dir kept",
+				"dir", name, "pv", name)
 			s.skips.WithLabelValues(skipPVStillPresent).Inc()
 			continue
 		}

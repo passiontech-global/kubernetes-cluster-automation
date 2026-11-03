@@ -40,6 +40,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -138,7 +139,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 
 	ids, err := a.dyn.Resource(ciliumIdentityGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return err // wrapper IncErrors — a returned error must not count itself
+		return fmt.Errorf("list ciliumidentities: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
 	// Keep only name → creationTimestamp: the audit never reads
 	// identity bodies beyond the age gate, and dropping the whole
@@ -154,7 +155,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	eps, err := a.dyn.Resource(ciliumEndpointGVR).Namespace(metav1.NamespaceAll).
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return err // wrapper IncErrors — a returned error must not count itself
+		return fmt.Errorf("list ciliumendpoints: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
 	for i := range eps.Items {
 		if id := endpointIdentityID(&eps.Items[i]); id != "" {
@@ -172,7 +173,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 			FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
 		})
 	if err != nil {
-		return err // wrapper IncErrors — a returned error must not count itself
+		return fmt.Errorf("list pods: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
 	for i := range pods.Items {
 		p := &pods.Items[i]
@@ -277,7 +278,7 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 	// Ready".
 	nodes, err := shared.ListNodes(ctx, a.cs)
 	if err != nil {
-		return err // propagates to run()'s return — wrapper IncErrors
+		return fmt.Errorf("list nodes: %w", err) // propagates to run()'s return — wrapper IncErrors
 	}
 	if len(nodes) == 0 {
 		log.Info("GC SKIP: no nodes listed — cannot verify cluster health",
@@ -305,7 +306,9 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 		if err := a.dyn.Resource(ciliumIdentityGVR).
 			Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
 			if apierrors.IsNotFound(err) {
-				continue // raced with cilium's own GC — already gone
+				log.Info("SKIP: identity already gone — raced with cilium's own GC",
+					"identity", name)
+				continue
 			}
 			metrics.IncError(ciliumAuditQueue)
 			log.Error(err, "identity delete failed", "identity", name)

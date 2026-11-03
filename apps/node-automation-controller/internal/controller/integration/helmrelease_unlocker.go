@@ -215,7 +215,8 @@ func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructur
 		}
 		lastErr = err
 	}
-	return nil, schema.GroupVersionResource{}, lastErr
+	return nil, schema.GroupVersionResource{},
+		fmt.Errorf("list helmreleases (all known GVRs failed): %w", lastErr)
 }
 
 // hrStuckInProgress reports whether the HR's Ready condition is False
@@ -232,7 +233,7 @@ func (u *helmReleaseUnlocker) helmControllerDown(ctx context.Context) (bool, err
 	pods, err := u.cs.CoreV1().Pods(helmControllerNS).List(ctx,
 		metav1.ListOptions{LabelSelector: helmControllerSel})
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("list helm-controller pods: %w", err)
 	}
 	for i := range pods.Items {
 		statuses := append([]corev1.ContainerStatus{},
@@ -240,6 +241,9 @@ func (u *helmReleaseUnlocker) helmControllerDown(ctx context.Context) (bool, err
 		statuses = append(statuses, pods.Items[i].Status.ContainerStatuses...)
 		for _, s := range statuses {
 			if s.State.Waiting != nil && s.State.Waiting.Reason == "CrashLoopBackOff" {
+				logf.FromContext(ctx).Info("helm-controller pod CrashLoopBackOff",
+					"pod", helmControllerNS+"/"+pods.Items[i].Name,
+					"container", s.Name)
 				return true, nil
 			}
 		}
@@ -266,7 +270,8 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	secrets, err := u.cs.CoreV1().Secrets(hrTargetNS(hr)).List(ctx,
 		metav1.ListOptions{LabelSelector: "owner=helm,name=" + release})
 	if err != nil {
-		return false, fmt.Errorf("list release secrets: %w", err)
+		return false, fmt.Errorf("list release secrets in %s for %s: %w",
+			hrTargetNS(hr), release, err)
 	}
 
 	var pending *corev1.Secret

@@ -522,11 +522,12 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 	// api-lb VMs — the fallback layer below the env vars for the
 	// socket/backend/backends/mode/token/ca knobs (env → guard.conf
 	// → compiled default). Absent elsewhere — zero value.
-	guardConf, gerr := apiprober.LoadGuardConf(
-		getenv("NODE_HOST_AGENT_API_GUARD_CONF", "/etc/api-backend-guard.conf"))
+	guardConfPath := getenv("NODE_HOST_AGENT_API_GUARD_CONF",
+		"/etc/api-backend-guard.conf")
+	guardConf, gerr := apiprober.LoadGuardConf(guardConfPath)
 	if gerr != nil {
 		slog.Error("api-backend-guard.conf parse failed — running on defaults",
-			"error", gerr)
+			"path", guardConfPath, "error", gerr)
 		guardConf = apiprober.GuardDefaults{}
 	}
 	apiproberEnabled := getenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto") != "false"
@@ -968,9 +969,18 @@ func main() {
 		namespace, version, metricsAddr, probeAddr, standaloneFlag)
 	a := agent.New(cfg)
 
+	// The enabled set is an operator's first question when a check
+	// misbehaves — list every subsystem that actually wired up
+	// (env/auto gates resolved, setup errors already logged above).
+	subsystems := make([]string, 0, len(cfg.Subsystems))
+	for _, s := range cfg.Subsystems {
+		subsystems = append(subsystems, s.Name())
+	}
 	slog.Info("starting node-host-agent",
 		"version", version, "node", a.NodeName(), "pod", podName,
-		"standalone", standaloneFlag, "apiprober", apiproberEnabled)
+		"standalone", standaloneFlag, "metricsAddr", metricsAddr,
+		"probeAddr", probeAddr, "subsystems", subsystems,
+		"apiprober", apiproberEnabled)
 	if err := a.Run(ctx); err != nil {
 		slog.Error("agent exited", "error", err)
 		os.Exit(1)

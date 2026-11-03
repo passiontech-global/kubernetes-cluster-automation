@@ -344,7 +344,9 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 		switch {
 		case apierrors.IsNotFound(err):
 		case err != nil:
-			return err // periodic loop meters/logs — nothing to act on without it
+			// periodic loop meters/logs — nothing to act on without it
+			return fmt.Errorf("get endpoints %s/%s: %w",
+				endpointGuardNS, endpointGuardName, err)
 		default:
 			ep = e
 		}
@@ -698,6 +700,8 @@ func (g *apiServerEndpointGuard) endpointMode() (bool, error) {
 	}
 	use := minor >= endpointSliceSinceMinor
 	g.sliceMode = &use
+	g.log.Info("endpoint SSOT detected — quarantine edits target this object",
+		"serverMinor", minor, "endpointSliceSSOT", use)
 	return use, nil
 }
 

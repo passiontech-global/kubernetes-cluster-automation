@@ -346,7 +346,7 @@ func readFileT(t *testing.T, path string) string {
 func TestCoreDNSStubRestart(t *testing.T) {
 	e := fixture(t, nil)
 	writeFile(t, e.resv, "nameserver 127.0.0.1\nnameserver 10.1.1.1\n")
-	e.sdReply["cat coredns.service"] = "# unit\n"
+	e.sdReply["LoadState --value coredns.service"] = "loaded\n"
 	e.sdReply["is-active coredns.service"] = "inactive\n"
 	e.n.Cycle(context.Background())
 	if !e.sdRan("restart coredns.service") {
@@ -363,7 +363,7 @@ func TestCoreDNSStubRestart(t *testing.T) {
 func TestCoreDNSStubNoLoopbackNoRestart(t *testing.T) {
 	e := fixture(t, nil)
 	writeFile(t, e.resv, "nameserver 10.1.1.1\n")
-	e.sdReply["cat coredns.service"] = "# unit\n"
+	e.sdReply["LoadState --value coredns.service"] = "loaded\n"
 	e.sdReply["is-active coredns.service"] = "inactive\n"
 	e.n.Cycle(context.Background())
 	if e.sdRan("coredns") {
@@ -639,7 +639,7 @@ func TestNebulaSlowpathAndSiteedge(t *testing.T) {
 
 func TestFail2banDownAndBans(t *testing.T) {
 	e := fixture(t, nil)
-	e.sdReply["cat fail2ban.service"] = "# unit\n"
+	e.sdReply["LoadState --value fail2ban.service"] = "loaded\n"
 	e.sdReply["is-active fail2ban.service"] = "inactive\n"
 	e.cmdReply["fail2ban-client status"] =
 		"Status\n|- Number of jail:\t2\n`- Jail list:\tsshd, recidive\n"
@@ -787,7 +787,7 @@ func TestClockSyncPrefersEnabledDaemonOverInstalled(t *testing.T) {
 	// is the live daemon.
 	e.sdReply["is-enabled chrony.service"] = "enabled\n"
 	e.sdReply["is-active chrony.service"] = "active\n"
-	e.sdReply["cat systemd-timesyncd.service"] = "# unit\n"
+	e.sdReply["LoadState --value systemd-timesyncd.service"] = "loaded\n"
 	e.sdReply["restart chrony.service"] = ""
 	e.n.Cycle(context.Background())
 	e.n.Cycle(context.Background())
@@ -910,7 +910,7 @@ func TestConntrackFlushMissingBinaryOnlyLogs(t *testing.T) {
 func TestConntrackFlushOnCoreDNSRestart(t *testing.T) {
 	e := fixture(t, nil)
 	writeFile(t, e.resv, "nameserver 127.0.0.1\nnameserver 10.1.1.1\n")
-	e.sdReply["cat coredns.service"] = "# unit\n"
+	e.sdReply["LoadState --value coredns.service"] = "loaded\n"
 	e.sdReply["is-active coredns.service"] = "inactive\n"
 	e.sdReply["restart coredns.service"] = ""
 	e.n.Cycle(context.Background())

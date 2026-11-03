@@ -159,7 +159,7 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 
 	nodes, err := shared.ListNodes(ctx, e.cs)
 	if err != nil {
-		return err
+		return fmt.Errorf("list nodes: %w", err)
 	}
 	byName := make(map[string]*corev1.Node, len(nodes))
 	flagged := map[string]bool{}
@@ -180,7 +180,7 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 				log.Error(err, "untaint failed", "node", n.Name)
 				continue
 			}
-			log.Info(fmt.Sprintf("UNTAINT %s: network partition cleared", n.Name))
+			log.Info("UNTAINT: network partition cleared", "node", n.Name)
 		}
 	}
 
@@ -189,19 +189,21 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		log.Info("OK: no partitioned nodes")
 		return nil
 	}
-	// Mesh-wide guard: >50% flagged (or all) means the partition is not
-	// node-local — evicting just churns pods between broken nodes.
-	total := len(nodes)
-	if nFlagged*2 > total || nFlagged >= total {
-		log.Info(fmt.Sprintf("ABORT: %d/%d nodes flagged — mesh-wide partition, no evict", nFlagged, total))
-		return nil
-	}
 
 	names := make([]string, 0, nFlagged)
 	for name := range flagged {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+
+	// Mesh-wide guard: >50% flagged (or all) means the partition is not
+	// node-local — evicting just churns pods between broken nodes.
+	total := len(nodes)
+	if nFlagged*2 > total || nFlagged >= total {
+		log.Info("ABORT: nodes flagged — mesh-wide partition, no evict",
+			"flagged", nFlagged, "total", total, "nodes", names)
+		return nil
+	}
 
 	// Resolve the eviction set once per run: the env allow-list plus
 	// the annotation opt-in (checked per pod inside the loop). One
@@ -219,7 +221,7 @@ loop:
 				metrics.IncError(partitionEvictorQueue)
 				log.Error(err, "taint failed", "node", name)
 			} else {
-				log.Info(fmt.Sprintf("TAINT %s: network partitioned -> NoSchedule", name))
+				log.Info("TAINT: network partitioned -> NoSchedule", "node", name)
 			}
 		}
 		pods, err := e.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
@@ -233,7 +235,8 @@ loop:
 		for i := range pods.Items {
 			p := &pods.Items[i]
 			if evicted >= partitionEvictCap {
-				log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", partitionEvictCap))
+				log.Info("SKIP rest: cap reached", "cap", partitionEvictCap,
+					"node", name)
 				break loop
 			}
 			// Belt: the spec.nodeName field selector scopes the
@@ -246,14 +249,16 @@ loop:
 			if !partitionEvictable(p, namespaces) {
 				continue
 			}
-			log.Info(fmt.Sprintf("EVICT %s/%s off %s (partitioned)", p.Namespace, p.Name, name))
+			log.Info("EVICT: pod off partitioned node",
+				"pod", p.Namespace+"/"+p.Name, "node", name)
 			if err := e.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
 				metrics.IncError(partitionEvictorQueue)
-				log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name)
+				log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name,
+					"node", name)
 			}
 			evicted++ // bash counts the attempt against the cap too
 		}
 	}
-	log.Info(fmt.Sprintf("sweep done: evicted %d pod(s) off %d flagged node(s)", evicted, nFlagged))
+	log.Info("sweep done", "evicted", evicted, "flaggedNodes", nFlagged)
 	return nil
 }

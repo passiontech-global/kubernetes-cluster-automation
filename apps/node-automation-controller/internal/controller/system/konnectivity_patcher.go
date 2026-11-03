@@ -15,6 +15,7 @@ package system
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -69,19 +70,23 @@ func (r *konnectivityPatcher) Reconcile(ctx context.Context, _ reconcile.Request
 	ds, err := r.cs.AppsV1().DaemonSets("kube-system").
 		Get(ctx, "konnectivity-agent", metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return res, nil // DS may not exist (cluster without konnectivity)
+		// DS may not exist (cluster without konnectivity)
+		log.Info("SKIP: daemonset not found", "daemonset", "kube-system/konnectivity-agent")
+		return res, nil
 	}
 	if err != nil {
 		metrics.IncError("konnectivity-patcher")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("get daemonset kube-system/konnectivity-agent: %w", err)
 	}
 
 	if !konnectivityDrifted(ds) {
-		log.Info("requests+priorityClassName already set - nothing to do")
+		log.Info("requests+priorityClassName already set - nothing to do",
+			"daemonset", "kube-system/konnectivity-agent")
 		return res, nil
 	}
 	if !shared.DaemonSetSettled(ds) {
 		log.Info("SKIP: drifted but rollout in progress",
+			"daemonset", "kube-system/konnectivity-agent",
 			"generation", ds.Generation,
 			"observedGeneration", ds.Status.ObservedGeneration,
 			"updated", ds.Status.UpdatedNumberScheduled,
@@ -96,7 +101,7 @@ func (r *konnectivityPatcher) Reconcile(ctx context.Context, _ reconcile.Request
 		"konnectivity-agent", types.StrategicMergePatchType,
 		konnectivityPatch, metav1.PatchOptions{}); err != nil {
 		metrics.IncError("konnectivity-patcher")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("patch daemonset kube-system/konnectivity-agent: %w", err)
 	}
 	return res, nil
 }

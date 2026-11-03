@@ -39,6 +39,7 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -114,7 +115,7 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	// cordoned_node_blocked series mid-incident.
 	nodes, err := shared.ListNodes(ctx, w.cs)
 	if err != nil {
-		return err
+		return fmt.Errorf("list nodes: %w", err)
 	}
 	anyCordoned := false
 	for i := range nodes {
@@ -128,7 +129,7 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	pdbs, err := w.cs.PolicyV1().PodDisruptionBudgets(metav1.NamespaceAll).
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("list poddisruptionbudgets: %w", err)
 	}
 
 	now := w.nowFn()

@@ -48,6 +48,7 @@ func (s *Syncer) Cycle(ctx context.Context) {
 		}
 	}
 
+	var converged, skipped, failed int
 	for _, t := range targets {
 		if ctx.Err() != nil {
 			return
@@ -56,18 +57,24 @@ func (s *Syncer) Cycle(ctx context.Context) {
 			s.cfg.Log.Error("hubsync: api-lb target skipped — guard credentials unavailable",
 				"target", t.Name, "ip", t.IP)
 			s.cycles.WithLabelValues(t.Name, "secret_error").Inc()
+			skipped++
 			continue
 		}
 		if err := s.syncTarget(ctx, t, token, ca); err != nil {
 			s.cfg.Log.Error("hubsync: target converge failed",
 				"target", t.Name, "ip", t.IP, "error", err)
 			s.cycles.WithLabelValues(t.Name, "error").Inc()
+			failed++
 			continue
 		}
 		s.cycles.WithLabelValues(t.Name, "ok").Inc()
 		s.lastSuccess.WithLabelValues(t.Name).SetToCurrentTime()
 		s.cfg.Log.Info("hubsync: target converged", "target", t.Name, "ip", t.IP)
+		converged++
 	}
+	s.cfg.Log.Info("hubsync: converge cycle complete",
+		"targets", len(targets), "converged", converged,
+		"skipped", skipped, "failed", failed)
 }
 
 func anyAPILB(targets []Target) bool {
@@ -151,6 +158,8 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte) err
 			return err
 		}
 		binaryUpdated = true
+		s.cfg.Log.Info("hubsync: binary updated",
+			"target", t.Name, "path", cfg.RemoteBinary)
 	}
 
 	// b. config dirs — per-file sha256 gating, atomic writes.
@@ -191,6 +200,8 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte) err
 			bytes.NewReader([]byte(unit)), "0644"); err != nil {
 			return err
 		}
+		s.cfg.Log.Info("hubsync: systemd unit updated",
+			"target", t.Name, "path", cfg.UnitPath)
 		if _, err := conn.Run(tctx, "systemctl daemon-reload"); err != nil {
 			return err
 		}
@@ -203,6 +214,8 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte) err
 		if _, err := conn.Run(tctx, "systemctl restart "+svc); err != nil {
 			return err
 		}
+		s.cfg.Log.Info("hubsync: service restarted after update",
+			"target", t.Name, "unit", svc)
 	} else {
 		if _, err := conn.Run(tctx, "systemctl enable --now "+svc); err != nil {
 			return err

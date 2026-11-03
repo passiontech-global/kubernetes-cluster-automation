@@ -91,7 +91,12 @@ func (w *DirWatcher) fingerprint() string {
 	var files []string
 	for _, d := range w.Dirs {
 		_ = filepath.WalkDir(d, func(p string, e fs.DirEntry, err error) error {
-			if err == nil && !e.IsDir() {
+			if err != nil {
+				slog.Debug("hostconfig: watcher walk error — entry skipped",
+					"dir", d, "path", p, "error", err)
+				return nil
+			}
+			if !e.IsDir() {
 				files = append(files, p)
 			}
 			return nil
@@ -101,6 +106,8 @@ func (w *DirWatcher) fingerprint() string {
 	for _, f := range files {
 		b, err := os.ReadFile(f)
 		if err != nil {
+			slog.Debug("hostconfig: watcher cannot read file — excluded from fingerprint",
+				"file", f, "error", err)
 			continue
 		}
 		h.Write([]byte(f))
@@ -295,7 +302,8 @@ func (r *Reconciler) Run(ctx context.Context) {
 			r.Cycle(ctx)
 		case <-p.C:
 			if r.cfg.Watcher != nil && r.cfg.Watcher.Changed() {
-				slog.Info("hostconfig: vars/certs changed — converging", "subsystem", "hostconfig")
+				slog.Info("hostconfig: vars/certs changed — converging",
+					"subsystem", "hostconfig", "node", r.cfg.NodeName)
 				r.Cycle(ctx)
 			}
 		}
@@ -307,9 +315,15 @@ func (r *Reconciler) hp(p string) string {
 	return filepath.Join(r.cfg.HostRoot, p)
 }
 
-// run is a runner shorthand — failures are logged, not fatal.
+// run is a runner shorthand — failures are logged at Debug (the
+// caller decides which failures deserve a Warn) and never fatal.
 func (r *Reconciler) run(ctx context.Context, name string, args ...string) (string, error) {
-	return r.cfg.Runner.Run(ctx, name, args...)
+	out, err := r.cfg.Runner.Run(ctx, name, args...)
+	if err != nil {
+		slog.Debug("hostconfig: host command failed",
+			"cmd", name+" "+strings.Join(args, " "), "out", out, "error", err)
+	}
+	return out, err
 }
 
 // writeManaged writes content to HostRoot+path atomically when it
@@ -327,7 +341,7 @@ func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode)
 			mode = st.Mode().Perm()
 		}
 	} else if !os.IsNotExist(err) {
-		slog.Warn("hostconfig: write managed file failed", "path", path, "error", err)
+		slog.Warn("hostconfig: read managed file failed", "path", path, "error", err)
 		return false, err
 	}
 	fail := func(err error) (bool, error) {
@@ -356,6 +370,10 @@ func (r *Reconciler) removeManaged(path string) (bool, error) {
 	dst := r.hp(path)
 	fi, err := os.Lstat(dst)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("hostconfig: remove stat failed — treating as absent",
+				"path", path, "error", err)
+		}
 		return false, nil
 	}
 	if fi.IsDir() {
@@ -383,13 +401,18 @@ func (r *Reconciler) fileExists(path string) bool {
 	return err == nil
 }
 
-// render renders an embedded .j2 template against ctx.
+// render renders an embedded .j2 template against ctx. Lookup hooks
+// are rooted at VarsDir (same convention topology.Load uses for the
+// vars files) so lookup('file', 'ca.crt') in a template resolves the
+// mounted ConfigMap file; lookups that cannot be honoured now error
+// the render instead of silently emitting "".
 func (r *Reconciler) render(name string, ctx map[string]any) ([]byte, error) {
 	text, err := templates.ReadFile("templates/" + name)
 	if err != nil {
 		return nil, err
 	}
-	out, err := topology.Render(string(text), ctx, nil)
+	out, err := topology.Render(string(text), ctx,
+		topology.NewEnv(r.cfg.VarsDir, r.cfg.NowFn))
 	if err != nil {
 		return nil, fmt.Errorf("render %s: %w", name, err)
 	}

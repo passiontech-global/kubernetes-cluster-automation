@@ -120,6 +120,7 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 // fetchIndex lists the team's pipelines, then each pipeline's
 // resources, keeping only resources whose source points at a repo.
 func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
+	start := time.Now()
 	var pipelines []struct {
 		Name string `json:"name"`
 	}
@@ -160,6 +161,10 @@ func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 		// "fetched" for the TTL check and the stale fallback.
 		index = []Resource{}
 	}
+	slog.Info("resource index refreshed",
+		"concourse_url", c.BaseURL, "team", c.Team,
+		"pipelines", len(pipelines), "resources", len(index),
+		"duration", time.Since(start).Round(time.Millisecond))
 	return index, nil
 }
 

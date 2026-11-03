@@ -19,6 +19,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -98,7 +99,7 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 			log.Info("skip: external-secrets CRDs not installed")
 			return nil
 		}
-		return err
+		return fmt.Errorf("list clustersecretstores: %w", err)
 	}
 
 	recovered := false
@@ -140,7 +141,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context) error {
 			log.Info("skip: external-secrets CRDs not installed")
 			return nil
 		}
-		return err
+		return fmt.Errorf("list externalsecrets: %w", err)
 	}
 	now := time.Now()
 	// Drop nudged entries past the cooldown or whose ExternalSecret
@@ -160,7 +161,8 @@ func (n *externalSecretNudge) nudge(ctx context.Context) error {
 	for i := range list.Items {
 		es := &list.Items[i]
 		key := es.GetNamespace() + "/" + es.GetName()
-		if status, _ := readyCond(es); status != "False" {
+		status, readyMsg := readyCond(es)
+		if status != "False" {
 			continue
 		}
 		since, ok := readySince(es)
@@ -190,7 +192,9 @@ func (n *externalSecretNudge) nudge(ctx context.Context) error {
 		}
 		n.nudged[key] = now
 		nudgedNow++
-		log.Info("ACTION: force-sync ExternalSecret", "es", key)
+		log.Info("ACTION: force-sync ExternalSecret", "es", key,
+			"stuckFor", now.Sub(since).Truncate(time.Minute),
+			"readyMsg", readyMsg)
 	}
 	log.Info("sweep done", "nudged", nudgedNow)
 	return nil

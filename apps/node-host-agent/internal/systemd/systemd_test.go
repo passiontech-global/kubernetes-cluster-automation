@@ -80,15 +80,102 @@ func TestIsActive(t *testing.T) {
 	}
 }
 
+func TestActiveSeparatesStateFromProbeFailure(t *testing.T) {
+	f := newFake()
+	c := New(Config{HostRoot: "/", RunCmd: f.run})
+	ctx := context.Background()
+	// `is-active` exits non-zero for every non-active state — a real
+	// state word on stdout is a definitive "down", NOT a probe error.
+	f.reply["is-active coredns.service"] = "inactive\n"
+	if active, err := c.Active(ctx, "coredns.service"); err != nil || active {
+		t.Fatalf("Active(inactive)=%v,%v want false,nil", active, err)
+	}
+	// An error with no state word means the check itself failed —
+	// the caller must see the error, not a bare false.
+	f.fail["is-active dbus.service"] = true
+	if _, err := c.Active(ctx, "dbus.service"); err == nil {
+		t.Fatal("broken systemctl want Active error")
+	}
+	// Garbage output without an error is still not a state word.
+	f.reply["is-active weird.service"] = "??\n"
+	if _, err := c.Active(ctx, "weird.service"); err == nil {
+		t.Fatal("unparseable is-active output want Active error")
+	}
+}
+
 func TestUnitExists(t *testing.T) {
 	f := newFake()
-	f.fail["cat missing.service"] = true
+	f.reply["LoadState --value k0sworker.service"] = "loaded\n"
+	f.reply["LoadState --value missing.service"] = "not-found\n"
 	c := New(Config{HostRoot: "/", RunCmd: f.run})
 	if !c.UnitExists("k0sworker.service") {
 		t.Fatal("present unit reported missing")
 	}
 	if c.UnitExists("missing.service") {
 		t.Fatal("absent unit reported present")
+	}
+	// Probe failure folds to false for the bool wrapper...
+	f.fail["LoadState --value coredns.service"] = true
+	if c.UnitExists("coredns.service") {
+		t.Fatal("errored LoadState probe reported present")
+	}
+	// ...but Exists surfaces it so gates can fail closed.
+	if _, err := c.Exists(context.Background(), "coredns.service"); err == nil {
+		t.Fatal("broken systemctl want Exists error")
+	}
+	exists, err := c.Exists(context.Background(), "k0sworker.service")
+	if err != nil || !exists {
+		t.Fatalf("Exists(loaded)=%v,%v want true,nil", exists, err)
+	}
+	exists, err = c.Exists(context.Background(), "missing.service")
+	if err != nil || exists {
+		t.Fatalf("Exists(not-found)=%v,%v want false,nil", exists, err)
+	}
+}
+
+func TestExistsLoadStateClassification(t *testing.T) {
+	f := newFake()
+	c := New(Config{HostRoot: "/", RunCmd: f.run})
+	ctx := context.Background()
+	// Every LoadState word systemd emits: only a working, loaded
+	// definition counts as present — masked/bad-setting/stub units
+	// exist on disk (or in the manager's references) but cannot be
+	// started, so the gate answers absent.
+	for _, tc := range []struct {
+		name  string
+		state string
+		want  bool
+	}{
+		{"loaded", "loaded\n", true},
+		{"merged", "merged\n", true},
+		{"stub", "stub\n", false},
+		{"not-found", "not-found\n", false},
+		{"bad-setting", "bad-setting\n", false},
+		{"error", "error\n", false},
+		{"masked", "masked\n", false},
+		{"empty", "", false},
+		{"whitespace", "  \n\t\n", false},
+		{"unrecognized", "frobnicate\n", false},
+	} {
+		key := "LoadState --value u.service"
+		if tc.state == "" {
+			delete(f.reply, key)
+		} else {
+			f.reply[key] = tc.state
+		}
+		got, err := c.Exists(ctx, "u.service")
+		if err != nil {
+			t.Fatalf("Exists(%s) err=%v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Fatalf("Exists(%s)=%v want %v", tc.name, got, tc.want)
+		}
+	}
+	// rc!=0 is probe failure, not a state answer — Exists reports
+	// the error so callers can fail closed.
+	f.fail["LoadState --value u.service"] = true
+	if _, err := c.Exists(ctx, "u.service"); err == nil {
+		t.Fatal("rc!=0 LoadState probe want Exists error")
 	}
 }
 

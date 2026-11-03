@@ -38,6 +38,7 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -116,7 +117,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 
 	nodes, err := shared.ListNodes(ctx, s.cs)
 	if err != nil {
-		return err
+		return fmt.Errorf("list nodes: %w", err)
 	}
 	nodeByName := make(map[string]*corev1.Node, len(nodes))
 	hasNotReady := false
@@ -152,7 +153,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// and the all-Ready happy path never consumes it. A stuck pod on
 	// a since-deleted node could only produce a skip-log anyway.
 	if !hasNotReady {
-		log.Info("sweep done", "untainted", untainted)
+		log.Info("sweep done — all nodes Ready", "untainted", untainted)
 		return nil
 	}
 
@@ -164,7 +165,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("list pods: %w", err)
 	}
 
 	// Count pods stuck in Terminating past the grace age, per node.
@@ -187,7 +188,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// release the full PodList before they run.
 	pods = nil
 	if len(stuck) == 0 {
-		log.Info("sweep done", "untainted", untainted)
+		log.Info("sweep done — no stuck Terminating pods", "untainted", untainted)
 		return nil
 	}
 
@@ -245,7 +246,8 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 
 		if err := shared.TaintNode(ctx, s.cs, nodeName, outOfServiceTaintKey,
 			outOfServiceTaintValue, corev1.TaintEffectNoExecute); err != nil {
-			log.Error(err, "out-of-service taint failed", "node", nodeName)
+			log.Error(err, "out-of-service taint failed", "node", nodeName,
+				"stuckPods", count)
 			metrics.IncError(deadNodeSweeperQueue)
 			continue
 		}
@@ -314,7 +316,7 @@ func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string)
 			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 				continue // CRD not installed on this cluster
 			}
-			return false, err
+			return false, fmt.Errorf("list %s: %w", gvr.Resource, err)
 		}
 		for i := range list.Items {
 			if list.Items[i].GetName() == nodeName {

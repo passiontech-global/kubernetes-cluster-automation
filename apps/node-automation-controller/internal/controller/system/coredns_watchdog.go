@@ -104,7 +104,7 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	if err != nil {
 		// Inconclusive — the next minute's run re-evaluates; returning
 		// nil avoids an error/retry hot loop on API flaps.
-		log.Info("ABORT: cannot list coredns pods (API flap) — inconclusive")
+		log.Info("ABORT: cannot list coredns pods (API flap) — inconclusive", "error", err)
 		return nil
 	}
 	podIP := map[string]string{}
@@ -225,7 +225,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 			if ago := time.Now().Unix() - ts; ago < corednsCooldownS {
 				metrics.IncError(corednsQueue)
 				log.Info("SKIP recovery: inside cooldown",
-					"agoS", ago, "cooldownS", corednsCooldownS)
+					"pods", suspects, "agoS", ago, "cooldownS", corednsCooldownS)
 				return nil
 			}
 		}
@@ -238,13 +238,15 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 	}
 	if notReady > 0 {
 		metrics.IncError(corednsQueue)
-		log.Info("SKIP recovery: nodes NotReady — cluster storm", "notReady", notReady)
+		log.Info("SKIP recovery: nodes NotReady — cluster storm",
+			"pods", suspects, "notReady", notReady)
 		return nil
 	}
 	// Fleet not fully ready = a rollout is already recreating pods.
 	if deploy.Status.ReadyReplicas < deploy.Status.Replicas {
 		metrics.IncError(corednsQueue)
 		log.Info("SKIP recovery: coredns not fully ready",
+			"pods", suspects,
 			"ready", deploy.Status.ReadyReplicas, "replicas", deploy.Status.Replicas)
 		return nil
 	}
@@ -297,24 +299,30 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 	if err != nil {
 		return fmt.Errorf("stamp cooldown annotation on deployment %s/coredns: %w", corednsNS, err)
 	}
-	log.Info("sweep done: stale coredns recovery issued")
+	log.Info("sweep done: stale coredns recovery issued", "pods", suspects)
 	return nil
 }
 
 // logHit returns the first last-10m log line matching the informer
 // death signature ("" = clean/unreadable). Bounded to 8s / 256KiB.
+// A stream/read failure is inconclusive, not clean — logged so a
+// broken pod-log path (RBAC, API flap) cannot silently disable
+// layer 1 while layers 2/3 keep reporting "fresh".
 func (w *coreDNSWatchdog) logHit(ctx context.Context, pod string) string {
+	log := logf.FromContext(ctx)
 	lctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	since := int64(corednsLogSinceS)
 	stream, err := w.cs.CoreV1().Pods(corednsNS).GetLogs(pod,
 		&corev1.PodLogOptions{SinceSeconds: &since}).Stream(lctx)
 	if err != nil {
+		log.Info("log: cannot stream pod logs — layer 1 inconclusive", "pod", pod, "error", err)
 		return ""
 	}
 	defer stream.Close()
 	data, err := io.ReadAll(io.LimitReader(stream, corednsMaxLogBytes))
 	if err != nil {
+		log.Info("log: cannot read pod log stream — layer 1 inconclusive", "pod", pod, "error", err)
 		return ""
 	}
 	for rest := string(data); rest != ""; {
@@ -331,8 +339,10 @@ func (w *coreDNSWatchdog) logHit(ctx context.Context, pod string) string {
 // Service <10m old having an EndpointSlice with a ready endpoint, or
 // "" when nothing qualifies (inconclusive).
 func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) string {
+	log := logf.FromContext(ctx)
 	svcs, err := w.cs.CoreV1().Services("").List(ctx, metav1.ListOptions{})
 	if err != nil {
+		log.Info("dns: cannot list services — layer 2 inconclusive", "error", err)
 		return ""
 	}
 	sort.Slice(svcs.Items, func(i, j int) bool {
@@ -367,6 +377,8 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) string {
 		eps, err := w.cs.DiscoveryV1().EndpointSlices(svc.ns).List(ctx,
 			metav1.ListOptions{LabelSelector: "kubernetes.io/service-name=" + svc.name})
 		if err != nil {
+			log.Info("dns: cannot list endpointslices — skipping probe candidate",
+				"service", svc.ns+"/"+svc.name, "error", err)
 			continue
 		}
 		for _, es := range eps.Items {

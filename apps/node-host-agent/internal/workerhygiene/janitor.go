@@ -334,6 +334,9 @@ func (j *Janitor) sweepLatches() {
 	entries, err := os.ReadDir(j.cfg.WatchdogStateDir)
 	if err != nil {
 		j.cycles.WithLabelValues(checkLatchReaper, "abort").Inc()
+		j.appendLog(fmt.Sprintf(
+			"janitor: state dir %s unreadable: %v — latch sweep skipped",
+			j.cfg.WatchdogStateDir, err))
 		return
 	}
 	now := j.cfg.nowFn()
@@ -493,7 +496,10 @@ func (j *Janitor) sweepIPMonitors() {
 			// the monitor can't be respawned, then the monitor.
 			j.appendLog(fmt.Sprintf(
 				"ACTION: kill legacy script pid=%d (%s)", ppid, parent))
-			_ = j.cfg.killFn(ppid, syscall.SIGKILL)
+			if err := j.cfg.killFn(ppid, syscall.SIGKILL); err != nil {
+				j.appendLog(fmt.Sprintf(
+					"suspect: kill legacy script pid=%d failed: %v", ppid, err))
+			}
 			j.actions.WithLabelValues(checkIPMonitor, "kill").Inc()
 			j.killIPMonitor(pid, cmdline,
 				fmt.Sprintf("legacy parent pid=%d", ppid))
@@ -510,7 +516,10 @@ func (j *Janitor) killIPMonitor(pid int, cmdline, why string) {
 	j.appendLog(fmt.Sprintf(
 		"ACTION: killed orphan ip monitor pid=%d (%s) cmdline=%q",
 		pid, why, cmdline))
-	_ = j.cfg.killFn(pid, syscall.SIGKILL)
+	if err := j.cfg.killFn(pid, syscall.SIGKILL); err != nil {
+		j.appendLog(fmt.Sprintf(
+			"suspect: kill orphan ip monitor pid=%d failed: %v", pid, err))
+	}
 	j.actions.WithLabelValues(checkIPMonitor, "kill").Inc()
 }
 
@@ -545,10 +554,15 @@ func isLegacyProcCmdline(cmdline string) bool {
 
 // --- /proc helpers (hostPID: pod /proc == host /proc) ---
 
-// procPIDs lists the numeric pid dirs under ProcRoot.
+// procPIDs lists the numeric pid dirs under ProcRoot. An unreadable
+// root is logged — a silent nil would make the monitor sweep no-op
+// invisibly.
 func (j *Janitor) procPIDs() []int {
 	entries, err := os.ReadDir(j.cfg.ProcRoot)
 	if err != nil {
+		j.appendLog(fmt.Sprintf(
+			"janitor: proc root %s unreadable: %v — ip monitor sweep skipped",
+			j.cfg.ProcRoot, err))
 		return nil
 	}
 	var pids []int

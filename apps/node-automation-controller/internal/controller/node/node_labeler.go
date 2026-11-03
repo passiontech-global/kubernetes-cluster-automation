@@ -15,6 +15,7 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -79,7 +80,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 	nodes, err := shared.ListNodes(ctx, r.cs)
 	if err != nil {
 		metrics.IncError("node-labeler")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
 	labeled := 0
 	for i := range nodes {
@@ -104,7 +105,18 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 	// (b) labels.txt — re-read every run: the ConfigMap volume refreshes
 	// without a pod restart. Missing or empty file => nothing to do.
 	data, err := os.ReadFile(r.configPath)
-	if err != nil || len(data) == 0 {
+	if err != nil {
+		// A missing file just means no ConfigMap is mounted on this
+		// cluster — anything else (permissions, dangling symlink,
+		// volume failure) silently disables file labels, so say so.
+		if !os.IsNotExist(err) {
+			log.Info("WARN: cannot read labels file — skipping file labels",
+				"path", r.configPath, "error", err)
+		}
+		log.Info("sweep done", "labeled", labeled)
+		return res, nil
+	}
+	if len(data) == 0 {
 		log.Info("sweep done", "labeled", labeled)
 		return res, nil
 	}
@@ -115,7 +127,13 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 			continue
 		}
 		label := fields[0]
-		key, val, _ := strings.Cut(label, "=")
+		key, val, hasEq := strings.Cut(label, "=")
+		if !hasEq {
+			// A bare "<token> <nodes>" line applies an empty-valued
+			// label — almost always a ConfigMap typo, so flag it.
+			log.Info("WARN: labels.txt line has no key=value — applying empty value",
+				"line", line, "path", r.configPath)
+		}
 		for _, name := range fields[1:] {
 			node, err := r.cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
 			if err != nil {

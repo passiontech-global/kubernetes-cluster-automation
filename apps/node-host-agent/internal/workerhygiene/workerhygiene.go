@@ -687,9 +687,24 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// checks — a node where k0sworker is intentionally down/inactive
 	// skips every check exactly like the runner did. A nil Systemd
 	// client (tests, unwired agent) can't answer → treat as active
-	// so the checks still run on their other evidence.
-	workerActive := h.cfg.Systemd == nil ||
-		h.cfg.Systemd.IsActive(ctx, "k0sworker.service")
+	// so the checks still run on their other evidence. A client that
+	// answers with an ERROR (dbus down, systemctl missing) is
+	// different from nil — the gate is wired but unverifiable, so
+	// fail closed: gate the checks off this cycle rather than risk
+	// hygiene actions on a possibly intentionally-downed worker.
+	workerActive := true
+	if h.cfg.Systemd != nil {
+		if active, err := h.cfg.Systemd.Active(ctx, "k0sworker.service"); err != nil {
+			slog.Warn("workerhygiene: k0sworker is-active probe "+
+				"failed — worker checks gated off this cycle "+
+				"(fail closed)",
+				"subsystem", "workerhygiene",
+				"unit", "k0sworker.service", "error", err)
+			workerActive = false
+		} else {
+			workerActive = active
+		}
+	}
 	sigOn := func(name string) bool {
 		return h.cfg.Watchdog == nil || h.cfg.Watchdog.SignalEnabled(name)
 	}
@@ -740,6 +755,9 @@ func (h *Hygiene) listNodePods(ctx context.Context) ([]corev1.Pod, bool) {
 		FieldSelector: "spec.nodeName=" + h.cfg.NodeName,
 	})
 	if err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: pod list failed node=%s: %v — pod checks inconclusive this cycle",
+			h.cfg.NodeName, err))
 		return nil, false
 	}
 	pods := make([]corev1.Pod, 0, len(list.Items))
@@ -984,6 +1002,15 @@ func (h *Hygiene) buildTaskMap() map[string][]ctrTask {
 	for _, root := range []string{h.cfg.CtrTaskRoot, h.cfg.SandboxCtlRoot} {
 		entries, err := os.ReadDir(root)
 		if err != nil {
+			// A genuinely-absent root is normal (no sandbox-shim
+			// dir on this containerd layout); a permission/IO
+			// error silently degrades the task map — force-delete
+			// decisions then run on incomplete data.
+			if !os.IsNotExist(err) {
+				h.appendLog(fmt.Sprintf(
+					"suspect: ctr task root %s unreadable: %v — task map incomplete",
+					root, err))
+			}
 			continue
 		}
 		for _, e := range entries {
@@ -1205,6 +1232,9 @@ func (h *Hygiene) deleteKonnectivityPod(ctx context.Context, pods []corev1.Pod) 
 		}
 		if err := h.cfg.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
 			metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}); err != nil {
+			h.appendLog(fmt.Sprintf(
+				"suspect: konnectivity pod delete %s/%s failed: %v",
+				p.Namespace, p.Name, err))
 			continue // a stale entry must not block the next candidate
 		}
 		return true
@@ -1273,7 +1303,14 @@ func (h *Hygiene) checkKonnectivity(ctx context.Context, pods []corev1.Pod, work
 			// the stale proxy-agent directly. Least-bad: a container
 			// restart alone can't fix env baked at pod create, but
 			// it still clears a hung agent while humans look.
-			_ = h.cfg.killFn(stalePID, syscall.SIGKILL)
+			if err := h.cfg.killFn(stalePID, syscall.SIGKILL); err != nil {
+				h.appendLog(fmt.Sprintf(
+					"suspect: kill stale proxy-agent pid=%d failed: %v", stalePID, err))
+			} else {
+				h.appendLog(fmt.Sprintf(
+					"ACTION: killed stale proxy-agent pid=%d — no API pod found",
+					stalePID))
+			}
 			h.actions.WithLabelValues(checkKonn, "sigkill").Inc()
 		}
 	} else {
@@ -1416,7 +1453,10 @@ func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
 			h.appendLog(fmt.Sprintf(
 				"DNS-RESOLV-RESTART: killing pause %d (%s) - dns-resolv-stale, resolv.conf pod stale vs host",
 				s.pid, s.pod))
-			_ = h.cfg.killFn(s.pid, syscall.SIGKILL)
+			if err := h.cfg.killFn(s.pid, syscall.SIGKILL); err != nil {
+				h.appendLog(fmt.Sprintf(
+					"suspect: kill pause %d (%s) failed: %v", s.pid, s.pod, err))
+			}
 			h.actions.WithLabelValues(checkDNS, "pause_kill").Inc()
 		}
 		h.dnsFails = 0
@@ -1776,6 +1816,9 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context, workerActive bool) {
 	}
 	entries, err := os.ReadDir(h.cfg.CtrTaskRoot)
 	if err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: ctr task root %s unreadable: %v — ctr-tasks check skipped",
+			h.cfg.CtrTaskRoot, err))
 		h.cycles.WithLabelValues(checkCtrTasks, "abort").Inc()
 		return
 	}
@@ -1817,7 +1860,10 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context, workerActive bool) {
 		}
 		h.appendLog(fmt.Sprintf(
 			"ACTION: kill orphan shim pid=%d id=%.12s - task dir missing", pid, sid))
-		_ = h.cfg.killFn(pid, syscall.SIGKILL)
+		if err := h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
+			h.appendLog(fmt.Sprintf(
+				"suspect: kill orphan shim pid=%d failed: %v", pid, err))
+		}
 		nShim++
 		h.actions.WithLabelValues(checkCtrTasks, "shim_kill").Inc()
 	}
@@ -1891,14 +1937,21 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context, workerActive bool) {
 				pid > 0 && h.pidLive(pid) {
 				h.appendLog(fmt.Sprintf(
 					"ACTION: kill -9 init %d of %.12s - log.json missing", pid, id))
-				_ = h.cfg.killFn(pid, syscall.SIGKILL)
+				if err := h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
+					h.appendLog(fmt.Sprintf(
+						"suspect: kill init %d of %.12s failed: %v", pid, id, err))
+				}
 			}
 		}
 		// pkill -9 -f "$id" parity: kill shim/runc leftovers holding
 		// the task id, then remove the dir — containerd GCs the task
 		// record once the shim is gone.
 		for _, pid := range h.pidsWithCmdline(id) {
-			_ = h.cfg.killFn(pid, syscall.SIGKILL)
+			if err := h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
+				h.appendLog(fmt.Sprintf(
+					"suspect: kill leftover pid=%d holding task %.12s failed: %v",
+					pid, id, err))
+			}
 		}
 		h.appendLog(fmt.Sprintf("ACTION: rm wedged task dir %.12s - dead >=5m", id))
 		if err := os.RemoveAll(d); err != nil {
@@ -1927,6 +1980,9 @@ func (h *Hygiene) stateFileExists(name string) bool {
 // unreachable parity: inconclusive, keep counters/latches).
 func (h *Hygiene) ciliumAgentTasks() (tasks []ctrTask, reachable bool) {
 	if _, err := os.ReadDir(h.cfg.CtrTaskRoot); err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: ctr task root %s unreadable: %v — cilium checks inconclusive",
+			h.cfg.CtrTaskRoot, err))
 		return nil, false
 	}
 	for _, root := range []string{h.cfg.CtrTaskRoot, h.cfg.SandboxCtlRoot} {
@@ -1967,7 +2023,10 @@ func (h *Hygiene) killCiliumAgent(tasks []ctrTask) bool {
 	killed := false
 	for _, t := range tasks {
 		if t.live && t.pid > 0 {
-			if h.cfg.killFn(t.pid, syscall.SIGKILL) == nil {
+			if err := h.cfg.killFn(t.pid, syscall.SIGKILL); err != nil {
+				h.appendLog(fmt.Sprintf(
+					"suspect: kill cilium-agent pid=%d failed: %v", t.pid, err))
+			} else {
 				killed = true
 			}
 		}
@@ -2061,6 +2120,9 @@ func (h *Hygiene) checkCiliumInitStuck(ctx context.Context, apiOK, workerActive 
 	if err != nil {
 		// Endpoint list unreadable — inconclusive: don't count, don't
 		// reset (shell: tasks exec fail → exit 0).
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-init-stuck endpoint query on %s failed: %v — inconclusive, keeping state",
+			h.cfg.CiliumSocket, err))
 		h.cycles.WithLabelValues(checkCiliumInit, "abort").Inc()
 		return
 	}
@@ -2565,13 +2627,27 @@ func (h *Hygiene) kubeletFeedTick(ctx context.Context) {
 	// accumulate fails toward a restart it doesn't want, and must not
 	// keep a healthz-down latch that escalates a deliberate stop into
 	// an NHC→SNR reboot.
-	if h.cfg.Systemd != nil && !h.cfg.Systemd.IsActive(ctx, "k0sworker.service") {
-		if h.kubeletWdFails > 0 {
-			h.appendLog("kubelet-feeder: k0sworker not active — fails reset (PartOf parity)")
+	if h.cfg.Systemd != nil {
+		active, err := h.cfg.Systemd.Active(ctx, "k0sworker.service")
+		if err != nil {
+			// Fail closed: the gate can't be evaluated — freeze
+			// this tick entirely. Accumulating fails could escalate
+			// to remediation on an unverifiable worker state, while
+			// resetting them would discard real evidence.
+			slog.Warn("kubelet-feeder: k0sworker is-active probe "+
+				"failed — skipping this tick (fail closed)",
+				"subsystem", "workerhygiene",
+				"unit", "k0sworker.service", "error", err)
+			return
 		}
-		h.kubeletWdFails = 0
-		h.stateExit("kubelet-healthz-down")
-		return
+		if !active {
+			if h.kubeletWdFails > 0 {
+				h.appendLog("kubelet-feeder: k0sworker not active — fails reset (PartOf parity)")
+			}
+			h.kubeletWdFails = 0
+			h.stateExit("kubelet-healthz-down")
+			return
+		}
 	}
 	h.kubeletWdFails++
 	h.appendLog(fmt.Sprintf("kubelet-feeder: probe fail %d/%d",

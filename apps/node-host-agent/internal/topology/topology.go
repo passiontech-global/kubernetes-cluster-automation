@@ -207,6 +207,31 @@ type Topology struct {
 	Errors []string // non-fatal derivations notes (e.g. marker dup)
 }
 
+// NewEnv builds the render-time lookup hooks rooted at varsDir:
+// lookup('file', p) reads filepath.Base(p) inside varsDir (the
+// ansible convention of resolving file lookups against the vars dir)
+// and lookup('pipe', 'date +%s') returns the unix epoch (nowFn
+// injectable for tests; nil → time.Now). No other pipe command is
+// honoured.
+func NewEnv(varsDir string, nowFn func() time.Time) *Env {
+	return &Env{
+		FileLookup: func(p string) (string, error) {
+			b, err := os.ReadFile(filepath.Join(varsDir, filepath.Base(p)))
+			return string(b), err
+		},
+		PipeLookup: func(cmd string) (string, error) {
+			if strings.TrimSpace(cmd) == "date +%s" {
+				now := time.Now()
+				if nowFn != nil {
+					now = nowFn()
+				}
+				return strconv.FormatInt(now.Unix(), 10), nil
+			}
+			return "", fmt.Errorf("unsupported pipe lookup %q", cmd)
+		},
+	}
+}
+
 // Load reads the vars dir and derives topology for cfg.NodeName.
 // A node absent from the registry still gets the shared defaults
 // (interdc_node == {} → most mesh groups self-gate off, mirroring
@@ -232,30 +257,25 @@ func Load(cfg Config) (*Topology, error) {
 	t.Nodes = nodes
 
 	var zone *OMap
-	if zv, err := rd("interdc_dns_zone.yaml"); err == nil {
+	if zv, zerr := rd("interdc_dns_zone.yaml"); zerr == nil {
 		zone, _ = zv.(*OMap)
+		if zv != nil && zone == nil {
+			t.Errors = append(t.Errors,
+				"interdc_dns_zone.yaml: top level is not a mapping — treating as empty zone")
+		}
+	} else if !os.IsNotExist(zerr) {
+		// A file that exists but cannot be decoded/read is silently
+		// swapped for an empty zone — surface it (missing file may be
+		// a deliberate "no zone" deployment).
+		t.Errors = append(t.Errors,
+			fmt.Sprintf("interdc_dns_zone.yaml: %v — treating as empty zone", zerr))
 	}
 	if zone == nil {
 		zone = NewOMap()
 	}
 	t.Zone = zone
 
-	env := &Env{
-		FileLookup: func(p string) (string, error) {
-			b, err := os.ReadFile(filepath.Join(cfg.VarsDir, filepath.Base(p)))
-			return string(b), err
-		},
-		PipeLookup: func(cmd string) (string, error) {
-			if strings.TrimSpace(cmd) == "date +%s" {
-				now := time.Now()
-				if cfg.NowFn != nil {
-					now = cfg.NowFn()
-				}
-				return strconv.FormatInt(now.Unix(), 10), nil
-			}
-			return "", fmt.Errorf("unsupported pipe lookup %q", cmd)
-		},
-	}
+	env := NewEnv(cfg.VarsDir, cfg.NowFn)
 
 	raw := NewOMap()
 	for _, f := range []string{"defaults.yaml", "cluster.yaml"} {
@@ -268,6 +288,12 @@ func Load(cfg Config) (*Topology, error) {
 			}
 		} else if f == "cluster.yaml" {
 			return nil, fmt.Errorf("cluster.yaml: %w", err)
+		} else {
+			// defaults.yaml unreadable: every default var resolves to
+			// Undefined and most groups silently self-gate off —
+			// the agent would converge nothing without a trace.
+			t.Errors = append(t.Errors,
+				fmt.Sprintf("%s: %v — vars defaults unavailable", f, err))
 		}
 	}
 	t.Vars = &Vars{

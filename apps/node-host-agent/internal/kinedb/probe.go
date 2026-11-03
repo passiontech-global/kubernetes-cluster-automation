@@ -183,7 +183,7 @@ func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
 	if k.containerRunning(ctx, pg) && k.containerRunning(ctx, pgb) {
 		res.checks[checkContainers] = 1
 	} else {
-		note("containers down")
+		note(fmt.Sprintf("containers down (%s and/or %s)", pg, pgb))
 	}
 
 	// (b) wire probe — unconditional like the shell: the whole point
@@ -191,7 +191,7 @@ func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
 	if k.cfg.wireFn(ctx, k.cfg.WireAddr) {
 		res.checks[checkWire] = 1
 	} else {
-		note("wire-probe-fail")
+		note(fmt.Sprintf("wire-probe-fail %s", k.cfg.WireAddr))
 	}
 
 	user, pass, credOK := k.creds()
@@ -201,7 +201,7 @@ func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
 		// ran it whenever both containers were up.
 		k.probeLogScan(ctx, pgb, res, note)
 		if !credOK {
-			note("missing .env creds")
+			note(fmt.Sprintf("missing .env creds (%s)", k.cfg.EnvFile))
 		} else {
 			k.probeAppChecks(ctx, pg, pgb, user, pass, res, note)
 		}
@@ -264,7 +264,7 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	if err == nil && strings.TrimSpace(out) == "1" {
 		res.checks[checkE2EAuth] = 1
 	} else {
-		note("e2e-auth-fail")
+		note(fmt.Sprintf("e2e-auth-fail via %s:%s", pgb, k.cfg.PoolerPort))
 	}
 
 	// (f) SHOW POOLS on the admin console — server conns > 0 means
@@ -302,7 +302,7 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 			note("show-pools-unparsed")
 		}
 	} else {
-		note("show-pools-fail")
+		note(fmt.Sprintf("show-pools-fail: %v", err))
 	}
 
 	// (d) backend env drift — the .env credentials must still log
@@ -311,7 +311,7 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	if err == nil && strings.TrimSpace(out) == "1" {
 		res.checks[checkBackendEnv] = 1
 	} else {
-		note("backend-env-drift")
+		note(fmt.Sprintf("backend-env-drift user=%s", user))
 	}
 
 	// (g) revision horizon — head vs compact_rev + the live-tuple
@@ -331,10 +331,10 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 			res.revSeen = true
 			res.head, res.compact, res.liveTup = head, crev, live
 		} else {
-			note("revision-unparsed")
+			note(fmt.Sprintf("revision-unparsed: %v", perr))
 		}
 	} else {
-		note("revision-query-fail")
+		note(fmt.Sprintf("revision-query-fail: %v", err))
 	}
 }
 
@@ -344,8 +344,16 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 // runs outside probeAppChecks.
 func (k *KineDB) probeLogScan(ctx context.Context, pgb string,
 	res *probeResult, note func(string)) {
-	logs, _ := k.exec(ctx, []string{k.cfg.Runtime, "logs",
+	logs, lerr := k.exec(ctx, []string{k.cfg.Runtime, "logs",
 		"--since", "301s", pgb}, "")
+	if lerr != nil {
+		// A failed `logs` read looks identical to a clean window —
+		// surface it so a log_errors pass is not mistaken for real
+		// evidence.
+		note(fmt.Sprintf("log-scan-fail: %v", lerr))
+		slog.Warn("kinedb pgbouncer log scan failed — log_errors check reads a clean window",
+			"container", pgb, "error", lerr)
+	}
 	n := int64(len(rePGBLogErr.FindAllString(logs, -1)))
 	res.logErrs = n
 	if n == 0 {

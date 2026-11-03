@@ -106,6 +106,10 @@ func (s *Syncer) renewLease(ctx context.Context) bool {
 		s.cfg.Log.Warn("hubsync: lease renew failed — retrying next tick",
 			"lease", s.cfg.LeaseNamespace+"/"+s.cfg.LeaseName, "error", err)
 	}
+	if !s.held && held {
+		s.cfg.Log.Info("hubsync: lease acquired",
+			"lease", s.cfg.LeaseNamespace+"/"+s.cfg.LeaseName)
+	}
 	if s.held && !held {
 		s.cfg.Log.Warn("hubsync: lost lease",
 			"lease", s.cfg.LeaseNamespace+"/"+s.cfg.LeaseName)

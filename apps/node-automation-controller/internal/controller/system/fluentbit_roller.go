@@ -83,7 +83,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	}
 	if err != nil {
 		metrics.IncError("fluent-bit-config-roller")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("get secret fluent-system/passiontech-pipeline: %w", err)
 	}
 	hash := sec.Annotations["fluent.io/config-hash"]
 	if hash == "" {
@@ -93,27 +93,30 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	}
 	cur := sec.Annotations["passiontech.dev/rolled-config-hash"]
 	if hash == cur {
-		log.Info("config already rolled — nothing to do", "hash", hash)
+		log.Info("config already rolled — nothing to do",
+			"secret", "fluent-system/passiontech-pipeline", "hash", hash)
 		return res, nil
 	}
-	log.Info("config drift", "hash", hash, "rolled", cur)
+	log.Info("config drift",
+		"secret", "fluent-system/passiontech-pipeline", "hash", hash, "rolled", cur)
 
 	// Storm gate: never restart the DS while nodes are down — adds
 	// churn; positionDB guarantees resume once stable.
 	notReady, err := shared.CountNotReadyNodes(ctx, r.cs)
 	if err != nil {
 		metrics.IncError("fluent-bit-config-roller")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("count not-ready nodes (storm gate): %w", err)
 	}
 	if notReady > 0 {
-		log.Info("node(s) not Ready — skip roll, wait for cluster to stabilize", "notReady", notReady)
+		log.Info("node(s) not Ready — skip roll, wait for cluster to stabilize",
+			"daemonset", "fluent-system/fluent-bit", "notReady", notReady)
 		return res, nil
 	}
 
 	ds, err := r.cs.AppsV1().DaemonSets("fluent-system").Get(ctx, "fluent-bit", metav1.GetOptions{})
 	if err != nil {
 		metrics.IncError("fluent-bit-config-roller")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("get daemonset fluent-system/fluent-bit: %w", err)
 	}
 	// Bash settled check exactly: generation observed AND updated ==
 	// desired. NumberReady is deliberately NOT required (bash didn't —
@@ -121,6 +124,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	if ds.Generation != ds.Status.ObservedGeneration ||
 		ds.Status.UpdatedNumberScheduled != ds.Status.DesiredNumberScheduled {
 		log.Info("rollout in progress — skip",
+			"daemonset", "fluent-system/fluent-bit",
 			"generation", ds.Generation, "observed", ds.Status.ObservedGeneration,
 			"updated", ds.Status.UpdatedNumberScheduled, "desired", ds.Status.DesiredNumberScheduled)
 		return res, nil
@@ -133,7 +137,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	if _, err := r.cs.AppsV1().DaemonSets("fluent-system").Patch(ctx, "fluent-bit",
 		types.StrategicMergePatchType, restartPatch, metav1.PatchOptions{}); err != nil {
 		metrics.IncError("fluent-bit-config-roller")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("rollout-restart patch daemonset fluent-system/fluent-bit: %w", err)
 	}
 	// State written only AFTER the restart succeeded (bash ordering):
 	// writing first would silently swallow the drift if restart failed.
@@ -142,7 +146,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	if _, err := r.cs.CoreV1().Secrets("fluent-system").Patch(ctx, "passiontech-pipeline",
 		types.MergePatchType, statePatch, metav1.PatchOptions{}); err != nil {
 		metrics.IncError("fluent-bit-config-roller")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("stamp rolled-config-hash on secret fluent-system/passiontech-pipeline: %w", err)
 	}
 	log.Info("ROLL: restarted fluent-bit for config",
 		"daemonset", "fluent-system/fluent-bit", "hash", hash)

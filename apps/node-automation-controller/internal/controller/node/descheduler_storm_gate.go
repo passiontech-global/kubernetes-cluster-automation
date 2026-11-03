@@ -111,7 +111,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	nodes, err := shared.ListNodes(ctx, r.cs)
 	if err != nil {
 		metrics.IncError("descheduler-storm-gate")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
 
 	var notReady, bad, tainted []string
@@ -148,7 +148,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	}
 	if err != nil {
 		metrics.IncError("descheduler-storm-gate")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/descheduler: %w", err)
 	}
 
 	if deploy.Annotations[stormGateHoldAnno] == "true" {
@@ -178,7 +178,9 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		if _, err := r.cs.AppsV1().Deployments("kube-system").
 			Update(ctx, deploy, metav1.UpdateOptions{}); err != nil {
 			metrics.IncError("descheduler-storm-gate")
-			return ctrl.Result{}, err
+			return ctrl.Result{}, fmt.Errorf(
+				"scale deployment kube-system/descheduler to %d replicas: %w",
+				want, err)
 		}
 		if err := annotateStormDecision(ctx, r.cs, decision); err != nil {
 			metrics.IncError("descheduler-storm-gate")
@@ -228,9 +230,12 @@ func annotateStormDecision(ctx context.Context, cs kubernetes.Interface, value s
 		},
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal %s patch: %w", stormGateDecisionAnno, err)
 	}
-	_, err = cs.AppsV1().Deployments("kube-system").Patch(ctx,
-		"descheduler", types.MergePatchType, payload, metav1.PatchOptions{})
-	return err
+	if _, err := cs.AppsV1().Deployments("kube-system").Patch(ctx,
+		"descheduler", types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf("patch %s on deployment kube-system/descheduler: %w",
+			stormGateDecisionAnno, err)
+	}
+	return nil
 }

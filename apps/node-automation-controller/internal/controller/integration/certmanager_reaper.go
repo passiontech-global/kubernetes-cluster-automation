@@ -20,6 +20,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -84,7 +85,7 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 	certs, err := r.dyn.Resource(certificateGVR).Namespace(metav1.NamespaceAll).
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("list certificates: %w", err)
 	}
 	seen := map[string]bool{}
 	candidates, reset := 0, 0
@@ -196,12 +197,14 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 			metrics.IncError(certReaperQueue)
 			log.Info("REFUSE: reset budget exhausted — cert config is broken, "+
 				"continuing would burn the ACME rate limit",
-				"cert", key, "resets", st.total)
+				"cert", key, "order", stuck.GetName(), "resets", st.total)
 		}
 		return false
 	}
 	if !st.last.IsZero() && time.Since(st.last) < certReaperMinGap {
-		log.Info("SKIP: reset rate-limited (max 1/hour)", "cert", key)
+		log.Info("SKIP: reset rate-limited (max 1/hour)",
+			"cert", key, "order", stuck.GetName(),
+			"lastResetAgo", time.Since(st.last).Truncate(time.Minute))
 		return false
 	}
 

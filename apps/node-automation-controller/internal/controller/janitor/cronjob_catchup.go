@@ -80,7 +80,7 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 
 	cronjobs, err := c.cs.BatchV1().CronJobs(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return err // periodic wrapper IncErrors catchupQueue
+		return fmt.Errorf("list cronjobs: %w", err) // periodic wrapper IncErrors catchupQueue
 	}
 
 	spawned := 0
@@ -230,7 +230,7 @@ func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1
 	if _, err := c.cs.BatchV1().Jobs(cj.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		metrics.IncError(catchupQueue)
 		log.Error(err, "create catch-up job failed",
-			"cronjob", cj.Namespace+"/"+cj.Name)
+			"cronjob", cj.Namespace+"/"+cj.Name, "job", job.Name)
 		return false
 	}
 	c.mu.Lock()

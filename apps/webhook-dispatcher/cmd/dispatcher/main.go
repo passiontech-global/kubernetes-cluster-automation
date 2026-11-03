@@ -133,6 +133,7 @@ func main() {
 
 	slog.Info("starting webhook-dispatcher",
 		"version", version, "addr", srv.Addr,
+		"routes", "POST /webhook, GET /healthz",
 		"concourse_url", client.BaseURL, "concourse_team", client.Team)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("server exited", "error", err)

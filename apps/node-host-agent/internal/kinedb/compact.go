@@ -177,10 +177,10 @@ func (k *KineDB) guardCycle(ctx context.Context) *guardResult {
 	switch {
 	case !credOK:
 		res.ok = false
-		note("missing .env creds")
+		note(fmt.Sprintf("missing .env creds (%s)", k.cfg.EnvFile))
 	case !k.containerRunning(ctx, pg):
 		res.ok = false
-		note("postgres container down")
+		note(fmt.Sprintf("postgres container %s down", pg))
 	default:
 		k.guardRun(ctx, pg, user, pass, res, note)
 	}
@@ -211,13 +211,13 @@ func (k *KineDB) guardRun(ctx context.Context, pg, user, pass string,
 		k.cfg.Table, k.cfg.Table, compactRevKey))
 	if err != nil {
 		res.ok = false
-		note("stats query fail")
+		note(fmt.Sprintf("stats query fail: %v", err))
 		return
 	}
 	head, crev, rows, perr := parseTriple(out)
 	if perr != nil {
 		res.ok = false
-		note("stats unparsed")
+		note(fmt.Sprintf("stats unparsed: %v", perr))
 		return
 	}
 	res.head, res.compact, res.rows = head, crev, rows
@@ -252,7 +252,7 @@ func (k *KineDB) guardRun(ctx context.Context, pg, user, pass string,
 	switch {
 	case err != nil:
 		res.ok = false
-		note("compact-fail")
+		note(fmt.Sprintf("compact-fail: %v", err))
 	case strings.Contains(sout, lockBusyMarker):
 		res.fired = false
 		note("guard already running")

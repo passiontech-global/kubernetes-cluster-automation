@@ -133,7 +133,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	// blippy list would brand healthy attachments orphaned.
 	nodes, err := shared.ListNodes(ctx, c.cs)
 	if err != nil {
-		return err // periodic wrapper IncErrors volumeattachment-cleaner
+		return fmt.Errorf("list nodes: %w", err) // periodic wrapper IncErrors volumeattachment-cleaner
 	}
 	if len(nodes) == 0 {
 		// An empty list is not "every VA is orphaned" — the operator
@@ -167,7 +167,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 
 	vas, err := c.cs.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("list volumeattachments: %w", err)
 	}
 	// Deterministic order — the per-cycle cap must always pick the
 	// same victims, not whichever ordering the apiserver returned.
@@ -252,7 +252,9 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		if err := c.cs.StorageV1().VolumeAttachments().Delete(ctx, va.Name,
 			metav1.DeleteOptions{}); err != nil {
 			metrics.IncError(volumeAttachmentCleanerQueue)
-			log.Error(err, "volumeattachment delete failed", "va", va.Name)
+			log.Error(err, "volumeattachment delete failed",
+				"va", va.Name, "node", va.Spec.NodeName,
+				"pv", ptr.Deref(va.Spec.Source.PersistentVolumeName, "?"))
 			failed++
 			continue
 		}
@@ -265,6 +267,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	for name := range c.orphanFirstSeen {
 		if !orphanNow[name] {
 			delete(c.orphanFirstSeen, name)
+			log.Info("orphan sighting cleared — node reappeared or VA gone", "va", name)
 		}
 	}
 	if capped {
@@ -296,7 +299,14 @@ func (c *volumeAttachmentCleaner) nodeFencedDead(ctx context.Context,
 		return false // fenced but alive — the taint is stale, VAs stay
 	}
 	since, ok := c.nodeNotReadySince[node.Name]
-	if !ok || now.Sub(since) < vaOutOfServiceDownFor {
+	if !ok {
+		return false // node not in the not-Ready ledger — no verdict
+	}
+	if now.Sub(since) < vaOutOfServiceDownFor {
+		log.Info("KEEP: fenced node still inside not-Ready window",
+			"node", node.Name,
+			"notReadyFor", now.Sub(since).Truncate(time.Minute),
+			"required", vaOutOfServiceDownFor)
 		return false // not-Ready window still running
 	}
 	live, err := c.livePodCount(ctx, livePods, node.Name)

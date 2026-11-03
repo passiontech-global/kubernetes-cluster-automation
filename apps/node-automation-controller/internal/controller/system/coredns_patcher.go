@@ -33,6 +33,7 @@ package system
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -79,6 +80,7 @@ type corednsPatcher struct {
 // proportionalReplicas. minReplicas<=0 disables the pin entirely.
 func SetupCoreDNSPatcher(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, zoneWhen string, zoneMinDomains, minReplicas, nodesPerReplica int) error {
 	if !enabled {
+		logf.Log.WithName("coredns-patcher").Info("disabled — module not registered")
 		return nil
 	}
 	b := ctrl.NewControllerManagedBy(mgr).
@@ -116,11 +118,13 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 	d, err := r.cs.AppsV1().Deployments("kube-system").
 		Get(ctx, "coredns", metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return res, nil // cluster without the k0s coredns addon
+		// cluster without the k0s coredns addon
+		log.Info("SKIP: deployment not found", "deployment", "kube-system/coredns")
+		return res, nil
 	}
 	if err != nil {
 		metrics.IncError("coredns-patcher")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/coredns: %w", err)
 	}
 
 	// Proportional replica pin — disabled when minReplicas<=0
@@ -131,19 +135,20 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 		nodes, err := shared.ListNodes(ctx, r.cs)
 		if err != nil {
 			metrics.IncError("coredns-patcher")
-			return ctrl.Result{}, err
+			return ctrl.Result{}, fmt.Errorf("list nodes for proportional replica count: %w", err)
 		}
 		wantReplicas = proportionalReplicas(len(nodes), r.minReplicas, r.nodesPerReplica)
 	}
 
 	if !corednsNeedsPatch(d, r.zoneWhen, r.minDomains, wantReplicas) {
-		log.Info("probes/resources/topology/replicas already pinned - nothing to do")
+		log.Info("probes/resources/topology/replicas already pinned - nothing to do",
+			"deployment", "kube-system/coredns", "wantReplicas", wantReplicas)
 		return res, nil
 	}
 	patch, err := corednsPatchBody(r.zoneWhen, r.minDomains, wantReplicas)
 	if err != nil {
 		metrics.IncError("coredns-patcher")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("render patch body for deployment kube-system/coredns: %w", err)
 	}
 	log.Info("PATCH: coredns drifted — restoring pinned spec",
 		"deployment", "kube-system/coredns", "wantReplicas", wantReplicas)
@@ -151,7 +156,7 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 		"coredns", types.StrategicMergePatchType,
 		patch, metav1.PatchOptions{}); err != nil {
 		metrics.IncError("coredns-patcher")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("patch deployment kube-system/coredns: %w", err)
 	}
 	return res, nil
 }

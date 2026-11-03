@@ -19,6 +19,7 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"time"
 
@@ -110,7 +111,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 	nodes, err := shared.ListNodes(ctx, r.cs)
 	if err != nil {
 		metrics.IncError("cilium-taint-reaper")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
 
 	reaped := 0
@@ -125,7 +126,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 		})
 		if err != nil {
 			metrics.IncError("cilium-taint-reaper")
-			return ctrl.Result{}, err
+			return ctrl.Result{}, fmt.Errorf("list cilium pods on node %s: %w", node.Name, err)
 		}
 		if len(pods.Items) == 0 {
 			log.Info("SKIP: taint present but no cilium pod on node",
@@ -138,7 +139,8 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 				"node", node.Name, "pod", pod.Name)
 			if err := shared.UntaintNode(ctx, r.cs, node.Name, ciliumNotReadyTaint); err != nil {
 				metrics.IncError("cilium-taint-reaper")
-				return ctrl.Result{}, err
+				return ctrl.Result{}, fmt.Errorf("remove taint %s on node %s: %w",
+					ciliumNotReadyTaint, node.Name, err)
 			}
 			reaped++
 		} else {
@@ -149,7 +151,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 				"ready", shared.PodReadyCond(pod))
 		}
 	}
-	log.Info("sweep done", "reaped", reaped)
+	log.Info("sweep done", "reaped", reaped, "nodes", len(nodes))
 	return res, nil
 }
 

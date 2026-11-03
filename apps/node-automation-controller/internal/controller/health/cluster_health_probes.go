@@ -237,10 +237,25 @@ func newClusterHealthProber(cs kubernetes.Interface, cfg healthProbeConfig) *clu
 // cilium-taint-reaper pattern.
 func SetupClusterHealthProber(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
 	if !enabled {
+		logf.Log.WithName(clusterHealthQueue).Info("disabled — module not registered")
 		return nil
 	}
 	p := newClusterHealthProber(cs, healthProbeConfigFromEnv())
 	interval := healthEnvDuration("CLUSTER_HEALTH_PROBES_INTERVAL", 5*time.Minute)
+	// Surface the resolved HEALTH_* knobs once at registration so an
+	// operator can tell from the logs which targets/thresholds the
+	// checks run with (an unparseable env value silently falls back
+	// to the default — the effective value is what matters here).
+	logf.Log.WithName(clusterHealthQueue).Info("registered",
+		"interval", interval, "dnsHostnames", p.cfg.dnsHostnames,
+		"checkTimeout", p.cfg.checkTimeout, "httpURL", p.cfg.httpURL,
+		"httpExpectedContent", p.cfg.httpExpectedContent,
+		"podCheckNamespace", p.cfg.podCheckNamespace,
+		"maxPodRestarts", p.cfg.maxPodRestarts,
+		"podSkipDuration", p.cfg.podSkipDuration,
+		"quotaThreshold", p.cfg.quotaThreshold,
+		"kcmLeaseMaxAge", p.cfg.kcmLeaseMaxAge,
+		"kcmFreezeMinAge", p.cfg.kcmFreezeMinAge)
 	return shared.AddPeriodic(mgr, clusterHealthQueue, interval, p.run)
 }
 

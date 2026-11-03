@@ -62,6 +62,7 @@ type cfTunnelProxyWatchdog struct {
 // (enabled=false skips registration entirely).
 func SetupCFTunnelProxyWatchdog(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, namespace string, interval time.Duration) error {
 	if !enabled {
+		logf.Log.WithName(cfTunnelWatchdogQueue).Info("disabled — module not registered")
 		return nil
 	}
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: namespace}
@@ -94,14 +95,14 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 	if err != nil {
 		return 0, fmt.Errorf("list proxy pods in %s: %w", w.namespace, err)
 	}
-	notReady := 0
+	var unready []string
 	for i := range pods.Items {
 		if pods.Items[i].Status.Phase == corev1.PodRunning &&
 			!podReady(&pods.Items[i]) {
-			notReady++
+			unready = append(unready, pods.Items[i].Name)
 		}
 	}
-	if notReady == 0 {
+	if len(unready) == 0 {
 		log.Info("all proxy pods ready", "namespace", w.namespace)
 		return 0, nil
 	}
@@ -125,8 +126,8 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 		}
 	}
 	log.Info("ACTION: forced proxy config resync",
-		"namespace", w.namespace, "notReadyPods", notReady,
-		"slices", len(epsList.Items))
+		"namespace", w.namespace, "notReadyPods", len(unready),
+		"pods", unready, "slices", len(epsList.Items))
 	return len(epsList.Items), nil
 }
 
