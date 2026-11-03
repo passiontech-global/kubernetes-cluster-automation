@@ -22,6 +22,9 @@
 //     METRICS_SERVER_MIN_REPLICAS / METRICS_SERVER_NODES_PER_REPLICA
 //     (default 3/1). minReplicas<=0 disables the pin and leaves
 //     .spec.replicas untouched so standalone CPA can be re-enabled.
+//   - The ported kuberhealthy HealthChecks are default-ON too:
+//     CLUSTER_HEALTH_PROBES_ENABLED / _INTERVAL plus the per-check
+//     HEALTH_* knobs (see internal/controller/cluster_health_probes.go).
 package main
 
 import (
@@ -233,7 +236,8 @@ func main() {
 		"concourseJanitor", mc.concourseJanitorEnabled,
 		"corednsPatcher", mc.corednsPatcherEnabled,
 		"metricsServerPatcher", mc.metricsServerPatcherEnabled,
-		"cfTunnelWatchdog", mc.cfTunnelWatchdogEnabled)
+		"cfTunnelWatchdog", mc.cfTunnelWatchdogEnabled,
+		"clusterHealthProbes", mc.clusterHealthProbesEnabled)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited")
 		os.Exit(1)
@@ -263,6 +267,7 @@ type moduleConfig struct {
 	cfTunnelWatchdogEnabled      bool
 	cfTunnelWatchdogNamespace    string
 	cfTunnelWatchdogInterval     time.Duration
+	clusterHealthProbesEnabled   bool
 }
 
 // moduleConfigFromEnv resolves every feature-gate env var once, after
@@ -293,6 +298,10 @@ func moduleConfigFromEnv() moduleConfig {
 			"cloudflare-tunnel-system"),
 		cfTunnelWatchdogInterval: getenvDuration("CF_TUNNEL_WATCHDOG_INTERVAL",
 			5*time.Minute),
+		// The kuberhealthy checker Pods ran always-on — default-ON
+		// here too; the HEALTH_* check knobs are read inside the
+		// prober package (SetupClusterHealthProber).
+		clusterHealthProbesEnabled: os.Getenv("CLUSTER_HEALTH_PROBES_ENABLED") != "false",
 	}
 }
 
@@ -338,6 +347,10 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 			return controller.SetupCFTunnelProxyWatchdog(mgr, cs,
 				mc.cfTunnelWatchdogEnabled, mc.cfTunnelWatchdogNamespace,
 				mc.cfTunnelWatchdogInterval)
+		},
+		"cluster-health-probes": func() error {
+			return controller.SetupClusterHealthProber(mgr, cs,
+				mc.clusterHealthProbesEnabled)
 		},
 	} {
 		if err := setup(); err != nil {

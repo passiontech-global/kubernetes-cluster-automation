@@ -182,8 +182,16 @@ func TestSetupPeriodicModules(t *testing.T) {
 				return SetupCFTunnelProxyWatchdog(m, cs, true,
 					"cloudflare-tunnel-system", 5*time.Minute)
 			}},
+		{"cluster-health-probes", 5 * time.Minute,
+			func(m manager.Manager) error {
+				return SetupClusterHealthProber(m, cs, true)
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// cluster-health-probes resolves its interval from env at
+			// Setup — pin it so a stray CLUSTER_HEALTH_PROBES_INTERVAL
+			// in the test environment can't flake the assertion.
+			t.Setenv("CLUSTER_HEALTH_PROBES_INTERVAL", "")
 			m := newStubManager()
 			if err := tc.setup(m); err != nil {
 				t.Fatalf("setup: %v", err)
@@ -196,8 +204,8 @@ func TestSetupPeriodicModules(t *testing.T) {
 // Feature flags split in two: externalsecret-nudge and csr-watcher
 // register unconditionally (the flag only gates the tick body, like
 // the bash exit-early at the top of the hook), while certmanager-reaper,
-// cilium-identity-auditor, cilium-taint-reaper and
-// fluent-bit-config-roller skip mgr.Add entirely when disabled (no
+// cilium-identity-auditor, cilium-taint-reaper, cluster-health-probes
+// and fluent-bit-config-roller skip mgr.Add entirely when disabled (no
 // informer, no RequeueAfter loop).
 func TestSetupFeatureFlagVariants(t *testing.T) {
 	cs := fake.NewSimpleClientset()
@@ -239,6 +247,9 @@ func TestSetupFeatureFlagVariants(t *testing.T) {
 		}},
 		{"fluent-bit-config-roller", func(m manager.Manager) error {
 			return SetupFluentBitRoller(m, cs, false)
+		}},
+		{"cluster-health-probes", func(m manager.Manager) error {
+			return SetupClusterHealthProber(m, cs, false)
 		}},
 	} {
 		t.Run(tc.name+"-disabled", func(t *testing.T) {

@@ -71,6 +71,38 @@ func TestObserveAPIBackend(t *testing.T) {
 	}
 }
 
+// TestObserveHealthCheck pins the kuberhealthy-compatible contract:
+// check + literal "kuberhealthy" namespace labels, OK/FAIL gauges
+// that flip on pass/fail, and a staleness gauge carrying whatever the
+// caller measured since the last pass.
+func TestObserveHealthCheck(t *testing.T) {
+	const check = "unit-test-check"
+
+	ObserveHealthCheck(check, true, 0)
+	if got := testutil.ToFloat64(
+		healthCheckStatus.WithLabelValues(check, "kuberhealthy", "OK")); got != 1 {
+		t.Fatalf("OK gauge = %v, want 1 on pass", got)
+	}
+	if got := testutil.ToFloat64(
+		healthCheckStatus.WithLabelValues(check, "kuberhealthy", "FAIL")); got != 0 {
+		t.Fatalf("FAIL gauge = %v, want 0 on pass", got)
+	}
+
+	ObserveHealthCheck(check, false, 913.5)
+	if got := testutil.ToFloat64(
+		healthCheckStatus.WithLabelValues(check, "kuberhealthy", "OK")); got != 0 {
+		t.Fatalf("OK gauge = %v, want 0 on fail", got)
+	}
+	if got := testutil.ToFloat64(
+		healthCheckStatus.WithLabelValues(check, "kuberhealthy", "FAIL")); got != 1 {
+		t.Fatalf("FAIL gauge = %v, want 1 on fail", got)
+	}
+	if got := testutil.ToFloat64(
+		healthCheckSecondsSinceSuccess.WithLabelValues(check, "kuberhealthy")); got != 913.5 {
+		t.Fatalf("seconds_since_success = %v, want 913.5", got)
+	}
+}
+
 // TestForgetAPIBackend prunes a backend's series when it leaves the
 // controller set so /metrics does not leak stale label values.
 func TestForgetAPIBackend(t *testing.T) {

@@ -35,6 +35,25 @@ var apiBackendQuarantined = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while the backend IP is quarantined out of default/Endpoints and EndpointSlice kubernetes.",
 }, []string{"backend"})
 
+// cluster-health-probes gauges — the EXACT series kuberhealthy
+// exported for the five ported HealthChecks, so the
+// KuberhealthyCheckFailed / KuberhealthyCheckStale PrometheusRule
+// alerts (and any dashboard keyed on check=<HealthCheck name>) keep
+// firing with no PromQL change. The namespace label stays the literal
+// "kuberhealthy" — the ns the HealthCheck CRs lived in — because the
+// alert annotations render {{ $labels.namespace }}.
+const healthCheckMetricNamespace = "kuberhealthy"
+
+var healthCheckStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "kuberhealthy_check",
+	Help: "Kuberhealthy-compatible check result (status=OK|FAIL) emitted by the in-process prober.",
+}, []string{"check", "namespace", "status"})
+
+var healthCheckSecondsSinceSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "kuberhealthy_check_seconds_since_success",
+	Help: "Seconds since the check last reported OK (kuberhealthy-compatible).",
+}, []string{"check", "namespace"})
+
 // queues are the legacy shell-operator queue names — pre-instantiated
 // at 0 so /metrics always exposes every series (an empty CounterVec
 // emits nothing, and shell-operator emitted its counters eagerly).
@@ -51,11 +70,14 @@ var queues = []string{
 	"apiserver-endpoint-guard",
 	// ported kubectl CronJobs (v0.8.0)
 	"coredns-patcher", "metrics-server-patcher", "cf-tunnel-proxy-watchdog",
+	// ported kuberhealthy HealthChecks
+	"cluster-health-probes",
 }
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(hookRunErrors, reconcileErrors,
-		apiBackendRVGap, apiBackendQuarantined)
+		apiBackendRVGap, apiBackendQuarantined,
+		healthCheckStatus, healthCheckSecondsSinceSuccess)
 	for _, q := range queues {
 		hookRunErrors.WithLabelValues(q)
 		reconcileErrors.WithLabelValues(q)
@@ -89,4 +111,21 @@ func ObserveAPIBackend(ip string, rvGap float64, quarantined bool) {
 func ForgetAPIBackend(ip string) {
 	apiBackendRVGap.DeleteLabelValues(ip)
 	apiBackendQuarantined.DeleteLabelValues(ip)
+}
+
+// ObserveHealthCheck records one result of a ported kuberhealthy check
+// under its original HealthCheck name: the status=OK|FAIL gauges
+// mirror kuberhealthy's output exactly (a pass sets OK=1/FAIL=0, a
+// fail flips them) and secondsSinceSuccess feeds the stale-check
+// alert — the caller tracks lastSuccess and passes now-lastSuccess
+// (0 on a pass, growing while the check keeps failing).
+func ObserveHealthCheck(check string, ok bool, secondsSinceSuccess float64) {
+	okV, failV := 0.0, 1.0
+	if ok {
+		okV, failV = 1.0, 0.0
+	}
+	healthCheckStatus.WithLabelValues(check, healthCheckMetricNamespace, "OK").Set(okV)
+	healthCheckStatus.WithLabelValues(check, healthCheckMetricNamespace, "FAIL").Set(failV)
+	healthCheckSecondsSinceSuccess.
+		WithLabelValues(check, healthCheckMetricNamespace).Set(secondsSinceSuccess)
 }

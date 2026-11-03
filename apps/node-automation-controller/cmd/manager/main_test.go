@@ -386,6 +386,7 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		"CF_TUNNEL_WATCHDOG_ENABLED",
 		"CF_TUNNEL_WATCHDOG_NAMESPACE",
 		"CF_TUNNEL_WATCHDOG_INTERVAL",
+		"CLUSTER_HEALTH_PROBES_ENABLED",
 	}
 	clear := func(t *testing.T) {
 		for _, k := range keys {
@@ -404,10 +405,10 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		if mc.labelerPath != "/etc/node-labeler/labels.txt" {
 			t.Fatalf("labelerPath = %q, want default", mc.labelerPath)
 		}
-		// The ported patcher/watchdog modules default ON — only an
-		// explicit "false" opts a cluster out.
+		// The ported patcher/watchdog/prober modules default ON — only
+		// an explicit "false" opts a cluster out.
 		if !mc.corednsPatcherEnabled || !mc.metricsServerPatcherEnabled ||
-			!mc.cfTunnelWatchdogEnabled {
+			!mc.cfTunnelWatchdogEnabled || !mc.clusterHealthProbesEnabled {
 			t.Fatalf("expected ported modules default-on, got %+v", mc)
 		}
 		if mc.corednsZoneWhen != "DoNotSchedule" {
@@ -477,9 +478,10 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		t.Setenv("CF_TUNNEL_WATCHDOG_ENABLED", "false")
 		t.Setenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "custom-ns")
 		t.Setenv("CF_TUNNEL_WATCHDOG_INTERVAL", "10m")
+		t.Setenv("CLUSTER_HEALTH_PROBES_ENABLED", "false")
 		mc := moduleConfigFromEnv()
 		if mc.corednsPatcherEnabled || mc.metricsServerPatcherEnabled ||
-			mc.cfTunnelWatchdogEnabled {
+			mc.cfTunnelWatchdogEnabled || mc.clusterHealthProbesEnabled {
 			t.Fatalf("explicit false must disable the ported modules, got %+v", mc)
 		}
 		if mc.corednsZoneWhen != "ScheduleAnyway" || mc.corednsZoneMinDomains != 0 {
@@ -570,11 +572,12 @@ func stubDyn() *dynamicfake.FakeDynamicClient {
 }
 
 // Every module registers exactly one runnable on the manager — 24 in
-// the map — except the seven gate-skippers (certmanager-reaper,
+// the map — except the eight gate-skippers (certmanager-reaper,
 // cilium-identity-auditor, cilium-taint-reaper, fluent-bit-config-roller,
-// coredns-patcher, metrics-server-patcher, cf-tunnel-proxy-watchdog),
-// which skip mgr.Add entirely while disabled (16 runnables then). The
-// other feature flags only gate the tick body, not registration.
+// coredns-patcher, metrics-server-patcher, cf-tunnel-proxy-watchdog,
+// cluster-health-probes), which skip mgr.Add entirely while disabled
+// (16 runnables then). The other feature flags only gate the tick
+// body, not registration.
 func TestSetupModules(t *testing.T) {
 	t.Run("all gates enabled", func(t *testing.T) {
 		m := newStubManager()
@@ -594,12 +597,13 @@ func TestSetupModules(t *testing.T) {
 			cfTunnelWatchdogEnabled:     true,
 			cfTunnelWatchdogNamespace:   "cloudflare-tunnel-system",
 			cfTunnelWatchdogInterval:    5 * time.Minute,
+			clusterHealthProbesEnabled:  true,
 		}
 		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), mc); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
-		if len(m.added) != 23 {
-			t.Fatalf("registered %d runnables, want 23", len(m.added))
+		if len(m.added) != 24 {
+			t.Fatalf("registered %d runnables, want 24", len(m.added))
 		}
 		for i, r := range m.added {
 			if r == nil {
