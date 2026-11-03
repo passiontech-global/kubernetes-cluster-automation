@@ -23,6 +23,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/concourseinit"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/etcdrescue"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/evpurge"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostconfig"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostmetrics"
@@ -67,6 +68,8 @@ func dispatch(argv []string) (int, bool) {
 		return checkKineDBCmd(ctx, argv[2:]), true
 	case "check-k0s-drift":
 		return checkK0sDriftCmd(argv[2:]), true
+	case "rescue-etcd":
+		return rescueEtcdCmd(ctx, argv[2:]), true
 	default:
 		subcommandUsage(argv[1])
 		return 2, true
@@ -92,6 +95,9 @@ usage:
                                             verify the kine postgres+pgbouncer stack (exit 1 on any FAIL)
   node-host-agent check-k0s-drift [--config=FILE] [--expected-keys=a,b] [--removed-flags=x,y] [--unit-file=FILE]
                                             report k0s.yaml extraArgs drift (removed-flag/extra-key/missing-key)
+  node-host-agent rescue-etcd [--k0s-dir=DIR] [--endpoint=URL] [--force-offline]
+                                            rescue a k0s etcd at backend quota
+                                            (compact -> online defrag -> offline defrag -> alarm disarm -> canary)
 `, word)
 }
 
@@ -782,6 +788,38 @@ func checkK0sDriftCmd(args []string) int {
 		ExpectedKeys: exp,
 		RemovedFlags: rem,
 	}, os.Stdout)
+}
+
+// --- rescue-etcd: port of scripts/rescue-etcd.sh ---
+//
+// Rescues a k0s controller etcd that hit the backend quota — run as
+// root ON the controller. Compact -> online defrag -> offline defrag
+// when the online pass reclaims nothing (or --force-offline) ->
+// alarm disarm -> write canary.
+func rescueEtcdCmd(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("rescue-etcd", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	k0sDir := fs.String("k0s-dir", "/var/lib/k0s",
+		"k0s data dir (derives bin/etcd*, pki/ cert paths)")
+	endpoint := fs.String("endpoint", "https://127.0.0.1:2379",
+		"etcd client endpoint")
+	forceOffline := fs.Bool("force-offline", false,
+		"skip the online defrag attempt, go straight to offline defrag")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0 // -h/--help is a clean exit, not a usage error
+		}
+		return 2
+	}
+	if err := etcdrescue.Run(ctx, etcdrescue.Config{
+		K0sDir:       *k0sDir,
+		Endpoint:     *endpoint,
+		ForceOffline: *forceOffline,
+	}, os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, "rescue-etcd:", err)
+		return 1
+	}
+	return 0
 }
 
 // splitCSV splits a comma-separated flag value, trimming spaces and

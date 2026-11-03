@@ -901,6 +901,22 @@ func TestDispatchCheckK0sDriftArgParsing(t *testing.T) {
 	}
 }
 
+func TestDispatchRescueEtcdArgParsing(t *testing.T) {
+	if code, handled := dispatch([]string{"nha", "rescue-etcd", "--bogus"}); !handled || code != 2 {
+		t.Fatalf("rescue-etcd --bogus=(%d,%v) want (2,true)", code, handled)
+	}
+	if code, handled := dispatch([]string{"nha", "rescue-etcd", "-h"}); !handled || code != 0 {
+		t.Fatalf("rescue-etcd -h=(%d,%v) want (0,true)", code, handled)
+	}
+	// A missing k0s dir → the etcdctl exec fails on the very first
+	// endpoint status → exit 1.
+	code, handled := dispatch([]string{"nha", "rescue-etcd",
+		"--k0s-dir=" + filepath.Join(t.TempDir(), "no-such")})
+	if !handled || code != 1 {
+		t.Fatalf("rescue-etcd missing k0s-dir=(%d,%v) want (1,true)", code, handled)
+	}
+}
+
 // --- sign-job derivation + pubkey normalization ---
 
 func TestStripPubArmor(t *testing.T) {
