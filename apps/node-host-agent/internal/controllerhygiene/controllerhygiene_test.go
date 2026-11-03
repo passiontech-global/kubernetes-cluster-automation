@@ -35,6 +35,10 @@ type env struct {
 
 	rv      map[string]map[bool]rvResult // endpoint -> cached -> result
 	journal string
+	jerr    error
+	jany    string
+	janyErr error
+	jdir    string
 	pgOK    bool
 	kills   []killRecord
 	props   map[string]string // "unit:prop" -> value
@@ -90,6 +94,7 @@ func fixture(t *testing.T) *env {
 	e := &env{
 		now:    time.Now(),
 		rv:     map[string]map[bool]rvResult{},
+		jany:   "-- No entries --\n",
 		pgOK:   true,
 		props:  map[string]string{},
 		active: map[string]string{},
@@ -100,7 +105,8 @@ func fixture(t *testing.T) *env {
 	e.fstate = filepath.Join(root, "feeder-state")
 	e.unit = filepath.Join(root, "k0scontroller.service")
 	e.cg = filepath.Join(root, "memory.events")
-	for _, d := range []string{e.state, e.proc, e.fstate} {
+	e.jdir = filepath.Join(root, "journal")
+	for _, d := range []string{e.state, e.proc, e.fstate, e.jdir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -128,6 +134,7 @@ func fixture(t *testing.T) *env {
 		KineTTLMode:           ModeEnforce,
 		KinePoolMode:          ModeEnforce,
 		OOMLoopMode:           ModeEnforce,
+		JournalDirs:           []string{e.jdir},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -147,7 +154,13 @@ func fixture(t *testing.T) *env {
 		return r.rv, true
 	}
 	cfg.journalFn = func(context.Context, string, time.Time) (string, error) {
-		return e.journal, nil
+		return e.journal, e.jerr
+	}
+	// Unfiltered journald probe: report journald alive so scripted
+	// empty unit journals classify as a quiet unit, never as
+	// journald-level blindness.
+	cfg.journalAnyFn = func(context.Context) (string, error) {
+		return e.jany, e.janyErr
 	}
 	cfg.pgWireFn = func(context.Context, string) bool { return e.pgOK }
 	cfg.restartFn = func(_ context.Context, unit string) error {
@@ -1216,5 +1229,247 @@ func TestRunCycleDeadlineAbortsStall(t *testing.T) {
 	}
 	if log := watchdogLog(t, e); !strings.Contains(log, "cycle deadline") {
 		t.Fatalf("cycle deadline not logged:\n%s", log)
+	}
+}
+
+// --- suspect-log dedupe (held-latch per-cycle spam, nonprod 2026-10) ---
+
+// countLogLines returns the number of watchdog log lines containing
+// needle.
+func countLogLines(t *testing.T, e *env, needle string) int {
+	t.Helper()
+	n := 0
+	for _, l := range strings.Split(watchdogLog(t, e), "\n") {
+		if strings.Contains(l, needle) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestTTLLoopSuspectLogDeduped(t *testing.T) {
+	e := fixture(t)
+	ctx := context.Background()
+	e.journal = "E TTL event watch failed\n"
+	const line = "suspect: kine-ttl-loop"
+
+	// Two consecutive wedged pids → loop latch; the suspect line
+	// lands once on the latch-enter cycle.
+	e.mkProc(t, 3001, "kine", []string{"kine"}, 1000)
+	e.h.Cycle(ctx) // rew=1: tier-1 kill
+	if len(e.kills) != 1 {
+		t.Fatalf("first wedged pid not killed: %v", e.kills)
+	}
+	if err := os.RemoveAll(filepath.Join(e.proc, "3001")); err != nil {
+		t.Fatal(err)
+	}
+	e.mkProc(t, 3002, "kine", []string{"kine"}, 400)
+	e.h.Cycle(ctx) // rew=2 → kine-ttl-loop latched
+	if !e.hasState(stateKineTTLLoop) {
+		t.Fatal("kine-ttl-loop not latched")
+	}
+	if n := countLogLines(t, e, line); n != 1 {
+		t.Fatalf("suspect lines=%d want 1 on latch entry", n)
+	}
+
+	// Held latch: repeated wedged cycles emit no repeat within the
+	// cadence — but the rewedge counter still tracks new pids.
+	for i := 0; i < 3; i++ {
+		e.h.Cycle(ctx)
+	}
+	if err := os.RemoveAll(filepath.Join(e.proc, "3002")); err != nil {
+		t.Fatal(err)
+	}
+	e.mkProc(t, 3003, "kine", []string{"kine"}, 400)
+	e.h.Cycle(ctx) // rew=3, same latch episode
+	if rew := e.h.ctrRead(fileCtrTTLRewedge); rew != 3 {
+		t.Fatalf("rewedge counter=%d want 3 — increments must continue under dedupe", rew)
+	}
+	if n := countLogLines(t, e, line); n != 1 {
+		t.Fatalf("suspect repeated while latch held: %d", n)
+	}
+
+	// Cadence expiry → exactly one re-reminder, then deduped again.
+	e.now = e.now.Add(e.h.cfg.SuspectLogCadence + time.Second)
+	e.h.Cycle(ctx)
+	if n := countLogLines(t, e, line); n != 2 {
+		t.Fatalf("re-reminder missing after cadence expiry: %d", n)
+	}
+	e.h.Cycle(ctx)
+	if n := countLogLines(t, e, line); n != 2 {
+		t.Fatalf("suspect repeated inside cadence window: %d", n)
+	}
+
+	// Latch exit (clean journal) drops the dedupe budget, so a
+	// re-entry logs a fresh line even inside the cadence window.
+	e.journal = ""
+	e.h.Cycle(ctx)
+	if e.hasState(stateKineTTLLoop) || e.hasState(stateKineTTLDead) {
+		t.Fatal("clean kine did not clear the TTL latches")
+	}
+	e.journal = "E TTL event watch failed\n"
+	e.h.Cycle(ctx) // pid 3003 wedges again: rew=1 — no loop yet
+	if n := countLogLines(t, e, line); n != 2 {
+		t.Fatalf("unexpected suspect before loop re-entry: %d", n)
+	}
+	if err := os.RemoveAll(filepath.Join(e.proc, "3003")); err != nil {
+		t.Fatal(err)
+	}
+	e.mkProc(t, 3004, "kine", []string{"kine"}, 400)
+	e.h.Cycle(ctx) // rew=2 → latch re-entered
+	if !e.hasState(stateKineTTLLoop) {
+		t.Fatal("kine-ttl-loop not re-latched")
+	}
+	if n := countLogLines(t, e, line); n != 3 {
+		t.Fatalf("no fresh suspect on latch re-entry: %d", n)
+	}
+}
+
+func TestCacheStaleSuspectLogDeduped(t *testing.T) {
+	e := fixture(t)
+	ctx := context.Background()
+	// Healthy rv (gap measurable, no wedge) isolates the stale
+	// check — the dead-fallback path is not exercised.
+	e.setRV("127.0.0.1:6443", false, 70000, true)
+	e.setRV("127.0.0.1:6443", true, 70000, true)
+	const line = "suspect: apiserver-cache-stale -"
+
+	e.journal = strings.Repeat(
+		"x required revision has been compacted\n", 20)
+	for i := 0; i < 3; i++ { // latch held across cycles → one line
+		e.h.Cycle(ctx)
+	}
+	if !e.hasState(stateCacheStale) {
+		t.Fatal("apiserver-cache-stale not latched")
+	}
+	if n := countLogLines(t, e, line); n != 1 {
+		t.Fatalf("suspect repeated while latch held: %d", n)
+	}
+	// Cadence expiry → exactly one re-reminder.
+	e.now = e.now.Add(e.h.cfg.SuspectLogCadence + time.Second)
+	e.h.Cycle(ctx)
+	if n := countLogLines(t, e, line); n != 2 {
+		t.Fatalf("re-reminder missing after cadence expiry: %d", n)
+	}
+	// Journal quiets → latch exits; a re-entry must log fresh.
+	e.journal = ""
+	e.h.Cycle(ctx)
+	if e.hasState(stateCacheStale) {
+		t.Fatal("stale latch not cleared")
+	}
+	e.journal = strings.Repeat(
+		"x required revision has been compacted\n", 20)
+	e.h.Cycle(ctx)
+	if n := countLogLines(t, e, line); n != 3 {
+		t.Fatalf("no fresh suspect on latch re-entry: %d", n)
+	}
+}
+
+// --- journal-unreadable blindness latch (journalwatch tracker) ---
+// Field incident: journald broken on a cicd controller — journalctl
+// killed/empty although journal files exist — every journal-grep
+// check silently saw "0 hits" with no persistent signal.
+
+func TestJournalUnreadableLatchesAfterConsecFails(t *testing.T) {
+	e := fixture(t)
+	ctx := context.Background()
+	e.jerr = fmt.Errorf("signal: killed") // journalctl dies every read
+	for i := 0; i < defaultJournalUnreadableNeeded-1; i++ {
+		e.h.Cycle(ctx)
+		if e.hasState(stateJournalUnreadable) {
+			t.Fatalf("latched early at cycle %d", i+1)
+		}
+	}
+	e.h.Cycle(ctx)
+	if !e.hasState(stateJournalUnreadable) {
+		t.Fatal("state-journal-unreadable not latched after Needed failed reads")
+	}
+	if n := countLogLines(t, e, "suspect: journal-unreadable"); n != 1 {
+		t.Fatalf("suspect lines=%d want 1 on latch entry", n)
+	}
+	// Held latch: no repeat inside the cadence window.
+	for i := 0; i < 3; i++ {
+		e.h.Cycle(ctx)
+	}
+	if n := countLogLines(t, e, "suspect: journal-unreadable"); n != 1 {
+		t.Fatalf("suspect repeated while latch held: %d", n)
+	}
+}
+
+func TestJournalUnreadableClearsOnRecovery(t *testing.T) {
+	e := fixture(t)
+	ctx := context.Background()
+	e.jerr = fmt.Errorf("signal: killed")
+	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
+		e.h.Cycle(ctx)
+	}
+	if !e.hasState(stateJournalUnreadable) {
+		t.Fatal("precondition: latch should be held")
+	}
+	e.jerr = nil
+	e.journal = "Oct 01 node k0s: healthy line\n"
+	e.h.Cycle(ctx)
+	if e.hasState(stateJournalUnreadable) {
+		t.Fatal("latch not cleared on first healthy read")
+	}
+	if n := countLogLines(t, e, "STATE-EXIT: journal-unreadable"); n != 1 {
+		t.Fatalf("STATE-EXIT lines=%d want 1", n)
+	}
+}
+
+func TestJournalUnreadableNoFireWithoutJournalDir(t *testing.T) {
+	e := fixture(t)
+	// No journal storage at all — journald legitimately absent is a
+	// config, not a failure: reads failing forever must never latch.
+	e.h.journalReads.Dirs = []string{filepath.Join(t.TempDir(), "missing")}
+	e.jerr = fmt.Errorf("signal: killed")
+	for i := 0; i < defaultJournalUnreadableNeeded+2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if e.hasState(stateJournalUnreadable) {
+		t.Fatal("latched without any journal storage — must not fire")
+	}
+	if n := countLogLines(t, e, "suspect: journal-unreadable"); n != 0 {
+		t.Fatalf("suspect lines=%d want 0", n)
+	}
+}
+
+func TestJournalUnreadableEmptyWindowQuietUnitNoFire(t *testing.T) {
+	e := fixture(t)
+	// Empty unit window BUT the unfiltered probe answers — a quiet
+	// unit on a healthy journald must never count as blindness.
+	e.journal = ""
+	e.jany = "-- No entries --\n"
+	for i := 0; i < defaultJournalUnreadableNeeded+2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if e.hasState(stateJournalUnreadable) {
+		t.Fatal("quiet unit on healthy journald must not latch")
+	}
+}
+
+func TestJournalUnreadableEmptyWindowSilentJournaldFires(t *testing.T) {
+	e := fixture(t)
+	// Empty unit window AND the unfiltered journald probe returns
+	// literally nothing — journald-level blindness.
+	e.journal = ""
+	e.jany = ""
+	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.hasState(stateJournalUnreadable) {
+		t.Fatal("journald-wide silence should latch journal-unreadable")
+	}
+}
+
+func TestJournalUnreadableFilesGoneMarkerFires(t *testing.T) {
+	e := fixture(t)
+	// journalctl ran but reports it cannot open the journal storage.
+	e.journal = "No journal files were found.\n"
+	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.hasState(stateJournalUnreadable) {
+		t.Fatal("'No journal files' reads should latch journal-unreadable")
 	}
 }

@@ -3,11 +3,18 @@ package apiprober
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -137,12 +145,18 @@ func (f *fakeHAProxy) commands() []string {
 // apiStub is a fake apiserver serving LIST responses with controllable
 // resourceVersions. resourceVersion=0 → cacheRV, anything else →
 // liveRV. fail=true makes queries fail (stall simulation).
+// cacheStatus/liveStatus force an HTTP status per path (0 = normal);
+// wantToken, when set, demands that exact bearer token and 401s
+// otherwise (credential verification for the token-reload tests).
 type apiStub struct {
-	srv     *httptest.Server
-	mu      sync.Mutex
-	cacheRV int64
-	liveRV  int64
-	fail    bool
+	srv         *httptest.Server
+	mu          sync.Mutex
+	cacheRV     int64
+	liveRV      int64
+	fail        bool
+	cacheStatus int
+	liveStatus  int
+	wantToken   string
 }
 
 func newAPIStub(t *testing.T) *apiStub {
@@ -160,13 +174,23 @@ func newAPIStubOn(t *testing.T, listenAddr string) *apiStub {
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		if a.fail {
-			w.WriteHeader(http.StatusServiceUnavailable)
+		if a.wantToken != "" &&
+			r.Header.Get("Authorization") != "Bearer "+a.wantToken {
+			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		rv := a.liveRV
+		status := a.liveStatus
 		if r.URL.Query().Get("resourceVersion") == "0" {
 			rv = a.cacheRV
+			status = a.cacheStatus
+		}
+		if status == 0 && a.fail {
+			status = http.StatusServiceUnavailable
+		}
+		if status != 0 {
+			w.WriteHeader(status)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"apiVersion":"v1","kind":"List","metadata":{"resourceVersion":"%d"},"items":[]}`, rv)
@@ -194,6 +218,22 @@ func (a *apiStub) setFail(fail bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.fail = fail
+}
+
+// setStatus forces an HTTP status per probe path — 0 restores the
+// normal LIST response (auth still applies when wantToken is set).
+func (a *apiStub) setStatus(cache, live int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cacheStatus, a.liveStatus = cache, live
+}
+
+// setToken makes the stub require that exact bearer token — "" lifts
+// the requirement (the injected-client fixtures send no auth).
+func (a *apiStub) setToken(want string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.wantToken = want
 }
 
 // fixture wires a Prober against the fake socket + injected HTTP
@@ -701,20 +741,21 @@ func TestListRV(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rv, ok := p.listRV(context.Background(), addr, "/api/v1/nodes?limit=1")
-	if !ok || rv != 42 {
-		t.Fatalf("listRV = %d, %v want 42, true", rv, ok)
+	rv, fc, ferr := p.listRV(context.Background(), addr, "/api/v1/nodes?limit=1")
+	if fc != failNone || rv != 42 {
+		t.Fatalf("listRV = %d, %v, %v want 42, failNone, nil", rv, fc, ferr)
 	}
 	if gotAuth != "Bearer tok-abc" {
 		t.Fatalf("Authorization=%q want %q", gotAuth, "Bearer tok-abc")
 	}
 
-	// Unreadable token file → query fails closed. Cycle refreshes
-	// p.eff from cfg every round — refresh here to pick the change up.
+	// Unreadable token file → query fails closed as failToken
+	// (probe-side). Cycle refreshes p.eff from cfg every round —
+	// refresh here to pick the change up.
 	p.cfg.TokenFile = filepath.Join(t.TempDir(), "absent")
 	p.refreshGuard()
-	if rv, ok := p.listRV(context.Background(), addr, "/x"); ok || rv != 0 {
-		t.Fatalf("listRV(bad token) = %d, %v want 0, false", rv, ok)
+	if rv, fc, _ := p.listRV(context.Background(), addr, "/x"); fc != failToken || rv != 0 {
+		t.Fatalf("listRV(bad token) = %d, %v want 0, failToken", rv, fc)
 	}
 }
 
@@ -723,10 +764,13 @@ func TestListRVFailureModes(t *testing.T) {
 		name   string
 		status int
 		body   string
+		wantFC failClass
 	}{
-		{"non-200", http.StatusServiceUnavailable, `{"metadata":{"resourceVersion":"1"}}`},
-		{"not-json", http.StatusOK, `this is not json`},
-		{"non-numeric-rv", http.StatusOK, `{"metadata":{"resourceVersion":"abc"}}`},
+		{"non-200", http.StatusServiceUnavailable, `{"metadata":{"resourceVersion":"1"}}`, failStatus},
+		{"unauthorized", http.StatusUnauthorized, ``, failAuth},
+		{"forbidden", http.StatusForbidden, ``, failAuth},
+		{"not-json", http.StatusOK, `this is not json`, failParse},
+		{"non-numeric-rv", http.StatusOK, `{"metadata":{"resourceVersion":"abc"}}`, failParse},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -735,15 +779,22 @@ func TestListRVFailureModes(t *testing.T) {
 				io.WriteString(w, tc.body)
 			}))
 			defer srv.Close()
-			p, err := New(Config{InsecureTLS: true, TokenFile: ""},
+			// HTTPClient==nil exercises the production path — a
+			// readable token file is required or the query fails at
+			// failToken before the request is even sent.
+			tokenFile := filepath.Join(t.TempDir(), "token")
+			if err := os.WriteFile(tokenFile, []byte("tok\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			p, err := New(Config{InsecureTLS: true, TokenFile: tokenFile},
 				prometheus.NewRegistry())
 			if err != nil {
 				t.Fatal(err)
 			}
-			rv, ok := p.listRV(context.Background(),
+			rv, fc, _ := p.listRV(context.Background(),
 				strings.TrimPrefix(srv.URL, "https://"), "/x")
-			if ok || rv != 0 {
-				t.Fatalf("listRV = %d, %v want 0, false", rv, ok)
+			if fc != tc.wantFC || rv != 0 {
+				t.Fatalf("listRV = %d, %v want 0, %v", rv, fc, tc.wantFC)
 			}
 		})
 	}
@@ -1357,8 +1408,8 @@ func TestListRVTransportErrors(t *testing.T) {
 		}
 		// A space in the host makes http.NewRequest fail before any
 		// dial — covers the request-build error return.
-		if rv, ok := p.listRV(context.Background(), "bad addr", "/x"); ok || rv != 0 {
-			t.Fatalf("listRV(bad url) = %d, %v want 0, false", rv, ok)
+		if rv, fc, _ := p.listRV(context.Background(), "bad addr", "/x"); fc != failRequest || rv != 0 {
+			t.Fatalf("listRV(bad url) = %d, %v want 0, failRequest", rv, fc)
 		}
 	})
 
@@ -1370,8 +1421,8 @@ func TestListRVTransportErrors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if rv, ok := p.listRV(context.Background(), "127.0.0.1:6443", "/x"); ok || rv != 0 {
-			t.Fatalf("listRV(transport err) = %d, %v want 0, false", rv, ok)
+		if rv, fc, _ := p.listRV(context.Background(), "127.0.0.1:6443", "/x"); fc != failTransp || rv != 0 {
+			t.Fatalf("listRV(transport err) = %d, %v want 0, failTransp", rv, fc)
 		}
 	})
 
@@ -1388,8 +1439,8 @@ func TestListRVTransportErrors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if rv, ok := p.listRV(context.Background(), "127.0.0.1:6443", "/x"); ok || rv != 0 {
-			t.Fatalf("listRV(body err) = %d, %v want 0, false", rv, ok)
+		if rv, fc, _ := p.listRV(context.Background(), "127.0.0.1:6443", "/x"); fc != failBody || rv != 0 {
+			t.Fatalf("listRV(body err) = %d, %v want 0, failBody", rv, fc)
 		}
 	})
 }
@@ -1412,15 +1463,15 @@ func TestListRVParseAndTimeout(t *testing.T) {
 
 	t.Run("unparseable json", func(t *testing.T) {
 		p, addr := mkProber(t, `this is not json`)
-		if rv, ok := p.listRV(context.Background(), addr, "/x"); ok || rv != 0 {
-			t.Fatalf("listRV(not json) = %d, %v want 0, false", rv, ok)
+		if rv, fc, _ := p.listRV(context.Background(), addr, "/x"); fc != failParse || rv != 0 {
+			t.Fatalf("listRV(not json) = %d, %v want 0, failParse", rv, fc)
 		}
 	})
 
 	t.Run("non numeric rv", func(t *testing.T) {
 		p, addr := mkProber(t, `{"metadata":{"resourceVersion":"abc"}}`)
-		if rv, ok := p.listRV(context.Background(), addr, "/x"); ok || rv != 0 {
-			t.Fatalf("listRV(non-numeric rv) = %d, %v want 0, false", rv, ok)
+		if rv, fc, _ := p.listRV(context.Background(), addr, "/x"); fc != failParse || rv != 0 {
+			t.Fatalf("listRV(non-numeric rv) = %d, %v want 0, failParse", rv, fc)
 		}
 	})
 
@@ -1433,9 +1484,9 @@ func TestListRVParseAndTimeout(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if rv, ok := p.listRV(context.Background(),
-			strings.TrimPrefix(srv.URL, "https://"), "/x"); ok || rv != 0 {
-			t.Fatalf("listRV(503) = %d, %v want 0, false", rv, ok)
+		if rv, fc, _ := p.listRV(context.Background(),
+			strings.TrimPrefix(srv.URL, "https://"), "/x"); fc != failStatus || rv != 0 {
+			t.Fatalf("listRV(503) = %d, %v want 0, failStatus", rv, fc)
 		}
 	})
 
@@ -1449,9 +1500,9 @@ func TestListRVParseAndTimeout(t *testing.T) {
 			t.Fatal(err)
 		}
 		p.cfg.QueryTimeout = 30 * time.Millisecond
-		if rv, ok := p.listRV(context.Background(),
-			strings.TrimPrefix(srv.URL, "https://"), "/x"); ok || rv != 0 {
-			t.Fatalf("listRV(timeout) = %d, %v want 0, false", rv, ok)
+		if rv, fc, _ := p.listRV(context.Background(),
+			strings.TrimPrefix(srv.URL, "https://"), "/x"); fc != failTimeout || rv != 0 {
+			t.Fatalf("listRV(timeout) = %d, %v want 0, failTimeout", rv, fc)
 		}
 	})
 }
@@ -2064,10 +2115,10 @@ func TestListRVSendsPartialObjectMetadataAccept(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rv, ok := p.listRV(context.Background(),
+	rv, fc, _ := p.listRV(context.Background(),
 		strings.TrimPrefix(srv.URL, "https://"), "/api/v1/nodes?limit=1")
-	if !ok || rv != 42 {
-		t.Fatalf("listRV = %d, %v want 42, true", rv, ok)
+	if fc != failNone || rv != 42 {
+		t.Fatalf("listRV = %d, %v want 42, failNone", rv, fc)
 	}
 	const want = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
 	if gotAccept != want {
@@ -2112,9 +2163,9 @@ func TestListRVDrainsBodyPastReadCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rv, ok := p.listRV(context.Background(), "127.0.0.1:6443", "/x")
-	if !ok || rv != 42 {
-		t.Fatalf("listRV = %d, %v want 42, true", rv, ok)
+	rv, fc, _ := p.listRV(context.Background(), "127.0.0.1:6443", "/x")
+	if fc != failNone || rv != 42 {
+		t.Fatalf("listRV = %d, %v want 42, failNone", rv, fc)
 	}
 	if body.total != int64(len(payload)) {
 		t.Fatalf("body read %d/%d bytes — tail past the cap not drained",
@@ -2811,5 +2862,388 @@ func TestStaticOnlyBackendMissingServerDrainOnce(t *testing.T) {
 	}
 	if p.states["ghost"].drained {
 		t.Fatal("drained flag not cleared after tolerated enable")
+	}
+}
+
+// --- probe-side vs apiserver-side failure classification ---
+// The DEAD verdict must only fire on apiserver-side evidence —
+// credential/TLS/request-build faults are probe-side (failClass.
+// probeSide) and make the cycle inconclusive, like TCP-unreachable.
+// Field incident this guards: an api-lb-vm guard credential problem
+// failed every query for ~12.5h and logged DEAD the whole time
+// while HAProxy marked the backend UP and kubectl over the VIP
+// worked — "API queries failing" alone could not tell a broken
+// probe from a dead apiserver.
+
+func TestFailClassProbeSide(t *testing.T) {
+	for _, c := range []failClass{failToken, failAuth, failTLS, failRequest} {
+		if !c.probeSide() {
+			t.Fatalf("%v.probeSide() = false want true", c)
+		}
+	}
+	for _, c := range []failClass{failNone, failTimeout, failRefused,
+		failConn, failTransp, failStatus, failBody, failParse} {
+		if c.probeSide() {
+			t.Fatalf("%v.probeSide() = true want false", c)
+		}
+	}
+}
+
+func TestClassifyTransport(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want failClass
+	}{
+		{"context deadline", context.DeadlineExceeded, failTimeout},
+		{"wrapped deadline",
+			fmt.Errorf("Get: %w", context.DeadlineExceeded), failTimeout},
+		{"net.Error timeout",
+			&net.DNSError{IsTimeout: true, Name: "x"}, failTimeout},
+		{"conn refused",
+			fmt.Errorf("dial: %w", syscall.ECONNREFUSED), failRefused},
+		{"op error refused", &net.OpError{Op: "dial",
+			Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}},
+			failRefused},
+		{"conn reset", fmt.Errorf("read: %w", syscall.ECONNRESET), failConn},
+		{"conn aborted", fmt.Errorf("read: %w", syscall.ECONNABORTED), failConn},
+		{"eof mid-request", fmt.Errorf("read: %w", io.EOF), failConn},
+		{"unknown authority", x509.UnknownAuthorityError{}, failTLS},
+		{"hostname mismatch", x509.HostnameError{}, failTLS},
+		{"cert verification", &tls.CertificateVerificationError{}, failTLS},
+		{"cert invalid", x509.CertificateInvalidError{}, failTLS},
+		{"tls string",
+			errors.New("remote error: tls: bad certificate"), failTLS},
+		{"x509 string",
+			errors.New("x509: certificate has expired"), failTLS},
+		{"generic transport", errors.New("boom"), failTransp},
+	}
+	for _, tc := range cases {
+		if got := classifyTransport(tc.err); got != tc.want {
+			t.Fatalf("classifyTransport(%s) = %v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// wrongCAPEM renders a self-signed CA cert that does NOT sign the
+// httptest servers' certificates — a valid bundle that produces a
+// real x509 unknown-authority failure when used as CAFile.
+func wrongCAPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "wrong-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl,
+		&key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func TestListRVTLSErrorClass(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("x509 unknown authority", func(t *testing.T) {
+		// Verify-TLS against a CA that did not sign the apiserver's
+		// cert → failTLS (probe-side) — the cert-mismatch case.
+		srv := httptest.NewTLSServer(http.HandlerFunc(
+			func(w http.ResponseWriter, _ *http.Request) {}))
+		defer srv.Close()
+		caFile := filepath.Join(t.TempDir(), "ca.crt")
+		if err := os.WriteFile(caFile, wrongCAPEM(t), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		p, err := New(Config{
+			InsecureTLS: false, CAFile: caFile, TokenFile: tokenFile,
+		}, prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		rv, fc, _ := p.listRV(context.Background(),
+			strings.TrimPrefix(srv.URL, "https://"), "/x")
+		if fc != failTLS || rv != 0 {
+			t.Fatalf("listRV(wrong CA) = %d, %v want 0, failTLS", rv, fc)
+		}
+	})
+
+	t.Run("endpoint not TLS", func(t *testing.T) {
+		// A plain-HTTP endpoint under the HTTPS probe → the
+		// transport's protocol-mismatch error → failTLS.
+		srv := httptest.NewServer(http.HandlerFunc(
+			func(w http.ResponseWriter, _ *http.Request) {}))
+		defer srv.Close()
+		p, err := New(Config{InsecureTLS: true, TokenFile: tokenFile},
+			prometheus.NewRegistry())
+		if err != nil {
+			t.Fatal(err)
+		}
+		rv, fc, _ := p.listRV(context.Background(),
+			strings.TrimPrefix(srv.URL, "http://"), "/x")
+		if fc != failTLS || rv != 0 {
+			t.Fatalf("listRV(plain http) = %d, %v want 0, failTLS", rv, fc)
+		}
+	})
+}
+
+func TestProbeSideFailuresDoNotMarkDead(t *testing.T) {
+	// 401 on BOTH probe paths: every failure is probe-side — the
+	// backend is inconclusive, never qfails toward DEAD, never
+	// drains, never latches the stale file (the incident shape).
+	bad := newAPIStubOn(t, "127.0.0.2:0") // distinct dashed-IP latch name
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	wdir := t.TempDir()
+	p := fixtureExt(t, ha, ModeEnforce, nil, func(c *Config) {
+		c.WatchdogStateDir = wdir
+	})
+
+	bad.setStatus(http.StatusUnauthorized, http.StatusUnauthorized)
+	good.set(50, 50)
+	for i := 0; i < 4; i++ {
+		p.Cycle(context.Background())
+	}
+
+	if hasCmd(ha.commands(), "disable server kube_apiserver/hub1") {
+		t.Fatalf("probe-side failures drained a backend: %v", ha.commands())
+	}
+	st := p.states["hub1"]
+	if st.qfail != 0 || st.drained {
+		t.Fatalf("probe-side failures touched the DEAD path: qfail=%d drained=%v",
+			st.qfail, st.drained)
+	}
+	if got := testutil.ToFloat64(
+		p.probeFailures.WithLabelValues("hub1", "probe_error")); got != 4 {
+		t.Fatalf("probe_error=%v want 4", got)
+	}
+	if got := testutil.ToFloat64(
+		p.probeFailures.WithLabelValues("hub1", "query")); got != 0 {
+		t.Fatalf("query=%v want 0 — probe-side faults are not apiserver evidence", got)
+	}
+	if _, err := os.Stat(filepath.Join(wdir,
+		"state-apiserver-backend-stale-127-0-0-2")); !os.IsNotExist(err) {
+		t.Fatalf("stale latch written for a probe-side outage: %v", err)
+	}
+	if got := testutil.ToFloat64(p.enabled.WithLabelValues("hub2")); got != 1 {
+		t.Fatalf("enabled{hub2}=%v want 1 — healthy backend unaffected", got)
+	}
+}
+
+func TestMixedFailurePrefersApiserverSide(t *testing.T) {
+	// cache path 401 (probe-side) + live path 503 (apiserver-side):
+	// the apiserver-side failure is real evidence — qfail still
+	// accumulates toward DEAD exactly like a plain query failure.
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	bad.setStatus(http.StatusUnauthorized, http.StatusServiceUnavailable)
+	good.set(50, 50)
+	p.Cycle(context.Background())
+	p.Cycle(context.Background()) // qfail #2 → DEAD → disable
+
+	if !hasCmd(ha.commands(), "disable server kube_apiserver/hub1") {
+		t.Fatalf("no disable for apiserver-side failure, cmds=%v", ha.commands())
+	}
+	if got := testutil.ToFloat64(
+		p.probeFailures.WithLabelValues("hub1", "query")); got < 2 {
+		t.Fatalf("query=%v want >=2", got)
+	}
+	if got := testutil.ToFloat64(
+		p.probeFailures.WithLabelValues("hub1", "probe_error")); got != 0 {
+		t.Fatalf("probe_error=%v want 0 — mixed failure is apiserver evidence", got)
+	}
+}
+
+func TestProbeErrorBackendIsNotFreshForFence(t *testing.T) {
+	// A probe-side-erroring backend can neither prove itself fresh
+	// nor be declared dead — so it must NOT supply the "fresh
+	// backend" the drain fence needs: hub2 stays wedged AND
+	// protected while hub1's credential is broken (fresh=0 → FENCE).
+	broken := newAPIStub(t)
+	wedged := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", broken.addr()},
+		[2]string{"hub2", wedged.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	broken.setStatus(http.StatusUnauthorized, http.StatusUnauthorized)
+	wedged.set(100, 100000) // rv gap >> GapMin(1000) → stale
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	for _, name := range []string{"hub1", "hub2"} {
+		if hasCmd(ha.commands(), "disable server kube_apiserver/"+name) {
+			t.Fatalf("disable issued for %s: %v", name, ha.commands())
+		}
+	}
+	if got := testutil.ToFloat64(
+		p.actions.WithLabelValues("hub2", "fence_skip")); got < 1 {
+		t.Fatalf("fence_skip=%v want >=1 — wedged backend kept, no fresh backend", got)
+	}
+}
+
+func TestTokenRotationSelfHeals(t *testing.T) {
+	// Production credential path (no injected client): the token
+	// file is re-read on EVERY query, so a credential rotated on
+	// disk self-heals on the next cycle without an agent restart —
+	// the api-lb-vm shape where hubsync re-pushes
+	// /etc/api-backend-guard/token.
+	stub := newAPIStub(t)
+	stub.setToken("good-token")
+	stub.set(50, 50)
+	ha := newFakeHAProxy(t, [2]string{"hub1", stub.addr()})
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenFile, []byte("stale-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(Config{
+		SocketPath:    ha.sockPath,
+		BackendName:   "kube_apiserver",
+		Mode:          ModeEnforce,
+		GapMin:        1000,
+		FailCycles:    2,
+		FrozenCycles:  2,
+		RecoverCycles: 3,
+		TokenFile:     tokenFile,
+		InsecureTLS:   true,
+		// Point the conf overlay at a file that never exists — this
+		// test owns TokenFile; a stray real /etc conf must not win.
+		GuardSrc: NewGuardReloader(
+			filepath.Join(dir, "absent.conf"), GuardDefaults{}),
+		TCPCheck: func(context.Context, string) error { return nil },
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stale credential → 401 → probe_error, never DEAD.
+	p.Cycle(context.Background())
+	if got := testutil.ToFloat64(
+		p.probeFailures.WithLabelValues("hub1", "probe_error")); got != 1 {
+		t.Fatalf("probe_error=%v want 1", got)
+	}
+	st := p.states["hub1"]
+	if st.qfail != 0 || st.probeErr == "" {
+		t.Fatalf("stale credential should be inconclusive: qfail=%d probeErr=%q",
+			st.qfail, st.probeErr)
+	}
+
+	// Rotate the credential file — picked up on the very next probe.
+	if err := os.WriteFile(tokenFile, []byte("good-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p.Cycle(context.Background())
+	if st.probeErr != "" {
+		t.Fatal("probeErr latch not cleared after credential healed")
+	}
+	if st.ok != 1 || st.qfail != 0 {
+		t.Fatalf("healed backend state ok=%d qfail=%d want 1/0", st.ok, st.qfail)
+	}
+	if got := testutil.ToFloat64(p.enabled.WithLabelValues("hub1")); got != 1 {
+		t.Fatalf("enabled=%v want 1 after credential rotation", got)
+	}
+	if got := testutil.ToFloat64(
+		p.probeFailures.WithLabelValues("hub1", "probe_error")); got != 1 {
+		t.Fatalf("probe_error=%v want 1 — healed cycle counted no error", got)
+	}
+}
+
+func TestProbeErrLoggedOncePerStateChange(t *testing.T) {
+	// The PROBE-ERR Warn is edge-latched on the failure-class pair —
+	// a persistent credential outage logs once, not once per cycle;
+	// recovery and re-entry log once each.
+	buf := captureSlog(t)
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	bad.setStatus(http.StatusUnauthorized, http.StatusUnauthorized)
+	good.set(50, 50)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	logs := buf.String()
+	if n := strings.Count(logs, "PROBE-ERR"); n != 1 {
+		t.Fatalf("PROBE-ERR lines=%d want 1 (edge latch):\n%s", n, logs)
+	}
+	if !strings.Contains(logs, `cacheErr="auth: HTTP 401`) {
+		t.Fatalf("PROBE-ERR line missing the concrete failure class:\n%s", logs)
+	}
+
+	// Recovery — one informational transition line.
+	bad.setStatus(0, 0)
+	bad.set(50, 50)
+	p.Cycle(context.Background())
+	logs = buf.String()
+	if n := strings.Count(logs, "probe-side errors cleared"); n != 1 {
+		t.Fatalf("cleared lines=%d want 1:\n%s", n, logs)
+	}
+	if n := strings.Count(logs, "PROBE-ERR"); n != 1 {
+		t.Fatalf("PROBE-ERR lines=%d want 1 after recovery:\n%s", n, logs)
+	}
+
+	// Re-entering the same failure logs again (new state-change).
+	bad.setStatus(http.StatusUnauthorized, http.StatusUnauthorized)
+	p.Cycle(context.Background())
+	if n := strings.Count(buf.String(), "PROBE-ERR"); n != 2 {
+		t.Fatalf("PROBE-ERR lines=%d want 2 after re-entry:\n%s", n, buf.String())
+	}
+}
+
+func TestDEADLogCarriesErrorDetail(t *testing.T) {
+	// The DEAD line — the line that logged "API queries failing" for
+	// 12.5h with no detail — now carries the concrete per-path
+	// failure class + error.
+	buf := captureSlog(t)
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	p := fixture(t, ha, ModeEnforce, nil)
+
+	bad.setStatus(http.StatusServiceUnavailable, http.StatusServiceUnavailable)
+	good.set(50, 50)
+	p.Cycle(context.Background())
+	p.Cycle(context.Background()) // qfail #2 → DEAD
+
+	logs := buf.String()
+	if !strings.Contains(logs, "DEAD: API queries failing") {
+		t.Fatalf("DEAD line missing:\n%s", logs)
+	}
+	for _, want := range []string{
+		`cacheErr="http_status: HTTP 503`, `liveErr="http_status: HTTP 503`,
+	} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("DEAD line missing %q:\n%s", want, logs)
+		}
 	}
 }

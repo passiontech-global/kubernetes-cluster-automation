@@ -47,7 +47,11 @@
 //   - A TCP-unreachable backend is left alone (HAProxy's tcp-check
 //     already marked it DOWN). But a TCP-alive backend whose queries
 //     fail FailCycles in a row is an apiserver stall/wedge — worse
-//     than DOWN — and is drained like a wedge.
+//     than DOWN — and is drained like a wedge. Failures classified
+//     probe-side (credential file unreadable, auth 401/403, TLS
+//     trust, request build) are NOT apiserver evidence — the cycle
+//     is inconclusive for that backend, counts neither fresh nor
+//     stale, and can never reach the DEAD verdict.
 //   - Mode=dry-run (default) logs "would disable/enable" only.
 //     Switch to enforce after the detection loop is verified.
 package apiprober
@@ -59,6 +63,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -70,6 +75,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -93,9 +99,11 @@ const (
 	defaultFrozenCycles  = 2
 	defaultRecoverCycles = 3
 	defaultTCPTimeout    = 5 * time.Second  // `timeout 5 /dev/tcp` preflight
-	defaultQueryTimeout  = 12 * time.Second // curl --max-time 12
-	defaultTokenFile     = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-	defaultCAFile        = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	defaultQueryTimeout  = 12 * time.Second // curl --max-time 12 — generous: the
+	// inter-DC probe path over nebula is ~ms RTT, so a timeout class
+	// failure is genuine apiserver stall evidence, not WAN latency.
+	defaultTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	defaultCAFile    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	// LivePath is a consistent (etcd) read — no resourceVersion. The
 	// nodes list is used because the SA has nodes get,list and
 	// /api/v1 has no leases resource (Lease is coordination.k8s.io).
@@ -283,6 +291,13 @@ type backendState struct {
 	prevCache int64 // last observed rv_cache
 	hasPrev   bool
 	drained   bool // we issued disable (or are tracking it)
+	// probeErr is the edge-latch key ("<cache class>|<live class>")
+	// of the probe-side failure last Warn'd — the PROBE-ERR line
+	// logs once on state-change (entering probe_error, or the class
+	// pair changing), and a recovery line logs once when the cycle
+	// stops being all-probe-side. A multi-hour credential outage
+	// logs a handful of lines, not one per cycle.
+	probeErr string
 }
 
 // Prober runs the wedge-detection loop.
@@ -356,7 +371,8 @@ func New(cfg Config, reg prometheus.Registerer) (*Prober, error) {
 	}, []string{"backend"})
 	p.probeFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_apiprober_probe_failures_total",
-		Help: "Backend probe failures by phase (tcp|query).",
+		Help: "Backend probe failures by phase (tcp|query|probe_error). " +
+			"probe_error = the fault is probe-side (credential/TLS), not apiserver evidence.",
 	}, []string{"backend", "phase"})
 	p.actions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_apiprober_actions_total",
@@ -692,20 +708,118 @@ func (p *Prober) tcpPreflight(ctx context.Context, addr string) error {
 	return conn.Close()
 }
 
+// failClass classifies why one backend query produced no usable rv —
+// the DEAD verdict must fire on apiserver-side evidence only, so
+// probe-side faults (credential file, auth reject, TLS trust, local
+// request build) get their own classes and never accumulate qfail.
+// The class is also the diagnostic operators were missing: "API
+// queries failing" alone cannot tell an expired token from a wedged
+// apiserver (the field incident this fixes: api-lb-vm logged DEAD
+// for ~12.5h on a healthy backend while the data path was fine —
+// HAProxy marked it UP and kubectl over the VIP worked).
+type failClass string
+
+const (
+	failNone    failClass = ""              // query OK
+	failToken   failClass = "token_read"    // token file unreadable — request never sent
+	failAuth    failClass = "auth"          // HTTP 401/403 — credential rejected
+	failTLS     failClass = "tls"           // handshake/x509 — trust/identity mismatch
+	failRequest failClass = "request_build" // URL/header build failed — local config
+	failTimeout failClass = "timeout"       // deadline exceeded — apiserver/network stall
+	failRefused failClass = "conn_refused"  // ECONNREFUSED despite TCP preflight
+	failConn    failClass = "conn_dropped"  // reset/aborted/EOF mid-request
+	failTransp  failClass = "transport"     // other RoundTrip error
+	failStatus  failClass = "http_status"   // non-200, non-auth response
+	failBody    failClass = "body_read"     // response body read error
+	failParse   failClass = "parse"         // bad JSON / non-numeric resourceVersion
+)
+
+// probeSide reports whether c is a fault of the PROBE rather than the
+// apiserver — a credential, trust or request-build failure carries
+// zero evidence about apiserver health, so a cycle whose failures
+// are all probe-side is inconclusive: the backend counts neither
+// fresh nor stale and can never reach the DEAD verdict (the 401-from-
+// a-stale-guard-token incident shape).
+func (c failClass) probeSide() bool {
+	switch c {
+	case failToken, failAuth, failTLS, failRequest:
+		return true
+	default:
+		return false
+	}
+}
+
+// failDetail renders a (class, error) pair for structured log fields
+// — "" on success, "<class>: <err>" otherwise (the error already
+// embeds the HTTP status for auth/status classes).
+func failDetail(c failClass, err error) string {
+	if c == failNone || err == nil {
+		return ""
+	}
+	return string(c) + ": " + err.Error()
+}
+
+// classifyTransport maps a RoundTrip failure to its failClass so the
+// DEAD/probe log lines carry the concrete fault — timeout vs refused
+// vs reset vs TLS — instead of an undifferentiated "transport
+// failed".
+func classifyTransport(err error) failClass {
+	var ne net.Error
+	if errors.Is(err, context.DeadlineExceeded) ||
+		(errors.As(err, &ne) && ne.Timeout()) {
+		return failTimeout
+	}
+	// Certificate verification errors surface as typed values under
+	// the RoundTrip's *url.Error.
+	var cv *tls.CertificateVerificationError
+	var ua x509.UnknownAuthorityError
+	var hn x509.HostnameError
+	var ci x509.CertificateInvalidError
+	if errors.As(err, &cv) || errors.As(err, &ua) ||
+		errors.As(err, &hn) || errors.As(err, &ci) {
+		return failTLS
+	}
+	// Handshake failures that surface as plain text ("tls: bad
+	// certificate", "tls: protocol version not supported", "tls:
+	// handshake failure") or the transport's own protocol-mismatch
+	// sentinel ("server gave HTTP response to HTTPS client" — the
+	// endpoint isn't speaking TLS at all) don't wrap a typed x509
+	// error — match on the error string before falling through to
+	// generic classes.
+	if s := err.Error(); strings.Contains(s, "tls:") ||
+		strings.Contains(s, "x509:") ||
+		strings.Contains(s, "response to HTTPS") {
+		return failTLS
+	}
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return failRefused
+	case errors.Is(err, syscall.ECONNRESET),
+		errors.Is(err, syscall.ECONNABORTED),
+		errors.Is(err, io.EOF),
+		errors.Is(err, io.ErrUnexpectedEOF):
+		return failConn
+	default:
+		return failTransp
+	}
+}
+
 // listRV returns the LIST-level resourceVersion of one apiserver
-// endpoint. ok=false on any transport/HTTP/parse failure — the caller
-// treats it as a query failure, same as the shell version's "empty or
-// non-numeric" check.
-func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bool) {
+// endpoint, or a classified failure — the class + error are what the
+// DEAD/probe log lines and the probe_error split consume.
+//
+// The bearer token is re-read on EVERY query (projected SA tokens
+// rotate; the guard token on api-lb VMs is re-pushed by hubsync on
+// every converge), so a rotated credential file self-heals on the
+// next probe without an agent restart — there is no startup-cached
+// credential to expire.
+func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc failClass, err error) {
 	qctx, cancel := context.WithTimeout(ctx, p.cfg.QueryTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(qctx, http.MethodGet,
 		"https://"+addr+path, nil)
 	if err != nil {
-		slog.Debug("apiprober: query request build failed",
-			"addr", addr, "path", path, "error", err,
-			"subsystem", "apiprober")
-		return 0, false
+		return 0, failRequest, err
 	}
 	// Ask for object metadata only — both probe paths are nodes LISTs,
 	// and with resourceVersion=0 the watch-cache ignores limit=1, so
@@ -713,24 +827,20 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 	// (and truncates at the read cap once it exceeds 1 MiB).
 	req.Header.Set("Accept",
 		"application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1")
-	// Token re-read per query — the SA token is projected and rotates.
+	// Token re-read per query — see func doc. An injected HTTPClient
+	// (the test seam) issues its own auth.
 	if p.eff.tokenFile != "" && p.cfg.HTTPClient == nil {
 		tok, err := os.ReadFile(p.eff.tokenFile)
 		if err != nil {
-			slog.Debug("apiprober: token read failed — query sent no request",
-				"tokenFile", p.eff.tokenFile, "addr", addr,
-				"error", err, "subsystem", "apiprober")
-			return 0, false
+			return 0, failToken,
+				fmt.Errorf("read token %s: %w", p.eff.tokenFile, err)
 		}
 		req.Header.Set("Authorization",
 			"Bearer "+strings.TrimSpace(string(tok)))
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
-		slog.Debug("apiprober: query transport failed",
-			"addr", addr, "path", path, "error", err,
-			"subsystem", "apiprober")
-		return 0, false
+		return 0, classifyTransport(err), err
 	}
 	defer resp.Body.Close()
 	// A metadata-only list is a few hundred bytes — the 1 MiB cap is
@@ -738,17 +848,16 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 	// reuse the connection.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		slog.Debug("apiprober: query response read failed",
-			"addr", addr, "path", path, "error", err,
-			"subsystem", "apiprober")
-		return 0, false
+		return 0, failBody, err
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		slog.Debug("apiprober: query returned non-200",
-			"addr", addr, "path", path, "status", resp.StatusCode,
-			"subsystem", "apiprober")
-		return 0, false
+		fc := failStatus
+		if resp.StatusCode == http.StatusUnauthorized ||
+			resp.StatusCode == http.StatusForbidden {
+			fc = failAuth
+		}
+		return 0, fc, fmt.Errorf("HTTP %d from apiserver", resp.StatusCode)
 	}
 	var list struct {
 		Metadata struct {
@@ -756,20 +865,15 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 		} `json:"metadata"`
 	}
 	if err := json.Unmarshal(body, &list); err != nil {
-		slog.Debug("apiprober: query response unmarshal failed",
-			"addr", addr, "path", path, "error", err,
-			"subsystem", "apiprober")
-		return 0, false
+		return 0, failParse, err
 	}
 	rv, err = strconv.ParseInt(list.Metadata.ResourceVersion, 10, 64)
 	if err != nil {
-		slog.Debug("apiprober: non-numeric resourceVersion in response",
-			"addr", addr, "path", path,
-			"resourceVersion", list.Metadata.ResourceVersion,
-			"error", err, "subsystem", "apiprober")
-		return 0, false
+		return 0, failParse,
+			fmt.Errorf("non-numeric resourceVersion %q: %w",
+				list.Metadata.ResourceVersion, err)
 	}
-	return rv, true
+	return rv, failNone, nil
 }
 
 // statics returns the effective static backend set: the
@@ -1198,9 +1302,45 @@ func (p *Prober) Cycle(ctx context.Context) {
 			continue
 		}
 
-		rvCache, okC := p.listRV(ctx, b.Addr, p.cfg.CachePath)
-		rvNow, okN := p.listRV(ctx, b.Addr, p.cfg.LivePath)
+		rvCache, fcC, errC := p.listRV(ctx, b.Addr, p.cfg.CachePath)
+		rvNow, fcN, errN := p.listRV(ctx, b.Addr, p.cfg.LivePath)
+		okC, okN := fcC == failNone, fcN == failNone
 		if !okC || !okN {
+			// Split the verdict: a probe-side fault (credential
+			// unreadable/rejected, TLS trust, request build) carries
+			// ZERO evidence about the apiserver — and a query that
+			// DID succeed proves the apiserver answered a real
+			// request this cycle, so it is not dead either way.
+			// Only an apiserver-side failure class (timeout,
+			// refused, dropped, bad status, unreadable/parseable
+			// response) may feed the DEAD counter.
+			apiserverSide := (!okC && !fcC.probeSide()) ||
+				(!okN && !fcN.probeSide())
+			if !apiserverSide {
+				// Inconclusive — same treatment as TCP-unreachable:
+				// counts neither fresh nor stale, never qfails
+				// toward DEAD, never latches the stale file
+				// (incident: a stale guard token 401ing for ~12h
+				// masqueraded as a dead apiserver while HAProxy and
+				// kubectl saw the backend healthy).
+				key := string(fcC) + "|" + string(fcN)
+				if st.probeErr != key {
+					st.probeErr = key
+					log.Warn("PROBE-ERR: backend queries failing probe-side — credential/TLS fault, verdict withheld (NOT apiserver evidence)",
+						"backend", b.Name, "addr", b.Addr,
+						"cacheErr", failDetail(fcC, errC),
+						"liveErr", failDetail(fcN, errN),
+						"tokenFile", p.eff.tokenFile,
+						"caFile", p.eff.caFile)
+				}
+				p.probeFailures.WithLabelValues(b.Name, "probe_error").Inc()
+				continue
+			}
+			if st.probeErr != "" {
+				st.probeErr = ""
+				log.Info("probe: probe-side errors cleared — failures are apiserver-side now",
+					"backend", b.Name, "addr", b.Addr)
+			}
 			// TCP alive but queries fail = apiserver stall/wedge —
 			// worse than DOWN (L7 /readyz may still pass while
 			// storage is wedged, incident 2026-10-07).
@@ -1212,13 +1352,25 @@ func (p *Prober) Cycle(ctx context.Context) {
 				stale[b.Name] = true
 				log.Info("DEAD: API queries failing — apiserver stall/wedge, drain from VIP",
 					"backend", b.Name, "addr", b.Addr,
-					"cacheOK", okC, "liveOK", okN, "qfail", st.qfail)
+					"cacheOK", okC, "liveOK", okN,
+					"cacheErr", failDetail(fcC, errC),
+					"liveErr", failDetail(fcN, errN),
+					"qfail", st.qfail)
 			} else {
 				log.Info("probe: query failed — not draining yet",
-					"backend", b.Name, "qfail", st.qfail,
+					"backend", b.Name,
+					"cacheOK", okC, "liveOK", okN,
+					"cacheErr", failDetail(fcC, errC),
+					"liveErr", failDetail(fcN, errN),
+					"qfail", st.qfail,
 					"failCycles", p.eff.failCycles)
 			}
 			continue
+		}
+		if st.probeErr != "" {
+			st.probeErr = ""
+			log.Info("probe: probe-side errors cleared — backend queries healthy again",
+				"backend", b.Name, "addr", b.Addr)
 		}
 		st.qfail = 0
 		gap := rvNow - rvCache
@@ -1310,6 +1462,48 @@ func (p *Prober) Cycle(ctx context.Context) {
 				}
 			} else if b.up() {
 				fresh++
+			}
+		}
+	}
+
+	// Re-apply drains HAProxy forgot — runtime disables are not
+	// persistent, so after a HAProxy restart a previously-drained
+	// wedged backend shows UP again. This pass covers ALL drained
+	// backends, not just ones flagged stale: a probe-side outage
+	// keeps a wedged backend out of `stale`, and without it the
+	// backend silently rejoins traffic for the whole outage. The
+	// stale loop below owns re-apply for its own entries (skip
+	// duplicates). Only discovered rows can show UP again — statics
+	// are constants with no HAProxy state to forget.
+	for _, name := range func() []string {
+		ns := make([]string, 0, len(p.states))
+		for n := range p.states {
+			ns = append(ns, n)
+		}
+		sort.Strings(ns)
+		return ns
+	}() {
+		st := p.states[name]
+		if !st.drained {
+			continue
+		}
+		if _, inStale := stale[name]; inStale {
+			continue // the stale loop below re-applies these
+		}
+		b := statusByName[name]
+		if !b.discovered || !b.up() {
+			continue
+		}
+		svname, inPrimary := actionTarget(b, svnameByAddr)
+		if p.eff.mode == ModeEnforce {
+			if err := p.haproxyServer(ctx, "disable",
+				svname, !inPrimary); err != nil {
+				log.Error("re-apply disable failed",
+					"backend", name, "server", svname, "error", err)
+			} else {
+				log.Info("ACTION: re-applied disable — HAProxy forgot drained server",
+					"backend", name)
+				p.actions.WithLabelValues(name, "disable").Inc()
 			}
 		}
 	}

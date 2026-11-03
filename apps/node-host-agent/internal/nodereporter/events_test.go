@@ -432,3 +432,20 @@ func TestEmittedEventsCap(t *testing.T) {
 		t.Fatal("oldest entry was not evicted")
 	}
 }
+
+// TestJournaldUnreadableEvent: the journalwatch STATE-ENTER line
+// (one per latch entry) emits a JournaldUnreadable Event + counter —
+// the bare "suspect: journal-unreadable" line must NOT match (it's
+// the cadence-throttled re-reminder, not a new incident).
+func TestJournaldUnreadableEvent(t *testing.T) {
+	e := fixture(t)
+	e.appendLog(t, "STATE-ENTER: journal-unreadable read failed: signal: killed")
+	e.appendLog(t, "suspect: journal-unreadable read failed: signal: killed — 5 consecutive journal reads produced nothing")
+	e.cycle()
+	if got := e.counter("JournaldUnreadable"); got != 1 {
+		t.Fatalf("problem_counter{JournaldUnreadable} = %v, want 1 (STATE-ENTER only)", got)
+	}
+	if n := len(eventsByReason(t, e, "JournaldUnreadable")); n != 1 {
+		t.Fatalf("JournaldUnreadable events = %d, want 1", n)
+	}
+}

@@ -3,7 +3,7 @@
 // node-problem-detector (watchdog-state-monitor.json custom plugin +
 // watchdog-filelog-monitor.json filelog):
 //
-//   - Permanent NodeConditions: every Interval the 9 watchdog
+//   - Permanent NodeConditions: every Interval the watchdog
 //     conditions are evaluated from the latch files under
 //     WatchdogStateDir (state-<key> files, plus the installed/last-run
 //     heartbeat pair for WatchdogStale — the reporter writes those

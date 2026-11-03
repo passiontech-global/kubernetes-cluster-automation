@@ -35,32 +35,34 @@ import (
 // just entries in env.live plus a stat file under env.proc, systemd
 // is a fake argv recorder, and HTTP/unix/journal probes are canned.
 type env struct {
-	h        *Hygiene
-	cs       *fake.Clientset
-	state    string
-	proc     string
-	ctr      string
-	sb       string
-	resv     string
-	unit     string
-	kubepods string
-	live     map[int]bool
-	kills    []killRecord
-	now      time.Time
-	mu       sync.Mutex // guards sdcmds (feeder goroutine + Cycle both record)
-	sdcmds   [][]string
-	sdReply  map[string]string
-	probes   map[string]error // url → error (nil = healthy)
-	status   map[string]int   // url → canned HTTP status for probeHTTPStatus
-	sockErrs map[string]error // unix socket path → dial error
-	diskUsed float64          // /var/lib/k0s fill ratio for statfsFn
-	ingest   string           // CtrIngestDir
-	sysnet   string           // SysClassNet
-	ciliumRt string           // CiliumRuntimeConfig
-	bodyOK   map[string]bool  // :10248 healthz body=="ok" canned answers
-	unixBody []byte
-	unixErr  error
-	journal  string
+	h          *Hygiene
+	cs         *fake.Clientset
+	state      string
+	proc       string
+	ctr        string
+	sb         string
+	resv       string
+	unit       string
+	kubepods   string
+	live       map[int]bool
+	kills      []killRecord
+	now        time.Time
+	mu         sync.Mutex // guards sdcmds (feeder goroutine + Cycle both record)
+	sdcmds     [][]string
+	sdReply    map[string]string
+	probes     map[string]error // url → error (nil = healthy)
+	status     map[string]int   // url → canned HTTP status for probeHTTPStatus
+	sockErrs   map[string]error // unix socket path → dial error
+	diskUsed   float64          // /var/lib/k0s fill ratio for statfsFn
+	ingest     string           // CtrIngestDir
+	sysnet     string           // SysClassNet
+	ciliumRt   string           // CiliumRuntimeConfig
+	bodyOK     map[string]bool  // :10248 healthz body=="ok" canned answers
+	unixBody   []byte
+	unixErr    error
+	journal    string
+	journalErr error
+	jdir       string
 }
 
 type killRecord struct {
@@ -116,7 +118,8 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 	e.ingest = filepath.Join(root, "ingest")
 	e.sysnet = filepath.Join(root, "sysnet")
 	e.ciliumRt = filepath.Join(root, "agent-runtime-config.json")
-	for _, d := range []string{e.state, e.proc, e.ctr, e.sb, e.kubepods, e.ingest, e.sysnet} {
+	e.jdir = filepath.Join(root, "journal")
+	for _, d := range []string{e.state, e.proc, e.ctr, e.sb, e.kubepods, e.ingest, e.sysnet, e.jdir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -171,6 +174,7 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		SysClassNet:          e.sysnet,
 		CiliumRuntimeConfig:  e.ciliumRt,
 		ZombieStormThreshold: 500,
+		JournalDirs:          []string{e.jdir},
 	}, prometheus.NewRegistry())
 	if err != nil {
 		t.Fatal(err)
@@ -202,7 +206,7 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		return e.unixBody, e.unixErr
 	}
 	h.cfg.journalFn = func(_ context.Context) (string, error) {
-		return e.journal, nil
+		return e.journal, e.journalErr
 	}
 	// Wave-2 seams: status-code probes default 200 (healthy) unless
 	// probes[url] errors or status[url] overrides; the unix socket
@@ -2822,4 +2826,117 @@ func counterValue(c prometheus.Counter) (float64, error) {
 		return 0, err
 	}
 	return m.GetCounter().GetValue(), nil
+}
+
+// --- journal-unreadable blindness latch (journalwatch tracker) ---
+// A broken journald (killed journalctl, "No journal files", or a
+// journald-wide empty reply) blinds the 05/06 signature greps AND
+// the A5 probe itself — this must surface as state-journal-unreadable,
+// not just rotate+vacuum cooldowns.
+
+func TestJournalUnreadableLatchesAfterConsecFails(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.journalErr = fmt.Errorf("signal: killed") // journalctl dies every read
+	// Each cycle feeds up to two reads into the tracker (the lazy
+	// journalOnce snapshot + the A5 probe) — one cycle is a streak
+	// below Needed, three must have latched.
+	e.h.Cycle(context.Background())
+	if e.h.stateExists(stateJournalUnreadable) {
+		t.Fatal("latched before the streak reached Needed")
+	}
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.h.stateExists(stateJournalUnreadable) {
+		t.Fatal("state-journal-unreadable not latched after persistent read failures")
+	}
+	if n := strings.Count(logLines(t, e), "suspect: journal-unreadable"); n != 1 {
+		t.Fatalf("suspect lines=%d want 1 on latch entry", n)
+	}
+	// Held latch: no repeat lines on later cycles.
+	for i := 0; i < 3; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if n := strings.Count(logLines(t, e), "suspect: journal-unreadable"); n != 1 {
+		t.Fatalf("suspect repeated while latch held: %d", n)
+	}
+}
+
+func TestJournalUnreadableClearsOnRecovery(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.journalErr = fmt.Errorf("signal: killed")
+	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.h.stateExists(stateJournalUnreadable) {
+		t.Fatal("precondition: latch should be held")
+	}
+	e.journalErr = nil
+	e.journal = "Oct 01 node k0sworker: healthy line\n"
+	e.h.Cycle(context.Background())
+	if e.h.stateExists(stateJournalUnreadable) {
+		t.Fatal("latch not cleared on first healthy read")
+	}
+	if n := strings.Count(logLines(t, e), "STATE-EXIT: journal-unreadable"); n != 1 {
+		t.Fatalf("STATE-EXIT lines=%d want 1", n)
+	}
+}
+
+func TestJournalUnreadableNoFireWithoutJournalDir(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	// No journal storage at all — journald legitimately absent is a
+	// config, not a failure: reads failing forever must never latch.
+	e.h.journalReads.Dirs = []string{filepath.Join(t.TempDir(), "missing")}
+	e.journalErr = fmt.Errorf("signal: killed")
+	for i := 0; i < defaultJournalUnreadableNeeded+2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if e.h.stateExists(stateJournalUnreadable) {
+		t.Fatal("latched without any journal storage — must not fire")
+	}
+	if n := strings.Count(logLines(t, e), "suspect: journal-unreadable"); n != 0 {
+		t.Fatalf("suspect lines=%d want 0", n)
+	}
+}
+
+func TestJournalUnreadableEmptyWindowSilentJournaldFires(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.journal = ""                    // empty 10m k0sworker window
+	e.sdReply["journalctl -n 1"] = "" // …and journald-wide silence
+	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.h.stateExists(stateJournalUnreadable) {
+		t.Fatal("journald-wide silence should latch journal-unreadable")
+	}
+}
+
+func TestJournalUnreadableQuietUnitNoFire(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.journal = "" // quiet k0sworker window…
+	e.sdReply["journalctl -n 1"] =
+		"Oct 01 node systemd[1]: Started Daily Cleanup.\n" // …but journald answers
+	for i := 0; i < defaultJournalUnreadableNeeded+2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if e.h.stateExists(stateJournalUnreadable) {
+		t.Fatal("quiet unit on healthy journald must not latch")
+	}
+}
+
+func TestJournalUnreadableFilesGoneMarkerFires(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.journal = "No journal files were found.\n"
+	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.h.stateExists(stateJournalUnreadable) {
+		t.Fatal("'No journal files' reads should latch journal-unreadable")
+	}
 }

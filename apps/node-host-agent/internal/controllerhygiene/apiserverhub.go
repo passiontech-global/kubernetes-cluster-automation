@@ -70,7 +70,7 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 	if cacheErrs >= h.cfg.StaleMinErrs {
 		h.stateEnter(stateCacheStale,
 			fmt.Sprintf("errors=%d/6min", cacheErrs))
-		h.appendLog(fmt.Sprintf(
+		h.suspectLog(stateCacheStale, fmt.Sprintf(
 			"suspect: apiserver-cache-stale - k0scontroller journal has %d watch-cache/consistency errors in 6 minutes",
 			cacheErrs))
 	} else {
@@ -219,7 +219,7 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 
 	switch {
 	case !h.rateOK(h.cfg.WatchdogStateDir, fileRateRestart, h.cfg.MinRestartInterval):
-		h.appendLog(fmt.Sprintf(
+		h.suspectLog(stateCacheWedged, fmt.Sprintf(
 			"suspect: apiserver-cache-wedged %s (%dx) - in restart cooldown (<%dm), skip",
 			wreason, gn, int(h.cfg.MinRestartInterval.Minutes())))
 		h.actions.WithLabelValues(checkHub, "fence_cooldown").Inc()
@@ -243,7 +243,7 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 			h.actions.WithLabelValues(checkHub, "dryrun_restart").Inc()
 		}
 	default:
-		h.appendLog(fmt.Sprintf(
+		h.suspectLog(stateCacheWedged, fmt.Sprintf(
 			"suspect: apiserver-cache-wedged %s (%dx) but %s and self is not first-hub (or <%d cycles not reached) — holding",
 			wreason, gn, peerNote, h.cfg.SoloCycles))
 		h.actions.WithLabelValues(checkHub, "fence_skip").Inc()
@@ -258,8 +258,12 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 // (first-hub + SoloCycles + rate-limit). When the probe fails the
 // outage is DB-side → latch kine-backend-unreachable instead.
 func (h *Hygiene) deadFallback(ctx context.Context) {
-	h.appendLog("suspect: apiserver-cache-stale but rv-gap unmeasurable " +
-		"(self+peer query fail) — wedged/autofix skipped")
+	// Own key, not stateCacheStale: sharing the cache-stale key meant
+	// the :73 cache-stale line spent the slot first every cadence and
+	// this "autofix is blind" signal stayed suppressed permanently.
+	h.suspectLog(logKeyDeadFallbk,
+		"suspect: apiserver-cache-stale but rv-gap unmeasurable "+
+			"(self+peer query fail) — wedged/autofix skipped")
 	if h.cfg.KineDBProbe == "" {
 		return
 	}
@@ -270,7 +274,7 @@ func (h *Hygiene) deadFallback(ctx context.Context) {
 			h.ctrReset(fileCtrDead)
 			h.stateEnter(stateKineUnreachable,
 				fmt.Sprintf("%s pg-wire fail", h.cfg.KineDBProbe))
-			h.appendLog(fmt.Sprintf(
+			h.suspectLog(stateKineUnreachable, fmt.Sprintf(
 				"suspect: kine-backend-unreachable %s — apiserver fail is a consequence of DB/pgbouncer, restarting the controller is useless",
 				h.cfg.KineDBProbe))
 			return
@@ -281,13 +285,13 @@ func (h *Hygiene) deadFallback(ctx context.Context) {
 	deadFirst := h.cfg.SelfAPI != "" &&
 		(h.cfg.PeerAPI == "" || h.cfg.SelfAPI < h.cfg.PeerAPI)
 	if dn < h.cfg.SoloCycles || !deadFirst {
-		h.appendLog(fmt.Sprintf(
+		h.suspectLog(logKeyDeadFallbk, fmt.Sprintf(
 			"suspect: apiserver dead, kine db ok — dead-fallback needs %d cycles + first-hub (dn=%d first=%v)",
 			h.cfg.SoloCycles, dn, deadFirst))
 		return
 	}
 	if !h.rateOK(h.cfg.WatchdogStateDir, fileRateRestart, h.cfg.MinRestartInterval) {
-		h.appendLog(fmt.Sprintf(
+		h.suspectLog(logKeyDeadFallbk, fmt.Sprintf(
 			"suspect: apiserver dead + kine db ok but in restart cooldown (<%dm), skip",
 			int(h.cfg.MinRestartInterval.Minutes())))
 		return
@@ -364,7 +368,11 @@ func (h *Hygiene) checkKineTTL(ctx context.Context) {
 	case rew >= h.cfg.KineTTLRewedgeCycles:
 		h.stateEnter(stateKineTTLLoop,
 			fmt.Sprintf("rewedge=%dx pid=%d", rew, kpid))
-		h.appendLog(fmt.Sprintf(
+		// Held-latch dedupe (nonprod 2026-10: this line logged every
+		// 60s cycle for weeks, 1600+ mentions) — first line on latch
+		// entry, then one re-reminder per SuspectLogCadence. The rew
+		// counter above still updates every cycle.
+		h.suspectLog(stateKineTTLLoop, fmt.Sprintf(
 			"suspect: kine-ttl-loop — %d consecutive kine pids wedged from boot; deterministic env (WAN DB + seed race), fast-kill suppressed",
 			rew))
 		// Loop path: one recovery-probe kill per KineTTLCtlRestart —
@@ -392,7 +400,7 @@ func (h *Hygiene) checkKineTTL(ctx context.Context) {
 		// Tier 1 (chance wedge): only remediate once the instance
 		// survived the seed window — never restart INTO the storm.
 		if !h.rateOK(h.cfg.WatchdogStateDir, fileRateTTLKill, h.cfg.KineTTLMinRestart) {
-			h.appendLog(fmt.Sprintf(
+			h.suspectLog(stateKineTTLDead, fmt.Sprintf(
 				"suspect: kine-ttl-dead but in restart cooldown (<%dm), skip",
 				int(h.cfg.KineTTLMinRestart.Minutes())))
 			break

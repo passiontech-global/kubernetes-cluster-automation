@@ -108,6 +108,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/journalwatch"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
 )
@@ -197,6 +198,11 @@ const (
 	// journaldVacuumInterval bounds how often the A5 remedy runs —
 	// journalctl --rotate is cheap but --vacuum-time does real IO.
 	journaldVacuumInterval = 30 * time.Minute
+	// defaultJournalUnreadableNeeded is the consecutive-failed-read
+	// budget for the journal-unreadable blindness latch (cicd
+	// controller incident: broken journald left every journal-based
+	// check silently seeing "0 hits").
+	defaultJournalUnreadableNeeded = 5
 )
 
 // Check names — prometheus `check` label + log context.
@@ -220,6 +226,12 @@ const (
 	checkCiliumEnvoy = "cilium-envoy"       // B1
 	checkCiliumMTU   = "cilium-mtu"         // B4
 )
+
+// stateJournalUnreadable is the blindness latch the journal-read
+// accounting sets: journald installed (journal storage exists) but
+// every read produces nothing — the 05/06 signature greps and the
+// nodereporter journal monitors are blind until it clears.
+const stateJournalUnreadable = "journal-unreadable"
 
 // Config carries the hygiene knobs — all test-injectable.
 type Config struct {
@@ -344,6 +356,15 @@ type Config struct {
 	// content ingest rm <ref>` via the systemd exec wrapper (A3).
 	// nil → Systemd.Exec default. Seam.
 	ctrRmIngest func(ctx context.Context, ref string) error
+
+	// JournalDirs are the host journal storage roots — the
+	// journal-unreadable latch may only fire while at least one
+	// exists (a host with no journald at all fails every read by
+	// configuration, not by fault).
+	JournalDirs []string
+	// JournalUnreadableNeeded is the consecutive-failed-read budget
+	// before state-journal-unreadable latches; <=0 → 5.
+	JournalUnreadableNeeded int
 }
 
 func (c *Config) applyDefaults() {
@@ -546,7 +567,9 @@ func (c *Config) applyDefaults() {
 		sd := c.Systemd
 		c.journalFn = func(ctx context.Context) (string, error) {
 			if sd == nil {
-				return "", nil
+				// Fail, not empty: a nil client fed the unreadable
+				// tracker a fake "journald-wide empty reply" verdict.
+				return "", fmt.Errorf("no systemd client wired")
 			}
 			return sd.Journal(ctx, "k0sworker.service", journalWindow)
 		}
@@ -555,7 +578,7 @@ func (c *Config) applyDefaults() {
 		sd := c.Systemd
 		c.journalAnyFn = func(ctx context.Context) (string, error) {
 			if sd == nil {
-				return "", nil
+				return "", fmt.Errorf("no systemd client wired")
 			}
 			return sd.ExecCombined(ctx,
 				"journalctl", "-n", "1", "--no-pager")
@@ -633,6 +656,15 @@ func (c *Config) applyDefaults() {
 				"k0s", "ctr", "-n", "k8s.io", "content", "ingest", "rm", ref)
 			return err
 		}
+	}
+	if len(c.JournalDirs) == 0 {
+		// /host mount convention like the other defaults; standalone
+		// wiring passes the unprefixed host paths.
+		c.JournalDirs = []string{
+			"/host/var/log/journal", "/host/run/log/journal"}
+	}
+	if c.JournalUnreadableNeeded <= 0 {
+		c.JournalUnreadableNeeded = defaultJournalUnreadableNeeded
 	}
 }
 
@@ -713,6 +745,11 @@ type Hygiene struct {
 	ctrsockFails  int
 	envoyFails    int
 	journaldFails int
+	// journalReads is the journal-unreadable accounting — every
+	// journal read (k0sworker snapshot + A5 probes) is classified
+	// into it; the tracker fires the state-journal-unreadable latch
+	// on persistent blindness while journal storage exists.
+	journalReads journalwatch.Tracker
 	// zombieStreaks counts consecutive cycles each parent has
 	// produced > ZombieStormThreshold defunct children (A2). Keyed
 	// by zombieParent (pid + stat starttime), NOT raw pid — a pid
@@ -746,6 +783,10 @@ type Hygiene struct {
 func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	cfg.applyDefaults()
 	h := &Hygiene{cfg: cfg, zombieStreaks: map[zombieParent]int{}}
+	h.journalReads = journalwatch.Tracker{
+		Needed: cfg.JournalUnreadableNeeded,
+		Dirs:   cfg.JournalDirs,
+	}
 
 	h.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_workerhygiene_cycles_total",
@@ -865,8 +906,20 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		if !journalSet {
 			journalSet = true
 			j, err := h.cfg.journalFn(ctx)
-			if err != nil {
+			switch {
+			case err != nil:
 				h.appendLog(fmt.Sprintf("k0sworker journal snapshot failed: %v", err))
+				h.noteJournalRead(false,
+					fmt.Sprintf("snapshot failed: %v", err))
+			case journalwatch.FilesGone(j):
+				h.noteJournalRead(false,
+					"journalctl reports no journal files")
+			case strings.TrimSpace(j) != "":
+				h.noteJournalRead(true, "")
+				// err==nil && empty: a quiet 10m window is
+				// ambiguous (A5's unfiltered probe owns the
+				// disambiguation) — it neither counts the
+				// streak nor clears it.
 			}
 			journal = j
 		}
@@ -3376,12 +3429,53 @@ func (h *Hygiene) checkZombieStorm(workerActive bool) {
 	h.cycles.WithLabelValues(checkZombieStorm, "ok").Inc()
 }
 
+// noteJournalRead feeds one classified journal read into the
+// journal-unreadable tracker and drives the latch on transitions:
+// enter → state-journal-unreadable + the suspect line, logged once
+// per latch entry (the stateExists gate — the latch dedupes the
+// alert AND its first line, like checkCiliumMTU); exit → STATE-EXIT
+// when a read finally returns journal data (or the journal storage
+// vanished — config change, not blindness). The journalDir gate
+// lives inside the tracker: a host with no journald storage never
+// fires — every read failing is then configuration, not a fault.
+func (h *Hygiene) noteJournalRead(ok bool, detail string) {
+	enter, exit := h.journalReads.NoteRead(ok)
+	if enter && !h.stateExists(stateJournalUnreadable) {
+		h.stateEnter(stateJournalUnreadable, detail)
+		h.appendLog(fmt.Sprintf(
+			"suspect: journal-unreadable %s — %d consecutive journal "+
+				"reads produced nothing while journal storage exists; "+
+				"every journal-grep check is blind",
+			detail, h.journalReads.Fails()))
+		h.cycles.WithLabelValues(checkJournald, "journal_unreadable").Inc()
+	} else if h.journalReads.Latched() &&
+		!h.stateExists(stateJournalUnreadable) {
+		// Re-establish after external removal: the latch file can
+		// vanish while the tracker stays latched (janitor 24h reap,
+		// manual rm) and `enter` is a once-per-episode edge that
+		// won't fire again — without this the metric/condition go
+		// dark mid-episode.
+		h.stateEnter(stateJournalUnreadable, detail)
+	}
+	if exit {
+		h.stateExit(stateJournalUnreadable)
+	}
+}
+
 // --- Check: journald integrity (A5) ---
 // After a hard-reboot (SNR) journald's binary files corrupt at the
 // tail: `journalctl -u k0sworker` errors, prints "corrupt", or
 // returns abnormally empty while the unit is active — which also
 // blinds the 05/06 journal-signature checks. The remedy is the
 // operator's rotate+vacuum, bounded by a rate budget.
+//
+// The same probes feed the journal-unreadable accounting: when
+// journald cannot answer at all (read error, "No journal files", or
+// a journald-wide empty unfiltered reply) for JournalUnreadableNeeded
+// consecutive reads AND journal storage exists, the
+// state-journal-unreadable latch marks the blindness — the
+// rotate+vacuum remedy only covers the CORRUPT subset, a dead or
+// mute journald needs surfacing, not vacuuming.
 
 func (h *Hygiene) checkJournaldIntegrity(ctx context.Context, workerActive bool) {
 	if !workerActive {
@@ -3392,6 +3486,8 @@ func (h *Hygiene) checkJournaldIntegrity(ctx context.Context, workerActive bool)
 	corrupt := err != nil ||
 		strings.Contains(strings.ToLower(out), "corrupt")
 	empty := err == nil && strings.TrimSpace(out) == ""
+	var unfiltered string
+	var uerr error
 	if empty {
 		// "No k0sworker lines in 10m" is ambiguous — a
 		// healthy-but-quiet unit hits the same branch as real
@@ -3400,12 +3496,36 @@ func (h *Hygiene) checkJournaldIntegrity(ctx context.Context, workerActive bool)
 		// Any line means journald is fine and the unit is just
 		// silent; an error, an empty reply, or a "corrupt" warning
 		// is journald-level anomaly — only then remediate.
-		unfiltered, uerr := h.cfg.journalAnyFn(ctx)
+		unfiltered, uerr = h.cfg.journalAnyFn(ctx)
 		if uerr == nil && strings.TrimSpace(unfiltered) != "" &&
 			!strings.Contains(strings.ToLower(unfiltered), "corrupt") {
 			empty = false
 		}
 	}
+	// journal-unreadable accounting: a "corrupt" notice means
+	// journald ANSWERED (A5's remedy owns that path) — only a read
+	// that produced literally nothing while journald should be
+	// talking counts as blindness.
+	unreadable := false
+	udetail := ""
+	switch {
+	case err != nil:
+		unreadable, udetail = true, fmt.Sprintf("read failed: %v", err)
+	case journalwatch.FilesGone(out):
+		unreadable, udetail = true, "journalctl reports no journal files"
+	case empty:
+		switch {
+		case uerr != nil:
+			unreadable, udetail = true,
+				fmt.Sprintf("unfiltered probe failed: %v", uerr)
+		case journalwatch.FilesGone(unfiltered):
+			unreadable, udetail = true,
+				"journalctl reports no journal files"
+		case strings.TrimSpace(unfiltered) == "":
+			unreadable, udetail = true, "journald-wide empty reply"
+		}
+	}
+	h.noteJournalRead(!unreadable, udetail)
 	switch {
 	case corrupt, empty:
 		h.journaldFails++

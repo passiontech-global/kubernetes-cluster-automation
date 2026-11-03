@@ -81,6 +81,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/etcdrescue"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/evpurge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/journalwatch"
 )
 
 // Autofix modes — the shell *_AUTOFIX knobs are preserved verbatim:
@@ -140,6 +141,11 @@ const (
 	defaultAPIServerAdj   = -800
 	defaultKineAdj        = 500
 	defaultJournalTimeout = 15 * time.Second
+	// defaultJournalUnreadableNeeded is the consecutive-failed-read
+	// budget for the journal-unreadable blindness latch (incident:
+	// broken journald on a cicd controller left every journal check
+	// silently seeing "0 hits").
+	defaultJournalUnreadableNeeded = 5
 
 	// systemd watchdog feeder (k0s-systemd-watchdog-feeder.sh) +
 	// remediation (k0scontroller-remediate.sh)
@@ -178,6 +184,13 @@ const (
 	// older is GC debt the purge may safely delete (fresh, debuggable
 	// events survive the guard's evpurge pass).
 	eventStaleAge = time.Hour
+	// defaultSuspectLogCadence is the re-reminder interval suspectLog
+	// applies to suspect/hold lines whose latch stays held: STATE-
+	// ENTER announces the transition and the raw line then repeats
+	// at most this often — the field-verified failure mode was
+	// kine-ttl-loop logging every 60s cycle for weeks on nonprod
+	// (1600+ lines), drowning the watchdog tail.
+	defaultSuspectLogCadence = time.Hour
 )
 
 // Check names — prometheus `check` label + log context.
@@ -188,6 +201,10 @@ const (
 	checkOOMLoop  = "oomloop"
 	checkFeeder   = "feeder"
 	checkEtcd     = "etcd-quota"
+	// checkJournal is the pseudo-check label the journal-unreadable
+	// blindness accounting counts under — journald readability is a
+	// cross-cutting witness, not one of the gated checks.
+	checkJournal = "journal"
 )
 
 // State latch names — identical to the shell signal names (NPD +
@@ -200,6 +217,11 @@ const (
 	stateKineTTLDead      = "kine-ttl-dead"
 	stateKineTTLLoop      = "kine-ttl-loop"
 	stateControllerOOMLop = "k0scontroller-oom-loop"
+	// stateJournalUnreadable latches while journal reads keep
+	// producing nothing although journal storage exists — every
+	// journal-grep check is blind until it clears (suspectLog's
+	// last-suspect- budget drops with the latch via stateExit).
+	stateJournalUnreadable = "journal-unreadable"
 )
 
 // On-disk bookkeeping file names under WatchdogStateDir — same names
@@ -222,9 +244,17 @@ const (
 	fileOOMKills      = "oomloop-kills"
 	fileOOMShielded   = "oomloop-shielded"
 	fileFeederLastRst = "last-restart" // under FeederStateDir
-	clkTck            = 100.0          // getconf CLK_TCK on x86_64 Linux
-	tcpStateListen    = "0A"
-	pgAuthOK          = "RSNK"
+	// suspectLog dedupe budgets: last-suspect-<key> epoch files spent
+	// at most once per SuspectLogCadence — the same rateOK/last-*
+	// convention as the action budgets, applied to log noise.
+	// Latch-named keys are dropped by stateExit so a latch re-entry
+	// logs a fresh first line; logKeyDeadFallbk keys the dead-
+	// fallback hold lines, which have no dedicated latch.
+	fileSuspectLog   = "last-suspect-"
+	logKeyDeadFallbk = "dead-fallback"
+	clkTck           = 100.0 // getconf CLK_TCK on x86_64 Linux
+	tcpStateListen   = "0A"
+	pgAuthOK         = "RSNK"
 )
 
 // Regexes — 1:1 with the shell grep patterns.
@@ -354,6 +384,14 @@ type Config struct {
 	// EtcdGuardMinRun is the evpurge+rescue rate budget; <=0 → 1h.
 	EtcdGuardMinRun time.Duration
 
+	// SuspectLogCadence throttles repeated suspect/hold log lines to
+	// at most one per interval per key (suspectLog backed by
+	// last-suspect-<key> budget files) — the state latch already
+	// dedupes the ALERT; this dedupes the raw log line to the same
+	// discipline while counters, latches and metrics still update
+	// every cycle. <=0 → defaultSuspectLogCadence (1h).
+	SuspectLogCadence time.Duration
+
 	// HTTPClient, when set, is used for ALL apiserver queries (rv
 	// probes) and overrides the credential files — test seam.
 	HTTPClient *http.Client
@@ -381,6 +419,22 @@ type Config struct {
 		cutoff time.Time, out io.Writer) error
 	etcdRescueFn func(ctx context.Context, cfg etcdrescue.Config,
 		out io.Writer) error
+	// journalAnyFn is the unfiltered second probe used to classify an
+	// empty unit-window read — `journalctl -n 1 --no-pager` with
+	// stderr folded in. A quiet unit on a healthy journald must NOT
+	// count as blindness; only when journald itself has nothing (or
+	// only "No journal files") to say does the empty window count.
+	// nil → journalctlAny.
+	journalAnyFn func(ctx context.Context) (string, error)
+
+	// JournalDirs are the host journal storage roots — the
+	// journal-unreadable latch may only fire while at least one
+	// exists (a host with no journald at all fails every read by
+	// configuration, not by fault).
+	JournalDirs []string
+	// JournalUnreadableNeeded is the consecutive-failed-read budget
+	// before state-journal-unreadable latches; <=0 → 5.
+	JournalUnreadableNeeded int
 }
 
 func (c *Config) applyDefaults() {
@@ -549,6 +603,9 @@ func (c *Config) applyDefaults() {
 	if c.journalFn == nil {
 		c.journalFn = journalctl
 	}
+	if c.journalAnyFn == nil {
+		c.journalAnyFn = journalctlAny
+	}
 	if c.pgWireFn == nil {
 		c.pgWireFn = pgWireOK
 	}
@@ -597,6 +654,9 @@ func (c *Config) applyDefaults() {
 	if c.EtcdGuardMinRun <= 0 {
 		c.EtcdGuardMinRun = defaultEtcdGuardMinRun
 	}
+	if c.SuspectLogCadence <= 0 {
+		c.SuspectLogCadence = defaultSuspectLogCadence
+	}
 	if c.etcdctlFn == nil {
 		k0sDir, endpoint := c.K0sDir, c.EtcdEndpoint
 		bin := filepath.Join(k0sDir, "bin", "etcdctl")
@@ -643,6 +703,11 @@ type Hygiene struct {
 	client *http.Client // mTLS client for rv probes; nil when creds absent
 	credFP string       // credential-file fingerprint the client was built from
 
+	// journalReads is the journal-unreadable accounting — every
+	// journalText result is classified into it; the tracker fires the
+	// state-journal-unreadable latch on persistent blindness.
+	journalReads journalwatch.Tracker
+
 	cycles    *prometheus.CounterVec // check, result
 	actions   *prometheus.CounterVec // check, action
 	rvGap     prometheus.Gauge
@@ -672,6 +737,10 @@ func ShouldRun(hostRoot string) bool {
 func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	cfg.applyDefaults()
 	h := &Hygiene{cfg: cfg}
+	h.journalReads = journalwatch.Tracker{
+		Needed: cfg.JournalUnreadableNeeded,
+		Dirs:   cfg.JournalDirs,
+	}
 	if cfg.HTTPClient != nil {
 		h.client = cfg.HTTPClient
 	}
@@ -904,6 +973,10 @@ func (h *Hygiene) stateExit(name string) {
 			"subsystem", "controllerhygiene")
 		return
 	}
+	// Drop the suspect-log dedupe budget with the latch — a later
+	// re-entry must log a fresh first line, not stay throttled by a
+	// stale epoch from the previous incident.
+	_ = os.Remove(filepath.Join(h.cfg.WatchdogStateDir, fileSuspectLog+name))
 	h.appendLog(fmt.Sprintf("STATE-EXIT: %s", name))
 }
 
@@ -930,6 +1003,24 @@ func (h *Hygiene) rateOK(dir, name string, interval time.Duration) bool {
 // rateSpend writes the current epoch to the budget file.
 func (h *Hygiene) rateSpend(dir, name string) {
 	h.writeEpochFile(filepath.Join(dir, name))
+}
+
+// suspectLog emits a suspect/hold line at most once per
+// SuspectLogCadence per key — a last-suspect-<key> epoch file under
+// the same rateOK/rateSpend convention as the action budgets. It
+// replaces the per-cycle appendLog for lines whose latch is already
+// held: the latch dedupes the ALERT and this dedupes the raw log
+// line to the same discipline (STATE-ENTER still announces the
+// transition; a cadence re-reminder keeps a long-held latch visible
+// in the tail). Counters, latches and metrics keep updating every
+// cycle — only the LOG line is throttled.
+func (h *Hygiene) suspectLog(key, msg string) {
+	if !h.rateOK(h.cfg.WatchdogStateDir, fileSuspectLog+key,
+		h.cfg.SuspectLogCadence) {
+		return
+	}
+	h.rateSpend(h.cfg.WatchdogStateDir, fileSuspectLog+key)
+	h.appendLog(msg)
 }
 
 // ctrInc mirrors lib.sh ctr_inc: read + increment + write + return.
@@ -1109,6 +1200,14 @@ func journalctl(ctx context.Context, unit string, since time.Time) (string, erro
 	if err != nil {
 		return "", err
 	}
+	// journald's own diagnostics ("No journal files were found.",
+	// "File ... is corrupt") go to STDERR with exit 0 — a stdout-only
+	// capture classifies a broken journald as a quiet unit and the
+	// journal-unreadable latch never fires. Fold stderr in; the
+	// bounded buffer is tiny because journald diagnostics are a few
+	// lines (payload data is on stdout).
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
@@ -1117,14 +1216,33 @@ func journalctl(ctx context.Context, unit string, since time.Time) (string, erro
 	if err := cmd.Wait(); err != nil {
 		return "", err
 	}
-	return string(out), nil
+	return string(out) + stderr.String(), nil
+}
+
+// journalctlAny is the default unfiltered probe — `timeout 15
+// journalctl -n 1 --no-pager` with stderr folded in: journald's own
+// diagnostics ("No journal files were found.", "File ... is
+// corrupt") are emitted on stderr, so a stdout-only capture cannot
+// see them.
+func journalctlAny(ctx context.Context) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "journalctl", "-n", "1", "--no-pager")
+	cmd.Env = scrubSystemdEnv(os.Environ())
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 // journalText returns the unit journal since `since`, mapping errors
 // to empty — `journalctl ... 2>/dev/null | grep -c` parity (a failed
-// journal read counts as 0 hits, never as wedge evidence).
+// journal read counts as 0 hits, never as wedge evidence). Every
+// read also feeds the journal-unreadable accounting: a journald that
+// persistently answers nothing while journal storage exists blinds
+// ALL journal-grep checks, and that blindness must latch+log, not
+// stay a per-cycle warning line.
 func (h *Hygiene) journalText(ctx context.Context, since time.Time) string {
 	out, err := h.cfg.journalFn(ctx, h.cfg.JournalUnit, since)
+	h.noteJournalRead(ctx, out, err)
 	if err != nil {
 		h.appendLogWarn(fmt.Sprintf(
 			"controllerhygiene: journal read failed (unit=%s): %v — journal checks see 0 hits",
@@ -1132,6 +1250,65 @@ func (h *Hygiene) journalText(ctx context.Context, since time.Time) string {
 		return ""
 	}
 	return out
+}
+
+// classifyJournalRead reduces one journal-read result to the
+// readable/unreadable verdict the tracker counts. A legitimately
+// quiet unit window (err==nil, empty output) is ambiguous, so the
+// unfiltered `journalctl -n 1` probe disambiguates — journald
+// answering ANY line (even "-- No entries --") means the empty
+// window was a quiet unit, while an error, a files-gone notice or
+// literally zero bytes is journald-level blindness.
+func (h *Hygiene) classifyJournalRead(ctx context.Context, out string, err error) (bool, string) {
+	switch {
+	case err != nil:
+		return false, fmt.Sprintf("read failed: %v", err)
+	case journalwatch.FilesGone(out):
+		return false, "journalctl reports no journal files"
+	case strings.TrimSpace(out) == "":
+		uout, uerr := h.cfg.journalAnyFn(ctx)
+		switch {
+		case uerr != nil:
+			return false, fmt.Sprintf("unfiltered probe failed: %v", uerr)
+		case journalwatch.FilesGone(uout):
+			return false, "journalctl reports no journal files"
+		case strings.TrimSpace(uout) == "":
+			return false, "journald-wide empty reply"
+		}
+	}
+	return true, ""
+}
+
+// noteJournalRead feeds one classified journal read into the
+// journal-unreadable tracker and drives the latch on transitions:
+// enter → state-journal-unreadable + the suspect line (suspectLog
+// then re-reminds at most once per SuspectLogCadence while the
+// latch stays held); exit → STATE-EXIT. The journalDir gate lives
+// inside the tracker — a host with no journal storage never fires.
+func (h *Hygiene) noteJournalRead(ctx context.Context, out string, err error) {
+	ok, detail := h.classifyJournalRead(ctx, out, err)
+	enter, exit := h.journalReads.NoteRead(ok)
+	// Re-establish after external removal: janitor's 24h reap or a
+	// manual rm can delete the file while the tracker stays latched,
+	// and `enter` won't fire twice per episode — without this the
+	// latch/metric/condition go dark mid-episode.
+	if enter || (h.journalReads.Latched() &&
+		!h.stateExists(stateJournalUnreadable)) {
+		h.stateEnter(stateJournalUnreadable, detail)
+		if enter {
+			h.cycles.WithLabelValues(checkJournal, "journal_unreadable").Inc()
+		}
+	}
+	if !ok && h.journalReads.Latched() {
+		h.suspectLog(stateJournalUnreadable, fmt.Sprintf(
+			"suspect: journal-unreadable %s — %d consecutive journal "+
+				"reads produced nothing while journal storage exists; "+
+				"every journal-grep check is blind",
+			detail, h.journalReads.Fails()))
+	}
+	if exit {
+		h.stateExit(stateJournalUnreadable)
+	}
 }
 
 // scrubSystemdEnv drops NOTIFY_SOCKET/WATCHDOG_* so child systemctl /
@@ -1520,7 +1697,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 
 	if !h.rateOK(h.cfg.WatchdogStateDir, fileRateEtcdGuard,
 		h.cfg.EtcdGuardMinRun) {
-		h.appendLog(fmt.Sprintf(
+		h.suspectLog(checkEtcd, fmt.Sprintf(
 			"etcdguard: %s but in guard cooldown (<%dm), skip",
 			reason, int(h.cfg.EtcdGuardMinRun.Minutes())))
 		h.cycles.WithLabelValues(checkEtcd, "cooldown").Inc()

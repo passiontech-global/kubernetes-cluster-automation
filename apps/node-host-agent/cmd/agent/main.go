@@ -442,6 +442,19 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 		hostPath("/var/log/node-watchdog.log"))
 	hnode := getenv("NODE_HOST_AGENT_NODE_NAME", nodeName)
 
+	// Shared journald inputs for the journal-unreadable blindness
+	// detector (workerhygiene + controllerhygiene): the storage dirs
+	// are the "journald is installed" witness — a host with no
+	// journald fails every read by config and must never latch.
+	// hostPath() makes them unprefixed in standalone mode.
+	journalDirs := envList("NODE_HOST_AGENT_JOURNAL_DIRS")
+	if journalDirs == nil {
+		journalDirs = []string{
+			hostPath("/var/log/journal"), hostPath("/run/log/journal")}
+	}
+	journalUnreadableNeeded := envInt(
+		"NODE_HOST_AGENT_JOURNAL_UNREADABLE_NEEDED", 5)
+
 	// Shared vars/textfile dirs — hoisted out of the hostconfig
 	// block: workerhygiene (systemd_watchdog_hosts), kinedb
 	// (Detect), hubsync (VarsDir) and hostconfig itself all read the
@@ -649,13 +662,15 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 					// systemd_watchdog_hosts out of the vars dir
 					// (cluster.yaml). Absent vars dir is not an error —
 					// the feeder self-gates on k0sworker.service anyway.
-					KubeletWatchdogHosts: kubeletWatchdogHosts(varsDir, hnode),
-					StuckDeleteAge:       envDuration("NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE", 15*time.Minute),
-					StuckWedgeAge:        envDuration("NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE", 30*time.Minute),
-					MaxForceDelete:       envInt("NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE", 5),
-					ConsecNeeded:         envInt("NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED", 2),
-					MinRestartInterval:   envDuration("NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL", 30*time.Minute),
-					Client:               cs,
+					KubeletWatchdogHosts:    kubeletWatchdogHosts(varsDir, hnode),
+					StuckDeleteAge:          envDuration("NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE", 15*time.Minute),
+					StuckWedgeAge:           envDuration("NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE", 30*time.Minute),
+					MaxForceDelete:          envInt("NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE", 5),
+					ConsecNeeded:            envInt("NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED", 2),
+					MinRestartInterval:      envDuration("NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL", 30*time.Minute),
+					JournalDirs:             journalDirs,
+					JournalUnreadableNeeded: journalUnreadableNeeded,
+					Client:                  cs,
 				}, reg)
 				if err != nil {
 					slog.Error("workerhygiene setup failed", "error", err)
@@ -797,19 +812,21 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 				wdCfg.OOMLoopMinKills, 3),
 			OOMLoopWindow: envDurOr("NODE_HOST_AGENT_OOMLOOP_WINDOW_S",
 				wdCfg.OOMLoopWindowS, time.Hour),
-			AdminKubeconfig:   hostPath("/var/lib/k0s/pki/admin.conf"),
-			AdminCert:         hostPath("/var/lib/k0s/pki/admin.crt"),
-			AdminKey:          hostPath("/var/lib/k0s/pki/admin.key"),
-			AdminCA:           hostPath("/var/lib/k0s/pki/ca.crt"),
-			InsecureTLS:       envBool("NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS", true),
-			CGroupEventsFile:  hostPath("/sys/fs/cgroup/system.slice/k0scontroller.service/memory.events"),
-			FeederEnabled:     envBool("NODE_HOST_AGENT_ENABLE_FEEDER", true),
-			NotifySocket:      os.Getenv("NOTIFY_SOCKET"),
-			FeederStateDir:    hostPath("/var/lib/k0s-systemd-watchdog"),
-			RemediatePeerFile: hostPath("/etc/default/k0scontroller-watchdog"),
-			K0sDir:            getenv("NODE_HOST_AGENT_K0S_DIR", hostPath("/var/lib/k0s")),
-			EtcdEndpoint:      getenv("NODE_HOST_AGENT_ETCD_ENDPOINT", "https://127.0.0.1:2379"),
-			EtcdDBSizeLimit:   envInt64("NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT", 0),
+			AdminKubeconfig:         hostPath("/var/lib/k0s/pki/admin.conf"),
+			AdminCert:               hostPath("/var/lib/k0s/pki/admin.crt"),
+			AdminKey:                hostPath("/var/lib/k0s/pki/admin.key"),
+			AdminCA:                 hostPath("/var/lib/k0s/pki/ca.crt"),
+			InsecureTLS:             envBool("NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS", true),
+			CGroupEventsFile:        hostPath("/sys/fs/cgroup/system.slice/k0scontroller.service/memory.events"),
+			FeederEnabled:           envBool("NODE_HOST_AGENT_ENABLE_FEEDER", true),
+			NotifySocket:            os.Getenv("NOTIFY_SOCKET"),
+			FeederStateDir:          hostPath("/var/lib/k0s-systemd-watchdog"),
+			RemediatePeerFile:       hostPath("/etc/default/k0scontroller-watchdog"),
+			K0sDir:                  getenv("NODE_HOST_AGENT_K0S_DIR", hostPath("/var/lib/k0s")),
+			EtcdEndpoint:            getenv("NODE_HOST_AGENT_ETCD_ENDPOINT", "https://127.0.0.1:2379"),
+			EtcdDBSizeLimit:         envInt64("NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT", 0),
+			JournalDirs:             journalDirs,
+			JournalUnreadableNeeded: journalUnreadableNeeded,
 		}, reg)
 		if err != nil {
 			slog.Error("controllerhygiene setup failed", "error", err)

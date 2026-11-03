@@ -72,6 +72,10 @@ var logRules = []logRule{
 	{"CorruptedImageRemoved", regexp.MustCompile(`ACTION: removed corrupted image`)},
 	{"ZombieProcessStorm", regexp.MustCompile(`ACTION:? *zombie-storm:`)},
 	{"CiliumMTUExceedsOverlay", regexp.MustCompile(`ACTION:? *cilium-mtu-drift:`)},
+	// journalwatch blindness latch — STATE-ENTER only (one event per
+	// latch entry; the suspect:* line carrying the same detail is a
+	// throttled re-reminder, matching it too would double-count).
+	{"JournaldUnreadable", regexp.MustCompile(`STATE-ENTER: journal-unreadable`)},
 }
 
 // maxEventNote caps the Event note — the apiserver validates the

@@ -39,8 +39,9 @@ type conditionDef struct {
 	altStateKey string
 }
 
-// conditionDefs is the 9-condition table ported from the NPD JSON —
-// order preserved so rendered status.conditions stays stable.
+// conditionDefs is the watchdog-condition table ported from the NPD
+// JSON — order preserved so rendered status.conditions stays stable —
+// plus agent-added entries at the tail (JournaldUnreadable).
 var conditionDefs = []conditionDef{
 	{
 		typ:            "NodeOverloaded",
@@ -106,6 +107,17 @@ var conditionDefs = []conditionDef{
 		problemReason:  "KubeletWatchWedgeDetected",
 		stateKey:       "kubelet-watch-wedge",
 	},
+	{
+		// Agent-added (not in the NPD JSON): the journalwatch
+		// tracker's blindness latch — journald installed but every
+		// journal read produces nothing, so all journal-grep checks
+		// and this reporter's own journal monitors are blind.
+		typ:            "JournaldUnreadable",
+		defaultReason:  "JournaldReadable",
+		defaultMessage: "journald journal reads return entries",
+		problemReason:  "JournaldUnreadableDetected",
+		stateKey:       "journal-unreadable",
+	},
 }
 
 // condEval is the evaluated state of one condition this cycle.
@@ -116,7 +128,7 @@ type condEval struct {
 	message string
 }
 
-// syncConditions evaluates the 9 conditions, updates problem_gauge,
+// syncConditions evaluates the conditions, updates problem_gauge,
 // then patches the node status iff any Status/Reason differs from the
 // live object. A GET failure skips the patch only — gauges are purely
 // local and always update.
@@ -194,7 +206,7 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 }
 
 // evalConditions reads the latch files once and computes the wanted
-// state of all 9 conditions.
+// state of all watchdog conditions.
 func (r *Reporter) evalConditions() []condEval {
 	out := make([]condEval, 0, len(conditionDefs))
 	for _, d := range conditionDefs {

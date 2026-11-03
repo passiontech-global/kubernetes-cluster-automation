@@ -148,7 +148,8 @@ func TestNewRequiresClientAndNode(t *testing.T) {
 
 // TestAllConditionDefaults: empty state dir → all conditions False
 // with the exact default Reason/Message ported from the NPD JSON —
-// the 9 watchdog latches plus the two NPD monitor conditions.
+// the watchdog latches plus the two NPD monitor conditions (and the
+// agent-added JournaldUnreadable).
 func TestAllConditionDefaults(t *testing.T) {
 	e := fixture(t)
 	e.cycle()
@@ -164,6 +165,7 @@ func TestAllConditionDefaults(t *testing.T) {
 		"KubeletWatchWedge":   {"KubeletWatchOk", "kubelet receives pod assignment normally (no unseen pod)"},
 		"KernelDeadlock":      {"KernelHasNoDeadlock", "kernel has no deadlock"},
 		"ReadonlyFilesystem":  {"FilesystemIsNotReadOnly", "Filesystem is not read-only"},
+		"JournaldUnreadable":  {"JournaldReadable", "journald journal reads return entries"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {
@@ -542,6 +544,39 @@ func TestKubeletRuntimeStallDualLatch(t *testing.T) {
 	c = e.cond(t, "KubeletRuntimeStall")
 	if c.Status != corev1.ConditionFalse || c.Reason != "KubeletRuntimeOk" {
 		t.Fatalf("all latches cleared: KubeletRuntimeStall = {%s %s}, want False/KubeletRuntimeOk",
+			c.Status, c.Reason)
+	}
+}
+
+// TestJournalUnreadableLatchSetsCondition: the journalwatch
+// blindness latch (state-journal-unreadable, written by the hygiene
+// subsystems' shared tracker) flips the agent-added
+// JournaldUnreadable condition True and drops problem_gauge — the
+// nodereporter-visible half of "journal checks are blind".
+func TestJournalUnreadableLatchSetsCondition(t *testing.T) {
+	e := fixture(t)
+	e.writeFile("state-journal-unreadable", "1700000003\n")
+	e.cycle()
+
+	c := e.cond(t, "JournaldUnreadable")
+	if c.Status != corev1.ConditionTrue || c.Reason != "JournaldUnreadableDetected" {
+		t.Fatalf("JournaldUnreadable = {%s %s}, want True/JournaldUnreadableDetected",
+			c.Status, c.Reason)
+	}
+	if c.Message != "watchdog state journal-unreadable active since 1700000003" {
+		t.Fatalf("unexpected message %q", c.Message)
+	}
+	if got := e.gauge("JournaldUnreadable", "JournaldUnreadableDetected"); got != 1 {
+		t.Fatalf("problem_gauge = %v, want 1", got)
+	}
+
+	if err := os.Remove(filepath.Join(e.dir, "state-journal-unreadable")); err != nil {
+		t.Fatal(err)
+	}
+	e.cycle()
+	c = e.cond(t, "JournaldUnreadable")
+	if c.Status != corev1.ConditionFalse || c.Reason != "JournaldReadable" {
+		t.Fatalf("cleared JournaldUnreadable = {%s %s}, want False/JournaldReadable",
 			c.Status, c.Reason)
 	}
 }

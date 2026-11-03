@@ -68,7 +68,7 @@ func (h *Hygiene) checkKinePool(_ context.Context) {
 		"conns=%d>%d x%d pid=%d", conns, h.cfg.KinePoolMaxConns, n, kpid))
 
 	if !h.rateOK(h.cfg.WatchdogStateDir, fileRatePoolKill, h.cfg.KinePoolMinRestart) {
-		h.appendLog(fmt.Sprintf(
+		h.suspectLog(stateKinePoolRunaway, fmt.Sprintf(
 			"kine-pool-runaway conns=%d (%dx) but in kill cooldown (<%dm), skip",
 			conns, n, int(h.cfg.KinePoolMinRestart.Minutes())))
 		h.cycles.WithLabelValues(checkKinePool, "ok").Inc()

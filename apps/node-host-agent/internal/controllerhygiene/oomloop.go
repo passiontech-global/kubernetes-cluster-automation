@@ -109,8 +109,10 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 	switch h.cfg.OOMLoopMode {
 	case ModeEnforce:
 		// Idempotent: PIDs change on every respawn so the shield is
-		// re-applied every cycle while the loop is latched.
-		h.appendLog(fmt.Sprintf(
+		// re-applied every cycle while the loop is latched — only
+		// the LOG line is deduped to the suspect cadence (the
+		// shield work + action metric stay per-cycle).
+		h.suspectLog(stateControllerOOMLop, fmt.Sprintf(
 			"ACTION: shield kube-apiserver (oom_score_adj=%d), kine %+d — window_kills=%d",
 			h.cfg.APIServerShieldAdj, h.cfg.KineShieldAdj, inWindow))
 		h.setAdj("kube-apiserver", h.cfg.APIServerShieldAdj)
@@ -118,7 +120,7 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 		h.writeState(fileOOMShielded, "")
 		h.actions.WithLabelValues(checkOOMLoop, "shield").Inc()
 	case ModeDryRun:
-		h.appendLog(fmt.Sprintf(
+		h.suspectLog(stateControllerOOMLop, fmt.Sprintf(
 			"DRY-RUN: would shield kube-apiserver oom_score_adj=%d, kine %+d — window_kills=%d",
 			h.cfg.APIServerShieldAdj, h.cfg.KineShieldAdj, inWindow))
 		h.actions.WithLabelValues(checkOOMLoop, "dryrun_shield").Inc()

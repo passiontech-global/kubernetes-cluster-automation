@@ -91,6 +91,8 @@ const (
 //	controllerhygiene: apiserver-cache-stale/-wedged (sig13),
 //	  kine-backend-unreachable, kine-pool-runaway, kine-ttl-dead,
 //	  kine-ttl-loop, k0scontroller-oom-loop
+//	controllerhygiene + workerhygiene (shared journalwatch tracker):
+//	  journal-unreadable
 //	hostmetrics: node-overloaded (PSI hysteresis), nebula-cert-expiring
 var knownLatchNames = map[string]bool{
 	"pod-teardown-wedged":      true,
@@ -124,6 +126,7 @@ var knownLatchNames = map[string]bool{
 	"cilium-envoy-down":        true, // B1
 	"cilium-mtu-drift":         true, // B4
 	"zombie-storm":             true, // A2
+	"journal-unreadable":       true, // journalwatch tracker (both hygienes)
 }
 
 // knownLatchPrefixes — parameterized latch families whose suffix is
