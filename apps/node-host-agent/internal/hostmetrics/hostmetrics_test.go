@@ -3,14 +3,17 @@ package hostmetrics
 import (
 	"encoding/pem"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"golang.org/x/sys/unix"
 )
 
 // fixture lays out the host filesystem tree under t.TempDir().
@@ -44,10 +47,25 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		// Never re-measure during unrelated tests — the real
 		// busy-loop only runs where a test injects cpuMeasure.
 		CPUDeliveredInterval: 24 * time.Hour,
+		// Deliberately nonexistent: the real /proc files would feed
+		// live host data into the scrapes. Tests that exercise a
+		// source write their own fake file under root.
+		ConntrackCountFile: filepath.Join(root, "nf_conntrack_count"),
+		ConntrackMaxFile:   filepath.Join(root, "nf_conntrack_max"),
+		FileNRFile:         filepath.Join(root, "file-nr"),
+		SockstatFile:       filepath.Join(root, "sockstat"),
+		FilesystemTargets:  []string{"/fake/etc", "/fake/k0s"},
 		// Default stub: returns no result — the real 0.3 cpu-s
 		// busy-loop would otherwise spin once per collector instance
 		// (~20 concurrent goroutines during a suite run).
 		cpuMeasure: func() (float64, float64, bool) { return 0, 0, false },
+		// Default stubs keep unrelated scrapes hermetic — the real
+		// adjtimex/statfs would feed live host data into assertions.
+		adjtimexFn: func(*unix.Timex) (int, error) { return 0, unix.ENOSYS },
+		statfsFn:   func(string, *unix.Statfs_t) error { return unix.ENOENT },
+		// Never wait the real 2s in tests — the stall tests inject
+		// their own hanging statfsFn against this shortened deadline.
+		fsProbeTimeout: 50 * time.Millisecond,
 	}, dirs
 }
 
@@ -490,6 +508,30 @@ func TestApplyDefaults(t *testing.T) {
 	if len(c.cfg.ExpectedKCMArgs) != len(defaultExpectedKCMArgs) {
 		t.Fatalf("ExpectedKCMArgs=%v want defaults", c.cfg.ExpectedKCMArgs)
 	}
+	if c.cfg.ConntrackCountFile != defaultConntrackCountFile {
+		t.Fatalf("ConntrackCountFile=%q want %q", c.cfg.ConntrackCountFile, defaultConntrackCountFile)
+	}
+	if c.cfg.ConntrackMaxFile != defaultConntrackMaxFile {
+		t.Fatalf("ConntrackMaxFile=%q want %q", c.cfg.ConntrackMaxFile, defaultConntrackMaxFile)
+	}
+	if c.cfg.FileNRFile != defaultFileNRFile {
+		t.Fatalf("FileNRFile=%q want %q", c.cfg.FileNRFile, defaultFileNRFile)
+	}
+	if c.cfg.SockstatFile != defaultSockstatFile {
+		t.Fatalf("SockstatFile=%q want %q", c.cfg.SockstatFile, defaultSockstatFile)
+	}
+	if len(c.cfg.FilesystemTargets) != len(defaultFilesystemTargets) {
+		t.Fatalf("FilesystemTargets=%v want defaults", c.cfg.FilesystemTargets)
+	}
+	if c.cfg.adjtimexFn == nil {
+		t.Fatal("adjtimexFn not defaulted to unix.Adjtimex")
+	}
+	if c.cfg.statfsFn == nil {
+		t.Fatal("statfsFn not defaulted to unix.Statfs")
+	}
+	if c.cfg.fsProbeTimeout != defaultFSProbeTimeout {
+		t.Fatalf("fsProbeTimeout=%v want %v", c.cfg.fsProbeTimeout, defaultFSProbeTimeout)
+	}
 }
 
 func TestRemovedFlagsCustom(t *testing.T) {
@@ -514,12 +556,13 @@ func TestRemovedFlagsCustom(t *testing.T) {
 
 func TestDescribe(t *testing.T) {
 	c := New(Config{})
-	ch := make(chan *prometheus.Desc, 16)
+	ch := make(chan *prometheus.Desc, 64)
 	c.Describe(ch)
 	// 10 base descs + the 2 legacy prom_emit aliases
-	// (node_watchdog_state, node_watchdog_egress_relay).
-	if got := len(ch); got != 12 {
-		t.Fatalf("Describe emitted %d descs want 12", got)
+	// (node_watchdog_state, node_watchdog_egress_relay) + 16
+	// gray-failure telemetry descs (H1/H2/H3/H6/H7).
+	if got := len(ch); got != 28 {
+		t.Fatalf("Describe emitted %d descs want 28", got)
 	}
 }
 
@@ -996,5 +1039,502 @@ func TestWriteTextfileNoDuplicateSeries(t *testing.T) {
 		`node_watchdog_state{signal="a"} 1`)
 	if count != 1 {
 		t.Fatalf("series emitted %d times want 1\n%s", count, data)
+	}
+}
+
+// --- H1: clock sync (adjtimex) ---
+
+func TestClockUnsynchronizedAndEstError(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.adjtimexFn = func(tx *unix.Timex) (int, error) {
+		tx.Status = unix.STA_UNSYNC
+		tx.Esterror = 750_000 // µs → 0.75 s
+		return 0, nil
+	}
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	if v, ok := metricValue(t, c, "node_host_agent_clock_unsynchronized",
+		node); !ok || v != 1 {
+		t.Fatalf("clock_unsynchronized=%v ok=%v want 1 (STA_UNSYNC)", v, ok)
+	}
+	if v, ok := metricValue(t, c,
+		"node_host_agent_clock_estimated_error_seconds",
+		node); !ok || v != 0.75 {
+		t.Fatalf("estimated_error=%v ok=%v want 0.75 (µs→s)", v, ok)
+	}
+}
+
+func TestClockSynchronizedEmitsZero(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.adjtimexFn = func(tx *unix.Timex) (int, error) {
+		tx.Status = unix.STA_PLL // synced flags, no STA_UNSYNC
+		tx.Esterror = 12_000
+		return 0, nil
+	}
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	if v, ok := metricValue(t, c, "node_host_agent_clock_unsynchronized",
+		node); !ok || v != 0 {
+		t.Fatalf("clock_unsynchronized=%v ok=%v want explicit 0", v, ok)
+	}
+	if v, ok := metricValue(t, c,
+		"node_host_agent_clock_estimated_error_seconds",
+		node); !ok || v != 0.012 {
+		t.Fatalf("estimated_error=%v ok=%v want 0.012", v, ok)
+	}
+}
+
+func TestClockAbsentWhenAdjtimexFails(t *testing.T) {
+	cfg, _ := fixture(t)
+	// fixture stub already errors — inconclusive read must emit no
+	// series rather than a fake "synchronized" 0.
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	if _, ok := metricValue(t, c, "node_host_agent_clock_unsynchronized",
+		node); ok {
+		t.Fatal("clock_unsynchronized emitted despite adjtimex error")
+	}
+	if _, ok := metricValue(t, c,
+		"node_host_agent_clock_estimated_error_seconds", node); ok {
+		t.Fatal("estimated_error emitted despite adjtimex error")
+	}
+}
+
+// --- H2: conntrack table pressure ---
+
+func TestConntrackMetrics(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.ConntrackCountFile, "230000\n")
+	write(t, cfg.ConntrackMaxFile, "262144\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+
+	if v, ok := metricValue(t, c, "node_host_agent_conntrack_entries",
+		node); !ok || v != 230000 {
+		t.Fatalf("entries=%v ok=%v want 230000", v, ok)
+	}
+	if v, ok := metricValue(t, c, "node_host_agent_conntrack_limit",
+		node); !ok || v != 262144 {
+		t.Fatalf("limit=%v ok=%v want 262144", v, ok)
+	}
+	want := 230000.0 / 262144.0
+	if v, ok := metricValue(t, c, "node_host_agent_conntrack_used_ratio",
+		node); !ok || math.Abs(v-want) > 1e-9 {
+		t.Fatalf("used_ratio=%v ok=%v want %v", v, ok, want)
+	}
+}
+
+func TestConntrackAbsentWithoutFiles(t *testing.T) {
+	cfg, _ := fixture(t)
+	// A node without the conntrack module has neither file → all
+	// three series absent (no fake 0).
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	for _, name := range []string{
+		"node_host_agent_conntrack_entries",
+		"node_host_agent_conntrack_limit",
+		"node_host_agent_conntrack_used_ratio",
+	} {
+		if _, ok := metricValue(t, c, name, node); ok {
+			t.Fatalf("%s emitted without proc files", name)
+		}
+	}
+}
+
+func TestConntrackPartialData(t *testing.T) {
+	cfg, _ := fixture(t)
+	// Only the count file reads — entries emits, limit+ratio stay
+	// absent (each gauge tracks its own source).
+	write(t, cfg.ConntrackCountFile, "42\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	if v, ok := metricValue(t, c, "node_host_agent_conntrack_entries",
+		node); !ok || v != 42 {
+		t.Fatalf("entries=%v ok=%v want 42", v, ok)
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_conntrack_limit",
+		node); ok {
+		t.Fatal("limit emitted without the max file")
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_conntrack_used_ratio",
+		node); ok {
+		t.Fatal("ratio emitted without the max file")
+	}
+}
+
+func TestConntrackZeroLimitSkipsRatio(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.ConntrackCountFile, "10\n")
+	write(t, cfg.ConntrackMaxFile, "0\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	if v, ok := metricValue(t, c, "node_host_agent_conntrack_limit",
+		node); !ok || v != 0 {
+		t.Fatalf("limit=%v ok=%v want 0", v, ok)
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_conntrack_used_ratio",
+		node); ok {
+		t.Fatal("ratio emitted with a zero limit (div-by-zero)")
+	}
+}
+
+func TestConntrackMalformedSkipped(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.ConntrackCountFile, "not-a-number\n")
+	write(t, cfg.ConntrackMaxFile, "\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	for _, name := range []string{
+		"node_host_agent_conntrack_entries",
+		"node_host_agent_conntrack_limit",
+		"node_host_agent_conntrack_used_ratio",
+	} {
+		if _, ok := metricValue(t, c, name, node); ok {
+			t.Fatalf("%s emitted for malformed data", name)
+		}
+	}
+}
+
+// --- H3 + H7: filesystem inode stats + hung-mount probe ---
+
+func TestFilesystemInodeMetrics(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.FilesystemTargets = []string{"/mnt/data", "/mnt/logs"}
+	cfg.statfsFn = func(path string, st *unix.Statfs_t) error {
+		if path == "/mnt/data" {
+			st.Files = 1000
+			st.Ffree = 250
+			return nil
+		}
+		return unix.ENOENT
+	}
+	c := New(cfg)
+
+	data := map[string]string{"node": "node-a", "mount": "/mnt/data"}
+	if v, ok := metricValue(t, c,
+		"node_host_agent_filesystem_inodes_total", data); !ok || v != 1000 {
+		t.Fatalf("inodes_total=%v ok=%v want 1000", v, ok)
+	}
+	if v, ok := metricValue(t, c,
+		"node_host_agent_filesystem_inodes_free", data); !ok || v != 250 {
+		t.Fatalf("inodes_free=%v ok=%v want 250", v, ok)
+	}
+	if v, ok := metricValue(t, c,
+		"node_host_agent_filesystem_inodes_used_ratio",
+		data); !ok || v != 0.75 {
+		t.Fatalf("inodes_used_ratio=%v ok=%v want 0.75", v, ok)
+	}
+	// probe_stalled emits for EVERY configured target — 0 means the
+	// probe answered in time.
+	if v, ok := metricValue(t, c,
+		"node_host_agent_filesystem_probe_stalled",
+		data); !ok || v != 0 {
+		t.Fatalf("probe_stalled=%v ok=%v want 0", v, ok)
+	}
+
+	// An erroring-but-fast probe still reports stalled=0, while the
+	// inode gauges stay absent (no fake numbers).
+	logs := map[string]string{"node": "node-a", "mount": "/mnt/logs"}
+	if v, ok := metricValue(t, c,
+		"node_host_agent_filesystem_probe_stalled",
+		logs); !ok || v != 0 {
+		t.Fatalf("probe_stalled{/mnt/logs}=%v ok=%v want 0", v, ok)
+	}
+	if _, ok := metricValue(t, c,
+		"node_host_agent_filesystem_inodes_total", logs); ok {
+		t.Fatal("inodes emitted for a failed statfs")
+	}
+}
+
+func TestFilesystemZeroInodesSkipsRatio(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.FilesystemTargets = []string{"/mnt/empty"}
+	cfg.statfsFn = func(path string, st *unix.Statfs_t) error {
+		st.Files, st.Ffree = 0, 0
+		return nil
+	}
+	c := New(cfg)
+	mnt := map[string]string{"node": "node-a", "mount": "/mnt/empty"}
+	if v, ok := metricValue(t, c,
+		"node_host_agent_filesystem_inodes_total", mnt); !ok || v != 0 {
+		t.Fatalf("inodes_total=%v ok=%v want 0", v, ok)
+	}
+	if _, ok := metricValue(t, c,
+		"node_host_agent_filesystem_inodes_used_ratio", mnt); ok {
+		t.Fatal("inodes_used_ratio emitted with Files=0 (div-by-zero)")
+	}
+}
+
+func TestFilesystemProbeStalledOnHang(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.FilesystemTargets = []string{"/mnt/hung"}
+	release := make(chan struct{})
+	defer close(release) // lets the stuck probe goroutine exit
+	var calls atomic.Int32
+	cfg.statfsFn = func(path string, st *unix.Statfs_t) error {
+		calls.Add(1)
+		<-release // simulates a mount hung in uninterruptible sleep
+		return nil
+	}
+	c := New(cfg)
+	mnt := map[string]string{"node": "node-a", "mount": "/mnt/hung"}
+
+	// The probe exceeds fsProbeTimeout → stalled=1, and no inode
+	// series for a mount that never answered.
+	if v, ok := metricValue(t, c,
+		"node_host_agent_filesystem_probe_stalled",
+		mnt); !ok || v != 1 {
+		t.Fatalf("probe_stalled=%v ok=%v want 1 on hung mount", v, ok)
+	}
+	if _, ok := metricValue(t, c,
+		"node_host_agent_filesystem_inodes_total", mnt); ok {
+		t.Fatal("inodes emitted for a hung mount")
+	}
+
+	// While the first probe is still stuck in the kernel, the next
+	// scrape reports stalled WITHOUT spawning another statfs — at
+	// most one goroutine piles up per mount.
+	if v, ok := metricValue(t, c,
+		"node_host_agent_filesystem_probe_stalled",
+		mnt); !ok || v != 1 {
+		t.Fatalf("probe_stalled=%v ok=%v want 1 while still hung", v, ok)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("statfs called %d times want 1 (in-flight probe not re-spawned)", got)
+	}
+}
+
+func TestFilesystemProbeRecoversAfterHang(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.FilesystemTargets = []string{"/mnt/flaky"}
+	release := make(chan struct{})
+	var calls atomic.Int32
+	cfg.statfsFn = func(path string, st *unix.Statfs_t) error {
+		if calls.Add(1) == 1 {
+			<-release // first probe hangs past the deadline
+			return unix.EIO
+		}
+		st.Files, st.Ffree = 100, 50
+		return nil
+	}
+	c := New(cfg)
+	mnt := map[string]string{"node": "node-a", "mount": "/mnt/flaky"}
+
+	if v, ok := metricValue(t, c,
+		"node_host_agent_filesystem_probe_stalled",
+		mnt); !ok || v != 1 {
+		t.Fatalf("probe_stalled=%v ok=%v want 1 while hung", v, ok)
+	}
+
+	// Once the stuck syscall returns, the in-flight bookkeeping
+	// clears and the next scrape probes fresh → back to 0 with the
+	// inode gauges populated.
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		v, ok := metricValue(t, c,
+			"node_host_agent_filesystem_probe_stalled", mnt)
+		if ok && v == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("probe_stalled never recovered to 0 after unhang")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if v, ok := metricValue(t, c,
+		"node_host_agent_filesystem_inodes_total", mnt); !ok || v != 100 {
+		t.Fatalf("inodes_total=%v ok=%v want 100 after recovery", v, ok)
+	}
+}
+
+// --- H6: FD + socket pressure (file-nr, sockstat) ---
+
+func TestFileFDMetrics(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.FileNRFile, "12345\t0\t9999999\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	if v, ok := metricValue(t, c, "node_host_agent_filefd_allocated",
+		node); !ok || v != 12345 {
+		t.Fatalf("allocated=%v ok=%v want 12345", v, ok)
+	}
+	if v, ok := metricValue(t, c, "node_host_agent_filefd_maximum",
+		node); !ok || v != 9999999 {
+		t.Fatalf("maximum=%v ok=%v want 9999999", v, ok)
+	}
+	want := 12345.0 / 9999999.0
+	if v, ok := metricValue(t, c, "node_host_agent_filefd_used_ratio",
+		node); !ok || math.Abs(v-want) > 1e-9 {
+		t.Fatalf("used_ratio=%v ok=%v want %v", v, ok, want)
+	}
+}
+
+func TestFileFDAbsentOnMissingOrMalformed(t *testing.T) {
+	cfg, _ := fixture(t)
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	names := []string{
+		"node_host_agent_filefd_allocated",
+		"node_host_agent_filefd_maximum",
+		"node_host_agent_filefd_used_ratio",
+	}
+	for _, name := range names {
+		if _, ok := metricValue(t, c, name, node); ok {
+			t.Fatalf("%s emitted without the file", name)
+		}
+	}
+	for _, content := range []string{
+		"12345\n",         // too few fields
+		"abc\t0\tdef\n",   // non-numeric
+		"12345\t0\tmax\n", // non-numeric max
+	} {
+		write(t, cfg.FileNRFile, content)
+		for _, name := range names {
+			if _, ok := metricValue(t, c, name, node); ok {
+				t.Fatalf("%s emitted for malformed %q", name, content)
+			}
+		}
+	}
+}
+
+func TestFileFDZeroMaxSkipsRatio(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.FileNRFile, "10\t0\t0\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	if v, ok := metricValue(t, c, "node_host_agent_filefd_maximum",
+		node); !ok || v != 0 {
+		t.Fatalf("maximum=%v ok=%v want 0", v, ok)
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_filefd_used_ratio",
+		node); ok {
+		t.Fatal("used_ratio emitted with a zero maximum (div-by-zero)")
+	}
+}
+
+func TestSockstatMetrics(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.SockstatFile,
+		"sockets: used 1847\n"+
+			"TCP: inuse 25 orphan 2 tw 4 alloc 1200 mem 456\n"+
+			"UDP: inuse 10 mem 20\n"+
+			"UDPLITE: inuse 0\n"+
+			"RAW: inuse 0\n"+
+			"FRAG: inuse 0 memory 0\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	checks := map[string]float64{
+		"node_host_agent_sockstat_sockets_used": 1847,
+		"node_host_agent_sockstat_tcp_inuse":    25,
+		"node_host_agent_sockstat_tcp_orphan":   2,
+		"node_host_agent_sockstat_tcp_tw":       4,
+	}
+	for name, want := range checks {
+		if v, ok := metricValue(t, c, name, node); !ok || v != want {
+			t.Fatalf("%s=%v ok=%v want %v", name, v, ok, want)
+		}
+	}
+}
+
+func TestSockstatAbsentWithoutFile(t *testing.T) {
+	cfg, _ := fixture(t)
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	for _, name := range []string{
+		"node_host_agent_sockstat_sockets_used",
+		"node_host_agent_sockstat_tcp_inuse",
+		"node_host_agent_sockstat_tcp_orphan",
+		"node_host_agent_sockstat_tcp_tw",
+	} {
+		if _, ok := metricValue(t, c, name, node); ok {
+			t.Fatalf("%s emitted without sockstat", name)
+		}
+	}
+}
+
+func TestSockstatMissingAndMalformedSections(t *testing.T) {
+	cfg, _ := fixture(t)
+	// No TCP line at all — sockets_used still emits, the TCP series
+	// stay absent rather than guessing 0.
+	write(t, cfg.SockstatFile, "sockets: used 99\nUDP: inuse 3\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	if v, ok := metricValue(t, c, "node_host_agent_sockstat_sockets_used",
+		node); !ok || v != 99 {
+		t.Fatalf("sockets_used=%v ok=%v want 99", v, ok)
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_sockstat_tcp_inuse",
+		node); ok {
+		t.Fatal("tcp_inuse emitted without a TCP line")
+	}
+
+	// A malformed TCP line (odd field count / non-numeric value)
+	// is skipped entirely — never emit junk.
+	write(t, cfg.SockstatFile,
+		"sockets: used 99\nTCP: inuse five orphan 0\nTCP: dangling\n")
+	for _, name := range []string{
+		"node_host_agent_sockstat_tcp_inuse",
+		"node_host_agent_sockstat_tcp_orphan",
+		"node_host_agent_sockstat_tcp_tw",
+	} {
+		if _, ok := metricValue(t, c, name, node); ok {
+			t.Fatalf("%s emitted for malformed TCP lines", name)
+		}
+	}
+}
+
+// --- WriteTextfile: gray-failure series in the prom_emit port ---
+
+func TestWriteTextfileIncludesGrayFailureMetrics(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.adjtimexFn = func(tx *unix.Timex) (int, error) {
+		tx.Status = unix.STA_UNSYNC
+		tx.Esterror = 500_000
+		return 0, nil
+	}
+	write(t, cfg.ConntrackCountFile, "100\n")
+	write(t, cfg.ConntrackMaxFile, "1000\n")
+	write(t, cfg.FileNRFile, "50\t0\t500\n")
+	write(t, cfg.SockstatFile,
+		"sockets: used 42\nTCP: inuse 7 orphan 1 tw 3 alloc 9 mem 2\n")
+	cfg.FilesystemTargets = []string{"/mnt/data"}
+	cfg.statfsFn = func(path string, st *unix.Statfs_t) error {
+		st.Files, st.Ffree = 200, 50
+		return nil
+	}
+	c := New(cfg)
+
+	dir := t.TempDir()
+	if err := c.WriteTextfile(dir); err != nil {
+		t.Fatalf("WriteTextfile: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "node-watchdog.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	// Label pairs render sorted — mount before node.
+	for _, want := range []string{
+		`node_host_agent_clock_unsynchronized{node="node-a"} 1`,
+		`node_host_agent_clock_estimated_error_seconds{node="node-a"} 0.5`,
+		`node_host_agent_conntrack_entries{node="node-a"} 100`,
+		`node_host_agent_conntrack_limit{node="node-a"} 1000`,
+		`node_host_agent_conntrack_used_ratio{node="node-a"} 0.1`,
+		`node_host_agent_filesystem_inodes_total{mount="/mnt/data",node="node-a"} 200`,
+		`node_host_agent_filesystem_inodes_free{mount="/mnt/data",node="node-a"} 50`,
+		`node_host_agent_filesystem_inodes_used_ratio{mount="/mnt/data",node="node-a"} 0.75`,
+		`node_host_agent_filesystem_probe_stalled{mount="/mnt/data",node="node-a"} 0`,
+		`node_host_agent_filefd_allocated{node="node-a"} 50`,
+		`node_host_agent_filefd_maximum{node="node-a"} 500`,
+		`node_host_agent_filefd_used_ratio{node="node-a"} 0.1`,
+		`node_host_agent_sockstat_tcp_inuse{node="node-a"} 7`,
+		`node_host_agent_sockstat_tcp_orphan{node="node-a"} 1`,
+		`node_host_agent_sockstat_tcp_tw{node="node-a"} 3`,
+		`node_host_agent_sockstat_sockets_used{node="node-a"} 42`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("textfile missing %q\n%s", want, text)
+		}
 	}
 }

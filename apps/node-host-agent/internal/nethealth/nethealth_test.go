@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
@@ -26,6 +27,10 @@ type env struct {
 	procudp  string
 	procudp6 string
 	uptime   string
+	ctcount  string
+	ctmax    string
+	timex    unix.Timex
+	adjErr   error
 	now      time.Time
 	cmds     [][]string
 	cmdReply map[string]string
@@ -123,6 +128,8 @@ func fixture(t *testing.T, wd *watchdogconf.Config) *env {
 	e.procudp = filepath.Join(root, "udp")
 	e.procudp6 = filepath.Join(root, "udp6")
 	e.uptime = filepath.Join(root, "uptime")
+	e.ctcount = filepath.Join(root, "nf_conntrack_count")
+	e.ctmax = filepath.Join(root, "nf_conntrack_max")
 	for _, d := range []string{e.state} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
@@ -130,25 +137,30 @@ func fixture(t *testing.T, wd *watchdogconf.Config) *env {
 	}
 	writeFile(t, e.uptime, "3600.00 7200.00\n")
 	writeFile(t, e.hosts, "127.0.0.1 localhost\n::1 localhost\n")
+	// Healthy defaults: empty conntrack table, synchronized clock.
+	writeFile(t, e.ctcount, "0\n")
+	writeFile(t, e.ctmax, "262144\n")
 	if wd == nil {
 		wd = &watchdogconf.Config{}
 	}
 	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: e.sdRun})
 	n, err := New(Config{
-		Enabled:          true,
-		Interval:         time.Hour,
-		WatchdogStateDir: e.state,
-		WatchdogLogFile:  filepath.Join(root, "watchdog.log"),
-		HostResolvConf:   e.resv,
-		HostsFile:        e.hosts,
-		ProcNetUDP:       e.procudp,
-		ProcNetUDP6:      e.procudp6,
-		UptimeFile:       e.uptime,
-		HostRoot:         "/",
-		Watchdog:         wd,
-		Systemd:          sd,
-		ConsecNeeded:     2,
-		MinRestart:       30 * time.Minute,
+		Enabled:            true,
+		Interval:           time.Hour,
+		WatchdogStateDir:   e.state,
+		WatchdogLogFile:    filepath.Join(root, "watchdog.log"),
+		HostResolvConf:     e.resv,
+		HostsFile:          e.hosts,
+		ProcNetUDP:         e.procudp,
+		ProcNetUDP6:        e.procudp6,
+		UptimeFile:         e.uptime,
+		ConntrackCountFile: e.ctcount,
+		ConntrackMaxFile:   e.ctmax,
+		HostRoot:           "/",
+		Watchdog:           wd,
+		Systemd:            sd,
+		ConsecNeeded:       2,
+		MinRestart:         30 * time.Minute,
 	}, prometheus.NewRegistry())
 	if err != nil {
 		t.Fatal(err)
@@ -174,6 +186,10 @@ func fixture(t *testing.T, wd *watchdogconf.Config) *env {
 	}
 	n.cfg.probeHTTP = func(_ context.Context, url string, _ time.Duration) error {
 		return e.httpErr[url]
+	}
+	n.cfg.adjtimexFn = func(buf *unix.Timex) (int, error) {
+		*buf = e.timex
+		return 0, e.adjErr
 	}
 	e.n = n
 	return e
@@ -687,5 +703,236 @@ func TestSignalDisabledSkipsCheck(t *testing.T) {
 	e.n.Cycle(context.Background())
 	if e.sdRan("restart nebula") {
 		t.Fatal("nebula check ran despite WD_SIG disable")
+	}
+}
+
+// --- clock-sync (H1) ---
+
+func TestClockSyncLatchAndRateLimitedRestart(t *testing.T) {
+	e := fixture(t, nil)
+	e.timex.Status = unix.STA_UNSYNC
+	e.sdReply["is-enabled systemd-timesyncd.service"] = "enabled\n"
+	e.sdReply["is-active systemd-timesyncd.service"] = "active\n"
+	e.sdReply["restart systemd-timesyncd.service"] = ""
+
+	// Cycle 1: first failure — no latch, no restart yet.
+	e.n.Cycle(context.Background())
+	if stateExists(e, "clock-unsync") {
+		t.Fatal("clock-unsync latch before ConsecNeeded")
+	}
+	if e.sdRan("restart") {
+		t.Fatal("ntp restart before ConsecNeeded")
+	}
+
+	// Cycle 2: second consecutive failure → latch + restart.
+	e.n.Cycle(context.Background())
+	if !stateExists(e, "clock-unsync") {
+		t.Fatal("clock-unsync latch missing after ConsecNeeded")
+	}
+	if !e.sdRan("restart systemd-timesyncd.service") {
+		t.Fatalf("timesyncd not restarted, cmds=%v", e.sdcmds)
+	}
+	if _, err := os.Stat(filepath.Join(e.state, "last-ntp-restart")); err != nil {
+		t.Fatal("last-ntp-restart budget not spent")
+	}
+
+	// Cycle 3 (still failing): the 30m budget blocks a re-restart.
+	e.sdcmds = nil
+	e.n.Cycle(context.Background())
+	if e.sdRan("restart systemd-timesyncd.service") {
+		t.Fatal("restart inside last-ntp-restart cooldown")
+	}
+
+	// Budget expired → next failing cycle restarts again.
+	e.now = e.now.Add(31 * time.Minute)
+	e.n.Cycle(context.Background())
+	if !e.sdRan("restart systemd-timesyncd.service") {
+		t.Fatal("no restart after last-ntp-restart window elapsed")
+	}
+
+	// Clock syncs again → latch clears.
+	e.timex.Status = 0
+	e.n.Cycle(context.Background())
+	if stateExists(e, "clock-unsync") {
+		t.Fatal("clock-unsync latch kept after resync")
+	}
+}
+
+func TestClockSyncEsterrorTooLarge(t *testing.T) {
+	e := fixture(t, nil)
+	// No STA_UNSYNC — but esterror above 500ms is unhealthy on its own.
+	e.timex.Esterror = 600_000
+	e.sdReply["is-enabled chronyd.service"] = "enabled\n"
+	e.sdReply["is-active chronyd.service"] = "active\n"
+	e.sdReply["restart chronyd.service"] = ""
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background())
+	if !stateExists(e, "clock-unsync") {
+		t.Fatal("clock-unsync latch missing on esterror > 500ms")
+	}
+	// timesyncd absent → falls through to the first enabled/active unit.
+	if !e.sdRan("restart chronyd.service") {
+		t.Fatalf("chronyd not restarted, cmds=%v", e.sdcmds)
+	}
+}
+
+// On a chrony node, timesyncd's unit FILE exists (it ships with
+// systemd) but the daemon is disabled — restarting it would start a
+// second clock-discipline daemon fighting chrony over adjtimex. The
+// picker must prefer the enabled/active unit, not UnitExists order.
+func TestClockSyncPrefersEnabledDaemonOverInstalled(t *testing.T) {
+	e := fixture(t, nil)
+	e.timex.Status = unix.STA_UNSYNC
+	// timesyncd installed but disabled (is-enabled → error), chrony
+	// is the live daemon.
+	e.sdReply["is-enabled chrony.service"] = "enabled\n"
+	e.sdReply["is-active chrony.service"] = "active\n"
+	e.sdReply["cat systemd-timesyncd.service"] = "# unit\n"
+	e.sdReply["restart chrony.service"] = ""
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background())
+	if e.sdRan("restart systemd-timesyncd.service") {
+		t.Fatal("disabled timesyncd restarted on a chrony node — " +
+			"would start a second sync daemon")
+	}
+	if !e.sdRan("restart chrony.service") {
+		t.Fatalf("chrony not restarted, cmds=%v", e.sdcmds)
+	}
+}
+
+func TestClockSyncAdjtimexErrorAborts(t *testing.T) {
+	e := fixture(t, nil)
+	e.adjErr = errors.New("operation not permitted")
+	e.sdReply["is-enabled systemd-timesyncd.service"] = "enabled\n"
+	e.sdReply["is-active systemd-timesyncd.service"] = "active\n"
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background())
+	if stateExists(e, "clock-unsync") {
+		t.Fatal("adjtimex error must not false-latch clock-unsync")
+	}
+	if e.sdRan("restart") {
+		t.Fatal("ntp restart on adjtimex read failure")
+	}
+}
+
+// --- conntrack-guard (H2) ---
+
+func TestConntrackPressureHysteresis(t *testing.T) {
+	e := fixture(t, nil)
+	writeFile(t, e.ctmax, "1000\n")
+
+	// 0.85 — between the bands: no latch without prior state.
+	writeFile(t, e.ctcount, "850\n")
+	e.n.Cycle(context.Background())
+	if stateExists(e, "conntrack-pressure") {
+		t.Fatal("latch below enter ratio")
+	}
+	// 0.95 > 0.90 → latch arms.
+	writeFile(t, e.ctcount, "950\n")
+	e.n.Cycle(context.Background())
+	if !stateExists(e, "conntrack-pressure") {
+		t.Fatal("latch missing above enter ratio")
+	}
+	// 0.85 — inside the hysteresis band: latch holds.
+	writeFile(t, e.ctcount, "850\n")
+	e.n.Cycle(context.Background())
+	if !stateExists(e, "conntrack-pressure") {
+		t.Fatal("latch dropped inside hysteresis band")
+	}
+	// 0.75 < 0.80 → latch clears.
+	writeFile(t, e.ctcount, "750\n")
+	e.n.Cycle(context.Background())
+	if stateExists(e, "conntrack-pressure") {
+		t.Fatal("latch kept below exit ratio")
+	}
+}
+
+func TestConntrackMissingFilesDropsLatch(t *testing.T) {
+	e := fixture(t, nil)
+	writeFile(t, filepath.Join(e.state, "state-conntrack-pressure"), "1\n")
+	// Module unloaded → both /proc entries gone.
+	if err := os.Remove(e.ctcount); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(e.ctmax); err != nil {
+		t.Fatal(err)
+	}
+	e.n.Cycle(context.Background())
+	if stateExists(e, "conntrack-pressure") {
+		t.Fatal("stale conntrack-pressure latch kept with no table")
+	}
+}
+
+// --- conntrack udp/53 flush triggers ---
+
+func TestConntrackFlushOnDNSFallbackPin(t *testing.T) {
+	e := fixture(t, &watchdogconf.Config{
+		DNSFallback: []watchdogconf.DNSEntry{
+			{Name: "api.test.internal", Port: "6443",
+				Candidates: []string{"10.0.0.2"}},
+		},
+	})
+	writeFile(t, e.resv, "nameserver 10.1.1.1\n")
+	e.tcpOK["10.0.0.2:6443"] = true
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background()) // second fail → pin + block update
+	if !strings.Contains(readFileT(t, e.hosts), "10.0.0.2 api.test.internal") {
+		t.Fatal("dns-fallback pin missing")
+	}
+	if !e.cmdRan("conntrack -D -p udp --dport 53") {
+		t.Fatalf("stale udp/53 conntrack not flushed, cmds=%v", e.cmds)
+	}
+}
+
+func TestConntrackFlushMissingBinaryOnlyLogs(t *testing.T) {
+	e := fixture(t, &watchdogconf.Config{
+		DNSFallback: []watchdogconf.DNSEntry{
+			{Name: "api.test.internal", Port: "6443",
+				Candidates: []string{"10.0.0.2"}},
+		},
+	})
+	writeFile(t, e.resv, "nameserver 10.1.1.1\n")
+	e.tcpOK["10.0.0.2:6443"] = true
+	e.cmdFail["conntrack"] = true // binary absent
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background())
+	// The pin still lands — a missing conntrack binary must never
+	// fail the cycle.
+	if !strings.Contains(readFileT(t, e.hosts), "10.0.0.2 api.test.internal") {
+		t.Fatal("dns-fallback pin missing after conntrack flush failure")
+	}
+	if !strings.Contains(logLines(t, e), "flush skipped") {
+		t.Fatalf("missing flush-skip log:\n%s", logLines(t, e))
+	}
+}
+
+func TestConntrackFlushOnCoreDNSRestart(t *testing.T) {
+	e := fixture(t, nil)
+	writeFile(t, e.resv, "nameserver 127.0.0.1\nnameserver 10.1.1.1\n")
+	e.sdReply["cat coredns.service"] = "# unit\n"
+	e.sdReply["is-active coredns.service"] = "inactive\n"
+	e.sdReply["restart coredns.service"] = ""
+	e.n.Cycle(context.Background())
+	if !e.sdRan("restart coredns.service") {
+		t.Fatal("coredns stub not restarted")
+	}
+	if !e.cmdRan("conntrack -D -p udp --dport 53") {
+		t.Fatalf("stale udp/53 conntrack not flushed, cmds=%v", e.cmds)
+	}
+}
+
+func TestConntrackFlushOnNebulaRestart(t *testing.T) {
+	e := nebulaEnv(t, nil)
+	e.sdReply["restart nebula@interdc"] = ""
+	writeFile(t, e.procudp, "  sl  local_address rem_address   st\n"+
+		"  1: 0100007F:0050 00000000:0000 07\n") // :B266 (45670) gone
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background())
+	if !e.sdRan("restart nebula@interdc") {
+		t.Fatal("nebula not restarted")
+	}
+	if !e.cmdRan("conntrack -D -p udp --dport 53") {
+		t.Fatalf("stale udp/53 conntrack not flushed, cmds=%v", e.cmds)
 	}
 }

@@ -41,6 +41,21 @@
 //   - 35-cilium-init-stuck.sh — sig15: endpoints stuck in
 //     reserved:init (informer wedge, healthz still OK) →
 //     state-cilium-init-stuck + SIGKILL cilium-agent.
+//   - 37-ctr-image-healer.sh — pods stuck Waiting
+//     (CreateContainerError/ErrImagePull/ImagePullBackOff) whose
+//     message is a corrupted containerd layer/content-store error
+//     (missing content digest, failed layer extraction, missing
+//     parent snapshot) get their image removed via `ctr images rm
+//     --sync` so kubelet's next pull re-fetches the bad layer —
+//     the pod recovers without a node reboot. Shared
+//     last-ctr-image-rm 15m budget.
+//   - 38-cilium-bpf-ipam.sh — cilium IPAM leak detector: reads
+//     ipam.ipv4 used/available off the agent unix socket and
+//     cross-checks the allocated count against non-hostNetwork
+//     Running pods on this node (allocated − in-use = leaked IPs
+//     held by dead pods). Gauges are exported every probe;
+//     leaked >30 or available <=2 for ConsecNeeded consecutive
+//     cycles → state-cilium-ipam-exhausted latch.
 //   - T15 (k0s-kubelet-watchdog.sh + k0sworker-remediate.sh) — the
 //     Option-D kubelet watchdog feeder, on its own 15s ticker
 //     parallel to Cycle: probe :10248/healthz (body must be "ok"),
@@ -66,8 +81,10 @@
 package workerhygiene
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -76,6 +93,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -122,6 +140,10 @@ const (
 	defaultMaxShimKill        = 10               // shell cap 5; 10 bounds orphan-shim storms with headroom
 	defaultConsecNeeded       = 2                // shell CONSEC_NEEDED=2
 	defaultMinRestartInterval = 30 * time.Minute // shell MIN_RESTART_INTERVAL_S=1800
+	// ctrImageRmInterval is the 37-ctr-image-healer budget — image
+	// removal is idempotent so it needs no consecutive gate; the 15m
+	// cooldown alone bounds the churn.
+	ctrImageRmInterval = 15 * time.Minute
 	// k0sWorkerSettle mirrors the plan's k0sworker_settled >=180s gate:
 	// a k0sworker restarted moments ago gets a settle window before
 	// ANY new restart is spent on it — kubelet needs the window to
@@ -166,6 +188,8 @@ const (
 	checkCtrTasks   = "ctr-tasks"
 	checkCilium     = "cilium"
 	checkCiliumInit = "cilium-init-stuck"
+	checkCtrImages  = "ctr-image-healer" // 37
+	checkCiliumIPAM = "cilium-ipam"      // 38
 	checkKubeletWd  = "kubelet-watchdog" // T15 feeder + remediate
 )
 
@@ -241,6 +265,11 @@ type Config struct {
 	// unixGet GETs path over a unix socket and returns the body —
 	// the cilium-dbg endpoint list replacement (35). Seam.
 	unixGet func(ctx context.Context, socket, path string) ([]byte, error)
+	// ctrRmImage removes one image from the k8s.io containerd
+	// namespace — the corrupted-layer remedy (37), `k0s ctr
+	// --namespace k8s.io images rm --sync <image>` via the systemd
+	// exec wrapper. nil → Systemd.Exec default. Seam.
+	ctrRmImage func(ctx context.Context, image string) error
 	// journalFn returns the k0sworker journal window — the runner's
 	// shared -10min snapshot (05/06). nil → Systemd.Journal.
 	journalFn func(ctx context.Context) (string, error)
@@ -397,6 +426,17 @@ func (c *Config) applyDefaults() {
 			return body, err
 		}
 	}
+	if c.ctrRmImage == nil {
+		sd := c.Systemd
+		c.ctrRmImage = func(ctx context.Context, image string) error {
+			if sd == nil {
+				return fmt.Errorf("no systemd client wired")
+			}
+			_, err := sd.Exec(ctx,
+				"k0s", "ctr", "--namespace", "k8s.io", "images", "rm", "--sync", image)
+			return err
+		}
+	}
 	if c.journalFn == nil {
 		sd := c.Systemd
 		c.journalFn = func(ctx context.Context) (string, error) {
@@ -461,6 +501,13 @@ var (
 	// cri.container-type=sandbox inside task config.json — pause
 	// tasks legitimately lack log.json (shell grep -q parity).
 	sandboxTypeRe = regexp.MustCompile(`cri\.container-type[^,]*sandbox`)
+	// Corrupted containerd layer/content-store signatures inside a
+	// pod's Waiting message (37) — a missing blob/snapshot never
+	// heals by retrying the pull; the image record must go.
+	corruptImageRe = regexp.MustCompile(
+		`content digest sha256:[0-9a-f]+: not found|` +
+			`failed to extract layer|` +
+			`parent snapshot .* does not exist`)
 )
 
 // Hygiene runs the worker checks on one ticker.
@@ -477,6 +524,7 @@ type Hygiene struct {
 	watchFails      int
 	ciliumFails     int
 	ciliumInitFails int
+	ciliumIPAMFails int
 	// kubeletWdFails is the T15 feeder's consecutive-fail counter —
 	// in-memory like the others (the shell counted within one feeder
 	// process anyway; an agent restart re-arms bounded by the 15s tick).
@@ -494,9 +542,11 @@ type Hygiene struct {
 	// lets both pass inside the same window (TOCTOU double-restart).
 	// Held only around the file check+write, never across
 	// network/systemd calls.
-	rateMu  sync.Mutex
-	cycles  *prometheus.CounterVec // check, result
-	actions *prometheus.CounterVec // check, action
+	rateMu          sync.Mutex
+	cycles          *prometheus.CounterVec // check, result
+	actions         *prometheus.CounterVec // check, action
+	ciliumAllocated prometheus.Gauge       // cilium IPAM allocated IPs (38)
+	ciliumLeaked    prometheus.Gauge       // allocated − in-use (38)
 }
 
 // New returns a Hygiene and registers its metrics on reg.
@@ -511,11 +561,21 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	h.actions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_workerhygiene_actions_total",
 		Help: "Worker-hygiene remediation actions by check and action " +
-			"(force_delete|pod_delete|sigkill|pause_kill|restart|rm_dir|shim_kill|remediate).",
+			"(force_delete|pod_delete|sigkill|pause_kill|restart|rm_dir|shim_kill|image_rm|remediate).",
 	}, []string{"check", "action"})
+	h.ciliumAllocated = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_workerhygiene_cilium_allocated_ips",
+		Help: "IPv4 addresses cilium IPAM reports allocated on this node.",
+	})
+	h.ciliumLeaked = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_workerhygiene_cilium_leaked_ips",
+		Help: "Allocated cilium IPs not held by a non-hostNetwork Running pod on this node (leaked).",
+	})
 
 	if reg != nil {
-		for _, c := range []prometheus.Collector{h.cycles, h.actions} {
+		for _, c := range []prometheus.Collector{
+			h.cycles, h.actions, h.ciliumAllocated, h.ciliumLeaked,
+		} {
 			if err := reg.Register(c); err != nil {
 				return nil, fmt.Errorf("register workerhygiene metrics: %w", err)
 			}
@@ -663,6 +723,12 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	})
 	run(checkCiliumInit, func() {
 		h.checkCiliumInitStuck(ctx, apiOK, workerActive)
+	})
+	run(checkCtrImages, func() {
+		h.checkCtrImages(ctx, pods, apiOK, workerActive)
+	})
+	run(checkCiliumIPAM, func() {
+		h.checkCiliumIPAM(ctx, pods, apiOK, workerActive)
 	})
 }
 
@@ -2042,6 +2108,292 @@ func (h *Hygiene) checkCiliumInitStuck(ctx context.Context, apiOK, workerActive 
 		}
 	}
 	h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
+}
+
+// --- Check: ctr-image-healer (37-ctr-image-healer.sh) ---
+
+// corruptImageWaitingReason mirrors the shell reason list — pull
+// failures (ErrImagePull/ImagePullBackOff) and create failures
+// (CreateContainerError) both surface corrupted-layer messages.
+func corruptImageWaitingReason(r string) bool {
+	switch r {
+	case "CreateContainerError", "ErrImagePull", "ImagePullBackOff":
+		return true
+	}
+	return false
+}
+
+// checkCtrImages scans this node's pods for containers stuck Waiting
+// on a corrupted containerd layer/content-store error and removes the
+// broken image (`k0s ctr images rm --sync`) so kubelet's next pull
+// re-fetches the missing layer — the pod recovers without a reboot.
+// Removal is idempotent (ctr tolerates re-pulls of a pruned ref), so
+// unlike the restart checks there is no consecutive gate: the 15m
+// last-ctr-image-rm budget alone bounds the churn, and one spend
+// covers the whole batch of matching images found in a cycle.
+func (h *Hygiene) checkCtrImages(ctx context.Context, pods []corev1.Pod,
+	apiOK, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCtrImages, "gated").Inc()
+		return
+	}
+	if !apiOK {
+		// Inconclusive — same "keep state, never act" rule as the
+		// other pod-list checks.
+		h.cycles.WithLabelValues(checkCtrImages, "abort").Inc()
+		return
+	}
+	// Dedupe images across pods and statuses — several containers
+	// pinned to one corrupted image need a single rm, not one each.
+	seen := map[string]bool{}
+	for i := range pods {
+		p := &pods[i]
+		statuses := slices.Concat(p.Status.InitContainerStatuses,
+			p.Status.ContainerStatuses, p.Status.EphemeralContainerStatuses)
+		for _, cs := range statuses {
+			w := cs.State.Waiting
+			if w == nil || !corruptImageWaitingReason(w.Reason) ||
+				!corruptImageRe.MatchString(w.Message) {
+				continue
+			}
+			if cs.Image != "" {
+				seen[cs.Image] = true
+			}
+		}
+	}
+	if len(seen) == 0 {
+		h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
+		return
+	}
+	images := make([]string, 0, len(seen))
+	for img := range seen {
+		images = append(images, img)
+	}
+	sort.Strings(images) // deterministic order — same convention as dnsStale
+	if !h.rateTrySpend("last-ctr-image-rm", ctrImageRmInterval) {
+		h.appendLog(fmt.Sprintf(
+			"suspect: ctr-image-healer corrupted image(s) %s - in rm cooldown (<15m), skip",
+			strings.Join(images, " ")))
+		h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
+		return
+	}
+	// Budget spent atomically BEFORE acting (lib.sh rate_spend
+	// parity): a failed rm still consumed the budget.
+	for _, img := range images {
+		if err := h.cfg.ctrRmImage(ctx, img); err != nil {
+			h.appendLog(fmt.Sprintf(
+				"suspect: ctr image rm %s failed: %v", img, err))
+			continue
+		}
+		// NPD contract: "removed corrupted image" feeds the
+		// CorruptedImageRemoved filelog pattern.
+		h.appendLog(fmt.Sprintf("ACTION: removed corrupted image %s", img))
+		h.actions.WithLabelValues(checkCtrImages, "image_rm").Inc()
+	}
+	h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
+}
+
+// --- Check: cilium-bpf-ipam (38-cilium-bpf-ipam.sh) ---
+
+// ipamCount reads one ipam value as a count — accepts a bare number,
+// an array (counted by length) or an object/map (counted by keys),
+// because the plan's used/available fields may be reported either as
+// counters or as the IP collections themselves.
+func ipamCount(v json.RawMessage) (int, bool) {
+	s := bytes.TrimSpace(v)
+	if len(s) == 0 || bytes.Equal(s, []byte("null")) {
+		return 0, false
+	}
+	switch s[0] {
+	case '[':
+		var arr []json.RawMessage
+		if err := json.Unmarshal(s, &arr); err != nil {
+			return 0, false
+		}
+		return len(arr), true
+	case '{':
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(s, &m); err != nil {
+			return 0, false
+		}
+		return len(m), true
+	default:
+		var n float64
+		if err := json.Unmarshal(s, &n); err != nil {
+			return 0, false
+		}
+		return int(n), true
+	}
+}
+
+// freeIPAMPool counts ipam.allocations entries marked free — in
+// cluster-pool/multi-pool mode that map is the node's WHOLE pool
+// (allocated AND free IPs; a free entry carries an empty owner).
+// Values on the real wire are owner-name strings ("10.0.0.5":
+// "pod-a"), so an EMPTY string is the free marker; the
+// {"owner": "…"} object shape is accepted too for older agents.
+// ok=false when the map is absent or fully owned: an all-owned map
+// can't be told apart from an allocated-only dump (the non-pool
+// modes), and reporting "0 free" there would false-latch exhaustion.
+func freeIPAMPool(m map[string]json.RawMessage) (int, bool) {
+	if len(m) == 0 {
+		return 0, false
+	}
+	free := 0
+	for _, v := range m {
+		var owner string
+		if err := json.Unmarshal(v, &owner); err == nil {
+			if owner == "" {
+				free++
+			}
+			continue
+		}
+		var e struct {
+			Owner string `json:"owner"`
+		}
+		if err := json.Unmarshal(v, &e); err == nil && e.Owner == "" {
+			free++
+		}
+	}
+	return free, free > 0
+}
+
+// parseCiliumIPAM extracts used/available IPv4 counts from a
+// /v1/healthz body. Two wire shapes are accepted:
+//   - ipam.ipv4 as an object {"used":…, "available":…} — the shape
+//     module 38 consumes; each value may be a number or a collection
+//     (counted by length via ipamCount).
+//   - ipam.ipv4 as an array — upstream cilium: the array IS the
+//     allocated-IP list, so used = len. The healthz payload carries
+//     no pool total in that shape; available is only recovered when
+//     ipam.allocations exposes free (unowned) pool entries, else -1
+//     (unknown — never invent a pool size).
+//
+// available == -1 means "unknown" — the `available <= 2` trigger is
+// then skipped while `leaked > 30` still applies. ok=false means no
+// usable ipam section: inconclusive.
+func parseCiliumIPAM(body []byte) (used, available int, ok bool) {
+	var resp struct {
+		IPAM *struct {
+			IPV4        json.RawMessage            `json:"ipv4"`
+			Allocations map[string]json.RawMessage `json:"allocations"`
+		} `json:"ipam"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || resp.IPAM == nil {
+		return 0, -1, false
+	}
+	available = -1
+	raw := bytes.TrimSpace(resp.IPAM.IPV4)
+	if len(raw) == 0 {
+		return 0, -1, false
+	}
+	switch raw[0] {
+	case '{':
+		var obj struct {
+			Used      json.RawMessage `json:"used"`
+			Available json.RawMessage `json:"available"`
+		}
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return 0, -1, false
+		}
+		if n, found := ipamCount(obj.Used); found {
+			used = n
+		}
+		if n, found := ipamCount(obj.Available); found {
+			available = n
+		}
+		return used, available, true
+	case '[':
+		var arr []json.RawMessage
+		if err := json.Unmarshal(raw, &arr); err != nil {
+			return 0, -1, false
+		}
+		used = len(arr)
+		if free, found := freeIPAMPool(resp.IPAM.Allocations); found {
+			available = free
+		}
+		return used, available, true
+	default:
+		// Bare number — the allocated count itself.
+		if n, found := ipamCount(raw); found {
+			return n, -1, true
+		}
+		return 0, -1, false
+	}
+}
+
+// checkCiliumIPAM reads the agent's IPAM usage off the unix socket
+// and cross-checks it against the non-hostNetwork Running pods on
+// this node: allocated − in-use = leaked IPs still held for dead
+// pods (a real pod eventually can't get an address — the black-hole
+// datapath this module exists to catch early). A small constant leak
+// (~2: router + health reserved IPs) is normal, so the latch needs
+// leaked >30 or available <=2 for ConsecNeeded consecutive cycles.
+// The gauges update on every successful probe regardless.
+func (h *Hygiene) checkCiliumIPAM(ctx context.Context, pods []corev1.Pod,
+	apiOK, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCiliumIPAM, "gated").Inc()
+		return
+	}
+	if !apiOK {
+		// The in-use count comes from the API — a failed LIST would
+		// make EVERY allocated IP look leaked.
+		h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
+		return
+	}
+	body, err := h.cfg.unixGet(ctx, h.cfg.CiliumSocket, "/v1/healthz")
+	if err != nil {
+		// Socket unreadable — inconclusive: keep counters/latch
+		// (same rule as checkCiliumInitStuck).
+		h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
+		return
+	}
+	used, available, ok := parseCiliumIPAM(body)
+	if !ok {
+		h.appendLog("suspect: cilium-ipam healthz has no parseable ipam.ipv4 data — inconclusive")
+		h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
+		return
+	}
+	inUse := 0
+	for i := range pods {
+		p := &pods[i]
+		// The denominator is "pods holding an address", not
+		// "Running pods": the CNI call happens at sandbox create,
+		// so a Pending/ContainerCreating pod already owns its IP —
+		// counting only Running would report those allocations as
+		// leaks. Terminal pods keep a stale .status.podIP; cilium
+		// frees that allocation at teardown, and if it hasn't, that
+		// IS the leak this check exists to find.
+		if p.Spec.HostNetwork || p.Status.PodIP == "" ||
+			p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		inUse++
+	}
+	leaked := used - inUse
+	if leaked < 0 {
+		leaked = 0
+	}
+	h.ciliumAllocated.Set(float64(used))
+	h.ciliumLeaked.Set(float64(leaked))
+	exhausted := leaked > 30 || (available >= 0 && available <= 2)
+	if !exhausted {
+		h.ciliumIPAMFails = 0
+		h.stateExit("cilium-ipam-exhausted")
+		h.cycles.WithLabelValues(checkCiliumIPAM, "ok").Inc()
+		return
+	}
+	h.ciliumIPAMFails++
+	if h.ciliumIPAMFails >= h.cfg.ConsecNeeded {
+		h.stateEnter("cilium-ipam-exhausted", fmt.Sprintf(
+			"used=%d in-use=%d leaked=%d available=%d", used, inUse, leaked, available))
+	} else {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-ipam-exhausted used=%d in-use=%d leaked=%d available=%d (check %d/%d)",
+			used, inUse, leaked, available, h.ciliumIPAMFails, h.cfg.ConsecNeeded))
+	}
+	h.cycles.WithLabelValues(checkCiliumIPAM, "ok").Inc()
 }
 
 // --- kubelet watchdog feeder + remediate (T15) ---

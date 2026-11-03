@@ -1,17 +1,25 @@
 package apiserver
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -365,5 +373,528 @@ func TestWebhookGuardPatchFailureReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "patches failed") {
 		t.Fatalf("expected the aggregated patch failure, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// C1 circuit breaker — builders
+// ---------------------------------------------------------------------------
+
+// wgBreakerGuard builds a guard with a scripted clock — advance *now
+// between runs to walk the deadSince streak past webhookDeadThreshold.
+func wgBreakerGuard(cs *fake.Clientset, now *time.Time) *webhookGuard {
+	return &webhookGuard{cs: cs,
+		nowFn:     func() time.Time { return *now },
+		deadSince: map[string]time.Time{}}
+}
+
+func wgFP(v admissionv1.FailurePolicyType) *admissionv1.FailurePolicyType {
+	return &v
+}
+
+// wgEndpointSlice builds a discovery.k8s.io/v1 slice carrying `ready`
+// ready + `notReady` unready endpoints, bound to svc via the
+// kubernetes.io/service-name label.
+func wgEndpointSlice(ns, svc string, ready, notReady int) *discoveryv1.EndpointSlice {
+	es := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: svc + "-slice",
+			Labels: map[string]string{discoveryv1.LabelServiceName: svc},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+	}
+	up, down := true, false
+	for i := 0; i < ready; i++ {
+		es.Endpoints = append(es.Endpoints, discoveryv1.Endpoint{
+			Addresses:  []string{fmt.Sprintf("10.10.0.%d", i+1)},
+			Conditions: discoveryv1.EndpointConditions{Ready: &up},
+		})
+	}
+	for i := 0; i < notReady; i++ {
+		es.Endpoints = append(es.Endpoints, discoveryv1.Endpoint{
+			Addresses:  []string{fmt.Sprintf("10.10.1.%d", i+1)},
+			Conditions: discoveryv1.EndpointConditions{Ready: &down},
+		})
+	}
+	return es
+}
+
+// wgNilReadySlice builds a slice whose endpoint leaves Ready unset —
+// nil counts as ready per the EndpointConditions contract.
+func wgNilReadySlice(ns, svc string) *discoveryv1.EndpointSlice {
+	es := wgEndpointSlice(ns, svc, 0, 0)
+	es.Endpoints = []discoveryv1.Endpoint{{
+		Addresses:  []string{"10.10.9.9"},
+		Conditions: discoveryv1.EndpointConditions{}, // Ready nil → ready
+	}}
+	return es
+}
+
+// wgMutatingFP returns the effective failurePolicy of one sub-webhook
+// ("" when unset) — the observable result of a breaker patch.
+func wgMutatingFP(t *testing.T, cs *fake.Clientset, cfg, hook string) admissionv1.FailurePolicyType {
+	t.Helper()
+	got, err := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
+		Get(ctx, cfg, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get mutatingwebhookconfiguration %s: %v", cfg, err)
+	}
+	for _, w := range got.Webhooks {
+		if w.Name == hook {
+			if w.FailurePolicy == nil {
+				return ""
+			}
+			return *w.FailurePolicy
+		}
+	}
+	t.Fatalf("webhook %q not found in %s", hook, cfg)
+	return ""
+}
+
+func wgValidatingFP(t *testing.T, cs *fake.Clientset, cfg, hook string) admissionv1.FailurePolicyType {
+	t.Helper()
+	got, err := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().
+		Get(ctx, cfg, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get validatingwebhookconfiguration %s: %v", cfg, err)
+	}
+	for _, w := range got.Webhooks {
+		if w.Name == hook {
+			if w.FailurePolicy == nil {
+				return ""
+			}
+			return *w.FailurePolicy
+		}
+	}
+	t.Fatalf("webhook %q not found in %s", hook, cfg)
+	return ""
+}
+
+// wgMutatingAnno reads the circuit-broken annotation of a config;
+// ok=false means the key is absent (fully cleared).
+func wgMutatingAnno(t *testing.T, cs *fake.Clientset, cfg string) (string, bool) {
+	t.Helper()
+	got, err := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
+		Get(ctx, cfg, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get mutatingwebhookconfiguration %s: %v", cfg, err)
+	}
+	v, ok := got.Annotations[webhookCircuitAnno]
+	return v, ok
+}
+
+func wgValidatingAnno(t *testing.T, cs *fake.Clientset, cfg string) (string, bool) {
+	t.Helper()
+	got, err := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().
+		Get(ctx, cfg, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get validatingwebhookconfiguration %s: %v", cfg, err)
+	}
+	v, ok := got.Annotations[webhookCircuitAnno]
+	return v, ok
+}
+
+// wgBrokenGauge reads the WebhookCircuitBroken series for one
+// (kind, config, webhook) label set.
+func wgBrokenGauge(t *testing.T, kind, cfg, hook string) float64 {
+	t.Helper()
+	return ptestutil.ToFloat64(
+		metrics.WebhookCircuitBroken.WithLabelValues(kind, cfg, hook))
+}
+
+// wgTripCount reads the WebhookCircuitBreakerTripsTotal series — call
+// before and after and compare deltas (the counter is process-global).
+func wgTripCount(t *testing.T, kind, cfg string) float64 {
+	t.Helper()
+	return ptestutil.ToFloat64(
+		metrics.WebhookCircuitBreakerTripsTotal.WithLabelValues(kind, cfg))
+}
+
+// ---------------------------------------------------------------------------
+// C1 circuit breaker — tests
+// ---------------------------------------------------------------------------
+
+// A fail-closed sub-webhook whose Service reports 0 Ready endpoints
+// does NOT trip on first sight nor inside the threshold — only a
+// continuous >= webhookDeadThreshold streak flips it to Ignore and
+// records the name in the annotation.
+func TestWebhookCircuitBreakerTripsAfterThreshold(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-mwc"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1), // 0 ready, 1 unready
+		mwc)
+	now := time.Unix(1_700_000_000, 0)
+	g := wgBreakerGuard(cs, &now)
+	patches := wgPatchCounter(cs)
+	tripsBefore := wgTripCount(t, webhookKindMutating, "cb-mwc")
+
+	// First sighting — recorded, not tripped.
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgMutatingFP(t, cs, "cb-mwc", "dead.example.com"); got != admissionv1.Fail {
+		t.Fatalf("first sighting must not trip, failurePolicy=%q", got)
+	}
+
+	// Inside the threshold — still no trip.
+	now = now.Add(4 * time.Minute)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgMutatingFP(t, cs, "cb-mwc", "dead.example.com"); got != admissionv1.Fail {
+		t.Fatalf("4m streak < %s must not trip, failurePolicy=%q",
+			webhookDeadThreshold, got)
+	}
+	if got := atomic.LoadInt32(patches); got != 0 {
+		t.Fatalf("breaker must not patch before the threshold, got %d patch(es)", got)
+	}
+
+	// Past the threshold — trip.
+	now = now.Add(2 * time.Minute) // 6m of dead backend
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgMutatingFP(t, cs, "cb-mwc", "dead.example.com"); got != admissionv1.Ignore {
+		t.Fatalf("expected failurePolicy=Ignore after trip, got %q", got)
+	}
+	anno, ok := wgMutatingAnno(t, cs, "cb-mwc")
+	if !ok || anno != "dead.example.com" {
+		t.Fatalf("annotation = %q (present=%v), want %q", anno, ok, "dead.example.com")
+	}
+	if got := wgBrokenGauge(t, webhookKindMutating, "cb-mwc", "dead.example.com"); got != 1 {
+		t.Fatalf("WebhookCircuitBroken = %v, want 1", got)
+	}
+	if got := wgTripCount(t, webhookKindMutating, "cb-mwc"); got != tripsBefore+1 {
+		t.Fatalf("trips = %v, want %v", got, tripsBefore+1)
+	}
+}
+
+// The trip lands as ONE merge patch carrying both the flipped
+// failurePolicy and the annotation — inspect the payload.
+func TestWebhookCircuitBreakerPatchContents(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-doc"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 2),
+		mwc)
+	var doc map[string]any
+	var patchType string
+	cs.PrependReactor("patch", "mutatingwebhookconfigurations",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			pa := action.(ktesting.PatchAction)
+			patchType = string(pa.GetPatchType())
+			if err := json.Unmarshal(pa.GetPatch(), &doc); err != nil {
+				t.Errorf("unmarshal patch: %v", err)
+			}
+			return false, nil, nil // passthrough
+		})
+	now := time.Unix(1_700_000_000, 0)
+	g := wgBreakerGuard(cs, &now)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(webhookDeadThreshold + time.Minute)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if doc == nil {
+		t.Fatal("no patch issued for the trip")
+	}
+	if patchType != string(types.MergePatchType) {
+		t.Fatalf("patch type = %s, want MergePatchType", patchType)
+	}
+	annos, _ := doc["metadata"].(map[string]any)["annotations"].(map[string]any)
+	if got := annos[webhookCircuitAnno]; got != "dead.example.com" {
+		t.Fatalf("patch annotation = %v, want %q", got, "dead.example.com")
+	}
+	whs, _ := doc["webhooks"].([]any)
+	if len(whs) != 1 {
+		t.Fatalf("patch webhooks = %v, want 1 entry", whs)
+	}
+	if got := whs[0].(map[string]any)["failurePolicy"]; got != "Ignore" {
+		t.Fatalf("patched failurePolicy = %v, want Ignore", got)
+	}
+}
+
+// Recovery: once the Service reports a Ready endpoint the breaker
+// restores failurePolicy=Fail, clears the now-empty annotation and
+// drops the gauge back to 0. Exercised on the validating kind.
+func TestWebhookCircuitBreakerRecoversAndClears(t *testing.T) {
+	vwc := &admissionv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-vwc"},
+		Webhooks: []admissionv1.ValidatingWebhook{{
+			Name:          "dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		vwc)
+	now := time.Unix(1_700_000_000, 0)
+	g := wgBreakerGuard(cs, &now)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(webhookDeadThreshold + time.Minute)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgValidatingFP(t, cs, "cb-vwc", "dead.example.com"); got != admissionv1.Ignore {
+		t.Fatalf("precondition: expected tripped webhook, failurePolicy=%q", got)
+	}
+	tripsAfterTrip := wgTripCount(t, webhookKindValidating, "cb-vwc")
+
+	// Backend comes back — one Ready endpoint.
+	if _, err := cs.DiscoveryV1().EndpointSlices("backend").Update(ctx,
+		wgEndpointSlice("backend", "dead-svc", 1, 0), metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update slice: %v", err)
+	}
+	now = now.Add(time.Minute)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgValidatingFP(t, cs, "cb-vwc", "dead.example.com"); got != admissionv1.Fail {
+		t.Fatalf("expected failurePolicy=Fail after recovery, got %q", got)
+	}
+	if anno, ok := wgValidatingAnno(t, cs, "cb-vwc"); ok {
+		t.Fatalf("annotation must be removed when empty, still %q", anno)
+	}
+	if got := wgBrokenGauge(t, webhookKindValidating, "cb-vwc", "dead.example.com"); got != 0 {
+		t.Fatalf("WebhookCircuitBroken = %v, want 0 after recovery", got)
+	}
+	if got := wgTripCount(t, webhookKindValidating, "cb-vwc"); got != tripsAfterTrip {
+		t.Fatalf("recovery must not count as a trip: %v != %v", got, tripsAfterTrip)
+	}
+}
+
+// The kill-switch: WEBHOOK_CIRCUIT_BREAKER_ENABLED=false leaves
+// fail-closed webhooks on dead Services untouched forever.
+func TestWebhookCircuitBreakerDisabledByEnv(t *testing.T) {
+	t.Setenv("WEBHOOK_CIRCUIT_BREAKER_ENABLED", "false")
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-off"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		mwc)
+	patches := wgPatchCounter(cs)
+	g := &webhookGuard{cs: cs}
+	for i := 0; i < 3; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := wgMutatingFP(t, cs, "cb-off", "dead.example.com"); got != admissionv1.Fail {
+		t.Fatalf("disabled breaker must not touch failurePolicy, got %q", got)
+	}
+	if _, ok := wgMutatingAnno(t, cs, "cb-off"); ok {
+		t.Fatal("disabled breaker must not write the annotation")
+	}
+	if got := atomic.LoadInt32(patches); got != 0 {
+		t.Fatalf("disabled breaker must not patch, got %d patch(es)", got)
+	}
+}
+
+// A Service with Ready endpoints — including a nil conditions.ready,
+// which the API treats as ready — never accumulates a streak.
+func TestWebhookCircuitBreakerReadyBackendNeverTrips(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		slice *discoveryv1.EndpointSlice
+	}{
+		{"explicit ready", wgEndpointSlice("backend", "live-svc", 1, 0)},
+		{"nil ready counts ready", wgNilReadySlice("backend", "live-svc")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mwc := &admissionv1.MutatingWebhookConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: "cb-live"},
+				Webhooks: []admissionv1.MutatingWebhook{{
+					Name:          "live.example.com",
+					FailurePolicy: wgFP(admissionv1.Fail),
+					ClientConfig: admissionv1.WebhookClientConfig{
+						Service: wgSvcRef("backend", "live-svc"),
+					},
+				}},
+			}
+			cs := fake.NewSimpleClientset(
+				wgNamespace("kube-system"), wgNamespace("backend"),
+				wgService("backend", "live-svc"), tc.slice, mwc)
+			patches := wgPatchCounter(cs)
+			now := time.Unix(1_700_000_000, 0)
+			g := wgBreakerGuard(cs, &now)
+			if err := g.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(2 * webhookDeadThreshold)
+			if err := g.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if got := wgMutatingFP(t, cs, "cb-live", "live.example.com"); got != admissionv1.Fail {
+				t.Fatalf("ready backend must never trip, failurePolicy=%q", got)
+			}
+			if got := atomic.LoadInt32(patches); got != 0 {
+				t.Fatalf("ready backend must not be patched, got %d patch(es)", got)
+			}
+		})
+	}
+}
+
+// Entries already fail-open (failurePolicy=Ignore) are never
+// tracked — there is no deadlock to break.
+func TestWebhookCircuitBreakerIgnorePolicyNeverTrips(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-open"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "open.example.com",
+			FailurePolicy: wgFP(admissionv1.Ignore),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		mwc)
+	patches := wgPatchCounter(cs)
+	now := time.Unix(1_700_000_000, 0)
+	g := wgBreakerGuard(cs, &now)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * webhookDeadThreshold)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wgMutatingAnno(t, cs, "cb-open"); ok {
+		t.Fatal("an Ignore entry must never enter the annotation")
+	}
+	if got := atomic.LoadInt32(patches); got != 0 {
+		t.Fatalf("Ignore entry must not be patched, got %d patch(es)", got)
+	}
+}
+
+// A failed patch on one config must not abort the sweep — the sibling
+// config still trips, and the failure surfaces as an error.
+func TestWebhookCircuitBreakerPatchFailureDoesNotAbort(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-m-ok"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "dead-m.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	vwc := &admissionv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-v-fail"},
+		Webhooks: []admissionv1.ValidatingWebhook{{
+			Name:          "dead-v.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		mwc, vwc)
+	cs.PrependReactor("patch", "validatingwebhookconfigurations",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	now := time.Unix(1_700_000_000, 0)
+	g := wgBreakerGuard(cs, &now)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(webhookDeadThreshold + time.Minute)
+	err := g.run(ctx)
+	if err == nil {
+		t.Fatal("expected the aggregated circuit breaker patch failure")
+	}
+	if !strings.Contains(err.Error(), "circuit breaker") {
+		t.Fatalf("expected a circuit breaker error, got %v", err)
+	}
+	if got := wgMutatingFP(t, cs, "cb-m-ok", "dead-m.example.com"); got != admissionv1.Ignore {
+		t.Fatalf("sibling config must still trip, failurePolicy=%q", got)
+	}
+	if got := wgValidatingFP(t, cs, "cb-v-fail", "dead-v.example.com"); got != admissionv1.Fail {
+		t.Fatalf("failed config keeps its policy, failurePolicy=%q", got)
+	}
+}
+
+// Annotation names that no longer match a live sub-webhook drop out —
+// e.g. after the orphan sweep removed the entry — while genuinely
+// broken names are kept.
+func TestWebhookCircuitBreakerDropsStaleAnnotationNames(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cb-stale",
+			Annotations: map[string]string{
+				webhookCircuitAnno: "gone.example.com,still-dead.example.com",
+			},
+		},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "still-dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Ignore),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		mwc)
+	g := &webhookGuard{cs: cs}
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	anno, ok := wgMutatingAnno(t, cs, "cb-stale")
+	if !ok || anno != "still-dead.example.com" {
+		t.Fatalf("annotation = %q (present=%v), want %q",
+			anno, ok, "still-dead.example.com")
 	}
 }

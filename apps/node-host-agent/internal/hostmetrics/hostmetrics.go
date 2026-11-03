@@ -42,6 +42,27 @@
 //     node_overlay_egress_relay_active{target} = 1 while
 //     egress-state-<ip> is "relay" (emitted for every configured
 //     target — absent vs 0 must stay distinguishable).
+//   - clock sync (H1): adjtimex(2) →
+//     node_host_agent_clock_unsynchronized (STA_UNSYNC flag) +
+//     node_host_agent_clock_estimated_error_seconds (Esterror,
+//     exported µs→s) — a silently drifting clock breaks cert
+//     validation, etcd and log ordering long before anyone notices.
+//   - conntrack table (H2): nf_conntrack_{count,max} →
+//     node_host_agent_conntrack_{entries,limit,used_ratio} — a full
+//     table drops NEW flows silently (DNS timeouts with zero
+//     packet-loss evidence).
+//   - filesystem inodes + hung-mount probe (H3/H7): statfs(2) over
+//     FilesystemTargets → node_host_agent_filesystem_inodes_* and
+//     node_host_agent_filesystem_probe_stalled — inode exhaustion
+//     fails every create while df still shows free GB, and a hung
+//     mount wedges any process that stats it (the probe runs with a
+//     deadline on a spare goroutine — a stuck syscall can't be
+//     cancelled, so at most one goroutine per mount is allowed to
+//     pile up).
+//   - FD + socket pressure (H6): /proc/sys/fs/file-nr +
+//     /proc/1/net/sockstat → node_host_agent_filefd_* +
+//     node_host_agent_sockstat_* — fd exhaustion and orphan/TIME_WAIT
+//     pileups present as accept/connect flakes.
 //
 // Emission policy (documented choice): watchdog_state emits for every
 // latch ever observed (1 while latched, 0 after clear). The
@@ -50,6 +71,10 @@
 // distinguishable from "interface down". The nebula cert days gauge
 // emits only when the cert parses. node_k0s_config_drift emits
 // only where the k0s controller unit exists — workers carry no series.
+// The clock/conntrack/filefd/sockstat gauges emit only when their
+// source reads or parses; filesystem_probe_stalled emits for EVERY
+// configured mount — a 0 means the probe answered in time, so
+// "reachable and boring" stays distinguishable from "never probed".
 package hostmetrics
 
 import (
@@ -83,6 +108,15 @@ const (
 	defaultK0sUnitFile      = "/etc/systemd/system/k0scontroller.service"
 	defaultNebulaCertFile   = "/host/etc/nebula/interdc/host.crt"
 	defaultPSIFile          = "/proc/pressure/cpu"
+	// H2 conntrack table + H6 fd/socket sources.
+	defaultConntrackCountFile = "/proc/sys/net/netfilter/nf_conntrack_count"
+	defaultConntrackMaxFile   = "/proc/sys/net/netfilter/nf_conntrack_max"
+	defaultFileNRFile         = "/proc/sys/fs/file-nr"
+	defaultSockstatFile       = "/proc/1/net/sockstat"
+	// defaultFSProbeTimeout bounds one statfs probe — a hung mount
+	// blocks the syscall in uninterruptible sleep, so the deadline
+	// is the only "still alive" signal (H7).
+	defaultFSProbeTimeout = 2 * time.Second
 	// psiOverloadedOn/Off are the node-overloaded hysteresis — the
 	// runner's load15>4*ncpu test replaced by PSI some avg60 (actual
 	// stall evidence, not raw load): enter the latch at >=40%,
@@ -114,6 +148,14 @@ const (
 // defaultRemovedFlags are k0s config keys removed upstream whose
 // presence means the rendered config drifted from the expected one.
 var defaultRemovedFlags = []string{"concurrent-service-syncs"}
+
+// defaultFilesystemTargets are the mounts statfs'd per scrape —
+// the inode + hung-mount canaries for the dirs that hurt most when
+// the fs underneath wedges or runs out of inodes (host /etc, the
+// k0s data dir, the OpenEBS local-path provisioner root).
+var defaultFilesystemTargets = []string{
+	"/host/etc", "/host/var/lib/k0s", "/var/openebs/local",
+}
 
 // defaultExpectedKCMArgs is the expected key set of
 // spec.controllerManager.extraArgs — the 11 keys pinned identically in
@@ -154,12 +196,34 @@ type Config struct {
 	CPUDeliveredInterval time.Duration
 	RemovedFlags         []string
 	ExpectedKCMArgs      []string
+	// ConntrackCountFile/ConntrackMaxFile are
+	// /proc/sys/net/netfilter/nf_conntrack_{count,max} — the H2
+	// conntrack-table-pressure gauges.
+	ConntrackCountFile string
+	ConntrackMaxFile   string
+	// FileNRFile is /proc/sys/fs/file-nr ("allocated unused max")
+	// and SockstatFile /proc/1/net/sockstat — the H6 fd/socket
+	// pressure gauges.
+	FileNRFile   string
+	SockstatFile string
+	// FilesystemTargets are the mounts statfs'd per scrape for the
+	// inode gauges (H3) and the hung-mount probe (H7).
+	FilesystemTargets []string
 
 	// nowFn supplies the current time — seam for tests.
 	nowFn func() time.Time
 	// cpuMeasure replaces the real RUSAGE_THREAD busy-loop for
 	// tests: returns (ratio, wallSeconds, ok).
 	cpuMeasure func() (ratio, wall float64, ok bool)
+	// adjtimexFn reads kernel clock-sync state (H1) — seam for
+	// tests (default unix.Adjtimex).
+	adjtimexFn func(*unix.Timex) (int, error)
+	// statfsFn probes one mount — seam for tests, including a fake
+	// that hangs to exercise the stalled path (default unix.Statfs).
+	statfsFn func(string, *unix.Statfs_t) error
+	// fsProbeTimeout bounds one statfs probe before the mount is
+	// reported stalled — seam so tests don't wait the full 2s.
+	fsProbeTimeout time.Duration
 }
 
 func (c *Config) applyDefaults() {
@@ -198,6 +262,30 @@ func (c *Config) applyDefaults() {
 	}
 	if len(c.ExpectedKCMArgs) == 0 {
 		c.ExpectedKCMArgs = defaultExpectedKCMArgs
+	}
+	if c.ConntrackCountFile == "" {
+		c.ConntrackCountFile = defaultConntrackCountFile
+	}
+	if c.ConntrackMaxFile == "" {
+		c.ConntrackMaxFile = defaultConntrackMaxFile
+	}
+	if c.FileNRFile == "" {
+		c.FileNRFile = defaultFileNRFile
+	}
+	if c.SockstatFile == "" {
+		c.SockstatFile = defaultSockstatFile
+	}
+	if len(c.FilesystemTargets) == 0 {
+		c.FilesystemTargets = defaultFilesystemTargets
+	}
+	if c.adjtimexFn == nil {
+		c.adjtimexFn = unix.Adjtimex
+	}
+	if c.statfsFn == nil {
+		c.statfsFn = unix.Statfs
+	}
+	if c.fsProbeTimeout <= 0 {
+		c.fsProbeTimeout = defaultFSProbeTimeout
 	}
 }
 
@@ -240,6 +328,25 @@ type Collector struct {
 	descF2B         *prometheus.Desc
 	descEgressRelay *prometheus.Desc
 
+	// Gray-failure telemetry (H1 clock, H2 conntrack, H3 inodes,
+	// H6 fd/sockets, H7 hung-mount probe).
+	descClockUnsync    *prometheus.Desc
+	descClockEstErr    *prometheus.Desc
+	descCtEntries      *prometheus.Desc
+	descCtLimit        *prometheus.Desc
+	descCtRatio        *prometheus.Desc
+	descFSInodesTotal  *prometheus.Desc
+	descFSInodesFree   *prometheus.Desc
+	descFSInodesRatio  *prometheus.Desc
+	descFSProbeStalled *prometheus.Desc
+	descFileFDAlloc    *prometheus.Desc
+	descFileFDMax      *prometheus.Desc
+	descFileFDRatio    *prometheus.Desc
+	descSockTCPInuse   *prometheus.Desc
+	descSockTCPOrphan  *prometheus.Desc
+	descSockTCPTW      *prometheus.Desc
+	descSockUsed       *prometheus.Desc
+
 	// Legacy node-watchdog aliases — the prom_emit textfile series
 	// the fluxcd PrometheusRules still alert on
 	// (node_watchdog_state{signal}, node_watchdog_egress_relay{target}).
@@ -264,12 +371,20 @@ type Collector struct {
 	cpuWall    float64
 	cpuOK      bool
 	cpuSink    uint64 // busy-loop sink, mu-guarded
+
+	// fsInflight (mu) holds the start time of each mount's in-kernel
+	// statfs probe — a hung syscall can't be cancelled, so a scrape
+	// that finds an in-flight probe reports stalled only once the
+	// deadline has elapsed, WITHOUT spawning another (bounds stuck
+	// goroutines at one per mount).
+	fsInflight map[string]time.Time
 }
 
 // New returns the Collector. Register it on the agent's registry.
 func New(cfg Config) *Collector {
 	cfg.applyDefaults()
-	c := &Collector{cfg: cfg, seenStates: map[string]time.Time{}}
+	c := &Collector{cfg: cfg, seenStates: map[string]time.Time{},
+		fsInflight: map[string]time.Time{}}
 	c.removedFlagRe = make(map[string]*regexp.Regexp, len(cfg.RemovedFlags))
 	for _, flag := range cfg.RemovedFlags {
 		// Anchored key match (same shape as the canonical
@@ -336,6 +451,73 @@ func New(cfg Config) *Collector {
 		"Egress target currently routed via overlay relay (1) or direct (0).",
 		[]string{"target"}, nil)
 
+	// Gray-failure telemetry — all carry the node label so a
+	// federated store can attribute them back to the agent host.
+	c.descClockUnsync = prometheus.NewDesc(
+		"node_host_agent_clock_unsynchronized",
+		"Kernel clock reports STA_UNSYNC via adjtimex (1 = not synchronized; emitted only when the syscall succeeds).",
+		[]string{"node"}, nil)
+	c.descClockEstErr = prometheus.NewDesc(
+		"node_host_agent_clock_estimated_error_seconds",
+		"adjtimex Timex.Esterror exported as seconds — the kernel's own bound on clock error.",
+		[]string{"node"}, nil)
+	c.descCtEntries = prometheus.NewDesc(
+		"node_host_agent_conntrack_entries",
+		"nf_conntrack_count — conntrack table entries currently tracked.",
+		[]string{"node"}, nil)
+	c.descCtLimit = prometheus.NewDesc(
+		"node_host_agent_conntrack_limit",
+		"nf_conntrack_max — conntrack table capacity.",
+		[]string{"node"}, nil)
+	c.descCtRatio = prometheus.NewDesc(
+		"node_host_agent_conntrack_used_ratio",
+		"Conntrack table fill ratio (entries/limit; emitted only when both files parse and limit > 0).",
+		[]string{"node"}, nil)
+	c.descFSInodesTotal = prometheus.NewDesc(
+		"node_host_agent_filesystem_inodes_total",
+		"Total inodes on the probed mount (statfs Files).",
+		[]string{"node", "mount"}, nil)
+	c.descFSInodesFree = prometheus.NewDesc(
+		"node_host_agent_filesystem_inodes_free",
+		"Free inodes on the probed mount (statfs Ffree).",
+		[]string{"node", "mount"}, nil)
+	c.descFSInodesRatio = prometheus.NewDesc(
+		"node_host_agent_filesystem_inodes_used_ratio",
+		"Used-inode share of the probed mount ((Files-Ffree)/Files; emitted only when statfs succeeds).",
+		[]string{"node", "mount"}, nil)
+	c.descFSProbeStalled = prometheus.NewDesc(
+		"node_host_agent_filesystem_probe_stalled",
+		"statfs probe of this mount exceeded the deadline (1 = hung mount; emitted for every configured target).",
+		[]string{"node", "mount"}, nil)
+	c.descFileFDAlloc = prometheus.NewDesc(
+		"node_host_agent_filefd_allocated",
+		"file-nr field 0 — file handles currently allocated.",
+		[]string{"node"}, nil)
+	c.descFileFDMax = prometheus.NewDesc(
+		"node_host_agent_filefd_maximum",
+		"file-nr field 2 — file handle limit.",
+		[]string{"node"}, nil)
+	c.descFileFDRatio = prometheus.NewDesc(
+		"node_host_agent_filefd_used_ratio",
+		"file-nr allocated/maximum (emitted only when file-nr parses and max > 0).",
+		[]string{"node"}, nil)
+	c.descSockTCPInuse = prometheus.NewDesc(
+		"node_host_agent_sockstat_tcp_inuse",
+		"sockstat TCP inuse — TCP sockets in use.",
+		[]string{"node"}, nil)
+	c.descSockTCPOrphan = prometheus.NewDesc(
+		"node_host_agent_sockstat_tcp_orphan",
+		"sockstat TCP orphan — orphaned (not attached to a socket) TCP connections.",
+		[]string{"node"}, nil)
+	c.descSockTCPTW = prometheus.NewDesc(
+		"node_host_agent_sockstat_tcp_tw",
+		"sockstat TCP tw — TCP sockets in TIME_WAIT.",
+		[]string{"node"}, nil)
+	c.descSockUsed = prometheus.NewDesc(
+		"node_host_agent_sockstat_sockets_used",
+		"sockstat 'sockets: used' — total sockets in use across protocols.",
+		[]string{"node"}, nil)
+
 	c.descMeta = map[*prometheus.Desc]descMeta{}
 	for _, d := range []struct {
 		desc *prometheus.Desc
@@ -366,6 +548,38 @@ func New(cfg Config) *Collector {
 			"Egress target currently routed via the overlay relay (1) or direct underlay (0)."},
 		{c.descEgressRelayLegacy, "node_watchdog_egress_relay",
 			"Egress target currently routed via overlay relay (1) or direct (0)."},
+		{c.descClockUnsync, "node_host_agent_clock_unsynchronized",
+			"Kernel clock reports STA_UNSYNC via adjtimex (1 = not synchronized)."},
+		{c.descClockEstErr, "node_host_agent_clock_estimated_error_seconds",
+			"adjtimex Timex.Esterror exported as seconds."},
+		{c.descCtEntries, "node_host_agent_conntrack_entries",
+			"nf_conntrack_count — conntrack table entries currently tracked."},
+		{c.descCtLimit, "node_host_agent_conntrack_limit",
+			"nf_conntrack_max — conntrack table capacity."},
+		{c.descCtRatio, "node_host_agent_conntrack_used_ratio",
+			"Conntrack table fill ratio (entries/limit)."},
+		{c.descFSInodesTotal, "node_host_agent_filesystem_inodes_total",
+			"Total inodes on the probed mount (statfs Files)."},
+		{c.descFSInodesFree, "node_host_agent_filesystem_inodes_free",
+			"Free inodes on the probed mount (statfs Ffree)."},
+		{c.descFSInodesRatio, "node_host_agent_filesystem_inodes_used_ratio",
+			"Used-inode share of the probed mount."},
+		{c.descFSProbeStalled, "node_host_agent_filesystem_probe_stalled",
+			"statfs probe of this mount exceeded the deadline (1 = hung mount)."},
+		{c.descFileFDAlloc, "node_host_agent_filefd_allocated",
+			"file-nr field 0 — file handles currently allocated."},
+		{c.descFileFDMax, "node_host_agent_filefd_maximum",
+			"file-nr field 2 — file handle limit."},
+		{c.descFileFDRatio, "node_host_agent_filefd_used_ratio",
+			"file-nr allocated/maximum."},
+		{c.descSockTCPInuse, "node_host_agent_sockstat_tcp_inuse",
+			"sockstat TCP inuse — TCP sockets in use."},
+		{c.descSockTCPOrphan, "node_host_agent_sockstat_tcp_orphan",
+			"sockstat TCP orphan — orphaned TCP connections."},
+		{c.descSockTCPTW, "node_host_agent_sockstat_tcp_tw",
+			"sockstat TCP tw — TCP sockets in TIME_WAIT."},
+		{c.descSockUsed, "node_host_agent_sockstat_sockets_used",
+			"sockstat 'sockets: used' — total sockets in use."},
 	} {
 		c.descMeta[d.desc] = descMeta{name: d.name, help: d.help}
 	}
@@ -394,6 +608,22 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.descF2B
 	ch <- c.descEgressRelay
 	ch <- c.descEgressRelayLegacy
+	ch <- c.descClockUnsync
+	ch <- c.descClockEstErr
+	ch <- c.descCtEntries
+	ch <- c.descCtLimit
+	ch <- c.descCtRatio
+	ch <- c.descFSInodesTotal
+	ch <- c.descFSInodesFree
+	ch <- c.descFSInodesRatio
+	ch <- c.descFSProbeStalled
+	ch <- c.descFileFDAlloc
+	ch <- c.descFileFDMax
+	ch <- c.descFileFDRatio
+	ch <- c.descSockTCPInuse
+	ch <- c.descSockTCPOrphan
+	ch <- c.descSockTCPTW
+	ch <- c.descSockUsed
 }
 
 // Collect implements prometheus.Collector.
@@ -417,6 +647,11 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.collectCPUDelivered(ch)
 	c.collectFail2ban(ch)
 	c.collectEgressRelay(ch)
+	c.collectClock(ch)
+	c.collectConntrack(ch)
+	c.collectFilesystem(ch)
+	c.collectFileFD(ch)
+	c.collectSockstat(ch)
 }
 
 // collectWatchdog scans state-* latch files. certDays/certOK fold the
@@ -1019,6 +1254,250 @@ func (c *Collector) collectEgressRelay(ch chan<- prometheus.Metric) {
 		// Legacy alias: prom_emit's node_watchdog_egress_relay{target}.
 		ch <- prometheus.MustNewConstMetric(c.descEgressRelayLegacy,
 			prometheus.GaugeValue, v, r)
+	}
+}
+
+// --- H1: clock sync (adjtimex) ---
+
+// collectClock emits the clock-sync gauges only when adjtimex
+// succeeds — an absent series means the syscall failed
+// (inconclusive), never a fake "synchronized" 0.
+func (c *Collector) collectClock(ch chan<- prometheus.Metric) {
+	var tx unix.Timex
+	if _, err := c.cfg.adjtimexFn(&tx); err != nil {
+		return
+	}
+	unsync := 0.0
+	if tx.Status&unix.STA_UNSYNC != 0 {
+		unsync = 1
+	}
+	ch <- prometheus.MustNewConstMetric(c.descClockUnsync,
+		prometheus.GaugeValue, unsync, c.cfg.NodeName)
+	// Timex.Esterror is microseconds — export seconds.
+	ch <- prometheus.MustNewConstMetric(c.descClockEstErr,
+		prometheus.GaugeValue, float64(tx.Esterror)/1e6, c.cfg.NodeName)
+}
+
+// --- H2: conntrack table pressure ---
+
+// readUintFile parses a single-integer procfs/sysfs file
+// (nf_conntrack_{count,max} shape — leading whitespace + trailing
+// newline tolerated).
+func readUintFile(path string) (uint64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	f := strings.Fields(string(data))
+	if len(f) == 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(f[0], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// collectConntrack emits entries/limit each only when its own file
+// parses (a node without the conntrack module has no files → absent
+// series, not a fake 0) and the ratio only when both parsed and the
+// limit is non-zero.
+func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
+	count, countOK := readUintFile(c.cfg.ConntrackCountFile)
+	limit, limitOK := readUintFile(c.cfg.ConntrackMaxFile)
+	if countOK {
+		ch <- prometheus.MustNewConstMetric(c.descCtEntries,
+			prometheus.GaugeValue, float64(count), c.cfg.NodeName)
+	}
+	if limitOK {
+		ch <- prometheus.MustNewConstMetric(c.descCtLimit,
+			prometheus.GaugeValue, float64(limit), c.cfg.NodeName)
+	}
+	if countOK && limitOK && limit > 0 {
+		ch <- prometheus.MustNewConstMetric(c.descCtRatio,
+			prometheus.GaugeValue,
+			float64(count)/float64(limit), c.cfg.NodeName)
+	}
+}
+
+// --- H3+H7: filesystem inode stats + hung-mount probe ---
+
+// fsResult is one statfs probe outcome.
+type fsResult struct {
+	st  unix.Statfs_t
+	err error
+}
+
+// probeFS statfs's one mount under the fsProbeTimeout deadline. A
+// hung mount blocks the syscall in uninterruptible sleep — it can't
+// be cancelled — so the call runs on a goroutine and the scrape
+// moves on after the deadline. stalled=true means the deadline
+// passed with the syscall still stuck (or an earlier probe of the
+// same mount has been in the kernel past the deadline — at most one
+// goroutine per mount is allowed to pile up). A scrape that lands
+// while a still-fresh probe is in flight reports stalled=0, not 1:
+// "probe running" is not "probe hung", and two overlapping scrapers
+// must not manufacture a hung-mount alert. ok=true only when statfs
+// completed without error.
+func (c *Collector) probeFS(mount string) (st unix.Statfs_t, stalled, ok bool) {
+	c.mu.Lock()
+	if start, inflight := c.fsInflight[mount]; inflight {
+		c.mu.Unlock()
+		return unix.Statfs_t{}, time.Since(start) >= c.cfg.fsProbeTimeout, false
+	}
+	c.fsInflight[mount] = time.Now()
+	c.mu.Unlock()
+
+	res := make(chan fsResult, 1)
+	go func() {
+		var r fsResult
+		r.err = c.cfg.statfsFn(mount, &r.st)
+		c.mu.Lock()
+		delete(c.fsInflight, mount)
+		c.mu.Unlock()
+		res <- r // buffered — never blocks after a timed-out scrape
+	}()
+
+	timer := time.NewTimer(c.cfg.fsProbeTimeout)
+	defer timer.Stop()
+	select {
+	case r := <-res:
+		if r.err != nil {
+			return unix.Statfs_t{}, false, false
+		}
+		return r.st, false, true
+	case <-timer.C:
+		return unix.Statfs_t{}, true, false
+	}
+}
+
+// collectFilesystem emits per-mount inode gauges plus the
+// probe_stalled signal for EVERY configured target — a 0 means the
+// probe answered in time (even with an error), so "reachable but
+// boring" stays distinguishable from "never probed". Inode gauges
+// emit only on a successful statfs — a failed/hung probe emits no
+// fake numbers.
+func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
+	for _, mount := range c.cfg.FilesystemTargets {
+		st, stalled, ok := c.probeFS(mount)
+		v := 0.0
+		if stalled {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.descFSProbeStalled,
+			prometheus.GaugeValue, v, c.cfg.NodeName, mount)
+		if !ok {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(c.descFSInodesTotal,
+			prometheus.GaugeValue, float64(st.Files), c.cfg.NodeName, mount)
+		ch <- prometheus.MustNewConstMetric(c.descFSInodesFree,
+			prometheus.GaugeValue, float64(st.Ffree), c.cfg.NodeName, mount)
+		if st.Files > 0 && st.Ffree <= st.Files {
+			// Ffree > Files wraps uint64 — pseudo/network filesystems
+			// can report free inodes above the total.
+			used := float64(st.Files-st.Ffree) / float64(st.Files)
+			ch <- prometheus.MustNewConstMetric(c.descFSInodesRatio,
+				prometheus.GaugeValue, used, c.cfg.NodeName, mount)
+		}
+	}
+}
+
+// --- H6: FD + socket pressure (file-nr, sockstat) ---
+
+// collectFileFD parses /proc/sys/fs/file-nr — "allocated unused
+// max" (fields 0 and 2; the middle "unused" field is always ~0 on
+// modern kernels). Absent/malformed → no series.
+func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
+	data, err := os.ReadFile(c.cfg.FileNRFile)
+	if err != nil {
+		return
+	}
+	f := strings.Fields(string(data))
+	if len(f) < 3 {
+		return
+	}
+	alloc, errA := strconv.ParseFloat(f[0], 64)
+	maxFD, errM := strconv.ParseFloat(f[2], 64)
+	if errA != nil || errM != nil {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.descFileFDAlloc,
+		prometheus.GaugeValue, alloc, c.cfg.NodeName)
+	ch <- prometheus.MustNewConstMetric(c.descFileFDMax,
+		prometheus.GaugeValue, maxFD, c.cfg.NodeName)
+	if maxFD > 0 {
+		ch <- prometheus.MustNewConstMetric(c.descFileFDRatio,
+			prometheus.GaugeValue, alloc/maxFD, c.cfg.NodeName)
+	}
+}
+
+// collectSockstat parses /proc/1/net/sockstat — section lines of
+// "NAME: key N key N ..." pairs ("sockets: used 1847",
+// "TCP: inuse 25 orphan 0 tw 4 alloc 1200 mem 456"). Each gauge
+// emits only when its key parsed — a node missing a section keeps
+// that series absent rather than 0.
+func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
+	f, err := os.Open(c.cfg.SockstatFile)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	var tcpInuse, tcpOrphan, tcpTW, sockUsed float64
+	var tcpInuseOK, tcpOrphanOK, tcpTWOK, sockUsedOK bool
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		// "NAME:" + an even number of key/value fields → odd total.
+		if len(fields) < 3 || len(fields)%2 == 0 {
+			continue
+		}
+		kv := make(map[string]float64, len(fields)/2)
+		good := true
+		for i := 1; i+1 < len(fields); i += 2 {
+			v, err := strconv.ParseFloat(fields[i+1], 64)
+			if err != nil {
+				good = false
+				break
+			}
+			kv[fields[i]] = v
+		}
+		if !good {
+			continue // malformed line — never emit junk
+		}
+		switch strings.TrimSuffix(fields[0], ":") {
+		case "TCP":
+			if v, ok := kv["inuse"]; ok {
+				tcpInuse, tcpInuseOK = v, true
+			}
+			if v, ok := kv["orphan"]; ok {
+				tcpOrphan, tcpOrphanOK = v, true
+			}
+			if v, ok := kv["tw"]; ok {
+				tcpTW, tcpTWOK = v, true
+			}
+		case "sockets":
+			if v, ok := kv["used"]; ok {
+				sockUsed, sockUsedOK = v, true
+			}
+		}
+	}
+	if sockUsedOK {
+		ch <- prometheus.MustNewConstMetric(c.descSockUsed,
+			prometheus.GaugeValue, sockUsed, c.cfg.NodeName)
+	}
+	if tcpInuseOK {
+		ch <- prometheus.MustNewConstMetric(c.descSockTCPInuse,
+			prometheus.GaugeValue, tcpInuse, c.cfg.NodeName)
+	}
+	if tcpOrphanOK {
+		ch <- prometheus.MustNewConstMetric(c.descSockTCPOrphan,
+			prometheus.GaugeValue, tcpOrphan, c.cfg.NodeName)
+	}
+	if tcpTWOK {
+		ch <- prometheus.MustNewConstMetric(c.descSockTCPTW,
+			prometheus.GaugeValue, tcpTW, c.cfg.NodeName)
 	}
 }
 

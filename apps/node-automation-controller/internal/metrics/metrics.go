@@ -54,6 +54,86 @@ var healthCheckSecondsSinceSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts
 	Help: "Seconds since the check last reported OK (kuberhealthy-compatible).",
 }, []string{"check", "namespace"})
 
+// ---------------------------------------------------------------------------
+// Self-healing / gray-failure defense metrics (Quick-Wins + C1-C6).
+// Exported so the domain packages under internal/controller drive the
+// vectors directly.
+// ---------------------------------------------------------------------------
+
+// CiliumIdentitiesCollectedTotal counts CiliumIdentity objects reaped
+// by the cilium-identity-auditor two-pass safe GC.
+var CiliumIdentitiesCollectedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	Name: "node_automation_cilium_identities_collected_total",
+	Help: "CiliumIdentity objects reaped by the two-pass safe GC.",
+})
+
+// WebhookCircuitBroken marks (1) each sub-webhook currently patched to
+// failurePolicy=Ignore by the admission-webhook circuit breaker (C1).
+// Labels: webhook config kind, config name, sub-webhook name.
+var WebhookCircuitBroken = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_webhook_circuit_broken",
+	Help: "1 while the named sub-webhook is circuit-broken (failurePolicy patched to Ignore).",
+}, []string{"kind", "name", "webhook"})
+
+// WebhookCircuitBreakerTripsTotal counts how many times the circuit
+// breaker tripped per webhook config.
+var WebhookCircuitBreakerTripsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_webhook_circuit_breaker_trips_total",
+	Help: "Circuit-breaker trips per webhook config.",
+}, []string{"kind", "name"})
+
+// PDBDrainBlocked marks (1) PodDisruptionBudgets blocking drains
+// (C2). reason is impossible_policy | cordoned_node_blocked |
+// prolonged_zero_disruptions.
+var PDBDrainBlocked = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_pdb_drain_blocked",
+	Help: "1 while the PDB reports expectedPods>0 and disruptionsAllowed==0 past its reason threshold.",
+}, []string{"namespace", "pdb", "reason"})
+
+// StuckTerminatingResources marks (1) Namespaces / PVCs stuck
+// Terminating past the audit threshold (C3).
+var StuckTerminatingResources = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_stuck_terminating_resources",
+	Help: "1 while the resource has had a DeletionTimestamp past the stuck threshold.",
+}, []string{"kind", "namespace", "name"})
+
+// HelmHookJobsCleanedTotal counts failed helm-hook Jobs reaped when
+// the helmrelease-unlocker frees a stuck HelmRelease (C3).
+var HelmHookJobsCleanedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_helm_hook_jobs_cleaned_total",
+	Help: "Failed helm.sh/hook Jobs deleted in the HelmRelease target namespace.",
+}, []string{"namespace"})
+
+// VolumeAttachmentsCleanedTotal counts orphaned VolumeAttachments
+// deleted by the volumeattachment-cleaner (C4). reason is
+// missing_node | out_of_service_node.
+var VolumeAttachmentsCleanedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_volumeattachments_cleaned_total",
+	Help: "Orphaned VolumeAttachments reaped, by detection reason.",
+}, []string{"reason"})
+
+// WebhookCABundleMismatch marks (1) webhook configs whose caBundle
+// drifted from the cert-manager injection source (C5).
+var WebhookCABundleMismatch = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_webhook_ca_bundle_mismatch",
+	Help: "1 while the named sub-webhook caBundle differs from its injection source.",
+}, []string{"kind", "name", "webhook"})
+
+// TLSSecretDaysToExpiry exposes days until the tls.crt in each
+// kubernetes.io/tls Secret expires (C5).
+var TLSSecretDaysToExpiry = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_tls_secret_days_to_expiry",
+	Help: "Days until the tls.crt certificate in the Secret expires.",
+}, []string{"namespace", "secret"})
+
+// KCMWorkqueueFrozen marks (1) a kube-controller-manager workqueue
+// freeze: the leader Lease still renews but objects stop being
+// reconciled (C6). reason identifies the stall signature.
+var KCMWorkqueueFrozen = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_kcm_workqueue_frozen",
+	Help: "1 while KCM renews its Lease but stops reconciling objects.",
+}, []string{"reason"})
+
 // queues are the legacy shell-operator queue names — pre-instantiated
 // at 0 so /metrics always exposes every series (an empty CounterVec
 // emits nothing, and shell-operator emitted its counters eagerly).
@@ -72,12 +152,21 @@ var queues = []string{
 	"coredns-patcher", "metrics-server-patcher", "cf-tunnel-proxy-watchdog",
 	// ported kuberhealthy HealthChecks
 	"cluster-health-probes",
+	// self-healing / gray-failure defense modules
+	"pdb-deadlock-watchdog", "volumeattachment-cleaner",
+	"cert-drift-auditor",
 }
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(hookRunErrors, reconcileErrors,
 		apiBackendRVGap, apiBackendQuarantined,
-		healthCheckStatus, healthCheckSecondsSinceSuccess)
+		healthCheckStatus, healthCheckSecondsSinceSuccess,
+		CiliumIdentitiesCollectedTotal,
+		WebhookCircuitBroken, WebhookCircuitBreakerTripsTotal,
+		PDBDrainBlocked, StuckTerminatingResources,
+		HelmHookJobsCleanedTotal, VolumeAttachmentsCleanedTotal,
+		WebhookCABundleMismatch, TLSSecretDaysToExpiry,
+		KCMWorkqueueFrozen)
 	for _, q := range queues {
 		hookRunErrors.WithLabelValues(q)
 		reconcileErrors.WithLabelValues(q)

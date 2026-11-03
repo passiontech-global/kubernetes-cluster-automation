@@ -6,7 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/testutil"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,6 +18,9 @@ import (
 	"k8s.io/client-go/dynamic/fake"
 	kfake "k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/testutil"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -589,8 +593,12 @@ func TestHelmReleaseUnlockerNoPendingSecret(t *testing.T) {
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v2", "myapp", 2, "superseded"))
 	dyn := newDynFake(hr)
 	u := newUnlocker(cs, dyn, 0, "")
-	if err := u.unlock(ctx, helmReleaseGVRs[0], hr); err != nil {
+	acted, err := u.unlock(ctx, helmReleaseGVRs[0], hr)
+	if err != nil {
 		t.Fatalf("absent pending secret must be a clean skip: %v", err)
+	}
+	if acted {
+		t.Fatal("skip path must not report acted — the caller stamps the unlock ledger on acted")
 	}
 	for _, name := range []string{
 		"sh.helm.release.v1.myapp.v1", "sh.helm.release.v1.myapp.v2"} {
@@ -600,5 +608,153 @@ func TestHelmReleaseUnlockerNoPendingSecret(t *testing.T) {
 	}
 	if got := hrAnnotation(t, dyn, helmReleaseGVRs[0], "apps", "myapp", fluxReconcileAnno); got != "" {
 		t.Fatal("reconcile requested despite no pending release")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// C3a — failed helm-hook Job reaper
+// ---------------------------------------------------------------------------
+
+// hookJob builds a Job carrying the helm.sh/hook annotation; failed
+// controls whether it reports JobFailed=True.
+func hookJob(ns, name string, failed bool) *batchv1.Job {
+	j := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   ns,
+			Name:        name,
+			Annotations: map[string]string{"helm.sh/hook": "pre-upgrade"},
+		},
+	}
+	if failed {
+		j.Status.Conditions = []batchv1.JobCondition{{
+			Type:   batchv1.JobFailed,
+			Status: corev1.ConditionTrue,
+		}}
+	}
+	return j
+}
+
+// plainFailedJob: JobFailed=True but NO helm.sh/hook annotation — the
+// reaper must never touch non-hook Jobs (failed-jobs-janitor's turf).
+func plainFailedJob(ns, name string) *batchv1.Job {
+	j := hookJob(ns, name, true)
+	j.Annotations = nil
+	return j
+}
+
+func jobExists(t *testing.T, cs *kfake.Clientset, ns, name string) bool {
+	t.Helper()
+	_, err := cs.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return true
+	}
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("get job %s/%s: %v", ns, name, err)
+	}
+	return false
+}
+
+// On a real unlock, a FAILED helm-hook Job in the HR's target namespace
+// is reaped (it would block the retried release's hooks), while a
+// still-running hook Job, a non-hook failed Job, and hook Jobs in
+// other namespaces are all left alone.
+func TestHelmReleaseUnlockerReapsFailedHookJobs(t *testing.T) {
+	dyn, secrets := stuckHRFixture()
+	cs := kfake.NewSimpleClientset(append(secrets,
+		hookJob("apps", "myapp-pre-upgrade", true),   // reaped
+		hookJob("apps", "myapp-post-upgrade", false), // still running — kept
+		plainFailedJob("apps", "unrelated-batch"),    // no hook anno — kept
+		hookJob("other-ns", "other-hook", true),      // wrong ns — kept
+	)...)
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+
+	before := promtestutil.ToFloat64(
+		metrics.HelmHookJobsCleanedTotal.WithLabelValues("apps"))
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if jobExists(t, cs, "apps", "myapp-pre-upgrade") {
+		t.Fatal("failed helm-hook Job not reaped on unlock")
+	}
+	for _, n := range []string{"myapp-post-upgrade", "unrelated-batch"} {
+		if !jobExists(t, cs, "apps", n) {
+			t.Fatalf("job %s reaped — only FAILED helm-hook Jobs may go", n)
+		}
+	}
+	if !jobExists(t, cs, "other-ns", "other-hook") {
+		t.Fatal("hook Job outside the target namespace reaped")
+	}
+	if got := promtestutil.ToFloat64(
+		metrics.HelmHookJobsCleanedTotal.WithLabelValues("apps")) - before; got != 1 {
+		t.Fatalf("HelmHookJobsCleanedTotal{apps} delta = %v, want 1", got)
+	}
+}
+
+// Hook cleanup is best-effort: a failing Job list must not undo the
+// unlock — the pending secret is still deleted, the reconcile stamp
+// still lands, and the HR is still marked unlocked.
+func TestHelmReleaseUnlockerHookJobListErrorKeepsUnlock(t *testing.T) {
+	dyn, secrets := stuckHRFixture()
+	cs := kfake.NewSimpleClientset(secrets...)
+	cs.PrependReactor("list", "jobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("jobs list boom")
+		})
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+
+	if err := u.run(ctx); err != nil {
+		t.Fatalf("hook-job list failure must not error the run: %v", err)
+	}
+	if secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
+		t.Fatal("pending secret kept although the unlock ran")
+	}
+	if _, ok := u.unlocked["apps/myapp"]; !ok {
+		t.Fatal("HR not marked unlocked — hook cleanup failure undid the unlock")
+	}
+}
+
+// A refused unlock (pending-install with no rollback target) never
+// reaches the hook sweep — nothing is touched.
+func TestHelmReleaseUnlockerRefusedUnlockSkipsHookSweep(t *testing.T) {
+	hr := hrObj("apps", "myapp", "v2")
+	hrTarget(hr, "apps")
+	hrReady(hr, "False", "Helm install failed: another operation is in progress")
+	dyn := newDynFake(hr)
+	cs := kfake.NewSimpleClientset(
+		helmRelSecret("apps", "sh.helm.release.v1.myapp.v1", "myapp", 1, "pending-install"),
+		hookJob("apps", "myapp-pre-install", true))
+	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
+
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !jobExists(t, cs, "apps", "myapp-pre-install") {
+		t.Fatal("hook Job reaped although the unlock was refused")
+	}
+}
+
+// jobFailed is True only on an explicit JobFailed=True condition —
+// absent conditions, JobFailed=False, Suspended and Complete all stay.
+func TestJobFailedCondition(t *testing.T) {
+	cond := func(tpe batchv1.JobConditionType, st corev1.ConditionStatus) *batchv1.Job {
+		return &batchv1.Job{Status: batchv1.JobStatus{
+			Conditions: []batchv1.JobCondition{{Type: tpe, Status: st}}}}
+	}
+	for _, tc := range []struct {
+		name string
+		job  *batchv1.Job
+		want bool
+	}{
+		{"no conditions", &batchv1.Job{}, false},
+		{"failed true", cond(batchv1.JobFailed, corev1.ConditionTrue), true},
+		{"failed false", cond(batchv1.JobFailed, corev1.ConditionFalse), false},
+		{"suspended", cond(batchv1.JobSuspended, corev1.ConditionTrue), false},
+		{"complete", cond(batchv1.JobComplete, corev1.ConditionTrue), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := jobFailed(tc.job); got != tc.want {
+				t.Fatalf("jobFailed = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

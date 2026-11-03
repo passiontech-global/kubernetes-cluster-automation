@@ -242,7 +242,10 @@ func main() {
 		"corednsPatcher", mc.corednsPatcherEnabled,
 		"metricsServerPatcher", mc.metricsServerPatcherEnabled,
 		"cfTunnelWatchdog", mc.cfTunnelWatchdogEnabled,
-		"clusterHealthProbes", mc.clusterHealthProbesEnabled)
+		"clusterHealthProbes", mc.clusterHealthProbesEnabled,
+		"volumeAttachmentCleaner", mc.volumeAttachmentCleanerEnabled,
+		"pdbWatchdog", mc.pdbWatchdogEnabled,
+		"certDriftAuditor", mc.certDriftAuditorEnabled)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited")
 		os.Exit(1)
@@ -253,26 +256,29 @@ func main() {
 // the modules need — the same flags the shell-operator read from its
 // ConfigMaps (see header contract).
 type moduleConfig struct {
-	ciliumEnabled                bool
-	fluentbitEnabled             bool
-	certReaperEnabled            bool
-	ciliumAuditEnabled           bool
-	esNudgeEnabled               bool
-	csrApproveEnabled            bool
-	labelerPath                  string
-	concourseJanitorEnabled      bool
-	corednsPatcherEnabled        bool
-	corednsZoneWhen              string
-	corednsZoneMinDomains        int
-	corednsMinReplicas           int
-	corednsNodesPerReplica       int
-	metricsServerPatcherEnabled  bool
-	metricsServerMinReplicas     int
-	metricsServerNodesPerReplica int
-	cfTunnelWatchdogEnabled      bool
-	cfTunnelWatchdogNamespace    string
-	cfTunnelWatchdogInterval     time.Duration
-	clusterHealthProbesEnabled   bool
+	ciliumEnabled                  bool
+	fluentbitEnabled               bool
+	certReaperEnabled              bool
+	ciliumAuditEnabled             bool
+	esNudgeEnabled                 bool
+	csrApproveEnabled              bool
+	labelerPath                    string
+	concourseJanitorEnabled        bool
+	corednsPatcherEnabled          bool
+	corednsZoneWhen                string
+	corednsZoneMinDomains          int
+	corednsMinReplicas             int
+	corednsNodesPerReplica         int
+	metricsServerPatcherEnabled    bool
+	metricsServerMinReplicas       int
+	metricsServerNodesPerReplica   int
+	cfTunnelWatchdogEnabled        bool
+	cfTunnelWatchdogNamespace      string
+	cfTunnelWatchdogInterval       time.Duration
+	clusterHealthProbesEnabled     bool
+	volumeAttachmentCleanerEnabled bool
+	pdbWatchdogEnabled             bool
+	certDriftAuditorEnabled        bool
 }
 
 // moduleConfigFromEnv resolves every feature-gate env var once, after
@@ -307,6 +313,12 @@ func moduleConfigFromEnv() moduleConfig {
 		// here too; the HEALTH_* check knobs are read inside the
 		// prober package (SetupClusterHealthProber).
 		clusterHealthProbesEnabled: os.Getenv("CLUSTER_HEALTH_PROBES_ENABLED") != "false",
+		// The self-healing / gray-failure defense modules default ON
+		// like the ported CronJobs — an explicit "false" opts a
+		// cluster out via the base-flags ConfigMap.
+		volumeAttachmentCleanerEnabled: os.Getenv("VOLUMEATTACHMENT_CLEANER_ENABLED") != "false",
+		pdbWatchdogEnabled:             os.Getenv("PDB_WATCHDOG_ENABLED") != "false",
+		certDriftAuditorEnabled:        os.Getenv("CERT_DRIFT_AUDITOR_ENABLED") != "false",
 	}
 }
 
@@ -344,6 +356,7 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 		"partition-pod-evictor":   func() error { return node.SetupPartitionEvictor(mgr, cs) },
 		"dead-node-sweeper":       func() error { return node.SetupDeadNodeSweeper(mgr, cs, dyn) },
 		"csr-watcher":             func() error { return node.SetupCSRWatcher(mgr, cs, mc.csrApproveEnabled) },
+		"pdb-deadlock-watchdog":   func() error { return node.SetupPDBDeadlockWatchdog(mgr, cs, mc.pdbWatchdogEnabled) },
 
 		// internal/controller/apiserver — apiserver integrity guards.
 		"admission-webhook-guard":  func() error { return apiserver.SetupWebhookGuard(mgr, cs) },
@@ -357,6 +370,9 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 			return janitor.SetupConcourseWorkdirJanitor(mgr, cs,
 				mc.concourseJanitorEnabled)
 		},
+		"volumeattachment-cleaner": func() error {
+			return janitor.SetupVolumeAttachmentCleaner(mgr, cs, mc.volumeAttachmentCleanerEnabled)
+		},
 
 		// internal/controller/integration — third-party controller
 		// unstuckers (dynamic client / CRD types).
@@ -364,6 +380,9 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 		"externalsecret-nudge":    func() error { return integration.SetupExternalSecretNudge(mgr, cs, dyn, mc.esNudgeEnabled) },
 		"certmanager-reaper":      func() error { return integration.SetupCertManagerReaper(mgr, cs, dyn, mc.certReaperEnabled) },
 		"cilium-identity-auditor": func() error { return integration.SetupCiliumIdentityAuditor(mgr, cs, dyn, mc.ciliumAuditEnabled) },
+		"cert-drift-auditor": func() error {
+			return integration.SetupCertDriftAuditor(mgr, cs, dyn, mc.certDriftAuditorEnabled)
+		},
 
 		// internal/controller/health — cluster health probes.
 		"cluster-health-probes": func() error {

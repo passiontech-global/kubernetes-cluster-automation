@@ -331,6 +331,16 @@ func TestSelfHealActionReasons(t *testing.T) {
 		{"suspect: kubelet-runtime-stall informer-zombie hits=80/10min", "KubeletInformerZombie"},
 		{"STATE-ENTER: nebula-isolated", "NebulaIsolatedEnter"},
 		{"suspect: node-overloaded load15=42 ncpu=4", "NodeOverloaded"},
+		{"STATE-ENTER: clock-unsync drift=+612ms esterror=900000", "ClockUnsynchronized"},
+		{"ACTION: restarting systemd-timesyncd.service - clock unsynchronized (persisted 2x)", "ClockUnsynchronized"},
+		{"ACTION: restarting chrony.service - clock unsynchronized (persisted 1x)", "ClockUnsynchronized"},
+		{"STATE-ENTER: conntrack-pressure used=0.93 of 262144", "ConntrackPressure"},
+		{"suspect: nf_conntrack: table full, dropping packet (dmesg)", "ConntrackPressure"},
+		{"nf_conntrack: expectation table full, dropping packet", "ConntrackPressure"},
+		{"STATE-ENTER: cilium-ipam-exhausted leaked=41 avail=1", "CiliumIPAMExhausted"},
+		{"FailedCreatePodSandBox: Allocating IPv4: no more IPs available", "CiliumIPAMExhausted"},
+		{"ACTION: removed corrupted image registry.local/app@sha256:dead - content digest not found", "CorruptedImageRemoved"},
+		{"ACTION: removed corrupted image docker.io/library/nginx:1.25 - failed to extract layer", "CorruptedImageRemoved"},
 	}
 	for _, l := range lines {
 		e.appendLog(t, l.msg)

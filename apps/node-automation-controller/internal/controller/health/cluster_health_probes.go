@@ -5,6 +5,14 @@
 // cronjob-checker, is deliberately NOT ported — cronjob-catchup
 // already sweeps CronJobs cluster-wide.
 //
+// A sixth in-process check rides along on the same sweep:
+// kcm-workqueue-watchdog (C6) detects a kube-controller-manager whose
+// leader Lease still renews while its object controllers stop
+// reconciling — a "gray" failure a dead-KCM check cannot see. It is
+// not a ported HealthCheck but reuses the same probe plumbing,
+// reporting FAIL on its own kuberhealthy_check series plus the
+// dedicated node_automation_kcm_workqueue_frozen{reason} gauge.
+//
 // Metric contract: results go out on the SAME series kuberhealthy
 // exported — kuberhealthy_check{check,namespace,status} and
 // kuberhealthy_check_seconds_since_success{check,namespace} — under
@@ -29,12 +37,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -48,13 +58,25 @@ const clusterHealthQueue = "cluster-health-probes"
 
 // Check names — the exact HealthCheck metadata.name values the
 // replaced kuberhealthy checks carried; they are the `check` label
-// values alerts and dashboards key on.
+// values alerts and dashboards key on. kcm-workqueue-watchdog is the
+// exception: not a ported HealthCheck, it is the C6 watchdog — it
+// still reports on the same series under its own check name so the
+// generic FAIL alerting path covers it too.
 const (
 	checkNameDNS           = "dns-status-internal"
 	checkNameHTTPContent   = "http-content-check"
 	checkNamePodRestarts   = "pod-restarts"
 	checkNamePodStatus     = "pod-status-check"
 	checkNameResourceQuota = "resource-quota-check"
+	checkNameKCMWorkqueue  = "kcm-workqueue-watchdog"
+)
+
+// C6 watchdog knobs — the KCM leader Lease name and the
+// node_automation_kcm_workqueue_frozen{reason} label values.
+const (
+	kcmLeaseName         = "kube-controller-manager"
+	kcmReasonDesiredZero = "daemonset_desired_zero"
+	kcmReasonStaleGen    = "stale_observed_generation"
 )
 
 // healthProbeConfig carries the HEALTH_* env knobs the checker Pods
@@ -69,6 +91,8 @@ type healthProbeConfig struct {
 	maxPodRestarts      int32         // HEALTH_MAX_POD_RESTARTS
 	podSkipDuration     time.Duration // HEALTH_POD_SKIP_DURATION
 	quotaThreshold      float64       // HEALTH_RESOURCE_QUOTA_THRESHOLD
+	kcmLeaseMaxAge      time.Duration // HEALTH_KCM_LEASE_MAX_AGE
+	kcmFreezeMinAge     time.Duration // HEALTH_KCM_FREEZE_MIN_AGE
 }
 
 func healthEnv(key, def string) string {
@@ -133,6 +157,17 @@ func healthProbeConfigFromEnv() healthProbeConfig {
 		maxPodRestarts:      int32(healthEnvInt("HEALTH_MAX_POD_RESTARTS", 10)),
 		podSkipDuration:     healthEnvDuration("HEALTH_POD_SKIP_DURATION", 10*time.Minute),
 		quotaThreshold:      healthEnvFloat("HEALTH_RESOURCE_QUOTA_THRESHOLD", 0.9),
+		// KCM leader-election defaults are LeaseDuration 15s,
+		// RenewDeadline 10s, RetryPeriod ~2s, so a live holder's
+		// renewTime is never more than a few seconds old. 30s — 2×
+		// the lease duration — bounds "still renewing" with margin
+		// for apiserver latency; anything older means the holder is
+		// gone (a dead KCM, not a frozen one).
+		kcmLeaseMaxAge: healthEnvDuration("HEALTH_KCM_LEASE_MAX_AGE", 30*time.Second),
+		// A freeze signature must persist this long before the gauge
+		// fires — a healthy reconcile legitimately lags a spec write
+		// by a sync period or two.
+		kcmFreezeMinAge: healthEnvDuration("HEALTH_KCM_FREEZE_MIN_AGE", 10*time.Minute),
 	}
 }
 
@@ -161,6 +196,17 @@ type clusterHealthProber struct {
 	// kuberhealthy (which counts from check creation).
 	mu       sync.Mutex
 	lastPass map[string]time.Time
+
+	// C6 watchdog state (under mu):
+	//   - kcmFirstSeen: signature key "<reason>/<kind>/<name>" → the
+	//     first sweep that observed it; a signature must persist
+	//     kcmFreezeMinAge before the gauge fires. Pruned when the
+	//     signature resolves — a later stall re-arms the window.
+	//   - kcmFrozenReasons: reason labels currently held at 1, so a
+	//     resolved signature flips its series back to 0 instead of
+	//     leaking a stale 1 forever.
+	kcmFirstSeen     map[string]time.Time
+	kcmFrozenReasons map[string]bool
 }
 
 func newClusterHealthProber(cs kubernetes.Interface, cfg healthProbeConfig) *clusterHealthProber {
@@ -177,7 +223,10 @@ func newClusterHealthProber(cs kubernetes.Interface, cfg healthProbeConfig) *clu
 			checkNamePodRestarts:   boot,
 			checkNamePodStatus:     boot,
 			checkNameResourceQuota: boot,
+			checkNameKCMWorkqueue:  boot,
 		},
+		kcmFirstSeen:     map[string]time.Time{},
+		kcmFrozenReasons: map[string]bool{},
 	}
 }
 
@@ -206,6 +255,7 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 		{checkNamePodRestarts, p.probePodRestarts},
 		{checkNamePodStatus, p.probePodStatus},
 		{checkNameResourceQuota, p.probeResourceQuota},
+		{checkNameKCMWorkqueue, p.checkKCMWorkqueue},
 	}
 	for _, c := range checks {
 		res := c.probe(ctx)
@@ -383,4 +433,172 @@ func (p *clusterHealthProber) probeResourceQuota(ctx context.Context) probeResul
 			p.cfg.quotaThreshold, strings.Join(over, ", "))}
 	}
 	return probeResult{pass: true}
+}
+
+// ---------------------------------------------------------------------------
+// kcm-workqueue-watchdog (C6)
+// ---------------------------------------------------------------------------
+
+// checkKCMWorkqueue detects a kube-controller-manager workqueue
+// freeze: the leader still renews its coordination.k8s.io Lease but
+// the object controllers stop reconciling — a "gray" failure where
+// /healthz and the leader lock stay green while cluster objects go
+// stale (the incident class behind this watchdog).
+//
+// Preconditions, quiet on miss — the frozen-but-leader case is the
+// ONLY thing this check flags:
+//   - at least one Ready Node (the storm gate: with no Ready node a
+//     desiredNumberScheduled==0 reading is ambiguous, and a dead
+//     cluster is covered by other checks);
+//   - the kube-system/kube-controller-manager Lease is still renewing
+//     (renewTime no older than kcmLeaseMaxAge — KCM leader-election
+//     renews every ~2s inside a 15s LeaseDuration). A stale or absent
+//     Lease means the holder is GONE: a dead KCM is a different
+//     failure pod-status/dead-node checks already cover, and flagging
+//     it here would double-alert the wrong diagnosis.
+//
+// Freeze signatures (kube-system objects), each required to persist
+// continuously for kcmFreezeMinAge via a per-object first-seen map:
+//   - daemonset_desired_zero: a DaemonSet reports
+//     status.desiredNumberScheduled==0 while pods are still
+//     scheduled/ready — the DS controller stopped recomputing desired
+//     from live nodes. desired==0 with zero pods anywhere is a
+//     legitimately-empty selector, not a freeze, so it is excluded.
+//   - stale_observed_generation: a Deployment or DaemonSet whose
+//     status.observedGeneration lags metadata.generation — its
+//     controller never processed the last spec write.
+//
+// On freeze the dedicated gauge
+// node_automation_kcm_workqueue_frozen{reason} goes to 1; it flips
+// back to 0 when the signature resolves (or when the preconditions
+// stop holding — resetKCMWorkqueue re-arms tracking from scratch).
+func (p *clusterHealthProber) checkKCMWorkqueue(ctx context.Context) probeResult {
+	log := logf.FromContext(ctx)
+	now := p.now()
+
+	nodes, err := shared.ListNodes(ctx, p.cs)
+	if err != nil {
+		return probeResult{infra: fmt.Errorf("list nodes: %w", err)}
+	}
+	ready := false
+	for i := range nodes {
+		if shared.NodeReady(&nodes[i]) {
+			ready = true
+			break
+		}
+	}
+	if !ready {
+		p.resetKCMWorkqueue()
+		return probeResult{pass: true}
+	}
+
+	lease, err := p.cs.CoordinationV1().Leases(metav1.NamespaceSystem).
+		Get(ctx, kcmLeaseName, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		// No leader Lease at all — no elected KCM to judge.
+		p.resetKCMWorkqueue()
+		return probeResult{pass: true}
+	case err != nil:
+		return probeResult{infra: fmt.Errorf("get lease %s/%s: %w",
+			metav1.NamespaceSystem, kcmLeaseName, err)}
+	case lease.Spec.RenewTime == nil ||
+		now.Sub(lease.Spec.RenewTime.Time) > p.cfg.kcmLeaseMaxAge:
+		// Stale renewTime = the holder is gone — a dead KCM, not a
+		// frozen one. Stay quiet.
+		p.resetKCMWorkqueue()
+		return probeResult{pass: true}
+	}
+
+	dss, err := p.cs.AppsV1().DaemonSets(metav1.NamespaceSystem).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return probeResult{infra: fmt.Errorf("list daemonsets in %s: %w",
+			metav1.NamespaceSystem, err)}
+	}
+	deps, err := p.cs.AppsV1().Deployments(metav1.NamespaceSystem).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return probeResult{infra: fmt.Errorf("list deployments in %s: %w",
+			metav1.NamespaceSystem, err)}
+	}
+
+	// Candidate signatures keyed "<reason>/<kind>/<name>" so each
+	// object's persistence window is tracked independently.
+	sigs := map[string]string{}
+	for i := range dss.Items {
+		ds := &dss.Items[i]
+		if ds.Status.DesiredNumberScheduled == 0 &&
+			(ds.Status.CurrentNumberScheduled+
+				ds.Status.UpdatedNumberScheduled+
+				ds.Status.NumberReady+
+				ds.Status.NumberMisscheduled) > 0 {
+			sigs[kcmReasonDesiredZero+"/daemonset/"+ds.Name] = kcmReasonDesiredZero
+		}
+		if ds.Status.ObservedGeneration < ds.Generation {
+			sigs[kcmReasonStaleGen+"/daemonset/"+ds.Name] = kcmReasonStaleGen
+		}
+	}
+	for i := range deps.Items {
+		dep := &deps.Items[i]
+		if dep.Status.ObservedGeneration < dep.Generation {
+			sigs[kcmReasonStaleGen+"/deployment/"+dep.Name] = kcmReasonStaleGen
+		}
+	}
+
+	p.mu.Lock()
+	frozen := map[string]bool{}
+	for sig, reason := range sigs {
+		if _, ok := p.kcmFirstSeen[sig]; !ok {
+			p.kcmFirstSeen[sig] = now
+			log.Info("KCM freeze signature — tracking first-seen",
+				"signature", sig)
+			continue
+		}
+		if now.Sub(p.kcmFirstSeen[sig]) >= p.cfg.kcmFreezeMinAge {
+			frozen[reason] = true
+		}
+	}
+	for sig := range p.kcmFirstSeen {
+		if _, ok := sigs[sig]; !ok {
+			delete(p.kcmFirstSeen, sig)
+		}
+	}
+	for reason := range p.kcmFrozenReasons {
+		if !frozen[reason] {
+			metrics.KCMWorkqueueFrozen.WithLabelValues(reason).Set(0)
+			delete(p.kcmFrozenReasons, reason)
+		}
+	}
+	for reason := range frozen {
+		metrics.KCMWorkqueueFrozen.WithLabelValues(reason).Set(1)
+		p.kcmFrozenReasons[reason] = true
+	}
+	p.mu.Unlock()
+
+	if len(frozen) == 0 {
+		return probeResult{pass: true}
+	}
+	reasons := make([]string, 0, len(frozen))
+	for r := range frozen {
+		reasons = append(reasons, r)
+	}
+	sort.Strings(reasons)
+	return probeResult{why: fmt.Sprintf(
+		"KCM lease renews but kube-system objects unreconciled >=%s: %s",
+		p.cfg.kcmFreezeMinAge, strings.Join(reasons, ", "))}
+}
+
+// resetKCMWorkqueue clears freeze tracking and drops any held gauge —
+// called when the frozen-but-leader diagnosis cannot apply (no Ready
+// nodes, absent/stale KCM Lease) so a signature that flaps around a
+// precondition edge re-arms its persistence window from scratch.
+func (p *clusterHealthProber) resetKCMWorkqueue() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	clear(p.kcmFirstSeen)
+	for reason := range p.kcmFrozenReasons {
+		metrics.KCMWorkqueueFrozen.WithLabelValues(reason).Set(0)
+		delete(p.kcmFrozenReasons, reason)
+	}
 }

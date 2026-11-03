@@ -27,6 +27,16 @@
 //     state-fail2ban-down; banned counts per jail are written to
 //     fail2ban-banned for hostmetrics (node_fail2ban_banned_ips).
 //
+// Agent-native additions (no shell-module counterpart):
+//
+//   - clock-sync (H1)       — kernel clock discipline via adjtimex:
+//     STA_UNSYNC or esterror > 500ms for ConsecNeeded cycles →
+//     clock-unsync latch + a rate-limited timesyncd/chrony restart.
+//   - conntrack-guard (H2)  — nf_conntrack table pressure latch
+//     (enter >0.90 used, clear <0.80) plus a best-effort stale
+//     udp/53 conntrack flush after every DNS-path transition
+//     (dns-fallback pin write, coredns-stub/nebula restart).
+//
 // Host commands (ip/ping/fail2ban-client) run through one seam —
 // nsenter-wrapped into the host net namespace when containerized,
 // plain exec on the host — and are fully fakeable in tests. DNS and
@@ -51,6 +61,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
@@ -71,7 +82,22 @@ const (
 	defaultConsecNeeded     = 2
 	defaultMinRestart       = 30 * time.Minute
 	corednsRestartInterval  = 5 * time.Minute
+	ntpRestartInterval      = 30 * time.Minute
 	purgeBudget             = time.Hour // shell last-purge-* rate window
+
+	defaultConntrackCountFile = "/proc/sys/net/netfilter/nf_conntrack_count"
+	defaultConntrackMaxFile   = "/proc/sys/net/netfilter/nf_conntrack_max"
+
+	// clockMaxEsterrorUS: an adjtimex estimated error above this
+	// (microseconds, 500ms) counts the clock as unsynchronized even
+	// while the kernel has not set STA_UNSYNC — a drifting clock
+	// breaks TLS/cert checks long before the discipline gives up.
+	clockMaxEsterrorUS = 500_000
+	// Conntrack pressure hysteresis: the latch arms above 0.90 of
+	// the table used and only clears below 0.80 — a hovering
+	// counter must not flap the state file every cycle.
+	conntrackEnterRatio = 0.90
+	conntrackExitRatio  = 0.80
 )
 
 // Check names — prometheus `check` label + log context.
@@ -81,6 +107,8 @@ const (
 	checkEgress  = "overlay-egress"
 	checkNebula  = "nebula-health"
 	checkF2B     = "fail2ban"
+	checkClock   = "clock-sync"
+	checkCT      = "conntrack-guard"
 )
 
 const hostsBlockBegin = "# BEGIN node-watchdog-dns"
@@ -91,17 +119,19 @@ const hostsBlockEnd = "# END node-watchdog-dns"
 // empty config (every check idles on defaults like the shell did on
 // nodes without a conf file).
 type Config struct {
-	Enabled          bool          // false → Run idles until ctx done
-	Interval         time.Duration // check cadence
-	WatchdogStateDir string        // state-*/egress-*/dnsfb-* files
-	WatchdogLogFile  string        // appended watchdog log (NPD filelog)
-	HostResolvConf   string        // host resolv.conf (DNS probe source)
-	HostsFile        string        // host /etc/hosts (managed block)
-	ProcNetUDP       string        // host /proc/1/net/udp (socket check)
-	ProcNetUDP6      string        // host /proc/1/net/udp6
-	UptimeFile       string        // host /proc/uptime (20/21 gate)
-	HostRoot         string        // "/" = already on host (no nsenter)
-	Watchdog         *watchdogconf.Config
+	Enabled            bool          // false → Run idles until ctx done
+	Interval           time.Duration // check cadence
+	WatchdogStateDir   string        // state-*/egress-*/dnsfb-* files
+	WatchdogLogFile    string        // appended watchdog log (NPD filelog)
+	HostResolvConf     string        // host resolv.conf (DNS probe source)
+	HostsFile          string        // host /etc/hosts (managed block)
+	ProcNetUDP         string        // host /proc/1/net/udp (socket check)
+	ProcNetUDP6        string        // host /proc/1/net/udp6
+	UptimeFile         string        // host /proc/uptime (20/21 gate)
+	ConntrackCountFile string        // nf_conntrack_count (entries used)
+	ConntrackMaxFile   string        // nf_conntrack_max (table size)
+	HostRoot           string        // "/" = already on host (no nsenter)
+	Watchdog           *watchdogconf.Config
 	// WatchdogSrc, when set, re-reads the conf file every Cycle so
 	// hostconfig rewrites (OVERLAY_*, DNS_FALLBACK_MAP, WD_SIG_*
 	// kill switches) apply live instead of only at agent start.
@@ -144,6 +174,9 @@ type Config struct {
 	// (hostNetwork, same inode as /proc/1/ns/net), else setns into
 	// pid-1's netns (hostPID — no /host/proc mount needed).
 	openRouteSocket func() (int, error)
+	// adjtimexFn reads the kernel clock discipline — a modes==0
+	// (read-only) adjtimex(2) needs no CAP_SYS_TIME. Tests inject.
+	adjtimexFn func(buf *unix.Timex) (int, error)
 }
 
 func (c *Config) applyDefaults() {
@@ -170,6 +203,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.UptimeFile == "" {
 		c.UptimeFile = defaultUptimeFile
+	}
+	if c.ConntrackCountFile == "" {
+		c.ConntrackCountFile = defaultConntrackCountFile
+	}
+	if c.ConntrackMaxFile == "" {
+		c.ConntrackMaxFile = defaultConntrackMaxFile
 	}
 	if c.HostRoot == "" {
 		c.HostRoot = defaultHostRoot
@@ -267,6 +306,9 @@ func (c *Config) applyDefaults() {
 			return probeHTTPGet(ctx, url, timeout)
 		}
 	}
+	if c.adjtimexFn == nil {
+		c.adjtimexFn = unix.Adjtimex
+	}
 }
 
 // NetHealth runs the network checks on one ticker.
@@ -277,6 +319,7 @@ type NetHealth struct {
 	nebulaFails  int            // socket/tun/stats fails
 	nebulaDpFail int            // dataplane-dead fails
 	nebulaDeg    int            // dataplane-degraded runs
+	clockFails   int            // consecutive unsynced adjtimex reads
 	egressCtr    map[string]int // per relay probe!=committed counter
 
 	cycles  *prometheus.CounterVec // check, result
@@ -390,6 +433,16 @@ func (n *NetHealth) Cycle(ctx context.Context) {
 		n.checkFail2ban(ctx)
 	} else {
 		n.cycles.WithLabelValues(checkF2B, "disabled").Inc()
+	}
+	if sigOn(checkClock) {
+		n.checkClockSync(ctx)
+	} else {
+		n.cycles.WithLabelValues(checkClock, "disabled").Inc()
+	}
+	if sigOn(checkCT) {
+		n.checkConntrack(ctx)
+	} else {
+		n.cycles.WithLabelValues(checkCT, "disabled").Inc()
 	}
 }
 
@@ -725,11 +778,18 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 	if block != "" {
 		if n.renderHostsBlock(block) {
 			n.appendLog("ACTION: /etc/hosts dns-fallback block updated")
+			// Newly written pins mean DNS was dead — conntrack
+			// entries learned on the broken path blackhole lookups
+			// until expiry unless flushed now.
+			n.flushStaleUDPConntrack(ctx)
 		}
 		n.stateEnter("dns-fallback", "")
 	} else {
 		if n.renderHostsBlock("") {
 			n.appendLog("ACTION: /etc/hosts dns-fallback block removed (DNS OK)")
+			// Unpin is a DNS-path transition too — replies for the
+			// restored resolver may sit in stale udp/53 entries.
+			n.flushStaleUDPConntrack(ctx)
 		}
 		n.stateExit("dns-fallback")
 	}
@@ -767,6 +827,7 @@ func (n *NetHealth) checkCoreDNSStub(ctx context.Context) {
 		n.appendLog(fmt.Sprintf("coredns restart failed: %v", err))
 	} else {
 		n.actions.WithLabelValues(checkCoreDNS, "restart").Inc()
+		n.flushStaleUDPConntrack(ctx)
 	}
 	n.cycles.WithLabelValues(checkCoreDNS, "ok").Inc()
 }
@@ -1046,6 +1107,9 @@ func (n *NetHealth) nebulaRestart(ctx context.Context) {
 		return
 	}
 	n.actions.WithLabelValues(checkNebula, "restart").Inc()
+	// DNS flows pinned to conntrack entries through the dead tunnel
+	// stay blackholed until expiry — flush them now.
+	n.flushStaleUDPConntrack(ctx)
 }
 
 // rmFiles removes every state-dir file matching glob — the module's
@@ -1291,4 +1355,182 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 		_ = os.Remove(bannedFile)
 	}
 	n.cycles.WithLabelValues(checkF2B, "ok").Inc()
+}
+
+// --- Check: clock-sync (H1) ---
+
+// checkClockSync — H1: the kernel's own clock discipline via a
+// read-only adjtimex(2) (modes==0 needs no CAP_SYS_TIME). The clock
+// is unhealthy when the kernel reports STA_UNSYNC (no sync source
+// achieved) or the estimated error exceeds 500ms — a silently
+// drifting clock breaks TLS/cert verification and raft leases long
+// before anything else on the node notices.
+//
+// Consecutive failing cycles >= ConsecNeeded arm the clock-unsync
+// latch and — under the 30m last-ntp-restart budget — restart the
+// node's sync daemon (whichever of timesyncd/chrony/chronyd is
+// installed). An adjtimex error aborts the cycle WITHOUT touching
+// the counter: an EPERM/seccomp-blocked read must not false-latch.
+func (n *NetHealth) checkClockSync(ctx context.Context) {
+	var tx unix.Timex
+	if _, err := n.cfg.adjtimexFn(&tx); err != nil {
+		n.appendLog(fmt.Sprintf("clock-sync: adjtimex failed: %v", err))
+		n.cycles.WithLabelValues(checkClock, "abort").Inc()
+		return
+	}
+	bad := ""
+	switch {
+	case tx.Status&unix.STA_UNSYNC != 0:
+		bad = "kernel reports STA_UNSYNC"
+	case tx.Esterror > clockMaxEsterrorUS:
+		bad = fmt.Sprintf("esterror %dus exceeds %dus",
+			tx.Esterror, clockMaxEsterrorUS)
+	}
+	if bad == "" {
+		n.clockFails = 0
+		n.stateExit("clock-unsync")
+		n.cycles.WithLabelValues(checkClock, "ok").Inc()
+		return
+	}
+	n.clockFails++
+	if n.clockFails < n.cfg.ConsecNeeded {
+		n.appendLog(fmt.Sprintf("suspect: clock-unsync %s (check %d/%d)",
+			bad, n.clockFails, n.cfg.ConsecNeeded))
+		n.cycles.WithLabelValues(checkClock, "ok").Inc()
+		return
+	}
+	n.stateEnter("clock-unsync", bad)
+	if n.rateOK("last-ntp-restart", ntpRestartInterval) {
+		n.restartNTPDaemon(ctx)
+	} else {
+		n.appendLog("suspect: clock-unsync persists but ntp restart " +
+			"cooldown (<30m), skip")
+	}
+	n.cycles.WithLabelValues(checkClock, "ok").Inc()
+}
+
+// restartNTPDaemon restarts whichever clock-sync daemon the node
+// runs — systemd-timesyncd (Debian/Ubuntu) or chrony/chronyd — under
+// the last-ntp-restart budget. The budget is spent on the restart
+// attempt itself; a node without any sync unit only gets the latch
+// (the daemon may be managed by other means).
+func (n *NetHealth) restartNTPDaemon(ctx context.Context) {
+	if n.cfg.Systemd == nil {
+		n.appendLog("ntp restart skipped — no systemd client")
+		return
+	}
+	// Pick the node's ACTUAL sync daemon, not just an installed one:
+	// timesyncd's unit file ships with systemd on every
+	// Debian/Ubuntu host — installed ≠ in use — so UnitExists alone
+	// would restart a disabled timesyncd on a chrony node and give
+	// the box two clock-discipline daemons fighting over adjtimex.
+	// Preference: enabled+active (the live daemon), then
+	// enabled-only (crashed — needs the restart most), then
+	// active-only (live but unmanaged enablement). A unit that
+	// merely exists never qualifies.
+	units := []string{
+		"systemd-timesyncd.service", "chrony.service", "chronyd.service",
+	}
+	pick := ""
+	for _, u := range units {
+		if n.unitEnabledActive(ctx, u) {
+			pick = u
+			break
+		}
+	}
+	if pick == "" {
+		for _, u := range units {
+			if n.cfg.Systemd.IsEnabled(ctx, u) {
+				pick = u
+				break
+			}
+		}
+	}
+	if pick == "" {
+		for _, u := range units {
+			if n.cfg.Systemd.IsActive(ctx, u) {
+				pick = u
+				break
+			}
+		}
+	}
+	if pick == "" {
+		n.appendLog("clock-unsync but no enabled/active sync unit found " +
+			"(timesyncd/chrony/chronyd all disabled or absent)")
+		return
+	}
+	n.appendLog(fmt.Sprintf(
+		"ACTION: restarting %s - clock unsynchronized (persisted %dx)",
+		pick, n.clockFails))
+	n.rateSpend("last-ntp-restart")
+	if err := n.cfg.Systemd.Restart(ctx, pick); err != nil {
+		n.appendLog(fmt.Sprintf("%s restart failed: %v", pick, err))
+		return
+	}
+	n.actions.WithLabelValues(checkClock, "restart").Inc()
+}
+
+// --- Check: conntrack-guard (H2) ---
+
+// checkConntrack — H2: nf_conntrack table pressure. Once the table
+// fills, the NAT path drops NEW connections silently (nf_conntrack:
+// table full, dropping packet) — a classic gray failure: established
+// flows keep working while everything new blackholes. The latch arms
+// above 0.90 used and only clears below 0.80 so a hovering counter
+// can't flap it. Missing /proc entries mean the module isn't loaded
+// → no table to pressure, drop any stale latch.
+func (n *NetHealth) checkConntrack(ctx context.Context) {
+	usedStr := readFile(n.cfg.ConntrackCountFile)
+	maxStr := readFile(n.cfg.ConntrackMaxFile)
+	if usedStr == "" || maxStr == "" {
+		n.stateExit("conntrack-pressure")
+		n.cycles.WithLabelValues(checkCT, "gated").Inc()
+		return
+	}
+	used, errU := strconv.ParseFloat(usedStr, 64)
+	max, errM := strconv.ParseFloat(maxStr, 64)
+	if errU != nil || errM != nil || max <= 0 {
+		n.cycles.WithLabelValues(checkCT, "abort").Inc()
+		return
+	}
+	ratio := used / max
+	if n.stateExists("conntrack-pressure") {
+		if ratio < conntrackExitRatio {
+			n.appendLog(fmt.Sprintf(
+				"conntrack-pressure cleared (used=%.0f max=%.0f ratio=%.2f)",
+				used, max, ratio))
+			n.stateExit("conntrack-pressure")
+		}
+	} else if ratio > conntrackEnterRatio {
+		n.appendLog(fmt.Sprintf(
+			"suspect: conntrack-pressure used=%.0f max=%.0f ratio=%.2f > %.2f",
+			used, max, ratio, conntrackEnterRatio))
+		n.stateEnter("conntrack-pressure",
+			fmt.Sprintf("used=%.0f max=%.0f ratio=%.2f", used, max, ratio))
+	}
+	n.cycles.WithLabelValues(checkCT, "ok").Inc()
+}
+
+// flushStaleUDPConntrack drops stale udp/53 conntrack entries after
+// a DNS-path transition (dns-fallback pins written, coredns-stub or
+// nebula@ just restarted). NATed DNS replies bound to a now-dead
+// endpoint's conntrack entry keep blackholing lookups until the
+// entry expires — deleting them makes the fix effective immediately.
+// Best-effort only: a missing conntrack binary or a denied delete
+// logs and moves on, it never fails the cycle.
+func (n *NetHealth) flushStaleUDPConntrack(ctx context.Context) {
+	// runMountCmd (nsenter -t 1 -m -n) is required — runHostCmd only
+	// joins the host NET namespace, so `conntrack` would resolve
+	// against the container image (which does not ship
+	// conntrack-tools). The host mount ns reaches the host binary;
+	// the host net ns operates on the real conntrack table.
+	out, err := n.cfg.runMountCmd(ctx,
+		[]string{"conntrack", "-D", "-p", "udp", "--dport", "53"})
+	if err != nil {
+		n.appendLog(fmt.Sprintf("conntrack udp/53 flush skipped: %v (%s)",
+			err, trimRunErr(out)))
+		return
+	}
+	n.actions.WithLabelValues(checkCT, "flush").Inc()
+	n.appendLog("ACTION: flushed stale udp/53 conntrack entries")
 }

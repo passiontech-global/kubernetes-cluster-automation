@@ -528,6 +528,127 @@ func TestRunCanaryFailures(t *testing.T) {
 	}
 }
 
+// --- OnlineOnly (background auto-maintenance: the offline path is
+// forbidden — systemctl stop/start + standalone etcd never run) ---
+
+func TestRunOnlineOnlySkipsOfflineOnBloat(t *testing.T) {
+	f := &fakeEtcd{
+		healthy: true,
+		statusJSON: []string{
+			statusJSON(100, 5000, 1000), // before
+			statusJSON(100, 5000, 1000), // post-defrag: 5000 > 2000
+			statusJSON(100, 5000, 1000), // [4/6] display
+		},
+	}
+	procRoot := fakeProc(t, map[int]string{4242: etcdProcCmdline})
+	starter := &fakeStarter{calls: &f.calls}
+	cfg := testRig(f, starter, procRoot)
+	cfg.OnlineOnly = true
+	var out strings.Builder
+	err := Run(context.Background(), cfg, &out)
+	// The bloat could not be reclaimed online — Run reports the
+	// required manual offline defrag as an error.
+	if err == nil {
+		t.Fatal("Run err=nil want offline-required error")
+	}
+	if !strings.Contains(err.Error(), "offline defrag") {
+		t.Fatalf("err=%v want offline-defrag hint", err)
+	}
+	// The offline machinery NEVER ran: no systemctl, no temp etcd.
+	if i := callIndex(f.calls, "systemctl"); i >= 0 {
+		t.Fatalf("systemctl ran under OnlineOnly:\n%v", f.calls)
+	}
+	if i := callIndex(f.calls, "temp-etcd"); i >= 0 {
+		t.Fatalf("standalone etcd spawned under OnlineOnly:\n%v", f.calls)
+	}
+	// The remaining online steps still completed: alarm disarm +
+	// write canary must have run (they often restore writes).
+	for _, want := range []string{"alarm disarm", "put " + canaryKey} {
+		if i := callIndex(f.calls, want); i < 0 {
+			t.Fatalf("missing %q under OnlineOnly:\n%v", want, f.calls)
+		}
+	}
+	if !strings.Contains(out.String(), "ONLINE-ONLY") {
+		t.Fatalf("missing online-only notice:\n%s", out.String())
+	}
+}
+
+func TestRunOnlineOnlySkipsOfflineOnDefragError(t *testing.T) {
+	f := &fakeEtcd{
+		healthy:          true,
+		failOnlineDefrag: true, // the 120s defrag errors → wants offline
+		statusJSON:       []string{statusJSON(100, 100, 90)},
+	}
+	procRoot := fakeProc(t, map[int]string{4242: etcdProcCmdline})
+	starter := &fakeStarter{calls: &f.calls}
+	cfg := testRig(f, starter, procRoot)
+	cfg.OnlineOnly = true
+	var out strings.Builder
+	err := Run(context.Background(), cfg, &out)
+	if err == nil {
+		t.Fatal("Run err=nil want offline-required error")
+	}
+	if i := callIndex(f.calls, "systemctl"); i >= 0 {
+		t.Fatalf("systemctl ran under OnlineOnly:\n%v", f.calls)
+	}
+	if starter.killed {
+		t.Fatal("standalone etcd touched under OnlineOnly")
+	}
+}
+
+func TestRunOnlineOnlyForceOfflineIgnored(t *testing.T) {
+	// ForceOffline + OnlineOnly is contradictory: OnlineOnly wins —
+	// the run degrades to a plain online attempt.
+	f := &fakeEtcd{
+		healthy: true,
+		statusJSON: []string{
+			statusJSON(100, 1000, 800), // before
+			statusJSON(100, 850, 800),  // post-defrag: 850 <= 1600
+			statusJSON(100, 850, 800),  // [4/6] display
+		},
+	}
+	procRoot := fakeProc(t, map[int]string{4242: etcdProcCmdline})
+	starter := &fakeStarter{calls: &f.calls}
+	cfg := testRig(f, starter, procRoot)
+	cfg.ForceOffline = true
+	cfg.OnlineOnly = true
+	var out strings.Builder
+	if err := Run(context.Background(), cfg, &out); err != nil {
+		t.Fatalf("Run err=%v want nil:\n%s", err, out.String())
+	}
+	// The online defrag WAS attempted (ForceOffline ignored) and the
+	// offline machinery never ran.
+	if i := callIndex(f.calls, "--command-timeout=120s defrag"); i < 0 {
+		t.Fatalf("online defrag not attempted:\n%v", f.calls)
+	}
+	if i := callIndex(f.calls, "systemctl"); i >= 0 {
+		t.Fatalf("systemctl ran under OnlineOnly:\n%v", f.calls)
+	}
+}
+
+func TestRunOnlineOnlySuccessNoError(t *testing.T) {
+	// When the online defrag reclaims enough, OnlineOnly changes
+	// nothing — the run completes cleanly.
+	f := &fakeEtcd{
+		healthy: true,
+		statusJSON: []string{
+			statusJSON(100, 1000, 800),
+			statusJSON(100, 850, 800),
+			statusJSON(100, 850, 800),
+		},
+	}
+	starter := &fakeStarter{calls: &f.calls}
+	cfg := testRig(f, starter, "")
+	cfg.OnlineOnly = true
+	var out strings.Builder
+	if err := Run(context.Background(), cfg, &out); err != nil {
+		t.Fatalf("Run err=%v want nil:\n%s", err, out.String())
+	}
+	if i := callIndex(f.calls, "systemctl"); i >= 0 {
+		t.Fatalf("unexpected systemctl call:\n%v", f.calls)
+	}
+}
+
 func TestRunStatusFailureFatal(t *testing.T) {
 	// Under set -e the bash died on the very first endpoint status —
 	// the port does too.

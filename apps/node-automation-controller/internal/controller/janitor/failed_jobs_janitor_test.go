@@ -13,6 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -55,7 +57,7 @@ func TestFailedJobsJanitorKeepsZeroTimestamp(t *testing.T) {
 		// LastTransitionTime deliberately zero
 	})
 	cs := fake.NewSimpleClientset(noTS)
-	j := &failedJobsJanitor{cs: cs}
+	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +75,7 @@ func TestFailedJobsJanitorCapFifty(t *testing.T) {
 			failedJob("ns-a", fmt.Sprintf("old-failed-%02d", i), 25*time.Hour))
 	}
 	cs := fake.NewSimpleClientset(objs...)
-	j := &failedJobsJanitor{cs: cs}
+	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +97,7 @@ func TestFailedJobsJanitorMultipleNamespaces(t *testing.T) {
 		failedJob("ns-b", "old-failed-b", 72*time.Hour),
 		failedJob("ns-b", "recent-failed-b", time.Hour), // fresh — must survive
 	)
-	j := &failedJobsJanitor{cs: cs}
+	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +126,7 @@ func TestFailedJobsJanitorKeepsFailedFalseAndNoCondition(t *testing.T) {
 		LastTransitionTime: metav1.NewTime(time.Now().Add(-72 * time.Hour)),
 	})
 	cs := fake.NewSimpleClientset(failedFalse, running, suspended)
-	j := &failedJobsJanitor{cs: cs}
+	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +144,7 @@ func TestFailedJobsJanitorListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	j := &failedJobsJanitor{cs: cs}
+	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
 	if err := j.run(ctx); err == nil {
 		t.Fatal("expected error when the jobs list fails")
 	}
@@ -158,7 +160,7 @@ func TestFailedJobsJanitorDeleteErrorTolerated(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("delete rejected")
 		})
-	j := &failedJobsJanitor{cs: cs}
+	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatalf("job delete failures must not error the run: %v", err)
 	}
@@ -166,5 +168,127 @@ func TestFailedJobsJanitorDeleteErrorTolerated(t *testing.T) {
 		if !fjjJobExists(t, cs, "a", name) {
 			t.Fatalf("job %s deleted despite the failing delete call", name)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// C3b stuck-Terminating audit
+// ---------------------------------------------------------------------------
+
+// A namespace and a PVC Terminating past the 2h threshold emit the
+// stuck series; fresh terminations and live objects do not. For the
+// cluster-scoped Namespace the namespace label is the documented "".
+// DeleteLabelValues doubles as an exists-probe and the cleanup.
+func TestStuckTerminatingAuditMarksStuck(t *testing.T) {
+	now := time.Now()
+	old := metav1.NewTime(now.Add(-3 * time.Hour))
+	fresh := metav1.NewTime(now.Add(-30 * time.Minute))
+	cs := fake.NewSimpleClientset(
+		&corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "stuck-ns", DeletionTimestamp: &old},
+			Spec: corev1.NamespaceSpec{
+				Finalizers: []corev1.FinalizerName{"kubernetes"}},
+		},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name: "fresh-ns", DeletionTimestamp: &fresh}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "live-ns"}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "data", Name: "stuck-pvc", DeletionTimestamp: &old,
+			Finalizers: []string{"kubernetes.io/pvc-protection"}}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "data", Name: "fresh-pvc", DeletionTimestamp: &fresh}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "data", Name: "live-pvc"}},
+	)
+	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	if err := j.auditStuckTerminating(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range [][3]string{
+		{"Namespace", "", "stuck-ns"},
+		{"PersistentVolumeClaim", "data", "stuck-pvc"},
+	} {
+		if !metrics.StuckTerminatingResources.DeleteLabelValues(key[0], key[1], key[2]) {
+			t.Fatalf("missing stuck series for %v", key)
+		}
+	}
+	for _, key := range [][3]string{
+		{"Namespace", "", "fresh-ns"},
+		{"Namespace", "", "live-ns"},
+		{"PersistentVolumeClaim", "data", "fresh-pvc"},
+		{"PersistentVolumeClaim", "data", "live-pvc"},
+	} {
+		if metrics.StuckTerminatingResources.DeleteLabelValues(key[0], key[1], key[2]) {
+			t.Fatalf("unexpected stuck series for %v", key)
+		}
+	}
+}
+
+// A resource that finishes terminating (or vanishes) gets its series
+// pruned on the next audit — /metrics must not leak stale "stuck"
+// label triples.
+func TestStuckTerminatingAuditPrunesFinished(t *testing.T) {
+	now := time.Now()
+	old := metav1.NewTime(now.Add(-3 * time.Hour))
+	cs := fake.NewSimpleClientset(
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "data", Name: "stuck-pvc", DeletionTimestamp: &old}},
+	)
+	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	if err := j.auditStuckTerminating(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := j.stuckEmitted[stuckTerminatingKey{
+		kind: "PersistentVolumeClaim", ns: "data", name: "stuck-pvc"}]; !ok {
+		t.Fatal("stuck pvc not tracked")
+	}
+	// The finalizer drained — the object is gone next sweep.
+	if err := cs.CoreV1().PersistentVolumeClaims("data").
+		Delete(ctx, "stuck-pvc", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.auditStuckTerminating(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.StuckTerminatingResources.DeleteLabelValues(
+		"PersistentVolumeClaim", "data", "stuck-pvc") {
+		t.Fatal("stale series survived the prune")
+	}
+	if len(j.stuckEmitted) != 0 {
+		t.Fatalf("stuckEmitted ledger holds %d entries, want 0", len(j.stuckEmitted))
+	}
+}
+
+// The audit rides the same hourly run() tick — a stuck namespace is
+// marked even when there is no failed job to delete.
+func TestStuckTerminatingAuditRunsInsideSweep(t *testing.T) {
+	now := time.Now()
+	old := metav1.NewTime(now.Add(-3 * time.Hour))
+	cs := fake.NewSimpleClientset(
+		failedJob("a", "old-failed", 25*time.Hour),
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name: "stuck-ns", DeletionTimestamp: &old}},
+	)
+	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !metrics.StuckTerminatingResources.DeleteLabelValues("Namespace", "", "stuck-ns") {
+		t.Fatal("stuck namespace series missing after full sweep")
+	}
+}
+
+// A namespaces list failure is a real error — the periodic wrapper
+// meters it.
+func TestStuckTerminatingAuditListError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "namespaces",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	if err := j.auditStuckTerminating(ctx); err == nil {
+		t.Fatal("expected error when the namespaces list fails")
 	}
 }

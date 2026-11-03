@@ -151,6 +151,7 @@ func TestNodeLabeler(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPartitionEvictor(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
 	old := metav1.NewTime(time.Now().Add(-20 * time.Minute))
 	partitioned := node("p1", corev1.ConditionTrue, nil)
 	partitioned.Status.Conditions = append(partitioned.Status.Conditions,

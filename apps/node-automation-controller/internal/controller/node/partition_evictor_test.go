@@ -3,6 +3,7 @@ package node
 import (
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -121,6 +122,7 @@ func TestPartitionEvictorZeroTimestampNotFlagged(t *testing.T) {
 // The eviction cap bounds churn at partitionEvictCap (8) pods per run:
 // with 9 flux-system pods on the flagged node exactly 8 are deleted.
 func TestPartitionEvictorEvictionCap(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
 	objs := []runtime.Object{
 		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
 	}
@@ -149,6 +151,7 @@ func TestPartitionEvictorEvictionCap(t *testing.T) {
 // Pods outside flux-system on a flagged node are never evicted, while
 // the flux-system pod on the same node is.
 func TestPartitionEvictorLeavesOtherNamespaces(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
 	objs := []runtime.Object{
 		pePartitionedNode("p1", "ClusterNetworkProblems", 30*time.Minute),
 		pePod("flux-system", "p1", "victim"),
@@ -174,6 +177,7 @@ func TestPartitionEvictorLeavesOtherNamespaces(t *testing.T) {
 // Two flagged nodes under the 50% guard: each is tainted and flux-system
 // pods are evicted off both.
 func TestPartitionEvictorMultipleFlaggedUnderHalf(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
 	objs := []runtime.Object{
 		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
 		pePartitionedNode("p2", "HostNetworkProblem", 20*time.Minute), // singular spelling
@@ -244,6 +248,7 @@ func TestPartitionEvictorNodeListError(t *testing.T) {
 // A pod list failure on one flagged node logs + continues: the run
 // still nils out and the other flagged node is fully processed.
 func TestPartitionEvictorPodListErrorContinues(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
 	objs := []runtime.Object{
 		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
 		pePartitionedNode("p2", "HostNetworkProblems", 20*time.Minute),
@@ -290,6 +295,7 @@ func TestPartitionEvictorPodListErrorContinues(t *testing.T) {
 // A failed pod delete is tolerated (logged, counted) — the run must
 // not error and the taint is still applied.
 func TestPartitionEvictorPodDeleteErrorTolerated(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
 	objs := append([]runtime.Object{
 		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
 		pePod("flux-system", "p1", "undeletable"),
@@ -335,6 +341,7 @@ func TestPartitionEvictorUntaintErrorTolerated(t *testing.T) {
 // still gets its pod sweep — the pod list afterwards must not be
 // skipped by the taint error.
 func TestPartitionEvictorTaintErrorStillSweepsPods(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
 	objs := append(
 		[]runtime.Object{
 			pePartitionedNode("p1", "ClusterNetworkProblems", 20*time.Minute),
@@ -355,5 +362,215 @@ func TestPartitionEvictorTaintErrorStillSweepsPods(t *testing.T) {
 	}
 	if pePodExists(t, cs, "flux-system", "src-ctrl") {
 		t.Fatal("pod on partitioned node not evicted after the taint failure")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// QW3 — PARTITION_EVICT_NAMESPACES allow-list + opt-in annotation.
+// ---------------------------------------------------------------------------
+
+// partitionEvictNamespaces: unset and whitespace-only values keep the
+// bash default (flux-system); a real value REPLACES it — the flag is
+// an allow-list, not an append-list.
+func TestPartitionEvictNamespacesParsing(t *testing.T) {
+	// Unset: save + clear the ambient value so the default branch is
+	// deterministic regardless of the shell the test runs under.
+	if old, had := os.LookupEnv(partitionNSsEnv); had {
+		t.Cleanup(func() { os.Setenv(partitionNSsEnv, old) }) //nolint:errcheck
+	}
+	if err := os.Unsetenv(partitionNSsEnv); err != nil {
+		t.Fatal(err)
+	}
+	got := partitionEvictNamespaces()
+	if len(got) != 1 || !nsSetHas(got, partitionPodNS) {
+		t.Fatalf("unset env produced %v, want {%s}", got, partitionPodNS)
+	}
+
+	// Whitespace-only is the same as unset — a ConfigMap value of
+	// " " must not become a namespace named " ".
+	t.Setenv(partitionNSsEnv, "   ")
+	got = partitionEvictNamespaces()
+	if len(got) != 1 || !nsSetHas(got, partitionPodNS) {
+		t.Fatalf("whitespace env produced %v, want {%s}", got, partitionPodNS)
+	}
+
+	// Comma-separated with stray whitespace and empty entries —
+	// "a, ,b," must parse to exactly {a, b} (no phantom namespace).
+	t.Setenv(partitionNSsEnv, " apps , ,monitoring,")
+	got = partitionEvictNamespaces()
+	if len(got) != 2 || !nsSetHas(got, "apps") || !nsSetHas(got, "monitoring") {
+		t.Fatalf("env ' apps , ,monitoring,' produced %v, want {apps monitoring}", got)
+	}
+	if nsSetHas(got, partitionPodNS) {
+		t.Fatal("explicit allow-list must replace the flux-system default")
+	}
+}
+
+func nsSetHas(set map[string]struct{}, ns string) bool {
+	_, ok := set[ns]
+	return ok
+}
+
+// A pod carrying node.ops/evict-on-partition=true in an UNLISTED
+// namespace is evicted off the flagged node; an identical unannotated
+// pod in the same namespace is left alone.
+func TestPartitionEvictorAnnotatedPodInUnlistedNamespace(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	optedIn := pePod("apps", "p1", "webhook-svc")
+	optedIn.Annotations = map[string]string{partitionEvictAnno: "true"}
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+		optedIn,
+		pePod("apps", "p1", "unannotated"),
+		pePod("flux-system", "p1", "listed-victim"),
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if pePodExists(t, cs, "apps", "webhook-svc") {
+		t.Fatal("annotated pod in unlisted namespace not evicted")
+	}
+	if pePodExists(t, cs, "flux-system", "listed-victim") {
+		t.Fatal("listed-namespace pod not evicted")
+	}
+	if !pePodExists(t, cs, "apps", "unannotated") {
+		t.Fatal("unannotated pod in unlisted namespace evicted — annotation leaked")
+	}
+}
+
+// The annotation opts IN the pod, it never overrides the safety
+// classes: terminal pods, DaemonSet pods and static mirror pods are
+// skipped even when annotated.
+func TestPartitionEvictorAnnotationSkipsProtectedPods(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	anno := map[string]string{partitionEvictAnno: "true"}
+
+	terminal := pePod("flux-system", "p1", "done-job")
+	terminal.Status.Phase = corev1.PodSucceeded
+	terminal.Annotations = anno
+
+	failed := pePod("flux-system", "p1", "crashed")
+	failed.Status.Phase = corev1.PodFailed
+	failed.Annotations = anno
+
+	ds := pePod("flux-system", "p1", "daemon-xyz")
+	ds.Annotations = anno
+	ds.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "DaemonSet", Name: "daemon", UID: "u1",
+	}}
+
+	mirror := pePod("flux-system", "p1", "static-etcd")
+	mirror.Annotations = map[string]string{
+		partitionEvictAnno: "true",
+		mirrorPodAnno:      "0123456789abcdef",
+	}
+
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+		terminal, failed, ds, mirror,
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"done-job", "crashed", "daemon-xyz", "static-etcd"} {
+		if !pePodExists(t, cs, "flux-system", name) {
+			t.Fatalf("protected pod flux-system/%s was evicted", name)
+		}
+	}
+}
+
+// The cap is global per run — annotated pods from other namespaces
+// share the same budget as allow-listed pods: 5 listed + 5 annotated
+// must still stop at partitionEvictCap deletions.
+func TestPartitionEvictorCapCoversAnnotatedPods(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	objs := []runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+	}
+	objs = append(objs, peHealthyNodes("h", 2)...)
+	for i := 0; i < 5; i++ {
+		objs = append(objs, pePod("flux-system", "p1", fmt.Sprintf("listed-%02d", i)))
+	}
+	for i := 0; i < 5; i++ {
+		p := pePod("apps", "p1", fmt.Sprintf("opted-%02d", i))
+		p.Annotations = map[string]string{partitionEvictAnno: "true"}
+		objs = append(objs, p)
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	remaining := 0
+	for _, ns := range []string{"flux-system", "apps"} {
+		l, err := cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		remaining += len(l.Items)
+	}
+	if want := 10 - partitionEvictCap; remaining != want {
+		t.Fatalf("cap not respected across membership classes: %d pods left, want %d", remaining, want)
+	}
+}
+
+// An explicit allow-list REPLACES the flux-system default — with
+// PARTITION_EVICT_NAMESPACES=monitoring a flux-system pod is left
+// alone while the monitoring pod is evicted.
+func TestPartitionEvictorEnvAllowListReplacesDefault(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "monitoring, logging")
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+		pePod("flux-system", "p1", "no-longer-listed"),
+		pePod("monitoring", "p1", "prom-victim"),
+		pePod("logging", "p1", "fluent-victim"),
+		pePod("default", "p1", "still-unlisted"),
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range [][2]string{{"monitoring", "prom-victim"}, {"logging", "fluent-victim"}} {
+		if pePodExists(t, cs, p[0], p[1]) {
+			t.Fatalf("listed-namespace pod %s/%s not evicted", p[0], p[1])
+		}
+	}
+	for _, p := range [][2]string{{"flux-system", "no-longer-listed"}, {"default", "still-unlisted"}} {
+		if !pePodExists(t, cs, p[0], p[1]) {
+			t.Fatalf("unlisted-namespace pod %s/%s evicted", p[0], p[1])
+		}
+	}
+}
+
+// Eviction is node-scoped: an allow-listed (or annotated) pod sitting
+// on a HEALTHY node is never touched — the spec.nodeName selector
+// must hold even when the fake clientset would leak it.
+func TestPartitionEvictorLeavesPodsOnHealthyNodes(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	optedIn := pePod("apps", "h-0", "healthy-node-pod")
+	optedIn.Annotations = map[string]string{partitionEvictAnno: "true"}
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+		pePod("flux-system", "p1", "victim"),
+		pePod("flux-system", "h-0", "healthy-listed"),
+		optedIn,
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if pePodExists(t, cs, "flux-system", "victim") {
+		t.Fatal("pod on partitioned node not evicted")
+	}
+	for _, p := range [][2]string{{"flux-system", "healthy-listed"}, {"apps", "healthy-node-pod"}} {
+		if !pePodExists(t, cs, p[0], p[1]) {
+			t.Fatalf("pod %s/%s on a healthy node was evicted", p[0], p[1])
+		}
 	}
 }

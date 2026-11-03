@@ -33,6 +33,10 @@ func TestSetupPeriodicModules(t *testing.T) {
 			func(m manager.Manager) error {
 				return SetupCiliumIdentityAuditor(m, cs, testutil.StubDyn(), true)
 			}},
+		{"cert-drift-auditor", 15 * time.Minute,
+			func(m manager.Manager) error {
+				return SetupCertDriftAuditor(m, cs, testutil.StubDyn(), true)
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := testutil.NewStubManager()
@@ -65,6 +69,9 @@ func TestSetupFeatureFlagVariants(t *testing.T) {
 		}},
 		{"cilium-identity-auditor", func(m manager.Manager) error {
 			return SetupCiliumIdentityAuditor(m, cs, testutil.StubDyn(), false)
+		}},
+		{"cert-drift-auditor", func(m manager.Manager) error {
+			return SetupCertDriftAuditor(m, cs, testutil.StubDyn(), false)
 		}},
 	} {
 		t.Run(tc.name+"-disabled", func(t *testing.T) {

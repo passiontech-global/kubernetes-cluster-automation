@@ -14,13 +14,24 @@
 //     partition where eviction only makes churn;
 //   - taint flagged nodes node.ops/network-partitioned=true:NoSchedule so
 //     evicted pods don't get rescheduled onto the same broken node;
-//   - delete pods in flux-system off flagged nodes, capped at 8/run.
+//   - delete pods in the configured namespaces (PARTITION_EVICT_NAMESPACES,
+//     default flux-system) plus any pod carrying the
+//     node.ops/evict-on-partition=true opt-in annotation — in ANY
+//     namespace — off flagged nodes, capped at 8/run.
+//
+// Three pod classes are never evicted no matter the namespace or the
+// annotation: terminal pods (nothing left to move), DaemonSet pods
+// (the daemon re-creates them in place — they are usually hostNetwork
+// and unaffected by the pod-net partition anyway), and static mirror
+// pods (the kubelet owns the real pod; the API object is a mirror).
 package node
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -37,8 +48,23 @@ const (
 	partitionEvictorQueue = "partition-pod-evictor"
 	partitionTaintKey     = "node.ops/network-partitioned"
 	partitionMinAge       = 600 * time.Second // condition True >10m before evicting
-	partitionPodNS        = "flux-system"
-	partitionEvictCap     = 8 // bound churn per run
+	partitionPodNS        = "flux-system"     // default for partitionNSsEnv
+	partitionEvictCap     = 8                 // bound churn per run
+	// partitionNSsEnv is the comma-separated namespace allow-list the
+	// sweep evicts from; unset/whitespace keeps the bash default
+	// (partitionPodNS) so a misconfigured flag degrades to the
+	// original behavior instead of silently evicting nothing.
+	partitionNSsEnv = "PARTITION_EVICT_NAMESPACES"
+	// partitionEvictAnno opts an individual pod into partition
+	// eviction from ANY namespace — the escape hatch for
+	// single-replica infra living outside the allow-list (a
+	// cert-manager webhook or a database proxy wedged on a
+	// blackholed node is just as stuck as source-controller was).
+	partitionEvictAnno = "node.ops/evict-on-partition"
+	// mirrorPodAnno is the kubelet's static-pod marker — the API
+	// object is only a mirror, the kubelet owns (and recreates) the
+	// real pod, so deleting it buys nothing.
+	mirrorPodAnno = "kubernetes.io/config.mirror"
 )
 
 // partitionCondTypes covers upstream NWPD K8sExporter plurals and the
@@ -73,6 +99,59 @@ func nodePartitioned(n *corev1.Node) bool {
 		}
 	}
 	return false
+}
+
+// partitionEvictNamespaces parses PARTITION_EVICT_NAMESPACES into the
+// namespace set the sweep evicts from: comma-separated, entries
+// trimmed, blanks dropped (so "a, ,b" and trailing commas produce no
+// phantom namespace). Unset or all-empty falls back to partitionPodNS.
+func partitionEvictNamespaces() map[string]struct{} {
+	raw := strings.TrimSpace(os.Getenv(partitionNSsEnv))
+	if raw == "" {
+		raw = partitionPodNS
+	}
+	out := make(map[string]struct{})
+	for _, ns := range strings.Split(raw, ",") {
+		if ns = strings.TrimSpace(ns); ns != "" {
+			out[ns] = struct{}{}
+		}
+	}
+	return out
+}
+
+// partitionEvictable reports whether pod p is a candidate for
+// partition eviction. Membership is by the configured namespace set
+// OR the node.ops/evict-on-partition=true opt-in annotation, but
+// three classes are always skipped no matter where they live:
+//   - terminal pods (Succeeded/Failed): dead weight, nothing to move;
+//   - DaemonSet pods: the daemon re-creates them in place — and DS
+//     pods are usually hostNetwork, so the pod-net partition does not
+//     strand them anyway;
+//   - static mirror pods: the kubelet owns the real pod — deleting
+//     the mirror only produces a new mirror.
+func partitionEvictable(p *corev1.Pod, namespaces map[string]struct{}) bool {
+	if p.Status.Phase == corev1.PodSucceeded ||
+		p.Status.Phase == corev1.PodFailed {
+		return false
+	}
+	if p.DeletionTimestamp != nil {
+		// Already terminating — a re-delete changes nothing but the
+		// attempt still counts against partitionEvictCap, so enough
+		// wedged pods would starve the real victims.
+		return false
+	}
+	if _, mirror := p.Annotations[mirrorPodAnno]; mirror {
+		return false
+	}
+	for _, o := range p.OwnerReferences {
+		if o.Kind == "DaemonSet" {
+			return false
+		}
+	}
+	if _, ok := namespaces[p.Namespace]; ok {
+		return true
+	}
+	return p.Annotations[partitionEvictAnno] == "true"
 }
 
 func (e *partitionEvictor) run(ctx context.Context) error {
@@ -124,6 +203,13 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	}
 	sort.Strings(names)
 
+	// Resolve the eviction set once per run: the env allow-list plus
+	// the annotation opt-in (checked per pod inside the loop). One
+	// node-scoped cluster-wide list per flagged node beats
+	// 1+len(namespaces) namespaced lists — RBAC already grants
+	// cluster-wide pod list (dead-node-sweeper reads the same way).
+	namespaces := partitionEvictNamespaces()
+
 	evicted := 0
 loop:
 	for _, name := range names {
@@ -136,18 +222,29 @@ loop:
 				log.Info(fmt.Sprintf("TAINT %s: network partitioned -> NoSchedule", name))
 			}
 		}
-		pods, err := e.cs.CoreV1().Pods(partitionPodNS).List(ctx, metav1.ListOptions{
+		pods, err := e.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
 			FieldSelector: "spec.nodeName=" + name,
 		})
 		if err != nil {
 			metrics.IncError(partitionEvictorQueue)
-			log.Error(err, "list pods failed", "node", name, "namespace", partitionPodNS)
+			log.Error(err, "list pods failed", "node", name)
 			continue
 		}
-		for _, p := range pods.Items {
+		for i := range pods.Items {
+			p := &pods.Items[i]
 			if evicted >= partitionEvictCap {
 				log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", partitionEvictCap))
 				break loop
+			}
+			// Belt: the spec.nodeName field selector scopes the
+			// server-side list, but fake clientsets ignore field
+			// selectors — and a dropped/broken selector must never
+			// turn a node-local sweep into a cluster-wide eviction.
+			if p.Spec.NodeName != name {
+				continue
+			}
+			if !partitionEvictable(p, namespaces) {
+				continue
 			}
 			log.Info(fmt.Sprintf("EVICT %s/%s off %s (partitioned)", p.Namespace, p.Name, name))
 			if err := e.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {

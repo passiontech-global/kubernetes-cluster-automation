@@ -27,7 +27,7 @@ func TestFailedJobsJanitor(t *testing.T) {
 		}}},
 	}
 	cs := fake.NewSimpleClientset(old, recent, complete)
-	j := &failedJobsJanitor{cs: cs}
+	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}

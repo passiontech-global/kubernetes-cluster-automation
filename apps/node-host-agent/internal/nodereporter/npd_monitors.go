@@ -78,6 +78,8 @@ var kernelTempRules = []logRule{
 	{"KernelOops", regexp.MustCompile(`BUG: unable to handle kernel|kernel BUG at|Oops:`)},
 	{"Ext4Error", regexp.MustCompile(`EXT4-fs error`)},
 	{"Ext4Warning", regexp.MustCompile(`EXT4-fs warning`)},
+	{"ConntrackTableFull", regexp.MustCompile(`nf_conntrack.*table full`)},
+	{"FilesystemIOError", regexp.MustCompile(`Buffer I/O error on dev|XFS.*[Mm]etadata I/O error`)},
 }
 
 // kernelDeadlockRe is the permanent KernelDeadlock rule — the

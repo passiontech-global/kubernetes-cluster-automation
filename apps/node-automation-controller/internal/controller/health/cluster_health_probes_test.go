@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
+	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,6 +23,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // testProber builds a prober with the env-equivalent defaults but
@@ -36,6 +41,8 @@ func testProber(cs *fake.Clientset) *clusterHealthProber {
 		maxPodRestarts:      10,
 		podSkipDuration:     10 * time.Minute,
 		quotaThreshold:      0.9,
+		kcmLeaseMaxAge:      30 * time.Second,
+		kcmFreezeMinAge:     10 * time.Minute,
 	})
 	p.lookupHost = func(context.Context, string) ([]string, error) {
 		return []string{"10.0.0.1"}, nil
@@ -285,7 +292,7 @@ func TestRunEmitsAllChecksPassing(t *testing.T) {
 	}
 	for _, check := range []string{
 		checkNameDNS, checkNameHTTPContent, checkNamePodRestarts,
-		checkNamePodStatus, checkNameResourceQuota,
+		checkNamePodStatus, checkNameResourceQuota, checkNameKCMWorkqueue,
 	} {
 		v, ok := healthGauge(t, check, "OK")
 		if !ok || v != 1 {
@@ -412,5 +419,364 @@ func TestRunAbortEmitsNothing(t *testing.T) {
 	}
 	if len(after) != len(before) {
 		t.Fatalf("aborted run emitted new series: %v -> %v", before, after)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// kcm-workqueue-watchdog (C6)
+// ---------------------------------------------------------------------------
+
+func kcmReadyNode() *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type:   corev1.NodeReady,
+			Status: corev1.ConditionTrue,
+		}}},
+	}
+}
+
+// kcmLease builds the kube-controller-manager leader Lease with
+// renewTime `age` before `at`.
+func kcmLease(age time.Duration, at time.Time) *coordinationv1.Lease {
+	rt := metav1.NewMicroTime(at.Add(-age))
+	return &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: metav1.NamespaceSystem,
+			Name:      "kube-controller-manager",
+		},
+		Spec: coordinationv1.LeaseSpec{RenewTime: &rt},
+	}
+}
+
+// renewKCMLease moves renewTime to just before `at` — the "still
+// renewing" signal the watchdog requires as test time advances.
+func renewKCMLease(t *testing.T, cs *fake.Clientset, at time.Time) {
+	t.Helper()
+	lease, err := cs.CoordinationV1().Leases(metav1.NamespaceSystem).
+		Get(ctx, "kube-controller-manager", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get lease: %v", err)
+	}
+	rt := metav1.NewMicroTime(at.Add(-2 * time.Second))
+	lease.Spec.RenewTime = &rt
+	if _, err := cs.CoordinationV1().Leases(metav1.NamespaceSystem).
+		Update(ctx, lease, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("renew lease: %v", err)
+	}
+}
+
+// kcmDesiredZeroDS is the freeze signature: desired dropped to 0 while
+// pods remain scheduled — the DS controller stopped recomputing.
+func kcmDesiredZeroDS() *appsv1.DaemonSet {
+	return &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  metav1.NamespaceSystem,
+			Name:       "cilium",
+			Generation: 1,
+		},
+		Status: appsv1.DaemonSetStatus{
+			ObservedGeneration:     1,
+			DesiredNumberScheduled: 0,
+			CurrentNumberScheduled: 5,
+		},
+	}
+}
+
+func kcmFrozenGauge(t *testing.T, reason string) (float64, bool) {
+	t.Helper()
+	m := findMetric(t, "node_automation_kcm_workqueue_frozen",
+		map[string]string{"reason": reason})
+	if m == nil {
+		return 0, false
+	}
+	return m.GetGauge().GetValue(), true
+}
+
+// resetKCMFrozenSeries drops the gauge's reason series: the registry
+// is process-global across the package, so a value held at 1 by an
+// earlier test would leak into "want absent/0" assertions here.
+func resetKCMFrozenSeries(t *testing.T, reasons ...string) {
+	t.Helper()
+	for _, r := range reasons {
+		metrics.KCMWorkqueueFrozen.DeleteLabelValues(r)
+	}
+}
+
+// The freeze gauge fires only after the signature persists the full
+// min-age window — first sighting and a mid-window observation pass.
+func TestCheckKCMWorkqueueFreezeAfterMinAge(t *testing.T) {
+	resetKCMFrozenSeries(t, "daemonset_desired_zero")
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		kcmReadyNode(),
+		kcmLease(2*time.Second, base),
+		kcmDesiredZeroDS(),
+	)
+	p := testProber(cs)
+	p.now = func() time.Time { return base }
+
+	// First sighting stamps first-seen — quiet.
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("first-seen signature must pass: %+v", res)
+	}
+	if _, ok := p.kcmFirstSeen["daemonset_desired_zero/daemonset/cilium"]; !ok {
+		t.Fatal("signature not tracked in kcmFirstSeen")
+	}
+	if v, ok := kcmFrozenGauge(t, "daemonset_desired_zero"); ok && v != 0 {
+		t.Fatalf("frozen gauge = %v before minAge, want absent/0", v)
+	}
+
+	// Inside the window — still quiet.
+	at := base.Add(9 * time.Minute)
+	renewKCMLease(t, cs, at)
+	p.now = func() time.Time { return at }
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("signature at 9m must still pass: %+v", res)
+	}
+	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
+		t.Fatalf("frozen gauge = %v inside window, want 0", v)
+	}
+
+	// Past the persistence window the freeze fires.
+	at = base.Add(10 * time.Minute)
+	renewKCMLease(t, cs, at)
+	p.now = func() time.Time { return at }
+	if res := p.checkKCMWorkqueue(ctx); res.pass {
+		t.Fatal("signature persisted >=10m must FAIL")
+	}
+	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 1 {
+		t.Fatalf("frozen gauge = %v, want 1", v)
+	}
+}
+
+// A kube-system Deployment or DaemonSet whose observedGeneration lags
+// generation flags stale_observed_generation once past the window.
+func TestCheckKCMWorkqueueStaleObservedGeneration(t *testing.T) {
+	resetKCMFrozenSeries(t, "stale_observed_generation")
+	base := time.Now()
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  metav1.NamespaceSystem,
+			Name:       "coredns",
+			Generation: 5,
+		},
+		Status: appsv1.DeploymentStatus{ObservedGeneration: 3},
+	}
+	// A DS caught up to its spec is not a signature alongside it.
+	settled := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  metav1.NamespaceSystem,
+			Name:       "kube-proxy",
+			Generation: 2,
+		},
+		Status: appsv1.DaemonSetStatus{
+			ObservedGeneration:     2,
+			DesiredNumberScheduled: 4,
+			CurrentNumberScheduled: 4,
+			NumberReady:            4,
+		},
+	}
+	cs := fake.NewSimpleClientset(
+		kcmReadyNode(),
+		kcmLease(2*time.Second, base),
+		dep, settled,
+	)
+	p := testProber(cs)
+	p.now = func() time.Time { return base }
+
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("first-seen signature must pass: %+v", res)
+	}
+	if _, ok := p.kcmFirstSeen["stale_observed_generation/deployment/coredns"]; !ok {
+		t.Fatal("deployment signature not tracked")
+	}
+	if len(p.kcmFirstSeen) != 1 {
+		t.Fatalf("settled DS must not be tracked: %v", p.kcmFirstSeen)
+	}
+
+	at := base.Add(11 * time.Minute)
+	renewKCMLease(t, cs, at)
+	p.now = func() time.Time { return at }
+	res := p.checkKCMWorkqueue(ctx)
+	if res.pass {
+		t.Fatal("stale observedGeneration >=10m must FAIL")
+	}
+	if v, _ := kcmFrozenGauge(t, "stale_observed_generation"); v != 1 {
+		t.Fatalf("frozen gauge = %v, want 1", v)
+	}
+	if !strings.Contains(res.why, "stale_observed_generation") {
+		t.Fatalf("why = %q, want the reason label", res.why)
+	}
+}
+
+// A stale renewTime means the KCM is DEAD — a different failure — so
+// freeze-looking signatures must not fire, and any held state clears.
+func TestCheckKCMWorkqueueQuietOnStaleLease(t *testing.T) {
+	resetKCMFrozenSeries(t, "daemonset_desired_zero")
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		kcmReadyNode(),
+		kcmLease(10*time.Minute, base), // renewTime far past maxAge
+		kcmDesiredZeroDS(),
+	)
+	p := testProber(cs)
+	p.now = func() time.Time { return base }
+
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("stale KCM lease must stay quiet: %+v", res)
+	}
+	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
+		t.Fatalf("frozen gauge = %v on stale lease, want absent/0", v)
+	}
+	if len(p.kcmFirstSeen) != 0 {
+		t.Fatalf("stale lease left %d tracked signatures", len(p.kcmFirstSeen))
+	}
+
+	// A previously-frozen gauge also clears when the holder dies.
+	p.kcmFrozenReasons["daemonset_desired_zero"] = true
+	metrics.KCMWorkqueueFrozen.WithLabelValues("daemonset_desired_zero").Set(1)
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("stale KCM lease must stay quiet: %+v", res)
+	}
+	if v, ok := kcmFrozenGauge(t, "daemonset_desired_zero"); !ok || v != 0 {
+		t.Fatalf("held gauge on dead KCM = %v,%v want 0", v, ok)
+	}
+
+	// No Lease object at all — same quiet path.
+	p = testProber(fake.NewSimpleClientset(kcmReadyNode(), kcmDesiredZeroDS()))
+	p.now = func() time.Time { return base }
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("missing KCM lease must stay quiet: %+v", res)
+	}
+}
+
+// With no Ready node the desired==0 reading is ambiguous — quiet.
+func TestCheckKCMWorkqueueQuietOnNoReadyNodes(t *testing.T) {
+	resetKCMFrozenSeries(t, "daemonset_desired_zero")
+	base := time.Now()
+
+	// Zero nodes at all.
+	cs := fake.NewSimpleClientset(kcmLease(2*time.Second, base), kcmDesiredZeroDS())
+	p := testProber(cs)
+	p.now = func() time.Time { return base }
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("no nodes must stay quiet: %+v", res)
+	}
+
+	// Every node NotReady — same.
+	notReady := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type:   corev1.NodeReady,
+			Status: corev1.ConditionFalse,
+		}}},
+	}
+	cs = fake.NewSimpleClientset(notReady, kcmLease(2*time.Second, base), kcmDesiredZeroDS())
+	p = testProber(cs)
+	p.now = func() time.Time { return base }
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("all nodes NotReady must stay quiet: %+v", res)
+	}
+	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
+		t.Fatalf("frozen gauge = %v with no ready nodes, want absent/0", v)
+	}
+	if len(p.kcmFirstSeen) != 0 {
+		t.Fatalf("no-ready-nodes left %d tracked signatures", len(p.kcmFirstSeen))
+	}
+}
+
+// Once the DS reconciles again the signature drops, first-seen is
+// pruned and the gauge flips back to 0.
+func TestCheckKCMWorkqueueRecoveryClearsGauge(t *testing.T) {
+	resetKCMFrozenSeries(t, "daemonset_desired_zero")
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		kcmReadyNode(),
+		kcmLease(2*time.Second, base),
+		kcmDesiredZeroDS(),
+	)
+	p := testProber(cs)
+	p.now = func() time.Time { return base }
+
+	// Drive past the window into frozen.
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("first-seen signature must pass: %+v", res)
+	}
+	at := base.Add(11 * time.Minute)
+	renewKCMLease(t, cs, at)
+	p.now = func() time.Time { return at }
+	if res := p.checkKCMWorkqueue(ctx); res.pass {
+		t.Fatal("expected frozen FAIL")
+	}
+	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 1 {
+		t.Fatalf("frozen gauge = %v, want 1", v)
+	}
+
+	// KCM catches up: desired recomputed to match the scheduled pods.
+	at = base.Add(12 * time.Minute)
+	renewKCMLease(t, cs, at)
+	p.now = func() time.Time { return at }
+	ds, err := cs.AppsV1().DaemonSets(metav1.NamespaceSystem).
+		Get(ctx, "cilium", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get ds: %v", err)
+	}
+	ds.Status.DesiredNumberScheduled = 5
+	if _, err := cs.AppsV1().DaemonSets(metav1.NamespaceSystem).
+		Update(ctx, ds, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update ds: %v", err)
+	}
+
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("recovered signature must pass: %+v", res)
+	}
+	if v, ok := kcmFrozenGauge(t, "daemonset_desired_zero"); !ok || v != 0 {
+		t.Fatalf("frozen gauge after recovery = %v,%v want 0", v, ok)
+	}
+	if len(p.kcmFirstSeen) != 0 {
+		t.Fatalf("resolved signature not pruned: %v", p.kcmFirstSeen)
+	}
+}
+
+// desired==0 with zero pods anywhere is a legitimately-empty selector
+// — not a freeze — and it must never even enter first-seen tracking.
+func TestCheckKCMWorkqueueIgnoresEmptyDaemonSet(t *testing.T) {
+	resetKCMFrozenSeries(t, "daemonset_desired_zero")
+	base := time.Now()
+	empty := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  metav1.NamespaceSystem,
+			Name:       "hw-agent",
+			Generation: 1,
+		},
+		Status: appsv1.DaemonSetStatus{
+			ObservedGeneration:     1,
+			DesiredNumberScheduled: 0,
+			// nothing scheduled/ready/misscheduled anywhere
+		},
+	}
+	cs := fake.NewSimpleClientset(
+		kcmReadyNode(),
+		kcmLease(2*time.Second, base),
+		empty,
+	)
+	p := testProber(cs)
+	p.now = func() time.Time { return base }
+
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("empty DaemonSet must pass: %+v", res)
+	}
+	at := base.Add(30 * time.Minute)
+	renewKCMLease(t, cs, at)
+	p.now = func() time.Time { return at }
+	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+		t.Fatalf("empty DaemonSet must never freeze: %+v", res)
+	}
+	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
+		t.Fatalf("frozen gauge = %v, want absent/0", v)
+	}
+	if len(p.kcmFirstSeen) != 0 {
+		t.Fatalf("non-signature must not be tracked: %v", p.kcmFirstSeen)
 	}
 }

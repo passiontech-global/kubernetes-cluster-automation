@@ -181,6 +181,12 @@ func TestKernelRulePatterns(t *testing.T) {
 		{"EXT4-fs (vda1): mounted filesystem with ordered data mode", "Ext4Error", false},
 		{"EXT4-fs warning (device vdb1): ext4_dx_add_entry: Directory index full!", "Ext4Warning", true},
 		{"EXT4-fs (vdb1): re-mounted. Opts: (null)", "Ext4Warning", false},
+		{"nf_conntrack: table full, dropping packet", "ConntrackTableFull", true},
+		{"netfilter: conntrack entries=200000 of max=262144", "ConntrackTableFull", false},
+		{"Buffer I/O error on dev sda1, logical block 1234567, async page read", "FilesystemIOError", true},
+		{"XFS (dm-2): metadata I/O error in \"xlog_recover_iodone\" at daddr 0x121500 len 32 error 28", "FilesystemIOError", true},
+		{"XFS (dm-2): Mounting V5 Filesystem", "FilesystemIOError", false},
+		{"blk_update_request: I/O error, dev vda, sector 42 op 0x0:(READ)", "FilesystemIOError", false},
 	}
 	for _, c := range cases {
 		for _, rule := range kernelTempRules {
@@ -198,6 +204,30 @@ func TestKernelRulePatterns(t *testing.T) {
 	}
 	if kernelDeadlockRe.MatchString("INFO: task kworker started") {
 		t.Error("KernelDeadlock pattern matched noise")
+	}
+}
+
+// TestKernelNewRulesEmit: the H2/H7 kernel reasons fire from
+// representative kmsg records — one counter + one Event per match.
+func TestKernelNewRulesEmit(t *testing.T) {
+	e := fixture(t)
+	e.appendKmsg(t,
+		"6,1,3599000000,-;nf_conntrack: table full, dropping packet\n"+
+			"3,2,3599000001,-;Buffer I/O error on dev vdb1, logical block 42, async page read\n"+
+			"4,3,3599000002,-;XFS (dm-2): Metadata I/O error detected at xfs_buf_read_map")
+	e.cycle()
+
+	if got := e.counter("ConntrackTableFull"); got != 1 {
+		t.Fatalf("ConntrackTableFull = %v, want 1", got)
+	}
+	if got := e.counter("FilesystemIOError"); got != 2 {
+		t.Fatalf("FilesystemIOError = %v, want 2", got)
+	}
+	if n := len(eventsByReason(t, e, "ConntrackTableFull")); n != 1 {
+		t.Fatalf("ConntrackTableFull events = %d, want 1", n)
+	}
+	if n := len(eventsByReason(t, e, "FilesystemIOError")); n != 2 {
+		t.Fatalf("FilesystemIOError events = %d, want 2", n)
 	}
 }
 

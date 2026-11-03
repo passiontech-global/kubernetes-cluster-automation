@@ -18,7 +18,11 @@
 //
 // Action: delete that newest pending-* secret + merge-patch the HR
 // annotation reconcile.fluxcd.io/requestedAt=<now> (flux's "reconcile
-// now" signal) so helm-controller retries immediately.
+// now" signal) so helm-controller retries immediately. On a successful
+// unlock the target namespace is also swept for FAILED helm-hook Jobs
+// (C3a): hooks are one-shot, but a failed hook Job object blocks the
+// retried release — helm cannot re-run a hook while its old Job still
+// exists ("cannot re-use a name that is still in use").
 //
 // Guards:
 //   - max one unlock per HR per 24h (in-memory);
@@ -39,6 +43,7 @@ import (
 	"sync"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -176,9 +181,17 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 				"hr", key, "unlockedAgo", now.Sub(last).Truncate(time.Minute))
 			continue
 		}
-		if err := u.unlock(ctx, gvr, hr); err != nil {
+		acted, err := u.unlock(ctx, gvr, hr)
+		if err != nil {
 			log.Error(err, "helmrelease unlock failed", "hr", key)
 			continue // per-HR failures must not starve the rest
+		}
+		if !acted {
+			// Refused/skipped (no pending secret, or no safe
+			// predecessor) — NOT an unlock: stamping the ledger
+			// here would suppress re-evaluation for 24h AND spam
+			// "still stuck after unlock" errors for a refusal.
+			continue
 		}
 		u.unlocked[key] = now
 		unlocked++
@@ -232,8 +245,11 @@ func (u *helmReleaseUnlocker) helmControllerDown(ctx context.Context) (bool, err
 
 // unlock deletes the newest pending-* release secret and stamps
 // reconcile.fluxcd.io/requestedAt on the HR. Only acts when an older
-// deployed/superseded revision exists to roll back to.
-func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersionResource, hr *unstructured.Unstructured) error {
+// deployed/superseded revision exists to roll back to. acted=false
+// means the HR was evaluated but refused (no pending secret / no
+// safe predecessor) — the caller must not stamp the cooldown ledger
+// for those.
+func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersionResource, hr *unstructured.Unstructured) (bool, error) {
 	log := logf.FromContext(ctx)
 	key := hr.GetNamespace() + "/" + hr.GetName()
 	release := hrReleaseName(hr)
@@ -246,7 +262,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	secrets, err := u.cs.CoreV1().Secrets(hrTargetNS(hr)).List(ctx,
 		metav1.ListOptions{LabelSelector: "owner=helm,name=" + release})
 	if err != nil {
-		return fmt.Errorf("list release secrets: %w", err)
+		return false, fmt.Errorf("list release secrets: %w", err)
 	}
 
 	var pending *corev1.Secret
@@ -272,7 +288,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	}
 	if pending == nil {
 		log.Info("skip: no pending-* release secret — not the pending deadlock", "hr", key, "release", release)
-		return nil
+		return false, nil
 	}
 	olderSafe := false
 	for _, r := range safeRevs {
@@ -286,14 +302,14 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 		// the release — refuse (helm-controller#644 class).
 		log.Info("skip: pending revision has no deployed/superseded predecessor — refusing",
 			"hr", key, "release", release, "pendingRev", pendingRev)
-		return nil
+		return false, nil
 	}
 
 	log.Info("ACTION: delete stuck pending release secret",
 		"hr", key, "secret", pending.Name, "status", pending.Labels["status"], "rev", pendingRev)
 	if err := u.cs.CoreV1().Secrets(pending.Namespace).Delete(ctx, pending.Name,
 		metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("delete pending secret %s/%s: %w", pending.Namespace, pending.Name, err)
+		return false, fmt.Errorf("delete pending secret %s/%s: %w", pending.Namespace, pending.Name, err)
 	}
 
 	// reconcile.fluxcd.io/requestedAt is flux's "reconcile now" hint —
@@ -304,14 +320,67 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 		}},
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err := u.dyn.Resource(gvr).Namespace(hr.GetNamespace()).Patch(ctx, hr.GetName(),
 		types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
-		return fmt.Errorf("annotate helmrelease %s: %w", key, err)
+		return false, fmt.Errorf("annotate helmrelease %s: %w", key, err)
 	}
 	log.Info("ACTION: requested HR reconcile", "hr", key)
-	return nil
+
+	// C3a: failed helm-hook Jobs in the target namespace are the second
+	// half of this deadlock class — the pending operation that wedged
+	// the release usually left a failed hook Job behind, and helm
+	// refuses to re-run a hook while its Job object still exists
+	// ("cannot re-use a name that is still in use"). Hooks are one-shot
+	// by contract, so a Failed hook Job is pure residue; reaping it
+	// lets the retried helm run recreate the hook fresh. Best-effort:
+	// a list/delete failure here must NOT undo the unlock that already
+	// landed — the pending-secret delete + reconcile stamp are the fix.
+	u.cleanFailedHookJobs(ctx, hrTargetNS(hr))
+	return true, nil
+}
+
+// cleanFailedHookJobs deletes batchv1 Jobs in ns that carry the
+// helm.sh/hook annotation and report JobFailed=True, with background
+// propagation so their pods go with them. Each deletion bumps
+// metrics.HelmHookJobsCleanedTotal{namespace}. Errors are logged and
+// skipped — hook cleanup never fails the caller.
+func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string) {
+	log := logf.FromContext(ctx)
+	jobs, err := u.cs.BatchV1().Jobs(ns).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		log.Error(err, "helm-hook job list failed — hook cleanup skipped", "ns", ns)
+		return
+	}
+	bg := metav1.DeletePropagationBackground
+	for i := range jobs.Items {
+		j := &jobs.Items[i]
+		if _, ok := j.Annotations["helm.sh/hook"]; !ok {
+			continue // not a helm hook — never ours to reap
+		}
+		if !jobFailed(j) {
+			continue // still running or succeeded — leave it
+		}
+		log.Info("ACTION: delete failed helm-hook Job",
+			"ns", ns, "job", j.Name)
+		if err := u.cs.BatchV1().Jobs(ns).Delete(ctx, j.Name,
+			metav1.DeleteOptions{PropagationPolicy: &bg}); err != nil {
+			log.Error(err, "helm-hook job delete failed", "ns", ns, "job", j.Name)
+			continue
+		}
+		metrics.HelmHookJobsCleanedTotal.WithLabelValues(ns).Inc()
+	}
+}
+
+// jobFailed reports whether the Job carries a JobFailed=True condition.
+func jobFailed(j *batchv1.Job) bool {
+	for _, c := range j.Status.Conditions {
+		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // hrReleaseName is spec.releaseName, falling back to the object name —

@@ -76,6 +76,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/etcdrescue"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/evpurge"
 )
 
 // Autofix modes — the shell *_AUTOFIX knobs are preserved verbatim:
@@ -141,6 +144,19 @@ const (
 	defaultRemediateMinRst = 30 * time.Minute // WDREM_MIN_RESTART_INTERVAL=1800
 	defaultRemediateGrace  = 90 * time.Second // WDREM_FRESH_GRACE_S=90
 	defaultPeerFile        = "/host/etc/default/k0scontroller-watchdog"
+
+	// etcdguard (embedded-etcd quota self-defence — cicd
+	// controllers; kine hosts lack <K0sDir>/bin/etcdctl and no-op).
+	defaultK0sDir          = "/host/var/lib/k0s" // DaemonSet host mount
+	defaultEtcdEndpoint    = "https://127.0.0.1:2379"
+	defaultEtcdDBSizeLimit = int64(1610612736) // 1.5 GiB
+	defaultEtcdGuardMinRun = time.Hour         // last-etcd-guard budget
+	defaultEtcdctlBudget   = 60 * time.Second  // ctx cap per etcdctl call
+	etcdctlCmdTimeout      = "30s"             // etcdctl --command-timeout
+	// eventStaleAge is the apiserver's own 1h event TTL — anything
+	// older is GC debt the purge may safely delete (fresh, debuggable
+	// events survive the guard's evpurge pass).
+	eventStaleAge = time.Hour
 )
 
 // Check names — prometheus `check` label + log context.
@@ -150,6 +166,7 @@ const (
 	checkKinePool = "kine-pool"
 	checkOOMLoop  = "oomloop"
 	checkFeeder   = "feeder"
+	checkEtcd     = "etcd-quota"
 )
 
 // State latch names — identical to the shell signal names (NPD +
@@ -170,6 +187,7 @@ const (
 	fileRateRestart   = "last-sig13-restart" // shared restart budget
 	fileRateTTLKill   = "last-ttl-restart"
 	fileRatePoolKill  = "last-kinepool-kill"
+	fileRateEtcdGuard = "last-etcd-guard" // evpurge+rescue budget
 	fileCtrGap        = "consecutive-sig13-gap"
 	fileCtrFrozen     = "consecutive-sig13-frozen"
 	fileCtrPeerFrozen = "consecutive-sig13-peer-frozen"
@@ -294,6 +312,19 @@ type Config struct {
 	RemediateFreshGrace time.Duration // G3 fresh-start grace
 	RemediatePeerFile   string        // PEER_APISERVER= override file
 
+	// EtcdGuard (embedded-etcd quota self-defence): each cycle on
+	// hosts whose K0sDir carries bin/etcdctl + pki/etcd/ca.crt —
+	// k0s embedded-etcd controllers (cicd). Kine hosts have neither
+	// file and the check is a silent no-op. Trigger = NOSPACE alarm
+	// or dbSize >= EtcdDBSizeLimit → evpurge + ONLINE-ONLY etcd
+	// rescue under the last-etcd-guard budget (the offline defrag
+	// stops k0scontroller and stays a manual action).
+	K0sDir          string // "" → /host/var/lib/k0s
+	EtcdEndpoint    string // "" → https://127.0.0.1:2379
+	EtcdDBSizeLimit int64  // dbSize trigger bytes; <=0 → 1.5 GiB
+	// EtcdGuardMinRun is the evpurge+rescue rate budget; <=0 → 1h.
+	EtcdGuardMinRun time.Duration
+
 	// HTTPClient, when set, is used for ALL apiserver queries (rv
 	// probes) and overrides the credential files — test seam.
 	HTTPClient *http.Client
@@ -310,6 +341,17 @@ type Config struct {
 	isActive  func(ctx context.Context, unit string) (string, error)
 	notifyFn  func(msg string) error
 	probeFn   func(ctx context.Context, url string) bool
+	// etcdctlFn runs `<K0sDir>/bin/etcdctl <certs> <args>` — the
+	// etcdguard probe seam (default adds the apiserver-etcd-client
+	// cert triple + --endpoints + --command-timeout and execs with
+	// ETCDCTL_API=3).
+	etcdctlFn func(ctx context.Context, args ...string) ([]byte, error)
+	// evpurgeRunFn / etcdRescueFn are the guard's remediation seams —
+	// nil → evpurge.Run / etcdrescue.Run.
+	evpurgeRunFn func(ctx context.Context, cfg evpurge.Config,
+		cutoff time.Time, out io.Writer) error
+	etcdRescueFn func(ctx context.Context, cfg etcdrescue.Config,
+		out io.Writer) error
 }
 
 func (c *Config) applyDefaults() {
@@ -511,6 +553,50 @@ func (c *Config) applyDefaults() {
 			return probeAnyCode(ctx, url, to)
 		}
 	}
+	if c.K0sDir == "" {
+		c.K0sDir = defaultK0sDir
+	}
+	if c.EtcdEndpoint == "" {
+		c.EtcdEndpoint = defaultEtcdEndpoint
+	}
+	if c.EtcdDBSizeLimit <= 0 {
+		c.EtcdDBSizeLimit = defaultEtcdDBSizeLimit
+	}
+	if c.EtcdGuardMinRun <= 0 {
+		c.EtcdGuardMinRun = defaultEtcdGuardMinRun
+	}
+	if c.etcdctlFn == nil {
+		k0sDir, endpoint := c.K0sDir, c.EtcdEndpoint
+		bin := filepath.Join(k0sDir, "bin", "etcdctl")
+		certArgs := []string{
+			// The apiserver's etcd client certs — the same triple
+			// rescue-etcd.sh uses (not the etcd server certs).
+			"--cacert=" + filepath.Join(k0sDir, "pki", "etcd", "ca.crt"),
+			"--cert=" + filepath.Join(k0sDir, "pki", "apiserver-etcd-client.crt"),
+			"--key=" + filepath.Join(k0sDir, "pki", "apiserver-etcd-client.key"),
+			"--endpoints=" + endpoint,
+			"--command-timeout=" + etcdctlCmdTimeout,
+		}
+		c.etcdctlFn = func(ctx context.Context, args ...string) ([]byte, error) {
+			argv := append(append([]string{}, certArgs...), args...)
+			cctx, cancel := context.WithTimeout(ctx, defaultEtcdctlBudget)
+			defer cancel()
+			cmd := exec.CommandContext(cctx, bin, argv...)
+			cmd.Env = append(os.Environ(), "ETCDCTL_API=3")
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				return out, fmt.Errorf("%w: %s", err,
+					strings.TrimSpace(string(out)))
+			}
+			return out, nil
+		}
+	}
+	if c.evpurgeRunFn == nil {
+		c.evpurgeRunFn = evpurge.Run
+	}
+	if c.etcdRescueFn == nil {
+		c.etcdRescueFn = etcdrescue.Run
+	}
 }
 
 // Hygiene runs the controller guards on one ticker plus the feeder
@@ -526,6 +612,11 @@ type Hygiene struct {
 	kineConns prometheus.Gauge
 	oomWindow prometheus.Gauge
 	feeding   prometheus.Gauge
+	// etcdguard gauges — only set when <K0sDir>/bin/etcdctl +
+	// pki/etcd/ca.crt exist (embedded-etcd controllers).
+	etcdDBSize  prometheus.Gauge
+	etcdDBUse   prometheus.Gauge
+	etcdNospace prometheus.Gauge
 }
 
 // ShouldRun reports whether hostRoot looks like a k0s controller
@@ -573,10 +664,26 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		Name: "node_host_agent_controllerhygiene_feeder_feeding",
 		Help: "1 while the feeder sends WATCHDOG=1 to systemd.",
 	})
+	h.etcdDBSize = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_controllerhygiene_etcd_db_size_bytes",
+		Help: "Embedded-etcd DB file size from the last etcdctl " +
+			"endpoint status probe (embedded-etcd controllers only).",
+	})
+	h.etcdDBUse = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_controllerhygiene_etcd_db_in_use_bytes",
+		Help: "Embedded-etcd DB size in use from the last etcdctl " +
+			"endpoint status probe (embedded-etcd controllers only).",
+	})
+	h.etcdNospace = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_controllerhygiene_etcd_nospace_alarm",
+		Help: "1 while the embedded etcd carries a NOSPACE alarm " +
+			"(embedded-etcd controllers only).",
+	})
 
 	if reg != nil {
 		for _, c := range []prometheus.Collector{
 			h.cycles, h.actions, h.rvGap, h.kineConns, h.oomWindow, h.feeding,
+			h.etcdDBSize, h.etcdDBUse, h.etcdNospace,
 		} {
 			if err := reg.Register(c); err != nil {
 				return nil, fmt.Errorf("register controllerhygiene metrics: %w", err)
@@ -634,6 +741,10 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// WD_REQUIRES: uptime.
 	h.checkKinePool(ctx)
 	h.checkOOMLoop(ctx)
+	// etcdguard is in the ungated group like kine-pool/oomloop — an
+	// embedded etcd that hit quota during boot needs the guard
+	// BEFORE the 20min wedge grace, and hosts without etcdctl no-op.
+	h.checkEtcdQuota(ctx)
 	// uptime gate (WD_REQUIRES: uptime unit:k0scontroller — 20min
 	// grace after boot before the destructive wedge/TTL checks).
 	if up, err := h.uptimeSeconds(); err == nil && up < minUptimeSeconds {
@@ -1257,4 +1368,177 @@ func (h *Hygiene) listRV(ctx context.Context, endpoint string, cached bool) (int
 		return 0, false
 	}
 	return rv, true
+}
+
+// --- etcdguard: embedded-etcd quota self-defence ---
+//
+// The cicd cluster runs k0s embedded etcd; it once hit the backend
+// quota (mvcc: database space exceeded — runbook
+// k0s-etcd-rescue-runbook.md) while the remedy (evpurge + compact +
+// defrag + alarm disarm) sat behind manual CLI commands. The guard
+// automates that: every cycle on hosts whose K0sDir carries
+// bin/etcdctl + pki/etcd/ca.crt (kine hosts have neither and no-op
+// silently) it reads `endpoint status -w json` + `alarm list` and
+// exports the db-size / nospace gauges. A NOSPACE alarm or dbSize >=
+// EtcdDBSizeLimit spends the last-etcd-guard budget (EtcdGuardMinRun,
+// 1h) on evpurge.Run + etcdrescue.Run with OnlineOnly — the offline
+// defrag stops k0scontroller and is NEVER a background action.
+
+// checkEtcdQuota runs one etcdguard cycle.
+func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
+	if _, err := os.Stat(filepath.Join(h.cfg.K0sDir, "bin", "etcdctl")); err != nil {
+		h.cycles.WithLabelValues(checkEtcd, "no_etcdctl").Inc()
+		return
+	}
+	if _, err := os.Stat(filepath.Join(h.cfg.K0sDir,
+		"pki", "etcd", "ca.crt")); err != nil {
+		h.cycles.WithLabelValues(checkEtcd, "no_etcd_pki").Inc()
+		return
+	}
+
+	dbSize, dbUse, err := h.etcdStatus(ctx)
+	if err != nil {
+		// etcd unreachable — nothing measurable; the wedge/feeder
+		// guards own the control-plane-down story.
+		h.cycles.WithLabelValues(checkEtcd, "status_error").Inc()
+		return
+	}
+	h.etcdDBSize.Set(float64(dbSize))
+	h.etcdDBUse.Set(float64(dbUse))
+
+	nospace, err := h.etcdNospaceArmed(ctx)
+	if err != nil {
+		// A failed alarm read must not hide a real alarm — treat
+		// the size signal as authoritative this cycle, surface the
+		// error once in the log, and LEAVE the gauge at its last
+		// value rather than force-clearing a possibly-armed alarm.
+		h.appendLogWarn(fmt.Sprintf("etcdguard: alarm list failed: %v", err))
+	} else if nospace {
+		h.etcdNospace.Set(1)
+	} else {
+		h.etcdNospace.Set(0)
+	}
+
+	var reason string
+	switch {
+	case nospace:
+		reason = "nospace-alarm"
+	case dbSize >= h.cfg.EtcdDBSizeLimit:
+		reason = fmt.Sprintf("dbSize=%d>=%d", dbSize, h.cfg.EtcdDBSizeLimit)
+	default:
+		h.cycles.WithLabelValues(checkEtcd, "ok").Inc()
+		return
+	}
+
+	if !h.rateOK(h.cfg.WatchdogStateDir, fileRateEtcdGuard,
+		h.cfg.EtcdGuardMinRun) {
+		h.appendLog(fmt.Sprintf(
+			"etcdguard: %s but in guard cooldown (<%dm), skip",
+			reason, int(h.cfg.EtcdGuardMinRun.Minutes())))
+		h.cycles.WithLabelValues(checkEtcd, "cooldown").Inc()
+		return
+	}
+	h.appendLog(fmt.Sprintf(
+		"ACTION: etcdguard %s — evpurge stale events + ONLINE-ONLY "+
+			"etcd rescue (offline defrag forbidden)", reason))
+	// Budget spent before the action — a kill mid-rescue must not
+	// allow a second run inside the window (feeder G6 parity).
+	h.rateSpend(h.cfg.WatchdogStateDir, fileRateEtcdGuard)
+	out := &guardLogWriter{h: h}
+
+	// Stale apiserver events are the classic quota-filler after a
+	// control-plane outage — purge first so the rescue's compaction
+	// has garbage to drop. Cutoff keeps the apiserver's own 1h event
+	// TTL: only GC debt is deleted, fresh events survive.
+	perr := h.cfg.evpurgeRunFn(ctx, evpurge.Config{
+		API:      "https://" + h.cfg.SelfEndpoint,
+		CAFile:   h.cfg.AdminCA,
+		CertFile: h.cfg.AdminCert,
+		KeyFile:  h.cfg.AdminKey,
+	}, h.cfg.nowFn().Add(-eventStaleAge), out)
+	out.flush()
+	if perr != nil {
+		h.appendLogWarn(fmt.Sprintf("etcdguard: evpurge failed: %v", perr))
+	}
+	rerr := h.cfg.etcdRescueFn(ctx, etcdrescue.Config{
+		K0sDir:   h.cfg.K0sDir,
+		Endpoint: h.cfg.EtcdEndpoint,
+		// OnlineOnly: this is background auto-maintenance — the
+		// systemctl-stop + standalone-etcd defrag would take the
+		// control plane down and stays a manual rescue-etcd action.
+		OnlineOnly: true,
+	}, out)
+	out.flush()
+	if rerr != nil {
+		h.appendLogWarn(fmt.Sprintf("etcdguard: rescue incomplete: %v", rerr))
+	}
+	h.actions.WithLabelValues(checkEtcd, "evpurge_rescue").Inc()
+	h.cycles.WithLabelValues(checkEtcd, "ok").Inc()
+}
+
+// etcdStatus fetches `endpoint status -w json` and returns the db
+// file size + in-use size of element[0] (same JSON shape
+// etcdrescue.parseStatusJSON consumes).
+func (h *Hygiene) etcdStatus(ctx context.Context) (dbSize, dbUse int64, err error) {
+	b, err := h.cfg.etcdctlFn(ctx, "endpoint", "status", "-w", "json")
+	if err != nil {
+		return 0, 0, err
+	}
+	var arr []struct {
+		Status struct {
+			DBSize      int64 `json:"dbSize"`
+			DBSizeInUse int64 `json:"dbSizeInUse"`
+		} `json:"Status"`
+	}
+	if err := json.Unmarshal(b, &arr); err != nil {
+		return 0, 0, fmt.Errorf("parse endpoint status: %w", err)
+	}
+	if len(arr) == 0 {
+		return 0, 0, fmt.Errorf("parse endpoint status: empty endpoint list")
+	}
+	return arr[0].Status.DBSize, arr[0].Status.DBSizeInUse, nil
+}
+
+// etcdNospaceArmed reports whether `alarm list` carries a NOSPACE
+// entry — the memberID:xxx alarm:NOSPACE grep the manual flow used.
+func (h *Hygiene) etcdNospaceArmed(ctx context.Context) (bool, error) {
+	b, err := h.cfg.etcdctlFn(ctx, "alarm", "list")
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(string(b), "NOSPACE"), nil
+}
+
+// guardLogWriter adapts the evpurge/etcdrescue io.Writer output to
+// the watchdog log — each completed line lands as its own timestamped
+// appendLog entry (the "<rfc3339> <msg>" filelog contract), prefixed
+// so the sub-command output is attributable in the NPD tail.
+type guardLogWriter struct {
+	h   *Hygiene
+	buf strings.Builder
+}
+
+func (w *guardLogWriter) Write(p []byte) (int, error) {
+	w.buf.Write(p)
+	for {
+		s := w.buf.String()
+		i := strings.IndexByte(s, '\n')
+		if i < 0 {
+			return len(p), nil
+		}
+		if line := strings.TrimSpace(s[:i]); line != "" {
+			w.h.appendLog("etcdguard: " + line)
+		}
+		w.buf.Reset()
+		w.buf.WriteString(s[i+1:])
+	}
+}
+
+// flush emits any trailing partial line — called after each sub-run
+// so a stream ending without '\n' still reaches the log.
+func (w *guardLogWriter) flush() {
+	if line := strings.TrimSpace(w.buf.String()); line != "" {
+		w.h.appendLog("etcdguard: " + line)
+	}
+	w.buf.Reset()
 }

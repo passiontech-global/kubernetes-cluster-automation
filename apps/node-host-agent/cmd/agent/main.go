@@ -575,6 +575,12 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			ExpectedKCMArgs:  envList("NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS"), // empty = defaults
 			PSIFile:          getenv("NODE_HOST_AGENT_PSI_FILE", "/proc/pressure/cpu"),
 			EgressRelays:     wdCfg.OverlayEgressRelays,
+			FilesystemTargets: func() []string {
+				if l := envList("NODE_HOST_AGENT_FILESYSTEM_TARGETS"); l != nil {
+					return l
+				}
+				return []string{hostPath("/etc"), hostPath("/var/lib/k0s"), "/var/openebs/local"}
+			}(),
 			CPUDeliveredInterval: envDuration(
 				"NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL", 2*time.Minute),
 		})
@@ -771,6 +777,9 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			NotifySocket:      os.Getenv("NOTIFY_SOCKET"),
 			FeederStateDir:    hostPath("/var/lib/k0s-systemd-watchdog"),
 			RemediatePeerFile: hostPath("/etc/default/k0scontroller-watchdog"),
+			K0sDir:            getenv("NODE_HOST_AGENT_K0S_DIR", hostPath("/var/lib/k0s")),
+			EtcdEndpoint:      getenv("NODE_HOST_AGENT_ETCD_ENDPOINT", "https://127.0.0.1:2379"),
+			EtcdDBSizeLimit:   envInt64("NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT", 0),
 		}, reg)
 		if err != nil {
 			slog.Error("controllerhygiene setup failed", "error", err)

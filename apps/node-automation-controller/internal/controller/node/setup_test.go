@@ -38,6 +38,8 @@ func TestSetupPeriodicModules(t *testing.T) {
 			func(m manager.Manager) error { return SetupDeadNodeSweeper(m, cs, testutil.StubDyn()) }},
 		{"csr-watcher", 10 * time.Minute,
 			func(m manager.Manager) error { return SetupCSRWatcher(m, cs, true) }},
+		{"pdb-deadlock-watchdog", 5 * time.Minute,
+			func(m manager.Manager) error { return SetupPDBDeadlockWatchdog(m, cs, true) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := testutil.NewStubManager()
@@ -51,8 +53,9 @@ func TestSetupPeriodicModules(t *testing.T) {
 
 // csr-watcher registers unconditionally (the flag only gates the tick
 // body, like the bash exit-early at the top of the hook), while
-// cilium-taint-reaper skips mgr.Add entirely when disabled (no
-// informer, no RequeueAfter loop).
+// cilium-taint-reaper and pdb-deadlock-watchdog skip mgr.Add entirely
+// when disabled (no informer, no RequeueAfter loop, no periodic LIST
+// against the apiserver).
 func TestSetupFeatureFlagVariants(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 
@@ -68,6 +71,14 @@ func TestSetupFeatureFlagVariants(t *testing.T) {
 	}
 	if len(m.Added) != 0 {
 		t.Fatalf("disabled module registered %d runnables, want 0", len(m.Added))
+	}
+
+	m = testutil.NewStubManager()
+	if err := SetupPDBDeadlockWatchdog(m, cs, false); err != nil {
+		t.Fatalf("disabled watchdog setup must return nil, got %v", err)
+	}
+	if len(m.Added) != 0 {
+		t.Fatalf("disabled watchdog registered %d runnables, want 0", len(m.Added))
 	}
 }
 

@@ -2,8 +2,10 @@ package sweeper
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -13,11 +15,19 @@ import (
 
 // ccPruner builds a pruner with the script defaults except chown —
 // tests run unprivileged (OwnerUID/GID -1 skips it; chmod 0777 stays).
-// mutate can shrink the size marks so the cap logic is exercisable
+// The statfs seam defaults to an error stub so the host filesystem's
+// real fill level never escalates a fixture (fail-open keeps the
+// normal limits); pressure tests inject their own via mutate, which
+// can also shrink the size marks so the cap logic is exercisable
 // without GiB fixtures.
 func ccPruner(t *testing.T, mutate func(*ConcourseCacheConfig)) *ConcourseCachePruner {
 	t.Helper()
-	cfg := ConcourseCacheConfig{OwnerUID: -1, OwnerGID: -1}
+	cfg := ConcourseCacheConfig{
+		OwnerUID: -1, OwnerGID: -1,
+		statfsFn: func(string, *syscall.Statfs_t) error {
+			return errors.New("no fs in test")
+		},
+	}
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -509,4 +519,144 @@ func TestSweepConcourseSharedCacheFunc(t *testing.T) {
 		t.Fatal(err)
 	}
 	ccMissing(t, old)
+}
+
+// ---------------------------------------------------------------------------
+// H3 — fs-pressure early trigger (max(diskUsedPct, inodeUsedPct))
+// ---------------------------------------------------------------------------
+
+// ccStatfs returns a statfsFn seam reporting the given used
+// percentages for blocks and inodes.
+func ccStatfs(diskPct, inodePct uint64) func(string, *syscall.Statfs_t) error {
+	return func(_ string, st *syscall.Statfs_t) error {
+		st.Blocks = 10000
+		st.Bfree = 10000 - diskPct*100
+		st.Files = 10000
+		st.Ffree = 10000 - inodePct*100
+		return nil
+	}
+}
+
+// The production seams default in applyDefaults: statfs →
+// syscall.Statfs, thresholds 75/85. Built without the ccPruner stub
+// so the real syscall.Statfs is exercised.
+func TestConcourseCachePressureDefaults(t *testing.T) {
+	p, err := NewConcourseCachePruner(
+		ConcourseCacheConfig{OwnerUID: -1, OwnerGID: -1},
+		prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.cfg.statfsFn == nil {
+		t.Fatal("statfsFn seam not defaulted")
+	}
+	if p.cfg.DiskHighPct != 75 || p.cfg.DiskCritPct != 85 {
+		t.Fatalf("thresholds = %v/%v, want 75/85",
+			p.cfg.DiskHighPct, p.cfg.DiskCritPct)
+	}
+	// The real statfs answers on a tmpdir — pressure is a sane
+	// reading, escalation off.
+	pct, ok := p.fsPressure(t.TempDir())
+	if !ok || pct < 0 || pct > 100 {
+		t.Fatalf("fsPressure = %v,%v, want 0..100,true", pct, ok)
+	}
+}
+
+// fsPressure reports max(used-bytes %, used-inodes %) — a low byte
+// reading must not mask inode exhaustion, and vice versa.
+func TestFSPressureMaxRatio(t *testing.T) {
+	p := ccPruner(t, func(c *ConcourseCacheConfig) {
+		c.statfsFn = ccStatfs(30, 82)
+	})
+	pct, ok := p.fsPressure(t.TempDir())
+	if !ok || pct != 82 {
+		t.Fatalf("fsPressure = %v,%v, want 82,true (inode wins)", pct, ok)
+	}
+	p.cfg.statfsFn = ccStatfs(91, 10)
+	pct, ok = p.fsPressure(t.TempDir())
+	if !ok || pct != 91 {
+		t.Fatalf("fsPressure = %v,%v, want 91,true (bytes win)", pct, ok)
+	}
+	// Statfs failure → ok=false (caller keeps normal limits).
+	p.cfg.statfsFn = func(string, *syscall.Statfs_t) error {
+		return errors.New("fs hung")
+	}
+	if _, ok := p.fsPressure(t.TempDir()); ok {
+		t.Fatal("fsPressure ok=true on statfs error")
+	}
+}
+
+// H3 early trigger: inode exhaustion alone (bytes still low) must
+// escalate the prune — here inodes at 90% cross DiskCritPct so every
+// file in the prunable buckets is eligible, even a 1h-old one that
+// the normal 72h go-build age would keep.
+func TestConcourseCacheInodePressureEarlyTrigger(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, "pvc-ino")
+	f40h := ccFile(t, filepath.Join(sc, "go-build", "f40h"), 4, 40*time.Hour)
+	f1h := ccFile(t, filepath.Join(sc, "go-build", "f1h"), 4, time.Hour)
+
+	p := ccPruner(t, func(c *ConcourseCacheConfig) {
+		c.statfsFn = ccStatfs(20, 90) // 20% bytes, 90% inodes → crit
+	})
+	if err := p.Sweep(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	ccMissing(t, f40h)
+	ccMissing(t, f1h)
+}
+
+// Byte pressure between the thresholds escalates to the high level:
+// age limits halve — a 40h file dies under the halved 36h go-build
+// limit while a 20h file survives.
+func TestConcourseCacheDiskPressureHigh(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, "pvc-hi")
+	old := ccFile(t, filepath.Join(sc, "go-build", "old"), 4, 40*time.Hour)
+	fresh := ccFile(t, filepath.Join(sc, "go-build", "fresh"), 4, 20*time.Hour)
+
+	p := ccPruner(t, func(c *ConcourseCacheConfig) {
+		c.statfsFn = ccStatfs(78, 30) // 78% bytes → high, not crit
+	})
+	if err := p.Sweep(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	ccMissing(t, old)
+	ccPresent(t, fresh)
+}
+
+// Below DiskHighPct the pressure reading changes nothing — the same
+// ages keep every file.
+func TestConcourseCachePressureUnderThreshold(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, "pvc-lo")
+	f40h := ccFile(t, filepath.Join(sc, "go-build", "f"), 4, 40*time.Hour)
+
+	p := ccPruner(t, func(c *ConcourseCacheConfig) {
+		c.statfsFn = ccStatfs(70, 60) // both under 75 → normal limits
+	})
+	if err := p.Sweep(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	ccPresent(t, f40h)
+}
+
+// A statfs failure fails open to the normal limits — escalation is
+// best-effort on top of the regular cadence prune.
+func TestConcourseCacheStatfsErrorFailsOpen(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, "pvc-err")
+	old := ccFile(t, filepath.Join(sc, "go-build", "old"), 4, 80*time.Hour)
+	f40h := ccFile(t, filepath.Join(sc, "go-build", "f40h"), 4, 40*time.Hour)
+
+	p := ccPruner(t, func(c *ConcourseCacheConfig) {
+		c.statfsFn = func(string, *syscall.Statfs_t) error {
+			return errors.New("fs hung")
+		}
+	})
+	if err := p.Sweep(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	ccMissing(t, old)  // normal 72h age still prunes
+	ccPresent(t, f40h) // 40h survives — no escalation
 }

@@ -102,6 +102,14 @@ type Config struct {
 	Svc      string // "" → k0scontroller (systemd unit stop/start)
 	// ForceOffline skips the online-defrag attempt entirely.
 	ForceOffline bool
+	// OnlineOnly forbids the offline-defrag path outright —
+	// background auto-maintenance must never stop k0scontroller.
+	// When the run still needs offline (the online defrag errored or
+	// reclaimed too little) the remaining online steps (disarm +
+	// write canary) still complete and Run returns an error noting
+	// the required manual follow-up instead of taking the downtime.
+	// Wins over ForceOffline.
+	OnlineOnly bool
 	// CallTimeout caps each spawned command's context; <=0 → 10min.
 	CallTimeout time.Duration
 
@@ -460,9 +468,17 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 	// crash-looping writes, so the decision uses dbSize vs
 	// dbSizeInUse — and a defrag error also forces offline.
 	needOffline := cfg.ForceOffline
-	if cfg.ForceOffline {
+	switch {
+	case cfg.ForceOffline && cfg.OnlineOnly:
+		// Contradictory flags — OnlineOnly is the safety promise
+		// (no control-plane stop), so it degrades the flag pair to
+		// a plain online attempt.
+		fmt.Fprintln(out, "[3/6] >>> --force-offline ignored under OnlineOnly")
+		needOffline = false
+	case cfg.ForceOffline:
 		fmt.Fprintln(out, "[3/6] >>> --force-offline: skipping online defrag")
-	} else {
+	}
+	if !needOffline {
 		fmt.Fprintln(out, "[3/6] >>> trying online defrag...")
 		if _, err := r.etcdctl(ctx, onlineDefragTimeout, "defrag"); err != nil {
 			fmt.Fprintln(out,
@@ -478,8 +494,18 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 			needOffline = true
 		}
 	}
+	offlinePending := false
 	if needOffline {
-		if err := r.offlineDefrag(ctx); err != nil {
+		if cfg.OnlineOnly {
+			// The systemctl-stop + standalone-etcd block is a
+			// planned-downtime action — never taken by a background
+			// loop. Disarm + canary still run below (they often
+			// restore writes already); the tail then reports the
+			// remaining bloat as an error.
+			fmt.Fprintln(out, ">>> ONLINE-ONLY: offline defrag "+
+				"required but forbidden — needs a manual rescue-etcd run")
+			offlinePending = true
+		} else if err := r.offlineDefrag(ctx); err != nil {
 			return err // service restart already handled by the defer
 		}
 	}
@@ -527,6 +553,10 @@ Next steps:
 - Check control-plane crash-loops: systemctl status %s
 - If the service keeps restarting: journalctl -u %s and dmesg | grep -i oom
 `, r.cfg.Svc, r.cfg.Svc)
+	if offlinePending {
+		return errors.New("etcd still bloated — offline defrag " +
+			"required (rerun rescue-etcd manually, without OnlineOnly)")
+	}
 	return nil
 }
 

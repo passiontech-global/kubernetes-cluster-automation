@@ -55,6 +55,16 @@ const (
 	ccBuildLow    = 2 << 30  //  2097152 KiB
 	ccNodeDepsHi  = 6 << 30  //  6291456 KiB
 	ccNodeDepsLow = 4 << 30  //  4194304 KiB
+
+	// Filesystem-pressure thresholds (used percent) for the H3 early
+	// trigger — see ConcourseCacheConfig.DiskHighPct/DiskCritPct.
+	ccDiskHighPct = 75
+	ccDiskCritPct = 85
+	// ccCritFloorAge bounds the crit escalation: ages collapse to
+	// this floor, not 0, so artifacts being written right now
+	// (in-flight lock files / staging dirs) survive even a crit
+	// prune. The cache is rebuildable — an active install isn't.
+	ccCritFloorAge = 5 * time.Minute
 )
 
 // ConcourseCacheConfig carries the pruner's knobs — every field maps
@@ -84,6 +94,25 @@ type ConcourseCacheConfig struct {
 	NodeDepsHighMark  int64         // du > 6GiB
 	NodeDepsLowMark   int64         // oldest <cksum> dirs to <= 4GiB
 
+	// DiskHighPct/DiskCritPct are used-percent thresholds on the
+	// filesystem holding a shared-cache — the H3 early trigger. The
+	// pressure reading is max(used bytes %, used inodes %): a cache
+	// tree of hundreds of thousands of tiny files lands ENOSPC on
+	// inode exhaustion while `df` still shows free GBs, so both
+	// readings share the one trigger.
+	//   >= DiskHighPct: escalate — every age limit halves and the
+	//     size caps engage at their LOW marks.
+	//   >= DiskCritPct: emergency — every file inside the prunable
+	//     buckets is eligible (age limits collapse to 0); the buckets
+	//     are all reconstructible caches while a full filesystem
+	//     wedges kubelet/containerd outright.
+	// A statfs failure fails open to the normal limits — the regular
+	// cadence prune is the baseline, escalation is a bonus.
+	DiskHighPct, DiskCritPct float64
+
+	// statfsFn reads filesystem stats for the pressure check — seam
+	// for tests; nil → syscall.Statfs.
+	statfsFn func(path string, st *syscall.Statfs_t) error
 	// nowFn supplies the current time — seam for tests; nil → time.Now.
 	nowFn func() time.Time
 }
@@ -137,6 +166,15 @@ func (c *ConcourseCacheConfig) applyDefaults() {
 	}
 	if c.NodeDepsLowMark <= 0 {
 		c.NodeDepsLowMark = ccNodeDepsLow
+	}
+	if c.DiskHighPct <= 0 {
+		c.DiskHighPct = ccDiskHighPct
+	}
+	if c.DiskCritPct <= 0 {
+		c.DiskCritPct = ccDiskCritPct
+	}
+	if c.statfsFn == nil {
+		c.statfsFn = syscall.Statfs
 	}
 	if c.nowFn == nil {
 		c.nowFn = time.Now
@@ -231,31 +269,99 @@ func (p *ConcourseCachePruner) pruneSharedCache(ctx context.Context, sc string) 
 		return // init-rm not done yet — nothing to prune
 	}
 	p.enforcePerms(sc)
+	eff := p.escalatedLimits(sc, log)
 
 	// go-build: stale entries + its own size cap.
-	p.pruneGoBuild(ctx, sc, log)
+	p.pruneGoBuild(ctx, sc, eff, log)
 
 	// Artifact bus: 24h files + empty dirs, then the build <key> cap.
 	for _, b := range []string{"build", "coverage"} {
-		p.pruneAgeBucket(ctx, sc, b, p.cfg.ArtifactMaxAge, true, log)
+		p.pruneAgeBucket(ctx, sc, b, eff.ArtifactMaxAge, true, log)
 	}
 	p.capTopLevelDirs(ctx, sc, "build",
-		p.cfg.BuildHighMark, p.cfg.BuildLowMark, false, log)
+		eff.BuildHighMark, eff.BuildLowMark, false, log)
 
 	// affected + ytt: 48h files, no dir cleanup.
 	for _, b := range []string{"affected", "ytt"} {
-		p.pruneAgeBucket(ctx, sc, b, p.cfg.StaleMaxAge, false, log)
+		p.pruneAgeBucket(ctx, sc, b, eff.StaleMaxAge, false, log)
 	}
 	// nx + moon task-graph caches: 7d files + empty dirs.
 	for _, b := range []string{"nx", "moon"} {
-		p.pruneAgeBucket(ctx, sc, b, p.cfg.GraphMaxAge, true, log)
+		p.pruneAgeBucket(ctx, sc, b, eff.GraphMaxAge, true, log)
 	}
 	// Scanner/tool caches: 14d files + empty dirs.
 	for _, b := range []string{"trivy", "sonar", "golangci-lint",
 		"uv", "pip", "bin", "py-tools", "bun"} {
-		p.pruneAgeBucket(ctx, sc, b, p.cfg.ToolMaxAge, true, log)
+		p.pruneAgeBucket(ctx, sc, b, eff.ToolMaxAge, true, log)
 	}
-	p.pruneNodeDeps(ctx, sc, log)
+	p.pruneNodeDeps(ctx, sc, eff, log)
+}
+
+// fsPressure returns the used percent of the filesystem holding
+// path — the max of the block and inode ratios. Inode exhaustion
+// (hundreds of thousands of tiny cache files) trips ENOSPC long
+// before the byte count looks full, so either signal must escalate
+// the prune. ok=false when statfs fails — the caller keeps the
+// normal limits.
+func (p *ConcourseCachePruner) fsPressure(path string) (pct float64, ok bool) {
+	var st syscall.Statfs_t
+	if err := p.cfg.statfsFn(path, &st); err != nil {
+		return 0, false
+	}
+	var diskPct, inodePct float64
+	// Free > total wraps uint64 to ~2^64 → a bogus ratio that would
+	// escalate to crit on a healthy fs (btrfs/XFS can report this).
+	// Saturate instead of subtracting blind.
+	if st.Blocks > 0 && st.Bfree <= st.Blocks {
+		diskPct = float64(st.Blocks-st.Bfree) / float64(st.Blocks) * 100
+	}
+	if st.Files > 0 && st.Ffree <= st.Files {
+		inodePct = float64(st.Files-st.Ffree) / float64(st.Files) * 100
+	}
+	return max(diskPct, inodePct), true
+}
+
+// escalatedLimits returns the effective prune config for one
+// shared-cache: the configured knobs unchanged under normal fs
+// pressure, tightened once DiskHighPct/DiskCritPct are crossed (see
+// their doc). Pressure is measured on sc itself — every pvc-* dir
+// could in principle sit on a different filesystem.
+func (p *ConcourseCachePruner) escalatedLimits(sc string, log *slog.Logger) ConcourseCacheConfig {
+	eff := p.cfg
+	pct, ok := p.fsPressure(sc)
+	if !ok || pct < eff.DiskHighPct {
+		return eff
+	}
+	crit := pct >= eff.DiskCritPct
+	ages := []*time.Duration{
+		&eff.GoBuildMaxAge, &eff.ArtifactMaxAge, &eff.StaleMaxAge,
+		&eff.GraphMaxAge, &eff.ToolMaxAge,
+		&eff.NodeDepsDirMaxAge, &eff.NodeDepsLockAge,
+	}
+	for _, d := range ages {
+		if crit {
+			// Emergency: nearly every file in a prunable bucket is
+			// stale. A small floor (not 0) keeps artifacts younger
+			// than ccCritFloorAge — a lock file or staging dir being
+			// written THIS minute by an in-flight install —
+			// undeletable even under crit pressure.
+			*d = ccCritFloorAge
+		} else {
+			*d /= 2 // high: prune twice as eagerly as scheduled
+		}
+	}
+	// Size caps engage at their LOW marks — under pressure the trim
+	// trigger and the trim target collapse to the low watermark.
+	eff.GoBuildHighMark = eff.GoBuildLowMark
+	eff.BuildHighMark = eff.BuildLowMark
+	eff.NodeDepsHighMark = eff.NodeDepsLowMark
+	level := "high"
+	if crit {
+		level = "crit"
+	}
+	log.Warn("fs pressure — escalating shared-cache prune",
+		"usedPct", pct, "level", level)
+	return eff
 }
 
 // enforcePerms is `chown 4294967294:4294967294 "$SC" "$SC"/* &&
@@ -283,18 +389,18 @@ func (p *ConcourseCachePruner) enforcePerms(sc string) {
 // pruneGoBuild is the go-build bucket: files older than GoBuildMaxAge
 // deleted, then oldest files trimmed until du <= GoBuildLowMark when
 // the bucket exceeds GoBuildHighMark.
-func (p *ConcourseCachePruner) pruneGoBuild(ctx context.Context, sc string, log *slog.Logger) {
+func (p *ConcourseCachePruner) pruneGoBuild(ctx context.Context, sc string, cfg ConcourseCacheConfig, log *slog.Logger) {
 	dir := filepath.Join(sc, "go-build")
 	if !isDir(dir) {
 		return
 	}
-	p.deleteOldFiles(ctx, dir, "go-build", p.cfg.GoBuildMaxAge, log)
+	p.deleteOldFiles(ctx, dir, "go-build", cfg.GoBuildMaxAge, log)
 
 	sz := int64(diskUsage(dir))
-	if sz <= p.cfg.GoBuildHighMark {
+	if sz <= cfg.GoBuildHighMark {
 		return
 	}
-	need := sz - p.cfg.GoBuildLowMark
+	need := sz - cfg.GoBuildLowMark
 	var acc int64
 	for _, f := range filesByAge(dir) {
 		if ctx.Err() != nil || acc >= need {
@@ -431,7 +537,7 @@ func (p *ConcourseCachePruner) capTopLevelDirs(ctx context.Context, sc, bucket s
 // 60m, crashed *.tmp-* staging dirs older than 60m, then the 6→4GiB
 // cap. Every rm -rf is preceded by chmod -R u+w (bun install makes
 // trees read-only).
-func (p *ConcourseCachePruner) pruneNodeDeps(ctx context.Context, sc string, log *slog.Logger) {
+func (p *ConcourseCachePruner) pruneNodeDeps(ctx context.Context, sc string, cfg ConcourseCacheConfig, log *slog.Logger) {
 	dir := filepath.Join(sc, "node-deps")
 	if !isDir(dir) {
 		return
@@ -449,7 +555,7 @@ func (p *ConcourseCachePruner) pruneNodeDeps(ctx context.Context, sc string, log
 				continue
 			}
 			info, err := e.Info()
-			if err != nil || now.Sub(info.ModTime()) <= p.cfg.NodeDepsDirMaxAge {
+			if err != nil || now.Sub(info.ModTime()) <= cfg.NodeDepsDirMaxAge {
 				continue
 			}
 			dpath := filepath.Join(dir, e.Name())
@@ -474,7 +580,7 @@ func (p *ConcourseCachePruner) pruneNodeDeps(ctx context.Context, sc string, log
 			return nil
 		}
 		info, err := d.Info()
-		if err != nil || now.Sub(info.ModTime()) <= p.cfg.NodeDepsLockAge {
+		if err != nil || now.Sub(info.ModTime()) <= cfg.NodeDepsLockAge {
 			return nil
 		}
 		if err := os.Remove(path); err == nil {
@@ -499,7 +605,7 @@ func (p *ConcourseCachePruner) pruneNodeDeps(ctx context.Context, sc string, log
 				continue
 			}
 			info, err := e.Info()
-			if err != nil || now.Sub(info.ModTime()) <= p.cfg.NodeDepsLockAge {
+			if err != nil || now.Sub(info.ModTime()) <= cfg.NodeDepsLockAge {
 				continue
 			}
 			dpath := filepath.Join(dir, e.Name())
@@ -511,7 +617,7 @@ func (p *ConcourseCachePruner) pruneNodeDeps(ctx context.Context, sc string, log
 	}
 
 	p.capTopLevelDirs(ctx, sc, "node-deps",
-		p.cfg.NodeDepsHighMark, p.cfg.NodeDepsLowMark, true, log)
+		cfg.NodeDepsHighMark, cfg.NodeDepsLowMark, true, log)
 }
 
 // ---------------------------------------------------------------------------

@@ -66,6 +66,10 @@ var logRules = []logRule{
 	{"DnsResolvStale", regexp.MustCompile(`dns-resolv-stale`)},
 	{"StuckPodForceDeleted", regexp.MustCompile(`force-delete pod `)},
 	{"PodTeardownWedged", regexp.MustCompile(`pod-teardown-wedged`)},
+	{"ClockUnsynchronized", regexp.MustCompile(`STATE-ENTER: clock-unsync|ACTION: restarting (systemd-timesyncd|chrony|chronyd)\.service`)},
+	{"ConntrackPressure", regexp.MustCompile(`STATE-ENTER: conntrack-pressure|nf_conntrack.*table full`)},
+	{"CiliumIPAMExhausted", regexp.MustCompile(`STATE-ENTER: cilium-ipam-exhausted|no more IPs available`)},
+	{"CorruptedImageRemoved", regexp.MustCompile(`ACTION: removed corrupted image`)},
 }
 
 // maxEventNote caps the Event note — the apiserver validates the

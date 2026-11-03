@@ -253,7 +253,7 @@ func fakeDiscoveryAPIServer(t *testing.T) *httptest.Server {
 
 // With a kubeconfig pointing at the fake apiserver, main() must run the
 // entire boot path — GetConfigOrDie, NewManager, clientset + dynamic
-// client, all 24 module setups, health probes, "starting manager" —
+// client, all 27 module setups, health probes, "starting manager" —
 // then block in mgr.Start. SIGINT (what SetupSignalHandler maps to ctx
 // cancel on pod termination) must unwind it to a clean exit 0.
 func TestMainStartsManagerUntilSignal(t *testing.T) {
@@ -387,6 +387,9 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		"CF_TUNNEL_WATCHDOG_NAMESPACE",
 		"CF_TUNNEL_WATCHDOG_INTERVAL",
 		"CLUSTER_HEALTH_PROBES_ENABLED",
+		"VOLUMEATTACHMENT_CLEANER_ENABLED",
+		"PDB_WATCHDOG_ENABLED",
+		"CERT_DRIFT_AUDITOR_ENABLED",
 	}
 	clear := func(t *testing.T) {
 		for _, k := range keys {
@@ -410,6 +413,10 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		if !mc.corednsPatcherEnabled || !mc.metricsServerPatcherEnabled ||
 			!mc.cfTunnelWatchdogEnabled || !mc.clusterHealthProbesEnabled {
 			t.Fatalf("expected ported modules default-on, got %+v", mc)
+		}
+		if !mc.volumeAttachmentCleanerEnabled || !mc.pdbWatchdogEnabled ||
+			!mc.certDriftAuditorEnabled {
+			t.Fatalf("expected self-healing modules default-on, got %+v", mc)
 		}
 		if mc.corednsZoneWhen != "DoNotSchedule" {
 			t.Fatalf("corednsZoneWhen = %q, want DoNotSchedule", mc.corednsZoneWhen)
@@ -479,10 +486,17 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		t.Setenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "custom-ns")
 		t.Setenv("CF_TUNNEL_WATCHDOG_INTERVAL", "10m")
 		t.Setenv("CLUSTER_HEALTH_PROBES_ENABLED", "false")
+		t.Setenv("VOLUMEATTACHMENT_CLEANER_ENABLED", "false")
+		t.Setenv("PDB_WATCHDOG_ENABLED", "false")
+		t.Setenv("CERT_DRIFT_AUDITOR_ENABLED", "false")
 		mc := moduleConfigFromEnv()
 		if mc.corednsPatcherEnabled || mc.metricsServerPatcherEnabled ||
 			mc.cfTunnelWatchdogEnabled || mc.clusterHealthProbesEnabled {
 			t.Fatalf("explicit false must disable the ported modules, got %+v", mc)
+		}
+		if mc.volumeAttachmentCleanerEnabled || mc.pdbWatchdogEnabled ||
+			mc.certDriftAuditorEnabled {
+			t.Fatalf("explicit false must disable the self-healing modules, got %+v", mc)
 		}
 		if mc.corednsZoneWhen != "ScheduleAnyway" || mc.corednsZoneMinDomains != 0 {
 			t.Fatalf("zone override not applied: %q/%d",
@@ -571,39 +585,43 @@ func stubDyn() *dynamicfake.FakeDynamicClient {
 	return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
 }
 
-// Every module registers exactly one runnable on the manager — 24 in
-// the map — except the eight gate-skippers (certmanager-reaper,
+// Every module registers exactly one runnable on the manager — 27 in
+// the map — except the eleven gate-skippers (certmanager-reaper,
 // cilium-identity-auditor, cilium-taint-reaper, fluent-bit-config-roller,
 // coredns-patcher, metrics-server-patcher, cf-tunnel-proxy-watchdog,
-// cluster-health-probes), which skip mgr.Add entirely while disabled
-// (16 runnables then). The other feature flags only gate the tick
-// body, not registration.
+// cluster-health-probes, pdb-deadlock-watchdog,
+// volumeattachment-cleaner, cert-drift-auditor), which skip mgr.Add
+// entirely while disabled (16 runnables then). The other feature flags
+// only gate the tick body, not registration.
 func TestSetupModules(t *testing.T) {
 	t.Run("all gates enabled", func(t *testing.T) {
 		m := newStubManager()
 		mc := moduleConfig{
-			ciliumEnabled:               true,
-			fluentbitEnabled:            true,
-			certReaperEnabled:           true,
-			ciliumAuditEnabled:          true,
-			esNudgeEnabled:              true,
-			csrApproveEnabled:           true,
-			concourseJanitorEnabled:     true,
-			labelerPath:                 filepath.Join(t.TempDir(), "labels.txt"),
-			corednsPatcherEnabled:       true,
-			corednsZoneWhen:             "DoNotSchedule",
-			corednsZoneMinDomains:       2,
-			metricsServerPatcherEnabled: true,
-			cfTunnelWatchdogEnabled:     true,
-			cfTunnelWatchdogNamespace:   "cloudflare-tunnel-system",
-			cfTunnelWatchdogInterval:    5 * time.Minute,
-			clusterHealthProbesEnabled:  true,
+			ciliumEnabled:                  true,
+			fluentbitEnabled:               true,
+			certReaperEnabled:              true,
+			ciliumAuditEnabled:             true,
+			esNudgeEnabled:                 true,
+			csrApproveEnabled:              true,
+			concourseJanitorEnabled:        true,
+			labelerPath:                    filepath.Join(t.TempDir(), "labels.txt"),
+			corednsPatcherEnabled:          true,
+			corednsZoneWhen:                "DoNotSchedule",
+			corednsZoneMinDomains:          2,
+			metricsServerPatcherEnabled:    true,
+			cfTunnelWatchdogEnabled:        true,
+			cfTunnelWatchdogNamespace:      "cloudflare-tunnel-system",
+			cfTunnelWatchdogInterval:       5 * time.Minute,
+			clusterHealthProbesEnabled:     true,
+			volumeAttachmentCleanerEnabled: true,
+			pdbWatchdogEnabled:             true,
+			certDriftAuditorEnabled:        true,
 		}
 		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), mc); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
-		if len(m.added) != 24 {
-			t.Fatalf("registered %d runnables, want 24", len(m.added))
+		if len(m.added) != 27 {
+			t.Fatalf("registered %d runnables, want 27", len(m.added))
 		}
 		for i, r := range m.added {
 			if r == nil {
