@@ -49,6 +49,13 @@ func getenv(key, def string) string {
 	return def
 }
 
+// parseLocalUsers splits Concourse basic auth "user:password" on the
+// first colon so passwords may contain colons.
+func parseLocalUsers(s string) (user, password string, ok bool) {
+	user, password, ok = strings.Cut(s, ":")
+	return user, password, ok && user != "" && password != ""
+}
+
 func main() {
 	var showVersion bool
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
@@ -76,10 +83,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// LOCAL_USERS carries Concourse basic auth as "user:password" —
-	// split on the first colon so passwords may contain colons.
-	user, password, ok := strings.Cut(os.Getenv("LOCAL_USERS"), ":")
-	if !ok || user == "" || password == "" {
+	// LOCAL_USERS carries Concourse basic auth as "user:password".
+	user, password, ok := parseLocalUsers(os.Getenv("LOCAL_USERS"))
+	if !ok {
 		slog.Error("LOCAL_USERS must be in 'user:password' form")
 		os.Exit(1)
 	}
@@ -110,10 +116,15 @@ func main() {
 		Addr:              getenv("LISTEN_ADDR", ":8080"),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		// WriteTimeout must cover the handler's 30s fan-out budget.
+		WriteTimeout: 45 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 	go func() {
 		<-ctx.Done()
-		_ = srv.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
 	}()
 
 	slog.Info("starting webhook-dispatcher",

@@ -6,6 +6,7 @@ package concourse
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -40,6 +41,11 @@ type Client struct {
 	// cache before a refresh; zero -> 1 minute.
 	IndexTTL time.Duration
 
+	// MinRefreshInterval bounds forced Refresh calls — zero-match
+	// deliveries for repos with no pipeline would otherwise refetch
+	// the whole index on every push. Zero -> 30 seconds.
+	MinRefreshInterval time.Duration
+
 	mu        sync.Mutex
 	index     []Resource
 	fetchedAt time.Time
@@ -57,6 +63,13 @@ func (c *Client) ttl() time.Duration {
 		return c.IndexTTL
 	}
 	return time.Minute
+}
+
+func (c *Client) minRefreshInterval() time.Duration {
+	if c.MinRefreshInterval > 0 {
+		return c.MinRefreshInterval
+	}
+	return 30 * time.Second
 }
 
 // Resources returns the repo -> resource index, served from a ~60s
@@ -84,11 +97,17 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 
 // Refresh forces an index refetch, bypassing the TTL — used when a
 // delivery matched nothing, covering a pipeline set since the last
-// fetch. A failed refresh keeps the previous index.
+// fetch. Calls are throttled to MinRefreshInterval: repos without a
+// pipeline zero-match every delivery, so an unthrottled refresh would
+// turn org-webhook volume into constant index rebuilds. A failed
+// refresh keeps the previous index.
 func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if time.Since(c.fetchedAt) < c.minRefreshInterval() {
+		return c.index, nil
+	}
 	index, err := c.fetchIndex(ctx)
 	if err != nil {
 		return nil, err
@@ -134,6 +153,11 @@ func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 			})
 		}
 	}
+	if index == nil {
+		// Keep it non-nil: a healthy empty index must still count as
+		// "fetched" for the TTL check and the stale fallback.
+		index = []Resource{}
+	}
 	return index, nil
 }
 
@@ -152,6 +176,13 @@ func (c *Client) CheckWebhook(ctx context.Context, r Resource) (int, error) {
 	}
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
+		// Do wraps transport failures in *url.Error, which embeds the
+		// full request URL — webhook_token included — and would leak
+		// the token into error logs. Return only the wrapped error.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return 0, ue.Err
+		}
 		return 0, err
 	}
 	defer resp.Body.Close()
@@ -178,6 +209,7 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
+		_, _ = io.Copy(io.Discard, resp.Body) // drain for keep-alive reuse
 		return fmt.Errorf("GET %s: unexpected status %d", path, resp.StatusCode)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
@@ -205,7 +237,21 @@ func NormalizeRepo(s string) string {
 	// from being treated as github.com.
 	if i := strings.Index(s, "github.com"); i >= 0 &&
 		(i == 0 || strings.ContainsRune("/@.", rune(s[i-1]))) {
-		s = strings.TrimLeft(s[i+len("github.com"):], ":/")
+		rest := s[i+len("github.com"):]
+		if rest != "" && rest[0] == ':' {
+			// After the colon: either an optional :port (URL form —
+			// digits immediately followed by /) or the scp-style
+			// separator itself.
+			rest = rest[1:]
+			j := 0
+			for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+				j++
+			}
+			if j > 0 && j < len(rest) && rest[j] == '/' {
+				rest = rest[j:]
+			}
+		}
+		s = strings.TrimLeft(rest, "/")
 	}
 	s = strings.TrimSuffix(s, "/")
 	s = strings.TrimSuffix(s, ".git")

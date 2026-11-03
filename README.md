@@ -10,6 +10,7 @@ one app in this workspace, alongside the per-node host agent.
 | --- | --- | --- | --- |
 | `apps/node-automation-controller` | `node-automation-controller` | Deployment (controller-runtime operator) | `ghcr.io/passiontech-global/node-automation-controller` |
 | `apps/node-host-agent` | `node-host-agent` | DaemonSet (per-node agent) | `ghcr.io/passiontech-global/node-host-agent` |
+| `apps/webhook-dispatcher` | `webhook-dispatcher` | Deployment (GitHub webhook → Concourse check fan-out) | `ghcr.io/passiontech-global/webhook-dispatcher` |
 
 ### node-automation-controller
 
@@ -60,6 +61,30 @@ serves `node_host_agent_info`/`node_host_agent_uptime_seconds` on
 graceful shutdown. Node identity comes from the downward API
 (`NODE_NAME`, `POD_NAME`, `POD_NAMESPACE`).
 
+### webhook-dispatcher
+
+Receives GitHub org webhook deliveries and fans out instant resource
+checks to the Concourse ATC — `push` deliveries check matching `git`
+resources, `pull_request` deliveries check matching `github-pr`
+resources — instead of waiting for the `check_every` polling interval.
+Deliveries are verified against `X-Hub-Signature-256` (HMAC-SHA256 over
+the raw body); a single resource failure never fails the delivery.
+
+#### Interface contract
+
+- Endpoints: `POST /webhook`, `GET /healthz` (returns `ok`).
+- Flags: `--version`.
+- Env:
+
+| Var | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `GITHUB_WEBHOOK_SECRET` | yes | — | HMAC key for `X-Hub-Signature-256` |
+| `CI_WEBHOOK_TOKEN` | yes | — | Concourse check-webhook token (`webhook_token=…`) |
+| `LOCAL_USERS` | yes | — | Concourse basic auth, `user:password` |
+| `CONCOURSE_URL` | | `http://concourse-web:8080` | ATC base URL |
+| `CONCOURSE_TEAM` | | `main` | Team to index and fan out to |
+| `LISTEN_ADDR` | | `:8080` | Listen address |
+
 ## Repository layout
 
 ```
@@ -67,6 +92,7 @@ graceful shutdown. Node identity comes from the downward API
 apps/
   node-automation-controller/  moon project (own go.mod, cliff.toml, .ko.yaml, Dockerfile)
   node-host-agent/             moon project (own go.mod, cliff.toml, .ko.yaml, Dockerfile)
+  webhook-dispatcher/          moon project (own go.mod, cliff.toml, .ko.yaml, Dockerfile)
 .github/workflows/
   ci.yml                         PR gate — moon ci on affected projects
   release-app.yml                reusable release pipeline

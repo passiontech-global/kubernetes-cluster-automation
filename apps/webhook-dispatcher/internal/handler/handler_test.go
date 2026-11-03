@@ -115,8 +115,8 @@ func TestUnhandledEventAccepted(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status=%d want 202", rec.Code)
 	}
-	if s := decodeSummary(t, rec); s.Deliveries != 1 {
-		t.Fatalf("deliveries=%d want 1", s.Deliveries)
+	if s := decodeSummary(t, rec); s.ResourcesChecked != 0 {
+		t.Fatalf("resources_checked=%d want 0", s.ResourcesChecked)
 	}
 }
 

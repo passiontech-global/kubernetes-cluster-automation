@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/webhook-dispatcher/internal/concourse"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/webhook-dispatcher/internal/verify"
@@ -49,7 +50,6 @@ type payload struct {
 
 // summary is the JSON response body for accepted deliveries.
 type summary struct {
-	Deliveries       int `json:"deliveries"`
 	ResourcesChecked int `json:"resources_checked"`
 }
 
@@ -85,7 +85,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		slog.Info("webhook delivery ignored: unhandled event",
 			"delivery", delivery, "event", event)
-		writeJSON(w, http.StatusAccepted, summary{Deliveries: 1})
+		writeJSON(w, http.StatusAccepted, summary{})
 		return
 	}
 
@@ -108,7 +108,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resources, err := h.backend.Resources(r.Context())
+	// Fan-out work runs detached from the request lifetime: GitHub
+	// abandons the connection after ~10s, which must not cancel the
+	// remaining check POSTs. A 30s budget keeps a wedged ATC from
+	// hanging the handler forever.
+	ctx, cancel := context.WithTimeout(
+		context.WithoutCancel(r.Context()), 30*time.Second)
+	defer cancel()
+
+	resources, err := h.backend.Resources(ctx)
 	if err != nil {
 		// With no index (and no stale copy) nothing can be checked —
 		// a 502 lets GitHub redeliver once the ATC is back instead of
@@ -124,7 +132,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// A pipeline set since the last index fetch may not be in the
 		// cache — force one refresh and retry the match once. No loop:
 		// a second miss is a genuine "nothing to check".
-		fresh, err := h.backend.Refresh(r.Context())
+		fresh, err := h.backend.Refresh(ctx)
 		if err != nil {
 			slog.Warn("index refresh on zero match failed — keeping prior result",
 				"delivery", delivery, "error", err)
@@ -135,7 +143,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	checked := 0
 	for _, res := range matched {
-		status, err := h.backend.CheckWebhook(r.Context(), res)
+		status, err := h.backend.CheckWebhook(ctx, res)
 		switch {
 		case err != nil:
 			slog.Error("check webhook request failed",
@@ -157,7 +165,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	slog.Info("webhook delivery dispatched",
 		"delivery", delivery, "event", event,
 		"repo", p.Repository.FullName, "resources_checked", checked)
-	writeJSON(w, http.StatusOK, summary{Deliveries: 1, ResourcesChecked: checked})
+	writeJSON(w, http.StatusOK, summary{ResourcesChecked: checked})
 }
 
 // matchResources returns the fan-out targets: resources of the
