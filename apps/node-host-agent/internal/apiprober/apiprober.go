@@ -239,6 +239,12 @@ type backend struct {
 	Name   string
 	Addr   string // ip:port for direct API queries
 	Status string // haproxy-reported status (UP, DOWN, MAINT, ...)
+	// discovered marks a real `show stat` row: Name is a HAProxy
+	// svname and Status is live. Static-merged rows leave it false —
+	// their Name is the configured API_BACKENDS name (possibly a raw
+	// addr), which may not be a svname in ANY HAProxy backend, so
+	// socket actions on it tolerate "No such server" replies.
+	discovered bool
 }
 
 // up reports whether HAProxy considers the backend usable. An
@@ -653,7 +659,10 @@ func (p *Prober) discover(ctx context.Context) ([]backend, error) {
 		// label value, or every unique name pins the multi-KB CSV on
 		// the heap forever.
 		backends = append(backends, backend{
-			Name: strings.Clone(svname), Addr: addr, Status: get("status"),
+			Name:       strings.Clone(svname),
+			Addr:       addr,
+			Status:     get("status"),
+			discovered: true,
 		})
 	}
 	if header == nil {
@@ -778,18 +787,40 @@ func withDefaultPort(addr string) string {
 
 // mergeStatic appends StaticBackends entries missing from discovery
 // as UP servers — they take traffic via their LB so they count toward
-// the drain fence like any discovered UP backend. Entries whose name
-// discovery already returned are skipped (discovery wins — it carries
-// the live HAProxy status), and so are names already appended from
-// the static set itself — the same name in both confs must not be
-// probed twice.
+// the drain fence like any discovered UP backend. Entries collapse
+// onto discovery two ways: same name (discovery wins — it carries
+// the live HAProxy status) and same normalized addr — the same
+// physical apiserver must be tracked ONCE: a second identity keyed
+// by its raw addr is probed twice per cycle under its own counters
+// and, when wedged, drains under a name HAProxy does not know
+// (`disable server <backend>/<addr>` → "No such server" on every
+// cycle — incident: API_BACKENDS carries bare "ip:port" entries that
+// name themselves). Static-vs-static duplicates collapse the same
+// way: named entries claim their addr first, so a bare self-named
+// "ip:port" entry never shadows a configured name for the same
+// apiserver; within each class first entry wins (ordering decides
+// precedence, see refreshGuard).
 func mergeStatic(backends []backend, static []StaticBackend) []backend {
 	seen := make(map[string]bool, len(backends))
+	seenAddr := make(map[string]bool, len(backends))
 	for _, b := range backends {
 		seen[b.Name] = true
+		seenAddr[withDefaultPort(b.Addr)] = true
 	}
+	appendStatic := func(sb StaticBackend) {
+		addr := withDefaultPort(sb.Addr)
+		if seen[sb.Name] || seenAddr[addr] {
+			return
+		}
+		seen[sb.Name] = true
+		seenAddr[addr] = true
+		backends = append(backends, backend{
+			Name: sb.Name, Addr: addr, Status: "UP",
+		})
+	}
+	var bare []StaticBackend
 	for _, sb := range static {
-		if sb.Name == "" || sb.Addr == "" || seen[sb.Name] {
+		if sb.Name == "" || sb.Addr == "" {
 			continue
 		}
 		// Char-spray guard: a jinja-scalar var that resolved to a
@@ -799,45 +830,90 @@ func mergeStatic(backends []backend, static []StaticBackend) []backend {
 			strings.ContainsAny(sb.Name+sb.Addr, " \t'\"[]{}(),") {
 			continue
 		}
-		seen[sb.Name] = true
-		backends = append(backends, backend{
-			Name: sb.Name, Addr: withDefaultPort(sb.Addr), Status: "UP",
-		})
+		// Bare "ip:port" API_BACKENDS entries parse self-named
+		// (Name == Addr — watchdogconf parity). Hold them back so a
+		// configured name for the same addr claims it first.
+		if sb.Name == sb.Addr {
+			bare = append(bare, sb)
+			continue
+		}
+		appendStatic(sb)
+	}
+	for _, sb := range bare {
+		appendStatic(sb)
 	}
 	return backends
+}
+
+// actionTarget resolves the HAProxy server name a guard action must
+// use for backend b, and whether the resolved name is a svname of
+// the primary backend. Discovered rows name themselves; a
+// static-merged entry that shadows a discovered addr resolves to
+// that row's svname — an addr is never a valid svname. A
+// static-only name returns (name, false): absent from the primary
+// backend, so a "No such server" reply there is an expected no-op
+// (the name may still exist on a companion backend — the action is
+// still issued there).
+func actionTarget(b backend, svnameByAddr map[string]string) (svname string, inPrimary bool) {
+	if b.discovered {
+		return b.Name, true
+	}
+	if sv, ok := svnameByAddr[withDefaultPort(b.Addr)]; ok {
+		return sv, true
+	}
+	return b.Name, false
 }
 
 // haproxyServer issues "<action> server <backend>/<name>" on the admin
 // socket for every backend in [BackendName]+CompanionBackends —
 // api-backend-guard.sh's haproxy_srv parity (a wedged controller is
-// drained on every lane it serves). A "No such server" reply on a
-// companion backend is ignored (the server simply doesn't exist
-// there); an error on the primary backend always propagates.
-func (p *Prober) haproxyServer(ctx context.Context, action, name string) error {
+// drained on every lane it serves, and the shell ignored every
+// reply). Only the PRIMARY backend's result propagates as an error:
+// a companion socket/reply failure is Warn-logged and tolerated — it
+// must not veto a drain the primary already applied, or the prober
+// would forget it drained and retry-fail every cycle (the incident
+// shape). "No such server" replies are no-ops everywhere: on
+// companions always (the server may not exist there) and on the
+// primary when tolerateMissingPrimary is set — for names the caller
+// knows are not svnames of the primary backend (static-only
+// API_BACKENDS entries), where the miss is expected, not an error
+// worth retrying.
+func (p *Prober) haproxyServer(ctx context.Context, action, name string,
+	tolerateMissingPrimary bool) error {
 	backends := append([]string{p.eff.backend}, p.eff.companions...)
-	var firstErr error
 	for i, be := range backends {
 		out, err := p.socketCmd(ctx,
 			fmt.Sprintf("%s server %s/%s", action, be, name))
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
+			if i == 0 {
+				return err
 			}
+			slog.Warn("haproxy companion backend command failed — tolerated",
+				"command", action, "backend", be, "server", name,
+				"error", err, "subsystem", "apiprober")
 			continue
 		}
 		// "No such server" or permission errors come back as text —
 		// an empty reply means success on HAProxy >= 2.x. Companions
 		// may legitimately not carry this server (no-op in the shell).
-		if s := strings.TrimSpace(out); s != "" {
-			if i > 0 && strings.Contains(s, "No such server") {
-				continue
-			}
-			if firstErr == nil {
-				firstErr = fmt.Errorf("%s server %s/%s: %s", action, be, name, s)
-			}
+		s := strings.TrimSpace(out)
+		if s == "" {
+			continue
 		}
+		if i > 0 {
+			if !strings.Contains(s, "No such server") {
+				slog.Warn("haproxy companion backend rejected command — tolerated",
+					"command", action, "backend", be, "server", name,
+					"reply", s, "subsystem", "apiprober")
+			}
+			continue
+		}
+		if strings.Contains(s, "No such server") && tolerateMissingPrimary {
+			continue
+		}
+		return fmt.Errorf("%s server %s/%s: %s", action, be, name, s)
 	}
-	return firstErr
+	return nil
 }
 
 // --- watchdog state files (module 34 parity) ---
@@ -1001,7 +1077,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 	// by hostconfig mid-run applies NOW, not after a restart.
 	p.refreshGuard()
 
-	backends, err := p.discover(ctx)
+	discovered, err := p.discover(ctx)
 	if err != nil {
 		log.Error("cannot discover backends from HAProxy socket",
 			"socket", p.eff.socket, "error", err)
@@ -1011,7 +1087,18 @@ func (p *Prober) Cycle(ctx context.Context) {
 	// Merge API_BACKENDS-style static entries — covers backends whose
 	// `show stat` addr column is empty (external API LB VMs) and
 	// apiservers the local HAProxy does not list.
-	backends = mergeStatic(backends, p.statics())
+	backends := mergeStatic(discovered, p.statics())
+	// svnameByAddr maps a discovered addr to its HAProxy svname —
+	// the socket action target must be the svname, never an addr key
+	// (incident: `disable server api_local_back/147.93.159.255:6443`
+	// → "No such server" retried every cycle).
+	svnameByAddr := make(map[string]string, len(discovered))
+	for _, d := range discovered {
+		addr := withDefaultPort(d.Addr)
+		if _, ok := svnameByAddr[addr]; !ok {
+			svnameByAddr[addr] = d.Name
+		}
+	}
 	p.backendCount.Set(float64(len(backends)))
 	p.cycles.WithLabelValues("ok").Inc()
 
@@ -1131,9 +1218,11 @@ func (p *Prober) Cycle(ctx context.Context) {
 				// externally — reconciled the same way).
 				if st.ok >= p.eff.recoverC {
 					if p.eff.mode == ModeEnforce {
-						if err := p.haproxyServer(ctx, "enable", b.Name); err != nil {
+						svname, inPrimary := actionTarget(b, svnameByAddr)
+						if err := p.haproxyServer(ctx, "enable",
+							svname, !inPrimary); err != nil {
 							log.Error("enable via HAProxy socket failed",
-								"backend", b.Name, "error", err)
+								"backend", b.Name, "server", svname, "error", err)
 						} else {
 							st.drained = false
 							st.ok = 0
@@ -1171,6 +1260,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 	for _, name := range names {
 		st := p.states[name]
 		b := statusByName[name]
+		svname, inPrimary := actionTarget(b, svnameByAddr)
 		if wdir != "" {
 			// Wedged/dead this cycle → state_enter parity (the latch
 			// gates 06-kubelet-watch-wedge's k0sworker restart).
@@ -1181,10 +1271,15 @@ func (p *Prober) Cycle(ctx context.Context) {
 			// disables (socket state is not persistent). Re-apply
 			// while HAProxy reports the server usable again; the
 			// recovery path above re-enables via the drained flag.
-			if p.eff.mode == ModeEnforce && b.up() {
-				if err := p.haproxyServer(ctx, "disable", name); err != nil {
+			// Only discovered rows can show UP again — a static-only
+			// backend is a constant "UP" with no HAProxy state to
+			// forget, so re-applying would just repeat the socket
+			// command every cycle.
+			if p.eff.mode == ModeEnforce && b.discovered && b.up() {
+				if err := p.haproxyServer(ctx, "disable",
+					svname, !inPrimary); err != nil {
 					log.Error("re-apply disable failed",
-						"backend", name, "error", err)
+						"backend", name, "server", svname, "error", err)
 				} else {
 					log.Info("ACTION: re-applied disable — HAProxy forgot drained server",
 						"backend", name)
@@ -1203,9 +1298,10 @@ func (p *Prober) Cycle(ctx context.Context) {
 			continue
 		}
 		if p.eff.mode == ModeEnforce {
-			if err := p.haproxyServer(ctx, "disable", name); err != nil {
+			if err := p.haproxyServer(ctx, "disable",
+				svname, !inPrimary); err != nil {
 				log.Error("disable via HAProxy socket failed",
-					"backend", name, "error", err)
+					"backend", name, "server", svname, "error", err)
 				continue
 			}
 			st.drained = true
@@ -1216,8 +1312,18 @@ func (p *Prober) Cycle(ctx context.Context) {
 			fresh--
 			p.actions.WithLabelValues(name, "disable").Inc()
 			log.Info("ACTION: disabled backend — watch-cache wedge",
-				"backend", name, "haproxyBackend", p.eff.backend,
+				"backend", name, "server", svname,
+				"haproxyBackend", p.eff.backend,
 				"freshRemaining", fresh)
+			if !inPrimary {
+				// The name is not a svname of the primary backend
+				// (static-only API_BACKENDS entry): the action was
+				// issued to every configured backend but only a
+				// companion could have carried it — the primary
+				// "No such server" was a no-op, not a drain.
+				log.Warn("backend is not a server of the primary HAProxy backend — drain reached companion backends only",
+					"backend", name, "haproxyBackend", p.eff.backend)
+			}
 		} else {
 			log.Info("DRY-RUN: would disable backend — watch-cache wedge",
 				"backend", name, "freshRemaining", fresh)
@@ -1245,7 +1351,8 @@ func (p *Prober) Cycle(ctx context.Context) {
 		if wantVIPDisable {
 			if p.eff.mode == ModeEnforce {
 				if !st.drained || vip.up() {
-					if err := p.haproxyServer(ctx, "disable", vip.Name); err != nil {
+					if err := p.haproxyServer(ctx, "disable",
+						vip.Name, false); err != nil {
 						log.Error("disable VIP via HAProxy socket failed",
 							"backend", vip.Name, "error", err)
 						continue
@@ -1263,7 +1370,8 @@ func (p *Prober) Cycle(ctx context.Context) {
 			}
 		} else if st.drained || vip.maint() {
 			if p.eff.mode == ModeEnforce {
-				if err := p.haproxyServer(ctx, "enable", vip.Name); err != nil {
+				if err := p.haproxyServer(ctx, "enable",
+					vip.Name, false); err != nil {
 					log.Error("enable VIP via HAProxy socket failed",
 						"backend", vip.Name, "error", err)
 					continue

@@ -33,10 +33,12 @@ type fakeHAProxy struct {
 	servers  map[string]string
 	order    []string
 	disabled map[string]bool
-	// failReply maps a two-word command prefix ("enable server") to a
-	// reply body — a non-empty reply makes the prober treat the command
-	// as failed and the server table is left untouched (like a real
-	// HAProxy "No such server" rejection).
+	// failReply maps a command to a reply body — the full command
+	// string first ("disable server kube_apiserver/hub1" for a
+	// per-server failure), then the two-word prefix ("enable server")
+	// for a blanket one. A non-empty reply makes the prober treat the
+	// command as failed and the server table is left untouched (like
+	// a real HAProxy "No such server" rejection).
 	failReply map[string]string
 }
 
@@ -104,7 +106,11 @@ func (f *fakeHAProxy) handle(conn net.Conn) {
 	// real HAProxy, empty reply = success.
 	parts := strings.Fields(cmd)
 	if len(parts) >= 2 {
-		if reply, fail := f.failReply[parts[0]+" "+parts[1]]; fail {
+		reply, fail := f.failReply[cmd]
+		if !fail {
+			reply, fail = f.failReply[parts[0]+" "+parts[1]]
+		}
+		if fail {
 			io.WriteString(conn, reply)
 			return
 		}
@@ -768,9 +774,34 @@ func TestHaproxyServerReplyHandling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = p.haproxyServer(context.Background(), "disable", "hub1")
+	err = p.haproxyServer(context.Background(), "disable", "hub1", false)
 	if err == nil || !strings.Contains(err.Error(), "No such server") {
 		t.Fatalf("haproxyServer err=%v want reply text in error", err)
+	}
+
+	// tolerateMissingPrimary downgrades the primary's "No such server"
+	// to a no-op — the contract for names known-absent from the
+	// primary backend (static-only API_BACKENDS entries).
+	p, err = New(Config{
+		DialSocket: pipeDial("No such server\n"),
+		HTTPClient: newAPIStub(t).srv.Client(),
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.haproxyServer(context.Background(), "disable", "ghost", true); err != nil {
+		t.Fatalf("haproxyServer tolerated-missing err=%v want nil", err)
+	}
+	// Other reply text is still an error even when tolerated.
+	p, err = New(Config{
+		DialSocket: pipeDial("permission denied\n"),
+		HTTPClient: newAPIStub(t).srv.Client(),
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.haproxyServer(context.Background(), "disable", "ghost", true); err == nil {
+		t.Fatal("haproxyServer tolerated non-'No such server' reply — want error")
 	}
 
 	// Empty reply → success (HAProxy >= 2.x semantics).
@@ -781,7 +812,7 @@ func TestHaproxyServerReplyHandling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.haproxyServer(context.Background(), "disable", "hub1"); err != nil {
+	if err := p.haproxyServer(context.Background(), "disable", "hub1", false); err != nil {
 		t.Fatalf("haproxyServer empty-reply err=%v want nil", err)
 	}
 }
@@ -1168,7 +1199,7 @@ func TestHaproxyServerSocketError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.haproxyServer(context.Background(), "disable", "hub1"); err == nil {
+	if err := p.haproxyServer(context.Background(), "disable", "hub1", false); err == nil {
 		t.Fatal("haproxyServer with dead socket want error")
 	}
 }
@@ -2349,6 +2380,73 @@ func TestMergeStaticDedupsStaticNames(t *testing.T) {
 	}
 }
 
+func TestMergeStaticDedupsByAddr(t *testing.T) {
+	// The production incident shape: discovery returns the HAProxy
+	// svname for an addr that API_BACKENDS also carries as a bare
+	// self-named "ip:port" entry — the same physical apiserver must
+	// be tracked ONCE under its svname, or the addr-keyed twin
+	// drains under a name HAProxy does not know.
+	merged := mergeStatic(
+		[]backend{
+			{Name: "api_contabo_ctrl", Addr: "147.93.159.255:6443",
+				Status: "UP", discovered: true},
+			{Name: "api_datahub_ctrl", Addr: "103.186.101.25:6443",
+				Status: "UP", discovered: true},
+		},
+		[]StaticBackend{
+			// worker API_BACKENDS = bare apiserver_probe_backends
+			// addrs — both are already discovered under svnames.
+			{Name: "147.93.159.255:6443", Addr: "147.93.159.255:6443"},
+			{Name: "103.186.101.25:6443", Addr: "103.186.101.25:6443"},
+			{Name: "api_contabo_ctrl", Addr: "147.93.159.255:6443"}, // name dedup too
+			{Name: "ghost", Addr: "10.9.9.9:6443"},                  // genuinely absent
+		})
+	if len(merged) != 3 {
+		t.Fatalf("merged=%v want 3 (2 discovered + ghost)", merged)
+	}
+	if merged[2].Name != "ghost" || merged[2].discovered {
+		t.Fatalf("merged[2]=%+v want undiscovered ghost", merged[2])
+	}
+}
+
+func TestMergeStaticPrefersConfiguredNameOverBareAddr(t *testing.T) {
+	// Static-vs-static same-addr: the configured name claims the
+	// identity even when the bare self-named entry is listed first
+	// — the addr is never the preferred key.
+	merged := mergeStatic(nil, []StaticBackend{
+		{Name: "10.0.0.1:6443", Addr: "10.0.0.1:6443"}, // bare, listed first
+		{Name: "ctrl1", Addr: "10.0.0.1:6443"},
+	})
+	if len(merged) != 1 || merged[0].Name != "ctrl1" {
+		t.Fatalf("merged=%v want [ctrl1] — named entry must win the addr", merged)
+	}
+}
+
+func TestActionTarget(t *testing.T) {
+	byAddr := map[string]string{"10.0.0.1:6443": "api_ctrl1"}
+	cases := []struct {
+		b        backend
+		wantName string
+		wantPrim bool
+	}{
+		{backend{Name: "api_ctrl1", Addr: "10.0.0.1:6443", discovered: true},
+			"api_ctrl1", true},
+		// Non-discovered row shadowing a discovered addr → the real
+		// svname, never the addr key.
+		{backend{Name: "10.0.0.1:6443", Addr: "10.0.0.1:6443"},
+			"api_ctrl1", true},
+		// Static-only name — absent from the primary backend.
+		{backend{Name: "ghost", Addr: "10.9.9.9:6443"}, "ghost", false},
+	}
+	for _, tc := range cases {
+		name, prim := actionTarget(tc.b, byAddr)
+		if name != tc.wantName || prim != tc.wantPrim {
+			t.Fatalf("actionTarget(%+v) = %q,%v want %q,%v",
+				tc.b, name, prim, tc.wantName, tc.wantPrim)
+		}
+	}
+}
+
 func TestMergeStaticDefaultPort(t *testing.T) {
 	// Bare-IP API_BACKENDS entry → bash default port 443; without it
 	// every TCP preflight failed "missing port in address" → the
@@ -2478,5 +2576,99 @@ FAIL_CYCLES=4
 	}
 	if got := p.staticAddr("ctl1"); got != "10.0.0.9:443" {
 		t.Fatalf("staticAddr=%q want conf addr + :443", got)
+	}
+}
+
+func TestAddrKeyedStaticDoesNotDuplicateDiscoveredBackend(t *testing.T) {
+	// The reported incident: API_BACKENDS on workers carries bare
+	// apiserver_probe_backends addrs ("147.93.159.255:6443") while
+	// api-local-lb serves the same addrs under svnames
+	// (api_contabo_ctrl). The bare entry must collapse onto the
+	// discovered row — never a second probe identity, and the drain
+	// must use the HAProxy svname.
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"api_contabo_ctrl", bad.addr()},
+		[2]string{"api_datahub_ctrl", good.addr()},
+	)
+	p := fixtureExt(t, ha, ModeEnforce, nil, func(c *Config) {
+		c.StaticBackends = []StaticBackend{
+			{Name: bad.addr(), Addr: bad.addr()},   // bare ip:port
+			{Name: good.addr(), Addr: good.addr()}, // bare ip:port
+		}
+	})
+
+	bad.set(100, 200) // frozen wedge
+	good.set(500, 500)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+
+	if !hasCmd(ha.commands(), "disable server kube_apiserver/api_contabo_ctrl") {
+		t.Fatalf("disable must use the HAProxy svname, cmds=%v", ha.commands())
+	}
+	addrCmd := "disable server kube_apiserver/" + bad.addr()
+	if hasCmd(ha.commands(), addrCmd) {
+		t.Fatalf("disable issued under the addr key %q — 'No such server' bug, cmds=%v",
+			bad.addr(), ha.commands())
+	}
+	if _, ok := p.states[bad.addr()]; ok {
+		t.Fatal("addr-keyed phantom backend got its own probe state")
+	}
+	if got := testutil.ToFloat64(p.backendCount); got != 2 {
+		t.Fatalf("backendCount=%v want 2 (addr-keyed static deduped)", got)
+	}
+}
+
+func TestStaticOnlyBackendMissingServerDrainOnce(t *testing.T) {
+	// A static-only backend (API_BACKENDS entry absent from every
+	// HAProxy backend) going stale: the primary replies "No such
+	// server" — the expected no-op — so the drain is recorded once
+	// and NOT retried as an error every cycle.
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t, [2]string{"hub2", good.addr()})
+	ha.failReply = map[string]string{
+		"disable server kube_apiserver/ghost": "No such server.\n",
+		"enable server kube_apiserver/ghost":  "No such server.\n",
+	}
+	p := fixtureExt(t, ha, ModeEnforce, nil, func(c *Config) {
+		c.StaticBackends = []StaticBackend{{Name: "ghost", Addr: bad.addr()}}
+	})
+
+	bad.set(100, 200) // frozen wedge
+	good.set(500, 500)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	if !hasCmd(ha.commands(), "disable server kube_apiserver/ghost") {
+		t.Fatalf("disable never attempted, cmds=%v", ha.commands())
+	}
+	if !p.states["ghost"].drained {
+		t.Fatal("ghost not marked drained — tolerated 'No such server' must not block the drain record")
+	}
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("ghost", "disable")); got != 1 {
+		t.Fatalf("actions disable=%v want 1", got)
+	}
+
+	// Still wedged for several more cycles — the missing-server
+	// drain must not retry/spam the socket every round.
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	if got := countCmd(ha.commands(), "disable server kube_apiserver/ghost"); got != 1 {
+		t.Fatalf("disable re-issued %d times for an absent server, cmds=%v",
+			got, ha.commands())
+	}
+
+	// Recovery: the tolerated "No such server" enable clears the
+	// drained flag the same way.
+	for i := 0; i < 3; i++ {
+		bad.set(300+int64(i), 300)
+		p.Cycle(context.Background())
+	}
+	if p.states["ghost"].drained {
+		t.Fatal("drained flag not cleared after tolerated enable")
 	}
 }
