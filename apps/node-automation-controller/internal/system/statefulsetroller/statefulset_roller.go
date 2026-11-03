@@ -1,0 +1,365 @@
+// statefulset-ondelete-roller — C2, the opt-in sequential Pod
+// updater for StatefulSets that deliberately use
+// spec.updateStrategy.type=OnDelete.
+//
+// OnDelete exists so stateful workloads (databases, clustered
+// middleware) only restart one member at a time under operator
+// control — but it also means `k0s`/Flux template changes land and
+// then sit forever: status.updateRevision diverges from
+// status.currentRevision and NOTHING reconciles it until someone
+// deletes a pod by hand. Clusters have carried stale STS revisions
+// for weeks this way.
+//
+// Opt-in only: the module only touches StatefulSets annotated
+// node.ops/auto-roll-ondelete="true" — an unannotated OnDelete set is
+// a deliberate manual-roll policy, not a forgotten one.
+//
+// Per 10m sweep, for each opted-in StatefulSet:
+//
+//   - Track when status.updateRevision != status.currentRevision
+//     began in an in-memory ledger; act only after >= 30m of
+//     CONTINUOUS drift (a flux apply that reverts itself, a
+//     mid-rollout status flap, or an operator restart all re-arm
+//     the window — the conservative side is intentional).
+//   - Safety gates, ALL required before any delete:
+//     1. every Node Ready=True and none spec.unschedulable;
+//     2. every PodDisruptionBudget in the namespace matching the
+//     candidate pod's labels has status.disruptionsAllowed >= 1
+//     (eviction would refuse the disruption anyway — a 0 means
+//     the workload is already mid-maintenance or misconfigured,
+//     so hands off);
+//     3. every Pod the StatefulSet owns is Ready=True and the
+//     newest pod has been Ready continuously for >= 5m (a fresh
+//     replacement that just came up must settle before the next
+//     member goes down).
+//   - Then delete exactly ONE pod: the highest ordinal still
+//     carrying the OLD controller-revision-hash — ordinal order
+//     mirrors StatefulSet's own update order (highest first) and
+//     one-at-a-time keeps the disruption inside any sane PDB.
+//
+// Deleting increments
+// node_automation_statefulset_ondelete_pods_rolled_total{namespace,
+// statefulset}.
+package statefulsetroller
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/kubernetes"
+	ctrl "sigs.k8s.io/controller-runtime"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+)
+
+const (
+	stsOnDeleteRollerQueue    = "statefulset-ondelete-roller"
+	stsOnDeleteRollerInterval = 10 * time.Minute
+	// stsAutoRollAnno is the opt-in switch — only annotated
+	// StatefulSets are ever rolled.
+	stsAutoRollAnno = "node.ops/auto-roll-ondelete"
+	// stsOnDeleteDriftMin: updateRevision must differ from
+	// currentRevision continuously for this long before the roller
+	// acts — a self-correcting apply or a slow-but-working rollout
+	// never triggers a pod delete.
+	stsOnDeleteDriftMin = 30 * time.Minute
+	// stsOnDeleteStableMin: the newest pod must have held
+	// Ready=True this long before the next member may go down —
+	// the post-replacement settle window.
+	stsOnDeleteStableMin = 5 * time.Minute
+	// stsRevisionHashLabel is the pod label the StatefulSet
+	// controller stamps with the owning ControllerRevision.
+	stsRevisionHashLabel = "controller-revision-hash"
+)
+
+type statefulSetOnDeleteRoller struct {
+	cs kubernetes.Interface
+	// nowFn is the clock seam — tests pin it so the 30m drift and
+	// 5m stability windows are deterministic. nil → time.Now.
+	nowFn func() time.Time
+	mu    sync.Mutex
+	// driftSince records when each "ns/name" StatefulSet's
+	// updateRevision != currentRevision drift was FIRST observed —
+	// any cycle where the revisions agree, the set leaves, or the
+	// opt-in annotation drops prunes the entry, restarting the 30m
+	// window (same first-seen convention as pdb-deadlock-watchdog).
+	driftSince map[string]time.Time
+}
+
+// Setup registers the 10-minute sweep.
+// Disabled clusters (STATEFULSET_ONDELETE_ROLLER_ENABLED=false) skip
+// registration entirely — same contract as cert-drift-auditor.
+func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
+	if !enabled {
+		logf.Log.WithName(stsOnDeleteRollerQueue).Info("disabled — module not registered")
+		return nil
+	}
+	r := &statefulSetOnDeleteRoller{cs: cs, nowFn: time.Now,
+		driftSince: map[string]time.Time{}}
+	return shared.AddPeriodic(mgr, stsOnDeleteRollerQueue, stsOnDeleteRollerInterval, r.run)
+}
+
+func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
+	log := logf.FromContext(ctx)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Lazily arm the zero-value struct — unit tests construct the
+	// roller literally without the Setup path.
+	if r.nowFn == nil {
+		r.nowFn = time.Now
+	}
+	if r.driftSince == nil {
+		r.driftSince = map[string]time.Time{}
+	}
+
+	stsList, err := r.cs.AppsV1().StatefulSets(metav1.NamespaceAll).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list statefulsets: %w", err)
+	}
+
+	now := r.nowFn()
+	// drifting collects the "ns/name" keys whose revision drift held
+	// THIS cycle — the prune pass below treats anything else in
+	// driftSince as settled, gone, or de-opted.
+	drifting := map[string]bool{}
+	type candidate struct {
+		idx int
+		key string
+	}
+	var due []candidate
+	for i := range stsList.Items {
+		sts := &stsList.Items[i]
+		key := sts.Namespace + "/" + sts.Name
+		if sts.Spec.UpdateStrategy.Type != "OnDelete" ||
+			sts.Annotations[stsAutoRollAnno] != "true" ||
+			sts.Status.UpdateRevision == "" ||
+			sts.Status.UpdateRevision == sts.Status.CurrentRevision {
+			continue // not opted in, not OnDelete, or no drift
+		}
+		drifting[key] = true
+		first, ok := r.driftSince[key]
+		if !ok {
+			// First sighting — open the continuity window; the
+			// roller waits out the full 30m before acting.
+			r.driftSince[key] = now
+			continue
+		}
+		if now.Sub(first) >= stsOnDeleteDriftMin {
+			due = append(due, candidate{idx: i, key: key})
+		}
+	}
+	for k := range r.driftSince {
+		if !drifting[k] {
+			delete(r.driftSince, k)
+		}
+	}
+	if len(due) == 0 {
+		log.Info("sweep done — no opted-in StatefulSet past the drift window")
+		return nil
+	}
+
+	// Gate 1 is cluster-wide — evaluate once for every due
+	// StatefulSet (a cluster failing it skips them all anyway).
+	nodes, err := shared.ListNodes(ctx, r.cs)
+	if err != nil {
+		return fmt.Errorf("list nodes (safety gate): %w", err)
+	}
+	nodesSafe := len(nodes) > 0
+	for i := range nodes {
+		if !shared.NodeReady(&nodes[i]) || nodes[i].Spec.Unschedulable {
+			nodesSafe = false
+			break
+		}
+	}
+	if !nodesSafe {
+		log.Info("cluster not safe for pod deletes — deferring all OnDelete rolls",
+			"due", len(due))
+		return nil
+	}
+
+	rolled := 0
+	for _, d := range due {
+		sts := &stsList.Items[d.idx]
+		if err := r.rollOne(ctx, sts, now, log); err != nil {
+			// Per-STS failures must not starve the rest — tolerated
+			// sub-operation failure, counted here so the nil return
+			// still leaves a trace.
+			log.Error(err, "ondelete roll failed", "statefulset", d.key)
+			metrics.IncError(stsOnDeleteRollerQueue)
+			continue
+		}
+		rolled++
+	}
+	log.Info("sweep done", "due", len(due), "rolled", rolled)
+	return nil
+}
+
+// rollOne applies gates 2+3 to one StatefulSet and deletes exactly
+// one stale pod when they hold. A gate failure is a skip, not an
+// error — only API/validation failures return one.
+func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
+	sts *appsv1.StatefulSet, now time.Time, log logr.Logger) error {
+
+	pods, err := r.ownedPods(ctx, sts)
+	if err != nil {
+		return err
+	}
+	if len(pods) == 0 {
+		return nil // nothing to roll
+	}
+
+	// Gate 3: every owned pod Ready, the newest one stable >= 5m —
+	// the settle window that keeps a slow-Ready replacement from
+	// collapsing the set one delete after another.
+	newest := pods[0]
+	for _, p := range pods {
+		if !podReadySince(p, now, 0) {
+			log.Info("skip: owned pod not Ready",
+				"statefulset", sts.Namespace+"/"+sts.Name,
+				"pod", p.Name)
+			return nil
+		}
+		if p.CreationTimestamp.After(newest.CreationTimestamp.Time) {
+			newest = p
+		}
+	}
+	if !podReadySince(newest, now, stsOnDeleteStableMin) {
+		log.Info("skip: newest pod not yet stable",
+			"statefulset", sts.Namespace+"/"+sts.Name,
+			"pod", newest.Name,
+			"stableFor", stsOnDeleteStableMin)
+		return nil
+	}
+
+	// Find the highest-ordinal pod still on the OLD revision — the
+	// StatefulSet controller's own update order runs ordinals from
+	// highest down to 0.
+	var candidate *corev1.Pod
+	candidateOrd := -1
+	for _, p := range pods {
+		if p.Labels[stsRevisionHashLabel] == sts.Status.UpdateRevision {
+			continue // already on the new revision
+		}
+		ord, ok := podOrdinal(sts.Name, p.Name)
+		if !ok {
+			continue
+		}
+		if ord > candidateOrd {
+			candidate, candidateOrd = p, ord
+		}
+	}
+	if candidate == nil {
+		return nil // every pod already on the new revision — status lags
+	}
+
+	// Gate 2: every PDB in the namespace selecting this pod must
+	// allow a disruption — a 0 means the workload is already at its
+	// floor and eviction would refuse the delete anyway.
+	pdbs, err := r.cs.PolicyV1().PodDisruptionBudgets(sts.Namespace).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w",
+			sts.Namespace, err)
+	}
+	for i := range pdbs.Items {
+		pdb := &pdbs.Items[i]
+		sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+		if err != nil {
+			log.Info("WARN: PDB selector unparseable — treating as matching (fail closed)",
+				"pdb", pdb.Namespace+"/"+pdb.Name, "error", err)
+			sel = labels.Everything()
+		}
+		if !sel.Matches(labels.Set(candidate.Labels)) {
+			continue
+		}
+		if pdb.Status.DisruptionsAllowed < 1 {
+			log.Info("skip: matching PDB allows no disruption",
+				"statefulset", sts.Namespace+"/"+sts.Name,
+				"pdb", pdb.Name,
+				"disruptionsAllowed", pdb.Status.DisruptionsAllowed)
+			return nil
+		}
+	}
+
+	log.Info("DELETE: roll OnDelete StatefulSet — highest stale ordinal",
+		"statefulset", sts.Namespace+"/"+sts.Name,
+		"pod", candidate.Name,
+		"updateRevision", sts.Status.UpdateRevision,
+		"currentRevision", sts.Status.CurrentRevision)
+	if err := r.cs.CoreV1().Pods(sts.Namespace).
+		Delete(ctx, candidate.Name, metav1.DeleteOptions{}); err != nil {
+		return fmt.Errorf("delete pod %s/%s: %w", sts.Namespace, candidate.Name, err)
+	}
+	metrics.StatefulSetOnDeletePodsRolledTotal.
+		WithLabelValues(sts.Namespace, sts.Name).Inc()
+	return nil
+}
+
+// ownedPods lists the pods the StatefulSet controls — matched by the
+// controller ownerReference (name+kind, not UID: fake clients and
+// hand-built fixtures rarely carry matching UIDs). Pods already
+// terminating are excluded: they are never delete candidates (the
+// delete is already in flight) and they must not block the all-Ready
+// gate either — a member wedged in Terminating (finalizer, lost
+// node) would pin the roll forever, while a real mid-deletion
+// disruption is still caught by the PDB gate's disruptionsAllowed.
+func (r *statefulSetOnDeleteRoller) ownedPods(ctx context.Context,
+	sts *appsv1.StatefulSet) ([]*corev1.Pod, error) {
+	list, err := r.cs.CoreV1().Pods(sts.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list pods in %s: %w", sts.Namespace, err)
+	}
+	var out []*corev1.Pod
+	for i := range list.Items {
+		p := &list.Items[i]
+		if !p.DeletionTimestamp.IsZero() {
+			continue
+		}
+		ref := metav1.GetControllerOf(p)
+		if ref != nil && ref.Kind == "StatefulSet" && ref.Name == sts.Name {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// podOrdinal parses the trailing ordinal out of "<stsName>-<N>".
+func podOrdinal(stsName, podName string) (int, bool) {
+	suffix := strings.TrimPrefix(podName, stsName+"-")
+	if suffix == podName {
+		return 0, false
+	}
+	n, err := strconv.Atoi(suffix)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// podReadySince reports whether the pod's Ready condition is True AND
+// has been so for at least minAge. A missing or timestamp-less Ready
+// condition reports false — an unverifiable age is not a settled pod.
+func podReadySince(p *corev1.Pod, now time.Time, minAge time.Duration) bool {
+	for _, c := range p.Status.Conditions {
+		if c.Type != corev1.PodReady {
+			continue
+		}
+		if c.Status != corev1.ConditionTrue || c.LastTransitionTime.IsZero() {
+			return false
+		}
+		return now.Sub(c.LastTransitionTime.Time) >= minAge
+	}
+	return false
+}

@@ -24,7 +24,7 @@
 //     .spec.replicas untouched so standalone CPA can be re-enabled.
 //   - The ported kuberhealthy HealthChecks are default-ON too:
 //     CLUSTER_HEALTH_PROBES_ENABLED / _INTERVAL plus the per-check
-//     HEALTH_* knobs (see internal/controller/health/cluster_health_probes.go).
+//     HEALTH_* knobs (see internal/clusterhealthprobes/cluster_health_probes.go).
 package main
 
 import (
@@ -50,12 +50,38 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/apiserver"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/health"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/integration"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/janitor"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/node"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/system"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/apiserver/apiserverendpointguard"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/apiserver/apiserviceguard"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/apiserver/webhookguard"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/clusterhealthprobes"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/certdriftauditor"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/certmanagerreaper"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/ciliumidentityauditor"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/externalsecretnudge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/helmreleaseunlocker"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/velerobackupauditor"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/concoursejanitor"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/cronjobcatchup"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/evictedpodjanitor"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/failedjobsjanitor"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/orphanendpointslicecleaner"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/volumeattachmentcleaner"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/zombiesidecarreaper"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/ciliumtaintreaper"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/csrwatcher"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/deadnodesweeper"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/deschedulerstormgate"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/kubeletreaper"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/nodelabeler"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/partitionevictor"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/pdbdeadlockwatchdog"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/cftunnelproxywatchdog"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/corednspatcher"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/corednswatchdog"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/fluentbitroller"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/konnectivitypatcher"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/metricsserverpatcher"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/statefulsetroller"
 )
 
 var version = "dev"
@@ -177,7 +203,7 @@ func main() {
 				},
 				// cilium component Role: pods in kube-system — informer is
 				// only started when CILIUM_TAINT_REAPER_ENABLED=true (see
-				// SetupCiliumTaintReaper, which now returns nil before
+				// Setup, which now returns nil before
 				// registering when disabled), so clusters without the
 				// component (and thus without pods watch RBAC) never open
 				// this watch. No other module watches Pods.
@@ -201,11 +227,11 @@ func main() {
 	// clientset is built: the guard writes the deprecated corev1
 	// Endpoints object deliberately on hosted planes, and installing
 	// the handler on the shared config lets
-	// SetupAPIServerEndpointGuard reuse THIS clientset instead of
+	// Setup reuse THIS clientset instead of
 	// cloning cfg into a second one — which would duplicate the
 	// http.Transport and its TLS connection pool just to silence one
 	// warning header.
-	cfg.WarningHandler = apiserver.NewEndpointGuardWarningHandler()
+	cfg.WarningHandler = apiserverendpointguard.NewWarningHandler()
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		log.Error(err, "unable to create clientset")
@@ -331,7 +357,7 @@ func moduleConfigFromEnv() moduleConfig {
 			5*time.Minute),
 		// The kuberhealthy checker Pods ran always-on — default-ON
 		// here too; the HEALTH_* check knobs are read inside the
-		// prober package (SetupClusterHealthProber).
+		// prober package (Setup).
 		clusterHealthProbesEnabled: os.Getenv("CLUSTER_HEALTH_PROBES_ENABLED") != "false",
 		// The self-healing / gray-failure defense modules default ON
 		// like the ported CronJobs — an explicit "false" opts a
@@ -353,80 +379,79 @@ func moduleConfigFromEnv() moduleConfig {
 func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, mc moduleConfig) error {
 	log := ctrl.Log.WithName("main")
 	for name, setup := range map[string]func() error{
-		// internal/controller/system — kube-system component patchers
-		// and watchdogs.
-		"konnectivity-patcher":     func() error { return system.SetupKonnectivityPatcher(mgr, cs) },
-		"fluent-bit-config-roller": func() error { return system.SetupFluentBitRoller(mgr, cs, mc.fluentbitEnabled) },
-		"coredns-stale-watchdog":   func() error { return system.SetupCoreDNSWatchdog(mgr, cs) },
+		// kube-system component patchers and watchdogs.
+		"konnectivity-patcher":     func() error { return konnectivitypatcher.Setup(mgr, cs) },
+		"fluent-bit-config-roller": func() error { return fluentbitroller.Setup(mgr, cs, mc.fluentbitEnabled) },
+		"coredns-stale-watchdog":   func() error { return corednswatchdog.Setup(mgr, cs) },
 		"coredns-patcher": func() error {
-			return system.SetupCoreDNSPatcher(mgr, cs,
+			return corednspatcher.Setup(mgr, cs,
 				mc.corednsPatcherEnabled, mc.corednsZoneWhen, mc.corednsZoneMinDomains,
 				mc.corednsMinReplicas, mc.corednsNodesPerReplica)
 		},
 		"metrics-server-patcher": func() error {
-			return system.SetupMetricsServerPatcher(mgr, cs, mc.metricsServerPatcherEnabled,
+			return metricsserverpatcher.Setup(mgr, cs, mc.metricsServerPatcherEnabled,
 				mc.metricsServerMinReplicas, mc.metricsServerNodesPerReplica)
 		},
 		"cf-tunnel-proxy-watchdog": func() error {
-			return system.SetupCFTunnelProxyWatchdog(mgr, cs,
+			return cftunnelproxywatchdog.Setup(mgr, cs,
 				mc.cfTunnelWatchdogEnabled, mc.cfTunnelWatchdogNamespace,
 				mc.cfTunnelWatchdogInterval)
 		},
 		"statefulset-ondelete-roller": func() error {
-			return system.SetupStatefulSetOnDeleteRoller(mgr, cs, mc.statefulSetRollerEnabled)
+			return statefulsetroller.Setup(mgr, cs, mc.statefulSetRollerEnabled)
 		},
 
-		// internal/controller/node — node lifecycle and health sweeps.
-		"cilium-taint-reaper":     func() error { return node.SetupCiliumTaintReaper(mgr, cs, mc.ciliumEnabled) },
-		"descheduler-storm-gate":  func() error { return node.SetupDeschedulerStormGate(mgr, cs, dyn) },
-		"node-labeler":            func() error { return node.SetupNodeLabeler(mgr, cs, mc.labelerPath) },
-		"kubelet-liveness-reaper": func() error { return node.SetupKubeletReaper(mgr, cs) },
-		"partition-pod-evictor":   func() error { return node.SetupPartitionEvictor(mgr, cs) },
-		"dead-node-sweeper":       func() error { return node.SetupDeadNodeSweeper(mgr, cs, dyn) },
-		"csr-watcher":             func() error { return node.SetupCSRWatcher(mgr, cs, mc.csrApproveEnabled) },
-		"pdb-deadlock-watchdog":   func() error { return node.SetupPDBDeadlockWatchdog(mgr, cs, mc.pdbWatchdogEnabled) },
+		// Node lifecycle and health sweeps.
+		"cilium-taint-reaper":     func() error { return ciliumtaintreaper.Setup(mgr, cs, mc.ciliumEnabled) },
+		"descheduler-storm-gate":  func() error { return deschedulerstormgate.Setup(mgr, cs, dyn) },
+		"node-labeler":            func() error { return nodelabeler.Setup(mgr, cs, mc.labelerPath) },
+		"kubelet-liveness-reaper": func() error { return kubeletreaper.Setup(mgr, cs) },
+		"partition-pod-evictor":   func() error { return partitionevictor.Setup(mgr, cs) },
+		"dead-node-sweeper":       func() error { return deadnodesweeper.Setup(mgr, cs, dyn) },
+		"csr-watcher":             func() error { return csrwatcher.Setup(mgr, cs, mc.csrApproveEnabled) },
+		"pdb-deadlock-watchdog":   func() error { return pdbdeadlockwatchdog.Setup(mgr, cs, mc.pdbWatchdogEnabled) },
 
-		// internal/controller/apiserver — apiserver integrity guards.
-		"admission-webhook-guard":  func() error { return apiserver.SetupWebhookGuard(mgr, cs) },
-		"apiserver-endpoint-guard": func() error { return apiserver.SetupAPIServerEndpointGuard(mgr, cs) },
+		// apiserver integrity guards.
+		"admission-webhook-guard":  func() error { return webhookguard.Setup(mgr, cs) },
+		"apiserver-endpoint-guard": func() error { return apiserverendpointguard.Setup(mgr, cs) },
 		"apiservice-guard": func() error {
-			return apiserver.SetupAPIServiceGuard(mgr, cs, dyn, mc.apiServiceGuardEnabled)
+			return apiserviceguard.Setup(mgr, cs, dyn, mc.apiServiceGuardEnabled)
 		},
 
-		// internal/controller/janitor — resource cleanup sweeps.
-		"failed-jobs-janitor": func() error { return janitor.SetupFailedJobsJanitor(mgr, cs) },
-		"evicted-pod-janitor": func() error { return janitor.SetupEvictedPodJanitor(mgr, cs) },
-		"cronjob-catchup":     func() error { return janitor.SetupCronJobCatchup(mgr, cs) },
+		// Resource cleanup sweeps.
+		"failed-jobs-janitor": func() error { return failedjobsjanitor.Setup(mgr, cs) },
+		"evicted-pod-janitor": func() error { return evictedpodjanitor.Setup(mgr, cs) },
+		"cronjob-catchup":     func() error { return cronjobcatchup.Setup(mgr, cs) },
 		"concourse-workdir-janitor": func() error {
-			return janitor.SetupConcourseWorkdirJanitor(mgr, cs, dyn,
+			return concoursejanitor.Setup(mgr, cs, dyn,
 				mc.concourseJanitorEnabled)
 		},
 		"volumeattachment-cleaner": func() error {
-			return janitor.SetupVolumeAttachmentCleaner(mgr, cs, mc.volumeAttachmentCleanerEnabled)
+			return volumeattachmentcleaner.Setup(mgr, cs, mc.volumeAttachmentCleanerEnabled)
 		},
 		"zombie-sidecar-reaper": func() error {
-			return janitor.SetupZombieSidecarReaper(mgr, cs, dyn, mc.zombieSidecarReaperEnabled)
+			return zombiesidecarreaper.Setup(mgr, cs, dyn, mc.zombieSidecarReaperEnabled)
 		},
 		"orphan-endpointslice-cleaner": func() error {
-			return janitor.SetupOrphanEndpointSliceCleaner(mgr, cs, dyn, mc.orphanEndpointSliceEnabled)
+			return orphanendpointslicecleaner.Setup(mgr, cs, dyn, mc.orphanEndpointSliceEnabled)
 		},
 
-		// internal/controller/integration — third-party controller
-		// unstuckers (dynamic client / CRD types).
-		"helmrelease-unlocker":    func() error { return integration.SetupHelmReleaseUnlocker(mgr, cs, dyn) },
-		"externalsecret-nudge":    func() error { return integration.SetupExternalSecretNudge(mgr, cs, dyn, mc.esNudgeEnabled) },
-		"certmanager-reaper":      func() error { return integration.SetupCertManagerReaper(mgr, cs, dyn, mc.certReaperEnabled) },
-		"cilium-identity-auditor": func() error { return integration.SetupCiliumIdentityAuditor(mgr, cs, dyn, mc.ciliumAuditEnabled) },
+		// Third-party controller unstuckers (dynamic client /
+		// CRD types).
+		"helmrelease-unlocker":    func() error { return helmreleaseunlocker.Setup(mgr, cs, dyn) },
+		"externalsecret-nudge":    func() error { return externalsecretnudge.Setup(mgr, cs, dyn, mc.esNudgeEnabled) },
+		"certmanager-reaper":      func() error { return certmanagerreaper.Setup(mgr, cs, dyn, mc.certReaperEnabled) },
+		"cilium-identity-auditor": func() error { return ciliumidentityauditor.Setup(mgr, cs, dyn, mc.ciliumAuditEnabled) },
 		"cert-drift-auditor": func() error {
-			return integration.SetupCertDriftAuditor(mgr, cs, dyn, mc.certDriftAuditorEnabled)
+			return certdriftauditor.Setup(mgr, cs, dyn, mc.certDriftAuditorEnabled)
 		},
 		"velero-backup-auditor": func() error {
-			return integration.SetupVeleroBackupAuditor(mgr, cs, dyn, mc.veleroBackupAuditorEnabled)
+			return velerobackupauditor.Setup(mgr, cs, dyn, mc.veleroBackupAuditorEnabled)
 		},
 
-		// internal/controller/health — cluster health probes.
+		// Cluster health probes.
 		"cluster-health-probes": func() error {
-			return health.SetupClusterHealthProber(mgr, cs,
+			return clusterhealthprobes.Setup(mgr, cs,
 				mc.clusterHealthProbesEnabled)
 		},
 	} {

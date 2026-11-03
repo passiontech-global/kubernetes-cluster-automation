@@ -56,7 +56,7 @@ var healthCheckSecondsSinceSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts
 
 // ---------------------------------------------------------------------------
 // Self-healing / gray-failure defense metrics (Quick-Wins + C1-C6).
-// Exported so the domain packages under internal/controller drive the
+// Exported so the module packages under internal/<domain>/ drive the
 // vectors directly.
 // ---------------------------------------------------------------------------
 

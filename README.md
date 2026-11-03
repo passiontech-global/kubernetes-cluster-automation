@@ -24,7 +24,11 @@ forks, no hook ConfigMap. The image is `distroless/static:nonroot`
 
 #### Modules
 
-All modules are grouped under `internal/controller/` by domain package.
+Each module is its own package under `internal/<domain>/` (one
+package per module, grouped by domain — same convention as
+`node-host-agent`). Shared machinery lives in `internal/shared`, test
+fakes/builders in `internal/testutil`, metric vectors in
+`internal/metrics`.
 Queue names below are what `shell_operator_hook_run_errors_total{queue}` /
 `node_automation_reconcile_errors_total{controller}` report.
 
