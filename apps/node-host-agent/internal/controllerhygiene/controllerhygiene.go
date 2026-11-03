@@ -54,6 +54,7 @@
 package controllerhygiene
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -371,8 +372,8 @@ type Config struct {
 	probeFn   func(ctx context.Context, url string) bool
 	// etcdctlFn runs `<K0sDir>/bin/etcdctl <certs> <args>` — the
 	// etcdguard probe seam (default adds the apiserver-etcd-client
-	// cert triple + --endpoints + --command-timeout and execs with
-	// ETCDCTL_API=3).
+	// cert triple + --endpoints + --command-timeout; stdout-only —
+	// stderr captured separately so -w json parses).
 	etcdctlFn func(ctx context.Context, args ...string) ([]byte, error)
 	// evpurgeRunFn / etcdRescueFn are the guard's remediation seams —
 	// nil → evpurge.Run / etcdrescue.Run.
@@ -613,11 +614,16 @@ func (c *Config) applyDefaults() {
 			cctx, cancel := context.WithTimeout(ctx, defaultEtcdctlBudget)
 			defer cancel()
 			cmd := exec.CommandContext(cctx, bin, argv...)
-			cmd.Env = append(os.Environ(), "ETCDCTL_API=3")
-			out, err := cmd.CombinedOutput()
+			// etcdctl >=3.7 warns "unrecognized environment variable
+			// ETCDCTL_API" on stderr — v3 is the default API anyway.
+			// stderr is kept separate because -w json output must
+			// parse; CombinedOutput would poison the payload.
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			out, err := cmd.Output()
 			if err != nil {
 				return out, fmt.Errorf("%w: %s", err,
-					strings.TrimSpace(string(out)))
+					strings.TrimSpace(stderr.String()))
 			}
 			return out, nil
 		}
@@ -1120,6 +1126,9 @@ func journalctl(ctx context.Context, unit string, since time.Time) (string, erro
 func (h *Hygiene) journalText(ctx context.Context, since time.Time) string {
 	out, err := h.cfg.journalFn(ctx, h.cfg.JournalUnit, since)
 	if err != nil {
+		h.appendLogWarn(fmt.Sprintf(
+			"controllerhygiene: journal read failed (unit=%s): %v — journal checks see 0 hits",
+			h.cfg.JournalUnit, err))
 		return ""
 	}
 	return out
@@ -1251,7 +1260,13 @@ func (h *Hygiene) ensureClient() *http.Client {
 		return h.client
 	}
 	c, err := h.buildClient()
-	if err != nil || c == nil {
+	if err != nil {
+		h.appendLogWarn(fmt.Sprintf(
+			"controllerhygiene: apiserver credential load failed: %v — wedge checks blind this cycle",
+			err))
+		return nil
+	}
+	if c == nil {
 		return nil
 	}
 	if h.client != nil {
@@ -1395,6 +1410,9 @@ func (h *Hygiene) listRV(ctx context.Context, endpoint string, cached bool) (int
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		slog.Warn("controllerhygiene: rv probe failed",
+			"endpoint", endpoint, "cached", cached, "error", err,
+			"subsystem", "controllerhygiene")
 		return 0, false
 	}
 	defer resp.Body.Close()
@@ -1404,6 +1422,9 @@ func (h *Hygiene) listRV(ctx context.Context, endpoint string, cached bool) (int
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
+		slog.Warn("controllerhygiene: rv probe non-200",
+			"endpoint", endpoint, "cached", cached,
+			"status", resp.StatusCode, "subsystem", "controllerhygiene")
 		return 0, false
 	}
 	var list struct {
@@ -1453,6 +1474,9 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	if err != nil {
 		// etcd unreachable — nothing measurable; the wedge/feeder
 		// guards own the control-plane-down story.
+		h.appendLogWarn(fmt.Sprintf(
+			"etcdguard: endpoint status failed (endpoint=%s): %v — quota check skipped",
+			h.cfg.EtcdEndpoint, err))
 		h.cycles.WithLabelValues(checkEtcd, "status_error").Inc()
 		return
 	}

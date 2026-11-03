@@ -72,9 +72,10 @@ const (
 	canaryKey = "/__rescue_canary"
 )
 
-// CmdRunner executes `name args...` and returns combined stdout — the
-// single exec seam (etcdctl + systemctl). The default wires
-// exec.CommandContext with ETCDCTL_API=3 in the environment.
+// CmdRunner executes `name args...` and returns stdout with stderr
+// captured separately — the single exec seam (etcdctl + systemctl).
+// The default wires exec.CommandContext; ETCDCTL_API is NOT set
+// (etcdctl >=3.7 warns on it and v3 is the default anyway).
 type CmdRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
 // TempEtcd is a started standalone-etcd child process.
@@ -138,11 +139,16 @@ func (c *Config) applyDefaults() {
 	if c.CmdRunner == nil {
 		c.CmdRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			cmd := exec.CommandContext(ctx, name, args...)
-			cmd.Env = append(os.Environ(), "ETCDCTL_API=3")
-			out, err := cmd.CombinedOutput()
+			// etcdctl >=3.7 warns "unrecognized environment variable
+			// ETCDCTL_API" on stderr — v3 is the default API anyway.
+			// stderr is kept separate: -w json output must parse, so
+			// CombinedOutput would poison the payload.
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			out, err := cmd.Output()
 			if err != nil {
 				return out, fmt.Errorf("%w: %s", err,
-					strings.TrimSpace(string(out)))
+					strings.TrimSpace(stderr.String()))
 			}
 			return out, nil
 		}
@@ -415,7 +421,9 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 		return fmt.Errorf("start standalone etcd: %w", terr)
 	}
 	if herr := r.waitHealthy(ctx, tempEtcdHealthTries); herr != nil {
-		_ = tmp.Kill() // SIGTERM — still give it the grace before reap
+		if kerr := tmp.Kill(); kerr != nil { // SIGTERM — grace before reap
+			fmt.Fprintf(r.out, "(kill standalone etcd: %v)\n", kerr)
+		}
 		_ = tmp.Wait()
 		return fmt.Errorf("standalone etcd never came up: %w", herr)
 	}
