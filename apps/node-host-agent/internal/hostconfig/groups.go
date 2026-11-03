@@ -1053,7 +1053,7 @@ func (c *cyc) groupWatchdog() {
 // for every backend, apiserver_lb_vip = name of the first *_lb
 // backend. Explicit non-empty var resolutions win over derivation.
 func (c *cyc) apilbWatchdogVars() (probeBackends []string, lbServers, lbVIP string) {
-	probeBackends = c.vs("apiserver_probe_backends")
+	probeBackends = strListVar(c, "apiserver_probe_backends")
 	lbServers = c.v("apiserver_lb_servers")
 	lbVIP = c.v("apiserver_lb_vip")
 	needPB := len(probeBackends) == 0
@@ -1091,6 +1091,34 @@ func (c *cyc) apilbWatchdogVars() (probeBackends []string, lbServers, lbVIP stri
 	}
 	lbVIP = vip
 	return probeBackends, lbServers, lbVIP
+}
+
+// strListVar reads a list-ish var safely: a real YAML list returns
+// its elements, but a jinja scalar that rendered to a STRING must not
+// go through Vars.List — toIter iterates strings rune-by-rune,
+// spraying "a b c" into single chars (the API_BACKENDS char bug).
+// String scalars split on whitespace (also strips []'"" repr chars).
+func strListVar(c *cyc, name string) []string {
+	if l := c.vl(name); len(l) > 0 {
+		var out []string
+		garbage := false
+		for _, it := range l {
+			s, _ := it.(string)
+			out = append(out, s)
+			if len(s) <= 1 {
+				garbage = true
+			}
+		}
+		if !garbage {
+			return out
+		}
+	}
+	raw := c.v(name)
+	if raw == "" || raw == "None" {
+		return nil
+	}
+	return strings.FieldsFunc(strings.Trim(raw, `[]'"`),
+		func(r rune) bool { return r == ' ' || r == ',' || r == '\'' || r == '"' || r == '[' || r == ']' })
 }
 
 func nodeIPStr(m *topology.OMap, key string) string {

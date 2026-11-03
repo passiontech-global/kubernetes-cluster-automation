@@ -283,8 +283,6 @@ func (r *Reporter) emitEvent(ctx context.Context, reason, note string) error {
 				"count":            e.count + 1,
 				"lastObservedTime": metav1.NewMicroTime(now),
 			},
-			"deprecatedCount":         e.count + 1,
-			"deprecatedLastTimestamp": metav1.NewTime(now),
 		})
 		if err == nil {
 			_, err = events.Patch(ctx, e.name, types.MergePatchType,
@@ -310,17 +308,15 @@ func (r *Reporter) emitEvent(ctx context.Context, reason, note string) error {
 		Type:                corev1.EventTypeWarning,
 		ReportingController: "node-host-agent",
 		ReportingInstance:   r.cfg.NodeName,
+		// events.k8s.io/v1 validation: action is REQUIRED and the
+		// deprecated* compat fields must be UNSET (apiserver rejects
+		// with "needs to be unset" on this k8s version).
+		Action: reason,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
 			Kind:       "Node",
 			Name:       r.cfg.NodeName,
 		},
-		// Deprecated fields keep `kubectl get events` SOURCE/LAST SEEN/
-		// COUNT columns populated on older kubectl versions.
-		DeprecatedSource:         corev1.EventSource{Component: "node-host-agent", Host: r.cfg.NodeName},
-		DeprecatedFirstTimestamp: metav1.NewTime(now),
-		DeprecatedLastTimestamp:  metav1.NewTime(now),
-		DeprecatedCount:          1,
 	}
 	created, err := events.Create(ctx, ev, metav1.CreateOptions{})
 	if err != nil {
