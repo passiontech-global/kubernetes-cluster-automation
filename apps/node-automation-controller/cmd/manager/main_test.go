@@ -507,11 +507,11 @@ func TestModuleConfigFromEnv(t *testing.T) {
 	})
 }
 
-// stubManager mirrors the one in internal/controller/setup_test.go:
+// stubManager mirrors testutil.StubManager:
 // Add appends to `added` (addErr injects a registration failure), and
 // only GetScheme/GetControllerOptions/GetLogger return anything
 // meaningful because those are the only getters the builder and
-// addPeriodic call — source.TypedKind only stores the cache until
+// AddPeriodic call — source.TypedKind only stores the cache until
 // Start (never invoked), so nil cache/client/mapper are safe, but the
 // scheme MUST be real: apiutil.GVKForObject resolves at build time.
 var _ manager.Manager = (*stubManager)(nil)

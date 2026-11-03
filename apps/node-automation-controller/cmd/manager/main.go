@@ -24,7 +24,7 @@
 //     .spec.replicas untouched so standalone CPA can be re-enabled.
 //   - The ported kuberhealthy HealthChecks are default-ON too:
 //     CLUSTER_HEALTH_PROBES_ENABLED / _INTERVAL plus the per-check
-//     HEALTH_* knobs (see internal/controller/cluster_health_probes.go).
+//     HEALTH_* knobs (see internal/controller/health/cluster_health_probes.go).
 package main
 
 import (
@@ -50,7 +50,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/apiserver"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/health"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/integration"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/janitor"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/node"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/controller/system"
 )
 
 var version = "dev"
@@ -200,7 +205,7 @@ func main() {
 	// cloning cfg into a second one — which would duplicate the
 	// http.Transport and its TLS connection pool just to silence one
 	// warning header.
-	cfg.WarningHandler = controller.NewEndpointGuardWarningHandler()
+	cfg.WarningHandler = apiserver.NewEndpointGuardWarningHandler()
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		log.Error(err, "unable to create clientset")
@@ -311,45 +316,58 @@ func moduleConfigFromEnv() moduleConfig {
 func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, mc moduleConfig) error {
 	log := ctrl.Log.WithName("main")
 	for name, setup := range map[string]func() error{
-		"konnectivity-patcher":     func() error { return controller.SetupKonnectivityPatcher(mgr, cs) },
-		"cilium-taint-reaper":      func() error { return controller.SetupCiliumTaintReaper(mgr, cs, mc.ciliumEnabled) },
-		"descheduler-storm-gate":   func() error { return controller.SetupDeschedulerStormGate(mgr, cs) },
-		"node-labeler":             func() error { return controller.SetupNodeLabeler(mgr, cs, mc.labelerPath) },
-		"fluent-bit-config-roller": func() error { return controller.SetupFluentBitRoller(mgr, cs, mc.fluentbitEnabled) },
-		"coredns-stale-watchdog":   func() error { return controller.SetupCoreDNSWatchdog(mgr, cs) },
-		"kubelet-liveness-reaper":  func() error { return controller.SetupKubeletReaper(mgr, cs) },
-		"admission-webhook-guard":  func() error { return controller.SetupWebhookGuard(mgr, cs) },
-		"partition-pod-evictor":    func() error { return controller.SetupPartitionEvictor(mgr, cs) },
-		"failed-jobs-janitor":      func() error { return controller.SetupFailedJobsJanitor(mgr, cs) },
-		"dead-node-sweeper":        func() error { return controller.SetupDeadNodeSweeper(mgr, cs, dyn) },
-		"helmrelease-unlocker":     func() error { return controller.SetupHelmReleaseUnlocker(mgr, cs, dyn) },
-		"externalsecret-nudge":     func() error { return controller.SetupExternalSecretNudge(mgr, cs, dyn, mc.esNudgeEnabled) },
-		"evicted-pod-janitor":      func() error { return controller.SetupEvictedPodJanitor(mgr, cs) },
-		"cronjob-catchup":          func() error { return controller.SetupCronJobCatchup(mgr, cs) },
-		"certmanager-reaper":       func() error { return controller.SetupCertManagerReaper(mgr, cs, dyn, mc.certReaperEnabled) },
-		"cilium-identity-auditor":  func() error { return controller.SetupCiliumIdentityAuditor(mgr, cs, dyn, mc.ciliumAuditEnabled) },
-		"csr-watcher":              func() error { return controller.SetupCSRWatcher(mgr, cs, mc.csrApproveEnabled) },
-		"apiserver-endpoint-guard": func() error { return controller.SetupAPIServerEndpointGuard(mgr, cs) },
-		"concourse-workdir-janitor": func() error {
-			return controller.SetupConcourseWorkdirJanitor(mgr, cs,
-				mc.concourseJanitorEnabled)
-		},
+		// internal/controller/system — kube-system component patchers
+		// and watchdogs.
+		"konnectivity-patcher":     func() error { return system.SetupKonnectivityPatcher(mgr, cs) },
+		"fluent-bit-config-roller": func() error { return system.SetupFluentBitRoller(mgr, cs, mc.fluentbitEnabled) },
+		"coredns-stale-watchdog":   func() error { return system.SetupCoreDNSWatchdog(mgr, cs) },
 		"coredns-patcher": func() error {
-			return controller.SetupCoreDNSPatcher(mgr, cs,
+			return system.SetupCoreDNSPatcher(mgr, cs,
 				mc.corednsPatcherEnabled, mc.corednsZoneWhen, mc.corednsZoneMinDomains,
 				mc.corednsMinReplicas, mc.corednsNodesPerReplica)
 		},
 		"metrics-server-patcher": func() error {
-			return controller.SetupMetricsServerPatcher(mgr, cs, mc.metricsServerPatcherEnabled,
+			return system.SetupMetricsServerPatcher(mgr, cs, mc.metricsServerPatcherEnabled,
 				mc.metricsServerMinReplicas, mc.metricsServerNodesPerReplica)
 		},
 		"cf-tunnel-proxy-watchdog": func() error {
-			return controller.SetupCFTunnelProxyWatchdog(mgr, cs,
+			return system.SetupCFTunnelProxyWatchdog(mgr, cs,
 				mc.cfTunnelWatchdogEnabled, mc.cfTunnelWatchdogNamespace,
 				mc.cfTunnelWatchdogInterval)
 		},
+
+		// internal/controller/node — node lifecycle and health sweeps.
+		"cilium-taint-reaper":     func() error { return node.SetupCiliumTaintReaper(mgr, cs, mc.ciliumEnabled) },
+		"descheduler-storm-gate":  func() error { return node.SetupDeschedulerStormGate(mgr, cs) },
+		"node-labeler":            func() error { return node.SetupNodeLabeler(mgr, cs, mc.labelerPath) },
+		"kubelet-liveness-reaper": func() error { return node.SetupKubeletReaper(mgr, cs) },
+		"partition-pod-evictor":   func() error { return node.SetupPartitionEvictor(mgr, cs) },
+		"dead-node-sweeper":       func() error { return node.SetupDeadNodeSweeper(mgr, cs, dyn) },
+		"csr-watcher":             func() error { return node.SetupCSRWatcher(mgr, cs, mc.csrApproveEnabled) },
+
+		// internal/controller/apiserver — apiserver integrity guards.
+		"admission-webhook-guard":  func() error { return apiserver.SetupWebhookGuard(mgr, cs) },
+		"apiserver-endpoint-guard": func() error { return apiserver.SetupAPIServerEndpointGuard(mgr, cs) },
+
+		// internal/controller/janitor — resource cleanup sweeps.
+		"failed-jobs-janitor": func() error { return janitor.SetupFailedJobsJanitor(mgr, cs) },
+		"evicted-pod-janitor": func() error { return janitor.SetupEvictedPodJanitor(mgr, cs) },
+		"cronjob-catchup":     func() error { return janitor.SetupCronJobCatchup(mgr, cs) },
+		"concourse-workdir-janitor": func() error {
+			return janitor.SetupConcourseWorkdirJanitor(mgr, cs,
+				mc.concourseJanitorEnabled)
+		},
+
+		// internal/controller/integration — third-party controller
+		// unstuckers (dynamic client / CRD types).
+		"helmrelease-unlocker":    func() error { return integration.SetupHelmReleaseUnlocker(mgr, cs, dyn) },
+		"externalsecret-nudge":    func() error { return integration.SetupExternalSecretNudge(mgr, cs, dyn, mc.esNudgeEnabled) },
+		"certmanager-reaper":      func() error { return integration.SetupCertManagerReaper(mgr, cs, dyn, mc.certReaperEnabled) },
+		"cilium-identity-auditor": func() error { return integration.SetupCiliumIdentityAuditor(mgr, cs, dyn, mc.ciliumAuditEnabled) },
+
+		// internal/controller/health — cluster health probes.
 		"cluster-health-probes": func() error {
-			return controller.SetupClusterHealthProber(mgr, cs,
+			return health.SetupClusterHealthProber(mgr, cs,
 				mc.clusterHealthProbesEnabled)
 		},
 	} {
