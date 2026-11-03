@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -138,8 +139,17 @@ type apiStub struct {
 
 func newAPIStub(t *testing.T) *apiStub {
 	t.Helper()
+	return newAPIStubOn(t, "127.0.0.1:0")
+}
+
+// newAPIStubOn is newAPIStub bound to a specific loopback address —
+// watchdog file names key on the backend IP, so tests exercising the
+// file contract need distinct IPs per stub (127.0.0.0/8 is all
+// loopback, e.g. "127.0.0.2:0").
+func newAPIStubOn(t *testing.T, listenAddr string) *apiStub {
+	t.Helper()
 	a := &apiStub{}
-	a.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		if a.fail {
@@ -153,6 +163,13 @@ func newAPIStub(t *testing.T) *apiStub {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"apiVersion":"v1","kind":"List","metadata":{"resourceVersion":"%d"},"items":[]}`, rv)
 	}))
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Listener = ln
+	srv.StartTLS()
+	a.srv = srv
 	t.Cleanup(a.srv.Close)
 	return a
 }
@@ -1524,5 +1541,205 @@ func TestVIPDryRunTransitions(t *testing.T) {
 		if !strings.HasPrefix(c, "show stat") {
 			t.Fatalf("dry-run issued socket action: %v", ha.commands())
 		}
+	}
+}
+
+// --- watchdog state files (module 34 backward-compat contract) ---
+
+// gapFilePath/staleFilePath name the compat files for a backend addr.
+func gapFilePath(dir, addr string) string {
+	return filepath.Join(dir, "apibe-gap-"+dashedIP(addr))
+}
+func staleFilePath(dir, addr string) string {
+	return filepath.Join(dir, "state-apiserver-backend-stale-"+dashedIP(addr))
+}
+
+func fileContent(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
+}
+
+func TestWatchdogGapFileWritten(t *testing.T) {
+	stub := newAPIStub(t)
+	ha := newFakeHAProxy(t, [2]string{"hub1", stub.addr()})
+	p := fixture(t, ha, ModeDryRun, nil)
+	p.cfg.WatchdogStateDir = t.TempDir()
+
+	stub.set(100, 900) // gap 800 — fresh (under GapMin)
+	p.Cycle(context.Background())
+
+	if got := fileContent(t, gapFilePath(p.cfg.WatchdogStateDir, stub.addr())); got != "800\n" {
+		t.Fatalf("gap file=%q want %q", got, "800\n")
+	}
+	if _, err := os.Stat(staleFilePath(p.cfg.WatchdogStateDir, stub.addr())); !os.IsNotExist(err) {
+		t.Fatal("stale latch exists on a fresh backend")
+	}
+
+	// Next cycle with a different gap → file tracks the latest probe.
+	stub.set(200, 600)
+	p.Cycle(context.Background())
+	if got := fileContent(t, gapFilePath(p.cfg.WatchdogStateDir, stub.addr())); got != "400\n" {
+		t.Fatalf("gap file=%q want %q", got, "400\n")
+	}
+}
+
+func TestWatchdogStaleLatchEnterExit(t *testing.T) {
+	bad := newAPIStub(t)
+	ha := newFakeHAProxy(t, [2]string{"hub1", bad.addr()})
+	p := fixture(t, ha, ModeDryRun, nil)
+	dir := t.TempDir()
+	p.cfg.WatchdogStateDir = dir
+	latch := staleFilePath(dir, bad.addr())
+
+	// gap > GapMin for FailCycles cycles → stale → latch created
+	// (latching is independent of the dry-run drain fence).
+	bad.set(100, 5000)
+	p.Cycle(context.Background())
+	p.Cycle(context.Background())
+	fi, err := os.Stat(latch)
+	if err != nil {
+		t.Fatalf("stale latch not created: %v", err)
+	}
+	if fi.Size() == 0 {
+		t.Fatal("stale latch empty — want epoch content")
+	}
+	if _, err := strconv.ParseInt(strings.TrimSpace(fileContent(t, latch)), 10, 64); err != nil {
+		t.Fatalf("stale latch content not an epoch: %v", err)
+	}
+
+	// Fresh cycles < RecoverCycles → latch survives (shell hysteresis:
+	// state_exit only after RECOVER_CYCLES consecutive fresh runs —
+	// one lucky probe must not unblock 06's upstream gate).
+	bad.set(60, 60)
+	p.Cycle(context.Background())
+	p.Cycle(context.Background())
+	if _, err := os.Stat(latch); err != nil {
+		t.Fatal("stale latch cleared before RecoverCycles fresh cycles")
+	}
+	// Third consecutive fresh cycle (== default RecoverCycles) → exit.
+	p.Cycle(context.Background())
+	if _, err := os.Stat(latch); !os.IsNotExist(err) {
+		t.Fatal("stale latch not cleared after RecoverCycles fresh cycles")
+	}
+}
+
+func TestWatchdogLatchNotClearedOnInconclusive(t *testing.T) {
+	bad := newAPIStub(t)
+	ha := newFakeHAProxy(t, [2]string{"hub1", bad.addr()})
+	p := fixture(t, ha, ModeDryRun, nil)
+	dir := t.TempDir()
+	p.cfg.WatchdogStateDir = dir
+	latch := staleFilePath(dir, bad.addr())
+
+	bad.set(100, 5000)
+	p.Cycle(context.Background())
+	p.Cycle(context.Background()) // stale → latch
+	if _, err := os.Stat(latch); err != nil {
+		t.Fatalf("stale latch not created: %v", err)
+	}
+
+	// TCP-unreachable cycle is inconclusive — the latch must survive
+	// (hysteresis: no exit on an indeterminate probe).
+	p.cfg.TCPCheck = func(_ context.Context, _ string) error {
+		return fmt.Errorf("connect refused")
+	}
+	p.Cycle(context.Background())
+	if _, err := os.Stat(latch); err != nil {
+		t.Fatal("stale latch cleared on an inconclusive cycle")
+	}
+
+	// Query-fail-but-under-threshold is also inconclusive.
+	p.cfg.TCPCheck = nil
+	p.states["hub1"].qfail = 0 // reset to under-threshold
+	bad.setFail(true)
+	p.Cycle(context.Background())
+	if _, err := os.Stat(latch); err != nil {
+		t.Fatal("stale latch cleared on an inconclusive query-fail cycle")
+	}
+}
+
+func TestWatchdogPruneRemovesRetiredBackends(t *testing.T) {
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t, [2]string{"hub2", good.addr()})
+	p := fixture(t, ha, ModeDryRun, nil)
+	dir := t.TempDir()
+	p.cfg.WatchdogStateDir = dir
+
+	// Files from a backend that left api-local-lb discovery.
+	oldGap := gapFilePath(dir, "10.9.9.9:6443")
+	oldLatch := staleFilePath(dir, "10.9.9.9:6443")
+	for _, f := range []string{oldGap, oldLatch} {
+		if err := os.WriteFile(f, []byte("1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	good.set(50, 50)
+	p.Cycle(context.Background())
+
+	for _, f := range []string{oldGap, oldLatch} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Fatalf("file for retired backend not pruned: %s", f)
+		}
+	}
+	// The discovered backend's own gap file survives.
+	if _, err := os.Stat(gapFilePath(dir, good.addr())); err != nil {
+		t.Fatalf("gap file for live backend pruned: %v", err)
+	}
+}
+
+func TestWatchdogNoPruneOnEmptyDiscovery(t *testing.T) {
+	// Discovery returned zero rows — never prune (a failed/empty scan
+	// must not wipe latches other watchdog consumers still read).
+	ha := newFakeHAProxy(t) // no servers
+	p := fixture(t, ha, ModeDryRun, nil)
+	dir := t.TempDir()
+	p.cfg.WatchdogStateDir = dir
+	f := staleFilePath(dir, "10.9.9.9:6443")
+	if err := os.WriteFile(f, []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.Cycle(context.Background())
+	if _, err := os.Stat(f); err != nil {
+		t.Fatal("latch pruned on an empty backend list")
+	}
+}
+
+func TestWatchdogFilesSkippedWhenDirUnsetOrMissing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wdir string
+	}{
+		{"empty", ""},
+		{"missing", filepath.Join(t.TempDir(), "no-such-dir")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := newAPIStub(t)
+			ha := newFakeHAProxy(t, [2]string{"hub1", bad.addr()})
+			p := fixture(t, ha, ModeDryRun, nil)
+			p.cfg.WatchdogStateDir = tc.wdir
+
+			bad.set(100, 5000)
+			p.Cycle(context.Background())
+			p.Cycle(context.Background()) // stale — must not create the dir or panic
+			if tc.wdir != "" {
+				if _, err := os.Stat(tc.wdir); !os.IsNotExist(err) {
+					t.Fatal("missing watchdog dir was created by file ops")
+				}
+			}
+		})
+	}
+}
+
+func TestDashedIP(t *testing.T) {
+	if got := dashedIP("10.0.0.1:6443"); got != "10-0-0-1" {
+		t.Fatalf("dashedIP=%q want 10-0-0-1", got)
+	}
+	// Raw addr without port — fallback keeps the host as-is.
+	if got := dashedIP("10.0.0.1"); got != "10-0-0-1" {
+		t.Fatalf("dashedIP=%q want 10-0-0-1", got)
 	}
 }

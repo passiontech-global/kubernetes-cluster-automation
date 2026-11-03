@@ -12,12 +12,18 @@
 //   - Feature gates via env (same flag ConfigMaps as before):
 //     CILIUM_TAINT_REAPER_ENABLED, FLUENTBIT_ROLLER_ENABLED,
 //     NODE_LABELER_CONFIG_PATH.
+//   - The ported kubectl-CronJob modules are default-ON:
+//     COREDNS_PATCHER_ENABLED / _ZONE_WHEN / _ZONE_MIN_DOMAINS,
+//     METRICS_SERVER_PATCHER_ENABLED, CF_TUNNEL_WATCHDOG_ENABLED /
+//     _NAMESPACE / _INTERVAL — an explicit "false" opts out.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -44,6 +50,24 @@ var version = "dev"
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func getenvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func getenvDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
 	return def
 }
@@ -100,6 +124,14 @@ func main() {
 				Namespaces: map[string]cache.Config{"kube-system": {}},
 				Field: fields.SelectorFromSet(
 					fields.Set{"metadata.name": "konnectivity-agent"}),
+			},
+			// kube-system Role: deployments get/list/watch (no
+			// resourceNames — the informer must see BOTH coredns and
+			// metrics-server; a single metadata.name field selector
+			// cannot express that, so the name pinning lives in the
+			// reconciler predicates instead).
+			&appsv1.Deployment{}: {
+				Namespaces: map[string]cache.Config{"kube-system": {}},
 			},
 			// ClusterRole: secrets resourceNames [passiontech-pipeline]
 			// (all namespaces; lives in fluent-system).
@@ -171,15 +203,22 @@ func main() {
 // the modules need — the same flags the shell-operator read from its
 // ConfigMaps (see header contract).
 type moduleConfig struct {
-	ciliumEnabled           bool
-	fluentbitEnabled        bool
-	certReaperEnabled       bool
-	ciliumAuditEnabled      bool
-	esNudgeEnabled          bool
-	csrApproveEnabled       bool
-	labelerPath             string
-	concourseJanitorEnabled bool
-	concourseJanitorScript  string
+	ciliumEnabled               bool
+	fluentbitEnabled            bool
+	certReaperEnabled           bool
+	ciliumAuditEnabled          bool
+	esNudgeEnabled              bool
+	csrApproveEnabled           bool
+	labelerPath                 string
+	concourseJanitorEnabled     bool
+	concourseJanitorScript      string
+	corednsPatcherEnabled       bool
+	corednsZoneWhen             string
+	corednsZoneMinDomains       int
+	metricsServerPatcherEnabled bool
+	cfTunnelWatchdogEnabled     bool
+	cfTunnelWatchdogNamespace   string
+	cfTunnelWatchdogInterval    time.Duration
 }
 
 // moduleConfigFromEnv resolves every feature-gate env var once, after
@@ -196,6 +235,18 @@ func moduleConfigFromEnv() moduleConfig {
 		concourseJanitorEnabled: os.Getenv("CONCOURSE_JANITOR_ENABLED") == "true",
 		concourseJanitorScript: getenv("CONCOURSE_JANITOR_SCRIPT_PATH",
 			"/etc/concourse-janitor/prune.sh"),
+		// The three ported patcher/watchdog CronJobs were always-on
+		// base components — default-ON here too (explicit "false"
+		// opts a cluster out), unlike the opt-in gates above.
+		corednsPatcherEnabled:       os.Getenv("COREDNS_PATCHER_ENABLED") != "false",
+		corednsZoneWhen:             getenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule"),
+		corednsZoneMinDomains:       getenvInt("COREDNS_PATCHER_ZONE_MIN_DOMAINS", 2),
+		metricsServerPatcherEnabled: os.Getenv("METRICS_SERVER_PATCHER_ENABLED") != "false",
+		cfTunnelWatchdogEnabled:     os.Getenv("CF_TUNNEL_WATCHDOG_ENABLED") != "false",
+		cfTunnelWatchdogNamespace: getenv("CF_TUNNEL_WATCHDOG_NAMESPACE",
+			"cloudflare-tunnel-system"),
+		cfTunnelWatchdogInterval: getenvDuration("CF_TUNNEL_WATCHDOG_INTERVAL",
+			5*time.Minute),
 	}
 }
 
@@ -228,6 +279,18 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 		"concourse-workdir-janitor": func() error {
 			return controller.SetupConcourseWorkdirJanitor(mgr, cs, cfg,
 				mc.concourseJanitorEnabled, mc.concourseJanitorScript)
+		},
+		"coredns-patcher": func() error {
+			return controller.SetupCoreDNSPatcher(mgr, cs,
+				mc.corednsPatcherEnabled, mc.corednsZoneWhen, mc.corednsZoneMinDomains)
+		},
+		"metrics-server-patcher": func() error {
+			return controller.SetupMetricsServerPatcher(mgr, cs, mc.metricsServerPatcherEnabled)
+		},
+		"cf-tunnel-proxy-watchdog": func() error {
+			return controller.SetupCFTunnelProxyWatchdog(mgr, cs,
+				mc.cfTunnelWatchdogEnabled, mc.cfTunnelWatchdogNamespace,
+				mc.cfTunnelWatchdogInterval)
 		},
 	} {
 		if err := setup(); err != nil {

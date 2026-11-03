@@ -51,6 +51,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -84,6 +85,13 @@ const (
 	defaultLivePath = "/api/v1/nodes?limit=1"
 	// CachePath is served from the apiserver watch-cache (rv=0).
 	defaultCachePath = "/api/v1/nodes?limit=1&resourceVersion=0"
+	// WatchdogStateDir is the node-watchdog state dir (host mount)
+	// holding the backward-compat files module 34-apiserver-backends
+	// wrote: apibe-gap-<ip-dashed> (rv gap per backend, read by
+	// prom_emit for node_watchdog_apiserver_backend_gap) and
+	// state-apiserver-backend-stale-<ip-dashed> (read by
+	// 06-kubelet-watch-wedge to gate k0sworker restarts).
+	defaultWatchdogStateDir = "/host/var/lib/node-watchdog"
 )
 
 // Config carries the prober's knobs — all test-injectable.
@@ -103,6 +111,9 @@ type Config struct {
 	InsecureTLS   bool          // skip backend cert verification (mirrors curl -sk)
 	LivePath      string        // consistent-read URL path+query
 	CachePath     string        // cached-read URL path+query
+	// WatchdogStateDir, when non-empty and present on disk, receives
+	// the apibe-gap-*/state-apiserver-backend-stale-* compat files.
+	WatchdogStateDir string
 
 	// HTTPClient, when set, is used for all API queries and overrides
 	// TokenFile/CAFile/InsecureTLS — the test seam (httptest clients).
@@ -157,6 +168,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.CachePath == "" {
 		c.CachePath = defaultCachePath
+	}
+	if c.WatchdogStateDir == "" {
+		c.WatchdogStateDir = defaultWatchdogStateDir
 	}
 }
 
@@ -482,6 +496,118 @@ func (p *Prober) haproxyServer(ctx context.Context, action, name string) error {
 	return nil
 }
 
+// --- watchdog state files (module 34 parity) ---
+// The host node-watchdog stack reads these: 06-kubelet-watch-wedge
+// gates k0sworker restarts on state-apiserver-backend-stale-<ip>, and
+// lib.sh prom_emit turns apibe-gap-<ip> into
+// node_watchdog_apiserver_backend_gap{backend="<ip-dashed>"}. The
+// suffix is the backend IP with dots replaced by dashes
+// (shell ${beh//./-}) — NOT the server name.
+
+// watchdogDir returns the configured state dir when it exists on disk
+// this cycle, else "". An empty/missing dir disables all file ops
+// silently — test environments and non-watchdog nodes.
+func (p *Prober) watchdogDir() string {
+	d := p.cfg.WatchdogStateDir
+	if d == "" {
+		return ""
+	}
+	if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
+		return ""
+	}
+	return d
+}
+
+// dashedIP maps a backend addr to the watchdog file suffix:
+// "10.0.0.1:6443" → "10-0-0-1".
+func dashedIP(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr // Addr without a port — use it raw
+	}
+	return strings.ReplaceAll(host, ".", "-")
+}
+
+// writeFileAtomic writes path via tmp+rename — the same atomic-copy
+// contract the watchdog prom files rely on (no torn reads mid-write).
+// The tmp name deliberately breaks the state-*/apibe-gap-* prefixes —
+// hostmetrics scans the dir for state-* files and a
+// "state-foo-<ip>.tmp" would surface as a phantom watchdog_state
+// series ("<ip>.tmp") that then persists at 0 forever.
+func writeFileAtomic(path string, data []byte) error {
+	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// writeGapFile records the last measured rv gap for prom_emit.
+// Best-effort: a write failure is logged, never fatal.
+func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
+	f := dir + "/apibe-gap-" + dashedIP(b.Addr)
+	if err := writeFileAtomic(f, []byte(strconv.FormatInt(gap, 10)+"\n")); err != nil {
+		slog.Info("watchdog gap file write failed", "file", f, "error", err)
+	}
+}
+
+// latchStale creates state-apiserver-backend-stale-<ip> — state_enter
+// semantics: create only if absent, content = current epoch.
+func (p *Prober) latchStale(dir string, b backend) {
+	f := dir + "/state-apiserver-backend-stale-" + dashedIP(b.Addr)
+	if _, err := os.Stat(f); err == nil {
+		return
+	}
+	if err := writeFileAtomic(f,
+		[]byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n")); err != nil {
+		slog.Info("watchdog stale latch write failed", "file", f, "error", err)
+	}
+}
+
+// clearStale removes the stale latch — state_exit semantics, called
+// only on a fully-fresh cycle (hysteresis: inconclusive cycles keep
+// whatever exists). not-exist is ignored.
+func (p *Prober) clearStale(dir string, b backend) {
+	f := dir + "/state-apiserver-backend-stale-" + dashedIP(b.Addr)
+	if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+		slog.Info("watchdog stale latch remove failed", "file", f, "error", err)
+	}
+}
+
+// pruneWatchdogFiles deletes apibe-gap-* and state-apiserver-backend-
+// stale-* files whose dashed-IP is no longer among the discovered
+// direct backends — a backend retired from api-local-lb would
+// otherwise leave its latch/gap file latched forever (false NPD/prom
+// signal, the shell's prune block parity). Only runs when discovery
+// returned rows — never on discover failure or an empty backend list.
+func (p *Prober) pruneWatchdogFiles(dir string, backends []backend) {
+	keep := make(map[string]bool, len(backends))
+	for _, b := range backends {
+		if !b.vip() {
+			keep[dashedIP(b.Addr)] = true
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		var suffix string
+		switch {
+		case strings.HasPrefix(name, "apibe-gap-"):
+			suffix = strings.TrimPrefix(name, "apibe-gap-")
+		case strings.HasPrefix(name, "state-apiserver-backend-stale-"):
+			suffix = strings.TrimPrefix(name, "state-apiserver-backend-stale-")
+		default:
+			continue
+		}
+		if !keep[suffix] {
+			_ = os.Remove(dir + "/" + name)
+		}
+	}
+}
+
 func (p *Prober) stateFor(name string) *backendState {
 	st, ok := p.states[name]
 	if !ok {
@@ -506,6 +632,9 @@ func (p *Prober) Cycle(ctx context.Context) {
 	}
 	p.backendCount.Set(float64(len(backends)))
 	p.cycles.WithLabelValues("ok").Inc()
+
+	// Resolved once per cycle: "" disables every watchdog file op.
+	wdir := p.watchdogDir()
 
 	fresh := 0                 // direct backends fresh AND usable this cycle (drain fence)
 	stale := map[string]bool{} // name → wedged/dead this cycle
@@ -557,6 +686,9 @@ func (p *Prober) Cycle(ctx context.Context) {
 		st.qfail = 0
 		gap := rvNow - rvCache
 		p.rvGap.WithLabelValues(b.Name).Set(float64(gap))
+		if wdir != "" {
+			p.writeGapFile(wdir, b, gap)
+		}
 
 		// Frozen signal: rv_cache bit-identical while rv_now advances
 		// → watch-cache stopped updating (early wedge signature).
@@ -601,6 +733,16 @@ func (p *Prober) Cycle(ctx context.Context) {
 				"frozen", st.frozen, "frozenCycles", p.cfg.FrozenCycles)
 		default:
 			st.ok++
+			if wdir != "" && st.ok >= p.cfg.RecoverCycles {
+				// state_exit parity: the shell needed RECOVER_CYCLES
+				// consecutive fully-fresh runs before clearing the
+				// latch — one lucky probe must not unblock
+				// 06-kubelet-watch-wedge's upstream gate. The
+				// inconclusive paths above (TCP-unreachable,
+				// under-threshold qfail/frozen/gap) keep whatever
+				// latch exists.
+				p.clearStale(wdir, b)
+			}
 			if st.drained || b.maint() {
 				// Re-enable only after RecoverCycles consecutive
 				// fresh cycles (drained by us, or admin-disabled
@@ -642,6 +784,11 @@ func (p *Prober) Cycle(ctx context.Context) {
 	for _, name := range names {
 		st := p.states[name]
 		b := statusByName[name]
+		if wdir != "" {
+			// Wedged/dead this cycle → state_enter parity (the latch
+			// gates 06-kubelet-watch-wedge's k0sworker restart).
+			p.latchStale(wdir, b)
+		}
 		if st.drained {
 			// Already drained — but a HAProxy restart forgets runtime
 			// disables (socket state is not persistent). Re-apply
@@ -749,5 +896,12 @@ func (p *Prober) Cycle(ctx context.Context) {
 			v = 1
 		}
 		p.enabled.WithLabelValues(b.Name).Set(v)
+	}
+
+	// Prune compat files for backends that left discovery — only when
+	// discover returned rows (never on discover_fail/empty: a failed
+	// or empty scan must not wipe latches the shell side still reads).
+	if wdir != "" && len(backends) > 0 {
+		p.pruneWatchdogFiles(wdir, backends)
 	}
 }

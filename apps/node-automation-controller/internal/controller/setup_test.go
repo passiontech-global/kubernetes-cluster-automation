@@ -177,6 +177,11 @@ func TestSetupPeriodicModules(t *testing.T) {
 			func(m manager.Manager) error {
 				return SetupCiliumIdentityAuditor(m, cs, stubDyn(), true)
 			}},
+		{"cf-tunnel-proxy-watchdog", 5 * time.Minute,
+			func(m manager.Manager) error {
+				return SetupCFTunnelProxyWatchdog(m, cs, true,
+					"cloudflare-tunnel-system", 5*time.Minute)
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newStubManager()
@@ -216,6 +221,16 @@ func TestSetupFeatureFlagVariants(t *testing.T) {
 		}},
 		{"cilium-identity-auditor", func(m manager.Manager) error {
 			return SetupCiliumIdentityAuditor(m, cs, stubDyn(), false)
+		}},
+		{"coredns-patcher", func(m manager.Manager) error {
+			return SetupCoreDNSPatcher(m, cs, false, "DoNotSchedule", 2)
+		}},
+		{"metrics-server-patcher", func(m manager.Manager) error {
+			return SetupMetricsServerPatcher(m, cs, false)
+		}},
+		{"cf-tunnel-proxy-watchdog", func(m manager.Manager) error {
+			return SetupCFTunnelProxyWatchdog(m, cs, false,
+				"cloudflare-tunnel-system", 5*time.Minute)
 		}},
 	} {
 		t.Run(tc.name+"-disabled", func(t *testing.T) {
@@ -265,6 +280,12 @@ func TestSetupBuilderModules(t *testing.T) {
 	}{
 		{"konnectivity-patcher", func(m manager.Manager) error {
 			return SetupKonnectivityPatcher(m, cs)
+		}},
+		{"coredns-patcher", func(m manager.Manager) error {
+			return SetupCoreDNSPatcher(m, cs, true, "DoNotSchedule", 2)
+		}},
+		{"metrics-server-patcher", func(m manager.Manager) error {
+			return SetupMetricsServerPatcher(m, cs, true)
 		}},
 		{"descheduler-storm-gate", func(m manager.Manager) error {
 			return SetupDeschedulerStormGate(m, cs)

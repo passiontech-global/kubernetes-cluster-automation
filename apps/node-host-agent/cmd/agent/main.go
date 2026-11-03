@@ -18,8 +18,12 @@
 //     (default auto = enabled iff the HAProxy admin socket
 //     exists at startup).
 //   - hostmetrics: scrape-time collector for watchdog state latches,
-//     nebula interface/route, and k0s config drift. Enabled
-//     via NODE_HOST_AGENT_ENABLE_HOSTMETRICS (default true).
+//     nebula interface/route/cert-expiry, and k0s config drift.
+//     Enabled via NODE_HOST_AGENT_ENABLE_HOSTMETRICS (default true).
+//   - workerhygiene: worker-only watchdog checks (pod-teardown,
+//     konnectivity IP drift, dns resolv drift). Enabled via
+//     NODE_HOST_AGENT_ENABLE_HYGIENE (default true); needs a kube
+//     client and a non-empty node name.
 package main
 
 import (
@@ -30,6 +34,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -42,6 +47,7 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/apiprober"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostmetrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/sweeper"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/workerhygiene"
 )
 
 var version = "dev"
@@ -94,6 +100,22 @@ func envDuration(key string, def time.Duration) time.Duration {
 		return time.Duration(n) * time.Second
 	}
 	return def
+}
+
+// envList parses a comma-separated env var; unset/empty → nil (the
+// consumer applies its own defaults).
+func envList(key string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // kubeClient builds the in-cluster clientset (SA token), falling back
@@ -185,6 +207,10 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 				"/api/v1/nodes?limit=1"),
 			CachePath: getenv("NODE_HOST_AGENT_APIPROBER_CACHE_PATH",
 				"/api/v1/nodes?limit=1&resourceVersion=0"),
+			// Same env/dir hostmetrics uses — one shared watchdog
+			// state dir mount for the whole pod.
+			WatchdogStateDir: getenv("NODE_HOST_AGENT_WATCHDOG_STATE_DIR",
+				"/host/var/lib/node-watchdog"),
 		}, reg)
 		if err != nil {
 			slog.Error("apiprober setup failed", "error", err)
@@ -203,7 +229,54 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			RouteFile:        getenv("NODE_HOST_AGENT_HOST_ROUTE_FILE", "/proc/1/net/route"),
 			K0sConfigFile:    getenv("NODE_HOST_AGENT_K0S_CONFIG", "/etc/k0s/k0s.yaml"),
 			K0sUnitFile:      getenv("NODE_HOST_AGENT_K0S_UNIT", "/etc/systemd/system/k0scontroller.service"),
+			NebulaCertFile:   getenv("NODE_HOST_AGENT_NEBULA_CERT", "/host/etc/nebula/interdc/host.crt"),
+			ExpectedKCMArgs:  envList("NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS"), // empty = defaults
 		}))
+	}
+
+	// --- workerhygiene: worker-only watchdog checks ---
+	// Needs a node name (pods are filtered by spec.nodeName) and a
+	// kube client; either missing skips the subsystem — never aborts
+	// the agent.
+	if envBool("NODE_HOST_AGENT_ENABLE_HYGIENE", true) {
+		// DaemonSet sets NODE_HOST_AGENT_NODE_NAME and NODE_NAME via
+		// the downward API — prefer the explicit override env.
+		hnode := getenv("NODE_HOST_AGENT_NODE_NAME", nodeName)
+		switch {
+		case hnode == "":
+			slog.Error("workerhygiene disabled: node name empty " +
+				"(NODE_HOST_AGENT_NODE_NAME/NODE_NAME unset)")
+		default:
+			cs, err := kubeClient()
+			if err != nil {
+				slog.Error("workerhygiene disabled: cannot build kubernetes client",
+					"error", err)
+			} else {
+				wh, err := workerhygiene.New(workerhygiene.Config{
+					NodeName:           hnode,
+					Enabled:            true,
+					Interval:           envDuration("NODE_HOST_AGENT_HYGIENE_INTERVAL", 2*time.Minute),
+					WatchdogStateDir:   getenv("NODE_HOST_AGENT_WATCHDOG_STATE_DIR", "/host/var/lib/node-watchdog"),
+					WatchdogLogFile:    getenv("NODE_HOST_AGENT_WATCHDOG_LOG", "/host/var/log/node-watchdog.log"),
+					ProcRoot:           getenv("NODE_HOST_AGENT_PROC_ROOT", "/proc"),
+					CtrTaskRoot:        getenv("NODE_HOST_AGENT_CTR_TASK_ROOT", "/host/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io"),
+					SandboxCtlRoot:     getenv("NODE_HOST_AGENT_SANDBOX_CTL_ROOT", "/host/run/k0s/containerd/io.containerd.sandbox.controller.v1.shim"),
+					HostResolvConf:     getenv("NODE_HOST_AGENT_HOST_RESOLV_CONF", "/host/etc/resolv.conf"),
+					K0sWorkerUnitFile:  getenv("NODE_HOST_AGENT_K0S_WORKER_UNIT", "/host/etc/systemd/system/k0sworker.service"),
+					StuckDeleteAge:     envDuration("NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE", 15*time.Minute),
+					StuckWedgeAge:      envDuration("NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE", 30*time.Minute),
+					MaxForceDelete:     envInt("NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE", 5),
+					ConsecNeeded:       envInt("NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED", 2),
+					MinRestartInterval: envDuration("NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL", 30*time.Minute),
+					Client:             cs,
+				}, reg)
+				if err != nil {
+					slog.Error("workerhygiene setup failed", "error", err)
+				} else {
+					subsystems = append(subsystems, wh)
+				}
+			}
+		}
 	}
 
 	return agent.Config{

@@ -1,9 +1,12 @@
 package hostmetrics
 
 import (
+	"encoding/pem"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -32,6 +35,7 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		RouteFile:        filepath.Join(root, "route"),
 		K0sConfigFile:    filepath.Join(dirs["k0s"], "k0s.yaml"),
 		K0sUnitFile:      filepath.Join(dirs["systemd"], "k0scontroller.service"),
+		NebulaCertFile:   filepath.Join(root, "host.crt"),
 	}, dirs
 }
 
@@ -173,9 +177,26 @@ func TestNebulaAbsent(t *testing.T) {
 	}
 }
 
-func k0sDrift(t *testing.T, c *Collector) (float64, bool) {
+func k0sDrift(t *testing.T, c *Collector, reason, key string) (float64, bool) {
 	t.Helper()
-	return metricValue(t, c, "node_k0s_config_drift", nil)
+	return metricValue(t, c, "node_k0s_config_drift",
+		map[string]string{"reason": reason, "key": key})
+}
+
+// k0sCleanYAML renders a k0s.yaml whose controllerManager.extraArgs
+// matches the default ExpectedKCMArgs exactly — the only shape that
+// produces zero missing-key findings.
+func k0sCleanYAML(extraKeys ...string) string {
+	var b strings.Builder
+	b.WriteString("apiVersion: k0s.k0sproject.io/v1beta1\n" +
+		"kind: ClusterConfig\nspec:\n  controllerManager:\n    extraArgs:\n")
+	for _, k := range defaultExpectedKCMArgs {
+		b.WriteString("      " + k + ": \"5\"\n")
+	}
+	for _, k := range extraKeys {
+		b.WriteString("      " + k + ": \"9\"\n")
+	}
+	return b.String()
 }
 
 func TestK0sDriftRemovedFlag(t *testing.T) {
@@ -184,17 +205,17 @@ func TestK0sDriftRemovedFlag(t *testing.T) {
 	write(t, cfg.K0sConfigFile,
 		"apiVersion: k0s.k0sproject.io/v1beta1\nkind: ClusterConfig\n"+
 			"spec:\n  api:\n    extraArgs:\n      concurrent-service-syncs: \"5\"\n")
-	if v, ok := k0sDrift(t, New(cfg)); !ok || v != 1 {
-		t.Fatalf("drift=%v ok=%v want 1 (removed flag present)", v, ok)
+	if v, ok := k0sDrift(t, New(cfg), "removed-flag", "concurrent-service-syncs"); !ok || v != 1 {
+		t.Fatalf("removed-flag=%v ok=%v want 1 (removed flag present)", v, ok)
 	}
 }
 
 func TestK0sDriftMissingConfig(t *testing.T) {
 	cfg, _ := fixture(t)
 	write(t, cfg.K0sUnitFile, "[Unit]\n")
-	// k0s.yaml absent → drift=1.
-	if v, ok := k0sDrift(t, New(cfg)); !ok || v != 1 {
-		t.Fatalf("drift=%v ok=%v want 1 (config missing)", v, ok)
+	// k0s.yaml absent → unreadable finding (drift=1 under the new schema).
+	if v, ok := k0sDrift(t, New(cfg), "unreadable", "k0s.yaml"); !ok || v != 1 {
+		t.Fatalf("unreadable=%v ok=%v want 1 (config missing)", v, ok)
 	}
 }
 
@@ -202,18 +223,57 @@ func TestK0sDriftUnparseable(t *testing.T) {
 	cfg, _ := fixture(t)
 	write(t, cfg.K0sUnitFile, "[Unit]\n")
 	write(t, cfg.K0sConfigFile, "  {not: [valid: yaml\n")
-	if v, ok := k0sDrift(t, New(cfg)); !ok || v != 1 {
-		t.Fatalf("drift=%v ok=%v want 1 (unparseable)", v, ok)
+	if v, ok := k0sDrift(t, New(cfg), "unreadable", "k0s.yaml"); !ok || v != 1 {
+		t.Fatalf("unreadable=%v ok=%v want 1 (unparseable)", v, ok)
 	}
 }
 
 func TestK0sNoDriftCleanConfig(t *testing.T) {
 	cfg, _ := fixture(t)
 	write(t, cfg.K0sUnitFile, "[Unit]\n")
+	write(t, cfg.K0sConfigFile, k0sCleanYAML())
+	if v, ok := k0sDrift(t, New(cfg), "none", "none"); !ok || v != 0 {
+		t.Fatalf("none=%v ok=%v want 0 (clean config)", v, ok)
+	}
+}
+
+func TestK0sDriftMissingKey(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.K0sUnitFile, "[Unit]\n")
+	// An empty extraArgs block → every expected KCM key is missing.
 	write(t, cfg.K0sConfigFile,
-		"apiVersion: k0s.k0sproject.io/v1beta1\nkind: ClusterConfig\nspec: {}\n")
-	if v, ok := k0sDrift(t, New(cfg)); !ok || v != 0 {
-		t.Fatalf("drift=%v ok=%v want 0 (clean config)", v, ok)
+		"apiVersion: k0s.k0sproject.io/v1beta1\nkind: ClusterConfig\n"+
+			"spec:\n  controllerManager:\n    extraArgs: {}\n")
+	c := New(cfg)
+	if v, ok := k0sDrift(t, c, "missing-key", "kube-api-qps"); !ok || v != 1 {
+		t.Fatalf("missing-key=%v ok=%v want 1", v, ok)
+	}
+	if _, ok := k0sDrift(t, c, "none", "none"); ok {
+		t.Fatal("none series emitted alongside findings")
+	}
+}
+
+func TestK0sDriftExtraKey(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.K0sUnitFile, "[Unit]\n")
+	write(t, cfg.K0sConfigFile, k0sCleanYAML("bogus-extra-flag"))
+	if v, ok := k0sDrift(t, New(cfg), "extra-key", "bogus-extra-flag"); !ok || v != 1 {
+		t.Fatalf("extra-key=%v ok=%v want 1", v, ok)
+	}
+}
+
+func TestK0sDriftRemovedFlagNotDoubleCounted(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.K0sUnitFile, "[Unit]\n")
+	// The removed flag sits INSIDE controllerManager.extraArgs: it
+	// must report as removed-flag only, not also as extra-key.
+	write(t, cfg.K0sConfigFile, k0sCleanYAML("concurrent-service-syncs"))
+	c := New(cfg)
+	if v, ok := k0sDrift(t, c, "removed-flag", "concurrent-service-syncs"); !ok || v != 1 {
+		t.Fatalf("removed-flag=%v ok=%v want 1", v, ok)
+	}
+	if _, ok := k0sDrift(t, c, "extra-key", "concurrent-service-syncs"); ok {
+		t.Fatal("removed flag double-reported as extra-key")
 	}
 }
 
@@ -221,8 +281,17 @@ func TestK0sMetricAbsentOnWorker(t *testing.T) {
 	cfg, _ := fixture(t)
 	// No k0scontroller.service → worker → no series even if config exists.
 	write(t, cfg.K0sConfigFile, "spec:\n  concurrent-service-syncs: true\n")
-	if v, ok := k0sDrift(t, New(cfg)); ok {
-		t.Fatalf("node_k0s_config_drift=%v emitted on non-controller node", v)
+	c := New(cfg)
+	for _, r := range []string{"removed-flag", "missing-key", "unreadable", "none"} {
+		key := "x"
+		if r == "unreadable" {
+			key = "k0s.yaml"
+		} else if r == "none" {
+			key = "none"
+		}
+		if v, ok := k0sDrift(t, c, r, key); ok {
+			t.Fatalf("node_k0s_config_drift{reason=%s}=%v emitted on non-controller node", r, v)
+		}
 	}
 }
 
@@ -249,6 +318,12 @@ func TestApplyDefaults(t *testing.T) {
 	if len(c.cfg.RemovedFlags) != 1 || c.cfg.RemovedFlags[0] != "concurrent-service-syncs" {
 		t.Fatalf("RemovedFlags=%v want [concurrent-service-syncs]", c.cfg.RemovedFlags)
 	}
+	if c.cfg.NebulaCertFile != defaultNebulaCertFile {
+		t.Fatalf("NebulaCertFile=%q want %q", c.cfg.NebulaCertFile, defaultNebulaCertFile)
+	}
+	if len(c.cfg.ExpectedKCMArgs) != len(defaultExpectedKCMArgs) {
+		t.Fatalf("ExpectedKCMArgs=%v want defaults", c.cfg.ExpectedKCMArgs)
+	}
 }
 
 func TestRemovedFlagsCustom(t *testing.T) {
@@ -260,14 +335,14 @@ func TestRemovedFlagsCustom(t *testing.T) {
 	write(t, cfg.K0sConfigFile,
 		"spec:\n  api:\n    extraArgs:\n      concurrent-service-syncs: \"5\"\n")
 	cfg.RemovedFlags = []string{"some-other-flag"}
-	if v, ok := k0sDrift(t, New(cfg)); !ok || v != 0 {
-		t.Fatalf("drift=%v ok=%v want 0 (custom flags keep concurrent-service-syncs ignored)", v, ok)
+	if _, ok := k0sDrift(t, New(cfg), "removed-flag", "concurrent-service-syncs"); ok {
+		t.Fatal("default removed flag reported despite custom list")
 	}
 
 	// And the custom flag itself is honoured.
 	write(t, cfg.K0sConfigFile, "spec:\n  some-other-flag: true\n")
-	if v, ok := k0sDrift(t, New(cfg)); !ok || v != 1 {
-		t.Fatalf("drift=%v ok=%v want 1 (custom removed flag present)", v, ok)
+	if v, ok := k0sDrift(t, New(cfg), "removed-flag", "some-other-flag"); !ok || v != 1 {
+		t.Fatalf("removed-flag=%v ok=%v want 1 (custom removed flag present)", v, ok)
 	}
 }
 
@@ -275,8 +350,8 @@ func TestDescribe(t *testing.T) {
 	c := New(Config{})
 	ch := make(chan *prometheus.Desc, 8)
 	c.Describe(ch)
-	if got := len(ch); got != 4 {
-		t.Fatalf("Describe emitted %d descs want 4", got)
+	if got := len(ch); got != 5 {
+		t.Fatalf("Describe emitted %d descs want 5", got)
 	}
 }
 
@@ -325,5 +400,158 @@ func TestWatchdogStateDirAbsentStillEmitsSeen(t *testing.T) {
 		map[string]string{"node": "node-a", "state": "net-fail"})
 	if !ok || v != 0 {
 		t.Fatalf("watchdog_state after dir removal=%v ok=%v want 0", v, ok)
+	}
+}
+
+// --- nebula cert expiry ---
+
+// pbVarint, pbTag, pbLenField, pbVarField hand-encode the protobuf
+// wire fields the parser reads — keeps the test independent of a
+// real nebula-cert binary while exercising the same wire shape:
+// NebulaCertificate{Details(field 1, LEN)=details, Signature(2)},
+// details{...,NotAfter(field 6, varint)}.
+func pbVarint(v uint64) []byte {
+	var b []byte
+	for {
+		c := byte(v & 0x7f)
+		v >>= 7
+		if v == 0 {
+			return append(b, c)
+		}
+		b = append(b, c|0x80)
+	}
+}
+
+func pbTag(field, wire int) []byte {
+	return pbVarint(uint64(field<<3 | wire))
+}
+
+func pbLenField(field int, payload []byte) []byte {
+	out := append(pbTag(field, 2), pbVarint(uint64(len(payload)))...)
+	return append(out, payload...)
+}
+
+func pbVarField(field int, v uint64) []byte {
+	return append(pbTag(field, 0), pbVarint(v)...)
+}
+
+// nebulaCertPEM builds a PEM "NEBULA CERTIFICATE" blob carrying
+// notAfter — structurally identical to what nebula-cert writes.
+func nebulaCertPEM(notAfter int64) []byte {
+	var details []byte
+	details = append(details, pbLenField(1, []byte("node-a"))...)
+	details = append(details, pbVarField(5, 1_700_000_000)...)    // NotBefore
+	details = append(details, pbVarField(6, uint64(notAfter))...) // NotAfter
+	details = append(details, pbLenField(7, []byte{0xde, 0xad, 0xbe, 0xef})...)
+	var cert []byte
+	cert = append(cert, pbLenField(1, details)...)
+	cert = append(cert, pbLenField(2, []byte{0x01, 0x02, 0x03})...)
+	return pem.EncodeToMemory(&pem.Block{Type: "NEBULA CERTIFICATE", Bytes: cert})
+}
+
+func TestNebulaCertNotAfterParse(t *testing.T) {
+	var details []byte
+	details = append(details, pbLenField(1, []byte("x"))...)
+	details = append(details, pbVarField(6, 1_800_000_000)...)
+	cert := append(pbLenField(1, details), pbLenField(2, []byte{9})...)
+	if got, ok := nebulaCertNotAfter(cert); !ok || got != 1_800_000_000 {
+		t.Fatalf("nebulaCertNotAfter=%d,%v want 1800000000,true", got, ok)
+	}
+}
+
+func TestNebulaCertNotAfterRejectsGarbage(t *testing.T) {
+	cases := map[string][]byte{
+		"empty":           {},
+		"truncated tag":   {0x80},
+		"details no f6":   append(pbLenField(1, pbLenField(1, []byte("x"))), pbLenField(2, []byte{1})...),
+		"truncated len":   append(pbTag(1, 2), 0x7f, 0x01), // declared len beyond payload
+		"bad wire in top": append(append(pbTag(1, 3), 0x01), pbLenField(2, []byte{1})...),
+		"details f6 len":  pbLenField(1, append(pbTag(6, 2), 0x01, 0x00)), // f6 as LEN not varint
+	}
+	for name, der := range cases {
+		if _, ok := nebulaCertNotAfter(der); ok {
+			t.Fatalf("nebulaCertNotAfter(%s) want ok=false", name)
+		}
+	}
+}
+
+func TestNebulaCertDaysLeftMetric(t *testing.T) {
+	cfg, _ := fixture(t)
+	notAfter := time.Now().Unix() + 10*86400 + 3600 // ~10 days → <30 → expiring
+	if err := os.WriteFile(cfg.NebulaCertFile, nebulaCertPEM(notAfter), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := New(cfg)
+	if v, ok := metricValue(t, c, "node_host_agent_nebula_cert_days_left", nil); !ok || v != 10 {
+		t.Fatalf("cert_days_left=%v ok=%v want 10", v, ok)
+	}
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "nebula-cert-expiring"}); !ok || v != 1 {
+		t.Fatalf("cert-expiring state=%v ok=%v want 1", v, ok)
+	}
+}
+
+func TestNebulaCertHealthyEmitsZero(t *testing.T) {
+	cfg, _ := fixture(t)
+	notAfter := time.Now().Unix() + 90*86400 // ~90 days → no expiring
+	if err := os.WriteFile(cfg.NebulaCertFile, nebulaCertPEM(notAfter), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := New(cfg)
+	if v, ok := metricValue(t, c, "node_host_agent_nebula_cert_days_left", nil); !ok || v != 90 {
+		t.Fatalf("cert_days_left=%v ok=%v want 90", v, ok)
+	}
+	// Alert contract: explicit 0 once the cert was readable.
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "nebula-cert-expiring"}); !ok || v != 0 {
+		t.Fatalf("cert-expiring state=%v ok=%v want emitted 0", v, ok)
+	}
+}
+
+func TestNebulaCertAbsentEmitsNothing(t *testing.T) {
+	cfg, _ := fixture(t)
+	c := New(cfg)
+	if _, ok := metricValue(t, c, "node_host_agent_nebula_cert_days_left", nil); ok {
+		t.Fatal("cert_days_left emitted without cert")
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "nebula-cert-expiring"}); ok {
+		t.Fatal("cert-expiring emitted though the cert was never readable")
+	}
+}
+
+func TestNebulaCertUnparseableEmitsNothing(t *testing.T) {
+	cfg, _ := fixture(t)
+	write(t, cfg.NebulaCertFile, "-----BEGIN NEBULA CERTIFICATE-----\nnot-base64!!!\n-----END NEBULA CERTIFICATE-----\n")
+	c := New(cfg)
+	if _, ok := metricValue(t, c, "node_host_agent_nebula_cert_days_left", nil); ok {
+		t.Fatal("cert_days_left emitted for garbage PEM")
+	}
+}
+
+func TestNebulaCertStatePersistsZeroAfterRemoval(t *testing.T) {
+	cfg, _ := fixture(t)
+	notAfter := time.Now().Unix() + 10*86400
+	if err := os.WriteFile(cfg.NebulaCertFile, nebulaCertPEM(notAfter), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := New(cfg)
+	// First scrape registers the state (value 1 while expiring).
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "nebula-cert-expiring"}); !ok || v != 1 {
+		t.Fatalf("cert-expiring=%v ok=%v want 1", v, ok)
+	}
+	// Cert vanishes — the seenStates bookkeeping must keep the
+	// series alive at 0 (auto-resolve), not drop it.
+	if err := os.Remove(cfg.NebulaCertFile); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": "nebula-cert-expiring"})
+	if !ok || v != 0 {
+		t.Fatalf("cert-expiring after removal=%v ok=%v want emitted 0", v, ok)
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_nebula_cert_days_left", nil); ok {
+		t.Fatal("cert_days_left emitted after cert removal")
 	}
 }

@@ -49,6 +49,8 @@ var queues = []string{
 	"cilium-identity-auditor", "csr-watcher",
 	// watch-cache wedge guard
 	"apiserver-endpoint-guard",
+	// ported kubectl CronJobs (v0.8.0)
+	"coredns-patcher", "metrics-server-patcher", "cf-tunnel-proxy-watchdog",
 }
 
 func init() {

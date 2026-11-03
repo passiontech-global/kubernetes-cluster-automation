@@ -249,6 +249,7 @@ func TestMainRunShutsDownOnSIGTERM(t *testing.T) {
 		"NODE_HOST_AGENT_ENABLE_SWEEPER=false",
 		"NODE_HOST_AGENT_ENABLE_APIPROBER=false",
 		"NODE_HOST_AGENT_ENABLE_HOSTMETRICS=false",
+		"NODE_HOST_AGENT_ENABLE_HYGIENE=false",
 		"KUBERNETES_SERVICE_HOST=",
 		"KUBERNETES_SERVICE_PORT=",
 		"KUBECONFIG=",
@@ -317,6 +318,7 @@ func TestMainRunListenerError(t *testing.T) {
 		"NODE_HOST_AGENT_ENABLE_SWEEPER=false",
 		"NODE_HOST_AGENT_ENABLE_APIPROBER=false",
 		"NODE_HOST_AGENT_ENABLE_HOSTMETRICS=false",
+		"NODE_HOST_AGENT_ENABLE_HYGIENE=false",
 		"KUBERNETES_SERVICE_HOST=",
 		"KUBERNETES_SERVICE_PORT=",
 		"KUBECONFIG=",
@@ -402,6 +404,7 @@ users:
 		t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "true")
 		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "false")
 		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "false")
+		t.Setenv("NODE_HOST_AGENT_ENABLE_HYGIENE", "false")
 		cfg, _ := buildAgentConfig("n", "p", "ns", "v", "127.0.0.1:0", "127.0.0.1:0")
 		if len(cfg.Subsystems) != 1 || cfg.Subsystems[0].Name() != "sweeper" {
 			names := []string{}
