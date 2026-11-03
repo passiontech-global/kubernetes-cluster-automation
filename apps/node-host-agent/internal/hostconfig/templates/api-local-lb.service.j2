@@ -1,0 +1,48 @@
+# Managed by node-config-agent - templates/api-local-lb.service.j2 (A1, 2026-09-16)
+# Unit RIENG cho LB node-local — KHONG dung unit 'haproxy.service' cua
+# distro: unit do chay /etc/haproxy/haproxy.cfg mac dinh (frontend :80,
+# policy restart khac). Task cai deb da stop+disable unit distro ngay.
+[Unit]
+Description=Node-local k0s API load balancer (127.0.0.1:6443 -> api backends)
+Documentation=file:/etc/haproxy/api-local-lb.cfg
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# -db: foreground (systemd lam supervisor), khong fork/pidfile.
+ExecStart=/usr/sbin/haproxy -db -f /etc/haproxy/api-local-lb.cfg
+# Drain-state persistence (cap doi voi server-state-file +
+# load-server-state-from-file trong api-local-lb.cfg): dump `show
+# servers state` ra file TRUOC khi process down de haproxy moi khoi
+# phuc enable/disable da set qua admin socket (watchdog sig14b,
+# apiprober). ExecStop chay truoc SIGTERM nen socket van song.
+# '-' + '|| :' = fail-open: khong socat/nc hoac socket mat thi bo qua.
+# socat fallback nc -U giong lib.sh lb_srv() — socat khong bat buoc.
+ExecReload=-/bin/sh -c 'echo "show servers state" | { socat stdio /run/api-local-lb-admin.sock 2>/dev/null || nc -U /run/api-local-lb-admin.sock 2>/dev/null; } > /run/api-local-lb.state.tmp && mv /run/api-local-lb.state.tmp /run/api-local-lb.state || :'
+# -db khong co master-worker => khong reload in-place duoc: reload =
+# TERM roi Restart=always bat lai voi config + state file moi nhat.
+ExecReload=-/bin/kill -TERM $MAINPID
+ExecStop=-/bin/sh -c 'echo "show servers state" | { socat stdio /run/api-local-lb-admin.sock 2>/dev/null || nc -U /run/api-local-lb-admin.sock 2>/dev/null; } > /run/api-local-lb.state.tmp && mv /run/api-local-lb.state.tmp /run/api-local-lb.state || :'
+{% if (api_lb_vip_ip | default('')) | length > 0 %}
+# Root-netns transparent redirect (T12 phan 2): DNAT
+# {{ api_lb_vip_ip }}:6443 -> 127.0.0.1:6443 — dua consumer POD
+# host-netns (cilium-agent/konnectivity-agent resolve VIP qua DNS,
+# khong thay /etc/hosts pin) vao LB local. /etc/api-local-dnat.nft
+# co `destroy table` dau file => nap lai sach moi lan (idempotent
+# qua Restart). skuid "haproxy" accept dau chain: outbound cua chinh
+# haproxy toi VIP (backend vip trong api_lb_backends) di thang ra
+# ngoai, khong bi dnat ve loopback -> loop.
+ExecStartPost=-/usr/sbin/nft -f /etc/api-local-dnat.nft
+{% endif %}
+# FAIL-OPEN tuyet doi: '-' = systemd bo qua exit code. Unit stop hoac
+# haproxy crash => xoa nguyen table => traffic toi VIP tro lai duong
+# truc tiep ngay lap tuc, khong con redirect vao 127.0.0.1:6443 chet.
+ExecStopPost=-/usr/sbin/nft delete table ip api_local_dnat
+# LB chet yen = node mat endpoint (hosts pin chi ve 127.0.0.1) =>
+# Restart=always + 5s de systemd tu hoi phuc, KHONG cho chu ky
+# playbook ~1h cua node-config-agent.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

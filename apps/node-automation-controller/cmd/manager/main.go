@@ -34,7 +34,6 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -162,11 +161,6 @@ func main() {
 					Field: fields.SelectorFromSet(
 						fields.Set{"metadata.name": "passiontech-pipeline"}),
 				},
-				// node-ops Role: configmaps get/list/watch (converge
-				// trigger watches every CM in this namespace).
-				&corev1.ConfigMap{}: {
-					Namespaces: map[string]cache.Config{"node-ops": {}},
-				},
 				// cilium component Role: pods in kube-system — informer is
 				// only started when CILIUM_TAINT_REAPER_ENABLED=true (see
 				// SetupCiliumTaintReaper, which now returns nil before
@@ -203,7 +197,7 @@ func main() {
 
 	mc := moduleConfigFromEnv()
 
-	if err := setupModules(mgr, cs, dyn, cfg, mc); err != nil {
+	if err := setupModules(mgr, cs, dyn, mc); err != nil {
 		os.Exit(1)
 	}
 
@@ -236,7 +230,6 @@ type moduleConfig struct {
 	csrApproveEnabled           bool
 	labelerPath                 string
 	concourseJanitorEnabled     bool
-	concourseJanitorScript      string
 	corednsPatcherEnabled       bool
 	corednsZoneWhen             string
 	corednsZoneMinDomains       int
@@ -258,8 +251,6 @@ func moduleConfigFromEnv() moduleConfig {
 		csrApproveEnabled:       os.Getenv("CSR_APPROVER_ENABLED") == "true",
 		labelerPath:             getenv("NODE_LABELER_CONFIG_PATH", "/etc/node-labeler/labels.txt"),
 		concourseJanitorEnabled: os.Getenv("CONCOURSE_JANITOR_ENABLED") == "true",
-		concourseJanitorScript: getenv("CONCOURSE_JANITOR_SCRIPT_PATH",
-			"/etc/concourse-janitor/prune.sh"),
 		// The three ported patcher/watchdog CronJobs were always-on
 		// base components — default-ON here too (explicit "false"
 		// opts a cluster out), unlike the opt-in gates above.
@@ -278,7 +269,7 @@ func moduleConfigFromEnv() moduleConfig {
 // setupModules registers every node-ops module on the manager. The map
 // (not a slice) keeps registration order deliberately random — no
 // module may rely on another being wired first.
-func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, cfg *rest.Config, mc moduleConfig) error {
+func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, mc moduleConfig) error {
 	log := ctrl.Log.WithName("main")
 	for name, setup := range map[string]func() error{
 		"konnectivity-patcher":     func() error { return controller.SetupKonnectivityPatcher(mgr, cs) },
@@ -291,7 +282,6 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 		"admission-webhook-guard":  func() error { return controller.SetupWebhookGuard(mgr, cs) },
 		"partition-pod-evictor":    func() error { return controller.SetupPartitionEvictor(mgr, cs) },
 		"failed-jobs-janitor":      func() error { return controller.SetupFailedJobsJanitor(mgr, cs) },
-		"converge-trigger":         func() error { return controller.SetupConvergeTrigger(mgr, cs) },
 		"dead-node-sweeper":        func() error { return controller.SetupDeadNodeSweeper(mgr, cs, dyn) },
 		"helmrelease-unlocker":     func() error { return controller.SetupHelmReleaseUnlocker(mgr, cs, dyn) },
 		"externalsecret-nudge":     func() error { return controller.SetupExternalSecretNudge(mgr, cs, dyn, mc.esNudgeEnabled) },
@@ -302,8 +292,8 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 		"csr-watcher":              func() error { return controller.SetupCSRWatcher(mgr, cs, mc.csrApproveEnabled) },
 		"apiserver-endpoint-guard": func() error { return controller.SetupAPIServerEndpointGuard(mgr, cs) },
 		"concourse-workdir-janitor": func() error {
-			return controller.SetupConcourseWorkdirJanitor(mgr, cs, cfg,
-				mc.concourseJanitorEnabled, mc.concourseJanitorScript)
+			return controller.SetupConcourseWorkdirJanitor(mgr, cs,
+				mc.concourseJanitorEnabled)
 		},
 		"coredns-patcher": func() error {
 			return controller.SetupCoreDNSPatcher(mgr, cs,

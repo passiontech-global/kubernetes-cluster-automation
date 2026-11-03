@@ -304,9 +304,6 @@ func TestSetupBuilderModules(t *testing.T) {
 		{"fluent-bit-config-roller", func(m manager.Manager) error {
 			return SetupFluentBitRoller(m, cs, true)
 		}},
-		{"converge-trigger", func(m manager.Manager) error {
-			return SetupConvergeTrigger(m, cs)
-		}},
 		// enabled registers two sources (.Watches on Nodes + cilium
 		// Pods) — still one controller runnable.
 		{"cilium-taint-reaper", func(m manager.Manager) error {

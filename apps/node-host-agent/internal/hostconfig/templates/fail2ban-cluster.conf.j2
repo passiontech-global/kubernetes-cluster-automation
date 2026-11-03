@@ -1,0 +1,35 @@
+# Managed by node-config-agent (tasks/node_tuning_fail2ban.yaml) —
+# fail2ban cho node co public IP (sshd bi brute-force lien tuc; flood
+# keo theo provider drop SYN -> converge CronJob fail ngau nhien).
+#
+# Chi jail sshd. Cac port k8s khac (6443 apiserver, 10250 kubelet) la
+# cert-auth: khong co password brute-force, va ban IP tren nhung port
+# do co the dut cluster traffic — tuyet doi khong them jail cho chung.
+[DEFAULT]
+# journald — khong phu thuoc /var/log/auth.log (cloud image toi gian
+# co the khong cai rsyslog).
+backend = systemd
+# nftables native — node chay nft (nebnat/interdc_acct/...); ban chi
+# ap cho port cua jail (ssh/22), khong dung cluster dataplane.
+banaction = nftables-multiport
+banaction_allports = nftables-allports
+# Whitelist: localhost + moi node trong mesh registry (automation SSH
+# public->public: hub-converge CronJob, ansible
+# converge tay — key auth hong nhieu lan van khong tu khoa).
+# Them LAN/VPN range qua fail2ban_ignoreip_extra neu admin SSH tu
+# private net.
+ignoreip = {{ fail2ban_ignoreip }}
+# Progressive ban: lan dau bantime, moi lan tai pham x factor, tran
+# maxtime — scanner dai dang bi ban gan nhu vinh vien, user quen pass
+# chi khoa tam.
+bantime = {{ fail2ban_bantime | default('1h') }}
+bantime.increment = true
+bantime.factor = 2
+bantime.maxtime = {{ fail2ban_bantime_max | default('1w') }}
+findtime = {{ fail2ban_findtime | default('10m') }}
+maxretry = {{ fail2ban_maxretry | default(5) }}
+
+[sshd]
+enabled = true
+port = {{ fail2ban_sshd_port | default('ssh') }}
+maxretry = {{ fail2ban_sshd_maxretry | default(4) }}

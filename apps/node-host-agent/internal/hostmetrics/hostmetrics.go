@@ -25,6 +25,23 @@
 //     directly and exports node_host_agent_nebula_cert_days_left plus
 //     the watchdog-state-style series
 //     node_host_agent_watchdog_state{state="nebula-cert-expiring"}.
+//   - PSI overload: /proc/pressure/cpu some avg60 →
+//     node_watchdog_psi_cpu_some_avg60, and drives the
+//     state-node-overloaded latch with hysteresis (>=40% enter,
+//     <25% exit) — the runner's node-overloaded signal every restart
+//     gate reads.
+//   - cpu-delivered probe (lib.sh measure_cpu_delivered): a fixed
+//     ~0.3 cpu-s busy loop on a locked thread (RUSAGE_THREAD) vs wall
+//     clock → node_cpu_delivered_ratio +
+//     node_cpu_delivered_probe_wall_seconds — the ground-truth
+//     "how much of 1 vCPU did the hypervisor actually give" steal
+//     canary guest accounting can't see.
+//   - fail2ban banned counts: fail2ban-banned file ("jail=N ...")
+//     written by the nethealth check → node_fail2ban_banned_ips{jail}.
+//   - egress relay state: per OVERLAY_EGRESS_RELAYS target,
+//     node_overlay_egress_relay_active{target} = 1 while
+//     egress-state-<ip> is "relay" (emitted for every configured
+//     target — absent vs 0 must stay distinguishable).
 //
 // Emission policy (documented choice): watchdog_state emits for every
 // latch ever observed (1 while latched, 0 after clear). The
@@ -41,12 +58,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sys/unix"
 	"sigs.k8s.io/yaml"
 )
 
@@ -59,6 +79,18 @@ const (
 	defaultK0sConfigFile    = "/etc/k0s/k0s.yaml"
 	defaultK0sUnitFile      = "/etc/systemd/system/k0scontroller.service"
 	defaultNebulaCertFile   = "/host/etc/nebula/interdc/host.crt"
+	defaultPSIFile          = "/proc/pressure/cpu"
+	// psiOverloadedOn/Off are the node-overloaded hysteresis — the
+	// runner's load15>4*ncpu test replaced by PSI some avg60 (actual
+	// stall evidence, not raw load): enter the latch at >=40%,
+	// release below 25%.
+	psiOverloadedOn  = 40.0
+	psiOverloadedOff = 25.0
+	// cpuDeliveredTarget is the fixed busy-loop work (~0.3 cpu-s —
+	// ~0.1% of a 5m cycle on a healthy node, ~6s wall at 95% steal).
+	cpuDeliveredTarget    = 0.3
+	cpuDeliveredMaxWall   = 60 * time.Second
+	defaultCPUDeliveredIn = 2 * time.Minute
 )
 
 // nebulaCertWarnDays mirrors module 13-nebula-health: fewer than this
@@ -97,8 +129,23 @@ type Config struct {
 	K0sConfigFile    string
 	K0sUnitFile      string
 	NebulaCertFile   string
-	RemovedFlags     []string
-	ExpectedKCMArgs  []string
+	// PSIFile is /proc/pressure/cpu — drives the overload gauge +
+	// state-node-overloaded latch.
+	PSIFile string
+	// EgressRelays is OVERLAY_EGRESS_RELAYS (wired from watchdogconf
+	// by main) — each target gets a relay-active gauge.
+	EgressRelays []string
+	// CPUDeliveredInterval bounds how often the busy-loop probe runs
+	// (shell: once per 2m run).
+	CPUDeliveredInterval time.Duration
+	RemovedFlags         []string
+	ExpectedKCMArgs      []string
+
+	// nowFn supplies the current time — seam for tests.
+	nowFn func() time.Time
+	// cpuMeasure replaces the real RUSAGE_THREAD busy-loop for
+	// tests: returns (ratio, wallSeconds, ok).
+	cpuMeasure func() (ratio, wall float64, ok bool)
 }
 
 func (c *Config) applyDefaults() {
@@ -122,6 +169,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.NebulaCertFile == "" {
 		c.NebulaCertFile = defaultNebulaCertFile
+	}
+	if c.PSIFile == "" {
+		c.PSIFile = defaultPSIFile
+	}
+	if c.CPUDeliveredInterval <= 0 {
+		c.CPUDeliveredInterval = defaultCPUDeliveredIn
+	}
+	if c.nowFn == nil {
+		c.nowFn = time.Now
 	}
 	if len(c.RemovedFlags) == 0 {
 		c.RemovedFlags = defaultRemovedFlags
@@ -160,6 +216,21 @@ type Collector struct {
 	descNebRoute    *prometheus.Desc
 	descNebCertDays *prometheus.Desc
 	descK0sDrift    *prometheus.Desc
+	descPSI         *prometheus.Desc
+	descCPURatio    *prometheus.Desc
+	descCPUWall     *prometheus.Desc
+	descF2B         *prometheus.Desc
+	descEgressRelay *prometheus.Desc
+
+	// cpu-delivered probe bookkeeping (mu): the busy-loop runs in a
+	// goroutine — a scrape triggers it and serves the last result;
+	// a scrape must never block up to ~6s on steal measurement.
+	cpuRunning bool
+	cpuLast    time.Time
+	cpuRatio   float64
+	cpuWall    float64
+	cpuOK      bool
+	cpuSink    uint64 // busy-loop sink, mu-guarded
 }
 
 // New returns the Collector. Register it on the agent's registry.
@@ -203,6 +274,26 @@ func New(cfg Config) *Collector {
 			"or unreadable config (emitted only on nodes running "+
 			"k0scontroller.service).",
 		[]string{"reason", "key"}, nil)
+	c.descPSI = prometheus.NewDesc(
+		"node_watchdog_psi_cpu_some_avg60",
+		"PSI cpu some avg60 — share of time runnable tasks stalled (runner's overload signal).",
+		nil, nil)
+	c.descCPURatio = prometheus.NewDesc(
+		"node_cpu_delivered_ratio",
+		"Share of 1 vCPU actually delivered by the hypervisor — busy-loop probe (~0.3 cpu-s, 1.0 = no steal).",
+		nil, nil)
+	c.descCPUWall = prometheus.NewDesc(
+		"node_cpu_delivered_probe_wall_seconds",
+		"Wall-clock the cpu-delivered probe ran — abnormal growth = the probe itself stalled.",
+		nil, nil)
+	c.descF2B = prometheus.NewDesc(
+		"node_fail2ban_banned_ips",
+		"Currently banned IPs per fail2ban jail (emitted only when the banned file exists).",
+		[]string{"jail"}, nil)
+	c.descEgressRelay = prometheus.NewDesc(
+		"node_overlay_egress_relay_active",
+		"Egress target currently routed via the overlay relay (1) or direct underlay (0).",
+		[]string{"target"}, nil)
 	return c
 }
 
@@ -213,17 +304,34 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.descNebRoute
 	ch <- c.descNebCertDays
 	ch <- c.descK0sDrift
+	ch <- c.descPSI
+	ch <- c.descCPURatio
+	ch <- c.descCPUWall
+	ch <- c.descF2B
+	ch <- c.descEgressRelay
 }
 
 // Collect implements prometheus.Collector.
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
+	// Side-effect probes run BEFORE the state-dir scan so a latch
+	// they transition shows up in this scrape's watchdog_state.
+	avg60, psiOK := c.psiAvg60()
+	if psiOK {
+		c.updateOverloadLatch(avg60)
+	}
+	c.maybeMeasureCPU()
 	// The cert is parsed once per scrape and shared between the
 	// watchdog-state latch bookkeeping and the days-left gauge.
 	certDays, certOK := c.nebulaCertDaysLeft()
+	c.updateCertLatch(certDays, certOK)
 	c.collectWatchdog(ch, certDays, certOK)
 	c.collectNebula(ch)
 	c.collectNebulaCert(ch, certDays, certOK)
 	c.collectK0sDrift(ch)
+	c.collectPSI(ch, avg60, psiOK)
+	c.collectCPUDelivered(ch)
+	c.collectFail2ban(ch)
+	c.collectEgressRelay(ch)
 }
 
 // collectWatchdog scans state-* latch files. certDays/certOK fold the
@@ -304,6 +412,43 @@ func (c *Collector) collectNebula(ch chan<- prometheus.Metric) {
 	}
 	ch <- prometheus.MustNewConstMetric(c.descNebRoute,
 		prometheus.GaugeValue, present)
+}
+
+// updateCertLatch mirrors 13-nebula-health.sh's FILE contract — the
+// nodereporter and prom filelog consumers read files, not metric
+// series: state-nebula-cert-expiring is created (state_enter, epoch
+// content, only while absent) when days < nebulaCertWarnDays and
+// removed on recovery, and nebula-cert-days-left is rewritten on
+// every parsed scrape (shell wrote it every run). An absent or
+// unparseable cert CLEARS both files — the shell left the latch
+// behind on `[ -s "$cert" ]` failure, but a permanent phantom latch
+// breaks both the file consumers and the emit-0 alert contract (a
+// gone cert cannot be "expiring").
+func (c *Collector) updateCertLatch(days int64, ok bool) {
+	dir := c.cfg.WatchdogStateDir
+	latch := filepath.Join(dir, "state-nebula-cert-expiring")
+	if !ok {
+		_ = os.Remove(latch)
+		_ = os.Remove(filepath.Join(dir, "nebula-cert-days-left"))
+		return
+	}
+	daysPath := filepath.Join(dir, "nebula-cert-days-left")
+	tmp := filepath.Join(dir, ".tmp-"+filepath.Base(daysPath))
+	if err := os.WriteFile(tmp,
+		[]byte(strconv.FormatInt(days, 10)+"\n"), 0o644); err == nil {
+		_ = os.Rename(tmp, daysPath)
+	}
+	_, statErr := os.Stat(latch)
+	switch {
+	case days < nebulaCertWarnDays && statErr != nil:
+		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
+		tmp = filepath.Join(dir, ".tmp-"+filepath.Base(latch))
+		if os.WriteFile(tmp, []byte(content), 0o644) == nil {
+			_ = os.Rename(tmp, latch)
+		}
+	case days >= nebulaCertWarnDays && statErr == nil:
+		_ = os.Remove(latch)
+	}
 }
 
 // collectNebulaCert emits the cert days-left gauge — only when the
@@ -535,5 +680,202 @@ func (c *Collector) collectK0sDrift(ch chan<- prometheus.Metric) {
 	for _, f := range findings {
 		ch <- prometheus.MustNewConstMetric(c.descK0sDrift,
 			prometheus.GaugeValue, 1, f.reason, f.key)
+	}
+}
+
+// --- PSI overload (runner's node-overloaded) ---
+
+// psiAvg60 parses the "some avg60=" field of /proc/pressure/cpu.
+// ok=false on a missing/malformed file — the latch is left untouched
+// (inconclusive, like the other file-based signals).
+func (c *Collector) psiAvg60() (float64, bool) {
+	data, err := os.ReadFile(c.cfg.PSIFile)
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 || f[0] != "some" {
+			continue
+		}
+		for _, kv := range f[1:] {
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok || k != "avg60" {
+				continue
+			}
+			x, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return 0, false
+			}
+			return x, true
+		}
+	}
+	return 0, false
+}
+
+// updateOverloadLatch drives state-node-overloaded with hysteresis:
+// >=psiOverloadedOn enters, <psiOverloadedOff exits, between the
+// thresholds the current state persists. Written only on transition —
+// the file content is when the condition STARTED.
+func (c *Collector) updateOverloadLatch(avg60 float64) {
+	p := filepath.Join(c.cfg.WatchdogStateDir, "state-node-overloaded")
+	_, err := os.Stat(p)
+	switch {
+	case avg60 >= psiOverloadedOn && err != nil:
+		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
+		tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
+		if os.WriteFile(tmp, []byte(content), 0o644) == nil {
+			_ = os.Rename(tmp, p)
+		}
+	case avg60 < psiOverloadedOff && err == nil:
+		_ = os.Remove(p)
+	}
+}
+
+// collectPSI emits the avg60 gauge only when PSI parsed.
+func (c *Collector) collectPSI(ch chan<- prometheus.Metric, avg60 float64, ok bool) {
+	if !ok {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.descPSI,
+		prometheus.GaugeValue, avg60)
+}
+
+// --- cpu-delivered probe (lib.sh measure_cpu_delivered) ---
+
+// maybeMeasureCPU re-arms the busy-loop probe every
+// CPUDeliveredInterval. The probe itself runs in a goroutine so a
+// scrape never blocks on wall-clock steal; the gauges serve the last
+// completed measurement.
+func (c *Collector) maybeMeasureCPU() {
+	c.mu.Lock()
+	if c.cpuRunning ||
+		c.cfg.nowFn().Sub(c.cpuLast) < c.cfg.CPUDeliveredInterval {
+		c.mu.Unlock()
+		return
+	}
+	c.cpuRunning = true
+	c.mu.Unlock()
+	go func() {
+		ratio, wall, ok := c.measureCPU()
+		c.mu.Lock()
+		c.cpuRunning = false
+		c.cpuLast = c.cfg.nowFn()
+		if ok {
+			c.cpuRatio, c.cpuWall, c.cpuOK = ratio, wall, true
+		}
+		c.mu.Unlock()
+	}()
+}
+
+// measureCPU burns a fixed ~0.3 cpu-s on a LOCKED thread and returns
+// ratio = cpu_target / wall (capped 1.0 — jiffies overshoot can make
+// wall slightly under target). RUSAGE_THREAD isolates the probe from
+// other goroutines' CPU — the shell measured the whole-process
+// jiffies; a locked thread is the closest Go equivalent.
+func (c *Collector) measureCPU() (ratio, wall float64, ok bool) {
+	if c.cfg.cpuMeasure != nil {
+		return c.cfg.cpuMeasure()
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	var ru0, ru1 unix.Rusage
+	if unix.Getrusage(unix.RUSAGE_THREAD, &ru0) != nil {
+		return 0, 0, false
+	}
+	cpuAt := func(r *unix.Rusage) float64 {
+		return float64(r.Utime.Sec) + float64(r.Utime.Usec)/1e6 +
+			float64(r.Stime.Sec) + float64(r.Stime.Usec)/1e6
+	}
+	wall0 := time.Now()
+	var sink uint64
+	for i := uint64(0); ; i++ {
+		sink += i // any real work — jiffie-counted CPU
+		if i%65536 == 0 {
+			if unix.Getrusage(unix.RUSAGE_THREAD, &ru1) != nil {
+				return 0, 0, false
+			}
+			if cpuAt(&ru1)-cpuAt(&ru0) >= cpuDeliveredTarget {
+				break
+			}
+			if time.Since(wall0) > cpuDeliveredMaxWall {
+				return 0, 0, false // probe itself stalled — no metric
+			}
+		}
+	}
+	c.mu.Lock()
+	c.cpuSink = sink
+	c.mu.Unlock()
+	wall = time.Since(wall0).Seconds()
+	if wall <= 0 {
+		return 0, 0, false
+	}
+	ratio = cpuDeliveredTarget / wall
+	if ratio > 1 {
+		ratio = 1
+	}
+	return ratio, wall, true
+}
+
+// cpuDeliveredSink keeps the busy loop's work observable so the
+// compiler can't optimize it away.
+var cpuDeliveredSink uint64
+
+// collectCPUDelivered emits the last completed probe — absent before
+// the first measurement (shell: no cpu-delivered file → no metric,
+// never a fake 0).
+func (c *Collector) collectCPUDelivered(ch chan<- prometheus.Metric) {
+	c.mu.Lock()
+	ok, ratio, wall := c.cpuOK, c.cpuRatio, c.cpuWall
+	c.mu.Unlock()
+	if !ok {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.descCPURatio,
+		prometheus.GaugeValue, ratio)
+	ch <- prometheus.MustNewConstMetric(c.descCPUWall,
+		prometheus.GaugeValue, wall)
+}
+
+// --- fail2ban banned counts (50-fail2ban.sh + prom_emit) ---
+
+// collectFail2ban emits node_fail2ban_banned_ips{jail} from the
+// fail2ban-banned file — absent when the file is (node without
+// fail2ban → absent series, never a fake 0).
+func (c *Collector) collectFail2ban(ch chan<- prometheus.Metric) {
+	data, err := os.ReadFile(
+		filepath.Join(c.cfg.WatchdogStateDir, "fail2ban-banned"))
+	if err != nil {
+		return
+	}
+	for _, pair := range strings.Fields(string(data)) {
+		jail, n, ok := strings.Cut(pair, "=")
+		if !ok || jail == "" {
+			continue
+		}
+		v, err := strconv.ParseFloat(n, 64)
+		if err != nil {
+			continue // malformed entry — never emit junk (file contract)
+		}
+		ch <- prometheus.MustNewConstMetric(c.descF2B,
+			prometheus.GaugeValue, v, jail)
+	}
+}
+
+// --- overlay egress relay state (12-overlay-egress + prom_emit) ---
+
+// collectEgressRelay emits node_overlay_egress_relay_active for
+// EVERY configured relay — a 0 while the target is direct vs an
+// absent series for "never relayed" must stay distinguishable.
+func (c *Collector) collectEgressRelay(ch chan<- prometheus.Metric) {
+	for _, r := range c.cfg.EgressRelays {
+		v := 0.0
+		data, err := os.ReadFile(
+			filepath.Join(c.cfg.WatchdogStateDir, "egress-state-"+r))
+		if err == nil && strings.TrimSpace(string(data)) == "relay" {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.descEgressRelay,
+			prometheus.GaugeValue, v, r)
 	}
 }

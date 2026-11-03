@@ -1,0 +1,109 @@
+#!/bin/bash
+# Managed by node-config-agent - nebula {{ interdc_nebula_net }} post-up
+# (ExecStartPost cua nebula@{{ interdc_nebula_net }}.service).
+# Converge task T5b cung apply cac rule nay — script la fallback path
+# khi daemon restart giua hai chu ky agent.
+DEV={{ interdc_nebula_dev }}
+PUB={{ interdc_nebula_table_pub }}
+MARK={{ interdc_nebula_table_marker }}
+NETDIR=/etc/nebula/{{ interdc_nebula_net }}
+# Overlay dang active doc tu state file do agent render — nebula KHONG
+# duoc ghi ip rules khi tinc dang giu dataplane (va nguoc lai tinc-up
+# doc cung file nay).
+OVERLAY=$(cat "$NETDIR/overlay" 2>/dev/null || echo tinc)
+
+# Transport UDP/{{ interdc_nebula_port }} phai bypass overlay — khong
+# mark thi packet toi public IP peer (nam trong targets) bi rule 1500
+# hut vao lai tunnel => routing loop. fwmark rule 1400 shared voi tinc.
+ip rule list | grep -q "fwmark 0x1000" || ip rule add pref 1400 fwmark 0x1000 lookup main
+for p in dport sport; do
+  iptables -t mangle -C OUTPUT -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000 2>/dev/null \
+    || iptables -t mangle -A OUTPUT -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000
+  iptables -t mangle -C PREROUTING -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000 2>/dev/null \
+    || iptables -t mangle -A PREROUTING -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000
+done
+
+sysctl -qw net.ipv4.conf.$DEV.rp_filter=0
+{% if interdc_relay_map[interdc_nebula_node.name] | default([]) | length > 0 %}
+sysctl -qw net.ipv4.ip_forward=1
+{% endif %}
+
+# Populate tables (warm standby — route san sang ke ca khi overlay=tinc).
+ip route replace default dev $DEV src {{ interdc_nebula_node.ip }} table $PUB
+NODE_IP=$(sed -n 's/.*--node-ip=\([0-9.]*\).*/\1/p' /etc/systemd/system/k0sworker.service 2>/dev/null | head -1)
+{% if (interdc_nebula_node.hub | default(false)) | bool %}
+NODE_IP={{ interdc_markers[interdc_nebula_node.name] }}
+{% endif %}
+case "$NODE_IP" in
+  {{ interdc_marker_base }}.*)
+    ip route replace default dev $DEV src $NODE_IP table $MARK ;;
+  *) ip route flush table $MARK 2>/dev/null ;;
+esac
+
+# Policy rules chi duoc ghi khi node nay da cutover sang nebula.
+if [ "$OVERLAY" = nebula ]; then
+  # Go moi rule pref-1500 cho dsts cua mesh tro table KHONG phai $PUB
+  # (stale tu overlay cu / renumber) + prune rules khong con trong
+  # keep-list (node bi go khoi mesh / doi site / relay go khoi list).
+  # Giu nguyen rules cho dst ngoai mesh.
+  ip rule list pref 1500 | sed -n "s|.*to \([0-9./]*\).*lookup \([0-9]*\).*|\1 \2|p" | while read -r d t; do
+    case " {{ interdc_targets | join(' ') }} {{ interdc_egress_relays | default([]) | join(' ') }} {{ interdc_marker_base }}.0/24 " in
+      *" $d "*) [ "$t" = "$PUB" ] || ip rule del pref 1500 to "$d" lookup "$t" 2>/dev/null ;;
+      *) ip rule del pref 1500 to "$d" lookup "$t" 2>/dev/null ;;
+    esac
+  done
+  for d in {{ interdc_targets | join(' ') }} {{ interdc_marker_base }}.0/24; do
+    ip rule list | grep -q "to $d lookup $PUB" \
+      || ip rule add pref 1500 to "$d" lookup $PUB
+  done
+  # Migrate relay rules dang committed (watchdog state=relay) sang $PUB
+  # ngay — khong cho module 12 heal 1 chu ky.
+  for d in {{ interdc_egress_relays | default([]) | join(' ') }}; do
+    if [ "$(cat /var/lib/node-watchdog/egress-state-$d 2>/dev/null)" = relay ]; then
+      ip rule list | grep -q "to $d lookup $PUB" \
+        || ip rule add pref 1500 to "$d" lookup $PUB
+    fi
+  done
+  for t in $(ip rule list pref 1490 | sed -n "s|.*to {{ interdc_marker_base }}\.0/24 .*lookup \([0-9]*\).*|\1|p"); do
+    [ "$t" = "$MARK" ] || ip rule del pref 1490 to {{ interdc_marker_base }}.0/24 lookup "$t" 2>/dev/null
+  done
+  case "$NODE_IP" in
+    {{ interdc_marker_base }}.*)
+      ip rule list | grep -q "to {{ interdc_marker_base }}.0/24 lookup $MARK" \
+        || ip rule add pref 1490 to {{ interdc_marker_base }}.0/24 lookup $MARK ;;
+  esac
+  # Flush moi table co route dev $DEV ngoai {pub, marker} — don table
+  # cu sau renumber (102/103 -> 100/101).
+  ip -o route show table all dev $DEV 2>/dev/null | sed -n "s|.* table \([0-9]*\) .*|\1|p" | sort -u | while read -r t; do
+    [ "$t" = "$PUB" ] || [ "$t" = "$MARK" ] || ip route flush table "$t" 2>/dev/null
+  done
+fi
+
+# nft nebnat — doi xung tincnat: marker traffic giu identity tunnel,
+# src khac SNAT ve public IP, relay IPs SNAT khi forward ra underlay.
+# priority srcnat-11 (sau tincnat -10) vi chi 1 dev active tai 1 thoi
+# diem — thu tu giua 2 table khong anh huong.
+nft add table ip nebnat 2>/dev/null
+nft 'add chain ip nebnat post { type nat hook postrouting priority srcnat - 11; }' 2>/dev/null
+for s in {{ interdc_marker_base }}.0; do
+  nft -a list chain ip nebnat post 2>/dev/null \
+    | sed -n "s/.*ip daddr $s\/24 return.*# handle \([0-9]*\).*/\1/p" \
+    | while read -r h; do nft delete rule ip nebnat post handle $h; done
+  nft list chain ip nebnat post 2>/dev/null | grep -q "saddr $s/24 return" \
+    || nft insert rule ip nebnat post oifname $DEV ip saddr $s/24 return
+  if ! nft list chain ip nebnat post 2>/dev/null | grep -q "daddr $s/24 snat"; then
+    h=$(nft -a list chain ip nebnat post 2>/dev/null \
+      | sed -n "s/.*oifname \"$DEV\" snat to {{ interdc_nebula_node.ip }}.*# handle \([0-9]*\).*/\1/p" | head -1)
+    [ -n "$h" ] && nft delete rule ip nebnat post handle $h
+    nft add rule ip nebnat post oifname $DEV ip daddr $s/24 snat to {{ interdc_markers[interdc_nebula_node.name] }}
+  fi
+done
+nft list chain ip nebnat post 2>/dev/null | grep -q "oifname \"$DEV\" snat to" \
+  || nft add rule ip nebnat post oifname $DEV snat to {{ interdc_nebula_node.ip }}
+{% for r in interdc_relay_map[interdc_nebula_node.name] | default([]) %}
+nft list chain ip nebnat post | grep -q "saddr {{ r.ip }} return" \
+  || nft insert rule ip nebnat post oifname $DEV ip saddr {{ r.ip }} return
+nft list chain ip nebnat post | grep -q "daddr {{ r.ip }} snat" \
+  || nft add rule ip nebnat post oifname != $DEV ip daddr {{ r.ip }} snat to {{ interdc_nebula_node.ip }}
+{% endfor %}
+exit 0

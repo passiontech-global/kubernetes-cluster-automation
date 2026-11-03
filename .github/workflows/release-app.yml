@@ -29,10 +29,20 @@ on:
         required: false
         default: false
         type: boolean
+    outputs:
+      rel_tag:
+        description: "Release tag created (e.g. <app>/v1.2.3)"
+        value: ${{ jobs.release.outputs.rel_tag }}
+      rel_version:
+        description: "Release version created (e.g. v1.2.3)"
+        value: ${{ jobs.release.outputs.rel_version }}
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      rel_tag: ${{ steps.rel.outputs.rel_tag }}
+      rel_version: ${{ steps.rel.outputs.rel_version }}
     env:
       APP: ${{ inputs.app }}
       IMAGE: ghcr.io/passiontech-global/${{ inputs.app }}
@@ -48,6 +58,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute version and changelog
+        id: rel
         run: |
           set -euo pipefail
           version_in="${{ inputs.version }}"
@@ -104,6 +115,11 @@ jobs:
 
           echo "REL_VERSION=$rel_version" >>"$GITHUB_ENV"
           echo "REL_TAG=$rel_tag" >>"$GITHUB_ENV"
+          # Job outputs for callers that need the resolved tag (e.g.
+          # the binary-attach job must not re-derive it from git —
+          # a stale higher tag could win that lookup).
+          echo "rel_version=$rel_version" >>"$GITHUB_OUTPUT"
+          echo "rel_tag=$rel_tag" >>"$GITHUB_OUTPUT"
 
       - name: Vet and test
         run: moon run "$APP:vet" "$APP:test"

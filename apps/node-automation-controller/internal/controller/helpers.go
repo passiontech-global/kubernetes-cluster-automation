@@ -7,8 +7,9 @@
 //     operator's RBAC intentionally has NO watch verb on most types
 //     (pods, services, jobs, webhookconfigs, ...), so a cached client
 //     would deadlock the informer. Only types with an explicit
-//     informer (Node, DaemonSet/konnectivity-agent, Secret/
-//     passiontech-pipeline, ConfigMap in node-ops) may be watched.
+//     informer (Node, DaemonSet/konnectivity-agent, Deployments and
+//     k8s-app=cilium Pods in kube-system, Secret/passiontech-pipeline)
+//     may be watched.
 //   - `name` everywhere is the legacy shell-operator queue name so
 //     metrics.IncError(name) keeps the alert contract.
 //   - Periodic modules register through addPeriodic; event-driven

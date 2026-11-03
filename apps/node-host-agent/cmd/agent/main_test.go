@@ -14,6 +14,8 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
 )
 
 func TestGetenv(t *testing.T) {
@@ -251,9 +253,14 @@ func TestMainRunShutsDownOnSIGTERM(t *testing.T) {
 		"GO_HELPER_PROCESS_RUN=1",
 		// Hermetic: no kube client attempts, no host-path probes.
 		"NODE_HOST_AGENT_ENABLE_SWEEPER=false",
+		"NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE=false",
 		"NODE_HOST_AGENT_ENABLE_APIPROBER=false",
 		"NODE_HOST_AGENT_ENABLE_HOSTMETRICS=false",
 		"NODE_HOST_AGENT_ENABLE_HYGIENE=false",
+		"NODE_HOST_AGENT_ENABLE_NETHEALTH=false",
+		"NODE_HOST_AGENT_ENABLE_REPORTER=false",
+		"NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE=false",
+		"NODE_HOST_AGENT_ENABLE_HOSTCONFIG=false",
 		"KUBERNETES_SERVICE_HOST=",
 		"KUBERNETES_SERVICE_PORT=",
 		"KUBECONFIG=",
@@ -320,9 +327,14 @@ func TestMainRunListenerError(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"GO_HELPER_PROCESS_BADADDR=1",
 		"NODE_HOST_AGENT_ENABLE_SWEEPER=false",
+		"NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE=false",
 		"NODE_HOST_AGENT_ENABLE_APIPROBER=false",
 		"NODE_HOST_AGENT_ENABLE_HOSTMETRICS=false",
 		"NODE_HOST_AGENT_ENABLE_HYGIENE=false",
+		"NODE_HOST_AGENT_ENABLE_NETHEALTH=false",
+		"NODE_HOST_AGENT_ENABLE_REPORTER=false",
+		"NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE=false",
+		"NODE_HOST_AGENT_ENABLE_HOSTCONFIG=false",
 		"KUBERNETES_SERVICE_HOST=",
 		"KUBERNETES_SERVICE_PORT=",
 		"KUBECONFIG=",
@@ -340,6 +352,33 @@ func TestMainRunListenerError(t *testing.T) {
 	}
 }
 
+// disableAllSubsystems switches every default-on subsystem off —
+// each subtest then re-enables only what it exercises.
+func disableAllSubsystems(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"NODE_HOST_AGENT_ENABLE_SWEEPER",
+		"NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE",
+		"NODE_HOST_AGENT_ENABLE_APIPROBER",
+		"NODE_HOST_AGENT_ENABLE_HOSTMETRICS",
+		"NODE_HOST_AGENT_ENABLE_HYGIENE",
+		"NODE_HOST_AGENT_ENABLE_NETHEALTH",
+		"NODE_HOST_AGENT_ENABLE_REPORTER",
+		"NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE",
+		"NODE_HOST_AGENT_ENABLE_HOSTCONFIG",
+	} {
+		t.Setenv(k, "false")
+	}
+}
+
+func subsystemNames(cfg agent.Config) []string {
+	names := []string{}
+	for _, s := range cfg.Subsystems {
+		names = append(names, s.Name())
+	}
+	return names
+}
+
 // TestBuildAgentConfigSubsystems exercises the env→Config wiring:
 // enable/disable envs control which subsystems are constructed.
 func TestBuildAgentConfigSubsystems(t *testing.T) {
@@ -351,9 +390,7 @@ func TestBuildAgentConfigSubsystems(t *testing.T) {
 	t.Setenv("KUBECONFIG", "")
 
 	t.Run("all disabled", func(t *testing.T) {
-		t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "false")
-		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "false")
-		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "false")
+		disableAllSubsystems(t)
 		cfg, apiproberOn := buildAgentConfig("n", "p", "ns", "v",
 			"127.0.0.1:0", "127.0.0.1:0")
 		if len(cfg.Subsystems) != 0 {
@@ -371,10 +408,9 @@ func TestBuildAgentConfigSubsystems(t *testing.T) {
 	})
 
 	t.Run("sweeper omitted without kubeconfig is not fatal", func(t *testing.T) {
+		disableAllSubsystems(t)
 		t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "absent"))
 		t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "true")
-		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "false")
-		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "false")
 		cfg, _ := buildAgentConfig("n", "p", "ns", "v", "127.0.0.1:0", "127.0.0.1:0")
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%d want 0 (sweeper skipped, not fatal)", len(cfg.Subsystems))
@@ -382,6 +418,7 @@ func TestBuildAgentConfigSubsystems(t *testing.T) {
 	})
 
 	t.Run("sweeper built with kubeconfig", func(t *testing.T) {
+		disableAllSubsystems(t)
 		kubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
 		content := `apiVersion: v1
 kind: Config
@@ -406,42 +443,32 @@ users:
 		}
 		t.Setenv("KUBECONFIG", kubeconfig)
 		t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "true")
-		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "false")
-		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "false")
-		t.Setenv("NODE_HOST_AGENT_ENABLE_HYGIENE", "false")
 		cfg, _ := buildAgentConfig("n", "p", "ns", "v", "127.0.0.1:0", "127.0.0.1:0")
-		if len(cfg.Subsystems) != 1 || cfg.Subsystems[0].Name() != "sweeper" {
-			names := []string{}
-			for _, s := range cfg.Subsystems {
-				names = append(names, s.Name())
-			}
+		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "sweeper" {
 			t.Fatalf("subsystems=%v want [sweeper]", names)
 		}
 	})
 
 	t.Run("apiprober default enabled", func(t *testing.T) {
-		t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "false")
-		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "false")
-		// NODE_HOST_AGENT_ENABLE_APIPROBER unset → "auto" → enabled.
+		disableAllSubsystems(t)
+		// "auto" is the production default — the prober enables
+		// itself without a socket gate.
+		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto")
 		cfg, apiproberOn := buildAgentConfig("n", "p", "ns", "v",
 			"127.0.0.1:0", "127.0.0.1:0")
 		if !apiproberOn {
 			t.Fatal("apiproberEnabled=false want true (auto default)")
 		}
-		if len(cfg.Subsystems) != 1 || cfg.Subsystems[0].Name() != "apiprober" {
-			names := []string{}
-			for _, s := range cfg.Subsystems {
-				names = append(names, s.Name())
-			}
+		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "apiprober" {
 			t.Fatalf("subsystems=%v want [apiprober]", names)
 		}
 	})
 
 	t.Run("hostmetrics default enabled registers collector", func(t *testing.T) {
-		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "false")
-		// SWEEPER/HOSTMETRICS unset → default true. Sweeper's client
-		// build fails (no kubeconfig) → skipped, not fatal;
-		// hostmetrics is a scrape-time collector, not a subsystem.
+		disableAllSubsystems(t)
+		// HOSTMETRICS default true; it is a scrape-time collector,
+		// not a subsystem.
+		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "true")
 		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
 			"127.0.0.1:0", "127.0.0.1:0")
 		if len(cfg.Subsystems) != 0 {
@@ -453,8 +480,8 @@ users:
 	})
 
 	t.Run("apiprober invalid mode is not fatal", func(t *testing.T) {
-		t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "false")
-		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "false")
+		disableAllSubsystems(t)
+		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto")
 		t.Setenv("NODE_HOST_AGENT_APIPROBER_MODE", "bogus")
 		cfg, apiproberOn := buildAgentConfig("n", "p", "ns", "v",
 			"127.0.0.1:0", "127.0.0.1:0")
@@ -463,6 +490,69 @@ users:
 		}
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%d want 0 (apiprober setup failed, not fatal)", len(cfg.Subsystems))
+		}
+	})
+
+	t.Run("concourse-cache default enabled without kube client", func(t *testing.T) {
+		disableAllSubsystems(t)
+		// CONCOURSE_CACHE default true; pure host-fs, no kube client
+		// required.
+		t.Setenv("NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE", "true")
+		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0")
+		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "concourse-cache" {
+			t.Fatalf("subsystems=%v want [concourse-cache]", names)
+		}
+	})
+
+	t.Run("nethealth default enabled without kube client", func(t *testing.T) {
+		disableAllSubsystems(t)
+		// NETHEALTH default true; no kube client required.
+		t.Setenv("NODE_HOST_AGENT_ENABLE_NETHEALTH", "true")
+		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0")
+		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "nethealth" {
+			t.Fatalf("subsystems=%v want [nethealth]", names)
+		}
+	})
+
+	t.Run("controllerhygiene auto disables on non-controller", func(t *testing.T) {
+		disableAllSubsystems(t)
+		// "auto" is the production default; no k0scontroller.service
+		// under the test host root → stays off.
+		t.Setenv("NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE", "auto")
+		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0")
+		if len(cfg.Subsystems) != 0 {
+			t.Fatalf("subsystems=%v want [] (no k0scontroller unit)", subsystemNames(cfg))
+		}
+	})
+
+	t.Run("hostconfig auto disables without vars dir", func(t *testing.T) {
+		disableAllSubsystems(t)
+		// "auto" is the production default; the default vars dir
+		// carries no defaults.yaml in the test environment → off.
+		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTCONFIG", "auto")
+		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0")
+		if len(cfg.Subsystems) != 0 {
+			t.Fatalf("subsystems=%v want [] (no vars dir)", subsystemNames(cfg))
+		}
+	})
+
+	t.Run("hostconfig auto enables when defaults.yaml present", func(t *testing.T) {
+		disableAllSubsystems(t)
+		varsDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(varsDir, "defaults.yaml"),
+			[]byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTCONFIG", "auto")
+		t.Setenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", varsDir)
+		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
+			"127.0.0.1:0", "127.0.0.1:0")
+		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "hostconfig" {
+			t.Fatalf("subsystems=%v want [hostconfig]", names)
 		}
 	})
 }
@@ -489,9 +579,8 @@ func enableBothKubeConsumers(t *testing.T) {
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
 	t.Setenv("KUBECONFIG", "")
+	disableAllSubsystems(t)
 	t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "true")
-	t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "false")
-	t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "false")
 	t.Setenv("NODE_HOST_AGENT_ENABLE_HYGIENE", "true")
 }
 

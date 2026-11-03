@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,28 +17,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
-	"k8s.io/client-go/rest"
 	ktesting "k8s.io/client-go/testing"
 )
 
 // ---------------------------------------------------------------------------
 // Fakes + builders (cj-prefixed)
 // ---------------------------------------------------------------------------
-
-// cjFakeExec records "exec:<pod>" and can be told to fail — an exec
-// failure alone must never trigger a wipe.
-type cjFakeExec struct {
-	events *[]string
-	fail   bool
-}
-
-func (f *cjFakeExec) ExecBash(_ context.Context, _, pod, _ string, _ []byte) (string, error) {
-	*f.events = append(*f.events, "exec:"+pod)
-	if f.fail {
-		return "", errors.New("exec boom")
-	}
-	return "pruned", nil
-}
 
 // cjFakeStats records "stats:<node>" and answers through fn(node,
 // callNumber) so tests can return different readings before/after a
@@ -144,22 +126,13 @@ func cjReplaceOnDelete(cs *fake.Clientset, events *[]string, ready bool) {
 	})
 }
 
-func cjScript(t *testing.T) string {
-	t.Helper()
-	p := filepath.Join(t.TempDir(), "prune.sh")
-	if err := os.WriteFile(p, []byte("echo prune\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
 // cjTestJanitor builds a janitor with shrunk timeouts — every poll
 // fires immediately on the first check; timeouts only matter for the
 // failure tests.
-func cjTestJanitor(cs *fake.Clientset, ex podExecutor, st nodeStatsReader, atc atcIface, script string) *concourseWorkdirJanitor {
+func cjTestJanitor(cs *fake.Clientset, st nodeStatsReader, atc atcIface) *concourseWorkdirJanitor {
 	return &concourseWorkdirJanitor{
-		cs: cs, exec: ex, stats: st, atc: atc,
-		enabled: true, scriptPath: script,
+		cs: cs, stats: st, atc: atc,
+		enabled:        true,
 		runTimeout:     10 * time.Second,
 		reqTimeout:     10 * time.Second,
 		drainTimeout:   50 * time.Millisecond,
@@ -192,17 +165,6 @@ func TestConcourseJanitorDisabled(t *testing.T) {
 	}
 }
 
-// A missing prune script is a hard error — unlike ATC/stats, this one
-// is NOT fail-open.
-func TestConcourseJanitorMissingScript(t *testing.T) {
-	cs := fake.NewSimpleClientset(cjWorkerSTS(1), cjLocalUsers())
-	j := cjTestJanitor(cs, &cjFakeExec{}, &cjFakeStats{}, &cjFakeATC{},
-		filepath.Join(t.TempDir(), "does-not-exist.sh"))
-	if err := j.run(ctx); err == nil {
-		t.Fatal("expected error for a missing prune script")
-	}
-}
-
 // Workdir under cap AND nodefs under threshold → keep the cache, no
 // delete. No annotation → baseline estimated as imageFs + 32GiB:
 // 50-10-32 = 8GiB <= 100, nodefs 25% < 60%.
@@ -216,21 +178,21 @@ func TestConcourseJanitorKeepCache(t *testing.T) {
 		fn: func(string, int) (int64, int64, int64, error) {
 			return 50 * gib, 200 * gib, 10 * gib, nil
 		}}
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events}, st,
-		&cjFakeATC{events: &events, states: map[string]string{}}, cjScript(t))
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-0" {
 		t.Fatalf("pod was replaced despite staying under thresholds (uid %s)", got)
 	}
-	want := []string{"login:admin", "exec:concourse-worker-0", "stats:node-a"}
+	want := []string{"login:admin", "stats:node-a"}
 	if fmt.Sprint(events) != fmt.Sprint(want) {
 		t.Fatalf("events %v, want %v", events, want)
 	}
 }
 
-// The full wipe path, ordinals descending: exec → stats → land →
+// The full wipe path, ordinals descending: stats → land →
 // drained → delete → prune (inside the init-rm window) → new uid →
 // Ready → baseline annotation stamped from the post-wipe nodefs.
 func TestConcourseJanitorFullWipeOrder(t *testing.T) {
@@ -248,19 +210,19 @@ func TestConcourseJanitorFullWipeOrder(t *testing.T) {
 			}
 			return 40 * gib, 200 * gib, 10 * gib, nil // post-wipe baseline
 		}}
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events}, st,
-		&cjFakeATC{events: &events, states: map[string]string{}}, cjScript(t))
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
 		"login:admin",
-		"exec:concourse-worker-1", "stats:node-b",
+		"stats:node-b",
 		"land:concourse-worker-1", "state:concourse-worker-1",
 		"delete:concourse-worker-1",
 		"state:concourse-worker-1", "prune:concourse-worker-1",
 		"stats:node-b",
-		"exec:concourse-worker-0", "stats:node-a",
+		"stats:node-a",
 		"land:concourse-worker-0", "state:concourse-worker-0",
 		"delete:concourse-worker-0",
 		"state:concourse-worker-0", "prune:concourse-worker-0",
@@ -298,13 +260,13 @@ func TestConcourseJanitorNoFlyStillDeletes(t *testing.T) {
 		}}
 	atc := &cjFakeATC{events: &events, loginErr: errors.New("atc down"),
 		states: map[string]string{}}
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events}, st, atc, cjScript(t))
+	j := cjTestJanitor(cs, st, atc)
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
 		"login:admin",
-		"exec:concourse-worker-0", "stats:node-a",
+		"stats:node-a",
 		"delete:concourse-worker-0",
 		"stats:node-a",
 	}
@@ -329,8 +291,8 @@ func TestConcourseJanitorStatsErrorFailOpen(t *testing.T) {
 		fn: func(string, int) (int64, int64, int64, error) {
 			return 0, 0, 0, errors.New("kubelet down")
 		}}
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events}, st,
-		&cjFakeATC{events: &events, states: map[string]string{}}, cjScript(t))
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -345,28 +307,6 @@ func TestConcourseJanitorStatsErrorFailOpen(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected a delete in events %v", events)
-	}
-}
-
-// An exec failure alone is NOT grounds to wipe — warn and continue to
-// the stats decision (pod mid-init etc.).
-func TestConcourseJanitorExecFailKeepsCache(t *testing.T) {
-	var events []string
-	cs := fake.NewSimpleClientset(
-		cjWorkerSTS(1),
-		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
-		cjLocalUsers())
-	st := &cjFakeStats{events: &events, calls: map[string]int{},
-		fn: func(string, int) (int64, int64, int64, error) {
-			return 50 * gib, 200 * gib, 10 * gib, nil
-		}}
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events, fail: true}, st,
-		&cjFakeATC{events: &events, states: map[string]string{}}, cjScript(t))
-	if err := j.run(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-0" {
-		t.Fatalf("exec failure alone caused a wipe: uid %s", got)
 	}
 }
 
@@ -385,8 +325,8 @@ func TestConcourseJanitorBaselineAnnotation(t *testing.T) {
 		fn: func(string, int) (int64, int64, int64, error) {
 			return 50 * gib, 200 * gib, -1, nil // imageFs absent
 		}}
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events}, st,
-		&cjFakeATC{events: &events, states: map[string]string{}}, cjScript(t))
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -408,8 +348,8 @@ func TestConcourseJanitorNewPodNeverAppears(t *testing.T) {
 		fn: func(string, int) (int64, int64, int64, error) {
 			return 160 * gib, 200 * gib, 10 * gib, nil
 		}}
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events}, st,
-		&cjFakeATC{events: &events, states: map[string]string{}}, cjScript(t))
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
 	if err := j.run(ctx); err == nil ||
 		!strings.Contains(err.Error(), "new pod not created") {
 		t.Fatalf("expected 'new pod not created' error, got %v", err)
@@ -429,8 +369,8 @@ func TestConcourseJanitorReadyTimeout(t *testing.T) {
 		fn: func(string, int) (int64, int64, int64, error) {
 			return 160 * gib, 200 * gib, 10 * gib, nil
 		}}
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events}, st,
-		&cjFakeATC{events: &events, states: map[string]string{}}, cjScript(t))
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
 	if err := j.run(ctx); err == nil || !strings.Contains(err.Error(), "not Ready") {
 		t.Fatalf("expected a Ready-timeout error, got %v", err)
 	}
@@ -440,10 +380,10 @@ func TestConcourseJanitorReadyTimeout(t *testing.T) {
 func TestConcourseJanitorMissingSTS(t *testing.T) {
 	var events []string
 	cs := fake.NewSimpleClientset(cjLocalUsers())
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events}, &cjFakeStats{
+	j := cjTestJanitor(cs, &cjFakeStats{
 		events: &events, calls: map[string]int{},
 		fn: func(string, int) (int64, int64, int64, error) { return 0, 0, 0, nil }},
-		&cjFakeATC{events: &events, states: map[string]string{}}, cjScript(t))
+		&cjFakeATC{events: &events, states: map[string]string{}})
 	if err := j.run(ctx); err == nil {
 		t.Fatal("expected error when sts concourse-worker is missing")
 	}
@@ -461,17 +401,17 @@ func TestConcourseJanitorSkipsYoungNotReadyPod(t *testing.T) {
 		fn: func(string, int) (int64, int64, int64, error) {
 			return 160 * gib, 200 * gib, 10 * gib, nil // 80% — would wipe
 		}}
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events}, st,
-		&cjFakeATC{events: &events, states: map[string]string{}}, cjScript(t))
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if got := cjPod(t, cs, "concourse-worker-0").UID; got != "uid-0" {
 		t.Fatalf("young not-Ready pod was replaced (uid %s)", got)
 	}
-	// exec+stats still ran (stats decide the keep/wipe side); no land,
+	// stats still ran (they decide the keep/wipe side); no land,
 	// no delete — the guard fires right after the keep-cache check.
-	want := []string{"login:admin", "exec:concourse-worker-0", "stats:node-a"}
+	want := []string{"login:admin", "stats:node-a"}
 	if fmt.Sprint(events) != fmt.Sprint(want) {
 		t.Fatalf("events %v, want %v", events, want)
 	}
@@ -489,8 +429,8 @@ func TestConcourseJanitorWipesOldNotReadyPod(t *testing.T) {
 		fn: func(string, int) (int64, int64, int64, error) {
 			return 160 * gib, 200 * gib, 10 * gib, nil
 		}}
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events}, st,
-		&cjFakeATC{events: &events, states: map[string]string{}}, cjScript(t))
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -520,7 +460,7 @@ func TestConcourseJanitorDrainKeepsPollingOnATCError(t *testing.T) {
 		}}
 	atc := &cjFakeATC{events: &events,
 		stateErr: errors.New("atc 502"), states: map[string]string{}}
-	j := cjTestJanitor(cs, &cjFakeExec{events: &events}, st, atc, cjScript(t))
+	j := cjTestJanitor(cs, st, atc)
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -708,49 +648,5 @@ func TestATCClientNon2xx(t *testing.T) {
 	if err := c.landWorker(ctx, "w"); err == nil ||
 		!strings.Contains(err.Error(), "500") {
 		t.Fatalf("expected status error on land, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// spdyExecutor.transports — the shared SPDY transport pair.
-// ---------------------------------------------------------------------------
-
-// transports() builds the RoundTripper+upgrader exactly once (the
-// per-exec remotecommand.NewSPDYExecutor used to leak a fresh
-// http.Transport + conn pool per worker pod) and hands the same pair
-// to every subsequent call.
-func TestSPDYExecutorTransportsCached(t *testing.T) {
-	e := &spdyExecutor{cfg: &rest.Config{Host: "https://127.0.0.1:6443"}}
-	rt1, up1, err := e.transports()
-	if err != nil {
-		t.Fatalf("transports: %v", err)
-	}
-	if rt1 == nil || up1 == nil {
-		t.Fatal("transports returned a nil leg")
-	}
-	rt2, up2, err := e.transports()
-	if err != nil {
-		t.Fatalf("second transports: %v", err)
-	}
-	if rt2 != rt1 || up2 != up1 {
-		t.Fatal("transports did not return the cached pair")
-	}
-}
-
-// A config RoundTripperFor rejects (here: unparsable CA data) keeps
-// its error cached too — the config never changes between calls, so
-// retrying could only repeat the same failure.
-func TestSPDYExecutorTransportsErrorCached(t *testing.T) {
-	e := &spdyExecutor{cfg: &rest.Config{
-		Host:            "https://127.0.0.1:6443",
-		TLSClientConfig: rest.TLSClientConfig{CAData: []byte("not-a-pem")},
-	}}
-	_, _, err1 := e.transports()
-	if err1 == nil {
-		t.Fatal("expected a transport build error for bad CA data")
-	}
-	_, _, err2 := e.transports()
-	if err2 != err1 {
-		t.Fatalf("cached error mismatch: first %v, second %v", err1, err2)
 	}
 }

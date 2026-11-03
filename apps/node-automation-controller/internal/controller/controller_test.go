@@ -15,7 +15,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -549,89 +548,5 @@ func TestFailedJobsJanitor(t *testing.T) {
 		if _, err := cs.BatchV1().Jobs("a").Get(ctx, name, metav1.GetOptions{}); err != nil {
 			t.Fatalf("job %s wrongly deleted: %v", name, err)
 		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// converge-trigger
-// ---------------------------------------------------------------------------
-
-func convergeCronJob(name string) *batchv1.CronJob {
-	return &batchv1.CronJob{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "node-ops", Name: name},
-		Spec: batchv1.CronJobSpec{
-			JobTemplate: batchv1.JobTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels:      map[string]string{"app": "converge"},
-					Annotations: map[string]string{"a": "b"},
-				},
-				Spec: batchv1.JobSpec{
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{
-							RestartPolicy: corev1.RestartPolicyNever,
-							Containers:    []corev1.Container{{Name: "c", Image: "i"}},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func TestConvergeTriggerDebounceThenCreate(t *testing.T) {
-	cs := fake.NewSimpleClientset(convergeCronJob("hub-converge"))
-	r := &convergeTrigger{cs: cs, pending: map[string]struct{}{}}
-
-	// First pass only arms the debounce — no Job yet.
-	res, err := r.Reconcile(ctx, reconcile.Request{
-		NamespacedName: types.NamespacedName{Name: "node-config-vars-abc"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.RequeueAfter != convergeSettle {
-		t.Fatalf("expected %s requeue, got %s", convergeSettle, res.RequeueAfter)
-	}
-	jobs, _ := cs.BatchV1().Jobs("node-ops").List(ctx, metav1.ListOptions{})
-	if len(jobs.Items) != 0 {
-		t.Fatal("job created before the settle window elapsed")
-	}
-
-	// Settle timer fired -> drain -> Job cloned from the CronJob.
-	if _, err := r.Reconcile(ctx, reconcile.Request{
-		NamespacedName: types.NamespacedName{Name: "node-config-vars-abc"}}); err != nil {
-		t.Fatal(err)
-	}
-	jobs, _ = cs.BatchV1().Jobs("node-ops").List(ctx, metav1.ListOptions{})
-	if len(jobs.Items) != 1 {
-		t.Fatalf("expected exactly 1 trigger job, got %d", len(jobs.Items))
-	}
-	j := jobs.Items[0]
-	if j.Labels["app.kubernetes.io/created-by"] != "node-ops-operator" {
-		t.Fatal("created-by label missing")
-	}
-	if j.Labels["app"] != "converge" || j.Annotations["a"] != "b" {
-		t.Fatal("JobTemplate metadata not cloned")
-	}
-}
-
-func TestConvergeTriggerDedupe(t *testing.T) {
-	recent := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "node-ops", Name: "hub-converge-trigger-1",
-		CreationTimestamp: metav1.NewTime(time.Now().Add(-10 * time.Second)),
-	}}
-	cs := fake.NewSimpleClientset(convergeCronJob("hub-converge"), recent)
-	r := &convergeTrigger{cs: cs, pending: map[string]struct{}{}}
-
-	if _, err := r.Reconcile(ctx, reconcile.Request{
-		NamespacedName: types.NamespacedName{Name: "node-config-vars-abc"}}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Reconcile(ctx, reconcile.Request{
-		NamespacedName: types.NamespacedName{Name: "node-config-vars-abc"}}); err != nil {
-		t.Fatal(err)
-	}
-	jobs, _ := cs.BatchV1().Jobs("node-ops").List(ctx, metav1.ListOptions{})
-	if len(jobs.Items) != 1 {
-		t.Fatalf("dedupe failed: %d jobs", len(jobs.Items))
 	}
 }

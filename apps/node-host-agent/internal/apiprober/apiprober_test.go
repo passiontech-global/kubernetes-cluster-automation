@@ -1053,13 +1053,17 @@ func TestDiscoverMalformedStat(t *testing.T) {
 		}
 	})
 
-	t.Run("short row has no addr", func(t *testing.T) {
+	t.Run("short row is skipped not fatal", func(t *testing.T) {
 		// Row shorter than the header: get() hits the i>=len(fields)
-		// guard and returns "" for addr.
-		csv := "# pxname,svname,status,addr\nkube_apiserver,hub1\n"
-		_, err := mkProber(t, csv).discover(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "no addr") {
-			t.Fatalf("discover err=%v want 'no addr'", err)
+		// guard and returns "" for addr. One bad row logs + skips —
+		// it must not fail the whole scan.
+		csv := "# pxname,svname,status,addr\nkube_apiserver,hub1\nkube_apiserver,hub2,UP,10.0.0.2:6443\n"
+		backends, err := mkProber(t, csv).discover(context.Background())
+		if err != nil {
+			t.Fatalf("discover err=%v want nil (row skipped)", err)
+		}
+		if len(backends) != 1 || backends[0].Name != "hub2" {
+			t.Fatalf("backends=%v want [hub2]", backends)
 		}
 	})
 }
@@ -1967,5 +1971,232 @@ func TestNewClonesDefaultTransport(t *testing.T) {
 	}
 	if tr.TLSClientConfig == nil || !tr.TLSClientConfig.InsecureSkipVerify {
 		t.Fatal("TLSClientConfig lost on the cloned transport")
+	}
+}
+
+// --- CompanionBackends + StaticBackends (api-backend-guard.sh merge) ---
+
+// fixtureExt is fixture plus extra Config knobs the new paths need.
+func fixtureExt(t *testing.T, ha *fakeHAProxy, mode string,
+	tcpReachable map[string]bool, mutate func(*Config)) *Prober {
+	t.Helper()
+	stub := newAPIStub(t)
+	cfg := Config{
+		SocketPath:    ha.sockPath,
+		BackendName:   "kube_apiserver",
+		Mode:          mode,
+		GapMin:        1000,
+		FailCycles:    2,
+		FrozenCycles:  2,
+		RecoverCycles: 3,
+		TokenFile:     "",
+		HTTPClient:    stub.srv.Client(),
+		TCPCheck: func(_ context.Context, addr string) error {
+			if ok, found := tcpReachable[addr]; found && !ok {
+				return fmt.Errorf("connect refused")
+			}
+			return nil
+		},
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	p, err := New(cfg, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestCompanionBackendsReceiveActions(t *testing.T) {
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	ha.failReply = map[string]string{
+		"disable server konn_back/hub1": "No such server konn_back/hub1\n",
+	}
+	p := fixtureExt(t, ha, ModeEnforce, nil, func(c *Config) {
+		c.CompanionBackends = []string{"konn_back"}
+	})
+
+	// Frozen wedge on hub1 for FrozenCycles.
+	bad.set(100, 200)
+	good.set(500, 500)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+
+	cmds := ha.commands()
+	if !hasCmd(cmds, "disable server kube_apiserver/hub1") {
+		t.Fatalf("primary backend disable missing, cmds=%v", cmds)
+	}
+	if !hasCmd(cmds, "disable server konn_back/hub1") {
+		t.Fatalf("companion backend disable missing, cmds=%v", cmds)
+	}
+	// "No such server" on the companion is a no-op — the action
+	// still counted as a disable, not an error path.
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 1 {
+		t.Fatalf("actions disable=%v want 1", got)
+	}
+}
+
+func TestCompanionErrorDoesNotBlockDrain(t *testing.T) {
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", bad.addr()},
+		[2]string{"hub2", good.addr()},
+	)
+	// Companion returns a REAL error (not "No such server") — the
+	// primary already drained; the error surfaces in the log only.
+	ha.failReply = map[string]string{
+		"disable server konn_back/hub1": "permission denied for socket\n",
+	}
+	p := fixtureExt(t, ha, ModeEnforce, nil, func(c *Config) {
+		c.CompanionBackends = []string{"konn_back"}
+	})
+	bad.set(100, 200)
+	good.set(500, 500)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	if !hasCmd(ha.commands(), "disable server kube_apiserver/hub1") {
+		t.Fatalf("primary disable missing, cmds=%v", ha.commands())
+	}
+	// Primary disable succeeded → drained flag set.
+	if !p.states["hub1"].drained {
+		t.Fatal("hub1 not drained despite companion error")
+	}
+}
+
+func TestStaticBackendsMergedAndDrained(t *testing.T) {
+	bad := newAPIStub(t)
+	good := newAPIStub(t)
+	// HAProxy knows only hub2; hub1 comes from StaticBackends (the
+	// api-backend-guard.conf API_BACKENDS model).
+	ha := newFakeHAProxy(t, [2]string{"hub2", good.addr()})
+	wdir := t.TempDir()
+	p := fixtureExt(t, ha, ModeEnforce, nil, func(c *Config) {
+		c.WatchdogStateDir = wdir
+		c.StaticBackends = []StaticBackend{
+			{Name: "hub1", Addr: bad.addr()},
+		}
+	})
+
+	bad.set(100, 200) // frozen wedge
+	good.set(500, 500)
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+
+	if !hasCmd(ha.commands(), "disable server kube_apiserver/hub1") {
+		t.Fatalf("static backend disable missing, cmds=%v", ha.commands())
+	}
+	if got := testutil.ToFloat64(p.backendCount); got != 2 {
+		t.Fatalf("backendCount=%v want 2 (static merged)", got)
+	}
+	// The stale latch is written for the static backend too — module
+	// 06's upstream gate reads it by dashed IP.
+	dashed := strings.ReplaceAll(strings.Split(bad.addr(), ":")[0], ".", "-")
+	if _, err := os.Stat(wdir + "/state-apiserver-backend-stale-" + dashed); err != nil {
+		t.Fatalf("stale latch missing for static backend: %v", err)
+	}
+}
+
+func TestDiscoverFillsEmptyAddrFromStatic(t *testing.T) {
+	stub := newAPIStub(t)
+	// External API LB VM shape: server row with no addr column —
+	// resolved from StaticBackends by name instead of failing.
+	ha := newFakeHAProxy(t, [2]string{"hub1", ""}, [2]string{"hub2", stub.addr()})
+	p := fixtureExt(t, ha, ModeDryRun, nil, func(c *Config) {
+		c.StaticBackends = []StaticBackend{{Name: "hub1", Addr: "10.0.0.1:6443"}}
+	})
+	backends, err := p.discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backends[0].Addr != "10.0.0.1:6443" {
+		t.Fatalf("hub1 addr=%q want static fill", backends[0].Addr)
+	}
+	if backends[1].Addr != stub.addr() {
+		t.Fatalf("hub2 addr=%q want discovered", backends[1].Addr)
+	}
+}
+
+func TestDiscoverEmptyAddrWithoutStaticSkips(t *testing.T) {
+	// No addr and no API_BACKENDS name match → the row is skipped
+	// (log-and-continue), never a whole-cycle failure.
+	ha := newFakeHAProxy(t, [2]string{"hub1", ""})
+	p := fixtureExt(t, ha, ModeDryRun, nil, nil)
+	backends, err := p.discover(context.Background())
+	if err != nil {
+		t.Fatalf("empty addr without static config want skip, err=%v", err)
+	}
+	if len(backends) != 0 {
+		t.Fatalf("backends=%v want none (unresolvable row skipped)", backends)
+	}
+}
+
+func TestStaticBackendDedupedAgainstDiscovery(t *testing.T) {
+	stub := newAPIStub(t)
+	ha := newFakeHAProxy(t, [2]string{"hub1", stub.addr()})
+	p := fixtureExt(t, ha, ModeDryRun, nil, func(c *Config) {
+		c.StaticBackends = []StaticBackend{
+			{Name: "hub1", Addr: "10.9.9.9:6443"}, // same name — discovery wins
+			{Name: "hub2", Addr: "10.0.0.2:6443"}, // new name — appended
+		}
+	})
+	backends, err := p.discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := mergeStatic(backends, p.cfg.StaticBackends)
+	if len(merged) != 2 {
+		t.Fatalf("merged=%v want 2 backends", merged)
+	}
+	if merged[0].Addr != stub.addr() {
+		t.Fatalf("discovered addr overwritten by static: %q", merged[0].Addr)
+	}
+	if merged[1].Name != "hub2" || merged[1].Addr != "10.0.0.2:6443" || !merged[1].up() {
+		t.Fatalf("static append wrong: %+v", merged[1])
+	}
+}
+
+func TestStagedDrainSpendsFreshPerDisable(t *testing.T) {
+	// fresh=1 with 2 wedged backends: the first disable decrements
+	// fresh (shell `fresh=$((fresh - 1))` parity), so the second
+	// wedge hits the fence — staged drain, not drain-all.
+	good := newAPIStub(t)
+	bad1 := newAPIStub(t)
+	bad2 := newAPIStub(t)
+	ha := newFakeHAProxy(t,
+		[2]string{"hub1", good.addr()},
+		[2]string{"hub2", bad1.addr()},
+		[2]string{"hub3", bad2.addr()},
+	)
+	p := fixtureExt(t, ha, ModeEnforce, nil, nil)
+	good.set(50, 50)
+	bad1.set(100, 200)
+	bad2.set(100, 200)
+	// Three cycles: cycle 1 seeds prevCache, frozen reaches
+	// FrozenCycles on cycle 3 → ONE drain round — and the per-cycle
+	// budget allows exactly `fresh` disables.
+	for i := 0; i < 3; i++ {
+		p.Cycle(context.Background())
+	}
+	disables := 0
+	for _, c := range ha.commands() {
+		if strings.HasPrefix(c, "disable server") {
+			disables++
+		}
+	}
+	if disables != 1 {
+		t.Fatalf("disables=%d want 1 (staged drain), cmds=%v", disables, ha.commands())
+	}
+	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub3", "fence_skip")); got < 1 {
+		t.Fatalf("hub3 fence_skip=%v want >=1", got)
 	}
 }

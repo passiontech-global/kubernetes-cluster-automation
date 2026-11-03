@@ -1,0 +1,58 @@
+#!/bin/bash
+# Managed by node-config-agent - templates/nebula-route-guard.sh.j2
+#
+# Muc dich: khoi phuc ip rule/route cua overlay nebula trong <500ms khi
+# kernel mat chung (systemd-networkd flush ip rule luc interface flap,
+# Cilium policy routing ghi de). node-watchdog chi quet dinh ky 5 phut —
+# trong cua so mu do moi traffic cross-DC di sai duong (bai hoc vong
+# xoay underlay flap 2026-09-11..15: mat rule pref 1490/1500 -> node
+# co lap khoi mesh). Daemon nay lang nghe netlink truc tiep: ~0% CPU
+# khi ranh, <2MiB RAM.
+#
+# Restore = chay lai nebula-up.sh (cung script ExecStartPost cua
+# nebula@{{ interdc_nebula_net }}.service): idempotent + tu doc
+# /etc/nebula/{{ interdc_nebula_net }}/overlay nen chi ghi ip rule khi
+# nebula dang so huu dataplane (khong dap rules khi overlay=tinc).
+set -u
+
+RESTORE="/etc/nebula/{{ interdc_nebula_net }}/nebula-up.sh"
+DEV="{{ interdc_nebula_dev }}"
+TABLE_PUB="{{ interdc_nebula_table_pub }}"
+TABLE_MARK="{{ interdc_nebula_table_marker }}"
+
+# Gate restore tren trang thai nebula: khi operator CHU Y stop
+# nebula@{{ interdc_nebula_net }} (rollback/switch overlay), nebula-down
+# xoa rule -> guard bat event Deleted va neu khong gate se chay lai
+# nebula-up -> song lai rules tro vao dev da chet. is-active=active
+# duy nhat moi duoc restore; activating de nebula-up cua chinh unit lo
+# (ExecStartPost), inactive/deactivating = dang stop -> skip.
+restore() {
+    [ "$(systemctl is-active "nebula@{{ interdc_nebula_net }}.service" 2>/dev/null)" = "active" ] || return 0
+    "$RESTORE" >/dev/null 2>&1 || true
+}
+
+# Khoi phuc ngay luc service start — bat kip rules mat trong luc guard
+# chua len (boot race hoac node moi duoc cai guard).
+restore
+
+# Outer loop: `ip monitor` thoat khi netlink socket loi thi mo lai sau
+# 2s — guard phai song ngang nebula daemon.
+while true; do
+    # -ts: timestamp tung event trong journald — trace duoc "mat luc
+    # nao" khi doi chieu su co. Monitor ca rule lan route.
+    ip -ts monitor rule route 2>/dev/null | while read -r line; do
+        case "$line" in
+        # Chi phan ung su kien XOA lien quan: route/rule table
+        # pub+marker, moi event dev neb1, pref 1400 (fwmark
+        # transport) + 1490 (marker) + 1500 (targets). Add/replace
+        # khong trigger — converge/watchdog so huu duong add.
+        *Deleted*"$TABLE_PUB"* | *Deleted*"$TABLE_MARK"* | *Deleted*"$DEV"* | *Deleted*1400* | *Deleted*1490* | *Deleted*1500*)
+            # Debounce 0.5s: interface flap ban hang chuc event
+            # xoa cung luc — gom ve mot lan restore.
+            sleep 0.5
+            restore
+            ;;
+        esac
+    done
+    sleep 2
+done

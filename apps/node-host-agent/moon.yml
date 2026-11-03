@@ -24,12 +24,32 @@ tasks:
       - 'bin/node-host-agent'
 
   image:
-    script: 'ko build --bare --sbom=none --tags "${TAGS:-latest}" ./cmd/agent'
+    # Plain docker build of ./Dockerfile — NOT `ko build`: the shipped
+    # image must contain userspace tools (nsenter, ip/ss, ping, sh) in
+    # the container fs (nethealth runs `nsenter -t 1 -n -- <argv>` where
+    # argv resolves container-side), and ko's defaultBaseImage cannot
+    # install packages. .ko.yaml is kept as a local-only fallback.
+    # Callers (release-app.yml) export KO_DOCKER_REPO + TAGS + VERSION
+    # and have already `docker login`'d ghcr.io.
+    script: |
+      set -eu
+      args=""
+      for t in $(echo "${TAGS:-latest}" | tr ',' ' '); do
+        args="$args -t ${KO_DOCKER_REPO:?KO_DOCKER_REPO unset}:$t"
+      done
+      docker build --build-arg "VERSION=${VERSION:-dev}" $args .
+      for t in $(echo "${TAGS:-latest}" | tr ',' ' '); do
+        docker push "${KO_DOCKER_REPO}:$t"
+      done
     toolchains: 'system'
     inputs:
       - 'cmd/**/*.go'
       - 'internal/**/*.go'
       - 'go.mod'
-      - '.ko.yaml'
+      - 'go.sum'
+      - 'Dockerfile'
+      - '.dockerignore'
     options:
+      # script is a multi-line shell snippet — must run via shell.
+      shell: true
       cache: false

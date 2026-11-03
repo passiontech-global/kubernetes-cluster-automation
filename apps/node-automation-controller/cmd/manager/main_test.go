@@ -374,7 +374,6 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		"EXTERNALSECRET_NUDGE_ENABLED",
 		"CSR_APPROVER_ENABLED",
 		"CONCOURSE_JANITOR_ENABLED",
-		"CONCOURSE_JANITOR_SCRIPT_PATH",
 		"NODE_LABELER_CONFIG_PATH",
 		"COREDNS_PATCHER_ENABLED",
 		"COREDNS_PATCHER_ZONE_WHEN",
@@ -400,9 +399,6 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		}
 		if mc.labelerPath != "/etc/node-labeler/labels.txt" {
 			t.Fatalf("labelerPath = %q, want default", mc.labelerPath)
-		}
-		if mc.concourseJanitorScript != "/etc/concourse-janitor/prune.sh" {
-			t.Fatalf("concourseJanitorScript = %q, want default", mc.concourseJanitorScript)
 		}
 		// The ported patcher/watchdog modules default ON — only an
 		// explicit "false" opts a cluster out.
@@ -435,7 +431,6 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		t.Setenv("EXTERNALSECRET_NUDGE_ENABLED", "true")
 		t.Setenv("CSR_APPROVER_ENABLED", "true")
 		t.Setenv("CONCOURSE_JANITOR_ENABLED", "true")
-		t.Setenv("CONCOURSE_JANITOR_SCRIPT_PATH", "/custom/prune.sh")
 		t.Setenv("NODE_LABELER_CONFIG_PATH", "/custom/labels.txt")
 		mc := moduleConfigFromEnv()
 		if !mc.ciliumEnabled || !mc.fluentbitEnabled || !mc.certReaperEnabled ||
@@ -445,9 +440,6 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		}
 		if mc.labelerPath != "/custom/labels.txt" {
 			t.Fatalf("labelerPath = %q, want /custom/labels.txt", mc.labelerPath)
-		}
-		if mc.concourseJanitorScript != "/custom/prune.sh" {
-			t.Fatalf("concourseJanitorScript = %q, want /custom/prune.sh", mc.concourseJanitorScript)
 		}
 	})
 
@@ -548,7 +540,7 @@ func stubDyn() *dynamicfake.FakeDynamicClient {
 // the map — except the seven gate-skippers (certmanager-reaper,
 // cilium-identity-auditor, cilium-taint-reaper, fluent-bit-config-roller,
 // coredns-patcher, metrics-server-patcher, cf-tunnel-proxy-watchdog),
-// which skip mgr.Add entirely while disabled (17 runnables then). The
+// which skip mgr.Add entirely while disabled (16 runnables then). The
 // other feature flags only gate the tick body, not registration.
 func TestSetupModules(t *testing.T) {
 	t.Run("all gates enabled", func(t *testing.T) {
@@ -561,7 +553,6 @@ func TestSetupModules(t *testing.T) {
 			esNudgeEnabled:              true,
 			csrApproveEnabled:           true,
 			concourseJanitorEnabled:     true,
-			concourseJanitorScript:      filepath.Join(t.TempDir(), "prune.sh"),
 			labelerPath:                 filepath.Join(t.TempDir(), "labels.txt"),
 			corednsPatcherEnabled:       true,
 			corednsZoneWhen:             "DoNotSchedule",
@@ -571,11 +562,11 @@ func TestSetupModules(t *testing.T) {
 			cfTunnelWatchdogNamespace:   "cloudflare-tunnel-system",
 			cfTunnelWatchdogInterval:    5 * time.Minute,
 		}
-		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), &rest.Config{}, mc); err != nil {
+		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), mc); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
-		if len(m.added) != 24 {
-			t.Fatalf("registered %d runnables, want 24", len(m.added))
+		if len(m.added) != 23 {
+			t.Fatalf("registered %d runnables, want 23", len(m.added))
 		}
 		for i, r := range m.added {
 			if r == nil {
@@ -586,11 +577,11 @@ func TestSetupModules(t *testing.T) {
 
 	t.Run("all gates disabled", func(t *testing.T) {
 		m := newStubManager()
-		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), &rest.Config{}, moduleConfig{}); err != nil {
+		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), moduleConfig{}); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
-		if len(m.added) != 17 {
-			t.Fatalf("registered %d runnables, want 17", len(m.added))
+		if len(m.added) != 16 {
+			t.Fatalf("registered %d runnables, want 16", len(m.added))
 		}
 	})
 }
@@ -664,7 +655,7 @@ func TestSetupModulesErrorPropagates(t *testing.T) {
 	want := errors.New("manager rejected runnable")
 	m := newStubManager()
 	m.addErr = want
-	err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), &rest.Config{}, moduleConfig{})
+	err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), moduleConfig{})
 	if !errors.Is(err, want) {
 		t.Fatalf("setupModules error = %v, want %v", err, want)
 	}

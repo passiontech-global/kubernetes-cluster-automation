@@ -1,5 +1,11 @@
-# ko build config — replaces the Dockerfile for image builds in CI.
-# Same base + nonroot user + version ldflag as Dockerfile.
+# ko build config — LOCAL/manual builds ONLY. CI (moon task `image`,
+# called by .github/workflows/release-app.yml) builds ./Dockerfile with
+# plain docker instead: the shipped image must contain userspace tools
+# (nsenter, ip/ss, ping, sh — nethealth execs `nsenter -t 1 -n -- <argv>`
+# where argv resolves in the CONTAINER mount namespace) and ko's
+# defaultBaseImage is a fixed image ref — it cannot install packages.
+# An image built via this file runs the binary but every host-tool
+# probe fails. Keep Dockerfile as the source of truth for the runtime.
 #
 # VERSION is read from the environment at build time (ko templating):
 #   VERSION=v1.2.3 KO_DOCKER_REPO=ghcr.io/passiontech-global/node-host-agent \

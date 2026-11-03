@@ -27,7 +27,19 @@
 //
 // Action: `disable server <backend>/<name>` over the HAProxy admin
 // socket on wedge; `enable` after RecoverCycles consecutive fresh
-// cycles.
+// cycles. When CompanionBackends is set the action is applied on
+// EVERY backend in [BackendName]+CompanionBackends (api-backend-
+// guard.sh parity: a wedged controller poisons the konnectivity lane
+// too — incident 2026-10-07); a "No such server" reply on a companion
+// backend is a no-op, not an error.
+//
+// StaticBackends merges the api-backend-guard.sh API_BACKENDS model:
+// "name=ip:port" entries probed directly — covers external API LB VMs
+// whose `show stat` rows carry no addr (the server line uses the name
+// as the address) and adds apiservers the local HAProxy does not list
+// at all. Discovered servers with an empty addr resolve their Addr
+// from StaticBackends by name; static entries absent from discovery
+// are appended as UP servers.
 //
 // SAFETY FENCES (ported 1:1):
 //   - NEVER disable the last usable backend — at least one backend
@@ -58,6 +70,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
 )
 
 // Mode values — the shell script's dry-run default is preserved.
@@ -95,9 +109,31 @@ const (
 )
 
 // Config carries the prober's knobs — all test-injectable.
+// StaticBackend is an API_BACKENDS-style entry — an apiserver to
+// probe by name + ip:port independent of `show stat` (external API LB
+// VMs where the server line has no explicit address, or controllers
+// missing from the local HAProxy config).
+type StaticBackend struct {
+	Name string
+	Addr string // ip:port for direct API queries
+}
+
+// Config carries the prober's knobs — all test-injectable.
 type Config struct {
-	SocketPath    string        // HAProxy admin unix socket
-	BackendName   string        // HAProxy backend holding the apiservers
+	SocketPath  string // HAProxy admin unix socket
+	BackendName string // HAProxy backend holding the apiservers
+	// CompanionBackends are extra HAProxy backends that receive the
+	// same enable/disable actions (shell HAPROXY_BACKENDS parity) —
+	// "No such server" replies on them are ignored.
+	CompanionBackends []string
+	// StaticBackends are API_BACKENDS-style name=ip:port entries
+	// merged into the probe set (see package doc).
+	StaticBackends []StaticBackend
+	// WatchdogSrc, when set, re-reads node-watchdog.conf every cycle
+	// and merges its API_BACKENDS into the static set — hostconfig
+	// rewrites the conf mid-run, so a backend joining/leaving the
+	// list must apply next cycle, not next agent restart.
+	WatchdogSrc   *watchdogconf.Reloader
 	Interval      time.Duration // probe cycle
 	Mode          string        // dry-run | enforce
 	GapMin        int64         // rv-gap wedge threshold
@@ -411,7 +447,20 @@ func (p *Prober) discover(ctx context.Context) ([]backend, error) {
 		}
 		addr := get("addr")
 		if addr == "" {
-			return nil, fmt.Errorf("show stat: server %s has no addr column value", svname)
+			// External API LB VMs run `server <name>` lines without an
+			// addr — resolve it from StaticBackends (API_BACKENDS) by
+			// name, api-backend-guard.sh parity.
+			if sa := p.staticAddr(svname); sa != "" {
+				addr = sa
+			} else {
+				// One unresolvable row must not fail the WHOLE
+				// cycle — the other servers still probe/drain
+				// normally (a stray server line is an ops config
+				// bug, not an apiserver outage).
+				slog.Warn("show stat: server has no addr column value and no API_BACKENDS match — skipping it",
+					"server", svname, "subsystem", "apiprober")
+				continue
+			}
 		}
 		// svname is a substring of the whole `show stat` buffer —
 		// clone it before it becomes a p.states map key / Prometheus
@@ -500,20 +549,83 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, ok bo
 	return rv, true
 }
 
+// statics returns the effective static backend set: cfg.StaticBackends
+// plus, when WatchdogSrc is wired, the conf's API_BACKENDS re-read
+// this call (the runner re-sourced the conf every run).
+func (p *Prober) statics() []StaticBackend {
+	if p.cfg.WatchdogSrc == nil {
+		return p.cfg.StaticBackends
+	}
+	out := append([]StaticBackend{}, p.cfg.StaticBackends...)
+	for _, b := range p.cfg.WatchdogSrc.Get().APIBackends {
+		out = append(out, StaticBackend{Name: b.Name, Addr: b.Addr})
+	}
+	return out
+}
+
+// staticAddr resolves a server name to its static-backend Addr ("" =
+// not configured).
+func (p *Prober) staticAddr(name string) string {
+	for _, sb := range p.statics() {
+		if sb.Name == name {
+			return sb.Addr
+		}
+	}
+	return ""
+}
+
+// mergeStatic appends StaticBackends entries missing from discovery
+// as UP servers — they take traffic via their LB so they count toward
+// the drain fence like any discovered UP backend. Entries whose name
+// discovery already returned are skipped (discovery wins — it carries
+// the live HAProxy status).
+func mergeStatic(backends []backend, static []StaticBackend) []backend {
+	seen := make(map[string]bool, len(backends))
+	for _, b := range backends {
+		seen[b.Name] = true
+	}
+	for _, sb := range static {
+		if sb.Name == "" || sb.Addr == "" || seen[sb.Name] {
+			continue
+		}
+		backends = append(backends, backend{
+			Name: sb.Name, Addr: sb.Addr, Status: "UP",
+		})
+	}
+	return backends
+}
+
 // haproxyServer issues "<action> server <backend>/<name>" on the admin
-// socket.
+// socket for every backend in [BackendName]+CompanionBackends —
+// api-backend-guard.sh's haproxy_srv parity (a wedged controller is
+// drained on every lane it serves). A "No such server" reply on a
+// companion backend is ignored (the server simply doesn't exist
+// there); an error on the primary backend always propagates.
 func (p *Prober) haproxyServer(ctx context.Context, action, name string) error {
-	out, err := p.socketCmd(ctx,
-		fmt.Sprintf("%s server %s/%s", action, p.cfg.BackendName, name))
-	if err != nil {
-		return err
+	backends := append([]string{p.cfg.BackendName}, p.cfg.CompanionBackends...)
+	var firstErr error
+	for i, be := range backends {
+		out, err := p.socketCmd(ctx,
+			fmt.Sprintf("%s server %s/%s", action, be, name))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		// "No such server" or permission errors come back as text —
+		// an empty reply means success on HAProxy >= 2.x. Companions
+		// may legitimately not carry this server (no-op in the shell).
+		if s := strings.TrimSpace(out); s != "" {
+			if i > 0 && strings.Contains(s, "No such server") {
+				continue
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s server %s/%s: %s", action, be, name, s)
+			}
+		}
 	}
-	// "No such server" or permission errors come back as text — an
-	// empty reply means success on HAProxy >= 2.x.
-	if s := strings.TrimSpace(out); s != "" {
-		return fmt.Errorf("%s server %s/%s: %s", action, p.cfg.BackendName, name, s)
-	}
-	return nil
+	return firstErr
 }
 
 // --- watchdog state files (module 34 parity) ---
@@ -675,6 +787,10 @@ func (p *Prober) Cycle(ctx context.Context) {
 		p.cycles.WithLabelValues("discover_fail").Inc()
 		return
 	}
+	// Merge API_BACKENDS-style static entries — covers backends whose
+	// `show stat` addr column is empty (external API LB VMs) and
+	// apiservers the local HAProxy does not list.
+	backends = mergeStatic(backends, p.statics())
 	p.backendCount.Set(float64(len(backends)))
 	p.cycles.WithLabelValues("ok").Inc()
 
@@ -821,6 +937,11 @@ func (p *Prober) Cycle(ctx context.Context) {
 	}
 
 	// Drain phase — after the fresh count for this cycle is final.
+	// usableFresh snapshots the pre-drain count: every backend in it
+	// stays enabled through the drain (drains only remove stale
+	// backends), so it is the RIGHT basis for the VIP bypass decision
+	// — unlike the decremented fence budget below.
+	usableFresh := fresh
 	names := make([]string, 0, len(stale))
 	for n := range stale {
 		names = append(names, n)
@@ -867,6 +988,11 @@ func (p *Prober) Cycle(ctx context.Context) {
 				continue
 			}
 			st.drained = true
+			// Staged drain (shell `fresh=$((fresh - 1))` parity):
+			// every successful disable spends one fresh slot, so a
+			// run drains at most `fresh` stale backends — the fence
+			// above then still has a usable backend to protect.
+			fresh--
 			p.actions.WithLabelValues(name, "disable").Inc()
 			log.Info("ACTION: disabled backend — watch-cache wedge",
 				"backend", name, "haproxyBackend", p.cfg.BackendName,
@@ -892,7 +1018,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 			staleCtrlCount++
 		}
 	}
-	wantVIPDisable := staleCtrlCount > 0 && fresh > 0
+	wantVIPDisable := staleCtrlCount > 0 && usableFresh > 0
 	for _, vip := range vips {
 		st := p.states[vip.Name]
 		if wantVIPDisable {

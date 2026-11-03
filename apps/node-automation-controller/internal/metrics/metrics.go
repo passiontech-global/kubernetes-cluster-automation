@@ -42,7 +42,7 @@ var queues = []string{
 	"konnectivity-patcher", "cilium-taint-reaper", "descheduler-storm-gate",
 	"node-labeler", "fluent-bit-config-roller", "coredns-stale-watchdog",
 	"kubelet-liveness-reaper", "admission-webhook-guard",
-	"partition-pod-evictor", "failed-jobs-janitor", "converge-trigger",
+	"partition-pod-evictor", "failed-jobs-janitor",
 	// remediation modules (v0.2.0)
 	"dead-node-sweeper", "helmrelease-unlocker", "externalsecret-nudge",
 	"evicted-pod-janitor", "cronjob-catchup", "certmanager-reaper",

@@ -12,18 +12,43 @@
 // Subsystems (all paths/intervals env-configurable):
 //   - sweeper:    openebs orphan-dir cleanup. Enabled via
 //     NODE_HOST_AGENT_ENABLE_SWEEPER (default true).
+//   - concourse-cache: native Go pruner for
+//     /var/openebs/local/pvc-*/shared-cache (replaces the CronJob +
+//     pods/exec janitor). NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE
+//     (default true), cadence NODE_HOST_AGENT_CONCOURSE_CACHE_INTERVAL
+//     (default 15m).
 //   - apiprober:  apiserver watch-cache wedge guard for the api-local-lb
-//     HAProxy sidecar — only meaningful on controller nodes.
-//     NODE_HOST_AGENT_ENABLE_APIPROBER: true|false|auto
-//     (default auto = enabled iff the HAProxy admin socket
-//     exists at startup).
+//     HAProxy sidecar. NODE_HOST_AGENT_ENABLE_APIPROBER:
+//     true|false|auto (default auto).
 //   - hostmetrics: scrape-time collector for watchdog state latches,
-//     nebula interface/route/cert-expiry, and k0s config drift.
+//     PSI/cpu-delivered, fail2ban, nebula + k0s config drift.
 //     Enabled via NODE_HOST_AGENT_ENABLE_HOSTMETRICS (default true).
 //   - workerhygiene: worker-only watchdog checks (pod-teardown,
-//     konnectivity IP drift, dns resolv drift). Enabled via
-//     NODE_HOST_AGENT_ENABLE_HYGIENE (default true); needs a kube
-//     client and a non-empty node name.
+//     konnectivity drift, kubelet stall/watch-wedge, ctr tasks,
+//     cilium health/init-stuck). NODE_HOST_AGENT_ENABLE_HYGIENE
+//     (default true); needs a kube client and a non-empty node name.
+//   - nethealth: DNS fallback, coredns-stub, overlay egress relays,
+//     nebula health, fail2ban (former watchdog modules 12/13/20/21/50).
+//     NODE_HOST_AGENT_ENABLE_NETHEALTH (default true).
+//   - nodereporter: syncs watchdog state-* latches to NodeConditions,
+//     K8s Events and problem_gauge/problem_counter (replaces the NPD
+//     watchdog monitors). NODE_HOST_AGENT_ENABLE_REPORTER (default
+//     true); needs a kube client and a node name.
+//   - controllerhygiene: control-plane guards (apiserver wedge,
+//     kine TTL/pool, oom-loop shield, systemd watchdog feeder).
+//     NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE: true|false|auto
+//     (default auto = enabled iff k0scontroller.service exists).
+//   - hostconfig: declarative host converger (sysctl, systemd
+//     drop-ins, nebula, coredns stub, api-local-lb, fail2ban, sshd)
+//     replacing the node-config-agent ansible DaemonSet.
+//     NODE_HOST_AGENT_ENABLE_HOSTCONFIG: true|false|auto (default
+//     auto = enabled iff the vars dir holds defaults.yaml).
+//
+// NODE_HOST_AGENT_HOST_ROOT (default "/host") prefixes every host
+// path; set it to "/" when running as a standalone systemd binary on
+// the host itself (API LB VMs, control-plane nodes). The kube client
+// is built lazily — only when a subsystem that needs it (sweeper,
+// workerhygiene, nodereporter) is enabled.
 package main
 
 import (
@@ -45,8 +70,14 @@ import (
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/apiprober"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/controllerhygiene"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostconfig"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/hostmetrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/nethealth"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/nodereporter"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/sweeper"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/systemd"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/workerhygiene"
 )
 
@@ -82,6 +113,51 @@ func envInt(key string, def int) int {
 func envInt64(key string, def int64) int64 {
 	if v, err := strconv.ParseInt(os.Getenv(key), 10, 64); err == nil {
 		return v
+	}
+	return def
+}
+
+// envOr is the env → conf → consumer-default chain for string knobs:
+// an unset env falls through to the conf value (which may itself be
+// empty — the package default then applies).
+func envOr(key, confVal string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return confVal
+}
+
+// envIntOr is env → conf-int → def for int knobs (conf ints are raw
+// counts; 0 = unset).
+func envIntOr(key string, confVal, def int) int {
+	if os.Getenv(key) != "" {
+		return envInt(key, def)
+	}
+	if confVal > 0 {
+		return confVal
+	}
+	return def
+}
+
+// envInt64Or is env → conf-int64 → def for int64 knobs.
+func envInt64Or(key string, confVal, def int64) int64 {
+	if os.Getenv(key) != "" {
+		return envInt64(key, def)
+	}
+	if confVal > 0 {
+		return confVal
+	}
+	return def
+}
+
+// envDurOr is env → conf-seconds → def for duration knobs (conf
+// carries bare seconds like the shell *_S knobs).
+func envDurOr(key string, confSeconds int, def time.Duration) time.Duration {
+	if os.Getenv(key) != "" {
+		return envDuration(key, def)
+	}
+	if confSeconds > 0 {
+		return time.Duration(confSeconds) * time.Second
 	}
 	return def
 }
@@ -135,11 +211,35 @@ var kubeClient = func() (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(cfg)
 }
 
+// periodic adapts a plain cycle func to the agent.Subsystem contract:
+// run immediately, then every interval until ctx is cancelled.
+type periodic struct {
+	name     string
+	interval time.Duration
+	fn       func(ctx context.Context)
+}
+
+func (p periodic) Name() string { return p.name }
+
+func (p periodic) Run(ctx context.Context) {
+	p.fn(ctx)
+	t := time.NewTicker(p.interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			p.fn(ctx)
+		}
+	}
+}
+
 // buildAgentConfig wires the environment into an agent.Config: one
-// shared registry plus the subsystem list in startup order (sweeper,
-// apiprober). hostmetrics registers on the shared registry directly.
-// The bool reports whether apiprober was enabled — it feeds the
-// startup log line only.
+// shared registry plus the subsystem list in startup order.
+// hostmetrics registers on the shared registry directly. The bool
+// reports whether apiprober was enabled — it feeds the startup log
+// line only.
 func buildAgentConfig(nodeName, podName, namespace, version,
 	metricsAddr, probeAddr string) (agent.Config, bool) {
 
@@ -148,9 +248,51 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 	reg := prometheus.NewRegistry()
 	var subsystems []agent.Subsystem
 
+	// Host root: "/host" in the DaemonSet (host fs bind-mounted),
+	// "/" for the standalone systemd binary on the host itself.
+	hostRoot := strings.TrimRight(getenv("NODE_HOST_AGENT_HOST_ROOT", "/host"), "/")
+	if hostRoot == "" {
+		hostRoot = "/"
+	}
+	hostPath := func(p string) string {
+		if hostRoot == "/" {
+			return p
+		}
+		return hostRoot + p
+	}
+
+	// Shared host-side inputs: the node-watchdog.conf parser feeds
+	// API_BACKENDS / OVERLAY_* / DNS_FALLBACK_MAP into apiprober,
+	// workerhygiene, nethealth and hostmetrics; the systemd client
+	// drives every host unit action (nsenter-wrapped in a container,
+	// direct on the host).
+	wdConfPath := getenv("NODE_HOST_AGENT_WATCHDOG_CONF",
+		hostPath("/etc/node-watchdog.conf"))
+	wdCfg, err := watchdogconf.Load(wdConfPath)
+	if err != nil {
+		slog.Error("watchdog conf parse failed — running on defaults",
+			"path", wdConfPath, "error", err)
+		wdCfg, _ = watchdogconf.Parse(nil)
+	}
+	// One shared reloader: hostconfig rewrites the conf every
+	// converge, so conf-consuming subsystems re-read it per cycle
+	// instead of pinning the startup parse (the runner re-sourced it
+	// every run — API_BACKENDS / OVERLAY_* / WD_SIG_* changes land
+	// next cycle).
+	wdReloader := watchdogconf.NewReloader(wdConfPath, wdCfg)
+	sdClient := systemd.New(systemd.Config{HostRoot: hostRoot})
+
+	watchdogStateDir := getenv("NODE_HOST_AGENT_WATCHDOG_STATE_DIR",
+		hostPath("/var/lib/node-watchdog"))
+	watchdogLogFile := getenv("NODE_HOST_AGENT_WATCHDOG_LOG",
+		hostPath("/var/log/node-watchdog.log"))
+	hnode := getenv("NODE_HOST_AGENT_NODE_NAME", nodeName)
+
 	// One clientset for the whole process: each NewForConfig builds
-	// its own http.Transport + TLS pool, so sweeper and workerhygiene
-	// share a lazily-built client instead of carrying two pools.
+	// its own http.Transport + TLS pool, so sweeper, workerhygiene
+	// and nodereporter share a lazily-built client instead of
+	// carrying three pools. On standalone hosts no kube client is
+	// built at all unless one of those subsystems is enabled.
 	var cs kubernetes.Interface
 	var csErr error
 	csOnce := func() (kubernetes.Interface, error) {
@@ -185,6 +327,27 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 		}
 	}
 
+	// --- concourse-cache: native shared-cache pruner ---
+	// Pure host-fs work — no kube client, so it also runs on
+	// standalone workers. Replaces the old CronJob + pods/exec path.
+	if envBool("NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE", true) {
+		pr, err := sweeper.NewConcourseCachePruner(sweeper.ConcourseCacheConfig{}, reg)
+		if err != nil {
+			slog.Error("concourse-cache pruner setup failed", "error", err)
+		} else {
+			cacheRoot := getenv("NODE_HOST_AGENT_SWEEP_BASE_DIR", "/var/openebs/local")
+			subsystems = append(subsystems, periodic{
+				name:     "concourse-cache",
+				interval: envDuration("NODE_HOST_AGENT_CONCOURSE_CACHE_INTERVAL", sweeper.DefaultConcourseCacheInterval),
+				fn: func(ctx context.Context) {
+					if err := pr.Sweep(ctx, cacheRoot); err != nil {
+						slog.Error("concourse cache sweep failed", "error", err)
+					}
+				},
+			})
+		}
+	}
+
 	// --- apiprober: apiserver watch-cache wedge guard ---
 	// NODE_HOST_AGENT_ENABLE_APIPROBER: "auto" (default) = on — the
 	// prober meters discover_fail cycles while the api-local-lb socket
@@ -197,15 +360,23 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 	// installed after this pod started. "false" disables explicitly.
 	apiproberEnabled := getenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto") != "false"
 	if apiproberEnabled {
+		var staticBackends []apiprober.StaticBackend
+		for _, b := range wdCfg.APIBackends {
+			staticBackends = append(staticBackends,
+				apiprober.StaticBackend{Name: b.Name, Addr: b.Addr})
+		}
 		pb, err := apiprober.New(apiprober.Config{
-			SocketPath:    apiproberSocket,
-			BackendName:   getenv("NODE_HOST_AGENT_APIPROBER_BACKEND", "api_local_back"),
-			Interval:      envDuration("NODE_HOST_AGENT_APIPROBER_INTERVAL", 30*time.Second),
-			Mode:          getenv("NODE_HOST_AGENT_APIPROBER_MODE", apiprober.ModeDryRun),
-			GapMin:        envInt64("NODE_HOST_AGENT_APIPROBER_GAP_MIN", 10000),
-			FailCycles:    envInt("NODE_HOST_AGENT_APIPROBER_FAIL_CYCLES", 2),
-			FrozenCycles:  envInt("NODE_HOST_AGENT_APIPROBER_FROZEN_CYCLES", 2),
-			RecoverCycles: envInt("NODE_HOST_AGENT_APIPROBER_RECOVER_CYCLES", 3),
+			SocketPath:  apiproberSocket,
+			BackendName: getenv("NODE_HOST_AGENT_APIPROBER_BACKEND", "api_local_back"),
+			CompanionBackends: envList(
+				"NODE_HOST_AGENT_APIPROBER_COMPANION_BACKENDS"),
+			StaticBackends: staticBackends,
+			Interval:       envDuration("NODE_HOST_AGENT_APIPROBER_INTERVAL", 30*time.Second),
+			Mode:           getenv("NODE_HOST_AGENT_APIPROBER_MODE", apiprober.ModeDryRun),
+			GapMin:         envInt64("NODE_HOST_AGENT_APIPROBER_GAP_MIN", 10000),
+			FailCycles:     envInt("NODE_HOST_AGENT_APIPROBER_FAIL_CYCLES", 2),
+			FrozenCycles:   envInt("NODE_HOST_AGENT_APIPROBER_FROZEN_CYCLES", 2),
+			RecoverCycles:  envInt("NODE_HOST_AGENT_APIPROBER_RECOVER_CYCLES", 3),
 			TokenFile: getenv("NODE_HOST_AGENT_APIPROBER_TOKEN_FILE",
 				"/var/run/secrets/kubernetes.io/serviceaccount/token"),
 			CAFile: getenv("NODE_HOST_AGENT_APIPROBER_CA_FILE",
@@ -223,8 +394,8 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 				"/api/v1/nodes?limit=1&resourceVersion=0"),
 			// Same env/dir hostmetrics uses — one shared watchdog
 			// state dir mount for the whole pod.
-			WatchdogStateDir: getenv("NODE_HOST_AGENT_WATCHDOG_STATE_DIR",
-				"/host/var/lib/node-watchdog"),
+			WatchdogStateDir: watchdogStateDir,
+			WatchdogSrc:      wdReloader,
 		}, reg)
 		if err != nil {
 			slog.Error("apiprober setup failed", "error", err)
@@ -237,14 +408,18 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 	if envBool("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", true) {
 		reg.MustRegister(hostmetrics.New(hostmetrics.Config{
 			NodeName:         nodeName,
-			WatchdogStateDir: getenv("NODE_HOST_AGENT_WATCHDOG_STATE_DIR", "/host/var/lib/node-watchdog"),
+			WatchdogStateDir: watchdogStateDir,
 			SysClassNet:      getenv("NODE_HOST_AGENT_SYS_CLASS_NET", "/sys/class/net"),
 			NebulaIface:      getenv("NODE_HOST_AGENT_NEBULA_IFACE", "neb1"),
 			RouteFile:        getenv("NODE_HOST_AGENT_HOST_ROUTE_FILE", "/proc/1/net/route"),
 			K0sConfigFile:    getenv("NODE_HOST_AGENT_K0S_CONFIG", "/etc/k0s/k0s.yaml"),
-			K0sUnitFile:      getenv("NODE_HOST_AGENT_K0S_UNIT", "/etc/systemd/system/k0scontroller.service"),
-			NebulaCertFile:   getenv("NODE_HOST_AGENT_NEBULA_CERT", "/host/etc/nebula/interdc/host.crt"),
+			K0sUnitFile:      getenv("NODE_HOST_AGENT_K0S_UNIT", hostPath("/etc/systemd/system/k0scontroller.service")),
+			NebulaCertFile:   getenv("NODE_HOST_AGENT_NEBULA_CERT", hostPath("/etc/nebula/"+wdCfg.NebulaNet+"/host.crt")),
 			ExpectedKCMArgs:  envList("NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS"), // empty = defaults
+			PSIFile:          getenv("NODE_HOST_AGENT_PSI_FILE", "/proc/pressure/cpu"),
+			EgressRelays:     wdCfg.OverlayEgressRelays,
+			CPUDeliveredInterval: envDuration(
+				"NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL", 2*time.Minute),
 		}))
 	}
 
@@ -255,7 +430,6 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 	if envBool("NODE_HOST_AGENT_ENABLE_HYGIENE", true) {
 		// DaemonSet sets NODE_HOST_AGENT_NODE_NAME and NODE_NAME via
 		// the downward API — prefer the explicit override env.
-		hnode := getenv("NODE_HOST_AGENT_NODE_NAME", nodeName)
 		switch {
 		case hnode == "":
 			slog.Error("workerhygiene disabled: node name empty " +
@@ -270,13 +444,19 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 					NodeName:           hnode,
 					Enabled:            true,
 					Interval:           envDuration("NODE_HOST_AGENT_HYGIENE_INTERVAL", 2*time.Minute),
-					WatchdogStateDir:   getenv("NODE_HOST_AGENT_WATCHDOG_STATE_DIR", "/host/var/lib/node-watchdog"),
-					WatchdogLogFile:    getenv("NODE_HOST_AGENT_WATCHDOG_LOG", "/host/var/log/node-watchdog.log"),
+					WatchdogStateDir:   watchdogStateDir,
+					WatchdogLogFile:    watchdogLogFile,
 					ProcRoot:           getenv("NODE_HOST_AGENT_PROC_ROOT", "/proc"),
-					CtrTaskRoot:        getenv("NODE_HOST_AGENT_CTR_TASK_ROOT", "/host/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io"),
-					SandboxCtlRoot:     getenv("NODE_HOST_AGENT_SANDBOX_CTL_ROOT", "/host/run/k0s/containerd/io.containerd.sandbox.controller.v1.shim"),
-					HostResolvConf:     getenv("NODE_HOST_AGENT_HOST_RESOLV_CONF", "/host/etc/resolv.conf"),
-					K0sWorkerUnitFile:  getenv("NODE_HOST_AGENT_K0S_WORKER_UNIT", "/host/etc/systemd/system/k0sworker.service"),
+					CtrTaskRoot:        getenv("NODE_HOST_AGENT_CTR_TASK_ROOT", hostPath("/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io")),
+					SandboxCtlRoot:     getenv("NODE_HOST_AGENT_SANDBOX_CTL_ROOT", hostPath("/run/k0s/containerd/io.containerd.sandbox.controller.v1.shim")),
+					HostResolvConf:     getenv("NODE_HOST_AGENT_HOST_RESOLV_CONF", hostPath("/etc/resolv.conf")),
+					K0sWorkerUnitFile:  getenv("NODE_HOST_AGENT_K0S_WORKER_UNIT", hostPath("/etc/systemd/system/k0sworker.service")),
+					KubeletPodsDir:     getenv("NODE_HOST_AGENT_KUBELET_PODS_DIR", hostPath("/var/lib/k0s/kubelet/pods")),
+					CiliumSocket:       getenv("NODE_HOST_AGENT_CILIUM_SOCKET", hostPath("/run/cilium/cilium.sock")),
+					Systemd:            sdClient,
+					Watchdog:           wdCfg,
+					WatchdogSrc:        wdReloader,
+					APIBackends:        wdCfg.APIBackendIPs(),
 					StuckDeleteAge:     envDuration("NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE", 15*time.Minute),
 					StuckWedgeAge:      envDuration("NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE", 30*time.Minute),
 					MaxForceDelete:     envInt("NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE", 5),
@@ -290,6 +470,170 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 					subsystems = append(subsystems, wh)
 				}
 			}
+		}
+	}
+
+	// --- nethealth: DNS/overlay/nebula/fail2ban watchdog modules ---
+	// Runs on workers AND hub nodes; no kube client needed.
+	if envBool("NODE_HOST_AGENT_ENABLE_NETHEALTH", true) {
+		nh, err := nethealth.New(nethealth.Config{
+			Enabled:          true,
+			Interval:         envDuration("NODE_HOST_AGENT_NETHEALTH_INTERVAL", 2*time.Minute),
+			WatchdogStateDir: watchdogStateDir,
+			WatchdogLogFile:  watchdogLogFile,
+			HostResolvConf:   getenv("NODE_HOST_AGENT_HOST_RESOLV_CONF", hostPath("/etc/resolv.conf")),
+			HostsFile:        getenv("NODE_HOST_AGENT_HOSTS_FILE", hostPath("/etc/hosts")),
+			ProcNetUDP:       getenv("NODE_HOST_AGENT_PROC_NET_UDP", "/proc/1/net/udp"),
+			ProcNetUDP6:      getenv("NODE_HOST_AGENT_PROC_NET_UDP6", "/proc/1/net/udp6"),
+			UptimeFile:       getenv("NODE_HOST_AGENT_UPTIME_FILE", "/proc/uptime"),
+			HostRoot:         hostRoot,
+			Watchdog:         wdCfg,
+			WatchdogSrc:      wdReloader,
+			Systemd:          sdClient,
+			ConsecNeeded:     envInt("NODE_HOST_AGENT_NETHEALTH_CONSEC_NEEDED", 2),
+			MinRestart:       envDuration("NODE_HOST_AGENT_NETHEALTH_MIN_RESTART", 30*time.Minute),
+		}, reg)
+		if err != nil {
+			slog.Error("nethealth setup failed", "error", err)
+		} else {
+			subsystems = append(subsystems, nh)
+		}
+	}
+
+	// --- nodereporter: state latches → NodeConditions/Events ---
+	// Replaces the NPD watchdog-state/filelog monitors; needs the
+	// kube client and a node name.
+	if envBool("NODE_HOST_AGENT_ENABLE_REPORTER", true) {
+		switch {
+		case hnode == "":
+			slog.Error("nodereporter disabled: node name empty " +
+				"(NODE_HOST_AGENT_NODE_NAME/NODE_NAME unset)")
+		default:
+			cs, err := csOnce()
+			if err != nil {
+				slog.Error("nodereporter disabled: cannot build kubernetes client",
+					"error", err)
+			} else {
+				nr, err := nodereporter.New(nodereporter.Config{
+					NodeName:         hnode,
+					Client:           cs,
+					WatchdogStateDir: watchdogStateDir,
+					WatchdogLogFile:  watchdogLogFile,
+					Interval:         envDuration("NODE_HOST_AGENT_REPORTER_INTERVAL", 30*time.Second),
+					EventNamespace:   getenv("NODE_HOST_AGENT_EVENT_NAMESPACE", "default"),
+				}, reg)
+				if err != nil {
+					slog.Error("nodereporter setup failed", "error", err)
+				} else {
+					subsystems = append(subsystems, nr)
+				}
+			}
+		}
+	}
+
+	// --- controllerhygiene: control-plane guards ---
+	// "auto" (default): enabled iff this host runs k0scontroller —
+	// workers and bare API LB VMs self-disable.
+	chMode := getenv("NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE", "auto")
+	if chMode == "true" || (chMode == "auto" && controllerhygiene.ShouldRun(hostRoot)) {
+		ch, err := controllerhygiene.New(controllerhygiene.Config{
+			Enabled:               true,
+			Interval:              envDuration("NODE_HOST_AGENT_CONTROLLER_INTERVAL", time.Minute),
+			WatchdogStateDir:      watchdogStateDir,
+			WatchdogLogFile:       watchdogLogFile,
+			ProcRoot:              getenv("NODE_HOST_AGENT_PROC_ROOT", "/proc"),
+			K0sControllerUnitFile: hostPath("/etc/systemd/system/k0scontroller.service"),
+			// env → wdCfg → package defaults; SelfAPI stays EMPTY
+			// when neither is set (the solo/dead-fallback fences gate
+			// on non-empty — a made-up identity would crown every
+			// unconfigured controller first-hub).
+			SelfAPI:     envOr("NODE_HOST_AGENT_API_SELF", wdCfg.APISelf),
+			PeerAPI:     envOr("NODE_HOST_AGENT_API_PEER", wdCfg.APIPeer),
+			KineDBProbe: envOr("NODE_HOST_AGENT_KINE_DB_PROBE", wdCfg.KineDBProbe),
+			Sig13Mode:   envOr("NODE_HOST_AGENT_SIG13_AUTOFIX", wdCfg.Sig13Autofix),
+			StaleMinErrs: envIntOr("NODE_HOST_AGENT_STALE_MIN_ERRS",
+				wdCfg.Sig13StaleMinErrs, 15),
+			GapMin: envInt64Or("NODE_HOST_AGENT_GAP_MIN",
+				wdCfg.Sig13GapMin, 10000),
+			GapCycles: envIntOr("NODE_HOST_AGENT_GAP_CYCLES",
+				wdCfg.Sig13GapCycles, 2),
+			FrozenCycles: envIntOr("NODE_HOST_AGENT_FROZEN_CYCLES",
+				wdCfg.Sig13FrozenCycles, 2),
+			SoloCycles: envIntOr("NODE_HOST_AGENT_SOLO_CYCLES",
+				wdCfg.Sig13SoloCycles, 8),
+			MinRestartInterval: envDurOr("NODE_HOST_AGENT_SIG13_MIN_RESTART_S",
+				wdCfg.Sig13MinRestartS, 2*time.Hour),
+			KineTTLMode: envOr("NODE_HOST_AGENT_KINE_TTL_AUTOFIX", wdCfg.KineTTLAutofix),
+			KineTTLMinRestart: envDurOr("NODE_HOST_AGENT_KINE_TTL_MIN_RESTART_S",
+				wdCfg.KineTTLMinRestartS, 30*time.Minute),
+			KineTTLCtlRestart: envDurOr("NODE_HOST_AGENT_KINE_TTL_CTL_RESTART_S",
+				wdCfg.KineTTLCtlRestartS, 2*time.Hour),
+			KineTTLRewedgeCycles: envIntOr("NODE_HOST_AGENT_KINE_TTL_REWEDGE_CYCLES",
+				wdCfg.KineTTLRewedgeCycle, 2),
+			KinePoolMode: envOr("NODE_HOST_AGENT_KINE_POOL_AUTOFIX", wdCfg.KinePoolAutofix),
+			KinePoolMaxConns: envIntOr("NODE_HOST_AGENT_KINE_POOL_MAX_CONNS",
+				wdCfg.KinePoolMaxConns, 72),
+			KinePoolCycles: envIntOr("NODE_HOST_AGENT_KINE_POOL_CYCLES",
+				wdCfg.KinePoolCycles, 3),
+			KinePoolMinRestart: envDurOr("NODE_HOST_AGENT_KINE_POOL_MIN_RESTART_S",
+				wdCfg.KinePoolMinRestartS, 20*time.Minute),
+			OOMLoopMode: envOr("NODE_HOST_AGENT_OOMLOOP_AUTOFIX", wdCfg.OOMLoopAutofix),
+			OOMLoopMinKills: envIntOr("NODE_HOST_AGENT_OOMLOOP_MIN_KILLS",
+				wdCfg.OOMLoopMinKills, 3),
+			OOMLoopWindow: envDurOr("NODE_HOST_AGENT_OOMLOOP_WINDOW_S",
+				wdCfg.OOMLoopWindowS, time.Hour),
+			AdminKubeconfig:   hostPath("/var/lib/k0s/pki/admin.conf"),
+			AdminCert:         hostPath("/var/lib/k0s/pki/admin.crt"),
+			AdminKey:          hostPath("/var/lib/k0s/pki/admin.key"),
+			AdminCA:           hostPath("/var/lib/k0s/pki/ca.crt"),
+			InsecureTLS:       envBool("NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS", true),
+			CGroupEventsFile:  hostPath("/sys/fs/cgroup/system.slice/k0scontroller.service/memory.events"),
+			FeederEnabled:     envBool("NODE_HOST_AGENT_ENABLE_FEEDER", true),
+			NotifySocket:      os.Getenv("NOTIFY_SOCKET"),
+			FeederStateDir:    hostPath("/var/lib/k0s-systemd-watchdog"),
+			RemediatePeerFile: hostPath("/etc/default/k0scontroller-watchdog"),
+		}, reg)
+		if err != nil {
+			slog.Error("controllerhygiene setup failed", "error", err)
+		} else {
+			subsystems = append(subsystems, ch)
+		}
+	}
+
+	// --- hostconfig: declarative host converger ---
+	// "auto" (default): enabled iff the vars dir actually carries
+	// defaults.yaml — pods without the node-config-vars mount and
+	// standalone hosts without config self-disable.
+	varsDir := getenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", "/config/vars")
+	hcMode := getenv("NODE_HOST_AGENT_ENABLE_HOSTCONFIG", "auto")
+	_, varsErr := os.Stat(varsDir + "/defaults.yaml")
+	if hcMode == "true" || (hcMode == "auto" && varsErr == nil) {
+		hostname, _ := os.Hostname()
+		var runner hostconfig.Runner = hostconfig.NsenterRunner{}
+		if hostRoot == "/" {
+			runner = hostconfig.DirectRunner{}
+		}
+		hc, err := hostconfig.New(hostconfig.Config{
+			Enabled:            true,
+			NodeName:           hnode,
+			Hostname:           hostname,
+			HostRoot:           hostRoot,
+			VarsDir:            varsDir,
+			NebulaCertsDir:     getenv("NODE_HOST_AGENT_NEBULA_CERTS_DIR", "/config/nebula-certs"),
+			WatchdogScriptsDir: getenv("NODE_HOST_AGENT_WATCHDOG_SCRIPTS_DIR", "/config/watchdog"),
+			Interval:           envDuration("NODE_HOST_AGENT_HOSTCONFIG_INTERVAL", 30*time.Minute),
+			Runner:             runner,
+			// Vars/cert changes converge on the next poll instead of
+			// waiting out the full interval.
+			Watcher: &hostconfig.DirWatcher{Dirs: []string{
+				varsDir,
+				getenv("NODE_HOST_AGENT_NEBULA_CERTS_DIR", "/config/nebula-certs"),
+			}},
+		}, reg)
+		if err != nil {
+			slog.Error("hostconfig setup failed", "error", err)
+		} else {
+			subsystems = append(subsystems, hc)
 		}
 	}
 

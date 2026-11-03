@@ -36,6 +36,17 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		K0sConfigFile:    filepath.Join(dirs["k0s"], "k0s.yaml"),
 		K0sUnitFile:      filepath.Join(dirs["systemd"], "k0scontroller.service"),
 		NebulaCertFile:   filepath.Join(root, "host.crt"),
+		// Deliberately nonexistent: the real /proc/pressure/cpu would
+		// feed live data into the overload hysteresis and rewrite
+		// test-managed latches.
+		PSIFile: filepath.Join(root, "no-such-psi"),
+		// Never re-measure during unrelated tests — the real
+		// busy-loop only runs where a test injects cpuMeasure.
+		CPUDeliveredInterval: 24 * time.Hour,
+		// Default stub: returns no result — the real 0.3 cpu-s
+		// busy-loop would otherwise spin once per collector instance
+		// (~20 concurrent goroutines during a suite run).
+		cpuMeasure: func() (float64, float64, bool) { return 0, 0, false },
 	}, dirs
 }
 
@@ -433,10 +444,10 @@ func TestRemovedFlagsCustom(t *testing.T) {
 
 func TestDescribe(t *testing.T) {
 	c := New(Config{})
-	ch := make(chan *prometheus.Desc, 8)
+	ch := make(chan *prometheus.Desc, 16)
 	c.Describe(ch)
-	if got := len(ch); got != 5 {
-		t.Fatalf("Describe emitted %d descs want 5", got)
+	if got := len(ch); got != 10 {
+		t.Fatalf("Describe emitted %d descs want 10", got)
 	}
 }
 
@@ -638,5 +649,139 @@ func TestNebulaCertStatePersistsZeroAfterRemoval(t *testing.T) {
 	}
 	if _, ok := metricValue(t, c, "node_host_agent_nebula_cert_days_left", nil); ok {
 		t.Fatal("cert_days_left emitted after cert removal")
+	}
+}
+
+// --- PSI overload (runner's node-overloaded) ---
+
+func TestPSIGaugeAndOverloadLatch(t *testing.T) {
+	cfg, dirs := fixture(t)
+	cfg.PSIFile = filepath.Join(t.TempDir(), "cpu")
+	c := New(cfg)
+
+	write(t, cfg.PSIFile, "some avg10=10.00 avg60=45.50 avg300=20.00 total=123\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+	v, ok := metricValue(t, c, "node_watchdog_psi_cpu_some_avg60", map[string]string{})
+	if !ok || v != 45.5 {
+		t.Fatalf("psi=%v,%v want 45.5", v, ok)
+	}
+	latch := filepath.Join(dirs["state"], "state-node-overloaded")
+	if _, err := os.Stat(latch); err != nil {
+		t.Fatalf("overload latch not created at avg60>=40: %v", err)
+	}
+	// Hysteresis: 30% is between 40/25 — latch persists.
+	write(t, cfg.PSIFile, "some avg10=5.00 avg60=30.00 avg300=10.00 total=9\n")
+	metricValue(t, c, "node_watchdog_psi_cpu_some_avg60", map[string]string{})
+	if _, err := os.Stat(latch); err != nil {
+		t.Fatal("latch dropped inside hysteresis band")
+	}
+	// Below 25 → released.
+	write(t, cfg.PSIFile, "some avg10=1.00 avg60=20.00 avg300=5.00 total=4\n")
+	metricValue(t, c, "node_watchdog_psi_cpu_some_avg60", map[string]string{})
+	if _, err := os.Stat(latch); !os.IsNotExist(err) {
+		t.Fatal("latch kept below the 25% release threshold")
+	}
+}
+
+func TestPSIUnreadableKeepsLatch(t *testing.T) {
+	cfg, dirs := fixture(t)
+	cfg.PSIFile = filepath.Join(t.TempDir(), "missing")
+	latch := filepath.Join(dirs["state"], "state-node-overloaded")
+	write(t, latch, "1\n")
+	c := New(cfg)
+	if _, ok := metricValue(t, c, "node_watchdog_psi_cpu_some_avg60",
+		map[string]string{}); ok {
+		t.Fatal("psi gauge emitted with unreadable PSI file")
+	}
+	// Inconclusive read → existing latch kept.
+	if _, err := os.Stat(latch); err != nil {
+		t.Fatal("latch dropped on unreadable PSI")
+	}
+}
+
+// --- cpu-delivered probe ---
+
+func TestCPUDeliveredEmitsAfterMeasure(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.CPUDeliveredInterval = time.Minute
+	c := New(cfg)
+	c.cfg.nowFn = func() time.Time { return time.Unix(1000, 0) }
+	c.cfg.cpuMeasure = func() (float64, float64, bool) { return 0.95, 0.32, true }
+
+	// First scrape: probe launched async — wait for it.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if v, ok := metricValue(t, c, "node_cpu_delivered_ratio",
+			map[string]string{}); ok {
+			if v != 0.95 {
+				t.Fatalf("ratio=%v want 0.95", v)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cpu delivered ratio never emitted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if v, ok := metricValue(t, c, "node_cpu_delivered_probe_wall_seconds",
+		map[string]string{}); !ok || v != 0.32 {
+		t.Fatalf("wall=%v,%v want 0.32", v, ok)
+	}
+}
+
+func TestCPUDeliveredAbsentBeforeMeasure(t *testing.T) {
+	cfg, _ := fixture(t)
+	c := New(cfg)
+	// Blocked forever — no result, and the scrape still completes.
+	c.cfg.cpuMeasure = func() (float64, float64, bool) {
+		select {} // never returns — simulates a probe still running
+	}
+	if _, ok := metricValue(t, c, "node_cpu_delivered_ratio",
+		map[string]string{}); ok {
+		t.Fatal("ratio emitted before first completed measurement")
+	}
+}
+
+// --- fail2ban banned counts ---
+
+func TestFail2banBannedMetric(t *testing.T) {
+	cfg, dirs := fixture(t)
+	write(t, filepath.Join(dirs["state"], "fail2ban-banned"), "sshd=7 recidive=1\n")
+	c := New(cfg)
+	v, ok := metricValue(t, c, "node_fail2ban_banned_ips",
+		map[string]string{"jail": "sshd"})
+	if !ok || v != 7 {
+		t.Fatalf("sshd=%v,%v want 7", v, ok)
+	}
+	if v, ok := metricValue(t, c, "node_fail2ban_banned_ips",
+		map[string]string{"jail": "recidive"}); !ok || v != 1 {
+		t.Fatalf("recidive=%v,%v want 1", v, ok)
+	}
+}
+
+func TestFail2banAbsentWithoutFile(t *testing.T) {
+	cfg, _ := fixture(t)
+	c := New(cfg)
+	if _, ok := metricValue(t, c, "node_fail2ban_banned_ips",
+		map[string]string{"jail": "sshd"}); ok {
+		t.Fatal("banned metric emitted without the file (fake 0)")
+	}
+}
+
+// --- egress relay gauge ---
+
+func TestEgressRelayGauge(t *testing.T) {
+	cfg, dirs := fixture(t)
+	cfg.EgressRelays = []string{"8.8.8.8", "1.1.1.1"}
+	write(t, filepath.Join(dirs["state"], "egress-state-8.8.8.8"), "relay\n")
+	write(t, filepath.Join(dirs["state"], "egress-state-1.1.1.1"), "direct\n")
+	c := New(cfg)
+	if v, ok := metricValue(t, c, "node_overlay_egress_relay_active",
+		map[string]string{"target": "8.8.8.8"}); !ok || v != 1 {
+		t.Fatalf("relay=%v,%v want 1", v, ok)
+	}
+	// Explicit 0 while direct — series always emitted per target.
+	if v, ok := metricValue(t, c, "node_overlay_egress_relay_active",
+		map[string]string{"target": "1.1.1.1"}); !ok || v != 0 {
+		t.Fatalf("direct=%v,%v want 0", v, ok)
 	}
 }

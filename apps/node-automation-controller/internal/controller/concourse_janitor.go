@@ -2,20 +2,18 @@
 // passiontech-fluxcd
 // (infrastructure/passiontech-k0s-cicd/concourse/concourse-workdir-janitor.yaml).
 //
-// Two jobs per run (every 30m):
+// One job per run (every 30m): when the work-dir exceeds the cap OR
+// nodefs crosses the threshold, replace worker pods ONE AT A TIME —
+// the sts init container `concourse-worker-init-rm` (custom in
+// values.yaml — cleanUpWorkDirOnStart=false) wipes /concourse-work-dir
+// except shared-cache/{go-mod,mise,ci-tool,node-deps} at pod start.
 //
-//  1. Exec the shared-cache prune script into every concourse-worker
-//     pod (container concourse-worker, `/bin/bash -s` with the script
-//     on stdin). The work-dir is a hostPath mount and ns concourse is
-//     VAP workload-no-hostpath Deny, so pruning can only go through
-//     pods/exec. The script is read fresh from scriptPath every run so
-//     a ConfigMap update takes effect without a controller restart.
-//
-//  2. When the work-dir exceeds the cap OR nodefs crosses the
-//     threshold, replace worker pods ONE AT A TIME: the sts init
-//     container `concourse-worker-init-rm` (custom in values.yaml —
-//     cleanUpWorkDirOnStart=false) wipes /concourse-work-dir except
-//     shared-cache/{go-mod,mise,ci-tool,node-deps} at pod start.
+// The shared-cache prune that used to be job 1 (pods/exec SPDY of a
+// prune.sh ConfigMap into every worker pod) is gone: ns concourse is
+// VAP workload-no-hostpath Deny so it was the only in-pod path, but
+// node-host-agent now prunes <openebs>/pvc-*/shared-cache natively on
+// the worker node every 15m (apps/node-host-agent/internal/sweeper/
+// concourse_cache.go) — no pods/exec grant, no script ConfigMap.
 //
 // Why this exists: openebs-hostpath does NOT enforce PVC quota (the
 // PVC `size` is metadata — the worker writes straight onto the node
@@ -40,11 +38,12 @@
 // the baseline is estimated as imageFs_used + 32GiB (OS/k0s/other
 // PVCs outside imageFs — measured 29-35GiB on the worker nodes).
 //
-// The shared-cache prune runs BEFORE stats are read — freed disk can
-// bring the pod back under both thresholds and avoid an unnecessary
-// wipe. The cache is kept only when workdir <= cap AND nodefs is
-// under the threshold; unreadable stats FAIL OPEN to a wipe (the
-// cleanup ability must never be lost to a broken metrics path).
+// The host-agent prune runs continuously independent of this run, so
+// freed cache disk is already reflected in the stats read here — the
+// keep-cache check below still avoids unnecessary wipes. The cache is
+// kept only when workdir <= cap AND nodefs is under the threshold;
+// unreadable stats FAIL OPEN to a wipe (the cleanup ability must
+// never be lost to a broken metrics path).
 //
 // Why sequential pod delete and not `rollout restart`: the worker sts
 // uses podManagementPolicy=Parallel, so a rollout restarts ALL
@@ -79,12 +78,10 @@
 package controller
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,10 +94,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/remotecommand"
-	"k8s.io/client-go/transport/spdy"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -108,7 +101,6 @@ import (
 const (
 	cjNamespace   = "concourse"
 	cjStatefulSet = "concourse-worker"
-	cjContainer   = "concourse-worker"
 	// The controller runs in ns node-ops — the cross-namespace short
 	// DNS name is required (bare "concourse-web" would not resolve).
 	cjATCBase      = "http://concourse-web.concourse:8080"
@@ -131,12 +123,6 @@ const (
 	cjSlowPoll       = 10 * time.Second // drain/ready waits (bash `sleep 10`)
 )
 
-// podExecutor runs a bash script inside a pod container — the
-// production impl is SPDY remotecommand (`kubectl exec -i ... bash -s`).
-type podExecutor interface {
-	ExecBash(ctx context.Context, ns, pod, container string, script []byte) (string, error)
-}
-
 // nodeStatsReader reads kubelet stats/summary through the apiserver
 // node proxy. Missing counters return -1 so callers can distinguish
 // "absent" from a real 0 (the bash sed pipeline produced "" there).
@@ -154,13 +140,11 @@ type atcIface interface {
 }
 
 type concourseWorkdirJanitor struct {
-	cs         kubernetes.Interface
-	exec       podExecutor
-	stats      nodeStatsReader
-	atc        atcIface
-	enabled    bool
-	scriptPath string
-	mu         sync.Mutex
+	cs      kubernetes.Interface
+	stats   nodeStatsReader
+	atc     atcIface
+	enabled bool
+	mu      sync.Mutex
 
 	// Timeouts/polls are fields (initialised from the consts) only so
 	// tests can shrink them; production values match the bash ones.
@@ -178,14 +162,12 @@ type concourseWorkdirJanitor struct {
 // CronJob schedule `7,37 * * * *`). With enabled=false the tick only
 // logs and returns nil — the module stays wired uniformly across
 // clusters with and without Concourse (CONCOURSE_JANITOR_ENABLED).
-func SetupConcourseWorkdirJanitor(mgr ctrl.Manager, cs kubernetes.Interface, cfg *rest.Config, enabled bool, scriptPath string) error {
+func SetupConcourseWorkdirJanitor(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
 	j := &concourseWorkdirJanitor{
-		cs:         cs,
-		exec:       &spdyExecutor{cfg: cfg, cs: cs},
-		stats:      &kubeletStatsReader{cs: cs},
-		atc:        newATCClient(cjATCBase, &http.Client{Timeout: cjATCTimeout}),
-		enabled:    enabled,
-		scriptPath: scriptPath,
+		cs:      cs,
+		stats:   &kubeletStatsReader{cs: cs},
+		atc:     newATCClient(cjATCBase, &http.Client{Timeout: cjATCTimeout}),
+		enabled: enabled,
 
 		runTimeout:     cjRunTimeout,
 		reqTimeout:     cjReqTimeout,
@@ -211,14 +193,6 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	// Whole-run bound — replaces the CronJob's activeDeadlineSeconds.
 	ctx, cancel := context.WithTimeout(ctx, j.runTimeout)
 	defer cancel()
-
-	// The script is re-read every run (ConfigMap updates take effect
-	// without a restart). Missing/unreadable is a hard error — the
-	// module is pointless without it, this is NOT fail-open.
-	script, err := os.ReadFile(j.scriptPath)
-	if err != nil {
-		return fmt.Errorf("read prune script %s: %w", j.scriptPath, err)
-	}
 
 	// ATC login is fail-open: on any failure land/drain/prune are
 	// skipped and pods are deleted as before — the worker's pre-stop
@@ -247,7 +221,7 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	// long as it is sequential: ≥1 worker always serves builds.
 	for i := replicas - 1; i >= 0; i-- {
 		pod := fmt.Sprintf("%s-%d", cjStatefulSet, i)
-		w, err := j.processPod(ctx, pod, script, flyOK, log)
+		w, err := j.processPod(ctx, pod, flyOK, log)
 		if err != nil {
 			return err // bash `exit 1` — abort the whole run
 		}
@@ -261,10 +235,10 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	return nil
 }
 
-// processPod runs prune → stats → maybe-wipe for one worker pod and
-// reports whether the pod was replaced. Errors abort the run, exactly
-// like `set -eu` + `exit 1` did.
-func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string, script []byte, flyOK bool, log logr.Logger) (bool, error) {
+// processPod runs stats → maybe-wipe for one worker pod and reports
+// whether the pod was replaced. Errors abort the run, exactly like
+// `set -eu` + `exit 1` did.
+func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string, flyOK bool, log logr.Logger) (bool, error) {
 	pod, err := j.getPod(ctx, podName)
 	if err != nil {
 		// bash: any `kubectl get pod` failure → skip + continue.
@@ -274,16 +248,6 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 			log.Info(fmt.Sprintf("SKIP %s: get failed: %v", podName, err))
 		}
 		return false, nil
-	}
-
-	// Prune shared-cache BEFORE reading stats — the freed disk can
-	// bring workdir/nodefs back under the thresholds and avoid a wipe.
-	// An exec failure (pod still in init, container not running) is
-	// NOT grounds to wipe — warn and continue to stats, like bash.
-	if out, err := j.exec.ExecBash(ctx, cjNamespace, podName, cjContainer, script); err != nil {
-		log.Info(fmt.Sprintf("WARN %s: shared-cache prune exec failed: %v", podName, err))
-	} else if out != "" {
-		log.Info(fmt.Sprintf("%s prune: %s", podName, out))
 	}
 
 	s := j.readStats(ctx, pod)
@@ -617,64 +581,6 @@ func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod
 // ---------------------------------------------------------------------------
 // Production implementations of the seams.
 // ---------------------------------------------------------------------------
-
-// spdyExecutor is the production podExecutor — `kubectl exec -i pod
-// -c concourse-worker -- /bin/bash -s`, script piped over stdin (avoids
-// nested escaping), stdout+stderr captured into the log.
-type spdyExecutor struct {
-	cfg *rest.Config
-	cs  kubernetes.Interface
-
-	// Transport + upgrader are built ONCE and shared by every exec:
-	// remotecommand.NewSPDYExecutor derives them from the rest.Config
-	// on EACH call — a fresh http.Transport + tls.Config + connection
-	// pool per exec whose idle conns are never closed, leaking
-	// sockets and memory every time a worker pod is exec'd into.
-	// The executor itself is URL-scoped so it is still constructed
-	// per exec, but always over this shared transport pair.
-	once     sync.Once
-	rt       http.RoundTripper
-	upgrader spdy.Upgrader
-	rtErr    error
-}
-
-// transports lazily builds the shared SPDY round-tripper/upgrader —
-// the exact pair NewSPDYExecutor makes internally via
-// spdy.RoundTripperFor, except cached for the struct's lifetime.
-func (e *spdyExecutor) transports() (http.RoundTripper, spdy.Upgrader, error) {
-	e.once.Do(func() {
-		e.rt, e.upgrader, e.rtErr = spdy.RoundTripperFor(e.cfg)
-	})
-	return e.rt, e.upgrader, e.rtErr
-}
-
-func (e *spdyExecutor) ExecBash(ctx context.Context, ns, pod, container string, script []byte) (string, error) {
-	req := e.cs.CoreV1().RESTClient().Post().
-		Resource("pods").Name(pod).Namespace(ns).SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: container,
-			Command:   []string{"/bin/bash", "-s"},
-			Stdin:     true,
-			Stdout:    true,
-			Stderr:    true,
-			TTY:       false,
-		}, scheme.ParameterCodec)
-	rt, upgrader, err := e.transports()
-	if err != nil {
-		return "", err
-	}
-	ex, err := remotecommand.NewSPDYExecutorForTransports(rt, upgrader, http.MethodPost, req.URL())
-	if err != nil {
-		return "", err
-	}
-	var stdout, stderr bytes.Buffer
-	err = ex.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdin:  bytes.NewReader(script),
-		Stdout: &stdout,
-		Stderr: &stderr,
-	})
-	return strings.TrimSpace(stdout.String() + stderr.String()), err
-}
 
 // kubeletSummary is the typed shape of GET
 // /api/v1/nodes/<node>/proxy/stats/summary — replaces the bash sed

@@ -43,3 +43,56 @@ jobs:
       version: ${{ inputs.version || '' }}
       prerelease: ${{ inputs.prerelease || false }}
     secrets: inherit
+
+  # The shared pipeline (release-app.yml) ships the container image +
+  # linux-x86_64 dist bundle. This job additionally attaches a bare
+  # static binary to the GitHub release just created (tag
+  # node-host-agent/v*) — the artifact host-level installs consume:
+  # k0s controller/hub nodes running node-host-agent as a systemd unit
+  # (no kubelet/container runtime pull path on hub non-agent hosts).
+  binary:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain (go pinned in mise.toml)
+        uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build static binary
+        run: |
+          set -euo pipefail
+          # The release job reports the tag it just created via
+          # outputs — re-deriving it from `git tag --sort=-v:refname`
+          # could pick a STALE higher tag (another release racing
+          # ahead). The git lookup stays only as a fallback.
+          tag="${{ needs.release.outputs.rel_tag }}"
+          if [ -z "$tag" ]; then
+            tag="$(git tag -l 'node-host-agent/v[0-9]*' --sort=-v:refname | head -1)"
+          fi
+          test -n "$tag"
+          echo "REL_TAG=$tag" >>"$GITHUB_ENV"
+          cd apps/node-host-agent
+          # Same flags as moon's build task (moon.yml) but pinned to
+          # linux/amd64 explicitly — the static release artifact.
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.version=${tag##*/}" \
+            -o node-host-agent-linux-amd64 ./cmd/agent
+          file node-host-agent-linux-amd64
+          ./node-host-agent-linux-amd64 --version
+          sha256sum node-host-agent-linux-amd64 > node-host-agent-linux-amd64.sha256
+          cat node-host-agent-linux-amd64.sha256
+
+      - name: Attach to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "$REL_TAG" --clobber \
+            apps/node-host-agent/node-host-agent-linux-amd64 \
+            apps/node-host-agent/node-host-agent-linux-amd64.sha256

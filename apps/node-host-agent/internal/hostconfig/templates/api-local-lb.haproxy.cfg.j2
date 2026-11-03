@@ -1,0 +1,75 @@
+# Managed by node-config-agent - templates/api-local-lb.haproxy.cfg.j2
+# A1 (2026-09-16): haproxy node-local cho control-plane endpoint. Kubelet
+# / watchdog (process host-level; POD khong thay pin — xem Han che trong
+# README) ket noi {{ cp_endpoint }}:6443 -> hosts pin
+# 127.0.0.1 (dat CUOI flow task node_api_lb.yaml, sau khi port pass) ->
+# frontend api_local o duoi day -> backend public IP:6443 cua cac hub,
+# di UNDERLAY truc tiep (proxy da go khoi tinc — khong con ip rule
+# day .14 vao table 100).
+#
+# Backend render tu api_lb_backends (vars/cluster.yaml) theo thu tu:
+# entry thuong luon render; entry `probe: true` chi render khi
+# preflight TCP reach (ten nam trong api_lb_probe_reachable, set boi
+# task probe trong node_api_lb.yaml). `backup: true` -> keyword backup.
+
+global
+    log /dev/log local0
+    # deb tao user/group 'haproxy'; chay foreground qua -db (unit tu
+    # quan ly), khong can quyen root sau khi bind 127.0.0.1 (>1024).
+    user haproxy
+    group haproxy
+    maxconn 2000
+    # Runtime socket cho node-watchdog sig14b + node-host-agent apiprober:
+    # drain/undrain server khi mot apiserver backend wedge watch-cache
+    # (tcp-check KHONG bat duoc — backend van healthy ve TCP/readyz nhung
+    # tra du lieu stale). mode 600 + owner haproxy; watchdog/apiprober
+    # chay root ghi duoc binh thuong.
+    stats socket /run/api-local-lb-admin.sock mode 600 level admin
+    # Drain-state persistence: ExecStop/ExecReload cua api-local-lb.service
+    # dump `show servers state` ra file nay truoc khi process down;
+    # `load-server-state-from-file` duoi defaults khoi phuc enable/disable
+    # (backup flag van trong config) => disable qua socket SONG QUA restart,
+    # khong con window backend wedge nhan traffic giua restart va chu ky
+    # re-apply 5 phut cua watchdog.
+    server-state-file /run/api-local-lb.state
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    # Khoi phuc drain-state tu server-state-file khai bao trong global
+    # (xem comment o `server-state-file`); file thieu (boot lan dau,
+    # /run tmpfs bi wipe) chi la warning, khong fail.
+    load-server-state-from-file global
+    # RTT lien site ~250-300ms (contabo qua relay): connect chi do
+    # SYN->SYN-ACK (1 RTT moi hop) => 5s du rong cho 1-2 hop relay.
+    timeout connect 5s
+    timeout queue 5s
+    # QUAN TRONG: kubelet watch + cilium agent la KET NOI DAI HAN.
+    # Mau mac dinh cua haproxy (30s/50s) se cat watch moi nua phut ->
+    # kubelet/cilium reconnect lien tuc -> churn quay lai dung van de
+    # A1 giai quyet. 24h >= moi watch lifetime thuc te (reconnect 1
+    # lan/ngay la chap nhan duoc; moc reconnect tu nhien theo thoi
+    # diem bat dau watch nen khong dong loat).
+    timeout client 24h
+    timeout server 24h
+
+frontend api_local
+    bind 127.0.0.1:6443
+    mode tcp
+    default_backend api_local_back
+
+backend api_local_back
+    # tcp-check connect: chi TCP :6443 (apiserver accept + tra TLS).
+    # inter 5s fall 2 => loai backend sau ~10s chet; rise 2 => nhan
+    # lai sau ~10s song — du de dao duong khi SNR/underlay flap ma
+    # khong dan do voi san check ngan (RTT site xa ~300ms). Timeout cho
+    # check/connect lay tu defaults timeout connect 5s — server line
+    # KHONG co keyword 'timeout' (haproxy 2.8: unknown keyword, unit
+    # crashloop 2026-09-16).
+    option tcp-check
+    tcp-check connect
+{% for b in api_lb_backends
+   if not (b.probe | default(false)) or b.name in (api_lb_probe_reachable | default([])) %}
+    server {{ b.name }} {{ b.addr }} check inter 5s fall 2 rise 2{{ ' backup' if b.backup | default(false) }}
+{% endfor %}

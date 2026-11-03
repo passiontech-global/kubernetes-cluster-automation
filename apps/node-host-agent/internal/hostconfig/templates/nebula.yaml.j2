@@ -1,0 +1,136 @@
+# Managed by node-config-agent — nebula {{ interdc_nebula_net }}
+# Migration context: docs/nebula-migration-plan.md
+pki:
+  ca: /etc/nebula/{{ interdc_nebula_net }}/ca.crt
+  cert: /etc/nebula/{{ interdc_nebula_net }}/host.crt
+  key: /etc/nebula/{{ interdc_nebula_net }}/host.key
+
+# Lighthouses = cac entry hub:true trong registry (chi discovery,
+# KHONG relay data). static_host_map tro underlay cua lighthouse —
+# cac node khac duoc discover qua handshake/punchy.
+static_host_map:
+{% for _n, _lh in interdc_nebula_lighthouses.items() | sort %}
+  "{{ _lh.marker }}": ["{{ _lh.ip }}:{{ interdc_nebula_port }}"]
+{% endfor %}
+
+lighthouse:
+  am_lighthouse: {{ interdc_nebula_am_lighthouse | bool }}
+  interval: 60
+{% if interdc_nebula_am_lighthouse | bool %}
+  hosts: []
+{% else %}
+  hosts:
+{% for _n, _lh in interdc_nebula_lighthouses.items() | sort %}
+    - "{{ _lh.marker }}"
+{% endfor %}
+{% endif %}
+  # local_allow_list: chi advertise IP underlay that (eth0/ens*/...).
+  # Neu khong loc, nebula advertise ca IP cilium_host (10.0.x/32) ->
+  # peer flap remote giua public IP va pod addr, tunnel churn mat goi
+  # (da gap 2026-09-21: "Host roamed" loop + loss cross-site).
+  # Tat ca rule interface phai cung bool -> deny ao, default allow con lai.
+  local_allow_list:
+    # '::/0' deny: listener IPv4-only (listen.host 0.0.0.0) nen addr
+    # IPv6 public cua NIC (AAAA) KHONG BAO GIO dung duoc — advertise no
+    # len lighthouse thi peer duoc tra remote [v6]:45670 va handshake
+    # vao do fail sau moi restart (su co 2026-09-22, ~17p mesh chet).
+    '::/0': false
+    interfaces:
+      'cilium.*': false
+      'lxc.*': false
+      'veth.*': false
+      'cni.*': false
+      'lo': false
+      'interdc': false
+      'neb.*': false
+      'docker.*': false
+      'kube-ipvs.*': false
+      'genev.*': false
+      'vxlan.*': false
+      'tunl.*': false
+      'flannel.*': false
+  # remote_allow_list: khong bao gio handshake toi addr private —
+  # underlay mesh nay hoan toan public IP. Tranh chap nhan pod addr
+  # (10.0.x) neu peer khac lo advertise. '::/0' deny: defense-in-depth
+  # cho node-side — ngay ca khi peer chua patch local_allow_list va
+  # van advertise IPv6, node nay cung bo qua remote do (khong
+  # handshake vao [v6]:45670 khong the toi duoc).
+  remote_allow_list:
+    '::/0': false
+    '10.0.0.0/8': false
+    '172.16.0.0/12': false
+    '192.168.0.0/16': false
+    '169.254.0.0/16': false
+    '100.64.0.0/10': false
+    '0.0.0.0/0': true
+
+listen:
+  host: 0.0.0.0
+  port: {{ interdc_nebula_port }}
+  # UDP/{{ interdc_nebula_port }} — KHONG doi sang 443/655: GSW
+  # (datahub) drop inbound UDP theo source port well-known.
+  batch: 64
+  read_buffer: 10485760
+  write_buffer: 10485760
+
+punchy:
+  punch: true
+  respond: true
+
+tun:
+  disabled: false
+  dev: {{ interdc_nebula_dev }}
+  drop_local_broadcast: true
+  drop_multicast: true
+  tx_queue: 500
+  mtu: {{ interdc_nebula_mtu }}
+{% if interdc_nebula_unsafe_routes | length > 0 %}
+  # install:false BAT BUOC — kernel routes/policy rules do agent +
+  # watchdog so huu (table {{ interdc_nebula_table_pub }}/{{ interdc_nebula_table_marker }}),
+  # nebula chi quyet dinh nexthop
+  # noi bo. metric = relay weight (thap = uu tien), nhieu entry cung
+  # route = failover giua cac owner.
+  unsafe_routes:
+{% for r in interdc_nebula_unsafe_routes %}
+    - route: {{ r.route }}
+      via: {{ r.via }}
+      metric: {{ r.metric }}
+      install: false
+{% endfor %}
+{% else %}
+  unsafe_routes: []
+{% endif %}
+
+logging:
+  level: info
+  format: text
+
+stats:
+  type: prometheus
+  listen: {{ interdc_nebula_stats_listen }}
+  interval: 10s
+  namespace: nebula
+  subsystem: ""
+  path: /metrics
+
+firewall:
+  outbound_action: drop
+  inbound_action: drop
+  conntrack:
+    tcp_timeout: 12m
+    udp_timeout: 3m
+    default_timeout: 10m
+  # local_cidr: any BAT BUOC — tu nebula 1.10 rule khong khai
+  # local_cidr chi match cert network cua node => traffic forward qua
+  # unsafe_routes (relay/egress) bi drop tham
+  # (nebula_firewall_outgoing_dropped_no_rule). Da verify 2026-09.
+  outbound:
+    - port: any
+      proto: any
+      host: any
+      local_cidr: any
+  inbound:
+    - port: any
+      proto: any
+      host: any
+      local_cidr: any

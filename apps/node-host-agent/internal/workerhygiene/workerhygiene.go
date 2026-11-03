@@ -1,6 +1,15 @@
-// Package workerhygiene ports three worker-only node-watchdog shell
+// Package workerhygiene ports the worker-only node-watchdog shell
 // modules (WD_REQUIRES: uptime k0sworker) into one agent subsystem:
 //
+//   - 05-kubelet-stall.sh       — sig1/sig2/kubelet-10250: informer
+//     zombie journal spam, phantom pods (>=5 pod dirs, zero live
+//     tasks), or a dead :10250 healthz → consecutive-gated k0sworker
+//     restart + state-kubelet-runtime-stall latch.
+//   - 06-kubelet-watch-wedge.sh — sig16: pods assigned to this node in
+//     the API for >15m without a kubelet pod dir → kubelet watch
+//     stream wedge → state-kubelet-watch-wedge + k0sworker restart
+//     (shared last-restart budget; gated when ALL apiserver backends
+//     are stale — upstream wedge, restart useless).
 //   - 36-pod-teardown.sh   — sig16: pods stuck Terminating with zero
 //     live containerd tasks get force-deleted (verified object
 //     cleanup, never while a task is alive); pods Terminating >30m
@@ -21,6 +30,17 @@
 //     SIGKILL the pod's PAUSE pid — kubelet recreates the sandbox with
 //     the fresh resolv.conf (killing the app container keeps the old
 //     sandbox and changes nothing).
+//   - 31-ctr-tasks.sh      — sig7: wedged containerd task dirs (init
+//     dead/zombie >=5m, half-written dir without init.pid >=5m, or
+//     missing log.json >=5m) get their shim killed + dir removed;
+//     orphan containerd-shim-runc-v2 processes whose task dir vanished
+//     get SIGKILLed.
+//   - 32-cilium.sh         — sig9: cilium-agent :9879 healthz down →
+//     state-cilium-agent-down + SIGKILL the agent container so
+//     kubelet restarts it (shared last-cilium-restart budget).
+//   - 35-cilium-init-stuck.sh — sig15: endpoints stuck in
+//     reserved:init (informer wedge, healthz still OK) →
+//     state-cilium-init-stuck + SIGKILL cilium-agent.
 //
 // Differences from the shell versions (documented, behaviour-equivalent):
 //   - `k0s ctr tasks ls` / `tasks kill` is replaced by scanning the
@@ -39,8 +59,12 @@ package workerhygiene
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -55,6 +79,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/systemd"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/watchdogconf"
 )
 
 // Defaults mirror the shell modules + the DaemonSet host mounts.
@@ -63,52 +90,115 @@ const (
 	// minUptimeSeconds mirrors the shell runner's WD_REQUIRES: uptime
 	// gate (MIN_UPTIME_S=1200) — no destructive checks in the first
 	// 20 minutes after boot.
-	minUptimeSeconds          = 1200
-	defaultWatchdogStateDir   = "/host/var/lib/node-watchdog"
-	defaultWatchdogLogFile    = "/host/var/log/node-watchdog.log"
-	defaultProcRoot           = "/proc" // hostPID:true makes pod /proc == host /proc
-	defaultCtrTaskRoot        = "/host/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io"
-	defaultSandboxCtlRoot     = "/host/run/k0s/containerd/io.containerd.sandbox.controller.v1.shim"
-	defaultHostResolvConf     = "/host/etc/resolv.conf"
-	defaultK0sWorkerUnitFile  = "/host/etc/systemd/system/k0sworker.service"
+	minUptimeSeconds         = 1200
+	defaultWatchdogStateDir  = "/host/var/lib/node-watchdog"
+	defaultWatchdogLogFile   = "/host/var/log/node-watchdog.log"
+	defaultProcRoot          = "/proc" // hostPID:true makes pod /proc == host /proc
+	defaultCtrTaskRoot       = "/host/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io"
+	defaultSandboxCtlRoot    = "/host/run/k0s/containerd/io.containerd.sandbox.controller.v1.shim"
+	defaultHostResolvConf    = "/host/etc/resolv.conf"
+	defaultK0sWorkerUnitFile = "/host/etc/systemd/system/k0sworker.service"
+	defaultKubeletPodsDir    = "/host/var/lib/k0s/kubelet/pods"
+	defaultKubeletHealthzURL = "https://127.0.0.1:10250/healthz"
+	defaultCiliumHealthzURL  = "http://127.0.0.1:9879/healthz"
+	// The DaemonSet mounts host /run at /host/run — /host/var/run is
+	// never mounted (host /var/run is a symlink to /run on modern
+	// distros but the pod bind-mount does not follow it).
+	defaultCiliumSocket       = "/host/run/cilium/cilium.sock"
 	defaultStuckDeleteAge     = 15 * time.Minute // shell STUCK_DELETE_S=900
 	defaultStuckWedgeAge      = 30 * time.Minute // shell STUCK_WEDGE_S=1800
+	defaultKubeletWatchMinAge = 15 * time.Minute // shell KUBELET_WATCH_MIN_AGE_S=900
 	defaultMaxForceDelete     = 5                // bounds per-cycle churn (shell used 3; 5 keeps parity headroom)
+	defaultMaxCtrTaskClean    = 5                // shell cap 5/lan
+	defaultMaxShimKill        = 10               // shell cap 5; 10 bounds orphan-shim storms with headroom
 	defaultConsecNeeded       = 2                // shell CONSEC_NEEDED=2
 	defaultMinRestartInterval = 30 * time.Minute // shell MIN_RESTART_INTERVAL_S=1800
+	// k0sWorkerSettle mirrors the plan's k0sworker_settled >=180s gate:
+	// a k0sworker restarted moments ago gets a settle window before
+	// ANY new restart is spent on it — kubelet needs the window to
+	// re-list pods / rebuild its watch stream.
+	k0sWorkerSettle = 180 * time.Second
+	// journalWindow mirrors the runner's `journalctl -u k0sworker
+	// --since "-10 min"` shared snapshot.
+	journalWindow     = "-10 min"
+	journalHitsThresh = 60 // shell JOURNAL_HITS_THRESHOLD
+	poddirThreshold   = 5  // shell PODDIR_THRESHOLD
+	probeAttempts     = 3  // kubelet :10250 curl loop runs 3x
+	probeGap          = 2 * time.Second
+	probeTimeout      = 3 * time.Second // curl -ksm3
+	ciliumProbeTime   = 5 * time.Second // task spec: 3x timeout 5s
 )
 
 // Check names — prometheus `check` label + log context.
 const (
-	checkTeardown = "pod-teardown"
-	checkKonn     = "konnectivity"
-	checkDNS      = "dns-resolv"
+	checkTeardown   = "pod-teardown"
+	checkKonn       = "konnectivity"
+	checkDNS        = "dns-resolv"
+	checkStall      = "kubelet-stall"
+	checkWatch      = "kubelet-watch-wedge"
+	checkCtrTasks   = "ctr-tasks"
+	checkCilium     = "cilium"
+	checkCiliumInit = "cilium-init-stuck"
 )
 
 // Config carries the hygiene knobs — all test-injectable.
 type Config struct {
-	NodeName           string        // this node (spec.nodeName)
-	Interval           time.Duration // check cadence
-	Enabled            bool          // false → Run idles until ctx done
-	WatchdogStateDir   string        // state-*/last-*/consecutive-* files
-	WatchdogLogFile    string        // appended watchdog log (NPD filelog)
-	ProcRoot           string        // host /proc
-	CtrTaskRoot        string        // containerd runtime-v2 task dirs
-	SandboxCtlRoot     string        // sandbox-controller shim dirs
-	HostResolvConf     string        // host resolv.conf (dns drift baseline)
-	K0sWorkerUnitFile  string        // presence gates ALL THREE checks
-	Client             kubernetes.Interface
+	NodeName          string        // this node (spec.nodeName)
+	Interval          time.Duration // check cadence
+	Enabled           bool          // false → Run idles until ctx done
+	WatchdogStateDir  string        // state-*/last-*/consecutive-* files
+	WatchdogLogFile   string        // appended watchdog log (NPD filelog)
+	ProcRoot          string        // host /proc
+	CtrTaskRoot       string        // containerd runtime-v2 task dirs
+	SandboxCtlRoot    string        // sandbox-controller shim dirs
+	HostResolvConf    string        // host resolv.conf (dns drift baseline)
+	K0sWorkerUnitFile string        // presence gates all checks
+	KubeletPodsDir    string        // host kubelet pod dirs (05/06)
+	KubeletHealthzURL string        // kubelet :10250 probe (05)
+	CiliumHealthzURL  string        // cilium-agent :9879 probe (32)
+	CiliumSocket      string        // cilium agent unix socket (35)
+	Client            kubernetes.Interface
+	// Systemd drives host restarts/probes (nsenter-wrapped inside the
+	// container). nil → all systemd-dependent checks degrade to the
+	// "cannot determine → keep" branch (log-only).
+	Systemd *systemd.Client
+	// Watchdog is the parsed node-watchdog.conf — feeds the runner's
+	// per-module kill switch (WD_SIG_<NAME>=off) and, through
+	// APIBackendIPs, the upstream-stale gate of the watch-wedge
+	// check. nil → every check runs (pre-conf behaviour).
+	Watchdog *watchdogconf.Config
+	// WatchdogSrc, when set, re-reads the conf every Cycle so
+	// hostconfig rewrites (WD_SIG_*, API_BACKENDS) apply live —
+	// APIBackends below is then refreshed from the file each cycle.
+	WatchdogSrc *watchdogconf.Reloader
+	// APIBackends are the "ip[:port]" apiserver endpoints module 06
+	// gates on — wired from watchdogconf.APIBackendIPs() by main
+	// (kept current by WatchdogSrc when set).
+	APIBackends        []string
 	StuckDeleteAge     time.Duration // Terminating age → force-delete candidate
 	StuckWedgeAge      time.Duration // Terminating age + task dir → wedge latch
+	KubeletWatchMinAge time.Duration // pod age without pod dir → watch wedge (06)
 	MaxForceDelete     int           // force-delete cap per cycle
+	MaxCtrTaskClean    int           // wedged ctr task dir cap per cycle (31)
+	MaxShimKill        int           // orphan shim kill cap per cycle (31)
 	ConsecNeeded       int           // consecutive suspect cycles before action
 	MinRestartInterval time.Duration // rate-limit budget for recreating actions
+	ProbeGap           time.Duration // sleep between probe retries (05/32)
 
 	// killFn delivers signals — seam for tests (SIGKILL on pause /
-	// proxy-agent pids, and signal-0 liveness probes).
+	// proxy-agent/shim/cilium pids, and signal-0 liveness probes).
 	killFn func(pid int, sig syscall.Signal) error
 	// nowFn supplies the current time — seam for tests.
 	nowFn func() time.Time
+	// probeHTTP does one GET and returns nil on ANY HTTP response
+	// (curl -ks parity — a 401 means the listener is alive). Seam.
+	probeHTTP func(ctx context.Context, url string, timeout time.Duration) error
+	// unixGet GETs path over a unix socket and returns the body —
+	// the cilium-dbg endpoint list replacement (35). Seam.
+	unixGet func(ctx context.Context, socket, path string) ([]byte, error)
+	// journalFn returns the k0sworker journal window — the runner's
+	// shared -10min snapshot (05/06). nil → Systemd.Journal.
+	journalFn func(ctx context.Context) (string, error)
 }
 
 func (c *Config) applyDefaults() {
@@ -136,20 +226,44 @@ func (c *Config) applyDefaults() {
 	if c.K0sWorkerUnitFile == "" {
 		c.K0sWorkerUnitFile = defaultK0sWorkerUnitFile
 	}
+	if c.KubeletPodsDir == "" {
+		c.KubeletPodsDir = defaultKubeletPodsDir
+	}
+	if c.KubeletHealthzURL == "" {
+		c.KubeletHealthzURL = defaultKubeletHealthzURL
+	}
+	if c.CiliumHealthzURL == "" {
+		c.CiliumHealthzURL = defaultCiliumHealthzURL
+	}
+	if c.CiliumSocket == "" {
+		c.CiliumSocket = defaultCiliumSocket
+	}
 	if c.StuckDeleteAge <= 0 {
 		c.StuckDeleteAge = defaultStuckDeleteAge
 	}
 	if c.StuckWedgeAge <= 0 {
 		c.StuckWedgeAge = defaultStuckWedgeAge
 	}
+	if c.KubeletWatchMinAge <= 0 {
+		c.KubeletWatchMinAge = defaultKubeletWatchMinAge
+	}
 	if c.MaxForceDelete <= 0 {
 		c.MaxForceDelete = defaultMaxForceDelete
+	}
+	if c.MaxCtrTaskClean <= 0 {
+		c.MaxCtrTaskClean = defaultMaxCtrTaskClean
+	}
+	if c.MaxShimKill <= 0 {
+		c.MaxShimKill = defaultMaxShimKill
 	}
 	if c.ConsecNeeded <= 0 {
 		c.ConsecNeeded = defaultConsecNeeded
 	}
 	if c.MinRestartInterval <= 0 {
 		c.MinRestartInterval = defaultMinRestartInterval
+	}
+	if c.ProbeGap <= 0 {
+		c.ProbeGap = probeGap
 	}
 	if c.killFn == nil {
 		c.killFn = func(pid int, sig syscall.Signal) error {
@@ -158,6 +272,61 @@ func (c *Config) applyDefaults() {
 	}
 	if c.nowFn == nil {
 		c.nowFn = time.Now
+	}
+	if c.probeHTTP == nil {
+		// curl -ks parity: insecure TLS (kubelet cert SANs don't cover
+		// 127.0.0.1), and ANY HTTP response — including 401 — means
+		// the listener is alive.
+		client := &http.Client{Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // mirrors curl -ks
+		}}
+		c.probeHTTP = func(ctx context.Context, url string, timeout time.Duration) error {
+			pctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
+			if err != nil {
+				return err
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+			return nil
+		}
+	}
+	if c.unixGet == nil {
+		c.unixGet = func(ctx context.Context, socket, path string) ([]byte, error) {
+			tr := &http.Transport{DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
+				d := net.Dialer{Timeout: 5 * time.Second}
+				return d.DialContext(dctx, "unix", socket)
+			}}
+			cl := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+				"http://localhost"+path, nil)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := cl.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return nil, fmt.Errorf("cilium api %s: status %d", path, resp.StatusCode)
+			}
+			return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		}
+	}
+	if c.journalFn == nil {
+		sd := c.Systemd
+		c.journalFn = func(ctx context.Context) (string, error) {
+			if sd == nil {
+				return "", nil
+			}
+			return sd.Journal(ctx, "k0sworker.service", journalWindow)
+		}
 	}
 }
 
@@ -181,18 +350,33 @@ var (
 	konnPodRe = regexp.MustCompile(`^konnectivity-agent-[a-z0-9]+$`)
 	dnsPodRe  = regexp.MustCompile(`^(node-local-dns-[a-z0-9]+|coredns-[a-z0-9]+-[a-z0-9]+)$`)
 	pidDirRe  = regexp.MustCompile(`^[0-9]+$`)
+	// Journal signatures (05/06) — grep -cE parity: count MATCHING
+	// LINES, not occurrences.
+	stallJournalRe = regexp.MustCompile(`node "[^"]+" not found|not registered yet`)
+	watchJournalRe = regexp.MustCompile(`not registered|no relationship found between node`)
+	// `containerd-shim-runc-v2 ... -id <64hex>` — orphan-shim task id
+	// extraction (shell sed pattern).
+	shimIDRe = regexp.MustCompile(`-id ([0-9a-f]{64})`)
+	// cri.container-type=sandbox inside task config.json — pause
+	// tasks legitimately lack log.json (shell grep -q parity).
+	sandboxTypeRe = regexp.MustCompile(`cri\.container-type[^,]*sandbox`)
 )
 
-// Hygiene runs the three worker checks on one ticker.
+// Hygiene runs the worker checks on one ticker.
 type Hygiene struct {
 	cfg Config
 
 	// In-memory consecutive counters — the shell kept these as
 	// consecutive-* files; in-agent state survives between cycles and
 	// an agent restart just re-arms the count (bounded by Interval).
-	wedgeFails int
-	konnFails  int
-	dnsFails   int
+	wedgeFails      int
+	konnFails       int
+	dnsFails        int
+	stallFails      int
+	watchFails      int
+	ciliumFails     int
+	ciliumInitFails int
+	taskMapBuilds   int // buildTaskMap invocation count (tests)
 
 	cycles  *prometheus.CounterVec // check, result
 	actions *prometheus.CounterVec // check, action
@@ -210,7 +394,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	h.actions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_workerhygiene_actions_total",
 		Help: "Worker-hygiene remediation actions by check and action " +
-			"(force_delete|pod_delete|sigkill|pause_kill).",
+			"(force_delete|pod_delete|sigkill|pause_kill|restart|rm_dir|shim_kill).",
 	}, []string{"check", "action"})
 
 	if reg != nil {
@@ -271,8 +455,8 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	pods, apiOK := h.listNodePods(ctx)
 	// The containerd task map reads EVERY task dir's config.json —
 	// build it lazily, at most once per cycle, shared between the
-	// teardown and dns checks. Most cycles neither needs it (no pod
-	// Terminating, no dns-pod running) so it stays unbuilt.
+	// teardown, stall and dns checks. Most cycles neither needs it (no
+	// pod Terminating, no dns-pod running) so it stays unbuilt.
 	var tasks map[string][]ctrTask
 	tasksOnce := func() map[string][]ctrTask {
 		if tasks == nil {
@@ -280,9 +464,73 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		}
 		return tasks
 	}
-	h.checkPodTeardown(ctx, pods, apiOK, tasksOnce)
-	h.checkKonnectivity(ctx, pods)
-	h.checkDNSResolvDrift(pods, apiOK, tasksOnce)
+	// The k0sworker journal snapshot is shared between 05/06 — the
+	// runner dumped it once per run for the same reason (journald is
+	// slow on CPU-starved nodes; two windows could disagree). Lazy:
+	// an idle cycle never touches journald.
+	journal := ""
+	journalSet := false
+	journalOnce := func() string {
+		if !journalSet {
+			journalSet = true
+			j, err := h.cfg.journalFn(ctx)
+			if err != nil {
+				h.appendLog(fmt.Sprintf("k0sworker journal snapshot failed: %v", err))
+			}
+			journal = j
+		}
+		return journal
+	}
+	// Refresh the conf every cycle when a source is wired — hostconfig
+	// rewrites /etc/node-watchdog.conf mid-run (WD_SIG_* kill switches,
+	// API_BACKENDS); the runner re-sourced it every run.
+	if h.cfg.WatchdogSrc != nil {
+		h.cfg.Watchdog = h.cfg.WatchdogSrc.Get()
+	}
+	if wd := h.cfg.Watchdog; wd != nil && h.cfg.WatchdogSrc != nil {
+		h.cfg.APIBackends = wd.APIBackendIPs()
+	}
+	// workerActive is the WD_REQUIRES k0sworker gate for ALL worker
+	// checks — a node where k0sworker is intentionally down/inactive
+	// skips every check exactly like the runner did. A nil Systemd
+	// client (tests, unwired agent) can't answer → treat as active
+	// so the checks still run on their other evidence.
+	workerActive := h.cfg.Systemd == nil ||
+		h.cfg.Systemd.IsActive(ctx, "k0sworker.service")
+	sigOn := func(name string) bool {
+		return h.cfg.Watchdog == nil || h.cfg.Watchdog.SignalEnabled(name)
+	}
+	run := func(name string, fn func()) {
+		if sigOn(name) {
+			fn()
+		} else {
+			h.cycles.WithLabelValues(name, "disabled").Inc()
+		}
+	}
+	run(checkStall, func() {
+		h.checkKubeletStall(ctx, apiOK, journalOnce, workerActive)
+	})
+	run(checkWatch, func() {
+		h.checkKubeletWatchWedge(ctx, pods, apiOK, journalOnce, workerActive)
+	})
+	run(checkTeardown, func() {
+		h.checkPodTeardown(ctx, pods, apiOK, tasksOnce, workerActive)
+	})
+	run(checkKonn, func() {
+		h.checkKonnectivity(ctx, pods, workerActive)
+	})
+	run(checkDNS, func() {
+		h.checkDNSResolvDrift(pods, apiOK, tasksOnce, workerActive)
+	})
+	run(checkCtrTasks, func() {
+		h.checkCtrTasks(ctx, workerActive)
+	})
+	run(checkCilium, func() {
+		h.checkCilium(ctx, apiOK, workerActive)
+	})
+	run(checkCiliumInit, func() {
+		h.checkCiliumInitStuck(ctx, apiOK, workerActive)
+	})
 }
 
 // listNodePods lists pods scheduled to this node; apiOK=false means
@@ -502,7 +750,10 @@ type ctrTask struct {
 // buildTaskMap scans CtrTaskRoot/*/ and SandboxCtlRoot/*/ once per
 // cycle and groups task dirs by pod UID — shared by the teardown and
 // dns checks. Missing roots/files are skipped, never fatal.
+// taskMapBuilds counts invocations so tests can assert the lazy
+// once-per-cycle behaviour directly.
 func (h *Hygiene) buildTaskMap() map[string][]ctrTask {
+	h.taskMapBuilds++
 	m := map[string][]ctrTask{}
 	for _, root := range []string{h.cfg.CtrTaskRoot, h.cfg.SandboxCtlRoot} {
 		entries, err := os.ReadDir(root)
@@ -592,7 +843,11 @@ func (h *Hygiene) forceDeletePod(ctx context.Context, p *corev1.Pod) error {
 }
 
 func (h *Hygiene) checkPodTeardown(ctx context.Context, pods []corev1.Pod,
-	apiOK bool, tasksOnce func() map[string][]ctrTask) {
+	apiOK bool, tasksOnce func() map[string][]ctrTask, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkTeardown, "gated").Inc()
+		return
+	}
 	if !apiOK {
 		// Inconclusive — shell "exit 0" semantics: abort silently,
 		// keep counters and latches (no state_exit flap on API blip).
@@ -731,7 +986,11 @@ func (h *Hygiene) deleteKonnectivityPod(ctx context.Context, pods []corev1.Pod) 
 	return false
 }
 
-func (h *Hygiene) checkKonnectivity(ctx context.Context, pods []corev1.Pod) {
+func (h *Hygiene) checkKonnectivity(ctx context.Context, pods []corev1.Pod, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkKonn, "gated").Inc()
+		return
+	}
 	nodeIP := h.k0sWorkerNodeIP()
 	// Healthy = ANY proxy-agent process baked with the current node
 	// IP. Scan ALL processes, never take the first match: an orphaned
@@ -861,7 +1120,11 @@ func pausePIDOf(tasks []ctrTask) int {
 }
 
 func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
-	tasksOnce func() map[string][]ctrTask) {
+	tasksOnce func() map[string][]ctrTask, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkDNS, "gated").Inc()
+		return
+	}
 	if !apiOK {
 		// Same inconclusive rule as teardown: a failed LIST keeps
 		// counters and the latch (no flap on API blip).
@@ -937,4 +1200,681 @@ func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
 			staleStr, h.dnsFails, h.cfg.ConsecNeeded))
 	}
 	h.cycles.WithLabelValues(checkDNS, "ok").Inc()
+}
+
+// --- shared helpers for the ported kubelet/cilium/ctr checks ---
+
+// countMatchingLines is grep -cE parity: lines matching re.
+func countMatchingLines(re *regexp.Regexp, s string) int {
+	n := 0
+	for _, line := range strings.Split(s, "\n") {
+		if re.MatchString(line) {
+			n++
+		}
+	}
+	return n
+}
+
+// dashedHost maps "ip[:port]" to the watchdog file suffix ip-dashed —
+// same transform as apiprober's dashedIP (state-apiserver-backend-
+// stale-<dashed> keying).
+func dashedHost(addr string) string {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	} else if i := strings.LastIndexByte(addr, ':'); i >= 0 {
+		host = addr[:i]
+	}
+	return strings.ReplaceAll(host, ".", "-")
+}
+
+// probeHTTPSeries runs up to `attempts` GET probes `gap` apart —
+// the shell's curl retry loops (a single blip must not trigger a
+// restart). Returns nil on the first success.
+func (h *Hygiene) probeHTTPSeries(ctx context.Context, url string,
+	attempts int, timeout, gap time.Duration) error {
+	var last error
+	for i := 0; i < attempts; i++ {
+		last = h.cfg.probeHTTP(ctx, url, timeout)
+		if last == nil {
+			return nil
+		}
+		if i+1 < attempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(gap):
+			}
+		}
+	}
+	return last
+}
+
+// podDirCount counts kubelet pod dirs — the shell's
+// `find $KUBELET_PODS_DIR -mindepth 1 -maxdepth 1 -type d | wc -l`.
+// ok=false means the dir is unreadable (treated like missing).
+func (h *Hygiene) podDirCount() (n int, ok bool) {
+	entries, err := os.ReadDir(h.cfg.KubeletPodsDir)
+	if err != nil {
+		return 0, false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			n++
+		}
+	}
+	return n, true
+}
+
+// taskRecordCount counts containerd task records — `ctr tasks ls |
+// wc -l` parity for the phantom-pods signal: every task dir under the
+// runtime + sandbox roots is a record, RUNNING or STOPPED alike (the
+// shell counted output lines, never filtered on task state). A
+// drained/evicted node holding stopped task dirs is NOT phantom —
+// counting only live init pids would false-positive a k0sworker
+// restart every MinRestartInterval.
+func (h *Hygiene) taskRecordCount() int {
+	n := 0
+	for _, root := range []string{h.cfg.CtrTaskRoot, h.cfg.SandboxCtlRoot} {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// k0sWorkerSettled gates k0sworker restarts: the unit must have been
+// continuously active for >=180s — restarting a kubelet that is still
+// re-listing its pods turns a settle blip into a restart loop.
+// nil Systemd (unwired/tests) can't answer → settled.
+func (h *Hygiene) k0sWorkerSettled(ctx context.Context) bool {
+	if h.cfg.Systemd == nil {
+		return true
+	}
+	age, err := h.cfg.Systemd.ActiveAge(ctx, "k0sworker.service")
+	return err == nil && age >= k0sWorkerSettle
+}
+
+// restartK0sWorker wraps Systemd.Restart — a nil client can't act
+// (unwired agent) and reports so the action is logged not counted.
+func (h *Hygiene) restartK0sWorker(ctx context.Context) error {
+	if h.cfg.Systemd == nil {
+		return fmt.Errorf("no systemd client wired")
+	}
+	return h.cfg.Systemd.Restart(ctx, "k0sworker.service")
+}
+
+// --- Check: kubelet-stall (05-kubelet-stall.sh) ---
+
+// checkKubeletStall detects a zombie kubelet: informer-zombie journal
+// spam, phantom pods (pod dirs but zero task records), or a dead
+// :10250 listener. 2 consecutive cycles → latch kubelet-runtime-stall
+// + restart k0sworker through the shared last-restart budget, gated
+// on overload / API reachability / settle.
+func (h *Hygiene) checkKubeletStall(ctx context.Context, apiOK bool,
+	journalOnce func() string, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkStall, "gated").Inc()
+		return
+	}
+	reason := ""
+	if hits := countMatchingLines(stallJournalRe, journalOnce()); hits > journalHitsThresh {
+		reason = fmt.Sprintf("informer-zombie hits=%d/10min", hits)
+	}
+	if reason == "" {
+		if poddirs, ok := h.podDirCount(); ok && poddirs >= poddirThreshold {
+			if _, err := os.ReadDir(h.cfg.CtrTaskRoot); err != nil {
+				reason = fmt.Sprintf("phantom-pods poddirs=%d ctr=unreachable", poddirs)
+			} else if h.taskRecordCount() == 0 {
+				reason = fmt.Sprintf("phantom-pods poddirs=%d tasks=0", poddirs)
+			}
+		}
+	}
+	if reason == "" {
+		// kubelet-10250-down: the listener may take 30-60s after a
+		// k0sworker restart — all 3 probes must fail (curl -ks parity:
+		// any HTTP response, even 401, means the listener is alive).
+		if err := h.probeHTTPSeries(ctx, h.cfg.KubeletHealthzURL,
+			probeAttempts, probeTimeout, h.cfg.ProbeGap); err != nil {
+			reason = "kubelet-10250-down"
+		}
+	}
+	if reason == "" {
+		h.stallFails = 0
+		h.stateExit("kubelet-runtime-stall")
+		h.cycles.WithLabelValues(checkStall, "ok").Inc()
+		return
+	}
+	h.stallFails++
+	if h.stallFails < h.cfg.ConsecNeeded {
+		h.appendLog(fmt.Sprintf("suspect: %s (check %d/%d)",
+			reason, h.stallFails, h.cfg.ConsecNeeded))
+		h.cycles.WithLabelValues(checkStall, "ok").Inc()
+		return
+	}
+	overloaded := h.stateExists("node-overloaded")
+	if strings.HasPrefix(reason, "phantom-pods") || strings.HasPrefix(reason, "kubelet-10250-down") {
+		if !overloaded {
+			h.stateEnter("kubelet-runtime-stall", reason)
+		} else if !h.stateExists("kubelet-runtime-stall") {
+			// Wedge under CPU starvation is a symptom, not a dead
+			// node — latching would kick NHC→SNR and dump 100% of
+			// load onto the survivors (amplifier). Log-only.
+			h.appendLog(fmt.Sprintf("runtime-stall-suppressed-overloaded - %s", reason))
+		}
+	} else {
+		h.stateExit("kubelet-runtime-stall")
+	}
+	switch {
+	case overloaded:
+		h.appendLog(fmt.Sprintf("suspect: %s - node overloaded, skip restart k0sworker", reason))
+	case !apiOK:
+		h.appendLog(fmt.Sprintf("suspect: %s - API unreachable (isolated?), skip restart k0sworker", reason))
+	case !h.k0sWorkerSettled(ctx):
+		h.appendLog(fmt.Sprintf("suspect: %s - k0sworker not settled (<180s), skip restart", reason))
+	case !h.rateOK("last-restart", h.cfg.MinRestartInterval):
+		h.appendLog(fmt.Sprintf("suspect: %s - in restart cooldown (<30m), skip", reason))
+	default:
+		h.appendLog(fmt.Sprintf("ACTION: restarting k0sworker - %s (persisted %dx)",
+			reason, h.stallFails))
+		h.rateSpend("last-restart")
+		h.stallFails = 0
+		if err := h.restartK0sWorker(ctx); err != nil {
+			h.appendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
+		} else {
+			h.actions.WithLabelValues(checkStall, "restart").Inc()
+		}
+	}
+	h.cycles.WithLabelValues(checkStall, "ok").Inc()
+}
+
+// --- Check: kubelet-watch-wedge (06-kubelet-watch-wedge.sh) ---
+
+// checkKubeletWatchWedge detects a wedged kubelet pod-watch stream:
+// pods assigned to this node (not Terminating, not terminal, older
+// than KubeletWatchMinAge) whose kubelet pod dir was never created.
+// Journal spam is early-warning only. 2 consecutive cycles → latch
+// kubelet-watch-wedge + restart k0sworker — unless EVERY apiserver
+// backend is stale (upstream wedge: the missing pods are a phantom of
+// stale LIST data, restarting kubelet is useless churn).
+func (h *Hygiene) checkKubeletWatchWedge(ctx context.Context, pods []corev1.Pod,
+	apiOK bool, journalOnce func() string, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkWatch, "gated").Inc()
+		return
+	}
+	if spam := countMatchingLines(watchJournalRe, journalOnce()); spam > journalHitsThresh {
+		h.appendLog(fmt.Sprintf(
+			"suspect: kubelet-watch-wedge early-warn spam=%d/10min (not-registered/no-relationship)", spam))
+	}
+	if !apiOK {
+		// Inconclusive — keep counters/latch exactly like the shell
+		// (a flapping API must not clear wedge evidence). Only log
+		// when there is something worth keeping.
+		if h.stateExists("kubelet-watch-wedge") || h.watchFails > 0 {
+			h.appendLog("suspect: kubelet-watch-wedge pods query fail — inconclusive, keeping state")
+		}
+		h.cycles.WithLabelValues(checkWatch, "abort").Inc()
+		return
+	}
+	now := h.cfg.nowFn()
+	missing := 0
+	for i := range pods {
+		p := &pods[i]
+		if p.DeletionTimestamp != nil ||
+			p.Status.Phase == corev1.PodSucceeded ||
+			p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		ct := p.CreationTimestamp.Time
+		if ct.IsZero() || now.Sub(ct) < h.cfg.KubeletWatchMinAge {
+			continue
+		}
+		if st, err := os.Stat(filepath.Join(h.cfg.KubeletPodsDir,
+			string(p.UID))); err != nil || !st.IsDir() {
+			missing++
+		}
+	}
+	if missing == 0 {
+		h.watchFails = 0
+		h.stateExit("kubelet-watch-wedge")
+		h.cycles.WithLabelValues(checkWatch, "ok").Inc()
+		return
+	}
+	h.watchFails++
+	if h.watchFails < h.cfg.ConsecNeeded {
+		h.appendLog(fmt.Sprintf(
+			"suspect: kubelet-watch-wedge %d pod(s) assigned but no pod dir on node (check %d/%d)",
+			missing, h.watchFails, h.cfg.ConsecNeeded))
+		h.cycles.WithLabelValues(checkWatch, "ok").Inc()
+		return
+	}
+	h.stateEnter("kubelet-watch-wedge", fmt.Sprintf("unseen-pods=%d", missing))
+	// Upstream gate: EVERY apiserver backend stale → the unseen pods
+	// are stale-LIST fallout, not a kubelet wedge (sig14 latches the
+	// state-apiserver-backend-stale-<ip> files).
+	if len(h.cfg.APIBackends) > 0 {
+		nstale := 0
+		for _, be := range h.cfg.APIBackends {
+			if h.stateExists("apiserver-backend-stale-" + dashedHost(be)) {
+				nstale++
+			}
+		}
+		if nstale == len(h.cfg.APIBackends) {
+			h.appendLog(fmt.Sprintf(
+				"suspect: kubelet-watch-wedge unseen=%d nhung %d/%d api backend stale — upstream wedge, skip restart k0sworker",
+				missing, nstale, len(h.cfg.APIBackends)))
+			h.cycles.WithLabelValues(checkWatch, "ok").Inc()
+			return
+		}
+	}
+	switch {
+	case h.stateExists("node-overloaded"):
+		h.appendLog(fmt.Sprintf(
+			"suspect: kubelet-watch-wedge unseen=%d - node overloaded, skip restart k0sworker", missing))
+	case !h.k0sWorkerSettled(ctx):
+		h.appendLog(fmt.Sprintf(
+			"suspect: kubelet-watch-wedge unseen=%d - k0sworker not settled (<180s), skip restart", missing))
+	case !h.rateOK("last-restart", h.cfg.MinRestartInterval):
+		h.appendLog(fmt.Sprintf(
+			"suspect: kubelet-watch-wedge unseen=%d - in restart cooldown (<30m), skip", missing))
+	default:
+		h.appendLog(fmt.Sprintf(
+			"ACTION: restarting k0sworker - kubelet-watch-wedge unseen-pods=%d (persisted %dx)",
+			missing, h.watchFails))
+		h.rateSpend("last-restart")
+		h.watchFails = 0
+		if err := h.restartK0sWorker(ctx); err != nil {
+			h.appendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
+		} else {
+			h.actions.WithLabelValues(checkWatch, "restart").Inc()
+		}
+	}
+	h.cycles.WithLabelValues(checkWatch, "ok").Inc()
+}
+
+// --- Check: ctr-tasks (31-ctr-tasks.sh) ---
+
+// procAge returns the age of a /proc/<pid> dir (shell
+// `now - stat -c %Y` — a shim that just spawned still has a fresh
+// mtime, so the 5m window can't kill a starting task).
+func (h *Hygiene) procAge(pid int) time.Duration {
+	fi, err := os.Stat(h.procFile(pid))
+	if err != nil {
+		return 0
+	}
+	return h.cfg.nowFn().Sub(fi.ModTime())
+}
+
+// pidsWithCmdline returns pids whose joined cmdline contains sub —
+// the pkill -f replacement (the agent can't rely on pkill being in
+// the container image).
+func (h *Hygiene) pidsWithCmdline(sub string) []int {
+	var out []int
+	for _, pid := range h.procPIDs() {
+		if strings.Contains(strings.Join(h.procCmdline(pid), " "), sub) {
+			out = append(out, pid)
+		}
+	}
+	return out
+}
+
+// checkCtrTasks cleans wedged containerd task dirs and orphan shims —
+// the filesystem port of the shell's ctr-based checks (no ctr socket
+// needed in the agent pod):
+//
+//   - Orphan shim: live containerd-shim-runc-v2 process whose -id task
+//     dir is gone from BOTH roots, proc age >=5m → SIGKILL (cap
+//     MaxShimKill/cycle).
+//   - Wedged task dir: init.pid unreadable/dead/zombie, OR init alive
+//     but log.json missing on a non-sandbox task — confirmed via a
+//     wedged-seen-<id> marker persisting >=5m (the marker replaces
+//     "dead >=5m": dir age can't distinguish a just-exited init from
+//     a real wedge). Confirmed → SIGKILL live init + any process
+//     holding the id, then remove the dir (cap MaxCtrTaskClean/cycle).
+func (h *Hygiene) checkCtrTasks(ctx context.Context, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCtrTasks, "gated").Inc()
+		return
+	}
+	entries, err := os.ReadDir(h.cfg.CtrTaskRoot)
+	if err != nil {
+		h.cycles.WithLabelValues(checkCtrTasks, "abort").Inc()
+		return
+	}
+	liveDirs := map[string]bool{}
+	for _, e := range entries {
+		if e.IsDir() {
+			liveDirs[e.Name()] = true
+		}
+	}
+	sbDirs := map[string]bool{}
+	if es, err := os.ReadDir(h.cfg.SandboxCtlRoot); err == nil {
+		for _, e := range es {
+			if e.IsDir() {
+				sbDirs[e.Name()] = true
+			}
+		}
+	}
+	// Phase B — orphan shims (shell ran this FIRST: a shim whose task
+	// dir vanished makes every shim-mediated kill fail forever).
+	nShim := 0
+	for _, pid := range h.procPIDs() {
+		if nShim >= h.cfg.MaxShimKill {
+			break
+		}
+		joined := strings.Join(h.procCmdline(pid), " ")
+		if !strings.Contains(joined, "containerd-shim-runc-v2") {
+			continue
+		}
+		m := shimIDRe.FindStringSubmatch(joined)
+		if m == nil {
+			continue
+		}
+		sid := m[1]
+		if liveDirs[sid] || sbDirs[sid] {
+			continue
+		}
+		if h.procAge(pid) < 5*time.Minute {
+			continue
+		}
+		h.appendLog(fmt.Sprintf(
+			"ACTION: kill orphan shim pid=%d id=%.12s - task dir missing", pid, sid))
+		_ = h.cfg.killFn(pid, syscall.SIGKILL)
+		nShim++
+		h.actions.WithLabelValues(checkCtrTasks, "shim_kill").Inc()
+	}
+	// Prune wedged-seen markers for dirs that disappeared between
+	// runs (teardown finished or a previous cleanup won the race).
+	if ms, err := filepath.Glob(
+		filepath.Join(h.cfg.WatchdogStateDir, "wedged-seen-*")); err == nil {
+		for _, m := range ms {
+			if !liveDirs[strings.TrimPrefix(filepath.Base(m), "wedged-seen-")] {
+				_ = os.Remove(m)
+			}
+		}
+	}
+	// Scan task dirs → wedge candidates confirmed by a >=5m marker.
+	var wedged []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		id := e.Name()
+		d := filepath.Join(h.cfg.CtrTaskRoot, id)
+		marker := "wedged-seen-" + id
+		dead := false
+		pidData, err := os.ReadFile(filepath.Join(d, "init.pid"))
+		ipid, _ := strconv.Atoi(strings.TrimSpace(string(pidData)))
+		if err != nil || ipid <= 0 || !h.pidLive(ipid) {
+			// Unreadable init.pid = half-written dir (containerd
+			// restart mid-create) or an exited init — both are
+			// wedge-shaped, but a task STARTING writes init.pid a
+			// few seconds after the dir: the 5m marker window absorbs
+			// that race.
+			dead = true
+		} else if _, err := os.Stat(filepath.Join(d, "log.json")); err != nil {
+			// init alive but log.json gone: runc kill fails with
+			// ENOENT forever on non-sandbox tasks (pause tasks have
+			// no log.json legitimately); unreadable config.json =
+			// wreckage → dead too (grep miss parity).
+			if cfg, err := os.ReadFile(filepath.Join(d, "config.json")); err != nil ||
+				!sandboxTypeRe.Match(cfg) {
+				dead = true
+			}
+		}
+		if !dead {
+			// Recovered between runs → cancel the pending confirm.
+			_ = os.Remove(filepath.Join(h.cfg.WatchdogStateDir, marker))
+			continue
+		}
+		if !h.stateFileExists(marker) {
+			h.rateSpend(marker)
+			h.appendLog(fmt.Sprintf("ctr-task-dead candidate %.12s - confirm next run", id))
+			continue
+		}
+		if !h.rateOK(marker, 5*time.Minute) {
+			continue
+		}
+		wedged = append(wedged, d)
+	}
+	nClean := 0
+	for _, d := range wedged {
+		id := filepath.Base(d)
+		_ = os.Remove(filepath.Join(h.cfg.WatchdogStateDir, "wedged-seen-"+id))
+		if nClean >= h.cfg.MaxCtrTaskClean {
+			h.appendLog(fmt.Sprintf("suspect: ctr-task-wedged still pending cap=%d",
+				h.cfg.MaxCtrTaskClean))
+			break
+		}
+		// Live init with missing log.json → SIGKILL it first so the
+		// shim can drain and exit (shell's kill -9 init).
+		if pidData, err := os.ReadFile(filepath.Join(d, "init.pid")); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil &&
+				pid > 0 && h.pidLive(pid) {
+				h.appendLog(fmt.Sprintf(
+					"ACTION: kill -9 init %d of %.12s - log.json missing", pid, id))
+				_ = h.cfg.killFn(pid, syscall.SIGKILL)
+			}
+		}
+		// pkill -9 -f "$id" parity: kill shim/runc leftovers holding
+		// the task id, then remove the dir — containerd GCs the task
+		// record once the shim is gone.
+		for _, pid := range h.pidsWithCmdline(id) {
+			_ = h.cfg.killFn(pid, syscall.SIGKILL)
+		}
+		h.appendLog(fmt.Sprintf("ACTION: rm wedged task dir %.12s - dead >=5m", id))
+		if err := os.RemoveAll(d); err != nil {
+			h.appendLog(fmt.Sprintf("suspect: rm task dir %.12s failed: %v", id, err))
+		}
+		nClean++
+		h.actions.WithLabelValues(checkCtrTasks, "rm_dir").Inc()
+	}
+	h.cycles.WithLabelValues(checkCtrTasks, "ok").Inc()
+}
+
+// stateFileExists reports whether a state-dir file exists — unlike
+// stateExists it checks RAW filenames (markers like wedged-seen-<id>
+// are not state-* latches).
+func (h *Hygiene) stateFileExists(name string) bool {
+	_, err := os.Stat(filepath.Join(h.cfg.WatchdogStateDir, name))
+	return err == nil
+}
+
+// --- Check: cilium (32-cilium.sh + 35-cilium-init-stuck.sh) ---
+
+// ciliumAgentTasks finds cilium-agent containerd tasks by container
+// name annotation — the Go port of
+// `ctr containers ls 'labels."io.kubernetes.container.name"=="cilium-agent"'`.
+// reachable=false means the task root itself is unreadable (ctr
+// unreachable parity: inconclusive, keep counters/latches).
+func (h *Hygiene) ciliumAgentTasks() (tasks []ctrTask, reachable bool) {
+	if _, err := os.ReadDir(h.cfg.CtrTaskRoot); err != nil {
+		return nil, false
+	}
+	for _, root := range []string{h.cfg.CtrTaskRoot, h.cfg.SandboxCtlRoot} {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			d := filepath.Join(root, e.Name())
+			cfgData, err := os.ReadFile(filepath.Join(d, "config.json"))
+			if err != nil {
+				continue
+			}
+			nm := containerNameRe.FindSubmatch(cfgData)
+			if nm == nil || string(nm[1]) != "cilium-agent" {
+				continue
+			}
+			t := ctrTask{}
+			if pidData, err := os.ReadFile(filepath.Join(d, "init.pid")); err == nil {
+				if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil {
+					t.pid = pid
+					t.live = h.pidLive(pid)
+				}
+			}
+			tasks = append(tasks, t)
+		}
+	}
+	return tasks, true
+}
+
+// killCiliumAgent SIGKILLs every live cilium-agent init pid — `ctr
+// tasks kill -s SIGKILL` parity. true = at least one task killed
+// (a dead task can't be signalled; kubelet retries on its own).
+func (h *Hygiene) killCiliumAgent(tasks []ctrTask) bool {
+	killed := false
+	for _, t := range tasks {
+		if t.live && t.pid > 0 {
+			if h.cfg.killFn(t.pid, syscall.SIGKILL) == nil {
+				killed = true
+			}
+		}
+	}
+	return killed
+}
+
+// checkCilium — sig9: cilium-agent :9879 healthz down → latch
+// cilium-agent-down + SIGKILL the agent container (kubelet restarts
+// it immediately, bypassing CrashLoopBackOff). Gates: apiOK (restart
+// while the API is dead can't resync), node-overloaded, shared
+// last-cilium-restart 30m budget.
+func (h *Hygiene) checkCilium(ctx context.Context, apiOK, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCilium, "gated").Inc()
+		return
+	}
+	tasks, reachable := h.ciliumAgentTasks()
+	if !reachable {
+		// ctr unreachable → inconclusive, keep everything.
+		h.cycles.WithLabelValues(checkCilium, "abort").Inc()
+		return
+	}
+	if len(tasks) == 0 {
+		// No cilium-agent container → this node runs no cilium
+		// (calico cluster, hub): clear any false-positive state.
+		h.ciliumFails = 0
+		h.stateExit("cilium-agent-down")
+		h.cycles.WithLabelValues(checkCilium, "ok").Inc()
+		return
+	}
+	err := h.probeHTTPSeries(ctx, h.cfg.CiliumHealthzURL,
+		probeAttempts, ciliumProbeTime, h.cfg.ProbeGap)
+	if err == nil {
+		h.ciliumFails = 0
+		h.stateExit("cilium-agent-down")
+		h.cycles.WithLabelValues(checkCilium, "ok").Inc()
+		return
+	}
+	h.stateEnter("cilium-agent-down", "")
+	h.ciliumFails++
+	switch {
+	case !apiOK:
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-agent-down healthz fail %dx nhung API unreachable — skip kill (agent van khong sync duoc du restart)",
+			h.ciliumFails))
+	case h.ciliumFails >= h.cfg.ConsecNeeded &&
+		h.rateOK("last-cilium-restart", h.cfg.MinRestartInterval) &&
+		!h.stateExists("node-overloaded"):
+		if h.killCiliumAgent(tasks) {
+			h.appendLog(fmt.Sprintf(
+				"ACTION: killed cilium-agent container - healthz down %dx (kubelet se restart)",
+				h.ciliumFails))
+			h.rateSpend("last-cilium-restart")
+			h.ciliumFails = 0
+			h.actions.WithLabelValues(checkCilium, "sigkill").Inc()
+		} else {
+			h.appendLog(fmt.Sprintf(
+				"suspect: cilium-agent-down healthz fail %dx, khong co task running de kill (kubelet tu retry)",
+				h.ciliumFails))
+		}
+	default:
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-agent-down healthz 127.0.0.1:9879 fail (check %d/%d)",
+			h.ciliumFails, h.cfg.ConsecNeeded))
+	}
+	h.cycles.WithLabelValues(checkCilium, "ok").Inc()
+}
+
+// checkCiliumInitStuck — sig15: endpoints stuck in reserved:init
+// while healthz stays green (informer wedge — every new pod gets a
+// black-holed datapath). The shell ran `cilium-dbg endpoint list` via
+// ctr exec; the agent reads the same data from the cilium agent unix
+// socket (/v1/endpoint) — reserved:init counting is identical.
+// Inconclusive (socket/exec fail) → keep counters, never reset.
+func (h *Hygiene) checkCiliumInitStuck(ctx context.Context, apiOK, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCiliumInit, "gated").Inc()
+		return
+	}
+	tasks, reachable := h.ciliumAgentTasks()
+	if !reachable {
+		h.cycles.WithLabelValues(checkCiliumInit, "abort").Inc()
+		return
+	}
+	if len(tasks) == 0 {
+		h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
+		return
+	}
+	body, err := h.cfg.unixGet(ctx, h.cfg.CiliumSocket, "/v1/endpoint")
+	if err != nil {
+		// Endpoint list unreadable — inconclusive: don't count, don't
+		// reset (shell: tasks exec fail → exit 0).
+		h.cycles.WithLabelValues(checkCiliumInit, "abort").Inc()
+		return
+	}
+	initEps := strings.Count(string(body), "reserved:init")
+	if initEps == 0 {
+		h.ciliumInitFails = 0
+		h.stateExit("cilium-init-stuck")
+		h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
+		return
+	}
+	h.ciliumInitFails++
+	if h.ciliumInitFails < h.cfg.ConsecNeeded {
+		h.appendLog(fmt.Sprintf("suspect: cilium-init-stuck init_eps=%d (check %d/%d)",
+			initEps, h.ciliumInitFails, h.cfg.ConsecNeeded))
+		h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
+		return
+	}
+	// Wedge confirmed — latch before any gate like the shell.
+	h.stateEnter("cilium-init-stuck", fmt.Sprintf("init_eps=%d", initEps))
+	switch {
+	case !apiOK:
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-init-stuck init_eps=%d %dx nhung API unreachable — skip kill (agent van khong resync duoc du restart)",
+			initEps, h.ciliumInitFails))
+	case h.stateExists("node-overloaded"):
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-init-stuck init_eps=%d %dx nhung node overloaded — skip kill",
+			initEps, h.ciliumInitFails))
+	case !h.rateOK("last-cilium-restart", h.cfg.MinRestartInterval):
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-init-stuck init_eps=%d %dx nhung restart cooldown — skip kill",
+			initEps, h.ciliumInitFails))
+	default:
+		if h.killCiliumAgent(tasks) {
+			h.appendLog(fmt.Sprintf(
+				"ACTION: killed cilium-agent container - init_eps=%d %dx (kubelet se restart -> informer resync)",
+				initEps, h.ciliumInitFails))
+			h.rateSpend("last-cilium-restart")
+			h.ciliumInitFails = 0
+			h.actions.WithLabelValues(checkCiliumInit, "sigkill").Inc()
+		} else {
+			h.appendLog(fmt.Sprintf(
+				"suspect: cilium-init-stuck init_eps=%d %dx, khong co task running de kill (kubelet tu retry)",
+				initEps, h.ciliumInitFails))
+		}
+	}
+	h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
 }

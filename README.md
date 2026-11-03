@@ -36,8 +36,7 @@ forks, no hook ConfigMap. The image is `distroless/static:nonroot`
 | `admission-webhook-guard` | periodic | 5m | Remove webhook entries whose `clientConfig.service.namespace` was deleted (fail-closed apiserver guard). |
 | `partition-pod-evictor` | periodic | 5m | Taint `node.ops/network-partitioned` + evict `flux-system` pods off nodes with NWPD partition conditions (>10m). |
 | `failed-jobs-janitor` | periodic | 60m | Delete Jobs `Failed` for >24h (cap 50/run). |
-| `converge-trigger` | watch ConfigMap (node-ops) | event | Create converge Jobs from CronJob templates when mounted ConfigMaps change (15s debounce, 120s dedupe). |
-| `concourse-workdir-janitor` | periodic | 30m | Prune shared-cache via exec + sequential land/drain/wipe of `concourse-worker` pods when work-dir exceeds the 100GiB cap or nodefs crosses 60%. **Opt-in:** `CONCOURSE_JANITOR_ENABLED=true`. |
+| `concourse-workdir-janitor` | periodic | 30m | Cluster-level worker orchestration only — sequential land-worker → drain → delete pod → waitReady → annotate baseline on `concourse-worker` pods when work-dir exceeds the 100GiB cap or nodefs crosses 60%. Shared-cache pruning moved to the node-host-agent `concourse-cache` sweeper. **Opt-in:** `CONCOURSE_JANITOR_ENABLED=true`. |
 
 #### Interface contract
 
@@ -49,17 +48,45 @@ forks, no hook ConfigMap. The image is `distroless/static:nonroot`
 - Flags: `--metrics-bind-address` (default `:9115`),
   `--health-probe-bind-address` (default `:8081`), `--version`.
 - Env: `CILIUM_TAINT_REAPER_ENABLED`, `FLUENTBIT_ROLLER_ENABLED`,
-  `NODE_LABELER_CONFIG_PATH`, `CONCOURSE_JANITOR_ENABLED`,
-  `CONCOURSE_JANITOR_SCRIPT_PATH` (default
-  `/etc/concourse-janitor/prune.sh`).
+  `NODE_LABELER_CONFIG_PATH`, `CONCOURSE_JANITOR_ENABLED`.
 
 ### node-host-agent
 
-Per-node agent intended to run as a DaemonSet. Currently a skeleton:
-serves `node_host_agent_info`/`node_host_agent_uptime_seconds` on
-`:9115/metrics`, probes on `:8081/healthz` + `:8081/readyz`, `--version`,
-graceful shutdown. Node identity comes from the downward API
-(`NODE_NAME`, `POD_NAME`, `POD_NAMESPACE`).
+Per-node agent (DaemonSet, or standalone systemd binary on API LB
+VMs / control-plane nodes — `NODE_HOST_AGENT_HOST_ROOT=/`). Subsystems
+(env-gated `NODE_HOST_AGENT_ENABLE_*`):
+
+- `sweeper` — openebs orphan `pvc-*` dir cleanup + PV GC.
+- `concourse-cache` — native pruner for
+  `/var/openebs/local/pvc-*/shared-cache` every 15m (replaces the old
+  CronJob + `pods/exec` janitor).
+- `apiprober` — apiserver watch-cache wedge guard; drains/enables
+  HAProxy `api-local-lb` servers over the admin socket, multi-backend
+  (`CompanionBackends` + `API_BACKENDS` static config).
+- `hostmetrics` — scrape-time collector: watchdog `state-*` latches,
+  PSI/`node-overloaded`, cpu-delivered, fail2ban, nebula, k0s drift.
+- `workerhygiene` — worker watchdog checks (pod-teardown, konnectivity
+  drift, kubelet stall/watch-wedge, ctr tasks, cilium health +
+  init-stuck).
+- `nethealth` — DNS fallback (managed `/etc/hosts` block),
+  coredns-stub, overlay egress relays, nebula health, fail2ban.
+- `nodereporter` — syncs `state-*` latches to the 9 permanent
+  `NodeCondition`s + K8s Events + `problem_gauge`/`problem_counter`
+  (replaces the NPD watchdog-state/filelog monitors).
+- `controllerhygiene` (`auto` when `k0scontroller.service` exists) —
+  apiserver wedge + kine TTL/pool guards, OOM-loop shield, sd_notify
+  watchdog feeder.
+- `hostconfig` (`auto` when the vars dir holds `defaults.yaml`) —
+  declarative host converger (sysctl, systemd drop-ins, resolved DNS,
+  nftables, nebula mesh, coredns stub, api-local-lb, fail2ban, sshd)
+  replacing the ansible `node-config-agent` DaemonSet + `hub-converge`
+  CronJob.
+
+Interface contract: `:9115/metrics`, `:8081/healthz|readyz`,
+`--version`, node identity via downward API (`NODE_NAME`, `POD_NAME`,
+`POD_NAMESPACE`). The kube client is built lazily — only when a
+subsystem that needs it (sweeper, workerhygiene, nodereporter) is
+enabled, so the standalone binary runs without one.
 
 ### webhook-dispatcher
 
