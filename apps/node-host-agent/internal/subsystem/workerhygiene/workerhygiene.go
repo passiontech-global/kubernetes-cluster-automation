@@ -191,7 +191,8 @@ const (
 	// storm), A5 (journald integrity), B1 (cilium-envoy), B4 (MTU
 	// drift) — defaults mirror the same /host mount convention.
 	defaultKubeletSyncloopURL  = "https://127.0.0.1:10250/healthz/syncloop"
-	defaultContainerdSocket    = "/host/run/k0s/containerd/containerd.sock"
+	defaultKubeletTokenPath    = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	defaultContainerdSocket    = "/host/run/k0s/containerd.sock"
 	defaultCiliumEnvoyReadyURL = "http://127.0.0.1:9964/ready"
 	defaultCtrIngestDir        = "/host/var/lib/k0s/containerd/io.containerd.content.v1.content/ingest"
 	defaultK0sDataDir          = "/host/var/lib/k0s"
@@ -345,7 +346,14 @@ type Config struct {
 	// Wave-2 checks: A4 syncloop/containerd probes, A3 ingest GC,
 	// A2 zombie storm, A5 journald integrity, B1 cilium-envoy, B4
 	// MTU drift — all default-injected like the other knobs.
-	KubeletSyncloopURL    string        // kubelet :10250 /healthz/syncloop (PLEG)
+	KubeletSyncloopURL string // kubelet :10250 /healthz/syncloop (PLEG)
+	// KubeletTokenPath is the bearer-token file attached to kubelet's
+	// secure-port probes — kubelet denies anonymous /healthz access,
+	// so the syncloop probe authenticates with the pod SA token
+	// (requires get on nonResourceURL /healthz/syncloop). Empty or
+	// unreadable → the probe runs unauthenticated and 401/403
+	// answers mark the check inconclusive, not down.
+	KubeletTokenPath      string
 	ContainerdSocket      string        // containerd grpc unix socket under /host/run
 	CiliumEnvoyReadyURL   string        // cilium-envoy admin :9964/ready
 	CtrIngestDir          string        // containerd content ingest dir (39)
@@ -412,8 +420,10 @@ type Config struct {
 	probeBodyOK func(ctx context.Context, url string, timeout time.Duration) bool
 	// probeHTTPStatus does one GET and returns the status code — the
 	// probeHTTP variant for endpoints where the CODE is the verdict
-	// (syncloop 500 vs healthz 200, envoy /ready 503). Seam.
-	probeHTTPStatus func(ctx context.Context, url string, timeout time.Duration) (int, error)
+	// (syncloop 500 vs healthz 200, envoy /ready 503). bearer != ""
+	// attaches an Authorization header (kubelet :10250 requires
+	// auth). Seam.
+	probeHTTPStatus func(ctx context.Context, url, bearer string, timeout time.Duration) (int, error)
 	// probeUnixSock connects to a unix socket under a deadline — the
 	// containerd-socket hang probe (A4). Seam.
 	probeUnixSock func(ctx context.Context, socket string, timeout time.Duration) error
@@ -534,6 +544,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.KubeletSyncloopURL == "" {
 		c.KubeletSyncloopURL = defaultKubeletSyncloopURL
+	}
+	if c.KubeletTokenPath == "" {
+		c.KubeletTokenPath = defaultKubeletTokenPath
 	}
 	if c.ContainerdSocket == "" {
 		c.ContainerdSocket = defaultContainerdSocket
@@ -759,12 +772,15 @@ func (c *Config) applyDefaults() {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
 		tr.IdleConnTimeout = 90 * time.Second
 		client := &http.Client{Transport: tr}
-		c.probeHTTPStatus = func(ctx context.Context, url string, timeout time.Duration) (int, error) {
+		c.probeHTTPStatus = func(ctx context.Context, url, bearer string, timeout time.Duration) (int, error) {
 			pctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
 			if err != nil {
 				return 0, err
+			}
+			if bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+bearer)
 			}
 			resp, err := client.Do(req)
 			if err != nil {
@@ -923,10 +939,11 @@ type Hygiene struct {
 	// Wave-2 counters/state: A4 syncloop + containerd-sock, A3
 	// ingest GC, A2 zombie storm (per-parent streaks), A5 journald,
 	// B1 cilium-envoy, B4 MTU drift.
-	syncloopFails int
-	ctrsockFails  int
-	envoyFails    int
-	journaldFails int
+	syncloopFails  int
+	syncloopUnauth bool // last probe was 401/403 — log the streak once
+	ctrsockFails   int
+	envoyFails     int
+	journaldFails  int
 	// ciliumWGFails counts consecutive cycles the WireGuard peer
 	// table reads below expectation (W5.6).
 	ciliumWGFails int
@@ -3464,18 +3481,29 @@ func (h *Hygiene) checkKubeletSyncloop(ctx context.Context, workerActive bool) {
 	}
 	var lastErr error
 	alive := false
+	unauth := false
+	// The bearer token is re-read every cycle — the file is small
+	// and bound SA tokens rotate.
+	bearer := h.kubeletBearer()
 	for i := 0; i < probeAttempts; i++ {
 		code, err := h.cfg.probeHTTPStatus(ctx,
-			h.cfg.KubeletSyncloopURL, probeTimeout)
-		if err == nil && code == http.StatusOK {
-			alive = true
-			break
+			h.cfg.KubeletSyncloopURL, bearer, probeTimeout)
+		if err == nil {
+			switch {
+			case code == http.StatusOK:
+				alive = true
+			case code == http.StatusUnauthorized || code == http.StatusForbidden:
+				// Kubelet answered but won't divulge the verdict —
+				// retrying the same credentials won't help.
+				unauth = true
+			default:
+				lastErr = fmt.Errorf("syncloop status %d", code)
+			}
+		} else {
+			lastErr = err
 		}
-		lastErr = err
-		if lastErr == nil {
-			// A non-200 answer carries no Go error — record the
-			// code or the latch extra reads "last_err=<nil>".
-			lastErr = fmt.Errorf("syncloop status %d", code)
+		if alive || unauth {
+			break
 		}
 		if i+1 < probeAttempts {
 			select {
@@ -3486,6 +3514,21 @@ func (h *Hygiene) checkKubeletSyncloop(ctx context.Context, workerActive bool) {
 			}
 		}
 	}
+	if unauth {
+		// The verdict is unknowable without working credentials —
+		// inconclusive like the other keep-state paths, NOT a down
+		// signal. Logged once per unauth streak so a permanently
+		// unauthenticated deployment doesn't spam every cycle.
+		if !h.syncloopUnauth {
+			h.appendLog("suspect: kubelet-syncloop-down probe unauthorized " +
+				"(401/403 — token missing or RBAC nonResourceURL /healthz/* not " +
+				"granted) — inconclusive, keeping state")
+			h.syncloopUnauth = true
+		}
+		h.cycles.WithLabelValues(checkSyncloop, "inconclusive").Inc()
+		return
+	}
+	h.syncloopUnauth = false
 	if alive {
 		h.syncloopFails = 0
 		h.stateExit("kubelet-syncloop-down")
@@ -3502,6 +3545,18 @@ func (h *Hygiene) checkKubeletSyncloop(ctx context.Context, workerActive bool) {
 			lastErr, h.syncloopFails, h.cfg.ConsecNeeded))
 	}
 	h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
+}
+
+// kubeletBearer reads the service-account token kubelet's :10250
+// webhook auth accepts — re-read every call so bound-token rotation
+// needs no caching logic. Missing/unreadable file → "" (the probe
+// runs unauthenticated and 401/403 marks the check inconclusive).
+func (h *Hygiene) kubeletBearer() string {
+	b, err := os.ReadFile(h.cfg.KubeletTokenPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 func (h *Hygiene) checkContainerdSock(ctx context.Context, workerActive bool) {
@@ -4024,7 +4079,7 @@ func (h *Hygiene) checkCiliumEnvoy(ctx context.Context, workerActive bool) {
 				h.envoyXDSFails))
 	}
 	code, err := h.cfg.probeHTTPStatus(ctx,
-		h.cfg.CiliumEnvoyReadyURL, ciliumProbeTime)
+		h.cfg.CiliumEnvoyReadyURL, "", ciliumProbeTime)
 	if err == nil && code == http.StatusOK {
 		h.envoyFails = 0
 		h.stateExit("cilium-envoy-down")
@@ -5185,7 +5240,7 @@ func (h *Hygiene) checkCalicoHygiene(ctx context.Context, pods []corev1.Pod,
 		h.stateExit("calico-felix-down")
 	default:
 		code, err := h.cfg.probeHTTPStatus(ctx,
-			h.cfg.CalicoFelixReadyURL, ciliumProbeTime)
+			h.cfg.CalicoFelixReadyURL, "", ciliumProbeTime)
 		if err == nil && code == http.StatusOK {
 			h.calicoFelixFails = 0
 			h.stateExit("calico-felix-down")

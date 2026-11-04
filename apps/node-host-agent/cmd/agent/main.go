@@ -689,10 +689,19 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 					K0sWorkerUnitFile: getenv("NODE_HOST_AGENT_K0S_WORKER_UNIT", hostPath("/etc/systemd/system/k0sworker.service")),
 					KubeletPodsDir:    getenv("NODE_HOST_AGENT_KUBELET_PODS_DIR", hostPath("/var/lib/k0s/kubelet/pods")),
 					CiliumSocket:      getenv("NODE_HOST_AGENT_CILIUM_SOCKET", hostPath("/run/cilium/cilium.sock")),
-					Systemd:           sdClient,
-					Watchdog:          wdCfg,
-					WatchdogSrc:       wdReloader,
-					APIBackends:       wdCfg.APIBackendIPs(),
+					// A4 probes: k0s puts the containerd socket at
+					// /run/k0s/containerd.sock (not inside the state
+					// dir); kubelet :10250 denies anonymous healthz,
+					// so the syncloop probe authenticates with the
+					// pod SA token.
+					ContainerdSocket:   getenv("NODE_HOST_AGENT_CONTAINERD_SOCKET", hostPath("/run/k0s/containerd.sock")),
+					KubeletSyncloopURL: getenv("NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL", ""),
+					KubeletTokenPath: envOr("NODE_HOST_AGENT_KUBELET_TOKEN_FILE",
+						"/var/run/secrets/kubernetes.io/serviceaccount/token"),
+					Systemd:     sdClient,
+					Watchdog:    wdCfg,
+					WatchdogSrc: wdReloader,
+					APIBackends: wdCfg.APIBackendIPs(),
 					// T15 opt-in host list: env override →
 					// systemd_watchdog_hosts out of the vars dir
 					// (cluster.yaml). Absent vars dir is not an error —

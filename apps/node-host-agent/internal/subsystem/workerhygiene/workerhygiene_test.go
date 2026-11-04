@@ -50,14 +50,15 @@ type env struct {
 	mu         sync.Mutex // guards sdcmds (feeder goroutine + Cycle both record)
 	sdcmds     [][]string
 	sdReply    map[string]string
-	probes     map[string]error // url → error (nil = healthy)
-	status     map[string]int   // url → canned HTTP status for probeHTTPStatus
-	sockErrs   map[string]error // unix socket path → dial error
-	diskUsed   float64          // /var/lib/k0s fill ratio for statfsFn
-	ingest     string           // CtrIngestDir
-	sysnet     string           // SysClassNet
-	ciliumRt   string           // CiliumRuntimeConfig
-	bodyOK     map[string]bool  // :10248 healthz body=="ok" canned answers
+	probes     map[string]error  // url → error (nil = healthy)
+	status     map[string]int    // url → canned HTTP status for probeHTTPStatus
+	bearer     map[string]string // url → bearer token the probe carried
+	sockErrs   map[string]error  // unix socket path → dial error
+	diskUsed   float64           // /var/lib/k0s fill ratio for statfsFn
+	ingest     string            // CtrIngestDir
+	sysnet     string            // SysClassNet
+	ciliumRt   string            // CiliumRuntimeConfig
+	bodyOK     map[string]bool   // :10248 healthz body=="ok" canned answers
 	unixBody   []byte
 	unixErr    error
 	journal    string
@@ -105,6 +106,7 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		sdReply:  map[string]string{},
 		probes:   map[string]error{},
 		status:   map[string]int{},
+		bearer:   map[string]string{},
 		sockErrs: map[string]error{},
 		bodyOK:   map[string]bool{},
 	}
@@ -212,7 +214,8 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 	// probes[url] errors or status[url] overrides; the unix socket
 	// probe answers from sockErrs (nil = connects); statfs reports
 	// e.diskUsed of 100 blocks.
-	h.cfg.probeHTTPStatus = func(_ context.Context, url string, _ time.Duration) (int, error) {
+	h.cfg.probeHTTPStatus = func(_ context.Context, url, bearer string, _ time.Duration) (int, error) {
+		e.bearer[url] = bearer
 		if err := e.probes[url]; err != nil {
 			return 0, err
 		}
@@ -2560,6 +2563,52 @@ func TestSyncloopFailClosedWhenActiveCheckErrors(t *testing.T) {
 	}
 	if e.h.stateExists("kubelet-syncloop-down") {
 		t.Fatal("no latch may be written while the unit state is unknown")
+	}
+}
+
+// TestSyncloopUnauthorizedIsInconclusive: a 401/403 answer means
+// kubelet is alive but won't divulge the syncloop verdict — the
+// check must neither latch nor count failures, and the notice is
+// logged once per unauth streak, not every cycle.
+func TestSyncloopUnauthorizedIsInconclusive(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 401
+	for i := 0; i < 3; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if e.h.stateExists("kubelet-syncloop-down") {
+		t.Fatal("401 must not latch kubelet-syncloop-down")
+	}
+	got := logLines(t, e)
+	if !strings.Contains(got, "probe unauthorized") {
+		t.Fatalf("expected an unauthorized/inconclusive log line, got:\n%s", got)
+	}
+	if n := strings.Count(got, "probe unauthorized"); n != 1 {
+		t.Fatalf("unauthorized should log once per streak, got %d lines:\n%s", n, got)
+	}
+	// A real verdict ends the streak — a later unauth stretch logs
+	// again.
+	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 200
+	e.h.Cycle(context.Background())
+	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 401
+	e.h.Cycle(context.Background())
+	if n := strings.Count(logLines(t, e), "probe unauthorized"); n != 2 {
+		t.Fatalf("unauth after a healthy verdict must re-log, got %d lines", n)
+	}
+}
+
+// TestSyncloopProbeSendsBearerToken: kubelet :10250 denies anonymous
+// /healthz — the SA token from KubeletTokenPath must ride the probe.
+func TestSyncloopProbeSendsBearerToken(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	tok := filepath.Join(e.state, "sa-token")
+	writeFile(t, tok, "tok-abc-123\n")
+	e.h.cfg.KubeletTokenPath = tok
+	e.h.Cycle(context.Background())
+	if got := e.bearer["https://127.0.0.1:10250/healthz/syncloop"]; got != "tok-abc-123" {
+		t.Fatalf("syncloop probe bearer = %q, want the SA token", got)
 	}
 }
 
