@@ -362,8 +362,7 @@ func (r *Reporter) kernelLines(ctx context.Context) ([]kernelLine, bool, error) 
 		}
 		data, caughtUp, err := readKmsgAvail(r.kmsgSrc)
 		if err != nil {
-			r.kmsgSrc.Close()
-			r.kmsgSrc = nil // reopen next cycle → lookback re-armed
+			r.closeKmsg() // reopen next cycle → lookback re-armed
 			return nil, false, fmt.Errorf("read %s: %w", r.cfg.KmsgFile, err)
 		}
 		replay := !r.kmsgScanned
@@ -381,6 +380,16 @@ func (r *Reporter) kernelLines(ctx context.Context) ([]kernelLine, bool, error) 
 			lines = append(lines, parseKmsgRecord(l))
 		}
 		return lines, replay, nil
+	}
+}
+
+// closeKmsg releases the lazily-opened kmsg handle — Run defers it so
+// subsystem shutdown drops the fd, and the read-error path above uses
+// it to force a fresh open next cycle.
+func (r *Reporter) closeKmsg() {
+	if r.kmsgSrc != nil {
+		_ = r.kmsgSrc.Close()
+		r.kmsgSrc = nil
 	}
 }
 

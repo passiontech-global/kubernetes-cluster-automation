@@ -257,6 +257,15 @@ func (e *env) mkSock(t *testing.T, pid int, fd int, inode string, dbPort int) {
 		dbPort, inode)
 }
 
+// setUnitStart stamps the unit's wall-clock start time age ago —
+// the remediate G3 fresh-start gate parses the unit's
+// ActiveEnterTimestamp (CLOCK_REALTIME side, not the monotonic
+// prop).
+func (e *env) setUnitStart(unit string, age time.Duration) {
+	e.props[unit+":ActiveEnterTimestamp"] =
+		e.now.Add(-age).Format(systemdTimestampLayout)
+}
+
 func (e *env) stateFile(name string) string {
 	return filepath.Join(e.state, "state-"+name)
 }
@@ -548,6 +557,52 @@ func TestOOMFirstRunSeedsOnly(t *testing.T) {
 	}
 }
 
+func TestOOMUnparseableBaselineReseeds(t *testing.T) {
+	e := fixture(t)
+	// A garbage oomloop-seen file is NO baseline — prev=0 would
+	// replay the whole cumulative counter as "new kills".
+	writeFile(t, filepath.Join(e.state, fileOOMSeen), "garbage\n")
+	writeEvents(t, e, 50)
+	e.h.Cycle(context.Background())
+	if e.hasState(stateControllerOOMLop) {
+		t.Fatal("unparseable baseline latched a phantom OOM loop")
+	}
+	// The re-seeded baseline is the current counter — a real delta
+	// from here still counts.
+	writeEvents(t, e, 53)
+	e.h.Cycle(context.Background())
+	if !e.hasState(stateControllerOOMLop) {
+		t.Fatal("re-seeded baseline did not count subsequent kills")
+	}
+}
+
+func TestOOMModeOffUnshields(t *testing.T) {
+	e := fixture(t)
+	e.mkProc(t, 2001, "kube-apiserver", []string{"kube-apiserver"}, 5000)
+	e.mkProc(t, 2002, "kine", []string{"kine"}, 5000)
+	writeEvents(t, e, 0)
+	e.h.Cycle(context.Background())
+	writeEvents(t, e, 3)
+	e.h.Cycle(context.Background()) // latched + shielded (enforce)
+	if !e.hasState(stateControllerOOMLop) {
+		t.Fatal("precondition: oom-loop not latched")
+	}
+	if v := readAdj(t, e, 2001); v != "-800" {
+		t.Fatalf("precondition: apiserver adj=%s want -800", v)
+	}
+	// Mode flips off while the loop is still in-window — the shield
+	// must come off, not persist for the process's lifetime.
+	e.h.cfg.OOMLoopMode = ModeOff
+	writeEvents(t, e, 4)
+	e.h.Cycle(context.Background())
+	if v := readAdj(t, e, 2001); v != "0" {
+		t.Fatalf("apiserver shield survived mode-off: adj=%s", v)
+	}
+	if v := readAdj(t, e, 2002); v != "0" {
+		t.Fatalf("kine shield survived mode-off: adj=%s", v)
+	}
+}
+
 func readAdj(t *testing.T, e *env, pid int) string {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(e.proc, strconv.Itoa(pid), "oom_score_adj"))
@@ -555,6 +610,40 @@ func readAdj(t *testing.T, e *env, pid int) string {
 		t.Fatal(err)
 	}
 	return strings.TrimSpace(string(b))
+}
+
+func TestOOMShieldSkippedWhenLatchUnwritable(t *testing.T) {
+	e := fixture(t)
+	e.mkProc(t, 2001, "kube-apiserver", []string{"kube-apiserver"}, 5000)
+	e.mkProc(t, 2002, "kine", []string{"kine"}, 5000)
+
+	// A state dir the probe can read but never write: seed the
+	// baseline + in-window kills by hand, then lock the dir. The
+	// failed latch write must abort shielding BEFORE any adj lands
+	// — an adj pinned with no latch would survive every later
+	// unshield (unshieldOOM keys on the file alone).
+	dir := filepath.Join(filepath.Dir(e.state), "ro-state")
+	writeFile(t, filepath.Join(dir, fileOOMSeen), "0\n")
+	var kills strings.Builder
+	for i := 0; i < defaultOOMMinKills; i++ {
+		fmt.Fprintf(&kills, "%d\n", e.now.Unix())
+	}
+	writeFile(t, filepath.Join(dir, fileOOMKills), kills.String())
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	e.h.cfg.WatchdogStateDir = dir
+
+	// cum == baseline → no new kills needed; the seeded in-window
+	// entries alone confirm the loop and reach the shield branch.
+	writeEvents(t, e, 0)
+	e.h.Cycle(context.Background())
+	for _, pid := range []int{2001, 2002} {
+		if _, err := os.Stat(e.h.procFile(pid, "oom_score_adj")); err == nil {
+			t.Fatalf("pid %d shielded without a persisted latch", pid)
+		}
+	}
 }
 
 // --- Guard a tail: kine TTL ---
@@ -631,7 +720,7 @@ func TestFeederGraceThenFail(t *testing.T) {
 	e.props["k0scontroller.service:MainPID"] = "4242"
 	e.active["k0scontroller.service"] = "active"
 	// G3 passes: unit started long ago.
-	e.props["k0scontroller.service:ActiveEnterTimestampMonotonic"] = "1"
+	e.setUnitStart("k0scontroller.service", time.Hour)
 	e.alive[e.h.cfg.FeedProbeURL] = false
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -677,7 +766,7 @@ func TestFeederFailPathRestarts(t *testing.T) {
 	e.h.cfg.FeedInterval = time.Millisecond
 	e.props["k0scontroller.service:MainPID"] = "4242"
 	e.active["k0scontroller.service"] = "active"
-	e.props["k0scontroller.service:ActiveEnterTimestampMonotonic"] = "1"
+	e.setUnitStart("k0scontroller.service", time.Hour)
 	e.alive[e.h.cfg.FeedProbeURL] = false
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -741,7 +830,7 @@ func TestRemediateG1PassNoRestart(t *testing.T) {
 func TestRemediateG5RateLimited(t *testing.T) {
 	e := fixture(t)
 	e.active["k0scontroller.service"] = "active"
-	e.props["k0scontroller.service:ActiveEnterTimestampMonotonic"] = "1"
+	e.setUnitStart("k0scontroller.service", time.Hour)
 	e.alive[e.h.cfg.FeedProbeURL] = false
 	// Fresh budget: last restart just now.
 	h := e.h
@@ -749,6 +838,60 @@ func TestRemediateG5RateLimited(t *testing.T) {
 	e.h.runRemediate(context.Background())
 	if e.rstN() != 0 {
 		t.Fatal("G5 rate-limit bypassed")
+	}
+}
+
+func TestPeerAPIServerCRLF(t *testing.T) {
+	e := fixture(t)
+	// A CRLF peer file must not leave '\r' glued to the URL — the
+	// peer probe against the garbage URL always read dead.
+	writeFile(t, e.h.cfg.RemediatePeerFile,
+		"PEER_APISERVER=\"https://10.0.0.2:6443\"\r\n")
+	if got := e.h.peerAPIServer(); got != "https://10.0.0.2:6443" {
+		t.Fatalf("peerAPIServer=%q want https://10.0.0.2:6443", got)
+	}
+}
+
+func TestParseSystemdTimestampZones(t *testing.T) {
+	// A Local-known abbrev resolves exactly — the normal same-host
+	// case: the zone systemd stamped IS the agent's zone (whatever
+	// the test host's TZ is).
+	want := time.Date(2026, 1, 5, 10, 0, 0, 0, time.Local)
+	got, err := parseSystemdTimestamp(want.Format(systemdTimestampLayout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(want) {
+		t.Fatalf("local-abbrev parse=%v want %v", got, want)
+	}
+
+	// A foreign abbrev must NOT leak Go's fabricated zero-offset
+	// zone: "XXX" is no Local zone and no IANA zone either, so the
+	// UTC fallback applies — the wall fields read as UTC under an
+	// honest UTC location (the documented bounded residual error).
+	got, err = parseSystemdTimestamp("Mon 2026-01-05 10:00:00 XXX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Location() != time.UTC {
+		t.Fatalf("fabricated zone leaked: location=%v want UTC", got.Location())
+	}
+	if !got.Equal(time.Date(2026, 1, 5, 10, 0, 0, 0, time.UTC)) {
+		t.Fatalf("UTC fallback instant=%v want 10:00Z", got)
+	}
+
+	// A foreign-but-real zone name recovers the offset fabrication
+	// would drop: "CET" exists in the tz database, so 10:00 CET
+	// parses as 09:00Z even on a TZ=UTC agent.
+	if _, err := time.LoadLocation("CET"); err != nil {
+		t.Skip("no tzdata — IANA-name fallback untestable")
+	}
+	got, err = parseSystemdTimestamp("Mon 2026-01-05 10:00:00 CET")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)) {
+		t.Fatalf("CET parse=%v want 09:00Z", got)
 	}
 }
 
@@ -819,7 +962,7 @@ func TestPGWire(t *testing.T) {
 func TestRemediateMarksBudgetBeforeRestart(t *testing.T) {
 	e := fixture(t)
 	e.active["k0scontroller.service"] = "active"
-	e.props["k0scontroller.service:ActiveEnterTimestampMonotonic"] = "1"
+	e.setUnitStart("k0scontroller.service", time.Hour)
 	e.alive[e.h.cfg.FeedProbeURL] = false
 	// restartFn asserts the G5 budget file ALREADY exists when the
 	// restart executes — a mid-restart kill must not leave it unspent.
@@ -841,7 +984,7 @@ func TestRemediateMarksBudgetBeforeRestart(t *testing.T) {
 func TestRemediateCreatesFeederStateDir(t *testing.T) {
 	e := fixture(t)
 	e.active["k0scontroller.service"] = "active"
-	e.props["k0scontroller.service:ActiveEnterTimestampMonotonic"] = "1"
+	e.setUnitStart("k0scontroller.service", time.Hour)
 	e.alive[e.h.cfg.FeedProbeURL] = false
 	if err := os.RemoveAll(e.fstate); err != nil {
 		t.Fatal(err)
@@ -1085,6 +1228,64 @@ func TestEtcdGuardRateLimitSuppressesSecondRun(t *testing.T) {
 	if g.purges != 2 || len(g.rescues) != 2 {
 		t.Fatalf("post-window run missing: purges=%d rescues=%d",
 			g.purges, len(g.rescues))
+	}
+}
+
+func TestEtcdGuardEvpurgeFailRescueOkStillRemediated(t *testing.T) {
+	// The rescue (compact+defrag) is the step that actually relieves
+	// the quota — when it lands, the cycle verdict is ok even though
+	// the upstream evpurge failed. The purge failure must still be
+	// logged on its own.
+	e := fixture(t)
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(defaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.wireEtcdGuard(t, g)
+	e.h.cfg.evpurgeRunFn = func(context.Context, evpurge.Config,
+		time.Time, io.Writer) error {
+		g.purges++
+		return fmt.Errorf("purge boom")
+	}
+	e.h.Cycle(context.Background())
+	if g.purges != 1 || len(g.rescues) != 1 {
+		t.Fatalf("steps ran purges=%d rescues=%d want 1/1",
+			g.purges, len(g.rescues))
+	}
+	if got := testutil.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "ok")); got != 1 {
+		t.Fatalf("cycles{ok}=%v want 1 — a landed rescue must not "+
+			"count as remediate_error", got)
+	}
+	if got := testutil.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "remediate_error")); got != 0 {
+		t.Fatalf("cycles{remediate_error}=%v want 0", got)
+	}
+	if log := watchdogLog(t, e); !strings.Contains(log, "evpurge failed") {
+		t.Fatalf("evpurge failure not logged separately:\n%s", log)
+	}
+}
+
+func TestEtcdGuardRescueFailCountsRemediateError(t *testing.T) {
+	// The inverse verdict: a failed rescue means the quota fix did
+	// NOT land — remediate_error even when evpurge succeeded.
+	e := fixture(t)
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(defaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.wireEtcdGuard(t, g)
+	e.h.cfg.etcdRescueFn = func(context.Context,
+		etcdrescue.Config, io.Writer) error {
+		g.rescues = append(g.rescues, etcdrescue.Config{})
+		return fmt.Errorf("rescue boom")
+	}
+	e.h.Cycle(context.Background())
+	if g.purges != 1 || len(g.rescues) != 1 {
+		t.Fatalf("steps ran purges=%d rescues=%d want 1/1",
+			g.purges, len(g.rescues))
+	}
+	if got := testutil.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "remediate_error")); got != 1 {
+		t.Fatalf("cycles{remediate_error}=%v want 1", got)
+	}
+	if got := testutil.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "ok")); got != 0 {
+		t.Fatalf("cycles{ok}=%v want 0 — failed rescue is not remediated", got)
 	}
 }
 

@@ -107,6 +107,25 @@ func TestParseShowPools(t *testing.T) {
 	if _, ok := parseShowPools("ERROR: boom\n", "postgres"); ok {
 		t.Fatal("parsed garbage")
 	}
+	// SHOW POOLS emits one row per (database,user) — sv_* sum and
+	// cl_waiting takes the max across the postgres pool's rows.
+	multi := "database|user|sv_active|sv_idle|cl_waiting\n" +
+		"postgres|postgres|3|7|2\n" +
+		"postgres|kine|1|4|9\n" +
+		"pgbouncer|pgbouncer|0|0|50\n"
+	st, ok = parseShowPools(multi, "postgres")
+	if !ok || st.svActive != 4 || st.svIdle != 11 ||
+		st.serverConns != 15 || st.clWaiting != 9 {
+		t.Fatalf("multi=%+v ok=%v", st, ok)
+	}
+	// A pool literally named "database" must not be eaten by the
+	// header case — the header row carries sv_*/cl_* column names.
+	named := "database|user|sv_active|cl_waiting\n" +
+		"database|postgres|5|1\n"
+	st, ok = parseShowPools(named, "database")
+	if !ok || st.svActive != 5 || st.clWaiting != 1 {
+		t.Fatalf("db-named pool=%+v ok=%v", st, ok)
+	}
 }
 
 // probeOKRules is the full-success command set. The revision query
@@ -259,5 +278,20 @@ func TestProbeCycleContainersDown(t *testing.T) {
 	}
 	if res.checks[checkE2EAuth] != 0 {
 		t.Fatal("e2e must stay 0 with containers down")
+	}
+}
+
+// TestProbeLogScanQuoting: the log scan is the one place a configured
+// name reaches a `sh -c` STRING — the runtime and container words
+// must be single-quoted so a space/metachar cannot split or glob.
+func TestProbeLogScanQuoting(t *testing.T) {
+	k, fr, _ := fixture(t, []rule{
+		{substr: "inspect", reply: "true"},
+		{substr: "logs --since", reply: "all quiet"},
+	})
+	k.probeCycle(context.Background())
+	if !strings.Contains(fr.joined(),
+		"'podman' logs --since 301s 'kine-pgbouncer' 2>&1") {
+		t.Fatalf("log scan argv unquoted:\n%s", fr.joined())
 	}
 }

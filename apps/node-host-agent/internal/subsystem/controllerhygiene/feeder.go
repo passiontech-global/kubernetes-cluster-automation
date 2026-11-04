@@ -45,7 +45,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -55,6 +54,10 @@ import (
 func (h *Hygiene) runFeeder(ctx context.Context) {
 	cfg := h.cfg
 	unit := cfg.RestartUnit
+	// The gauge must not pin at 1 once the loop exits (ctx cancel
+	// or a recovered panic in the wrapper) — it would advertise
+	// "still feeding" while WATCHDOG=1 has stopped.
+	defer h.feeding.Set(0)
 
 	mainPID := h.waitMainPID(ctx, unit)
 	if mainPID == "" {
@@ -198,18 +201,22 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 	}
 	h.appendLog("G2: " + unit + " still 'active' — process alive but apiserver not serving, wedge signature")
 
-	// G3: fresh-start grace. ActiveEnterTimestampMonotonic resets on
-	// every start; age = uptime_us - mono_us.
-	mono := h.unitProp(ctx, unit, "ActiveEnterTimestampMonotonic")
-	monoUS, err1 := strconv.ParseInt(mono, 10, 64)
-	upS, err2 := h.uptimeSeconds()
-	if err1 != nil || err2 != nil {
+	// G3: fresh-start grace. Age must come from ONE clock domain:
+	// ActiveEnterTimestampMonotonic is CLOCK_MONOTONIC while
+	// /proc/uptime counts suspend time, so uptime-mono inflates the
+	// unit's age by every suspend since boot — a host that slept
+	// passes the grace gate instantly and restarts mid-init. The
+	// wall-clock ActiveEnterTimestamp vs nowFn() is
+	// clock-consistent.
+	ts := h.unitProp(ctx, unit, "ActiveEnterTimestamp")
+	entered, terr := parseSystemdTimestamp(ts)
+	if terr != nil {
 		h.appendLog(fmt.Sprintf(
-			"G3 PASS: unreadable timestamp (mono='%s' uptime=%v) — never restart blind, stop",
-			mono, err2))
+			"G3 PASS: unreadable ActiveEnterTimestamp='%s' (%v) — never restart blind, stop",
+			ts, terr))
 		return
 	}
-	ageS := int64((upS*1e6 - float64(monoUS)) / 1e6)
+	ageS := int64(h.cfg.nowFn().Sub(entered).Seconds())
 	if ageS < int64(cfg.RemediateFreshGrace.Seconds()) {
 		h.appendLog(fmt.Sprintf(
 			"G3 PASS: %s started %ds ago (< %ds grace) — apiserver may still be initialising, stop",
@@ -233,10 +240,17 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 	}
 
 	// G5: rate-limit — at most one restart per RemediateMinRestart,
-	// budget file last-restart under FeederStateDir.
+	// budget file last-restart under FeederStateDir. The
+	// read-epoch/compare/write-epoch runs under rateMu: the file
+	// stays the cross-process contract, but in-process
+	// check-then-act without the mutex lets two overlapping
+	// remediate passes both see "allowed" inside one window
+	// (TOCTOU double-restart — workerhygiene rateTrySpend parity).
+	h.rateMu.Lock()
 	lastPath := filepath.Join(cfg.FeederStateDir, fileFeederLastRst)
 	delta := h.cfg.nowFn().Unix() - h.readEpoch(lastPath)
 	if delta < int64(cfg.RemediateMinRestart.Seconds()) {
+		h.rateMu.Unlock()
 		h.appendLog(fmt.Sprintf(
 			"G5 PASS: last restart %ds ago (< %ds) — rate-limit, stop",
 			delta, int(cfg.RemediateMinRestart.Seconds())))
@@ -254,12 +268,14 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 	// second restart inside the 1800s window. FeederStateDir may not
 	// exist yet (mkdir -p parity) — create it so the mark lands.
 	if err := os.MkdirAll(cfg.FeederStateDir, 0o755); err != nil {
+		h.rateMu.Unlock()
 		h.appendLogWarn(fmt.Sprintf("G6: mkdir %s failed: %v — restart skipped (budget file must exist)",
 			cfg.FeederStateDir, err))
 		return
 	}
 	h.appendLog("G6: all gates passed — systemctl restart " + unit)
 	h.writeEpochFile(lastPath)
+	h.rateMu.Unlock()
 	if err := h.cfg.restartFn(ctx, unit); err != nil {
 		h.appendLogWarn(fmt.Sprintf("G6: restart %s FAIL: %v (budget spent)", unit, err))
 		return
@@ -277,10 +293,79 @@ func (h *Hygiene) peerAPIServer() string {
 	if err != nil {
 		return ""
 	}
-	// `... | tail -n 1` parity: the LAST assignment wins.
+	// `... | tail -n 1` parity: the LAST assignment wins. The
+	// regex captures to EOL, so a CRLF peer file leaves a trailing
+	// '\r' on the value — trim it too, or every CRLF file's peer
+	// URL is garbage and always probes dead.
 	matches := peerAPIServerRe.FindAllSubmatch(data, -1)
 	if len(matches) == 0 {
 		return ""
 	}
-	return strings.Trim(string(matches[len(matches)-1][1]), `"' `+"\t")
+	return strings.Trim(string(matches[len(matches)-1][1]), `"' `+"\t\r")
+}
+
+// systemdTimestampLayout is systemctl's "--value" wall-clock
+// timestamp format — "Mon 2006-01-02 15:04:05 UTC" (day-abbrev
+// prefix + local time + zone abbrev).
+const systemdTimestampLayout = "Mon 2006-01-02 15:04:05 MST"
+
+// systemdTimestampLayoutBare is systemdTimestampLayout minus the
+// trailing zone field — the fallback parses below re-read the wall
+// fields once the zone abbrev has been resolved (or given up on)
+// out of band.
+const systemdTimestampLayoutBare = "Mon 2006-01-02 15:04:05"
+
+// parseSystemdTimestamp parses a wall-clock systemd property value
+// (ActiveEnterTimestamp & friends). "n/a"/empty/garbage fail parse —
+// callers treat that as "never act blind".
+//
+// The emitted zone abbrev resolves most-exact first:
+//
+//  1. In time.Local — the normal same-host case, DST included. Go
+//     flags that path by keeping the result's Location() pinned to
+//     time.Local.
+//  2. An abbrev Local does NOT define (the agent's TZ disagrees with
+//     the zone systemd stamped — e.g. a TZ=UTC agent on a CET host)
+//     makes Go FABRICATE a zero-offset location: the instant shifts
+//     by the real offset and the G3 age inflates by it, under-firing
+//     the fresh-start grace. On fabrication the abbrev is retried as
+//     an IANA zone name — the tz database carries the POSIX abbrevs
+//     (CET, EST, MST, MET, EET, WET, GMT...) as real zones, so "CET"
+//     recovers the +1 the fabrication dropped. The re-parse is only
+//     trusted when that zone reproduces the stamped abbrev at that
+//     instant (a summer wall time stamped "CET" stays unresolvable).
+//  3. Otherwise (no tzdata, a DST-only abbrev like CEST, garbage):
+//     the wall fields parse in UTC. Residual error: ± the emitting
+//     zone's real offset — bounded by the host's own TZ delta, never
+//     by an arbitrary agent-vs-host TZ gap, and the result honestly
+//     reports UTC instead of a fake "+00:00 <abbrev>" zone.
+func parseSystemdTimestamp(v string) (time.Time, error) {
+	s := strings.TrimSpace(v)
+	t, err := time.ParseInLocation(systemdTimestampLayout, s, time.Local)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if t.Location() == time.Local {
+		return t, nil // abbrev defined in Local — exact
+	}
+	// Fabricated/foreign zone: split the abbrev off (the layout's
+	// last whitespace-separated field) and re-parse the wall fields
+	// under the best resolvable zone.
+	i := strings.LastIndexByte(s, ' ')
+	if i < 0 {
+		return t, nil // unreachable after a successful layout parse
+	}
+	wall, abbrev := s[:i], s[i+1:]
+	if loc, lerr := time.LoadLocation(abbrev); lerr == nil {
+		if tw, werr := time.ParseInLocation(
+			systemdTimestampLayoutBare, wall, loc); werr == nil {
+			if name, _ := tw.Zone(); name == abbrev {
+				return tw, nil
+			}
+		}
+	}
+	if tu, uerr := time.Parse(systemdTimestampLayoutBare, wall); uerr == nil {
+		return tu, nil
+	}
+	return t, nil
 }

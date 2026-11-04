@@ -262,6 +262,50 @@ func TestWorkerInitBtrfsCleanup(t *testing.T) {
 	}
 }
 
+// A symlink AT <WorkDir>/shared-cache is refused outright: the
+// per-entry Lstat guard only protects its children — a link at the
+// shared-cache slot itself would make wipeExcept rm -rf the LINK
+// TARGET's contents and the chown/chmod pass land on the target.
+func TestWorkerInitSymlinkedSharedCacheFails(t *testing.T) {
+	cfg := testConfig(t, nil)
+	target := filepath.Join(t.TempDir(), "elsewhere")
+	mustFile(t, filepath.Join(target, "precious"), "x")
+	mustDir(t, cfg.WorkDir)
+	if err := os.Symlink(target,
+		filepath.Join(cfg.WorkDir, sharedCacheName)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WorkerInit(context.Background(), cfg); err == nil {
+		t.Fatal("expected error for symlinked shared-cache")
+	}
+	// The wipe never followed the link — the target keeps its
+	// contents.
+	assertPresent(t, filepath.Join(target, "precious"))
+}
+
+// WorkDir itself may ride on a symlink (whatever the chart mounted):
+// the guard compares RESOLVED paths, so a linked work dir still
+// inits — the scaffold lands in the real dir.
+func TestWorkerInitWorkDirSymlinkResolves(t *testing.T) {
+	cfg := testConfig(t, nil)
+	realDir := filepath.Join(t.TempDir(), "real-work-dir")
+	seedWorkDir(t, realDir)
+	link := filepath.Join(t.TempDir(), "work-dir-link")
+	if err := os.Symlink(realDir, link); err != nil {
+		t.Fatal(err)
+	}
+	cfg.WorkDir = link
+
+	if err := WorkerInit(context.Background(), cfg); err != nil {
+		t.Fatalf("WorkerInit with symlinked work dir: %v", err)
+	}
+	sc := filepath.Join(realDir, sharedCacheName)
+	for _, d := range ScaffoldCacheDirs {
+		assertPresent(t, filepath.Join(sc, d))
+	}
+}
+
 // A missing work dir is NOT fatal — the bash glob on a nonexistent
 // dir expands to nothing and mkdir -p then creates the whole tree.
 func TestWorkerInitMissingWorkDir(t *testing.T) {

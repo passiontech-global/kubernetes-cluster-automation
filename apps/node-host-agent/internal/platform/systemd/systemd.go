@@ -25,7 +25,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -49,6 +48,13 @@ const (
 	// push unbounded child output into the agent's heap. The rest is
 	// drained and discarded so the child can still exit cleanly.
 	maxCmdOutputBytes = 16 << 20
+	// cmdWaitDelay bounds the post-exit/kill wait for the child's I/O
+	// pipes. A daemonized grandchild inheriting the stdout pipe holds
+	// EOF open after CommandContext kills the child — without a bound,
+	// the reader/Wait hang forever and Config.Timeout goes unenforced.
+	// After the grace exec closes the pipes and Wait returns
+	// ErrWaitDelay (wrapped in the returned error).
+	cmdWaitDelay = 5 * time.Second
 )
 
 // Config carries the exec seam — all test-injectable.
@@ -89,24 +95,34 @@ func (c *Config) applyDefaults() {
 	if c.RunCmd == nil {
 		c.RunCmd = func(ctx context.Context, argv []string) (string, error) {
 			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-			stdout, err := cmd.StdoutPipe()
-			if err != nil {
-				return "", err
-			}
-			if err := cmd.Start(); err != nil {
-				return "", err
-			}
-			out, _ := io.ReadAll(io.LimitReader(stdout, maxCmdOutputBytes))
-			_, _ = io.Copy(io.Discard, stdout) // drain so Wait cannot deadlock
-			// Partial output is returned alongside the error just
-			// like exec.Cmd.Output (callers count grep hits —
-			// truncated text is still useful evidence).
-			return string(out), cmd.Wait()
+			// WaitDelay bounds the post-exit/kill wait for I/O. It
+			// only works on goroutine-copied pipes (an io.Writer
+			// sink) — a StdoutPipe fd is only closed INSIDE Wait,
+			// which a blocked pre-Wait ReadAll never reaches. So
+			// stdout goes through the same capped sink as the
+			// combined runner: a daemonized grandchild inheriting
+			// the pipe holds EOF open after CommandContext kills
+			// the child, and WaitDelay forces the pipe closed so
+			// Run returns (ErrWaitDelay) instead of hanging past
+			// Config.Timeout.
+			cmd.WaitDelay = cmdWaitDelay
+			var buf cappedBuffer
+			cmd.Stdout = &buf
+			// Run waits for the copy goroutine — buf is complete
+			// once it returns. Partial output is returned alongside
+			// the error just like exec.Cmd.Output (callers count
+			// grep hits — truncated text is still useful evidence).
+			err := cmd.Run()
+			return buf.String(), err
 		}
 	}
 	if c.RunCmdCombined == nil {
 		c.RunCmdCombined = func(ctx context.Context, argv []string) (string, error) {
 			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+			// Same hang class as the stdout path: the internal
+			// copy goroutines block on a pipe a grandchild holds —
+			// WaitDelay closes them so Run cannot outlive the ctx.
+			cmd.WaitDelay = cmdWaitDelay
 			// Both streams share one capped sink — the child never
 			// blocks on an unread stderr pipe, and output over the
 			// cap is swallowed (same budget as the stdout path).
@@ -123,7 +139,7 @@ func (c *Config) applyDefaults() {
 }
 
 // cappedBuffer is a goroutine-safe io.Writer retaining at most
-// maxCmdOutputBytes — the combined runner's stdout+stderr sink
+// maxCmdOutputBytes — the runners' stdout (+stderr) sink
 // (exec copies each stream on its own goroutine; excess is
 // swallowed so the child still exits cleanly).
 type cappedBuffer struct {

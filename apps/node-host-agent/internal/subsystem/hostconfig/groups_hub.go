@@ -7,12 +7,9 @@ package hostconfig
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -230,7 +227,9 @@ ExecStart=/usr/bin/prometheus-node-exporter --collector.textfile.directory=/var/
 		r.daemonReload(ctx)
 		r.restartService(ctx, "prometheus-node-exporter.service")
 	}
-	r.run(ctx, "sh", "-c", c.hubMetricsScript())
+	if s := c.hubMetricsScript(); s != "" {
+		r.run(ctx, "sh", "-c", s)
+	}
 	r.ensureService(ctx, "prometheus-node-exporter.service", true, true)
 }
 
@@ -270,7 +269,7 @@ func (c *cyc) hubMetricsNodeExporter() {
 	// re-fetched.
 	local := r.hp("/tmp/" + file)
 	if !(fileExistsNoRoot(local) && sha256FileOK(local, sum)) {
-		if err := nexpDownload(ctx, url, local, sum); err != nil {
+		if err := r.nexpDownload(ctx, url, local, sum); err != nil {
 			c.err("hub-metrics-fw: node_exporter deb download failed",
 				"url", url, "error", err)
 			return
@@ -278,51 +277,27 @@ func (c *cyc) hubMetricsNodeExporter() {
 	}
 	// ansible apt deb: => apt-get on the deb path (dep resolution
 	// included); the runner sees host paths, not HostRoot-joined.
-	if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+	// runLong: dep resolution on a slow-egress VM outlives the
+	// interactive budget.
+	if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 		"apt-get", "install", "-y", "/tmp/"+file); err != nil {
 		c.err("hub-metrics-fw: node_exporter deb install failed",
 			"deb", "/tmp/"+file, "error", err)
 	}
 }
 
-// nexpDownload mirrors download() (groups_tuning.go) but honours the
-// ansible get_url timeout=300 — the api-lb/db infra VMs this runs
-// on have very slow egress, and the ~4.5MB deb over ~15KB/s needs
-// minutes (the 2026-09-24 hub-converge run failed on the default
-// ~10s read timeout). Kept local rather than changing the shared
-// helper's contract for coredns/nebula.
-func nexpDownload(ctx context.Context, url, dst, wantSHA256 string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
+// nexpDownload mirrors r.download (groups_tuning.go) but floors the
+// client timeout at the ansible get_url timeout=300 — the api-lb/db
+// infra VMs this runs on have very slow egress, and the ~4.5MB deb
+// over ~15KB/s needs minutes (the 2026-09-24 hub-converge run failed
+// on the default ~10s read timeout). A Config.HTTPTimeout ABOVE the
+// floor still wins.
+func (r *Reconciler) nexpDownload(ctx context.Context, url, dst, wantSHA256 string) error {
+	to := r.cfg.HTTPTimeout
+	if to < 300*time.Second {
+		to = 300 * time.Second
 	}
-	resp, err := (&http.Client{Timeout: 300 * time.Second}).Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	tmp := dst + ".dl"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	h := sha256.New()
-	_, err = io.Copy(io.MultiWriter(f, h), resp.Body)
-	f.Close()
-	if err != nil {
-		return err
-	}
-	if wantSHA256 != "" && !strings.EqualFold(wantSHA256, fmt.Sprintf("%x", h.Sum(nil))) {
-		os.Remove(tmp)
-		return fmt.Errorf("download %s: sha256 mismatch", url)
-	}
-	return os.Rename(tmp, dst)
+	return downloadFile(ctx, url, dst, wantSHA256, to)
 }
 
 // hubMetricsExtraPorts — hub_metrics_extra_ports from cluster.yaml
@@ -342,9 +317,12 @@ func (c *cyc) hubMetricsExtraPorts() []string {
 // hubMetricsScript renders the idempotent HUBMETRICS rebuild — the
 // ansible shell task verbatim: flush the chain, per port ACCEPT each
 // mesh IP + the marker subnet then DROP, hook INPUT once, persist
-// when netfilter-persistent exists.
+// when netfilter-persistent exists. Returns "" when a vars-derived
+// IP/port fails the shell-charset gate — the whole script is skipped
+// rather than interpolating a possible injection.
 func (c *cyc) hubMetricsScript() string {
 	var ips []string
+	safe := c.shMarkerBase("interdc_marker_base", c.markerBase())
 	for _, k := range c.t.Nodes.Keys() {
 		nv, _ := c.t.Nodes.Get(k)
 		om, _ := nv.(*topology.OMap)
@@ -352,13 +330,23 @@ func (c *cyc) hubMetricsScript() string {
 			continue
 		}
 		if ip := nodeIPStr(om, "ip"); ip != "" {
+			safe = c.shIPCIDR("mesh node ip", ip) && safe
 			ips = append(ips, ip)
 		}
+	}
+	ports := append([]string{"9100", "9115"}, c.hubMetricsExtraPorts()...)
+	for _, p := range ports {
+		// *Req: every entry lands in a --dport — an empty port is a
+		// malformed rule, not "cannot inject".
+		safe = c.shPortReq("hubmetrics port", p) && safe
+	}
+	if !safe {
+		return ""
 	}
 	mb := c.markerBase()
 	var sb strings.Builder
 	sb.WriteString("iptables -N HUBMETRICS 2>/dev/null; iptables -F HUBMETRICS;")
-	for _, mport := range append([]string{"9100", "9115"}, c.hubMetricsExtraPorts()...) {
+	for _, mport := range ports {
 		for _, ip := range ips {
 			fmt.Fprintf(&sb, " iptables -A HUBMETRICS -p tcp -s %s --dport %s -j ACCEPT;", ip, mport)
 		}
@@ -431,8 +419,9 @@ func (c *cyc) groupAPILBVM() {
 	apiBackends := strOf(e, "api_backends")
 	mode := defStr(strOf(e, "mode"), "enforce")
 
-	// prereqs — best-effort like ansible failed_when: false.
-	r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "socat", "curl")
+	// prereqs — best-effort like ansible failed_when: false. runLong:
+	// apt on a slow-egress infra VM outlives the interactive budget.
+	r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "socat", "curl")
 
 	// tmpfiles.d: recreate the bind-mount source owned by the
 	// container's haproxy uid on every boot (/run is tmpfs — docker
@@ -643,9 +632,10 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 	}
 
 	// validate before touching the live container — a bad cfg never
-	// reaches the VIP.
+	// reaches the VIP. runLong: docker run may pull the image first,
+	// which outlives the interactive budget on slow egress.
 	if cfgChanged || composeChanged {
-		if out, err := r.run(ctx, "docker", "run", "--rm",
+		if out, err := r.runLong(ctx, "docker", "run", "--rm",
 			"-v", cfgPath+":/tmp/haproxy.cfg:ro",
 			image, "haproxy", "-c", "-f", "/tmp/haproxy.cfg"); err != nil {
 			c.err("api-lb-vm: haproxy -c failed — not recreating/restarting",
@@ -656,7 +646,8 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 	switch {
 	case composeChanged || !sockMounted:
 		// ~2-5s VIP blip — only on first setup or real drift.
-		if _, err := r.run(ctx, "sh", "-c",
+		// runLong: compose up pulls images on first setup.
+		if _, err := r.runLong(ctx, "sh", "-c",
 			fmt.Sprintf("cd %s && docker compose -f %s up -d",
 				sq(composeDir), sq(composeFile))); err != nil {
 			c.err("api-lb-vm: docker compose up failed — admin socket will not appear",
@@ -739,7 +730,7 @@ func (c *cyc) etcdctlInstallBinary() {
 				"file", local, "sha256", sum)
 			return
 		}
-	} else if err := download(ctx, url, local, sum); err != nil {
+	} else if err := r.download(ctx, url, local, sum); err != nil {
 		c.err("etcdctl: tgz download", "url", url, "file", local, "error", err)
 		return
 	}
@@ -802,7 +793,7 @@ func (c *cyc) groupKineService() {
 	}
 	binChanged := false
 	if !r.fileExists(binPath) || !sha256FileOK(r.hp(binPath), sum) {
-		if err := download(ctx, url, r.hp(binPath), sum); err != nil {
+		if err := r.download(ctx, url, r.hp(binPath), sum); err != nil {
 			c.err("kine.service: kine binary download", "url", url, "error", err)
 			return
 		}

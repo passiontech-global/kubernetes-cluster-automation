@@ -14,12 +14,16 @@
 // a removed/renamed check, or orphaned when a condition resolved
 // under a crashed/old binary, sits forever (real case:
 // state-node-overloaded ~11h stale on a healthy worker). The reaper
-// removes a state-* file when EITHER its name is not producible by
-// any currently-enabled check (unknown registry name → reaped
-// immediately — nothing will ever re-enter or exit it) OR it is a
-// known latch name whose mtime is older than LatchMaxAge (24h) — a
-// still-active latch's owner re-enters within one check cycle, so
-// the worst case is one duplicated STATE-ENTER per day per latch.
+// removes a state-* file once its mtime is older than LatchMaxAge
+// (24h) — a still-active latch's owner re-enters within one check
+// cycle, so the worst case is one duplicated STATE-ENTER per day
+// per latch. The age floor applies to UNKNOWN registry names too:
+// a different-schema writer on the same host (a retired legacy
+// watchdog unit still looping, an older agent binary) rewrites its
+// latch right after a reap, so instant reaping turned into a
+// delete/rewrite flap every sweep — while that writer lives its own
+// writes keep the mtime fresh, and 24h after it dies the orphan is
+// reaped like any stale latch.
 // last-* rate-limit budgets and every non-state-* file are NEVER
 // touched — deleting a last-* file would silently bypass cooldowns.
 //
@@ -58,12 +62,14 @@ import (
 
 const (
 	defaultJanitorInterval = 10 * time.Minute
-	// latchMaxAge is the reap age for KNOWN latch names: a live latch
-	// is refreshed only by its owner's STATE-ENTER on condition start,
-	// so mtime == when the condition started — it cannot distinguish
-	// "active for 25h" from "abandoned 25h". 24h bounds the stale
-	// window while keeping false-reaps (a genuinely long-held latch
-	// re-enters next cycle, one duplicate alert) rare.
+	// latchMaxAge is the reap age for every state-* latch: a live
+	// latch is refreshed only by its owner's STATE-ENTER on condition
+	// start, so mtime == when the condition started — it cannot
+	// distinguish "active for 25h" from "abandoned 25h". 24h bounds
+	// the stale window while keeping false-reaps (a genuinely
+	// long-held latch re-enters next cycle, one duplicate alert)
+	// rare — and keeps a foreign-schema writer's latch from being
+	// flapped by instant reaping (see the package doc).
 	latchMaxAge = 24 * time.Hour
 )
 
@@ -217,8 +223,9 @@ type JanitorConfig struct {
 	WatchdogStateDir string        // the shared node-watchdog state dir
 	WatchdogLogFile  string        // appended watchdog log (NPD filelog)
 	ProcRoot         string        // host /proc (hostPID pod or host)
-	// LatchMaxAge is the reap age for KNOWN latch names — unknown
-	// names are always reaped regardless of age. <=0 → latchMaxAge.
+	// LatchMaxAge is the reap age for every state-* latch — known
+	// AND unknown registry names (unknowns get the same floor so a
+	// foreign-schema writer can't be flapped). <=0 → latchMaxAge.
 	LatchMaxAge time.Duration
 	// Systemd runs the list-units probe and the reset-failed/stop
 	// remedies (nsenter-wrapped inside the container). nil → the
@@ -337,10 +344,11 @@ func (j *Janitor) appendLog(msg string) {
 
 // --- A: stale state-latch reaper ---
 
-// sweepLatches removes state-* files that are either unproducible by
-// any current check (unknown registry name → immediate) or known but
-// past LatchMaxAge. last-* budgets, marker files and everything
-// without the state- prefix are never touched.
+// sweepLatches removes state-* files past LatchMaxAge — known latch
+// names (owner gone/renamed) and unknown registry names alike (the
+// age floor keeps a live foreign-schema writer's latch from
+// flapping; see the package doc). last-* budgets, marker files and
+// everything without the state- prefix are never touched.
 func (j *Janitor) sweepLatches() {
 	entries, err := os.ReadDir(j.cfg.WatchdogStateDir)
 	if err != nil {
@@ -361,18 +369,21 @@ func (j *Janitor) sweepLatches() {
 				"suspect: state dir entry %s is a directory — skipped", e.Name()))
 			continue
 		}
+		// age starts at -1 for "Info() failed": unknown-age entries
+		// are skipped (fail closed — no reaping on a guess), so by
+		// the reap below age is always a real duration.
 		age := time.Duration(-1)
 		if fi, err := e.Info(); err == nil {
 			age = now.Sub(fi.ModTime())
 		}
 		var rule string
 		switch {
+		case age < 0 || age <= j.cfg.LatchMaxAge:
+			continue
 		case !isKnownLatchName(key):
 			rule = "unknown"
-		case age >= 0 && age > j.cfg.LatchMaxAge:
-			rule = "max-age"
 		default:
-			continue
+			rule = "max-age"
 		}
 		p := filepath.Join(j.cfg.WatchdogStateDir, e.Name())
 		if err := os.Remove(p); err != nil {
@@ -380,15 +391,9 @@ func (j *Janitor) sweepLatches() {
 				"suspect: rm stale latch %s failed: %v", e.Name(), err))
 			continue
 		}
-		if age >= 0 {
-			j.appendLog(fmt.Sprintf(
-				"ACTION: reaped stale latch %s (age=%.1fh, rule=%s)",
-				e.Name(), age.Hours(), rule))
-		} else {
-			j.appendLog(fmt.Sprintf(
-				"ACTION: reaped stale latch %s (age=unknown, rule=%s)",
-				e.Name(), rule))
-		}
+		j.appendLog(fmt.Sprintf(
+			"ACTION: reaped stale latch %s (age=%.1fh, rule=%s)",
+			e.Name(), age.Hours(), rule))
 		j.actions.WithLabelValues(checkLatchReaper, "reap").Inc()
 	}
 	j.cycles.WithLabelValues(checkLatchReaper, "ok").Inc()

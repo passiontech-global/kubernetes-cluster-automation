@@ -262,7 +262,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Syncer, error) {
 	s := &Syncer{cfg: cfg}
 	s.dialer = cfg.Dialer
 	if s.dialer == nil {
-		d, err := newSSHDialer(cfg.SSHKeyPath, cfg.SSHPort, cfg.SSHTimeout)
+		d, err := newSSHDialer(cfg.SSHKeyPath, cfg.SSHPort, cfg.SSHTimeout, cfg.Log)
 		if err != nil {
 			return nil, fmt.Errorf("hubsync: ssh key: %w", err)
 		}
@@ -286,7 +286,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Syncer, error) {
 	}, []string{"target"})
 	s.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_hubsync_cycles_total",
-		Help: "Converge cycles per target by result (ok|error|parse_error|secret_error).",
+		Help: "Converge cycles per target by result (ok|error|parse_error|parse_note|secret_error|unresolved).",
 	}, []string{"target", "result"})
 
 	if reg != nil {

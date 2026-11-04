@@ -11,6 +11,7 @@ package topology
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"strconv"
 
 	yaml3 "go.yaml.in/yaml/v3"
@@ -70,32 +71,63 @@ func (m *OMap) Items() []any {
 }
 
 // DecodeYAML parses a YAML document into jinja values: mappings →
-// *OMap (ordered), sequences → []any, ints stay int64.
+// *OMap (ordered), sequences → []any, ints stay int64. The vars
+// files are single-document — extra documents that decode to real
+// values error rather than being silently dropped (half-loaded
+// vars, no error); ones decoding to nil (a trailing bare `---`
+// separator) are legal YAML and accepted.
 func DecodeYAML(data []byte) (any, error) {
 	var node yaml3.Node
 	dec := yaml3.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&node); err != nil {
 		return nil, err
 	}
-	return yamlNodeToValue(&node)
+	for {
+		var extra yaml3.Node
+		switch err := dec.Decode(&extra); err {
+		case nil:
+			v, verr := yamlNodeToValue(&extra)
+			if verr != nil {
+				return nil, verr
+			}
+			if v != nil {
+				return nil, fmt.Errorf("unexpected second yaml document")
+			}
+			// nil-decoding doc (bare `---`) — keep scanning.
+		case io.EOF:
+			return yamlNodeToValue(&node)
+		default:
+			return nil, err
+		}
+	}
 }
 
-func yamlNodeToValue(n *yaml3.Node) (any, error) {
+// yamlMaxDepth bounds yamlNodeToValue — a recursive anchor
+// (&x {self: *x}) links the node graph into a cycle that would
+// otherwise recurse until the stack burst.
+const yamlMaxDepth = 100
+
+func yamlNodeToValue(n *yaml3.Node) (any, error) { return yamlNodeAt(n, 0) }
+
+func yamlNodeAt(n *yaml3.Node, depth int) (any, error) {
 	if n == nil {
 		return nil, nil
+	}
+	if depth > yamlMaxDepth {
+		return nil, fmt.Errorf("yaml: nesting exceeds %d levels (anchor cycle?)", yamlMaxDepth)
 	}
 	if n.Kind == yaml3.DocumentNode {
 		if len(n.Content) == 0 {
 			return nil, nil
 		}
-		return yamlNodeToValue(n.Content[0])
+		return yamlNodeAt(n.Content[0], depth+1)
 	}
 	switch n.Kind {
 	case yaml3.MappingNode:
 		m := NewOMap()
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			kn, vn := n.Content[i], n.Content[i+1]
-			v, err := yamlNodeToValue(vn)
+			v, err := yamlNodeAt(vn, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -105,7 +137,7 @@ func yamlNodeToValue(n *yaml3.Node) (any, error) {
 	case yaml3.SequenceNode:
 		out := make([]any, 0, len(n.Content))
 		for _, c := range n.Content {
-			v, err := yamlNodeToValue(c)
+			v, err := yamlNodeAt(c, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -135,7 +167,7 @@ func yamlNodeToValue(n *yaml3.Node) (any, error) {
 			return n.Value, nil
 		}
 	case yaml3.AliasNode:
-		return yamlNodeToValue(n.Alias)
+		return yamlNodeAt(n.Alias, depth+1)
 	default:
 		return nil, fmt.Errorf("unsupported yaml node kind %v", n.Kind)
 	}

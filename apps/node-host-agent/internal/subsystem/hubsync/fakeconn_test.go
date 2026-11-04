@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"path"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -23,15 +25,16 @@ func (e exitErr) ExitStatus() int { return e.status }
 type fakeConn struct {
 	mu    sync.Mutex
 	files map[string][]byte
-	ops   []string // ordered op log: "run:<cmd>" | "write:<path>"
-	sudo  bool     // non-root resolved user → sudo -n prefix
+	dirs  map[string]bool // seeded remote dirs (empty dirs the files map can't hold)
+	ops   []string        // ordered op log: "run:<cmd>" | "write:<path>"
+	sudo  bool            // non-root resolved user → sudo -n prefix
 
 	runHook func(cmd string) (string, error) // optional override
 	closed  bool
 }
 
 func newFakeConn() *fakeConn {
-	return &fakeConn{files: map[string][]byte{}}
+	return &fakeConn{files: map[string][]byte{}, dirs: map[string]bool{}}
 }
 
 // seedFile plants remote content (pre-converged state).
@@ -39,6 +42,27 @@ func (f *fakeConn) seedFile(p string, data []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.files[p] = data
+}
+
+// seedDir plants a remote directory — `test -d`/`ls` consult it.
+func (f *fakeConn) seedDir(p string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dirs[p] = true
+}
+
+// isDirLocked reports whether p is a remote directory: an explicit
+// seedDir, or a path prefix over the files map. Caller holds mu.
+func (f *fakeConn) isDirLocked(p string) bool {
+	if f.dirs[p] {
+		return true
+	}
+	for fpath := range f.files {
+		if path.Dir(fpath) == p || strings.HasPrefix(fpath, p+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeConn) opsLog() []string {
@@ -69,6 +93,12 @@ func (f *fakeConn) Run(_ context.Context, cmd string) (string, error) {
 	}
 	exec := strings.TrimPrefix(cmd, "sudo -n ")
 	switch {
+	case strings.HasPrefix(exec, "test -d "):
+		p := unshq(strings.TrimPrefix(exec, "test -d "))
+		if f.isDirLocked(p) {
+			return "", nil
+		}
+		return "", exitErr{1}
 	case strings.HasPrefix(exec, "sha256sum "):
 		p := unshq(strings.TrimPrefix(exec, "sha256sum "))
 		b, ok := f.files[p]
@@ -86,6 +116,27 @@ func (f *fakeConn) Run(_ context.Context, cmd string) (string, error) {
 			f.files[dst] = b
 			delete(f.files, src)
 		}
+		return "", nil
+	case strings.HasPrefix(exec, "ls -1p"):
+		// `ls -1pA <dir>` — basenames incl. dotfiles; dirs get a
+		// trailing '/' like the real -p flag.
+		p := unshq(strings.TrimPrefix(strings.TrimPrefix(exec, "ls -1p"), "A "))
+		var ns []string
+		for fpath := range f.files {
+			if path.Dir(fpath) == p {
+				ns = append(ns, path.Base(fpath))
+			}
+		}
+		for d := range f.dirs {
+			if path.Dir(d) == p {
+				ns = append(ns, path.Base(d)+"/")
+			}
+		}
+		sort.Strings(ns)
+		return strings.Join(ns, "\n"), nil
+	case strings.HasPrefix(exec, "rm -f "):
+		p := unshq(strings.TrimPrefix(exec, "rm -f "))
+		delete(f.files, p)
 		return "", nil
 	default:
 		// mkdir/chmod/systemctl/daemon-reload → success no-op.

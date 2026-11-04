@@ -1,8 +1,8 @@
 package hubsync
 
 import (
-	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
 )
@@ -26,12 +26,19 @@ type Target struct {
 
 // loadTargets re-parses the vars dir every cycle — ConfigMap updates
 // land as file changes and must apply without an agent restart.
-func loadTargets(varsDir string) ([]Target, error) {
+// notes carries topology.Load's NON-FATAL resolution notes (marker
+// dups, zone decode / jinja eval failures); err is reserved for a
+// genuine load/aggregation failure that must abort the cycle.
+// dropped lists the inventory names that resolved to an EMPTY ip —
+// not targets, but still known hosts the caller must mark down
+// rather than silently lose.
+func loadTargets(varsDir string) (targets []Target, dropped, notes []string, err error) {
 	t, err := topology.Load(topology.Config{VarsDir: varsDir})
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
-	return aggregateTargets(t)
+	targets, dropped = aggregateTargets(t)
+	return targets, dropped, t.Errors, nil
 }
 
 // aggregateTargets merges the three hub_converge inventory sources
@@ -46,8 +53,13 @@ func loadTargets(varsDir string) ([]Target, error) {
 //
 // Dedup is by IP; later sources override scalar fields when non-empty
 // and OR the flags (hub_converge add_host last-registration-wins
-// parity).
-func aggregateTargets(t *topology.Topology) ([]Target, error) {
+// parity). t.Errors stays with the caller — those notes are non-fatal
+// and must not suppress the targets that did resolve.
+// The second return records the NAMES of inventory entries dropped
+// for an empty ip: a target that vanishes from the list without a
+// trace would get its metric series pruned, hiding the broken
+// resolution — the caller marks those names down instead.
+func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string) {
 	defUser := t.Vars.Str("interdc_ssh_default_user")
 	if defUser == "" {
 		defUser = "root"
@@ -71,8 +83,17 @@ func aggregateTargets(t *topology.Topology) ([]Target, error) {
 
 	var order []string
 	byIP := map[string]*Target{}
+	droppedSet := map[string]bool{}
 	add := func(nt Target) {
 		if nt.IP == "" {
+			// No dialable address — record the name so the cycle
+			// can keep its series and mark it down. Deduped: a
+			// host in two sources (extra_hosts + api_lb_guard_vms)
+			// must not be recorded twice.
+			if nt.Name != "" && !droppedSet[nt.Name] {
+				droppedSet[nt.Name] = true
+				dropped = append(dropped, nt.Name)
+			}
 			return
 		}
 		if ex, ok := byIP[nt.IP]; ok {
@@ -148,10 +169,7 @@ func aggregateTargets(t *topology.Topology) ([]Target, error) {
 	for _, ip := range order {
 		out = append(out, *byIP[ip])
 	}
-	if len(t.Errors) > 0 {
-		return out, fmt.Errorf("vars resolution errors: %v", t.Errors)
-	}
-	return out, nil
+	return out, dropped
 }
 
 // --- jinja value helpers (topology keeps its coercions unexported) ---
@@ -173,7 +191,17 @@ func omBool(m *topology.OMap, key string, def bool) bool {
 	case bool:
 		return t
 	case string:
-		return t == "true" || t == "yes" || t == "1"
+		// YAML "True"/"Yes"/"1"-style scalars decode as strings —
+		// coerce the ansible truthy/falsy spellings (kineDBHost
+		// parity) and fall back to def on anything unrecognized.
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "true", "yes", "1", "on":
+			return true
+		case "false", "no", "0", "off":
+			return false
+		}
+	case int64:
+		return t != 0
 	}
 	return def
 }

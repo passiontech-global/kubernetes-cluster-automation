@@ -278,6 +278,137 @@ func TestDNSFallbackKeepsDeadPinWithoutReplacement(t *testing.T) {
 	}
 }
 
+// A `# BEGIN` without `# END` (truncated/corrupted hosts file) must
+// not silently eat the lines after the marker: they are kept as
+// ordinary content and the rewritten file is well-formed again.
+func TestRenderHostsBlockUnterminatedBegin(t *testing.T) {
+	e := fixture(t, nil)
+	writeFile(t, e.hosts, "127.0.0.1 localhost\n"+
+		hostsBlockBegin+"\n10.0.0.1 stranded.example\n")
+
+	if !e.n.renderHostsBlock("10.0.0.2 api.y\n") {
+		t.Fatal("unterminated block not rewritten")
+	}
+	hosts := readFileT(t, e.hosts)
+	if !strings.Contains(hosts, "10.0.0.1 stranded.example") {
+		t.Fatalf("tail after unterminated BEGIN dropped:\n%s", hosts)
+	}
+	if !strings.Contains(hosts, hostsBlockEnd) ||
+		!strings.Contains(hosts, "10.0.0.2 api.y") {
+		t.Fatalf("new block not written well-formed:\n%s", hosts)
+	}
+	// The rewrite is convergent: the next render sees a clean file.
+	if e.n.renderHostsBlock("10.0.0.2 api.y\n") {
+		t.Fatalf("rewrite not idempotent:\n%s", readFileT(t, e.hosts))
+	}
+
+	// Removing the block keeps the tail too.
+	writeFile(t, e.hosts, "127.0.0.1 localhost\n"+
+		hostsBlockBegin+"\n10.0.0.1 stranded.example\n")
+	if !e.n.renderHostsBlock("") {
+		t.Fatal("unterminated block removal not rewritten")
+	}
+	hosts = readFileT(t, e.hosts)
+	if !strings.Contains(hosts, "10.0.0.1 stranded.example") {
+		t.Fatalf("tail dropped on block removal:\n%s", hosts)
+	}
+	if strings.Contains(hosts, hostsBlockBegin) {
+		t.Fatalf("stray BEGIN kept:\n%s", hosts)
+	}
+}
+
+// A tail line pinning a MANAGED fallback name is residue of an
+// earlier managed block — keeping it above the new block would let a
+// dead pin shadow the fresh one (first match wins). Foreign names
+// still get the rescue.
+func TestRenderHostsBlockTailDropsStaleManagedPins(t *testing.T) {
+	e := fixture(t, &watchdogconf.Config{
+		DNSFallback: []watchdogconf.DNSEntry{
+			{Name: "api.test.internal", Port: "6443",
+				Candidates: []string{"10.0.0.2"}},
+		},
+	})
+	writeFile(t, e.hosts, "127.0.0.1 localhost\n"+
+		hostsBlockBegin+"\n"+
+		"10.0.0.9 api.test.internal\n"+ // stale pin on a managed name
+		"10.0.0.7 stranded.example\n") // foreign entry — rescued
+
+	if !e.n.renderHostsBlock("10.0.0.2 api.test.internal\n") {
+		t.Fatal("unterminated block not rewritten")
+	}
+	hosts := readFileT(t, e.hosts)
+	if !strings.Contains(hosts, "10.0.0.7 stranded.example") {
+		t.Fatalf("foreign tail entry dropped:\n%s", hosts)
+	}
+	if strings.Contains(hosts, "10.0.0.9 api.test.internal") {
+		t.Fatalf("stale managed pin kept in tail — shadows fresh pin:\n%s", hosts)
+	}
+	if !strings.Contains(hosts,
+		hostsBlockBegin+"\n10.0.0.2 api.test.internal\n"+hostsBlockEnd) {
+		t.Fatalf("fresh block not written well-formed:\n%s", hosts)
+	}
+}
+
+// A file-level bind mount (the DaemonSet's /host/etc/hosts mount)
+// makes rename(2) return EBUSY — writeFileAtomic must fall back to a
+// direct fsync'd write instead of never landing the pin.
+func TestWriteFileAtomicBusyFallback(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "hosts")
+	writeFile(t, target, "127.0.0.1 localhost\n")
+
+	old := renameFile
+	defer func() { renameFile = old }()
+	renameFile = func(_, _ string) error { return unix.EBUSY }
+
+	if err := writeFileAtomic(target, "1.2.3.4 pinned.example\n"); err != nil {
+		t.Fatalf("writeFileAtomic EBUSY fallback failed: %v", err)
+	}
+	if got := readFileT(t, target); got != "1.2.3.4 pinned.example\n" {
+		t.Fatalf("content after fallback=%q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".tmp-hosts")); !os.IsNotExist(err) {
+		t.Fatal("tmp file left behind after fallback")
+	}
+
+	// A non-fallback rename error propagates and never touches the
+	// target — the fallback is EBUSY/EXDEV only.
+	renameFile = func(_, _ string) error { return unix.EPERM }
+	if err := writeFileAtomic(target, "9.9.9.9 evil\n"); !errors.Is(err, unix.EPERM) {
+		t.Fatalf("writeFileAtomic err=%v want EPERM", err)
+	}
+	if got := readFileT(t, target); got != "1.2.3.4 pinned.example\n" {
+		t.Fatalf("target overwritten on non-fallback rename error:\n%s", got)
+	}
+}
+
+// The suspectLog dedupe budgets are named last-suspect-<key>; keys
+// without a state-* latch (egress-probe-<ip> and friends) had no
+// reset path — a latch exit is the incident boundary that now drops
+// the whole family, while ordinary last-* action budgets stay.
+func TestStateExitDropsSuspectBudgets(t *testing.T) {
+	e := fixture(t, nil)
+	writeFile(t, filepath.Join(e.state, "state-conntrack-pressure"), "1\n")
+	writeFile(t, filepath.Join(e.state, "last-suspect-conntrack-pressure"), "1\n")
+	writeFile(t, filepath.Join(e.state, "last-suspect-egress-probe-8.8.8.8"), "1\n")
+	writeFile(t, filepath.Join(e.state, "last-nebula-restart"), "1\n") // action budget — not a suspect key
+
+	e.n.stateExit("conntrack-pressure")
+
+	for _, f := range []string{
+		"state-conntrack-pressure",
+		"last-suspect-conntrack-pressure",
+		"last-suspect-egress-probe-8.8.8.8",
+	} {
+		if _, err := os.Stat(filepath.Join(e.state, f)); !os.IsNotExist(err) {
+			t.Fatalf("%s kept after latch exit", f)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(e.state, "last-nebula-restart")); err != nil {
+		t.Fatal("action budget removed by the suspect-budget prune")
+	}
+}
+
 func TestDNSFallbackEmptyMapCleans(t *testing.T) {
 	e := fixture(t, nil) // empty conf
 	writeFile(t, e.resv, "nameserver 10.1.1.1\n")
@@ -679,6 +810,33 @@ func TestEgressHealedRelayDropsRuleForTCPProbe(t *testing.T) {
 	}
 	if !e.cmdRan("rule add pref 1500 to 8.8.8.8/32 lookup 100") {
 		t.Fatalf("rule not restored after TCP probe: %v", e.cmds)
+	}
+}
+
+// When the probe-window rule del fails the TCP fallback is skipped —
+// committing relay then only restates live; the log must not claim
+// "(direct failed)" underlay evidence the skipped probe never made.
+func TestEgressUnprobeableWindowCommitsToLive(t *testing.T) {
+	e := overlayEnv(t, nil)
+	// Committed direct but a live relay rule (drift); the heal del
+	// AND the probe-window del both fail → no probe runs.
+	e.cmdReply["rule list pref 1500"] = "1500:\tfrom all to 8.8.8.8 lookup 100\n"
+	writeFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "direct\n")
+	e.cmdFail["rule del"] = true
+	e.pingOK["8.8.8.8|true"] = false
+	e.tcpOK["8.8.8.8:53"] = true // would prove direct — never consulted
+
+	e.n.Cycle(context.Background())
+
+	if got := readFile(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
+		t.Fatalf("committed=%q want relay (committed to live)", got)
+	}
+	log := logLines(t, e)
+	if !strings.Contains(log, "unprobeable window — committed to live") {
+		t.Fatalf("missing unprobeable-window commit log:\n%s", log)
+	}
+	if strings.Contains(log, "direct failed") {
+		t.Fatalf("misleading '(direct failed)' logged for an unrun probe:\n%s", log)
 	}
 }
 

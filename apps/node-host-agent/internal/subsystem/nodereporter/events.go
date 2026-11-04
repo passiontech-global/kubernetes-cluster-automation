@@ -29,6 +29,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -277,8 +278,11 @@ func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool)
 // emitEvent creates or aggregates one Warning Event on this Node.
 // Dedup key is reason+message: a fresh key creates a new object; a
 // repeat inside EventDedupTTL series-patches the existing one
-// (count++, lastObservedTime). A patch failure (event TTL'd away)
-// drops the entry and recreates.
+// (count++, lastObservedTime). A NotFound patch failure (event TTL'd
+// away) drops the entry and recreates; any OTHER patch error keeps
+// the entry and returns the error — recreating a fresh object per
+// occurrence under a persistent failure (RBAC create-but-not-patch,
+// apiserver degradation) would spam unbounded Events.
 func (r *Reporter) emitEvent(ctx context.Context, reason, note string) error {
 	events := r.cfg.Client.EventsV1().Events(r.cfg.EventNamespace)
 	now := r.cfg.nowFn()
@@ -306,6 +310,16 @@ func (r *Reporter) emitEvent(ctx context.Context, reason, note string) error {
 			e.count++
 			e.at = now
 			return nil
+		}
+		if !apierrors.IsNotFound(err) {
+			// Not a "the Event is gone" — RBAC, throttling, a wedged
+			// apiserver. Keep the dedup entry: deleting it here would
+			// fall through to a fresh Create on EVERY occurrence of
+			// this reason+message for as long as the failure lasts.
+			// The caller logs the error; the next identical line
+			// retries the patch against the same entry.
+			return fmt.Errorf("patch event %s/%s: %w",
+				r.cfg.EventNamespace, e.name, err)
 		}
 		delete(r.emittedEvts, key) // stale entry — recreate below
 	}

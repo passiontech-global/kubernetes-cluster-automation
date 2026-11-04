@@ -73,6 +73,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -611,24 +612,25 @@ func (c *Config) applyDefaults() {
 	}
 	if c.restartFn == nil {
 		c.restartFn = func(ctx context.Context, unit string) error {
-			// The remediate gate used `timeout 90` — keep a bounded
-			// budget for the restart itself.
-			rctx, cancel := context.WithTimeout(ctx, 90*time.Second)
-			defer cancel()
-			_, err := systemctl(rctx, "restart", unit)
+			// The remediate gate used `timeout 90` — the restart
+			// keeps its own 90s budget, not the 10s query cap (a
+			// 10s clamp SIGKILLed a slow restart mid-flight and
+			// logged FAIL while systemd finished asynchronously).
+			_, err := systemctl(ctx, 90*time.Second, "restart", unit)
 			return err
 		}
 	}
 	if c.propFn == nil {
 		c.propFn = func(ctx context.Context, unit, prop string) (string, error) {
-			return systemctl(ctx, "show", unit, "-p", prop, "--value")
+			return systemctl(ctx, defaultSystemctlBudget,
+				"show", unit, "-p", prop, "--value")
 		}
 	}
 	if c.isActive == nil {
 		c.isActive = func(ctx context.Context, unit string) (string, error) {
 			// is-active exits non-zero for inactive — the output is
 			// the value, not an error (shell `|| true` parity).
-			out, _ := systemctl(ctx, "is-active", unit)
+			out, _ := systemctl(ctx, defaultSystemctlBudget, "is-active", unit)
 			return out, nil
 		}
 	}
@@ -702,6 +704,21 @@ type Hygiene struct {
 	cfg    Config
 	client *http.Client // mTLS client for rv probes; nil when creds absent
 	credFP string       // credential-file fingerprint the client was built from
+
+	// feederOnce keeps the feeder single-flight: the agent
+	// supervisor re-invokes Run on the same ctx after a Cycle
+	// panic, and without it every restart stacks another feeder —
+	// duplicate sd_notify plus duplicate runRemediate passes
+	// (routeGuardOnce parity, nethealth.go).
+	feederOnce sync.Once
+	// rateMu serialises the remediate G5 check + G6 budget spend:
+	// the last-restart epoch file stays the cross-process contract,
+	// but the in-process read-compare-write still needs a mutex or
+	// two overlapping remediate passes can both see "allowed" in
+	// the same window (TOCTOU double-restart). Held only around
+	// the file check+mkdir+write, never across systemctl —
+	// workerhygiene rateTrySpend parity.
+	rateMu sync.Mutex
 
 	// journalReads is the journal-unreadable accounting — every
 	// journalText result is classified into it; the tracker fires the
@@ -818,7 +835,23 @@ func (h *Hygiene) Run(ctx context.Context) {
 		return
 	}
 	if h.feederActive() {
-		go h.runFeeder(ctx)
+		h.feederOnce.Do(func() {
+			go func() {
+				// agent.go's panic recovery only wraps sub.Run —
+				// a panic in this spawned goroutine would take the
+				// whole daemon down. Recover and die loudly
+				// instead: WATCHDOG=1 stops, so the unit's own
+				// watchdog fires (the shell exit-1 → OnFailure
+				// equivalence).
+				defer func() {
+					if r := recover(); r != nil {
+						h.appendLogWarn(fmt.Sprintf(
+							"feeder: PANIC %v — feeder dead, WATCHDOG=1 stops (agent kept alive)", r))
+					}
+				}()
+				h.runFeeder(ctx)
+			}()
+		})
 	}
 	h.runCycle(ctx)
 	t := time.NewTicker(h.cfg.Interval)
@@ -1329,9 +1362,17 @@ func scrubSystemdEnv(env []string) []string {
 	return out
 }
 
-// systemctl runs `timeout 10 systemctl <args>` with the scrubbed env.
-func systemctl(ctx context.Context, args ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+// defaultSystemctlBudget caps the query-shaped systemctl calls —
+// shell `timeout 10` parity.
+const defaultSystemctlBudget = 10 * time.Second
+
+// systemctl runs `timeout <budget> systemctl <args>` with the
+// scrubbed env. The budget is a caller parameter, not a fixed 10s:
+// the restart path needs its own 90s (an unconditional 10s wrap
+// SIGKILLed a slow `systemctl restart` mid-flight — the unit still
+// restarted asynchronously, but the gate logged FAIL).
+func systemctl(ctx context.Context, budget time.Duration, args ...string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "systemctl", args...)
 	cmd.Env = scrubSystemdEnv(os.Environ())
@@ -1352,6 +1393,10 @@ func sdNotify(sock, msg string) error {
 		return err
 	}
 	defer conn.Close()
+	// A wedged notify socket must not hang the feeder loop —
+	// datagram writes are near-instant, so the deadline only covers
+	// pathological socket states.
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	_, err = conn.Write([]byte(msg))
 	return err
 }
@@ -1511,12 +1556,29 @@ func (h *Hygiene) loadCreds() (cert, key, ca []byte, err error) {
 			if len(a.ClientCertificateData) > 0 {
 				cert = a.ClientCertificateData
 			} else if a.ClientCertificate != "" {
-				cert, _ = os.ReadFile(resolveRel(h.cfg.AdminKubeconfig, a.ClientCertificate))
+				// A kubeconfig that REFERENCES cert/key files and
+				// cannot read them is not "no creds" — warn so the
+				// blind-cycle no_creds result stays attributable.
+				ref := resolveRel(h.cfg.AdminKubeconfig, a.ClientCertificate)
+				if b, rerr := os.ReadFile(ref); rerr != nil {
+					h.appendLogWarn(fmt.Sprintf(
+						"controllerhygiene: kubeconfig client-cert %s unreadable: %v",
+						ref, rerr))
+				} else {
+					cert = b
+				}
 			}
 			if len(a.ClientKeyData) > 0 {
 				key = a.ClientKeyData
 			} else if a.ClientKey != "" {
-				key, _ = os.ReadFile(resolveRel(h.cfg.AdminKubeconfig, a.ClientKey))
+				ref := resolveRel(h.cfg.AdminKubeconfig, a.ClientKey)
+				if b, rerr := os.ReadFile(ref); rerr != nil {
+					h.appendLogWarn(fmt.Sprintf(
+						"controllerhygiene: kubeconfig client-key %s unreadable: %v",
+						ref, rerr))
+				} else {
+					key = b
+				}
 			}
 			if len(cert) > 0 && len(key) > 0 {
 				break
@@ -1733,8 +1795,16 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	}, h.cfg.nowFn().Add(-eventStaleAge), out)
 	out.flush()
 	if perr != nil {
+		// Logged on its own — a purge miss does NOT fail the cycle
+		// when the quota-remediating step still lands below.
 		h.appendLogWarn(fmt.Sprintf("etcdguard: evpurge failed: %v", perr))
 	}
+	// remediated tracks the step that actually relieves the quota:
+	// the online rescue (compact+defrag). evpurge only drops event
+	// GC debt so the rescue has garbage to free — when the rescue
+	// ran, its result IS the verdict, even if evpurge failed
+	// upstream (the purge failure stays logged above either way).
+	remediated := perr == nil
 	// A dead gctx here means evpurge (or a cancelled parent) ate
 	// the whole budget — spawn no further calls that can only fail;
 	// the rescue is idempotent and retries in the next window.
@@ -1757,6 +1827,11 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 		if rerr != nil {
 			h.appendLogWarn(fmt.Sprintf("etcdguard: rescue incomplete: %v", rerr))
 		}
+		remediated = rerr == nil
+	} else {
+		// The budget died inside evpurge — the rescue never ran,
+		// so the cycle is incomplete, not a clean ok.
+		remediated = false
 	}
 	if errors.Is(gctx.Err(), context.DeadlineExceeded) {
 		h.appendLogWarn(fmt.Sprintf(
@@ -1765,7 +1840,11 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 			defaultEtcdGuardBudget, h.cfg.EtcdGuardMinRun))
 	}
 	h.actions.WithLabelValues(checkEtcd, "evpurge_rescue").Inc()
-	h.cycles.WithLabelValues(checkEtcd, "ok").Inc()
+	if remediated {
+		h.cycles.WithLabelValues(checkEtcd, "ok").Inc()
+	} else {
+		h.cycles.WithLabelValues(checkEtcd, "remediate_error").Inc()
+	}
 }
 
 // etcdStatus fetches `endpoint status -w json` and returns the db

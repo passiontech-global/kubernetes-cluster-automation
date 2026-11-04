@@ -528,6 +528,50 @@ func TestRunCanaryFailures(t *testing.T) {
 	}
 }
 
+// The standalone log path is predictable (/tmp/etcd-standalone.log)
+// and opened as root — a planted symlink must be refused BEFORE
+// O_TRUNC can clobber the target.
+func TestStartTempEtcdRejectsSymlinkLog(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "victim")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "etcd-standalone.log")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := startTempEtcdExec(context.Background(),
+		"/nonexistent/etcd", nil, link); err == nil {
+		t.Fatal("expected refusal for symlinked log path")
+	}
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "keep" {
+		t.Fatalf("symlink target clobbered: %q", body)
+	}
+}
+
+// A regular log path is created 0600 (the exec then fails on the
+// missing binary — this only proves the file side).
+func TestStartTempEtcdCreatesLog0600(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "etcd-standalone.log")
+	_, err := startTempEtcdExec(context.Background(),
+		"/nonexistent/etcd", nil, logPath)
+	if err == nil {
+		t.Fatal("expected exec failure for missing etcd binary")
+	}
+	fi, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatalf("log not created: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("log mode %o want 0600", fi.Mode().Perm())
+	}
+}
+
 // --- OnlineOnly (background auto-maintenance: the offline path is
 // forbidden — systemctl stop/start + standalone etcd never run) ---
 

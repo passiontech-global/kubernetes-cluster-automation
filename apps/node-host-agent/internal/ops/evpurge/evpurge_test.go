@@ -138,6 +138,23 @@ func TestRunContinuesAllPages(t *testing.T) {
 	}
 }
 
+// A body over the 8MiB cap fails naming the cap — a truncated page
+// must not surface as a misleading JSON syntax error.
+func TestListRejectsOversizeResponse(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(bytes.Repeat([]byte("x"), maxResponseBytes+1))
+		}))
+	defer srv.Close()
+
+	_, err := listStale(context.Background(), srv.Client(), srv.URL,
+		time.Now())
+	if err == nil || !strings.Contains(err.Error(), "8MiB cap") {
+		t.Fatalf("err=%v want the 8MiB-cap message", err)
+	}
+}
+
 func TestDefaultCAFallback(t *testing.T) {
 	// On a dev box /var/lib/k0s/pki/ca.crt does not exist → the etcd
 	// CA path is the fallback. When it does exist the primary wins.

@@ -19,7 +19,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+// btrfsCmdTimeout bounds each btrfs invocation — a wedged btrfs
+// binary or filesystem must not stall the init for the caller's
+// whole ctx budget.
+const btrfsCmdTimeout = 60 * time.Second
 
 // Config carries the init knobs — the zero value IS the production
 // config (same convention as sweeper.ConcourseCacheConfig).
@@ -56,8 +62,15 @@ func (c *Config) applyDefaults() {
 	if c.RuncSource == "" {
 		c.RuncSource = DefaultRuncSource
 	}
-	if c.OwnerUID == 0 && c.OwnerGID == 0 {
-		c.OwnerUID, c.OwnerGID = cacheOwner, cacheOwner
+	// OwnerUID/OwnerGID default INDEPENDENTLY — a partial config
+	// (OwnerUID=-1 alone, "skip the uid half") must not leave GID 0:
+	// uid/gid 0 is root, and chown-to-root was never a supported
+	// mode of the script.
+	if c.OwnerUID == 0 {
+		c.OwnerUID = cacheOwner
+	}
+	if c.OwnerGID == 0 {
+		c.OwnerGID = cacheOwner
 	}
 	if c.Mode == 0 {
 		c.Mode = cachePerm
@@ -77,7 +90,48 @@ func (c *Config) applyDefaults() {
 // the first fail-closed error; the btrfs phase can never produce one.
 func WorkerInit(ctx context.Context, cfg Config) error {
 	cfg.applyDefaults()
+	// wipeExcept rm -rf's every non-dot top-level entry under
+	// WorkDir — refuse to run that against the filesystem root or a
+	// relative path resolved at the wrong cwd: a misconfigured
+	// WorkDir is catastrophic, not a no-op.
+	if !filepath.IsAbs(cfg.WorkDir) ||
+		filepath.Clean(cfg.WorkDir) == "/" {
+		return fmt.Errorf("unsafe work dir %q", cfg.WorkDir)
+	}
 	sc := filepath.Join(cfg.WorkDir, sharedCacheName)
+
+	// shared-cache itself needs the same scrutiny the per-entry
+	// Lstat below gives its CHILDREN: a symlink planted AT
+	// <WorkDir>/shared-cache sails past the top-level wipe (it is
+	// the keep-list entry), then wipeExcept(sc, ...) rm -rf's the
+	// LINK TARGET's contents and the chmod 0777/chown pass lands on
+	// the target — the same privilege gadget, one level up. A real
+	// shared-cache is only ever a plain dir the scaffold mkdir'd, so
+	// any symlink here is hostile and fails the init.
+	if fi, err := os.Lstat(sc); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("shared-cache %s is a symlink", sc)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("lstat %s: %w", sc, err)
+	}
+	// Depth check behind the Lstat: WorkDir may itself ride on a
+	// symlink (whatever the chart mounted), so compare RESOLVED
+	// paths — a shared-cache whose real path does not sit strictly
+	// inside the resolved work dir is refused (this also rejects a
+	// WorkDir symlinked at the filesystem root, which would be the
+	// same catastrophic wipe the IsAbs check guards).
+	if wdReal, err := filepath.EvalSymlinks(cfg.WorkDir); err == nil {
+		if scReal, err := filepath.EvalSymlinks(sc); err == nil &&
+			!strings.HasPrefix(scReal,
+				wdReal+string(os.PathSeparator)) {
+			return fmt.Errorf("shared-cache %s resolves outside "+
+				"work dir: %s", sc, scReal)
+		}
+	}
+	// Missing work dir / missing shared-cache is fine — EvalSymlinks
+	// errors on nonexistent paths and the scaffold mkdir's the whole
+	// tree below.
 
 	// btrfs subvolume cleanup — inherited from the chart's built-in
 	// init-rm. Fail-open: `btrfs subvolume list || true` yields an
@@ -126,11 +180,35 @@ func WorkerInit(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("read shared-cache: %w", err)
 	}
 	for _, e := range entries {
-		if e.Type()&os.ModeSymlink != 0 || strings.HasPrefix(e.Name(), ".") {
+		if strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		targets = append(targets, filepath.Join(sc, e.Name()))
+		p := filepath.Join(sc, e.Name())
+		// Lstat each candidate — DirEntry.Type() is zero on
+		// filesystems reporting DT_UNKNOWN, so a planted symlink
+		// could slip a Type()-based guard and the chown/chmod below
+		// would dereference it (a CI-planted `<entry> -> /etc/...`
+		// privilege gadget).
+		fi, err := os.Lstat(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // raced away between ReadDir and Lstat
+			}
+			return fmt.Errorf("lstat %s: %w", p, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		targets = append(targets, p)
 	}
+	// Residual TOCTOU window, documented not closed: the Lstat above
+	// proved the entry was not a symlink AT CHECK TIME, but
+	// chown/chmod re-resolve the path — an actor able to swap a
+	// verified entry for a symlink in between could still redirect
+	// the dereference. Closing it for real needs openat2/…AT_SYMLINK_
+	// NOFOLLOW + fchown/fchmod on the held fd; the init runs as root
+	// before task containers start, so the window is accepted (same
+	// residual the script's chown/chmod carried).
 	for _, t := range targets {
 		if cfg.OwnerUID >= 0 || cfg.OwnerGID >= 0 {
 			if err := cfg.chown(t, cfg.OwnerUID, cfg.OwnerGID); err != nil {
@@ -200,7 +278,9 @@ func wipeExcept(ctx context.Context, dir string, keep map[string]bool) error {
 // binary or a non-btrfs fs returns an empty list, matching the
 // script's no-op on ext4.
 func btrfsListSubvols(ctx context.Context, dir string) ([]string, error) {
-	cmd := exec.CommandContext(ctx, "btrfs", "subvolume", "list",
+	cctx, cancel := context.WithTimeout(ctx, btrfsCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "btrfs", "subvolume", "list",
 		"--sort=-ogen", dir)
 	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
@@ -222,12 +302,17 @@ func btrfsListSubvols(ctx context.Context, dir string) ([]string, error) {
 // gone by the time the loop reaches it). The caller discards the
 // error — the script's `|| true`.
 func btrfsDeleteSubvol(ctx context.Context, path string) error {
-	show := exec.CommandContext(ctx, "btrfs", "subvolume", "show", path)
+	sctx, cancel := context.WithTimeout(ctx, btrfsCmdTimeout)
+	show := exec.CommandContext(sctx, "btrfs", "subvolume", "show", path)
 	show.Stdout, show.Stderr = os.Stdout, os.Stderr
-	if err := show.Run(); err != nil {
+	err := show.Run()
+	cancel()
+	if err != nil {
 		return err
 	}
-	del := exec.CommandContext(ctx, "btrfs", "subvolume", "delete",
+	dctx, cancel := context.WithTimeout(ctx, btrfsCmdTimeout)
+	defer cancel()
+	del := exec.CommandContext(dctx, "btrfs", "subvolume", "delete",
 		"--recursive", path)
 	del.Stdout, del.Stderr = os.Stdout, os.Stderr
 	return del.Run()

@@ -39,6 +39,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Defaults mirror rescue-etcd.sh.
@@ -284,12 +286,19 @@ func (r *rescuer) waitHealthy(ctx context.Context, tries int) error {
 	return fmt.Errorf("etcd still unhealthy after %ds", tries)
 }
 
-// waitPidExit polls /proc/<pid> until it disappears — the old etcd
-// must be gone before the standalone opens the same data-dir.
+// waitPidExit polls /proc/<pid> until the process is gone — the old
+// etcd must be fully dead before the standalone opens the same
+// data-dir. A zombie keeps its /proc entry but is already dead (fds
+// and the bbolt lock released), so state Z counts as exited instead
+// of stalling the full wait budget.
 func (r *rescuer) waitPidExit(ctx context.Context, pid int) error {
 	procDir := filepath.Join(r.cfg.ProcRoot, strconv.Itoa(pid))
+	statFile := filepath.Join(procDir, "stat")
 	for i := 0; i < pidExitWaitTries; i++ {
 		if _, err := os.Stat(procDir); os.IsNotExist(err) {
+			return nil
+		}
+		if procZombie(statFile) {
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
@@ -299,6 +308,22 @@ func (r *rescuer) waitPidExit(ctx context.Context, pid int) error {
 	}
 	return fmt.Errorf("etcd pid %d did not exit after %ds",
 		pid, pidExitWaitTries)
+}
+
+// procZombie reports whether a /proc/<pid>/stat file shows process
+// state Z. comm is parenthesised and may itself contain spaces or
+// parens, so the state field is the first token after the LAST ')'.
+func procZombie(statFile string) bool {
+	data, err := os.ReadFile(statFile)
+	if err != nil {
+		return false
+	}
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 {
+		return false
+	}
+	f := strings.Fields(string(data[i+1:]))
+	return len(f) > 0 && f[0] == "Z"
 }
 
 // matchEtcdCmdline reports whether a /proc/<pid>/cmdline blob belongs
@@ -340,10 +365,17 @@ func (r *rescuer) findEtcdProcess() (int, []string, error) {
 		}
 		var flags []string
 		for i, a := range strings.Split(string(cl), "\x00") {
-			if i == 0 || a == "" { // drop argv[0] + trailing NULs
+			if i == 0 { // drop argv[0] only
 				continue
 			}
 			flags = append(flags, a)
+		}
+		// cmdline ends in a NUL, so the split leaves one trailing ""
+		// — drop ONLY that. Interior empty elements are legitimate
+		// empty flag values; removing them would shift every
+		// flag→value pairing (flagValue + the standalone argv).
+		if n := len(flags); n > 0 && flags[n-1] == "" {
+			flags = flags[:n-1]
 		}
 		return pid, flags, nil
 	}
@@ -464,11 +496,13 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 	r.printAlarmList(ctx, "alarm list: (none)")
 
 	// [2/6] Compact all MVCC history to the head revision. The
-	// script's `|| echo` tolerates an already-compacted revision.
+	// script's `|| echo` tolerated ANY compact failure — keep that,
+	// but print the real error: a timeout/auth/network failure must
+	// not masquerade as "already compacted".
 	fmt.Fprintf(out, "[2/6] >>> compact to revision %d\n", st.Revision)
 	if _, err := r.etcdctl(ctx, "", "compact", "--physical",
 		strconv.FormatInt(st.Revision, 10)); err != nil {
-		fmt.Fprintln(out, "(revision already compacted — skipping)")
+		fmt.Fprintf(out, "(compact error — skipping: %v)\n", err)
 	}
 
 	// [3/6] Online defrag first (no downtime). Field-proven caveat:
@@ -609,8 +643,26 @@ func (t *tempEtcdProc) Wait() error {
 // would block the deferred `systemctl start` from recovering etcd.
 func startTempEtcdExec(ctx context.Context, bin string,
 	args []string, logPath string) (TempEtcd, error) {
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// logPath is a predictable name under the shared /tmp opened as
+	// root — a pre-planted symlink would have O_TRUNC clobber its
+	// target before the Chmod below ever runs. Two layers: the
+	// Lstat gives a diagnosable refusal, and O_NOFOLLOW closes the
+	// plant-between-check-and-open race.
+	if fi, err := os.Lstat(logPath); err == nil &&
+		fi.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("temp etcd log %s is a symlink — refusing",
+			logPath)
+	}
+	f, err := os.OpenFile(logPath,
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
+		return nil, err
+	}
+	// 0o600 only applies on O_CREATE — a leftover log from a prior
+	// run keeps its old mode. Force it: the etcd output can carry
+	// peer URLs/flags and must not stay world-readable.
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)

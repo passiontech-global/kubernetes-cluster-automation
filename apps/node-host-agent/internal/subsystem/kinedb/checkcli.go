@@ -54,8 +54,8 @@ func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
 		res.envUser), res.checks[checkBackendEnv] == 1)
 	check(fmt.Sprintf("pgbouncer log clean (server_login_retry/auth fail = %d)",
 		res.logErrs), res.checks[checkLogErrors] == 1)
-	check("SHOW POOLS: db postgres has server conn (sv_*>0)",
-		res.checks[checkPools] == 1)
+	check(fmt.Sprintf("SHOW POOLS: db postgres has server conn (sv_*>0) and cl_waiting<=%d",
+		k.cfg.WaitMax), res.checks[checkPools] == 1)
 	check(fmt.Sprintf("revision horizon (head=%s compact_rev=%s live_tup=%s)",
 		intOrNA(res.revSeen, res.head),
 		intOrNA(res.revSeen, res.compact),

@@ -90,7 +90,11 @@ func createBundle(args []string) (string, bool) {
 	bundle := ""
 	prev := ""
 	for _, arg := range args {
-		if prev == "--bundle" || prev == "-b" {
+		// A `-`-prefixed arg after -b/--bundle is another flag, not
+		// the bundle path — treat it as "no bundle value" instead of
+		// consuming it.
+		if (prev == "--bundle" || prev == "-b") &&
+			!strings.HasPrefix(arg, "-") {
 			bundle = arg
 		}
 		switch {
@@ -137,9 +141,12 @@ func injectSharedCacheMount(configPath, source string) {
 		return // `[ -f "$bundle/config.json" ]` failed — passthrough
 	}
 
-	// RawMessage everywhere except the two fields we inspect, so the
-	// rewrite preserves every untouched byte (mount objects keep
-	// their original formatting verbatim).
+	// RawMessage everywhere except the fields we inspect, so
+	// untouched SUBTREES re-serialise verbatim (each mount object
+	// keeps its member order). The top-level object is a map — its
+	// key order re-sorts alphabetically on marshal and insignificant
+	// whitespace is compacted; byte-parity of the whole file was
+	// never the contract (the awk rewrite changed formatting too).
 	var spec map[string]json.RawMessage
 	if err := json.Unmarshal(data, &spec); err != nil {
 		fmt.Fprintf(os.Stderr,

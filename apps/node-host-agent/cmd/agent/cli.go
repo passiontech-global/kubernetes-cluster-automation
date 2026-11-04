@@ -15,6 +15,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,9 +70,14 @@ func dispatch(argv []string) (int, bool) {
 	case "check-kine-db":
 		return checkKineDBCmd(ctx, argv[2:]), true
 	case "check-k0s-drift":
-		return checkK0sDriftCmd(argv[2:]), true
+		return checkK0sDriftCmd(ctx, argv[2:]), true
 	case "rescue-etcd":
 		return rescueEtcdCmd(ctx, argv[2:]), true
+	case "version":
+		// Positional twin of --version — a bare `version` word
+		// should not fall through to "unknown subcommand".
+		fmt.Println(version)
+		return 0, true
 	default:
 		subcommandUsage(argv[1])
 		return 2, true
@@ -83,6 +90,7 @@ func subcommandUsage(word string) {
 
 usage:
   node-host-agent [daemon flags]            run the agent daemon
+  node-host-agent version                   print version and exit
   node-host-agent concourse-worker-init [--work-dir=DIR] [--runc-dir=DIR] [--runc-source=PATH] [--wrapper-source=PATH]
                                             concourse worker init-rm (init container)
   node-host-agent concourse-runc-wrapper    runc shim (argv[0] "runc" works too)
@@ -225,6 +233,10 @@ type signJob struct {
 	ProxyJump string
 }
 
+// nebulaNetRe gates the network name before it lands in the remote
+// `cat /etc/nebula/<net>/host.pub` command — vars are operator input.
+var nebulaNetRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
 // signConfig carries the nebula-sign inputs (flags resolved).
 type signConfig struct {
 	VarsDir  string
@@ -297,6 +309,12 @@ func nebulaSign(ctx context.Context, cfg signConfig) error {
 	if nebulaNet == "" {
 		nebulaNet = "interdc"
 	}
+	// nebulaNet interpolates into a remote root shell command — it
+	// is vars-derived, so gate it to a safe alphabet.
+	if !nebulaNetRe.MatchString(nebulaNet) {
+		return fmt.Errorf("invalid interdc_nebula_net %q — only "+
+			"[A-Za-z0-9_-] is allowed", nebulaNet)
+	}
 	for i := range jobs {
 		if jobs[i].Pub != "" {
 			continue
@@ -341,6 +359,7 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 	bySite := jstrMap(t.Vars.Get("interdc_ssh_user_by_site"))
 
 	var jobs []signJob
+	var badNodes []string
 	for _, k := range t.Nodes.Keys() {
 		if only != "" && k != only {
 			continue
@@ -355,10 +374,23 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 		if octet == "" {
 			octet = lastOctet(ip)
 		}
-		var subs []string
-		if ip != "" {
-			subs = append(subs, ip+"/32")
+		// ip feeds Subnets and the SSH fallback, octet feeds
+		// IPCIDR — an empty one would produce "172.29.0./24" or
+		// -subnets "" and fail opaquely inside nebula-cert, so
+		// report the missing fields per node upfront instead.
+		var missingFields []string
+		if ip == "" {
+			missingFields = append(missingFields, "ip")
 		}
+		if octet == "" {
+			missingFields = append(missingFields, "marker_octet")
+		}
+		if len(missingFields) > 0 {
+			badNodes = append(badNodes, fmt.Sprintf("%s (missing %s)",
+				k, strings.Join(missingFields, ", ")))
+			continue
+		}
+		subs := []string{ip + "/32"}
 		for _, r := range omList(om, "relay") {
 			var rip string
 			if rm, ok := r.(*topology.OMap); ok {
@@ -382,6 +414,13 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 		if name == "" {
 			name = k
 		}
+		// The name lands in <varsDir>/nebula-<name>.crt — a registry
+		// entry carrying '/', '\' or '..' would path-traverse out.
+		if strings.ContainsAny(name, `/\`) ||
+			strings.Contains(name, "..") {
+			return nil, fmt.Errorf("node %s: cert name %q must not "+
+				"contain path separators or \"..\"", k, name)
+		}
 		jobs = append(jobs, signJob{
 			Hostname:  k,
 			Name:      name,
@@ -392,6 +431,10 @@ func buildSignJobs(t *topology.Topology, only string) ([]signJob, error) {
 			SSHUser:   user,
 			ProxyJump: omStr(om, "ssh_proxyjump"),
 		})
+	}
+	if len(badNodes) > 0 {
+		return nil, fmt.Errorf("interdc_nodes.yaml nodes missing "+
+			"required fields: %s", strings.Join(badNodes, ", "))
 	}
 	if only != "" && len(jobs) == 0 {
 		return nil, fmt.Errorf("node %q not in interdc_nodes.yaml registry", only)
@@ -444,9 +487,11 @@ func signAll(ctx context.Context, certBin string, cfg signConfig, jobs []signJob
 		dst := filepath.Join(cfg.VarsDir, "nebula-"+j.Name+".crt")
 		tmpDst := dst + ".tmp"
 		if err := os.WriteFile(tmpDst, crt, 0o644); err != nil {
+			os.Remove(tmpDst)
 			return fmt.Errorf("%s: %w", j.Hostname, err)
 		}
 		if err := os.Rename(tmpDst, dst); err != nil {
+			os.Remove(tmpDst)
 			return fmt.Errorf("%s: %w", j.Hostname, err)
 		}
 		fmt.Fprintf(os.Stderr, "nebula-sign: signed %s (%s) -> %s\n",
@@ -463,8 +508,10 @@ func stripPubArmor(s string) string {
 	var b strings.Builder
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.Contains(line, "BEGIN") ||
-			strings.Contains(line, "END") {
+		// Armor lines start with "-----" (-----BEGIN/END ...-----).
+		// Base64 content can legitimately contain "BEGIN"/"END" as
+		// substrings, so match the armor prefix — never Contains.
+		if line == "" || strings.HasPrefix(line, "-----") {
 			continue
 		}
 		b.WriteString(line)
@@ -704,6 +751,39 @@ func purgeEventsCmd(ctx context.Context, args []string) int {
 	before := fs.String("before", "",
 		"delete events created before this RFC3339 timestamp "+
 			"(positional arg also accepted; default deletes everything)")
+	// flag stops parsing at the first positional, so
+	// `purge-events <ts> --workers=2` would silently drop --workers —
+	// pull the positional cutoff out first, then parse what remains.
+	// Value-taking flags in `--flag value` form skip their value so
+	// it is not mistaken for the cutoff.
+	valueFlags := map[string]bool{
+		"api": true, "ca": true, "cert": true,
+		"key": true, "workers": true, "before": true,
+	}
+	// Work on a clone: args aliases the os.Args backing array and the
+	// in-place compaction below (`append(args[:i], args[i+1:]...)`)
+	// would corrupt argv for anything that reads it afterwards.
+	args = slices.Clone(args)
+	var positional string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			if i+1 < len(args) {
+				positional = args[i+1]
+				args = append(args[:i+1], args[i+2:]...)
+			}
+			break
+		}
+		if !strings.HasPrefix(a, "-") {
+			positional = a
+			args = append(args[:i], args[i+1:]...)
+			break
+		}
+		if name := strings.TrimLeft(a, "-"); !strings.Contains(name, "=") &&
+			valueFlags[name] {
+			i++
+		}
+	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0 // -h/--help is a clean exit, not a usage error
@@ -711,6 +791,9 @@ func purgeEventsCmd(ctx context.Context, args []string) int {
 		return 2
 	}
 	cutStr := *before
+	if cutStr == "" && positional != "" {
+		cutStr = positional
+	}
 	if cutStr == "" && fs.NArg() > 0 {
 		cutStr = fs.Arg(0)
 	}
@@ -767,7 +850,7 @@ func checkKineDBCmd(ctx context.Context, args []string) int {
 // Reports removed-flag / extra-key / missing-key drift between the
 // node's /etc/k0s/k0s.yaml controllerManager.extraArgs and the
 // expected set. Exit 0 clean (or not a k0s controller), 1 on drift.
-func checkK0sDriftCmd(args []string) int {
+func checkK0sDriftCmd(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("check-k0s-drift", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	config := fs.String("config", "/etc/k0s/k0s.yaml", "k0s config to scan")
@@ -797,6 +880,12 @@ func checkK0sDriftCmd(args []string) int {
 	}
 	if provided["removed-flags"] {
 		rem = splitCSV(*removed)
+	}
+	// The scan itself is a fast file read — honoring the signal ctx
+	// is an upfront cancellation gate.
+	if err := ctx.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "check-k0s-drift:", err)
+		return 1
 	}
 	return hostmetrics.RunK0sDriftCLI(hostmetrics.K0sDriftConfig{
 		ConfigFile:   *config,

@@ -64,6 +64,7 @@ package nethealth
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -95,8 +96,14 @@ const (
 	routeGuardPoll = 30 * time.Second
 	// routeGuardErrEvery re-logs a persistent bind failure every Nth
 	// error (~1min at the 2s retry) — a dead guard must not go
-	// silent after the first log line.
+	// silent after the first log line. The same first-plus-every-Nth
+	// throttle covers the ENOBUFS warn below: a flooded receive
+	// queue must stay visible without one log line per dropped read.
 	routeGuardErrEvery = 30
+	// routeGuardRespawnBackoff rate-limits guard respawns after an
+	// exit: a guard that dies instantly on every spawn (e.g. a
+	// deterministic panic) must not spin the spawn path.
+	routeGuardRespawnBackoff = 30 * time.Second
 )
 
 // Netns magic-link paths for the host-netns bind selection.
@@ -116,6 +123,18 @@ func bindRouteSocket() (int, error) {
 		unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
 	if err != nil {
 		return -1, err
+	}
+	// A route-delete burst (interface flap, Cilium churn) can
+	// overflow the default netlink receive buffer (~200K) — the
+	// kernel then silently drops exactly the DEL events this guard
+	// exists to catch. 4MiB is the usual monitor sizing; a failure
+	// (rmem_max cap) only logs — a smaller buffer still beats no
+	// guard.
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET,
+		unix.SO_RCVBUF, 4<<20); err != nil {
+		slog.Warn("route-guard: SO_RCVBUF 4MiB failed — keeping "+
+			"default buffer (delete bursts may lose events)",
+			"subsystem", "nethealth", "error", err)
 	}
 	if err := unix.Bind(fd, &unix.SockaddrNetlink{
 		Family: unix.AF_NETLINK,
@@ -273,11 +292,42 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// spawnRouteGuard starts the route guard unless one is already
+// running. The CompareAndSwap preserves the old sync.Once "don't
+// stack" guarantee — a second guard would double-bind the netlink
+// socket and double-restore — while clearing the flag on exit lets a
+// dead guard be re-armed by the next Run restart or tick instead of
+// staying dead forever (route events would go unmonitored). A panic
+// is recovered and logged: a defect in the guard must not crash the
+// whole daemon, and clearing the flag re-arms the next spawn. A
+// short backoff after each exit keeps a crash-looping guard from
+// spawn-storming.
+func (n *NetHealth) spawnRouteGuard(ctx context.Context) {
+	if last := n.routeGuardLastExit.Load(); last != 0 &&
+		time.Since(time.Unix(0, last)) < routeGuardRespawnBackoff {
+		return
+	}
+	if !n.routeGuardRunning.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("route-guard: guard panicked — exiting, "+
+					"respawn allowed after backoff",
+					"subsystem", "nethealth", "panic", r)
+			}
+			n.routeGuardLastExit.Store(time.Now().UnixNano())
+			n.routeGuardRunning.Store(false)
+		}()
+		n.routeGuard(ctx)
+	}()
+}
+
 // routeGuard is the outer lifecycle: poll for nebula-up.sh, bind the
 // netlink socket, monitor, reopen on read error — the bash outer
-// `while true; ip monitor; sleep 2` loop. Spawned once per NetHealth
-// via routeGuardOnce in Run() — an agent panic-restart of Run must
-// not double-bind sockets or double-restore.
+// `while true; ip monitor; sleep 2` loop. Spawned via
+// spawnRouteGuard — single-flight while alive, re-arms after exit.
 func (n *NetHealth) routeGuard(ctx context.Context) {
 	open := n.cfg.openRouteSocket
 	if open == nil {
@@ -356,11 +406,45 @@ func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 	closeFd := func() { closeOnce.Do(func() { unix.Close(fd) }) }
 	defer closeFd()
 	go func() {
+		// Registered first so it runs LAST on unwind: done and the
+		// fd close first so the monitor still unwinds, then the
+		// panic is logged and swallowed — a defect in the reader
+		// must not crash the whole daemon.
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("route-guard: netlink reader panicked — "+
+					"monitor exits, socket will reopen",
+					"subsystem", "nethealth", "panic", r)
+			}
+		}()
 		defer close(done)
 		defer closeFd()
 		buf := make([]byte, 64*1024)
+		enobufs := 0 // overruns seen on THIS socket — warn throttle
 		for {
 			nr, err := unix.Read(fd, buf)
+			if errors.Is(err, unix.ENOBUFS) {
+				enobufs++
+				// Receive queue overrun: DEL events were dropped —
+				// the silent-loss mode the SO_RCVBUF bump shrinks
+				// but can't remove. Count the window as a delete
+				// burst so the debounced restore heals whatever
+				// was missed instead of pretending all is well;
+				// the socket itself is still good. The warn is
+				// throttled like the open-fail counter: first
+				// overrun + every Nth, so a sustained flood can't
+				// emit a line per read while staying visible.
+				if enobufs == 1 || enobufs%routeGuardErrEvery == 0 {
+					slog.Warn("route-guard: netlink receive queue "+
+						"overrun — events lost, forcing a restore",
+						"subsystem", "nethealth", "overruns", enobufs)
+				}
+				select {
+				case events <- struct{}{}:
+				default:
+				}
+				continue
+			}
 			if err != nil || nr == 0 {
 				// err: closed/failing fd; nr==0: peer EOF. A close
 				// triggered by ctx cancel is the normal shutdown —
@@ -381,6 +465,12 @@ func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 		}
 	}()
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("route-guard: cancel watcher panicked",
+					"subsystem", "nethealth", "panic", r)
+			}
+		}()
 		select {
 		case <-ctx.Done():
 			closeFd() // unblock the Read → reader exits → done closes

@@ -220,13 +220,28 @@ func envDuration(key string, def time.Duration) time.Duration {
 	if v == "" {
 		return def
 	}
-	if d, err := time.ParseDuration(v); err == nil {
-		return d
+	var d time.Duration
+	if parsed, err := time.ParseDuration(v); err == nil {
+		d = parsed
+	} else if n, err := strconv.Atoi(v); err == nil {
+		d = time.Duration(n) * time.Second
+	} else {
+		// Neither shape parsed — warn like the ≤0 path does: a typo'd
+		// knob silently pinned to the default is impossible to spot
+		// from the outside.
+		slog.Warn("unparseable env duration ignored — using default",
+			"env", key, "value", v, "default", def)
+		return def
 	}
-	if n, err := strconv.Atoi(v); err == nil {
-		return time.Duration(n) * time.Second
+	if d <= 0 {
+		// A ≤0 interval would panic time.NewTicker inside the
+		// subsystem and crash-loop the daemon — warn and keep the
+		// default instead.
+		slog.Warn("non-positive env duration ignored — using default",
+			"env", key, "value", v, "default", def)
+		return def
 	}
-	return def
+	return d
 }
 
 // envList parses a comma-separated env var; unset/empty → nil (the
@@ -275,7 +290,7 @@ func resolveLocalBinary() string {
 
 // kubeClient builds the in-cluster clientset (SA token), falling back
 // to $KUBECONFIG for out-of-cluster runs. A var (not a plain func) so
-// tests can stub the factory — csOnce's single-build behaviour is
+// tests can stub the factory — csOnce's shared-build behaviour is
 // only observable through it.
 var kubeClient = func() (kubernetes.Interface, error) {
 	cfg, err := rest.InClusterConfig()
@@ -286,6 +301,13 @@ var kubeClient = func() (kubernetes.Interface, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	// Every subsystem shares this client — a wedged apiserver must
+	// not hang each kube API call forever, so the config carries the
+	// same request-timeout knob the sweeper uses for its cycles.
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = envDuration("NODE_HOST_AGENT_REQUEST_TIMEOUT",
+			30*time.Second)
 	}
 	return kubernetes.NewForConfig(cfg)
 }
@@ -470,12 +492,19 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 	// carrying three pools. On standalone hosts no kube client is
 	// built at all unless one of those subsystems is enabled.
 	var cs kubernetes.Interface
-	var csErr error
 	csOnce := func() (kubernetes.Interface, error) {
-		if cs == nil && csErr == nil {
-			cs, csErr = kubeClient()
+		if cs == nil {
+			// Only a successful build is cached — a transient
+			// failure (token not mounted yet, brief apiserver
+			// outage) must not disable every kube consumer for
+			// the process lifetime.
+			c, err := kubeClient()
+			if err != nil {
+				return nil, err
+			}
+			cs = c
 		}
-		return cs, csErr
+		return cs, nil
 	}
 
 	// --- sweeper: openebs orphan pvc-* dir cleanup ---
@@ -978,7 +1007,8 @@ func main() {
 
 	// Precedence: NODE_HOST_AGENT_NODE_NAME > NODE_NAME > --node-name.
 	// Standalone units pass --node-name (no downward API on the host).
-	nodeName := getenv("NODE_NAME", nodeNameFlag)
+	nodeName := getenv("NODE_HOST_AGENT_NODE_NAME",
+		getenv("NODE_NAME", nodeNameFlag))
 	podName := getenv("POD_NAME", "")
 	namespace := getenv("POD_NAMESPACE", "")
 

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -2040,5 +2041,733 @@ func TestJournaldRotateRateLimited(t *testing.T) {
 	c.groupBase()
 	if got := len(sr.callsMatching("journalctl --rotate --vacuum-time=3d")); got != 1 {
 		t.Fatalf("rotate ran %d times, want 1 (cooldown latch)", got)
+	}
+}
+
+// ---------- audit regression tests ----------
+
+// TestHostnamePinNoGlueOnMissingNewline — a hosts file without a
+// trailing newline must not fuse the 127.0.1.1 pin onto the last
+// existing line.
+func TestHostnamePinNoGlueOnMissingNewline(t *testing.T) {
+	c, r, _ := journaldEnv(t, map[string]string{
+		"journalctl -n 5": "ok",
+	}, map[string]bool{})
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost") // NO trailing \n
+	c.groupBase()
+	hosts := hostRead(t, r, "/etc/hosts")
+	if !strings.Contains(hosts, "127.0.0.1 localhost\n127.0.1.1 node-b\n") {
+		t.Fatalf("hostname pin glued onto the last line:\n%q", hosts)
+	}
+}
+
+// TestResolvConfAtomicRepoint — the T4 repoint creates the symlink
+// at a temp name and renames over; no gap window and no leftover tmp.
+func TestResolvConfAtomicRepoint(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{
+		"systemctl show systemd-resolved.service": "active",
+		"ss -lntu": "tcp  LISTEN 0  4096  127.0.0.53:53  0.0.0.0:*",
+	}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/run/systemd/resolve/resolv.conf", "nameserver 10.0.0.2\n")
+	hostWrite(t, r, "/etc/resolv.conf", "nameserver 8.8.8.8\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupNLD()
+	dst := filepath.Join(r.cfg.HostRoot, "etc/resolv.conf")
+	fi, err := os.Lstat(dst)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("resolv.conf not a symlink after repoint: %v %v", fi, err)
+	}
+	if l, _ := os.Readlink(dst); l != "/run/systemd/resolve/resolv.conf" {
+		t.Fatalf("resolv.conf -> %q", l)
+	}
+	if hostExists(r, "/etc/resolv.conf.hostconfig.tmp") {
+		t.Fatal("temp symlink lingered after repoint")
+	}
+}
+
+// TestApplyNftUnitRejectsBeforePromote — an invalid ruleset must be
+// nft -c'd at a CANDIDATE path and never reach the deploy file.
+func TestApplyNftUnitRejectsBeforePromote(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{
+		"nft -c -f": true,
+	}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/guard.nft", "table ip good {}\n")
+	c := loadCyc(t, r, vars, "node-b")
+	before := c.errs
+	c.applyNftUnit("guard", "/etc/guard.nft", []byte("garbage ruleset\n"), "test guard")
+	if c.errs == before {
+		t.Fatal("invalid ruleset not counted")
+	}
+	if got := hostRead(t, r, "/etc/guard.nft"); got != "table ip good {}\n" {
+		t.Fatalf("deploy path clobbered by invalid ruleset:\n%s", got)
+	}
+	if hostExists(r, "/etc/guard.nft.candidate") {
+		t.Fatal("rejected candidate left behind")
+	}
+	// validation ran on the candidate, not the deploy path
+	if len(sr.callsMatching("nft -c -f /etc/guard.nft.candidate")) == 0 {
+		t.Fatalf("nft -c did not target the candidate: %v",
+			sr.callsMatching("nft -c"))
+	}
+}
+
+// TestApplyNftUnitPromotesValidCandidate — a valid candidate is
+// promoted through writeManaged and the staging file swept.
+func TestApplyNftUnitPromotesValidCandidate(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.applyNftUnit("guard", "/etc/guard.nft", []byte("table ip guard {}\n"), "test guard")
+	if got := hostRead(t, r, "/etc/guard.nft"); got != "table ip guard {}\n" {
+		t.Fatalf("valid ruleset not promoted:\n%s", got)
+	}
+	if hostExists(r, "/etc/guard.nft.candidate") {
+		t.Fatal("candidate lingered after promotion")
+	}
+	if len(sr.callsMatching("systemctl restart guard.service")) == 0 {
+		t.Fatal("changed ruleset did not restart the unit")
+	}
+}
+
+// TestBlockInHostsReadFail — a failed /etc/hosts read must bail (and
+// count) rather than rewrite the file to only the managed block.
+func TestBlockInHostsReadFail(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// /etc/hosts as a DIRECTORY makes ReadFile fail.
+	if err := os.MkdirAll(filepath.Join(r.cfg.HostRoot, "etc/hosts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	before := c.errs
+	c.blockInHosts("x-test", "# BEGIN x-test managed block\n1.2.3.4 x\n# END x-test managed block\n")
+	if c.errs == before {
+		t.Fatal("hosts read failure not counted")
+	}
+	if fi, _ := os.Stat(filepath.Join(r.cfg.HostRoot, "etc/hosts")); !fi.IsDir() {
+		t.Fatal("hosts overwritten on read failure")
+	}
+}
+
+// TestGroupPullsQuotedExtraArgs — flags must land INSIDE a quoted
+// --kubelet-extra-args value (before the closing quote), both quote
+// styles.
+func TestGroupPullsQuotedExtraArgs(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
+		Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/systemd/system/k0sworker.service",
+		"[Service]\nExecStart=/usr/bin/k0s worker --data-dir=/var/lib/k0s "+
+			`--kubelet-extra-args="--node-ip=172.29.0.14"`+"\n")
+	hostWrite(t, r, "/etc/systemd/system/k0scontroller.service",
+		"[Service]\nExecStart=/usr/bin/k0s controller --data-dir=/var/lib/k0s "+
+			`--kubelet-extra-args='--node-ip=172.29.0.14'`+"\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupPulls()
+	unit := hostRead(t, r, "/etc/systemd/system/k0sworker.service")
+	if !strings.Contains(unit,
+		`--kubelet-extra-args="--node-ip=172.29.0.14\x20--serialize-image-pulls=false\x20--registry-qps=2\x20--registry-burst=4"`) {
+		t.Fatalf("flags not inside the double-quoted value:\n%s", unit)
+	}
+	ctl := hostRead(t, r, "/etc/systemd/system/k0scontroller.service")
+	if !strings.Contains(ctl,
+		`--kubelet-extra-args='--node-ip=172.29.0.14\x20--serialize-image-pulls=false\x20--registry-qps=2\x20--registry-burst=4'`) {
+		t.Fatalf("flags not inside the single-quoted value:\n%s", ctl)
+	}
+}
+
+// TestRenderZoneFileSkipsMarkerlessHub — a hub with no registry
+// marker must not render `nsN IN A ` (empty rdata coredns rejects).
+func TestRenderZoneFileSkipsMarkerlessHub(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	if err := os.WriteFile(filepath.Join(vars, "interdc_nodes.yaml"), []byte(`node-a:
+  name: a
+  ip: 10.0.1.10
+  site: s1
+  hub: true
+node-z:
+  name: z
+  site: s1
+  hub: true
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-a")
+	zb, err := c.renderZoneFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	z := string(zb)
+	if strings.Contains(z, "ns2") {
+		t.Fatalf("markerless hub rendered NS records:\n%s", z)
+	}
+	if regexp.MustCompile(`IN A\s*\n`).MatchString(z) {
+		t.Fatalf("empty A rdata rendered:\n%s", z)
+	}
+	if !strings.Contains(z, "IN NS ns1.test.internal.") ||
+		!strings.Contains(z, "IN A 172.29.0.10") {
+		t.Fatalf("marker hub records missing:\n%s", z)
+	}
+}
+
+// TestAPILBRestartsOnUnitDrift — a drifted unit file alone (cfg/nft
+// unchanged) must restart api-local-lb; daemon-reload leaves haproxy
+// on the OLD unit otherwise.
+func TestAPILBRestartsOnUnitDrift(t *testing.T) {
+	vars := lbVars(t)
+	sr := lbRunner()
+	r := newLBHost(t, vars, sr)
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupAPILB()
+	// Hand-edit the unit out-of-band; nothing else changed.
+	hostWrite(t, r, "/etc/systemd/system/api-local-lb.service", "[Unit]\n# hand-edited\n")
+	sr.calls = nil
+	c2 := loadCyc(t, r, vars, "node-b")
+	c2.groupAPILB()
+	if len(sr.callsMatching("systemctl restart api-local-lb.service")) == 0 {
+		t.Fatalf("unit drift did not restart api-local-lb: %v",
+			sr.callsMatching("api-local-lb"))
+	}
+}
+
+// TestNebulaEmptyVersionPinSkips — an empty version pin is "not
+// pinned": log+skip, never a vacuous version match, never download("").
+func TestNebulaEmptyVersionPinSkips(t *testing.T) {
+	vars := writeVarsDir(t, "interdc_nebula_version: \"\"\n")
+	sr := &scriptedRunner{res: map[string]string{
+		"/usr/local/bin/nebula -version": "nebula version 9.9.9",
+	}, errs: map[string]bool{}}
+	dl := t.TempDir()
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.nebulaInstallBinary()
+	if c.errs == 0 {
+		t.Fatal("unpinned nebula install not counted")
+	}
+	if len(sr.callsMatching("nebula -version")) > 0 {
+		t.Fatal("version probe ran on an empty pin")
+	}
+	if entries, _ := os.ReadDir(dl); len(entries) > 0 {
+		t.Fatal("download attempted without a version pin")
+	}
+}
+
+// TestCoreDNSEmptyVersionPinSkips — same contract for coredns.
+func TestCoreDNSEmptyVersionPinSkips(t *testing.T) {
+	vars := writeVarsDir(t, "interdc_coredns_version: \"\"\n")
+	sr := &scriptedRunner{res: map[string]string{
+		"/usr/local/bin/coredns -version": "CoreDNS-9.9.9",
+	}, errs: map[string]bool{}}
+	dl := t.TempDir()
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.corednsInstallBinary()
+	if c.errs == 0 {
+		t.Fatal("unpinned coredns install not counted")
+	}
+	if len(sr.callsMatching("coredns -version")) > 0 {
+		t.Fatal("version probe ran on an empty pin")
+	}
+	if entries, _ := os.ReadDir(dl); len(entries) > 0 {
+		t.Fatal("download attempted without a version pin")
+	}
+}
+
+// TestNebulaRoutingRefusesBadVar — a var carrying shell metachars
+// must abort the routing converge before any sh -c is built.
+func TestNebulaRoutingRefusesBadVar(t *testing.T) {
+	vars := writeVarsDir(t, `interdc_marker_base: "172.29.0;rm -rf /"`)
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.nebulaRouting()
+	if c.errs == 0 {
+		t.Fatal("injected var not counted")
+	}
+	if len(sr.callsMatching("sh -c")) > 0 {
+		t.Fatalf("shell ran with injected marker_base: %v", sr.callsMatching("sh -c"))
+	}
+}
+
+// TestHubMetricsScriptRefusesBadIP — a mesh node ip with shell
+// metachars empties the whole HUBMETRICS rebuild (fail closed).
+func TestHubMetricsScriptRefusesBadIP(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	if err := os.WriteFile(filepath.Join(vars, "interdc_nodes.yaml"), []byte(`node-a:
+  name: a
+  ip: "10.0.1.10;touch /tmp/pwned"
+  site: s1
+  hub: true
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-a")
+	if s := c.hubMetricsScript(); s != "" {
+		t.Fatalf("script rendered with injected ip:\n%s", s)
+	}
+	if c.errs == 0 {
+		t.Fatal("injected node ip not counted")
+	}
+}
+
+// TestProbeReachableRejectsBadAddr — a backend addr containing a
+// quote is skipped before it can break out of the bash -c wrapper.
+func TestProbeReachableRejectsBadAddr(t *testing.T) {
+	vars := writeVarsDir(t, `api_lb_backends:
+  - {name: api_evil, addr: "10.0.0.1';id:6443", probe: true}
+  - {name: api_ok, addr: "10.0.1.10:6443", probe: true}
+`)
+	sr := &scriptedRunner{res: map[string]string{
+		"/dev/tcp/10.0.1.10/6443": "",
+	}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	got := c.probeReachable()
+	if len(got) != 1 || got[0] != "api_ok" {
+		t.Fatalf("probeReachable = %v", got)
+	}
+	if len(sr.callsMatching("/dev/tcp/10.0.0.1")) > 0 {
+		t.Fatalf("injected addr reached the shell: %v", sr.callsMatching("/dev/tcp"))
+	}
+	if c.errs == 0 {
+		t.Fatal("injected backend addr not counted")
+	}
+}
+
+// TestDownloadSweepsTmpOnShaMismatch — the .dl staging file must not
+// survive a rejected download.
+func TestDownloadSweepsTmpOnShaMismatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("tampered"))
+	}))
+	t.Cleanup(srv.Close)
+	r := newTestReconciler(t, t.TempDir())
+	dst := filepath.Join(r.cfg.HostRoot, "dl/x.tgz")
+	if err := r.download(context.Background(), srv.URL+"/x.tgz", dst,
+		strings.Repeat("0", 64)); err == nil {
+		t.Fatal("expected sha256 mismatch")
+	}
+	if hostExists(r, "/dl/x.tgz.dl") {
+		t.Fatal("partial .dl left behind")
+	}
+	if hostExists(r, "/dl/x.tgz") {
+		t.Fatal("mismatched payload promoted")
+	}
+}
+
+// ---------- runLong timeout routing ----------
+
+// budgetProbe answers canned output like scriptedRunner but records
+// the deadline each command ran under — asserts the run vs runLong
+// routing of slow host ops.
+type budgetProbe struct {
+	res map[string]string
+	dls map[string]time.Duration
+}
+
+func (b *budgetProbe) Run(ctx context.Context, name string, args ...string) (string, error) {
+	c := name + " " + strings.Join(args, " ")
+	if b.dls == nil {
+		b.dls = map[string]time.Duration{}
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		b.dls[c] = time.Until(dl)
+	}
+	best, bestLen := "", -1
+	for k, v := range b.res {
+		if strings.Contains(c, k) && len(k) > bestLen {
+			best, bestLen = v, len(k)
+		}
+	}
+	return best, nil
+}
+
+// TestSlowOpsUseLongBudget — the package/vacuum commands run under
+// CmdTimeoutLong (~10m); plain probes stay on CmdTimeout (~120s).
+func TestSlowOpsUseLongBudget(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	bp := &budgetProbe{res: map[string]string{
+		"journalctl -n 5": "File corruption detected at /var/log/journal/x/system.journal:0 (of 20971520 bytes, 0%)",
+		"sshd -T":         "passwordauthentication no",
+	}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: bp}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupBase()
+	c.groupSecurity()
+	budget := func(call string) time.Duration {
+		d, ok := bp.dls[call]
+		if !ok {
+			t.Fatalf("%q never ran", call)
+		}
+		return d
+	}
+	if d := budget("journalctl --rotate --vacuum-time=3d"); d <= 9*time.Minute+50*time.Second {
+		t.Fatalf("rotate/vacuum budget %v — slow vacuum must run under CmdTimeoutLong", d)
+	}
+	if d := budget("env DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban"); d <= 9*time.Minute+50*time.Second {
+		t.Fatalf("apt-get install budget %v — must run under CmdTimeoutLong", d)
+	}
+	if d := budget("journalctl -n 5 -q --no-pager"); d > 2*time.Minute {
+		t.Fatalf("probe budget %v — plain queries stay on CmdTimeout", d)
+	}
+	if d := budget("dpkg-query -W -f=${db:Status-Status} fail2ban"); d > 2*time.Minute {
+		t.Fatalf("dpkg-query budget %v — plain queries stay on CmdTimeout", d)
+	}
+}
+
+// ---------- groupAPILB candidate staging ----------
+
+// TestAPILBStagesHaproxyCandidate — a cfg that fails haproxy -c must
+// never sit at the live path the unit loads on next start.
+func TestAPILBStagesHaproxyCandidate(t *testing.T) {
+	vars := lbVars(t)
+	sr := lbRunner()
+	sr.errs["api-local-lb.cfg.candidate"] = true
+	r := newLBHost(t, vars, sr)
+	hostWrite(t, r, "/etc/haproxy/api-local-lb.cfg", "global\n# last good\n")
+	c := loadCyc(t, r, vars, "node-b")
+	before := c.errs
+	c.groupAPILB()
+	if c.errs == before {
+		t.Fatal("haproxy -c failure not counted")
+	}
+	if got := hostRead(t, r, "/etc/haproxy/api-local-lb.cfg"); got != "global\n# last good\n" {
+		t.Fatalf("deploy path clobbered by a rejected render:\n%s", got)
+	}
+	if hostExists(r, "/etc/haproxy/api-local-lb.cfg.candidate") {
+		t.Fatal("rejected cfg candidate left behind")
+	}
+	if len(sr.callsMatching("haproxy -c -f /etc/haproxy/api-local-lb.cfg.candidate")) == 0 {
+		t.Fatalf("haproxy -c did not target the candidate: %v",
+			sr.callsMatching("haproxy"))
+	}
+}
+
+// TestAPILBStagesNftCandidate — a ruleset that fails nft -c must
+// never sit at the live path ExecStartPost loads.
+func TestAPILBStagesNftCandidate(t *testing.T) {
+	vars := lbVars(t)
+	sr := lbRunner()
+	sr.errs["api-local-dnat.nft.candidate"] = true
+	r := newLBHost(t, vars, sr)
+	hostWrite(t, r, "/etc/api-local-dnat.nft", "table ip good {}\n")
+	c := loadCyc(t, r, vars, "node-b")
+	before := c.errs
+	c.groupAPILB()
+	if c.errs == before {
+		t.Fatal("nft -c failure not counted")
+	}
+	if got := hostRead(t, r, "/etc/api-local-dnat.nft"); got != "table ip good {}\n" {
+		t.Fatalf("deploy path clobbered by a rejected ruleset:\n%s", got)
+	}
+	if hostExists(r, "/etc/api-local-dnat.nft.candidate") {
+		t.Fatal("rejected nft candidate left behind")
+	}
+	// deploy aborted before the pin — /etc/hosts untouched.
+	if hosts := hostRead(t, r, "/etc/hosts"); strings.Contains(hosts, "api.test.internal") {
+		t.Fatalf("hosts pinned despite rejected ruleset:\n%s", hosts)
+	}
+}
+
+// TestAPILBPromotesAndSweepsCandidates — valid renders promote via
+// writeManaged and leave no staging files behind.
+func TestAPILBPromotesAndSweepsCandidates(t *testing.T) {
+	vars := lbVars(t)
+	sr := lbRunner()
+	r := newLBHost(t, vars, sr)
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupAPILB()
+	if hostExists(r, "/etc/haproxy/api-local-lb.cfg.candidate") ||
+		hostExists(r, "/etc/api-local-dnat.nft.candidate") {
+		t.Fatal("candidate lingered after promotion")
+	}
+	if len(sr.callsMatching("haproxy -c -f /etc/haproxy/api-local-lb.cfg.candidate")) == 0 {
+		t.Fatalf("haproxy -c did not target the candidate: %v",
+			sr.callsMatching("haproxy"))
+	}
+	if len(sr.callsMatching("nft -c -f /etc/api-local-dnat.nft.candidate")) == 0 {
+		t.Fatalf("nft -c did not target the candidate: %v",
+			sr.callsMatching("nft -c"))
+	}
+}
+
+// TestApplyNftUnitSweepsStaleCandidate — on the unchanged-content
+// path a leftover .candidate from a crashed converge is still swept.
+func TestApplyNftUnitSweepsStaleCandidate(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/guard.nft", "table ip guard {}\n")
+	hostWrite(t, r, "/etc/guard.nft.candidate", "stale from crashed converge\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.applyNftUnit("guard", "/etc/guard.nft", []byte("table ip guard {}\n"), "test guard")
+	if hostExists(r, "/etc/guard.nft.candidate") {
+		t.Fatal("stale candidate not swept on the unchanged path")
+	}
+	if len(sr.callsMatching("nft -c")) > 0 {
+		t.Fatal("unchanged ruleset re-validated — staging must be skipped")
+	}
+}
+
+// ---------- blockInHosts ENOENT ----------
+
+// TestBlockInHostsCreatesWhenMissing — a missing /etc/hosts is not
+// the unreadable case: create it containing just the managed block.
+func TestBlockInHostsCreatesWhenMissing(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.blockInHosts("x-test", "# BEGIN x-test managed block\n1.2.3.4 x\n# END x-test managed block\n")
+	if c.errs != 0 {
+		t.Fatalf("ENOENT hosts counted %d errors — must create instead", c.errs)
+	}
+	if got := hostRead(t, r, "/etc/hosts"); got !=
+		"# BEGIN x-test managed block\n1.2.3.4 x\n# END x-test managed block\n" {
+		t.Fatalf("hosts = %q, want just the managed block", got)
+	}
+}
+
+// ---------- probeReachable IPv6 ----------
+
+// TestProbeReachableIPv6SplitHostPort — a bracketed IPv6 backend addr
+// must parse host/port via net.SplitHostPort (first-colon Cut would
+// mangle [::1]:6443).
+func TestProbeReachableIPv6SplitHostPort(t *testing.T) {
+	vars := writeVarsDir(t, `api_lb_backends:
+  - {name: api_v6, addr: "[::1]:6443", probe: true}
+`)
+	sr := &scriptedRunner{res: map[string]string{
+		"/dev/tcp/::1/6443": "",
+	}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	got := c.probeReachable()
+	if len(got) != 1 || got[0] != "api_v6" {
+		t.Fatalf("probeReachable = %v — bracketed IPv6 must parse", got)
+	}
+	if len(sr.callsMatching("/dev/tcp/::1/6443")) == 0 {
+		t.Fatalf("v6 probe not issued: %v", sr.callsMatching("/dev/tcp"))
+	}
+}
+
+// ---------- required-slot empty values ----------
+
+// TestNebulaRoutingEmptyRequiredIPCounted — node-b has no ip, so the
+// REQUIRED pub/marker slots resolve "". Empty cannot inject, but it
+// emits `src <blank>`/`snat to <blank>` that only fail inside sh -c
+// at Debug level — the *Req gates must count it instead.
+func TestNebulaRoutingEmptyRequiredIPCounted(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	if err := os.WriteFile(filepath.Join(vars, "interdc_nodes.yaml"), []byte(`node-a:
+  name: a
+  ip: 10.0.1.10
+  site: s1
+  hub: true
+node-b:
+  name: b
+  site: s2
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.nebulaRouting()
+	if c.errs == 0 {
+		t.Fatal("empty required ip not counted")
+	}
+	if len(sr.callsMatching("sh -c")) > 0 {
+		t.Fatalf("shell ran with an empty required ip: %v", sr.callsMatching("sh -c"))
+	}
+}
+
+// TestShRequiredGatesCountEmpty — the base gates keep their empty-
+// allowed semantics; only the *Req variants count empty as an error.
+func TestShRequiredGatesCountEmpty(t *testing.T) {
+	c := &cyc{}
+	if !c.shToken("x", "") || !c.shIPCIDR("x", "") || !c.shPort("x", "") {
+		t.Fatal("base gates must keep allowing empty")
+	}
+	if c.shIPCIDRReq("x", "") || c.shPortReq("x", "") {
+		t.Fatal("required gates must refuse empty")
+	}
+	if c.errs != 2 {
+		t.Fatalf("errs = %d, want 2", c.errs)
+	}
+}
+
+// ---------- t7 extra-args hardening ----------
+
+// TestGroupPullsRefusesUnsafeQPS — a vars value with shell metachars
+// interpolated into ExecStart must skip the unit rewrite, not emit a
+// mangled unit.
+func TestGroupPullsRefusesUnsafeQPS(t *testing.T) {
+	vars := writeVarsDir(t, "kubelet_registry_qps: \"2;rm -rf /\"\n")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/systemd/system/k0sworker.service",
+		"[Service]\nExecStart=/usr/bin/k0s worker --data-dir=/var/lib/k0s\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupPulls()
+	if c.errs == 0 {
+		t.Fatal("metachar kubelet_registry_qps not counted")
+	}
+	unit := hostRead(t, r, "/etc/systemd/system/k0sworker.service")
+	if strings.Contains(unit, `\x20`) || strings.Contains(unit, "kubelet-extra-args") {
+		t.Fatalf("unit mutated despite a refused qps value:\n%s", unit)
+	}
+}
+
+// TestGroupPullsUnterminatedExtraArgsQuote — `--kubelet-extra-args="abc`
+// (no closing quote) must error and leave the unit untouched rather
+// than merge flags into a value systemd tokenizes differently.
+func TestGroupPullsUnterminatedExtraArgsQuote(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/systemd/system/k0sworker.service",
+		"[Service]\nExecStart=/usr/bin/k0s worker --data-dir=/var/lib/k0s "+
+			`--kubelet-extra-args="--node-ip=172.29.0.14`+"\n")
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupPulls()
+	if c.errs == 0 {
+		t.Fatal("unterminated --kubelet-extra-args quote not counted")
+	}
+	unit := hostRead(t, r, "/etc/systemd/system/k0sworker.service")
+	if strings.Contains(unit, `\x20`) {
+		t.Fatalf("flags merged into an unterminated value:\n%s", unit)
+	}
+}
+
+// TestT7AppendExtraArgsUnterminated — direct check of the ok flag on
+// open-quote values vs properly quoted/bare ones.
+func TestT7AppendExtraArgsUnterminated(t *testing.T) {
+	if _, ok := t7AppendExtraArgs(`ExecStart=k0s --kubelet-extra-args="abc`, `\x20--x`); ok {
+		t.Fatal("unterminated double-quote accepted")
+	}
+	if _, ok := t7AppendExtraArgs(`ExecStart=k0s --kubelet-extra-args='abc`, `\x20--x`); ok {
+		t.Fatal("unterminated single-quote accepted")
+	}
+	if out, ok := t7AppendExtraArgs(`ExecStart=k0s --kubelet-extra-args="abc"`, `\x20--x`); !ok ||
+		!strings.Contains(out, `--kubelet-extra-args="abc\x20--x"`) {
+		t.Fatalf("quoted append wrong: %q ok=%v", out, ok)
+	}
+	if out, ok := t7AppendExtraArgs(`ExecStart=k0s --kubelet-extra-args=abc`, `\x20--x`); !ok ||
+		!strings.Contains(out, `--kubelet-extra-args=abc\x20--x`) {
+		t.Fatalf("bare append wrong: %q ok=%v", out, ok)
+	}
+}
+
+// ---------- groupNebula disable path ----------
+
+// TestNebulaDisableRunsUnconditionalCleanup — a charset-refused var
+// must only skip the INTERPOLATED sweep; the non-interpolated
+// systemctl disable cleanup still runs.
+func TestNebulaDisableRunsUnconditionalCleanup(t *testing.T) {
+	vars := writeVarsDir(t, "interdc_nebula_enabled: false\ninterdc_marker_base: \"172.29.0;rm -rf /\"\n")
+	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
+	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupNebula()
+	if len(sr.callsMatching("systemctl disable --now nebula@interdc.service")) == 0 {
+		t.Fatal("nebula unit not disabled on the gate-refused path")
+	}
+	if len(sr.callsMatching("systemctl disable --now nebula-route-guard.service")) == 0 {
+		t.Fatal("route-guard not disabled on the gate-refused path")
+	}
+	if len(sr.callsMatching("sh -c")) > 0 {
+		t.Fatalf("interpolated sweep ran with a refused var: %v", sr.callsMatching("sh -c"))
+	}
+	if c.errs == 0 {
+		t.Fatal("refused marker_base not counted")
 	}
 }

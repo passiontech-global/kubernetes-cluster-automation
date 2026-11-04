@@ -232,8 +232,10 @@ func SweepConcourseSharedCache(ctx context.Context, openebsRoot string) error {
 }
 
 // Sweep runs one prune pass over every pvc-*/shared-cache under
-// openebsRoot. The glob is the same pvc-* prefix the orphan sweeper
-// uses; non-pvc dirs and pvc dirs without a shared-cache are skipped
+// openebsRoot. The name check is the orphan sweeper's strict
+// pvc-<uuid> belt (pvcNameRe) — a hand-made pvc-* dir or a stray
+// pvc-* file is not a worker volume and gets no chown/chmod/prune.
+// Non-matching dirs and pvc dirs without a shared-cache are skipped
 // (the script's `[ -d "$SC" ] || exit 0`).
 func (p *ConcourseCachePruner) Sweep(ctx context.Context, openebsRoot string) error {
 	entries, err := os.ReadDir(openebsRoot)
@@ -250,7 +252,7 @@ func (p *ConcourseCachePruner) Sweep(ctx context.Context, openebsRoot string) er
 			p.cycles.WithLabelValues("abort").Inc()
 			return err
 		}
-		if !e.IsDir() || !strings.HasPrefix(e.Name(), "pvc-") {
+		if !e.IsDir() || !pvcNameRe.MatchString(e.Name()) {
 			continue
 		}
 		p.pruneSharedCache(ctx,
@@ -311,9 +313,13 @@ func (p *ConcourseCachePruner) fsPressure(path string) (pct float64, ok bool) {
 	var diskPct, inodePct float64
 	// Free > total wraps uint64 to ~2^64 → a bogus ratio that would
 	// escalate to crit on a healthy fs (btrfs/XFS can report this).
-	// Saturate instead of subtracting blind.
-	if st.Blocks > 0 && st.Bfree <= st.Blocks {
-		diskPct = float64(st.Blocks-st.Bfree) / float64(st.Blocks) * 100
+	// Saturate instead of subtracting blind. The free-side field is
+	// Bavail, not Bfree — blocks reserved for root don't count as
+	// usable by the unprivileged task-container writers this prune
+	// protects, so unprivileged-free is the safer signal (the same
+	// choice workerhygiene's ctr-ingest-GC disk trigger makes).
+	if st.Blocks > 0 && st.Bavail <= st.Blocks {
+		diskPct = float64(st.Blocks-st.Bavail) / float64(st.Blocks) * 100
 	}
 	if st.Files > 0 && st.Ffree <= st.Files {
 		inodePct = float64(st.Files-st.Ffree) / float64(st.Files) * 100
@@ -414,6 +420,7 @@ func (p *ConcourseCachePruner) pruneGoBuild(ctx context.Context, sc string, cfg 
 	}
 	need := sz - cfg.GoBuildLowMark
 	var acc int64
+	var freed int64
 	var failed int
 	var lastErr error
 	for _, f := range filesByAge(dir) {
@@ -424,6 +431,7 @@ func (p *ConcourseCachePruner) pruneGoBuild(ctx context.Context, sc string, cfg 
 		// the awk accumulator — removal failure does not re-run.
 		acc += f.size
 		if err := os.Remove(f.path); err == nil {
+			freed += f.size
 			p.filesDeleted.WithLabelValues("go-build").Inc()
 			p.bytesFreed.Add(float64(f.size))
 		} else {
@@ -435,9 +443,11 @@ func (p *ConcourseCachePruner) pruneGoBuild(ctx context.Context, sc string, cfg 
 		log.Warn("go-build trim removals failed",
 			"files", failed, "error", lastErr)
 	}
+	// freed is the successful-remove total — logging it avoids a
+	// second full-tree du just for the "after" number.
 	log.Info("go-build trimmed",
 		"beforeGiB", float64(sz)/(1<<30),
-		"afterGiB", float64(diskUsage(dir))/(1<<30))
+		"freedGiB", float64(freed)/(1<<30))
 }
 
 // pruneAgeBucket is `find -type f -mtime +N -delete` plus the optional
@@ -508,10 +518,11 @@ func (p *ConcourseCachePruner) deleteEmptyDirs(ctx context.Context, dir string, 
 		}
 		return nil
 	})
-	slices.SortFunc(dirs, func(a, b string) int {
-		return strings.Count(b, string(os.PathSeparator)) -
-			strings.Count(a, string(os.PathSeparator))
-	})
+	// WalkDir visits parents before children (pre-order), so reversed
+	// collection order puts every dir after ALL its descendants —
+	// the same deepest-first collapse the separator-count sort gave,
+	// without materializing a second ordering.
+	slices.Reverse(dirs)
 	var n int
 	for _, d := range dirs {
 		if ctx.Err() != nil {
@@ -535,17 +546,20 @@ func (p *ConcourseCachePruner) capTopLevelDirs(ctx context.Context, sc, bucket s
 	if !isDir(dir) {
 		return
 	}
-	sz := int64(diskUsage(dir))
-	if sz <= high {
+	// ONE walk gives the bucket du AND every first-level dir's share
+	// — the per-candidate diskUsage calls below used to re-walk each
+	// <key>/<cksum> subtree on top of the bucket walk.
+	sz, perDir := diskUsageByTopDir(dir)
+	if int64(sz) <= high {
 		return
 	}
-	need := sz - low
+	need := int64(sz) - low
 	var freed int64
 	for _, d := range topLevelDirsByAge(dir) {
 		if ctx.Err() != nil || freed >= need {
 			break
 		}
-		dsz := int64(diskUsage(d.path))
+		dsz := int64(perDir[filepath.Base(d.path)])
 		if writable {
 			makeWritable(d.path)
 		}
@@ -559,9 +573,11 @@ func (p *ConcourseCachePruner) capTopLevelDirs(ctx context.Context, sc, bucket s
 		// `rm -rf; freed+=dsz` without checking rm's exit.
 		freed += dsz
 	}
+	// freed is the accounted total — logging it avoids a second
+	// full-tree du just for the "after" number.
 	log.Info(bucket+" trimmed",
 		"beforeGiB", float64(sz)/(1<<30),
-		"afterGiB", float64(diskUsage(dir))/(1<<30))
+		"freedGiB", float64(freed)/(1<<30))
 }
 
 // pruneNodeDeps is the node-deps bucket (<cksum> node_modules cache):
@@ -692,6 +708,16 @@ type cacheFile struct {
 	modTime time.Time
 }
 
+// entryBlocks is the du -sk contribution of one walked entry:
+// allocated blocks (st_blocks×512), falling back to apparent size —
+// sparse files measure like du does.
+func entryBlocks(info os.FileInfo) uint64 {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Blocks > 0 {
+		return uint64(st.Blocks) * 512
+	}
+	return uint64(info.Size())
+}
+
 // diskUsage is du -sk×1024: allocated blocks (st_blocks×512) summed
 // over the tree INCLUDING the directories themselves — never apparent
 // size, so sparse files measure like du does.
@@ -705,14 +731,37 @@ func diskUsage(root string) uint64 {
 		if err != nil {
 			return nil
 		}
-		if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Blocks > 0 {
-			total += uint64(st.Blocks) * 512
-		} else {
-			total += uint64(info.Size())
-		}
+		total += entryBlocks(info)
 		return nil
 	})
 	return total
+}
+
+// diskUsageByTopDir is diskUsage plus the per-first-level-component
+// split the size caps need — one tree walk instead of a du per
+// <key>/<cksum> dir. perDir is keyed by the component NAME under
+// root (dirs AND loose files count; the caps only look up dirs).
+func diskUsageByTopDir(root string) (total uint64, perDir map[string]uint64) {
+	perDir = map[string]uint64{}
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		sz := entryBlocks(info)
+		total += sz
+		if rel, rerr := filepath.Rel(root, path); rerr == nil && rel != "." {
+			if i := strings.IndexByte(rel, os.PathSeparator); i >= 0 {
+				rel = rel[:i]
+			}
+			perDir[rel] += sz
+		}
+		return nil
+	})
+	return total, perDir
 }
 
 // filesByAge lists every regular file under root sorted oldest-first —

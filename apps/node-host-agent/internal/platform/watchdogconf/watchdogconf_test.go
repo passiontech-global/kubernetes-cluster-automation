@@ -247,3 +247,63 @@ func TestReloaderSeesRewrites(t *testing.T) {
 		t.Fatalf("missing file backends=%v want empty defaults", got)
 	}
 }
+
+// ${A:-B} falls back on UNSET-OR-EMPTY — an explicitly empty
+// primary does NOT win over a non-empty fallback.
+func TestPickFallsBackOnEmptyPrimary(t *testing.T) {
+	c, err := Parse([]byte("OVERLAY_PROBE_TARGETS=\nTINC_PROBE_TARGETS=10.8.0.9\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c.OverlayProbeTargets, []string{"10.8.0.9"}) {
+		t.Fatalf("empty-primary targets=%v want TINC fallback", c.OverlayProbeTargets)
+	}
+	// Quoted empty behaves the same.
+	c, err = Parse([]byte("OVERLAY_PROBE_TARGETS=\"\"\nTINC_PROBE_TARGETS=10.8.0.9\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c.OverlayProbeTargets, []string{"10.8.0.9"}) {
+		t.Fatalf("quoted-empty-primary targets=%v", c.OverlayProbeTargets)
+	}
+	// And a non-empty primary still wins.
+	c, err = Parse([]byte("OVERLAY_PROBE_TARGETS=10.8.0.1\nTINC_PROBE_TARGETS=10.8.0.9\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c.OverlayProbeTargets, []string{"10.8.0.1"}) {
+		t.Fatalf("primary=%v", c.OverlayProbeTargets)
+	}
+}
+
+// Bash quote removal happens per word: KEY="a"#tail → `a#tail`
+// (mid-word '#' is literal), not the raw `"a"#tail`.
+func TestParseQuotedThenHashTail(t *testing.T) {
+	vars := parseKV("A=\"a\"#comment\nB=\"a\" # comment\nC=x'y'z\nD=''#x\n")
+	for k, want := range map[string]string{
+		"A": "a#comment", // '#' glued to the closing quote is literal
+		"B": "a",         // '#' after whitespace opens the comment
+		"C": "xyz",       // mid-word quote removal
+		"D": "#x",        // empty quoted word + glued '#'
+	} {
+		if vars[k] != want {
+			t.Fatalf("%s=%q want %q", k, vars[k], want)
+		}
+	}
+}
+
+// Bare/bracketed IPv6 backends must keep their full host part —
+// a bare "::1" used to last-colon-chop to ":".
+func TestAPIBackendIPsIPv6(t *testing.T) {
+	c := &Config{APIBackends: []APIBackend{
+		{Name: "b1", Addr: "::1"},
+		{Name: "b2", Addr: "[::1]:6443"},
+		{Name: "b3", Addr: "[fe80::1]"},
+		{Name: "b4", Addr: "10.0.0.1:6443"},
+		{Name: "b5", Addr: "10.0.0.2"},
+	}}
+	want := []string{"::1", "::1", "fe80::1", "10.0.0.1", "10.0.0.2"}
+	if got := c.APIBackendIPs(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ips=%v want %v", got, want)
+	}
+}

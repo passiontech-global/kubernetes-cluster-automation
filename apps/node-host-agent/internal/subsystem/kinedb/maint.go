@@ -36,11 +36,12 @@ func deadTuplePct(dead, live int64) int64 {
 // maintResult captures one maintenance run for emission + tests.
 type maintResult struct {
 	okReindex   bool
-	okRepack    bool   // skip counts as ok — only a ran-and-failed repack flips it
-	repackState string // skipped|done|fail|no-binary
+	okRepack    bool   // skip counts as ok — a ran-and-failed repack (or a failed assessment) flips it
+	repackState string // skipped|done|fail|no-binary|assess-fail
 	heapBytes   int64
 	indexBytes  int64
 	deadPct     int64
+	statsOK     bool // sizes/dead-tuple stats were actually read this run
 	notes       []string
 }
 
@@ -98,11 +99,19 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 			res.heapBytes = heap
 			res.indexBytes = idx
 			res.deadPct = deadTuplePct(dead, live)
+			res.statsOK = true
 		} else {
 			note(fmt.Sprintf("sizes-unparsed: %v", perr))
 		}
 	} else {
 		note(fmt.Sprintf("sizes-fail: %v", err))
+	}
+	if !res.statsOK {
+		// deadPct=0 + heapBytes=0 reads as "not bloated" — a failed
+		// assessment must not skip repack and still report OK.
+		res.okRepack = false
+		res.repackState = "assess-fail"
+		return
 	}
 
 	// (c) pg_repack ONLY when the heap is genuinely bloated —
@@ -127,7 +136,12 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 	}
 	if _, err := k.exec(ctx, k.psqlArgs(pg, user, pass, false,
 		"-qc", "CREATE EXTENSION IF NOT EXISTS pg_repack"), ""); err != nil {
+		// pg_repack cannot run without the extension — attempting
+		// it anyway fails identically and doubles the error noise.
+		res.okRepack = false
+		res.repackState = "fail"
 		note(fmt.Sprintf("repack-ext-fail: %v", err))
+		return
 	}
 	if _, err := k.execLong(ctx, []string{k.cfg.Runtime, "exec",
 		"-e", "PGPASSWORD=" + pass, pg, repackBin,
@@ -164,13 +178,18 @@ func (k *KineDB) emitMaint(res *maintResult) {
 	p.gauge("kine_db_maint_last_run_timestamp_seconds",
 		"Last maintenance run", ts)
 	k.m.maintLastRun.Set(ts)
-	p.gaugeLabels("kine_db_maint_relation_bytes",
-		"Heap/index size of the kine table", `kind="heap"`,
-		float64(res.heapBytes))
-	p.gaugeLabels("kine_db_maint_relation_bytes",
-		"Heap/index size of the kine table", `kind="indexes"`,
-		float64(res.indexBytes))
-	k.m.maintRelBytes.WithLabelValues("heap").Set(float64(res.heapBytes))
-	k.m.maintRelBytes.WithLabelValues("indexes").Set(float64(res.indexBytes))
+	// relation_bytes comes out of the stats read — emitGuard's
+	// statsOK gating applied here too: on assess-fail a fabricated
+	// 0 overwriting a meaningful size is worse than a stale gauge.
+	if res.statsOK {
+		p.gaugeLabels("kine_db_maint_relation_bytes",
+			"Heap/index size of the kine table", `kind="heap"`,
+			float64(res.heapBytes))
+		p.gaugeLabels("kine_db_maint_relation_bytes",
+			"Heap/index size of the kine table", `kind="indexes"`,
+			float64(res.indexBytes))
+		k.m.maintRelBytes.WithLabelValues("heap").Set(float64(res.heapBytes))
+		k.m.maintRelBytes.WithLabelValues("indexes").Set(float64(res.indexBytes))
+	}
 	k.emitTextfile("kine-db-maint.prom", &p)
 }

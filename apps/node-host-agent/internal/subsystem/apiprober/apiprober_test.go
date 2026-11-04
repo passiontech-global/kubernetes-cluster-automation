@@ -30,6 +30,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // fakeHAProxy is a fake HAProxy admin unix socket: `show stat` returns
@@ -1150,6 +1152,30 @@ func TestDiscoverMalformedStat(t *testing.T) {
 		}
 		if len(backends) != 1 || backends[0].Name != "hub2" {
 			t.Fatalf("backends=%v want [hub2]", backends)
+		}
+	})
+
+	t.Run("glued header marker still parses", func(t *testing.T) {
+		// "#pxname" (no space after the marker): the old
+		// TrimPrefix("# ") left the header unparsed — pxname never
+		// mapped and every row silently skipped.
+		csv := "#pxname,svname,status,addr\nkube_apiserver,hub1,UP,10.0.0.1:6443\n"
+		backends, err := mkProber(t, csv).discover(context.Background())
+		if err != nil {
+			t.Fatalf("discover err=%v want nil", err)
+		}
+		if len(backends) != 1 || backends[0].Name != "hub1" {
+			t.Fatalf("backends=%v want [hub1]", backends)
+		}
+	})
+
+	t.Run("missing required column is fatal", func(t *testing.T) {
+		// A header without pxname/svname/status is a schema break —
+		// error instead of silently discovering zero backends.
+		csv := "# pxname,svname\nkube_apiserver,hub1\n"
+		if _, err := mkProber(t, csv).discover(context.Background()); err == nil ||
+			!strings.Contains(err.Error(), "missing") {
+			t.Fatalf("discover err=%v want 'missing column'", err)
 		}
 	})
 }
@@ -2666,6 +2692,59 @@ func TestWithDefaultPort(t *testing.T) {
 		if got := withDefaultPort(in); got != want {
 			t.Fatalf("withDefaultPort(%q)=%q want %q", in, got, want)
 		}
+	}
+}
+
+func TestCycleStaticsClearedAfterCycle(t *testing.T) {
+	// cycleStatics is a Cycle-scoped snapshot by contract: outside
+	// Cycle it must be nil so staticAddr resolves FRESH via
+	// statics() (direct discover calls in tests rely on it). A
+	// snapshot left behind would serve the last cycle's conf to
+	// out-of-Cycle callers forever.
+	confPath := filepath.Join(t.TempDir(), "node-watchdog.conf")
+	writeConf := func(s string) {
+		if err := os.WriteFile(confPath, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConf("API_BACKENDS=\"old=10.0.0.9:6443\"\n")
+
+	ha := newFakeHAProxy(t, [2]string{"hub1", "10.0.0.1:6443"})
+	// TCP preflight fails for every backend → the cycle completes
+	// without real apiserver probes (query timeouts would make the
+	// test wait on the wall clock).
+	p := fixture(t, ha, ModeDryRun,
+		map[string]bool{"10.0.0.1:6443": false, "10.0.0.9:6443": false})
+	p.cfg.WatchdogSrc = watchdogconf.NewReloader(confPath, nil)
+
+	p.Cycle(context.Background())
+	if p.cycleStatics != nil {
+		t.Fatal("cycleStatics retained a stale snapshot after Cycle")
+	}
+	// A conf edit after the cycle must resolve NOW — serving the
+	// cycle's snapshot is exactly the staleness the clear prevents.
+	writeConf("API_BACKENDS=\"new=10.0.0.8:6443\"\n")
+	if got := p.staticAddr("new"); got != "10.0.0.8:6443" {
+		t.Fatalf("staticAddr(new)=%q want 10.0.0.8:6443 — stale snapshot served", got)
+	}
+	if got := p.staticAddr("old"); got != "" {
+		t.Fatalf("staticAddr(old)=%q want \"\" — conf edit not re-read", got)
+	}
+
+	// Early-return path: a missing socket gates the cycle BEFORE
+	// discover — the defer must still drop the snapshot.
+	p2, err := New(Config{
+		SocketPath:  filepath.Join(t.TempDir(), "absent.sock"),
+		BackendName: "kube_apiserver",
+		Mode:        ModeDryRun,
+		HTTPClient:  newAPIStub(t).srv.Client(),
+	}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2.Cycle(context.Background())
+	if p2.cycleStatics != nil {
+		t.Fatal("cycleStatics retained a stale snapshot after a gated cycle")
 	}
 }
 

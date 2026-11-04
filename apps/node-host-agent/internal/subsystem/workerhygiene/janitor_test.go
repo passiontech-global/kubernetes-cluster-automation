@@ -145,14 +145,23 @@ func fileExists(path string) bool {
 
 // --- A: latch reaper ---
 
-func TestJanitorReapsUnknownLatchImmediately(t *testing.T) {
+func TestJanitorReapsUnknownLatchAfterMaxAge(t *testing.T) {
 	e := jfixture(t)
-	// Fresh file, name no current check produces — the removed/
-	// renamed-check case. Reaped regardless of age.
-	writeFile(t, filepath.Join(e.state, "state-tinc-route-lost"), "1\n")
+	// Name no current check produces — the removed/renamed-check
+	// case. FRESH unknowns survive the sweep: a foreign-schema
+	// writer (retired legacy unit, old binary) would flap on an
+	// instant reap — its rewrites keep the mtime young, and the
+	// orphan is only reaped once it has stayed stale for max-age.
+	fresh := filepath.Join(e.state, "state-tinc-route-lost")
+	writeFile(t, fresh, "1\n")
 	e.j.Sweep(context.Background())
-	if fileExists(filepath.Join(e.state, "state-tinc-route-lost")) {
-		t.Fatal("unknown latch survived sweep")
+	if !fileExists(fresh) {
+		t.Fatal("fresh unknown latch reaped — age floor broken")
+	}
+	ageFile(t, fresh, 25*time.Hour)
+	e.j.Sweep(context.Background())
+	if fileExists(fresh) {
+		t.Fatal("aged unknown latch survived sweep")
 	}
 	if !e.logContains(t, "ACTION: reaped stale latch state-tinc-route-lost") {
 		t.Fatal("missing ACTION reaped log line")
@@ -258,7 +267,9 @@ func TestJanitorMissingStateDirAbortsCleanly(t *testing.T) {
 
 func TestJanitorMetricsBumpOnReap(t *testing.T) {
 	e := jfixture(t)
-	writeFile(t, filepath.Join(e.state, "state-bogus-old-check"), "1\n")
+	p := filepath.Join(e.state, "state-bogus-old-check")
+	writeFile(t, p, "1\n")
+	ageFile(t, p, 25*time.Hour) // unknown names reap past max-age too
 	e.j.Sweep(context.Background())
 	if got := testutil.ToFloat64(
 		e.j.actions.WithLabelValues(checkLatchReaper, "reap")); got != 1 {
@@ -336,7 +347,9 @@ func TestJanitorUnitsSweepGatedWithoutSystemd(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.j = j
-	writeFile(t, filepath.Join(e.state, "state-ghost-from-old-check"), "1\n")
+	p := filepath.Join(e.state, "state-ghost-from-old-check")
+	writeFile(t, p, "1\n")
+	ageFile(t, p, 25*time.Hour) // past max-age — reaps unknown names too
 
 	e.j.Sweep(context.Background())
 

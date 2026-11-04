@@ -234,6 +234,11 @@ TasksMax=infinity
 			}
 		}
 	} else {
+		// Glue guard: a hosts file without a trailing newline must
+		// not fuse the pin onto the last existing line.
+		if len(hosts) > 0 && hosts[len(hosts)-1] != '\n' {
+			hosts = append(hosts, '\n')
+		}
 		nh := append(hosts, []byte(line+"\n")...)
 		r.writeManaged("/etc/hosts", nh, 0o644)
 	}
@@ -307,7 +312,9 @@ func (c *cyc) journaldIntegrity() {
 	// more than once per cooldown window.
 	r.ensureDir(watchdogStateDir, 0o755)
 	r.rateSpend("last-journald-rotate")
-	if vout, verr := r.run(ctx, "journalctl", "--rotate", "--vacuum-time=3d"); verr != nil {
+	// runLong: vacuum of a multi-GB journal on a slow disk blows past
+	// the interactive command budget.
+	if vout, verr := r.runLong(ctx, "journalctl", "--rotate", "--vacuum-time=3d"); verr != nil {
 		c.err("base: journalctl rotate/vacuum failed",
 			"out", vout, "error", verr)
 	}
@@ -463,18 +470,20 @@ func (c *cyc) groupNLD() {
 					"path", "/run/systemd/resolve/resolv.conf")
 				refuse = true
 			} else {
-				// repoint symlink
+				// repoint symlink — atomic: create the symlink at a
+				// temp name in the same dir then rename over, so a
+				// failure never leaves a window with no resolv.conf.
 				dst := r.hp("/etc/resolv.conf")
 				fi, _ := os.Lstat(dst)
 				if fi == nil || fi.Mode()&os.ModeSymlink == 0 ||
 					func() bool { l, _ := os.Readlink(dst); return l != "/run/systemd/resolve/resolv.conf" }() {
-					if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-						// Best-effort pre-clean — a failed remove is
-						// covered by the Symlink error counted below.
-						slog.Warn("T4: resolv.conf remove before repoint failed",
+					tmp := dst + ".hostconfig.tmp"
+					os.Remove(tmp) // stale temp from a crashed converge
+					if err := os.Symlink("/run/systemd/resolve/resolv.conf", tmp); err != nil {
+						c.err("T4: resolv.conf temp symlink failed — DNS not repointed",
 							"path", dst, "error", err)
-					}
-					if err := os.Symlink("/run/systemd/resolve/resolv.conf", dst); err != nil {
+					} else if err := os.Rename(tmp, dst); err != nil {
+						os.Remove(tmp)
 						c.err("T4: resolv.conf symlink repoint failed — DNS not repointed",
 							"path", dst, "error", err)
 					}
@@ -525,16 +534,64 @@ table ip nodelocaldns_guard {
 	r.removeManaged("/etc/nftables.d/nodelocaldns-guard.nft")
 }
 
+// checkedDeploy is the candidate-staging validate-then-promote half
+// of applyNftUnit, shared by the haproxy/nft deploys in groupAPILB:
+// content is written to path+".candidate", the check command runs
+// against the CANDIDATE (its name appended to check argv), and only a
+// passing candidate is promoted to path via writeManaged — a bad
+// render therefore never sits at the live path where the unit loads
+// it on next start. The candidate is swept on every outcome.
+//
+// An unchanged file skips staging entirely (it was validated the
+// cycle it was promoted) but still sweeps a stale candidate a crashed
+// converge left behind.
+//
+// Returns (changed, ok): ok=false means the stage write or check
+// failed — already counted (writeManaged's noteErr or the counted
+// c.err here carrying errMsg) and the caller must abort the deploy.
+func (c *cyc) checkedDeploy(path string, content []byte, mode os.FileMode, errMsg string, check ...string) (changed, ok bool) {
+	r, ctx := c.r, c.ctx
+	changed = true
+	if old, err := os.ReadFile(r.hp(path)); err == nil &&
+		sha256.Sum256(old) == sha256.Sum256(content) {
+		changed = false
+	}
+	if !changed {
+		// Cheap sweep, ENOENT ignored — a candidate orphaned between
+		// stage and promote must not linger next to the live file.
+		if err := os.Remove(r.hp(path + ".candidate")); err != nil && !os.IsNotExist(err) {
+			slog.Warn("hostconfig: stale candidate sweep failed",
+				"path", path+".candidate", "error", err)
+		}
+		return false, true
+	}
+	cand := path + ".candidate"
+	if _, err := r.writeManaged(cand, content, mode); err != nil {
+		return false, false // writeManaged counted the failure via noteErr
+	}
+	if out, err := r.run(ctx, check[0], append(check[1:], cand)...); err != nil {
+		c.err(errMsg,
+			"path", path, "candidate", cand,
+			"check", strings.Join(check, " "), "out", out, "error", err)
+		r.removeManaged(cand)
+		return false, false
+	}
+	changed, _ = r.writeManaged(path, content, mode)
+	r.removeManaged(cand)
+	return changed, true
+}
+
 // applyNftUnit deploys an nft ruleset + its oneshot boot unit, applies
 // via restart when the file changed (T4/T11 pattern).
 func (c *cyc) applyNftUnit(name, path string, content []byte, desc string) {
 	r, ctx := c.r, c.ctx
-	ch, _ := r.writeManaged(path, content, 0o644)
-	// ansible: nft -c -f <file> after deploy — an invalid ruleset fails
-	// the run here and the unit keeps serving the LAST GOOD file.
-	if out, err := r.run(ctx, "nft", "-c", "-f", path); err != nil {
-		c.err("nft ruleset failed nft -c — boot unit left on last good file",
-			"path", path, "unit", name+".service", "out", out, "error", err)
+	// `nft -c` runs on the CANDIDATE — writeManaged must only ever
+	// land a validated ruleset at the deploy path, or a broken render
+	// would persist where the oneshot unit loads it at boot.
+	ch, ok := c.checkedDeploy(path, content, 0o644,
+		"nft ruleset failed nft -c — deploy path keeps the last good file",
+		"nft", "-c", "-f")
+	if !ok {
 		return
 	}
 	unitPath := "/etc/systemd/system/" + name + ".service"
@@ -579,10 +636,20 @@ func (c *cyc) groupNebula() {
 
 	if !enabled || !t.Found {
 		// disable path — ansible: stop+disable then sweep the
-		// nebula-owned ip rules and flush BOTH policy tables.
-		pub, mark := c.tablePub(), c.tableMark()
+		// nebula-owned ip rules and flush BOTH policy tables. The
+		// systemctl cleanup interpolates nothing, so it runs even
+		// when a vars value would fail the charset gate below.
 		r.run(ctx, "systemctl", "disable", "--now", "nebula-route-guard.service")
 		r.run(ctx, "systemctl", "disable", "--now", unit)
+		pub, mark := c.tablePub(), c.tableMark()
+		// Vars land unquoted inside the sh -c below — charset-gate
+		// before building the command (nebulaRouting does the same);
+		// a refused value skips ONLY the interpolated sweep.
+		if !(c.shToken("interdc_nebula_table_pub", pub) &&
+			c.shToken("interdc_nebula_table_marker", mark) &&
+			c.shMarkerBase("interdc_marker_base", c.markerBase())) {
+			return
+		}
 		r.run(ctx, "sh", "-c", fmt.Sprintf(
 			`ip rule list pref 1500 | sed -n "s/.*to \([0-9./]*\).*/\1/p" | while read -r d; do ip rule del pref 1500 to "$d" lookup %s 2>/dev/null; done; `+
 				`ip rule del pref 1490 to %s.0/24 lookup %s 2>/dev/null; `+
@@ -607,17 +674,19 @@ func (c *cyc) groupNebula() {
 	certFile := func(name string) (string, bool) {
 		for _, d := range []string{r.cfg.NebulaCertsDir, r.cfg.VarsDir} {
 			p := filepath2(d, name)
-			if _, err := os.Stat(p); err == nil {
-				b, err := os.ReadFile(p)
-				if err != nil {
-					// Best-effort read — "unreadable" degrades to
-					// "missing", and the missing-cert error below
-					// is what counts the group.
-					slog.Warn("T5b: cert file unreadable — treated as missing",
-						"path", p, "error", err)
-				}
-				return string(b), err == nil
+			if _, err := os.Stat(p); err != nil {
+				continue
 			}
+			b, err := os.ReadFile(p)
+			if err != nil {
+				// An unreadable hit must NOT shadow the VarsDir
+				// fallback — keep looking; if nothing reads, the
+				// missing-cert error below counts the group.
+				slog.Warn("T5b: cert file unreadable — trying fallback dir",
+					"path", p, "error", err)
+				continue
+			}
+			return string(b), true
 		}
 		return "", false
 	}
@@ -736,14 +805,17 @@ func filepath2(dir, name string) string {
 // nebulaInstallBinary ports the version-check + tarball install path.
 func (c *cyc) nebulaInstallBinary() {
 	r, ctx := c.r, c.ctx
-	bin := r.hp("/usr/local/bin/nebula")
-	need := true
-	if out, err := r.run(ctx, "/usr/local/bin/nebula", "-version"); err == nil &&
-		strings.Contains(out, c.v("interdc_nebula_version")) {
-		need = false
+	ver := c.v("interdc_nebula_version")
+	if ver == "" || ver == "None" {
+		// An empty pin is NOT a match — strings.Contains(out, "") is
+		// vacuously true (would pin any installed version forever)
+		// and download("") is a counted bogus fetch. Not pinned =
+		// not installed.
+		c.err("T5b: interdc_nebula_version not pinned — nebula not installed")
+		return
 	}
-	if !need {
-		_ = bin
+	if out, err := r.run(ctx, "/usr/local/bin/nebula", "-version"); err == nil &&
+		strings.Contains(out, ver) {
 		return
 	}
 	tgzFile := c.v("interdc_nebula_tgz_file")
@@ -758,7 +830,7 @@ func (c *cyc) nebulaInstallBinary() {
 				"file", local, "sha256", sum)
 			return
 		}
-	} else if err := download(ctx, url, local, sum); err != nil {
+	} else if err := r.download(ctx, url, local, sum); err != nil {
 		c.err("T5b: nebula tarball download", "url", url, "file", local, "error", err)
 		return
 	}
@@ -995,6 +1067,32 @@ func (c *cyc) nebulaRouting() {
 	pubIP := nodeIPStr(t.Node, "ip") // interdc_nebula_node.ip (public)
 	mkIP := t.Markers[t.MeshName]    // registry marker
 	nodeIPV := nodeIP(c)             // --node-ip or hub marker
+
+	// Every value below lands unquoted inside `sh -c` command strings
+	// — several inside sed/grep patterns where quoting would corrupt
+	// the match. Charset/shape-gate them all BEFORE building commands
+	// so a malformed var can never become shell metachars. pubIP/mkIP
+	// use the *Req variant: they are REQUIRED route/SNAT sources, and
+	// an empty pass there is not "cannot inject" — it emits
+	// `src <blank>`/`snat to <blank>` that fails only inside the
+	// shell at Debug level.
+	safe := c.shToken("interdc_nebula_dev", dev) &&
+		c.shToken("interdc_nebula_table_pub", pub) &&
+		c.shToken("interdc_nebula_table_marker", mark) &&
+		c.shMarkerBase("interdc_marker_base", mb) &&
+		c.shIPCIDRReq("node public ip", pubIP) &&
+		c.shIPCIDRReq("node marker ip", mkIP) &&
+		c.shIPCIDR("node ip", nodeIPV) &&
+		c.shPort("interdc_nebula_port", port(c))
+	for _, tgt := range append(append([]string{}, t.Targets...), t.EgressRelays...) {
+		safe = c.shIPCIDR("routing target", tgt) && safe
+	}
+	for _, e := range t.RelayMap[t.MeshName] {
+		safe = c.shIPCIDR("relay ip", e.IP) && safe
+	}
+	if !safe {
+		return
+	}
 
 	// Hub hairpin prune (hub_converge.yaml, incident 2026-09-16): a
 	// stale static route in table main sending a target IP via ANOTHER

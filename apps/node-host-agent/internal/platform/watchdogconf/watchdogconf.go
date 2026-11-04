@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -119,6 +120,11 @@ func parseScalar(v string) string {
 // word is literal (KEY="a # b" → `a # b`, KEY=a#b → `a#b`), and a
 // comment after a quoted value is stripped too (KEY="a b" # note →
 // `a b`) — bash `source` parity.
+//
+// Quote characters are consumed as they open/close — bash quote
+// removal happens per word, so KEY="a"#tail yields `a#tail` (the
+// mid-word '#' stays literal) rather than the raw `"a"#tail` a
+// whole-value quote-strip could never see.
 func parseValue(val string) string {
 	var out strings.Builder
 	out.Grow(len(val))
@@ -127,17 +133,18 @@ func parseValue(val string) string {
 	for i := 0; i < len(val); i++ {
 		ch := val[i]
 		if quote != 0 {
-			out.WriteByte(ch)
 			if ch == quote {
 				quote = 0
+				continue // closing quote consumed
 			}
+			out.WriteByte(ch)
 			continue
 		}
 		switch ch {
 		case '"', '\'':
 			quote = ch
 			wordStart = false
-			out.WriteByte(ch)
+			// opening quote consumed — content follows
 		case ' ', '\t':
 			wordStart = true
 			out.WriteByte(ch)
@@ -188,9 +195,9 @@ func wordList(v string) []string {
 	return out
 }
 
-// pick returns vars[primary] if set (even empty-string set? bash's
-// ${A:-${B:-}} only falls back on UNSET-or-empty — mirror that: an
-// explicitly empty primary wins over a non-empty fallback).
+// pick mirrors bash's ${A:-${B:-}}: the fallback applies when A is
+// UNSET **or** empty — an explicitly empty primary does NOT win
+// over a non-empty fallback.
 func pick(vars map[string]string, primary, fallback string) string {
 	if v, ok := vars[primary]; ok && v != "" {
 		return v
@@ -409,6 +416,11 @@ func (c *Config) APIBackendIPs() []string {
 		host := b.Addr
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
+		} else if a, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+			// Bare or bracketed IPv6/IPv4 without a port — a bare
+			// "::1" must not fall through to the last-colon chop
+			// below (that yields ":").
+			host = a.String()
 		} else if i := strings.LastIndexByte(host, ':'); i >= 0 {
 			host = host[:i] // "ip:port" that SplitHostPort still rejected
 		}
@@ -445,7 +457,9 @@ func NewReloader(path string, initial *Config) *Reloader {
 }
 
 // Get returns the freshest parse of Path, falling back to the last
-// good config on read/parse errors.
+// good config on read/parse errors. The returned *Config is SHARED
+// across callers and retained by the reloader — consumers must not
+// mutate it.
 func (r *Reloader) Get() *Config {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -71,8 +71,13 @@ func (l *lease) renew(ctx context.Context) (bool, error) {
 	mt := metav1.NewMicroTime(now)
 	switch {
 	case holder == l.identity:
-		// Heartbeat.
+		// Heartbeat — also adopt a changed configured duration,
+		// which would otherwise only take effect on takeover.
 		cur.Spec.RenewTime = &mt
+		if cur.Spec.LeaseDurationSeconds == nil ||
+			*cur.Spec.LeaseDurationSeconds != durSec {
+			cur.Spec.LeaseDurationSeconds = &durSec
+		}
 		if _, err := l.leases.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
 			return false, fmt.Errorf("renew lease: %w", err)
 		}

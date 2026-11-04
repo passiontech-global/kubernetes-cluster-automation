@@ -48,6 +48,7 @@
 package kinedb
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -127,18 +128,26 @@ var (
 	// (postgres-percona -> percona-postgres broke every check,
 	// incident 2026-10-01). Only used when the configured names do
 	// not inspect.
-	rePGName     = regexp.MustCompile(`(?i)percona|postgres`)
-	rePGExclude  = regexp.MustCompile(`(?i)cleanup|pgbouncer`)
-	rePGBName    = regexp.MustCompile(`(?i)pgbouncer|pgb`)
-	rePGBLogErr  = regexp.MustCompile(`server_login_retry|password authentication failed|pooler error`)
-	reDeleted    = regexp.MustCompile(`deleted=([0-9]+)`)
+	rePGName    = regexp.MustCompile(`(?i)percona|postgres`)
+	rePGExclude = regexp.MustCompile(`(?i)cleanup|pgbouncer`)
+	rePGBName   = regexp.MustCompile(`(?i)pgbouncer|pgb`)
+	rePGBLogErr = regexp.MustCompile(`server_login_retry|password authentication failed|pooler error`)
+	reDeleted   = regexp.MustCompile(`deleted=([0-9]+)`)
+	// Table is Sprintf'd into SQL identifiers and quoted literals
+	// all over the probe/guard/maint queries — only a plain SQL
+	// identifier is safe to interpolate.
+	reTableIdent = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 	repackGlob   = `ls /usr/pgsql-*/bin/pg_repack /usr/lib/postgresql/*/bin/pg_repack 2>/dev/null | head -1`
 	pgbAdminDB   = "pgbouncer" // SHOW POOLS lives on the admin console db
 	poolDatabase = "postgres"  // the pool kine draws server conns from
 )
 
 // runner executes argv with optional stdin — the single command seam
-// (podman/docker exec, logs, inspect). Default is exec.CommandContext.
+// (podman/docker exec, logs, inspect). The default wires
+// exec.CommandContext and returns CLEAN stdout: stderr is captured
+// separately — folded into the error on failure, debug-logged on
+// success — so psql WARNING/NOTICE/version-skew lines cannot poison
+// the exact-match stdout parsers.
 type runner func(ctx context.Context, argv []string, stdin string) (string, error)
 
 // Config carries the kinedb knobs — all test-injectable.
@@ -185,7 +194,7 @@ type Config struct {
 	wireFn func(ctx context.Context, addr string) bool
 }
 
-func (c *Config) applyDefaults() {
+func (c *Config) applyDefaults() error {
 	if c.ProbeInterval <= 0 {
 		c.ProbeInterval = defaultProbeInterval
 	}
@@ -225,6 +234,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Table == "" {
 		c.Table = defaultTable
+	}
+	if !reTableIdent.MatchString(c.Table) {
+		return fmt.Errorf("kinedb: Table %q is not a plain SQL identifier", c.Table)
 	}
 	if c.WaitMax <= 0 {
 		c.WaitMax = defaultWaitMax
@@ -277,7 +289,22 @@ func (c *Config) applyDefaults() {
 			if stdin != "" {
 				cmd.Stdin = strings.NewReader(stdin)
 			}
-			out, err := cmd.CombinedOutput()
+			// stderr stays out of the returned output — the same
+			// split as etcdrescue's CmdRunner. A psql WARNING or a
+			// "server version" notice on stderr would otherwise
+			// merge into stdout and break the `== "1"` and a|b|c
+			// parsers.
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			out, err := cmd.Output()
+			serr := strings.TrimSpace(stderr.String())
+			switch {
+			case err != nil && serr != "":
+				return string(out), fmt.Errorf("%w: %s", err, serr)
+			case serr != "":
+				slog.Debug("kinedb command stderr",
+					"cmd", argv[0], "stderr", serr)
+			}
 			return string(out), err
 		}
 	}
@@ -286,6 +313,7 @@ func (c *Config) applyDefaults() {
 			return pgWireProbe(ctx, addr, pgWireTimeout)
 		}
 	}
+	return nil
 }
 
 // metrics holds every collector mirrored into the textfiles.
@@ -414,13 +442,23 @@ type KineDB struct {
 
 // New returns a KineDB and registers its metrics on reg.
 func New(cfg Config, reg prometheus.Registerer) (*KineDB, error) {
-	cfg.applyDefaults()
+	if err := cfg.applyDefaults(); err != nil {
+		return nil, err
+	}
 	k := &KineDB{cfg: cfg, m: newMetrics()}
 	if reg != nil {
+		var done []prometheus.Collector
 		for _, c := range k.m.collectors() {
 			if err := reg.Register(c); err != nil {
+				// Roll back the partial registration — without it
+				// a retry of New() hits duplicate-registration on
+				// the collectors that did succeed.
+				for _, r := range done {
+					reg.Unregister(r)
+				}
 				return nil, fmt.Errorf("register kinedb metrics: %w", err)
 			}
+			done = append(done, c)
 		}
 	}
 	return k, nil
@@ -635,21 +673,48 @@ func (k *KineDB) creds() (user, pass string, ok bool) {
 	return user, pass, user != "" && pass != ""
 }
 
-// envValue extracts KEY=value, removing the chars the bash
-// `tr -d "\"' "` deleted — every quote and space, not just the edges.
+// shq single-quotes a shell word — the one place a configured name
+// reaches a `sh -c` STRING (probeLogScan's runtime+container) must
+// not let a stray space or metachar split or glob the command.
+func shq(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// envValue extracts KEY=value from .env content the way dotenv does:
+// an optional `export ` prefix, a value that may be wrapped in one
+// quote pair (only the wrapping pair is stripped — inner quotes,
+// spaces and '#' stay literal), and a trailing ` # comment` on bare
+// values. The bash `tr -d "\"' "` deleted every quote and space
+// INSIDE the value too, silently corrupting credentials that
+// legitimately contain them.
 func envValue(data, key string) string {
 	prefix := key + "="
 	for _, l := range strings.Split(data, "\n") {
-		if strings.HasPrefix(l, prefix) {
-			v := strings.TrimPrefix(l, prefix)
-			return strings.Map(func(r rune) rune {
-				switch r {
-				case '"', '\'', ' ':
-					return -1
-				}
-				return r
-			}, v)
+		l = strings.TrimSpace(l)
+		l = strings.TrimPrefix(l, "export ")
+		if !strings.HasPrefix(l, prefix) {
+			continue
 		}
+		v := strings.TrimSpace(strings.TrimPrefix(l, prefix))
+		if v == "" {
+			return ""
+		}
+		if v[0] == '"' || v[0] == '\'' {
+			// Quoted value: content runs to the matching closer;
+			// anything after it (a trailing comment) is dropped.
+			if end := strings.LastIndexByte(v[1:], v[0]); end >= 0 {
+				return v[1 : 1+end]
+			}
+			// Unmatched opener: the bash `tr -d "\"' "` stripped
+			// the leading quote too — drop it for parity rather
+			// than smuggling it into the credential.
+			return v[1:]
+		}
+		// Bare value: ` #` opens a comment.
+		if i := strings.Index(v, " #"); i >= 0 {
+			v = v[:i]
+		}
+		return strings.TrimSpace(v)
 	}
 	return ""
 }
@@ -697,10 +762,25 @@ func writeTextfileAtomic(dir, name string, content []byte) error {
 		tmp.Close()
 		return err
 	}
+	// fsync the payload before the rename — without it a crash can
+	// leave a renamed-but-empty file behind.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), filepath.Join(dir, name))
+	if err := os.Rename(tmp.Name(), filepath.Join(dir, name)); err != nil {
+		return err
+	}
+	// fsync the directory so the rename itself is durable.
+	if d, err := os.Open(dir); err == nil {
+		err = d.Sync()
+		_ = d.Close()
+		return err
+	}
+	return nil
 }
 
 // promBuf accumulates HELP/TYPE/sample lines for one textfile.

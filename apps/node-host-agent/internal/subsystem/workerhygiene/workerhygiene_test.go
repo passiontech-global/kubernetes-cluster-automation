@@ -444,6 +444,29 @@ func TestForceDeleteCap(t *testing.T) {
 	}
 }
 
+// TestTeardownAbortOnUnreadableTaskRoot is the fail-closed guard:
+// with the ctr task root unlistable the map cannot prove "zero live
+// tasks", so a Terminating pod must NOT be force-deleted — the cycle
+// is inconclusive (checkCtrTasks unreadable-root parity).
+func TestTeardownAbortOnUnreadableTaskRoot(t *testing.T) {
+	e := fixture(t)
+	p := terminatingPod(e, "stuck-pod", "default", uidA, 20*time.Minute)
+	if _, err := e.cs.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// Root gone entirely — on a live worker it should exist.
+	if err := os.RemoveAll(e.ctr); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	if n := len(deleteActions(e.cs)); n != 0 {
+		t.Fatalf("deletes=%d want 0 on unreadable task root", n)
+	}
+	if !strings.Contains(logLines(t, e), "task map incomplete") {
+		t.Fatalf("missing incomplete-map log:\n%s", logLines(t, e))
+	}
+}
+
 func TestWedgeLatchLiveTask(t *testing.T) {
 	e := fixture(t)
 	p := terminatingPod(e, "wedged", "default", uidA, 40*time.Minute)
@@ -750,6 +773,28 @@ func TestDNSResolvNonRunningAndJobNameSkipped(t *testing.T) {
 	}
 }
 
+// TestDNSResolvSkipsForeignNamespace is the kube-system pin: a user
+// pod named coredns-*/node-local-dns-* outside kube-system matches
+// the name regex but is never a pause-kill target.
+func TestDNSResolvSkipsForeignNamespace(t *testing.T) {
+	e := fixture(t)
+	writeFile(t, e.resv, "nameserver 10.96.0.10\n")
+	p := dnsPod(e, "coredns-abc12-def34", uidA)
+	p.Namespace = "default"
+	if _, err := e.cs.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	e.mkProc(t, 8005, "S", "", "")
+	e.mkTask(t, uidA, "pause", 8005)
+	writeFile(t, filepath.Join(e.proc, "8005", "root/etc/resolv.conf"), "nameserver 8.8.8.8\n")
+
+	e.h.Cycle(context.Background())
+	e.h.Cycle(context.Background())
+	if len(e.kills) != 0 {
+		t.Fatal("foreign-namespace coredns-named pod pause killed")
+	}
+}
+
 // --- plumbing ---
 
 func TestStateEnterExitTransitionLogsOnce(t *testing.T) {
@@ -812,6 +857,31 @@ func TestName(t *testing.T) {
 	e := fixture(t)
 	if e.h.Name() != "workerhygiene" {
 		t.Fatalf("Name()=%q want workerhygiene", e.h.Name())
+	}
+}
+
+// TestNewRequiresClient: a nil Clientset would nil-pointer panic on
+// the first Cycle LIST — New must reject it (never-panic contract).
+func TestNewRequiresClient(t *testing.T) {
+	if _, err := New(Config{}, nil); err == nil {
+		t.Fatal("New accepted a nil Client")
+	}
+}
+
+// TestWithDefaultAPIPort covers the backend port defaulting — the
+// trailing-colon form ("1.2.3.4:") previously passed through into a
+// malformed URL that failed every /livez probe silently.
+func TestWithDefaultAPIPort(t *testing.T) {
+	for in, want := range map[string]string{
+		"1.2.3.4":      "1.2.3.4:6443",
+		"1.2.3.4:":     "1.2.3.4:6443",
+		"1.2.3.4:7443": "1.2.3.4:7443",
+		"[::1]:6443":   "[::1]:6443",
+		"[::1]:":       "[::1]:6443",
+	} {
+		if got := withDefaultAPIPort(in); got != want {
+			t.Fatalf("withDefaultAPIPort(%q)=%q want %q", in, got, want)
+		}
 	}
 }
 
@@ -1150,6 +1220,57 @@ func TestKubeletWatchWedgeAPIFailKeepsLatch(t *testing.T) {
 	}
 }
 
+// TestKubeletWatchWedgePodsDirGoneInconclusive: with the pods ROOT
+// itself gone/unreadable every per-pod stat fails and ALL pods would
+// count "missing" — the sweep must abort instead of latching a false
+// wedge and spending a k0sworker restart on a filesystem blip.
+func TestKubeletWatchWedgePodsDirGoneInconclusive(t *testing.T) {
+	e := fixture(t)
+	p := assignedPod(e, "unseen", uidA, 20*time.Minute)
+	if _, err := e.cs.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(e.kubepods); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	e.h.Cycle(context.Background())
+	if _, err := os.Stat(filepath.Join(e.state, "state-kubelet-watch-wedge")); !os.IsNotExist(err) {
+		t.Fatal("wedge latch on unstatable pods dir")
+	}
+	if e.sdRan("restart k0sworker.service") {
+		t.Fatal("restart spent on unstatable pods dir")
+	}
+}
+
+// TestKubeletWatchWedgePodsDirIsFileInconclusive: a REGULAR FILE at
+// the pods-root path stats cleanly but every per-pod join then fails
+// ENOTDIR — ALL assigned pods would count "missing" → the same false
+// wedge + wasted k0sworker restart as the dir-gone case. The IsDir
+// guard takes the same inconclusive path.
+func TestKubeletWatchWedgePodsDirIsFileInconclusive(t *testing.T) {
+	e := fixture(t)
+	p := assignedPod(e, "unseen", uidA, 20*time.Minute)
+	if _, err := e.cs.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(e.kubepods); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, e.kubepods, "not a dir\n")
+	e.h.Cycle(context.Background())
+	e.h.Cycle(context.Background())
+	if _, err := os.Stat(filepath.Join(e.state, "state-kubelet-watch-wedge")); !os.IsNotExist(err) {
+		t.Fatal("wedge latch on file-as-pods-dir")
+	}
+	if e.sdRan("restart k0sworker.service") {
+		t.Fatal("restart spent on file-as-pods-dir")
+	}
+	if !strings.Contains(logLines(t, e), "not a directory") {
+		t.Fatalf("missing inconclusive log:\n%s", logLines(t, e))
+	}
+}
+
 // --- check 6: ctr-tasks (31) ---
 
 func TestCtrTasksWedgedDirTwoPhase(t *testing.T) {
@@ -1265,6 +1386,40 @@ func TestCtrTasksHealthyShimKept(t *testing.T) {
 	e.h.Cycle(context.Background())
 	if len(e.kills) != 0 {
 		t.Fatalf("healthy shim killed, kills=%v", e.kills)
+	}
+}
+
+// TestCtrTasksOverCapKeepsMarker: dirs dropped by the per-cycle cap
+// must KEEP their confirmed wedged-seen marker — removing it on the
+// capped pass forced over-cap dirs to re-confirm for 5m forever.
+func TestCtrTasksOverCapKeepsMarker(t *testing.T) {
+	e := fixture(t)
+	e.h.cfg.MaxCtrTaskClean = 2
+	// 4 confirmed-wedged dirs (dead init: no init.pid at all), each
+	// with a marker already past the 5m confirm window.
+	for i := 0; i < 4; i++ {
+		id := fmt.Sprintf("wedged%02d%s", i, strings.Repeat("d", 55))
+		if err := os.MkdirAll(filepath.Join(e.ctr, id), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(e.state, "wedged-seen-"+id),
+			fmt.Sprintf("%d\n", e.now.Add(-10*time.Minute).Unix()))
+	}
+	e.h.Cycle(context.Background())
+	// First two (ReadDir order) cleaned, markers consumed.
+	for i := 0; i < 2; i++ {
+		id := fmt.Sprintf("wedged%02d%s", i, strings.Repeat("d", 55))
+		if _, err := os.Stat(filepath.Join(e.ctr, id)); !os.IsNotExist(err) {
+			t.Fatalf("in-cap wedged dir %s not removed", id)
+		}
+	}
+	// The capped two keep BOTH dir and marker — confirmed state
+	// survives so next cycle cleans them without a new 5m wait.
+	for i := 2; i < 4; i++ {
+		id := fmt.Sprintf("wedged%02d%s", i, strings.Repeat("d", 55))
+		if _, err := os.Stat(filepath.Join(e.state, "wedged-seen-"+id)); err != nil {
+			t.Fatalf("over-cap marker %s dropped — dir would re-confirm forever", id)
+		}
 	}
 }
 
@@ -2505,6 +2660,33 @@ func TestCtrIngestGCFailedScanRetriesNextCycle(t *testing.T) {
 	}
 }
 
+// TestCtrIngestGCBavailOverBlocksSaturates: btrfs/XFS can report
+// Bavail > Blocks — the uint64 subtraction wraps to ~2^64 and
+// diskHigh sticks true, sweeping the GC every cycle. The saturation
+// guard must keep it low (concourse fsPressure parity).
+func TestCtrIngestGCBavailOverBlocksSaturates(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.h.cfg.statfsFn = func(_ string, st *unix.Statfs_t) error {
+		st.Blocks, st.Bavail = 100, 120 // free > total
+		return nil
+	}
+	// First cycle stamps lastIngestScan so the second is not `due`.
+	e.h.Cycle(context.Background())
+	stale := filepath.Join(e.ingest, "deadbeefref")
+	if err := os.MkdirAll(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-4 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatal("stale ingest dir swept under wrapped-free disk pressure")
+	}
+}
+
 // --- A2: zombie storm ---
 
 // mkZombieProc writes a Z-state stat for pid whose parent is ppid.
@@ -2624,6 +2806,37 @@ func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 	}
 }
 
+// TestZombieStormLatchDropsBelowThreshold: a stored streak must be
+// re-validated against THIS cycle's count before it can hold the
+// latch — previously the streak loop latched on any live parent
+// with ≥1 zombie, keeping the latch one extra cycle after the
+// storm dropped under the threshold.
+func TestZombieStormLatchDropsBelowThreshold(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.h.cfg.ZombieStormThreshold = 3
+	mkParentProc(t, e, 777, "111111")
+	for pid := 800; pid < 805; pid++ {
+		mkZombieProc(t, e, pid, 777)
+	}
+	e.h.Cycle(context.Background())
+	e.h.Cycle(context.Background())
+	if !e.h.stateExists("zombie-storm") {
+		t.Fatal("latch expected after 2 storm cycles")
+	}
+	// Storm drains to 2 zombies (≤ threshold but >0) — the parent
+	// still has zombie children, but the latch must drop NOW.
+	for pid := 800; pid < 803; pid++ {
+		if err := os.RemoveAll(filepath.Join(e.proc, fmt.Sprint(pid))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.h.Cycle(context.Background())
+	if e.h.stateExists("zombie-storm") {
+		t.Fatal("latch held an extra cycle after storm dropped below threshold")
+	}
+}
+
 // --- A5: journald integrity ---
 
 func TestJournaldCorruptionRotates(t *testing.T) {
@@ -2687,6 +2900,21 @@ func TestJournaldQuietUnitHealthyJournaldNoRotate(t *testing.T) {
 	}
 	if !e.sdRan("journalctl -n 1 --no-pager") {
 		t.Fatal("the unfiltered journald probe should have run for the empty case")
+	}
+}
+
+// TestJournaldExecErrorNoVacuum: an exec-level read failure
+// (nsenter/journalctl timeout) is journal-UNREADABLE, not corruption
+// — it must never spend the rotate+vacuum remedy.
+func TestJournaldExecErrorNoVacuum(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.journalErr = fmt.Errorf("exec timeout")
+	for i := 0; i < 3; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if e.sdRan("journalctl --rotate --vacuum-time=3d") {
+		t.Fatal("rotate+vacuum spent on a transient exec failure")
 	}
 }
 

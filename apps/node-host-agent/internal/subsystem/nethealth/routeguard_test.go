@@ -434,10 +434,12 @@ func TestRouteGuardBindFailureStillRestores(t *testing.T) {
 	}
 }
 
-// Run() may be restarted by the agent after a panic — the guard is
-// spawned behind sync.Once so a restart can't double-bind the socket
-// or double-restore.
-func TestRouteGuardSpawnedOnceAcrossRunRestarts(t *testing.T) {
+// The guard must stay single-flight while alive — a second guard
+// would double-bind the netlink socket and double-restore — but once
+// it has exited (ctx cancel, or a recovered panic) a later Run
+// restart or tick re-arms it: the old sync.Once made any guard death
+// permanent.
+func TestRouteGuardRespawnsAfterExit(t *testing.T) {
 	e := routeGuardFixture(t)
 	// Cycle's checks would race the route guard on the fixture's
 	// single-writer command/systemd fakes — keep them off; this test
@@ -463,22 +465,67 @@ func TestRouteGuardSpawnedOnceAcrossRunRestarts(t *testing.T) {
 		e.n.Run(ctx)
 	}()
 	waitForCond(t, 2*time.Second, func() bool { return opens.Load() >= 1 })
+
+	// A concurrent spawn attempt while the guard is alive must not
+	// stack a second guard.
+	e.n.spawnRouteGuard(ctx)
+	time.Sleep(100 * time.Millisecond)
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("routeGuard stacked a second guard: opens=%d", got)
+	}
+
 	cancel()
 	<-done
+	waitForCond(t, 2*time.Second, func() bool {
+		return !e.n.routeGuardRunning.Load()
+	})
 
-	// A restarted Run must not respawn the guard.
+	// The guard exited with ctx — a restarted Run respawns it.
+	// (Production waits routeGuardRespawnBackoff between spawn
+	// attempts after an exit; the test clears the backoff stamp.)
+	e.n.routeGuardLastExit.Store(0)
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	done2 := make(chan struct{})
 	go func() {
 		defer close(done2)
 		e.n.Run(ctx2)
 	}()
-	time.Sleep(100 * time.Millisecond)
+	waitForCond(t, 2*time.Second, func() bool { return opens.Load() >= 2 })
 	cancel2()
 	<-done2
-	if got := opens.Load(); got != 1 {
-		t.Fatalf("routeGuard respawned on Run restart: opens=%d", got)
+}
+
+// A panic inside the guard is recovered (no daemon crash), logged,
+// and the running flag clears so the next spawn attempt re-arms —
+// subject to the respawn backoff.
+func TestRouteGuardPanicRecoveredAndRearms(t *testing.T) {
+	e := routeGuardFixture(t)
+	var calls atomic.Int32
+	e.n.cfg.openRouteSocket = func() (int, error) {
+		calls.Add(1)
+		panic("boom")
 	}
+	ctx := context.Background()
+	e.n.spawnRouteGuard(ctx)
+	waitForCond(t, 2*time.Second, func() bool {
+		return !e.n.routeGuardRunning.Load()
+	})
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("openRouteSocket calls=%d want 1", got)
+	}
+	// The backoff stamp blocks an immediate respawn…
+	e.n.spawnRouteGuard(ctx)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("respawn ignored the backoff: calls=%d", got)
+	}
+	// …until it elapses — then the guard re-arms (and panics again,
+	// recovered again).
+	e.n.routeGuardLastExit.Store(0)
+	e.n.spawnRouteGuard(ctx)
+	waitForCond(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
+	waitForCond(t, 2*time.Second, func() bool {
+		return !e.n.routeGuardRunning.Load()
+	})
 }
 
 func TestRouteGuardNoScriptNeverOpensSocket(t *testing.T) {

@@ -104,16 +104,26 @@ func readText(t *testing.T, dir, name string) string {
 }
 
 func TestEnvValue(t *testing.T) {
-	data := "POSTGRES_USER=\"admin\"\nPOSTGRES_PASSWORD= 's e c'\nOTHER=x\n"
-	if got := envValue(data, "POSTGRES_USER"); got != "admin" {
-		t.Fatalf("user=%q", got)
+	data := "POSTGRES_USER=\"admin\"\n" +
+		"POSTGRES_PASSWORD= 's e c'\n" + // quoted: inner spaces keep
+		"export POSTGRES_DB=kine\n" + // export prefix
+		"POSTGRES_HOST=db.local # the db vm\n" + // trailing comment
+		"POSTGRES_OPTS=\"a # b\"\n" + // quoted '#' is literal
+		"POSTGRES_BROKEN='oops\n" + // unclosed quote: leading quote stripped (tr -d parity)
+		"OTHER=x\n"
+	cases := map[string]string{
+		"POSTGRES_USER":     "admin",
+		"POSTGRES_PASSWORD": "s e c",
+		"POSTGRES_DB":       "kine",
+		"POSTGRES_HOST":     "db.local",
+		"POSTGRES_OPTS":     "a # b",
+		"POSTGRES_BROKEN":   "oops",
+		"MISSING":           "",
 	}
-	// bash `tr -d "\"' "` strips quotes AND spaces.
-	if got := envValue(data, "POSTGRES_PASSWORD"); got != "sec" {
-		t.Fatalf("pass=%q", got)
-	}
-	if got := envValue(data, "MISSING"); got != "" {
-		t.Fatalf("missing=%q", got)
+	for key, want := range cases {
+		if got := envValue(data, key); got != want {
+			t.Fatalf("%s=%q want %q", key, got, want)
+		}
 	}
 }
 

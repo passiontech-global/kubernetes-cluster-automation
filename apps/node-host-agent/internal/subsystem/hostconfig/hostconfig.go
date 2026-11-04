@@ -19,11 +19,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,6 +45,17 @@ const (
 	defaultNebulaCertsDir = "/config/nebula-certs"
 	defaultWatchdogDir    = "/config/watchdog"
 	defaultWatchPoll      = 15 * time.Second
+	defaultCmdTimeout     = 120 * time.Second
+	// CmdTimeoutLong budgets the slow-egress ops (apt-get
+	// install/purge, docker image pulls/compose up, journalctl
+	// --vacuum) routed through runLong — they legitimately run for
+	// minutes on the api-lb/kine-db infra VMs and would die at the
+	// interactive-command budget before finishing.
+	defaultCmdTimeoutLong = 10 * time.Minute
+	// matches the 120s the download helper hardcoded before
+	// HTTPTimeout was wired in — nexpDownload floors at 300s for the
+	// slow-egress infra VMs.
+	defaultHTTPTimeout = 120 * time.Second
 )
 
 // Runner executes a command inside the HOST namespaces.
@@ -190,11 +204,21 @@ type Config struct {
 	NebulaCertsDir     string
 	WatchdogScriptsDir string // optional: node-watchdog-scripts CM mount
 	Interval           time.Duration
-	Enabled            bool
-	Runner             Runner
-	Watcher            Watcher
-	NowFn              func() time.Time
-	HTTPTimeout        time.Duration
+	// CmdTimeout is the per-host-command deadline applied inside run —
+	// a hung systemctl/apt-get/docker must fail, not wedge the
+	// converge loop on Run's ctx (effectively unbounded between
+	// panic-restarts).
+	CmdTimeout time.Duration
+	// CmdTimeoutLong is the deadline runLong applies to the
+	// slow-egress commands — apt-get install/purge, docker run/compose
+	// (image pulls), journalctl --vacuum. Plain systemctl/queries
+	// stay on CmdTimeout.
+	CmdTimeoutLong time.Duration
+	Enabled        bool
+	Runner         Runner
+	Watcher        Watcher
+	NowFn          func() time.Time
+	HTTPTimeout    time.Duration
 	// DownloadDir caches fetched archives (nebula/coredns/haproxy deb).
 	DownloadDir string
 	// Standalone marks the on-host systemd deployment (hub/infra/API-LB
@@ -227,7 +251,13 @@ func (c *Config) applyDefaults() {
 		c.NowFn = time.Now
 	}
 	if c.HTTPTimeout <= 0 {
-		c.HTTPTimeout = 60 * time.Second
+		c.HTTPTimeout = defaultHTTPTimeout
+	}
+	if c.CmdTimeout <= 0 {
+		c.CmdTimeout = defaultCmdTimeout
+	}
+	if c.CmdTimeoutLong <= 0 {
+		c.CmdTimeoutLong = defaultCmdTimeoutLong
 	}
 	if c.DownloadDir == "" {
 		c.DownloadDir = "/tmp/hostconfig"
@@ -254,6 +284,11 @@ type Reconciler struct {
 	// group that hits a write/command error is marked "error" and
 	// CycleWithErrors reports it. Cycles run on a single goroutine.
 	cur *cyc
+
+	// watchOnce keeps the vars/certs poller single-flight: an agent
+	// panic-restart re-invokes Run on the same ctx and must not stack
+	// a second Poll goroutine (routeGuardOnce parity in nethealth).
+	watchOnce sync.Once
 }
 
 // noteErr attributes a managed-operation failure to the active
@@ -302,7 +337,7 @@ func (r *Reconciler) Run(ctx context.Context) {
 		return
 	}
 	if r.cfg.Watcher != nil {
-		go r.cfg.Watcher.Poll(ctx)
+		r.watchOnce.Do(func() { go r.cfg.Watcher.Poll(ctx) })
 	}
 	r.Cycle(ctx)
 	t := time.NewTicker(r.cfg.Interval)
@@ -332,8 +367,25 @@ func (r *Reconciler) hp(p string) string {
 
 // run is a runner shorthand — failures are logged at Debug (the
 // caller decides which failures deserve a Warn) and never fatal.
+// Every command gets a CmdTimeout deadline: the converge ctx is
+// long-lived, so a hung host binary must time out here.
 func (r *Reconciler) run(ctx context.Context, name string, args ...string) (string, error) {
-	out, err := r.cfg.Runner.Run(ctx, name, args...)
+	return r.runBudget(ctx, r.cfg.CmdTimeout, name, args...)
+}
+
+// runLong is run for the slow-egress commands — apt-get
+// install/purge, docker run/compose (image pulls), journalctl
+// --vacuum — which legitimately run for minutes on the infra VMs and
+// would die at the interactive CmdTimeout budget. Same contract,
+// CmdTimeoutLong deadline.
+func (r *Reconciler) runLong(ctx context.Context, name string, args ...string) (string, error) {
+	return r.runBudget(ctx, r.cfg.CmdTimeoutLong, name, args...)
+}
+
+func (r *Reconciler) runBudget(ctx context.Context, budget time.Duration, name string, args ...string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	out, err := r.cfg.Runner.Run(cctx, name, args...)
 	if err != nil {
 		slog.Debug("hostconfig: host command failed",
 			"cmd", name+" "+strings.Join(args, " "), "out", out, "error", err)
@@ -369,14 +421,44 @@ func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode)
 		return fail(err)
 	}
 	tmp := dst + ".hostconfig.tmp"
-	if err := os.WriteFile(tmp, content, mode); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return fail(err)
+	}
+	// A short write is a failed write — n < len(content) means a
+	// truncated file would be promoted by the rename below.
+	if n, err := f.Write(content); err != nil || n < len(content) {
+		f.Close()
+		os.Remove(tmp)
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		return fail(err)
+	}
+	// fsync BEFORE rename — the content must be durable at the final
+	// name, so a crash after rename can never expose a zeroed file.
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
 		return fail(err)
 	}
 	if err := os.Chmod(tmp, mode); err != nil {
+		os.Remove(tmp)
 		return fail(err)
 	}
 	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
 		return fail(err)
+	}
+	// Parent-dir fsync: the rename is only durable once the new
+	// directory entry is flushed.
+	if d, err := os.Open(filepath.Dir(dst)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	r.writes.WithLabelValues(path).Inc()
 	slog.Info("hostconfig: wrote managed file", "path", path)
@@ -450,8 +532,21 @@ func (r *Reconciler) rateOK(name string, interval time.Duration) bool {
 func (r *Reconciler) rateSpend(name string) {
 	p := r.hp(watchdogStateDir + "/" + name)
 	content := strconv.FormatInt(r.cfg.NowFn().Unix(), 10) + "\n"
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+	// tmp+rename (controllerhygiene writeEpochFile parity): a torn
+	// write parses as garbage in rateOK and silently bypasses the
+	// cooldown — the latch must appear whole or not at all. The
+	// leading dot keeps the tmp out of hostmetrics' state-* scan.
+	tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
 		slog.Warn("hostconfig: rate budget write failed",
+			"budget", name, "path", p, "error", err)
+		return
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		// Sweep the staging file — a stranded .tmp-* must not linger
+		// in the state dir after a failed promote.
+		os.Remove(tmp)
+		slog.Warn("hostconfig: rate budget install failed",
 			"budget", name, "path", p, "error", err)
 	}
 }
@@ -544,4 +639,104 @@ func (r *Reconciler) reloadService(ctx context.Context, unit string) {
 		slog.Warn("hostconfig: reload failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
+}
+
+// --- sh -c interpolation gates ---
+//
+// Several groups build `sh -c`/`bash -c` command strings with
+// vars-derived values (nebula tables/dev, mesh IPs, ports). Many of
+// those values land inside sed/grep patterns where shell-quoting
+// would corrupt the match — so the gate is a strict charset/shape
+// check applied BEFORE any command is built, not quoting at the
+// interpolation site. A value outside the charset counts a cycle
+// error and refuses the shell work.
+
+// shTokenRe is the safe-charset gate for values interpolated into
+// host shell commands: IPs, CIDRs, netdev/table names and paths all
+// fit; space, quote, $, `, ; & | < > never do.
+var shTokenRe = regexp.MustCompile(`^[A-Za-z0-9_.,:/@%+=-]+$`)
+
+// shToken reports whether a vars-derived value may be interpolated
+// into a host shell command. Empty stays allowed (callers keep their
+// existing empty-value semantics — an empty value cannot inject) —
+// but see the *Req variants: at slots where the value is REQUIRED an
+// empty pass still emits a malformed command.
+func (c *cyc) shToken(what, s string) bool {
+	if s == "" || shTokenRe.MatchString(s) {
+		return true
+	}
+	c.err("hostconfig: unsafe value refused for shell interpolation",
+		"what", what, "value", s)
+	return false
+}
+
+// shIPCIDR is shToken for IP/prefix values — netip parse enforces
+// real IP/CIDR shape on top of the charset (a malformed value would
+// only produce a failing ip/nft invocation, but a vars bug should
+// surface as a cycle error, not a silent shell failure).
+func (c *cyc) shIPCIDR(what, s string) bool {
+	if s == "" {
+		return true
+	}
+	if _, err := netip.ParseAddr(s); err == nil {
+		return true
+	}
+	if _, err := netip.ParsePrefix(s); err == nil {
+		return true
+	}
+	c.err("hostconfig: invalid IP/CIDR refused for shell interpolation",
+		"what", what, "value", s)
+	return false
+}
+
+// shMarkerBase validates the marker subnet base (interdc_marker_base,
+// e.g. "172.29.0") — rules use it as <base>.0/24, so <base>.0 must
+// be a valid IPv4 addr (a 3-octet base, NOT a full IP).
+func (c *cyc) shMarkerBase(what, s string) bool {
+	if s == "" {
+		return true
+	}
+	if _, err := netip.ParseAddr(s + ".0"); err == nil {
+		return true
+	}
+	c.err("hostconfig: invalid marker base refused for shell interpolation",
+		"what", what, "value", s)
+	return false
+}
+
+// shPort is shToken for TCP/UDP ports destined for --dport or
+// /dev/tcp interpolation: digits only, 1-65535.
+func (c *cyc) shPort(what, s string) bool {
+	if s == "" {
+		return true
+	}
+	if n, err := strconv.Atoi(s); err == nil && n >= 1 && n <= 65535 {
+		return true
+	}
+	c.err("hostconfig: invalid port refused for shell interpolation",
+		"what", what, "value", s)
+	return false
+}
+
+// The *Req variants are the same gates for slots where the value is
+// REQUIRED: an empty value there cannot inject, but it still emits a
+// malformed command (`ip route replace default dev neb1 src <blank>`,
+// `--dport <blank>`) that only fails at Debug level inside sh -c.
+// Required slots count an empty value as a cycle error instead.
+func (c *cyc) shIPCIDRReq(what, s string) bool {
+	if s == "" {
+		c.err("hostconfig: required IP/CIDR empty — refusing shell interpolation",
+			"what", what)
+		return false
+	}
+	return c.shIPCIDR(what, s)
+}
+
+func (c *cyc) shPortReq(what, s string) bool {
+	if s == "" {
+		c.err("hostconfig: required port empty — refusing shell interpolation",
+			"what", what)
+		return false
+	}
+	return c.shPort(what, s)
 }

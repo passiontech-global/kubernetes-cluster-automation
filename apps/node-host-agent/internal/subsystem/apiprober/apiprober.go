@@ -317,6 +317,13 @@ type Prober struct {
 	// the transition (and one more when the socket appears), not
 	// an ERROR per cycle. Only the Cycle goroutine touches it.
 	socketAbsent bool
+	// cycleStatics is the per-cycle snapshot of the merged static
+	// backend set — resolved once in Cycle. statics() re-parses
+	// node-watchdog.conf on every call (WatchdogSrc.Get re-reads
+	// the file each Get), so discover's per-row staticAddr lookups
+	// must not each trigger a conf parse. Nil outside Cycle →
+	// staticAddr resolves fresh (direct discover calls in tests).
+	cycleStatics []StaticBackend
 
 	rvGap         *prometheus.GaugeVec
 	enabled       *prometheus.GaugeVec
@@ -550,6 +557,7 @@ func (p *Prober) refreshClient() {
 		return
 	}
 	if key != p.caKey {
+		p.client.CloseIdleConnections() // drop the rotated client's pool
 		p.client, p.caKey = cl, key
 		slog.Info("apiprober: rebuilt TLS client — effective CA changed",
 			"ca", p.eff.caFile, "subsystem", "apiprober")
@@ -633,10 +641,25 @@ func (p *Prober) discover(ctx context.Context) ([]backend, error) {
 			continue
 		}
 		if strings.HasPrefix(line, "#") {
-			cols := strings.Split(strings.TrimPrefix(strings.TrimSpace(line), "# "), ",")
+			// CSV header. HAProxy emits "# pxname,..." but the
+			// marker can come back glued ("#pxname") — strip the
+			// '#' first, then whitespace. TrimPrefix("# ") left a
+			// glued header unparsed: pxname never mapped, every row
+			// was skipped, and cycles{ok} still counted over a
+			// silently empty backend set.
+			cols := strings.Split(
+				strings.TrimSpace(strings.TrimPrefix(line, "#")), ",")
 			header = make(map[string]int, len(cols))
 			for i, c := range cols {
 				header[strings.TrimSpace(c)] = i
+			}
+			// A header without the required columns is a schema
+			// break — loud-fail instead of matching nothing.
+			for _, req := range []string{"pxname", "svname", "status"} {
+				if _, ok := header[req]; !ok {
+					return nil, fmt.Errorf(
+						"show stat: header missing %q column", req)
+				}
 			}
 			continue
 		}
@@ -705,7 +728,10 @@ func (p *Prober) tcpPreflight(ctx context.Context, addr string) error {
 	if err != nil {
 		return err
 	}
-	return conn.Close()
+	// The dial is the verdict — a Close failure is local noise,
+	// not evidence the backend is unreachable.
+	_ = conn.Close()
+	return nil
 }
 
 // failClass classifies why one backend query produced no usable rv —
@@ -892,9 +918,15 @@ func (p *Prober) statics() []StaticBackend {
 }
 
 // staticAddr resolves a server name to its static-backend Addr ("" =
-// not configured), normalized with the bash default port.
+// not configured), normalized with the bash default port. Inside
+// Cycle it reads the per-cycle snapshot — resolving via statics()
+// per empty-addr row would re-parse the watchdog conf once per row.
 func (p *Prober) staticAddr(name string) string {
-	for _, sb := range p.statics() {
+	set := p.cycleStatics
+	if set == nil {
+		set = p.statics() // outside Cycle (tests/direct calls)
+	}
+	for _, sb := range set {
 		if sb.Name == name {
 			return withDefaultPort(sb.Addr)
 		}
@@ -1221,6 +1253,17 @@ func (p *Prober) Cycle(ctx context.Context) {
 	// Re-read the guard conf every cycle — a conf written or edited
 	// by hostconfig mid-run applies NOW, not after a restart.
 	p.refreshGuard()
+	// Resolve the merged static set once for the whole cycle:
+	// statics() re-reads node-watchdog.conf on every call and
+	// discover needs it once per empty-addr `show stat` row — an
+	// N-row table would otherwise cost N conf re-parses per cycle.
+	p.cycleStatics = p.statics()
+	// The snapshot is Cycle-scoped by contract: out-of-Cycle
+	// staticAddr callers must resolve fresh via statics(), never
+	// read the last cycle's (possibly conf-edited-away) snapshot.
+	// Clear on EVERY return path — Cycle exits early at the socket
+	// gate, on discover failure, and on ctx cancel.
+	defer func() { p.cycleStatics = nil }()
 
 	// Missing-socket gate: api-local-lb is worker-only (hostconfig
 	// groupAPILB returns early on non-k0sworker hosts), so the
@@ -1259,7 +1302,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 	// Merge API_BACKENDS-style static entries — covers backends whose
 	// `show stat` addr column is empty (external API LB VMs) and
 	// apiservers the local HAProxy does not list.
-	backends := mergeStatic(discovered, p.statics())
+	backends := mergeStatic(discovered, p.cycleStatics)
 	// svnameByAddr maps a discovered addr to its HAProxy svname —
 	// the socket action target must be the svname, never an addr key
 	// (incident: `disable server api_local_back/147.93.159.255:6443`
@@ -1308,12 +1351,15 @@ func (p *Prober) Cycle(ctx context.Context) {
 		if !okC || !okN {
 			// Split the verdict: a probe-side fault (credential
 			// unreadable/rejected, TLS trust, request build) carries
-			// ZERO evidence about the apiserver — and a query that
-			// DID succeed proves the apiserver answered a real
-			// request this cycle, so it is not dead either way.
-			// Only an apiserver-side failure class (timeout,
-			// refused, dropped, bad status, unreadable/parseable
-			// response) may feed the DEAD counter.
+			// ZERO evidence about the apiserver, so a cycle whose
+			// failures are ALL probe-side is inconclusive — counts
+			// neither fresh nor stale. But EITHER query failing on
+			// an apiserver-side class (timeout, refused, dropped,
+			// bad status, unreadable/unparseable response) feeds
+			// the DEAD counter even when the other query succeeded:
+			// a watch-cache read that still answers while the
+			// consistent read stalls IS the wedge signature — the
+			// cache serves stale hits over a dead storage path.
 			apiserverSide := (!okC && !fcC.probeSide()) ||
 				(!okN && !fcN.probeSide())
 			if !apiserverSide {
@@ -1345,8 +1391,14 @@ func (p *Prober) Cycle(ctx context.Context) {
 			// worse than DOWN (L7 /readyz may still pass while
 			// storage is wedged, incident 2026-10-07).
 			st.qfail++
+			// Streaks must not span an outage: the gap counter and
+			// the frozen baseline belong to the pre-outage episode —
+			// carried across, a gap streak would merge two separate
+			// incidents and the stale prevCache is no comparable.
 			st.frozen = 0
+			st.fail = 0
 			st.ok = 0
+			st.hasPrev = false
 			p.probeFailures.WithLabelValues(b.Name, "query").Inc()
 			if st.qfail >= p.eff.failCycles {
 				stale[b.Name] = true

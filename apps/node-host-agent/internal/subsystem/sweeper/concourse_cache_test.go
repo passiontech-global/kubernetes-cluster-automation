@@ -3,6 +3,7 @@ package sweeper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -36,6 +37,21 @@ func ccPruner(t *testing.T, mutate func(*ConcourseCacheConfig)) *ConcourseCacheP
 		t.Fatal(err)
 	}
 	return p
+}
+
+// ccPVCName renders a readable test tag as a strict pvc-<uuid> dir
+// name — Sweep only enters dirs matching the orphan sweeper's
+// pvcNameRe, so fixtures need real UUID shapes (the tag's bytes are
+// hex-encoded into the first field, the rest is zeros).
+func ccPVCName(tag string) string {
+	h := fmt.Sprintf("%x", tag)
+	if len(h) > 8 {
+		h = h[:8]
+	}
+	for len(h) < 8 {
+		h += "0"
+	}
+	return "pvc-" + h + "-0000-0000-0000-000000000000"
 }
 
 // mkSharedCache creates <root>/<pvc>/shared-cache and returns the
@@ -110,9 +126,14 @@ func TestConcourseCacheSkipsNonCacheDirs(t *testing.T) {
 	p := ccPruner(t, nil)
 
 	// pvc dir without shared-cache.
-	if err := os.MkdirAll(filepath.Join(root, "pvc-1234"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(root, ccPVCName("nocache")), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// A pvc-* name that is NOT a strict pvc-<uuid> is skipped by the
+	// name belt before the shared-cache check — its cache content
+	// stays untouched too.
+	loose := ccFile(t, filepath.Join(root, "pvc-1234", "shared-cache",
+		"go-build", "old"), 4, 100*time.Hour)
 	// A shared-cache that is NOT under a pvc-* dir stays untouched.
 	stray := filepath.Join(root, "handmade", "shared-cache", "go-build")
 	old := ccFile(t, filepath.Join(stray, "old"), 4, 100*time.Hour)
@@ -121,12 +142,13 @@ func TestConcourseCacheSkipsNonCacheDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 	ccPresent(t, old)
+	ccPresent(t, loose)
 }
 
 // The perm invariant: shared-cache + first level forced to 0777.
 func TestConcourseCachePermInvariant(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-aaaa")
+	sc := mkSharedCache(t, root, ccPVCName("aaaa"))
 	child := filepath.Join(sc, "go-build")
 	if err := os.MkdirAll(child, 0o700); err != nil {
 		t.Fatal(err)
@@ -158,7 +180,7 @@ func TestConcourseCachePermInvariant(t *testing.T) {
 // root-running pruner is a host-file takeover gadget.
 func TestConcourseCacheSymlinkSafety(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-ln")
+	sc := mkSharedCache(t, root, ccPVCName("ln"))
 
 	// Outside target: a dir holding a stale file plus a loose file —
 	// both with modes enforcePerms would rewrite if it dereferenced.
@@ -212,7 +234,7 @@ func TestConcourseCacheSymlinkSafety(t *testing.T) {
 // go-build: files older than 72h die, younger survive.
 func TestConcourseCacheGoBuildAge(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-gb")
+	sc := mkSharedCache(t, root, ccPVCName("gb"))
 	old := ccFile(t, filepath.Join(sc, "go-build", "ab", "old"), 4, 73*time.Hour)
 	fresh := ccFile(t, filepath.Join(sc, "go-build", "ab", "fresh"), 4, 71*time.Hour)
 
@@ -231,7 +253,7 @@ func TestConcourseCacheGoBuildAge(t *testing.T) {
 // mark is satisfied — selection is by mtime, not name.
 func TestConcourseCacheGoBuildSizeCap(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-gb")
+	sc := mkSharedCache(t, root, ccPVCName("gb"))
 	dir := filepath.Join(sc, "go-build")
 	// All <72h so the age rule cannot fire.
 	oldest := ccFile(t, filepath.Join(dir, "f1"), 100, 54*time.Hour)
@@ -254,7 +276,7 @@ func TestConcourseCacheGoBuildSizeCap(t *testing.T) {
 // build + coverage: 48h files deleted, empty dirs swept, fresh kept.
 func TestConcourseCacheBuildCoverage(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-bc")
+	sc := mkSharedCache(t, root, ccPVCName("bc"))
 
 	for _, bucket := range []string{"build", "coverage"} {
 		old := ccFile(t, filepath.Join(sc, bucket, "key", "art"), 4, 49*time.Hour)
@@ -276,7 +298,7 @@ func TestConcourseCacheBuildCoverage(t *testing.T) {
 // low mark is freed.
 func TestConcourseCacheBuildSizeCap(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-bc")
+	sc := mkSharedCache(t, root, ccPVCName("bc"))
 	dir := filepath.Join(sc, "build")
 	ccFile(t, filepath.Join(dir, "k-old", "f"), 10, 0)
 	ccFile(t, filepath.Join(dir, "k-mid", "f"), 10, 0)
@@ -303,7 +325,7 @@ func TestConcourseCacheBuildSizeCap(t *testing.T) {
 // the script gave these buckets no dir cleanup.
 func TestConcourseCacheAffectedYtt(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-ay")
+	sc := mkSharedCache(t, root, ccPVCName("ay"))
 
 	for _, bucket := range []string{"affected", "ytt"} {
 		old := ccFile(t, filepath.Join(sc, bucket, "dead"), 4, 73*time.Hour)
@@ -324,7 +346,7 @@ func TestConcourseCacheAffectedYtt(t *testing.T) {
 // nx + moon: 8d files die, empty dirs are swept.
 func TestConcourseCacheNxMoon(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-nm")
+	sc := mkSharedCache(t, root, ccPVCName("nm"))
 
 	for _, bucket := range []string{"nx", "moon"} {
 		old := ccFile(t, filepath.Join(sc, bucket, "stale"), 4, 9*24*time.Hour)
@@ -345,7 +367,7 @@ func TestConcourseCacheNxMoon(t *testing.T) {
 // sonar and bun (the whole list shares one code path).
 func TestConcourseCacheToolBuckets(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-tools")
+	sc := mkSharedCache(t, root, ccPVCName("tools"))
 
 	for _, bucket := range []string{"trivy", "sonar", "golangci-lint",
 		"uv", "pip", "bin", "py-tools", "bun"} {
@@ -370,7 +392,7 @@ func TestConcourseCacheToolBuckets(t *testing.T) {
 // <cksum> dir survives.
 func TestConcourseCacheNodeDepsAgedDir(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-nd")
+	sc := mkSharedCache(t, root, ccPVCName("nd"))
 
 	oldDir := filepath.Join(sc, "node-deps", "cksum-old")
 	ro := filepath.Join(oldDir, "pkg", "sub")
@@ -396,7 +418,7 @@ func TestConcourseCacheNodeDepsAgedDir(t *testing.T) {
 // younger ones and regular files survive.
 func TestConcourseCacheNodeDepsLockFiles(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-nd")
+	sc := mkSharedCache(t, root, ccPVCName("nd"))
 	nd := filepath.Join(sc, "node-deps")
 
 	stale1 := ccFile(t, filepath.Join(nd, ".lock-abc"), 4, 62*time.Minute)
@@ -422,7 +444,7 @@ func TestConcourseCacheNodeDepsLockFiles(t *testing.T) {
 // a younger one and a same-named file's parent survive.
 func TestConcourseCacheNodeDepsStagingDirs(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-nd")
+	sc := mkSharedCache(t, root, ccPVCName("nd"))
 	nd := filepath.Join(sc, "node-deps")
 
 	stale := filepath.Join(nd, "cksum.tmp-123")
@@ -452,7 +474,7 @@ func TestConcourseCacheNodeDepsStagingDirs(t *testing.T) {
 // first — the losing dir here has a read-only subtree).
 func TestConcourseCacheNodeDepsSizeCap(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-nd")
+	sc := mkSharedCache(t, root, ccPVCName("nd"))
 	dir := filepath.Join(sc, "node-deps")
 
 	oldDir := filepath.Join(dir, "cksum-old")
@@ -484,7 +506,7 @@ func TestConcourseCacheNodeDepsSizeCap(t *testing.T) {
 // are silently skipped — mirrors every `[ -d ]` guard in the script.
 func TestConcourseCacheUnderCapKeepsAll(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-keep")
+	sc := mkSharedCache(t, root, ccPVCName("keep"))
 	fresh := ccFile(t, filepath.Join(sc, "go-build", "f"), 4, time.Hour)
 
 	p := ccPruner(t, nil)
@@ -497,7 +519,7 @@ func TestConcourseCacheUnderCapKeepsAll(t *testing.T) {
 // Cancellation between pvc dirs aborts the pass with ctx.Err().
 func TestConcourseCacheContextCancelled(t *testing.T) {
 	root := t.TempDir()
-	mkSharedCache(t, root, "pvc-a")
+	mkSharedCache(t, root, ccPVCName("a"))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -513,7 +535,7 @@ func TestConcourseCacheContextCancelled(t *testing.T) {
 // The package-level entry point applies the script defaults.
 func TestSweepConcourseSharedCacheFunc(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-fn")
+	sc := mkSharedCache(t, root, ccPVCName("fn"))
 	old := ccFile(t, filepath.Join(sc, "ytt", "stale"), 4, 73*time.Hour)
 	if err := SweepConcourseSharedCache(context.Background(), root); err != nil {
 		t.Fatal(err)
@@ -526,11 +548,14 @@ func TestSweepConcourseSharedCacheFunc(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // ccStatfs returns a statfsFn seam reporting the given used
-// percentages for blocks and inodes.
+// percentages for blocks and inodes. Bfree and Bavail are set alike —
+// fsPressure guards on Bavail (unprivileged-free), matching
+// workerhygiene's ingest-GC trigger.
 func ccStatfs(diskPct, inodePct uint64) func(string, *syscall.Statfs_t) error {
 	return func(_ string, st *syscall.Statfs_t) error {
 		st.Blocks = 10000
 		st.Bfree = 10000 - diskPct*100
+		st.Bavail = 10000 - diskPct*100
 		st.Files = 10000
 		st.Ffree = 10000 - inodePct*100
 		return nil
@@ -592,7 +617,7 @@ func TestFSPressureMaxRatio(t *testing.T) {
 // the normal 72h go-build age would keep.
 func TestConcourseCacheInodePressureEarlyTrigger(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-ino")
+	sc := mkSharedCache(t, root, ccPVCName("ino"))
 	f40h := ccFile(t, filepath.Join(sc, "go-build", "f40h"), 4, 40*time.Hour)
 	f1h := ccFile(t, filepath.Join(sc, "go-build", "f1h"), 4, time.Hour)
 
@@ -611,7 +636,7 @@ func TestConcourseCacheInodePressureEarlyTrigger(t *testing.T) {
 // limit while a 20h file survives.
 func TestConcourseCacheDiskPressureHigh(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-hi")
+	sc := mkSharedCache(t, root, ccPVCName("hi"))
 	old := ccFile(t, filepath.Join(sc, "go-build", "old"), 4, 40*time.Hour)
 	fresh := ccFile(t, filepath.Join(sc, "go-build", "fresh"), 4, 20*time.Hour)
 
@@ -629,7 +654,7 @@ func TestConcourseCacheDiskPressureHigh(t *testing.T) {
 // ages keep every file.
 func TestConcourseCachePressureUnderThreshold(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-lo")
+	sc := mkSharedCache(t, root, ccPVCName("lo"))
 	f40h := ccFile(t, filepath.Join(sc, "go-build", "f"), 4, 40*time.Hour)
 
 	p := ccPruner(t, func(c *ConcourseCacheConfig) {
@@ -645,7 +670,7 @@ func TestConcourseCachePressureUnderThreshold(t *testing.T) {
 // best-effort on top of the regular cadence prune.
 func TestConcourseCacheStatfsErrorFailsOpen(t *testing.T) {
 	root := t.TempDir()
-	sc := mkSharedCache(t, root, "pvc-err")
+	sc := mkSharedCache(t, root, ccPVCName("err"))
 	old := ccFile(t, filepath.Join(sc, "go-build", "old"), 4, 80*time.Hour)
 	f40h := ccFile(t, filepath.Join(sc, "go-build", "f40h"), 4, 40*time.Hour)
 

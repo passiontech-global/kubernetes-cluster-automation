@@ -247,7 +247,10 @@ func New(cfg Config, reg prometheus.Registerer) (*Reporter, error) {
 func (r *Reporter) Name() string { return "nodereporter" }
 
 // Run syncs immediately, then every Interval until ctx is cancelled.
+// The lazily-opened kmsg handle is the one file the Reporter holds —
+// it is released when the subsystem stops.
 func (r *Reporter) Run(ctx context.Context) {
+	defer r.closeKmsg()
 	r.Cycle(ctx)
 	t := time.NewTicker(r.cfg.Interval)
 	defer t.Stop()

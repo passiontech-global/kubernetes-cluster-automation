@@ -157,3 +157,26 @@ func TestMaintCycleContainerDown(t *testing.T) {
 		t.Fatal("reindex ran with the container down")
 	}
 }
+
+// TestMaintCycleAssessFailGatesGauges: when the stats read fails the
+// relation_bytes gauges must not emit fabricated zeros — the same
+// statsOK gating emitGuard applies. The failure still reads as a
+// repack check failure.
+func TestMaintCycleAssessFailGatesGauges(t *testing.T) {
+	k, _, dir := fixture(t, []rule{
+		{substr: "inspect", reply: "true"},
+		{substr: "REINDEX TABLE CONCURRENTLY", reply: "REINDEX\n"},
+		{substr: "pg_indexes_size", err: errors.New("connection reset")},
+	})
+	res := k.maintCycle(context.Background())
+	if res.repackState != "assess-fail" || res.okRepack {
+		t.Fatalf("res=%+v", res)
+	}
+	content := readText(t, dir, "kine-db-maint.prom")
+	if strings.Contains(content, "kine_db_maint_relation_bytes") {
+		t.Fatalf("fabricated relation_bytes on assess-fail:\n%s", content)
+	}
+	if !strings.Contains(content, `kine_db_maint_ok{check="repack"} 0`) {
+		t.Fatalf("repack failure not emitted:\n%s", content)
+	}
+}

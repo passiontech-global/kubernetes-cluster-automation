@@ -878,7 +878,8 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, certDays int64, certOK bool) {
 	present := map[string]bool{}
 	entries, err := os.ReadDir(c.cfg.WatchdogStateDir)
-	if err == nil {
+	switch {
+	case err == nil:
 		for _, e := range entries {
 			if !e.Type().IsRegular() {
 				continue
@@ -887,6 +888,39 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, certDays int64,
 				present[name] = true
 			}
 		}
+	case os.IsNotExist(err):
+		// The dir is gone — the latches really are absent, so the
+		// emit-0 cleared bookkeeping below is honest (a node
+		// without node-watchdog keeps exporting 0s).
+	default:
+		// A ReadDir error other than NotExist leaves `present`
+		// empty — letting it fall through would stamp every latched
+		// state cleared and emit a false 0 for the whole family
+		// despite on-disk latches. Serve the last-known values
+		// unchanged instead (active entries keep 1, cleared
+		// entries keep their emit-0 state); the bookkeeping map
+		// is left untouched so no TTL eviction is manufactured.
+		slog.Debug("hostmetrics: watchdog state dir unreadable — "+
+			"serving previous watchdog_state values",
+			"subsystem", "hostmetrics",
+			"dir", c.cfg.WatchdogStateDir, "error", err)
+		c.mu.Lock()
+		prev := make(map[string]bool, len(c.seenStates))
+		for s, clearedAt := range c.seenStates {
+			prev[s] = clearedAt.IsZero()
+		}
+		c.mu.Unlock()
+		for name, active := range prev {
+			v := 0.0
+			if active {
+				v = 1
+			}
+			ch <- prometheus.MustNewConstMetric(c.descWatchdog,
+				prometheus.GaugeValue, v, c.cfg.NodeName, name)
+			ch <- prometheus.MustNewConstMetric(c.descWatchdogLegacy,
+				prometheus.GaugeValue, v, name)
+		}
+		return
 	}
 	if certOK && certDays < nebulaCertWarnDays {
 		present["nebula-cert-expiring"] = true
@@ -1460,10 +1494,6 @@ func (c *Collector) measureCPU() (ratio, wall float64, ok bool) {
 	return ratio, wall, true
 }
 
-// cpuDeliveredSink keeps the busy loop's work observable so the
-// compiler can't optimize it away.
-var cpuDeliveredSink uint64
-
 // collectCPUDelivered emits the last completed probe — absent before
 // the first measurement (shell: no cpu-delivered file → no metric,
 // never a fake 0).
@@ -1613,9 +1643,10 @@ func (c *Collector) probeFS(mount string) (st unix.Statfs_t, stalled, ok bool) {
 	c.mu.Lock()
 	if start, inflight := c.fsInflight[mount]; inflight {
 		c.mu.Unlock()
-		return unix.Statfs_t{}, time.Since(start) >= c.cfg.fsProbeTimeout, false
+		return unix.Statfs_t{},
+			c.cfg.nowFn().Sub(start) >= c.cfg.fsProbeTimeout, false
 	}
-	c.fsInflight[mount] = time.Now()
+	c.fsInflight[mount] = c.cfg.nowFn()
 	c.mu.Unlock()
 
 	res := make(chan fsResult, 1)
@@ -1962,13 +1993,24 @@ func (c *Collector) sweepInotify() (inst, watch uint64, top []inotifyConsumer) {
 // at most once per InotifyScanInterval.
 func (c *Collector) inotifySnapshot() (uint64, uint64, []inotifyConsumer) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.cfg.nowFn().Sub(c.inoAt) < c.cfg.InotifyScanInterval {
-		return c.inoInstances, c.inoWatches, c.inoTop
+		inst, watch, top := c.inoInstances, c.inoWatches, c.inoTop
+		c.mu.Unlock()
+		return inst, watch, top
 	}
-	c.inoInstances, c.inoWatches, c.inoTop = c.sweepInotify()
+	c.mu.Unlock()
+
+	// The /proc/*/fdinfo sweep can take seconds on a busy node —
+	// run it WITHOUT mu so concurrent scrapes aren't blocked for
+	// the whole walk (mu also guards every other collector
+	// section's bookkeeping). Two scrapes may then sweep in
+	// parallel; the later store wins, harmless for a cache.
+	inst, watch, top := c.sweepInotify()
+	c.mu.Lock()
+	c.inoInstances, c.inoWatches, c.inoTop = inst, watch, top
 	c.inoAt = c.cfg.nowFn()
-	return c.inoInstances, c.inoWatches, c.inoTop
+	c.mu.Unlock()
+	return inst, watch, top
 }
 
 // warnInotifyTop edge-logs the top-3 holder report once per

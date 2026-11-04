@@ -49,12 +49,23 @@ func (v *Vars) get(name string) any {
 	if x, ok := v.resolved[name]; ok {
 		return x
 	}
-	if x, ok := v.extra[name]; ok {
-		return x
-	}
 	if v.resolving[name] {
 		v.errs = append(v.errs, "var "+name+": reference cycle")
 		return Undefined{name + "(cycle)"}
+	}
+	if x, ok := v.extra[name]; ok {
+		// Preloaded files (interdc_nodes/interdc_dns_zone) go
+		// through the same jinja resolution as defaults/cluster
+		// values — they used to bypass it, so embedded {{ }}
+		// never rendered. Cached under resolved like a raw var,
+		// with the same cycle protection.
+		v.resolving[name] = true
+		prev := v.cur
+		v.cur = name
+		v.resolved[name] = v.resolve(x)
+		v.cur = prev
+		delete(v.resolving, name)
+		return v.resolved[name]
 	}
 	rv, ok := v.raw.Get(name)
 	if !ok {
@@ -302,6 +313,16 @@ func Load(cfg Config) (*Topology, error) {
 		resolved:  map[string]any{},
 		resolving: map[string]bool{},
 		env:       env,
+	}
+	// Pull the preloaded registries through the resolution path —
+	// get() resolves+caches extras so embedded {{ }} renders (they
+	// used to reach jinja lookups raw), and derive() works on the
+	// same resolved copies.
+	if rn, ok := t.Vars.get("interdc_nodes").(*OMap); ok && rn != nil {
+		t.Nodes = rn
+	}
+	if zr, ok := t.Vars.get("interdc_dns_zone").(*OMap); ok && zr != nil {
+		t.Zone = zr
 	}
 	t.derive()
 	t.Errors = append(t.Errors, t.Vars.Errors()...)
@@ -688,6 +709,14 @@ func (t *Topology) derive() {
 		for _, r := range t.RelayMap[nm] {
 			siteOK := r.Sites == nil || contains(r.Sites, site)
 			if siteOK && !selfwin[r.IP] {
+				if r.IP == "" {
+					// Same guard as the registry ip above — an
+					// empty relay ip must not mint a "/32" route.
+					t.Errors = append(t.Errors, fmt.Sprintf(
+						"node %q (mesh %q): relay entry has no ip — unsafe route skipped",
+						k, nm))
+					continue
+				}
 				metric := r.Weight
 				if metric == 0 {
 					metric = 10
@@ -697,8 +726,23 @@ func (t *Topology) derive() {
 		}
 	}
 
-	subnets := []string{mapStr(node, "ip") + "/32"}
+	// cert SAN subnets — an empty registry ip must NOT produce a
+	// literal "/32" (unparseable subnet silently baked into a cert).
+	var subnets []string
+	if selfIP := mapStr(node, "ip"); selfIP != "" {
+		subnets = append(subnets, selfIP+"/32")
+	} else {
+		t.Errors = append(t.Errors, fmt.Sprintf(
+			"node %q (mesh %q): registry entry has no ip — cert SAN subnets incomplete",
+			t.NodeKey, self))
+	}
 	for _, r := range t.RelayMap[self] {
+		if r.IP == "" {
+			t.Errors = append(t.Errors, fmt.Sprintf(
+				"node %q (mesh %q): relay entry has no ip — cert SAN subnets incomplete",
+				t.NodeKey, self))
+			continue
+		}
 		subnets = append(subnets, r.IP+"/32")
 	}
 	t.CertSubnets = uniqSorted(subnets)

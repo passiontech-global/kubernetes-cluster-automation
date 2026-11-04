@@ -93,12 +93,33 @@ type poolStats struct {
 	clWaiting   int64
 }
 
+// isPoolsHeader reports whether a `SHOW POOLS` field row is the
+// column header rather than a data row: f[0]=="database" alone is
+// not enough — a pool can literally be named "database" — so the
+// row must also carry sv_*/cl_* column names (a data row has numbers
+// in those positions; only the header spells the names out).
+func isPoolsHeader(f []string) bool {
+	if len(f) < 2 || f[0] != "database" {
+		return false
+	}
+	for _, name := range f[1:] {
+		if strings.HasPrefix(name, "sv_") || strings.HasPrefix(name, "cl_") {
+			return true
+		}
+	}
+	return false
+}
+
 // parseShowPools parses `psql -Aqc "SHOW POOLS"` output by header name
 // (the shell did the same — sv_* column positions shift between
-// pgbouncer versions). Returns false when the header or the pool row
-// is absent.
+// pgbouncer versions). SHOW POOLS emits one row per (database,user)
+// pair, so every row for dbName is aggregated: sv_* columns sum,
+// cl_waiting takes the worst. Returns false when the header or no
+// matching pool row is present.
 func parseShowPools(out, dbName string) (poolStats, bool) {
 	var hdr map[string]int
+	var st poolStats
+	seen := false
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -108,17 +129,16 @@ func parseShowPools(out, dbName string) (poolStats, bool) {
 		for i := range f {
 			f[i] = strings.TrimSpace(f[i])
 		}
-		switch f[0] {
-		case "database":
+		switch {
+		case isPoolsHeader(f):
 			hdr = map[string]int{}
 			for i, name := range f {
 				hdr[name] = i
 			}
-		case dbName:
-			if hdr == nil {
-				continue
-			}
-			st := poolStats{}
+		case hdr == nil || f[0] != dbName:
+			continue
+		default:
+			seen = true
 			for name, i := range hdr {
 				if i >= len(f) {
 					continue
@@ -129,20 +149,19 @@ func parseShowPools(out, dbName string) (poolStats, bool) {
 				}
 				switch {
 				case name == "sv_active":
-					st.svActive = v
+					st.svActive += v
 				case name == "sv_idle":
-					st.svIdle = v
-				case name == "cl_waiting":
+					st.svIdle += v
+				case name == "cl_waiting" && v > st.clWaiting:
 					st.clWaiting = v
 				}
 				if strings.HasPrefix(name, "sv_") {
 					st.serverConns += v
 				}
 			}
-			return st, true
 		}
 	}
-	return poolStats{}, false
+	return st, seen
 }
 
 // probeResult captures one probe run for emission + tests.
@@ -163,6 +182,10 @@ type probeResult struct {
 	pgbName string // resolved pgbouncer container name
 	envUser string // POSTGRES_USER read from the stack .env
 	logErrs int64  // error-line count in the pgbouncer log window
+	// logScanned is false when `logs` itself failed — log_errors is
+	// then inconclusive (a fabricated clean window must neither
+	// pass nor fail the probe).
+	logScanned bool
 }
 
 // runProbeChecks executes every probe check once and fills
@@ -212,7 +235,10 @@ func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
 		res.checks[checkE2EAuth] == 1 &&
 		res.checks[checkPools] == 1 &&
 		res.checks[checkBackendEnv] == 1 &&
-		res.checks[checkLogErrors] == 1
+		// log_errors only counts when the log read worked — like
+		// revision_horizon, an inconclusive check zeroes the gauge
+		// without failing the probe.
+		(!res.logScanned || res.checks[checkLogErrors] == 1)
 	return res
 }
 
@@ -344,17 +370,30 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 // runs outside probeAppChecks.
 func (k *KineDB) probeLogScan(ctx context.Context, pgb string,
 	res *probeResult, note func(string)) {
-	logs, lerr := k.exec(ctx, []string{k.cfg.Runtime, "logs",
-		"--since", "301s", pgb}, "")
+	// stderr folded in for THIS call only: pgbouncer logs on its
+	// stderr stream and the runner now keeps stderr out of the
+	// returned output — without 2>&1 the scan would read nothing.
+	// Both interpolated words are shq-quoted: a runtime/container
+	// name with a space or metachar must not split or glob inside
+	// the sh -c string.
+	logs, lerr := k.exec(ctx, []string{"sh", "-c",
+		shq(k.cfg.Runtime) + " logs --since 301s " + shq(pgb) + " 2>&1"}, "")
 	if lerr != nil {
-		// A failed `logs` read looks identical to a clean window —
-		// surface it so a log_errors pass is not mistaken for real
-		// evidence.
+		// A failed `logs` read is inconclusive, not clean — leave
+		// the check at 0 and exclude it from `succeeded` so a scan
+		// failure is not mistaken for real evidence either way.
 		note(fmt.Sprintf("log-scan-fail: %v", lerr))
-		slog.Warn("kinedb pgbouncer log scan failed — log_errors check reads a clean window",
+		slog.Warn("kinedb pgbouncer log scan failed — log_errors check is inconclusive",
 			"container", pgb, "error", lerr)
+		return
 	}
-	n := int64(len(rePGBLogErr.FindAllString(logs, -1)))
+	res.logScanned = true
+	var n int64
+	for _, l := range strings.Split(logs, "\n") {
+		if rePGBLogErr.MatchString(l) {
+			n++ // grep -c parity: matching LINES, not occurrences
+		}
+	}
 	res.logErrs = n
 	if n == 0 {
 		res.checks[checkLogErrors] = 1

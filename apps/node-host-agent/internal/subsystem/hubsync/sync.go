@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/prometheus/client_golang/prometheus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -26,7 +27,7 @@ func (s *Syncer) Cycle(ctx context.Context) {
 	// metered + logged, and the retry cadence is SyncInterval /
 	// watcher edges, not the renew tick.
 	s.syncedWhileHeld = true
-	targets, err := loadTargets(s.cfg.VarsDir)
+	targets, dropped, notes, err := loadTargets(s.cfg.VarsDir)
 	if err != nil {
 		s.cfg.Log.Error("hubsync: target aggregation failed", "error", err)
 		s.cycles.WithLabelValues("all", "parse_error").Inc()
@@ -38,9 +39,31 @@ func (s *Syncer) Cycle(ctx context.Context) {
 		}
 		return
 	}
+	if len(notes) > 0 {
+		// topology.Load reports non-fatal resolution notes (marker
+		// dups, zone/jinja eval failures) — surface and meter them,
+		// but still converge the targets that did resolve.
+		s.cfg.Log.Warn("hubsync: vars resolution notes — converging anyway",
+			"notes", notes)
+		s.cycles.WithLabelValues("all", "parse_note").Inc()
+	}
+	s.pruneStaleTargets(targets, dropped)
 	s.lastTargets = s.lastTargets[:0]
 	for _, t := range targets {
 		s.lastTargets = append(s.lastTargets, t.Name)
+	}
+	for _, name := range dropped {
+		// Inventory entry resolved to an EMPTY ip — nothing to
+		// dial, but the host is still declared: keep its series
+		// (last_success stays as evidence of the last good
+		// converge) and read it DOWN. Dropping it from lastTargets
+		// would prune the series entirely — the old loud failure
+		// mode replaced by silent disappearance.
+		s.lastTargets = append(s.lastTargets, name)
+		s.targetUp.WithLabelValues(name).Set(0)
+		s.cycles.WithLabelValues(name, "unresolved").Inc()
+		s.cfg.Log.Warn("hubsync: target resolved to no ip — marked down, series kept",
+			"target", name)
 	}
 
 	var token, ca []byte
@@ -90,6 +113,37 @@ func (s *Syncer) Cycle(ctx context.Context) {
 		"skipped", skipped, "failed", failed)
 }
 
+// pruneStaleTargets drops the metric series of targets no longer in
+// the vars-derived set — a renamed/removed host would otherwise keep
+// its target_up/last_success label values (and last value) on the
+// registry forever. Runs only after a successful loadTargets, so a
+// parse failure never prunes (the abort path zeroes instead).
+// keep names hosts that ARE still in the inventory but resolved to
+// no ip this cycle — they are not in targets yet their series must
+// survive (they read target_up=0 as evidence, not vanish).
+// (apiprober.pruneStaleBackends pattern.)
+func (s *Syncer) pruneStaleTargets(targets []Target, keep []string) {
+	live := make(map[string]bool, len(targets)+len(keep))
+	for _, t := range targets {
+		live[t.Name] = true
+	}
+	for _, name := range keep {
+		live[name] = true
+	}
+	for _, name := range s.lastTargets {
+		if live[name] {
+			continue
+		}
+		s.lastSuccess.DeleteLabelValues(name)
+		s.targetUp.DeleteLabelValues(name)
+		// cycles carries a second label (result) — drop every series
+		// whose target label matches.
+		s.cycles.DeletePartialMatch(prometheus.Labels{"target": name})
+		s.cfg.Log.Info("hubsync: target left vars — pruned metric series",
+			"target", name)
+	}
+}
+
 func anyAPILB(targets []Target) bool {
 	for _, t := range targets {
 		if t.APILB {
@@ -108,7 +162,15 @@ func (s *Syncer) guardCreds(ctx context.Context) (token, ca []byte, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return sec.Data["token"], sec.Data["ca.crt"], nil
+	token, ca = sec.Data["token"], sec.Data["ca.crt"]
+	if len(token) == 0 || len(ca) == 0 {
+		// A secret that exists but lacks the keys would otherwise
+		// converge "ok" while pushing nothing — surface it as a
+		// secret_error like a missing secret.
+		return nil, nil, fmt.Errorf("secret %s/%s missing token/ca.crt data",
+			s.cfg.SecretNamespace, s.cfg.SecretName)
+	}
+	return token, ca, nil
 }
 
 // syncTarget converges one host over SSH: binary, vars (+ nebula
@@ -145,7 +207,13 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte) err
 		}
 	}
 	if t.APILB {
-		if _, err := conn.Run(tctx, "mkdir -p "+shq(cfg.GuardDir)+" && chmod 0700 "+shq(cfg.GuardDir)); err != nil {
+		// Two separate runs: the conn prepends `sudo -n` to the raw
+		// string, so a `mkdir && chmod` compound would only escalate
+		// mkdir — the chmod would fail EPERM for non-root ssh_user.
+		if _, err := conn.Run(tctx, "mkdir -p "+shq(cfg.GuardDir)); err != nil {
+			return err
+		}
+		if _, err := conn.Run(tctx, "chmod 0700 "+shq(cfg.GuardDir)); err != nil {
 			return err
 		}
 	}
@@ -221,16 +289,16 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte) err
 	}
 	svc := unitName(cfg.UnitPath)
 	if binaryUpdated || (unitChanged && !freshUnit) {
-		if _, err := conn.Run(tctx, "systemctl enable "+svc); err != nil {
+		if _, err := conn.Run(tctx, "systemctl enable "+shq(svc)); err != nil {
 			return err
 		}
-		if _, err := conn.Run(tctx, "systemctl restart "+svc); err != nil {
+		if _, err := conn.Run(tctx, "systemctl restart "+shq(svc)); err != nil {
 			return err
 		}
 		s.cfg.Log.Info("hubsync: service restarted after update",
 			"target", t.Name, "unit", svc)
 	} else {
-		if _, err := conn.Run(tctx, "systemctl enable --now "+svc); err != nil {
+		if _, err := conn.Run(tctx, "systemctl enable --now "+shq(svc)); err != nil {
 			return err
 		}
 	}
@@ -250,11 +318,25 @@ func isCertArtifact(name string) bool {
 		strings.HasSuffix(name, ".key")
 }
 
-// syncDir pushes every regular file of localDir into remoteDir —
+// isKeyMaterial flags private-key-looking filenames — mirrored
+// config lands under a shared 0644 mode, so staged key material
+// would be world-readable on the target without the 0600 override.
+func isKeyMaterial(name string) bool {
+	n := strings.ToLower(name)
+	return strings.HasSuffix(n, ".key") ||
+		strings.HasSuffix(n, "key.pem") ||
+		strings.Contains(n, "private")
+}
+
+// syncDir mirrors every regular file of localDir into remoteDir —
 // sha256-gated per file, atomic tmp+chmod+mv writes. ConfigMap
 // volumes expose keys as symlinks, so "regular" means non-dir,
 // non-hidden entries; ReadFile resolves the ..data links. A non-nil
-// keep filter further restricts which filenames are mirrored.
+// keep filter further restricts which filenames are mirrored. Key
+// material is chmod'd 0600 regardless of mode. Finally, remote files
+// absent from the local set are removed — remoteDir is a dedicated
+// managed dir, and a locally-deleted file would otherwise linger on
+// every target forever.
 func (s *Syncer) syncDir(ctx context.Context, c Conn, localDir, remoteDir, mode string, keep func(string) bool) error {
 	entries, err := os.ReadDir(localDir)
 	if err != nil {
@@ -276,9 +358,63 @@ func (s *Syncer) syncDir(ctx context.Context, c Conn, localDir, remoteDir, mode 
 		if err != nil {
 			return err
 		}
-		if err := s.putIfChanged(ctx, c, path.Join(remoteDir, name), data, mode); err != nil {
+		m := mode
+		if isKeyMaterial(name) {
+			m = "0600"
+		}
+		if err := s.putIfChanged(ctx, c, path.Join(remoteDir, name), data, m); err != nil {
 			return err
 		}
+	}
+	return s.pruneRemoteDir(ctx, c, remoteDir, names)
+}
+
+// pruneRemoteDir removes files inside remoteDir that are not in
+// names — the remote-side half of the mirror. `ls -1pA` returns
+// basenames (dotfiles included, no ./..) and marks directories with
+// a trailing '/', so stray subdirs are skipped rather than failing
+// `rm -f` forever; deletions are scoped to remoteDir by
+// construction (basename joined back onto it). An EMPTY kept-set
+// refuses outright: mirror semantics would rm every remote file,
+// but a locally-empty dir means the SOURCE is broken (empty
+// ConfigMap / failed mount), not that the target should be wiped.
+// `.<name>.tmp` staging leftovers from an interrupted put are
+// pruned too — but only for names absent from the kept set (a tmp
+// whose file is still mirrored may be an in-flight upload).
+func (s *Syncer) pruneRemoteDir(ctx context.Context, c Conn, remoteDir string, names []string) error {
+	if len(names) == 0 {
+		return fmt.Errorf("prune %s: refusing to empty remote dir — local kept-set empty",
+			remoteDir)
+	}
+	out, err := c.Run(ctx, "ls -1pA "+shq(remoteDir))
+	if err != nil {
+		return fmt.Errorf("ls %s: %w", remoteDir, err)
+	}
+	local := make(map[string]bool, len(names))
+	for _, n := range names {
+		local[n] = true
+	}
+	for _, rname := range strings.Split(out, "\n") {
+		rname = strings.TrimSpace(rname)
+		if rname == "" || local[rname] || strings.HasSuffix(rname, "/") {
+			continue
+		}
+		if strings.HasPrefix(rname, ".") {
+			// Dotfiles are bounded to the staging scheme — other
+			// hidden files in the managed dir are not ours to
+			// touch. A `.<name>.tmp` whose <name> is still kept may
+			// be an in-flight upload: leave it.
+			stem := strings.TrimPrefix(rname, ".")
+			if !strings.HasSuffix(stem, ".tmp") ||
+				local[strings.TrimSuffix(stem, ".tmp")] {
+				continue
+			}
+		}
+		if _, err := c.Run(ctx, "rm -f "+shq(path.Join(remoteDir, rname))); err != nil {
+			return fmt.Errorf("rm stale %s/%s: %w", remoteDir, rname, err)
+		}
+		s.cfg.Log.Info("hubsync: removed stale remote file",
+			"path", path.Join(remoteDir, rname))
 	}
 	return nil
 }

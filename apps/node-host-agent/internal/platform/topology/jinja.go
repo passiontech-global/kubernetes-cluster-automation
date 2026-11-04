@@ -50,6 +50,29 @@ func (u Undefined) String() string { return "Undefined(" + u.name + ")" }
 // behaves like python lists across scope bindings.
 type List struct{ V []any }
 
+// flattenMaxDepth bounds |flatten recursion — a self-referential
+// list would otherwise loop forever (python raises RecursionError;
+// here the tail is left unexpanded).
+const flattenMaxDepth = 100
+
+// flattenMaxOut bounds |flatten OUTPUT. Depth alone doesn't stop
+// a branching cycle — l.V=[l,l] stays shallow while doubling the
+// result every level (2^100 appends), so total elements are
+// budgeted too.
+const flattenMaxOut = 100_000
+
+// walkMaxDepth bounds the recursive value walkers (stringify,
+// deepEq, toPlain, jsonValue). A cyclic *List/*OMap is
+// constructible in-template ({% set _ = l.append(l) %}) and would
+// otherwise recurse until the goroutine stack burst — python
+// raises RecursionError, here the deep tail is elided/false.
+const walkMaxDepth = 200
+
+// rangeMaxOut bounds range() materialization — python's range is
+// lazy, ours builds a slice, so an open-ended range must fail
+// rather than hang+OOM on the append.
+const rangeMaxOut = 1_000_000
+
 // Env carries render-time hooks.
 type Env struct {
 	// FileLookup resolves lookup('file'|'ansible.builtin.file', path).
@@ -110,9 +133,44 @@ func (s *scope) get(name string) any {
 			if len(args) > 2 {
 				step, _ = toInt(args[2])
 			}
-			var out []any
-			for i := lo; i < hi; i += step {
+			if step == 0 {
+				// lo<hi with step 0 never advances — unbounded
+				// append = hang+OOM. Python raises ValueError.
+				return nil, fmt.Errorf("range: step cannot be zero")
+			}
+			// Compute the length arithmetically BEFORE looping —
+			// a `for i += step` condition check can't see step
+			// wrap the counter (range(-1,-2,MinInt64): -1 wraps to
+			// MaxInt64 which still satisfies i>hi → unbounded
+			// append). hi-lo itself overflows int64 at the
+			// extremes, so count in unsigned space where the
+			// difference is exact.
+			var count uint64
+			if step > 0 && hi > lo {
+				d, u := uint64(hi)-uint64(lo), uint64(step)
+				count = d / u
+				if d%u != 0 {
+					count++
+				}
+			} else if step < 0 && lo > hi {
+				// -uint64(step) is |step| even for MinInt64,
+				// where -step can't exist as an int64.
+				d, u := uint64(lo)-uint64(hi), -uint64(step)
+				count = d / u
+				if d%u != 0 {
+					count++
+				}
+			}
+			if count > rangeMaxOut {
+				return nil, fmt.Errorf("range: %d elements exceeds cap %d", count, rangeMaxOut)
+			}
+			// Drive the loop by the precomputed count, not the
+			// boundary condition — i += step may wrap the counter,
+			// the count still terminates the append.
+			out := make([]any, 0, count)
+			for k, i := uint64(0), lo; k < count; k++ {
 				out = append(out, i)
+				i += step
 			}
 			return &List{out}, nil
 		})
@@ -165,20 +223,31 @@ type forNode struct {
 	body  []tnode
 }
 
-// bind assigns the loop variable(s) for one item.
-func (n forNode) bind(s *scope, it any) {
-	if len(n.names) == 2 {
-		pair := toIter(it)
-		if len(pair) >= 2 {
-			s.vars[n.names[0]] = pair[0]
-			s.vars[n.names[1]] = pair[1]
-		} else {
-			s.vars[n.names[0]] = it
-			s.vars[n.names[1]] = Undefined{"loop-item"}
-		}
-	} else {
+// bind assigns the loop variable(s) for one item. Unpacking N
+// names requires the item to yield exactly N values — python
+// raises "cannot unpack"/"too many values to unpack" where the
+// loose match used to bind literal "key"/"value" strings off
+// dict2items pairs, char-split keys, or silently drop extras.
+func (n forNode) bind(s *scope, it any) error {
+	if len(n.names) == 1 {
 		s.vars[n.names[0]] = it
+		return nil
 	}
+	// A mapping is not a pair — iterating it yields keys, and a
+	// 2-key mapping would "unpack" into its own key names. The
+	// idiom is x.key/x.value on a single loop var, or .items()
+	// which yields real [k,v] pairs.
+	if _, ok := it.(*OMap); ok {
+		return fmt.Errorf("for: cannot unpack a mapping into %d names — use .items() or a single loop var", len(n.names))
+	}
+	pair := toIter(it)
+	if len(pair) != len(n.names) {
+		return fmt.Errorf("for: cannot unpack item with %d values into %d names", len(pair), len(n.names))
+	}
+	for i, nm := range n.names {
+		s.vars[nm] = pair[i]
+	}
+	return nil
 }
 
 func (n forNode) render(s *scope, b *strings.Builder) error {
@@ -186,13 +255,34 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 	if err != nil {
 		return err
 	}
+	// Iterating a mapping yields its KEYS as plain strings — a
+	// `for k,v in omap` then char-splits each key (or binds garbage
+	// where python raises "cannot unpack"). Fail loud: the idiom is
+	// `.items()`/`dict2items`, which yields real pairs.
+	if _, ok := v.(*OMap); ok && len(n.names) == 2 {
+		return fmt.Errorf("for: cannot unpack mapping keys — use .items() or dict2items")
+	}
+	// Jinja scopes a for body: the loop var(s) and any {% set %}
+	// inside do NOT leak past {% endfor %}. Run the loop on a copy
+	// of the bindings — shared *List/*OMap values still mutate
+	// through (append-in-loop keeps working), only rebindings are
+	// block-local.
+	saved := s.vars
+	defer func() { s.vars = saved }()
+	inner := make(map[string]any, len(saved))
+	for k, x := range saved {
+		inner[k] = x
+	}
+	s.vars = inner
 	// Apply the `if` filters first: the loop var is bound for each
 	// candidate and every condition must be truthy for the item to
 	// iterate — loop.index/count then track the FILTERED sequence
 	// (jinja semantics).
 	var kept []any
 	for _, it := range toIter(v) {
-		n.bind(s, it)
+		if err := n.bind(s, it); err != nil {
+			return err
+		}
 		ok := true
 		for _, ce := range n.conds {
 			cv, err := ce.eval(s)
@@ -210,7 +300,9 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 	}
 	ln := len(kept)
 	for i, it := range kept {
-		n.bind(s, it)
+		if err := n.bind(s, it); err != nil {
+			return err
+		}
 		loop := NewOMap()
 		loop.Set("index", int64(i+1))
 		loop.Set("index0", int64(i))
@@ -307,7 +399,9 @@ func parseTemplate(text string) ([]tnode, error) {
 			*cur() = append(*cur(), textNode(text[i:]))
 			break
 		}
-		stripL := strings.HasPrefix(text[j:j+3], tag+"-")
+		// text[j:j+3] would panic on a bare 2-char opener at EOF
+		// ("...{{") — HasPrefix on the remainder is bounds-safe.
+		stripL := strings.HasPrefix(text[j:], tag+"-")
 		chunk := text[i:j]
 		if stripL {
 			chunk = strings.TrimRight(chunk, " \t\n\r")
@@ -320,7 +414,15 @@ func parseTemplate(text string) ([]tnode, error) {
 			openLen = 3
 		}
 		rest := text[j+openLen:]
-		closeIdx := strings.Index(rest, end)
+		var closeIdx int
+		if tag == "{#" {
+			// Comments are opaque text — no string literals to honor.
+			closeIdx = strings.Index(rest, end)
+		} else {
+			// A "}}"/"%}" inside a 'quoted' literal is text, not the
+			// tag close ({{ 'a}}b' }}) — naive Index would cut early.
+			closeIdx = tagEnd(rest, end)
+		}
 		if closeIdx < 0 {
 			return nil, fmt.Errorf("unclosed %s tag", tag)
 		}
@@ -385,7 +487,10 @@ func parseTemplate(text string) ([]tnode, error) {
 			if len(frames) == 0 || frames[len(frames)-1].kind != "if" {
 				return nil, fmt.Errorf("%s without if", kw)
 			}
-			in := frames[len(frames)-1].n.(*ifNode)
+			in, ok := frames[len(frames)-1].n.(*ifNode)
+			if !ok {
+				return nil, fmt.Errorf("%s: frame is %T, not *ifNode", kw, frames[len(frames)-1].n)
+			}
 			containers = containers[:len(containers)-1] // pop previous arm body
 			if kw == "elif" {
 				e, err := parseExpr(strings.TrimSpace(strings.TrimPrefix(stmt, "elif")))
@@ -408,6 +513,29 @@ func parseTemplate(text string) ([]tnode, error) {
 		}
 	}
 	return nodes, nil
+}
+
+// tagEnd finds the offset of the closing delimiter in rest, skipping
+// over 'single' and "double" quoted literals (with backslash escapes)
+// so a "}}"/"%}" inside a string isn't misread as the tag close.
+func tagEnd(rest, end string) int {
+	for i := 0; i+len(end) <= len(rest); i++ {
+		if c := rest[i]; c == '\'' || c == '"' {
+			i++
+			for i < len(rest) && rest[i] != c {
+				if rest[i] == '\\' {
+					i++
+				}
+				i++
+			}
+			// i now sits on the close quote (or len — loop ends).
+			continue
+		}
+		if strings.HasPrefix(rest[i:], end) {
+			return i
+		}
+	}
+	return -1
 }
 
 // parseFor parses `{% for a[,b] in seq [if cond [if cond2 ...]] %}`.
@@ -675,7 +803,10 @@ func (e testExpr) eval(s *scope) (any, error) {
 		}
 		args = append(args, x)
 	}
-	r := runTest(e.name, v, args)
+	r, err := runTest(e.name, v, args)
+	if err != nil {
+		return nil, err
+	}
 	if e.neg {
 		return !r, nil
 	}
@@ -814,18 +945,31 @@ type parser struct {
 	pos  int
 }
 
-func (p *parser) peek() tok { return p.toks[p.pos] }
-func (p *parser) next() tok { t := p.toks[p.pos]; p.pos++; return t }
+// tok returns toks[pos+off], or a synthetic eof past the slice end —
+// a grammar path that consumed past the terminator must degrade to
+// a parse error, not an index panic.
+func (p *parser) tok(off int) tok {
+	if i := p.pos + off; i >= 0 && i < len(p.toks) {
+		return p.toks[i]
+	}
+	return tok{"eof", ""}
+}
+
+func (p *parser) peek() tok { return p.tok(0) }
+func (p *parser) next() tok { t := p.tok(0); p.pos++; return t }
 func (p *parser) at(v string) bool {
-	return p.toks[p.pos].kind == "op" && p.toks[p.pos].val == v
+	t := p.tok(0)
+	return t.kind == "op" && t.val == v
 }
 func (p *parser) atName(v string) bool {
-	return p.toks[p.pos].kind == "name" && p.toks[p.pos].val == v
+	t := p.tok(0)
+	return t.kind == "name" && t.val == v
 }
-func (p *parser) atKind(k string) bool { return p.toks[p.pos].kind == k }
+func (p *parser) atKind(k string) bool { return p.tok(0).kind == k }
 func (p *parser) expect(v string) error {
 	if !p.at(v) {
-		return fmt.Errorf("expected %q got %q (%s)", v, p.toks[p.pos].val, p.toks[p.pos].kind)
+		t := p.tok(0)
+		return fmt.Errorf("expected %q got %q (%s)", v, t.val, t.kind)
 	}
 	p.next()
 	return nil
@@ -940,7 +1084,7 @@ func (p *parser) parseCompare() (expr, error) {
 			l = binExpr{"in", l, r}
 			continue
 		}
-		if t.kind == "name" && t.val == "not" && p.toks[p.pos+1].kind == "name" && p.toks[p.pos+1].val == "in" {
+		if t.kind == "name" && t.val == "not" && p.tok(1).kind == "name" && p.tok(1).val == "in" {
 			p.next()
 			p.next()
 			r, err := p.parseConcat()
@@ -956,6 +1100,12 @@ func (p *parser) parseCompare() (expr, error) {
 			if p.atName("not") {
 				p.next()
 				neg = true
+			}
+			// `x is` / `x is not` at eof: without this guard next()
+			// eats the terminator and the at("(") probe indexes out
+			// of range — a panic, not a parse error.
+			if !p.atKind("name") {
+				return nil, fmt.Errorf("is: expected test name, got %q", p.peek().val)
 			}
 			name := p.next().val
 			var args []expr
@@ -1046,7 +1196,7 @@ func (p *parser) parsePostfix() (expr, error) {
 			if p.at("(") {
 				p.next()
 				for !p.at(")") {
-					if p.toks[p.pos].kind == "name" && p.toks[p.pos+1].kind == "op" && p.toks[p.pos+1].val == "=" {
+					if p.tok(0).kind == "name" && p.tok(1).kind == "op" && p.tok(1).val == "=" {
 						kn := p.next().val
 						p.next()
 						ke, err := p.parseTernary()
@@ -1086,7 +1236,7 @@ func (p *parser) parsePostfix() (expr, error) {
 			var args []expr
 			var kw []kwarg
 			for !p.at(")") {
-				if p.toks[p.pos].kind == "name" && p.toks[p.pos+1].kind == "op" && p.toks[p.pos+1].val == "=" {
+				if p.tok(0).kind == "name" && p.tok(1).kind == "op" && p.tok(1).val == "=" {
 					kn := p.next().val
 					p.next()
 					ke, err := p.parseTernary()
@@ -1213,7 +1363,16 @@ func truthy(v any) bool {
 	return true
 }
 
-func stringify(v any) string {
+func stringify(v any) string { return stringifyAt(v, 0) }
+
+// stringifyAt renders under a recursion budget (walkMaxDepth) —
+// a cyclic *List is constructible in-template and unbounded
+// recursion would burst the goroutine stack. Past the cap a
+// python-style "[...]" marks the elided tail.
+func stringifyAt(v any, depth int) string {
+	if depth > walkMaxDepth {
+		return "[...]"
+	}
 	switch t := v.(type) {
 	case nil:
 		return "None"
@@ -1236,16 +1395,16 @@ func stringify(v any) string {
 	case []any:
 		parts := make([]string, len(t))
 		for i, x := range t {
-			parts[i] = stringify(x)
+			parts[i] = stringifyAt(x, depth+1)
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
 	case *List:
-		return stringify(t.V)
+		return stringifyAt(t.V, depth+1)
 	case *OMap:
 		parts := make([]string, 0, t.Len())
 		for _, k := range t.Keys() {
 			vv, _ := t.Get(k)
-			parts = append(parts, "'"+k+"': "+stringify(vv))
+			parts = append(parts, "'"+k+"': "+stringifyAt(vv, depth+1))
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
 	}
@@ -1338,7 +1497,14 @@ func getIndex(v any, k any) (any, error) {
 		return t[i], nil
 	case string:
 		i, ok := toInt(k)
-		if !ok || i < 0 || i >= int64(len(t)) {
+		if !ok {
+			return Undefined{"index"}, nil
+		}
+		// Same negative-index semantics as the []any branch.
+		if i < 0 {
+			i += int64(len(t))
+		}
+		if i < 0 || i >= int64(len(t)) {
 			return Undefined{"index"}, nil
 		}
 		return string(t[i]), nil
@@ -1358,7 +1524,9 @@ func toInt(v any) (int64, bool) {
 		}
 		return 0, true
 	case string:
-		i, err := strconv.ParseInt(strings.TrimSpace(t), 0, 64)
+		// Base-10 only: ParseInt(s, 0, ...) reads a leading 0 as
+		// OCTAL ("010"→8, "08"→error) — python's int('010') is 10.
+		i, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64)
 		return i, err == nil
 	}
 	return 0, false
@@ -1401,11 +1569,33 @@ func numEq(l, r any) bool {
 	return stringify(l) == stringify(r)
 }
 
-func deepEq(l, r any) bool {
-	if lt, ok := l.(*List); ok {
-		l = lt.V
+func deepEq(l, r any) bool { return deepEqAt(l, r, 0) }
+
+// deepEqAt is deepEq under the walkMaxDepth recursion budget —
+// cyclic structures can't be compared meaningfully and would
+// overflow the stack; the deep tail answers false. Identical
+// container pointers short-circuit true so `l == l` stays true
+// even for a self-referential list.
+func deepEqAt(l, r any, depth int) bool {
+	if depth > walkMaxDepth {
+		return false
 	}
-	if rt, ok := r.(*List); ok {
+	switch lt := l.(type) {
+	case *List:
+		if lt == r {
+			return true
+		}
+		l = lt.V
+	case *OMap:
+		if lt == r {
+			return true
+		}
+	}
+	switch rt := r.(type) {
+	case *List:
+		if rt == l {
+			return true
+		}
 		r = rt.V
 	}
 	switch lt := l.(type) {
@@ -1417,7 +1607,7 @@ func deepEq(l, r any) bool {
 		for _, k := range lt.Keys() {
 			lv, _ := lt.Get(k)
 			rv, ok := rt.Get(k)
-			if !ok || !deepEq(lv, rv) {
+			if !ok || !deepEqAt(lv, rv, depth+1) {
 				return false
 			}
 		}
@@ -1428,7 +1618,7 @@ func deepEq(l, r any) bool {
 			return false
 		}
 		for i := range lt {
-			if !deepEq(lt[i], rt[i]) {
+			if !deepEqAt(lt[i], rt[i], depth+1) {
 				return false
 			}
 		}
@@ -1467,8 +1657,25 @@ func binOp(op string, l, r any) (any, error) {
 				return append(append([]any{}, ls...), rs...), nil
 			}
 		}
+		if isStr(l) || isStr(r) {
+			// str+str concatenates; str+number silently producing
+			// "53" for '5'+3 hides template bugs — python raises
+			// TypeError (use ~ for concat-coercion).
+			ls, lok := l.(string)
+			rs, rok := r.(string)
+			if lok && rok {
+				return ls + rs, nil
+			}
+			// Name the NON-string operand — reporting r's type
+			// blamed the string half when l was the offender.
+			bad := r
+			if !lok {
+				bad = l
+			}
+			return nil, fmt.Errorf("cannot concatenate string and %T (use ~ for coercion)", bad)
+		}
 		if lf, ok := toFloat(l); ok {
-			if rf, ok := toFloat(r); ok && !isStr(l) && !isStr(r) {
+			if rf, ok := toFloat(r); ok {
 				li, lInt := toInt(l)
 				ri, rInt := toInt(r)
 				if lInt && rInt && isNum(l) && isNum(r) {
@@ -1477,12 +1684,10 @@ func binOp(op string, l, r any) (any, error) {
 				return lf + rf, nil
 			}
 		}
-		if ls, ok := l.(string); ok {
-			if rs, ok := r.(string); ok {
-				return ls + rs, nil
-			}
-		}
-		return stringify(l) + stringify(r), nil
+		// list+num, dict+num, none+num … used to fall through to
+		// a silent stringify-concat — same bug-hiding class as
+		// str+num. Only num+num, str+str and seq+seq are legal.
+		return nil, fmt.Errorf("unsupported operand types for +: %T and %T", l, r)
 	case "-", "*", "/", "//", "%":
 		lf, lok := toFloat(l)
 		rf, rok := toFloat(r)
@@ -1589,6 +1794,18 @@ func isNum(v any) bool {
 	return false
 }
 
+// minMaxLess is the min/max comparator: numeric when both operands
+// are numbers, lexical on the string form otherwise — a non-numeric
+// list used to keep the first element untouched (never comparing).
+func minMaxLess(a, b any) bool {
+	if isNum(a) && isNum(b) {
+		af, _ := toFloat(a)
+		bf, _ := toFloat(b)
+		return af < bf
+	}
+	return stringify(a) < stringify(b)
+}
+
 func callValue(fn any, args []any, kw map[string]any, s *scope) (any, error) {
 	if m, ok := fn.(boundMethod); ok {
 		return m.call(args, s)
@@ -1636,6 +1853,9 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 		}
 	case "get":
 		if om, ok := m.obj.(*OMap); ok {
+			if len(args) == 0 {
+				return nil, fmt.Errorf("get: missing key argument")
+			}
 			if v, ok := om.Get(stringify(args[0])); ok {
 				return v, nil
 			}
@@ -1662,6 +1882,9 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 	case "strip":
 		return strings.TrimSpace(stringify(m.obj)), nil
 	case "index":
+		if len(args) == 0 {
+			return nil, fmt.Errorf("index: missing argument")
+		}
 		for i, it := range toIter(m.obj) {
 			if deepEq(it, args[0]) {
 				return int64(i), nil
@@ -1669,11 +1892,21 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 		}
 		return nil, fmt.Errorf("index: not found")
 	case "pop":
-		if l, ok := m.obj.(*List); ok && len(l.V) > 0 {
-			i := len(l.V) - 1
+		if l, ok := m.obj.(*List); ok {
+			if len(l.V) == 0 {
+				return nil, fmt.Errorf("pop: empty list")
+			}
+			i := int64(len(l.V)) - 1
 			if len(args) > 0 {
 				j, _ := toInt(args[0])
-				i = int(j)
+				i = j
+				// python list.pop accepts negative indices.
+				if i < 0 {
+					i += int64(len(l.V))
+				}
+			}
+			if i < 0 || i >= int64(len(l.V)) {
+				return nil, fmt.Errorf("pop: index %d out of range", i)
 			}
 			v := l.V[i]
 			l.V = append(l.V[:i], l.V[i+1:]...)
@@ -1702,62 +1935,66 @@ func splitAny(s, sep string) []any {
 
 // ---------------- tests ----------------
 
-func runTest(name string, v any, args []any) bool {
+func runTest(name string, v any, args []any) (bool, error) {
 	switch name {
 	case "defined":
-		return !isNilOrUndef(v)
+		return !isNilOrUndef(v), nil
 	case "undefined":
 		_, u := v.(Undefined)
-		return u
+		return u, nil
 	case "none":
-		return v == nil
+		return v == nil, nil
 	case "mapping":
 		_, ok := v.(*OMap)
-		return ok
+		return ok, nil
 	case "iterable", "sequence":
 		switch v.(type) {
 		case []any, *List, *OMap, string:
-			return true
+			return true, nil
 		}
-		return false
+		return false, nil
 	case "string":
 		_, ok := v.(string)
-		return ok
+		return ok, nil
 	case "number":
-		return isNum(v)
+		return isNum(v), nil
 	case "boolean", "bool":
 		_, ok := v.(bool)
-		return ok
+		return ok, nil
 	case "search":
 		if len(args) == 0 {
-			return false
+			return false, nil
 		}
 		re, err := regexp.Compile(stringify(args[0]))
 		if err != nil {
-			return false
+			return false, nil
 		}
-		return re.MatchString(stringify(v))
+		return re.MatchString(stringify(v)), nil
 	case "equalto", "eq":
 		if len(args) == 0 {
-			return false
+			return false, nil
 		}
-		return deepEq(v, args[0])
+		return deepEq(v, args[0]), nil
 	case "sameas":
 		if len(args) == 0 {
-			return false
+			return false, nil
 		}
-		return deepEq(v, args[0])
+		return deepEq(v, args[0]), nil
 	case "changed", "failed", "succeeded", "skipped":
-		return false
+		return false, nil
 	case "in":
 		if len(args) == 0 {
-			return false
+			return false, nil
 		}
 		r, _ := binOp("in", v, args[0])
 		b, _ := r.(bool)
-		return b
+		return b, nil
 	}
-	return truthy(v)
+	// Unknown test name — almost always a typo (is defind), and
+	// evaluating it was actively dangerous: false + `is not`
+	// negated to TRUE and silently opened the gate. Jinja raises
+	// "no test named"; do the same.
+	return false, fmt.Errorf("no test named %q", name)
 }
 
 // ---------------- filters ----------------
@@ -1968,9 +2205,18 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		matches := re.FindAllStringSubmatch(stringify(v), -1)
 		out := make([]any, 0, len(matches))
 		for _, m := range matches {
-			if len(m) > 1 {
+			switch {
+			case len(m) > 2:
+				// Multiple capture groups — python findall yields a
+				// tuple of ALL groups per match, not just group 1.
+				grps := make([]any, 0, len(m)-1)
+				for _, g := range m[1:] {
+					grps = append(grps, g)
+				}
+				out = append(out, &List{grps})
+			case len(m) == 2:
 				out = append(out, m[1])
-			} else {
+			default:
 				out = append(out, m[0])
 			}
 		}
@@ -2041,10 +2287,8 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		best := l[0]
 		for _, it := range l[1:] {
-			if f, ok := toFloat(it); ok {
-				if bf, ok := toFloat(best); ok && f < bf {
-					best = it
-				}
+			if minMaxLess(it, best) {
+				best = it
 			}
 		}
 		return best, nil
@@ -2055,15 +2299,13 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		best := l[0]
 		for _, it := range l[1:] {
-			if f, ok := toFloat(it); ok {
-				if bf, ok := toFloat(best); ok && f > bf {
-					best = it
-				}
+			if minMaxLess(best, it) {
+				best = it
 			}
 		}
 		return best, nil
 	case "format":
-		return pyFormat(stringify(v), args), nil
+		return pyFormat(stringify(v), args)
 	case "indent":
 		n := int64(4)
 		if len(args) > 0 {
@@ -2073,16 +2315,43 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		return pad + strings.ReplaceAll(stringify(v), "\n", "\n"+pad), nil
 	case "flatten":
 		var out []any
-		var rec func(x any)
-		rec = func(x any) {
-			for _, it := range toIter(x) {
-				rec(it)
-			}
-			if toIter(x) == nil {
+		var rec func(x any, depth int) error
+		rec = func(x any, depth int) error {
+			// Only real lists nest. toIter char-splits strings and
+			// dumps map keys, so routing everything through it
+			// turned ["ab","cd"] into [a b c d]; a dict is an atom.
+			var items []any
+			switch t := x.(type) {
+			case *List:
+				items = t.V
+			case []any:
+				items = t
+			default:
 				out = append(out, x)
+				return nil
 			}
+			if depth >= flattenMaxDepth {
+				// Depth cap keeps a self-referential list from
+				// recursing forever — keep the tail unexpanded.
+				out = append(out, items...)
+				return nil
+			}
+			for _, it := range items {
+				if err := rec(it, depth+1); err != nil {
+					return err
+				}
+				if len(out) > flattenMaxOut {
+					// A BRANCHING cycle (l.V=[l,l]) never nears
+					// the depth cap yet doubles output per level —
+					// budget total elements, not just depth.
+					return fmt.Errorf("flatten: output exceeds %d elements", flattenMaxOut)
+				}
+			}
+			return nil
 		}
-		rec(v)
+		if err := rec(v, 0); err != nil {
+			return nil, err
+		}
 		return &List{out}, nil
 	case "zip":
 		var out []any
@@ -2110,7 +2379,7 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return deepEq(v, args[0]), nil
 	case "search":
-		return runTest("search", v, args), nil
+		return runTest("search", v, args)
 	case "mandatory":
 		if isNilOrUndef(v) {
 			return nil, fmt.Errorf("mandatory: value undefined")
@@ -2120,7 +2389,11 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 	return nil, fmt.Errorf("unsupported filter %q", name)
 }
 
-func pyFormat(format string, args []any) string {
+// pyFormat implements the python printf-style subset used by the
+// format filter: %s/%r/%v, %d, %x/%X, %f/%e/%g (+upper) with
+// flags/width/precision, %c, %%. A conversion we cannot honour
+// errors rather than emitting silently wrong output.
+func pyFormat(format string, args []any) (string, error) {
 	out := format
 	argi := 0
 	var b strings.Builder
@@ -2136,30 +2409,87 @@ func pyFormat(format string, args []any) string {
 			continue
 		}
 		j := i + 1
-		for j < len(out) && !strings.ContainsRune("sdvrxXfEgGc", rune(out[j])) {
+		// A spec is flags/width/precision then ONE conversion
+		// letter — the first non-spec byte terminates it. Scanning
+		// for "a letter we handle" let %o/%u/%p pass through
+		// literally (or eat across text to the next real spec) and
+		// left %F a dead case.
+		for j < len(out) && strings.ContainsRune("0123456789-+. #", rune(out[j])) {
 			j++
 		}
-		if j >= len(out) || argi >= len(args) {
+		if j >= len(out) {
+			// Trailing incomplete spec ("%5" at EOF) — emit as-is.
 			b.WriteString(out[i:])
 			break
 		}
 		spec := out[i+1 : j]
 		conv := out[j]
+		switch conv {
+		case 's', 'd', 'v', 'r', 'x', 'X', 'f', 'F', 'e', 'E', 'g', 'G', 'c':
+		default:
+			return "", fmt.Errorf("format: unsupported conversion %%%c", conv)
+		}
+		if argi >= len(args) {
+			return "", fmt.Errorf("format: not enough args for %%%s%c", spec, conv)
+		}
 		a := args[argi]
 		argi++
 		switch conv {
 		case 'd':
-			iv, _ := toInt(a)
-			width := 0
-			num := strings.TrimLeft(spec, "-+0")
-			fmt.Sscanf(num, "%d", &width)
+			iv, ok := toInt(a)
+			if !ok {
+				return "", fmt.Errorf("format: %%%sd arg %v is not a number", spec, a)
+			}
+			if !validFmtSpec(spec, false) {
+				return "", fmt.Errorf("format: unsupported %%%s%c spec", spec, conv)
+			}
 			if strings.Contains(spec, "-") {
+				width := 0
+				fmt.Sscanf(strings.TrimLeft(spec, "-+0"), "%d", &width)
 				b.WriteString(fmt.Sprintf("%-"+strconv.Itoa(width)+"d", iv))
 			} else {
 				b.WriteString(fmt.Sprintf("%"+spec+"d", iv))
 			}
+		case 'x', 'X':
+			iv, ok := toInt(a)
+			if !ok {
+				return "", fmt.Errorf("format: %%%s%c arg %v is not a number", spec, conv, a)
+			}
+			if !validFmtSpec(spec, true) {
+				return "", fmt.Errorf("format: unsupported %%%s%c spec", spec, conv)
+			}
+			b.WriteString(fmt.Sprintf("%"+spec+string(conv), iv))
+		case 'f', 'F', 'e', 'E', 'g', 'G':
+			fv, ok := toFloat(a)
+			if !ok {
+				return "", fmt.Errorf("format: %%%s%c arg %v is not a number", spec, conv, a)
+			}
+			if !validFmtSpec(spec, true) {
+				return "", fmt.Errorf("format: unsupported %%%s%c spec", spec, conv)
+			}
+			b.WriteString(fmt.Sprintf("%"+spec+string(conv), fv))
+		case 'c':
+			if iv, ok := toInt(a); ok {
+				b.WriteString(string(rune(iv)))
+			} else if sv := stringify(a); sv != "" {
+				// First RUNE, not first byte — sv[:1] split a
+				// multi-byte UTF-8 character.
+				for _, r := range sv {
+					b.WriteRune(r)
+					break
+				}
+			}
 		case 's', 'v', 'r':
 			sv := stringify(a)
+			// %.Ns truncates the string form (python precision
+			// semantics on %s).
+			if dot := strings.IndexByte(spec, '.'); dot >= 0 {
+				if n, err := strconv.Atoi(spec[dot+1:]); err == nil && n >= 0 {
+					if rs := []rune(sv); len(rs) > n {
+						sv = string(rs[:n])
+					}
+				}
+			}
 			num := strings.TrimLeft(spec, "-")
 			width := 0
 			fmt.Sscanf(num, "%d", &width)
@@ -2170,12 +2500,37 @@ func pyFormat(format string, args []any) string {
 			} else {
 				b.WriteString(sv)
 			}
-		default:
-			b.WriteString(stringify(a))
 		}
 		i = j
 	}
-	return b.String()
+	if argi < len(args) {
+		return "", fmt.Errorf("format: not all arguments converted (%d given)", len(args))
+	}
+	return b.String(), nil
+}
+
+// validFmtSpec reports whether spec (between % and the conversion
+// letter) is flags → width → .precision IN ORDER — the flat
+// char-set check used to accept "%5-2f", whose mid-spec '-' then
+// rendered as Go's %!f(BAD) noise. precision requires dot.
+func validFmtSpec(spec string, dot bool) bool {
+	i := 0
+	for i < len(spec) && strings.ContainsRune("-+ #0", rune(spec[i])) {
+		i++ // flags
+	}
+	for i < len(spec) && spec[i] >= '0' && spec[i] <= '9' {
+		i++ // width
+	}
+	if i < len(spec) && spec[i] == '.' {
+		if !dot {
+			return false
+		}
+		i++
+		for i < len(spec) && spec[i] >= '0' && spec[i] <= '9' {
+			i++ // precision
+		}
+	}
+	return i == len(spec)
 }
 
 func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
@@ -2211,10 +2566,6 @@ func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
 func selectAttrKey(v any, path string) any {
 	cur := v
 	for _, seg := range strings.Split(path, ".") {
-		if m, ok := cur.(boundMethod); ok {
-			cur = m
-			continue
-		}
 		cur = getAttr(cur, seg)
 		if _, u := cur.(Undefined); u {
 			return cur
@@ -2241,7 +2592,11 @@ func filterSelectAttr(v any, args []any, keep bool) (any, error) {
 		if testName == "" {
 			ok = truthy(val)
 		} else {
-			ok = runTest(testName, val, testArgs)
+			var err error
+			ok, err = runTest(testName, val, testArgs)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if ok == keep {
 			out = append(out, it)
@@ -2251,13 +2606,24 @@ func filterSelectAttr(v any, args []any, keep bool) (any, error) {
 }
 
 func filterTest(v any, args []any, keep bool) (any, error) {
+	var out []any
 	if len(args) == 0 {
-		return v, nil
+		// select/reject with no test filters on truthiness —
+		// `x | select` keeps truthy items, `| reject` drops them
+		// (previously the whole list passed through unchanged).
+		for _, it := range toIter(v) {
+			if truthy(it) == keep {
+				out = append(out, it)
+			}
+		}
+		return &List{out}, nil
 	}
 	testName := stringify(args[0])
-	var out []any
 	for _, it := range toIter(v) {
-		ok := runTest(testName, it, args[1:])
+		ok, err := runTest(testName, it, args[1:])
+		if err != nil {
+			return nil, err
+		}
 		if ok == keep {
 			out = append(out, it)
 		}
@@ -2267,25 +2633,33 @@ func filterTest(v any, args []any, keep bool) (any, error) {
 
 // ---------------- conversions ----------------
 
-func jsonValue(v any) any {
+func jsonValue(v any) any { return jsonValueAt(v, 0) }
+
+// jsonValueAt converts under the walkMaxDepth recursion budget —
+// a cyclic value can't be marshaled anyway, so past the cap a
+// "[...]" string placeholder stands in (marshal-safe).
+func jsonValueAt(v any, depth int) any {
+	if depth > walkMaxDepth {
+		return "[...]"
+	}
 	switch t := v.(type) {
 	case *OMap:
 		m := map[string]any{}
 		for _, k := range t.Keys() {
 			vv, _ := t.Get(k)
-			m[k] = jsonValue(vv)
+			m[k] = jsonValueAt(vv, depth+1)
 		}
 		return m
 	case *List:
 		out := make([]any, len(t.V))
 		for i, x := range t.V {
-			out[i] = jsonValue(x)
+			out[i] = jsonValueAt(x, depth+1)
 		}
 		return out
 	case []any:
 		out := make([]any, len(t))
 		for i, x := range t {
-			out[i] = jsonValue(x)
+			out[i] = jsonValueAt(x, depth+1)
 		}
 		return out
 	case Undefined:
@@ -2324,25 +2698,33 @@ func fromJSON(v any) any {
 	}
 }
 
-func toPlain(v any) any {
+func toPlain(v any) any { return toPlainAt(v, 0) }
+
+// toPlainAt converts under the walkMaxDepth recursion budget —
+// same cyclic-input guard as jsonValueAt; past the cap a "[...]"
+// placeholder keeps the yaml.Marshal fed and acyclic.
+func toPlainAt(v any, depth int) any {
+	if depth > walkMaxDepth {
+		return "[...]"
+	}
 	switch t := v.(type) {
 	case *OMap:
 		m := map[string]any{}
 		for _, k := range t.Keys() {
 			vv, _ := t.Get(k)
-			m[k] = toPlain(vv)
+			m[k] = toPlainAt(vv, depth+1)
 		}
 		return m
 	case *List:
 		out := make([]any, len(t.V))
 		for i, x := range t.V {
-			out[i] = toPlain(x)
+			out[i] = toPlainAt(x, depth+1)
 		}
 		return out
 	case []any:
 		out := make([]any, len(t))
 		for i, x := range t {
-			out[i] = toPlain(x)
+			out[i] = toPlainAt(x, depth+1)
 		}
 		return out
 	case Undefined:

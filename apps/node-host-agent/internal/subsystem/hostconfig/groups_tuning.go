@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -45,9 +46,38 @@ var t7KubeletCfgCandidates = []string{
 }
 
 var (
-	t7ExtraArgsRe = regexp.MustCompile(`--kubelet-extra-args=\S+`)
+	// --kubelet-extra-args= may be bare or single/double-quoted. The
+	// quoted arms MUST come first: a bare \S+ match would swallow a
+	// closing quote and appended \x20-flags would land OUTSIDE the
+	// value — bare k0s argv with literal backslash-x-2-0 garbage.
+	t7ExtraArgsRe = regexp.MustCompile(`--kubelet-extra-args=("[^"\n]*"|'[^'\n]*'|\S+)`)
 	t7DataDirRe   = regexp.MustCompile(`ExecStart=.*k0s (worker|controller) --data-dir=\S+`)
 )
+
+// t7AppendExtraArgs appends extra inside the --kubelet-extra-args
+// VALUE — before the closing quote when the value is quoted — so the
+// literal \x20 separators stay within the kubelet arg string.
+// ok=false means the value has an UNTERMINATED quote ("abc with no
+// closing ") — appending would merge flags into a string systemd
+// tokenizes differently than intended, so the caller drops the whole
+// rewrite rather than emit a mangled ExecStart.
+func t7AppendExtraArgs(u, extra string) (string, bool) {
+	ok := true
+	out := t7ExtraArgsRe.ReplaceAllStringFunc(u, func(m string) string {
+		v := strings.TrimPrefix(m, "--kubelet-extra-args=")
+		if v != "" && (v[0] == '"' || v[0] == '\'') {
+			if len(v) < 2 || v[len(v)-1] != v[0] {
+				// Quote opened but never closed — leave m untouched
+				// and refuse the rewrite.
+				ok = false
+				return m
+			}
+			return m[:len(m)-1] + extra + m[len(m)-1:]
+		}
+		return m + extra
+	})
+	return out, ok
+}
 
 // kubeletCfgPath ports the T7 discovery: --config of the running
 // kubelet (via /proc cmdline), else the first existing candidate.
@@ -206,6 +236,14 @@ func (c *cyc) groupPulls() {
 
 	// Flags go INSIDE --kubelet-extra-args with literal \x20
 	// separators — a real space would turn them into bare k0s argv.
+	// qps/burst land raw inside ExecStart — a vars value carrying
+	// whitespace/metachars would corrupt the unit (a newline splits
+	// ExecStart into a bogus second line). Same charset gate the
+	// sh -c interpolations use; a refused value skips ONLY the unit
+	// rewrite — the kubelet-cfg/containerd converge below does not
+	// interpolate them.
+	flagsOK := c.shToken("kubelet_registry_qps", qps) &&
+		c.shToken("kubelet_registry_burst", burst)
 	changed := false
 	for _, p := range units {
 		b, err := os.ReadFile(r.hp(p))
@@ -216,22 +254,31 @@ func (c *cyc) groupPulls() {
 		}
 		u := string(b)
 		u2 := u
-		if strings.Contains(u2, "--kubelet-extra-args") {
-			if !strings.Contains(u2, "--serialize-image-pulls") {
-				u2 = t7ExtraArgsRe.ReplaceAllString(u2,
-					"${0}\\x20--serialize-image-pulls=false")
+		if flagsOK {
+			if strings.Contains(u2, "--kubelet-extra-args") {
+				ok := true
+				if !strings.Contains(u2, "--serialize-image-pulls") {
+					u2, ok = t7AppendExtraArgs(u2, `\x20--serialize-image-pulls=false`)
+				}
+				if ok && !strings.Contains(u2, "--registry-qps") {
+					u2, ok = t7AppendExtraArgs(u2,
+						`\x20--registry-qps=`+qps+`\x20--registry-burst=`+burst)
+				}
+				if !ok {
+					// Unterminated quote — leave the unit file
+					// untouched rather than write a mangled ExecStart.
+					c.err("T7: unterminated --kubelet-extra-args quote — unit left untouched",
+						"path", p)
+					continue
+				}
+			} else {
+				// Unit without extra-args: inject full token after
+				// `k0s (worker|controller) --data-dir=\S+` (bootstrap
+				// installFlags parity).
+				u2 = t7DataDirRe.ReplaceAllString(u2,
+					"${0} --kubelet-extra-args=--serialize-image-pulls=false\\x20--registry-qps="+
+						qps+"\\x20--registry-burst="+burst)
 			}
-			if !strings.Contains(u2, "--registry-qps") {
-				u2 = t7ExtraArgsRe.ReplaceAllString(u2,
-					"${0}\\x20--registry-qps="+qps+"\\x20--registry-burst="+burst)
-			}
-		} else {
-			// Unit without extra-args: inject full token after
-			// `k0s (worker|controller) --data-dir=\S+` (bootstrap
-			// installFlags parity).
-			u2 = t7DataDirRe.ReplaceAllString(u2,
-				"${0} --kubelet-extra-args=--serialize-image-pulls=false\\x20--registry-qps="+
-					qps+"\\x20--registry-burst="+burst)
 		}
 		if u2 != u {
 			if ch, _ := r.writeManaged(p, []byte(u2), 0o644); ch {
@@ -657,7 +704,14 @@ func (c *cyc) renderZoneFile() ([]byte, error) {
 		}
 		if hv, ok := om.Get("hub"); ok {
 			if b, _ := hv.(bool); b {
-				hubs = append(hubs, nodeIPStr(om, "name"))
+				nm := nodeIPStr(om, "name")
+				// A hub without a registry marker would render
+				// `nsN IN A ` with empty rdata and coredns rejects
+				// the whole zone — pinZoneRecords guard parity.
+				if nm == "" || t.Markers[nm] == "" {
+					continue
+				}
+				hubs = append(hubs, nm)
 			}
 		}
 	}
@@ -744,6 +798,13 @@ func jsonPlain(v any) any {
 
 func (c *cyc) corednsInstallBinary() {
 	ver := c.v("interdc_coredns_version")
+	if ver == "" || ver == "None" {
+		// Same empty-pin rule as nebula: "CoreDNS-"+"" matches every
+		// -version output (never upgrades) and download("") is a
+		// counted bogus fetch. Not pinned = not installed.
+		c.err("T9: interdc_coredns_version not pinned — coredns not installed")
+		return
+	}
 	if out, err := c.r.run(c.ctx, "/usr/local/bin/coredns", "-version"); err == nil &&
 		strings.Contains(out, "CoreDNS-"+ver) {
 		return
@@ -759,7 +820,7 @@ func (c *cyc) corednsInstallBinary() {
 				"file", local, "sha256", sum)
 			return
 		}
-	} else if err := download(c.ctx, url, local, sum); err != nil {
+	} else if err := c.r.download(c.ctx, url, local, sum); err != nil {
 		c.err("T9: coredns download", "url", url, "file", local, "error", err)
 		return
 	}
@@ -809,7 +870,9 @@ func (c *cyc) groupSecurity() {
 	r, ctx := c.r, c.ctx
 	if c.vb("fail2ban_enabled") {
 		if out, _ := r.run(ctx, "dpkg-query", "-W", "-f=${db:Status-Status}", "fail2ban"); out != "installed" {
-			if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+			// runLong: apt install on slow egress outlives the
+			// interactive budget.
+			if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 				"apt-get", "install", "-y", "fail2ban"); err != nil {
 				c.err("security: fail2ban install failed — jail will not apply",
 					"error", err)
@@ -837,7 +900,8 @@ func (c *cyc) groupSecurity() {
 		// remove the jail AND purge the package.
 		r.removeManaged("/etc/fail2ban/jail.d/90-cluster-sshd.conf")
 		r.removeManaged("/etc/fail2ban/jail.d/cluster.conf")
-		if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+		// runLong: same slow-egress budget as the install above.
+		if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 			"apt-get", "purge", "-y", "fail2ban"); err != nil {
 			c.err("security: fail2ban purge failed — package remains",
 				"error", err)
@@ -967,13 +1031,15 @@ func (c *cyc) groupAPILB() {
 		local := r.hp(hostDeb)
 		r.ensureDir("/var/lib/node-watchdog", 0o755)
 		if !(fileExistsNoRoot(local) && sha256FileOK(local, c.v("api_lb_haproxy_deb_sha256"))) {
-			if err := download(ctx, c.v("api_lb_haproxy_deb_url"), local, c.v("api_lb_haproxy_deb_sha256")); err != nil {
+			if err := r.download(ctx, c.v("api_lb_haproxy_deb_url"), local, c.v("api_lb_haproxy_deb_sha256")); err != nil {
 				c.err("T12: haproxy deb download",
 					"url", c.v("api_lb_haproxy_deb_url"), "deb", hostDeb, "error", err)
 				return
 			}
 		}
-		if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+		// runLong: dep resolution on slow egress outlives the
+		// interactive budget.
+		if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 			"apt-get", "install", "-y", hostDeb); err != nil {
 			c.err("T12: haproxy deb install failed — continuing with installed version",
 				"deb", hostDeb, "error", err)
@@ -983,11 +1049,13 @@ func (c *cyc) groupAPILB() {
 	// frontend) — A1 runs a dedicated unit; keep the distro one off.
 	r.run(ctx, "systemctl", "disable", "--now", "haproxy.service")
 	r.ensureDir("/etc/haproxy", 0o755)
-	cfgChanged, _ := r.writeManaged("/etc/haproxy/api-local-lb.cfg", cfg, 0o644)
-	// validate cfg before touching the unit (ansible fails the run).
-	if out, err := r.run(ctx, "/usr/sbin/haproxy", "-c", "-f", "/etc/haproxy/api-local-lb.cfg"); err != nil {
-		c.err("T12: haproxy -c failed — not starting/restarting api-local-lb",
-			"conf", "/etc/haproxy/api-local-lb.cfg", "out", out, "error", err)
+	// Candidate-staged validate-then-promote (applyNftUnit parity):
+	// haproxy -c runs on the CANDIDATE — a bad render never sits at
+	// the live path where ExecStart loads it on next start.
+	cfgChanged, ok := c.checkedDeploy("/etc/haproxy/api-local-lb.cfg", cfg, 0o644,
+		"T12: haproxy -c failed — not starting/restarting api-local-lb",
+		"/usr/sbin/haproxy", "-c", "-f")
+	if !ok {
 		return
 	}
 	// Root-netns DNAT (pod host-netns consumers). FAIL-OPEN via
@@ -995,7 +1063,8 @@ func (c *cyc) groupAPILB() {
 	// unit template — the table dies with the LB.
 	nftChanged := false
 	if vip := c.v("api_lb_vip_ip"); vip != "" && vip != "None" {
-		if _, err := r.run(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+		// runLong: same slow-egress budget as the haproxy deb.
+		if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 			"apt-get", "install", "-y", "nftables"); err != nil {
 			c.err("T12: nftables install failed — nft -c may fail below",
 				"error", err)
@@ -1020,13 +1089,16 @@ table ip api_local_dnat {
 %s    }
 }
 `, vip, rules.String())
-		nftChanged, _ = r.writeManaged("/etc/api-local-dnat.nft", []byte(nft), 0o644)
-		if out, err := r.run(ctx, "nft", "-c", "-f", "/etc/api-local-dnat.nft"); err != nil {
-			c.err("T12: nft ruleset failed nft -c — DNAT not applied",
-				"path", "/etc/api-local-dnat.nft", "vip", vip,
-				"out", out, "error", err)
+		// Same candidate-staged deploy as the cfg — nft -c runs on
+		// the candidate; a bad ruleset never reaches the path
+		// ExecStartPost loads.
+		nch, ok := c.checkedDeploy("/etc/api-local-dnat.nft", []byte(nft), 0o644,
+			"T12: nft ruleset failed nft -c — DNAT not applied",
+			"nft", "-c", "-f")
+		if !ok {
 			return
 		}
+		nftChanged = nch
 	}
 	// sweep the invented separate-unit deployment of the first port.
 	r.run(ctx, "systemctl", "disable", "--now", "api-lb-dnat.service")
@@ -1042,7 +1114,9 @@ table ip api_local_dnat {
 		r.daemonReload(ctx)
 	}
 	r.ensureService(ctx, "api-local-lb.service", true, true)
-	if cfgChanged || nftChanged {
+	// Unit drift restarts too — daemon-reload alone leaves haproxy
+	// running the OLD unit definition (kine.service parity).
+	if cfgChanged || nftChanged || uch {
 		r.restartService(ctx, "api-local-lb.service")
 	}
 	// Gate: LB must accept on 127.0.0.1:6443 before /etc/hosts pin —
@@ -1106,9 +1180,23 @@ func (c *cyc) probeReachable() []string {
 		if as == "" || ns == "" {
 			continue
 		}
-		host, port, _ := strings.Cut(as, ":")
+		// net.SplitHostPort handles bracketed IPv6 ([::1]:6443) —
+		// a first-colon Cut would mangle it. When SplitHostPort
+		// errors (bare host, missing port) keep the first-colon cut
+		// the probe always used.
+		host, port, err := net.SplitHostPort(as)
+		if err != nil {
+			host, port, _ = strings.Cut(as, ":")
+		}
 		if port == "" {
 			port = "6443"
+		}
+		// host/port land inside the single-quoted bash -c argument —
+		// gate them so a vars typo can never inject shell (a quote in
+		// host would close the '...' wrapper).
+		if !c.shToken("api_lb_backends addr host", host) ||
+			!c.shPort("api_lb_backends addr port", port) {
+			continue
 		}
 		// ansible: timeout 5 bash -c 'cat < /dev/null > /dev/tcp/h/p'
 		// — /dev/tcp is a bashism; sh/dash has no such device.
@@ -1133,7 +1221,16 @@ func hostsBlockRe(mark string) *regexp.Regexp {
 
 // blockInHosts upserts an ansible-style managed block in /etc/hosts.
 func (c *cyc) blockInHosts(mark, block string) {
-	hosts, _ := os.ReadFile(c.r.hp("/etc/hosts"))
+	hosts, err := os.ReadFile(c.r.hp("/etc/hosts"))
+	if err != nil && !os.IsNotExist(err) {
+		// Bail like removeFromHosts: appending after a failed read
+		// would rewrite /etc/hosts to ONLY the managed block.
+		c.err("hosts: cannot read /etc/hosts — managed block not written",
+			"mark", mark, "error", err)
+		return
+	}
+	// ENOENT is fine — a minimal image may ship no /etc/hosts at
+	// all; write it containing just the managed block.
 	re := hostsBlockRe(mark)
 	var nh []byte
 	if re.Match(hosts) {
@@ -1193,12 +1290,20 @@ func (c *cyc) groupVerify() {
 
 // ---------- download helpers ----------
 
-func download(ctx context.Context, url, dst, wantSHA256 string) error {
+// download fetches url to dst under the Config.HTTPTimeout client
+// deadline (nebula/coredns/etcdctl tarballs, haproxy + kine deb/bin).
+func (r *Reconciler) download(ctx context.Context, url, dst, wantSHA256 string) error {
+	return downloadFile(ctx, url, dst, wantSHA256, r.cfg.HTTPTimeout)
+}
+
+// downloadFile streams url to dst atomically: tmp file + sha256
+// verify + fsync + rename, partial tmp swept on every failure path.
+func downloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time.Duration) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
 		return err
 	}
@@ -1216,15 +1321,28 @@ func download(ctx context.Context, url, dst, wantSHA256 string) error {
 	}
 	h := sha256.New()
 	_, err = io.Copy(io.MultiWriter(f, h), resp.Body)
-	f.Close()
+	if err == nil {
+		// fsync before rename — the staged artifact must be durable;
+		// Close's error counts too (NFS/delayed-write failures only
+		// surface there).
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
 	if err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	if wantSHA256 != "" && !strings.EqualFold(wantSHA256, fmt.Sprintf("%x", h.Sum(nil))) {
 		os.Remove(tmp)
 		return fmt.Errorf("download %s: sha256 mismatch", url)
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // untarInstall extracts member name from a .tar.gz and atomically
@@ -1253,14 +1371,28 @@ func untarInstall(tgz, member, dst string, mode os.FileMode) error {
 				return err
 			}
 			_, err = io.Copy(out, tr)
-			out.Close()
+			if err == nil {
+				// fsync before rename (writeManaged parity) — a
+				// crash after rename must never expose a zeroed
+				// binary at the install path.
+				err = out.Sync()
+			}
+			// Close's error counts too — delayed-write failures only
+			// surface there.
+			if cerr := out.Close(); err == nil {
+				err = cerr
+			}
 			if err != nil {
 				// sweep the partial tmp — a truncated member must not
 				// linger next to the live binary.
 				os.Remove(tmp)
 				return err
 			}
-			return os.Rename(tmp, dst)
+			if err := os.Rename(tmp, dst); err != nil {
+				os.Remove(tmp)
+				return err
+			}
+			return nil
 		}
 	}
 }

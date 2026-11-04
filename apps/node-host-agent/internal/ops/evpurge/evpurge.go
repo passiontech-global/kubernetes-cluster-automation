@@ -43,6 +43,11 @@ const (
 	fallbackCAFile  = "/var/lib/k0s/pki/etcd/ca.crt"
 	defaultCertFile = "/var/lib/k0s/pki/admin.crt"
 	defaultKeyFile  = "/var/lib/k0s/pki/admin.key"
+
+	// maxResponseBytes caps one apiserver response body — a LIST
+	// page of 500 events is ~1-2MB; a hostile or pathological reply
+	// must not slurp unbounded heap.
+	maxResponseBytes = 8 << 20
 )
 
 // DefaultCA resolves the CA the script picked: /var/lib/k0s/pki/ca.crt
@@ -115,6 +120,10 @@ func (c Config) httpClient() (*http.Client, error) {
 	return &http.Client{
 		Timeout: c.Timeout,
 		Transport: &http.Transport{
+			// The worker pool runs cfg.Workers parallel DELETEs —
+			// the default MaxIdleConnsPerHost=2 would churn
+			// connections every cycle.
+			MaxIdleConnsPerHost: c.Workers,
 			TLSClientConfig: &tls.Config{
 				RootCAs:      pool,
 				Certificates: []tls.Certificate{cert},
@@ -176,16 +185,25 @@ func doReq(ctx context.Context, client *http.Client, method, u string) (int, []b
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	// Read cap+1 so an oversize body is distinguishable from one
+	// landing exactly on the cap — a LimitReader-truncated page would
+	// otherwise surface downstream as a misleading JSON syntax error.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return resp.StatusCode, nil, err
+	}
+	if len(body) > maxResponseBytes {
+		return resp.StatusCode, nil, fmt.Errorf(
+			"response exceeded %dMiB cap", maxResponseBytes>>20)
 	}
 	return resp.StatusCode, body, nil
 }
 
 // listStale walks the paginated event LIST once (limit=500,
-// resourceVersion=0 — a quorum read, the script's exact query) and
-// returns the delete path of every item older than cutoff.
+// resourceVersion=0 — the script's exact query; rv=0 is a possibly-
+// stale cache read, acceptable for a one-shot purge since a freshly
+// missed event simply survives to the next run) and returns the
+// delete path of every item older than cutoff.
 func listStale(ctx context.Context, client *http.Client,
 	base string, cutoff time.Time) ([]string, error) {
 	var paths []string
@@ -222,7 +240,9 @@ func listStale(ctx context.Context, client *http.Client,
 
 // deleteAll is the script's ThreadPoolExecutor(WORKERS) map — one
 // shared client, N workers pulling delete paths off a channel.
-// A DELETE counts as ok on any 2xx; a transport error or non-2xx
+// A DELETE counts as ok on any 2xx — and on 404/410, since an event
+// GC'd or deleted between LIST and DELETE is already in the desired
+// end state, not a failure. Any other transport error or non-2xx
 // status counts as errors (the script's `except: err += 1`). The
 // first failure's detail is returned for the summary — the bare
 // tally cannot distinguish RBAC denials from a wedged apiserver.
@@ -238,7 +258,11 @@ func deleteAll(ctx context.Context, client *http.Client, base string,
 			for p := range jobs {
 				code, _, err := doReq(ctx, client, http.MethodDelete, base+p)
 				mu.Lock()
-				if err == nil && code/100 == 2 {
+				if err == nil && (code/100 == 2 ||
+					code == http.StatusNotFound || code == http.StatusGone) {
+					// 2xx deleted it; 404/410 means the event was
+					// GC'd or deleted between LIST and DELETE — the
+					// desired end state either way, not an error.
 					ok++
 				} else {
 					errs++
@@ -258,8 +282,9 @@ func deleteAll(ctx context.Context, client *http.Client, base string,
 		select {
 		case jobs <- p:
 		case <-ctx.Done():
-			// Stop feeding; in-flight deletes still settle into the
-			// counters (workers drain the buffered sends already made).
+			// Stop feeding; jobs is UNBUFFERED so "in-flight" is just
+			// the paths a worker already received — those still settle
+			// into the counters while wg.Wait drains the pool.
 			close(jobs)
 			wg.Wait()
 			return ok, errs, firstErr

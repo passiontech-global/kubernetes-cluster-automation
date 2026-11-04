@@ -94,7 +94,11 @@ func (k *KineDB) guardTrigger(head, compactRev, rows, retained, freeze int64, pr
 // (each DO block is its own autocommitted statement = one txn per
 // chunk, same as the bash per-chunk DO), VACUUM, unlock. The \gset +
 // \if keeps every statement behind the lock check; a busy lock echoes
-// the lockBusyMarker and skips everything.
+// the lockBusyMarker and skips everything. Each chunk's row count is
+// also INSERTed into the kcg_deleted temp table and SELECTed back at
+// the end: RAISE NOTICE travels on stderr, which the runner keeps
+// out of stdout, so the `deleted=N` lines sumDeleted parses must be
+// real query output.
 func (k *KineDB) buildCompactScript(cur, target int64) string {
 	t := k.cfg.Table
 	var b strings.Builder
@@ -102,6 +106,7 @@ func (k *KineDB) buildCompactScript(cur, target int64) string {
 		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS kcg_locked;\n",
 		k.cfg.AdvisoryLockID)
 	b.WriteString("\\gset\n\\if :kcg_locked\n")
+	b.WriteString("CREATE TEMP TABLE kcg_deleted(n int);\n")
 	for chunks := 0; cur < target && chunks < k.cfg.MaxChunks; chunks++ {
 		next := cur + k.cfg.ChunkRevisions
 		if next > target {
@@ -120,11 +125,13 @@ BEGIN
       WHERE kd.deleted != 0 AND kd.id > %d AND kd.id <= %d
   ) AS ks WHERE kv.id = ks.id;
   GET DIAGNOSTICS n = ROW_COUNT;
+  INSERT INTO kcg_deleted VALUES (n);
   RAISE NOTICE 'deleted=%%', n;
 END $$;
 `, t, next, compactRevKey, t, t, compactRevKey, cur, next, t, cur, next)
 		cur = next
 	}
+	b.WriteString("SELECT 'deleted=' || n AS deleted FROM kcg_deleted;\n")
 	fmt.Fprintf(&b, "VACUUM (ANALYZE) %s;\n", t)
 	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", k.cfg.AdvisoryLockID)
 	b.WriteString("\\else\n\\echo '" + lockBusyMarker + "'\n\\endif\n")
@@ -285,10 +292,6 @@ func (k *KineDB) emitGuard(res *guardResult) {
 	p.gauge("kine_db_guard_ok",
 		"Compact guard result (1 = ok/skip, 0 = fail)", ok)
 	k.m.guardOK.Set(ok)
-	p.gauge("kine_db_guard_freeze_cycles",
-		"Consecutive runs compact_rev stayed frozen while head advanced",
-		float64(res.frozen))
-	k.m.guardFreeze.Set(float64(res.frozen))
 	fired := 0.0
 	if res.fired {
 		fired = 1
@@ -296,12 +299,18 @@ func (k *KineDB) emitGuard(res *guardResult) {
 	p.gauge("kine_db_guard_fired",
 		"1 when the last guard run executed a compact session", fired)
 	k.m.guardFired.Set(fired)
-	// kine_db_rows lives here, not in the probe textfile — the
-	// COUNT(*) it needs seq-scans the table, so it belongs to the
-	// 10-min cadence. Emitting it in both files would also fail the
-	// scrape (duplicate series across textfiles). Skip it when the
-	// stats read failed — a fabricated 0 is worse than going stale.
+	// freeze_cycles + kine_db_rows come out of the stats read —
+	// kine_db_rows lives here, not in the probe textfile, because
+	// the COUNT(*) it needs seq-scans the table (10-min cadence)
+	// and emitting it in both files would fail the scrape
+	// (duplicate series across textfiles). Both gauges are skipped
+	// when the stats read failed — a fabricated 0 overwriting a
+	// meaningful freeze count (or row count) is worse than stale.
 	if res.statsOK {
+		p.gauge("kine_db_guard_freeze_cycles",
+			"Consecutive runs compact_rev stayed frozen while head advanced",
+			float64(res.frozen))
+		k.m.guardFreeze.Set(float64(res.frozen))
 		p.gauge("kine_db_rows",
 			"Row count of the kine table — kine boot fill cost",
 			float64(res.rows))

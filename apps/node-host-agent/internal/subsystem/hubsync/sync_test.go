@@ -101,8 +101,8 @@ func TestSyncTargetFreshHost(t *testing.T) {
 	}
 	ops := strings.Join(c.opsLog(), "\n")
 	assertOpOrder(t, c.opsLog(),
-		"run:systemctl enable node-host-agent.service",
-		"run:systemctl restart node-host-agent.service")
+		"run:systemctl enable 'node-host-agent.service'",
+		"run:systemctl restart 'node-host-agent.service'")
 	if strings.Contains(ops, "enable --now") {
 		t.Fatalf("binary install path must restart, not enable --now:\n%s", ops)
 	}
@@ -180,7 +180,7 @@ func TestSyncTargetBinaryUpdatedRestarts(t *testing.T) {
 	ops := c.opsLog()
 	assertOpOrder(t, ops,
 		"run:mv '/usr/local/bin/.node-host-agent.tmp' '/usr/local/bin/node-host-agent'",
-		"run:systemctl restart node-host-agent.service")
+		"run:systemctl restart 'node-host-agent.service'")
 	joined := strings.Join(ops, "\n")
 	if strings.Contains(joined, "enable --now") {
 		t.Fatalf("binary update path must restart, not enable --now:\n%s", joined)
@@ -724,7 +724,7 @@ func TestSystemdUnitContent(t *testing.T) {
 		"/usr/local/bin/node-host-agent",
 		"/etc/node-host-agent/vars", "/etc/node-host-agent/nebula-certs")
 	for _, want := range []string{
-		"ExecStart=/usr/local/bin/node-host-agent --standalone --node-name=db-vm --health-probe-bind-address=:8091",
+		"ExecStart=/usr/local/bin/node-host-agent --standalone --node-name='db-vm' --health-probe-bind-address=:8091",
 		"Environment=NODE_HOST_AGENT_HOST_ROOT=/",
 		"Environment=NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR=/etc/node-host-agent/vars",
 		"Environment=NODE_HOST_AGENT_NEBULA_CERTS_DIR=/etc/node-host-agent/nebula-certs",
@@ -736,4 +736,182 @@ func TestSystemdUnitContent(t *testing.T) {
 			t.Fatalf("unit missing %q:\n%s", want, u)
 		}
 	}
+}
+
+// TestCycleUnresolvedTargetMarkedDown: an inventory entry that
+// resolves to an empty ip is not dialable — but it must not
+// silently disappear either: target_up reads 0, the cycle counts
+// as unresolved and the series survives the stale-target prune
+// (evidence). Removing the entry from vars entirely prunes for
+// real.
+func TestCycleUnresolvedTargetMarkedDown(t *testing.T) {
+	vars := t.TempDir()
+	for name, data := range map[string]string{
+		"interdc_nodes.yaml": "node-x:\n  agent: false\n  name: nx\n  ip: \"10.0.0.99\"\n  site: s\n",
+		"cluster.yaml": "node_exporter_extra_hosts:\n" +
+			"  - { name: real-vm, ip: \"10.0.0.15\" }\n" +
+			"  - { name: ghost-vm }\n",
+		"defaults.yaml": "interdc_ssh_default_user: root\n",
+	} {
+		if err := os.WriteFile(path.Join(vars, name), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dialer := newFakeDialer()
+	reg := prometheus.NewRegistry()
+	cfg := testConfig(t, newClientsetWithSecret(), dialer, []byte("bin"))
+	cfg.VarsDir = vars
+	s, err := New(cfg, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Cycle(context.Background())
+
+	up := gatherVec(t, reg, "node_host_agent_hubsync_target_up")
+	if v, ok := up[labelKey("target", "ghost-vm")]; !ok || v != 0 {
+		t.Fatalf("target_up{ghost-vm}=%v present=%v — empty-ip target must read 0", v, ok)
+	}
+	cycles := gatherVec(t, reg, "node_host_agent_hubsync_cycles_total")
+	if cycles[labelKey("target", "ghost-vm", "result", "unresolved")] != 1 {
+		t.Fatalf("ghost-vm unresolved cycle not counted: %v", cycles)
+	}
+	for _, ip := range dialer.dials() {
+		if ip == "" {
+			t.Fatal("dialed an empty ip")
+		}
+	}
+
+	// Second cycle — still unresolved → series kept (prune skip).
+	s.Cycle(context.Background())
+	up = gatherVec(t, reg, "node_host_agent_hubsync_target_up")
+	if _, ok := up[labelKey("target", "ghost-vm")]; !ok {
+		t.Fatal("ghost-vm series pruned while still in inventory")
+	}
+
+	// Removing the entry entirely prunes for real on the next cycle.
+	if err := os.WriteFile(path.Join(vars, "cluster.yaml"),
+		[]byte("node_exporter_extra_hosts:\n  - { name: real-vm, ip: \"10.0.0.15\" }\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.Cycle(context.Background())
+	up = gatherVec(t, reg, "node_host_agent_hubsync_target_up")
+	if _, ok := up[labelKey("target", "ghost-vm")]; ok {
+		t.Fatal("ghost-vm series survived removal from inventory")
+	}
+}
+
+// TestSyncDirEmptyKeepsetRefusesPrune: a mirror dir that enumerates
+// EMPTY must not rm the remote copy — an empty kept-set means the
+// source is broken (empty ConfigMap / failed mount), not that the
+// target should be wiped.
+func TestSyncDirEmptyKeepsetRefusesPrune(t *testing.T) {
+	s, err := New(testConfig(t, newClientsetWithSecret(), newFakeDialer(),
+		[]byte("bin")), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newFakeConn()
+	c.seedFile("/etc/node-host-agent/vars/cluster.yaml", []byte("x"))
+
+	err = s.syncDir(context.Background(), c, t.TempDir(),
+		"/etc/node-host-agent/vars", "0644", nil)
+	if err == nil || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("empty kept-set must refuse, got %v", err)
+	}
+	// The refusal happens before any remote enumeration/deletion.
+	for _, op := range c.opsLog() {
+		if strings.Contains(op, "ls -1p") || strings.Contains(op, "rm -f") {
+			t.Fatalf("prune touched remote on empty kept-set:\n%s",
+				strings.Join(c.opsLog(), "\n"))
+		}
+	}
+	if _, ok := c.fileContent("/etc/node-host-agent/vars/cluster.yaml"); !ok {
+		t.Fatal("remote file wiped on empty kept-set")
+	}
+}
+
+// TestPruneRemoteDirStaleTmp: mirror pruning also removes orphaned
+// `.<name>.tmp` staging leftovers — but only names absent from the
+// kept set (a tmp whose file is still mirrored may be in-flight),
+// and never foreign dotfiles or subdirs.
+func TestPruneRemoteDirStaleTmp(t *testing.T) {
+	s, err := New(testConfig(t, newClientsetWithSecret(), newFakeDialer(),
+		[]byte("bin")), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newFakeConn()
+	c.seedFile("/d/kept.yaml", []byte("x"))
+	c.seedFile("/d/stale.yaml", []byte("x"))
+	c.seedFile("/d/.orphan.yaml.tmp", []byte("x"))
+	c.seedFile("/d/.kept.yaml.tmp", []byte("x")) // name still kept — in-flight
+	c.seedFile("/d/.foreign", []byte("x"))
+	c.seedDir("/d/subdir")
+
+	if err := s.pruneRemoteDir(context.Background(), c, "/d",
+		[]string{"kept.yaml"}); err != nil {
+		t.Fatalf("pruneRemoteDir: %v", err)
+	}
+	ops := strings.Join(c.opsLog(), "\n")
+	for _, gone := range []string{"/d/stale.yaml", "/d/.orphan.yaml.tmp"} {
+		if !strings.Contains(ops, "rm -f '"+gone+"'") {
+			t.Fatalf("%s not pruned:\n%s", gone, ops)
+		}
+	}
+	for _, kept := range []string{"/d/kept.yaml", "/d/.kept.yaml.tmp",
+		"/d/.foreign", "/d/subdir"} {
+		if strings.Contains(ops, "rm -f '"+kept+"'") {
+			t.Fatalf("%s must not be pruned:\n%s", kept, ops)
+		}
+	}
+}
+
+// TestRemoteSHA256Directory: a DIRECTORY at remotePath must error —
+// sha256sum exits 1 for a dir exactly like a missing file, and the
+// follow-up `mv tmp dir` would silently nest the staging file.
+func TestRemoteSHA256Directory(t *testing.T) {
+	c := newFakeConn()
+	c.seedDir("/etc/node-host-agent/vars")
+	if _, err := remoteSHA256(context.Background(), c,
+		"/etc/node-host-agent/vars"); err == nil ||
+		!strings.Contains(err.Error(), "directory") {
+		t.Fatalf("remoteSHA256 on a dir = %v, want is-a-directory error", err)
+	}
+	// Plain file hashes; absent path still reads as drift.
+	c.seedFile("/etc/f", []byte("data"))
+	if got, err := remoteSHA256(context.Background(), c, "/etc/f"); err != nil || got == "" {
+		t.Fatalf("file sha=%q err=%v", got, err)
+	}
+	if got, err := remoteSHA256(context.Background(), c, "/etc/missing"); err != nil || got != "" {
+		t.Fatalf("missing path=%q err=%v, want absent", got, err)
+	}
+}
+
+// TestPutAtomicKeyMaterialChmodEarly: secret material must not sit
+// world-readable in the staging tmp under the remote umask — the
+// 0600 lands right after the upload, before the final-mode chmod
+// and the mv.
+func TestPutAtomicKeyMaterialChmodEarly(t *testing.T) {
+	c := newFakeConn()
+	if err := putAtomic(context.Background(), c, "/etc/x/host.key",
+		strings.NewReader("key-material"), "0644"); err != nil {
+		t.Fatalf("putAtomic: %v", err)
+	}
+	assertOpOrder(t, c.opsLog(),
+		"write:/etc/x/.host.key.tmp",
+		"run:chmod 0600 '/etc/x/.host.key.tmp'",
+		"run:chmod 0644 '/etc/x/.host.key.tmp'",
+		"run:mv '/etc/x/.host.key.tmp' '/etc/x/host.key'")
+
+	// A non-secret file gets no early chmod.
+	c2 := newFakeConn()
+	if err := putAtomic(context.Background(), c2, "/etc/x/plain.yaml",
+		strings.NewReader("y"), "0644"); err != nil {
+		t.Fatalf("putAtomic: %v", err)
+	}
+	assertOpOrder(t, c2.opsLog(),
+		"write:/etc/x/.plain.yaml.tmp",
+		"run:chmod 0644 '/etc/x/.plain.yaml.tmp'",
+		"run:mv '/etc/x/.plain.yaml.tmp' '/etc/x/plain.yaml'")
 }

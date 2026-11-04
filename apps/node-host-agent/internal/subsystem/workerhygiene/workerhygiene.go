@@ -781,6 +781,11 @@ type Hygiene struct {
 
 // New returns a Hygiene and registers its metrics on reg.
 func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
+	if cfg.Client == nil {
+		// The first Cycle LIST would nil-pointer panic — the check
+		// contract is "never panic", so reject at construction.
+		return nil, fmt.Errorf("workerhygiene: Config.Client is required")
+	}
 	cfg.applyDefaults()
 	h := &Hygiene{cfg: cfg, zombieStreaks: map[zombieParent]int{}}
 	h.journalReads = journalwatch.Tracker{
@@ -843,16 +848,40 @@ func (h *Hygiene) Run(ctx context.Context) {
 	// agent restart. The wait makes Run's return coincide with the
 	// feeder's exit — a restarted Run must never stack a second
 	// feeder, and callers may tear down cfg paths on return.
+	// The feeder gets its OWN cancel: a bare `defer wg.Wait()` also
+	// runs during panic unwinding, but the feeder only exits on
+	// ctx.Done() — nothing cancels ctx on a Cycle panic, so Run
+	// parked forever and the agent's recover never fired (the
+	// subsystem died silently). Cancelling first bounds the wait on
+	// EVERY exit path — panic included — so the panic reaches the
+	// agent recover and a restarted Run finds the old feeder gone.
+	fctx, stop := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		h.runKubeletFeeder(ctx)
+		defer func() {
+			// A feeder panic must not take the daemon down — the
+			// agent's recover only wraps Run itself, not
+			// goroutines Run spawned.
+			if r := recover(); r != nil {
+				slog.Error("workerhygiene: kubelet watchdog feeder "+
+					"panicked — feeder dead until Run restart",
+					"subsystem", "workerhygiene", "panic", r)
+			}
+		}()
+		h.runKubeletFeeder(fctx)
+	}()
+	// Feeder setup precedes the FIRST Cycle too — a first-Cycle
+	// panic must tear down a running feeder, not stack a second
+	// one behind it on the agent's restart.
+	defer func() {
+		stop()
+		wg.Wait()
 	}()
 	h.Cycle(ctx)
 	t := time.NewTicker(h.cfg.Interval)
 	defer t.Stop()
-	defer wg.Wait()
 	for {
 		select {
 		case <-ctx.Done():
@@ -888,13 +917,29 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// The containerd task map reads EVERY task dir's config.json —
 	// build it lazily, at most once per cycle, shared between the
 	// teardown, stall and dns checks. Most cycles neither needs it (no
-	// pod Terminating, no dns-pod running) so it stays unbuilt.
+	// pod Terminating, no dns-pod running) so it stays unbuilt. The
+	// second return is the root-reachability flag: false = a task
+	// root could not be listed, so "zero live tasks" verdicts are
+	// unverifiable (teardown fails closed).
 	var tasks map[string][]ctrTask
-	tasksOnce := func() map[string][]ctrTask {
+	tasksComplete := true
+	tasksOnce := func() (map[string][]ctrTask, bool) {
 		if tasks == nil {
-			tasks = h.buildTaskMap()
+			tasks, tasksComplete = h.buildTaskMap()
 		}
-		return tasks
+		return tasks, tasksComplete
+	}
+	// One /proc pid-dir listing feeds every per-cycle process scan
+	// (konnectivity proxy-agent sweep, ctr-tasks orphan shims +
+	// per-dir leftover kills, zombie-storm count) — independent
+	// ReadDir sweeps were 3-5 full walks of a several-thousand-entry
+	// dir. Lazy like the task map: most cycles never need it.
+	var pids []int
+	pidsOnce := func() []int {
+		if pids == nil {
+			pids = h.procPIDs()
+		}
+		return pids
 	}
 	// The k0sworker journal snapshot is shared between 05/06 — the
 	// runner dumped it once per run for the same reason (journald is
@@ -979,7 +1024,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		h.checkPodTeardown(ctx, pods, apiOK, tasksOnce, workerActive)
 	})
 	run(checkKonn, func() {
-		h.checkKonnectivity(ctx, pods, workerActive)
+		h.checkKonnectivity(ctx, pods, pidsOnce, workerActive)
 	})
 	run(checkDNS, func() {
 		h.checkDNSResolvDrift(pods, apiOK, tasksOnce, workerActive)
@@ -991,7 +1036,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		h.checkContainerdSock(ctx, workerActive)
 	})
 	run(checkCtrTasks, func() {
-		h.checkCtrTasks(ctx, workerActive)
+		h.checkCtrTasks(ctx, pidsOnce, workerActive)
 	})
 	run(checkIngestGC, func() {
 		h.checkCtrIngestGC(ctx, workerActive)
@@ -1015,7 +1060,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		h.checkCiliumMTU(workerActive)
 	})
 	run(checkZombieStorm, func() {
-		h.checkZombieStorm(workerActive)
+		h.checkZombieStorm(pidsOnce, workerActive)
 	})
 	run(checkJournald, func() {
 		h.checkJournaldIntegrity(ctx, workerActive)
@@ -1207,11 +1252,11 @@ func (h *Hygiene) uptimeSeconds() (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	up, err := strconv.ParseFloat(strings.Fields(string(data))[0], 64)
-	if err != nil {
-		return 0, err
+	f := strings.Fields(string(data))
+	if len(f) == 0 {
+		return 0, fmt.Errorf("empty uptime")
 	}
-	return up, nil
+	return strconv.ParseFloat(f[0], 64)
 }
 
 func (h *Hygiene) procPIDs() []int {
@@ -1268,19 +1313,29 @@ type ctrTask struct {
 
 // buildTaskMap scans CtrTaskRoot/*/ and SandboxCtlRoot/*/ once per
 // cycle and groups task dirs by pod UID — shared by the teardown and
-// dns checks. Missing roots/files are skipped, never fatal.
+// dns checks. Missing files are skipped, never fatal.
+//
+// complete=false when a task ROOT itself could not be listed — the
+// map then only claims "no live tasks" for pods whose tasks it
+// never saw, so force-delete callers must fail closed (checkCtrTasks
+// abort parity): the runtime root must exist on a live worker (ANY
+// error incl. ENOENT is suspect), while a genuinely-absent sandbox
+// root is normal on layouts without a shim dir and stays complete.
 // taskMapBuilds counts invocations so tests can assert the lazy
 // once-per-cycle behaviour directly.
-func (h *Hygiene) buildTaskMap() map[string][]ctrTask {
+func (h *Hygiene) buildTaskMap() (map[string][]ctrTask, bool) {
 	h.taskMapBuilds++
 	m := map[string][]ctrTask{}
-	for _, root := range []string{h.cfg.CtrTaskRoot, h.cfg.SandboxCtlRoot} {
+	complete := true
+	for i, root := range []string{h.cfg.CtrTaskRoot, h.cfg.SandboxCtlRoot} {
 		entries, err := os.ReadDir(root)
 		if err != nil {
-			// A genuinely-absent root is normal (no sandbox-shim
-			// dir on this containerd layout); a permission/IO
-			// error silently degrades the task map — force-delete
-			// decisions then run on incomplete data.
+			if i == 0 || !os.IsNotExist(err) {
+				complete = false
+			}
+			// A permission/IO error silently degrades the task
+			// map — surface it so force-delete decisions aren't
+			// the only trace of running on incomplete data.
 			if !os.IsNotExist(err) {
 				h.appendLog(fmt.Sprintf(
 					"suspect: ctr task root %s unreadable: %v — task map incomplete",
@@ -1314,7 +1369,7 @@ func (h *Hygiene) buildTaskMap() map[string][]ctrTask {
 			m[t.uid] = append(m[t.uid], t)
 		}
 	}
-	return m
+	return m, complete
 }
 
 // countLive returns how many tasks of a UID still have a live init
@@ -1371,7 +1426,7 @@ func (h *Hygiene) forceDeletePod(ctx context.Context, p *corev1.Pod) error {
 }
 
 func (h *Hygiene) checkPodTeardown(ctx context.Context, pods []corev1.Pod,
-	apiOK bool, tasksOnce func() map[string][]ctrTask, workerActive bool) {
+	apiOK bool, tasksOnce func() (map[string][]ctrTask, bool), workerActive bool) {
 	if !workerActive {
 		h.cycles.WithLabelValues(checkTeardown, "gated").Inc()
 		return
@@ -1394,7 +1449,19 @@ func (h *Hygiene) checkPodTeardown(ctx context.Context, pods []corev1.Pod,
 			continue
 		}
 		if tasks == nil {
-			tasks = tasksOnce()
+			var complete bool
+			tasks, complete = tasksOnce()
+			if !complete {
+				// A task root was unreadable — "zero live tasks"
+				// is unverifiable, so a force-delete could reap a
+				// pod whose tasks the map never saw. Inconclusive
+				// cycle: keep counters/latch, act on nothing
+				// (checkCtrTasks unreadable-root parity).
+				h.appendLog(
+					"suspect: pod-teardown aborted — ctr task map incomplete, force-deletes unverifiable")
+				h.cycles.WithLabelValues(checkTeardown, "abort").Inc()
+				return
+			}
 		}
 		uid := string(p.UID)
 		age := now.Sub(p.DeletionTimestamp.Time)
@@ -1517,7 +1584,8 @@ func (h *Hygiene) deleteKonnectivityPod(ctx context.Context, pods []corev1.Pod) 
 	return false
 }
 
-func (h *Hygiene) checkKonnectivity(ctx context.Context, pods []corev1.Pod, workerActive bool) {
+func (h *Hygiene) checkKonnectivity(ctx context.Context, pods []corev1.Pod,
+	pidsOnce func() []int, workerActive bool) {
 	if !workerActive {
 		h.cycles.WithLabelValues(checkKonn, "gated").Inc()
 		return
@@ -1533,7 +1601,7 @@ func (h *Hygiene) checkKonnectivity(ctx context.Context, pods []corev1.Pod, work
 	healthy := false
 	agentHost := ""
 	stalePID := 0
-	for _, pid := range h.procPIDs() {
+	for _, pid := range pidsOnce() {
 		argv := h.procCmdline(pid)
 		if !isProxyAgent(argv) {
 			continue
@@ -1657,7 +1725,7 @@ func pausePIDOf(tasks []ctrTask) int {
 }
 
 func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
-	tasksOnce func() map[string][]ctrTask, workerActive bool) {
+	tasksOnce func() (map[string][]ctrTask, bool), workerActive bool) {
 	if !workerActive {
 		h.cycles.WithLabelValues(checkDNS, "gated").Inc()
 		return
@@ -1677,12 +1745,20 @@ func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
 		var tasks map[string][]ctrTask
 		for i := range pods {
 			p := &pods[i]
+			// Namespace pin like deleteKonnectivityPod: the name
+			// regex alone would match a user pod named coredns-*/
+			// node-local-dns-* in ANY namespace — the pause SIGKILL
+			// is only for the kube-system DaemonSets.
 			if p.Status.Phase != corev1.PodRunning ||
+				p.Namespace != "kube-system" ||
 				!dnsPodRe.MatchString(p.Name) {
 				continue
 			}
 			if tasks == nil {
-				tasks = tasksOnce()
+				tasks, _ = tasksOnce()
+				// An incomplete map is fail-closed here already:
+				// an unseen pause pid reads as pid==0 → the pod
+				// is skipped, never killed.
 			}
 			pid := pausePIDOf(tasks[string(p.UID)])
 			if pid == 0 {
@@ -1968,6 +2044,22 @@ func (h *Hygiene) checkKubeletWatchWedge(ctx context.Context, pods []corev1.Pod,
 		h.cycles.WithLabelValues(checkWatch, "abort").Inc()
 		return
 	}
+	// Stat the pods ROOT once before the per-pod sweep: with the dir
+	// itself unreadable/vanished every per-pod stat fails and ALL
+	// assigned pods count "missing" → false wedge latch + a k0sworker
+	// restart spent on a filesystem blip. The IsDir half matters just
+	// as much as the error half: a regular FILE at the path stats
+	// cleanly but every per-pod join then fails ENOTDIR — the same
+	// false wedge via a different syscall. Inconclusive — keep
+	// counters/latch exactly like the !apiOK path.
+	st, err := os.Stat(h.cfg.KubeletPodsDir)
+	if err != nil || !st.IsDir() {
+		h.appendLog(fmt.Sprintf(
+			"suspect: kubelet pods dir %s unstatable or not a directory (isdir=%v, err=%v) — watch-wedge inconclusive, keeping state",
+			h.cfg.KubeletPodsDir, err == nil && st.IsDir(), err))
+		h.cycles.WithLabelValues(checkWatch, "abort").Inc()
+		return
+	}
 	now := h.cfg.nowFn()
 	missing := 0
 	for i := range pods {
@@ -2060,10 +2152,11 @@ func (h *Hygiene) procAge(pid int) time.Duration {
 
 // pidsWithCmdline returns pids whose joined cmdline contains sub —
 // the pkill -f replacement (the agent can't rely on pkill being in
-// the container image).
-func (h *Hygiene) pidsWithCmdline(sub string) []int {
+// the container image). The pid list is the caller's per-cycle
+// snapshot.
+func (h *Hygiene) pidsWithCmdline(sub string, pids []int) []int {
 	var out []int
-	for _, pid := range h.procPIDs() {
+	for _, pid := range pids {
 		if strings.Contains(strings.Join(h.procCmdline(pid), " "), sub) {
 			out = append(out, pid)
 		}
@@ -2084,7 +2177,8 @@ func (h *Hygiene) pidsWithCmdline(sub string) []int {
 //     "dead >=5m": dir age can't distinguish a just-exited init from
 //     a real wedge). Confirmed → SIGKILL live init + any process
 //     holding the id, then remove the dir (cap MaxCtrTaskClean/cycle).
-func (h *Hygiene) checkCtrTasks(ctx context.Context, workerActive bool) {
+func (h *Hygiene) checkCtrTasks(ctx context.Context,
+	pidsOnce func() []int, workerActive bool) {
 	if !workerActive {
 		h.cycles.WithLabelValues(checkCtrTasks, "gated").Inc()
 		return
@@ -2114,7 +2208,8 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context, workerActive bool) {
 	// Phase B — orphan shims (shell ran this FIRST: a shim whose task
 	// dir vanished makes every shim-mediated kill fail forever).
 	nShim := 0
-	for _, pid := range h.procPIDs() {
+	pids := pidsOnce()
+	for _, pid := range pids {
 		if nShim >= h.cfg.MaxShimKill {
 			break
 		}
@@ -2199,12 +2294,16 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context, workerActive bool) {
 	nClean := 0
 	for _, d := range wedged {
 		id := filepath.Base(d)
-		_ = os.Remove(filepath.Join(h.cfg.WatchdogStateDir, "wedged-seen-"+id))
 		if nClean >= h.cfg.MaxCtrTaskClean {
 			h.appendLog(fmt.Sprintf("suspect: ctr-task-wedged still pending cap=%d",
 				h.cfg.MaxCtrTaskClean))
 			break
 		}
+		// Marker removal only once the dir is actually being
+		// cleaned: a dir dropped by the cap must KEEP its
+		// confirmed marker — removing it first made over-cap
+		// dirs re-confirm for another 5m forever.
+		_ = os.Remove(filepath.Join(h.cfg.WatchdogStateDir, "wedged-seen-"+id))
 		// Live init with missing log.json → SIGKILL it first so the
 		// shim can drain and exit (shell's kill -9 init).
 		if pidData, err := os.ReadFile(filepath.Join(d, "init.pid")); err == nil {
@@ -2221,7 +2320,7 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context, workerActive bool) {
 		// pkill -9 -f "$id" parity: kill shim/runc leftovers holding
 		// the task id, then remove the dir — containerd GCs the task
 		// record once the shim is gone.
-		for _, pid := range h.pidsWithCmdline(id) {
+		for _, pid := range h.pidsWithCmdline(id, pids) {
 			if err := h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
 				h.appendLog(fmt.Sprintf(
 					"suspect: kill leftover pid=%d holding task %.12s failed: %v",
@@ -2366,13 +2465,15 @@ func (h *Hygiene) checkCilium(ctx context.Context, apiOK, workerActive bool) {
 			"suspect: cilium-agent-down healthz fail %dx but API unreachable — skip kill (agent still cannot sync even after restart)",
 			h.ciliumFails))
 	case h.ciliumFails >= h.cfg.ConsecNeeded &&
-		h.rateOK("last-cilium-restart", h.cfg.MinRestartInterval) &&
-		!h.stateExists("node-overloaded"):
+		!h.stateExists("node-overloaded") &&
+		h.rateTrySpend("last-cilium-restart", h.cfg.MinRestartInterval):
+		// Budget spent atomically BEFORE acting (rate_spend
+		// parity): a missed kill still consumed it — the feeder
+		// goroutine competes for the same file.
 		if h.killCiliumAgent(tasks) {
 			h.appendLog(fmt.Sprintf(
 				"ACTION: killed cilium-agent container - healthz down %dx (kubelet will restart)",
 				h.ciliumFails))
-			h.rateSpend("last-cilium-restart")
 			h.ciliumFails = 0
 			h.actions.WithLabelValues(checkCilium, "sigkill").Inc()
 		} else {
@@ -2443,16 +2544,17 @@ func (h *Hygiene) checkCiliumInitStuck(ctx context.Context, apiOK, workerActive 
 		h.appendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but node overloaded — skip kill",
 			initEps, h.ciliumInitFails))
-	case !h.rateOK("last-cilium-restart", h.cfg.MinRestartInterval):
+	case !h.rateTrySpend("last-cilium-restart", h.cfg.MinRestartInterval):
 		h.appendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but restart cooldown — skip kill",
 			initEps, h.ciliumInitFails))
 	default:
+		// Budget already spent atomically by the rateTrySpend case —
+		// the feeder goroutine competes for the same file.
 		if h.killCiliumAgent(tasks) {
 			h.appendLog(fmt.Sprintf(
 				"ACTION: killed cilium-agent container - init_eps=%d %dx (kubelet will restart -> informer resync)",
 				initEps, h.ciliumInitFails))
-			h.rateSpend("last-cilium-restart")
 			h.ciliumInitFails = 0
 			h.actions.WithLabelValues(checkCiliumInit, "sigkill").Inc()
 		} else {
@@ -3091,10 +3193,16 @@ func (h *Hygiene) anyAPIBackendLive(ctx context.Context) bool {
 // backend entry — API_BACKENDS is "ip:port" but bare-IP entries occur
 // (APIBackendIPs strips ports for the stale-latch key).
 func withDefaultAPIPort(addr string) string {
-	if _, _, err := net.SplitHostPort(addr); err == nil {
+	// An EMPTY port parses cleanly ("1.2.3.4:" → host ok, port "")
+	// but builds a malformed probe URL ("https://1.2.3.4:/livez")
+	// that fails every GET silently → node reads isolated forever.
+	// Treat it as "port missing" like a bare IP.
+	if _, port, err := net.SplitHostPort(addr); err == nil && port != "" {
 		return addr
 	}
-	if strings.LastIndexByte(addr, ':') < 0 {
+	addr = strings.TrimSuffix(addr, ":")
+	if strings.LastIndexByte(addr, ':') < 0 ||
+		(strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]")) {
 		return addr + ":6443"
 	}
 	return addr
@@ -3210,7 +3318,15 @@ func (h *Hygiene) checkCtrIngestGC(ctx context.Context, workerActive bool) {
 	}
 	var st unix.Statfs_t
 	diskHigh := false
-	if err := h.cfg.statfsFn(h.cfg.K0sDataDir, &st); err == nil && st.Blocks > 0 {
+	// Free > total wraps uint64 to ~2^64 → used ~= 1.0 → diskHigh
+	// permanently true → the GC sweeps EVERY cycle (btrfs/XFS can
+	// report Bavail > Blocks). Saturate instead of subtracting
+	// blind — same guard as concourse_cache's fsPressure. The
+	// free-side field is Bavail, not Bfree: kubelet/containerd run
+	// unprivileged against the root-reserved block margin, so
+	// unprivileged-free is the signal that trips ENOSPC first.
+	if err := h.cfg.statfsFn(h.cfg.K0sDataDir, &st); err == nil &&
+		st.Blocks > 0 && st.Bavail <= st.Blocks {
 		used := float64(st.Blocks-st.Bavail) / float64(st.Blocks)
 		diskHigh = used > h.cfg.K0sDiskHighWatermark
 	}
@@ -3362,13 +3478,13 @@ func (h *Hygiene) procStartTime(pid int) string {
 	return f[19]
 }
 
-func (h *Hygiene) checkZombieStorm(workerActive bool) {
+func (h *Hygiene) checkZombieStorm(pidsOnce func() []int, workerActive bool) {
 	if !workerActive {
 		h.cycles.WithLabelValues(checkZombieStorm, "gated").Inc()
 		return
 	}
 	byPPID := map[int]int{}
-	for _, pid := range h.procPIDs() {
+	for _, pid := range pidsOnce() {
 		state, ppid, ok := h.procStatStatePPID(pid)
 		if !ok || state != "Z" {
 			continue
@@ -3386,12 +3502,15 @@ func (h *Hygiene) checkZombieStorm(workerActive bool) {
 		}
 		return k
 	}
+	// Loop 1 only PRUNES dead streaks — a stored streak must not set
+	// storm here: this cycle's zombie count isn't re-validated yet,
+	// so a parent that dropped below threshold would hold the latch
+	// one extra cycle. Loop 2 re-validates against the current count
+	// before any streak contributes to storm.
 	storm := false
-	for parent, streak := range h.zombieStreaks {
+	for parent := range h.zombieStreaks {
 		if _, ok := byPPID[parent.pid]; !ok || keyOf(parent.pid) != parent {
 			delete(h.zombieStreaks, parent) // parent gone or pid recycled — streak dead
-		} else if streak >= h.cfg.ConsecNeeded {
-			storm = true
 		}
 	}
 	for ppid, n := range byPPID {
@@ -3464,9 +3583,11 @@ func (h *Hygiene) noteJournalRead(ok bool, detail string) {
 
 // --- Check: journald integrity (A5) ---
 // After a hard-reboot (SNR) journald's binary files corrupt at the
-// tail: `journalctl -u k0sworker` errors, prints "corrupt", or
-// returns abnormally empty while the unit is active — which also
-// blinds the 05/06 journal-signature checks. The remedy is the
+// tail: `journalctl -u k0sworker` prints "corrupt" or returns
+// abnormally empty while the unit is active — which also blinds the
+// 05/06 journal-signature checks. An exec-level read ERROR is not
+// corruption evidence (journald never answered — the
+// journal-unreadable tracker owns that signal). The remedy is the
 // operator's rotate+vacuum, bounded by a rate budget.
 //
 // The same probes feed the journal-unreadable accounting: when
@@ -3483,8 +3604,14 @@ func (h *Hygiene) checkJournaldIntegrity(ctx context.Context, workerActive bool)
 		return
 	}
 	out, err := h.cfg.journalFn(ctx)
-	corrupt := err != nil ||
-		strings.Contains(strings.ToLower(out), "corrupt")
+	// Only OUTPUT evidence counts as corruption: an exec-level error
+	// (nsenter/journalctl timeout, transient host exec failure) means
+	// journald never answered — that is journal-UNREADABLE, not
+	// corrupt. Lumping err into "corrupt" ran the rotate+vacuum
+	// remedy on every cooldown for a purely transient failure.
+	// Journal() folds stderr in, so a corrupt-file notice survives
+	// even a non-zero exit and still counts here.
+	corrupt := strings.Contains(strings.ToLower(out), "corrupt")
 	empty := err == nil && strings.TrimSpace(out) == ""
 	var unfiltered string
 	var uerr error
@@ -3536,6 +3663,12 @@ func (h *Hygiene) checkJournaldIntegrity(ctx context.Context, workerActive bool)
 			h.cycles.WithLabelValues(checkJournald, "ok").Inc()
 			return
 		}
+	case err != nil:
+		// Exec failure without corruption evidence — inconclusive
+		// (the unreadable tracker owns this signal): keep the fail
+		// streak intact but never grow it, and never vacuum.
+		h.cycles.WithLabelValues(checkJournald, "abort").Inc()
+		return
 	default:
 		h.journaldFails = 0
 		h.cycles.WithLabelValues(checkJournald, "ok").Inc()

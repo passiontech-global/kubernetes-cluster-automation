@@ -11,6 +11,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -53,7 +54,7 @@ type Config struct {
 type Agent struct {
 	cfg     Config
 	reg     *prometheus.Registry
-	started time.Time
+	started atomic.Int64 // unixnano — read by the scrape-time GaugeFunc
 	ready   atomic.Bool
 	info    *prometheus.GaugeVec
 }
@@ -79,10 +80,10 @@ func New(cfg Config) *Agent {
 		Name: "node_host_agent_uptime_seconds",
 		Help: "Seconds since the agent started.",
 	}, func() float64 {
-		if a.started.IsZero() {
-			return 0
+		if t := a.started.Load(); t > 0 {
+			return time.Since(time.Unix(0, t)).Seconds()
 		}
-		return time.Since(a.started).Seconds()
+		return 0
 	}))
 	return a
 }
@@ -120,13 +121,19 @@ func (a *Agent) probeMux() *http.ServeMux {
 // the agent ready, then blocks until ctx is cancelled or a server
 // fails. Shutdown is graceful.
 func (a *Agent) Run(ctx context.Context) error {
-	a.started = time.Now()
+	a.started.Store(time.Now().UnixNano())
 
 	for _, sub := range a.cfg.Subsystems {
 		sub := sub
 		go func() {
 			slog.Info("subsystem started", "name", sub.Name())
+			// Restart backoff doubles per early exit (5s → 5m cap) so
+			// a subsystem that returns instantly can't spam a restart
+			// + error log every cycle; a run that outlived the
+			// current backoff counts as healthy and resets it.
+			backoff := 5 * time.Second
 			for {
+				began := time.Now()
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
@@ -139,15 +146,21 @@ func (a *Agent) Run(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return
 				}
+				if time.Since(began) >= backoff {
+					backoff = 5 * time.Second
+				}
 				// Run returned while ctx is live (panic recovered, or
 				// a silent early return) — restart after backoff
 				// instead of letting the subsystem die invisibly.
 				slog.Error("subsystem exited unexpectedly — restarting",
-					"subsystem", sub.Name())
+					"subsystem", sub.Name(), "backoff", backoff)
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(5 * time.Second):
+				case <-time.After(backoff):
+				}
+				if backoff *= 2; backoff > 5*time.Minute {
+					backoff = 5 * time.Minute
 				}
 			}
 		}()
@@ -165,15 +178,26 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.ready.Store(true)
 
 	errCh := make(chan error, 2)
+	// done releases the parked shutdown goroutines when Run returns —
+	// without it they would linger until ctx cancel even on the errCh
+	// path, then Shutdown a server the sibling Close() already tore
+	// down (at best a no-op, at worst a misleading failure log).
+	done := make(chan struct{})
+	defer close(done)
+	var servers []*http.Server
 	serve := func(name string, ln net.Listener, h http.Handler) {
-		srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
-		go func() {
-			<-ctx.Done()
-			if err := srv.Shutdown(context.Background()); err != nil {
-				slog.Error("server shutdown failed — connections dropped",
-					"server", name, "error", err)
-			}
-		}()
+		// The metrics handler collects at scrape time and can block
+		// on a hung filesystem — bound every phase so one wedged
+		// connection can't pin the server.
+		srv := &http.Server{
+			Handler:           h,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
+		servers = append(servers, srv)
+		go gracefulShutdown(ctx, done, name, srv.Shutdown)
 		go func() {
 			slog.Info("listening", "server", name, "addr", ln.Addr().String())
 			if err := srv.Serve(ln); err != http.ErrServerClosed {
@@ -188,6 +212,42 @@ func (a *Agent) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		return nil
 	case err := <-errCh:
+		// A listener died while ctx is live — drop the sibling server
+		// too (Close is immediate; Shutdown could park on a wedged
+		// handler) so nothing outlives Run returning the error.
+		for _, srv := range servers {
+			if cerr := srv.Close(); cerr != nil {
+				slog.Error("sibling server close failed",
+					"error", cerr)
+			}
+		}
 		return err
+	}
+}
+
+// gracefulShutdown parks until ctx is cancelled, then drains srv via
+// shutdown. Run's done channel releases it early when Run exits on
+// the error path — the sibling Close() already dropped those
+// listeners, so a late Shutdown is at best a no-op and at worst a
+// bogus "connections dropped" log. The ctx.Err() re-check (not just
+// the select branch) keeps the graceful drain on ctx cancel even
+// when done is already closed too — select picks randomly between
+// ready cases. ErrServerClosed counts as the intended end state —
+// a server torn down underneath us is not a shutdown failure.
+func gracefulShutdown(ctx context.Context, done <-chan struct{},
+	name string, shutdown func(context.Context) error) {
+	select {
+	case <-ctx.Done():
+	case <-done:
+	}
+	if ctx.Err() == nil {
+		// Woken by done while ctx is live: Run exited on the error
+		// path — nothing left to drain.
+		return
+	}
+	if err := shutdown(context.Background()); err != nil &&
+		!errors.Is(err, http.ErrServerClosed) {
+		slog.Error("server shutdown failed — connections dropped",
+			"server", name, "error", err)
 	}
 }

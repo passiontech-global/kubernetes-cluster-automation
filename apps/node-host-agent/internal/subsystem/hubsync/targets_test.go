@@ -8,9 +8,12 @@ import (
 // by-IP dedup and the ssh_user resolution chain against the fixture
 // vars dir.
 func TestLoadTargetsAggregation(t *testing.T) {
-	targets, err := loadTargets("testdata/vars")
+	targets, dropped, _, err := loadTargets("testdata/vars")
 	if err != nil {
 		t.Fatalf("loadTargets: %v", err)
+	}
+	if len(dropped) != 0 {
+		t.Fatalf("unexpected dropped names: %v", dropped)
 	}
 
 	byName := map[string]Target{}

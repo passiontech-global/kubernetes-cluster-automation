@@ -298,6 +298,37 @@ func TestMountAtDirSkips(t *testing.T) {
 	}
 }
 
+// The mounts snapshot is taken once per cycle — a mount appearing
+// inside the candidate dir between the snapshot and the rm (a pod
+// volume attaching mid-sweep) is invisible to it. The pre-rm
+// re-read is the last belt: here the mount lands when the
+// per-candidate PV re-GET runs, after the snapshot.
+func TestMountAppearingMidSweepSkips(t *testing.T) {
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	cs := fake.NewSimpleClientset(other)
+	s, base, mountsFile := fixture(t, cs)
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+	cs.PrependReactor("get", "persistentvolumes",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			mounts := "tmpfs " + dir + " tmpfs rw 0 0\n"
+			if err := os.WriteFile(mountsFile, []byte(mounts), 0o644); err != nil {
+				return true, nil, err
+			}
+			return true, nil, apierrors.NewNotFound(
+				corev1.Resource("persistentvolumes"), pvcUUID)
+		})
+
+	s.Sweep(context.Background())
+
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir removed despite mid-sweep mount: %v", err)
+	}
+	if got := skipCount(t, s, skipMounted); got != 1 {
+		t.Fatalf("mounted skips=%v want 1 (fresh mount-table re-read)", got)
+	}
+}
+
 func TestMaxDeleteCap(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
@@ -325,6 +356,35 @@ func TestMaxDeleteCap(t *testing.T) {
 	}
 }
 
+// MaxDelete counts BOTH destructive ops — the Released-PV object
+// delete AND the dir rm. With the cap at 1 a Released+Delete pair
+// spends its whole budget on the PV object; the orphaned dir waits
+// for next cycle instead of riding past the cap on the same op.
+func TestMaxDeleteCountsPVObjectDelete(t *testing.T) {
+	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "", "")
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	cs := fake.NewSimpleClientset(pv, other)
+	s, base, _ := fixture(t, cs)
+	s.cfg.MaxDelete = 1
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+	s.Sweep(context.Background())
+
+	if _, err := cs.CoreV1().PersistentVolumes().
+		Get(context.Background(), pvcUUID, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("Released PV still present: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir removed past MAX_DELETE=1 (PV delete spent the slot): %v", err)
+	}
+	// Next cycle the PV is gone — the lone dir rm fits the budget.
+	s.Sweep(context.Background())
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("orphan dir kept after budget-free cycle: %v", err)
+	}
+}
+
 func TestUnescapeMountField(t *testing.T) {
 	got := unescapeMountField(`/var/lib/dir\040with\011esc\012seq\134x`)
 	want := "/var/lib/dir with\tesc\nseq\\x"
@@ -343,7 +403,10 @@ func TestName(t *testing.T) {
 func TestApplyDefaults(t *testing.T) {
 	// Trailing slashes must be trimmed — they would defeat the
 	// mount-boundary string compare in mountedInside.
-	s, err := New(Config{BaseDir: "/var/openebs/local/"}, nil)
+	s, err := New(Config{
+		BaseDir: "/var/openebs/local/",
+		Client:  fake.NewSimpleClientset(),
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +414,7 @@ func TestApplyDefaults(t *testing.T) {
 		t.Fatalf("BaseDir=%q want trailing slash trimmed", s.cfg.BaseDir)
 	}
 
-	s, err = New(Config{}, nil)
+	s, err = New(Config{Client: fake.NewSimpleClientset()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -713,7 +776,8 @@ func TestRunTicksSweepAgain(t *testing.T) {
 
 func TestSweepCtxCancelledInDirLoop(t *testing.T) {
 	// A cancelled ctx aborts mid-loop BEFORE any dir is examined —
-	// the per-dir ctx.Err() guard, distinct from an abort result.
+	// the per-dir ctx.Err() guard records an abort cycle (and the
+	// examined gauge) instead of returning uncounted.
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
 	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
@@ -729,11 +793,19 @@ func TestSweepCtxCancelledInDirLoop(t *testing.T) {
 	if got := testutil.ToFloat64(s.cycles.WithLabelValues("ok")); got != 0 {
 		t.Fatalf("cycles ok=%v want 0 (bailed before cycle end)", got)
 	}
-	if got := testutil.ToFloat64(s.cycles.WithLabelValues("abort")); got != 0 {
-		t.Fatalf("cycles abort=%v want 0", got)
+	if got := testutil.ToFloat64(s.cycles.WithLabelValues("abort")); got != 1 {
+		t.Fatalf("cycles abort=%v want 1 (cancelled mid-loop counts as abort)", got)
 	}
 	if got := testutil.ToFloat64(s.dirsExamined); got != 0 {
 		t.Fatalf("dirsExamined=%v want 0 (bailed in the dir loop)", got)
+	}
+}
+
+func TestNewNilClientErrors(t *testing.T) {
+	// A nil Client must fail at construction, not panic on the
+	// first PV List.
+	if _, err := New(Config{}, nil); err == nil {
+		t.Fatal("New with nil Client want error")
 	}
 }
 

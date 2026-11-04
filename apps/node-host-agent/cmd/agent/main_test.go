@@ -2,15 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
 	"errors"
 	"flag"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -147,6 +150,45 @@ func TestEnvDuration(t *testing.T) {
 	t.Setenv(key, "")
 	if got := envDuration(key, time.Second); got != time.Second {
 		t.Fatalf("envDuration(empty)=%v want default 1s", got)
+	}
+}
+
+// captureSlog swaps the default slog logger for a text handler
+// writing to the returned buffer — restored on cleanup.
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// An unparseable env duration falls back to the default — but warns,
+// like the ≤0 path does: a typo'd knob silently pinned to the
+// default is impossible to spot from the outside.
+func TestEnvDurationWarnsOnUnparseable(t *testing.T) {
+	const key = "TEST_NHA_DURATION_WARN"
+	buf := captureSlog(t)
+
+	t.Setenv(key, "bogus!")
+	if got := envDuration(key, time.Second); got != time.Second {
+		t.Fatalf("envDuration(invalid)=%v want default 1s", got)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "unparseable env duration") ||
+		!strings.Contains(logs, key) {
+		t.Fatalf("missing unparseable-duration warn:\n%s", logs)
+	}
+
+	// Parseable values warn nothing.
+	buf.Reset()
+	t.Setenv(key, "30s")
+	if got := envDuration(key, time.Second); got != 30*time.Second {
+		t.Fatalf("envDuration(30s)=%v want 30s", got)
+	}
+	if strings.Contains(buf.String(), "env duration") {
+		t.Fatalf("parseable value warned:\n%s", buf.String())
 	}
 }
 
@@ -573,7 +615,7 @@ users:
 }
 
 // stubKubeClient swaps the package-level client factory for a counter
-// stub — csOnce's single-build behaviour is only observable through it.
+// stub — csOnce's shared-build behaviour is only observable through it.
 func stubKubeClient(t *testing.T,
 	fn func() (kubernetes.Interface, error)) *int {
 	t.Helper()
@@ -623,10 +665,11 @@ func TestCsOnceSharesOneClientset(t *testing.T) {
 	}
 }
 
-// TestCsOnceErrorNotRetried: a failed first build is cached — the
-// second consumer sees the same error without re-attempting (and
-// neither subsystem aborts the agent).
-func TestCsOnceErrorNotRetried(t *testing.T) {
+// TestCsOnceErrorRetried: only a successful build is cached — each
+// consumer re-attempts after a failure so one transient error cannot
+// disable every kube subsystem for the process lifetime (and neither
+// subsystem aborts the agent).
+func TestCsOnceErrorRetried(t *testing.T) {
 	calls := stubKubeClient(t, func() (kubernetes.Interface, error) {
 		return nil, errors.New("no config")
 	})
@@ -635,8 +678,9 @@ func TestCsOnceErrorNotRetried(t *testing.T) {
 	cfg, _ := buildAgentConfig("node-a", "p", "ns", "v",
 		"127.0.0.1:0", "127.0.0.1:0", false)
 
-	if *calls != 1 {
-		t.Fatalf("kubeClient calls=%d want 1 (error cached, not retried)", *calls)
+	// sweeper + workerhygiene + hubsync each re-attempt once.
+	if *calls != 3 {
+		t.Fatalf("kubeClient calls=%d want 3 (error retried per consumer)", *calls)
 	}
 	if len(cfg.Subsystems) != 0 {
 		t.Fatalf("subsystems=%d want 0 (client build failed)", len(cfg.Subsystems))
@@ -901,6 +945,27 @@ func TestDispatchPurgeEventsArgParsing(t *testing.T) {
 		"--ca=/nonexistent/ca.crt", "2026-08-23T04:27:00Z"})
 	if !handled || code != 1 {
 		t.Fatalf("purge-events missing CA=(%d,%v) want (1,true)", code, handled)
+	}
+}
+
+// The positional-cutoff scan works on a clone — the compacting
+// appends must not corrupt the caller's slice (which aliases the
+// os.Args backing array in production).
+func TestPurgeEventsDoesNotMutateArgs(t *testing.T) {
+	for _, args := range [][]string{
+		// Positional first: without the clone the compaction shifts
+		// the flag left over it inside the shared backing array.
+		{"2026-08-23T04:27:00Z", "--ca=/nonexistent/ca.crt"},
+		// The `--` branch drops the element after it in place.
+		{"--", "not-a-timestamp", "--ca=/nonexistent/ca.crt"},
+	} {
+		want := slices.Clone(args)
+		if code := purgeEventsCmd(context.Background(), args); code != 1 && code != 2 {
+			t.Fatalf("purge-events %v=%d want 1 or 2", args, code)
+		}
+		if !slices.Equal(args, want) {
+			t.Fatalf("args mutated in place: got %v want %v", args, want)
+		}
 	}
 }
 

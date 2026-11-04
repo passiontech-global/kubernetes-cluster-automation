@@ -29,11 +29,13 @@
 //   - Before deleting, the PV is re-GET: the dir is removed only on an
 //     explicit IsNotFound — a PV that reappeared, or ANY other API
 //     error, skips.
-//   - MaxDelete bounds deletions per cycle — caps the damage if the
-//     logic is ever wrong.
+//   - MaxDelete bounds destructive ops per cycle — the Released-PV
+//     object delete AND the dir rm each spend a slot — caps the
+//     damage if the logic is ever wrong.
 //   - The host mount table (MountsFile, /proc/1/mounts via hostPID) is
-//     checked before rm: any mount point at or inside the dir → skip.
-//     That is the only reliable --one-file-system guard.
+//     checked before rm — snapshotted once per cycle AND re-read
+//     immediately before each rm: any mount point at or inside the
+//     dir → skip. That is the only reliable --one-file-system guard.
 //   - Released PV: deleted only when reclaimPolicy=Delete AND the
 //     claimRef PVC is explicitly NotFound — Released+Retain or any API
 //     error → skip.
@@ -152,6 +154,11 @@ type Sweeper struct {
 
 // New returns a Sweeper and registers its metrics on reg.
 func New(cfg Config, reg prometheus.Registerer) (*Sweeper, error) {
+	// A nil Client only surfaces as a panic on the first PV List —
+	// fail at construction instead.
+	if cfg.Client == nil {
+		return nil, fmt.Errorf("sweeper: Config.Client is required")
+	}
 	cfg.applyDefaults()
 	s := &Sweeper{cfg: cfg}
 
@@ -237,24 +244,36 @@ func (s *Sweeper) listPVDirs() ([]os.DirEntry, error) {
 	return dirs, nil
 }
 
-// mountedInside reports whether any mount point in the host mount table
-// sits at or inside dir — the rm --one-file-system guard.
-func (s *Sweeper) mountedInside(dir string) (bool, error) {
+// mountPoints reads + parses the host mount table (MountsFile —
+// /proc/1/mounts under hostPID) once per sweep: the
+// rm --one-file-system guard below used to re-read and re-parse it
+// for every candidate dir.
+func (s *Sweeper) mountPoints() ([]string, error) {
 	data, err := os.ReadFile(s.cfg.MountsFile)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
+	var mounts []string
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
 		}
-		mp := unescapeMountField(fields[1])
+		mounts = append(mounts, unescapeMountField(fields[1]))
+	}
+	return mounts, nil
+}
+
+// mountedInside reports whether any mount point in the parsed host
+// mount table sits at or inside dir — the rm --one-file-system
+// guard.
+func mountedInside(dir string, mounts []string) bool {
+	for _, mp := range mounts {
 		if mp == dir || strings.HasPrefix(mp, dir+"/") {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 // unescapeMountField decodes the octal escapes /proc/*/mounts applies
@@ -336,10 +355,26 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 		pvByName[pvList.Items[i].Name] = &pvList.Items[i]
 	}
 
+	// Host mount table parsed once per cycle — the rm
+	// --one-file-system guard consulted per candidate below (was:
+	// re-read + re-parsed for every dir). An unreadable table fails
+	// closed on every candidate. The snapshot is only the first
+	// belt: the table is re-read immediately before each rm — a
+	// mount created inside a candidate dir mid-sweep is invisible
+	// to this once-per-cycle read (see the pre-rm guard below).
+	mounts, mountsErr := s.mountPoints()
+
 	ndel := 0
 	ndir := 0
 	for _, d := range dirs {
 		if ctx.Err() != nil {
+			// Record the interrupted cycle before bailing — the
+			// plain return used to leave the cycle uncounted and
+			// the examined gauge stale.
+			log.Info("ABORT: context cancelled mid-sweep",
+				"examined", ndir, "error", ctx.Err())
+			s.dirsExamined.Set(float64(ndir))
+			s.cycles.WithLabelValues("abort").Inc()
 			return
 		}
 		ndir++
@@ -364,6 +399,17 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 				"minAge", s.cfg.MinAge.String())
 			s.skips.WithLabelValues(skipTooYoung).Inc()
 			continue
+		}
+
+		// MaxDelete bounds the destructive half of the cycle — EVERY
+		// destructive op spends a slot: the Released-PV object
+		// delete below AND the dir rm after the re-GET (a
+		// Released-PV pair therefore costs 2). Checked before the
+		// PV branch and re-checked before the rm, so a PV delete
+		// that lands the cap can't get a free dir rm on top.
+		if ndel >= s.cfg.MaxDelete {
+			log.Info("STOP: cap MAX_DELETE reached", "maxDelete", s.cfg.MaxDelete)
+			break
 		}
 
 		if pvPresent {
@@ -434,6 +480,10 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 				s.skips.WithLabelValues(skipPVDeleteFailed).Inc()
 				continue
 			}
+			// The PV object delete is a destructive op too — it
+			// spends a MaxDelete slot (the comment at the cap
+			// check explains why both ops count).
+			ndel++
 		}
 
 		// Re-check: delete only on an explicit NotFound — a PV that
@@ -455,25 +505,47 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 			continue
 		}
 
-		if ndel >= s.cfg.MaxDelete {
-			log.Info("STOP: cap MAX_DELETE reached", "maxDelete", s.cfg.MaxDelete)
-			break
-		}
-
 		// Mount-boundary guard: any mount point at or inside the dir →
 		// never remove. An unreadable mount table fails closed too.
 		dirPath := s.cfg.BaseDir + "/" + name
-		mounted, err := s.mountedInside(dirPath)
-		if err != nil {
+		if mountsErr != nil {
 			log.Info("SKIP: cannot read host mount table",
-				"dir", name, "error", err)
+				"dir", name, "error", mountsErr)
 			s.skips.WithLabelValues(skipMountsUnread).Inc()
 			continue
 		}
-		if mounted {
+		if mountedInside(dirPath, mounts) {
 			log.Info("SKIP: mount found inside dir", "dir", name)
 			s.skips.WithLabelValues(skipMounted).Inc()
 			continue
+		}
+
+		// Last-belt re-verify: `mounts` is a cycle-start snapshot —
+		// a mount created inside this dir mid-sweep (a pod volume
+		// attaching between the snapshot and now) is invisible to
+		// it. Re-read the table immediately before the destructive
+		// rm: one read+parse per delete candidate, cheap against
+		// rm -rf'ing a live mount's contents. Unreadable fails
+		// closed, same as the snapshot path.
+		fresh, ferr := s.mountPoints()
+		if ferr != nil {
+			log.Info("SKIP: cannot re-read host mount table before rm",
+				"dir", name, "error", ferr)
+			s.skips.WithLabelValues(skipMountsUnread).Inc()
+			continue
+		}
+		if mountedInside(dirPath, fresh) {
+			log.Info("SKIP: mount appeared inside dir mid-sweep",
+				"dir", name)
+			s.skips.WithLabelValues(skipMounted).Inc()
+			continue
+		}
+		// The PV delete above may have just spent the last
+		// MaxDelete slot — re-check so one candidate can't burn
+		// two ops past the cap.
+		if ndel >= s.cfg.MaxDelete {
+			log.Info("STOP: cap MAX_DELETE reached", "maxDelete", s.cfg.MaxDelete)
+			break
 		}
 
 		u0, _ := s.cfg.statfsFn(s.cfg.BaseDir)

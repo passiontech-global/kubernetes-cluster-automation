@@ -50,11 +50,18 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 
 	// First run (no baseline file): seed the baseline only — the
 	// counter is cumulative since cgroup creation, so counting it
-	// now would latch instantly on pre-probe history.
+	// now would latch instantly on pre-probe history. An
+	// UNPARSEABLE baseline is no baseline either: prev=0 would
+	// replay the whole cumulative counter as "new kills" — the
+	// same false latch, so re-seed instead.
 	seenPath := filepath.Join(dir, fileOOMSeen)
-	_, statErr := os.Stat(seenPath)
-	hadBaseline := statErr == nil
-	prev := h.readEpoch(seenPath)
+	prev := int64(0)
+	hadBaseline := false
+	if data, rerr := os.ReadFile(seenPath); rerr == nil {
+		if v, perr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); perr == nil {
+			prev, hadBaseline = v, true
+		}
+	}
 	h.writeState(fileOOMSeen, strconv.FormatInt(oomNow, 10))
 
 	killsPath := filepath.Join(dir, fileOOMKills)
@@ -85,16 +92,10 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 	h.oomWindow.Set(float64(inWindow))
 
 	if inWindow < h.cfg.OOMLoopMinKills {
-		if _, err := os.Stat(filepath.Join(dir, fileOOMShielded)); err == nil {
-			// Loop cleared: remove the shield — apiserver must not
-			// stay protected forever (a genuine runaway apiserver
-			// has to remain killable).
-			h.appendLog("oom-loop clear — unshield kube-apiserver/kine (oom_score_adj=0)")
-			h.setAdj("kube-apiserver", 0)
-			h.setAdj("kine", 0)
-			_ = removeStateFile(dir, fileOOMShielded)
-			h.actions.WithLabelValues(checkOOMLoop, "unshield").Inc()
-		}
+		// Loop cleared: remove the shield — apiserver must not
+		// stay protected forever (a genuine runaway apiserver
+		// has to remain killable).
+		h.unshieldOOM(dir, "clear")
 		h.stateExit(stateControllerOOMLop)
 		h.cycles.WithLabelValues(checkOOMLoop, "ok").Inc()
 		return
@@ -115,9 +116,22 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 		h.suspectLog(stateControllerOOMLop, fmt.Sprintf(
 			"ACTION: shield kube-apiserver (oom_score_adj=%d), kine %+d — window_kills=%d",
 			h.cfg.APIServerShieldAdj, h.cfg.KineShieldAdj, inWindow))
+		// Latch FIRST and confirm it landed: fileOOMShielded is the
+		// only record unshieldOOM keys on, so pinning an adj before
+		// the latch exists is a single-point-of-failure — a failed
+		// latch write leaves a shielded process nothing can find,
+		// and a later mode-off/loop-clear unshield early-returns on
+		// the missing file while oom_score_adj stays pinned for the
+		// process's lifetime. No latch ⇒ nothing may be pinned.
+		h.writeState(fileOOMShielded, "")
+		if _, err := os.Stat(filepath.Join(dir, fileOOMShielded)); err != nil {
+			h.appendLogWarn(fmt.Sprintf(
+				"oomloop: shield latch %s not persisted: %v — shielding skipped (no latch, nothing pinned)",
+				filepath.Join(dir, fileOOMShielded), err))
+			break
+		}
 		h.setAdj("kube-apiserver", h.cfg.APIServerShieldAdj)
 		h.setAdj("kine", h.cfg.KineShieldAdj)
-		h.writeState(fileOOMShielded, "")
 		h.actions.WithLabelValues(checkOOMLoop, "shield").Inc()
 	case ModeDryRun:
 		h.suspectLog(stateControllerOOMLop, fmt.Sprintf(
@@ -125,7 +139,30 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 			h.cfg.APIServerShieldAdj, h.cfg.KineShieldAdj, inWindow))
 		h.actions.WithLabelValues(checkOOMLoop, "dryrun_shield").Inc()
 	}
+	// A mode flip off enforce while the shield is latched must not
+	// leave oom_score_adj pinned on the apiserver for the process's
+	// lifetime — unshield on any non-enforce mode (off, dry-run, or
+	// an unrecognised value). Cheap: one stat per latched cycle.
+	if h.cfg.OOMLoopMode != ModeEnforce {
+		h.unshieldOOM(dir, "mode not enforce")
+	}
 	h.cycles.WithLabelValues(checkOOMLoop, "ok").Inc()
+}
+
+// unshieldOOM drops the apiserver/kine oom_score_adj shield when the
+// latch file is present — loop-clear AND every non-enforce mode (a
+// mode flip must not strand an enforce-era shield on the processes
+// forever). why joins the log line ("oom-loop <why> — unshield ...").
+func (h *Hygiene) unshieldOOM(dir, why string) {
+	if _, err := os.Stat(filepath.Join(dir, fileOOMShielded)); err != nil {
+		return
+	}
+	h.appendLog(fmt.Sprintf(
+		"oom-loop %s — unshield kube-apiserver/kine (oom_score_adj=0)", why))
+	h.setAdj("kube-apiserver", 0)
+	h.setAdj("kine", 0)
+	_ = removeStateFile(dir, fileOOMShielded)
+	h.actions.WithLabelValues(checkOOMLoop, "unshield").Inc()
 }
 
 // parseOOMKill extracts the `oom_kill` counter from memory.events —

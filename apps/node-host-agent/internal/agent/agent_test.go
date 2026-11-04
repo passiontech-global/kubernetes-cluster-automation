@@ -1,8 +1,12 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +17,17 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+// captureSlog swaps the default slog logger for a text handler
+// writing to the returned buffer — restored on cleanup.
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
 
 func TestProbeEndpoints(t *testing.T) {
 	a := New(Config{NodeName: "node-a"})
@@ -51,7 +66,7 @@ func TestProbeEndpoints(t *testing.T) {
 
 func TestMetricsEndpoint(t *testing.T) {
 	a := New(Config{NodeName: "node-a", PodName: "pod-1", Namespace: "node-ops", Version: "test"})
-	a.started = time.Now()
+	a.started.Store(time.Now().UnixNano())
 	srv := httptest.NewServer(a.metricsMux())
 	defer srv.Close()
 
@@ -139,7 +154,7 @@ func TestSubsystemMetricsOnSharedRegistry(t *testing.T) {
 		Help: "test",
 	}))
 	a := New(Config{Registry: reg})
-	a.started = time.Now()
+	a.started.Store(time.Now().UnixNano())
 	srv := httptest.NewServer(a.metricsMux())
 	defer srv.Close()
 
@@ -224,7 +239,7 @@ func TestRunRecoversSubsystemPanic(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	// Supervisor restart has a hard-coded 5s backoff — poll until the
+	// Supervisor restart backoff starts at 5s — poll until the
 	// second Run invocation rather than sleeping a fixed interval.
 	for {
 		select {
@@ -273,6 +288,91 @@ func TestRunProbeAddrInUse(t *testing.T) {
 	err = a.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "probe listener") {
 		t.Fatalf("Run err=%v want 'probe listener' error", err)
+	}
+}
+
+// ctx cancel drains the server through the injected shutdown — the
+// normal graceful path.
+func TestGracefulShutdownDrainsOnCancel(t *testing.T) {
+	buf := captureSlog(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{}) // stays open — Run is still running
+	var called atomic.Bool
+	fin := make(chan struct{})
+	go func() {
+		defer close(fin)
+		gracefulShutdown(ctx, done, "test", func(context.Context) error {
+			called.Store(true)
+			return nil
+		})
+	}()
+	cancel()
+	select {
+	case <-fin:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gracefulShutdown did not return after cancel")
+	}
+	if !called.Load() {
+		t.Fatal("shutdown was not invoked on ctx cancel")
+	}
+	if strings.Contains(buf.String(), "shutdown failed") {
+		t.Fatalf("clean shutdown logged a failure:\n%s", buf.String())
+	}
+}
+
+// Run's done channel releases the parked goroutine WITHOUT touching
+// the server — on the error path the sibling Close() already tore
+// it down, so a late drain would be a no-op (or a bogus log).
+func TestGracefulShutdownExitsOnDone(t *testing.T) {
+	ctx := context.Background() // stays live, like the errCh path
+	done := make(chan struct{})
+	var called atomic.Bool
+	fin := make(chan struct{})
+	go func() {
+		defer close(fin)
+		gracefulShutdown(ctx, done, "test", func(context.Context) error {
+			called.Store(true)
+			return nil
+		})
+	}()
+	close(done)
+	select {
+	case <-fin:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gracefulShutdown did not return on done")
+	}
+	if called.Load() {
+		t.Fatal("shutdown ran on the done release — would double tear down")
+	}
+}
+
+// ErrServerClosed from the drain (the server was torn down
+// underneath us) is the intended end state — never a logged failure;
+// any other error still logs "connections dropped".
+func TestGracefulShutdownErrorFilter(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		wantLog bool
+	}{
+		{"ErrServerClosed skipped", http.ErrServerClosed, false},
+		{"wrapped ErrServerClosed skipped",
+			fmt.Errorf("drain: %w", http.ErrServerClosed), false},
+		{"nil error silent", nil, false},
+		{"real error logged", errors.New("listener wedged"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureSlog(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			gracefulShutdown(ctx, make(chan struct{}), "test",
+				func(context.Context) error { return tc.err })
+			got := strings.Contains(buf.String(), "shutdown failed")
+			if got != tc.wantLog {
+				t.Fatalf("failure logged=%v want %v:\n%s",
+					got, tc.wantLog, buf.String())
+			}
+		})
 	}
 }
 

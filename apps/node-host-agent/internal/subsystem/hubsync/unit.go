@@ -17,6 +17,9 @@ import (
 // DaemonSet arg (:8091 — :8081 is lixo-fabric's
 // --health-probe-bind-address on production hosts) so probes/metrics
 // keep one port convention across pod and standalone deployments.
+// node-name is shq-quoted: systemd strips the quotes when splitting
+// ExecStart argv, so a config-derived name with spaces stays one
+// argument instead of smuggling extra flags.
 func systemdUnit(t Target, remoteBinary, remoteVarsDir, remoteCertsDir string) string {
 	return fmt.Sprintf(`[Unit]
 Description=node-host-agent (standalone host converge agent)
@@ -35,7 +38,7 @@ RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-`, remoteVarsDir, remoteCertsDir, remoteBinary, t.Name)
+`, remoteVarsDir, remoteCertsDir, remoteBinary, shq(t.Name))
 }
 
 // unitName derives the systemd unit name from UnitPath.
