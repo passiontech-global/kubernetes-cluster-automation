@@ -177,6 +177,14 @@ const (
 	// report — early enough to find the leaker before
 	// max_user_instances is hit.
 	inotifyWarnRatio = 0.80
+	// W8-KR3: /proc/key-users — kernel keyring quota pressure.
+	defaultKeyUsersFile = "/proc/key-users"
+	// kernelKeysPressureRatio arms state-kernel-keys-pressure.
+	kernelKeysPressureRatio = 0.80
+	// defaultLatchInterval is the Run() ticker's cadence (BUG-H5) —
+	// the watchdog-state file contract must hold even when nothing
+	// scrapes this collector (DaemonSet mode).
+	defaultLatchInterval = 30 * time.Second
 )
 
 // nebulaCertWarnDays mirrors module 13-nebula-health: fewer than this
@@ -337,6 +345,15 @@ type Config struct {
 	// CgroupMemUnits are the system.slice unit names whose
 	// memory.events feed the W7-H6 high/oom_kill counters.
 	CgroupMemUnits []string
+	// KeyUsersFile is /proc/key-users — the W8-KR3 kernel keyring
+	// quota source (per-UID usage vs maxkeys).
+	KeyUsersFile string
+	// Standalone marks systemd (non-pod) mode — informational only;
+	// the latch ticker runs regardless (BUG-H5).
+	Standalone bool
+	// LatchInterval is the Run() latch-maintenance cadence; <=0 →
+	// 30s. Seamed so tests don't wait real seconds.
+	LatchInterval time.Duration
 
 	// nowFn supplies the current time — seam for tests.
 	nowFn func() time.Time
@@ -474,6 +491,12 @@ func (c *Config) applyDefaults() {
 	if len(c.CgroupMemUnits) == 0 {
 		c.CgroupMemUnits = defaultCgroupMemUnits
 	}
+	if c.KeyUsersFile == "" {
+		c.KeyUsersFile = defaultKeyUsersFile
+	}
+	if c.LatchInterval <= 0 {
+		c.LatchInterval = defaultLatchInterval
+	}
 }
 
 // Collector implements prometheus.Collector — all reads happen at
@@ -562,6 +585,10 @@ type Collector struct {
 	descARPEntries    *prometheus.Desc
 	descCgMemHigh     *prometheus.Desc
 	descCgMemOOMKill  *prometheus.Desc
+
+	// W8 additions: KR3 kernel keyring quota + TCP close_wait.
+	descKernelKeys *prometheus.Desc
+	descSockTCPCW  *prometheus.Desc
 
 	// Legacy node-watchdog aliases — the prom_emit textfile series
 	// the fluxcd PrometheusRules still alert on
@@ -843,6 +870,17 @@ func New(cfg Config) *Collector {
 		"memory.events `oom_kill` of the unit — actual OOM kills counted by the cgroup.",
 		[]string{"node", "unit"}, nil)
 
+	// W8-KR3 — /proc/key-users: worst per-UID keyring quota fill;
+	// /proc/net/sockstat TCP close_wait (hung client sockets).
+	c.descKernelKeys = prometheus.NewDesc(
+		"node_host_agent_kernel_keys_used_ratio",
+		"Highest per-UID keyring fill ratio from /proc/key-users (instantiated/max; >0.80 latches state-kernel-keys-pressure).",
+		[]string{"node"}, nil)
+	c.descSockTCPCW = prometheus.NewDesc(
+		"node_host_agent_sockstat_tcp_close_wait",
+		"sockstat TCP close_wait — sockets stuck half-closed waiting for local close().",
+		[]string{"node"}, nil)
+
 	c.descMeta = map[*prometheus.Desc]descMeta{}
 	for _, d := range []struct {
 		desc *prometheus.Desc
@@ -945,6 +983,10 @@ func New(cfg Config) *Collector {
 			"memory.events high of the unit — direct-reclaim throttling."},
 		{c.descCgMemOOMKill, "node_host_agent_cgroup_memory_oom_kill_events_total",
 			"memory.events oom_kill of the unit."},
+		{c.descKernelKeys, "node_host_agent_kernel_keys_used_ratio",
+			"Highest per-UID keyring fill ratio from /proc/key-users."},
+		{c.descSockTCPCW, "node_host_agent_sockstat_tcp_close_wait",
+			"sockstat TCP close_wait."},
 	} {
 		c.descMeta[d.desc] = descMeta{name: d.name, help: d.help}
 	}
@@ -1009,6 +1051,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.descARPEntries
 	ch <- c.descCgMemHigh
 	ch <- c.descCgMemOOMKill
+	ch <- c.descKernelKeys
+	ch <- c.descSockTCPCW
 }
 
 // Collect implements prometheus.Collector.
@@ -1046,6 +1090,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.collectSystemdScopes(ch)
 	c.collectARP(ch)
 	c.collectCgroupMemEvents(ch)
+	c.collectKernelKeys(ch)
 }
 
 // collectWatchdog scans state-* latch files. certDays/certOK fold the
@@ -2048,8 +2093,8 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 		return
 	}
 	defer f.Close()
-	var tcpInuse, tcpOrphan, tcpTW, sockUsed float64
-	var tcpInuseOK, tcpOrphanOK, tcpTWOK, sockUsedOK bool
+	var tcpInuse, tcpOrphan, tcpTW, tcpCW, sockUsed float64
+	var tcpInuseOK, tcpOrphanOK, tcpTWOK, tcpCWOK, sockUsedOK bool
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
@@ -2081,6 +2126,13 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 			if v, ok := kv["tw"]; ok {
 				tcpTW, tcpTWOK = v, true
 			}
+			// close_wait/cw — kernels that report it carry hung
+			// half-closed sockets here (W8-KR3 companion metric).
+			if v, ok := kv["close_wait"]; ok {
+				tcpCW, tcpCWOK = v, true
+			} else if v, ok := kv["cw"]; ok {
+				tcpCW, tcpCWOK = v, true
+			}
 		case "sockets":
 			if v, ok := kv["used"]; ok {
 				sockUsed, sockUsedOK = v, true
@@ -2102,6 +2154,10 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 	if tcpTWOK {
 		ch <- prometheus.MustNewConstMetric(c.descSockTCPTW,
 			prometheus.GaugeValue, tcpTW, c.cfg.NodeName)
+	}
+	if tcpCWOK {
+		ch <- prometheus.MustNewConstMetric(c.descSockTCPCW,
+			prometheus.GaugeValue, tcpCW, c.cfg.NodeName)
 	}
 }
 

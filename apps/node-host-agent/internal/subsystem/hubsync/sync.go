@@ -27,7 +27,7 @@ func (s *Syncer) Cycle(ctx context.Context) {
 	// A cycle attempt while holding the lease counts — failures are
 	// metered + logged, and the retry cadence is SyncInterval /
 	// watcher edges, not the renew tick.
-	s.syncedWhileHeld = true
+	s.markSynced()
 	targets, dropped, notes, err := loadTargets(s.cfg.VarsDir)
 	if err != nil {
 		s.cfg.Log.Error("hubsync: target aggregation failed", "error", err)

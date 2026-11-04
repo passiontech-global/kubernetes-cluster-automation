@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -168,6 +169,20 @@ func TestAllConditionDefaults(t *testing.T) {
 		"JournaldUnreadable":  {"JournaldReadable", "journald journal reads return entries"},
 		"FilesystemReadOnly":  {"FilesystemReadWrite", "all probed filesystems are read-write"},
 		"KernelHungTasks":     {"KernelTasksRunOk", "no D-state task storm (uninterruptible sleep below threshold)"},
+		// Wave-8 latch→condition surface.
+		"NebulaIsolated":              {"NebulaMeshHealthy", "all nebula peers handshake normally"},
+		"NebulaDegraded":              {"NebulaDataplaneOk", "nebula dataplane healthy (no relay/latency degradation)"},
+		"CiliumEnvoyDown":             {"CiliumEnvoyReady", "cilium-envoy admin /ready OK"},
+		"CiliumIPAMExhausted":         {"CiliumIPAMOk", "cilium IPAM pool has headroom (no address leak)"},
+		"CiliumBPFMapPressure":        {"CiliumBPFMapsOk", "critical cilium BPF maps below 90% capacity"},
+		"SpegelMirrorDegraded":        {"SpegelMirrorReady", "spegel P2P mirror pod Ready"},
+		"CalicoVethLeak":              {"CalicoVethCountOk", "cali* veth count matches pod count (no CNI DEL leak)"},
+		"CalicoFelixDown":             {"CalicoFelixReady", "calico felix :9099 readiness OK"},
+		"Fail2banDown":                {"Fail2banActive", "fail2ban service installed and active"},
+		"ConntrackPressure":           {"ConntrackNormal", "nf_conntrack table below pressure threshold"},
+		"KernelKeysPressure":          {"KernelKeysNormal", "kernel keyring quota below pressure threshold"},
+		"ControlPlaneCertReloadStale": {"ControlPlaneCertReloadFresh", "control-plane cert reload markers fresh"},
+		"MemoryPSIThrashing":          {"MemoryPSINormal", "memory PSI full avg60 <= 25% or free memory >= 8%"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {
@@ -225,8 +240,7 @@ func TestLatchSetsConditionTrue(t *testing.T) {
 // TestWatchdogStaleProbe is check-watchdog-fresh.sh ported:
 // installed marker gates, last-run content (or installed's as
 // baseline) strictly older than 1200s → stale. It exercises
-// watchdogStale() directly — a full Cycle() refreshes last-run
-// before evaluating, so a stale fixture can't survive one.
+// watchdogStale() directly.
 func TestWatchdogStaleProbe(t *testing.T) {
 	e := fixture(t)
 
@@ -278,10 +292,11 @@ func TestWatchdogStaleProbe(t *testing.T) {
 	}
 }
 
-// TestHeartbeatFiles: each cycle rewrites last-run with the current
-// epoch and creates installed once (content = first-heartbeat epoch)
-// when absent — the agent-owned replacement for the shell watchdog's
-// prom_emit trap.
+// TestHeartbeatFiles: the FIRST cycle seeds installed + last-run
+// only when absent — the one-time initialization (BUG-H1). Later
+// cycles must NOT refresh last-run: the periodic refresh belongs
+// to the hygiene Cycle()s, and a reporter that refreshed its own
+// staleness probe could never trip.
 func TestHeartbeatFiles(t *testing.T) {
 	e := fixture(t)
 	e.cycle()
@@ -302,50 +317,45 @@ func TestHeartbeatFiles(t *testing.T) {
 		t.Fatalf("last-run = %d, want %d", got, e.now.Unix())
 	}
 
-	// installed is force:false — a later cycle keeps the original
-	// epoch; last-run tracks the cycle time.
+	// A later cycle keeps both files untouched — installed is
+	// force:false, and last-run is NOT refreshed by the reporter.
 	e.now = e.now.Add(time.Minute)
 	e.cycle()
 	if got := read("installed"); got != installEpoch {
 		t.Fatalf("installed rewritten: %d, want %d", got, installEpoch)
 	}
-	if got := read("last-run"); got != e.now.Unix() {
-		t.Fatalf("last-run not refreshed: %d, want %d", got, e.now.Unix())
+	if got := read("last-run"); got != installEpoch {
+		t.Fatalf("last-run refreshed by reporter: %d, want unchanged %d",
+			got, installEpoch)
 	}
 }
 
-// TestHeartbeatClearsStale: a stale last-run left behind by the dead
-// shell watchdog is overwritten by the agent's first cycle —
-// WatchdogStale goes straight to False and never false-positives.
-func TestHeartbeatClearsStale(t *testing.T) {
+// TestHeartbeatKeepsExistingFiles: pre-existing installed/last-run
+// (written by the hygiene Cycle before the reporter started) are
+// never overwritten — even when they carry the real current epoch.
+func TestHeartbeatKeepsExistingFiles(t *testing.T) {
 	e := fixture(t)
 	e.writeFile("installed", strconv.FormatInt(e.now.Unix()-9000, 10))
-	e.writeFile("last-run", strconv.FormatInt(e.now.Unix()-9000, 10))
+	e.writeFile("last-run", strconv.FormatInt(e.now.Unix()-60, 10))
 	e.cycle()
-	if c := e.cond(t, "WatchdogStale"); c.Status != corev1.ConditionFalse || c.Reason != "WatchdogFresh" {
-		t.Fatalf("WatchdogStale = {%s %s}, want False/WatchdogFresh", c.Status, c.Reason)
-	}
 	data, err := os.ReadFile(filepath.Join(e.dir, "last-run"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := parseEpoch(data); got != e.now.Unix() {
-		t.Fatalf("last-run = %d, want refreshed %d", got, e.now.Unix())
+	if got := parseEpoch(data); got != e.now.Unix()-60 {
+		t.Fatalf("existing last-run overwritten: %d, want %d",
+			got, e.now.Unix()-60)
 	}
 }
 
 // TestWatchdogStaleCondition exercises the stale→fresh condition
-// path through a full cycle: a poisoned tmp path makes the atomic
-// heartbeat write fail while reads still work, so the old last-run
-// survives evaluation → True; unpoison → next cycle's heartbeat
-// clears it back to False.
+// path through full cycles: a stale last-run survives evaluation
+// (the reporter never refreshes it, BUG-H1) → True on every cycle;
+// a fresh last-run written by the watchdog side clears it to False.
 func TestWatchdogStaleCondition(t *testing.T) {
 	e := fixture(t)
 	e.writeFile("installed", strconv.FormatInt(e.now.Unix()-3000, 10))
 	e.writeFile("last-run", strconv.FormatInt(e.now.Unix()-1300, 10))
-	if err := os.Mkdir(filepath.Join(e.dir, "last-run.tmp"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	e.cycle()
 	c := e.cond(t, "WatchdogStale")
 	if c.Status != corev1.ConditionTrue || c.Reason != "WatchdogStaleDetected" {
@@ -355,17 +365,47 @@ func TestWatchdogStaleCondition(t *testing.T) {
 	if c.Message != wantMsg {
 		t.Fatalf("message = %q, want %q", c.Message, wantMsg)
 	}
-	if got := testutil.ToFloat64(e.r.cycles.WithLabelValues("error")); got != 1 {
-		t.Fatalf("cycles{error} = %v, want 1", got)
+	// A second cycle must not mask the staleness — last-run is
+	// still the old epoch, so the condition stays True.
+	e.now = e.now.Add(5 * time.Minute)
+	e.cycle()
+	if c := e.cond(t, "WatchdogStale"); c.Status != corev1.ConditionTrue {
+		t.Fatalf("stale across cycles: got {%s %s}", c.Status, c.Reason)
 	}
 
-	if err := os.Remove(filepath.Join(e.dir, "last-run.tmp")); err != nil {
-		t.Fatal(err)
-	}
+	// The watchdog side heartbeats again → next cycle clears.
+	e.writeFile("last-run", strconv.FormatInt(e.now.Unix()-60, 10))
 	e.cycle()
 	c = e.cond(t, "WatchdogStale")
 	if c.Status != corev1.ConditionFalse || c.Reason != "WatchdogFresh" {
-		t.Fatalf("after heartbeat recovery: got {%s %s}", c.Status, c.Reason)
+		t.Fatalf("after watchdog heartbeat: got {%s %s}", c.Status, c.Reason)
+	}
+}
+
+// TestWatchdogStaleNotRefreshedAcrossCycles is the BUG-H1
+// regression: with a last-run older than the staleness threshold,
+// ANY number of Cycle() calls must keep reporting
+// WatchdogStale=True — the reporter must never refresh the very
+// file its probe reads.
+func TestWatchdogStaleNotRefreshedAcrossCycles(t *testing.T) {
+	e := fixture(t)
+	e.r.cfg.StaleThreshold = 600 * time.Second
+	e.writeFile("installed", strconv.FormatInt(e.now.Unix()-3000, 10))
+	e.writeFile("last-run", strconv.FormatInt(e.now.Unix()-700, 10))
+	for i := 0; i < 3; i++ {
+		e.cycle()
+		if c := e.cond(t, "WatchdogStale"); c.Status != corev1.ConditionTrue {
+			t.Fatalf("cycle %d: WatchdogStale = {%s %s}, want True — "+
+				"the reporter refreshed last-run", i, c.Status, c.Reason)
+		}
+	}
+	// The file itself must still hold the stale epoch.
+	data, err := os.ReadFile(filepath.Join(e.dir, "last-run"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parseEpoch(data); got != e.now.Unix()-700 {
+		t.Fatalf("last-run = %d, want the stale %d untouched", got, e.now.Unix()-700)
 	}
 }
 
@@ -547,6 +587,68 @@ func TestKubeletRuntimeStallDualLatch(t *testing.T) {
 	if c.Status != corev1.ConditionFalse || c.Reason != "KubeletRuntimeOk" {
 		t.Fatalf("all latches cleared: KubeletRuntimeStall = {%s %s}, want False/KubeletRuntimeOk",
 			c.Status, c.Reason)
+	}
+}
+
+// TestKubeletRuntimeStallA4Latches is the BUG-H4 pairing: the A4
+// probes' latches — a frozen PLEG (state-kubelet-syncloop-down) and
+// a hung containerd socket (state-containerd-sock-down) — are
+// runtime stalls even though :10250 /healthz still answers; both
+// must fire KubeletRuntimeStall.
+func TestKubeletRuntimeStallA4Latches(t *testing.T) {
+	for _, latch := range []string{
+		"state-kubelet-syncloop-down",
+		"state-containerd-sock-down",
+	} {
+		t.Run(latch, func(t *testing.T) {
+			e := fixture(t)
+			e.writeFile(latch, "1700000005\n")
+			e.cycle()
+			c := e.cond(t, "KubeletRuntimeStall")
+			if c.Status != corev1.ConditionTrue || c.Reason != "KubeletRuntimeStallDetected" {
+				t.Fatalf("%s latch: KubeletRuntimeStall = {%s %s}, want True/KubeletRuntimeStallDetected",
+					latch, c.Status, c.Reason)
+			}
+			if got := e.gauge("KubeletRuntimeStall", "KubeletRuntimeStallDetected"); got != 1 {
+				t.Fatalf("problem_gauge = %v, want 1", got)
+			}
+		})
+	}
+}
+
+// TestWave8LatchConditions: every Wave-8 latch maps 1:1 to its
+// permanent NodeCondition — the NHC→SNR chain and the
+// problem_gauge series cover the full latch set.
+func TestWave8LatchConditions(t *testing.T) {
+	for latch, typ := range map[string]string{
+		"state-nebula-isolated":         "NebulaIsolated",
+		"state-nebula-degraded":         "NebulaDegraded",
+		"state-cilium-envoy-down":       "CiliumEnvoyDown",
+		"state-cilium-ipam-exhausted":   "CiliumIPAMExhausted",
+		"state-cilium-bpf-map-pressure": "CiliumBPFMapPressure",
+		"state-spegel-mirror-degraded":  "SpegelMirrorDegraded",
+		"state-calico-veth-leak":        "CalicoVethLeak",
+		"state-calico-felix-down":       "CalicoFelixDown",
+		"state-fail2ban-down":           "Fail2banDown",
+		"state-conntrack-pressure":      "ConntrackPressure",
+		"state-kernel-keys-pressure":    "KernelKeysPressure",
+		"state-cp-cert-reload-stale":    "ControlPlaneCertReloadStale",
+		"state-psi-memory-thrash":       "MemoryPSIThrashing",
+	} {
+		t.Run(latch, func(t *testing.T) {
+			e := fixture(t)
+			e.writeFile(latch, "1700000005\n")
+			e.cycle()
+			c := e.cond(t, corev1.NodeConditionType(typ))
+			if c.Status != corev1.ConditionTrue {
+				t.Fatalf("latch %s: %s = {%s %s %q}, want True",
+					latch, typ, c.Status, c.Reason, c.Message)
+			}
+			if want := "watchdog state " + strings.TrimPrefix(latch, "state-") +
+				" active since 1700000005"; c.Message != want {
+				t.Fatalf("message = %q, want %q", c.Message, want)
+			}
+		})
 	}
 }
 

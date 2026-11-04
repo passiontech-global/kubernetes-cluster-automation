@@ -61,10 +61,11 @@ import (
 
 const (
 	defaultJanitorInterval = 10 * time.Minute
-	// latchMaxAge is the reap age for every state-* latch: a live
-	// latch is refreshed only by its owner's STATE-ENTER on condition
-	// start, so mtime == when the condition started — it cannot
-	// distinguish "active for 25h" from "abandoned 25h". 24h bounds
+	// latchMaxAge is the reap age for every state-* latch: since
+	// BUG-H6 a live latch's mtime is refreshed by its owner's
+	// stateEnter every cycle the condition still holds, so an
+	// aged-out file is an abandoned latch — its owner stopped
+	// evaluating it. 24h bounds
 	// the stale window while keeping false-reaps (a genuinely
 	// long-held latch re-enters next cycle, one duplicate alert)
 	// rare — and keeps a foreign-schema writer's latch from being
@@ -91,16 +92,19 @@ const (
 //	  cilium-envoy-down (B1), cilium-mtu-drift (B4),
 //	  zombie-storm (A2), d-state-storm (W7-H1),
 //	  cilium-envoy-xds-reject (W7-H3), spegel-mirror-degraded (W7-H4),
-//	  calico-veth-leak / calico-felix-down (W7-H7)
+//	  calico-veth-leak / calico-felix-down (W7-H7),
+//	  cilium-bpf-map-pressure (W8-NM3), psi-memory-thrash (W2)
 //	nethealth: dns-fallback (20), nebula-isolated/-degraded/-slowpath/
 //	  -siteedge (13), fail2ban-down (50), clock-unsync (H1),
 //	  conntrack-pressure (H2)
 //	controllerhygiene: apiserver-cache-stale/-wedged (sig13),
 //	  kine-backend-unreachable, kine-pool-runaway, kine-ttl-dead,
-//	  kine-ttl-loop, k0scontroller-oom-loop
+//	  kine-ttl-loop, k0scontroller-oom-loop, cp-cert-reload-stale (W8-CP4),
+//	  cp-component-frozen (W8-CP3)
 //	controllerhygiene + workerhygiene (shared journalwatch tracker):
 //	  journal-unreadable
-//	hostmetrics: node-overloaded (PSI hysteresis), nebula-cert-expiring
+//	hostmetrics: node-overloaded (PSI hysteresis), filesystem-readonly,
+//	  nebula-cert-expiring, kernel-keys-pressure (W8-KR3)
 var knownLatchNames = map[string]bool{
 	"pod-teardown-wedged":      true,
 	"konnectivity-ip-mismatch": true,
@@ -142,6 +146,11 @@ var knownLatchNames = map[string]bool{
 	"spegel-mirror-degraded":   true, // W7-H4 spegel P2P mirror
 	"calico-veth-leak":         true, // W7-H7 orphan cali* veth leak
 	"calico-felix-down":        true, // W7-H7 felix readiness
+	"cilium-bpf-map-pressure":  true, // W8-NM3 cilium BPF map fill ratio
+	"psi-memory-thrash":        true, // W2 PSI memory thrash guard
+	"kernel-keys-pressure":     true, // hostmetrics kernel keyring quota (W8-KR3)
+	"cp-cert-reload-stale":     true, // controllerhygiene cert reload (W8-CP4)
+	"cp-component-frozen":      true, // controllerhygiene KCM/scheduler freeze (W8-CP3)
 }
 
 // knownLatchPrefixes — parameterized latch families whose suffix is

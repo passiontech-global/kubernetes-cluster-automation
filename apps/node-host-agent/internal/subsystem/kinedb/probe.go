@@ -225,7 +225,16 @@ func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
 		if !credOK {
 			note(fmt.Sprintf("missing .env creds (%s)", k.cfg.EnvFile))
 		} else {
+			// W8-CP2: reap stuck sessions each probe round —
+			// idle-in-transaction >5m or a non-maintenance active
+			// query >10m holds locks the compact guard needs.
+			k.reapStuckSessions(ctx, pg, user, pass, note)
 			k.probeAppChecks(ctx, pg, pgb, user, pass, res, note)
+			// W8-CP2: pgbouncer saturation/auth wedge — deep
+			// client queue, or e2e auth failing while the raw
+			// backend still logs in, means the pooler itself is
+			// the wedge → container restart (15m cooldown).
+			k.checkPGBWedge(ctx, pgb, res, note)
 		}
 	}
 

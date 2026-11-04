@@ -931,7 +931,6 @@ Environment=GOGC=50
 EnvironmentFile=/etc/kine/kine.env
 %s%sExecStart=/usr/local/bin/kine --listen-address=%s --metrics-bind-address=%s
 MemoryMax=2G
-MemorySwapMax=0
 # OOMScoreAdjust negative: the kernel kills other processes before
 # kine (apiserver data-path); high CPUWeight protects kine under CPU
 # pressure.

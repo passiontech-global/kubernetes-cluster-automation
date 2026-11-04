@@ -183,6 +183,9 @@ type Config struct {
 	// Maintenance.
 	RepackDeadPct      int64 // dead-tuple % → repack candidate
 	RepackMinHeapBytes int64 // heap bytes → repack candidate
+	// PGDataDir is the in-container postgres data dir whose free
+	// space gates pg_repack (W8-CP2); "" → /var/lib/postgresql/data.
+	PGDataDir string
 
 	CmdTimeout     time.Duration // per command budget
 	LongCmdTimeout time.Duration // compact/vacuum/reindex/repack budget

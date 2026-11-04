@@ -513,9 +513,27 @@ func (c *cyc) t16Pairs() [][2]string {
 		{"net.ipv4.neigh.default.gc_thresh2", "32768"},
 		{"net.ipv4.neigh.default.gc_thresh3", "65536"},
 	}
+	// W8-KR2: keyring quota headroom — a full keyring fails
+	// keyctl/add_key silently for new sessions.
+	if c.r.fileExists("/proc/sys/kernel/keys/root_maxkeys") ||
+		fileExistsNoRoot("/proc/sys/kernel/keys/root_maxkeys") {
+		p = append(p,
+			[2]string{"kernel.keys.root_maxkeys", "1000000"},
+			[2]string{"kernel.keys.root_maxbytes", "25000000"},
+			[2]string{"kernel.keys.maxkeys", "100000"},
+			[2]string{"kernel.keys.maxbytes", "2500000"})
+	}
 	if c.r.fileExists("/proc/sys/net/netfilter/nf_conntrack_max") ||
 		fileExistsNoRoot("/proc/sys/net/netfilter/nf_conntrack_max") {
 		p = append(p, [2]string{"net.netfilter.nf_conntrack_max", "262144"})
+	}
+	// W8-KR2: shrink dead-flow occupancy of the conntrack table —
+	// TIME_WAIT/CLOSE_WAIT pileups ate the table on WAN flaps.
+	if c.r.fileExists("/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait") ||
+		fileExistsNoRoot("/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait") {
+		p = append(p,
+			[2]string{"net.netfilter.nf_conntrack_tcp_timeout_time_wait", "30"},
+			[2]string{"net.netfilter.nf_conntrack_tcp_timeout_close_wait", "60"})
 	}
 	// W7-H5: give the IPv6 neighbour cache the same headroom as
 	// IPv4 — only when the kernel exposes the ndisc table (IPv6
@@ -565,6 +583,22 @@ FallbackDNS=%s
 Cache=yes
 `, c.v("fallback_dns"))), 0o644); ch {
 		c.r.restartService(c.ctx, "systemd-resolved.service")
+	}
+	// W2: timesyncd NTP fallback — when the primary NTP source dies
+	// (site upstream blocked), the public pools keep the clock
+	// disciplined instead of drifting unsynced.
+	if c.r.serviceState(c.ctx, "systemd-timesyncd.service") != "" ||
+		c.r.fileExists("/etc/systemd/system/systemd-timesyncd.service") ||
+		fileExistsNoRoot("/usr/lib/systemd/system/systemd-timesyncd.service") ||
+		fileExistsNoRoot("/lib/systemd/system/systemd-timesyncd.service") {
+		c.r.ensureDir("/etc/systemd/timesyncd.conf.d", 0o755)
+		if ch, _ := c.r.writeManaged("/etc/systemd/timesyncd.conf.d/99-fallback.conf",
+			[]byte(`# Managed by node-config-agent - public NTP fallbacks
+[Time]
+FallbackNTP=time.cloudflare.com time.google.com 0.pool.ntp.org 1.pool.ntp.org
+`), 0o644); ch {
+			c.r.restartService(c.ctx, "systemd-timesyncd.service")
+		}
 	}
 }
 
@@ -1117,6 +1151,7 @@ func (c *cyc) tplCtx() map[string]any {
 		"interdc_relay_map":            relayMap,
 		"interdc_targets":              &topology.List{V: strSliceToAny(t.Targets)},
 		"interdc_egress_relays":        &topology.List{V: strSliceToAny(t.EgressRelays)},
+		"nebula_direct_tcp_ports":      &topology.List{V: strSliceToAny(c.nebulaDirectTCPPorts())},
 		"interdc_overlay":              t.Overlay,
 		"interdc_dns_zone":             t.Zone,
 		"interdc_dns_resolvers":        &topology.List{V: strSliceToAny(t.DNSResolvers)},
@@ -1258,6 +1293,24 @@ func (c *cyc) tableMark() string {
 // `ip -o route get` output.
 var hairpinViaRe = regexp.MustCompile(`\bvia\s+([0-9.]+)`)
 
+// nebulaDirectTCPPorts is the pref-1499 Direct-Underlay TCP bypass
+// list (nebula_direct_tcp_ports var; default the management/CP
+// ports). Only numeric 1-65535 entries survive — they land inside
+// `ip rule` shell strings below.
+func (c *cyc) nebulaDirectTCPPorts() []string {
+	ports := c.vs("nebula_direct_tcp_ports")
+	if len(ports) == 0 {
+		ports = []string{"22", "6443", "8132", "9443", "39901"}
+	}
+	var out []string
+	for _, p := range ports {
+		if c.shPort("nebula_direct_tcp_ports", p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // nebulaRouting ports the live ip rule/route/nft converge of T5b
 // (tasks/interdc_nebula.yaml: mangle fwmark, populate overlay tables,
 // flip ip rules to nebula, nebnat SNAT). SNAT/route source is the
@@ -1386,11 +1439,24 @@ func (c *cyc) nebulaRouting() {
 			r.run(ctx, "sh", "-c", fmt.Sprintf(
 				`ip rule del pref 1490 to %s.0/24 lookup %s 2>/dev/null || true`, mb, mark))
 		}
+		// pref-1499 Direct-Underlay TCP bypass: management/CP TCP
+		// dports must never be sucked into the tunnel — rule them
+		// into the main table (nethealth re-adds lost ones).
+		for _, p := range c.nebulaDirectTCPPorts() {
+			r.run(ctx, "sh", "-c", fmt.Sprintf(
+				`ip rule list pref 1499 | grep -q "ipproto tcp dport %s " || ip rule add pref 1499 ipproto tcp dport %s lookup main`,
+				p, p))
+		}
 		// flush foreign dev tables (stale nebula-era tables).
 		r.run(ctx, "sh", "-c", fmt.Sprintf(
 			`ip -o route show table all dev %s 2>/dev/null | sed -n "s|.* table \([0-9]*\) .*|\1|p" | sort -u | while read -r t; do [ "$t" = "%s" ] || [ "$t" = "%s" ] || ip route flush table "$t" 2>/dev/null; done`,
 			dev, pub, mark))
 	} else {
+		// overlay=tinc: pref-1499 bypass rules go too.
+		for _, p := range c.nebulaDirectTCPPorts() {
+			r.run(ctx, "sh", "-c", fmt.Sprintf(
+				`ip rule del pref 1499 ipproto tcp dport %s lookup main 2>/dev/null || true`, p))
+		}
 		// overlay=tinc rollback: drop nebula-owned rules.
 		r.run(ctx, "sh", "-c", fmt.Sprintf(
 			`ip rule list pref 1500 | sed -n "s/.*to \([0-9./]*\).*/\1/p" | while read -r d; do ip rule del pref 1500 to "$d" lookup %s 2>/dev/null; done; ip rule del pref 1490 to %s.0/24 lookup %s 2>/dev/null; true`,
@@ -1790,10 +1856,9 @@ func (c *cyc) controllerTuning() {
 	c.ctrlDropIn("k0scontroller_memory_max_by_host", "50-memory-guard.conf", func(v string) []byte {
 		return []byte(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
 # cgroup OOM boundary for k0scontroller (OOMPolicy=continue).
-# MemorySwapMax=0: forbid the unit from swapping.
+# BUG-H2: no MemorySwapMax — the 12GiB /swapfile-kine must stay usable.
 [Service]
 MemoryMax=` + v + `
-MemorySwapMax=0
 OOMPolicy=continue
 `)
 	})

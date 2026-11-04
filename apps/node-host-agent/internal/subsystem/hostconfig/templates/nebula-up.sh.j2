@@ -72,6 +72,12 @@ if [ "$OVERLAY" = nebula ]; then
       ip rule list | grep -q "to {{ interdc_marker_base }}.0/24 lookup $MARK" \
         || ip rule add pref 1490 to {{ interdc_marker_base }}.0/24 lookup $MARK ;;
   esac
+  # pref-1499 Direct-Underlay TCP bypass — management/CP TCP dports
+  # stay on the main table, never into the tunnel.
+  for p in {{ nebula_direct_tcp_ports | default([22, 6443, 8132, 9443, 39901]) | join(' ') }}; do
+    ip rule list pref 1499 | grep -q "ipproto tcp dport $p " \
+      || ip rule add pref 1499 ipproto tcp dport $p lookup main
+  done
   # Flush moi table co route dev $DEV ngoai {pub, marker} — don table
   # cu sau renumber (102/103 -> 100/101).
   ip -o route show table all dev $DEV 2>/dev/null | sed -n "s|.* table \([0-9]*\) .*|\1|p" | sort -u | while read -r t; do

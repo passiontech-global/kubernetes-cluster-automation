@@ -523,13 +523,15 @@ users:
 
 	t.Run("hostmetrics default enabled registers collector", func(t *testing.T) {
 		disableAllSubsystems(t)
-		// HOSTMETRICS default true; it is a scrape-time collector,
-		// not a subsystem.
+		// HOSTMETRICS default true; it registers on the registry AND
+		// (BUG-H5) runs as a subsystem driving the latch ticker —
+		// latches can't ride scrape-time Collect() when Prometheus
+		// goes dark.
 		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "true")
 		cfg, _ := buildAgentConfig("n", "p", "ns", "v",
 			"127.0.0.1:0", "127.0.0.1:0", false)
-		if len(cfg.Subsystems) != 0 {
-			t.Fatalf("subsystems=%d want 0 (hostmetrics registers on the registry)", len(cfg.Subsystems))
+		if len(cfg.Subsystems) != 1 || cfg.Subsystems[0].Name() != "hostmetrics" {
+			t.Fatalf("subsystems=%v want [hostmetrics]", subsystemNames(cfg))
 		}
 		if _, err := cfg.Registry.Gather(); err != nil {
 			t.Fatalf("Gather on shared registry failed: %v", err)
@@ -717,8 +719,9 @@ func TestStandaloneDefaultFlips(t *testing.T) {
 			"127.0.0.1:0", "127.0.0.1:0", true)
 		names := subsystemNames(cfg)
 		want := map[string]bool{
-			"apiprober": true, "hostmetrics-textfile": true,
-			"nethealth": true, "janitor": true,
+			"apiprober": true, "hostmetrics": true,
+			"hostmetrics-textfile": true,
+			"nethealth":            true, "janitor": true,
 		}
 		for _, n := range names {
 			if !want[n] {

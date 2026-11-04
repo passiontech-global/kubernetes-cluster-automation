@@ -73,6 +73,16 @@
 //     Ready=False DaemonSet pod → delete + state latch), and
 //     calico-hygiene (H7: orphan cali* veth leak + felix :9099
 //     readiness — active only on calico nodes like cicd).
+//   - W8 additions — the agent-owned watchdog heartbeat (BUG-H1:
+//     Cycle() refreshes last-run + seeds installed, the reporter's
+//     self-heartbeat made WatchdogStale permanently blind),
+//     k0sworker restarts on the A4 syncloop/containerd-sock latches
+//     (BUG-H4, shared overload/settle/last-restart gates), mtime
+//     refresh on maintained latches (BUG-H6), 2xx-only probeHTTP
+//     verdicts (BUG-H7), pod-log + snapshot attribution in
+//     disk-bloat (BUG-H8), felix restart + cali* orphan-veth GC
+//     (W8-NM3), cilium BPF map pressure (W8-NM3), and the PSI
+//     memory-thrash evictor (W2).
 //
 // Differences from the shell versions (documented, behaviour-equivalent):
 //   - `k0s ctr tasks ls` / `tasks kill` is replaced by scanning the
@@ -246,6 +256,18 @@ const (
 	spegelMinPodAge               = 3 * time.Minute
 	defaultCalicoFelixReadyURL    = "http://127.0.0.1:9099/readiness"
 	defaultCalicoOrphanVethThresh = 50 // cali* ifaces above the pod count → leak
+	// Wave-8 knobs: felix restart after the latch persisted this
+	// many consecutive failed cycles, orphan-veth down-age for the
+	// cali* GC, the critical BPF map fill ratio (W8-NM3), the PSI
+	// memory-thrash guard thresholds (W2), the /var/log/pods walk
+	// (BUG-H8) and the evict cooldown shared with disk-bloat.
+	calicoFelixRestartFails = 3
+	calicoVethGCMinAge      = 15 * time.Minute
+	defaultBPFMapHighRatio  = 0.90
+	defaultPodLogsDir       = "/host/var/log/pods"
+	defaultPSIFullAvg60     = 25.0             // /proc/pressure/memory full avg60 in percent
+	defaultMemFreeMinRatio  = 0.08             // MemAvailable/MemTotal floor
+	psiEvictInterval        = 15 * time.Minute // last-psi-evict budget
 )
 
 // Check names — prometheus `check` label + log context.
@@ -275,6 +297,8 @@ const (
 	checkCiliumLRP   = "cilium-lrp-dns"     // W7-H3
 	checkSpegel      = "spegel-mirror"      // W7-H4
 	checkCalico      = "calico-hygiene"     // W7-H7
+	checkCiliumBPF   = "cilium-bpf-maps"    // W8-NM3 (inside checkCilium)
+	checkPSIThrash   = "psi-memory-thrash"  // W2
 )
 
 // stateJournalUnreadable is the blindness latch the journal-read
@@ -385,14 +409,25 @@ type Config struct {
 	LocalDNSProbeName         string // query name the DNS probe resolves
 	CalicoFelixReadyURL       string // calico-node felix :9099/readiness probe
 	CalicoOrphanVethThreshold int    // cali* ifaces above the pod count → leak (50)
+	// Wave-8 knobs: the /var/log/pods walk added to disk-bloat
+	// (BUG-H8), the critical BPF map fill ratio for the cilium-bpf
+	// latch (W8-NM3), and the PSI memory-thrash guard (W2): latch
+	// when /proc/pressure/memory `full avg60` exceeds PSIFullAvg60
+	// (percent) AND MemAvailable/MemTotal drops under
+	// MemFreeMinRatio for ConsecNeeded cycles.
+	PodLogsDir      string  // /var/log/pods walk root (BUG-H8)
+	BPFMapHighRatio float64 // critical-map fill ratio → latch (0.90)
+	PSIFullAvg60    float64 // PSI memory full avg60 percent (25)
+	MemFreeMinRatio float64 // free-mem ratio floor (0.08)
 
 	// killFn delivers signals — seam for tests (SIGKILL on pause /
 	// proxy-agent/shim/cilium pids, and signal-0 liveness probes).
 	killFn func(pid int, sig syscall.Signal) error
 	// nowFn supplies the current time — seam for tests.
 	nowFn func() time.Time
-	// probeHTTP does one GET and returns nil on ANY HTTP response
-	// (curl -ks parity — a 401 means the listener is alive). Seam.
+	// probeHTTP does one GET and returns nil only on a 2xx response
+	// (BUG-H7 — a 500/503 means the probed service is wedged, not
+	// "the listener is alive"). Seam.
 	probeHTTP func(ctx context.Context, url string, timeout time.Duration) error
 	// unixGet GETs path over a unix socket and returns the body —
 	// the cilium-dbg endpoint list replacement (35). Seam.
@@ -614,6 +649,18 @@ func (c *Config) applyDefaults() {
 	if c.CalicoOrphanVethThreshold <= 0 {
 		c.CalicoOrphanVethThreshold = defaultCalicoOrphanVethThresh
 	}
+	if c.PodLogsDir == "" {
+		c.PodLogsDir = defaultPodLogsDir
+	}
+	if c.BPFMapHighRatio <= 0 {
+		c.BPFMapHighRatio = defaultBPFMapHighRatio
+	}
+	if c.PSIFullAvg60 <= 0 {
+		c.PSIFullAvg60 = defaultPSIFullAvg60
+	}
+	if c.MemFreeMinRatio <= 0 {
+		c.MemFreeMinRatio = defaultMemFreeMinRatio
+	}
 	if c.httpGetBody == nil {
 		// Plain HTTP (no TLS) — the envoy admin stats page lives on
 		// loopback :9901. A non-200 is an error: the reject-delta
@@ -652,9 +699,10 @@ func (c *Config) applyDefaults() {
 		c.nowFn = time.Now
 	}
 	if c.probeHTTP == nil {
-		// curl -ks parity: insecure TLS (kubelet cert SANs don't cover
-		// 127.0.0.1), and ANY HTTP response — including 401 — means
-		// the listener is alive.
+		// BUG-H7: an HTTP response no longer counts as alive on its
+		// own — a wedged cilium-agent :9879/healthz answering 500/503
+		// must read as DOWN. Only a 2xx is a pass; insecure TLS stays
+		// (kubelet cert SANs don't cover 127.0.0.1, curl -ks parity).
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
 		tr.IdleConnTimeout = 90 * time.Second
@@ -672,6 +720,9 @@ func (c *Config) applyDefaults() {
 			}
 			defer resp.Body.Close()
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+			}
 			return nil
 		}
 	}
@@ -985,6 +1036,9 @@ type Hygiene struct {
 	spegelFails      int
 	calicoVethFails  int
 	calicoFelixFails int
+
+	// Wave-8 counters: the W2 PSI memory-thrash streak.
+	psiThrashFails int
 
 	// rateMu serialises rate-budget check+spend pairs: the feeder
 	// goroutine (remediate G5/G6) and Cycle checks compete for the
@@ -1307,6 +1361,16 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	run(checkCalico, func() {
 		h.checkCalicoHygiene(ctx, pods, apiOK, workerActive)
 	})
+	run(checkPSIThrash, func() {
+		h.checkPSIThrash(ctx, pods, apiOK, pidsOnce, workerActive)
+	})
+	// BUG-H1: the periodic watchdog heartbeat lives HERE now —
+	// nodereporter used to refresh last-run every Cycle, which made
+	// its own WatchdogStale probe permanently blind. The hygiene
+	// Cycle owns the refresh (controllerhygiene/nethealth do the
+	// same on non-worker nodes); gated early-returns above skip it
+	// so a node where the checks never ran does not claim a run.
+	h.writeHeartbeat()
 }
 
 // listNodePods lists pods scheduled to this node; apiOK=false means
@@ -1365,10 +1429,16 @@ func (h *Hygiene) stateExists(name string) bool {
 
 // stateEnter creates state-<name> with the current epoch — only when
 // absent (the file's mtime/content is when the condition STARTED) and
-// logs the transition once, lib.sh STATE-ENTER parity.
+// logs the transition once, lib.sh STATE-ENTER parity. An existing
+// latch gets its mtime refreshed (BUG-H6): the janitor reaps state-*
+// files older than 24h, so a latch maintained for days by an owner
+// still evaluating the condition would otherwise be reaped
+// mid-episode.
 func (h *Hygiene) stateEnter(name, extra string) {
 	p := h.statePath(name)
 	if _, err := os.Stat(p); err == nil {
+		now := h.cfg.nowFn()
+		_ = os.Chtimes(p, now, now)
 		return
 	}
 	content := strconv.FormatInt(h.cfg.nowFn().Unix(), 10) + "\n"
@@ -1407,6 +1477,43 @@ func (h *Hygiene) stateExit(name string) {
 		return
 	}
 	h.appendLog(fmt.Sprintf("STATE-EXIT: %s", name))
+}
+
+// writeHeartbeat is the agent-owned replacement for the shell
+// watchdog's prom_emit heartbeat (BUG-H1): `installed` is created
+// only when absent (baseline epoch, ansible force:false parity) and
+// `last-run` is rewritten every cycle — nodereporter's
+// watchdogStale() reads exactly this pair. Writes are atomic via
+// the ".tmp-<name>" convention so a reader never sees a truncated
+// epoch; a failed write is logged, never fatal.
+func (h *Hygiene) writeHeartbeat() {
+	if err := os.MkdirAll(h.cfg.WatchdogStateDir, 0o755); err != nil {
+		logger().Warn("workerhygiene: watchdog heartbeat failed",
+			"dir", h.cfg.WatchdogStateDir, "error", err)
+		return
+	}
+	now := h.cfg.nowFn().Unix()
+	installed := filepath.Join(h.cfg.WatchdogStateDir, "installed")
+	if _, err := os.Stat(installed); os.IsNotExist(err) {
+		h.writeEpochFile(installed, now)
+	}
+	h.writeEpochFile(filepath.Join(h.cfg.WatchdogStateDir, "last-run"), now)
+}
+
+// writeEpochFile writes "<epoch>\n" via the stateEnter ".tmp-<name>"
+// tmp+rename convention — atomic on POSIX.
+func (h *Hygiene) writeEpochFile(path string, epoch int64) {
+	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
+	content := strconv.FormatInt(epoch, 10) + "\n"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		logger().Warn("workerhygiene: heartbeat write failed",
+			"path", path, "error", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		logger().Warn("workerhygiene: heartbeat write failed",
+			"path", path, "error", err)
+	}
 }
 
 // rateOK reports whether the rate budget file is absent, unparseable,
@@ -2696,6 +2803,11 @@ func (h *Hygiene) checkCilium(ctx context.Context, apiOK, workerActive bool) {
 	if err == nil {
 		h.ciliumFails = 0
 		h.stateExit("cilium-agent-down")
+		// W8-NM3: a healthy healthz doesn't prove the datapath —
+		// conntrack/SNAT/LB BPF maps can sit at capacity while the
+		// agent still answers 200. Evaluate the map fill ratios on
+		// the same agent socket.
+		h.checkCiliumBPFMaps(ctx)
 		h.cycles.WithLabelValues(checkCilium, "ok").Inc()
 		return
 	}
@@ -2806,6 +2918,123 @@ func (h *Hygiene) checkCiliumInitStuck(ctx context.Context, apiOK, workerActive 
 		}
 	}
 	h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
+}
+
+// --- W8-NM3: cilium BPF map pressure ---
+// The datapath dies silently long before the agent does: once the
+// conntrack, SNAT or LB-service maps hit maxEntries, new flows are
+// dropped/blackholed while :9879/healthz keeps returning 200. The
+// check reads `GET /v1/map` off the agent socket and latches
+// state-cilium-bpf-map-pressure when any critical map exceeds
+// BPFMapHighRatio of its capacity — the latch is what NPD/NHC sees;
+// no remedy is attempted (map growth needs a datapath
+// restart/resize decision a node agent must not take alone).
+
+// ciliumBPFMapCritical is the map set whose fill ratio gates the
+// latch — the v4 conntrack pair, the SNAT pool and the v2 LB
+// services map hit hard maxEntries first and each blackholes a
+// different traffic class when full.
+var ciliumBPFMapCritical = map[string]bool{
+	"cilium_ct4_global":       true,
+	"cilium_ct_any4_global":   true,
+	"cilium_snat_v4_external": true,
+	"cilium_lb4_services_v2":  true,
+}
+
+// parseCiliumBPFMaps extracts name → [used, max] from a /v1/map
+// body. Wire shapes differ across agent versions: entries are
+// objects carrying either "name" or "path" (the map name is the
+// path basename), the used count arrives as a "used"/"entries"/
+// "count" number or a "cache" array whose length is the live
+// entries, and capacity as "size"/"max"/"maxSize"/"capacity". A map
+// with no readable used+max pair is skipped — pressure can only be
+// claimed on both numbers.
+func parseCiliumBPFMaps(body []byte) map[string][2]int64 {
+	var top any
+	if json.Unmarshal(body, &top) != nil {
+		return nil
+	}
+	numOf := func(m map[string]any, keys ...string) (int64, bool) {
+		for _, k := range keys {
+			if f, ok := m[k].(float64); ok {
+				return int64(f), true
+			}
+		}
+		return 0, false
+	}
+	out := map[string][2]int64{}
+	var walk func(n any)
+	walk = func(n any) {
+		switch t := n.(type) {
+		case []any:
+			for _, e := range t {
+				walk(e)
+			}
+		case map[string]any:
+			name, _ := t["name"].(string)
+			if name == "" {
+				if p, _ := t["path"].(string); p != "" {
+					name = filepath.Base(p)
+				}
+			}
+			if name != "" && ciliumBPFMapCritical[name] {
+				used, uok := numOf(t, "used", "entries", "count")
+				if !uok {
+					// Entry arrays carry the live count as their
+					// length ("cache" on the /v1/map wire;
+					// "entries" on some dumps).
+					for _, k := range []string{"cache", "entries"} {
+						if arr, ok := t[k].([]any); ok {
+							used, uok = int64(len(arr)), true
+							break
+						}
+					}
+				}
+				max, mok := numOf(t, "max", "maxSize", "max-size", "capacity", "size")
+				if uok && mok && max > 0 {
+					out[name] = [2]int64{used, max}
+				}
+			}
+			// Map collections may be nested under "maps"/
+			// "dynamicMaps"/"staticMaps" keys.
+			for _, v := range t {
+				walk(v)
+			}
+		}
+	}
+	walk(top)
+	return out
+}
+
+// checkCiliumBPFMaps reads the map fill ratios off the agent socket
+// and latches state-cilium-bpf-map-pressure when a critical map
+// exceeds BPFMapHighRatio. An unreadable socket or unparseable body
+// is inconclusive (the cilium checks' keep-state rule) — the latch
+// is neither entered nor cleared on missing evidence.
+func (h *Hygiene) checkCiliumBPFMaps(ctx context.Context) {
+	body, err := h.cfg.unixGet(ctx, h.cfg.CiliumSocket, "/v1/map")
+	if err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-bpf-maps map query on %s failed: %v — inconclusive, keeping state",
+			h.cfg.CiliumSocket, err))
+		h.cycles.WithLabelValues(checkCiliumBPF, "abort").Inc()
+		return
+	}
+	maps := parseCiliumBPFMaps(body)
+	var over []string
+	for name, um := range maps {
+		if float64(um[0]) >= h.cfg.BPFMapHighRatio*float64(um[1]) {
+			over = append(over, fmt.Sprintf("%s=%d/%d", name, um[0], um[1]))
+		}
+	}
+	if len(over) == 0 {
+		h.stateExit("cilium-bpf-map-pressure")
+		h.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
+		return
+	}
+	sort.Strings(over)
+	h.stateEnter("cilium-bpf-map-pressure", strings.Join(over, " "))
+	h.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
 }
 
 // --- Check: ctr-image-healer (37-ctr-image-healer.sh) ---
@@ -3471,8 +3700,10 @@ func (h *Hygiene) resetFailedK0sWorker(ctx context.Context) {
 // kubelet exposes /healthz/syncloop specifically for the sync loop
 // (returns 500 the moment PLEG dies). The containerd unix socket is
 // the other half: a hung containerd wedges PLEG while every HTTP
-// endpoint still answers. Both are latch-only signals — the shared
-// restart machinery (05/T15) does the remediation.
+// endpoint still answers. Both latches now self-heal (BUG-H4): at
+// ConsecNeeded fails they run the shared k0sworker restart gates
+// (overload / settle / last-restart budget) instead of waiting for
+// 05/T15 to notice.
 
 func (h *Hygiene) checkKubeletSyncloop(ctx context.Context, workerActive bool) {
 	if !workerActive {
@@ -3536,13 +3767,48 @@ func (h *Hygiene) checkKubeletSyncloop(ctx context.Context, workerActive bool) {
 		return
 	}
 	h.syncloopFails++
-	if h.syncloopFails >= h.cfg.ConsecNeeded {
-		h.stateEnter("kubelet-syncloop-down",
-			fmt.Sprintf("pleg-frozen last_err=%v", lastErr))
-	} else {
+	if h.syncloopFails < h.cfg.ConsecNeeded {
 		h.appendLog(fmt.Sprintf(
 			"suspect: kubelet-syncloop-down /healthz/syncloop fail (PLEG?) err=%v (check %d/%d)",
 			lastErr, h.syncloopFails, h.cfg.ConsecNeeded))
+		h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
+		return
+	}
+	// BUG-H4: a frozen PLEG is a kubelet stall the 05 probe can't
+	// see — confirmed consecutive fails now self-heal through the
+	// shared k0sworker restart gates (overload / settle /
+	// last-restart budget), checkKubeletStall parity.
+	overloaded := h.stateExists("node-overloaded")
+	if !overloaded {
+		h.stateEnter("kubelet-syncloop-down",
+			fmt.Sprintf("pleg-frozen last_err=%v", lastErr))
+	} else if !h.stateExists("kubelet-syncloop-down") {
+		// A stall under CPU starvation is a symptom — latching
+		// would escalate to NHC→SNR and dump 100% of the load
+		// onto the survivors (amplifier). Log-only.
+		h.appendLog(fmt.Sprintf(
+			"kubelet-syncloop-down suppressed-overloaded - pleg-frozen last_err=%v", lastErr))
+	}
+	switch {
+	case overloaded:
+		h.appendLog(fmt.Sprintf(
+			"suspect: kubelet-syncloop-down - node overloaded, skip restart k0sworker (err=%v)", lastErr))
+	case !h.k0sWorkerSettled(ctx):
+		h.appendLog("suspect: kubelet-syncloop-down - k0sworker not settled (<180s), skip restart")
+	case !h.rateTrySpend("last-restart", h.cfg.MinRestartInterval):
+		h.appendLog("suspect: kubelet-syncloop-down - in restart cooldown (<30m), skip")
+	default:
+		// Budget already spent atomically by the rateTrySpend
+		// case — the feeder goroutine competes for the same file.
+		h.appendLog(fmt.Sprintf(
+			"ACTION: restarting k0sworker - kubelet-syncloop-down pleg-frozen (persisted %dx)",
+			h.syncloopFails))
+		h.syncloopFails = 0
+		if err := h.restartK0sWorker(ctx); err != nil {
+			h.appendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
+		} else {
+			h.actions.WithLabelValues(checkSyncloop, "restart").Inc()
+		}
 	}
 	h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
 }
@@ -3572,13 +3838,45 @@ func (h *Hygiene) checkContainerdSock(ctx context.Context, workerActive bool) {
 		return
 	}
 	h.ctrsockFails++
-	if h.ctrsockFails >= h.cfg.ConsecNeeded {
-		h.stateEnter("containerd-sock-down",
-			fmt.Sprintf("probe_err=%v", err))
-	} else {
+	if h.ctrsockFails < h.cfg.ConsecNeeded {
 		h.appendLog(fmt.Sprintf(
 			"suspect: containerd-sock-down %s probe fail: %v (check %d/%d)",
 			h.cfg.ContainerdSocket, err, h.ctrsockFails, h.cfg.ConsecNeeded))
+		h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
+		return
+	}
+	// BUG-H4: a hung containerd socket wedges PLEG and every pod
+	// lifecycle op — confirmed consecutive fails self-heal through
+	// the shared k0sworker restart gates, checkKubeletSyncloop
+	// parity.
+	overloaded := h.stateExists("node-overloaded")
+	if !overloaded {
+		h.stateEnter("containerd-sock-down",
+			fmt.Sprintf("probe_err=%v", err))
+	} else if !h.stateExists("containerd-sock-down") {
+		h.appendLog(fmt.Sprintf(
+			"containerd-sock-down suppressed-overloaded - probe_err=%v", err))
+	}
+	switch {
+	case overloaded:
+		h.appendLog(fmt.Sprintf(
+			"suspect: containerd-sock-down - node overloaded, skip restart k0sworker (err=%v)", err))
+	case !h.k0sWorkerSettled(ctx):
+		h.appendLog("suspect: containerd-sock-down - k0sworker not settled (<180s), skip restart")
+	case !h.rateTrySpend("last-restart", h.cfg.MinRestartInterval):
+		h.appendLog("suspect: containerd-sock-down - in restart cooldown (<30m), skip")
+	default:
+		// Budget already spent atomically by the rateTrySpend
+		// case — the feeder goroutine competes for the same file.
+		h.appendLog(fmt.Sprintf(
+			"ACTION: restarting k0sworker - containerd-sock-down %s (persisted %dx)",
+			h.cfg.ContainerdSocket, h.ctrsockFails))
+		h.ctrsockFails = 0
+		if err := h.restartK0sWorker(ctx); err != nil {
+			h.appendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
+		} else {
+			h.actions.WithLabelValues(checkCtrSock, "restart").Inc()
+		}
 	}
 	h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
 }
@@ -4523,10 +4821,24 @@ func (h *Hygiene) walkBytes(root string) (total int64, truncated bool) {
 	return total, truncated
 }
 
-// scanBloat runs the two bounded walks the check is defined over:
+// podLogDirUID extracts the pod uid from a /var/log/pods dir name
+// (<ns>_<pod>_<uid>): neither namespaces nor pod names can contain
+// '_', so the LAST '_' delimits the uid. "" when there is no
+// trailing segment.
+func podLogDirUID(base string) string {
+	if i := strings.LastIndexByte(base, '_'); i >= 0 && i+1 < len(base) {
+		return base[i+1:]
+	}
+	return ""
+}
+
+// scanBloat runs the bounded walks the check is defined over:
 // kubelet emptyDir volumes (tmpfs-backed ones can't fill the disk —
-// skipped via statfs type) and containerd overlayfs snapshots.
-// Over-threshold dirs return as hits; podTotals/podByUID feed the
+// skipped via statfs type), containerd overlayfs snapshots, and the
+// /var/log/pods stdout log dirs (BUG-H8 — a runaway log writer
+// fills the disk while its emptyDir stays small, and a leaked
+// snapshot pins space no volume path accounts for). Over-threshold
+// dirs return as hits; podTotals/podByUID feed the
 // critical-watermark eviction decision.
 func (h *Hygiene) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 	podTotals map[string]int64, podByUID map[string]*corev1.Pod) {
@@ -4560,17 +4872,66 @@ func (h *Hygiene) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 		}
 	}
 	// (2) containerd overlayfs snapshots — <id>/fs is the unpacked
-	// layer content; a leaked snapshot pins real disk.
+	// layer content; a leaked snapshot pins real disk. The CRI
+	// plugin uses the container ID (== the task dir name) as the
+	// snapshot key, so a live task dir maps the snapshot back to
+	// its pod's uid for the eviction decision; unresolvable
+	// snapshots stay hits-only.
 	snapRoot := filepath.Join(h.cfg.K0sDataDir, "containerd",
 		"io.containerd.snapshotter.v1.overlayfs", "snapshots")
 	for _, snap := range readDirNames(snapRoot) {
+		id := filepath.Base(snap)
 		size, _ := h.walkBytes(filepath.Join(snap, "fs"))
+		if size <= 0 {
+			continue
+		}
+		if uid := h.snapshotPodUID(id); uid != "" {
+			podTotals[uid] += size
+		}
 		if size > threshold {
 			hits = append(hits, bloatHit{
-				label: "snapshot " + filepath.Base(snap), bytes: size})
+				label: "snapshot " + id, bytes: size})
+		}
+	}
+	// (3) pod stdout log dirs — <PodLogsDir>/<ns>_<pod>_<uid>/: the
+	// containerd CRI writes container logs here (rotated at 10MiB ×
+	// 5 by kubelet, but a chatty container under a stuck rotation —
+	// or a pod with hundreds of short-lived restarts — outruns it).
+	for _, logDir := range readDirNames(h.cfg.PodLogsDir) {
+		base := filepath.Base(logDir)
+		uid := podLogDirUID(base)
+		size, _ := h.walkBytes(logDir)
+		if uid != "" {
+			podTotals[uid] += size
+		}
+		if size > threshold {
+			label := "pod-logs " + base
+			if p, ok := podByUID[uid]; ok && p != nil {
+				label = "pod " + p.Namespace + "/" + p.Name + " logs"
+			}
+			hits = append(hits, bloatHit{label: label, bytes: size})
 		}
 	}
 	return hits, podTotals, podByUID
+}
+
+// snapshotPodUID resolves a containerd snapshot id back to the pod
+// uid owning it — the CRI plugin uses the container ID as the
+// snapshot key, and the runtime-v2 task dir of that ID carries the
+// io.kubernetes.pod.uid annotation in config.json (either task root
+// may hold it). "" when no task dir resolves (leaked/orphan
+// snapshot — no pod to bill it to).
+func (h *Hygiene) snapshotPodUID(id string) string {
+	for _, root := range []string{h.cfg.CtrTaskRoot, h.cfg.SandboxCtlRoot} {
+		cfgData, err := os.ReadFile(filepath.Join(root, id, "config.json"))
+		if err != nil {
+			continue
+		}
+		if m := podUIDRe.FindSubmatch(cfgData); m != nil {
+			return string(m[1])
+		}
+	}
+	return ""
 }
 
 func (h *Hygiene) checkDiskBloat(ctx context.Context, pods []corev1.Pod,
@@ -5222,20 +5583,31 @@ func (h *Hygiene) checkCalicoHygiene(ctx context.Context, pods []corev1.Pod,
 		h.calicoVethFails = 0
 		h.stateExit("calico-veth-leak")
 	}
+	// Check 1b — orphan-veth GC (W8-NM3): while the leak latch is
+	// set, reap cali* host veths that stayed DOWN (carrier 0) for
+	// calicoVethGCMinAge. Live veths always answer carrier=1; a
+	// leaked one from a failed CNI DEL is DOWN forever. The
+	// veth-seen-<name> marker provides the 15m age — same
+	// confirm-marker shape as wedged-seen-* (a veth must not be
+	// deleted on a single read: an interface mid-creation can read
+	// carrier 0 for a moment).
+	if h.stateExists("calico-veth-leak") {
+		h.gcCalicoOrphanVeths(ctx)
+	}
 	// Check 2 — felix readiness, gated on a Running calico-node pod
 	// on this node (no pod → nothing to probe).
-	felixPod := false
+	var felix *corev1.Pod
 	for i := range pods {
 		p := &pods[i]
 		if (p.Namespace == "kube-system" || p.Namespace == "calico-system") &&
 			calicoNodePodRe.MatchString(p.Name) &&
 			p.DeletionTimestamp == nil && p.Status.Phase == corev1.PodRunning {
-			felixPod = true
+			felix = p
 			break
 		}
 	}
 	switch {
-	case !felixPod || h.cfg.CalicoFelixReadyURL == "":
+	case felix == nil || h.cfg.CalicoFelixReadyURL == "":
 		h.calicoFelixFails = 0
 		h.stateExit("calico-felix-down")
 	default:
@@ -5244,17 +5616,327 @@ func (h *Hygiene) checkCalicoHygiene(ctx context.Context, pods []corev1.Pod,
 		if err == nil && code == http.StatusOK {
 			h.calicoFelixFails = 0
 			h.stateExit("calico-felix-down")
-		} else {
-			h.calicoFelixFails++
-			if h.calicoFelixFails >= h.cfg.ConsecNeeded {
-				h.stateEnter("calico-felix-down",
-					fmt.Sprintf("readiness_probe_fails=%d", h.calicoFelixFails))
-			} else {
+			break
+		}
+		h.calicoFelixFails++
+		if h.calicoFelixFails < h.cfg.ConsecNeeded {
+			h.appendLog(fmt.Sprintf(
+				"suspect: calico-felix-down readiness probe code=%d err=%v (check %d/%d)",
+				code, err, h.calicoFelixFails, h.cfg.ConsecNeeded))
+			break
+		}
+		h.stateEnter("calico-felix-down",
+			fmt.Sprintf("readiness_probe_fails=%d", h.calicoFelixFails))
+		// W8-NM3: a felix datapath whose readiness stayed dark
+		// across calicoFelixRestartFails consecutive cycles is a
+		// real wedge, not a flap — delete the calico-node pod so
+		// the DaemonSet rebuilds it (last-calico-restart budget).
+		if h.calicoFelixFails >= calicoFelixRestartFails {
+			switch {
+			case h.stateExists("node-overloaded"):
 				h.appendLog(fmt.Sprintf(
-					"suspect: calico-felix-down readiness probe code=%d err=%v (check %d/%d)",
-					code, err, h.calicoFelixFails, h.cfg.ConsecNeeded))
+					"suspect: calico-felix-down %dx but node overloaded — skip pod restart", h.calicoFelixFails))
+			case !h.rateTrySpend("last-calico-restart", h.cfg.MinRestartInterval):
+				h.appendLog(fmt.Sprintf(
+					"suspect: calico-felix-down %dx but pod restart in cooldown (<30m), skip", h.calicoFelixFails))
+			default:
+				// Budget spent atomically BEFORE the delete.
+				h.appendLog(fmt.Sprintf(
+					"ACTION: calico-hygiene deleted pod %s/%s - felix readiness down %dx",
+					felix.Namespace, felix.Name, h.calicoFelixFails))
+				if derr := h.cfg.Client.CoreV1().Pods(felix.Namespace).Delete(
+					ctx, felix.Name, metav1.DeleteOptions{
+						GracePeriodSeconds: ptr.To[int64](0)}); derr != nil {
+					h.appendLog(fmt.Sprintf(
+						"suspect: calico-hygiene delete %s/%s failed: %v",
+						felix.Namespace, felix.Name, derr))
+				} else {
+					h.actions.WithLabelValues(checkCalico, "pod_delete").Inc()
+				}
 			}
 		}
 	}
 	h.cycles.WithLabelValues(checkCalico, "ok").Inc()
+}
+
+// gcCalicoOrphanVeths reaps cali* host veths that have been DOWN
+// (carrier 0) for calicoVethGCMinAge — the orphans a failed CNI
+// DEL leaks: they still carry iptables routes and keep the leak
+// count climbing even after the latch fired. Confirmation goes
+// through a veth-seen-<name> marker in the state dir (the
+// wedged-seen-* pattern — a single down read is not enough: an
+// iface mid-creation reads carrier 0 briefly). Markers for ifaces
+// that vanished or came back up are pruned.
+func (h *Hygiene) gcCalicoOrphanVeths(ctx context.Context) {
+	entries, err := os.ReadDir(h.cfg.SysClassNet)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "cali") {
+			continue
+		}
+		marker := filepath.Join(h.cfg.WatchdogStateDir, "veth-seen-"+name)
+		carrier, err := os.ReadFile(filepath.Join(h.cfg.SysClassNet, name, "carrier"))
+		if err != nil {
+			continue // racing an iface add/remove — neither up nor down
+		}
+		if strings.TrimSpace(string(carrier)) != "0" {
+			// Live veth — a stale marker from an earlier leak
+			// episode must not carry into this one.
+			_ = os.Remove(marker)
+			continue
+		}
+		if !h.stateFileExists("veth-seen-" + name) {
+			h.rateSpend("veth-seen-" + name)
+			h.appendLog(fmt.Sprintf(
+				"calico-hygiene: orphan veth candidate %s - carrier down, confirm in %dm",
+				name, int(calicoVethGCMinAge.Minutes())))
+			continue
+		}
+		if !h.rateOK("veth-seen-"+name, calicoVethGCMinAge) {
+			continue
+		}
+		if h.cfg.Systemd == nil {
+			h.appendLog(fmt.Sprintf(
+				"suspect: calico-hygiene orphan veth %s down >%dm but no systemd client — skip delete",
+				name, int(calicoVethGCMinAge.Minutes())))
+			continue
+		}
+		out, derr := h.cfg.Systemd.Exec(ctx, "ip", "link", "delete", name)
+		if derr != nil {
+			h.appendLog(fmt.Sprintf(
+				"suspect: calico-hygiene ip link delete %s failed: %v (%s)",
+				name, derr, strings.TrimSpace(out)))
+			continue
+		}
+		_ = os.Remove(marker)
+		h.appendLog(fmt.Sprintf(
+			"ACTION: calico-hygiene deleted orphan veth %s - carrier down >%dm (CNI DEL leak)",
+			name, int(calicoVethGCMinAge.Minutes())))
+		h.actions.WithLabelValues(checkCalico, "veth_delete").Inc()
+	}
+	// Prune markers for ifaces that no longer exist.
+	if ms, err := filepath.Glob(
+		filepath.Join(h.cfg.WatchdogStateDir, "veth-seen-*")); err == nil {
+		for _, m := range ms {
+			name := strings.TrimPrefix(filepath.Base(m), "veth-seen-")
+			if _, err := os.Stat(filepath.Join(h.cfg.SysClassNet, name)); err != nil {
+				_ = os.Remove(m)
+			}
+		}
+	}
+}
+
+// --- Check: PSI memory thrash guard (W2) ---
+// When the kernel is genuinely out of memory the LAST thing that
+// should die is a system daemon — but the OOM killer scores by
+// oom_score, not by "this box still needs a kubelet". A sustained
+// memory-full stall (PSI `full avg60` > PSIFullAvg60) together with
+// real free memory under MemFreeMinRatio means the node IS
+// thrashing; for ConsecNeeded consecutive cycles the
+// state-psi-memory-thrash latch fires and the highest-RSS
+// non-system pod is evicted through the API (last-psi-evict 15m
+// budget) — buying back headroom before the kernel picks a victim
+// of its own (k0sworker, containerd, the agent itself).
+
+// psiMemoryFullAvg60 parses <ProcRoot>/pressure/memory — the
+// `full avg60=` value of the memory pressure stall (percent). PSI
+// files look like:
+//
+//	some avg10=1.23 avg60=4.56 avg300=0.78 total=12345
+//	full avg10=0.89 avg60=26.10 avg300=0.54 total=6789
+//
+// ok=false when the file is unreadable or carries no full avg60
+// (PSI disabled on this kernel — the whole check is then dormant).
+func (h *Hygiene) psiMemoryFullAvg60() (float64, bool) {
+	data, err := os.ReadFile(filepath.Join(h.cfg.ProcRoot, "pressure", "memory"))
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 || f[0] != "full" {
+			continue
+		}
+		for _, kv := range f[1:] {
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok || k != "avg60" {
+				continue
+			}
+			if x, err := strconv.ParseFloat(v, 64); err == nil {
+				return x, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// memFreeRatio parses <ProcRoot>/meminfo — MemAvailable/MemTotal.
+// MemAvailable is the usable-free number (kernel 3.14+); ok=false
+// when either field is missing or MemTotal is zero.
+func (h *Hygiene) memFreeRatio() (float64, bool) {
+	data, err := os.ReadFile(filepath.Join(h.cfg.ProcRoot, "meminfo"))
+	if err != nil {
+		return 0, false
+	}
+	var total, avail int64
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		v, err := strconv.ParseInt(f[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch f[0] {
+		case "MemTotal:":
+			total = v
+		case "MemAvailable:":
+			avail = v
+		}
+	}
+	if total <= 0 {
+		return 0, false
+	}
+	return float64(avail) / float64(total), true
+}
+
+// procRSS reads /proc/<pid>/status VmRSS in bytes — the resident
+// footprint used to rank eviction victims.
+func (h *Hygiene) procRSS(pid int) int64 {
+	data, err := os.ReadFile(h.procFile(pid, "status"))
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "VmRSS:") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) >= 2 {
+			if kb, err := strconv.ParseInt(f[1], 10, 64); err == nil {
+				return kb << 10 // VmRSS is reported in kB
+			}
+		}
+	}
+	return 0
+}
+
+// highestRSSPod returns the non-system pod on this node whose
+// summed /proc VmRSS is largest — the eviction victim for the
+// psi-memory-thrash guard. kube-system and node-ops are never
+// evicted (the guard exists to protect system daemons, not to reap
+// them); pods already Terminating are skipped. Pids are attributed
+// to pods via the same /proc/<pid>/cgroup uid extraction the zombie
+// check uses.
+func (h *Hygiene) highestRSSPod(pods []corev1.Pod, pids []int) (victim *corev1.Pod, rss int64) {
+	byUID := map[string]*corev1.Pod{}
+	for i := range pods {
+		p := &pods[i]
+		if p.DeletionTimestamp != nil || p.Namespace == "kube-system" ||
+			p.Namespace == "node-ops" {
+			continue
+		}
+		byUID[string(p.UID)] = p
+	}
+	if len(byUID) == 0 || len(pids) == 0 {
+		return nil, 0
+	}
+	rssOf := map[string]int64{}
+	for _, pid := range pids {
+		uid := h.podUIDForPID(pid)
+		if uid == "unknown" {
+			continue
+		}
+		if _, ok := byUID[uid]; ok {
+			rssOf[uid] += h.procRSS(pid)
+		}
+	}
+	for uid, total := range rssOf {
+		if total <= 0 {
+			continue
+		}
+		if victim == nil || total > rss {
+			victim, rss = byUID[uid], total
+		}
+	}
+	return victim, rss
+}
+
+func (h *Hygiene) checkPSIThrash(ctx context.Context, pods []corev1.Pod,
+	apiOK bool, pidsOnce func() []int, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkPSIThrash, "gated").Inc()
+		return
+	}
+	avg60, psiOK := h.psiMemoryFullAvg60()
+	free, memOK := h.memFreeRatio()
+	if !psiOK || !memOK {
+		// PSI disabled or meminfo unreadable — inconclusive, keep
+		// streak/latch exactly like a failed probe (a kernel without
+		// PSI never latches but must not clear a live one on a
+		// transient read error).
+		h.cycles.WithLabelValues(checkPSIThrash, "abort").Inc()
+		return
+	}
+	thrash := avg60 > h.cfg.PSIFullAvg60 && free < h.cfg.MemFreeMinRatio
+	if !thrash {
+		h.psiThrashFails = 0
+		h.stateExit("psi-memory-thrash")
+		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		return
+	}
+	h.psiThrashFails++
+	if h.psiThrashFails < h.cfg.ConsecNeeded {
+		h.appendLog(fmt.Sprintf(
+			"suspect: psi-memory-thrash psi_full_avg60=%.1f mem_free=%.3f (check %d/%d)",
+			avg60, free, h.psiThrashFails, h.cfg.ConsecNeeded))
+		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		return
+	}
+	if !h.stateExists("psi-memory-thrash") {
+		// NPD contract: nodereporter maps this line to the
+		// NodeMemoryPSIThrashing Event + problem_counter — logged
+		// once per latch entry (checkCiliumMTU parity).
+		h.appendLog(fmt.Sprintf(
+			"ACTION psi-memory-thrash: psi_full_avg60=%.1f mem_free=%.3f fails=%d",
+			avg60, free, h.psiThrashFails))
+	}
+	h.stateEnter("psi-memory-thrash",
+		fmt.Sprintf("psi_full_avg60=%.1f mem_free=%.3f", avg60, free))
+	if !apiOK {
+		h.appendLog("suspect: psi-memory-thrash but API unreachable — skip pod evict")
+		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		return
+	}
+	victim, rss := h.highestRSSPod(pods, pidsOnce())
+	if victim == nil {
+		// No attributable non-system pod — latch only; the kernel
+		// OOM verdict then stands (nothing ours to give it).
+		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		return
+	}
+	if !h.rateTrySpend("last-psi-evict", psiEvictInterval) {
+		h.appendLog(fmt.Sprintf(
+			"suspect: psi-memory-thrash victim %s/%s rss=%d - in evict cooldown (<15m), skip",
+			victim.Namespace, victim.Name, rss))
+		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		return
+	}
+	// Budget spent atomically BEFORE the delete (rate_spend parity).
+	h.appendLog(fmt.Sprintf(
+		"ACTION: psi-memory-thrash evicted pod %s/%s - rss=%d bytes, psi_full_avg60=%.1f mem_free=%.3f",
+		victim.Namespace, victim.Name, rss, avg60, free))
+	if err := h.cfg.Client.CoreV1().Pods(victim.Namespace).Delete(
+		ctx, victim.Name, metav1.DeleteOptions{}); err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: psi-memory-thrash evict %s/%s failed: %v",
+			victim.Namespace, victim.Name, err))
+	} else {
+		h.actions.WithLabelValues(checkPSIThrash, "pod_evict").Inc()
+	}
+	h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 }

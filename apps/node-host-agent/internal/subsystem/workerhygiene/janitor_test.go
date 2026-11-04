@@ -475,3 +475,30 @@ func TestJanitorNewWave2LatchesAreKnown(t *testing.T) {
 		}
 	}
 }
+
+// The wave-8 latches must be registered in knownLatchNames —
+// sweepLatches deletes unregistered state-* files immediately, so a
+// missing entry would eat the latch the moment a check writes it.
+func TestJanitorWave8LatchesAreKnown(t *testing.T) {
+	e := jfixture(t)
+	names := []string{
+		"cilium-bpf-map-pressure", "psi-memory-thrash",
+		"kernel-keys-pressure", "cp-cert-reload-stale",
+		// Latches whose owners live in other subsystems but which
+		// the janitor must know too (already registered — guard
+		// against regression).
+		"nebula-isolated", "nebula-degraded", "cilium-envoy-down",
+		"cilium-ipam-exhausted", "spegel-mirror-degraded",
+		"calico-veth-leak", "calico-felix-down", "fail2ban-down",
+		"conntrack-pressure",
+	}
+	for _, n := range names {
+		writeFile(t, filepath.Join(e.state, "state-"+n), "1\n")
+	}
+	e.j.Sweep(context.Background())
+	for _, n := range names {
+		if !fileExists(filepath.Join(e.state, "state-"+n)) {
+			t.Fatalf("registered latch state-%s was reaped as unknown", n)
+		}
+	}
+}

@@ -32,6 +32,10 @@ var maintBloatRules = []rule{
 	{substr: "pg_repack", reply: "/usr/pgsql-16/bin/pg_repack\n"},
 	{substr: "REINDEX TABLE CONCURRENTLY", reply: "REINDEX\n"},
 	{substr: "pg_indexes_size", reply: "300000000|14572800|800000|800000\n"},
+	// W8-CP2 headroom gate: 0 WAL bytes, 100GiB free — ample for the
+	// 300MB heap (needs >= 2.5*heap).
+	{substr: "pg_ls_waldir", reply: "0\n"},
+	{substr: "df", reply: "Avail\n107374182400\n"},
 }
 
 func TestMaintCycleRepacksWhenBloated(t *testing.T) {
@@ -94,7 +98,10 @@ func TestMaintCycleRepackMissingBinary(t *testing.T) {
 		{substr: "inspect", reply: "true"},
 		{substr: "REINDEX TABLE CONCURRENTLY", reply: "REINDEX\n"},
 		{substr: "pg_indexes_size", reply: "300000000|14572800|800000|800000\n"},
-		// repackGlob finds nothing → empty reply.
+		// headroom gate passes, then repackGlob finds nothing →
+		// empty reply.
+		{substr: "pg_ls_waldir", reply: "0\n"},
+		{substr: "df", reply: "Avail\n107374182400\n"},
 	})
 	res := k.maintCycle(context.Background())
 	if res.repackState != "no-binary" {
@@ -110,6 +117,29 @@ func TestMaintCycleRepackMissingBinary(t *testing.T) {
 	}
 }
 
+func TestMaintCycleRepackSkippedOnLowHeadroom(t *testing.T) {
+	k, fr, _ := fixture(t, []rule{
+		{substr: "inspect", reply: "true"},
+		{substr: "REINDEX TABLE CONCURRENTLY", reply: "REINDEX\n"},
+		{substr: "pg_indexes_size", reply: "300000000|14572800|800000|800000\n"},
+		{substr: "pg_ls_waldir", reply: "50000000\n"},
+		// 800MB free < 2.5*(300MB heap + 50MB wal) = 875MB →
+		// VACUUM-only fallback, no repack.
+		{substr: "df", reply: "Avail\n800000000\n"},
+	})
+	res := k.maintCycle(context.Background())
+	if res.repackState != "skipped-headroom" {
+		t.Fatalf("repackState=%s", res.repackState)
+	}
+	j := fr.joined()
+	if !strings.Contains(j, "VACUUM (ANALYZE) kine") {
+		t.Fatalf("fallback vacuum missing:\n%s", j)
+	}
+	if strings.Contains(j, "--no-superuser-check") {
+		t.Fatal("pg_repack ran with insufficient headroom")
+	}
+}
+
 func TestMaintCycleRepackFailure(t *testing.T) {
 	k, _, dir := fixture(t, []rule{
 		{substr: "inspect", reply: "true"},
@@ -117,6 +147,8 @@ func TestMaintCycleRepackFailure(t *testing.T) {
 		{substr: "pg_repack", reply: "/usr/pgsql-16/bin/pg_repack\n"},
 		{substr: "REINDEX TABLE CONCURRENTLY", reply: "REINDEX\n"},
 		{substr: "pg_indexes_size", reply: "300000000|14572800|800000|800000\n"},
+		{substr: "pg_ls_waldir", reply: "0\n"},
+		{substr: "df", reply: "Avail\n107374182400\n"},
 	})
 	res := k.maintCycle(context.Background())
 	if res.okRepack || res.repackState != "fail" {

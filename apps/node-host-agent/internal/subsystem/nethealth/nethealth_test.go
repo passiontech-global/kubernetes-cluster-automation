@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +33,10 @@ type env struct {
 	timex    unix.Timex
 	adjErr   error
 	now      time.Time
+	// mu guards cmds/sdcmds — Cycle (checkNebulaDirectTCP → n.ip)
+	// and a spawned routeGuard goroutine can invoke runHost
+	// concurrently (W8).
+	mu       sync.Mutex
 	cmds     [][]string
 	cmdReply map[string]string
 	cmdFail  map[string]bool
@@ -58,6 +63,8 @@ func matchReply(m map[string]string, j string) (string, bool) {
 }
 
 func (e *env) runHost(ctx context.Context, argv []string) (string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.cmds = append(e.cmds, argv)
 	j := strings.Join(argv, " ")
 	for k := range e.cmdFail {
@@ -72,6 +79,8 @@ func (e *env) runHost(ctx context.Context, argv []string) (string, error) {
 }
 
 func (e *env) sdRun(ctx context.Context, argv []string) (string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.sdcmds = append(e.sdcmds, argv)
 	j := strings.Join(argv, " ")
 	if v, ok := matchReply(e.sdReply, j); ok {
@@ -81,6 +90,8 @@ func (e *env) sdRun(ctx context.Context, argv []string) (string, error) {
 }
 
 func (e *env) sdRan(sub string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	for _, c := range e.sdcmds {
 		if strings.Contains(strings.Join(c, " "), sub) {
 			return true
@@ -90,6 +101,8 @@ func (e *env) sdRan(sub string) bool {
 }
 
 func (e *env) cmdRan(sub string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	for _, c := range e.cmds {
 		if strings.Contains(strings.Join(c, " "), sub) {
 			return true
@@ -779,6 +792,13 @@ func TestFail2banDownAndBans(t *testing.T) {
 	e.n.Cycle(context.Background())
 	if !stateExists(e, "fail2ban-down") {
 		t.Fatal("fail2ban-down latch missing")
+	}
+	// A stopped jail protects nothing — the guard restarts the unit.
+	if !e.sdRan("restart fail2ban.service") {
+		t.Fatalf("fail2ban not restarted, cmds=%v", e.sdcmds)
+	}
+	if _, err := os.Stat(filepath.Join(e.state, "last-fail2ban-restart")); err != nil {
+		t.Fatal("restart budget file missing")
 	}
 	got := readFile(filepath.Join(e.state, "fail2ban-banned"))
 	if !strings.Contains(got, "sshd=7") || !strings.Contains(got, "recidive=1") {

@@ -86,6 +86,24 @@ var logRules = []logRule{
 	// W7-H1: workerhygiene's d-state-storm latch-entry line —
 	// "ACTION d-state-storm: count=N runtime=M wchan=...".
 	{"KernelHungTasks", regexp.MustCompile(`ACTION:? *d-state-storm:`)},
+	// --- Wave-8 latch→event surface ---
+	// One Event per STATE-ENTER of a latch that maps to a permanent
+	// NodeCondition (conditions.go). Latches already covered by an
+	// older rule (nebula-isolated → NebulaIsolatedEnter,
+	// conntrack-pressure → ConntrackPressure, cilium-ipam-exhausted
+	// → CiliumIPAMExhausted) are intentionally not duplicated.
+	{"NebulaDegraded", regexp.MustCompile(`STATE-ENTER: nebula-degraded`)},
+	{"CiliumEnvoyDown", regexp.MustCompile(`STATE-ENTER: cilium-envoy-down`)},
+	{"CiliumBPFMapPressure", regexp.MustCompile(`STATE-ENTER: cilium-bpf-map-pressure`)},
+	{"SpegelMirrorDegraded", regexp.MustCompile(`STATE-ENTER: spegel-mirror-degraded`)},
+	{"CalicoVethLeak", regexp.MustCompile(`STATE-ENTER: calico-veth-leak`)},
+	{"CalicoFelixDown", regexp.MustCompile(`STATE-ENTER: calico-felix-down`)},
+	{"Fail2banDown", regexp.MustCompile(`STATE-ENTER: fail2ban-down`)},
+	{"KernelKeysPressure", regexp.MustCompile(`STATE-ENTER: kernel-keys-pressure`)},
+	{"ControlPlaneCertReloadStale", regexp.MustCompile(`STATE-ENTER: cp-cert-reload-stale`)},
+	// W2: workerhygiene's psi-memory-thrash latch-entry line —
+	// "ACTION psi-memory-thrash: avg60=... free=...".
+	{"NodeMemoryPSIThrashing", regexp.MustCompile(`ACTION:? *psi-memory-thrash:`)},
 }
 
 // maxEventNote caps the Event note — the apiserver validates the

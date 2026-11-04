@@ -49,6 +49,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -234,9 +235,16 @@ type Syncer struct {
 	dialer Dialer
 	lease  *lease
 
-	held            bool // lease currently held (single-goroutine state)
+	// mu guards the lease/key bookkeeping — the dedicated lease
+	// goroutine (BUG-H3) and the cycle driver touch it from two
+	// goroutines now that renewal is decoupled from Cycle.
+	mu              sync.Mutex
+	held            bool // lease currently held
 	syncedWhileHeld bool // a cycle already ran since the lease was acquired
 	keyReady        bool // converge SSH key observed at least once (latched)
+	// cycleCh signals "lease freshly held — converge now" from the
+	// renew loop to the cycle driver (buffered 1, drop-when-full).
+	cycleCh chan struct{}
 
 	// lastTargets caches the target names of the last successful
 	// loadTargets — a parse failure must drive every known
@@ -259,7 +267,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Syncer, error) {
 		return nil, fmt.Errorf("hubsync: Identity is required")
 	}
 
-	s := &Syncer{cfg: cfg}
+	s := &Syncer{cfg: cfg, cycleCh: make(chan struct{}, 1)}
 	s.dialer = cfg.Dialer
 	if s.dialer == nil {
 		d, err := newSSHDialer(cfg.SSHKeyPath, cfg.SSHPort, cfg.SSHTimeout, cfg.Log)
@@ -316,35 +324,90 @@ func (s *Syncer) Run(ctx context.Context) {
 	if s.cfg.Watcher != nil {
 		s.cfg.Watcher.Changed()
 	}
-	if s.ensureKey() && s.renewLease(ctx) {
-		s.Cycle(ctx)
-	}
-	renew := time.NewTicker(s.cfg.RenewInterval)
+	// BUG-H3: the lease heartbeater runs on its OWN goroutine. Before
+	// this split the renew tick shared this select with Cycle — a
+	// slow SSH/SCP converge (up to ~3min/target over WAN) starved it
+	// past the 60s LeaseDurationSeconds, letting a second pod claim
+	// the lease mid-cycle (two holders converging the same targets).
+	go s.leaseLoop(ctx)
 	syncT := time.NewTicker(s.cfg.SyncInterval)
 	watch := time.NewTicker(s.cfg.WatchInterval)
-	defer renew.Stop()
 	defer syncT.Stop()
 	defer watch.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-renew.C:
-			if s.ensureKey() && s.renewLease(ctx) && !s.syncedWhileHeld {
-				// Freshly acquired (or re-acquired after a gap):
-				// converge now rather than waiting out SyncInterval.
+		case <-s.cycleCh:
+			// Freshly acquired (or re-acquired after a gap):
+			// converge now rather than waiting out SyncInterval.
+			if s.ensureKey() && s.leaseHeld() {
 				s.Cycle(ctx)
 			}
 		case <-syncT.C:
-			if s.held && s.ensureKey() {
+			if s.leaseHeld() && s.ensureKey() {
 				s.Cycle(ctx)
 			}
 		case <-watch.C:
-			if s.ensureKey() && s.held && s.cfg.Watcher != nil && s.cfg.Watcher.Changed() {
+			if s.ensureKey() && s.leaseHeld() && s.cfg.Watcher != nil && s.cfg.Watcher.Changed() {
 				s.Cycle(ctx)
 			}
 		}
 	}
+}
+
+// leaseLoop is the dedicated lease heartbeater (BUG-H3): acquire or
+// renew every RenewInterval on its own goroutine, decoupled from
+// Cycle, so a slow WAN sync can't drop the 60s lease. A fresh hold
+// kicks an immediate converge through cycleCh.
+func (s *Syncer) leaseLoop(ctx context.Context) {
+	defer func() {
+		// Same single-flight reasoning as the feeder panic-recovery
+		// in controllerhygiene — a defect here must not kill the
+		// daemon, and a dead renewer fails safe (the lease lapses
+		// rather than two pods holding it).
+		if r := recover(); r != nil {
+			s.cfg.Log.Error("hubsync: lease loop panicked — heartbeats stop, lease will lapse",
+				"panic", r)
+		}
+	}()
+	for {
+		if s.ensureKey() && s.renewLease(ctx) && s.freshHold() {
+			select {
+			case s.cycleCh <- struct{}{}:
+			default:
+			}
+		}
+		t := time.NewTimer(s.cfg.RenewInterval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// leaseHeld reports the current hold state (mutexed).
+func (s *Syncer) leaseHeld() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.held
+}
+
+// freshHold reports whether the lease is held but no cycle ran yet
+// since acquisition — the "converge immediately" trigger.
+func (s *Syncer) freshHold() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.held && !s.syncedWhileHeld
+}
+
+// markSynced records that a cycle ran while holding the lease.
+func (s *Syncer) markSynced() {
+	s.mu.Lock()
+	s.syncedWhileHeld = true
+	s.mu.Unlock()
 }
 
 // ensureKey re-checks the converge SSH key until it appears, then
@@ -353,6 +416,8 @@ func (s *Syncer) Run(ctx context.Context) {
 // materializes. First detection is logged; a LATE key starts
 // convergence on the next renew tick (<=RenewInterval).
 func (s *Syncer) ensureKey() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.keyReady {
 		return true
 	}

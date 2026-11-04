@@ -581,8 +581,9 @@ func TestDescribe(t *testing.T) {
 	// gray-failure telemetry descs (H1/H2/H3/H6/H7) + 7 W7 descs
 	// (dstate, systemd scopes, conntrack insert_failed/drop, arp,
 	// cgroup memory high/oom_kill).
-	if got := len(ch); got != 48 {
-		t.Fatalf("Describe emitted %d descs want 48", got)
+	// + 2 W8 descs (kernel-keys ratio, sockstat tcp close_wait).
+	if got := len(ch); got != 50 {
+		t.Fatalf("Describe emitted %d descs want 50", got)
 	}
 }
 

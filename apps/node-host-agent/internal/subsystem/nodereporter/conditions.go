@@ -31,11 +31,13 @@ type conditionDef struct {
 	defaultMessage string
 	problemReason  string
 	stateKey       string // latch file state-<stateKey>; "" = special probe
-	// altStateKey is an optional second latch that trips the same
+	// altStateKeys are optional extra latches that trip the same
 	// condition — the T15 kubelet watchdog's state-kubelet-healthz-down
-	// (restart budget exhausted) must fire KubeletRuntimeStall so the
-	// existing NHC k0sworker-remediate-exhausted rule keeps working.
-	altStateKey string
+	// (restart budget exhausted) and the A4 probes'
+	// state-kubelet-syncloop-down / state-containerd-sock-down must
+	// all fire KubeletRuntimeStall so the existing NHC
+	// k0sworker-remediate-exhausted rule keeps working (BUG-H4).
+	altStateKeys []string
 }
 
 // conditionDefs is the watchdog-condition table ported from the NPD
@@ -76,7 +78,14 @@ var conditionDefs = []conditionDef{
 		defaultMessage: "no phantom-pods wedge (ctr alive, tasks > 0)",
 		problemReason:  "KubeletRuntimeStallDetected",
 		stateKey:       "kubelet-runtime-stall",
-		altStateKey:    "kubelet-healthz-down",
+		// BUG-H4: the PLEG/syncloop freeze and the hung containerd
+		// socket are runtime stalls too — every latch must light
+		// the condition.
+		altStateKeys: []string{
+			"kubelet-healthz-down",
+			"kubelet-syncloop-down",
+			"containerd-sock-down",
+		},
 	},
 	{
 		typ:            "DnsFallbackActive",
@@ -137,6 +146,102 @@ var conditionDefs = []conditionDef{
 		defaultMessage: "no D-state task storm (uninterruptible sleep below threshold)",
 		problemReason:  "KernelHungTasksDetected",
 		stateKey:       "d-state-storm",
+	},
+	// --- Wave-8 latch→condition surface ---
+	// Agent-added conditions for the latches the hygiene subsystems
+	// already wrote (or Wave-8 adds): every state-<key> below maps
+	// 1:1 to a permanent NodeCondition so the NHC→SNR chain and the
+	// problem_gauge series cover the full latch set.
+	{
+		typ:            "NebulaIsolated",
+		defaultReason:  "NebulaMeshHealthy",
+		defaultMessage: "all nebula peers handshake normally",
+		problemReason:  "NebulaIsolatedDetected",
+		stateKey:       "nebula-isolated",
+	},
+	{
+		typ:            "NebulaDegraded",
+		defaultReason:  "NebulaDataplaneOk",
+		defaultMessage: "nebula dataplane healthy (no relay/latency degradation)",
+		problemReason:  "NebulaDegradedDetected",
+		stateKey:       "nebula-degraded",
+	},
+	{
+		typ:            "CiliumEnvoyDown",
+		defaultReason:  "CiliumEnvoyReady",
+		defaultMessage: "cilium-envoy admin /ready OK",
+		problemReason:  "CiliumEnvoyDownDetected",
+		stateKey:       "cilium-envoy-down",
+	},
+	{
+		typ:            "CiliumIPAMExhausted",
+		defaultReason:  "CiliumIPAMOk",
+		defaultMessage: "cilium IPAM pool has headroom (no address leak)",
+		problemReason:  "CiliumIPAMExhaustedDetected",
+		stateKey:       "cilium-ipam-exhausted",
+	},
+	{
+		typ:            "CiliumBPFMapPressure",
+		defaultReason:  "CiliumBPFMapsOk",
+		defaultMessage: "critical cilium BPF maps below 90% capacity",
+		problemReason:  "CiliumBPFMapPressureDetected",
+		stateKey:       "cilium-bpf-map-pressure",
+	},
+	{
+		typ:            "SpegelMirrorDegraded",
+		defaultReason:  "SpegelMirrorReady",
+		defaultMessage: "spegel P2P mirror pod Ready",
+		problemReason:  "SpegelMirrorDegradedDetected",
+		stateKey:       "spegel-mirror-degraded",
+	},
+	{
+		typ:            "CalicoVethLeak",
+		defaultReason:  "CalicoVethCountOk",
+		defaultMessage: "cali* veth count matches pod count (no CNI DEL leak)",
+		problemReason:  "CalicoVethLeakDetected",
+		stateKey:       "calico-veth-leak",
+	},
+	{
+		typ:            "CalicoFelixDown",
+		defaultReason:  "CalicoFelixReady",
+		defaultMessage: "calico felix :9099 readiness OK",
+		problemReason:  "CalicoFelixDownDetected",
+		stateKey:       "calico-felix-down",
+	},
+	{
+		typ:            "Fail2banDown",
+		defaultReason:  "Fail2banActive",
+		defaultMessage: "fail2ban service installed and active",
+		problemReason:  "Fail2banDownDetected",
+		stateKey:       "fail2ban-down",
+	},
+	{
+		typ:            "ConntrackPressure",
+		defaultReason:  "ConntrackNormal",
+		defaultMessage: "nf_conntrack table below pressure threshold",
+		problemReason:  "ConntrackPressureDetected",
+		stateKey:       "conntrack-pressure",
+	},
+	{
+		typ:            "KernelKeysPressure",
+		defaultReason:  "KernelKeysNormal",
+		defaultMessage: "kernel keyring quota below pressure threshold",
+		problemReason:  "KernelKeysPressureDetected",
+		stateKey:       "kernel-keys-pressure",
+	},
+	{
+		typ:            "ControlPlaneCertReloadStale",
+		defaultReason:  "ControlPlaneCertReloadFresh",
+		defaultMessage: "control-plane cert reload markers fresh",
+		problemReason:  "ControlPlaneCertReloadStaleDetected",
+		stateKey:       "cp-cert-reload-stale",
+	},
+	{
+		typ:            "MemoryPSIThrashing",
+		defaultReason:  "MemoryPSINormal",
+		defaultMessage: "memory PSI full avg60 <= 25% or free memory >= 8%",
+		problemReason:  "MemoryPSIThrashingDetected",
+		stateKey:       "psi-memory-thrash",
 	},
 }
 
@@ -241,7 +346,7 @@ func (r *Reporter) evalConditions() []condEval {
 				res.message = fmt.Sprintf(
 					"node-watchdog missed heartbeat %ds (timer dead or run failed)", age)
 			}
-		} else if key, since, ok := r.firstLatch(d.stateKey, d.altStateKey); ok {
+		} else if key, since, ok := r.firstLatch(d.stateKey, d.altStateKeys); ok {
 			res.status = corev1.ConditionTrue
 			res.reason = d.problemReason
 			// check-watchdog-state.sh echo verbatim.
@@ -253,10 +358,10 @@ func (r *Reporter) evalConditions() []condEval {
 }
 
 // firstLatch probes the given latch keys in order and reports the
-// first present one's key + content — dual-latch conditions name
-// their fallback key in altStateKey (primary wins on the message).
-func (r *Reporter) firstLatch(keys ...string) (key, since string, ok bool) {
-	for _, k := range keys {
+// first present one's key + content — multi-latch conditions name
+// their fallback keys in altStateKeys (primary wins on the message).
+func (r *Reporter) firstLatch(primary string, alts []string) (key, since string, ok bool) {
+	for _, k := range append([]string{primary}, alts...) {
 		if k == "" {
 			continue
 		}
@@ -282,19 +387,22 @@ func (r *Reporter) stateFileSince(key string) (string, bool) {
 	return "unknown", true
 }
 
-// writeHeartbeat is the writer half of the installed/last-run
-// contract watchdogStale() reads. The shell watchdog's prom_emit
-// trap owned it; on agent-managed nodes nothing else writes last-run,
-// so the reporter self-heartbeats once per cycle — otherwise its own
-// staleness probe latches True ~20m after the last shell heartbeat
-// and never clears.
+// initHeartbeatFiles seeds the installed/last-run pair ONCE — only
+// for files that don't already exist (BUG-H1). The shell watchdog's
+// prom_emit trap owned the periodic last-run refresh; on agent
+// nodes the hygiene Cycle()s (workerhygiene/controllerhygiene/
+// nethealth) own it now. The reporter still needs the pair on a
+// fresh state dir — a missing `installed` disables the staleness
+// gate entirely and a missing `last-run` reads as epoch 0 — so it
+// initializes them at startup for new envs and unit tests where no
+// hygiene subsystem has run yet.
 //
 // `installed` is created only when absent (ansible force:false
 // parity — presence activates the probe's gate, content is the
 // baseline epoch used when last-run doesn't exist yet); `last-run`
-// is rewritten every cycle, atomically via tmp+rename so a reader
-// never observes a truncated epoch.
-func (r *Reporter) writeHeartbeat() error {
+// is likewise created only when absent, atomically via tmp+rename
+// so a reader never observes a truncated epoch.
+func (r *Reporter) initHeartbeatFiles() error {
 	if err := os.MkdirAll(r.cfg.WatchdogStateDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", r.cfg.WatchdogStateDir, err)
 	}
@@ -306,8 +414,10 @@ func (r *Reporter) writeHeartbeat() error {
 		}
 	}
 	lastRun := filepath.Join(r.cfg.WatchdogStateDir, "last-run")
-	if err := writeEpochFile(lastRun, now); err != nil {
-		return fmt.Errorf("write %s: %w", lastRun, err)
+	if _, err := os.Stat(lastRun); os.IsNotExist(err) {
+		if err := writeEpochFile(lastRun, now); err != nil {
+			return fmt.Errorf("write %s: %w", lastRun, err)
+		}
 	}
 	return nil
 }

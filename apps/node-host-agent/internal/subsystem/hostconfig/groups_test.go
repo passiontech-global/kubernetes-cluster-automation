@@ -1720,7 +1720,6 @@ kine_endpoint: "postgres://postgres:pw@db.test.internal:6432/postgres?sslmode=di
 	for _, want := range []string{
 		"Before=k0scontroller.service",
 		"MemoryMax=2G",
-		"MemorySwapMax=0",
 		"Environment=GOMEMLIMIT=1500MiB",
 		"Environment=GOGC=50",
 		"OOMScoreAdjust=-500",

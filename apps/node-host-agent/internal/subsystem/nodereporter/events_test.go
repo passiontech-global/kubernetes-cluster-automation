@@ -344,6 +344,18 @@ func TestSelfHealActionReasons(t *testing.T) {
 		{"ACTION zombie-storm: pod_uid=11111111-2222-3333-4444-555555555555 zombies=640 ppid=777", "ZombieProcessStorm"},
 		{"ACTION cilium-mtu-drift: cilium=1500 nebula=1300", "CiliumMTUExceedsOverlay"},
 		{"ACTION d-state-storm: count=7 runtime=3 wchan=runc=umount_tree", "KernelHungTasks"},
+		// Wave-8 latch→event surface — one Event per STATE-ENTER of
+		// a latch that maps to a permanent NodeCondition.
+		{"STATE-ENTER: nebula-degraded relays_only", "NebulaDegraded"},
+		{"STATE-ENTER: cilium-envoy-down admin_ready_fails=2", "CiliumEnvoyDown"},
+		{"STATE-ENTER: cilium-bpf-map-pressure cilium_ct4_global=950/1000", "CiliumBPFMapPressure"},
+		{"STATE-ENTER: spegel-mirror-degraded pod=kube-system/spegel-x1 Ready=False", "SpegelMirrorDegraded"},
+		{"STATE-ENTER: calico-veth-leak cali=63 pods=5", "CalicoVethLeak"},
+		{"STATE-ENTER: calico-felix-down readiness_probe_fails=2", "CalicoFelixDown"},
+		{"STATE-ENTER: fail2ban-down service=inactive", "Fail2banDown"},
+		{"STATE-ENTER: kernel-keys-pressure usage=0.96", "KernelKeysPressure"},
+		{"STATE-ENTER: cp-cert-reload-stale reload_age=7200s", "ControlPlaneCertReloadStale"},
+		{"ACTION psi-memory-thrash: psi_full_avg60=30.0 mem_free=0.050 fails=2", "NodeMemoryPSIThrashing"},
 	}
 	for _, l := range lines {
 		e.appendLog(t, l.msg)

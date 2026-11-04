@@ -119,6 +119,23 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 		res.heapBytes <= k.cfg.RepackMinHeapBytes {
 		return
 	}
+	// W8-CP2 item 3: repack shadows the heap + WAL churn — require
+	// free >= 2.5*(heap+wal) on the data fs first; otherwise run
+	// only a VACUUM (ANALYZE) and warn (repack would fill the disk).
+	free, wal, headroom := k.repackHeadroom(ctx, pg, user, pass,
+		res.heapBytes, note)
+	if !headroom {
+		note(fmt.Sprintf("repack-skipped-insufficient-headroom (free=%dB heap=%dB wal=%dB)",
+			free, res.heapBytes, wal))
+		logger().Warn("kinedb: pg_repack skipped — insufficient disk headroom, VACUUM only",
+			"free", free, "heap", res.heapBytes, "wal", wal)
+		res.repackState = "skipped-headroom"
+		if _, err := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
+			"-qc", fmt.Sprintf("VACUUM (ANALYZE) %s", k.cfg.Table)), ""); err != nil {
+			note(fmt.Sprintf("fallback-vacuum-fail: %v", err))
+		}
+		return
+	}
 	repackBin, rerr := k.exec(ctx, []string{k.cfg.Runtime, "exec", pg,
 		"sh", "-c", repackGlob}, "")
 	if rerr != nil {

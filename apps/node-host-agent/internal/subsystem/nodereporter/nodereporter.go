@@ -6,8 +6,11 @@
 //   - Permanent NodeConditions: every Interval the watchdog
 //     conditions are evaluated from the latch files under
 //     WatchdogStateDir (state-<key> files, plus the installed/last-run
-//     heartbeat pair for WatchdogStale — the reporter writes those
-//     itself once per cycle since it owns the staleness probe) and
+//     heartbeat pair for WatchdogStale — the reporter only
+//     INITIALIZES the pair once at startup when absent; the periodic
+//     last-run refresh belongs to the hygiene Cycle()s —
+//     workerhygiene/controllerhygiene/nethealth — otherwise the
+//     staleness probe could never trip, BUG-H1) and
 //     merged into status.conditions on this Node — same Type/Reason/Message
 //     contract as the removed NPD JSON so the NHC→SNR remediation
 //     chain keeps working unchanged.
@@ -194,6 +197,11 @@ type Reporter struct {
 	kmsgPending      []byte   // carried partial kmsg record
 	kmsgScanned      bool     // first drain done → lookback replay disarmed
 
+	// heartbeatInit marks the one-time installed/last-run
+	// initialization — periodic refreshes are the hygiene
+	// subsystems' job (BUG-H1), the reporter only reads them.
+	heartbeatInit bool
+
 	// Permanent-condition bookkeeping for the NPD monitors —
 	// KernelDeadlock latches True for the process lifetime (NPD
 	// permanent parity); ReadonlyFilesystem follows the live mounts.
@@ -263,17 +271,26 @@ func (r *Reporter) Run(ctx context.Context) {
 	}
 }
 
-// Cycle runs one sync round: watchdog heartbeat, conditions+gauges,
-// then log→events. Each step reports its own error so a failing piece
-// never starves the others; all feed the cycles{result} counter.
+// Cycle runs one sync round: one-time heartbeat initialization,
+// conditions+gauges, then log→events. Each step reports its own
+// error so a failing piece never starves the others; all feed the
+// cycles{result} counter.
 func (r *Reporter) Cycle(ctx context.Context) {
 	ok := true
-	// Heartbeat first: the staleness probe evaluated below reads the
-	// last-run file this writes.
-	if err := r.writeHeartbeat(); err != nil {
-		logger().Error("nodereporter: watchdog heartbeat failed",
-			"node", r.cfg.NodeName, "dir", r.cfg.WatchdogStateDir, "error", err)
-		ok = false
+	// BUG-H1: the reporter must NOT refresh last-run — the
+	// staleness probe reads exactly this file, and a self-heartbeat
+	// made WatchdogStale permanently blind. Periodic refreshes
+	// belong to the hygiene Cycle()s; the reporter only
+	// INITIALIZES the pair when absent (new envs and unit tests
+	// where no hygiene subsystem has run yet).
+	if !r.heartbeatInit {
+		if err := r.initHeartbeatFiles(); err != nil {
+			logger().Error("nodereporter: watchdog heartbeat init failed",
+				"node", r.cfg.NodeName, "dir", r.cfg.WatchdogStateDir, "error", err)
+			ok = false
+		} else {
+			r.heartbeatInit = true
+		}
 	}
 	if err := r.syncConditions(ctx); err != nil {
 		logger().Error("nodereporter: condition sync failed",

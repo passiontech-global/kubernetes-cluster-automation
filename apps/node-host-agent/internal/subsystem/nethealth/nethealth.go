@@ -117,6 +117,19 @@ const (
 	checkF2B     = "fail2ban"
 	checkClock   = "clock-sync"
 	checkCT      = "conntrack-guard"
+	checkNebTCP  = "nebula-direct-tcp"
+)
+
+// defaultNebulaDirectTCPPorts is the pref-1499 Direct-Underlay TCP
+// bypass set — hostconfig's nebula_direct_tcp_ports var rendered
+// into /etc/nebula/<net>/nebula-up.sh + the T5b ip-rule converge;
+// the guard re-adds a rule the kernel dropped.
+var defaultNebulaDirectTCPPorts = []int{22, 6443, 8132, 9443, 39901}
+
+const (
+	f2bRestartInterval = 30 * time.Minute
+	// fileLastRun is the per-cycle liveness stamp (BUG-H1).
+	fileLastRun = "last-run"
 )
 
 const hostsBlockBegin = "# BEGIN node-watchdog-dns"
@@ -153,6 +166,11 @@ type Config struct {
 	Systemd      *systemd.Client // nil → systemd checks degrade keep-only
 	ConsecNeeded int
 	MinRestart   time.Duration
+	// NebulaDirectTCPPorts is the nebula_direct_tcp_ports list the
+	// pref-1499 route guard enforces — TCP dport on these ports
+	// bypasses the overlay (direct underlay). Nil → the default
+	// [22 6443 8132 9443 39901].
+	NebulaDirectTCPPorts []int
 
 	// Seams — nil gets production defaults.
 	nowFn func() time.Time
@@ -241,6 +259,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MinRestart <= 0 {
 		c.MinRestart = defaultMinRestart
+	}
+	if c.NebulaDirectTCPPorts == nil {
+		c.NebulaDirectTCPPorts = defaultNebulaDirectTCPPorts
 	}
 	if c.nowFn == nil {
 		c.nowFn = time.Now
@@ -429,6 +450,7 @@ func (n *NetHealth) Run(ctx context.Context) {
 // skips it (SignalEnabled), and the conf is re-read every cycle when
 // WatchdogSrc is wired (hostconfig rewrites land next cycle).
 func (n *NetHealth) Cycle(ctx context.Context) {
+	defer n.stampLastRun()
 	if n.cfg.WatchdogSrc != nil {
 		n.cfg.Watchdog = n.cfg.WatchdogSrc.Get()
 	}
@@ -479,6 +501,69 @@ func (n *NetHealth) Cycle(ctx context.Context) {
 	} else {
 		n.cycles.WithLabelValues(checkCT, "disabled").Inc()
 	}
+	if sigOn(checkNebTCP) {
+		n.checkNebulaDirectTCP(ctx)
+	} else {
+		n.cycles.WithLabelValues(checkNebTCP, "disabled").Inc()
+	}
+}
+
+// stampLastRun refreshes <state>/last-run every cycle — the liveness
+// stamp the watchdog-stalled alert reads (BUG-H1). Deferred so even
+// an early-returned cycle proves the loop is alive.
+func (n *NetHealth) stampLastRun() {
+	if n.cfg.WatchdogStateDir == "" {
+		return
+	}
+	content := strconv.FormatInt(n.cfg.nowFn().Unix(), 10) + "\n"
+	if err := writeFileAtomic(
+		filepath.Join(n.cfg.WatchdogStateDir, fileLastRun), content); err != nil {
+		logger().Debug("nethealth: last-run stamp failed",
+			"dir", n.cfg.WatchdogStateDir, "error", err)
+	}
+}
+
+// checkNebulaDirectTCP enforces the pref-1499 Direct-Underlay TCP
+// bypass rules (ipproto tcp dport <port> lookup main) for every
+// nebula_direct_tcp_ports entry — hostconfig installs them via
+// nebula-up.sh + the T5b converge; this guard re-adds a rule the
+// kernel lost between converges (same failure mode the netlink route
+// guard covers for the overlay tables). Only runs where the nebula
+// dataplane is actually deployed.
+func (n *NetHealth) checkNebulaDirectTCP(ctx context.Context) {
+	wd := n.watchdogConf()
+	if wd == nil || !n.nebulaUpExists(wd) {
+		n.cycles.WithLabelValues(checkNebTCP, "gated").Inc()
+		return
+	}
+	for _, port := range n.cfg.NebulaDirectTCPPorts {
+		if port <= 0 || port > 65535 {
+			continue
+		}
+		p := strconv.Itoa(port)
+		out, err := n.ip(ctx, "rule", "list", "pref", "1499")
+		if err != nil {
+			n.cycles.WithLabelValues(checkNebTCP, "open_error").Inc()
+			return
+		}
+		if strings.Contains(out, "dport "+p+" ") ||
+			strings.Contains(out, "dport "+p+"\n") ||
+			strings.HasSuffix(strings.TrimSpace(out), "dport "+p) {
+			continue
+		}
+		if _, err := n.ip(ctx, "rule", "add", "pref", "1499",
+			"ipproto", "tcp", "dport", p, "lookup", "main"); err != nil {
+			n.appendLog(fmt.Sprintf(
+				"nebula-direct-tcp: ip rule add pref 1499 dport %s failed: %v",
+				p, err))
+			n.cycles.WithLabelValues(checkNebTCP, "restore_error").Inc()
+			continue
+		}
+		n.actions.WithLabelValues(checkNebTCP, "rule_add").Inc()
+		n.appendLog(fmt.Sprintf(
+			"ACTION: re-added pref-1499 direct-underlay tcp dport %s rule", p))
+	}
+	n.cycles.WithLabelValues(checkNebTCP, "ok").Inc()
 }
 
 // --- watchdog file helpers (lib.sh parity — same contract as
@@ -575,6 +660,13 @@ func writeFileDirect(path, content string) error {
 func (n *NetHealth) stateEnter(name, extra string) {
 	p := n.statePath(name)
 	if _, err := os.Stat(p); err == nil {
+		// BUG-H6: the latch stays held — refresh its mtime so the
+		// janitor's 24h latch reap can't retire an active signal.
+		now := n.cfg.nowFn()
+		if cerr := os.Chtimes(p, now, now); cerr != nil {
+			logger().Debug("nethealth: state latch touch failed",
+				"state", name, "path", p, "error", cerr)
+		}
 		return
 	}
 	content := strconv.FormatInt(n.cfg.nowFn().Unix(), 10) + "\n"
@@ -1706,6 +1798,17 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 		n.suspectLog("fail2ban-down",
 			"suspect: fail2ban-down (unit exists but service inactive)")
 		n.stateEnter("fail2ban-down", "service=inactive")
+		// A stopped jail protects nothing — restart it under the
+		// last-fail2ban-restart budget (30m) instead of only latching.
+		if n.rateOK("last-fail2ban-restart", f2bRestartInterval) {
+			n.appendLog("ACTION: restarting fail2ban.service - unit exists but service inactive")
+			n.rateSpend("last-fail2ban-restart")
+			if err := n.cfg.Systemd.Restart(ctx, "fail2ban.service"); err != nil {
+				n.appendLog(fmt.Sprintf("fail2ban.service restart failed: %v", err))
+			} else {
+				n.actions.WithLabelValues(checkF2B, "restart").Inc()
+			}
+		}
 	} else {
 		n.stateExit("fail2ban-down")
 	}

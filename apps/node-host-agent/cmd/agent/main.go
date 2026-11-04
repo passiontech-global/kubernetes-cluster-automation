@@ -260,6 +260,23 @@ func envList(key string) []string {
 	return out
 }
 
+// envIntList parses a comma-separated env var of ints; unset/empty →
+// nil (the consumer applies its own defaults). Non-numeric entries
+// are skipped.
+func envIntList(key string) []int {
+	var out []int
+	for _, p := range envList(key) {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			logger().Warn("non-numeric env list entry ignored",
+				"env", key, "value", p)
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
 // osExecutable is os.Executable as a var — tests stub it to exercise
 // the "(deleted)"/missing-path fallbacks in resolveLocalBinary.
 var osExecutable = os.Executable
@@ -616,15 +633,20 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 		hm := hostmetrics.New(hostmetrics.Config{
 			NodeName:         hnode,
 			WatchdogStateDir: watchdogStateDir,
-			SysClassNet:      getenv("NODE_HOST_AGENT_SYS_CLASS_NET", "/sys/class/net"),
-			NebulaIface:      getenv("NODE_HOST_AGENT_NEBULA_IFACE", "neb1"),
-			RouteFile:        getenv("NODE_HOST_AGENT_HOST_ROUTE_FILE", "/proc/1/net/route"),
-			K0sConfigFile:    getenv("NODE_HOST_AGENT_K0S_CONFIG", "/etc/k0s/k0s.yaml"),
-			K0sUnitFile:      getenv("NODE_HOST_AGENT_K0S_UNIT", hostPath("/etc/systemd/system/k0scontroller.service")),
-			NebulaCertFile:   getenv("NODE_HOST_AGENT_NEBULA_CERT", hostPath("/etc/nebula/"+wdCfg.NebulaNet+"/host.crt")),
-			ExpectedKCMArgs:  envList("NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS"), // empty = defaults
-			PSIFile:          getenv("NODE_HOST_AGENT_PSI_FILE", "/proc/pressure/cpu"),
-			EgressRelays:     wdCfg.OverlayEgressRelays,
+			Standalone:       standalone,
+			KeyUsersFile: getenv("NODE_HOST_AGENT_KEY_USERS_FILE",
+				"/proc/key-users"),
+			LatchInterval: envDuration("NODE_HOST_AGENT_LATCH_INTERVAL",
+				30*time.Second),
+			SysClassNet:     getenv("NODE_HOST_AGENT_SYS_CLASS_NET", "/sys/class/net"),
+			NebulaIface:     getenv("NODE_HOST_AGENT_NEBULA_IFACE", "neb1"),
+			RouteFile:       getenv("NODE_HOST_AGENT_HOST_ROUTE_FILE", "/proc/1/net/route"),
+			K0sConfigFile:   getenv("NODE_HOST_AGENT_K0S_CONFIG", "/etc/k0s/k0s.yaml"),
+			K0sUnitFile:     getenv("NODE_HOST_AGENT_K0S_UNIT", hostPath("/etc/systemd/system/k0scontroller.service")),
+			NebulaCertFile:  getenv("NODE_HOST_AGENT_NEBULA_CERT", hostPath("/etc/nebula/"+wdCfg.NebulaNet+"/host.crt")),
+			ExpectedKCMArgs: envList("NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS"), // empty = defaults
+			PSIFile:         getenv("NODE_HOST_AGENT_PSI_FILE", "/proc/pressure/cpu"),
+			EgressRelays:    wdCfg.OverlayEgressRelays,
 			FilesystemTargets: func() []string {
 				if l := envList("NODE_HOST_AGENT_FILESYSTEM_TARGETS"); l != nil {
 					return l
@@ -641,6 +663,10 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			CgroupMemUnits: envList("NODE_HOST_AGENT_CGROUP_MEM_UNITS"),
 		})
 		reg.MustRegister(hm)
+		// BUG-H5: the latch-maintenance ticker runs in BOTH modes —
+		// on the DaemonSet Prometheus may not scrape for long
+		// stretches, so latches can't ride Collect() alone.
+		subsystems = append(subsystems, hm)
 		// Standalone hosts have no Prometheus scrape — the legacy
 		// prom_emit contract is kept by rendering the same series
 		// into the node-exporter textfile dir on a ticker.
@@ -751,6 +777,9 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			Systemd:          sdClient,
 			ConsecNeeded:     envInt("NODE_HOST_AGENT_NETHEALTH_CONSEC_NEEDED", 2),
 			MinRestart:       envDuration("NODE_HOST_AGENT_NETHEALTH_MIN_RESTART", 30*time.Minute),
+			// W8: pref-1499 direct-underlay TCP bypass; empty →
+			// the package default [22 6443 8132 9443 39901].
+			NebulaDirectTCPPorts: envIntList("NODE_HOST_AGENT_NEBULA_DIRECT_TCP_PORTS"),
 		}, reg)
 		if err != nil {
 			logger().Error("nethealth setup failed", "error", err)
@@ -822,6 +851,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			Interval:              envDuration("NODE_HOST_AGENT_CONTROLLER_INTERVAL", time.Minute),
 			WatchdogStateDir:      watchdogStateDir,
 			WatchdogLogFile:       watchdogLogFile,
+			WatchdogSrc:           wdReloader,
 			ProcRoot:              getenv("NODE_HOST_AGENT_PROC_ROOT", "/proc"),
 			K0sControllerUnitFile: hostPath("/etc/systemd/system/k0scontroller.service"),
 			// env → wdCfg → package defaults; SelfAPI stays EMPTY
@@ -974,6 +1004,9 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			TextfileDir: textfileDir,
 			GuardStateDir: getenv("NODE_HOST_AGENT_KINEDB_GUARD_STATE_DIR",
 				hostPath("/var/lib/kine-compact-guard")),
+			// W8-CP2: in-container postgres data dir for the
+			// repack headroom gate; empty → package default.
+			PGDataDir: getenv("NODE_HOST_AGENT_KINEDB_PG_DATA_DIR", ""),
 		}, reg)
 		if err != nil {
 			logger().Error("kinedb setup failed", "error", err)

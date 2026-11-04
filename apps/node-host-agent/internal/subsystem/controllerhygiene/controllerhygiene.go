@@ -82,6 +82,7 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdrescue"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // Autofix modes — the shell *_AUTOFIX knobs are preserved verbatim:
@@ -222,6 +223,12 @@ const (
 	// journal-grep check is blind until it clears (suspectLog's
 	// last-suspect- budget drops with the latch via stateExit).
 	stateJournalUnreadable = "journal-unreadable"
+	// W8-CP3 latch: a KCM/scheduler component frozen while the peer
+	// apiserver stays healthy.
+	stateCPComponentFrozen = "cp-component-frozen"
+	// W8-CP4 latch: an on-disk PKI cert newer than what the live
+	// socket presents — the daemon never reloaded the rotated cert.
+	statePKIReloadStale = "cp-cert-reload-stale"
 )
 
 // On-disk bookkeeping file names under WatchdogStateDir — same names
@@ -244,6 +251,25 @@ const (
 	fileOOMKills      = "oomloop-kills"
 	fileOOMShielded   = "oomloop-shielded"
 	fileFeederLastRst = "last-restart" // under FeederStateDir
+	fileLastRun       = "last-run"     // per-cycle liveness stamp (BUG-H1)
+	// W8-CP3 (KCM/scheduler freeze auto-heal) + W8-CP4 (PKI reload
+	// drift) bookkeeping.
+	fileRateCPRestart  = "last-cp-restart"
+	fileRatePKIRestart = "last-cp-cert-restart"
+	fileCtrCPFreeze    = "consecutive-cp-freeze"
+	fileCtrKCMQuiet    = "consecutive-kcm-quiet"
+	fileCtrPKIDriftPre = "consecutive-cp-cert-stale-"
+	// W8-CP3 defaults: 3 consecutive healthz failures, or a KCM that
+	// is leader yet carries zero queued work for >10m — while the
+	// peer apiserver still answers — restarts k0scontroller under a
+	// 2h budget.
+	defaultCPFreezeCycles     = 3
+	defaultCPFreezeQuietFor   = 10 * time.Minute
+	defaultCPFreezeMinRestart = 2 * time.Hour
+	// W8-CP4: an on-disk cert newer than the socket-presented cert
+	// for 2 consecutive cycles → restart the owning unit (1h budget).
+	defaultPKIDriftCycles     = 2
+	defaultPKIRestartInterval = time.Hour
 	// suspectLog dedupe budgets: last-suspect-<key> epoch files spent
 	// at most once per SuspectLogCadence — the same rateOK/last-*
 	// convention as the action budgets, applied to log noise.
@@ -435,6 +461,69 @@ type Config struct {
 	// JournalUnreadableNeeded is the consecutive-failed-read budget
 	// before state-journal-unreadable latches; <=0 → 5.
 	JournalUnreadableNeeded int
+
+	// WatchdogSrc, when set, re-reads /etc/node-watchdog.conf every
+	// Cycle and re-applies the conf-derived knobs (API_SELF/API_PEER,
+	// KINE_DB_PROBE, SIG13_*, KINE_TTL_*, KINE_POOL_*, K0S_OOMLOOP_*)
+	// — hostconfig rewrites land next cycle instead of needing an
+	// agent restart (nethealth's WatchdogSrc parity; BUG-H9). A knob
+	// set from elsewhere (env wiring) is preserved: only fields that
+	// still carry the PREVIOUS conf-derived value move to the new
+	// one.
+	WatchdogSrc *watchdogconf.Reloader
+
+	// --- W8-CP3: KCM/scheduler freeze auto-heal ---
+	// KCMHealthURL/SchedHealthURL are the healthz endpoints of the
+	// kube-controller-manager and kube-scheduler hosted inside
+	// k0scontroller; KCMMetricsURL feeds the leader-without-workers
+	// signal. Empty → the loopback defaults.
+	KCMHealthURL     string
+	SchedHealthURL   string
+	KCMMetricsURL    string
+	CPFreezeCycles   int           // consecutive healthz fails → act (default 3)
+	CPFreezeQuietFor time.Duration // KCM leader+idle grace (default 10m)
+	// CPFreezeMinRestart is the last-cp-restart budget (default 2h).
+	CPFreezeMinRestart time.Duration
+
+	// --- W8-CP4: PKI reload drift ---
+	// PKIDriftPairs pairs an on-disk cert with the socket that must
+	// present it and the unit restarted on drift; nil → the four
+	// defaults (apiserver.crt→:6443, konnectivity-server.crt→:8132,
+	// etcd/server.crt→:2379 — all k0scontroller.service —
+	// and /etc/kine/pki/server.crt→:2379 → kine.service). Paths may
+	// use the $K0SDIR placeholder, resolved against K0sDir.
+	PKIDriftPairs []PKIDriftPair
+	// PKIDriftCycles is the consecutive-newer-cycle gate (default 2);
+	// PKIRestartInterval the last-cp-cert-restart budget (default 1h).
+	PKIDriftCycles     int
+	PKIRestartInterval time.Duration
+	// KinePKIDir prefixes the default kine cert path ("" →
+	// "/host/etc/kine/pki").
+	KinePKIDir string
+
+	// --- injectable seams for W8 additions (defaults follow) ---
+	// ssKillFn runs `ss -K sport = :6443` — kills hung HTTP/2 watch
+	// streams before a wedge restart (W8-CP1).
+	ssKillFn func(ctx context.Context) error
+	// cpHealthFn is the KCM/scheduler healthz probe: true on a 2xx
+	// response. nil → probeHTTP2xx.
+	cpHealthFn func(ctx context.Context, url string) bool
+	// kcmMetricsFn fetches the KCM /metrics body (leader-without-
+	// workers evidence). nil → httpGET insecure.
+	kcmMetricsFn func(ctx context.Context, url string) (string, error)
+	// tlsCertFn returns the leaf certificate a TLS listener
+	// presents. nil → tlsDialCert (InsecureSkipVerify — only the
+	// presented cert is wanted, chain trust is irrelevant).
+	tlsCertFn func(ctx context.Context, addr string) (*x509.Certificate, error)
+}
+
+// PKIDriftPair is one W8-CP4 check row: the on-disk cert file, the
+// TLS listener that must already serve it, and the systemd unit a
+// detected drift restarts.
+type PKIDriftPair struct {
+	CertFile string
+	Addr     string
+	Unit     string
 }
 
 func (c *Config) applyDefaults() {
@@ -695,6 +784,77 @@ func (c *Config) applyDefaults() {
 	if c.etcdRescueFn == nil {
 		c.etcdRescueFn = etcdrescue.Run
 	}
+	if c.KCMHealthURL == "" {
+		c.KCMHealthURL = "https://127.0.0.1:10257/healthz"
+	}
+	if c.SchedHealthURL == "" {
+		c.SchedHealthURL = "https://127.0.0.1:10259/healthz"
+	}
+	if c.KCMMetricsURL == "" {
+		c.KCMMetricsURL = "https://127.0.0.1:10257/metrics"
+	}
+	if c.CPFreezeCycles <= 0 {
+		c.CPFreezeCycles = defaultCPFreezeCycles
+	}
+	if c.CPFreezeQuietFor <= 0 {
+		c.CPFreezeQuietFor = defaultCPFreezeQuietFor
+	}
+	if c.CPFreezeMinRestart <= 0 {
+		c.CPFreezeMinRestart = defaultCPFreezeMinRestart
+	}
+	if c.KinePKIDir == "" {
+		c.KinePKIDir = "/host/etc/kine/pki"
+	}
+	if c.PKIDriftPairs == nil {
+		k0s := c.K0sDir
+		c.PKIDriftPairs = []PKIDriftPair{
+			{filepath.Join(k0s, "pki", "apiserver.crt"),
+				"127.0.0.1:6443", "k0scontroller.service"},
+			{filepath.Join(k0s, "pki", "konnectivity-server.crt"),
+				"127.0.0.1:8132", "k0scontroller.service"},
+			{filepath.Join(k0s, "pki", "etcd", "server.crt"),
+				"127.0.0.1:2379", "k0scontroller.service"},
+			{filepath.Join(c.KinePKIDir, "server.crt"),
+				"127.0.0.1:2379", "kine.service"},
+		}
+	} else {
+		for i := range c.PKIDriftPairs {
+			c.PKIDriftPairs[i].CertFile = strings.ReplaceAll(
+				c.PKIDriftPairs[i].CertFile, "$K0SDIR", c.K0sDir)
+		}
+	}
+	if c.PKIDriftCycles <= 0 {
+		c.PKIDriftCycles = defaultPKIDriftCycles
+	}
+	if c.PKIRestartInterval <= 0 {
+		c.PKIRestartInterval = defaultPKIRestartInterval
+	}
+	if c.ssKillFn == nil {
+		c.ssKillFn = func(ctx context.Context) error {
+			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(cctx, "ss", "-K", "sport", "=", ":6443")
+			cmd.Env = scrubSystemdEnv(os.Environ())
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+			}
+			return nil
+		}
+	}
+	if c.cpHealthFn == nil {
+		c.cpHealthFn = func(ctx context.Context, url string) bool {
+			return probeHTTP2xx(ctx, url, 5*time.Second)
+		}
+	}
+	if c.kcmMetricsFn == nil {
+		c.kcmMetricsFn = func(ctx context.Context, url string) (string, error) {
+			return httpGetInsecure(ctx, url, 8*time.Second)
+		}
+	}
+	if c.tlsCertFn == nil {
+		c.tlsCertFn = tlsDialCert
+	}
 }
 
 // Hygiene runs the controller guards on one ticker plus the feeder
@@ -723,6 +883,15 @@ type Hygiene struct {
 	// journalText result is classified into it; the tracker fires the
 	// state-journal-unreadable latch on persistent blindness.
 	journalReads journalwatch.Tracker
+
+	// wdApplied records the watchdogconf parse the conf-derived knobs
+	// were last refreshed from — BUG-H9's "only move fields that still
+	// carry the previous conf value" rule needs the previous parse.
+	wdApplied *watchdogconf.Config
+	// kcmQuietSince is the first cycle the KCM read leader+idle —
+	// leader-without-workers only counts as frozen after
+	// CPFreezeQuietFor (W8-CP3).
+	kcmQuietSince time.Time
 
 	cycles    *prometheus.CounterVec // check, result
 	actions   *prometheus.CounterVec // check, action
@@ -889,11 +1058,15 @@ func (h *Hygiene) runCycle(ctx context.Context) {
 // file gates everything (WD_REQUIRES: unit:k0scontroller). Each check
 // must never panic and degrades to no-op on missing files.
 func (h *Hygiene) Cycle(ctx context.Context) {
+	defer h.stampLastRun()
 	if _, err := os.Stat(h.cfg.K0sControllerUnitFile); err != nil {
 		h.cycles.WithLabelValues("all", "gated").Inc()
 		return
 	}
 	_ = os.MkdirAll(h.cfg.WatchdogStateDir, 0o755)
+	// BUG-H9: hostconfig rewrites /etc/node-watchdog.conf mid-run —
+	// refresh the conf-derived knobs before the checks consume them.
+	h.refreshWatchdogConf()
 	// The 60s-timer guards (kine pool, OOM loop) had no uptime gate in
 	// shell — they run immediately. Only the module-22 checks carried
 	// WD_REQUIRES: uptime.
@@ -903,6 +1076,12 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// embedded etcd that hit quota during boot needs the guard
 	// BEFORE the 20min wedge grace, and hosts without etcdctl no-op.
 	h.checkEtcdQuota(ctx)
+	// W8-CP3/CP4 are ungated like the 60s-timer guards: a frozen
+	// KCM/scheduler or a stale PKI reload must not wait out the
+	// module-22 boot grace — both probes are read-only until their
+	// own consecutive-cycle + rate budgets pass.
+	h.checkCPFreeze(ctx)
+	h.checkPKIReloadDrift(ctx)
 	// uptime gate (WD_REQUIRES: uptime unit:k0scontroller — 20min
 	// grace after boot before the destructive wedge/TTL checks).
 	if up, err := h.uptimeSeconds(); err == nil && up < minUptimeSeconds {
@@ -911,6 +1090,168 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	}
 	h.checkApiserverHub(ctx)
 	h.checkKineTTL(ctx)
+}
+
+// stampLastRun refreshes <state>/last-run every cycle — the liveness
+// stamp the watchdog-stalled alert reads (BUG-H1). Deferred so even a
+// gated/aborted cycle proves the loop is alive. The file carries the
+// epoch like every other bookkeeping file; the alert keys on mtime,
+// which writeEpochFile's atomic rename refreshes each cycle.
+func (h *Hygiene) stampLastRun() {
+	if h.cfg.WatchdogStateDir == "" {
+		return
+	}
+	h.writeEpochFile(filepath.Join(h.cfg.WatchdogStateDir, fileLastRun))
+}
+
+// refreshWatchdogConf re-applies the watchdogconf-derived knobs each
+// cycle when WatchdogSrc is wired (BUG-H9 — nethealth's per-cycle
+// WatchdogSrc.Get parity). The conf is one of several config sources:
+// an env-set or programmatic knob must survive a conf rewrite, so a
+// field only moves when it still carries the value the PREVIOUS conf
+// parse produced (wdApplied). Empty conf keys derive to the package
+// default — the same ${VAR:-def} fallback main's envOr chain applied
+// at construction.
+func (h *Hygiene) refreshWatchdogConf() {
+	if h.cfg.WatchdogSrc == nil {
+		return
+	}
+	wd := h.cfg.WatchdogSrc.Get()
+	if wd == nil || wd == h.wdApplied {
+		return
+	}
+	old := h.wdApplied
+	if old == nil {
+		old, _ = watchdogconf.Parse(nil)
+	}
+	// Each knob only moves when it still carries the previous
+	// conf-derived value — a knob set from elsewhere (env wiring)
+	// keeps its override.
+	apply := func(prev, next string, set func(string), cur func() string) {
+		if cur() == prev {
+			set(next)
+		}
+	}
+	// Strings.
+	apply(old.APISelf, wd.APISelf, func(v string) { h.cfg.SelfAPI = v },
+		func() string { return h.cfg.SelfAPI })
+	apply(old.APIPeer, wd.APIPeer, func(v string) { h.cfg.PeerAPI = v },
+		func() string { return h.cfg.PeerAPI })
+	apply(old.KineDBProbe, wd.KineDBProbe, func(v string) { h.cfg.KineDBProbe = v },
+		func() string { return h.cfg.KineDBProbe })
+	apply(old.Sig13Autofix, wd.Sig13Autofix, func(v string) {
+		if v != "" {
+			h.cfg.Sig13Mode = v
+		}
+	}, func() string { return h.cfg.Sig13Mode })
+	apply(old.KineTTLAutofix, wd.KineTTLAutofix, func(v string) {
+		if v != "" {
+			h.cfg.KineTTLMode = v
+		}
+	}, func() string { return h.cfg.KineTTLMode })
+	apply(old.KinePoolAutofix, wd.KinePoolAutofix, func(v string) {
+		if v != "" {
+			h.cfg.KinePoolMode = v
+		}
+	}, func() string { return h.cfg.KinePoolMode })
+	apply(old.OOMLoopAutofix, wd.OOMLoopAutofix, func(v string) {
+		if v != "" {
+			h.cfg.OOMLoopMode = v
+		}
+	}, func() string { return h.cfg.OOMLoopMode })
+	// Ints — conf 0 derives to the package default.
+	intOf := func(v, def int) int {
+		if v > 0 {
+			return v
+		}
+		return def
+	}
+	applyI := func(prevV, nextV int, set func(int), cur func() int) {
+		if cur() == prevV {
+			set(nextV)
+		}
+	}
+	applyI(intOf(old.Sig13StaleMinErrs, defaultStaleMinErrs),
+		intOf(wd.Sig13StaleMinErrs, defaultStaleMinErrs),
+		func(v int) { h.cfg.StaleMinErrs = v },
+		func() int { return h.cfg.StaleMinErrs })
+	applyI(intOf(old.Sig13SoloCycles, defaultSoloCycles),
+		intOf(wd.Sig13SoloCycles, defaultSoloCycles),
+		func(v int) { h.cfg.SoloCycles = v },
+		func() int { return h.cfg.SoloCycles })
+	applyI(intOf(old.Sig13GapCycles, defaultGapCycles),
+		intOf(wd.Sig13GapCycles, defaultGapCycles),
+		func(v int) { h.cfg.GapCycles = v },
+		func() int { return h.cfg.GapCycles })
+	applyI(intOf(old.Sig13FrozenCycles, defaultFrozenCycles),
+		intOf(wd.Sig13FrozenCycles, defaultFrozenCycles),
+		func(v int) { h.cfg.FrozenCycles = v },
+		func() int { return h.cfg.FrozenCycles })
+	applyI(intOf(old.KineTTLRewedgeCycle, defaultTTLRewedgeCycles),
+		intOf(wd.KineTTLRewedgeCycle, defaultTTLRewedgeCycles),
+		func(v int) { h.cfg.KineTTLRewedgeCycles = v },
+		func() int { return h.cfg.KineTTLRewedgeCycles })
+	applyI(intOf(old.KinePoolMaxConns, defaultPoolMaxConns),
+		intOf(wd.KinePoolMaxConns, defaultPoolMaxConns),
+		func(v int) { h.cfg.KinePoolMaxConns = v },
+		func() int { return h.cfg.KinePoolMaxConns })
+	applyI(intOf(old.KinePoolCycles, defaultPoolCycles),
+		intOf(wd.KinePoolCycles, defaultPoolCycles),
+		func(v int) { h.cfg.KinePoolCycles = v },
+		func() int { return h.cfg.KinePoolCycles })
+	applyI(intOf(old.OOMLoopMinKills, defaultOOMMinKills),
+		intOf(wd.OOMLoopMinKills, defaultOOMMinKills),
+		func(v int) { h.cfg.OOMLoopMinKills = v },
+		func() int { return h.cfg.OOMLoopMinKills })
+	// int64.
+	apply64 := func(prevV, nextV int64, set func(int64), cur func() int64) {
+		if cur() == prevV {
+			set(nextV)
+		}
+	}
+	i64 := func(v int64, def int64) int64 {
+		if v > 0 {
+			return v
+		}
+		return def
+	}
+	apply64(i64(old.Sig13GapMin, defaultGapMin),
+		i64(wd.Sig13GapMin, defaultGapMin),
+		func(v int64) { h.cfg.GapMin = v },
+		func() int64 { return h.cfg.GapMin })
+	// Durations — conf seconds 0 derives to the package default.
+	dur := func(v int, def time.Duration) time.Duration {
+		if v > 0 {
+			return time.Duration(v) * time.Second
+		}
+		return def
+	}
+	applyD := func(prevV, nextV time.Duration, set func(time.Duration), cur func() time.Duration) {
+		if cur() == prevV {
+			set(nextV)
+		}
+	}
+	applyD(dur(old.Sig13MinRestartS, defaultMinRestart),
+		dur(wd.Sig13MinRestartS, defaultMinRestart),
+		func(v time.Duration) { h.cfg.MinRestartInterval = v },
+		func() time.Duration { return h.cfg.MinRestartInterval })
+	applyD(dur(old.KineTTLMinRestartS, defaultTTLMinRestart),
+		dur(wd.KineTTLMinRestartS, defaultTTLMinRestart),
+		func(v time.Duration) { h.cfg.KineTTLMinRestart = v },
+		func() time.Duration { return h.cfg.KineTTLMinRestart })
+	applyD(dur(old.KineTTLCtlRestartS, defaultTTLCtlRestart),
+		dur(wd.KineTTLCtlRestartS, defaultTTLCtlRestart),
+		func(v time.Duration) { h.cfg.KineTTLCtlRestart = v },
+		func() time.Duration { return h.cfg.KineTTLCtlRestart })
+	applyD(dur(old.KinePoolMinRestartS, defaultPoolMinRestart),
+		dur(wd.KinePoolMinRestartS, defaultPoolMinRestart),
+		func(v time.Duration) { h.cfg.KinePoolMinRestart = v },
+		func() time.Duration { return h.cfg.KinePoolMinRestart })
+	applyD(dur(old.OOMLoopWindowS, defaultOOMWindow),
+		dur(wd.OOMLoopWindowS, defaultOOMWindow),
+		func(v time.Duration) { h.cfg.OOMLoopWindow = v },
+		func() time.Duration { return h.cfg.OOMLoopWindow })
+	h.wdApplied = wd
 }
 
 // --- watchdog file helpers (lib.sh parity) ---
@@ -980,6 +1321,13 @@ func (h *Hygiene) writeEpochFile(path string) {
 func (h *Hygiene) stateEnter(name, extra string) {
 	p := h.statePath(name)
 	if _, err := os.Stat(p); err == nil {
+		// BUG-H6: the latch stays held — refresh its mtime so the
+		// janitor's 24h latch reap can't retire an active signal.
+		now := h.cfg.nowFn()
+		if cerr := os.Chtimes(p, now, now); cerr != nil {
+			logger().Debug("controllerhygiene: state latch touch failed",
+				"state", name, "path", p, "error", cerr)
+		}
 		return
 	}
 	h.writeEpochFile(p)

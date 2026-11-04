@@ -231,6 +231,14 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 				wreason, gn, peerNote, soloOK))
 			h.rateSpend(h.cfg.WatchdogStateDir, fileRateRestart)
 			h.ctrReset(fileCtrGap)
+			// W8-CP1: hung HTTP/2 watch streams can survive past the
+			// wedge decision and pin the apiserver's watch cache —
+			// ss -K drops the zombie sockets so the restart (and the
+			// post-restart reconnect) starts clean.
+			if err := h.cfg.ssKillFn(ctx); err != nil {
+				h.appendLogWarn(fmt.Sprintf(
+					"ss -K sport = :6443 failed (zombie watch streams left): %v", err))
+			}
 			if err := h.cfg.restartFn(ctx, h.cfg.RestartUnit); err != nil {
 				h.appendLogWarn(fmt.Sprintf(
 					"suspect: restart %s failed: %v", h.cfg.RestartUnit, err))
