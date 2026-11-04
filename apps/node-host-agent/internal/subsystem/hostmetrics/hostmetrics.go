@@ -2462,6 +2462,7 @@ func (c *Collector) collectAll() []prometheus.Metric {
 func (c *Collector) WriteTextfile(dir string) error {
 	series := map[string][]string{}
 	metaByName := map[string]descMeta{}
+	counterSeries := map[string]bool{}
 	var names []string
 	for _, m := range c.collectAll() {
 		meta, ok := c.descMeta[m.Desc()]
@@ -2472,7 +2473,17 @@ func (c *Collector) WriteTextfile(dir string) error {
 		if err := m.Write(&dm); err != nil {
 			continue
 		}
-		if dm.Gauge == nil || dm.Gauge.Value == nil {
+		// Counters land on dm.Counter, gauges on dm.Gauge — the
+		// vmstat swap-thrash series (W5.7) are the first counters in
+		// the set; skipping non-gauges would silently drop them from
+		// node-watchdog.prom on standalone VMs.
+		val, isCounter := float64(0), false
+		switch {
+		case dm.Gauge != nil && dm.Gauge.Value != nil:
+			val = dm.Gauge.GetValue()
+		case dm.Counter != nil && dm.Counter.Value != nil:
+			val, isCounter = dm.Counter.GetValue(), true
+		default:
 			continue
 		}
 		var sb strings.Builder
@@ -2491,10 +2502,13 @@ func (c *Collector) WriteTextfile(dir string) error {
 			sb.WriteByte('}')
 		}
 		sb.WriteByte(' ')
-		sb.WriteString(strconv.FormatFloat(dm.Gauge.GetValue(), 'g', -1, 64))
+		sb.WriteString(strconv.FormatFloat(val, 'g', -1, 64))
 		if _, seen := series[meta.name]; !seen {
 			names = append(names, meta.name)
 			metaByName[meta.name] = meta
+		}
+		if isCounter {
+			counterSeries[meta.name] = true
 		}
 		series[meta.name] = append(series[meta.name], sb.String())
 	}
@@ -2502,8 +2516,12 @@ func (c *Collector) WriteTextfile(dir string) error {
 
 	var b strings.Builder
 	for _, name := range names {
-		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s gauge\n",
-			name, metaByName[name].help, name)
+		typ := "gauge"
+		if counterSeries[name] {
+			typ = "counter"
+		}
+		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n",
+			name, metaByName[name].help, name, typ)
 		samples := series[name]
 		sort.Strings(samples)
 		// Dedupe identical sample lines — a duplicated series makes

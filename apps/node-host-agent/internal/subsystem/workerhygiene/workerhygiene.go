@@ -717,18 +717,21 @@ func (c *Config) applyDefaults() {
 		}
 	}
 	if c.ciliumEncryptPeersFn == nil {
-		sd := c.Systemd
 		c.ciliumEncryptPeersFn = func(ctx context.Context) (int, error) {
-			if sd == nil {
-				return 0, fmt.Errorf("no systemd client wired")
-			}
-			out, err := sd.Exec(ctx, "cilium-dbg", "encrypt", "status")
+			// The agent's own API beats `cilium-dbg`: the binary only
+			// lives INSIDE the cilium-agent container — an sd.Exec on
+			// the host always fails and silently degrades every cycle
+			// to the ReadyNodes-1 fallback. /v1/healthz's
+			// cluster.nodes[] lists exactly the remote cilium members
+			// this node should peer with (virtual/liqo nodes run no
+			// agent, so they never appear).
+			body, err := c.unixGet(ctx, c.CiliumSocket, "/v1/healthz")
 			if err != nil {
 				return 0, err
 			}
-			n, ok := parseCiliumEncryptPeers(out)
+			n, ok := parseCiliumHealthNodes(body)
 			if !ok {
-				return 0, fmt.Errorf("no peer count in cilium-dbg encrypt status")
+				return 0, fmt.Errorf("no cluster.nodes in cilium healthz")
 			}
 			return n, nil
 		}
@@ -4074,8 +4077,33 @@ func parseCiliumEncryptPeers(out string) (int, bool) {
 	return 0, false
 }
 
-// readyNodeCount lists Ready nodes — the expected-peers fallback
-// (every other Ready node should be a WireGuard peer).
+// parseCiliumHealthNodes counts remote cluster members in the
+// agent's /v1/healthz payload ({"cluster":{"nodes":[...]}} — the
+// same source `cilium status` reports "Cluster health: N/M"). Every
+// entry is a remote node running cilium-agent, i.e. one WireGuard
+// peer this node should hold; virtual/liqo nodes run no agent and
+// never appear. ok=false when the section is absent or empty — the
+// caller then falls back to the node-list heuristic.
+func parseCiliumHealthNodes(body []byte) (int, bool) {
+	var resp struct {
+		Cluster *struct {
+			Nodes []json.RawMessage `json:"nodes"`
+		} `json:"cluster"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil ||
+		resp.Cluster == nil || len(resp.Cluster.Nodes) == 0 {
+		return 0, false
+	}
+	return len(resp.Cluster.Nodes), true
+}
+
+// readyNodeCount lists Ready, REAL nodes — the expected-peers
+// fallback (every other real Ready node should be a WireGuard
+// peer). Virtual nodes (Liqo/virtual-kubelet) are excluded — they
+// run no cilium-agent so they never become peers; control-plane
+// members are excluded too: undercounting expected is the
+// fail-safe direction (it can only blunt a partial-drift signal,
+// never produce the repeated false kill an overcount causes).
 func (h *Hygiene) readyNodeCount(ctx context.Context) int {
 	list, err := h.cfg.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -4083,7 +4111,26 @@ func (h *Hygiene) readyNodeCount(ctx context.Context) int {
 	}
 	n := 0
 	for i := range list.Items {
-		for _, cond := range list.Items[i].Status.Conditions {
+		node := &list.Items[i]
+		// Virtual nodes run no cilium-agent — never peers.
+		if _, ok := node.Labels["liqo.io/type"]; ok {
+			continue
+		}
+		if _, ok := node.Labels["virtual-kubelet.io/provider"]; ok {
+			continue
+		}
+		if node.Labels["type"] == "virtual-kubelet" {
+			continue
+		}
+		// Control-plane members may or may not run the agent —
+		// excluding them can only undercount (fail safe).
+		if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; ok {
+			continue
+		}
+		if _, ok := node.Labels["node-role.kubernetes.io/master"]; ok {
+			continue
+		}
+		for _, cond := range node.Status.Conditions {
 			if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
 				n++
 				break

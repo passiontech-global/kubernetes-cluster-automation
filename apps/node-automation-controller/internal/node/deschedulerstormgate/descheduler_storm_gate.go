@@ -94,7 +94,7 @@ var stormConds = []corev1.NodeConditionType{
 	"KubeletRuntimeStall", "KubeletWatchWedge", "PodTeardownWedged",
 	"WatchdogStale", "HostNetworkProblems", "ClusterNetworkProblems",
 	"HostNetworkProblem", "ClusterNetworkProblem", "MemoryPressure",
-	"DiskPressure", "NetworkUnavailable",
+	"DiskPressure", "NetworkUnavailable", "FilesystemReadOnly",
 }
 
 // stormTaints mirrors STORM_TAINTS.

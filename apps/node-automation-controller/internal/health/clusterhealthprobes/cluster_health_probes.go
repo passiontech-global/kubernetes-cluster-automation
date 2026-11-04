@@ -1541,6 +1541,20 @@ func (p *clusterHealthProber) checkStatefulMasterlessServices(ctx context.Contex
 // that triggered it (survives operator restarts).
 func (p *clusterHealthProber) healDragonflyOperator(ctx context.Context, log logr.Logger,
 	sig masterSvc, now time.Time) {
+	// Maintenance mutex — never kill an operator mid-drain/upgrade;
+	// "cannot verify" fails closed like healOperatorLeader (W5.8).
+	held, why, err := shared.MaintenanceActive(ctx, p.cs, p.dyn)
+	if err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
+			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name, "error", err)
+		return
+	}
+	if held {
+		log.Info("maintenance in progress — heal deferred",
+			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name, "why", why)
+		return
+	}
 	if ts := sig.sts.Annotations[dragonflyHealAnno]; ts != "" {
 		if t, err := time.Parse(time.RFC3339, ts); err == nil &&
 			now.Sub(t) < dragonflyHealCooldown {
@@ -1732,9 +1746,29 @@ func (p *clusterHealthProber) checkRabbitMQSuspendedPods(ctx context.Context) pr
 	}
 	p.mu.Unlock()
 
+	// Maintenance mutex — evaluated once per sweep and only when
+	// there is something to delete: pod kills during a drain/upgrade
+	// are exactly what the mutex exists to prevent; "cannot verify"
+	// fails closed.
+	var maintHeld bool
+	var maintWhy string
+	var maintErr error
+	if len(due) > 0 {
+		maintHeld, maintWhy, maintErr = shared.MaintenanceActive(ctx, p.cs, p.dyn)
+		if maintErr != nil {
+			metrics.IncError(clusterHealthQueue)
+			log.Info("WARN: maintenance check unverifiable — heals deferred (fail closed)",
+				"error", maintErr)
+		}
+	}
 	for i := range due {
 		pod := &due[i]
 		key := pod.Namespace + "/" + pod.Name
+		if maintErr != nil || maintHeld {
+			log.Info("maintenance gate — suspended rabbitmq pod kept",
+				"pod", key, "why", maintWhy)
+			continue
+		}
 		p.mu.Lock()
 		last, ok := p.rbHealed[key]
 		p.mu.Unlock()
