@@ -39,6 +39,9 @@ func shOpDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 		gwv1("gateways"):   "GatewayList",
 		gwv1("httproutes"): "HTTPRouteList",
 		gwv1("grpcroutes"): "GRPCRouteList",
+		// The owns filter LISTs classes once per stuck gateway-api
+		// object — unregistered GVR panics the fake.
+		gwv1("gatewayclasses"): "GatewayClassList",
 		{Group: "scylla.scylladb.com", Version: "v1", Resource: "scyllaclusters"}:         "ScyllaClusterList",
 		{Group: "dragonflydb.io", Version: "v1alpha1", Resource: "dragonflies"}:           "DragonflyList",
 		{Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"}:        "HelmReleaseList",
@@ -166,23 +169,33 @@ func TestOperatorStuckPredicates(t *testing.T) {
 		t.Fatal("non-suspended stale HelmRelease must count as stuck")
 	}
 
-	// Gateway-API: empty/absent status.parents OR a stale generation.
-	route := shUnstructured("gateway.networking.k8s.io/v1", "HTTPRoute", "apps", "r", 1, 1)
+	// Gateway-API: empty/absent status.parents reads as stuck; the
+	// generation signal lives inside each parent's conditions —
+	// these types carry no top-level status.observedGeneration.
+	route := shUnstructured("gateway.networking.k8s.io/v1", "HTTPRoute", "apps", "r", 1, 0)
 	if !gatewayStatusStuck(route) {
 		t.Fatal("route with no status.parents must read as stuck")
 	}
 	_ = unstructured.SetNestedSlice(route.Object,
-		[]any{map[string]any{"parentRef": map[string]any{"name": "gw"}}},
+		[]any{map[string]any{
+			"parentRef": map[string]any{"name": "gw"},
+			"conditions": []any{map[string]any{
+				"type": "Accepted", "status": "True", "observedGeneration": int64(1)}},
+		}},
 		"status", "parents")
 	if gatewayStatusStuck(route) {
-		t.Fatal("route with parents + fresh generation must not read as stuck")
+		t.Fatal("route attached at the current generation must not read as stuck")
 	}
-	staleRoute := shUnstructured("gateway.networking.k8s.io/v1", "HTTPRoute", "apps", "r", 5, 3)
+	staleRoute := shUnstructured("gateway.networking.k8s.io/v1", "HTTPRoute", "apps", "r", 5, 0)
 	_ = unstructured.SetNestedSlice(staleRoute.Object,
-		[]any{map[string]any{"parentRef": map[string]any{"name": "gw"}}},
+		[]any{map[string]any{
+			"parentRef": map[string]any{"name": "gw"},
+			"conditions": []any{map[string]any{
+				"type": "Accepted", "status": "True", "observedGeneration": int64(3)}},
+		}},
 		"status", "parents")
 	if !gatewayStatusStuck(staleRoute) {
-		t.Fatal("route with parents but stale generation must read as stuck")
+		t.Fatal("route whose parents only saw gen 3 must read as stuck at gen 5")
 	}
 }
 

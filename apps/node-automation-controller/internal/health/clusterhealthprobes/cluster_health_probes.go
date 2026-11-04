@@ -151,6 +151,11 @@ const (
 	// observedGeneration lags — the gateway controller never
 	// attached it.
 	opReasonStaleGWStatus = "stale_gateway_status"
+	// ciliumGatewayController is the spec.controllerName a
+	// GatewayClass carries when cilium's gateway-api controller
+	// serves it — the ownership key for the gateway-API resources
+	// in cilium-operator's target set.
+	ciliumGatewayController = "io.cilium/gateway-controller"
 	// opReasonNoConditions is the never-reconciled signature for CR
 	// types that carry no observedGeneration — their controller
 	// stamps status.conditions on the first reconcile pass, so an
@@ -402,6 +407,12 @@ type clusterHealthProber struct {
 	opFirstSeen map[string]time.Time
 	opFrozen    map[string]bool
 	opHealed    map[string]time.Time
+
+	// gwClassCtlr caches GatewayClass name → spec.controllerName for
+	// ~a minute so the gateway-API ownership filter doesn't LIST the
+	// class set once per stuck object (under mu).
+	gwClassCtlr map[string]string
+	gwClassAt   time.Time
 
 	// W6.2 watchdog state (under mu):
 	//   - stsZeroSince: "ns/svc/sts" → first sweep the master-role
@@ -905,11 +916,18 @@ func (p *clusterHealthProber) resetKCMWorkqueue() {
 
 // opStuckResource binds a watched CRD GVR to its stall signature: the
 // reason label reported on OperatorWorkqueueFrozen and the predicate
-// deciding whether one object counts as unreconciled.
+// deciding whether one object counts as unreconciled. owns optionally
+// filters stuck objects down to those this operator is actually
+// responsible for — required on resource types shared by several
+// controllers (gateway-api objects on this cluster split between
+// cilium-operator and the cloudflare-tunnel gateway controller, so a
+// stuck route must not be blamed on — or healed by — the wrong
+// operator). Nil means every stuck object counts.
 type opStuckResource struct {
 	gvr    schema.GroupVersionResource
 	reason string
 	stuck  func(o *unstructured.Unstructured) bool
+	owns   func(ctx context.Context, p *clusterHealthProber, o *unstructured.Unstructured) bool
 }
 
 // operatorTarget is one watched operator: the leader-election Lease
@@ -945,6 +963,20 @@ func fluxUnsuspendedStaleGen(o *unstructured.Unstructured) bool {
 	return staleObservedGeneration(o)
 }
 
+// helmRepoStaleGen is fluxUnsuspendedStaleGen plus the type=oci
+// carve-out: since Flux v2.2 an OCI HelmRepository is a static
+// reference — source-controller keeps no reconciler for it and never
+// writes status, so observedGeneration stays absent forever and the
+// generic signature would flag every healthy OCI repo (the actual
+// OCI pull health lives on the generated HelmChart objects, which
+// ARE watched by the helmcharts entry).
+func helmRepoStaleGen(o *unstructured.Unstructured) bool {
+	if t, _, _ := unstructured.NestedString(o.Object, "spec", "type"); t == "oci" {
+		return false
+	}
+	return fluxUnsuspendedStaleGen(o)
+}
+
 // noStatusConditions is the "never reconciled" signature for CR
 // types that lack a reliable observedGeneration (cert-manager
 // Certificates, ExternalSecrets, KEDA ScaledObjects): the controller
@@ -963,17 +995,49 @@ func emptyStatusPhase(o *unstructured.Unstructured) bool {
 	return !found || phase == ""
 }
 
+// condMaxObservedGeneration returns the largest observedGeneration
+// carried inside a conditions list. Gateway-API resources report the
+// generation their controller last processed inside each condition —
+// there is no top-level status.observedGeneration on
+// Gateway/HTTPRoute/GRPCRoute — so 0 means the attached controller
+// has never reported a spec generation.
+func condMaxObservedGeneration(conds []any) int64 {
+	var max int64
+	for _, c := range conds {
+		m, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if og, _, _ := unstructured.NestedInt64(m, "observedGeneration"); og > max {
+			max = og
+		}
+	}
+	return max
+}
+
 // gatewayStatusStuck is the cilium-operator signature on the
 // gateway-API route resources its gateway controller reconciles: an
 // object reporting no status.parents (the controller attaches a
-// parent status when it programs the route) or a lagging
-// observedGeneration.
+// parent status when it programs the route), or one whose parents'
+// conditions still report only older observedGenerations — the
+// controller attached once but never saw the last spec write.
 func gatewayStatusStuck(o *unstructured.Unstructured) bool {
-	if staleObservedGeneration(o) {
+	parents, found, _ := unstructured.NestedSlice(o.Object, "status", "parents")
+	if !found || len(parents) == 0 {
 		return true
 	}
-	parents, found, _ := unstructured.NestedSlice(o.Object, "status", "parents")
-	return !found || len(parents) == 0
+	var maxOG int64
+	for _, pr := range parents {
+		m, ok := pr.(map[string]any)
+		if !ok {
+			continue
+		}
+		conds, _, _ := unstructured.NestedSlice(m, "conditions")
+		if og := condMaxObservedGeneration(conds); og > maxOG {
+			maxOG = og
+		}
+	}
+	return maxOG < o.GetGeneration()
 }
 
 // gatewayObjectStuck is the same signature for the Gateway kind
@@ -982,16 +1046,129 @@ func gatewayStatusStuck(o *unstructured.Unstructured) bool {
 // programmed Gateway reports one status.listeners entry per
 // spec.listeners entry; a spec with listeners but an empty/absent
 // status.listeners means the controller never programmed it.
+// Generation lag is judged from the conditions' observedGeneration
+// (top-level status.conditions plus per-listener conditions) —
+// Gateway status has no top-level observedGeneration field.
 func gatewayObjectStuck(o *unstructured.Unstructured) bool {
-	if staleObservedGeneration(o) {
-		return true
-	}
 	spec, found, _ := unstructured.NestedSlice(o.Object, "spec", "listeners")
 	if !found || len(spec) == 0 {
 		return false
 	}
 	status, found, _ := unstructured.NestedSlice(o.Object, "status", "listeners")
-	return !found || len(status) == 0
+	if !found || len(status) == 0 {
+		return true
+	}
+	var maxOG int64
+	conds, _, _ := unstructured.NestedSlice(o.Object, "status", "conditions")
+	maxOG = condMaxObservedGeneration(conds)
+	for _, l := range status {
+		m, ok := l.(map[string]any)
+		if !ok {
+			continue
+		}
+		conds, _, _ := unstructured.NestedSlice(m, "conditions")
+		if og := condMaxObservedGeneration(conds); og > maxOG {
+			maxOG = og
+		}
+	}
+	return maxOG < o.GetGeneration()
+}
+
+// gatewayClassController resolves a GatewayClass name to its
+// spec.controllerName, caching the class set for a minute so a
+// stuck-object sweep doesn't LIST per object. ok=false means the
+// class set is unavailable or the class is unknown — callers treat
+// that as "cannot disprove ownership" and keep the object.
+func (p *clusterHealthProber) gatewayClassController(ctx context.Context, class string) (string, bool) {
+	p.mu.Lock()
+	cached, at := p.gwClassCtlr, p.gwClassAt
+	p.mu.Unlock()
+	if cached == nil || p.now().Sub(at) > time.Minute {
+		list, err := p.dyn.Resource(gwv1("gatewayclasses")).
+			List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return "", false
+		}
+		m := map[string]string{}
+		for i := range list.Items {
+			ctlr, _, _ := unstructured.NestedString(
+				list.Items[i].Object, "spec", "controllerName")
+			m[list.Items[i].GetName()] = ctlr
+		}
+		p.mu.Lock()
+		p.gwClassCtlr, p.gwClassAt = m, p.now()
+		p.mu.Unlock()
+		cached = m
+	}
+	ctlr, ok := cached[class]
+	return ctlr, ok
+}
+
+// ciliumOwnsGatewayObject is the ownership filter for the Gateways
+// resource: only a Gateway whose class is served by cilium's gateway
+// controller belongs in cilium-operator's stuck set. Unresolvable
+// class data keeps the object — a Gateway whose class cannot be
+// attributed is still worth flagging under the cluster's gateway-API
+// watcher.
+func ciliumOwnsGatewayObject(ctx context.Context, p *clusterHealthProber,
+	o *unstructured.Unstructured) bool {
+	class, _, _ := unstructured.NestedString(o.Object, "spec", "gatewayClassName")
+	ctlr, ok := p.gatewayClassController(ctx, class)
+	if !ok {
+		return true
+	}
+	return ctlr == ciliumGatewayController
+}
+
+// ciliumOwnsRouteParent is the same filter for the route kinds: it
+// resolves each spec.parentRefs[] entry to its Gateway and reports
+// whether any parent's class is cilium's. Objects with no Gateway
+// parents, or parents that fail to resolve, stay in the stuck set —
+// an unattributable route is still a gateway-API-plane problem —
+// while a route provably owned by another gateway controller is
+// that controller's problem, not cilium-operator's.
+func ciliumOwnsRouteParent(ctx context.Context, p *clusterHealthProber,
+	o *unstructured.Unstructured) bool {
+	refs, found, _ := unstructured.NestedSlice(o.Object, "spec", "parentRefs")
+	if !found || len(refs) == 0 {
+		return true
+	}
+	resolved := false
+	for _, ref := range refs {
+		m, ok := ref.(map[string]any)
+		if !ok {
+			continue
+		}
+		if k, _, _ := unstructured.NestedString(m, "kind"); k != "" && k != "Gateway" {
+			continue
+		}
+		if g, _, _ := unstructured.NestedString(m, "group"); g != "" && g != "gateway.networking.k8s.io" {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(m, "name")
+		if name == "" {
+			continue
+		}
+		ns, _, _ := unstructured.NestedString(m, "namespace")
+		if ns == "" {
+			ns = o.GetNamespace()
+		}
+		gw, err := p.dyn.Resource(gwv1("gateways")).Namespace(ns).
+			Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			continue
+		}
+		class, _, _ := unstructured.NestedString(gw.Object, "spec", "gatewayClassName")
+		ctlr, ok := p.gatewayClassController(ctx, class)
+		if !ok {
+			continue
+		}
+		resolved = true
+		if ctlr == ciliumGatewayController {
+			return true
+		}
+	}
+	return !resolved
 }
 
 // gwv1 is the gateway.networking.k8s.io/v1 group shared by the three
@@ -1009,9 +1186,12 @@ var operatorTargets = []operatorTarget{
 		podSelector: "io.cilium/app=operator",
 		stuckMinAge: ciliumStuckMinAge,
 		resources: []opStuckResource{
-			{gvr: gwv1("gateways"), reason: opReasonStaleGWStatus, stuck: gatewayObjectStuck},
-			{gvr: gwv1("httproutes"), reason: opReasonStaleGWStatus, stuck: gatewayStatusStuck},
-			{gvr: gwv1("grpcroutes"), reason: opReasonStaleGWStatus, stuck: gatewayStatusStuck},
+			{gvr: gwv1("gateways"), reason: opReasonStaleGWStatus,
+				stuck: gatewayObjectStuck, owns: ciliumOwnsGatewayObject},
+			{gvr: gwv1("httproutes"), reason: opReasonStaleGWStatus,
+				stuck: gatewayStatusStuck, owns: ciliumOwnsRouteParent},
+			{gvr: gwv1("grpcroutes"), reason: opReasonStaleGWStatus,
+				stuck: gatewayStatusStuck, owns: ciliumOwnsRouteParent},
 		},
 	},
 	{
@@ -1078,7 +1258,7 @@ var operatorTargets = []operatorTarget{
 				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
 			{gvr: schema.GroupVersionResource{
 				Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmrepositories"},
-				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
+				reason: kcmReasonStaleGen, stuck: helmRepoStaleGen},
 			{gvr: schema.GroupVersionResource{
 				Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmcharts"},
 				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
@@ -1090,24 +1270,13 @@ var operatorTargets = []operatorTarget{
 				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
 		},
 	},
-	{
-		name:        "notification-controller",
-		leaseNS:     "flux-system",
-		leaseName:   "notification-controller-leader-election",
-		podSelector: "app=notification-controller",
-		stuckMinAge: operatorStuckMinAge,
-		resources: []opStuckResource{
-			{gvr: schema.GroupVersionResource{
-				Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "alerts"},
-				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
-			{gvr: schema.GroupVersionResource{
-				Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "providers"},
-				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
-			{gvr: schema.GroupVersionResource{
-				Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "receivers"},
-				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
-		},
-	},
+	// notification-controller is deliberately absent: its v1beta3
+	// Alert/Provider/Receiver are static objects — the API version
+	// dropped their reconcilers, so no controller ever writes
+	// status.observedGeneration or conditions on them and every
+	// stuck signature flags healthy objects forever (the
+	// passiontech-k0s-nonprod false-positive incident 2026-11-04).
+	// Liveness stays covered by the pod/lease watches elsewhere.
 	{
 		name: "cert-manager",
 		// The cert-manager helm chart elects leaders in kube-system
@@ -1308,6 +1477,12 @@ func (p *clusterHealthProber) checkOperatorWorkqueues(ctx context.Context) probe
 			for i := range list.Items {
 				o := &list.Items[i]
 				if !res.stuck(o) {
+					continue
+				}
+				// Shared-resource types: skip objects provably owned
+				// by a different controller so the signature — and
+				// the heal — lands on the right operator only.
+				if res.owns != nil && !res.owns(ctx, p, o) {
 					continue
 				}
 				key := op.name + "/" + res.gvr.Resource + "/" +
@@ -1547,6 +1722,20 @@ func (p *clusterHealthProber) leaderPods(ctx context.Context, op operatorTarget,
 	if err != nil {
 		return nil, fmt.Errorf("list operator pods in %s (selector %q): %w",
 			lease.Namespace, op.podSelector, err)
+	}
+	// The selector fallback cannot tell the leader from its
+	// standbys — deleting every matched replica wedges the operator
+	// outright (the 2026-11-04 cilium-operator triple-delete). Cap
+	// the blast radius at one pod, preferring the oldest (the
+	// longest-running replica is the likelier wedged holder): if
+	// the survivor was the real holder the signature stays up and
+	// the next post-cooldown sweep deletes it.
+	if len(pods.Items) > 1 {
+		sort.Slice(pods.Items, func(i, j int) bool {
+			return pods.Items[i].CreationTimestamp.
+				Before(&pods.Items[j].CreationTimestamp)
+		})
+		return pods.Items[:1], nil
 	}
 	return pods.Items, nil
 }

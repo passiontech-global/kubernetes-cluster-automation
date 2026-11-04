@@ -25,8 +25,11 @@ import (
 // W7-C2 — operator watchdog expansion
 // ---------------------------------------------------------------------------
 
-// The watchdog must cover the original five plus the ten W7-C2
-// additions — and never a duplicate name (a dup would share a
+// The watchdog must cover the original five plus nine of the ten
+// W7-C2 additions — notification-controller is excluded on purpose:
+// its v1beta3 Alert/Provider/Receiver objects are static (no
+// reconciler writes status on them), so no stuck signature can ever
+// be accurate — and never a duplicate name (a dup would share a
 // first-seen keyspace and double-report).
 func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 	seen := map[string]bool{}
@@ -36,11 +39,11 @@ func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 		}
 		seen[op.name] = true
 	}
-	if len(operatorTargets) != 15 {
-		t.Fatalf("operatorTargets = %d, want 15", len(operatorTargets))
+	if len(operatorTargets) != 14 {
+		t.Fatalf("operatorTargets = %d, want 14", len(operatorTargets))
 	}
 	for _, want := range []string{
-		"source-controller", "notification-controller", "cert-manager",
+		"source-controller", "cert-manager",
 		"external-secrets", "rabbitmq-cluster-operator", "keda-operator",
 		"argocd-operator", "kargo-controller", "everest-operator",
 		"shipwright-build-controller",
@@ -48,6 +51,10 @@ func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 		if !seen[want] {
 			t.Fatalf("missing operator target %q", want)
 		}
+	}
+	if seen["notification-controller"] {
+		t.Fatal("notification-controller must not be a target — " +
+			"v1beta3 Alert/Provider/Receiver never get status")
 	}
 }
 
