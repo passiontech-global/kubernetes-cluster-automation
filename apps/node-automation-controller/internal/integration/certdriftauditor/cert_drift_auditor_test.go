@@ -610,3 +610,129 @@ func TestCertDriftAuditorTrustBundles(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// W7-C6 — kubernetes-replicator tls.crt drift
+// ---------------------------------------------------------------------------
+
+// replicatedSecret builds a TLS-type secret carrying the
+// replicated-from annotation and an arbitrary tls.crt payload —
+// drift is a byte comparison, the bytes need not parse as PEM (the
+// expiry audit just skips them).
+func replicatedSecret(ns, name, sourceRef, crt string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: name,
+			Annotations: map[string]string{replicatedFromAnno: sourceRef}},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{"tls.crt": []byte(crt)},
+	}
+}
+
+func driftGauge(ns, name, src string) float64 {
+	return promtestutil.ToFloat64(
+		metrics.ReplicatedSecretDrift.WithLabelValues(ns, name, src))
+}
+
+// The drift latch: a single-scan mismatch is the replicator mid-sync
+// — only the SECOND consecutive mismatch sets the gauge.
+func TestReplicatedDriftLatchesAfterTwoScans(t *testing.T) {
+	metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
+	t.Cleanup(func() {
+		metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
+	})
+	cs := fake.NewSimpleClientset(
+		replicatedSecret("sec", "tls-src", "", "CRT-v2"),
+		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-v1"))
+	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := driftGauge("apps", "tls-copy", "sec/tls-src"); got != 0 {
+		t.Fatalf("drift gauge = %v after one scan, want 0 (mid-sync)", got)
+	}
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := driftGauge("apps", "tls-copy", "sec/tls-src"); got != 1 {
+		t.Fatalf("drift gauge = %v after two scans, want 1", got)
+	}
+}
+
+// A matching copy resets the streak AND prunes the held series —
+// recovered drift must not park a 1 in /metrics.
+func TestReplicatedDriftClearsOnResync(t *testing.T) {
+	metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
+	t.Cleanup(func() {
+		metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
+	})
+	cs := fake.NewSimpleClientset(
+		replicatedSecret("sec", "tls-src", "", "CRT-v1"),
+		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-old"))
+	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := driftGauge("apps", "tls-copy", "sec/tls-src"); got != 1 {
+		t.Fatalf("precondition: gauge = %v, want 1", got)
+	}
+	// The replicator catches up — dest now matches the source.
+	if err := cs.Tracker().Update(
+		corev1.SchemeGroupVersion.WithResource("secrets"),
+		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-v1"), "apps"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := driftGauge("apps", "tls-copy", "sec/tls-src"); got != 0 {
+		t.Fatalf("drift series still held after re-sync: %v", got)
+	}
+	if len(a.replicationMismatch) != 0 {
+		t.Fatalf("mismatch streak not reset: %v", a.replicationMismatch)
+	}
+}
+
+// A source that is NOT a TLS secret resolves via the direct-Get
+// fallback, not the tlsData sweep map.
+func TestReplicatedDriftOpaqueSourceFallback(t *testing.T) {
+	metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
+	t.Cleanup(func() {
+		metrics.ReplicatedSecretDrift.DeleteLabelValues("apps", "tls-copy", "sec/tls-src")
+	})
+	src := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "sec", Name: "tls-src"},
+		Type:       corev1.SecretTypeOpaque,
+		Data:       map[string][]byte{"tls.crt": []byte("CRT-v2")},
+	}
+	cs := fake.NewSimpleClientset(src,
+		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-v1"))
+	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := driftGauge("apps", "tls-copy", "sec/tls-src"); got != 1 {
+		t.Fatalf("opaque-source drift not detected: %v, want 1", got)
+	}
+}
+
+// A missing source is "can't compare", not drift — no streak, no
+// gauge.
+func TestReplicatedDriftMissingSourceQuiet(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-v1"))
+	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.replicationMismatch) != 0 {
+		t.Fatalf("missing source counted as drift: %v", a.replicationMismatch)
+	}
+}

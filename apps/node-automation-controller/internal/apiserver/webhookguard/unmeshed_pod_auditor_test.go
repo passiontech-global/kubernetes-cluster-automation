@@ -8,16 +8,23 @@ import (
 
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -212,7 +219,7 @@ func TestUnmeshedAuditSkipsNonRunning(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // Healthy injector + remediation on: unmeshed, owned, old pods are
-// deleted — capped at 2 per cycle — and counted.
+// evicted — capped at 2 per cycle — and counted.
 func TestUnmeshedRemediationDeletesUpToTwo(t *testing.T) {
 	metrics.UnmeshedPodsRecreatedTotal.DeleteLabelValues("meshed")
 	t.Cleanup(func() {
@@ -225,6 +232,7 @@ func TestUnmeshedRemediationDeletesUpToTwo(t *testing.T) {
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"), upPod("meshed", "web-b"), upPod("meshed", "web-c"))
+	emulateEviction(cs)
 	g := upGuard(cs)
 	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
@@ -449,9 +457,10 @@ func TestUnmeshedAuditPaginatesPodList(t *testing.T) {
 	}
 }
 
-// The unmeshed delete carries a UID precondition — a same-named pod
-// recreated between the list snapshot and the delete (admitted after
-// the injector recovered) is not the pod this sweep vetted.
+// The unmeshed eviction carries a UID precondition on the Eviction's
+// DeleteOptions — a same-named pod recreated between the list
+// snapshot and the evict (admitted after the injector recovered) is
+// not the pod this sweep vetted.
 func TestUnmeshedRemediationDeleteUIDPrecondition(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		upNamespace("kube-system", ""),
@@ -460,27 +469,33 @@ func TestUnmeshedRemediationDeleteUIDPrecondition(t *testing.T) {
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"))
 	var gotUID *types.UID
-	cs.PrependReactor("delete", "pods",
+	cs.PrependReactor("create", "pods",
 		func(a ktesting.Action) (bool, runtime.Object, error) {
-			opts := a.(ktesting.DeleteAction).GetDeleteOptions()
-			if opts.Preconditions != nil {
-				gotUID = opts.Preconditions.UID
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
 			}
-			return false, nil, nil // fall through to the tracker
+			ev := ca.GetObject().(*policyv1.Eviction)
+			if ev.DeleteOptions != nil && ev.DeleteOptions.Preconditions != nil {
+				gotUID = ev.DeleteOptions.Preconditions.UID
+			}
+			return true, ev, cs.Tracker().Delete(
+				corev1.SchemeGroupVersion.WithResource("pods"),
+				ca.GetNamespace(), ev.Name)
 		})
 	g := upGuard(cs)
 	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if gotUID == nil {
-		t.Fatal("delete missing the UID precondition")
+		t.Fatal("eviction missing the UID precondition")
 	}
 	if upPodExists(t, cs, "meshed", "web-a") {
-		t.Fatal("pod still exists — delete never landed")
+		t.Fatal("pod still exists — eviction never landed")
 	}
 }
 
-// A persistently failing delete must not storm the API: the sweep
+// A persistently failing eviction must not storm the API: the sweep
 // gives up after unmeshedDeleteAttempts and retries next cycle.
 func TestUnmeshedRemediationCapsDeleteAttempts(t *testing.T) {
 	objs := []runtime.Object{
@@ -492,23 +507,171 @@ func TestUnmeshedRemediationCapsDeleteAttempts(t *testing.T) {
 		objs = append(objs, upPod("meshed", fmt.Sprintf("web-%d", i)))
 	}
 	cs := fake.NewSimpleClientset(objs...)
-	deletes := 0
-	cs.PrependReactor("delete", "pods",
-		func(ktesting.Action) (bool, runtime.Object, error) {
-			deletes++
+	evictions := 0
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			evictions++
 			return true, nil, errors.New("apiserver wedged")
 		})
 	g := upGuard(cs)
 	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if deletes != unmeshedDeleteAttempts {
-		t.Fatalf("delete attempts = %d, want cap of %d",
-			deletes, unmeshedDeleteAttempts)
+	if evictions != unmeshedDeleteAttempts {
+		t.Fatalf("eviction attempts = %d, want cap of %d",
+			evictions, unmeshedDeleteAttempts)
 	}
 	for i := 0; i < 8; i++ {
 		if !upPodExists(t, cs, "meshed", fmt.Sprintf("web-%d", i)) {
 			t.Fatalf("pod web-%d deleted through the failing reactor", i)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W7-C1 — Eviction API, PDB deferral & maintenance mutex
+// ---------------------------------------------------------------------------
+
+// A PDB-refused eviction (HTTP 429 — disruptionsAllowed==0) is a
+// deferral, not a failure: the pod is kept, no error counts, and the
+// sweep moves on to the next candidate — which still evicts.
+func TestUnmeshedRemediationPDBRefusalDefers(t *testing.T) {
+	metrics.UnmeshedPodsRecreatedTotal.DeleteLabelValues("meshed")
+	t.Cleanup(func() {
+		metrics.UnmeshedPodsRecreatedTotal.DeleteLabelValues("meshed")
+	})
+
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		upPod("meshed", "web-a"), upPod("meshed", "web-b"))
+	refused := false
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			ev := ca.GetObject().(*policyv1.Eviction)
+			if ev.Name == "web-a" {
+				refused = true
+				return true, nil, apierrors.NewTooManyRequests(
+					"pdb allows no disruptions", 0)
+			}
+			return true, ev, cs.Tracker().Delete(
+				corev1.SchemeGroupVersion.WithResource("pods"),
+				ca.GetNamespace(), ev.Name)
+		})
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	if !refused {
+		t.Fatal("web-a eviction never attempted")
+	}
+	if !upPodExists(t, cs, "meshed", "web-a") {
+		t.Fatal("PDB-refused pod was deleted anyway")
+	}
+	if upPodExists(t, cs, "meshed", "web-b") {
+		t.Fatal("PDB refusal on web-a must not block web-b's eviction")
+	}
+	// The refusal is a deferral — web-b's eviction counted, web-a's
+	// did not error.
+	if got := ptestutil.ToFloat64(
+		metrics.UnmeshedPodsRecreatedTotal.WithLabelValues("meshed")); got != 1 {
+		t.Fatalf("recreated counter = %v, want 1 (only web-b)", got)
+	}
+}
+
+// A cordoned node means a drain is in flight — the maintenance mutex
+// defers the whole remediation even though the injector is healthy.
+func TestUnmeshedRemediationMaintenanceDefers(t *testing.T) {
+	cordoned := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "w1"},
+		Spec:       corev1.NodeSpec{Unschedulable: true},
+	}
+	cs := fake.NewSimpleClientset(cordoned,
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		upPod("meshed", "web-a"))
+	evictions := 0
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if ok && ca.GetSubresource() == "eviction" {
+				evictions++
+			}
+			return true, nil, errors.New("must not evict")
+		})
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	if evictions != 0 {
+		t.Fatalf("eviction attempted during maintenance: %d", evictions)
+	}
+	if !upPodExists(t, cs, "meshed", "web-a") {
+		t.Fatal("pod deleted during maintenance")
+	}
+}
+
+// The kured reboot lock is the second clientset-only mutex signal —
+// honored on the nil-dyn path (unit-test construction).
+func TestUnmeshedRemediationKuredLockDefers(t *testing.T) {
+	kured := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "kube-system", Name: "kured",
+			Annotations: map[string]string{
+				"weave.works/kured-node-lock": "node-42"}},
+	}
+	cs := fake.NewSimpleClientset(kured,
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		upPod("meshed", "web-a"))
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	if !upPodExists(t, cs, "meshed", "web-a") {
+		t.Fatal("pod deleted while kured holds the reboot lock")
+	}
+}
+
+// With a real dyn wired the full mutex runs: an in-flight autopilot
+// Plan (state neither Schedulable nor Completed) defers remediation
+// even when no node is cordoned.
+func TestUnmeshedRemediationAutopilotPlanDefers(t *testing.T) {
+	plan := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "autopilot.k0sproject.io/v1beta2",
+		"kind":       "Plan",
+		"metadata":   map[string]any{"name": "upgrade-1"},
+	}}
+	_ = unstructured.SetNestedField(plan.Object, "Running", "status", "state")
+	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
+		shared.AutopilotPlanGVR: "PlanList",
+	}, plan)
+	cs := fake.NewSimpleClientset(
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		upPod("meshed", "web-a"))
+	g := &webhookGuard{cs: cs, dyn: dyn, nowFn: time.Now,
+		unmeshedEmitted: map[string]bool{}}
+	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	if !upPodExists(t, cs, "meshed", "web-a") {
+		t.Fatal("pod deleted while an autopilot plan is in flight")
 	}
 }

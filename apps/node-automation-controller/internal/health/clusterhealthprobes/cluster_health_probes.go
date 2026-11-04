@@ -109,6 +109,10 @@ const (
 	checkNameOperatorWorkqueue  = "operator-workqueue-watchdog"
 	checkNameStatefulMasterless = "stateful-masterless-services"
 	checkNameRabbitMQSuspended  = "rabbitmq-suspended-listener"
+	// W7 — same not-ported shape: the checks ride the generic FAIL
+	// alerting path under their own check names.
+	checkNameLocalPVStranded = "localpv-stranded-pods"
+	checkNameOLMHealth       = "olm-subscription-health"
 )
 
 // C6 watchdog knobs — the KCM leader Lease name and the
@@ -147,6 +151,15 @@ const (
 	// observedGeneration lags — the gateway controller never
 	// attached it.
 	opReasonStaleGWStatus = "stale_gateway_status"
+	// opReasonNoConditions is the never-reconciled signature for CR
+	// types that carry no observedGeneration — their controller
+	// stamps status.conditions on the first reconcile pass, so an
+	// absent/empty list means it never picked the object up (W7-C2).
+	opReasonNoConditions = "no_status_conditions"
+	// opReasonNoPhase is the same signature for CR types that report
+	// a status.phase (argocd): an empty phase means the operator
+	// never reconciled the object (W7-C2).
+	opReasonNoPhase = "no_status_phase"
 )
 
 // W6.2 — stateful-masterless-services knobs.
@@ -166,6 +179,25 @@ const (
 	// dragonflyHealAnno persists the last heal moment on the STS —
 	// the restart-proof half of the cooldown.
 	dragonflyHealAnno = "node.ops/last-dragonfly-operator-heal"
+
+	// W7-C3 — dual-replica deadlock: past this zero-endpoint streak
+	// the operator restart (step 1) demonstrably failed to re-elect
+	// a master, so the STS ordinal-0 pod is deleted to force the
+	// whole election from scratch.
+	dragonflyReplicaDeadlockMinAge = 10 * time.Minute
+	// dragonflyOperatorSettleMin bounds how fresh the operator heal
+	// must be before the pod kill is allowed — step 1 needs a few
+	// minutes to relabel the pods; deleting ordinal-0 while the new
+	// operator is still reconciling reaps the pod pointlessly.
+	dragonflyOperatorSettleMin = 3 * time.Minute
+	// dragonflyPodHealCooldown bounds ordinal-0 pod deletes to one
+	// per STS — wider of the in-RAM ledger and the persisted
+	// node.ops/last-dragonfly-pod-heal stamp (same wider-of-both
+	// shape as the operator heal above).
+	dragonflyPodHealCooldown = 30 * time.Minute
+	// dragonflyPodHealAnno persists the last ordinal-0 pod delete on
+	// the STS — the restart-proof half of the cooldown.
+	dragonflyPodHealAnno = "node.ops/last-dragonfly-pod-heal"
 )
 
 // W6.4 — rabbitmq-suspended-listener knobs.
@@ -381,9 +413,13 @@ type clusterHealthProber struct {
 	//   - drHealed: operator pod "ns/name" → last delete — the
 	//     in-RAM half of the 30m dragonfly heal cooldown (the STS
 	//     annotation stamp is the durable half).
+	//   - drPodHealed: "ns/sts" → last ordinal-0 pod delete — the
+	//     in-RAM half of the 30m dual-replica-deadlock cooldown
+	//     (W7-C3; the STS annotation is the durable half).
 	stsZeroSince   map[string]time.Time
 	stsZeroEmitted map[string]bool
 	drHealed       map[string]time.Time
+	drPodHealed    map[string]time.Time
 
 	// W6.4 watchdog state (under mu):
 	//   - rbSuspendedSince: "ns/pod/uid" → first sweep the pod
@@ -392,6 +428,36 @@ type clusterHealthProber struct {
 	//   - rbHealed: "ns/pod" → last delete — the 30m heal cooldown.
 	rbSuspendedSince map[string]time.Time
 	rbHealed         map[string]time.Time
+
+	// W7-C4 watchdog state (under mu):
+	//   - localPVEmitted: "ns/pod/pvc/node/reason" gauge tuples held
+	//     at 1 — pruned via DeleteLabelValues when not re-seen (same
+	//     hygiene as stsZeroEmitted).
+	//   - pvcStalledEmitted: "ns/pvc/storageclass" gauge tuples held
+	//     at 1 — same lifecycle.
+	//   - localPVHealed: "ns/pvc" → last ephemeral-PVC heal — the
+	//     30m cooldown (in-RAM: the PVC is deleted, nothing durable
+	//     can carry the stamp).
+	//   - pvcProvHealed: provisioner → last provisioner pod delete —
+	//     the 1h cooldown.
+	localPVEmitted    map[string]bool
+	pvcStalledEmitted map[string]bool
+	localPVHealed     map[string]time.Time
+	pvcProvHealed     map[string]time.Time
+
+	// W7-C5 watchdog state (under mu):
+	//   - olmFirstSeen: "kind/ns/name/reason" → first sweep the
+	//     unhealthy signature showed; it must persist
+	//     olmUnhealthyMinAge before the gauge fires (>= olmHealMinAge
+	//     for the CSV-triggered operator heal). Pruned on resolve.
+	//   - olmEmitted: same keys held at gauge=1 — a tuple not
+	//     re-seen gets DeleteLabelValues, not a stale 1.
+	//   - olmHealed: reason → last olm-operator pod delete — the 1h
+	//     cooldown (in-RAM: deleting the operator pod is the heal,
+	//     nothing else can carry the stamp).
+	olmFirstSeen map[string]time.Time
+	olmEmitted   map[string]bool
+	olmHealed    map[string]time.Time
 }
 
 func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg healthProbeConfig) *clusterHealthProber {
@@ -413,17 +479,27 @@ func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg 
 			checkNameOperatorWorkqueue:  boot,
 			checkNameStatefulMasterless: boot,
 			checkNameRabbitMQSuspended:  boot,
+			checkNameLocalPVStranded:    boot,
+			checkNameOLMHealth:          boot,
 		},
-		kcmFirstSeen:     map[string]time.Time{},
-		kcmFrozenReasons: map[string]bool{},
-		opFirstSeen:      map[string]time.Time{},
-		opFrozen:         map[string]bool{},
-		opHealed:         map[string]time.Time{},
-		stsZeroSince:     map[string]time.Time{},
-		stsZeroEmitted:   map[string]bool{},
-		drHealed:         map[string]time.Time{},
-		rbSuspendedSince: map[string]time.Time{},
-		rbHealed:         map[string]time.Time{},
+		kcmFirstSeen:      map[string]time.Time{},
+		kcmFrozenReasons:  map[string]bool{},
+		opFirstSeen:       map[string]time.Time{},
+		opFrozen:          map[string]bool{},
+		opHealed:          map[string]time.Time{},
+		stsZeroSince:      map[string]time.Time{},
+		stsZeroEmitted:    map[string]bool{},
+		drHealed:          map[string]time.Time{},
+		drPodHealed:       map[string]time.Time{},
+		rbSuspendedSince:  map[string]time.Time{},
+		rbHealed:          map[string]time.Time{},
+		localPVEmitted:    map[string]bool{},
+		pvcStalledEmitted: map[string]bool{},
+		localPVHealed:     map[string]time.Time{},
+		pvcProvHealed:     map[string]time.Time{},
+		olmFirstSeen:      map[string]time.Time{},
+		olmEmitted:        map[string]bool{},
+		olmHealed:         map[string]time.Time{},
 	}
 }
 
@@ -473,6 +549,8 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 		{checkNameOperatorWorkqueue, p.checkOperatorWorkqueues},
 		{checkNameStatefulMasterless, p.checkStatefulMasterlessServices},
 		{checkNameRabbitMQSuspended, p.checkRabbitMQSuspendedPods},
+		{checkNameLocalPVStranded, p.checkLocalPVStrandedPods},
+		{checkNameOLMHealth, p.checkOLMHealth},
 	}
 	for _, c := range checks {
 		res := c.probe(ctx)
@@ -867,6 +945,24 @@ func fluxUnsuspendedStaleGen(o *unstructured.Unstructured) bool {
 	return staleObservedGeneration(o)
 }
 
+// noStatusConditions is the "never reconciled" signature for CR
+// types that lack a reliable observedGeneration (cert-manager
+// Certificates, ExternalSecrets, KEDA ScaledObjects): the controller
+// stamps status.conditions on its first reconcile pass, so an absent
+// or empty list means it never picked the object up (W7-C2).
+func noStatusConditions(o *unstructured.Unstructured) bool {
+	conds, found, _ := unstructured.NestedSlice(o.Object, "status", "conditions")
+	return !found || len(conds) == 0
+}
+
+// emptyStatusPhase is the same never-reconciled signature for CR
+// types that report a status.phase (ArgoCD): an absent/empty phase
+// means the operator never touched the object (W7-C2).
+func emptyStatusPhase(o *unstructured.Unstructured) bool {
+	phase, found, _ := unstructured.NestedString(o.Object, "status", "phase")
+	return !found || phase == ""
+}
+
 // gatewayStatusStuck is the cilium-operator signature on the
 // gateway-API route resources its gateway controller reconciles: an
 // object reporting no status.parents (the controller attaches a
@@ -964,6 +1060,166 @@ var operatorTargets = []operatorTarget{
 			gvr: schema.GroupVersionResource{
 				Group: "kustomize.toolkit.fluxcd.io", Version: "v1", Resource: "kustomizations"},
 			reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen,
+		}},
+	},
+	// W7-C2 — the ten additional leader-electing operators: every one
+	// a controller-runtime leader whose zombie-leader gray failure
+	// would wedge a whole slice of the stack (gitops sources, cert
+	// issuance, secret sync, autoscaling, stateful operands).
+	{
+		name:        "source-controller",
+		leaseNS:     "flux-system",
+		leaseName:   "source-controller-leader-election",
+		podSelector: "app=source-controller",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{
+			{gvr: schema.GroupVersionResource{
+				Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "gitrepositories"},
+				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
+			{gvr: schema.GroupVersionResource{
+				Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmrepositories"},
+				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
+			{gvr: schema.GroupVersionResource{
+				Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmcharts"},
+				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
+			{gvr: schema.GroupVersionResource{
+				Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "ocirepositories"},
+				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
+			{gvr: schema.GroupVersionResource{
+				Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "buckets"},
+				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
+		},
+	},
+	{
+		name:        "notification-controller",
+		leaseNS:     "flux-system",
+		leaseName:   "notification-controller-leader-election",
+		podSelector: "app=notification-controller",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{
+			{gvr: schema.GroupVersionResource{
+				Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "alerts"},
+				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
+			{gvr: schema.GroupVersionResource{
+				Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "providers"},
+				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
+			{gvr: schema.GroupVersionResource{
+				Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "receivers"},
+				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
+		},
+	},
+	{
+		name: "cert-manager",
+		// The cert-manager helm chart elects leaders in kube-system
+		// (global.leaderElection.namespace default) — the lease does
+		// NOT live in the release namespace.
+		leaseNS:     "kube-system",
+		leaseName:   "cert-manager-controller",
+		podSelector: "app.kubernetes.io/name=cert-manager",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "cert-manager.io", Version: "v1", Resource: "certificates"},
+			reason: opReasonNoConditions, stuck: noStatusConditions,
+		}},
+	},
+	{
+		name:    "external-secrets",
+		leaseNS: "external-secrets",
+		// Helm-default lease id — the deployment runs leaderElect:
+		// false today (single replica), so this target stays dormant
+		// until HA is switched on. externalsecret-operator-leader-
+		// election is the OLM-installed name, not the helm chart's.
+		leaseName:   "external-secrets-controller",
+		podSelector: "app.kubernetes.io/name=external-secrets",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{
+			{gvr: schema.GroupVersionResource{
+				Group: "external-secrets.io", Version: "v1", Resource: "externalsecrets"},
+				reason: opReasonNoConditions, stuck: noStatusConditions},
+			{gvr: schema.GroupVersionResource{
+				Group: "external-secrets.io", Version: "v1beta1", Resource: "externalsecrets"},
+				reason: opReasonNoConditions, stuck: noStatusConditions},
+		},
+	},
+	{
+		name:        "rabbitmq-cluster-operator",
+		leaseNS:     "operators",
+		leaseName:   "9c433e27.rabbitmq.com",
+		podSelector: "app.kubernetes.io/name=rabbitmq-cluster-operator",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "rabbitmq.com", Version: "v1beta1", Resource: "rabbitmqclusters"},
+			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
+		}},
+	},
+	{
+		name:        "keda-operator",
+		leaseNS:     "operators",
+		leaseName:   "operator.keda.sh",
+		podSelector: "app=keda-operator",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "keda.sh", Version: "v1alpha1", Resource: "scaledobjects"},
+			reason: opReasonNoConditions, stuck: noStatusConditions,
+		}},
+	},
+	{
+		name: "argocd-operator",
+		// The OLM Subscription sits in argocd-operator-system (see
+		// infrastructure/base/operators/argocd-operator.yaml) — OLM
+		// places the CSV deployment AND the leader-election lease
+		// there, and the manager pods carry the kubebuilder
+		// control-plane label, not name=argocd-operator.
+		leaseNS:     "argocd-operator-system",
+		leaseName:   "b23f6029.argoproj.io",
+		podSelector: "control-plane=controller-manager",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "argoproj.io", Version: "v1beta1", Resource: "argocds"},
+			reason: opReasonNoPhase, stuck: emptyStatusPhase,
+		}},
+	},
+	{
+		name:        "kargo-controller",
+		leaseNS:     "kargo",
+		leaseName:   "kargo-controller",
+		podSelector: "app.kubernetes.io/name=kargo,app.kubernetes.io/component=controller",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{
+			{gvr: schema.GroupVersionResource{
+				Group: "kargo.akuity.io", Version: "v1alpha1", Resource: "stages"},
+				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
+			{gvr: schema.GroupVersionResource{
+				Group: "kargo.akuity.io", Version: "v1alpha1", Resource: "warehouses"},
+				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
+		},
+	},
+	{
+		name:        "everest-operator",
+		leaseNS:     "everest-system",
+		leaseName:   "a8916322.percona.com",
+		podSelector: "control-plane=controller-manager",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "everest.percona.com", Version: "v1alpha1", Resource: "databaseclusters"},
+			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
+		}},
+	},
+	{
+		name:        "shipwright-build-controller",
+		leaseNS:     "shipwright-build",
+		leaseName:   "shipwright-build-controller",
+		podSelector: "app.kubernetes.io/name=shipwright-build-controller",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "shipwright.io", Version: "v1beta1", Resource: "builds"},
+			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
 		}},
 	},
 }
@@ -1356,6 +1612,14 @@ type masterSvc struct {
 	sts     *appsv1.StatefulSet
 }
 
+// masterlessDue pairs a master-role service past the heal window
+// with the moment its zero-endpoint streak began — the W7-C3
+// deadlock heal needs the streak length, not just "past 5m".
+type masterlessDue struct {
+	svc   masterSvc
+	since time.Time
+}
+
 // dragonflyOwned reports whether the StatefulSet is managed by the
 // dragonfly-operator — via app.kubernetes.io/part-of=dragonfly or
 // app.kubernetes.io/created-by=dragonfly-operator on the STS metadata
@@ -1394,6 +1658,9 @@ func (p *clusterHealthProber) checkStatefulMasterlessServices(ctx context.Contex
 	}
 	if p.drHealed == nil {
 		p.drHealed = map[string]time.Time{}
+	}
+	if p.drPodHealed == nil {
+		p.drPodHealed = map[string]time.Time{}
 	}
 	p.mu.Unlock()
 
@@ -1463,7 +1730,7 @@ func (p *clusterHealthProber) checkStatefulMasterlessServices(ctx context.Contex
 
 	seen := map[string]bool{}    // tuples observed at 0 ready this sweep
 	emitted := map[string]bool{} // tuples past the gauge window
-	var due []masterSvc          // past the heal window
+	var due []masterlessDue      // past the heal window
 	for _, c := range candidates {
 		key := c.ns + "/" + c.svc + "/" + c.sts.Name
 		if ready[c.ns+"/"+c.svc] > 0 {
@@ -1488,7 +1755,7 @@ func (p *clusterHealthProber) checkStatefulMasterlessServices(ctx context.Contex
 		metrics.StatefulServiceZeroEndpoints.
 			WithLabelValues(c.ns, c.svc, c.sts.Name).Set(1)
 		if now.Sub(first) >= masterlessHealMinAge {
-			due = append(due, c)
+			due = append(due, masterlessDue{svc: c, since: first})
 		}
 	}
 
@@ -1512,12 +1779,22 @@ func (p *clusterHealthProber) checkStatefulMasterlessServices(ctx context.Contex
 	p.mu.Unlock()
 
 	// Dragonfly auto-heal — a masterless dragonfly past the heal
-	// window bounces the operator leader to force re-election.
-	for _, c := range due {
-		if !dragonflyOwned(c.sts) {
+	// window bounces the operator leader to force re-election (step
+	// 1); past the deadlock window and >=3m after that bounce the
+	// dual-replica heal deletes the lowest-ordinal pod to restart
+	// the election from scratch (step 2, W7-C3). A non-dragonfly
+	// masterless STS gets per-pod role diagnostics instead — its
+	// election contract is operand-specific and a generic pod kill
+	// is not safe to automate.
+	for _, d := range due {
+		if !dragonflyOwned(d.svc.sts) {
+			p.logStatefulPodRoles(ctx, log, d.svc)
 			continue
 		}
-		p.healDragonflyOperator(ctx, log, c, now)
+		p.healDragonflyOperator(ctx, log, d.svc, now)
+		if now.Sub(d.since) >= dragonflyReplicaDeadlockMinAge {
+			p.healDragonflyReplicaDeadlock(ctx, log, d.svc, now)
+		}
 	}
 
 	if len(emitted) == 0 {
@@ -1624,6 +1901,262 @@ func (p *clusterHealthProber) healDragonflyOperator(ctx context.Context, log log
 		metrics.IncError(clusterHealthQueue)
 		log.Error(err, "persist dragonfly heal stamp failed",
 			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name)
+	}
+}
+
+// dragonflyOperatorHealedAt returns the most recent moment a
+// dragonfly-operator leader pod was deleted by step 1 — the wider
+// of the persisted node.ops/last-dragonfly-operator-heal stamp on
+// this STS and the in-RAM per-pod ledger (which survives an STS
+// patch failure). ok=false means no heal has landed yet: the
+// dual-replica heal must not skip ahead of step 1.
+func (p *clusterHealthProber) dragonflyOperatorHealedAt(sig masterSvc) (time.Time, bool) {
+	var latest time.Time
+	if ts := sig.sts.Annotations[dragonflyHealAnno]; ts != "" {
+		if t, err := time.Parse(time.RFC3339, ts); err == nil && t.After(latest) {
+			latest = t
+		}
+	}
+	p.mu.Lock()
+	for _, t := range p.drHealed {
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	p.mu.Unlock()
+	return latest, !latest.IsZero()
+}
+
+// podMasterRole reports whether the pod carries a master/primary/
+// leader value under any master-role label key — the positive form
+// of the dual-replica deadlock check (a pod already holding the
+// master role means the election produced a winner and a pod kill
+// would fight it).
+func podMasterRole(pod *corev1.Pod) bool {
+	for _, k := range masterlessRoleKeys {
+		if slices.Contains(masterlessRoleValues, pod.Labels[k]) {
+			return true
+		}
+	}
+	return false
+}
+
+// smallestOrdinalPod returns the pod with the lowest StatefulSet
+// ordinal — "<sts>-0" in the common case — or nil when none of the
+// pods match the "<sts>-<n>" naming. StatefulSet pod names are the
+// only source of truth for the ordinal (there is no field for it).
+func smallestOrdinalPod(pods []corev1.Pod, stsName string) *corev1.Pod {
+	var best *corev1.Pod
+	bestOrd := -1
+	for i := range pods {
+		name := pods[i].Name
+		if !strings.HasPrefix(name, stsName+"-") {
+			continue
+		}
+		ord, err := strconv.Atoi(name[len(stsName)+1:])
+		if err != nil {
+			continue
+		}
+		if bestOrd < 0 || ord < bestOrd {
+			bestOrd = ord
+			best = &pods[i]
+		}
+	}
+	return best
+}
+
+// logStatefulPodRoles dumps per-pod role-label diagnostics for a
+// masterless non-dragonfly StatefulSet — the W7-C3 pod-delete heal
+// is dragonfly-only (its election contract is operator-driven), so
+// for Percona/PostgreSQL/NATS the check leaves this evidence trail
+// for the on-call engineer instead of acting on it. Diagnostics
+// only: a list failure must not escalate into a run error.
+func (p *clusterHealthProber) logStatefulPodRoles(ctx context.Context, log logr.Logger, sig masterSvc) {
+	sel, err := metav1.LabelSelectorAsSelector(sig.sts.Spec.Selector)
+	if err != nil {
+		return
+	}
+	pods, err := p.cs.CoreV1().Pods(sig.sts.Namespace).List(ctx,
+		metav1.ListOptions{LabelSelector: sel.String()})
+	if err != nil {
+		return
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		roles := map[string]string{}
+		for _, k := range masterlessRoleKeys {
+			if v := pod.Labels[k]; v != "" {
+				roles[k] = v
+			}
+		}
+		log.Info("masterless service — pod role diagnostic",
+			"service", sig.ns+"/"+sig.svc,
+			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name,
+			"pod", pod.Name,
+			"ready", shared.PodReadyCond(pod),
+			"roles", fmt.Sprintf("%v", roles))
+	}
+}
+
+// healDragonflyReplicaDeadlock is the W7-C3 step-2 heal: the
+// dragonfly-operator leader was already bounced (step 1, W6.2) but
+// the masterless streak outlived it — the dual-replica deadlock
+// where every pod holds role=replica (each still executing
+// REPLICAOF <old-dead-ip>) and an operator restart alone cannot
+// re-elect. Deleting the lowest-ordinal pod forces the election
+// from scratch.
+//
+// Gates, in order:
+//  1. the operator heal must have actually landed >=
+//     dragonflyOperatorSettleMin ago — deleting a pod before the new
+//     leader had time to relabel reaps it pointlessly, and no heal
+//     record at all means step 1 never ran: keep waiting rather
+//     than skipping to pod kills;
+//  2. the deadlock itself: every STS pod Ready AND zero pods
+//     carrying a master-role label — an unready pod or an existing
+//     master means the wedge sits elsewhere and a pod kill helps
+//     nothing;
+//  3. the 30m cooldown (wider of in-RAM ledger and persisted STS
+//     stamp) and the maintenance mutex — the same shape every
+//     pod-delete heal in this package carries.
+func (p *clusterHealthProber) healDragonflyReplicaDeadlock(ctx context.Context, log logr.Logger,
+	sig masterSvc, now time.Time) {
+
+	stsKey := sig.sts.Namespace + "/" + sig.sts.Name
+
+	// Gate 1 — the operator heal must have settled first.
+	opHealedAt, healed := p.dragonflyOperatorHealedAt(sig)
+	switch {
+	case !healed:
+		log.Info("dual-replica deadlock: no operator heal recorded — waiting for step 1",
+			"statefulset", stsKey)
+		return
+	case now.Sub(opHealedAt) < dragonflyOperatorSettleMin:
+		log.Info("dual-replica deadlock: operator heal still settling — waiting",
+			"statefulset", stsKey,
+			"ago", now.Sub(opHealedAt).Truncate(time.Minute))
+		return
+	}
+
+	sel, err := metav1.LabelSelectorAsSelector(sig.sts.Spec.Selector)
+	if err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Info("WARN: statefulset selector unparseable — deadlock heal deferred",
+			"statefulset", stsKey, "error", err)
+		return
+	}
+	pods, err := p.cs.CoreV1().Pods(sig.sts.Namespace).List(ctx,
+		metav1.ListOptions{LabelSelector: sel.String()})
+	if err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Info("WARN: list statefulset pods failed — deadlock heal deferred",
+			"statefulset", stsKey, "error", err)
+		return
+	}
+
+	// Gate 2 — confirm the deadlock shape: all replicas Ready but
+	// nobody holds the master role.
+	if len(pods.Items) == 0 {
+		return // no pods — nothing safe to delete
+	}
+	allReady := true
+	hasMaster := false
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !shared.PodReadyCond(pod) {
+			allReady = false
+		}
+		if podMasterRole(pod) {
+			hasMaster = true
+		}
+	}
+	switch {
+	case !allReady:
+		log.Info("dual-replica deadlock not confirmed: unready pod — heal deferred",
+			"statefulset", stsKey)
+		return
+	case hasMaster:
+		// A pod already carries the master role — endpoints will
+		// follow; a pod kill now would fight a live re-election.
+		return
+	}
+
+	// Gate 3 — the 30m cooldown (wider of in-RAM + persisted), then
+	// the maintenance mutex.
+	p.mu.Lock()
+	last, ok := p.drPodHealed[stsKey]
+	p.mu.Unlock()
+	if ok && now.Sub(last) < dragonflyPodHealCooldown {
+		log.Info("skip heal: dragonfly pod inside cooldown",
+			"statefulset", stsKey, "ago", now.Sub(last).Truncate(time.Minute))
+		return
+	}
+	if ts := sig.sts.Annotations[dragonflyPodHealAnno]; ts != "" {
+		if t, err := time.Parse(time.RFC3339, ts); err == nil &&
+			now.Sub(t) < dragonflyPodHealCooldown {
+			log.Info("skip heal: persisted stamp inside cooldown",
+				"statefulset", stsKey,
+				"ago", now.Sub(t).Truncate(time.Minute))
+			return
+		}
+	}
+	// Maintenance mutex — never kill a stateful pod mid-drain/
+	// upgrade; "cannot verify" fails closed like every other caller.
+	held, why, err := shared.MaintenanceActive(ctx, p.cs, p.dyn)
+	if err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
+			"statefulset", stsKey, "error", err)
+		return
+	}
+	if held {
+		log.Info("maintenance in progress — heal deferred",
+			"statefulset", stsKey, "why", why)
+		return
+	}
+
+	target := smallestOrdinalPod(pods.Items, sig.sts.Name)
+	if target == nil {
+		return // no STS-named pod found — nothing safe to delete
+	}
+	// UID precondition closes the list→delete TOCTOU: a same-named
+	// replacement pod is not ours to reap.
+	uid := target.UID
+	if err := p.cs.CoreV1().Pods(target.Namespace).Delete(ctx, target.Name,
+		metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &uid},
+		}); err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Error(err, "dragonfly dual-replica pod delete failed",
+			"pod", target.Namespace+"/"+target.Name)
+		return
+	}
+	metrics.DragonflyMasterlessPodHealsTotal.
+		WithLabelValues(sig.sts.Namespace, sig.sts.Name).Inc()
+	p.mu.Lock()
+	p.drPodHealed[stsKey] = now
+	p.mu.Unlock()
+	log.Info("DELETE: dragonfly dual-replica deadlock — lowest-ordinal pod deleted to force master re-election",
+		"pod", target.Namespace+"/"+target.Name,
+		"statefulset", stsKey, "service", sig.ns+"/"+sig.svc)
+
+	// Persist the stamp on the STS — the durable half of the
+	// cooldown. A patch failure leaves the in-RAM half holding.
+	payload, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"annotations": map[string]any{
+			dragonflyPodHealAnno: now.UTC().Format(time.RFC3339),
+		}},
+	})
+	if err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Error(err, "marshal dragonfly pod heal stamp", "statefulset", stsKey)
+		return
+	}
+	if _, err := p.cs.AppsV1().StatefulSets(sig.sts.Namespace).Patch(ctx,
+		sig.sts.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Error(err, "persist dragonfly pod heal stamp failed",
+			"statefulset", stsKey)
 	}
 }
 
@@ -1818,4 +2351,717 @@ func (p *clusterHealthProber) checkRabbitMQSuspendedPods(ctx context.Context) pr
 	return probeResult{why: fmt.Sprintf(
 		"rabbitmq pods running suspended >=%s: %s",
 		rabbitSuspendedMinAge, strings.Join(names, ", "))}
+}
+
+// ---------------------------------------------------------------------------
+// localpv-stranded-pods (W7-C4) — local-PV dead-node diagnostics +
+// ephemeral-PVC rescue + provisioner watchdog.
+// ---------------------------------------------------------------------------
+
+// W7-C4 — localpv-stranded-pods knobs.
+const (
+	// localPVStrandedMinAge: a Pending pod must be this old before
+	// its bound PV's node gets audited — younger pods may still be
+	// pulling images or waiting on the scheduler, not stranded.
+	localPVStrandedMinAge = 5 * time.Minute
+	// localPVEphemeralHealMinAge: a stranded ephemeral pod must
+	// persist this long before the PVC+pod delete fires — longer
+	// than the gauge window so a flap cannot reap a volume.
+	localPVEphemeralHealMinAge   = 10 * time.Minute
+	localPVEphemeralHealCooldown = 30 * time.Minute
+	// localPVEphemeralAnno opts any workload into the disposable-
+	// volume heal — set on the pod or its PVC.
+	localPVEphemeralAnno = "node.ops/ephemeral-localpv"
+	// concourseWorkerNS/PodPrefix name the workload whose local
+	// workdir is disposable by design — losing it on a dead node is
+	// the exact rescue the concourse janitor already performs while
+	// the node lives.
+	concourseWorkerNS        = "concourse"
+	concourseWorkerPodPrefix = "concourse-worker"
+	// pvcStalledMinAge is the pending window for the provisioner
+	// watchdog: a PVC pending this long on the hostpath class while
+	// Ready workers exist means the provisioner wedged.
+	pvcStalledMinAge           = 15 * time.Minute
+	pvcProvisionerHealCooldown = time.Hour
+	openebsHostpathSC          = "openebs-hostpath"
+	openebsProvisionerNS       = "openebs"
+	openebsProvisionerPrefix   = "openebs-localpv-provisioner"
+	openebsProvisionerName     = "openebs-localpv-provisioner"
+	// Stranded-reason gauge label values.
+	strandedReasonMissingNode  = "missing_node"
+	strandedReasonOutOfService = "out_of_service"
+	strandedReasonNotReady     = "not_ready"
+	strandedReasonCordoned     = "cordoned"
+)
+
+// strandedHeal is one pod+PVC pair eligible for the ephemeral-volume
+// rescue — carried out of the pod scan so the maintenance mutex is
+// evaluated once per sweep.
+type strandedHeal struct {
+	pod    *corev1.Pod
+	pvc    *corev1.PersistentVolumeClaim
+	node   string
+	reason string
+}
+
+// localPVNodeNames extracts the hostnames a PV's required
+// nodeAffinity pins it to — the local volume can only ever exist on
+// those nodes.
+func localPVNodeNames(pv *corev1.PersistentVolume) []string {
+	na := pv.Spec.NodeAffinity
+	if na == nil || na.Required == nil {
+		return nil
+	}
+	var out []string
+	for _, term := range na.Required.NodeSelectorTerms {
+		for _, expr := range term.MatchExpressions {
+			if expr.Key != corev1.LabelHostname ||
+				expr.Operator != corev1.NodeSelectorOpIn {
+				continue
+			}
+			out = append(out, expr.Values...)
+		}
+	}
+	return out
+}
+
+// strandedNodeReason classifies a PV-pinned node that can never host
+// the pod again — "" when the node is fine (the pod pends for some
+// other reason: CPU, scheduling, image).
+func strandedNodeReason(nodes map[string]*corev1.Node, name string) string {
+	n := nodes[name]
+	if n == nil {
+		return strandedReasonMissingNode
+	}
+	if shared.HasTaint(n.Spec.Taints, corev1.TaintNodeOutOfService) {
+		return strandedReasonOutOfService
+	}
+	if !shared.NodeReady(n) {
+		return strandedReasonNotReady
+	}
+	if n.Spec.Unschedulable {
+		return strandedReasonCordoned
+	}
+	return ""
+}
+
+// ephemeralLocalPV reports whether the workload's local volume is
+// disposable: concourse-worker workdirs (rebuilt by the init
+// container on the new node) or anything explicitly annotated
+// node.ops/ephemeral-localpv on the pod or the PVC.
+func ephemeralLocalPV(pod *corev1.Pod, pvc *corev1.PersistentVolumeClaim) bool {
+	if pod.Namespace == concourseWorkerNS &&
+		strings.HasPrefix(pod.Name, concourseWorkerPodPrefix) {
+		return true
+	}
+	return pod.Annotations[localPVEphemeralAnno] == "true" ||
+		pvc.Annotations[localPVEphemeralAnno] == "true"
+}
+
+// checkLocalPVStrandedPods covers the two local-PV failure shapes
+// that leave workloads Pending forever with no signal:
+//
+//	a) STRANDED — a Pending pod's bound PVC points at a PV whose
+//	   nodeAffinity pins it to a node that is missing, out-of-
+//	   service, NotReady or cordoned. The volume can never follow
+//	   the pod to a new node, so the pod pends forever. Every such
+//	   pod emits localpv_stranded_pods=1 — and for workloads whose
+//	   volume is disposable (concourse-worker, or pod/PVC annotated
+//	   node.ops/ephemeral-localpv) stranded on a confirmed-gone
+//	   node (missing or out-of-service) the heal deletes PVC+pod so
+//	   the StatefulSet rebinds on a live node while the Released PV
+//	   gets swept by the node-host-agent. Database volumes are
+//	   NEVER touched — alerting only.
+//	b) STALLED — a Pending pod waits on a Pending openebs-hostpath
+//	   PVC while Ready+schedulable workers exist: the localpv
+//	   provisioner wedged. pvc_provisioning_stalled=1 fires and —
+//	   outside maintenance, past the 1h cooldown — the provisioner
+//	   pod is deleted to force a resync.
+func (p *clusterHealthProber) checkLocalPVStrandedPods(ctx context.Context) probeResult {
+	log := logf.FromContext(ctx)
+	now := p.now()
+	p.mu.Lock()
+	if p.localPVEmitted == nil {
+		p.localPVEmitted = map[string]bool{}
+	}
+	if p.pvcStalledEmitted == nil {
+		p.pvcStalledEmitted = map[string]bool{}
+	}
+	if p.localPVHealed == nil {
+		p.localPVHealed = map[string]time.Time{}
+	}
+	if p.pvcProvHealed == nil {
+		p.pvcProvHealed = map[string]time.Time{}
+	}
+	p.mu.Unlock()
+
+	nodes, err := shared.ListNodes(ctx, p.cs)
+	if err != nil {
+		return probeResult{infra: fmt.Errorf("list nodes: %w", err)}
+	}
+	nodesByName := make(map[string]*corev1.Node, len(nodes))
+	hasSchedulableWorker := false
+	for i := range nodes {
+		nodesByName[nodes[i].Name] = &nodes[i]
+		if shared.NodeReady(&nodes[i]) && !nodes[i].Spec.Unschedulable &&
+			!shared.IsControlPlane(&nodes[i]) {
+			hasSchedulableWorker = true
+		}
+	}
+
+	// Paged cluster-wide reads — the same full-truth posture as the
+	// masterless EndpointSlice census: a partial read cannot tell
+	// "stranded" from "no data", so a list error aborts the check.
+	pvsByName := map[string]*corev1.PersistentVolume{}
+	pvOpts := metav1.ListOptions{Limit: healthListPageSize}
+	for {
+		page, err := p.cs.CoreV1().PersistentVolumes().List(ctx, pvOpts)
+		if err != nil {
+			return probeResult{infra: fmt.Errorf("list persistentvolumes: %w", err)}
+		}
+		for i := range page.Items {
+			pvsByName[page.Items[i].Name] = &page.Items[i]
+		}
+		if page.Continue == "" {
+			break
+		}
+		pvOpts.Continue = page.Continue
+	}
+	pvcsByKey := map[string]*corev1.PersistentVolumeClaim{}
+	pvcOpts := metav1.ListOptions{Limit: healthListPageSize}
+	for {
+		page, err := p.cs.CoreV1().PersistentVolumeClaims(metav1.NamespaceAll).
+			List(ctx, pvcOpts)
+		if err != nil {
+			return probeResult{infra: fmt.Errorf("list persistentvolumeclaims: %w", err)}
+		}
+		for i := range page.Items {
+			pvcsByKey[page.Items[i].Namespace+"/"+page.Items[i].Name] = &page.Items[i]
+		}
+		if page.Continue == "" {
+			break
+		}
+		pvcOpts.Continue = page.Continue
+	}
+
+	emitted := map[string]bool{} // "ns/pod/pvc/node/reason" this sweep
+	stalled := map[string]bool{} // "ns/pvc/storageclass" this sweep
+	var heals []strandedHeal
+
+	podOpts := metav1.ListOptions{
+		FieldSelector: "status.phase=Pending",
+		Limit:         healthListPageSize,
+	}
+	for {
+		page, err := p.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, podOpts)
+		if err != nil {
+			return probeResult{infra: fmt.Errorf("list pods: %w", err)}
+		}
+		for i := range page.Items {
+			pod := &page.Items[i]
+			if pod.Status.Phase != corev1.PodPending {
+				continue // mirrors the FieldSelector for fake clients
+			}
+			age := now.Sub(pod.CreationTimestamp.Time)
+			if age < localPVStrandedMinAge {
+				continue
+			}
+			for _, vol := range pod.Spec.Volumes {
+				claim := vol.PersistentVolumeClaim
+				if claim == nil {
+					continue
+				}
+				pvc := pvcsByKey[pod.Namespace+"/"+claim.ClaimName]
+				if pvc == nil {
+					continue
+				}
+				// Branch A — bound local PV on an unavailable node.
+				if pvc.Status.Phase == corev1.ClaimBound &&
+					pvc.Spec.VolumeName != "" {
+					if pv := pvsByName[pvc.Spec.VolumeName]; pv != nil {
+						for _, node := range localPVNodeNames(pv) {
+							reason := strandedNodeReason(nodesByName, node)
+							if reason == "" {
+								continue
+							}
+							key := pod.Namespace + "/" + pod.Name + "/" +
+								pvc.Name + "/" + node + "/" + reason
+							emitted[key] = true
+							metrics.LocalPVStrandedPods.WithLabelValues(
+								pod.Namespace, pod.Name, pvc.Name, node, reason).Set(1)
+							// Confirmed-gone nodes only: NotReady/
+							// cordoned can come back — a missing or
+							// fenced (out-of-service) node cannot.
+							if ephemeralLocalPV(pod, pvc) &&
+								(reason == strandedReasonMissingNode ||
+									reason == strandedReasonOutOfService) &&
+								age >= localPVEphemeralHealMinAge {
+								heals = append(heals, strandedHeal{
+									pod: pod, pvc: pvc, node: node, reason: reason})
+							}
+						}
+					}
+				}
+				// Branch B — claim still Pending on the hostpath
+				// provisioner while schedulable workers exist.
+				if pvc.Status.Phase == corev1.ClaimPending &&
+					hasSchedulableWorker &&
+					pvc.Spec.StorageClassName != nil &&
+					*pvc.Spec.StorageClassName == openebsHostpathSC &&
+					age >= pvcStalledMinAge {
+					key := pod.Namespace + "/" + pvc.Name + "/" + openebsHostpathSC
+					stalled[key] = true
+					metrics.PVCProvisioningStalled.WithLabelValues(
+						pod.Namespace, pvc.Name, openebsHostpathSC).Set(1)
+				}
+			}
+		}
+		if page.Continue == "" {
+			break
+		}
+		podOpts.Continue = page.Continue
+	}
+
+	// Prune the gauges' series for tuples not re-seen — same
+	// DeleteLabelValues hygiene as stsZeroEmitted.
+	p.mu.Lock()
+	for k := range p.localPVEmitted {
+		if emitted[k] {
+			continue
+		}
+		if parts := strings.SplitN(k, "/", 5); len(parts) == 5 {
+			metrics.LocalPVStrandedPods.DeleteLabelValues(
+				parts[0], parts[1], parts[2], parts[3], parts[4])
+		}
+		delete(p.localPVEmitted, k)
+	}
+	maps.Copy(p.localPVEmitted, emitted)
+	for k := range p.pvcStalledEmitted {
+		if stalled[k] {
+			continue
+		}
+		if parts := strings.SplitN(k, "/", 3); len(parts) == 3 {
+			metrics.PVCProvisioningStalled.DeleteLabelValues(
+				parts[0], parts[1], parts[2])
+		}
+		delete(p.pvcStalledEmitted, k)
+	}
+	maps.Copy(p.pvcStalledEmitted, stalled)
+	p.mu.Unlock()
+
+	// The maintenance mutex is evaluated once per sweep and only
+	// when there is something to delete — pod/PVC kills during a
+	// drain are exactly what it exists to prevent; "cannot verify"
+	// fails closed.
+	var maintHeld bool
+	var maintWhy string
+	var maintErr error
+	if len(heals) > 0 || len(stalled) > 0 {
+		maintHeld, maintWhy, maintErr = shared.MaintenanceActive(ctx, p.cs, p.dyn)
+		if maintErr != nil {
+			metrics.IncError(clusterHealthQueue)
+			log.Info("WARN: maintenance check unverifiable — localpv heals deferred (fail closed)",
+				"error", maintErr)
+		}
+	}
+	for i := range heals {
+		h := &heals[i]
+		pvcKey := h.pvc.Namespace + "/" + h.pvc.Name
+		if maintErr != nil || maintHeld {
+			log.Info("maintenance gate — stranded ephemeral pvc kept",
+				"pvc", pvcKey, "why", maintWhy)
+			continue
+		}
+		p.mu.Lock()
+		last, ok := p.localPVHealed[pvcKey]
+		p.mu.Unlock()
+		if ok && now.Sub(last) < localPVEphemeralHealCooldown {
+			log.Info("skip heal: ephemeral localpv inside cooldown",
+				"pvc", pvcKey, "ago", now.Sub(last).Truncate(time.Minute))
+			continue
+		}
+		// PVC first, then the pod — the claim release flips the PV
+		// to Released so the node-host-agent sweeps it, and the pod
+		// delete lets the StatefulSet rebind onto a live node. UID
+		// preconditions close the list→delete TOCTOU on both.
+		pvcUID := h.pvc.UID
+		pvcErr := p.cs.CoreV1().PersistentVolumeClaims(h.pvc.Namespace).
+			Delete(ctx, h.pvc.Name, metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &pvcUID},
+			})
+		switch {
+		case pvcErr == nil || apierrors.IsNotFound(pvcErr):
+			// NotFound: the claim vanished between list and heal —
+			// the release half is already done, still free the pod.
+		case apierrors.IsForbidden(pvcErr):
+			// RBAC-denied is permanent (PVC delete is only granted
+			// via the concourse Role — an ephemeral-localpv opt-in
+			// elsewhere can never succeed). Stamp the cooldown so
+			// the check doesn't error-loop every sweep, keep the
+			// pod, and surface once.
+			metrics.IncError(clusterHealthQueue)
+			log.Error(pvcErr, "ephemeral localpv pvc delete forbidden — RBAC scope blocks the heal; stamping cooldown",
+				"pvc", pvcKey)
+			p.mu.Lock()
+			p.localPVHealed[pvcKey] = now
+			p.mu.Unlock()
+			continue
+		default:
+			metrics.IncError(clusterHealthQueue)
+			log.Error(pvcErr, "ephemeral localpv pvc delete failed", "pvc", pvcKey)
+			continue
+		}
+		podUID := h.pod.UID
+		if err := p.cs.CoreV1().Pods(h.pod.Namespace).Delete(ctx, h.pod.Name,
+			metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &podUID},
+			}); err != nil && !apierrors.IsNotFound(err) {
+			metrics.IncError(clusterHealthQueue)
+			log.Error(err, "stranded pod delete failed",
+				"pod", h.pod.Namespace+"/"+h.pod.Name)
+			continue
+		}
+		p.mu.Lock()
+		p.localPVHealed[pvcKey] = now
+		p.mu.Unlock()
+		metrics.LocalPVEphemeralHealsTotal.
+			WithLabelValues(h.pvc.Namespace, h.pvc.Name, h.node).Inc()
+		log.Info("DELETE: ephemeral localpv pvc+pod stranded on a confirmed-dead node — StatefulSet rebinds on a live node",
+			"pvc", pvcKey, "pod", h.pod.Namespace+"/"+h.pod.Name,
+			"node", h.node, "reason", h.reason)
+	}
+	if len(stalled) > 0 && maintErr == nil && !maintHeld {
+		p.healLocalPVProvisioner(ctx, log, now)
+	}
+
+	if len(emitted) == 0 && len(stalled) == 0 {
+		return probeResult{pass: true}
+	}
+	keys := make([]string, 0, len(emitted)+len(stalled))
+	for k := range emitted {
+		keys = append(keys, k)
+	}
+	for k := range stalled {
+		keys = append(keys, "stalled:"+k)
+	}
+	sort.Strings(keys)
+	return probeResult{why: fmt.Sprintf(
+		"localpv-stranded/stalled volumes: %s", strings.Join(keys, ", "))}
+}
+
+// healLocalPVProvisioner deletes the openebs-localpv-provisioner
+// pod(s) — the same re-sync nudge every operator heal here applies.
+// Pending hostpath claims while Ready workers exist mean the
+// provisioner missed a watch event; a restart makes it re-list and
+// provision. 1h cooldown (in-RAM — the pod itself is the heal
+// target, nothing else can carry the stamp).
+func (p *clusterHealthProber) healLocalPVProvisioner(ctx context.Context,
+	log logr.Logger, now time.Time) {
+
+	p.mu.Lock()
+	last, ok := p.pvcProvHealed[openebsProvisionerName]
+	p.mu.Unlock()
+	if ok && now.Sub(last) < pvcProvisionerHealCooldown {
+		log.Info("skip heal: localpv provisioner inside cooldown",
+			"ago", now.Sub(last).Truncate(time.Minute))
+		return
+	}
+	pods, err := p.cs.CoreV1().Pods(openebsProvisionerNS).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Info("WARN: list provisioner pods failed — heal deferred",
+			"error", err)
+		return
+	}
+	deleted := false
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !strings.HasPrefix(pod.Name, openebsProvisionerPrefix) {
+			continue
+		}
+		uid := pod.UID
+		if err := p.cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
+			metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &uid},
+			}); err != nil {
+			metrics.IncError(clusterHealthQueue)
+			log.Error(err, "localpv provisioner delete failed",
+				"pod", pod.Namespace+"/"+pod.Name)
+			continue
+		}
+		deleted = true
+		log.Info("DELETE: wedged localpv provisioner — stalled claims need a resync",
+			"pod", pod.Namespace+"/"+pod.Name)
+	}
+	if !deleted {
+		return
+	}
+	p.mu.Lock()
+	p.pvcProvHealed[openebsProvisionerName] = now
+	p.mu.Unlock()
+	metrics.PVCProvisionerHealsTotal.
+		WithLabelValues(openebsProvisionerName).Inc()
+}
+
+// ---------------------------------------------------------------------------
+// olm-subscription-health (W7-C5) — OLM CSV / webhook cert /
+// subscription guard + olm-operator auto-heal.
+// ---------------------------------------------------------------------------
+
+// W7-C5 — olm-subscription-health knobs.
+const (
+	// olmUnhealthyMinAge: an unhealthy CSV/Subscription signature
+	// must persist this long before the gauge fires — CSVs
+	// legitimately sit in Installing/Replacing during upgrades.
+	olmUnhealthyMinAge = 15 * time.Minute
+	// olmHealMinAge: a CSV stuck or overdue on webhook cert
+	// rotation this long triggers the olm-operator pod delete.
+	olmHealMinAge   = 20 * time.Minute
+	olmHealCooldown = time.Hour
+	// olmOperatorNS/PodPrefix locate the operator pods the heal
+	// deletes to force CSV/webhook-cert reconciliation.
+	olmOperatorNS        = "olm"
+	olmOperatorPodPrefix = "olm-operator"
+	// OLM kind label values for the gauge.
+	olmKindCSV          = "ClusterServiceVersion"
+	olmKindSubscription = "Subscription"
+	// Unhealthy-reason gauge label values.
+	olmReasonCSVStuck         = "csv_not_succeeded"
+	olmReasonCertOverdue      = "cert_rotation_overdue"
+	olmReasonCatalogUnhealthy = "catalog_sources_unhealthy"
+	olmReasonResolutionFailed = "resolution_failed"
+)
+
+// OLM GVRs — dynamic-client reads, skipped gracefully when the CRDs
+// are not installed on a cluster.
+var (
+	olmCSVGVR = schema.GroupVersionResource{
+		Group: "operators.coreos.com", Version: "v1alpha1",
+		Resource: "clusterserviceversions"}
+	olmSubGVR = schema.GroupVersionResource{
+		Group: "operators.coreos.com", Version: "v1alpha1",
+		Resource: "subscriptions"}
+)
+
+// checkOLMHealth audits the OLM control plane's two user-visible
+// surfaces — ClusterServiceVersions and Subscriptions. Unlike
+// cert-manager operators, OLM manages and rotates its operands'
+// webhook TLS itself via the CSV, so a wedged olm-operator silently
+// expires every admission webhook it owns (the NHC/SNR paralysis
+// scenario: the remediation operator's webhook dies exactly when a
+// node needs fencing):
+//
+//   - CSV status.phase != "Succeeded" — an install wedged mid-flight;
+//   - CSV status.certsRotateAt in the past — the webhook cert
+//     rotation OLM owes the operand never landed;
+//   - Subscription conditions CatalogSourcesUnhealthy=True /
+//     ResolutionFailed=True — a subscription that can no longer
+//     resolve its package.
+//
+// A signature must persist olmUnhealthyMinAge before
+// olm_unhealthy_resources=1 fires; a CSV stuck or cert-overdue past
+// olmHealMinAge additionally deletes the olm-operator pod (outside
+// maintenance, 1h cooldown) to force the missed reconciliation.
+func (p *clusterHealthProber) checkOLMHealth(ctx context.Context) probeResult {
+	log := logf.FromContext(ctx)
+	// The CR scans and the maintenance mutex both need dyn — a
+	// missing client is a wiring bug, not "no signal".
+	if p.dyn == nil {
+		return probeResult{infra: fmt.Errorf(
+			"no dynamic client — olm health check unverifiable")}
+	}
+	now := p.now()
+	p.mu.Lock()
+	if p.olmFirstSeen == nil {
+		p.olmFirstSeen = map[string]time.Time{}
+	}
+	if p.olmEmitted == nil {
+		p.olmEmitted = map[string]bool{}
+	}
+	if p.olmHealed == nil {
+		p.olmHealed = map[string]time.Time{}
+	}
+	p.mu.Unlock()
+
+	// live signatures keyed "kind/ns/name/reason".
+	live := map[string]bool{}
+	csvs, err := p.dyn.Resource(olmCSVGVR).List(ctx, metav1.ListOptions{})
+	switch {
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		// OLM not installed on this cluster — nothing to audit.
+	case err != nil:
+		return probeResult{infra: fmt.Errorf("list clusterserviceversions: %w", err)}
+	default:
+		for i := range csvs.Items {
+			csv := &csvs.Items[i]
+			obj := olmKindCSV + "/" + csv.GetNamespace() + "/" + csv.GetName()
+			phase, _, _ := unstructured.NestedString(csv.Object, "status", "phase")
+			if phase != "Succeeded" {
+				live[obj+"/"+olmReasonCSVStuck] = true
+			}
+			if ts, found, _ := unstructured.NestedString(
+				csv.Object, "status", "certsRotateAt"); found && ts != "" {
+				if t, err := time.Parse(time.RFC3339, ts); err == nil && now.After(t) {
+					live[obj+"/"+olmReasonCertOverdue] = true
+				}
+			}
+		}
+	}
+	subs, err := p.dyn.Resource(olmSubGVR).List(ctx, metav1.ListOptions{})
+	switch {
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case err != nil:
+		return probeResult{infra: fmt.Errorf("list subscriptions: %w", err)}
+	default:
+		for i := range subs.Items {
+			sub := &subs.Items[i]
+			obj := olmKindSubscription + "/" +
+				sub.GetNamespace() + "/" + sub.GetName()
+			for _, c := range shared.ReadyConds(sub) {
+				ctype, _ := c["type"].(string)
+				cstatus, _ := c["status"].(string)
+				if cstatus != "True" {
+					continue
+				}
+				switch ctype {
+				case "CatalogSourcesUnhealthy":
+					live[obj+"/"+olmReasonCatalogUnhealthy] = true
+				case "ResolutionFailed":
+					live[obj+"/"+olmReasonResolutionFailed] = true
+				}
+			}
+		}
+	}
+
+	emitted := map[string]bool{}     // keys past the gauge window
+	healReasons := map[string]bool{} // reasons past the heal window (CSV only)
+	p.mu.Lock()
+	for k := range p.olmFirstSeen {
+		if !live[k] {
+			delete(p.olmFirstSeen, k)
+		}
+	}
+	for k := range live {
+		first, ok := p.olmFirstSeen[k]
+		if !ok {
+			p.olmFirstSeen[k] = now
+			log.Info("olm unhealthy signature — tracking first-seen",
+				"signature", k)
+			continue
+		}
+		if now.Sub(first) < olmUnhealthyMinAge {
+			continue
+		}
+		emitted[k] = true
+		parts := strings.SplitN(k, "/", 4)
+		metrics.OLMUnhealthyResources.
+			WithLabelValues(parts[0], parts[1], parts[2], parts[3]).Set(1)
+		// The heal is CSV-scoped: a subscription failure is the
+		// catalog's problem, not olm-operator's queue.
+		if parts[0] == olmKindCSV && now.Sub(first) >= olmHealMinAge {
+			healReasons[parts[3]] = true
+		}
+	}
+	for k := range p.olmEmitted {
+		if emitted[k] {
+			continue
+		}
+		if parts := strings.SplitN(k, "/", 4); len(parts) == 4 {
+			metrics.OLMUnhealthyResources.DeleteLabelValues(
+				parts[0], parts[1], parts[2], parts[3])
+		}
+		delete(p.olmEmitted, k)
+	}
+	maps.Copy(p.olmEmitted, emitted)
+	p.mu.Unlock()
+
+	if len(healReasons) > 0 {
+		reasons := make([]string, 0, len(healReasons))
+		for r := range healReasons {
+			reasons = append(reasons, r)
+		}
+		sort.Strings(reasons)
+		p.healOLMOperator(ctx, log, reasons, now)
+	}
+
+	if len(emitted) == 0 {
+		return probeResult{pass: true}
+	}
+	keys := make([]string, 0, len(emitted))
+	for k := range emitted {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return probeResult{why: fmt.Sprintf(
+		"olm resources unhealthy >=%s: %s",
+		olmUnhealthyMinAge, strings.Join(keys, ", "))}
+}
+
+// healOLMOperator deletes the olm-operator pod(s) — a wedged
+// operator stops reconciling CSVs and stops rotating the webhook
+// certificates it owns, so a restart forces both queues to re-list.
+// Gates: the 1h in-RAM cooldown (the pod is the heal target —
+// nothing else can carry the stamp) and the maintenance mutex, same
+// shape as every pod-delete heal in this package.
+func (p *clusterHealthProber) healOLMOperator(ctx context.Context,
+	log logr.Logger, reasons []string, now time.Time) {
+
+	p.mu.Lock()
+	last, ok := p.olmHealed[olmOperatorPodPrefix]
+	p.mu.Unlock()
+	if ok && now.Sub(last) < olmHealCooldown {
+		log.Info("skip heal: olm-operator inside cooldown",
+			"ago", now.Sub(last).Truncate(time.Minute))
+		return
+	}
+	held, why, err := shared.MaintenanceActive(ctx, p.cs, p.dyn)
+	if err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
+			"error", err)
+		return
+	}
+	if held {
+		log.Info("maintenance in progress — heal deferred", "why", why)
+		return
+	}
+	pods, err := p.cs.CoreV1().Pods(olmOperatorNS).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Info("WARN: list olm-operator pods failed — heal deferred",
+			"error", err)
+		return
+	}
+	deleted := false
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !strings.HasPrefix(pod.Name, olmOperatorPodPrefix) {
+			continue
+		}
+		uid := pod.UID
+		if err := p.cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
+			metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &uid},
+			}); err != nil {
+			metrics.IncError(clusterHealthQueue)
+			log.Error(err, "olm-operator delete failed",
+				"pod", pod.Namespace+"/"+pod.Name)
+			continue
+		}
+		deleted = true
+		log.Info("DELETE: wedged olm-operator — stuck CSV/cert-rotation queues need a resync",
+			"pod", pod.Namespace+"/"+pod.Name,
+			"reasons", strings.Join(reasons, ","))
+	}
+	if !deleted {
+		return
+	}
+	p.mu.Lock()
+	p.olmHealed[olmOperatorPodPrefix] = now
+	p.mu.Unlock()
+	for _, r := range reasons {
+		metrics.OLMOperatorHealsTotal.WithLabelValues(r).Inc()
+	}
 }

@@ -31,7 +31,9 @@ import (
 // ---------------------------------------------------------------------------
 
 // shOpDyn registers every GVR the self-healing checks scan — the fake
-// dynamic client needs an explicit GVR→ListKind map for each.
+// dynamic client PANICS on an unregistered GVR List, so every watched
+// operator resource (W5.8 original five + the ten W7-C2 additions)
+// plus the OLM/autopilot reads must be mapped.
 func shOpDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	return testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
 		gwv1("gateways"):   "GatewayList",
@@ -41,6 +43,29 @@ func shOpDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 		{Group: "dragonflydb.io", Version: "v1alpha1", Resource: "dragonflies"}:           "DragonflyList",
 		{Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"}:        "HelmReleaseList",
 		{Group: "kustomize.toolkit.fluxcd.io", Version: "v1", Resource: "kustomizations"}: "KustomizationList",
+		// W7-C2 — the ten additional watched operators' CRDs.
+		{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "gitrepositories"}:      "GitRepositoryList",
+		{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmrepositories"}:     "HelmRepositoryList",
+		{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmcharts"}:           "HelmChartList",
+		{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "ocirepositories"}:      "OCIRepositoryList",
+		{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "buckets"}:              "BucketList",
+		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "alerts"}:    "AlertList",
+		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "providers"}: "ProviderList",
+		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "receivers"}: "ReceiverList",
+		{Group: "cert-manager.io", Version: "v1", Resource: "certificates"}:                  "CertificateList",
+		{Group: "external-secrets.io", Version: "v1", Resource: "externalsecrets"}:           "ExternalSecretList",
+		{Group: "external-secrets.io", Version: "v1beta1", Resource: "externalsecrets"}:      "ExternalSecretList",
+		{Group: "rabbitmq.com", Version: "v1beta1", Resource: "rabbitmqclusters"}:            "RabbitmqClusterList",
+		{Group: "keda.sh", Version: "v1alpha1", Resource: "scaledobjects"}:                   "ScaledObjectList",
+		{Group: "argoproj.io", Version: "v1beta1", Resource: "argocds"}:                      "ArgoCDList",
+		{Group: "kargo.akuity.io", Version: "v1alpha1", Resource: "stages"}:                  "StageList",
+		{Group: "kargo.akuity.io", Version: "v1alpha1", Resource: "warehouses"}:              "WarehouseList",
+		{Group: "everest.percona.com", Version: "v1alpha1", Resource: "databaseclusters"}:    "DatabaseClusterList",
+		{Group: "shipwright.io", Version: "v1beta1", Resource: "builds"}:                     "BuildList",
+		// W7-C5 — OLM reads.
+		olmCSVGVR: "ClusterServiceVersionList",
+		olmSubGVR: "SubscriptionList",
+		// Maintenance mutex read.
 		shared.AutopilotPlanGVR: "PlanList",
 	}, objs...)
 }

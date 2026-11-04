@@ -475,7 +475,7 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 		"pdb-deadlock-watchdog":   func() error { return pdbdeadlockwatchdog.Setup(mgr, cs, mc.pdbWatchdogEnabled) },
 
 		// apiserver integrity guards.
-		"admission-webhook-guard":  func() error { return webhookguard.Setup(mgr, cs) },
+		"admission-webhook-guard":  func() error { return webhookguard.Setup(mgr, cs, dyn) },
 		"apiserver-endpoint-guard": func() error { return apiserverendpointguard.Setup(mgr, cs) },
 		"apiservice-guard": func() error {
 			return apiserviceguard.Setup(mgr, cs, dyn, mc.apiServiceGuardEnabled)

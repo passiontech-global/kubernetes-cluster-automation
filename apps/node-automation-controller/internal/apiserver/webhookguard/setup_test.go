@@ -16,7 +16,7 @@ import (
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset()); err != nil {
+	if err := Setup(m, fake.NewSimpleClientset(), nil); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "admission-webhook-guard", 5*time.Minute)

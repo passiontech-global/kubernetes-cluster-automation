@@ -32,6 +32,13 @@
 //     Secret in namespace linkerd carrying ca.crt/crt.pem (Opaque
 //     included, e.g. linkerd-identity-issuer) get days-to-expiry of
 //     the earliest cert in the bundle.
+//  5. kubernetes-replicator sync drift (W7-C6) — every TLS Secret
+//     carrying replicator.v1.mittwald.de/replicated-from has its
+//     tls.crt compared against the source Secret's. A mismatch that
+//     persists across >= 2 consecutive scans flags
+//     replicated_secret_drift=1 (the replicator missed a watch
+//     event or the copy was hand-edited); a single-scan mismatch is
+//     ignored because it catches the replicator mid-sync.
 //
 // Series lifecycle: both gauges keep a seen-set — secrets deleted and
 // webhook entries/annotations removed since the last sweep get their
@@ -74,6 +81,14 @@ const (
 	// certDriftListPage caps each cluster-wide List response — the
 	// all-namespaces TLS-secret read is unbounded.
 	certDriftListPage = 500
+	// replicatedFromAnno carries "src-namespace/src-name" — the
+	// kubernetes-replicator annotation marking a replicated copy
+	// (W7-C6).
+	replicatedFromAnno = "replicator.v1.mittwald.de/replicated-from"
+	// replicationDriftScans is how many consecutive sweeps a tls.crt
+	// mismatch must persist before the drift gauge fires — a
+	// single-scan diff just catches the replicator mid-sync.
+	replicationDriftScans = 2
 )
 
 // certificateGVR resolves a Certificate's spec.secretName — the only
@@ -86,6 +101,20 @@ var certificateGVR = schema.GroupVersionResource{
 // prune-sweep trivially exact (no string splitting on re-emit).
 type webhookMetricKey struct{ kind, name, webhook string }
 type secretMetricKey struct{ namespace, name string }
+
+// replicationMetricKey is the exact label tuple of the
+// ReplicatedSecretDrift gauge — source is the verbatim
+// "src-ns/src-name" annotation value (a slash inside a label VALUE
+// is unambiguous).
+type replicationMetricKey struct{ namespace, name, source string }
+
+// replicatedSecretRef is one replicated TLS Secret discovered in the
+// sweep — the destination identity plus its raw tls.crt for the
+// source comparison.
+type replicatedSecretRef struct {
+	namespace, name, source string
+	dest                    []byte
+}
 
 // webhookEntry flattens the two webhook entry types (MutatingWebhook /
 // ValidatingWebhook share WebhookClientConfig) down to the fields this
@@ -119,6 +148,15 @@ type certDriftAuditor struct {
 	// caBundle days-to-expiry and linkerd trust-bundle gauges.
 	seenWebhookExpiry map[webhookMetricKey]bool
 	seenTrustBundles  map[secretMetricKey]bool
+	// replicationMismatch counts consecutive scans where a
+	// replicated secret's tls.crt differed from its source — drift
+	// fires only at replicationDriftScans, so a replicator mid-sync
+	// never raises a false alert (W7-C6).
+	replicationMismatch map[replicationMetricKey]int
+	// seenReplication: series ledger for ReplicatedSecretDrift —
+	// re-synced or gone replicas get DeleteLabelValues, never a
+	// parked 1.
+	seenReplication map[replicationMetricKey]bool
 }
 
 // Setup registers the 15m sweep — or nothing when the
@@ -131,13 +169,15 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
 		return nil
 	}
 	a := &certDriftAuditor{
-		cs:                cs,
-		dyn:               dyn,
-		nowFn:             time.Now,
-		seenWebhooks:      map[webhookMetricKey]bool{},
-		seenSecrets:       map[secretMetricKey]bool{},
-		seenWebhookExpiry: map[webhookMetricKey]bool{},
-		seenTrustBundles:  map[secretMetricKey]bool{},
+		cs:                  cs,
+		dyn:                 dyn,
+		nowFn:               time.Now,
+		seenWebhooks:        map[webhookMetricKey]bool{},
+		seenSecrets:         map[secretMetricKey]bool{},
+		seenWebhookExpiry:   map[webhookMetricKey]bool{},
+		seenTrustBundles:    map[secretMetricKey]bool{},
+		replicationMismatch: map[replicationMetricKey]int{},
+		seenReplication:     map[replicationMetricKey]bool{},
 	}
 	return shared.AddPeriodic(mgr, certDriftQueue, 15*time.Minute, a.run)
 }
@@ -160,6 +200,12 @@ func (a *certDriftAuditor) run(ctx context.Context) error {
 	}
 	if a.seenTrustBundles == nil {
 		a.seenTrustBundles = map[secretMetricKey]bool{}
+	}
+	if a.replicationMismatch == nil {
+		a.replicationMismatch = map[replicationMetricKey]int{}
+	}
+	if a.seenReplication == nil {
+		a.seenReplication = map[replicationMetricKey]bool{}
 	}
 
 	// The audits are independent: a broken webhook list must not
@@ -450,6 +496,13 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
 	current := map[secretMetricKey]bool{}
+	// W7-C6 — the sweep collects two extra payloads on the same
+	// paged read: tlsData snapshots every TLS secret's raw tls.crt
+	// (parseable or not — drift is a byte comparison, not a cert
+	// parse), and replicated holds every destination carrying the
+	// replicated-from annotation for the source-diff pass.
+	tlsData := map[string][]byte{}
+	var replicated []replicatedSecretRef
 	// Server-side type filter + continue-token pagination: the
 	// all-namespaces secret read is the biggest this module makes —
 	// page it at certDriftListPage so no single response dominates.
@@ -470,6 +523,13 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 			// rule as the pod-phase filter in cilium_identity_auditor).
 			if s.Type != corev1.SecretTypeTLS {
 				continue
+			}
+			tlsData[s.Namespace+"/"+s.Name] = s.Data["tls.crt"]
+			if src := strings.TrimSpace(s.Annotations[replicatedFromAnno]); src != "" {
+				replicated = append(replicated, replicatedSecretRef{
+					namespace: s.Namespace, name: s.Name,
+					source: src, dest: s.Data["tls.crt"],
+				})
 			}
 			block, _ := pem.Decode(s.Data["tls.crt"])
 			if block == nil {
@@ -505,7 +565,100 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 		}
 	}
 	a.seenSecrets = current
+
+	// W7-C6 — the replicator drift diff rides the same read: every
+	// replicated destination's tls.crt is compared against its
+	// source (the TLS map first, a direct Get for non-TLS sources).
+	a.auditReplicatedSecrets(ctx, tlsData, replicated)
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Check E — kubernetes-replicator sync drift (W7-C6)
+// ---------------------------------------------------------------------------
+
+// auditReplicatedSecrets diffs each replicated TLS secret's tls.crt
+// against its source. The comparison is bytes — the replicator
+// copies data verbatim, so ANY byte difference is drift (a rotated
+// source cert the copy missed, or a hand-edited destination). A
+// mismatch must persist replicationDriftScans consecutive sweeps
+// before the gauge fires: a single-scan diff is the replicator
+// mid-sync, not a wedge. A matched copy resets the streak and drops
+// any held series via DeleteLabelValues.
+func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
+	tlsData map[string][]byte, replicated []replicatedSecretRef) {
+	log := logf.FromContext(ctx)
+
+	current := map[replicationMetricKey]bool{}
+	for _, d := range replicated {
+		k := replicationMetricKey{
+			namespace: d.namespace, name: d.name, source: d.source}
+		src, ok := tlsData[d.source]
+		if !ok {
+			// Source not in the TLS sweep — it may be a non-TLS
+			// (Opaque) secret; a direct Get resolves it. Malformed
+			// refs and genuinely-missing sources are skipped —
+			// "can't compare" is not drift. A transient Get failure
+			// carries the last verdict forward (same shape as the
+			// cainjector path's carry-forward).
+			srcNS, srcName, refOK := splitNSName(d.source)
+			if !refOK {
+				log.Info("skip: malformed replicated-from annotation",
+					"secret", d.namespace+"/"+d.name, "value", d.source)
+				continue
+			}
+			s, err := a.cs.CoreV1().Secrets(srcNS).Get(ctx, srcName, metav1.GetOptions{})
+			switch {
+			case err == nil:
+				src = s.Data["tls.crt"]
+				if len(src) == 0 {
+					continue // source has no tls.crt — nothing to compare
+				}
+			case apierrors.IsNotFound(err):
+				continue // source gone — the replica's problem, not drift
+			default:
+				log.Error(err, "replicated source get failed — verdict carried forward",
+					"secret", d.namespace+"/"+d.name, "source", d.source)
+				if a.seenReplication[k] {
+					current[k] = true
+				}
+				continue
+			}
+		}
+		current[k] = true
+		if bytes.Equal(d.dest, src) {
+			delete(a.replicationMismatch, k)
+			if a.seenReplication[k] {
+				metrics.ReplicatedSecretDrift.
+					DeleteLabelValues(k.namespace, k.name, k.source)
+			}
+			continue
+		}
+		a.replicationMismatch[k]++
+		if a.replicationMismatch[k] < replicationDriftScans {
+			continue // first mismatch — the replicator may be mid-sync
+		}
+		metrics.ReplicatedSecretDrift.
+			WithLabelValues(k.namespace, k.name, k.source).Set(1)
+		log.Info("replicated tls secret drifted from source across scans",
+			"secret", d.namespace+"/"+d.name, "source", d.source,
+			"consecutiveScans", a.replicationMismatch[k])
+	}
+
+	// Prune series + streaks for replicas gone (or sources no longer
+	// comparable) since the last sweep.
+	for k := range a.seenReplication {
+		if !current[k] {
+			metrics.ReplicatedSecretDrift.
+				DeleteLabelValues(k.namespace, k.name, k.source)
+		}
+	}
+	a.seenReplication = current
+	for k := range a.replicationMismatch {
+		if !current[k] {
+			delete(a.replicationMismatch, k)
+		}
+	}
 }
 
 // earliestCertExpiryDays returns days until the earliest NotAfter

@@ -274,6 +274,81 @@ var RabbitMQSuspendedHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpt
 	Help: "RabbitMQ pods deleted while running with a suspended listener (started but never Ready).",
 }, []string{"namespace", "pod"})
 
+// ---------------------------------------------------------------------------
+// Wave 7 self-healing metrics (W7-C3/W7-C4/W7-C5/W7-C6).
+// ---------------------------------------------------------------------------
+
+// DragonflyMasterlessPodHealsTotal counts dragonfly StatefulSet
+// ordinal-0 pods deleted to force a master re-election after the
+// operator-heal (W6.2) left both replicas stuck role=replica — the
+// dual-replica deadlock (W7-C3).
+var DragonflyMasterlessPodHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_dragonfly_masterless_pod_heals_total",
+	Help: "Dragonfly STS ordinal-0 pods deleted to force master re-election after a dual-replica deadlock.",
+}, []string{"namespace", "statefulset"})
+
+// LocalPVStrandedPods marks (1) pods stuck Pending because their bound
+// local PV's nodeAffinity pins them to a node that is missing,
+// out-of-service, NotReady or cordoned — the volume can never follow
+// the pod to a new node (W7-C4). reason is missing_node |
+// out_of_service | not_ready | cordoned.
+var LocalPVStrandedPods = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_localpv_stranded_pods",
+	Help: "1 while the Pod pends on a local PV node-affinity-pinned to an unavailable node.",
+}, []string{"namespace", "pod", "pvc", "node", "reason"})
+
+// LocalPVEphemeralHealsTotal counts dead PVC+pod pairs reaped for
+// workloads whose local volume is disposable — concourse-worker or
+// anything annotated node.ops/ephemeral-localpv — once the bound
+// node is confirmed gone (missing or out-of-service). Deleting the
+// PVC lets the StatefulSet rebind the pod onto a live node; the
+// Released PV is swept by the node-host-agent (W7-C4).
+var LocalPVEphemeralHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_localpv_ephemeral_heals_total",
+	Help: "Ephemeral localpv PVC+pod pairs reaped after their bound node was confirmed gone.",
+}, []string{"namespace", "pvc", "node"})
+
+// PVCProvisioningStalled marks (1) PVCs Pending on a local
+// provisioner storage class while Ready+schedulable worker nodes
+// exist — the provisioner pod wedged, not the cluster (W7-C4).
+var PVCProvisioningStalled = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_pvc_provisioning_stalled",
+	Help: "1 while the PVC pends on a local provisioner despite Ready schedulable workers existing.",
+}, []string{"namespace", "pvc", "storageclass"})
+
+// PVCProvisionerHealsTotal counts local provisioner pods deleted to
+// unstick Pending claims, by provisioner (W7-C4).
+var PVCProvisionerHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_pvc_provisioner_heals_total",
+	Help: "Local provisioner pods deleted to unstick Pending claims, by provisioner.",
+}, []string{"provisioner"})
+
+// OLMUnhealthyResources marks (1) OLM ClusterServiceVersions stuck
+// off Succeeded or overdue on cert rotation, and Subscriptions
+// reporting CatalogSourcesUnhealthy / ResolutionFailed, past the
+// audit threshold (W7-C5). kind is ClusterServiceVersion |
+// Subscription.
+var OLMUnhealthyResources = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_olm_unhealthy_resources",
+	Help: "1 while the OLM resource reports an unhealthy phase/condition past the audit threshold.",
+}, []string{"kind", "namespace", "name", "reason"})
+
+// OLMOperatorHealsTotal counts olm-operator pods deleted to unstick
+// wedged CSV reconciliation or webhook cert rotation (W7-C5).
+var OLMOperatorHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_olm_operator_heals_total",
+	Help: "olm-operator pods deleted to unstick wedged CSV/cert-rotation reconciliation, by detected reason.",
+}, []string{"reason"})
+
+// ReplicatedSecretDrift marks (1) kubernetes-replicator copies
+// (replicator.v1.mittwald.de/replicated-from) whose tls.crt diverged
+// from the source Secret across consecutive scans — the replicator
+// missed a watch event or the copy was hand-edited (W7-C6).
+var ReplicatedSecretDrift = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_replicated_secret_drift",
+	Help: "1 while the replicated Secret's tls.crt differs from its source across consecutive scans.",
+}, []string{"namespace", "name", "source"})
+
 // queues are the legacy shell-operator queue names — pre-instantiated
 // at 0 so /metrics always exposes every series (an empty CounterVec
 // emits nothing, and shell-operator emitted its counters eagerly).
@@ -321,7 +396,11 @@ func init() {
 		VeleroBackupEmptyOrErrored,
 		OperatorWorkqueueFrozen, OperatorWorkqueueHealsTotal,
 		CronJobTooManyMissedStarts, StatefulServiceZeroEndpoints,
-		RabbitMQSuspendedHealsTotal)
+		RabbitMQSuspendedHealsTotal,
+		DragonflyMasterlessPodHealsTotal, LocalPVStrandedPods,
+		LocalPVEphemeralHealsTotal, PVCProvisioningStalled,
+		PVCProvisionerHealsTotal, OLMUnhealthyResources,
+		OLMOperatorHealsTotal, ReplicatedSecretDrift)
 	for _, q := range queues {
 		hookRunErrors.WithLabelValues(q)
 		reconcileErrors.WithLabelValues(q)

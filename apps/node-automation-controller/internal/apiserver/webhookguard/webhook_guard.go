@@ -42,7 +42,7 @@
 // the linkerd-proxy container+initContainer. When the injector
 // webhook is provably healthy again — not circuit-broken, failurePolicy
 // still Fail, Ready endpoints > 0 — and UNMESHED_POD_REMEDIATION_ENABLED
-// is not "false", the auditor deletes up to 2 unmeshed pods per cycle
+// is not "false", the auditor EVICTS up to 2 unmeshed pods per cycle
 // (only pods >2m old, not already terminating, with a non-Node
 // controller ownerReference, so a controller recreates them meshed;
 // at most 4 delete attempts so a persistently failing apiserver
@@ -51,6 +51,15 @@
 // Pods are list/watch-locked in the manager cache (kube-system +
 // k8s-app=cilium only), so the audit reads through the direct
 // clientset exactly like every other module.
+//
+// W7-C1 — remediation hardening: before evicting anything the sweep
+// holds the shared maintenance mutex (a cordon/drain/kured reboot or
+// an in-flight k0s autopilot upgrade defers the work), and the pod
+// kill goes through the policy/v1 Eviction API — a raw Delete would
+// bypass every PodDisruptionBudget and could take the last Ready
+// replica of an already-degraded workload. An apiserver 429 (PDB
+// refusing the disruption) is a deferral, not an error: the pod is
+// kept and the next candidate is tried.
 package webhookguard
 
 import (
@@ -69,8 +78,11 @@ import (
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -136,6 +148,12 @@ const (
 
 type webhookGuard struct {
 	cs kubernetes.Interface
+	// dyn feeds the autopilot-Plan signal of the maintenance mutex
+	// (W7-C1) — wired through Setup like every other dynamic-client
+	// module. A nil dyn (unit tests that build the guard directly)
+	// narrows the mutex to the clientset-only signals (node cordon +
+	// kured lock) instead of failing closed.
+	dyn dynamic.Interface
 	// nowFn is the clock seam for the dead-backend streak — tests pin
 	// a scripted now to reach past webhookDeadThreshold. nil → time.Now.
 	nowFn func() time.Time
@@ -163,11 +181,13 @@ type webhookGuard struct {
 	partitionZeroThreshold time.Duration
 }
 
-// Setup registers the 5-minute sweep (was crontab */5).
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface) error {
+// Setup registers the 5-minute sweep (was crontab */5). dyn feeds
+// the autopilot-Plan signal of the maintenance mutex consulted by
+// the unmeshed-pod healer (W7-C1).
+func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface) error {
 	logf.Log.WithName(webhookGuardQueue).Info("registered",
 		"interval", 5*time.Minute, "circuitBreaker", circuitBreakerEnabled())
-	g := &webhookGuard{cs: cs, nowFn: time.Now,
+	g := &webhookGuard{cs: cs, dyn: dyn, nowFn: time.Now,
 		deadSince:       map[string]time.Time{},
 		brokenEmitted:   map[string]bool{},
 		unmeshedEmitted: map[string]bool{}}
@@ -1006,6 +1026,24 @@ func (g *webhookGuard) sweepUnmeshedPods(ctx context.Context, snap *sweepSnapsho
 		return nil
 	}
 
+	// W7-C1 — the maintenance mutex gates the evictions: killing
+	// pods mid-drain/upgrade is exactly what the mutex exists to
+	// prevent, and "cannot verify" fails closed like every other
+	// caller of shared.MaintenanceActive.
+	held, why, err := g.maintenanceActive(ctx)
+	if err != nil {
+		metrics.IncError(webhookGuardQueue)
+		log.Info("WARN: maintenance check unverifiable — "+
+			"DEFER: unmeshed remediation skipped (fail closed)",
+			"error", err, "candidates", len(candidates))
+		return nil
+	}
+	if held {
+		log.Info("DEFER: maintenance active — unmeshed remediation skipped",
+			"why", why, "candidates", len(candidates))
+		return nil
+	}
+
 	// Deterministic order so the cap picks the same pods.
 	slices.SortFunc(candidates, func(a, b corev1.Pod) int {
 		return strings.Compare(a.Namespace+"/"+a.Name, b.Namespace+"/"+b.Name)
@@ -1017,20 +1055,39 @@ func (g *webhookGuard) sweepUnmeshedPods(ctx context.Context, snap *sweepSnapsho
 			break
 		}
 		attempts++
-		log.Info("DELETE: unmeshed pod — owner controller recreates it meshed",
+		log.Info("EVICT: unmeshed pod — owner controller recreates it meshed",
 			"pod", p.Namespace+"/"+p.Name,
 			"age", now.Sub(p.CreationTimestamp.Time).Truncate(time.Second))
-		// UID precondition closes the TOCTOU window between the audit
-		// snapshot and the delete — a same-named pod recreated in
-		// between was admitted after the injector recovered and is
-		// not ours to reap (same pattern as the apiservice orphan
-		// reaper).
+		// The kill goes through the policy/v1 Eviction API, NOT a raw
+		// Delete (W7-C1): the apiserver enforces PodDisruptionBudgets
+		// and consumes a disruption slot atomically, so an already
+		// degraded workload cannot lose its last replica to a
+		// cosmetic fix. The UID precondition closes the TOCTOU
+		// window between the audit snapshot and the evict — a
+		// same-named pod recreated in between was admitted after
+		// the injector recovered and is not ours to reap.
 		uid := p.UID
-		if err := g.cs.CoreV1().Pods(p.Namespace).
-			Delete(ctx, p.Name, metav1.DeleteOptions{
+		eviction := &policyv1.Eviction{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      p.Name,
+				Namespace: p.Namespace,
+			},
+			DeleteOptions: &metav1.DeleteOptions{
 				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
-			log.Error(err, "unmeshed pod delete failed", "pod", p.Namespace+"/"+p.Name)
+			},
+		}
+		if err := g.cs.CoreV1().Pods(p.Namespace).EvictV1(ctx, eviction); err != nil {
+			if apierrors.IsTooManyRequests(err) {
+				// HTTP 429 — a PDB with disruptionsAllowed==0
+				// refused the eviction. That is a deferral, not a
+				// failure: the workload is already at its replica
+				// floor and killing this pod would finish the
+				// outage. Keep it, count no error, move on.
+				log.Info("DEFER: PDB refused eviction of unmeshed pod — keeping pod alive",
+					"pod", p.Namespace+"/"+p.Name)
+				continue
+			}
+			log.Error(err, "unmeshed pod eviction failed", "pod", p.Namespace+"/"+p.Name)
 			metrics.IncError(webhookGuardQueue)
 			continue
 		}
@@ -1040,6 +1097,41 @@ func (g *webhookGuard) sweepUnmeshedPods(ctx context.Context, snap *sweepSnapsho
 	log.Info("unmeshed audit done", "unmeshed", len(emitted),
 		"candidates", len(candidates), "deleted", deleted)
 	return nil
+}
+
+// maintenanceActive runs the cluster maintenance mutex (W7-C1) —
+// the shared three-signal check when a dynamic client is wired
+// (node cordon + kured lock + autopilot Plan), narrowed to the
+// clientset-only signals (node cordon + kured lock) when it is not:
+// a missing dyn is a test-only construction, so the check degrades
+// instead of failing closed like a real client outage must.
+func (g *webhookGuard) maintenanceActive(ctx context.Context) (bool, string, error) {
+	if g.dyn != nil {
+		return shared.MaintenanceActive(ctx, g.cs, g.dyn)
+	}
+	nodes, err := shared.ListNodes(ctx, g.cs)
+	if err != nil {
+		return false, "", fmt.Errorf("list nodes (maintenance mutex): %w", err)
+	}
+	for i := range nodes {
+		if nodes[i].Spec.Unschedulable {
+			return true, "node " + nodes[i].Name + " unschedulable", nil
+		}
+	}
+	ds, err := g.cs.AppsV1().DaemonSets(shared.KuredDaemonSetNS).
+		Get(ctx, shared.KuredDaemonSetName, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		// kured not installed — no signal.
+	case err != nil:
+		return false, "", fmt.Errorf("get daemonset %s/%s (maintenance mutex): %w",
+			shared.KuredDaemonSetNS, shared.KuredDaemonSetName, err)
+	default:
+		if v := ds.Annotations[shared.KuredLockAnno]; v != "" {
+			return true, "kured lock held by " + v, nil
+		}
+	}
+	return false, "", nil
 }
 
 // podWantsMesh reports whether the pod opted into linkerd injection:
