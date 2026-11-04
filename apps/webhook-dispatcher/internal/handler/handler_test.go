@@ -10,7 +10,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/webhook-dispatcher/internal/concourse"
 )
@@ -29,16 +33,19 @@ func signedRequest(t *testing.T, event, body string) *http.Request {
 }
 
 // fakeBackend returns a fixed index, a separately configured index on
-// Refresh, and records CheckWebhook calls.
+// Refresh, and records CheckWebhook calls. Mutable state is
+// mutex-guarded — the fan-out runs on background goroutines.
 type fakeBackend struct {
 	resources  []concourse.Resource
 	indexErr   error
 	refreshRes []concourse.Resource
 	refreshErr error
-	refreshed  int
 	status     int
 	checkErr   error
-	checks     []concourse.Resource
+
+	mu        sync.Mutex
+	refreshed int
+	checks    []concourse.Resource
 }
 
 func (f *fakeBackend) Resources(_ context.Context) ([]concourse.Resource, error) {
@@ -46,11 +53,15 @@ func (f *fakeBackend) Resources(_ context.Context) ([]concourse.Resource, error)
 }
 
 func (f *fakeBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.refreshed++
 	return f.refreshRes, f.refreshErr
 }
 
 func (f *fakeBackend) CheckWebhook(_ context.Context, r concourse.Resource) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.checks = append(f.checks, r)
 	if f.checkErr != nil {
 		return 0, f.checkErr
@@ -58,10 +69,39 @@ func (f *fakeBackend) CheckWebhook(_ context.Context, r concourse.Resource) (int
 	return f.status, nil
 }
 
+func (f *fakeBackend) checkList() []concourse.Resource {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]concourse.Resource(nil), f.checks...)
+}
+
+func (f *fakeBackend) refreshCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.refreshed
+}
+
 var pushBody = `{"repository":{
 	"full_name":"org/repo",
 	"ssh_url":"git@github.com:org/repo.git",
 	"clone_url":"https://github.com/org/repo.git",
+	"html_url":"https://github.com/org/repo"
+}}`
+
+// releaseBody is a release "published" delivery — the only release
+// action that can mean a new tag for git resources.
+var releaseBody = `{"action":"published","repository":{
+	"full_name":"org/repo",
+	"html_url":"https://github.com/org/repo"
+}}`
+
+var createTagBody = `{"ref_type":"tag","ref":"v1.2.3","repository":{
+	"full_name":"org/repo",
+	"html_url":"https://github.com/org/repo"
+}}`
+
+var createBranchBody = `{"ref_type":"branch","ref":"feature","repository":{
+	"full_name":"org/repo",
 	"html_url":"https://github.com/org/repo"
 }}`
 
@@ -186,8 +226,8 @@ func TestUnhandledEventAccepted(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status=%d want 202", rec.Code)
 	}
-	if s := decodeSummary(t, rec); s.ResourcesChecked != 0 {
-		t.Fatalf("resources_checked=%d want 0", s.ResourcesChecked)
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 0 {
+		t.Fatalf("resources_matched=%d want 0", s.ResourcesMatched)
 	}
 }
 
@@ -197,22 +237,105 @@ func TestPushChecksGitResourcesOnly(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d want 200", rec.Code)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
 	}
-	if s := decodeSummary(t, rec); s.ResourcesChecked != 2 {
-		t.Fatalf("resources_checked=%d want 2", s.ResourcesChecked)
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 2 {
+		t.Fatalf("resources_matched=%d want 2", s.ResourcesMatched)
 	}
-	for _, r := range b.checks {
+	h.wg.Wait()
+	checks := b.checkList()
+	for _, r := range checks {
 		if r.Type != "git" || r.Repo != "org/repo" {
 			t.Fatalf("unexpected check fan-out: %+v", r)
 		}
 	}
-	if len(b.checks) != 2 {
-		t.Fatalf("checks=%d want 2", len(b.checks))
+	if len(checks) != 2 {
+		t.Fatalf("checks=%d want 2", len(checks))
 	}
-	if b.refreshed != 0 {
-		t.Fatalf("refreshed=%d want 0 (match found without retry)", b.refreshed)
+	if b.refreshCount() != 0 {
+		t.Fatalf("refreshed=%d want 0 (match found without retry)", b.refreshCount())
+	}
+}
+
+func TestReleasePublishedChecksGitResources(t *testing.T) {
+	b := &fakeBackend{resources: testIndex(), status: http.StatusCreated}
+	h := New(testSecret, b)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest(t, "release", releaseBody))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
+	}
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 2 {
+		t.Fatalf("resources_matched=%d want 2", s.ResourcesMatched)
+	}
+	h.wg.Wait()
+	if checks := b.checkList(); len(checks) != 2 {
+		t.Fatalf("checks=%d want 2", len(checks))
+	}
+}
+
+func TestReleaseNonPublishActionIgnored(t *testing.T) {
+	// edited/deleted/prereleased release deliveries carry no new tag.
+	b := &fakeBackend{resources: testIndex(), status: http.StatusOK}
+	h := New(testSecret, b)
+	for _, action := range []string{"edited", "deleted", "created"} {
+		body := strings.Replace(releaseBody, "published", action, 1)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "release", body))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("action=%s status=%d want 202", action, rec.Code)
+		}
+		if s := decodeSummary(t, rec); s.ResourcesMatched != 0 {
+			t.Fatalf("action=%s resources_matched=%d want 0", action, s.ResourcesMatched)
+		}
+	}
+	h.wg.Wait()
+	if checks := b.checkList(); len(checks) != 0 {
+		t.Fatalf("checks=%d want 0", len(checks))
+	}
+}
+
+func TestCreateTagChecksGitResources(t *testing.T) {
+	b := &fakeBackend{resources: testIndex(), status: http.StatusCreated}
+	h := New(testSecret, b)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest(t, "create", createTagBody))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
+	}
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 2 {
+		t.Fatalf("resources_matched=%d want 2", s.ResourcesMatched)
+	}
+	h.wg.Wait()
+	checks := b.checkList()
+	if len(checks) != 2 {
+		t.Fatalf("checks=%d want 2", len(checks))
+	}
+	for _, r := range checks {
+		if r.Type != "git" {
+			t.Fatalf("unexpected check fan-out: %+v", r)
+		}
+	}
+}
+
+func TestCreateBranchIgnored(t *testing.T) {
+	b := &fakeBackend{resources: testIndex(), status: http.StatusOK}
+	h := New(testSecret, b)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest(t, "create", createBranchBody))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
+	}
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 0 {
+		t.Fatalf("resources_matched=%d want 0", s.ResourcesMatched)
+	}
+	h.wg.Wait()
+	if checks := b.checkList(); len(checks) != 0 {
+		t.Fatalf("checks=%d want 0", len(checks))
 	}
 }
 
@@ -228,39 +351,41 @@ func TestZeroMatchRetriesAfterRefresh(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d want 200", rec.Code)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
 	}
-	if b.refreshed != 1 {
-		t.Fatalf("refreshed=%d want 1", b.refreshed)
+	if b.refreshCount() != 1 {
+		t.Fatalf("refreshed=%d want 1", b.refreshCount())
 	}
-	if s := decodeSummary(t, rec); s.ResourcesChecked != 2 {
-		t.Fatalf("resources_checked=%d want 2", s.ResourcesChecked)
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 2 {
+		t.Fatalf("resources_matched=%d want 2", s.ResourcesMatched)
 	}
-	if len(b.checks) != 2 {
-		t.Fatalf("checks=%d want 2", len(b.checks))
+	h.wg.Wait()
+	if checks := b.checkList(); len(checks) != 2 {
+		t.Fatalf("checks=%d want 2", len(checks))
 	}
 }
 
 func TestZeroMatchStaysZeroWhenRefreshEmpty(t *testing.T) {
 	// A repo genuinely unknown to Concourse: refresh once, still no
-	// match, answer 200 with nothing checked — no loop.
+	// match, answer 202 with nothing to check — no loop.
 	b := &fakeBackend{status: http.StatusOK}
 	h := New(testSecret, b)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d want 200", rec.Code)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
 	}
-	if b.refreshed != 1 {
-		t.Fatalf("refreshed=%d want exactly 1 (no loop)", b.refreshed)
+	if b.refreshCount() != 1 {
+		t.Fatalf("refreshed=%d want exactly 1 (no loop)", b.refreshCount())
 	}
-	if s := decodeSummary(t, rec); s.ResourcesChecked != 0 {
-		t.Fatalf("resources_checked=%d want 0", s.ResourcesChecked)
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 0 {
+		t.Fatalf("resources_matched=%d want 0", s.ResourcesMatched)
 	}
-	if len(b.checks) != 0 {
-		t.Fatalf("checks=%d want 0", len(b.checks))
+	h.wg.Wait()
+	if checks := b.checkList(); len(checks) != 0 {
+		t.Fatalf("checks=%d want 0", len(checks))
 	}
 }
 
@@ -272,11 +397,11 @@ func TestZeroMatchRefreshFailureKeepsResult(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d want 200", rec.Code)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
 	}
-	if s := decodeSummary(t, rec); s.ResourcesChecked != 0 {
-		t.Fatalf("resources_checked=%d want 0", s.ResourcesChecked)
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 0 {
+		t.Fatalf("resources_matched=%d want 0", s.ResourcesMatched)
 	}
 }
 
@@ -286,11 +411,13 @@ func TestPullRequestChecksPRResourcesOnly(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, signedRequest(t, "pull_request", pushBody))
 
-	if s := decodeSummary(t, rec); s.ResourcesChecked != 1 {
-		t.Fatalf("resources_checked=%d want 1", s.ResourcesChecked)
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 1 {
+		t.Fatalf("resources_matched=%d want 1", s.ResourcesMatched)
 	}
-	if len(b.checks) != 1 || b.checks[0].Type != "github-pr" {
-		t.Fatalf("checks=%+v want one github-pr check", b.checks)
+	h.wg.Wait()
+	checks := b.checkList()
+	if len(checks) != 1 || checks[0].Type != "github-pr" {
+		t.Fatalf("checks=%+v want one github-pr check", checks)
 	}
 }
 
@@ -305,29 +432,34 @@ func TestMatchViaAlternateRepoURL(t *testing.T) {
 	}}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, signedRequest(t, "push", body))
-	if s := decodeSummary(t, rec); s.ResourcesChecked != 2 {
-		t.Fatalf("resources_checked=%d want 2", s.ResourcesChecked)
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 2 {
+		t.Fatalf("resources_matched=%d want 2", s.ResourcesMatched)
 	}
 }
 
 func TestCheckFailuresNeverFailDelivery(t *testing.T) {
-	// 404 + 5xx must all be swallowed — the summary only counts 2xx
-	// checks and the delivery still succeeds.
-	h := New(testSecret, &sequencingBackend{
+	// 404 + 5xx must all be swallowed — the delivery is still
+	// accepted and every target gets its check attempt.
+	b := &sequencingBackend{
 		statuses: []int{http.StatusOK, http.StatusNotFound, http.StatusInternalServerError},
 		resources: []concourse.Resource{
 			{Pipeline: "p1", Name: "a", Type: "git", Repo: "org/repo"},
 			{Pipeline: "p1", Name: "b", Type: "git", Repo: "org/repo"},
 			{Pipeline: "p1", Name: "c", Type: "git", Repo: "org/repo"},
 		},
-	})
+	}
+	h := New(testSecret, b)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d want 200", rec.Code)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
 	}
-	if s := decodeSummary(t, rec); s.ResourcesChecked != 1 {
-		t.Fatalf("resources_checked=%d want 1 (only the 2xx)", s.ResourcesChecked)
+	if s := decodeSummary(t, rec); s.ResourcesMatched != 3 {
+		t.Fatalf("resources_matched=%d want 3", s.ResourcesMatched)
+	}
+	h.wg.Wait()
+	if got := b.calls(); got != 3 {
+		t.Fatalf("check calls=%d want 3", got)
 	}
 }
 
@@ -335,6 +467,7 @@ func TestCheckFailuresNeverFailDelivery(t *testing.T) {
 type sequencingBackend struct {
 	resources []concourse.Resource
 	statuses  []int
+	mu        sync.Mutex
 	n         int
 }
 
@@ -347,9 +480,17 @@ func (s *sequencingBackend) Refresh(_ context.Context) ([]concourse.Resource, er
 }
 
 func (s *sequencingBackend) CheckWebhook(_ context.Context, _ concourse.Resource) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	st := s.statuses[s.n%len(s.statuses)]
 	s.n++
 	return st, nil
+}
+
+func (s *sequencingBackend) calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.n
 }
 
 func TestIndexUnavailableReturns502(t *testing.T) {
@@ -373,5 +514,120 @@ func TestBadPayloadRejected(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("body=%q status=%d want 400", body, rec.Code)
 		}
+	}
+}
+
+func TestFanoutBoundsConcurrency(t *testing.T) {
+	// More targets than fanoutWorkers: in-flight CheckWebhook calls
+	// must never exceed the semaphore — a large match set can't
+	// stampede the ATC.
+	b := &throttledBackend{delay: 5 * time.Millisecond}
+	var resources []concourse.Resource
+	for i := 0; i < fanoutWorkers*4; i++ {
+		resources = append(resources, concourse.Resource{
+			Pipeline: "p1", Name: fmt.Sprintf("r%d", i),
+			Type: "git", Repo: "org/repo",
+		})
+	}
+	b.resources = resources
+	h := New(testSecret, b)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
+	}
+	h.wg.Wait()
+	if got := b.maxInflight(); got > fanoutWorkers {
+		t.Fatalf("max in-flight checks=%d want <= %d", got, fanoutWorkers)
+	}
+	if got := b.maxInflight(); got < 2 {
+		t.Fatalf("max in-flight checks=%d want > 1 (fan-out must be parallel)", got)
+	}
+	if got := b.calls(); got != len(resources) {
+		t.Fatalf("check calls=%d want %d", got, len(resources))
+	}
+}
+
+// throttledBackend sleeps per check and tracks peak concurrency.
+type throttledBackend struct {
+	resources []concourse.Resource
+	delay     time.Duration
+	mu        sync.Mutex
+	inflight  int
+	max       int
+	n         int
+}
+
+func (b *throttledBackend) Resources(_ context.Context) ([]concourse.Resource, error) {
+	return b.resources, nil
+}
+
+func (b *throttledBackend) Refresh(_ context.Context) ([]concourse.Resource, error) {
+	return b.resources, nil
+}
+
+func (b *throttledBackend) CheckWebhook(ctx context.Context, _ concourse.Resource) (int, error) {
+	b.mu.Lock()
+	b.inflight++
+	if b.inflight > b.max {
+		b.max = b.inflight
+	}
+	b.n++
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.inflight--
+		b.mu.Unlock()
+	}()
+	select {
+	case <-time.After(b.delay):
+		return http.StatusCreated, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (b *throttledBackend) maxInflight() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.max
+}
+
+func (b *throttledBackend) calls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.n
+}
+
+func TestMetricsRecorded(t *testing.T) {
+	dispatchedBefore := testutil.ToFloat64(
+		deliveriesTotal.WithLabelValues("push", "dispatched"))
+	unauthorizedBefore := testutil.ToFloat64(
+		deliveriesTotal.WithLabelValues("push", "unauthorized"))
+	okBefore := testutil.ToFloat64(fanoutTotal.WithLabelValues("ok"))
+
+	b := &fakeBackend{resources: testIndex(), status: http.StatusCreated}
+	h := New(testSecret, b)
+
+	// A rejected delivery and a dispatched one.
+	req := signedRequest(t, "push", pushBody)
+	req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	h.ServeHTTP(httptest.NewRecorder(), signedRequest(t, "push", pushBody))
+	h.wg.Wait()
+
+	if got := testutil.ToFloat64(
+		deliveriesTotal.WithLabelValues("push", "unauthorized")); got != unauthorizedBefore+1 {
+		t.Fatalf("unauthorized deliveries=%v want %v", got, unauthorizedBefore+1)
+	}
+	if got := testutil.ToFloat64(
+		deliveriesTotal.WithLabelValues("push", "dispatched")); got != dispatchedBefore+1 {
+		t.Fatalf("dispatched deliveries=%v want %v", got, dispatchedBefore+1)
+	}
+	// The index holds two git resources for org/repo.
+	if got := testutil.ToFloat64(
+		fanoutTotal.WithLabelValues("ok")); got != okBefore+2 {
+		t.Fatalf("ok fanout=%v want %v", got, okBefore+2)
 	}
 }

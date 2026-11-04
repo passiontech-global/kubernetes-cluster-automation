@@ -116,8 +116,17 @@ func (c *Client) Refresh(ctx context.Context) ([]Resource, error) {
 	return index, nil
 }
 
+// fetchIndexWorkers bounds how many pipeline resource listings run
+// concurrently — a large team shouldn't fan one GET per pipeline at
+// the ATC all at once, but a serial listing is what made index
+// rebuilds slow enough to matter.
+const fetchIndexWorkers = 8
+
 // fetchIndex lists the team's pipelines, then each pipeline's
 // resources, keeping only resources whose source points at a repo.
+// The per-pipeline listings run in parallel (bounded by
+// fetchIndexWorkers); results stay in pipeline order so the index is
+// deterministic.
 func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 	start := time.Now()
 	var pipelines []struct {
@@ -127,33 +136,47 @@ func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 		return nil, err
 	}
 
-	var index []Resource
-	for _, p := range pipelines {
-		var resources []struct {
-			Name   string         `json:"name"`
-			Type   string         `json:"type"`
-			Source map[string]any `json:"source"`
-		}
-		path := "pipelines/" + url.PathEscape(p.Name) + "/resources"
-		if err := c.getJSON(ctx, c.apiPath(path), &resources); err != nil {
-			// One unreadable pipeline must not lose the whole index.
-			logger().Warn("pipeline resource listing failed — skipped",
-				"concourse_url", c.BaseURL, "team", c.Team,
-				"pipeline", p.Name, "error", err)
-			continue
-		}
-		for _, r := range resources {
-			repo := NormalizeRepo(sourceRepo(r.Source))
-			if repo == "" {
-				continue
+	results := make([][]Resource, len(pipelines))
+	sem := make(chan struct{}, fetchIndexWorkers)
+	var wg sync.WaitGroup
+	for i, p := range pipelines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			var resources []struct {
+				Name   string         `json:"name"`
+				Type   string         `json:"type"`
+				Source map[string]any `json:"source"`
 			}
-			index = append(index, Resource{
-				Pipeline: p.Name,
-				Name:     r.Name,
-				Type:     r.Type,
-				Repo:     repo,
-			})
-		}
+			path := "pipelines/" + url.PathEscape(p.Name) + "/resources"
+			if err := c.getJSON(ctx, c.apiPath(path), &resources); err != nil {
+				// One unreadable pipeline must not lose the whole index.
+				logger().Warn("pipeline resource listing failed — skipped",
+					"concourse_url", c.BaseURL, "team", c.Team,
+					"pipeline", p.Name, "error", err)
+				return
+			}
+			for _, r := range resources {
+				repo := NormalizeRepo(sourceRepo(r.Source))
+				if repo == "" {
+					continue
+				}
+				results[i] = append(results[i], Resource{
+					Pipeline: p.Name,
+					Name:     r.Name,
+					Type:     r.Type,
+					Repo:     repo,
+				})
+			}
+		}()
+	}
+	wg.Wait()
+
+	var index []Resource
+	for _, rs := range results {
+		index = append(index, rs...)
 	}
 	if index == nil {
 		// Keep it non-nil: a healthy empty index must still count as

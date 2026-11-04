@@ -6,7 +6,7 @@ stack: 'backend'
 
 project:
   title: 'webhook-dispatcher'
-  description: 'GitHub org webhook fan-out to Concourse resource check webhooks (push -> git, pull_request -> github-pr).'
+  description: 'GitHub org webhook fan-out to Concourse resource check webhooks (push/release/tag-create -> git, pull_request -> github-pr).'
 
 tasks:
   build:

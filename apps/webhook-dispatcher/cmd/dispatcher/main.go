@@ -4,15 +4,21 @@
 //
 // Flow: POST /webhook -> verify X-Hub-Signature-256 (HMAC-SHA256 over
 // the raw request body) -> resolve repository.full_name against the
-// cached Concourse pipeline/resource index (~60s TTL) -> POST each
-// matching resource's check webhook:
+// cached Concourse pipeline/resource index (~60s TTL) -> answer 202
+// and POST each matching resource's check webhook on a detached,
+// bounded fan-out (16 workers, 15s per target):
 //
-//	push         -> git resources
-//	pull_request -> github-pr resources
+//	push              -> git resources
+//	pull_request      -> github-pr resources
+//	release (publish) -> git resources
+//	create (tag)      -> git resources
 //
 // Other events are acknowledged with 202 so GitHub does not retry.
 // A single resource failure never fails the delivery — GitHub
 // redelivery would re-trigger every resource, not just the failed one.
+//
+// GET /metrics exposes the Prometheus counters/histogram; GET /healthz
+// is the liveness probe.
 //
 // Env contract:
 //
@@ -35,6 +41,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/webhook-dispatcher/internal/concourse"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/webhook-dispatcher/internal/handler"
@@ -107,6 +115,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
@@ -116,7 +125,8 @@ func main() {
 		Addr:              getenv("LISTEN_ADDR", ":8080"),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
-		// WriteTimeout must cover the handler's 30s fan-out budget.
+		// WriteTimeout must cover the handler's 30s index-fetch budget
+		// (fan-out itself is async — the response is a fast 202).
 		WriteTimeout: 45 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
@@ -133,7 +143,7 @@ func main() {
 
 	logger().Info("starting webhook-dispatcher",
 		"version", version, "addr", srv.Addr,
-		"routes", "POST /webhook, GET /healthz",
+		"routes", "POST /webhook, GET /healthz, GET /metrics",
 		"concourse_url", client.BaseURL, "concourse_team", client.Team)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger().Error("server exited", "error", err)
