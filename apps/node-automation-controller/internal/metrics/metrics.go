@@ -196,6 +196,15 @@ var FluxSourceReconcilesTriggeredTotal = prometheus.NewCounterVec(prometheus.Cou
 	Help: "reconcile.fluxcd.io/requestedAt nudges applied to Flux source objects.",
 }, []string{"kind", "namespace", "name"})
 
+// HelmStallUnwedgesTotal counts old-ReplicaSet scale-downs applied to
+// open a scheduling window behind a Stalled/RetriesExceeded
+// HelmRelease (helmrelease-unlocker stalled-rollout signature).
+// Labels: workload namespace + Deployment name.
+var HelmStallUnwedgesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_helm_stall_unwedges_total",
+	Help: "Old-ReplicaSet scale-downs that unwedged an anti-affinity surge deadlock behind a stalled HelmRelease.",
+}, []string{"namespace", "deployment"})
+
 // StatefulSetOnDeletePodsRolledTotal counts Pods deleted by the opt-in
 // OnDelete rolling helper (statefulset-ondelete-roller, C2).
 var StatefulSetOnDeletePodsRolledTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -259,7 +268,7 @@ func init() {
 		TrustBundleDaysToExpiry, UnmeshedPods,
 		UnmeshedPodsRecreatedTotal, ZombieSidecarPodsReapedTotal,
 		OrphanEndpointSlicesCleanedTotal,
-		FluxSourceReconcilesTriggeredTotal,
+		FluxSourceReconcilesTriggeredTotal, HelmStallUnwedgesTotal,
 		StatefulSetOnDeletePodsRolledTotal, VeleroSchedulePaused,
 		VeleroBackupEmptyOrErrored)
 	for _, q := range queues {

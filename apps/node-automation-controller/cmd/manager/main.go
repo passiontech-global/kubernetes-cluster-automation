@@ -280,6 +280,7 @@ func main() {
 		"ciliumTaintReaper", mc.ciliumEnabled, "fluentBitRoller", mc.fluentbitEnabled,
 		"certManagerReaper", mc.certReaperEnabled, "ciliumAudit", mc.ciliumAuditEnabled,
 		"externalSecretNudge", mc.esNudgeEnabled, "csrApprove", mc.csrApproveEnabled,
+		"helmStallUnwedge", mc.helmStallUnwedgeEnabled,
 		"concourseJanitor", mc.concourseJanitorEnabled,
 		"corednsPatcher", mc.corednsPatcherEnabled,
 		"corednsZoneWhen", mc.corednsZoneWhen,
@@ -317,6 +318,7 @@ type moduleConfig struct {
 	ciliumAuditEnabled             bool
 	esNudgeEnabled                 bool
 	csrApproveEnabled              bool
+	helmStallUnwedgeEnabled        bool
 	labelerPath                    string
 	concourseJanitorEnabled        bool
 	corednsPatcherEnabled          bool
@@ -345,12 +347,18 @@ type moduleConfig struct {
 // the clients exist and before any module is wired.
 func moduleConfigFromEnv() moduleConfig {
 	return moduleConfig{
-		ciliumEnabled:           os.Getenv("CILIUM_TAINT_REAPER_ENABLED") == "true",
-		fluentbitEnabled:        os.Getenv("FLUENTBIT_ROLLER_ENABLED") == "true",
-		certReaperEnabled:       os.Getenv("CERTMANAGER_REAPER_ENABLED") == "true",
-		ciliumAuditEnabled:      os.Getenv("CILIUM_IDENTITY_AUDITOR_ENABLED") == "true",
-		esNudgeEnabled:          os.Getenv("EXTERNALSECRET_NUDGE_ENABLED") == "true",
-		csrApproveEnabled:       os.Getenv("CSR_APPROVER_ENABLED") == "true",
+		ciliumEnabled:      os.Getenv("CILIUM_TAINT_REAPER_ENABLED") == "true",
+		fluentbitEnabled:   os.Getenv("FLUENTBIT_ROLLER_ENABLED") == "true",
+		certReaperEnabled:  os.Getenv("CERTMANAGER_REAPER_ENABLED") == "true",
+		ciliumAuditEnabled: os.Getenv("CILIUM_IDENTITY_AUDITOR_ENABLED") == "true",
+		esNudgeEnabled:     os.Getenv("EXTERNALSECRET_NUDGE_ENABLED") == "true",
+		csrApproveEnabled:  os.Getenv("CSR_APPROVER_ENABLED") == "true",
+		// Opt-in like the other destructive-gate flags: the stall
+		// unwedge scales workload ReplicaSets (a brief availability
+		// dip) and needs apps/replicasets+deployments RBAC the base
+		// ClusterRole does not carry — a cluster must consciously
+		// grant both before enabling the signature.
+		helmStallUnwedgeEnabled: os.Getenv("HELM_STALL_UNWEDGE_ENABLED") == "true",
 		labelerPath:             getenv("NODE_LABELER_CONFIG_PATH", "/etc/node-labeler/labels.txt"),
 		concourseJanitorEnabled: os.Getenv("CONCOURSE_JANITOR_ENABLED") == "true",
 		// The three ported patcher/watchdog CronJobs were always-on
@@ -452,7 +460,9 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 
 		// Third-party controller unstuckers (dynamic client /
 		// CRD types).
-		"helmrelease-unlocker":    func() error { return helmreleaseunlocker.Setup(mgr, cs, dyn) },
+		"helmrelease-unlocker": func() error {
+			return helmreleaseunlocker.Setup(mgr, cs, dyn, mc.helmStallUnwedgeEnabled)
+		},
 		"externalsecret-nudge":    func() error { return externalsecretnudge.Setup(mgr, cs, dyn, mc.esNudgeEnabled) },
 		"certmanager-reaper":      func() error { return certmanagerreaper.Setup(mgr, cs, dyn, mc.certReaperEnabled) },
 		"cilium-identity-auditor": func() error { return ciliumidentityauditor.Setup(mgr, cs, dyn, mc.ciliumAuditEnabled) },

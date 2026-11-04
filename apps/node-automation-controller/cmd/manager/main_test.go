@@ -454,6 +454,7 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		"CILIUM_IDENTITY_AUDITOR_ENABLED",
 		"EXTERNALSECRET_NUDGE_ENABLED",
 		"CSR_APPROVER_ENABLED",
+		"HELM_STALL_UNWEDGE_ENABLED",
 		"CONCOURSE_JANITOR_ENABLED",
 		"NODE_LABELER_CONFIG_PATH",
 		"COREDNS_PATCHER_ENABLED",
@@ -488,7 +489,7 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		mc := moduleConfigFromEnv()
 		if mc.ciliumEnabled || mc.fluentbitEnabled || mc.certReaperEnabled ||
 			mc.ciliumAuditEnabled || mc.esNudgeEnabled || mc.csrApproveEnabled ||
-			mc.concourseJanitorEnabled {
+			mc.helmStallUnwedgeEnabled || mc.concourseJanitorEnabled {
 			t.Fatalf("expected all gates disabled, got %+v", mc)
 		}
 		if mc.labelerPath != "/etc/node-labeler/labels.txt" {
@@ -549,12 +550,13 @@ func TestModuleConfigFromEnv(t *testing.T) {
 		t.Setenv("CILIUM_IDENTITY_AUDITOR_ENABLED", "true")
 		t.Setenv("EXTERNALSECRET_NUDGE_ENABLED", "true")
 		t.Setenv("CSR_APPROVER_ENABLED", "true")
+		t.Setenv("HELM_STALL_UNWEDGE_ENABLED", "true")
 		t.Setenv("CONCOURSE_JANITOR_ENABLED", "true")
 		t.Setenv("NODE_LABELER_CONFIG_PATH", "/custom/labels.txt")
 		mc := moduleConfigFromEnv()
 		if !mc.ciliumEnabled || !mc.fluentbitEnabled || !mc.certReaperEnabled ||
 			!mc.ciliumAuditEnabled || !mc.esNudgeEnabled || !mc.csrApproveEnabled ||
-			!mc.concourseJanitorEnabled {
+			!mc.helmStallUnwedgeEnabled || !mc.concourseJanitorEnabled {
 			t.Fatalf("expected all gates enabled, got %+v", mc)
 		}
 		if mc.labelerPath != "/custom/labels.txt" {

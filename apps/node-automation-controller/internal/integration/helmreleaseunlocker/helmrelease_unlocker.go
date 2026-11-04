@@ -37,10 +37,29 @@
 // artifact. node.ops/last-source-nudge on the source caps this at
 // once per source per 30m across all consumers.
 //
+// Stalled-rollout surge unwedge (opt-in via
+// HELM_STALL_UNWEDGE_ENABLED): a HelmRelease wedged in
+// Stalled=True/RetriesExceeded (or Ready=False with a "stalled
+// resources" message) after a failed upgrade can sit behind a
+// Deployment surge deadlock — the old ReplicaSet's pods still carry
+// REQUIRED podAntiAffinity occupying every schedulable node, so the
+// new surge pod can never land (incident 2026-11-04,
+// 1password/connect on passiontech-k0s-cicd). When the stalled
+// workload verifiably matches that shape, the unwedge scales the OLD
+// ReplicaSet down by the minimum needed to free one node, then stamps
+// reconcile.fluxcd.io/{requestedAt,resetAt,forceAt} on the HR — the
+// resetAt token is what clears the RetriesExceeded/Stalled
+// bookkeeping (helm-controller >= v0.37.0) without a suspend/resume
+// cycle. Full signature + guard details live in
+// helm_stall_unwedge.go.
+//
 // Guards:
 //   - max one unlock per HR per 24h (in-memory ledger AND the
 //     persisted node.ops/last-helm-unlock annotation — a restart
-//     wipes the ledger but must not refund the cooldown);
+//     wipes the ledger but must not refund the cooldown); the stall
+//     unwedge carries the same 24h cap under its own
+//     node.ops/last-helm-stall-unwedge annotation so the two
+//     cooldowns never refund each other;
 //   - skip+warn while a helm-controller pod (flux-system,
 //     app.kubernetes.io/name=helm-controller) is CrashLoopBackOff —
 //     deleting secrets cannot converge without a working controller;
@@ -147,16 +166,37 @@ type helmReleaseUnlocker struct {
 	// 24h (~144 increments/day). Pruned alongside unlocked so a new
 	// cooldown window alerts afresh.
 	alerted map[string]bool
+	// stallEnabled gates the stalled-rollout surge unwedge —
+	// HELM_STALL_UNWEDGE_ENABLED. Opt-in because the remediation
+	// scales workload ReplicaSets (brief availability dip) and needs
+	// apps/replicasets RBAC the base ClusterRole does not carry.
+	stallEnabled bool
+	// stallFirstSeen / unwedged / stallAlerted mirror the ledgers
+	// above for the stalled-rollout signature: first-seen tracking
+	// for the 30m window, the 24h remediation cooldown (also
+	// persisted via node.ops/last-helm-stall-unwedge), and the
+	// once-per-cooldown alert dedup shared by "re-stalled after
+	// unwedge" and "signature matched but a guard refused".
+	stallFirstSeen map[string]time.Time
+	unwedged       map[string]time.Time
+	stallAlerted   map[string]time.Time
 }
 
-// Setup registers the 10-minute sweep.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface) error {
+// Setup registers the 10-minute sweep. stallUnwedgeEnabled gates ONLY
+// the stalled-rollout unwedge pass (the pod-affecting signature); the
+// pending-secret unlock and the artifact-source healer run
+// unconditionally like before.
+func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, stallUnwedgeEnabled bool) error {
 	u := &helmReleaseUnlocker{
-		cs:        cs,
-		dyn:       dyn,
-		firstSeen: map[string]time.Time{},
-		unlocked:  map[string]time.Time{},
-		alerted:   map[string]bool{},
+		cs:             cs,
+		dyn:            dyn,
+		firstSeen:      map[string]time.Time{},
+		unlocked:       map[string]time.Time{},
+		alerted:        map[string]bool{},
+		stallEnabled:   stallUnwedgeEnabled,
+		stallFirstSeen: map[string]time.Time{},
+		unwedged:       map[string]time.Time{},
+		stallAlerted:   map[string]time.Time{},
 	}
 	return shared.AddPeriodic(mgr, helmUnlockQueue, helmUnlockInterval, u.run)
 }
@@ -165,6 +205,17 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	// Lazy-init for literal-constructed structs (tests) — Setup
+	// always initializes, but a fixture must not panic on a nil map.
+	if u.stallFirstSeen == nil {
+		u.stallFirstSeen = map[string]time.Time{}
+	}
+	if u.unwedged == nil {
+		u.unwedged = map[string]time.Time{}
+	}
+	if u.stallAlerted == nil {
+		u.stallAlerted = map[string]time.Time{}
+	}
 
 	list, gvr, err := u.listHelmReleases(ctx)
 	if err != nil {
@@ -173,18 +224,26 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 
 	now := time.Now()
 	stuck := map[string]*unstructured.Unstructured{}
+	stalled := map[string]*unstructured.Unstructured{}
 	present := map[string]bool{} // every listed HR, stuck or not
 	for i := range list.Items {
 		hr := &list.Items[i]
-		present[hr.GetNamespace()+"/"+hr.GetName()] = true
-		if !hrStuckInProgress(hr) {
-			continue
-		}
 		key := hr.GetNamespace() + "/" + hr.GetName()
-		stuck[key] = hr
-		if _, ok := u.firstSeen[key]; !ok {
-			u.firstSeen[key] = now
-			log.Info("HR shows 'in progress' — tracking first-seen", "hr", key)
+		present[key] = true
+		if hrStuckInProgress(hr) {
+			stuck[key] = hr
+			if _, ok := u.firstSeen[key]; !ok {
+				u.firstSeen[key] = now
+				log.Info("HR shows 'in progress' — tracking first-seen", "hr", key)
+			}
+			continue // the pending-op signature claims it — no double-tracking
+		}
+		if u.stallEnabled && hrStalledRollout(hr) {
+			stalled[key] = hr
+			if _, ok := u.stallFirstSeen[key]; !ok {
+				u.stallFirstSeen[key] = now
+				log.Info("HR shows stalled-rollout signature — tracking first-seen", "hr", key)
+			}
 		}
 	}
 	// Prune HRs that recovered (or vanished) so a later stall re-arms
@@ -192,6 +251,11 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	for key := range u.firstSeen {
 		if _, ok := stuck[key]; !ok {
 			delete(u.firstSeen, key)
+		}
+	}
+	for key := range u.stallFirstSeen {
+		if _, ok := stalled[key]; !ok {
+			delete(u.stallFirstSeen, key)
 		}
 	}
 	// Same prune for the unlock ledger: entries past the 24h cooldown
@@ -203,6 +267,17 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 			delete(u.alerted, key)
 		}
 	}
+	// Identical prune for the unwedge ledger + its alert dedup.
+	for key, last := range u.unwedged {
+		if !present[key] || now.Sub(last) >= helmUnlockCooldown {
+			delete(u.unwedged, key)
+		}
+	}
+	for key, last := range u.stallAlerted {
+		if !present[key] || now.Sub(last) >= helmUnlockCooldown {
+			delete(u.stallAlerted, key)
+		}
+	}
 
 	var due []string
 	for key := range stuck {
@@ -211,13 +286,22 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 		}
 	}
 	sort.Strings(due)
+	var stallDue []string
+	for key := range stalled {
+		if now.Sub(u.stallFirstSeen[key]) >= helmStuckThreshold {
+			stallDue = append(stallDue, key)
+		}
+	}
+	sort.Strings(stallDue)
 
 	var firstErr error
-	unlocked := 0
-	if len(due) > 0 {
-		// helm-controller crashlooping → the unlock cannot converge
-		// (someone must finish the rollback after the pending secret
-		// is deleted). Warn and abort; the next tick re-evaluates.
+	unlocked, unwedged := 0, 0
+	if len(due) > 0 || len(stallDue) > 0 {
+		// helm-controller crashlooping → neither signature can
+		// converge (someone must finish the rollback after the
+		// pending secret is deleted, and someone must retry the
+		// release after the surge window opens). Warn and abort;
+		// the next tick re-evaluates.
 		down, err := u.helmControllerDown(ctx)
 		switch {
 		case err != nil:
@@ -225,9 +309,11 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 			// it reads different resources than the pod list.
 			firstErr = err
 		case down:
-			log.Info("SKIP: helm-controller pod CrashLoopBackOff — unlock would not converge", "due", due)
+			log.Info("SKIP: helm-controller pod CrashLoopBackOff — unlock/unwedge would not converge",
+				"due", due, "stallDue", stallDue)
 		default:
 			unlocked = u.unlockDue(ctx, gvr, stuck, due, now)
+			unwedged = u.unwedgeDue(ctx, gvr, stalled, stallDue, now)
 		}
 	}
 
@@ -237,7 +323,8 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	if err := u.healArtifactSources(ctx, list); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	log.Info("sweep done", "stuck", len(stuck), "due", len(due), "unlocked", unlocked)
+	log.Info("sweep done", "stuck", len(stuck), "due", len(due), "unlocked", unlocked,
+		"stalled", len(stalled), "stallDue", len(stallDue), "unwedged", unwedged)
 	return firstErr
 }
 

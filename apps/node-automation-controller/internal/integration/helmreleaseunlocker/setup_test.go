@@ -16,7 +16,7 @@ import (
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), testutil.StubDyn()); err != nil {
+	if err := Setup(m, fake.NewSimpleClientset(), testutil.StubDyn(), true); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "helmrelease-unlocker", 10*time.Minute)
