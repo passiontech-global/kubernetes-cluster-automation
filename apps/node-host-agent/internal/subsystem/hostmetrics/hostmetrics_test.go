@@ -578,9 +578,11 @@ func TestDescribe(t *testing.T) {
 	c.Describe(ch)
 	// 10 base descs + the 2 legacy prom_emit aliases
 	// (node_watchdog_state, node_watchdog_egress_relay) + 16
-	// gray-failure telemetry descs (H1/H2/H3/H6/H7).
-	if got := len(ch); got != 41 {
-		t.Fatalf("Describe emitted %d descs want 41", got)
+	// gray-failure telemetry descs (H1/H2/H3/H6/H7) + 7 W7 descs
+	// (dstate, systemd scopes, conntrack insert_failed/drop, arp,
+	// cgroup memory high/oom_kill).
+	if got := len(ch); got != 48 {
+		t.Fatalf("Describe emitted %d descs want 48", got)
 	}
 }
 

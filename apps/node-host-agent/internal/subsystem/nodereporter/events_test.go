@@ -343,6 +343,7 @@ func TestSelfHealActionReasons(t *testing.T) {
 		{"ACTION: removed corrupted image docker.io/library/nginx:1.25 - failed to extract layer", "CorruptedImageRemoved"},
 		{"ACTION zombie-storm: pod_uid=11111111-2222-3333-4444-555555555555 zombies=640 ppid=777", "ZombieProcessStorm"},
 		{"ACTION cilium-mtu-drift: cilium=1500 nebula=1300", "CiliumMTUExceedsOverlay"},
+		{"ACTION d-state-storm: count=7 runtime=3 wchan=runc=umount_tree", "KernelHungTasks"},
 	}
 	for _, l := range lines {
 		e.appendLog(t, l.msg)

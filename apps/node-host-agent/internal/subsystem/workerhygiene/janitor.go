@@ -89,7 +89,9 @@ const (
 //	  cilium-init-stuck (35), kubelet-healthz-down (T15 remediate),
 //	  kubelet-syncloop-down / containerd-sock-down (A4),
 //	  cilium-envoy-down (B1), cilium-mtu-drift (B4),
-//	  zombie-storm (A2)
+//	  zombie-storm (A2), d-state-storm (W7-H1),
+//	  cilium-envoy-xds-reject (W7-H3), spegel-mirror-degraded (W7-H4),
+//	  calico-veth-leak / calico-felix-down (W7-H7)
 //	nethealth: dns-fallback (20), nebula-isolated/-degraded/-slowpath/
 //	  -siteedge (13), fail2ban-down (50), clock-unsync (H1),
 //	  conntrack-pressure (H2)
@@ -135,6 +137,11 @@ var knownLatchNames = map[string]bool{
 	"filesystem-readonly":      true, // W5.3 hostmetrics ST_RDONLY
 	"cilium-wg-peer-wipe":      true, // W5.6 cilium WireGuard drift
 	"disk-bloat":               true, // W6.3 disk-bloat runaway
+	"d-state-storm":            true, // W7-H1 kernel hung tasks
+	"cilium-envoy-xds-reject":  true, // W7-H3 envoy xDS NACK
+	"spegel-mirror-degraded":   true, // W7-H4 spegel P2P mirror
+	"calico-veth-leak":         true, // W7-H7 orphan cali* veth leak
+	"calico-felix-down":        true, // W7-H7 felix readiness
 }
 
 // knownLatchPrefixes — parameterized latch families whose suffix is

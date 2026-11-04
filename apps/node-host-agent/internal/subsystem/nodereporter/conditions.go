@@ -127,6 +127,17 @@ var conditionDefs = []conditionDef{
 		problemReason:  "FilesystemReadOnlyDetected",
 		stateKey:       "filesystem-readonly",
 	},
+	{
+		// Agent-added (W7-H1): workerhygiene's D-state storm
+		// detector — >=5 tasks (or >=2 runtime-critical) stuck in
+		// uninterruptible sleep means a hung kernel IO path no
+		// service restart can clear; NHC→SNR owns the remedy.
+		typ:            "KernelHungTasks",
+		defaultReason:  "KernelTasksRunOk",
+		defaultMessage: "no D-state task storm (uninterruptible sleep below threshold)",
+		problemReason:  "KernelHungTasksDetected",
+		stateKey:       "d-state-storm",
+	},
 }
 
 // condEval is the evaluated state of one condition this cycle.

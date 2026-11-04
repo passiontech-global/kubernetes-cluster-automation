@@ -107,6 +107,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -168,6 +169,10 @@ const (
 	defaultInotifyMaxWatchFile = "/proc/sys/fs/inotify/max_user_watches"
 	defaultCgroupRoot          = "/sys/fs/cgroup"
 	defaultCiliumIface         = "cilium_net"
+	// W7 sources: H5 conntrack per-CPU stats + ARP table, H6 cgroup
+	// memory.events units under system.slice/.
+	defaultConntrackStatFile = "/proc/net/stat/nf_conntrack"
+	defaultARPTableFile      = "/proc/net/arp"
 	// inotifyWarnRatio is the fill ratio that logs the top-3 holder
 	// report — early enough to find the leaker before
 	// max_user_instances is hit.
@@ -219,6 +224,14 @@ var defaultCgroupPidsSlices = []string{
 	"system.slice/k0sworker.service",
 	"system.slice/k0scontroller.service",
 	"kubepods.slice",
+}
+
+// defaultCgroupMemUnits are the system.slice units whose
+// memory.events feed the W7-H6 reclaim-throttling counters — the
+// k0s daemons whose freeze-under-high is the classic gray failure.
+var defaultCgroupMemUnits = []string{
+	"k0scontroller.service",
+	"k0sworker.service",
 }
 
 // defaultExpectedKCMArgs is the expected key set of
@@ -315,6 +328,15 @@ type Config struct {
 	// HostRoot).
 	CiliumIface         string
 	CiliumRuntimeConfig string
+	// ConntrackStatFile is /proc/net/stat/nf_conntrack — the
+	// per-CPU conntrack counters (insert_failed/drop for W7-H5);
+	// ARPTableFile is /proc/net/arp — the ARP neighbour-table fill
+	// gauge.
+	ConntrackStatFile string
+	ARPTableFile      string
+	// CgroupMemUnits are the system.slice unit names whose
+	// memory.events feed the W7-H6 high/oom_kill counters.
+	CgroupMemUnits []string
 
 	// nowFn supplies the current time — seam for tests.
 	nowFn func() time.Time
@@ -443,6 +465,15 @@ func (c *Config) applyDefaults() {
 		c.CiliumRuntimeConfig = filepath.Join(c.HostRoot,
 			"run/cilium/state/agent-runtime-config.json")
 	}
+	if c.ConntrackStatFile == "" {
+		c.ConntrackStatFile = defaultConntrackStatFile
+	}
+	if c.ARPTableFile == "" {
+		c.ARPTableFile = defaultARPTableFile
+	}
+	if len(c.CgroupMemUnits) == 0 {
+		c.CgroupMemUnits = defaultCgroupMemUnits
+	}
 }
 
 // Collector implements prometheus.Collector — all reads happen at
@@ -520,6 +551,17 @@ type Collector struct {
 	descPSIIOFull  *prometheus.Desc
 	descPSWPIn     *prometheus.Desc
 	descPSWPOut    *prometheus.Desc
+
+	// W7 additions: H1 d-state processes, H2 cri-containerd scope
+	// footprint, H5 conntrack insert_failed/drop + ARP entries,
+	// H6 cgroup memory.events counters.
+	descDState        *prometheus.Desc
+	descSystemdScopes *prometheus.Desc
+	descCtInsertFail  *prometheus.Desc
+	descCtDrops       *prometheus.Desc
+	descARPEntries    *prometheus.Desc
+	descCgMemHigh     *prometheus.Desc
+	descCgMemOOMKill  *prometheus.Desc
 
 	// Legacy node-watchdog aliases — the prom_emit textfile series
 	// the fluxcd PrometheusRules still alert on
@@ -771,6 +813,36 @@ func New(cfg Config) *Collector {
 		"/proc/vmstat pswpout — cumulative pages swapped out (swap thrash evidence).",
 		[]string{"node"}, nil)
 
+	// W7 gray-failure telemetry — same node-label convention.
+	c.descDState = prometheus.NewDesc(
+		"node_host_agent_dstate_processes",
+		"Processes in state D (uninterruptible sleep) under the host proc root (emitted only when the scan succeeds).",
+		[]string{"node"}, nil)
+	c.descSystemdScopes = prometheus.NewDesc(
+		"node_host_agent_systemd_scopes_count",
+		"cri-containerd-*.scope dirs under the kubepods cgroup slice — the abandoned-scope footprint slowing PID 1 D-Bus.",
+		[]string{"node"}, nil)
+	c.descCtInsertFail = prometheus.NewDesc(
+		"node_host_agent_conntrack_insert_failed_total",
+		"Sum of the insert_failed column across all CPU rows of /proc/net/stat/nf_conntrack (UDP tuple-collision drops).",
+		[]string{"node"}, nil)
+	c.descCtDrops = prometheus.NewDesc(
+		"node_host_agent_conntrack_drops_total",
+		"Sum of the drop column across all CPU rows of /proc/net/stat/nf_conntrack.",
+		[]string{"node"}, nil)
+	c.descARPEntries = prometheus.NewDesc(
+		"node_host_agent_arp_entries",
+		"Entries in /proc/net/arp — ARP neighbour-table fill vs gc_thresh headroom.",
+		[]string{"node"}, nil)
+	c.descCgMemHigh = prometheus.NewDesc(
+		"node_host_agent_cgroup_memory_high_events_total",
+		"memory.events `high` of the unit — direct-reclaim throttling episodes (freeze, not OOMKill).",
+		[]string{"node", "unit"}, nil)
+	c.descCgMemOOMKill = prometheus.NewDesc(
+		"node_host_agent_cgroup_memory_oom_kill_events_total",
+		"memory.events `oom_kill` of the unit — actual OOM kills counted by the cgroup.",
+		[]string{"node", "unit"}, nil)
+
 	c.descMeta = map[*prometheus.Desc]descMeta{}
 	for _, d := range []struct {
 		desc *prometheus.Desc
@@ -859,6 +931,20 @@ func New(cfg Config) *Collector {
 			"/proc/vmstat pswpin — cumulative pages swapped in."},
 		{c.descPSWPOut, "node_host_agent_vmstat_pswpout_total",
 			"/proc/vmstat pswpout — cumulative pages swapped out."},
+		{c.descDState, "node_host_agent_dstate_processes",
+			"Processes in state D (uninterruptible sleep) under the host proc root."},
+		{c.descSystemdScopes, "node_host_agent_systemd_scopes_count",
+			"cri-containerd-*.scope dirs under the kubepods cgroup slice."},
+		{c.descCtInsertFail, "node_host_agent_conntrack_insert_failed_total",
+			"insert_failed column sum over all CPU rows of nf_conntrack stats."},
+		{c.descCtDrops, "node_host_agent_conntrack_drops_total",
+			"drop column sum over all CPU rows of nf_conntrack stats."},
+		{c.descARPEntries, "node_host_agent_arp_entries",
+			"Entries in the ARP neighbour table."},
+		{c.descCgMemHigh, "node_host_agent_cgroup_memory_high_events_total",
+			"memory.events high of the unit — direct-reclaim throttling."},
+		{c.descCgMemOOMKill, "node_host_agent_cgroup_memory_oom_kill_events_total",
+			"memory.events oom_kill of the unit."},
 	} {
 		c.descMeta[d.desc] = descMeta{name: d.name, help: d.help}
 	}
@@ -916,6 +1002,13 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.descPSIIOFull
 	ch <- c.descPSWPIn
 	ch <- c.descPSWPOut
+	ch <- c.descDState
+	ch <- c.descSystemdScopes
+	ch <- c.descCtInsertFail
+	ch <- c.descCtDrops
+	ch <- c.descARPEntries
+	ch <- c.descCgMemHigh
+	ch <- c.descCgMemOOMKill
 }
 
 // Collect implements prometheus.Collector.
@@ -950,6 +1043,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.collectCgroupPids(ch)
 	c.collectMTUDrift(ch)
 	c.collectMemoryIO(ch)
+	c.collectSystemdScopes(ch)
+	c.collectARP(ch)
+	c.collectCgroupMemEvents(ch)
 }
 
 // collectWatchdog scans state-* latch files. certDays/certOK fold the
@@ -1698,6 +1794,62 @@ func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
 			prometheus.GaugeValue,
 			float64(count)/float64(limit), c.cfg.NodeName)
 	}
+	// W7-H5: the per-CPU stat counters — insert_failed grows on the
+	// UDP source-port tuple collision (A+AAAA race) long before the
+	// table fills; drop counts the packets conntrack refused. Both
+	// are cumulative kernel counters → CounterValue.
+	if st, ok := conntrackStatCounters(c.cfg.ConntrackStatFile,
+		"insert_failed", "drop"); ok {
+		if v, found := st["insert_failed"]; found {
+			ch <- prometheus.MustNewConstMetric(c.descCtInsertFail,
+				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+		}
+		if v, found := st["drop"]; found {
+			ch <- prometheus.MustNewConstMetric(c.descCtDrops,
+				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+		}
+	}
+}
+
+// conntrackStatCounters parses /proc/net/stat/nf_conntrack — a
+// header line of column names followed by one HEX value row per
+// CPU; the named columns are summed across all CPUs. ok=false when
+// the file is unreadable or the header carries none of the wanted
+// columns (conntrack module absent → absent series, no fake 0).
+func conntrackStatCounters(path string, keys ...string) (map[string]uint64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) < 2 {
+		return nil, false
+	}
+	header := strings.Fields(lines[0])
+	idx := map[string]int{}
+	for _, k := range keys {
+		for i, name := range header {
+			if name == k {
+				idx[k] = i
+			}
+		}
+	}
+	if len(idx) == 0 {
+		return nil, false
+	}
+	out := map[string]uint64{}
+	for _, line := range lines[1:] {
+		f := strings.Fields(line)
+		if len(f) != len(header) {
+			continue // malformed CPU row — never emit junk
+		}
+		for k, i := range idx {
+			if v, err := strconv.ParseUint(f[i], 16, 64); err == nil {
+				out[k] += v
+			}
+		}
+	}
+	return out, true
 }
 
 // --- H3+H7: filesystem inode stats + hung-mount probe ---
@@ -2201,7 +2353,7 @@ func (c *Collector) collectZombies(ch chan<- prometheus.Metric) {
 	if err != nil {
 		return
 	}
-	var n float64
+	var n, dstate float64
 	for _, e := range entries {
 		if !e.IsDir() || !pidDirRe.MatchString(e.Name()) {
 			continue
@@ -2212,13 +2364,20 @@ func (c *Collector) collectZombies(ch chan<- prometheus.Metric) {
 		}
 		s := string(data)
 		if i := strings.LastIndexByte(s, ')'); i >= 0 {
-			if f := strings.Fields(s[i+1:]); len(f) > 0 && f[0] == "Z" {
-				n++
+			if f := strings.Fields(s[i+1:]); len(f) > 0 {
+				switch f[0] {
+				case "Z":
+					n++
+				case "D": // W7-H1: uninterruptible-sleep count, same scan
+					dstate++
+				}
 			}
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(c.descZombies,
 		prometheus.GaugeValue, n, c.cfg.NodeName)
+	ch <- prometheus.MustNewConstMetric(c.descDState,
+		prometheus.GaugeValue, dstate, c.cfg.NodeName)
 }
 
 // collectCgroupPids emits pids.current/pids.max per slice — a
@@ -2420,6 +2579,75 @@ func (c *Collector) collectMemoryIO(ch chan<- prometheus.Metric) {
 		if v, ok := vm[k.key]; ok {
 			ch <- prometheus.MustNewConstMetric(k.desc,
 				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+		}
+	}
+}
+
+// --- W7: systemd scope footprint, ARP entries, cgroup memory.events ---
+
+// collectSystemdScopes counts cri-containerd-*.scope dirs under the
+// kubepods cgroup slice (W7-H2): a leaking abandoned-scope
+// footprint is what slows every PID 1 D-Bus call down before
+// systemctl-level symptoms appear. Counted directly in the cgroup
+// fs — no systemctl fork per scrape. Emits only when the slice
+// root exists.
+func (c *Collector) collectSystemdScopes(ch chan<- prometheus.Metric) {
+	root := filepath.Join(c.cfg.CgroupRoot, "kubepods.slice")
+	if _, err := os.Stat(root); err != nil {
+		return
+	}
+	var n float64
+	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // unreadable entries are skipped, never fatal
+		}
+		if d.IsDir() && strings.HasPrefix(d.Name(), "cri-containerd-") &&
+			strings.HasSuffix(d.Name(), ".scope") {
+			n++
+		}
+		return nil
+	})
+	ch <- prometheus.MustNewConstMetric(c.descSystemdScopes,
+		prometheus.GaugeValue, n, c.cfg.NodeName)
+}
+
+// collectARP counts /proc/net/arp entry rows (header skipped) — the
+// ARP neighbour-table fill half of W7-H5 (gc_thresh overflow drops
+// outbound packets while every other signal stays green). Emits
+// only when the file reads.
+func (c *Collector) collectARP(ch chan<- prometheus.Metric) {
+	data, err := os.ReadFile(c.cfg.ARPTableFile)
+	if err != nil {
+		return
+	}
+	var n float64
+	for i, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if i == 0 || len(strings.Fields(line)) == 0 {
+			continue
+		}
+		n++
+	}
+	ch <- prometheus.MustNewConstMetric(c.descARPEntries,
+		prometheus.GaugeValue, n, c.cfg.NodeName)
+}
+
+// collectCgroupMemEvents reads memory.events of the configured
+// system.slice units (W7-H6): a climbing `high` count is
+// direct-reclaim throttling evidence — the unit freezes without an
+// OOMKill, the classic healthcheck-timeout-with-no-logs gray
+// failure; `oom_kill` counts the kills that do happen. Each series
+// emits only when its own field parses.
+func (c *Collector) collectCgroupMemEvents(ch chan<- prometheus.Metric) {
+	for _, unit := range c.cfg.CgroupMemUnits {
+		ev := vmstatCounters(filepath.Join(c.cfg.CgroupRoot,
+			"system.slice", unit, "memory.events"), "high", "oom_kill")
+		if v, ok := ev["high"]; ok {
+			ch <- prometheus.MustNewConstMetric(c.descCgMemHigh,
+				prometheus.CounterValue, float64(v), c.cfg.NodeName, unit)
+		}
+		if v, ok := ev["oom_kill"]; ok {
+			ch <- prometheus.MustNewConstMetric(c.descCgMemOOMKill,
+				prometheus.CounterValue, float64(v), c.cfg.NodeName, unit)
 		}
 	}
 }

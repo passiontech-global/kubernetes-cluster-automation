@@ -633,6 +633,12 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			}(),
 			CPUDeliveredInterval: envDuration(
 				"NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL", 2*time.Minute),
+			// W7-H5/H6 telemetry files.
+			ConntrackStatFile: getenv("NODE_HOST_AGENT_CONNTRACK_STAT_FILE",
+				"/proc/net/stat/nf_conntrack"),
+			ARPTableFile: getenv("NODE_HOST_AGENT_ARP_TABLE_FILE",
+				"/proc/net/arp"),
+			CgroupMemUnits: envList("NODE_HOST_AGENT_CGROUP_MEM_UNITS"),
 		})
 		reg.MustRegister(hm)
 		// Standalone hosts have no Prometheus scrape — the legacy
@@ -699,7 +705,14 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 					MinRestartInterval:      envDuration("NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL", 30*time.Minute),
 					JournalDirs:             journalDirs,
 					JournalUnreadableNeeded: journalUnreadableNeeded,
-					Client:                  cs,
+					// W7 knobs — empty env → in-package defaults.
+					DStateStormThreshold:      envInt("NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD", 5),
+					CiliumEnvoyAdminURL:       getenv("NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL", ""),
+					LocalDNSProbeAddr:         getenv("NODE_HOST_AGENT_LOCALDNS_PROBE_ADDR", ""),
+					LocalDNSProbeName:         getenv("NODE_HOST_AGENT_LOCALDNS_PROBE_NAME", ""),
+					CalicoFelixReadyURL:       getenv("NODE_HOST_AGENT_CALICO_FELIX_READY_URL", ""),
+					CalicoOrphanVethThreshold: envInt("NODE_HOST_AGENT_CALICO_ORPHAN_VETH_THRESHOLD", 50),
+					Client:                    cs,
 				}, reg)
 				if err != nil {
 					logger().Error("workerhygiene setup failed", "error", err)

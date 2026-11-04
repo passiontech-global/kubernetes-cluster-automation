@@ -83,6 +83,9 @@ var logRules = []logRule{
 	// latch entry; the suspect:* line carrying the same detail is a
 	// throttled re-reminder, matching it too would double-count).
 	{"JournaldUnreadable", regexp.MustCompile(`STATE-ENTER: journal-unreadable`)},
+	// W7-H1: workerhygiene's d-state-storm latch-entry line —
+	// "ACTION d-state-storm: count=N runtime=M wchan=...".
+	{"KernelHungTasks", regexp.MustCompile(`ACTION:? *d-state-storm:`)},
 }
 
 // maxEventNote caps the Event note — the apiserver validates the

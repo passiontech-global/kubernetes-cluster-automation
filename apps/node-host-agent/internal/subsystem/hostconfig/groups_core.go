@@ -517,6 +517,28 @@ func (c *cyc) t16Pairs() [][2]string {
 		fileExistsNoRoot("/proc/sys/net/netfilter/nf_conntrack_max") {
 		p = append(p, [2]string{"net.netfilter.nf_conntrack_max", "262144"})
 	}
+	// W7-H5: give the IPv6 neighbour cache the same headroom as
+	// IPv4 — only when the kernel exposes the ndisc table (IPv6
+	// compiled out leaves no gc_thresh3 node to write to; an
+	// unconditional key would fail sysctl --system). Values come
+	// from the ipv6_neigh_sysctls var (defaults.yaml, same source
+	// as tcp_keepalive/bbr) with a hardcoded fallback matching the
+	// IPv4 tier so an older vars bundle still gets the tuning.
+	if c.r.fileExists("/proc/sys/net/ipv6/neigh/default/gc_thresh3") ||
+		fileExistsNoRoot("/proc/sys/net/ipv6/neigh/default/gc_thresh3") {
+		var v6 [][2]string
+		if c.t != nil {
+			v6 = c.sysctlPairs("ipv6_neigh_sysctls")
+		}
+		if len(v6) == 0 {
+			v6 = [][2]string{
+				{"net.ipv6.neigh.default.gc_thresh1", "8192"},
+				{"net.ipv6.neigh.default.gc_thresh2", "32768"},
+				{"net.ipv6.neigh.default.gc_thresh3", "65536"},
+			}
+		}
+		p = append(p, v6...)
+	}
 	return p
 }
 

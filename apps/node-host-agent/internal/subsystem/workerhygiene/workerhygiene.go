@@ -64,6 +64,15 @@
 //     the shared last-restart budget on a k0sworker restart. An
 //     exhausted budget latches state-kubelet-healthz-down instead —
 //     the NHC→SNR reboot escalation path.
+//   - W7 additions — d-state-storm (H1: >=5 total or >=2
+//     runtime-critical procs in uninterruptible sleep for
+//     ConsecNeeded cycles → state-d-state-storm → KernelHungTasks),
+//     systemd-scopes (H2: 30m reset-failed sweep of abandoned
+//     cri-containerd-*.scope units), the cilium-envoy xDS NACK guard
+//   - cilium-lrp-dns :53 datapath probe (H3), spegel-mirror (H4:
+//     Ready=False DaemonSet pod → delete + state latch), and
+//     calico-hygiene (H7: orphan cali* veth leak + felix :9099
+//     readiness — active only on calico nodes like cicd).
 //
 // Differences from the shell versions (documented, behaviour-equivalent):
 //   - `k0s ctr tasks ls` / `tasks kill` is replaced by scanning the
@@ -215,6 +224,27 @@ const (
 	// controller incident: broken journald left every journal-based
 	// check silently seeing "0 hits").
 	defaultJournalUnreadableNeeded = 5
+	// Wave-7 defaults (W7-H1..H7): the D-state storm thresholds
+	// (total procs OR runtime-critical procs), the 30m
+	// systemd-scope reaper cadence, the envoy admin stats +
+	// node-local-dns :53 probe targets, the spegel pod maturity
+	// floor, and the calico guard knobs.
+	defaultDStateStormThreshold = 5
+	dStateRuntimeMin            = 2 // runtime-critical D-state procs → storm
+	systemdScopeScanInterval    = 30 * time.Minute
+	defaultCiliumEnvoyAdminURL  = "http://127.0.0.1:9901/stats?filter=update_rejected"
+	// The LRP datapath probe targets the kube-dns ClusterIP — the
+	// CiliumLocalRedirectPolicy's serviceMatcher redirects
+	// 10.96.0.10:53 to the local cache pod, so this exercises the
+	// real frontend→backend path from the host netns (socket-LB).
+	// 169.254.20.10 only exists in the legacy hostNetwork/iptables
+	// mode (calico cluster, where this check is dormant) — probing
+	// it on a cilium node always fails → false-positive pod kills.
+	defaultLocalDNSProbeAddr      = "10.96.0.10:53"
+	defaultLocalDNSProbeName      = "kubernetes.default.svc.cluster.local"
+	spegelMinPodAge               = 3 * time.Minute
+	defaultCalicoFelixReadyURL    = "http://127.0.0.1:9099/readiness"
+	defaultCalicoOrphanVethThresh = 50 // cali* ifaces above the pod count → leak
 )
 
 // Check names — prometheus `check` label + log context.
@@ -239,6 +269,11 @@ const (
 	checkCiliumMTU   = "cilium-mtu"         // B4
 	checkCiliumWG    = "cilium-wg-peers"    // W5.6
 	checkDiskBloat   = "disk-bloat"         // W6.3
+	checkDState      = "d-state-storm"      // W7-H1
+	checkSysScopes   = "systemd-scopes"     // W7-H2
+	checkCiliumLRP   = "cilium-lrp-dns"     // W7-H3
+	checkSpegel      = "spegel-mirror"      // W7-H4
+	checkCalico      = "calico-hygiene"     // W7-H7
 )
 
 // stateJournalUnreadable is the blindness latch the journal-read
@@ -333,6 +368,15 @@ type Config struct {
 	K0sDiskBloatCriticalWatermark float64
 	DiskBloatPodThresholdBytes    int64
 	DiskBloatScanInterval         time.Duration
+	// Wave-7 knobs: H1 D-state storm threshold, H3 envoy admin
+	// stats URL + the node-local-dns :53 datapath probe target,
+	// H7 calico orphan-veth headroom + felix readiness probe.
+	DStateStormThreshold      int    // total D-state procs → storm latch (5)
+	CiliumEnvoyAdminURL       string // envoy :9901 /stats?filter=update_rejected
+	LocalDNSProbeAddr         string // node-local-dns :53 probe target (169.254.20.10:53)
+	LocalDNSProbeName         string // query name the DNS probe resolves
+	CalicoFelixReadyURL       string // calico-node felix :9099/readiness probe
+	CalicoOrphanVethThreshold int    // cali* ifaces above the pod count → leak (50)
 
 	// killFn delivers signals — seam for tests (SIGKILL on pause /
 	// proxy-agent/shim/cilium pids, and signal-0 liveness probes).
@@ -390,6 +434,14 @@ type Config struct {
 	// makes the caller fall back to ReadyNodes-1. nil →
 	// Systemd.Exec default. Seam.
 	ciliumEncryptPeersFn func(ctx context.Context) (int, error)
+	// httpGetBody GETs a plain-HTTP endpoint and returns the body —
+	// the envoy admin stats page (W7-H3 xDS NACK guard). Seam.
+	httpGetBody func(ctx context.Context, url string, timeout time.Duration) ([]byte, error)
+	// dnsProbe sends one UDP DNS query for a fixed cluster name to
+	// addr and reports whether a well-formed answer returns before
+	// the deadline — the node-local-dns :53 datapath probe
+	// (W7-H3). Seam.
+	dnsProbe func(addr, name string, timeout time.Duration) bool
 
 	// JournalDirs are the host journal storage roots — the
 	// journal-unreadable latch may only fire while at least one
@@ -530,6 +582,53 @@ func (c *Config) applyDefaults() {
 	}
 	if c.DiskBloatScanInterval <= 0 {
 		c.DiskBloatScanInterval = diskBloatScanInterval
+	}
+	if c.DStateStormThreshold <= 0 {
+		c.DStateStormThreshold = defaultDStateStormThreshold
+	}
+	if c.CiliumEnvoyAdminURL == "" {
+		c.CiliumEnvoyAdminURL = defaultCiliumEnvoyAdminURL
+	}
+	if c.LocalDNSProbeAddr == "" {
+		c.LocalDNSProbeAddr = defaultLocalDNSProbeAddr
+	}
+	if c.LocalDNSProbeName == "" {
+		c.LocalDNSProbeName = defaultLocalDNSProbeName
+	}
+	if c.CalicoFelixReadyURL == "" {
+		c.CalicoFelixReadyURL = defaultCalicoFelixReadyURL
+	}
+	if c.CalicoOrphanVethThreshold <= 0 {
+		c.CalicoOrphanVethThreshold = defaultCalicoOrphanVethThresh
+	}
+	if c.httpGetBody == nil {
+		// Plain HTTP (no TLS) — the envoy admin stats page lives on
+		// loopback :9901. A non-200 is an error: the reject-delta
+		// verdict is unreadable, not "zero".
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.IdleConnTimeout = 90 * time.Second
+		client := &http.Client{Transport: tr}
+		c.httpGetBody = func(ctx context.Context, url string, timeout time.Duration) ([]byte, error) {
+			pctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+				return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+			}
+			return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		}
+	}
+	if c.dnsProbe == nil {
+		c.dnsProbe = probeDNSUDP
 	}
 	if c.killFn == nil {
 		c.killFn = func(pid int, sig syscall.Signal) error {
@@ -789,6 +888,10 @@ var (
 	// (kubepods-burstable-pod<8_4_4_4_12>.slice), some runtimes keep
 	// dashes; both normalize to the dashed form.
 	podUIDCgroupRe = regexp.MustCompile(`pod([0-9a-fA-F_-]{36})`)
+	// W7 pod matchers — anchored like konnPodRe/dnsPodRe.
+	nldPodRe        = regexp.MustCompile(`^node-local-dns-[a-z0-9]+$`) // H3 LRP DNS guard
+	spegelPodRe     = regexp.MustCompile(`^spegel-[a-z0-9]+$`)         // H4 P2P mirror
+	calicoNodePodRe = regexp.MustCompile(`^calico-node-[a-z0-9]+$`)    // H7 felix
 )
 
 // Hygiene runs the worker checks on one ticker.
@@ -850,6 +953,21 @@ type Hygiene struct {
 	// lastIngestScan is the last time the ingest GC walked the
 	// ingest dir — the 6h periodic trigger (A3).
 	lastIngestScan time.Time
+
+	// Wave-7 counters/state: H1 d-state storm streak, H2 last
+	// systemd scope sweep, H3 envoy xDS NACK streak (+ the
+	// baseline/last-seen reject sums) and the node-local-dns probe
+	// streak, H4 spegel ready-fail streak, H7 calico veth-leak and
+	// felix readiness streaks.
+	dstateFails      int
+	lastScopeScan    time.Time
+	envoyXDSInit     bool
+	envoyXDSLast     uint64
+	envoyXDSFails    int
+	nldFails         int
+	spegelFails      int
+	calicoVethFails  int
+	calicoFelixFails int
 
 	// rateMu serialises rate-budget check+spend pairs: the feeder
 	// goroutine (remediate G5/G6) and Cycle checks compete for the
@@ -1156,6 +1274,21 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	})
 	run(checkJournald, func() {
 		h.checkJournaldIntegrity(ctx, workerActive)
+	})
+	run(checkDState, func() {
+		h.checkDStateTasks(pidsOnce, workerActive)
+	})
+	run(checkSysScopes, func() {
+		h.checkSystemdScopes(ctx, workerActive)
+	})
+	run(checkCiliumLRP, func() {
+		h.checkCiliumLRPDNS(ctx, pods, apiOK, workerActive)
+	})
+	run(checkSpegel, func() {
+		h.checkSpegelMirror(ctx, pods, apiOK, workerActive)
+	})
+	run(checkCalico, func() {
+		h.checkCalicoHygiene(ctx, pods, apiOK, workerActive)
 	})
 }
 
@@ -3865,6 +3998,31 @@ func (h *Hygiene) checkCiliumEnvoy(ctx context.Context, workerActive bool) {
 		h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
+	// W7-H3: xDS NACK guard — envoy can answer /ready=200 while
+	// rejecting every config push (cds/lds/rds update_rejected
+	// climbing → Gateway/Gateway API routes 404/503 while their API
+	// objects report Accepted:True). Positive deltas for
+	// ConsecNeeded consecutive cycles latch
+	// state-cilium-envoy-xds-reject and restart envoy through the
+	// same last-cilium-envoy-restart budget. Runs BEFORE the ready
+	// probe's early-return so a green /ready can't hide the wedge.
+	if reject, inconclusive := h.evalEnvoyXDS(ctx); inconclusive {
+		// Stats page unreadable — inconclusive, keep the streak
+		// (a dead envoy fails its own ready probe next).
+	} else if reject {
+		h.envoyXDSFails++
+	} else {
+		h.envoyXDSFails = 0
+		h.stateExit("cilium-envoy-xds-reject")
+	}
+	if h.envoyXDSFails >= h.cfg.ConsecNeeded {
+		h.stateEnter("cilium-envoy-xds-reject",
+			fmt.Sprintf("update_rejected=%d fails=%d",
+				h.envoyXDSLast, h.envoyXDSFails))
+		h.killCiliumEnvoy(tasks,
+			fmt.Sprintf("xDS update_rejected deltas %d consecutive cycles",
+				h.envoyXDSFails))
+	}
 	code, err := h.cfg.probeHTTPStatus(ctx,
 		h.cfg.CiliumEnvoyReadyURL, ciliumProbeTime)
 	if err == nil && code == http.StatusOK {
@@ -4450,4 +4608,598 @@ func (h *Hygiene) checkDiskBloat(ctx context.Context, pods []corev1.Pod,
 		h.actions.WithLabelValues(checkDiskBloat, "pod_evict").Inc()
 	}
 	h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+}
+
+// --- Check: d-state-storm (W7-H1) ---
+// A wedged block device (btrfs/jbd2 journal), loop device
+// (baggageclaim/LocalPV) or kernel mutex drops the calling process
+// into D (uninterruptible sleep) — un-killable, invisible to the
+// zombie storm (state Z) and the statfs stall probes (the mount
+// still answers while a runc/shim sits frozen in fsync/umount).
+// The check reuses the per-cycle pid sweep: every state-D process
+// is counted, and the runtime-critical subset (runc, containerd*,
+// k0s*, kubelet, btrfs-*, jbd2/* kernel threads) is tallied
+// separately — a storm in THOSE wedges the pod lifecycle, not just
+// one workload. /proc/<pid>/wchan names the kernel function holding
+// the task, reported in the latch-entry ACTION line. No remedy is
+// attempted (a D-state process survives SIGKILL and every service
+// restart): the latch drives nodereporter's KernelHungTasks
+// condition for the NHC→SNR reboot escalation path.
+
+// procStatCommState parses /proc/<pid>/stat for comm + state — comm
+// sits between the FIRST '(' and the LAST ')' (it can hold spaces
+// and parens), state is the first field after that ')' (same trick
+// as procStatStatePPID).
+func (h *Hygiene) procStatCommState(pid int) (comm, state string, ok bool) {
+	data, err := os.ReadFile(h.procFile(pid, "stat"))
+	if err != nil {
+		return "", "", false
+	}
+	s := string(data)
+	i := strings.LastIndexByte(s, ')')
+	open := strings.IndexByte(s, '(')
+	if i < 0 || open < 0 || open > i {
+		return "", "", false
+	}
+	f := strings.Fields(s[i+1:])
+	if len(f) == 0 {
+		return "", "", false
+	}
+	return s[open+1 : i], f[0], true
+}
+
+// procWchan returns the kernel function a task is sleeping inside —
+// /proc/<pid>/wchan names it; "0" (running/not-sleeping) and
+// unreadable files report "".
+func (h *Hygiene) procWchan(pid int) string {
+	data, err := os.ReadFile(h.procFile(pid, "wchan"))
+	if err != nil {
+		return ""
+	}
+	w := strings.TrimSpace(string(data))
+	if w == "0" {
+		return ""
+	}
+	return w
+}
+
+// dstateRuntimeComm reports whether a /proc/<pid>/stat comm belongs
+// to the runtime-critical set — D-state here wedges the pod
+// lifecycle (runc, containerd + containerd-shim, k0s workers,
+// kubelet) or signals a hung fs journal (btrfs-*/jbd2/* kernel
+// threads). Prefixes, not exact names: comm is truncated at 15
+// bytes ("containerd-shim" is the shim's real comm) and jbd2
+// threads embed the device (jbd2/vda1-8).
+func dstateRuntimeComm(comm string) bool {
+	for _, p := range []string{
+		"runc", "containerd", "k0s", "kubelet", "btrfs-", "jbd2/",
+	} {
+		if strings.HasPrefix(comm, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Hygiene) checkDStateTasks(pidsOnce func() []int, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkDState, "gated").Inc()
+		return
+	}
+	total, runtime := 0, 0
+	// A small comm=wchan sample for the ACTION line — the kernel
+	// function holding the tasks is the triage hint (umount_tree /
+	// wait_transaction_locked / blk_mq_get_tag).
+	wchans := make([]string, 0, 4)
+	for _, pid := range pidsOnce() {
+		comm, state, ok := h.procStatCommState(pid)
+		if !ok || state != "D" {
+			continue
+		}
+		total++
+		if dstateRuntimeComm(comm) {
+			runtime++
+		}
+		if len(wchans) < 4 {
+			if w := h.procWchan(pid); w != "" {
+				wchans = append(wchans, comm+"="+w)
+			}
+		}
+	}
+	if total < h.cfg.DStateStormThreshold && runtime < dStateRuntimeMin {
+		h.dstateFails = 0
+		h.stateExit("d-state-storm")
+		h.cycles.WithLabelValues(checkDState, "ok").Inc()
+		return
+	}
+	h.dstateFails++
+	if h.dstateFails < h.cfg.ConsecNeeded {
+		h.appendLog(fmt.Sprintf(
+			"suspect: d-state-storm count=%d runtime=%d (check %d/%d)",
+			total, runtime, h.dstateFails, h.cfg.ConsecNeeded))
+		h.cycles.WithLabelValues(checkDState, "ok").Inc()
+		return
+	}
+	if !h.stateExists("d-state-storm") {
+		// NPD contract: nodereporter maps this line to the
+		// KernelHungTasks Event + problem_counter — logged once per
+		// latch entry (the !stateExists gate, checkCiliumMTU parity).
+		h.appendLog(fmt.Sprintf(
+			"ACTION d-state-storm: count=%d runtime=%d wchan=%s",
+			total, runtime, strings.Join(wchans, ",")))
+	}
+	h.stateEnter("d-state-storm",
+		fmt.Sprintf("count=%d runtime=%d", total, runtime))
+	h.cycles.WithLabelValues(checkDState, "ok").Inc()
+}
+
+// --- Check: systemd-scopes (W7-H2) ---
+// On high-churn nodes (cicd's Concourse/Tekton/Shipwright build
+// pods, crashloop storms) PID 1 leaks transient
+// cri-containerd-*.scope units in the failed state — they pile into
+// systemd's unit hash table and every D-Bus call kubelet/containerd
+// makes (sandbox create) slows from ms to seconds (kubernetes
+// #104029). A 30m sweep lists the failed scopes and resets them —
+// reset-failed is safe on live scopes (it only clears the failed
+// bookkeeping of already-dead units).
+
+func (h *Hygiene) checkSystemdScopes(ctx context.Context, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkSysScopes, "gated").Inc()
+		return
+	}
+	if h.cfg.Systemd == nil {
+		h.cycles.WithLabelValues(checkSysScopes, "gated").Inc()
+		return
+	}
+	if h.cfg.nowFn().Sub(h.lastScopeScan) < systemdScopeScanInterval {
+		h.cycles.WithLabelValues(checkSysScopes, "ok").Inc()
+		return
+	}
+	out, err := h.cfg.Systemd.Exec(ctx, "systemctl", "list-units",
+		"--type=scope", "--state=failed", "--no-legend", "--plain",
+		"cri-containerd-*.scope")
+	if err != nil {
+		// A transient systemctl/D-Bus failure is inconclusive — the
+		// scan must NOT stamp (a stamped failure defers the retry a
+		// full interval) and zero evidence was gathered.
+		h.appendLog(fmt.Sprintf(
+			"suspect: systemd-scopes list-units failed: %v (%s) — scan skipped",
+			err, strings.TrimSpace(out)))
+		h.cycles.WithLabelValues(checkSysScopes, "abort").Inc()
+		return
+	}
+	h.lastScopeScan = h.cfg.nowFn()
+	n := 0
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) > 0 &&
+			strings.HasSuffix(f[0], ".scope") {
+			n++
+		}
+	}
+	if n == 0 {
+		h.cycles.WithLabelValues(checkSysScopes, "ok").Inc()
+		return
+	}
+	// NPD contract line (reset-failed evidence in the watchdog log).
+	h.appendLog(fmt.Sprintf("ACTION: systemd-scopes reset-failed count=%d", n))
+	if rout, rerr := h.cfg.Systemd.Exec(ctx,
+		"systemctl", "reset-failed", "cri-containerd-*.scope"); rerr != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: systemd-scopes reset-failed failed: %v (%s)",
+			rerr, strings.TrimSpace(rout)))
+	} else {
+		h.actions.WithLabelValues(checkSysScopes, "reset_failed").Inc()
+	}
+	h.cycles.WithLabelValues(checkSysScopes, "ok").Inc()
+}
+
+// --- Check: cilium-envoy xDS NACK + node-local-dns LRP (W7-H3) ---
+// Two datapath wedges that leave every healthz green:
+//   - envoy rejects xDS pushes (cds/lds/rds update_rejected
+//     counters climbing) — the listener accepts connections but
+//     never programs new routes; Gateway API objects report
+//     Accepted:True while replies 404/503.
+//   - the LocalRedirectPolicy sends cluster :53 to the local
+//     node-local-dns pod whose UDP/TCP :53 listener is hung while
+//     its :8080 healthz still answers — every pod on the node loses
+//     DNS (the 8-day LRP outage shape). The API still reports the
+//     pod Ready=True, so the pod itself is the remedy target.
+
+// parseEnvoyXDSRejected sums the cds/lds/rds update_rejected
+// counters out of `envoy admin /stats?filter=update_rejected` —
+// lines look like "cluster_manager.cds.update_rejected: 3". A stat
+// counts toward the xDS NACK total when one dotted segment is
+// cds/lds/rds AND the name ends in update_rejected.
+func parseEnvoyXDSRejected(body []byte) uint64 {
+	var total uint64
+	for _, line := range strings.Split(string(body), "\n") {
+		name, val, ok := strings.Cut(line, ":")
+		if !ok || !strings.HasSuffix(strings.TrimSpace(name), "update_rejected") {
+			continue
+		}
+		match := false
+		for _, seg := range strings.Split(name, ".") {
+			if seg == "cds" || seg == "lds" || seg == "rds" {
+				match = true
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		if v, err := strconv.ParseUint(strings.TrimSpace(val), 10, 64); err == nil {
+			total += v
+		}
+	}
+	return total
+}
+
+// evalEnvoyXDS fetches the envoy admin update_rejected page and
+// reports whether the summed reject counters GREW since the last
+// successful read — the delta is the wedge signal (a node can carry
+// old rejects forever; only new NACKs mean pushes are failing now).
+// The first successful read only establishes the baseline.
+// inconclusive=true means the page could not be evaluated — the
+// caller keeps the streak untouched (a dead envoy also fails its
+// /ready probe and the B1 path owns that verdict).
+func (h *Hygiene) evalEnvoyXDS(ctx context.Context) (reject, inconclusive bool) {
+	if h.cfg.CiliumEnvoyAdminURL == "" {
+		return false, true
+	}
+	body, err := h.cfg.httpGetBody(ctx, h.cfg.CiliumEnvoyAdminURL, ciliumProbeTime)
+	if err != nil {
+		return false, true
+	}
+	total := parseEnvoyXDSRejected(body)
+	if !h.envoyXDSInit {
+		h.envoyXDSInit = true
+		h.envoyXDSLast = total
+		return false, false
+	}
+	reject = total > h.envoyXDSLast
+	h.envoyXDSLast = total
+	return reject, false
+}
+
+// probeDNSUDP sends one minimal A-record query to addr over UDP and
+// reports whether a well-formed reply returns before the deadline —
+// the node-local-dns datapath probe (W7-H3). Any reply matching the
+// query id proves :53 answers: NXDOMAIN/SERVFAIL still mean the
+// listener is alive; silence means the LRP datapath is wedged.
+func probeDNSUDP(addr, name string, timeout time.Duration) bool {
+	id := uint16(time.Now().UnixNano())
+	// Header: ID, flags 0x0100 (RD), QDCOUNT=1, AN/NS/AR=0.
+	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
+	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
+		if label == "" {
+			continue
+		}
+		q = append(q, byte(len(label)))
+		q = append(q, label...)
+	}
+	q = append(q, 0, 0, 1, 0, 1) // root label + QTYPE A + QCLASS IN
+	conn, err := net.DialTimeout("udp", addr, timeout)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write(q); err != nil {
+		return false
+	}
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	// ID echo + QR bit set (a response, not another query or a stray
+	// datagram sharing the id).
+	return err == nil && n >= 4 && buf[0] == q[0] && buf[1] == q[1] &&
+		buf[2]&0x80 != 0
+}
+
+// podReady reports whether the pod's Ready condition is True — the
+// API-side verdict the datapath guards contrast against (a pod
+// Ready=True whose service listener is dead is exactly the wedge
+// these checks heal).
+func podReady(p *corev1.Pod) bool {
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// checkCiliumLRPDNS probes the node-local resolver's :53 listener
+// while its pod claims Ready — a hung listener inside an LRP path
+// blackholes cluster DNS node-wide. Confirmed for ConsecNeeded
+// consecutive cycles → delete the node-local-dns pod on this node
+// (the DaemonSet respawns it with a fresh socket; last-nld-restart
+// 30m budget). Only evaluated on cilium nodes (cilium_host present)
+// — calico nodes serve local DNS without the LRP datapath.
+func (h *Hygiene) checkCiliumLRPDNS(ctx context.Context, pods []corev1.Pod,
+	apiOK, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCiliumLRP, "gated").Inc()
+		return
+	}
+	if _, err := os.Stat(filepath.Join(h.cfg.SysClassNet, "cilium_host")); err != nil {
+		// No cilium datapath — the LRP wedge can't exist here.
+		h.nldFails = 0
+		h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		return
+	}
+	// The plan gates on cilium-agent actually running: cilium_host
+	// persists while the agent is down, and a dead/wedged agent can
+	// break the :53 datapath itself — killing the nld pod then would
+	// mask the real failure (checkCilium owns the agent-down verdict).
+	agentTasks, ctrOK := h.ciliumAgentTasks()
+	if !ctrOK {
+		h.cycles.WithLabelValues(checkCiliumLRP, "abort").Inc()
+		return
+	}
+	if len(agentTasks) == 0 {
+		// Agent absent/dead — datapath verdict inconclusive; the LRP
+		// check stands down rather than punish a healthy pod.
+		h.nldFails = 0
+		h.cycles.WithLabelValues(checkCiliumLRP, "gated").Inc()
+		return
+	}
+	if !apiOK {
+		// Inconclusive — keep the streak like the other API-gated
+		// checks (a LIST flake must not count or clear evidence).
+		h.cycles.WithLabelValues(checkCiliumLRP, "abort").Inc()
+		return
+	}
+	var nld *corev1.Pod
+	for i := range pods {
+		p := &pods[i]
+		if p.Namespace == "kube-system" && nldPodRe.MatchString(p.Name) &&
+			p.DeletionTimestamp == nil && p.Status.Phase == corev1.PodRunning &&
+			podReady(p) {
+			nld = p
+			break
+		}
+	}
+	if nld == nil {
+		// No Ready node-local-dns pod → nothing owes a datapath
+		// answer (not-Running/NotReady pods are kubelet's problem).
+		h.nldFails = 0
+		h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		return
+	}
+	if h.cfg.dnsProbe(h.cfg.LocalDNSProbeAddr, h.cfg.LocalDNSProbeName,
+		ciliumProbeTime) {
+		h.nldFails = 0
+		h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		return
+	}
+	h.nldFails++
+	if h.nldFails < h.cfg.ConsecNeeded {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-lrp-dns :53 probe of %s failed while %s/%s Ready=True (check %d/%d)",
+			h.cfg.LocalDNSProbeAddr, nld.Namespace, nld.Name,
+			h.nldFails, h.cfg.ConsecNeeded))
+		h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		return
+	}
+	if !h.rateTrySpend("last-nld-restart", h.cfg.MinRestartInterval) {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-lrp-dns :53 probe fails %dx but pod restart in cooldown (<30m), skip",
+			h.nldFails))
+		h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		return
+	}
+	// Budget spent atomically BEFORE the delete (rate_spend parity).
+	h.appendLog(fmt.Sprintf(
+		"ACTION: cilium-lrp-dns deleted pod %s/%s - :53 probe failed %dx while Ready=True (LRP datapath wedge)",
+		nld.Namespace, nld.Name, h.nldFails))
+	if err := h.cfg.Client.CoreV1().Pods(nld.Namespace).Delete(ctx, nld.Name,
+		metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}); err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-lrp-dns delete %s/%s failed: %v",
+			nld.Namespace, nld.Name, err))
+	} else {
+		h.actions.WithLabelValues(checkCiliumLRP, "pod_delete").Inc()
+	}
+	h.nldFails = 0
+	h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+}
+
+// --- Check: spegel-mirror (W7-H4) ---
+// Containerd's mirror config on every node points image pulls at
+// the LOCAL spegel peer first. A wedged spegel pod (accepts TCP but
+// stalls TLS/HTTP headers) makes PullImage eat the full per-mirror
+// timeout before falling back — mass ErrImagePull exactly during a
+// rollout/drain. A Ready=False spegel DaemonSet pod for
+// ConsecNeeded cycles latches state-spegel-mirror-degraded and
+// deletes the pod (fresh socket + fresh state; last-spegel-restart
+// 30m budget). The 3m age floor keeps a just-scheduled pod from
+// being deleted mid-startup.
+
+func (h *Hygiene) checkSpegelMirror(ctx context.Context, pods []corev1.Pod,
+	apiOK, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkSpegel, "gated").Inc()
+		return
+	}
+	if !apiOK {
+		// Inconclusive — keep streak/latch exactly like teardown.
+		h.cycles.WithLabelValues(checkSpegel, "abort").Inc()
+		return
+	}
+	var sp *corev1.Pod
+	for i := range pods {
+		p := &pods[i]
+		if (p.Namespace != "spegel" && p.Namespace != "kube-system") ||
+			!spegelPodRe.MatchString(p.Name) ||
+			p.DeletionTimestamp != nil ||
+			p.Status.Phase != corev1.PodRunning ||
+			h.cfg.nowFn().Sub(p.CreationTimestamp.Time) < spegelMinPodAge {
+			continue
+		}
+		sp = p
+		break
+	}
+	if sp == nil || podReady(sp) {
+		// No spegel DS on this node, or the pod is healthy — either
+		// way the mirror datapath isn't our problem; clear stale
+		// evidence like checkCilium's no-agent path.
+		h.spegelFails = 0
+		h.stateExit("spegel-mirror-degraded")
+		h.cycles.WithLabelValues(checkSpegel, "ok").Inc()
+		return
+	}
+	h.spegelFails++
+	if h.spegelFails < h.cfg.ConsecNeeded {
+		h.appendLog(fmt.Sprintf(
+			"suspect: spegel-mirror pod %s/%s Ready=False (check %d/%d)",
+			sp.Namespace, sp.Name, h.spegelFails, h.cfg.ConsecNeeded))
+		h.cycles.WithLabelValues(checkSpegel, "ok").Inc()
+		return
+	}
+	h.stateEnter("spegel-mirror-degraded",
+		fmt.Sprintf("pod=%s/%s ready_fails=%d", sp.Namespace, sp.Name, h.spegelFails))
+	if !h.rateTrySpend("last-spegel-restart", h.cfg.MinRestartInterval) {
+		h.appendLog(fmt.Sprintf(
+			"suspect: spegel-mirror %s/%s Ready=False %dx but restart in cooldown (<30m), skip",
+			sp.Namespace, sp.Name, h.spegelFails))
+		h.cycles.WithLabelValues(checkSpegel, "ok").Inc()
+		return
+	}
+	// Budget spent atomically BEFORE the delete (rate_spend parity).
+	h.appendLog(fmt.Sprintf(
+		"ACTION: spegel-mirror deleted pod %s/%s - Ready=False %dx (containerd mirror points at a wedged peer)",
+		sp.Namespace, sp.Name, h.spegelFails))
+	if err := h.cfg.Client.CoreV1().Pods(sp.Namespace).Delete(ctx, sp.Name,
+		metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}); err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: spegel-mirror delete %s/%s failed: %v",
+			sp.Namespace, sp.Name, err))
+	} else {
+		h.spegelFails = 0
+		h.actions.WithLabelValues(checkSpegel, "pod_delete").Inc()
+	}
+	h.cycles.WithLabelValues(checkSpegel, "ok").Inc()
+}
+
+// --- Check: calico-hygiene (W7-H7) ---
+// The cicd cluster runs Calico, not Cilium — the cilium guard
+// family above is all dormant there, while calico has its own leak
+// modes: orphan cali* veth pairs left by failed CNI DELs (classic
+// on high-churn CI nodes) and a wedged felix datapath whose
+// :9099/readiness goes dark while the pod looks Running.
+//   - Check 1 (veth leak): cali* iface count > node pod count +
+//     CalicoOrphanVethThreshold for ConsecNeeded cycles →
+//     state-calico-veth-leak (log-only — mass veth deletion is not
+//     an unattended remedy).
+//   - Check 2 (felix readiness): a Running calico-node pod whose
+//     :9099/readiness fails ConsecNeeded cycles →
+//     state-calico-felix-down for the NHC escalation path.
+// The check is dormant everywhere cilium_host exists (cilium nodes)
+// and on hosts with no cali* ifaces at all (non-calico, hub nodes).
+
+// calicoIfaceCount counts cali* interfaces under SysClassNet; -1
+// when the sysfs root is unreadable (inconclusive).
+func (h *Hygiene) calicoIfaceCount() int {
+	entries, err := os.ReadDir(h.cfg.SysClassNet)
+	if err != nil {
+		return -1
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "cali") {
+			n++
+		}
+	}
+	return n
+}
+
+func (h *Hygiene) checkCalicoHygiene(ctx context.Context, pods []corev1.Pod,
+	apiOK, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCalico, "gated").Inc()
+		return
+	}
+	if _, err := os.Stat(filepath.Join(h.cfg.SysClassNet, "cilium_host")); err == nil {
+		// Cilium node — every calico verdict belongs to the cilium
+		// guard family; drop stale evidence like checkCiliumWGPeers.
+		h.calicoVethFails = 0
+		h.calicoFelixFails = 0
+		h.stateExit("calico-veth-leak")
+		h.stateExit("calico-felix-down")
+		h.cycles.WithLabelValues(checkCalico, "ok").Inc()
+		return
+	}
+	cali := h.calicoIfaceCount()
+	if cali <= 0 {
+		// No cali* veth at all — not a calico node (unreadable
+		// sysfs reports -1 the same way: nothing to verify).
+		h.calicoVethFails = 0
+		h.calicoFelixFails = 0
+		h.stateExit("calico-veth-leak")
+		h.stateExit("calico-felix-down")
+		h.cycles.WithLabelValues(checkCalico, "ok").Inc()
+		return
+	}
+	if !apiOK {
+		// Pod count is the leak baseline — an API flake makes the
+		// comparison invalid. Keep streaks/latches (inconclusive).
+		h.cycles.WithLabelValues(checkCalico, "abort").Inc()
+		return
+	}
+	// Check 1 — orphan veth leak.
+	if cali > len(pods)+h.cfg.CalicoOrphanVethThreshold {
+		h.calicoVethFails++
+		if h.calicoVethFails >= h.cfg.ConsecNeeded {
+			if !h.stateExists("calico-veth-leak") {
+				h.appendLog(fmt.Sprintf(
+					"suspect: calico-hygiene orphan veth leak cali=%d pods=%d threshold=%d — CNI DEL cleanup is leaking veth pairs",
+					cali, len(pods), h.cfg.CalicoOrphanVethThreshold))
+			}
+			h.stateEnter("calico-veth-leak",
+				fmt.Sprintf("cali=%d pods=%d", cali, len(pods)))
+		} else {
+			h.appendLog(fmt.Sprintf(
+				"suspect: calico-hygiene veth leak candidate cali=%d pods=%d (check %d/%d)",
+				cali, len(pods), h.calicoVethFails, h.cfg.ConsecNeeded))
+		}
+	} else {
+		h.calicoVethFails = 0
+		h.stateExit("calico-veth-leak")
+	}
+	// Check 2 — felix readiness, gated on a Running calico-node pod
+	// on this node (no pod → nothing to probe).
+	felixPod := false
+	for i := range pods {
+		p := &pods[i]
+		if (p.Namespace == "kube-system" || p.Namespace == "calico-system") &&
+			calicoNodePodRe.MatchString(p.Name) &&
+			p.DeletionTimestamp == nil && p.Status.Phase == corev1.PodRunning {
+			felixPod = true
+			break
+		}
+	}
+	switch {
+	case !felixPod || h.cfg.CalicoFelixReadyURL == "":
+		h.calicoFelixFails = 0
+		h.stateExit("calico-felix-down")
+	default:
+		code, err := h.cfg.probeHTTPStatus(ctx,
+			h.cfg.CalicoFelixReadyURL, ciliumProbeTime)
+		if err == nil && code == http.StatusOK {
+			h.calicoFelixFails = 0
+			h.stateExit("calico-felix-down")
+		} else {
+			h.calicoFelixFails++
+			if h.calicoFelixFails >= h.cfg.ConsecNeeded {
+				h.stateEnter("calico-felix-down",
+					fmt.Sprintf("readiness_probe_fails=%d", h.calicoFelixFails))
+			} else {
+				h.appendLog(fmt.Sprintf(
+					"suspect: calico-felix-down readiness probe code=%d err=%v (check %d/%d)",
+					code, err, h.calicoFelixFails, h.cfg.ConsecNeeded))
+			}
+		}
+	}
+	h.cycles.WithLabelValues(checkCalico, "ok").Inc()
 }
