@@ -2629,6 +2629,25 @@ func TestContainerdSockDownLatches(t *testing.T) {
 	}
 }
 
+// TestContainerdSocketDefaultPinsK0sPath: k0s puts the containerd
+// socket at /run/k0s/containerd.sock — the nested
+// /run/k0s/containerd/ dir is containerd's state root, NOT the
+// socket. Probing inside it is a permanent ENOENT that latches
+// containerd-sock-down on every agent start (the A4 bug this
+// pins).
+func TestContainerdSocketDefaultPinsK0sPath(t *testing.T) {
+	c := Config{}
+	c.applyDefaults()
+	if c.ContainerdSocket != "/host/run/k0s/containerd.sock" {
+		t.Fatalf("default ContainerdSocket=%q, want /host/run/k0s/containerd.sock",
+			c.ContainerdSocket)
+	}
+	if c.KubeletTokenPath != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
+		t.Fatalf("default KubeletTokenPath=%q, want the pod SA token path",
+			c.KubeletTokenPath)
+	}
+}
+
 // --- A3: ingest GC ---
 
 func TestCtrIngestGCCleansStaleDirs(t *testing.T) {
