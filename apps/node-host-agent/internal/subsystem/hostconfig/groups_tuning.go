@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
 )
 
@@ -1323,8 +1324,12 @@ func downloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time
 	if err == nil {
 		// fsync before rename — the staged artifact must be durable;
 		// Close's error counts too (NFS/delayed-write failures only
-		// surface there).
-		err = f.Sync()
+		// surface there). Drop the just-written pages after Sync —
+		// archives are staged for untarInstall/sha256FileOK, not for
+		// serving, and their cache would pin the pod's cgroup charge.
+		if err = f.Sync(); err == nil {
+			pagecache.Drop(f)
+		}
 	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
@@ -1351,7 +1356,9 @@ func untarInstall(tgz, member, dst string, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	// Drop the archive's read-behind pages on the way out — the tgz
+	// is only scanned once per install.
+	defer func() { pagecache.Drop(f); _ = f.Close() }()
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return err
@@ -1373,8 +1380,13 @@ func untarInstall(tgz, member, dst string, mode os.FileMode) error {
 			if err == nil {
 				// fsync before rename (writeManaged parity) — a
 				// crash after rename must never expose a zeroed
-				// binary at the install path.
-				err = out.Sync()
+				// binary at the install path. Then drop the staged
+				// pages: a freshly installed binary's cache charge
+				// belongs to whoever execs it, not to this pod's
+				// working set.
+				if err = out.Sync(); err == nil {
+					pagecache.Drop(out)
+				}
 			}
 			// Close's error counts too — delayed-write failures only
 			// surface there.

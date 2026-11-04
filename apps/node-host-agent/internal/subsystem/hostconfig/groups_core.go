@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"embed"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
 )
 
@@ -423,17 +423,21 @@ func (c *cyc) selfStageBinary() {
 	// the DS ships when src is unreadable (same rule
 	// resolveLocalBinary uses for the hubsync mirror).
 	src = strings.TrimSuffix(src, " (deleted)")
-	srcb, err := os.ReadFile(src)
+	// Streamed sha + pagecache drop for BOTH sides of the compare:
+	// hashing ~30 MB through os.ReadFile every cycle pinned ~60 MB
+	// of page cache inside the pod cgroup permanently.
+	srcSum, err := pagecache.Sha256File(src)
 	if err != nil && src != "/node-host-agent" {
-		srcb, err = os.ReadFile("/node-host-agent")
+		src = "/node-host-agent"
+		srcSum, err = pagecache.Sha256File(src)
 	}
 	if err != nil {
 		c.err("self-stage: cannot read running binary", "path", src, "error", err)
 		return
 	}
 	dst := "/usr/local/bin/node-host-agent"
-	if old, err := os.ReadFile(r.hp(dst)); err == nil &&
-		sha256.Sum256(old) == sha256.Sum256(srcb) {
+	if oldSum, err := pagecache.Sha256File(r.hp(dst)); err == nil &&
+		oldSum == srcSum {
 		// host already carries this exact build — still re-tighten a
 		// drifted mode: the hostPath consumer needs the exec bit.
 		if fi, serr := os.Stat(r.hp(dst)); serr == nil && fi.Mode().Perm() != 0o755 {
@@ -441,6 +445,11 @@ func (c *cyc) selfStageBinary() {
 				c.err("self-stage: chmod 0755 failed", "path", dst, "error", cerr)
 			}
 		}
+		return
+	}
+	srcb, err := pagecache.ReadFile(src)
+	if err != nil {
+		c.err("self-stage: cannot read running binary", "path", src, "error", err)
 		return
 	}
 	if _, err := r.writeManaged(dst, srcb, 0o755); err != nil {
@@ -1303,12 +1312,11 @@ func sha256FileOK(path, wantHex string) bool {
 	if wantHex == "" {
 		return true
 	}
-	b, err := os.ReadFile(path)
+	sum, err := pagecache.Sha256File(path)
 	if err != nil {
 		return false
 	}
-	sum := sha256.Sum256(b)
-	return strings.EqualFold(hex.EncodeToString(sum[:]), wantHex)
+	return strings.EqualFold(sum, wantHex)
 }
 
 func (c *cyc) markerBase() string {

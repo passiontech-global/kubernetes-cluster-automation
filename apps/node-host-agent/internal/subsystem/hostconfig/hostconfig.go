@@ -34,6 +34,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
 )
 
@@ -397,10 +398,12 @@ func (r *Reconciler) runBudget(ctx context.Context, budget time.Duration, name s
 // mode; default mode when creating.
 func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode) (bool, error) {
 	dst := r.hp(path)
-	if old, err := os.ReadFile(dst); err == nil {
-		sum := sha256.Sum256(old)
+	// Streamed hash + pagecache drop: dst can be a staged binary in
+	// the tens of MB (self-stage) — os.ReadFile would pull it into
+	// the pod's charged page cache every cycle.
+	if oldHex, err := pagecache.Sha256File(dst); err == nil {
 		nsum := sha256.Sum256(content)
-		if sum == nsum {
+		if oldHex == hex.EncodeToString(nsum[:]) {
 			return false, nil
 		}
 		if st, err := os.Stat(dst); err == nil {
@@ -441,6 +444,10 @@ func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode)
 		os.Remove(tmp)
 		return fail(err)
 	}
+	// Evict the just-written pages — a staged binary's cache charge
+	// outlives the write otherwise (see pagecache doc). After Sync
+	// the pages are clean, so DONTNEED drops them outright.
+	pagecache.Drop(f)
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
 		return fail(err)

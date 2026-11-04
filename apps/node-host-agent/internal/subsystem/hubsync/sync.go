@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"sort"
@@ -14,6 +13,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/pagecache"
 )
 
 // Cycle is one full converge round — the hub_converge CronJob run:
@@ -234,6 +235,9 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte) err
 			return err
 		}
 		err = putAtomic(tctx, conn, cfg.RemoteBinary, f, "0755")
+		// The streamed binary's pages were only needed for the put —
+		// same every-cycle charge problem as sha256File below.
+		pagecache.Drop(f)
 		f.Close()
 		if err != nil {
 			return err
@@ -434,16 +438,9 @@ func (s *Syncer) putIfChanged(ctx context.Context, c Conn, remotePath string, da
 }
 
 // sha256File hashes a local file without loading it whole — the
-// agent binary is ~15 MiB and cycles run every few minutes.
+// agent binary is ~15 MiB and cycles run every few minutes — and
+// drops its page-cache pages afterwards so the recurring hash does
+// not pin the file in the pod's charged cache (pagecache pkg doc).
 func sha256File(p string) (string, error) {
-	f, err := os.Open(p)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return pagecache.Sha256File(p)
 }
