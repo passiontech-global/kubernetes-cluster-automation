@@ -59,7 +59,7 @@ import (
 var (
 	corednsWantReqCPU = resource.MustParse("25m")
 	corednsWantReqMem = resource.MustParse("64Mi")
-	corednsWantLimCPU = resource.MustParse("300m")
+	corednsWantLimCPU = resource.MustParse("1000m")
 	corednsWantLimMem = resource.MustParse("256Mi")
 )
 
@@ -315,7 +315,7 @@ func corednsPatchBody(zoneWhen string, minDomains int, wantReplicas int32) ([]by
 					"readinessProbe": map[string]any{"timeoutSeconds": 5},
 					"resources": map[string]any{
 						"requests": map[string]any{"cpu": "25m", "memory": "64Mi"},
-						"limits":   map[string]any{"cpu": "300m", "memory": "256Mi"},
+						"limits":   map[string]any{"cpu": "1000m", "memory": "256Mi"},
 					},
 				}},
 				"topologySpreadConstraints": []any{

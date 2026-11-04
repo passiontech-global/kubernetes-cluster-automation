@@ -40,6 +40,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -78,7 +79,11 @@ type coreDNSWatchdog struct {
 	// panics methods below — fields so tests can stub log-stream,
 	// UDP:53 and :9153 access that the fake clientset cannot reach.
 	logHitFn func(ctx context.Context, pod string) string
-	dnsFn    func(ctx context.Context, podIP, fqdn string) bool
+	// dnsFn resolves fqdn through one coredns pod and returns the
+	// A-record IPs it answered — the W8-NM5 fallback verifies them
+	// against the live EndpointSlice/ClusterIP instead of accepting
+	// any answer as "fresh". nil → dnsProbe.
+	dnsFn    func(ctx context.Context, podIP, fqdn string) ([]string, error)
 	panicsFn func(ctx context.Context, podIP string) (float64, bool)
 }
 
@@ -132,11 +137,11 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	}
 
 	// ===== Layer 2: active freshness query =====
-	fqdn := w.probeFQDN(ctx)
+	fqdn, wantIPs := w.probeFQDN(ctx)
 	if fqdn == "" {
-		log.Info("dns: skip layer 2 — no service <10m old with a ready endpoint (inconclusive)")
+		log.Info("dns: skip layer 2 — no service <10m old and no usable endpointslice (inconclusive)")
 	} else {
-		log.Info("dns: probing each coredns pod", "fqdn", fqdn)
+		log.Info("dns: probing each coredns pod", "fqdn", fqdn, "wantIPs", len(wantIPs))
 		answered := 0
 		var failed []string
 		for name, ip := range podIP {
@@ -147,10 +152,10 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 				log.Info("dns: no podIP — skipping layer 2", "pod", name)
 				continue
 			}
-			if w.dnsFn(ctx, ip, fqdn) {
+			if ips, err := w.dnsFn(ctx, ip, fqdn); err == nil && dnsAnswerFresh(ips, wantIPs) {
 				answered++
 				delete(w.streak, name)
-				log.Info("dns: fresh", "pod", name)
+				log.Info("dns: fresh", "pod", name, "answers", len(ips))
 			} else {
 				failed = append(failed, name)
 			}
@@ -335,10 +340,21 @@ func (w *coreDNSWatchdog) logHit(ctx context.Context, pod string) string {
 	return ""
 }
 
-// probeFQDN returns <name>.<ns>.svc.cluster.local of the newest
-// Service <10m old having an EndpointSlice with a ready endpoint, or
-// "" when nothing qualifies (inconclusive).
-func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) string {
+// probeFQDN picks the layer-2 probe target: the newest Service <10m
+// old having an EndpointSlice with a ready endpoint — its delta
+// certainly crossed a healthy watch — returning its
+// <name>.<ns>.svc.cluster.local FQDN plus nil wantIPs (any answer
+// proves freshness).
+//
+// W8-NM5 fallback: on a quiet cluster no Service is <10m old, so the
+// old code skipped layer 2 entirely — exactly the steady-state where a
+// frozen watch rots longest. The fallback picks the most-recently-
+// CHANGED EndpointSlice (highest resourceVersion) that still carries a
+// ready endpoint and resolves its owning Service: the want set is the
+// Service's clusterIPs, or — for a headless service — the ready
+// endpoint pod IPs. A pod answering with anything else is serving a
+// frozen cache. Returns ("", nil) when nothing qualifies.
+func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) (string, map[string]bool) {
 	log := logf.FromContext(ctx)
 	// Page the cluster-wide Service list — an unbounded List forces
 	// etcd to serialize every Service into one response; 500-per-page
@@ -350,7 +366,7 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) string {
 			metav1.ListOptions{Limit: 500, Continue: cont})
 		if err != nil {
 			log.Info("dns: cannot list services — layer 2 inconclusive", "error", err)
-			return ""
+			return "", nil
 		}
 		svcItems = append(svcItems, page.Items...)
 		if page.Continue == "" {
@@ -379,10 +395,6 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) string {
 			created: s.CreationTimestamp.Time,
 		})
 	}
-	// Release the cluster-wide Service slice before issuing
-	// per-service EndpointSlice queries.
-	svcItems = nil
-
 	for _, svc := range cands {
 		if time.Since(svc.created) >= corednsLogSinceS*time.Second {
 			continue
@@ -398,17 +410,117 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) string {
 			for _, ep := range es.Endpoints {
 				// bash: conditions.ready == true — nil does NOT count.
 				if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
-					return svc.name + "." + svc.ns + ".svc.cluster.local"
+					return svc.name + "." + svc.ns + ".svc.cluster.local", nil
 				}
 			}
 		}
 	}
-	return ""
+	svcItems = nil
+	return w.probeFQDNFromSlices(ctx)
+}
+
+// probeFQDNFromSlices is the W8-NM5 fallback target: the
+// most-recently-changed EndpointSlice (highest resourceVersion —
+// slice objects carry no change timestamp, so the apiserver's RV is
+// the recency proxy) with at least one ready endpoint. The answer set
+// comes from the slice's Service: clusterIPs for a normal service,
+// the ready endpoint pod IPs for a headless one.
+func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[string]bool) {
+	log := logf.FromContext(ctx)
+	var best *discoveryv1.EndpointSlice
+	var bestRV int64
+	opts := metav1.ListOptions{Limit: 500}
+	for {
+		page, err := w.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).
+			List(ctx, opts)
+		if err != nil {
+			log.Info("dns: cannot list endpointslices — fallback inconclusive", "error", err)
+			return "", nil
+		}
+		for i := range page.Items {
+			es := &page.Items[i]
+			if es.Labels[discoveryv1.LabelServiceName] == "" {
+				continue
+			}
+			ready := false
+			for _, ep := range es.Endpoints {
+				if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
+					ready = true
+					break
+				}
+			}
+			if !ready {
+				continue
+			}
+			rv, err := strconv.ParseInt(es.ResourceVersion, 10, 64)
+			if err != nil || rv <= bestRV {
+				continue
+			}
+			best, bestRV = es, rv
+		}
+		if page.Continue == "" {
+			break
+		}
+		opts.Continue = page.Continue
+	}
+	if best == nil {
+		return "", nil
+	}
+	ns, svcName := best.Namespace, best.Labels[discoveryv1.LabelServiceName]
+	svc, err := w.cs.CoreV1().Services(ns).Get(ctx, svcName, metav1.GetOptions{})
+	if err != nil {
+		log.Info("dns: fallback slice's service unresolvable — inconclusive",
+			"service", ns+"/"+svcName, "error", err)
+		return "", nil
+	}
+	want := map[string]bool{}
+	if svc.Spec.ClusterIP != "" && svc.Spec.ClusterIP != corev1.ClusterIPNone {
+		want[svc.Spec.ClusterIP] = true
+		for _, ip := range svc.Spec.ClusterIPs {
+			want[ip] = true
+		}
+	} else {
+		// Headless: the A record IS the endpoint set.
+		for _, ep := range best.Endpoints {
+			if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
+				continue
+			}
+			for _, a := range ep.Addresses {
+				want[a] = true
+			}
+		}
+	}
+	if len(want) == 0 {
+		return "", nil
+	}
+	return svcName + "." + ns + ".svc.cluster.local", want
+}
+
+// dnsAnswerFresh reports whether a coredns pod's answer proves its
+// watch is alive: at least one A record, and — when the caller knows
+// the expected answer set — every returned IP inside it. A stale
+// replica either resolves NODATA (no records) or answers with IPs the
+// EndpointSlice no longer carries.
+func dnsAnswerFresh(ips []string, want map[string]bool) bool {
+	if len(ips) == 0 {
+		return false
+	}
+	if want == nil {
+		return true
+	}
+	for _, ip := range ips {
+		if !want[ip] {
+			return false
+		}
+	}
+	return true
 }
 
 // dnsProbe resolves fqdn directly through one coredns pod (UDP :53),
-// equivalent to `nslookup <fqdn> <podIP>`.
-func (w *coreDNSWatchdog) dnsProbe(ctx context.Context, podIP, fqdn string) bool {
+// equivalent to `nslookup <fqdn> <podIP>` — returning the A-record
+// addresses it answered so the caller can diff them against the live
+// endpoint set.
+func (w *coreDNSWatchdog) dnsProbe(ctx context.Context, podIP, fqdn string) ([]string, error) {
 	r := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -420,8 +532,7 @@ func (w *coreDNSWatchdog) dnsProbe(ctx context.Context, podIP, fqdn string) bool
 	// resolver's read/retries) — nslookup's default is ~5s.
 	pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	_, err := r.LookupHost(pctx, fqdn)
-	return err == nil
+	return r.LookupHost(pctx, fqdn)
 }
 
 // panics sums coredns_panics_total across label variants on the pod's

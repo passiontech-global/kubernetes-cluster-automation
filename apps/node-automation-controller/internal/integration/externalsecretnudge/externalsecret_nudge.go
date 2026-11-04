@@ -58,11 +58,24 @@ const (
 	esLastNudgeAnno = "node.ops/last-es-nudge"
 )
 
+// The external-secrets API exists at v1 AND v1beta1 — both GVRs are
+// listed so either serving version works (each List is tolerant of a
+// not-installed GVR). SecretStore joins ClusterSecretStore: ESO
+// defaults spec.secretStoreRef.kind to the namespaced SecretStore,
+// which is the common shape on these clusters.
 var (
-	clusterSecretStoreGVR = schema.GroupVersionResource{
-		Group: "external-secrets.io", Version: "v1beta1", Resource: "clustersecretstores"}
-	externalSecretGVR = schema.GroupVersionResource{
-		Group: "external-secrets.io", Version: "v1beta1", Resource: "externalsecrets"}
+	clusterSecretStoreGVRs = []schema.GroupVersionResource{
+		{Group: "external-secrets.io", Version: "v1", Resource: "clustersecretstores"},
+		{Group: "external-secrets.io", Version: "v1beta1", Resource: "clustersecretstores"},
+	}
+	secretStoreGVRs = []schema.GroupVersionResource{
+		{Group: "external-secrets.io", Version: "v1", Resource: "secretstores"},
+		{Group: "external-secrets.io", Version: "v1beta1", Resource: "secretstores"},
+	}
+	externalSecretGVRs = []schema.GroupVersionResource{
+		{Group: "external-secrets.io", Version: "v1", Resource: "externalsecrets"},
+		{Group: "external-secrets.io", Version: "v1beta1", Resource: "externalsecrets"},
+	}
 )
 
 type externalSecretNudge struct {
@@ -102,7 +115,7 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	stores, err := n.dyn.Resource(clusterSecretStoreGVR).List(ctx, metav1.ListOptions{})
+	stores, err := n.listFirst(ctx, clusterSecretStoreGVRs)
 	if err != nil {
 		// ESO CRDs absent on this cluster (flag enabled but the
 		// operator is not installed yet — e.g. a component opted in
@@ -115,21 +128,38 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 		}
 		return fmt.Errorf("list clustersecretstores: %w", err)
 	}
+	namespacedStores, err := n.listFirst(ctx, secretStoreGVRs)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			namespacedStores = nil // SecretStore absent — cluster-only install
+		} else {
+			return fmt.Errorf("list secretstores: %w", err)
+		}
+	}
 
 	recovered := false
 	seen := map[string]bool{}
-	for i := range stores.Items {
-		s := &stores.Items[i]
-		name := s.GetName()
-		seen[name] = true
-		ready, _ := shared.ReadyCond(s)
-		isReady := ready == "True"
-		prev, tracked := n.storeReady[name]
-		n.storeReady[name] = isReady
+	track := func(kind, ns, name string, isReady bool) {
+		key := kind + "/" + ns + "/" + name
+		seen[key] = true
+		prev, tracked := n.storeReady[key]
+		n.storeReady[key] = isReady
 		if tracked && !prev && isReady {
 			recovered = true
-			log.Info("ClusterSecretStore recovered (Ready False→True) — nudging stuck ExternalSecrets",
-				"store", name)
+			log.Info("SecretStore recovered (Ready False→True) — nudging stuck ExternalSecrets",
+				"store", key)
+		}
+	}
+	for i := range stores.Items {
+		s := &stores.Items[i]
+		ready, _ := shared.ReadyCond(s)
+		track("ClusterSecretStore", "", s.GetName(), ready == "True")
+	}
+	if namespacedStores != nil {
+		for i := range namespacedStores.Items {
+			s := &namespacedStores.Items[i]
+			ready, _ := shared.ReadyCond(s)
+			track("SecretStore", s.GetNamespace(), s.GetName(), ready == "True")
 		}
 	}
 	// Drop vanished stores so a delete+recreate re-seeds fresh.
@@ -156,14 +186,44 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 	return n.nudge(ctx, recovered)
 }
 
+// listFirst lists the first working GVR of a candidate set — the ESO
+// API serves v1 on current installs and v1beta1 on older ones; a
+// not-installed candidate is skipped, the first listable wins.
+func (n *externalSecretNudge) listFirst(ctx context.Context,
+	gvrs []schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
+	var lastErr error
+	for _, gvr := range gvrs {
+		list, err := n.dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
+		if err == nil {
+			return list, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// gvrForPatch returns the GVR the ES list answered on — patches must
+// land on the same served version.
+func (n *externalSecretNudge) listES(ctx context.Context) (*unstructured.UnstructuredList, schema.GroupVersionResource, error) {
+	var lastErr error
+	for _, gvr := range externalSecretGVRs {
+		list, err := n.dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
+		if err == nil {
+			return list, gvr, nil
+		}
+		lastErr = err
+	}
+	return nil, schema.GroupVersionResource{}, lastErr
+}
+
 // nudge stamps force-sync on every eligible ExternalSecret Ready=
 // False for longer than esStuckAge, at most once per esNudgeCooldown.
 // recovered=true is the edge fast-path (any stuck ES qualifies); with
-// recovered=false only ESs whose referenced ClusterSecretStore is
-// currently Ready=True qualify (state-based path).
+// recovered=false only ESs whose referenced stores are ALL Ready=True
+// qualify (state-based path).
 func (n *externalSecretNudge) nudge(ctx context.Context, recovered bool) error {
 	log := logf.FromContext(ctx)
-	list, err := n.dyn.Resource(externalSecretGVR).List(ctx, metav1.ListOptions{})
+	list, esGVR, err := n.listES(ctx)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("skip: external-secrets CRDs not installed")
@@ -231,7 +291,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered bool) error {
 		if err != nil {
 			return err
 		}
-		if _, err := n.dyn.Resource(externalSecretGVR).Namespace(es.GetNamespace()).Patch(ctx,
+		if _, err := n.dyn.Resource(esGVR).Namespace(es.GetNamespace()).Patch(ctx,
 			es.GetName(), types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 			// Tolerated per-ES failure: absorbed (log + continue,
 			// nil return) so it never reaches the periodic wrapper —
@@ -250,17 +310,27 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered bool) error {
 	return nil
 }
 
-// esStoreReady reports whether every SecretStore the ES can pull from
-// is a ClusterSecretStore currently reporting Ready=True. ESO defaults
-// an unset kind to SecretStore (namespaced) — only an explicit
-// kind=ClusterSecretStore qualifies, and ALL referenced stores must
-// qualify: a namespaced SecretStore ref, an absent ref set, or a
-// store we have never seen is "can't tell" → false.
+// esStoreReady reports whether every store the ES can pull from is
+// tracked AND currently Ready=True — ClusterSecretStore by name, or a
+// namespaced SecretStore in the ES's own namespace (ESO defaults an
+// unset kind to SecretStore). ALL referenced stores must qualify: an
+// absent ref set or a store we have never seen is "can't tell" →
+// false.
 func (n *externalSecretNudge) esStoreReady(es *unstructured.Unstructured) bool {
 	any, ready := false, true
 	esStoreRefs(es, func(name, kind string) {
-		r, tracked := n.storeReady[name]
-		if kind != "ClusterSecretStore" || !tracked || !r {
+		key := ""
+		switch kind {
+		case "ClusterSecretStore":
+			key = "ClusterSecretStore//" + name
+		case "", "SecretStore":
+			key = "SecretStore/" + es.GetNamespace() + "/" + name
+		default:
+			ready = false
+			return
+		}
+		r, tracked := n.storeReady[key]
+		if !tracked || !r {
 			ready = false
 			return
 		}

@@ -349,6 +349,52 @@ var ReplicatedSecretDrift = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while the replicated Secret's tls.crt differs from its source across consecutive scans.",
 }, []string{"namespace", "name", "source"})
 
+// ---------------------------------------------------------------------------
+// Wave 8 metrics (W8-CP3/W8-ST1/W8-ST2/W8-NM2-3/W4).
+// ---------------------------------------------------------------------------
+
+// SchedulerFrozen marks (1) pods Pending >=5m with no nodeName and no
+// PodScheduled condition while Ready uncordoned workers exist — the
+// kube-scheduler stopped scheduling (W8-CP3).
+var SchedulerFrozen = prometheus.NewGauge(prometheus.GaugeOpts{
+	Name: "node_automation_scheduler_frozen",
+	Help: "1 while unscheduled Pending pods accumulate past 5m despite Ready uncordoned workers.",
+})
+
+// VeleroBSLUnavailable marks (1) each velero.io BackupStorageLocation
+// whose status.phase is not Available (W8-ST1).
+var VeleroBSLUnavailable = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_velero_bsl_unavailable",
+	Help: "1 while the BackupStorageLocation reports a phase other than Available.",
+}, []string{"namespace", "name"})
+
+// ControlPlanePodHealsTotal counts control-plane/operator pods deleted
+// by the cluster-health mesh watchdogs — cilium-operator on
+// CiliumIPAMExhausted (W8-NM2), linkerd-destination/identity on the
+// wedged-watch signature (W8-NM3), and db operator pods deleted to
+// force master re-election for a masterless StatefulSet (W4
+// stateful-masterless extension).
+var ControlPlanePodHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_controlplane_pod_heals_total",
+	Help: "Control-plane/operator pods deleted to force re-election or resync, by component.",
+}, []string{"component"})
+
+// NodeHangCordonsTotal counts nodes preemptively cordoned by the W8-ST2
+// hang guard (FilesystemReadOnly / KernelHungTasks) before NHC/SNR
+// reboots them.
+var NodeHangCordonsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_node_hang_cordons_total",
+	Help: "Worker nodes patched spec.unschedulable after a sustained hang condition.",
+}, []string{"node"})
+
+// VolumeAttachmentFinalizersRemovedTotal counts wedged VolumeAttachment
+// finalizers stripped after the attach-detach cleanup provably died
+// (node gone, or out-of-service with zero non-DaemonSet pods) — W4.
+var VolumeAttachmentFinalizersRemovedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_volumeattachment_finalizers_removed_total",
+	Help: "Stuck VolumeAttachment finalizers stripped to free the volume, by node.",
+}, []string{"node"})
+
 // queues are the legacy shell-operator queue names — pre-instantiated
 // at 0 so /metrics always exposes every series (an empty CounterVec
 // emits nothing, and shell-operator emitted its counters eagerly).
@@ -400,7 +446,10 @@ func init() {
 		DragonflyMasterlessPodHealsTotal, LocalPVStrandedPods,
 		LocalPVEphemeralHealsTotal, PVCProvisioningStalled,
 		PVCProvisionerHealsTotal, OLMUnhealthyResources,
-		OLMOperatorHealsTotal, ReplicatedSecretDrift)
+		OLMOperatorHealsTotal, ReplicatedSecretDrift,
+		SchedulerFrozen, VeleroBSLUnavailable,
+		ControlPlanePodHealsTotal, NodeHangCordonsTotal,
+		VolumeAttachmentFinalizersRemovedTotal)
 	for _, q := range queues {
 		hookRunErrors.WithLabelValues(q)
 		reconcileErrors.WithLabelValues(q)

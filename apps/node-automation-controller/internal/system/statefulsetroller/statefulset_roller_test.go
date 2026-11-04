@@ -31,8 +31,9 @@ func srSTS(ns, name string, optedIn bool) *appsv1.StatefulSet {
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, Annotations: annos},
 		Spec: appsv1.StatefulSetSpec{
-			// The selector feeds the server-side pod-list filter in
-			// ownedPods — a real StatefulSet always carries one.
+			// BUG-C3: the membership gate requires spec.replicas —
+			// tests adjust it (and status.readyReplicas) to match
+			// their pod fixtures via srSetMembership.
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"app": name}},
 			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
@@ -49,6 +50,14 @@ func srSTS(ns, name string, optedIn bool) *appsv1.StatefulSet {
 			UpdateRevision:  "rev-new",
 		},
 	}
+}
+
+// srSetMembership pins the StatefulSet's desired/ready membership —
+// the BUG-C3 rollOne gate refuses to evict while
+// len(ownedPods) != spec.replicas or readyReplicas != spec.replicas.
+func srSetMembership(sts *appsv1.StatefulSet, replicas int32) {
+	sts.Spec.Replicas = &replicas
+	sts.Status.ReadyReplicas = replicas
 }
 
 // srPod builds a Ready, STS-owned pod on `revision`, Ready since
@@ -133,9 +142,11 @@ func TestStatefulSetRollerDeletesHighestStaleOrdinal(t *testing.T) {
 	})
 
 	t0 := time.Now()
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 3)
 	objs := srNodes(2)
 	objs = append(objs,
-		srSTS("apps", "db", true),
+		sts,
 		srPod("db", 0, "rev-old", 30*time.Minute),
 		srPod("db", 1, "rev-old", 30*time.Minute),
 		srPod("db", 2, "rev-new", 30*time.Minute))
@@ -260,9 +271,11 @@ func TestStatefulSetRollerPDBGate(t *testing.T) {
 		},
 		Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: 0},
 	}
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 1)
 	objs := srNodes(1)
 	objs = append(objs,
-		srSTS("apps", "db", true),
+		sts,
 		srPod("db", 0, "rev-old", 30*time.Minute),
 		pdb)
 	cs := fake.NewSimpleClientset(objs...)
@@ -306,9 +319,11 @@ func TestStatefulSetRollerPDBEmptySelectorGate(t *testing.T) {
 			Selector: &metav1.LabelSelector{}},
 		Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: 0},
 	}
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 1)
 	objs := srNodes(1)
 	objs = append(objs,
-		srSTS("apps", "db", true),
+		sts,
 		srPod("db", 0, "rev-old", 30*time.Minute),
 		pdb)
 	cs := fake.NewSimpleClientset(objs...)
@@ -328,9 +343,11 @@ func TestStatefulSetRollerMissingRevisionLabel(t *testing.T) {
 	t0 := time.Now()
 	unlabeled := srPod("db", 1, "", 30*time.Minute)
 	delete(unlabeled.Labels, stsRevisionHashLabel)
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 2)
 	objs := srNodes(1)
 	objs = append(objs,
-		srSTS("apps", "db", true),
+		sts,
 		srPod("db", 0, "rev-old", 30*time.Minute),
 		unlabeled)
 	cs := fake.NewSimpleClientset(objs...)
@@ -348,18 +365,20 @@ func TestStatefulSetRollerMissingRevisionLabel(t *testing.T) {
 	}
 }
 
-// A member already terminating is excluded entirely: never a delete
-// candidate (the delete is in flight) and never a gate blocker (a
-// wedged-terminating member must not pin the roll forever).
-func TestStatefulSetRollerTerminatingPodIgnored(t *testing.T) {
+// BUG-C3: a member still Terminating means the previous eviction has
+// not landed — evicting again takes two members down at once, so the
+// roll holds until the set is full and Ready again.
+func TestStatefulSetRollerTerminatingPodBlocksRoll(t *testing.T) {
 	t0 := time.Now()
 	terminating := srPod("db", 2, "rev-old", 30*time.Minute)
 	termAt := metav1.NewTime(t0)
 	terminating.DeletionTimestamp = &termAt
 	terminating.Status.Conditions[0].Status = corev1.ConditionFalse
+	sts := srSTS("apps", "db", true)
+	srSetMembership(sts, 3)
 	objs := srNodes(1)
 	objs = append(objs,
-		srSTS("apps", "db", true),
+		sts,
 		srPod("db", 0, "rev-old", 30*time.Minute),
 		srPod("db", 1, "rev-new", 30*time.Minute),
 		terminating)
@@ -370,11 +389,33 @@ func TestStatefulSetRollerTerminatingPodIgnored(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if srPodExists(t, cs, "apps", "db-0") {
-		t.Fatal("stale pod not deleted — terminating member blocked the gates")
+	if !srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("pod evicted while a member is still terminating — membership gate must hold")
 	}
 	if !srPodExists(t, cs, "apps", "db-2") {
 		t.Fatal("terminating pod double-deleted")
+	}
+}
+
+// 2.1.6: the opt-in annotation also lands on the pod template —
+// operators propagate spec.annotations into the template without
+// annotating the StatefulSet object itself.
+func TestStatefulSetRollerPodTemplateAnnotationOptIn(t *testing.T) {
+	t0 := time.Now()
+	sts := srSTS("apps", "db", false) // STS object NOT annotated
+	sts.Spec.Template.Annotations = map[string]string{stsAutoRollAnno: "true"}
+	srSetMembership(sts, 1)
+	objs := srNodes(1)
+	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
+	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
+	r := srRoller(cs, t0)
+	r.driftSince["apps/db"] = t0.Add(-time.Hour)
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if srPodExists(t, cs, "apps", "db-0") {
+		t.Fatal("pod not rolled — pod-template opt-in annotation ignored")
 	}
 }
 

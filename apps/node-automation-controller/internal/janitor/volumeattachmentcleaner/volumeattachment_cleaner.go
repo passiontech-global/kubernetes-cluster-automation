@@ -48,6 +48,7 @@ package volumeattachmentcleaner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
@@ -56,6 +57,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -88,6 +90,12 @@ const (
 	// vaOutOfServiceTaint is the Kubernetes-native "node is fenced"
 	// signal — the same key dead-node-sweeper sets.
 	vaOutOfServiceTaint = "node.kubernetes.io/out-of-service"
+	// vaStuckTerminatingAge: a VA already carrying a DeletionTimestamp
+	// this long whose node is gone or fenced-and-empty is a wedged
+	// attach-detach cleanup — the external-attacher finalizer never
+	// drains because the node it reports to no longer exists. Past
+	// this age the cleaner strips the finalizers itself (W4).
+	vaStuckTerminatingAge = 15 * time.Minute
 )
 
 type volumeAttachmentCleaner struct {
@@ -236,9 +244,27 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	for i := range vas {
 		va := &vas[i]
 		if va.DeletionTimestamp != nil {
-			// Already terminating — a second delete cannot unstick a
-			// wedged attacher finalizer, and surfacing those is the
-			// stuck-terminating audit's job (C3b).
+			// W4: already terminating past the stuck age on a node
+			// that is gone (or fenced with zero non-DaemonSet pods)
+			// — the attacher finalizer can never drain, so the
+			// finalizers are stripped to free the volume. Inside
+			// the grace window it stays the stuck-terminating
+			// audit's surface (C3b), untouched here.
+			if now.Sub(va.DeletionTimestamp.Time) < vaStuckTerminatingAge {
+				continue
+			}
+			if !c.stuckTerminatingNodeDead(ctx, va, nodeByName, livePods) {
+				continue
+			}
+			if deleted+failed >= vaDeleteCap {
+				capped = true
+				break
+			}
+			if err := c.stripFinalizers(ctx, va); err != nil {
+				failed++
+				continue
+			}
+			deleted++
 			continue
 		}
 
@@ -298,6 +324,71 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", vaDeleteCap))
 	}
 	log.Info("sweep done", "deleted", deleted, "failed", failed)
+	return nil
+}
+
+// stuckTerminatingNodeDead is the W4 wedged-detach gate: the VA's
+// node is gone outright, or carries the out-of-service taint while a
+// live pod List proves zero non-DaemonSet pods remain — in both
+// shapes the external-attacher has no live node to report the detach
+// to, so the finalizer can never drain. Any pod-list failure fails
+// closed (the mount may still be real).
+func (c *volumeAttachmentCleaner) stuckTerminatingNodeDead(ctx context.Context,
+	va *storagev1.VolumeAttachment, nodeByName map[string]*corev1.Node,
+	livePods map[string]podProbe) bool {
+	log := logf.FromContext(ctx)
+	node, ok := nodeByName[va.Spec.NodeName]
+	if !ok {
+		return true // node object gone — nothing left to detach from
+	}
+	if !shared.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
+		return false
+	}
+	live, err := c.livePodCount(ctx, livePods, node.Name)
+	if err != nil {
+		if pr := livePods[node.Name]; !pr.reported {
+			pr.reported = true
+			livePods[node.Name] = pr
+			metrics.IncError(volumeAttachmentCleanerQueue)
+		}
+		log.Error(err, "pod list failed — keeping stuck VA finalizers (fail closed)",
+			"node", node.Name)
+		return false
+	}
+	return live == 0
+}
+
+// stripFinalizers merge-patches metadata.finalizers away on a wedged
+// VolumeAttachment — the last resort that frees the PV when the
+// attacher-side cleanup is dead. The patch pins resourceVersion so a
+// concurrent attacher write makes this a conflict (retried next
+// sweep) rather than a blind overwrite.
+func (c *volumeAttachmentCleaner) stripFinalizers(ctx context.Context,
+	va *storagev1.VolumeAttachment) error {
+	log := logf.FromContext(ctx)
+	log.Info("PATCH-FINALIZERS: stuck VolumeAttachment on a dead node — stripping finalizers to free the volume",
+		"va", va.Name, "node", va.Spec.NodeName,
+		"pv", ptr.Deref(va.Spec.Source.PersistentVolumeName, "?"),
+		"terminatingFor", c.nowFn().Sub(va.DeletionTimestamp.Time).Truncate(time.Minute),
+		"finalizers", va.Finalizers)
+	payload, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"resourceVersion": va.ResourceVersion,
+			"finalizers":      nil,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := c.cs.StorageV1().VolumeAttachments().Patch(ctx, va.Name,
+		types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		metrics.IncError(volumeAttachmentCleanerQueue)
+		log.Error(err, "stuck volumeattachment finalizer strip failed",
+			"va", va.Name, "node", va.Spec.NodeName)
+		return err
+	}
+	metrics.VolumeAttachmentFinalizersRemovedTotal.
+		WithLabelValues(va.Spec.NodeName).Inc()
 	return nil
 }
 

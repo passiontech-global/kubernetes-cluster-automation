@@ -113,6 +113,8 @@ const (
 	// alerting path under their own check names.
 	checkNameLocalPVStranded = "localpv-stranded-pods"
 	checkNameOLMHealth       = "olm-subscription-health"
+	// W8 — the Wave-8 checks live in cluster_health_wave8.go; their
+	// check-name constants are declared there alongside the code.
 )
 
 // C6 watchdog knobs — the KCM leader Lease name and the
@@ -469,6 +471,12 @@ type clusterHealthProber struct {
 	olmFirstSeen map[string]time.Time
 	olmEmitted   map[string]bool
 	olmHealed    map[string]time.Time
+
+	// W8 watchdog state (under mu):
+	//   - meshHealed: component → last control-plane pod delete —
+	//     the W8-NM2 cilium-operator (1h) and W8-NM3 linkerd (30m)
+	//     cooldowns, plus the W4 db-operator masterless heals.
+	meshHealed map[string]time.Time
 }
 
 func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg healthProbeConfig) *clusterHealthProber {
@@ -492,6 +500,9 @@ func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg 
 			checkNameRabbitMQSuspended:  boot,
 			checkNameLocalPVStranded:    boot,
 			checkNameOLMHealth:          boot,
+			checkNameSchedulerWatchdog:  boot,
+			checkNameMeshWatchdog:       boot,
+			checkNameNodeHang:           boot,
 		},
 		kcmFirstSeen:      map[string]time.Time{},
 		kcmFrozenReasons:  map[string]bool{},
@@ -511,6 +522,7 @@ func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg 
 		olmFirstSeen:      map[string]time.Time{},
 		olmEmitted:        map[string]bool{},
 		olmHealed:         map[string]time.Time{},
+		meshHealed:        map[string]time.Time{},
 	}
 }
 
@@ -562,6 +574,9 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 		{checkNameRabbitMQSuspended, p.checkRabbitMQSuspendedPods},
 		{checkNameLocalPVStranded, p.checkLocalPVStrandedPods},
 		{checkNameOLMHealth, p.checkOLMHealth},
+		{checkNameSchedulerWatchdog, p.checkSchedulerFrozen},
+		{checkNameMeshWatchdog, p.checkMeshControlPlane},
+		{checkNameNodeHang, p.checkNodeHangPreCordon},
 	}
 	for _, c := range checks {
 		res := c.probe(ctx)
@@ -933,14 +948,23 @@ type opStuckResource struct {
 // operatorTarget is one watched operator: the leader-election Lease
 // proving liveness, the pod label selector resolving the holder to a
 // pod when holderIdentity parsing fails, the stuck persistence window
-// and the CRD resources it is responsible for reconciling.
+// and the CRD resources it is responsible for reconciling. A nil
+// opStuckResource.owns means every stuck object counts.
+//
+// leaseOptional marks operators that legitimately run without a
+// leader-election Lease (external-secrets runs replicas:1 with
+// leaderElect:false): when the Lease is absent the watchdog falls
+// back to a Running pod matching podSelector as the liveness proof —
+// a live pod whose CRs still sit unreconciled is the same zombie
+// shape the Lease renewTime proves for electing operators.
 type operatorTarget struct {
-	name        string
-	leaseNS     string
-	leaseName   string
-	podSelector string
-	stuckMinAge time.Duration
-	resources   []opStuckResource
+	name          string
+	leaseNS       string
+	leaseName     string
+	podSelector   string
+	leaseOptional bool
+	stuckMinAge   time.Duration
+	resources     []opStuckResource
 }
 
 // staleObservedGeneration is the canonical "controller never saw the
@@ -1286,29 +1310,44 @@ var operatorTargets = []operatorTarget{
 		leaseName:   "cert-manager-controller",
 		podSelector: "app.kubernetes.io/name=cert-manager",
 		stuckMinAge: operatorStuckMinAge,
-		resources: []opStuckResource{{
-			gvr: schema.GroupVersionResource{
+		resources: []opStuckResource{
+			{gvr: schema.GroupVersionResource{
 				Group: "cert-manager.io", Version: "v1", Resource: "certificates"},
-			reason: opReasonNoConditions, stuck: noStatusConditions,
-		}},
+				reason: opReasonNoConditions, stuck: noStatusConditions},
+			// BUG-C5 — the same GVR additionally watched for
+			// observedGeneration lag: a Certificate the controller
+			// DID once reconcile can still be skipped by every
+			// later spec write.
+			{gvr: schema.GroupVersionResource{
+				Group: "cert-manager.io", Version: "v1", Resource: "certificates"},
+				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
+		},
 	},
 	{
 		name:    "external-secrets",
 		leaseNS: "external-secrets",
 		// Helm-default lease id — the deployment runs leaderElect:
-		// false today (single replica), so this target stays dormant
-		// until HA is switched on. externalsecret-operator-leader-
-		// election is the OLM-installed name, not the helm chart's.
-		leaseName:   "external-secrets-controller",
-		podSelector: "app.kubernetes.io/name=external-secrets",
-		stuckMinAge: operatorStuckMinAge,
+		// false today (single replica), so the leaseOptional pod
+		// fallback carries the liveness proof until HA is switched
+		// on. externalsecret-operator-leader-election is the
+		// OLM-installed name, not the helm chart's.
+		leaseName:     "external-secrets-controller",
+		podSelector:   "app.kubernetes.io/name=external-secrets",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{
 			{gvr: schema.GroupVersionResource{
 				Group: "external-secrets.io", Version: "v1", Resource: "externalsecrets"},
 				reason: opReasonNoConditions, stuck: noStatusConditions},
 			{gvr: schema.GroupVersionResource{
+				Group: "external-secrets.io", Version: "v1", Resource: "externalsecrets"},
+				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
+			{gvr: schema.GroupVersionResource{
 				Group: "external-secrets.io", Version: "v1beta1", Resource: "externalsecrets"},
 				reason: opReasonNoConditions, stuck: noStatusConditions},
+			{gvr: schema.GroupVersionResource{
+				Group: "external-secrets.io", Version: "v1beta1", Resource: "externalsecrets"},
+				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
 		},
 	},
 	{
@@ -1329,11 +1368,14 @@ var operatorTargets = []operatorTarget{
 		leaseName:   "operator.keda.sh",
 		podSelector: "app=keda-operator",
 		stuckMinAge: operatorStuckMinAge,
-		resources: []opStuckResource{{
-			gvr: schema.GroupVersionResource{
+		resources: []opStuckResource{
+			{gvr: schema.GroupVersionResource{
 				Group: "keda.sh", Version: "v1alpha1", Resource: "scaledobjects"},
-			reason: opReasonNoConditions, stuck: noStatusConditions,
-		}},
+				reason: opReasonNoConditions, stuck: noStatusConditions},
+			{gvr: schema.GroupVersionResource{
+				Group: "keda.sh", Version: "v1alpha1", Resource: "scaledobjects"},
+				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
+		},
 	},
 	{
 		name: "argocd-operator",
@@ -1346,11 +1388,14 @@ var operatorTargets = []operatorTarget{
 		leaseName:   "b23f6029.argoproj.io",
 		podSelector: "control-plane=controller-manager",
 		stuckMinAge: operatorStuckMinAge,
-		resources: []opStuckResource{{
-			gvr: schema.GroupVersionResource{
+		resources: []opStuckResource{
+			{gvr: schema.GroupVersionResource{
 				Group: "argoproj.io", Version: "v1beta1", Resource: "argocds"},
-			reason: opReasonNoPhase, stuck: emptyStatusPhase,
-		}},
+				reason: opReasonNoPhase, stuck: emptyStatusPhase},
+			{gvr: schema.GroupVersionResource{
+				Group: "argoproj.io", Version: "v1beta1", Resource: "argocds"},
+				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
+		},
 	},
 	{
 		name:        "kargo-controller",
@@ -1437,6 +1482,24 @@ func (p *clusterHealthProber) checkOperatorWorkqueues(ctx context.Context) probe
 		lease, err := p.cs.CoordinationV1().Leases(op.leaseNS).
 			Get(ctx, op.leaseName, metav1.GetOptions{})
 		switch {
+		case apierrors.IsNotFound(err) && op.leaseOptional:
+			// No leader-election Lease by design (replicas:1) —
+			// a Running pod under the selector is the liveness
+			// proof a renewing Lease provides elsewhere. lease
+			// stays nil: healOperatorLeader/leaderPods both
+			// tolerate it (selector fallback, no stamp persist).
+			alive, aerr := p.operatorPodRunning(ctx, op)
+			switch {
+			case aerr != nil:
+				if firstErr == nil {
+					firstErr = fmt.Errorf("list pods %s selector %q (%s): %w",
+						op.leaseNS, op.podSelector, op.name, aerr)
+				}
+				continue
+			case !alive:
+				p.resetOperator(op.name)
+				continue
+			}
 		case apierrors.IsNotFound(err):
 			// No leader Lease — no elected operator to judge.
 			p.resetOperator(op.name)
@@ -1457,22 +1520,34 @@ func (p *clusterHealthProber) checkOperatorWorkqueues(ctx context.Context) probe
 
 		// Collect this operator's live stuck signatures — keyed
 		// "operator/<gvr>/<ns>/<name>" so each object's persistence
-		// window is tracked independently.
+		// window is tracked independently. The list cache shares
+		// one List across the resource entries that watch the same
+		// GVR for different signatures (no_status_conditions +
+		// stale_observed_generation, BUG-C5).
 		live := map[string]bool{}
 		reasonsFrozen := map[string]bool{}
 		evalFailed := false
+		lists := map[schema.GroupVersionResource]*unstructured.UnstructuredList{}
 		for _, res := range op.resources {
-			list, err := p.dyn.Resource(res.gvr).List(ctx, metav1.ListOptions{})
-			switch {
-			case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-				continue // CRD not installed on this cluster
-			case err != nil:
-				evalFailed = true
-				if firstErr == nil {
-					firstErr = fmt.Errorf("list %s (%s): %w",
-						res.gvr.Resource, op.name, err)
+			list, listed := lists[res.gvr]
+			if !listed {
+				l, err := p.dyn.Resource(res.gvr).List(ctx, metav1.ListOptions{})
+				switch {
+				case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+					lists[res.gvr] = &unstructured.UnstructuredList{}
+					list = lists[res.gvr]
+				case err != nil:
+					evalFailed = true
+					if firstErr == nil {
+						firstErr = fmt.Errorf("list %s (%s): %w",
+							res.gvr.Resource, op.name, err)
+					}
+					lists[res.gvr] = &unstructured.UnstructuredList{}
+					list = lists[res.gvr]
+				default:
+					lists[res.gvr] = l
+					list = l
 				}
-				continue
 			}
 			for i := range list.Items {
 				o := &list.Items[i]
@@ -1561,6 +1636,25 @@ func (p *clusterHealthProber) checkOperatorWorkqueues(ctx context.Context) probe
 		strings.Join(keys, ", "))}
 }
 
+// operatorPodRunning is the leaseOptional liveness fallback: at
+// least one pod in the operator's namespace matching podSelector is
+// Running — a live pod whose CRs sit unreconciled is the same zombie
+// signature a renewing-lease zombie leader presents.
+func (p *clusterHealthProber) operatorPodRunning(ctx context.Context, op operatorTarget) (bool, error) {
+	pods, err := p.cs.CoreV1().Pods(op.leaseNS).List(ctx,
+		metav1.ListOptions{LabelSelector: op.podSelector})
+	if err != nil {
+		return false, err
+	}
+	for i := range pods.Items {
+		if pods.Items[i].Status.Phase == corev1.PodRunning &&
+			pods.Items[i].DeletionTimestamp == nil {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // resetOperator clears one operator's tracking and flips its held
 // frozen series back to 0 — called when the frozen-but-leader
 // diagnosis cannot apply (absent/stale Lease) so a signature that
@@ -1602,13 +1696,15 @@ func (p *clusterHealthProber) healOperatorLeader(ctx context.Context, log logr.L
 			"ago", now.Sub(last).Truncate(time.Minute))
 		return
 	}
-	if ts := lease.Annotations[operatorHealAnno]; ts != "" {
-		if t, err := time.Parse(time.RFC3339, ts); err == nil &&
-			now.Sub(t) < operatorHealCooldown {
-			log.Info("skip heal: persisted stamp inside cooldown",
-				"operator", op.name,
-				"ago", now.Sub(t).Truncate(time.Minute))
-			return
+	if lease != nil {
+		if ts := lease.Annotations[operatorHealAnno]; ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil &&
+				now.Sub(t) < operatorHealCooldown {
+				log.Info("skip heal: persisted stamp inside cooldown",
+					"operator", op.name,
+					"ago", now.Sub(t).Truncate(time.Minute))
+				return
+			}
 		}
 	}
 	// Maintenance mutex — "cannot verify" fails closed like every
@@ -1669,7 +1765,12 @@ func (p *clusterHealthProber) healOperatorLeader(ctx context.Context, log logr.L
 	p.opHealed[op.name] = now
 	p.mu.Unlock()
 	// Persist the stamp on the Lease — the durable half of the
-	// cooldown. A patch failure leaves the in-RAM half holding.
+	// cooldown. A nil lease (leaseOptional operators healing through
+	// the pod fallback) has nowhere to stamp; the in-RAM half is all
+	// there is. A patch failure leaves the in-RAM half holding.
+	if lease == nil {
+		return
+	}
 	payload, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{"annotations": map[string]any{
 			operatorHealAnno: now.UTC().Format(time.RFC3339),
@@ -1695,8 +1796,14 @@ func (p *clusterHealthProber) healOperatorLeader(ctx context.Context, log logr.L
 func (p *clusterHealthProber) leaderPods(ctx context.Context, op operatorTarget,
 	lease *coordinationv1.Lease) ([]corev1.Pod, error) {
 	holder := ""
-	if lease.Spec.HolderIdentity != nil {
-		holder = *lease.Spec.HolderIdentity
+	// The pod namespace is the Lease's own — for a nil lease
+	// (leaseOptional operators) the selector scans op.leaseNS.
+	podNS := op.leaseNS
+	if lease != nil {
+		podNS = lease.Namespace
+		if lease.Spec.HolderIdentity != nil {
+			holder = *lease.Spec.HolderIdentity
+		}
 	}
 	if holder != "" {
 		candidates := []string{holder}
@@ -1704,24 +1811,24 @@ func (p *clusterHealthProber) leaderPods(ctx context.Context, op operatorTarget,
 			candidates = append([]string{holder[:i]}, candidates...)
 		}
 		for _, name := range candidates {
-			pod, err := p.cs.CoreV1().Pods(lease.Namespace).
+			pod, err := p.cs.CoreV1().Pods(podNS).
 				Get(ctx, name, metav1.GetOptions{})
 			switch {
 			case apierrors.IsNotFound(err):
 				continue
 			case err != nil:
 				return nil, fmt.Errorf("get leader pod %s/%s: %w",
-					lease.Namespace, name, err)
+					podNS, name, err)
 			default:
 				return []corev1.Pod{*pod}, nil
 			}
 		}
 	}
-	pods, err := p.cs.CoreV1().Pods(lease.Namespace).List(ctx,
+	pods, err := p.cs.CoreV1().Pods(podNS).List(ctx,
 		metav1.ListOptions{LabelSelector: op.podSelector})
 	if err != nil {
 		return nil, fmt.Errorf("list operator pods in %s (selector %q): %w",
-			lease.Namespace, op.podSelector, err)
+			podNS, op.podSelector, err)
 	}
 	// The selector fallback cannot tell the leader from its
 	// standbys — deleting every matched replica wedges the operator
@@ -1977,7 +2084,15 @@ func (p *clusterHealthProber) checkStatefulMasterlessServices(ctx context.Contex
 	// is not safe to automate.
 	for _, d := range due {
 		if !dragonflyOwned(d.svc.sts) {
-			p.logStatefulPodRoles(ctx, log, d.svc)
+			// W4: a masterless stateful service owned by a known db
+			// operator gets the operator pod bounced to force
+			// re-election — the same re-election nudge as the
+			// dragonfly heal, on its own per-operator 30m cooldown.
+			if op := dbOperatorFor(d.svc.sts); op != "" {
+				p.healDBOperator(ctx, log, d.svc, op, now)
+			} else {
+				p.logStatefulPodRoles(ctx, log, d.svc)
+			}
 			continue
 		}
 		p.healDragonflyOperator(ctx, log, d.svc, now)
@@ -2152,6 +2267,111 @@ func smallestOrdinalPod(pods []corev1.Pod, stsName string) *corev1.Pod {
 		}
 	}
 	return best
+}
+
+// dbOperatorNames are the operators whose role-assignment wedge this
+// check heals — matched against the StatefulSet's labels, pod-template
+// labels and ownerReferences.
+var dbOperatorNames = []string{
+	"mariadb-operator", "pxc-operator", "psmdb-operator",
+	"pg-operator", "scylla-operator",
+}
+
+// dbOperatorFor returns the db operator name owning this StatefulSet,
+// or "" — matching any label value on the STS or its pod template
+// containing the operator name (managed-by/part-of/created-by and
+// operator-specific labels all end up containing it), plus
+// ownerReference names.
+func dbOperatorFor(sts *appsv1.StatefulSet) string {
+	for _, lbls := range []map[string]string{sts.Labels, sts.Spec.Template.Labels} {
+		for _, v := range lbls {
+			for _, op := range dbOperatorNames {
+				if strings.Contains(v, op) {
+					return op
+				}
+			}
+		}
+	}
+	for _, ref := range sts.OwnerReferences {
+		for _, op := range dbOperatorNames {
+			if strings.Contains(ref.Name, op) {
+				return op
+			}
+		}
+	}
+	return ""
+}
+
+// healDBOperator deletes a pod of the responsible db operator to
+// force master re-election — only fires while !MaintenanceActive
+// (the caller guarantees the >=5m zero-endpoint streak and
+// sts.Status.ReadyReplicas > 0; the check itself only reaches here
+// for ready STS). 30m per-operator cooldown on the in-RAM ledger.
+func (p *clusterHealthProber) healDBOperator(ctx context.Context, log logr.Logger,
+	sig masterSvc, operator string, now time.Time) {
+	const dbOperatorHealCooldown = 30 * time.Minute
+	p.mu.Lock()
+	last, ok := p.meshHealed[operator]
+	p.mu.Unlock()
+	if ok && now.Sub(last) < dbOperatorHealCooldown {
+		log.Info("skip heal: db operator inside cooldown", "operator", operator,
+			"ago", now.Sub(last).Truncate(time.Minute))
+		return
+	}
+	held, why, err := shared.MaintenanceActive(ctx, p.cs, p.dyn)
+	if err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
+			"operator", operator, "error", err)
+		return
+	}
+	if held {
+		log.Info("maintenance in progress — heal deferred", "operator", operator, "why", why)
+		return
+	}
+	pods, err := p.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Info("WARN: list pods failed — db operator heal deferred", "error", err)
+		return
+	}
+	// Find the oldest Running pod of the operator — its namespace is
+	// not fixed across installs, so the prefix match runs
+	// cluster-wide and the blast radius is capped at one pod.
+	var target *corev1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !strings.HasPrefix(pod.Name, operator+"-") ||
+			pod.Status.Phase != corev1.PodRunning ||
+			pod.DeletionTimestamp != nil {
+			continue
+		}
+		if target == nil || pod.CreationTimestamp.Before(&target.CreationTimestamp) {
+			target = pod
+		}
+	}
+	if target == nil {
+		log.Info("no running pod found for db operator — heal deferred",
+			"operator", operator)
+		return
+	}
+	uid := target.UID
+	if err := p.cs.CoreV1().Pods(target.Namespace).Delete(ctx, target.Name,
+		metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &uid},
+		}); err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Error(err, "db operator pod delete failed",
+			"pod", target.Namespace+"/"+target.Name, "operator", operator)
+		return
+	}
+	p.mu.Lock()
+	p.meshHealed[operator] = now
+	p.mu.Unlock()
+	metrics.ControlPlanePodHealsTotal.WithLabelValues(operator).Inc()
+	log.Info("DELETE: db operator pod — masterless service, forcing re-election",
+		"operator", operator, "pod", target.Namespace+"/"+target.Name,
+		"service", sig.ns+"/"+sig.svc, "statefulset", sig.sts.Name)
 }
 
 // logStatefulPodRoles dumps per-pod role-label diagnostics for a
@@ -2400,14 +2620,31 @@ func (p *clusterHealthProber) rabbitQuorumSafe(ctx context.Context, pod *corev1.
 		return false, fmt.Errorf("list peer pods of %s/%s: %w",
 			pod.Namespace, owner.Name, err)
 	}
+	// BUG-C2: quorum must be verified against the DESIRED membership,
+	// not just "every listed peer is Ready" — a scaled-down or
+	// mid-churn set where fewer than spec.replicas pods even exist
+	// cannot prove the delete leaves quorum intact. Require the full
+	// pod count AND replicas-1 READY peers (the suspended pod itself
+	// holds the remaining vote).
+	if sts.Spec.Replicas == nil {
+		return false, nil
+	}
+	want := int(*sts.Spec.Replicas)
+	if len(peers.Items) < want {
+		return false, nil
+	}
+	readyPeers := 0
 	for i := range peers.Items {
 		peer := &peers.Items[i]
 		if peer.UID == pod.UID {
 			continue
 		}
-		if !shared.PodReadyCond(peer) {
-			return false, nil
+		if shared.PodReadyCond(peer) {
+			readyPeers++
 		}
+	}
+	if readyPeers < want-1 {
+		return false, nil
 	}
 	return true, nil
 }

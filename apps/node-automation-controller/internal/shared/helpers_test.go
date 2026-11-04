@@ -3,6 +3,7 @@ package shared
 import (
 	"context"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -69,4 +70,35 @@ func reconcileErrorCount(t *testing.T, name string) float64 {
 		}
 	}
 	return 0
+}
+
+// BUG-C4 — NodeActivelyCordoned: only a FRESH cordon counts as an
+// active drain; a statically-cordoned node (>45m) does not.
+func TestNodeActivelyCordoned(t *testing.T) {
+	now := time.Now()
+	fresh := metav1.NewTime(now.Add(-10 * time.Minute))
+	old := metav1.NewTime(now.Add(-time.Hour))
+	for _, tc := range []struct {
+		name          string
+		unschedulable bool
+		taints        []corev1.Taint
+		want          bool
+	}{
+		{"schedulable", false, nil, false},
+		{"cordoned no taint (unverifiable)", true, nil, true},
+		{"cordoned nil TimeAdded", true,
+			[]corev1.Taint{{Key: UnschedulableTaintKey}}, true},
+		{"cordoned 10m ago", true,
+			[]corev1.Taint{{Key: UnschedulableTaintKey, TimeAdded: &fresh}}, true},
+		{"static cordon 60m ago", true,
+			[]corev1.Taint{{Key: UnschedulableTaintKey, TimeAdded: &old}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := &corev1.Node{Spec: corev1.NodeSpec{
+				Unschedulable: tc.unschedulable, Taints: tc.taints}}
+			if got := NodeActivelyCordoned(n, now); got != tc.want {
+				t.Fatalf("NodeActivelyCordoned=%v, want %v", got, tc.want)
+			}
+		})
+	}
 }

@@ -451,6 +451,12 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 			}
 			if st.haveLast && res.cacheRV == st.lastCacheRV && res.liveRV > st.lastLiveRV {
 				st.frozenStreak++
+			} else if res.cacheRV < res.liveRV {
+				// W8-CP1: the cache still trails the quorum RV — a
+				// quiet cycle (cache advanced a little, or nothing
+				// changed) must KEEP the frozen streak instead of
+				// re-arming it, or a slowly-lagging cache never
+				// reaches the wedge threshold.
 			} else {
 				st.frozenStreak = 0
 			}
@@ -546,6 +552,14 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 			continue
 		}
 		toRemove = append(toRemove, ip)
+	}
+	if len(toRemove) > 0 && g.client != nil {
+		// W8-CP1: quarantining the IP only protects NEW dials —
+		// pooled keep-alive connections to the wedged backend stay
+		// pinned until they break. Drop them so the very next probe
+		// (and anything sharing this transport) re-dials onto a
+		// healthy backend.
+		g.client.CloseIdleConnections()
 	}
 
 	// ---- Decide re-adds --------------------------------------------------

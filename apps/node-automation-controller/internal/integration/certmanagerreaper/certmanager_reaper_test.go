@@ -80,7 +80,9 @@ func cmrOrderOwned(ns, name, state string, age time.Duration, crName string) *un
 
 // cmrCertRequest builds a CertificateRequest owned by certName — the
 // second hop of the attribution chain (cert-manager sets the
-// Certificate ownerRef on every CR it creates).
+// Certificate ownerRef on every CR it creates). Freshly created and
+// Ready-True: a stuck Ready=False/old CR is built inline by the W8
+// stuck-CR tests instead.
 func cmrCertRequest(ns, name, certName string) *unstructured.Unstructured {
 	o := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "cert-manager.io/v1",
@@ -88,11 +90,24 @@ func cmrCertRequest(ns, name, certName string) *unstructured.Unstructured {
 	}}
 	o.SetNamespace(ns)
 	o.SetName(name)
+	o.SetCreationTimestamp(metav1.NewTime(time.Now()))
 	o.SetOwnerReferences([]metav1.OwnerReference{{
 		APIVersion: "cert-manager.io/v1",
 		Kind:       "Certificate",
 		Name:       certName,
 	}})
+	return o
+}
+
+// cmrCertRequestStuck is the W8 wedge: Ready=False (Pending/Failed)
+// for >30m under certName — reaped by reapStuckCR.
+func cmrCertRequestStuck(ns, name, certName string, age time.Duration) *unstructured.Unstructured {
+	o := cmrCertRequest(ns, name, certName)
+	o.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-age)))
+	_ = unstructured.SetNestedSlice(o.Object, []interface{}{
+		map[string]interface{}{"type": "Ready", "status": "False",
+			"lastTransitionTime": time.Now().Add(-age).UTC().Format(time.RFC3339)},
+	}, "status", "conditions")
 	return o
 }
 
@@ -726,5 +741,32 @@ func TestCertResetFromAnnotation(t *testing.T) {
 			t.Fatalf("annotation %q hydrated last=%v, want present=%v",
 				tc.in, st.last, tc.wantLast)
 		}
+	}
+}
+
+// W8 — a CertificateRequest wedged Ready=False >30m under a
+// Ready=False Certificate is deleted (budget-charged), so
+// cert-manager re-issues on the next sync.
+func TestCertManagerReaperStuckCertificateRequest(t *testing.T) {
+	objs := []runtime.Object{
+		cmrCert("app", "tls-stuck", "False", ""),
+		cmrCertRequestStuck("app", "cr-stuck", "tls-stuck", time.Hour),
+	}
+	dyn := testutil.NewFakeDyn(cmrListKinds, objs...)
+	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
+		resets: map[string]*certReset{}, crReaped: map[string]time.Time{}}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dyn.Resource(certificateRequestGVR).Namespace("app").
+		Get(ctx, "cr-stuck", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatal("stuck CertificateRequest not deleted")
+	}
+	if st := r.resets["app/tls-stuck"]; st == nil || st.total != 1 {
+		t.Fatalf("CR reap did not charge the shared budget: %+v", st)
+	}
+	// The 6h gap blocks an immediate second reap.
+	if r.reapStuckCR(ctx, cmrCert("app", "tls-stuck", "False", ""), time.Now()) {
+		t.Fatal("second CR reap fired inside the 6h cooldown")
 	}
 }

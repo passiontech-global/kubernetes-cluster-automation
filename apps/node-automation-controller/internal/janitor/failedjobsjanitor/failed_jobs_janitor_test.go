@@ -381,3 +381,61 @@ func TestStuckTerminatingAuditListError(t *testing.T) {
 		t.Fatal("expected error when the namespaces list fails")
 	}
 }
+
+// W4 — a PVC stuck Terminating >2h whose only finalizer is
+// pvc-protection and which no live pod references gets the finalizer
+// stripped.
+func TestAuditStuckPVCFinalizerStrip(t *testing.T) {
+	now := time.Now()
+	termAt := metav1.NewTime(now.Add(-3 * time.Hour))
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "apps", Name: "data",
+			DeletionTimestamp: &termAt,
+			Finalizers:        []string{"kubernetes.io/pvc-protection"},
+		},
+	}
+	cs := fake.NewSimpleClientset(pvc)
+	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	if err := j.auditStuckTerminating(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, "data", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Finalizers) != 0 {
+		t.Fatalf("pvc-protection finalizer not stripped: %v", got.Finalizers)
+	}
+}
+
+// A live pod still claiming the PVC keeps the finalizer — fail closed.
+func TestAuditStuckPVCReferencedKept(t *testing.T) {
+	now := time.Now()
+	termAt := metav1.NewTime(now.Add(-3 * time.Hour))
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "apps", Name: "data",
+			DeletionTimestamp: &termAt,
+			Finalizers:        []string{"kubernetes.io/pvc-protection"},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "user"},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+			Name: "v",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: "data"}}}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	cs := fake.NewSimpleClientset(pvc, pod)
+	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	if err := j.auditStuckTerminating(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, "data", metav1.GetOptions{})
+	if len(got.Finalizers) == 0 {
+		t.Fatal("finalizer stripped while a pod still references the claim")
+	}
+}

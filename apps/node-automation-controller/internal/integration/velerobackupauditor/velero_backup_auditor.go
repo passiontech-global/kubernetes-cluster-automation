@@ -55,7 +55,24 @@ var (
 		Group: "velero.io", Version: "v1", Resource: "schedules"}
 	veleroBackupGVR = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v1", Resource: "backups"}
+	veleroBSLGVR = schema.GroupVersionResource{
+		Group: "velero.io", Version: "v1", Resource: "backupstoragelocations"}
 )
+
+// veleroStuckPhases are terminal-failure and wedged-in-flight
+// signatures — a backup Failed, PartiallyFailed or FailedValidation
+// is a data-protection failure worth surfacing, and InProgress or
+// Deleting held past veleroStuckMaxAge means the velero server lost
+// the thread (W8-ST1).
+var veleroStuckPhases = map[string]string{
+	"Failed":           "failed",
+	"PartiallyFailed":  "failed",
+	"FailedValidation": "failed",
+	"InProgress":       "stuck",
+	"Deleting":         "stuck",
+}
+
+const veleroStuckMaxAge = 6 * time.Hour
 
 // pausedKey / backupKey are the exact label tuples of the two
 // exported gauge vecs — the seen-set prune pattern from
@@ -75,6 +92,9 @@ type veleroBackupAuditor struct {
 	nowFn      func() time.Time // clock seam — same pattern as certDriftAuditor
 	seenPaused map[pausedKey]bool
 	seenBad    map[backupKey]bool
+	// seenBSL: series ledger for VeleroBSLUnavailable — an
+	// Available-again or deleted BSL gets DeleteLabelValues.
+	seenBSL map[pausedKey]bool
 	// firstSeenPaused: when the sweep first saw this Schedule
 	// generation paused — measures the actual pause duration. A
 	// Schedule carries no "paused since" timestamp, so the ledger is
@@ -99,6 +119,7 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
 		nowFn:           time.Now,
 		seenPaused:      map[pausedKey]bool{},
 		seenBad:         map[backupKey]bool{},
+		seenBSL:         map[pausedKey]bool{},
 		firstSeenPaused: map[pausedLedgerKey]time.Time{},
 	}
 	return shared.AddPeriodic(mgr, veleroAuditQueue, veleroAuditInterval, a.run)
@@ -116,6 +137,9 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	}
 	if a.seenBad == nil {
 		a.seenBad = map[backupKey]bool{}
+	}
+	if a.seenBSL == nil {
+		a.seenBSL = map[pausedKey]bool{}
 	}
 	if a.firstSeenPaused == nil {
 		a.firstSeenPaused = map[pausedLedgerKey]time.Time{}
@@ -202,8 +226,42 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		}
 	}
 	a.seenBad = currentBad
+
+	// W8-ST1 — BackupStorageLocation availability: a BSL not
+	// phase=Available means backups run to an unreachable bucket and
+	// the next restore has nothing to read.
+	currentBSL := map[pausedKey]bool{}
+	bsls, err := a.dyn.Resource(veleroBSLGVR).List(ctx, metav1.ListOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		// CRD absent — nothing to audit.
+	case err != nil:
+		return fmt.Errorf("list velero backupstoragelocations: %w", err)
+	default:
+		for i := range bsls.Items {
+			bsl := &bsls.Items[i]
+			ns, name := bsl.GetNamespace(), bsl.GetName()
+			phase, _, _ := unstructured.NestedString(bsl.Object, "status", "phase")
+			if phase == "Available" {
+				continue
+			}
+			k := pausedKey{ns, name}
+			currentBSL[k] = true
+			metrics.VeleroBSLUnavailable.WithLabelValues(ns, name).Set(1)
+			log.Info("velero BSL unavailable — backups/restore at risk",
+				"bsl", ns+"/"+name, "phase", phase)
+		}
+	}
+	for k := range a.seenBSL {
+		if !currentBSL[k] {
+			metrics.VeleroBSLUnavailable.DeleteLabelValues(k.namespace, k.schedule)
+		}
+	}
+	a.seenBSL = currentBSL
+
 	log.Info("sweep done", "schedules", len(schedules.Items),
-		"paused", len(currentPaused), "badBackups", len(currentBad))
+		"paused", len(currentPaused), "badBackups", len(currentBad),
+		"bslUnavailable", len(currentBSL))
 	return nil
 }
 
@@ -239,6 +297,33 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 	b *unstructured.Unstructured, ns, schedule string, current map[backupKey]bool) {
 	log := logf.FromContext(ctx)
 	phase, _, _ := unstructured.NestedString(b.Object, "status", "phase")
+	// W8-ST1 — terminal failures and wedged in-flight phases are
+	// flagged on their own reason series before the Completed path
+	// runs: Failed/PartiallyFailed/FailedValidation flag immediately,
+	// InProgress/Deleting only past 6h (measured from
+	// status.startTimestamp, else creationTimestamp).
+	if reason, watched := veleroStuckPhases[phase]; watched {
+		flag := reason == "failed"
+		if reason == "stuck" {
+			since := b.GetCreationTimestamp().Time
+			if st, found, _ := unstructured.NestedString(
+				b.Object, "status", "startTimestamp"); found {
+				if t, err := time.Parse(time.RFC3339, st); err == nil {
+					since = t
+				}
+			}
+			flag = a.nowFn().Sub(since) > veleroStuckMaxAge
+		}
+		if flag {
+			current[backupKey{ns, schedule, reason}] = true
+			metrics.VeleroBackupEmptyOrErrored.
+				WithLabelValues(ns, schedule, reason).Set(1)
+			log.Info("velero backup in a bad phase",
+				"backup", b.GetNamespace()+"/"+b.GetName(),
+				"schedule", ns+"/"+schedule, "phase", phase)
+		}
+		return
+	}
 	if phase != "Completed" {
 		return
 	}

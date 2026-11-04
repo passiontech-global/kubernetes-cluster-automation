@@ -25,7 +25,7 @@ import (
 
 func cssObj(name, ready string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "external-secrets.io/v1beta1",
+		"apiVersion": "external-secrets.io/v1",
 		"kind":       "ClusterSecretStore",
 		"metadata":   map[string]any{"name": name},
 		"status": map[string]any{
@@ -40,7 +40,7 @@ func cssObj(name, ready string) *unstructured.Unstructured {
 
 func esObj(ns, name, ready string, failingFor time.Duration) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "external-secrets.io/v1beta1",
+		"apiVersion": "external-secrets.io/v1",
 		"kind":       "ExternalSecret",
 		"metadata": map[string]any{
 			"namespace": ns,
@@ -121,7 +121,7 @@ func newNudge(dyn *fake.FakeDynamicClient, enabled bool) *externalSecretNudge {
 // fake tracker (the run only ever lists — this simulates the flap).
 func setStoreReady(t *testing.T, dyn *fake.FakeDynamicClient, name, ready string) {
 	t.Helper()
-	u, err := dyn.Resource(clusterSecretStoreGVR).Get(ctx, name, metav1.GetOptions{})
+	u, err := dyn.Resource(clusterSecretStoreGVRs[0]).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get store %s: %v", name, err)
 	}
@@ -132,7 +132,7 @@ func setStoreReady(t *testing.T, dyn *fake.FakeDynamicClient, name, ready string
 	}}, "status", "conditions"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dyn.Resource(clusterSecretStoreGVR).Update(ctx, u, metav1.UpdateOptions{}); err != nil {
+	if _, err := dyn.Resource(clusterSecretStoreGVRs[0]).Update(ctx, u, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("update store %s: %v", name, err)
 	}
 }
@@ -156,10 +156,10 @@ func TestExternalSecretNudgeRecoveryTransition(t *testing.T) {
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got != "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno); got != "" {
 		t.Fatal("nudged on first sight — no transition happened yet")
 	}
-	if r, ok := n.storeReady["css1"]; !ok || r {
+	if r, ok := n.storeReady["ClusterSecretStore//css1"]; !ok || r {
 		t.Fatal("store state not seeded as not-ready")
 	}
 
@@ -168,21 +168,21 @@ func TestExternalSecretNudgeRecoveryTransition(t *testing.T) {
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got == "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno); got == "" {
 		t.Fatal("stuck ES not force-synced on store recovery")
 	}
 	for _, name := range []string{"es-fresh", "es-ok"} {
-		if got := esAnnotation(t, dyn, externalSecretGVR, "apps", name, esForceSyncAnno); got != "" {
+		if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", name, esForceSyncAnno); got != "" {
 			t.Fatalf("ES %s nudged but should not be (fresh/healthy)", name)
 		}
 	}
 
 	// Tick 3 with no new transition: value must not change again.
-	stamp := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno)
+	stamp := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno)
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got != stamp {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno); got != stamp {
 		t.Fatal("ES re-nudged without a new recovery transition")
 	}
 }
@@ -200,7 +200,7 @@ func TestExternalSecretNudgeRateLimit(t *testing.T) {
 	if err := n.run(ctx); err != nil { // transition → nudge
 		t.Fatal(err)
 	}
-	stamp := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno)
+	stamp := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno)
 	if stamp == "" {
 		t.Fatal("first nudge did not stamp force-sync")
 	}
@@ -214,7 +214,7 @@ func TestExternalSecretNudgeRateLimit(t *testing.T) {
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got != stamp {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno); got != stamp {
 		t.Fatal("ES re-nudged inside the 1h rate-limit window")
 	}
 }
@@ -229,7 +229,7 @@ func TestExternalSecretNudgeNoTransitionOnFirstSight(t *testing.T) {
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got != "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno); got != "" {
 		t.Fatal("nudged on first sight of an already-ready store")
 	}
 }
@@ -247,7 +247,7 @@ func TestExternalSecretNudgeDisabled(t *testing.T) {
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got != "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno); got != "" {
 		t.Fatal("disabled module stamped force-sync")
 	}
 	if len(n.storeReady) != 0 {
@@ -278,7 +278,7 @@ func TestExternalSecretNudgeCRDsAbsent(t *testing.T) {
 	dyn.PrependReactor("list", "clustersecretstores",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewNotFound(
-				clusterSecretStoreGVR.GroupResource(), "")
+				clusterSecretStoreGVRs[0].GroupResource(), "")
 		})
 	n := newNudge(dyn, true)
 	if err := n.run(ctx); err != nil {
@@ -297,29 +297,29 @@ func TestExternalSecretNudgePrunedStoreReseeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Store vanishes — the prune must drop it from storeReady.
-	if err := dyn.Resource(clusterSecretStoreGVR).
+	if err := dyn.Resource(clusterSecretStoreGVRs[0]).
 		Delete(ctx, "css1", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := n.storeReady["css1"]; ok {
+	if _, ok := n.storeReady["ClusterSecretStore//css1"]; ok {
 		t.Fatal("vanished store not pruned from storeReady")
 	}
 
 	// Recreated already-True: first sight again — seed, no nudge.
-	if _, err := dyn.Resource(clusterSecretStoreGVR).
+	if _, err := dyn.Resource(clusterSecretStoreGVRs[0]).
 		Create(ctx, cssObj("css1", "True"), metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got != "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno); got != "" {
 		t.Fatal("recreated store treated as a recovery transition — must re-seed")
 	}
-	if r, ok := n.storeReady["css1"]; !ok || !r {
+	if r, ok := n.storeReady["ClusterSecretStore//css1"]; !ok || !r {
 		t.Fatal("recreated store not re-seeded as ready")
 	}
 }
@@ -366,7 +366,7 @@ func TestExternalSecretNudgeReadySinceFallback(t *testing.T) {
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got == "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno); got == "" {
 		t.Fatal("old ES with malformed lastTransitionTime not nudged — creationTimestamp fallback broken")
 	}
 }
@@ -402,7 +402,7 @@ func TestExternalSecretNudgePrunesNudgedLedger(t *testing.T) {
 	if got := n.nudged["apps/es-expired"]; !got.After(stale) {
 		t.Fatal("ES past the cooldown was not re-nudged")
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-expired", esForceSyncAnno); got == "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-expired", esForceSyncAnno); got == "" {
 		t.Fatal("expired entry's ES was pruned but never re-stamped")
 	}
 }
@@ -411,7 +411,7 @@ func TestExternalSecretNudgePrunesNudgedLedger(t *testing.T) {
 // malformed shapes (real objects in the wild are inconsistent).
 func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 	bare := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "external-secrets.io/v1beta1",
+		"apiVersion": "external-secrets.io/v1",
 		"kind":       "ExternalSecret",
 		"metadata":   map[string]any{"name": "bare"},
 	}}
@@ -553,22 +553,22 @@ func TestExternalSecretNudgeStateBasedWithoutEdge(t *testing.T) {
 	if err := n.run(ctx); err != nil { // seeds both stores, no edge
 		t.Fatal(err)
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esForceSyncAnno); got == "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno); got == "" {
 		t.Fatal("stuck ES on a Ready=True store not nudged without an edge")
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stuck", esLastNudgeAnno); got == "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esLastNudgeAnno); got == "" {
 		t.Fatal("node.ops/last-es-nudge not persisted alongside force-sync")
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-via-datafrom", esForceSyncAnno); got == "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-via-datafrom", esForceSyncAnno); got == "" {
 		t.Fatal("ES whose only store ref is a dataFrom CSS override not nudged")
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-via-data", esForceSyncAnno); got == "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-via-data", esForceSyncAnno); got == "" {
 		t.Fatal("ES whose only store ref is a spec.data[] CSS override not nudged")
 	}
 	for _, name := range []string{
 		"es-other-store", "es-namespaced", "es-default-kind", "es-broken-store",
 		"es-mixed-broken", "es-mixed-namespaced", "es-mixed-data-broken"} {
-		if got := esAnnotation(t, dyn, externalSecretGVR, "apps", name, esForceSyncAnno); got != "" {
+		if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", name, esForceSyncAnno); got != "" {
 			t.Fatalf("ES %s nudged although its referenced store is not Ready=True", name)
 		}
 	}
@@ -595,10 +595,10 @@ func TestExternalSecretNudgePersistedCooldown(t *testing.T) {
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-recent", esLastNudgeAnno); got != "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-recent", esLastNudgeAnno); got != "" {
 		t.Fatal("ES re-stamped inside the persisted 1h cooldown")
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-stale", esForceSyncAnno); got == "" {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stale", esForceSyncAnno); got == "" {
 		t.Fatal("ES with a stale last-es-nudge stamp not re-nudged")
 	}
 }

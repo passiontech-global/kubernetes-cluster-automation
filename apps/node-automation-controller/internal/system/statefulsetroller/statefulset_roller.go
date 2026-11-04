@@ -57,6 +57,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -156,7 +157,7 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 		sts := &stsItems[i]
 		key := sts.Namespace + "/" + sts.Name
 		if sts.Spec.UpdateStrategy.Type != "OnDelete" ||
-			sts.Annotations[stsAutoRollAnno] != "true" ||
+			!stsAutoRollOptedIn(sts) ||
 			sts.Status.UpdateRevision == "" ||
 			sts.Status.UpdateRevision == sts.Status.CurrentRevision {
 			continue // not opted in, not OnDelete, or no drift
@@ -191,7 +192,8 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 	}
 	nodesSafe := len(nodes) > 0
 	for i := range nodes {
-		if !shared.NodeReady(&nodes[i]) || nodes[i].Spec.Unschedulable {
+		if !shared.NodeReady(&nodes[i]) ||
+			shared.NodeActivelyCordoned(&nodes[i], now) {
 			nodesSafe = false
 			break
 		}
@@ -231,6 +233,22 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	}
 	if len(pods) == 0 {
 		return nil // nothing to roll
+	}
+
+	// Membership gate (BUG-C3): the full desired set must be present
+	// AND Ready before the next eviction — ownedPods already drops
+	// terminating pods, so a pod still Terminating or not yet
+	// recreated makes len(pods) < spec.replicas and blocks the roll
+	// (evicting mid-replacement would take two members down at once).
+	if sts.Spec.Replicas == nil ||
+		len(pods) != int(*sts.Spec.Replicas) ||
+		sts.Status.ReadyReplicas != *sts.Spec.Replicas {
+		log.Info("skip: statefulset membership incomplete — previous pod still Terminating or not yet recreated",
+			"statefulset", sts.Namespace+"/"+sts.Name,
+			"pods", len(pods),
+			"specReplicas", ptr.Deref(sts.Spec.Replicas, -1),
+			"readyReplicas", sts.Status.ReadyReplicas)
+		return nil
 	}
 
 	// Gate 3: every owned pod Ready, the newest one stable >= 5m —
@@ -337,6 +355,16 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	metrics.StatefulSetOnDeletePodsRolledTotal.
 		WithLabelValues(sts.Namespace, sts.Name).Inc()
 	return nil
+}
+
+// stsAutoRollOptedIn reports the opt-in: node.ops/auto-roll-ondelete
+// on the StatefulSet itself OR on its pod template — operators like
+// dragonfly-operator propagate CR spec.annotations into the pod
+// template only, so the STS object never carries the annotation even
+// though the workload opted in (2.1.6).
+func stsAutoRollOptedIn(sts *appsv1.StatefulSet) bool {
+	return sts.Annotations[stsAutoRollAnno] == "true" ||
+		sts.Spec.Template.Annotations[stsAutoRollAnno] == "true"
 }
 
 // ownedPods lists the pods the StatefulSet controls — the apiserver

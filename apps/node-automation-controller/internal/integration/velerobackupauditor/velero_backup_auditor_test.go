@@ -376,3 +376,37 @@ func TestVeleroBackupAuditorClearsResolvedSeries(t *testing.T) {
 		t.Fatal("zero_items series kept after a healthy backup landed")
 	}
 }
+
+// W8-ST1 — Failed/partial backups and wedged in-flight phases flag
+// on their own reason series; BSLs not phase=Available raise the
+// unavailable gauge.
+func TestVeleroBackupAuditorFailedAndBSL(t *testing.T) {
+	sched := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "velero.io/v1", "kind": "Schedule",
+		"metadata": map[string]any{"namespace": "velero", "name": "daily"}}}
+	failed := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "velero.io/v1", "kind": "Backup",
+		"metadata": map[string]any{
+			"namespace": "velero", "name": "daily-x",
+			"labels": map[string]any{"velero.io/schedule-name": "daily"}},
+		"status": map[string]any{"phase": "PartiallyFailed"}}}
+	bsl := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "velero.io/v1", "kind": "BackupStorageLocation",
+		"metadata": map[string]any{"namespace": "velero", "name": "main"},
+		"status":   map[string]any{"phase": "Unavailable"}}}
+	dyn := newDynFake(sched, failed, bsl)
+	a := &veleroBackupAuditor{dyn: dyn, nowFn: time.Now,
+		seenPaused: map[pausedKey]bool{}, seenBad: map[backupKey]bool{},
+		seenBSL: map[pausedKey]bool{}, firstSeenPaused: map[pausedLedgerKey]time.Time{}}
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := testutil.GaugeSeriesValue(t, "node_automation_velero_backup_empty_or_errored",
+		map[string]string{"namespace": "velero", "schedule": "daily", "reason": "failed"}); !ok || got != 1 {
+		t.Fatal("failed-phase backup not flagged")
+	}
+	if got, ok := testutil.GaugeSeriesValue(t, "node_automation_velero_bsl_unavailable",
+		map[string]string{"namespace": "velero", "name": "main"}); !ok || got != 1 {
+		t.Fatal("unavailable BSL not flagged")
+	}
+}

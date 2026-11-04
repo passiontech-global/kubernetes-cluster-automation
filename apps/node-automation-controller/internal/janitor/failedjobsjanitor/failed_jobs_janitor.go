@@ -28,6 +28,7 @@ package failedjobsjanitor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -251,9 +252,20 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 		mark("Namespace", "", n.Name, n.DeletionTimestamp, nsFinalizerNames(n))
 	}
 	nss = nil
+	// W4: a PVC wedged past the threshold whose ONLY finalizer is
+	// kubernetes.io/pvc-protection is stuck waiting on the protection
+	// controller to prove no pod uses it — when zero pods in the
+	// namespace still reference it, the finalizer is stripped. The
+	// per-namespace reference scan is cached per audit pass.
+	nsClaims := map[string]pvcUseProbe{}
 	for i := range pvcs {
 		p := &pvcs[i]
 		mark("PersistentVolumeClaim", p.Namespace, p.Name, p.DeletionTimestamp, p.Finalizers)
+		if p.DeletionTimestamp != nil &&
+			now.Sub(p.DeletionTimestamp.Time) > stuckTerminatingMaxAge &&
+			len(p.Finalizers) == 1 && p.Finalizers[0] == pvcProtectionFinalizer {
+			j.unstickPVCProtection(ctx, p, nsClaims)
+		}
 	}
 	pvcs = nil
 	// VolumeAttachments: the volumeattachment-cleaner refuses to
@@ -279,6 +291,78 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 
 	log.Info("stuck-terminating audit done", "stuck", len(current))
 	return nil
+}
+
+// pvcProtectionFinalizer is the in-tree claim-protection finalizer —
+// it drains only after the pvc-protection-controller verifies no pod
+// references the claim; a wedged controller (or a deleted pod whose
+// reference the controller missed) leaves it forever (W4).
+const pvcProtectionFinalizer = "kubernetes.io/pvc-protection"
+
+// pvcUseProbe caches one namespace's "who still claims what" verdict
+// per audit pass — a shared failure must not be re-listed per PVC.
+type pvcUseProbe struct {
+	claims map[string]bool // claim names still referenced by a live pod
+	err    error
+}
+
+// unstickPVCProtection strips the pvc-protection finalizer from a
+// stuck Terminating claim once a namespace pod scan proves nothing
+// references it. Any list failure fails closed — the claim stays
+// protected rather than risk an early unbind.
+func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
+	pvc *corev1.PersistentVolumeClaim, cache map[string]pvcUseProbe) {
+	log := logf.FromContext(ctx)
+	pr, ok := cache[pvc.Namespace]
+	if !ok {
+		pr = pvcUseProbe{claims: map[string]bool{}}
+		pods, err := j.cs.CoreV1().Pods(pvc.Namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			pr.err = err
+		} else {
+			for i := range pods.Items {
+				p := &pods.Items[i]
+				if p.Status.Phase == corev1.PodSucceeded ||
+					p.Status.Phase == corev1.PodFailed {
+					continue
+				}
+				for _, v := range p.Spec.Volumes {
+					if v.PersistentVolumeClaim != nil {
+						pr.claims[v.PersistentVolumeClaim.ClaimName] = true
+					}
+				}
+			}
+		}
+		cache[pvc.Namespace] = pr
+	}
+	if pr.err != nil {
+		metrics.IncError(failedJobQueue)
+		log.Error(pr.err, "pod list failed — keeping pvc-protection finalizer (fail closed)",
+			"pvc", pvc.Namespace+"/"+pvc.Name)
+		return
+	}
+	if pr.claims[pvc.Name] {
+		return // still referenced — the finalizer is doing its job
+	}
+	log.Info("PATCH-FINALIZER: stuck PVC unreferenced by every live pod — removing pvc-protection",
+		"pvc", pvc.Namespace+"/"+pvc.Name,
+		"terminatingFor", j.nowFn().Sub(pvc.DeletionTimestamp.Time).Truncate(time.Minute))
+	payload, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"resourceVersion": pvc.ResourceVersion,
+			"finalizers":      nil,
+		},
+	})
+	if err != nil {
+		metrics.IncError(failedJobQueue)
+		return
+	}
+	if _, err := j.cs.CoreV1().PersistentVolumeClaims(pvc.Namespace).Patch(ctx,
+		pvc.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		metrics.IncError(failedJobQueue)
+		log.Error(err, "pvc-protection finalizer strip failed",
+			"pvc", pvc.Namespace+"/"+pvc.Name)
+	}
 }
 
 // nsFinalizerNames renders .spec.finalizers — the list that actually

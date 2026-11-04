@@ -754,9 +754,13 @@ func TestRabbitSuspendedSignature(t *testing.T) {
 // the heals counter moves; the check FAILs either way.
 func TestCheckRabbitMQSuspendedHeals(t *testing.T) {
 	base := time.Now()
+	replicas := int32(3)
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "mq", Name: "rabbitmq"},
 		Spec: appsv1.StatefulSetSpec{
+			// BUG-C2: quorum is verified against spec.replicas — a
+			// fixture without it is refused outright.
+			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"app.kubernetes.io/component": "rabbitmq"}},
 		},

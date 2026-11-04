@@ -206,7 +206,35 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 					helmUnlockCooldown))
 			continue
 		}
+		// W8-GO2 — cap the retry cycle: at most
+		// stallMaxAttemptsPerRevision unwedges for one
+		// lastAttemptedRevision, each at least
+		// stallAttemptCooldown apart. A revision change re-arms —
+		// the new revision has not had its window yet.
+		revision, _, _ := unstructured.NestedString(
+			hr.Object, "status", "lastAttemptedRevision")
+		att := u.stallAttempts[key]
+		if att == nil || att.revision != revision {
+			att = &stallAttempt{revision: revision}
+			u.stallAttempts[key] = att
+		}
+		if att.count >= stallMaxAttemptsPerRevision {
+			u.alertStallOnce(ctx, key, now, fmt.Sprintf(
+				"HR revision %q already consumed %d unwedge attempts — refusing to retry-loop",
+				revision, att.count))
+			continue
+		}
+		if att.count > 0 && now.Sub(att.last) < stallAttemptCooldown {
+			continue // inside the 6h attempt gap — let the last unwedge land
+		}
 		acted, refuse, err := u.unwedge(ctx, gvr, hr)
+		if acted || err == nil && refuse == "" {
+			// Only a completed cycle (acted, or a clean no-op that
+			// needed nothing) and refusals count as attempts —
+			// API errors must not burn the 2-try budget.
+			att.count++
+			att.last = now
+		}
 		switch {
 		case err != nil:
 			// Tolerated per-HR failure: absorbed (log + continue,
@@ -292,6 +320,13 @@ func (u *helmReleaseUnlocker) unwedge(ctx context.Context,
 		return false, "", fmt.Errorf("scale down replicaset %s/%s: %w",
 			dep.Namespace, plan.target.Name, err)
 	}
+
+	// W8-GO2: the failed upgrade usually left a Failed helm-hook Job
+	// behind in the release namespace — helm refuses to re-run a
+	// hook while its Job object still exists, so the retry would
+	// wedge identically. Reap it BEFORE the requestedAt cycle; the
+	// sweep is best-effort and cannot undo the window we just opened.
+	u.cleanFailedHookJobs(ctx, hrReleaseNS(hr))
 
 	// Then poke the HR: requestedAt is the reconcile-now hint,
 	// resetAt (same token — required pairing) zeroes the failure

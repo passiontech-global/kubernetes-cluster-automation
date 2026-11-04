@@ -519,3 +519,49 @@ func TestVACleanerDeleteErrorTolerated(t *testing.T) {
 		t.Fatal("VA deleted despite the failing delete call")
 	}
 }
+
+// W4 — a VolumeAttachment Terminating >15m whose node is gone has its
+// finalizers stripped (the attacher-side detach can never drain).
+func TestVACleanerStuckTerminatingFinalizerStrip(t *testing.T) {
+	now := time.Now()
+	va := vacAttachment("va-stuck", "node-gone", now.Add(-time.Hour))
+	termAt := metav1.NewTime(now.Add(-30 * time.Minute))
+	va.DeletionTimestamp = &termAt
+	va.Finalizers = []string{"external-attacher/csi-test"}
+	cs := fake.NewSimpleClientset(va,
+		vacNode("w-live", corev1.ConditionTrue)) // va's node-gone absent from the live list
+	c := newVACleaner(cs, func() time.Time { return now })
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cs.StorageV1().VolumeAttachments().Get(ctx, "va-stuck", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Finalizers) != 0 {
+		t.Fatalf("stuck VA finalizers not stripped: %v", got.Finalizers)
+	}
+}
+
+// Same shape but inside the 15m grace window — left for the
+// stuck-terminating audit, not stripped.
+func TestVACleanerStuckTerminatingTooYoung(t *testing.T) {
+	now := time.Now()
+	va := vacAttachment("va-fresh", "node-gone", now.Add(-time.Hour))
+	termAt := metav1.NewTime(now.Add(-5 * time.Minute))
+	va.DeletionTimestamp = &termAt
+	va.Finalizers = []string{"external-attacher/csi-test"}
+	cs := fake.NewSimpleClientset(va,
+		vacNode("w-live", corev1.ConditionTrue))
+	c := newVACleaner(cs, func() time.Time { return now })
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cs.StorageV1().VolumeAttachments().Get(ctx, "va-fresh", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Finalizers) == 0 {
+		t.Fatal("finalizers stripped inside the grace window")
+	}
+}

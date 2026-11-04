@@ -67,13 +67,17 @@ const (
 	mirrorPodAnno = "kubernetes.io/config.mirror"
 )
 
-// partitionCondTypes covers upstream NWPD K8sExporter plurals and the
-// singular spellings some builds emit.
+// partitionCondTypes covers upstream NWPD K8sExporter plurals, the
+// singular spellings some builds emit, and NebulaIsolated — the
+// node-host-agent's overlay-partition condition: a node cut off from
+// the Nebula mesh is pod-unreachable from other sites in exactly the
+// way this evictor exists for.
 var partitionCondTypes = []corev1.NodeConditionType{
 	"HostNetworkProblems",
 	"ClusterNetworkProblems",
 	"HostNetworkProblem",
 	"ClusterNetworkProblem",
+	"NebulaIsolated",
 }
 
 type partitionEvictor struct {

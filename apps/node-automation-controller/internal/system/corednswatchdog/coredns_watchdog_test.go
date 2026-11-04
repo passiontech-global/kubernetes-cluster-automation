@@ -78,7 +78,7 @@ func newCDNSWatchdog(cs *fake.Clientset) *coreDNSWatchdog {
 		cs:       cs,
 		streak:   map[string]int{},
 		logHitFn: func(context.Context, string) string { return "" },
-		dnsFn:    func(context.Context, string, string) bool { return true },
+		dnsFn:    func(context.Context, string, string) ([]string, error) { return []string{"10.1.2.3"}, nil },
 		panicsFn: func(context.Context, string) (float64, bool) { return 0, true },
 	}
 }
@@ -162,7 +162,7 @@ func TestCoreDNSProbeFQDN(t *testing.T) {
 				cs = fake.NewSimpleClientset(svc, es)
 			}
 			w := newCDNSWatchdog(cs)
-			if got := w.probeFQDN(ctx); got != tc.want {
+			if got, _ := w.probeFQDN(ctx); got != tc.want {
 				t.Fatalf("probeFQDN=%q, want %q", got, tc.want)
 			}
 		})
@@ -172,14 +172,14 @@ func TestCoreDNSProbeFQDN(t *testing.T) {
 		oldSvc, oldES := cdnsProbeService("old-svc", "app-ns", 20*time.Minute, &readyTrue)
 		newSvc, newES := cdnsProbeService("fresh-svc", "app-ns", 0, &readyTrue)
 		w := newCDNSWatchdog(fake.NewSimpleClientset(oldSvc, oldES, newSvc, newES))
-		if got := w.probeFQDN(ctx); got != "fresh-svc.app-ns.svc.cluster.local" {
+		if got, _ := w.probeFQDN(ctx); got != "fresh-svc.app-ns.svc.cluster.local" {
 			t.Fatalf("probeFQDN=%q", got)
 		}
 	})
 
 	t.Run("empty cluster is inconclusive", func(t *testing.T) {
 		w := newCDNSWatchdog(fake.NewSimpleClientset())
-		if got := w.probeFQDN(ctx); got != "" {
+		if got, _ := w.probeFQDN(ctx); got != "" {
 			t.Fatalf("probeFQDN=%q, want empty", got)
 		}
 	})
@@ -195,9 +195,12 @@ func TestCoreDNSWatchdogLayer2StreakThenRecover(t *testing.T) {
 		svc, es)
 	w := newCDNSWatchdog(cs)
 	var gotFQDN string
-	w.dnsFn = func(_ context.Context, podIP, fqdn string) bool {
+	w.dnsFn = func(_ context.Context, podIP, fqdn string) ([]string, error) {
 		gotFQDN = fqdn
-		return podIP != "10.0.0.1" // only cdns-a fails to resolve
+		if podIP == "10.0.0.1" {
+			return nil, nil // only cdns-a fails to resolve
+		}
+		return []string{"10.1.2.3"}, nil
 	}
 
 	// First failure: suspect only — streak 1, no recovery action.
@@ -247,7 +250,7 @@ func TestCoreDNSWatchdogLayer2AbortAllFail(t *testing.T) {
 	w.streak["cdns-a"] = 1
 	// Every pod fails to resolve -> the probe path is broken, NOT the
 	// fleet. The layer must abort without bumping any streak.
-	w.dnsFn = func(context.Context, string, string) bool { return false }
+	w.dnsFn = func(context.Context, string, string) ([]string, error) { return nil, nil }
 
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
@@ -462,9 +465,9 @@ func TestCoreDNSWatchdogLayer2Skips(t *testing.T) {
 		return ""
 	}
 	dnsCalled := false
-	w.dnsFn = func(context.Context, string, string) bool {
+	w.dnsFn = func(context.Context, string, string) ([]string, error) {
 		dnsCalled = true
-		return true
+		return []string{"10.1.2.3"}, nil
 	}
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
@@ -542,7 +545,7 @@ func TestCoreDNSProbeFQDNTop8Cap(t *testing.T) {
 	oldSvc, oldES := cdnsProbeService("svc-9th", "app-ns", 9*time.Minute, &ready)
 	objs = append(objs, oldSvc, oldES)
 	w := newCDNSWatchdog(fake.NewSimpleClientset(objs...))
-	if got := w.probeFQDN(ctx); got != "" {
+	if got, _ := w.probeFQDN(ctx); got != "" {
 		t.Fatalf("probeFQDN=%q, want empty (9th-newest service must be capped)", got)
 	}
 }
@@ -558,7 +561,7 @@ func TestCoreDNSProbeFQDNSliceListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	w := newCDNSWatchdog(cs)
-	if got := w.probeFQDN(ctx); got != "" {
+	if got, _ := w.probeFQDN(ctx); got != "" {
 		t.Fatalf("probeFQDN=%q, want empty on slice list failure", got)
 	}
 }

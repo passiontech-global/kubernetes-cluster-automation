@@ -12,10 +12,19 @@ import (
 
 var ctx = context.Background()
 
-// newDynFake seeds the two ESO types the nudge lists.
+// newDynFake seeds the ESO types the nudge lists — every served
+// version of each GVR must carry a ListKind or the fake's List
+// errors out (the production code then just tries the next GVR).
 func newDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		clusterSecretStoreGVR: "ClusterSecretStoreList",
-		externalSecretGVR:     "ExternalSecretList",
-	}, objs...)
+	kinds := map[schema.GroupVersionResource]string{}
+	for _, gvr := range clusterSecretStoreGVRs {
+		kinds[gvr] = "ClusterSecretStoreList"
+	}
+	for _, gvr := range secretStoreGVRs {
+		kinds[gvr] = "SecretStoreList"
+	}
+	for _, gvr := range externalSecretGVRs {
+		kinds[gvr] = "ExternalSecretList"
+	}
+	return testutil.NewFakeDyn(kinds, objs...)
 }

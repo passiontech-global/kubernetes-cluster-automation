@@ -204,6 +204,42 @@ func HasTaint(taints []corev1.Taint, key string) bool {
 	return false
 }
 
+// UnschedulableTaintKey is the taint the cordon path stamps alongside
+// spec.unschedulable — its TimeAdded is the only clock for "how long
+// has this cordon been live".
+const UnschedulableTaintKey = "node.kubernetes.io/unschedulable"
+
+// NodeCordonActiveMaxAge is how old a cordon may be before it reads as
+// deliberate static state rather than a drain in flight.
+const NodeCordonActiveMaxAge = 45 * time.Minute
+
+// NodeActivelyCordoned reports whether the node is cordoned AND the
+// cordon looks like a drain in flight — spec.unschedulable plus the
+// node.kubernetes.io/unschedulable taint younger than
+// NodeCordonActiveMaxAge (or timestamp-less: unverifiable fails
+// closed). A statically-cordoned node — unschedulable held past the
+// window — does NOT count: long-cordoned nodes are an operator
+// decision (decommissioned capacity, quarantined hardware), not a
+// drain, and treating them as "maintenance in flight" freezes every
+// remediation that defers to it forever.
+func NodeActivelyCordoned(n *corev1.Node, now time.Time) bool {
+	if !n.Spec.Unschedulable {
+		return false
+	}
+	for _, t := range n.Spec.Taints {
+		if t.Key != UnschedulableTaintKey {
+			continue
+		}
+		if t.TimeAdded == nil {
+			return true // cordon timestamp unverifiable — fail closed
+		}
+		return now.Sub(t.TimeAdded.Time) < NodeCordonActiveMaxAge
+	}
+	// unschedulable without the companion taint — the age cannot be
+	// verified, so it counts (fail closed, same as a nil TimeAdded).
+	return true
+}
+
 // DropTaintsByKey returns taints with every entry matching key
 // removed. It filters IN PLACE — the result aliases and shortens the
 // caller's backing array, so the input must not be shared or
@@ -454,7 +490,11 @@ var AutopilotPlanGVR = schema.GroupVersionResource{
 // in flight — destructive remediation (pod deletes, leader kills)
 // defers while any signal holds:
 //
-//	a) any node spec.unschedulable — a cordon/drain is running;
+//	a) any node ACTIVELY cordoned — spec.unschedulable with the
+//	   unschedulable taint younger than 45m. A statically-cordoned
+//	   node (>45m, no kured lock, no live Plan) is deliberate
+//	   state, not maintenance: counting it would freeze every
+//	   deferring remediation forever (W8).
 //	b) DaemonSet kube-system/kured holding weave.works/kured-node-lock;
 //	c) an autopilot Plan whose status.state is neither Schedulable
 //	   nor Completed — a k0s upgrade in flight.
@@ -465,14 +505,17 @@ var AutopilotPlanGVR = schema.GroupVersionResource{
 // A nil dynamic client makes the Plan check unverifiable and is
 // reported as an error, never silently skipped.
 func MaintenanceActive(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface) (bool, string, error) {
-	// (a) cordon/drain in progress.
+	// (a) cordon/drain in progress — a node cordoned for longer
+	// than the active window with no other maintenance signal is a
+	// static cordon, not a drain.
+	now := time.Now()
 	nodes, err := ListNodes(ctx, cs)
 	if err != nil {
 		return false, "", fmt.Errorf("list nodes (maintenance mutex): %w", err)
 	}
 	for i := range nodes {
-		if nodes[i].Spec.Unschedulable {
-			return true, "node " + nodes[i].Name + " unschedulable", nil
+		if NodeActivelyCordoned(&nodes[i], now) {
+			return true, "node " + nodes[i].Name + " actively cordoned", nil
 		}
 	}
 

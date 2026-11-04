@@ -50,6 +50,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"strings"
@@ -61,6 +62,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -89,6 +91,19 @@ const (
 	// mismatch must persist before the drift gauge fires — a
 	// single-scan diff just catches the replicator mid-sync.
 	replicationDriftScans = 2
+	// replicatedFromVersionAnno is the replicator's source-version
+	// stamp — removing it on a drifted destination forces
+	// kubernetes-replicator to resync the copy (W8-NM2).
+	replicatedFromVersionAnno = "replicator.v1.mittwald.de/replicated-from-version"
+	replicationResyncCooldown = time.Hour
+	// linkerd-identity-issuer fingerprint tracking (W8-NM2): the
+	// issuer cert's SerialNumber is the fingerprint — a change means
+	// cert-manager rotated the issuer and linkerd-identity must
+	// re-roll to pick the new bundle up.
+	linkerdIssuerSecret      = "linkerd-identity-issuer"
+	linkerdIssuerDeploy      = "linkerd-identity"
+	linkerdIssuerRolloutAnno = "kubectl.kubernetes.io/restartedAt"
+	linkerdIssuerCooldown    = 30 * time.Minute
 )
 
 // certificateGVR resolves a Certificate's spec.secretName — the only
@@ -157,6 +172,14 @@ type certDriftAuditor struct {
 	// re-synced or gone replicas get DeleteLabelValues, never a
 	// parked 1.
 	seenReplication map[replicationMetricKey]bool
+	// resyncNudged: replicationMetricKey → last replicated-from-
+	// version annotation strip (1h cooldown, in-RAM only).
+	resyncNudged map[replicationMetricKey]time.Time
+	// linkerdIssuerSerial / linkerdIssuerHealed: the tracked issuer
+	// fingerprint and the last rollout-stamp moment (30m cooldown).
+	linkerdIssuerSerial  string
+	linkerdIssuerHealed  time.Time
+	linkerdIssuerTracked bool
 }
 
 // Setup registers the 15m sweep — or nothing when the
@@ -178,6 +201,7 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
 		seenTrustBundles:    map[secretMetricKey]bool{},
 		replicationMismatch: map[replicationMetricKey]int{},
 		seenReplication:     map[replicationMetricKey]bool{},
+		resyncNudged:        map[replicationMetricKey]time.Time{},
 	}
 	return shared.AddPeriodic(mgr, certDriftQueue, 15*time.Minute, a.run)
 }
@@ -643,6 +667,10 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 		log.Info("replicated tls secret drifted from source across scans",
 			"secret", d.namespace+"/"+d.name, "source", d.source,
 			"consecutiveScans", a.replicationMismatch[k])
+		// W8-NM2: a confirmed drift means the replicator missed the
+		// update — stripping the replicated-from-version stamp
+		// makes it resync on its next reconcile (1h cooldown).
+		a.forceReplicationResync(ctx, d, k)
 	}
 
 	// Prune series + streaks for replicas gone (or sources no longer
@@ -659,6 +687,101 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 			delete(a.replicationMismatch, k)
 		}
 	}
+}
+
+// forceReplicationResync strips the replicated-from-version
+// annotation on a drifted destination so kubernetes-replicator copies
+// the source fresh on its next pass — rate-limited to once per
+// destination per hour (in-RAM: the annotation removal is the heal).
+func (a *certDriftAuditor) forceReplicationResync(ctx context.Context,
+	d replicatedSecretRef, k replicationMetricKey) {
+	log := logf.FromContext(ctx)
+	if a.resyncNudged == nil {
+		a.resyncNudged = map[replicationMetricKey]time.Time{} // literal-constructed auditors (tests)
+	}
+	now := a.nowFn()
+	if last, ok := a.resyncNudged[k]; ok && now.Sub(last) < replicationResyncCooldown {
+		log.Info("skip resync: replicated secret inside cooldown",
+			"secret", d.namespace+"/"+d.name,
+			"ago", now.Sub(last).Truncate(time.Minute))
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"annotations": map[string]any{
+			replicatedFromVersionAnno: nil,
+		}},
+	})
+	if err != nil {
+		return
+	}
+	if _, err := a.cs.CoreV1().Secrets(d.namespace).Patch(ctx, d.name,
+		types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		metrics.IncError(certDriftQueue)
+		log.Error(err, "replicated-from-version strip failed",
+			"secret", d.namespace+"/"+d.name)
+		return
+	}
+	a.resyncNudged[k] = now
+	log.Info("ACTION: stripped replicated-from-version — forcing kubernetes-replicator resync",
+		"secret", d.namespace+"/"+d.name, "source", d.source)
+}
+
+// auditLinkerdIssuer tracks the linkerd-identity-issuer Secret's
+// certificate fingerprint (SerialNumber): a cert-manager rotation
+// changes it, and linkerd-identity must re-roll to serve the new
+// issuer — a wedged rollout after rotation breaks mTLS mesh-wide.
+// First sight only seeds the fingerprint; a CHANGE patches a rollout
+// annotation on Deployment/linkerd-identity (30m cooldown).
+func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Secret) {
+	log := logf.FromContext(ctx)
+	var serial string
+	for _, key := range []string{"tls.crt", "crt.pem", "ca.crt"} {
+		block, _ := pem.Decode(s.Data[key])
+		if block == nil {
+			continue
+		}
+		if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
+			serial = cert.SerialNumber.String()
+			break
+		}
+	}
+	if serial == "" {
+		return
+	}
+	if !a.linkerdIssuerTracked {
+		a.linkerdIssuerTracked = true
+		a.linkerdIssuerSerial = serial
+		return
+	}
+	if serial == a.linkerdIssuerSerial {
+		return
+	}
+	a.linkerdIssuerSerial = serial
+	now := a.nowFn()
+	if now.Sub(a.linkerdIssuerHealed) < linkerdIssuerCooldown {
+		log.Info("skip issuer rollout: inside cooldown",
+			"ago", now.Sub(a.linkerdIssuerHealed).Truncate(time.Minute))
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"spec": map[string]any{"template": map[string]any{
+			"metadata": map[string]any{"annotations": map[string]string{
+				linkerdIssuerRolloutAnno: now.UTC().Format(time.RFC3339),
+			}},
+		}},
+	})
+	if err != nil {
+		return
+	}
+	if _, err := a.cs.AppsV1().Deployments(linkerdNS).Patch(ctx, linkerdIssuerDeploy,
+		types.StrategicMergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		metrics.IncError(certDriftQueue)
+		log.Error(err, "linkerd-identity rollout stamp failed")
+		return
+	}
+	a.linkerdIssuerHealed = now
+	metrics.ControlPlanePodHealsTotal.WithLabelValues(linkerdIssuerDeploy).Inc()
+	log.Info("ACTION: issuer cert rotated (serial changed) — stamped rollout annotation on linkerd-identity")
 }
 
 // earliestCertExpiryDays returns days until the earliest NotAfter
@@ -741,6 +864,9 @@ func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
 			continue
 		}
 		a.emitTrustBundle(ctx, s.Namespace, s.Name, bundle, current)
+		if s.Name == linkerdIssuerSecret {
+			a.auditLinkerdIssuer(ctx, s)
+		}
 	}
 
 	// Prune series for bundles deleted since the last sweep — the

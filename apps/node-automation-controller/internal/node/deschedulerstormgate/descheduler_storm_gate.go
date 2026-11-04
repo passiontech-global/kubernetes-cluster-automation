@@ -90,11 +90,18 @@ var autopilotPlanGVR = schema.GroupVersionResource{
 }
 
 // stormConds mirrors STORM_CONDS (see package comment for sources).
+// NebulaIsolated/NebulaDegraded are the node-host-agent overlay
+// conditions; KernelHungTasks, CalicoFelixDown and
+// CiliumIPAMExhausted are the node-problem-detector/CNI latches that
+// make rebalancing actively harmful — same posture as the existing
+// network-problem conditions.
 var stormConds = []corev1.NodeConditionType{
 	"KubeletRuntimeStall", "KubeletWatchWedge", "PodTeardownWedged",
 	"WatchdogStale", "HostNetworkProblems", "ClusterNetworkProblems",
 	"HostNetworkProblem", "ClusterNetworkProblem", "MemoryPressure",
 	"DiskPressure", "NetworkUnavailable", "FilesystemReadOnly",
+	"NebulaIsolated", "NebulaDegraded", "KernelHungTasks",
+	"CalicoFelixDown", "CiliumIPAMExhausted",
 }
 
 // stormTaints mirrors STORM_TAINTS.
@@ -164,12 +171,16 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	}
 
 	var notReady, bad, tainted, cordoned []string
+	now := time.Now()
 	for i := range nodes {
 		n := &nodes[i]
 		if !shared.NodeReady(n) {
 			notReady = append(notReady, n.Name)
 		}
-		if n.Spec.Unschedulable {
+		// Only an ACTIVE cordon is a storm signal — a node statically
+		// cordoned past the cordon window is deliberate state, and
+		// counting it would pin the descheduler at 0 forever.
+		if shared.NodeActivelyCordoned(n, now) {
 			cordoned = append(cordoned, n.Name)
 		}
 		for _, c := range n.Status.Conditions {

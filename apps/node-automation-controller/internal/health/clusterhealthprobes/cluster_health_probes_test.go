@@ -385,11 +385,12 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	if v, _ := healthGauge(t, checkNamePodStatus, "FAIL"); v != 1 {
 		t.Fatalf("pod-status FAIL gauge = %v, want 1 on List error", v)
 	}
-	// The two pod checks, the rabbitmq-suspended-listener sweep AND
-	// the localpv-stranded-pods scan hit the same cluster-wide pods
-	// List error -> four run errors.
-	if got := errCount() - before; got != 4 {
-		t.Fatalf("run errors delta = %v, want 4", got)
+	// The two pod checks, the rabbitmq-suspended-listener sweep, the
+	// localpv-stranded-pods scan AND the W8-CP3 scheduler-watchdog
+	// pending-pods List all hit the same cluster-wide pods List
+	// error -> five run errors.
+	if got := errCount() - before; got != 5 {
+		t.Fatalf("run errors delta = %v, want 5", got)
 	}
 }
 

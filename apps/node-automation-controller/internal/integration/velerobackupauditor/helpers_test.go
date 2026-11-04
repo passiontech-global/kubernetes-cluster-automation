@@ -12,10 +12,12 @@ import (
 
 var ctx = context.Background()
 
-// newDynFake seeds the two Velero types the auditor lists.
+// newDynFake seeds the Velero types the auditor lists — schedules,
+// backups, and the W8-ST1 backupstoragelocations.
 func newDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	return testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
 		veleroScheduleGVR: "ScheduleList",
 		veleroBackupGVR:   "BackupList",
+		veleroBSLGVR:      "BackupStorageLocationList",
 	}, objs...)
 }

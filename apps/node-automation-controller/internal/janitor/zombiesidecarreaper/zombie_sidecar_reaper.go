@@ -46,6 +46,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -64,9 +65,6 @@ const (
 	// legit post-completion grace (preStop of the sidecar, log
 	// shipping) so a normally-finishing pod is never touched.
 	zombieSidecarTermAge = 5 * time.Minute
-	// zombieSidecarShutdownPort is the linkerd admin port that
-	// serves /shutdown.
-	zombieSidecarShutdownPort = 4191
 	// zombieSidecarShutdownTimeout bounds the admin call — a
 	// wedged proxy must not stall the sweep.
 	zombieSidecarShutdownTimeout = 3 * time.Second
@@ -84,6 +82,17 @@ var zombieSidecarNames = map[string]bool{
 	"istio-proxy":   true,
 }
 
+// zombieSidecarShutdownTargets maps each supported sidecar to its
+// admin quit endpoint — linkerd's admin serves POST /shutdown on
+// :4191, istio's pilot-agent serves POST /quitquitquit on :15000.
+var zombieSidecarShutdownTargets = map[string]struct {
+	port int
+	path string
+}{
+	"linkerd-proxy": {port: 4191, path: "/shutdown"},
+	"istio-proxy":   {port: 15000, path: "/quitquitquit"},
+}
+
 type zombieSidecarReaper struct {
 	cs kubernetes.Interface
 	// dyn is accepted for Setup-signature parity with the other
@@ -93,8 +102,10 @@ type zombieSidecarReaper struct {
 	// termination window is deterministic. nil → time.Now.
 	nowFn func() time.Time
 	// shutdownFn POSTs the sidecar's admin shutdown — a seam so
-	// tests never leave the process. nil → zombieSidecarShutdown.
-	shutdownFn func(ctx context.Context, podIP string) error
+	// tests never leave the process. The sidecar name selects the
+	// admin endpoint (linkerd :4191/shutdown, istio :15000/
+	// quitquitquit). nil → zombieSidecarShutdown.
+	shutdownFn func(ctx context.Context, podIP, sidecar string) error
 	mu         sync.Mutex
 	// poked records "ns/name/uid" of pods already sent /shutdown:
 	// one graceful cycle, then delete. UID is part of the key so a
@@ -160,35 +171,53 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	deleted := 0
 	for i := range pods {
 		p := &pods[i]
-		if !r.zombiePod(p, now) {
+		sidecar := r.zombiePod(p, now)
+		if sidecar == "" {
 			continue
 		}
 		key := zombieKey(p)
 		seen[key] = true
 		if r.poked[key] {
-			// Already sent /shutdown last cycle and the pod STILL
-			// qualifies — the sidecar ignored the graceful path, so
-			// the pod itself goes away.
+			// Already sent the admin quit call last cycle and the
+			// pod STILL qualifies — the sidecar ignored the
+			// graceful path, so the pod itself goes away. The
+			// Job-completion gate still applies: deleting a
+			// still-Running pod of an unfinished Job recreates it
+			// and re-runs the Job.
+			if !r.jobAllowsReap(ctx, p) {
+				continue
+			}
 			delete(r.poked, key)
-			if err := r.reap(ctx, p, "still stuck after /shutdown"); err != nil {
+			if err := r.reap(ctx, p, "still stuck after sidecar shutdown"); err != nil {
 				continue
 			}
 			deleted++
 			continue
 		}
 		if p.Status.PodIP == "" {
-			// No admin endpoint to poke — straight to delete.
-			if err := r.reap(ctx, p, "no podIP for /shutdown"); err != nil {
+			// No admin endpoint to poke — straight to delete, same
+			// Job gate as every other forced path.
+			if !r.jobAllowsReap(ctx, p) {
+				continue
+			}
+			if err := r.reap(ctx, p, "no podIP for sidecar shutdown"); err != nil {
 				continue
 			}
 			deleted++
 			continue
 		}
-		if err := r.shutdownFn(ctx, p.Status.PodIP); err != nil {
+		if err := r.shutdownFn(ctx, p.Status.PodIP, sidecar); err != nil {
 			// A failed shutdown call cannot reach the sidecar —
 			// graceful is impossible, so delete now rather than
-			// burn a cycle.
-			if derr := r.reap(ctx, p, fmt.Sprintf("/shutdown failed: %v", err)); derr != nil {
+			// burn a cycle. BUG-C1: with every app container at
+			// exit 0 the Job must already be Complete first —
+			// deleting a still-Running pod whose Job has not
+			// counted it makes the job-controller recreate the
+			// pod and re-run the Job.
+			if !r.jobAllowsReap(ctx, p) {
+				continue
+			}
+			if derr := r.reap(ctx, p, fmt.Sprintf("sidecar shutdown failed: %v", err)); derr != nil {
 				continue
 			}
 			deleted++
@@ -196,7 +225,8 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		}
 		r.poked[key] = true
 		log.Info("SHUTDOWN: asked zombie sidecar to exit",
-			"pod", p.Namespace+"/"+p.Name, "podIP", p.Status.PodIP)
+			"pod", p.Namespace+"/"+p.Name, "podIP", p.Status.PodIP,
+			"sidecar", sidecar)
 	}
 	pods = nil
 
@@ -212,18 +242,20 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	return nil
 }
 
-// zombiePod reports whether the pod matches every zombie clause —
-// phase Running and not already terminating, Job-owned, all app
-// containers Terminated >= termAge with a final exit, every
-// non-sidecar init container finished, at least one sidecar still
-// Running in EITHER status list (native sidecars live in
-// spec.initContainers + status.initContainerStatuses).
-func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) bool {
+// zombiePod returns the name of the still-Running mesh sidecar when
+// the pod matches every zombie clause — phase Running and not already
+// terminating, Job-owned, all app containers Terminated >= termAge
+// with a final exit, every non-sidecar init container finished, at
+// least one sidecar still Running in EITHER status list (native
+// sidecars live in spec.initContainers + status.initContainerStatuses).
+// "" means not a zombie — the empty string doubles as the sentinel so
+// the caller picks the right admin endpoint per sidecar.
+func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) string {
 	if p.Status.Phase != corev1.PodRunning {
-		return false
+		return ""
 	}
 	if !p.DeletionTimestamp.IsZero() {
-		return false // already terminating — a delete is in flight, don't pile on
+		return "" // already terminating — a delete is in flight, don't pile on
 	}
 	jobOwned := false
 	for _, ref := range p.OwnerReferences {
@@ -233,7 +265,7 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) bool {
 		}
 	}
 	if !jobOwned {
-		return false
+		return ""
 	}
 
 	statusByName := make(map[string]*corev1.ContainerStatus, len(p.Status.ContainerStatuses))
@@ -253,18 +285,18 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) bool {
 		appSeen = true
 		st := statusByName[c.Name]
 		if st == nil || st.State.Terminated == nil {
-			return false // app container still running or never started
+			return "" // app container still running or never started
 		}
 		term := st.State.Terminated
 		if now.Sub(term.FinishedAt.Time) < zombieSidecarTermAge {
-			return false // too fresh — may still be inside normal completion
+			return "" // too fresh — may still be inside normal completion
 		}
 		if term.ExitCode != 0 && p.Spec.RestartPolicy != corev1.RestartPolicyNever {
-			return false // non-zero exit with a restartable policy — not final
+			return "" // non-zero exit with a restartable policy — not final
 		}
 	}
 	if !appSeen {
-		return false // no app containers — nothing to prove the job finished
+		return "" // no app containers — nothing to prove the job finished
 	}
 
 	// Native sidecars (initContainers with restartPolicy:Always)
@@ -280,7 +312,7 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) bool {
 		}
 		st := initStatusByName[c.Name]
 		if st == nil || st.State.Terminated == nil {
-			return false
+			return ""
 		}
 	}
 
@@ -291,11 +323,76 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) bool {
 		for i := range statuses {
 			st := &statuses[i]
 			if zombieSidecarNames[st.Name] && st.State.Running != nil {
-				return true
+				return st.Name
 			}
 		}
 	}
-	return false
+	return ""
+}
+
+// allZeroExit reports whether every app (non-sidecar) container in
+// spec.containers terminated with exit code 0 — the "Job succeeded but
+// the sidecar never noticed" shape, where a forced pod delete must
+// first prove the parent Job already counted the completion.
+func allZeroExit(p *corev1.Pod) bool {
+	statusByName := make(map[string]*corev1.ContainerStatus, len(p.Status.ContainerStatuses))
+	for i := range p.Status.ContainerStatuses {
+		statusByName[p.Status.ContainerStatuses[i].Name] = &p.Status.ContainerStatuses[i]
+	}
+	for _, c := range p.Spec.Containers {
+		if zombieSidecarNames[c.Name] {
+			continue
+		}
+		st := statusByName[c.Name]
+		if st == nil || st.State.Terminated == nil || st.State.Terminated.ExitCode != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// jobAllowsReap gates the forced-delete paths (shutdown unreachable,
+// still stuck after the graceful call, no podIP): when every app
+// container exited 0, a still-Running pod may only be deleted once the
+// parent Job already recorded the success — job.Status.Succeeded >= 1.
+// Deleting earlier makes the job-controller recreate the pod and
+// re-run the Job (BUG-C1). A pod with any non-zero app exit needs no
+// such gate: a re-run after a failed exit is the Job's own retry
+// semantics, not a double-success. A missing Job object means no
+// controller can recreate the pod — safe to reap; any other Get
+// failure is "cannot verify" and fails closed.
+func (r *zombieSidecarReaper) jobAllowsReap(ctx context.Context, p *corev1.Pod) bool {
+	if !allZeroExit(p) {
+		return true
+	}
+	jobName := ""
+	for _, ref := range p.OwnerReferences {
+		if ref.Kind == "Job" {
+			jobName = ref.Name
+			break
+		}
+	}
+	if jobName == "" {
+		return false // qualification guarantees a Job owner — unreachable
+	}
+	log := logf.FromContext(ctx)
+	job, err := r.cs.BatchV1().Jobs(p.Namespace).Get(ctx, jobName, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		return true // Job gone — nobody recreates the pod
+	case err != nil:
+		metrics.IncError(zombieSidecarReaperQueue)
+		log.Info("WARN: job lookup failed — keeping still-Running exit-0 pod (fail closed)",
+			"pod", p.Namespace+"/"+p.Name, "job", jobName, "error", err)
+		return false
+	case job.Status.Succeeded >= 1:
+		return true
+	default:
+		log.Info("KEEP: Job not Complete — deleting the Running pod would re-run it",
+			"pod", p.Namespace+"/"+p.Name, "job", jobName,
+			"succeeded", job.Status.Succeeded)
+		return false
+	}
 }
 
 // reap deletes the zombie pod and counts the reap — the Job
@@ -325,14 +422,21 @@ func zombieKey(p *corev1.Pod) string {
 	return p.Namespace + "/" + p.Name + "/" + string(p.UID)
 }
 
-// zombieSidecarShutdown POSTs the linkerd admin /shutdown endpoint —
-// the graceful exit path the proxy honors even when its pod's app
-// containers are gone.
-func zombieSidecarShutdown(ctx context.Context, podIP string) error {
+// zombieSidecarShutdown POSTs the sidecar's admin quit endpoint — the
+// graceful exit path the proxy honors even when its pod's app
+// containers are gone (linkerd :4191/shutdown, istio
+// :15000/quitquitquit). An unknown sidecar name falls back to the
+// linkerd endpoint: zombieSidecarNames only admits the two known
+// names, so the fallback is unreachable in practice.
+func zombieSidecarShutdown(ctx context.Context, podIP, sidecar string) error {
+	target, ok := zombieSidecarShutdownTargets[sidecar]
+	if !ok {
+		target = zombieSidecarShutdownTargets["linkerd-proxy"]
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		// JoinHostPort brackets IPv6 podIPs — plain %s:%d breaks on them.
 		"http://"+net.JoinHostPort(podIP,
-			strconv.Itoa(zombieSidecarShutdownPort))+"/shutdown", nil)
+			strconv.Itoa(target.port))+target.path, nil)
 	if err != nil {
 		return err
 	}
@@ -348,7 +452,7 @@ func zombieSidecarShutdown(ctx context.Context, podIP string) error {
 		resp.Body.Close()
 	}()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("sidecar /shutdown returned %s", resp.Status)
+		return fmt.Errorf("sidecar %s returned %s", target.path, resp.Status)
 	}
 	return nil
 }

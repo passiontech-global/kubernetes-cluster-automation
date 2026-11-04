@@ -216,7 +216,7 @@ func TestCoreDNSDNSProbeCancelled(t *testing.T) {
 	cancel()
 	w := &coreDNSWatchdog{}
 	start := time.Now()
-	if w.dnsProbe(cctx, "10.9.9.9", "svc.ns.svc.cluster.local") {
+	if ips, err := w.dnsProbe(cctx, "10.9.9.9", "svc.ns.svc.cluster.local"); err == nil && len(ips) > 0 {
 		t.Fatal("cancelled probe resolved an fqdn")
 	}
 	if d := time.Since(start); d > 4*time.Second {
@@ -231,7 +231,7 @@ func TestCoreDNSProbeFQDNListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	w := &coreDNSWatchdog{cs: cs}
-	if got := w.probeFQDN(ctx); got != "" {
+	if got, _ := w.probeFQDN(ctx); got != "" {
 		t.Fatalf("service list error produced fqdn %q", got)
 	}
 }

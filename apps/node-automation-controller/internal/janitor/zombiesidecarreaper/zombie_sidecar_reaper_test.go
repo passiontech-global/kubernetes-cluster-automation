@@ -10,6 +10,7 @@ import (
 	"time"
 
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -83,7 +84,7 @@ type zsrShutdownProbe struct {
 	err   error
 }
 
-func (s *zsrShutdownProbe) fn(_ context.Context, podIP string) error {
+func (s *zsrShutdownProbe) fn(_ context.Context, podIP, _ string) error {
 	s.calls = append(s.calls, podIP)
 	return s.err
 }
@@ -368,7 +369,7 @@ func TestZombieSidecarShutdownIPv6(t *testing.T) {
 	srv.Start()
 	defer srv.Close()
 
-	if err := zombieSidecarShutdown(ctx, "::1"); err != nil {
+	if err := zombieSidecarShutdown(ctx, "::1", "linkerd-proxy"); err != nil {
 		t.Fatalf("IPv6 /shutdown failed: %v", err)
 	}
 }
@@ -382,5 +383,87 @@ func TestZombieSidecarPodListError(t *testing.T) {
 	r := zsrReaper(cs, &zsrShutdownProbe{})
 	if err := r.run(ctx); err == nil {
 		t.Fatal("expected error when the pod list fails")
+	}
+}
+
+// BUG-C1 — an exit-0 pod whose Job is NOT Complete yet must survive
+// the forced-delete paths: deleting a still-Running pod makes the
+// job-controller recreate it and re-run the Job.
+func TestZombieSidecarJobNotCompleteKept(t *testing.T) {
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "jobs", Name: "job-x"}} // Status.Succeeded = 0 — not complete
+	cs := fake.NewSimpleClientset(zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0), job)
+	probe := &zsrShutdownProbe{err: errors.New("connection refused")}
+	r := zsrReaper(cs, probe)
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		t.Fatal("exit-0 pod deleted while its Job was still incomplete — would re-run the Job")
+	}
+}
+
+// Same shape but the Job already counted the success — the forced
+// delete is safe and fires.
+func TestZombieSidecarJobCompleteReaped(t *testing.T) {
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "jobs", Name: "job-x"},
+		Status:     batchv1.JobStatus{Succeeded: 1}}
+	cs := fake.NewSimpleClientset(zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0), job)
+	probe := &zsrShutdownProbe{err: errors.New("connection refused")}
+	r := zsrReaper(cs, probe)
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		t.Fatal("pod kept although its Job already completed")
+	}
+}
+
+// A non-zero app exit needs no Job gate — job-controller retries are
+// the Job's own semantics.
+func TestZombieSidecarNonZeroExitReaped(t *testing.T) {
+	cs := fake.NewSimpleClientset(zsrPod("jobs", "job-x-abcde", 10*time.Minute, 1))
+	probe := &zsrShutdownProbe{err: errors.New("connection refused")}
+	r := zsrReaper(cs, probe)
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		t.Fatal("non-zero-exit pod kept — Job gate must not apply")
+	}
+}
+
+// BUG-C1 — the shutdown endpoint is selected per sidecar: istio gets
+// :15000/quitquitquit, linkerd :4191/shutdown.
+func TestZombieSidecarShutdownTargets(t *testing.T) {
+	istio := zombieSidecarShutdownTargets["istio-proxy"]
+	if istio.port != 15000 || istio.path != "/quitquitquit" {
+		t.Fatalf("istio target = %+v, want :15000/quitquitquit", istio)
+	}
+	linkerd := zombieSidecarShutdownTargets["linkerd-proxy"]
+	if linkerd.port != 4191 || linkerd.path != "/shutdown" {
+		t.Fatalf("linkerd target = %+v, want :4191/shutdown", linkerd)
+	}
+	// An istio zombie pod gets poked through the istio endpoint.
+	p := zsrPod("jobs", "istio-job-abcde", 10*time.Minute, 0)
+	p.Spec.Containers[1] = corev1.Container{Name: "istio-proxy"}
+	p.Status.ContainerStatuses[1] = corev1.ContainerStatus{
+		Name: "istio-proxy",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.NewTime(time.Now().Add(-time.Hour))}},
+	}
+	cs := fake.NewSimpleClientset(p)
+	var gotSidecar string
+	r := &zombieSidecarReaper{cs: cs, nowFn: time.Now,
+		shutdownFn: func(_ context.Context, _ string, sidecar string) error {
+			gotSidecar = sidecar
+			return nil
+		}, poked: map[string]bool{}}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if gotSidecar != "istio-proxy" {
+		t.Fatalf("shutdown called with sidecar %q, want istio-proxy", gotSidecar)
 	}
 }
