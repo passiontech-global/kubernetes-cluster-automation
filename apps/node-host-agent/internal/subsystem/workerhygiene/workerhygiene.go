@@ -87,6 +87,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -194,6 +195,18 @@ const (
 	ctrIngestMaxAge            = 3 * time.Hour
 	ctrIngestScanInterval      = 6 * time.Hour
 	k0sDiskHighWatermark       = 0.75
+	// W6.3 disk-bloat thresholds: above the warn watermark the
+	// bounded walk runs (at most once per DiskBloatScanInterval —
+	// the walk itself costs IO on the disk that is already full);
+	// above the critical watermark a non-system offender may be
+	// evicted outright. Any single dir past the pod threshold is a
+	// runaway target.
+	k0sDiskBloatWatermark         = 0.85
+	k0sDiskBloatCriticalWatermark = 0.92
+	diskBloatPodThresholdBytes    = int64(15) << 30 // 15 GiB
+	diskBloatScanInterval         = 15 * time.Minute
+	diskBloatEvictInterval        = 15 * time.Minute // last-disk-bloat-evict budget
+	maxBloatWalkEntries           = 10000            // walk cap per scanned dir
 	// journaldVacuumInterval bounds how often the A5 remedy runs —
 	// journalctl --rotate is cheap but --vacuum-time does real IO.
 	journaldVacuumInterval = 30 * time.Minute
@@ -224,6 +237,8 @@ const (
 	checkJournald    = "journald-integrity" // A5
 	checkCiliumEnvoy = "cilium-envoy"       // B1
 	checkCiliumMTU   = "cilium-mtu"         // B4
+	checkCiliumWG    = "cilium-wg-peers"    // W5.6
+	checkDiskBloat   = "disk-bloat"         // W6.3
 )
 
 // stateJournalUnreadable is the blindness latch the journal-read
@@ -308,6 +323,16 @@ type Config struct {
 	CtrIngestMaxAge       time.Duration // ingest dir mtime older than → stale (3h)
 	CtrIngestScanInterval time.Duration // periodic rescan even under disk WM (6h)
 	K0sDiskHighWatermark  float64       // /var/lib/k0s used ratio triggering GC
+	// W6.3 disk-bloat runaway detector: above K0sDiskBloatWatermark
+	// the bounded emptyDir/snapshot walk runs (gated by
+	// DiskBloatScanInterval — the walk costs IO on the disk that is
+	// already full); above K0sDiskBloatCriticalWatermark a
+	// non-system pod holding more than DiskBloatPodThresholdBytes
+	// may be evicted through the API (last-disk-bloat-evict budget).
+	K0sDiskBloatWatermark         float64
+	K0sDiskBloatCriticalWatermark float64
+	DiskBloatPodThresholdBytes    int64
+	DiskBloatScanInterval         time.Duration
 
 	// killFn delivers signals — seam for tests (SIGKILL on pause /
 	// proxy-agent/shim/cilium pids, and signal-0 liveness probes).
@@ -355,6 +380,16 @@ type Config struct {
 	// content ingest rm <ref>` via the systemd exec wrapper (A3).
 	// nil → Systemd.Exec default. Seam.
 	ctrRmIngest func(ctx context.Context, ref string) error
+	// wgAllowedIPsFn returns how many cilium_wg0 peers carry a real
+	// allowed-ips set — `wg show cilium_wg0 allowed-ips` parsed
+	// (peers at "(none)" are wiped). nil → Systemd.Exec default.
+	// Seam for the W5.6 check.
+	wgAllowedIPsFn func(ctx context.Context) (int, error)
+	// ciliumEncryptPeersFn returns the expected WG peer count —
+	// `cilium-dbg encrypt status` parsed. An error or a count <=0
+	// makes the caller fall back to ReadyNodes-1. nil →
+	// Systemd.Exec default. Seam.
+	ciliumEncryptPeersFn func(ctx context.Context) (int, error)
 
 	// JournalDirs are the host journal storage roots — the
 	// journal-unreadable latch may only fire while at least one
@@ -483,6 +518,18 @@ func (c *Config) applyDefaults() {
 	}
 	if c.K0sDiskHighWatermark <= 0 {
 		c.K0sDiskHighWatermark = k0sDiskHighWatermark
+	}
+	if c.K0sDiskBloatWatermark <= 0 {
+		c.K0sDiskBloatWatermark = k0sDiskBloatWatermark
+	}
+	if c.K0sDiskBloatCriticalWatermark <= 0 {
+		c.K0sDiskBloatCriticalWatermark = k0sDiskBloatCriticalWatermark
+	}
+	if c.DiskBloatPodThresholdBytes <= 0 {
+		c.DiskBloatPodThresholdBytes = diskBloatPodThresholdBytes
+	}
+	if c.DiskBloatScanInterval <= 0 {
+		c.DiskBloatScanInterval = diskBloatScanInterval
 	}
 	if c.killFn == nil {
 		c.killFn = func(pid int, sig syscall.Signal) error {
@@ -656,6 +703,36 @@ func (c *Config) applyDefaults() {
 			return err
 		}
 	}
+	if c.wgAllowedIPsFn == nil {
+		sd := c.Systemd
+		c.wgAllowedIPsFn = func(ctx context.Context) (int, error) {
+			if sd == nil {
+				return 0, fmt.Errorf("no systemd client wired")
+			}
+			out, err := sd.Exec(ctx, "wg", "show", "cilium_wg0", "allowed-ips")
+			if err != nil {
+				return 0, err
+			}
+			return parseWGAllowedIPs(out), nil
+		}
+	}
+	if c.ciliumEncryptPeersFn == nil {
+		sd := c.Systemd
+		c.ciliumEncryptPeersFn = func(ctx context.Context) (int, error) {
+			if sd == nil {
+				return 0, fmt.Errorf("no systemd client wired")
+			}
+			out, err := sd.Exec(ctx, "cilium-dbg", "encrypt", "status")
+			if err != nil {
+				return 0, err
+			}
+			n, ok := parseCiliumEncryptPeers(out)
+			if !ok {
+				return 0, fmt.Errorf("no peer count in cilium-dbg encrypt status")
+			}
+			return n, nil
+		}
+	}
 	if len(c.JournalDirs) == 0 {
 		// /host mount convention like the other defaults; standalone
 		// wiring passes the unprefixed host paths.
@@ -744,6 +821,14 @@ type Hygiene struct {
 	ctrsockFails  int
 	envoyFails    int
 	journaldFails int
+	// ciliumWGFails counts consecutive cycles the WireGuard peer
+	// table reads below expectation (W5.6).
+	ciliumWGFails int
+	// lastBloatScan stamps the last bounded disk-bloat walk — the
+	// tree scan costs IO on the very disk that is full, so above
+	// the warn watermark it runs at most once per
+	// DiskBloatScanInterval (W6.3).
+	lastBloatScan time.Time
 	// journalReads is the journal-unreadable accounting — every
 	// journal read (k0sworker snapshot + A5 probes) is classified
 	// into it; the tracker fires the state-journal-unreadable latch
@@ -1056,6 +1141,12 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	})
 	run(checkCiliumMTU, func() {
 		h.checkCiliumMTU(workerActive)
+	})
+	run(checkCiliumWG, func() {
+		h.checkCiliumWGPeers(ctx, apiOK, workerActive)
+	})
+	run(checkDiskBloat, func() {
+		h.checkDiskBloat(ctx, pods, apiOK, workerActive)
 	})
 	run(checkZombieStorm, func() {
 		h.checkZombieStorm(pidsOnce, workerActive)
@@ -3905,4 +3996,411 @@ func (h *Hygiene) checkCiliumMTU(workerActive bool) {
 		h.stateExit("cilium-mtu-drift")
 	}
 	h.cycles.WithLabelValues(checkCiliumMTU, "ok").Inc()
+}
+
+// --- Check: cilium WireGuard peer-gc drift healer (W5.6) ---
+// A cilium WireGuard node can lose its wg0 peer table (kernel-side
+// peer GC racing agent bookkeeping): cilium_wg0 exists, the agent's
+// healthz stays green, but every peer's allowed-ips reads "(none)"
+// — the node encrypts nothing while cross-node pod traffic
+// blackholes. The healer compares live allowed-ips peers against the
+// expected count (cilium-dbg encrypt status, falling back to
+// ReadyNodes-1) and restarts the agent through the shared cilium
+// budget.
+
+// parseWGAllowedIPs counts peers carrying a real allowed-ips set —
+// `wg show <iface> allowed-ips` prints "<pubkey>\t<ip,ip,...>" per
+// line, "(none)" for a peer whose routes were wiped.
+func parseWGAllowedIPs(out string) int {
+	n := 0
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[1] == "(none)" {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// encryptPeersRe matches a textual "num-peers"-style field inside
+// `cilium-dbg encrypt status` — versions that print a table instead
+// of JSON (e.g. "NumPeers: 5", "num_peers=5").
+var encryptPeersRe = regexp.MustCompile(`(?i)num.?peers[^0-9]*([0-9]+)`)
+
+// jsonFindKeys collects every numeric value under keys matching
+// (case-insensitive) any wanted name — the same recursive walk
+// runtimeConfigMTU uses for `mtu` (cilium versions nest the count
+// differently).
+func jsonFindKeys(v any, out *[]int64, keys ...string) {
+	switch n := v.(type) {
+	case map[string]any:
+		for k, val := range n {
+			for _, want := range keys {
+				if strings.EqualFold(k, want) {
+					if f, ok := val.(float64); ok {
+						*out = append(*out, int64(f))
+					}
+				}
+			}
+			jsonFindKeys(val, out, keys...)
+		}
+	case []any:
+		for _, val := range n {
+			jsonFindKeys(val, out, keys...)
+		}
+	}
+}
+
+// parseCiliumEncryptPeers extracts the expected WireGuard peer count
+// from `cilium-dbg encrypt status`. JSON bodies are searched for a
+// num-peers-ish key (the largest match wins — interfaces may repeat
+// the field); a non-JSON body falls back to a text regex. ok=false
+// means no usable number (non-wireguard mode, older agent).
+func parseCiliumEncryptPeers(out string) (int, bool) {
+	var v any
+	if json.Unmarshal([]byte(out), &v) == nil {
+		var vals []int64
+		jsonFindKeys(v, &vals, "num-peers", "numpeers", "num_peers")
+		if len(vals) > 0 {
+			return int(slices.Max(vals)), true
+		}
+		return 0, false
+	}
+	if m := encryptPeersRe.FindStringSubmatch(out); m != nil {
+		n, err := strconv.Atoi(m[1])
+		return n, err == nil
+	}
+	return 0, false
+}
+
+// readyNodeCount lists Ready nodes — the expected-peers fallback
+// (every other Ready node should be a WireGuard peer).
+func (h *Hygiene) readyNodeCount(ctx context.Context) int {
+	list, err := h.cfg.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for i := range list.Items {
+		for _, cond := range list.Items[i].Status.Conditions {
+			if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+// checkCiliumWGPeers detects the wiped peer table: it runs only on
+// nodes where cilium_wg0 exists, the API answered, and a
+// cilium-agent task is running — every other shape is another
+// check's signal. actual < expected for ConsecNeeded consecutive
+// cycles latches state-cilium-wg-peer-wipe and SIGKILLs the agent
+// (kubelet restarts it; the shared last-cilium-restart 30m budget
+// and the node-overloaded gate apply like sig9).
+func (h *Hygiene) checkCiliumWGPeers(ctx context.Context, apiOK, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCiliumWG, "gated").Inc()
+		return
+	}
+	if !apiOK {
+		// Inconclusive — keep counters/latch exactly like the other
+		// API-dependent checks.
+		h.cycles.WithLabelValues(checkCiliumWG, "abort").Inc()
+		return
+	}
+	if _, err := os.Stat(filepath.Join(h.cfg.SysClassNet, "cilium_wg0")); err != nil {
+		// No WireGuard datapath on this node (calico, tunnel mode,
+		// hub) — nothing to heal; drop stale evidence.
+		h.ciliumWGFails = 0
+		h.stateExit("cilium-wg-peer-wipe")
+		h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+		return
+	}
+	tasks, reachable := h.ciliumAgentTasks()
+	if !reachable {
+		h.cycles.WithLabelValues(checkCiliumWG, "abort").Inc()
+		return
+	}
+	running := false
+	for _, t := range tasks {
+		if t.live && t.pid > 0 {
+			running = true
+			break
+		}
+	}
+	if !running {
+		// No live cilium-agent — sig9 owns agent-down; killing
+		// nothing here is correct, not a miss.
+		h.ciliumWGFails = 0
+		h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+		return
+	}
+	actual, err := h.cfg.wgAllowedIPsFn(ctx)
+	if err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-wg-peers wg allowed-ips probe failed: %v — inconclusive, keeping state", err))
+		h.cycles.WithLabelValues(checkCiliumWG, "abort").Inc()
+		return
+	}
+	expected, err := h.cfg.ciliumEncryptPeersFn(ctx)
+	if err != nil || expected <= 0 {
+		// encrypt status unreadable or carries no count — fall back
+		// to ReadyNodes-1 (every OTHER Ready node is a peer).
+		if n := h.readyNodeCount(ctx); n > 1 {
+			expected = n - 1
+		} else {
+			expected = 0
+		}
+	}
+	if expected <= 0 {
+		// No expectation available — inconclusive but not harmful:
+		// neither count nor clear a streak we cannot verify.
+		h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+		return
+	}
+	if actual >= expected {
+		h.ciliumWGFails = 0
+		h.stateExit("cilium-wg-peer-wipe")
+		h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+		return
+	}
+	h.ciliumWGFails++
+	if h.ciliumWGFails < h.cfg.ConsecNeeded {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-wg-peers allowed_ips=%d expected=%d (check %d/%d)",
+			actual, expected, h.ciliumWGFails, h.cfg.ConsecNeeded))
+		h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+		return
+	}
+	h.stateEnter("cilium-wg-peer-wipe",
+		fmt.Sprintf("allowed_ips=%d expected=%d", actual, expected))
+	switch {
+	case h.stateExists("node-overloaded"):
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-wg-peers allowed_ips=%d expected=%d %dx but node overloaded — skip kill",
+			actual, expected, h.ciliumWGFails))
+	case !h.rateTrySpend("last-cilium-restart", h.cfg.MinRestartInterval):
+		h.appendLog(fmt.Sprintf(
+			"suspect: cilium-wg-peers allowed_ips=%d expected=%d %dx but restart cooldown — skip kill",
+			actual, expected, h.ciliumWGFails))
+	default:
+		// Budget already spent atomically by the rateTrySpend case.
+		if h.killCiliumAgent(tasks) {
+			// NPD contract: the cilium_wg0 line feeds
+			// CiliumWireGuardPeerDrift (events.go).
+			h.appendLog(fmt.Sprintf(
+				"ACTION: killed cilium-agent container - cilium_wg0 has %d allowed-ip peers while expected %d (kubelet will restart -> wireguard peer resync)",
+				actual, expected))
+			h.ciliumWGFails = 0
+			h.actions.WithLabelValues(checkCiliumWG, "sigkill").Inc()
+		} else {
+			h.appendLog(fmt.Sprintf(
+				"suspect: cilium-wg-peers allowed_ips=%d expected=%d, no running task to kill",
+				actual, expected))
+		}
+	}
+	h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+}
+
+// --- Check: disk-bloat runaway detector + emergency evictor (W6.3) ---
+// A runaway emptyDir (or a leaked containerd snapshot) can fill
+// /var/lib/k0s faster than kubelet's eviction thresholds notice —
+// the fs going full first kills kubelet/containerd writes and the
+// node wedges. Above the warn watermark a bounded walk attributes
+// space to pods and snapshots (any single dir past the threshold →
+// state-disk-bloat + DiskBloatRunaway event); above the critical
+// watermark the largest non-system pod offender is deleted via the
+// API under the last-disk-bloat-evict budget.
+
+// bloatHit is one over-threshold directory found by the walk.
+type bloatHit struct {
+	label string
+	bytes int64
+}
+
+// readDirNames lists the immediate subdirectories of dir (an
+// unreadable/absent root yields nil — the scan just sees no dirs).
+func readDirNames(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			out = append(out, filepath.Join(dir, e.Name()))
+		}
+	}
+	return out
+}
+
+// walkBytes sums regular-file sizes under root. The walk is bounded:
+// after maxBloatWalkEntries entries it stops and reports
+// truncated=true — the total is then a lower bound (a tree that
+// huge is bloat by definition, but the walk must never become its
+// own IO problem on the disk that is already full).
+func (h *Hygiene) walkBytes(root string) (total int64, truncated bool) {
+	entries := 0
+	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // unreadable entries are skipped, never fatal
+		}
+		entries++
+		if entries > maxBloatWalkEntries {
+			truncated = true
+			return fs.SkipAll
+		}
+		if d.Type().IsRegular() {
+			if fi, ierr := d.Info(); ierr == nil {
+				total += fi.Size()
+			}
+		}
+		return nil
+	})
+	return total, truncated
+}
+
+// scanBloat runs the two bounded walks the check is defined over:
+// kubelet emptyDir volumes (tmpfs-backed ones can't fill the disk —
+// skipped via statfs type) and containerd overlayfs snapshots.
+// Over-threshold dirs return as hits; podTotals/podByUID feed the
+// critical-watermark eviction decision.
+func (h *Hygiene) scanBloat(pods []corev1.Pod) (hits []bloatHit,
+	podTotals map[string]int64, podByUID map[string]*corev1.Pod) {
+	podByUID = map[string]*corev1.Pod{}
+	podTotals = map[string]int64{}
+	for i := range pods {
+		podByUID[string(pods[i].UID)] = &pods[i]
+	}
+	threshold := h.cfg.DiskBloatPodThresholdBytes
+	// (1) emptyDir volumes: pods/<uid>/volumes/kubernetes.io~empty-dir/<vol>.
+	for _, uidDir := range readDirNames(h.cfg.KubeletPodsDir) {
+		uid := filepath.Base(uidDir)
+		for _, vol := range readDirNames(filepath.Join(
+			uidDir, "volumes", "kubernetes.io~empty-dir")) {
+			var vst unix.Statfs_t
+			if err := h.cfg.statfsFn(vol, &vst); err == nil &&
+				int64(vst.Type) == int64(unix.TMPFS_MAGIC) {
+				continue // medium=Memory emptyDir — can't fill the disk
+			}
+			size, _ := h.walkBytes(vol)
+			podTotals[uid] += size
+			if size > threshold {
+				label := "pod-uid " + uid
+				if p, ok := podByUID[uid]; ok && p != nil {
+					label = "pod " + p.Namespace + "/" + p.Name
+				}
+				hits = append(hits, bloatHit{
+					label: label + " volume " + filepath.Base(vol),
+					bytes: size})
+			}
+		}
+	}
+	// (2) containerd overlayfs snapshots — <id>/fs is the unpacked
+	// layer content; a leaked snapshot pins real disk.
+	snapRoot := filepath.Join(h.cfg.K0sDataDir, "containerd",
+		"io.containerd.snapshotter.v1.overlayfs", "snapshots")
+	for _, snap := range readDirNames(snapRoot) {
+		size, _ := h.walkBytes(filepath.Join(snap, "fs"))
+		if size > threshold {
+			hits = append(hits, bloatHit{
+				label: "snapshot " + filepath.Base(snap), bytes: size})
+		}
+	}
+	return hits, podTotals, podByUID
+}
+
+func (h *Hygiene) checkDiskBloat(ctx context.Context, pods []corev1.Pod,
+	apiOK, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkDiskBloat, "gated").Inc()
+		return
+	}
+	var st unix.Statfs_t
+	used := -1.0
+	if err := h.cfg.statfsFn(h.cfg.K0sDataDir, &st); err == nil &&
+		st.Blocks > 0 && st.Bavail <= st.Blocks {
+		used = float64(st.Blocks-st.Bavail) / float64(st.Blocks)
+	}
+	if used < 0 {
+		// statfs failed or returned garbage — inconclusive; keep
+		// the latch like a failed probe.
+		h.cycles.WithLabelValues(checkDiskBloat, "abort").Inc()
+		return
+	}
+	if used <= h.cfg.K0sDiskBloatWatermark {
+		h.stateExit("disk-bloat")
+		h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+		return
+	}
+	// The walk is IO on the disk that is full — at most once per
+	// DiskBloatScanInterval; an existing latch persists meanwhile.
+	if h.cfg.nowFn().Sub(h.lastBloatScan) < h.cfg.DiskBloatScanInterval {
+		h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+		return
+	}
+	h.lastBloatScan = h.cfg.nowFn()
+	hits, podTotals, podByUID := h.scanBloat(pods)
+	if len(hits) == 0 {
+		h.stateExit("disk-bloat")
+		h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+		return
+	}
+	h.stateEnter("disk-bloat", fmt.Sprintf("targets=%d", len(hits)))
+	for _, hit := range hits {
+		// NPD contract: "ACTION disk-bloat: target=... bytes=...
+		// used_pct=..." feeds DiskBloatRunaway (events.go).
+		h.appendLog(fmt.Sprintf(
+			"ACTION disk-bloat: target=%s bytes=%d used_pct=%.1f",
+			hit.label, hit.bytes, used*100))
+	}
+	h.actions.WithLabelValues(checkDiskBloat, "detect").Inc()
+	// Critical band: emergency-evict the largest non-system pod
+	// holding more than the threshold — kube-system/node-ops are
+	// never deleted by this check.
+	if used <= h.cfg.K0sDiskBloatCriticalWatermark || !apiOK {
+		h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+		return
+	}
+	var victim *corev1.Pod
+	var victimBytes int64
+	for uid, total := range podTotals {
+		p := podByUID[uid]
+		if total <= h.cfg.DiskBloatPodThresholdBytes || p == nil ||
+			p.DeletionTimestamp != nil ||
+			p.Namespace == "kube-system" || p.Namespace == "node-ops" {
+			continue
+		}
+		if victim == nil || total > victimBytes {
+			victim, victimBytes = p, total
+		}
+	}
+	if victim == nil {
+		h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+		return
+	}
+	if !h.rateTrySpend("last-disk-bloat-evict", diskBloatEvictInterval) {
+		h.appendLog(fmt.Sprintf(
+			"suspect: disk-bloat victim %s/%s bytes=%d - in evict cooldown (<15m), skip",
+			victim.Namespace, victim.Name, victimBytes))
+		h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+		return
+	}
+	// Budget spent atomically BEFORE the delete (rate_spend parity —
+	// a failed delete still consumed it).
+	if err := h.cfg.Client.CoreV1().Pods(victim.Namespace).Delete(
+		ctx, victim.Name, metav1.DeleteOptions{}); err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: disk-bloat evict %s/%s failed: %v",
+			victim.Namespace, victim.Name, err))
+	} else {
+		h.appendLog(fmt.Sprintf(
+			"ACTION: disk-bloat evicted pod %s/%s - emptyDir holds %d bytes, /var/lib/k0s at %.1f%%",
+			victim.Namespace, victim.Name, victimBytes, used*100))
+		h.actions.WithLabelValues(checkDiskBloat, "pod_evict").Inc()
+	}
+	h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
 }

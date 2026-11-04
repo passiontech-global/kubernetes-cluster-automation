@@ -132,6 +132,9 @@ var knownLatchNames = map[string]bool{
 	"cilium-mtu-drift":         true, // B4
 	"zombie-storm":             true, // A2
 	"journal-unreadable":       true, // journalwatch tracker (both hygienes)
+	"filesystem-readonly":      true, // W5.3 hostmetrics ST_RDONLY
+	"cilium-wg-peer-wipe":      true, // W5.6 cilium WireGuard drift
+	"disk-bloat":               true, // W6.3 disk-bloat runaway
 }
 
 // knownLatchPrefixes — parameterized latch families whose suffix is

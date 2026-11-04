@@ -72,6 +72,13 @@ var logRules = []logRule{
 	{"CorruptedImageRemoved", regexp.MustCompile(`ACTION: removed corrupted image`)},
 	{"ZombieProcessStorm", regexp.MustCompile(`ACTION:? *zombie-storm:`)},
 	{"CiliumMTUExceedsOverlay", regexp.MustCompile(`ACTION:? *cilium-mtu-drift:`)},
+	// W5.6: workerhygiene's cilium WireGuard peer-gc drift healer —
+	// "ACTION: killed cilium-agent container - cilium_wg0 has N
+	// allowed-ip peers while expected M".
+	{"CiliumWireGuardPeerDrift", regexp.MustCompile(`ACTION: killed cilium-agent container - cilium_wg0`)},
+	// W6.3: disk-bloat runaway detector —
+	// "ACTION disk-bloat: target=... bytes=... used_pct=...".
+	{"DiskBloatRunaway", regexp.MustCompile(`ACTION:? *disk-bloat:`)},
 	// journalwatch blindness latch — STATE-ENTER only (one event per
 	// latch entry; the suspect:* line carrying the same detail is a
 	// throttled re-reminder, matching it too would double-count).

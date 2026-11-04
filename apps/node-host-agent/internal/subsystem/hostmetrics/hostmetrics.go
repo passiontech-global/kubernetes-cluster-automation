@@ -135,6 +135,9 @@ const (
 	defaultK0sUnitFile      = "/etc/systemd/system/k0scontroller.service"
 	defaultNebulaCertFile   = "/host/etc/nebula/interdc/host.crt"
 	defaultPSIFile          = "/proc/pressure/cpu"
+	defaultPSIMemoryFile    = "/proc/pressure/memory"
+	defaultPSIIOFile        = "/proc/pressure/io"
+	defaultVMStatFile       = "/proc/vmstat"
 	// H2 conntrack table + H6 fd/socket sources.
 	defaultConntrackCountFile = "/proc/sys/net/netfilter/nf_conntrack_count"
 	defaultConntrackMaxFile   = "/proc/sys/net/netfilter/nf_conntrack_max"
@@ -249,6 +252,15 @@ type Config struct {
 	// PSIFile is /proc/pressure/cpu — drives the overload gauge +
 	// state-node-overloaded latch.
 	PSIFile string
+	// PSIMemoryFile/PSIIOFile are /proc/pressure/{memory,io} — the
+	// W5.7 some/full avg60 gauges (memory-reclaim and block-IO stall
+	// evidence the cpu PSI can't see). Missing files (PSI off in the
+	// kernel) simply emit no series.
+	PSIMemoryFile string
+	PSIIOFile     string
+	// VMStatFile is /proc/vmstat — pswpin/pswpout swap-thrash
+	// counters (W5.7).
+	VMStatFile string
 	// EgressRelays is OVERLAY_EGRESS_RELAYS (wired from watchdogconf
 	// by main) — each target gets a relay-active gauge.
 	EgressRelays []string
@@ -344,6 +356,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.PSIFile == "" {
 		c.PSIFile = defaultPSIFile
+	}
+	if c.PSIMemoryFile == "" {
+		c.PSIMemoryFile = defaultPSIMemoryFile
+	}
+	if c.PSIIOFile == "" {
+		c.PSIIOFile = defaultPSIIOFile
+	}
+	if c.VMStatFile == "" {
+		c.VMStatFile = defaultVMStatFile
 	}
 	if c.CPUDeliveredInterval <= 0 {
 		c.CPUDeliveredInterval = defaultCPUDeliveredIn
@@ -474,6 +495,7 @@ type Collector struct {
 	descFSInodesFree   *prometheus.Desc
 	descFSInodesRatio  *prometheus.Desc
 	descFSProbeStalled *prometheus.Desc
+	descFSReadonly     *prometheus.Desc
 	descFileFDAlloc    *prometheus.Desc
 	descFileFDMax      *prometheus.Desc
 	descFileFDRatio    *prometheus.Desc
@@ -490,6 +512,14 @@ type Collector struct {
 	descZombies        *prometheus.Desc
 	descCgroupPids     *prometheus.Desc
 	descMTUDrift       *prometheus.Desc
+
+	// W5.7 PSI memory/io avg60 gauges + vmstat swap-thrash counters.
+	descPSIMemSome *prometheus.Desc
+	descPSIMemFull *prometheus.Desc
+	descPSIIOSome  *prometheus.Desc
+	descPSIIOFull  *prometheus.Desc
+	descPSWPIn     *prometheus.Desc
+	descPSWPOut    *prometheus.Desc
 
 	// Legacy node-watchdog aliases — the prom_emit textfile series
 	// the fluxcd PrometheusRules still alert on
@@ -710,6 +740,36 @@ func New(cfg Config) *Collector {
 		"node_host_agent_mtu_drift",
 		"cilium datapath MTU exceeds the nebula overlay MTU (1 = drift; emitted only when both MTUs resolve).",
 		[]string{"node"}, nil)
+	c.descFSReadonly = prometheus.NewDesc(
+		"node_host_agent_filesystem_readonly",
+		"Probed mount reports ST_RDONLY via statfs (1 = filesystem remounted read-only; emitted only when statfs succeeds).",
+		[]string{"node", "mount"}, nil)
+
+	// W5.7 — PSI memory/io some+full avg60 and vmstat swap counters.
+	c.descPSIMemSome = prometheus.NewDesc(
+		"node_host_agent_psi_memory_some_avg60",
+		"PSI memory some avg60 — share of time any task stalled on memory reclaim.",
+		[]string{"node"}, nil)
+	c.descPSIMemFull = prometheus.NewDesc(
+		"node_host_agent_psi_memory_full_avg60",
+		"PSI memory full avg60 — share of time ALL non-idle tasks stalled on memory reclaim (thrashing).",
+		[]string{"node"}, nil)
+	c.descPSIIOSome = prometheus.NewDesc(
+		"node_host_agent_psi_io_some_avg60",
+		"PSI io some avg60 — share of time any task stalled on block IO.",
+		[]string{"node"}, nil)
+	c.descPSIIOFull = prometheus.NewDesc(
+		"node_host_agent_psi_io_full_avg60",
+		"PSI io full avg60 — share of time ALL non-idle tasks stalled on block IO (disk saturation).",
+		[]string{"node"}, nil)
+	c.descPSWPIn = prometheus.NewDesc(
+		"node_host_agent_vmstat_pswpin_total",
+		"/proc/vmstat pswpin — cumulative pages swapped in (swap thrash evidence).",
+		[]string{"node"}, nil)
+	c.descPSWPOut = prometheus.NewDesc(
+		"node_host_agent_vmstat_pswpout_total",
+		"/proc/vmstat pswpout — cumulative pages swapped out (swap thrash evidence).",
+		[]string{"node"}, nil)
 
 	c.descMeta = map[*prometheus.Desc]descMeta{}
 	for _, d := range []struct {
@@ -785,6 +845,20 @@ func New(cfg Config) *Collector {
 			"pids.current / pids.max of the slice."},
 		{c.descMTUDrift, "node_host_agent_mtu_drift",
 			"cilium datapath MTU exceeds the nebula overlay MTU (1 = drift)."},
+		{c.descFSReadonly, "node_host_agent_filesystem_readonly",
+			"Probed mount reports ST_RDONLY via statfs (1 = filesystem remounted read-only)."},
+		{c.descPSIMemSome, "node_host_agent_psi_memory_some_avg60",
+			"PSI memory some avg60 — share of time any task stalled on memory reclaim."},
+		{c.descPSIMemFull, "node_host_agent_psi_memory_full_avg60",
+			"PSI memory full avg60 — share of time all tasks stalled on memory reclaim."},
+		{c.descPSIIOSome, "node_host_agent_psi_io_some_avg60",
+			"PSI io some avg60 — share of time any task stalled on block IO."},
+		{c.descPSIIOFull, "node_host_agent_psi_io_full_avg60",
+			"PSI io full avg60 — share of time all tasks stalled on block IO."},
+		{c.descPSWPIn, "node_host_agent_vmstat_pswpin_total",
+			"/proc/vmstat pswpin — cumulative pages swapped in."},
+		{c.descPSWPOut, "node_host_agent_vmstat_pswpout_total",
+			"/proc/vmstat pswpout — cumulative pages swapped out."},
 	} {
 		c.descMeta[d.desc] = descMeta{name: d.name, help: d.help}
 	}
@@ -835,6 +909,13 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.descZombies
 	ch <- c.descCgroupPids
 	ch <- c.descMTUDrift
+	ch <- c.descFSReadonly
+	ch <- c.descPSIMemSome
+	ch <- c.descPSIMemFull
+	ch <- c.descPSIIOSome
+	ch <- c.descPSIIOFull
+	ch <- c.descPSWPIn
+	ch <- c.descPSWPOut
 }
 
 // Collect implements prometheus.Collector.
@@ -868,6 +949,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.collectZombies(ch)
 	c.collectCgroupPids(ch)
 	c.collectMTUDrift(ch)
+	c.collectMemoryIO(ch)
 }
 
 // collectWatchdog scans state-* latch files. certDays/certOK fold the
@@ -1675,8 +1757,12 @@ func (c *Collector) probeFS(mount string) (st unix.Statfs_t, stalled, ok bool) {
 // probe answered in time (even with an error), so "reachable but
 // boring" stays distinguishable from "never probed". Inode gauges
 // emit only on a successful statfs — a failed/hung probe emits no
-// fake numbers.
+// fake numbers. A successful probe also exports the ST_RDONLY flag
+// (W5.3): one read-only mount latches state-filesystem-readonly for
+// nodereporter's FilesystemReadOnly condition.
 func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
+	anyRO := false
+	probed := false // at least one statfs answered — the latch's evidence base
 	for _, mount := range c.cfg.FilesystemTargets {
 		st, stalled, ok := c.probeFS(mount)
 		v := 0.0
@@ -1711,6 +1797,14 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 		if !ok {
 			continue
 		}
+		probed = true
+		ro := 0.0
+		if st.Flags&unix.ST_RDONLY != 0 {
+			ro = 1
+			anyRO = true
+		}
+		ch <- prometheus.MustNewConstMetric(c.descFSReadonly,
+			prometheus.GaugeValue, ro, c.cfg.NodeName, mount)
 		ch <- prometheus.MustNewConstMetric(c.descFSInodesTotal,
 			prometheus.GaugeValue, float64(st.Files), c.cfg.NodeName, mount)
 		ch <- prometheus.MustNewConstMetric(c.descFSInodesFree,
@@ -1721,6 +1815,43 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 			used := float64(st.Files-st.Ffree) / float64(st.Files)
 			ch <- prometheus.MustNewConstMetric(c.descFSInodesRatio,
 				prometheus.GaugeValue, used, c.cfg.NodeName, mount)
+		}
+	}
+	c.updateFSReadonlyLatch(anyRO, probed)
+}
+
+// updateFSReadonlyLatch drives state-filesystem-readonly (W5.3):
+// set when ANY successfully probed mount carries ST_RDONLY, cleared
+// once every probed mount is rw again. probed=false (every statfs
+// failed or stalled) leaves the latch untouched — inconclusive
+// evidence must neither set nor clear it, the same rule the
+// overload latch follows on an unparseable PSI file.
+func (c *Collector) updateFSReadonlyLatch(anyRO, probed bool) {
+	p := filepath.Join(c.cfg.WatchdogStateDir, "state-filesystem-readonly")
+	_, err := os.Stat(p)
+	switch {
+	case anyRO && err != nil:
+		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
+		tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
+		if werr := os.WriteFile(tmp, []byte(content), 0o644); werr != nil {
+			logger().Warn("hostmetrics: filesystem-readonly latch write failed",
+				"path", p, "error", werr)
+		} else if rerr := os.Rename(tmp, p); rerr != nil {
+			logger().Warn("hostmetrics: filesystem-readonly latch install failed",
+				"path", p, "error", rerr)
+		} else {
+			logger().Warn("hostmetrics: filesystem-readonly latch set — "+
+				"a probed mount reports ST_RDONLY",
+				"path", p)
+		}
+	case probed && !anyRO && err == nil:
+		if rerr := os.Remove(p); rerr != nil {
+			logger().Warn("hostmetrics: filesystem-readonly latch remove failed",
+				"path", p, "error", rerr)
+		} else {
+			logger().Info("hostmetrics: filesystem-readonly latch cleared — "+
+				"all probed mounts rw again",
+				"path", p)
 		}
 	}
 }
@@ -2190,6 +2321,107 @@ func (c *Collector) collectMTUDrift(ch chan<- prometheus.Metric) {
 	}
 	ch <- prometheus.MustNewConstMetric(c.descMTUDrift,
 		prometheus.GaugeValue, drift, c.cfg.NodeName)
+}
+
+// --- W5.7: PSI memory/IO pressure + vmstat swap-thrash counters ---
+
+// psiAvg60Full parses BOTH avg60 values of a PSI file — the "some"
+// line (any-task stalled) and the "full" line (all-tasks stalled).
+// A missing/unreadable file or a missing field reports that side as
+// unparsed — PSI may be compiled out of the kernel and emitting a
+// fake 0 would hide that.
+func psiAvg60Full(path string) (some, full float64, someOK, fullOK bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 || (f[0] != "some" && f[0] != "full") {
+			continue
+		}
+		for _, kv := range f[1:] {
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok || k != "avg60" {
+				continue
+			}
+			x, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				continue
+			}
+			if f[0] == "some" {
+				some, someOK = x, true
+			} else {
+				full, fullOK = x, true
+			}
+		}
+	}
+	return some, full, someOK, fullOK
+}
+
+// vmstatCounters extracts the named cumulative counters from
+// /proc/vmstat — "key value" per line (pswpin/pswpout for W5.7).
+// Missing keys are simply absent from the map.
+func vmstatCounters(path string, keys ...string) map[string]uint64 {
+	want := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		want[k] = true
+	}
+	out := map[string]uint64{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 || !want[f[0]] {
+			continue
+		}
+		if v, err := strconv.ParseUint(f[1], 10, 64); err == nil {
+			out[f[0]] = v
+		}
+	}
+	return out
+}
+
+// collectMemoryIO emits the PSI memory/io some+full avg60 gauges and
+// the vmstat pswpin/pswpout counters — each only when its own source
+// parses (a kernel without PSI or a missing vmstat yields absent
+// series, never a fake 0 — same emission rule as conntrack).
+func (c *Collector) collectMemoryIO(ch chan<- prometheus.Metric) {
+	if some, full, someOK, fullOK := psiAvg60Full(c.cfg.PSIMemoryFile); someOK || fullOK {
+		if someOK {
+			ch <- prometheus.MustNewConstMetric(c.descPSIMemSome,
+				prometheus.GaugeValue, some, c.cfg.NodeName)
+		}
+		if fullOK {
+			ch <- prometheus.MustNewConstMetric(c.descPSIMemFull,
+				prometheus.GaugeValue, full, c.cfg.NodeName)
+		}
+	}
+	if some, full, someOK, fullOK := psiAvg60Full(c.cfg.PSIIOFile); someOK || fullOK {
+		if someOK {
+			ch <- prometheus.MustNewConstMetric(c.descPSIIOSome,
+				prometheus.GaugeValue, some, c.cfg.NodeName)
+		}
+		if fullOK {
+			ch <- prometheus.MustNewConstMetric(c.descPSIIOFull,
+				prometheus.GaugeValue, full, c.cfg.NodeName)
+		}
+	}
+	vm := vmstatCounters(c.cfg.VMStatFile, "pswpin", "pswpout")
+	for _, k := range []struct {
+		key  string
+		desc *prometheus.Desc
+	}{
+		{"pswpin", c.descPSWPIn},
+		{"pswpout", c.descPSWPOut},
+	} {
+		if v, ok := vm[k.key]; ok {
+			ch <- prometheus.MustNewConstMetric(k.desc,
+				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+		}
+	}
 }
 
 // --- node-exporter textfile rendering (standalone prom_emit port) ---

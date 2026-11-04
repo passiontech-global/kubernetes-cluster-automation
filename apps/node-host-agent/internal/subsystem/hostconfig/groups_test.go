@@ -1881,13 +1881,14 @@ func TestCycleWithErrorsCountsGroupErrors(t *testing.T) {
 	sr.errs["systemctl daemon-reload"] = true
 	got := r.CycleWithErrors(context.Background())
 	// EXACT count — one noteErr per daemonReload invocation:
-	// nodelocaldns nft apply + nodeip_cpu nebula drop-in. (coredns
+	// nodelocaldns nft apply + host-internal-ports nft apply
+	// (W6.1, same groupNLD) + nodeip_cpu nebula drop-in. (coredns
 	// self-gates here: nebula disabled → derive() leaves no
 	// DNSResolvers.) A regression that counts a fault twice (or
 	// skips one) moves this number.
-	if got != 2 {
-		t.Fatalf("cycle returned %d errors, want exactly 2 "+
-			"(daemon-reload x nodelocaldns/nodeip_cpu)", got)
+	if got != 3 {
+		t.Fatalf("cycle returned %d errors, want exactly 3 "+
+			"(daemon-reload x nodelocaldns/host-ports-guard/nodeip_cpu)", got)
 	}
 	if got := testutil.ToFloat64(r.cycles.WithLabelValues("nodelocaldns", "error")); got != 1 {
 		t.Fatalf("cycles{nodelocaldns,error} = %v want 1", got)

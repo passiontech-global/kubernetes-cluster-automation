@@ -1063,23 +1063,53 @@ func (p *Prober) haproxyServer(ctx context.Context, action, name string,
 		// an empty reply means success on HAProxy >= 2.x. Companions
 		// may legitimately not carry this server (no-op in the shell).
 		s := strings.TrimSpace(out)
-		if s == "" {
-			continue
-		}
-		if i > 0 {
+		switch {
+		case s == "":
+			// Command accepted.
+		case i > 0:
 			if !strings.Contains(s, "No such server") {
 				logger().Warn("haproxy companion backend rejected command — tolerated",
 					"command", action, "backend", be, "server", name,
 					"reply", s)
 			}
-			continue
+		case strings.Contains(s, "No such server") && tolerateMissingPrimary:
+			// Tolerated primary miss — see func doc.
+		default:
+			return fmt.Errorf("%s server %s/%s: %s", action, be, name, s)
 		}
-		if strings.Contains(s, "No such server") && tolerateMissingPrimary {
-			continue
+		// W5.2: `disable server` stops NEW traffic but every
+		// long-lived session already pinned to the server survives —
+		// the kubelet/cilium HTTP/2 watch streams ride the 24h
+		// client timeout, so a wedged apiserver keeps feeding stale
+		// data through the drain. Kill those sessions on the same
+		// backend(s) the disable just landed on.
+		if action == "disable" {
+			p.shutdownSessions(ctx, be, name)
 		}
-		return fmt.Errorf("%s server %s/%s: %s", action, be, name, s)
 	}
 	return nil
+}
+
+// shutdownSessions issues `shutdown sessions server <be>/<name>` on
+// the admin socket — the W5.2 complement of a disable: closes every
+// session still stuck to the drained backend. Best-effort like the
+// companion replies above (the shell ignored every socket reply): a
+// failed shutdown must not veto a drain that already landed, and a
+// "No such server" answer is the same expected no-op it is on
+// disable.
+func (p *Prober) shutdownSessions(ctx context.Context, be, name string) {
+	out, err := p.socketCmd(ctx,
+		fmt.Sprintf("shutdown sessions server %s/%s", be, name))
+	if err != nil {
+		logger().Warn("haproxy shutdown sessions failed — tolerated",
+			"backend", be, "server", name, "error", err)
+		return
+	}
+	if s := strings.TrimSpace(out); s != "" &&
+		!strings.Contains(s, "No such server") {
+		logger().Warn("haproxy shutdown sessions rejected — tolerated",
+			"backend", be, "server", name, "reply", s)
+	}
 }
 
 // --- watchdog state files (module 34 parity) ---

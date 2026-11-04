@@ -117,6 +117,16 @@ var conditionDefs = []conditionDef{
 		problemReason:  "JournaldUnreadableDetected",
 		stateKey:       "journal-unreadable",
 	},
+	{
+		// Agent-added (W5.3): hostmetrics' statfs probes found a
+		// mount reporting ST_RDONLY — the fs remounted read-only
+		// (kernel error path) and every write on it silently fails.
+		typ:            "FilesystemReadOnly",
+		defaultReason:  "FilesystemReadWrite",
+		defaultMessage: "all probed filesystems are read-write",
+		problemReason:  "FilesystemReadOnlyDetected",
+		stateKey:       "filesystem-readonly",
+	},
 }
 
 // condEval is the evaluated state of one condition this cycle.

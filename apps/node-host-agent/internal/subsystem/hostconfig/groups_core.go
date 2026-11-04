@@ -501,6 +501,12 @@ func (c *cyc) t16Pairs() [][2]string {
 		{"net.core.netdev_max_backlog", "8192"},
 		{"net.ipv4.tcp_max_syn_backlog", "8192"},
 		{"net.ipv4.ip_local_port_range", "10240 65535"},
+		// W5.1: keep the kernel's ephemeral source-port allocation off
+		// ports host daemons LISTEN on — an ephemeral steal of kubelet
+		// 10248/10250/10256, NPD 20256, NodePort+Spegel 30000-32767,
+		// Nebula UDP 45670 or Cilium WireGuard 51871 wedges the real
+		// listener's next bind or blackholes its replies.
+		{"net.ipv4.ip_local_reserved_ports", "10248-10260,20256,30000-32767,45670,51871"},
 		{"fs.file-max", "2097152"},
 		{"vm.max_map_count", "524288"},
 		{"net.ipv4.neigh.default.gc_thresh1", "8192"},
@@ -595,21 +601,9 @@ DNSStubListener=no
 			}
 		}
 	}
-	// guard allow list = private + node IPs + extra, sorted.
-	allow := append(c.vs("nodelocaldns_guard_allow_private"), c.vs("nodelocaldns_guard_allow_extra")...)
-	for _, k := range c.t.Nodes.Keys() {
-		nv, _ := c.t.Nodes.Get(k)
-		om, _ := nv.(*topology.OMap)
-		if om == nil {
-			continue
-		}
-		if ip, ok := om.Get("ip"); ok {
-			if s, ok := ip.(string); ok && s != "" {
-				allow = append(allow, s)
-			}
-		}
-	}
-	sort.Strings(allow)
+	// guard allow list = private + node IPs + extra, sorted —
+	// shared with the host-internal-ports guard (W6.1).
+	allow := c.guardAllowSources()
 	nft := fmt.Sprintf(`# Managed by node-config-agent - block DNS from non-cluster sources
 destroy table ip nodelocaldns_guard
 table ip nodelocaldns_guard {
@@ -626,6 +620,102 @@ table ip nodelocaldns_guard {
 		[]byte(nft), "nodelocal-dns :53 guard (block non-cluster sources)")
 	// sweep the buggy nftables.d path this port originally wrote
 	r.removeManaged("/etc/nftables.d/nodelocaldns-guard.nft")
+	// W6.1: the node-internal listener ports get the same guard —
+	// non-cluster sources have no business reaching kubelet/NPD/
+	// exporter endpoints over the underlay.
+	c.convergeHostPortsGuard()
+}
+
+// guardAllowSources returns the sorted allow CIDR/IP set shared by
+// the nft guards: nodelocaldns_guard_allow_private + every node's
+// registry ip + nodelocaldns_guard_allow_extra.
+func (c *cyc) guardAllowSources() []string {
+	allow := append(c.vs("nodelocaldns_guard_allow_private"),
+		c.vs("nodelocaldns_guard_allow_extra")...)
+	for _, k := range c.t.Nodes.Keys() {
+		nv, _ := c.t.Nodes.Get(k)
+		om, _ := nv.(*topology.OMap)
+		if om == nil {
+			continue
+		}
+		if ip, ok := om.Get("ip"); ok {
+			if s, ok := ip.(string); ok && s != "" {
+				allow = append(allow, s)
+			}
+		}
+	}
+	sort.Strings(allow)
+	return allow
+}
+
+// hostPortsGuardPorts are the node-internal TCP listeners (W6.1)
+// that must never answer a non-cluster source over the underlay:
+// kubelet healthz/ro-port/read-only, node-exporter, blackbox
+// exporter, coredns metrics, node-problem-detector and the
+// node-host-agent metrics port.
+var hostPortsGuardPorts = []int{10248, 10250, 10256, 9100, 9115, 9253, 20256, 30020}
+
+// convergeHostPortsGuard deploys the host-internal-ports nft guard
+// + its boot oneshot (W6.1): inbound TCP to the internal listeners
+// is dropped unless it arrives via loopback, a cluster datapath
+// interface (neb1, cilium/lxc/cali — pod traffic paths), an
+// established/related flow, or an allowlisted source. Enabled by
+// default; `host_internal_ports_guard_enabled: false` tears the
+// unit and the live table down.
+func (c *cyc) convergeHostPortsGuard() {
+	r, ctx := c.r, c.ctx
+	// An UNDEFINED var means default-ON — the guard exists because
+	// a missing firewall rule only ever surfaces as "how did a
+	// scanner reach kubelet", so opt-out must be explicit.
+	enabled := true
+	if _, undef := c.t.Vars.Get("host_internal_ports_guard_enabled").(topology.Undefined); !undef {
+		enabled = c.vb("host_internal_ports_guard_enabled")
+	}
+	if !enabled {
+		r.run(ctx, "systemctl", "disable", "--now", "host-internal-ports-guard.service")
+		uch, _ := r.removeManaged("/etc/systemd/system/host-internal-ports-guard.service")
+		r.removeManaged("/etc/host-internal-ports-guard.nft")
+		if uch {
+			r.daemonReload(ctx)
+		}
+		// Drop the LIVE table too — disabling must actually reopen
+		// the ports, not only stop the oneshot.
+		r.run(ctx, "sh", "-c",
+			"nft delete table ip host_internal_ports_guard 2>/dev/null; true")
+		return
+	}
+	var ports strings.Builder
+	for i, p := range hostPortsGuardPorts {
+		if i > 0 {
+			ports.WriteString(", ")
+		}
+		fmt.Fprintf(&ports, "%d", p)
+	}
+	allow := c.guardAllowSources()
+	saddr := ""
+	if len(allow) > 0 {
+		// An empty saddr set literal is invalid nft — skip the rule
+		// when no allowlist resolved at all.
+		saddr = fmt.Sprintf("        ip saddr { %s } accept\n",
+			strings.Join(allow, ", "))
+	}
+	nft := fmt.Sprintf(`# Managed by node-config-agent - drop non-cluster traffic to node-internal ports
+destroy table ip host_internal_ports_guard
+table ip host_internal_ports_guard {
+    chain input {
+        type filter hook input priority filter - 5; policy accept;
+        iifname "lo" accept
+        iifname "neb1" accept
+        iifname "cilium*" accept
+        iifname "lxc*" accept
+        iifname "cali*" accept
+        ct state { established, related } accept
+%s        tcp dport { %s } drop
+    }
+}
+`, saddr, ports.String())
+	c.applyNftUnit("host-internal-ports-guard", "/etc/host-internal-ports-guard.nft",
+		[]byte(nft), "host internal ports guard (drop non-cluster sources to node-internal listeners)")
 }
 
 // checkedDeploy is the candidate-staging validate-then-promote half

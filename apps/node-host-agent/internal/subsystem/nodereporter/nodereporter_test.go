@@ -166,6 +166,7 @@ func TestAllConditionDefaults(t *testing.T) {
 		"KernelDeadlock":      {"KernelHasNoDeadlock", "kernel has no deadlock"},
 		"ReadonlyFilesystem":  {"FilesystemIsNotReadOnly", "Filesystem is not read-only"},
 		"JournaldUnreadable":  {"JournaldReadable", "journald journal reads return entries"},
+		"FilesystemReadOnly":  {"FilesystemReadWrite", "all probed filesystems are read-write"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {
