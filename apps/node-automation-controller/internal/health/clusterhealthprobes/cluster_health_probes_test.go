@@ -20,19 +20,26 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // testProber builds a prober with the env-equivalent defaults but
 // deterministic seams: DNS always resolves, and the HTTP check points
 // at a dead address (fast connection-refused FAIL) unless the test
-// overrides cfg.httpURL/httpClient.
+// overrides cfg.httpURL/httpClient. dyn is a bare fake — tests that
+// exercise the CR-scanning checks replace it via testProberDyn.
 func testProber(cs *fake.Clientset) *clusterHealthProber {
-	p := newClusterHealthProber(cs, healthProbeConfig{
+	return testProberDyn(cs, testutil.NewFakeDyn(nil))
+}
+
+func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *clusterHealthProber {
+	p := newClusterHealthProber(cs, dyn, healthProbeConfig{
 		dnsHostnames:        []string{"svc-a.ns.svc", "svc-b.ns.svc"},
 		checkTimeout:        5 * time.Second,
 		httpURL:             "http://127.0.0.1:1/",
@@ -369,9 +376,10 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	if v, _ := healthGauge(t, checkNamePodStatus, "FAIL"); v != 1 {
 		t.Fatalf("pod-status FAIL gauge = %v, want 1 on List error", v)
 	}
-	// Both pod checks hit the same List error -> two run errors.
-	if got := errCount() - before; got != 2 {
-		t.Fatalf("run errors delta = %v, want 2", got)
+	// The two pod checks AND the rabbitmq-suspended-listener sweep
+	// hit the same cluster-wide pods List error -> three run errors.
+	if got := errCount() - before; got != 3 {
+		t.Fatalf("run errors delta = %v, want 3", got)
 	}
 }
 

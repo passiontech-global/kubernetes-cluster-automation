@@ -424,6 +424,8 @@ func TestWebhookGuardListsClusterStateOncePerRun(t *testing.T) {
 		"endpointslices":                  1,
 		"pods":                            1,
 		"services":                        1,
+		// W5.5 — the node census feeds the effective-ready math.
+		"nodes": 1,
 	} {
 		if counts[res] != want {
 			t.Fatalf("list %s = %d, want %d per run", res, counts[res], want)
@@ -1135,5 +1137,236 @@ func TestWebhookCircuitBreakerPrunesSeriesForRecreatedConfig(t *testing.T) {
 	}
 	if anno, ok := wgMutatingAnno(t, cs, "cb-recreated"); ok {
 		t.Fatalf("recreated config must not carry the annotation, still %q", anno)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W5.5 — partitioned-node-aware circuit breaker
+// ---------------------------------------------------------------------------
+
+// wgReadyNode builds a Ready Node carrying the given taints.
+func wgReadyNode(name string, taints ...corev1.Taint) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       corev1.NodeSpec{Taints: taints},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type:   corev1.NodeReady,
+			Status: corev1.ConditionTrue,
+		}}},
+	}
+}
+
+// wgSliceOnNode builds a slice with one Ready endpoint bound to
+// nodeName — the shape that exercises the W5.5 effective-ready math.
+func wgSliceOnNode(ns, svc, nodeName string) *discoveryv1.EndpointSlice {
+	es := wgEndpointSlice(ns, svc, 0, 0)
+	up := true
+	es.Endpoints = []discoveryv1.Endpoint{{
+		Addresses:  []string{"10.10.5.5"},
+		NodeName:   &nodeName,
+		Conditions: discoveryv1.EndpointConditions{Ready: &up},
+	}}
+	return es
+}
+
+// nodeUnhealthyForEndpoints flags every node whose pod network is
+// presumed dead for admission: NotReady, any partition/unresponsive/
+// lifecycle taint, or an explicit NetworkPartitioned condition.
+func TestNodeUnhealthyForEndpoints(t *testing.T) {
+	notReady := wgReadyNode("n-notready")
+	notReady.Status.Conditions[0].Status = corev1.ConditionFalse
+	partCond := wgReadyNode("n-partcond")
+	partCond.Status.Conditions = append(partCond.Status.Conditions,
+		corev1.NodeCondition{Type: "NetworkPartitioned", Status: corev1.ConditionTrue})
+
+	for _, tc := range []struct {
+		name string
+		node *corev1.Node
+		want bool
+	}{
+		{"not ready", notReady, true},
+		{"ready clean", wgReadyNode("n-ok"), false},
+		{"network-partitioned taint", wgReadyNode("n1",
+			corev1.Taint{Key: "node.ops/network-partitioned", Effect: corev1.TaintEffectNoSchedule}), true},
+		{"kubelet-unresponsive taint", wgReadyNode("n2",
+			corev1.Taint{Key: "node.ops/kubelet-unresponsive", Effect: corev1.TaintEffectNoSchedule}), true},
+		{"unreachable taint", wgReadyNode("n3",
+			corev1.Taint{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoSchedule}), true},
+		{"not-ready taint", wgReadyNode("n4",
+			corev1.Taint{Key: "node.kubernetes.io/not-ready", Effect: corev1.TaintEffectNoSchedule}), true},
+		{"out-of-service taint", wgReadyNode("n5",
+			corev1.Taint{Key: "node.kubernetes.io/out-of-service", Effect: corev1.TaintEffectNoSchedule}), true},
+		{"NetworkPartitioned condition", partCond, true},
+		{"unrelated taint", wgReadyNode("n6",
+			corev1.Taint{Key: "node.cilium.io/agent-not-ready", Effect: corev1.TaintEffectNoSchedule}), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nodeUnhealthyForEndpoints(tc.node); got != tc.want {
+				t.Fatalf("nodeUnhealthyForEndpoints = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// tripThreshold picks the faster partition window only when raw
+// Ready endpoints remain (all of them stranded on bad nodes); a truly
+// empty backend keeps the full dead threshold. Field overrides win
+// over the package defaults.
+func TestTripThresholdSelection(t *testing.T) {
+	g := &webhookGuard{}
+	if got := g.tripThreshold(0); got != webhookDeadThreshold {
+		t.Fatalf("raw=0 threshold = %s, want %s", got, webhookDeadThreshold)
+	}
+	if got := g.tripThreshold(3); got != webhookPartitionedThreshold {
+		t.Fatalf("raw>0 threshold = %s, want %s", got, webhookPartitionedThreshold)
+	}
+	g = &webhookGuard{zeroThreshold: 7 * time.Minute, partitionZeroThreshold: 42 * time.Second}
+	if got := g.tripThreshold(0); got != 7*time.Minute {
+		t.Fatalf("zeroThreshold override ignored: %s", got)
+	}
+	if got := g.tripThreshold(1); got != 42*time.Second {
+		t.Fatalf("partitionZeroThreshold override ignored: %s", got)
+	}
+}
+
+// The W5.5 signature: every Ready endpoint of the backend Service sits
+// on a partitioned node — raw > 0, effective == 0 — so the breaker
+// trips on the 90s partition threshold instead of waiting 5m.
+func TestWebhookCircuitBreakerPartitionedBackendTripsFast(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-part"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgSliceOnNode("backend", "dead-svc", "node-part"),
+		wgReadyNode("node-part",
+			corev1.Taint{Key: "node.ops/network-partitioned", Effect: corev1.TaintEffectNoSchedule}),
+		mwc)
+	now := time.Unix(1_700_000_000, 0)
+	g := wgBreakerGuard(cs, &now)
+	patches := wgPatchCounter(cs)
+	t.Cleanup(func() {
+		metrics.WebhookCircuitBroken.DeleteLabelValues(
+			webhookKindMutating, "cb-part", "dead.example.com")
+	})
+
+	// First sighting — tracked, not tripped.
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 60s in — inside the 90s partition window, nowhere near 5m.
+	now = now.Add(60 * time.Second)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgMutatingFP(t, cs, "cb-part", "dead.example.com"); got != admissionv1.Fail {
+		t.Fatalf("60s streak < %s partition threshold must not trip, failurePolicy=%q",
+			webhookPartitionedThreshold, got)
+	}
+	// 100s in — past the partition window, still far under 5m.
+	now = now.Add(40 * time.Second)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgMutatingFP(t, cs, "cb-part", "dead.example.com"); got != admissionv1.Ignore {
+		t.Fatalf("partitioned backend must trip on the fast threshold, failurePolicy=%q", got)
+	}
+	if anno, ok := wgMutatingAnno(t, cs, "cb-part"); !ok || anno != "dead.example.com" {
+		t.Fatalf("annotation = %q (present=%v), want %q", anno, ok, "dead.example.com")
+	}
+	if got := atomic.LoadInt32(patches); got == 0 {
+		t.Fatal("expected a breaker patch")
+	}
+}
+
+// A Ready endpoint on a HEALTHY node keeps effective > 0 — the
+// partition fast-path must never engage even past both thresholds.
+func TestWebhookCircuitBreakerHealthyNodeBackendNeverTrips(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-healthy-node"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "live.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "live-svc"),
+			},
+		}},
+	}
+	// One endpoint stranded on a partitioned node, one healthy —
+	// effective counts the healthy one.
+	healthySlice := wgSliceOnNode("backend", "live-svc", "node-ok")
+	healthySlice.Name = "live-svc-slice-ok"
+	badSlice := wgSliceOnNode("backend", "live-svc", "node-part")
+	badSlice.Name = "live-svc-slice-bad"
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "live-svc"),
+		healthySlice, badSlice,
+		wgReadyNode("node-ok"),
+		wgReadyNode("node-part",
+			corev1.Taint{Key: "node.ops/network-partitioned", Effect: corev1.TaintEffectNoSchedule}),
+		mwc)
+	patches := wgPatchCounter(cs)
+	now := time.Unix(1_700_000_000, 0)
+	g := wgBreakerGuard(cs, &now)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * webhookDeadThreshold)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgMutatingFP(t, cs, "cb-healthy-node", "live.example.com"); got != admissionv1.Fail {
+		t.Fatalf("a reachable Ready endpoint must never trip, failurePolicy=%q", got)
+	}
+	if got := atomic.LoadInt32(patches); got != 0 {
+		t.Fatalf("reachable backend must not be patched, got %d patch(es)", got)
+	}
+}
+
+// A node list failure is indistinguishable from "no node data" — the
+// breaker must skip the sweep rather than trip webhooks on a blind
+// effective-ready reading.
+func TestWebhookCircuitBreakerNodeListErrorSkips(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cb-nodeerr"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "dead.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "dead-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		mwc)
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("nodes unreachable")
+		})
+	patches := wgPatchCounter(cs)
+	now := time.Unix(1_700_000_000, 0)
+	g := wgBreakerGuard(cs, &now)
+	if err := g.run(ctx); err == nil {
+		t.Fatal("expected an error when the node census fails")
+	}
+	now = now.Add(2 * webhookDeadThreshold)
+	_ = g.run(ctx)
+	if got := wgMutatingFP(t, cs, "cb-nodeerr", "dead.example.com"); got != admissionv1.Fail {
+		t.Fatalf("blind node census must not trip, failurePolicy=%q", got)
+	}
+	if got := atomic.LoadInt32(patches); got != 0 {
+		t.Fatalf("blind node census must not patch, got %d patch(es)", got)
 	}
 }

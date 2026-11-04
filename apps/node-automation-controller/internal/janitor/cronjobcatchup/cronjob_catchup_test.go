@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,6 +15,9 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -542,5 +546,167 @@ func TestCronJobCatchupTimeZoneHonored(t *testing.T) {
 	}
 	if n := ccJobCount(t, cs, "ops"); n != 0 {
 		t.Fatalf("spec.timeZone ignored — UTC tick math flagged stale (%d jobs)", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W5.9b — TooManyMissedStarts detector + auto-unfreezer
+// ---------------------------------------------------------------------------
+
+// missedOver100 counts the schedule ticks owed between anchor and now
+// — the kube-controller-manager >100 cap engages at 101.
+func TestMissedOver100(t *testing.T) {
+	anchor := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	hourly, err := cron.ParseStandard("0 * * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly 100 ticks owed — at the cap, not over it.
+	if missedOver100(hourly, anchor, anchor.Add(100*time.Hour+time.Minute)) {
+		t.Fatal("exactly 100 missed ticks must not trip the >100 cap")
+	}
+	// 101 ticks — one over.
+	if !missedOver100(hourly, anchor, anchor.Add(101*time.Hour+time.Minute)) {
+		t.Fatal("101 missed ticks must trip the >100 cap")
+	}
+	// A dense schedule hits the cap fast: */5 over 9h owes 108 ticks.
+	frequent, err := cron.ParseStandard("*/5 * * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !missedOver100(frequent, anchor, anchor.Add(9*time.Hour)) {
+		t.Fatal("*/5 schedule idle 9h missed >100 ticks")
+	}
+	// A sparse schedule idle the same 9h owes nothing at all.
+	if missedOver100(hourly, anchor, anchor.Add(9*time.Hour)) {
+		t.Fatal("hourly schedule idle 9h owes only 9 ticks")
+	}
+}
+
+// A CronJob past the >100 missed cap gets
+// spec.startingDeadlineSeconds=3600 + the provenance annotation
+// merge-patched in — no opt-in annotation required (the deadline is
+// inert repair, not a backlog replay) — and the gauge goes to 1.
+func TestCronJobCatchupTooManyMissedStartsPatchesDeadline(t *testing.T) {
+	cj := ccCronJob("ops", "deadhourly", "0 * * * *", nil)
+	delete(cj.Annotations, catchupAnno) // not opted in — still unfrozen
+	cj.CreationTimestamp = metav1.NewTime(time.Now().Add(-200 * time.Hour))
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchup(cs)
+	t.Cleanup(func() {
+		metrics.CronJobTooManyMissedStarts.DeleteLabelValues("ops", "deadhourly")
+	})
+
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cs.BatchV1().CronJobs("ops").Get(ctx, "deadhourly", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.StartingDeadlineSeconds == nil ||
+		*got.Spec.StartingDeadlineSeconds != deadlinePatchSeconds {
+		t.Fatalf("startingDeadlineSeconds = %v, want %d",
+			got.Spec.StartingDeadlineSeconds, deadlinePatchSeconds)
+	}
+	if got.Annotations[deadlinePatchedAnno] == "" {
+		t.Fatal("deadline-patched annotation missing")
+	}
+	v, ok := testutil.GaugeSeriesValue(t,
+		"node_automation_cronjob_too_many_missed_starts",
+		map[string]string{"namespace": "ops", "cronjob": "deadhourly"})
+	if !ok || v != 1 {
+		t.Fatalf("TooManyMissedStarts gauge = %v,%v want 1", v, ok)
+	}
+	// Not opted in → no catch-up Job, ever.
+	if n := ccJobCount(t, cs, "ops"); n != 0 {
+		t.Fatalf("unfreeze must not spawn a catch-up job (%d jobs)", n)
+	}
+
+	// Next sweep: the deadline is set now, so the >100 cap cannot
+	// re-evaluate — the emitted series gets pruned rather than
+	// pinning at 1 forever.
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := testutil.GaugeSeriesValue(t,
+		"node_automation_cronjob_too_many_missed_starts",
+		map[string]string{"namespace": "ops", "cronjob": "deadhourly"}); ok {
+		t.Fatal("gauge series must be pruned once the deadline is set")
+	}
+}
+
+// A CronJob that already carries spec.startingDeadlineSeconds is left
+// alone — the controller's >100 cap cannot engage while it is set.
+func TestCronJobCatchupDeadlineAlreadySetNoPatch(t *testing.T) {
+	cj := ccCronJob("ops", "bounded", "*/5 * * * *", nil)
+	cj.CreationTimestamp = metav1.NewTime(time.Now().Add(-200 * time.Hour))
+	cj.Spec.StartingDeadlineSeconds = ptr.To(int64(60))
+	cs := fake.NewSimpleClientset(cj)
+	var patches int32
+	cs.PrependReactor("patch", "cronjobs",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			atomic.AddInt32(&patches, 1)
+			return false, nil, nil
+		})
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&patches); got != 0 {
+		t.Fatalf("cronjob with a deadline must not be patched, got %d patch(es)", got)
+	}
+	if _, ok := testutil.GaugeSeriesValue(t,
+		"node_automation_cronjob_too_many_missed_starts",
+		map[string]string{"namespace": "ops", "cronjob": "bounded"}); ok {
+		t.Fatal("no gauge series for a deadline-carrying cronjob")
+	}
+}
+
+// Suspended CronJobs are never evaluated — honoring the operator's
+// pause beats every other check.
+func TestCronJobCatchupSuspendedNoDeadlinePatch(t *testing.T) {
+	cj := ccCronJob("ops", "paused", "*/5 * * * *", nil)
+	cj.CreationTimestamp = metav1.NewTime(time.Now().Add(-200 * time.Hour))
+	cj.Spec.Suspend = ptr.To(true)
+	cs := fake.NewSimpleClientset(cj)
+	var patches int32
+	cs.PrependReactor("patch", "cronjobs",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			atomic.AddInt32(&patches, 1)
+			return false, nil, nil
+		})
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&patches); got != 0 {
+		t.Fatalf("suspended cronjob must not be patched, got %d patch(es)", got)
+	}
+}
+
+// Under the cap — a 50h-old hourly job owes only 50 ticks — nothing
+// is patched and nothing is emitted.
+func TestCronJobCatchupUnderMissedCapNoPatch(t *testing.T) {
+	cj := ccCronJob("ops", "young", "0 * * * *", nil)
+	cj.CreationTimestamp = metav1.NewTime(time.Now().Add(-50 * time.Hour))
+	cs := fake.NewSimpleClientset(cj)
+	var patches int32
+	cs.PrependReactor("patch", "cronjobs",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			atomic.AddInt32(&patches, 1)
+			return false, nil, nil
+		})
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&patches); got != 0 {
+		t.Fatalf("cronjob under the missed cap must not be patched, got %d patch(es)", got)
+	}
+	if _, ok := testutil.GaugeSeriesValue(t,
+		"node_automation_cronjob_too_many_missed_starts",
+		map[string]string{"namespace": "ops", "cronjob": "young"}); ok {
+		t.Fatal("no gauge series under the missed cap")
 	}
 }

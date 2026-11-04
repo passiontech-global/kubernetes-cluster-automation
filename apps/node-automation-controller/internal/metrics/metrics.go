@@ -226,6 +226,54 @@ var VeleroBackupEmptyOrErrored = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while the Schedule's latest Backup completed empty/errored/warned.",
 }, []string{"namespace", "schedule", "reason"})
 
+// ---------------------------------------------------------------------------
+// Wave 5/6 self-healing metrics (W5.8/W5.9b/W6.2/W6.4).
+// ---------------------------------------------------------------------------
+
+// OperatorWorkqueueFrozen marks (1) an operator whose leader Lease
+// still renews while its target CRs sit unreconciled past the stuck
+// threshold — the same gray-failure shape as the C6 KCM watchdog
+// (operator-workqueue-watchdog, W5.8). reason identifies the stall
+// signature.
+var OperatorWorkqueueFrozen = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_operator_workqueue_frozen",
+	Help: "1 while the operator renews its Lease but its CRs stay unreconciled past the stuck threshold.",
+}, []string{"operator", "reason"})
+
+// OperatorWorkqueueHealsTotal counts stuck-operator leader pods
+// deleted by the W5.8 auto-healer to force re-election.
+var OperatorWorkqueueHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_operator_workqueue_heals_total",
+	Help: "Stuck operator leader pods deleted to force re-election, by detected stall reason.",
+}, []string{"operator", "reason"})
+
+// CronJobTooManyMissedStarts marks (1) CronJobs that accumulated
+// more than 100 missed start times — the point where the controller
+// permanently stops scheduling them until startingDeadlineSeconds is
+// set (cronjob-catchup auto-unfreezer, W5.9b).
+var CronJobTooManyMissedStarts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_cronjob_too_many_missed_starts",
+	Help: "1 while the CronJob has more than 100 missed start times (controller stops scheduling it).",
+}, []string{"namespace", "cronjob"})
+
+// StatefulServiceZeroEndpoints marks (1) a master-role Service
+// (role/redis-role/app.kubernetes.io/role in {master,primary,leader})
+// backed by a ready StatefulSet whose EndpointSlices report 0 Ready
+// endpoints — a masterless stateful service (W6.2).
+var StatefulServiceZeroEndpoints = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_stateful_service_zero_endpoints",
+	Help: "1 while the master-role Service of a ready StatefulSet reports 0 Ready endpoints.",
+}, []string{"namespace", "service", "statefulset"})
+
+// RabbitMQSuspendedHealsTotal counts RabbitMQ pods deleted because
+// they ran suspended (all containers started but Ready=false — the
+// ranch:suspended listener wedge) while every peer replica was
+// Ready (W6.4).
+var RabbitMQSuspendedHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_rabbitmq_suspended_heals_total",
+	Help: "RabbitMQ pods deleted while running with a suspended listener (started but never Ready).",
+}, []string{"namespace", "pod"})
+
 // queues are the legacy shell-operator queue names — pre-instantiated
 // at 0 so /metrics always exposes every series (an empty CounterVec
 // emits nothing, and shell-operator emitted its counters eagerly).
@@ -270,7 +318,10 @@ func init() {
 		OrphanEndpointSlicesCleanedTotal,
 		FluxSourceReconcilesTriggeredTotal, HelmStallUnwedgesTotal,
 		StatefulSetOnDeletePodsRolledTotal, VeleroSchedulePaused,
-		VeleroBackupEmptyOrErrored)
+		VeleroBackupEmptyOrErrored,
+		OperatorWorkqueueFrozen, OperatorWorkqueueHealsTotal,
+		CronJobTooManyMissedStarts, StatefulServiceZeroEndpoints,
+		RabbitMQSuspendedHealsTotal)
 	for _, q := range queues {
 		hookRunErrors.WithLabelValues(q)
 		reconcileErrors.WithLabelValues(q)

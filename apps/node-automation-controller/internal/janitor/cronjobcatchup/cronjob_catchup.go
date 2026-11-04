@@ -24,6 +24,7 @@ package cronjobcatchup
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"strings"
@@ -34,6 +35,7 @@ import (
 	"github.com/robfig/cron/v3"
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -61,6 +63,22 @@ const (
 	// catchupJobNameMax is the DNS-1123 subdomain ceiling a Job name
 	// must fit — "<cj>-catchup-<unix>" is truncated to stay under it.
 	catchupJobNameMax = 63
+
+	// missedStartsLimit mirrors the CronJob controller's hard cap:
+	// more than 100 missed start times and kube-controller-manager
+	// logs "too many missed start times" and NEVER schedules the
+	// CronJob again while spec.startingDeadlineSeconds is unset —
+	// the job silently dies (W5.9b).
+	missedStartsLimit = 100
+	// deadlinePatchSeconds is the startingDeadlineSeconds the
+	// auto-unfreezer stamps — 1h of slack lets the controller pick
+	// up from the most recent missed tick instead of demanding the
+	// full backlog.
+	deadlinePatchSeconds = int64(3600)
+	// deadlinePatchedAnno records when/that this module repaired the
+	// CronJob — operator-visible provenance on an object GitOps did
+	// not write the deadline into.
+	deadlinePatchedAnno = "node.ops/starting-deadline-patched"
 )
 
 type cronJobCatchup struct {
@@ -75,6 +93,12 @@ type cronJobCatchup struct {
 	// 24h window across restarts.
 	mu          sync.Mutex
 	lastCatchup map[string]string
+	// missedEmitted is the CronJobTooManyMissedStarts ledger
+	// ("ns/name") of series currently held at =1 — a CronJob that
+	// got its deadline patched, was suspended, or vanished gets its
+	// series deleted instead of pinning the alert forever (same
+	// seen-set hygiene as the webhook guard's brokenEmitted).
+	missedEmitted map[string]bool
 }
 
 // Setup registers the 15-minute sweep.
@@ -90,6 +114,10 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 	if c.nowFn == nil {
 		c.nowFn = time.Now
 	}
+	if c.missedEmitted == nil {
+		c.missedEmitted = map[string]bool{}
+	}
+	now := c.nowFn()
 
 	cronjobs, err := c.cs.BatchV1().CronJobs(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -97,10 +125,31 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 	}
 
 	spawned := 0
+	emitted := map[string]bool{} // TooManyMissedStarts tuples re-seen this sweep
 	for i := range cronjobs.Items {
 		cj := &cronjobs.Items[i]
 		if cj.Spec.Suspend != nil && *cj.Spec.Suspend {
 			continue // deliberately paused — honor the operator's intent
+		}
+		// W5.9b — the too-many-missed-starts unfreeze runs for EVERY
+		// non-suspended CronJob, opt-in or not: unlike a backlog
+		// replay, stamping startingDeadlineSeconds has no side
+		// effect on the workload — it only un-breaks the controller.
+		// Jobs already carrying a deadline are excluded: the >100
+		// cap cannot engage while one is set.
+		if cj.Spec.StartingDeadlineSeconds == nil {
+			if sched, ok := c.parseSchedule(log, cj); ok {
+				anchor := cj.CreationTimestamp.Time
+				if cj.Status.LastScheduleTime != nil {
+					anchor = cj.Status.LastScheduleTime.Time
+				}
+				if missedOver100(sched, anchor, now) {
+					emitted[cj.Namespace+"/"+cj.Name] = true
+					metrics.CronJobTooManyMissedStarts.
+						WithLabelValues(cj.Namespace, cj.Name).Set(1)
+					c.unfreezeDeadline(ctx, log, cj, now)
+				}
+			}
 		}
 		if cj.Annotations[catchupAnno] != "true" {
 			continue // not opted in — backlog replay may not be idempotent
@@ -139,23 +188,27 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 		}
 	}
 	c.mu.Unlock()
+	// Prune TooManyMissedStarts series whose tuple was not re-seen —
+	// a patched (deadline now set), suspended or deleted CronJob
+	// must not pin the gauge at 1 forever.
+	for k := range c.missedEmitted {
+		if emitted[k] {
+			continue
+		}
+		if parts := strings.SplitN(k, "/", 2); len(parts) == 2 {
+			metrics.CronJobTooManyMissedStarts.
+				DeleteLabelValues(parts[0], parts[1])
+		}
+	}
+	c.missedEmitted = emitted
 	log.Info("sweep done", "spawned", spawned)
 	return nil
 }
 
-// stale parses the schedule — honoring spec.timeZone via the
-// CRON_TZ= prefix the parser understands — and decides whether the
-// CronJob genuinely missed a run: the first scheduled tick strictly
-// AFTER lastScheduleTime lying in the past beyond its grace bound.
-// A nil lastScheduleTime means the CronJob NEVER scheduled (or
-// status was wiped) — the creation timestamp anchors the same
-// missed-tick math, so a brand-new job whose first tick is still in
-// the future is NOT stale (the old code treated nil as stale
-// unconditionally: a fresh opted-in job got an immediate replay and
-// kept re-firing daily until its first real tick landed, because
-// lastScheduleTime stays nil that whole time). ok=false reports an
-// unparseable schedule.
-func (c *cronJobCatchup) stale(log logr.Logger, cj *batchv1.CronJob) (bool, bool) {
+// parseSchedule resolves the CronJob's effective schedule — honoring
+// spec.timeZone via the CRON_TZ= prefix the parser understands.
+// ok=false reports an unparseable schedule (warned, skipped).
+func (c *cronJobCatchup) parseSchedule(log logr.Logger, cj *batchv1.CronJob) (cron.Schedule, bool) {
 	schedule := cj.Spec.Schedule
 	if tz := cj.Spec.TimeZone; tz != nil && *tz != "" {
 		// spec.timeZone sets the zone the expression is evaluated in
@@ -167,6 +220,25 @@ func (c *cronJobCatchup) stale(log logr.Logger, cj *batchv1.CronJob) (bool, bool
 		log.Info("WARN: unparseable schedule — skip",
 			"cronjob", cj.Namespace+"/"+cj.Name,
 			"schedule", cj.Spec.Schedule, "error", err)
+		return nil, false
+	}
+	return sched, true
+}
+
+// stale decides whether the CronJob genuinely missed a run: the first
+// scheduled tick strictly AFTER lastScheduleTime lying in the past
+// beyond its grace bound.
+// A nil lastScheduleTime means the CronJob NEVER scheduled (or
+// status was wiped) — the creation timestamp anchors the same
+// missed-tick math, so a brand-new job whose first tick is still in
+// the future is NOT stale (the old code treated nil as stale
+// unconditionally: a fresh opted-in job got an immediate replay and
+// kept re-firing daily until its first real tick landed, because
+// lastScheduleTime stays nil that whole time). ok=false reports an
+// unparseable schedule.
+func (c *cronJobCatchup) stale(log logr.Logger, cj *batchv1.CronJob) (bool, bool) {
+	sched, ok := c.parseSchedule(log, cj)
+	if !ok {
 		return false, false
 	}
 	// The first tick strictly after lastScheduleTime is the run the
@@ -195,6 +267,62 @@ func (c *cronJobCatchup) stale(log logr.Logger, cj *batchv1.CronJob) (bool, bool
 		threshold = 2 * period
 	}
 	return now.Sub(missed) > threshold, true
+}
+
+// ---------------------------------------------------------------------------
+// W5.9b — TooManyMissedStarts detector + auto-unfreezer.
+// ---------------------------------------------------------------------------
+
+// missedOver100 reports whether the schedule owes more than 100 ticks
+// between anchor (lastScheduleTime, or creationTimestamp when the job
+// never ran) and now — the kube-controller-manager hard cap after
+// which the CronJob is permanently skipped while
+// spec.startingDeadlineSeconds is unset. The loop is self-bounding:
+// it returns on the 101st missed tick regardless of the gap's size.
+func missedOver100(sched cron.Schedule, anchor, now time.Time) bool {
+	missed := 0
+	for t := sched.Next(anchor); t.Before(now); t = sched.Next(t) {
+		missed++
+		if missed > missedStartsLimit {
+			return true
+		}
+	}
+	return false
+}
+
+// unfreezeDeadline stamps spec.startingDeadlineSeconds=3600 plus the
+// provenance annotation onto a CronJob that crossed the >100-missed
+// cap — the controller treats the deadline as "count misses only
+// inside the window", so the job schedules again instead of being
+// skipped forever. Merge patch: the annotation adds a single key and
+// the spec field cannot clobber a concurrent writer's spec edits
+// (merge preserves every key not named). A patch failure is
+// metered+logged but absorbed — the next sweep retries.
+func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, cj *batchv1.CronJob, now time.Time) {
+	payload, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"annotations": map[string]any{
+			deadlinePatchedAnno: now.UTC().Format(time.RFC3339),
+		}},
+		"spec": map[string]any{
+			"startingDeadlineSeconds": deadlinePatchSeconds,
+		},
+	})
+	if err != nil {
+		metrics.IncError(catchupQueue)
+		log.Error(err, "marshal deadline patch",
+			"cronjob", cj.Namespace+"/"+cj.Name)
+		return
+	}
+	if _, err := c.cs.BatchV1().CronJobs(cj.Namespace).Patch(ctx, cj.Name,
+		types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		metrics.IncError(catchupQueue)
+		log.Error(err, "startingDeadlineSeconds patch failed",
+			"cronjob", cj.Namespace+"/"+cj.Name)
+		return
+	}
+	log.Info("PATCH: startingDeadlineSeconds=3600 — CronJob crossed the >100 missed-start cap",
+		"cronjob", cj.Namespace+"/"+cj.Name,
+		"schedule", cj.Spec.Schedule)
 }
 
 // deduped reports whether a catch-up for cj is already covered:

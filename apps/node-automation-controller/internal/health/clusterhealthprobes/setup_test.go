@@ -21,7 +21,7 @@ func TestSetupPeriodicModules(t *testing.T) {
 	}{
 		{"cluster-health-probes", 5 * time.Minute,
 			func(m manager.Manager) error {
-				return Setup(m, cs, true)
+				return Setup(m, cs, testutil.NewFakeDyn(nil), true)
 			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -42,7 +42,7 @@ func TestSetupPeriodicModules(t *testing.T) {
 // checker Pods were always-on, but a cluster can still opt out.
 func TestSetupFeatureFlagVariants(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), false); err != nil {
+	if err := Setup(m, fake.NewSimpleClientset(), testutil.NewFakeDyn(nil), false); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {

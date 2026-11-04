@@ -25,6 +25,10 @@
 // node.ops/circuit-broken-webhooks annotation on the config; when the
 // Service reports >= 1 Ready endpoint again the declared Fail policy
 // is restored and the annotation shrinks (removed when empty).
+// W5.5 — the endpoint census is node-aware: Ready endpoints on
+// partitioned/unresponsive/NotReady nodes are discounted, and when
+// they are ALL that remains the breaker trips on the faster
+// partitionZeroThreshold (90s) instead of webhookDeadThreshold.
 //
 // 2.2 — unmeshed-pod-auditor + post-circuit-breaker healer. Pods
 // created while the C1 breaker held linkerd-proxy-injector open run
@@ -90,6 +94,13 @@ const (
 	// backend Service must report 0 Ready endpoints before the breaker
 	// trips it to Ignore.
 	webhookDeadThreshold = 5 * time.Minute
+	// webhookPartitionedThreshold is the faster trip window used when
+	// the Service still reports Ready endpoints but EVERY one sits on
+	// a partitioned/unresponsive node (W5.5): those pods cannot serve
+	// the apiserver's webhook calls, so the deadlock is real now — 90s
+	// of that condition is already an outage, no need to wait out the
+	// full dead-backend window.
+	webhookPartitionedThreshold = 90 * time.Second
 
 	// kind label values for the WebhookCircuit* metrics — the short
 	// forms matching webhookPatch.mutating.
@@ -145,6 +156,11 @@ type webhookGuard struct {
 	// ("namespace/pod") — deleted pods and pods that gained the
 	// sidecar get their series pruned each sweep.
 	unmeshedEmitted map[string]bool
+	// zeroThreshold / partitionZeroThreshold override the two trip
+	// windows — tests shrink them; a zero value falls back to
+	// webhookDeadThreshold / webhookPartitionedThreshold.
+	zeroThreshold          time.Duration
+	partitionZeroThreshold time.Duration
 }
 
 // Setup registers the 5-minute sweep (was crontab */5).
@@ -200,12 +216,20 @@ type sweepSnapshot struct {
 	vwc    *admissionv1.ValidatingWebhookConfigurationList
 	vwcErr error
 
+	// unhealthyNodes is the W5.5 node census: nodes whose Ready
+	// endpoints cannot actually serve webhook traffic (NotReady,
+	// partitioned, kubelet-unresponsive, unreachable/out-of-service
+	// taints, or an explicit NetworkPartitioned condition). The
+	// endpoint census discounts endpoints hosted on them.
+	unhealthyNodes map[string]bool
+	nodesErr       error
+
 	// readyOnce/ready/readyErr lazily cache the EndpointSlice ready
 	// census — the circuit breaker and the injector-health check
 	// share it, and a run whose breaker is disabled and has no
 	// unmeshed candidates never pays for the list at all.
 	readyOnce sync.Once
-	ready     map[string]int
+	ready     endpointCensus
 	readyErr  error
 }
 
@@ -217,15 +241,72 @@ func (g *webhookGuard) takeSnapshot(ctx context.Context) *sweepSnapshot {
 		MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
 	s.vwc, s.vwcErr = g.cs.AdmissionregistrationV1().
 		ValidatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
+	// W5.5 — the node census feeds the effective-ready math: a
+	// "Ready" webhook pod on a partitioned node cannot be called by
+	// the apiserver, so it must not count toward backend health.
+	s.unhealthyNodes = map[string]bool{}
+	nodes, err := shared.ListNodes(ctx, g.cs)
+	s.nodesErr = err
+	if err == nil {
+		for i := range nodes {
+			if nodeUnhealthyForEndpoints(&nodes[i]) {
+				s.unhealthyNodes[nodes[i].Name] = true
+			}
+		}
+	}
 	return s
+}
+
+// webhookUnhealthyNodeTaints are the taint keys marking a node whose
+// pod network is presumed dead for admission purposes — the node.ops
+// pair this operator asserts itself plus the kubelet/node-controller
+// lifecycle taints.
+var webhookUnhealthyNodeTaints = []string{
+	"node.ops/network-partitioned",
+	"node.ops/kubelet-unresponsive",
+	"node.kubernetes.io/unreachable",
+	"node.kubernetes.io/not-ready",
+	"node.kubernetes.io/out-of-service",
+}
+
+// nodeUnhealthyForEndpoints reports whether Ready pods on this node
+// should be DISCOUNTED from a webhook backend census: the node is
+// NotReady, carries a partition/unresponsive/lifecycle taint, or
+// reports an explicit NetworkPartitioned condition — in all three
+// cases the apiserver's webhook call to that pod times out, so the
+// endpoint is Ready in name only.
+func nodeUnhealthyForEndpoints(n *corev1.Node) bool {
+	if !shared.NodeReady(n) {
+		return true
+	}
+	for _, k := range webhookUnhealthyNodeTaints {
+		if shared.HasTaint(n.Spec.Taints, k) {
+			return true
+		}
+	}
+	for _, c := range n.Status.Conditions {
+		if c.Type == "NetworkPartitioned" && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// endpointCensus is the W5.5 dual ready-endpoint count: raw counts
+// every Ready endpoint; effective excludes the Ready endpoints whose
+// pod sits on an unhealthy node (partitioned/unresponsive — reachable
+// in the API sense but dead for webhook traffic).
+type endpointCensus struct {
+	raw       map[string]int
+	effective map[string]int
 }
 
 // readyCounts returns the EndpointSlice ready census, listing it at
 // most once per run — the circuit breaker and the injector-health
 // check both draw from the same result, including the same error.
-func (s *sweepSnapshot) readyCounts() (map[string]int, error) {
+func (s *sweepSnapshot) readyCounts() (endpointCensus, error) {
 	s.readyOnce.Do(func() {
-		s.ready, s.readyErr = s.g.readyEndpointCounts(s.ctx)
+		s.ready, s.readyErr = s.g.readyEndpointCounts(s.ctx, s)
 	})
 	return s.ready, s.readyErr
 }
@@ -503,20 +584,27 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context, snap *sweepSnaps
 }
 
 // readyEndpointCounts builds the ns/service → Ready-endpoint census
-// from the cluster-wide EndpointSlice list (paged — see listPageSize).
-// The kubernetes.io/service-name label binds each slice to its
-// Service; a nil conditions.ready counts as ready (the field defaults
-// to true server-side). No degraded mode: without a complete census
-// "0 ready" is indistinguishable from "no data", so a list error skips
-// the whole breaker rather than trip healthy webhooks.
-func (g *webhookGuard) readyEndpointCounts(ctx context.Context) (map[string]int, error) {
-	ready := map[string]int{}
+// from the cluster-wide EndpointSlice list (paged — see listPageSize),
+// in TWO counts (W5.5): raw counts every Ready endpoint; effective
+// drops the endpoints whose NodeName is flagged unhealthy by the
+// node census — a "Ready" pod on a partitioned node still fails every
+// apiserver webhook call. The kubernetes.io/service-name label binds
+// each slice to its Service; a nil conditions.ready counts as ready
+// (the field defaults to true server-side). No degraded mode: without
+// a complete census "0 ready" is indistinguishable from "no data", so
+// a list error — endpoints OR nodes — skips the whole breaker rather
+// than trip healthy webhooks.
+func (g *webhookGuard) readyEndpointCounts(ctx context.Context, snap *sweepSnapshot) (endpointCensus, error) {
+	if snap.nodesErr != nil {
+		return endpointCensus{}, fmt.Errorf("list nodes — circuit breaker skipped: %w", snap.nodesErr)
+	}
+	ready := endpointCensus{raw: map[string]int{}, effective: map[string]int{}}
 	opts := metav1.ListOptions{Limit: listPageSize}
 	for {
 		sliceList, err := g.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).
 			List(ctx, opts)
 		if err != nil {
-			return nil, fmt.Errorf("list endpointslices — circuit breaker skipped: %w", err)
+			return endpointCensus{}, fmt.Errorf("list endpointslices — circuit breaker skipped: %w", err)
 		}
 		for _, s := range sliceList.Items {
 			svc := s.Labels[discoveryv1.LabelServiceName]
@@ -526,7 +614,13 @@ func (g *webhookGuard) readyEndpointCounts(ctx context.Context) (map[string]int,
 			key := s.Namespace + "/" + svc
 			for _, ep := range s.Endpoints {
 				if ep.Conditions.Ready == nil || *ep.Conditions.Ready {
-					ready[key]++
+					ready.raw[key]++
+					// A nil NodeName (off-cluster target, not yet
+					// bound) cannot be attributed to a bad node —
+					// benefit of the doubt, count it effective.
+					if ep.NodeName == nil || !snap.unhealthyNodes[*ep.NodeName] {
+						ready.effective[key]++
+					}
 				}
 			}
 		}
@@ -567,6 +661,25 @@ func valHookViews(ws []admissionv1.ValidatingWebhook) []hookView {
 	return out
 }
 
+// tripThreshold picks the dead-backend streak window for this webhook:
+// when the Service still reports Ready endpoints but every one sits on
+// a partitioned/unresponsive node (raw > 0, effective == 0) the
+// deadlock is already real — the shorter partition threshold applies;
+// a genuinely empty backend keeps the full dead threshold. The fields
+// are test seams; zero values fall back to the package defaults.
+func (g *webhookGuard) tripThreshold(rawReady int) time.Duration {
+	if rawReady > 0 {
+		if g.partitionZeroThreshold > 0 {
+			return g.partitionZeroThreshold
+		}
+		return webhookPartitionedThreshold
+	}
+	if g.zeroThreshold > 0 {
+		return g.zeroThreshold
+	}
+	return webhookDeadThreshold
+}
+
 // circuitPatch evaluates one config's sub-webhooks against the ready
 // census and builds the strategic-merge patch that flips long-dead
 // entries to Ignore, restores recovered ones to Fail and rewrites the
@@ -583,7 +696,7 @@ func valHookViews(ws []admissionv1.ValidatingWebhook) []hookView {
 // trips/recovered are the names whose metric updates the caller must
 // apply only after the patch lands.
 func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal string,
-	hooks []hookView, ready map[string]int, now time.Time,
+	hooks []hookView, ready endpointCensus, now time.Time,
 	seen, emitted map[string]bool) ([]byte, []string, []string) {
 
 	broken := parseCircuitAnnotation(annoVal)
@@ -607,20 +720,26 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 		present[h.name] = true
 		key := kind + "/" + cfgName + "/" + h.name
 		isBroken := broken[h.name]
-		// svcReady < 0 marks "not Service-backed" — URL webhooks and
-		// malformed refs are unmeasurable, the breaker never trips them.
-		svcReady := -1
+		// svcEffective < 0 marks "not Service-backed" — URL webhooks
+		// and malformed refs are unmeasurable, the breaker never
+		// trips them. effective excludes Ready endpoints sitting on
+		// partitioned/unresponsive nodes (W5.5); raw keeps them for
+		// the threshold pick.
+		svcEffective, svcRaw := -1, -1
 		svc := ""
 		if h.svc != nil && h.svc.Namespace != "" && h.svc.Name != "" {
 			svc = h.svc.Namespace + "/" + h.svc.Name
-			svcReady = ready[svc]
+			svcEffective = ready.effective[svc]
+			svcRaw = ready.raw[svc]
 		}
 		switch {
-		case isBroken && svcReady != 0:
-			// RECOVER — the Service has >= 1 Ready endpoint again, or
-			// the entry was repointed off its Service entirely
-			// (svcReady < 0): the breaker cannot measure a URL, so it
-			// hands back the declared Fail and steps out.
+		case isBroken && svcEffective != 0:
+			// RECOVER — the Service has >= 1 reachable Ready endpoint
+			// again, or the entry was repointed off its Service
+			// entirely (svcEffective < 0): the breaker cannot measure
+			// a URL, so it hands back the declared Fail and steps
+			// out. Endpoints on partitioned nodes do NOT count —
+			// they still fail every apiserver call.
 			flip(h, admissionv1.Fail)
 			delete(broken, h.name)
 			recovered = append(recovered, h.name)
@@ -636,30 +755,37 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 			}
 			metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, h.name).Set(1)
 			emitted[key] = true
-		case svcReady == 0 && failClosed(h.fp):
+		case svcEffective == 0 && failClosed(h.fp):
 			seen[key] = true
 			first, ok := g.deadSince[key]
 			if !ok {
 				g.deadSince[key] = now
 				log.Info("circuit breaker: fail-closed webhook on a dead Service — tracking",
-					"kind", kind, "config", cfgName, "webhook", h.name, "service", svc)
+					"kind", kind, "config", cfgName, "webhook", h.name,
+					"service", svc, "rawReady", svcRaw)
 				continue
 			}
-			if now.Sub(first) < webhookDeadThreshold {
+			threshold := g.tripThreshold(svcRaw)
+			if now.Sub(first) < threshold {
 				continue
 			}
 			// TRIP — dead backend past the threshold. deadSince is
 			// deliberately NOT cleared here: if the patch fails the
 			// annotation never lands, so keeping the streak lets the
 			// next sweep retry immediately instead of re-opening a
-			// fresh 5m window. Once the entry is broken it no longer
+			// fresh window. Once the entry is broken it no longer
 			// marks seen[key], so the ledger prunes itself.
 			flip(h, admissionv1.Ignore)
 			broken[h.name] = true
 			trips = append(trips, h.name)
 			changed = true
-			log.Info(fmt.Sprintf("CIRCUIT-TRIP: %s/%s webhook %q -> %s (0 ready endpoints >= %s) — patching failurePolicy=Ignore",
-				kind, cfgName, h.name, svc, webhookDeadThreshold))
+			if svcRaw > 0 {
+				log.Info(fmt.Sprintf("CIRCUIT-TRIP: %s/%s webhook %q -> %s (all %d ready endpoints on partitioned/unresponsive nodes >= %s) — patching failurePolicy=Ignore",
+					kind, cfgName, h.name, svc, svcRaw, threshold))
+			} else {
+				log.Info(fmt.Sprintf("CIRCUIT-TRIP: %s/%s webhook %q -> %s (0 ready endpoints >= %s) — patching failurePolicy=Ignore",
+					kind, cfgName, h.name, svc, threshold))
+			}
 		}
 	}
 
@@ -1006,7 +1132,7 @@ func (g *webhookGuard) linkerdInjectorHealthy(snap *sweepSnapshot) (bool, error)
 				continue
 			}
 			svc := w.ClientConfig.Service.Namespace + "/" + w.ClientConfig.Service.Name
-			if ready[svc] > 0 {
+			if ready.effective[svc] > 0 {
 				return true, nil
 			}
 		}

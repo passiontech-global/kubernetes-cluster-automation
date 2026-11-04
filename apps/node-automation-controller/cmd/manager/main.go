@@ -516,7 +516,7 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 
 		// Cluster health probes.
 		"cluster-health-probes": func() error {
-			return clusterhealthprobes.Setup(mgr, cs,
+			return clusterhealthprobes.Setup(mgr, cs, dyn,
 				mc.clusterHealthProbesEnabled)
 		},
 	} {
