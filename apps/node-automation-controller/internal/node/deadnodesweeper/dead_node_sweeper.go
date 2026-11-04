@@ -161,32 +161,43 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// Terminating" evidence, so they are dead weight in the biggest
 	// read this module makes. The in-code phase check stays — fake
 	// clientsets ignore field selectors and the belt costs nothing.
-	pods, err := s.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
-	})
-	if err != nil {
-		return fmt.Errorf("list pods: %w", err)
-	}
-
-	// Count pods stuck in Terminating past the grace age, per node.
+	// Paged: one unbounded List forces the apiserver to serialize
+	// every pod in the cluster into a single response — a multi-MB
+	// heap burst both server- and client-side; 500-per-page flattens
+	// it while keeping only the per-node Terminating counts.
+	// The stuck-pod count is folded INTO the pagination loop — each
+	// page is tallied and dropped, so peak client heap is one page,
+	// not every pod in the cluster (which is the same footprint the
+	// unbounded List had).
 	stuck := map[string]int{}
-	for i := range pods.Items {
-		p := &pods.Items[i]
-		if p.Status.Phase == corev1.PodSucceeded ||
-			p.Status.Phase == corev1.PodFailed {
-			continue // mirrors the FieldSelector for fake clients
+	cont := ""
+	for {
+		page, err := s.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+			FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
+			Limit:         500,
+			Continue:      cont,
+		})
+		if err != nil {
+			return fmt.Errorf("list pods: %w", err)
 		}
-		if p.DeletionTimestamp == nil || p.Spec.NodeName == "" {
-			continue
+		for i := range page.Items {
+			p := &page.Items[i]
+			if p.Status.Phase == corev1.PodSucceeded ||
+				p.Status.Phase == corev1.PodFailed {
+				continue // mirrors the FieldSelector for fake clients
+			}
+			if p.DeletionTimestamp == nil || p.Spec.NodeName == "" {
+				continue
+			}
+			if time.Since(p.DeletionTimestamp.Time) <= deadNodeStuckPodAge {
+				continue // still inside a legitimate graceful shutdown
+			}
+			stuck[p.Spec.NodeName]++
 		}
-		if time.Since(p.DeletionTimestamp.Time) <= deadNodeStuckPodAge {
-			continue // still inside a legitimate graceful shutdown
+		if cont = page.Continue; cont == "" {
+			break
 		}
-		stuck[p.Spec.NodeName]++
 	}
-	// The probes/lists/taints below only need the per-node counts —
-	// release the full PodList before they run.
-	pods = nil
 	if len(stuck) == 0 {
 		log.Info("sweep done — no stuck Terminating pods", "untainted", untainted)
 		return nil
@@ -307,6 +318,12 @@ func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node) (bo
 // named after the node (CR name == node name in both CRDs). A missing
 // CRD is "no evidence", not an error — other list failures are real.
 func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string) (bool, error) {
+	// A missing dynamic client is a wiring bug, not "no fencing
+	// evidence" — unverifiable fails closed like every other check
+	// (same contract as descheduler-storm-gate's dyn guard).
+	if s.dyn == nil {
+		return false, fmt.Errorf("no dynamic client — remediation CR check unverifiable")
+	}
 	for _, gvr := range []schema.GroupVersionResource{
 		selfNodeRemediationGVR, fenceAgentsRemediationGVR,
 	} {
@@ -348,16 +365,26 @@ func (s *deadNodeSweeper) probe(ctx context.Context, nodeName string) (bool, err
 // Never fatal, never vetoes a decision.
 func (s *deadNodeSweeper) logVolumeAttachments(ctx context.Context, nodeName string) {
 	log := logf.FromContext(ctx)
-	vas, err := s.cs.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.Error(err, "volumeattachment list failed — signal only", "node", nodeName)
-		metrics.IncError(deadNodeSweeperQueue)
-		return
-	}
+	// Paged like the pod list above — VolumeAttachments are
+	// cluster-scoped and unbounded, and this read is signal-only.
 	var names []string
-	for i := range vas.Items {
-		if vas.Items[i].Spec.NodeName == nodeName {
-			names = append(names, vas.Items[i].Name)
+	cont := ""
+	for {
+		page, err := s.cs.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{
+			Limit: 500, Continue: cont,
+		})
+		if err != nil {
+			log.Error(err, "volumeattachment list failed — signal only", "node", nodeName)
+			metrics.IncError(deadNodeSweeperQueue)
+			return
+		}
+		for i := range page.Items {
+			if page.Items[i].Spec.NodeName == nodeName {
+				names = append(names, page.Items[i].Name)
+			}
+		}
+		if cont = page.Continue; cont == "" {
+			break
 		}
 	}
 	if len(names) > 0 {

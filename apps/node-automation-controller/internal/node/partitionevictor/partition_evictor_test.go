@@ -203,6 +203,123 @@ func TestPartitionEvictorMultipleFlaggedUnderHalf(t *testing.T) {
 	}
 }
 
+// The eviction cap bounds pod churn, never fencing: when the first
+// flagged node alone exhausts partitionEvictCap, every OTHER flagged
+// node must still be tainted in the same run (previously a cap-break
+// skipped their taint until the next cycle).
+func TestPartitionEvictorTaintsAllFlaggedBeforeCap(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	objs := []runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+		pePartitionedNode("p2", "HostNetworkProblems", 20*time.Minute),
+	}
+	objs = append(objs, peHealthyNodes("h", 3)...) // 2/5 flagged < 50%
+	for i := 0; i < partitionEvictCap+1; i++ {
+		objs = append(objs, pePod("flux-system", "p1", fmt.Sprintf("pod-%02d", i)))
+	}
+	objs = append(objs, pePod("flux-system", "p2", "pod-p2"))
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"p1", "p2"} {
+		if !shared.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, partitionTaintKey) {
+			t.Fatalf("flagged node %s left untainted by the eviction cap", name)
+		}
+	}
+	// The cap still held: p1's 9 pods shed exactly cap victims and
+	// p2's pod never got a turn this run.
+	if !pePodExists(t, cs, "flux-system", "pod-p2") {
+		t.Fatal("cap broke — p2's pod was evicted")
+	}
+}
+
+// A partitioned control-plane node is never flagged: k0s control
+// planes run no evictable workload, so they must be neither tainted
+// nor counted toward the mesh-wide guard.
+func TestPartitionEvictorSkipsControlPlane(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	cp := pePartitionedNode("cp1", "HostNetworkProblems", 20*time.Minute)
+	cp.Labels = map[string]string{"node-role.kubernetes.io/control-plane": ""}
+	objs := append([]runtime.Object{cp,
+		pePod("flux-system", "cp1", "cp-pod")},
+		peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if shared.HasTaint(testutil.GetNode(t, cs, "cp1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("control-plane node tainted")
+	}
+	if !pePodExists(t, cs, "flux-system", "cp-pod") {
+		t.Fatal("pod evicted off a control-plane node")
+	}
+}
+
+// The mesh-wide guard's denominator counts only EVICTABLE nodes:
+// on a 3CP+3worker cluster with all 3 workers partitioned,
+// flagged*2 > workers (6>3) must abort — counting CPs (6>6) would
+// proceed to taint+evict on a fully-partitioned workforce.
+func TestPartitionEvictorMeshGuardIgnoresControlPlanes(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	var objs []runtime.Object
+	for i := 0; i < 3; i++ {
+		cp := peHealthyNodes(fmt.Sprintf("cp%d", i+1), 1)[0].(*corev1.Node)
+		cp.Labels = map[string]string{"node-role.kubernetes.io/control-plane": ""}
+		objs = append(objs, cp)
+	}
+	for i := 0; i < 3; i++ {
+		objs = append(objs,
+			pePartitionedNode(fmt.Sprintf("w%d", i+1), "HostNetworkProblems", 20*time.Minute),
+			pePod("flux-system", fmt.Sprintf("w%d", i+1), fmt.Sprintf("pod-w%d", i+1)))
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		name := fmt.Sprintf("w%d", i)
+		if shared.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, partitionTaintKey) {
+			t.Fatalf("worker %s tainted on a mesh-wide partition", name)
+		}
+		if !pePodExists(t, cs, "flux-system", "pod-"+name) {
+			t.Fatalf("pod evicted off %s on a mesh-wide partition", name)
+		}
+	}
+}
+
+// The pod delete carries a UID precondition — a same-named pod
+// recreated after the list must never be killed in the victim's place.
+func TestPartitionEvictorDeleteCarriesUIDPrecondition(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	victim := pePod("flux-system", "p1", "victim")
+	victim.UID = "uid-victim-123"
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+		victim,
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	var got *metav1.Preconditions
+	cs.PrependReactor("delete", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if da, ok := a.(ktesting.DeleteAction); ok {
+				opts := da.GetDeleteOptions()
+				got = opts.Preconditions
+			}
+			return false, nil, nil
+		})
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.UID == nil || *got.UID != victim.UID {
+		t.Fatalf("delete missing UID precondition, got %+v", got)
+	}
+}
+
 // Untaint runs before the flagged path: a recovered node loses the
 // partition taint while a still-flagged node keeps it (and is not
 // tainted twice).

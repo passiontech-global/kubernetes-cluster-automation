@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -33,16 +34,23 @@ const (
 	evictedPodQueue  = "evicted-pod-janitor"
 	evictedPodMaxAge = time.Hour
 	evictedPodCap    = 10 // bound delete churn per run
+	// evictedPodListPageSize bounds each Failed-pod List page —
+	// continue-token pagination keeps a big failure fleet from
+	// arriving as one giant response body.
+	evictedPodListPageSize = 500
 )
 
 // evictedPodReasons is the set of terminal status.reason values that
 // leave a Failed pod behind with no controller to clean it up
-// (k8s#55051). Anything else — ContainerStatusUnknown, ImagePull
-// backoff that ended in Failed, etc. — is kept for debugging.
+// (k8s#55051 — "Preempted" is the same shape: scheduler preemption
+// leaves a Failed pod nobody owns). Anything else —
+// ContainerStatusUnknown, ImagePull backoff that ended in Failed,
+// etc. — is kept for debugging.
 var evictedPodReasons = map[string]struct{}{
 	"Evicted":                  {},
 	"NodeAffinity":             {},
 	"NodeLost":                 {},
+	"Preempted":                {},
 	"Shutdown":                 {},
 	"UnexpectedAdmissionError": {},
 	"OutOfcpu":                 {},
@@ -68,21 +76,32 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 	// Running/Pending pod in the cluster to throw them away below.
 	// The in-code phase check stays — fake clientsets ignore field
 	// selectors and the belt costs nothing.
-	pods, err := j.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-		FieldSelector: "status.phase=" + string(corev1.PodFailed),
-	})
-	if err != nil {
-		return fmt.Errorf("list failed pods: %w", err) // periodic wrapper IncErrors evictedPodQueue
+	var pods []corev1.Pod
+	cont := ""
+	for {
+		page, err := j.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+			FieldSelector: "status.phase=" + string(corev1.PodFailed),
+			Limit:         evictedPodListPageSize,
+			Continue:      cont,
+		})
+		if err != nil {
+			return fmt.Errorf("list failed pods: %w", err) // periodic wrapper IncErrors evictedPodQueue
+		}
+		pods = append(pods, page.Items...)
+		if cont = page.Continue; cont == "" {
+			break
+		}
 	}
 
 	type target struct {
 		ns, name, node, reason string
+		uid                    types.UID
 		ageHours               int
 	}
 	var targets []target
 	capped := false
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		if pod.Status.Phase != corev1.PodFailed {
 			continue
 		}
@@ -92,7 +111,11 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 		if pod.DeletionTimestamp != nil {
 			continue // already terminating — the API owns it now
 		}
-		age := time.Since(pod.CreationTimestamp.Time)
+		// The eviction happened when the containers died, not when
+		// the pod object was created — a pod can live for weeks
+		// before eviction, and CreationTimestamp-based aging would
+		// reap a minutes-old eviction the operator has not seen.
+		age := time.Since(evictionTime(pod))
 		if age <= evictedPodMaxAge {
 			continue // fresh eviction — keep it inspectable
 		}
@@ -105,10 +128,11 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 			name:     pod.Name,
 			node:     pod.Spec.NodeName,
 			reason:   pod.Status.Reason,
+			uid:      pod.UID,
 			ageHours: int(age.Hours()),
 		})
 	}
-	// Release the PodList before issuing Delete calls.
+	// Release the pod slice before issuing Delete calls.
 	pods = nil
 
 	background := metav1.DeletePropagationBackground
@@ -116,8 +140,11 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 	for _, t := range targets {
 		log.Info(fmt.Sprintf("DELETE %s/%s on %s: reason=%s age=%dh",
 			t.ns, t.name, t.node, t.reason, t.ageHours))
+		// UID precondition: the listed object is what we vetted — a
+		// same-named pod recreated in between is not ours to reap.
 		if err := j.cs.CoreV1().Pods(t.ns).Delete(ctx, t.name,
-			metav1.DeleteOptions{PropagationPolicy: &background}); err != nil {
+			metav1.DeleteOptions{PropagationPolicy: &background,
+				Preconditions: &metav1.Preconditions{UID: &t.uid}}); err != nil {
 			metrics.IncError(evictedPodQueue)
 			log.Error(err, "pod delete failed",
 				"pod", t.ns+"/"+t.name, "node", t.node, "reason", t.reason)
@@ -131,4 +158,28 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 	}
 	log.Info("sweep done", "deleted", deleted, "failed", failed)
 	return nil
+}
+
+// evictionTime is the moment the pod's containers actually died —
+// the latest containerStatuses[].state.terminated.finishedAt — or
+// the CreationTimestamp when no terminated state is recorded. The
+// finishedAt fallback ordering matters: a long-lived pod evicted an
+// hour ago must read as fresh even though its object is old.
+// InitContainerStatuses are scanned too: a pod evicted DURING init
+// never populates containerStatuses, so without it the eviction
+// clock wrongly anchors at CreationTimestamp and a minutes-old
+// eviction could be reaped inside the 1h keep window.
+func evictionTime(pod *corev1.Pod) time.Time {
+	latest := pod.CreationTimestamp.Time
+	for _, statuses := range [][]corev1.ContainerStatus{
+		pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses,
+	} {
+		for i := range statuses {
+			if t := statuses[i].State.Terminated; t != nil &&
+				t.FinishedAt.After(latest) {
+				latest = t.FinishedAt.Time
+			}
+		}
+	}
+	return latest
 }

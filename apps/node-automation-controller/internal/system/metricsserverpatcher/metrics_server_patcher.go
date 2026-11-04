@@ -33,7 +33,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"slices"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -67,6 +66,21 @@ var (
 	metricsServerWantLimCPU = resource.MustParse("200m")
 	metricsServerWantLimMem = resource.MustParse("384Mi")
 )
+
+// metricsServerWantArgs is the exact args list the patch installs —
+// args is a plain list the strategic merge replaces wholesale, so the
+// drift check must compare the WHOLE list: any pinned arg missing OR
+// any arg present that the patch would drop counts as drift (a check
+// covering only some pinned args would leave the rest permanently
+// unpatched).
+var metricsServerWantArgs = []string{
+	"--cert-dir=/tmp",
+	"--secure-port=10250",
+	"--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname",
+	"--kubelet-use-node-status-port",
+	"--metric-resolution=30s",
+	"--kubelet-request-timeout=25s",
+}
 
 type metricsServerPatcher struct {
 	cs              kubernetes.Interface
@@ -147,6 +161,18 @@ func (r *metricsServerPatcher) Reconcile(ctx context.Context, _ reconcile.Reques
 			"deployment", "kube-system/metrics-server", "wantReplicas", wantReplicas)
 		return res, nil
 	}
+	// A missing metrics-server container reads as drift, but the
+	// strategic-merge patch below merges containers BY NAME — applied
+	// to a spec without it, it would append a container entry with no
+	// image that the apiserver rejects forever. We cannot reconstruct
+	// the image, so warn and leave the Deployment for the stack
+	// applier rather than emitting a guaranteed-invalid patch.
+	if !shared.PodSpecHasContainer(&d.Spec.Template.Spec, "metrics-server") {
+		log.Info("WARN: metrics-server container missing from pod spec — "+
+			"skipping patch (strategic merge cannot create it without an image)",
+			"deployment", "kube-system/metrics-server")
+		return res, nil
+	}
 	patch, err := metricsServerPatchBody(wantReplicas)
 	if err != nil {
 		metrics.IncError("metrics-server-patcher")
@@ -206,8 +232,7 @@ func metricsServerNeedsPatch(d *appsv1.Deployment, wantReplicas int32) bool {
 		if c.Name != "metrics-server" {
 			continue
 		}
-		if !slices.Contains(c.Args, "--metric-resolution=30s") ||
-			!slices.Contains(c.Args, "--kubelet-request-timeout=25s") {
+		if metricsServerArgsDrifted(c.Args) {
 			return true
 		}
 		if c.LivenessProbe == nil || c.LivenessProbe.TimeoutSeconds != 5 ||
@@ -235,6 +260,26 @@ func metricsServerNeedsPatch(d *appsv1.Deployment, wantReplicas int32) bool {
 	return true
 }
 
+// metricsServerArgsDrifted reports whether the live args list differs
+// from metricsServerWantArgs as a multiset — a missing pinned arg and
+// an extra arg the patch would drop are BOTH drift, matching the
+// replace-whole-list semantics of the strategic merge.
+func metricsServerArgsDrifted(args []string) bool {
+	counts := make(map[string]int, len(metricsServerWantArgs))
+	for _, a := range metricsServerWantArgs {
+		counts[a]++
+	}
+	for _, a := range args {
+		counts[a]--
+	}
+	for _, n := range counts {
+		if n != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // metricsServerWantTolerations is the explicit set the patch pins —
 // no wildcard Exists (it tolerates node.kubernetes.io/unschedulable
 // too, the drain-treadmill bug of 2026-10-30).
@@ -252,7 +297,12 @@ var metricsServerWantTolerations = []corev1.Toleration{
 }
 
 // metricsServerTolerationsDrifted: a wildcard Exists toleration (no
-// key) means drift, and every wanted toleration must be present.
+// key) means drift, every wanted toleration must be present, and any
+// toleration NOT in the pinned set is drift too — .spec.tolerations
+// is +listType=atomic, so the patch replaces it wholesale; the check
+// must see every entry the patch would actually wipe, otherwise an
+// addon-injected toleration is silently deleted by a patch the drift
+// check never asked for.
 func metricsServerTolerationsDrifted(tols []corev1.Toleration) bool {
 	for _, t := range tols {
 		if t.Operator == corev1.TolerationOpExists && t.Key == "" {
@@ -262,7 +312,19 @@ func metricsServerTolerationsDrifted(tols []corev1.Toleration) bool {
 	for _, w := range metricsServerWantTolerations {
 		found := false
 		for _, t := range tols {
-			if t.Key == w.Key && t.Operator == w.Operator && t.Effect == w.Effect {
+			if tolerationMatches(&t, &w) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return true
+		}
+	}
+	for i := range tols {
+		found := false
+		for j := range metricsServerWantTolerations {
+			if tolerationMatches(&tols[i], &metricsServerWantTolerations[j]) {
 				found = true
 				break
 			}
@@ -272,6 +334,21 @@ func metricsServerTolerationsDrifted(tols []corev1.Toleration) bool {
 		}
 	}
 	return false
+}
+
+// tolerationMatches compares the identity fields the pinned set is
+// keyed on — key/operator/effect plus tolerationSeconds. nil vs set
+// matters: a seconds value injected onto a wanted toleration by
+// another actor changes what the pod actually tolerates, and the
+// atomic-list patch would wipe it — it must read as drift, not match.
+func tolerationMatches(t, w *corev1.Toleration) bool {
+	if t.Key != w.Key || t.Operator != w.Operator || t.Effect != w.Effect {
+		return false
+	}
+	if t.TolerationSeconds == nil || w.TolerationSeconds == nil {
+		return t.TolerationSeconds == nil && w.TolerationSeconds == nil
+	}
+	return *t.TolerationSeconds == *w.TolerationSeconds
 }
 
 // metricsServerTopologyOK requires both soft constraints: zone and

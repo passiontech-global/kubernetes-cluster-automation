@@ -20,9 +20,10 @@ import (
 )
 
 var cmrListKinds = map[schema.GroupVersionResource]string{
-	certificateGVR: "CertificateList",
-	orderGVR:       "OrderList",
-	challengeGVR:   "ChallengeList",
+	certificateGVR:        "CertificateList",
+	certificateRequestGVR: "CertificateRequestList",
+	orderGVR:              "OrderList",
+	challengeGVR:          "ChallengeList",
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +66,36 @@ func cmrOrder(ns, name, state string, age time.Duration) *unstructured.Unstructu
 	return o
 }
 
+// cmrOrderOwned wires the Order's CertificateRequest ownerRef — the
+// first hop of the Order→CR→Certificate attribution chain.
+func cmrOrderOwned(ns, name, state string, age time.Duration, crName string) *unstructured.Unstructured {
+	o := cmrOrder(ns, name, state, age)
+	o.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: "acme.cert-manager.io/v1",
+		Kind:       "CertificateRequest",
+		Name:       crName,
+	}})
+	return o
+}
+
+// cmrCertRequest builds a CertificateRequest owned by certName — the
+// second hop of the attribution chain (cert-manager sets the
+// Certificate ownerRef on every CR it creates).
+func cmrCertRequest(ns, name, certName string) *unstructured.Unstructured {
+	o := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "cert-manager.io/v1",
+		"kind":       "CertificateRequest",
+	}}
+	o.SetNamespace(ns)
+	o.SetName(name)
+	o.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: "cert-manager.io/v1",
+		Kind:       "Certificate",
+		Name:       certName,
+	}})
+	return o
+}
+
 // cmrChallenge builds an unstructured Challenge; transitionAgo ages
 // status.lastTransitionTime, orderOwner sets the ownerReference name.
 func cmrChallenge(ns, name string, presented, processing bool,
@@ -99,12 +130,14 @@ func cmrOrderExists(t *testing.T, dyn *dynamicfake.FakeDynamicClient, ns, name s
 	return true
 }
 
-// stuckFixture is the full wedge: Ready=False cert + pending>30m order
-// + presented/processing challenge with an old transition.
+// stuckFixture is the full wedge: Ready=False cert + its
+// CertificateRequest + pending>30m order owned by that CR +
+// presented/processing challenge with an old transition.
 func stuckFixture(ns, certName, orderName string) []runtime.Object {
 	return []runtime.Object{
 		cmrCert(ns, certName, "False", ""),
-		cmrOrder(ns, orderName, "pending", 45*time.Minute),
+		cmrCertRequest(ns, orderName+"-cr", certName),
+		cmrOrderOwned(ns, orderName, "pending", 45*time.Minute, orderName+"-cr"),
 		cmrChallenge(ns, orderName+"-ch", true, true, time.Hour, orderName),
 	}
 }
@@ -140,7 +173,8 @@ func TestCertManagerReaperRenewalWindowCandidate(t *testing.T) {
 	dyn := testutil.NewFakeDyn(cmrListKinds,
 		cmrCert("app", "tls-b", "True",
 			time.Now().Add(48*time.Hour).UTC().Format(time.RFC3339)),
-		cmrOrder("app", "order-b", "pending", 45*time.Minute),
+		cmrCertRequest("app", "order-b-cr", "tls-b"),
+		cmrOrderOwned("app", "order-b", "pending", 45*time.Minute, "order-b-cr"),
 		cmrChallenge("app", "order-b-ch", true, true, time.Hour, "order-b"))
 	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
 		resets: map[string]*certReset{}}
@@ -157,7 +191,8 @@ func TestCertManagerReaperKeepsHealthyCert(t *testing.T) {
 	dyn := testutil.NewFakeDyn(cmrListKinds,
 		cmrCert("app", "tls-ok", "True",
 			time.Now().Add(30*24*time.Hour).UTC().Format(time.RFC3339)),
-		cmrOrder("app", "order-ok", "pending", 45*time.Minute),
+		cmrCertRequest("app", "order-ok-cr", "tls-ok"),
+		cmrOrderOwned("app", "order-ok", "pending", 45*time.Minute, "order-ok-cr"),
 		cmrChallenge("app", "order-ok-ch", true, true, time.Hour, "order-ok"))
 	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
 		resets: map[string]*certReset{}}
@@ -169,12 +204,14 @@ func TestCertManagerReaperKeepsHealthyCert(t *testing.T) {
 	}
 }
 
-// Order must be BOTH pending and >30m old.
+// Order must be BOTH pending and >30m old — and owned by this cert's
+// CertificateRequest before the gates even apply.
 func TestCertManagerReaperOrderGates(t *testing.T) {
 	dyn := testutil.NewFakeDyn(cmrListKinds,
 		cmrCert("app", "tls-a", "False", ""),
-		cmrOrder("app", "young", "pending", 10*time.Minute), // fresh
-		cmrOrder("app", "valid", "valid", 45*time.Minute),   // not pending
+		cmrCertRequest("app", "cr-a", "tls-a"),
+		cmrOrderOwned("app", "young", "pending", 10*time.Minute, "cr-a"), // fresh
+		cmrOrderOwned("app", "valid", "valid", 45*time.Minute, "cr-a"),   // not pending
 		cmrChallenge("app", "ch", true, true, time.Hour, "young"))
 	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
 		resets: map[string]*certReset{}}
@@ -192,7 +229,8 @@ func TestCertManagerReaperOrderGates(t *testing.T) {
 func TestCertManagerReaperKeepsOrderWhenChallengeProgressing(t *testing.T) {
 	dyn := testutil.NewFakeDyn(cmrListKinds,
 		cmrCert("app", "tls-a", "False", ""),
-		cmrOrder("app", "order-a", "pending", 45*time.Minute),
+		cmrCertRequest("app", "order-a-cr", "tls-a"),
+		cmrOrderOwned("app", "order-a", "pending", 45*time.Minute, "order-a-cr"),
 		// presented but not processing — still moving.
 		cmrChallenge("app", "ch-a", true, false, time.Hour, "order-a"))
 	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
@@ -211,7 +249,8 @@ func TestCertManagerReaperKeepsOrderWhenChallengeProgressing(t *testing.T) {
 func TestCertManagerReaperIgnoresForeignChallenge(t *testing.T) {
 	dyn := testutil.NewFakeDyn(cmrListKinds,
 		cmrCert("app", "tls-a", "False", ""),
-		cmrOrder("app", "order-a", "pending", 45*time.Minute),
+		cmrCertRequest("app", "order-a-cr", "tls-a"),
+		cmrOrderOwned("app", "order-a", "pending", 45*time.Minute, "order-a-cr"),
 		cmrChallenge("app", "ch-b", true, true, time.Hour, "other-order"))
 	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
 		resets: map[string]*certReset{}}
@@ -233,8 +272,8 @@ func TestCertManagerReaperHourlyRateLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	// cert-manager recreated the order (with a fresh challenge);
-	// it wedged again.
-	recreated := cmrOrder("app", "order-2", "pending", 45*time.Minute)
+	// it wedged again — owned by the same cert's request.
+	recreated := cmrOrderOwned("app", "order-2", "pending", 45*time.Minute, "order-1-cr")
 	if _, err := dyn.Resource(orderGVR).Namespace("app").
 		Create(ctx, recreated, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -298,7 +337,8 @@ func TestCertManagerReaperRenewalKeepsResetBudget(t *testing.T) {
 	dyn := testutil.NewFakeDyn(cmrListKinds,
 		cmrCert("app", "tls-renew", "True",
 			time.Now().Add(48*time.Hour).UTC().Format(time.RFC3339)),
-		cmrOrder("app", "order-r", "pending", 45*time.Minute),
+		cmrCertRequest("app", "order-r-cr", "tls-renew"),
+		cmrOrderOwned("app", "order-r", "pending", 45*time.Minute, "order-r-cr"),
 		cmrChallenge("app", "order-r-ch", true, true, time.Hour, "order-r"))
 	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
 		resets: map[string]*certReset{
@@ -451,9 +491,10 @@ func TestCertManagerReaperOrderDeleteError(t *testing.T) {
 	}
 }
 
-// challengeLinkedToOrder: ownerReferences and the acme order-name label
-// are linkage — a linked challenge must point at THIS order; linkage-
-// free challenges fall back to the same-namespace match.
+// challengeLinkedToOrder: ownerReferences and the acme order-name
+// label/annotation are linkage — a linked challenge must point at THIS
+// order; a linkage-free challenge is ambiguous in a shared namespace
+// and does NOT count (fail closed).
 func TestChallengeLinkedToOrder(t *testing.T) {
 	order := cmrOrder("app", "order-a", "pending", 45*time.Minute)
 
@@ -472,11 +513,16 @@ func TestChallengeLinkedToOrder(t *testing.T) {
 	}{
 		{"label points at order", withLabel("ch-1", "order-a"), true},
 		{"label points elsewhere", withLabel("ch-2", "order-b"), false},
+		{"annotation points at order", func() *unstructured.Unstructured {
+			ch := cmrChallenge("app", "ch-anno", true, true, time.Hour, "")
+			ch.SetAnnotations(map[string]string{"acme.cert-manager.io/order-name": "order-a"})
+			return ch
+		}(), true},
 		{"ownerRef points at order",
 			cmrChallenge("app", "ch-3", true, true, time.Hour, "order-a"), true},
 		{"ownerRef points elsewhere",
 			cmrChallenge("app", "ch-4", true, true, time.Hour, "order-b"), false},
-		{"no linkage — namespace fallback", withLabel("ch-5", ""), true},
+		{"no linkage — ambiguous, not ours", withLabel("ch-5", ""), false},
 		{"ownerRef right + label wrong wins on ownerRef", func() *unstructured.Unstructured {
 			ch := cmrChallenge("app", "ch-6", true, true, time.Hour, "order-a")
 			ch.SetLabels(map[string]string{"acme.cert-manager.io/order-name": "order-b"})
@@ -496,6 +542,61 @@ func TestChallengeLinkedToOrder(t *testing.T) {
 	}
 }
 
+// Order attribution is per-cert through the Order→CertificateRequest→
+// Certificate owner chain: a pending>30m order owned by a DIFFERENT
+// cert's CR — or carrying no ownerRef at all — is never reaped on
+// this cert's candidacy (and never charges its budget).
+func TestCertManagerReaperIgnoresForeignOrder(t *testing.T) {
+	dyn := testutil.NewFakeDyn(cmrListKinds,
+		cmrCert("app", "tls-a", "False", ""),
+		cmrCert("app", "tls-x", "True",
+			time.Now().Add(48*time.Hour).UTC().Format(time.RFC3339)),
+		cmrCertRequest("app", "cr-a", "tls-a"),
+		cmrCertRequest("app", "cr-x", "tls-x"),
+		// tls-a's own stuck order — the only reappable one.
+		cmrOrderOwned("app", "order-a", "pending", 45*time.Minute, "cr-a"),
+		cmrChallenge("app", "order-a-ch", true, true, time.Hour, "order-a"),
+		// A foreign cert's pending order — never tls-a's to reap.
+		cmrOrderOwned("app", "order-x", "pending", 45*time.Minute, "cr-x"),
+		// An ownerless pending order — unattributable, kept.
+		cmrOrder("app", "order-free", "pending", 45*time.Minute))
+	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
+		resets: map[string]*certReset{}}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cmrOrderExists(t, dyn, "app", "order-a") {
+		t.Fatal("tls-a's own stuck order was not deleted")
+	}
+	for _, name := range []string{"order-x", "order-free"} {
+		if !cmrOrderExists(t, dyn, "app", name) {
+			t.Fatalf("order %s deleted — only this cert's orders may be reaped", name)
+		}
+	}
+}
+
+// A CertificateRequest list failure makes attribution indeterminate —
+// per-item IncError + keep, same posture as the order/challenge lists.
+func TestCertManagerReaperCRListError(t *testing.T) {
+	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
+	dyn.PrependReactor("list", "certificaterequests",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("cr list boom")
+		})
+	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
+		resets: map[string]*certReset{}}
+	before := testutil.QueueErrorCount(t, certReaperQueue)
+	if err := r.run(ctx); err != nil {
+		t.Fatalf("per-item failure must not abort the run: %v", err)
+	}
+	if !cmrOrderExists(t, dyn, "app", "order-a") {
+		t.Fatal("order deleted although attribution could not be established")
+	}
+	if got := testutil.QueueErrorCount(t, certReaperQueue) - before; got != 1 {
+		t.Fatalf("CR list failure did not IncError once, delta %v", got)
+	}
+}
+
 // Malformed condition entries (non-map elements in
 // status.conditions) are skipped, not crashed on — cert objects
 // straight from unstructured conversion can carry anything.
@@ -510,7 +611,7 @@ func TestCertNeedsReapNonMapCondition(t *testing.T) {
 			},
 		},
 	}}
-	if certNeedsReap(cert) {
+	if certNeedsReap(cert, time.Now()) {
 		t.Fatal("non-Ready / malformed conditions influenced the verdict")
 	}
 }
@@ -554,7 +655,8 @@ func TestCertManagerReaperHydratesBudgetFromAnnotation(t *testing.T) {
 	})
 	dyn := testutil.NewFakeDyn(cmrListKinds,
 		cert,
-		cmrOrder("app", "order-a", "pending", 45*time.Minute),
+		cmrCertRequest("app", "order-a-cr", "tls-a"),
+		cmrOrderOwned("app", "order-a", "pending", 45*time.Minute, "order-a-cr"),
 		cmrChallenge("app", "ch-a", true, true, time.Hour, "order-a"))
 	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn,
 		resets: map[string]*certReset{}}

@@ -122,7 +122,8 @@ func TestNodeLabelerEmptyConfigFile(t *testing.T) {
 }
 
 // labels.txt grammar: comment lines (# anywhere in leading whitespace),
-// blank lines, "<key=val> node1 node2 ..." rows, already-correct labels
+// trailing comments after the node list, blank lines,
+// "<key=val> node1 node2 ..." rows, already-correct labels
 // (no-op, no patch), nodes that no longer exist (warn+continue, never
 // an error) and rows naming a control-plane node (labels.txt applies
 // to whatever is named — unlike the worker-role sweep).
@@ -131,7 +132,7 @@ func TestNodeLabelerLabelsFileParsing(t *testing.T) {
 
     # comment after leading whitespace — skipped too
 passiontech.dev/workload=app w1 w2 ghost-node
-passiontech.dev/tier=db w2
+passiontech.dev/tier=db w2  # trailing comment — words after # are not node names
 passiontech.dev/already=set w1
 passiontech.dev/vip=lb cp1
 key-without-equals-sign-and-no-nodes
@@ -144,12 +145,23 @@ key-without-equals-sign-and-no-nodes
 		testutil.Node("w2", corev1.ConditionTrue, nil),
 	)
 	r := &nodeLabeler{cs: cs, configPath: cfg}
+	before := testutil.QueueErrorCount(t, "node-labeler")
 	res, err := r.Reconcile(ctx, reconcile.Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.RequeueAfter != 30*time.Minute {
 		t.Fatalf("expected 30m requeue, got %s", res.RequeueAfter)
+	}
+
+	// The labels.txt sweep resolves node objects from the listed
+	// snapshot — per-entry Nodes().Get would N+1 the apiserver.
+	// (Checked before the testutil.GetNode assertions below, which
+	// issue their own gets.)
+	for _, a := range cs.Actions() {
+		if a.GetVerb() == "get" && a.GetResource().Resource == "nodes" {
+			t.Fatalf("labels.txt sweep issued a per-entry node get: %v", a)
+		}
 	}
 
 	if got := testutil.GetNode(t, cs, "w1").Labels["passiontech.dev/workload"]; got != "app" {
@@ -163,8 +175,12 @@ key-without-equals-sign-and-no-nodes
 		w2.Labels["passiontech.dev/tier"] != "db" {
 		t.Fatalf("labels.txt entries not applied on w2: %v", w2.Labels)
 	}
-	// ghost-node is absent from the cluster — warn+continue, and the
-	// Reconcile above still returned nil.
+	// ghost-node is absent from the cluster — warn+continue (and the
+	// Reconcile above still returned nil), but it must be metered so
+	// a lingering labels.txt entry is not invisible to alerting.
+	if got := testutil.QueueErrorCount(t, "node-labeler") - before; got != 1 {
+		t.Fatalf("ghost node not IncError'd, delta %v", got)
+	}
 
 	cp1 := testutil.GetNode(t, cs, "cp1")
 	if got := cp1.Labels["passiontech.dev/vip"]; got != "lb" {

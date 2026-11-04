@@ -58,6 +58,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -163,81 +164,157 @@ func circuitBreakerEnabled() bool {
 	return os.Getenv("WEBHOOK_CIRCUIT_BREAKER_ENABLED") != "false"
 }
 
-// webhookPatch is one queued replace of /webhooks on a single config
-// (bash did per-index removes; one atomic replace per config is the
-// equivalent and cannot shift indices mid-patch).
+// webhookPatch is one queued strategic-merge patch on a single
+// config's /webhooks list (bash did per-index removes; the merge-key
+// patch is the equivalent that cannot shift indices mid-patch AND
+// cannot revert a concurrent writer's entries — see collect).
 type webhookPatch struct {
 	mutating bool
 	name     string
 	payload  []byte
 }
 
+// listPageSize bounds every cluster-wide namespaced List below —
+// an unbounded all-namespaces EndpointSlice/pod/Service list is a
+// heap spike every sweep, so they page through the apiserver's
+// continue token instead. The snapshot's cluster-scoped lists
+// (Namespaces, Mutating/ValidatingWebhookConfigurations) stay
+// unpaged: they are tiny by definition.
+const listPageSize = 500
+
+// sweepSnapshot carries the cluster state one run shares across its
+// sub-sweeps: the namespace census and both webhook-config lists are
+// identical inputs for the orphan sweep, the circuit breaker and the
+// unmeshed-pod audit, so they are listed ONCE per run instead of once
+// per consumer. A list failure is recorded on the snapshot, not
+// returned — every duty still decides for itself whether the missing
+// piece aborts it (fail-closed source) or merely skips a check.
+type sweepSnapshot struct {
+	g   *webhookGuard
+	ctx context.Context
+
+	ns     *corev1.NamespaceList
+	nsErr  error
+	mwc    *admissionv1.MutatingWebhookConfigurationList
+	mwcErr error
+	vwc    *admissionv1.ValidatingWebhookConfigurationList
+	vwcErr error
+
+	// readyOnce/ready/readyErr lazily cache the EndpointSlice ready
+	// census — the circuit breaker and the injector-health check
+	// share it, and a run whose breaker is disabled and has no
+	// unmeshed candidates never pays for the list at all.
+	readyOnce sync.Once
+	ready     map[string]int
+	readyErr  error
+}
+
+// takeSnapshot lists the shared inputs once — see sweepSnapshot.
+func (g *webhookGuard) takeSnapshot(ctx context.Context) *sweepSnapshot {
+	s := &sweepSnapshot{g: g, ctx: ctx}
+	s.ns, s.nsErr = g.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	s.mwc, s.mwcErr = g.cs.AdmissionregistrationV1().
+		MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
+	s.vwc, s.vwcErr = g.cs.AdmissionregistrationV1().
+		ValidatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
+	return s
+}
+
+// readyCounts returns the EndpointSlice ready census, listing it at
+// most once per run — the circuit breaker and the injector-health
+// check both draw from the same result, including the same error.
+func (s *sweepSnapshot) readyCounts() (map[string]int, error) {
+	s.readyOnce.Do(func() {
+		s.ready, s.readyErr = s.g.readyEndpointCounts(s.ctx)
+	})
+	return s.ready, s.readyErr
+}
+
 func (g *webhookGuard) run(ctx context.Context) error {
 	// The orphan sweep, the circuit breaker and the unmeshed-pod
 	// auditor are independent duties — a failure in one must never
 	// skip the others, so all run and their errors join
-	// (nil+nil+nil → nil).
-	orphanErr := g.sweepOrphans(ctx)
+	// (nil+nil+nil → nil). All three read the same cluster state, so
+	// the shared snapshot is listed once up front instead of once per
+	// consumer.
+	snap := g.takeSnapshot(ctx)
+	orphanErr := g.sweepOrphans(ctx, snap)
 	var breakerErr error
 	if circuitBreakerEnabled() {
-		breakerErr = g.sweepCircuitBreaker(ctx)
+		breakerErr = g.sweepCircuitBreaker(ctx, snap)
 	}
-	unmeshedErr := g.sweepUnmeshedPods(ctx)
+	unmeshedErr := g.sweepUnmeshedPods(ctx, snap)
 	return errors.Join(orphanErr, breakerErr, unmeshedErr)
 }
 
-func (g *webhookGuard) sweepOrphans(ctx context.Context) error {
+func (g *webhookGuard) sweepOrphans(ctx context.Context, snap *sweepSnapshot) error {
 	log := logf.FromContext(ctx)
 
 	// Namespace snapshot — the ONLY source of "deleted" truth. Any error
 	// or a missing kube-system means API flap: abort, patch nothing.
-	nsList, err := g.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list namespaces (API flap) — abort: %w", err)
+	if snap.nsErr != nil {
+		return fmt.Errorf("list namespaces (API flap) — abort: %w", snap.nsErr)
 	}
-	namespaces := make(map[string]bool, len(nsList.Items))
-	for _, ns := range nsList.Items {
+	namespaces := make(map[string]bool, len(snap.ns.Items))
+	for _, ns := range snap.ns.Items {
 		namespaces[ns.Name] = true
 	}
-	nsList = nil
 	if !namespaces["kube-system"] {
 		return fmt.Errorf("kube-system absent from namespace list (API flap) — abort")
 	}
 
 	// Service snapshot feeds only the WARN branch — a failure here
 	// degrades to namespace-only checking, it must not block orphans.
+	// Paged like every cluster-wide list in this module.
 	haveSvc := true
 	services := map[string]bool{}
-	svcList, err := g.cs.CoreV1().Services(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		metrics.IncError(webhookGuardQueue)
-		log.Info("WARN: cannot list services — skipping service check (namespace check still runs)", "error", err)
-		haveSvc = false
-	} else {
+	svcOpts := metav1.ListOptions{Limit: listPageSize}
+	for {
+		svcList, err := g.cs.CoreV1().Services(metav1.NamespaceAll).List(ctx, svcOpts)
+		if err != nil {
+			metrics.IncError(webhookGuardQueue)
+			log.Info("WARN: cannot list services — skipping service check (namespace check still runs)", "error", err)
+			haveSvc = false
+			break
+		}
 		for _, s := range svcList.Items {
 			services[s.Namespace+"/"+s.Name] = true
 		}
+		if svcList.Continue == "" {
+			break
+		}
+		svcOpts.Continue = svcList.Continue
 	}
-	svcList = nil
 
-	mwc, err := g.cs.AdmissionregistrationV1().MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list mutatingwebhookconfigurations (API flap) — abort: %w", err)
+	if snap.mwcErr != nil {
+		return fmt.Errorf("list mutatingwebhookconfigurations (API flap) — abort: %w", snap.mwcErr)
 	}
-	vwc, err := g.cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list validatingwebhookconfigurations (API flap) — abort: %w", err)
+	if snap.vwcErr != nil {
+		return fmt.Errorf("list validatingwebhookconfigurations (API flap) — abort: %w", snap.vwcErr)
 	}
+	mwc, vwc := snap.mwc, snap.vwc
 
 	var patches []webhookPatch
-	collect := func(mutating bool, cfgName string, filtered any, dirty bool) {
-		if !dirty {
+	// collect queues ONE strategic-merge patch per config listing every
+	// orphan entry as {"name": X, "$patch": "delete"}: the webhooks
+	// list is patchMergeKey=name + patchStrategy=merge (and
+	// +listType=map), so each removal deletes by merge key instead of
+	// re-serializing the whole array from our List snapshot. A
+	// concurrent writer's entry — cainjector rotating caBundle, GitOps
+	// adding a webhook — is merged around, never silently reverted.
+	collect := func(mutating bool, cfgName string, removed []string) {
+		if len(removed) == 0 {
 			return
 		}
-		payload, err := json.Marshal([]map[string]any{{
-			"op": "replace", "path": "/webhooks", "value": filtered,
-		}})
+		dels := make([]map[string]any, 0, len(removed))
+		for _, name := range removed {
+			dels = append(dels, map[string]any{"name": name, "$patch": "delete"})
+		}
+		payload, err := json.Marshal(map[string]any{"webhooks": dels})
 		if err != nil {
+			// Absorbed sub-failure: the sweep logs and continues —
+			// metered so the dropped work is still counted.
+			metrics.IncError(webhookGuardQueue)
 			log.Error(err, "marshal webhook patch",
 				"config", cfgName, "mutating", mutating)
 			return
@@ -246,28 +323,22 @@ func (g *webhookGuard) sweepOrphans(ctx context.Context) error {
 	}
 
 	for _, cfg := range mwc.Items {
-		filtered := make([]admissionv1.MutatingWebhook, 0, len(cfg.Webhooks))
-		dirty := false
+		var removed []string
 		for i, w := range cfg.Webhooks {
 			if g.orphanEntry(log, "mutatingwebhookconfigurations", cfg.Name, i, w.ClientConfig.Service, namespaces, services, haveSvc) {
-				dirty = true
-				continue
+				removed = append(removed, w.Name)
 			}
-			filtered = append(filtered, w)
 		}
-		collect(true, cfg.Name, filtered, dirty)
+		collect(true, cfg.Name, removed)
 	}
 	for _, cfg := range vwc.Items {
-		filtered := make([]admissionv1.ValidatingWebhook, 0, len(cfg.Webhooks))
-		dirty := false
+		var removed []string
 		for i, w := range cfg.Webhooks {
 			if g.orphanEntry(log, "validatingwebhookconfigurations", cfg.Name, i, w.ClientConfig.Service, namespaces, services, haveSvc) {
-				dirty = true
-				continue
+				removed = append(removed, w.Name)
 			}
-			filtered = append(filtered, w)
 		}
-		collect(false, cfg.Name, filtered, dirty)
+		collect(false, cfg.Name, removed)
 	}
 
 	if len(patches) == 0 {
@@ -281,12 +352,13 @@ func (g *webhookGuard) sweepOrphans(ctx context.Context) error {
 		if p.mutating {
 			kind = webhookKindMutating
 		}
-		log.Info("PATCH: replace /webhooks (drop orphan entries)",
+		log.Info("PATCH: drop orphan entries by merge key",
 			"kind", kind, "config", p.name)
+		var err error
 		if p.mutating {
-			_, err = g.cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Patch(ctx, p.name, types.JSONPatchType, p.payload, metav1.PatchOptions{})
+			_, err = g.cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Patch(ctx, p.name, types.StrategicMergePatchType, p.payload, metav1.PatchOptions{})
 		} else {
-			_, err = g.cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Patch(ctx, p.name, types.JSONPatchType, p.payload, metav1.PatchOptions{})
+			_, err = g.cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Patch(ctx, p.name, types.StrategicMergePatchType, p.payload, metav1.PatchOptions{})
 		}
 		if err != nil {
 			log.Error(err, "webhook config patch failed",
@@ -338,7 +410,7 @@ func (g *webhookGuard) now() time.Time {
 // the Service has endpoints again. It runs after the orphan sweep so
 // it always evaluates post-prune state; a patch failure on one config
 // is logged and the sweep continues with the rest.
-func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context) error {
+func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context, snap *sweepSnapshot) error {
 	log := logf.FromContext(ctx)
 	now := g.now()
 	if g.deadSince == nil {
@@ -348,20 +420,17 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context) error {
 		g.brokenEmitted = map[string]bool{}
 	}
 
-	ready, err := g.readyEndpointCounts(ctx)
+	ready, err := snap.readyCounts()
 	if err != nil {
 		return err
 	}
-	mwcs, err := g.cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
-		List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list mutatingwebhookconfigurations — circuit breaker skipped: %w", err)
+	if snap.mwcErr != nil {
+		return fmt.Errorf("list mutatingwebhookconfigurations — circuit breaker skipped: %w", snap.mwcErr)
 	}
-	vwcs, err := g.cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().
-		List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list validatingwebhookconfigurations — circuit breaker skipped: %w", err)
+	if snap.vwcErr != nil {
+		return fmt.Errorf("list validatingwebhookconfigurations — circuit breaker skipped: %w", snap.vwcErr)
 	}
+	mwcs, vwcs := snap.mwc, snap.vwc
 
 	// seen marks the deadSince keys still under evaluation — streaks
 	// for entries gone since the last sweep are pruned below.
@@ -374,12 +443,12 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context) error {
 		cfg := &mwcs.Items[i]
 		payload, trips, recovered := g.circuitPatch(log, webhookKindMutating,
 			cfg.Name, cfg.Annotations[webhookCircuitAnno],
-			mutHookViews(cfg.Webhooks), cfg.Webhooks, ready, now, seen, emitted)
+			mutHookViews(cfg.Webhooks), ready, now, seen, emitted)
 		if payload == nil {
 			continue
 		}
 		if _, err := g.cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
-			Patch(ctx, cfg.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{}); err != nil {
 			log.Error(err, "circuit breaker patch failed",
 				"kind", webhookKindMutating, "config", cfg.Name)
 			failed = append(failed, cfg.Name)
@@ -391,12 +460,12 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context) error {
 		cfg := &vwcs.Items[i]
 		payload, trips, recovered := g.circuitPatch(log, webhookKindValidating,
 			cfg.Name, cfg.Annotations[webhookCircuitAnno],
-			valHookViews(cfg.Webhooks), cfg.Webhooks, ready, now, seen, emitted)
+			valHookViews(cfg.Webhooks), ready, now, seen, emitted)
 		if payload == nil {
 			continue
 		}
 		if _, err := g.cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().
-			Patch(ctx, cfg.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{}); err != nil {
 			log.Error(err, "circuit breaker patch failed",
 				"kind", webhookKindValidating, "config", cfg.Name)
 			failed = append(failed, cfg.Name)
@@ -434,43 +503,46 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context) error {
 }
 
 // readyEndpointCounts builds the ns/service → Ready-endpoint census
-// from one cluster-wide EndpointSlice list. The
-// kubernetes.io/service-name label binds each slice to its Service; a
-// nil conditions.ready counts as ready (the field defaults to true
-// server-side). No degraded mode: without a complete census "0 ready"
-// is indistinguishable from "no data", so a list error skips the whole
-// breaker rather than trip healthy webhooks.
+// from the cluster-wide EndpointSlice list (paged — see listPageSize).
+// The kubernetes.io/service-name label binds each slice to its
+// Service; a nil conditions.ready counts as ready (the field defaults
+// to true server-side). No degraded mode: without a complete census
+// "0 ready" is indistinguishable from "no data", so a list error skips
+// the whole breaker rather than trip healthy webhooks.
 func (g *webhookGuard) readyEndpointCounts(ctx context.Context) (map[string]int, error) {
-	sliceList, err := g.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("list endpointslices — circuit breaker skipped: %w", err)
-	}
 	ready := map[string]int{}
-	for _, s := range sliceList.Items {
-		svc := s.Labels[discoveryv1.LabelServiceName]
-		if svc == "" {
-			continue // no owning Service — cannot map to a webhook backend
+	opts := metav1.ListOptions{Limit: listPageSize}
+	for {
+		sliceList, err := g.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).
+			List(ctx, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list endpointslices — circuit breaker skipped: %w", err)
 		}
-		key := s.Namespace + "/" + svc
-		for _, ep := range s.Endpoints {
-			if ep.Conditions.Ready == nil || *ep.Conditions.Ready {
-				ready[key]++
+		for _, s := range sliceList.Items {
+			svc := s.Labels[discoveryv1.LabelServiceName]
+			if svc == "" {
+				continue // no owning Service — cannot map to a webhook backend
+			}
+			key := s.Namespace + "/" + svc
+			for _, ep := range s.Endpoints {
+				if ep.Conditions.Ready == nil || *ep.Conditions.Ready {
+					ready[key]++
+				}
 			}
 		}
+		if sliceList.Continue == "" {
+			return ready, nil
+		}
+		opts.Continue = sliceList.Continue
 	}
-	return ready, nil
 }
 
 // hookView is the breaker's uniform projection over MutatingWebhook /
 // ValidatingWebhook — identical relevant fields, distinct Go types.
-// set writes the failurePolicy back into the config's webhook list so
-// the whole list can be re-serialized into the merge patch.
 type hookView struct {
 	name string
 	fp   *admissionv1.FailurePolicyType
 	svc  *admissionv1.ServiceReference
-	set  func(*admissionv1.FailurePolicyType)
 }
 
 func mutHookViews(ws []admissionv1.MutatingWebhook) []hookView {
@@ -479,9 +551,6 @@ func mutHookViews(ws []admissionv1.MutatingWebhook) []hookView {
 		out[i] = hookView{
 			name: ws[i].Name, fp: ws[i].FailurePolicy,
 			svc: ws[i].ClientConfig.Service,
-			set: func(fp *admissionv1.FailurePolicyType) {
-				ws[i].FailurePolicy = fp
-			},
 		}
 	}
 	return out
@@ -493,28 +562,28 @@ func valHookViews(ws []admissionv1.ValidatingWebhook) []hookView {
 		out[i] = hookView{
 			name: ws[i].Name, fp: ws[i].FailurePolicy,
 			svc: ws[i].ClientConfig.Service,
-			set: func(fp *admissionv1.FailurePolicyType) {
-				ws[i].FailurePolicy = fp
-			},
 		}
 	}
 	return out
 }
 
 // circuitPatch evaluates one config's sub-webhooks against the ready
-// census and builds the merge patch that flips long-dead entries to
-// Ignore, restores recovered ones to Fail and rewrites the
+// census and builds the strategic-merge patch that flips long-dead
+// entries to Ignore, restores recovered ones to Fail and rewrites the
 // circuit-broken annotation (merge-patch null removes the key when the
-// set empties). hooks views the config's live webhook list; raw is
-// that same list re-serialized wholesale into the patch (merge
-// semantics replace arrays). emitted records the WebhookCircuitBroken
-// label tuples re-asserted at =1 this sweep — the caller rebuilds the
-// guard's series ledger from it and prunes whatever was not re-seen.
-// Returns nil payload when nothing changed; trips/recovered are the
-// names whose metric updates the caller must apply only after the
-// patch lands.
+// set empties). hooks views the config's live webhook list; each
+// changed entry lands in the patch as {"name": X, "failurePolicy":
+// ...} — the webhooks list is patchMergeKey=name + patchStrategy=merge
+// (+listType=map), so only the touched element's failurePolicy is
+// rewritten and a concurrent writer's sibling entries survive instead
+// of being reverted by a whole-array reserialize. emitted records the
+// WebhookCircuitBroken label tuples re-asserted at =1 this sweep — the
+// caller rebuilds the guard's series ledger from it and prunes
+// whatever was not re-seen. Returns nil payload when nothing changed;
+// trips/recovered are the names whose metric updates the caller must
+// apply only after the patch lands.
 func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal string,
-	hooks []hookView, raw any, ready map[string]int, now time.Time,
+	hooks []hookView, ready map[string]int, now time.Time,
 	seen, emitted map[string]bool) ([]byte, []string, []string) {
 
 	broken := parseCircuitAnnotation(annoVal)
@@ -522,7 +591,15 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 	// below compares the annotation against it (a freshly tripped name
 	// is present even though it was not in the annotation yet).
 	present := map[string]bool{}
-	ignore, fail := admissionv1.Ignore, admissionv1.Fail
+	// hookMerges collects the strategic-merge entries for every
+	// failurePolicy flip — one {"name": X, "failurePolicy": ...} map
+	// per touched sub-webhook (each hook is visited once, so a plain
+	// append cannot duplicate a merge key).
+	var hookMerges []map[string]any
+	flip := func(h hookView, fp admissionv1.FailurePolicyType) {
+		hookMerges = append(hookMerges, map[string]any{
+			"name": h.name, "failurePolicy": string(fp)})
+	}
 	changed := false
 	var trips, recovered []string
 
@@ -544,7 +621,7 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 			// the entry was repointed off its Service entirely
 			// (svcReady < 0): the breaker cannot measure a URL, so it
 			// hands back the declared Fail and steps out.
-			h.set(&fail)
+			flip(h, admissionv1.Fail)
 			delete(broken, h.name)
 			recovered = append(recovered, h.name)
 			changed = true
@@ -554,7 +631,7 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 			// Still dead — the annotation is the SSOT, so re-assert
 			// Ignore if the policy was flipped back externally.
 			if h.fp == nil || *h.fp != admissionv1.Ignore {
-				h.set(&ignore)
+				flip(h, admissionv1.Ignore)
 				changed = true
 			}
 			metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, h.name).Set(1)
@@ -577,7 +654,7 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 			// next sweep retry immediately instead of re-opening a
 			// fresh 5m window. Once the entry is broken it no longer
 			// marks seen[key], so the ledger prunes itself.
-			h.set(&ignore)
+			flip(h, admissionv1.Ignore)
 			broken[h.name] = true
 			trips = append(trips, h.name)
 			changed = true
@@ -605,11 +682,17 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 	if len(broken) > 0 {
 		anno[webhookCircuitAnno] = strings.Join(slices.Sorted(maps.Keys(broken)), ",")
 	}
-	payload, err := json.Marshal(map[string]any{
+	doc := map[string]any{
 		"metadata": map[string]any{"annotations": anno},
-		"webhooks": raw,
-	})
+	}
+	if len(hookMerges) > 0 {
+		doc["webhooks"] = hookMerges
+	}
+	payload, err := json.Marshal(doc)
 	if err != nil {
+		// Absorbed sub-failure: the sweep logs and continues —
+		// metered so the dropped work is still counted.
+		metrics.IncError(webhookGuardQueue)
 		log.Error(err, "marshal circuit breaker patch", "config", cfgName)
 		return nil, nil, nil
 	}
@@ -678,7 +761,7 @@ func unmeshedRemediationEnabled() bool {
 // admitted while the C1 breaker held the injector open. The gauge is
 // exported unconditionally; deletion additionally requires the
 // injector webhook provably healthy and the remediation flag on.
-func (g *webhookGuard) sweepUnmeshedPods(ctx context.Context) error {
+func (g *webhookGuard) sweepUnmeshedPods(ctx context.Context, snap *sweepSnapshot) error {
 	log := logf.FromContext(ctx)
 	if g.unmeshedEmitted == nil {
 		// Lazily arm for direct-constructed fixtures — Setup always
@@ -690,62 +773,73 @@ func (g *webhookGuard) sweepUnmeshedPods(ctx context.Context) error {
 	// opt-in. An empty list is an API flap — a pod whose namespace
 	// cannot be checked must never be classified, so abort the
 	// audit before anything is emitted or deleted.
-	nsList, err := g.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list namespaces — unmeshed audit skipped: %w", err)
+	if snap.nsErr != nil {
+		return fmt.Errorf("list namespaces — unmeshed audit skipped: %w", snap.nsErr)
 	}
-	if len(nsList.Items) == 0 {
+	if len(snap.ns.Items) == 0 {
 		return fmt.Errorf("empty namespace list (API flap) — unmeshed audit skipped")
 	}
-	nsInject := make(map[string]string, len(nsList.Items))
-	for _, ns := range nsList.Items {
+	nsInject := make(map[string]string, len(snap.ns.Items))
+	for _, ns := range snap.ns.Items {
 		nsInject[ns.Name] = injectDirective(ns.Labels, ns.Annotations)
 	}
-	nsList = nil
 
 	// Server-side phase filter (the informer cache is list/watch-
 	// locked to kube-system cilium pods, so this goes through cs like
 	// every other module); the in-code phase check stays because
-	// fake clientsets ignore field selectors.
-	pods, err := g.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-		FieldSelector: "status.phase=Running",
-	})
-	if err != nil {
-		return fmt.Errorf("list pods — unmeshed audit skipped: %w", err)
-	}
-
+	// fake clientsets ignore field selectors. The list is PAGED —
+	// all Running pods cluster-wide is an unbounded read, and each
+	// page is processed then dropped instead of pinning the whole
+	// list for the sweep.
 	now := g.now()
 	emitted := map[string]bool{}
-	var candidates []*corev1.Pod
-	for i := range pods.Items {
-		p := &pods.Items[i]
-		if p.Status.Phase != corev1.PodRunning {
-			continue // mirrors the FieldSelector for fake clients
-		}
-		if !podWantsMesh(p, nsInject[p.Namespace]) {
-			continue
-		}
-		if podHasSidecar(p) {
-			continue
-		}
-		emitted[p.Namespace+"/"+p.Name] = true
-		metrics.UnmeshedPods.WithLabelValues(p.Namespace, p.Name).Set(1)
-		log.Info("UNMESHED: pod running without linkerd-proxy sidecar",
-			"pod", p.Namespace+"/"+p.Name)
-		// Deletion requires a CONTROLLER owner (a bare ownerReference
-		// proves nothing is recreating the pod) that is not a Node —
-		// mirror pods only reflect a static manifest, deleting one
-		// changes nothing — and the pod must not already be
-		// terminating: its replacement gets the sidecar at admission,
-		// so a second delete buys nothing.
-		if owner := metav1.GetControllerOf(p); owner != nil &&
-			owner.Kind != "Node" &&
-			p.DeletionTimestamp.IsZero() &&
-			now.Sub(p.CreationTimestamp.Time) >= unmeshedMinPodAge {
-			candidates = append(candidates, p)
-		}
+	var candidates []corev1.Pod
+	listOpts := metav1.ListOptions{
+		FieldSelector: "status.phase=Running",
+		Limit:         listPageSize,
 	}
-	pods = nil
+	for {
+		pods, err := g.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, listOpts)
+		if err != nil {
+			return fmt.Errorf("list pods — unmeshed audit skipped: %w", err)
+		}
+		for i := range pods.Items {
+			p := &pods.Items[i]
+			if p.Status.Phase != corev1.PodRunning {
+				continue // mirrors the FieldSelector for fake clients
+			}
+			if !podWantsMesh(p, nsInject[p.Namespace]) {
+				continue
+			}
+			if podHasSidecar(p) {
+				continue
+			}
+			emitted[p.Namespace+"/"+p.Name] = true
+			metrics.UnmeshedPods.WithLabelValues(p.Namespace, p.Name).Set(1)
+			log.Info("UNMESHED: pod running without linkerd-proxy sidecar",
+				"pod", p.Namespace+"/"+p.Name)
+			// Deletion requires a CONTROLLER owner (a bare
+			// ownerReference proves nothing is recreating the pod)
+			// that is not a Node — mirror pods only reflect a
+			// static manifest, deleting one changes nothing — and
+			// the pod must not already be terminating: its
+			// replacement gets the sidecar at admission, so a
+			// second delete buys nothing. The candidate is COPIED
+			// out of the page — holding pointers would keep the
+			// whole pods.Items backing array reachable until the
+			// deletes finish.
+			if owner := metav1.GetControllerOf(p); owner != nil &&
+				owner.Kind != "Node" &&
+				p.DeletionTimestamp.IsZero() &&
+				now.Sub(p.CreationTimestamp.Time) >= unmeshedMinPodAge {
+				candidates = append(candidates, *p)
+			}
+		}
+		if pods.Continue == "" {
+			break
+		}
+		listOpts.Continue = pods.Continue
+	}
 
 	// Prune series for pods that vanished or gained the sidecar —
 	// same DeleteLabelValues hygiene as brokenEmitted.
@@ -773,7 +867,7 @@ func (g *webhookGuard) sweepUnmeshedPods(ctx context.Context) error {
 	// and >= 1 Ready endpoint behind its Service. An unverifiable
 	// answer fails closed — a wrong "healthy" verdict deletes pods
 	// that would only be recreated unmeshed again.
-	healthy, err := g.linkerdInjectorHealthy(ctx)
+	healthy, err := g.linkerdInjectorHealthy(snap)
 	if err != nil {
 		metrics.IncError(webhookGuardQueue)
 		log.Info("WARN: injector health unverifiable — remediation skipped (fail closed)",
@@ -787,11 +881,12 @@ func (g *webhookGuard) sweepUnmeshedPods(ctx context.Context) error {
 	}
 
 	// Deterministic order so the cap picks the same pods.
-	slices.SortFunc(candidates, func(a, b *corev1.Pod) int {
+	slices.SortFunc(candidates, func(a, b corev1.Pod) int {
 		return strings.Compare(a.Namespace+"/"+a.Name, b.Namespace+"/"+b.Name)
 	})
 	deleted, attempts := 0, 0
-	for _, p := range candidates {
+	for i := range candidates {
+		p := &candidates[i]
 		if deleted >= unmeshedDeleteCap || attempts >= unmeshedDeleteAttempts {
 			break
 		}
@@ -799,8 +894,16 @@ func (g *webhookGuard) sweepUnmeshedPods(ctx context.Context) error {
 		log.Info("DELETE: unmeshed pod — owner controller recreates it meshed",
 			"pod", p.Namespace+"/"+p.Name,
 			"age", now.Sub(p.CreationTimestamp.Time).Truncate(time.Second))
+		// UID precondition closes the TOCTOU window between the audit
+		// snapshot and the delete — a same-named pod recreated in
+		// between was admitted after the injector recovered and is
+		// not ours to reap (same pattern as the apiservice orphan
+		// reaper).
+		uid := p.UID
 		if err := g.cs.CoreV1().Pods(p.Namespace).
-			Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
+			Delete(ctx, p.Name, metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &uid},
+			}); err != nil {
 			log.Error(err, "unmeshed pod delete failed", "pod", p.Namespace+"/"+p.Name)
 			metrics.IncError(webhookGuardQueue)
 			continue
@@ -875,16 +978,18 @@ func injectDirective(labels, annotations map[string]string) string {
 // still Fail (a tripped breaker leaves Ignore behind), and >= 1 Ready
 // endpoint behind its backend Service. Any measurement failure is a
 // real error — the caller treats "cannot verify" as "not healthy".
-func (g *webhookGuard) linkerdInjectorHealthy(ctx context.Context) (bool, error) {
-	ready, err := g.readyEndpointCounts(ctx)
+// Runs only when unmeshed candidates exist, so its census +
+// config-list inputs are drawn from the shared run snapshot (the
+// census is computed lazily on first use — see sweepSnapshot).
+func (g *webhookGuard) linkerdInjectorHealthy(snap *sweepSnapshot) (bool, error) {
+	ready, err := snap.readyCounts()
 	if err != nil {
 		return false, err
 	}
-	mwcs, err := g.cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
-		List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("list mutatingwebhookconfigurations — injector health unknown: %w", err)
+	if snap.mwcErr != nil {
+		return false, fmt.Errorf("list mutatingwebhookconfigurations — injector health unknown: %w", snap.mwcErr)
 	}
+	mwcs := snap.mwc
 	found := false
 	for i := range mwcs.Items {
 		cfg := &mwcs.Items[i]
@@ -907,7 +1012,7 @@ func (g *webhookGuard) linkerdInjectorHealthy(ctx context.Context) (bool, error)
 		}
 	}
 	if !found {
-		logf.FromContext(ctx).Info("injector health: no linkerd-proxy-injector webhook found")
+		logf.FromContext(snap.ctx).Info("injector health: no linkerd-proxy-injector webhook found")
 	}
 	return false, nil
 }

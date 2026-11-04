@@ -739,6 +739,64 @@ func TestCheckKCMWorkqueueRecoveryClearsGauge(t *testing.T) {
 	}
 }
 
+// HEALTH_* env knobs: garbage strings, zero and negative values must
+// not silently produce dangerous config — HEALTH_CHECK_TIMEOUT=0
+// would instant-fail every probe, HEALTH_MAX_POD_RESTARTS=-1 would
+// flag every container, and a 0s interval would panic the ticker.
+// Each falls back to the default (and logs a warning).
+func TestHealthEnvHelpersClampBadValues(t *testing.T) {
+	// Unset → defaults.
+	for _, k := range []string{
+		"HEALTH_CHECK_TIMEOUT", "HEALTH_POD_SKIP_DURATION",
+		"HEALTH_KCM_LEASE_MAX_AGE", "HEALTH_KCM_FREEZE_MIN_AGE",
+		"HEALTH_MAX_POD_RESTARTS", "HEALTH_RESOURCE_QUOTA_THRESHOLD",
+		"CLUSTER_HEALTH_PROBES_INTERVAL",
+	} {
+		t.Setenv(k, "")
+	}
+	cfg := healthProbeConfigFromEnv()
+	if cfg.checkTimeout != 30*time.Second || cfg.podSkipDuration != 10*time.Minute ||
+		cfg.kcmLeaseMaxAge != 30*time.Second || cfg.kcmFreezeMinAge != 10*time.Minute {
+		t.Fatalf("unset env produced non-default config: %+v", cfg)
+	}
+	if cfg.maxPodRestarts != 10 || cfg.quotaThreshold != 0.9 {
+		t.Fatalf("unset env produced non-default config: %+v", cfg)
+	}
+
+	// Zero/negative durations → default, not instant-fail/panic.
+	for _, v := range []string{"0", "0s", "-5s", "garbage"} {
+		t.Setenv("HEALTH_CHECK_TIMEOUT", v)
+		if got := healthProbeConfigFromEnv().checkTimeout; got != 30*time.Second {
+			t.Fatalf("HEALTH_CHECK_TIMEOUT=%q → checkTimeout %v, want 30s default", v, got)
+		}
+	}
+	// A parseable positive value wins.
+	t.Setenv("HEALTH_CHECK_TIMEOUT", "15s")
+	if got := healthProbeConfigFromEnv().checkTimeout; got != 15*time.Second {
+		t.Fatalf("HEALTH_CHECK_TIMEOUT=15s → %v, want 15s", got)
+	}
+
+	// Negative int → default; 0 is a legitimate (strict) threshold.
+	t.Setenv("HEALTH_MAX_POD_RESTARTS", "-1")
+	if got := healthProbeConfigFromEnv().maxPodRestarts; got != 10 {
+		t.Fatalf("HEALTH_MAX_POD_RESTARTS=-1 → %d, want 10 default", got)
+	}
+	t.Setenv("HEALTH_MAX_POD_RESTARTS", "not-an-int")
+	if got := healthProbeConfigFromEnv().maxPodRestarts; got != 10 {
+		t.Fatalf("HEALTH_MAX_POD_RESTARTS=not-an-int → %d, want 10 default", got)
+	}
+	t.Setenv("HEALTH_MAX_POD_RESTARTS", "0")
+	if got := healthProbeConfigFromEnv().maxPodRestarts; got != 0 {
+		t.Fatalf("HEALTH_MAX_POD_RESTARTS=0 → %d, want 0 (any restart flags)", got)
+	}
+
+	// Unparseable float → default.
+	t.Setenv("HEALTH_RESOURCE_QUOTA_THRESHOLD", "banana")
+	if got := healthProbeConfigFromEnv().quotaThreshold; got != 0.9 {
+		t.Fatalf("HEALTH_RESOURCE_QUOTA_THRESHOLD=banana → %v, want 0.9", got)
+	}
+}
+
 // desired==0 with zero pods anywhere is a legitimately-empty selector
 // — not a freeze — and it must never even enter first-seen tracking.
 func TestCheckKCMWorkqueueIgnoresEmptyDaemonSet(t *testing.T) {

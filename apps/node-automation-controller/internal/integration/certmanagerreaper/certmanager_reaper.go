@@ -61,6 +61,8 @@ const (
 var (
 	certificateGVR = schema.GroupVersionResource{
 		Group: "cert-manager.io", Version: "v1", Resource: "certificates"}
+	certificateRequestGVR = schema.GroupVersionResource{
+		Group: "cert-manager.io", Version: "v1", Resource: "certificaterequests"}
 	orderGVR = schema.GroupVersionResource{
 		Group: "acme.cert-manager.io", Version: "v1", Resource: "orders"}
 	challengeGVR = schema.GroupVersionResource{
@@ -83,6 +85,10 @@ type certManagerReaper struct {
 	cs     kubernetes.Interface // reserved for future typed reads
 	dyn    dynamic.Interface
 	resets map[string]*certReset
+	// nowFn is the clock seam — tests pin it so the pending/wedged
+	// windows, the renewal window and the hourly reset gap are
+	// deterministic. nil → time.Now.
+	nowFn func() time.Time
 }
 
 // Setup registers the 15m sweep. Disabled clusters
@@ -99,6 +105,15 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
 
 func (r *certManagerReaper) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
+	// Lazily arm the zero-value struct — unit tests construct the
+	// reaper literally without the Setup path.
+	if r.nowFn == nil {
+		r.nowFn = time.Now
+	}
+	if r.resets == nil {
+		r.resets = map[string]*certReset{}
+	}
+	now := r.nowFn()
 
 	certs, err := r.dyn.Resource(certificateGVR).Namespace(metav1.NamespaceAll).
 		List(ctx, metav1.ListOptions{})
@@ -111,7 +126,7 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 		cert := &certs.Items[i]
 		key := cert.GetNamespace() + "/" + cert.GetName()
 		seen[key] = true
-		needsReap := certNeedsReap(cert)
+		needsReap := certNeedsReap(cert, now)
 		// A cert back to Ready=True earned a clean slate — drop its
 		// reset budget (memory AND persisted annotation) so a few
 		// stuck-issuance episodes spread over months cannot refuse it
@@ -160,10 +175,10 @@ func certReady(cert *unstructured.Unstructured) bool {
 }
 
 // certNeedsReap mirrors the bash filter: Ready=False OR renewalTime
-// within 7d — a healthy cert with no upcoming renewal cannot have a
-// stuck issuance worth resetting. cert-manager publishes the next
-// renewal under STATUS.renewalTime (spec carries no such field).
-func certNeedsReap(cert *unstructured.Unstructured) bool {
+// within 7d of now — a healthy cert with no upcoming renewal cannot
+// have a stuck issuance worth resetting. cert-manager publishes the
+// next renewal under STATUS.renewalTime (spec carries no such field).
+func certNeedsReap(cert *unstructured.Unstructured, now time.Time) bool {
 	if conds, found, _ := unstructured.NestedSlice(
 		cert.Object, "status", "conditions"); found {
 		for _, c := range conds {
@@ -179,7 +194,7 @@ func certNeedsReap(cert *unstructured.Unstructured) bool {
 	if rt, found, _ := unstructured.NestedString(
 		cert.Object, "status", "renewalTime"); found {
 		if t, err := time.Parse(time.RFC3339, rt); err == nil &&
-			!t.After(time.Now().Add(certRenewalWindow)) {
+			!t.After(now.Add(certRenewalWindow)) {
 			return true
 		}
 	}
@@ -194,6 +209,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	log := logf.FromContext(ctx)
 	ns, name := cert.GetNamespace(), cert.GetName()
 	key := ns + "/" + name
+	now := r.nowFn()
 
 	orders, err := r.dyn.Resource(orderGVR).Namespace(ns).
 		List(ctx, metav1.ListOptions{})
@@ -202,13 +218,38 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		log.Error(err, "order list failed", "cert", key)
 		return false
 	}
+
+	// Attribute orders to THIS cert through the owner chain — an
+	// Order's ownerRef names its CertificateRequest and the CR's
+	// ownerRef names the Certificate (cert-manager also stamps the
+	// cert-manager.io/certificate-name ref on the CR). Picking the
+	// first pending order in the NAMESPACE would reap another cert's
+	// order while charging the reset budget to this cert. A failed
+	// CR list makes attribution impossible — fail closed.
+	crs, err := r.dyn.Resource(certificateRequestGVR).Namespace(ns).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		metrics.IncError(certReaperQueue)
+		log.Error(err, "certificaterequest list failed", "cert", key)
+		return false
+	}
+	crToCert := make(map[string]string, len(crs.Items))
+	for i := range crs.Items {
+		if certName, ok := certNameForCR(&crs.Items[i]); ok {
+			crToCert[crs.Items[i].GetName()] = certName
+		}
+	}
+
 	var stuck *unstructured.Unstructured
 	for i := range orders.Items {
 		o := &orders.Items[i]
+		if !orderOwnedByCert(o, name, crToCert) {
+			continue // not this cert's order — never ours to reap
+		}
 		if st, _, _ := unstructured.NestedString(o.Object, "status", "state"); st != "pending" {
 			continue
 		}
-		if time.Since(o.GetCreationTimestamp().Time) <= orderPendingMinAge {
+		if now.Sub(o.GetCreationTimestamp().Time) <= orderPendingMinAge {
 			continue
 		}
 		stuck = o
@@ -237,10 +278,10 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		}
 		return false
 	}
-	if !st.last.IsZero() && time.Since(st.last) < certReaperMinGap {
+	if !st.last.IsZero() && now.Sub(st.last) < certReaperMinGap {
 		log.Info("SKIP: reset rate-limited (max 1/hour)",
 			"cert", key, "order", stuck.GetName(),
-			"lastResetAgo", time.Since(st.last).Truncate(time.Minute))
+			"lastResetAgo", now.Sub(st.last).Truncate(time.Minute))
 		return false
 	}
 
@@ -251,7 +292,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		log.Error(err, "challenge list failed", "cert", key)
 		return false
 	}
-	if !stuckChallengeForOrder(stuck, chals.Items) {
+	if !stuckChallengeForOrder(stuck, chals.Items, now) {
 		log.Info("KEEP: pending order but no wedged challenge — "+
 			"issuance still progressing", "cert", key, "order", stuck.GetName())
 		return false
@@ -259,14 +300,16 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 
 	log.Info("RESET: deleting stuck pending Order — cert-manager recreates fresh",
 		"cert", key, "order", stuck.GetName())
+	stuckUID := stuck.GetUID()
 	if err := r.dyn.Resource(orderGVR).Namespace(ns).
-		Delete(ctx, stuck.GetName(), metav1.DeleteOptions{}); err != nil {
+		Delete(ctx, stuck.GetName(), metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &stuckUID}}); err != nil {
 		metrics.IncError(certReaperQueue)
 		log.Error(err, "order delete failed", "cert", key, "order", stuck.GetName())
 		return false
 	}
 	st.total++
-	st.last = time.Now()
+	st.last = now
 	// Persist the consumed reset immediately — a controller restart
 	// between sweeps must not refund it. Best-effort: the Order is
 	// already deleted, so a failed write is flagged, not fatal.
@@ -323,16 +366,53 @@ func (r *certManagerReaper) patchResetsAnnotation(ctx context.Context,
 	return err
 }
 
+// certNameForCR resolves the Certificate a CertificateRequest serves:
+// the CR's ownerRef (cert-manager always sets it) first, then the
+// cert-manager.io/certificate-name label/annotation as fallback.
+// ok=false means unattributable — the CR's Orders then match nothing.
+func certNameForCR(cr *unstructured.Unstructured) (string, bool) {
+	for _, or := range cr.GetOwnerReferences() {
+		if or.Kind == "Certificate" && or.Name != "" {
+			return or.Name, true
+		}
+	}
+	if v := cr.GetLabels()["cert-manager.io/certificate-name"]; v != "" {
+		return v, true
+	}
+	if v := cr.GetAnnotations()["cert-manager.io/certificate-name"]; v != "" {
+		return v, true
+	}
+	return "", false
+}
+
+// orderOwnedByCert reports whether the Order's CertificateRequest
+// ownerRef resolves — through the namespace's CR→Certificate map — to
+// THIS cert. An Order with no ownerRef, or whose owning CR names a
+// different cert (or resolves to nothing), is unattributable: it must
+// never be reaped on this cert's candidacy or budget.
+func orderOwnedByCert(o *unstructured.Unstructured, certName string,
+	crToCert map[string]string) bool {
+	for _, or := range o.GetOwnerReferences() {
+		if or.Kind != "CertificateRequest" {
+			continue
+		}
+		if owner, ok := crToCert[or.Name]; ok {
+			return owner == certName
+		}
+	}
+	return false
+}
+
 // stuckChallengeForOrder reports whether any Challenge in the
-// namespace is both wedged and attributable to this order. Challenges
-// that carry linkage (ownerReference or the acme order-name label)
-// must point at the order; fixtures/real objects without linkage fall
-// back to the same-namespace match.
+// namespace is both wedged and attributable to this order. Only
+// explicit linkage (ownerReference or the acme order-name
+// label/annotation naming this order) counts — a linkage-free
+// challenge is ambiguous in a shared namespace and justifies nothing.
 func stuckChallengeForOrder(order *unstructured.Unstructured,
-	chals []unstructured.Unstructured) bool {
+	chals []unstructured.Unstructured, now time.Time) bool {
 	for i := range chals {
 		ch := &chals[i]
-		if !challengeWedged(ch) {
+		if !challengeWedged(ch, now) {
 			continue
 		}
 		if challengeLinkedToOrder(ch, order) {
@@ -344,10 +424,10 @@ func stuckChallengeForOrder(order *unstructured.Unstructured,
 
 // challengeWedged is the self-check-retry-forever signature: the
 // challenge resource was presented to the ACME server and is still
-// processing, with no state transition for over 30m. Uses
+// processing, with no state transition for over 30m before now. Uses
 // status.lastTransitionTime when present (real objects do not carry
 // it — fixtures may), else creationTimestamp.
-func challengeWedged(ch *unstructured.Unstructured) bool {
+func challengeWedged(ch *unstructured.Unstructured, now time.Time) bool {
 	presented, _, _ := unstructured.NestedBool(ch.Object, "status", "presented")
 	processing, _, _ := unstructured.NestedBool(ch.Object, "status", "processing")
 	if !presented || !processing {
@@ -360,22 +440,28 @@ func challengeWedged(ch *unstructured.Unstructured) bool {
 			since = t
 		}
 	}
-	return time.Since(since) > orderPendingMinAge
+	return now.Sub(since) > orderPendingMinAge
 }
 
+// challengeLinkedToOrder requires EXPLICIT linkage — an ownerReference
+// or the acme.cert-manager.io/order-name label/annotation naming this
+// order. A challenge carrying no linkage at all could belong to a
+// different cert's order on a busy namespace: it does not count as
+// cross-check evidence for THIS order (fail closed, matching the
+// order-attribution rule above).
 func challengeLinkedToOrder(ch, order *unstructured.Unstructured) bool {
-	linked := false
 	for _, or := range ch.GetOwnerReferences() {
-		linked = true
 		if or.Name == order.GetName() {
 			return true
 		}
 	}
-	if ln, ok := ch.GetLabels()["acme.cert-manager.io/order-name"]; ok {
-		linked = true
-		if ln == order.GetName() {
-			return true
-		}
+	if ln := ch.GetLabels()["acme.cert-manager.io/order-name"]; ln != "" &&
+		ln == order.GetName() {
+		return true
 	}
-	return !linked // no linkage fields → namespace-scoped match
+	if an := ch.GetAnnotations()["acme.cert-manager.io/order-name"]; an != "" &&
+		an == order.GetName() {
+		return true
+	}
+	return false
 }

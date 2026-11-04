@@ -33,6 +33,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -232,6 +233,10 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered bool) error {
 		}
 		if _, err := n.dyn.Resource(externalSecretGVR).Namespace(es.GetNamespace()).Patch(ctx,
 			es.GetName(), types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+			// Tolerated per-ES failure: absorbed (log + continue,
+			// nil return) so it never reaches the periodic wrapper —
+			// IncError here keeps it on the alert path.
+			metrics.IncError(esNudgeQueue)
 			log.Error(err, "force-sync patch failed", "es", key)
 			continue // per-ES failures must not starve the rest
 		}
@@ -266,10 +271,10 @@ func (n *externalSecretNudge) esStoreReady(es *unstructured.Unstructured) bool {
 
 // esStoreRefs walks every store reference the ExternalSecret carries —
 // spec.secretStoreRef (the default store) plus each
-// spec.dataFrom[].sourceRef.storeRef per-entry override — invoking
-// fn(name, kind) for each ref that names a store. Refs without a name
-// are genuinely absent; generator refs (sourceRef.generatorRef) are
-// not stores and never reach fn.
+// spec.dataFrom[].sourceRef.storeRef AND spec.data[].sourceRef.storeRef
+// per-entry override — invoking fn(name, kind) for each ref that names
+// a store. Refs without a name are genuinely absent; generator refs
+// (sourceRef.generatorRef) are not stores and never reach fn.
 func esStoreRefs(es *unstructured.Unstructured, fn func(name, kind string)) {
 	if name, _, _ := unstructured.NestedString(
 		es.Object, "spec", "secretStoreRef", "name"); name != "" {
@@ -277,17 +282,21 @@ func esStoreRefs(es *unstructured.Unstructured, fn func(name, kind string)) {
 			es.Object, "spec", "secretStoreRef", "kind")
 		fn(name, kind)
 	}
-	dataFrom, _, _ := unstructured.NestedSlice(es.Object, "spec", "dataFrom")
-	for _, df := range dataFrom {
-		m, ok := df.(map[string]any)
-		if !ok {
-			continue
-		}
-		if name, _, _ := unstructured.NestedString(
-			m, "sourceRef", "storeRef", "name"); name != "" {
-			kind, _, _ := unstructured.NestedString(
-				m, "sourceRef", "storeRef", "kind")
-			fn(name, kind)
+	// dataFrom[].sourceRef.storeRef and data[].sourceRef.storeRef are
+	// the same per-entry override shape under two parent lists.
+	for _, field := range []string{"dataFrom", "data"} {
+		entries, _, _ := unstructured.NestedSlice(es.Object, "spec", field)
+		for _, e := range entries {
+			m, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			if name, _, _ := unstructured.NestedString(
+				m, "sourceRef", "storeRef", "name"); name != "" {
+				kind, _, _ := unstructured.NestedString(
+					m, "sourceRef", "storeRef", "kind")
+				fn(name, kind)
+			}
 		}
 	}
 }

@@ -149,7 +149,9 @@ func TestWatchdogPendingPodNoResync(t *testing.T) {
 
 // A stale Progressing/ProgressDeadlineExceeded condition is removed
 // via a status-subresource JSONPatch — same call the shell made with
-// `kubectl patch --subresource=status --type=json`.
+// `kubectl patch --subresource=status --type=json`, plus a "test" op
+// precondition so the remove only fires while the index still points
+// at the stale condition (TOCTOU guard).
 func TestWatchdogClearsStaleStall(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		proxyPod("proxy-1", true),
@@ -176,7 +178,8 @@ func TestWatchdogClearsStaleStall(t *testing.T) {
 	if gotType != types.JSONPatchType {
 		t.Fatalf("patch type = %v, want JSONPatchType", gotType)
 	}
-	want := `[{"op":"remove","path":"/status/conditions/1"}]`
+	want := `[{"op":"test","path":"/status/conditions/1/reason","value":"ProgressDeadlineExceeded"},` +
+		`{"op":"remove","path":"/status/conditions/1"}]`
 	if string(gotPatch) != want {
 		t.Fatalf("patch body = %s, want %s", gotPatch, want)
 	}

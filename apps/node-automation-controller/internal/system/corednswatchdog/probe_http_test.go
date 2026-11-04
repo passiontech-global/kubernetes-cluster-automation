@@ -108,6 +108,47 @@ func TestCoreDNSPanics(t *testing.T) {
 		}
 	})
 
+	t.Run("non-200 body still drained before close", func(t *testing.T) {
+		// The early status return must not skip the drain — an
+		// unread body makes the connection unreusable, which
+		// silently defeats keep-alive on the shared transport.
+		body := strings.Repeat("e", 64*1024)
+		tb := &testutil.TrackingBody{R: strings.NewReader(body)}
+		httpc := &http.Client{Transport: &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 500, Body: tb, Header: http.Header{}}, nil
+		}}}
+		w := &coreDNSWatchdog{http: httpc}
+		if _, ok := w.panics(ctx, "10.9.9.9"); ok {
+			t.Fatal("5xx scrape reported as known")
+		}
+		if !tb.Closed {
+			t.Fatal("body never closed")
+		}
+		if tb.N != len(body) {
+			t.Fatalf("closed after %d/%d bytes — undrained body defeats keep-alive",
+				tb.N, len(body))
+		}
+	})
+
+	t.Run("oversized body tail drained before close", func(t *testing.T) {
+		// The scanner stops at the 4MiB cap; the deferred drain must
+		// still consume the tail so keep-alive survives a fat scrape.
+		body := strings.Repeat("x", 5*1024*1024)
+		tb := &testutil.TrackingBody{R: strings.NewReader(body)}
+		httpc := &http.Client{Transport: &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: tb, Header: http.Header{}}, nil
+		}}}
+		w := &coreDNSWatchdog{http: httpc}
+		_, _ = w.panics(ctx, "10.9.9.9")
+		if !tb.Closed {
+			t.Fatal("body never closed")
+		}
+		if tb.N != len(body) {
+			t.Fatalf("closed after %d/%d bytes — undrained tail defeats keep-alive",
+				tb.N, len(body))
+		}
+	})
+
 	t.Run("truncated body is unknown", func(t *testing.T) {
 		httpc := &http.Client{Transport: &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
 			return &http.Response{

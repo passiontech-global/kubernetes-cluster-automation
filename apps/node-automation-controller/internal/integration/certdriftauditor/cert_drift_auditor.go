@@ -71,6 +71,9 @@ const (
 	// injectCAFromSecretAnno carries "namespace/secretName" — a direct
 	// reference, no Certificate hop.
 	injectCAFromSecretAnno = "cert-manager.io/inject-ca-from-secret"
+	// certDriftListPage caps each cluster-wide List response — the
+	// all-namespaces TLS-secret read is unbounded.
+	certDriftListPage = 500
 )
 
 // certificateGVR resolves a Certificate's spec.secretName — the only
@@ -445,43 +448,53 @@ func validatingEntries(ws []admissionv1.ValidatingWebhook) []webhookEntry {
 
 func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	secrets, err := a.cs.CoreV1().Secrets(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{
-			FieldSelector: "type=kubernetes.io/tls",
-		})
-	if err != nil {
-		return fmt.Errorf("list tls secrets: %w", err)
-	}
 
 	current := map[secretMetricKey]bool{}
-	for i := range secrets.Items {
-		s := &secrets.Items[i]
-		// Belt-and-suspenders: the type field selector is applied
-		// server-side on a real apiserver, but fake clientsets ignore
-		// it — an in-code check keeps both honest (same rule as the
-		// pod-phase filter in cilium_identity_auditor).
-		if s.Type != corev1.SecretTypeTLS {
-			continue
-		}
-		block, _ := pem.Decode(s.Data["tls.crt"])
-		if block == nil {
-			log.Info("skip: tls secret carries no decodable tls.crt PEM",
-				"secret", s.Namespace+"/"+s.Name)
-			continue
-		}
-		cert, err := x509.ParseCertificate(block.Bytes)
+	// Server-side type filter + continue-token pagination: the
+	// all-namespaces secret read is the biggest this module makes —
+	// page it at certDriftListPage so no single response dominates.
+	opts := metav1.ListOptions{
+		FieldSelector: "type=kubernetes.io/tls",
+		Limit:         certDriftListPage,
+	}
+	for {
+		page, err := a.cs.CoreV1().Secrets(metav1.NamespaceAll).List(ctx, opts)
 		if err != nil {
-			log.Error(err, "tls.crt parse failed",
-				"secret", s.Namespace+"/"+s.Name)
-			continue
+			return fmt.Errorf("list tls secrets: %w", err)
 		}
-		key := secretMetricKey{s.Namespace, s.Name}
-		current[key] = true
-		// Days, not seconds — the alert budget this feeds ("fires
-		// <30d, pages <7d") thinks in days; negatives mean expired.
-		days := cert.NotAfter.Sub(a.nowFn()).Hours() / 24
-		metrics.TLSSecretDaysToExpiry.
-			WithLabelValues(s.Namespace, s.Name).Set(days)
+		for i := range page.Items {
+			s := &page.Items[i]
+			// Belt-and-suspenders: the type field selector is applied
+			// server-side on a real apiserver, but fake clientsets
+			// ignore it — an in-code check keeps both honest (same
+			// rule as the pod-phase filter in cilium_identity_auditor).
+			if s.Type != corev1.SecretTypeTLS {
+				continue
+			}
+			block, _ := pem.Decode(s.Data["tls.crt"])
+			if block == nil {
+				log.Info("skip: tls secret carries no decodable tls.crt PEM",
+					"secret", s.Namespace+"/"+s.Name)
+				continue
+			}
+			cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				log.Error(err, "tls.crt parse failed",
+					"secret", s.Namespace+"/"+s.Name)
+				continue
+			}
+			key := secretMetricKey{s.Namespace, s.Name}
+			current[key] = true
+			// Days, not seconds — the alert budget this feeds ("fires
+			// <30d, pages <7d") thinks in days; negatives mean expired.
+			days := cert.NotAfter.Sub(a.nowFn()).Hours() / 24
+			metrics.TLSSecretDaysToExpiry.
+				WithLabelValues(s.Namespace, s.Name).Set(days)
+		}
+		if page.Continue == "" {
+			break
+		}
+		opts.Continue = page.Continue
 	}
 
 	// Prune series for secrets gone (or no longer parseable) since the

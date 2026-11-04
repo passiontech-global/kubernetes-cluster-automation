@@ -61,6 +61,11 @@ const (
 	// be absent before the slice is reaped — a single bad snapshot
 	// can never delete.
 	orphanEndpointSliceStreak = 2
+	// orphanEndpointSliceListPageSize bounds each cluster-wide
+	// Service/EndpointSlice List page — continue-token pagination
+	// keeps a large endpoint fleet from arriving as one giant
+	// response body.
+	orphanEndpointSliceListPageSize = 500
 )
 
 type orphanEndpointSliceCleaner struct {
@@ -110,35 +115,57 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	// "deleted" truth. An error or an empty list aborts the run —
 	// every cluster has at least the default/kubernetes Service, so
 	// an empty answer is an apiserver/RBAC flap, never a real state.
-	svcList, err := c.cs.CoreV1().Services(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list services (API flap) — abort: %w", err)
+	svcCount := 0
+	services := map[string]bool{}
+	cont := ""
+	for {
+		page, err := c.cs.CoreV1().Services(metav1.NamespaceAll).
+			List(ctx, metav1.ListOptions{
+				Limit: orphanEndpointSliceListPageSize, Continue: cont})
+		if err != nil {
+			return fmt.Errorf("list services (API flap) — abort: %w", err)
+		}
+		for _, s := range page.Items {
+			services[s.Namespace+"/"+s.Name] = true
+		}
+		svcCount += len(page.Items)
+		if cont = page.Continue; cont == "" {
+			break
+		}
 	}
-	if len(svcList.Items) == 0 {
+	if svcCount == 0 {
 		return fmt.Errorf("empty service list (API flap) — abort")
 	}
-	services := make(map[string]bool, len(svcList.Items))
-	for _, s := range svcList.Items {
-		services[s.Namespace+"/"+s.Name] = true
-	}
-	svcList = nil
 
 	// Server-side label filter; the in-code check stays because
 	// fake clientsets ignore ListOptions selectors.
-	slices, err := c.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{
-			LabelSelector: discoveryv1.LabelServiceName,
-		})
-	if err != nil {
-		return fmt.Errorf("list endpointslices: %w", err)
+	var slices []discoveryv1.EndpointSlice
+	for {
+		page, err := c.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).
+			List(ctx, metav1.ListOptions{
+				LabelSelector: discoveryv1.LabelServiceName,
+				Limit:         orphanEndpointSliceListPageSize,
+				Continue:      cont,
+			})
+		if err != nil {
+			return fmt.Errorf("list endpointslices: %w", err)
+		}
+		slices = append(slices, page.Items...)
+		if cont = page.Continue; cont == "" {
+			break
+		}
 	}
 
 	now := c.nowFn()
 	absentNow := map[string]bool{}
 	deleted := 0
-	for i := range slices.Items {
-		s := &slices.Items[i]
+	for i := range slices {
+		s := &slices[i]
+		if s.DeletionTimestamp != nil {
+			// Already terminating — the API owns it now; it must not
+			// feed the streak ledger or the delete count.
+			continue
+		}
 		svcName := s.Labels[discoveryv1.LabelServiceName]
 		if svcName == "" {
 			continue // no owning Service label — not ours to judge

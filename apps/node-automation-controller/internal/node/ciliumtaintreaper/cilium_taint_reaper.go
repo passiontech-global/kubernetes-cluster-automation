@@ -133,10 +133,21 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 				"node", node.Name)
 			continue
 		}
-		pod := &pods.Items[0]
-		if ciliumPodHealthy(pod) {
+		// The verdict must read EVERY cilium pod on the node — during
+		// a rollout the old (terminating/unready) and new agents can
+		// coexist, and reading only Items[0] makes the outcome depend
+		// on apiserver list order. ANY healthy agent means the taint
+		// is stale; reap only then.
+		var healthy *corev1.Pod
+		for i := range pods.Items {
+			if ciliumPodHealthy(&pods.Items[i]) {
+				healthy = &pods.Items[i]
+				break
+			}
+		}
+		if healthy != nil {
 			log.Info("REAP: agent healthy but stale taint -> removing",
-				"node", node.Name, "pod", pod.Name)
+				"node", node.Name, "pod", healthy.Name)
 			if err := shared.UntaintNode(ctx, r.cs, node.Name, ciliumNotReadyTaint); err != nil {
 				metrics.IncError("cilium-taint-reaper")
 				return ctrl.Result{}, fmt.Errorf("remove taint %s on node %s: %w",
@@ -144,8 +155,10 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 			}
 			reaped++
 		} else {
-			log.Info("KEEP: agent not healthy -> taint is doing its job",
-				"node", node.Name, "pod", pod.Name,
+			pod := &pods.Items[0] // first pod, for diagnostics only
+			log.Info("KEEP: no healthy agent -> taint is doing its job",
+				"node", node.Name, "pods", len(pods.Items),
+				"pod", pod.Name,
 				"phase", pod.Status.Phase,
 				"terminating", pod.DeletionTimestamp != nil,
 				"ready", shared.PodReadyCond(pod))

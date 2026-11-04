@@ -26,7 +26,8 @@
 // A backend is wedged when ANY of:
 //   - live_rv - cache_rv >= 200 for 2 consecutive cycles, or
 //   - cache_rv unchanged for 3 cycles while live_rv advanced, or
-//   - the probe errored (timeout / non-2xx incl. 5xx) this cycle.
+//   - the probe errored (timeout / non-2xx incl. 5xx) for 2
+//     consecutive cycles.
 //
 // When a wedged backend has >= 1 OTHER backend healthy this cycle, its
 // IP is pulled out of Endpoints + EndpointSlice and recorded in the
@@ -122,6 +123,13 @@ const (
 	endpointGuardGapCycles          = 2               // consecutive gapped cycles before wedge
 	endpointGuardFrozenCyc          = 3               // cache_rv frozen cycles (live_rv growing)
 	endpointGuardRecoverCyc         = 2               // consecutive healthy cycles to re-add
+	// endpointGuardExpireCyc: consecutive probe-error cycles after
+	// which a quarantined IP that is ALSO absent from the current
+	// address sets is declared decommissioned and dropped from
+	// quarantine — ~5m at the 10s quarantine cadence. Without the
+	// expiry a dead IP pins quarantineActive (and the fast cadence)
+	// forever.
+	endpointGuardExpireCyc = 30
 	// endpointGuardMinBackends: clusters with fewer controller IPs than
 	// this get probe+log+metrics only — editing endpoints there can only
 	// empty the set (production/cicd run a single controller).
@@ -352,6 +360,13 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 		}
 	}
 
+	// Mirror slices are never the write SSOT while Endpoints exists
+	// (the mirroring controller reverts edits), but when Endpoints
+	// is GONE the mirror is the only readable source of backend IPs
+	// — probing must keep working even though the quarantine edit it
+	// may land is futile (reverted next reconcile). Erroring out
+	// here instead would blind the probe entirely for as long as
+	// the Endpoints object stays absent, which is strictly worse.
 	useSlice := primary != nil &&
 		(ep == nil || (preferSlice && !mirrorManagedSlice(primary)))
 	if !useSlice && ep == nil {
@@ -360,12 +375,15 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	}
 
 	var activeIPs []string
+	var routableIPs map[string]bool
 	var quarantinedIPs map[string]bool
 	if useSlice {
 		activeIPs = slicesIPs(epsList)
+		routableIPs = routableSliceIPs(epsList)
 		quarantinedIPs = parseQuarantineAnnotation(primary)
 	} else {
 		activeIPs = endpointIPs(ep)
+		routableIPs = routableEndpointIPs(ep)
 		quarantinedIPs = parseQuarantineAnnotation(ep)
 	}
 	// The endpoints reconciler may rebuild the SSOT object wholesale
@@ -446,10 +464,44 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 		}
 	}
 
+	// ---- Quarantine expiry ------------------------------------------
+	// A permanently decommissioned backend never recovers AND the
+	// endpoints reconciler stops re-adding it: absent from the current
+	// address sets while probe-erring continuously for
+	// endpointGuardExpireCyc cycles means it is never coming back, so
+	// it drops out of the quarantine set (annotation rewrite below +
+	// memQuarantine) instead of pinning a dead IP — and the 10s
+	// re-apply cadence — forever. This is decided BEFORE the
+	// min-backends gate: the expiry only shrinks the annotation, a
+	// write that can never empty the endpoint set, so it stays legal
+	// where address edits are banned — and its bookkeeping can never
+	// deadlock behind the early return.
+	var toExpire []string
+	for _, ip := range slices.Sorted(maps.Keys(quarantinedIPs)) {
+		if slices.Contains(activeIPs, ip) {
+			continue // the reconciler re-added it — still a live backend
+		}
+		if st := g.backends[ip]; st != nil && st.errStreak >= endpointGuardExpireCyc {
+			toExpire = append(toExpire, ip)
+		}
+	}
+	for _, ip := range toExpire {
+		delete(quarantinedIPs, ip)
+		delete(g.backends, ip)
+		metrics.ForgetAPIBackend(ip)
+		log.Info("EXPIRE-QUARANTINE: backend absent from endpoints and unreachable — dropping quarantine",
+			"ip", ip, "errCycles", endpointGuardExpireCyc)
+	}
+	if len(toExpire) > 0 {
+		g.memQuarantine = maps.Clone(quarantinedIPs)
+		g.quarantineActive = len(quarantinedIPs) > 0
+	}
+
 	// Fewer than 2 controller IPs total (single-controller clusters):
 	// the probe streaks/metrics above still ran, but edits here can
-	// only empty the endpoint set — hard no-op.
-	if len(allIPs) < endpointGuardMinBackends {
+	// only empty the endpoint set — hard no-op, EXCEPT the annotation
+	// shrink a quarantine expiry asks for.
+	if len(allIPs) < endpointGuardMinBackends && len(toExpire) == 0 {
 		log.Info("sweep done: single-controller cluster — probe only, no edits",
 			"backends", allIPs)
 		return nil
@@ -457,11 +509,17 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 
 	// ---- Decide removals -------------------------------------------------
 	// A wedged active IP may be quarantined only while at least one
-	// OTHER active IP is healthy this cycle — processed in sorted order
-	// so a multi-wedge cycle can never remove the last healthy backend.
+	// OTHER ROUTABLE IP is healthy this cycle — processed in sorted
+	// order so a multi-wedge cycle can never remove the last healthy
+	// backend. "Routable" excludes notReadyAddresses / Ready=false
+	// slice endpoints: kube-proxy never routes to them, so a notReady
+	// backend that happens to probe fine must not vouch for pulling
+	// the last Ready endpoint — that would flap kubernetes.default to
+	// zero routable addresses (notReady suspects are still probed and
+	// quarantined above; only the healthy-peer accounting changes).
 	var toRemove []string
 	healthyActive := 0
-	for _, ip := range activeIPs {
+	for ip := range routableIPs {
 		if results[ip].healthy {
 			healthyActive++
 		}
@@ -489,7 +547,7 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 		}
 	}
 
-	if len(toRemove) == 0 && len(toAdd) == 0 {
+	if len(toRemove) == 0 && len(toAdd) == 0 && len(toExpire) == 0 {
 		log.Info("sweep done", "backends", len(allIPs), "healthyActive", healthyActive,
 			"quarantined", len(quarantinedIPs))
 		return nil
@@ -865,6 +923,20 @@ func endpointIPs(ep *corev1.Endpoints) []string {
 	return slices.Sorted(maps.Keys(set))
 }
 
+// routableEndpointIPs returns the IPs kube-proxy actually routes to:
+// subsets[].Addresses ONLY — a notReadyAddresses entry is probed and
+// quarantined like any backend, but it can never serve traffic, so it
+// must not count as a healthy peer when deciding removals.
+func routableEndpointIPs(ep *corev1.Endpoints) map[string]bool {
+	set := map[string]bool{}
+	for _, sub := range ep.Subsets {
+		for _, a := range sub.Addresses {
+			set[a.IP] = true
+		}
+	}
+	return set
+}
+
 // parseQuarantineAnnotation reads node.ops/quarantined-endpoints off
 // whichever object is the SSOT this cluster (Endpoints <1.33,
 // EndpointSlice >=1.33).
@@ -982,6 +1054,25 @@ func sliceIPs(eps *discoveryv1.EndpointSlice) []string {
 		}
 	}
 	return slices.Sorted(maps.Keys(set))
+}
+
+// routableSliceIPs unions the addresses of READY endpoints across the
+// resolved slices — the slice-side routable set (a nil
+// conditions.ready counts as ready: the field defaults to true
+// server-side). Ready=false endpoints stay in activeIPs for probing
+// and quarantine but never vouch as a healthy peer.
+func routableSliceIPs(list []*discoveryv1.EndpointSlice) map[string]bool {
+	set := map[string]bool{}
+	for _, s := range list {
+		for _, e := range s.Endpoints {
+			if e.Conditions.Ready == nil || *e.Conditions.Ready {
+				for _, a := range e.Addresses {
+					set[a] = true
+				}
+			}
+		}
+	}
+	return set
 }
 
 // removeSliceIP drops ip from every endpoint's addresses in the slice;

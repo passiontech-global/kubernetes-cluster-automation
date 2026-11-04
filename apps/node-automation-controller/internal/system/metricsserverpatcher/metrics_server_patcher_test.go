@@ -141,6 +141,14 @@ func TestMetricsServerNeedsPatch(t *testing.T) {
 			d.Spec.Template.Spec.Containers[0].Args =
 				d.Spec.Template.Spec.Containers[0].Args[:5]
 		}), 0, true},
+		// The patch replaces args wholesale, so an arg that is not in
+		// the pinned set is drift too — checking only for presence of
+		// pinned args would leave it (and the rest of the spec it
+		// hides) unpatched forever.
+		{"extra arg present", mutate(func(d *appsv1.Deployment) {
+			d.Spec.Template.Spec.Containers[0].Args = append(
+				d.Spec.Template.Spec.Containers[0].Args, "--v=4")
+		}), 0, true},
 		{"nil liveness probe", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.Containers[0].LivenessProbe = nil
 		}), 0, true},
@@ -163,6 +171,25 @@ func TestMetricsServerNeedsPatch(t *testing.T) {
 				{Key: "node-role.kubernetes.io/control-plane",
 					Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
 			}
+		}), 0, true},
+		// .spec.tolerations is +listType=atomic — the patch wipes the
+		// whole list, so an extra (non-wildcard) toleration beyond the
+		// pinned set is drift, not something to silently tolerate.
+		{"extra toleration present", mutate(func(d *appsv1.Deployment) {
+			d.Spec.Template.Spec.Tolerations = append(
+				d.Spec.Template.Spec.Tolerations,
+				corev1.Toleration{Key: "example.com/extra",
+					Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule})
+		}), 0, true},
+		// A tolerationSeconds injected onto a wanted toleration by
+		// another actor changes what the pod tolerates — and the
+		// atomic-list patch would wipe it — so it must read as drift.
+		{"tolerationSeconds injected", mutate(func(d *appsv1.Deployment) {
+			// Tolerations aliases the package-level wanted set —
+			// clone before mutating or the fixture corrupts it.
+			tols := append([]corev1.Toleration(nil), d.Spec.Template.Spec.Tolerations...)
+			tols[2].TolerationSeconds = ptr.To(int64(300))
+			d.Spec.Template.Spec.Tolerations = tols
 		}), 0, true},
 		{"hostname constraint missing", mutate(func(d *appsv1.Deployment) {
 			d.Spec.Template.Spec.TopologySpreadConstraints =
@@ -317,6 +344,31 @@ func TestMetricsServerPatcherNoOpWhenCorrect(t *testing.T) {
 	}
 	if patched {
 		t.Fatal("patched an already-correct Deployment")
+	}
+	if res.RequeueAfter != 15*time.Minute {
+		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
+	}
+}
+
+// A Deployment without the metrics-server container reads as drift,
+// but the patch merges containers by name and would append a
+// container entry with NO image — the apiserver rejects it forever.
+// The reconciler must skip with a warn, never attempt the patch.
+func TestMetricsServerPatcherMissingContainerNoPatch(t *testing.T) {
+	d := metricsServerDeploy()
+	d.Spec.Template.Spec.Containers = nil
+	cs := fake.NewSimpleClientset(d)
+	var patched bool
+	testutil.ForbidDeployPatch(cs, &patched)
+
+	r := &metricsServerPatcher{cs: cs}
+	res, err := r.Reconcile(ctx, reconcile.Request{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if patched {
+		t.Fatal("patched a Deployment whose metrics-server container is absent — " +
+			"the name-only container entry has no image and the apiserver rejects it")
 	}
 	if res.RequeueAfter != 15*time.Minute {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)

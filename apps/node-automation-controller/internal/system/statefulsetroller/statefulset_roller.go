@@ -53,6 +53,7 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
@@ -123,10 +124,22 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 		r.driftSince = map[string]time.Time{}
 	}
 
-	stsList, err := r.cs.AppsV1().StatefulSets(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list statefulsets: %w", err)
+	// Page the cluster-wide list — an unbounded List forces etcd to
+	// serialize every StatefulSet into one response; 500-per-page
+	// keeps each request cheap at fleet scale.
+	var stsItems []appsv1.StatefulSet
+	cont := ""
+	for {
+		page, err := r.cs.AppsV1().StatefulSets(metav1.NamespaceAll).
+			List(ctx, metav1.ListOptions{Limit: 500, Continue: cont})
+		if err != nil {
+			return fmt.Errorf("list statefulsets: %w", err)
+		}
+		stsItems = append(stsItems, page.Items...)
+		if page.Continue == "" {
+			break
+		}
+		cont = page.Continue
 	}
 
 	now := r.nowFn()
@@ -139,8 +152,8 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 		key string
 	}
 	var due []candidate
-	for i := range stsList.Items {
-		sts := &stsList.Items[i]
+	for i := range stsItems {
+		sts := &stsItems[i]
 		key := sts.Namespace + "/" + sts.Name
 		if sts.Spec.UpdateStrategy.Type != "OnDelete" ||
 			sts.Annotations[stsAutoRollAnno] != "true" ||
@@ -191,7 +204,7 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 
 	rolled := 0
 	for _, d := range due {
-		sts := &stsList.Items[d.idx]
+		sts := &stsItems[d.idx]
 		if err := r.rollOne(ctx, sts, now, log); err != nil {
 			// Per-STS failures must not starve the rest — tolerated
 			// sub-operation failure, counted here so the nil return
@@ -266,15 +279,25 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 
 	// Gate 2: every PDB in the namespace selecting this pod must
 	// allow a disruption — a 0 means the workload is already at its
-	// floor and eviction would refuse the delete anyway.
-	pdbs, err := r.cs.PolicyV1().PodDisruptionBudgets(sts.Namespace).
-		List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w",
-			sts.Namespace, err)
+	// floor and eviction would refuse the delete anyway. Paged like
+	// the StatefulSet list above.
+	var pdbItems []policyv1.PodDisruptionBudget
+	cont := ""
+	for {
+		page, err := r.cs.PolicyV1().PodDisruptionBudgets(sts.Namespace).
+			List(ctx, metav1.ListOptions{Limit: 500, Continue: cont})
+		if err != nil {
+			return fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w",
+				sts.Namespace, err)
+		}
+		pdbItems = append(pdbItems, page.Items...)
+		if page.Continue == "" {
+			break
+		}
+		cont = page.Continue
 	}
-	for i := range pdbs.Items {
-		pdb := &pdbs.Items[i]
+	for i := range pdbItems {
+		pdb := &pdbItems[i]
 		sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
 		if err != nil {
 			log.Info("WARN: PDB selector unparseable — treating as matching (fail closed)",
@@ -293,31 +316,51 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 		}
 	}
 
-	log.Info("DELETE: roll OnDelete StatefulSet — highest stale ordinal",
+	log.Info("EVICT: roll OnDelete StatefulSet — highest stale ordinal",
 		"statefulset", sts.Namespace+"/"+sts.Name,
 		"pod", candidate.Name,
 		"updateRevision", sts.Status.UpdateRevision,
 		"currentRevision", sts.Status.CurrentRevision)
-	if err := r.cs.CoreV1().Pods(sts.Namespace).
-		Delete(ctx, candidate.Name, metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("delete pod %s/%s: %w", sts.Namespace, candidate.Name, err)
+	// Evict through the policy/v1 subresource, NOT a raw pod delete:
+	// the apiserver enforces the PDB budget and consumes a disruption
+	// slot atomically — the gate-2 pre-check above stays as a
+	// fast-path skip, and a refused eviction just errors this STS's
+	// roll (retried next sweep, no pod lost).
+	ev := &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: candidate.Name, Namespace: sts.Namespace},
+	}
+	if err := r.cs.PolicyV1().Evictions(sts.Namespace).
+		Evict(ctx, ev); err != nil {
+		return fmt.Errorf("evict pod %s/%s: %w", sts.Namespace, candidate.Name, err)
 	}
 	metrics.StatefulSetOnDeletePodsRolledTotal.
 		WithLabelValues(sts.Namespace, sts.Name).Inc()
 	return nil
 }
 
-// ownedPods lists the pods the StatefulSet controls — matched by the
-// controller ownerReference (name+kind, not UID: fake clients and
-// hand-built fixtures rarely carry matching UIDs). Pods already
-// terminating are excluded: they are never delete candidates (the
-// delete is already in flight) and they must not block the all-Ready
-// gate either — a member wedged in Terminating (finalizer, lost
-// node) would pin the roll forever, while a real mid-deletion
-// disruption is still caught by the PDB gate's disruptionsAllowed.
+// ownedPods lists the pods the StatefulSet controls — the apiserver
+// pre-filters by the STS's own spec.selector (without it every STS
+// would drag the whole namespace's pod list across the wire per
+// sweep), then the controller ownerReference decides (name+kind, not
+// UID: fake clients and hand-built fixtures rarely carry matching
+// UIDs). A selector that fails to parse fails CLOSED — an error
+// skips this STS rather than rolling it on an unfiltered pod list.
+// Pods already terminating are excluded: they are never delete
+// candidates (the delete is already in flight) and they must not
+// block the all-Ready gate either — a member wedged in Terminating
+// (finalizer, lost node) would pin the roll forever, while a real
+// mid-deletion disruption is still caught by the PDB gate's
+// disruptionsAllowed.
 func (r *statefulSetOnDeleteRoller) ownedPods(ctx context.Context,
 	sts *appsv1.StatefulSet) ([]*corev1.Pod, error) {
-	list, err := r.cs.CoreV1().Pods(sts.Namespace).List(ctx, metav1.ListOptions{})
+	sel, err := metav1.LabelSelectorAsSelector(sts.Spec.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("parse selector of statefulset %s/%s: %w",
+			sts.Namespace, sts.Name, err)
+	}
+	list, err := r.cs.CoreV1().Pods(sts.Namespace).List(ctx,
+		metav1.ListOptions{LabelSelector: sel.String()})
 	if err != nil {
 		return nil, fmt.Errorf("list pods in %s: %w", sts.Namespace, err)
 	}

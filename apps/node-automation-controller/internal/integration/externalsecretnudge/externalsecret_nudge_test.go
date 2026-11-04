@@ -15,6 +15,7 @@ import (
 	kfake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 	ktesting "k8s.io/client-go/testing"
 )
 
@@ -78,6 +79,23 @@ func esDataFromStoreRef(es *unstructured.Unstructured, kind, name string) {
 	_ = unstructured.SetNestedSlice(es.Object, []any{
 		map[string]any{"sourceRef": map[string]any{"storeRef": ref}},
 	}, "spec", "dataFrom")
+}
+
+// esDataStoreRef appends a spec.data[] entry whose sourceRef.storeRef
+// overrides the store for that key — the third store-reference shape,
+// sibling to the dataFrom override.
+func esDataStoreRef(es *unstructured.Unstructured, kind, name string) {
+	ref := map[string]any{"name": name}
+	if kind != "" {
+		ref["kind"] = kind
+	}
+	_ = unstructured.SetNestedSlice(es.Object, []any{
+		map[string]any{
+			"secretKey": "k",
+			"remoteRef": map[string]any{"key": "k"},
+			"sourceRef": map[string]any{"storeRef": ref},
+		},
+	}, "spec", "data")
 }
 
 func esAnnotation(t *testing.T, dyn *fake.FakeDynamicClient, gvr schema.GroupVersionResource, ns, name, anno string) string {
@@ -455,7 +473,8 @@ func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 
 // A per-ES patch failure is logged and the sweep continues to the
 // next ExternalSecret — it must neither error the run nor record a
-// delivered nudge.
+// delivered nudge, and the absorbed failure still IncErrors once (the
+// run returns nil so the periodic wrapper never sees it).
 func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 	dyn := newDynFake(
 		esObj("apps", "es-bad", "False", 30*time.Minute),
@@ -468,6 +487,7 @@ func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 			return false, nil, nil
 		})
 	n := newNudge(dyn, true)
+	before := testutil.QueueErrorCount(t, esNudgeQueue)
 	if err := n.nudge(ctx, true); err != nil {
 		t.Fatalf("per-ES patch failure must not fail the nudge: %v", err)
 	}
@@ -476,6 +496,9 @@ func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 	}
 	if _, ok := n.nudged["apps/es-good"]; !ok {
 		t.Fatal("healthy patch skipped after a sibling's failure")
+	}
+	if got := testutil.QueueErrorCount(t, esNudgeQueue) - before; got != 1 {
+		t.Fatalf("absorbed patch failure did not IncError once, delta %v", got)
 	}
 }
 
@@ -512,10 +535,19 @@ func TestExternalSecretNudgeStateBasedWithoutEdge(t *testing.T) {
 	mixedNamespaced := esObj("apps", "es-mixed-namespaced", "False", time.Hour)
 	esStoreRef(mixedNamespaced, "ClusterSecretStore", "css1")
 	esDataFromStoreRef(mixedNamespaced, "SecretStore", "ss-ns")
+	// No top-level secretStoreRef — the ES's only store link is a
+	// spec.data[].sourceRef.storeRef override pointing at the ready CSS.
+	viaData := esObj("apps", "es-via-data", "False", time.Hour)
+	esDataStoreRef(viaData, "ClusterSecretStore", "css1")
+	// Default store healthy but a spec.data[] override hangs off the
+	// BROKEN store — same conservative skip as the dataFrom variant.
+	mixedDataBroken := esObj("apps", "es-mixed-data-broken", "False", time.Hour)
+	esStoreRef(mixedDataBroken, "ClusterSecretStore", "css1")
+	esDataStoreRef(mixedDataBroken, "ClusterSecretStore", "css2")
 	dyn := newDynFake(
 		cssObj("css1", "True"), cssObj("css2", "False"),
 		stuck, other, namespaced, defaulted, broken,
-		viaDataFrom, mixedBroken, mixedNamespaced)
+		viaDataFrom, mixedBroken, mixedNamespaced, viaData, mixedDataBroken)
 	n := newNudge(dyn, true)
 
 	if err := n.run(ctx); err != nil { // seeds both stores, no edge
@@ -530,9 +562,12 @@ func TestExternalSecretNudgeStateBasedWithoutEdge(t *testing.T) {
 	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-via-datafrom", esForceSyncAnno); got == "" {
 		t.Fatal("ES whose only store ref is a dataFrom CSS override not nudged")
 	}
+	if got := esAnnotation(t, dyn, externalSecretGVR, "apps", "es-via-data", esForceSyncAnno); got == "" {
+		t.Fatal("ES whose only store ref is a spec.data[] CSS override not nudged")
+	}
 	for _, name := range []string{
 		"es-other-store", "es-namespaced", "es-default-kind", "es-broken-store",
-		"es-mixed-broken", "es-mixed-namespaced"} {
+		"es-mixed-broken", "es-mixed-namespaced", "es-mixed-data-broken"} {
 		if got := esAnnotation(t, dyn, externalSecretGVR, "apps", name, esForceSyncAnno); got != "" {
 			t.Fatalf("ES %s nudged although its referenced store is not Ready=True", name)
 		}

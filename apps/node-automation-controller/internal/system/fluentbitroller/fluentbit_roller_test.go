@@ -76,33 +76,14 @@ func rolledHash(s *corev1.Secret) string {
 	return s.Annotations["passiontech.dev/rolled-config-hash"]
 }
 
-// FLUENTBIT_ROLLER_ENABLED=false: never touches anything, even with
-// obvious drift on the secret.
-func TestFluentBitRollerDisabled(t *testing.T) {
-	cs := fake.NewSimpleClientset(
-		pipelineSecret(map[string]string{"fluent.io/config-hash": "h1"}),
-		testutil.Node("n1", corev1.ConditionTrue, nil),
-		fluentBitDS(2, 2, 3, 3))
-	r := &fluentBitRoller{cs: cs, enabled: false}
-	res, err := r.Reconcile(ctx, reconcile.Request{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.RequeueAfter != 30*time.Minute {
-		t.Fatalf("expected 30m requeue, got %s", res.RequeueAfter)
-	}
-	if got := dsRestartedAt(getFluentBitDS(t, cs)); got != "" {
-		t.Fatalf("disabled roller restarted the DS: %q", got)
-	}
-	if got := rolledHash(getPipelineSecret(t, cs)); got != "" {
-		t.Fatalf("disabled roller wrote rolled-config-hash: %q", got)
-	}
-}
+// FLUENTBIT_ROLLER_ENABLED=false means Setup never registers the
+// reconciler (see TestSetupDisabled) — there is no in-Reconcile
+// disabled path to test.
 
 // No pipeline secret on this cluster — NotFound is a clean no-op.
 func TestFluentBitRollerSecretAbsent(t *testing.T) {
 	cs := fake.NewSimpleClientset()
-	r := &fluentBitRoller{cs: cs, enabled: true}
+	r := &fluentBitRoller{cs: cs}
 	res, err := r.Reconcile(ctx, reconcile.Request{})
 	if err != nil {
 		t.Fatal(err)
@@ -121,7 +102,7 @@ func TestFluentBitRollerNoDrift(t *testing.T) {
 		}),
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		fluentBitDS(2, 2, 3, 3))
-	r := &fluentBitRoller{cs: cs, enabled: true}
+	r := &fluentBitRoller{cs: cs}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +129,7 @@ func TestFluentBitRollerRollsOnDrift(t *testing.T) {
 				testutil.Node("n1", corev1.ConditionTrue, nil),
 				testutil.Node("n2", corev1.ConditionTrue, nil),
 				fluentBitDS(2, 2, 3, 3))
-			r := &fluentBitRoller{cs: cs, enabled: true}
+			r := &fluentBitRoller{cs: cs}
 			res, err := r.Reconcile(ctx, reconcile.Request{})
 			if err != nil {
 				t.Fatal(err)
@@ -184,7 +165,7 @@ func TestFluentBitRollerSkipsOnNotReadyNode(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		testutil.Node("n2", corev1.ConditionFalse, nil),
 		fluentBitDS(2, 2, 3, 3))
-	r := &fluentBitRoller{cs: cs, enabled: true}
+	r := &fluentBitRoller{cs: cs}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +188,7 @@ func TestFluentBitRollerSkipsWhileDSUnsettled(t *testing.T) {
 				pipelineSecret(map[string]string{"fluent.io/config-hash": "h1"}),
 				testutil.Node("n1", corev1.ConditionTrue, nil),
 				ds)
-			r := &fluentBitRoller{cs: cs, enabled: true}
+			r := &fluentBitRoller{cs: cs}
 			if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 				t.Fatal(err)
 			}
@@ -222,24 +203,72 @@ func TestFluentBitRollerSkipsWhileDSUnsettled(t *testing.T) {
 }
 
 // Older fluent-operators never write fluent.io/config-hash — the
-// secret's resourceVersion is the fallback drift hash (bash parity),
-// and it is what gets recorded as rolled.
+// drift hash falls back to a content hash of the secret's data. The
+// resourceVersion must NOT be used: stamping rolled-config-hash bumps
+// the RV itself, so RV-based drift would never settle and the DS
+// would restart on every requeue.
 func TestFluentBitRollerResourceVersionFallback(t *testing.T) {
 	sec := pipelineSecret(nil)
 	sec.ResourceVersion = "777"
+	sec.Data = map[string][]byte{"fluent-bit.conf": []byte("[INPUT]\n  Name tail\n")}
 	cs := fake.NewSimpleClientset(
 		sec,
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		fluentBitDS(2, 2, 3, 3))
-	r := &fluentBitRoller{cs: cs, enabled: true}
+	r := &fluentBitRoller{cs: cs}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got == "" {
-		t.Fatal("DS not rolled on the resourceVersion fallback")
+		t.Fatal("DS not rolled on the content-hash fallback")
 	}
-	if got := rolledHash(getPipelineSecret(t, cs)); got != "777" {
-		t.Fatalf("rolled-config-hash = %q, want the secret resourceVersion 777", got)
+	got := rolledHash(getPipelineSecret(t, cs))
+	if got == "" || got == "777" {
+		t.Fatalf("rolled-config-hash = %q, want the data content hash (not the resourceVersion)", got)
+	}
+	if got != secretDataHash(sec) {
+		t.Fatalf("rolled-config-hash = %q, want data hash %q", got, secretDataHash(sec))
+	}
+}
+
+// The content-hash fallback must be stable across the stamp write:
+// a second reconcile on the fallback path sees hash == rolled and
+// does NOT restart the DS again (the old resourceVersion fallback
+// looped forever because the stamp PATCH moved the RV).
+func TestFluentBitRollerFallbackNoReroll(t *testing.T) {
+	sec := pipelineSecret(nil)
+	sec.Data = map[string][]byte{"fluent-bit.conf": []byte("config v1")}
+	cs := fake.NewSimpleClientset(
+		sec,
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		fluentBitDS(2, 2, 3, 3))
+	r := &fluentBitRoller{cs: cs}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := dsRestartedAt(getFluentBitDS(t, cs)); got == "" {
+		t.Fatal("first reconcile did not roll on drift")
+	}
+	patches := 0
+	for _, a := range cs.Actions() {
+		if a.GetVerb() == "patch" && a.GetResource().Resource == "daemonsets" {
+			patches++
+		}
+	}
+	if patches != 1 {
+		t.Fatalf("daemonset patch count = %d, want 1", patches)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	patches = 0
+	for _, a := range cs.Actions() {
+		if a.GetVerb() == "patch" && a.GetResource().Resource == "daemonsets" {
+			patches++
+		}
+	}
+	if patches != 1 {
+		t.Fatalf("second reconcile re-rolled the DS: daemonset patch count = %d, want 1", patches)
 	}
 }
 
@@ -260,7 +289,7 @@ func TestFluentBitRollerSecretGetError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("etcd wedged")
 		})
-	r := &fluentBitRoller{cs: cs, enabled: true}
+	r := &fluentBitRoller{cs: cs}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the secret get fails")
 	}
@@ -273,7 +302,7 @@ func TestFluentBitRollerNodeListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	r := &fluentBitRoller{cs: cs, enabled: true}
+	r := &fluentBitRoller{cs: cs}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
@@ -286,7 +315,7 @@ func TestFluentBitRollerDSGetError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	r := &fluentBitRoller{cs: cs, enabled: true}
+	r := &fluentBitRoller{cs: cs}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the daemonset get fails")
 	}
@@ -301,7 +330,7 @@ func TestFluentBitRollerRestartPatchErrorKeepsDriftMarker(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
-	r := &fluentBitRoller{cs: cs, enabled: true}
+	r := &fluentBitRoller{cs: cs}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the restart patch fails")
 	}
@@ -319,7 +348,7 @@ func TestFluentBitRollerStatePatchError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("secret patch rejected")
 		})
-	r := &fluentBitRoller{cs: cs, enabled: true}
+	r := &fluentBitRoller{cs: cs}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the state patch fails")
 	}

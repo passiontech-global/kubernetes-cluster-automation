@@ -22,7 +22,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -63,10 +62,17 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface, configPath string) error {
 				GenericFunc: func(event.GenericEvent) bool { return true },
 				// bash jqFilter='.metadata.labels' — only label drift fires.
 				UpdateFunc: func(e event.UpdateEvent) bool {
-					if e.ObjectOld == nil || e.ObjectNew == nil {
-						return false
+					// client.Object is an interface: == nil cannot
+					// catch a typed-nil pointer (GetLabels would
+					// panic on it). The ok-comma assert siblings use
+					// covers both — a nil interface fails the assert,
+					// a typed nil lands in oldN/newN.
+					oldN, ok1 := e.ObjectOld.(*corev1.Node)
+					newN, ok2 := e.ObjectNew.(*corev1.Node)
+					if !ok1 || !ok2 || oldN == nil || newN == nil {
+						return false // missing objects never fire
 					}
-					return !reflect.DeepEqual(e.ObjectOld.GetLabels(), e.ObjectNew.GetLabels())
+					return !reflect.DeepEqual(oldN.GetLabels(), newN.GetLabels())
 				},
 			})).
 		Complete(r)
@@ -82,9 +88,14 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 		metrics.IncError("node-labeler")
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
+	// The listed snapshot doubles as the labels.txt lookup index —
+	// a per-entry Nodes().Get would N+1 the apiserver for a file
+	// that names every node in the cluster.
+	byName := make(map[string]*corev1.Node, len(nodes))
 	labeled := 0
 	for i := range nodes {
 		n := &nodes[i]
+		byName[n.Name] = n
 		if shared.IsControlPlane(n) {
 			continue
 		}
@@ -122,8 +133,13 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 	}
 	// (c) each line: <key=val> <node1> <node2> ...
 	for _, line := range strings.Split(string(data), "\n") {
+		// '#' starts a comment anywhere on the line — full-line
+		// comments and trailing "n1 n2 # why" notes alike. Neither a
+		// label key=value nor a node name can contain '#', so cutting
+		// at the first one is unambiguous.
+		line, _, _ = strings.Cut(line, "#")
 		fields := strings.Fields(line)
-		if len(fields) == 0 || strings.HasPrefix(fields[0], "#") {
+		if len(fields) == 0 {
 			continue
 		}
 		label := fields[0]
@@ -135,11 +151,15 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 				"line", line, "path", r.configPath)
 		}
 		for _, name := range fields[1:] {
-			node, err := r.cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
-			if err != nil {
+			node, ok := byName[name]
+			if !ok {
 				// Likely a deleted node still listed in labels.txt —
 				// warn and move on, never hot-loop (bash exit 0).
-				log.Info("WARN: cannot get node", "node", name, "label", label, "error", err)
+				// The run absorbs the miss (returns nil), so count it
+				// here: a ghost entry that lingers for weeks would
+				// otherwise stay invisible to alerting.
+				metrics.IncError("node-labeler")
+				log.Info("WARN: node in labels.txt not found", "node", name, "label", label)
 				continue
 			}
 			if node.Labels[key] == val {

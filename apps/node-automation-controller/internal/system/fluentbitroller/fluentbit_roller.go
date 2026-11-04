@@ -17,7 +17,10 @@ package fluentbitroller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -37,8 +40,7 @@ import (
 )
 
 type fluentBitRoller struct {
-	cs      kubernetes.Interface
-	enabled bool // FLUENTBIT_ROLLER_ENABLED — only clusters with fluentbit
+	cs kubernetes.Interface
 }
 
 // Setup wires the fluent-bit-config-roller reconciler.
@@ -51,7 +53,7 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
 		logf.Log.WithName("fluent-bit-config-roller").Info("disabled — module not registered")
 		return nil
 	}
-	r := &fluentBitRoller{cs: cs, enabled: enabled}
+	r := &fluentBitRoller{cs: cs}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("fluent-bit-config-roller").
 		For(&corev1.Secret{}, builder.WithPredicates(
@@ -67,10 +69,6 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	// 30m safety net replacing the old crontab: catches a wiped
 	// rolled-config-hash annotation even without a secret event.
 	res := ctrl.Result{RequeueAfter: 30 * time.Minute}
-	if !r.enabled {
-		log.Info("skip: FLUENTBIT_ROLLER_ENABLED != true (cluster has no fluentbit component)")
-		return res, nil
-	}
 
 	sec, err := r.cs.CoreV1().Secrets("fluent-system").Get(ctx, "passiontech-pipeline", metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -87,9 +85,14 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	}
 	hash := sec.Annotations["fluent.io/config-hash"]
 	if hash == "" {
-		// Older operators lack config-hash — resourceVersion still
-		// works, it just rolls on ANY secret write (bash fallback).
-		hash = sec.ResourceVersion
+		// Older operators lack config-hash. resourceVersion is NOT a
+		// usable fallback here: the rolled-config-hash stamp below is
+		// itself a secret write, so it bumps the RV — the stamped RV
+		// never equals the RV we read, drift never clears, and the DS
+		// restarts on every ~30m requeue forever. Hash the secret
+		// DATA instead: stable across stamp/annotation writes, still
+		// moves when the generated config actually changes.
+		hash = secretDataHash(sec)
 	}
 	cur := sec.Annotations["passiontech.dev/rolled-config-hash"]
 	if hash == cur {
@@ -151,4 +154,27 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	log.Info("ROLL: restarted fluent-bit for config",
 		"daemonset", "fluent-system/fluent-bit", "hash", hash)
 	return res, nil
+}
+
+// secretDataHash is the drift signal for secrets whose operator never
+// stamps fluent.io/config-hash: a sha256 over the sorted data entries
+// (16 hex chars — drift detection needs collision resistance against
+// config churn, not cryptographic strength). Unlike resourceVersion it
+// ignores our own rolled-config-hash stamp and unrelated metadata
+// writes, yet still changes on any real config regeneration.
+func secretDataHash(sec *corev1.Secret) string {
+	keys := make([]string, 0, len(sec.Data))
+	for k := range sec.Data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		// NUL separators keep "ab"+"c" distinct from "a"+"bc".
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write(sec.Data[k])
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }

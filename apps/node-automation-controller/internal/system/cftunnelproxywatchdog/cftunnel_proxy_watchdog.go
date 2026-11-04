@@ -98,7 +98,7 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 	var unready []string
 	for i := range pods.Items {
 		if pods.Items[i].Status.Phase == corev1.PodRunning &&
-			!podReady(&pods.Items[i]) {
+			!shared.PodReadyCond(&pods.Items[i]) {
 			unready = append(unready, pods.Items[i].Name)
 		}
 	}
@@ -158,8 +158,16 @@ func (w *cfTunnelProxyWatchdog) clearStaleStall(ctx context.Context) (bool, erro
 	if idx < 0 {
 		return false, nil
 	}
+	// TOCTOU: the deployment controller rewrites .status.conditions
+	// constantly, so idx can point at a DIFFERENT condition by the
+	// time this patch lands — an unguarded remove could then delete
+	// e.g. a fresh Available=False. The test op makes the remove
+	// conditional on the slot still holding the stale
+	// ProgressDeadlineExceeded; a mismatch just fails the patch
+	// (harmless — the next sweep re-reads and retries).
 	patch := []byte(fmt.Sprintf(
-		`[{"op":"remove","path":"/status/conditions/%d"}]`, idx))
+		`[{"op":"test","path":"/status/conditions/%d/reason","value":"ProgressDeadlineExceeded"},`+
+			`{"op":"remove","path":"/status/conditions/%d"}]`, idx, idx))
 	if _, err := w.cs.AppsV1().Deployments(w.namespace).Patch(ctx,
 		cfTunnelProxyDeployName, types.JSONPatchType, patch,
 		metav1.PatchOptions{}, "status"); err != nil {
@@ -170,15 +178,4 @@ func (w *cfTunnelProxyWatchdog) clearStaleStall(ctx context.Context) (bool, erro
 		"helm can upgrade again",
 		"deployment", w.namespace+"/"+cfTunnelProxyDeployName)
 	return true, nil
-}
-
-// podReady reports whether the pod's Ready condition is True — a
-// missing condition counts as not ready.
-func podReady(p *corev1.Pod) bool {
-	for _, c := range p.Status.Conditions {
-		if c.Type == corev1.PodReady {
-			return c.Status == corev1.ConditionTrue
-		}
-	}
-	return false
 }

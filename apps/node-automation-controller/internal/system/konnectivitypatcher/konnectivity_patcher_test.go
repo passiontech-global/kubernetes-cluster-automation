@@ -130,6 +130,31 @@ func TestKonnectivityPatcherNoOpWhenCorrect(t *testing.T) {
 	}
 }
 
+// A DaemonSet without the konnectivity-agent container reads as
+// drift, but the patch merges containers by name and would append a
+// container entry with NO image — the apiserver rejects it forever.
+// The reconciler must skip with a warn, never attempt the patch.
+func TestKonnectivityPatcherMissingContainerNoPatch(t *testing.T) {
+	ds := konnectivityDS("", "", "")
+	ds.Spec.Template.Spec.Containers = nil
+	cs := fake.NewSimpleClientset(ds)
+	var patched bool
+	forbidDSPatch(cs, &patched)
+
+	r := &konnectivityPatcher{cs: cs}
+	res, err := r.Reconcile(ctx, reconcile.Request{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if patched {
+		t.Fatal("patched a DaemonSet whose konnectivity-agent container is absent — " +
+			"the name-only container entry has no image and the apiserver rejects it")
+	}
+	if res.RequeueAfter != 15*time.Minute {
+		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
+	}
+}
+
 func TestKonnectivityPatcherMissingDS(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	r := &konnectivityPatcher{cs: cs}

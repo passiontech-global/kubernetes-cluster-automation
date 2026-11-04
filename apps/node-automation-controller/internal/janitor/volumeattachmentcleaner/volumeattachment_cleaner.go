@@ -54,6 +54,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
@@ -80,6 +81,10 @@ const (
 	// vaDeleteCap bounds detach calls per cycle — a wrong verdict
 	// must never detach more than a handful of volumes at once.
 	vaDeleteCap = 10
+	// vaListPageSize bounds each cluster-wide VA/pod List page —
+	// continue-token pagination keeps a large fleet from arriving
+	// as one giant response body.
+	vaListPageSize = 500
 	// vaOutOfServiceTaint is the Kubernetes-native "node is fenced"
 	// signal — the same key dead-node-sweeper sets.
 	vaOutOfServiceTaint = "node.kubernetes.io/out-of-service"
@@ -138,7 +143,10 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	if len(nodes) == 0 {
 		// An empty list is not "every VA is orphaned" — the operator
 		// always runs against a cluster with nodes, so zero nodes
-		// means the apiserver or RBAC broke. Refuse to evaluate.
+		// means the apiserver or RBAC broke. Refuse to evaluate, but
+		// meter it: a persistently-empty node list is invisible
+		// otherwise (the run deliberately still returns nil).
+		metrics.IncError(volumeAttachmentCleanerQueue)
 		log.Info("SKIP: node list empty — refusing to evaluate attachments")
 		return nil
 	}
@@ -165,14 +173,23 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	}
 	nodes = nil
 
-	vas, err := c.cs.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list volumeattachments: %w", err)
+	var vas []storagev1.VolumeAttachment
+	cont := ""
+	for {
+		page, err := c.cs.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{
+			Limit: vaListPageSize, Continue: cont})
+		if err != nil {
+			return fmt.Errorf("list volumeattachments: %w", err)
+		}
+		vas = append(vas, page.Items...)
+		if cont = page.Continue; cont == "" {
+			break
+		}
 	}
 	// Deterministic order — the per-cycle cap must always pick the
 	// same victims, not whichever ordering the apiserver returned.
-	sort.Slice(vas.Items, func(i, j int) bool {
-		return vas.Items[i].Name < vas.Items[j].Name
+	sort.Slice(vas, func(i, j int) bool {
+		return vas[i].Name < vas[j].Name
 	})
 
 	// orphanNow tracks which VAs still look missing-node orphaned
@@ -199,8 +216,8 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	// listed VA before any delete runs — a VA past the delete cap
 	// keeps its firstSeen ledger instead of re-arming the
 	// two-sighting window every capped cycle.
-	for i := range vas.Items {
-		va := &vas.Items[i]
+	for i := range vas {
+		va := &vas[i]
 		if va.DeletionTimestamp != nil {
 			continue
 		}
@@ -216,8 +233,8 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 
 	deleted, failed := 0, 0
 	capped := false
-	for i := range vas.Items {
-		va := &vas.Items[i]
+	for i := range vas {
+		va := &vas[i]
 		if va.DeletionTimestamp != nil {
 			// Already terminating — a second delete cannot unstick a
 			// wedged attacher finalizer, and surfacing those is the
@@ -249,8 +266,15 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		log.Info(fmt.Sprintf("DELETE volumeattachment %s: reason=%s node=%s pv=%s",
 			va.Name, reason, va.Spec.NodeName,
 			ptr.Deref(va.Spec.Source.PersistentVolumeName, "?")))
+		// UID precondition: VA names are deterministic csi-hash
+		// names — a volume re-attachment between list and delete
+		// recreates the SAME name, so only the object we vetted may
+		// be removed.
+		uid := va.UID
 		if err := c.cs.StorageV1().VolumeAttachments().Delete(ctx, va.Name,
-			metav1.DeleteOptions{}); err != nil {
+			metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &uid},
+			}); err != nil {
 			metrics.IncError(volumeAttachmentCleanerQueue)
 			log.Error(err, "volumeattachment delete failed",
 				"va", va.Name, "node", va.Spec.NodeName,
@@ -283,10 +307,13 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 // the VA — the volume may still be mounted by something real.
 // podProbe caches one node's live-pod verdict for the cycle: a
 // successful count, or the list error (fail closed either way on
-// retry within the same sweep).
+// retry within the same sweep). reported marks that err already
+// bumped IncError — N VAs sharing one fenced node must not fire N
+// error bumps off the single cached failure.
 type podProbe struct {
-	count int
-	err   error
+	count    int
+	err      error
+	reported bool
 }
 
 func (c *volumeAttachmentCleaner) nodeFencedDead(ctx context.Context,
@@ -312,8 +339,15 @@ func (c *volumeAttachmentCleaner) nodeFencedDead(ctx context.Context,
 	live, err := c.livePodCount(ctx, livePods, node.Name)
 	if err != nil {
 		// Cannot prove the node is empty → cannot prove the mount
-		// is dead. Fail closed: keep the VA, flag the API failure.
-		metrics.IncError(volumeAttachmentCleanerQueue)
+		// is dead. Fail closed: keep the VA, flag the API failure —
+		// once per node, not once per VA: every VA on this node
+		// re-reads the same cached error, so the once-flag rides on
+		// the probe itself.
+		if pr := livePods[node.Name]; !pr.reported {
+			pr.reported = true
+			livePods[node.Name] = pr
+			metrics.IncError(volumeAttachmentCleanerQueue)
+		}
 		log.Error(err, "pod list failed — keeping node VAs (fail closed)",
 			"node", node.Name)
 		return false
@@ -341,17 +375,27 @@ func (c *volumeAttachmentCleaner) livePodCount(ctx context.Context,
 	if pr, ok := cache[node]; ok {
 		return pr.count, pr.err
 	}
-	pods, err := c.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-		FieldSelector: "spec.nodeName=" + node,
-	})
-	if err != nil {
-		err = fmt.Errorf("list pods on %s: %w", node, err)
-		cache[node] = podProbe{err: err}
-		return 0, err
+	var pods []corev1.Pod
+	cont := ""
+	for {
+		page, err := c.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+			FieldSelector: "spec.nodeName=" + node,
+			Limit:         vaListPageSize,
+			Continue:      cont,
+		})
+		if err != nil {
+			err = fmt.Errorf("list pods on %s: %w", node, err)
+			cache[node] = podProbe{err: err}
+			return 0, err
+		}
+		pods = append(pods, page.Items...)
+		if cont = page.Continue; cont == "" {
+			break
+		}
 	}
 	live := 0
-	for i := range pods.Items {
-		p := &pods.Items[i]
+	for i := range pods {
+		p := &pods[i]
 		// Fake clientsets ignore field selectors — the spec.nodeName
 		// filter is applied in code too, same convention as the
 		// phase filters elsewhere in this codebase.

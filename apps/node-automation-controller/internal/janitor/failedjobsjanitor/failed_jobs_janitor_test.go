@@ -3,14 +3,17 @@ package failedjobsjanitor
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
@@ -150,6 +153,59 @@ func TestFailedJobsJanitorListError(t *testing.T) {
 	}
 }
 
+// A Job already Terminating is skipped entirely — re-deleting would
+// only burn a per-run cap slot on an object the API already owns.
+func TestFailedJobsJanitorSkipsTerminating(t *testing.T) {
+	now := metav1.NewTime(time.Now())
+	terminating := failedJob("a", "terminating-failed", 25*time.Hour)
+	terminating.DeletionTimestamp = &now
+	cs := fake.NewSimpleClientset(terminating)
+	var attempts int32
+	cs.PrependReactor("delete", "jobs",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			atomic.AddInt32(&attempts, 1)
+			return false, nil, nil
+		})
+	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 0 {
+		t.Fatalf("terminating job consumed a delete attempt (%d)", got)
+	}
+	if !fjjJobExists(t, cs, "a", "terminating-failed") {
+		t.Fatal("terminating job vanished")
+	}
+}
+
+// The delete carries a UID precondition — the listed object is what
+// the sweep vetted; a same-named Job recreated between list and
+// delete must not inherit it.
+func TestFailedJobsJanitorDeleteUIDPrecondition(t *testing.T) {
+	job := failedJob("a", "old-failed", 25*time.Hour)
+	job.UID = "uid-old-failed"
+	cs := fake.NewSimpleClientset(job)
+	var gotUID *types.UID
+	cs.PrependReactor("delete", "jobs",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			opts := a.(ktesting.DeleteAction).GetDeleteOptions()
+			if opts.Preconditions != nil {
+				gotUID = opts.Preconditions.UID
+			}
+			return false, nil, nil // fall through to the tracker
+		})
+	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if gotUID == nil || *gotUID != job.UID {
+		t.Fatalf("delete missing the UID precondition: %v", gotUID)
+	}
+	if fjjJobExists(t, cs, "a", "old-failed") {
+		t.Fatal("old failed job not deleted")
+	}
+}
+
 // A failed delete is tolerated (logged) — the run still nils out and
 // the job survives for the next sweep.
 func TestFailedJobsJanitorDeleteErrorTolerated(t *testing.T) {
@@ -221,6 +277,39 @@ func TestStuckTerminatingAuditMarksStuck(t *testing.T) {
 	} {
 		if metrics.StuckTerminatingResources.DeleteLabelValues(key[0], key[1], key[2]) {
 			t.Fatalf("unexpected stuck series for %v", key)
+		}
+	}
+}
+
+// A VolumeAttachment wedged in Terminating past 2h is surfaced too —
+// the volumeattachment-cleaner refuses to delete terminating VAs, so
+// the attacher-finalizer wedge is exactly what this audit covers.
+// VAs are cluster-scoped: the namespace label is "".
+func TestStuckTerminatingAuditMarksStuckVA(t *testing.T) {
+	now := time.Now()
+	old := metav1.NewTime(now.Add(-3 * time.Hour))
+	fresh := metav1.NewTime(now.Add(-30 * time.Minute))
+	cs := fake.NewSimpleClientset(
+		&storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{
+			Name: "va-stuck", DeletionTimestamp: &old,
+			Finalizers: []string{"external-attacher/test-csi"}}},
+		&storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{
+			Name: "va-fresh", DeletionTimestamp: &fresh}},
+		&storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{
+			Name: "va-live"}},
+	)
+	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	if err := j.auditStuckTerminating(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !metrics.StuckTerminatingResources.DeleteLabelValues(
+		"VolumeAttachment", "", "va-stuck") {
+		t.Fatal("missing stuck series for the terminating VolumeAttachment")
+	}
+	for _, name := range []string{"va-fresh", "va-live"} {
+		if metrics.StuckTerminatingResources.DeleteLabelValues(
+			"VolumeAttachment", "", name) {
+			t.Fatalf("unexpected stuck series for %s", name)
 		}
 	}
 }

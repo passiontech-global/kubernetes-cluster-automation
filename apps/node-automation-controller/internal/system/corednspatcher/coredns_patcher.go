@@ -83,6 +83,25 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, zoneWhen str
 		logf.Log.WithName("coredns-patcher").Info("disabled — module not registered")
 		return nil
 	}
+	// zoneWhen lands verbatim in the whenUnsatisfiable field of the
+	// rendered patch — a typo is not caught until the apiserver
+	// rejects the invalid enum, at which point the Deployment
+	// perpetually reads as drifted and every reconcile fails (eternal
+	// error loop). Validate at boot instead — but disable only this
+	// module: a returned error would propagate through setupModules
+	// and abort ALL 32 modules for one ConfigMap typo. The error is
+	// still loud: logged at Error level and counted on the queue's
+	// error metric.
+	switch corev1.UnsatisfiableConstraintAction(zoneWhen) {
+	case corev1.DoNotSchedule, corev1.ScheduleAnyway:
+	default:
+		err := fmt.Errorf("invalid zoneWhen %q — must be %q or %q "+
+			"(UnsatisfiableConstraintAction); module disabled",
+			zoneWhen, corev1.DoNotSchedule, corev1.ScheduleAnyway)
+		logf.Log.WithName("coredns-patcher").Error(err, "setup failed")
+		metrics.IncError("coredns-patcher")
+		return nil
+	}
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named("coredns-patcher").
 		For(&appsv1.Deployment{}, builder.WithPredicates(
@@ -143,6 +162,18 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 	if !corednsNeedsPatch(d, r.zoneWhen, r.minDomains, wantReplicas) {
 		log.Info("probes/resources/topology/replicas already pinned - nothing to do",
 			"deployment", "kube-system/coredns", "wantReplicas", wantReplicas)
+		return res, nil
+	}
+	// A missing coredns container reads as drift, but the
+	// strategic-merge patch merges containers BY NAME — applied to a
+	// spec without it, it would append a container entry with no
+	// image that the apiserver rejects forever. We cannot reconstruct
+	// the image, so warn and leave the Deployment for the stack
+	// applier rather than emitting a guaranteed-invalid patch.
+	if !shared.PodSpecHasContainer(&d.Spec.Template.Spec, "coredns") {
+		log.Info("WARN: coredns container missing from pod spec — "+
+			"skipping patch (strategic merge cannot create it without an image)",
+			"deployment", "kube-system/coredns")
 		return res, nil
 	}
 	patch, err := corednsPatchBody(r.zoneWhen, r.minDomains, wantReplicas)

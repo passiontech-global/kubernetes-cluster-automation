@@ -7,17 +7,23 @@
 // Detect mode (approve=false — default): warn-logs each pending CSR
 // once and takes no action — not an error, never IncError.
 //
-// Approve mode: validates spec.username is "system:node:<name>" AND a
-// Node named <name> exists (the standard kubelet-serving binding —
-// same check `kubectl certificate approve`'s RBAC implies), then
-// appends an Approved condition via UpdateApproval. Validation
-// failures warn+skip and IncError once per CSR. Capped at 5 approvals
-// per run to bound a misbehaving flood.
+// Approve mode: runs the same checks a conformant kubelet-serving
+// approver does before appending an Approved condition via
+// UpdateApproval — spec.username is "system:node:<name>", a Node
+// named <name> exists, the requester is in system:nodes, the usages
+// are the serving triple only, and the x509 CSR inside spec.request
+// names exactly that node (CN, O=system:nodes, SANs ⊆ the node's own
+// status.addresses — a serving cert may carry no foreign identity).
+// Validation failures warn+skip and IncError once per CSR. Capped at
+// 5 approvals per run to bound a misbehaving flood.
 package csrwatcher
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -37,9 +43,19 @@ const (
 	csrWatcherQueue      = "csr-watcher"
 	kubeletServingSigner = "kubernetes.io/kubelet-serving"
 	nodeUserPrefix       = "system:node:"
+	nodesGroup           = "system:nodes"
 	csrMinAge            = 15 * time.Minute // fresh CSRs may still be under review
 	csrMaxApprovalsRun   = 5
 )
+
+// kubeletServingUsages is the usage set a conformant kubelet-serving
+// approver accepts — any other usage (client auth!) would mint a
+// credential this signer must never produce.
+var kubeletServingUsages = map[certificatesv1.KeyUsage]struct{}{
+	certificatesv1.UsageDigitalSignature: {},
+	certificatesv1.UsageKeyEncipherment:  {},
+	certificatesv1.UsageServerAuth:       {},
+}
 
 type csrWatcher struct {
 	cs       kubernetes.Interface
@@ -61,10 +77,21 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface, approve bool) error {
 func (w *csrWatcher) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	list, err := w.cs.CertificatesV1().CertificateSigningRequests().
-		List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list certificatesigningrequests: %w", err)
+	// Paged list — CSRs accumulate forever on clusters where nothing
+	// auto-approves them, so bound each apiserver response instead of
+	// decoding the whole pile in one shot.
+	list := &certificatesv1.CertificateSigningRequestList{}
+	cont := ""
+	for {
+		page, err := w.cs.CertificatesV1().CertificateSigningRequests().
+			List(ctx, metav1.ListOptions{Limit: 500, Continue: cont})
+		if err != nil {
+			return fmt.Errorf("list certificatesigningrequests: %w", err)
+		}
+		list.Items = append(list.Items, page.Items...)
+		if cont = page.Continue; cont == "" {
+			break
+		}
 	}
 	approved, pending := 0, 0
 	for i := range list.Items {
@@ -96,13 +123,19 @@ func (w *csrWatcher) run(ctx context.Context) error {
 		if !w.validNodeCSR(ctx, csr) {
 			continue
 		}
+		// One timestamp for both fields — the in-tree approver sets
+		// LastUpdateTime AND LastTransitionTime, and consumers that
+		// key on transition time (kubectl certificate, cert-manager's
+		// approver parity checks) read it as unset otherwise.
+		now := metav1.Now()
 		csr.Status.Conditions = append(csr.Status.Conditions,
 			certificatesv1.CertificateSigningRequestCondition{
-				Type:           certificatesv1.CertificateApproved,
-				Status:         corev1.ConditionTrue,
-				Reason:         "NodeOpsAutoApprove",
-				Message:        "validated by node-automation-controller",
-				LastUpdateTime: metav1.Now(),
+				Type:               certificatesv1.CertificateApproved,
+				Status:             corev1.ConditionTrue,
+				Reason:             "NodeOpsAutoApprove",
+				Message:            "validated by node-automation-controller",
+				LastUpdateTime:     now,
+				LastTransitionTime: now,
 			})
 		if _, err := w.cs.CertificatesV1().CertificateSigningRequests().
 			UpdateApproval(ctx, csr.Name, csr, metav1.UpdateOptions{}); err != nil {
@@ -138,9 +171,15 @@ func (w *csrWatcher) run(ctx context.Context) error {
 	return nil
 }
 
-// validNodeCSR enforces the kubelet-serving binding: the requester
-// must be system:node:<name> and that Node must exist. Failures warn
-// every run but IncError only once per CSR.
+// validNodeCSR enforces the kubelet-serving binding a conformant
+// approver applies: the requester must be system:node:<name> in
+// system:nodes, the Node must exist, the usages must be the serving
+// triple only, and the embedded x509 CSR must ask for THIS node's
+// identity — CN=system:node:<name>, O=system:nodes, and every SAN
+// drawn from the node's own status.addresses (a serving cert naming
+// another host/IP is an impersonation attempt). Every rejection path
+// fails closed: a malformed or unverifiable CSR is skipped, never
+// approved. Failures warn every run but IncError only once per CSR.
 func (w *csrWatcher) validNodeCSR(ctx context.Context,
 	csr *certificatesv1.CertificateSigningRequest) bool {
 	log := logf.FromContext(ctx)
@@ -157,13 +196,83 @@ func (w *csrWatcher) validNodeCSR(ctx context.Context,
 	if nodeName == "" || nodeName == csr.Spec.Username {
 		return fail("username is not " + nodeUserPrefix + "<nodeName>")
 	}
-	if _, err := w.cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{}); err != nil {
+	// The requester must actually sit in the nodes group — the
+	// username string is just a claim, spec.groups is what the
+	// apiserver authenticated.
+	if !slices.Contains(csr.Spec.Groups, nodesGroup) {
+		return fail("requester groups lack " + nodesGroup)
+	}
+	// The usages must be exactly the serving triple — the in-tree
+	// kubelet-serving approver compares SETS, not subsets: a CSR
+	// asking for only "server auth" mints a malformed serving cert
+	// and is rejected the same as one smuggling "client auth". The
+	// len check runs on the de-duplicated set so [x, x, x] cannot
+	// sneak past as len 3.
+	usageSet := map[certificatesv1.KeyUsage]struct{}{}
+	for _, u := range csr.Spec.Usages {
+		usageSet[u] = struct{}{}
+	}
+	if len(usageSet) != len(kubeletServingUsages) {
+		return fail("usages are not exactly the kubelet-serving set")
+	}
+	for u := range usageSet {
+		if _, ok := kubeletServingUsages[u]; !ok {
+			return fail("usage not allowed for kubelet-serving: " + string(u))
+		}
+	}
+	block, _ := pem.Decode(csr.Spec.Request)
+	if block == nil || block.Type != "CERTIFICATE REQUEST" {
+		return fail("spec.request is not a PEM certificate request")
+	}
+	req, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return fail("unparseable x509 CSR: " + err.Error())
+	}
+	if err := req.CheckSignature(); err != nil {
+		return fail("CSR signature invalid: " + err.Error())
+	}
+	// The CSR must ask for the same identity the username claims —
+	// not for some other node (and not for a non-node CN at all).
+	if req.Subject.CommonName != nodeUserPrefix+nodeName {
+		return fail("CSR CN is not " + csr.Spec.Username)
+	}
+	if !slices.Contains(req.Subject.Organization, nodesGroup) {
+		return fail("CSR missing O=" + nodesGroup)
+	}
+	node, err := w.cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return fail("node does not exist: " + nodeName)
 		}
 		// A transient Get failure is not proof the node is absent —
 		// still fail closed, but record what actually happened.
 		return fail("node lookup failed: " + err.Error())
+	}
+	// Every SAN must resolve to this node's own addresses — a
+	// kubelet-serving cert may name only the node it serves.
+	// Email/URI SANs have no place in a serving cert at all.
+	dnsOK := map[string]struct{}{}
+	ipOK := map[string]struct{}{}
+	for _, a := range node.Status.Addresses {
+		switch a.Type {
+		case corev1.NodeInternalDNS, corev1.NodeExternalDNS, corev1.NodeHostName:
+			dnsOK[a.Address] = struct{}{}
+		case corev1.NodeInternalIP, corev1.NodeExternalIP:
+			ipOK[a.Address] = struct{}{}
+		}
+	}
+	if len(req.EmailAddresses) > 0 || len(req.URIs) > 0 {
+		return fail("CSR carries non-DNS/IP SANs")
+	}
+	for _, d := range req.DNSNames {
+		if _, ok := dnsOK[d]; !ok {
+			return fail("CSR DNS SAN is not a node address: " + d)
+		}
+	}
+	for _, ip := range req.IPAddresses {
+		if _, ok := ipOK[ip.String()]; !ok {
+			return fail("CSR IP SAN is not a node address: " + ip.String())
+		}
 	}
 	return true
 }

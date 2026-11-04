@@ -28,6 +28,10 @@ func ccCronJob(ns, name, schedule string, lastSchedule *metav1.Time) *batchv1.Cr
 			Namespace:   ns,
 			Name:        name,
 			Annotations: map[string]string{catchupAnno: "true"},
+			// A real CronJob always carries a creation timestamp —
+			// stale() anchors the missed-tick math on it when
+			// lastScheduleTime is nil.
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-2 * time.Hour)),
 		},
 		Spec: batchv1.CronJobSpec{
 			Schedule: schedule,
@@ -64,6 +68,13 @@ func newCatchup(cs *fake.Clientset) *cronJobCatchup {
 	return &cronJobCatchup{cs: cs, lastCatchup: map[string]string{}}
 }
 
+// newCatchupAt pins the clock seam so staleness against a real cron
+// schedule is deterministic.
+func newCatchupAt(cs *fake.Clientset, now time.Time) *cronJobCatchup {
+	return &cronJobCatchup{cs: cs, lastCatchup: map[string]string{},
+		nowFn: func() time.Time { return now }}
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -71,7 +82,7 @@ func newCatchup(cs *fake.Clientset) *cronJobCatchup {
 // A stale CronJob without the opt-in annotation is left alone —
 // backlog replay is only safe for jobs known to be idempotent.
 func TestCronJobCatchupNoAnnotationSkips(t *testing.T) {
-	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	delete(cj.Annotations, catchupAnno)
 	cs := fake.NewSimpleClientset(cj)
 	c := newCatchup(cs)
@@ -86,7 +97,7 @@ func TestCronJobCatchupNoAnnotationSkips(t *testing.T) {
 // suspend:true is the operator's explicit "do not run" — even an
 // opted-in, stale CronJob must not be replayed.
 func TestCronJobCatchupSuspendedSkips(t *testing.T) {
-	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	cj.Spec.Suspend = ptr.To(true)
 	cs := fake.NewSimpleClientset(cj)
 	c := newCatchup(cs)
@@ -98,11 +109,13 @@ func TestCronJobCatchupSuspendedSkips(t *testing.T) {
 	}
 }
 
-// nil lastScheduleTime = never scheduled (or status wiped): stale by
-// definition. The spawned Job must be a faithful JobTemplate clone
-// living in the CronJob's own namespace.
+// nil lastScheduleTime = never scheduled (or status wiped): the
+// creation timestamp anchors the missed-tick math — a job created
+// 2h ago on a */5 schedule missed its very first tick long past the
+// grace bound, so it IS stale. The spawned Job must be a faithful
+// JobTemplate clone living in the CronJob's own namespace.
 func TestCronJobCatchupNilLastScheduleCreates(t *testing.T) {
-	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	cs := fake.NewSimpleClientset(cj)
 	c := newCatchup(cs)
 	if err := c.run(ctx); err != nil {
@@ -143,6 +156,23 @@ func TestCronJobCatchupNilLastScheduleCreates(t *testing.T) {
 	}
 }
 
+// A brand-new opted-in CronJob whose first tick hasn't arrived yet
+// is NOT stale: nil lastScheduleTime anchors at creation, and the
+// next tick after a 2h-old creation on a daily schedule always lies
+// in the future — the job hasn't missed anything. (The old
+// nil-==stale rule would have fired an immediate replay.)
+func TestCronJobCatchupFreshCronJobNotStale(t *testing.T) {
+	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 0 {
+		t.Fatalf("catch-up job created for a cronjob whose first tick hasn't passed (%d jobs)", n)
+	}
+}
+
 // A CronJob that scheduled recently is healthy — threshold is
 // max(2*period, period+30m), and 10m ago is far inside it for an
 // hourly job.
@@ -177,7 +207,7 @@ func TestCronJobCatchupStaleCreates(t *testing.T) {
 // An Active Job owned by the CronJob means a scheduled run is in
 // flight — a catch-up on top of it would double-fire the workload.
 func TestCronJobCatchupActiveOwnedJobSkips(t *testing.T) {
-	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	active := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "ops", Name: "nightly-29381234",
@@ -201,7 +231,7 @@ func TestCronJobCatchupActiveOwnedJobSkips(t *testing.T) {
 // A catch-up Job carrying the missed-catchup label younger than 24h
 // already covers this CronJob.
 func TestCronJobCatchupLabelDedupeSkips(t *testing.T) {
-	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	prior := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:         "ops",
@@ -223,7 +253,7 @@ func TestCronJobCatchupLabelDedupeSkips(t *testing.T) {
 // The in-memory daily cap holds even when the created catch-up Job is
 // gone — the label dedupe alone could not cover a deleted Job.
 func TestCronJobCatchupDailyCap(t *testing.T) {
-	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	cs := fake.NewSimpleClientset(cj)
 	c := newCatchup(cs)
 	if err := c.run(ctx); err != nil {
@@ -250,7 +280,7 @@ func TestCronJobCatchupDailyCap(t *testing.T) {
 // rest of the sweep and never errors the run.
 func TestCronJobCatchupInvalidScheduleSkips(t *testing.T) {
 	bad := ccCronJob("ops", "broken", "not-a-cron", nil)
-	good := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	good := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	cs := fake.NewSimpleClientset(bad, good)
 	c := newCatchup(cs)
 	if err := c.run(ctx); err != nil {
@@ -268,7 +298,7 @@ func TestCronJobCatchupInvalidScheduleSkips(t *testing.T) {
 // A jobs list failure inside deduped() degrades to "not deduped" —
 // a missed catch-up is worse than one extra idempotent Job.
 func TestCronJobCatchupDedupeListErrorStillCreates(t *testing.T) {
-	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	cs := fake.NewSimpleClientset(cj)
 	var failed atomic.Bool
 	cs.PrependReactor("list", "jobs",
@@ -290,7 +320,7 @@ func TestCronJobCatchupDedupeListErrorStillCreates(t *testing.T) {
 // A Job create failure is metered+logged but does NOT arm the in-memory
 // daily cap — the next sweep must retry the spawn.
 func TestCronJobCatchupCreateErrorDoesNotArmCap(t *testing.T) {
-	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	cs := fake.NewSimpleClientset(cj)
 	var creates int32
 	cs.PrependReactor("create", "jobs",
@@ -316,7 +346,7 @@ func TestCronJobCatchupCreateErrorDoesNotArmCap(t *testing.T) {
 // still stamp the missed-catchup label and the instantiate annotation
 // (maps.Clone(nil) must not leave nil maps behind).
 func TestCronJobCatchupBareJobTemplate(t *testing.T) {
-	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	cj.Spec.JobTemplate.Labels = nil
 	cj.Spec.JobTemplate.Annotations = nil
 	cs := fake.NewSimpleClientset(cj)
@@ -343,7 +373,7 @@ func TestCronJobCatchupBareJobTemplate(t *testing.T) {
 // The daily-cap map is pruned for CronJobs that vanished — a deleted
 // CronJob must not pin a stale cap entry forever.
 func TestCronJobCatchupPrunesCapForDeletedCronJob(t *testing.T) {
-	cj := ccCronJob("ops", "nightly", "0 3 * * *", nil)
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
 	cs := fake.NewSimpleClientset(cj)
 	c := newCatchup(cs)
 	c.lastCatchup["ops/gone"] = "2000-01-01" // vanished CJ's stale entry
@@ -384,5 +414,133 @@ func TestCronJobCatchupCappedLazyInit(t *testing.T) {
 	}
 	if c.lastCatchup == nil {
 		t.Fatal("cap map not lazily initialized")
+	}
+}
+
+// A 52-char CronJob name must not overflow the 63-char Job-name
+// ceiling: the catch-up suffix is kept whole and only the
+// CronJob-name portion is truncated.
+func TestCronJobCatchupLongNameTruncated(t *testing.T) {
+	longName := strings.Repeat("a", 45) + "-" + strings.Repeat("b", 6) // 52 chars
+	cj := ccCronJob("ops", longName, "*/5 * * * *", nil)
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchup(cs)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := cs.BatchV1().Jobs("ops").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("expected 1 catch-up job, got %d", len(jobs.Items))
+	}
+	name := jobs.Items[0].Name
+	if len(name) > 63 {
+		t.Fatalf("job name %q is %d chars — Create would fail Invalid", name, len(name))
+	}
+	if !strings.Contains(name, "-catchup-") {
+		t.Fatalf("job name %q lost the -catchup-<unix> suffix", name)
+	}
+	// Trailing separators would still violate DNS-1123.
+	if strings.HasSuffix(name[:strings.Index(name, "-catchup-")], "-") {
+		t.Fatalf("truncated name portion ends on a separator: %q", name)
+	}
+}
+
+// A weekday-only CronJob idle since Friday must NOT be flagged stale
+// over the weekend — its next tick (Monday 09:00) is still in the
+// future. The old two-future-ticks period math compared raw
+// lastScheduleTime age and fired ~once a day all weekend.
+func TestCronJobCatchupWeekdayScheduleWeekendNotStale(t *testing.T) {
+	// 2026-01-03 is a Saturday; the last weekday tick ran Friday
+	// 2026-01-02 17:00.
+	now := time.Date(2026, 1, 3, 12, 0, 0, 0, time.UTC)
+	if now.Weekday() != time.Saturday {
+		t.Fatalf("test premise broken: %v is not a Saturday", now)
+	}
+	last := metav1.NewTime(time.Date(2026, 1, 2, 17, 0, 0, 0, time.UTC))
+	cj := ccCronJob("ops", "weekday", "0 9-17 * * 1-5", &last)
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchupAt(cs, now)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 0 {
+		t.Fatalf("weekday-only cronjob flagged stale on a Saturday (%d jobs)", n)
+	}
+}
+
+// The same weekday-only schedule DOES catch up once a real tick is
+// missed past its grace: Monday noon with a Friday lastScheduleTime
+// means the Monday 09:00 tick never ran (period to the next tick is
+// 1h → threshold 2h).
+func TestCronJobCatchupWeekdayScheduleMissedTickStale(t *testing.T) {
+	now := time.Date(2026, 1, 5, 12, 0, 0, 0, time.UTC) // Monday noon
+	if now.Weekday() != time.Monday {
+		t.Fatalf("test premise broken: %v is not a Monday", now)
+	}
+	last := metav1.NewTime(time.Date(2026, 1, 2, 17, 0, 0, 0, time.UTC)) // Friday 17:00
+	cj := ccCronJob("ops", "weekday", "0 9-17 * * 1-5", &last)
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchupAt(cs, now)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 1 {
+		t.Fatalf("missed weekday tick not caught up (%d jobs)", n)
+	}
+}
+
+// A missed tick still inside its grace bound is not stale yet — the
+// daily job that missed this morning's 03:00 tick gets a full
+// 2*period (48h) before a replay is spawned.
+func TestCronJobCatchupMissedTickInsideGraceNotStale(t *testing.T) {
+	now := time.Date(2026, 1, 5, 12, 0, 0, 0, time.UTC)                 // Monday noon
+	last := metav1.NewTime(time.Date(2026, 1, 4, 3, 0, 0, 0, time.UTC)) // Sunday 03:00
+	cj := ccCronJob("ops", "daily", "0 3 * * *", &last)
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchupAt(cs, now)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 0 {
+		t.Fatalf("missed tick inside the grace bound flagged stale (%d jobs)", n)
+	}
+}
+
+// A daily run missed beyond max(2*period, period+30m) is stale:
+// last tick Sunday 03:00, the Monday 03:00 tick is now 57h old —
+// past the 48h threshold — so a catch-up fires.
+func TestCronJobCatchupMissedDailyRunStale(t *testing.T) {
+	now := time.Date(2026, 1, 7, 12, 0, 0, 0, time.UTC)                 // Wednesday noon
+	last := metav1.NewTime(time.Date(2026, 1, 4, 3, 0, 0, 0, time.UTC)) // Sunday 03:00
+	cj := ccCronJob("ops", "daily", "0 3 * * *", &last)
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchupAt(cs, now)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 1 {
+		t.Fatalf("missed daily run not caught up (%d jobs)", n)
+	}
+}
+
+// spec.timeZone shifts where the ticks land: an hourly job in
+// Asia/Kathmandu (UTC+5:45) ticks at :15 UTC. The 11:15 UTC tick
+// missed 1h55m ago is inside the 2h grace — a UTC interpretation
+// would have flagged the 11:00 UTC tick missed 2h10m ago as stale.
+func TestCronJobCatchupTimeZoneHonored(t *testing.T) {
+	now := time.Date(2026, 1, 5, 13, 10, 0, 0, time.UTC)
+	last := metav1.NewTime(time.Date(2026, 1, 5, 10, 15, 0, 0, time.UTC))
+	cj := ccCronJob("ops", "tz-hourly", "0 * * * *", &last)
+	cj.Spec.TimeZone = ptr.To("Asia/Kathmandu")
+	cs := fake.NewSimpleClientset(cj)
+	c := newCatchupAt(cs, now)
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := ccJobCount(t, cs, "ops"); n != 0 {
+		t.Fatalf("spec.timeZone ignored — UTC tick math flagged stale (%d jobs)", n)
 	}
 }

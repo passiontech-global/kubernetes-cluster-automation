@@ -185,6 +185,21 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		}
 	}
 
+	// The deployment-exists check runs BEFORE the maintenance mutex:
+	// on a cluster without descheduler there is nothing to gate, so
+	// the kured GET + autopilot plans LIST (and their failure modes,
+	// including an unwired dyn client) must not run at all.
+	deploy, err := r.cs.AppsV1().Deployments("kube-system").
+		Get(ctx, "descheduler", metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		log.Info("SKIP: no descheduler deployment on this cluster")
+		return res, nil
+	}
+	if err != nil {
+		metrics.IncError("descheduler-storm-gate")
+		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/descheduler: %w", err)
+	}
+
 	// 2.7 maintenance mutex (signals b + c — signal a is the
 	// `cordoned` list above): deliberate maintenance gates the
 	// descheduler exactly like a storm does.
@@ -199,18 +214,6 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	if len(notReady) > 0 || len(bad) > 0 || len(tainted) > 0 ||
 		len(cordoned) > 0 || len(maintenance) > 0 {
 		want, verdict = 0, "storm"
-	}
-
-	deploy, err := r.cs.AppsV1().Deployments("kube-system").
-		Get(ctx, "descheduler", metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		log.Info("SKIP: no descheduler deployment on this cluster",
-			"verdict", verdict)
-		return res, nil
-	}
-	if err != nil {
-		metrics.IncError("descheduler-storm-gate")
-		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/descheduler: %w", err)
 	}
 
 	if deploy.Annotations[stormGateHoldAnno] == "true" {
@@ -237,10 +240,18 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 			"verdict", verdict, "from", curStr, "to", want,
 			"notReady", notReady, "bad", bad, "tainted", tainted,
 			"cordoned", cordoned, "maintenance", maintenance)
-		w := want
-		deploy.Spec.Replicas = &w
+		// Merge-patch spec.replicas only — a full-object Update on a
+		// cached Get races any concurrent spec edit (HPA, gitops)
+		// and would clobber it or fail on resourceVersion.
+		patch, err := json.Marshal(map[string]any{
+			"spec": map[string]any{"replicas": want},
+		})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("marshal replicas patch: %w", err)
+		}
 		if _, err := r.cs.AppsV1().Deployments("kube-system").
-			Update(ctx, deploy, metav1.UpdateOptions{}); err != nil {
+			Patch(ctx, "descheduler", types.MergePatchType, patch,
+				metav1.PatchOptions{}); err != nil {
 			metrics.IncError("descheduler-storm-gate")
 			return ctrl.Result{}, fmt.Errorf(
 				"scale deployment kube-system/descheduler to %d replicas: %w",

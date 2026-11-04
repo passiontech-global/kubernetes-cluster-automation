@@ -10,11 +10,13 @@
 // Active retries and fresh failures (still worth debugging) are kept,
 // Complete/Running are never touched. Capped at 50 deletions per run.
 //
-// auditStuckTerminating (C3b — detect-only): Namespaces and PVCs can
-// wedge in Terminating forever when the controller that owns a
-// finalizer is gone or itself deadlocked (namespace-controller cannot
-// finish an ns whose remaining resources need a deleted API service;
-// kubernetes.io/pvc-protection waits on a pod that will never exit).
+// auditStuckTerminating (C3b — detect-only): Namespaces, PVCs and
+// VolumeAttachments can wedge in Terminating forever when the
+// controller that owns a finalizer is gone or itself deadlocked
+// (namespace-controller cannot finish an ns whose remaining
+// resources need a deleted API service; kubernetes.io/pvc-protection
+// waits on a pod that will never exit; a VA's external-attacher
+// finalizer never drains once its node is gone).
 // Nothing in-tree alerts on it — the object just sits there for days.
 // The audit marks each resource Terminating >2h on
 // node_automation_stuck_terminating_resources and logs its finalizer
@@ -31,7 +33,9 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -50,6 +54,10 @@ const (
 	// PVC unprotect, resourcequota reconcile) finishes in seconds to
 	// a couple of minutes.
 	stuckTerminatingMaxAge = 2 * time.Hour
+	// failedJobListPageSize bounds each cluster-wide List page —
+	// continue-token pagination keeps a huge Job/PVC/VA fleet from
+	// arriving as one giant response body.
+	failedJobListPageSize = 500
 )
 
 // stuckTerminatingKey identifies one emitted
@@ -82,20 +90,40 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface) error {
 
 func (j *failedJobsJanitor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
+	// Lazily arm the zero-value struct — unit tests construct the
+	// module literally without the Setup path. stuckEmitted needs
+	// no such guard: it is only ranged over (nil-safe) and replaced
+	// wholesale each audit, never keyed-written like a cache.
+	if j.nowFn == nil {
+		j.nowFn = time.Now
+	}
 
-	jobs, err := j.cs.BatchV1().Jobs(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list jobs: %w", err)
+	var jobs []batchv1.Job
+	cont := ""
+	for {
+		page, err := j.cs.BatchV1().Jobs(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+			Limit: failedJobListPageSize, Continue: cont})
+		if err != nil {
+			return fmt.Errorf("list jobs: %w", err)
+		}
+		jobs = append(jobs, page.Items...)
+		if cont = page.Continue; cont == "" {
+			break
+		}
 	}
 
 	type target struct {
 		ns, name string
+		uid      types.UID
 		ageHours int
 	}
 	var targets []target
 	capped := false
-	for i := range jobs.Items {
-		job := &jobs.Items[i]
+	for i := range jobs {
+		job := &jobs[i]
+		if job.DeletionTimestamp != nil {
+			continue // already terminating — a second delete just burns a cap slot
+		}
 		var failedAt *metav1.Time
 		for ci := range job.Status.Conditions {
 			c := &job.Status.Conditions[ci]
@@ -118,18 +146,23 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 		targets = append(targets, target{
 			ns:       job.Namespace,
 			name:     job.Name,
+			uid:      job.UID,
 			ageHours: int(age.Hours()),
 		})
 	}
-	// Release the cluster-wide JobList before issuing Delete calls.
+	// Release the cluster-wide job slice before issuing Delete calls.
 	jobs = nil
 
 	background := metav1.DeletePropagationBackground
 	deleted, failed := 0, 0
 	for _, t := range targets {
 		log.Info(fmt.Sprintf("DELETE %s/%s: Failed for %dh", t.ns, t.name, t.ageHours))
+		// UID precondition: the listed object is what we vetted — a
+		// same-named Job recreated in between must not inherit the
+		// delete.
 		if err := j.cs.BatchV1().Jobs(t.ns).Delete(ctx, t.name,
-			metav1.DeleteOptions{PropagationPolicy: &background}); err != nil {
+			metav1.DeleteOptions{PropagationPolicy: &background,
+				Preconditions: &metav1.Preconditions{UID: &t.uid}}); err != nil {
 			metrics.IncError(failedJobQueue)
 			log.Error(err, "job delete failed",
 				"job", t.ns+"/"+t.name, "failedForHours", t.ageHours)
@@ -148,32 +181,54 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 	return j.auditStuckTerminating(ctx)
 }
 
-// auditStuckTerminating marks every namespace/PVC stuck in
-// Terminating past stuckTerminatingMaxAge on
+// auditStuckTerminating marks every namespace/PVC/VolumeAttachment
+// stuck in Terminating past stuckTerminatingMaxAge on
 // metrics.StuckTerminatingResources and logs its finalizers — the
 // finalizer list is the debugging payload: it names the controller
-// that stopped draining (kubernetes.io/pvc-protection, a deleted
+// that stopped draining (kubernetes.io/pvc-protection, a wedged
+// external-attacher finalizer on a VA whose node is gone, a deleted
 // operator's custom finalizer, ...). Detect-only — finalizers are
 // never stripped automatically.
 //
-// Label convention: kind is "Namespace" or "PersistentVolumeClaim".
-// For kind=Namespace (cluster-scoped) the "namespace" label is the
-// empty string — there is no containing namespace, and repeating the
-// object name would only make the two labels redundant.
+// Label convention: kind is "Namespace", "PersistentVolumeClaim" or
+// "VolumeAttachment". For the cluster-scoped kinds (Namespace,
+// VolumeAttachment) the "namespace" label is the empty string —
+// there is no containing namespace, and repeating the object name
+// would only make the two labels redundant.
 func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	now := j.nowFn()
 
-	// Both lists land before any series is emitted — a failed second
+	// All lists land before any series is emitted — a failed later
 	// list must not leave the gauge half-populated for an hour.
 	nss, err := j.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("list namespaces: %w", err)
 	}
-	pvcs, err := j.cs.CoreV1().PersistentVolumeClaims(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list persistentvolumeclaims: %w", err)
+	var pvcs []corev1.PersistentVolumeClaim
+	cont := ""
+	for {
+		page, err := j.cs.CoreV1().PersistentVolumeClaims(metav1.NamespaceAll).
+			List(ctx, metav1.ListOptions{Limit: failedJobListPageSize, Continue: cont})
+		if err != nil {
+			return fmt.Errorf("list persistentvolumeclaims: %w", err)
+		}
+		pvcs = append(pvcs, page.Items...)
+		if cont = page.Continue; cont == "" {
+			break
+		}
+	}
+	var vas []storagev1.VolumeAttachment
+	for {
+		page, err := j.cs.StorageV1().VolumeAttachments().
+			List(ctx, metav1.ListOptions{Limit: failedJobListPageSize, Continue: cont})
+		if err != nil {
+			return fmt.Errorf("list volumeattachments: %w", err)
+		}
+		vas = append(vas, page.Items...)
+		if cont = page.Continue; cont == "" {
+			break
+		}
 	}
 
 	current := map[stuckTerminatingKey]struct{}{}
@@ -196,11 +251,19 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 		mark("Namespace", "", n.Name, n.DeletionTimestamp, nsFinalizerNames(n))
 	}
 	nss = nil
-	for i := range pvcs.Items {
-		p := &pvcs.Items[i]
+	for i := range pvcs {
+		p := &pvcs[i]
 		mark("PersistentVolumeClaim", p.Namespace, p.Name, p.DeletionTimestamp, p.Finalizers)
 	}
 	pvcs = nil
+	// VolumeAttachments: the volumeattachment-cleaner refuses to
+	// touch a VA already Terminating — the wedged attacher finalizer
+	// is exactly what this audit exists to surface.
+	for i := range vas {
+		v := &vas[i]
+		mark("VolumeAttachment", "", v.Name, v.DeletionTimestamp, v.Finalizers)
+	}
+	vas = nil
 
 	// Hygiene: series for resources that finished terminating are
 	// deleted, not zeroed — a Set(0) leaves the label triple in

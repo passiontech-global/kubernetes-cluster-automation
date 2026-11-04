@@ -100,6 +100,64 @@ func TestCiliumTaintReaperSweepsWholeCluster(t *testing.T) {
 	}
 }
 
+// A healthy agent must reap the taint even while an unhealthy sibling
+// cilium pod (old agent mid-rollout, terminating replica) sits on the
+// same node — the verdict reads every pod, not Items[0], so list
+// order cannot keep a stale taint.
+func TestCiliumTaintReaperAnyHealthyPodReaps(t *testing.T) {
+	t.Run("unhealthy first, healthy second -> reaped", func(t *testing.T) {
+		unready := ciliumPod("n1", corev1.PodRunning, true)
+		unready.Name = "cilium-old"
+		unready.Status.Conditions[0].Status = corev1.ConditionFalse
+		healthy := ciliumPod("n1", corev1.PodRunning, true)
+		healthy.Name = "cilium-new"
+		cs, r := reaperClientset(
+			testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
+			unready, healthy)
+		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		if shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+			t.Fatal("taint kept though a healthy agent runs on the node")
+		}
+	})
+
+	t.Run("terminating + healthy -> reaped", func(t *testing.T) {
+		terminating := ciliumPod("n1", corev1.PodRunning, true)
+		terminating.Name = "cilium-dying"
+		now := metav1.Now()
+		terminating.DeletionTimestamp = &now
+		healthy := ciliumPod("n1", corev1.PodRunning, true)
+		healthy.Name = "cilium-live"
+		cs, r := reaperClientset(
+			testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
+			terminating, healthy)
+		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		if shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+			t.Fatal("taint kept though a healthy agent runs on the node")
+		}
+	})
+
+	t.Run("all unhealthy -> kept", func(t *testing.T) {
+		a := ciliumPod("n1", corev1.PodPending, false)
+		a.Name = "cilium-a"
+		b := ciliumPod("n1", corev1.PodRunning, true)
+		b.Name = "cilium-b"
+		b.Status.Conditions[0].Status = corev1.ConditionFalse
+		cs, r := reaperClientset(
+			testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
+			a, b)
+		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+			t.Fatal("taint removed with no healthy agent on the node")
+		}
+	})
+}
+
 func TestCiliumTaintReaperPodOnOtherNodeDoesNotCount(t *testing.T) {
 	// The verdict must read the cilium pod scheduled ON the tainted
 	// node (spec.nodeName field selector + k8s-app label). A healthy

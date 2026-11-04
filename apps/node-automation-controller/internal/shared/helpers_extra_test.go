@@ -335,6 +335,53 @@ func TestPeriodicErrorIncrementsErrorMetric(t *testing.T) {
 	}
 }
 
+// A non-positive Interval used to panic in rand.N / time.NewTicker —
+// Start must now return it as a plain error instead (the manager
+// turns a runnable error into a clean exit, not a crash loop).
+func TestPeriodicNonPositiveInterval(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Minute} {
+		p := &Periodic{
+			Name:     "test-periodic-bad-interval",
+			Interval: d,
+			Fn: func(context.Context) error {
+				t.Error("fn ran on a non-positive interval")
+				return nil
+			},
+			Log: logr.Discard(),
+		}
+		if err := p.Start(ctx); err == nil {
+			t.Fatalf("Start(Interval=%s) returned nil, want error", d)
+		}
+	}
+}
+
+// AddPeriodic must reject a non-positive interval BEFORE mgr.Add —
+// the returned error is what setupModules propagates to abort boot
+// (e.g. an env-derived *_INTERVAL knob set to "0s"). A nil manager
+// proves the guard fires before any manager interaction.
+func TestAddPeriodicRejectsNonPositiveInterval(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		err := AddPeriodic(nil, "bad-interval", d,
+			func(context.Context) error { return nil })
+		if err == nil {
+			t.Fatalf("AddPeriodic(interval=%s) returned nil, want error", d)
+		}
+	}
+}
+
+// A parsed-but-tiny interval ("1ns" through an env knob) is just as
+// bad as <=0 — it would hot-loop the sweep on every tick. AddPeriodic
+// floors the interval at 1s for the same reason.
+func TestAddPeriodicRejectsSubSecondInterval(t *testing.T) {
+	for _, d := range []time.Duration{time.Nanosecond, 500 * time.Millisecond, time.Second - 1} {
+		err := AddPeriodic(nil, "bad-interval", d,
+			func(context.Context) error { return nil })
+		if err == nil {
+			t.Fatalf("AddPeriodic(interval=%s) returned nil, want error", d)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // SweepRequests / fixedSweepRequest — fixed-key watch fan-in.
 // ---------------------------------------------------------------------------
@@ -411,6 +458,18 @@ func TestDropTaintsByKey(t *testing.T) {
 	out := DropTaintsByKey(in, "a")
 	if len(out) != 1 || out[0].Key != "b" {
 		t.Fatalf("expected only taint b, got %+v", out)
+	}
+	// In-place contract: the result aliases the input's backing
+	// array — the surviving taint moved into slot 0 — and the stale
+	// tail past len(out) is zeroed so the dropped entries (and their
+	// strings) become collectable.
+	if in[0].Key != "b" {
+		t.Fatalf("result does not alias the input array: in[0]=%+v", in[0])
+	}
+	for i, stale := range in[len(out):] {
+		if stale != (corev1.Taint{}) {
+			t.Fatalf("stale tail slot %d not cleared: %+v", len(out)+i, stale)
+		}
 	}
 }
 

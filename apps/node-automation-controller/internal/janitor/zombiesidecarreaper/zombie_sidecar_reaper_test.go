@@ -262,6 +262,93 @@ func TestZombieSidecarQualification(t *testing.T) {
 	}
 }
 
+// Native sidecars live in spec.initContainers (restartPolicy:Always)
+// with status in initContainerStatuses — an istio/linkerd proxy
+// there must count for liveness exactly like the injected regular
+// container does.
+func TestZombieSidecarNativeSidecarQualifies(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	native := zsrPod("jobs", "native-istio", 10*time.Minute, 0)
+	native.Spec.Containers = []corev1.Container{{Name: "app"}}
+	native.Spec.InitContainers = []corev1.Container{
+		{Name: "istio-proxy", RestartPolicy: &always}}
+	native.Status.ContainerStatuses = native.Status.ContainerStatuses[:1] // app only
+	native.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: "istio-proxy",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.NewTime(time.Now().Add(-time.Hour))}},
+	}}
+
+	// A finished plain init container must not disqualify an
+	// otherwise-good zombie (normal pods run init containers to
+	// completion before the app starts).
+	withInit := zsrPod("jobs", "init-done", 10*time.Minute, 0)
+	withInit.Spec.InitContainers = []corev1.Container{{Name: "init-db"}}
+	withInit.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: "init-db",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 0, FinishedAt: metav1.NewTime(time.Now().Add(-time.Hour))}},
+	}}
+
+	// A non-mesh always-restart init container still Running is not
+	// the zombie shape this reaper owns — fail closed.
+	other := zsrPod("jobs", "other-native", 10*time.Minute, 0)
+	other.Spec.Containers = []corev1.Container{{Name: "app"}}
+	other.Spec.InitContainers = []corev1.Container{
+		{Name: "custom-agent", RestartPolicy: &always}}
+	other.Status.ContainerStatuses = other.Status.ContainerStatuses[:1]
+	other.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: "custom-agent",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.NewTime(time.Now().Add(-time.Hour))}},
+	}}
+
+	cs := fake.NewSimpleClientset(native, withInit, other)
+	probe := &zsrShutdownProbe{}
+	r := zsrReaper(cs, probe)
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []*corev1.Pod{native, withInit} {
+		if !r.poked[zombieKey(p)] {
+			t.Fatalf("pod %s (native sidecar) qualifies but was not poked", p.Name)
+		}
+	}
+	if r.poked[zombieKey(other)] {
+		t.Fatal("non-mesh always-restart init was poked — fail closed violated")
+	}
+	if len(probe.calls) != 2 {
+		t.Fatalf("/shutdown called %d times, want 2", len(probe.calls))
+	}
+}
+
+// The reap delete carries a UID precondition — the zombie we vetted
+// is the object deleted, never a same-named replacement.
+func TestZombieSidecarDeleteUIDPrecondition(t *testing.T) {
+	pod := zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0)
+	pod.Status.PodIP = "" // no admin endpoint → straight to delete
+	cs := fake.NewSimpleClientset(pod)
+	var gotUID *types.UID
+	cs.PrependReactor("delete", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			opts := a.(ktesting.DeleteAction).GetDeleteOptions()
+			if opts.Preconditions != nil {
+				gotUID = opts.Preconditions.UID
+			}
+			return false, nil, nil // fall through to the tracker
+		})
+	r := zsrReaper(cs, &zsrShutdownProbe{})
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if gotUID == nil || *gotUID != pod.UID {
+		t.Fatalf("delete missing the UID precondition: %v", gotUID)
+	}
+	if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		t.Fatal("zombie pod not reaped")
+	}
+}
+
 // The /shutdown URL must bracket IPv6 podIPs — fmt's %s:%d produces
 // "http://::1:4191/", which is unparseable.
 func TestZombieSidecarShutdownIPv6(t *testing.T) {

@@ -130,8 +130,10 @@ func (c *atcClient) doJSON(ctx context.Context, method, endpoint string, out any
 		return err
 	}
 	defer func() {
-		// Drain so the connection can be reused (keep-alive).
-		_, _ = io.Copy(io.Discard, resp.Body)
+		// Drain so the connection can be reused (keep-alive);
+		// bounded like login's drain so a misbehaving endpoint
+		// cannot stall the return.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
 	}()
 	if resp.StatusCode/100 != 2 {

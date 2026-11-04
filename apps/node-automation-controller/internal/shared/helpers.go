@@ -27,6 +27,7 @@ package shared
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math/rand/v2"
 	"time"
 
@@ -63,6 +64,15 @@ type Periodic struct {
 }
 
 func (p *Periodic) Start(ctx context.Context) error {
+	// A non-positive interval would panic in rand.N / time.NewTicker.
+	// AddPeriodic validates at registration, but a Periodic built by
+	// hand must still fail here — as a runnable error that stops the
+	// manager cleanly, not a panic inside a goroutine that
+	// crash-loops the pod.
+	if p.Interval <= 0 {
+		return fmt.Errorf("periodic %q: interval must be > 0, got %s",
+			p.Name, p.Interval)
+	}
 	// De-phase the sweep modules: every AddPeriodic caller begins at
 	// the same startup moment, so identical NewTicker intervals would
 	// fire all modules on the same wall-clock minute — a thundering
@@ -71,14 +81,12 @@ func (p *Periodic) Start(ctx context.Context) error {
 	// [0, interval) spreads them; the first run lands in
 	// [interval, 2*interval), acceptable for crontab-equivalent
 	// sweeps. ctx is honored so shutdown is never delayed.
-	if p.Interval > 0 {
-		timer := time.NewTimer(rand.N(p.Interval))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil
-		case <-timer.C:
-		}
+	timer := time.NewTimer(rand.N(p.Interval))
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return nil
+	case <-timer.C:
 	}
 	t := time.NewTicker(p.Interval)
 	defer t.Stop()
@@ -97,8 +105,16 @@ func (p *Periodic) Start(ctx context.Context) error {
 
 // AddPeriodic registers fn to run every interval (equivalent to the
 // old crontab entry). name is the legacy queue name for metrics
-// compat.
+// compat. interval must be >= 1s: a non-positive interval (e.g. an
+// env-derived *_INTERVAL knob set to "0s") would panic time.NewTicker
+// inside the runnable, and a sub-second interval would hot-loop the
+// sweep — returning an error here instead lets setupModules abort
+// boot with the module name attached.
 func AddPeriodic(mgr manager.Manager, name string, interval time.Duration, fn func(ctx context.Context) error) error {
+	if interval < time.Second {
+		return fmt.Errorf("periodic %q: interval must be >= 1s, got %s",
+			name, interval)
+	}
 	return mgr.Add(&Periodic{
 		Name:     name,
 		Interval: interval,
@@ -170,7 +186,12 @@ func HasTaint(taints []corev1.Taint, key string) bool {
 	return false
 }
 
-// DropTaintsByKey returns taints with every entry matching key removed.
+// DropTaintsByKey returns taints with every entry matching key
+// removed. It filters IN PLACE — the result aliases and shortens the
+// caller's backing array, so the input must not be shared or
+// informer-cache-owned. Callers must pass a slice they own (today
+// every call site hands over .spec.taints of a fresh Get, which the
+// apiserver decodes per call).
 func DropTaintsByKey(taints []corev1.Taint, key string) []corev1.Taint {
 	out := taints[:0]
 	changed := false
@@ -293,6 +314,20 @@ func PodReadyCond(p *corev1.Pod) bool {
 	for _, c := range p.Status.Conditions {
 		if c.Type == corev1.PodReady {
 			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// PodSpecHasContainer reports whether the pod spec carries a container
+// named name. The pinned patchers' strategic-merge patches merge
+// containers by name and cannot create one (a name-only entry has no
+// image and the apiserver rejects the pod spec), so a missing
+// container must be a skip, not a patch.
+func PodSpecHasContainer(ps *corev1.PodSpec, name string) bool {
+	for i := range ps.Containers {
+		if ps.Containers[i].Name == name {
+			return true
 		}
 	}
 	return false

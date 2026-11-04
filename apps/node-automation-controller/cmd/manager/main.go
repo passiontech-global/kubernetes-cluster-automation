@@ -93,20 +93,34 @@ func getenv(key, def string) string {
 	return def
 }
 
+// getenvInt reads an integer env knob. An unparseable value warns and
+// falls back to def rather than being silently discarded — a mistyped
+// flag must surface in the logs instead of looking configured. The
+// parsed value is kept verbatim: <=0 is a legitimate setting for the
+// replica-pin knobs (minReplicas<=0 disables the pin).
 func getenvInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
+		ctrl.Log.WithName("env").Info("unparseable integer env value, using default",
+			"key", key, "value", v, "default", def)
 	}
 	return def
 }
 
+// getenvDuration reads a duration env knob. Unparseable values warn and
+// fall back to def; so do parsed values < 1s — every duration knob is
+// a sweep interval, where <=0 is never meaningful and would panic
+// time.NewTicker downstream in shared.Periodic, and a sub-second
+// interval would hot-loop the sweep.
 func getenvDuration(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
+		if d, err := time.ParseDuration(v); err == nil && d >= time.Second {
 			return d
 		}
+		ctrl.Log.WithName("env").Info("invalid duration env value, using default",
+			"key", key, "value", v, "default", def)
 	}
 	return def
 }

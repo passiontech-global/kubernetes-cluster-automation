@@ -9,8 +9,15 @@
 // all network policy.
 //
 // An identity is orphaned when no CiliumEndpoint references its
-// numeric ID (status.identity.id) and no pod carries the
-// cilium.io/identity annotation with it.
+// numeric ID (status.identity.id), no CiliumEndpointSlice endpoint
+// records it (.spec.endpoints[].identity.id — on CES-enabled clusters
+// the agent stops writing CEPs entirely, so without the CES read
+// every live identity would read orphaned), and no pod carries the
+// cilium.io/identity annotation with it. Reserved-range identities
+// (numeric name <=255, or a `reserved:` security label) are skipped
+// before orphan accounting — upstream GC exempts them too. A failed
+// usage-source list (CEP, CES, or pods) aborts the sweep: usage is
+// indeterminate, so nothing is flagged or collected on partial data.
 //
 // v1 was detect-only because an in-flight endpoint create momentarily
 // looks orphaned. v2 makes deletion safe with FOUR stacked gates —
@@ -52,6 +59,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -80,6 +88,13 @@ const (
 	// a burst of cluster-scoped Deletes hammering the apiserver when
 	// a mass-orphan event finally converges.
 	ciliumGCMaxDelete = 50
+	// ciliumListPageSize caps each cluster-wide List response — the
+	// all-namespaces pod read is the biggest this module makes.
+	ciliumListPageSize = 500
+	// ciliumReservedIDMax is the top of Cilium's reserved identity
+	// range (1–255: host, world, health, ingress, ...) — upstream GC
+	// exempts it, so orphan accounting must too.
+	ciliumReservedIDMax = 255
 )
 
 var (
@@ -87,6 +102,11 @@ var (
 		Group: "cilium.io", Version: "v2", Resource: "ciliumidentities"}
 	ciliumEndpointGVR = schema.GroupVersionResource{
 		Group: "cilium.io", Version: "v2", Resource: "ciliumendpoints"}
+	// ciliumEndpointSliceGVR is the v2alpha1 CiliumEndpointSlice —
+	// on CES-enabled clusters the agent stops writing CiliumEndpoints
+	// entirely and records identity usage here instead.
+	ciliumEndpointSliceGVR = schema.GroupVersionResource{
+		Group: "cilium.io", Version: "v2alpha1", Resource: "ciliumendpointslices"}
 )
 
 type ciliumIdentityAuditor struct {
@@ -141,13 +161,22 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list ciliumidentities: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
-	// Keep only name → creationTimestamp: the audit never reads
-	// identity bodies beyond the age gate, and dropping the whole
-	// UnstructuredList here lets GC reclaim it while the two
-	// cluster-wide lists below are still in flight.
+	// Keep only name → (creationTimestamp, UID): the audit never
+	// reads identity bodies beyond the age gate and the delete
+	// precondition, and dropping the whole UnstructuredList here lets
+	// GC reclaim it while the two cluster-wide lists below are still
+	// in flight. Reserved-range identities (1–255, or a `reserved:`
+	// security label) are skipped outright — upstream GC exempts
+	// them, so they are neither orphans nor collectible.
 	idCreated := make(map[string]time.Time, len(ids.Items))
+	idUIDs := make(map[string]types.UID, len(ids.Items))
 	for i := range ids.Items {
-		idCreated[ids.Items[i].GetName()] = ids.Items[i].GetCreationTimestamp().Time
+		id := &ids.Items[i]
+		if reservedIdentity(id) {
+			continue
+		}
+		idCreated[id.GetName()] = id.GetCreationTimestamp().Time
+		idUIDs[id.GetName()] = id.GetUID()
 	}
 	ids = nil
 
@@ -162,31 +191,64 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 			used[id] = struct{}{}
 		}
 	}
-	eps = nil // used-map extracted — release before the pod list lands
+	eps = nil // used-map extracted — release before the next lists land
 
-	// Server-side phase filter: terminal pods hold no live endpoints, so
-	// they are dead weight in the biggest read this module makes. The
-	// in-code phase check stays — fake clientsets ignore field
-	// selectors and the belt costs nothing.
-	pods, err := a.cs.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{
-			FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
-		})
-	if err != nil {
-		return fmt.Errorf("list pods: %w", err) // wrapper IncErrors — a returned error must not count itself
-	}
-	for i := range pods.Items {
-		p := &pods.Items[i]
-		if p.Status.Phase == corev1.PodSucceeded ||
-			p.Status.Phase == corev1.PodFailed {
-			continue
+	// CiliumEndpointSlice is the SECOND identity-usage source: on
+	// CES-enabled clusters the agent stops writing CiliumEndpoints
+	// and records usage in .spec.endpoints[].identity.id instead —
+	// without this read every live identity would read orphaned and
+	// the GC path would reap them. A missing CRD means the cluster
+	// simply does not run CES (fine); any other failure makes usage
+	// indeterminate — fail closed like the CEP/pod lists (a returned
+	// error aborts the run, so the GC path below is never reached on
+	// partial data).
+	slices, err := a.dyn.Resource(ciliumEndpointSliceGVR).
+		Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	switch {
+	case err == nil:
+		for i := range slices.Items {
+			for _, id := range sliceIdentityIDs(&slices.Items[i]) {
+				used[id] = struct{}{}
+			}
 		}
-		if v := strings.TrimSpace(
-			p.Annotations[ciliumIDAnnotation]); v != "" {
-			used[v] = struct{}{}
-		}
+		slices = nil
+	case apierrors.IsNotFound(err):
+		// CES CRD absent — CEP-only cluster, nothing to merge.
+	default:
+		return fmt.Errorf("list ciliumendpointslices: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
-	pods = nil
+
+	// Server-side phase filter + continue-token pagination: terminal
+	// pods hold no live endpoints, and the all-namespaces pod read is
+	// the biggest this module makes — page it at ciliumListPageSize so
+	// no single response dominates. The in-code phase check stays —
+	// fake clientsets ignore field selectors and the belt costs
+	// nothing.
+	podOpts := metav1.ListOptions{
+		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
+		Limit:         ciliumListPageSize,
+	}
+	for {
+		page, err := a.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, podOpts)
+		if err != nil {
+			return fmt.Errorf("list pods: %w", err) // wrapper IncErrors — a returned error must not count itself
+		}
+		for i := range page.Items {
+			p := &page.Items[i]
+			if p.Status.Phase == corev1.PodSucceeded ||
+				p.Status.Phase == corev1.PodFailed {
+				continue
+			}
+			if v := strings.TrimSpace(
+				p.Annotations[ciliumIDAnnotation]); v != "" {
+				used[v] = struct{}{}
+			}
+		}
+		if page.Continue == "" {
+			break
+		}
+		podOpts.Continue = page.Continue
+	}
 
 	// orphanSet doubles as the prune filter: entries whose identity is
 	// referenced again (an endpoint/pod reappeared) or whose object
@@ -242,7 +304,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		// behavior (they have been orphaned for days, not seconds).
 		return nil
 	}
-	return a.gcOrphans(ctx, orphans, idCreated, now)
+	return a.gcOrphans(ctx, orphans, idCreated, idUIDs, now)
 }
 
 // gcOrphans is the v2 delete path: only orphans that satisfy BOTH the
@@ -251,7 +313,8 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 // eligible, and even then deletion only proceeds while every node is
 // Ready — capped at ciliumGCMaxDelete per sweep.
 func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
-	orphans []string, idCreated map[string]time.Time, now time.Time) error {
+	orphans []string, idCreated map[string]time.Time,
+	idUIDs map[string]types.UID, now time.Time) error {
 	log := logf.FromContext(ctx)
 
 	var eligible []string
@@ -303,10 +366,21 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 		log.Info("ACTION: GC orphaned CiliumIdentity",
 			"identity", name,
 			"orphanedFor", now.Sub(a.orphanFirstSeen[name]).Truncate(time.Minute))
+		// UID precondition closes the list→delete TOCTOU: a same-named
+		// identity recreated between the List above and this Delete is
+		// not the orphan this sweep vetted — the apiserver rejects the
+		// delete with a Conflict, skipped like the NotFound race below.
+		uid := idUIDs[name]
 		if err := a.dyn.Resource(ciliumIdentityGVR).
-			Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
-			if apierrors.IsNotFound(err) {
+			Delete(ctx, name, metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil {
+			switch {
+			case apierrors.IsNotFound(err):
 				log.Info("SKIP: identity already gone — raced with cilium's own GC",
+					"identity", name)
+				continue
+			case apierrors.IsConflict(err):
+				log.Info("SKIP: identity recreated since the list — UID precondition fired",
 					"identity", name)
 				continue
 			}
@@ -333,4 +407,56 @@ func endpointIdentityID(ep *unstructured.Unstructured) string {
 		return strconv.FormatInt(int64(f), 10)
 	}
 	return ""
+}
+
+// sliceIdentityIDs extracts every endpoint's identity id from a
+// CiliumEndpointSlice's .spec.endpoints[].identity.id — the CES
+// replacement for the CEP's .status.identity.id. Non-numeric entries
+// are skipped like the CEP path does.
+func sliceIdentityIDs(ces *unstructured.Unstructured) []string {
+	endpoints, _, _ := unstructured.NestedSlice(
+		ces.Object, "spec", "endpoints")
+	out := make([]string, 0, len(endpoints))
+	for _, e := range endpoints {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		if id, found, _ := unstructured.NestedInt64(
+			m, "identity", "id"); found {
+			out = append(out, strconv.FormatInt(id, 10))
+			continue
+		}
+		if f, found, _ := unstructured.NestedFloat64(
+			m, "identity", "id"); found {
+			out = append(out, strconv.FormatInt(int64(f), 10))
+		}
+	}
+	return out
+}
+
+// reservedIdentity exempts Cilium's reserved identity range from
+// orphan accounting: a numeric name <= ciliumReservedIDMax (upstream
+// GC never reaps 1–255) or a security label carrying the `reserved:`
+// prefix (reserved:host, reserved:world, ... — checked in both
+// metadata.labels, where Cilium actually stores identity labels, and
+// .spec.security-labels for shape tolerance).
+func reservedIdentity(id *unstructured.Unstructured) bool {
+	if n, err := strconv.ParseInt(id.GetName(), 10, 64); err == nil &&
+		n <= ciliumReservedIDMax {
+		return true
+	}
+	for k := range id.GetLabels() {
+		if strings.HasPrefix(k, "reserved:") {
+			return true
+		}
+	}
+	secLabels, _, _ := unstructured.NestedStringMap(
+		id.Object, "spec", "security-labels")
+	for k := range secLabels {
+		if strings.HasPrefix(k, "reserved:") {
+			return true
+		}
+	}
+	return false
 }

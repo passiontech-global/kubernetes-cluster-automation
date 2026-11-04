@@ -105,6 +105,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -121,6 +122,7 @@ import (
 )
 
 const (
+	cjQueue       = "concourse-workdir-janitor"
 	cjNamespace   = "concourse"
 	cjStatefulSet = "concourse-worker"
 	// The controller runs in ns node-ops — the cross-namespace short
@@ -134,15 +136,26 @@ const (
 	cjMinNodefsPct  = 60  // nodefs above this forces a wipe too
 	cjOSBaselineGiB = 32  // OS + k0s + other pods beyond imageFs (no anno)
 
-	cjRunTimeout     = 190 * time.Minute // was activeDeadlineSeconds=11400
-	cjDrainTimeout   = 30 * time.Minute  // wait for in-flight builds post-land
-	cjDeleteTimeout  = 5 * time.Minute
-	cjUIDPollTimeout = 5 * time.Minute  // wait for the replacement pod object
-	cjReadyTimeout   = 45 * time.Minute // init-rm rm -rf of a huge work-dir
-	cjReqTimeout     = 30 * time.Second // kubectl --request-timeout equivalent
-	cjATCTimeout     = 15 * time.Second
-	cjFastPoll       = 5 * time.Second  // uid/delete waits (bash `sleep 5`)
-	cjSlowPoll       = 10 * time.Second // drain/ready waits (bash `sleep 10`)
+	cjRunTimeout   = 190 * time.Minute // was activeDeadlineSeconds=11400
+	cjDrainTimeout = 30 * time.Minute  // wait for in-flight builds post-land
+	// cjLandFailWait bounds the drain confirmation when land-worker
+	// itself failed — the drain never started, so waiting the full
+	// drainTimeout only stalls the sweep while state reads
+	// "running". The pod delete then proceeds on the same policy as
+	// a timed-out drain.
+	cjLandFailWait = time.Minute
+	// cjPruneStateTimeout bounds the worker-state poll inside
+	// maybePruneWorker — the ATC de-registers a dead worker
+	// asynchronously, so a single "running" read right after pod
+	// delete does not prove the prune window closed.
+	cjPruneStateTimeout = time.Minute
+	cjDeleteTimeout     = 5 * time.Minute
+	cjUIDPollTimeout    = 5 * time.Minute  // wait for the replacement pod object
+	cjReadyTimeout      = 45 * time.Minute // init-rm rm -rf of a huge work-dir
+	cjReqTimeout        = 30 * time.Second // kubectl --request-timeout equivalent
+	cjATCTimeout        = 15 * time.Second
+	cjFastPoll          = 5 * time.Second  // uid/delete waits (bash `sleep 5`)
+	cjSlowPoll          = 10 * time.Second // drain/ready waits (bash `sleep 10`)
 
 	// cjKuredLockAnno is the reboot-coordination lock kured holds
 	// while a node drains for its reboot window (2.7 signal b).
@@ -191,6 +204,8 @@ type concourseWorkdirJanitor struct {
 	runTimeout     time.Duration
 	reqTimeout     time.Duration
 	drainTimeout   time.Duration
+	landFailWait   time.Duration
+	pruneStateWait time.Duration
 	deleteTimeout  time.Duration
 	uidPollTimeout time.Duration
 	readyTimeout   time.Duration
@@ -213,13 +228,15 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, ena
 		runTimeout:     cjRunTimeout,
 		reqTimeout:     cjReqTimeout,
 		drainTimeout:   cjDrainTimeout,
+		landFailWait:   cjLandFailWait,
+		pruneStateWait: cjPruneStateTimeout,
 		deleteTimeout:  cjDeleteTimeout,
 		uidPollTimeout: cjUIDPollTimeout,
 		readyTimeout:   cjReadyTimeout,
 		fastPoll:       cjFastPoll,
 		slowPoll:       cjSlowPoll,
 	}
-	return shared.AddPeriodic(mgr, "concourse-workdir-janitor", 30*time.Minute, j.run)
+	return shared.AddPeriodic(mgr, cjQueue, 30*time.Minute, j.run)
 }
 
 func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
@@ -319,6 +336,14 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 			podName, s.workdirGiB, cjMaxWorkdirGiB, s.pct, cjMinNodefsPct))
 		return false, nil
 	}
+	if !s.nodefsOK || !s.workdirOK {
+		// A blind wipe is deliberate fail-open policy, but a
+		// persistently-unreadable stats path must be visible on the
+		// error metric — not just in logs.
+		metrics.IncError(cjQueue)
+		log.Info(fmt.Sprintf("WARN %s: wiping with unreadable stats (nodefsOK=%v workdirOK=%v)",
+			podName, s.nodefsOK, s.workdirOK))
+	}
 
 	// A pod created < readyTimeout ago that is still not Ready is
 	// almost certainly inside init-rm from an earlier wipe (a full
@@ -392,17 +417,22 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 // waits for state=landed — all in-flight builds done. A drain timeout
 // still proceeds to delete: the goal is reclaiming disk and builds
 // running >30m get cut (accepted trade-off — used to be >60s).
+// When land-worker itself fails the drain never started, so the wait
+// is shortened to landFailWait — a state read of "running" is then
+// the expected steady state, not a drain in progress.
 func (j *concourseWorkdirJanitor) drain(ctx context.Context, podName string, log logr.Logger) {
 	log.Info(fmt.Sprintf("=== %s: land-worker ===", podName))
+	bound := j.drainTimeout
 	if err := j.atc.landWorker(ctx, podName); err != nil {
 		log.Info(fmt.Sprintf("WARN %s: land-worker failed: %v", podName, err))
+		bound = j.landFailWait
 	}
-	dctx, cancel := context.WithTimeout(ctx, j.drainTimeout)
+	dctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
 	err := wait.PollUntilContextCancel(dctx, j.slowPoll, true,
 		func(ctx context.Context) (bool, error) {
 			// "" only means drained when the ATC call SUCCEEDED — an
-			// errored poll keeps waiting (up to drainTimeout), so a
+			// errored poll keeps waiting (up to the bound), so a
 			// transient ATC blip cannot cut in-flight builds early.
 			// (Bash could not tell the two apart; Go can.)
 			st, werr := j.atc.workerState(ctx, podName)
@@ -410,7 +440,7 @@ func (j *concourseWorkdirJanitor) drain(ctx context.Context, podName string, log
 		})
 	if err != nil {
 		log.Info(fmt.Sprintf("WARN %s: drain exceeded %s — still deleting pod",
-			podName, j.drainTimeout))
+			podName, bound))
 	} else {
 		log.Info(fmt.Sprintf("=== %s: drained ===", podName))
 	}
@@ -418,15 +448,38 @@ func (j *concourseWorkdirJanitor) drain(ctx context.Context, podName string, log
 
 // maybePruneWorker issues prune-worker while the ATC still records a
 // non-running state — inside the window between the old pod's
-// termination and the new worker's re-registration.
+// termination and the new worker's re-registration. The ATC clears
+// the worker record asynchronously, so state can still read
+// "running" for a few seconds right after the pod died: poll
+// (bounded by pruneStateWait) until it settles instead of deciding
+// on a single laggy read.
 func (j *concourseWorkdirJanitor) maybePruneWorker(ctx context.Context, podName string, log logr.Logger) {
-	st, err := j.atc.workerState(ctx, podName)
-	if err != nil {
-		log.Info(fmt.Sprintf("WARN %s: worker state unreadable (%v) — no prune", podName, err))
+	pctx, cancel := context.WithTimeout(ctx, j.pruneStateWait)
+	defer cancel()
+	var st string
+	var lastErr error
+	// The first check is immediate; a timeout just means the last
+	// read stands — the decision below uses it either way.
+	_ = wait.PollUntilContextCancel(pctx, j.fastPoll, true,
+		func(ctx context.Context) (bool, error) {
+			s, err := j.atc.workerState(ctx, podName)
+			if err != nil {
+				lastErr = err
+				return false, nil // transient — keep polling inside the bound
+			}
+			lastErr = nil
+			st = s
+			return s != "running", nil
+		})
+	if lastErr != nil {
+		log.Info(fmt.Sprintf("WARN %s: worker state unreadable (%v) — no prune", podName, lastErr))
 		return
 	}
 	switch st {
-	case "stalled", "landed", "retired", "retiring":
+	// "landing" too: a drain that timed out mid-land still leaves a
+	// ghost worker record (and its claimed volumes) at the ATC — the
+	// worker already stopped picking up builds, so pruning is safe.
+	case "stalled", "landing", "landed", "retired", "retiring":
 		log.Info(fmt.Sprintf("=== %s: worker state=%s — prune before new pod Ready ===", podName, st))
 		if err := j.atc.pruneWorker(ctx, podName); err != nil {
 			log.Info(fmt.Sprintf("WARN %s: prune-worker failed: %v", podName, err))
@@ -468,8 +521,12 @@ func (j *concourseWorkdirJanitor) workerReplicas(ctx context.Context) (int32, er
 func (j *concourseWorkdirJanitor) deletePod(ctx context.Context, name string, oldUID types.UID) error {
 	dctx, cancel := context.WithTimeout(ctx, j.deleteTimeout)
 	defer cancel()
-	if err := j.cs.CoreV1().Pods(cjNamespace).Delete(dctx, name, metav1.DeleteOptions{}); err != nil &&
-		!apierrors.IsNotFound(err) {
+	// UID precondition: oldUID was re-fetched right before this call
+	// — if the object already churned to a new UID, the delete must
+	// conflict rather than remove a pod we never vetted.
+	if err := j.cs.CoreV1().Pods(cjNamespace).Delete(dctx, name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &oldUID},
+	}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete pod %s: %w", name, err)
 	}
 	err := wait.PollUntilContextCancel(dctx, j.fastPoll, true,
@@ -601,6 +658,10 @@ func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod
 	defer cancel()
 	used, capBytes, imgUsed, err := j.stats.Summary(cctx, s.node)
 	if err != nil {
+		// Fail-open is deliberate, but a persistently-broken
+		// stats/summary path must show up on the error metric —
+		// every pod will blind-wipe until it is fixed.
+		metrics.IncError(cjQueue)
 		logf.FromContext(ctx).Info(fmt.Sprintf(
 			"WARN %s: stats/summary unreadable on node %s: %v — disk unknown, fail-open",
 			pod.Name, s.node, err))
@@ -710,8 +771,13 @@ func (r *kubeletStatsReader) Summary(ctx context.Context, node string) (nodefsUs
 // DaemonSet or absent autopilot CRD is not evidence; real API
 // failures are errors — "cannot verify" must never read as "clear".
 func (j *concourseWorkdirJanitor) maintenanceHeld(ctx context.Context) (bool, string, error) {
+	// The mutex runs BEFORE the whole-run timeout installs, so every
+	// call here carries its own reqTimeout — an apiserver hang must
+	// not pin the periodic sweep forever.
 	// (a) cordon/drain in progress.
-	nodes, err := shared.ListNodes(ctx, j.cs)
+	nctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
+	nodes, err := shared.ListNodes(nctx, j.cs)
+	cancel()
 	if err != nil {
 		return false, "", fmt.Errorf("list nodes (maintenance mutex): %w", err)
 	}
@@ -723,8 +789,10 @@ func (j *concourseWorkdirJanitor) maintenanceHeld(ctx context.Context) (bool, st
 
 	// (b) kured holding its node-lock annotation means a reboot
 	// drain is in progress right now.
+	dctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
 	ds, err := j.cs.AppsV1().DaemonSets(cjKuredDaemonSetNS).
-		Get(ctx, cjKuredDaemonSetName, metav1.GetOptions{})
+		Get(dctx, cjKuredDaemonSetName, metav1.GetOptions{})
+	cancel()
 	switch {
 	case apierrors.IsNotFound(err):
 		// kured not installed on this cluster — no signal.
@@ -745,8 +813,10 @@ func (j *concourseWorkdirJanitor) maintenanceHeld(ctx context.Context) (bool, st
 	if j.dyn == nil {
 		return false, "", fmt.Errorf("no dynamic client — autopilot plan check unverifiable (maintenance mutex)")
 	}
+	pctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
 	plans, err := j.dyn.Resource(cjAutopilotPlanGVR).
-		List(ctx, metav1.ListOptions{})
+		List(pctx, metav1.ListOptions{})
+	cancel()
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// autopilot CRD not installed — no signal.

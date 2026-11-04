@@ -340,35 +340,48 @@ func (w *coreDNSWatchdog) logHit(ctx context.Context, pod string) string {
 // "" when nothing qualifies (inconclusive).
 func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) string {
 	log := logf.FromContext(ctx)
-	svcs, err := w.cs.CoreV1().Services("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.Info("dns: cannot list services — layer 2 inconclusive", "error", err)
-		return ""
+	// Page the cluster-wide Service list — an unbounded List forces
+	// etcd to serialize every Service into one response; 500-per-page
+	// keeps each request cheap at fleet scale.
+	var svcItems []corev1.Service
+	cont := ""
+	for {
+		page, err := w.cs.CoreV1().Services(metav1.NamespaceAll).List(ctx,
+			metav1.ListOptions{Limit: 500, Continue: cont})
+		if err != nil {
+			log.Info("dns: cannot list services — layer 2 inconclusive", "error", err)
+			return ""
+		}
+		svcItems = append(svcItems, page.Items...)
+		if page.Continue == "" {
+			break
+		}
+		cont = page.Continue
 	}
-	sort.Slice(svcs.Items, func(i, j int) bool {
-		return svcs.Items[i].CreationTimestamp.Time.
-			After(svcs.Items[j].CreationTimestamp.Time)
+	sort.Slice(svcItems, func(i, j int) bool {
+		return svcItems[i].CreationTimestamp.Time.
+			After(svcItems[j].CreationTimestamp.Time)
 	})
 	type svcCand struct {
 		ns, name string
 		created  time.Time
 	}
-	n := len(svcs.Items)
+	n := len(svcItems)
 	if n > 8 { // bash: top-8 newest BEFORE the age filter
 		n = 8
 	}
 	cands := make([]svcCand, 0, n)
 	for i := 0; i < n; i++ {
-		s := &svcs.Items[i]
+		s := &svcItems[i]
 		cands = append(cands, svcCand{
 			ns:      s.Namespace,
 			name:    s.Name,
 			created: s.CreationTimestamp.Time,
 		})
 	}
-	// Release the cluster-wide ServiceList before issuing per-service
-	// EndpointSlice queries.
-	svcs = nil
+	// Release the cluster-wide Service slice before issuing
+	// per-service EndpointSlice queries.
+	svcItems = nil
 
 	for _, svc := range cands {
 		if time.Since(svc.created) >= corednsLogSinceS*time.Second {
@@ -423,7 +436,15 @@ func (w *coreDNSWatchdog) panics(ctx context.Context, podIP string) (float64, bo
 	if err != nil {
 		return 0, false
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Drain before Close — an unread body makes the connection
+		// unreusable, which silently defeats keep-alive on the
+		// shared transport (same pattern as the apiserver endpoint
+		// guard). Bounded to the same 4MiB as the scan so a
+		// pathological body cannot pin the sweep either.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024*1024))
+		resp.Body.Close()
+	}()
 	if resp.StatusCode != http.StatusOK {
 		return 0, false
 	}

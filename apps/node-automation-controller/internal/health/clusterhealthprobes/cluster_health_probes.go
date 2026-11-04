@@ -102,31 +102,75 @@ func healthEnv(key, def string) string {
 	return def
 }
 
+// healthEnvDuration parses a duration env knob, warning + defaulting
+// on two failure shapes: unparseable values (typos, unit-less numbers)
+// and non-positive durations — a 0s/negative check timeout would make
+// every probe fail instantly, and a 0s interval would panic the
+// periodic ticker registration downstream.
 func healthEnvDuration(key string, def time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
-	return def
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		logf.Log.WithName(clusterHealthQueue).Info(
+			"invalid env duration — using default", "key", key, "value", v,
+			"default", def)
+		return def
+	}
+	if d <= 0 {
+		logf.Log.WithName(clusterHealthQueue).Info(
+			"non-positive env duration — using default", "key", key,
+			"value", v, "default", def)
+		return def
+	}
+	return d
 }
 
+// healthEnvInt parses an integer env knob, warning + defaulting on
+// unparseable values and negatives — e.g. HEALTH_MAX_POD_RESTARTS=-1
+// would flag every container as over-limit.
 func healthEnvInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		logf.Log.WithName(clusterHealthQueue).Info(
+			"invalid env int — using default", "key", key, "value", v,
+			"default", def)
+		return def
+	}
+	if n < 0 {
+		logf.Log.WithName(clusterHealthQueue).Info(
+			"negative env int — using default", "key", key, "value", v,
+			"default", def)
+		return def
+	}
+	return n
 }
 
+// healthEnvFloat parses a float env knob, warning + defaulting on
+// unparseable values (a garbage threshold string must not silently
+// collapse to the default without an operator-visible note).
 func healthEnvFloat(key string, def float64) float64 {
-	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
-	return def
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 {
+		// Non-positive thresholds are never meaningful (a <=0
+		// quota threshold flags EVERYTHING); >1 is kept as the
+		// operator's documented "disable this check" escape.
+		logf.Log.WithName(clusterHealthQueue).Info(
+			"invalid env float — using default", "key", key, "value", v,
+			"default", def)
+		return def
+	}
+	return f
 }
 
 // healthProbeConfigFromEnv resolves the check knobs once at Setup.

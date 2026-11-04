@@ -39,9 +39,11 @@ func veleroSchedule(ns, name string, paused bool, age time.Duration) *unstructur
 }
 
 // veleroBackup builds a Backup owned by `schedule`; phase plus the
-// status counters drive the rot signatures.
+// status counters drive the rot signatures. progress carries Velero's
+// real fields — itemsBackedUp/totalItems (BackupProgress has no
+// totalBytes; the old fixture field never existed upstream).
 func veleroBackup(ns, name, schedule, phase string, age time.Duration,
-	items, bytes, errs, warns int64) *unstructured.Unstructured {
+	items, total, errs, warns int64) *unstructured.Unstructured {
 	o := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "velero.io/v1",
 		"kind":       "Backup",
@@ -52,7 +54,7 @@ func veleroBackup(ns, name, schedule, phase string, age time.Duration,
 			"warnings": warns,
 			"progress": map[string]any{
 				"itemsBackedUp": items,
-				"totalBytes":    bytes,
+				"totalItems":    total,
 			},
 		},
 	}}
@@ -242,6 +244,17 @@ func TestVeleroBackupAuditorPauseLedgerReset(t *testing.T) {
 // newer backup clears the flag a broken older one would set; and a
 // non-Completed phase flags nothing (partial counters, not rot).
 func TestVeleroBackupAuditorEmptyOrErrored(t *testing.T) {
+	// A Completed backup with NO progress block (older Velero,
+	// stripped status) is "can't tell" — it must NOT flag zero_items;
+	// a backup whose only progress field is totalItems==0 still flags.
+	noProgress := veleroBackup("velero", "b-noprogress", "noprogress-sched",
+		"Completed", time.Hour, 0, 0, 0, 0)
+	delete(noProgress.Object["status"].(map[string]any), "progress")
+	totalOnly := veleroBackup("velero", "b-totalonly", "totalonly-sched",
+		"Completed", time.Hour, 0, 0, 0, 0)
+	totalOnly.Object["status"].(map[string]any)["progress"] =
+		map[string]any{"totalItems": int64(0)}
+
 	dyn := newDynFake(
 		veleroSchedule("velero", "empty-sched", false, 72*time.Hour),
 		veleroSchedule("velero", "err-sched", false, 72*time.Hour),
@@ -253,6 +266,8 @@ func TestVeleroBackupAuditorEmptyOrErrored(t *testing.T) {
 		// counters, NOT the rot signature (the Completed gate).
 		veleroSchedule("velero", "inflight-sched", false, 72*time.Hour),
 		veleroSchedule("velero", "failed-sched", false, 72*time.Hour),
+		veleroSchedule("velero", "noprogress-sched", false, 72*time.Hour),
+		veleroSchedule("velero", "totalonly-sched", false, 72*time.Hour),
 		veleroBackup("velero", "b-empty", "empty-sched", "Completed",
 			time.Hour, 0, 0, 0, 0),
 		veleroBackup("velero", "b-err", "err-sched", "Completed",
@@ -269,6 +284,7 @@ func TestVeleroBackupAuditorEmptyOrErrored(t *testing.T) {
 			time.Hour, 0, 0, 5, 3),
 		veleroBackup("velero", "b-failed", "failed-sched", "Failed",
 			time.Hour, 0, 0, 5, 3),
+		noProgress, totalOnly,
 		// Manual backup with no schedule label — must not leak into a schedule.
 		veleroBackup("velero", "b-manual", "", "Completed",
 			10*time.Minute, 0, 0, 0, 0))
@@ -281,6 +297,7 @@ func TestVeleroBackupAuditorEmptyOrErrored(t *testing.T) {
 		{"velero", "empty-sched", "zero_items"},
 		{"velero", "err-sched", "errors"},
 		{"velero", "warn-sched", "warnings"},
+		{"velero", "totalonly-sched", "zero_items"}, // totalItems==0 alone still flags
 	} {
 		if v, ok := badSeries(t, tc[0], tc[1], tc[2]); !ok || v != 1 {
 			t.Fatalf("%s series = %v,%v, want 1,true", tc[2], v, ok)
@@ -290,13 +307,14 @@ func TestVeleroBackupAuditorEmptyOrErrored(t *testing.T) {
 		{"velero", "healthy-sched", "zero_items"},
 		{"velero", "healthy-sched", "errors"},
 		{"velero", "healthy-sched", "warnings"},
-		{"velero", "recovered-sched", "zero_items"}, // newest backup is healthy
-		{"velero", "inflight-sched", "zero_items"},  // phase gate
-		{"velero", "inflight-sched", "errors"},      // phase gate
-		{"velero", "inflight-sched", "warnings"},    // phase gate
-		{"velero", "failed-sched", "zero_items"},    // phase gate
-		{"velero", "failed-sched", "errors"},        // phase gate
-		{"velero", "failed-sched", "warnings"},      // phase gate
+		{"velero", "recovered-sched", "zero_items"},  // newest backup is healthy
+		{"velero", "inflight-sched", "zero_items"},   // phase gate
+		{"velero", "inflight-sched", "errors"},       // phase gate
+		{"velero", "inflight-sched", "warnings"},     // phase gate
+		{"velero", "failed-sched", "zero_items"},     // phase gate
+		{"velero", "failed-sched", "errors"},         // phase gate
+		{"velero", "failed-sched", "warnings"},       // phase gate
+		{"velero", "noprogress-sched", "zero_items"}, // no progress block — can't tell
 	} {
 		if _, ok := badSeries(t, tc[0], tc[1], tc[2]); ok {
 			t.Fatalf("non-Completed/healthy backup produced a %s series for %s", tc[2], tc[1])

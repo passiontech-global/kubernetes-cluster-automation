@@ -7,11 +7,13 @@
 //     restore test finds nothing to restore.
 //  2. Empty/errored backups: the LATEST Backup a Schedule produced
 //     reporting phase=Completed with progress.itemsBackedUp==0 or
-//     progress.totalBytes==0 (reason=zero_items), or status.errors>0
-//     (reason=errors), or status.warnings>0 (reason=warnings) — a
-//     "successful" backup of nothing is worse than a failed one: it
-//     LOOKS protected. All three reasons gate on Completed: partial
-//     counters on an in-flight or failed backup are not rot.
+//     progress.totalItems==0 — progress fields actually PRESENT, else
+//     the read is "can't tell" (reason=zero_items) — or
+//     status.errors>0 (reason=errors), or status.warnings>0
+//     (reason=warnings) — a "successful" backup of nothing is worse
+//     than a failed one: it LOOKS protected. All three reasons gate
+//     on Completed: partial counters on an in-flight or failed
+//     backup are not rot.
 //
 // Clusters without Velero have no CRDs — the Schedule List 404s and
 // the sweep no-ops quietly (same contract as externalsecret-nudge).
@@ -240,15 +242,20 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 	if phase != "Completed" {
 		return
 	}
-	items, _, _ := unstructured.NestedInt64(
+	// Velero's BackupProgress carries itemsBackedUp/totalItems — there
+	// is no totalBytes field (reading one always yields 0). Both reads
+	// gate on `found`: a Completed backup with no progress block at
+	// all (older Velero, stripped status) is "can't tell", not empty —
+	// without the gate every absent-progress backup false-flags.
+	items, itemsFound, _ := unstructured.NestedInt64(
 		b.Object, "status", "progress", "itemsBackedUp")
-	bytes, _, _ := unstructured.NestedInt64(
-		b.Object, "status", "progress", "totalBytes")
-	if items == 0 || bytes == 0 {
+	total, totalFound, _ := unstructured.NestedInt64(
+		b.Object, "status", "progress", "totalItems")
+	if (itemsFound && items == 0) || (totalFound && total == 0) {
 		current[backupKey{ns, schedule, "zero_items"}] = true
 		metrics.VeleroBackupEmptyOrErrored.
 			WithLabelValues(ns, schedule, "zero_items").Set(1)
-		log.Info("velero backup completed with zero items/bytes",
+		log.Info("velero backup completed with zero items",
 			"backup", b.GetNamespace()+"/"+b.GetName(), "schedule", ns+"/"+schedule)
 	}
 	if errs, _, _ := unstructured.NestedInt64(b.Object, "status", "errors"); errs > 0 {

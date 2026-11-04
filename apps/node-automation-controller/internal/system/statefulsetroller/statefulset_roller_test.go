@@ -31,6 +31,10 @@ func srSTS(ns, name string, optedIn bool) *appsv1.StatefulSet {
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, Annotations: annos},
 		Spec: appsv1.StatefulSetSpec{
+			// The selector feeds the server-side pod-list filter in
+			// ownedPods — a real StatefulSet always carries one.
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": name}},
 			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
 				Type: appsv1.OnDeleteStatefulSetStrategyType,
 			},
@@ -85,6 +89,27 @@ func srRoller(cs *fake.Clientset, now time.Time) *statefulSetOnDeleteRoller {
 		nowFn: func() time.Time { return now }, driftSince: map[string]time.Time{}}
 }
 
+// emulateEviction teaches the fake clientset the apiserver's
+// pods/eviction contract: the fake tracker records a pods/eviction
+// CREATE but never deletes the pod (fixture.go only applies
+// same-type subresource writes, and an Eviction is not a Pod), so
+// tests asserting the pod is gone wire the delete themselves. PDB
+// budget enforcement is apiserver-only and stays untested here —
+// the gate-2 pre-check remains the observable contract.
+func emulateEviction(cs *fake.Clientset) {
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil // a real pod create — let the tracker take it
+			}
+			ev := ca.GetObject().(*policyv1.Eviction)
+			return true, ev, cs.Tracker().Delete(
+				corev1.SchemeGroupVersion.WithResource("pods"),
+				ca.GetNamespace(), ev.Name)
+		})
+}
+
 // srNodes returns n Ready workers.
 func srNodes(n int) []runtime.Object {
 	var out []runtime.Object
@@ -115,6 +140,7 @@ func TestStatefulSetRollerDeletesHighestStaleOrdinal(t *testing.T) {
 		srPod("db", 1, "rev-old", 30*time.Minute),
 		srPod("db", 2, "rev-new", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
 	r := srRoller(cs, t0)
 
 	if err := r.run(ctx); err != nil { // seeds driftSince
@@ -129,6 +155,23 @@ func TestStatefulSetRollerDeletesHighestStaleOrdinal(t *testing.T) {
 	}
 	if srPodExists(t, cs, "apps", "db-1") {
 		t.Fatal("highest stale-ordinal pod not deleted")
+	}
+	// The roll must go through the eviction subresource (PDB budget
+	// enforced+consumed atomically), never a raw pod delete.
+	evicts, deletes := 0, 0
+	for _, a := range cs.Actions() {
+		if a.GetResource().Resource != "pods" {
+			continue
+		}
+		if a.GetVerb() == "create" && a.GetSubresource() == "eviction" {
+			evicts++
+		}
+		if a.GetVerb() == "delete" {
+			deletes++
+		}
+	}
+	if evicts != 1 || deletes != 0 {
+		t.Fatalf("pod actions: %d evictions, %d raw deletes — want 1/0", evicts, deletes)
 	}
 	for _, name := range []string{"db-0", "db-2"} {
 		if !srPodExists(t, cs, "apps", name) {
@@ -223,6 +266,7 @@ func TestStatefulSetRollerPDBGate(t *testing.T) {
 		srPod("db", 0, "rev-old", 30*time.Minute),
 		pdb)
 	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince["apps/db"] = t0.Add(-time.Hour)
 	if err := r.run(ctx); err != nil {
@@ -290,6 +334,7 @@ func TestStatefulSetRollerMissingRevisionLabel(t *testing.T) {
 		srPod("db", 0, "rev-old", 30*time.Minute),
 		unlabeled)
 	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince["apps/db"] = t0.Add(-time.Hour)
 	if err := r.run(ctx); err != nil {
@@ -319,6 +364,7 @@ func TestStatefulSetRollerTerminatingPodIgnored(t *testing.T) {
 		srPod("db", 1, "rev-new", 30*time.Minute),
 		terminating)
 	cs := fake.NewSimpleClientset(objs...)
+	emulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince["apps/db"] = t0.Add(-time.Hour)
 	if err := r.run(ctx); err != nil {
@@ -411,6 +457,49 @@ func TestStatefulSetRollerDriftReArms(t *testing.T) {
 	}
 	if !srPodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod deleted after drift settled")
+	}
+}
+
+// ownedPods scopes the server-side List to sts.Spec.Selector: an
+// owned pod whose labels no longer match the selector is excluded,
+// and same-namespace pods of other sets never leave etcd. Without
+// the selector every STS would drag the whole namespace's pod list
+// per sweep.
+func TestStatefulSetRollerOwnedPodsScopedBySelector(t *testing.T) {
+	sts := srSTS("apps", "db", true) // selector app=db
+	mislabeled := srPod("db", 1, "rev-old", 30*time.Minute)
+	mislabeled.Labels = map[string]string{"app": "other"} // owned but off-selector
+	cs := fake.NewSimpleClientset(
+		sts,
+		srPod("db", 0, "rev-old", 30*time.Minute),
+		mislabeled,
+		srPod("other", 0, "rev-old", 30*time.Minute)) // other STS entirely
+	r := srRoller(cs, time.Now())
+	pods, err := r.ownedPods(ctx, sts)
+	if err != nil {
+		t.Fatalf("ownedPods: %v", err)
+	}
+	if len(pods) != 1 || pods[0].Name != "db-0" {
+		names := []string{}
+		for _, p := range pods {
+			names = append(names, p.Name)
+		}
+		t.Fatalf("ownedPods = %v, want [db-0]", names)
+	}
+}
+
+// A selector that cannot parse must fail closed — an error skips the
+// roll rather than listing (and maybe deleting) from an unfiltered
+// pod set.
+func TestStatefulSetRollerSelectorParseErrorFailsClosed(t *testing.T) {
+	sts := srSTS("apps", "db", true)
+	sts.Spec.Selector = &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{{
+			Key: "app", Operator: "BogusOperator"}}}
+	cs := fake.NewSimpleClientset(sts, srPod("db", 0, "rev-old", 30*time.Minute))
+	r := srRoller(cs, time.Now())
+	if _, err := r.ownedPods(ctx, sts); err == nil {
+		t.Fatal("expected error on an unparseable STS selector")
 	}
 }
 

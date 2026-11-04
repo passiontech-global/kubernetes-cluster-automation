@@ -36,6 +36,7 @@ func newDynFake(objs ...runtime.Object) *fake.FakeDynamicClient {
 		fluxSourceGVRs["GitRepository"]:  "GitRepositoryList",
 		fluxSourceGVRs["HelmRepository"]: "HelmRepositoryList",
 		fluxSourceGVRs["OCIRepository"]:  "OCIRepositoryList",
+		fluxSourceGVRs["Bucket"]:         "BucketList",
 	}, objs...)
 }
 
@@ -123,7 +124,6 @@ func newUnlocker(cs *kfake.Clientset, dyn *fake.FakeDynamicClient, stuckFor time
 // pending secret deleted and reconcile requested on the HR.
 func TestHelmReleaseUnlockerDeletesPendingSecret(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
-	hrTarget(hr, "apps")
 	hrReady(hr, "False", "Helm upgrade failed: another operation (install/upgrade/rollback) is in progress")
 
 	dyn := newDynFake(hr)
@@ -164,7 +164,6 @@ func TestHelmReleaseUnlockerDeletesPendingSecret(t *testing.T) {
 // deleting it would orphan the release.
 func TestHelmReleaseUnlockerNoOlderDeployed(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
-	hrTarget(hr, "apps")
 	hrReady(hr, "False", "Helm install failed: another operation is in progress")
 
 	dyn := newDynFake(hr)
@@ -187,7 +186,6 @@ func TestHelmReleaseUnlockerNoOlderDeployed(t *testing.T) {
 // unlock did not fix it → alert (IncError), no action.
 func TestHelmReleaseUnlockerCooldownAlert(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
-	hrTarget(hr, "apps")
 	hrReady(hr, "False", "another operation is in progress")
 
 	dyn := newDynFake(hr)
@@ -215,7 +213,6 @@ func TestHelmReleaseUnlockerCooldownAlert(t *testing.T) {
 // Cooldown expired (>24h) → a fresh unlock IS allowed.
 func TestHelmReleaseUnlockerCooldownExpired(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
-	hrTarget(hr, "apps")
 	hrReady(hr, "False", "another operation is in progress")
 
 	dyn := newDynFake(hr)
@@ -237,7 +234,6 @@ func TestHelmReleaseUnlockerCooldownExpired(t *testing.T) {
 // without a working controller the unlock cannot converge.
 func TestHelmReleaseUnlockerCrashLoopSkip(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
-	hrTarget(hr, "apps")
 	hrReady(hr, "False", "another operation is in progress")
 
 	dyn := newDynFake(hr)
@@ -269,7 +265,6 @@ func TestHelmReleaseUnlockerCrashLoopSkip(t *testing.T) {
 // never acted on until the window elapses.
 func TestHelmReleaseUnlockerFirstSeenGate(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
-	hrTarget(hr, "apps")
 	hrReady(hr, "False", "another operation is in progress")
 
 	dyn := newDynFake(hr)
@@ -310,7 +305,6 @@ func TestHelmReleaseUnlockerFirstSeenGate(t *testing.T) {
 // Recovery prunes the first-seen marker so a later stall re-arms.
 func TestHelmReleaseUnlockerRecoveryPrunesFirstSeen(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
-	hrTarget(hr, "apps")
 	hrReady(hr, "False", "another operation is in progress")
 
 	dyn := newDynFake(hr)
@@ -341,7 +335,6 @@ func TestHelmReleaseUnlockerRecoveryPrunesFirstSeen(t *testing.T) {
 // v2 list fails (older flux / CRDs absent) → fall back to v2beta2.
 func TestHelmReleaseUnlockerV2beta2Fallback(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2beta2")
-	hrTarget(hr, "apps")
 	hrReady(hr, "False", "another operation is in progress")
 
 	dyn := newDynFake(hr)
@@ -386,7 +379,6 @@ func TestHelmReleaseUnlockerListError(t *testing.T) {
 // "in progress" past the 30m window plus a deployed + pending secret pair.
 func stuckHRFixture() (*fake.FakeDynamicClient, []runtime.Object) {
 	hr := hrObj("apps", "myapp", "v2")
-	hrTarget(hr, "apps")
 	hrReady(hr, "False", "another operation is in progress")
 	return newDynFake(hr), []runtime.Object{
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v1", "myapp", 1, "deployed"),
@@ -521,35 +513,132 @@ func TestHelmReleaseUnlockerAnnotateError(t *testing.T) {
 	}
 }
 
-// spec.releaseName / spec.targetNamespace / spec.storageNamespace
-// drive where the release secrets live: storageNamespace wins (flux
-// stores them there when set), targetNamespace is next, the HR's own
-// namespace is the last fallback.
+// The three resolvers mirror upstream flux exactly:
+//   - hrReleaseName = GetReleaseName(): spec.releaseName, then
+//     "<targetNamespace>-<name>" when targetNamespace is set, then the
+//     bare object name;
+//   - hrStorageNS = GetStorageNamespace(): spec.storageNamespace ||
+//     HR namespace — where the release secrets live (targetNamespace
+//     is NOT in this chain);
+//   - hrReleaseNS = spec.targetNamespace || HR namespace — where the
+//     release (and its hook Jobs) is installed.
 func TestHRNameAndNamespaceFallbacks(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
 	if got := hrReleaseName(hr); got != "myapp" {
 		t.Fatalf("hrReleaseName fallback = %q, want myapp", got)
 	}
-	if got := hrTargetNS(hr); got != "apps" {
-		t.Fatalf("hrTargetNS fallback = %q, want apps", got)
+	if got := hrStorageNS(hr); got != "apps" {
+		t.Fatalf("hrStorageNS fallback = %q, want apps", got)
+	}
+	if got := hrReleaseNS(hr); got != "apps" {
+		t.Fatalf("hrReleaseNS fallback = %q, want apps", got)
 	}
 
-	hr.Object["spec"] = map[string]any{
-		"releaseName":     "customrel",
-		"targetNamespace": "target-ns",
+	// targetNamespace alone prefixes the release name (flux's rule —
+	// same-named HRs released into different namespaces must not
+	// collide) and moves the RELEASE ns, but the secrets stay in the
+	// HR's own namespace (the storage default).
+	hr.Object["spec"] = map[string]any{"targetNamespace": "target-ns"}
+	if got := hrReleaseName(hr); got != "target-ns-myapp" {
+		t.Fatalf("hrReleaseName = %q, want target-ns-myapp", got)
 	}
+	if got := hrStorageNS(hr); got != "apps" {
+		t.Fatalf("hrStorageNS = %q, want apps (targetNamespace is not storage)", got)
+	}
+	if got := hrReleaseNS(hr); got != "target-ns" {
+		t.Fatalf("hrReleaseNS = %q, want target-ns", got)
+	}
+
+	// releaseName wins over the prefix rule.
+	hr.Object["spec"].(map[string]any)["releaseName"] = "customrel"
 	if got := hrReleaseName(hr); got != "customrel" {
 		t.Fatalf("hrReleaseName = %q, want customrel", got)
 	}
-	if got := hrTargetNS(hr); got != "target-ns" {
-		t.Fatalf("hrTargetNS = %q, want target-ns", got)
-	}
 
-	// storageNamespace outranks targetNamespace — the release secrets
-	// live there, so that is where the unlock must look.
+	// storageNamespace moves ONLY the secrets — release name and
+	// release namespace are untouched by it.
 	hr.Object["spec"].(map[string]any)["storageNamespace"] = "storage-ns"
-	if got := hrTargetNS(hr); got != "storage-ns" {
-		t.Fatalf("hrTargetNS = %q, want storage-ns (storageNamespace precedence)", got)
+	if got := hrStorageNS(hr); got != "storage-ns" {
+		t.Fatalf("hrStorageNS = %q, want storage-ns", got)
+	}
+	if got := hrReleaseName(hr); got != "customrel" {
+		t.Fatalf("hrReleaseName = %q, want customrel (storageNamespace must not leak)", got)
+	}
+	if got := hrReleaseNS(hr); got != "target-ns" {
+		t.Fatalf("hrReleaseNS = %q, want target-ns (storageNamespace must not leak)", got)
+	}
+}
+
+// End-to-end on the corrected Flux semantics: a targetNamespace-only
+// HR in namespace "ops" reads its release secrets from the STORAGE
+// namespace (the HR's own — no storageNamespace set) under the
+// flux-derived release name "<targetNS>-<name>", and failed hook Jobs
+// are swept in the RELEASE namespace (target-ns), not the storage one.
+func TestHelmReleaseUnlockerTargetNamespaceSemantics(t *testing.T) {
+	hr := hrObj("ops", "myapp", "v2")
+	hrTarget(hr, "target-ns")
+	hrReady(hr, "False", "another operation is in progress")
+
+	dyn := newDynFake(hr)
+	cs := kfake.NewSimpleClientset(
+		// Secrets live in the HR namespace (storage default) under
+		// the prefixed release name.
+		helmRelSecret("ops", "sh.helm.release.v1.r.v1", "target-ns-myapp", 1, "deployed"),
+		helmRelSecret("ops", "sh.helm.release.v1.r.v2", "target-ns-myapp", 2, "pending-upgrade"),
+		// Secrets under the UNPREFIXED name or in the target ns are
+		// not this release's storage — must be left alone.
+		helmRelSecret("ops", "sh.helm.release.v1.myapp.v2", "myapp", 2, "pending-upgrade"),
+		helmRelSecret("target-ns", "sh.helm.release.v1.r.v2", "target-ns-myapp", 2, "pending-upgrade"),
+		// Hook Jobs live in the RELEASE namespace.
+		hookJob("target-ns", "myapp-pre-upgrade", true),
+		hookJob("ops", "misplaced-hook", true), // storage ns — not where hooks run
+	)
+	u := newUnlocker(cs, dyn, time.Hour, "ops/myapp")
+
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if secretExists(t, cs, "ops", "sh.helm.release.v1.r.v2") {
+		t.Fatal("pending secret in the HR (storage) ns not deleted")
+	}
+	if !secretExists(t, cs, "ops", "sh.helm.release.v1.myapp.v2") {
+		t.Fatal("unprefixed-name secret touched — wrong release")
+	}
+	if !secretExists(t, cs, "target-ns", "sh.helm.release.v1.r.v2") {
+		t.Fatal("secret in the release ns touched — secrets live in storage ns")
+	}
+	if jobExists(t, cs, "target-ns", "myapp-pre-upgrade") {
+		t.Fatal("failed hook Job in the release namespace not reaped")
+	}
+	if !jobExists(t, cs, "ops", "misplaced-hook") {
+		t.Fatal("hook Job in the storage ns reaped — hooks only live in the release ns")
+	}
+}
+
+// storageNamespace set → the release secrets are read (and the pending
+// one deleted) there, not in the HR's namespace.
+func TestHelmReleaseUnlockerStorageNamespaceSecrets(t *testing.T) {
+	hr := hrObj("ops", "myapp", "v2")
+	hr.Object["spec"] = map[string]any{"storageNamespace": "helm-store"}
+	hrReady(hr, "False", "another operation is in progress")
+
+	dyn := newDynFake(hr)
+	cs := kfake.NewSimpleClientset(
+		helmRelSecret("helm-store", "sh.helm.release.v1.myapp.v1", "myapp", 1, "deployed"),
+		helmRelSecret("helm-store", "sh.helm.release.v1.myapp.v2", "myapp", 2, "pending-upgrade"),
+		// Same-looking secrets in the HR ns — not this release's storage.
+		helmRelSecret("ops", "sh.helm.release.v1.myapp.v2", "myapp", 2, "pending-upgrade"),
+	)
+	u := newUnlocker(cs, dyn, time.Hour, "ops/myapp")
+
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if secretExists(t, cs, "helm-store", "sh.helm.release.v1.myapp.v2") {
+		t.Fatal("pending secret in storageNamespace not deleted")
+	}
+	if !secretExists(t, cs, "ops", "sh.helm.release.v1.myapp.v2") {
+		t.Fatal("secret in the HR ns touched — storage lives in storageNamespace")
 	}
 }
 
@@ -618,7 +707,6 @@ func TestHelmReleaseUnlockerPrunesUnlockedLedger(t *testing.T) {
 // delete, no annotate.
 func TestHelmReleaseUnlockerNoPendingSecret(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
-	hrTarget(hr, "apps")
 	cs := kfake.NewSimpleClientset(
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v1", "myapp", 1, "deployed"),
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v2", "myapp", 2, "superseded"))
@@ -748,7 +836,6 @@ func TestHelmReleaseUnlockerHookJobListErrorKeepsUnlock(t *testing.T) {
 // reaches the hook sweep — nothing is touched.
 func TestHelmReleaseUnlockerRefusedUnlockSkipsHookSweep(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
-	hrTarget(hr, "apps")
 	hrReady(hr, "False", "Helm install failed: another operation is in progress")
 	dyn := newDynFake(hr)
 	cs := kfake.NewSimpleClientset(
@@ -831,7 +918,6 @@ func ksObj(ns, name string, staleMsg string, failingFor time.Duration) *unstruct
 // alerted, not re-unlocked.
 func TestHelmReleaseUnlockerPersistedCooldown(t *testing.T) {
 	hr := hrObj("apps", "myapp", "v2")
-	hrTarget(hr, "apps")
 	hrReady(hr, "False", "another operation is in progress")
 	hr.SetAnnotations(map[string]string{
 		helmLastUnlockAnno: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),

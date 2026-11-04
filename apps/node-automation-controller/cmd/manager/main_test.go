@@ -56,6 +56,87 @@ func TestGetenv(t *testing.T) {
 	})
 }
 
+func TestGetenvInt(t *testing.T) {
+	const key = "NAC_TEST_GETENV_INT"
+
+	t.Run("unset returns default", func(t *testing.T) {
+		t.Setenv(key, "")
+		if got := getenvInt(key, 4); got != 4 {
+			t.Fatalf("getenvInt=%d, want 4", got)
+		}
+	})
+	t.Run("valid returns value", func(t *testing.T) {
+		t.Setenv(key, "7")
+		if got := getenvInt(key, 4); got != 7 {
+			t.Fatalf("getenvInt=%d, want 7", got)
+		}
+	})
+	t.Run("zero and negative are honored", func(t *testing.T) {
+		// minReplicas<=0 is the documented "disable the pin" setting —
+		// getenvInt must not clamp it away.
+		for v, want := range map[string]int{"0": 0, "-2": -2} {
+			t.Setenv(key, v)
+			if got := getenvInt(key, 4); got != want {
+				t.Fatalf("getenvInt(%q)=%d, want %d", v, got, want)
+			}
+		}
+	})
+	t.Run("unparseable falls back to default", func(t *testing.T) {
+		t.Setenv(key, "not-a-number")
+		if got := getenvInt(key, 4); got != 4 {
+			t.Fatalf("getenvInt=%d, want 4", got)
+		}
+	})
+}
+
+func TestGetenvDuration(t *testing.T) {
+	const key = "NAC_TEST_GETENV_DURATION"
+
+	t.Run("unset returns default", func(t *testing.T) {
+		t.Setenv(key, "")
+		if got := getenvDuration(key, 5*time.Minute); got != 5*time.Minute {
+			t.Fatalf("getenvDuration=%s, want 5m", got)
+		}
+	})
+	t.Run("valid returns value", func(t *testing.T) {
+		t.Setenv(key, "10m")
+		if got := getenvDuration(key, 5*time.Minute); got != 10*time.Minute {
+			t.Fatalf("getenvDuration=%s, want 10m", got)
+		}
+	})
+	// Every duration knob feeds a ticker interval — <=0 would panic
+	// time.NewTicker and a sub-second one would hot-loop the sweep,
+	// so both must fall back to the default, not be honored.
+	t.Run("non-positive falls back to default", func(t *testing.T) {
+		for _, v := range []string{"0s", "-5m"} {
+			t.Setenv(key, v)
+			if got := getenvDuration(key, 5*time.Minute); got != 5*time.Minute {
+				t.Fatalf("getenvDuration(%q)=%s, want 5m", v, got)
+			}
+		}
+	})
+	t.Run("sub-second falls back to default", func(t *testing.T) {
+		for _, v := range []string{"1ns", "500ms", "999ms"} {
+			t.Setenv(key, v)
+			if got := getenvDuration(key, 5*time.Minute); got != 5*time.Minute {
+				t.Fatalf("getenvDuration(%q)=%s, want 5m", v, got)
+			}
+		}
+	})
+	t.Run("one second is honored", func(t *testing.T) {
+		t.Setenv(key, "1s")
+		if got := getenvDuration(key, 5*time.Minute); got != time.Second {
+			t.Fatalf("getenvDuration=%s, want 1s", got)
+		}
+	})
+	t.Run("unparseable falls back to default", func(t *testing.T) {
+		t.Setenv(key, "not-a-duration")
+		if got := getenvDuration(key, 5*time.Minute); got != 5*time.Minute {
+			t.Fatalf("getenvDuration=%s, want 5m", got)
+		}
+	})
+}
+
 // ---- subprocess tests for main() -------------------------------------
 //
 // main() terminates via os.Exit on both the happy version path and

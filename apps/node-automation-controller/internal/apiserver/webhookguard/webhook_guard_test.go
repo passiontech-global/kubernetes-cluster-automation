@@ -352,6 +352,85 @@ func TestWebhookGuardWebhookConfigListErrors(t *testing.T) {
 	}
 }
 
+// Orphan removal is a strategic-merge patch: every dropped entry is
+// listed as {"name": X, "$patch": "delete"} and NOTHING else is in
+// the webhooks list — the merge-key delete can never revert a
+// concurrent writer's sibling entries the way a whole-array
+// "replace /webhooks" did.
+func TestWebhookGuardOrphanPatchIsStrategicDelete(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "cfg"},
+		Webhooks: []admissionv1.MutatingWebhook{
+			wgMutatingHook("keep.example.com", wgSvcRef("alive", "svc")),
+			wgMutatingHook("orphan.example.com", wgSvcRef("dead-ns", "svc")),
+		},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("alive"),
+		wgService("alive", "svc"),
+		mwc)
+	var doc map[string]any
+	var patchType string
+	cs.PrependReactor("patch", "mutatingwebhookconfigurations",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			pa := action.(ktesting.PatchAction)
+			patchType = string(pa.GetPatchType())
+			if err := json.Unmarshal(pa.GetPatch(), &doc); err != nil {
+				t.Errorf("unmarshal patch: %v", err)
+			}
+			return false, nil, nil // passthrough
+		})
+	g := &webhookGuard{cs: cs}
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if patchType != string(types.StrategicMergePatchType) {
+		t.Fatalf("patch type = %s, want StrategicMergePatchType", patchType)
+	}
+	whs, _ := doc["webhooks"].([]any)
+	if len(whs) != 1 {
+		t.Fatalf("patch webhooks = %v, want exactly the 1 delete directive", whs)
+	}
+	entry, _ := whs[0].(map[string]any)
+	if len(entry) != 2 || entry["name"] != "orphan.example.com" ||
+		entry["$patch"] != "delete" {
+		t.Fatalf("merge entry = %v, want exactly {name, $patch:delete}", entry)
+	}
+	if _, ok := doc["metadata"]; ok {
+		t.Fatalf("orphan patch must not touch metadata: %v", doc)
+	}
+	wgAssertNames(t, wgMutatingNames(t, cs, "cfg"), []string{"keep.example.com"})
+}
+
+// The cluster-wide inputs are shared across the run's three duties:
+// namespaces, both webhook-config lists, EndpointSlices and pods are
+// each listed exactly once per run — never once per consumer.
+func TestWebhookGuardListsClusterStateOncePerRun(t *testing.T) {
+	cs := fake.NewSimpleClientset(wgNamespace("kube-system"))
+	counts := map[string]int{}
+	cs.PrependReactor("list", "*",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			counts[a.GetResource().Resource]++
+			return false, nil, nil // passthrough to the tracker
+		})
+	g := &webhookGuard{cs: cs}
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for res, want := range map[string]int{
+		"namespaces":                      1,
+		"mutatingwebhookconfigurations":   1,
+		"validatingwebhookconfigurations": 1,
+		"endpointslices":                  1,
+		"pods":                            1,
+		"services":                        1,
+	} {
+		if counts[res] != want {
+			t.Fatalf("list %s = %d, want %d per run", res, counts[res], want)
+		}
+	}
+}
+
 // A failed /webhooks patch is surfaced as an error — silently
 // swallowing it would leave orphan entries fail-closed forever.
 func TestWebhookGuardPatchFailureReturnsError(t *testing.T) {
@@ -584,8 +663,10 @@ func TestWebhookCircuitBreakerTripsAfterThreshold(t *testing.T) {
 	}
 }
 
-// The trip lands as ONE merge patch carrying both the flipped
-// failurePolicy and the annotation — inspect the payload.
+// The trip lands as ONE strategic-merge patch carrying both the
+// flipped failurePolicy (a {"name": X, "failurePolicy": ...} entry —
+// merged by name, never a whole-array replace) and the annotation —
+// inspect the payload.
 func TestWebhookCircuitBreakerPatchContents(t *testing.T) {
 	mwc := &admissionv1.MutatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: "cb-doc"},
@@ -625,8 +706,8 @@ func TestWebhookCircuitBreakerPatchContents(t *testing.T) {
 	if doc == nil {
 		t.Fatal("no patch issued for the trip")
 	}
-	if patchType != string(types.MergePatchType) {
-		t.Fatalf("patch type = %s, want MergePatchType", patchType)
+	if patchType != string(types.StrategicMergePatchType) {
+		t.Fatalf("patch type = %s, want StrategicMergePatchType", patchType)
 	}
 	annos, _ := doc["metadata"].(map[string]any)["annotations"].(map[string]any)
 	if got := annos[webhookCircuitAnno]; got != "dead.example.com" {
@@ -636,8 +717,10 @@ func TestWebhookCircuitBreakerPatchContents(t *testing.T) {
 	if len(whs) != 1 {
 		t.Fatalf("patch webhooks = %v, want 1 entry", whs)
 	}
-	if got := whs[0].(map[string]any)["failurePolicy"]; got != "Ignore" {
-		t.Fatalf("patched failurePolicy = %v, want Ignore", got)
+	entry, _ := whs[0].(map[string]any)
+	if len(entry) != 2 || entry["name"] != "dead.example.com" ||
+		entry["failurePolicy"] != "Ignore" {
+		t.Fatalf("merge entry = %v, want exactly {name, failurePolicy:Ignore}", entry)
 	}
 }
 

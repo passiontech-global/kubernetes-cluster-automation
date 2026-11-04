@@ -110,6 +110,37 @@ func TestKubeletReaperSweep(t *testing.T) {
 		}
 	})
 
+	t.Run("probe fail + future-dated heartbeat keeps untainted", func(t *testing.T) {
+		// Clock skew: a heartbeat timestamped in the FUTURE (age < 0)
+		// is still proof the kubelet posted status — never stale.
+		future := kubeletWorker("w1", 0)
+		future.Status.Conditions[0].LastHeartbeatTime =
+			metav1.NewTime(time.Now().Add(time.Hour))
+		cs := fake.NewSimpleClientset(future)
+		r := &kubeletReaper{cs: cs}
+		if err := r.sweep(ctx, kubeletWorker("w1", 0), false); err != nil {
+			t.Fatal(err)
+		}
+		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+			t.Fatal("tainted on a future-dated (skewed) heartbeat — clock skew is not staleness")
+		}
+	})
+
+	t.Run("probe fail + future-dated heartbeat clears taint", func(t *testing.T) {
+		// Same skew while already tainted: the fresh path removes it.
+		future := kubeletWorker("w1", 0, kubeletDeadTaint)
+		future.Status.Conditions[0].LastHeartbeatTime =
+			metav1.NewTime(time.Now().Add(time.Hour))
+		cs := fake.NewSimpleClientset(future)
+		r := &kubeletReaper{cs: cs}
+		if err := r.sweep(ctx, kubeletWorker("w1", 0), false); err != nil {
+			t.Fatal(err)
+		}
+		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+			t.Fatal("taint kept though the skewed heartbeat is fresh")
+		}
+	})
+
 	t.Run("probe fail + fresh heartbeat clears taint", func(t *testing.T) {
 		cs := fake.NewSimpleClientset(kubeletWorker("w1", 10*time.Second, kubeletDeadTaint))
 		r := &kubeletReaper{cs: cs}
@@ -358,8 +389,14 @@ func TestKubeletReaperRun(t *testing.T) {
 			cs:      cs,
 			probeFn: func(_ context.Context, name string) bool { return name == "w2" },
 		}
+		before := testutil.QueueErrorCount(t, kubeletReaperQueue)
 		if err := r.run(ctx); err != nil {
 			t.Fatalf("per-node sweep failure must not fail the run: %v", err)
+		}
+		// The failure was absorbed (nil return) but must still be
+		// metered — an uncounted skip is invisible to alerting.
+		if got := testutil.QueueErrorCount(t, kubeletReaperQueue) - before; got != 1 {
+			t.Fatalf("absorbed sweep failure not IncError'd, delta %v", got)
 		}
 	})
 }

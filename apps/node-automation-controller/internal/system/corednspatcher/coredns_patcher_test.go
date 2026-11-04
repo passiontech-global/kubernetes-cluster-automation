@@ -417,6 +417,31 @@ func TestCoreDNSPatcherNoOpWhenCorrect(t *testing.T) {
 	}
 }
 
+// A Deployment without the coredns container reads as drift, but the
+// patch merges containers by name and would append a container entry
+// with NO image — the apiserver rejects it forever. The reconciler
+// must skip with a warn, never attempt the patch.
+func TestCoreDNSPatcherMissingContainerNoPatch(t *testing.T) {
+	d := corednsDeployBare()
+	d.Spec.Template.Spec.Containers = nil
+	cs := fake.NewSimpleClientset(d)
+	var patched bool
+	testutil.ForbidDeployPatch(cs, &patched)
+
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
+	res, err := r.Reconcile(ctx, reconcile.Request{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if patched {
+		t.Fatal("patched a Deployment whose coredns container is absent — " +
+			"the name-only container entry has no image and the apiserver rejects it")
+	}
+	if res.RequeueAfter != 15*time.Minute {
+		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
+	}
+}
+
 func TestCoreDNSPatcherMissingDeployment(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}

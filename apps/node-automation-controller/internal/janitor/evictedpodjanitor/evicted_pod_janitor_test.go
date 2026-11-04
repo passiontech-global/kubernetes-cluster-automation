@@ -11,6 +11,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 )
@@ -55,7 +56,7 @@ func epjPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 func TestEvictedPodJanitorReasonSet(t *testing.T) {
 	objs := []runtime.Object{}
 	for i, reason := range []string{
-		"Evicted", "NodeAffinity", "NodeLost", "Shutdown",
+		"Evicted", "NodeAffinity", "NodeLost", "Preempted", "Shutdown",
 		"UnexpectedAdmissionError", "OutOfcpu", "OutOfmemory",
 		"OutOfephemeral-storage",
 	} {
@@ -70,7 +71,7 @@ func TestEvictedPodJanitorReasonSet(t *testing.T) {
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 9; i++ {
 		if epjPodExists(t, cs, "a", fmt.Sprintf("doomed-%d", i)) {
 			t.Fatalf("doomed-%d not deleted", i)
 		}
@@ -154,6 +155,65 @@ func TestEvictedPodJanitorMultipleNamespaces(t *testing.T) {
 		if epjPodExists(t, cs, p[0], p[1]) {
 			t.Fatalf("old evicted pod %s/%s not deleted", p[0], p[1])
 		}
+	}
+}
+
+// Pod age is measured from the latest terminated container
+// finishedAt, not object creation: a weeks-old pod evicted 30m ago
+// stays inspectable, while one evicted 2h ago is reaped.
+func TestEvictedPodJanitorUsesFinishedAt(t *testing.T) {
+	fresh := epjPod("a", "old-pod-fresh-eviction", corev1.PodFailed, "Evicted", 72*time.Hour)
+	fresh.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "app",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			FinishedAt: metav1.NewTime(time.Now().Add(-30 * time.Minute)),
+		}},
+	}}
+	old := epjPod("a", "old-pod-old-eviction", corev1.PodFailed, "Evicted", 72*time.Hour)
+	old.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "app",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			FinishedAt: metav1.NewTime(time.Now().Add(-2 * time.Hour)),
+		}},
+	}}
+	cs := fake.NewSimpleClientset(fresh, old)
+	j := &evictedPodJanitor{cs: cs}
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !epjPodExists(t, cs, "a", "old-pod-fresh-eviction") {
+		t.Fatal("freshly evicted pod deleted — finishedAt ignored")
+	}
+	if epjPodExists(t, cs, "a", "old-pod-old-eviction") {
+		t.Fatal("old eviction not reaped")
+	}
+}
+
+// The delete carries a UID precondition — the listed object is what
+// the sweep vetted; a same-named pod recreated between list and
+// delete must not inherit it.
+func TestEvictedPodJanitorDeleteUIDPrecondition(t *testing.T) {
+	pod := epjPod("a", "old-evicted", corev1.PodFailed, "Evicted", 2*time.Hour)
+	pod.UID = "uid-old-evicted"
+	cs := fake.NewSimpleClientset(pod)
+	var gotUID *types.UID
+	cs.PrependReactor("delete", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			opts := a.(ktesting.DeleteAction).GetDeleteOptions()
+			if opts.Preconditions != nil {
+				gotUID = opts.Preconditions.UID
+			}
+			return false, nil, nil // fall through to the tracker
+		})
+	j := &evictedPodJanitor{cs: cs}
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if gotUID == nil || *gotUID != pod.UID {
+		t.Fatalf("delete missing the UID precondition: %v", gotUID)
+	}
+	if epjPodExists(t, cs, "a", "old-evicted") {
+		t.Fatal("old evicted pod not deleted")
 	}
 }
 

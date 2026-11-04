@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -114,8 +115,11 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 		}
 		if err := r.sweep(ctx, n, ok[n.Name]); err != nil {
 			// Best-effort per node — like the bash loop a failure on
-			// one node must not skip the rest of the sweep.
+			// one node must not skip the rest of the sweep. The run
+			// absorbs it (returns nil), so it IncErrors here —
+			// shared.Periodic only meters errors fn RETURNS.
 			sweepErrs++
+			metrics.IncError(kubeletReaperQueue)
 			log.Error(err, "sweep failed — node skipped", "node", n.Name)
 		}
 	}
@@ -133,12 +137,23 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 // probe GETs /api/v1/nodes/<node>/proxy/healthz through the apiserver
 // up to 4 times (10s apart, 8s each) — a body starting with "ok" wins.
 func (r *kubeletReaper) probe(ctx context.Context, node string) bool {
+	// One timer reused across the inter-probe gaps — a fresh
+	// time.After per attempt leaves each channel allocated until GC.
+	// Armed stopped+drained so Reset never races an earlier fire; each
+	// wait below consumes the pending fire, leaving the channel empty
+	// for the next Reset.
+	gap := time.NewTimer(kubeletReaperProbeGap)
+	if !gap.Stop() {
+		<-gap.C
+	}
+	defer gap.Stop()
 	for i := 0; i < kubeletReaperProbes; i++ {
 		if i > 0 {
+			gap.Reset(kubeletReaperProbeGap)
 			select {
 			case <-ctx.Done():
 				return false
-			case <-time.After(kubeletReaperProbeGap):
+			case <-gap.C:
 			}
 		}
 		body, err := r.cs.CoreV1().RESTClient().Get().
@@ -211,13 +226,24 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	name := listed.Name
 
 	// Probe failed — heartbeat gate: fresh Ready heartbeat = broken
-	// proxy path, not a dead kubelet. Missing condition/timestamp or
-	// age > HB_STALE_S = kubelet really dead.
-	age := -1
-	if c := shared.NodeCondition(node, corev1.NodeReady); c != nil {
+	// proxy path, not a dead kubelet. A MISSING Ready condition or a
+	// zero LastHeartbeatTime means the kubelet never posted status —
+	// stale (taint). A heartbeat dated in the FUTURE (age <= 0, clock
+	// skew between the kubelet's host and this pod) is still proof of
+	// life — fresh (no taint); conflating skew with staleness would
+	// mass-taint on an NTP flap.
+	age := -1 // sentinel: no usable timestamp -> stale
+	if c := shared.NodeCondition(node, corev1.NodeReady); c != nil &&
+		!c.LastHeartbeatTime.IsZero() {
 		age = int(time.Since(c.LastHeartbeatTime.Time) / time.Second)
+		if age < 0 {
+			// A heartbeat 1-2s in the future computes -1 and would
+			// collide with the sentinel — clamp so skew reads as
+			// the proof of life it is, never as staleness.
+			age = 0
+		}
 	}
-	if age < 0 || age > kubeletReaperHBStaleS {
+	if age == -1 || age > kubeletReaperHBStaleS {
 		if !has {
 			if err := shared.TaintNode(ctx, r.cs, name, kubeletReaperTaint, "true",
 				corev1.TaintEffectNoSchedule); err != nil {

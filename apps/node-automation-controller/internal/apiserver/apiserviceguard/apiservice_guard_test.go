@@ -289,6 +289,27 @@ func TestAPIServiceGuardDeleteUIDPrecondition(t *testing.T) {
 	}
 }
 
+// Both duties consume ONE APIService list per run — the orphan pass
+// and the availability watchdog share the snapshot instead of listing
+// twice.
+func TestAPIServiceGuardListsOncePerRun(t *testing.T) {
+	cs := fake.NewSimpleClientset(testutil.Namespace("kube-system"))
+	dyn := asgDynFake(asgObj("v1.apps.example.com", "alive", "svc"))
+	lists := 0
+	dyn.PrependReactor("list", "apiservices",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			lists++
+			return false, nil, nil // passthrough
+		})
+	g := asgGuard(cs, dyn)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if lists != 1 {
+		t.Fatalf("apiservices listed %d times in one run, want 1", lists)
+	}
+}
+
 // An apiservices list failure inside the watchdog is a real error —
 // but the orphan pass must have already run (independence).
 func TestAPIServiceGuardListErrorIsolated(t *testing.T) {

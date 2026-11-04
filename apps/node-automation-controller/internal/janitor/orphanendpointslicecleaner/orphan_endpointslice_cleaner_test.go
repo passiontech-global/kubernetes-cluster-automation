@@ -250,6 +250,38 @@ func TestOrphanEndpointSliceDeleteUIDPrecondition(t *testing.T) {
 	}
 }
 
+// A slice already Terminating is skipped entirely — the API owns it
+// now, so it must not accrue absent-streak cycles nor consume a
+// delete attempt.
+func TestOrphanEndpointSliceSkipsTerminating(t *testing.T) {
+	slice := oescSlice("apps", "gone-abc", "gone", 30*time.Minute)
+	ts := metav1.NewTime(time.Now())
+	slice.DeletionTimestamp = &ts
+	cs := fake.NewSimpleClientset(
+		oescService("default", "kubernetes"), slice)
+	var deletes int
+	cs.PrependReactor("delete", "endpointslices",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			deletes++
+			return false, nil, nil
+		})
+	c := oescCleaner(cs)
+	for i := 0; i < 3; i++ {
+		if err := c.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if deletes != 0 {
+		t.Fatalf("terminating slice consumed %d delete attempt(s)", deletes)
+	}
+	if len(c.absentStreak) != 0 {
+		t.Fatal("terminating slice accrued an absent streak")
+	}
+	if !oescSliceExists(t, cs, "apps", "gone-abc") {
+		t.Fatal("terminating slice vanished")
+	}
+}
+
 // Slices without the service-name label are ignored entirely.
 func TestOrphanEndpointSliceIgnoresUnlabeled(t *testing.T) {
 	plain := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{

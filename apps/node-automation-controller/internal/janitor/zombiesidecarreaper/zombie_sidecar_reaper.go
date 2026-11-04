@@ -26,7 +26,11 @@
 // (name != linkerd-proxy && != istio-proxy) in spec, EVERY app
 // container Terminated >= zombieSidecarTermAge ago with a final exit
 // (exitCode==0, or spec.restartPolicy==Never so a non-zero exit is
-// still terminal), and at least one sidecar container still Running.
+// still terminal), every non-sidecar init container finished, and
+// at least one sidecar still Running — whether it sits in
+// spec.containers or in spec.initContainers as a native sidecar
+// (restartPolicy: Always, the shape istio's native-sidecar mode and
+// newer linkerd injection use).
 // Pods are read through the direct clientset — the manager cache is
 // list/watch-locked to kube-system cilium pods.
 package zombiesidecarreaper
@@ -34,6 +38,7 @@ package zombiesidecarreaper
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -65,6 +70,10 @@ const (
 	// zombieSidecarShutdownTimeout bounds the admin call — a
 	// wedged proxy must not stall the sweep.
 	zombieSidecarShutdownTimeout = 3 * time.Second
+	// zombieSidecarListPageSize bounds each Running-pod List page —
+	// continue-token pagination keeps a busy cluster's pod fleet
+	// from arriving as one giant response body.
+	zombieSidecarListPageSize = 500
 )
 
 // zombieSidecarNames are the injected sidecars that keep a finished
@@ -129,18 +138,28 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	// Server-side phase filter — zombies are always Running; the
 	// in-code phase check stays for fake clients (field selectors
 	// are ignored there).
-	pods, err := r.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-		FieldSelector: "status.phase=Running",
-	})
-	if err != nil {
-		return fmt.Errorf("list pods: %w", err)
+	var pods []corev1.Pod
+	cont := ""
+	for {
+		page, err := r.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+			FieldSelector: "status.phase=Running",
+			Limit:         zombieSidecarListPageSize,
+			Continue:      cont,
+		})
+		if err != nil {
+			return fmt.Errorf("list pods: %w", err)
+		}
+		pods = append(pods, page.Items...)
+		if cont = page.Continue; cont == "" {
+			break
+		}
 	}
 
 	now := r.nowFn()
 	seen := map[string]bool{} // qualifying keys this cycle
 	deleted := 0
-	for i := range pods.Items {
-		p := &pods.Items[i]
+	for i := range pods {
+		p := &pods[i]
 		if !r.zombiePod(p, now) {
 			continue
 		}
@@ -195,8 +214,10 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 
 // zombiePod reports whether the pod matches every zombie clause —
 // phase Running and not already terminating, Job-owned, all app
-// containers Terminated >= termAge with a final exit, at least one
-// sidecar still Running.
+// containers Terminated >= termAge with a final exit, every
+// non-sidecar init container finished, at least one sidecar still
+// Running in EITHER status list (native sidecars live in
+// spec.initContainers + status.initContainerStatuses).
 func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) bool {
 	if p.Status.Phase != corev1.PodRunning {
 		return false
@@ -218,6 +239,10 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) bool {
 	statusByName := make(map[string]*corev1.ContainerStatus, len(p.Status.ContainerStatuses))
 	for i := range p.Status.ContainerStatuses {
 		statusByName[p.Status.ContainerStatuses[i].Name] = &p.Status.ContainerStatuses[i]
+	}
+	initStatusByName := make(map[string]*corev1.ContainerStatus, len(p.Status.InitContainerStatuses))
+	for i := range p.Status.InitContainerStatuses {
+		initStatusByName[p.Status.InitContainerStatuses[i].Name] = &p.Status.InitContainerStatuses[i]
 	}
 
 	appSeen := false
@@ -242,12 +267,32 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) bool {
 		return false // no app containers — nothing to prove the job finished
 	}
 
+	// Native sidecars (initContainers with restartPolicy:Always)
+	// hold the pod Running exactly like an injected regular
+	// container. Named mesh sidecars are the liveness candidates
+	// below; every OTHER init container must have finished — a
+	// plain init still running means the pod is not done starting,
+	// and a non-mesh always-restart init still running is a shape
+	// this reaper does not understand: fail closed either way.
+	for _, c := range p.Spec.InitContainers {
+		if zombieSidecarNames[c.Name] {
+			continue
+		}
+		st := initStatusByName[c.Name]
+		if st == nil || st.State.Terminated == nil {
+			return false
+		}
+	}
+
 	// At least one sidecar must still be Running — a pod whose
 	// sidecar also exited is just a finishing Job pod, not a zombie.
-	for i := range p.Status.ContainerStatuses {
-		st := &p.Status.ContainerStatuses[i]
-		if zombieSidecarNames[st.Name] && st.State.Running != nil {
-			return true
+	for _, statuses := range [][]corev1.ContainerStatus{
+		p.Status.ContainerStatuses, p.Status.InitContainerStatuses} {
+		for i := range statuses {
+			st := &statuses[i]
+			if zombieSidecarNames[st.Name] && st.State.Running != nil {
+				return true
+			}
 		}
 	}
 	return false
@@ -258,8 +303,14 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) bool {
 func (r *zombieSidecarReaper) reap(ctx context.Context, p *corev1.Pod, why string) error {
 	log := logf.FromContext(ctx)
 	log.Info("DELETE: zombie sidecar pod", "pod", p.Namespace+"/"+p.Name, "reason", why)
+	// UID precondition: the listed object is the zombie we vetted —
+	// a same-named replacement must start its own graceful cycle,
+	// not inherit this delete.
+	uid := p.UID
 	if err := r.cs.CoreV1().Pods(p.Namespace).
-		Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
+		Delete(ctx, p.Name, metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &uid},
+		}); err != nil {
 		log.Error(err, "zombie pod delete failed", "pod", p.Namespace+"/"+p.Name)
 		metrics.IncError(zombieSidecarReaperQueue)
 		return err
@@ -289,7 +340,13 @@ func zombieSidecarShutdown(ctx context.Context, podIP string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Drain before Close so the keep-alive connection can be
+		// reused; bounded so a chatty endpoint cannot stall the
+		// sweep.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+	}()
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("sidecar /shutdown returned %s", resp.Status)
 	}

@@ -1,8 +1,15 @@
 package csrwatcher
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
@@ -37,6 +44,56 @@ func csr(name, signer, username string, age time.Duration,
 			})
 	}
 	return o
+}
+
+// csrPEM mints a real, signature-valid PEM x509 CSR — the
+// kubelet-serving validation parses spec.request, so test fixtures
+// cannot fake it with placeholder bytes.
+func csrPEM(t *testing.T, cn string, org, dnsNames, ips []string) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.CertificateRequest{
+		Subject:  pkix.Name{CommonName: cn, Organization: org},
+		DNSNames: dnsNames,
+	}
+	for _, s := range ips {
+		tmpl.IPAddresses = append(tmpl.IPAddresses, net.ParseIP(s))
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, tmpl, key)
+	if err != nil {
+		t.Fatalf("create csr: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+}
+
+// servingCSR builds a kubelet-serving CSR that passes every
+// validNodeCSR check for the named node: correct username, the
+// system:nodes group, the serving usage triple, and a PEM x509 CSR
+// whose CN/O/SANs match. Tests mutate individual fields to probe a
+// specific rejection path.
+func servingCSR(t *testing.T, name, nodeName string, age time.Duration,
+	dnsNames, ips []string) *certificatesv1.CertificateSigningRequest {
+	c := csr(name, kubeletServingSigner, nodeUserPrefix+nodeName, age, false)
+	c.Spec.Groups = []string{nodesGroup, "system:authenticated"}
+	c.Spec.Usages = []certificatesv1.KeyUsage{
+		certificatesv1.UsageDigitalSignature,
+		certificatesv1.UsageKeyEncipherment,
+		certificatesv1.UsageServerAuth,
+	}
+	c.Spec.Request = csrPEM(t, nodeUserPrefix+nodeName,
+		[]string{nodesGroup}, dnsNames, ips)
+	return c
+}
+
+// addressedNode is testutil.Node plus status.addresses — the SAN ⊆
+// addresses check needs real addresses to match (or reject) against.
+func addressedNode(name string, addrs ...corev1.NodeAddress) *corev1.Node {
+	n := testutil.Node(name, corev1.ConditionTrue, nil)
+	n.Status.Addresses = addrs
+	return n
 }
 
 func newCSRWatcher(cs *fake.Clientset, approve bool) *csrWatcher {
@@ -81,11 +138,18 @@ func TestCSRWatcherDetectOnly(t *testing.T) {
 	}
 }
 
-// Approve mode happy path: valid system:node user + existing Node.
+// Approve mode happy path: a fully conformant kubelet-serving CSR —
+// correct username + groups + usages, PEM CSR naming the node, SANs
+// drawn from the node's own status.addresses.
 func TestCSRWatcherApprovesValid(t *testing.T) {
-	old := csr("csr-1", kubeletServingSigner, "system:node:n1", time.Hour, false)
+	old := servingCSR(t, "csr-1", "n1", time.Hour,
+		[]string{"n1.internal", "n1.example.com"}, []string{"10.0.0.1"})
 	cs := fake.NewSimpleClientset(old,
-		testutil.Node("n1", corev1.ConditionTrue, nil))
+		addressedNode("n1",
+			corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: "10.0.0.1"},
+			corev1.NodeAddress{Type: corev1.NodeExternalIP, Address: "192.0.2.1"},
+			corev1.NodeAddress{Type: corev1.NodeInternalDNS, Address: "n1.internal"},
+			corev1.NodeAddress{Type: corev1.NodeHostName, Address: "n1.example.com"}))
 	w := newCSRWatcher(cs, true)
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
@@ -97,6 +161,169 @@ func TestCSRWatcherApprovesValid(t *testing.T) {
 	if reason != "NodeOpsAutoApprove" {
 		t.Fatalf("unexpected approval reason %q", reason)
 	}
+	// In-tree approver parity: the Approved condition must stamp
+	// LastTransitionTime, not just LastUpdateTime.
+	got, err := cs.CertificatesV1().CertificateSigningRequests().
+		Get(ctx, "csr-1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range got.Status.Conditions {
+		if c.Type == certificatesv1.CertificateApproved &&
+			c.LastTransitionTime.IsZero() {
+			t.Fatal("approved condition missing LastTransitionTime")
+		}
+	}
+}
+
+// A CSR with zero SANs is also acceptable — ⊆ holds vacuously (the
+// kubelet's real CSRs always carry SANs, but nothing in the binding
+// requires them).
+func TestCSRWatcherApprovesSANlessCSR(t *testing.T) {
+	old := servingCSR(t, "csr-1", "n1", time.Hour, nil, nil)
+	cs := fake.NewSimpleClientset(old,
+		testutil.Node("n1", corev1.ConditionTrue, nil))
+	w := newCSRWatcher(cs, true)
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := csrApproved(t, cs, "csr-1"); !ok {
+		t.Fatal("SAN-less kubelet-serving CSR not approved")
+	}
+}
+
+// Every kubelet-serving validation wall rejects — and every rejection
+// skips the CSR (fail closed) while IncError'ing exactly once.
+func TestCSRWatcherValidationRejections(t *testing.T) {
+	node := func() *corev1.Node {
+		return addressedNode("n1",
+			corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: "10.0.0.1"},
+			corev1.NodeAddress{Type: corev1.NodeInternalDNS, Address: "n1.internal"})
+	}
+
+	t.Run("client-auth usage is rejected", func(t *testing.T) {
+		c := servingCSR(t, "csr-client", "n1", time.Hour, nil, nil)
+		c.Spec.Usages = append(c.Spec.Usages, certificatesv1.UsageClientAuth)
+		cs := fake.NewSimpleClientset(c, node())
+		w := newCSRWatcher(cs, true)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := csrApproved(t, cs, "csr-client"); ok {
+			t.Fatal("CSR with client-auth usage was approved")
+		}
+	})
+
+	t.Run("strict-subset usages are rejected", func(t *testing.T) {
+		// The in-tree approver requires the EXACT serving triple —
+		// a CSR asking for only server auth is malformed, not
+		// "allowed usages only".
+		c := servingCSR(t, "csr-subset", "n1", time.Hour, nil, nil)
+		c.Spec.Usages = []certificatesv1.KeyUsage{
+			certificatesv1.UsageServerAuth}
+		cs := fake.NewSimpleClientset(c, node())
+		w := newCSRWatcher(cs, true)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := csrApproved(t, cs, "csr-subset"); ok {
+			t.Fatal("CSR with a strict-subset usage list was approved")
+		}
+	})
+
+	t.Run("empty usages are rejected", func(t *testing.T) {
+		c := servingCSR(t, "csr-nousage", "n1", time.Hour, nil, nil)
+		c.Spec.Usages = nil
+		cs := fake.NewSimpleClientset(c, node())
+		w := newCSRWatcher(cs, true)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := csrApproved(t, cs, "csr-nousage"); ok {
+			t.Fatal("CSR with an empty usage list was approved")
+		}
+	})
+
+	t.Run("requester outside system:nodes is rejected", func(t *testing.T) {
+		c := servingCSR(t, "csr-groups", "n1", time.Hour, nil, nil)
+		c.Spec.Groups = []string{"system:authenticated"}
+		cs := fake.NewSimpleClientset(c, node())
+		w := newCSRWatcher(cs, true)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := csrApproved(t, cs, "csr-groups"); ok {
+			t.Fatal("CSR from a non-system:nodes requester was approved")
+		}
+	})
+
+	t.Run("CN mismatch is rejected", func(t *testing.T) {
+		c := servingCSR(t, "csr-cn", "n1", time.Hour, nil, nil)
+		// Username says n1, the CSR asks for a DIFFERENT node —
+		// classic serving-cert impersonation.
+		c.Spec.Request = csrPEM(t, nodeUserPrefix+"n2",
+			[]string{nodesGroup}, nil, nil)
+		cs := fake.NewSimpleClientset(c, node())
+		w := newCSRWatcher(cs, true)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := csrApproved(t, cs, "csr-cn"); ok {
+			t.Fatal("CSR asking for another node's identity was approved")
+		}
+	})
+
+	t.Run("missing O=system:nodes is rejected", func(t *testing.T) {
+		c := servingCSR(t, "csr-org", "n1", time.Hour, nil, nil)
+		c.Spec.Request = csrPEM(t, nodeUserPrefix+"n1", nil, nil, nil)
+		cs := fake.NewSimpleClientset(c, node())
+		w := newCSRWatcher(cs, true)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := csrApproved(t, cs, "csr-org"); ok {
+			t.Fatal("CSR without O=system:nodes was approved")
+		}
+	})
+
+	t.Run("foreign DNS SAN is rejected", func(t *testing.T) {
+		c := servingCSR(t, "csr-dns", "n1", time.Hour,
+			[]string{"n1.internal", "other.internal"}, nil)
+		cs := fake.NewSimpleClientset(c, node())
+		w := newCSRWatcher(cs, true)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := csrApproved(t, cs, "csr-dns"); ok {
+			t.Fatal("CSR with a foreign DNS SAN was approved")
+		}
+	})
+
+	t.Run("foreign IP SAN is rejected", func(t *testing.T) {
+		c := servingCSR(t, "csr-ip", "n1", time.Hour,
+			nil, []string{"10.0.0.1", "10.0.0.99"})
+		cs := fake.NewSimpleClientset(c, node())
+		w := newCSRWatcher(cs, true)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := csrApproved(t, cs, "csr-ip"); ok {
+			t.Fatal("CSR with a foreign IP SAN was approved")
+		}
+	})
+
+	t.Run("unparseable request fails closed", func(t *testing.T) {
+		c := servingCSR(t, "csr-pem", "n1", time.Hour, nil, nil)
+		c.Spec.Request = []byte("not a pem block")
+		cs := fake.NewSimpleClientset(c, node())
+		w := newCSRWatcher(cs, true)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := csrApproved(t, cs, "csr-pem"); ok {
+			t.Fatal("CSR with a non-PEM request was approved")
+		}
+	})
 }
 
 // Skips: wrong signer, already-decided, too fresh.
@@ -150,7 +377,7 @@ func TestCSRWatcherUsernameMismatch(t *testing.T) {
 // Node named in the username does not exist -> validation fails.
 func TestCSRWatcherNodeMissing(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		csr("csr-ghost", kubeletServingSigner, "system:node:ghost", time.Hour, false))
+		servingCSR(t, "csr-ghost", "ghost", time.Hour, nil, nil))
 	w := newCSRWatcher(cs, true)
 	before := testutil.QueueErrorCount(t, csrWatcherQueue)
 	if err := w.run(ctx); err != nil {
@@ -171,8 +398,7 @@ func TestCSRWatcherApprovalCap(t *testing.T) {
 	for i := 0; i < csrMaxApprovalsRun+2; i++ {
 		name := fmt.Sprintf("n%02d", i)
 		objs = append(objs,
-			csr("csr-"+name, kubeletServingSigner,
-				"system:node:"+name, time.Hour, false),
+			servingCSR(t, "csr-"+name, name, time.Hour, nil, nil),
 			testutil.Node(name, corev1.ConditionTrue, nil))
 	}
 	cs := fake.NewSimpleClientset(objs...)
@@ -283,8 +509,8 @@ func TestCSRWatcherListError(t *testing.T) {
 // and the sibling CSR is still approved.
 func TestCSRWatcherApprovalErrorContinues(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		csr("csr-bad", kubeletServingSigner, "system:node:n1", time.Hour, false),
-		csr("csr-good", kubeletServingSigner, "system:node:n2", time.Hour, false),
+		servingCSR(t, "csr-bad", "n1", time.Hour, nil, nil),
+		servingCSR(t, "csr-good", "n2", time.Hour, nil, nil),
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		testutil.Node("n2", corev1.ConditionTrue, nil))
 	cs.PrependReactor("update", "certificatesigningrequests",

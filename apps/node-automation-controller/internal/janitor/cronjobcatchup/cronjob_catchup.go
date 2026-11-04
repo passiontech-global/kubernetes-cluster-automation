@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,15 +52,22 @@ const (
 	// catchupDedupeAge is how long a previously-created catch-up Job
 	// blocks a new one.
 	catchupDedupeAge = 24 * time.Hour
-	// catchupMinStaleGrace: a CronJob is stale when lastScheduleTime is
-	// older than max(2*period, period+30m). The +30m floor keeps a
-	// */5-minute job from being flagged during a routine apiserver
-	// blip — one missed tick is normal controller behavior.
+	// catchupMinStaleGrace: a missed tick counts as stale once it is
+	// older than max(2*period, period+30m), where period is the gap
+	// between the missed tick and the FOLLOWING one. The +30m floor
+	// keeps a */5-minute job from being flagged during a routine
+	// apiserver blip — one missed tick is normal controller behavior.
 	catchupMinStaleGrace = 30 * time.Minute
+	// catchupJobNameMax is the DNS-1123 subdomain ceiling a Job name
+	// must fit — "<cj>-catchup-<unix>" is truncated to stay under it.
+	catchupJobNameMax = 63
 )
 
 type cronJobCatchup struct {
 	cs kubernetes.Interface
+	// nowFn is the clock seam — tests pin it so schedule-relative
+	// staleness is deterministic. nil → time.Now.
+	nowFn func() time.Time
 	// lastCatchup enforces the 1-per-cronjob-per-day cap in memory —
 	// keyed "ns/name" -> "2006-01-02" (UTC), pruned each sweep for
 	// CronJobs that vanished. An apiserver-restart-clean map only
@@ -71,12 +79,17 @@ type cronJobCatchup struct {
 
 // Setup registers the 15-minute sweep.
 func Setup(mgr ctrl.Manager, cs kubernetes.Interface) error {
-	c := &cronJobCatchup{cs: cs, lastCatchup: map[string]string{}}
+	c := &cronJobCatchup{cs: cs, nowFn: time.Now, lastCatchup: map[string]string{}}
 	return shared.AddPeriodic(mgr, catchupQueue, 15*time.Minute, c.run)
 }
 
 func (c *cronJobCatchup) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
+	// Lazily arm the zero-value struct — unit tests construct the
+	// module literally without the Setup path.
+	if c.nowFn == nil {
+		c.nowFn = time.Now
+	}
 
 	cronjobs, err := c.cs.BatchV1().CronJobs(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -130,30 +143,58 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 	return nil
 }
 
-// stale parses the schedule and decides whether lastScheduleTime is
-// older than max(2*period, period+30m). A nil lastScheduleTime means
-// the CronJob NEVER scheduled (or status was wiped) — that is stale
-// by definition. ok=false reports an unparseable schedule.
+// stale parses the schedule — honoring spec.timeZone via the
+// CRON_TZ= prefix the parser understands — and decides whether the
+// CronJob genuinely missed a run: the first scheduled tick strictly
+// AFTER lastScheduleTime lying in the past beyond its grace bound.
+// A nil lastScheduleTime means the CronJob NEVER scheduled (or
+// status was wiped) — the creation timestamp anchors the same
+// missed-tick math, so a brand-new job whose first tick is still in
+// the future is NOT stale (the old code treated nil as stale
+// unconditionally: a fresh opted-in job got an immediate replay and
+// kept re-firing daily until its first real tick landed, because
+// lastScheduleTime stays nil that whole time). ok=false reports an
+// unparseable schedule.
 func (c *cronJobCatchup) stale(log logr.Logger, cj *batchv1.CronJob) (bool, bool) {
-	sched, err := cron.ParseStandard(cj.Spec.Schedule)
+	schedule := cj.Spec.Schedule
+	if tz := cj.Spec.TimeZone; tz != nil && *tz != "" {
+		// spec.timeZone sets the zone the expression is evaluated in
+		// — robfig/cron accepts the CRON_TZ= prefix natively.
+		schedule = "CRON_TZ=" + *tz + " " + schedule
+	}
+	sched, err := cron.ParseStandard(schedule)
 	if err != nil {
 		log.Info("WARN: unparseable schedule — skip",
 			"cronjob", cj.Namespace+"/"+cj.Name,
 			"schedule", cj.Spec.Schedule, "error", err)
 		return false, false
 	}
-	if cj.Status.LastScheduleTime == nil {
-		return true, true
+	// The first tick strictly after lastScheduleTime is the run the
+	// controller owed us next. Still in the future means healthy,
+	// however long ago the last run was: a weekday-only job idle
+	// since Friday 17:00 is NOT stale on Saturday — its next tick is
+	// Monday. (The old check derived the period from two FUTURE
+	// ticks and compared raw lastScheduleTime age against it, which
+	// fired all weekend because the gap since Friday dwarfed the
+	// weekday cadence.)
+	anchor := cj.CreationTimestamp.Time
+	if cj.Status.LastScheduleTime != nil {
+		anchor = cj.Status.LastScheduleTime.Time
 	}
-	// Derive the period from two successive ticks — works for any
-	// cron expression the parser accepts (@daily, */5, ranges, ...).
-	next := sched.Next(time.Now())
-	period := sched.Next(next).Sub(next)
+	missed := sched.Next(anchor)
+	now := c.nowFn()
+	if !missed.Before(now) {
+		return false, true
+	}
+	// Grace: the period of the MISSED tick — the gap to the tick
+	// after it, not the upcoming cadence — so a */5 job gets a tight
+	// bound while a sparse schedule is not flagged prematurely.
+	period := sched.Next(missed).Sub(missed)
 	threshold := period + catchupMinStaleGrace
 	if 2*period > threshold {
 		threshold = 2 * period
 	}
-	return time.Since(cj.Status.LastScheduleTime.Time) > threshold, true
+	return now.Sub(missed) > threshold, true
 }
 
 // deduped reports whether a catch-up for cj is already covered:
@@ -197,7 +238,13 @@ func (c *cronJobCatchup) capped(key string) bool {
 	if c.lastCatchup == nil {
 		c.lastCatchup = map[string]string{}
 	}
-	return c.lastCatchup[key] == time.Now().UTC().Format("2006-01-02")
+	// Same lazy arm as run() — tests call capped() on a zero-value
+	// struct, and the day stamp must come from the clock seam so a
+	// pinned nowFn really pins "today".
+	if c.nowFn == nil {
+		c.nowFn = time.Now
+	}
+	return c.lastCatchup[key] == c.nowFn().UTC().Format("2006-01-02")
 }
 
 // spawn clones the CronJob's JobTemplate into a <cj>-catchup-<unix>
@@ -208,6 +255,13 @@ func (c *cronJobCatchup) capped(key string) bool {
 // is metered+logged but does not abort the sweep or arm the daily
 // cap — the next tick retries. Reports whether the Job was created.
 func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1.CronJob, key string) bool {
+	// One read of the clock seam feeds both the Job-name suffix and
+	// the daily-cap stamp — a pinned nowFn (tests) must pin both,
+	// and on a real clock the two can never straddle midnight.
+	if c.nowFn == nil {
+		c.nowFn = time.Now
+	}
+	now := c.nowFn()
 	labels := maps.Clone(cj.Spec.JobTemplate.Labels)
 	if labels == nil {
 		labels = map[string]string{}
@@ -218,9 +272,19 @@ func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1
 		annotations = map[string]string{}
 	}
 	annotations["cronjob.kubernetes.io/instantiate"] = "manual"
+	// DNS-1123 subdomain caps the Job name at 63 chars but a CronJob
+	// name can reach 52 — a naive "<cj>-catchup-<unix>" overflows and
+	// Create fails Invalid forever. Truncate the CronJob-name portion
+	// so the always-meaningful suffix fits, and drop trailing
+	// separators so the name still ends alphanumeric.
+	suffix := fmt.Sprintf("-catchup-%d", now.Unix())
+	name := cj.Name
+	if max := catchupJobNameMax - len(suffix); len(name) > max {
+		name = strings.TrimRight(name[:max], "-.")
+	}
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        fmt.Sprintf("%s-catchup-%d", cj.Name, time.Now().Unix()),
+			Name:        name + suffix,
 			Namespace:   cj.Namespace,
 			Labels:      labels,
 			Annotations: annotations,
@@ -234,7 +298,7 @@ func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1
 		return false
 	}
 	c.mu.Lock()
-	c.lastCatchup[key] = time.Now().UTC().Format("2006-01-02")
+	c.lastCatchup[key] = now.UTC().Format("2006-01-02")
 	c.mu.Unlock()
 	log.Info("CATCHUP job", "job", job.Name,
 		"cronjob", cj.Namespace+"/"+cj.Name,

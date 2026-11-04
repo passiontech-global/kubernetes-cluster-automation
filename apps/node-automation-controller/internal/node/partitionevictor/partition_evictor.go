@@ -163,8 +163,18 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	}
 	byName := make(map[string]*corev1.Node, len(nodes))
 	flagged := map[string]bool{}
+	total := 0
 	for i := range nodes {
 		byName[nodes[i].Name] = &nodes[i]
+		if shared.IsControlPlane(&nodes[i]) {
+			// k0s control planes run no kubelet and no evictable
+			// workload — a partition condition there must neither
+			// taint nor count toward the mesh-wide guard (counting
+			// them would dilute the denominator and mask a
+			// fully-partitioned workforce).
+			continue
+		}
+		total++
 		if nodePartitioned(&nodes[i]) {
 			flagged[nodes[i].Name] = true
 		}
@@ -196,10 +206,10 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	}
 	sort.Strings(names)
 
-	// Mesh-wide guard: >50% flagged (or all) means the partition is not
-	// node-local — evicting just churns pods between broken nodes.
-	total := len(nodes)
-	if nFlagged*2 > total || nFlagged >= total {
+	// Mesh-wide guard: >50% of EVICTABLE nodes flagged means the
+	// partition is not node-local — evicting just churns pods
+	// between broken nodes.
+	if nFlagged*2 > total {
 		log.Info("ABORT: nodes flagged — mesh-wide partition, no evict",
 			"flagged", nFlagged, "total", total, "nodes", names)
 		return nil
@@ -212,8 +222,10 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	// cluster-wide pod list (dead-node-sweeper reads the same way).
 	namespaces := partitionEvictNamespaces()
 
-	evicted := 0
-loop:
+	// Taint EVERY flagged node before any eviction — the cap below
+	// bounds pod churn, not fencing. Breaking out of a combined loop
+	// on cap would leave later flagged nodes schedulable until the
+	// next run while their pods sit on a blackholed node.
 	for _, name := range names {
 		node := byName[name]
 		if !shared.HasTaint(node.Spec.Taints, partitionTaintKey) {
@@ -224,6 +236,11 @@ loop:
 				log.Info("TAINT: network partitioned -> NoSchedule", "node", name)
 			}
 		}
+	}
+
+	evicted := 0
+loop:
+	for _, name := range names {
 		pods, err := e.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
 			FieldSelector: "spec.nodeName=" + name,
 		})
@@ -251,7 +268,13 @@ loop:
 			}
 			log.Info("EVICT: pod off partitioned node",
 				"pod", p.Namespace+"/"+p.Name, "node", name)
-			if err := e.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
+			// UID precondition: the listed pod could be replaced by a
+			// same-named fresh pod before the delete lands — never
+			// kill the replacement.
+			if err := e.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
+				metav1.DeleteOptions{
+					Preconditions: &metav1.Preconditions{UID: &p.UID},
+				}); err != nil {
 				metrics.IncError(partitionEvictorQueue)
 				log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name,
 					"node", name)

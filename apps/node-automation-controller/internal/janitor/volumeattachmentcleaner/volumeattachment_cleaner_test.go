@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
@@ -382,13 +383,16 @@ func TestVACleanerCap(t *testing.T) {
 }
 
 // Zero nodes means the apiserver/RBAC broke — every VA would look
-// orphaned, so nothing is evaluated or recorded.
+// orphaned, so nothing is evaluated or recorded. The refusal is
+// deliberately non-fatal (nil return) but MUST be metered — a
+// persistently-empty node list is broken RBAC, invisible otherwise.
 func TestVACleanerEmptyNodeListAborts(t *testing.T) {
 	now := time.Now()
 	cs := fake.NewSimpleClientset(
 		vacAttachment("va-orphan", "gone-node", now.Add(-time.Hour)))
 	c := newVACleaner(cs, func() time.Time { return now })
 
+	before := testutil.QueueErrorCount(t, volumeAttachmentCleanerQueue)
 	if err := c.run(ctx); err != nil {
 		t.Fatalf("empty node list must abort cleanly, got %v", err)
 	}
@@ -397,6 +401,9 @@ func TestVACleanerEmptyNodeListAborts(t *testing.T) {
 	}
 	if len(c.orphanFirstSeen) != 0 {
 		t.Fatal("orphan sightings recorded on an aborted run")
+	}
+	if got := testutil.QueueErrorCount(t, volumeAttachmentCleanerQueue) - before; got != 1 {
+		t.Fatalf("empty node list not metered: error delta = %v, want 1", got)
 	}
 }
 
@@ -453,6 +460,39 @@ func TestVACleanerPodListErrorFailsClosed(t *testing.T) {
 	}
 	if got := testutil.QueueErrorCount(t, volumeAttachmentCleanerQueue) - before; got != 1 {
 		t.Fatalf("queue error delta = %v, want 1", got)
+	}
+}
+
+// The delete carries a UID precondition — VA names are deterministic
+// csi-hash names, so a re-attachment between list and delete recreates
+// the SAME name and only the vetted object may be removed.
+func TestVACleanerDeleteUIDPrecondition(t *testing.T) {
+	now := time.Now()
+	va := vacAttachment("va-orphan", "gone-node", now.Add(-time.Hour))
+	va.UID = "uid-va-orphan"
+	cs := fake.NewSimpleClientset(
+		vacNode("alive", corev1.ConditionTrue), va)
+	var gotUID *types.UID
+	cs.PrependReactor("delete", "volumeattachments",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			opts := a.(ktesting.DeleteAction).GetDeleteOptions()
+			if opts.Preconditions != nil {
+				gotUID = opts.Preconditions.UID
+			}
+			return false, nil, nil // fall through to the tracker
+		})
+	c := newVACleaner(cs, func() time.Time { return now })
+
+	for i := 0; i < 2; i++ {
+		if err := c.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if gotUID == nil || *gotUID != va.UID {
+		t.Fatalf("delete missing the UID precondition: %v", gotUID)
+	}
+	if vaExists(t, cs, "va-orphan") {
+		t.Fatal("orphan VA not deleted")
 	}
 }
 

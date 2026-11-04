@@ -3,6 +3,7 @@ package deschedulerstormgate
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -176,11 +177,17 @@ func TestStormGateHoldOnlyWhenTrue(t *testing.T) {
 }
 
 func TestStormGateNoDeschedulerDeployment(t *testing.T) {
-	// Cluster without descheduler — the verdict is computed but the
-	// reconcile is a clean no-op.
+	// Cluster without descheduler — the reconcile is a clean no-op.
+	// The IsNotFound skip runs BEFORE the maintenance mutex: a nil
+	// dyn client AND a failing kured get prove neither ran — both
+	// would have errored the reconcile on the old order.
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionFalse, nil))
-	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	cs.PrependReactor("get", "daemonsets",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("kured get must not run")
+		})
+	r := &deschedulerStormGate{cs: cs} // dyn nil — must not be consulted either
 	res, err := r.Reconcile(ctx, reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -272,19 +279,54 @@ func TestStormGateNodeListError(t *testing.T) {
 	}
 }
 
-// A failed replicas update errors the reconcile — the verdict must not
-// be swallowed.
-func TestStormGateDeployUpdateError(t *testing.T) {
+// A failed replicas merge-patch errors the reconcile — the verdict
+// must not be swallowed.
+func TestStormGateScalePatchError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionFalse, nil), // storm -> want 0
+		deschedulerDeploy(1, nil))
+	cs.PrependReactor("patch", "deployments",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if strings.Contains(
+				string(a.(ktesting.PatchAction).GetPatch()), "replicas") {
+				return true, nil, errors.New("patch rejected")
+			}
+			return false, nil, nil
+		})
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the replicas patch fails")
+	}
+}
+
+// Scaling writes a spec.replicas merge patch — never a full-object
+// Update that would clobber concurrent spec edits or fail on
+// resourceVersion.
+func TestStormGateScalesViaMergePatch(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionFalse, nil), // storm -> want 0
 		deschedulerDeploy(1, nil))
 	cs.PrependReactor("update", "deployments",
 		func(ktesting.Action) (bool, runtime.Object, error) {
-			return true, nil, errors.New("update rejected")
+			return true, nil, errors.New("full-object update must not be used")
+		})
+	var patches [][]byte
+	cs.PrependReactor("patch", "deployments",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			patches = append(patches, a.(ktesting.PatchAction).GetPatch())
+			return false, nil, nil
 		})
 	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
-		t.Fatal("expected error when the deployment update fails")
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	// First patch is the replicas write (the decision annotation
+	// patch follows it).
+	if len(patches) == 0 || string(patches[0]) != `{"spec":{"replicas":0}}` {
+		t.Fatalf("scale patch = %s, want spec.replicas merge patch", patches)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 0 {
+		t.Fatalf("merge patch did not scale to 0, replicas=%d", got)
 	}
 }
 
@@ -295,8 +337,13 @@ func TestStormGateDecisionPatchError(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionFalse, nil),
 		deschedulerDeploy(1, nil))
 	cs.PrependReactor("patch", "deployments",
-		func(ktesting.Action) (bool, runtime.Object, error) {
-			return true, nil, errors.New("patch rejected")
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if strings.Contains(
+				string(a.(ktesting.PatchAction).GetPatch()),
+				stormGateDecisionAnno) {
+				return true, nil, errors.New("patch rejected")
+			}
+			return false, nil, nil
 		})
 	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {

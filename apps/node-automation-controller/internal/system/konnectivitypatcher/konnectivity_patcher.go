@@ -84,6 +84,18 @@ func (r *konnectivityPatcher) Reconcile(ctx context.Context, _ reconcile.Request
 			"daemonset", "kube-system/konnectivity-agent")
 		return res, nil
 	}
+	// A missing konnectivity-agent container reads as drift, but the
+	// strategic-merge patch merges containers BY NAME — applied to a
+	// spec without it, it would append a container entry with no
+	// image that the apiserver rejects forever. We cannot reconstruct
+	// the image, so warn and leave the DS for the stack applier
+	// rather than emitting a guaranteed-invalid patch.
+	if !shared.PodSpecHasContainer(&ds.Spec.Template.Spec, "konnectivity-agent") {
+		log.Info("WARN: konnectivity-agent container missing from pod spec — "+
+			"skipping patch (strategic merge cannot create it without an image)",
+			"daemonset", "kube-system/konnectivity-agent")
+		return res, nil
+	}
 	if !shared.DaemonSetSettled(ds) {
 		log.Info("SKIP: drifted but rollout in progress",
 			"daemonset", "kube-system/konnectivity-agent",

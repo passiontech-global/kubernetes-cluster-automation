@@ -10,7 +10,9 @@
 // upgrade legitimately shows that message for minutes).
 //
 // Confirmation before touching anything: the release's own secrets
-// (type helm.sh/release.v1, label name=<release>) in the target ns
+// (type helm.sh/release.v1, label name=<release>) in the STORAGE
+// namespace (flux GetStorageNamespace: spec.storageNamespace || HR
+// namespace — targetNamespace is not in that chain)
 // must show the NEWEST revision as pending-* AND an older deployed/
 // superseded revision must exist — that is a safe rollback target;
 // deleting the pending secret restores the previous state instead of
@@ -19,10 +21,11 @@
 // Action: delete that newest pending-* secret + merge-patch the HR
 // annotation reconcile.fluxcd.io/requestedAt=<now> (flux's "reconcile
 // now" signal) so helm-controller retries immediately. On a successful
-// unlock the target namespace is also swept for FAILED helm-hook Jobs
-// (C3a): hooks are one-shot, but a failed hook Job object blocks the
-// retried release — helm cannot re-run a hook while its old Job still
-// exists ("cannot re-use a name that is still in use").
+// unlock the RELEASE namespace (targetNamespace || HR namespace —
+// where helm installs hook Jobs) is also swept for FAILED helm-hook
+// Jobs (C3a): hooks are one-shot, but a failed hook Job object blocks
+// the retried release — helm cannot re-run a hook while its old Job
+// still exists ("cannot re-use a name that is still in use").
 //
 // Flux source artifact healer (C1): a HelmRelease OR Kustomization
 // stuck Ready=False >=15m on a stale-artifact signature ("artifact
@@ -92,6 +95,10 @@ const (
 	// transient fetch retry.
 	artifactStuckMinAge = 15 * time.Minute
 	sourceNudgeCooldown = 30 * time.Minute // max 1 nudge per Flux source
+	// helmListPageSize caps each List response — cluster-wide HR /
+	// Kustomization reads page through continue tokens instead of one
+	// unbounded fetch.
+	helmListPageSize = 500
 )
 
 // helmReleaseGVRs tried in order — v2 on current flux, v2beta2 on
@@ -116,6 +123,9 @@ var fluxSourceGVRs = map[string]schema.GroupVersionResource{
 	"GitRepository":  {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "gitrepositories"},
 	"HelmRepository": {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmrepositories"},
 	"OCIRepository":  {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "ocirepositories"},
+	// Bucket is a first-class v1 source kind — a Kustomization or HR
+	// sourcing artifacts from an S3/GCS bucket needs the same nudge.
+	"Bucket": {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "buckets"},
 }
 
 type helmReleaseUnlocker struct {
@@ -131,6 +141,12 @@ type helmReleaseUnlocker struct {
 	// Pruned each sweep once past the cooldown or when the HR
 	// vanished.
 	unlocked map[string]time.Time
+	// alerted: ns/name → the "still stuck after unlock" page already
+	// fired for the CURRENT cooldown window — without it a stuck HR
+	// re-bumps the error metric every 10-minute sweep for up to
+	// 24h (~144 increments/day). Pruned alongside unlocked so a new
+	// cooldown window alerts afresh.
+	alerted map[string]bool
 }
 
 // Setup registers the 10-minute sweep.
@@ -140,6 +156,7 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface) err
 		dyn:       dyn,
 		firstSeen: map[string]time.Time{},
 		unlocked:  map[string]time.Time{},
+		alerted:   map[string]bool{},
 	}
 	return shared.AddPeriodic(mgr, helmUnlockQueue, helmUnlockInterval, u.run)
 }
@@ -183,6 +200,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	for key, last := range u.unlocked {
 		if !present[key] || now.Sub(last) >= helmUnlockCooldown {
 			delete(u.unlocked, key)
+			delete(u.alerted, key)
 		}
 	}
 
@@ -243,10 +261,17 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 			u.unlocked[key] = last // fold the persisted stamp into the ledger
 			// Still/again stuck inside the cooldown: the previous
 			// unlock did NOT resolve it — page instead of churning
-			// secrets every tick.
-			metrics.IncError(helmUnlockQueue)
-			log.Info("ALERT: HR still stuck after unlock — not retrying inside cooldown",
-				"hr", key, "unlockedAgo", now.Sub(last).Truncate(time.Minute))
+			// secrets every tick. The alert itself fires once per
+			// cooldown window (alerted ledger), not per sweep.
+			if u.alerted == nil {
+				u.alerted = map[string]bool{} // literal-constructed structs (tests)
+			}
+			if !u.alerted[key] {
+				metrics.IncError(helmUnlockQueue)
+				u.alerted[key] = true
+				log.Info("ALERT: HR still stuck after unlock — not retrying inside cooldown",
+					"hr", key, "unlockedAgo", now.Sub(last).Truncate(time.Minute))
+			}
 			continue
 		}
 		acted, err := u.unlock(ctx, gvr, hr)
@@ -272,11 +297,14 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 }
 
 // listHelmReleases returns the HR list and the GVR that answered — v2
-// first, v2beta2 when the v2 CRDs are absent.
+// first, v2beta2 when the v2 CRDs are absent. Pages at
+// helmListPageSize: HRs are unbounded cluster-wide and each item
+// embeds values/crds hooks — a single shot List of a large fleet is
+// a heap spike.
 func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructured.UnstructuredList, schema.GroupVersionResource, error) {
 	var lastErr error
 	for _, gvr := range helmReleaseGVRs {
-		list, err := u.dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
+		list, err := u.listAllPages(ctx, u.dyn.Resource(gvr))
 		if err == nil {
 			return list, gvr, nil
 		}
@@ -284,6 +312,26 @@ func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructur
 	}
 	return nil, schema.GroupVersionResource{},
 		fmt.Errorf("list helmreleases (all known GVRs failed): %w", lastErr)
+}
+
+// listAllPages walks ListOptions.Continue until the apiserver stops
+// paging — every cluster-wide dynamic List in this module goes through
+// it so no single response hauls the whole resource across the wire.
+func (u *helmReleaseUnlocker) listAllPages(ctx context.Context,
+	ri dynamic.ResourceInterface) (*unstructured.UnstructuredList, error) {
+	out := &unstructured.UnstructuredList{}
+	opts := metav1.ListOptions{Limit: helmListPageSize}
+	for {
+		page, err := ri.List(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		out.Items = append(out.Items, page.Items...)
+		if page.GetContinue() == "" {
+			return out, nil
+		}
+		opts.Continue = page.GetContinue()
+	}
 }
 
 // hrStuckInProgress reports whether the HR's Ready condition is False
@@ -333,12 +381,14 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	// release secrets embed the full compressed chart, so an
 	// unfiltered list hauls every release in the namespace across
 	// the wire. owner=helm + name=<release> is the same label pair
-	// the revision scan below matches on.
-	secrets, err := u.cs.CoreV1().Secrets(hrTargetNS(hr)).List(ctx,
+	// the revision scan below matches on. Storage ns is flux's
+	// GetStorageNamespace() — spec.storageNamespace || HR namespace;
+	// targetNamespace is NOT part of that chain.
+	secrets, err := u.cs.CoreV1().Secrets(hrStorageNS(hr)).List(ctx,
 		metav1.ListOptions{LabelSelector: "owner=helm,name=" + release})
 	if err != nil {
 		return false, fmt.Errorf("list release secrets in %s for %s: %w",
-			hrTargetNS(hr), release, err)
+			hrStorageNS(hr), release, err)
 	}
 
 	var pending *corev1.Secret
@@ -384,7 +434,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	log.Info("ACTION: delete stuck pending release secret",
 		"hr", key, "secret", pending.Name, "status", pending.Labels["status"], "rev", pendingRev)
 	if err := u.cs.CoreV1().Secrets(pending.Namespace).Delete(ctx, pending.Name,
-		metav1.DeleteOptions{}); err != nil {
+		metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &pending.UID}}); err != nil {
 		return false, fmt.Errorf("delete pending secret %s/%s: %w", pending.Namespace, pending.Name, err)
 	}
 
@@ -408,16 +458,19 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	}
 	log.Info("ACTION: requested HR reconcile", "hr", key)
 
-	// C3a: failed helm-hook Jobs in the target namespace are the second
-	// half of this deadlock class — the pending operation that wedged
-	// the release usually left a failed hook Job behind, and helm
-	// refuses to re-run a hook while its Job object still exists
-	// ("cannot re-use a name that is still in use"). Hooks are one-shot
-	// by contract, so a Failed hook Job is pure residue; reaping it
-	// lets the retried helm run recreate the hook fresh. Best-effort:
-	// a list/delete failure here must NOT undo the unlock that already
-	// landed — the pending-secret delete + reconcile stamp are the fix.
-	u.cleanFailedHookJobs(ctx, hrTargetNS(hr))
+	// C3a: failed helm-hook Jobs in the RELEASE namespace are the second
+	// half of this deadlock class — hook Jobs are created where the
+	// release is installed (targetNamespace || HR namespace), NOT in
+	// the storage namespace where the release secrets live. The
+	// pending operation that wedged the release usually left a failed
+	// hook Job behind, and helm refuses to re-run a hook while its
+	// Job object still exists ("cannot re-use a name that is still
+	// in use"). Hooks are one-shot by contract, so a Failed hook Job
+	// is pure residue; reaping it lets the retried helm run recreate
+	// the hook fresh. Best-effort: a list/delete failure here must
+	// NOT undo the unlock that already landed — the pending-secret
+	// delete + reconcile stamp are the fix.
+	u.cleanFailedHookJobs(ctx, hrReleaseNS(hr))
 	return true, nil
 }
 
@@ -445,7 +498,8 @@ func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string
 		log.Info("ACTION: delete failed helm-hook Job",
 			"ns", ns, "job", j.Name)
 		if err := u.cs.BatchV1().Jobs(ns).Delete(ctx, j.Name,
-			metav1.DeleteOptions{PropagationPolicy: &bg}); err != nil {
+			metav1.DeleteOptions{PropagationPolicy: &bg,
+				Preconditions: &metav1.Preconditions{UID: &j.UID}}); err != nil {
 			log.Error(err, "helm-hook job delete failed", "ns", ns, "job", j.Name)
 			continue
 		}
@@ -502,7 +556,7 @@ type fluxSourceRef struct{ kind, namespace, name string }
 func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 	hrs *unstructured.UnstructuredList) error {
 	log := logf.FromContext(ctx)
-	kustomizations, err := u.dyn.Resource(fluxKustomizationGVR).List(ctx, metav1.ListOptions{})
+	kustomizations, err := u.listAllPages(ctx, u.dyn.Resource(fluxKustomizationGVR))
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			kustomizations = nil // pre-v1 flux — the HR half still runs
@@ -688,24 +742,41 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 	return true
 }
 
-// hrReleaseName is spec.releaseName, falling back to the object name —
-// the label helm puts on its release secrets.
+// hrReleaseName mirrors upstream flux's GetReleaseName():
+// spec.releaseName wins, then "<targetNamespace>-<name>" when a
+// targetNamespace is set (flux prefixes the release name to keep
+// same-named HRs in different target namespaces distinct), then the
+// bare object name. It is the `name=` label helm puts on its release
+// secrets.
 func hrReleaseName(hr *unstructured.Unstructured) string {
 	if n, _, _ := unstructured.NestedString(hr.Object, "spec", "releaseName"); n != "" {
 		return n
 	}
+	if ns, _, _ := unstructured.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
+		return ns + "-" + hr.GetName()
+	}
 	return hr.GetName()
 }
 
-// hrTargetNS resolves where the release secrets live:
-// spec.storageNamespace first (helm-controller stores release secrets
-// there when set), then spec.targetNamespace, then the HR's own
-// namespace — mirroring flux's own precedence.
-func hrTargetNS(hr *unstructured.Unstructured) string {
-	if ns, _, _ := unstructured.NestedString(hr.Object, "spec", "storageNamespace"); ns != "" {
+// hrReleaseNS resolves where the release is INSTALLED —
+// spec.targetNamespace || HR namespace (upstream flux's
+// GetReleaseNamespace used to locate hook Jobs, pods, and every
+// workload the chart renders). Hook Jobs live here, not in the
+// storage namespace.
+func hrReleaseNS(hr *unstructured.Unstructured) string {
+	if ns, _, _ := unstructured.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
 		return ns
 	}
-	if ns, _, _ := unstructured.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
+	return hr.GetNamespace()
+}
+
+// hrStorageNS mirrors upstream flux's GetStorageNamespace():
+// spec.storageNamespace || HR namespace. This is where helm-controller
+// writes the sh.helm.release.v1 secrets — spec.targetNamespace is NOT
+// part of the chain (it only locates the installed release, not its
+// bookkeeping).
+func hrStorageNS(hr *unstructured.Unstructured) string {
+	if ns, _, _ := unstructured.NestedString(hr.Object, "spec", "storageNamespace"); ns != "" {
 		return ns
 	}
 	return hr.GetNamespace()

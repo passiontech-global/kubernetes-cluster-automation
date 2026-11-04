@@ -20,6 +20,8 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -43,11 +45,15 @@ func (f *cjFakeStats) Summary(_ context.Context, node string) (int64, int64, int
 
 // cjFakeATC records every call; landWorker flips the recorded worker
 // state to "landed" so the drain loop finishes on the first poll.
+// landErr makes the land call fail (drain never starts); stateFn, if
+// set, answers workerState calls with per-call control.
 type cjFakeATC struct {
 	events   *[]string
 	loginErr error
 	stateErr error
+	landErr  error
 	states   map[string]string
+	stateFn  func(name string) (string, error)
 }
 
 func (f *cjFakeATC) login(_ context.Context, user, _ string) error {
@@ -57,6 +63,9 @@ func (f *cjFakeATC) login(_ context.Context, user, _ string) error {
 
 func (f *cjFakeATC) workerState(_ context.Context, name string) (string, error) {
 	*f.events = append(*f.events, "state:"+name)
+	if f.stateFn != nil {
+		return f.stateFn(name)
+	}
 	if f.stateErr != nil {
 		return "", f.stateErr
 	}
@@ -65,6 +74,9 @@ func (f *cjFakeATC) workerState(_ context.Context, name string) (string, error) 
 
 func (f *cjFakeATC) landWorker(_ context.Context, name string) error {
 	*f.events = append(*f.events, "land:"+name)
+	if f.landErr != nil {
+		return f.landErr
+	}
 	f.states[name] = "landed"
 	return nil
 }
@@ -161,6 +173,8 @@ func cjTestJanitor(cs *fake.Clientset, st nodeStatsReader, atc atcIface) *concou
 		runTimeout:     10 * time.Second,
 		reqTimeout:     10 * time.Second,
 		drainTimeout:   50 * time.Millisecond,
+		landFailWait:   10 * time.Millisecond,
+		pruneStateWait: 10 * time.Millisecond,
 		deleteTimeout:  100 * time.Millisecond,
 		uidPollTimeout: 100 * time.Millisecond,
 		readyTimeout:   100 * time.Millisecond,
@@ -376,7 +390,8 @@ func TestConcourseJanitorNoFlyStillDeletes(t *testing.T) {
 }
 
 // Unreadable stats fail OPEN to a wipe — the cleanup must never be
-// lost to a broken metrics path.
+// lost to a broken metrics path — but the blind wipe IS metered:
+// IncError on the stats read and again on the wipe decision.
 func TestConcourseJanitorStatsErrorFailOpen(t *testing.T) {
 	var events []string
 	cs := fake.NewSimpleClientset(
@@ -390,6 +405,7 @@ func TestConcourseJanitorStatsErrorFailOpen(t *testing.T) {
 		}}
 	j := cjTestJanitor(cs, st,
 		&cjFakeATC{events: &events, states: map[string]string{}})
+	before := testutil.QueueErrorCount(t, cjQueue)
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -404,6 +420,11 @@ func TestConcourseJanitorStatsErrorFailOpen(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected a delete in events %v", events)
+	}
+	// stats read error + blind-wipe decision + the post-wipe re-read
+	// all meter — at least the read + the wipe must count.
+	if got := testutil.QueueErrorCount(t, cjQueue) - before; got < 2 {
+		t.Fatalf("fail-open wipe under-metered: error delta = %v, want >= 2", got)
 	}
 }
 
@@ -576,6 +597,118 @@ func TestConcourseJanitorDrainKeepsPollingOnATCError(t *testing.T) {
 	}
 	if !deleted {
 		t.Fatalf("pod not deleted after drain timeout: %v", events)
+	}
+}
+
+// land-worker failure means the drain never started — the wait is
+// bounded by landFailWait, not drainTimeout: a worker stuck reading
+// "running" gives up inside the small bound and the pod is still
+// deleted on the same policy as a timed-out drain.
+func TestConcourseJanitorLandFailShortensDrain(t *testing.T) {
+	var events []string
+	cs := fake.NewSimpleClientset(
+		cjWorkerSTS(1),
+		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjLocalUsers())
+	cjReplaceOnDelete(cs, &events, true)
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			return 160 * gib, 200 * gib, 10 * gib, nil
+		}}
+	atc := &cjFakeATC{events: &events, landErr: errors.New("atc 503"),
+		states: map[string]string{"concourse-worker-0": "running"}}
+	j := cjTestJanitor(cs, st, atc)
+	// If the failed-land path used drainTimeout the run would stall
+	// for this full window; landFailWait must bound it instead.
+	j.drainTimeout = 5 * time.Second
+	j.landFailWait = 20 * time.Millisecond
+	start := time.Now()
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("drain waited %s past the land-fail bound — drainTimeout used", elapsed)
+	}
+	deleted := false
+	for _, e := range events {
+		if e == "delete:concourse-worker-0" {
+			deleted = true
+		}
+	}
+	if !deleted {
+		t.Fatalf("pod not deleted after land-fail wait: %v", events)
+	}
+}
+
+// The ATC de-registers a dead worker asynchronously — a state that
+// still reads "running" right after pod delete flips a few polls
+// later, and the bounded poll must catch it before deciding (no
+// prune while "running", prune once it settles).
+func TestConcourseJanitorPruneWaitsForStateSettle(t *testing.T) {
+	var events []string
+	cs := fake.NewSimpleClientset(
+		cjWorkerSTS(1),
+		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjLocalUsers())
+	cjReplaceOnDelete(cs, &events, true)
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			return 160 * gib, 200 * gib, 10 * gib, nil
+		}}
+	stateCalls := 0
+	atc := &cjFakeATC{events: &events, states: map[string]string{},
+		stateFn: func(name string) (string, error) {
+			stateCalls++
+			// Drain needs "landed" fast; the post-delete prune poll
+			// then sees the async lag: "running" twice, then settled.
+			if stateCalls <= 1 {
+				return "landed", nil // drain poll
+			}
+			if stateCalls <= 3 {
+				return "running", nil // lagging de-registration
+			}
+			return "landed", nil
+		}}
+	j := cjTestJanitor(cs, st, atc)
+	j.pruneStateWait = 50 * time.Millisecond
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pruned := false
+	for _, e := range events {
+		if e == "prune:concourse-worker-0" {
+			pruned = true
+		}
+	}
+	if !pruned {
+		t.Fatalf("worker record lagged but prune never ran: %v", events)
+	}
+	if stateCalls < 4 {
+		t.Fatalf("expected the prune poll to retry past the lag, got %d state calls", stateCalls)
+	}
+}
+
+// deletePod passes the re-fetched UID as a delete precondition — a
+// pod that churned to a different UID between re-get and delete must
+// conflict rather than be removed unvetted.
+func TestConcourseJanitorDeletePodUIDPrecondition(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil))
+	var gotUID *types.UID
+	cs.PrependReactor("delete", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			opts := a.(ktesting.DeleteAction).GetDeleteOptions()
+			if opts.Preconditions != nil {
+				gotUID = opts.Preconditions.UID
+			}
+			return false, nil, nil // fall through to the tracker
+		})
+	j := cjTestJanitor(cs, nil, nil)
+	if err := j.deletePod(ctx, "concourse-worker-0", "uid-0"); err != nil {
+		t.Fatal(err)
+	}
+	if gotUID == nil || *gotUID != "uid-0" {
+		t.Fatalf("delete missing the UID precondition: %v", gotUID)
 	}
 }
 

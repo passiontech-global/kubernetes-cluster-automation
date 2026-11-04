@@ -108,9 +108,13 @@ func (g *apiServiceGuard) run(ctx context.Context) error {
 	}
 	// The orphan sweep and the availability watchdog are
 	// independent duties — a failure in one must never blind the
-	// other, so both run and their errors join (nil+nil → nil).
-	orphanErr := g.sweepOrphans(ctx)
-	watchErr := g.sweepAvailability(ctx)
+	// other, so both run and their errors join (nil+nil → nil). Both
+	// read the same APIService set, so it is listed ONCE per run and
+	// shared; a list failure is handed to each duty separately
+	// (either may still act on the parts it does not need).
+	svcs, svcsErr := g.dyn.Resource(apiServiceGVR).List(ctx, metav1.ListOptions{})
+	orphanErr := g.sweepOrphans(ctx, svcs, svcsErr)
+	watchErr := g.sweepAvailability(ctx, svcs, svcsErr)
 	return errors.Join(orphanErr, watchErr)
 }
 
@@ -118,7 +122,11 @@ func (g *apiServiceGuard) run(ctx context.Context) error {
 // (a) Fail-closed orphan cleanup.
 // ---------------------------------------------------------------------------
 
-func (g *apiServiceGuard) sweepOrphans(ctx context.Context) error {
+// sweepOrphans consumes the shared per-run APIService snapshot — a
+// list error is delivered via svcsErr (recorded by run, not returned
+// there) so this pass can still abort itself while the watchdog
+// reports its own verdict on the same failure.
+func (g *apiServiceGuard) sweepOrphans(ctx context.Context, svcs *unstructured.UnstructuredList, svcsErr error) error {
 	log := logf.FromContext(ctx)
 
 	// Namespace snapshot — the ONLY source of "deleted" truth. An
@@ -140,9 +148,8 @@ func (g *apiServiceGuard) sweepOrphans(ctx context.Context) error {
 	}
 	nsList = nil
 
-	svcs, err := g.dyn.Resource(apiServiceGVR).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list apiservices — abort orphan pass: %w", err)
+	if svcsErr != nil {
+		return fmt.Errorf("list apiservices — abort orphan pass: %w", svcsErr)
 	}
 
 	deleted := 0
@@ -195,11 +202,13 @@ func (g *apiServiceGuard) sweepOrphans(ctx context.Context) error {
 // (b) Availability watchdog.
 // ---------------------------------------------------------------------------
 
-func (g *apiServiceGuard) sweepAvailability(ctx context.Context) error {
+// sweepAvailability consumes the same per-run snapshot — a list error
+// is delivered via svcsErr and aborts only this duty (the orphan pass
+// above already ran its own verdict).
+func (g *apiServiceGuard) sweepAvailability(ctx context.Context, svcs *unstructured.UnstructuredList, svcsErr error) error {
 	log := logf.FromContext(ctx)
-	svcs, err := g.dyn.Resource(apiServiceGVR).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list apiservices — watchdog skipped: %w", err)
+	if svcsErr != nil {
+		return fmt.Errorf("list apiservices — watchdog skipped: %w", svcsErr)
 	}
 
 	now := g.nowFn()

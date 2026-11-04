@@ -667,6 +667,171 @@ func TestEndpointGuardSkipsQuarantineWithNoHealthyPeer(t *testing.T) {
 	}
 }
 
+// THE routable-peer guard: a wedged READY backend whose only
+// "healthy" peer sits in notReadyAddresses must NOT be quarantined —
+// kube-proxy never routes to notReady addresses, so pulling the last
+// routable IP would flap kubernetes.default to zero Ready endpoints.
+// (The notReady suspect itself is still probed and could be pulled.)
+func TestEndpointGuardNotReadyPeerCountsAsNoPeer(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1"}, []string{"10.0.0.2"}, nil),
+		kubeEndpointSlice([]string{"10.0.0.1"}))
+	probes := probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500), // healthy probe, but NOT routable
+	}
+	g := newEndpointGuard(cs, probes)
+	for i := 0; i < endpointGuardErrCycles; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ep := getKubeEndpoints(t, cs)
+	if !endpointAddrSet(ep)["10.0.0.1"] {
+		t.Fatal("last routable backend quarantined on a notReady peer's health")
+	}
+	if ep.Annotations[endpointGuardAnno] != "" {
+		t.Fatalf("annotation = %q, want empty", ep.Annotations[endpointGuardAnno])
+	}
+}
+
+// Same guard on the EndpointSlice SSOT: a Ready=false slice endpoint
+// is probed (and could be pulled) but never counts as a healthy peer.
+func TestEndpointGuardSliceModeNotReadyPeerCountsAsNoPeer(t *testing.T) {
+	eps := kubeEndpointSlice([]string{"10.0.0.1"})
+	down := false
+	eps.Endpoints = append(eps.Endpoints, discoveryv1.Endpoint{
+		Addresses:  []string{"10.0.0.2"},
+		Conditions: discoveryv1.EndpointConditions{Ready: &down},
+	})
+	cs := fake.NewSimpleClientset(eps)
+	fakeServerVersion(cs, "1", "33")
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	for i := 0; i < endpointGuardErrCycles; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := getKubeSlice(t, cs)
+	if !sliceAddrSet(got)["10.0.0.1"] {
+		t.Fatal("last Ready slice endpoint quarantined on a Ready=false peer's health")
+	}
+	if got.Annotations[endpointGuardAnno] != "" {
+		t.Fatalf("annotation = %q, want empty", got.Annotations[endpointGuardAnno])
+	}
+}
+
+// Quarantine expiry: a quarantined IP that vanishes from the address
+// sets AND keeps failing its probe past endpointGuardExpireCyc
+// consecutive cycles is declared decommissioned — dropped from the
+// annotation, memQuarantine and backend state so the 10s re-apply
+// cadence releases (quarantineActive clears).
+func TestEndpointGuardQuarantineExpiresForDepartedBackend(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, []string{"10.0.0.9"}),
+		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	probes := probeTable{
+		"10.0.0.1": apiHealthyProbe(1000),
+		"10.0.0.2": apiHealthyProbe(1000),
+		"10.0.0.9": {err: errors.New("connection refused")},
+	}
+	g := newEndpointGuard(cs, probes)
+	for i := 0; i < endpointGuardExpireCyc-1; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ep := getKubeEndpoints(t, cs)
+	if ep.Annotations[endpointGuardAnno] != "10.0.0.9" {
+		t.Fatalf("quarantine dropped before %d err cycles: %q",
+			endpointGuardExpireCyc, ep.Annotations[endpointGuardAnno])
+	}
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ep = getKubeEndpoints(t, cs)
+	if _, ok := ep.Annotations[endpointGuardAnno]; ok {
+		t.Fatalf("dead backend still pinned: %q", ep.Annotations[endpointGuardAnno])
+	}
+	if endpointAddrSet(ep)["10.0.0.9"] {
+		t.Fatal("expired backend re-added to addresses — expiry must not re-add")
+	}
+	if g.quarantineActive {
+		t.Fatal("quarantineActive still armed after the last IP expired")
+	}
+	if g.memQuarantine["10.0.0.9"] {
+		t.Fatal("memQuarantine still holds the expired IP")
+	}
+	if _, ok := g.backends["10.0.0.9"]; ok {
+		t.Fatal("backend probe state for the expired IP not pruned")
+	}
+}
+
+// A quarantined IP the endpoints reconciler keeps re-adding (still a
+// live backend, e.g. rebuilding after a rebuild-and-rejoin) is never
+// expired no matter how long it errors — absence from the address
+// sets is the decommissioned tell.
+func TestEndpointGuardQuarantineNeverExpiresWhileAddressed(t *testing.T) {
+	ep := kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, []string{"10.0.0.9"})
+	ep.Subsets[0].Addresses = append(ep.Subsets[0].Addresses,
+		corev1.EndpointAddress{IP: "10.0.0.9"}) // reconciler re-added it
+	cs := fake.NewSimpleClientset(ep)
+	probes := probeTable{
+		"10.0.0.1": apiHealthyProbe(1000),
+		"10.0.0.2": apiHealthyProbe(1000),
+		"10.0.0.9": {err: errors.New("connection refused")},
+	}
+	g := newEndpointGuard(cs, probes)
+	for i := 0; i < endpointGuardExpireCyc+2; i++ {
+		// The endpoint reconciler re-adds a pulled LIVE backend every
+		// ~10s — simulate that before each sweep (the guard pulls it
+		// again each cycle because it still wedges).
+		cur := getKubeEndpoints(t, cs)
+		if !endpointAddrSet(cur)["10.0.0.9"] {
+			cur = cur.DeepCopy()
+			cur.Subsets[0].Addresses = append(cur.Subsets[0].Addresses,
+				corev1.EndpointAddress{IP: "10.0.0.9"})
+			if _, err := cs.CoreV1().Endpoints(endpointGuardNS).
+				Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ep := getKubeEndpoints(t, cs); ep.Annotations[endpointGuardAnno] != "10.0.0.9" {
+		t.Fatalf("addressed backend expired: %q", ep.Annotations[endpointGuardAnno])
+	}
+}
+
+// The <2-backends early-return must not deadlock the expiry
+// bookkeeping: a lone quarantined dead IP (zero active addresses)
+// still gets its annotation shrink persisted.
+func TestEndpointGuardExpiryNotBlockedByMinBackends(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		kubeEndpoints(nil, nil, []string{"10.0.0.9"}))
+	g := newEndpointGuard(cs, probeTable{
+		"10.0.0.9": {err: errors.New("connection refused")},
+	})
+	for i := 0; i < endpointGuardExpireCyc; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ep := getKubeEndpoints(t, cs)
+	if _, ok := ep.Annotations[endpointGuardAnno]; ok {
+		t.Fatalf("expiry deadlocked behind the min-backends gate: %q",
+			ep.Annotations[endpointGuardAnno])
+	}
+	if g.quarantineActive {
+		t.Fatal("quarantineActive still armed after expiry under min-backends")
+	}
+}
+
 // An Endpoints object carrying no annotations at all must still take
 // the quarantine annotation — the guard initializes the map instead
 // of failing the mutation.
