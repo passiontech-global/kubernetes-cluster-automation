@@ -63,7 +63,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -925,14 +924,14 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 // watchdog log, plus a slog mirror for `kubectl logs` debugging.
 // Best-effort: an unwritable log file never fails a check.
 func (h *Hygiene) appendLog(msg string) {
-	slog.Info(msg, "subsystem", "controllerhygiene")
+	logger().Info(msg)
 	h.writeLogFile(msg)
 }
 
 // appendLogWarn is appendLog for failure/degraded paths — the file
 // line is identical (NPD contract), the slog mirror is Warn-level.
 func (h *Hygiene) appendLogWarn(msg string) {
-	slog.Warn(msg, "subsystem", "controllerhygiene")
+	logger().Warn(msg)
 	h.writeLogFile(msg)
 }
 
@@ -940,9 +939,9 @@ func (h *Hygiene) writeLogFile(msg string) {
 	f, err := os.OpenFile(h.cfg.WatchdogLogFile,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		slog.Warn("controllerhygiene: watchdog log file unwritable",
+		logger().Warn("controllerhygiene: watchdog log file unwritable",
 			"file", h.cfg.WatchdogLogFile, "error", err,
-			"subsystem", "controllerhygiene")
+		)
 		return
 	}
 	defer f.Close()
@@ -966,13 +965,13 @@ func (h *Hygiene) writeEpochFile(path string) {
 	content := strconv.FormatInt(h.cfg.nowFn().Unix(), 10) + "\n"
 	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		slog.Warn("controllerhygiene: state file write failed",
-			"path", path, "error", err, "subsystem", "controllerhygiene")
+		logger().Warn("controllerhygiene: state file write failed",
+			"path", path, "error", err)
 		return
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		slog.Warn("controllerhygiene: state file install failed",
-			"path", path, "error", err, "subsystem", "controllerhygiene")
+		logger().Warn("controllerhygiene: state file install failed",
+			"path", path, "error", err)
 	}
 }
 
@@ -1001,9 +1000,9 @@ func (h *Hygiene) stateExit(name string) {
 		return
 	}
 	if err := os.Remove(p); err != nil {
-		slog.Warn("controllerhygiene: state latch remove failed",
+		logger().Warn("controllerhygiene: state latch remove failed",
 			"state", name, "path", p, "error", err,
-			"subsystem", "controllerhygiene")
+		)
 		return
 	}
 	// Drop the suspect-log dedupe budget with the latch — a later
@@ -1064,8 +1063,8 @@ func (h *Hygiene) ctrInc(name string) int {
 	n++
 	content := strconv.Itoa(n) + "\n"
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-		slog.Warn("controllerhygiene: counter file write failed",
-			"path", p, "error", err, "subsystem", "controllerhygiene")
+		logger().Warn("controllerhygiene: counter file write failed",
+			"path", p, "error", err)
 		return 0
 	}
 	return n
@@ -1107,8 +1106,8 @@ func removeStateFile(dir, name string) error {
 func (h *Hygiene) writeState(name, content string) {
 	p := filepath.Join(h.cfg.WatchdogStateDir, name)
 	if err := os.WriteFile(p, []byte(content+"\n"), 0o644); err != nil {
-		slog.Warn("controllerhygiene: state file write failed",
-			"path", p, "error", err, "subsystem", "controllerhygiene")
+		logger().Warn("controllerhygiene: state file write failed",
+			"path", p, "error", err)
 	}
 }
 
@@ -1649,9 +1648,9 @@ func (h *Hygiene) listRV(ctx context.Context, endpoint string, cached bool) (int
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		slog.Warn("controllerhygiene: rv probe failed",
+		logger().Warn("controllerhygiene: rv probe failed",
 			"endpoint", endpoint, "cached", cached, "error", err,
-			"subsystem", "controllerhygiene")
+		)
 		return 0, false
 	}
 	defer resp.Body.Close()
@@ -1661,9 +1660,9 @@ func (h *Hygiene) listRV(ctx context.Context, endpoint string, cached bool) (int
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
-		slog.Warn("controllerhygiene: rv probe non-200",
+		logger().Warn("controllerhygiene: rv probe non-200",
 			"endpoint", endpoint, "cached", cached,
-			"status", resp.StatusCode, "subsystem", "controllerhygiene")
+			"status", resp.StatusCode)
 		return 0, false
 	}
 	var list struct {

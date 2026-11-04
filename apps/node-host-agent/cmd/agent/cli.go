@@ -9,7 +9,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -196,14 +195,14 @@ func convergeOnce(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "converge-once:", err)
 		return 1
 	}
-	slog.Info("converge-once starting",
+	logger().Info("converge-once starting",
 		"node", nn, "varsDir", *varsDir, "certsDir", *certsDir)
 	// CycleWithErrors counts topology/vars failures, group
 	// write/command errors and panics — a non-zero count means the
 	// converge did not fully apply, so the timer/CI caller gets a
 	// non-zero exit (ansible failed_when parity).
 	if errs := hc.CycleWithErrors(ctx); errs > 0 {
-		slog.Error("converge-once finished with errors",
+		logger().Error("converge-once finished with errors",
 			"node", nn, "errors", errs)
 		return 1
 	}

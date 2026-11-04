@@ -266,7 +266,7 @@ func (p *ConcourseCachePruner) Sweep(ctx context.Context, openebsRoot string) er
 // in the script's order. All helpers are best-effort (the script's
 // `2>/dev/null || true`) — only ctx cancellation aborts mid-flight.
 func (p *ConcourseCachePruner) pruneSharedCache(ctx context.Context, sc string) {
-	log := slog.With("subsystem", "concourse-cache", "dir", sc)
+	log := logger().With("subsystem", "concourse-cache", "dir", sc)
 	if !isDir(sc) {
 		return // init-rm not done yet — nothing to prune
 	}

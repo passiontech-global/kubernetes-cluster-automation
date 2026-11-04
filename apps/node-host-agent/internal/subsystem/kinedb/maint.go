@@ -18,7 +18,6 @@ package kinedb
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 )
 
@@ -65,10 +64,10 @@ func (k *KineDB) maintCycle(ctx context.Context) *maintResult {
 	sum := fmt.Sprintf("reindex=%v repack=%s heap=%dB idx=%dB dead=%d%%",
 		res.okReindex, res.repackState, res.heapBytes, res.indexBytes, res.deadPct)
 	if res.okReindex && res.okRepack {
-		slog.Info("kine-db-maint OK: " + sum)
+		logger().Info("kine-db-maint OK: " + sum)
 		k.m.cycles.WithLabelValues("maint", "ok").Inc()
 	} else {
-		slog.Warn("kine-db-maint FAIL: "+sum, "notes", strings.Join(res.notes, " "))
+		logger().Warn("kine-db-maint FAIL: "+sum, "notes", strings.Join(res.notes, " "))
 		k.m.cycles.WithLabelValues("maint", "fail").Inc()
 	}
 	return res

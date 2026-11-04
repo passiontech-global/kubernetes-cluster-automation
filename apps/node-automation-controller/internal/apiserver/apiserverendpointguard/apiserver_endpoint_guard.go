@@ -288,6 +288,18 @@ var _ rest.WarningHandlerWithContext = endpointGuardWarnings{}
 // non-empty (see the coverage-caveats note above: the endpoint
 // reconciler re-adds quarantined IPs every ~10s).
 func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
+	// Inject the named logger into the ctx run() sees: this runnable
+	// bypasses shared.Periodic (it needs the adaptive interval), so
+	// without this run()'s logf.FromContext would resolve the UNNAMED
+	// root logger and every sweep line would lack
+	// "logger":"apiserver-endpoint-guard". A guard built by hand may
+	// leave g.log zero-value — fall back to naming the ctx logger
+	// rather than silently discarding.
+	log := g.log
+	if log.GetSink() == nil {
+		log = logf.FromContext(ctx).WithName(endpointGuardQueue)
+	}
+	ctx = logf.IntoContext(ctx, log)
 	interval := endpointGuardInterval
 	for {
 		timer := time.NewTimer(interval)
@@ -304,7 +316,7 @@ func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
 		cancel()
 		if err != nil {
 			metrics.IncError(endpointGuardQueue)
-			g.log.Error(err, "sweep failed")
+			log.Error(err, "sweep failed")
 		}
 		if g.quarantineActive {
 			interval = endpointGuardQuarantineInterval

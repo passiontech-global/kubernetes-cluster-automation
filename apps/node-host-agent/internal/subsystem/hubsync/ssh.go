@@ -139,7 +139,7 @@ type sshDialer struct {
 func newSSHDialer(keyPath string, port int, timeout time.Duration,
 	log *slog.Logger) (*sshDialer, error) {
 	if log == nil {
-		log = slog.Default()
+		log = logger()
 	}
 	return &sshDialer{keyPath: keyPath, port: port, timeout: timeout, log: log}, nil
 }

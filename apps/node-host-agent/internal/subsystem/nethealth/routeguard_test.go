@@ -22,33 +22,247 @@ import (
 // nlmsg serializes a bare nlmsghdr of the given type — netlink is
 // host byte order, binary.NativeEndian matches the decoder.
 func nlmsg(typ uint16) []byte {
-	b := make([]byte, unix.NLMSG_HDRLEN)
+	return nlmsgBody(typ, nil)
+}
+
+// nlmsgBody serializes a full nlmsg: header + payload (nlmsg_len
+// covers exactly both — no trailing pad, like the kernel's last
+// message in a datagram).
+func nlmsgBody(typ uint16, payload []byte) []byte {
+	b := make([]byte, unix.NLMSG_HDRLEN+len(payload))
 	binary.NativeEndian.PutUint32(b[0:4], uint32(len(b)))
 	binary.NativeEndian.PutUint16(b[4:6], typ)
+	copy(b[unix.NLMSG_HDRLEN:], payload)
 	return b
 }
 
+// rtmsgBytes builds a struct rtmsg payload: the 12-byte fixed
+// header (family at [0], table at [4]) followed by rtattrs.
+func rtmsgBytes(family, table byte, attrs ...[]byte) []byte {
+	b := make([]byte, unix.SizeofRtMsg)
+	b[0] = family
+	b[4] = table
+	for _, a := range attrs {
+		b = append(b, a...)
+	}
+	return b
+}
+
+// fibRuleBytes builds a struct fib_rule_hdr payload: same 12-byte
+// fixed size, family at [0], then rtattrs.
+func fibRuleBytes(family byte, attrs ...[]byte) []byte {
+	b := make([]byte, fibRuleHdrLen)
+	b[0] = family
+	for _, a := range attrs {
+		b = append(b, a...)
+	}
+	return b
+}
+
+// rtattrU32 serializes one u32-valued rtattr (rta_len 8).
+func rtattrU32(typ uint16, v uint32) []byte {
+	b := make([]byte, unix.SizeofRtAttr+4)
+	binary.NativeEndian.PutUint16(b[0:2], uint16(len(b)))
+	binary.NativeEndian.PutUint16(b[2:4], typ)
+	binary.NativeEndian.PutUint32(b[4:8], v)
+	return b
+}
+
+// testRouteFilter is the fixture dataplane identity: pub table 100,
+// marker table 101, the three nebula prefs, neb1 at ifindex 7.
+func testRouteFilter() *routeEventFilter {
+	return &routeEventFilter{
+		tables: map[uint32]bool{100: true, 101: true},
+		prefs:  map[uint32]bool{1400: true, 1490: true, 1500: true},
+		nebIf:  7,
+	}
+}
+
+func delRoute(family byte, table byte, attrs ...[]byte) []byte {
+	return nlmsgBody(unix.RTM_DELROUTE, rtmsgBytes(family, table, attrs...))
+}
+
+func delRule(family byte, attrs ...[]byte) []byte {
+	return nlmsgBody(unix.RTM_DELRULE, fibRuleBytes(family, attrs...))
+}
+
 func TestScanDeleteEvents(t *testing.T) {
+	f := testRouteFilter()
+	// tornAttr claims rta_len 32 but only 6 bytes follow — an
+	// undecodable tail the scan must fail open on.
+	tornAttr := []byte{0x20, 0x00, 0x0f, 0x00, 0xaa, 0xbb}
 	for name, tc := range map[string]struct {
 		buf  []byte
 		want bool
 	}{
-		"delroute":   {nlmsg(unix.RTM_DELROUTE), true},
-		"delrule":    {nlmsg(unix.RTM_DELRULE), true},
-		"newroute":   {nlmsg(unix.RTM_NEWROUTE), false}, // converge's own adds
-		"newrule":    {nlmsg(unix.RTM_NEWRULE), false},
-		"newaddr":    {nlmsg(unix.RTM_NEWADDR), false},
-		"newlink":    {nlmsg(unix.RTM_NEWLINK), false},
-		"multi del":  {append(nlmsg(unix.RTM_NEWADDR), nlmsg(unix.RTM_DELRULE)...), true},
-		"multi miss": {append(nlmsg(unix.RTM_NEWADDR), nlmsg(unix.RTM_NEWLINK)...), false},
-		"empty":      {nil, false},
-		"truncated":  {nlmsg(unix.RTM_DELROUTE)[:8], false},
-		"bad length": {append([]byte{0xff, 0xff, 0xff, 0xff}, nlmsg(unix.RTM_DELROUTE)[4:]...), false},
-		"undersize":  {[]byte{8, 0, 0, 0, 0x19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false},
+		// The cicd noise — the whole point of the filter. A Calico
+		// pod-route delete (main table, foreign oif) and a foreign
+		// rule delete must NOT re-run nebula-up.sh.
+		"calico pod-route delete": {
+			delRoute(unix.AF_INET, unix.RT_TABLE_MAIN,
+				rtattrU32(unix.RTA_OIF, 42)), false},
+		"delrule foreign pref": {
+			delRule(unix.AF_INET,
+				rtattrU32(unix.FRA_PRIORITY, 9000)), false},
+		"delroute big table nonmatch": {
+			delRoute(unix.AF_INET, unix.RT_TABLE_COMPAT,
+				rtattrU32(unix.RTA_TABLE, 300),
+				rtattrU32(unix.RTA_OIF, 42)), false},
+		// IPv6 sits in a different multicast group — but a v6
+		// delete carrying OUR table/pref numbers still must not
+		// count (the family check fires first).
+		"delroute ipv6 same table": {
+			delRoute(unix.AF_INET6, 100,
+				rtattrU32(unix.RTA_OIF, 7)), false},
+		"delrule ipv6 same pref": {
+			delRule(unix.AF_INET6,
+				rtattrU32(unix.FRA_PRIORITY, 1500)), false},
+		// Converge's own writers — adds never trigger.
+		"newroute": {nlmsg(unix.RTM_NEWROUTE), false},
+		"newrule":  {nlmsg(unix.RTM_NEWRULE), false},
+		"newaddr":  {nlmsg(unix.RTM_NEWADDR), false},
+		"newlink":  {nlmsg(unix.RTM_NEWLINK), false},
+		"newroute nebula table": {
+			nlmsgBody(unix.RTM_NEWROUTE,
+				rtmsgBytes(unix.AF_INET, 100)), false},
+
+		// The nebula dataplane — every delete here re-runs the
+		// script.
+		"delroute pub table": {
+			delRoute(unix.AF_INET, 100,
+				rtattrU32(unix.RTA_OIF, 7)), true},
+		"delroute mark table": {
+			delRoute(unix.AF_INET, 101,
+				rtattrU32(unix.RTA_OIF, 7)), true},
+		// The marker-base /24 link route sits in table MAIN —
+		// only the oif names it.
+		"delroute neb dev main": {
+			delRoute(unix.AF_INET, unix.RT_TABLE_MAIN,
+				rtattrU32(unix.RTA_OIF, 7)), true},
+		// Tables >255 travel in RTA_TABLE (rtm_table then reads
+		// RT_TABLE_COMPAT=252) — the attribute wins.
+		"delroute big table match": {
+			delRoute(unix.AF_INET, unix.RT_TABLE_COMPAT,
+				rtattrU32(unix.RTA_TABLE, 100),
+				rtattrU32(unix.RTA_OIF, 42)), true},
+		"delrule pref 1500": {
+			delRule(unix.AF_INET,
+				rtattrU32(unix.FRA_PRIORITY, 1500)), true},
+		"delrule pref 1490": {
+			delRule(unix.AF_INET,
+				rtattrU32(unix.FRA_PRIORITY, 1490)), true},
+		"delrule pref 1400": {
+			delRule(unix.AF_INET,
+				rtattrU32(unix.FRA_PRIORITY, 1400)), true},
+
+		// Fail-open: anything too torn to classify counts — a
+		// missed real delete costs minutes off-mesh, a spurious
+		// trigger one idempotent script run.
+		"delroute no payload":  {nlmsg(unix.RTM_DELROUTE), true},
+		"delrule no payload":   {nlmsg(unix.RTM_DELRULE), true},
+		"delroute torn rtmsg":  {nlmsgBody(unix.RTM_DELROUTE, []byte{1, 2, 3}), true},
+		"delroute torn attr":   {delRoute(unix.AF_INET, unix.RT_TABLE_MAIN, tornAttr), true},
+		"delrule missing prio": {delRule(unix.AF_INET, rtattrU32(unix.FRA_FWMARK, 0x1000)), true},
+		"delrule torn attr":    {delRule(unix.AF_INET, tornAttr), true},
+		"bad nlmsg length": {
+			append([]byte{0xff, 0xff, 0xff, 0xff}, nlmsg(unix.RTM_DELROUTE)[4:]...), true},
+		"undersize nlmsg": {
+			[]byte{8, 0, 0, 0, 0x19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, true},
+		"truncated datagram": {nlmsg(unix.RTM_DELROUTE)[:8], true},
+
+		// Bursts: one match anywhere in the datagram fires; pure
+		// noise bursts don't.
+		"burst with match": {
+			append(delRoute(unix.AF_INET, unix.RT_TABLE_MAIN,
+				rtattrU32(unix.RTA_OIF, 42)),
+				delRule(unix.AF_INET, rtattrU32(unix.FRA_PRIORITY, 1490))...), true},
+		"burst all noise": {
+			append(delRoute(unix.AF_INET, unix.RT_TABLE_MAIN,
+				rtattrU32(unix.RTA_OIF, 42)),
+				nlmsg(unix.RTM_NEWADDR)...), false},
+		"empty": {nil, false},
 	} {
-		if got := scanDeleteEvents(tc.buf); got != tc.want {
+		if got := f.scanDeleteEvents(tc.buf); got != tc.want {
 			t.Fatalf("%s: scanDeleteEvents=%v want %v", name, got, tc.want)
 		}
+	}
+}
+
+// The neb-dev link route lives in table MAIN and is named only by
+// its oif — an unresolved ifindex (dev absent when the filter
+// armed) must not flip that match on (a 0 ifindex never equals a
+// real one), while table matching keeps working regardless.
+func TestScanDeleteEventsDevMissing(t *testing.T) {
+	f := testRouteFilter()
+	f.nebIf = 0
+	linkRoute := delRoute(unix.AF_INET, unix.RT_TABLE_MAIN,
+		rtattrU32(unix.RTA_OIF, 7))
+	if f.scanDeleteEvents(linkRoute) {
+		t.Fatal("neb-dev link route matched with ifindex unresolved")
+	}
+	if !f.scanDeleteEvents(delRoute(unix.AF_INET, 100)) {
+		t.Fatal("pub-table delete ignored when ifindex unresolved")
+	}
+}
+
+// nebulaIfindex reads the kernel ifindex netlink puts in RTA_OIF
+// from sysfs; anything unreadable yields 0 (match inert, tables
+// still work).
+func TestNebulaIfindex(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "neb1", "ifindex"), "9\n")
+	if got := nebulaIfindex(dir, "neb1"); got != 9 {
+		t.Fatalf("ifindex=%d want 9", got)
+	}
+	writeFile(t, filepath.Join(dir, "junk", "ifindex"), "abc\n")
+	if got := nebulaIfindex(dir, "junk"); got != 0 {
+		t.Fatalf("garbage ifindex=%d want 0", got)
+	}
+	if got := nebulaIfindex(dir, "no-such-dev"); got != 0 {
+		t.Fatalf("missing dev ifindex=%d want 0", got)
+	}
+	if got := nebulaIfindex(dir, ""); got != 0 {
+		t.Fatalf("empty dev ifindex=%d want 0", got)
+	}
+}
+
+// nebulaRouteFilter wires the filter from watchdog conf: the pub
+// table comes from OVERLAY_EGRESS_TABLE (hostconfig writes
+// interdc_nebula_table_pub into the conf), the marker table + prefs
+// are the nebula-up.sh constants, and the dev ifindex comes from
+// sysfs.
+func TestNebulaRouteFilterFromConf(t *testing.T) {
+	e := fixture(t, &watchdogconf.Config{
+		NebulaDev:          "neb9",
+		OverlayEgressTable: 105,
+	})
+	sysdir := t.TempDir()
+	writeFile(t, filepath.Join(sysdir, "neb9", "ifindex"), "9\n")
+	e.n.cfg.sysClassNet = sysdir
+	f := e.n.nebulaRouteFilter()
+	if f.nebIf != 9 {
+		t.Fatalf("nebIf=%d want 9", f.nebIf)
+	}
+	if !f.tables[105] || !f.tables[routeGuardTableMark] ||
+		len(f.tables) != 2 {
+		t.Fatalf("tables=%v want {105,101}", f.tables)
+	}
+	for _, p := range []uint32{1400, 1490, 1500} {
+		if !f.prefs[p] {
+			t.Fatalf("pref %d missing: %v", p, f.prefs)
+		}
+	}
+}
+
+func TestNebulaRouteFilterDefaults(t *testing.T) {
+	e := fixture(t, nil) // empty conf → Normalize defaults pub=100/neb1
+	e.n.cfg.sysClassNet = t.TempDir()
+	f := e.n.nebulaRouteFilter()
+	if !f.tables[100] || !f.tables[101] || len(f.tables) != 2 {
+		t.Fatalf("tables=%v want {100,101}", f.tables)
+	}
+	if f.nebIf != 0 {
+		t.Fatalf("nebIf=%d want 0 (no devices in fixture sysfs)", f.nebIf)
 	}
 }
 
@@ -226,6 +440,9 @@ func routeGuardFixture(t *testing.T) *env {
 	})
 	root := filepath.Dir(e.state)
 	e.n.cfg.HostRoot = root
+	// No real sysfs — the event filter arms with nebIf=0 unless the
+	// test plants an ifindex file (table/pref matching always on).
+	e.n.cfg.sysClassNet = t.TempDir()
 	writeFile(t, filepath.Join(root, "etc/nebula/interdc/nebula-up.sh"),
 		"#!/bin/bash\nexit 0\n")
 	e.sdReply["is-active nebula@interdc"] = "active\n"
@@ -326,6 +543,11 @@ func TestRouteGuardEventDrivesRestore(t *testing.T) {
 	e := routeGuardFixture(t)
 	e.n.cfg.routeDebounce = 20 * time.Millisecond
 	e.n.cfg.routeMinRestore = 60 * time.Millisecond
+	// Deterministic neb1 ifindex (7) — the CNI-noise deletes below
+	// use foreign oif 42.
+	sysdir := t.TempDir()
+	writeFile(t, filepath.Join(sysdir, "neb1", "ifindex"), "7\n")
+	e.n.cfg.sysClassNet = sysdir
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -350,22 +572,39 @@ func TestRouteGuardEventDrivesRestore(t *testing.T) {
 	if _, err := unix.Write(fds[1], nlmsg(unix.RTM_NEWRULE)); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(80 * time.Millisecond) // > debounce
-	if got := restoredCount(e); got != 1 {
-		t.Fatalf("NEW events triggered restore: restored=%v", got)
-	}
-
-	// A DELROUTE+DELRULE burst debounces into one more restore.
-	if _, err := unix.Write(fds[1], nlmsg(unix.RTM_DELROUTE)); err != nil {
+	// Deletes NOT naming the nebula state are ignored too — the
+	// CNI pod-route churn the filter exists for: a main-table
+	// route out a foreign oif, and a rule at a foreign pref.
+	if _, err := unix.Write(fds[1], delRoute(unix.AF_INET,
+		unix.RT_TABLE_MAIN, rtattrU32(unix.RTA_OIF, 42))); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := unix.Write(fds[1], nlmsg(unix.RTM_DELRULE)); err != nil {
+	if _, err := unix.Write(fds[1], delRule(unix.AF_INET,
+		rtattrU32(unix.FRA_PRIORITY, 9000))); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond) // > debounce
+	if got := restoredCount(e); got != 1 {
+		t.Fatalf("non-nebula events triggered restore: restored=%v", got)
+	}
+
+	// A nebula DELROUTE+DELRULE burst debounces into one more
+	// restore: `default dev neb1 table 100` + the pref-1500 rule.
+	if _, err := unix.Write(fds[1], delRoute(unix.AF_INET, 100,
+		rtattrU32(unix.RTA_OIF, 7))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unix.Write(fds[1], delRule(unix.AF_INET,
+		rtattrU32(unix.FRA_PRIORITY, 1500))); err != nil {
 		t.Fatal(err)
 	}
 	waitForCond(t, 2*time.Second, func() bool { return restoredCount(e) >= 2 })
 
-	// A later burst still lands — the rate cap delays, never drops.
-	if _, err := unix.Write(fds[1], nlmsg(unix.RTM_DELROUTE)); err != nil {
+	// A later burst still lands — the rate cap delays, never
+	// drops. The link route (main table, oif neb1) exercises the
+	// RTA_OIF match.
+	if _, err := unix.Write(fds[1], delRoute(unix.AF_INET,
+		unix.RT_TABLE_MAIN, rtattrU32(unix.RTA_OIF, 7))); err != nil {
 		t.Fatal(err)
 	}
 	waitForCond(t, 2*time.Second, func() bool { return restoredCount(e) >= 3 })

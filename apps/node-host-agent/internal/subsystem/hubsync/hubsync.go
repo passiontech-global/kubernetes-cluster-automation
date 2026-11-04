@@ -203,7 +203,7 @@ func (c *Config) applyDefaults() {
 		c.NowFn = time.Now
 	}
 	if c.Log == nil {
-		c.Log = slog.Default()
+		c.Log = logger()
 	}
 	if c.Watcher == nil {
 		c.Watcher = &hostconfig.DirWatcher{

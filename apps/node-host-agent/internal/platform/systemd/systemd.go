@@ -25,7 +25,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"strconv"
@@ -329,9 +328,9 @@ func (c *Client) Exists(ctx context.Context, unit string) (bool, error) {
 	case "stub", "not-found", "bad-setting", "error", "masked", "":
 		return false, nil
 	default:
-		slog.Warn("systemd: unexpected LoadState word — "+
+		logger().Warn("systemd: unexpected LoadState word — "+
 			"treating unit as absent this probe",
-			"subsystem", "systemd", "unit", unit, "loadstate", state)
+			"unit", unit, "loadstate", state)
 		return false, nil
 	}
 }

@@ -2044,6 +2044,152 @@ func TestJournaldRotateRateLimited(t *testing.T) {
 	}
 }
 
+// ---------- journald persistence (standalone) + silent restart ----------
+
+// standaloneJournaldEnv is journaldEnv for the standalone (HostRoot
+// "/" — on-host systemd) path journaldPersistence gates on.
+func standaloneJournaldEnv(t *testing.T, res map[string]string, errs map[string]bool) (*cyc, *Reconciler, *scriptedRunner) {
+	t.Helper()
+	vars := writeVarsDir(t, "")
+	sr := &scriptedRunner{res: res, errs: errs}
+	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Standalone: true, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
+	hostWrite(t, r, "/etc/machine-id", "abcdef1234567890\n")
+	return loadCyc(t, r, vars, "node-a"), r, sr
+}
+
+func TestJournaldPersistenceStandaloneConverge(t *testing.T) {
+	c, r, sr := standaloneJournaldEnv(t, map[string]string{
+		"journalctl -n 5": "ok line",
+	}, map[string]bool{})
+	c.groupBase()
+
+	jd := hostRead(t, r, "/etc/systemd/journald.conf.d/50-node-config-agent.conf")
+	if !strings.Contains(jd, "[Journal]") || !strings.Contains(jd, "Storage=persistent") {
+		t.Fatalf("bad journald drop-in:\n%s", jd)
+	}
+	fi, err := os.Stat(filepath.Join(r.cfg.HostRoot, "/var/log/journal/abcdef1234567890"))
+	if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o755 || fi.Mode()&os.ModeSetgid == 0 {
+		t.Fatalf("journal dir missing/wrong mode (want 02755): fi=%v err=%v", fi.Mode(), err)
+	}
+	if len(sr.callsMatching("chgrp systemd-journal /var/log/journal/abcdef1234567890")) == 0 {
+		t.Fatalf("journal dir not chgrp'd: %v", sr.callsMatching("chgrp"))
+	}
+	// First converge: drop-in write + fresh dir → exactly one restart.
+	if got := len(sr.callsMatching("systemctl restart systemd-journald.service")); got != 1 {
+		t.Fatalf("journald restarts = %d, want 1: %v", got, sr.callsMatching("systemctl"))
+	}
+}
+
+func TestJournaldPersistenceSkipsContainer(t *testing.T) {
+	c, r, sr := journaldEnv(t, map[string]string{
+		"journalctl -n 5": "ok line",
+	}, map[string]bool{})
+	c.groupBase()
+	if hostExists(r, "/etc/systemd/journald.conf.d/50-node-config-agent.conf") {
+		t.Fatal("standalone drop-in written on a DaemonSet host")
+	}
+	if len(sr.callsMatching("systemctl restart systemd-journald.service")) > 0 {
+		t.Fatal("journald restarted on a DaemonSet host by the persistence converge")
+	}
+}
+
+func TestJournaldPersistenceIdempotent(t *testing.T) {
+	c, _, sr := standaloneJournaldEnv(t, map[string]string{
+		"journalctl -n 5": "ok line",
+	}, map[string]bool{})
+	c.groupBase()
+	c.groupBase()
+	// Second converge: drop-in unchanged, dir exists → no more
+	// restarts (journald restart is a bounded side-effect, not a
+	// per-cycle action).
+	if got := len(sr.callsMatching("systemctl restart systemd-journald.service")); got != 1 {
+		t.Fatalf("journald restarts across 2 cycles = %d, want 1", got)
+	}
+}
+
+func TestJournaldSilentNoFilesRestarts(t *testing.T) {
+	// Incident shape: journalctl answers "No journal files were
+	// found." while a journal storage root exists — journald is
+	// writing nowhere and must be restarted (rotate cannot create
+	// files).
+	c, r, sr := journaldEnv(t, map[string]string{
+		"journalctl -n 5": "No journal files were found.\n",
+	}, map[string]bool{})
+	if err := os.MkdirAll(filepath.Join(r.cfg.HostRoot, "/var/log/journal/machine-x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c.groupBase()
+	if len(sr.callsMatching("systemctl restart systemd-journald.service")) == 0 {
+		t.Fatalf("silent journald not restarted: %v", sr.callsMatching("systemctl"))
+	}
+	if len(sr.callsMatching("journalctl --rotate")) > 0 {
+		t.Fatal("rotate ran for a file-less journal — rotate cannot create files")
+	}
+}
+
+func TestJournaldSilentEmptyNoFilesRestarts(t *testing.T) {
+	// Same verdict without the notice text (suppressed/locale): a
+	// literally empty read + a storage root + zero *.journal files.
+	c, r, sr := journaldEnv(t, map[string]string{}, map[string]bool{})
+	if err := os.MkdirAll(filepath.Join(r.cfg.HostRoot, "/var/log/journal/machine-x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c.groupBase()
+	if len(sr.callsMatching("systemctl restart systemd-journald.service")) == 0 {
+		t.Fatalf("empty journal with storage root not restarted: %v", sr.callsMatching("systemctl"))
+	}
+}
+
+func TestJournaldSilentNoStorageNoRestart(t *testing.T) {
+	// No journal storage at all → journald legitimately absent —
+	// silence is configuration, not a fault: no restart, no rotate.
+	c, _, sr := journaldEnv(t, map[string]string{
+		"journalctl -n 5": "No journal files were found.\n",
+	}, map[string]bool{})
+	c.groupBase()
+	if len(sr.callsMatching("systemctl restart systemd-journald.service")) > 0 {
+		t.Fatal("journald restarted with no storage configured")
+	}
+	if len(sr.callsMatching("journalctl --rotate")) > 0 {
+		t.Fatal("rotate ran with no storage configured")
+	}
+}
+
+func TestJournaldSilentRestartRateLimited(t *testing.T) {
+	c, r, sr := journaldEnv(t, map[string]string{
+		"journalctl -n 5": "No journal files were found.\n",
+	}, map[string]bool{})
+	if err := os.MkdirAll(filepath.Join(r.cfg.HostRoot, "/var/log/journal/machine-x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c.groupBase()
+	c.groupBase()
+	if got := len(sr.callsMatching("systemctl restart systemd-journald.service")); got != 1 {
+		t.Fatalf("journald restarts = %d, want 1 (last-journald-restart cooldown)", got)
+	}
+}
+
+func TestJournaldPersistenceRestartNotDoubled(t *testing.T) {
+	// Standalone + silent probe: the persistence converge's own
+	// restart must satisfy the integrity probe — one bounce per
+	// cycle, never two (journaldRestarted dedupe).
+	c, r, sr := standaloneJournaldEnv(t, map[string]string{
+		"journalctl -n 5": "No journal files were found.\n",
+	}, map[string]bool{})
+	if err := os.MkdirAll(filepath.Join(r.cfg.HostRoot, "/var/log/journal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c.groupBase()
+	if got := len(sr.callsMatching("systemctl restart systemd-journald.service")); got != 1 {
+		t.Fatalf("journald restarts = %d, want 1 (converge restart covers the probe)", got)
+	}
+}
+
 // ---------- audit regression tests ----------
 
 // TestHostnamePinNoGlueOnMissingNewline — a hosts file without a
@@ -2467,7 +2613,7 @@ func TestSlowOpsUseLongBudget(t *testing.T) {
 	if d := budget("env DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban"); d <= 9*time.Minute+50*time.Second {
 		t.Fatalf("apt-get install budget %v — must run under CmdTimeoutLong", d)
 	}
-	if d := budget("journalctl -n 5 -q --no-pager"); d > 2*time.Minute {
+	if d := budget("journalctl -n 5 --no-pager"); d > 2*time.Minute {
 		t.Fatalf("probe budget %v — plain queries stay on CmdTimeout", d)
 	}
 	if d := budget("dpkg-query -W -f=${db:Status-Status} fail2ban"); d > 2*time.Minute {

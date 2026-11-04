@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -387,7 +386,7 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip addr show dev neb1 | grep -
 				// Best-effort live apply — the declared state is on
 				// disk; the agent never restarts k0s so the drop-in
 				// lands at the next natural restart.
-				slog.Warn("T10: set-property failed — drop-in applies at next restart",
+				logger().Warn("T10: set-property failed — drop-in applies at next restart",
 					"unit", "k0sworker.service", "value", w, "error", err)
 			}
 		}
@@ -403,7 +402,7 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip addr show dev neb1 | grep -
 			r.daemonReload(ctx)
 			if _, err := r.run(ctx, "systemctl", "set-property", "nebula@interdc.service", "CPUQuota="+quota); err != nil {
 				// Best-effort live apply — same drop-in contract.
-				slog.Warn("T10: set-property failed — drop-in applies at next restart",
+				logger().Warn("T10: set-property failed — drop-in applies at next restart",
 					"unit", "nebula@interdc.service", "value", quota, "error", err)
 			}
 		}
@@ -938,7 +937,7 @@ ClientAliveCountMax 2
 		if out, err := r.run(ctx, "sshd", "-T", "-C", "user=root,host=localhost,addr=127.0.0.1"); err != nil {
 			// Best-effort verify only — a failed probe proves nothing
 			// about the applied config.
-			slog.Warn("ssh-hardening: sshd -T failed — cannot verify effective config",
+			logger().Warn("ssh-hardening: sshd -T failed — cannot verify effective config",
 				"error", err)
 		} else if !strings.Contains(out, "passwordauthentication no") {
 			c.err("ssh-hardening: passwordauthentication still enabled — drop-in not effective",
@@ -1001,13 +1000,13 @@ func (c *cyc) groupAPILB() {
 	if kb, err := os.ReadFile(r.hp("/var/lib/k0s/kubelet.conf")); err == nil {
 		re := regexp.MustCompile(`server:\s*https://([^:/\s]+)`)
 		if m := re.FindSubmatch(kb); m != nil && string(m[1]) != c.v("cp_endpoint") {
-			slog.Warn("T12: kubelet.conf server host != cp_endpoint — pin has no effect on kubelet",
+			logger().Warn("T12: kubelet.conf server host != cp_endpoint — pin has no effect on kubelet",
 				"host", string(m[1]), "cp_endpoint", c.v("cp_endpoint"))
 		}
 	} else {
 		// Best-effort preflight — a static-IP kubelet is legitimate;
 		// the pin checks below are the group's real signal.
-		slog.Warn("T12: kubelet.conf unreadable — skipping server-URL check",
+		logger().Warn("T12: kubelet.conf unreadable — skipping server-URL check",
 			"path", "/var/lib/k0s/kubelet.conf", "error", err)
 	}
 	tctx := c.tplCtx() // includes api_lb_probe_reachable (names)
@@ -1275,16 +1274,16 @@ func (c *cyc) unpinHosts() {
 // parity) — its probes only log; they never count a group error.
 func (c *cyc) groupVerify() {
 	if out, err := c.r.run(c.ctx, "getent", "ahosts", c.v("cp_endpoint")); err == nil {
-		slog.Info("hostconfig verify: cp_endpoint resolves", "getent", out)
+		logger().Info("hostconfig verify: cp_endpoint resolves", "getent", out)
 	} else {
-		slog.Warn("hostconfig verify: cp_endpoint does not resolve",
+		logger().Warn("hostconfig verify: cp_endpoint does not resolve",
 			"cp_endpoint", c.v("cp_endpoint"), "error", err)
 	}
 	if out, err := c.r.run(c.ctx, "sysctl", "-n",
 		"net.ipv4.tcp_congestion_control", "net.core.default_qdisc"); err == nil {
-		slog.Info("hostconfig verify: cc/qdisc", "sysctl", out)
+		logger().Info("hostconfig verify: cc/qdisc", "sysctl", out)
 	} else {
-		slog.Warn("hostconfig verify: cc/qdisc unreadable", "error", err)
+		logger().Warn("hostconfig verify: cc/qdisc unreadable", "error", err)
 	}
 }
 

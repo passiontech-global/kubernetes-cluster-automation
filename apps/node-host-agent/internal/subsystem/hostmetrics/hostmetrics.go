@@ -107,7 +107,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -900,9 +899,8 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, certDays int64,
 		// unchanged instead (active entries keep 1, cleared
 		// entries keep their emit-0 state); the bookkeeping map
 		// is left untouched so no TTL eviction is manufactured.
-		slog.Debug("hostmetrics: watchdog state dir unreadable — "+
+		logger().Debug("hostmetrics: watchdog state dir unreadable — "+
 			"serving previous watchdog_state values",
-			"subsystem", "hostmetrics",
 			"dir", c.cfg.WatchdogStateDir, "error", err)
 		c.mu.Lock()
 		prev := make(map[string]bool, len(c.seenStates))
@@ -1055,23 +1053,23 @@ func (c *Collector) updateCertLatch(days int64, ok bool) {
 		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
 		tmp = filepath.Join(dir, ".tmp-"+filepath.Base(latch))
 		if werr := os.WriteFile(tmp, []byte(content), 0o644); werr != nil {
-			slog.Warn("hostmetrics: nebula-cert-expiring latch write failed",
-				"subsystem", "hostmetrics", "path", latch, "error", werr)
+			logger().Warn("hostmetrics: nebula-cert-expiring latch write failed",
+				"path", latch, "error", werr)
 		} else if rerr := os.Rename(tmp, latch); rerr != nil {
-			slog.Warn("hostmetrics: nebula-cert-expiring latch install failed",
-				"subsystem", "hostmetrics", "path", latch, "error", rerr)
+			logger().Warn("hostmetrics: nebula-cert-expiring latch install failed",
+				"path", latch, "error", rerr)
 		} else {
-			slog.Info("hostmetrics: nebula-cert-expiring latch set",
-				"subsystem", "hostmetrics", "daysLeft", days,
+			logger().Info("hostmetrics: nebula-cert-expiring latch set",
+				"daysLeft", days,
 				"warnDays", nebulaCertWarnDays, "path", latch)
 		}
 	case days >= nebulaCertWarnDays && statErr == nil:
 		if rerr := os.Remove(latch); rerr != nil {
-			slog.Warn("hostmetrics: nebula-cert-expiring latch remove failed",
-				"subsystem", "hostmetrics", "path", latch, "error", rerr)
+			logger().Warn("hostmetrics: nebula-cert-expiring latch remove failed",
+				"path", latch, "error", rerr)
 		} else {
-			slog.Info("hostmetrics: nebula-cert-expiring latch cleared",
-				"subsystem", "hostmetrics", "daysLeft", days, "path", latch)
+			logger().Info("hostmetrics: nebula-cert-expiring latch cleared",
+				"daysLeft", days, "path", latch)
 		}
 	}
 }
@@ -1257,9 +1255,9 @@ func (c *Collector) k0sConfig() (data []byte, parsed map[string]any, ok bool) {
 		}
 		// Cached per mtime+size — this fires once per file change,
 		// not once per scrape.
-		slog.Debug("hostmetrics: k0s config unreadable/unparseable — "+
+		logger().Debug("hostmetrics: k0s config unreadable/unparseable — "+
 			"drift reports {unreadable,k0s.yaml}",
-			"subsystem", "hostmetrics", "path", c.cfg.K0sConfigFile,
+			"path", c.cfg.K0sConfigFile,
 			"error", cause)
 	}
 	c.k0sLoaded = true
@@ -1380,25 +1378,25 @@ func (c *Collector) updateOverloadLatch(avg60 float64) {
 		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
 		tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
 		if werr := os.WriteFile(tmp, []byte(content), 0o644); werr != nil {
-			slog.Warn("hostmetrics: node-overloaded latch write failed",
-				"subsystem", "hostmetrics", "path", p, "error", werr)
+			logger().Warn("hostmetrics: node-overloaded latch write failed",
+				"path", p, "error", werr)
 		} else if rerr := os.Rename(tmp, p); rerr != nil {
-			slog.Warn("hostmetrics: node-overloaded latch install failed",
-				"subsystem", "hostmetrics", "path", p, "error", rerr)
+			logger().Warn("hostmetrics: node-overloaded latch install failed",
+				"path", p, "error", rerr)
 		} else {
-			slog.Info("hostmetrics: node-overloaded latch set — "+
+			logger().Info("hostmetrics: node-overloaded latch set — "+
 				"PSI cpu some avg60 above threshold",
-				"subsystem", "hostmetrics", "avg60", avg60,
+				"avg60", avg60,
 				"enterThreshold", psiOverloadedOn, "path", p)
 		}
 	case avg60 < psiOverloadedOff && err == nil:
 		if rerr := os.Remove(p); rerr != nil {
-			slog.Warn("hostmetrics: node-overloaded latch remove failed",
-				"subsystem", "hostmetrics", "path", p, "error", rerr)
+			logger().Warn("hostmetrics: node-overloaded latch remove failed",
+				"path", p, "error", rerr)
 		} else {
-			slog.Info("hostmetrics: node-overloaded latch cleared — "+
+			logger().Info("hostmetrics: node-overloaded latch cleared — "+
 				"PSI cpu some avg60 back below threshold",
-				"subsystem", "hostmetrics", "avg60", avg60,
+				"avg60", avg60,
 				"exitThreshold", psiOverloadedOff, "path", p)
 		}
 	}
@@ -1438,9 +1436,9 @@ func (c *Collector) maybeMeasureCPU() {
 		}
 		c.mu.Unlock()
 		if !ok {
-			slog.Warn("hostmetrics: cpu-delivered probe did not "+
+			logger().Warn("hostmetrics: cpu-delivered probe did not " +
 				"complete — serving previous result",
-				"subsystem", "hostmetrics")
+			)
 		}
 	}()
 }
@@ -1699,14 +1697,14 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 		c.mu.Unlock()
 		switch {
 		case stalled && !wasLogged:
-			slog.Warn("hostmetrics: statfs probe exceeded deadline — "+
+			logger().Warn("hostmetrics: statfs probe exceeded deadline — "+
 				"possible hung mount",
-				"subsystem", "hostmetrics", "mount", mount,
+				"mount", mount,
 				"timeout", c.cfg.fsProbeTimeout)
 		case !stalled && wasLogged:
-			slog.Info("hostmetrics: statfs probe answering again — "+
+			logger().Info("hostmetrics: statfs probe answering again — "+
 				"mount recovered",
-				"subsystem", "hostmetrics", "mount", mount)
+				"mount", mount)
 		}
 		ch <- prometheus.MustNewConstMetric(c.descFSProbeStalled,
 			prometheus.GaugeValue, v, c.cfg.NodeName, mount)
@@ -2035,10 +2033,10 @@ func (c *Collector) warnInotifyTop(kind string, over bool,
 		parts = append(parts, fmt.Sprintf("pid=%d %s instances=%d watches=%d",
 			p.pid, p.name, p.instances, p.watches))
 	}
-	slog.Warn("hostmetrics: inotify "+kind+" above "+
+	logger().Warn("hostmetrics: inotify "+kind+" above "+
 		strconv.FormatFloat(inotifyWarnRatio*100, 'f', -1, 64)+
 		"% of the limit — top holders: "+strings.Join(parts, "; "),
-		"subsystem", "hostmetrics", "kind", kind)
+		"kind", kind)
 }
 
 // collectInotify emits the two fill ratios — each only when its own

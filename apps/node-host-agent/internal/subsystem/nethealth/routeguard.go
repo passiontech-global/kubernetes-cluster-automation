@@ -39,18 +39,24 @@
 // self-limiting: nebula-up.sh is idempotent, so the DEL events its
 // own cleanup emits drain to silence once the state is converged.
 //
-// Any IPv4 DELROUTE/DELRULE counts — Cilium pod-route churn emits
-// them by the hundred — so on top of the burst debounce restores are
-// capped to one per routeGuardMinRestore: a fire inside the window is
-// re-armed for the window's end rather than dropped, so the trailing
-// edge of a flap still lands exactly one restore. Filtering DELRULE
-// by FRA_PRIORITY or DELROUTE by rtm_table was considered and
-// dropped: the bash guard matched the pub/marker tables and prefs
-// 1400/1490/1500 by NAME in `ip monitor` text — netlink carries only
-// numbers that need /etc/iproute2/rt_tables to resolve, which the
-// agent can't map host-side cheaply. The rate limit already bounds
-// the exec cost (~20 subcommands per restore); the is-active gate
-// bounds the rest.
+// Only deletes that name the NEBULA dataplane count. The bash guard
+// matched the pub/marker tables and prefs 1400/1490/1500 by NAME in
+// `ip monitor` text; netlink carries only numbers, but every number
+// is a nebula-up.sh constant ($PUB/$MARK, the pref literals) plus one
+// sysfs read (the dev's ifindex) — no /etc/iproute2/rt_tables needed.
+// The scan decodes each nlmsg: DELROUTE on a nebula table or with
+// RTA_OIF == <NebulaDev>, DELRULE at a nebula pref. Everything else —
+// the Cilium/Calico pod-route churn that fired ~400 spurious
+// restores/day on the cicd workers — is skipped. Decode is FAIL-OPEN:
+// a message too torn to classify still counts, because a missed real
+// delete strands the node off-mesh for minutes while a spurious
+// trigger costs one idempotent script run.
+//
+// On top of the burst debounce, restores stay capped to one per
+// routeGuardMinRestore — the backstop for a sustained RELEVANT
+// delete flood: a fire inside the window is re-armed for the
+// window's end rather than dropped, so the trailing edge of a flap
+// still lands exactly one restore.
 //
 // With no nebula-up.sh on the host (plain workers) or an inactive
 // unit the guard is a no-op — the socket isn't even bound until the
@@ -66,10 +72,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -132,9 +139,9 @@ func bindRouteSocket() (int, error) {
 	// guard.
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET,
 		unix.SO_RCVBUF, 4<<20); err != nil {
-		slog.Warn("route-guard: SO_RCVBUF 4MiB failed — keeping "+
+		logger().Warn("route-guard: SO_RCVBUF 4MiB failed — keeping "+
 			"default buffer (delete bursts may lose events)",
-			"subsystem", "nethealth", "error", err)
+			"error", err)
 	}
 	if err := unix.Bind(fd, &unix.SockaddrNetlink{
 		Family: unix.AF_NETLINK,
@@ -217,9 +224,9 @@ func bindInNetns(nsPath string) (int, error) {
 		if fd >= 0 {
 			unix.Close(fd)
 		}
-		slog.Error("route-guard: setns restore failed — parking "+
+		logger().Error("route-guard: setns restore failed — parking "+
 			"thread in the host netns and exiting the guard goroutine",
-			"error", rerr, "subsystem", "nethealth")
+			"error", rerr)
 		runtime.Goexit()
 		panic("unreachable")
 	}
@@ -227,28 +234,216 @@ func bindInNetns(nsPath string) (int, error) {
 	return fd, serr
 }
 
-// scanDeleteEvents reports whether buf carries at least one nlmsg of
-// type RTM_DELROUTE or RTM_DELRULE — the only events the bash guard
-// reacted to (`*Deleted*` lines). Netlink headers are host byte order
-// — binary.NativeEndian matches the kernel layout without unsafe.
-func scanDeleteEvents(buf []byte) bool {
-	for len(buf) >= unix.NLMSG_HDRLEN {
+// --- delete-event decode ---
+
+// The numeric identity of the nebula dataplane — constants mirrored
+// from nebula-up.sh (hostconfig templates/nebula-up.sh.j2):
+// routeGuardTablePub is the $PUB default — a node that overrode
+// interdc_nebula_table_pub carries it in watchdog conf as
+// OVERLAY_EGRESS_TABLE (hostconfig writes it there), so the conf
+// value wins. $MARK (interdc_nebula_table_marker) and the three
+// prefs have no conf counterpart — 101/1400/1490/1500 are the only
+// values the script renders: 1400 the fwmark-0x1000 underlay bypass
+// shared with tinc, 1490 the marker-CIDR lookup into $MARK, 1500
+// the per-target lookups into $PUB.
+const (
+	routeGuardTablePub   = 100
+	routeGuardTableMark  = 101
+	routeGuardPrefFwmark = 1400
+	routeGuardPrefMarker = 1490
+	routeGuardPrefPub    = 1500
+	// fibRuleHdrLen is sizeof(struct fib_rule_hdr) — the fixed
+	// header a DELRULE payload carries before its rtattr list
+	// (x/sys exports no constant for it).
+	fibRuleHdrLen = 12
+)
+
+// routeEventFilter is the nebula dataplane identity the delete scan
+// matches against: the pub/marker routing tables, the rule prefs
+// nebula-up.sh owns, and the nebula dev's kernel ifindex (0 =
+// unresolved — the RTA_OIF half of the DELROUTE match then stays
+// inert, but tables and prefs still catch the rules).
+type routeEventFilter struct {
+	tables map[uint32]bool
+	prefs  map[uint32]bool
+	nebIf  uint32
+}
+
+// nebulaRouteFilter builds the filter once per socket session —
+// cheap: a couple of map writes plus one sysfs read. The ifindex
+// resolves through the same /sys/class/net view hostmetrics reads
+// (the host netns under hostNetwork — exactly the netns the bound
+// socket watches); on a non-hostNetwork pod sysfs shows the pod's
+// own netns and the dev simply doesn't resolve.
+func (n *NetHealth) nebulaRouteFilter() *routeEventFilter {
+	f := &routeEventFilter{
+		tables: map[uint32]bool{routeGuardTableMark: true},
+		prefs: map[uint32]bool{
+			routeGuardPrefFwmark: true,
+			routeGuardPrefMarker: true,
+			routeGuardPrefPub:    true,
+		},
+	}
+	wd := n.watchdogConf()
+	if wd == nil {
+		f.tables[routeGuardTablePub] = true
+		return f
+	}
+	pub := uint32(wd.OverlayEgressTable)
+	if pub == 0 {
+		pub = routeGuardTablePub
+	}
+	f.tables[pub] = true
+	f.nebIf = nebulaIfindex(n.cfg.sysClassNet, wd.NebulaDev)
+	return f
+}
+
+// nebulaIfindex reads <dir>/<dev>/ifindex — the numeric id netlink
+// puts in RTA_OIF. A missing/unreadable dev (down mid-restart,
+// nebula not yet up) yields 0 — never a real ifindex, so the OIF
+// match stays inert instead of failing open into the CNI flood.
+func nebulaIfindex(dir, dev string) uint32 {
+	if dev == "" {
+		return 0
+	}
+	b, err := os.ReadFile(filepath.Join(dir, dev, "ifindex"))
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return uint32(v)
+}
+
+// scanDeleteEvents reports whether buf carries at least one nlmsg a
+// restore must answer — the only events the bash guard reacted to
+// (`*Deleted*` lines naming the nebula state). Netlink headers are
+// host byte order — binary.NativeEndian matches the kernel layout
+// without unsafe. Fail-open: a torn header or tail can't be proven
+// NOT to be a nebula delete, so it counts.
+func (f *routeEventFilter) scanDeleteEvents(buf []byte) bool {
+	for len(buf) > 0 {
+		if len(buf) < unix.NLMSG_HDRLEN {
+			return true
+		}
 		ln := int(binary.NativeEndian.Uint32(buf[0:4]))
 		typ := binary.NativeEndian.Uint16(buf[4:6])
 		if ln < unix.NLMSG_HDRLEN || ln > len(buf) {
-			return false
-		}
-		switch typ {
-		case unix.RTM_DELROUTE, unix.RTM_DELRULE:
 			return true
 		}
-		buf = buf[nlmsgAlign(ln):]
+		switch typ {
+		case unix.RTM_DELROUTE:
+			if f.delRouteRelevant(buf[unix.NLMSG_HDRLEN:ln]) {
+				return true
+			}
+		case unix.RTM_DELRULE:
+			if f.delRuleRelevant(buf[unix.NLMSG_HDRLEN:ln]) {
+				return true
+			}
+		}
+		// The next message sits at the aligned offset — but the
+		// kernel may not pad the LAST message to alignment, so the
+		// offset can land exactly at or past the buffer end.
+		if next := nlmsgAlign(ln); next < len(buf) {
+			buf = buf[next:]
+		} else {
+			return false
+		}
 	}
 	return false
 }
 
+// delRouteRelevant decodes an RTM_DELROUTE payload (struct rtmsg +
+// rtattrs). Relevant when the route sat in a nebula table (`default
+// dev neb1` in $PUB/$MARK) or egressed the nebula dev — the
+// marker-base /24 link route lives in table MAIN (254). rtm_table
+// is a u8; ids >255 arrive in RTA_TABLE instead, which wins when
+// present. Undecodable payloads are relevant (fail-open).
+func (f *routeEventFilter) delRouteRelevant(payload []byte) bool {
+	if len(payload) < unix.SizeofRtMsg {
+		return true // truncated rtmsg — can't prove it isn't ours
+	}
+	if payload[0] != unix.AF_INET {
+		return false // non-IPv4 — never nebula's (no v6 tables/rules)
+	}
+	attrs, clean := routeAttrs(payload[unix.SizeofRtMsg:],
+		unix.RTA_TABLE, unix.RTA_OIF)
+	if !clean {
+		return true // torn attribute list — can't prove it isn't ours
+	}
+	table := uint32(payload[4])
+	if v, ok := attrs[unix.RTA_TABLE]; ok {
+		table = v
+	}
+	return f.tables[table] ||
+		(f.nebIf != 0 && attrs[unix.RTA_OIF] == f.nebIf)
+}
+
+// delRuleRelevant decodes an RTM_DELRULE payload (struct
+// fib_rule_hdr + rtattrs): relevant when FRA_PRIORITY is a pref
+// nebula-up.sh owns. The kernel sends FRA_PRIORITY unconditionally —
+// a payload without it, or with a torn attribute list, is
+// undecodable → relevant.
+func (f *routeEventFilter) delRuleRelevant(payload []byte) bool {
+	if len(payload) < fibRuleHdrLen {
+		return true
+	}
+	if payload[0] != unix.AF_INET {
+		return false
+	}
+	attrs, clean := routeAttrs(payload[fibRuleHdrLen:],
+		unix.FRA_PRIORITY)
+	if !clean {
+		return true
+	}
+	prio, ok := attrs[unix.FRA_PRIORITY]
+	if !ok {
+		return true
+	}
+	return f.prefs[prio]
+}
+
+// routeAttrs walks a rtattr list and extracts the wanted u32-valued
+// attributes. clean=false means the walk hit a torn attribute
+// (rta_len shorter than the header or running past the buffer end)
+// — the wanted values may sit in the unread tail, so callers treat
+// !clean as undecodable. A last attribute whose ALIGNMENT padding
+// overruns the buffer is a clean end: the kernel need not pad the
+// final attribute of a message.
+func routeAttrs(buf []byte, wants ...uint16) (map[uint16]uint32, bool) {
+	found := map[uint16]uint32{}
+	want := map[uint16]bool{}
+	for _, w := range wants {
+		want[w] = true
+	}
+	for len(buf) >= unix.SizeofRtAttr {
+		ln := int(binary.NativeEndian.Uint16(buf[0:2]))
+		typ := binary.NativeEndian.Uint16(buf[2:4])
+		if ln < unix.SizeofRtAttr || ln > len(buf) {
+			return found, false
+		}
+		if want[typ] && ln >= unix.SizeofRtAttr+4 {
+			found[typ] = binary.NativeEndian.Uint32(buf[4:8])
+		}
+		if next := rtaAlign(ln); next < len(buf) {
+			buf = buf[next:]
+		} else {
+			return found, next == len(buf) || ln == len(buf)
+		}
+	}
+	// A <4B residue can't hold an attribute (min rta_len is the
+	// header) — treat it as undecodable rather than silently exact.
+	return found, len(buf) == 0
+}
+
 func nlmsgAlign(ln int) int {
 	return (ln + int(unix.NLMSG_ALIGNTO) - 1) &^ (int(unix.NLMSG_ALIGNTO) - 1)
+}
+
+func rtaAlign(ln int) int {
+	return (ln + int(unix.RTA_ALIGNTO) - 1) &^ (int(unix.RTA_ALIGNTO) - 1)
 }
 
 // --- the guard loop ---
@@ -313,9 +508,9 @@ func (n *NetHealth) spawnRouteGuard(ctx context.Context) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("route-guard: guard panicked — exiting, "+
+				logger().Error("route-guard: guard panicked — exiting, "+
 					"respawn allowed after backoff",
-					"subsystem", "nethealth", "panic", r)
+					"panic", r)
 			}
 			n.routeGuardLastExit.Store(time.Now().UnixNano())
 			n.routeGuardRunning.Store(false)
@@ -400,6 +595,12 @@ func (n *NetHealth) routeGuard(ctx context.Context) {
 // exit or cancel (the outer loop then reopens after the backoff).
 func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 	debounce, minRestore time.Duration) {
+	// The delete filter arms once per socket session: a rebuilt
+	// nebula dev (tun recreate) or a watchdog-conf table renumber
+	// only re-reads on the next socket reopen. The ifindex read
+	// failing is NOT fatal — matching then falls back to
+	// tables+prefs.
+	filter := n.nebulaRouteFilter()
 	events := make(chan struct{}, 16)
 	done := make(chan struct{})
 	var closeOnce sync.Once
@@ -412,9 +613,9 @@ func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 		// must not crash the whole daemon.
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("route-guard: netlink reader panicked — "+
+				logger().Error("route-guard: netlink reader panicked — "+
 					"monitor exits, socket will reopen",
-					"subsystem", "nethealth", "panic", r)
+					"panic", r)
 			}
 		}()
 		defer close(done)
@@ -435,9 +636,9 @@ func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 				// overrun + every Nth, so a sustained flood can't
 				// emit a line per read while staying visible.
 				if enobufs == 1 || enobufs%routeGuardErrEvery == 0 {
-					slog.Warn("route-guard: netlink receive queue "+
+					logger().Warn("route-guard: netlink receive queue "+
 						"overrun — events lost, forcing a restore",
-						"subsystem", "nethealth", "overruns", enobufs)
+						"overruns", enobufs)
 				}
 				select {
 				case events <- struct{}{}:
@@ -450,13 +651,13 @@ func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 				// triggered by ctx cancel is the normal shutdown —
 				// only unexpected read failures are worth a trail.
 				if err != nil && ctx.Err() == nil {
-					slog.Debug("route-guard: netlink read failed — "+
+					logger().Debug("route-guard: netlink read failed — "+
 						"socket will reopen",
-						"subsystem", "nethealth", "error", err)
+						"error", err)
 				}
 				return
 			}
-			if scanDeleteEvents(buf[:nr]) {
+			if filter.scanDeleteEvents(buf[:nr]) {
 				select {
 				case events <- struct{}{}:
 				default:
@@ -467,8 +668,8 @@ func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("route-guard: cancel watcher panicked",
-					"subsystem", "nethealth", "panic", r)
+				logger().Error("route-guard: cancel watcher panicked",
+					"panic", r)
 			}
 		}()
 		select {
@@ -537,13 +738,13 @@ func routeGuardDebounceLoop(ctx context.Context, events <-chan struct{},
 func (n *NetHealth) restoreRouteGuard(ctx context.Context) {
 	wd := n.watchdogConf()
 	if !wd.SignalEnabled(checkRouteGuard) {
-		slog.Debug("route-guard: restore skipped — kill switch off "+
-			"(WD_SIG_ROUTE_GUARD=off)", "subsystem", "nethealth")
+		logger().Debug("route-guard: restore skipped — kill switch off " +
+			"(WD_SIG_ROUTE_GUARD=off)")
 		return
 	}
 	if !n.nebulaUpExists(wd) {
-		slog.Debug("route-guard: restore skipped — nebula-up.sh gone "+
-			"mid-run", "subsystem", "nethealth", "net", wd.NebulaNet)
+		logger().Debug("route-guard: restore skipped — nebula-up.sh gone "+
+			"mid-run", "net", wd.NebulaNet)
 		return
 	}
 	// bash gate: restore only while `systemctl is-active
@@ -552,8 +753,8 @@ func (n *NetHealth) restoreRouteGuard(ctx context.Context) {
 	// deactivating AND no-systemd all count as down; activating is
 	// the unit's own ExecStartPost job).
 	if n.cfg.Systemd == nil {
-		slog.Debug("route-guard: restore skipped — no systemd client",
-			"subsystem", "nethealth", "unit", "nebula@"+wd.NebulaNet)
+		logger().Debug("route-guard: restore skipped — no systemd client",
+			"unit", "nebula@"+wd.NebulaNet)
 		return
 	}
 	active, err := n.cfg.Systemd.Active(ctx, "nebula@"+wd.NebulaNet)
@@ -561,16 +762,16 @@ func (n *NetHealth) restoreRouteGuard(ctx context.Context) {
 		// Fail closed: an unanswerable probe (dbus down, systemctl
 		// missing) must not resurrect a possibly-stopped unit —
 		// skip the restore this cycle.
-		slog.Warn("route-guard: restore skipped — is-active probe "+
+		logger().Warn("route-guard: restore skipped — is-active probe "+
 			"failed (fail closed)",
-			"subsystem", "nethealth", "unit", "nebula@"+wd.NebulaNet,
+			"unit", "nebula@"+wd.NebulaNet,
 			"error", err)
 		return
 	}
 	if !active {
-		slog.Debug("route-guard: restore skipped — nebula unit not "+
+		logger().Debug("route-guard: restore skipped — nebula unit not "+
 			"active",
-			"subsystem", "nethealth", "unit", "nebula@"+wd.NebulaNet)
+			"unit", "nebula@"+wd.NebulaNet)
 		return
 	}
 	script := nebulaUpScript(wd.NebulaNet)

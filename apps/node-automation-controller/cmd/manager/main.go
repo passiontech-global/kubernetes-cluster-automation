@@ -149,6 +149,7 @@ func defaultCacheTransform(obj interface{}) (interface{}, error) {
 func main() {
 	var metricsAddr, probeAddr string
 	var showVersion, leaderElect bool
+	var leaseDuration, renewDeadline, retryPeriod time.Duration
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9115",
 		"address the Prometheus metrics endpoint binds to")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
@@ -157,6 +158,28 @@ func main() {
 	flag.BoolVar(&leaderElect, "leader-elect", false,
 		"enable leader election via a coordination.k8s.io Lease — "+
 			"required when running more than one replica")
+	// Lease timing knobs. 0 = unset: the matching *time.Duration field
+	// in ctrl.Options stays nil and controller-runtime keeps its
+	// compiled-in defaults (15s/10s/2s) — running without these flags
+	// is byte-for-byte the old behavior. Deployments pass explicit
+	// values via args (see node-automation-controller/deployment.yaml
+	// in passiontech-fluxcd: 180s/120s/5s, sized for the multi-minute
+	// Nebula dataplane blips of incident 2026-11-04 where the 10s
+	// RenewDeadline was eaten by the 5s lease-client timeout →
+	// "leader election lost" → fleet-wide manager restarts).
+	// The required ordering LeaseDuration > RenewDeadline >
+	// RetryPeriod*JitterFactor(1.2) is already enforced by client-go's
+	// NewLeaderElector — an invalid combo fails mgr.Start → exit 1 →
+	// visible CrashLoopBackOff, so no extra validation here.
+	flag.DurationVar(&leaseDuration, "leader-elect-lease-duration", 0,
+		"duration non-leader candidates wait before force-acquiring the "+
+			"Lease; 0 keeps the controller-runtime default (15s)")
+	flag.DurationVar(&renewDeadline, "leader-elect-renew-deadline", 0,
+		"duration the leader retries renewing the Lease before giving "+
+			"up; 0 keeps the controller-runtime default (10s)")
+	flag.DurationVar(&retryPeriod, "leader-elect-retry-period", 0,
+		"interval between Lease renew/acquire attempts; 0 keeps the "+
+			"controller-runtime default (2s)")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -177,7 +200,7 @@ func main() {
 	// Cache must mirror RBAC: several types are list/watch-locked to a
 	// single object via resourceNames, so informers MUST carry the
 	// matching field/label selector or the API returns Forbidden.
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+	mgrOptions := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
@@ -186,8 +209,8 @@ func main() {
 		// so `periodic` sweepers and all reconcilers only run on the
 		// leader) while informers, metrics and probes stay warm on
 		// standbys. ReleaseOnCancel hands the Lease over on graceful
-		// shutdown — rolling-update failover ~2s vs the ~15s lease
-		// timeout on crash.
+		// shutdown — rolling-update failover ~2s vs up to LeaseDuration
+		// on crash (15s default; deployments pass 180s).
 		LeaderElection:                leaderElect,
 		LeaderElectionID:              "node-automation-controller.node-ops",
 		LeaderElectionReleaseOnCancel: true,
@@ -227,7 +250,20 @@ func main() {
 				},
 			},
 		},
-	})
+	}
+	// Only wire the fields the operator actually set — the Options
+	// fields are *time.Duration and nil means "controller-runtime
+	// default", which is exactly what the zero flag value should keep.
+	if leaseDuration > 0 {
+		mgrOptions.LeaseDuration = &leaseDuration
+	}
+	if renewDeadline > 0 {
+		mgrOptions.RenewDeadline = &renewDeadline
+	}
+	if retryPeriod > 0 {
+		mgrOptions.RetryPeriod = &retryPeriod
+	}
+	mgr, err := ctrl.NewManager(cfg, mgrOptions)
 	if err != nil {
 		log.Error(err, "unable to create manager")
 		os.Exit(1)
@@ -276,7 +312,12 @@ func main() {
 
 	log.Info("starting manager", "version", version,
 		"leaderElection", leaderElect, "metricsAddr", metricsAddr,
-		"probeAddr", probeAddr, "nodeLabelerConfig", mc.labelerPath,
+		"probeAddr", probeAddr,
+		// 0s in this line means "controller-runtime default" — see the
+		// flag comments above.
+		"leaseDuration", leaseDuration, "renewDeadline", renewDeadline,
+		"retryPeriod", retryPeriod,
+		"nodeLabelerConfig", mc.labelerPath,
 		"ciliumTaintReaper", mc.ciliumEnabled, "fluentBitRoller", mc.fluentbitEnabled,
 		"certManagerReaper", mc.certReaperEnabled, "ciliumAudit", mc.ciliumAuditEnabled,
 		"externalSecretNudge", mc.esNudgeEnabled, "csrApprove", mc.csrApproveEnabled,

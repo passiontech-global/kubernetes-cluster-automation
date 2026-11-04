@@ -79,14 +79,14 @@ func main() {
 		}
 	}
 	if len(missing) > 0 {
-		slog.Error("missing required environment variables", "vars", missing)
+		logger().Error("missing required environment variables", "vars", missing)
 		os.Exit(1)
 	}
 
 	// LOCAL_USERS carries Concourse basic auth as "user:password".
 	user, password, ok := parseLocalUsers(os.Getenv("LOCAL_USERS"))
 	if !ok {
-		slog.Error("LOCAL_USERS must be in 'user:password' form")
+		logger().Error("LOCAL_USERS must be in 'user:password' form")
 		os.Exit(1)
 	}
 
@@ -122,21 +122,21 @@ func main() {
 	}
 	go func() {
 		<-ctx.Done()
-		slog.Info("shutdown signal received — draining connections")
+		logger().Info("shutdown signal received — draining connections")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			slog.Warn("graceful shutdown failed — connections dropped",
+			logger().Warn("graceful shutdown failed — connections dropped",
 				"error", err)
 		}
 	}()
 
-	slog.Info("starting webhook-dispatcher",
+	logger().Info("starting webhook-dispatcher",
 		"version", version, "addr", srv.Addr,
 		"routes", "POST /webhook, GET /healthz",
 		"concourse_url", client.BaseURL, "concourse_team", client.Team)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		slog.Error("server exited", "error", err)
+		logger().Error("server exited", "error", err)
 		os.Exit(1)
 	}
 }

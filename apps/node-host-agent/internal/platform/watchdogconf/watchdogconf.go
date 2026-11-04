@@ -22,7 +22,6 @@ package watchdogconf
 
 import (
 	"fmt"
-	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -464,8 +463,8 @@ func (r *Reloader) Get() *Config {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if c, err := Load(r.Path); err != nil {
-		slog.Warn("watchdogconf: reload failed — keeping last good config",
-			"subsystem", "watchdogconf", "path", r.Path, "error", err)
+		logger().Warn("watchdogconf: reload failed — keeping last good config",
+			"path", r.Path, "error", err)
 	} else if c != nil {
 		r.cfg = c
 	}

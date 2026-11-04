@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -131,7 +130,7 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 	}
 
 	if exists && fi.Size() != wantBytes && !active {
-		slog.Info("swap: removing wrong-size inactive file", "path", path,
+		logger().Info("swap: removing wrong-size inactive file", "path", path,
 			"size", fi.Size(), "want", wantBytes)
 		if err := os.Remove(dst); err != nil {
 			c.err("swap: remove wrong-size file", "path", path, "error", err)
@@ -143,7 +142,7 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 		if _, err := r.run(ctx, "fallocate", "-l", fmt.Sprintf("%dM", mb), path); err != nil {
 			// Best-effort primary path — dd below is the fallback;
 			// only its failure counts.
-			slog.Warn("swap: fallocate failed — dd fallback", "path", path, "error", err)
+			logger().Warn("swap: fallocate failed — dd fallback", "path", path, "error", err)
 			if _, derr := r.run(ctx, "dd", "if=/dev/zero", "of="+path, "bs=1M",
 				fmt.Sprintf("count=%d", mb), "status=none"); derr != nil {
 				c.err("swap: dd create failed", "path", path, "error", derr)
@@ -168,7 +167,7 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 	if fstabErr != nil && !os.IsNotExist(fstabErr) {
 		// Best-effort pre-warning — a failed fstab write is counted
 		// by writeManaged's noteErr below.
-		slog.Warn("swap: cannot read /etc/fstab — swap fstab entry will fail",
+		logger().Warn("swap: cannot read /etc/fstab — swap fstab entry will fail",
 			"error", fstabErr)
 	}
 	re := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(path) + `\s.*$`)
@@ -359,6 +358,121 @@ func (c *cyc) hubMetricsScript() string {
 	return sb.String()
 }
 
+// ---------- journald persistence (standalone hosts) ----------
+//
+// DaemonSet nodes get persistent journals as a mount side-effect:
+// the pod's /var/log/journal hostPath is DirectoryOrCreate, and a
+// Storage=auto journald goes persistent once the dir exists at its
+// start. The standalone deployments (interdc hubs, k0s controllers,
+// infra VMs) had no equivalent converge: a journald that started
+// before the dir existed — or whose journal files were
+// deleted/vacuumed under it — writes nowhere and never recovers on
+// its own (cicd controller 103.186.101.30, 2026-11:
+// /var/log/journal/<machine-id> existed but EMPTY, journalctl
+// answered "No journal files were found." and the journal-unreadable
+// watchdog latch fired with nothing remediating it). groupBase runs
+// this on every standalone host before the integrity probe so a
+// restart the probe prescribes lands on Storage=persistent.
+
+// journaldPersistence converges the generic persistent-storage
+// drop-in on standalone hosts — a no-op on DaemonSet nodes, where
+// the /var/log/journal hostPath mount already flips Storage=auto.
+func (c *cyc) journaldPersistence() {
+	if !c.r.cfg.Standalone {
+		return
+	}
+	c.journaldStorage("/etc/systemd/journald.conf.d/50-node-config-agent.conf",
+		[]byte(`# Managed by node-config-agent — persistent journald on standalone
+# hosts (no kubelet hostPath to flip Storage=auto). A journald that
+# started before /var/log/journal existed, or lost its files under it,
+# writes nowhere until restarted (cicd controller incident 2026-11).
+[Journal]
+Storage=persistent
+`))
+}
+
+// journaldStorage converges one journald.conf.d drop-in plus the
+// machine-id journal dir, restarts systemd-journald when the drop-in
+// changed or the dir was missing — journald only re-scans storage on
+// start, so a dir created under a running journald stays invisible
+// without the bounce — and folds orphaned *.journal files (stale
+// machine-id dirs, e.g. cloned images) into the live dir. The restart
+// is recorded on c.journaldRestarted so journaldIntegrity does not
+// spend its restart budget on a second bounce in the same cycle.
+func (c *cyc) journaldStorage(dropinPath string, dropin []byte) {
+	r, ctx := c.r, c.ctx
+	r.ensureDir("/etc/systemd/journald.conf.d", 0o755)
+	ch, _ := r.writeManaged(dropinPath, dropin, 0o644)
+	created := c.ensureJournalDir()
+	if ch || created {
+		r.restartService(ctx, "systemd-journald.service")
+		c.journaldRestarted = true
+	}
+	c.journaldOrphanFold()
+}
+
+// ensureJournalDir creates /var/log/journal/<machine-id> with the
+// 02755 root:systemd-journal shape journald expects (the same
+// ownership systemd's own creation uses). Returns true when the dir
+// was missing before this cycle — the caller restarts journald so
+// the fresh dir is actually seen. chmod/chgrp failures are
+// best-effort warns: drifted perms weaken the setup but never block
+// the converge.
+func (c *cyc) ensureJournalDir() bool {
+	r, ctx := c.r, c.ctx
+	mid := r.machineID()
+	if mid == "" {
+		return false
+	}
+	dir := "/var/log/journal/" + mid
+	created := !r.fileExists(dir)
+	if err := os.MkdirAll(r.hp(dir), 0o755); err != nil {
+		logger().Warn("journald: journal dir create failed — persistence may not take effect",
+			"dir", dir, "error", err)
+		return created
+	}
+	// os.ModeSetgid|0755, not 0o2755: os.Chmod maps the abstract
+	// FileMode flags — the raw 0o2000 bit is silently dropped (the
+	// api-lb block this replaces had that latent bug).
+	if err := os.Chmod(r.hp(dir), os.ModeSetgid|0o755); err != nil {
+		logger().Warn("journald: chmod journal dir failed", "dir", dir, "error", err)
+	}
+	if _, err := r.run(ctx, "chgrp", "systemd-journal", dir); err != nil {
+		logger().Warn("journald: chgrp journal dir failed", "dir", dir, "error", err)
+	}
+	return created
+}
+
+// journaldOrphanFold moves *.journal files stranded under stale
+// machine-id dirs into the live one — same mv-with-rename dance as
+// ansible (incident 2026-10-09 cloned-image journals).
+func (c *cyc) journaldOrphanFold() {
+	r, ctx := c.r, c.ctx
+	mid := r.machineID()
+	if mid == "" {
+		return
+	}
+	// sh -c runs in the host namespaces via the Runner — unjoined
+	// host paths, not HostRoot-prefixed.
+	r.run(ctx, "sh", "-c", fmt.Sprintf(`mid=%q
+for f in /var/log/journal/*/*.journal; do
+  [ -e "$f" ] || continue
+  case "$f" in "/var/log/journal/$mid/"*) continue ;; esac
+  base=$(basename "$f")
+  dest="/var/log/journal/$mid/$base"
+  [ -e "$dest" ] && dest="/var/log/journal/$mid/orphan-$base"
+  mv "$f" "$dest" || echo "WARN: could not move $f"
+done`, mid))
+}
+
+// machineID reads the host machine-id — the journal storage dir name.
+func (r *Reconciler) machineID() string {
+	if b, err := os.ReadFile(r.hp("/etc/machine-id")); err == nil {
+		return strings.TrimSpace(string(b))
+	}
+	return ""
+}
+
 // ---------- api-lb-vm (api_lb_guard.yaml) ----------
 //
 // Converges the api-backend-guard prerequisites on a VM matching an
@@ -444,58 +558,14 @@ d %s 0755 99 99 -
 	// journald persistence — the only drain-audit history on these
 	// out-of-inventory VMs (incident 2026-10-09: cloned image left
 	// journals under a stale machine-id dir, orphaned on next boot).
-	r.ensureDir("/etc/systemd/journald.conf.d", 0o755)
-	jch, _ := r.writeManaged("/etc/systemd/journald.conf.d/50-api-lb-guard.conf",
+	// 500M cap: the VM only runs haproxy + agent.
+	c.journaldStorage("/etc/systemd/journald.conf.d/50-api-lb-guard.conf",
 		[]byte(`# api-lb-guard: persistent journal to audit guard drain
 # history across reboots. 500M cap: the VM only runs haproxy + agent.
 [Journal]
 Storage=persistent
 SystemMaxUse=500M
-`), 0o644)
-	mid := ""
-	if b, err := os.ReadFile(r.hp("/etc/machine-id")); err == nil {
-		mid = strings.TrimSpace(string(b))
-	}
-	jdirChanged := false
-	if mid != "" {
-		if !r.fileExists("/var/log/journal/" + mid) {
-			jdirChanged = true
-		}
-		if err := os.MkdirAll(r.hp("/var/log/journal/"+mid), 0o755); err == nil {
-			if err := os.Chmod(r.hp("/var/log/journal/"+mid), 0o2755); err != nil {
-				// Best-effort — the dir exists; drifted perms only
-				// weaken the audit-history setup, not the guard.
-				slog.Warn("api-lb-vm: chmod journal dir failed",
-					"dir", "/var/log/journal/"+mid, "error", err)
-			}
-			if _, err := r.run(ctx, "chgrp", "systemd-journal", "/var/log/journal/"+mid); err != nil {
-				// Best-effort — same audit-history rationale.
-				slog.Warn("api-lb-vm: chgrp journal dir failed",
-					"dir", "/var/log/journal/"+mid, "error", err)
-			}
-		} else {
-			// Best-effort — journald persistence only carries the
-			// drain-audit history; the guard itself still converges.
-			slog.Warn("api-lb-vm: journal dir create failed — journald persistence may not take effect",
-				"dir", "/var/log/journal/"+mid, "error", err)
-		}
-	}
-	if jch || jdirChanged {
-		r.restartService(ctx, "systemd-journald.service")
-	}
-	if mid != "" {
-		// Fold orphaned *.journal files (stale machine-id dirs) into
-		// the current mid dir — same mv-with-rename dance as ansible.
-		r.run(ctx, "sh", "-c", fmt.Sprintf(`mid=%q
-for f in /var/log/journal/*/*.journal; do
-  [ -e "$f" ] || continue
-  case "$f" in "/var/log/journal/$mid/"*) continue ;; esac
-  base=$(basename "$f")
-  dest="/var/log/journal/$mid/$base"
-  [ -e "$dest" ] && dest="/var/log/journal/$mid/orphan-$base"
-  mv "$f" "$dest" || echo "WARN: could not move $f"
-done`, mid))
-	}
+`))
 
 	c.apiLBHaproxy(container, sockDir, socket)
 
@@ -604,7 +674,7 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 	if b, err := os.ReadFile(r.hp(cfgPath)); err != nil {
 		// Best-effort precondition — the definitive signal (admin
 		// socket absent after the wait below) is what counts.
-		slog.Warn("api-lb-vm: cannot read haproxy.cfg — stats socket not ensured",
+		logger().Warn("api-lb-vm: cannot read haproxy.cfg — stats socket not ensured",
 			"path", cfgPath, "error", err)
 	} else if !strings.Contains(string(b), "stats socket") {
 		nb := "# BEGIN api-lb-guard: admin socket for guard backend drain\n" +
@@ -619,7 +689,7 @@ func (c *cyc) apiLBHaproxy(container, sockDir, socket string) {
 	composeChanged := false
 	if cb, err := os.ReadFile(r.hp(composeFile)); err != nil {
 		// Best-effort precondition — same socket-wait signal below.
-		slog.Warn("api-lb-vm: cannot read compose file — /run/haproxy mount not ensured",
+		logger().Warn("api-lb-vm: cannot read compose file — /run/haproxy mount not ensured",
 			"path", composeFile, "error", err)
 	} else {
 		mountRe := regexp.MustCompile(`(?m)^\s*-\s*["']?` +
@@ -739,7 +809,7 @@ func (c *cyc) etcdctlInstallBinary() {
 	if err := r.ensureDir("/var/lib/k0s/bin", 0o755); err != nil {
 		// ensureDir already counted the failure via noteErr — log
 		// context only, do not count the same fault twice.
-		slog.Error("etcdctl: ensure k0s bin dir", "error", err)
+		logger().Error("etcdctl: ensure k0s bin dir", "error", err)
 		return
 	}
 	if err := untarInstall(local, "etcdctl", r.hp(bin), 0o755); err != nil {

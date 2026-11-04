@@ -48,7 +48,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -81,6 +80,7 @@ const (
 	defaultProcNetUDP6      = "/proc/1/net/udp6"
 	defaultUptimeFile       = "/proc/uptime"
 	defaultHostRoot         = "/host"
+	defaultSysClassNet      = "/sys/class/net"
 	defaultConsecNeeded     = 2
 	defaultMinRestart       = 30 * time.Minute
 	corednsRestartInterval  = 5 * time.Minute
@@ -188,6 +188,11 @@ type Config struct {
 	// (hostNetwork, same inode as /proc/1/ns/net), else setns into
 	// pid-1's netns (hostPID — no /host/proc mount needed).
 	openRouteSocket func() (int, error)
+	// sysClassNet is the sysfs net-device dir the route guard
+	// resolves the nebula dev's ifindex from — the netns the bound
+	// socket watches under hostNetwork (same convention as
+	// hostmetrics' SysClassNet; tests point it at a fixture).
+	sysClassNet string
 	// adjtimexFn reads the kernel clock discipline — a modes==0
 	// (read-only) adjtimex(2) needs no CAP_SYS_TIME. Tests inject.
 	adjtimexFn func(buf *unix.Timex) (int, error)
@@ -320,6 +325,9 @@ func (c *Config) applyDefaults() {
 			return probeHTTPGet(ctx, url, timeout)
 		}
 	}
+	if c.sysClassNet == "" {
+		c.sysClassNet = defaultSysClassNet
+	}
 	if c.adjtimexFn == nil {
 		c.adjtimexFn = unix.Adjtimex
 	}
@@ -384,8 +392,7 @@ func (n *NetHealth) Name() string { return "nethealth" }
 // Run checks immediately, then every Interval until ctx is cancelled.
 func (n *NetHealth) Run(ctx context.Context) {
 	if !n.cfg.Enabled {
-		slog.Info("nethealth disabled — idling until shutdown",
-			"subsystem", "nethealth")
+		logger().Info("nethealth disabled — idling until shutdown")
 		<-ctx.Done()
 		return
 	}
@@ -478,13 +485,13 @@ func (n *NetHealth) Cycle(ctx context.Context) {
 // workerhygiene's: state-* latches, last-* budgets, log + slog) ---
 
 func (n *NetHealth) appendLog(msg string) {
-	slog.Info(msg, "subsystem", "nethealth")
+	logger().Info(msg)
 	f, err := os.OpenFile(n.cfg.WatchdogLogFile,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		slog.Debug("nethealth: watchdog log file append failed — "+
+		logger().Debug("nethealth: watchdog log file append failed — "+
 			"line kept in agent log only",
-			"subsystem", "nethealth", "path", n.cfg.WatchdogLogFile,
+			"path", n.cfg.WatchdogLogFile,
 			"error", err)
 		return
 	}
@@ -529,9 +536,9 @@ func writeFileAtomic(path, content string) error {
 	// One warn per path, not per write — a bind-mounted hosts file
 	// takes the fallback on every render and would spam the log.
 	if _, logged := renameFallbackLogged.LoadOrStore(path, true); !logged {
-		slog.Warn("nethealth: atomic rename refused (bind-mounted "+
+		logger().Warn("nethealth: atomic rename refused (bind-mounted "+
 			"target?) — falling back to direct fsync'd write",
-			"subsystem", "nethealth", "path", path, "error", err)
+			"path", path, "error", err)
 	}
 	return writeFileDirect(path, content)
 }
@@ -572,8 +579,8 @@ func (n *NetHealth) stateEnter(name, extra string) {
 	}
 	content := strconv.FormatInt(n.cfg.nowFn().Unix(), 10) + "\n"
 	if err := writeFileAtomic(p, content); err != nil {
-		slog.Warn("nethealth: state latch write failed",
-			"subsystem", "nethealth", "state", name, "path", p, "error", err)
+		logger().Warn("nethealth: state latch write failed",
+			"state", name, "path", p, "error", err)
 		return
 	}
 	if extra != "" {
@@ -589,8 +596,8 @@ func (n *NetHealth) stateExit(name string) {
 		return
 	}
 	if err := os.Remove(p); err != nil {
-		slog.Warn("nethealth: state latch remove failed",
-			"subsystem", "nethealth", "state", name, "path", p, "error", err)
+		logger().Warn("nethealth: state latch remove failed",
+			"state", name, "path", p, "error", err)
 		return
 	}
 	// Drop the suspect-log dedupe budgets with the latch — a later
@@ -626,8 +633,8 @@ func (n *NetHealth) rateSpend(name string) {
 	p := filepath.Join(n.cfg.WatchdogStateDir, name)
 	content := strconv.FormatInt(n.cfg.nowFn().Unix(), 10) + "\n"
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-		slog.Warn("nethealth: rate budget write failed",
-			"subsystem", "nethealth", "budget", name, "path", p, "error", err)
+		logger().Warn("nethealth: rate budget write failed",
+			"budget", name, "path", p, "error", err)
 	}
 }
 
@@ -756,9 +763,9 @@ func (n *NetHealth) pinFiles() []string {
 func (n *NetHealth) renderHostsBlock(block string) (changed bool) {
 	data, err := os.ReadFile(n.cfg.HostsFile)
 	if err != nil {
-		slog.Warn("nethealth: hosts file unreadable — dns-fallback "+
+		logger().Warn("nethealth: hosts file unreadable — dns-fallback "+
 			"block left untouched",
-			"subsystem", "nethealth", "path", n.cfg.HostsFile,
+			"path", n.cfg.HostsFile,
 			"error", err)
 		return false
 	}
@@ -810,10 +817,10 @@ func (n *NetHealth) renderHostsBlock(block string) (changed bool) {
 			}
 			kept = append(kept, line)
 		}
-		slog.Warn("nethealth: unterminated "+hostsBlockBegin+" block "+
+		logger().Warn("nethealth: unterminated "+hostsBlockBegin+" block "+
 			"in hosts file — treating EOF as block end, keeping the "+
 			"tail outside the managed block",
-			"subsystem", "nethealth", "path", n.cfg.HostsFile,
+			"path", n.cfg.HostsFile,
 			"stalePinsDropped", dropped)
 	}
 	body := strings.TrimRight(strings.Join(kept, "\n"), "\n")
@@ -828,9 +835,9 @@ func (n *NetHealth) renderHostsBlock(block string) (changed bool) {
 		return false
 	}
 	if err := writeFileAtomic(n.cfg.HostsFile, next); err != nil {
-		slog.Warn("nethealth: hosts file write failed — dns-fallback "+
+		logger().Warn("nethealth: hosts file write failed — dns-fallback "+
 			"block not applied",
-			"subsystem", "nethealth", "path", n.cfg.HostsFile,
+			"path", n.cfg.HostsFile,
 			"error", err)
 		return false
 	}
@@ -889,8 +896,8 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		for _, server := range ns {
 			ip, err := n.cfg.dnsProbe(ctx, server, e.Name)
 			if err != nil {
-				slog.Debug("nethealth: dns probe failed",
-					"subsystem", "nethealth", "name", e.Name,
+				logger().Debug("nethealth: dns probe failed",
+					"name", e.Name,
 					"nameserver", server, "error", err)
 				continue
 			}
@@ -902,10 +909,10 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		if resolved != "" {
 			if readFile(lg) != resolved {
 				if err := writeFileAtomic(lg, resolved+"\n"); err != nil {
-					slog.Warn("nethealth: dns last-good write "+
+					logger().Warn("nethealth: dns last-good write "+
 						"failed — fallback pick may lose the "+
 						"last-known-good IP",
-						"subsystem", "nethealth", "name", e.Name,
+						"name", e.Name,
 						"path", lg, "error", err)
 				}
 			}
@@ -1030,9 +1037,9 @@ func (n *NetHealth) checkCoreDNSStub(ctx context.Context) {
 	// skip-gate) a coredns restart on a lie.
 	exists, err := n.cfg.Systemd.Exists(ctx, "coredns.service")
 	if err != nil {
-		slog.Warn("nethealth: coredns existence probe failed — "+
+		logger().Warn("nethealth: coredns existence probe failed — "+
 			"treating unit as present this cycle (fail closed)",
-			"subsystem", "nethealth", "unit", "coredns.service",
+			"unit", "coredns.service",
 			"error", err)
 		exists = true
 	}
@@ -1042,9 +1049,9 @@ func (n *NetHealth) checkCoreDNSStub(ctx context.Context) {
 	}
 	active, err := n.cfg.Systemd.Active(ctx, "coredns.service")
 	if err != nil {
-		slog.Warn("nethealth: coredns is-active probe failed — "+
+		logger().Warn("nethealth: coredns is-active probe failed — "+
 			"treating unit as active this cycle (fail closed)",
-			"subsystem", "nethealth", "unit", "coredns.service",
+			"unit", "coredns.service",
 			"error", err)
 		active = true
 	}
@@ -1079,8 +1086,8 @@ func (n *NetHealth) checkCoreDNSStub(ctx context.Context) {
 func (n *NetHealth) ip(ctx context.Context, args ...string) (string, error) {
 	out, err := n.cfg.runHostCmd(ctx, append([]string{"ip"}, args...))
 	if err != nil {
-		slog.Debug("nethealth: host ip command failed",
-			"subsystem", "nethealth", "args", args,
+		logger().Debug("nethealth: host ip command failed",
+			"args", args,
 			"output", trimRunErr(out), "error", err)
 	}
 	return out, err
@@ -1175,9 +1182,9 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 		// relay then looks live=direct, driving redundant
 		// del/add churn and a rigged probe path. Warn so the
 		// blind cycle is visible.
-		slog.Warn("nethealth: ip rule list pref 1500 failed — "+
+		logger().Warn("nethealth: ip rule list pref 1500 failed — "+
 			"relays read as unruled this cycle",
-			"subsystem", "nethealth", "error", err)
+			"error", err)
 	}
 
 	inSet := map[string]bool{}
@@ -1266,9 +1273,9 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 					// says "kept live" instead of claiming
 					// underlay evidence that was never collected.
 					unprobeable = true
-					slog.Warn("nethealth: probe-window rule del "+
+					logger().Warn("nethealth: probe-window rule del "+
 						"failed — skipping TCP fallback probe this cycle",
-						"subsystem", "nethealth", "relay", r,
+						"relay", r,
 						"table", table, "error", derr)
 				} else {
 					ruleDropped = true
@@ -1280,9 +1287,8 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 					if _, err := os.Stat(icmpBlk); err != nil {
 						if werr := writeFileAtomic(icmpBlk,
 							strconv.FormatInt(n.cfg.nowFn().Unix(), 10)+"\n"); werr != nil {
-							slog.Warn("nethealth: egress "+
+							logger().Warn("nethealth: egress "+
 								"icmp-blocked marker write failed",
-								"subsystem", "nethealth",
 								"path", icmpBlk, "error", werr)
 						}
 						n.appendLog(fmt.Sprintf(
@@ -1301,10 +1307,10 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 						"to", r+"/32", "lookup", strconv.Itoa(table))
 				}
 				if aerr != nil {
-					slog.Warn("nethealth: probe-window rule "+
+					logger().Warn("nethealth: probe-window rule "+
 						"restore failed — relay rule left removed "+
 						"until next cycle's drift heal",
-						"subsystem", "nethealth", "relay", r,
+						"relay", r,
 						"table", table, "error", aerr)
 				}
 			}
@@ -1323,10 +1329,10 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 				if werr := writeFileAtomic(stf, probe+"\n"); werr != nil {
 					// Committed/live drift: the rule change below
 					// still runs; next cycle's heal converges.
-					slog.Warn("nethealth: egress state commit "+
+					logger().Warn("nethealth: egress state commit "+
 						"write failed — committed/live drift "+
 						"heals next cycle",
-						"subsystem", "nethealth", "relay", r,
+						"relay", r,
 						"path", stf, "error", werr)
 				}
 				if probe == "relay" {
@@ -1680,9 +1686,9 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 	// entering or clearing it on a guess.
 	exists, err := n.cfg.Systemd.Exists(ctx, "fail2ban.service")
 	if err != nil {
-		slog.Warn("nethealth: fail2ban existence probe failed — "+
+		logger().Warn("nethealth: fail2ban existence probe failed — "+
 			"treating unit as present this cycle (fail closed)",
-			"subsystem", "nethealth", "unit", "fail2ban.service",
+			"unit", "fail2ban.service",
 			"error", err)
 		exists = true
 	}
@@ -1692,9 +1698,9 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 	}
 	active, err := n.cfg.Systemd.Active(ctx, "fail2ban.service")
 	if err != nil {
-		slog.Warn("nethealth: fail2ban is-active probe failed — "+
+		logger().Warn("nethealth: fail2ban is-active probe failed — "+
 			"down-latch left unchanged this cycle (fail closed)",
-			"subsystem", "nethealth", "unit", "fail2ban.service",
+			"unit", "fail2ban.service",
 			"error", err)
 	} else if !active {
 		n.suspectLog("fail2ban-down",
@@ -1730,9 +1736,9 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 			st, err := n.cfg.runMountCmd(ctx,
 				[]string{"fail2ban-client", "status", j})
 			if err != nil {
-				slog.Warn("nethealth: fail2ban per-jail status "+
+				logger().Warn("nethealth: fail2ban per-jail status "+
 					"failed — banned count reported as 0",
-					"subsystem", "nethealth", "jail", j,
+					"jail", j,
 					"output", trimRunErr(st), "error", err)
 			} else if b := bannedRe.FindStringSubmatch(st); b != nil {
 				cnt = b[1]
@@ -1743,9 +1749,9 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 	if len(pairs) > 0 {
 		if err := writeFileAtomic(bannedFile,
 			strings.Join(pairs, " ")+"\n"); err != nil {
-			slog.Warn("nethealth: fail2ban banned-count write "+
+			logger().Warn("nethealth: fail2ban banned-count write "+
 				"failed — node_fail2ban_banned_ips stale this cycle",
-				"subsystem", "nethealth", "path", bannedFile,
+				"path", bannedFile,
 				"error", err)
 		}
 	} else {

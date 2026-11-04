@@ -87,7 +87,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -865,9 +864,9 @@ func (h *Hygiene) Run(ctx context.Context) {
 			// agent's recover only wraps Run itself, not
 			// goroutines Run spawned.
 			if r := recover(); r != nil {
-				slog.Error("workerhygiene: kubelet watchdog feeder "+
+				logger().Error("workerhygiene: kubelet watchdog feeder "+
 					"panicked — feeder dead until Run restart",
-					"subsystem", "workerhygiene", "panic", r)
+					"panic", r)
 			}
 		}()
 		h.runKubeletFeeder(fctx)
@@ -991,10 +990,9 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	workerActive := true
 	if h.cfg.Systemd != nil {
 		if active, err := h.cfg.Systemd.Active(ctx, "k0sworker.service"); err != nil {
-			slog.Warn("workerhygiene: k0sworker is-active probe "+
+			logger().Warn("workerhygiene: k0sworker is-active probe "+
 				"failed — worker checks gated off this cycle "+
 				"(fail closed)",
-				"subsystem", "workerhygiene",
 				"unit", "k0sworker.service", "error", err)
 			workerActive = false
 		} else {
@@ -1100,7 +1098,7 @@ func (h *Hygiene) listNodePods(ctx context.Context) ([]corev1.Pod, bool) {
 // plus a slog mirror for `kubectl logs` debugging. Best-effort: an
 // unwritable log file never fails a check.
 func (h *Hygiene) appendLog(msg string) {
-	slog.Info(msg, "subsystem", "workerhygiene")
+	logger().Info(msg)
 	f, err := os.OpenFile(h.cfg.WatchdogLogFile,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -1136,13 +1134,13 @@ func (h *Hygiene) stateEnter(name, extra string) {
 	// that then sits at 0 forever (seenStates never drops keys).
 	tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		slog.Warn("workerhygiene: state latch write failed",
-			"subsystem", "workerhygiene", "state", name, "path", p, "error", err)
+		logger().Warn("workerhygiene: state latch write failed",
+			"state", name, "path", p, "error", err)
 		return
 	}
 	if err := os.Rename(tmp, p); err != nil {
-		slog.Warn("workerhygiene: state latch write failed",
-			"subsystem", "workerhygiene", "state", name, "path", p, "error", err)
+		logger().Warn("workerhygiene: state latch write failed",
+			"state", name, "path", p, "error", err)
 		return
 	}
 	if extra != "" {
@@ -1160,8 +1158,8 @@ func (h *Hygiene) stateExit(name string) {
 		return
 	}
 	if err := os.Remove(p); err != nil {
-		slog.Warn("workerhygiene: state latch remove failed",
-			"subsystem", "workerhygiene", "state", name, "path", p, "error", err)
+		logger().Warn("workerhygiene: state latch remove failed",
+			"state", name, "path", p, "error", err)
 		return
 	}
 	h.appendLog(fmt.Sprintf("STATE-EXIT: %s", name))
@@ -1188,8 +1186,8 @@ func (h *Hygiene) rateSpend(name string) {
 	p := filepath.Join(h.cfg.WatchdogStateDir, name)
 	content := strconv.FormatInt(h.cfg.nowFn().Unix(), 10) + "\n"
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-		slog.Warn("workerhygiene: rate budget write failed",
-			"subsystem", "workerhygiene", "budget", name, "path", p, "error", err)
+		logger().Warn("workerhygiene: rate budget write failed",
+			"budget", name, "path", p, "error", err)
 	}
 }
 
@@ -3028,9 +3026,8 @@ func (h *Hygiene) kubeletFeedTick(ctx context.Context) {
 			// this tick entirely. Accumulating fails could escalate
 			// to remediation on an unverifiable worker state, while
 			// resetting them would discard real evidence.
-			slog.Warn("kubelet-feeder: k0sworker is-active probe "+
+			logger().Warn("kubelet-feeder: k0sworker is-active probe "+
 				"failed — skipping this tick (fail closed)",
-				"subsystem", "workerhygiene",
 				"unit", "k0sworker.service", "error", err)
 			return
 		}

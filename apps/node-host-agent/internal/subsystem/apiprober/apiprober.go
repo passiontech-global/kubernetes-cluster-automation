@@ -66,7 +66,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -552,15 +551,15 @@ func (p *Prober) refreshClient() {
 	}
 	cl, key, err := caClient(p.eff.caFile)
 	if err != nil {
-		slog.Error("apiprober: CA load failed — keeping previous TLS client",
-			"ca", p.eff.caFile, "error", err, "subsystem", "apiprober")
+		logger().Error("apiprober: CA load failed — keeping previous TLS client",
+			"ca", p.eff.caFile, "error", err)
 		return
 	}
 	if key != p.caKey {
 		p.client.CloseIdleConnections() // drop the rotated client's pool
 		p.client, p.caKey = cl, key
-		slog.Info("apiprober: rebuilt TLS client — effective CA changed",
-			"ca", p.eff.caFile, "subsystem", "apiprober")
+		logger().Info("apiprober: rebuilt TLS client — effective CA changed",
+			"ca", p.eff.caFile)
 	}
 }
 
@@ -693,9 +692,9 @@ func (p *Prober) discover(ctx context.Context) ([]backend, error) {
 				// cycle — the other servers still probe/drain
 				// normally (a stray server line is an ops config
 				// bug, not an apiserver outage).
-				slog.Warn("show stat: server has no addr column value and no API_BACKENDS match — skipping it",
+				logger().Warn("show stat: server has no addr column value and no API_BACKENDS match — skipping it",
 					"server", svname, "backend", p.eff.backend,
-					"subsystem", "apiprober")
+				)
 				continue
 			}
 		}
@@ -992,9 +991,9 @@ func mergeStatic(backends []backend, static []StaticBackend) []backend {
 		// anything that can't be a real backend name/addr.
 		if len(sb.Name) < 2 ||
 			strings.ContainsAny(sb.Name+sb.Addr, " \t'\"[]{}(),") {
-			slog.Warn("apiprober: skipping malformed API_BACKENDS entry",
+			logger().Warn("apiprober: skipping malformed API_BACKENDS entry",
 				"name", sb.Name, "addr", sb.Addr,
-				"subsystem", "apiprober")
+			)
 			continue
 		}
 		// Bare "ip:port" API_BACKENDS entries parse self-named
@@ -1055,9 +1054,9 @@ func (p *Prober) haproxyServer(ctx context.Context, action, name string,
 			if i == 0 {
 				return err
 			}
-			slog.Warn("haproxy companion backend command failed — tolerated",
+			logger().Warn("haproxy companion backend command failed — tolerated",
 				"command", action, "backend", be, "server", name,
-				"error", err, "subsystem", "apiprober")
+				"error", err)
 			continue
 		}
 		// "No such server" or permission errors come back as text —
@@ -1069,9 +1068,9 @@ func (p *Prober) haproxyServer(ctx context.Context, action, name string,
 		}
 		if i > 0 {
 			if !strings.Contains(s, "No such server") {
-				slog.Warn("haproxy companion backend rejected command — tolerated",
+				logger().Warn("haproxy companion backend rejected command — tolerated",
 					"command", action, "backend", be, "server", name,
-					"reply", s, "subsystem", "apiprober")
+					"reply", s)
 			}
 			continue
 		}
@@ -1134,9 +1133,9 @@ func writeFileAtomic(path string, data []byte) error {
 func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
 	f := dir + "/apibe-gap-" + dashedIP(b.Addr)
 	if err := writeFileAtomic(f, []byte(strconv.FormatInt(gap, 10)+"\n")); err != nil {
-		slog.Warn("watchdog gap file write failed",
+		logger().Warn("watchdog gap file write failed",
 			"file", f, "backend", b.Name, "error", err,
-			"subsystem", "apiprober")
+		)
 	}
 }
 
@@ -1149,9 +1148,9 @@ func (p *Prober) latchStale(dir string, b backend) {
 	}
 	if err := writeFileAtomic(f,
 		[]byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n")); err != nil {
-		slog.Warn("watchdog stale latch write failed",
+		logger().Warn("watchdog stale latch write failed",
 			"file", f, "backend", b.Name, "error", err,
-			"subsystem", "apiprober")
+		)
 	}
 }
 
@@ -1161,9 +1160,9 @@ func (p *Prober) latchStale(dir string, b backend) {
 func (p *Prober) clearStale(dir string, b backend) {
 	f := dir + "/state-apiserver-backend-stale-" + dashedIP(b.Addr)
 	if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
-		slog.Warn("watchdog stale latch remove failed",
+		logger().Warn("watchdog stale latch remove failed",
 			"file", f, "backend", b.Name, "error", err,
-			"subsystem", "apiprober")
+		)
 	}
 }
 
@@ -1182,8 +1181,8 @@ func (p *Prober) pruneWatchdogFiles(dir string, backends []backend) {
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		slog.Warn("watchdog state dir scan failed — stale files not pruned",
-			"dir", dir, "error", err, "subsystem", "apiprober")
+		logger().Warn("watchdog state dir scan failed — stale files not pruned",
+			"dir", dir, "error", err)
 		return
 	}
 	for _, e := range entries {
@@ -1199,9 +1198,9 @@ func (p *Prober) pruneWatchdogFiles(dir string, backends []backend) {
 		}
 		if !keep[suffix] {
 			if err := os.Remove(dir + "/" + name); err != nil {
-				slog.Warn("watchdog stale file prune failed",
+				logger().Warn("watchdog stale file prune failed",
 					"file", name, "dir", dir, "error", err,
-					"subsystem", "apiprober")
+				)
 			}
 		}
 	}
@@ -1234,9 +1233,9 @@ func (p *Prober) pruneStaleBackends(backends []backend) {
 		delete(p.states, name)
 		p.rvGap.DeleteLabelValues(name)
 		p.enabled.DeleteLabelValues(name)
-		slog.Info("apiprober: backend left HAProxy discovery — pruned "+
+		logger().Info("apiprober: backend left HAProxy discovery — pruned "+
 			"probe state and metric series",
-			"backend", name, "subsystem", "apiprober")
+			"backend", name)
 		// probeFailures/actions carry a second label (phase|action)
 		// — drop every series whose backend label matches.
 		p.probeFailures.DeletePartialMatch(prometheus.Labels{"backend": name})
@@ -1246,7 +1245,7 @@ func (p *Prober) pruneStaleBackends(backends []backend) {
 
 // Cycle runs one detection+guard round — the shell script body.
 func (p *Prober) Cycle(ctx context.Context) {
-	log := slog.With("subsystem", "apiprober")
+	log := logger()
 	start := time.Now()
 	defer func() { p.duration.Set(time.Since(start).Seconds()) }()
 
@@ -1796,15 +1795,15 @@ func (r *GuardReloader) Get() GuardDefaults {
 	if g, err := LoadGuardConf(r.Path); err == nil {
 		if r.loadErr {
 			r.loadErr = false
-			slog.Info("apiprober: guard conf readable again",
-				"path", r.Path, "subsystem", "apiprober")
+			logger().Info("apiprober: guard conf readable again",
+				"path", r.Path)
 		}
 		r.cur = g
 	} else if !r.loadErr {
 		r.loadErr = true
-		slog.Warn("apiprober: guard conf unreadable — keeping last "+
+		logger().Warn("apiprober: guard conf unreadable — keeping last "+
 			"good parse", "path", r.Path, "error", err,
-			"subsystem", "apiprober")
+		)
 	}
 	return r.cur
 }

@@ -47,7 +47,6 @@ package workerhygiene
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -332,7 +331,7 @@ func (j *Janitor) Sweep(ctx context.Context) {
 // appendLog mirrors workerhygiene's: "<rfc3339> <msg>" to the
 // watchdog log (NPD filelog contract) plus a slog mirror.
 func (j *Janitor) appendLog(msg string) {
-	slog.Info(msg, "subsystem", "janitor")
+	logger().Info(msg, "subsystem", "janitor")
 	f, err := os.OpenFile(j.cfg.WatchdogLogFile,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {

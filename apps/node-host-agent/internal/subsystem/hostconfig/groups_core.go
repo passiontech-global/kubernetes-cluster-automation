@@ -9,7 +9,6 @@ import (
 	"embed"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
 )
 
@@ -40,7 +40,7 @@ func (r *Reconciler) CycleWithErrors(ctx context.Context) int {
 	t, err := topology.Load(topology.Config{VarsDir: r.cfg.VarsDir, NodeName: r.cfg.NodeName, NowFn: r.cfg.NowFn})
 	if err != nil {
 		r.cycles.WithLabelValues("load", "error").Inc()
-		slog.Error("hostconfig: topology load failed",
+		logger().Error("hostconfig: topology load failed",
 			"varsDir", r.cfg.VarsDir, "node", r.cfg.NodeName, "error", err)
 		return 1
 	}
@@ -84,7 +84,7 @@ func (r *Reconciler) CycleWithErrors(ctx context.Context) int {
 	if c.errs == 0 {
 		r.lastOK.Set(float64(r.cfg.NowFn().Unix()))
 	}
-	slog.Info("hostconfig: cycle done",
+	logger().Info("hostconfig: cycle done",
 		"node", r.cfg.NodeName, "errors", c.errs,
 		"elapsed", time.Since(start).Round(time.Second).String())
 	return c.errs
@@ -95,6 +95,11 @@ type cyc struct {
 	ctx  context.Context
 	t    *topology.Topology
 	errs int // errors observed so far this cycle (all groups + vars)
+	// journaldRestarted is set by journaldStorage when it bounced
+	// systemd-journald this cycle (drop-in or journal-dir change) —
+	// journaldIntegrity's silent-journald remedy reads it so one
+	// converge never spends the restart budget on a second bounce.
+	journaldRestarted bool
 }
 
 // err logs at Error level AND marks the current cycle (and the group
@@ -103,7 +108,7 @@ type cyc struct {
 // exit code see it.
 func (c *cyc) err(msg string, args ...any) {
 	c.errs++
-	slog.Error(msg, args...)
+	logger().Error(msg, args...)
 }
 
 // group runs one converge group and records the outcome:
@@ -197,7 +202,7 @@ func (c *cyc) groupBase() {
 	lines := strings.Fields(out)
 	want := []string{c.sysctlVal("bbr_sysctls", 0), c.sysctlVal("bbr_sysctls", 1)}
 	if len(lines) < 2 || lines[0] != want[0] || lines[1] != want[1] {
-		slog.Warn("BBR/fq not effective — kernel values differ from rendered sysctls",
+		logger().Warn("BBR/fq not effective — kernel values differ from rendered sysctls",
 			"got", out, "want", strings.Join(want, " "))
 	}
 
@@ -220,7 +225,7 @@ TasksMax=infinity
 	if hostsErr != nil && !os.IsNotExist(hostsErr) {
 		// Best-effort pre-warning only — the writeManaged failure
 		// below is what counts the group error.
-		slog.Warn("base: cannot read /etc/hosts — hostname pin update will fail",
+		logger().Warn("base: cannot read /etc/hosts — hostname pin update will fail",
 			"error", hostsErr)
 	}
 	hn := c.r.cfg.NodeName
@@ -243,11 +248,22 @@ TasksMax=infinity
 		r.writeManaged("/etc/hosts", nh, 0o644)
 	}
 
+	// Journald persistence BEFORE the integrity probe: on standalone
+	// hosts the drop-in converge below is what guarantees the probe's
+	// silent-journald restart lands on Storage=persistent, and a
+	// drop-in/dir change already bounced journald this cycle
+	// (c.journaldRestarted) so the probe must not spend the restart
+	// budget a second time.
+	c.journaldPersistence()
+
 	// A5 (lightweight hostconfig half — workerhygiene owns the
 	// unit-scoped probe): journald integrity. A corrupt journal or an
 	// abnormally empty read while journal files exist on disk (post
 	// hard-reboot truncation) means logging is silently dead; rotate
-	// + vacuum so journald recovers.
+	// + vacuum so journald recovers. A journald producing NO files at
+	// all while a storage root exists (started before the dir
+	// appeared, or lost them under it) is restarted instead — the
+	// rotate remedy cannot create files.
 	c.journaldIntegrity()
 
 	// Self-stage the agent binary on the host for hostPath-mounted
@@ -261,63 +277,132 @@ TasksMax=infinity
 
 // journaldRotateCooldown caps how often journaldIntegrity may run
 // rotate+vacuum (last-journald-rotate latch in the watchdog state
-// dir — last-* names are janitor-safe).
-const journaldRotateCooldown = time.Hour
+// dir — last-* names are janitor-safe); journaldRestartCooldown is
+// the same budget for the silent-journald restart remedy
+// (last-journald-restart).
+const (
+	journaldRotateCooldown  = time.Hour
+	journaldRestartCooldown = time.Hour
+)
 
 // journaldIntegrity is the cheap journald probe groupBase runs every
-// cycle: `journalctl` reporting corruption, or returning nothing at
-// all while journal files are on disk, triggers a best-effort
-// `journalctl --rotate --vacuum-time=3d`. A missing journalctl or a
-// failed read without corruption markers is NOT treated as corrupt —
-// the tool may simply be absent (minimal image) and rotating would
-// fail anyway.
+// cycle. Three verdicts:
+//
+//   - CORRUPT — `journalctl` prints corruption markers, or returns
+//     nothing at all while journal files are on disk (post
+//     hard-reboot truncation). Remedy: `journalctl --rotate
+//     --vacuum-time=3d` so journald recovers (last-journald-rotate
+//     cooldown).
+//   - SILENT — journalctl reports "No journal files" or produces
+//     literally nothing while a journal storage root exists: journald
+//     is running but writing nowhere (started before /var/log/journal
+//     appeared, or lost its files under it — the cicd controller
+//     incident, an empty /var/log/journal/<machine-id> + "No journal
+//     files were found."). Rotate cannot create files; the remedy is
+//     `systemctl restart systemd-journald`, which journaldStorage
+//     has already pointed at persistent storage this cycle
+//     (last-journald-restart cooldown). The storage-root gate keeps
+//     journald-less minimal hosts out — there silence is
+//     configuration, not a fault.
+//
+// A missing journalctl or a failed read without corruption markers is
+// NEITHER — the tool may simply be absent (minimal image) and either
+// remedy would fail anyway.
 func (c *cyc) journaldIntegrity() {
 	r, ctx := c.r, c.ctx
-	out, err := r.run(ctx, "journalctl", "-n", "5", "-q", "--no-pager")
+	// No -q: --quiet suppresses "No journal files were found." — the
+	// incident signature the SILENT verdict needs (the notice is a
+	// journald diagnostic on stderr, folded into out by the Runner).
+	out, err := r.run(ctx, "journalctl", "-n", "5", "--no-pager")
 	low := strings.ToLower(out)
 	corrupt := strings.Contains(low, "corrupt") ||
 		strings.Contains(low, "invalid object") ||
 		strings.Contains(low, "failed to open journal")
-	if !corrupt && err == nil && strings.TrimSpace(out) == "" {
-		// Abnormally empty read: journal files exist on disk but the
-		// journal returns no entries at all.
-		for _, pat := range []string{
-			"/var/log/journal/*/*.journal*",
-			"/run/log/journal/*/*.journal*",
-		} {
-			if m, gerr := filepath.Glob(r.hp(pat)); gerr == nil && len(m) > 0 {
-				corrupt = true
-				break
-			}
+	empty := err == nil && strings.TrimSpace(out) == ""
+	files := false
+	for _, pat := range []string{
+		"/var/log/journal/*/*.journal*",
+		"/run/log/journal/*/*.journal*",
+	} {
+		if m, gerr := filepath.Glob(r.hp(pat)); gerr == nil && len(m) > 0 {
+			files = true
+			break
 		}
 	}
-	if !corrupt {
-		return
+	if empty && files {
+		// Abnormally empty read: journal files exist on disk but the
+		// journal returns no entries at all.
+		corrupt = true
 	}
-	// Cooldown latch like nethealth's last-* budgets: a persistently
-	// corrupt (or false-positive) probe would otherwise re-run
-	// rotate+vacuum — and re-fail — every cycle, pinning errs and
-	// hammering the journal on every converge. The last-* name is
-	// janitor-safe (only state-* latches are swept).
-	if !r.rateOK("last-journald-rotate", journaldRotateCooldown) {
-		slog.Warn("base: journald journal still corrupt — rotate+vacuum in cooldown, skipping",
-			"cooldown", journaldRotateCooldown.String())
-		return
+	// FilesGone counts even on a non-zero exit — the "No journal
+	// files" notice is positive evidence journald has no storage,
+	// unlike a bare exec failure. The empty-and-no-files half keeps
+	// the err==nil gate: a failed exec with empty output is the
+	// missing-binary case, not blindness.
+	silent := !corrupt && c.journalStoragePresent() &&
+		(journalwatch.FilesGone(out) || (empty && !files))
+	switch {
+	case corrupt:
+		// Cooldown latch like nethealth's last-* budgets: a persistently
+		// corrupt (or false-positive) probe would otherwise re-run
+		// rotate+vacuum — and re-fail — every cycle, pinning errs and
+		// hammering the journal on every converge. The last-* name is
+		// janitor-safe (only state-* latches are swept).
+		if !r.rateOK("last-journald-rotate", journaldRotateCooldown) {
+			logger().Warn("base: journald journal still corrupt — rotate+vacuum in cooldown, skipping",
+				"cooldown", journaldRotateCooldown.String())
+			return
+		}
+		logger().Warn("base: journald journal corrupt/abnormally empty — rotating + vacuuming",
+			"action", "journalctl --rotate --vacuum-time=3d",
+			"probe_out", out)
+		r.actions.WithLabelValues("journalctl --rotate --vacuum-time=3d").Inc()
+		// Spend on the attempt: a failing rotate retries next cycle no
+		// more than once per cooldown window.
+		r.ensureDir(watchdogStateDir, 0o755)
+		r.rateSpend("last-journald-rotate")
+		// runLong: vacuum of a multi-GB journal on a slow disk blows past
+		// the interactive command budget.
+		if vout, verr := r.runLong(ctx, "journalctl", "--rotate", "--vacuum-time=3d"); verr != nil {
+			c.err("base: journalctl rotate/vacuum failed",
+				"out", vout, "error", verr)
+		}
+	case silent:
+		if c.journaldRestarted {
+			// journaldStorage already bounced journald this cycle —
+			// give it the rest of the converge to open files; if the
+			// probe is still silent next cycle the remedy fires then
+			// (still inside the restart cooldown budget).
+			logger().Info("base: journald silent — already restarted by the persistence converge this cycle")
+			return
+		}
+		if !r.rateOK("last-journald-restart", journaldRestartCooldown) {
+			logger().Warn("base: journald still writing no journal files — restart in cooldown, skipping",
+				"cooldown", journaldRestartCooldown.String())
+			return
+		}
+		logger().Warn("base: journald writing no journal files though storage exists — restarting",
+			"action", "systemctl restart systemd-journald.service",
+			"probe_out", out)
+		// Spend on the attempt: a failing restart retries no more
+		// than once per cooldown window.
+		r.ensureDir(watchdogStateDir, 0o755)
+		r.rateSpend("last-journald-restart")
+		r.restartService(ctx, "systemd-journald.service")
 	}
-	slog.Warn("base: journald journal corrupt/abnormally empty — rotating + vacuuming",
-		"action", "journalctl --rotate --vacuum-time=3d",
-		"probe_out", out)
-	r.actions.WithLabelValues("journalctl --rotate --vacuum-time=3d").Inc()
-	// Spend on the attempt: a failing rotate retries next cycle no
-	// more than once per cooldown window.
-	r.ensureDir(watchdogStateDir, 0o755)
-	r.rateSpend("last-journald-rotate")
-	// runLong: vacuum of a multi-GB journal on a slow disk blows past
-	// the interactive command budget.
-	if vout, verr := r.runLong(ctx, "journalctl", "--rotate", "--vacuum-time=3d"); verr != nil {
-		c.err("base: journalctl rotate/vacuum failed",
-			"out", vout, "error", verr)
+}
+
+// journalStoragePresent mirrors journalwatch.Tracker.Present for the
+// HostRoot view: true while /var/log/journal or /run/log/journal
+// exists — the "journald should be writing" witness that gates the
+// SILENT verdict.
+func (c *cyc) journalStoragePresent() bool {
+	for _, d := range []string{"/var/log/journal", "/run/log/journal"} {
+		if fi, err := os.Stat(c.r.hp(d)); err == nil && fi.IsDir() {
+			return true
+		}
 	}
+	return false
 }
 
 // selfStageBinary mirrors the RUNNING agent binary out to the host's
@@ -361,7 +446,7 @@ func (c *cyc) selfStageBinary() {
 	if _, err := r.writeManaged(dst, srcb, 0o755); err != nil {
 		// writeManaged already counted the failure via noteErr —
 		// log context only, do not count the same fault twice.
-		slog.Error("self-stage: install agent binary on host failed",
+		logger().Error("self-stage: install agent binary on host failed",
 			"path", dst, "error", err)
 		return
 	}
@@ -456,7 +541,7 @@ func (c *cyc) groupNLD() {
 	} else {
 		// Best-effort detection — a failed probe leaves
 		// stubListening=false and the rest of T4 still converges.
-		slog.Warn("T4: ss -lntu failed — cannot detect resolved stub listener; continuing",
+		logger().Warn("T4: ss -lntu failed — cannot detect resolved stub listener; continuing",
 			"error", err)
 	}
 	if c.resolvedRunning() {
@@ -560,7 +645,7 @@ func (c *cyc) checkedDeploy(path string, content []byte, mode os.FileMode, errMs
 		// Cheap sweep, ENOENT ignored — a candidate orphaned between
 		// stage and promote must not linger next to the live file.
 		if err := os.Remove(r.hp(path + ".candidate")); err != nil && !os.IsNotExist(err) {
-			slog.Warn("hostconfig: stale candidate sweep failed",
+			logger().Warn("hostconfig: stale candidate sweep failed",
 				"path", path+".candidate", "error", err)
 		}
 		return false, true
@@ -682,7 +767,7 @@ func (c *cyc) groupNebula() {
 				// An unreadable hit must NOT shadow the VarsDir
 				// fallback — keep looking; if nothing reads, the
 				// missing-cert error below counts the group.
-				slog.Warn("T5b: cert file unreadable — trying fallback dir",
+				logger().Warn("T5b: cert file unreadable — trying fallback dir",
 					"path", p, "error", err)
 				continue
 			}
@@ -842,7 +927,7 @@ func (c *cyc) nebulaInstallBinary() {
 		// Best-effort companion binary — the nebula binary itself is
 		// installed above; a missing key only errors when keygen is
 		// actually needed (counted at the keygen call site).
-		slog.Warn("T5b: nebula-cert install failed — keygen unavailable",
+		logger().Warn("T5b: nebula-cert install failed — keygen unavailable",
 			"file", local, "error", err)
 	}
 }
@@ -1111,18 +1196,18 @@ func (c *cyc) nebulaRouting() {
 		for _, tgt := range t.Targets {
 			out, err := r.run(ctx, "ip", "-o", "route", "get", tgt, "mark", "0x1000")
 			if err != nil {
-				slog.Debug("T5b/hub: hairpin probe failed — skipping target",
+				logger().Debug("T5b/hub: hairpin probe failed — skipping target",
 					"target", tgt, "error", err)
 				continue
 			}
 			m := hairpinViaRe.FindStringSubmatch(out)
 			if m != nil && meshIPs[m[1]] {
-				slog.Info("T5b/hub: pruning hairpin route via mesh IP",
+				logger().Info("T5b/hub: pruning hairpin route via mesh IP",
 					"target", tgt, "via", m[1])
 				if _, err := r.run(ctx, "ip", "route", "del", tgt+"/32", "table", "main"); err != nil {
 					// Best-effort prune — the live ip-rule converge
 					// below still routes the target correctly.
-					slog.Warn("T5b/hub: hairpin route delete failed",
+					logger().Warn("T5b/hub: hairpin route delete failed",
 						"target", tgt, "error", err)
 				}
 			}
@@ -1360,7 +1445,7 @@ func (c *cyc) groupWatchdog() {
 	} else {
 		// Best-effort compat file — the Go subsystems write state
 		// latches, not this log; a create failure is not counted.
-		slog.Warn("watchdog: cannot create log file — state consumers may miss it",
+		logger().Warn("watchdog: cannot create log file — state consumers may miss it",
 			"path", "/var/log/node-watchdog.log", "error", err)
 	}
 	r.ensureDir("/var/lib/node-exporter/textfile", 0o755)
@@ -1437,7 +1522,7 @@ func strListVar(c *cyc, name string) []string {
 		if !garbage {
 			return out
 		}
-		slog.Debug("watchdog: var list looked char-split — reparsing as scalar",
+		logger().Debug("watchdog: var list looked char-split — reparsing as scalar",
 			"var", name)
 	}
 	raw := c.v(name)
@@ -1557,7 +1642,7 @@ func (c *cyc) pruneLegacyWatchdog() {
 	if err := os.RemoveAll(r.hp("/usr/local/lib/node-watchdog")); err != nil {
 		// Best-effort sweep of retired files — leftover shell libs
 		// are inert, so a failed prune only warns.
-		slog.Warn("prune watchdog lib dir failed",
+		logger().Warn("prune watchdog lib dir failed",
 			"path", "/usr/local/lib/node-watchdog", "error", err)
 	}
 	if removed {

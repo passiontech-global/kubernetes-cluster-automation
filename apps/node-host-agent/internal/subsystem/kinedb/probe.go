@@ -32,7 +32,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -257,10 +256,10 @@ func (k *KineDB) probeCycle(ctx context.Context) *probeResult {
 		res.checks[checkRevision], intOrNA(res.revSeen, res.head),
 		intOrNA(res.revSeen, res.compact), intOrNA(res.revSeen, res.liveTup))
 	if res.succeeded {
-		slog.Info("kine-db-probe OK: " + sum)
+		logger().Info("kine-db-probe OK: " + sum)
 		k.m.cycles.WithLabelValues("probe", "ok").Inc()
 	} else {
-		slog.Warn("kine-db-probe FAIL: "+sum, "notes", strings.Join(res.notes, " "))
+		logger().Warn("kine-db-probe FAIL: "+sum, "notes", strings.Join(res.notes, " "))
 		k.m.cycles.WithLabelValues("probe", "fail").Inc()
 	}
 	return res
@@ -383,7 +382,7 @@ func (k *KineDB) probeLogScan(ctx context.Context, pgb string,
 		// the check at 0 and exclude it from `succeeded` so a scan
 		// failure is not mistaken for real evidence either way.
 		note(fmt.Sprintf("log-scan-fail: %v", lerr))
-		slog.Warn("kinedb pgbouncer log scan failed — log_errors check is inconclusive",
+		logger().Warn("kinedb pgbouncer log scan failed — log_errors check is inconclusive",
 			"container", pgb, "error", lerr)
 		return
 	}

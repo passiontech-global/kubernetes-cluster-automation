@@ -45,7 +45,6 @@ package sweeper
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"regexp"
 	"strings"
@@ -299,7 +298,7 @@ func (s *Sweeper) apiCtx(ctx context.Context) (context.Context, context.CancelFu
 // counted under skips{reason} and logged; the cycle result lands on
 // cycles{result}.
 func (s *Sweeper) Sweep(ctx context.Context) {
-	log := slog.With("subsystem", "sweeper")
+	log := logger()
 	start := s.cfg.nowFn()
 	defer func() { s.duration.Set(s.cfg.nowFn().Sub(start).Seconds()) }()
 

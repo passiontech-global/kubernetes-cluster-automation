@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -85,7 +84,7 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 	index, err := c.fetchIndex(ctx)
 	if err != nil {
 		if c.index != nil {
-			slog.Warn("resource index refresh failed — serving stale",
+			logger().Warn("resource index refresh failed — serving stale",
 				"concourse_url", c.BaseURL, "team", c.Team,
 				"error", err)
 			return c.index, nil
@@ -138,7 +137,7 @@ func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 		path := "pipelines/" + url.PathEscape(p.Name) + "/resources"
 		if err := c.getJSON(ctx, c.apiPath(path), &resources); err != nil {
 			// One unreadable pipeline must not lose the whole index.
-			slog.Warn("pipeline resource listing failed — skipped",
+			logger().Warn("pipeline resource listing failed — skipped",
 				"concourse_url", c.BaseURL, "team", c.Team,
 				"pipeline", p.Name, "error", err)
 			continue
@@ -161,7 +160,7 @@ func (c *Client) fetchIndex(ctx context.Context) ([]Resource, error) {
 		// "fetched" for the TTL check and the stale fallback.
 		index = []Resource{}
 	}
-	slog.Info("resource index refreshed",
+	logger().Info("resource index refreshed",
 		"concourse_url", c.BaseURL, "team", c.Team,
 		"pipelines", len(pipelines), "resources", len(index),
 		"duration", time.Since(start).Round(time.Millisecond))

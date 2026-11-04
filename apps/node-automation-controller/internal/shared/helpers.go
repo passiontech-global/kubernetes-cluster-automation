@@ -40,6 +40,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -73,6 +74,19 @@ func (p *Periodic) Start(ctx context.Context) error {
 		return fmt.Errorf("periodic %q: interval must be > 0, got %s",
 			p.Name, p.Interval)
 	}
+	// Inject the named logger into the ctx fn sees: modules log via
+	// logf.FromContext(ctx), which on the raw manager ctx returns the
+	// UNNAMED root logger — every run log line would lack the
+	// "logger":"<queue>" field reconcilers get for free. A Periodic
+	// built by hand (not via AddPeriodic) may carry a zero-value Log;
+	// fall back to naming whatever the ctx already has so the run log
+	// and the error log below stay named rather than silently
+	// discarding.
+	log := p.Log
+	if log.GetSink() == nil {
+		log = logf.FromContext(ctx).WithName(p.Name)
+	}
+	runCtx := logf.IntoContext(ctx, log)
 	// De-phase the sweep modules: every AddPeriodic caller begins at
 	// the same startup moment, so identical NewTicker intervals would
 	// fire all modules on the same wall-clock minute — a thundering
@@ -95,9 +109,9 @@ func (p *Periodic) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
-			if err := p.Fn(ctx); err != nil {
+			if err := p.Fn(runCtx); err != nil {
 				metrics.IncError(p.Name)
-				p.Log.Error(err, "periodic run failed")
+				log.Error(err, "periodic run failed")
 			}
 		}
 	}

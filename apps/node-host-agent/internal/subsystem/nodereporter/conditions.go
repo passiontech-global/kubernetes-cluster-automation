@@ -12,7 +12,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -200,7 +199,7 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 		types.StrategicMergePatchType, payload, metav1.PatchOptions{}, "status"); err != nil {
 		return fmt.Errorf("patch node %s status: %w", r.cfg.NodeName, err)
 	}
-	slog.Info("nodereporter: node conditions updated",
+	logger().Info("nodereporter: node conditions updated",
 		"node", r.cfg.NodeName, "changed", changedList)
 	return nil
 }

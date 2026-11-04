@@ -27,7 +27,6 @@ package kinedb
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -197,10 +196,10 @@ func (k *KineDB) guardCycle(ctx context.Context) *guardResult {
 		res.head, res.compact, res.rows, res.frozen, res.fired,
 		reasonOrDash(res.reason), res.deleted, intOrNA(res.revSeen, res.revAfter))
 	if res.ok {
-		slog.Info("kine-compact-guard OK: " + sum)
+		logger().Info("kine-compact-guard OK: " + sum)
 		k.m.cycles.WithLabelValues("compact-guard", "ok").Inc()
 	} else {
-		slog.Warn("kine-compact-guard FAIL: "+sum, "notes", strings.Join(res.notes, " "))
+		logger().Warn("kine-compact-guard FAIL: "+sum, "notes", strings.Join(res.notes, " "))
 		k.m.cycles.WithLabelValues("compact-guard", "fail").Inc()
 	}
 	return res

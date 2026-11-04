@@ -48,7 +48,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -216,7 +215,7 @@ func (r *Reporter) matchEventRules(ctx context.Context, rules []logRule, msg str
 		}
 		r.problemCounter.WithLabelValues(rule.reason).Inc()
 		if err := r.emitEvent(ctx, rule.reason, msg); err != nil {
-			slog.Error("nodereporter: event emit failed",
+			logger().Error("nodereporter: event emit failed",
 				"reason", rule.reason, "error", err)
 		}
 	}
@@ -354,7 +353,7 @@ func (r *Reporter) kernelLines(ctx context.Context) ([]kernelLine, bool, error) 
 			r.kmsgScanned = false // fresh handle → backlog replays via lookback
 			if r.kmsgSrc == nil {
 				r.kmsgJournalMode = true
-				slog.Warn("nodereporter: /dev/kmsg unreadable, kernel monitor "+
+				logger().Warn("nodereporter: /dev/kmsg unreadable, kernel monitor "+
 					"falls back to journalctl -k for the process lifetime",
 					"kmsg", r.cfg.KmsgFile, "hostRoot", r.cfg.HostRoot)
 				continue
@@ -451,7 +450,7 @@ func (r *Reporter) processKernelLine(ctx context.Context, msg string) {
 			r.kernelDeadlock = true
 			r.kernelDeadlockMsg = msg
 			if err := r.emitEvent(ctx, kernelDeadlockProblemReason, msg); err != nil {
-				slog.Error("nodereporter: event emit failed",
+				logger().Error("nodereporter: event emit failed",
 					"reason", kernelDeadlockProblemReason, "error", err)
 			}
 		}
@@ -526,7 +525,7 @@ func (r *Reporter) syncReadonlyMounts(ctx context.Context) error {
 		r.readonlyFSMsg = "read-only filesystems: " + strings.Join(ro, ", ")
 		if !was {
 			if err := r.emitEvent(ctx, readonlyProblemReason, r.readonlyFSMsg); err != nil {
-				slog.Error("nodereporter: event emit failed",
+				logger().Error("nodereporter: event emit failed",
 					"reason", readonlyProblemReason, "error", err)
 			}
 		}
@@ -637,7 +636,7 @@ func (r *Reporter) syncNPDConditions(ctx context.Context) error {
 		types.StrategicMergePatchType, payload, metav1.PatchOptions{}, "status"); err != nil {
 		return fmt.Errorf("patch node %s status: %w", r.cfg.NodeName, err)
 	}
-	slog.Info("nodereporter: npd node conditions updated",
+	logger().Info("nodereporter: npd node conditions updated",
 		"node", r.cfg.NodeName, "changed", changedList)
 	return nil
 }

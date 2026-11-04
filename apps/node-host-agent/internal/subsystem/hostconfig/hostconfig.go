@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log/slog"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -107,7 +106,7 @@ func (w *DirWatcher) fingerprint() string {
 	for _, d := range w.Dirs {
 		_ = filepath.WalkDir(d, func(p string, e fs.DirEntry, err error) error {
 			if err != nil {
-				slog.Debug("hostconfig: watcher walk error — entry skipped",
+				logger().Debug("hostconfig: watcher walk error — entry skipped",
 					"dir", d, "path", p, "error", err)
 				return nil
 			}
@@ -121,7 +120,7 @@ func (w *DirWatcher) fingerprint() string {
 	for _, f := range files {
 		b, err := os.ReadFile(f)
 		if err != nil {
-			slog.Debug("hostconfig: watcher cannot read file — excluded from fingerprint",
+			logger().Debug("hostconfig: watcher cannot read file — excluded from fingerprint",
 				"file", f, "error", err)
 			continue
 		}
@@ -352,8 +351,8 @@ func (r *Reconciler) Run(ctx context.Context) {
 			r.Cycle(ctx)
 		case <-p.C:
 			if r.cfg.Watcher != nil && r.cfg.Watcher.Changed() {
-				slog.Info("hostconfig: vars/certs changed — converging",
-					"subsystem", "hostconfig", "node", r.cfg.NodeName)
+				logger().Info("hostconfig: vars/certs changed — converging",
+					"node", r.cfg.NodeName)
 				r.Cycle(ctx)
 			}
 		}
@@ -387,7 +386,7 @@ func (r *Reconciler) runBudget(ctx context.Context, budget time.Duration, name s
 	defer cancel()
 	out, err := r.cfg.Runner.Run(cctx, name, args...)
 	if err != nil {
-		slog.Debug("hostconfig: host command failed",
+		logger().Debug("hostconfig: host command failed",
 			"cmd", name+" "+strings.Join(args, " "), "out", out, "error", err)
 	}
 	return out, err
@@ -408,12 +407,12 @@ func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode)
 			mode = st.Mode().Perm()
 		}
 	} else if !os.IsNotExist(err) {
-		slog.Warn("hostconfig: read managed file failed", "path", path, "error", err)
+		logger().Warn("hostconfig: read managed file failed", "path", path, "error", err)
 		r.noteErr(err)
 		return false, err
 	}
 	fail := func(err error) (bool, error) {
-		slog.Warn("hostconfig: write managed file failed", "path", path, "error", err)
+		logger().Warn("hostconfig: write managed file failed", "path", path, "error", err)
 		r.noteErr(err)
 		return false, err
 	}
@@ -461,7 +460,7 @@ func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode)
 		_ = d.Close()
 	}
 	r.writes.WithLabelValues(path).Inc()
-	slog.Info("hostconfig: wrote managed file", "path", path)
+	logger().Info("hostconfig: wrote managed file", "path", path)
 	return true, nil
 }
 
@@ -470,29 +469,29 @@ func (r *Reconciler) removeManaged(path string) (bool, error) {
 	fi, err := os.Lstat(dst)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			slog.Warn("hostconfig: remove stat failed — treating as absent",
+			logger().Warn("hostconfig: remove stat failed — treating as absent",
 				"path", path, "error", err)
 		}
 		return false, nil
 	}
 	if fi.IsDir() {
-		slog.Warn("hostconfig: remove refused — path is a dir", "path", path)
+		logger().Warn("hostconfig: remove refused — path is a dir", "path", path)
 		err := fmt.Errorf("removeManaged: %s is a dir", path)
 		r.noteErr(err)
 		return false, err
 	}
 	if err := os.Remove(dst); err != nil {
-		slog.Warn("hostconfig: remove file failed", "path", path, "error", err)
+		logger().Warn("hostconfig: remove file failed", "path", path, "error", err)
 		r.noteErr(err)
 		return false, err
 	}
-	slog.Info("hostconfig: removed file", "path", path)
+	logger().Info("hostconfig: removed file", "path", path)
 	return true, nil
 }
 
 func (r *Reconciler) ensureDir(path string, mode os.FileMode) error {
 	if err := os.MkdirAll(r.hp(path), mode); err != nil {
-		slog.Warn("hostconfig: ensure dir failed", "path", path, "error", err)
+		logger().Warn("hostconfig: ensure dir failed", "path", path, "error", err)
 		r.noteErr(err)
 		return err
 	}
@@ -538,7 +537,7 @@ func (r *Reconciler) rateSpend(name string) {
 	// leading dot keeps the tmp out of hostmetrics' state-* scan.
 	tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		slog.Warn("hostconfig: rate budget write failed",
+		logger().Warn("hostconfig: rate budget write failed",
 			"budget", name, "path", p, "error", err)
 		return
 	}
@@ -546,7 +545,7 @@ func (r *Reconciler) rateSpend(name string) {
 		// Sweep the staging file — a stranded .tmp-* must not linger
 		// in the state dir after a failed promote.
 		os.Remove(tmp)
-		slog.Warn("hostconfig: rate budget install failed",
+		logger().Warn("hostconfig: rate budget install failed",
 			"budget", name, "path", p, "error", err)
 	}
 }
@@ -574,7 +573,7 @@ func (r *Reconciler) render(name string, ctx map[string]any) ([]byte, error) {
 func (r *Reconciler) daemonReload(ctx context.Context) {
 	r.actions.WithLabelValues("daemon-reload").Inc()
 	if _, err := r.run(ctx, "systemctl", "daemon-reload"); err != nil {
-		slog.Warn("hostconfig: daemon-reload failed", "error", err)
+		logger().Warn("hostconfig: daemon-reload failed", "error", err)
 		r.noteErr(err)
 	}
 }
@@ -604,7 +603,7 @@ func (r *Reconciler) ensureService(ctx context.Context, unit string, enable, sta
 func (r *Reconciler) enableService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("enable:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "enable", unit); err != nil {
-		slog.Warn("hostconfig: enable failed", "unit", unit, "error", err)
+		logger().Warn("hostconfig: enable failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
 }
@@ -612,7 +611,7 @@ func (r *Reconciler) enableService(ctx context.Context, unit string) {
 func (r *Reconciler) startService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("start:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "start", unit); err != nil {
-		slog.Warn("hostconfig: start failed", "unit", unit, "error", err)
+		logger().Warn("hostconfig: start failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
 }
@@ -620,7 +619,7 @@ func (r *Reconciler) startService(ctx context.Context, unit string) {
 func (r *Reconciler) stopService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("stop:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "stop", unit); err != nil {
-		slog.Warn("hostconfig: stop failed", "unit", unit, "error", err)
+		logger().Warn("hostconfig: stop failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
 }
@@ -628,7 +627,7 @@ func (r *Reconciler) stopService(ctx context.Context, unit string) {
 func (r *Reconciler) restartService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("restart:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "restart", unit); err != nil {
-		slog.Warn("hostconfig: restart failed", "unit", unit, "error", err)
+		logger().Warn("hostconfig: restart failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
 }
@@ -636,7 +635,7 @@ func (r *Reconciler) restartService(ctx context.Context, unit string) {
 func (r *Reconciler) reloadService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("reload:" + unit).Inc()
 	if _, err := r.run(ctx, "systemctl", "reload", unit); err != nil {
-		slog.Warn("hostconfig: reload failed", "unit", unit, "error", err)
+		logger().Warn("hostconfig: reload failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
 }

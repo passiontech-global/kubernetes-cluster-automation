@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"regexp"
 	"slices"
@@ -146,7 +145,7 @@ func (r *Reporter) readNewLogLines() ([][]byte, bool, error) {
 		return nil, replay, fmt.Errorf("stat %s: %w", r.cfg.WatchdogLogFile, err)
 	}
 	if fi.Size() < r.logOffset {
-		slog.Debug("nodereporter: watchdog log shrank — offset reset, "+
+		logger().Debug("nodereporter: watchdog log shrank — offset reset, "+
 			"rescanning retained tail through the lookback filter",
 			"file", r.cfg.WatchdogLogFile,
 			"oldOffset", r.logOffset, "size", fi.Size())
@@ -269,7 +268,7 @@ func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool)
 		if err := r.emitEvent(ctx, rule.reason, msg); err != nil {
 			// Logged, not fatal — the counter already reflects the
 			// match and the next identical line retries the Event.
-			slog.Error("nodereporter: event emit failed",
+			logger().Error("nodereporter: event emit failed",
 				"reason", rule.reason, "error", err)
 		}
 	}
@@ -351,7 +350,7 @@ func (r *Reporter) emitEvent(ctx context.Context, reason, note string) error {
 		return fmt.Errorf("create event %s/%s: %w", r.cfg.EventNamespace, name, err)
 	}
 	r.emittedEvts[key] = &emittedEvent{name: created.Name, count: 1, at: now}
-	slog.Info("nodereporter: event emitted",
+	logger().Info("nodereporter: event emitted",
 		"node", r.cfg.NodeName, "event", created.Name,
 		"namespace", r.cfg.EventNamespace, "reason", reason)
 	return nil

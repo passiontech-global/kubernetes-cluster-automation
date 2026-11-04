@@ -229,7 +229,7 @@ func envDuration(key string, def time.Duration) time.Duration {
 		// Neither shape parsed — warn like the ≤0 path does: a typo'd
 		// knob silently pinned to the default is impossible to spot
 		// from the outside.
-		slog.Warn("unparseable env duration ignored — using default",
+		logger().Warn("unparseable env duration ignored — using default",
 			"env", key, "value", v, "default", def)
 		return def
 	}
@@ -237,7 +237,7 @@ func envDuration(key string, def time.Duration) time.Duration {
 		// A ≤0 interval would panic time.NewTicker inside the
 		// subsystem and crash-loop the daemon — warn and keep the
 		// default instead.
-		slog.Warn("non-positive env duration ignored — using default",
+		logger().Warn("non-positive env duration ignored — using default",
 			"env", key, "value", v, "default", def)
 		return def
 	}
@@ -446,7 +446,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 		hostPath("/etc/node-watchdog.conf"))
 	wdCfg, err := watchdogconf.Load(wdConfPath)
 	if err != nil {
-		slog.Error("watchdog conf parse failed — running on defaults",
+		logger().Error("watchdog conf parse failed — running on defaults",
 			"path", wdConfPath, "error", err)
 		wdCfg, _ = watchdogconf.Parse(nil)
 	}
@@ -513,7 +513,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 		if err != nil {
 			// Not fatal: the metrics/probe endpoints and other
 			// subsystems still serve; the sweeper simply does not run.
-			slog.Error("sweeper disabled: cannot build kubernetes client", "error", err)
+			logger().Error("sweeper disabled: cannot build kubernetes client", "error", err)
 		} else {
 			sw, err := sweeper.New(sweeper.Config{
 				BaseDir:        getenv("NODE_HOST_AGENT_SWEEP_BASE_DIR", "/var/openebs/local"),
@@ -525,7 +525,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 				Client:         cs,
 			}, reg)
 			if err != nil {
-				slog.Error("sweeper setup failed", "error", err)
+				logger().Error("sweeper setup failed", "error", err)
 			} else {
 				subsystems = append(subsystems, sw)
 			}
@@ -539,7 +539,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 	if envBool("NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE", defKube) {
 		pr, err := sweeper.NewConcourseCachePruner(sweeper.ConcourseCacheConfig{}, reg)
 		if err != nil {
-			slog.Error("concourse-cache pruner setup failed", "error", err)
+			logger().Error("concourse-cache pruner setup failed", "error", err)
 		} else {
 			cacheRoot := getenv("NODE_HOST_AGENT_SWEEP_BASE_DIR", "/var/openebs/local")
 			subsystems = append(subsystems, periodic{
@@ -547,7 +547,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 				interval: envDuration("NODE_HOST_AGENT_CONCOURSE_CACHE_INTERVAL", sweeper.DefaultConcourseCacheInterval),
 				fn: func(ctx context.Context) {
 					if err := pr.Sweep(ctx, cacheRoot); err != nil {
-						slog.Error("concourse cache sweep failed", "error", err)
+						logger().Error("concourse cache sweep failed", "error", err)
 					}
 				},
 			})
@@ -568,7 +568,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 		"/etc/api-backend-guard.conf")
 	guardConf, gerr := apiprober.LoadGuardConf(guardConfPath)
 	if gerr != nil {
-		slog.Error("api-backend-guard.conf parse failed — running on defaults",
+		logger().Error("api-backend-guard.conf parse failed — running on defaults",
 			"path", guardConfPath, "error", gerr)
 		guardConf = apiprober.GuardDefaults{}
 	}
@@ -605,7 +605,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			WatchdogSrc:      wdReloader,
 		}, reg)
 		if err != nil {
-			slog.Error("apiprober setup failed", "error", err)
+			logger().Error("apiprober setup failed", "error", err)
 		} else {
 			subsystems = append(subsystems, pb)
 		}
@@ -645,7 +645,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 					30*time.Second),
 				fn: func(ctx context.Context) {
 					if err := hm.WriteTextfile(textfileDir); err != nil {
-						slog.Error("hostmetrics textfile write failed",
+						logger().Error("hostmetrics textfile write failed",
 							"dir", textfileDir, "error", err)
 					}
 				},
@@ -662,12 +662,12 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 		// the downward API — prefer the explicit override env.
 		switch {
 		case hnode == "":
-			slog.Error("workerhygiene disabled: node name empty " +
+			logger().Error("workerhygiene disabled: node name empty " +
 				"(NODE_HOST_AGENT_NODE_NAME/NODE_NAME unset)")
 		default:
 			cs, err := csOnce()
 			if err != nil {
-				slog.Error("workerhygiene disabled: cannot build kubernetes client",
+				logger().Error("workerhygiene disabled: cannot build kubernetes client",
 					"error", err)
 			} else {
 				wh, err := workerhygiene.New(workerhygiene.Config{
@@ -702,7 +702,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 					Client:                  cs,
 				}, reg)
 				if err != nil {
-					slog.Error("workerhygiene setup failed", "error", err)
+					logger().Error("workerhygiene setup failed", "error", err)
 				} else {
 					subsystems = append(subsystems, wh)
 				}
@@ -731,7 +731,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			MinRestart:       envDuration("NODE_HOST_AGENT_NETHEALTH_MIN_RESTART", 30*time.Minute),
 		}, reg)
 		if err != nil {
-			slog.Error("nethealth setup failed", "error", err)
+			logger().Error("nethealth setup failed", "error", err)
 		} else {
 			subsystems = append(subsystems, nh)
 		}
@@ -753,7 +753,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			Systemd:          sdClient,
 		}, reg)
 		if err != nil {
-			slog.Error("janitor setup failed", "error", err)
+			logger().Error("janitor setup failed", "error", err)
 		} else {
 			subsystems = append(subsystems, jn)
 		}
@@ -765,12 +765,12 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 	if envBool("NODE_HOST_AGENT_ENABLE_REPORTER", defKube) {
 		switch {
 		case hnode == "":
-			slog.Error("nodereporter disabled: node name empty " +
+			logger().Error("nodereporter disabled: node name empty " +
 				"(NODE_HOST_AGENT_NODE_NAME/NODE_NAME unset)")
 		default:
 			cs, err := csOnce()
 			if err != nil {
-				slog.Error("nodereporter disabled: cannot build kubernetes client",
+				logger().Error("nodereporter disabled: cannot build kubernetes client",
 					"error", err)
 			} else {
 				nr, err := nodereporter.New(nodereporter.Config{
@@ -782,7 +782,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 					EventNamespace:   getenv("NODE_HOST_AGENT_EVENT_NAMESPACE", "default"),
 				}, reg)
 				if err != nil {
-					slog.Error("nodereporter setup failed", "error", err)
+					logger().Error("nodereporter setup failed", "error", err)
 				} else {
 					subsystems = append(subsystems, nr)
 				}
@@ -858,7 +858,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			JournalUnreadableNeeded: journalUnreadableNeeded,
 		}, reg)
 		if err != nil {
-			slog.Error("controllerhygiene setup failed", "error", err)
+			logger().Error("controllerhygiene setup failed", "error", err)
 		} else {
 			subsystems = append(subsystems, ch)
 		}
@@ -894,7 +894,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 			}},
 		}, reg)
 		if err != nil {
-			slog.Error("hostconfig setup failed", "error", err)
+			logger().Error("hostconfig setup failed", "error", err)
 		} else {
 			subsystems = append(subsystems, hc)
 		}
@@ -912,15 +912,15 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 	if !standalone {
 		switch {
 		case podName == "":
-			slog.Error("hubsync disabled: pod name empty (POD_NAME unset)")
+			logger().Error("hubsync disabled: pod name empty (POD_NAME unset)")
 		default:
 			cs, err := csOnce()
 			if err != nil {
-				slog.Error("hubsync disabled: cannot build kubernetes client",
+				logger().Error("hubsync disabled: cannot build kubernetes client",
 					"error", err)
 			} else {
 				if !hubsync.Enabled(convergeKey) {
-					slog.Info("hubsync: converge key not mounted yet — polling until it appears",
+					logger().Info("hubsync: converge key not mounted yet — polling until it appears",
 						"path", convergeKey)
 				}
 				hs, err := hubsync.New(hubsync.Config{
@@ -932,7 +932,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 					LocalBinary:    resolveLocalBinary(),
 				}, reg)
 				if err != nil {
-					slog.Error("hubsync setup failed", "error", err)
+					logger().Error("hubsync setup failed", "error", err)
 				} else {
 					subsystems = append(subsystems, hs)
 				}
@@ -954,7 +954,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 				hostPath("/var/lib/kine-compact-guard")),
 		}, reg)
 		if err != nil {
-			slog.Error("kinedb setup failed", "error", err)
+			logger().Error("kinedb setup failed", "error", err)
 		} else {
 			subsystems = append(subsystems, kd)
 		}
@@ -1023,13 +1023,13 @@ func main() {
 	for _, s := range cfg.Subsystems {
 		subsystems = append(subsystems, s.Name())
 	}
-	slog.Info("starting node-host-agent",
+	logger().Info("starting node-host-agent",
 		"version", version, "node", a.NodeName(), "pod", podName,
 		"standalone", standaloneFlag, "metricsAddr", metricsAddr,
 		"probeAddr", probeAddr, "subsystems", subsystems,
 		"apiprober", apiproberEnabled)
 	if err := a.Run(ctx); err != nil {
-		slog.Error("agent exited", "error", err)
+		logger().Error("agent exited", "error", err)
 		os.Exit(1)
 	}
 }

@@ -51,7 +51,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -302,7 +301,7 @@ func (c *Config) applyDefaults() error {
 			case err != nil && serr != "":
 				return string(out), fmt.Errorf("%w: %s", err, serr)
 			case serr != "":
-				slog.Debug("kinedb command stderr",
+				logger().Debug("kinedb command stderr",
 					"cmd", argv[0], "stderr", serr)
 			}
 			return string(out), err
@@ -601,7 +600,7 @@ func (k *KineDB) loop(ctx context.Context, name string, every time.Duration, fn 
 func (k *KineDB) safeCycle(ctx context.Context, name string, fn func(context.Context)) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("kinedb cycle panicked", "loop", name, "panic", r)
+			logger().Error("kinedb cycle panicked", "loop", name, "panic", r)
 			k.m.cycles.WithLabelValues(name, "panic").Inc()
 		}
 	}()
@@ -817,7 +816,7 @@ func (p *promBuf) String() string { return p.b.String() }
 
 func (k *KineDB) emitTextfile(name string, p *promBuf) {
 	if err := writeTextfileAtomic(k.cfg.TextfileDir, name, []byte(p.String())); err != nil {
-		slog.Warn("kinedb textfile write failed", "file", name, "error", err)
+		logger().Warn("kinedb textfile write failed", "file", name, "error", err)
 	}
 }
 
@@ -890,15 +889,15 @@ func readIntFile(path string) (int64, error) {
 
 func writeIntFile(path string, v int64) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		slog.Warn("kinedb state file write failed", "file", path, "error", err)
+		logger().Warn("kinedb state file write failed", "file", path, "error", err)
 		return
 	}
 	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
 	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(v, 10)+"\n"), 0o644); err != nil {
-		slog.Warn("kinedb state file write failed", "file", path, "error", err)
+		logger().Warn("kinedb state file write failed", "file", path, "error", err)
 		return
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		slog.Warn("kinedb state file write failed", "file", path, "error", err)
+		logger().Warn("kinedb state file write failed", "file", path, "error", err)
 	}
 }

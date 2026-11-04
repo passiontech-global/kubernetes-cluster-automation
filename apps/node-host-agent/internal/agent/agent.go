@@ -13,7 +13,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"runtime"
@@ -126,7 +125,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	for _, sub := range a.cfg.Subsystems {
 		sub := sub
 		go func() {
-			slog.Info("subsystem started", "name", sub.Name())
+			logger().Info("subsystem started", "name", sub.Name())
 			// Restart backoff doubles per early exit (5s → 5m cap) so
 			// a subsystem that returns instantly can't spam a restart
 			// + error log every cycle; a run that outlived the
@@ -137,7 +136,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
-							slog.Error("subsystem panicked — restarting",
+							logger().Error("subsystem panicked — restarting",
 								"subsystem", sub.Name(), "panic", r)
 						}
 					}()
@@ -152,7 +151,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				// Run returned while ctx is live (panic recovered, or
 				// a silent early return) — restart after backoff
 				// instead of letting the subsystem die invisibly.
-				slog.Error("subsystem exited unexpectedly — restarting",
+				logger().Error("subsystem exited unexpectedly — restarting",
 					"subsystem", sub.Name(), "backoff", backoff)
 				select {
 				case <-ctx.Done():
@@ -199,7 +198,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		servers = append(servers, srv)
 		go gracefulShutdown(ctx, done, name, srv.Shutdown)
 		go func() {
-			slog.Info("listening", "server", name, "addr", ln.Addr().String())
+			logger().Info("listening", "server", name, "addr", ln.Addr().String())
 			if err := srv.Serve(ln); err != http.ErrServerClosed {
 				errCh <- fmt.Errorf("%s server: %w", name, err)
 			}
@@ -217,7 +216,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		// handler) so nothing outlives Run returning the error.
 		for _, srv := range servers {
 			if cerr := srv.Close(); cerr != nil {
-				slog.Error("sibling server close failed",
+				logger().Error("sibling server close failed",
 					"error", cerr)
 			}
 		}
@@ -247,7 +246,7 @@ func gracefulShutdown(ctx context.Context, done <-chan struct{},
 	}
 	if err := shutdown(context.Background()); err != nil &&
 		!errors.Is(err, http.ErrServerClosed) {
-		slog.Error("server shutdown failed — connections dropped",
+		logger().Error("server shutdown failed — connections dropped",
 			"server", name, "error", err)
 	}
 }

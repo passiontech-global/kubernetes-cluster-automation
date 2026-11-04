@@ -33,7 +33,6 @@ package nodereporter
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"sync/atomic"
 	"time"
@@ -272,17 +271,17 @@ func (r *Reporter) Cycle(ctx context.Context) {
 	// Heartbeat first: the staleness probe evaluated below reads the
 	// last-run file this writes.
 	if err := r.writeHeartbeat(); err != nil {
-		slog.Error("nodereporter: watchdog heartbeat failed",
+		logger().Error("nodereporter: watchdog heartbeat failed",
 			"node", r.cfg.NodeName, "dir", r.cfg.WatchdogStateDir, "error", err)
 		ok = false
 	}
 	if err := r.syncConditions(ctx); err != nil {
-		slog.Error("nodereporter: condition sync failed",
+		logger().Error("nodereporter: condition sync failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}
 	if err := r.syncLogEvents(ctx); err != nil {
-		slog.Error("nodereporter: event sync failed",
+		logger().Error("nodereporter: event sync failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}
@@ -290,22 +289,22 @@ func (r *Reporter) Cycle(ctx context.Context) {
 	// source never starves the others; syncNPDConditions runs last so
 	// it ships whatever state the monitors computed this cycle.
 	if err := r.syncKubeletJournal(ctx); err != nil {
-		slog.Error("nodereporter: kubelet-stale journal scan failed",
+		logger().Error("nodereporter: kubelet-stale journal scan failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}
 	if err := r.syncKernelMonitor(ctx); err != nil {
-		slog.Error("nodereporter: kernel monitor failed",
+		logger().Error("nodereporter: kernel monitor failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}
 	if err := r.syncReadonlyMounts(ctx); err != nil {
-		slog.Error("nodereporter: readonly filesystem check failed",
+		logger().Error("nodereporter: readonly filesystem check failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}
 	if err := r.syncNPDConditions(ctx); err != nil {
-		slog.Error("nodereporter: npd condition sync failed",
+		logger().Error("nodereporter: npd condition sync failed",
 			"node", r.cfg.NodeName, "error", err)
 		ok = false
 	}

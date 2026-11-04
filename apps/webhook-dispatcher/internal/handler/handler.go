@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log/slog"
 	"net/http"
 	"time"
 
@@ -70,7 +69,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	event := r.Header.Get("X-GitHub-Event")
 	sig := r.Header.Get("X-Hub-Signature-256")
 
-	slog.Info("webhook delivery received",
+	logger().Info("webhook delivery received",
 		"remote_addr", r.RemoteAddr, "path", r.URL.Path,
 		"delivery", delivery, "event", event)
 
@@ -79,7 +78,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// buffer allocation. The HMAC check below still runs on the full
 	// body for well-formed headers.
 	if !verify.HasValidSignatureFormat(h.secret, sig) {
-		slog.Warn("webhook rejected: malformed signature",
+		logger().Warn("webhook rejected: malformed signature",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event,
 			"status", http.StatusUnauthorized)
@@ -89,7 +88,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
-		slog.Warn("webhook rejected: body read failed",
+		logger().Warn("webhook rejected: body read failed",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event, "error", err,
 			"status", http.StatusRequestEntityTooLarge)
@@ -97,7 +96,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !verify.Signature(h.secret, body, sig) {
-		slog.Warn("webhook rejected: signature mismatch",
+		logger().Warn("webhook rejected: signature mismatch",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event,
 			"status", http.StatusUnauthorized)
@@ -107,7 +106,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	wantType, ok := resourceTypeForEvent[event]
 	if !ok {
-		slog.Info("webhook delivery ignored: unhandled event",
+		logger().Info("webhook delivery ignored: unhandled event",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event)
 		writeJSON(w, http.StatusAccepted, summary{})
@@ -116,7 +115,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var p payload
 	if err := json.Unmarshal(body, &p); err != nil {
-		slog.Warn("webhook rejected: malformed JSON payload",
+		logger().Warn("webhook rejected: malformed JSON payload",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event, "error", err,
 			"status", http.StatusBadRequest)
@@ -124,7 +123,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if p.Repository.FullName == "" {
-		slog.Warn("webhook rejected: missing repository.full_name",
+		logger().Warn("webhook rejected: missing repository.full_name",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event,
 			"status", http.StatusBadRequest)
@@ -158,7 +157,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// With no index (and no stale copy) nothing can be checked —
 		// a 502 lets GitHub redeliver once the ATC is back instead of
 		// silently dropping the delivery.
-		slog.Error("resource index unavailable",
+		logger().Error("resource index unavailable",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event, "error", err,
 			"status", http.StatusBadGateway)
@@ -173,7 +172,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// a second miss is a genuine "nothing to check".
 		fresh, err := h.backend.Refresh(ctx)
 		if err != nil {
-			slog.Warn("index refresh on zero match failed — keeping prior result",
+			logger().Warn("index refresh on zero match failed — keeping prior result",
 				"remote_addr", r.RemoteAddr,
 				"delivery", delivery, "event", event, "error", err)
 		} else {
@@ -186,26 +185,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status, err := h.backend.CheckWebhook(ctx, res)
 		switch {
 		case err != nil:
-			slog.Error("check webhook request failed",
+			logger().Error("check webhook request failed",
 				"pipeline", res.Pipeline, "resource", res.Name,
 				"repo", res.Repo, "delivery", delivery, "error", err)
 		case status/100 == 2:
 			checked++
-			slog.Info("check webhook dispatched",
+			logger().Info("check webhook dispatched",
 				"pipeline", res.Pipeline, "resource", res.Name,
 				"repo", res.Repo, "delivery", delivery, "status", status)
 		case status == http.StatusUnauthorized || status == http.StatusNotFound:
-			slog.Warn("check webhook rejected",
+			logger().Warn("check webhook rejected",
 				"pipeline", res.Pipeline, "resource", res.Name,
 				"repo", res.Repo, "delivery", delivery, "status", status)
 		default:
-			slog.Error("check webhook unexpected status",
+			logger().Error("check webhook unexpected status",
 				"pipeline", res.Pipeline, "resource", res.Name,
 				"repo", res.Repo, "delivery", delivery, "status", status)
 		}
 	}
 
-	slog.Info("webhook delivery dispatched",
+	logger().Info("webhook delivery dispatched",
 		"remote_addr", r.RemoteAddr,
 		"delivery", delivery, "event", event,
 		"repo", p.Repository.FullName,
