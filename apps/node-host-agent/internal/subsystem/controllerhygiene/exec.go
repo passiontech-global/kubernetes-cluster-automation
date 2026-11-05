@@ -112,7 +112,7 @@ func sdNotify(sock, msg string) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	// A wedged notify socket must not hang the feeder loop —
 	// datagram writes are near-instant, so the deadline only covers
 	// pathological socket states.

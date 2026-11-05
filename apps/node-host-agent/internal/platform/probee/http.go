@@ -29,7 +29,7 @@ func HTTP2xx(ctx context.Context, url string, timeout time.Duration) bool {
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
@@ -51,7 +51,7 @@ func HTTPAnyCode(ctx context.Context, url string, timeout time.Duration) bool {
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	return true
 }
@@ -76,7 +76,7 @@ func HTTPGet(ctx context.Context, url string, timeout time.Duration) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
@@ -105,7 +105,7 @@ func HTTPStatus(ctx context.Context, url, bearer string, timeout time.Duration) 
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	return resp.StatusCode, nil
 }
@@ -126,7 +126,7 @@ func HTTPBody(ctx context.Context, url string, timeout time.Duration) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
@@ -154,7 +154,7 @@ func HTTPBodyInsecure(ctx context.Context, url string, timeout time.Duration) (s
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return "", err
@@ -180,7 +180,7 @@ func BodyOK(ctx context.Context, url string, timeout time.Duration) bool {
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	return strings.TrimSpace(string(body)) == "ok"
 }

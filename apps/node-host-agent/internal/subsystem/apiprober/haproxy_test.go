@@ -50,7 +50,7 @@ func TestDiscoverFailCounted(t *testing.T) {
 		DialSocket: func(_ context.Context, _ string) (net.Conn, error) {
 			c1, c2 := net.Pipe()
 			go func() {
-				defer c2.Close()
+				defer func() { _ = c2.Close() }()
 				buf := make([]byte, 256)
 				_, _ = c2.Read(buf) // consume "show stat" — pipe is synchronous
 				_, _ = io.WriteString(c2, "garbage without header\n")
@@ -356,7 +356,7 @@ func TestSocketGateRecoversWhenSocketAppears(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {
 			conn, err := ln.Accept()

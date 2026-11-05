@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strconv"
@@ -49,7 +50,10 @@ func runTest(name string, v any, args []any) (bool, error) {
 		}
 		re, err := regexp.Compile(Stringify(args[0]))
 		if err != nil {
-			return false, nil //nolint:nilerr // an unparseable pattern is no match, not a template error
+			// an unparseable pattern is no match, not a template error
+			slog.Debug("jinja: search pattern does not compile — no match",
+				"pattern", Stringify(args[0]), "error", err)
+			return false, nil
 		}
 		return re.MatchString(Stringify(v)), nil
 	case "equalto", "eq":
@@ -527,7 +531,7 @@ func pyFormat(format string, args []any) (string, error) {
 			}
 			if strings.Contains(spec, "-") {
 				width := 0
-				fmt.Sscanf(strings.TrimLeft(spec, "-+0"), "%d", &width)
+				_, _ = fmt.Sscanf(strings.TrimLeft(spec, "-+0"), "%d", &width)
 				b.WriteString(fmt.Sprintf("%-"+strconv.Itoa(width)+"d", iv))
 			} else {
 				b.WriteString(fmt.Sprintf("%"+spec+"d", iv))
@@ -574,7 +578,7 @@ func pyFormat(format string, args []any) (string, error) {
 			}
 			num := strings.TrimLeft(spec, "-")
 			width := 0
-			fmt.Sscanf(num, "%d", &width)
+			_, _ = fmt.Sscanf(num, "%d", &width)
 			if strings.Contains(spec, "-") {
 				b.WriteString(fmt.Sprintf("%-"+strconv.Itoa(width)+"s", sv))
 			} else if width > 0 {

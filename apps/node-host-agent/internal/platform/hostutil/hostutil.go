@@ -52,7 +52,7 @@ func WriteFileAtomic(path, content string) error {
 	if err == nil {
 		return nil
 	}
-	defer os.Remove(tmp)
+	defer func() { _ = os.Remove(tmp) }()
 	if !errors.Is(err, unix.EBUSY) && !errors.Is(err, unix.EXDEV) {
 		return err
 	}

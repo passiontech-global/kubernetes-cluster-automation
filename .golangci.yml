@@ -39,54 +39,17 @@ linters:
       checks: ["all", "-QF*", "-ST1000", "-ST1020"]
 
   exclusions:
-    rules:
-      # errcheck — deferred Close() is the codebase's fire-and-forget
-      # cleanup idiom (listeners, conns, ssh sessions, temp files);
-      # the error is never actionable at that point.
-      - linters: [errcheck]
-        text: 'Error return value of `.*\.Close` is not checked'
-      # errcheck — writes to report/log writers and best-effort
-      # parse/format helpers whose error cannot usefully be handled.
-      - linters: [errcheck]
-        text: 'Error return value of `(fmt\.Fprintf|fmt\.Fprintln|fmt\.Sscanf|io\.WriteString)` is not checked'
-      # errcheck — best-effort temp-file/socket cleanup on error
-      # paths; a failure there must not mask the real error.
-      - linters: [errcheck]
-        text: 'Error return value of `(os\.Remove|os\.RemoveAll|os\.WriteFile|unix\.Close)` is not checked'
-      # errcheck — tests deliberately ignore drain/close noise:
-      # <-done channel waits, listener Close, WriteFile fixtures.
-      - linters: [errcheck]
-        path: '_test\.go$'
+    # Test files are exempt from linting entirely — fixture/test
+    # scaffolding is allowed best-effort idioms (_ = f(), unchecked
+    # closes/writes, deprecated-type fixtures) that production code
+    # must not use.
+    paths:
+      - _test\.go$
 
-      # unused — every package keeps the logger() seam via logx.For
-      # for symmetry, even when nothing calls it yet (same one-liner
-      # in ~20 packages, e.g. hoststate, nebulasign).
-      - linters: [unused]
-        text: 'func logger is unused'
-      # unused — mapInt is pre-existing dead code in topology.go
-      # (sibling of the used mapString/mapBool helpers).
-      - linters: [unused]
-        text: 'func mapInt is unused'
-        path: internal/platform/topology/topology\.go
-
-      # staticcheck leftovers after -QF*: one simplification each in
-      # files owned by concurrent changes.
-      - linters: [staticcheck]
-        text: 'S1011'
-        path: internal/platform/watchdogconf/watchdogconf\.go
-      - linters: [staticcheck]
-        text: 'S1008'
-        path: internal/subsystem/hostconfig/group_nebula\.go
-      - linters: [staticcheck]
-        text: 'SA9003'
-        path: internal/platform/topology/topology_test\.go
-
-      # ineffassign — two pre-existing dead assignments in files
-      # owned by concurrent changes.
-      - linters: [ineffassign]
-        path: internal/subsystem/controllerhygiene/etcdguard\.go
-      - linters: [ineffassign]
-        path: internal/subsystem/nethealth/nebula_mtu_blackhole\.go
+issues:
+  # No result caps — surface every issue so the list is complete.
+  max-issues-per-linter: 0
+  max-same-issues: 0
 
 formatters:
   enable:

@@ -13,7 +13,7 @@ func TestPGWire(t *testing.T) {
 	if err != nil {
 		t.Skip("no loopback")
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -21,7 +21,7 @@ func TestPGWire(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				buf := make([]byte, 64)
 				_, _ = c.Read(buf)
 				_, _ = c.Write([]byte("R")) // auth request = healthy
@@ -35,7 +35,7 @@ func TestPGWire(t *testing.T) {
 	if err != nil {
 		t.Skip("no loopback")
 	}
-	defer ln2.Close()
+	defer func() { _ = ln2.Close() }()
 	go func() {
 		for {
 			c, err := ln2.Accept()
@@ -43,7 +43,7 @@ func TestPGWire(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				buf := make([]byte, 64)
 				_, _ = c.Read(buf)
 				_, _ = c.Write([]byte("E")) // ErrorResponse = broken

@@ -167,7 +167,7 @@ func (d *sshDialer) clientConfig(user string, signer ssh.Signer) *ssh.ClientConf
 	return &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error { //nolint:gosec // documented parity
+		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error { // documented parity
 			d.log.Info("hubsync: ssh host key accepted (no strict check)",
 				"addr", hostname, "remote", remote.String(),
 				"fingerprint", ssh.FingerprintSHA256(key))
@@ -208,7 +208,7 @@ func (d *sshDialer) Dial(ctx context.Context, t Target) (Conn, error) {
 		nc, err := jump.Dial("tcp", addr)
 		clear()
 		if err != nil {
-			jump.Close()
+			_ = jump.Close()
 			return nil, fmt.Errorf("jump %s → %s: %w", t.ProxyJump, addr, err)
 		}
 		// nc here is a chanConn — SetDeadline always errors on it,
@@ -216,7 +216,7 @@ func (d *sshDialer) Dial(ctx context.Context, t Target) (Conn, error) {
 		// muxed traffic rides).
 		client, err := d.handshake(ctx, nc, jnc, addr, cfg)
 		if err != nil {
-			jump.Close()
+			_ = jump.Close()
 			return nil, fmt.Errorf("%s via %s: %w", addr, t.ProxyJump, err)
 		}
 		return &sshConn{client: client, netc: nc, jnc: jnc, jump: jump,
@@ -266,7 +266,7 @@ func (d *sshDialer) handshake(ctx context.Context, nc, carrier net.Conn,
 	}
 	c, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
 	if err != nil {
-		nc.Close()
+		_ = nc.Close()
 		return nil, err
 	}
 	_ = carrier.SetDeadline(time.Time{})
@@ -338,7 +338,7 @@ func (c *sshConn) deadlineConn() net.Conn {
 func (c *sshConn) Close() error {
 	err := c.client.Close()
 	if c.jump != nil {
-		c.jump.Close()
+		_ = c.jump.Close()
 	}
 	return err
 }
@@ -359,7 +359,7 @@ func (c *sshConn) Run(ctx context.Context, cmd string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 	done := make(chan struct{})
 	var out []byte
 	var runErr error
@@ -394,7 +394,7 @@ func (c *sshConn) Write(ctx context.Context, remotePath string, r io.Reader) err
 	if err != nil {
 		return err
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 	stdin, err := sess.StdinPipe()
 	if err != nil {
 		return err
@@ -409,7 +409,7 @@ func (c *sshConn) Write(ctx context.Context, remotePath string, r io.Reader) err
 	done := make(chan error, 1)
 	go func() {
 		_, cerr := io.Copy(stdin, r)
-		stdin.Close()
+		_ = stdin.Close()
 		if cerr != nil {
 			done <- cerr
 			return
@@ -421,7 +421,12 @@ func (c *sshConn) Write(ctx context.Context, remotePath string, r io.Reader) err
 		_ = sess.Close()
 		// Wait for the copy goroutine to release r before returning
 		// — the caller closes the file/handle right after Write.
-		<-done //nolint:errcheck // value is sess.Wait() result — intentionally dropped on the cancel path
+		// The value is the sess.Wait() result — non-actionable on the
+		// cancel path (ctx.Err() is what the caller gets) but worth a
+		// debug line for post-mortems.
+		if werr := <-done; werr != nil {
+			c.log.Debug("hubsync: ssh write wait failed after cancel", "error", werr)
+		}
 		return ctx.Err()
 	case err := <-done:
 		return err

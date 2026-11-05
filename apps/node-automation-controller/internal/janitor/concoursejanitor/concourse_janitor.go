@@ -480,7 +480,9 @@ func (j *concourseWorkdirJanitor) maybePruneWorker(ctx context.Context, podName 
 			s, err := j.atc.workerState(ctx, podName)
 			if err != nil {
 				lastErr = err
-				return false, nil //nolint:nilerr // transient — keep polling inside the bound
+				log.V(1).Info("worker state poll failed — keep polling",
+					"pod", podName, "error", err)
+				return false, nil // transient — keep polling inside the bound
 			}
 			lastErr = nil
 			st = s

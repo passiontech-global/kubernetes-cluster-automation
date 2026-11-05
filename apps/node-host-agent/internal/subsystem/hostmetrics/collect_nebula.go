@@ -48,7 +48,7 @@ func (c *Collector) collectNebula(ch chan<- prometheus.Metric) {
 
 	present := 0.0
 	if f, err := os.Open(c.cfg.RouteFile); err == nil {
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		sc := bufio.NewScanner(f)
 		for sc.Scan() {
 			fields := strings.Fields(sc.Text())

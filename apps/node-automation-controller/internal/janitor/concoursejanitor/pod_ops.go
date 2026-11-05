@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -62,7 +63,8 @@ func (j *concourseWorkdirJanitor) deletePod(ctx context.Context, name string, ol
 				return true, nil
 			}
 			if err != nil {
-				return false, nil //nolint:nilerr // transient — keep waiting
+				logf.FromContext(ctx).V(1).Info("pod get failed — keep waiting", "pod", name, "error", err)
+				return false, nil // transient — keep waiting
 			}
 			return p.UID != oldUID, nil // old object deleted (or still terminating)
 		})
@@ -83,7 +85,8 @@ func (j *concourseWorkdirJanitor) waitNewPod(ctx context.Context, name string, o
 		func(ctx context.Context) (bool, error) {
 			p, err := j.cs.CoreV1().Pods(cjNamespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
-				return false, nil //nolint:nilerr // not created yet / transient — keep polling
+				logf.FromContext(ctx).V(1).Info("pod get failed — keep polling", "pod", name, "error", err)
+				return false, nil // not created yet / transient — keep polling
 			}
 			return p.UID != oldUID, nil
 		})
@@ -102,7 +105,8 @@ func (j *concourseWorkdirJanitor) waitReady(ctx context.Context, name string) er
 		func(ctx context.Context) (bool, error) {
 			p, err := j.cs.CoreV1().Pods(cjNamespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
-				return false, nil //nolint:nilerr // transient — keep polling
+				logf.FromContext(ctx).V(1).Info("pod get failed — keep polling", "pod", name, "error", err)
+				return false, nil // transient — keep polling
 			}
 			return shared.PodReadyCond(p), nil
 		})

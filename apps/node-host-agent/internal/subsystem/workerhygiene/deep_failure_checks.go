@@ -537,7 +537,7 @@ func readSmallFile(path string) string {
 	if err != nil {
 		return ""
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	b, _ := io.ReadAll(io.LimitReader(f, 4096))
 	return string(b)
 }

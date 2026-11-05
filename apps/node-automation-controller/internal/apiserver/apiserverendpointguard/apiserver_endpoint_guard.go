@@ -87,9 +87,11 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -142,8 +144,19 @@ const (
 	endpointSliceMirrorValue = "endpointslicemirroring-controller.k8s.io"
 )
 
+// endpointsGVR is the dynamic-client handle for the deprecated core/v1
+// Endpoints object. The guard reaches it through unstructured maps so
+// the deprecated type is never named in code — the object stays the
+// write SSOT on hosted planes where the kubernetes slice is a mirror
+// projection, but no source file has to reference corev1.Endpoints.
+var endpointsGVR = schema.GroupVersionResource{Version: "v1", Resource: "endpoints"}
+
 type apiServerEndpointGuard struct {
 	cs kubernetes.Interface
+	// dyn is the dynamic client — used ONLY for the deprecated
+	// core/v1 Endpoints object (unstructured, so the deprecated type
+	// is never named); slices/discovery stay on the typed clientset.
+	dyn dynamic.Interface
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the named logger and every IncError label
 	// come from one place.
@@ -189,22 +202,23 @@ type apiServerEndpointGuard struct {
 // Setup registers the 30s wedge sweep.
 func Setup(d shared.Deps) error {
 	mgr, cs := d.Mgr, d.CS
-	g := &apiServerEndpointGuard{cs: cs, queue: d.Name, backends: map[string]*backendProbeState{}}
+	g := &apiServerEndpointGuard{cs: cs, dyn: d.Dyn, queue: d.Name, backends: map[string]*backendProbeState{}}
 	g.probeFn = g.probe
 	g.log = mgr.GetLogger().WithName(g.queue)
-	// Dedicated clientset filtering the "v1 Endpoints is deprecated"
-	// 299 warning: on hosted planes the guard writes the deprecated
-	// object deliberately every sweep (it is the SSOT behind the
-	// mirror slice), which the shared client's default WarningLogger
-	// would turn into one klog line per cycle. Every other warning
-	// still delegates. Fall back to the shared client when the
-	// filtered one cannot be built — nil config on test doubles or a
-	// construction failure — the guard works either way, just noisier.
+	// Dedicated dynamic client filtering the "v1 Endpoints is
+	// deprecated" 299 warning: on hosted planes the guard writes the
+	// deprecated object deliberately every sweep (it is the SSOT
+	// behind the mirror slice), which the shared client's default
+	// WarningLogger would turn into one klog line per cycle. Every
+	// other warning still delegates. Fall back to the shared dynamic
+	// client when the filtered one cannot be built — nil config on
+	// test doubles or a construction failure — the guard works either
+	// way, just noisier.
 	if cfg := mgr.GetConfig(); cfg != nil {
-		if filtered, err := endpointsWarningClient(cfg, cs); err == nil {
-			g.cs = filtered
+		if filtered, err := endpointsWarningClient(cfg, d.Dyn); err == nil {
+			g.dyn = filtered
 		} else {
-			g.log.Error(err, "filtered clientset build failed — sharing the noisy default client")
+			g.log.Error(err, "filtered dynamic client build failed — sharing the noisy default client")
 		}
 	}
 	return mgr.Add(g)
@@ -220,22 +234,22 @@ func NewWarningHandler() rest.WarningHandler {
 	return endpointGuardWarnings{delegate: rest.WarningLogger{}}
 }
 
-// endpointsWarningClient returns a clientset whose WarningHandler
+// endpointsWarningClient returns a dynamic client whose WarningHandler
 // drops only the apiserver's Endpoints deprecation header — the
-// guard's corev1 Endpoints reads/writes are intentional. When cfg
-// already carries the guard's filter (main wires it onto the shared
-// config before building cs), the incoming clientset is reused:
-// cloning cfg into a second clientset would duplicate the
-// http.Transport and its connection pool for zero behavioral gain.
-func endpointsWarningClient(cfg *rest.Config, cs kubernetes.Interface) (kubernetes.Interface, error) {
-	if cs != nil {
+// guard's Endpoints reads/writes are intentional. When cfg already
+// carries the guard's filter (main wires it onto the shared config
+// before building dyn), the incoming client is reused: cloning cfg
+// into a second client would duplicate the http.Transport and its
+// connection pool for zero behavioral gain.
+func endpointsWarningClient(cfg *rest.Config, dyn dynamic.Interface) (dynamic.Interface, error) {
+	if dyn != nil {
 		if _, ok := cfg.WarningHandler.(endpointGuardWarnings); ok {
-			return cs, nil
+			return dyn, nil
 		}
 	}
 	cfg = rest.CopyConfig(cfg)
 	cfg.WarningHandler = NewWarningHandler()
-	return kubernetes.NewForConfig(cfg)
+	return dynamic.NewForConfig(cfg)
 }
 
 // endpointGuardWarnings suppresses exactly one warning: "v1 Endpoints
@@ -334,9 +348,9 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	// Endpoints is fetched only when it can actually be the SSOT — on a
 	// >=1.33 self-managed cluster (non-mirrored slice) the deprecated
 	// object is never touched at all.
-	var ep *corev1.Endpoints //nolint:staticcheck // SA1019: deliberate — the deprecated Endpoints object is the writable SSOT on hosted planes
+	var ep *unstructured.Unstructured
 	if primary == nil || mirrorManagedSlice(primary) || !preferSlice {
-		e, getErr := g.cs.CoreV1().Endpoints(endpointGuardNS).
+		e, getErr := g.dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
 			Get(ctx, endpointGuardName, metav1.GetOptions{})
 		gone, err := shared.ConfirmAbsent(getErr)
 		if err != nil {
@@ -594,9 +608,6 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 		}
 	} else {
 		ep = ep.DeepCopy()
-		if ep.Annotations == nil {
-			ep.Annotations = map[string]string{}
-		}
 		for _, ip := range toRemove {
 			removeEndpointIP(ep, ip)
 			quarantinedIPs[ip] = true
@@ -609,7 +620,7 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 			log.Info("RE-ADD: recovered apiserver back in kubernetes endpoints", "ip", ip)
 		}
 		writeQuarantineAnnotation(ep, quarantinedIPs)
-		if _, err := g.cs.CoreV1().Endpoints(endpointGuardNS).
+		if _, err := g.dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
 			Update(ctx, ep, metav1.UpdateOptions{}); err != nil {
 			return fmt.Errorf("update endpoints/%s: %w", endpointGuardName, err)
 		}

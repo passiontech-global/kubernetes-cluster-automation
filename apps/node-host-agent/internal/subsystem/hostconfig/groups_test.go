@@ -375,7 +375,7 @@ func TestApplyNftUnitPromotesValidCandidate(t *testing.T) {
 // survive a rejected download.
 func TestDownloadSweepsTmpOnShaMismatch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("tampered"))
+		_, _ = w.Write([]byte("tampered"))
 	}))
 	t.Cleanup(srv.Close)
 	r := newTestReconciler(t, t.TempDir())

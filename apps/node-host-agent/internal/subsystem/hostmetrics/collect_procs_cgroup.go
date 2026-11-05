@@ -153,9 +153,11 @@ func (c *Collector) collectSystemdScopes(ch chan<- prometheus.Metric) {
 		return
 	}
 	var n float64
-	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+			logger().Debug("hostmetrics: kubepods scope walk entry skipped — unreadable",
+				"path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
 		}
 		if d.IsDir() && strings.HasPrefix(d.Name(), "cri-containerd-") &&
 			strings.HasSuffix(d.Name(), ".scope") {

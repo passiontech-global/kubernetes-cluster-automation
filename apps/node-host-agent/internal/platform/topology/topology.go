@@ -364,11 +364,6 @@ func mapStr(m any, key string) string { return jinja.Stringify(mapGet(m, key)) }
 
 func mapBool(m any, key string) bool { return jinja.Truthy(mapGet(m, key)) }
 
-func mapInt(m any, key string) int64 {
-	i, _ := jinja.ToInt(mapGet(m, key))
-	return i
-}
-
 func mapList(m any, key string) []any { return jinja.ToIter(mapGet(m, key)) }
 
 func nodeNameOf(v any) string { return mapStr(v, "name") }

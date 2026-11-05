@@ -25,7 +25,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
 # Host tools (systemctl, journalctl, nft, sshd, apt-get, haproxy, ...)
 # are exec'd via `nsenter -m` → they resolve in the HOST mount ns and
 # intentionally do NOT ship here.
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache util-linux iproute2 iputils bash
 COPY --from=build /out/node-host-agent /node-host-agent
 USER 65532:65532

@@ -16,7 +16,7 @@ import (
 func TestSetup(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Name: "apiserver-endpoint-guard", Mgr: m, CS: cs}); err != nil {
+	if err := Setup(shared.Deps{Name: "apiserver-endpoint-guard", Mgr: m, CS: cs, Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	if len(m.Added) != 1 {

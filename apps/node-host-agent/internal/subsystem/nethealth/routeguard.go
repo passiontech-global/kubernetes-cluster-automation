@@ -147,7 +147,7 @@ func bindRouteSocket() (int, error) {
 		Family: unix.AF_NETLINK,
 		Groups: unix.RTMGRP_IPV4_ROUTE | unix.RTMGRP_IPV4_RULE,
 	}); err != nil {
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		return -1, err
 	}
 	return fd, nil
@@ -208,12 +208,12 @@ func bindInNetns(nsPath string) (int, error) {
 	if err != nil {
 		return -1, fmt.Errorf("self netns: %w", err)
 	}
-	defer unix.Close(self)
+	defer func() { _ = unix.Close(self) }()
 	host, err := unix.Open(nsPath, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return -1, fmt.Errorf("host netns %s: %w", nsPath, err)
 	}
-	defer unix.Close(host)
+	defer func() { _ = unix.Close(host) }()
 	runtime.LockOSThread()
 	if err := unix.Setns(host, unix.CLONE_NEWNET); err != nil {
 		runtime.UnlockOSThread()
@@ -222,7 +222,7 @@ func bindInNetns(nsPath string) (int, error) {
 	fd, serr := bindRouteSocket()
 	if rerr := unix.Setns(self, unix.CLONE_NEWNET); rerr != nil {
 		if fd >= 0 {
-			unix.Close(fd)
+			_ = unix.Close(fd)
 		}
 		logger().Error("route-guard: setns restore failed — parking "+
 			"thread in the host netns and exiting the guard goroutine",
@@ -608,7 +608,7 @@ func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 	events := make(chan struct{}, 16)
 	done := make(chan struct{})
 	var closeOnce sync.Once
-	closeFd := func() { closeOnce.Do(func() { unix.Close(fd) }) }
+	closeFd := func() { closeOnce.Do(func() { _ = unix.Close(fd) }) }
 	defer closeFd()
 	go func() {
 		// Registered first so it runs LAST on unwind: done and the

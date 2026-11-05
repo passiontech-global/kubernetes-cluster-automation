@@ -84,7 +84,7 @@ func (h *Hygiene) buildClient() (*http.Client, error) {
 	}
 	tlsCfg := &tls.Config{
 		Certificates:       []tls.Certificate{pair},
-		InsecureSkipVerify: h.cfg.InsecureTLS, //nolint:gosec // mirrors curl -sk
+		InsecureSkipVerify: h.cfg.InsecureTLS, // mirrors curl -sk
 	}
 	if !h.cfg.InsecureTLS && len(caPEM) > 0 {
 		pool := x509.NewCertPool()
@@ -156,7 +156,10 @@ func (h *Hygiene) loadCreds() (cert, key, ca []byte, err error) {
 		return cert, key, ca, nil
 	}
 	if _, statErr := os.Stat(h.cfg.AdminCert); statErr != nil {
-		return nil, nil, nil, nil //nolint:nilerr // not a controller / k0s not initialised
+		// not a controller / k0s not initialised
+		logger().Debug("controllerhygiene: admin cert absent — apiserver checks idle",
+			"path", h.cfg.AdminCert, "error", statErr)
+		return nil, nil, nil, nil
 	}
 	cert, err = os.ReadFile(h.cfg.AdminCert)
 	if err != nil {
@@ -211,7 +214,7 @@ func (h *Hygiene) listRV(ctx context.Context, endpoint string, cached bool) (int
 		)
 		return 0, false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return 0, false

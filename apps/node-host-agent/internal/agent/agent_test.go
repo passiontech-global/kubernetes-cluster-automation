@@ -39,7 +39,7 @@ func TestProbeEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("healthz: got %d, want 200", resp.StatusCode)
 	}
@@ -49,7 +49,7 @@ func TestProbeEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("readyz before ready: got %d, want 503", resp.StatusCode)
 	}
@@ -59,7 +59,7 @@ func TestProbeEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("readyz after ready: got %d, want 200", resp.StatusCode)
 	}
@@ -75,7 +75,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -145,7 +145,7 @@ func TestRunStartsSubsystems(t *testing.T) {
 	case <-deadline:
 		t.Fatal("subsystem Run did not return after cancel")
 	}
-	<-done
+	t.Logf("Run: %v", <-done)
 }
 
 func TestSubsystemMetricsOnSharedRegistry(t *testing.T) {
@@ -163,7 +163,7 @@ func TestSubsystemMetricsOnSharedRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	out := string(body)
 	if !strings.Contains(out, "node_host_agent_stub_metric") {
@@ -269,7 +269,7 @@ func TestRunMetricsAddrInUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	a := New(Config{MetricsAddr: ln.Addr().String(), ProbeAddr: "127.0.0.1:0"})
 	err = a.Run(context.Background())
@@ -283,7 +283,7 @@ func TestRunProbeAddrInUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	a := New(Config{MetricsAddr: "127.0.0.1:0", ProbeAddr: ln.Addr().String()})
 	err = a.Run(context.Background())
@@ -428,7 +428,7 @@ func TestSubsystemRestartCounterIncrements(t *testing.T) {
 	})
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
-	defer func() { cancel(); <-done }()
+	defer func() { cancel(); t.Logf("Run: %v", <-done) }()
 
 	// Run returned while ctx was live → the supervisor counts it.
 	waitFor(t, "restart counter", func() bool {
@@ -479,7 +479,7 @@ func TestSubsystemUpGaugeFlips(t *testing.T) {
 	})
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
-	defer func() { cancel(); <-done }()
+	defer func() { cancel(); t.Logf("Run: %v", <-done) }()
 
 	up := a.subUp.WithLabelValues("gated")
 	waitFor(t, "up gauge to rise", func() bool {
@@ -507,7 +507,7 @@ func TestSubsystemPanicCountedAsRestart(t *testing.T) {
 	})
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
-	defer func() { cancel(); <-done }()
+	defer func() { cancel(); t.Logf("Run: %v", <-done) }()
 
 	// A panic-recovered exit is an unexpected exit too — it must
 	// land in the same counter as a silent early return.

@@ -256,13 +256,12 @@ func main() {
 	// reads outside the informer types go through this.
 	//
 	// The endpoint-guard warning filter is attached BEFORE the
-	// clientset is built: the guard writes the deprecated corev1
-	// Endpoints object deliberately on hosted planes, and installing
-	// the handler on the shared config lets
-	// Setup reuse THIS clientset instead of
-	// cloning cfg into a second one — which would duplicate the
-	// http.Transport and its TLS connection pool just to silence one
-	// warning header.
+	// clients are built: the guard writes the deprecated Endpoints
+	// object deliberately on hosted planes, and installing the
+	// handler on the shared config lets Setup reuse THIS dynamic
+	// client instead of cloning cfg into a second one — which would
+	// duplicate the http.Transport and its TLS connection pool just
+	// to silence one warning header.
 	cfg.WarningHandler = apiserverendpointguard.NewWarningHandler()
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {

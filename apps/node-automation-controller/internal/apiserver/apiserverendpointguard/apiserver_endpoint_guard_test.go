@@ -1,4 +1,3 @@
-//nolint:staticcheck // SA1019: fixtures deliberately build deprecated corev1 Endpoints/EndpointSubset objects — that is the API the guard manages on hosted planes.
 package apiserverendpointguard
 
 import (
@@ -11,15 +10,18 @@ import (
 
 	"github.com/go-logr/logr"
 
-	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/version"
 	fakediscovery "k8s.io/client-go/discovery/fake"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -27,29 +29,71 @@ import (
 // ---------------------------------------------------------------------------
 
 // kubeEndpoints builds the default/kubernetes Endpoints object the way
-// the apiserver's own reconciler writes it: one subset, port 443.
-func kubeEndpoints(active, notReady, quarantined []string) *corev1.Endpoints {
-	ep := &corev1.Endpoints{ObjectMeta: metav1.ObjectMeta{
-		Namespace: endpointGuardNS, Name: endpointGuardName,
-		Annotations: map[string]string{},
-	}}
-	sub := corev1.EndpointSubset{
-		Ports: []corev1.EndpointPort{
-			{Name: "https", Port: 443, Protocol: corev1.ProtocolTCP},
+// the apiserver's own reconciler writes it: one subset, port 443 —
+// unstructured, the shape the dynamic client returns on the wire.
+func kubeEndpoints(active, notReady, quarantined []string) *unstructured.Unstructured {
+	sub := map[string]any{
+		"ports": []any{map[string]any{
+			"name": "https", "port": int64(443), "protocol": "TCP"}},
+	}
+	if len(active) > 0 {
+		addrs := make([]any, 0, len(active))
+		for _, ip := range active {
+			addrs = append(addrs, map[string]any{"ip": ip})
+		}
+		sub["addresses"] = addrs
+	}
+	if len(notReady) > 0 {
+		nr := make([]any, 0, len(notReady))
+		for _, ip := range notReady {
+			nr = append(nr, map[string]any{"ip": ip})
+		}
+		sub["notReadyAddresses"] = nr
+	}
+	ep := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Endpoints",
+		"metadata": map[string]any{
+			"namespace": endpointGuardNS, "name": endpointGuardName,
 		},
-	}
-	for _, ip := range active {
-		sub.Addresses = append(sub.Addresses, corev1.EndpointAddress{IP: ip})
-	}
-	for _, ip := range notReady {
-		sub.NotReadyAddresses = append(sub.NotReadyAddresses,
-			corev1.EndpointAddress{IP: ip})
-	}
-	ep.Subsets = []corev1.EndpointSubset{sub}
+		"subsets": []any{sub},
+	}}
+	annos := map[string]string{}
 	if len(quarantined) > 0 {
-		ep.Annotations[endpointGuardAnno] = strings.Join(quarantined, ",")
+		annos[endpointGuardAnno] = strings.Join(quarantined, ",")
 	}
+	ep.SetAnnotations(annos)
 	return ep
+}
+
+// subsetAddrs decodes subset[i]'s map-typed list field for assertions.
+func subsetAddrs(ep *unstructured.Unstructured, i int, field string) []map[string]any {
+	subs := endpointSubsets(ep)
+	if i >= len(subs) {
+		return nil
+	}
+	return nestedMaps(subs[i], field)
+}
+
+// appendSubset appends a raw subset map to the fixture — the
+// unstructured equivalent of ep.Subsets = append(ep.Subsets, ...).
+func appendSubset(ep *unstructured.Unstructured, subset map[string]any) {
+	subs, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
+	subs = append(subs, subset)
+	if err := unstructured.SetNestedSlice(ep.Object, subs, "subsets"); err != nil {
+		panic(err)
+	}
+}
+
+// appendAddr appends {"ip": ip} to subset[i]'s field — the test-time
+// "reconciler re-added a live IP" mutation.
+func appendAddr(ep *unstructured.Unstructured, i int, field, ip string) {
+	subs, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
+	m, _ := subs[i].(map[string]any)
+	addrs, _, _ := unstructured.NestedSlice(m, field)
+	addrs = append(addrs, map[string]any{"ip": ip})
+	_ = unstructured.SetNestedSlice(m, addrs, field)
+	_ = unstructured.SetNestedSlice(ep.Object, subs, "subsets")
 }
 
 // kubeEndpointSlice mirrors the discovery.k8s.io/v1 slice the apiserver
@@ -101,17 +145,18 @@ func (pt probeTable) fn(_ context.Context, ip string) apiProbeResult {
 	return apiProbeResult{err: errors.New("no probe result scripted for " + ip)}
 }
 
-func newEndpointGuard(cs kubernetes.Interface, probes probeTable) *apiServerEndpointGuard {
+func newEndpointGuard(cs kubernetes.Interface, dyn dynamic.Interface, probes probeTable) *apiServerEndpointGuard {
 	return &apiServerEndpointGuard{
 		cs:       cs,
+		dyn:      dyn,
 		probeFn:  probes.fn,
 		backends: map[string]*backendProbeState{},
 	}
 }
 
-func getKubeEndpoints(t *testing.T, cs *fake.Clientset) *corev1.Endpoints {
+func getKubeEndpoints(t *testing.T, dyn dynamic.Interface) *unstructured.Unstructured {
 	t.Helper()
-	ep, err := cs.CoreV1().Endpoints(endpointGuardNS).
+	ep, err := dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
 		Get(ctx, endpointGuardName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get endpoints: %v", err)
@@ -129,11 +174,13 @@ func getKubeSlice(t *testing.T, cs *fake.Clientset) *discoveryv1.EndpointSlice {
 	return eps
 }
 
-func endpointAddrSet(ep *corev1.Endpoints) map[string]bool {
+func endpointAddrSet(ep *unstructured.Unstructured) map[string]bool {
 	set := map[string]bool{}
-	for _, sub := range ep.Subsets {
-		for _, a := range sub.Addresses {
-			set[a.IP] = true
+	for _, sub := range endpointSubsets(ep) {
+		for _, a := range nestedMaps(sub, "addresses") {
+			if ip, _ := a["ip"].(string); ip != "" {
+				set[ip] = true
+			}
 		}
 	}
 	return set
@@ -158,30 +205,31 @@ func apiHealthyProbe(rv int64) *apiProbeResult {
 // annotation — the first gapped cycle only arms the streak.
 func TestEndpointGuardQuarantineOnRVGap(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil, nil),
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil, nil))
 	probes := probeTable{
 		"10.0.0.1": {liveRV: 1000, cacheRV: 100}, // gap 900 — wedged
 		"10.0.0.2": apiHealthyProbe(1000),
 		"10.0.0.3": apiHealthyProbe(1000),
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := endpointAddrSet(getKubeEndpoints(t, cs)); !got["10.0.0.1"] {
+	if got := endpointAddrSet(getKubeEndpoints(t, dyn)); !got["10.0.0.1"] {
 		t.Fatal("wedged backend removed after a single gapped cycle")
 	}
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	ep := getKubeEndpoints(t, cs)
+	ep := getKubeEndpoints(t, dyn)
 	if got := endpointAddrSet(ep); got["10.0.0.1"] || !got["10.0.0.2"] || !got["10.0.0.3"] {
 		t.Fatalf("wedged backend not quarantined, addresses=%v", got)
 	}
-	if ann := ep.Annotations[endpointGuardAnno]; ann != "10.0.0.1" {
+	if ann := ep.GetAnnotations()[endpointGuardAnno]; ann != "10.0.0.1" {
 		t.Fatalf("quarantine annotation = %q, want 10.0.0.1", ann)
 	}
 	if got := sliceAddrSet(getKubeSlice(t, cs)); got["10.0.0.1"] {
@@ -193,21 +241,22 @@ func TestEndpointGuardQuarantineOnRVGap(t *testing.T) {
 // wedge even when the instantaneous gap stays under the threshold.
 func TestEndpointGuardQuarantineOnFrozenCache(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	bad := &apiProbeResult{liveRV: 100, cacheRV: 90} // gap 10 < 200
 	probes := probeTable{
 		"10.0.0.1": bad,
 		"10.0.0.2": apiHealthyProbe(100),
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 
 	for cycle := 0; cycle < 3; cycle++ {
 		bad.liveRV += 50 // live grows, cache stuck at 90
 		if err := g.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if endpointAddrSet(getKubeEndpoints(t, cs))["10.0.0.1"] == false {
+		if endpointAddrSet(getKubeEndpoints(t, dyn))["10.0.0.1"] == false {
 			t.Fatalf("cycle %d: backend removed before the 3-frozen-cycle latch", cycle)
 		}
 	}
@@ -215,7 +264,7 @@ func TestEndpointGuardQuarantineOnFrozenCache(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if endpointAddrSet(getKubeEndpoints(t, cs))["10.0.0.1"] {
+	if endpointAddrSet(getKubeEndpoints(t, dyn))["10.0.0.1"] {
 		t.Fatal("frozen-cache backend not quarantined after 3 cycles")
 	}
 }
@@ -225,24 +274,25 @@ func TestEndpointGuardQuarantineOnFrozenCache(t *testing.T) {
 // a verdict.
 func TestEndpointGuardQuarantineOnProbeError(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	probes := probeTable{
 		"10.0.0.1": {err: errors.New("context deadline exceeded")},
 		"10.0.0.2": apiHealthyProbe(1000),
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 	for i := 0; i < endpointGuardErrCycles; i++ {
 		if err := g.run(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ep := getKubeEndpoints(t, cs)
+	ep := getKubeEndpoints(t, dyn)
 	if endpointAddrSet(ep)["10.0.0.1"] {
 		t.Fatal("backend with failed probe kept in endpoints")
 	}
-	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
-		t.Fatalf("annotation = %q", ep.Annotations[endpointGuardAnno])
+	if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("annotation = %q", ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
 
@@ -250,23 +300,24 @@ func TestEndpointGuardQuarantineOnProbeError(t *testing.T) {
 // mass-wedge (or broken probe path) must not empty the endpoint set.
 func TestEndpointGuardNeverRemovesLastHealthy(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	probes := probeTable{
 		"10.0.0.1": {err: errors.New("timeout")},
 		"10.0.0.2": {err: errors.New("timeout")},
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	ep := getKubeEndpoints(t, cs)
+	ep := getKubeEndpoints(t, dyn)
 	if got := endpointAddrSet(ep); !got["10.0.0.1"] || !got["10.0.0.2"] {
 		t.Fatalf("endpoints emptied during mass-wedge: %v", got)
 	}
-	if ep.Annotations[endpointGuardAnno] != "" {
+	if ep.GetAnnotations()[endpointGuardAnno] != "" {
 		t.Fatalf("annotation written with nothing quarantined: %q",
-			ep.Annotations[endpointGuardAnno])
+			ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
 
@@ -275,17 +326,18 @@ func TestEndpointGuardNeverRemovesLastHealthy(t *testing.T) {
 // would leave zero endpoints).
 func TestEndpointGuardKeepsSoleRemainingBackend(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.2"}, nil, []string{"10.0.0.1"}),
 		kubeEndpointSlice([]string{"10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.2"}, nil, []string{"10.0.0.1"}))
 	probes := probeTable{
 		"10.0.0.1": {err: errors.New("still down")},
 		"10.0.0.2": {err: errors.New("just wedged")},
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := endpointAddrSet(getKubeEndpoints(t, cs)); !got["10.0.0.2"] {
+	if got := endpointAddrSet(getKubeEndpoints(t, dyn)); !got["10.0.0.2"] {
 		t.Fatal("sole remaining backend was quarantined — endpoints would be empty")
 	}
 }
@@ -294,36 +346,37 @@ func TestEndpointGuardKeepsSoleRemainingBackend(t *testing.T) {
 // back into both objects and dropped from the annotation.
 func TestEndpointGuardReaddsRecoveredBackend(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.2", "10.0.0.3"}, nil, []string{"10.0.0.1"}),
 		kubeEndpointSlice([]string{"10.0.0.2", "10.0.0.3"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.2", "10.0.0.3"}, nil, []string{"10.0.0.1"}))
 	probes := probeTable{
 		"10.0.0.1": apiHealthyProbe(1000),
 		"10.0.0.2": apiHealthyProbe(1000),
 		"10.0.0.3": apiHealthyProbe(1000),
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	ep := getKubeEndpoints(t, cs)
+	ep := getKubeEndpoints(t, dyn)
 	if endpointAddrSet(ep)["10.0.0.1"] {
 		t.Fatal("backend re-added after a single healthy cycle")
 	}
-	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
-		t.Fatalf("annotation dropped too early: %q", ep.Annotations[endpointGuardAnno])
+	if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("annotation dropped too early: %q", ep.GetAnnotations()[endpointGuardAnno])
 	}
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	ep = getKubeEndpoints(t, cs)
+	ep = getKubeEndpoints(t, dyn)
 	if got := endpointAddrSet(ep); !got["10.0.0.1"] {
 		t.Fatalf("recovered backend not re-added, addresses=%v", got)
 	}
-	if _, ok := ep.Annotations[endpointGuardAnno]; ok {
+	if _, ok := ep.GetAnnotations()[endpointGuardAnno]; ok {
 		t.Fatalf("annotation left behind after full recovery: %q",
-			ep.Annotations[endpointGuardAnno])
+			ep.GetAnnotations()[endpointGuardAnno])
 	}
 	if got := sliceAddrSet(getKubeSlice(t, cs)); !got["10.0.0.1"] {
 		t.Fatalf("recovered backend not back in EndpointSlice: %v", got)
@@ -334,24 +387,25 @@ func TestEndpointGuardReaddsRecoveredBackend(t *testing.T) {
 // okStreak resets on every failed cycle and recovery never latches.
 func TestEndpointGuardKeepsStillWedgedQuarantine(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.2"}, nil, []string{"10.0.0.1"}),
 		kubeEndpointSlice([]string{"10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.2"}, nil, []string{"10.0.0.1"}))
 	probes := probeTable{
 		"10.0.0.1": {liveRV: 900, cacheRV: 100}, // gap 800 — still wedged
 		"10.0.0.2": apiHealthyProbe(900),
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 	for i := 0; i < 3; i++ {
 		if err := g.run(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ep := getKubeEndpoints(t, cs)
+	ep := getKubeEndpoints(t, dyn)
 	if endpointAddrSet(ep)["10.0.0.1"] {
 		t.Fatal("still-wedged backend re-added")
 	}
-	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
-		t.Fatalf("annotation = %q, want 10.0.0.1 kept", ep.Annotations[endpointGuardAnno])
+	if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("annotation = %q, want 10.0.0.1 kept", ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
 
@@ -359,24 +413,25 @@ func TestEndpointGuardKeepsStillWedgedQuarantine(t *testing.T) {
 // probes and streaks still run, but the objects are never touched.
 func TestEndpointGuardSingleControllerNeverEdits(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1"}, nil, nil),
 		kubeEndpointSlice([]string{"10.0.0.1"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1"}, nil, nil))
 	probes := probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 	for i := 0; i < 3; i++ {
 		if err := g.run(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ep := getKubeEndpoints(t, cs)
+	ep := getKubeEndpoints(t, dyn)
 	if !endpointAddrSet(ep)["10.0.0.1"] {
 		t.Fatal("single-controller endpoints edited")
 	}
-	if ep.Annotations[endpointGuardAnno] != "" {
+	if ep.GetAnnotations()[endpointGuardAnno] != "" {
 		t.Fatalf("annotation written on a single-controller cluster: %q",
-			ep.Annotations[endpointGuardAnno])
+			ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
 
@@ -384,28 +439,29 @@ func TestEndpointGuardSingleControllerNeverEdits(t *testing.T) {
 // quarantine must strip it from BOTH address lists.
 func TestEndpointGuardRemovesNotReadyAddress(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.2"}, []string{"10.0.0.1"}, nil),
 		kubeEndpointSlice([]string{"10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.2"}, []string{"10.0.0.1"}, nil))
 	probes := probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 	for i := 0; i < endpointGuardErrCycles; i++ {
 		if err := g.run(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ep := getKubeEndpoints(t, cs)
-	for _, sub := range ep.Subsets {
-		for _, a := range sub.NotReadyAddresses {
-			if a.IP == "10.0.0.1" {
+	ep := getKubeEndpoints(t, dyn)
+	for _, sub := range endpointSubsets(ep) {
+		for _, a := range nestedMaps(sub, "notReadyAddresses") {
+			if a["ip"] == "10.0.0.1" {
 				t.Fatal("wedged IP still in notReadyAddresses")
 			}
 		}
 	}
-	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
-		t.Fatalf("annotation = %q", ep.Annotations[endpointGuardAnno])
+	if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("annotation = %q", ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
 
@@ -417,8 +473,8 @@ func TestEndpointGuardRemovesNotReadyAddress(t *testing.T) {
 func TestEndpointIPSet(t *testing.T) {
 	ep := kubeEndpoints([]string{"10.0.0.3", "10.0.0.1"}, []string{"10.0.0.2"}, nil)
 	// Duplicate the IP across subsets to prove dedupe.
-	ep.Subsets = append(ep.Subsets, corev1.EndpointSubset{
-		Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}},
+	appendSubset(ep, map[string]any{
+		"addresses": []any{map[string]any{"ip": "10.0.0.1"}},
 	})
 	got := endpointIPs(ep)
 	want := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
@@ -433,11 +489,11 @@ func TestParseQuarantineAnnotation(t *testing.T) {
 	if got := parseQuarantineAnnotation(ep); len(got) != 0 {
 		t.Fatalf("absent annotation = %v", got)
 	}
-	ep.Annotations[endpointGuardAnno] = ""
+	ep.SetAnnotations(map[string]string{endpointGuardAnno: ""})
 	if got := parseQuarantineAnnotation(ep); len(got) != 0 {
 		t.Fatalf("empty annotation = %v", got)
 	}
-	ep.Annotations[endpointGuardAnno] = " 10.0.0.1 , ,10.0.0.2 "
+	ep.SetAnnotations(map[string]string{endpointGuardAnno: " 10.0.0.1 , ,10.0.0.2 "})
 	got := parseQuarantineAnnotation(ep)
 	if len(got) != 2 || !got["10.0.0.1"] || !got["10.0.0.2"] {
 		t.Fatalf("parseQuarantineAnnotation = %v", got)
@@ -449,11 +505,11 @@ func TestParseQuarantineAnnotation(t *testing.T) {
 func TestWriteQuarantineAnnotation(t *testing.T) {
 	ep := kubeEndpoints(nil, nil, nil)
 	writeQuarantineAnnotation(ep, map[string]bool{"10.0.0.2": true, "10.0.0.1": true})
-	if got := ep.Annotations[endpointGuardAnno]; got != "10.0.0.1,10.0.0.2" {
+	if got := ep.GetAnnotations()[endpointGuardAnno]; got != "10.0.0.1,10.0.0.2" {
 		t.Fatalf("annotation = %q, want sorted join", got)
 	}
 	writeQuarantineAnnotation(ep, map[string]bool{})
-	if _, ok := ep.Annotations[endpointGuardAnno]; ok {
+	if _, ok := ep.GetAnnotations()[endpointGuardAnno]; ok {
 		t.Fatal("empty quarantine set left the annotation behind")
 	}
 }
@@ -472,12 +528,13 @@ func TestUnionIPs(t *testing.T) {
 // must never serialize an empty-addresses subset.
 func TestRemoveEndpointIPDropsEmptySubset(t *testing.T) {
 	ep := kubeEndpoints([]string{"10.0.0.1"}, nil, nil)
-	ep.Subsets = append(ep.Subsets, corev1.EndpointSubset{
-		Addresses: []corev1.EndpointAddress{{IP: "10.0.0.2"}},
+	appendSubset(ep, map[string]any{
+		"addresses": []any{map[string]any{"ip": "10.0.0.2"}},
 	})
 	removeEndpointIP(ep, "10.0.0.1")
-	if len(ep.Subsets) != 1 || ep.Subsets[0].Addresses[0].IP != "10.0.0.2" {
-		t.Fatalf("emptied subset not dropped: %+v", ep.Subsets)
+	subs := endpointSubsets(ep)
+	if len(subs) != 1 || subsetAddrs(ep, 0, "addresses")[0]["ip"] != "10.0.0.2" {
+		t.Fatalf("emptied subset not dropped: %+v", subs)
 	}
 }
 
@@ -487,45 +544,53 @@ func TestAddEndpointIPPlacement(t *testing.T) {
 	// Already present — no-op.
 	ep := kubeEndpoints([]string{"10.0.0.1"}, nil, nil)
 	addEndpointIP(ep, "10.0.0.1")
-	if n := len(ep.Subsets[0].Addresses); n != 1 {
+	if n := len(subsetAddrs(ep, 0, "addresses")); n != 1 {
 		t.Fatalf("duplicate address appended: %d addresses", n)
 	}
 
 	// No subsets at all — a fresh subset is seeded with port 6443/https.
 	bare := kubeEndpoints(nil, nil, nil)
-	bare.Subsets = nil
+	unstructured.RemoveNestedField(bare.Object, "subsets")
 	addEndpointIP(bare, "10.0.0.9")
-	if len(bare.Subsets) != 1 || len(bare.Subsets[0].Addresses) != 1 ||
-		bare.Subsets[0].Addresses[0].IP != "10.0.0.9" {
-		t.Fatalf("empty endpoints not re-seeded: %+v", bare.Subsets)
+	bareAddrs := subsetAddrs(bare, 0, "addresses")
+	if len(endpointSubsets(bare)) != 1 || len(bareAddrs) != 1 ||
+		bareAddrs[0]["ip"] != "10.0.0.9" {
+		t.Fatalf("empty endpoints not re-seeded: %+v", endpointSubsets(bare))
 	}
-	if p := bare.Subsets[0].Ports[0]; p.Port != 6443 || p.Name != "https" {
+	if p := nestedMaps(endpointSubsets(bare)[0], "ports")[0]; num64(p["port"]) != 6443 || p["name"] != "https" {
 		t.Fatalf("seeded subset port = %+v, want 6443/https", p)
 	}
 
 	// A subset carrying an "https" port (any number) is the target.
-	named := &corev1.Endpoints{Subsets: []corev1.EndpointSubset{
-		{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}},
-			Ports: []corev1.EndpointPort{{Name: "https", Port: 443}},
-		},
-		{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.2"}},
-			Ports: []corev1.EndpointPort{{Name: "other", Port: 1234}},
+	named := &unstructured.Unstructured{Object: map[string]any{
+		"subsets": []any{
+			map[string]any{
+				"addresses": []any{map[string]any{"ip": "10.0.0.1"}},
+				"ports":     []any{map[string]any{"name": "https", "port": int64(443)}},
+			},
+			map[string]any{
+				"addresses": []any{map[string]any{"ip": "10.0.0.2"}},
+				"ports":     []any{map[string]any{"name": "other", "port": int64(1234)}},
+			},
 		},
 	}}
 	addEndpointIP(named, "10.0.0.7")
-	if n := len(named.Subsets[0].Addresses); n != 2 {
-		t.Fatalf("IP not appended to the https subset: %+v", named.Subsets)
+	if n := len(subsetAddrs(named, 0, "addresses")); n != 2 {
+		t.Fatalf("IP not appended to the https subset: %+v", endpointSubsets(named))
 	}
 
 	// No https/6443 port anywhere — fall back to subset[0].
-	fallback := &corev1.Endpoints{Subsets: []corev1.EndpointSubset{
-		{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}},
-			Ports: []corev1.EndpointPort{{Name: "dns", Port: 53}},
+	fallback := &unstructured.Unstructured{Object: map[string]any{
+		"subsets": []any{
+			map[string]any{
+				"addresses": []any{map[string]any{"ip": "10.0.0.1"}},
+				"ports":     []any{map[string]any{"name": "dns", "port": int64(53)}},
+			},
 		},
 	}}
 	addEndpointIP(fallback, "10.0.0.8")
-	if n := len(fallback.Subsets[0].Addresses); n != 2 {
-		t.Fatalf("IP not appended to subset[0]: %+v", fallback.Subsets)
+	if n := len(subsetAddrs(fallback, 0, "addresses")); n != 2 {
+		t.Fatalf("IP not appended to subset[0]: %+v", endpointSubsets(fallback))
 	}
 }
 
@@ -571,7 +636,8 @@ func TestRemoveSliceIPDropsEmptyEndpoint(t *testing.T) {
 // No default/kubernetes Endpoints object at all -> real error.
 func TestEndpointGuardMissingEndpoints(t *testing.T) {
 	cs := fake.NewSimpleClientset()
-	g := newEndpointGuard(cs, probeTable{})
+	dyn := testutil.NewDynamicClient()
+	g := newEndpointGuard(cs, dyn, probeTable{})
 	if err := g.run(ctx); err == nil {
 		t.Fatal("expected error when the Endpoints object is missing")
 	}
@@ -580,13 +646,14 @@ func TestEndpointGuardMissingEndpoints(t *testing.T) {
 // An EndpointSlice list failure is a real error — the guard cannot
 // decide the SSOT without knowing which slices exist.
 func TestEndpointGuardSliceListError(t *testing.T) {
-	cs := fake.NewSimpleClientset(
+	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient(
 		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	cs.PrependReactor("list", "endpointslices",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	g := newEndpointGuard(cs, probeTable{
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": apiHealthyProbe(100),
 		"10.0.0.2": apiHealthyProbe(100),
 	})
@@ -598,9 +665,10 @@ func TestEndpointGuardSliceListError(t *testing.T) {
 // EndpointSlice absent entirely (empty list) is tolerated — the guard
 // still sweeps the Endpoints object.
 func TestEndpointGuardSliceAbsent(t *testing.T) {
-	cs := fake.NewSimpleClientset(
+	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient(
 		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
-	g := newEndpointGuard(cs, probeTable{
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": apiHealthyProbe(100),
 		"10.0.0.2": apiHealthyProbe(100),
 	})
@@ -611,8 +679,9 @@ func TestEndpointGuardSliceAbsent(t *testing.T) {
 
 // Zero controller IPs (empty subsets) -> clean no-op, probes skipped.
 func TestEndpointGuardNoControllerIPs(t *testing.T) {
-	cs := fake.NewSimpleClientset(kubeEndpoints(nil, nil, nil))
-	g := newEndpointGuard(cs, probeTable{}) // any probe call would error
+	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient(kubeEndpoints(nil, nil, nil))
+	g := newEndpointGuard(cs, dyn, probeTable{}) // any probe call would error
 	if err := g.run(ctx); err != nil {
 		t.Fatalf("empty controller set must be a no-op: %v", err)
 	}
@@ -622,9 +691,10 @@ func TestEndpointGuardNoControllerIPs(t *testing.T) {
 // pruned (and its metric series forgotten) — otherwise a removed
 // backend's streak could resurface as stale evidence on re-add.
 func TestEndpointGuardPrunesDepartedBackend(t *testing.T) {
-	cs := fake.NewSimpleClientset(
+	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient(
 		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
-	g := newEndpointGuard(cs, probeTable{
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": apiHealthyProbe(100),
 		"10.0.0.2": apiHealthyProbe(100),
 	})
@@ -643,15 +713,16 @@ func TestEndpointGuardPrunesDepartedBackend(t *testing.T) {
 // routable apiserver at all.
 func TestEndpointGuardSkipsQuarantineWithNoHealthyPeer(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	probes := probeTable{
 		"10.0.0.1": {err: errors.New("dead")},
 		// gapped but under the 2-cycle latch: not wedged AND not
 		// healthy — healthyActive stays 0 while 10.0.0.1 wedges.
 		"10.0.0.2": {liveRV: 1000, cacheRV: 100},
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
@@ -659,12 +730,12 @@ func TestEndpointGuardSkipsQuarantineWithNoHealthyPeer(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	ep := getKubeEndpoints(t, cs)
+	ep := getKubeEndpoints(t, dyn)
 	if got := endpointAddrSet(ep); !got["10.0.0.1"] {
 		t.Fatalf("backend quarantined with no healthy peer, addresses=%v", got)
 	}
-	if ep.Annotations[endpointGuardAnno] != "" {
-		t.Fatalf("annotation = %q, want empty", ep.Annotations[endpointGuardAnno])
+	if ep.GetAnnotations()[endpointGuardAnno] != "" {
+		t.Fatalf("annotation = %q, want empty", ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
 
@@ -675,24 +746,25 @@ func TestEndpointGuardSkipsQuarantineWithNoHealthyPeer(t *testing.T) {
 // (The notReady suspect itself is still probed and could be pulled.)
 func TestEndpointGuardNotReadyPeerCountsAsNoPeer(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1"}, []string{"10.0.0.2"}, nil),
 		kubeEndpointSlice([]string{"10.0.0.1"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1"}, []string{"10.0.0.2"}, nil))
 	probes := probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500), // healthy probe, but NOT routable
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 	for i := 0; i < endpointGuardErrCycles; i++ {
 		if err := g.run(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ep := getKubeEndpoints(t, cs)
+	ep := getKubeEndpoints(t, dyn)
 	if !endpointAddrSet(ep)["10.0.0.1"] {
 		t.Fatal("last routable backend quarantined on a notReady peer's health")
 	}
-	if ep.Annotations[endpointGuardAnno] != "" {
-		t.Fatalf("annotation = %q, want empty", ep.Annotations[endpointGuardAnno])
+	if ep.GetAnnotations()[endpointGuardAnno] != "" {
+		t.Fatalf("annotation = %q, want empty", ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
 
@@ -706,8 +778,9 @@ func TestEndpointGuardSliceModeNotReadyPeerCountsAsNoPeer(t *testing.T) {
 		Conditions: discoveryv1.EndpointConditions{Ready: &down},
 	})
 	cs := fake.NewSimpleClientset(eps)
+	dyn := testutil.NewDynamicClient()
 	fakeServerVersion(cs, "1", "33")
-	g := newEndpointGuard(cs, probeTable{
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	})
@@ -732,30 +805,31 @@ func TestEndpointGuardSliceModeNotReadyPeerCountsAsNoPeer(t *testing.T) {
 // cadence releases (quarantineActive clears).
 func TestEndpointGuardQuarantineExpiresForDepartedBackend(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, []string{"10.0.0.9"}),
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, []string{"10.0.0.9"}))
 	probes := probeTable{
 		"10.0.0.1": apiHealthyProbe(1000),
 		"10.0.0.2": apiHealthyProbe(1000),
 		"10.0.0.9": {err: errors.New("connection refused")},
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 	for i := 0; i < endpointGuardExpireCyc-1; i++ {
 		if err := g.run(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ep := getKubeEndpoints(t, cs)
-	if ep.Annotations[endpointGuardAnno] != "10.0.0.9" {
+	ep := getKubeEndpoints(t, dyn)
+	if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.9" {
 		t.Fatalf("quarantine dropped before %d err cycles: %q",
-			endpointGuardExpireCyc, ep.Annotations[endpointGuardAnno])
+			endpointGuardExpireCyc, ep.GetAnnotations()[endpointGuardAnno])
 	}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	ep = getKubeEndpoints(t, cs)
-	if _, ok := ep.Annotations[endpointGuardAnno]; ok {
-		t.Fatalf("dead backend still pinned: %q", ep.Annotations[endpointGuardAnno])
+	ep = getKubeEndpoints(t, dyn)
+	if _, ok := ep.GetAnnotations()[endpointGuardAnno]; ok {
+		t.Fatalf("dead backend still pinned: %q", ep.GetAnnotations()[endpointGuardAnno])
 	}
 	if endpointAddrSet(ep)["10.0.0.9"] {
 		t.Fatal("expired backend re-added to addresses — expiry must not re-add")
@@ -777,25 +851,24 @@ func TestEndpointGuardQuarantineExpiresForDepartedBackend(t *testing.T) {
 // sets is the decommissioned tell.
 func TestEndpointGuardQuarantineNeverExpiresWhileAddressed(t *testing.T) {
 	ep := kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, []string{"10.0.0.9"})
-	ep.Subsets[0].Addresses = append(ep.Subsets[0].Addresses,
-		corev1.EndpointAddress{IP: "10.0.0.9"}) // reconciler re-added it
-	cs := fake.NewSimpleClientset(ep)
+	appendAddr(ep, 0, "addresses", "10.0.0.9") // reconciler re-added it
+	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient(ep)
 	probes := probeTable{
 		"10.0.0.1": apiHealthyProbe(1000),
 		"10.0.0.2": apiHealthyProbe(1000),
 		"10.0.0.9": {err: errors.New("connection refused")},
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 	for i := 0; i < endpointGuardExpireCyc+2; i++ {
 		// The endpoint reconciler re-adds a pulled LIVE backend every
 		// ~10s — simulate that before each sweep (the guard pulls it
 		// again each cycle because it still wedges).
-		cur := getKubeEndpoints(t, cs)
+		cur := getKubeEndpoints(t, dyn)
 		if !endpointAddrSet(cur)["10.0.0.9"] {
 			cur = cur.DeepCopy()
-			cur.Subsets[0].Addresses = append(cur.Subsets[0].Addresses,
-				corev1.EndpointAddress{IP: "10.0.0.9"})
-			if _, err := cs.CoreV1().Endpoints(endpointGuardNS).
+			appendAddr(cur, 0, "addresses", "10.0.0.9")
+			if _, err := dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
 				Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
 				t.Fatal(err)
 			}
@@ -804,8 +877,8 @@ func TestEndpointGuardQuarantineNeverExpiresWhileAddressed(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if ep := getKubeEndpoints(t, cs); ep.Annotations[endpointGuardAnno] != "10.0.0.9" {
-		t.Fatalf("addressed backend expired: %q", ep.Annotations[endpointGuardAnno])
+	if ep := getKubeEndpoints(t, dyn); ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.9" {
+		t.Fatalf("addressed backend expired: %q", ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
 
@@ -813,9 +886,10 @@ func TestEndpointGuardQuarantineNeverExpiresWhileAddressed(t *testing.T) {
 // bookkeeping: a lone quarantined dead IP (zero active addresses)
 // still gets its annotation shrink persisted.
 func TestEndpointGuardExpiryNotBlockedByMinBackends(t *testing.T) {
-	cs := fake.NewSimpleClientset(
+	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient(
 		kubeEndpoints(nil, nil, []string{"10.0.0.9"}))
-	g := newEndpointGuard(cs, probeTable{
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.9": {err: errors.New("connection refused")},
 	})
 	for i := 0; i < endpointGuardExpireCyc; i++ {
@@ -823,10 +897,10 @@ func TestEndpointGuardExpiryNotBlockedByMinBackends(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ep := getKubeEndpoints(t, cs)
-	if _, ok := ep.Annotations[endpointGuardAnno]; ok {
+	ep := getKubeEndpoints(t, dyn)
+	if _, ok := ep.GetAnnotations()[endpointGuardAnno]; ok {
 		t.Fatalf("expiry deadlocked behind the min-backends gate: %q",
-			ep.Annotations[endpointGuardAnno])
+			ep.GetAnnotations()[endpointGuardAnno])
 	}
 	if g.quarantineActive {
 		t.Fatal("quarantineActive still armed after expiry under min-backends")
@@ -838,9 +912,10 @@ func TestEndpointGuardExpiryNotBlockedByMinBackends(t *testing.T) {
 // of failing the mutation.
 func TestEndpointGuardQuarantinesAnnotationlessEndpoints(t *testing.T) {
 	ep := kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil)
-	ep.Annotations = nil
-	cs := fake.NewSimpleClientset(ep)
-	g := newEndpointGuard(cs, probeTable{
+	unstructured.RemoveNestedField(ep.Object, "metadata", "annotations")
+	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient(ep)
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	})
@@ -849,9 +924,9 @@ func TestEndpointGuardQuarantinesAnnotationlessEndpoints(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ep = getKubeEndpoints(t, cs)
-	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
-		t.Fatalf("annotation = %q, want 10.0.0.1", ep.Annotations[endpointGuardAnno])
+	ep = getKubeEndpoints(t, dyn)
+	if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("annotation = %q, want 10.0.0.1", ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
 
@@ -859,16 +934,17 @@ func TestEndpointGuardQuarantinesAnnotationlessEndpoints(t *testing.T) {
 // sweep so the EndpointSlice can never converge ahead of it.
 func TestEndpointGuardEndpointsUpdateError(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
-	g := newEndpointGuard(cs, probeTable{
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	})
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	cs.PrependReactor("update", "endpoints",
+	dyn.PrependReactor("update", "endpoints",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("update rejected")
 		})
@@ -882,9 +958,10 @@ func TestEndpointGuardEndpointsUpdateError(t *testing.T) {
 // re-applies the slice diff.
 func TestEndpointGuardSliceUpdateErrorTolerated(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
-	g := newEndpointGuard(cs, probeTable{
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	})
@@ -899,9 +976,9 @@ func TestEndpointGuardSliceUpdateErrorTolerated(t *testing.T) {
 		t.Fatalf("slice update failure must not fail the run: %v", err)
 	}
 	// Endpoints still converged — the slice retries next cycle.
-	ep := getKubeEndpoints(t, cs)
-	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
-		t.Fatalf("annotation = %q", ep.Annotations[endpointGuardAnno])
+	ep := getKubeEndpoints(t, dyn)
+	if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("annotation = %q", ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
 
@@ -921,14 +998,16 @@ func TestEndpointGuardProbeNoTransport(t *testing.T) {
 // to 30s. Real-timer bound: ~40s (the 30s first tick is the code
 // under test — the fake's action log is the sync point, not a sleep).
 func TestEndpointGuardStartCycles(t *testing.T) {
-	cs := fake.NewSimpleClientset() // no Endpoints -> first sweep errors
+	cs := fake.NewSimpleClientset()    // no EndpointSlice -> read-through falls to Endpoints
+	dyn := testutil.NewDynamicClient() // no Endpoints -> first sweep errors
 	// probed receives each backend IP the sweep probes — a probe call
 	// is the deterministic sync point for "run() got past the
 	// fetch/decide stage" where quarantineActive is (re)assigned; the
 	// clientset action count alone can't prove the sweep finished.
 	probed := make(chan string, 8)
 	g := &apiServerEndpointGuard{
-		cs: cs,
+		cs:  cs,
+		dyn: dyn,
 		probeFn: func(_ context.Context, ip string) apiProbeResult {
 			probed <- ip
 			return *apiHealthyProbe(1)
@@ -964,7 +1043,7 @@ func TestEndpointGuardStartCycles(t *testing.T) {
 	// Seed a lone-backend Endpoints so the second (10s-cadence) sweep
 	// reaches the probe stage — its success clears quarantineActive
 	// and resets the interval to 30s (the else branch).
-	if _, err := cs.CoreV1().Endpoints(endpointGuardNS).Create(ctx,
+	if _, err := dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).Create(ctx,
 		kubeEndpoints([]string{"10.0.0.1"}, nil, nil), metav1.CreateOptions{}); err != nil {
 		t.Fatalf("seed endpoints: %v", err)
 	}
@@ -1013,11 +1092,15 @@ func kubeSliceWithQuarantine(ips, quarantined []string) *discoveryv1.EndpointSli
 	return eps
 }
 
-// actionResources tallies clientset actions per resource — used to
-// prove the slice path never touches corev1 Endpoints.
-func actionResources(cs *fake.Clientset) map[string]int {
+// actionResources tallies fake-client actions per resource — used to
+// prove the slice path never touches the deprecated Endpoints object.
+type actionLogger interface {
+	Actions() []ktesting.Action
+}
+
+func actionResources(f actionLogger) map[string]int {
 	out := map[string]int{}
-	for _, a := range cs.Actions() {
+	for _, a := range f.Actions() {
 		out[a.GetResource().Resource]++
 	}
 	return out
@@ -1117,10 +1200,11 @@ func TestEndpointGuardSliceIPs(t *testing.T) {
 // annotation recorded — while corev1 Endpoints is never even read.
 func TestEndpointGuardSliceModeQuarantine(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	fakeServerVersion(cs, "1", "33")
-	g := newEndpointGuard(cs, probeTable{
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	})
@@ -1138,10 +1222,10 @@ func TestEndpointGuardSliceModeQuarantine(t *testing.T) {
 			eps.Annotations[endpointGuardAnno])
 	}
 	// The deprecated object must stay untouched — no reads, no writes.
-	if acts := actionResources(cs)["endpoints"]; acts != 0 {
+	if acts := actionResources(dyn)["endpoints"]; acts != 0 {
 		t.Fatalf("%d endpoints actions on the slice path, want 0", acts)
 	}
-	ep := getKubeEndpoints(t, cs)
+	ep := getKubeEndpoints(t, dyn)
 	if !endpointAddrSet(ep)["10.0.0.1"] {
 		t.Fatal("Endpoints object was mutated on the slice path")
 	}
@@ -1152,12 +1236,13 @@ func TestEndpointGuardSliceModeQuarantine(t *testing.T) {
 func TestEndpointGuardSliceModeReaddsRecovered(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		kubeSliceWithQuarantine([]string{"10.0.0.2"}, []string{"10.0.0.1"}))
+	dyn := testutil.NewDynamicClient()
 	fakeServerVersion(cs, "1", "34")
 	probes := probeTable{
 		"10.0.0.1": apiHealthyProbe(1000),
 		"10.0.0.2": apiHealthyProbe(1000),
 	}
-	g := newEndpointGuard(cs, probes)
+	g := newEndpointGuard(cs, dyn, probes)
 	for i := 0; i < endpointGuardRecoverCyc; i++ {
 		if err := g.run(ctx); err != nil {
 			t.Fatal(err)
@@ -1177,8 +1262,9 @@ func TestEndpointGuardSliceModeReaddsRecovered(t *testing.T) {
 // alone falls back to Endpoints instead (below).
 func TestEndpointGuardSliceModeMissingSlice(t *testing.T) {
 	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient()
 	fakeServerVersion(cs, "1", "33")
-	g := newEndpointGuard(cs, probeTable{})
+	g := newEndpointGuard(cs, dyn, probeTable{})
 	if err := g.run(ctx); err == nil {
 		t.Fatal("expected error when neither endpoints object exists")
 	}
@@ -1187,10 +1273,11 @@ func TestEndpointGuardSliceModeMissingSlice(t *testing.T) {
 // On >=v1.33 a missing slice drops back to the Endpoints path rather
 // than dead-looping — the deprecated object is still writable there.
 func TestEndpointGuardSliceModeFallsBackToEndpoints(t *testing.T) {
-	cs := fake.NewSimpleClientset(
+	cs := fake.NewSimpleClientset()
+	dyn := testutil.NewDynamicClient(
 		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	fakeServerVersion(cs, "1", "33")
-	g := newEndpointGuard(cs, probeTable{
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	})
@@ -1199,10 +1286,10 @@ func TestEndpointGuardSliceModeFallsBackToEndpoints(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ep := getKubeEndpoints(t, cs)
-	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
+	ep := getKubeEndpoints(t, dyn)
+	if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
 		t.Fatalf("fallback did not run the Endpoints path, annotation = %q",
-			ep.Annotations[endpointGuardAnno])
+			ep.GetAnnotations()[endpointGuardAnno])
 	}
 }
 
@@ -1211,8 +1298,9 @@ func TestEndpointGuardSliceModeFallsBackToEndpoints(t *testing.T) {
 func TestEndpointGuardSliceModeKeepsSoleHealthy(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		kubeSliceWithQuarantine([]string{"10.0.0.2"}, []string{"10.0.0.1"}))
+	dyn := testutil.NewDynamicClient()
 	fakeServerVersion(cs, "1", "33")
-	g := newEndpointGuard(cs, probeTable{
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": {err: errors.New("still down")},
 		"10.0.0.2": {err: errors.New("just wedged")},
 	})
@@ -1229,8 +1317,9 @@ func TestEndpointGuardSliceModeKeepsSoleHealthy(t *testing.T) {
 func TestEndpointGuardSliceModeUpdateError(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	dyn := testutil.NewDynamicClient()
 	fakeServerVersion(cs, "1", "33")
-	g := newEndpointGuard(cs, probeTable{
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	})
@@ -1258,10 +1347,11 @@ func TestEndpointGuardSliceModeUpdateError(t *testing.T) {
 // Endpoints (the mirror's source of truth), the mirror slice converges.
 func TestEndpointGuardMirrorSliceEndpointsSSOT(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
 		kubeMirrorSlice("kubernetes-89b87", []string{"10.0.0.1", "10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	fakeServerVersion(cs, "1", "37")
-	g := newEndpointGuard(cs, probeTable{
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	})
@@ -1270,13 +1360,13 @@ func TestEndpointGuardMirrorSliceEndpointsSSOT(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ep := getKubeEndpoints(t, cs)
+	ep := getKubeEndpoints(t, dyn)
 	if endpointAddrSet(ep)["10.0.0.1"] {
 		t.Fatal("wedged IP still in Endpoints")
 	}
-	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
+	if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
 		t.Fatalf("annotation not on the Endpoints SSOT: %q",
-			ep.Annotations[endpointGuardAnno])
+			ep.GetAnnotations()[endpointGuardAnno])
 	}
 	// The mirror slice converges too — the direct write beats the
 	// mirror controller's own resync.
@@ -1297,8 +1387,9 @@ func TestEndpointGuardGeneratedNameSliceSSOT(t *testing.T) {
 	eps := kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"})
 	eps.Name = "kubernetes-xy12z"
 	cs := fake.NewSimpleClientset(eps)
+	dyn := testutil.NewDynamicClient()
 	fakeServerVersion(cs, "1", "34")
-	g := newEndpointGuard(cs, probeTable{
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	})
@@ -1327,7 +1418,8 @@ func TestEndpointGuardGeneratedNameSliceSSOT(t *testing.T) {
 func TestEndpointGuardSliceOnlyFallback(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		kubeMirrorSlice("kubernetes-89b87", []string{"10.0.0.1", "10.0.0.2"}))
-	g := newEndpointGuard(cs, probeTable{
+	dyn := testutil.NewDynamicClient()
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": apiHealthyProbe(100),
 		"10.0.0.2": apiHealthyProbe(100),
 	})
@@ -1340,12 +1432,14 @@ func TestEndpointGuardSliceOnlyFallback(t *testing.T) {
 // rebuilt from the Endpoints object on the next mirror reconcile.
 func TestEndpointGuardMirrorSliceIgnoredOnNewVersion(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
 		kubeMirrorSlice("kubernetes-89b87", []string{"10.0.0.1", "10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	fakeServerVersion(cs, "1", "34")
 	probed := map[string]int{}
 	g := &apiServerEndpointGuard{
-		cs: cs,
+		cs:  cs,
+		dyn: dyn,
 		probeFn: func(_ context.Context, ip string) apiProbeResult {
 			probed[ip]++
 			return *apiHealthyProbe(100)
@@ -1365,15 +1459,17 @@ func TestEndpointGuardMirrorSliceIgnoredOnNewVersion(t *testing.T) {
 // it stays probed and quarantineActive stays armed.
 func TestEndpointGuardMemQuarantineSurvivesAnnotationLoss(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
 	probed := map[string]int{}
 	probes := probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	}
 	g := &apiServerEndpointGuard{
-		cs: cs,
+		cs:  cs,
+		dyn: dyn,
 		probeFn: func(_ context.Context, ip string) apiProbeResult {
 			probed[ip]++
 			return probes.fn(context.Background(), ip)
@@ -1392,10 +1488,12 @@ func TestEndpointGuardMemQuarantineSurvivesAnnotationLoss(t *testing.T) {
 	}
 	// Simulate the reconciler rebuilding the object without the
 	// annotation (and without re-adding the pulled IP yet).
-	ep := getKubeEndpoints(t, cs)
+	ep := getKubeEndpoints(t, dyn)
 	ep = ep.DeepCopy()
-	delete(ep.Annotations, endpointGuardAnno)
-	if _, err := cs.CoreV1().Endpoints(endpointGuardNS).
+	annos := ep.GetAnnotations()
+	delete(annos, endpointGuardAnno)
+	ep.SetAnnotations(annos)
+	if _, err := dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
 		Update(ctx, ep, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -1410,7 +1508,7 @@ func TestEndpointGuardMemQuarantineSurvivesAnnotationLoss(t *testing.T) {
 		t.Fatalf("quarantined IP probed %d times, want 1", probed["10.0.0.1"])
 	}
 	// Still wedged -> the pulled IP stays out of the object.
-	if got := endpointAddrSet(getKubeEndpoints(t, cs)); got["10.0.0.1"] {
+	if got := endpointAddrSet(getKubeEndpoints(t, dyn)); got["10.0.0.1"] {
 		t.Fatal("wedged backend back in endpoints while still failing")
 	}
 }
@@ -1448,9 +1546,10 @@ func (r recordingWarnings) HandleWarningHeaderWithContext(_ context.Context, _ i
 // the sweep still functions on a cluster whose /version is broken.
 func TestEndpointGuardVersionUndetectableFallsBack(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil),
 		kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
-	g := newEndpointGuard(cs, probeTable{
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
+	g := newEndpointGuard(cs, dyn, probeTable{
 		"10.0.0.1": {err: errors.New("wedged")},
 		"10.0.0.2": apiHealthyProbe(500),
 	})
@@ -1462,9 +1561,9 @@ func TestEndpointGuardVersionUndetectableFallsBack(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ep := getKubeEndpoints(t, cs)
-	if ep.Annotations[endpointGuardAnno] != "10.0.0.1" {
+	ep := getKubeEndpoints(t, dyn)
+	if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
 		t.Fatalf("fallback did not run the Endpoints path, annotation = %q",
-			ep.Annotations[endpointGuardAnno])
+			ep.GetAnnotations()[endpointGuardAnno])
 	}
 }

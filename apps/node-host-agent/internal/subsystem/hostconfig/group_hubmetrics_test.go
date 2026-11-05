@@ -93,7 +93,7 @@ func TestHubMetricsNexpSkipsNewerVersion(t *testing.T) {
 	deb := []byte("fake-deb-payload")
 	sum := sha256.Sum256(deb)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(deb)
+		_, _ = w.Write(deb)
 	}))
 	t.Cleanup(srv.Close)
 	vars := writeVarsDir(t, fmt.Sprintf(`interdc_nexp_version: "1.7.0-1ubuntu0.3"
@@ -126,7 +126,7 @@ func TestHubMetricsNexpInstallsPinnedDeb(t *testing.T) {
 	deb := []byte("fake-deb-payload")
 	sum := sha256.Sum256(deb)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(deb)
+		_, _ = w.Write(deb)
 	}))
 	t.Cleanup(srv.Close)
 	vars := writeVarsDir(t, fmt.Sprintf(`interdc_nexp_version: "1.7.0-1ubuntu0.3"
@@ -156,7 +156,7 @@ interdc_nexp_deb_sha256: "%x"
 
 func TestHubMetricsNexpRejectsBadSHA(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("tampered"))
+		_, _ = w.Write([]byte("tampered"))
 	}))
 	t.Cleanup(srv.Close)
 	vars := writeVarsDir(t, fmt.Sprintf(`interdc_nexp_version: "9.9.9"

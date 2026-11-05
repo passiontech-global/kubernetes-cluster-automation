@@ -214,7 +214,7 @@ func (c *Client) CheckWebhook(ctx context.Context, r Resource) (int, error) {
 		}
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// Drain (bounded) so the keep-alive connection can be reused.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	return resp.StatusCode, nil
@@ -237,7 +237,7 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode/100 != 2 {
 		// Drain (bounded) so the keep-alive connection can be reused.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))

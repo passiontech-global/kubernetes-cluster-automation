@@ -32,11 +32,11 @@ const checkPKIDrift = "cp-cert-drift"
 func tlsDialCert(ctx context.Context, addr string) (*x509.Certificate, error) {
 	d := &net.Dialer{Timeout: 8 * time.Second}
 	conn, err := tls.DialWithDialer(d, "tcp", addr,
-		&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // drift check wants the presented cert
+		&tls.Config{InsecureSkipVerify: true}) // drift check wants the presented cert
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	state := conn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		return nil, errors.New("no peer certificate")

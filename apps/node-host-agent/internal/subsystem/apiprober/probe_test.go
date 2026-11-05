@@ -45,7 +45,7 @@ func TestTCPPreflightRealDial(t *testing.T) {
 	if err := p.tcpPreflight(context.Background(), addr); err != nil {
 		t.Fatalf("tcpPreflight(%s) err=%v want nil", addr, err)
 	}
-	ln.Close()
+	_ = ln.Close()
 	// Nothing listens now — the dial must fail fast (conn refused).
 	if err := p.tcpPreflight(context.Background(), addr); err == nil {
 		t.Fatalf("tcpPreflight(%s) after close want error", addr)
@@ -57,7 +57,7 @@ func TestListRV(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"metadata":{"resourceVersion":"42"}}`)
+		_, _ = io.WriteString(w, `{"metadata":{"resourceVersion":"42"}}`)
 	}))
 	defer srv.Close()
 	addr := strings.TrimPrefix(srv.URL, "https://")
@@ -109,7 +109,7 @@ func TestListRVFailureModes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(tc.status)
-				io.WriteString(w, tc.body)
+				_, _ = io.WriteString(w, tc.body)
 			}))
 			defer srv.Close()
 			// HTTPClient==nil exercises the production path — a
@@ -200,7 +200,7 @@ func TestListRVParseAndTimeout(t *testing.T) {
 	mkProber := func(t *testing.T, body string) (*Prober, string) {
 		t.Helper()
 		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			io.WriteString(w, body)
+			_, _ = io.WriteString(w, body)
 		}))
 		t.Cleanup(srv.Close)
 		p, err := New(Config{HTTPClient: srv.Client()}, prometheus.NewRegistry())
@@ -260,7 +260,7 @@ func TestListRVSendsPartialObjectMetadataAccept(t *testing.T) {
 	var gotAccept string
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAccept = r.Header.Get("Accept")
-		io.WriteString(w, `{"metadata":{"resourceVersion":"42"}}`)
+		_, _ = io.WriteString(w, `{"metadata":{"resourceVersion":"42"}}`)
 	}))
 	defer srv.Close()
 	p, err := New(Config{HTTPClient: srv.Client()}, prometheus.NewRegistry())

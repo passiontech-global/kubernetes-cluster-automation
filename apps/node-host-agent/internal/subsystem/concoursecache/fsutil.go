@@ -44,13 +44,17 @@ func entryBlocks(info os.FileInfo) uint64 {
 // size, so sparse files measure like du does.
 func diskUsage(root string) uint64 {
 	var total uint64
-	_ = filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+			logger().Debug("du: unreadable entry skipped",
+				"path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
 		}
 		info, err := d.Info()
 		if err != nil {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+			logger().Debug("du: unreadable entry skipped",
+				"path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
 		}
 		total += entryBlocks(info)
 		return nil
@@ -66,11 +70,15 @@ func diskUsageByTopDir(root string) (total uint64, perDir map[string]uint64) {
 	perDir = map[string]uint64{}
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+			logger().Debug("du: unreadable entry skipped",
+				"path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
 		}
 		info, err := d.Info()
 		if err != nil {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+			logger().Debug("du: unreadable entry skipped",
+				"path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
 		}
 		sz := entryBlocks(info)
 		total += sz
@@ -90,8 +98,13 @@ func diskUsageByTopDir(root string) (total uint64, perDir map[string]uint64) {
 func filesByAge(root string) []cacheFile {
 	var out []cacheFile
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !d.Type().IsRegular() {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+		if err != nil {
+			logger().Debug("find: unreadable entry skipped",
+				"path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
+		}
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil
 		}
 		if info, err := d.Info(); err == nil {
 			out = append(out, cacheFile{path: path, size: info.Size(), modTime: info.ModTime()})
@@ -132,7 +145,9 @@ func topLevelDirsByAge(root string) []cacheFile {
 func makeWritable(root string) {
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+			logger().Debug("chmod -R: unreadable entry skipped",
+				"path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
 		}
 		// Skip symlinks: coreutils chmod -R never touches link targets
 		// (node_modules .bin is a symlink farm onto other trees).

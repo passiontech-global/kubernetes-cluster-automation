@@ -326,7 +326,7 @@ func copyFileAtomic(src, dst string, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 
 	tmp := dst + ".tmp"
 	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)

@@ -162,13 +162,13 @@ func Run(ctx context.Context, cfg Config, cutoff time.Time, out io.Writer) error
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "to delete: %d\n", len(paths))
+	_, _ = fmt.Fprintf(out, "to delete: %d\n", len(paths))
 	ok, errs, firstErr := deleteAll(ctx, client, cfg.API, paths, cfg.Workers)
-	fmt.Fprintf(out, "deleted=%d errors=%d\n", ok, errs)
+	_, _ = fmt.Fprintf(out, "deleted=%d errors=%d\n", ok, errs)
 	if firstErr != "" {
 		// The tally alone cannot say WHY deletes failed — RBAC,
 		// a wedged apiserver and a 404 storm all read "errors=N".
-		fmt.Fprintf(out, "first error: %s\n", firstErr)
+		_, _ = fmt.Fprintf(out, "first error: %s\n", firstErr)
 	}
 	return nil
 }
@@ -184,7 +184,7 @@ func doReq(ctx context.Context, client *http.Client, method, u string) (int, []b
 	if err != nil {
 		return 0, nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// Read cap+1 so an oversize body is distinguishable from one
 	// landing exactly on the cap — a LimitReader-truncated page would
 	// otherwise surface downstream as a misleading JSON syntax error.

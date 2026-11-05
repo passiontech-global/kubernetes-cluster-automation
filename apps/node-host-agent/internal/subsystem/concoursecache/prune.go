@@ -84,12 +84,22 @@ func (p *Pruner) deleteOldFiles(ctx context.Context, dir, bucket string, maxAge 
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
-		if err != nil || d.IsDir() || !d.Type().IsRegular() {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+		if err != nil {
+			log.Debug("age prune: unreadable entry skipped",
+				"bucket", bucket, "path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
+		}
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil
 		}
 		info, err := d.Info()
-		if err != nil || now.Sub(info.ModTime()) <= maxAge {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+		if err != nil {
+			log.Debug("age prune: unreadable entry skipped",
+				"bucket", bucket, "path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
+		}
+		if now.Sub(info.ModTime()) <= maxAge {
+			return nil
 		}
 		if err := os.Remove(path); err == nil {
 			n++
@@ -236,16 +246,26 @@ func (p *Pruner) pruneNodeDeps(ctx context.Context, sc string, cfg Config, log *
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
-		if err != nil || d.IsDir() || !d.Type().IsRegular() {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+		if err != nil {
+			log.Debug("node-deps: unreadable entry skipped",
+				"path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
+		}
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil
 		}
 		name := d.Name()
 		if !strings.HasPrefix(name, ".lock-") && !strings.HasPrefix(name, ".tmp-") {
 			return nil
 		}
 		info, err := d.Info()
-		if err != nil || now.Sub(info.ModTime()) <= cfg.NodeDepsLockAge {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+		if err != nil {
+			log.Debug("node-deps: unreadable entry skipped",
+				"path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
+		}
+		if now.Sub(info.ModTime()) <= cfg.NodeDepsLockAge {
+			return nil
 		}
 		if err := os.Remove(path); err == nil {
 			nlocks++

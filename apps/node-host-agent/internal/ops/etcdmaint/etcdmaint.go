@@ -260,11 +260,11 @@ func (r *rescuer) status(ctx context.Context) (endpointStatus, error) {
 func (r *rescuer) printAlarmList(ctx context.Context, emptyNote string) {
 	al, err := r.etcdctl(ctx, "", "alarm", "list")
 	if err != nil {
-		fmt.Fprintf(r.out, "(alarm list error: %v)\n", err)
+		_, _ = fmt.Fprintf(r.out, "(alarm list error: %v)\n", err)
 		return
 	}
 	if len(bytes.TrimSpace(al)) == 0 {
-		fmt.Fprintln(r.out, emptyNote)
+		_, _ = fmt.Fprintln(r.out, emptyNote)
 		return
 	}
 	_, _ = r.out.Write(al)
@@ -407,7 +407,7 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 	if err != nil {
 		return err // service never stopped — nothing to restore
 	}
-	fmt.Fprintf(r.out,
+	_, _ = fmt.Fprintf(r.out,
 		">>> etcd pid=%d data-dir=%s quota-backend-bytes=%s\n",
 		pid,
 		flagValue(flags, "--data-dir", filepath.Join(r.cfg.K0sDir, "etcd")),
@@ -416,7 +416,7 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 	if _, serr := r.systemctl(ctx, "stop"); serr != nil {
 		return fmt.Errorf("systemctl stop %s: %w", r.cfg.Svc, serr)
 	}
-	fmt.Fprintf(r.out, ">>> %s stopped — starting standalone etcd\n",
+	_, _ = fmt.Fprintf(r.out, ">>> %s stopped — starting standalone etcd\n",
 		r.cfg.Svc)
 	// From here the service is down: ALWAYS start it again and wait
 	// for the k0s-managed etcd to come back healthy, even when a
@@ -424,7 +424,7 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 	defer func() {
 		dctx := context.WithoutCancel(ctx)
 		if _, serr := r.systemctl(dctx, "start"); serr != nil {
-			fmt.Fprintf(r.out, ">>> systemctl start %s failed: %v\n",
+			_, _ = fmt.Fprintf(r.out, ">>> systemctl start %s failed: %v\n",
 				r.cfg.Svc, serr)
 			if err == nil {
 				err = fmt.Errorf("systemctl start %s: %w", r.cfg.Svc, serr)
@@ -432,7 +432,7 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 			return
 		}
 		if herr := r.waitHealthy(dctx, postStartHealthTries); herr != nil {
-			fmt.Fprintf(r.out,
+			_, _ = fmt.Fprintf(r.out,
 				">>> %s not healthy after restart: %v\n", r.cfg.Svc, herr)
 			if err == nil {
 				err = fmt.Errorf("etcd unhealthy after %s restart: %w",
@@ -448,14 +448,14 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 	// Fixed log path like the script's /tmp/etcd-standalone.log —
 	// survives the run for post-mortem and never accumulates tempdirs.
 	logPath := filepath.Join(os.TempDir(), "etcd-standalone.log")
-	fmt.Fprintf(r.out, ">>> standalone etcd log: %s\n", logPath)
+	_, _ = fmt.Fprintf(r.out, ">>> standalone etcd log: %s\n", logPath)
 	tmp, terr := r.cfg.StartTempEtcd(ctx, r.etcdBin, flags, logPath)
 	if terr != nil {
 		return fmt.Errorf("start standalone etcd: %w", terr)
 	}
 	if herr := r.waitHealthy(ctx, tempEtcdHealthTries); herr != nil {
 		if kerr := tmp.Kill(); kerr != nil { // SIGTERM — grace before reap
-			fmt.Fprintf(r.out, "(kill standalone etcd: %v)\n", kerr)
+			_, _ = fmt.Fprintf(r.out, "(kill standalone etcd: %v)\n", kerr)
 		}
 		_ = tmp.Wait()
 		return fmt.Errorf("standalone etcd never came up: %w", herr)
@@ -463,13 +463,13 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 
 	_, derr := r.etcdctl(ctx, offlineDefragTimeout, "defrag")
 	if kerr := tmp.Kill(); kerr != nil {
-		fmt.Fprintf(r.out, "(kill standalone etcd: %v)\n", kerr)
+		_, _ = fmt.Fprintf(r.out, "(kill standalone etcd: %v)\n", kerr)
 	}
 	_ = tmp.Wait()
 	if derr != nil {
 		return fmt.Errorf("offline defrag: %w", derr)
 	}
-	fmt.Fprintln(r.out, ">>> offline defrag done")
+	_, _ = fmt.Fprintln(r.out, ">>> offline defrag done")
 	return nil
 }
 
@@ -482,7 +482,7 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 
 	// [1/6] Before-snapshot: table for humans, json for the numbers,
 	// then the alarm list (|| true in the script).
-	fmt.Fprintln(out, "[1/6] ===== BEFORE RESCUE =====")
+	_, _ = fmt.Fprintln(out, "[1/6] ===== BEFORE RESCUE =====")
 	tbl, err := r.etcdctl(ctx, "", "endpoint", "status", "-w", "table")
 	if err != nil {
 		return fmt.Errorf("endpoint status: %w", err)
@@ -492,7 +492,7 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("endpoint status -w json: %w", err)
 	}
-	fmt.Fprintf(out, "dbSize=%d dbSizeInUse=%d revision=%d\n",
+	_, _ = fmt.Fprintf(out, "dbSize=%d dbSizeInUse=%d revision=%d\n",
 		st.DBSize, st.DBSizeInUse, st.Revision)
 	r.printAlarmList(ctx, "alarm list: (none)")
 
@@ -500,10 +500,10 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 	// script's `|| echo` tolerated ANY compact failure — keep that,
 	// but print the real error: a timeout/auth/network failure must
 	// not masquerade as "already compacted".
-	fmt.Fprintf(out, "[2/6] >>> compact to revision %d\n", st.Revision)
+	_, _ = fmt.Fprintf(out, "[2/6] >>> compact to revision %d\n", st.Revision)
 	if _, err := r.etcdctl(ctx, "", "compact", "--physical",
 		strconv.FormatInt(st.Revision, 10)); err != nil {
-		fmt.Fprintf(out, "(compact error — skipping: %v)\n", err)
+		_, _ = fmt.Fprintf(out, "(compact error — skipping: %v)\n", err)
 	}
 
 	// [3/6] Online defrag first (no downtime). Field-proven caveat:
@@ -516,21 +516,21 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 		// Contradictory flags — OnlineOnly is the safety promise
 		// (no control-plane stop), so it degrades the flag pair to
 		// a plain online attempt.
-		fmt.Fprintln(out, "[3/6] >>> --force-offline ignored under OnlineOnly")
+		_, _ = fmt.Fprintln(out, "[3/6] >>> --force-offline ignored under OnlineOnly")
 		needOffline = false
 	case cfg.ForceOffline:
-		fmt.Fprintln(out, "[3/6] >>> --force-offline: skipping online defrag")
+		_, _ = fmt.Fprintln(out, "[3/6] >>> --force-offline: skipping online defrag")
 	}
 	if !needOffline {
-		fmt.Fprintln(out, "[3/6] >>> trying online defrag...")
+		_, _ = fmt.Fprintln(out, "[3/6] >>> trying online defrag...")
 		if _, err := r.etcdctl(ctx, onlineDefragTimeout, "defrag"); err != nil {
-			fmt.Fprintln(out,
+			_, _ = fmt.Fprintln(out,
 				">>> online defrag failed/missing — falling back to offline")
 			needOffline = true
 		} else if st2, serr := r.status(ctx); serr != nil {
 			return fmt.Errorf("endpoint status after defrag: %w", serr)
 		} else if st2.DBSize > st2.DBSizeInUse*2 {
-			fmt.Fprintf(out,
+			_, _ = fmt.Fprintf(out,
 				">>> online defrag reclaimed too little "+
 					"(file=%d, in-use=%d) → OFFLINE DEFRAG\n",
 				st2.DBSize, st2.DBSizeInUse)
@@ -545,7 +545,7 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 			// loop. Disarm + canary still run below (they often
 			// restore writes already); the tail then reports the
 			// remaining bloat as an error.
-			fmt.Fprintln(out, ">>> ONLINE-ONLY: offline defrag "+
+			_, _ = fmt.Fprintln(out, ">>> ONLINE-ONLY: offline defrag "+
 				"required but forbidden — needs a manual rescue-etcd run")
 			offlinePending = true
 		} else if err := r.offlineDefrag(ctx); err != nil {
@@ -555,17 +555,17 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 
 	// [4/6] Post-defrag numbers (display only — a flaky read here
 	// must not mask the real health check, the canary).
-	fmt.Fprintln(out, "[4/6] Post-defrag status:")
+	_, _ = fmt.Fprintln(out, "[4/6] Post-defrag status:")
 	if st3, serr := r.status(ctx); serr == nil {
-		fmt.Fprintf(out, "dbSize=%d dbSizeInUse=%d revision=%d\n",
+		_, _ = fmt.Fprintf(out, "dbSize=%d dbSizeInUse=%d revision=%d\n",
 			st3.DBSize, st3.DBSizeInUse, st3.Revision)
 	} else {
-		fmt.Fprintf(out, "(endpoint status error: %v)\n", serr)
+		_, _ = fmt.Fprintf(out, "(endpoint status error: %v)\n", serr)
 	}
 
 	// [5/6] NOSPACE alarms never self-clear after space is freed —
 	// disarm is mandatory. Fatal like the script's `set -e`.
-	fmt.Fprintln(out, "[5/6] >>> alarm disarm (NOSPACE never self-clears)")
+	_, _ = fmt.Fprintln(out, "[5/6] >>> alarm disarm (NOSPACE never self-clears)")
 	if _, err := r.etcdctl(ctx, "", "alarm", "disarm"); err != nil {
 		return fmt.Errorf("alarm disarm: %w", err)
 	}
@@ -573,7 +573,7 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 
 	// [6/6] Write canary — the actual proof etcd accepts writes
 	// again. A failure exits 1 like the script.
-	fmt.Fprintln(out, "[6/6] >>> verifying writes (canary put/del)")
+	_, _ = fmt.Fprintln(out, "[6/6] >>> verifying writes (canary put/del)")
 	if _, err := r.etcdctl(ctx, "", "put", canaryKey, "ok"); err != nil {
 		return fmt.Errorf(">>> WRITE STILL FAILING — "+
 			"check alarm/status manually! (put: %w)", err)
@@ -582,14 +582,14 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 		return fmt.Errorf(">>> WRITE STILL FAILING — "+
 			"check alarm/status manually! (del: %w)", err)
 	}
-	fmt.Fprintln(out, ">>> WRITE OK — etcd is back")
+	_, _ = fmt.Fprintln(out, ">>> WRITE OK — etcd is back")
 
-	fmt.Fprintln(out, "===== AFTER RESCUE =====")
+	_, _ = fmt.Fprintln(out, "===== AFTER RESCUE =====")
 	if tbl, err := r.etcdctl(ctx, "",
 		"endpoint", "status", "-w", "table"); err == nil {
 		_, _ = out.Write(tbl)
 	}
-	fmt.Fprintf(out, `
+	_, _ = fmt.Fprintf(out, `
 ===== DONE =====
 Next steps:
 - After TTL GC finishes reaping events (a few hours), re-run this to reclaim more

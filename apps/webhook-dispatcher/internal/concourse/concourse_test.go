@@ -88,7 +88,7 @@ func newATCStub(t *testing.T, routes map[string]string) *atcStub {
 			w.WriteHeader(status)
 		case routed:
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, body)
+			_, _ = fmt.Fprint(w, body)
 		case isCheck:
 			w.WriteHeader(http.StatusCreated)
 		default:
@@ -357,7 +357,7 @@ func TestGetJSONSendsBasicAuth(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `[]`)
+		_, _ = fmt.Fprint(w, `[]`)
 	}))
 	defer srv.Close()
 

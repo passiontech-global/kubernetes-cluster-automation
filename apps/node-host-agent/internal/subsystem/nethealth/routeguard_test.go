@@ -290,7 +290,7 @@ func TestOpenRouteNetlinkDirectBindWhenHostNet(t *testing.T) {
 	if fd < 0 {
 		t.Fatalf("fd=%d", fd)
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	sa, err := unix.Getsockname(fd)
 	if err != nil {
 		t.Fatalf("Getsockname: %v", err)
@@ -315,7 +315,7 @@ func TestOpenRouteNetlinkSetnsAndHostRootFallback(t *testing.T) {
 	if fd, err := openRouteNetlink("/"); err == nil ||
 		!strings.Contains(err.Error(), "setns") {
 		if fd >= 0 {
-			unix.Close(fd)
+			_ = unix.Close(fd)
 		}
 		t.Fatalf("want setns failure, got fd=%d err=%v", fd, err)
 	}
@@ -326,7 +326,7 @@ func TestOpenRouteNetlinkSetnsAndHostRootFallback(t *testing.T) {
 	writeFile(t, fake, "")
 	fd, err := openRouteNetlink(root)
 	if fd >= 0 {
-		unix.Close(fd)
+		_ = unix.Close(fd)
 	}
 	if err == nil || !strings.Contains(err.Error(), fake) {
 		t.Fatalf("host-root fallback not attempted: %v", err)
@@ -552,7 +552,7 @@ func TestRouteGuardEventDrivesRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unix.Close(fds[1])
+	defer func() { _ = unix.Close(fds[1]) }()
 	e.n.cfg.openRouteSocket = func() (int, error) { return fds[0], nil }
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -633,7 +633,7 @@ func TestRouteGuardReadExitsOnReadError(t *testing.T) {
 			50*time.Millisecond, time.Millisecond)
 	}()
 	waitForCond(t, 2*time.Second, func() bool { return restoredCount(e) >= 1 })
-	unix.Close(fds[1]) // peer EOF → reader exits → done broadcasts
+	_ = unix.Close(fds[1]) // peer EOF → reader exits → done broadcasts
 	select {
 	case <-finished:
 	case <-time.After(2 * time.Second):
@@ -691,7 +691,7 @@ func TestRouteGuardRespawnsAfterExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unix.Close(fds[1])
+	defer func() { _ = unix.Close(fds[1]) }()
 	var opens atomic.Int32
 	e.n.cfg.openRouteSocket = func() (int, error) {
 		opens.Add(1)
