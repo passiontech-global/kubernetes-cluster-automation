@@ -6,7 +6,7 @@
 // NOT all sorted). Go's map[string]any loses that order, so every
 // YAML mapping is decoded into *OMap which keeps key order while
 // still offering map semantics to the jinja evaluator.
-package topology
+package jinja
 
 import (
 	"bytes"
