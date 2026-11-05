@@ -16,7 +16,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	// Zero-value Deps.Disabled = gate-on — PDB_WATCHDOG_ENABLED is
 	// resolved by setupModules, not re-read here.
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
+	if err := Setup(shared.Deps{Name: "pdb-deadlock-watchdog", Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "pdb-deadlock-watchdog", 5*time.Minute)
@@ -26,7 +26,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 // no Periodic, no tick, no LIST against the apiserver.
 func TestSetupDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(), Disabled: true}); err != nil {
+	if err := Setup(shared.Deps{Name: "pdb-deadlock-watchdog", Mgr: m, CS: fake.NewSimpleClientset(), Disabled: true}); err != nil {
 		t.Fatalf("disabled watchdog setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {

@@ -53,7 +53,7 @@ func (u *helmReleaseUnlocker) pruneSupersededSecrets(ctx context.Context) error 
 		// Hygiene sweep — a list failure must not fail the run
 		// (same posture as cleanFailedHookJobs): the next sweep
 		// retries, and IncError keeps it on the alert path.
-		metrics.IncError(helmUnlockQueue)
+		metrics.IncError(u.queue)
 		log.Error(err, "superseded secret prune: list failed — skipped")
 		return nil
 	}
@@ -111,9 +111,8 @@ func (u *helmReleaseUnlocker) pruneSupersededSecrets(ctx context.Context) error 
 				"release", k.ns+"/"+k.name, "secret", cand.s.Name,
 				"version", cand.v, "supersededTotal", len(superseded))
 			if err := u.cs.CoreV1().Secrets(cand.s.Namespace).Delete(ctx,
-				cand.s.Name, metav1.DeleteOptions{
-					Preconditions: &metav1.Preconditions{UID: &cand.s.UID}}); err != nil {
-				metrics.IncError(helmUnlockQueue)
+				cand.s.Name, shared.UIDDeleteOptions(cand.s.UID, "")); err != nil {
+				metrics.IncError(u.queue)
 				log.Error(err, "superseded secret delete failed",
 					"secret", cand.s.Namespace+"/"+cand.s.Name)
 				continue // try the next-oldest instead of giving up

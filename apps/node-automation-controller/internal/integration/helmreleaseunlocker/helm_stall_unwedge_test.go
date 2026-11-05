@@ -19,7 +19,6 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -189,7 +188,7 @@ func stallFixture() (*unstructured.Unstructured, []runtime.Object) {
 // window for key.
 func newStallUnlocker(cs *kfake.Clientset, dyn *fake.FakeDynamicClient,
 	stuckFor time.Duration, key string) *helmReleaseUnlocker {
-	u := &helmReleaseUnlocker{
+	u := &helmReleaseUnlocker{queue: "helmrelease-unlocker",
 		cs:           cs,
 		dyn:          dyn,
 		unlocked:     map[string]time.Time{},
@@ -277,7 +276,7 @@ func TestHelmStallUnwedgePendingOtherReasonSkipped(t *testing.T) {
 	cs := kfake.NewSimpleClientset(objs...)
 	u := newStallUnlocker(cs, dyn, time.Hour, "ops/connect")
 
-	before := testutil.ReconcileErrorCount(t, helmUnlockQueue)
+	before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +286,7 @@ func TestHelmStallUnwedgePendingOtherReasonSkipped(t *testing.T) {
 	if got := hrAnnotation(t, dyn, helmReleaseGVRs[0], "ops", "connect", fluxReconcileAnno); got != "" {
 		t.Fatal("HR annotated despite refusal")
 	}
-	if got := testutil.ReconcileErrorCount(t, helmUnlockQueue); got != before+1 {
+	if got := testutil.ReconcileErrorCount(t, "helmrelease-unlocker"); got != before+1 {
 		t.Fatalf("refusal did not IncError for visibility: got %v, want %v", got, before+1)
 	}
 }
@@ -313,7 +312,7 @@ func TestHelmStallUnwedgePDBBlocked(t *testing.T) {
 	cs := kfake.NewSimpleClientset(append(objs, pdb)...)
 	u := newStallUnlocker(cs, dyn, time.Hour, "ops/connect")
 
-	before := testutil.ReconcileErrorCount(t, helmUnlockQueue)
+	before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +322,7 @@ func TestHelmStallUnwedgePDBBlocked(t *testing.T) {
 	if got := hrAnnotation(t, dyn, helmReleaseGVRs[0], "ops", "connect", fluxReconcileAnno); got != "" {
 		t.Fatal("HR annotated despite the PDB refusal")
 	}
-	if got := testutil.ReconcileErrorCount(t, helmUnlockQueue); got != before+1 {
+	if got := testutil.ReconcileErrorCount(t, "helmrelease-unlocker"); got != before+1 {
 		t.Fatalf("PDB refusal did not IncError: got %v, want %v", got, before+1)
 	}
 }
@@ -369,14 +368,14 @@ func TestHelmStallUnwedgePreferredOnlySkipped(t *testing.T) {
 	cs := kfake.NewSimpleClientset(objs...)
 	u := newStallUnlocker(cs, dyn, time.Hour, "ops/connect")
 
-	before := testutil.ReconcileErrorCount(t, helmUnlockQueue)
+	before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if got := rsReplicas(t, cs, "onepassword", "connect-old"); got != 2 {
 		t.Fatalf("old ReplicaSet scaled on preferred-only anti-affinity: %d, want 2", got)
 	}
-	if got := testutil.ReconcileErrorCount(t, helmUnlockQueue); got != before+1 {
+	if got := testutil.ReconcileErrorCount(t, "helmrelease-unlocker"); got != before+1 {
 		t.Fatalf("preferred-only refusal did not IncError: got %v, want %v", got, before+1)
 	}
 }
@@ -393,21 +392,21 @@ func TestHelmStallUnwedgeCooldownHonored(t *testing.T) {
 		u := newStallUnlocker(cs, dyn, time.Hour, "ops/connect")
 		u.unwedged["ops/connect"] = time.Now().Add(-time.Hour)
 
-		before := testutil.ReconcileErrorCount(t, helmUnlockQueue)
+		before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 		if err := u.run(ctx); err != nil {
 			t.Fatal(err)
 		}
 		if got := rsReplicas(t, cs, "onepassword", "connect-old"); got != 2 {
 			t.Fatalf("old ReplicaSet scaled inside the cooldown: %d, want 2", got)
 		}
-		if got := testutil.ReconcileErrorCount(t, helmUnlockQueue); got != before+1 {
+		if got := testutil.ReconcileErrorCount(t, "helmrelease-unlocker"); got != before+1 {
 			t.Fatalf("re-stall inside cooldown did not IncError: got %v, want %v", got, before+1)
 		}
 		// A second sweep inside the same window must NOT re-alert.
 		if err := u.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if got := testutil.ReconcileErrorCount(t, helmUnlockQueue); got != before+1 {
+		if got := testutil.ReconcileErrorCount(t, "helmrelease-unlocker"); got != before+1 {
 			t.Fatalf("alert dedup broke — repeated IncError inside cooldown: got %v, want %v", got, before+1)
 		}
 	})
@@ -500,8 +499,12 @@ func TestHelmStallUnwedgeDisabledGate(t *testing.T) {
 func TestHelmStallUnwedgeListFallback(t *testing.T) {
 	hr, objs := stallFixture()
 	// Scrub the explicit Deployment/<name> token from every message.
-	for _, c := range shared.ReadyConds(hr) {
-		c["message"] = "upgrade retries exhausted — no workload named"
+	if conds, ok, _ := unstructured.NestedSlice(hr.Object, "status", "conditions"); ok {
+		for _, c := range conds {
+			if m, ok := c.(map[string]any); ok {
+				m["message"] = "upgrade retries exhausted — no workload named"
+			}
+		}
 	}
 	dyn := newDynFake(hr)
 	cs := kfake.NewSimpleClientset(objs...)
@@ -532,14 +535,14 @@ func TestHelmStallUnwedgeNonDeadlockShapeSkipped(t *testing.T) {
 	cs := kfake.NewSimpleClientset(kept...)
 	u := newStallUnlocker(cs, dyn, time.Hour, "ops/connect")
 
-	before := testutil.ReconcileErrorCount(t, helmUnlockQueue)
+	before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if got := rsReplicas(t, cs, "onepassword", "connect-old"); got != 2 {
 		t.Fatalf("old ReplicaSet scaled without pending pods: %d, want 2", got)
 	}
-	if got := testutil.ReconcileErrorCount(t, helmUnlockQueue); got != before+1 {
+	if got := testutil.ReconcileErrorCount(t, "helmrelease-unlocker"); got != before+1 {
 		t.Fatalf("shape refusal did not IncError: got %v, want %v", got, before+1)
 	}
 }

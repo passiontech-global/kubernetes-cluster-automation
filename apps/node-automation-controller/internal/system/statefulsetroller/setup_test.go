@@ -17,7 +17,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	// (STATEFULSET_ONDELETE_ROLLER_ENABLED) is resolved by
 	// setupModules, not re-read here.
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "statefulset-ondelete-roller", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -27,7 +27,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 // The roller skips mgr.Add entirely when Deps.Disabled is stamped.
 func TestSetupDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "statefulset-ondelete-roller", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}

@@ -51,7 +51,6 @@ import (
 )
 
 const (
-	corednsQueue       = "coredns-stale-watchdog"
 	corednsNS          = "kube-system"
 	corednsPodSelector = "k8s-app=kube-dns"
 	corednsLogSinceS   = 600 // layer-1 log window / layer-2 max service age
@@ -69,7 +68,11 @@ var corednsLogRE = regexp.MustCompile(
 type coreDNSWatchdog struct {
 	cs   kubernetes.Interface
 	http *http.Client
-	mu   sync.Mutex
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
+	mu    sync.Mutex
 	// streak replaces the bash /tmp/coredns-streak-* files: pod ->
 	// consecutive layer-2 failures. Resets on operator restart,
 	// biasing conservative like the old tmpfs files did.
@@ -90,12 +93,13 @@ func Setup(d shared.Deps) error {
 	w := &coreDNSWatchdog{
 		cs:     d.CS,
 		http:   &http.Client{Timeout: 5 * time.Second},
+		queue:  d.Name,
 		streak: map[string]int{},
 	}
 	w.logHitFn = w.logHit
 	w.dnsFn = w.dnsProbe
 	w.panicsFn = w.panics
-	return shared.AddPeriodic(d.Mgr, corednsQueue, time.Minute, w.run)
+	return shared.AddPeriodic(d.Mgr, w.queue, time.Minute, w.run)
 }
 
 func (w *coreDNSWatchdog) run(ctx context.Context) error {
@@ -227,7 +231,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 	if last, ok := deploy.Annotations[corednsTSAnno]; ok {
 		if ts, err := strconv.ParseInt(last, 10, 64); err == nil {
 			if ago := time.Now().Unix() - ts; ago < corednsCooldownS {
-				metrics.IncError(corednsQueue)
+				metrics.IncError(w.queue)
 				log.Info("SKIP recovery: inside cooldown",
 					"pods", suspects, "agoS", ago, "cooldownS", corednsCooldownS)
 				return nil
@@ -241,14 +245,14 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 		return fmt.Errorf("count not-ready nodes (storm gate): %w", err)
 	}
 	if notReady > 0 {
-		metrics.IncError(corednsQueue)
+		metrics.IncError(w.queue)
 		log.Info("SKIP recovery: nodes NotReady — cluster storm",
 			"pods", suspects, "notReady", notReady)
 		return nil
 	}
 	// Fleet not fully ready = a rollout is already recreating pods.
 	if deploy.Status.ReadyReplicas < deploy.Status.Replicas {
-		metrics.IncError(corednsQueue)
+		metrics.IncError(w.queue)
 		log.Info("SKIP recovery: coredns not fully ready",
 			"pods", suspects,
 			"ready", deploy.Status.ReadyReplicas, "replicas", deploy.Status.Replicas)

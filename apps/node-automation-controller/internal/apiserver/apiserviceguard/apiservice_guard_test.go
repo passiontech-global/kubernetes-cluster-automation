@@ -68,7 +68,7 @@ func asgExists(t *testing.T, dyn *dynamicfake.FakeDynamicClient, name string) bo
 }
 
 func asgGuard(cs *fake.Clientset, dyn *dynamicfake.FakeDynamicClient) *apiServiceGuard {
-	return &apiServiceGuard{cs: cs, dyn: dyn, nowFn: time.Now}
+	return &apiServiceGuard{cs: cs, dyn: dyn, now: time.Now}
 }
 
 // ---------------------------------------------------------------------------

@@ -48,7 +48,6 @@ import (
 )
 
 const (
-	esNudgeQueue    = "externalsecret-nudge"
 	esNudgeInterval = 10 * time.Minute
 	esStuckAge      = 15 * time.Minute // Ready=False this long before nudging
 	esNudgeCooldown = time.Hour        // max 1 force-sync stamp per ES
@@ -65,6 +64,10 @@ const (
 	esStormMinFailing     = 5
 	esConnectHealMinAge   = 15 * time.Minute
 	esConnectHealCooldown = time.Hour
+
+	// esListPageSize bounds each List page — the ExternalSecret and
+	// store lists are cluster-wide and unbounded.
+	esListPageSize = 500
 )
 
 // esConnectNamespaces are where the 1Password Connect pod can live —
@@ -88,8 +91,12 @@ var (
 )
 
 type externalSecretNudge struct {
-	cs      kubernetes.Interface // reserved for future typed reads
-	dyn     dynamic.Interface
+	cs  kubernetes.Interface // reserved for future typed reads
+	dyn dynamic.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue   string
 	enabled bool // EXTERNALSECRET_NUDGE_ENABLED — clusters without ESO skip
 	mu      sync.Mutex
 	// storeReady: clustersecretstore name → last observed Ready state.
@@ -121,11 +128,12 @@ func Setup(d shared.Deps) error {
 	n := &externalSecretNudge{
 		cs:         d.CS,
 		dyn:        d.Dyn,
+		queue:      d.Name,
 		enabled:    shared.Gate("EXTERNALSECRET_NUDGE_ENABLED", false),
 		storeReady: map[string]bool{},
 		nudged:     map[string]time.Time{},
 	}
-	return shared.AddPeriodic(d.Mgr, esNudgeQueue, esNudgeInterval, n.run)
+	return shared.AddPeriodic(d.Mgr, n.queue, esNudgeInterval, n.run)
 }
 
 func (n *externalSecretNudge) run(ctx context.Context) error {
@@ -182,14 +190,14 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 	}
 	for i := range stores.Items {
 		s := &stores.Items[i]
-		ready, _ := shared.ReadyCond(s)
-		track("ClusterSecretStore", "", s.GetName(), ready == "True")
+		c, _ := shared.ConditionOf(s.Object, "Ready")
+		track("ClusterSecretStore", "", s.GetName(), c.Status == "True")
 	}
 	if namespacedStores != nil {
 		for i := range namespacedStores.Items {
 			s := &namespacedStores.Items[i]
-			ready, _ := shared.ReadyCond(s)
-			track("SecretStore", s.GetNamespace(), s.GetName(), ready == "True")
+			c, _ := shared.ConditionOf(s.Object, "Ready")
+			track("SecretStore", s.GetNamespace(), s.GetName(), c.Status == "True")
 		}
 	}
 	// Drop vanished stores so a delete+recreate re-seeds fresh —
@@ -226,9 +234,11 @@ func (n *externalSecretNudge) listFirst(ctx context.Context,
 	gvrs []schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
 	var lastErr error
 	for _, gvr := range gvrs {
-		list, err := n.dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
+		items, err := shared.ListAll(ctx,
+			metav1.ListOptions{Limit: esListPageSize},
+			shared.DynamicPage(n.dyn.Resource(gvr)))
 		if err == nil {
-			return list, nil
+			return &unstructured.UnstructuredList{Items: items}, nil
 		}
 		lastErr = err
 	}
@@ -240,9 +250,11 @@ func (n *externalSecretNudge) listFirst(ctx context.Context,
 func (n *externalSecretNudge) listES(ctx context.Context) (*unstructured.UnstructuredList, schema.GroupVersionResource, error) {
 	var lastErr error
 	for _, gvr := range externalSecretGVRs {
-		list, err := n.dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
+		items, err := shared.ListAll(ctx,
+			metav1.ListOptions{Limit: esListPageSize},
+			shared.DynamicPage(n.dyn.Resource(gvr)))
 		if err == nil {
-			return list, gvr, nil
+			return &unstructured.UnstructuredList{Items: items}, gvr, nil
 		}
 		lastErr = err
 	}
@@ -285,7 +297,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 	totalES, failingES := 0, 0
 	for i := range list.Items {
 		totalES++
-		if status, _ := shared.ReadyCond(&list.Items[i]); status == "False" {
+		if c, _ := shared.ConditionOf(list.Items[i].Object, "Ready"); c.Status == "False" {
 			failingES++
 		}
 	}
@@ -334,12 +346,13 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 	for i := range list.Items {
 		es := &list.Items[i]
 		key := es.GetNamespace() + "/" + es.GetName()
-		status, readyMsg := shared.ReadyCond(es)
-		if status != "False" {
+		c, _ := shared.ConditionOf(es.Object, "Ready")
+		if c.Status != "False" {
 			continue
 		}
-		since, ok := shared.ReadySince(es)
-		if !ok {
+		readyMsg := c.Message
+		since := c.LastTransitionTime
+		if since.IsZero() {
 			since = es.GetCreationTimestamp().Time
 		}
 		if now.Sub(since) < esStuckAge {
@@ -381,7 +394,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 			// Tolerated per-ES failure: absorbed (log + continue,
 			// nil return) so it never reaches the periodic wrapper —
 			// IncError here keeps it on the alert path.
-			metrics.IncError(esNudgeQueue)
+			metrics.IncError(n.queue)
 			log.Error(err, "force-sync patch failed", "es", key)
 			continue // per-ES failures must not starve the rest
 		}
@@ -538,7 +551,7 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	// bounce, and "cannot verify" skips it.
 	held, why, err := shared.MaintenanceActive(ctx, n.cs, n.dyn)
 	if err != nil {
-		metrics.IncError(esNudgeQueue)
+		metrics.IncError(n.queue)
 		log.Info("WARN: maintenance check unverifiable — "+
 			"DEFER: connect pod heal skipped (fail closed)", "error", err)
 		return
@@ -559,9 +572,8 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 		"storeDown", storeDown, "stormLong", stormLong)
 	uid := pod.UID
 	if err := n.cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-		metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil {
-		metrics.IncError(esNudgeQueue)
+		shared.UIDDeleteOptions(uid, "")); err != nil {
+		metrics.IncError(n.queue)
 		log.Error(err, "connect pod delete failed",
 			"pod", pod.Namespace+"/"+pod.Name)
 		return
@@ -580,16 +592,18 @@ func (n *externalSecretNudge) oldestConnectPod(ctx context.Context) *corev1.Pod 
 	log := logf.FromContext(ctx)
 	var oldest *corev1.Pod
 	for _, ns := range esConnectNamespaces {
-		pods, err := n.cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+		pods, err := shared.ListAll(ctx,
+			metav1.ListOptions{Limit: esListPageSize},
+			shared.Pods(n.cs, ns))
 		if err != nil {
 			if !apierrors.IsNotFound(err) {
-				metrics.IncError(esNudgeQueue)
+				metrics.IncError(n.queue)
 				log.Error(err, "connect pod list failed", "namespace", ns)
 			}
 			continue
 		}
-		for i := range pods.Items {
-			p := &pods.Items[i]
+		for i := range pods {
+			p := &pods[i]
 			if p.DeletionTimestamp != nil ||
 				p.Status.Phase != corev1.PodRunning ||
 				!strings.HasPrefix(p.Name, esConnectPodPrefix) {

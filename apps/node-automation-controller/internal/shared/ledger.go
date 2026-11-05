@@ -4,8 +4,8 @@
 // seenStuckBackup/seenWedgedPVB), cert-drift-auditor (seenWebhooks/
 // seenSecrets/seenWebhookExpiry/seenTrustBundles/seenReplication),
 // failed-jobs-janitor (stuckEmitted), cronjob-catchup (missedEmitted),
-// the webhook guard (brokenEmitted/unmeshedEmitted) and
-// cluster-health-probes' reconcileEmittedGauges:
+// the webhook guard (brokenEmitted/unmeshedEmitted) and the
+// internal/health checks' per-check emitted ledgers:
 //
 //	sweep:    for each live condition -> vec.WithLabelValues(lv...).Set(v)
 //	end:      for each tuple emitted LAST sweep but not re-asserted
@@ -77,4 +77,18 @@ func (l *GaugeLedger[K]) Prune(delete func(labelValues ...string) bool) int {
 // or its slices; Emit clones on the way in.
 func (l *GaugeLedger[K]) Last() map[K][]string {
 	return l.emitted
+}
+
+// Reconcile folds a whole sweep's emissions into the ledger in one
+// call: every key in current is Emitted (with its label values), then
+// Prune deletes every stale tuple through delete. It is the compact
+// form of `for k, lv := range current { l.Emit(k, lv...) }; l.Prune(del)`
+// and returns the pruned count. Callers Set() their gauge values
+// BEFORE calling — Reconcile only manages series existence.
+func (l *GaugeLedger[K]) Reconcile(current map[K][]string,
+	delete func(labelValues ...string) bool) int {
+	for k, lv := range current {
+		l.Emit(k, lv...)
+	}
+	return l.Prune(delete)
 }

@@ -55,14 +55,14 @@ func NestedSlice(obj map[string]any, fields ...string) ([]any, bool) {
 // the near-universal {type,status,reason,message,lastTransitionTime}
 // shape cert-manager, Flux, OLM, Gateway-API and most operators
 // stamp. Fields the entry lacks stay zero-valued; the decode never
-// fails on a partial entry (same posture as ReadyConds).
+// fails on a partial entry (same posture as Conditions).
 type Condition struct {
 	Type    string
 	Status  string
 	Reason  string
 	Message string
 	// LastTransitionTime is the parsed RFC3339 timestamp — zero when
-	// absent or unparseable (same contract as ReadySince).
+	// absent or unparseable (same contract as Conditions).
 	LastTransitionTime time.Time
 	// ObservedGeneration is the generation the condition's controller
 	// last reconciled — Gateway-API resources report it inside

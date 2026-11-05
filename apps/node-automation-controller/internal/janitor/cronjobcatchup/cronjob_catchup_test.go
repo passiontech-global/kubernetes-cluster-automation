@@ -76,7 +76,7 @@ func newCatchup(cs *fake.Clientset) *cronJobCatchup {
 // schedule is deterministic.
 func newCatchupAt(cs *fake.Clientset, now time.Time) *cronJobCatchup {
 	return &cronJobCatchup{cs: cs, lastCatchup: map[string]string{},
-		nowFn: func() time.Time { return now }}
+		now: func() time.Time { return now }}
 }
 
 // ---------------------------------------------------------------------------

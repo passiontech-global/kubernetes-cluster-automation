@@ -20,7 +20,7 @@ func TestSetupRegistersController(t *testing.T) {
 	t.Setenv("METRICS_SERVER_MIN_REPLICAS", "3")
 	t.Setenv("METRICS_SERVER_NODES_PER_REPLICA", "1")
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "metrics-server-patcher", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -33,7 +33,7 @@ func TestSetupRegistersController(t *testing.T) {
 // stamped.
 func TestSetupDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "metrics-server-patcher", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}

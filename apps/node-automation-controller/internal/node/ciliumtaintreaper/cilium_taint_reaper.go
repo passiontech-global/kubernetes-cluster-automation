@@ -42,7 +42,11 @@ import (
 const ciliumNotReadyTaint = "node.cilium.io/agent-not-ready"
 
 type ciliumTaintReaper struct {
-	cs      kubernetes.Interface
+	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the controller name and every IncError label
+	// come from one place.
+	queue   string
 	enabled bool
 }
 
@@ -93,7 +97,7 @@ func Setup(d shared.Deps) error {
 		return nil
 	}
 	return ctrl.NewControllerManagedBy(mgr).
-		Named("cilium-taint-reaper").
+		Named(d.Name).
 		// Watches with a single fixed workqueue key, not For(): the
 		// reconcile ignores req.Name and always sweeps the whole
 		// cluster, so per-node keys only produced N duplicate queued
@@ -114,7 +118,7 @@ func Setup(d shared.Deps) error {
 		// unconditionally true here — the field and its Reconcile
 		// check now only matter for literally-constructed reapers
 		// in tests.
-		Complete(&ciliumTaintReaper{cs: cs, enabled: true})
+		Complete(&ciliumTaintReaper{cs: cs, queue: d.Name, enabled: true})
 }
 
 func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -129,7 +133,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 	// trigger, the verdict always covers the whole cluster.
 	nodes, err := shared.ListNodes(ctx, r.cs)
 	if err != nil {
-		metrics.IncError("cilium-taint-reaper")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
 
@@ -144,7 +148,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 			FieldSelector: "spec.nodeName=" + node.Name,
 		})
 		if err != nil {
-			metrics.IncError("cilium-taint-reaper")
+			metrics.IncError(r.queue)
 			return ctrl.Result{}, fmt.Errorf("list cilium pods on node %s: %w", node.Name, err)
 		}
 		if len(pods.Items) == 0 {
@@ -168,7 +172,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 			log.Info("REAP: agent healthy but stale taint -> removing",
 				"node", node.Name, "pod", healthy.Name)
 			if err := shared.UntaintNode(ctx, r.cs, node.Name, ciliumNotReadyTaint); err != nil {
-				metrics.IncError("cilium-taint-reaper")
+				metrics.IncError(r.queue)
 				return ctrl.Result{}, fmt.Errorf("remove taint %s on node %s: %w",
 					ciliumNotReadyTaint, node.Name, err)
 			}

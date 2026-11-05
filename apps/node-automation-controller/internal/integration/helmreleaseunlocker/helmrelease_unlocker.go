@@ -88,7 +88,6 @@ import (
 )
 
 const (
-	helmUnlockQueue    = "helmrelease-unlocker"
 	helmUnlockInterval = 10 * time.Minute
 	helmStuckThreshold = 30 * time.Minute // first-seen window before acting
 	helmUnlockCooldown = 24 * time.Hour   // max 1 unlock/HR inside this window
@@ -110,7 +109,11 @@ var helmReleaseGVRs = shared.HelmReleaseGVRs
 type helmReleaseUnlocker struct {
 	cs  kubernetes.Interface
 	dyn dynamic.Interface
-	mu  sync.Mutex
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
+	mu    sync.Mutex
 	// firstSeen: ns/name → first tick that saw the HR stuck on
 	// "in progress". Pruned when the HR recovers; an operator restart
 	// re-arms it, biasing conservative.
@@ -167,6 +170,7 @@ func Setup(d shared.Deps) error {
 	u := &helmReleaseUnlocker{
 		cs:                 d.CS,
 		dyn:                d.Dyn,
+		queue:              d.Name,
 		unlocked:           map[string]time.Time{},
 		alerted:            map[string]bool{},
 		stallEnabled:       shared.Gate("HELM_STALL_UNWEDGE_ENABLED", false),
@@ -175,7 +179,7 @@ func Setup(d shared.Deps) error {
 		stallAttempts:      map[string]*stallAttempt{},
 		immutableJobHealed: map[string]time.Time{},
 	}
-	return shared.AddPeriodic(d.Mgr, helmUnlockQueue, helmUnlockInterval, u.run)
+	return shared.AddPeriodic(d.Mgr, u.queue, helmUnlockInterval, u.run)
 }
 
 func (u *helmReleaseUnlocker) run(ctx context.Context) error {
@@ -381,14 +385,15 @@ func (u *helmReleaseUnlocker) helmControllerDown(ctx context.Context) (bool, err
 // skipped — hook cleanup never fails the caller.
 func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string) {
 	log := logf.FromContext(ctx)
-	jobs, err := u.cs.BatchV1().Jobs(ns).List(ctx, metav1.ListOptions{})
+	jobs, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: helmListPageSize},
+		shared.Jobs(u.cs, ns))
 	if err != nil {
 		log.Error(err, "helm-hook job list failed — hook cleanup skipped", "ns", ns)
 		return
 	}
-	bg := metav1.DeletePropagationBackground
-	for i := range jobs.Items {
-		j := &jobs.Items[i]
+	for i := range jobs {
+		j := &jobs[i]
 		if _, ok := j.Annotations["helm.sh/hook"]; !ok {
 			continue // not a helm hook — never ours to reap
 		}
@@ -398,8 +403,7 @@ func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string
 		log.Info("ACTION: delete failed helm-hook Job",
 			"ns", ns, "job", j.Name)
 		if err := u.cs.BatchV1().Jobs(ns).Delete(ctx, j.Name,
-			metav1.DeleteOptions{PropagationPolicy: &bg,
-				Preconditions: &metav1.Preconditions{UID: &j.UID}}); err != nil {
+			shared.UIDDeleteOptions(j.UID, metav1.DeletePropagationBackground)); err != nil {
 			log.Error(err, "helm-hook job delete failed", "ns", ns, "job", j.Name)
 			continue
 		}

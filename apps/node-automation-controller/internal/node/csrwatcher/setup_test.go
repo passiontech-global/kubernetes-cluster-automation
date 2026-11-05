@@ -15,7 +15,7 @@ import (
 func TestSetupRegistersPeriodic(t *testing.T) {
 	t.Setenv("CSR_APPROVER_ENABLED", "true")
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
+	if err := Setup(shared.Deps{Name: "csr-watcher", Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "csr-watcher", 10*time.Minute)
@@ -26,7 +26,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 func TestSetupRegistersWhenDisabled(t *testing.T) {
 	t.Setenv("CSR_APPROVER_ENABLED", "false")
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
+	if err := Setup(shared.Deps{Name: "csr-watcher", Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("detect-only csr setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "csr-watcher", 10*time.Minute)

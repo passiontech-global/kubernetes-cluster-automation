@@ -50,8 +50,8 @@ func pdwCordonedNode(name string) *corev1.Node {
 // sleeping.
 func newPDWWatchdog(cs *fake.Clientset, clock *time.Time) *pdbDeadlockWatchdog {
 	return &pdbDeadlockWatchdog{
-		cs:    cs,
-		nowFn: func() time.Time { return *clock },
+		cs:  cs,
+		now: func() time.Time { return *clock },
 	}
 }
 

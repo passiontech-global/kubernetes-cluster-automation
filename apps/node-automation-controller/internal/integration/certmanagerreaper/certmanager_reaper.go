@@ -45,7 +45,6 @@ import (
 )
 
 const (
-	certReaperQueue    = "certmanager-reaper"
 	orderPendingMinAge = 30 * time.Minute   // order/challenge must be wedged this long
 	certRenewalWindow  = 7 * 24 * time.Hour // renewalTime within this window = candidate
 	certReaperMinGap   = time.Hour          // max 1 order reset per cert per hour
@@ -83,13 +82,17 @@ type certReset struct {
 }
 
 type certManagerReaper struct {
-	cs     kubernetes.Interface // reserved for future typed reads
-	dyn    dynamic.Interface
+	cs  kubernetes.Interface // reserved for future typed reads
+	dyn dynamic.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue  string
 	resets map[string]*certReset
-	// nowFn is the clock seam — tests pin it so the pending/wedged
+	// now is the clock seam — tests pin it so the pending/wedged
 	// windows, the renewal window and the hourly reset gap are
 	// deterministic. nil → time.Now.
-	nowFn shared.Clock
+	now shared.Clock
 	// crReaped: cert key → last stuck-CertificateRequest delete —
 	// the 6h in-RAM half of the W8 CR-reap cooldown (the durable
 	// half shares node.ops/acme-order-resets).
@@ -116,18 +119,15 @@ func Setup(d shared.Deps) error {
 	if d.Disabled {
 		return nil
 	}
-	r := &certManagerReaper{cs: cs, dyn: dyn,
+	r := &certManagerReaper{cs: cs, dyn: dyn, queue: d.Name,
 		resets: map[string]*certReset{}, crReaped: map[string]time.Time{}}
-	return shared.AddPeriodic(mgr, certReaperQueue, 15*time.Minute, r.run)
+	return shared.AddPeriodic(mgr, r.queue, 15*time.Minute, r.run)
 }
 
 func (r *certManagerReaper) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	// Lazily arm the zero-value struct — unit tests construct the
 	// reaper literally without the Setup path.
-	if r.nowFn == nil {
-		r.nowFn = time.Now
-	}
 	if r.resets == nil {
 		r.resets = map[string]*certReset{}
 	}
@@ -135,17 +135,17 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 		r.crReaped = map[string]time.Time{}
 	}
 	r.crCache = map[string]crListResult{}
-	now := r.nowFn()
+	now := r.now.Now()
 
-	certs, err := r.dyn.Resource(certificateGVR).Namespace(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	certs, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
+		shared.DynamicPage(r.dyn.Resource(certificateGVR).Namespace(metav1.NamespaceAll)))
 	if err != nil {
 		return fmt.Errorf("list certificates: %w", err)
 	}
 	seen := map[string]bool{}
 	candidates, reset := 0, 0
-	for i := range certs.Items {
-		cert := &certs.Items[i]
+	for i := range certs {
+		cert := &certs[i]
 		key := cert.GetNamespace() + "/" + cert.GetName()
 		seen[key] = true
 		needsReap := certNeedsReap(cert, now)
@@ -166,7 +166,7 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 			delete(r.resets, key)
 			if hasAnno {
 				if err := r.patchResetsAnnotation(ctx, cert, nil); err != nil {
-					metrics.IncError(certReaperQueue)
+					metrics.IncError(r.queue)
 					log.Error(err, "acme-resets annotation clear failed", "cert", key)
 				}
 			}
@@ -201,8 +201,8 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 
 // certReady reports whether the Certificate's Ready condition is True.
 func certReady(cert *unstructured.Unstructured) bool {
-	status, _ := shared.ReadyCond(cert)
-	return status == "True"
+	c, _ := shared.ConditionOf(cert.Object, "Ready")
+	return c.Status == "True"
 }
 
 // certNeedsReap mirrors the bash filter: Ready=False OR renewalTime
@@ -240,12 +240,12 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	log := logf.FromContext(ctx)
 	ns, name := cert.GetNamespace(), cert.GetName()
 	key := ns + "/" + name
-	now := r.nowFn()
+	now := r.now.Now()
 
 	orders, err := r.dyn.Resource(orderGVR).Namespace(ns).
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
-		metrics.IncError(certReaperQueue)
+		metrics.IncError(r.queue)
 		log.Error(err, "order list failed", "cert", key)
 		return false
 	}
@@ -300,7 +300,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	if st.total >= certReaperMaxReset {
 		if !st.gaveUp {
 			st.gaveUp = true
-			metrics.IncError(certReaperQueue)
+			metrics.IncError(r.queue)
 			log.Info("REFUSE: reset budget exhausted — cert config is broken, "+
 				"continuing would burn the ACME rate limit",
 				"cert", key, "order", stuck.GetName(), "resets", st.total)
@@ -317,7 +317,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	chals, err := r.dyn.Resource(challengeGVR).Namespace(ns).
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
-		metrics.IncError(certReaperQueue)
+		metrics.IncError(r.queue)
 		log.Error(err, "challenge list failed", "cert", key)
 		return false
 	}
@@ -331,9 +331,8 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		"cert", key, "order", stuck.GetName())
 	stuckUID := stuck.GetUID()
 	if err := r.dyn.Resource(orderGVR).Namespace(ns).
-		Delete(ctx, stuck.GetName(), metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &stuckUID}}); err != nil {
-		metrics.IncError(certReaperQueue)
+		Delete(ctx, stuck.GetName(), shared.UIDDeleteOptions(stuckUID, "")); err != nil {
+		metrics.IncError(r.queue)
 		log.Error(err, "order delete failed", "cert", key, "order", stuck.GetName())
 		return false
 	}
@@ -343,7 +342,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	// between sweeps must not refund it. Best-effort: the Order is
 	// already deleted, so a failed write is flagged, not fatal.
 	if err := r.patchResetsAnnotation(ctx, cert, st); err != nil {
-		metrics.IncError(certReaperQueue)
+		metrics.IncError(r.queue)
 		log.Error(err, "acme-resets annotation write failed", "cert", key)
 	}
 	return true
@@ -360,7 +359,7 @@ func (r *certManagerReaper) listCRs(ctx context.Context, ns string) (*unstructur
 	list, err := r.dyn.Resource(certificateRequestGVR).Namespace(ns).
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
-		metrics.IncError(certReaperQueue)
+		metrics.IncError(r.queue)
 	}
 	r.crCache[ns] = crListResult{list: list, err: err}
 	return list, err
@@ -368,8 +367,8 @@ func (r *certManagerReaper) listCRs(ctx context.Context, ns string) (*unstructur
 
 // certReadyFalse reports the Ready=False half of the W8 CR candidacy.
 func certReadyFalse(cert *unstructured.Unstructured) bool {
-	status, _ := shared.ReadyCond(cert)
-	return status == "False"
+	c, _ := shared.ConditionOf(cert.Object, "Ready")
+	return c.Status == "False"
 }
 
 // certExpiringSoon reports whether status.notAfter lands within the
@@ -414,16 +413,16 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 		if cn, ok := certNameForCR(cr); !ok || cn != name {
 			continue
 		}
-		st, _ := shared.ReadyCond(cr)
-		if st == "True" {
+		st, _ := shared.ConditionOf(cr.Object, "Ready")
+		if st.Status == "True" {
 			continue // issued — not stuck
 		}
 		// Ready=False (Pending/Failed) or never-reported: the wedge
 		// age comes from the condition's lastTransitionTime when it
 		// exists, else the CR's age.
 		since := cr.GetCreationTimestamp().Time
-		if lt, ok := shared.ReadySince(cr); ok {
-			since = lt
+		if !st.LastTransitionTime.IsZero() {
+			since = st.LastTransitionTime
 		}
 		if now.Sub(since) <= crStuckMinAge {
 			continue
@@ -444,7 +443,7 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 	if st.total >= certReaperMaxReset {
 		if !st.gaveUp {
 			st.gaveUp = true
-			metrics.IncError(certReaperQueue)
+			metrics.IncError(r.queue)
 			log.Info("REFUSE: reset budget exhausted — cert config is broken, "+
 				"continuing would burn the ACME rate limit",
 				"cert", key, "certificaterequest", stuck.GetName(), "resets", st.total)
@@ -461,9 +460,8 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 		"cert", key, "certificaterequest", stuck.GetName())
 	uid := stuck.GetUID()
 	if err := r.dyn.Resource(certificateRequestGVR).Namespace(ns).
-		Delete(ctx, stuck.GetName(), metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil {
-		metrics.IncError(certReaperQueue)
+		Delete(ctx, stuck.GetName(), shared.UIDDeleteOptions(uid, "")); err != nil {
+		metrics.IncError(r.queue)
 		log.Error(err, "certificaterequest delete failed",
 			"cert", key, "certificaterequest", stuck.GetName())
 		return false
@@ -472,7 +470,7 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 	st.last = now
 	r.crReaped[key] = now
 	if err := r.patchResetsAnnotation(ctx, cert, st); err != nil {
-		metrics.IncError(certReaperQueue)
+		metrics.IncError(r.queue)
 		log.Error(err, "acme-resets annotation write failed", "cert", key)
 	}
 	return true

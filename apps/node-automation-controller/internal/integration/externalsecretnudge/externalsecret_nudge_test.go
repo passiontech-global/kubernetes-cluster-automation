@@ -111,7 +111,7 @@ func esAnnotation(t *testing.T, dyn *fake.FakeDynamicClient, gvr schema.GroupVer
 }
 
 func newNudge(dyn *fake.FakeDynamicClient, enabled bool) *externalSecretNudge {
-	return &externalSecretNudge{
+	return &externalSecretNudge{queue: "externalsecret-nudge",
 		cs:         kfake.NewSimpleClientset(),
 		dyn:        dyn,
 		enabled:    enabled,
@@ -418,14 +418,11 @@ func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 		"kind":       "ExternalSecret",
 		"metadata":   map[string]any{"name": "bare"},
 	}}
-	if s, m := shared.ReadyCond(bare); s != "" || m != "" {
-		t.Fatalf("readyCond on condition-less object = %q,%q", s, m)
+	if c, ok := shared.ConditionOf(bare.Object, "Ready"); ok || c.Status != "" || c.Message != "" {
+		t.Fatalf("ConditionOf on condition-less object = %v,%q,%q", ok, c.Status, c.Message)
 	}
-	if _, ok := shared.ReadySince(bare); ok {
-		t.Fatal("readySince true on condition-less object")
-	}
-	if got := shared.ReadyConds(bare); len(got) != 0 {
-		t.Fatalf("readyConds on condition-less object = %v", got)
+	if got := shared.Conditions(bare.Object, "status", "conditions"); len(got) != 0 {
+		t.Fatalf("Conditions on condition-less object = %v", got)
 	}
 
 	// Non-map entries inside .status.conditions are skipped.
@@ -434,14 +431,14 @@ func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 			"conditions": []any{"garbage", int64(42), nil},
 		},
 	}}
-	if s, _ := shared.ReadyCond(junk); s != "" {
-		t.Fatalf("readyCond saw a non-map entry: %q", s)
+	if _, ok := shared.ConditionOf(junk.Object, "Ready"); ok {
+		t.Fatal("ConditionOf saw a non-map entry")
 	}
-	if got := shared.ReadyConds(junk); len(got) != 0 {
-		t.Fatalf("readyConds kept non-map entries: %v", got)
+	if got := shared.Conditions(junk.Object, "status", "conditions"); len(got) != 0 {
+		t.Fatalf("Conditions kept non-map entries: %v", got)
 	}
 
-	// A non-Ready condition is ignored by both helpers.
+	// A non-Ready condition is ignored.
 	nonReady := &unstructured.Unstructured{Object: map[string]any{
 		"status": map[string]any{
 			"conditions": []any{map[string]any{
@@ -450,14 +447,11 @@ func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 			}},
 		},
 	}}
-	if s, _ := shared.ReadyCond(nonReady); s != "" {
-		t.Fatalf("readyCond returned a non-Ready status: %q", s)
-	}
-	if _, ok := shared.ReadySince(nonReady); ok {
-		t.Fatal("readySince true for a non-Ready condition")
+	if _, ok := shared.ConditionOf(nonReady.Object, "Ready"); ok {
+		t.Fatal("ConditionOf returned a non-Ready condition")
 	}
 
-	// Malformed lastTransitionTime → readySince false.
+	// Malformed lastTransitionTime decodes as zero.
 	badTS := &unstructured.Unstructured{Object: map[string]any{
 		"status": map[string]any{
 			"conditions": []any{map[string]any{
@@ -466,11 +460,12 @@ func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 			}},
 		},
 	}}
-	if s, _ := shared.ReadyCond(badTS); s != "False" {
-		t.Fatalf("readyCond = %q, want False", s)
+	c, ok := shared.ConditionOf(badTS.Object, "Ready")
+	if !ok || c.Status != "False" {
+		t.Fatalf("ConditionOf = %v,%q, want found/False", ok, c.Status)
 	}
-	if _, ok := shared.ReadySince(badTS); ok {
-		t.Fatal("readySince true on malformed lastTransitionTime")
+	if !c.LastTransitionTime.IsZero() {
+		t.Fatal("malformed lastTransitionTime did not decode as zero")
 	}
 }
 
@@ -490,7 +485,7 @@ func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 			return false, nil, nil
 		})
 	n := newNudge(dyn, true)
-	before := testutil.QueueErrorCount(t, esNudgeQueue)
+	before := testutil.QueueErrorCount(t, "externalsecret-nudge")
 	if err := n.nudge(ctx, true, true); err != nil {
 		t.Fatalf("per-ES patch failure must not fail the nudge: %v", err)
 	}
@@ -500,7 +495,7 @@ func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 	if _, ok := n.nudged["apps/es-good"]; !ok {
 		t.Fatal("healthy patch skipped after a sibling's failure")
 	}
-	if got := testutil.QueueErrorCount(t, esNudgeQueue) - before; got != 1 {
+	if got := testutil.QueueErrorCount(t, "externalsecret-nudge") - before; got != 1 {
 		t.Fatalf("absorbed patch failure did not IncError once, delta %v", got)
 	}
 }
@@ -707,7 +702,7 @@ func TestExternalSecretNudgeConnectHeal(t *testing.T) {
 	}
 	cs := kfake.NewSimpleClientset(oldPod, newPod)
 	dyn := esNudgeDynFake(cssObj("store", "False"))
-	n := &externalSecretNudge{
+	n := &externalSecretNudge{queue: "externalsecret-nudge",
 		cs:         cs,
 		dyn:        dyn,
 		enabled:    true,
@@ -752,7 +747,7 @@ func TestExternalSecretNudgeConnectHealTransient(t *testing.T) {
 	}
 	cs := kfake.NewSimpleClientset(pod)
 	dyn := esNudgeDynFake(cssObj("store", "False"))
-	n := &externalSecretNudge{
+	n := &externalSecretNudge{queue: "externalsecret-nudge",
 		cs:         cs,
 		dyn:        dyn,
 		enabled:    true,

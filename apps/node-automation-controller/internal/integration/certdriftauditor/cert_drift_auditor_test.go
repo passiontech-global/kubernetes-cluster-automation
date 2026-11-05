@@ -127,9 +127,9 @@ func validatingCfg(name string, annos map[string]string,
 func newCertDriftAuditor(cs kubernetes.Interface, dyn dynamic.Interface,
 	now time.Time) *certDriftAuditor {
 	return &certDriftAuditor{
-		cs:    cs,
-		dyn:   dyn,
-		nowFn: func() time.Time { return now },
+		cs:  cs,
+		dyn: dyn,
+		now: func() time.Time { return now },
 	}
 }
 

@@ -71,7 +71,6 @@ import (
 )
 
 const (
-	zombieSidecarReaperQueue    = "zombie-sidecar-reaper"
 	zombieSidecarReaperInterval = 5 * time.Minute
 	// zombieSidecarTermAge: how long every app container must have
 	// been Terminated before the pod counts as a zombie — covers
@@ -110,12 +109,16 @@ var zombieSidecarShutdownTargets = map[string]struct {
 
 type zombieSidecarReaper struct {
 	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
 	// dyn is accepted for Setup-signature parity with the other
 	// wave modules — the reaper only needs typed Pod access today.
 	dyn dynamic.Interface
-	// nowFn is the clock seam — tests pin it so the >5m
+	// now is the clock seam — tests pin it so the >5m
 	// termination window is deterministic. nil → time.Now.
-	nowFn func() time.Time
+	now shared.Clock
 	// shutdownFn POSTs the sidecar's admin shutdown over the direct
 	// pod-IP path — a seam so tests never leave the process. The
 	// sidecar name selects the admin endpoint (linkerd :4191/
@@ -151,10 +154,10 @@ func Setup(d shared.Deps) error {
 	if d.Disabled {
 		return nil
 	}
-	r := &zombieSidecarReaper{cs: d.CS, dyn: d.Dyn, nowFn: time.Now,
-		shutdownFn: zombieSidecarShutdown, poked: map[string]bool{},
-		tried: map[string]bool{}}
-	return shared.AddPeriodic(d.Mgr, zombieSidecarReaperQueue, zombieSidecarReaperInterval, r.run)
+	r := &zombieSidecarReaper{cs: d.CS, dyn: d.Dyn, queue: d.Name,
+		now: shared.SystemClock, shutdownFn: zombieSidecarShutdown,
+		poked: map[string]bool{}, tried: map[string]bool{}}
+	return shared.AddPeriodic(d.Mgr, r.queue, zombieSidecarReaperInterval, r.run)
 }
 
 func (r *zombieSidecarReaper) run(ctx context.Context) error {
@@ -163,9 +166,6 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	defer r.mu.Unlock()
 	// Lazily arm the zero-value struct — unit tests construct the
 	// reaper literally without the Setup path.
-	if r.nowFn == nil {
-		r.nowFn = time.Now
-	}
 	if r.shutdownFn == nil {
 		r.shutdownFn = zombieSidecarShutdown
 	}
@@ -187,7 +187,7 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		return fmt.Errorf("list pods: %w", err)
 	}
 
-	now := r.nowFn()
+	now := r.now.Now()
 	seen := map[string]bool{} // qualifying keys this cycle
 	deleted := 0
 	for i := range pods {
@@ -410,7 +410,7 @@ func (r *zombieSidecarReaper) jobAllowsReap(ctx context.Context, p *corev1.Pod, 
 	case apierrors.IsNotFound(err):
 		return true // Job gone — nobody recreates the pod
 	case err != nil:
-		metrics.IncError(zombieSidecarReaperQueue)
+		metrics.IncError(r.queue)
 		log.Info("WARN: job lookup failed — keeping still-Running exit-0 pod (fail closed)",
 			"pod", p.Namespace+"/"+p.Name, "job", jobName, "error", err)
 		return false
@@ -501,11 +501,9 @@ func (r *zombieSidecarReaper) reap(ctx context.Context, p *corev1.Pod, why strin
 	// not inherit this delete.
 	uid := p.UID
 	if err := r.cs.CoreV1().Pods(p.Namespace).
-		Delete(ctx, p.Name, metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid},
-		}); err != nil {
+		Delete(ctx, p.Name, shared.UIDDeleteOptions(uid, "")); err != nil {
 		log.Error(err, "zombie pod delete failed", "pod", p.Namespace+"/"+p.Name)
-		metrics.IncError(zombieSidecarReaperQueue)
+		metrics.IncError(r.queue)
 		return err
 	}
 	metrics.ZombieSidecarPodsReapedTotal.WithLabelValues(p.Namespace).Inc()

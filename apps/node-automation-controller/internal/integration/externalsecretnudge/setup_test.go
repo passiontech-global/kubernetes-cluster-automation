@@ -18,7 +18,7 @@ import (
 func TestSetupRegistersPeriodic(t *testing.T) {
 	t.Setenv("EXTERNALSECRET_NUDGE_ENABLED", "true")
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "externalsecret-nudge", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 func TestSetupRegistersWhenDisabled(t *testing.T) {
 	t.Setenv("EXTERNALSECRET_NUDGE_ENABLED", "false")
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "externalsecret-nudge", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("disabled nudge setup: %v", err)
 	}

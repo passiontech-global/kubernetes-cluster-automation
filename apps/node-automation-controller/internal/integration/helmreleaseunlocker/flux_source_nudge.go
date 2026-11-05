@@ -120,11 +120,11 @@ func fluxArtifactStale(o *unstructured.Unstructured) bool {
 	if suspended, _ := shared.NestedBool(o.Object, "spec", "suspend"); suspended {
 		return false // suspended objects are parked, not broken
 	}
-	status, msg := shared.ReadyCond(o)
-	if status != "False" {
+	c, _ := shared.ConditionOf(o.Object, "Ready")
+	if c.Status != "False" {
 		return false
 	}
-	lower := strings.ToLower(msg)
+	lower := strings.ToLower(c.Message)
 	hit := false
 	for _, s := range artifactFailMsgs {
 		if strings.Contains(lower, s) {
@@ -135,8 +135,8 @@ func fluxArtifactStale(o *unstructured.Unstructured) bool {
 	if !hit {
 		return false
 	}
-	since, ok := shared.ReadySince(o)
-	if !ok {
+	since := c.LastTransitionTime
+	if since.IsZero() {
 		since = o.GetCreationTimestamp().Time
 	}
 	return time.Since(since) >= artifactStuckMinAge
@@ -224,7 +224,7 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 				"kind", ref.kind, "source", key, "consumer", consumer)
 			return false
 		}
-		metrics.IncError(helmUnlockQueue)
+		metrics.IncError(u.queue)
 		log.Error(err, "flux source get failed", "kind", ref.kind, "source", key)
 		return false
 	}
@@ -249,7 +249,7 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 	}
 	if _, err := u.dyn.Resource(gvr).Namespace(ref.namespace).Patch(ctx, ref.name,
 		types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
-		metrics.IncError(helmUnlockQueue)
+		metrics.IncError(u.queue)
 		log.Error(err, "flux source nudge patch failed", "kind", ref.kind, "source", key)
 		return false
 	}

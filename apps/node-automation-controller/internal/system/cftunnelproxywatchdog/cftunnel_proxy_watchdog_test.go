@@ -289,7 +289,7 @@ func TestWatchdogDeletesPodWithFatalLogs(t *testing.T) {
 		proxyDeploy(nil))
 	cs.PrependReactor("get", "pods", cfLogReactor(
 		"2026-11-20T00:00:00Z ERR Failed to sufficiently increase receive buffer size\n"))
-	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, nowFn: func() time.Time { return now }}
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
 	if err := w.run(ctx); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestWatchdogAllUnreadyDeletesOldest(t *testing.T) {
 			now.Add(-time.Hour), now.Add(-20*time.Minute)),
 		proxyDeploy(nil))
 	cs.PrependReactor("get", "pods", cfLogReactor("INF tunnel running normally\n"))
-	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, nowFn: func() time.Time { return now }}
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
 	if err := w.run(ctx); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestWatchdogAllUnreadyDeletesOldest(t *testing.T) {
 	cs2.PrependReactor("get", "pods", cfLogReactor("INF ok\n"))
 	w2 := &cfTunnelProxyWatchdog{cs: cs2, namespace: cfWatchdogTestNS}
 	w2.lastHeal.Stamp(cfWatchdogTestNS+"/proxy-old", now.Add(-5*time.Minute))
-	w2.nowFn = func() time.Time { return now }
+	w2.now = func() time.Time { return now }
 	if err := w2.run(ctx); err != nil {
 		t.Fatalf("run2: %v", err)
 	}
@@ -357,7 +357,7 @@ func TestWatchdogYoungUnreadyPodUntouched(t *testing.T) {
 			}
 			return false, nil, nil
 		})
-	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, nowFn: func() time.Time { return now }}
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
 	if err := w.run(ctx); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestWatchdogHealsIngressControllerNamespace(t *testing.T) {
 		proxyDeploy(nil))
 	cs.PrependReactor("get", "pods", cfLogReactor(
 		"2026-11-20T00:00:00Z ERR Serve tunnel error error=\"connection refused\"\n"))
-	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, nowFn: func() time.Time { return now }}
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
 	if err := w.run(ctx); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -423,7 +423,7 @@ func TestCloudflaredLogsWedged(t *testing.T) {
 // CF_TUNNEL_WATCHDOG_ENABLED=false.
 func TestSetupCFTunnelProxyWatchdogDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "cf-tunnel-proxy-watchdog", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
@@ -440,9 +440,9 @@ func TestSetupCFTunnelProxyWatchdogPeriodic(t *testing.T) {
 	t.Setenv("CF_TUNNEL_WATCHDOG_NAMESPACE", cfWatchdogTestNS)
 	t.Setenv("CF_TUNNEL_WATCHDOG_INTERVAL", "5m")
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "cf-tunnel-proxy-watchdog", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	testutil.ExpectPeriodic(t, m, cfTunnelWatchdogQueue, 5*time.Minute)
+	testutil.ExpectPeriodic(t, m, "cf-tunnel-proxy-watchdog", 5*time.Minute)
 }

@@ -97,7 +97,7 @@ func upPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 }
 
 func upGuard(cs *fake.Clientset) *webhookGuard {
-	return &webhookGuard{cs: cs, nowFn: time.Now,
+	return &webhookGuard{cs: cs, now: time.Now,
 		unmeshedPodAuditor: unmeshedPodAuditor{}}
 }
 
@@ -666,7 +666,7 @@ func TestUnmeshedRemediationAutopilotPlanDefers(t *testing.T) {
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"))
-	g := &webhookGuard{cs: cs, dyn: dyn, nowFn: time.Now,
+	g := &webhookGuard{cs: cs, dyn: dyn, now: time.Now,
 		unmeshedPodAuditor: unmeshedPodAuditor{}}
 	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
 		t.Fatal(err)

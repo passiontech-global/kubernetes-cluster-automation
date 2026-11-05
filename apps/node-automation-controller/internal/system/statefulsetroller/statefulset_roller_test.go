@@ -104,7 +104,7 @@ func srPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 
 func srRoller(cs *fake.Clientset, now time.Time) *statefulSetOnDeleteRoller {
 	return &statefulSetOnDeleteRoller{cs: cs,
-		nowFn: func() time.Time { return now }}
+		now: func() time.Time { return now }}
 }
 
 // emulateEviction teaches the fake clientset the apiserver's
@@ -169,7 +169,7 @@ func TestStatefulSetRollerDeletesHighestStaleOrdinal(t *testing.T) {
 	if !srPodExists(t, cs, "apps", "db-1") {
 		t.Fatal("pod deleted before the 30m drift window")
 	}
-	r.nowFn = func() time.Time { return t0.Add(31 * time.Minute) }
+	r.now = func() time.Time { return t0.Add(31 * time.Minute) }
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestStatefulSetRollerRequiresOptIn(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	r := srRoller(cs, t0)
 	for _, when := range []time.Duration{0, time.Hour} {
-		r.nowFn = func() time.Time { return t0.Add(when) }
+		r.now = func() time.Time { return t0.Add(when) }
 		if err := r.run(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -238,7 +238,7 @@ func TestStatefulSetRollerRequiresOnDelete(t *testing.T) {
 	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
 	r := srRoller(cs, t0)
-	r.nowFn = func() time.Time { return t0.Add(time.Hour) }
+	r.now = func() time.Time { return t0.Add(time.Hour) }
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}

@@ -135,6 +135,15 @@ func Jobs(cs kubernetes.Interface, namespace string) PageFunc[batchv1.Job] {
 		func(l *batchv1.JobList) []batchv1.Job { return l.Items })
 }
 
+// CronJobs lists batch CronJobs in namespace.
+func CronJobs(cs kubernetes.Interface, namespace string) PageFunc[batchv1.CronJob] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*batchv1.CronJobList, error) {
+			return cs.BatchV1().CronJobs(namespace).List(ctx, o)
+		},
+		func(l *batchv1.CronJobList) []batchv1.CronJob { return l.Items })
+}
+
 // Secrets lists Secrets in namespace.
 func Secrets(cs kubernetes.Interface, namespace string) PageFunc[corev1.Secret] {
 	return typedPage(
@@ -160,6 +169,34 @@ func EndpointSlices(cs kubernetes.Interface, namespace string) PageFunc[discover
 			return cs.DiscoveryV1().EndpointSlices(namespace).List(ctx, o)
 		},
 		func(l *discoveryv1.EndpointSliceList) []discoveryv1.EndpointSlice { return l.Items })
+}
+
+// Namespaces lists cluster-scoped Namespaces.
+func Namespaces(cs kubernetes.Interface) PageFunc[corev1.Namespace] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*corev1.NamespaceList, error) {
+			return cs.CoreV1().Namespaces().List(ctx, o)
+		},
+		func(l *corev1.NamespaceList) []corev1.Namespace { return l.Items })
+}
+
+// Nodes lists cluster-scoped Nodes — the backing PageFunc for
+// ListNodes in node.go.
+func Nodes(cs kubernetes.Interface) PageFunc[corev1.Node] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*corev1.NodeList, error) {
+			return cs.CoreV1().Nodes().List(ctx, o)
+		},
+		func(l *corev1.NodeList) []corev1.Node { return l.Items })
+}
+
+// Events lists Events in namespace.
+func Events(cs kubernetes.Interface, namespace string) PageFunc[corev1.Event] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*corev1.EventList, error) {
+			return cs.CoreV1().Events(namespace).List(ctx, o)
+		},
+		func(l *corev1.EventList) []corev1.Event { return l.Items })
 }
 
 // PersistentVolumeClaims lists PersistentVolumeClaims in namespace.

@@ -41,6 +41,10 @@ import (
 
 type fluentBitRoller struct {
 	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the controller name and every IncError label
+	// come from one place.
+	queue string
 }
 
 // onlyPipelineSecret is the exact predicate the For() watch below
@@ -61,9 +65,9 @@ func Setup(d shared.Deps) error {
 	if d.Disabled {
 		return nil
 	}
-	r := &fluentBitRoller{cs: d.CS}
+	r := &fluentBitRoller{cs: d.CS, queue: d.Name}
 	return ctrl.NewControllerManagedBy(d.Mgr).
-		Named("fluent-bit-config-roller").
+		Named(d.Name).
 		For(&corev1.Secret{}, builder.WithPredicates(onlyPipelineSecret)).
 		Complete(r)
 }
@@ -78,13 +82,13 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	if apierrors.IsNotFound(err) {
 		// Enabled cluster but no pipeline secret — bash's set -e made
 		// this an error+metric; surface it the same way.
-		metrics.IncError("fluent-bit-config-roller")
+		metrics.IncError(r.queue)
 		log.Info("WARN: pipeline secret fluent-system/passiontech-pipeline " +
 			"missing — config drift untracked")
 		return res, nil
 	}
 	if err != nil {
-		metrics.IncError("fluent-bit-config-roller")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("get secret fluent-system/passiontech-pipeline: %w", err)
 	}
 	hash := sec.Annotations["fluent.io/config-hash"]
@@ -111,7 +115,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	// churn; positionDB guarantees resume once stable.
 	notReady, err := shared.CountNotReadyNodes(ctx, r.cs)
 	if err != nil {
-		metrics.IncError("fluent-bit-config-roller")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("count not-ready nodes (storm gate): %w", err)
 	}
 	if notReady > 0 {
@@ -122,7 +126,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 
 	ds, err := r.cs.AppsV1().DaemonSets("fluent-system").Get(ctx, "fluent-bit", metav1.GetOptions{})
 	if err != nil {
-		metrics.IncError("fluent-bit-config-roller")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("get daemonset fluent-system/fluent-bit: %w", err)
 	}
 	// Bash settled check exactly: generation observed AND updated ==
@@ -143,7 +147,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 		time.Now().UTC().Format(time.RFC3339)))
 	if _, err := r.cs.AppsV1().DaemonSets("fluent-system").Patch(ctx, "fluent-bit",
 		types.StrategicMergePatchType, restartPatch, metav1.PatchOptions{}); err != nil {
-		metrics.IncError("fluent-bit-config-roller")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("rollout-restart patch daemonset fluent-system/fluent-bit: %w", err)
 	}
 	// State written only AFTER the restart succeeded (bash ordering):
@@ -152,7 +156,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 		`{"metadata":{"annotations":{"passiontech.dev/rolled-config-hash":%q}}}`, hash))
 	if _, err := r.cs.CoreV1().Secrets("fluent-system").Patch(ctx, "passiontech-pipeline",
 		types.MergePatchType, statePatch, metav1.PatchOptions{}); err != nil {
-		metrics.IncError("fluent-bit-config-roller")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("stamp rolled-config-hash on secret fluent-system/passiontech-pipeline: %w", err)
 	}
 	log.Info("ROLL: restarted fluent-bit for config",

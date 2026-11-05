@@ -86,8 +86,6 @@ import (
 )
 
 const (
-	webhookGuardQueue = "admission-webhook-guard"
-
 	// kind label values for the WebhookCircuit* metrics — the short
 	// forms matching webhookPatch.mutating.
 	webhookKindMutating   = "mutating"
@@ -104,21 +102,25 @@ const (
 // is unchanged by the split.
 type webhookGuard struct {
 	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name, the registration log and
+	// every IncError label come from one place.
+	queue string
 	// dyn feeds the autopilot-Plan signal of the maintenance mutex
 	// (W7-C1) — wired through Setup like every other dynamic-client
 	// module. A nil dyn (unit tests that build the guard directly)
 	// narrows the mutex to the clientset-only signals (node cordon +
 	// kured lock) instead of failing closed.
 	dyn dynamic.Interface
-	// nowFn is the clock seam for the dead-backend streak — tests pin
+	// now is the clock seam for the dead-backend streak — tests pin
 	// a scripted now to reach past webhookDeadThreshold. nil → time.Now.
-	nowFn shared.Clock
+	now shared.Clock
 	// endpointProber is the W9-CP1 brownout probe — a TCP connect +
 	// TLS handshake against a Ready endpoint IP on the webhook port.
 	// Injectable for tests; nil falls back to tcpTLSEndpointProber.
 	endpointProber func(ctx context.Context, ip string, port int32) bool
 
-	// The three sweeps share cs/dyn/nowFn/endpointProber through
+	// The three sweeps share cs/dyn/now/endpointProber through
 	// snap.g and hand each other nothing else; embedding keeps the
 	// guard's method set — and every in-package test fixture — stable
 	// across the split.
@@ -131,14 +133,14 @@ type webhookGuard struct {
 // the autopilot-Plan signal of the maintenance mutex consulted by
 // the unmeshed-pod healer (W7-C1).
 func Setup(d shared.Deps) error {
-	logf.Log.WithName(webhookGuardQueue).Info("registered",
+	logf.Log.WithName(d.Name).Info("registered",
 		"interval", 5*time.Minute, "circuitBreaker", circuitBreakerEnabled(),
 		"unmeshedRemediation", unmeshedRemediationEnabled())
 	// The bookkeeping ledgers (brokenEmitted, unmeshedEmitted,
 	// deadSince, bounceAt) are shared.* zero-value types — nothing to
 	// initialize here.
-	g := &webhookGuard{cs: d.CS, dyn: d.Dyn, nowFn: time.Now}
-	return shared.AddPeriodic(d.Mgr, webhookGuardQueue, 5*time.Minute, g.run)
+	g := &webhookGuard{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
+	return shared.AddPeriodic(d.Mgr, g.queue, 5*time.Minute, g.run)
 }
 
 // listPageSize bounds every cluster-wide namespaced List below —
@@ -284,13 +286,6 @@ func (s *sweepSnapshot) readyCounts() (endpointCensus, error) {
 		s.ready, s.readyErr = s.g.readyEndpointCounts(s.ctx, s)
 	})
 	return s.ready, s.readyErr
-}
-
-func (g *webhookGuard) now() time.Time {
-	if g.nowFn != nil {
-		return g.nowFn()
-	}
-	return time.Now()
 }
 
 func (g *webhookGuard) run(ctx context.Context) error {

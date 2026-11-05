@@ -18,7 +18,7 @@ import (
 func TestSetupRegistersPeriodic(t *testing.T) {
 	t.Setenv("HELM_STALL_UNWEDGE_ENABLED", "true")
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "helmrelease-unlocker", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}

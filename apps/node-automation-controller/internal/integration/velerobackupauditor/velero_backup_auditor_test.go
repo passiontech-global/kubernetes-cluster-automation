@@ -68,9 +68,9 @@ func veleroBackup(ns, name, schedule, phase string, age time.Duration,
 
 func newVeleroAuditor(dyn *fake.FakeDynamicClient, now time.Time) *veleroBackupAuditor {
 	return &veleroBackupAuditor{
-		cs:    kfake.NewSimpleClientset(),
-		dyn:   dyn,
-		nowFn: func() time.Time { return now },
+		cs:  kfake.NewSimpleClientset(),
+		dyn: dyn,
+		now: func() time.Time { return now },
 	}
 }
 
@@ -150,7 +150,7 @@ func TestVeleroBackupAuditorPausedSchedule(t *testing.T) {
 	}
 
 	// Advance past the 24h threshold: both paused schedules alert.
-	a.nowFn = func() time.Time { return now.Add(25 * time.Hour) }
+	a.now = func() time.Time { return now.Add(25 * time.Hour) }
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestVeleroBackupAuditorPauseLedgerReset(t *testing.T) {
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	a.nowFn = func() time.Time { return now.Add(25 * time.Hour) }
+	a.now = func() time.Time { return now.Add(25 * time.Hour) }
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +336,7 @@ func TestVeleroBackupAuditorClearsResolvedSeries(t *testing.T) {
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	a.nowFn = func() time.Time { return now.Add(25 * time.Hour) }
+	a.now = func() time.Time { return now.Add(25 * time.Hour) }
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +394,7 @@ func TestVeleroBackupAuditorFailedAndBSL(t *testing.T) {
 		"metadata": map[string]any{"namespace": "velero", "name": "main"},
 		"status":   map[string]any{"phase": "Unavailable"}}}
 	dyn := newDynFake(sched, failed, bsl)
-	a := &veleroBackupAuditor{dyn: dyn, nowFn: time.Now}
+	a := &veleroBackupAuditor{dyn: dyn, now: time.Now}
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}

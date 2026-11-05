@@ -47,6 +47,10 @@ var (
 
 type konnectivityPatcher struct {
 	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the controller name and every IncError label
+	// come from one place.
+	queue string
 }
 
 // onlyKonnectivityDaemonSet is the exact predicate the For() watch
@@ -62,9 +66,9 @@ var onlyKonnectivityDaemonSet = predicate.NewPredicateFuncs(func(o client.Object
 // manager cache; the predicate is a cheap belt on top).
 func Setup(d shared.Deps) error {
 	return ctrl.NewControllerManagedBy(d.Mgr).
-		Named("konnectivity-patcher").
+		Named(d.Name).
 		For(&appsv1.DaemonSet{}, builder.WithPredicates(onlyKonnectivityDaemonSet)).
-		Complete(&konnectivityPatcher{cs: d.CS})
+		Complete(&konnectivityPatcher{cs: d.CS, queue: d.Name})
 }
 
 func (r *konnectivityPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -79,7 +83,7 @@ func (r *konnectivityPatcher) Reconcile(ctx context.Context, _ reconcile.Request
 		return res, nil
 	}
 	if err != nil {
-		metrics.IncError("konnectivity-patcher")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("get daemonset kube-system/konnectivity-agent: %w", err)
 	}
 
@@ -116,7 +120,7 @@ func (r *konnectivityPatcher) Reconcile(ctx context.Context, _ reconcile.Request
 	if _, err := r.cs.AppsV1().DaemonSets("kube-system").Patch(ctx,
 		"konnectivity-agent", types.StrategicMergePatchType,
 		konnectivityPatch, metav1.PatchOptions{}); err != nil {
-		metrics.IncError("konnectivity-patcher")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("patch daemonset kube-system/konnectivity-agent: %w", err)
 	}
 	return res, nil

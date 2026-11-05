@@ -82,6 +82,29 @@ func TestGaugeLedgerLastCarryForward(t *testing.T) {
 	}
 }
 
+func TestGaugeLedgerReconcile(t *testing.T) {
+	var led GaugeLedger[string]
+	var deleted [][]string
+	del := func(lv ...string) bool {
+		deleted = append(deleted, append([]string{}, lv...))
+		return true
+	}
+	// First sweep: two tuples emitted, nothing to prune.
+	if n := led.Reconcile(map[string][]string{
+		"a": {"A"}, "b": {"B"}}, del); n != 0 || len(deleted) != 0 {
+		t.Fatalf("first Reconcile pruned %d/%v", n, deleted)
+	}
+	// Second sweep: "a" persists, "b" resolved, "c" is new.
+	deleted = nil
+	if n := led.Reconcile(map[string][]string{
+		"a": {"A"}, "c": {"C"}}, del); n != 1 {
+		t.Fatalf("Reconcile = %d, want 1", n)
+	}
+	if fmt.Sprint(deleted) != "[[B]]" {
+		t.Fatalf("deleted = %v, want [[B]]", deleted)
+	}
+}
+
 func TestGaugeLedgerEmitClonesLabelValues(t *testing.T) {
 	var led GaugeLedger[string]
 	lv := []string{"ns", "a"}

@@ -6,3 +6,4 @@ changelog.md
 *.test
 coverage.out
 apps/node-host-agent/agent
+apps/node-automation-controller/manager

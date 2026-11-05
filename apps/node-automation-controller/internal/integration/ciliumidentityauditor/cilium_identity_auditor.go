@@ -67,7 +67,6 @@ import (
 )
 
 const (
-	ciliumAuditQueue    = "cilium-identity-auditor"
 	ciliumIDAnnotation  = "cilium.io/identity"
 	ciliumOrphanMax     = 100 // above this the leak is real, not noise — alert
 	ciliumOrphanSamples = 5   // sample names in the warn log
@@ -115,9 +114,13 @@ type ciliumIdentityAuditor struct {
 	// consecutive sweeps. Pruned when the identity is referenced
 	// again or vanishes; a restart re-arms it, biasing conservative.
 	orphanFirstSeen shared.FirstSeenLedger
-	// nowFn is the clock seam — tests pin it so the grace/minAge
+	// now is the clock seam — tests pin it so the grace/minAge
 	// windows are deterministic.
-	nowFn shared.Clock
+	now shared.Clock
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name, the registration log and
+	// every IncError label come from one place.
+	queue string
 }
 
 // Setup registers the 15m sweep. Disabled on
@@ -133,22 +136,20 @@ func Setup(d shared.Deps) error {
 		cs:        cs,
 		dyn:       dyn,
 		gcEnabled: shared.Gate("CILIUM_IDENTITY_GC_ENABLED", true),
-		nowFn:     time.Now,
+		now:       shared.SystemClock,
+		queue:     d.Name,
 	}
-	logf.Log.WithName(ciliumAuditQueue).Info("registered", "gcEnabled", a.gcEnabled)
-	return shared.AddPeriodic(mgr, ciliumAuditQueue, 15*time.Minute, a.run)
+	logf.Log.WithName(a.queue).Info("registered", "gcEnabled", a.gcEnabled)
+	return shared.AddPeriodic(mgr, a.queue, 15*time.Minute, a.run)
 }
 
 func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	// Lazily arm the zero-value struct — unit tests construct the
-	// auditor literally without the Setup path.
-	if a.nowFn == nil {
-		a.nowFn = time.Now
-	}
-	now := a.nowFn()
+	now := a.now.Now()
 
-	ids, err := a.dyn.Resource(ciliumIdentityGVR).List(ctx, metav1.ListOptions{})
+	ids, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: ciliumListPageSize},
+		shared.DynamicPage(a.dyn.Resource(ciliumIdentityGVR)))
 	if err != nil {
 		return fmt.Errorf("list ciliumidentities: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
@@ -159,10 +160,10 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	// in flight. Reserved-range identities (1–255, or a `reserved:`
 	// security label) are skipped outright — upstream GC exempts
 	// them, so they are neither orphans nor collectible.
-	idCreated := make(map[string]time.Time, len(ids.Items))
-	idUIDs := make(map[string]types.UID, len(ids.Items))
-	for i := range ids.Items {
-		id := &ids.Items[i]
+	idCreated := make(map[string]time.Time, len(ids))
+	idUIDs := make(map[string]types.UID, len(ids))
+	for i := range ids {
+		id := &ids[i]
 		if reservedIdentity(id) {
 			continue
 		}
@@ -172,13 +173,14 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	ids = nil
 
 	used := map[string]struct{}{}
-	eps, err := a.dyn.Resource(ciliumEndpointGVR).Namespace(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	eps, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: ciliumListPageSize},
+		shared.DynamicPage(a.dyn.Resource(ciliumEndpointGVR).Namespace(metav1.NamespaceAll)))
 	if err != nil {
 		return fmt.Errorf("list ciliumendpoints: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
-	for i := range eps.Items {
-		if id := endpointIdentityID(&eps.Items[i]); id != "" {
+	for i := range eps {
+		if id := endpointIdentityID(&eps[i]); id != "" {
 			used[id] = struct{}{}
 		}
 	}
@@ -193,12 +195,14 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	// indeterminate — fail closed like the CEP/pod lists (a returned
 	// error aborts the run, so the GC path below is never reached on
 	// partial data).
-	slices, err := a.dyn.Resource(ciliumEndpointSliceGVR).
-		Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	slices, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: ciliumListPageSize},
+		shared.DynamicPage(a.dyn.Resource(ciliumEndpointSliceGVR).
+			Namespace(metav1.NamespaceAll)))
 	switch {
 	case err == nil:
-		for i := range slices.Items {
-			for _, id := range sliceIdentityIDs(&slices.Items[i]) {
+		for i := range slices {
+			for _, id := range sliceIdentityIDs(&slices[i]) {
 				used[id] = struct{}{}
 			}
 		}
@@ -266,7 +270,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	}
 	if len(orphans) > ciliumOrphanMax {
 		// Real leak — surface through the existing alert path.
-		metrics.IncError(ciliumAuditQueue)
+		metrics.IncError(a.queue)
 		log.Info("ORPHANED cilium identities above threshold — identity "+
 			"leak, 65k range exhaustion risk",
 			"orphans", len(orphans), "total", len(idCreated),
@@ -356,8 +360,7 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 		// delete with a Conflict, skipped like the NotFound race below.
 		uid := idUIDs[name]
 		if err := a.dyn.Resource(ciliumIdentityGVR).
-			Delete(ctx, name, metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil {
+			Delete(ctx, name, shared.UIDDeleteOptions(uid, "")); err != nil {
 			switch {
 			case apierrors.IsNotFound(err):
 				log.Info("SKIP: identity already gone — raced with cilium's own GC",
@@ -368,7 +371,7 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 					"identity", name)
 				continue
 			}
-			metrics.IncError(ciliumAuditQueue)
+			metrics.IncError(a.queue)
 			log.Error(err, "identity delete failed", "identity", name)
 			continue // per-identity failure must not starve the rest
 		}

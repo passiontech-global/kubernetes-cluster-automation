@@ -37,8 +37,8 @@ const (
 // with a "…in progress" message — the deadlock signature. A missing or
 // non-False Ready never counts.
 func hrStuckInProgress(hr *unstructured.Unstructured) bool {
-	status, msg := shared.ReadyCond(hr)
-	return status == "False" && strings.Contains(msg, "in progress")
+	c, _ := shared.ConditionOf(hr.Object, "Ready")
+	return c.Status == "False" && strings.Contains(c.Message, "in progress")
 }
 
 // unlockDue runs the unlock pass over the due HRs — cooldown check,
@@ -67,7 +67,7 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 				u.alerted = map[string]bool{} // literal-constructed structs (tests)
 			}
 			if !u.alerted[key] {
-				metrics.IncError(helmUnlockQueue)
+				metrics.IncError(u.queue)
 				u.alerted[key] = true
 				log.Info("ALERT: HR still stuck after unlock — not retrying inside cooldown",
 					"hr", key, "unlockedAgo", now.Sub(last).Truncate(time.Minute))
@@ -79,7 +79,7 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 			// Tolerated per-HR failure: the run absorbs it (logs +
 			// continues, returns nil) so it never reaches the
 			// wrapper — IncError here keeps it on the alert path.
-			metrics.IncError(helmUnlockQueue)
+			metrics.IncError(u.queue)
 			log.Error(err, "helmrelease unlock failed", "hr", key)
 			continue // per-HR failures must not starve the rest
 		}
@@ -164,7 +164,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	log.Info("ACTION: delete stuck pending release secret",
 		"hr", key, "secret", pending.Name, "status", pending.Labels["status"], "rev", pendingRev)
 	if err := u.cs.CoreV1().Secrets(pending.Namespace).Delete(ctx, pending.Name,
-		metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &pending.UID}}); err != nil {
+		shared.UIDDeleteOptions(pending.UID, "")); err != nil {
 		return false, fmt.Errorf("delete pending secret %s/%s: %w", pending.Namespace, pending.Name, err)
 	}
 

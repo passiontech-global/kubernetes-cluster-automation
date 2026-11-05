@@ -482,7 +482,7 @@ func TestCoreDNSPatcherPatchError(t *testing.T) {
 // COREDNS_PATCHER_ENABLED=false.
 func TestSetupCoreDNSPatcherDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "coredns-patcher", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}

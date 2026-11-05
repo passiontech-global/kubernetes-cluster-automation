@@ -88,6 +88,85 @@ func defaultCacheTransform(obj interface{}) (interface{}, error) {
 	return obj, nil
 }
 
+// buildCacheOptions assembles the informer cache shape. The cache
+// must mirror RBAC: several types are list/watch-locked to a single
+// object via resourceNames, so informers MUST carry the matching
+// field/label selector or the API returns Forbidden.
+func buildCacheOptions() cache.Options {
+	return cache.Options{
+		DefaultTransform: defaultCacheTransform,
+		ByObject: map[client.Object]cache.ByObject{
+			// kube-system Role: daemonsets resourceNames
+			// [konnectivity-agent].
+			&appsv1.DaemonSet{}: {
+				Namespaces: map[string]cache.Config{"kube-system": {}},
+				Field: fields.SelectorFromSet(
+					fields.Set{"metadata.name": "konnectivity-agent"}),
+			},
+			// kube-system Role: deployments get/list/watch (no
+			// resourceNames — the informer must see BOTH coredns and
+			// metrics-server; a single metadata.name field selector
+			// cannot express that, so the name pinning lives in the
+			// reconciler predicates instead).
+			&appsv1.Deployment{}: {
+				Namespaces: map[string]cache.Config{"kube-system": {}},
+			},
+			// ClusterRole: secrets resourceNames [passiontech-pipeline]
+			// (all namespaces; lives in fluent-system).
+			&corev1.Secret{}: {
+				Field: fields.SelectorFromSet(
+					fields.Set{"metadata.name": "passiontech-pipeline"}),
+			},
+			// cilium component Role: pods in kube-system — informer is
+			// only started when CILIUM_TAINT_REAPER_ENABLED=true (the
+			// registry gate in modules.go hands the module
+			// Deps.Disabled, so it registers nothing when off), so
+			// clusters without the component (and thus without pods
+			// watch RBAC) never open this watch. No other module
+			// watches Pods.
+			&corev1.Pod{}: {
+				Namespaces: map[string]cache.Config{"kube-system": {}},
+				Label:      labels.SelectorFromSet(labels.Set{"k8s-app": "cilium"}),
+			},
+		},
+	}
+}
+
+// buildMgrOptions assembles ctrl.Options from the parsed flag values.
+// leaseDuration/renewDeadline/retryPeriod carry the flag values where
+// 0 means "operator did not set it": the matching Options fields are
+// *time.Duration and nil means "controller-runtime default", which is
+// exactly what the zero flag value keeps.
+func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
+	leaderElect bool, leaseDuration, renewDeadline, retryPeriod time.Duration) ctrl.Options {
+	mgrOptions := ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+		HealthProbeBindAddress: probeAddr,
+		// Active/passive HA (--leader-elect): every runnable is
+		// lease-gated (plain Runnables default NeedLeaderElection()=true,
+		// so `periodic` sweepers and all reconcilers only run on the
+		// leader) while informers, metrics and probes stay warm on
+		// standbys. ReleaseOnCancel hands the Lease over on graceful
+		// shutdown — rolling-update failover ~2s vs up to LeaseDuration
+		// on crash (15s default; deployments pass 180s).
+		LeaderElection:                leaderElect,
+		LeaderElectionID:              "node-automation-controller.node-ops",
+		LeaderElectionReleaseOnCancel: true,
+		Cache:                         buildCacheOptions(),
+	}
+	if leaseDuration > 0 {
+		mgrOptions.LeaseDuration = &leaseDuration
+	}
+	if renewDeadline > 0 {
+		mgrOptions.RenewDeadline = &renewDeadline
+	}
+	if retryPeriod > 0 {
+		mgrOptions.RetryPeriod = &retryPeriod
+	}
+	return mgrOptions
+}
+
 func main() {
 	var metricsAddr, probeAddr, modulesFilter string
 	var showVersion, leaderElect bool
@@ -160,74 +239,9 @@ func main() {
 
 	cfg := ctrl.GetConfigOrDie()
 
-	// Cache must mirror RBAC: several types are list/watch-locked to a
-	// single object via resourceNames, so informers MUST carry the
-	// matching field/label selector or the API returns Forbidden.
-	mgrOptions := ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
-		HealthProbeBindAddress: probeAddr,
-		// Active/passive HA (--leader-elect): every runnable is
-		// lease-gated (plain Runnables default NeedLeaderElection()=true,
-		// so `periodic` sweepers and all reconcilers only run on the
-		// leader) while informers, metrics and probes stay warm on
-		// standbys. ReleaseOnCancel hands the Lease over on graceful
-		// shutdown — rolling-update failover ~2s vs up to LeaseDuration
-		// on crash (15s default; deployments pass 180s).
-		LeaderElection:                leaderElect,
-		LeaderElectionID:              "node-automation-controller.node-ops",
-		LeaderElectionReleaseOnCancel: true,
-		Cache: cache.Options{
-			DefaultTransform: defaultCacheTransform,
-			ByObject: map[client.Object]cache.ByObject{
-				// kube-system Role: daemonsets resourceNames
-				// [konnectivity-agent].
-				&appsv1.DaemonSet{}: {
-					Namespaces: map[string]cache.Config{"kube-system": {}},
-					Field: fields.SelectorFromSet(
-						fields.Set{"metadata.name": "konnectivity-agent"}),
-				},
-				// kube-system Role: deployments get/list/watch (no
-				// resourceNames — the informer must see BOTH coredns and
-				// metrics-server; a single metadata.name field selector
-				// cannot express that, so the name pinning lives in the
-				// reconciler predicates instead).
-				&appsv1.Deployment{}: {
-					Namespaces: map[string]cache.Config{"kube-system": {}},
-				},
-				// ClusterRole: secrets resourceNames [passiontech-pipeline]
-				// (all namespaces; lives in fluent-system).
-				&corev1.Secret{}: {
-					Field: fields.SelectorFromSet(
-						fields.Set{"metadata.name": "passiontech-pipeline"}),
-				},
-				// cilium component Role: pods in kube-system — informer is
-				// only started when CILIUM_TAINT_REAPER_ENABLED=true (the
-				// registry gate in modules.go hands the module
-				// Deps.Disabled, so it registers nothing when off), so
-				// clusters without the component (and thus without pods
-				// watch RBAC) never open this watch. No other module
-				// watches Pods.
-				&corev1.Pod{}: {
-					Namespaces: map[string]cache.Config{"kube-system": {}},
-					Label:      labels.SelectorFromSet(labels.Set{"k8s-app": "cilium"}),
-				},
-			},
-		},
-	}
-	// Only wire the fields the operator actually set — the Options
-	// fields are *time.Duration and nil means "controller-runtime
-	// default", which is exactly what the zero flag value should keep.
-	if leaseDuration > 0 {
-		mgrOptions.LeaseDuration = &leaseDuration
-	}
-	if renewDeadline > 0 {
-		mgrOptions.RenewDeadline = &renewDeadline
-	}
-	if retryPeriod > 0 {
-		mgrOptions.RetryPeriod = &retryPeriod
-	}
-	mgr, err := ctrl.NewManager(cfg, mgrOptions)
+	mgr, err := ctrl.NewManager(cfg,
+		buildMgrOptions(scheme, metricsAddr, probeAddr, leaderElect,
+			leaseDuration, renewDeadline, retryPeriod))
 	if err != nil {
 		log.Error(err, "unable to create manager")
 		os.Exit(1)

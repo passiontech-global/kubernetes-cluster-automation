@@ -145,11 +145,11 @@ func hrStalledRollout(hr *unstructured.Unstructured) bool {
 	if status, _, _ := hrCondition(hr, "Stalled"); status == "True" {
 		return true
 	}
-	status, msg := shared.ReadyCond(hr)
-	if status != "False" {
+	c, _ := shared.ConditionOf(hr.Object, "Ready")
+	if c.Status != "False" {
 		return false
 	}
-	lower := strings.ToLower(msg)
+	lower := strings.ToLower(c.Message)
 	for _, frag := range stallRolloutMsgs {
 		if strings.Contains(lower, frag) {
 			return true
@@ -159,18 +159,10 @@ func hrStalledRollout(hr *unstructured.Unstructured) bool {
 }
 
 // hrCondition returns a named condition's status/reason/message —
-// ReadyConds covers the whole list; ReadyCond only reads "Ready".
+// ("","","") when the condition is absent.
 func hrCondition(o *unstructured.Unstructured, condType string) (status, reason, message string) {
-	for _, c := range shared.ReadyConds(o) {
-		if c["type"] != condType {
-			continue
-		}
-		s, _ := c["status"].(string)
-		r, _ := c["reason"].(string)
-		m, _ := c["message"].(string)
-		return s, r, m
-	}
-	return "", "", ""
+	c, _ := shared.ConditionOf(o.Object, condType)
+	return c.Status, c.Reason, c.Message
 }
 
 // helmLastStallUnwedge reads the persisted node.ops/last-helm-stall-
@@ -243,7 +235,7 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		case err != nil:
 			// Tolerated per-HR failure: absorbed (log + continue,
 			// nil return) — IncError keeps it on the alert path.
-			metrics.IncError(helmUnlockQueue)
+			metrics.IncError(u.queue)
 			log.Error(err, "helmrelease stall unwedge failed", "hr", key)
 		case refuse != "":
 			u.alertStallOnce(ctx, key, now,
@@ -267,7 +259,7 @@ func (u *helmReleaseUnlocker) alertStallOnce(ctx context.Context, key string, no
 	if last, ok := u.stallAlerted[key]; ok && now.Sub(last) < helmUnlockCooldown {
 		return
 	}
-	metrics.IncError(helmUnlockQueue)
+	metrics.IncError(u.queue)
 	u.stallAlerted[key] = now
 	logf.FromContext(ctx).Info("ALERT: "+msg, "hr", key)
 }
@@ -370,9 +362,8 @@ func (u *helmReleaseUnlocker) unwedge(ctx context.Context,
 func (u *helmReleaseUnlocker) stalledDeployment(ctx context.Context,
 	hr *unstructured.Unstructured) (*appsv1.Deployment, string, error) {
 	releaseNS := hrReleaseNS(hr)
-	for _, c := range shared.ReadyConds(hr) {
-		msg, _ := c["message"].(string)
-		m := stalledWorkloadRe.FindStringSubmatch(msg)
+	for _, c := range shared.Conditions(hr.Object, "status", "conditions") {
+		m := stalledWorkloadRe.FindStringSubmatch(c.Message)
 		if m == nil {
 			continue
 		}
@@ -472,7 +463,9 @@ func (u *helmReleaseUnlocker) deadlockPlan(ctx context.Context,
 	if err != nil {
 		return nil, "", fmt.Errorf("list replicasets in %s: %w", dep.Namespace, err)
 	}
-	pods, err := u.cs.CoreV1().Pods(dep.Namespace).List(ctx, metav1.ListOptions{})
+	pods, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: helmListPageSize},
+		shared.Pods(u.cs, dep.Namespace))
 	if err != nil {
 		return nil, "", fmt.Errorf("list pods in %s: %w", dep.Namespace, err)
 	}
@@ -500,7 +493,7 @@ func (u *helmReleaseUnlocker) deadlockPlan(ctx context.Context,
 			"newest ReplicaSet %s has desired replicas 0 — no surge pod is trying to schedule",
 			newRS.Name), nil
 	}
-	newPods := podsOwnedBy(pods.Items, newRS)
+	newPods := podsOwnedBy(pods, newRS)
 	pendingBlocked := 0
 	pendingOther := 0
 	for _, p := range newPods {
@@ -538,7 +531,7 @@ func (u *helmReleaseUnlocker) deadlockPlan(ctx context.Context,
 			continue
 		}
 		rsBlocking := 0
-		for _, p := range podsOwnedBy(pods.Items, rs) {
+		for _, p := range podsOwnedBy(pods, rs) {
 			if p.Spec.NodeName == "" || p.DeletionTimestamp != nil {
 				continue // unscheduled/dying pods block nothing
 			}
@@ -614,12 +607,14 @@ func (u *helmReleaseUnlocker) deadlockPlan(ctx context.Context,
 // statefulset-ondelete-roller).
 func (u *helmReleaseUnlocker) pdbBlocksScaleDown(ctx context.Context,
 	ns string, podLabels map[string]string, remove int) (string, error) {
-	pdbs, err := u.cs.PolicyV1().PodDisruptionBudgets(ns).List(ctx, metav1.ListOptions{})
+	pdbs, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: helmListPageSize},
+		shared.PodDisruptionBudgets(u.cs, ns))
 	if err != nil {
 		return "", fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w", ns, err)
 	}
-	for i := range pdbs.Items {
-		pdb := &pdbs.Items[i]
+	for i := range pdbs {
+		pdb := &pdbs[i]
 		sel := labels.Everything()
 		if pdb.Spec.Selector != nil {
 			parsed, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)

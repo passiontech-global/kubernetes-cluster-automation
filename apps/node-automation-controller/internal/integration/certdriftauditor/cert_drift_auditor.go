@@ -70,7 +70,6 @@ import (
 )
 
 const (
-	certDriftQueue = "cert-drift-auditor"
 	// injectCAFromAnno carries "namespace/certificateName" — cainjector
 	// resolves the Certificate's spec.secretName to find the CA secret.
 	injectCAFromAnno = "cert-manager.io/inject-ca-from"
@@ -145,9 +144,13 @@ type webhookEntry struct {
 type certDriftAuditor struct {
 	cs  kubernetes.Interface
 	dyn dynamic.Interface
-	// nowFn is the clock seam — tests pin it so days-until-expiry and
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
+	// now is the clock seam — tests pin it so days-until-expiry and
 	// staleness windows are deterministic.
-	nowFn shared.Clock
+	now shared.Clock
 	// seenWebhooks: gauge series emitted last sweep, kept so an entry
 	// that disappears (webhook removed, annotation dropped, config
 	// deleted) gets its series pruned instead of pinning drift=1
@@ -190,20 +193,18 @@ func Setup(d shared.Deps) error {
 	a := &certDriftAuditor{
 		cs:                  cs,
 		dyn:                 dyn,
-		nowFn:               time.Now,
+		queue:               d.Name,
+		now:                 shared.SystemClock,
 		replicationMismatch: map[replicationMetricKey]int{},
 		resyncNudged:        map[replicationMetricKey]time.Time{},
 	}
-	return shared.AddPeriodic(mgr, certDriftQueue, 15*time.Minute, a.run)
+	return shared.AddPeriodic(mgr, a.queue, 15*time.Minute, a.run)
 }
 
 func (a *certDriftAuditor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	// Lazily arm the zero-value struct — unit tests construct the
 	// auditor literally without the Setup path.
-	if a.nowFn == nil {
-		a.nowFn = time.Now
-	}
 	if a.replicationMismatch == nil {
 		a.replicationMismatch = map[replicationMetricKey]int{}
 	}
@@ -300,7 +301,7 @@ func (a *certDriftAuditor) auditOneWebhookConfig(ctx context.Context,
 			}
 			continue
 		}
-		if days, ok := earliestCertExpiryDays(e.caBundle, a.nowFn()); ok {
+		if days, ok := earliestCertExpiryDays(e.caBundle, a.now.Now()); ok {
 			a.seenWebhookExpiry.Emit(k, k.kind, k.name, k.webhook)
 			metrics.WebhookCABundleDaysToExpiry.
 				WithLabelValues(k.kind, k.name, k.webhook).Set(days)
@@ -530,7 +531,7 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 				a.seenSecrets.Emit(key, s.Namespace, s.Name)
 				// Days, not seconds — the alert budget this feeds ("fires
 				// <30d, pages <7d") thinks in days; negatives mean expired.
-				days := cert.NotAfter.Sub(a.nowFn()).Hours() / 24
+				days := cert.NotAfter.Sub(a.now.Now()).Hours() / 24
 				metrics.TLSSecretDaysToExpiry.
 					WithLabelValues(s.Namespace, s.Name).Set(days)
 			}
@@ -646,7 +647,7 @@ func (a *certDriftAuditor) forceReplicationResync(ctx context.Context,
 	if a.resyncNudged == nil {
 		a.resyncNudged = map[replicationMetricKey]time.Time{} // literal-constructed auditors (tests)
 	}
-	now := a.nowFn()
+	now := a.now.Now()
 	if last, ok := a.resyncNudged[k]; ok && now.Sub(last) < replicationResyncCooldown {
 		log.Info("skip resync: replicated secret inside cooldown",
 			"secret", d.namespace+"/"+d.name,
@@ -663,7 +664,7 @@ func (a *certDriftAuditor) forceReplicationResync(ctx context.Context,
 	}
 	if _, err := a.cs.CoreV1().Secrets(d.namespace).Patch(ctx, d.name,
 		types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
-		metrics.IncError(certDriftQueue)
+		metrics.IncError(a.queue)
 		log.Error(err, "replicated-from-version strip failed",
 			"secret", d.namespace+"/"+d.name)
 		return
@@ -704,7 +705,7 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 		return
 	}
 	a.linkerdIssuerSerial = serial
-	now := a.nowFn()
+	now := a.now.Now()
 	if now.Sub(a.linkerdIssuerHealed) < linkerdIssuerCooldown {
 		log.Info("skip issuer rollout: inside cooldown",
 			"ago", now.Sub(a.linkerdIssuerHealed).Truncate(time.Minute))
@@ -722,7 +723,7 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 	}
 	if _, err := a.cs.AppsV1().Deployments(linkerdNS).Patch(ctx, linkerdIssuerDeploy,
 		types.StrategicMergePatchType, payload, metav1.PatchOptions{}); err != nil {
-		metrics.IncError(certDriftQueue)
+		metrics.IncError(a.queue)
 		log.Error(err, "linkerd-identity rollout stamp failed")
 		return
 	}
@@ -793,12 +794,14 @@ func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
 		return fmt.Errorf("get linkerd trust-roots configmap: %w", err)
 	}
 
-	secrets, err := a.cs.CoreV1().Secrets(linkerdNS).List(ctx, metav1.ListOptions{})
+	secrets, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: certDriftListPage},
+		shared.Secrets(a.cs, linkerdNS))
 	if err != nil {
 		return fmt.Errorf("list linkerd secrets: %w", err)
 	}
-	for i := range secrets.Items {
-		s := &secrets.Items[i]
+	for i := range secrets {
+		s := &secrets[i]
 		// Concatenate every bundle key — earliest expiry across
 		// ca.crt + crt.pem is what the gauge reports.
 		var bundle []byte
@@ -827,7 +830,7 @@ func (a *certDriftAuditor) emitTrustBundle(ctx context.Context, ns, name string,
 	if len(bundle) == 0 {
 		return
 	}
-	days, ok := earliestCertExpiryDays(bundle, a.nowFn())
+	days, ok := earliestCertExpiryDays(bundle, a.now.Now())
 	if !ok {
 		logf.FromContext(ctx).Info("skip: trust bundle carries no parseable X.509 PEM",
 			"object", ns+"/"+name)

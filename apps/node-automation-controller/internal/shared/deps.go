@@ -13,6 +13,12 @@ import (
 // parameter plumbing, and a module that needs nothing beyond the
 // standard clients still gets a uniform signature.
 //
+//   - Name is the module's ops/queue name from its registry row —
+//     setupModules stamps it before calling Setup. Modules use it
+//     for AddPeriodic and metrics.IncError instead of carrying a
+//     private queue-name const, so the registry stays the single
+//     source of truth. Empty in literally-constructed test Deps —
+//     tests that assert a registered runnable's name should set it.
 //   - Mgr is the controller-runtime manager (Add/runables, builder
 //     watches, cached client).
 //   - CS is the direct (uncached) clientset — RBAC intentionally
@@ -28,6 +34,7 @@ import (
 //     enabled — literally-constructed Deps in tests behave as
 //     gate-on.
 type Deps struct {
+	Name     string
 	Mgr      manager.Manager
 	CS       kubernetes.Interface
 	Dyn      dynamic.Interface

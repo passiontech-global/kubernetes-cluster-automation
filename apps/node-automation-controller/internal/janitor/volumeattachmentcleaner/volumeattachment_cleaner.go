@@ -67,8 +67,7 @@ import (
 )
 
 const (
-	volumeAttachmentCleanerQueue = "volumeattachment-cleaner"
-	vaCleanerInterval            = 5 * time.Minute
+	vaCleanerInterval = 5 * time.Minute
 
 	// vaMissingNodeMinAge: a VA must exist at least this long before
 	// "its node is gone" counts against it — a VA can legitimately
@@ -99,8 +98,12 @@ const (
 
 type volumeAttachmentCleaner struct {
 	cs kubernetes.Interface
-	// nowFn is the clock seam — tests pin and advance it freely.
-	nowFn func() time.Time
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
+	// now is the clock seam — tests pin and advance it freely.
+	now shared.Clock
 
 	mu sync.Mutex
 	// orphanFirstSeen: va name → first cycle the VA pointed at a
@@ -127,16 +130,17 @@ func Setup(d shared.Deps) error {
 	}
 	c := &volumeAttachmentCleaner{
 		cs:    d.CS,
-		nowFn: time.Now,
+		queue: d.Name,
+		now:   shared.SystemClock,
 	}
-	return shared.AddPeriodic(d.Mgr, volumeAttachmentCleanerQueue, vaCleanerInterval, c.run)
+	return shared.AddPeriodic(d.Mgr, c.queue, vaCleanerInterval, c.run)
 }
 
 func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	now := c.nowFn()
+	now := c.now.Now()
 
 	// Gate 1: the node list is the single source of truth for
 	// "should this attachment exist". Abort on error — a partial or
@@ -151,7 +155,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		// means the apiserver or RBAC broke. Refuse to evaluate, but
 		// meter it: a persistently-empty node list is invisible
 		// otherwise (the run deliberately still returns nil).
-		metrics.IncError(volumeAttachmentCleanerQueue)
+		metrics.IncError(c.queue)
 		log.Info("SKIP: node list empty — refusing to evaluate attachments")
 		return nil
 	}
@@ -277,19 +281,17 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 			break
 		}
 
-		log.Info(fmt.Sprintf("DELETE volumeattachment %s: reason=%s node=%s pv=%s",
-			va.Name, reason, va.Spec.NodeName,
-			ptr.Deref(va.Spec.Source.PersistentVolumeName, "?")))
+		log.Info("DELETE volumeattachment",
+			"va", va.Name, "reason", reason, "node", va.Spec.NodeName,
+			"pv", ptr.Deref(va.Spec.Source.PersistentVolumeName, "?"))
 		// UID precondition: VA names are deterministic csi-hash
 		// names — a volume re-attachment between list and delete
 		// recreates the SAME name, so only the object we vetted may
 		// be removed.
 		uid := va.UID
 		if err := c.cs.StorageV1().VolumeAttachments().Delete(ctx, va.Name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
-			metrics.IncError(volumeAttachmentCleanerQueue)
+			shared.UIDDeleteOptions(uid, "")); err != nil {
+			metrics.IncError(c.queue)
 			log.Error(err, "volumeattachment delete failed",
 				"va", va.Name, "node", va.Spec.NodeName,
 				"pv", ptr.Deref(va.Spec.Source.PersistentVolumeName, "?"))
@@ -310,7 +312,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		return false
 	})
 	if capped {
-		log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", vaDeleteCap))
+		log.Info("SKIP rest: cap reached", "cap", vaDeleteCap)
 	}
 	log.Info("sweep done", "deleted", deleted, "failed", failed)
 	return nil
@@ -338,7 +340,7 @@ func (c *volumeAttachmentCleaner) stuckTerminatingNodeDead(ctx context.Context,
 		if pr := livePods[node.Name]; !pr.reported {
 			pr.reported = true
 			livePods[node.Name] = pr
-			metrics.IncError(volumeAttachmentCleanerQueue)
+			metrics.IncError(c.queue)
 		}
 		log.Error(err, "pod list failed — keeping stuck VA finalizers (fail closed)",
 			"node", node.Name)
@@ -358,7 +360,7 @@ func (c *volumeAttachmentCleaner) stripFinalizers(ctx context.Context,
 	log.Info("PATCH-FINALIZERS: stuck VolumeAttachment on a dead node — stripping finalizers to free the volume",
 		"va", va.Name, "node", va.Spec.NodeName,
 		"pv", ptr.Deref(va.Spec.Source.PersistentVolumeName, "?"),
-		"terminatingFor", c.nowFn().Sub(va.DeletionTimestamp.Time).Truncate(time.Minute),
+		"terminatingFor", c.now.Now().Sub(va.DeletionTimestamp.Time).Truncate(time.Minute),
 		"finalizers", va.Finalizers)
 	payload, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{
@@ -371,7 +373,7 @@ func (c *volumeAttachmentCleaner) stripFinalizers(ctx context.Context,
 	}
 	if _, err := c.cs.StorageV1().VolumeAttachments().Patch(ctx, va.Name,
 		types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
-		metrics.IncError(volumeAttachmentCleanerQueue)
+		metrics.IncError(c.queue)
 		log.Error(err, "stuck volumeattachment finalizer strip failed",
 			"va", va.Name, "node", va.Spec.NodeName)
 		return err
@@ -426,7 +428,7 @@ func (c *volumeAttachmentCleaner) nodeFencedDead(ctx context.Context,
 		if pr := livePods[node.Name]; !pr.reported {
 			pr.reported = true
 			livePods[node.Name] = pr
-			metrics.IncError(volumeAttachmentCleanerQueue)
+			metrics.IncError(c.queue)
 		}
 		log.Error(err, "pod list failed — keeping node VAs (fail closed)",
 			"node", node.Name)

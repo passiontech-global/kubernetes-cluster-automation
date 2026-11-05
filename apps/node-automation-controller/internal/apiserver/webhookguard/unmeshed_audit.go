@@ -68,7 +68,7 @@ func unmeshedRemediationEnabled() bool {
 // unmeshedPodAuditor owns the unmeshed-pod sweep's per-sweep state —
 // embedded in webhookGuard so the facade's method set (and every
 // in-package test fixture built on it) is unchanged by the split.
-// Shared deps (cs/dyn/nowFn) are reached through snap.g; only the
+// Shared deps (cs/dyn/now) are reached through snap.g; only the
 // emitted-series ledger lives here.
 type unmeshedPodAuditor struct {
 	// unmeshedEmitted is the same ledger for UnmeshedPods
@@ -109,7 +109,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 	// all Running pods cluster-wide is an unbounded read, and each
 	// page is processed then dropped instead of pinning the whole
 	// list for the sweep.
-	now := g.now()
+	now := g.now.Now()
 	unmeshed := 0 // UnmeshedPods tuples re-asserted this sweep
 	var candidates []corev1.Pod
 	listOpts := metav1.ListOptions{
@@ -178,7 +178,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 	// that would only be recreated unmeshed again.
 	healthy, err := a.linkerdInjectorHealthy(snap)
 	if err != nil {
-		metrics.IncError(webhookGuardQueue)
+		metrics.IncError(g.queue)
 		log.Info("WARN: injector health unverifiable — remediation skipped (fail closed)",
 			"error", err, "candidates", len(candidates))
 		return nil
@@ -195,7 +195,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 	// caller of shared.MaintenanceActive.
 	held, why, err := g.maintenanceActive(ctx)
 	if err != nil {
-		metrics.IncError(webhookGuardQueue)
+		metrics.IncError(g.queue)
 		log.Info("WARN: maintenance check unverifiable — "+
 			"DEFER: unmeshed remediation skipped (fail closed)",
 			"error", err, "candidates", len(candidates))
@@ -230,14 +230,13 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 		// same-named pod recreated in between was admitted after
 		// the injector recovered and is not ours to reap.
 		uid := p.UID
+		deleteOpts := shared.UIDDeleteOptions(uid, "")
 		eviction := &policyv1.Eviction{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      p.Name,
 				Namespace: p.Namespace,
 			},
-			DeleteOptions: &metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			},
+			DeleteOptions: &deleteOpts,
 		}
 		if err := g.cs.CoreV1().Pods(p.Namespace).EvictV1(ctx, eviction); err != nil {
 			if apierrors.IsTooManyRequests(err) {
@@ -251,7 +250,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 				continue
 			}
 			log.Error(err, "unmeshed pod eviction failed", "pod", p.Namespace+"/"+p.Name)
-			metrics.IncError(webhookGuardQueue)
+			metrics.IncError(g.queue)
 			continue
 		}
 		metrics.UnmeshedPodsRecreatedTotal.WithLabelValues(p.Namespace).Inc()

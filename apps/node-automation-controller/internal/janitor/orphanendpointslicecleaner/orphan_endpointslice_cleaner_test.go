@@ -42,7 +42,7 @@ func oescSliceExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 }
 
 func oescCleaner(cs *fake.Clientset) *orphanEndpointSliceCleaner {
-	return &orphanEndpointSliceCleaner{cs: cs, nowFn: time.Now,
+	return &orphanEndpointSliceCleaner{cs: cs, now: time.Now,
 		absentStreak: map[string]int{}}
 }
 

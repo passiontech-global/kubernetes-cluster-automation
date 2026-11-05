@@ -22,7 +22,7 @@ func TestSetupRegistersController(t *testing.T) {
 	t.Setenv("COREDNS_MIN_REPLICAS", "4")
 	t.Setenv("COREDNS_NODES_PER_REPLICA", "1")
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "coredns-patcher", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestSetupRegistersController(t *testing.T) {
 // informer, no RequeueAfter loop.
 func TestSetupDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "coredns-patcher", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
@@ -58,7 +58,7 @@ func TestSetupRejectsInvalidZoneWhen(t *testing.T) {
 	t.Setenv("COREDNS_MIN_REPLICAS", "0")
 	t.Setenv("COREDNS_NODES_PER_REPLICA", "0")
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "coredns-patcher", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("invalid zoneWhen must disable the module, not error: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestSetupRejectsInvalidZoneWhen(t *testing.T) {
 	// only a non-empty invalid value can reach the validation above.
 	m = testutil.NewStubManager()
 	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "")
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "coredns-patcher", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("default zoneWhen must not error: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestSetupRejectsInvalidZoneWhen(t *testing.T) {
 	// disable or error.
 	m = testutil.NewStubManager()
 	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "ScheduleAnywway") //nolint:misspell
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "coredns-patcher", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must ignore zoneWhen, got %v", err)
 	}

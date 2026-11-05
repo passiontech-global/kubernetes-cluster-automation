@@ -38,7 +38,6 @@ import (
 )
 
 const (
-	kubeletReaperQueue    = "kubelet-liveness-reaper"
 	kubeletReaperTaint    = "node.ops/kubelet-unresponsive"
 	kubeletReaperProbes   = 4                // all probes fail -> really down
 	kubeletReaperProbeGap = 10 * time.Second // between probes
@@ -48,6 +47,10 @@ const (
 
 type kubeletReaper struct {
 	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
 	// Probe seam: r.probe goes through the apiserver REST client,
 	// which the fake clientset cannot serve — a field so tests can
 	// stub the healthz outcome per node.
@@ -55,9 +58,9 @@ type kubeletReaper struct {
 }
 
 func Setup(d shared.Deps) error {
-	r := &kubeletReaper{cs: d.CS}
+	r := &kubeletReaper{cs: d.CS, queue: d.Name}
 	r.probeFn = r.probe
-	return shared.AddPeriodic(d.Mgr, kubeletReaperQueue, 2*time.Minute, r.run)
+	return shared.AddPeriodic(d.Mgr, r.queue, 2*time.Minute, r.run)
 }
 
 func (r *kubeletReaper) run(ctx context.Context) error {
@@ -118,7 +121,7 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 			// absorbs it (returns nil), so it IncErrors here —
 			// shared.Periodic only meters errors fn RETURNS.
 			sweepErrs++
-			metrics.IncError(kubeletReaperQueue)
+			metrics.IncError(r.queue)
 			log.Error(err, "sweep failed — node skipped", "node", n.Name)
 		}
 	}

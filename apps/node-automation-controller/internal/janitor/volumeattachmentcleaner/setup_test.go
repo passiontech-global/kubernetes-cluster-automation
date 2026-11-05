@@ -16,7 +16,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	// Zero-value Deps.Disabled = gate-on — VOLUMEATTACHMENT_CLEANER_ENABLED
 	// is resolved by setupModules, not re-read here.
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{
+	if err := Setup(shared.Deps{Name: "volumeattachment-cleaner",
 		Mgr: m,
 		CS:  fake.NewSimpleClientset(),
 	}); err != nil {
@@ -31,7 +31,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 // Periodic, no tick.
 func TestSetupDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{
+	if err := Setup(shared.Deps{Name: "volumeattachment-cleaner",
 		Mgr:      m,
 		CS:       fake.NewSimpleClientset(),
 		Disabled: true,
