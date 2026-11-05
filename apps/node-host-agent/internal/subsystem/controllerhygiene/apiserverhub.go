@@ -68,11 +68,11 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 	cacheErrs := countMatches(cacheErrRe,
 		h.journalText(ctx, now.Add(-6*time.Minute)))
 	if cacheErrs >= h.cfg.StaleMinErrs {
-		h.stateEnter(stateCacheStale,
+		h.state.Enter(stateCacheStale,
 			fmt.Sprintf("errors=%d/6min", cacheErrs))
-		h.suspectLog(stateCacheStale, fmt.Sprintf(
+		h.state.SuspectLog(stateCacheStale, fmt.Sprintf(
 			"suspect: apiserver-cache-stale - k0scontroller journal has %d watch-cache/consistency errors in 6 minutes",
-			cacheErrs))
+			cacheErrs), h.cfg.SuspectLogCadence)
 	} else {
 		h.stateExit(stateCacheStale)
 	}
@@ -111,12 +111,12 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 		prev := h.readState(fileLastRVC)
 		h.writeState(fileLastRVC, strconv.FormatInt(rvC, 10))
 		if gapKnown && prev == strconv.FormatInt(rvC, 10) && rvN > rvC {
-			frn = h.ctrInc(fileCtrFrozen)
+			frn = h.state.Incr(fileCtrFrozen)
 			if frn >= h.cfg.FrozenCycles {
 				frozen = true
 			}
 		} else {
-			h.ctrReset(fileCtrFrozen)
+			h.state.ResetCounter(fileCtrFrozen)
 		}
 	}
 
@@ -136,12 +136,12 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 			prevP := h.readState(fileLastPRVC)
 			h.writeState(fileLastPRVC, prv)
 			if prevP != "" && prevP == prv && gapKnown && rvN > prvRV {
-				pfn = h.ctrInc(fileCtrPeerFrozen)
+				pfn = h.state.Incr(fileCtrPeerFrozen)
 				if pfn >= h.cfg.FrozenCycles {
 					peerFrozen = true
 				}
 			} else {
-				h.ctrReset(fileCtrPeerFrozen)
+				h.state.ResetCounter(fileCtrPeerFrozen)
 			}
 		}
 	}
@@ -163,13 +163,13 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 	}
 
 	if !wedged {
-		h.ctrReset(fileCtrGap)
+		h.state.ResetCounter(fileCtrGap)
 		h.stateExit(stateCacheWedged)
 		// rv measurable again → reset the dead counter (it only
 		// covers the both-APIs-mute window; left alone it would
 		// carry into the next incident).
 		if gapKnown {
-			h.ctrReset(fileCtrDead)
+			h.state.ResetCounter(fileCtrDead)
 		}
 		if !gapKnown && cacheErrs > 0 {
 			h.deadFallback(ctx)
@@ -179,14 +179,14 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 	}
 
 	// --- wedge evidence present ---
-	gn := h.ctrInc(fileCtrGap)
-	h.stateEnter(stateCacheWedged,
+	gn := h.state.Incr(fileCtrGap)
+	h.state.Enter(stateCacheWedged,
 		fmt.Sprintf("%s rv_cache=%d rv_now=%d", wreason, rvC, rvN))
 	// Frozen is already sustained evidence — bypass the second
 	// GAP_CYCLES gate (a big one-off gap can be transient lag; a
 	// bit-identical rv_cache cannot).
 	if !frozen && gn < h.cfg.GapCycles {
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"suspect: apiserver cache %s — wedge evidence (check %d/%d)",
 			wreason, gn, h.cfg.GapCycles))
 		h.cycles.WithLabelValues(checkHub, "ok").Inc()
@@ -218,42 +218,43 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 	}
 
 	switch {
-	case !h.rateOK(h.cfg.WatchdogStateDir, fileRateRestart, h.cfg.MinRestartInterval):
-		h.suspectLog(stateCacheWedged, fmt.Sprintf(
+	case !h.state.RateOK(fileRateRestart, h.cfg.MinRestartInterval):
+		h.state.SuspectLog(stateCacheWedged, fmt.Sprintf(
 			"suspect: apiserver-cache-wedged %s (%dx) - in restart cooldown (<%dm), skip",
-			wreason, gn, int(h.cfg.MinRestartInterval.Minutes())))
+			wreason, gn, int(h.cfg.MinRestartInterval.Minutes())),
+			h.cfg.SuspectLogCadence)
 		h.actions.WithLabelValues(checkHub, "fence_cooldown").Inc()
 	case peerFresh || soloOK:
 		switch h.cfg.Sig13Mode {
 		case ModeEnforce:
-			h.appendLog(fmt.Sprintf(
+			h.state.AppendLog(fmt.Sprintf(
 				"ACTION: restarting k0scontroller - apiserver-cache-wedged %s (%dx) %s solo=%v",
 				wreason, gn, peerNote, soloOK))
-			h.rateSpend(h.cfg.WatchdogStateDir, fileRateRestart)
-			h.ctrReset(fileCtrGap)
+			h.state.RateSpend(fileRateRestart)
+			h.state.ResetCounter(fileCtrGap)
 			// W8-CP1: hung HTTP/2 watch streams can survive past the
 			// wedge decision and pin the apiserver's watch cache —
 			// ss -K drops the zombie sockets so the restart (and the
 			// post-restart reconnect) starts clean.
 			if err := h.cfg.ssKillFn(ctx); err != nil {
-				h.appendLogWarn(fmt.Sprintf(
+				h.state.AppendLogWarn(fmt.Sprintf(
 					"ss -K sport = :6443 failed (zombie watch streams left): %v", err))
 			}
 			if err := h.cfg.restartFn(ctx, h.cfg.RestartUnit); err != nil {
-				h.appendLogWarn(fmt.Sprintf(
+				h.state.AppendLogWarn(fmt.Sprintf(
 					"suspect: restart %s failed: %v", h.cfg.RestartUnit, err))
 			}
 			h.actions.WithLabelValues(checkHub, "restart_controller").Inc()
 		case ModeDryRun:
-			h.appendLog(fmt.Sprintf(
+			h.state.AppendLog(fmt.Sprintf(
 				"DRY-RUN: would restart k0scontroller - apiserver-cache-wedged %s (%dx) %s solo=%v",
 				wreason, gn, peerNote, soloOK))
 			h.actions.WithLabelValues(checkHub, "dryrun_restart").Inc()
 		}
 	default:
-		h.suspectLog(stateCacheWedged, fmt.Sprintf(
+		h.state.SuspectLog(stateCacheWedged, fmt.Sprintf(
 			"suspect: apiserver-cache-wedged %s (%dx) but %s and self is not first-hub (or <%d cycles not reached) — holding",
-			wreason, gn, peerNote, h.cfg.SoloCycles))
+			wreason, gn, peerNote, h.cfg.SoloCycles), h.cfg.SuspectLogCadence)
 		h.actions.WithLabelValues(checkHub, "fence_skip").Inc()
 	}
 	h.cycles.WithLabelValues(checkHub, "ok").Inc()
@@ -269,9 +270,10 @@ func (h *Hygiene) deadFallback(ctx context.Context) {
 	// Own key, not stateCacheStale: sharing the cache-stale key meant
 	// the :73 cache-stale line spent the slot first every cadence and
 	// this "autofix is blind" signal stayed suppressed permanently.
-	h.suspectLog(logKeyDeadFallbk,
+	h.state.SuspectLog(logKeyDeadFallbk,
 		"suspect: apiserver-cache-stale but rv-gap unmeasurable "+
-			"(self+peer query fail) — wedged/autofix skipped")
+			"(self+peer query fail) — wedged/autofix skipped",
+		h.cfg.SuspectLogCadence)
 	if h.cfg.KineDBProbe == "" {
 		return
 	}
@@ -279,45 +281,45 @@ func (h *Hygiene) deadFallback(ctx context.Context) {
 	if !h.cfg.pgWireFn(ctx, h.cfg.KineDBProbe) {
 		h.cfg.sleepFn(3 * time.Second)
 		if !h.cfg.pgWireFn(ctx, h.cfg.KineDBProbe) {
-			h.ctrReset(fileCtrDead)
-			h.stateEnter(stateKineUnreachable,
+			h.state.ResetCounter(fileCtrDead)
+			h.state.Enter(stateKineUnreachable,
 				fmt.Sprintf("%s pg-wire fail", h.cfg.KineDBProbe))
-			h.suspectLog(stateKineUnreachable, fmt.Sprintf(
+			h.state.SuspectLog(stateKineUnreachable, fmt.Sprintf(
 				"suspect: kine-backend-unreachable %s — apiserver fail is a consequence of DB/pgbouncer, restarting the controller is useless",
-				h.cfg.KineDBProbe))
+				h.cfg.KineDBProbe), h.cfg.SuspectLogCadence)
 			return
 		}
 	}
 	h.stateExit(stateKineUnreachable)
-	dn := h.ctrInc(fileCtrDead)
+	dn := h.state.Incr(fileCtrDead)
 	deadFirst := h.cfg.SelfAPI != "" &&
 		(h.cfg.PeerAPI == "" || h.cfg.SelfAPI < h.cfg.PeerAPI)
 	if dn < h.cfg.SoloCycles || !deadFirst {
-		h.suspectLog(logKeyDeadFallbk, fmt.Sprintf(
+		h.state.SuspectLog(logKeyDeadFallbk, fmt.Sprintf(
 			"suspect: apiserver dead, kine db ok — dead-fallback needs %d cycles + first-hub (dn=%d first=%v)",
-			h.cfg.SoloCycles, dn, deadFirst))
+			h.cfg.SoloCycles, dn, deadFirst), h.cfg.SuspectLogCadence)
 		return
 	}
-	if !h.rateOK(h.cfg.WatchdogStateDir, fileRateRestart, h.cfg.MinRestartInterval) {
-		h.suspectLog(logKeyDeadFallbk, fmt.Sprintf(
+	if !h.state.RateOK(fileRateRestart, h.cfg.MinRestartInterval) {
+		h.state.SuspectLog(logKeyDeadFallbk, fmt.Sprintf(
 			"suspect: apiserver dead + kine db ok but in restart cooldown (<%dm), skip",
-			int(h.cfg.MinRestartInterval.Minutes())))
+			int(h.cfg.MinRestartInterval.Minutes())), h.cfg.SuspectLogCadence)
 		return
 	}
 	switch h.cfg.Sig13Mode {
 	case ModeEnforce:
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"ACTION: restarting k0scontroller - apiserver unresponsive, kine db %s healthy (dead-fallback %dx)",
 			h.cfg.KineDBProbe, dn))
-		h.rateSpend(h.cfg.WatchdogStateDir, fileRateRestart)
-		h.ctrReset(fileCtrDead)
+		h.state.RateSpend(fileRateRestart)
+		h.state.ResetCounter(fileCtrDead)
 		if err := h.cfg.restartFn(ctx, h.cfg.RestartUnit); err != nil {
-			h.appendLogWarn(fmt.Sprintf(
+			h.state.AppendLogWarn(fmt.Sprintf(
 				"suspect: restart %s failed: %v", h.cfg.RestartUnit, err))
 		}
 		h.actions.WithLabelValues(checkHub, "restart_controller").Inc()
 	case ModeDryRun:
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"DRY-RUN: would restart k0scontroller - apiserver dead, kine db ok (dead-fallback %dx)", dn))
 		h.actions.WithLabelValues(checkHub, "dryrun_restart").Inc()
 	}
@@ -341,7 +343,7 @@ func (h *Hygiene) checkKineTTL(ctx context.Context) {
 	if err != nil {
 		// Age unreadable → the journal window collapses to "now"
 		// and a dead TTL goes undetected — surface it.
-		h.appendLogWarn(fmt.Sprintf(
+		h.state.AppendLogWarn(fmt.Sprintf(
 			"suspect: kine pid=%d age unreadable: %v — TTL journal window degenerates",
 			kpid, err))
 		kage = 0
@@ -351,7 +353,7 @@ func (h *Hygiene) checkKineTTL(ctx context.Context) {
 	if !ttlDead {
 		// Pid living clean past the seed window → loop broken:
 		// reset the counter and clear both latches.
-		h.ctrReset(fileCtrTTLRewedge)
+		h.state.ResetCounter(fileCtrTTLRewedge)
 		_ = removeStateFile(h.cfg.WatchdogStateDir, fileTTLWedgedPID)
 		h.stateExit(stateKineTTLDead)
 		h.stateExit(stateKineTTLLoop)
@@ -359,7 +361,7 @@ func (h *Hygiene) checkKineTTL(ctx context.Context) {
 		return
 	}
 
-	h.stateEnter(stateKineTTLDead,
+	h.state.Enter(stateKineTTLDead,
 		fmt.Sprintf("pid=%d age=%ds", kpid, int(kage)))
 	// Each wedged pid counts once (dedupe ttl-last-wedged-pid); a pid
 	// change = respawn after kill/crash — re-wedging on the new pid
@@ -367,65 +369,65 @@ func (h *Hygiene) checkKineTTL(ctx context.Context) {
 	rew := 0
 	if strconv.Itoa(kpid) != h.readState(fileTTLWedgedPID) {
 		h.writeState(fileTTLWedgedPID, strconv.Itoa(kpid))
-		rew = h.ctrInc(fileCtrTTLRewedge)
+		rew = h.state.Incr(fileCtrTTLRewedge)
 	} else {
-		rew = h.ctrRead(fileCtrTTLRewedge)
+		rew = h.state.Counter(fileCtrTTLRewedge)
 	}
 
 	switch {
 	case rew >= h.cfg.KineTTLRewedgeCycles:
-		h.stateEnter(stateKineTTLLoop,
+		h.state.Enter(stateKineTTLLoop,
 			fmt.Sprintf("rewedge=%dx pid=%d", rew, kpid))
 		// Held-latch dedupe (nonprod 2026-10: this line logged every
 		// 60s cycle for weeks, 1600+ mentions) — first line on latch
 		// entry, then one re-reminder per SuspectLogCadence. The rew
 		// counter above still updates every cycle.
-		h.suspectLog(stateKineTTLLoop, fmt.Sprintf(
+		h.state.SuspectLog(stateKineTTLLoop, fmt.Sprintf(
 			"suspect: kine-ttl-loop — %d consecutive kine pids wedged from boot; deterministic env (WAN DB + seed race), fast-kill suppressed",
-			rew))
+			rew), h.cfg.SuspectLogCadence)
 		// Loop path: one recovery-probe kill per KineTTLCtlRestart —
 		// faster remediation is pointless and just flaps.
-		if !h.rateOK(h.cfg.WatchdogStateDir, fileRateTTLKill, h.cfg.KineTTLCtlRestart) {
+		if !h.state.RateOK(fileRateTTLKill, h.cfg.KineTTLCtlRestart) {
 			break // low cadence not reached — stay silent
 		}
 		switch h.cfg.KineTTLMode {
 		case ModeEnforce:
-			h.appendLog(fmt.Sprintf(
+			h.state.AppendLog(fmt.Sprintf(
 				"ACTION: kill kine pid=%d — recovery probe kine-ttl-loop (rewedge=%dx, cadence %ds)",
 				kpid, rew, int(h.cfg.KineTTLCtlRestart.Seconds())))
-			h.rateSpend(h.cfg.WatchdogStateDir, fileRateTTLKill)
+			h.state.RateSpend(fileRateTTLKill)
 			if err := h.cfg.killFn(kpid, syscall.SIGTERM); err != nil {
-				h.appendLogWarn(fmt.Sprintf(
+				h.state.AppendLogWarn(fmt.Sprintf(
 					"suspect: kill kine pid=%d failed: %v", kpid, err))
 			}
 			h.actions.WithLabelValues(checkKineTTL, "kill_kine").Inc()
 		case ModeDryRun:
-			h.appendLog(fmt.Sprintf(
+			h.state.AppendLog(fmt.Sprintf(
 				"DRY-RUN: would kill kine pid=%d — kine-ttl-loop rewedge=%dx", kpid, rew))
 			h.actions.WithLabelValues(checkKineTTL, "dryrun_kill").Inc()
 		}
 	case kage > h.cfg.KineTTLMinProcAge.Seconds():
 		// Tier 1 (chance wedge): only remediate once the instance
 		// survived the seed window — never restart INTO the storm.
-		if !h.rateOK(h.cfg.WatchdogStateDir, fileRateTTLKill, h.cfg.KineTTLMinRestart) {
-			h.suspectLog(stateKineTTLDead, fmt.Sprintf(
+		if !h.state.RateOK(fileRateTTLKill, h.cfg.KineTTLMinRestart) {
+			h.state.SuspectLog(stateKineTTLDead, fmt.Sprintf(
 				"suspect: kine-ttl-dead but in restart cooldown (<%dm), skip",
-				int(h.cfg.KineTTLMinRestart.Minutes())))
+				int(h.cfg.KineTTLMinRestart.Minutes())), h.cfg.SuspectLogCadence)
 			break
 		}
 		switch h.cfg.KineTTLMode {
 		case ModeEnforce:
-			h.appendLog(fmt.Sprintf(
+			h.state.AppendLog(fmt.Sprintf(
 				"ACTION: kill kine pid=%d — TTL workqueue dead — k0s supervisor respawns",
 				kpid))
-			h.rateSpend(h.cfg.WatchdogStateDir, fileRateTTLKill)
+			h.state.RateSpend(fileRateTTLKill)
 			if err := h.cfg.killFn(kpid, syscall.SIGTERM); err != nil {
-				h.appendLogWarn(fmt.Sprintf(
+				h.state.AppendLogWarn(fmt.Sprintf(
 					"suspect: kill kine pid=%d failed: %v", kpid, err))
 			}
 			h.actions.WithLabelValues(checkKineTTL, "kill_kine").Inc()
 		case ModeDryRun:
-			h.appendLog(fmt.Sprintf(
+			h.state.AppendLog(fmt.Sprintf(
 				"DRY-RUN: would kill kine pid=%d — TTL dead", kpid))
 			h.actions.WithLabelValues(checkKineTTL, "dryrun_kill").Inc()
 		}

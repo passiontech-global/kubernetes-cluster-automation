@@ -95,12 +95,13 @@ func (h *Hygiene) checkKubeconfigCertExpiry(_ context.Context) {
 			minDays)
 		h.cycles.WithLabelValues(checkKubeCert, "ok").Inc()
 		if minDays < kubeconfigCertMinDays {
-			h.stateEnter(stateKubeCertExpiring, fmt.Sprintf(
+			h.state.Enter(stateKubeCertExpiring, fmt.Sprintf(
 				"client cert expires in %.1fd", minDays))
-			h.suspectLog(stateKubeCertExpiring, fmt.Sprintf(
+			h.state.SuspectLog(stateKubeCertExpiring, fmt.Sprintf(
 				"kubeconfig-cert-expiring: embedded client cert "+
 					"NotAfter in %.1f days (<%d)",
-				minDays, int(kubeconfigCertMinDays)))
+				minDays, int(kubeconfigCertMinDays)),
+				h.cfg.SuspectLogCadence)
 		} else {
 			h.stateExit(stateKubeCertExpiring)
 		}

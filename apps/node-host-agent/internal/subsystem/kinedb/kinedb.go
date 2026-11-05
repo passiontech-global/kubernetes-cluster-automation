@@ -63,6 +63,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	yaml "go.yaml.in/yaml/v3"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // Defaults mirror the shell scripts + their systemd timers.
@@ -440,6 +442,12 @@ func (m *metrics) collectors() []prometheus.Collector {
 type KineDB struct {
 	cfg Config
 	m   *metrics
+
+	// state is the shared watchdog-state contract handle (hoststate)
+	// for the GuardStateDir last-* rate budgets (last-pgb-restart).
+	// Now is a closure over k.cfg.nowFn — tests re-stub the clock
+	// after New() and the store must observe the new one.
+	state *hoststate.Store
 }
 
 // New returns a KineDB and registers its metrics on reg.
@@ -448,6 +456,8 @@ func New(cfg Config, reg prometheus.Registerer) (*KineDB, error) {
 		return nil, err
 	}
 	k := &KineDB{cfg: cfg, m: newMetrics()}
+	k.state = hoststate.New(cfg.GuardStateDir, "",
+		func() time.Time { return k.cfg.nowFn() }, logger)
 	if reg != nil {
 		var done []prometheus.Collector
 		for _, c := range k.m.collectors() {

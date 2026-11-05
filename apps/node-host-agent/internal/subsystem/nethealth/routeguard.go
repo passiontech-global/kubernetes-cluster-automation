@@ -560,7 +560,7 @@ func (n *NetHealth) routeGuard(ctx context.Context) {
 			// dead guard stays visible instead of logging once and
 			// going silent.
 			if openFails == 1 || openFails%routeGuardErrEvery == 0 {
-				n.appendLog(fmt.Sprintf(
+				n.state.AppendLog(fmt.Sprintf(
 					"route-guard: netlink socket failed (x%d): %v (retrying)",
 					openFails, err))
 			}
@@ -784,12 +784,12 @@ func (n *NetHealth) restoreRouteGuard(ctx context.Context) {
 	// files) — identical environment to the unit's ExecStartPost.
 	if out, err := n.cfg.runMountCmd(ctx, []string{script}); err != nil {
 		n.cycles.WithLabelValues(checkRouteGuard, "restore_error").Inc()
-		n.appendLog(fmt.Sprintf("route-guard: %s failed: %v (%s)",
+		n.state.AppendLog(fmt.Sprintf("route-guard: %s failed: %v (%s)",
 			script, err, trimRunErr(out)))
 		return
 	}
 	n.actions.WithLabelValues(checkRouteGuard, "restored").Inc()
-	n.appendLog("ACTION: route-guard re-ran nebula-up.sh after netlink delete")
+	n.state.AppendLog("ACTION: route-guard re-ran nebula-up.sh after netlink delete")
 }
 
 // trimRunErr clips captured output for the log line.

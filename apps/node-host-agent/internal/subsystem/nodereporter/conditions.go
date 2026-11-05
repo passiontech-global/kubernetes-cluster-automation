@@ -442,8 +442,7 @@ func (r *Reporter) firstLatch(primary string, alts []string) (key, since string,
 // (the epoch state_enter wrote; "unknown" when empty/unreadable —
 // check-watchdog-state.sh's `|| echo unknown` fallback).
 func (r *Reporter) stateFileSince(key string) (string, bool) {
-	p := filepath.Join(r.cfg.WatchdogStateDir, "state-"+key)
-	data, err := os.ReadFile(p)
+	data, err := os.ReadFile(r.state.Path(key))
 	if err != nil {
 		return "", false
 	}
@@ -451,51 +450,6 @@ func (r *Reporter) stateFileSince(key string) (string, bool) {
 		return s, true
 	}
 	return "unknown", true
-}
-
-// initHeartbeatFiles seeds the installed/last-run pair ONCE — only
-// for files that don't already exist (BUG-H1). The shell watchdog's
-// prom_emit trap owned the periodic last-run refresh; on agent
-// nodes the hygiene Cycle()s (workerhygiene/controllerhygiene/
-// nethealth) own it now. The reporter still needs the pair on a
-// fresh state dir — a missing `installed` disables the staleness
-// gate entirely and a missing `last-run` reads as epoch 0 — so it
-// initializes them at startup for new envs and unit tests where no
-// hygiene subsystem has run yet.
-//
-// `installed` is created only when absent (ansible force:false
-// parity — presence activates the probe's gate, content is the
-// baseline epoch used when last-run doesn't exist yet); `last-run`
-// is likewise created only when absent, atomically via tmp+rename
-// so a reader never observes a truncated epoch.
-func (r *Reporter) initHeartbeatFiles() error {
-	if err := os.MkdirAll(r.cfg.WatchdogStateDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", r.cfg.WatchdogStateDir, err)
-	}
-	now := r.cfg.nowFn().Unix()
-	installed := filepath.Join(r.cfg.WatchdogStateDir, "installed")
-	if _, err := os.Stat(installed); os.IsNotExist(err) {
-		if err := writeEpochFile(installed, now); err != nil {
-			return fmt.Errorf("write %s: %w", installed, err)
-		}
-	}
-	lastRun := filepath.Join(r.cfg.WatchdogStateDir, "last-run")
-	if _, err := os.Stat(lastRun); os.IsNotExist(err) {
-		if err := writeEpochFile(lastRun, now); err != nil {
-			return fmt.Errorf("write %s: %w", lastRun, err)
-		}
-	}
-	return nil
-}
-
-// writeEpochFile writes "<epoch>\n" (date +%s parity) via a same-dir
-// tmp file + rename — atomic on POSIX.
-func writeEpochFile(path string, epoch int64) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(epoch, 10)+"\n"), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
 }
 
 // watchdogStale is check-watchdog-fresh.sh ported: no `installed`

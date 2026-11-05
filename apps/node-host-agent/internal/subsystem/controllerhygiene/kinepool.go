@@ -48,15 +48,15 @@ func (h *Hygiene) checkKinePool(_ context.Context) {
 	h.kineConns.Set(float64(conns))
 
 	if conns <= h.cfg.KinePoolMaxConns {
-		h.ctrReset(fileCtrPool)
+		h.state.ResetCounter(fileCtrPool)
 		h.stateExit(stateKinePoolRunaway)
 		h.cycles.WithLabelValues(checkKinePool, "ok").Inc()
 		return
 	}
 
-	n := h.ctrInc(fileCtrPool)
+	n := h.state.Incr(fileCtrPool)
 	if n < h.cfg.KinePoolCycles {
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"suspect: kine conns-to-db=%d > %d — pool spiral? (check %d/%d)",
 			conns, h.cfg.KinePoolMaxConns, n, h.cfg.KinePoolCycles))
 		h.cycles.WithLabelValues(checkKinePool, "ok").Inc()
@@ -64,31 +64,32 @@ func (h *Hygiene) checkKinePool(_ context.Context) {
 	}
 
 	// --- spiral confirmed ---
-	h.stateEnter(stateKinePoolRunaway, fmt.Sprintf(
+	h.state.Enter(stateKinePoolRunaway, fmt.Sprintf(
 		"conns=%d>%d x%d pid=%d", conns, h.cfg.KinePoolMaxConns, n, kpid))
 
-	if !h.rateOK(h.cfg.WatchdogStateDir, fileRatePoolKill, h.cfg.KinePoolMinRestart) {
-		h.suspectLog(stateKinePoolRunaway, fmt.Sprintf(
+	if !h.state.RateOK(fileRatePoolKill, h.cfg.KinePoolMinRestart) {
+		h.state.SuspectLog(stateKinePoolRunaway, fmt.Sprintf(
 			"kine-pool-runaway conns=%d (%dx) but in kill cooldown (<%dm), skip",
-			conns, n, int(h.cfg.KinePoolMinRestart.Minutes())))
+			conns, n, int(h.cfg.KinePoolMinRestart.Minutes())),
+			h.cfg.SuspectLogCadence)
 		h.cycles.WithLabelValues(checkKinePool, "ok").Inc()
 		return
 	}
 
 	switch h.cfg.KinePoolMode {
 	case ModeEnforce:
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"ACTION: kill kine pid=%d — conns-to-db=%d > %d x%d (k0s supervisor respawns with a clean pool)",
 			kpid, conns, h.cfg.KinePoolMaxConns, n))
-		h.rateSpend(h.cfg.WatchdogStateDir, fileRatePoolKill)
-		h.ctrReset(fileCtrPool)
+		h.state.RateSpend(fileRatePoolKill)
+		h.state.ResetCounter(fileCtrPool)
 		if err := h.cfg.killFn(kpid, syscall.SIGTERM); err != nil {
-			h.appendLogWarn(fmt.Sprintf(
+			h.state.AppendLogWarn(fmt.Sprintf(
 				"suspect: kill kine pid=%d failed: %v", kpid, err))
 		}
 		h.actions.WithLabelValues(checkKinePool, "kill_kine").Inc()
 	case ModeDryRun:
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"DRY-RUN: would kill kine pid=%d — conns-to-db=%d > %d x%d",
 			kpid, conns, h.cfg.KinePoolMaxConns, n))
 		h.actions.WithLabelValues(checkKinePool, "dryrun_kill").Inc()

@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -263,7 +264,7 @@ func TestDNSFallbackPinAndRecover(t *testing.T) {
 		t.Fatalf("pin files kept after recovery: %v", files)
 	}
 	// last-known-good cache kept the resolved IP.
-	if got := readFile(filepath.Join(e.state, "dnsfb-lg-api.test.internal")); got != "10.0.0.1" {
+	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "dnsfb-lg-api.test.internal")); got != "10.0.0.1" {
 		t.Fatalf("last-good=%q want 10.0.0.1", got)
 	}
 }
@@ -363,19 +364,19 @@ func TestRenderHostsBlockTailDropsStaleManagedPins(t *testing.T) {
 }
 
 // A file-level bind mount (the DaemonSet's /host/etc/hosts mount)
-// makes rename(2) return EBUSY — writeFileAtomic must fall back to a
-// direct fsync'd write instead of never landing the pin.
+// makes rename(2) return EBUSY — hostutil.WriteFileAtomic must fall
+// back to a direct fsync'd write instead of never landing the pin.
 func TestWriteFileAtomicBusyFallback(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "hosts")
 	writeFile(t, target, "127.0.0.1 localhost\n")
 
-	old := renameFile
-	defer func() { renameFile = old }()
-	renameFile = func(_, _ string) error { return unix.EBUSY }
+	old := hostutil.RenameFile
+	defer func() { hostutil.RenameFile = old }()
+	hostutil.RenameFile = func(_, _ string) error { return unix.EBUSY }
 
-	if err := writeFileAtomic(target, "1.2.3.4 pinned.example\n"); err != nil {
-		t.Fatalf("writeFileAtomic EBUSY fallback failed: %v", err)
+	if err := hostutil.WriteFileAtomic(target, "1.2.3.4 pinned.example\n"); err != nil {
+		t.Fatalf("WriteFileAtomic EBUSY fallback failed: %v", err)
 	}
 	if got := readFileT(t, target); got != "1.2.3.4 pinned.example\n" {
 		t.Fatalf("content after fallback=%q", got)
@@ -386,9 +387,9 @@ func TestWriteFileAtomicBusyFallback(t *testing.T) {
 
 	// A non-fallback rename error propagates and never touches the
 	// target — the fallback is EBUSY/EXDEV only.
-	renameFile = func(_, _ string) error { return unix.EPERM }
-	if err := writeFileAtomic(target, "9.9.9.9 evil\n"); !errors.Is(err, unix.EPERM) {
-		t.Fatalf("writeFileAtomic err=%v want EPERM", err)
+	hostutil.RenameFile = func(_, _ string) error { return unix.EPERM }
+	if err := hostutil.WriteFileAtomic(target, "9.9.9.9 evil\n"); !errors.Is(err, unix.EPERM) {
+		t.Fatalf("WriteFileAtomic err=%v want EPERM", err)
 	}
 	if got := readFileT(t, target); got != "1.2.3.4 pinned.example\n" {
 		t.Fatalf("target overwritten on non-fallback rename error:\n%s", got)
@@ -545,7 +546,7 @@ func TestEgressUnderlayDiesRelaysImmediately(t *testing.T) {
 	if !e.cmdRan("rule add pref 1500 to 8.8.8.8/32 lookup 100") {
 		t.Fatalf("relay rule not added, cmds=%v", e.cmds)
 	}
-	if got := readFile(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
+	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
 		t.Fatalf("committed=%q want relay", got)
 	}
 	// Relay target itself unreachable through tunnel → suspect log.
@@ -569,7 +570,7 @@ func TestEgressRecoveryNeedsTwoFreshProbes(t *testing.T) {
 	if !e.cmdRan("rule del pref 1500 to 8.8.8.8/32 lookup 100") {
 		t.Fatalf("direct rule not restored, cmds=%v", e.cmds)
 	}
-	if got := readFile(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "direct" {
+	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "direct" {
 		t.Fatalf("committed=%q want direct", got)
 	}
 }
@@ -800,7 +801,7 @@ func TestFail2banDownAndBans(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.state, "last-fail2ban-restart")); err != nil {
 		t.Fatal("restart budget file missing")
 	}
-	got := readFile(filepath.Join(e.state, "fail2ban-banned"))
+	got := hostutil.ReadTrimmed(filepath.Join(e.state, "fail2ban-banned"))
 	if !strings.Contains(got, "sshd=7") || !strings.Contains(got, "recidive=1") {
 		t.Fatalf("banned file=%q", got)
 	}
@@ -848,7 +849,7 @@ func TestEgressUnprobeableWindowCommitsToLive(t *testing.T) {
 
 	e.n.Cycle(context.Background())
 
-	if got := readFile(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
+	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
 		t.Fatalf("committed=%q want relay (committed to live)", got)
 	}
 	log := logLines(t, e)
@@ -1164,7 +1165,7 @@ func TestEgressSwitchFlushesPeerConntrack(t *testing.T) {
 	e.tcpOK["8.8.8.8:53"] = false
 	e.pingOK["8.8.8.8|true"] = false
 	e.n.Cycle(context.Background())
-	if got := readFile(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
+	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
 		t.Fatalf("committed=%q want relay", got)
 	}
 	if !e.cmdRan("conntrack -D -p udp --dport 45670 -d 8.8.8.8") {
@@ -1179,7 +1180,7 @@ func TestEgressRecoveryFlushesPeerConntrack(t *testing.T) {
 	e.pingOK["8.8.8.8|true"] = true // underlay back
 	e.n.Cycle(context.Background())
 	e.n.Cycle(context.Background()) // 2nd fresh probe → flip to direct
-	if got := readFile(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "direct" {
+	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "direct" {
 		t.Fatalf("committed=%q want direct", got)
 	}
 	if !e.cmdRan("conntrack -D -p udp --dport 45670 -d 8.8.8.8") {
@@ -1209,7 +1210,7 @@ func TestPeerConntrackFlushBestEffort(t *testing.T) {
 	e.n.Cycle(context.Background())
 	// The relay commit still lands — a missing conntrack binary must
 	// never block the path switch.
-	if got := readFile(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
+	if got := hostutil.ReadTrimmed(filepath.Join(e.state, "egress-state-8.8.8.8")); got != "relay" {
 		t.Fatalf("committed=%q want relay", got)
 	}
 	if !strings.Contains(logLines(t, e), "flush 8.8.8.8 skipped") {

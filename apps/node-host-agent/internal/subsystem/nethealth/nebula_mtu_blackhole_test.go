@@ -95,7 +95,7 @@ func TestNebulaMTUMetric(t *testing.T) {
 		t.Fatalf("metric wrong:\n%s", b)
 	}
 	// Latch → gauge flips to 1.
-	n.stateEnter("nebula-mtu-blackhole", "test")
+	n.state.Enter("nebula-mtu-blackhole", "test")
 	n.writeMTUBHMetric(st)
 	b, _ = os.ReadFile(filepath.Join(dir, "node-agent-nebula-mtu.prom"))
 	if !strings.Contains(string(b),

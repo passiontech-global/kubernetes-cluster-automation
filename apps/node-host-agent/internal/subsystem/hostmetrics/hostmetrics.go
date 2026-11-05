@@ -104,7 +104,6 @@ import (
 	"bufio"
 	"cmp"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io/fs"
@@ -120,6 +119,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"golang.org/x/sys/unix"
@@ -530,6 +531,13 @@ func (c *Config) applyDefaults() {
 type Collector struct {
 	cfg Config
 
+	// state is the shared watchdog-state contract handle (hoststate):
+	// the last-* rate budgets and the kmsg counter files go through it
+	// so the on-disk format stays the lib.sh parity every subsystem
+	// shares. Now is a closure over c.cfg.nowFn — tests re-stub the
+	// clock after New() and the store must observe the new one.
+	state *hoststate.Store
+
 	// Hoisted out of the scrape path in New(): drift regexes are
 	// compiled once and the expected-KCM set is built once — the
 	// per-scrape work left in collectK0sDrift is a stat + map lookups.
@@ -686,6 +694,8 @@ func New(cfg Config) *Collector {
 	cfg.applyDefaults()
 	c := &Collector{cfg: cfg, seenStates: map[string]time.Time{},
 		fsInflight: map[string]time.Time{}, fsStalledLogged: map[string]bool{}}
+	c.state = hoststate.New(cfg.WatchdogStateDir, "",
+		func() time.Time { return c.cfg.nowFn() }, logger)
 	c.removedFlagRe = make(map[string]*regexp.Regexp, len(cfg.RemovedFlags))
 	for _, flag := range cfg.RemovedFlags {
 		// Anchored key match (same shape as the canonical
@@ -1846,32 +1856,13 @@ func (c *Collector) collectClock(ch chan<- prometheus.Metric) {
 
 // --- H2: conntrack table pressure ---
 
-// readUintFile parses a single-integer procfs/sysfs file
-// (nf_conntrack_{count,max} shape — leading whitespace + trailing
-// newline tolerated).
-func readUintFile(path string) (uint64, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
-	}
-	f := strings.Fields(string(data))
-	if len(f) == 0 {
-		return 0, false
-	}
-	v, err := strconv.ParseUint(f[0], 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return v, true
-}
-
 // collectConntrack emits entries/limit each only when its own file
 // parses (a node without the conntrack module has no files → absent
 // series, not a fake 0) and the ratio only when both parsed and the
 // limit is non-zero.
 func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
-	count, countOK := readUintFile(c.cfg.ConntrackCountFile)
-	limit, limitOK := readUintFile(c.cfg.ConntrackMaxFile)
+	count, countOK := hostutil.ReadUintFile(c.cfg.ConntrackCountFile)
+	limit, limitOK := hostutil.ReadUintFile(c.cfg.ConntrackMaxFile)
 	if countOK {
 		ch <- prometheus.MustNewConstMetric(c.descCtEntries,
 			prometheus.GaugeValue, float64(count), c.cfg.NodeName)
@@ -2428,8 +2419,8 @@ func (c *Collector) warnInotifyTop(kind string, over bool,
 // limit file parses (same per-source rule as conntrack).
 func (c *Collector) collectInotify(ch chan<- prometheus.Metric) {
 	inst, watch, top := c.inotifySnapshot()
-	maxI, instOK := readUintFile(c.cfg.InotifyMaxInstancesFile)
-	maxW, watchOK := readUintFile(c.cfg.InotifyMaxWatchesFile)
+	maxI, instOK := hostutil.ReadUintFile(c.cfg.InotifyMaxInstancesFile)
+	maxW, watchOK := hostutil.ReadUintFile(c.cfg.InotifyMaxWatchesFile)
 	if instOK && maxI > 0 {
 		r := float64(inst) / float64(maxI)
 		ch <- prometheus.MustNewConstMetric(c.descInotifyInst,
@@ -2489,12 +2480,12 @@ func (c *Collector) collectZombies(ch chan<- prometheus.Metric) {
 // files simply don't exist and no series emits.
 func (c *Collector) collectCgroupPids(ch chan<- prometheus.Metric) {
 	for _, slice := range c.cfg.CgroupPidsSlices {
-		cur, ok := readUintFile(filepath.Join(
+		cur, ok := hostutil.ReadUintFile(filepath.Join(
 			c.cfg.CgroupRoot, slice, "pids.current"))
 		if !ok {
 			continue
 		}
-		mx, ok := readUintFile(filepath.Join(
+		mx, ok := hostutil.ReadUintFile(filepath.Join(
 			c.cfg.CgroupRoot, slice, "pids.max"))
 		if !ok || mx == 0 {
 			continue
@@ -2506,60 +2497,11 @@ func (c *Collector) collectCgroupPids(ch chan<- prometheus.Metric) {
 }
 
 // --- B4: MTU drift (cilium datapath vs nebula overlay) ---
-
-// mtuOfIface parses /sys/class/net/<iface>/mtu.
-func mtuOfIface(sysnet, iface string) (int64, bool) {
-	v, ok := readUintFile(filepath.Join(sysnet, iface, "mtu"))
-	if !ok {
-		return 0, false
-	}
-	return int64(v), true
-}
-
-// jsonFindInts collects EVERY numeric value of a key named `key`
-// (case-insensitive) under decoded JSON — maps AND arrays are
-// descended. The cilium runtime config nests its MTU differently
-// across agent versions and may carry several `mtu` keys; a
-// "first match" walk is nondeterministic because Go map iteration
-// order is random.
-func jsonFindInts(v any, key string, out *[]int64) {
-	switch n := v.(type) {
-	case map[string]any:
-		for k, val := range n {
-			if strings.EqualFold(k, key) {
-				if f, ok := val.(float64); ok {
-					*out = append(*out, int64(f))
-				}
-			}
-			jsonFindInts(val, key, out)
-		}
-	case []any:
-		for _, val := range n {
-			jsonFindInts(val, key, out)
-		}
-	}
-}
-
-// runtimeConfigMTU is the fallback MTU source when the cilium_net
-// interface is absent: agent-runtime-config.json under HostRoot.
-// With several `mtu` keys the MAX wins — deterministic, and the
-// drift check wants the worst-case datapath MTU anyway.
-func runtimeConfigMTU(path string) (int64, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
-	}
-	var v any
-	if json.Unmarshal(data, &v) != nil {
-		return 0, false
-	}
-	var vals []int64
-	jsonFindInts(v, "mtu", &vals)
-	if len(vals) == 0 {
-		return 0, false
-	}
-	return slices.Max(vals), true
-}
+//
+// mtuOfIface/jsonFindInts/runtimeConfigMTU live in
+// internal/platform/hostutil now — the same helpers workerhygiene's
+// checkCiliumMTU uses (hostutil.MTUOfIface / JSONFindInts /
+// RuntimeConfigMTU).
 
 // wgEncapOverheadBytes is the WireGuard encapsulation overhead the
 // cilium_wg0 MTU must leave under the nebula overlay MTU (W9
@@ -2575,15 +2517,15 @@ const wgEncapOverheadBytes = 60
 // series emits when the overlay MTU resolves AND at least one
 // datapath MTU resolves; absent interfaces simply don't vote.
 func (c *Collector) collectMTUDrift(ch chan<- prometheus.Metric) {
-	neb, ok := mtuOfIface(c.cfg.SysClassNet, c.cfg.NebulaIface)
+	neb, ok := hostutil.MTUOfIface(c.cfg.SysClassNet, c.cfg.NebulaIface)
 	if !ok {
 		return
 	}
-	cil, cilOK := mtuOfIface(c.cfg.SysClassNet, c.cfg.CiliumIface)
+	cil, cilOK := hostutil.MTUOfIface(c.cfg.SysClassNet, c.cfg.CiliumIface)
 	if !cilOK {
-		cil, cilOK = runtimeConfigMTU(c.cfg.CiliumRuntimeConfig)
+		cil, cilOK = hostutil.RuntimeConfigMTU(c.cfg.CiliumRuntimeConfig)
 	}
-	wg, wgOK := mtuOfIface(c.cfg.SysClassNet, c.cfg.CiliumWG0Iface)
+	wg, wgOK := hostutil.MTUOfIface(c.cfg.SysClassNet, c.cfg.CiliumWG0Iface)
 	if !cilOK && !wgOK {
 		return
 	}

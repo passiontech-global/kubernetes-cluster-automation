@@ -45,7 +45,6 @@ package nethealth
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -64,6 +63,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -128,8 +129,6 @@ var defaultNebulaDirectTCPPorts = []int{22, 6443, 8132, 9443, 39901}
 
 const (
 	f2bRestartInterval = 30 * time.Minute
-	// fileLastRun is the per-cycle liveness stamp (BUG-H1).
-	fileLastRun = "last-run"
 )
 
 const hostsBlockBegin = "# BEGIN node-watchdog-dns"
@@ -358,6 +357,11 @@ func (c *Config) applyDefaults() {
 type NetHealth struct {
 	cfg Config
 
+	// state is the shared hoststate Store — every state-*/last-*/
+	// dnsfb-*/egress-*/fail2ban-* file and the watchdog log append
+	// goes through it (the single lib.sh-parity implementation).
+	state *hoststate.Store
+
 	dnsfails     map[string]int // per DNS_FALLBACK_MAP name
 	nebulaFails  int            // socket/tun/stats fails
 	nebulaDpFail int            // dataplane-dead fails
@@ -388,6 +392,11 @@ func New(cfg Config, reg prometheus.Registerer) (*NetHealth, error) {
 		dnsfails:  map[string]int{},
 		egressCtr: map[string]int{},
 	}
+	// The Now closure must read n.cfg.nowFn at call time — tests
+	// re-stub the clock after New() and the store has to observe it
+	// (hoststate.Store.Now contract; controllerhygiene parity).
+	n.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
+		func() time.Time { return n.cfg.nowFn() }, logger)
 	n.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_nethealth_cycles_total",
 		Help: "Net-health check cycles by check and result " +
@@ -451,7 +460,9 @@ func (n *NetHealth) Run(ctx context.Context) {
 // skips it (SignalEnabled), and the conf is re-read every cycle when
 // WatchdogSrc is wired (hostconfig rewrites land next cycle).
 func (n *NetHealth) Cycle(ctx context.Context) {
-	defer n.stampLastRun()
+	// Deferred so even an early-returned cycle proves the loop is
+	// alive (BUG-H1 — Store.StampLastRun no-ops on an empty dir).
+	defer n.state.StampLastRun()
 	if n.cfg.WatchdogSrc != nil {
 		n.cfg.Watchdog = n.cfg.WatchdogSrc.Get()
 	}
@@ -459,7 +470,8 @@ func (n *NetHealth) Cycle(ctx context.Context) {
 		return n.cfg.Watchdog == nil || n.cfg.Watchdog.SignalEnabled(name)
 	}
 	upOk := true
-	if up, err := n.uptimeSeconds(); err == nil && up < minUptimeSeconds {
+	if up, err := hostutil.UptimeSeconds(n.cfg.UptimeFile); err == nil &&
+		up < minUptimeSeconds {
 		upOk = false
 	}
 	if upOk {
@@ -509,19 +521,35 @@ func (n *NetHealth) Cycle(ctx context.Context) {
 	}
 }
 
-// stampLastRun refreshes <state>/last-run every cycle — the liveness
-// stamp the watchdog-stalled alert reads (BUG-H1). Deferred so even
-// an early-returned cycle proves the loop is alive.
-func (n *NetHealth) stampLastRun() {
-	if n.cfg.WatchdogStateDir == "" {
-		return
-	}
-	content := strconv.FormatInt(n.cfg.nowFn().Unix(), 10) + "\n"
-	if err := writeFileAtomic(
-		filepath.Join(n.cfg.WatchdogStateDir, fileLastRun), content); err != nil {
-		logger().Debug("nethealth: last-run stamp failed",
-			"dir", n.cfg.WatchdogStateDir, "error", err)
-	}
+// --- watchdog file helpers (lib.sh parity) ---
+//
+// The on-disk contract itself lives in platform/hoststate — n.state
+// is the single Store implementation of state_enter/state_exit,
+// rate_ok/rate_spend, the last-suspect-* dedupe budgets, the
+// watchdog log append and the last-run stamp (BUG-H1). Atomic file
+// writes go through platform/hostutil. What remains below is only
+// what Store does not cover: nethealth's stateExit divergence — the
+// whole last-suspect-* family resets with the latch.
+
+// stateExit removes state-<name> if present and logs the
+// transition — clears the NPD permanent condition. The divergence
+// hoststate keeps behind Store.Exit's cleanup hook: the suspect-log
+// dedupe budgets drop with the latch — a later re-entry must log a
+// fresh first line, not stay throttled by a stale epoch from the
+// previous incident. That covers the latch-paired
+// last-suspect-<name>, and the whole rest of the family goes with
+// it: the NON-latch keys (egress-probe-<ip>, conntrack-parse,
+// clock-adjtimex, ...) have no state-* twin to exit with, so a
+// cleared condition would otherwise suppress the first line of a
+// re-incident for up to suspectLogCadence. No clean per-key pairing
+// exists — a latch exit IS an incident boundary, so the whole family
+// resets; a still-held condition pays at most one early re-log line.
+func (n *NetHealth) stateExit(name string) {
+	n.state.Exit(name, func() {
+		for _, f := range n.egressFiles(fileSuspectLog) {
+			_ = os.Remove(f)
+		}
+	})
 }
 
 // checkNebulaDirectTCP enforces the pref-1499 Direct-Underlay TCP
@@ -554,221 +582,17 @@ func (n *NetHealth) checkNebulaDirectTCP(ctx context.Context) {
 		}
 		if _, err := n.ip(ctx, "rule", "add", "pref", "1499",
 			"ipproto", "tcp", "dport", p, "lookup", "main"); err != nil {
-			n.appendLog(fmt.Sprintf(
+			n.state.AppendLog(fmt.Sprintf(
 				"nebula-direct-tcp: ip rule add pref 1499 dport %s failed: %v",
 				p, err))
 			n.cycles.WithLabelValues(checkNebTCP, "restore_error").Inc()
 			continue
 		}
 		n.actions.WithLabelValues(checkNebTCP, "rule_add").Inc()
-		n.appendLog(fmt.Sprintf(
+		n.state.AppendLog(fmt.Sprintf(
 			"ACTION: re-added pref-1499 direct-underlay tcp dport %s rule", p))
 	}
 	n.cycles.WithLabelValues(checkNebTCP, "ok").Inc()
-}
-
-// --- watchdog file helpers (lib.sh parity — same contract as
-// workerhygiene's: state-* latches, last-* budgets, log + slog) ---
-
-func (n *NetHealth) appendLog(msg string) {
-	logger().Info(msg)
-	f, err := os.OpenFile(n.cfg.WatchdogLogFile,
-		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		logger().Debug("nethealth: watchdog log file append failed — "+
-			"line kept in agent log only",
-			"path", n.cfg.WatchdogLogFile,
-			"error", err)
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s %s\n", n.cfg.nowFn().Format(time.RFC3339), msg)
-}
-
-func (n *NetHealth) statePath(name string) string {
-	return filepath.Join(n.cfg.WatchdogStateDir, "state-"+name)
-}
-
-func (n *NetHealth) stateExists(name string) bool {
-	_, err := os.Stat(n.statePath(name))
-	return err == nil
-}
-
-// writeFileAtomic writes content via a tmp file in the same dir +
-// rename — the stateEnter latch pattern. A crash mid-write then can
-// never leave a truncated target (the pre-atomic /etc/hosts rewrite
-// could orphan a `# BEGIN` block over the node's real host entries).
-//
-// rename(2) has one blind spot that matters here: the TARGET of a
-// file-level bind mount cannot be renamed over — the kernel returns
-// EBUSY — and that is exactly how the DaemonSet mounts
-// /host/etc/hosts. EXDEV (tmp and target ever landing on different
-// filesystems) shares the fallback. Both degrade to a direct
-// write+fsync on the target: the crash-atomicity is lost but the
-// pins actually land — strictly better than never writing at all.
-func writeFileAtomic(path, content string) error {
-	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		return err
-	}
-	err := renameFile(tmp, path)
-	if err == nil {
-		return nil
-	}
-	defer os.Remove(tmp)
-	if !errors.Is(err, unix.EBUSY) && !errors.Is(err, unix.EXDEV) {
-		return err
-	}
-	// One warn per path, not per write — a bind-mounted hosts file
-	// takes the fallback on every render and would spam the log.
-	if _, logged := renameFallbackLogged.LoadOrStore(path, true); !logged {
-		logger().Warn("nethealth: atomic rename refused (bind-mounted "+
-			"target?) — falling back to direct fsync'd write",
-			"path", path, "error", err)
-	}
-	return writeFileDirect(path, content)
-}
-
-// renameFile is the rename(2) seam — tests stub it to force the
-// EBUSY/EXDEV bind-mount fallback without a real mount.
-var renameFile = os.Rename
-
-// renameFallbackLogged remembers which paths already warned about the
-// direct-write fallback — one line per path per process.
-var renameFallbackLogged sync.Map
-
-// writeFileDirect writes content straight onto path with an fsync —
-// the writeFileAtomic fallback when rename(2) is refused. Truncates
-// in place, so a crash can leave a partial file; only used where
-// rename is provably impossible.
-func writeFileDirect(path, content string) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	var werr error
-	if _, err := f.WriteString(content); err != nil {
-		werr = err
-	} else if err := f.Sync(); err != nil {
-		werr = err
-	}
-	if cerr := f.Close(); werr == nil {
-		werr = cerr
-	}
-	return werr
-}
-
-func (n *NetHealth) stateEnter(name, extra string) {
-	p := n.statePath(name)
-	if _, err := os.Stat(p); err == nil {
-		// BUG-H6: the latch stays held — refresh its mtime so the
-		// janitor's 24h latch reap can't retire an active signal.
-		now := n.cfg.nowFn()
-		if cerr := os.Chtimes(p, now, now); cerr != nil {
-			logger().Debug("nethealth: state latch touch failed",
-				"state", name, "path", p, "error", cerr)
-		}
-		return
-	}
-	content := strconv.FormatInt(n.cfg.nowFn().Unix(), 10) + "\n"
-	if err := writeFileAtomic(p, content); err != nil {
-		logger().Warn("nethealth: state latch write failed",
-			"state", name, "path", p, "error", err)
-		return
-	}
-	if extra != "" {
-		n.appendLog(fmt.Sprintf("STATE-ENTER: %s %s", name, extra))
-	} else {
-		n.appendLog(fmt.Sprintf("STATE-ENTER: %s", name))
-	}
-}
-
-func (n *NetHealth) stateExit(name string) {
-	p := n.statePath(name)
-	if _, err := os.Stat(p); err != nil {
-		return
-	}
-	if err := os.Remove(p); err != nil {
-		logger().Warn("nethealth: state latch remove failed",
-			"state", name, "path", p, "error", err)
-		return
-	}
-	// Drop the suspect-log dedupe budgets with the latch — a later
-	// re-entry must log a fresh first line, not stay throttled by a
-	// stale epoch from the previous incident. That covers the
-	// latch-paired last-suspect-<name>, and the whole rest of the
-	// family goes with it: the NON-latch keys (egress-probe-<ip>,
-	// conntrack-parse, clock-adjtimex, ...) have no state-* twin to
-	// exit with, so a cleared condition would otherwise suppress the
-	// first line of a re-incident for up to suspectLogCadence. No
-	// clean per-key pairing exists — a latch exit IS an incident
-	// boundary, so the whole family resets; a still-held condition
-	// pays at most one early re-log line.
-	for _, f := range n.egressFiles(fileSuspectLog) {
-		_ = os.Remove(f)
-	}
-	n.appendLog(fmt.Sprintf("STATE-EXIT: %s", name))
-}
-
-func (n *NetHealth) rateOK(name string, interval time.Duration) bool {
-	data, err := os.ReadFile(filepath.Join(n.cfg.WatchdogStateDir, name))
-	if err != nil {
-		return true
-	}
-	last, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-	if err != nil {
-		return true
-	}
-	return n.cfg.nowFn().Unix()-last >= int64(interval.Seconds())
-}
-
-func (n *NetHealth) rateSpend(name string) {
-	p := filepath.Join(n.cfg.WatchdogStateDir, name)
-	content := strconv.FormatInt(n.cfg.nowFn().Unix(), 10) + "\n"
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-		logger().Warn("nethealth: rate budget write failed",
-			"budget", name, "path", p, "error", err)
-	}
-}
-
-// suspectLog emits a suspect/hold line at most once per
-// suspectLogCadence per key — a last-suspect-<key> epoch file under
-// the same rateOK/rateSpend convention as the action budgets
-// (controllerhygiene's suspectLog parity). It replaces the per-cycle
-// appendLog for lines whose condition persists: STATE-ENTER still
-// announces the transition and a cadence re-reminder keeps a
-// long-held condition visible in the tail. Counters, latches and
-// metrics keep updating every cycle — only the LOG line is
-// throttled. A latch exit drops the WHOLE last-suspect-* family —
-// the latch is an incident boundary, and non-latch keys have no
-// other reset path (see stateExit).
-func (n *NetHealth) suspectLog(key, msg string) {
-	if !n.rateOK(fileSuspectLog+key, suspectLogCadence) {
-		return
-	}
-	n.rateSpend(fileSuspectLog + key)
-	n.appendLog(msg)
-}
-
-// readFile returns trimmed file content, "" on any error.
-func readFile(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
-}
-
-func (n *NetHealth) uptimeSeconds() (float64, error) {
-	data, err := os.ReadFile(n.cfg.UptimeFile)
-	if err != nil {
-		return 0, err
-	}
-	f := strings.Fields(string(data))
-	if len(f) == 0 {
-		return 0, fmt.Errorf("empty uptime")
-	}
-	return strconv.ParseFloat(f[0], 64)
 }
 
 // nameservers returns up to 3 nameserver IPs from a resolv.conf
@@ -927,7 +751,7 @@ func (n *NetHealth) renderHostsBlock(block string) (changed bool) {
 	if next == cur {
 		return false
 	}
-	if err := writeFileAtomic(n.cfg.HostsFile, next); err != nil {
+	if err := hostutil.WriteFileAtomic(n.cfg.HostsFile, next); err != nil {
 		logger().Warn("nethealth: hosts file write failed — dns-fallback "+
 			"block not applied",
 			"path", n.cfg.HostsFile,
@@ -967,7 +791,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		// (`rm -f dnsfb-*`: pin/last-good/counter files all go —
 		// shell leftovers included).
 		if n.renderHostsBlock("") {
-			n.appendLog("ACTION: /etc/hosts dns-fallback block removed (map empty)")
+			n.state.AppendLog("ACTION: /etc/hosts dns-fallback block removed (map empty)")
 		}
 		for _, f := range n.egressFiles("dnsfb-") {
 			_ = os.Remove(f)
@@ -1000,8 +824,8 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 			}
 		}
 		if resolved != "" {
-			if readFile(lg) != resolved {
-				if err := writeFileAtomic(lg, resolved+"\n"); err != nil {
+			if hostutil.ReadTrimmed(lg) != resolved {
+				if err := hostutil.WriteFileAtomic(lg, resolved+"\n"); err != nil {
 					logger().Warn("nethealth: dns last-good write "+
 						"failed — fallback pick may lose the "+
 						"last-known-good IP",
@@ -1016,11 +840,11 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		n.dnsfails[e.Name]++
 		fails := n.dnsfails[e.Name]
 		curIP := ""
-		if pin := strings.Fields(readFile(pinf)); len(pin) >= 1 {
+		if pin := strings.Fields(hostutil.ReadTrimmed(pinf)); len(pin) >= 1 {
 			curIP = pin[0]
 		}
 		if fails < n.cfg.ConsecNeeded && curIP == "" {
-			n.appendLog(fmt.Sprintf(
+			n.state.AppendLog(fmt.Sprintf(
 				"suspect: dns-resolve %s fail via resolv.conf (check %d/%d)",
 				e.Name, fails, n.cfg.ConsecNeeded))
 			continue
@@ -1031,7 +855,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		// hubs filter it).
 		if curIP == "" || n.cfg.tcpProbe(ctx, curIP, e.Port, 3*time.Second) != nil {
 			newIP := ""
-			cands := append([]string{readFile(lg)}, e.Candidates...)
+			cands := append([]string{hostutil.ReadTrimmed(lg)}, e.Candidates...)
 			for _, c := range cands {
 				if c == "" || c == curIP {
 					continue
@@ -1042,20 +866,20 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 				}
 			}
 			if newIP != "" {
-				n.appendLog(fmt.Sprintf(
+				n.state.AppendLog(fmt.Sprintf(
 					"ACTION: dns-fallback pin %s -> %s (DNS fail %dx, was '%s')",
 					e.Name, newIP, fails, curIP))
-				if err := writeFileAtomic(pinf,
+				if err := hostutil.WriteFileAtomic(pinf,
 					newIP+" "+e.Name+"\n"); err != nil {
-					n.appendLog(fmt.Sprintf(
+					n.state.AppendLog(fmt.Sprintf(
 						"dns-fallback: pin file write failed for %s -> %s: %v",
 						e.Name, newIP, err))
 				}
 				n.actions.WithLabelValues(checkDNSFB, "pin").Inc()
 			} else if curIP == "" {
-				n.suspectLog("dnsfb-nocand-"+e.Name, fmt.Sprintf(
+				n.state.SuspectLog("dnsfb-nocand-"+e.Name, fmt.Sprintf(
 					"suspect: dns-fallback %s — all candidates unreachable, not pinning",
-					e.Name))
+					e.Name), suspectLogCadence)
 			}
 			// Dead pin with no replacement → keep it (a pinned dead
 			// IP is no worse than NXDOMAIN and may come back).
@@ -1081,22 +905,22 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 	// Render the managed block from the pins.
 	block := ""
 	for _, f := range n.pinFiles() {
-		if c := readFile(f); c != "" {
+		if c := hostutil.ReadTrimmed(f); c != "" {
 			block += c + "\n"
 		}
 	}
 	if block != "" {
 		if n.renderHostsBlock(block) {
-			n.appendLog("ACTION: /etc/hosts dns-fallback block updated")
+			n.state.AppendLog("ACTION: /etc/hosts dns-fallback block updated")
 			// Newly written pins mean DNS was dead — conntrack
 			// entries learned on the broken path blackhole lookups
 			// until expiry unless flushed now.
 			n.flushStaleUDPConntrack(ctx, checkDNSFB)
 		}
-		n.stateEnter("dns-fallback", "")
+		n.state.Enter("dns-fallback", "")
 	} else {
 		if n.renderHostsBlock("") {
-			n.appendLog("ACTION: /etc/hosts dns-fallback block removed (DNS OK)")
+			n.state.AppendLog("ACTION: /etc/hosts dns-fallback block removed (DNS OK)")
 			// Unpin is a DNS-path transition too — replies for the
 			// restored resolver may sit in stale udp/53 entries.
 			n.flushStaleUDPConntrack(ctx, checkDNSFB)
@@ -1152,16 +976,17 @@ func (n *NetHealth) checkCoreDNSStub(ctx context.Context) {
 		n.cycles.WithLabelValues(checkCoreDNS, "ok").Inc()
 		return
 	}
-	if !n.rateOK("last-coredns-restart", corednsRestartInterval) {
-		n.suspectLog("coredns-cooldown",
-			"suspect: coredns stub dead but restart cooldown (<5m), skip")
+	if !n.state.RateOK("last-coredns-restart", corednsRestartInterval) {
+		n.state.SuspectLog("coredns-cooldown",
+			"suspect: coredns stub dead but restart cooldown (<5m), skip",
+			suspectLogCadence)
 		n.cycles.WithLabelValues(checkCoreDNS, "ok").Inc()
 		return
 	}
-	n.appendLog("ACTION: restarting coredns - stub dead but resolv.conf points at 127.0.0.1")
-	n.rateSpend("last-coredns-restart")
+	n.state.AppendLog("ACTION: restarting coredns - stub dead but resolv.conf points at 127.0.0.1")
+	n.state.RateSpend("last-coredns-restart")
 	if err := n.cfg.Systemd.Restart(ctx, "coredns.service"); err != nil {
-		n.appendLog(fmt.Sprintf("coredns restart failed: %v", err))
+		n.state.AppendLog(fmt.Sprintf("coredns restart failed: %v", err))
 	} else {
 		n.actions.WithLabelValues(checkCoreDNS, "restart").Inc()
 		n.flushStaleUDPConntrack(ctx, checkCoreDNS)
@@ -1261,8 +1086,9 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 
 	rules, err := n.ip(ctx, "rule", "list")
 	if err != nil {
-		n.suspectLog("egress-rulelist", fmt.Sprintf(
-			"overlay-egress: ip rule list failed: %v — cycle aborted", err))
+		n.state.SuspectLog("egress-rulelist", fmt.Sprintf(
+			"overlay-egress: ip rule list failed: %v — cycle aborted", err),
+			suspectLogCadence)
 		n.cycles.WithLabelValues(checkEgress, "abort").Inc()
 		return
 	}
@@ -1286,7 +1112,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 	}
 	for _, r := range relays {
 		stf := filepath.Join(n.cfg.WatchdogStateDir, "egress-state-"+r)
-		comm := readFile(stf)
+		comm := hostutil.ReadTrimmed(stf)
 		if comm != "relay" {
 			comm = "direct"
 		}
@@ -1300,7 +1126,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 		for _, t := range ruleTablesFor(rules1500, r) {
 			if t != table {
 				n.ipRuleDel1500(ctx, r, []int{t})
-				n.appendLog(fmt.Sprintf(
+				n.state.AppendLog(fmt.Sprintf(
 					"cleanup: egress %s rule lookup %d stale (current table %d)", r, t, table))
 			}
 		}
@@ -1319,11 +1145,11 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 				// Heal failed — leave `live` as probed so the probe
 				// window and the relay-dead check below see the real
 				// rule state; the drift is retried next cycle.
-				n.suspectLog("egress-heal-"+r, fmt.Sprintf(
+				n.state.SuspectLog("egress-heal-"+r, fmt.Sprintf(
 					"suspect: heal egress %s rule -> %s table %d failed: %v",
-					r, comm, table, herr))
+					r, comm, table, herr), suspectLogCadence)
 			} else {
-				n.appendLog(fmt.Sprintf(
+				n.state.AppendLog(fmt.Sprintf(
 					"ACTION: heal egress %s rule -> %s table %d (was %s)", r, comm, table, live))
 				live = comm
 				// B3: the rule change just switched the underlay path for
@@ -1378,13 +1204,13 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 				if n.cfg.tcpProbe(ctx, r, port, 5*time.Second) == nil {
 					probe = "direct"
 					if _, err := os.Stat(icmpBlk); err != nil {
-						if werr := writeFileAtomic(icmpBlk,
+						if werr := hostutil.WriteFileAtomic(icmpBlk,
 							strconv.FormatInt(n.cfg.nowFn().Unix(), 10)+"\n"); werr != nil {
 							logger().Warn("nethealth: egress "+
 								"icmp-blocked marker write failed",
 								"path", icmpBlk, "error", werr)
 						}
-						n.appendLog(fmt.Sprintf(
+						n.state.AppendLog(fmt.Sprintf(
 							"egress %s: ICMP blocked but tcp/%s alive — treat as direct (provider blocks ICMP?)", r, port))
 					}
 				}
@@ -1419,7 +1245,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 			ctr := n.egressCtr[r]
 			if ctr >= need {
 				delete(n.egressCtr, r)
-				if werr := writeFileAtomic(stf, probe+"\n"); werr != nil {
+				if werr := hostutil.WriteFileAtomic(stf, probe+"\n"); werr != nil {
 					// Committed/live drift: the rule change below
 					// still runs; next cycle's heal converges.
 					logger().Warn("nethealth: egress state commit "+
@@ -1435,17 +1261,17 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 						// failed)" here would claim a dead-underlay
 						// measurement the skipped TCP fallback
 						// never produced.
-						n.appendLog(fmt.Sprintf(
+						n.state.AppendLog(fmt.Sprintf(
 							"ACTION: egress %s -> overlay relay table %d (unprobeable window — committed to live)", r, table))
 					} else {
-						n.appendLog(fmt.Sprintf(
+						n.state.AppendLog(fmt.Sprintf(
 							"ACTION: egress %s -> overlay relay table %d (direct failed)", r, table))
 					}
 					_, _ = n.ip(ctx, "rule", "add", "pref", "1500", "to",
 						r+"/32", "lookup", strconv.Itoa(table))
 					n.actions.WithLabelValues(checkEgress, "rule_add").Inc()
 				} else {
-					n.appendLog(fmt.Sprintf(
+					n.state.AppendLog(fmt.Sprintf(
 						"ACTION: egress %s -> direct underlay (recovered)", r))
 					_, _ = n.ip(ctx, "rule", "del", "pref", "1500", "to",
 						r+"/32", "lookup", strconv.Itoa(table))
@@ -1457,16 +1283,18 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 				// old path; flush only this peer's entries.
 				n.flushPeerNebulaConntrack(ctx, checkEgress, r)
 			} else {
-				n.suspectLog("egress-probe-"+r, fmt.Sprintf(
-					"suspect: egress %s probe=%s cur=%s (check %d/%d)", r, probe, comm, ctr, need))
+				n.state.SuspectLog("egress-probe-"+r, fmt.Sprintf(
+					"suspect: egress %s probe=%s cur=%s (check %d/%d)", r, probe, comm, ctr, need),
+					suspectLogCadence)
 			}
 		}
 		// Serving via relay while the tunnel itself is unreachable →
 		// the relay is dead too.
 		if live == "relay" {
 			if ok, _ := n.cfg.ping(ctx, r, 1, 4, false); !ok {
-				n.suspectLog("egress-unreach-"+r, fmt.Sprintf(
-					"suspect: overlay-egress unreachable %s (relay down?)", r))
+				n.state.SuspectLog("egress-unreach-"+r, fmt.Sprintf(
+					"suspect: overlay-egress unreachable %s (relay down?)", r),
+					suspectLogCadence)
 			}
 		}
 	}
@@ -1483,7 +1311,7 @@ func (n *NetHealth) checkOverlayEgress(ctx context.Context) {
 		n.ipRuleDel1500(ctx, ip, allTables)
 		_ = os.Remove(f)
 		delete(n.egressCtr, ip)
-		n.appendLog(fmt.Sprintf(
+		n.state.AppendLog(fmt.Sprintf(
 			"cleanup: egress state/rule for %s (no longer in OVERLAY_EGRESS_RELAYS)", ip))
 	}
 	n.cycles.WithLabelValues(checkEgress, "ok").Inc()
@@ -1535,12 +1363,12 @@ func (n *NetHealth) hasIPv4Addr(ctx context.Context, dev string) bool {
 func (n *NetHealth) nebulaRestart(ctx context.Context) {
 	net := n.cfg.Watchdog.NebulaNet
 	if n.cfg.Systemd == nil {
-		n.suspectLog("nebula-no-systemd",
-			"nebula restart skipped — no systemd client")
+		n.state.SuspectLog("nebula-no-systemd",
+			"nebula restart skipped — no systemd client", suspectLogCadence)
 		return
 	}
 	if err := n.cfg.Systemd.Restart(ctx, "nebula@"+net); err != nil {
-		n.appendLog(fmt.Sprintf("nebula@%s restart failed: %v", net, err))
+		n.state.AppendLog(fmt.Sprintf("nebula@%s restart failed: %v", net, err))
 		return
 	}
 	n.actions.WithLabelValues(checkNebula, "restart").Inc()
@@ -1651,10 +1479,10 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 			}
 		}
 		if len(slowpath) > 0 {
-			n.suspectLog("nebula-slowpath", fmt.Sprintf(
+			n.state.SuspectLog("nebula-slowpath", fmt.Sprintf(
 				"suspect: nebula-dataplane-slowpath (reroute via remote site) %s",
-				strings.Join(slowpath, " ")))
-			n.stateEnter("nebula-slowpath", strings.Join(slowpath, " "))
+				strings.Join(slowpath, " ")), suspectLogCadence)
+			n.state.Enter("nebula-slowpath", strings.Join(slowpath, " "))
 		} else {
 			n.stateExit("nebula-slowpath")
 		}
@@ -1671,10 +1499,10 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 				}
 			}
 			if len(siteedge) > 0 {
-				n.suspectLog("nebula-siteedge", fmt.Sprintf(
+				n.state.SuspectLog("nebula-siteedge", fmt.Sprintf(
 					"suspect: nebula-siteedge-degraded (site-mesh edge lost) %s",
-					strings.Join(siteedge, " ")))
-				n.stateEnter("nebula-siteedge", strings.Join(siteedge, " "))
+					strings.Join(siteedge, " ")), suspectLogCadence)
+				n.state.Enter("nebula-siteedge", strings.Join(siteedge, " "))
 			} else {
 				n.stateExit("nebula-siteedge")
 			}
@@ -1686,7 +1514,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 			dpFail = true
 			n.nebulaDeg = 0
 			n.stateExit("nebula-degraded")
-			if !n.stateExists("nebula-isolated") {
+			if !n.state.Exists("nebula-isolated") {
 				// B3: on the isolation edge the conntrack entries
 				// learned on the dead path keep the tunnel blackholed
 				// — drop each affected peer's udp/<nebula-port>
@@ -1699,18 +1527,19 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 				// stale flows have long expired by then).
 				n.flushPeerNebulaConntrack(ctx, checkNebula, nebulaPeerUnderlayIPs(wd)...)
 			}
-			n.stateEnter("nebula-isolated", "dataplane dead")
+			n.state.Enter("nebula-isolated", "dataplane dead")
 		case dpTotal-dpAlive >= 2 || mkTotal-mkAlive >= 2:
 			n.nebulaDeg++
 			need := wd.NebulaDegradedConsec
 			if need <= 0 {
 				need = 2
 			}
-			n.suspectLog("nebula-degraded", fmt.Sprintf(
+			n.state.SuspectLog("nebula-degraded", fmt.Sprintf(
 				"suspect: nebula-dataplane-degraded pub=%d/%d marker=%d/%d (run %d/%d)",
-				dpAlive, dpTotal, mkAlive, mkTotal, n.nebulaDeg, need))
+				dpAlive, dpTotal, mkAlive, mkTotal, n.nebulaDeg, need),
+				suspectLogCadence)
 			if n.nebulaDeg >= need {
-				n.stateEnter("nebula-degraded", fmt.Sprintf(
+				n.state.Enter("nebula-degraded", fmt.Sprintf(
 					"pub=%d/%d marker=%d/%d", dpAlive, dpTotal, mkAlive, mkTotal))
 			}
 		default:
@@ -1748,19 +1577,19 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 	}
 	*fails++
 	if *fails >= n.cfg.ConsecNeeded &&
-		n.rateOK("last-nebula-restart", n.cfg.MinRestart) {
-		n.appendLog(fmt.Sprintf("ACTION: restarting nebula@%s - %s (persisted %dx)",
+		n.state.RateOK("last-nebula-restart", n.cfg.MinRestart) {
+		n.state.AppendLog(fmt.Sprintf("ACTION: restarting nebula@%s - %s (persisted %dx)",
 			net, reason, *fails))
-		n.rateSpend("last-nebula-restart")
+		n.state.RateSpend("last-nebula-restart")
 		n.nebulaFails, n.nebulaDpFail = 0, 0
 		n.nebulaRestart(ctx)
 	} else {
 		// Key on the reason's leading token so a persisting cause
 		// throttles to the cadence while a NEW cause still logs at
 		// once.
-		n.suspectLog(strings.SplitN(reason, " ", 2)[0], fmt.Sprintf(
+		n.state.SuspectLog(strings.SplitN(reason, " ", 2)[0], fmt.Sprintf(
 			"suspect: %s (check %d/%d)",
-			reason, *fails, n.cfg.ConsecNeeded))
+			reason, *fails, n.cfg.ConsecNeeded), suspectLogCadence)
 	}
 	n.cycles.WithLabelValues(checkNebula, "ok").Inc()
 }
@@ -1797,12 +1626,12 @@ func (n *NetHealth) checkNebulaPMTU(ctx context.Context,
 		"ping", "-c", "1", "-W", "2", "-M", "do", "-s", "1200", target})
 	if err != nil {
 		n.pmtuFails++
-		n.suspectLog("nebula-pmtu-blackhole", fmt.Sprintf(
+		n.state.SuspectLog("nebula-pmtu-blackhole", fmt.Sprintf(
 			"suspect: nebula-pmtu-blackhole df_probe_failed target=%s size=1200 (check %d/%d): %v (%s)",
 			target, n.pmtuFails, n.cfg.ConsecNeeded, err,
-			trimRunErr(out)))
+			trimRunErr(out)), suspectLogCadence)
 		if n.pmtuFails >= n.cfg.ConsecNeeded {
-			n.stateEnter("nebula-pmtu-blackhole",
+			n.state.Enter("nebula-pmtu-blackhole",
 				fmt.Sprintf("target=%s df_size=1200", target))
 		}
 		return
@@ -1852,16 +1681,17 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 			"unit", "fail2ban.service",
 			"error", err)
 	} else if !active {
-		n.suspectLog("fail2ban-down",
-			"suspect: fail2ban-down (unit exists but service inactive)")
-		n.stateEnter("fail2ban-down", "service=inactive")
+		n.state.SuspectLog("fail2ban-down",
+			"suspect: fail2ban-down (unit exists but service inactive)",
+			suspectLogCadence)
+		n.state.Enter("fail2ban-down", "service=inactive")
 		// A stopped jail protects nothing — restart it under the
 		// last-fail2ban-restart budget (30m) instead of only latching.
-		if n.rateOK("last-fail2ban-restart", f2bRestartInterval) {
-			n.appendLog("ACTION: restarting fail2ban.service - unit exists but service inactive")
-			n.rateSpend("last-fail2ban-restart")
+		if n.state.RateOK("last-fail2ban-restart", f2bRestartInterval) {
+			n.state.AppendLog("ACTION: restarting fail2ban.service - unit exists but service inactive")
+			n.state.RateSpend("last-fail2ban-restart")
 			if err := n.cfg.Systemd.Restart(ctx, "fail2ban.service"); err != nil {
-				n.appendLog(fmt.Sprintf("fail2ban.service restart failed: %v", err))
+				n.state.AppendLog(fmt.Sprintf("fail2ban.service restart failed: %v", err))
 			} else {
 				n.actions.WithLabelValues(checkF2B, "restart").Inc()
 			}
@@ -1874,9 +1704,9 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 	if err != nil {
 		// Client missing/failed → remove the metric file (no stale
 		// series — absent, not 0).
-		n.suspectLog("fail2ban-client", fmt.Sprintf(
+		n.state.SuspectLog("fail2ban-client", fmt.Sprintf(
 			"fail2ban: fail2ban-client status failed: %v (%s) — banned metrics dropped",
-			err, trimRunErr(out)))
+			err, trimRunErr(out)), suspectLogCadence)
 		_ = os.Remove(bannedFile)
 		n.cycles.WithLabelValues(checkF2B, "ok").Inc()
 		return
@@ -1907,7 +1737,7 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 		}
 	}
 	if len(pairs) > 0 {
-		if err := writeFileAtomic(bannedFile,
+		if err := hostutil.WriteFileAtomic(bannedFile,
 			strings.Join(pairs, " ")+"\n"); err != nil {
 			logger().Warn("nethealth: fail2ban banned-count write "+
 				"failed — node_fail2ban_banned_ips stale this cycle",
@@ -1937,8 +1767,9 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 func (n *NetHealth) checkClockSync(ctx context.Context) {
 	var tx unix.Timex
 	if _, err := n.cfg.adjtimexFn(&tx); err != nil {
-		n.suspectLog("clock-adjtimex",
-			fmt.Sprintf("clock-sync: adjtimex failed: %v", err))
+		n.state.SuspectLog("clock-adjtimex",
+			fmt.Sprintf("clock-sync: adjtimex failed: %v", err),
+			suspectLogCadence)
 		n.cycles.WithLabelValues(checkClock, "abort").Inc()
 		return
 	}
@@ -1958,17 +1789,17 @@ func (n *NetHealth) checkClockSync(ctx context.Context) {
 	}
 	n.clockFails++
 	if n.clockFails < n.cfg.ConsecNeeded {
-		n.appendLog(fmt.Sprintf("suspect: clock-unsync %s (check %d/%d)",
+		n.state.AppendLog(fmt.Sprintf("suspect: clock-unsync %s (check %d/%d)",
 			bad, n.clockFails, n.cfg.ConsecNeeded))
 		n.cycles.WithLabelValues(checkClock, "ok").Inc()
 		return
 	}
-	n.stateEnter("clock-unsync", bad)
-	if n.rateOK("last-ntp-restart", ntpRestartInterval) {
+	n.state.Enter("clock-unsync", bad)
+	if n.state.RateOK("last-ntp-restart", ntpRestartInterval) {
 		n.restartNTPDaemon(ctx)
 	} else {
-		n.suspectLog("clock-unsync", "suspect: clock-unsync persists "+
-			"but ntp restart cooldown (<30m), skip")
+		n.state.SuspectLog("clock-unsync", "suspect: clock-unsync persists "+
+			"but ntp restart cooldown (<30m), skip", suspectLogCadence)
 	}
 	n.cycles.WithLabelValues(checkClock, "ok").Inc()
 }
@@ -1980,8 +1811,8 @@ func (n *NetHealth) checkClockSync(ctx context.Context) {
 // (the daemon may be managed by other means).
 func (n *NetHealth) restartNTPDaemon(ctx context.Context) {
 	if n.cfg.Systemd == nil {
-		n.suspectLog("ntp-no-systemd",
-			"ntp restart skipped — no systemd client")
+		n.state.SuspectLog("ntp-no-systemd",
+			"ntp restart skipped — no systemd client", suspectLogCadence)
 		return
 	}
 	// Pick the node's ACTUAL sync daemon, not just an installed one:
@@ -2023,17 +1854,17 @@ func (n *NetHealth) restartNTPDaemon(ctx context.Context) {
 		// The restart budget is intentionally NOT spent here —
 		// there is nothing to restart — but the line is cadence-
 		// throttled so a unit-less node doesn't re-log every cycle.
-		n.suspectLog("no-sync-unit", "clock-unsync but no "+
+		n.state.SuspectLog("no-sync-unit", "clock-unsync but no "+
 			"enabled/active sync unit found (timesyncd/chrony/"+
-			"chronyd all disabled or absent)")
+			"chronyd all disabled or absent)", suspectLogCadence)
 		return
 	}
-	n.appendLog(fmt.Sprintf(
+	n.state.AppendLog(fmt.Sprintf(
 		"ACTION: restarting %s - clock unsynchronized (persisted %dx)",
 		pick, n.clockFails))
-	n.rateSpend("last-ntp-restart")
+	n.state.RateSpend("last-ntp-restart")
 	if err := n.cfg.Systemd.Restart(ctx, pick); err != nil {
-		n.appendLog(fmt.Sprintf("%s restart failed: %v", pick, err))
+		n.state.AppendLog(fmt.Sprintf("%s restart failed: %v", pick, err))
 		return
 	}
 	n.actions.WithLabelValues(checkClock, "restart").Inc()
@@ -2049,8 +1880,8 @@ func (n *NetHealth) restartNTPDaemon(ctx context.Context) {
 // can't flap it. Missing /proc entries mean the module isn't loaded
 // → no table to pressure, drop any stale latch.
 func (n *NetHealth) checkConntrack(ctx context.Context) {
-	usedStr := readFile(n.cfg.ConntrackCountFile)
-	maxStr := readFile(n.cfg.ConntrackMaxFile)
+	usedStr := hostutil.ReadTrimmed(n.cfg.ConntrackCountFile)
+	maxStr := hostutil.ReadTrimmed(n.cfg.ConntrackMaxFile)
 	if usedStr == "" || maxStr == "" {
 		n.stateExit("conntrack-pressure")
 		n.cycles.WithLabelValues(checkCT, "gated").Inc()
@@ -2059,25 +1890,25 @@ func (n *NetHealth) checkConntrack(ctx context.Context) {
 	used, errU := strconv.ParseFloat(usedStr, 64)
 	max, errM := strconv.ParseFloat(maxStr, 64)
 	if errU != nil || errM != nil || max <= 0 {
-		n.suspectLog("conntrack-parse", fmt.Sprintf(
+		n.state.SuspectLog("conntrack-parse", fmt.Sprintf(
 			"conntrack-guard: unparseable conntrack values count=%q max=%q — cycle aborted",
-			usedStr, maxStr))
+			usedStr, maxStr), suspectLogCadence)
 		n.cycles.WithLabelValues(checkCT, "abort").Inc()
 		return
 	}
 	ratio := used / max
-	if n.stateExists("conntrack-pressure") {
+	if n.state.Exists("conntrack-pressure") {
 		if ratio < conntrackExitRatio {
-			n.appendLog(fmt.Sprintf(
+			n.state.AppendLog(fmt.Sprintf(
 				"conntrack-pressure cleared (used=%.0f max=%.0f ratio=%.2f)",
 				used, max, ratio))
 			n.stateExit("conntrack-pressure")
 		}
 	} else if ratio > conntrackEnterRatio {
-		n.appendLog(fmt.Sprintf(
+		n.state.AppendLog(fmt.Sprintf(
 			"suspect: conntrack-pressure used=%.0f max=%.0f ratio=%.2f > %.2f",
 			used, max, ratio, conntrackEnterRatio))
-		n.stateEnter("conntrack-pressure",
+		n.state.Enter("conntrack-pressure",
 			fmt.Sprintf("used=%.0f max=%.0f ratio=%.2f", used, max, ratio))
 	}
 	n.cycles.WithLabelValues(checkCT, "ok").Inc()
@@ -2120,13 +1951,13 @@ func (n *NetHealth) flushPeerNebulaConntrack(ctx context.Context, check string, 
 				"--dport", dport}, sel...)
 			out, err := n.cfg.runMountCmd(ctx, args)
 			if err != nil {
-				n.appendLog(fmt.Sprintf("conntrack nebula-peer flush %s skipped: %v (%s) [%s]",
+				n.state.AppendLog(fmt.Sprintf("conntrack nebula-peer flush %s skipped: %v (%s) [%s]",
 					p, err, trimRunErr(out), sel[0]))
 				continue
 			}
 			n.actions.WithLabelValues(check, "flush_peer").Inc()
 		}
-		n.appendLog(fmt.Sprintf(
+		n.state.AppendLog(fmt.Sprintf(
 			"ACTION: flushed stale udp/%d conntrack entries for peer %s", port, p))
 	}
 }
@@ -2158,10 +1989,10 @@ func (n *NetHealth) flushStaleUDPConntrack(ctx context.Context, check string) {
 	out, err := n.cfg.runMountCmd(ctx,
 		[]string{"conntrack", "-D", "-p", "udp", "--dport", "53"})
 	if err != nil {
-		n.appendLog(fmt.Sprintf("conntrack udp/53 flush skipped: %v (%s)",
+		n.state.AppendLog(fmt.Sprintf("conntrack udp/53 flush skipped: %v (%s)",
 			err, trimRunErr(out)))
 		return
 	}
 	n.actions.WithLabelValues(check, "flush").Inc()
-	n.appendLog("ACTION: flushed stale udp/53 conntrack entries")
+	n.state.AppendLog("ACTION: flushed stale udp/53 conntrack entries")
 }

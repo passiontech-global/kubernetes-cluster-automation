@@ -57,51 +57,52 @@ func (h *Hygiene) checkPKIReloadDrift(ctx context.Context) {
 		if err != nil {
 			// Cert absent — not a controller / pair not deployed on
 			// this host. Reset rather than carry a stale count.
-			h.ctrReset(ctr)
+			h.state.ResetCounter(ctr)
 			continue
 		}
 		sock, err := h.cfg.tlsCertFn(ctx, pair.Addr)
 		if err != nil {
 			// Socket down is someone else's check — the drift
 			// comparison is inconclusive, not evidence.
-			h.ctrReset(ctr)
+			h.state.ResetCounter(ctr)
 			continue
 		}
 		if !certNewerThan(disk, sock) {
-			h.ctrReset(ctr)
+			h.state.ResetCounter(ctr)
 			continue
 		}
 		anyDrift = true
-		n := h.ctrInc(ctr)
+		n := h.state.Incr(ctr)
 		if n < h.cfg.PKIDriftCycles {
 			continue
 		}
-		h.stateEnter(statePKIReloadStale, fmt.Sprintf(
+		h.state.Enter(statePKIReloadStale, fmt.Sprintf(
 			"%s newer than %s (disk notAfter=%s socket=%s)",
 			pair.CertFile, pair.Addr,
 			disk.NotAfter.UTC().Format(time.RFC3339),
 			sock.NotAfter.UTC().Format(time.RFC3339)))
-		if !h.rateOK(h.cfg.WatchdogStateDir, fileRatePKIRestart,
+		if !h.state.RateOK(fileRatePKIRestart,
 			h.cfg.PKIRestartInterval) {
-			h.suspectLog(statePKIReloadStale, fmt.Sprintf(
+			h.state.SuspectLog(statePKIReloadStale, fmt.Sprintf(
 				"suspect: cp-cert-reload-stale %s but in restart cooldown (<%dm), skip",
-				pair.CertFile, int(h.cfg.PKIRestartInterval.Minutes())))
+				pair.CertFile, int(h.cfg.PKIRestartInterval.Minutes())),
+				h.cfg.SuspectLogCadence)
 			continue
 		}
 		switch h.cfg.Sig13Mode {
 		case ModeEnforce:
-			h.appendLog(fmt.Sprintf(
+			h.state.AppendLog(fmt.Sprintf(
 				"ACTION: restarting %s - cp-cert-reload-stale %s newer than %s",
 				pair.Unit, pair.CertFile, pair.Addr))
-			h.rateSpend(h.cfg.WatchdogStateDir, fileRatePKIRestart)
-			h.ctrReset(ctr)
+			h.state.RateSpend(fileRatePKIRestart)
+			h.state.ResetCounter(ctr)
 			if err := h.cfg.restartFn(ctx, pair.Unit); err != nil {
-				h.appendLogWarn(fmt.Sprintf(
+				h.state.AppendLogWarn(fmt.Sprintf(
 					"suspect: restart %s failed: %v", pair.Unit, err))
 			}
 			h.actions.WithLabelValues(checkPKIDrift, "restart_unit").Inc()
 		case ModeDryRun:
-			h.appendLog(fmt.Sprintf(
+			h.state.AppendLog(fmt.Sprintf(
 				"DRY-RUN: would restart %s - cp-cert-reload-stale %s",
 				pair.Unit, pair.CertFile))
 			h.actions.WithLabelValues(checkPKIDrift, "dryrun_restart").Inc()

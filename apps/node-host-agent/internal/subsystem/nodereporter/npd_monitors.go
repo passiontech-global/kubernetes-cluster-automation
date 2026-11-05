@@ -58,6 +58,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 // kubelet-stale-monitor.json rules — journald plugin, temporary
@@ -392,21 +394,6 @@ func (r *Reporter) closeKmsg() {
 	}
 }
 
-// hostUptimeSeconds reads the first field of /proc/uptime — under
-// hostPID this is the HOST uptime, which converts kmsg µs-since-boot
-// timestamps into ages for the first-scan lookback.
-func hostUptimeSeconds(path string) (float64, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	f := strings.Fields(string(data))
-	if len(f) == 0 {
-		return 0, fmt.Errorf("empty uptime %s", path)
-	}
-	return strconv.ParseFloat(f[0], 64)
-}
-
 // syncKernelMonitor is the kernel-monitor port: new kernel lines →
 // temporary rules (counter + Event) plus the permanent KernelDeadlock
 // latch.
@@ -417,7 +404,11 @@ func (r *Reporter) syncKernelMonitor(ctx context.Context) error {
 	}
 	uptime := float64(-1)
 	if replay {
-		if u, e := hostUptimeSeconds(r.cfg.ProcUptimeFile); e == nil {
+		// hostUptimeSeconds read the first field of /proc/uptime —
+		// under hostPID this is the HOST uptime, which converts kmsg
+		// µs-since-boot timestamps into ages for the first-scan
+		// lookback (hostutil.UptimeSeconds is the shared parser).
+		if u, e := hostutil.UptimeSeconds(r.cfg.ProcUptimeFile); e == nil {
 			uptime = u
 		}
 	}

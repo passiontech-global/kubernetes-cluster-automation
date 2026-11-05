@@ -42,8 +42,9 @@ func (h *Hygiene) textfilePromDir() string {
 func (h *Hygiene) writeTextfileProm(name, content string) {
 	dir := h.textfilePromDir()
 	fail := func(err error) {
-		h.suspectLog("textfile-prom", fmt.Sprintf(
-			"textfile prom %s unwritable (dir=%s): %v", name, dir, err))
+		h.state.SuspectLog("textfile-prom", fmt.Sprintf(
+			"textfile prom %s unwritable (dir=%s): %v", name, dir, err),
+			h.cfg.SuspectLogCadence)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		fail(err)

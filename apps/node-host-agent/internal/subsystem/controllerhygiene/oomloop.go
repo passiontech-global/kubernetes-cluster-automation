@@ -79,11 +79,11 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 			}
 			_ = f.Close()
 		} else {
-			h.appendLogWarn(fmt.Sprintf(
+			h.state.AppendLogWarn(fmt.Sprintf(
 				"oomloop: kills file %s append failed: %v — window undercounts kills",
 				killsPath, ferr))
 		}
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"oomloop-probe: %d new memcg OOM kill(s) in k0scontroller (cum=%d)",
 			d, oomNow))
 	}
@@ -102,7 +102,7 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 	}
 
 	// --- OOM loop confirmed ---
-	h.stateEnter(stateControllerOOMLop, fmt.Sprintf(
+	h.state.Enter(stateControllerOOMLop, fmt.Sprintf(
 		"oom_kills_window=%d/%d in %ds (cum=%d)",
 		inWindow, h.cfg.OOMLoopMinKills,
 		int(h.cfg.OOMLoopWindow.Seconds()), oomNow))
@@ -113,9 +113,10 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 		// re-applied every cycle while the loop is latched — only
 		// the LOG line is deduped to the suspect cadence (the
 		// shield work + action metric stay per-cycle).
-		h.suspectLog(stateControllerOOMLop, fmt.Sprintf(
+		h.state.SuspectLog(stateControllerOOMLop, fmt.Sprintf(
 			"ACTION: shield kube-apiserver (oom_score_adj=%d), kine %+d — window_kills=%d",
-			h.cfg.APIServerShieldAdj, h.cfg.KineShieldAdj, inWindow))
+			h.cfg.APIServerShieldAdj, h.cfg.KineShieldAdj, inWindow),
+			h.cfg.SuspectLogCadence)
 		// Latch FIRST and confirm it landed: fileOOMShielded is the
 		// only record unshieldOOM keys on, so pinning an adj before
 		// the latch exists is a single-point-of-failure — a failed
@@ -125,7 +126,7 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 		// process's lifetime. No latch ⇒ nothing may be pinned.
 		h.writeState(fileOOMShielded, "")
 		if _, err := os.Stat(filepath.Join(dir, fileOOMShielded)); err != nil {
-			h.appendLogWarn(fmt.Sprintf(
+			h.state.AppendLogWarn(fmt.Sprintf(
 				"oomloop: shield latch %s not persisted: %v — shielding skipped (no latch, nothing pinned)",
 				filepath.Join(dir, fileOOMShielded), err))
 			break
@@ -134,9 +135,10 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 		h.setAdj("kine", h.cfg.KineShieldAdj)
 		h.actions.WithLabelValues(checkOOMLoop, "shield").Inc()
 	case ModeDryRun:
-		h.suspectLog(stateControllerOOMLop, fmt.Sprintf(
+		h.state.SuspectLog(stateControllerOOMLop, fmt.Sprintf(
 			"DRY-RUN: would shield kube-apiserver oom_score_adj=%d, kine %+d — window_kills=%d",
-			h.cfg.APIServerShieldAdj, h.cfg.KineShieldAdj, inWindow))
+			h.cfg.APIServerShieldAdj, h.cfg.KineShieldAdj, inWindow),
+			h.cfg.SuspectLogCadence)
 		h.actions.WithLabelValues(checkOOMLoop, "dryrun_shield").Inc()
 	}
 	// A mode flip off enforce while the shield is latched must not
@@ -157,7 +159,7 @@ func (h *Hygiene) unshieldOOM(dir, why string) {
 	if _, err := os.Stat(filepath.Join(dir, fileOOMShielded)); err != nil {
 		return
 	}
-	h.appendLog(fmt.Sprintf(
+	h.state.AppendLog(fmt.Sprintf(
 		"oom-loop %s — unshield kube-apiserver/kine (oom_score_adj=0)", why))
 	h.setAdj("kube-apiserver", 0)
 	h.setAdj("kine", 0)
@@ -207,11 +209,11 @@ func (h *Hygiene) pruneKills(killsPath string, now int64) int {
 	}
 	tmp := killsPath + ".tmp"
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		h.appendLogWarn(fmt.Sprintf(
+		h.state.AppendLogWarn(fmt.Sprintf(
 			"oomloop: kills file %s rewrite failed: %v — stale entries persist",
 			killsPath, err))
 	} else if err := os.Rename(tmp, killsPath); err != nil {
-		h.appendLogWarn(fmt.Sprintf(
+		h.state.AppendLogWarn(fmt.Sprintf(
 			"oomloop: kills file %s install failed: %v — stale entries persist",
 			killsPath, err))
 	}
@@ -231,7 +233,7 @@ func (h *Hygiene) setAdj(comm string, adj int) {
 		[]byte(strconv.Itoa(adj)), 0o644); err != nil {
 		// A swallowed write failure leaves the shield half-applied
 		// and invisible — surface it once per call (per cycle).
-		h.appendLogWarn(fmt.Sprintf(
+		h.state.AppendLogWarn(fmt.Sprintf(
 			"oomloop: write oom_score_adj=%d comm=%s pid=%d failed: %v",
 			adj, comm, pid, err))
 	}

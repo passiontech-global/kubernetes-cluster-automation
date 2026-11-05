@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -132,7 +133,8 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 	writeFile(t, e.unit, "[Service]\nExecStart=/usr/bin/k0s worker --node-ip=10.1.2.3\n")
 
 	e.cs = fake.NewSimpleClientset(objs...)
-	// Host up 2h — the uptime file feeds BOTH h.uptimeSeconds (G1)
+	// Host up 2h — the uptime file feeds BOTH the Cycle G1 uptime
+	// gate (hostutil.UptimeSeconds)
 	// and systemd.ActiveAge's monotonic compare, so one file is one
 	// host clock. ActiveEnterTimestampMonotonic is µs since boot:
 	// uptimeµs - 1h → a 1h-old (settled) unit.
@@ -823,8 +825,8 @@ func TestDNSResolvSkipsForeignNamespace(t *testing.T) {
 
 func TestStateEnterExitTransitionLogsOnce(t *testing.T) {
 	e := fixture(t)
-	e.h.stateEnter("test-state", "extra=1")
-	e.h.stateEnter("test-state", "extra=1") // idempotent — one log line
+	e.h.state.Enter("test-state", "extra=1")
+	e.h.state.Enter("test-state", "extra=1") // idempotent — one log line
 	if got := strings.Count(logLines(t, e), "STATE-ENTER: test-state"); got != 1 {
 		t.Fatalf("STATE-ENTER lines=%d want 1", got)
 	}
@@ -835,8 +837,8 @@ func TestStateEnterExitTransitionLogsOnce(t *testing.T) {
 	if _, err := fmt.Sscanf(strings.TrimSpace(string(content)), "%d", new(int64)); err != nil {
 		t.Fatalf("state file content=%q want epoch", content)
 	}
-	e.h.stateExit("test-state")
-	e.h.stateExit("test-state")
+	e.h.state.Exit("test-state", nil)
+	e.h.state.Exit("test-state", nil)
 	if got := strings.Count(logLines(t, e), "STATE-EXIT: test-state"); got != 1 {
 		t.Fatalf("STATE-EXIT lines=%d want 1", got)
 	}
@@ -845,20 +847,20 @@ func TestStateEnterExitTransitionLogsOnce(t *testing.T) {
 func TestRateOKSpend(t *testing.T) {
 	e := fixture(t)
 	name := "last-test"
-	if !e.h.rateOK(name, 30*time.Minute) {
+	if !e.h.state.RateOK(name, 30*time.Minute) {
 		t.Fatal("rateOK on absent file want true")
 	}
-	e.h.rateSpend(name)
-	if e.h.rateOK(name, 30*time.Minute) {
+	e.h.state.RateSpend(name)
+	if e.h.state.RateOK(name, 30*time.Minute) {
 		t.Fatal("rateOK right after spend want false")
 	}
 	e.now = e.now.Add(31 * time.Minute)
-	if !e.h.rateOK(name, 30*time.Minute) {
+	if !e.h.state.RateOK(name, 30*time.Minute) {
 		t.Fatal("rateOK after interval want true")
 	}
 	// Garbage content → 0 → ok (shell parity).
 	writeFile(t, filepath.Join(e.state, name), "garbage\n")
-	if !e.h.rateOK(name, 30*time.Minute) {
+	if !e.h.state.RateOK(name, 30*time.Minute) {
 		t.Fatal("rateOK on garbage file want true")
 	}
 }
@@ -993,7 +995,7 @@ func TestStateEnterAtomicTmpLeavesNoResidue(t *testing.T) {
 	// have surfaced as a phantom hostmetrics watchdog_state series.
 	writeFile(t, filepath.Join(e.state, ".tmp-state-x"), "stale\n")
 
-	e.h.stateEnter("x", "")
+	e.h.state.Enter("x", "")
 
 	entries, err := os.ReadDir(e.state)
 	if err != nil {
@@ -1076,7 +1078,7 @@ func TestKubeletStall10250AuthResponseIsUp(t *testing.T) {
 func TestKubeletStall10250AuthClearsStaleEvidence(t *testing.T) {
 	e := fixture(t)
 	latch := filepath.Join(e.state, "state-kubelet-runtime-stall")
-	e.h.stateEnter("kubelet-runtime-stall", "test")
+	e.h.state.Enter("kubelet-runtime-stall", "test")
 	e.h.stallFails = 1
 	e.status[defaultKubeletHealthzURL] = 401
 	e.h.Cycle(context.Background())
@@ -2116,7 +2118,7 @@ func TestKubeletFeederReactivationResetsFails(t *testing.T) {
 
 // TestRateTrySpendAtomic: the shared last-* budgets are checked and
 // spent by BOTH the feeder goroutine and Cycle — check+spend under
-// rateMu means exactly one winner per window.
+// the hoststate store mutex means exactly one winner per window.
 func TestRateTrySpendAtomic(t *testing.T) {
 	e := fixture(t)
 	const n = 8
@@ -2126,7 +2128,7 @@ func TestRateTrySpendAtomic(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if e.h.rateTrySpend("last-restart", e.h.cfg.MinRestartInterval) {
+			if e.h.state.RateTrySpend("last-restart", e.h.cfg.MinRestartInterval) {
 				wins.Add(1)
 			}
 		}()
@@ -2731,12 +2733,12 @@ func TestSyncloopDownLatchesOnPLEGFreeze(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.stateExists("kubelet-syncloop-down") {
+	if !e.h.state.Exists("kubelet-syncloop-down") {
 		t.Fatal("state-kubelet-syncloop-down should latch after 2 failed syncloop probes")
 	}
 	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 200
 	e.h.Cycle(context.Background())
-	if e.h.stateExists("kubelet-syncloop-down") {
+	if e.h.state.Exists("kubelet-syncloop-down") {
 		t.Fatal("recovery should clear the syncloop latch")
 	}
 }
@@ -2753,7 +2755,7 @@ func TestSyncloopNon200LogsStatusCode(t *testing.T) {
 		t.Fatalf("suspect line must carry the HTTP code, got:\n%s", got)
 	}
 	e.h.Cycle(context.Background()) // streak 2 → latch
-	if !e.h.stateExists("kubelet-syncloop-down") {
+	if !e.h.state.Exists("kubelet-syncloop-down") {
 		t.Fatal("latch expected after ConsecNeeded failed probes")
 	}
 	if got := logLines(t, e); strings.Contains(got, "last_err=<nil>") {
@@ -2773,7 +2775,7 @@ func TestSyncloopFailClosedWhenActiveCheckErrors(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if e.h.stateExists("kubelet-syncloop-down") {
+	if e.h.state.Exists("kubelet-syncloop-down") {
 		t.Fatal("no latch may be written while the unit state is unknown")
 	}
 }
@@ -2789,7 +2791,7 @@ func TestSyncloopUnauthorizedIsInconclusive(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if e.h.stateExists("kubelet-syncloop-down") {
+	if e.h.state.Exists("kubelet-syncloop-down") {
 		t.Fatal("401 must not latch kubelet-syncloop-down")
 	}
 	got := logLines(t, e)
@@ -2831,12 +2833,12 @@ func TestContainerdSockDownLatches(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.stateExists("containerd-sock-down") {
+	if !e.h.state.Exists("containerd-sock-down") {
 		t.Fatal("state-containerd-sock-down should latch after 2 socket failures")
 	}
 	e.sockErrs[e.h.cfg.ContainerdSocket] = nil
 	e.h.Cycle(context.Background())
-	if e.h.stateExists("containerd-sock-down") {
+	if e.h.state.Exists("containerd-sock-down") {
 		t.Fatal("recovery should clear the containerd-sock latch")
 	}
 }
@@ -3001,7 +3003,7 @@ func TestZombieStormLatchesAndLogsAction(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.stateExists("zombie-storm") {
+	if !e.h.state.Exists("zombie-storm") {
 		t.Fatal("state-zombie-storm should latch after 2 storm cycles")
 	}
 	data, err := os.ReadFile(e.h.cfg.WatchdogLogFile)
@@ -3040,7 +3042,7 @@ func TestZombieStormActionLoggedOncePerEpisode(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.stateExists("zombie-storm") {
+	if !e.h.state.Exists("zombie-storm") {
 		t.Fatal("storm latch should hold while the storm persists")
 	}
 	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 1 {
@@ -3061,7 +3063,7 @@ func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 	}
 	e.h.Cycle(context.Background()) // streak 1
 	e.h.Cycle(context.Background()) // streak 2 → ACTION + latch
-	if !e.h.stateExists("zombie-storm") {
+	if !e.h.state.Exists("zombie-storm") {
 		t.Fatal("latch expected after 2 storm cycles")
 	}
 	// pid 777 is RECYCLED — same ppid, different starttime. The
@@ -3069,7 +3071,7 @@ func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 	// restarts at streak 1, the latch drops, no second ACTION yet.
 	mkParentProc(t, e, 777, "222222")
 	e.h.Cycle(context.Background())
-	if e.h.stateExists("zombie-storm") {
+	if e.h.state.Exists("zombie-storm") {
 		t.Fatal("recycled ppid must not inherit the dead parent's streak")
 	}
 	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 1 {
@@ -3078,7 +3080,7 @@ func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 	// The new generation earns its own streak — latch + ACTION
 	// again on its own entry.
 	e.h.Cycle(context.Background())
-	if !e.h.stateExists("zombie-storm") {
+	if !e.h.state.Exists("zombie-storm") {
 		t.Fatal("recycled parent's own streak should re-latch")
 	}
 	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 2 {
@@ -3101,7 +3103,7 @@ func TestZombieStormLatchDropsBelowThreshold(t *testing.T) {
 	}
 	e.h.Cycle(context.Background())
 	e.h.Cycle(context.Background())
-	if !e.h.stateExists("zombie-storm") {
+	if !e.h.state.Exists("zombie-storm") {
 		t.Fatal("latch expected after 2 storm cycles")
 	}
 	// Storm drains to 2 zombies (≤ threshold but >0) — the parent
@@ -3112,7 +3114,7 @@ func TestZombieStormLatchDropsBelowThreshold(t *testing.T) {
 		}
 	}
 	e.h.Cycle(context.Background())
-	if e.h.stateExists("zombie-storm") {
+	if e.h.state.Exists("zombie-storm") {
 		t.Fatal("latch held an extra cycle after storm dropped below threshold")
 	}
 }
@@ -3226,7 +3228,7 @@ func TestCiliumEnvoyUnreadyKillAfterConsec(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.stateExists("cilium-envoy-down") {
+	if !e.h.state.Exists("cilium-envoy-down") {
 		t.Fatal("state-cilium-envoy-down should latch after 2 unready cycles")
 	}
 	found := false
@@ -3268,7 +3270,7 @@ func TestCiliumMTUDriftLatchesAndLogs(t *testing.T) {
 	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
 	writeFile(t, filepath.Join(e.sysnet, "cilium_net", "mtu"), "1500\n")
 	e.h.Cycle(context.Background())
-	if !e.h.stateExists("cilium-mtu-drift") {
+	if !e.h.state.Exists("cilium-mtu-drift") {
 		t.Fatal("state-cilium-mtu-drift should latch when cilium_mtu > neb1")
 	}
 	data, err := os.ReadFile(e.h.cfg.WatchdogLogFile)
@@ -3281,7 +3283,7 @@ func TestCiliumMTUDriftLatchesAndLogs(t *testing.T) {
 	// Drift fixed → latch clears.
 	writeFile(t, filepath.Join(e.sysnet, "cilium_net", "mtu"), "1300\n")
 	e.h.Cycle(context.Background())
-	if e.h.stateExists("cilium-mtu-drift") {
+	if e.h.state.Exists("cilium-mtu-drift") {
 		t.Fatal("latch should clear once MTUs align")
 	}
 }
@@ -3292,7 +3294,7 @@ func TestCiliumMTURuntimeConfigFallback(t *testing.T) {
 	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
 	writeFile(t, e.ciliumRt, `{"mtu":1500,"other":1}`)
 	e.h.Cycle(context.Background())
-	if !e.h.stateExists("cilium-mtu-drift") {
+	if !e.h.state.Exists("cilium-mtu-drift") {
 		t.Fatal("runtime-config MTU 1500 > neb1 1300 should latch drift")
 	}
 }
@@ -3305,9 +3307,9 @@ func TestRuntimeConfigMTUMaxDeterministic(t *testing.T) {
 	e := fixture(t)
 	writeFile(t, e.ciliumRt,
 		`{"a":{"mtu":1300},"list":[{"mtu":1400},{"mtu":1500}],"z":{"MTU":900}}`)
-	got, ok := runtimeConfigMTU(e.ciliumRt)
+	got, ok := hostutil.RuntimeConfigMTU(e.ciliumRt)
 	if !ok || got != 1500 {
-		t.Fatalf("runtimeConfigMTU=%v,%v want 1500,true (max of all mtu keys)", got, ok)
+		t.Fatalf("RuntimeConfigMTU=%v,%v want 1500,true (max of all mtu keys)", got, ok)
 	}
 }
 
@@ -3350,13 +3352,13 @@ func TestJournalUnreadableLatchesAfterConsecFails(t *testing.T) {
 	// journalOnce snapshot + the A5 probe) — one cycle is a streak
 	// below Needed, three must have latched.
 	e.h.Cycle(context.Background())
-	if e.h.stateExists(stateJournalUnreadable) {
+	if e.h.state.Exists(stateJournalUnreadable) {
 		t.Fatal("latched before the streak reached Needed")
 	}
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.stateExists(stateJournalUnreadable) {
+	if !e.h.state.Exists(stateJournalUnreadable) {
 		t.Fatal("state-journal-unreadable not latched after persistent read failures")
 	}
 	if n := strings.Count(logLines(t, e), "suspect: journal-unreadable"); n != 1 {
@@ -3378,13 +3380,13 @@ func TestJournalUnreadableClearsOnRecovery(t *testing.T) {
 	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.stateExists(stateJournalUnreadable) {
+	if !e.h.state.Exists(stateJournalUnreadable) {
 		t.Fatal("precondition: latch should be held")
 	}
 	e.journalErr = nil
 	e.journal = "Oct 01 node k0sworker: healthy line\n"
 	e.h.Cycle(context.Background())
-	if e.h.stateExists(stateJournalUnreadable) {
+	if e.h.state.Exists(stateJournalUnreadable) {
 		t.Fatal("latch not cleared on first healthy read")
 	}
 	if n := strings.Count(logLines(t, e), "STATE-EXIT: journal-unreadable"); n != 1 {
@@ -3402,7 +3404,7 @@ func TestJournalUnreadableNoFireWithoutJournalDir(t *testing.T) {
 	for i := 0; i < defaultJournalUnreadableNeeded+2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if e.h.stateExists(stateJournalUnreadable) {
+	if e.h.state.Exists(stateJournalUnreadable) {
 		t.Fatal("latched without any journal storage — must not fire")
 	}
 	if n := strings.Count(logLines(t, e), "suspect: journal-unreadable"); n != 0 {
@@ -3418,7 +3420,7 @@ func TestJournalUnreadableEmptyWindowSilentJournaldFires(t *testing.T) {
 	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.stateExists(stateJournalUnreadable) {
+	if !e.h.state.Exists(stateJournalUnreadable) {
 		t.Fatal("journald-wide silence should latch journal-unreadable")
 	}
 }
@@ -3432,7 +3434,7 @@ func TestJournalUnreadableQuietUnitNoFire(t *testing.T) {
 	for i := 0; i < defaultJournalUnreadableNeeded+2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if e.h.stateExists(stateJournalUnreadable) {
+	if e.h.state.Exists(stateJournalUnreadable) {
 		t.Fatal("quiet unit on healthy journald must not latch")
 	}
 }
@@ -3444,7 +3446,7 @@ func TestJournalUnreadableFilesGoneMarkerFires(t *testing.T) {
 	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.stateExists(stateJournalUnreadable) {
+	if !e.h.state.Exists(stateJournalUnreadable) {
 		t.Fatal("'No journal files' reads should latch journal-unreadable")
 	}
 }

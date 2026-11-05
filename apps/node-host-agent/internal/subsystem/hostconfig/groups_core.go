@@ -364,7 +364,7 @@ func (c *cyc) journaldIntegrity() {
 		// rotate+vacuum — and re-fail — every cycle, pinning errs and
 		// hammering the journal on every converge. The last-* name is
 		// janitor-safe (only state-* latches are swept).
-		if !r.rateOK("last-journald-rotate", journaldRotateCooldown) {
+		if !r.state.RateOK("last-journald-rotate", journaldRotateCooldown) {
 			logger().Warn("base: journald journal still corrupt — rotate+vacuum in cooldown, skipping",
 				"cooldown", journaldRotateCooldown.String())
 			return
@@ -376,7 +376,7 @@ func (c *cyc) journaldIntegrity() {
 		// Spend on the attempt: a failing rotate retries next cycle no
 		// more than once per cooldown window.
 		r.ensureDir(watchdogStateDir, 0o755)
-		r.rateSpend("last-journald-rotate")
+		r.state.RateSpend("last-journald-rotate")
 		// runLong: vacuum of a multi-GB journal on a slow disk blows past
 		// the interactive command budget.
 		if vout, verr := r.runLong(ctx, "journalctl", "--rotate", "--vacuum-time=3d"); verr != nil {
@@ -392,7 +392,7 @@ func (c *cyc) journaldIntegrity() {
 			logger().Info("base: journald silent — already restarted by the persistence converge this cycle")
 			return
 		}
-		if !r.rateOK("last-journald-restart", journaldRestartCooldown) {
+		if !r.state.RateOK("last-journald-restart", journaldRestartCooldown) {
 			logger().Warn("base: journald still writing no journal files — restart in cooldown, skipping",
 				"cooldown", journaldRestartCooldown.String())
 			return
@@ -403,7 +403,7 @@ func (c *cyc) journaldIntegrity() {
 		// Spend on the attempt: a failing restart retries no more
 		// than once per cooldown window.
 		r.ensureDir(watchdogStateDir, 0o755)
-		r.rateSpend("last-journald-restart")
+		r.state.RateSpend("last-journald-restart")
 		r.restartService(ctx, "systemd-journald.service")
 	}
 }

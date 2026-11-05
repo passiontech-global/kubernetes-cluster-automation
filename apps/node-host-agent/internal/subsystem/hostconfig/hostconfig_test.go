@@ -267,7 +267,7 @@ func TestRateSpendAtomicLatch(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(r.cfg.HostRoot, watchdogStateDir), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	r.rateSpend("last-test")
+	r.state.RateSpend("last-test")
 	b, err := os.ReadFile(filepath.Join(r.cfg.HostRoot, watchdogStateDir, "last-test"))
 	if err != nil || string(b) != "1700000000\n" {
 		t.Fatalf("latch content = %q err %v", b, err)
@@ -275,11 +275,11 @@ func TestRateSpendAtomicLatch(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(r.cfg.HostRoot, watchdogStateDir, ".tmp-last-test")); !os.IsNotExist(err) {
 		t.Fatal("staging tmp left behind")
 	}
-	if r.rateOK("last-test", time.Hour) {
-		t.Fatal("rateOK ignored a fresh latch")
+	if r.state.RateOK("last-test", time.Hour) {
+		t.Fatal("RateOK ignored a fresh latch")
 	}
-	if !r.rateOK("last-test", 0) {
-		t.Fatal("rateOK false on expired latch")
+	if !r.state.RateOK("last-test", 0) {
+		t.Fatal("RateOK false on expired latch")
 	}
 }
 
@@ -292,7 +292,7 @@ func TestRateSpendSweepsTmpOnRenameFailure(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(r.cfg.HostRoot, watchdogStateDir, "last-x"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	r.rateSpend("last-x")
+	r.state.RateSpend("last-x")
 	if _, err := os.Stat(filepath.Join(r.cfg.HostRoot, watchdogStateDir, ".tmp-last-x")); !os.IsNotExist(err) {
 		t.Fatal("staging tmp left behind after failed rename")
 	}

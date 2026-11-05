@@ -81,6 +81,8 @@ import (
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdrescue"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -251,7 +253,6 @@ const (
 	fileOOMKills      = "oomloop-kills"
 	fileOOMShielded   = "oomloop-shielded"
 	fileFeederLastRst = "last-restart" // under FeederStateDir
-	fileLastRun       = "last-run"     // per-cycle liveness stamp (BUG-H1)
 	// W8-CP3 (KCM/scheduler freeze auto-heal) + W8-CP4 (PKI reload
 	// drift) bookkeeping.
 	fileRateCPRestart  = "last-cp-restart"
@@ -270,13 +271,13 @@ const (
 	// for 2 consecutive cycles → restart the owning unit (1h budget).
 	defaultPKIDriftCycles     = 2
 	defaultPKIRestartInterval = time.Hour
-	// suspectLog dedupe budgets: last-suspect-<key> epoch files spent
-	// at most once per SuspectLogCadence — the same rateOK/last-*
-	// convention as the action budgets, applied to log noise.
-	// Latch-named keys are dropped by stateExit so a latch re-entry
-	// logs a fresh first line; logKeyDeadFallbk keys the dead-
-	// fallback hold lines, which have no dedicated latch.
-	fileSuspectLog   = "last-suspect-"
+	// suspectLog dedupe budgets: hoststate.SuspectBudgetPrefix+<key>
+	// epoch files spent at most once per SuspectLogCadence — the
+	// same rateOK/last-* convention as the action budgets, applied
+	// to log noise (h.state.SuspectLog). Latch-named keys are
+	// dropped by stateExit so a latch re-entry logs a fresh first
+	// line; logKeyDeadFallbk keys the dead-fallback hold lines,
+	// which have no dedicated latch.
 	logKeyDeadFallbk = "dead-fallback"
 	clkTck           = 100.0 // getconf CLK_TCK on x86_64 Linux
 	tcpStateListen   = "0A"
@@ -864,6 +865,11 @@ type Hygiene struct {
 	client *http.Client // mTLS client for rv probes; nil when creds absent
 	credFP string       // credential-file fingerprint the client was built from
 
+	// state is the shared hoststate Store — every state-*/last-*/
+	// consecutive-*/last-suspect-* file and the watchdog log append
+	// goes through it (the single lib.sh-parity implementation).
+	state *hoststate.Store
+
 	// feederOnce keeps the feeder single-flight: the agent
 	// supervisor re-invokes Run on the same ctx after a Cycle
 	// panic, and without it every restart stacks another feeder —
@@ -922,6 +928,11 @@ func ShouldRun(hostRoot string) bool {
 func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	cfg.applyDefaults()
 	h := &Hygiene{cfg: cfg}
+	// The Now closure must read h.cfg.nowFn at call time — tests
+	// re-stub the clock after New() and the store has to observe it
+	// (hoststate.Store.Now contract).
+	h.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
+		func() time.Time { return h.cfg.nowFn() }, logger)
 	h.journalReads = journalwatch.Tracker{
 		Needed: cfg.JournalUnreadableNeeded,
 		Dirs:   cfg.JournalDirs,
@@ -1013,7 +1024,7 @@ func (h *Hygiene) Run(ctx context.Context) {
 				// equivalence).
 				defer func() {
 					if r := recover(); r != nil {
-						h.appendLogWarn(fmt.Sprintf(
+						h.state.AppendLogWarn(fmt.Sprintf(
 							"feeder: PANIC %v — feeder dead, WATCHDOG=1 stops (agent kept alive)", r))
 					}
 				}()
@@ -1048,7 +1059,7 @@ func (h *Hygiene) runCycle(ctx context.Context) {
 	defer cancel()
 	h.Cycle(cctx)
 	if errors.Is(cctx.Err(), context.DeadlineExceeded) {
-		h.appendLogWarn(fmt.Sprintf(
+		h.state.AppendLogWarn(fmt.Sprintf(
 			"controllerhygiene: cycle deadline %s exceeded — "+
 				"stalled check(s) aborted", h.cfg.CycleTimeout))
 	}
@@ -1058,7 +1069,12 @@ func (h *Hygiene) runCycle(ctx context.Context) {
 // file gates everything (WD_REQUIRES: unit:k0scontroller). Each check
 // must never panic and degrades to no-op on missing files.
 func (h *Hygiene) Cycle(ctx context.Context) {
-	defer h.stampLastRun()
+	// BUG-H1: refresh <state>/last-run every cycle — the liveness
+	// stamp the watchdog-stalled alert reads (the alert keys on
+	// mtime, which the atomic rename refreshes each cycle).
+	// Deferred so even a gated/aborted cycle proves the loop is
+	// alive; Store.StampLastRun no-ops on an empty state dir.
+	defer h.state.StampLastRun()
 	if _, err := os.Stat(h.cfg.K0sControllerUnitFile); err != nil {
 		h.cycles.WithLabelValues("all", "gated").Inc()
 		return
@@ -1090,18 +1106,6 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	}
 	h.checkApiserverHub(ctx)
 	h.checkKineTTL(ctx)
-}
-
-// stampLastRun refreshes <state>/last-run every cycle — the liveness
-// stamp the watchdog-stalled alert reads (BUG-H1). Deferred so even a
-// gated/aborted cycle proves the loop is alive. The file carries the
-// epoch like every other bookkeeping file; the alert keys on mtime,
-// which writeEpochFile's atomic rename refreshes each cycle.
-func (h *Hygiene) stampLastRun() {
-	if h.cfg.WatchdogStateDir == "" {
-		return
-	}
-	h.writeEpochFile(filepath.Join(h.cfg.WatchdogStateDir, fileLastRun))
 }
 
 // refreshWatchdogConf re-applies the watchdogconf-derived knobs each
@@ -1260,172 +1264,27 @@ func (h *Hygiene) refreshWatchdogConf() {
 // consecutive-*   : consecutive-fail counters (on-disk parity — the
 //                   files are shared with still-deployed shell pieces)
 // watchdog log    : "<rfc3339> <msg>" appended to WatchdogLogFile
+//
+// The on-disk contract itself lives in platform/hoststate — h.state
+// is the single Store implementation of state_enter/state_exit,
+// rate_ok/rate_spend, ctr_inc/ctr_read/ctr_reset, suspectLog's
+// last-suspect-* budgets, the watchdog log append and the last-run
+// stamp. The per-subsystem copies that used to live here are gone;
+// what remains below is only what Store does not cover.
 
-// appendLog mirrors lib.sh log(): "<date -Is> <msg>" appended to the
-// watchdog log, plus a slog mirror for `kubectl logs` debugging.
-// Best-effort: an unwritable log file never fails a check.
-func (h *Hygiene) appendLog(msg string) {
-	logger().Info(msg)
-	h.writeLogFile(msg)
-}
-
-// appendLogWarn is appendLog for failure/degraded paths — the file
-// line is identical (NPD contract), the slog mirror is Warn-level.
-func (h *Hygiene) appendLogWarn(msg string) {
-	logger().Warn(msg)
-	h.writeLogFile(msg)
-}
-
-func (h *Hygiene) writeLogFile(msg string) {
-	f, err := os.OpenFile(h.cfg.WatchdogLogFile,
-		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		logger().Warn("controllerhygiene: watchdog log file unwritable",
-			"file", h.cfg.WatchdogLogFile, "error", err,
-		)
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s %s\n", h.cfg.nowFn().Format(time.RFC3339), msg)
-}
-
-func (h *Hygiene) statePath(name string) string {
-	return filepath.Join(h.cfg.WatchdogStateDir, "state-"+name)
-}
-
-// stateExists reports whether the latch file is present.
-func (h *Hygiene) stateExists(name string) bool {
-	_, err := os.Stat(h.statePath(name))
-	return err == nil
-}
-
-// writeEpochFile writes the current epoch via tmp+rename — the same
-// atomic-copy contract the watchdog prom files rely on. The leading
-// dot keeps the tmp name out of hostmetrics' state-* scan.
-func (h *Hygiene) writeEpochFile(path string) {
-	content := strconv.FormatInt(h.cfg.nowFn().Unix(), 10) + "\n"
-	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		logger().Warn("controllerhygiene: state file write failed",
-			"path", path, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		logger().Warn("controllerhygiene: state file install failed",
-			"path", path, "error", err)
-	}
-}
-
-// stateEnter creates state-<name> only when absent and logs the
-// transition once — lib.sh STATE-ENTER parity.
-func (h *Hygiene) stateEnter(name, extra string) {
-	p := h.statePath(name)
-	if _, err := os.Stat(p); err == nil {
-		// BUG-H6: the latch stays held — refresh its mtime so the
-		// janitor's 24h latch reap can't retire an active signal.
-		now := h.cfg.nowFn()
-		if cerr := os.Chtimes(p, now, now); cerr != nil {
-			logger().Debug("controllerhygiene: state latch touch failed",
-				"state", name, "path", p, "error", cerr)
-		}
-		return
-	}
-	h.writeEpochFile(p)
-	if _, err := os.Stat(p); err != nil {
-		return
-	}
-	if extra != "" {
-		h.appendLog(fmt.Sprintf("STATE-ENTER: %s %s", name, extra))
-	} else {
-		h.appendLog(fmt.Sprintf("STATE-ENTER: %s", name))
-	}
-}
-
-// stateExit removes state-<name> if present and logs the transition.
+// stateExit removes state-<name> if present and logs the
+// transition — the controllerhygiene divergence hoststate keeps
+// behind Store.Exit's cleanup hook: the latch's last-suspect-<name>
+// dedupe budget (hoststate.SuspectBudgetPrefix) is dropped with it,
+// so a later re-entry logs a fresh first line instead of staying
+// throttled by a stale epoch from the previous incident. The budget
+// dir is the Store's own — the same dir h.state.SuspectLog spent it
+// under.
 func (h *Hygiene) stateExit(name string) {
-	p := h.statePath(name)
-	if _, err := os.Stat(p); err != nil {
-		return
-	}
-	if err := os.Remove(p); err != nil {
-		logger().Warn("controllerhygiene: state latch remove failed",
-			"state", name, "path", p, "error", err,
-		)
-		return
-	}
-	// Drop the suspect-log dedupe budget with the latch — a later
-	// re-entry must log a fresh first line, not stay throttled by a
-	// stale epoch from the previous incident.
-	_ = os.Remove(filepath.Join(h.cfg.WatchdogStateDir, fileSuspectLog+name))
-	h.appendLog(fmt.Sprintf("STATE-EXIT: %s", name))
-}
-
-// readEpoch parses an epoch file — garbage/absent → 0 (rate_ok parity).
-func (h *Hygiene) readEpoch(path string) int64 {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0
-	}
-	v, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-	if err != nil {
-		return 0
-	}
-	return v
-}
-
-// rateOK reports whether the budget file is absent, unparseable, or
-// older than interval — lib.sh rate_ok parity.
-func (h *Hygiene) rateOK(dir, name string, interval time.Duration) bool {
-	last := h.readEpoch(filepath.Join(dir, name))
-	return h.cfg.nowFn().Unix()-last >= int64(interval.Seconds())
-}
-
-// rateSpend writes the current epoch to the budget file.
-func (h *Hygiene) rateSpend(dir, name string) {
-	h.writeEpochFile(filepath.Join(dir, name))
-}
-
-// suspectLog emits a suspect/hold line at most once per
-// SuspectLogCadence per key — a last-suspect-<key> epoch file under
-// the same rateOK/rateSpend convention as the action budgets. It
-// replaces the per-cycle appendLog for lines whose latch is already
-// held: the latch dedupes the ALERT and this dedupes the raw log
-// line to the same discipline (STATE-ENTER still announces the
-// transition; a cadence re-reminder keeps a long-held latch visible
-// in the tail). Counters, latches and metrics keep updating every
-// cycle — only the LOG line is throttled.
-func (h *Hygiene) suspectLog(key, msg string) {
-	if !h.rateOK(h.cfg.WatchdogStateDir, fileSuspectLog+key,
-		h.cfg.SuspectLogCadence) {
-		return
-	}
-	h.rateSpend(h.cfg.WatchdogStateDir, fileSuspectLog+key)
-	h.appendLog(msg)
-}
-
-// ctrInc mirrors lib.sh ctr_inc: read + increment + write + return.
-// Garbage → 1.
-func (h *Hygiene) ctrInc(name string) int {
-	p := filepath.Join(h.cfg.WatchdogStateDir, name)
-	n := int(h.readEpoch(p))
-	n++
-	content := strconv.Itoa(n) + "\n"
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-		logger().Warn("controllerhygiene: counter file write failed",
-			"path", p, "error", err)
-		return 0
-	}
-	return n
-}
-
-// ctrRead returns a consecutive-* file value (garbage/absent → 0).
-func (h *Hygiene) ctrRead(name string) int {
-	return int(h.readEpoch(filepath.Join(h.cfg.WatchdogStateDir, name)))
-}
-
-// ctrReset removes a consecutive-* file.
-func (h *Hygiene) ctrReset(name string) {
-	_ = os.Remove(filepath.Join(h.cfg.WatchdogStateDir, name))
+	h.state.Exit(name, func() {
+		_ = os.Remove(filepath.Join(h.state.Dir,
+			hoststate.SuspectBudgetPrefix+name))
+	})
 }
 
 // readState reads an arbitrary bookkeeping file under the state dir.
@@ -1467,17 +1326,10 @@ func (h *Hygiene) procFile(pid int, elems ...string) string {
 	return filepath.Join(parts...)
 }
 
-// uptimeSeconds parses <ProcRoot>/uptime.
+// uptimeSeconds parses <ProcRoot>/uptime — hostutil's shared
+// /proc/uptime reader.
 func (h *Hygiene) uptimeSeconds() (float64, error) {
-	data, err := os.ReadFile(filepath.Join(h.cfg.ProcRoot, "uptime"))
-	if err != nil {
-		return 0, err
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) == 0 {
-		return 0, fmt.Errorf("empty uptime")
-	}
-	return strconv.ParseFloat(fields[0], 64)
+	return hostutil.UptimeSeconds(filepath.Join(h.cfg.ProcRoot, "uptime"))
 }
 
 var pidDirRe = regexp.MustCompile(`^[0-9]+$`)
@@ -1624,7 +1476,7 @@ func (h *Hygiene) journalText(ctx context.Context, since time.Time) string {
 	out, err := h.cfg.journalFn(ctx, h.cfg.JournalUnit, since)
 	h.noteJournalRead(ctx, out, err)
 	if err != nil {
-		h.appendLogWarn(fmt.Sprintf(
+		h.state.AppendLogWarn(fmt.Sprintf(
 			"controllerhygiene: journal read failed (unit=%s): %v — journal checks see 0 hits",
 			h.cfg.JournalUnit, err))
 		return ""
@@ -1673,18 +1525,18 @@ func (h *Hygiene) noteJournalRead(ctx context.Context, out string, err error) {
 	// and `enter` won't fire twice per episode — without this the
 	// latch/metric/condition go dark mid-episode.
 	if enter || (h.journalReads.Latched() &&
-		!h.stateExists(stateJournalUnreadable)) {
-		h.stateEnter(stateJournalUnreadable, detail)
+		!h.state.Exists(stateJournalUnreadable)) {
+		h.state.Enter(stateJournalUnreadable, detail)
 		if enter {
 			h.cycles.WithLabelValues(checkJournal, "journal_unreadable").Inc()
 		}
 	}
 	if !ok && h.journalReads.Latched() {
-		h.suspectLog(stateJournalUnreadable, fmt.Sprintf(
+		h.state.SuspectLog(stateJournalUnreadable, fmt.Sprintf(
 			"suspect: journal-unreadable %s — %d consecutive journal "+
 				"reads produced nothing while journal storage exists; "+
 				"every journal-grep check is blind",
-			detail, h.journalReads.Fails()))
+			detail, h.journalReads.Fails()), h.cfg.SuspectLogCadence)
 	}
 	if exit {
 		h.stateExit(stateJournalUnreadable)
@@ -1830,7 +1682,7 @@ func (h *Hygiene) ensureClient() *http.Client {
 	}
 	c, err := h.buildClient()
 	if err != nil {
-		h.appendLogWarn(fmt.Sprintf(
+		h.state.AppendLogWarn(fmt.Sprintf(
 			"controllerhygiene: apiserver credential load failed: %v — wedge checks blind this cycle",
 			err))
 		return nil
@@ -1908,7 +1760,7 @@ func (h *Hygiene) loadCreds() (cert, key, ca []byte, err error) {
 				// blind-cycle no_creds result stays attributable.
 				ref := resolveRel(h.cfg.AdminKubeconfig, a.ClientCertificate)
 				if b, rerr := os.ReadFile(ref); rerr != nil {
-					h.appendLogWarn(fmt.Sprintf(
+					h.state.AppendLogWarn(fmt.Sprintf(
 						"controllerhygiene: kubeconfig client-cert %s unreadable: %v",
 						ref, rerr))
 				} else {
@@ -1920,7 +1772,7 @@ func (h *Hygiene) loadCreds() (cert, key, ca []byte, err error) {
 			} else if a.ClientKey != "" {
 				ref := resolveRel(h.cfg.AdminKubeconfig, a.ClientKey)
 				if b, rerr := os.ReadFile(ref); rerr != nil {
-					h.appendLogWarn(fmt.Sprintf(
+					h.state.AppendLogWarn(fmt.Sprintf(
 						"controllerhygiene: kubeconfig client-key %s unreadable: %v",
 						ref, rerr))
 				} else {
@@ -2060,7 +1912,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	if err != nil {
 		// etcd unreachable — nothing measurable; the wedge/feeder
 		// guards own the control-plane-down story.
-		h.appendLogWarn(fmt.Sprintf(
+		h.state.AppendLogWarn(fmt.Sprintf(
 			"etcdguard: endpoint status failed (endpoint=%s): %v — quota check skipped",
 			h.cfg.EtcdEndpoint, err))
 		h.cycles.WithLabelValues(checkEtcd, "status_error").Inc()
@@ -2084,7 +1936,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 			// treat the size signal as authoritative this cycle,
 			// surface the error once in the log, and LEAVE the
 			// gauge at its last value.
-			h.appendLogWarn(fmt.Sprintf("etcdguard: alarm list failed: %v", aerr))
+			h.state.AppendLogWarn(fmt.Sprintf("etcdguard: alarm list failed: %v", aerr))
 		} else if ns {
 			nospace = true
 			h.etcdNospace.Set(1)
@@ -2104,20 +1956,21 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 		return
 	}
 
-	if !h.rateOK(h.cfg.WatchdogStateDir, fileRateEtcdGuard,
+	if !h.state.RateOK(fileRateEtcdGuard,
 		h.cfg.EtcdGuardMinRun) {
-		h.suspectLog(checkEtcd, fmt.Sprintf(
+		h.state.SuspectLog(checkEtcd, fmt.Sprintf(
 			"etcdguard: %s but in guard cooldown (<%dm), skip",
-			reason, int(h.cfg.EtcdGuardMinRun.Minutes())))
+			reason, int(h.cfg.EtcdGuardMinRun.Minutes())),
+			h.cfg.SuspectLogCadence)
 		h.cycles.WithLabelValues(checkEtcd, "cooldown").Inc()
 		return
 	}
-	h.appendLog(fmt.Sprintf(
+	h.state.AppendLog(fmt.Sprintf(
 		"ACTION: etcdguard %s — evpurge stale events + ONLINE-ONLY "+
 			"etcd rescue (offline defrag forbidden)", reason))
 	// Budget spent before the action — a kill mid-rescue must not
 	// allow a second run inside the window (feeder G6 parity).
-	h.rateSpend(h.cfg.WatchdogStateDir, fileRateEtcdGuard)
+	h.state.RateSpend(fileRateEtcdGuard)
 	out := &guardLogWriter{h: h}
 
 	// The whole remediation runs under a bounded ctx: evpurge is
@@ -2144,7 +1997,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	if perr != nil {
 		// Logged on its own — a purge miss does NOT fail the cycle
 		// when the quota-remediating step still lands below.
-		h.appendLogWarn(fmt.Sprintf("etcdguard: evpurge failed: %v", perr))
+		h.state.AppendLogWarn(fmt.Sprintf("etcdguard: evpurge failed: %v", perr))
 	}
 	// remediated tracks the step that actually relieves the quota:
 	// the online rescue (compact+defrag). evpurge only drops event
@@ -2172,7 +2025,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 		}, out)
 		out.flush()
 		if rerr != nil {
-			h.appendLogWarn(fmt.Sprintf("etcdguard: rescue incomplete: %v", rerr))
+			h.state.AppendLogWarn(fmt.Sprintf("etcdguard: rescue incomplete: %v", rerr))
 		}
 		remediated = rerr == nil
 	} else {
@@ -2181,7 +2034,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 		remediated = false
 	}
 	if errors.Is(gctx.Err(), context.DeadlineExceeded) {
-		h.appendLogWarn(fmt.Sprintf(
+		h.state.AppendLogWarn(fmt.Sprintf(
 			"etcdguard: run budget (%s) exhausted — remaining steps "+
 				"deferred to the next %s window",
 			defaultEtcdGuardBudget, h.cfg.EtcdGuardMinRun))
@@ -2245,7 +2098,7 @@ func (w *guardLogWriter) Write(p []byte) (int, error) {
 			return len(p), nil
 		}
 		if line := strings.TrimSpace(s[:i]); line != "" {
-			w.h.appendLog("etcdguard: " + line)
+			w.h.state.AppendLog("etcdguard: " + line)
 		}
 		w.buf.Reset()
 		w.buf.WriteString(s[i+1:])
@@ -2256,7 +2109,7 @@ func (w *guardLogWriter) Write(p []byte) (int, error) {
 // so a stream ending without '\n' still reaches the log.
 func (w *guardLogWriter) flush() {
 	if line := strings.TrimSpace(w.buf.String()); line != "" {
-		w.h.appendLog("etcdguard: " + line)
+		w.h.state.AppendLog("etcdguard: " + line)
 	}
 	w.buf.Reset()
 }

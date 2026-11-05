@@ -317,7 +317,7 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 	reason := ""
 	switch {
 	case !kcmOK || !schedOK:
-		n := h.ctrInc(fileCtrCPFreeze)
+		n := h.state.Incr(fileCtrCPFreeze)
 		if n >= h.cfg.CPFreezeCycles {
 			frozen = true
 			reason = fmt.Sprintf("healthz dead %dx (kcm=%v sched=%v)",
@@ -327,7 +327,7 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 			return
 		}
 	default:
-		h.ctrReset(fileCtrCPFreeze)
+		h.state.ResetCounter(fileCtrCPFreeze)
 	}
 
 	// Leader-with-a-stalled-workqueue is an OR-condition: even with
@@ -350,7 +350,7 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 		if stalled {
 			if h.kcmQuietSince.IsZero() {
 				h.kcmQuietSince = h.cfg.nowFn()
-				h.ctrInc(fileCtrKCMQuiet)
+				h.state.Incr(fileCtrKCMQuiet)
 			}
 			if h.cfg.nowFn().Sub(h.kcmQuietSince) >= h.cfg.CPFreezeQuietFor {
 				frozen = true
@@ -359,7 +359,7 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 			}
 		} else {
 			h.kcmQuietSince = time.Time{}
-			h.ctrReset(fileCtrKCMQuiet)
+			h.state.ResetCounter(fileCtrKCMQuiet)
 		}
 	}
 
@@ -368,41 +368,42 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 		h.cycles.WithLabelValues(checkCPFreeze, "ok").Inc()
 		return
 	}
-	h.stateEnter(stateCPComponentFrozen, reason)
+	h.state.Enter(stateCPComponentFrozen, reason)
 	// Gate: the peer apiserver must still answer — otherwise the
 	// outage is bigger than a frozen component and the wedge guard
 	// owns the restart story.
 	if !h.peerHealthy(ctx) {
-		h.suspectLog(stateCPComponentFrozen, fmt.Sprintf(
+		h.state.SuspectLog(stateCPComponentFrozen, fmt.Sprintf(
 			"suspect: cp-component-frozen %s but peer apiserver unhealthy — wedge guard owns this, skip",
-			reason))
+			reason), h.cfg.SuspectLogCadence)
 		h.cycles.WithLabelValues(checkCPFreeze, "gated").Inc()
 		return
 	}
-	if !h.rateOK(h.cfg.WatchdogStateDir, fileRateCPRestart,
+	if !h.state.RateOK(fileRateCPRestart,
 		h.cfg.CPFreezeMinRestart) {
-		h.suspectLog(stateCPComponentFrozen, fmt.Sprintf(
+		h.state.SuspectLog(stateCPComponentFrozen, fmt.Sprintf(
 			"suspect: cp-component-frozen %s but in restart cooldown (<%dm), skip",
-			reason, int(h.cfg.CPFreezeMinRestart.Minutes())))
+			reason, int(h.cfg.CPFreezeMinRestart.Minutes())),
+			h.cfg.SuspectLogCadence)
 		h.cycles.WithLabelValues(checkCPFreeze, "cooldown").Inc()
 		return
 	}
 	switch h.cfg.Sig13Mode {
 	case ModeEnforce:
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"ACTION: restarting k0scontroller - cp-component-frozen %s",
 			reason))
-		h.rateSpend(h.cfg.WatchdogStateDir, fileRateCPRestart)
-		h.ctrReset(fileCtrCPFreeze)
-		h.ctrReset(fileCtrKCMQuiet)
+		h.state.RateSpend(fileRateCPRestart)
+		h.state.ResetCounter(fileCtrCPFreeze)
+		h.state.ResetCounter(fileCtrKCMQuiet)
 		h.kcmQuietSince = time.Time{}
 		if err := h.cfg.restartFn(ctx, h.cfg.RestartUnit); err != nil {
-			h.appendLogWarn(fmt.Sprintf(
+			h.state.AppendLogWarn(fmt.Sprintf(
 				"suspect: restart %s failed: %v", h.cfg.RestartUnit, err))
 		}
 		h.actions.WithLabelValues(checkCPFreeze, "restart_controller").Inc()
 	case ModeDryRun:
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"DRY-RUN: would restart k0scontroller - cp-component-frozen %s",
 			reason))
 		h.actions.WithLabelValues(checkCPFreeze, "dryrun_restart").Inc()

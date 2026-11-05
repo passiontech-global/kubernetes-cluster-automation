@@ -69,7 +69,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -79,6 +78,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -1144,25 +1144,12 @@ func dashedIP(addr string) string {
 	return strings.ReplaceAll(host, ".", "-")
 }
 
-// writeFileAtomic writes path via tmp+rename — the same atomic-copy
-// contract the watchdog prom files rely on (no torn reads mid-write).
-// The tmp name deliberately breaks the state-*/apibe-gap-* prefixes —
-// hostmetrics scans the dir for state-* files and a
-// "state-foo-<ip>.tmp" would surface as a phantom watchdog_state
-// series ("<ip>.tmp") that then persists at 0 forever.
-func writeFileAtomic(path string, data []byte) error {
-	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
 // writeGapFile records the last measured rv gap for prom_emit.
 // Best-effort: a write failure is logged, never fatal.
 func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
 	f := dir + "/apibe-gap-" + dashedIP(b.Addr)
-	if err := writeFileAtomic(f, []byte(strconv.FormatInt(gap, 10)+"\n")); err != nil {
+	if err := hostutil.WriteFileAtomicBytes(f,
+		[]byte(strconv.FormatInt(gap, 10)+"\n")); err != nil {
 		logger().Warn("watchdog gap file write failed",
 			"file", f, "backend", b.Name, "error", err,
 		)
@@ -1176,7 +1163,7 @@ func (p *Prober) latchStale(dir string, b backend) {
 	if _, err := os.Stat(f); err == nil {
 		return
 	}
-	if err := writeFileAtomic(f,
+	if err := hostutil.WriteFileAtomicBytes(f,
 		[]byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n")); err != nil {
 		logger().Warn("watchdog stale latch write failed",
 			"file", f, "backend", b.Name, "error", err,

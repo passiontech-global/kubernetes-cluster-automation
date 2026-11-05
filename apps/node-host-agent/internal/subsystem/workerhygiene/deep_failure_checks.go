@@ -81,7 +81,7 @@ func (h *Hygiene) checkContainerdHealth(ctx context.Context,
 	if journalFn != nil {
 		out, err := journalFn(ctx)
 		if err != nil {
-			h.appendLog(fmt.Sprintf(
+			h.state.AppendLog(fmt.Sprintf(
 				"suspect: containerd-meta journal probe failed: %v — journal half inconclusive",
 				err))
 		} else if m := ctrMetaCorruptRe.FindString(out); m != "" {
@@ -96,15 +96,15 @@ func (h *Hygiene) checkContainerdHealth(ctx context.Context,
 	}
 	if evidence != "" {
 		h.ctrMetaFails++
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"suspect: containerd meta.db corruption evidence (%s) — run %d/%d",
 			evidence, h.ctrMetaFails, h.cfg.ConsecNeeded))
 		if h.ctrMetaFails >= h.cfg.ConsecNeeded {
-			h.stateEnter("containerd-corrupt", evidence)
+			h.state.Enter("containerd-corrupt", evidence)
 		}
 	} else {
 		h.ctrMetaFails = 0
-		h.stateExit("containerd-corrupt")
+		h.state.Exit("containerd-corrupt", nil)
 	}
 	h.cycles.WithLabelValues(checkCtrMeta, "ok").Inc()
 }
@@ -218,7 +218,7 @@ func (h *Hygiene) checkHostOOMVictims(ctx context.Context) {
 		content := strconv.FormatInt(count, 10) + " " +
 			strconv.FormatInt(epoch, 10) + "\n"
 		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-			h.appendLog(fmt.Sprintf(
+			h.state.AppendLog(fmt.Sprintf(
 				"suspect: host-oom dedup marker write failed: %v", err))
 		}
 	}
@@ -264,11 +264,11 @@ func (h *Hygiene) emitOOMEvent(ctx context.Context, comm string,
 	}
 	if _, err := h.cfg.Client.EventsV1().Events(h.cfg.EventNamespace).
 		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"suspect: SystemOOMVictim event create failed: %v", err))
 		return
 	}
-	h.appendLog(fmt.Sprintf(
+	h.state.AppendLog(fmt.Sprintf(
 		"ACTION: SystemOOMVictim event — host-level OOM kill victim=%s delta=%d total=%d",
 		comm, delta, total))
 }
@@ -314,7 +314,7 @@ func (h *Hygiene) checkOrphanedHostPathVolumes(ctx context.Context,
 	if pvs, err := h.cfg.Client.CoreV1().PersistentVolumes().
 		List(ctx, metav1.ListOptions{}); err != nil {
 		apiOK = false
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"suspect: orphan-hostpath PV list failed: %v — removal half inconclusive",
 			err))
 	} else {
@@ -346,16 +346,16 @@ func (h *Hygiene) checkOrphanedHostPathVolumes(ctx context.Context,
 		}
 		if ok, why := orphanHPRemovable(cd.path); ok {
 			if rerr := os.RemoveAll(cd.path); rerr != nil {
-				h.appendLog(fmt.Sprintf(
+				h.state.AppendLog(fmt.Sprintf(
 					"suspect: orphan-hostpath remove %s failed: %v", cd.path, rerr))
 			} else {
-				h.appendLog(fmt.Sprintf(
+				h.state.AppendLog(fmt.Sprintf(
 					"ACTION: removed orphaned hostpath volume dir %s (%s, %d bytes)",
 					cd.path, why, size))
 				h.actions.WithLabelValues(checkOrphanHP, "rm_dir").Inc()
 			}
 		} else {
-			h.appendLog(fmt.Sprintf(
+			h.state.AppendLog(fmt.Sprintf(
 				"suspect: orphan hostpath %s holds data (%s, %d bytes) — left in place",
 				cd.path, why, size))
 		}
@@ -434,7 +434,7 @@ func (h *Hygiene) promTextfileDir() string {
 func (h *Hygiene) writeNodeAgentPromTextfile() {
 	dir := h.promTextfileDir()
 	fail := func(err error) {
-		h.appendLog(fmt.Sprintf(
+		h.state.AppendLog(fmt.Sprintf(
 			"suspect: node-agent prom textfile unwritable (dir=%s): %v", dir, err))
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {

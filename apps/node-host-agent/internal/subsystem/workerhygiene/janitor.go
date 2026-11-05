@@ -47,6 +47,7 @@ package workerhygiene
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -56,6 +57,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
@@ -297,6 +299,7 @@ func (c *JanitorConfig) applyDefaults() {
 // Janitor runs the state-dir + systemd ghost sweeps on one ticker.
 type Janitor struct {
 	cfg     JanitorConfig
+	state   *hoststate.Store       // shared watchdog-state contract (log appends)
 	cycles  *prometheus.CounterVec // check, result
 	actions *prometheus.CounterVec // check, action
 }
@@ -305,6 +308,13 @@ type Janitor struct {
 func NewJanitor(cfg JanitorConfig, reg prometheus.Registerer) (*Janitor, error) {
 	cfg.applyDefaults()
 	j := &Janitor{cfg: cfg}
+	// Now closes over the live config field — tests re-stub
+	// j.cfg.nowFn after NewJanitor returns (hoststate.New doc).
+	// The Log func keeps the "subsystem"="janitor" slog attr the old
+	// appendLog attached to every mirror line.
+	j.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
+		func() time.Time { return j.cfg.nowFn() },
+		func() *slog.Logger { return logger().With("subsystem", "janitor") })
 	j.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_janitor_cycles_total",
 		Help: "Janitor sweep cycles by check and result (ok|abort|gated).",
@@ -358,19 +368,6 @@ func (j *Janitor) Sweep(ctx context.Context) {
 	j.sweepIPMonitors()
 }
 
-// appendLog mirrors workerhygiene's: "<rfc3339> <msg>" to the
-// watchdog log (NPD filelog contract) plus a slog mirror.
-func (j *Janitor) appendLog(msg string) {
-	logger().Info(msg, "subsystem", "janitor")
-	f, err := os.OpenFile(j.cfg.WatchdogLogFile,
-		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s %s\n", j.cfg.nowFn().Format(time.RFC3339), msg)
-}
-
 // --- A: stale state-latch reaper ---
 
 // sweepLatches removes state-* files past LatchMaxAge — known latch
@@ -382,7 +379,7 @@ func (j *Janitor) sweepLatches() {
 	entries, err := os.ReadDir(j.cfg.WatchdogStateDir)
 	if err != nil {
 		j.cycles.WithLabelValues(checkLatchReaper, "abort").Inc()
-		j.appendLog(fmt.Sprintf(
+		j.state.AppendLog(fmt.Sprintf(
 			"janitor: state dir %s unreadable: %v — latch sweep skipped",
 			j.cfg.WatchdogStateDir, err))
 		return
@@ -394,7 +391,7 @@ func (j *Janitor) sweepLatches() {
 			continue
 		}
 		if e.IsDir() {
-			j.appendLog(fmt.Sprintf(
+			j.state.AppendLog(fmt.Sprintf(
 				"suspect: state dir entry %s is a directory — skipped", e.Name()))
 			continue
 		}
@@ -416,11 +413,11 @@ func (j *Janitor) sweepLatches() {
 		}
 		p := filepath.Join(j.cfg.WatchdogStateDir, e.Name())
 		if err := os.Remove(p); err != nil {
-			j.appendLog(fmt.Sprintf(
+			j.state.AppendLog(fmt.Sprintf(
 				"suspect: rm stale latch %s failed: %v", e.Name(), err))
 			continue
 		}
-		j.appendLog(fmt.Sprintf(
+		j.state.AppendLog(fmt.Sprintf(
 			"ACTION: reaped stale latch %s (age=%.1fh, rule=%s)",
 			e.Name(), age.Hours(), rule))
 		j.actions.WithLabelValues(checkLatchReaper, "reap").Inc()
@@ -444,7 +441,7 @@ func (j *Janitor) sweepLegacyUnits(ctx context.Context) {
 		"--all", "--no-legend", "--no-pager", "--plain")
 	if err != nil {
 		j.cycles.WithLabelValues(checkLegacyUnits, "abort").Inc()
-		j.appendLog(fmt.Sprintf(
+		j.state.AppendLog(fmt.Sprintf(
 			"janitor: systemctl list-units failed: %v (%s)",
 			err, strings.TrimSpace(out)))
 		return
@@ -468,12 +465,12 @@ func (j *Janitor) sweepLegacyUnits(ctx context.Context) {
 			// clear any residual failure state.
 			if sout, serr := j.cfg.Systemd.Exec(ctx,
 				"systemctl", "stop", unit); serr != nil {
-				j.appendLog(fmt.Sprintf(
+				j.state.AppendLog(fmt.Sprintf(
 					"suspect: stop ghost unit %s failed: %v (%s)",
 					unit, serr, strings.TrimSpace(sout)))
 				continue
 			}
-			j.appendLog(fmt.Sprintf(
+			j.state.AppendLog(fmt.Sprintf(
 				"ACTION: stopped ghost unit %s (load=%s active=%s)",
 				unit, load, active))
 			j.actions.WithLabelValues(checkLegacyUnits, "stop").Inc()
@@ -486,12 +483,12 @@ func (j *Janitor) sweepLegacyUnits(ctx context.Context) {
 func (j *Janitor) resetFailedUnit(ctx context.Context, unit, load, active string) {
 	if out, err := j.cfg.Systemd.Exec(ctx,
 		"systemctl", "reset-failed", unit); err != nil {
-		j.appendLog(fmt.Sprintf(
+		j.state.AppendLog(fmt.Sprintf(
 			"suspect: reset-failed %s failed: %v (%s)",
 			unit, err, strings.TrimSpace(out)))
 		return
 	}
-	j.appendLog(fmt.Sprintf(
+	j.state.AppendLog(fmt.Sprintf(
 		"ACTION: reset-failed ghost unit %s (load=%s active=%s)",
 		unit, load, active))
 	j.actions.WithLabelValues(checkLegacyUnits, "reset_failed").Inc()
@@ -512,7 +509,7 @@ func (j *Janitor) sweepIPMonitors() {
 		cmdline := strings.Join(argv, " ")
 		ppid, ok := j.procPPID(pid)
 		if !ok {
-			j.appendLog(fmt.Sprintf(
+			j.state.AppendLog(fmt.Sprintf(
 				"suspect: ip monitor pid=%d (%s) — ppid unreadable, skipping",
 				pid, cmdline))
 			continue
@@ -526,30 +523,30 @@ func (j *Janitor) sweepIPMonitors() {
 		case parent == "":
 			// Parent exited mid-scan — the kernel reparents the
 			// monitor to init; the NEXT sweep reaps it as ppid==1.
-			j.appendLog(fmt.Sprintf(
+			j.state.AppendLog(fmt.Sprintf(
 				"suspect: ip monitor pid=%d ppid=%d vanished mid-scan — skipping",
 				pid, ppid))
 		case strings.Contains(parent, "node-host-agent"):
 			// Should be impossible (the guard is in-process) — if a
 			// future agent ever forks a monitor, this stays hands-off.
-			j.appendLog(fmt.Sprintf(
+			j.state.AppendLog(fmt.Sprintf(
 				"suspect: ip monitor pid=%d parented by agent pid=%d — skipping",
 				pid, ppid))
 		case isLegacyProcCmdline(parent):
 			// Retired script still looping (e.g. the unit was torn
 			// down but the shell survived): kill the loop first so
 			// the monitor can't be respawned, then the monitor.
-			j.appendLog(fmt.Sprintf(
+			j.state.AppendLog(fmt.Sprintf(
 				"ACTION: kill legacy script pid=%d (%s)", ppid, parent))
 			if err := j.cfg.killFn(ppid, syscall.SIGKILL); err != nil {
-				j.appendLog(fmt.Sprintf(
+				j.state.AppendLog(fmt.Sprintf(
 					"suspect: kill legacy script pid=%d failed: %v", ppid, err))
 			}
 			j.actions.WithLabelValues(checkIPMonitor, "kill").Inc()
 			j.killIPMonitor(pid, cmdline,
 				fmt.Sprintf("legacy parent pid=%d", ppid))
 		default:
-			j.appendLog(fmt.Sprintf(
+			j.state.AppendLog(fmt.Sprintf(
 				"suspect: ip monitor pid=%d has non-legacy parent pid=%d (%s) — skipping",
 				pid, ppid, parent))
 		}
@@ -558,11 +555,11 @@ func (j *Janitor) sweepIPMonitors() {
 }
 
 func (j *Janitor) killIPMonitor(pid int, cmdline, why string) {
-	j.appendLog(fmt.Sprintf(
+	j.state.AppendLog(fmt.Sprintf(
 		"ACTION: killed orphan ip monitor pid=%d (%s) cmdline=%q",
 		pid, why, cmdline))
 	if err := j.cfg.killFn(pid, syscall.SIGKILL); err != nil {
-		j.appendLog(fmt.Sprintf(
+		j.state.AppendLog(fmt.Sprintf(
 			"suspect: kill orphan ip monitor pid=%d failed: %v", pid, err))
 	}
 	j.actions.WithLabelValues(checkIPMonitor, "kill").Inc()
@@ -605,7 +602,7 @@ func isLegacyProcCmdline(cmdline string) bool {
 func (j *Janitor) procPIDs() []int {
 	entries, err := os.ReadDir(j.cfg.ProcRoot)
 	if err != nil {
-		j.appendLog(fmt.Sprintf(
+		j.state.AppendLog(fmt.Sprintf(
 			"janitor: proc root %s unreadable: %v — ip monitor sweep skipped",
 			j.cfg.ProcRoot, err))
 		return nil

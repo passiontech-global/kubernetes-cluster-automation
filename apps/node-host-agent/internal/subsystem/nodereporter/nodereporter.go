@@ -43,6 +43,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
@@ -173,6 +174,13 @@ func (c *Config) applyDefaults() {
 type Reporter struct {
 	cfg Config
 
+	// state is the shared watchdog-state contract handle (hoststate):
+	// the one-time installed/last-run seed and the state-<key> latch
+	// paths. The reporter never APPENDS to the watchdog log (it only
+	// tails WatchdogLogFile for events) so LogFile stays "". Now is a
+	// closure over r.cfg.nowFn — tests re-stub the clock after New().
+	state *hoststate.Store
+
 	// NPD-compatible metric names — PrometheusRules query these exact
 	// series (problem_gauge{type=...} == 1, increase(problem_counter{reason=...})).
 	problemGauge   *prometheus.GaugeVec   // labels: type, reason
@@ -224,6 +232,8 @@ func New(cfg Config, reg prometheus.Registerer) (*Reporter, error) {
 		return nil, fmt.Errorf("nodereporter: NodeName is required")
 	}
 	r := &Reporter{cfg: cfg, emittedEvts: map[string]*emittedEvent{}}
+	r.state = hoststate.New(cfg.WatchdogStateDir, "",
+		func() time.Time { return r.cfg.nowFn() }, logger)
 
 	r.problemGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "problem_gauge",
@@ -284,7 +294,23 @@ func (r *Reporter) Cycle(ctx context.Context) {
 	// INITIALIZES the pair when absent (new envs and unit tests
 	// where no hygiene subsystem has run yet).
 	if !r.heartbeatInit {
-		if err := r.initHeartbeatFiles(); err != nil {
+		// initHeartbeatFiles seeds the installed/last-run pair ONCE —
+		// only for files that don't already exist (BUG-H1). The shell
+		// watchdog's prom_emit trap owned the periodic last-run
+		// refresh; on agent nodes the hygiene Cycle()s
+		// (workerhygiene/controllerhygiene/nethealth) own it now. The
+		// reporter still needs the pair on a fresh state dir — a
+		// missing `installed` disables the staleness gate entirely
+		// and a missing `last-run` reads as epoch 0 — so it
+		// initializes them at startup for new envs and unit tests
+		// where no hygiene subsystem has run yet.
+		//
+		// `installed` is created only when absent (ansible force:false
+		// parity — presence activates the probe's gate, content is the
+		// baseline epoch used when last-run doesn't exist yet);
+		// `last-run` is likewise created only when absent, atomically
+		// via tmp+rename so a reader never observes a truncated epoch.
+		if err := r.state.InitHeartbeatFiles(); err != nil {
 			logger().Error("nodereporter: watchdog heartbeat init failed",
 				"node", r.cfg.NodeName, "dir", r.cfg.WatchdogStateDir, "error", err)
 			ok = false

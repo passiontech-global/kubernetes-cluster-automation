@@ -76,7 +76,7 @@ func (h *Hygiene) checkKineStorageHealth(ctx context.Context) {
 		h.cycles.WithLabelValues(checkKineStorage, "ok").Inc()
 		return
 	}
-	if !h.rateOK(h.cfg.WatchdogStateDir, fileRateKineCheckpoint,
+	if !h.state.RateOK(fileRateKineCheckpoint,
 		kineWALCheckpointCooldown) {
 		h.cycles.WithLabelValues(checkKineStorage, "checkpoint_cooldown").Inc()
 		return
@@ -88,15 +88,15 @@ func (h *Hygiene) checkKineStorageHealth(ctx context.Context) {
 		// cooldown so a later install still gets the checkpoint.
 		h.cycles.WithLabelValues(checkKineStorage, "no_sqlite3").Inc()
 	case err != nil:
-		h.rateSpend(h.cfg.WatchdogStateDir, fileRateKineCheckpoint)
-		h.appendLogWarn(fmt.Sprintf(
+		h.state.RateSpend(fileRateKineCheckpoint)
+		h.state.AppendLogWarn(fmt.Sprintf(
 			"suspect: kine wal=%.0fMiB > %dMiB but wal_checkpoint failed: %v",
 			float64(walBytes)/(1<<20),
 			kineWALCheckpointMinBytes>>20, err))
 		h.cycles.WithLabelValues(checkKineStorage, "checkpoint_fail").Inc()
 	default:
-		h.rateSpend(h.cfg.WatchdogStateDir, fileRateKineCheckpoint)
-		h.appendLog(fmt.Sprintf(
+		h.state.RateSpend(fileRateKineCheckpoint)
+		h.state.AppendLog(fmt.Sprintf(
 			"ACTION: kine wal_checkpoint(TRUNCATE) — state.db-wal %.0fMiB > %dMiB",
 			float64(walBytes)/(1<<20), kineWALCheckpointMinBytes>>20))
 		h.actions.WithLabelValues(checkKineStorage, "wal_checkpoint").Inc()

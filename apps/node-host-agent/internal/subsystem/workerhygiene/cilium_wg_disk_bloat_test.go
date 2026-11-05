@@ -83,7 +83,7 @@ func TestCheckCiliumWGPeers(t *testing.T) {
 	if !found {
 		t.Fatalf("second cycle: kills = %v, want SIGKILL on 4242", e.kills)
 	}
-	if !e.h.stateExists("cilium-wg-peer-wipe") {
+	if !e.h.state.Exists("cilium-wg-peer-wipe") {
 		t.Fatal("state-cilium-wg-peer-wipe not latched")
 	}
 	logData, _ := os.ReadFile(e.h.cfg.WatchdogLogFile)
@@ -156,7 +156,7 @@ func TestCheckDiskBloatEvicts(t *testing.T) {
 		},
 	}
 	e.h.checkDiskBloat(context.Background(), []corev1.Pod{pod}, true, true)
-	if !e.h.stateExists("disk-bloat") {
+	if !e.h.state.Exists("disk-bloat") {
 		t.Fatal("state-disk-bloat not latched")
 	}
 	if _, err := e.cs.CoreV1().Pods("app").Get(
@@ -185,7 +185,7 @@ func TestCheckDiskBloatSystemPodSafe(t *testing.T) {
 		Name: "sys-hog", Namespace: "kube-system", UID: types.UID("uid-sys"),
 	}}
 	e.h.checkDiskBloat(context.Background(), []corev1.Pod{pod}, true, true)
-	if !e.h.stateExists("disk-bloat") {
+	if !e.h.state.Exists("disk-bloat") {
 		t.Fatal("state-disk-bloat not latched")
 	}
 	if _, err := e.cs.CoreV1().Pods("kube-system").Get(

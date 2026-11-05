@@ -194,12 +194,12 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 		st.mtuFails++
 		fails := st.mtuFails
 		st.mu.Unlock()
-		n.suspectLog("nebula-mtu-blackhole", fmt.Sprintf(
+		n.state.SuspectLog("nebula-mtu-blackhole", fmt.Sprintf(
 			"suspect: nebula-mtu-blackhole df_probe_failed peer=%s size=%s (check %d/%d): %v (%s)",
 			peer, mtuDFSize, fails, mtuBlackholeNeeded, err,
-			trimRunErr(out)))
+			trimRunErr(out)), suspectLogCadence)
 		if fails >= mtuBlackholeNeeded {
-			n.stateEnter("nebula-mtu-blackhole",
+			n.state.Enter("nebula-mtu-blackhole",
 				fmt.Sprintf("peer=%s df_size=%s", peer, mtuDFSize))
 			n.maybeClampNebulaMSS(ctx, wd, st)
 		}
@@ -243,13 +243,13 @@ func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 			"--tcp-flags", "SYN,RST", "SYN",
 			"-j", "TCPMSS", "--clamp-mss-to-pmtu"})
 	if err != nil {
-		n.appendLog(fmt.Sprintf(
+		n.state.AppendLog(fmt.Sprintf(
 			"suspect: nebula-mtu-blackhole MSS clamp failed on %s: %v (%s)",
 			dev, err, trimRunErr(out)))
 		return
 	}
 	n.actions.WithLabelValues(mtuCheckName, "mss_clamp").Inc()
-	n.appendLog(fmt.Sprintf(
+	n.state.AppendLog(fmt.Sprintf(
 		"ACTION: nebula-mtu-blackhole clamped TCP MSS to PMTU on %s", dev))
 }
 
@@ -259,7 +259,7 @@ func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 // skip the rewrite so the file's mtime tracks real changes.
 func (n *NetHealth) writeMTUBHMetric(st *mtuProbeState) {
 	v := "0"
-	if n.stateExists("nebula-mtu-blackhole") {
+	if n.state.Exists("nebula-mtu-blackhole") {
 		v = "1"
 	}
 	st.mu.Lock()

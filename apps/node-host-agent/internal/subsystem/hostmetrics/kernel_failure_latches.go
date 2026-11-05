@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"golang.org/x/sys/unix"
 )
 
@@ -282,14 +283,8 @@ func (c *Collector) writeKmsgCursor(cur *kmsgCursor) {
 		content = fmt.Sprintf("dmesgRaw %d %d\n", cur.lines, cur.hash)
 	}
 	p := c.statePath(kmsgCursorFile)
-	tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+	if err := hostutil.WriteFileAtomicBytes(p, []byte(content)); err != nil {
 		logger().Debug("hostmetrics: kmsg cursor write failed",
-			"path", p, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		logger().Debug("hostmetrics: kmsg cursor install failed",
 			"path", p, "error", err)
 	}
 }
@@ -532,7 +527,7 @@ func (c *Collector) noteHostOOMKill(msg string, st *kernelScanState) {
 	if !host {
 		return
 	}
-	c.bumpStateCounter(kmsgOOMCountFile)
+	c.state.Incr(kmsgOOMCountFile)
 	now := c.cfg.nowFn()
 	p := c.statePath(kmsgOOMVictimFile)
 	content := strconv.FormatInt(now.Unix(), 10) + " " + comm + "\n"
@@ -572,26 +567,8 @@ func (c *Collector) noteKernelFsError(msg string) {
 // stops dropping packets. A failed sysctl write is a Warn, never
 // fatal (read-only /proc/sys in unprivileged pods just logs).
 func (c *Collector) noteConntrackFull() {
-	c.bumpStateCounter(kmsgConntrackDropsFile)
+	c.state.Incr(kmsgConntrackDropsFile)
 	c.maybeBumpConntrackMax()
-}
-
-// bumpStateCounter increments a decimal counter file in the state dir
-// and returns the new value (missing/corrupt → starts at 1).
-func (c *Collector) bumpStateCounter(name string) int64 {
-	p := c.statePath(name)
-	var n int64 = 1
-	if b, err := os.ReadFile(p); err == nil {
-		if v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil {
-			n = v + 1
-		}
-	}
-	if err := os.WriteFile(p,
-		[]byte(strconv.FormatInt(n, 10)+"\n"), 0o644); err != nil {
-		logger().Debug("hostmetrics: kmsg counter write failed",
-			"file", name, "error", err)
-	}
-	return n
 }
 
 // maybeBumpConntrackMax doubles ConntrackMaxFile when a table-full
@@ -599,10 +576,10 @@ func (c *Collector) bumpStateCounter(name string) int64 {
 // the sysctl path directly; containerized agents without a writable
 // /proc/sys get a Warn and move on.
 func (c *Collector) maybeBumpConntrackMax() {
-	if !c.rateBudgetOK(conntrackBumpBudgetFile, conntrackBumpEvery) {
+	if !c.state.RateOK(conntrackBumpBudgetFile, conntrackBumpEvery) {
 		return
 	}
-	cur, ok := readUintFile(c.cfg.ConntrackMaxFile)
+	cur, ok := hostutil.ReadUintFile(c.cfg.ConntrackMaxFile)
 	if !ok || cur == 0 || cur >= conntrackMaxCeiling {
 		return
 	}
@@ -616,7 +593,7 @@ func (c *Collector) maybeBumpConntrackMax() {
 			"path", c.cfg.ConntrackMaxFile, "error", err)
 		return
 	}
-	c.rateBudgetSpend(conntrackBumpBudgetFile)
+	c.state.RateSpend(conntrackBumpBudgetFile)
 	logger().Warn("hostmetrics: nf_conntrack table full — bumped "+
 		"nf_conntrack_max",
 		"from", cur, "to", next)
@@ -1019,7 +996,7 @@ func (c *Collector) checkClockSkew() {
 		return
 	}
 	if (!synced || math.Abs(off) > clockSkewStepOffset) &&
-		c.rateBudgetTrySpend(clockStepBudgetFile, clockSkewMakestepGap) {
+		c.state.RateTrySpend(clockStepBudgetFile, clockSkewMakestepGap) {
 		out, err := runHostCmd(context.Background(), "chronyc", "makestep")
 		if err != nil {
 			logger().Warn("hostmetrics: chronyc makestep failed",
@@ -1286,40 +1263,7 @@ func (c *Collector) writeKernelUtilProm(pids, threads, filefd float64,
 }
 
 // --- small Wave-10 helpers (uniquely named per file rules) ---
-
-// rateBudgetOK reports whether the rate budget file is absent,
-// unparseable, or older than d — the workerhygiene rateOK parity.
-func (c *Collector) rateBudgetOK(name string, d time.Duration) bool {
-	b, err := os.ReadFile(c.statePath(name))
-	if err != nil {
-		return true
-	}
-	last, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
-	if err != nil {
-		return true
-	}
-	return c.cfg.nowFn().Unix()-last >= int64(d.Seconds())
-}
-
-// rateBudgetSpend writes the current epoch to the budget file.
-func (c *Collector) rateBudgetSpend(name string) {
-	p := c.statePath(name)
-	content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-		logger().Debug("hostmetrics: rate budget spend write failed",
-			"budget", name, "error", err)
-	}
-}
-
-// rateBudgetTrySpend is the atomic check+spend — the chronyc makestep
-// budget must not double-fire across overlapping latch ticks.
-func (c *Collector) rateBudgetTrySpend(name string, d time.Duration) bool {
-	// Latch ticks are single-goroutine (Run's ticker); the file
-	// check+write is short enough that a mutex buys nothing — keep
-	// the workerhygiene file-budget semantics without the lock.
-	if !c.rateBudgetOK(name, d) {
-		return false
-	}
-	c.rateBudgetSpend(name)
-	return true
-}
+//
+// The last-* rate budgets (conntrackBumpBudgetFile,
+// clockStepBudgetFile) go through c.state — the shared hoststate
+// rateOK/rateSpend parity (atomic spend, same file format).

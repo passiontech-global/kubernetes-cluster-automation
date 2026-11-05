@@ -18,6 +18,7 @@ package kinedb
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -93,8 +94,10 @@ func (k *KineDB) checkPGBWedge(ctx context.Context, pgb string,
 	}
 	fires := 2 // e2e_auth must fail twice consecutively
 	if saturated || fails >= fires {
-		if last, err := readIntFile(filepath.Join(dir, pgbRestartFile)); err == nil &&
-			k.cfg.nowFn().Unix()-last < int64(pgbWedgeRestartBudget.Seconds()) {
+		// last-pgb-restart is a last-* rate budget — the shared
+		// hoststate rateOK/rateSpend parity (absent/garbage/expired
+		// → ok; the spend lands on the restart ATTEMPT).
+		if !k.state.RateOK(pgbRestartFile, pgbWedgeRestartBudget) {
 			note(fmt.Sprintf("pgb-wedge but in restart cooldown (<15m) cl_waiting=%d e2e_fails=%d",
 				res.pool.clWaiting, fails))
 			return
@@ -106,7 +109,10 @@ func (k *KineDB) checkPGBWedge(ctx context.Context, pgb string,
 		note(fmt.Sprintf("pgbouncer wedge: %s — restarting %s", reason, pgb))
 		logger().Warn("kinedb: pgbouncer wedge — restarting pooler",
 			"reason", reason, "container", pgb)
-		writeIntFile(filepath.Join(dir, pgbRestartFile), k.cfg.nowFn().Unix())
+		// writeIntFile's lazy MkdirAll — Store.WriteEpochFile does
+		// not create the state dir itself.
+		_ = os.MkdirAll(dir, 0o755)
+		k.state.RateSpend(pgbRestartFile)
 		if _, err := k.exec(ctx,
 			[]string{k.cfg.Runtime, "restart", pgb}, ""); err != nil {
 			note(fmt.Sprintf("pgb-restart-fail: %v", err))

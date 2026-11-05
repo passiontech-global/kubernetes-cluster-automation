@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"golang.org/x/sys/unix"
@@ -1887,9 +1888,9 @@ func TestRuntimeConfigMTUMaxDeterministic(t *testing.T) {
 	cfg, _ := fixture(t)
 	write(t, cfg.CiliumRuntimeConfig,
 		`{"a":{"mtu":1300},"list":[{"mtu":1400},{"mtu":1500}],"z":{"MTU":900}}`)
-	got, ok := runtimeConfigMTU(cfg.CiliumRuntimeConfig)
+	got, ok := hostutil.RuntimeConfigMTU(cfg.CiliumRuntimeConfig)
 	if !ok || got != 1500 {
-		t.Fatalf("runtimeConfigMTU=%v,%v want 1500,true (max of all mtu keys)", got, ok)
+		t.Fatalf("RuntimeConfigMTU=%v,%v want 1500,true (max of all mtu keys)", got, ok)
 	}
 }
 

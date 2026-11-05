@@ -34,6 +34,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
 )
@@ -274,6 +275,13 @@ func (c *Config) applyDefaults() {
 type Reconciler struct {
 	cfg Config
 
+	// state is the shared watchdog-state contract handle (hoststate)
+	// for the last-* rate budgets under watchdogStateDir — Dir is
+	// resolved through hp() once at New() (HostRoot never changes
+	// afterwards). Now is a closure over r.cfg.NowFn: tests re-stub
+	// the clock after New() and the store must observe the new one.
+	state *hoststate.Store
+
 	cycles  *prometheus.CounterVec // group, result
 	writes  *prometheus.CounterVec // file
 	actions *prometheus.CounterVec // action
@@ -302,6 +310,8 @@ func (r *Reconciler) noteErr(err error) {
 func New(cfg Config, reg prometheus.Registerer) (*Reconciler, error) {
 	cfg.applyDefaults()
 	r := &Reconciler{cfg: cfg}
+	r.state = hoststate.New(r.hp(watchdogStateDir), "",
+		func() time.Time { return r.cfg.NowFn() }, logger)
 	r.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_hostconfig_cycles_total",
 		Help: "hostconfig converge cycles by group and result.",
@@ -512,50 +522,14 @@ func (r *Reconciler) fileExists(path string) bool {
 
 // watchdogStateDir is the shared latch dir every subsystem writes
 // state-*/last-* files into (nethealth latches, workerhygiene rate
-// budgets) — groupWatchdog ensures it on the converge path.
-const watchdogStateDir = "/var/lib/node-watchdog"
-
-// rateOK mirrors nethealth's last-* rate-limit budget: true while
-// the latch file is absent, unparseable, or older than interval.
-// The name MUST keep the last-* prefix — the workerhygiene janitor
+// budgets) — groupWatchdog ensures it on the converge path. The
+// last-* rate budgets themselves go through r.state (hoststate):
+// the name MUST keep the last-* prefix — the workerhygiene janitor
 // only sweeps state-* latches and deliberately never touches last-*
-// budget files (deleting one would silently bypass cooldowns).
-func (r *Reconciler) rateOK(name string, interval time.Duration) bool {
-	data, err := os.ReadFile(r.hp(watchdogStateDir + "/" + name))
-	if err != nil {
-		return true
-	}
-	last, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-	if err != nil {
-		return true
-	}
-	return r.cfg.NowFn().Unix()-last >= int64(interval.Seconds())
-}
-
-// rateSpend stamps a last-* budget latch with the current epoch
-// (nethealth rateSpend parity: the spend is recorded on the action
-// attempt, so a failing remediation cannot spam retries every cycle).
-func (r *Reconciler) rateSpend(name string) {
-	p := r.hp(watchdogStateDir + "/" + name)
-	content := strconv.FormatInt(r.cfg.NowFn().Unix(), 10) + "\n"
-	// tmp+rename (controllerhygiene writeEpochFile parity): a torn
-	// write parses as garbage in rateOK and silently bypasses the
-	// cooldown — the latch must appear whole or not at all. The
-	// leading dot keeps the tmp out of hostmetrics' state-* scan.
-	tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		logger().Warn("hostconfig: rate budget write failed",
-			"budget", name, "path", p, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		// Sweep the staging file — a stranded .tmp-* must not linger
-		// in the state dir after a failed promote.
-		os.Remove(tmp)
-		logger().Warn("hostconfig: rate budget install failed",
-			"budget", name, "path", p, "error", err)
-	}
-}
+// budget files (deleting one would silently bypass cooldowns), and
+// the spend lands on the action ATTEMPT so a failing remediation
+// cannot spam retries every cycle.
+const watchdogStateDir = "/var/lib/node-watchdog"
 
 // render renders an embedded .j2 template against ctx. Lookup hooks
 // are rooted at VarsDir (same convention topology.Load uses for the

@@ -330,7 +330,7 @@ func TestGapWedgePeerFreshRestarts(t *testing.T) {
 		t.Fatalf("expected 1 restart, got %d", e.rstN())
 	}
 	// Rate budget spent.
-	if h := e.h.readEpoch(filepath.Join(e.state, fileRateRestart)); h == 0 {
+	if h := e.h.state.Epoch(filepath.Join(e.state, fileRateRestart)); h == 0 {
 		t.Fatal("last-sig13-restart budget not spent")
 	}
 }
@@ -634,6 +634,7 @@ func TestOOMShieldSkippedWhenLatchUnwritable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
 	e.h.cfg.WatchdogStateDir = dir
+	e.h.state.Dir = dir // Store was built in New() — re-point it too
 
 	// cum == baseline → no new kills needed; the seeded in-window
 	// entries alone confirm the loop and reach the shield branch.
@@ -834,7 +835,8 @@ func TestRemediateG5RateLimited(t *testing.T) {
 	e.alive[e.h.cfg.FeedProbeURL] = false
 	// Fresh budget: last restart just now.
 	h := e.h
-	h.writeEpochFile(filepath.Join(e.fstate, fileFeederLastRst))
+	h.state.WriteEpochFile(filepath.Join(e.fstate, fileFeederLastRst),
+		h.cfg.nowFn().Unix())
 	e.h.runRemediate(context.Background())
 	if e.rstN() != 0 {
 		t.Fatal("G5 rate-limit bypassed")
@@ -1169,7 +1171,7 @@ func TestEtcdGuardNospaceTriggers(t *testing.T) {
 		t.Fatalf("nospace gauge=%v want 1", got)
 	}
 	// Rate budget spent.
-	if h := e.h.readEpoch(filepath.Join(e.state, fileRateEtcdGuard)); h == 0 {
+	if h := e.h.state.Epoch(filepath.Join(e.state, fileRateEtcdGuard)); h == 0 {
 		t.Fatal("last-etcd-guard budget not spent")
 	}
 	// The purge cutoff is now - 1h (the apiserver event TTL).
@@ -1386,7 +1388,7 @@ func TestEtcdGuardBudgetExhaustedDefers(t *testing.T) {
 	}
 	// The rate budget stays spent — a timeout defers to the next
 	// window, it does not refund.
-	if v := e.h.readEpoch(filepath.Join(e.state, fileRateEtcdGuard)); v == 0 {
+	if v := e.h.state.Epoch(filepath.Join(e.state, fileRateEtcdGuard)); v == 0 {
 		t.Fatal("last-etcd-guard budget not spent")
 	}
 	if log := watchdogLog(t, e); !strings.Contains(log, "budget") ||
@@ -1483,7 +1485,7 @@ func TestTTLLoopSuspectLogDeduped(t *testing.T) {
 	}
 	e.mkProc(t, 3003, "kine", []string{"kine"}, 400)
 	e.h.Cycle(ctx) // rew=3, same latch episode
-	if rew := e.h.ctrRead(fileCtrTTLRewedge); rew != 3 {
+	if rew := e.h.state.Counter(fileCtrTTLRewedge); rew != 3 {
 		t.Fatalf("rewedge counter=%d want 3 — increments must continue under dedupe", rew)
 	}
 	if n := countLogLines(t, e, line); n != 1 {
