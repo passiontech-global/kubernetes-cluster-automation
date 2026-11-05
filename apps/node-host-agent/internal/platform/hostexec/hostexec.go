@@ -21,7 +21,9 @@ package hostexec
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -147,22 +149,10 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RunCmdCombined == nil {
 		c.RunCmdCombined = func(ctx context.Context, argv []string) (string, error) {
-			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-			// Same hang class as the stdout path: the internal
-			// copy goroutines block on a pipe a grandchild holds —
-			// WaitDelay closes them so Run cannot outlive the ctx.
-			cmd.WaitDelay = cmdWaitDelay
-			// Both streams share one capped sink — the child never
-			// blocks on an unread stderr pipe, and output over the
-			// cap is swallowed (same budget as the stdout path).
-			var buf cappedBuffer
-			cmd.Stdout = &buf
-			cmd.Stderr = &buf
-			// Run waits for the copy goroutines — buf is complete
-			// once it returns (partial output alongside an error,
-			// same contract as the stdout path).
-			err := cmd.Run()
-			return buf.String(), err
+			// Same container-side combined runner as the
+			// package-level helper — one implementation of the
+			// capped-buffer/WaitDelay contract.
+			return RunCombined(ctx, argv...)
 		}
 	}
 }
@@ -262,4 +252,92 @@ func (r *Runner) argv(ns NS, name string, args []string) []string {
 		}
 	}
 	return append(append(prefix, "--"), argv...)
+}
+
+// errEmptyArgv guards the package-level helpers — exec.CommandContext
+// would index argv[0] on an empty slice and panic.
+var errEmptyArgv = errors.New("hostexec: empty argv")
+
+// --- container-side package-level helpers ---
+//
+// Config.RunCmd/RunCmdCombined stay the seam for commands that want
+// the nsenter wrap AND test injection. The helpers below serve the
+// callers that deliberately exec CONTAINER-SIDE — the standalone
+// systemd deployment (HostRoot "/" already lives in the host
+// namespaces, an nsenter wrap would be wrong work), hostPath-prefixed
+// binaries that only exist in the pod's mount view, and probes with
+// no Config seam to inject through. They reuse the same
+// cappedBuffer/WaitDelay contract the Config defaults implement so
+// the safety properties (16MiB output cap, grandchild-pipe bound)
+// stop depending on which entry point a caller picked; unlike the
+// Config paths they apply NO extra timeout — ctx arrives already
+// budgeted by the caller.
+
+// RunCombined runs argv[0] argv[1:] container-side — no nsenter
+// wrap — with stdout AND stderr folded into one stream capped at
+// maxCmdOutputBytes. It is the shared form of the plain
+// `exec.CommandContext(...).CombinedOutput()` the bespoke runners
+// carried: same hang class too, so WaitDelay is set (a daemonized
+// grandchild inheriting a pipe must not hold EOF open past ctx —
+// Wait returns ErrWaitDelay instead of blocking forever). Run waits
+// for the copy goroutines, so partial output is returned complete
+// alongside an error. Callers keep any deadline on ctx themselves.
+func RunCombined(ctx context.Context, argv ...string) (string, error) {
+	return runCombined(ctx, nil, argv)
+}
+
+// RunCombinedEnv is RunCombined with the child's environment
+// REPLACED by env (nil → inherit the agent's environ) — for the
+// container-side exec that must scrub inherited daemon variables
+// (controllerhygiene's NOTIFY_SOCKET/WATCHDOG_* drop) where the
+// argv-level `env -u` trick cannot be assumed: it would resolve
+// `env` against the pod image's own PATH.
+func RunCombinedEnv(ctx context.Context, env []string, argv ...string) (string, error) {
+	return runCombined(ctx, env, argv)
+}
+
+// runCombined is the shared combined-stream spawn behind RunCombined
+// / RunCombinedEnv / Config.RunCmdCombined's default — both streams
+// share one capped sink so the child never blocks on an unread
+// stderr pipe and output over the cap is swallowed.
+func runCombined(ctx context.Context, env []string, argv []string) (string, error) {
+	if len(argv) == 0 {
+		return "", errEmptyArgv
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	if env != nil {
+		cmd.Env = env
+	}
+	cmd.WaitDelay = cmdWaitDelay
+	var buf cappedBuffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	return buf.String(), err
+}
+
+// Run runs argv[0] argv[1:] container-side — no nsenter wrap —
+// capturing stdout and stderr into SEPARATE capped buffers and
+// feeding the child stdin when non-empty. Use it when stdout must
+// stay machine-clean: a `psql` WARNING/NOTICE or etcdctl's
+// "unrecognized environment variable ETCDCTL_API" line folded into
+// stdout would poison the exact-match and `-w json` parsers. The
+// caller owns the folding decision — stderr into the error on
+// failure, a debug log (or nothing) on success; Run deliberately
+// returns BOTH streams on the error path so partial output survives.
+// Same WaitDelay contract as the Config runners.
+func Run(ctx context.Context, argv []string, stdin string) (stdout, stderr string, err error) {
+	if len(argv) == 0 {
+		return "", "", errEmptyArgv
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	cmd.WaitDelay = cmdWaitDelay
+	var out, serr cappedBuffer
+	cmd.Stdout = &out
+	cmd.Stderr = &serr
+	err = cmd.Run()
+	return out.String(), serr.String(), err
 }
