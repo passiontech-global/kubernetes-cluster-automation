@@ -1,15 +1,16 @@
 // Package systemd ports the node-watchdog modules' host systemd
 // control into a testable client. The agent pod sees the host through
-// a mounted host root: every command is wrapped in
-// `nsenter -t 1 -m -u -i -n -p --` so systemctl/journalctl run inside
-// the host PID-1 namespaces and talk to the REAL systemd — plain
-// `systemctl` in-container would fail (no /run/systemd/private) or
-// worse, act on the wrong namespace. When the agent runs directly on
-// the host (HostRoot "/") the wrapper is skipped.
+// a mounted host root: every command goes through platform/hostexec,
+// which wraps it in `nsenter -t 1 -m -u -i -n -p --` so
+// systemctl/journalctl run inside the host PID-1 namespaces and talk
+// to the REAL systemd — plain `systemctl` in-container would fail
+// (no /run/systemd/private) or worse, act on the wrong namespace.
+// When the agent runs directly on the host (HostRoot "/") the
+// wrapper is skipped.
 //
 // All commands go through Config.RunCmd — one seam that tests replace
 // with a fake recorder, and that production wires to
-// exec.CommandContext. Shell parity:
+// exec.CommandContext (via hostexec). Shell parity:
 //
 //	systemctl is-active <u>        -> Active / IsActive
 //	systemctl show -p LoadState <u> -> Exists / UnitExists (WD_REQUIRES unit:<n>)
@@ -22,15 +23,14 @@
 package systemd
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostexec"
 )
 
 // Defaults — containerized default is the DaemonSet host-root mount.
@@ -42,18 +42,6 @@ const (
 	// mounted at /host (the nsenter wrapping covers commands, not
 	// this file read).
 	defaultProcUptimeFile = "/proc/uptime"
-	// maxCmdOutputBytes caps the stdout retained per spawned command —
-	// a log storm (journalctl -10min snapshot on a sick node) must not
-	// push unbounded child output into the agent's heap. The rest is
-	// drained and discarded so the child can still exit cleanly.
-	maxCmdOutputBytes = 16 << 20
-	// cmdWaitDelay bounds the post-exit/kill wait for the child's I/O
-	// pipes. A daemonized grandchild inheriting the stdout pipe holds
-	// EOF open after CommandContext kills the child — without a bound,
-	// the reader/Wait hang forever and Config.Timeout goes unenforced.
-	// After the grace exec closes the pipes and Wait returns
-	// ErrWaitDelay (wrapped in the returned error).
-	cmdWaitDelay = 5 * time.Second
 )
 
 // Config carries the exec seam — all test-injectable.
@@ -91,95 +79,37 @@ func (c *Config) applyDefaults() {
 	if c.ProcUptimeFile == "" {
 		c.ProcUptimeFile = defaultProcUptimeFile
 	}
-	if c.RunCmd == nil {
-		c.RunCmd = func(ctx context.Context, argv []string) (string, error) {
-			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-			// WaitDelay bounds the post-exit/kill wait for I/O. It
-			// only works on goroutine-copied pipes (an io.Writer
-			// sink) — a StdoutPipe fd is only closed INSIDE Wait,
-			// which a blocked pre-Wait ReadAll never reaches. So
-			// stdout goes through the same capped sink as the
-			// combined runner: a daemonized grandchild inheriting
-			// the pipe holds EOF open after CommandContext kills
-			// the child, and WaitDelay forces the pipe closed so
-			// Run returns (ErrWaitDelay) instead of hanging past
-			// Config.Timeout.
-			cmd.WaitDelay = cmdWaitDelay
-			var buf cappedBuffer
-			cmd.Stdout = &buf
-			// Run waits for the copy goroutine — buf is complete
-			// once it returns. Partial output is returned alongside
-			// the error just like exec.Cmd.Output (callers count
-			// grep hits — truncated text is still useful evidence).
-			err := cmd.Run()
-			return buf.String(), err
-		}
-	}
-	if c.RunCmdCombined == nil {
-		c.RunCmdCombined = func(ctx context.Context, argv []string) (string, error) {
-			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-			// Same hang class as the stdout path: the internal
-			// copy goroutines block on a pipe a grandchild holds —
-			// WaitDelay closes them so Run cannot outlive the ctx.
-			cmd.WaitDelay = cmdWaitDelay
-			// Both streams share one capped sink — the child never
-			// blocks on an unread stderr pipe, and output over the
-			// cap is swallowed (same budget as the stdout path).
-			var buf cappedBuffer
-			cmd.Stdout = &buf
-			cmd.Stderr = &buf
-			// Run waits for the copy goroutines — buf is complete
-			// once it returns (partial output alongside an error,
-			// same contract as the stdout path).
-			err := cmd.Run()
-			return buf.String(), err
-		}
-	}
-}
-
-// cappedBuffer is a goroutine-safe io.Writer retaining at most
-// maxCmdOutputBytes — the runners' stdout (+stderr) sink
-// (exec copies each stream on its own goroutine; excess is
-// swallowed so the child still exits cleanly).
-type cappedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *cappedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.buf.Len() < maxCmdOutputBytes {
-		b.buf.Write(p)
-	}
-	return len(p), nil
-}
-
-func (b *cappedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
+	// nil RunCmd/RunCmdCombined are left for hostexec to wire to the
+	// real exec.CommandContext runners — the nsenter wrap, capped
+	// output sink and WaitDelay pipe-close grace all live there now.
 }
 
 // Client runs host systemd commands.
 type Client struct {
-	cfg Config
+	cfg  Config
+	host *hostexec.Runner
 }
 
 // New returns a Client for cfg.
 func New(cfg Config) *Client {
 	cfg.applyDefaults()
-	return &Client{cfg: cfg}
+	return &Client{
+		cfg: cfg,
+		host: hostexec.New(hostexec.Config{
+			HostRoot:       cfg.HostRoot,
+			Timeout:        cfg.Timeout,
+			RunCmd:         cfg.RunCmd,
+			RunCmdCombined: cfg.RunCmdCombined,
+		}),
+	}
 }
 
 // Exec runs an arbitrary host command — systemctl and journalctl are
-// wrapped identically, and other host binaries (fail2ban-client, ip)
-// share the same nsenter path. ctx is additionally bounded by
-// Config.Timeout.
+// wrapped identically (hostexec.NSAll), and other host binaries
+// (fail2ban-client, ip) share the same nsenter path. ctx is
+// additionally bounded by Config.Timeout.
 func (c *Client) Exec(ctx context.Context, name string, args ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
-	defer cancel()
-	return c.cfg.RunCmd(cctx, c.hostArgv(name, args))
+	return c.host.Exec(ctx, hostexec.NSAll, name, args...)
 }
 
 // ExecCombined is Exec with the child's STDERR folded into the
@@ -189,20 +119,7 @@ func (c *Client) Exec(ctx context.Context, name string, args ...string) (string,
 // code). Callers that only want stdout keep Exec — the signature
 // contract is unchanged.
 func (c *Client) ExecCombined(ctx context.Context, name string, args ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
-	defer cancel()
-	return c.cfg.RunCmdCombined(cctx, c.hostArgv(name, args))
-}
-
-// hostArgv applies the nsenter host-namespace wrap — shared by
-// Exec and ExecCombined.
-func (c *Client) hostArgv(name string, args []string) []string {
-	argv := append([]string{name}, args...)
-	if c.cfg.HostRoot != "/" {
-		argv = append([]string{"nsenter", "-t", "1",
-			"-m", "-u", "-i", "-n", "-p", "--"}, argv...)
-	}
-	return argv
+	return c.host.ExecCombined(ctx, hostexec.NSAll, name, args...)
 }
 
 func (c *Client) systemctl(ctx context.Context, args ...string) (string, error) {
