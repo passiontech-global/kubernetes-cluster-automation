@@ -91,14 +91,11 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -113,34 +110,6 @@ import (
 )
 
 var version = "dev"
-
-// osExecutable is os.Executable as a var — tests stub it to exercise
-// the "(deleted)"/missing-path fallbacks in resolveLocalBinary.
-var osExecutable = os.Executable
-
-// resolveLocalBinary finds the binary hubsync mirrors to targets.
-// LocalBinary mirrors the running binary — the DaemonSet ships it at
-// /node-host-agent, but resolving our own path keeps the mirror
-// correct wherever the binary actually lives. Two failure shapes are
-// normalised: os.Executable reports "<path> (deleted)" when the
-// running image was replaced in place (sha256File would fail every
-// cycle on that literal path), and a still-nonexistent resolved path
-// falls back to the DS's fixed /node-host-agent.
-func resolveLocalBinary() string {
-	if v := os.Getenv("NODE_HOST_AGENT_HUBSYNC_LOCAL_BINARY"); v != "" {
-		return v
-	}
-	const fallback = "/node-host-agent"
-	exe, err := osExecutable()
-	if err != nil {
-		return fallback
-	}
-	exe = strings.TrimSuffix(exe, " (deleted)")
-	if _, err := os.Stat(exe); err != nil {
-		return fallback
-	}
-	return exe
-}
 
 // kubeClient builds the in-cluster clientset (SA token), falling back
 // to $KUBECONFIG for out-of-cluster runs. A var (not a plain func) so
@@ -295,20 +264,16 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 		podName:                 podName,
 	}
 
-	// One wire* call per subsystem, in the same order the sequential
-	// blocks ran — w.subsystems startup order is unchanged.
-	w.wireSweeper()
-	w.wireConcourseCache()
-	apiproberEnabled := w.wireApiprober()
-	w.wireHostmetrics()
-	w.wireWorkerHygiene()
-	w.wireNethealth()
-	w.wireJanitor()
-	w.wireNodereporter()
-	w.wireControllerHygiene()
-	w.wireHostconfig()
-	w.wireHubsync()
-	w.wireKinedb()
+	// One Descriptor per subsystem, in the same order the sequential
+	// blocks ran — w.subsystems startup order is unchanged. wire
+	// returns the resolved enable mode; apiprober's feeds the startup
+	// log line (a setup failure does not clear it).
+	apiproberEnabled := false
+	for _, d := range w.descriptors() {
+		if w.wire(d) && d.Name == "apiprober" {
+			apiproberEnabled = true
+		}
+	}
 
 	return agent.Config{
 		NodeName:    nodeName,
@@ -352,7 +317,7 @@ func main() {
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signalContext()
 	defer stop()
 
 	// Precedence: NODE_HOST_AGENT_NODE_NAME > NODE_NAME > --node-name.

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // captureSlog swaps the default slog logger for a text handler
@@ -395,6 +396,125 @@ func TestUptimeZeroBeforeStart(t *testing.T) {
 		return
 	}
 	t.Fatal("node_host_agent_uptime_seconds missing")
+}
+
+// --- supervisor health metrics ---
+
+// waitFor polls cond until it holds or the deadline passes — the
+// supervisor's 5s restart backoff means metric assertions poll
+// rather than sleeping a fixed interval.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for !cond() {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", what)
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+func TestSubsystemRestartCounterIncrements(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reg := prometheus.NewRegistry()
+	sub := &earlyReturnSubsystem{ran: make(chan struct{})}
+	a := New(Config{
+		MetricsAddr: "127.0.0.1:0",
+		ProbeAddr:   "127.0.0.1:0",
+		Registry:    reg,
+		Subsystems:  []Subsystem{sub},
+	})
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	// Run returned while ctx was live → the supervisor counts it.
+	waitFor(t, "restart counter", func() bool {
+		return testutil.ToFloat64(
+			a.restarts.WithLabelValues("early-return")) >= 1
+	})
+
+	// The counter is on the shared registry, labelled by name.
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, mf := range mfs {
+		if mf.GetName() == "node_host_agent_subsystem_restarts_total" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("node_host_agent_subsystem_restarts_total missing from registry")
+	}
+}
+
+// gatedSubsystem's first Run blocks until release closes (the "up
+// while running" probe); every later Run parks on ctx so the gauge's
+// 0 window is observable for the whole backoff.
+type gatedSubsystem struct {
+	calls   atomic.Int32
+	release chan struct{}
+}
+
+func (s *gatedSubsystem) Name() string { return "gated" }
+func (s *gatedSubsystem) Run(ctx context.Context) {
+	if s.calls.Add(1) == 1 {
+		<-s.release
+		return
+	}
+	<-ctx.Done()
+}
+
+func TestSubsystemUpGaugeFlips(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sub := &gatedSubsystem{release: make(chan struct{})}
+	a := New(Config{
+		MetricsAddr: "127.0.0.1:0",
+		ProbeAddr:   "127.0.0.1:0",
+		Subsystems:  []Subsystem{sub},
+	})
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	up := a.subUp.WithLabelValues("gated")
+	waitFor(t, "up gauge to rise", func() bool {
+		return testutil.ToFloat64(up) == 1
+	})
+	close(sub.release)
+	// Run exits while ctx is live → up drops to 0 for the backoff
+	// window and the restart is counted.
+	waitFor(t, "up gauge to drop", func() bool {
+		return testutil.ToFloat64(up) == 0
+	})
+	waitFor(t, "restart counter", func() bool {
+		return testutil.ToFloat64(
+			a.restarts.WithLabelValues("gated")) >= 1
+	})
+}
+
+func TestSubsystemPanicCountedAsRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sub := &panicOnceSubsystem{second: make(chan struct{})}
+	a := New(Config{
+		MetricsAddr: "127.0.0.1:0",
+		ProbeAddr:   "127.0.0.1:0",
+		Subsystems:  []Subsystem{sub},
+	})
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	// A panic-recovered exit is an unexpected exit too — it must
+	// land in the same counter as a silent early return.
+	waitFor(t, "panic restart counted", func() bool {
+		return testutil.ToFloat64(
+			a.restarts.WithLabelValues("panic-once")) >= 1
+	})
 }
 
 // earlyReturnSubsystem's Run records invocation and returns

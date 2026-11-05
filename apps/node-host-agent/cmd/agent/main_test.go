@@ -689,6 +689,51 @@ func TestDispatchUnknownSubcommand(t *testing.T) {
 	}
 }
 
+// TestSubcommandUsageText pins the generated usage block to the
+// pre-table text — the table IS the dispatch contract, and the
+// rendered help must not drift from what operators documented.
+func TestSubcommandUsageText(t *testing.T) {
+	want := `usage:
+  node-host-agent [daemon flags]            run the agent daemon
+  node-host-agent version                   print version and exit
+  node-host-agent concourse-worker-init [--work-dir=DIR] [--runc-dir=DIR] [--runc-source=PATH] [--wrapper-source=PATH]
+                                            concourse worker init-rm (init container)
+  node-host-agent concourse-runc-wrapper    runc shim (argv[0] "runc" works too)
+  node-host-agent converge-once --vars-dir=DIR [--node-name=N] [--nebula-certs-dir=DIR]
+                                            one hostconfig converge on the host, then exit
+  node-host-agent nebula-sign --vars-dir=DIR --ca-dir=DIR [--node=N] [--duration=8760h] [--ssh-key=PATH]
+                                            sign interdc nebula host certs with the local CA
+  node-host-agent purge-events [--api=URL] [--ca=FILE] [--cert=FILE] [--key=FILE] [--workers=N] [--before=TS | RFC3339]
+                                            delete apiserver events older than the cutoff (etcd backlog GC)
+  node-host-agent check-kine-db [--env-file=FILE] [--wire-addr=HOST:PORT] [--runtime=podman|docker]
+                                            verify the kine postgres+pgbouncer stack (exit 1 on any FAIL)
+  node-host-agent check-k0s-drift [--config=FILE] [--expected-keys=a,b] [--removed-flags=x,y] [--unit-file=FILE]
+                                            report k0s.yaml extraArgs drift (removed-flag/extra-key/missing-key)
+  node-host-agent rescue-etcd [--k0s-dir=DIR] [--endpoint=URL] [--force-offline]
+                                            rescue a k0s etcd at backend quota
+                                            (compact -> online defrag -> offline defrag -> alarm disarm -> canary)
+`
+	if got := subcommandUsageText(); got != want {
+		t.Fatalf("usage text drifted:\n--- got ---\n%s\n--- want ---\n%s",
+			got, want)
+	}
+	// Every table entry must be dispatchable — a name typo in the
+	// table would silently drop a subcommand.
+	seen := map[string]bool{}
+	for _, sc := range subcommands {
+		seen[sc.name] = true
+	}
+	for _, name := range []string{
+		"version", "concourse-worker-init", "concourse-runc-wrapper",
+		"converge-once", "nebula-sign", "purge-events", "check-kine-db",
+		"check-k0s-drift", "rescue-etcd",
+	} {
+		if !seen[name] {
+			t.Fatalf("subcommand %q missing from dispatch table", name)
+		}
+	}
+}
+
 func TestDispatchRuncArgv0(t *testing.T) {
 	// argv[0] "runc" selects the wrapper; runc.real does not exist in
 	// the test env so exec fails → non-zero, but dispatch handled it.
