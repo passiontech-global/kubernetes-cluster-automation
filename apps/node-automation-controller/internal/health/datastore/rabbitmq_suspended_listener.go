@@ -3,13 +3,13 @@ package datastore
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -24,18 +24,14 @@ type rabbitMQSuspendedCheck struct {
 	//     showed the suspended-listener signature (uid in the key
 	//     keeps a same-named replacement from inheriting the streak).
 	//   - rbHealed: "ns/pod" → last delete — the 30m heal cooldown.
-	rbSuspendedSince map[string]time.Time
-	rbHealed         map[string]time.Time
+	rbSuspendedSince shared.FirstSeenLedger
+	rbHealed         shared.CooldownSet
 }
 
-// newRabbitMQSuspendedCheck builds the W6.4 check with fresh
-// tracking maps — the state-map initialization that used to live in
-// the monolithic newClusterHealthProber literal.
+// newRabbitMQSuspendedCheck builds the W6.4 check — both ledgers
+// arm lazily on first use.
 func NewRabbitMQSuspendedCheck(d *probefw.Deps) probefw.Check {
-	return &rabbitMQSuspendedCheck{Deps: d,
-		rbSuspendedSince: map[string]time.Time{},
-		rbHealed:         map[string]time.Time{},
-	}
+	return &rabbitMQSuspendedCheck{Deps: d}
 }
 
 // W6.4 — rabbitmq-suspended-listener knobs.
@@ -139,12 +135,6 @@ func (p *rabbitMQSuspendedCheck) rabbitQuorumSafe(ctx context.Context, pod *core
 func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	if p.rbSuspendedSince == nil {
-		p.rbSuspendedSince = map[string]time.Time{}
-	}
-	if p.rbHealed == nil {
-		p.rbHealed = map[string]time.Time{}
-	}
 
 	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).List(ctx,
 		metav1.ListOptions{LabelSelector: rabbitComponentLabel})
@@ -161,11 +151,8 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 		}
 		key := pod.Namespace + "/" + pod.Name + "/" + string(pod.UID)
 		live[key] = true
-		first, ok := p.rbSuspendedSince[key]
-		if !ok {
-			p.rbSuspendedSince[key] = now
-		}
-		if !ok {
+		first, tracked := p.rbSuspendedSince.Observe(key, now)
+		if !tracked {
 			log.Info("rabbitmq suspended-listener signature — tracking first-seen",
 				"pod", pod.Namespace+"/"+pod.Name)
 			continue
@@ -174,11 +161,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 			due = append(due, *pod)
 		}
 	}
-	for k := range p.rbSuspendedSince {
-		if !live[k] {
-			delete(p.rbSuspendedSince, k)
-		}
-	}
+	p.rbSuspendedSince.Prune(func(k string) bool { return live[k] })
 
 	// Maintenance mutex — evaluated once per sweep and only when
 	// there is something to delete: pod kills during a drain/upgrade
@@ -203,10 +186,8 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 				"pod", key, "why", maintWhy)
 			continue
 		}
-		last, ok := p.rbHealed[key]
-		if ok && now.Sub(last) < rabbitHealCooldown {
-			log.Info("skip heal: rabbitmq pod inside cooldown",
-				"pod", key, "ago", now.Sub(last).Truncate(time.Minute))
+		if p.rbHealed.CooledDown(key, rabbitHealCooldown, now) {
+			log.Info("skip heal: rabbitmq pod inside cooldown", "pod", key)
 			continue
 		}
 		safe, err := p.rabbitQuorumSafe(ctx, pod)
@@ -230,7 +211,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(err, "suspended rabbitmq pod delete failed", "pod", key)
 			continue
 		}
-		p.rbHealed[key] = now
+		p.rbHealed.Stamp(key, now)
 		metrics.RabbitMQSuspendedHealsTotal.
 			WithLabelValues(pod.Namespace, pod.Name).Inc()
 		log.Info("DELETE: suspended-listener rabbitmq pod — quorum verified",

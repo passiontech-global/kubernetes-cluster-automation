@@ -52,8 +52,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 var (
@@ -107,54 +107,68 @@ var nodeCountChanges = predicate.Funcs{
 // minReplicas/nodesPerReplica are the CPA-linear replica pin — see
 // proportionalReplicas. minReplicas<=0 disables the pin entirely.
 func Setup(d shared.Deps) error {
-	// Parse the knobs BEFORE the Disabled check — the old
-	// moduleConfigFromEnv resolved them at boot regardless of enabled
-	// state, so an unparseable COREDNS_* value still warned on a
-	// disabled module.
-	zoneWhen := shared.Getenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule")
-	zoneMinDomains := shared.GetenvInt("COREDNS_PATCHER_ZONE_MIN_DOMAINS", 2)
-	minReplicas := shared.GetenvInt("COREDNS_MIN_REPLICAS", 4)
-	nodesPerReplica := shared.GetenvInt("COREDNS_NODES_PER_REPLICA", 1)
-	if d.Disabled {
-		return nil
+	return shared.SetupWithConfig(d, configFromEnv, func(cfg corednsPatcherConfig) error {
+		// zoneWhen lands verbatim in the whenUnsatisfiable field of the
+		// rendered patch — a typo is not caught until the apiserver
+		// rejects the invalid enum, at which point the Deployment
+		// perpetually reads as drifted and every reconcile fails (eternal
+		// error loop). Validate at boot instead — but disable only this
+		// module: a returned error would propagate through setupModules
+		// and abort ALL 32 modules for one ConfigMap typo. The error is
+		// still loud: logged at Error level and counted on the queue's
+		// error metric.
+		switch corev1.UnsatisfiableConstraintAction(cfg.zoneWhen) {
+		case corev1.DoNotSchedule, corev1.ScheduleAnyway:
+		default:
+			err := fmt.Errorf("invalid zoneWhen %q — must be %q or %q "+
+				"(UnsatisfiableConstraintAction); module disabled",
+				cfg.zoneWhen, corev1.DoNotSchedule, corev1.ScheduleAnyway)
+			logf.Log.WithName(d.Name).Error(err, "setup failed")
+			metrics.IncError(d.Name)
+			return nil
+		}
+		logf.Log.WithName(d.Name).Info("registered",
+			"zoneWhen", cfg.zoneWhen, "zoneMinDomains", cfg.zoneMinDomains,
+			"minReplicas", cfg.minReplicas, "nodesPerReplica", cfg.nodesPerReplica)
+		b := ctrl.NewControllerManagedBy(d.Mgr).
+			Named(d.Name).
+			For(&appsv1.Deployment{}, builder.WithPredicates(onlyCoreDNSDeployment))
+		if cfg.minReplicas > 0 {
+			// Node add/remove changes the proportional replica total —
+			// see nodeCountChanges for why only create/delete fire.
+			// Collapses to one fixed key: Reconcile ignores the request
+			// name anyway. With the pin disabled the count is never read,
+			// so the watch is not registered at all.
+			b = b.Watches(&corev1.Node{},
+				handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("coredns-patcher-sweep")),
+				builder.WithPredicates(nodeCountChanges))
+		}
+		return b.Complete(&corednsPatcher{cs: d.CS, queue: d.Name, zoneWhen: cfg.zoneWhen,
+			minDomains: cfg.zoneMinDomains, minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica})
+	})
+}
+
+// corednsPatcherConfig is the module's env-resolved knob set — what
+// the old moduleConfigFromEnv returned, now carried through
+// SetupWithConfig's parse step.
+type corednsPatcherConfig struct {
+	zoneWhen        string
+	zoneMinDomains  int
+	minReplicas     int
+	nodesPerReplica int
+}
+
+// configFromEnv resolves the COREDNS_* knobs. SetupWithConfig runs it
+// BEFORE the Deps.Disabled gate — the old moduleConfigFromEnv
+// resolved them at boot regardless of enabled state, so an
+// unparseable COREDNS_* value still warns on a disabled module.
+func configFromEnv() corednsPatcherConfig {
+	return corednsPatcherConfig{
+		zoneWhen:        shared.Getenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule"),
+		zoneMinDomains:  shared.GetenvInt("COREDNS_PATCHER_ZONE_MIN_DOMAINS", 2),
+		minReplicas:     shared.GetenvInt("COREDNS_MIN_REPLICAS", 4),
+		nodesPerReplica: shared.GetenvInt("COREDNS_NODES_PER_REPLICA", 1),
 	}
-	// zoneWhen lands verbatim in the whenUnsatisfiable field of the
-	// rendered patch — a typo is not caught until the apiserver
-	// rejects the invalid enum, at which point the Deployment
-	// perpetually reads as drifted and every reconcile fails (eternal
-	// error loop). Validate at boot instead — but disable only this
-	// module: a returned error would propagate through setupModules
-	// and abort ALL 32 modules for one ConfigMap typo. The error is
-	// still loud: logged at Error level and counted on the queue's
-	// error metric.
-	switch corev1.UnsatisfiableConstraintAction(zoneWhen) {
-	case corev1.DoNotSchedule, corev1.ScheduleAnyway:
-	default:
-		err := fmt.Errorf("invalid zoneWhen %q — must be %q or %q "+
-			"(UnsatisfiableConstraintAction); module disabled",
-			zoneWhen, corev1.DoNotSchedule, corev1.ScheduleAnyway)
-		logf.Log.WithName(d.Name).Error(err, "setup failed")
-		metrics.IncError(d.Name)
-		return nil
-	}
-	logf.Log.WithName(d.Name).Info("registered",
-		"zoneWhen", zoneWhen, "zoneMinDomains", zoneMinDomains,
-		"minReplicas", minReplicas, "nodesPerReplica", nodesPerReplica)
-	b := ctrl.NewControllerManagedBy(d.Mgr).
-		Named(d.Name).
-		For(&appsv1.Deployment{}, builder.WithPredicates(onlyCoreDNSDeployment))
-	if minReplicas > 0 {
-		// Node add/remove changes the proportional replica total —
-		// see nodeCountChanges for why only create/delete fire.
-		// Collapses to one fixed key: Reconcile ignores the request
-		// name anyway. With the pin disabled the count is never read,
-		// so the watch is not registered at all.
-		b = b.Watches(&corev1.Node{},
-			handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("coredns-patcher-sweep")),
-			builder.WithPredicates(nodeCountChanges))
-	}
-	return b.Complete(&corednsPatcher{cs: d.CS, queue: d.Name, zoneWhen: zoneWhen,
-		minDomains: zoneMinDomains, minReplicas: minReplicas, nodesPerReplica: nodesPerReplica})
 }
 
 func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {

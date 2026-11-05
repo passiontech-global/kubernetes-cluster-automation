@@ -1,13 +1,9 @@
 package ciliumtaintreaper
 
 import (
-	"context"
-
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
-
-var ctx = context.Background()
 
 func ciliumPod(nodeName string, phase corev1.PodPhase, ready bool) *corev1.Pod {
 	p := &corev1.Pod{

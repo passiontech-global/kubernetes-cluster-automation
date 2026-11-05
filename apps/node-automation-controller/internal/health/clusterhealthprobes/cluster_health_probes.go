@@ -62,16 +62,16 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/datastore"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/gitops"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/nethealth"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/nodehealth"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/ported"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/watchdogs"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/promq"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // healthProbeConfigFromEnv resolves the check knobs once at Setup.
@@ -212,34 +212,45 @@ func newClusterHealthProber(name string, cs kubernetes.Interface, dyn dynamic.In
 // self-healing checks (W5.8/W6.2) — wired like every other
 // dynamic-client module.
 func Setup(d shared.Deps) error {
-	// Config resolution stays BEFORE the disabled early-return so
-	// knob-parse warnings still fire for a gated-off module — the
-	// codebase's parse-before-gate contract.
-	cfg := healthProbeConfigFromEnv()
-	// shared.GetenvDuration rejects <1s (the retired helper accepted
-	// any d > 0) — a sub-second sweep interval was already a
-	// hot-loop bug, never a sane setting.
-	interval := shared.GetenvDuration("CLUSTER_HEALTH_PROBES_INTERVAL", 5*time.Minute)
-	if d.Disabled {
-		return nil
+	return shared.SetupWithConfig(d, setupConfigFromEnv, func(cfg setupConfig) error {
+		p := newClusterHealthProber(d.Name, d.CS, d.Dyn, cfg.probes)
+		// Surface the resolved HEALTH_* knobs once at registration so an
+		// operator can tell from the logs which targets/thresholds the
+		// checks run with (an unparseable env value silently falls back
+		// to the default — the effective value is what matters here).
+		logf.Log.WithName(d.Name).Info("registered",
+			"interval", cfg.interval, "perCheckTimeout", p.Cfg.Timeouts.PerCheck,
+			"dnsHostnames", p.Cfg.DNS.Hostnames,
+			"checkTimeout", p.Cfg.Timeouts.Check, "httpURL", p.Cfg.HTTPContent.URL,
+			"httpExpectedContent", p.Cfg.HTTPContent.Expected,
+			"podCheckNamespace", p.Cfg.Pods.Namespace,
+			"maxPodRestarts", p.Cfg.Pods.MaxRestarts,
+			"podSkipDuration", p.Cfg.Pods.SkipDuration,
+			"quotaThreshold", p.Cfg.Quota.Threshold,
+			"kcmLeaseMaxAge", p.Cfg.KCM.LeaseMaxAge,
+			"kcmFreezeMinAge", p.Cfg.KCM.FreezeMinAge)
+		return shared.AddPeriodic(d.Mgr, d.Name, cfg.interval, p.run)
+	})
+}
+
+// setupConfig couples the resolved per-check knobs with the sweep
+// interval so SetupWithConfig can hand both to register as one value.
+type setupConfig struct {
+	probes   probefw.Config
+	interval time.Duration
+}
+
+// setupConfigFromEnv resolves every module knob. SetupWithConfig runs
+// it BEFORE the Deps.Disabled gate so knob-parse warnings still fire
+// for a gated-off module — the codebase's parse-before-gate contract.
+func setupConfigFromEnv() setupConfig {
+	return setupConfig{
+		probes: healthProbeConfigFromEnv(),
+		// shared.GetenvDuration rejects <1s (the retired helper accepted
+		// any d > 0) — a sub-second sweep interval was already a
+		// hot-loop bug, never a sane setting.
+		interval: shared.GetenvDuration("CLUSTER_HEALTH_PROBES_INTERVAL", 5*time.Minute),
 	}
-	p := newClusterHealthProber(d.Name, d.CS, d.Dyn, cfg)
-	// Surface the resolved HEALTH_* knobs once at registration so an
-	// operator can tell from the logs which targets/thresholds the
-	// checks run with (an unparseable env value silently falls back
-	// to the default — the effective value is what matters here).
-	logf.Log.WithName(d.Name).Info("registered",
-		"interval", interval, "perCheckTimeout", p.Cfg.Timeouts.PerCheck,
-		"dnsHostnames", p.Cfg.DNS.Hostnames,
-		"checkTimeout", p.Cfg.Timeouts.Check, "httpURL", p.Cfg.HTTPContent.URL,
-		"httpExpectedContent", p.Cfg.HTTPContent.Expected,
-		"podCheckNamespace", p.Cfg.Pods.Namespace,
-		"maxPodRestarts", p.Cfg.Pods.MaxRestarts,
-		"podSkipDuration", p.Cfg.Pods.SkipDuration,
-		"quotaThreshold", p.Cfg.Quota.Threshold,
-		"kcmLeaseMaxAge", p.Cfg.KCM.LeaseMaxAge,
-		"kcmFreezeMinAge", p.Cfg.KCM.FreezeMinAge)
-	return shared.AddPeriodic(d.Mgr, d.Name, interval, p.run)
 }
 
 func (p *clusterHealthProber) run(ctx context.Context) error {
@@ -258,7 +269,7 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 		// would leave fake series behind on the dying pod. Bail out
 		// silently — the surviving leader's next cycle reports.
 		if ctx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // cancelled ctx is not a run error — bail silently
 		}
 		if cctx.Err() == context.DeadlineExceeded {
 			log.Info("health check exceeded per-check timeout",

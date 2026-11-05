@@ -18,8 +18,8 @@ import (
 	kfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -194,8 +194,6 @@ func newStallUnlocker(cs *kfake.Clientset, dyn *fake.FakeDynamicClient,
 		unlocked:     map[string]time.Time{},
 		alerted:      map[string]bool{},
 		stallEnabled: true,
-		unwedged:     map[string]time.Time{},
-		stallAlerted: map[string]time.Time{},
 	}
 	if key != "" {
 		u.stallFirstSeen.Observe(key, time.Now().Add(-stuckFor))
@@ -250,7 +248,7 @@ func TestHelmStallUnwedgeHappyPath(t *testing.T) {
 			t.Fatalf("annotation %s = %q, want the shared token %q", anno, got, token)
 		}
 	}
-	if _, ok := u.unwedged["ops/connect"]; !ok {
+	if !u.unwedged.CooledDown("ops/connect", helmUnlockCooldown, time.Now()) {
 		t.Fatal("HR not recorded in the unwedged ledger")
 	}
 	if got := promtestutil.ToFloat64(
@@ -390,7 +388,7 @@ func TestHelmStallUnwedgeCooldownHonored(t *testing.T) {
 		dyn := newDynFake(hr)
 		cs := kfake.NewSimpleClientset(objs...)
 		u := newStallUnlocker(cs, dyn, time.Hour, "ops/connect")
-		u.unwedged["ops/connect"] = time.Now().Add(-time.Hour)
+		u.unwedged.Stamp("ops/connect", time.Now().Add(-time.Hour))
 
 		before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 		if err := u.run(ctx); err != nil {
@@ -433,7 +431,7 @@ func TestHelmStallUnwedgeCooldownHonored(t *testing.T) {
 		dyn := newDynFake(hr)
 		cs := kfake.NewSimpleClientset(objs...)
 		u := newStallUnlocker(cs, dyn, time.Hour, "ops/connect")
-		u.unwedged["ops/connect"] = time.Now().Add(-25 * time.Hour)
+		u.unwedged.Stamp("ops/connect", time.Now().Add(-25*time.Hour))
 
 		if err := u.run(ctx); err != nil {
 			t.Fatal(err)

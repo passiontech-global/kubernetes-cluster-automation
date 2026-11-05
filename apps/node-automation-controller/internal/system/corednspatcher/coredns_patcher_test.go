@@ -1,13 +1,14 @@
 package corednspatcher
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -15,7 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -99,7 +100,7 @@ func corednsDeployBare() *appsv1.Deployment {
 func getCorednsDeploy(t *testing.T, cs *fake.Clientset) *appsv1.Deployment {
 	t.Helper()
 	d, err := cs.AppsV1().Deployments("kube-system").
-		Get(ctx, "coredns", metav1.GetOptions{})
+		Get(context.Background(), "coredns", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get coredns: %v", err)
 	}
@@ -227,7 +228,7 @@ func TestCoreDNSPatcherAppliesPatch(t *testing.T) {
 	testutil.CaptureDeployPatch(cs, &got)
 
 	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
-	res, err := r.Reconcile(ctx, reconcile.Request{})
+	res, err := r.Reconcile(context.Background(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -264,7 +265,7 @@ func TestCoreDNSPatcherScalesReplicas(t *testing.T) {
 
 	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
 		minReplicas: 4, nodesPerReplica: 2}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if !strings.Contains(string(got), `"replicas":5`) {
@@ -290,7 +291,7 @@ func TestCoreDNSPatcherReplicasFloor(t *testing.T) {
 
 	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
 		minReplicas: 4, nodesPerReplica: 1}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if !strings.Contains(string(got), `"replicas":4`) {
@@ -317,7 +318,7 @@ func TestCoreDNSPatcherScalingDisabledKeepsReplicas(t *testing.T) {
 	testutil.ForbidDeployPatch(cs, &patched)
 
 	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if patched {
@@ -338,7 +339,7 @@ func TestCoreDNSPatcherNodeListError(t *testing.T) {
 		})
 	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
 		minReplicas: 4, nodesPerReplica: 1}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
 }
@@ -353,7 +354,7 @@ func TestCoreDNSPatcherNullsMinDomainsOnScheduleAnyway(t *testing.T) {
 	testutil.CaptureDeployPatch(cs, &got)
 
 	r := &corednsPatcher{cs: cs, zoneWhen: "ScheduleAnyway", minDomains: 0}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if !strings.Contains(string(got), `"minDomains":null`) {
@@ -404,7 +405,7 @@ func TestCoreDNSPatcherNoOpWhenCorrect(t *testing.T) {
 
 	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
 		minReplicas: 4, nodesPerReplica: 1}
-	res, err := r.Reconcile(ctx, reconcile.Request{})
+	res, err := r.Reconcile(context.Background(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -428,7 +429,7 @@ func TestCoreDNSPatcherMissingContainerNoPatch(t *testing.T) {
 	testutil.ForbidDeployPatch(cs, &patched)
 
 	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
-	res, err := r.Reconcile(ctx, reconcile.Request{})
+	res, err := r.Reconcile(context.Background(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -444,7 +445,7 @@ func TestCoreDNSPatcherMissingContainerNoPatch(t *testing.T) {
 func TestCoreDNSPatcherMissingDeployment(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
-	res, err := r.Reconcile(ctx, reconcile.Request{})
+	res, err := r.Reconcile(context.Background(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -460,7 +461,7 @@ func TestCoreDNSPatcherGetError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the deployment get fails")
 	}
 }
@@ -472,7 +473,7 @@ func TestCoreDNSPatcherPatchError(t *testing.T) {
 			return true, nil, errors.New("patch rejected")
 		})
 	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the drift patch fails")
 	}
 }

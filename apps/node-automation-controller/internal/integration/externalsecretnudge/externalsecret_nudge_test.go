@@ -3,6 +3,7 @@ package externalsecretnudge
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -15,9 +16,9 @@ import (
 	"k8s.io/client-go/dynamic/fake"
 	kfake "k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	ktesting "k8s.io/client-go/testing"
 )
@@ -116,7 +117,6 @@ func newNudge(dyn *fake.FakeDynamicClient, enabled bool) *externalSecretNudge {
 		dyn:        dyn,
 		enabled:    enabled,
 		storeReady: map[string]bool{},
-		nudged:     map[string]time.Time{},
 	}
 }
 
@@ -374,39 +374,41 @@ func TestExternalSecretNudgeReadySinceFallback(t *testing.T) {
 	}
 }
 
-// The nudged ledger prunes stamps whose ES vanished or aged past the
-// 1h cooldown, keeps a live ES still inside it, and lets an expired
-// entry re-nudge a still-stuck ES.
-func TestExternalSecretNudgePrunesNudgedLedger(t *testing.T) {
+// The nudged cooldown suppresses a still-stuck ES inside the 1h
+// window and lets an expired stamp re-nudge. CooldownSet has no
+// enumeration — stamps for vanished ESs are dead weight that ages
+// out of the window on its own.
+func TestExternalSecretNudgeNudgedCooldown(t *testing.T) {
 	live := esObj("apps", "es-live", "False", 30*time.Minute)
 	expired := esObj("apps", "es-expired", "False", 2*time.Hour)
 	healed := esObj("apps", "es-healed", "True", 3*time.Hour)
 	dyn := newDynFake(live, expired, healed)
 	n := newNudge(dyn, true)
-	fresh := time.Now().Add(-10 * time.Minute)
-	stale := time.Now().Add(-esNudgeCooldown - time.Minute)
-	n.nudged["apps/es-live"] = fresh    // live + inside cooldown → keep
-	n.nudged["apps/es-expired"] = stale // live + past cooldown → re-nudge
-	n.nudged["apps/es-healed"] = stale  // healed → prune, nothing re-adds
-	n.nudged["apps/es-gone"] = fresh    // vanished → prune
+	now := time.Now()
+	fresh := now.Add(-10 * time.Minute)
+	stale := now.Add(-esNudgeCooldown - time.Minute)
+	n.nudged.Stamp("apps/es-live", fresh)    // live + inside cooldown → suppress
+	n.nudged.Stamp("apps/es-expired", stale) // live + past cooldown → re-nudge
+	n.nudged.Stamp("apps/es-healed", stale)  // healed → nothing re-adds
+	n.nudged.Stamp("apps/es-gone", fresh)    // vanished → dead weight
 
 	if err := n.nudge(ctx, true, true); err != nil { // edge path — all stuck ESs eligible
 		t.Fatal(err)
 	}
-	if _, ok := n.nudged["apps/es-gone"]; ok {
-		t.Fatal("nudged entry for a deleted ES not pruned")
+	if !n.nudged.CooledDown("apps/es-live", esNudgeCooldown, now) {
+		t.Fatal("live ES inside the cooldown lost its nudge suppression")
 	}
-	if _, ok := n.nudged["apps/es-healed"]; ok {
-		t.Fatal("expired entry on a healed ES not pruned")
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-live", esForceSyncAnno); got != "" {
+		t.Fatal("ES re-nudged inside the in-RAM cooldown")
 	}
-	if got := n.nudged["apps/es-live"]; !got.Equal(fresh) {
-		t.Fatal("live ES inside the cooldown lost/re-stamped its nudge entry")
-	}
-	if got := n.nudged["apps/es-expired"]; !got.After(stale) {
-		t.Fatal("ES past the cooldown was not re-nudged")
+	if !n.nudged.CooledDown("apps/es-expired", esNudgeCooldown, now) {
+		t.Fatal("re-nudged ES did not re-stamp the cooldown")
 	}
 	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-expired", esForceSyncAnno); got == "" {
-		t.Fatal("expired entry's ES was pruned but never re-stamped")
+		t.Fatal("ES past the cooldown was not re-nudged")
+	}
+	if n.nudged.CooledDown("apps/es-healed", esNudgeCooldown, now) {
+		t.Fatal("stale stamp on a healed ES still reads cooled")
 	}
 }
 
@@ -489,10 +491,10 @@ func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 	if err := n.nudge(ctx, true, true); err != nil {
 		t.Fatalf("per-ES patch failure must not fail the nudge: %v", err)
 	}
-	if _, ok := n.nudged["apps/es-bad"]; ok {
+	if n.nudged.CooledDown("apps/es-bad", esNudgeCooldown, time.Now()) {
 		t.Fatal("failed nudge recorded as delivered")
 	}
-	if _, ok := n.nudged["apps/es-good"]; !ok {
+	if !n.nudged.CooledDown("apps/es-good", esNudgeCooldown, time.Now()) {
 		t.Fatal("healthy patch skipped after a sibling's failure")
 	}
 	if got := testutil.QueueErrorCount(t, "externalsecret-nudge") - before; got != 1 {
@@ -592,7 +594,7 @@ func TestExternalSecretNudgePersistedCooldown(t *testing.T) {
 	recent := esObj("apps", "es-recent", "False", 2*time.Hour)
 	esStoreRef(recent, "ClusterSecretStore", "css1")
 	recent.SetAnnotations(map[string]string{
-		esForceSyncAnno: fmt.Sprintf("%d", time.Now().Add(-30*time.Minute).Unix()),
+		esForceSyncAnno: strconv.FormatInt(time.Now().Add(-30*time.Minute).Unix(), 10),
 	})
 	stale := esObj("apps", "es-stale", "False", 2*time.Hour)
 	esStoreRef(stale, "ClusterSecretStore", "css1")
@@ -707,7 +709,6 @@ func TestExternalSecretNudgeConnectHeal(t *testing.T) {
 		dyn:        dyn,
 		enabled:    true,
 		storeReady: map[string]bool{},
-		nudged:     map[string]time.Time{},
 	}
 	// The store has been observed down since 20m ago — past the
 	// 15m persistence window.
@@ -752,7 +753,6 @@ func TestExternalSecretNudgeConnectHealTransient(t *testing.T) {
 		dyn:        dyn,
 		enabled:    true,
 		storeReady: map[string]bool{},
-		nudged:     map[string]time.Time{},
 	}
 	if err := n.run(ctx); err != nil { // first sight — clock starts now
 		t.Fatal(err)

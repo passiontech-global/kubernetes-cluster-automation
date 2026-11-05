@@ -37,7 +37,7 @@ func TestKubeletHealthz(t *testing.T) {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			w.WriteHeader(200)
+			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprint(w, "ok")
 		})
 		body, err := KubeletHealthz(ctx, cs, "w1")
@@ -57,7 +57,7 @@ func TestKubeletHealthz(t *testing.T) {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			w.WriteHeader(200)
+			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprint(w, "ok")
 		})
 		if _, err := KubeletHealthz(ctx, cs, "w2"); err != nil {
@@ -70,7 +70,7 @@ func TestKubeletHealthz(t *testing.T) {
 	// policy to weigh.
 	t.Run("5xx propagates as an error", func(t *testing.T) {
 		cs := healthzClientset(t, func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(500)
+			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = fmt.Fprint(w, "error trying to reach service")
 		})
 		if _, err := KubeletHealthz(ctx, cs, "w1"); err == nil {

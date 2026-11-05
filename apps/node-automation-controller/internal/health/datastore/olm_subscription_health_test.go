@@ -4,7 +4,7 @@
 package datastore
 
 import (
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"testing"
 	"time"
 
@@ -16,7 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -128,8 +128,9 @@ func TestCheckOLMHealthUnhealthySubscription(t *testing.T) {
 		})
 	p := testProberDyn(cs, probetest.OpDyn(sub))
 	p.Now = func() time.Time { return base }
-	mustCheck[*olmHealthCheck](t, p).olmFirstSeen["Subscription/operators/keda/"+olmReasonCatalogUnhealthy] =
-		base.Add(-time.Hour)
+	mustCheck[*olmHealthCheck](t, p).olmFirstSeen.
+		Observe("Subscription/operators/keda/"+olmReasonCatalogUnhealthy,
+			base.Add(-time.Hour))
 
 	if res := mustCheck[*olmHealthCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("unhealthy subscription must FAIL")
@@ -159,8 +160,9 @@ func TestCheckOLMHealthCertRotationOverdue(t *testing.T) {
 		})
 	p := testProberDyn(cs, probetest.OpDyn(csv))
 	p.Now = func() time.Time { return base }
-	mustCheck[*olmHealthCheck](t, p).olmFirstSeen["ClusterServiceVersion/operators/nhc.v1/"+olmReasonCertOverdue] =
-		base.Add(-25 * time.Minute)
+	mustCheck[*olmHealthCheck](t, p).olmFirstSeen.
+		Observe("ClusterServiceVersion/operators/nhc.v1/"+olmReasonCertOverdue,
+			base.Add(-25*time.Minute))
 
 	if res := mustCheck[*olmHealthCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("overdue cert rotation past the heal window must FAIL")
@@ -179,7 +181,7 @@ func TestCheckOLMHealthHealthyPasses(t *testing.T) {
 	if res := mustCheck[*olmHealthCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("healthy OLM state must pass: %+v", res)
 	}
-	if len(mustCheck[*olmHealthCheck](t, p).olmFirstSeen) != 0 {
-		t.Fatalf("healthy objects must not be tracked: %v", mustCheck[*olmHealthCheck](t, p).olmFirstSeen)
+	if keys := dsTrackedKeys(&mustCheck[*olmHealthCheck](t, p).olmFirstSeen); len(keys) != 0 {
+		t.Fatalf("healthy objects must not be tracked: %v", keys)
 	}
 }

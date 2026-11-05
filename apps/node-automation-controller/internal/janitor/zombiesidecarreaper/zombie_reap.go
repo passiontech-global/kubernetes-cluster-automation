@@ -11,12 +11,11 @@ import (
 	"context"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // allZeroExit reports whether every app (non-sidecar) container in
@@ -73,9 +72,10 @@ func (r *zombieSidecarReaper) jobAllowsReap(ctx context.Context, p *corev1.Pod, 
 		return false // qualification guarantees a Job owner — unreachable
 	}
 	log := logf.FromContext(ctx)
-	job, err := r.cs.BatchV1().Jobs(p.Namespace).Get(ctx, jobName, metav1.GetOptions{})
+	job, getErr := r.cs.BatchV1().Jobs(p.Namespace).Get(ctx, jobName, metav1.GetOptions{})
+	jobGone, err := shared.ConfirmAbsent(getErr)
 	switch {
-	case apierrors.IsNotFound(err):
+	case jobGone:
 		return true // Job gone — nobody recreates the pod
 	case err != nil:
 		metrics.IncError(r.queue)

@@ -14,21 +14,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // The reaper skips mgr.Add entirely when Deps.Disabled is stamped
 // (setupModules resolves CILIUM_TAINT_REAPER_ENABLED) — no informer,
 // no RequeueAfter loop, no periodic LIST against the apiserver.
 func TestSetupDisabled(t *testing.T) {
-	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Name: "cilium-taint-reaper", Mgr: m, CS: fake.NewSimpleClientset(), Disabled: true}); err != nil {
-		t.Fatalf("disabled setup must return nil, got %v", err)
-	}
-	if len(m.Added) != 0 {
-		t.Fatalf("disabled module registered %d runnables, want 0", len(m.Added))
-	}
+	testutil.DisabledNoop(t, Setup, shared.Deps{
+		Name: "cilium-taint-reaper",
+		CS:   fake.NewSimpleClientset(),
+	})
 }
 
 // Builder-based: .Complete() resolves the For() GVK via the real

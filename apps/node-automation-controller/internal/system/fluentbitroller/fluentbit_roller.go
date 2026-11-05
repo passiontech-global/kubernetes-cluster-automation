@@ -35,8 +35,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 type fluentBitRoller struct {
@@ -45,6 +45,9 @@ type fluentBitRoller struct {
 	// registry row) so the controller name and every IncError label
 	// come from one place.
 	queue string
+	// now is the clock seam — tests pin it so the rollout-restart
+	// timestamp is deterministic. nil → time.Now.
+	now shared.Clock
 }
 
 // onlyPipelineSecret is the exact predicate the For() watch below
@@ -65,7 +68,7 @@ func Setup(d shared.Deps) error {
 	if d.Disabled {
 		return nil
 	}
-	r := &fluentBitRoller{cs: d.CS, queue: d.Name}
+	r := &fluentBitRoller{cs: d.CS, queue: d.Name, now: shared.SystemClock}
 	return ctrl.NewControllerManagedBy(d.Mgr).
 		Named(d.Name).
 		For(&corev1.Secret{}, builder.WithPredicates(onlyPipelineSecret)).
@@ -144,7 +147,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	// kubectl rollout restart equivalent.
 	restartPatch := []byte(fmt.Sprintf(
 		`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":%q}}}}}`,
-		time.Now().UTC().Format(time.RFC3339)))
+		r.now.Now().UTC().Format(time.RFC3339)))
 	if _, err := r.cs.AppsV1().DaemonSets("fluent-system").Patch(ctx, "fluent-bit",
 		types.StrategicMergePatchType, restartPatch, metav1.PatchOptions{}); err != nil {
 		metrics.IncError(r.queue)

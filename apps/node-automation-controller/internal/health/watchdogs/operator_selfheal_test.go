@@ -4,8 +4,8 @@
 package watchdogs
 
 import (
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"testing"
 	"time"
 
@@ -17,8 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // shLease builds a leader-election Lease renewing `age` before `at`.
@@ -158,8 +158,8 @@ func TestCheckOperatorWorkqueuesStaleLeaseQuiet(t *testing.T) {
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("stale lease must pass quietly, got %+v", res)
 	}
-	if len(mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) != 0 {
-		t.Fatalf("stale-lease operator must not be tracked: %v", mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen)
+	if keys := wdTrackedKeys(&mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen); len(keys) != 0 {
+		t.Fatalf("stale-lease operator must not be tracked: %v", keys)
 	}
 }
 
@@ -194,8 +194,8 @@ func TestCheckOperatorWorkqueuesStuckThenHeals(t *testing.T) {
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
-	if len(mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) != 1 {
-		t.Fatalf("signature not tracked: %v", mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen)
+	if keys := wdTrackedKeys(&mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen); len(keys) != 1 {
+		t.Fatalf("signature not tracked: %v", keys)
 	}
 	if v, ok := shOpFrozenGauge(t, "scylla-operator", kcmReasonStaleGen); ok && v != 0 {
 		t.Fatalf("frozen gauge = %v before the window, want absent/0", v)
@@ -256,7 +256,8 @@ func TestCheckOperatorWorkqueuesHealCooldown(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	// Seed first-seen long ago so the signature is already frozen.
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("scylla-operator/scyllaclusters/scylla/db", base.Add(-time.Hour))
 
 	res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
@@ -318,7 +319,8 @@ func TestCheckOperatorWorkqueuesPersistedCooldown(t *testing.T) {
 		"scylla", "db", 5, 3)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("scylla-operator/scyllaclusters/scylla/db", base.Add(-time.Hour))
 
 	res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
@@ -354,7 +356,8 @@ func TestCheckOperatorWorkqueuesMaintenanceDefers(t *testing.T) {
 		"scylla", "db", 5, 3)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("scylla-operator/scyllaclusters/scylla/db", base.Add(-time.Hour))
 
 	res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
@@ -382,12 +385,14 @@ func TestCheckOperatorWorkqueuesSuspendedFluxIgnored(t *testing.T) {
 	_ = unstructured.SetNestedField(suspended.Object, true, "spec", "suspend")
 	p := testProberDyn(cs, probetest.OpDyn(suspended))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["helm-controller/helmreleases/apps/hr"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("helm-controller/helmreleases/apps/hr", base.Add(-time.Hour))
 
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("suspended HelmRelease must not freeze the check: %+v", res)
 	}
-	if _, ok := mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["helm-controller/helmreleases/apps/hr"]; ok {
+	if _, ok := mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Seen("helm-controller/helmreleases/apps/hr", base); ok {
 		t.Fatal("suspended-object tracking must be pruned")
 	}
 }
@@ -416,7 +421,8 @@ func TestCheckOperatorWorkqueuesSelectorFallback(t *testing.T) {
 		"db", "cache", 9, 4)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["dragonfly-operator/dragonflies/db/cache"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("dragonfly-operator/dragonflies/db/cache", base.Add(-time.Hour))
 
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("stuck dragonfly must FAIL")
@@ -454,7 +460,8 @@ func TestCheckOperatorWorkqueuesCertManagerPodNS(t *testing.T) {
 		"apps", "tls", 5, 3)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["cert-manager/certificates/apps/tls"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("cert-manager/certificates/apps/tls", base.Add(-time.Hour))
 
 	res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
@@ -490,7 +497,8 @@ func TestCheckOperatorWorkqueuesDragonflyLeaseOptional(t *testing.T) {
 		"db", "cache", 9, 4)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["dragonfly-operator/dragonflies/db/cache"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("dragonfly-operator/dragonflies/db/cache", base.Add(-time.Hour))
 
 	res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
@@ -546,8 +554,9 @@ func TestCheckOperatorWorkqueuesMedik8sTarget(t *testing.T) {
 		"NodeHealthCheck", "operators", "nhc", 3, 0)
 	p := testProberDyn(cs, probetest.OpDyn(nhc))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["node-healthcheck-operator/nodehealthchecks/operators/nhc"] =
-		base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("node-healthcheck-operator/nodehealthchecks/operators/nhc",
+			base.Add(-time.Hour))
 
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("never-reconciled NodeHealthCheck must FAIL")

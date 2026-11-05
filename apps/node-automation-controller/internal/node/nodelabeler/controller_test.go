@@ -1,6 +1,7 @@
 package nodelabeler
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,7 +10,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 func TestNodeLabeler(t *testing.T) {
@@ -27,7 +28,7 @@ func TestNodeLabeler(t *testing.T) {
 			map[string]string{"node-role.kubernetes.io/worker": ""}),
 	)
 	r := &nodeLabeler{cs: cs, configPath: cfg}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -8,7 +8,7 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"maps"
 	"sort"
 	"strings"
@@ -23,8 +23,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // linkerdEndpointSyncCheck is the W9-NM2 linkerd endpoint-sync
@@ -43,19 +43,18 @@ type linkerdEndpointSyncCheck struct {
 	//   - linkerdDesyncHealed: "ns/svc" → last linkerd-destination
 	//     bounce — the 1h per-service cooldown (in-RAM: the pod is
 	//     the heal target, nothing else can carry the stamp).
-	linkerdDesyncSince   map[string]time.Time
+	linkerdDesyncSince   shared.FirstSeenLedger
 	linkerdDesyncEmitted map[string]bool
-	linkerdDesyncHealed  map[string]time.Time
+	linkerdDesyncHealed  shared.CooldownSet
 }
 
 // newLinkerdEndpointSyncCheck builds the W9-NM2 check with fresh
 // tracking maps — the state-map initialization that used to live in
-// the monolithic newClusterHealthProber literal.
+// the monolithic newClusterHealthProber literal. The time-keyed
+// ledgers are zero-value ready; only the gauge-tuple set arms here.
 func NewLinkerdEndpointSyncCheck(d *probefw.Deps) probefw.Check {
 	return &linkerdEndpointSyncCheck{Deps: d,
-		linkerdDesyncSince:   map[string]time.Time{},
 		linkerdDesyncEmitted: map[string]bool{},
-		linkerdDesyncHealed:  map[string]time.Time{},
 	}
 }
 
@@ -195,14 +194,8 @@ func staleLinkerdSlices(slices []linkerdSliceRef,
 func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	if p.linkerdDesyncSince == nil {
-		p.linkerdDesyncSince = map[string]time.Time{}
-	}
 	if p.linkerdDesyncEmitted == nil {
 		p.linkerdDesyncEmitted = map[string]bool{}
-	}
-	if p.linkerdDesyncHealed == nil {
-		p.linkerdDesyncHealed = map[string]time.Time{}
 	}
 
 	// Namespaces opted into injection — the only places a desynced
@@ -344,15 +337,10 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	emitted := map[string]bool{} // "ns/name" past the persistence window
-	for k := range p.linkerdDesyncSince {
-		if !desynced[k] {
-			delete(p.linkerdDesyncSince, k)
-		}
-	}
+	p.linkerdDesyncSince.Prune(func(k string) bool { return desynced[k] })
 	for k := range desynced {
-		first, ok := p.linkerdDesyncSince[k]
-		if !ok {
-			p.linkerdDesyncSince[k] = now
+		first, seen := p.linkerdDesyncSince.Observe(k, now)
+		if !seen {
 			log.Info("linkerd endpoint desync — tracking first-seen", "service", k)
 			continue
 		}
@@ -373,13 +361,6 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		delete(p.linkerdDesyncEmitted, k)
 	}
 	maps.Copy(p.linkerdDesyncEmitted, emitted)
-	// Prune expired heal-ledger entries — an entry past the cooldown
-	// can never block again, so keeping it is pure map growth.
-	for k, last := range p.linkerdDesyncHealed {
-		if now.Sub(last) >= linkerdDestHealCooldown {
-			delete(p.linkerdDesyncHealed, k)
-		}
-	}
 
 	// Past the window: bounce the oldest linkerd-destination pod so
 	// its endpoint table rebuilds from the current EndpointSlices.
@@ -425,10 +406,9 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 	log logr.Logger, svcKey string, now time.Time, stale []linkerdSliceRef) {
 
-	last, ok := p.linkerdDesyncHealed[svcKey]
-	if ok && now.Sub(last) < linkerdDestHealCooldown {
+	if p.linkerdDesyncHealed.CooledDown(svcKey, linkerdDestHealCooldown, now) {
 		log.Info("skip heal: linkerd-destination inside cooldown",
-			"service", svcKey, "ago", now.Sub(last).Truncate(time.Minute))
+			"service", svcKey)
 		return
 	}
 	held, why, err := shared.MaintenanceActive(ctx, p.CS, p.Dyn)
@@ -502,6 +482,6 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		}
 	}
 	if healed {
-		p.linkerdDesyncHealed[svcKey] = now
+		p.linkerdDesyncHealed.Stamp(svcKey, now)
 	}
 }

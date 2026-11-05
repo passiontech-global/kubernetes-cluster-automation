@@ -3,13 +3,12 @@ package watchdogs
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
-	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -29,16 +28,16 @@ type kcmWorkqueueCheck struct {
 	//   - kcmFrozenReasons: reason labels currently held at 1, so a
 	//     resolved signature flips its series back to 0 instead of
 	//     leaking a stale 1 forever.
-	kcmFirstSeen     map[string]time.Time
+	kcmFirstSeen     shared.FirstSeenLedger
 	kcmFrozenReasons map[string]bool
 }
 
-// newKcmWorkqueueCheck builds the C6 watchdog with fresh tracking
-// maps — the state-map initialization that used to live in the
-// monolithic newClusterHealthProber literal.
+// newKcmWorkqueueCheck builds the C6 watchdog — the first-seen
+// ledger arms lazily; only the frozen-reasons map needs the
+// explicit initialization that used to live in the monolithic
+// newClusterHealthProber literal.
 func NewKcmWorkqueueCheck(d *probefw.Deps) probefw.Check {
 	return &kcmWorkqueueCheck{Deps: d,
-		kcmFirstSeen:     map[string]time.Time{},
 		kcmFrozenReasons: map[string]bool{},
 	}
 }
@@ -79,7 +78,7 @@ const (
 //     it here would double-alert the wrong diagnosis.
 //
 // Freeze signatures (kube-system objects), each required to persist
-// continuously for kcmFreezeMinAge via a per-object first-seen map:
+// continuously for kcmFreezeMinAge via a per-object first-seen ledger:
 //   - daemonset_desired_zero: a DaemonSet reports
 //     status.desiredNumberScheduled==0 while pods are still
 //     scheduled/ready — the DS controller stopped recomputing desired
@@ -169,21 +168,20 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 
 	frozen := map[string]bool{}
 	for sig, reason := range sigs {
-		if _, ok := p.kcmFirstSeen[sig]; !ok {
-			p.kcmFirstSeen[sig] = now
+		first, tracked := p.kcmFirstSeen.Observe(sig, now)
+		if !tracked {
 			log.Info("KCM freeze signature — tracking first-seen",
 				"signature", sig)
 			continue
 		}
-		if now.Sub(p.kcmFirstSeen[sig]) >= p.Cfg.KCM.FreezeMinAge {
+		if now.Sub(first) >= p.Cfg.KCM.FreezeMinAge {
 			frozen[reason] = true
 		}
 	}
-	for sig := range p.kcmFirstSeen {
-		if _, ok := sigs[sig]; !ok {
-			delete(p.kcmFirstSeen, sig)
-		}
-	}
+	p.kcmFirstSeen.Prune(func(sig string) bool {
+		_, ok := sigs[sig]
+		return ok
+	})
 	for reason := range p.kcmFrozenReasons {
 		if !frozen[reason] {
 			metrics.KCMWorkqueueFrozen.WithLabelValues(reason).Set(0)
@@ -213,7 +211,7 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 // nodes, absent/stale KCM Lease) so a signature that flaps around a
 // precondition edge re-arms its persistence window from scratch.
 func (p *kcmWorkqueueCheck) resetKCMWorkqueue() {
-	clear(p.kcmFirstSeen)
+	p.kcmFirstSeen = shared.FirstSeenLedger{}
 	for reason := range p.kcmFrozenReasons {
 		metrics.KCMWorkqueueFrozen.WithLabelValues(reason).Set(0)
 		delete(p.kcmFrozenReasons, reason)

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 func TestKubeletReaperProbeHTTP(t *testing.T) {
@@ -36,7 +36,7 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 			case hit <- struct{}{}:
 			default:
 			}
-			w.WriteHeader(200)
+			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprint(w, "error trying to reach service")
 		})
 		r := &kubeletReaper{cs: cs}
@@ -73,7 +73,7 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 		var attempts atomic.Int32
 		cs := testutil.ProbeClientset(t, func(w http.ResponseWriter, r *http.Request) {
 			attempts.Add(1)
-			w.WriteHeader(200)
+			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprint(w, "error trying to reach service")
 		})
 		r := &kubeletReaper{cs: cs}
@@ -97,7 +97,7 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 	t.Run("recovery between retries reports healthy", func(t *testing.T) {
 		var attempts atomic.Int32
 		cs := testutil.ProbeClientset(t, func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(200)
+			w.WriteHeader(http.StatusOK)
 			if attempts.Add(1) >= 2 {
 				_, _ = fmt.Fprint(w, "ok")
 				return

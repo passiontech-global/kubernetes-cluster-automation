@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -438,7 +438,7 @@ func TestCertManagerReaperListError(t *testing.T) {
 	dyn := testutil.NewFakeDyn(cmrListKinds)
 	dyn.PrependReactor("list", "certificates",
 		func(clienttesting.Action) (bool, runtime.Object, error) {
-			return true, nil, fmt.Errorf("api down")
+			return true, nil, errors.New("api down")
 		})
 	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
@@ -758,7 +758,7 @@ func TestCertManagerReaperStuckCertificateRequest(t *testing.T) {
 	}
 	dyn := testutil.NewFakeDyn(cmrListKinds, objs...)
 	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
-		resets: map[string]*certReset{}, crReaped: map[string]time.Time{}}
+		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}

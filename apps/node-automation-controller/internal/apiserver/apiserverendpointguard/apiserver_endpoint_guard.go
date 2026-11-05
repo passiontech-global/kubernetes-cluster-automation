@@ -89,14 +89,13 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -337,15 +336,15 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	// object is never touched at all.
 	var ep *corev1.Endpoints //nolint:staticcheck // SA1019: deliberate — the deprecated Endpoints object is the writable SSOT on hosted planes
 	if primary == nil || mirrorManagedSlice(primary) || !preferSlice {
-		e, err := g.cs.CoreV1().Endpoints(endpointGuardNS).
+		e, getErr := g.cs.CoreV1().Endpoints(endpointGuardNS).
 			Get(ctx, endpointGuardName, metav1.GetOptions{})
-		switch {
-		case apierrors.IsNotFound(err):
-		case err != nil:
+		gone, err := shared.ConfirmAbsent(getErr)
+		if err != nil {
 			// periodic loop meters/logs — nothing to act on without it
 			return fmt.Errorf("get endpoints %s/%s: %w",
 				endpointGuardNS, endpointGuardName, err)
-		default:
+		}
+		if !gone {
 			ep = e
 		}
 	}

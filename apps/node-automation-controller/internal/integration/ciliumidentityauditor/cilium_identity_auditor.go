@@ -62,8 +62,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -128,19 +128,25 @@ type ciliumIdentityAuditor struct {
 // not exist there; CILIUM_IDENTITY_AUDITOR_ENABLED is opt-in and
 // resolved by setupModules into Deps.Disabled).
 func Setup(d shared.Deps) error {
-	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	if d.Disabled {
-		return nil
-	}
-	a := &ciliumIdentityAuditor{
-		cs:        cs,
-		dyn:       dyn,
-		gcEnabled: shared.Gate("CILIUM_IDENTITY_GC_ENABLED", true),
-		now:       shared.SystemClock,
-		queue:     d.Name,
-	}
-	logf.Log.WithName(a.queue).Info("registered", "gcEnabled", a.gcEnabled)
-	return shared.AddPeriodic(mgr, a.queue, 15*time.Minute, a.run)
+	return shared.SetupWithConfig(d, gcEnabledFromEnv, func(gcEnabled bool) error {
+		a := &ciliumIdentityAuditor{
+			cs:        d.CS,
+			dyn:       d.Dyn,
+			gcEnabled: gcEnabled,
+			now:       shared.SystemClock,
+			queue:     d.Name,
+		}
+		logf.Log.WithName(a.queue).Info("registered", "gcEnabled", a.gcEnabled)
+		return shared.AddPeriodic(d.Mgr, a.queue, 15*time.Minute, a.run)
+	})
+}
+
+// gcEnabledFromEnv resolves the GC sub-feature gate. SetupWithConfig
+// runs it before the Deps.Disabled check — see corednspatcher: an
+// unparseable CILIUM_IDENTITY_GC_ENABLED must warn even on a
+// gated-off cluster.
+func gcEnabledFromEnv() bool {
+	return shared.Gate("CILIUM_IDENTITY_GC_ENABLED", true)
 }
 
 func (a *ciliumIdentityAuditor) run(ctx context.Context) error {

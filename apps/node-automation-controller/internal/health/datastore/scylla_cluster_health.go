@@ -7,8 +7,9 @@ package datastore
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"io"
 	"maps"
 	"regexp"
@@ -24,8 +25,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // scyllaHealthCheck is the W9-ST1 scylla cluster health watchdog.
@@ -40,17 +41,17 @@ type scyllaHealthCheck struct {
 	//     condition's lastTransitionTime). Pruned on resolve.
 	//   - scyllaEmitted: "ns/cluster/reason" gauge tuples held at 1 —
 	//     same DeleteLabelValues hygiene as the other emitted sets.
-	scyllaFirstSeen map[string]time.Time
+	scyllaFirstSeen shared.FirstSeenLedger
 	scyllaEmitted   map[string]bool
 }
 
-// newScyllaHealthCheck builds the W9-ST1 check with fresh tracking
-// maps — the state-map initialization that used to live in the
-// monolithic newClusterHealthProber literal.
+// newScyllaHealthCheck builds the W9-ST1 check — the first-seen
+// ledger arms lazily; only the emitted-series map needs the
+// explicit initialization that used to live in the monolithic
+// newClusterHealthProber literal.
 func NewScyllaHealthCheck(d *probefw.Deps) probefw.Check {
 	return &scyllaHealthCheck{Deps: d,
-		scyllaFirstSeen: map[string]time.Time{},
-		scyllaEmitted:   map[string]bool{},
+		scyllaEmitted: map[string]bool{},
 	}
 }
 
@@ -193,13 +194,10 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 	// The CR scan needs dyn — a missing client is a wiring bug, not
 	// "no signal" (same posture as the OLM check).
 	if p.Dyn == nil {
-		return probefw.Result{Infra: fmt.Errorf(
+		return probefw.Result{Infra: errors.New(
 			"no dynamic client — scylla health check unverifiable")}
 	}
 	now := p.Now()
-	if p.scyllaFirstSeen == nil {
-		p.scyllaFirstSeen = map[string]time.Time{}
-	}
 	if p.scyllaEmitted == nil {
 		p.scyllaEmitted = map[string]bool{}
 	}
@@ -344,15 +342,13 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	// Persistence window + gauge emission — same first-seen /
 	// DeleteLabelValues hygiene as the OLM and masterless checks.
-	for k := range p.scyllaFirstSeen {
-		if _, ok := pending[k]; !ok {
-			delete(p.scyllaFirstSeen, k)
-		}
-	}
+	p.scyllaFirstSeen.Prune(func(k string) bool {
+		_, ok := pending[k]
+		return ok
+	})
 	for k, f := range pending {
-		first, ok := p.scyllaFirstSeen[k]
-		if !ok {
-			p.scyllaFirstSeen[k] = now
+		first, tracked := p.scyllaFirstSeen.Observe(k, now)
+		if !tracked {
 			log.Info("scylla unhealthy signature — tracking first-seen",
 				"signature", k)
 			continue
@@ -391,6 +387,6 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	return probefw.Result{Why: fmt.Sprintf(
-		"scylla unhealthy signatures: %s", strings.Join(keys, ", "))}
+	return probefw.Result{Why: "scylla unhealthy signatures: " +
+		strings.Join(keys, ", ")}
 }

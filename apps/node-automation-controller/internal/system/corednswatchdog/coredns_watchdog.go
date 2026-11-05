@@ -35,7 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -59,7 +59,11 @@ type coreDNSWatchdog struct {
 	// streak replaces the bash /tmp/coredns-streak-* files: pod ->
 	// consecutive layer-2 failures. Resets on operator restart,
 	// biasing conservative like the old tmpfs files did.
-	streak map[string]int
+	streak shared.StreakLedger
+	// now is the clock seam — tests pin it so the recovery cooldown
+	// window and the stamped timestamps are deterministic.
+	// nil → time.Now.
+	now shared.Clock
 	// Probe seams: the real implementations are the logHit/dnsProbe/
 	// panics methods below — fields so tests can stub log-stream,
 	// UDP:53 and :9153 access that the fake clientset cannot reach.
@@ -74,10 +78,10 @@ type coreDNSWatchdog struct {
 
 func Setup(d shared.Deps) error {
 	w := &coreDNSWatchdog{
-		cs:     d.CS,
-		http:   &http.Client{Timeout: 5 * time.Second},
-		queue:  d.Name,
-		streak: map[string]int{},
+		cs:    d.CS,
+		http:  &http.Client{Timeout: 5 * time.Second},
+		queue: d.Name,
+		now:   shared.SystemClock,
 	}
 	w.logHitFn = w.logHit
 	w.dnsFn = w.dnsProbe
@@ -106,18 +110,17 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	// before the log streams, EndpointSlice lists and DNS probes run.
 	podList = nil
 	// Prune streaks of pods that vanished (recreates change names).
-	for name := range w.streak {
-		if _, ok := podIP[name]; !ok {
-			delete(w.streak, name)
-		}
-	}
+	w.streak.Prune(func(name string) bool {
+		_, ok := podIP[name]
+		return ok
+	})
 	stale := map[string]bool{}
 
 	// ===== Layer 1: log fast-path =====
 	for name := range podIP {
 		if hit := w.logHitFn(ctx, name); hit != "" {
 			stale[name] = true
-			w.streak[name] = corednsStreakMax
+			w.streak.Set(name, corednsStreakMax)
 			log.Info("log: STALE — informer death signature", "pod", name, "match", hit)
 		}
 	}
@@ -140,7 +143,7 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 			}
 			if ips, err := w.dnsFn(ctx, ip, fqdn); err == nil && dnsAnswerFresh(ips, wantIPs) {
 				answered++
-				delete(w.streak, name)
+				w.streak.Reset(name)
 				log.Info("dns: fresh", "pod", name, "answers", len(ips))
 			} else {
 				failed = append(failed, name)
@@ -154,8 +157,7 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 			log.Info("dns: ABORT layer 2 — no pod answered, probe path to podIP likely broken (inconclusive)")
 		} else {
 			for _, name := range failed {
-				s := w.streak[name] + 1
-				w.streak[name] = s
+				s := w.streak.Hit(name)
 				if s >= corednsStreakMax {
 					stale[name] = true
 					log.Info("dns: STALE — cannot resolve probe fqdn",
@@ -180,7 +182,7 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 		}
 		if panics > 0 {
 			stale[name] = true
-			w.streak[name] = corednsStreakMax
+			w.streak.Set(name, corednsStreakMax)
 			log.Info("metrics: STALE — coredns_panics_total>0", "pod", name, "panics", panics)
 		}
 	}

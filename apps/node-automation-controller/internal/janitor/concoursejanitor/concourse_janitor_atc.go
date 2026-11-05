@@ -7,6 +7,7 @@ package concoursejanitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -75,7 +76,7 @@ func (c *atcClient) login(ctx context.Context, user, pass string) error {
 		return fmt.Errorf("atc token decode: %w", err)
 	}
 	if tok.AccessToken == "" {
-		return fmt.Errorf("atc token response has no access_token")
+		return errors.New("atc token response has no access_token")
 	}
 	c.token = "Bearer " + tok.AccessToken
 	return nil

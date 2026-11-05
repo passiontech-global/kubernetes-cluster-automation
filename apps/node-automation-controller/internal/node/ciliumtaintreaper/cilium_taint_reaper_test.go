@@ -1,11 +1,12 @@
 package ciliumtaintreaper
 
 import (
+	"context"
 	"errors"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,7 +33,7 @@ func TestCiliumTaintReaperNoPodKeepsTaint(t *testing.T) {
 	// from the DaemonSet, node draining, ...) — never reap blind.
 	cs, r := reaperClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint))
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
@@ -46,7 +47,7 @@ func TestCiliumTaintReaperUnreadyPodKeepsTaint(t *testing.T) {
 	pod.Status.Conditions[0].Status = corev1.ConditionFalse
 	cs, r := reaperClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint), pod)
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
@@ -62,7 +63,7 @@ func TestCiliumTaintReaperTerminatingPodKeepsTaint(t *testing.T) {
 	pod.DeletionTimestamp = &now
 	cs, r := reaperClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint), pod)
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
@@ -86,7 +87,7 @@ func TestCiliumTaintReaperSweepsWholeCluster(t *testing.T) {
 		testutil.Node("n2", corev1.ConditionTrue, nil, ciliumStaleTaint),
 		testutil.Node("n3", corev1.ConditionTrue, nil),
 		healthy, unready)
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
@@ -114,7 +115,7 @@ func TestCiliumTaintReaperAnyHealthyPodReaps(t *testing.T) {
 		cs, r := reaperClientset(
 			testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
 			unready, healthy)
-		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
 		if shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
@@ -132,7 +133,7 @@ func TestCiliumTaintReaperAnyHealthyPodReaps(t *testing.T) {
 		cs, r := reaperClientset(
 			testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
 			terminating, healthy)
-		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
 		if shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
@@ -149,7 +150,7 @@ func TestCiliumTaintReaperAnyHealthyPodReaps(t *testing.T) {
 		cs, r := reaperClientset(
 			testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
 			a, b)
-		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
 		if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
@@ -166,7 +167,7 @@ func TestCiliumTaintReaperPodOnOtherNodeDoesNotCount(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
 		testutil.Node("n2", corev1.ConditionTrue, nil),
 		ciliumPod("n2", corev1.PodRunning, true))
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
@@ -184,7 +185,7 @@ func TestCiliumTaintReaperPodListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := &ciliumTaintReaper{cs: cs, enabled: true}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the cilium pod list fails")
 	}
 	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
@@ -229,7 +230,7 @@ func TestCiliumTaintReaperNodeListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := &ciliumTaintReaper{cs: cs, enabled: true}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
 }
@@ -246,7 +247,7 @@ func TestCiliumTaintReaperUntaintError(t *testing.T) {
 			return true, nil, errors.New("patch rejected")
 		})
 	r := &ciliumTaintReaper{cs: cs, enabled: true}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the untaint patch fails")
 	}
 	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {

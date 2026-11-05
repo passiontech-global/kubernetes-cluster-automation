@@ -22,8 +22,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -172,7 +172,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	// only the value changing matters; RFC3339 is the convention. The
 	// same patch persists node.ops/last-helm-unlock so the 24h
 	// cooldown survives an operator restart.
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := u.now.Now().UTC().Format(time.RFC3339)
 	patch, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{"annotations": map[string]string{
 			fluxReconcileAnno:  now,

@@ -21,8 +21,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // listCRs returns the CertificateRequests of one namespace, caching
@@ -55,9 +55,8 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 	if !certReadyFalse(cert) && !certExpiringSoon(cert, now) {
 		return false
 	}
-	if last, ok := r.crReaped[key]; ok && now.Sub(last) < crReapMinGap {
-		log.Info("SKIP: stuck-CR reap rate-limited (max 1/6h)",
-			"cert", key, "lastReapAgo", now.Sub(last).Truncate(time.Minute))
+	if r.crReaped.CooledDown(key, crReapMinGap, now) {
+		log.Info("SKIP: stuck-CR reap rate-limited (max 1/6h)", "cert", key)
 		return false
 	}
 	crs, err := r.listCRs(ctx, ns)
@@ -126,7 +125,7 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 	}
 	st.total++
 	st.last = now
-	r.crReaped[key] = now
+	r.crReaped.Stamp(key, now)
 	if err := r.patchResetsAnnotation(ctx, cert, st); err != nil {
 		metrics.IncError(r.queue)
 		log.Error(err, "acme-resets annotation write failed", "cert", key)

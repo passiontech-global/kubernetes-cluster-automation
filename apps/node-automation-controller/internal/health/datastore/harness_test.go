@@ -13,8 +13,9 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 var ctx = context.Background()
@@ -47,7 +48,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *prober {
 }
 
 // mustCheck locates the registered check instance of type T — tests
-// that drive one check directly or poke its state maps look the
+// that drive one check directly or poke its state ledgers look the
 // instance up here (exactly one check of each type is registered).
 func mustCheck[T probefw.Check](t *testing.T, p *prober) T {
 	t.Helper()
@@ -59,4 +60,13 @@ func mustCheck[T probefw.Check](t *testing.T, p *prober) T {
 	t.Fatalf("no registered check of the wanted type")
 	var zero T
 	return zero
+}
+
+// dsTrackedKeys reports the keys a FirstSeenLedger currently holds —
+// the ledger's keyspace is intentionally unexported, so tests read
+// membership through a keep-all Prune.
+func dsTrackedKeys(l *shared.FirstSeenLedger) []string {
+	var keys []string
+	l.Prune(func(k string) bool { keys = append(keys, k); return true })
+	return keys
 }

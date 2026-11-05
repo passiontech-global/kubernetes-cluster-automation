@@ -3,15 +3,15 @@ package nodehealth
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"maps"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,19 +36,18 @@ type localPVStrandedCheck struct {
 	//     the 1h cooldown.
 	localPVEmitted    map[string]bool
 	pvcStalledEmitted map[string]bool
-	localPVHealed     map[string]time.Time
-	pvcProvHealed     map[string]time.Time
+	localPVHealed     shared.CooldownSet
+	pvcProvHealed     shared.CooldownSet
 }
 
 // newLocalPVStrandedCheck builds the W7-C4 check with fresh
 // tracking maps — the state-map initialization that used to live in
-// the monolithic newClusterHealthProber literal.
+// the monolithic newClusterHealthProber literal. The cooldown
+// ledgers are zero-value ready; only the gauge-tuple sets arm here.
 func NewLocalPVStrandedCheck(d *probefw.Deps) probefw.Check {
 	return &localPVStrandedCheck{Deps: d,
 		localPVEmitted:    map[string]bool{},
 		pvcStalledEmitted: map[string]bool{},
-		localPVHealed:     map[string]time.Time{},
-		pvcProvHealed:     map[string]time.Time{},
 	}
 }
 
@@ -189,12 +188,6 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	}
 	if p.pvcStalledEmitted == nil {
 		p.pvcStalledEmitted = map[string]bool{}
-	}
-	if p.localPVHealed == nil {
-		p.localPVHealed = map[string]time.Time{}
-	}
-	if p.pvcProvHealed == nil {
-		p.pvcProvHealed = map[string]time.Time{}
 	}
 
 	nodes, err := shared.ListNodes(ctx, p.CS)
@@ -365,10 +358,9 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 				"pvc", pvcKey, "why", maintWhy)
 			continue
 		}
-		last, ok := p.localPVHealed[pvcKey]
-		if ok && now.Sub(last) < localPVEphemeralHealCooldown {
+		if p.localPVHealed.CooledDown(pvcKey, localPVEphemeralHealCooldown, now) {
 			log.Info("skip heal: ephemeral localpv inside cooldown",
-				"pvc", pvcKey, "ago", now.Sub(last).Truncate(time.Minute))
+				"pvc", pvcKey)
 			continue
 		}
 		// PVC first, then the pod — the claim release flips the PV
@@ -393,7 +385,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 			metrics.IncError(p.Name)
 			log.Error(pvcErr, "ephemeral localpv pvc delete forbidden — RBAC scope blocks the heal; stamping cooldown",
 				"pvc", pvcKey)
-			p.localPVHealed[pvcKey] = now
+			p.localPVHealed.Stamp(pvcKey, now)
 			continue
 		default:
 			metrics.IncError(p.Name)
@@ -410,7 +402,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 				"pod", h.pod.Namespace+"/"+h.pod.Name)
 			continue
 		}
-		p.localPVHealed[pvcKey] = now
+		p.localPVHealed.Stamp(pvcKey, now)
 		metrics.LocalPVEphemeralHealsTotal.
 			WithLabelValues(h.pvc.Namespace, h.pvc.Name, h.node).Inc()
 		log.Info("DELETE: ephemeral localpv pvc+pod stranded on a confirmed-dead node — StatefulSet rebinds on a live node",
@@ -432,8 +424,8 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 		keys = append(keys, "stalled:"+k)
 	}
 	sort.Strings(keys)
-	return probefw.Result{Why: fmt.Sprintf(
-		"localpv-stranded/stalled volumes: %s", strings.Join(keys, ", "))}
+	return probefw.Result{Why: "localpv-stranded/stalled volumes: " +
+		strings.Join(keys, ", ")}
 }
 
 // healLocalPVProvisioner deletes the openebs-localpv-provisioner
@@ -445,10 +437,8 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	log logr.Logger, now time.Time) {
 
-	last, ok := p.pvcProvHealed[openebsProvisionerName]
-	if ok && now.Sub(last) < pvcProvisionerHealCooldown {
-		log.Info("skip heal: localpv provisioner inside cooldown",
-			"ago", now.Sub(last).Truncate(time.Minute))
+	if p.pvcProvHealed.CooledDown(openebsProvisionerName, pvcProvisionerHealCooldown, now) {
+		log.Info("skip heal: localpv provisioner inside cooldown")
 		return
 	}
 	pods, err := p.CS.CoreV1().Pods(openebsProvisionerNS).
@@ -482,7 +472,7 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	if !deleted {
 		return
 	}
-	p.pvcProvHealed[openebsProvisionerName] = now
+	p.pvcProvHealed.Stamp(openebsProvisionerName, now)
 	metrics.PVCProvisionerHealsTotal.
 		WithLabelValues(openebsProvisionerName).Inc()
 }

@@ -21,8 +21,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -83,9 +83,10 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 		}
 	}
 	nudged := 0
+	now := u.now.Now()
 	for i := range hrs.Items {
 		hr := &hrs.Items[i]
-		if !fluxArtifactStale(hr) {
+		if !fluxArtifactStale(hr, now) {
 			continue
 		}
 		if ref, ok := hrSourceRef(hr); ok &&
@@ -100,7 +101,7 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 	if kustomizations != nil {
 		for i := range kustomizations.Items {
 			k := &kustomizations.Items[i]
-			if !fluxArtifactStale(k) {
+			if !fluxArtifactStale(k, now) {
 				continue
 			}
 			if ref, ok := ksSourceRef(k); ok &&
@@ -114,9 +115,10 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 }
 
 // fluxArtifactStale is the stale-artifact signature: a non-suspended
-// consumer Ready=False continuously for >=15m with a message pointing
-// at the source's artifact (not the consumer's own logic).
-func fluxArtifactStale(o *unstructured.Unstructured) bool {
+// consumer Ready=False continuously for >=15m (measured against now)
+// with a message pointing at the source's artifact (not the
+// consumer's own logic).
+func fluxArtifactStale(o *unstructured.Unstructured, now time.Time) bool {
 	if suspended, _ := shared.NestedBool(o.Object, "spec", "suspend"); suspended {
 		return false // suspended objects are parked, not broken
 	}
@@ -139,7 +141,7 @@ func fluxArtifactStale(o *unstructured.Unstructured) bool {
 	if since.IsZero() {
 		since = o.GetCreationTimestamp().Time
 	}
-	return time.Since(since) >= artifactStuckMinAge
+	return now.Sub(since) >= artifactStuckMinAge
 }
 
 // hrSourceRef resolves the source a HelmRelease pulls its artifact
@@ -218,30 +220,32 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 	}
 	src, err := u.dyn.Resource(gvr).Namespace(ref.namespace).
 		Get(ctx, ref.name, metav1.GetOptions{})
+	gone, err := shared.ConfirmAbsent(err)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			log.Info("skip: flux source gone",
-				"kind", ref.kind, "source", key, "consumer", consumer)
-			return false
-		}
 		metrics.IncError(u.queue)
 		log.Error(err, "flux source get failed", "kind", ref.kind, "source", key)
 		return false
 	}
+	if gone {
+		log.Info("skip: flux source gone",
+			"kind", ref.kind, "source", key, "consumer", consumer)
+		return false
+	}
+	now := u.now.Now()
 	if ts := src.GetAnnotations()[fluxLastNudgeAnno]; ts != "" {
 		if t, err := time.Parse(time.RFC3339, ts); err == nil &&
-			time.Since(t) < sourceNudgeCooldown {
+			now.Sub(t) < sourceNudgeCooldown {
 			log.Info("skip: source nudged inside cooldown",
 				"kind", ref.kind, "source", key,
-				"ago", time.Since(t).Truncate(time.Minute))
+				"ago", now.Sub(t).Truncate(time.Minute))
 			return false
 		}
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	stamp := now.UTC().Format(time.RFC3339)
 	patch, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{"annotations": map[string]string{
-			fluxReconcileAnno: now,
-			fluxLastNudgeAnno: now,
+			fluxReconcileAnno: stamp,
+			fluxLastNudgeAnno: stamp,
 		}},
 	})
 	if err != nil {

@@ -22,7 +22,7 @@
 package watchdogs
 
 import (
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"strings"
 	"testing"
 	"time"
@@ -34,9 +34,9 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // foreignGatewayController is a non-cilium spec.controllerName — the
@@ -569,7 +569,7 @@ func TestCheckOperatorWorkqueuesForeignGatewaySkipped(t *testing.T) {
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("foreign-owned stuck route must pass quietly: %+v", res)
 	}
-	for k := range mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen {
+	for _, k := range wdTrackedKeys(&mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
 		t.Fatalf("foreign-owned route entered cilium's stuck set: %s", k)
 	}
 }
@@ -600,8 +600,9 @@ func TestCheckOperatorWorkqueuesCiliumGatewayTracked(t *testing.T) {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
 	want := "cilium-operator/httproutes/apps/r-cilium"
-	if _, ok := mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen[want]; !ok {
-		t.Fatalf("cilium-owned stuck route not tracked under %q: %v", want, mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen)
+	if _, ok := mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.Seen(want, base); !ok {
+		t.Fatalf("cilium-owned stuck route not tracked under %q: %v",
+			want, wdTrackedKeys(&mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen))
 	}
 }
 
@@ -633,10 +634,12 @@ func TestCheckOperatorWorkqueuesGatewayClassOwnership(t *testing.T) {
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
-	if _, ok := mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["cilium-operator/gatewayclasses//cilium"]; !ok {
-		t.Fatalf("never-accepted cilium class not tracked: %v", mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen)
+	if _, ok := mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Seen("cilium-operator/gatewayclasses//cilium", base); !ok {
+		t.Fatalf("never-accepted cilium class not tracked: %v",
+			wdTrackedKeys(&mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen))
 	}
-	for k := range mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen {
+	for _, k := range wdTrackedKeys(&mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
 		if strings.Contains(k, "cloudflare-tunnel") {
 			t.Fatalf("foreign-owned class entered cilium's stuck set: %s", k)
 		}
@@ -663,7 +666,8 @@ func TestCheckOperatorWorkqueuesGatewayClassStaleFreezes(t *testing.T) {
 	dyn := testutil.NewFakeDyn(gatewayDynKinds(), stale)
 	p := testProberDyn(cs, dyn)
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["cilium-operator/gatewayclasses//cilium"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("cilium-operator/gatewayclasses//cilium", base.Add(-time.Hour))
 
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("stale cilium GatewayClass past the window must FAIL")
@@ -692,7 +696,7 @@ func TestCheckOperatorWorkqueuesGatewayClassHealthyQuiet(t *testing.T) {
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("healthy accepted class must keep the check quiet: %+v", res)
 	}
-	for k := range mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen {
+	for _, k := range wdTrackedKeys(&mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
 		t.Fatalf("healthy class entered the stuck set: %s", k)
 	}
 }

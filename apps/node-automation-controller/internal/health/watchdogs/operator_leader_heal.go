@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -48,10 +48,8 @@ const (
 func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log logr.Logger,
 	op operatorTarget, lease *coordinationv1.Lease, reasons []string, now time.Time) {
 
-	last, ok := p.opHealed[op.name]
-	if ok && now.Sub(last) < operatorHealCooldown {
-		log.Info("skip heal: operator inside cooldown", "operator", op.name,
-			"ago", now.Sub(last).Truncate(time.Minute))
+	if p.opHealed.CooledDown(op.name, operatorHealCooldown, now) {
+		log.Info("skip heal: operator inside cooldown", "operator", op.name)
 		return
 	}
 	if lease != nil {
@@ -119,7 +117,7 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	for _, r := range reasons {
 		metrics.OperatorWorkqueueHealsTotal.WithLabelValues(op.name, r).Inc()
 	}
-	p.opHealed[op.name] = now
+	p.opHealed.Stamp(op.name, now)
 	// Persist the stamp on the Lease — the durable half of the
 	// cooldown. A nil lease (leaseOptional operators healing through
 	// the pod fallback) has nowhere to stamp; the in-RAM half is all

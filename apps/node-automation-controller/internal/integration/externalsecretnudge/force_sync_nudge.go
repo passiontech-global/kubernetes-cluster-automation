@@ -15,8 +15,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -51,7 +51,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 		}
 		return fmt.Errorf("list externalsecrets: %w", err)
 	}
-	now := time.Now()
+	now := n.now.Now()
 
 	// W9-GO1 — storm census over the WHOLE population: totalES is
 	// every ExternalSecret, failingES every Ready=False one. The
@@ -92,19 +92,9 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 		return nil
 	}
 
-	// Drop nudged entries past the cooldown or whose ExternalSecret
-	// vanished — the map only ever shrinks here (nudged is written
-	// solely in this function), same prune pattern as storeReady.
-	live := map[string]bool{}
-	for i := range list.Items {
-		es := &list.Items[i]
-		live[es.GetNamespace()+"/"+es.GetName()] = true
-	}
-	for key, last := range n.nudged {
-		if !live[key] || now.Sub(last) >= esNudgeCooldown {
-			delete(n.nudged, key)
-		}
-	}
+	// The nudged ledger needs no prune pass: CooldownSet has no
+	// enumeration (stamps past the cooldown read uncooled anyway,
+	// and entries for vanished ESs are dead weight that ages out).
 	nudgedNow := 0
 	for i := range list.Items {
 		es := &list.Items[i]
@@ -136,9 +126,8 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 				"es", key, "ago", now.Sub(last).Truncate(time.Minute))
 			continue
 		}
-		if last, ok := n.nudged[key]; ok && now.Sub(last) < esNudgeCooldown {
-			log.Info("skip: already nudged inside cooldown",
-				"es", key, "ago", now.Sub(last).Truncate(time.Minute))
+		if n.nudged.CooledDown(key, esNudgeCooldown, now) {
+			log.Info("skip: already nudged inside cooldown", "es", key)
 			continue
 		}
 		patch, err := json.Marshal(map[string]any{
@@ -161,7 +150,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 			log.Error(err, "force-sync patch failed", "es", key)
 			continue // per-ES failures must not starve the rest
 		}
-		n.nudged[key] = now
+		n.nudged.Stamp(key, now)
 		nudgedNow++
 		log.Info("ACTION: force-sync ExternalSecret", "es", key,
 			"stuckFor", now.Sub(since).Truncate(time.Minute),

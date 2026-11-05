@@ -94,8 +94,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -189,12 +189,16 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		hr := stalled[key]
 		// Wider of in-RAM ledger and persisted stamp — same cooldown
 		// contract as the unlock path (restart must not refund 24h).
-		last, ok := u.unwedged[key]
-		if t, hasAnno := helmLastStallUnwedge(hr); hasAnno && t.After(last) {
-			last, ok = t, true
+		cooled := u.unwedged.CooledDown(key, helmUnlockCooldown, now)
+		if t, hasAnno := helmLastStallUnwedge(hr); hasAnno &&
+			now.Sub(t) < helmUnlockCooldown {
+			// Fold the persisted stamp into the ledger (the anno is
+			// stamped at unwedge time, never older than the in-RAM
+			// stamp from the same action).
+			u.unwedged.Stamp(key, t)
+			cooled = true
 		}
-		if ok && now.Sub(last) < helmUnlockCooldown {
-			u.unwedged[key] = last // fold the persisted stamp into the ledger
+		if cooled {
 			u.alertStallOnce(ctx, key, now,
 				fmt.Sprintf("HR re-stalled inside the %s unwedge cooldown — previous unwedge did not fix it",
 					helmUnlockCooldown))
@@ -239,7 +243,7 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 			u.alertStallOnce(ctx, key, now,
 				"stalled HR is not the surge-deadlock shape — refusing to scale: "+refuse)
 		case acted:
-			u.unwedged[key] = now
+			u.unwedged.Stamp(key, now)
 			unwedged++
 		}
 	}
@@ -251,14 +255,11 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 // permanently refused signature would otherwise bump the error
 // counter every 10-minute sweep.
 func (u *helmReleaseUnlocker) alertStallOnce(ctx context.Context, key string, now time.Time, msg string) {
-	if u.stallAlerted == nil {
-		u.stallAlerted = map[string]time.Time{} // literal-constructed structs (tests)
-	}
-	if last, ok := u.stallAlerted[key]; ok && now.Sub(last) < helmUnlockCooldown {
+	if u.stallAlerted.CooledDown(key, helmUnlockCooldown, now) {
 		return
 	}
 	metrics.IncError(u.queue)
-	u.stallAlerted[key] = now
+	u.stallAlerted.Stamp(key, now)
 	logf.FromContext(ctx).Info("ALERT: "+msg, "hr", key)
 }
 
@@ -328,7 +329,7 @@ func (u *helmReleaseUnlocker) unwedge(ctx context.Context,
 	// forceAt runs the upgrade even with no drift. Without the
 	// reset token a stalled HR would consume the freed scheduling
 	// window and stay parked.
-	token := time.Now().UTC().Format(time.RFC3339)
+	token := u.now.Now().UTC().Format(time.RFC3339)
 	patch, err = json.Marshal(map[string]any{
 		"metadata": map[string]any{"annotations": map[string]string{
 			fluxReconcileAnno:        token,

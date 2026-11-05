@@ -2,16 +2,17 @@ package datastore
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"maps"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,19 +34,18 @@ type olmHealthCheck struct {
 	//   - olmHealed: reason → last olm-operator pod delete — the 1h
 	//     cooldown (in-RAM: deleting the operator pod is the heal,
 	//     nothing else can carry the stamp).
-	olmFirstSeen map[string]time.Time
+	olmFirstSeen shared.FirstSeenLedger
 	olmEmitted   map[string]bool
-	olmHealed    map[string]time.Time
+	olmHealed    shared.CooldownSet
 }
 
-// newOlmHealthCheck builds the W7-C5 check with fresh tracking
-// maps — the state-map initialization that used to live in the
-// monolithic newClusterHealthProber literal.
+// newOlmHealthCheck builds the W7-C5 check — the ledgers arm
+// lazily on first use; only the emitted-series map needs the
+// explicit initialization that used to live in the monolithic
+// newClusterHealthProber literal.
 func NewOlmHealthCheck(d *probefw.Deps) probefw.Check {
 	return &olmHealthCheck{Deps: d,
-		olmFirstSeen: map[string]time.Time{},
-		olmEmitted:   map[string]bool{},
-		olmHealed:    map[string]time.Time{},
+		olmEmitted: map[string]bool{},
 	}
 }
 
@@ -113,18 +113,12 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 	// The CR scans and the maintenance mutex both need dyn — a
 	// missing client is a wiring bug, not "no signal".
 	if p.Dyn == nil {
-		return probefw.Result{Infra: fmt.Errorf(
+		return probefw.Result{Infra: errors.New(
 			"no dynamic client — olm health check unverifiable")}
 	}
 	now := p.Now()
-	if p.olmFirstSeen == nil {
-		p.olmFirstSeen = map[string]time.Time{}
-	}
 	if p.olmEmitted == nil {
 		p.olmEmitted = map[string]bool{}
-	}
-	if p.olmHealed == nil {
-		p.olmHealed = map[string]time.Time{}
 	}
 
 	// live signatures keyed "kind/ns/name/reason".
@@ -177,15 +171,10 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	emitted := map[string]bool{}     // keys past the gauge window
 	healReasons := map[string]bool{} // reasons past the heal window (CSV only)
-	for k := range p.olmFirstSeen {
-		if !live[k] {
-			delete(p.olmFirstSeen, k)
-		}
-	}
+	p.olmFirstSeen.Prune(func(k string) bool { return live[k] })
 	for k := range live {
-		first, ok := p.olmFirstSeen[k]
-		if !ok {
-			p.olmFirstSeen[k] = now
+		first, tracked := p.olmFirstSeen.Observe(k, now)
+		if !tracked {
 			log.Info("olm unhealthy signature — tracking first-seen",
 				"signature", k)
 			continue
@@ -246,10 +235,8 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	log logr.Logger, reasons []string, now time.Time) {
 
-	last, ok := p.olmHealed[olmOperatorPodPrefix]
-	if ok && now.Sub(last) < olmHealCooldown {
-		log.Info("skip heal: olm-operator inside cooldown",
-			"ago", now.Sub(last).Truncate(time.Minute))
+	if p.olmHealed.CooledDown(olmOperatorPodPrefix, olmHealCooldown, now) {
+		log.Info("skip heal: olm-operator inside cooldown")
 		return
 	}
 	held, why, err := shared.MaintenanceActive(ctx, p.CS, p.Dyn)
@@ -295,7 +282,7 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	if !deleted {
 		return
 	}
-	p.olmHealed[olmOperatorPodPrefix] = now
+	p.olmHealed.Stamp(olmOperatorPodPrefix, now)
 	for _, r := range reasons {
 		metrics.OLMOperatorHealsTotal.WithLabelValues(r).Inc()
 	}

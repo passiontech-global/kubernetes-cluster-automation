@@ -2,7 +2,7 @@ package ciliumidentityauditor
 
 import (
 	"errors"
-	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -19,9 +19,9 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 var ciliumAuditListKinds = map[schema.GroupVersionResource]string{
@@ -139,7 +139,7 @@ func TestCiliumIdentityAuditorCleanCluster(t *testing.T) {
 func TestCiliumIdentityAuditorOrphanThreshold(t *testing.T) {
 	objs := make([]runtime.Object, 0, ciliumOrphanMax+1)
 	for i := 0; i < ciliumOrphanMax+1; i++ {
-		objs = append(objs, ciliumIdentity(fmt.Sprintf("%d", 5000+i)))
+		objs = append(objs, ciliumIdentity(strconv.Itoa(5000+i)))
 	}
 	dyn := testutil.NewFakeDyn(ciliumAuditListKinds, objs...)
 	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor", cs: fake.NewSimpleClientset(), dyn: dyn}
@@ -406,14 +406,14 @@ func TestCiliumIdentityAuditorGCMaxDeleteCap(t *testing.T) {
 	old := now.Add(-time.Hour)
 	objs := make([]runtime.Object, 0, ciliumGCMaxDelete+10)
 	for i := 0; i < ciliumGCMaxDelete+10; i++ {
-		name := fmt.Sprintf("%d", 20000+i)
+		name := strconv.Itoa(20000 + i)
 		objs = append(objs, ciliumIdentityAged(name, old))
 	}
 	dyn := testutil.NewFakeDyn(ciliumAuditListKinds, objs...)
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
 	for i := 0; i < ciliumGCMaxDelete+10; i++ {
-		a.orphanFirstSeen.Observe(fmt.Sprintf("%d", 20000+i), now.Add(-time.Hour))
+		a.orphanFirstSeen.Observe(strconv.Itoa(20000+i), now.Add(-time.Hour))
 	}
 
 	before := promtestutil.ToFloat64(metrics.CiliumIdentitiesCollectedTotal)

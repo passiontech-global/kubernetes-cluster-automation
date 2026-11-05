@@ -7,8 +7,9 @@ package gitops
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
 	"time"
@@ -24,8 +25,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // argoCDAppStuckCheck is the ArgoCD stuck-application watchdog with
@@ -92,7 +93,7 @@ func init() {
 func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	if p.Dyn == nil {
-		return probefw.Result{Infra: fmt.Errorf(
+		return probefw.Result{Infra: errors.New(
 			"no dynamic client — argocd app check unverifiable")}
 	}
 	now := p.Now()
