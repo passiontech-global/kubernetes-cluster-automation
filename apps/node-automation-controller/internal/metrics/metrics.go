@@ -429,6 +429,87 @@ var ScyllaClusterUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while the ScyllaCluster/member shows a sustained unhealthy signature.",
 }, []string{"namespace", "cluster", "reason"})
 
+// ---------------------------------------------------------------------------
+// Later self-healing metrics grouped by owning module (W9-CP2/W9-ST3/
+// W9-GO1/W10-NM2/W10-ST6/W10-CP1).
+// ---------------------------------------------------------------------------
+
+// HelmSecretsPrunedTotal counts superseded helm release secrets
+// deleted by the helmrelease-unlocker Kine bloat guard (W9-CP2) —
+// helm keeps every revision forever and each secret embeds the full
+// compressed chart, so unbounded superseded history bloats Kine.
+// Label: the namespace the release secrets live in.
+var HelmSecretsPrunedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_helm_secrets_pruned_total",
+	Help: "Superseded helm release secrets pruned per release, by namespace.",
+}, []string{"namespace"})
+
+// DBBackupUnhealthy marks (1) each Everest DatabaseCluster whose
+// backup posture is unhealthy (W9-ST3). reason is failed (latest
+// backup Failed), stuck (a Running/Starting backup older than 6h)
+// or stale (newest Succeeded backup older than 36h). Labels:
+// DatabaseCluster namespace + name + reason.
+var DBBackupUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_db_backup_unhealthy",
+	Help: "1 while the DatabaseCluster's backups are failed, stuck or stale.",
+}, []string{"namespace", "cluster", "reason"})
+
+// ExternalSecretStormSuppressed marks (1) while the
+// externalsecret-nudge storm guard is active (W9-GO1): >=5
+// ExternalSecrets Ready=False AND >=50% of all ExternalSecrets
+// failing simultaneously — the signature of a 1Password
+// Connect/429/store outage where force-sync stamps would only
+// amplify the failure.
+var ExternalSecretStormSuppressed = prometheus.NewGauge(prometheus.GaugeOpts{
+	Name: "node_automation_externalsecret_storm_suppressed",
+	Help: "1 while the ExternalSecret storm guard suppresses force-sync stamps.",
+})
+
+// CFTunnelWedgePodsDeletedTotal counts cloudflared connector pods
+// deleted by the cf-tunnel proxy watchdog wedge healer (W10-NM2).
+// reason is fatal_logs (wedged log signature) or all_unready_oldest
+// (readyCount==0 deadlock — oldest stale-unready pod deleted once per
+// cooldown). Labels: pod namespace + reason.
+var CFTunnelWedgePodsDeletedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_cftunnel_wedge_pods_deleted_total",
+	Help: "Wedged cloudflared connector pods deleted, by namespace and reason.",
+}, []string{"namespace", "reason"})
+
+// VeleroBackupStuck marks (1) each velero.io Backup wedged
+// InProgress or Deleting for over 6h (W10-ST6). Labels: namespace +
+// backup name.
+var VeleroBackupStuck = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_velero_backup_stuck",
+	Help: "1 while a velero.io Backup is InProgress or Deleting for over 6h.",
+}, []string{"namespace", "backup"})
+
+// VeleroPodVolumeBackupWedged marks (1) each velero.io
+// PodVolumeBackup stuck InProgress for over 6h whose node-agent
+// restarted or has no active Kopia process (W10-ST6). Labels:
+// namespace + pvb name.
+var VeleroPodVolumeBackupWedged = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_velero_podvolumebackup_wedged",
+	Help: "1 while a PodVolumeBackup is wedged InProgress past the Kopia criteria.",
+}, []string{"namespace", "pvb"})
+
+// VeleroWedgedObjectsCleanedTotal counts wedged velero objects
+// cleaned by the backup auditor (W10-ST6). action is pvb_deleted or
+// pod_restarted. Labels: namespace + action.
+var VeleroWedgedObjectsCleanedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_velero_wedged_objects_cleaned_total",
+	Help: "Wedged velero PodVolumeBackups deleted and pods bounced, by namespace and action.",
+}, []string{"namespace", "action"})
+
+// APIServiceUnblockHealsTotal counts dead APIService heals forced
+// through the namespace-skip gate by the apiservice guard (W10-CP1):
+// an APIService in a normally-skipped namespace that stayed
+// Available=False >=15m while a namespace sat Terminating >=15m with
+// references to its API group.
+var APIServiceUnblockHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_apiservice_unblock_heals_total",
+	Help: "APIService heals forced past the skip-namespace gate, by namespace and reason.",
+}, []string{"namespace", "reason"})
+
 // queues are the legacy shell-operator queue names — pre-instantiated
 // at 0 so /metrics always exposes every series (an empty CounterVec
 // emits nothing, and shell-operator emitted its counters eagerly).
@@ -485,7 +566,11 @@ func init() {
 		ControlPlanePodHealsTotal, NodeHangCordonsTotal,
 		NodeHangUncordonsTotal,
 		VolumeAttachmentFinalizersRemovedTotal,
-		LinkerdEndpointDesync, ScyllaClusterUnhealthy)
+		LinkerdEndpointDesync, ScyllaClusterUnhealthy,
+		HelmSecretsPrunedTotal, DBBackupUnhealthy,
+		ExternalSecretStormSuppressed, CFTunnelWedgePodsDeletedTotal,
+		VeleroBackupStuck, VeleroPodVolumeBackupWedged,
+		VeleroWedgedObjectsCleanedTotal, APIServiceUnblockHealsTotal)
 	for _, q := range queues {
 		hookRunErrors.WithLabelValues(q)
 		reconcileErrors.WithLabelValues(q)

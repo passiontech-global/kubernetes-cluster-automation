@@ -116,12 +116,20 @@ const (
 	// W10-CP4/W10-ST5 — Flux HelmRelease retry remediation and the
 	// Percona cluster quorum watchdog live in this file; their
 	// check-name constants sit here alongside the code. The nine
-	// Wave-10 probes live in cluster_health_wave10.go with their
-	// constants declared there.
+	// self-healing probes (W10-NM*/CP*/ST*/GI*) live one check per
+	// file — cilium_bpf_map_pressure.go, linkerd_protocol_detection_
+	// stall.go, coredns_upstream.go, cilium_node_ipam_exhaustion.go,
+	// namespace_terminating_wedged.go, argocd_app_stuck.go,
+	// rabbitmq_quorum_health.go, dragonfly_replica_sync_storm.go,
+	// image_pull_storm.go — sharing self_healing_shared.go; their
+	// check-name constants are declared in those files.
 	checkNameFluxHRRetries = "flux-helmrelease-retries"
 	checkNamePerconaQuorum = "percona-cluster-quorum"
-	// W8/W9 — the Wave-8/9 checks live in cluster_health_wave8.go;
-	// their check-name constants are declared there alongside the code.
+	// W8/W9 — the Wave-8/9 checks live one check per file
+	// (scheduler_watchdog.go, mesh_controlplane_watchdog.go,
+	// node_hang_precordon.go, linkerd_endpoint_sync.go,
+	// scylla_cluster_health.go); their check-name constants are
+	// declared there alongside the code.
 )
 
 // C6 watchdog knobs — the KCM leader Lease name and the
