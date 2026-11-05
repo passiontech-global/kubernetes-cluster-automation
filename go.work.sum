@@ -62,10 +62,15 @@ google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa/go.
 google.golang.org/grpc v1.82.1/go.mod h1:yzTZ1TB1Z3SG+LIYaI+WiE8D5+PZ3ArnrSp8zF3+/ZA=
 gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c/go.mod h1:JHkPIbrfpd72SG/EVd6muEfDQjcINNoR0C8j2r3qZ4Q=
 gopkg.in/natefinch/lumberjack.v2 v2.2.1/go.mod h1:YD8tP3GAjkrDg1eZH7EGmyESg/lsYskCTPBJVb9jqSc=
+gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
 k8s.io/apiserver v0.37.0/go.mod h1:OddHDF4gy9qyIb8o/3+qaeP6S0vEObWLgOygVqXksv0=
+k8s.io/apiserver v0.37.2/go.mod h1:d0P4WZtt6XMYAo6VN8dDPRnvY3O34quI3pOuxtfgAgM=
 k8s.io/code-generator v0.37.0/go.mod h1:qg7E/uDlyvevVRL1V8+h2z9UWmi/8gxaRka/lVXUBdk=
+k8s.io/code-generator v0.37.2/go.mod h1:k24CS91bM7Kk5b776drjJYvvfLT5vceiLeOzTxNsEUc=
 k8s.io/component-base v0.37.0/go.mod h1:LjOebp4R9y6LODWZQv102ZQxGheLcDO2ZJLAw6bbh4I=
+k8s.io/component-base v0.37.2/go.mod h1:qq+ueHZyLfzRJzxyDoyxHWNhF1JPv4zm3hcaddXWDvY=
 k8s.io/gengo/v2 v2.0.0-20260408192533-25e2208e0dc3/go.mod h1:yvyl3l9E+UxlqOMUULdKTAYB0rEhsmjr7+2Vb/1pCSo=
 k8s.io/kms v0.37.0/go.mod h1:0U6zfwLkfJr9O/jLgz2GARnKLh2uIhkq2EeaU66J5ow=
+k8s.io/kms v0.37.2/go.mod h1:0U6zfwLkfJr9O/jLgz2GARnKLh2uIhkq2EeaU66J5ow=
 k8s.io/streaming v0.37.2/go.mod h1:APlJR26ZWRcVy5bIEj0QRrKUXROtBHPcxl2NT7EAzPU=
 sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.36.0/go.mod h1:tJo1aepTXyR+8Xs3sUsGBDk4Ub2AM5dPAPKJx0mpm5c=

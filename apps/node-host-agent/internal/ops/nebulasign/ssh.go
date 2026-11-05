@@ -1,24 +1,34 @@
-// ssh.go — the minimal SSH host.pub fetch backing nebulaSign.
+// ssh.go — the SSH host.pub fetch backing nebulaSign.
 //
-// hubsync's real dialer is package-private; the signer only needs a
-// one-command fetch so it carries the smallest dialer: same key
-// resolution (flag/env, default ~/.ssh/id_ed25519), same tolerance
-// (InsecureIgnoreHostKey — infra VMs rotate host keys on rebuild),
-// same ssh_proxyjump bastion semantics as hubsync's sshDialer.
+// The dial mechanics (key resolution + "~/" expansion, the
+// InsecureIgnoreHostKey tolerance, the ssh_proxyjump bastion hop)
+// moved to platform/sshclient, shared with hubsync's converge
+// dialer — this file used to carry a second private copy of them.
+// What stays is nebulasign's own contract: the nebulaNet gate and
+// the one-shot `cat /etc/nebula/<net>/host.pub`.
+//
+// Parity notes vs the removed private dialer:
+//   - Port 22 and the 15s Timeout reproduce the hard-coded knobs.
+//   - Config.Log stays nil → bare ssh.InsecureIgnoreHostKey,
+//     exactly the old silent tolerance (infra VMs rotate host keys
+//     on rebuild; hub_converge parity).
+//   - sshclient bounds the bastion channel-open + tunneled
+//     handshake (this copy left them unbounded — a wedged bastion
+//     could hang forever) and warns on a rejected SetDeadline via
+//     its package logger; dial error strings are sshclient's
+//     unified wording. Failure-path tightening only — the success
+//     path is identical.
 package nebulasign
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/ssh"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sshclient"
 )
 
 // nebulaNetRe gates the network name before it lands in the remote
@@ -29,63 +39,20 @@ func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) 
 	if j.IP == "" {
 		return "", errors.New("no ip in registry")
 	}
-	keyPath = expandHome(keyPath)
-	pem, err := os.ReadFile(keyPath)
+	cfg := sshclient.Config{
+		KeyPath: keyPath,
+		Port:    22,
+		Timeout: 15 * time.Second,
+		// Log deliberately nil — the silent host-key tolerance of
+		// the old private dialer.
+	}
+	link, err := cfg.Dial(ctx, j.SSHUser, j.IP, j.ProxyJump)
 	if err != nil {
-		return "", fmt.Errorf("read ssh key %s: %w", keyPath, err)
+		return "", err
 	}
-	signer, err := ssh.ParsePrivateKey(pem)
-	if err != nil {
-		return "", fmt.Errorf("parse ssh key %s: %w", keyPath, err)
-	}
-	user := j.SSHUser
-	if user == "" {
-		user = "root"
-	}
-	timeout := 15 * time.Second
-	cfg := &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // hub_converge parity
-		Timeout:         timeout,
-	}
-	addr := net.JoinHostPort(j.IP, "22")
+	defer func() { _ = link.Close() }()
 
-	var client *ssh.Client
-	var jumpClient *ssh.Client
-	if j.ProxyJump != "" {
-		juser, jhost, jport := splitJump(j.ProxyJump)
-		jcfg := &ssh.ClientConfig{
-			User:            juser,
-			Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-			Timeout:         timeout,
-		}
-		jc, err := dialSSH(ctx, net.JoinHostPort(jhost, jport), jcfg, timeout)
-		if err != nil {
-			return "", fmt.Errorf("jump %s: %w", j.ProxyJump, err)
-		}
-		jumpClient = jc
-		defer func() { _ = jumpClient.Close() }()
-		nc, err := jc.Dial("tcp", addr)
-		if err != nil {
-			return "", fmt.Errorf("jump %s -> %s: %w", j.ProxyJump, addr, err)
-		}
-		c, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
-		if err != nil {
-			_ = nc.Close()
-			return "", fmt.Errorf("handshake via %s: %w", j.ProxyJump, err)
-		}
-		client = ssh.NewClient(c, chans, reqs)
-	} else {
-		client, err = dialSSH(ctx, addr, cfg, timeout)
-		if err != nil {
-			return "", err
-		}
-	}
-	defer func() { _ = client.Close() }()
-
-	sess, err := client.NewSession()
+	sess, err := link.Client.NewSession()
 	if err != nil {
 		return "", err
 	}
@@ -111,48 +78,4 @@ func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) 
 		}
 		return string(r.out), nil
 	}
-}
-
-func dialSSH(ctx context.Context, addr string, cfg *ssh.ClientConfig,
-	timeout time.Duration) (*ssh.Client, error) {
-	nd := net.Dialer{Timeout: timeout}
-	nc, err := nd.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	dl := time.Now().Add(timeout)
-	if cdl, ok := ctx.Deadline(); ok && cdl.Before(dl) {
-		dl = cdl
-	}
-	_ = nc.SetDeadline(dl)
-	c, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
-	if err != nil {
-		_ = nc.Close()
-		return nil, err
-	}
-	_ = nc.SetDeadline(time.Time{})
-	return ssh.NewClient(c, chans, reqs), nil
-}
-
-// splitJump parses "user@host[:port]" / "host" from ssh_proxyjump —
-// the same shape hubsync's splitUserHost accepts.
-func splitJump(j string) (user, host, port string) {
-	user, port = "root", "22"
-	if u, h, ok := strings.Cut(j, "@"); ok {
-		user, j = u, h
-	}
-	host = j
-	if h, p, err := net.SplitHostPort(j); err == nil {
-		host, port = h, p
-	}
-	return user, host, port
-}
-
-func expandHome(p string) string {
-	if strings.HasPrefix(p, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(home, p[2:])
-		}
-	}
-	return p
 }
