@@ -65,6 +65,7 @@ import (
 	yaml "go.yaml.in/yaml/v3"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // Defaults mirror the shell scripts + their systemd timers.
@@ -759,76 +760,11 @@ func (k *KineDB) psqlScript(ctx context.Context, pg, user, pass, script string) 
 
 // --- textfile helpers ---
 
-// writeTextfileAtomic writes content to dir/.tmp-* then renames over
-// dir/name — the textfile collector rejects partially-written files.
-func writeTextfileAtomic(dir, name string, content []byte) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, "."+name+".*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(content); err != nil {
-		tmp.Close()
-		return err
-	}
-	// fsync the payload before the rename — without it a crash can
-	// leave a renamed-but-empty file behind.
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp.Name(), filepath.Join(dir, name)); err != nil {
-		return err
-	}
-	// fsync the directory so the rename itself is durable.
-	if d, err := os.Open(dir); err == nil {
-		err = d.Sync()
-		_ = d.Close()
-		return err
-	}
-	return nil
-}
-
-// promBuf accumulates HELP/TYPE/sample lines for one textfile.
-// Headers (# HELP / # TYPE) are emitted once per metric family —
-// node_exporter's textfile collector rejects duplicate HELP/TYPE
-// lines for the same metric name.
-type promBuf struct {
-	b    strings.Builder
-	seen map[string]bool
-}
-
-func (p *promBuf) gauge(name, help string, v float64) {
-	p.gaugeLabels(name, help, "", v)
-}
-
-func (p *promBuf) gaugeLabels(name, help, labels string, v float64) {
-	if p.seen == nil {
-		p.seen = map[string]bool{}
-	}
-	if !p.seen[name] {
-		p.seen[name] = true
-		fmt.Fprintf(&p.b, "# HELP %s %s\n", name, help)
-		fmt.Fprintf(&p.b, "# TYPE %s gauge\n", name)
-	}
-	val := strconv.FormatFloat(v, 'f', -1, 64)
-	if labels != "" {
-		fmt.Fprintf(&p.b, "%s{%s} %s\n", name, labels, val)
-	} else {
-		fmt.Fprintf(&p.b, "%s %s\n", name, val)
-	}
-}
-
-func (p *promBuf) String() string { return p.b.String() }
-
-func (k *KineDB) emitTextfile(name string, p *promBuf) {
-	if err := writeTextfileAtomic(k.cfg.TextfileDir, name, []byte(p.String())); err != nil {
+// emitTextfile installs the rendered builder as
+// <TextfileDir>/<name> — promfile.Write stages + renames so the
+// textfile collector never sees a partial file.
+func (k *KineDB) emitTextfile(name string, p *promfile.Builder) {
+	if err := promfile.Write(k.cfg.TextfileDir, name, []byte(p.String())); err != nil {
 		logger().Warn("kinedb textfile write failed", "file", name, "error", err)
 	}
 }

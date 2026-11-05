@@ -30,6 +30,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // Guard state file names under GuardStateDir.
@@ -283,19 +285,19 @@ func (k *KineDB) guardRun(ctx context.Context, pg, user, pass string,
 
 // emitGuard renders the textfile and updates the collectors.
 func (k *KineDB) emitGuard(res *guardResult) {
-	var p promBuf
+	var p promfile.Builder
 	ok := 0.0
 	if res.ok {
 		ok = 1
 	}
-	p.gauge("kine_db_guard_ok",
+	p.Gauge("kine_db_guard_ok",
 		"Compact guard result (1 = ok/skip, 0 = fail)", ok)
 	k.m.guardOK.Set(ok)
 	fired := 0.0
 	if res.fired {
 		fired = 1
 	}
-	p.gauge("kine_db_guard_fired",
+	p.Gauge("kine_db_guard_fired",
 		"1 when the last guard run executed a compact session", fired)
 	k.m.guardFired.Set(fired)
 	// freeze_cycles + kine_db_rows come out of the stats read —
@@ -306,30 +308,30 @@ func (k *KineDB) emitGuard(res *guardResult) {
 	// when the stats read failed — a fabricated 0 overwriting a
 	// meaningful freeze count (or row count) is worse than stale.
 	if res.statsOK {
-		p.gauge("kine_db_guard_freeze_cycles",
+		p.Gauge("kine_db_guard_freeze_cycles",
 			"Consecutive runs compact_rev stayed frozen while head advanced",
 			float64(res.frozen))
 		k.m.guardFreeze.Set(float64(res.frozen))
-		p.gauge("kine_db_rows",
+		p.Gauge("kine_db_rows",
 			"Row count of the kine table — kine boot fill cost",
 			float64(res.rows))
 		k.m.rows.Set(float64(res.rows))
 	}
 	if res.revSeen {
-		p.gauge("kine_db_guard_compact_rev_after",
+		p.Gauge("kine_db_guard_compact_rev_after",
 			"compact_rev re-read after the last completed compact run",
 			float64(res.revAfter))
 		k.m.guardRevAfter.Set(float64(res.revAfter))
 	}
-	p.gauge("kine_db_guard_last_deleted_rows",
+	p.Gauge("kine_db_guard_last_deleted_rows",
 		"Rows deleted by the last compact run", float64(res.deleted))
 	k.m.guardLastDeleted.Set(float64(res.deleted))
 	lastCompact := float64(k.readGuardCompactTS())
-	p.gauge("kine_db_guard_last_compact_timestamp_seconds",
+	p.Gauge("kine_db_guard_last_compact_timestamp_seconds",
 		"Timestamp of the last completed compact run", lastCompact)
 	k.m.guardLastCompact.Set(lastCompact)
 	ts := float64(k.cfg.nowFn().Unix())
-	p.gauge("kine_db_guard_last_run_timestamp_seconds",
+	p.Gauge("kine_db_guard_last_run_timestamp_seconds",
 		"Last guard run", ts)
 	k.m.guardLastRun.Set(ts)
 	k.emitTextfile("kine-compact-guard.prom", &p)

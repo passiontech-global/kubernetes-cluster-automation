@@ -1027,7 +1027,7 @@ func TestWriteTextfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if e.Name() == textfileTmpName || strings.HasPrefix(e.Name(), ".tmp-") {
+		if e.Name() != TextfileName {
 			t.Fatalf("staging file left behind: %s", e.Name())
 		}
 	}
@@ -1050,14 +1050,9 @@ func TestWriteTextfile(t *testing.T) {
 func TestWriteTextfileTmpNameEscapesPromGlob(t *testing.T) {
 	// node_exporter ingests every file matching *.prom — the
 	// staging name must never match, or a partially-written file
-	// could be scraped (and ".tmp-x.prom" DOES match: * swallows
-	// the leading dot).
-	if ok, _ := filepath.Match("*.prom", textfileTmpName); ok {
-		t.Fatalf("staging name %q matches the *.prom glob", textfileTmpName)
-	}
-	if ok, _ := filepath.Match("*.prom", ".tmp-"+TextfileName); !ok {
-		t.Fatal("sanity: the old .tmp- prefix really did match *.prom")
-	}
+	// could be scraped. Staging now lives in platform/promfile
+	// (TestStagingNameEscapesPromGlob covers the pattern); here we
+	// only re-check the final-name contract.
 	if ok, _ := filepath.Match("*.prom", TextfileName); !ok {
 		t.Fatalf("final name %q must match the *.prom glob", TextfileName)
 	}
