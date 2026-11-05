@@ -2513,13 +2513,133 @@ func (h *Hygiene) pidsWithCmdline(sub string, pids []int) []int {
 	return out
 }
 
+// --- orphan-shim scope helpers ---
+//
+// The Phase-B shim reaper must only ever reap shims of THE containerd
+// instance CtrTaskRoot belongs to. A node can run a second containerd
+// (host dockerd serves namespace moby on /run/containerd/containerd.sock,
+// concourse workers spawn their own) whose shims read as "orphan" the
+// moment their -id doesn't exist under the k0s k8s.io task root —
+// SIGKILLing them cold-restarted every docker container per sweep
+// (NodeOverloaded incident 2026-11: 10 containers x every ~6min).
+// The shim's own cmdline carries the proof: -namespace + -address.
+
+// shimFlagValue extracts `-name value` / `-name=value` (double-dash
+// forms tolerated) from a shim argv. ok=false when the flag is absent
+// or value-less.
+func shimFlagValue(argv []string, name string) (string, bool) {
+	for i, a := range argv {
+		if a == "-"+name || a == "--"+name {
+			if i+1 < len(argv) {
+				return argv[i+1], true
+			}
+			return "", false
+		}
+		if v, ok := strings.CutPrefix(a, "-"+name+"="); ok {
+			return v, true
+		}
+		if v, ok := strings.CutPrefix(a, "--"+name+"="); ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// hostSidePath maps an in-pod /host-mounted path back to the path a
+// host process reports — the shim's -address carries the HOST socket
+// path (/run/k0s/containerd.sock) while config paths live under the
+// host-root mount (/host/run/k0s/containerd.sock).
+func hostSidePath(p string) string {
+	if rest, ok := strings.CutPrefix(p, "/host/"); ok {
+		return "/" + rest
+	}
+	if p == "/host" {
+		return "/"
+	}
+	return p
+}
+
+// normalizeCtrAddr canonicalizes a containerd grpc socket address so
+// a cosmetic difference can't mark our own shim foreign: the unix://
+// scheme and the /var/run symlink collapse to the canonical /run path.
+func normalizeCtrAddr(a string) string {
+	a = strings.TrimPrefix(a, "unix://")
+	if a == "" {
+		return ""
+	}
+	a = filepath.Clean("/" + strings.TrimPrefix(a, "/"))
+	if rest, ok := strings.CutPrefix(a, "/var/run/"); ok {
+		a = "/run/" + rest
+	}
+	return a
+}
+
+// ctrShimSockets returns the host-side socket paths the k0s
+// containerd is expected to listen on: the configured
+// ContainerdSocket plus the path derived from CtrTaskRoot
+// (…/containerd/io.containerd.runtime.v2.task/k8s.io → the sibling
+// …/k0s/containerd.sock — k0s keeps the socket next to the containerd
+// root dir, not inside it).
+func (h *Hygiene) ctrShimSockets() map[string]bool {
+	out := map[string]bool{}
+	if s := normalizeCtrAddr(hostSidePath(h.cfg.ContainerdSocket)); s != "" {
+		out[s] = true
+	}
+	derived := filepath.Join(
+		filepath.Dir(filepath.Dir(filepath.Dir(h.cfg.CtrTaskRoot))),
+		"containerd.sock")
+	if s := normalizeCtrAddr(hostSidePath(derived)); s != "" {
+		out[s] = true
+	}
+	return out
+}
+
+// validShimNamespace guards the per-namespace task-dir join against
+// path traversal — a shim cmdline is host-controlled input.
+func validShimNamespace(ns string) bool {
+	return ns != "" && ns != "." && ns != ".." &&
+		!strings.ContainsAny(ns, "/\\")
+}
+
+// shimTaskDir resolves the task dir a shim of namespace ns + id would
+// own under THIS containerd: k8s.io is CtrTaskRoot itself, a foreign
+// namespace on the same daemon lives at the sibling
+// io.containerd.runtime.v2.task/<ns>/<id> dir.
+func (h *Hygiene) shimTaskDir(ns, id string) string {
+	return filepath.Join(filepath.Dir(h.cfg.CtrTaskRoot), ns, id)
+}
+
+// ctrShimScope parses a containerd-shim-runc-v2 argv and reports the
+// task id + whether the shim belongs to the containerd instance this
+// agent watches. A shim is in-scope only when BOTH flags are present
+// AND -address names our containerd socket — a missing/unparseable
+// flag means the instance can't be verified, so the shim is treated
+// as foreign (fail closed: never reap an unidentified shim).
+func (h *Hygiene) ctrShimScope(argv []string) (ns, sid string, inScope bool) {
+	m := shimIDRe.FindStringSubmatch(strings.Join(argv, " "))
+	if m == nil {
+		return "", "", false
+	}
+	ns, nsOK := shimFlagValue(argv, "namespace")
+	addr, addrOK := shimFlagValue(argv, "address")
+	if !nsOK || !addrOK || !validShimNamespace(ns) {
+		return "", "", false
+	}
+	if !h.ctrShimSockets()[normalizeCtrAddr(addr)] {
+		return "", "", false
+	}
+	return ns, m[1], true
+}
+
 // checkCtrTasks cleans wedged containerd task dirs and orphan shims —
 // the filesystem port of the shell's ctr-based checks (no ctr socket
 // needed in the agent pod):
 //
-//   - Orphan shim: live containerd-shim-runc-v2 process whose -id task
-//     dir is gone from BOTH roots, proc age >=5m → SIGKILL (cap
-//     MaxShimKill/cycle).
+//   - Orphan shim: live containerd-shim-runc-v2 process scoped to THIS
+//     containerd (-address names the k0s socket; -address/-namespace
+//     absent or foreign → not ours, never touched) whose -id task dir
+//     is gone from its namespace's task root AND the sandbox root,
+//     proc age >=5m → SIGKILL (cap MaxShimKill/cycle).
 //   - Wedged task dir: init.pid unreadable/dead/zombie, OR init alive
 //     but log.json missing on a non-sandbox task — confirmed via a
 //     wedged-seen-<id> marker persisting >=5m (the marker replaces
@@ -2555,30 +2675,47 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context,
 		}
 	}
 	// Phase B — orphan shims (shell ran this FIRST: a shim whose task
-	// dir vanished makes every shim-mediated kill fail forever).
+	// dir vanished makes every shim-mediated kill fail forever). The
+	// reaper is scoped by -address to the containerd that owns
+	// CtrTaskRoot: a second containerd on the same host (host dockerd's
+	// moby shims, a concourse worker's own daemon) has task dirs under
+	// a DIFFERENT root, so its shims used to all read "orphan" and get
+	// SIGKILLed every sweep — cold-restarting every foreign container
+	// and saturating the node (NodeOverloaded incident 2026-11).
 	nShim := 0
 	pids := pidsOnce()
 	for _, pid := range pids {
 		if nShim >= h.cfg.MaxShimKill {
 			break
 		}
-		joined := strings.Join(h.procCmdline(pid), " ")
+		argv := h.procCmdline(pid)
+		joined := strings.Join(argv, " ")
 		if !strings.Contains(joined, "containerd-shim-runc-v2") {
 			continue
 		}
-		m := shimIDRe.FindStringSubmatch(joined)
-		if m == nil {
+		ns, sid, inScope := h.ctrShimScope(argv)
+		if !inScope {
 			continue
 		}
-		sid := m[1]
-		if liveDirs[sid] || sbDirs[sid] {
-			continue
+		if ns == "k8s.io" {
+			if liveDirs[sid] || sbDirs[sid] {
+				continue
+			}
+		} else {
+			// Foreign namespace on OUR containerd (e.g. a `ctr -n`
+			// task): resolve the dir under the sibling namespace
+			// root — only a genuinely missing dir is an orphan.
+			if _, err := os.Stat(h.shimTaskDir(ns, sid)); err == nil ||
+				sbDirs[sid] {
+				continue
+			}
 		}
 		if h.procAge(pid) < 5*time.Minute {
 			continue
 		}
 		h.appendLog(fmt.Sprintf(
-			"ACTION: kill orphan shim pid=%d id=%.12s - task dir missing", pid, sid))
+			"ACTION: kill orphan shim pid=%d id=%.12s ns=%s - task dir missing",
+			pid, sid, ns))
 		if err := h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
 			h.appendLog(fmt.Sprintf(
 				"suspect: kill orphan shim pid=%d failed: %v", pid, err))

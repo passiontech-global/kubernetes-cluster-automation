@@ -1355,8 +1355,12 @@ func TestCtrTasksOrphanShim(t *testing.T) {
 	e := fixture(t)
 	sid := strings.Repeat("e", 64)
 	// Orphan shim: cmdline holds -id <sid> but no task dir anywhere.
+	// -address pins it to the k0s containerd socket (host-side path —
+	// ContainerdSocket's /host mount prefix is stripped for the
+	// comparison).
 	e.mkProc(t, 9200, "S",
-		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+"\x00", "")
+		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+
+			"\x00-address\x00/run/k0s/containerd.sock\x00", "")
 	// Fresh proc mtime — must survive the 5m orphan window.
 	e.h.Cycle(context.Background())
 	if len(e.kills) != 0 {
@@ -1377,7 +1381,8 @@ func TestCtrTasksHealthyShimKept(t *testing.T) {
 	e := fixture(t)
 	sid := strings.Repeat("f", 64)
 	e.mkProc(t, 9201, "S",
-		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+"\x00", "")
+		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+
+			"\x00-address\x00/run/k0s/containerd.sock\x00", "")
 	// The task dir exists → shim is not an orphan.
 	if err := os.MkdirAll(filepath.Join(e.ctr, sid), 0o755); err != nil {
 		t.Fatal(err)
@@ -1389,6 +1394,110 @@ func TestCtrTasksHealthyShimKept(t *testing.T) {
 	e.h.Cycle(context.Background())
 	if len(e.kills) != 0 {
 		t.Fatalf("healthy shim killed, kills=%v", e.kills)
+	}
+}
+
+// TestCtrTasksForeignShimNotKilled is the NodeOverloaded-incident
+// regression: a host dockerd shim (namespace moby, socket
+// /run/containerd/containerd.sock — a DIFFERENT containerd root) has
+// no task dir under the k0s k8s.io root, so the pre-fix reaper
+// SIGKILLed every docker shim each sweep. It must now read as
+// out-of-scope and survive even past the 5m age window.
+func TestCtrTasksForeignShimNotKilled(t *testing.T) {
+	e := fixture(t)
+	sid := strings.Repeat("a", 64)
+	e.mkProc(t, 9300, "S",
+		"containerd-shim-runc-v2\x00-namespace\x00moby\x00-id\x00"+sid+
+			"\x00-address\x00/run/containerd/containerd.sock\x00", "")
+	old := e.now.Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(e.proc, "9300"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	if len(e.kills) != 0 {
+		t.Fatalf("docker/moby shim killed by orphan reaper, kills=%v", e.kills)
+	}
+}
+
+// TestCtrTasksK8sNsForeignAddressNotKilled: namespace alone is not
+// scope — a foreign containerd can also serve a k8s.io-looking
+// namespace (a second CRI daemon, a concourse worker's containerd).
+// The -address flag is the instance identity.
+func TestCtrTasksK8sNsForeignAddressNotKilled(t *testing.T) {
+	e := fixture(t)
+	sid := strings.Repeat("b", 64)
+	e.mkProc(t, 9301, "S",
+		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+
+			"\x00-address\x00/run/containerd/containerd.sock\x00", "")
+	old := e.now.Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(e.proc, "9301"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	if len(e.kills) != 0 {
+		t.Fatalf("k8s.io shim of foreign containerd killed, kills=%v", e.kills)
+	}
+}
+
+// TestCtrTasksShimMissingFlagsNotKilled: a shim that can't be tied to
+// our containerd (no -address at all) is skipped — fail closed, the
+// instance is unverifiable.
+func TestCtrTasksShimMissingFlagsNotKilled(t *testing.T) {
+	e := fixture(t)
+	sid := strings.Repeat("c", 64)
+	e.mkProc(t, 9302, "S",
+		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+"\x00", "")
+	old := e.now.Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(e.proc, "9302"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	if len(e.kills) != 0 {
+		t.Fatalf("unverifiable shim (no -address) killed, kills=%v", e.kills)
+	}
+}
+
+// TestCtrTasksForeignNsSameSocketKept: a non-k8s.io namespace on OUR
+// containerd resolves its task dir under the sibling namespace root —
+// a live task must not read as orphan.
+func TestCtrTasksForeignNsSameSocketKept(t *testing.T) {
+	e := fixture(t)
+	sid := strings.Repeat("d", 64)
+	e.mkProc(t, 9303, "S",
+		"containerd-shim-runc-v2\x00-namespace\x00buildkit\x00-id\x00"+sid+
+			"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	// Task dir exists under the buildkit namespace root: sibling of
+	// the k8s.io root (filepath.Dir(e.ctr)/<ns>/<id>).
+	if err := os.MkdirAll(
+		filepath.Join(filepath.Dir(e.ctr), "buildkit", sid), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := e.now.Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(e.proc, "9303"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	if len(e.kills) != 0 {
+		t.Fatalf("live foreign-namespace shim on k0s containerd killed, kills=%v", e.kills)
+	}
+}
+
+// TestCtrTasksForeignNsSameSocketOrphanKilled: same socket + a
+// foreign namespace whose task dir is genuinely gone IS our
+// containerd's orphan — reap it like a k8s.io orphan.
+func TestCtrTasksForeignNsSameSocketOrphanKilled(t *testing.T) {
+	e := fixture(t)
+	sid := strings.Repeat("9", 64)
+	e.mkProc(t, 9304, "S",
+		"containerd-shim-runc-v2\x00-namespace\x00buildkit\x00-id\x00"+sid+
+			"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	old := e.now.Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(e.proc, "9304"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	if len(e.kills) != 1 || e.kills[0].pid != 9304 || e.kills[0].sig != syscall.SIGKILL {
+		t.Fatalf("orphan same-socket foreign-ns shim not killed, kills=%v", e.kills)
 	}
 }
 
