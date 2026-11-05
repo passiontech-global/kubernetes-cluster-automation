@@ -26,131 +26,13 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/hostconverge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 )
 
-func TestGetenv(t *testing.T) {
-	const key = "TEST_NHA_GETENV"
-
-	t.Run("unset returns default", func(t *testing.T) {
-		if got := getenv(key, "def"); got != "def" {
-			t.Fatalf("getenv unset=%q want %q", got, "def")
-		}
-	})
-	t.Run("empty returns default", func(t *testing.T) {
-		t.Setenv(key, "")
-		if got := getenv(key, "def"); got != "def" {
-			t.Fatalf("getenv empty=%q want %q", got, "def")
-		}
-	})
-	t.Run("set returns value", func(t *testing.T) {
-		t.Setenv(key, "val")
-		if got := getenv(key, "def"); got != "val" {
-			t.Fatalf("getenv set=%q want %q", got, "val")
-		}
-	})
-}
-
-func TestEnvBool(t *testing.T) {
-	const key = "TEST_NHA_BOOL"
-
-	// Truthy and falsy spellings must round-trip regardless of the
-	// default — mirroring the shell knobs they replace.
-	for _, v := range []string{"1", "true", "yes", "on"} {
-		t.Run("truthy/"+v, func(t *testing.T) {
-			t.Setenv(key, v)
-			if !envBool(key, false) {
-				t.Fatalf("envBool(%q) with default=false want true", v)
-			}
-			if !envBool(key, true) {
-				t.Fatalf("envBool(%q) with default=true want true", v)
-			}
-		})
-	}
-	for _, v := range []string{"0", "false", "no", "off"} {
-		t.Run("falsy/"+v, func(t *testing.T) {
-			t.Setenv(key, v)
-			if envBool(key, true) {
-				t.Fatalf("envBool(%q) with default=true want false", v)
-			}
-			if envBool(key, false) {
-				t.Fatalf("envBool(%q) with default=false want false", v)
-			}
-		})
-	}
-	// Invalid/empty fall through to the default — both directions.
-	for _, def := range []bool{true, false} {
-		t.Setenv(key, "bogus")
-		if got := envBool(key, def); got != def {
-			t.Fatalf("envBool(invalid)=%v want default %v", got, def)
-		}
-		t.Setenv(key, "")
-		if got := envBool(key, def); got != def {
-			t.Fatalf("envBool(empty)=%v want default %v", got, def)
-		}
-	}
-}
-
-func TestEnvInt(t *testing.T) {
-	const key = "TEST_NHA_INT"
-
-	t.Setenv(key, "42")
-	if got := envInt(key, 7); got != 42 {
-		t.Fatalf("envInt=%d want 42", got)
-	}
-	t.Setenv(key, "notanint")
-	if got := envInt(key, 7); got != 7 {
-		t.Fatalf("envInt(invalid)=%d want default 7", got)
-	}
-	t.Setenv(key, "")
-	if got := envInt(key, 7); got != 7 {
-		t.Fatalf("envInt(empty)=%d want default 7", got)
-	}
-}
-
-func TestEnvInt64(t *testing.T) {
-	const key = "TEST_NHA_INT64"
-
-	t.Setenv(key, "9876543210")
-	if got := envInt64(key, 5); got != 9876543210 {
-		t.Fatalf("envInt64=%d want 9876543210", got)
-	}
-	t.Setenv(key, "notanint")
-	if got := envInt64(key, 5); got != 5 {
-		t.Fatalf("envInt64(invalid)=%d want default 5", got)
-	}
-	t.Setenv(key, "")
-	if got := envInt64(key, 5); got != 5 {
-		t.Fatalf("envInt64(empty)=%d want default 5", got)
-	}
-}
-
-func TestEnvDuration(t *testing.T) {
-	const key = "TEST_NHA_DURATION"
-
-	// Go duration strings parse normally.
-	t.Setenv(key, "1h")
-	if got := envDuration(key, time.Second); got != time.Hour {
-		t.Fatalf("envDuration(1h)=%v want 1h", got)
-	}
-	t.Setenv(key, "30s")
-	if got := envDuration(key, time.Second); got != 30*time.Second {
-		t.Fatalf("envDuration(30s)=%v want 30s", got)
-	}
-	// A bare integer means seconds — parity with the shell knobs.
-	t.Setenv(key, "90")
-	if got := envDuration(key, time.Second); got != 90*time.Second {
-		t.Fatalf("envDuration(90)=%v want 90s", got)
-	}
-	t.Setenv(key, "bogus!")
-	if got := envDuration(key, time.Second); got != time.Second {
-		t.Fatalf("envDuration(invalid)=%v want default 1s", got)
-	}
-	t.Setenv(key, "")
-	if got := envDuration(key, time.Second); got != time.Second {
-		t.Fatalf("envDuration(empty)=%v want default 1s", got)
-	}
-}
+// Env-parse semantics live in internal/platform/envx (envx_test.go
+// covers them); only the warn behaviour cmd/agent operators see is
+// still asserted here.
 
 // captureSlog swaps the default slog logger for a text handler
 // writing to the returned buffer — restored on cleanup.
@@ -163,16 +45,18 @@ func captureSlog(t *testing.T) *bytes.Buffer {
 	return &buf
 }
 
-// An unparseable env duration falls back to the default — but warns,
-// like the ≤0 path does: a typo'd knob silently pinned to the
-// default is impossible to spot from the outside.
+// An unparseable env duration falls back to the default — but warns:
+// a typo'd knob silently pinned to the default is impossible to spot
+// from the outside. envx.Duration emits the same message through the
+// "envx" logger; logx.For resolves slog.Default() per call so the
+// captured handler still sees it.
 func TestEnvDurationWarnsOnUnparseable(t *testing.T) {
 	const key = "TEST_NHA_DURATION_WARN"
 	buf := captureSlog(t)
 
 	t.Setenv(key, "bogus!")
-	if got := envDuration(key, time.Second); got != time.Second {
-		t.Fatalf("envDuration(invalid)=%v want default 1s", got)
+	if got := envx.Duration(key, time.Second); got != time.Second {
+		t.Fatalf("envx.Duration(invalid)=%v want default 1s", got)
 	}
 	logs := buf.String()
 	if !strings.Contains(logs, "unparseable env duration") ||
@@ -183,8 +67,8 @@ func TestEnvDurationWarnsOnUnparseable(t *testing.T) {
 	// Parseable values warn nothing.
 	buf.Reset()
 	t.Setenv(key, "30s")
-	if got := envDuration(key, time.Second); got != 30*time.Second {
-		t.Fatalf("envDuration(30s)=%v want 30s", got)
+	if got := envx.Duration(key, time.Second); got != 30*time.Second {
+		t.Fatalf("envx.Duration(30s)=%v want 30s", got)
 	}
 	if strings.Contains(buf.String(), "env duration") {
 		t.Fatalf("parseable value warned:\n%s", buf.String())
