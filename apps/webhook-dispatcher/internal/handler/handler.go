@@ -18,8 +18,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/webhook-dispatcher/internal/concourse"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/webhook-dispatcher/internal/verify"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal/concourse"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal/verify"
 )
 
 // maxBodyBytes caps the webhook payload — GitHub deliveries are far

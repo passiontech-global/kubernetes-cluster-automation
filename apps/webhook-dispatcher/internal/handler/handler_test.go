@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,7 +17,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/webhook-dispatcher/internal/concourse"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal/concourse"
 )
 
 const testSecret = "hook-secret"
@@ -154,7 +155,7 @@ type errReader struct{ reads int }
 
 func (r *errReader) Read([]byte) (int, error) {
 	r.reads++
-	return 0, fmt.Errorf("body must not be read")
+	return 0, errors.New("body must not be read")
 }
 
 func TestMalformedSignatureRejectsBeforeBodyRead(t *testing.T) {
@@ -392,7 +393,7 @@ func TestZeroMatchStaysZeroWhenRefreshEmpty(t *testing.T) {
 func TestZeroMatchRefreshFailureKeepsResult(t *testing.T) {
 	// ATC down during the retry — the delivery still succeeds with
 	// the prior (empty) match result.
-	b := &fakeBackend{refreshErr: fmt.Errorf("atc down"), status: http.StatusOK}
+	b := &fakeBackend{refreshErr: errors.New("atc down"), status: http.StatusOK}
 	h := New(testSecret, b)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
@@ -494,7 +495,7 @@ func (s *sequencingBackend) calls() int {
 }
 
 func TestIndexUnavailableReturns502(t *testing.T) {
-	h := New(testSecret, &fakeBackend{indexErr: fmt.Errorf("atc down")})
+	h := New(testSecret, &fakeBackend{indexErr: errors.New("atc down")})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
 	if rec.Code != http.StatusBadGateway {

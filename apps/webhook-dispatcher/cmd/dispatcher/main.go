@@ -44,8 +44,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/webhook-dispatcher/internal/concourse"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/webhook-dispatcher/internal/handler"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal/concourse"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal/handler"
 )
 
 var version = "dev"
