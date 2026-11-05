@@ -183,6 +183,10 @@ func TestAllConditionDefaults(t *testing.T) {
 		"KernelKeysPressure":          {"KernelKeysNormal", "kernel keyring quota below pressure threshold"},
 		"ControlPlaneCertReloadStale": {"ControlPlaneCertReloadFresh", "control-plane cert reload markers fresh"},
 		"MemoryPSIThrashing":          {"MemoryPSINormal", "memory PSI full avg60 <= 25% or free memory >= 8%"},
+		// Wave-9 latch→condition surface.
+		"ClockUnsynchronized": {"ClockSynchronized", "kernel clock disciplined (adjtimex synced, esterror <= 500ms)"},
+		"KernelSlabLeak":      {"KernelSlabNormal", "unreclaimable kernel slab below pressure threshold"},
+		"NebulaPMTUBlackhole": {"NebulaPMTUOk", "nebula overlay passes DF probes at probe size"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {
@@ -234,6 +238,32 @@ func TestLatchSetsConditionTrue(t *testing.T) {
 	}
 	if got := e.gauge("CiliumAgentDown", "CiliumAgentDownDetected"); got != 0 {
 		t.Fatalf("problem_gauge after clear = %v, want 0", got)
+	}
+}
+
+// TestWave9LatchConditions: the three Wave-9 state-* latches each
+// flip their permanent NodeCondition to True with the problem
+// reason — clock-unsync (nethealth H1), kernel-slab-leak
+// (workerhygiene W9-KR3), nebula-pmtu-blackhole (nethealth W9-NM1).
+func TestWave9LatchConditions(t *testing.T) {
+	e := fixture(t)
+	e.writeFile("state-clock-unsync", "1700000001\n")
+	e.writeFile("state-kernel-slab-leak", "1700000002\n")
+	e.writeFile("state-nebula-pmtu-blackhole", "1700000003\n")
+	e.cycle()
+
+	for _, tc := range []struct {
+		typ    corev1.NodeConditionType
+		reason string
+	}{
+		{"ClockUnsynchronized", "ClockUnsynchronizedDetected"},
+		{"KernelSlabLeak", "KernelSlabLeakDetected"},
+		{"NebulaPMTUBlackhole", "NebulaPMTUBlackholeDetected"},
+	} {
+		c := e.cond(t, tc.typ)
+		if c.Status != corev1.ConditionTrue || c.Reason != tc.reason {
+			t.Errorf("%s = {%s %s}, want True/%s", tc.typ, c.Status, c.Reason, tc.reason)
+		}
 	}
 }
 

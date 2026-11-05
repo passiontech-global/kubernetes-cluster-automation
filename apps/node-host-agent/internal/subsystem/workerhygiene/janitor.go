@@ -93,10 +93,11 @@ const (
 //	  zombie-storm (A2), d-state-storm (W7-H1),
 //	  cilium-envoy-xds-reject (W7-H3), spegel-mirror-degraded (W7-H4),
 //	  calico-veth-leak / calico-felix-down (W7-H7),
-//	  cilium-bpf-map-pressure (W8-NM3), psi-memory-thrash (W2)
+//	  cilium-bpf-map-pressure (W8-NM3), psi-memory-thrash (W2),
+//	  kernel-slab-leak (W9-KR3)
 //	nethealth: dns-fallback (20), nebula-isolated/-degraded/-slowpath/
 //	  -siteedge (13), fail2ban-down (50), clock-unsync (H1),
-//	  conntrack-pressure (H2)
+//	  conntrack-pressure (H2), nebula-pmtu-blackhole (W9-NM1)
 //	controllerhygiene: apiserver-cache-stale/-wedged (sig13),
 //	  kine-backend-unreachable, kine-pool-runaway, kine-ttl-dead,
 //	  kine-ttl-loop, k0scontroller-oom-loop, cp-cert-reload-stale (W8-CP4),
@@ -151,6 +152,8 @@ var knownLatchNames = map[string]bool{
 	"kernel-keys-pressure":     true, // hostmetrics kernel keyring quota (W8-KR3)
 	"cp-cert-reload-stale":     true, // controllerhygiene cert reload (W8-CP4)
 	"cp-component-frozen":      true, // controllerhygiene KCM/scheduler freeze (W8-CP3)
+	"kernel-slab-leak":         true, // workerhygiene SUnreclaim guard (W9-KR3)
+	"nebula-pmtu-blackhole":    true, // nethealth DF PMTU probe (W9-NM1)
 }
 
 // knownLatchPrefixes — parameterized latch families whose suffix is

@@ -562,9 +562,9 @@ func TestCheckPSIThrashLatchesAndEvicts(t *testing.T) {
 	if got := logLines(t, e); !strings.Contains(got, "ACTION psi-memory-thrash:") {
 		t.Fatalf("the NodeMemoryPSIThrashing Event line missing:\n%s", got)
 	}
-	del := deleteActions(e.cs)
-	if len(del) != 1 || del[0].GetName() != "memhog" {
-		t.Fatalf("deletes = %v, want the highest-RSS pod memhog", del)
+	evs := evictActions(e.cs)
+	if len(evs) != 1 || evs[0] != "memhog" {
+		t.Fatalf("evictions = %v, want the highest-RSS pod memhog", evs)
 	}
 	if _, err := os.Stat(filepath.Join(e.state, "last-psi-evict")); err != nil {
 		t.Fatal("last-psi-evict budget not spent")
@@ -629,7 +629,10 @@ func TestCheckPSIThrashSystemPodsSafe(t *testing.T) {
 			"0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+underscored+".slice\n")
 		rss := 900000 // the SYSTEM pod holds the most RSS
 		if pid == 5002 {
-			rss = 100
+			// Above the 512MiB victim floor (524288 kB) but
+			// below the system pod — still the only eligible
+			// victim.
+			rss = 600000
 		}
 		writeFile(t, filepath.Join(d, "status"),
 			fmt.Sprintf("Name:\tc\nVmRSS:\t%d kB\n", rss))
@@ -637,8 +640,8 @@ func TestCheckPSIThrashSystemPodsSafe(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.checkPSIThrash(context.Background(), pods, true, pidsOf(5001, 5002), true)
 	}
-	del := deleteActions(e.cs)
-	if len(del) != 1 || del[0].GetName() != "workload" {
-		t.Fatalf("deletes = %v, want workload (system pods protected)", del)
+	evs := evictActions(e.cs)
+	if len(evs) != 1 || evs[0] != "workload" {
+		t.Fatalf("evictions = %v, want workload (system pods protected)", evs)
 	}
 }

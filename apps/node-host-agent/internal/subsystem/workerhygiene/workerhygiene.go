@@ -123,6 +123,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
@@ -209,12 +210,16 @@ const (
 	defaultSysClassNet         = "/sys/class/net"
 	defaultNebulaIface         = "neb1"
 	defaultCiliumIface         = "cilium_net"
+	defaultCiliumWG0Iface      = "cilium_wg0"
 	defaultCiliumRuntimeConfig = "/host/run/cilium/state/agent-runtime-config.json"
-	unixSockProbeTimeout       = 5 * time.Second
-	zombieStormThreshold       = 500 // <defunct> children of one parent = storm
-	ctrIngestMaxAge            = 3 * time.Hour
-	ctrIngestScanInterval      = 6 * time.Hour
-	k0sDiskHighWatermark       = 0.75
+	// defaultNetnsDir is the host /run/netns mount — the CNI
+	// netns-file leak reaper scans cni-* entries here.
+	defaultNetnsDir       = "/host/run/netns"
+	unixSockProbeTimeout  = 5 * time.Second
+	zombieStormThreshold  = 500 // <defunct> children of one parent = storm
+	ctrIngestMaxAge       = 3 * time.Hour
+	ctrIngestScanInterval = 6 * time.Hour
+	k0sDiskHighWatermark  = 0.75
 	// W6.3 disk-bloat thresholds: above the warn watermark the
 	// bounded walk runs (at most once per DiskBloatScanInterval —
 	// the walk itself costs IO on the disk that is already full);
@@ -268,6 +273,18 @@ const (
 	defaultPSIFullAvg60     = 25.0             // /proc/pressure/memory full avg60 in percent
 	defaultMemFreeMinRatio  = 0.08             // MemAvailable/MemTotal floor
 	psiEvictInterval        = 15 * time.Minute // last-psi-evict budget
+	// Wave-9 knobs: the kernel slab-leak guard thresholds
+	// (SUnreclaim/MemTotal enter/clear hysteresis + the
+	// drop_caches budget), the orphan CNI netns confirmation age,
+	// the WireGuard encapsulation overhead subtracted from the
+	// overlay MTU for the cilium_wg0 drift check, and the
+	// content-store prune budget.
+	slabLeakEnterRatio     = 0.35
+	slabLeakClearRatio     = 0.25
+	slabDropCachesInterval = time.Hour
+	cniNetnsMinAge         = 30 * time.Minute
+	wgEncapOverheadBytes   = 60
+	contentPruneInterval   = 6 * time.Hour
 )
 
 // Check names — prometheus `check` label + log context.
@@ -299,6 +316,7 @@ const (
 	checkCalico      = "calico-hygiene"     // W7-H7
 	checkCiliumBPF   = "cilium-bpf-maps"    // W8-NM3 (inside checkCilium)
 	checkPSIThrash   = "psi-memory-thrash"  // W2
+	checkCNINetns    = "cni-netns-gc"       // W9 orphan /run/netns/cni-* reaper
 )
 
 // stateJournalUnreadable is the blindness latch the journal-read
@@ -419,6 +437,11 @@ type Config struct {
 	BPFMapHighRatio float64 // critical-map fill ratio → latch (0.90)
 	PSIFullAvg60    float64 // PSI memory full avg60 percent (25)
 	MemFreeMinRatio float64 // free-mem ratio floor (0.08)
+	// Wave-9 knobs: the cilium WireGuard datapath iface for the
+	// double-encap MTU check (B4 extension), and the host
+	// /run/netns mount the orphan cni-* reaper scans.
+	CiliumWG0Iface string // cilium WG tunnel iface (cilium_wg0)
+	NetnsDir       string // host /run/netns — orphan cni-* netns files
 
 	// killFn delivers signals — seam for tests (SIGKILL on pause /
 	// proxy-agent/shim/cilium pids, and signal-0 liveness probes).
@@ -471,6 +494,12 @@ type Config struct {
 	// content ingest rm <ref>` via the systemd exec wrapper (A3).
 	// nil → Systemd.Exec default. Seam.
 	ctrRmIngest func(ctx context.Context, ref string) error
+	// ctrPruneContent runs the store-wide content GC — `k0s ctr -n
+	// k8s.io content prune` via the systemd exec wrapper (W9). It
+	// only fires while /var/lib/k0s sits above the high watermark,
+	// on the last-content-gc 6h budget. nil → Systemd.Exec
+	// default. Seam.
+	ctrPruneContent func(ctx context.Context) error
 	// wgAllowedIPsFn returns how many cilium_wg0 peers carry a real
 	// allowed-ips set — `wg show cilium_wg0 allowed-ips` parsed
 	// (peers at "(none)" are wiped). nil → Systemd.Exec default.
@@ -605,6 +634,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.CiliumIface == "" {
 		c.CiliumIface = defaultCiliumIface
+	}
+	if c.CiliumWG0Iface == "" {
+		c.CiliumWG0Iface = defaultCiliumWG0Iface
+	}
+	if c.NetnsDir == "" {
+		c.NetnsDir = defaultNetnsDir
 	}
 	if c.CiliumRuntimeConfig == "" {
 		c.CiliumRuntimeConfig = defaultCiliumRuntimeConfig
@@ -868,6 +903,17 @@ func (c *Config) applyDefaults() {
 			}
 			_, err := sd.Exec(ctx,
 				"k0s", "ctr", "-n", "k8s.io", "content", "ingest", "rm", ref)
+			return err
+		}
+	}
+	if c.ctrPruneContent == nil {
+		sd := c.Systemd
+		c.ctrPruneContent = func(ctx context.Context) error {
+			if sd == nil {
+				return fmt.Errorf("no systemd client wired")
+			}
+			_, err := sd.Exec(ctx,
+				"k0s", "ctr", "-n", "k8s.io", "content", "prune")
 			return err
 		}
 	}
@@ -1362,6 +1408,9 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	})
 	run(checkCalico, func() {
 		h.checkCalicoHygiene(ctx, pods, apiOK, workerActive)
+	})
+	run(checkCNINetns, func() {
+		h.checkOrphanCNINetns(ctx, pidsOnce, workerActive)
 	})
 	run(checkPSIThrash, func() {
 		h.checkPSIThrash(ctx, pods, apiOK, pidsOnce, workerActive)
@@ -4086,6 +4135,13 @@ func (h *Hygiene) checkCtrIngestGC(ctx context.Context, workerActive bool) {
 		h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
 		return
 	}
+	// W9: above the high watermark the content store itself may be
+	// the hog — run the store-wide prune on its own 6h budget IN
+	// ADDITION to the stale-ingest sweep below. Below the
+	// watermark (periodic rescan only) it never fires.
+	if diskHigh {
+		h.maybePruneContentStore(ctx)
+	}
 	entries, err := os.ReadDir(h.cfg.CtrIngestDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -4145,6 +4201,28 @@ func (h *Hygiene) checkCtrIngestGC(ctx context.Context, workerActive bool) {
 		h.actions.WithLabelValues(checkIngestGC, "ingest_rm").Inc()
 	}
 	h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
+}
+
+// maybePruneContentStore runs `k0s ctr -n k8s.io content prune` —
+// the store-wide GC that drops content blobs no lease references
+// (the stale-ingest sweep only touches ingest/ leftovers; leaked
+// leased content is what actually fills /var/lib/k0s). Budgeted by
+// the last-content-gc marker at contentPruneInterval — the prune
+// walks every blob + lease so it must not run every cycle even
+// while the disk stays above the watermark. The budget is spent
+// BEFORE the command (rate_spend parity); a failed prune logs
+// suspect and does NOT count as an action.
+func (h *Hygiene) maybePruneContentStore(ctx context.Context) {
+	if !h.rateTrySpend("last-content-gc", contentPruneInterval) {
+		return
+	}
+	if err := h.cfg.ctrPruneContent(ctx); err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: ctr-ingest-gc content prune failed: %v", err))
+		return
+	}
+	h.appendLog("ACTION: ctr-ingest-gc content prune ran (disk above watermark)")
+	h.actions.WithLabelValues(checkIngestGC, "content_gc").Inc()
 }
 
 // --- Check: zombie storm (A2) ---
@@ -4664,21 +4742,34 @@ func (h *Hygiene) checkCiliumMTU(workerActive bool) {
 	if !cilOK {
 		cil, cilOK = runtimeConfigMTU(h.cfg.CiliumRuntimeConfig)
 	}
-	if !nebOK || !cilOK {
-		// No overlay or no cilium datapath to compare — a drift
-		// latch from before must not linger.
+	// W9 double-encap guard: on the WireGuard datapath cilium_wg0
+	// carries pod traffic INSIDE the nebula overlay — its MTU must
+	// leave room for the WG header (~60B) under the overlay MTU.
+	// A wg0 MTU above neb−60 means pod packets exceed what the
+	// double-encapsulated path can carry → silent blackhole.
+	wg, wgOK := mtuOfIface(h.cfg.SysClassNet, h.cfg.CiliumWG0Iface)
+	if !nebOK {
+		// No overlay to compare against — a drift latch from
+		// before must not linger.
 		h.stateExit("cilium-mtu-drift")
 		h.cycles.WithLabelValues(checkCiliumMTU, "ok").Inc()
 		return
 	}
-	if cil > neb {
+	var driftWhy string
+	switch {
+	case cilOK && cil > neb:
+		driftWhy = fmt.Sprintf("cilium_net=%d nebula=%d", cil, neb)
+	case wgOK && wg > neb-wgEncapOverheadBytes:
+		driftWhy = fmt.Sprintf("cilium_wg0=%d nebula=%d (wg overhead %d)",
+			wg, neb, wgEncapOverheadBytes)
+	}
+	if driftWhy != "" {
 		if !h.stateExists("cilium-mtu-drift") {
-			h.stateEnter("cilium-mtu-drift",
-				fmt.Sprintf("cilium=%d nebula=%d", cil, neb))
+			h.stateEnter("cilium-mtu-drift", driftWhy)
 			// NPD contract: nodereporter maps this line to the
 			// CiliumMTUExceedsOverlay Event + problem_counter.
 			h.appendLog(fmt.Sprintf(
-				"ACTION cilium-mtu-drift: cilium=%d nebula=%d", cil, neb))
+				"ACTION cilium-mtu-drift: %s", driftWhy))
 		}
 	} else {
 		h.stateExit("cilium-mtu-drift")
@@ -5903,6 +5994,184 @@ func (h *Hygiene) gcCalicoOrphanVeths(ctx context.Context) {
 	}
 }
 
+// --- Check: orphan CNI netns reaper (W9) ---
+// CNI plugins pin each pod sandbox's network namespace by
+// bind-mounting its nsfs file at /run/netns/cni-<id>. A pod teardown
+// that dies mid-DEL (crash, OOM kill, kubelet restart) leaks the
+// mount: the file outlives the namespace, and `ip netns` listings
+// accumulate dead entries that confuse operators and slow CNI
+// scans. The reaper stats every cni-* file — the nsfs inode is the
+// namespace's identity, shared with /proc/<pid>/ns/net for every
+// process still inside it — and only a file whose inode NO live
+// process references is an orphan. Confirmation is the
+// cni-netns-seen-<name> two-pass marker (veth-seen-* parity): first
+// sighting records the epoch, and only a file still unreferenced
+// >= cniNetnsMinAge later is lazily unmounted + removed. The umount
+// runs through the systemd nsenter wrapper so the HOST mount
+// namespace is the one modified; the file removal uses the /host
+// view (NetnsDir).
+
+// netnsInode stats a netns file and returns the nsfs inode — the
+// identity /proc/<pid>/ns/net entries share for the same network
+// namespace (bind-mounted copies keep the inode).
+func netnsInode(path string) (uint64, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return st.Ino, true
+}
+
+// liveNetnsInodes collects the nsfs inode of every live process's
+// network namespace. Unreadable entries are skipped — a pid that
+// vanished mid-scan is not a reference.
+func (h *Hygiene) liveNetnsInodes(pids []int) map[uint64]bool {
+	out := map[uint64]bool{}
+	for _, pid := range pids {
+		if ino, ok := netnsInode(h.procFile(pid, "ns", "net")); ok {
+			out[ino] = true
+		}
+	}
+	return out
+}
+
+func (h *Hygiene) checkOrphanCNINetns(ctx context.Context, pidsOnce func() []int, workerActive bool) {
+	if !workerActive {
+		h.cycles.WithLabelValues(checkCNINetns, "gated").Inc()
+		return
+	}
+	entries, err := os.ReadDir(h.cfg.NetnsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No netns dir at all (non-CNI node, unmounted /run) —
+			// prune stale markers and go quiet.
+			h.pruneCNINetnsMarkers(nil)
+			h.cycles.WithLabelValues(checkCNINetns, "ok").Inc()
+			return
+		}
+		h.appendLog(fmt.Sprintf(
+			"suspect: cni-netns-gc read %s failed: %v — scan skipped",
+			h.cfg.NetnsDir, err))
+		h.cycles.WithLabelValues(checkCNINetns, "abort").Inc()
+		return
+	}
+	// Collect cni-* candidates first — the /proc ns/net stat sweep
+	// only runs when there is something to check.
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "cni-") {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	if len(names) == 0 {
+		h.pruneCNINetnsMarkers(nil)
+		h.cycles.WithLabelValues(checkCNINetns, "ok").Inc()
+		return
+	}
+	live := h.liveNetnsInodes(pidsOnce())
+	seen := map[string]bool{}
+	for _, name := range names {
+		seen[name] = true
+		path := filepath.Join(h.cfg.NetnsDir, name)
+		ino, ok := netnsInode(path)
+		if !ok {
+			continue // vanished or unreadable — next cycle re-reads
+		}
+		if live[ino] {
+			// A live process still sits in this netns — the mount
+			// is real. Drop any stale marker so a later orphan
+			// episode re-arms the full confirmation window.
+			_ = os.Remove(filepath.Join(
+				h.cfg.WatchdogStateDir, "cni-netns-seen-"+name))
+			continue
+		}
+		marker := "cni-netns-seen-" + name
+		if !h.stateFileExists(marker) {
+			h.rateSpend(marker)
+			h.appendLog(fmt.Sprintf(
+				"cni-netns-gc: orphan netns candidate %s - no live process, confirm in %dm",
+				name, int(cniNetnsMinAge.Minutes())))
+			continue
+		}
+		if !h.rateOK(marker, cniNetnsMinAge) {
+			continue
+		}
+		// Re-stat before acting: the inode must STILL be
+		// unreferenced (a process may have joined the netns since
+		// the snapshot; `live` is a per-cycle map).
+		ino2, ok2 := netnsInode(path)
+		if !ok2 || live[ino2] {
+			continue
+		}
+		h.reapCNINetns(ctx, name)
+	}
+	h.pruneCNINetnsMarkers(seen)
+	h.cycles.WithLabelValues(checkCNINetns, "ok").Inc()
+}
+
+// reapCNINetns lazily unmounts the orphan netns bind-mount inside
+// the HOST mount namespace, then removes the file under the /host
+// view. The marker is dropped only after the umount succeeds — a
+// failed umount keeps the confirmation so the next cycle retries.
+func (h *Hygiene) reapCNINetns(ctx context.Context, name string) {
+	if h.cfg.Systemd == nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cni-netns-gc orphan netns %s confirmed but no systemd client — skip umount",
+			name))
+		return
+	}
+	// The umount path is the HOST's /run/netns — NOT NetnsDir,
+	// which is the /host-prefixed filesystem view used for scans.
+	out, err := h.cfg.Systemd.Exec(ctx, "umount", "-l",
+		"/run/netns/"+name)
+	if err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: cni-netns-gc umount /run/netns/%s failed: %v (%s) — keeping marker",
+			name, err, strings.TrimSpace(out)))
+		return
+	}
+	if rerr := os.Remove(filepath.Join(h.cfg.NetnsDir, name)); rerr != nil &&
+		!os.IsNotExist(rerr) {
+		// The mount IS detached — the dangerous half is done; a
+		// leftover plain file re-arms as a fresh candidate next
+		// cycle rather than looping a doomed umount.
+		h.appendLog(fmt.Sprintf(
+			"suspect: cni-netns-gc rm %s failed: %v — mount detached, file remains",
+			filepath.Join(h.cfg.NetnsDir, name), rerr))
+	}
+	_ = os.Remove(filepath.Join(
+		h.cfg.WatchdogStateDir, "cni-netns-seen-"+name))
+	h.appendLog(fmt.Sprintf(
+		"ACTION: cni-netns-gc reaped orphan netns %s - unmounted + removed (no live process >%dm)",
+		name, int(cniNetnsMinAge.Minutes())))
+	h.actions.WithLabelValues(checkCNINetns, "umount_rm").Inc()
+}
+
+// pruneCNINetnsMarkers drops cni-netns-seen-* markers whose netns
+// file vanished — a file that reappeared referenced or was cleaned
+// up by other means must not keep a stale confirmation armed.
+func (h *Hygiene) pruneCNINetnsMarkers(seen map[string]bool) {
+	ms, err := filepath.Glob(filepath.Join(
+		h.cfg.WatchdogStateDir, "cni-netns-seen-*"))
+	if err != nil {
+		return
+	}
+	for _, m := range ms {
+		name := strings.TrimPrefix(filepath.Base(m), "cni-netns-seen-")
+		if seen != nil && seen[name] {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(h.cfg.NetnsDir, name)); err != nil {
+			_ = os.Remove(m)
+		}
+	}
+}
+
 // --- Check: PSI memory thrash guard (W2) ---
 // When the kernel is genuinely out of memory the LAST thing that
 // should die is a system daemon — but the OOM killer scores by
@@ -5910,10 +6179,15 @@ func (h *Hygiene) gcCalicoOrphanVeths(ctx context.Context) {
 // memory-full stall (PSI `full avg60` > PSIFullAvg60) together with
 // real free memory under MemFreeMinRatio means the node IS
 // thrashing; for ConsecNeeded consecutive cycles the
-// state-psi-memory-thrash latch fires and the highest-RSS
-// non-system pod is evicted through the API (last-psi-evict 15m
-// budget) — buying back headroom before the kernel picks a victim
-// of its own (k0sworker, containerd, the agent itself).
+// state-psi-memory-thrash latch fires and the highest-RSS eligible
+// pod is evicted through the policy/v1 Eviction API (PDB-enforced,
+// last-psi-evict 15m budget) — buying back headroom before the
+// kernel picks a victim of its own (k0sworker, containerd, the
+// agent itself). W9 hardening: a kernel-slab-leak latch suppresses
+// the eviction entirely (a kernel leak is not a pod-size problem),
+// and victim selection excludes system namespaces, critical
+// priority classes, terminating pods, StatefulSet database/quorum
+// members, and anything under the 512 MiB RSS floor.
 
 // psiMemoryFullAvg60 parses <ProcRoot>/pressure/memory — the
 // `full avg60=` value of the memory pressure stall (percent). PSI
@@ -5947,15 +6221,27 @@ func (h *Hygiene) psiMemoryFullAvg60() (float64, bool) {
 	return 0, false
 }
 
-// memFreeRatio parses <ProcRoot>/meminfo — MemAvailable/MemTotal.
-// MemAvailable is the usable-free number (kernel 3.14+); ok=false
-// when either field is missing or MemTotal is zero.
-func (h *Hygiene) memFreeRatio() (float64, bool) {
+// memInfo holds the <ProcRoot>/meminfo fields the memory checks
+// consume — all values in kB as reported by the kernel.
+type memInfo struct {
+	totalKB     int64
+	availKB     int64
+	slabUnrecKB int64 // SUnreclaim — slab the kernel cannot reclaim
+	parsed      bool  // at least MemTotal + MemAvailable seen
+}
+
+// readMeminfo parses <ProcRoot>/meminfo once for every consumer —
+// MemTotal/MemAvailable drive the free-ratio floor, SUnreclaim the
+// W9-KR3 slab-leak guard. ok=false semantics live on the callers:
+// a missing MemTotal or MemAvailable means "unreadable".
+func (h *Hygiene) readMeminfo() memInfo {
+	var m memInfo
 	data, err := os.ReadFile(filepath.Join(h.cfg.ProcRoot, "meminfo"))
 	if err != nil {
-		return 0, false
+		return m
 	}
-	var total, avail int64
+	var total, avail, slab int64
+	var sawTotal, sawAvail bool
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 2 {
@@ -5967,15 +6253,76 @@ func (h *Hygiene) memFreeRatio() (float64, bool) {
 		}
 		switch f[0] {
 		case "MemTotal:":
-			total = v
+			total, sawTotal = v, true
 		case "MemAvailable:":
-			avail = v
+			avail, sawAvail = v, true
+		case "SUnreclaim:":
+			slab = v
 		}
 	}
-	if total <= 0 {
-		return 0, false
+	if !sawTotal || !sawAvail || total <= 0 {
+		return m
 	}
-	return float64(avail) / float64(total), true
+	m.totalKB, m.availKB, m.slabUnrecKB, m.parsed = total, avail, slab, true
+	return m
+}
+
+// guardKernelSlabLeak is the W9-KR3 kernel slab-leak guard: while
+// SUnreclaim/MemTotal sits above slabLeakEnterRatio the
+// state-kernel-slab-leak latch is held and a 1h-budgeted
+// drop_caches write ("2" — dentries+inodes) tries to hand the
+// reclaimable share back. The latch is the PSI evictor's circuit
+// breaker — a kernel leaking unreclaimable slab is a kernel bug,
+// not a pod-size problem, and evicting workloads cannot fix it.
+// Hysteresis: enter >0.35, clear <=0.25; between the two the latch
+// (and its drop-caches cadence) simply persists. Returns true while
+// the latch is held.
+func (h *Hygiene) guardKernelSlabLeak(m memInfo) bool {
+	ratio := float64(m.slabUnrecKB) / float64(m.totalKB)
+	latched := h.stateExists("kernel-slab-leak")
+	switch {
+	case ratio > slabLeakEnterRatio:
+		if !latched {
+			// NPD contract parity: the ACTION line announces the
+			// latch entry (nodereporter maps STATE-ENTER too).
+			h.appendLog(fmt.Sprintf(
+				"ACTION kernel-slab-leak: sunreclaim_ratio=%.3f sunreclaim_kb=%d memtotal_kb=%d",
+				ratio, m.slabUnrecKB, m.totalKB))
+		}
+		latched = true
+	case ratio <= slabLeakClearRatio:
+		if latched {
+			h.stateExit("kernel-slab-leak")
+		}
+		latched = false
+	}
+	if !latched {
+		return false
+	}
+	// stateEnter refreshes the latch mtime every cycle it is held —
+	// the janitor's 24h reap must not retire a live condition.
+	h.stateEnter("kernel-slab-leak",
+		fmt.Sprintf("sunreclaim_ratio=%.3f", ratio))
+	if h.rateTrySpend("last-slab-drop-caches", slabDropCachesInterval) {
+		h.dropKernelCaches()
+	}
+	return true
+}
+
+// dropKernelCaches writes "2" to <ProcRoot>/sys/vm/drop_caches —
+// frees dentries/inodes/slab caches. Best-effort: a write failure
+// is logged suspect and never counted as an action — the budget
+// marker is already spent either way (rate_spend parity).
+func (h *Hygiene) dropKernelCaches() {
+	p := filepath.Join(h.cfg.ProcRoot, "sys", "vm", "drop_caches")
+	if err := os.WriteFile(p, []byte("2\n"), 0o644); err != nil {
+		h.appendLog(fmt.Sprintf(
+			"suspect: kernel-slab-leak drop_caches write %s failed: %v",
+			p, err))
+		return
+	}
+	h.appendLog("ACTION: kernel-slab-leak wrote 2 to sys/vm/drop_caches")
+	h.actions.WithLabelValues(checkPSIThrash, "drop_caches").Inc()
 }
 
 // procRSS reads /proc/<pid>/status VmRSS in bytes — the resident
@@ -5999,45 +6346,146 @@ func (h *Hygiene) procRSS(pid int) int64 {
 	return 0
 }
 
-// highestRSSPod returns the non-system pod on this node whose
-// summed /proc VmRSS is largest — the eviction victim for the
-// psi-memory-thrash guard. kube-system and node-ops are never
-// evicted (the guard exists to protect system daemons, not to reap
-// them); pods already Terminating are skipped. Pids are attributed
-// to pods via the same /proc/<pid>/cgroup uid extraction the zombie
-// check uses.
+// psiEvictExcludedNamespaces are namespaces the PSI evictor never
+// touches — system daemons, CNI/mesh control planes, storage
+// operators, cert/secrets plumbing, the flux delivery layer and the
+// database quorum namespaces. Evicting from these under memory
+// pressure removes the very components needed to recover.
+var psiEvictExcludedNamespaces = map[string]bool{
+	"kube-system":      true,
+	"node-ops":         true,
+	"medik8s":          true,
+	"cilium":           true,
+	"linkerd":          true,
+	"linkerd-cni":      true,
+	"openebs":          true,
+	"cert-manager":     true,
+	"external-secrets": true,
+	"operators":        true,
+	"everest-system":   true,
+	"scylla":           true,
+	"scylla-manager":   true,
+	"flux-system":      true,
+}
+
+// psiEvictCriticalPriorityClasses — pods the scheduler marked
+// untouchable; evicting them fights the cluster's own guarantees.
+var psiEvictCriticalPriorityClasses = map[string]bool{
+	"system-node-critical":    true,
+	"system-cluster-critical": true,
+}
+
+// dbQuorumTokens mark StatefulSet-owned pods carrying database /
+// quorum state — losing one replica under memory pressure can cost
+// quorum, far worse than the memory it frees. Matched
+// case-insensitively against label keys AND values.
+var dbQuorumTokens = []string{
+	"scylla", "dragonfly", "rabbitmq", "pxc", "psmdb", "postgresql",
+}
+
+// minEvictRSSBytes is the victim floor — below 512 MiB RSS a pod is
+// not worth an eviction: the API churn + PDB slot buys back almost
+// nothing while the thrash persists.
+const minEvictRSSBytes = 512 * 1024 * 1024
+
+// ownedByStatefulSet reports whether any ownerReference is a
+// StatefulSet — the tiering hint for victim preference.
+func ownedByStatefulSet(p *corev1.Pod) bool {
+	for _, ref := range p.OwnerReferences {
+		if ref.Kind == "StatefulSet" {
+			return true
+		}
+	}
+	return false
+}
+
+// carriesDBQuorumLabel reports whether the pod's labels name a
+// database/quorum workload (dbQuorumTokens, case-insensitive over
+// keys and values).
+func carriesDBQuorumLabel(p *corev1.Pod) bool {
+	for k, v := range p.Labels {
+		lk, lv := strings.ToLower(k), strings.ToLower(v)
+		for _, tok := range dbQuorumTokens {
+			if strings.Contains(lk, tok) || strings.Contains(lv, tok) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// highestRSSPod returns the eviction victim for the
+// psi-memory-thrash guard: the eligible non-system pod on this node
+// whose summed /proc VmRSS is largest, subject to the W8-W1 safety
+// rails —
+//
+//   - minEvictRSSBytes floor: no candidate >= 512 MiB RSS → no
+//     eviction at all (victim=nil).
+//   - psiEvictExcludedNamespaces + critical priority classes are
+//     never candidates.
+//   - StatefulSet pods carrying database/quorum labels are never
+//     candidates (quorum loss >> memory freed).
+//   - Tiered pick: BestEffort/Burstable pods NOT owned by a
+//     StatefulSet are preferred; Guaranteed pods and other
+//     StatefulSet pods are the fallback tier — evicting them is
+//     still better than letting the kernel OOM killer choose.
+//
+// Pids are attributed to pods via the same /proc/<pid>/cgroup uid
+// extraction the zombie check uses.
 func (h *Hygiene) highestRSSPod(pods []corev1.Pod, pids []int) (victim *corev1.Pod, rss int64) {
-	byUID := map[string]*corev1.Pod{}
+	type candidate struct {
+		pod       *corev1.Pod
+		rss       int64
+		preferred bool // Burstable/BestEffort && !StatefulSet-owned
+	}
+	byUID := map[string]*candidate{}
 	for i := range pods {
 		p := &pods[i]
-		if p.DeletionTimestamp != nil || p.Namespace == "kube-system" ||
-			p.Namespace == "node-ops" {
+		if p.DeletionTimestamp != nil || psiEvictExcludedNamespaces[p.Namespace] ||
+			psiEvictCriticalPriorityClasses[p.Spec.PriorityClassName] ||
+			(ownedByStatefulSet(p) && carriesDBQuorumLabel(p)) {
 			continue
 		}
-		byUID[string(p.UID)] = p
+		byUID[string(p.UID)] = &candidate{
+			pod: p,
+			// Guaranteed QoS (or empty — the API always sets the
+			// class on real pods; empty only shows in tests) is
+			// never "preferred" — empty stays preferred because a
+			// fake/legacy pod without the class is not provably
+			// Guaranteed.
+			preferred: p.Status.QOSClass != corev1.PodQOSGuaranteed &&
+				!ownedByStatefulSet(p),
+		}
 	}
 	if len(byUID) == 0 || len(pids) == 0 {
 		return nil, 0
 	}
-	rssOf := map[string]int64{}
 	for _, pid := range pids {
 		uid := h.podUIDForPID(pid)
 		if uid == "unknown" {
 			continue
 		}
-		if _, ok := byUID[uid]; ok {
-			rssOf[uid] += h.procRSS(pid)
+		if c, ok := byUID[uid]; ok {
+			c.rss += h.procRSS(pid)
 		}
 	}
-	for uid, total := range rssOf {
-		if total <= 0 {
-			continue
+	// Tiered selection: preferred candidates first; only when none
+	// clears the RSS floor does the fallback tier compete.
+	for _, wantPreferred := range []bool{true, false} {
+		var best *candidate
+		for _, c := range byUID {
+			if c.preferred != wantPreferred || c.rss < minEvictRSSBytes {
+				continue
+			}
+			if best == nil || c.rss > best.rss {
+				best = c
+			}
 		}
-		if victim == nil || total > rss {
-			victim, rss = byUID[uid], total
+		if best != nil {
+			return best.pod, best.rss
 		}
 	}
-	return victim, rss
+	return nil, 0
 }
 
 func (h *Hygiene) checkPSIThrash(ctx context.Context, pods []corev1.Pod,
@@ -6047,15 +6495,26 @@ func (h *Hygiene) checkPSIThrash(ctx context.Context, pods []corev1.Pod,
 		return
 	}
 	avg60, psiOK := h.psiMemoryFullAvg60()
-	free, memOK := h.memFreeRatio()
-	if !psiOK || !memOK {
-		// PSI disabled or meminfo unreadable — inconclusive, keep
-		// streak/latch exactly like a failed probe (a kernel without
-		// PSI never latches but must not clear a live one on a
-		// transient read error).
+	m := h.readMeminfo()
+	if !m.parsed {
+		// meminfo unreadable — inconclusive, keep streak/latch
+		// exactly like a failed probe (a transient read error must
+		// not clear a live latch).
 		h.cycles.WithLabelValues(checkPSIThrash, "abort").Inc()
 		return
 	}
+	// W9-KR3: the slab-leak guard runs on EVERY readable-meminfo
+	// cycle — its latch is this check's eviction circuit breaker,
+	// and it must arm even on kernels without PSI or while PSI is
+	// quiet (a kernel slab leak is a kernel problem, not a PSI one).
+	slabLeaking := h.guardKernelSlabLeak(m)
+	if !psiOK {
+		// PSI disabled on this kernel — the whole thrash check is
+		// dormant, but the slab guard above still evaluated.
+		h.cycles.WithLabelValues(checkPSIThrash, "abort").Inc()
+		return
+	}
+	free := float64(m.availKB) / float64(m.totalKB)
 	thrash := avg60 > h.cfg.PSIFullAvg60 && free < h.cfg.MemFreeMinRatio
 	if !thrash {
 		h.psiThrashFails = 0
@@ -6086,10 +6545,20 @@ func (h *Hygiene) checkPSIThrash(ctx context.Context, pods []corev1.Pod,
 		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
+	if slabLeaking {
+		// The kernel is leaking unreclaimable slab — evicting a
+		// pod cannot fix that and would only remove capacity the
+		// node needs to recover. drop_caches owns the reclaim;
+		// the latch stays so the condition remains visible.
+		h.appendLog("suspect: psi-memory-thrash pod evict suppressed - kernel-slab-leak latched")
+		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		return
+	}
 	victim, rss := h.highestRSSPod(pods, pidsOnce())
 	if victim == nil {
-		// No attributable non-system pod — latch only; the kernel
-		// OOM verdict then stands (nothing ours to give it).
+		// No eligible victim above the RSS floor — latch only;
+		// the kernel OOM verdict then stands (nothing ours worth
+		// giving it).
 		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
@@ -6100,12 +6569,22 @@ func (h *Hygiene) checkPSIThrash(ctx context.Context, pods []corev1.Pod,
 		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
-	// Budget spent atomically BEFORE the delete (rate_spend parity).
+	// Budget spent atomically BEFORE the eviction (rate_spend
+	// parity). policy/v1 Eviction — NOT a raw pod delete: the
+	// apiserver enforces the victim's PodDisruptionBudget
+	// atomically, so a PDB-protected pod is refused instead of
+	// silently disrupted.
+	ev := &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      victim.Name,
+			Namespace: victim.Namespace,
+		},
+	}
 	h.appendLog(fmt.Sprintf(
 		"ACTION: psi-memory-thrash evicted pod %s/%s - rss=%d bytes, psi_full_avg60=%.1f mem_free=%.3f",
 		victim.Namespace, victim.Name, rss, avg60, free))
-	if err := h.cfg.Client.CoreV1().Pods(victim.Namespace).Delete(
-		ctx, victim.Name, metav1.DeleteOptions{}); err != nil {
+	if err := h.cfg.Client.PolicyV1().Evictions(victim.Namespace).
+		Evict(ctx, ev); err != nil {
 		h.appendLog(fmt.Sprintf(
 			"suspect: psi-memory-thrash evict %s/%s failed: %v",
 			victim.Namespace, victim.Name, err))

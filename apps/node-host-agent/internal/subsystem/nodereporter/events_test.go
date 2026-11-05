@@ -356,6 +356,9 @@ func TestSelfHealActionReasons(t *testing.T) {
 		{"STATE-ENTER: kernel-keys-pressure usage=0.96", "KernelKeysPressure"},
 		{"STATE-ENTER: cp-cert-reload-stale reload_age=7200s", "ControlPlaneCertReloadStale"},
 		{"ACTION psi-memory-thrash: psi_full_avg60=30.0 mem_free=0.050 fails=2", "NodeMemoryPSIThrashing"},
+		// Wave-9 latch→event surface.
+		{"STATE-ENTER: kernel-slab-leak sunreclaim_ratio=0.412", "KernelSlabLeak"},
+		{"STATE-ENTER: nebula-pmtu-blackhole target=10.8.0.1 df_size=1200", "NebulaPMTUBlackhole"},
 	}
 	for _, l := range lines {
 		e.appendLog(t, l.msg)

@@ -169,6 +169,12 @@ const (
 	defaultInotifyMaxWatchFile = "/proc/sys/fs/inotify/max_user_watches"
 	defaultCgroupRoot          = "/sys/fs/cgroup"
 	defaultCiliumIface         = "cilium_net"
+	defaultCiliumWG0Iface      = "cilium_wg0"
+	// W9 LocalPV telemetry: the openebs localpv-provisioner
+	// hostPath root + the du-walk cache TTL + per-volume entry cap.
+	defaultOpenEBSLocalDir  = "/var/openebs/local"
+	defaultLocalPVScanEvery = 15 * time.Minute
+	localPVMaxWalkEntries   = 20000
 	// W7 sources: H5 conntrack per-CPU stats + ARP table, H6 cgroup
 	// memory.events units under system.slice/.
 	defaultConntrackStatFile = "/proc/net/stat/nf_conntrack"
@@ -331,10 +337,13 @@ type Config struct {
 	CgroupRoot       string
 	CgroupPidsSlices []string
 	// CiliumIface is the cilium host-side interface for the B4 MTU
-	// drift check vs NebulaIface; CiliumRuntimeConfig is the
-	// fallback MTU source (agent-runtime-config.json under
-	// HostRoot).
+	// drift check vs NebulaIface; CiliumWG0Iface is the WireGuard
+	// datapath iface checked against NebulaIface minus the ~60B
+	// encapsulation overhead (W9 double-encap guard);
+	// CiliumRuntimeConfig is the fallback MTU source
+	// (agent-runtime-config.json under HostRoot).
 	CiliumIface         string
+	CiliumWG0Iface      string
 	CiliumRuntimeConfig string
 	// ConntrackStatFile is /proc/net/stat/nf_conntrack — the
 	// per-CPU conntrack counters (insert_failed/drop for W7-H5);
@@ -348,6 +357,14 @@ type Config struct {
 	// KeyUsersFile is /proc/key-users — the W8-KR3 kernel keyring
 	// quota source (per-UID usage vs maxkeys).
 	KeyUsersFile string
+	// OpenEBSLocalDir is the localpv-provisioner hostPath root —
+	// /var/openebs/local in both pod and standalone mode (the
+	// DaemonSet mounts it at the same path, not under /host).
+	// LocalPVScanInterval caches the per-PVC du walk: a full
+	// filesystem walk per PVC per scrape is too heavy on a node
+	// with hundreds of volumes (W9).
+	OpenEBSLocalDir     string
+	LocalPVScanInterval time.Duration
 	// Standalone marks systemd (non-pod) mode — informational only;
 	// the latch ticker runs regardless (BUG-H5).
 	Standalone bool
@@ -478,6 +495,9 @@ func (c *Config) applyDefaults() {
 	if c.CiliumIface == "" {
 		c.CiliumIface = defaultCiliumIface
 	}
+	if c.CiliumWG0Iface == "" {
+		c.CiliumWG0Iface = defaultCiliumWG0Iface
+	}
 	if c.CiliumRuntimeConfig == "" {
 		c.CiliumRuntimeConfig = filepath.Join(c.HostRoot,
 			"run/cilium/state/agent-runtime-config.json")
@@ -493,6 +513,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.KeyUsersFile == "" {
 		c.KeyUsersFile = defaultKeyUsersFile
+	}
+	if c.OpenEBSLocalDir == "" {
+		c.OpenEBSLocalDir = defaultOpenEBSLocalDir
+	}
+	if c.LocalPVScanInterval <= 0 {
+		c.LocalPVScanInterval = defaultLocalPVScanEvery
 	}
 	if c.LatchInterval <= 0 {
 		c.LatchInterval = defaultLatchInterval
@@ -590,6 +616,9 @@ type Collector struct {
 	descKernelKeys *prometheus.Desc
 	descSockTCPCW  *prometheus.Desc
 
+	// W9 additions: per-PVC LocalPV dir bytes.
+	descLocalPVDirBytes *prometheus.Desc
+
 	// Legacy node-watchdog aliases — the prom_emit textfile series
 	// the fluxcd PrometheusRules still alert on
 	// (node_watchdog_state{signal}, node_watchdog_egress_relay{target}).
@@ -635,6 +664,12 @@ type Collector struct {
 	inoTop         []inotifyConsumer
 	inoWarnedInst  bool // edge-triggered >80% Warn per episode
 	inoWarnedWatch bool
+
+	// localpv walk cache (mu): the per-PVC du walk is cached for
+	// LocalPVScanInterval — walking every volume dir per scrape is
+	// too heavy on a node with hundreds of LocalPVs.
+	lpvAt    time.Time
+	lpvBytes map[string]int64
 }
 
 // inotifyConsumer is one process's inotify footprint — kept for the
@@ -881,6 +916,13 @@ func New(cfg Config) *Collector {
 		"sockstat TCP close_wait — sockets stuck half-closed waiting for local close().",
 		[]string{"node"}, nil)
 
+	// W9 — OpenEBS LocalPV per-volume dir bytes (bounded du walk,
+	// 15m cache).
+	c.descLocalPVDirBytes = prometheus.NewDesc(
+		"node_host_agent_localpv_dir_bytes",
+		"Bytes under the OpenEBS LocalPV pvc-* volume dir (bounded walk; emitted per pvc-* dir present).",
+		[]string{"node", "pvc_volume"}, nil)
+
 	c.descMeta = map[*prometheus.Desc]descMeta{}
 	for _, d := range []struct {
 		desc *prometheus.Desc
@@ -987,6 +1029,8 @@ func New(cfg Config) *Collector {
 			"Highest per-UID keyring fill ratio from /proc/key-users."},
 		{c.descSockTCPCW, "node_host_agent_sockstat_tcp_close_wait",
 			"sockstat TCP close_wait."},
+		{c.descLocalPVDirBytes, "node_host_agent_localpv_dir_bytes",
+			"Bytes under the OpenEBS LocalPV pvc-* volume dir."},
 	} {
 		c.descMeta[d.desc] = descMeta{name: d.name, help: d.help}
 	}
@@ -1053,6 +1097,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.descCgMemOOMKill
 	ch <- c.descKernelKeys
 	ch <- c.descSockTCPCW
+	ch <- c.descLocalPVDirBytes
 }
 
 // Collect implements prometheus.Collector.
@@ -1091,6 +1136,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.collectARP(ch)
 	c.collectCgroupMemEvents(ch)
 	c.collectKernelKeys(ch)
+	c.collectLocalPVUsage(ch)
 }
 
 // collectWatchdog scans state-* latch files. certDays/certOK fold the
@@ -2515,23 +2561,34 @@ func runtimeConfigMTU(path string) (int64, bool) {
 	return slices.Max(vals), true
 }
 
-// collectMTUDrift emits 1 when the pod-datapath MTU exceeds the
-// overlay's — a pod holding MTU 1500 dies silently on FRAG_NEEDED
-// through neb1 (1300). Both sides must resolve; else absent.
+// wgEncapOverheadBytes is the WireGuard encapsulation overhead the
+// cilium_wg0 MTU must leave under the nebula overlay MTU (W9
+// double-encap guard — same constant as workerhygiene).
+const wgEncapOverheadBytes = 60
+
+// collectMTUDrift emits 1 when a pod-datapath MTU exceeds what the
+// overlay path can carry — a pod holding MTU 1500 dies silently on
+// FRAG_NEEDED through neb1 (1300). Two datapaths are checked:
+// cilium_net (sysfs, falling back to agent-runtime-config.json)
+// must stay <= neb, and cilium_wg0 must stay <= neb-60 to leave
+// room for the WG header inside the double-encapsulated path. The
+// series emits when the overlay MTU resolves AND at least one
+// datapath MTU resolves; absent interfaces simply don't vote.
 func (c *Collector) collectMTUDrift(ch chan<- prometheus.Metric) {
 	neb, ok := mtuOfIface(c.cfg.SysClassNet, c.cfg.NebulaIface)
 	if !ok {
 		return
 	}
-	cil, ok := mtuOfIface(c.cfg.SysClassNet, c.cfg.CiliumIface)
-	if !ok {
-		cil, ok = runtimeConfigMTU(c.cfg.CiliumRuntimeConfig)
+	cil, cilOK := mtuOfIface(c.cfg.SysClassNet, c.cfg.CiliumIface)
+	if !cilOK {
+		cil, cilOK = runtimeConfigMTU(c.cfg.CiliumRuntimeConfig)
 	}
-	if !ok {
+	wg, wgOK := mtuOfIface(c.cfg.SysClassNet, c.cfg.CiliumWG0Iface)
+	if !cilOK && !wgOK {
 		return
 	}
 	drift := 0.0
-	if cil > neb {
+	if (cilOK && cil > neb) || (wgOK && wg > neb-wgEncapOverheadBytes) {
 		drift = 1
 	}
 	ch <- prometheus.MustNewConstMetric(c.descMTUDrift,
@@ -2719,6 +2776,93 @@ const TextfileName = "node-watchdog.prom"
 // ingest a partially-written file (and a ".*-name.prom" prefix
 // scheme DOES match: glob * swallows the leading dot).
 const textfileTmpName = TextfileName + ".tmp"
+
+// --- W9: OpenEBS LocalPV per-PVC dir bytes ---
+
+// collectLocalPVUsage emits node_host_agent_localpv_dir_bytes per
+// pvc-* volume dir under OpenEBSLocalDir. The du walk is cached
+// for LocalPVScanInterval — a node with hundreds of LocalPVs would
+// otherwise pay a full filesystem walk per PVC per scrape. A
+// missing/unreadable root emits nothing (absent, not 0 — "no
+// local-path volumes here" must stay distinguishable from "zero
+// bytes").
+func (c *Collector) collectLocalPVUsage(ch chan<- prometheus.Metric) {
+	c.mu.Lock()
+	fresh := c.lpvBytes != nil &&
+		c.cfg.nowFn().Sub(c.lpvAt) < c.cfg.LocalPVScanInterval
+	cached := c.lpvBytes
+	c.mu.Unlock()
+	bytes := cached
+	if !fresh {
+		if walked := c.walkLocalPVDirs(); walked != nil {
+			c.mu.Lock()
+			c.lpvBytes = walked
+			c.lpvAt = c.cfg.nowFn()
+			c.mu.Unlock()
+			bytes = walked
+		}
+		// A failed walk (root unreadable) keeps serving the last
+		// good snapshot rather than blanking every series.
+	}
+	for pvc, b := range bytes {
+		ch <- prometheus.MustNewConstMetric(c.descLocalPVDirBytes,
+			prometheus.GaugeValue, float64(b), c.cfg.NodeName, pvc)
+	}
+}
+
+// walkLocalPVDirs sums the bytes under every pvc-* dir in
+// OpenEBSLocalDir. Returns nil when the root can't be listed —
+// callers keep the previous cache. Each volume's walk is bounded
+// at localPVMaxWalkEntries entries: a runaway PVC with millions of
+// files must not stall the scrape; the emitted count is then a
+// partial sum (documented on the metric).
+func (c *Collector) walkLocalPVDirs() map[string]int64 {
+	entries, err := os.ReadDir(c.cfg.OpenEBSLocalDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logger().Debug("hostmetrics: openebs local dir unreadable — "+
+				"localpv metrics keep previous snapshot",
+				"dir", c.cfg.OpenEBSLocalDir, "error", err)
+		}
+		return nil
+	}
+	out := map[string]int64{}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "pvc-") {
+			continue
+		}
+		out[e.Name()] = dirSizeBytes(
+			filepath.Join(c.cfg.OpenEBSLocalDir, e.Name()),
+			localPVMaxWalkEntries)
+	}
+	return out
+}
+
+// dirSizeBytes is a bounded du: sums regular-file sizes under root,
+// stopping after maxEntries entries. Unreadable entries are
+// skipped — a permission-denied subtree under-counts rather than
+// failing the whole volume.
+func dirSizeBytes(root string, maxEntries int) int64 {
+	var total int64
+	n := 0
+	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries, never fatal
+		}
+		n++
+		if n > maxEntries {
+			return fs.SkipAll
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if fi, err := d.Info(); err == nil {
+			total += fi.Size()
+		}
+		return nil
+	})
+	return total
+}
 
 // collectAll drains a full Collect into a slice — the textfile
 // writer's scrape (Collect pushes; a reader must consume

@@ -104,6 +104,12 @@ var logRules = []logRule{
 	// W2: workerhygiene's psi-memory-thrash latch-entry line —
 	// "ACTION psi-memory-thrash: avg60=... free=...".
 	{"NodeMemoryPSIThrashing", regexp.MustCompile(`ACTION:? *psi-memory-thrash:`)},
+	// --- Wave-9 latch→event surface ---
+	// workerhygiene's W9-KR3 slab-leak guard + nethealth's W9-NM1
+	// DF PMTU probe — one Event per STATE-ENTER (clock-unsync is
+	// already covered by the ClockUnsynchronized rule above).
+	{"KernelSlabLeak", regexp.MustCompile(`STATE-ENTER: kernel-slab-leak`)},
+	{"NebulaPMTUBlackhole", regexp.MustCompile(`STATE-ENTER: nebula-pmtu-blackhole`)},
 }
 
 // maxEventNote caps the Event note — the apiserver validates the

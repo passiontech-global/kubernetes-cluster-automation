@@ -243,6 +243,40 @@ var conditionDefs = []conditionDef{
 		problemReason:  "MemoryPSIThrashingDetected",
 		stateKey:       "psi-memory-thrash",
 	},
+	// --- Wave-9 latch→condition surface ---
+	// Agent-added conditions for the latches Wave-9 adds (or the
+	// H1 clock check already wrote): every state-<key> below maps
+	// 1:1 to a permanent NodeCondition.
+	{
+		// nethealth's H1 clock-discipline latch — adjtimex reports
+		// STA_UNSYNC or esterror > 500ms for ConsecNeeded cycles.
+		typ:            "ClockUnsynchronized",
+		defaultReason:  "ClockSynchronized",
+		defaultMessage: "kernel clock disciplined (adjtimex synced, esterror <= 500ms)",
+		problemReason:  "ClockUnsynchronizedDetected",
+		stateKey:       "clock-unsync",
+	},
+	{
+		// workerhygiene's W9-KR3 slab-leak guard — SUnreclaim above
+		// 35% of MemTotal means kernel memory is leaking into
+		// unreclaimable slab (dentries/inodes/slab caches that
+		// drop_caches cannot fully reclaim).
+		typ:            "KernelSlabLeak",
+		defaultReason:  "KernelSlabNormal",
+		defaultMessage: "unreclaimable kernel slab below pressure threshold",
+		problemReason:  "KernelSlabLeakDetected",
+		stateKey:       "kernel-slab-leak",
+	},
+	{
+		// nethealth's W9-NM1 DF PMTU probe — small-packet overlay
+		// pings pass but a 1200-byte DF probe blackholes: the
+		// double-encap path MTU sits below the overlay MTU.
+		typ:            "NebulaPMTUBlackhole",
+		defaultReason:  "NebulaPMTUOk",
+		defaultMessage: "nebula overlay passes DF probes at probe size",
+		problemReason:  "NebulaPMTUBlackholeDetected",
+		stateKey:       "nebula-pmtu-blackhole",
+	},
 }
 
 // condEval is the evaluated state of one condition this cycle.

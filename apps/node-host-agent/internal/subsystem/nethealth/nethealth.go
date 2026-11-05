@@ -362,6 +362,7 @@ type NetHealth struct {
 	nebulaFails  int            // socket/tun/stats fails
 	nebulaDpFail int            // dataplane-dead fails
 	nebulaDeg    int            // dataplane-degraded runs
+	pmtuFails    int            // consecutive DF-probe failures (W9-NM1)
 	clockFails   int            // consecutive unsynced adjtimex reads
 	egressCtr    map[string]int // per relay probe!=committed counter
 
@@ -1574,6 +1575,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 		// 12's own business.
 		n.rmFiles("state-nebula-")
 		n.nebulaFails, n.nebulaDpFail, n.nebulaDeg = 0, 0, 0
+		n.pmtuFails = 0
 		n.cycles.WithLabelValues(checkNebula, "gated").Inc()
 		return
 	}
@@ -1716,14 +1718,23 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 			n.stateExit("nebula-degraded")
 			n.stateExit("nebula-isolated")
 		}
+		// W9-NM1: small-packet pings can pass while a DF probe at
+		// near-MTU size blackholes — the double-encap path MTU
+		// sits below the overlay's. Only evaluated when at least
+		// one overlay target answered the small pings; total
+		// overlay failure belongs to the isolated/degraded
+		// verdicts above, not to a PMTU latch.
+		n.checkNebulaPMTU(ctx, targets, results)
 	} else {
 		// overlay != nebula (or no probe config): don't probe through
 		// the other overlay — clear leftover dataplane states.
 		n.nebulaDeg = 0
+		n.pmtuFails = 0
 		n.stateExit("nebula-degraded")
 		n.stateExit("nebula-slowpath")
 		n.stateExit("nebula-siteedge")
 		n.stateExit("nebula-isolated")
+		n.stateExit("nebula-pmtu-blackhole")
 	}
 
 	if reason == "" {
@@ -1752,6 +1763,52 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 			reason, *fails, n.cfg.ConsecNeeded))
 	}
 	n.cycles.WithLabelValues(checkNebula, "ok").Inc()
+}
+
+// checkNebulaPMTU is the W9-NM1 double-encapsulation PMTU probe:
+// small-packet overlay pings keep passing while a 1200-byte
+// don't-fragment probe blackholes — the signature of a path MTU
+// below the overlay's (nebula-in-nebula / wg-in-overlay double
+// encapsulation leaves less headroom than the overlay MTU
+// advertises). The probe only runs when at least one overlay
+// target answered the normal small pings — total overlay failure
+// is the isolated/degraded verdict's job, not a PMTU latch.
+// ConsecNeeded consecutive DF failures latch
+// state-nebula-pmtu-blackhole; a passing probe (or no alive
+// target) clears it.
+func (n *NetHealth) checkNebulaPMTU(ctx context.Context,
+	targets []string, results map[string]pingResult) {
+	target := ""
+	for _, t := range targets {
+		if results[t].ok {
+			target = t
+			break
+		}
+	}
+	if target == "" {
+		// No alive overlay peer this cycle — the isolation /
+		// degraded verdicts own the diagnosis; a PMTU streak
+		// cannot be measured without a reachable target.
+		n.pmtuFails = 0
+		n.stateExit("nebula-pmtu-blackhole")
+		return
+	}
+	out, err := n.cfg.runHostCmd(ctx, []string{
+		"ping", "-c", "1", "-W", "2", "-M", "do", "-s", "1200", target})
+	if err != nil {
+		n.pmtuFails++
+		n.suspectLog("nebula-pmtu-blackhole", fmt.Sprintf(
+			"suspect: nebula-pmtu-blackhole df_probe_failed target=%s size=1200 (check %d/%d): %v (%s)",
+			target, n.pmtuFails, n.cfg.ConsecNeeded, err,
+			trimRunErr(out)))
+		if n.pmtuFails >= n.cfg.ConsecNeeded {
+			n.stateEnter("nebula-pmtu-blackhole",
+				fmt.Sprintf("target=%s df_size=1200", target))
+		}
+		return
+	}
+	n.pmtuFails = 0
+	n.stateExit("nebula-pmtu-blackhole")
 }
 
 // --- Check: fail2ban (50-fail2ban.sh) ---

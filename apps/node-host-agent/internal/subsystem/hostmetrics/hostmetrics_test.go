@@ -582,8 +582,9 @@ func TestDescribe(t *testing.T) {
 	// (dstate, systemd scopes, conntrack insert_failed/drop, arp,
 	// cgroup memory high/oom_kill).
 	// + 2 W8 descs (kernel-keys ratio, sockstat tcp close_wait).
-	if got := len(ch); got != 50 {
-		t.Fatalf("Describe emitted %d descs want 50", got)
+	// + 1 W9 desc (localpv dir bytes).
+	if got := len(ch); got != 51 {
+		t.Fatalf("Describe emitted %d descs want 51", got)
 	}
 }
 
@@ -1917,5 +1918,171 @@ func TestWriteTextfileIncludesNewMetrics(t *testing.T) {
 		if !strings.Contains(string(data), name) {
 			t.Fatalf("textfile missing %s:\n%s", name, data)
 		}
+	}
+}
+
+// --- Wave-9: cilium_wg0 double-encap MTU + OpenEBS LocalPV bytes ---
+
+// TestMTUDriftWG0Encap: cilium_wg0 must stay <= nebula-60 — the WG
+// header overhead inside the overlay. Above that the double-encap
+// path blackholes and drift reports 1 even with no cilium_net.
+func TestMTUDriftWG0Encap(t *testing.T) {
+	cfg, dirs := fixture(t)
+	for _, n := range []string{"neb1", "cilium_wg0"} {
+		if err := os.MkdirAll(filepath.Join(dirs["sysnet"], n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	write(t, filepath.Join(dirs["sysnet"], "cilium_wg0", "mtu"), "1250\n")
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_mtu_drift",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 1 {
+		t.Fatalf("wg0=1250 > 1300-60: drift=%v ok=%v want 1", got, ok)
+	}
+	// Exactly at budget → no drift.
+	write(t, filepath.Join(dirs["sysnet"], "cilium_wg0", "mtu"), "1240\n")
+	got, ok = metricValue(t, c, "node_host_agent_mtu_drift",
+		map[string]string{"node": "node-a"})
+	if !ok || got != 0 {
+		t.Fatalf("wg0=1240 == 1300-60: drift=%v ok=%v want 0", got, ok)
+	}
+}
+
+// TestMTUDriftWG0AbsentNoVote: with nebula up but NO datapath MTU
+// resolvable the series is absent — absent ifaces do not vote, and
+// "no datapath" must stay distinguishable from "aligned datapaths".
+func TestMTUDriftWG0AbsentNoVote(t *testing.T) {
+	cfg, dirs := fixture(t)
+	if err := os.MkdirAll(filepath.Join(dirs["sysnet"], "neb1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	c := New(cfg)
+	if _, ok := metricValue(t, c, "node_host_agent_mtu_drift",
+		map[string]string{"node": "node-a"}); ok {
+		t.Fatal("series emitted with nebula but zero datapath MTUs")
+	}
+}
+
+// TestLocalPVDirBytes: node_host_agent_localpv_dir_bytes sums the
+// regular-file bytes under each pvc-* dir; non-pvc entries are
+// ignored.
+func TestLocalPVDirBytes(t *testing.T) {
+	cfg, _ := fixture(t)
+	root := t.TempDir()
+	cfg.OpenEBSLocalDir = root
+	// pvc-aaa: 1000 + 500 (nested) = 1500; pvc-bbb: 2000.
+	for _, d := range []string{"pvc-aaa", "pvc-aaa/sub", "pvc-bbb", "provisioning"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(t, filepath.Join(root, "pvc-aaa", "data.bin"), strings.Repeat("x", 1000))
+	write(t, filepath.Join(root, "pvc-aaa", "sub", "more.bin"), strings.Repeat("y", 500))
+	write(t, filepath.Join(root, "pvc-bbb", "vol.bin"), strings.Repeat("z", 2000))
+	// Not a pvc-* dir → ignored entirely.
+	write(t, filepath.Join(root, "provisioning", "junk.bin"), strings.Repeat("j", 9999))
+
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-aaa"})
+	if !ok || got != 1500 {
+		t.Fatalf("pvc-aaa bytes=%v ok=%v want 1500", got, ok)
+	}
+	got, ok = metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-bbb"})
+	if !ok || got != 2000 {
+		t.Fatalf("pvc-bbb bytes=%v ok=%v want 2000", got, ok)
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "provisioning"}); ok {
+		t.Fatal("non-pvc dir emitted a series")
+	}
+}
+
+// TestLocalPVDirBytesMissingRoot: an absent OpenEBS root emits no
+// series at all — "no local-path volumes" stays distinguishable
+// from "zero bytes".
+func TestLocalPVDirBytesMissingRoot(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.OpenEBSLocalDir = filepath.Join(t.TempDir(), "no-such-dir")
+	c := New(cfg)
+	if _, ok := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-x"}); ok {
+		t.Fatal("series emitted for a missing localpv root")
+	}
+}
+
+// TestLocalPVDirBytesCache: the du walk is cached for
+// LocalPVScanInterval — scrapes inside the window reuse the
+// snapshot; past it a fresh walk runs.
+func TestLocalPVDirBytesCache(t *testing.T) {
+	cfg, _ := fixture(t)
+	root := t.TempDir()
+	cfg.OpenEBSLocalDir = root
+	cfg.LocalPVScanInterval = 15 * time.Minute
+	now := time.Now()
+	cfg.nowFn = func() time.Time { return now }
+	vol := filepath.Join(root, "pvc-cache")
+	if err := os.MkdirAll(vol, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(vol, "a.bin"), strings.Repeat("x", 100))
+
+	c := New(cfg)
+	got, _ := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-cache"})
+	if got != 100 {
+		t.Fatalf("initial bytes=%v want 100", got)
+	}
+	// Grow the volume — inside the cache window the old snapshot
+	// is still served.
+	write(t, filepath.Join(vol, "b.bin"), strings.Repeat("y", 400))
+	got, _ = metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-cache"})
+	if got != 100 {
+		t.Fatalf("cached bytes=%v want 100 (stale snapshot expected)", got)
+	}
+	// Past the interval a fresh walk picks up the new file.
+	now = now.Add(16 * time.Minute)
+	got, _ = metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-cache"})
+	if got != 500 {
+		t.Fatalf("post-cache bytes=%v want 500", got)
+	}
+}
+
+// TestLocalPVDirBytesFailedWalkKeepsSnapshot: when the root becomes
+// unreadable after a good walk, the last snapshot keeps serving
+// rather than blanking every series.
+func TestLocalPVDirBytesFailedWalkKeepsSnapshot(t *testing.T) {
+	cfg, _ := fixture(t)
+	root := t.TempDir()
+	cfg.OpenEBSLocalDir = root
+	now := time.Now()
+	cfg.nowFn = func() time.Time { return now }
+	vol := filepath.Join(root, "pvc-keep")
+	if err := os.MkdirAll(vol, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(vol, "a.bin"), strings.Repeat("x", 100))
+
+	c := New(cfg)
+	got, _ := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-keep"})
+	if got != 100 {
+		t.Fatalf("initial bytes=%v want 100", got)
+	}
+	// Root vanishes + cache expires → failed walk keeps the snapshot.
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(16 * time.Minute)
+	got, ok := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
+		map[string]string{"node": "node-a", "pvc_volume": "pvc-keep"})
+	if !ok || got != 100 {
+		t.Fatalf("after failed walk bytes=%v ok=%v want 100 (kept snapshot)", got, ok)
 	}
 }

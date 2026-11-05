@@ -502,3 +502,22 @@ func TestJanitorWave8LatchesAreKnown(t *testing.T) {
 		}
 	}
 }
+
+// The wave-9 latches must be registered in knownLatchNames —
+// sweepLatches deletes unregistered state-* files immediately, so a
+// missing entry would eat the latch the moment a check writes it.
+func TestJanitorWave9LatchesAreKnown(t *testing.T) {
+	e := jfixture(t)
+	names := []string{
+		"clock-unsync", "kernel-slab-leak", "nebula-pmtu-blackhole",
+	}
+	for _, n := range names {
+		writeFile(t, filepath.Join(e.state, "state-"+n), "1\n")
+	}
+	e.j.Sweep(context.Background())
+	for _, n := range names {
+		if !fileExists(filepath.Join(e.state, "state-"+n)) {
+			t.Fatalf("registered latch state-%s was reaped as unknown", n)
+		}
+	}
+}

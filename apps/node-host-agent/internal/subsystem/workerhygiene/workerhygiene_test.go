@@ -20,6 +20,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -304,6 +305,26 @@ func deleteActions(cs *fake.Clientset) []k8stesting.DeleteAction {
 	for _, a := range cs.Actions() {
 		if d, ok := a.(k8stesting.DeleteAction); ok && a.GetResource().Resource == "pods" {
 			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// evictActions returns the pod names evicted through the
+// policy/v1 Eviction subresource — the fake clientset records them
+// as create actions on pods/eviction carrying the *policyv1.Eviction
+// object (W9: the PSI evictor uses the eviction API so PDBs are
+// enforced, not raw deletes).
+func evictActions(cs *fake.Clientset) []string {
+	var out []string
+	for _, a := range cs.Actions() {
+		ca, ok := a.(k8stesting.CreateAction)
+		if !ok || a.GetResource().Resource != "pods" ||
+			a.GetSubresource() != "eviction" {
+			continue
+		}
+		if ev, ok := ca.GetObject().(*policyv1.Eviction); ok {
+			out = append(out, ev.Name)
 		}
 	}
 	return out
@@ -3254,7 +3275,7 @@ func TestCiliumMTUDriftLatchesAndLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "ACTION cilium-mtu-drift: cilium=1500 nebula=1300") {
+	if !strings.Contains(string(data), "ACTION cilium-mtu-drift: cilium_net=1500 nebula=1300") {
 		t.Fatalf("log missing drift ACTION line:\n%s", data)
 	}
 	// Drift fixed → latch clears.
