@@ -62,23 +62,35 @@ type wiring struct {
 	podName                 string
 }
 
+// withKube runs build with the shared lazily-built clientset and
+// appends the result. A client-build failure logs "<name> disabled:
+// cannot build kubernetes client" and a subsystem-construction
+// failure "<name> setup failed" — neither is fatal: the metrics/
+// probe endpoints and other subsystems still serve.
+func (w *wiring) withKube(name string,
+	build func(cs kubernetes.Interface) (agent.Subsystem, error)) {
+
+	cs, err := w.csOnce()
+	if err != nil {
+		logger().Error(name+" disabled: cannot build kubernetes client",
+			"error", err)
+		return
+	}
+	sub, err := build(cs)
+	if err != nil {
+		logger().Error(name+" setup failed", "error", err)
+		return
+	}
+	w.subsystems = append(w.subsystems, sub)
+}
+
 // --- sweeper: openebs orphan pvc-* dir cleanup ---
 func (w *wiring) wireSweeper() {
 	if envx.Bool("NODE_HOST_AGENT_ENABLE_SWEEPER", w.defKube) {
-		cs, err := w.csOnce()
-		if err != nil {
-			// Not fatal: the metrics/probe endpoints and other
-			// subsystems still serve; the sweeper simply does not run.
-			logger().Error("sweeper disabled: cannot build kubernetes client", "error", err)
-		} else {
-			sw, err := sweeper.New(sweeper.ConfigFromEnv(
+		w.withKube("sweeper", func(cs kubernetes.Interface) (agent.Subsystem, error) {
+			return sweeper.New(sweeper.ConfigFromEnv(
 				sweeper.EnvDeps{Client: cs}), w.reg)
-			if err != nil {
-				logger().Error("sweeper setup failed", "error", err)
-			} else {
-				w.subsystems = append(w.subsystems, sw)
-			}
-		}
+		})
 	}
 }
 
@@ -180,12 +192,8 @@ func (w *wiring) wireWorkerHygiene() {
 			logger().Error("workerhygiene disabled: node name empty " +
 				"(NODE_HOST_AGENT_NODE_NAME/NODE_NAME unset)")
 		default:
-			cs, err := w.csOnce()
-			if err != nil {
-				logger().Error("workerhygiene disabled: cannot build kubernetes client",
-					"error", err)
-			} else {
-				wh, err := workerhygiene.New(workerhygiene.ConfigFromEnv(
+			w.withKube("workerhygiene", func(cs kubernetes.Interface) (agent.Subsystem, error) {
+				return workerhygiene.New(workerhygiene.ConfigFromEnv(
 					workerhygiene.EnvDeps{
 						Client:                  cs,
 						NodeName:                w.hnode,
@@ -199,12 +207,7 @@ func (w *wiring) wireWorkerHygiene() {
 						JournalUnreadableNeeded: w.journalUnreadableNeeded,
 						HostPath:                w.hostPath,
 					}), w.reg)
-				if err != nil {
-					logger().Error("workerhygiene setup failed", "error", err)
-				} else {
-					w.subsystems = append(w.subsystems, wh)
-				}
-			}
+			})
 		}
 	}
 }
@@ -262,24 +265,15 @@ func (w *wiring) wireNodereporter() {
 			logger().Error("nodereporter disabled: node name empty " +
 				"(NODE_HOST_AGENT_NODE_NAME/NODE_NAME unset)")
 		default:
-			cs, err := w.csOnce()
-			if err != nil {
-				logger().Error("nodereporter disabled: cannot build kubernetes client",
-					"error", err)
-			} else {
-				nr, err := nodereporter.New(nodereporter.ConfigFromEnv(
+			w.withKube("nodereporter", func(cs kubernetes.Interface) (agent.Subsystem, error) {
+				return nodereporter.New(nodereporter.ConfigFromEnv(
 					nodereporter.EnvDeps{
 						Client:           cs,
 						NodeName:         w.hnode,
 						WatchdogStateDir: w.watchdogStateDir,
 						WatchdogLogFile:  w.watchdogLogFile,
 					}), w.reg)
-				if err != nil {
-					logger().Error("nodereporter setup failed", "error", err)
-				} else {
-					w.subsystems = append(w.subsystems, nr)
-				}
-			}
+			})
 		}
 	}
 }
@@ -345,11 +339,7 @@ func (w *wiring) wireHubsync() {
 		case w.podName == "":
 			logger().Error("hubsync disabled: pod name empty (POD_NAME unset)")
 		default:
-			cs, err := w.csOnce()
-			if err != nil {
-				logger().Error("hubsync disabled: cannot build kubernetes client",
-					"error", err)
-			} else {
+			w.withKube("hubsync", func(cs kubernetes.Interface) (agent.Subsystem, error) {
 				hsCfg := hubsync.ConfigFromEnv(hubsync.EnvDeps{
 					Client:      cs,
 					Identity:    w.podName,
@@ -360,13 +350,8 @@ func (w *wiring) wireHubsync() {
 					logger().Info("hubsync: converge key not mounted yet — polling until it appears",
 						"path", hsCfg.SSHKeyPath)
 				}
-				hs, err := hubsync.New(hsCfg, w.reg)
-				if err != nil {
-					logger().Error("hubsync setup failed", "error", err)
-				} else {
-					w.subsystems = append(w.subsystems, hs)
-				}
-			}
+				return hubsync.New(hsCfg, w.reg)
+			})
 		}
 	}
 }
