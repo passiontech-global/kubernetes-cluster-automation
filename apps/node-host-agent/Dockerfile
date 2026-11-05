@@ -4,12 +4,19 @@
 # defaultBaseImage is a fixed image ref and cannot install packages,
 # while the agent needs real userspace tools IN the container fs (see
 # the runtime stage below).
+#
+# The build CONTEXT is the repo ROOT — the moon task runs
+# `docker build -f apps/node-host-agent/Dockerfile <root>` — so the
+# go.mod `replace ../../libs/hostkit` target resolves inside the
+# context at /src/libs/hostkit. No go.work is copied, so the build
+# runs in plain module mode (the release path).
 FROM golang:1.27 AS build
 ARG VERSION=dev
 WORKDIR /src
-COPY go.mod go.sum ./
+COPY libs/hostkit/ libs/hostkit/
+COPY apps/node-host-agent/ apps/node-host-agent/
+WORKDIR /src/apps/node-host-agent
 RUN go mod download
-COPY . .
 RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/node-host-agent ./cmd/agent

@@ -46,16 +46,10 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal/concourse"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal/handler"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 var version = "dev"
-
-func getenv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
 
 // parseLocalUsers splits Concourse basic auth "user:password" on the
 // first colon so passwords may contain colons.
@@ -99,8 +93,8 @@ func main() {
 	}
 
 	client := &concourse.Client{
-		BaseURL:      getenv("CONCOURSE_URL", "http://concourse-web:8080"),
-		Team:         getenv("CONCOURSE_TEAM", "main"),
+		BaseURL:      envx.String("CONCOURSE_URL", "http://concourse-web:8080"),
+		Team:         envx.String("CONCOURSE_TEAM", "main"),
 		User:         user,
 		Password:     password,
 		WebhookToken: os.Getenv("CI_WEBHOOK_TOKEN"),
@@ -122,7 +116,7 @@ func main() {
 	defer stop()
 
 	srv := &http.Server{
-		Addr:              getenv("LISTEN_ADDR", ":8080"),
+		Addr:              envx.String("LISTEN_ADDR", ":8080"),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		// WriteTimeout must cover the handler's 30s index-fetch budget

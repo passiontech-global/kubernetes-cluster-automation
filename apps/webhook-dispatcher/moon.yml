@@ -4,6 +4,10 @@ language: 'go'
 layer: 'application'
 stack: 'backend'
 
+# hostkit change -> this project's tasks are affected (moon ci).
+dependsOn:
+  - 'hostkit'
+
 project:
   title: 'webhook-dispatcher'
   description: 'GitHub org webhook fan-out to Concourse resource check webhooks (push/release/tag-create -> git, pull_request -> github-pr).'

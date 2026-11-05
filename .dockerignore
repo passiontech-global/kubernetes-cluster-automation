@@ -1,0 +1,15 @@
+# Repo-root .dockerignore — apps' Dockerfiles are built with the repo
+# ROOT as context (`docker build -f apps/<app>/Dockerfile .`) so the
+# libs/hostkit go.mod replace target resolves inside the context.
+# Each Dockerfile COPYs only the dirs it needs (libs/hostkit + its own
+# app dir); this list just keeps the context small and reproducible.
+.git/
+.github/
+.moon/
+**/bin/
+**/dist/
+**/node_modules/
+**/notes.md
+**/changelog.md
+**/*.test
+**/coverage.out

@@ -1,0 +1,9 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+language: 'go'
+layer: 'library'
+stack: 'backend'
+
+project:
+  title: 'hostkit'
+  description: 'Shared stdlib-only host-agent toolkit: envx (env knobs/Mode/Knob tables) and logx (named slog loggers).'

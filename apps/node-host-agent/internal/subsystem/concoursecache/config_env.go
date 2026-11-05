@@ -3,7 +3,7 @@ package concoursecache
 import (
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // defaultBaseDir is the openebs hostdir root — duplicated from

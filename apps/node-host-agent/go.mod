@@ -3,6 +3,7 @@ module github.com/passiontech-global/kubernetes-cluster-automation/apps/node-hos
 go 1.27.3
 
 require (
+	github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit v0.0.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	go.yaml.in/yaml/v3 v3.0.6
@@ -63,3 +64,5 @@ require (
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.2 // indirect
 )
+
+replace github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit => ../../libs/hostkit
