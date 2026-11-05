@@ -26,8 +26,7 @@ tasks:
     inputs:
       - '**/*.go'
 
-  # golangci-lint (pinned in mise.toml). Advisory for now — not wired
-  # into the `moon ci` gate; run locally with `moon run :lint`.
+  # golangci-lint (pinned in mise.toml) — part of the `moon ci` PR gate.
   lint:
     command: 'golangci-lint run ./...'
     toolchains: 'system'
