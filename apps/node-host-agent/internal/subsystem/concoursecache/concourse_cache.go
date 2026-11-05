@@ -9,7 +9,7 @@
 // <openebsRoot>/pvc-*/shared-cache — is pruned directly on the host:
 // no pods/exec grant, no script ConfigMap, no bash inside the worker.
 // The caller should schedule Sweep every
-// DefaultConcourseCacheInterval (15m — tighter than the 30m cadence
+// DefaultInterval (15m — tighter than the 30m cadence
 // the prune had inside the janitor run).
 //
 // The bucket rules are the script's 1:1 — same ages, same size caps,
@@ -50,9 +50,9 @@ import (
 var pvcNameRe = regexp.MustCompile(
 	`^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
-// DefaultConcourseCacheInterval is the cadence the caller should
+// DefaultInterval is the cadence the caller should
 // schedule — 15m vs the 30m the prune ran inside the janitor.
-const DefaultConcourseCacheInterval = 15 * time.Minute
+const DefaultInterval = 15 * time.Minute
 
 // prune.sh constants. Size thresholds were KiB (du -sk); here bytes.
 const (
@@ -66,7 +66,7 @@ const (
 	ccNodeDepsLow = 4 << 30  //  4194304 KiB
 
 	// Filesystem-pressure thresholds (used percent) for the H3 early
-	// trigger — see ConcourseCacheConfig.DiskHighPct/DiskCritPct.
+	// trigger — see Config.DiskHighPct/DiskCritPct.
 	ccDiskHighPct = 75
 	ccDiskCritPct = 85
 	// ccCritFloorAge bounds the crit escalation: ages collapse to
@@ -76,10 +76,10 @@ const (
 	ccCritFloorAge = 5 * time.Minute
 )
 
-// ConcourseCacheConfig carries the pruner's knobs — every field maps
+// Config carries the pruner's knobs — every field maps
 // to a prune.sh constant and a zero value falls back to the script
-// default, so a bare ConcourseCacheConfig{} IS the production config.
-type ConcourseCacheConfig struct {
+// default, so a bare Config{} IS the production config.
+type Config struct {
 	// Ownership/perm invariant forced on shared-cache + its first
 	// level (chown 4294967294:4294967294, chmod 0777). Set both to -1
 	// to skip chown entirely (unprivileged dev runs).
@@ -126,7 +126,7 @@ type ConcourseCacheConfig struct {
 	nowFn func() time.Time
 }
 
-func (c *ConcourseCacheConfig) applyDefaults() {
+func (c *Config) applyDefaults() {
 	// -1,-1 opts out of chown; the zero value means the script's
 	// 4294967294 — chown to root was never a supported mode.
 	if c.OwnerUID == 0 && c.OwnerGID == 0 {
@@ -190,22 +190,22 @@ func (c *ConcourseCacheConfig) applyDefaults() {
 	}
 }
 
-// ConcourseCachePruner prunes the Concourse shared-cache inside every
+// Pruner prunes the Concourse shared-cache inside every
 // worker PVC — <openebsRoot>/pvc-*/shared-cache — directly on the
 // host, the native replacement for exec'ing prune.sh into each pod.
-type ConcourseCachePruner struct {
-	cfg ConcourseCacheConfig
+type Pruner struct {
+	cfg Config
 
 	cycles       *prometheus.CounterVec // result: ok|abort
 	filesDeleted *prometheus.CounterVec // bucket label
 	bytesFreed   prometheus.Counter
 }
 
-// NewConcourseCachePruner returns a pruner and registers its metrics
+// New returns a pruner and registers its metrics
 // on reg — same contract as the orphan sweeper's New.
-func NewConcourseCachePruner(cfg ConcourseCacheConfig, reg prometheus.Registerer) (*ConcourseCachePruner, error) {
+func New(cfg Config, reg prometheus.Registerer) (*Pruner, error) {
 	cfg.applyDefaults()
-	p := &ConcourseCachePruner{cfg: cfg}
+	p := &Pruner{cfg: cfg}
 	p.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_concourse_cache_cycles_total",
 		Help: "Concourse shared-cache prune passes by result (ok|abort).",
@@ -228,12 +228,12 @@ func NewConcourseCachePruner(cfg ConcourseCacheConfig, reg prometheus.Registerer
 	return p, nil
 }
 
-// SweepConcourseSharedCache runs one prune pass over
+// SweepSharedCache runs one prune pass over
 // <openebsRoot>/pvc-*/shared-cache with the script defaults — the
 // convenience entry point for callers that need no metrics or custom
 // thresholds.
-func SweepConcourseSharedCache(ctx context.Context, openebsRoot string) error {
-	p, err := NewConcourseCachePruner(ConcourseCacheConfig{}, nil)
+func SweepSharedCache(ctx context.Context, openebsRoot string) error {
+	p, err := New(Config{}, nil)
 	if err != nil {
 		return err
 	}
@@ -246,7 +246,7 @@ func SweepConcourseSharedCache(ctx context.Context, openebsRoot string) error {
 // pvc-* file is not a worker volume and gets no chown/chmod/prune.
 // Non-matching dirs and pvc dirs without a shared-cache are skipped
 // (the script's `[ -d "$SC" ] || exit 0`).
-func (p *ConcourseCachePruner) Sweep(ctx context.Context, openebsRoot string) error {
+func (p *Pruner) Sweep(ctx context.Context, openebsRoot string) error {
 	entries, err := os.ReadDir(openebsRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -274,7 +274,7 @@ func (p *ConcourseCachePruner) Sweep(ctx context.Context, openebsRoot string) er
 // pruneSharedCache applies every bucket rule to one shared-cache dir,
 // in the script's order. All helpers are best-effort (the script's
 // `2>/dev/null || true`) — only ctx cancellation aborts mid-flight.
-func (p *ConcourseCachePruner) pruneSharedCache(ctx context.Context, sc string) {
+func (p *Pruner) pruneSharedCache(ctx context.Context, sc string) {
 	log := logger().With("subsystem", "concourse-cache", "dir", sc)
 	if !isDir(sc) {
 		return // init-rm not done yet — nothing to prune
@@ -314,7 +314,7 @@ func (p *ConcourseCachePruner) pruneSharedCache(ctx context.Context, sc string) 
 // before the byte count looks full, so either signal must escalate
 // the prune. ok=false when statfs fails — the caller keeps the
 // normal limits.
-func (p *ConcourseCachePruner) fsPressure(path string) (pct float64, ok bool) {
+func (p *Pruner) fsPressure(path string) (pct float64, ok bool) {
 	var st syscall.Statfs_t
 	if err := p.cfg.statfsFn(path, &st); err != nil {
 		return 0, false
@@ -341,7 +341,7 @@ func (p *ConcourseCachePruner) fsPressure(path string) (pct float64, ok bool) {
 // pressure, tightened once DiskHighPct/DiskCritPct are crossed (see
 // their doc). Pressure is measured on sc itself — every pvc-* dir
 // could in principle sit on a different filesystem.
-func (p *ConcourseCachePruner) escalatedLimits(sc string, log *slog.Logger) ConcourseCacheConfig {
+func (p *Pruner) escalatedLimits(sc string, log *slog.Logger) Config {
 	eff := p.cfg
 	pct, ok := p.fsPressure(sc)
 	if !ok || pct < eff.DiskHighPct {
@@ -384,7 +384,7 @@ func (p *ConcourseCachePruner) escalatedLimits(sc string, log *slog.Logger) Conc
 // Failures are best-effort like the script's `&&`, but Debug-logged:
 // a silently unenforced ownership invariant is how cache writes
 // start landing as root.
-func (p *ConcourseCachePruner) enforcePerms(sc string, log *slog.Logger) {
+func (p *Pruner) enforcePerms(sc string, log *slog.Logger) {
 	targets := []string{sc}
 	if entries, err := os.ReadDir(sc); err == nil {
 		for _, e := range entries {
@@ -416,7 +416,7 @@ func (p *ConcourseCachePruner) enforcePerms(sc string, log *slog.Logger) {
 // pruneGoBuild is the go-build bucket: files older than GoBuildMaxAge
 // deleted, then oldest files trimmed until du <= GoBuildLowMark when
 // the bucket exceeds GoBuildHighMark.
-func (p *ConcourseCachePruner) pruneGoBuild(ctx context.Context, sc string, cfg ConcourseCacheConfig, log *slog.Logger) {
+func (p *Pruner) pruneGoBuild(ctx context.Context, sc string, cfg Config, log *slog.Logger) {
 	dir := filepath.Join(sc, "go-build")
 	if !isDir(dir) {
 		return
@@ -461,7 +461,7 @@ func (p *ConcourseCachePruner) pruneGoBuild(ctx context.Context, sc string, cfg 
 
 // pruneAgeBucket is `find -type f -mtime +N -delete` plus the optional
 // `find -mindepth 1 -type d -empty -delete` some buckets carry.
-func (p *ConcourseCachePruner) pruneAgeBucket(ctx context.Context, sc, bucket string, maxAge time.Duration, emptyDirs bool, log *slog.Logger) {
+func (p *Pruner) pruneAgeBucket(ctx context.Context, sc, bucket string, maxAge time.Duration, emptyDirs bool, log *slog.Logger) {
 	dir := filepath.Join(sc, bucket)
 	if !isDir(dir) {
 		return
@@ -475,7 +475,7 @@ func (p *ConcourseCachePruner) pruneAgeBucket(ctx context.Context, sc, bucket st
 // deleteOldFiles removes regular files under dir whose mtime is older
 // than maxAge (-type f -mtime +N -delete). Errors are skipped like
 // the script's `|| true`; ctx cancellation stops the walk.
-func (p *ConcourseCachePruner) deleteOldFiles(ctx context.Context, dir, bucket string, maxAge time.Duration, log *slog.Logger) {
+func (p *Pruner) deleteOldFiles(ctx context.Context, dir, bucket string, maxAge time.Duration, log *slog.Logger) {
 	now := p.cfg.nowFn()
 	var n, failed int
 	var bytes int64
@@ -516,7 +516,7 @@ func (p *ConcourseCachePruner) deleteOldFiles(ctx context.Context, dir, bucket s
 // deepest dirs first (-delete implies -depth), so a chain of dirs
 // that only hold empty dirs collapses to the top. dir itself is
 // never removed (mindepth 1).
-func (p *ConcourseCachePruner) deleteEmptyDirs(ctx context.Context, dir string, log *slog.Logger) {
+func (p *Pruner) deleteEmptyDirs(ctx context.Context, dir string, log *slog.Logger) {
 	var dirs []string
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
@@ -550,7 +550,7 @@ func (p *ConcourseCachePruner) deleteEmptyDirs(ctx context.Context, dir string, 
 // high → rm -rf the oldest <key>/<cksum> dirs (sorted by mtime) until
 // at least du-low has been freed. writable adds `chmod -R u+w` before
 // rm (node-deps subdirs can be read-only — bun install chmod a-w).
-func (p *ConcourseCachePruner) capTopLevelDirs(ctx context.Context, sc, bucket string, high, low int64, writable bool, log *slog.Logger) {
+func (p *Pruner) capTopLevelDirs(ctx context.Context, sc, bucket string, high, low int64, writable bool, log *slog.Logger) {
 	dir := filepath.Join(sc, bucket)
 	if !isDir(dir) {
 		return
@@ -594,7 +594,7 @@ func (p *ConcourseCachePruner) capTopLevelDirs(ctx context.Context, sc, bucket s
 // 60m, crashed *.tmp-* staging dirs older than 60m, then the 6→4GiB
 // cap. Every rm -rf is preceded by chmod -R u+w (bun install makes
 // trees read-only).
-func (p *ConcourseCachePruner) pruneNodeDeps(ctx context.Context, sc string, cfg ConcourseCacheConfig, log *slog.Logger) {
+func (p *Pruner) pruneNodeDeps(ctx context.Context, sc string, cfg Config, log *slog.Logger) {
 	dir := filepath.Join(sc, "node-deps")
 	if !isDir(dir) {
 		return

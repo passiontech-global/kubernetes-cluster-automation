@@ -33,5 +33,5 @@ func ConfigFromEnv(d EnvDeps) Config {
 
 // The concourse shared-cache pruner moved to
 // internal/subsystem/concoursecache — see
-// concoursecache.ConcourseCacheFromEnv (it still reads the shared
+// concoursecache.ConfigFromEnv (it still reads the shared
 // NODE_HOST_AGENT_SWEEP_BASE_DIR for the same openebs root).
