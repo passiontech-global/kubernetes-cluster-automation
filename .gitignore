@@ -5,3 +5,4 @@ notes.md
 changelog.md
 *.test
 coverage.out
+apps/node-host-agent/agent
