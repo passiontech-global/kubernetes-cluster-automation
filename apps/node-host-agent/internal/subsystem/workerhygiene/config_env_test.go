@@ -7,16 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/client-go/kubernetes/fake"
-
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
 )
 
 func testEnvDeps(t *testing.T) EnvDeps {
 	t.Helper()
 	return EnvDeps{
-		Client:                  fake.NewSimpleClientset(),
+		Client:                  testutil.FakeKube(),
 		NodeName:                "node-a",
 		Systemd:                 systemd.New(systemd.Config{HostRoot: "/"}),
 		Watchdog:                &watchdogconf.Config{APIBackends: []watchdogconf.APIBackend{{Name: "cp1", Addr: "10.0.0.1:6443"}}},

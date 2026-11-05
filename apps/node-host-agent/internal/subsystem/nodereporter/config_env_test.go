@@ -4,14 +4,14 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/client-go/kubernetes/fake"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("NODE_HOST_AGENT_REPORTER_INTERVAL", "45s")
 	t.Setenv("NODE_HOST_AGENT_EVENT_NAMESPACE", "node-ops")
 
-	cs := fake.NewSimpleClientset()
+	cs := testutil.FakeKube()
 	cfg := ConfigFromEnv(EnvDeps{
 		Client:           cs,
 		NodeName:         "node-1",

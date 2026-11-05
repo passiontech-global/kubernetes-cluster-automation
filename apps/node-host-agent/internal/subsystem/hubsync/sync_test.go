@@ -14,6 +14,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
 )
 
 // testConfig returns a Config pointed at the fixture dirs plus a
@@ -45,7 +47,7 @@ func testConfig(t *testing.T, cs *fake.Clientset, dialer *fakeDialer,
 }
 
 func newClientsetWithSecret() *fake.Clientset {
-	return fake.NewSimpleClientset(&corev1.Secret{
+	return testutil.FakeKube(&corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "kube-system", Name: "api-backend-guard-token",
 		},
@@ -290,7 +292,7 @@ func TestRunLeaseGatesSync(t *testing.T) {
 	dur := int32(2) // 2s lease duration
 	other := "pod-b"
 	rt := metav1.NewMicroTime(now)
-	cs := fake.NewSimpleClientset(&coordv1.Lease{
+	cs := testutil.FakeKube(&coordv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "node-ops", Name: "node-host-agent-hubsync",
 		},
@@ -490,7 +492,7 @@ func TestCycleSecretFailureScopesAPILB(t *testing.T) {
 	dialer := newFakeDialer()
 	reg := prometheus.NewRegistry()
 	// Clientset WITHOUT the api-backend-guard-token secret.
-	s, err := New(testConfig(t, fake.NewSimpleClientset(), dialer,
+	s, err := New(testConfig(t, testutil.FakeKube(), dialer,
 		[]byte("bin")), reg)
 	if err != nil {
 		t.Fatal(err)
@@ -544,7 +546,7 @@ func TestCycleTargetUpGauge(t *testing.T) {
 	// converged targets stay 1.
 	dialer2 := newFakeDialer()
 	reg2 := prometheus.NewRegistry()
-	s2, err := New(testConfig(t, fake.NewSimpleClientset(), dialer2, []byte("bin")), reg2)
+	s2, err := New(testConfig(t, testutil.FakeKube(), dialer2, []byte("bin")), reg2)
 	if err != nil {
 		t.Fatal(err)
 	}

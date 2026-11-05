@@ -8,6 +8,8 @@ import (
 	coordv1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
 )
 
 func newTestSyncer(cs *fake.Clientset, now func() time.Time) *Syncer {
@@ -32,7 +34,7 @@ func newTestSyncer(cs *fake.Clientset, now func() time.Time) *Syncer {
 func TestLeaseAcquireRenewTakeover(t *testing.T) {
 	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
 	clock := &now
-	cs := fake.NewSimpleClientset()
+	cs := testutil.FakeKube()
 	s := newTestSyncer(cs, func() time.Time { return *clock })
 	ctx := context.Background()
 
@@ -72,7 +74,7 @@ func TestLeaseOtherHolderFresh(t *testing.T) {
 	other := "pod-b"
 	dur := int32(60)
 	rt := metav1.NewMicroTime(now)
-	cs := fake.NewSimpleClientset(&coordv1.Lease{
+	cs := testutil.FakeKube(&coordv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "node-ops", Name: "node-host-agent-hubsync",
 		},
@@ -113,7 +115,7 @@ func TestLeaseOtherHolderFresh(t *testing.T) {
 func TestLeaseLossClearsSyncedLatch(t *testing.T) {
 	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
 	clock := &now
-	cs := fake.NewSimpleClientset()
+	cs := testutil.FakeKube()
 	s := newTestSyncer(cs, func() time.Time { return *clock })
 	ctx := context.Background()
 
