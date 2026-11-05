@@ -37,6 +37,7 @@ package controllerhygiene
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -109,7 +110,7 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 	frozen := false
 	if okC {
 		prev := h.readState(fileLastRVC)
-		h.writeState(fileLastRVC, strconv.FormatInt(rvC, 10))
+		h.state.WriteEpochFile(filepath.Join(h.state.Dir, fileLastRVC), rvC)
 		if gapKnown && prev == strconv.FormatInt(rvC, 10) && rvN > rvC {
 			frn = h.state.Incr(fileCtrFrozen)
 			if frn >= h.cfg.Sig13.FrozenCycles {
@@ -134,7 +135,7 @@ func (h *Hygiene) checkApiserverHub(ctx context.Context) {
 		if prvOK {
 			prv = strconv.FormatInt(prvRV, 10)
 			prevP := h.readState(fileLastPRVC)
-			h.writeState(fileLastPRVC, prv)
+			h.state.WriteEpochFile(filepath.Join(h.state.Dir, fileLastPRVC), prvRV)
 			if prevP != "" && prevP == prv && gapKnown && rvN > prvRV {
 				pfn = h.state.Incr(fileCtrPeerFrozen)
 				if pfn >= h.cfg.Sig13.FrozenCycles {
@@ -354,7 +355,7 @@ func (h *Hygiene) checkKineTTL(ctx context.Context) {
 		// Pid living clean past the seed window → loop broken:
 		// reset the counter and clear both latches.
 		h.state.ResetCounter(fileCtrTTLRewedge)
-		_ = removeStateFile(h.cfg.WatchdogStateDir, fileTTLWedgedPID)
+		h.state.ResetCounter(fileTTLWedgedPID)
 		h.stateExit(stateKineTTLDead)
 		h.stateExit(stateKineTTLLoop)
 		h.cycles.WithLabelValues(checkKineTTL, "ok").Inc()
@@ -368,7 +369,8 @@ func (h *Hygiene) checkKineTTL(ctx context.Context) {
 	// is "kill cannot cure" evidence → accumulate rewedge.
 	rew := 0
 	if strconv.Itoa(kpid) != h.readState(fileTTLWedgedPID) {
-		h.writeState(fileTTLWedgedPID, strconv.Itoa(kpid))
+		h.state.WriteEpochFile(filepath.Join(h.state.Dir, fileTTLWedgedPID),
+			int64(kpid))
 		rew = h.state.Incr(fileCtrTTLRewedge)
 	} else {
 		rew = h.state.Counter(fileCtrTTLRewedge)

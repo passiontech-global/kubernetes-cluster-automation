@@ -122,6 +122,21 @@ func (c *Client) ExecCombined(ctx context.Context, name string, args ...string) 
 	return c.host.ExecCombined(ctx, hostexec.NSAll, name, args...)
 }
 
+// ExecBounded is Exec with a per-call budget replacing Config.Timeout
+// — for remediations whose bound is deliberately longer than the
+// shared 30s default (the apiserver wedge gate's `timeout 90
+// systemctl restart`). ctx still bounds the call from above;
+// budget <= 0 falls back to Config.Timeout.
+func (c *Client) ExecBounded(ctx context.Context, budget time.Duration, name string, args ...string) (string, error) {
+	return c.host.ExecBounded(ctx, hostexec.NSAll, budget, name, args...)
+}
+
+// ExecCombinedBounded is ExecBounded with stderr folded into the
+// returned output — the ExecCombined/ExecBounded pairing.
+func (c *Client) ExecCombinedBounded(ctx context.Context, budget time.Duration, name string, args ...string) (string, error) {
+	return c.host.ExecCombinedBounded(ctx, hostexec.NSAll, budget, name, args...)
+}
+
 func (c *Client) systemctl(ctx context.Context, args ...string) (string, error) {
 	return c.Exec(ctx, "systemctl", args...)
 }

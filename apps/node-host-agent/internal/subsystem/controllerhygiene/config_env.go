@@ -4,6 +4,7 @@ import (
 	"os"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -29,6 +30,10 @@ type EnvDeps struct {
 	// once for the whole pod.
 	WatchdogStateDir string
 	WatchdogLogFile  string
+	// Systemd is the shared host-systemd client (Config.Systemd) —
+	// may be nil: the seam defaults degrade to "no systemd client
+	// wired" and every dependent check no-ops/log-degrades.
+	Systemd *systemd.Client
 	// JournalDirs / JournalUnreadableNeeded are the shared journald
 	// blindness-detector inputs buildAgentConfig resolves once for
 	// workerhygiene + controllerhygiene.
@@ -149,5 +154,6 @@ func ConfigFromEnv(d EnvDeps) Config {
 		},
 		JournalDirs:             d.JournalDirs,
 		JournalUnreadableNeeded: d.JournalUnreadableNeeded,
+		Systemd:                 d.Systemd,
 	}
 }

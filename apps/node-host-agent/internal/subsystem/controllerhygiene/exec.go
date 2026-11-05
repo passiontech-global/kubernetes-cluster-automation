@@ -1,0 +1,121 @@
+// exec.go — the host-command/env plumbing shared by the Config seam
+// defaults: the NOTIFY_SOCKET/WATCHDOG_* scrub (argv form for the
+// shared platform/systemd client, env form for the rare in-container
+// execs), the nil-tolerant systemd-client wrapper every host command
+// routes through, and the sd_notify datagram sender.
+package controllerhygiene
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"strings"
+	"time"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
+)
+
+// defaultSystemctlBudget caps the query-shaped systemctl calls —
+// shell `timeout 10` parity. The shared client adds its own
+// Config.Timeout (30s default) inside every Exec — wrapping the ctx
+// here keeps the tighter per-query budget the shell had.
+const defaultSystemctlBudget = 10 * time.Second
+
+// defaultRestartBudget is the remediate gate's `timeout 90` parity —
+// a control-plane unit restart legitimately outlives the shared
+// client's 30s default, so it goes through ExecBounded instead.
+const defaultRestartBudget = 90 * time.Second
+
+// scrubSystemdEnv drops NOTIFY_SOCKET/WATCHDOG_* so child systemctl /
+// journalctl processes cannot sd_notify back to our unit — the
+// `env -u NOTIFY_SOCKET -u WATCHDOG_PID -u WATCHDOG_USEC` fix the
+// feeder applies (systemd>=255 auto-sends EXIT_STATUS otherwise).
+// Used by the commands that still run container-side (etcdctl's
+// stderr capture needs exec.Cmd fields the hostexec seam does not
+// expose; kine_storage's sqlite3 runs the pod-visible binary).
+// Commands routed through the shared systemd client get the argv
+// equivalent — scrubArgv.
+func scrubSystemdEnv(env []string) []string {
+	out := env[:0]
+	for _, e := range env {
+		if strings.HasPrefix(e, "NOTIFY_SOCKET=") ||
+			strings.HasPrefix(e, "WATCHDOG_PID=") ||
+			strings.HasPrefix(e, "WATCHDOG_USEC=") {
+			continue
+		}
+		out = append(out, e)
+	}
+	clear(env[len(out):]) // drop refs held by the filtered tail
+	return out
+}
+
+// scrubArgv prefixes name+args with `env -u NOTIFY_SOCKET -u
+// WATCHDOG_PID -u WATCHDOG_USEC --` — the scrubSystemdEnv fix in argv
+// form, for commands routed through systemd.Client/hostexec (their
+// RunCmd seam carries no env slot). `env` resolves on the HOST inside
+// the nsenter wrap, immediately before the real binary.
+func scrubArgv(name string, args ...string) []string {
+	argv := make([]string, 0, len(args)+9)
+	argv = append(argv, "env",
+		"-u", "NOTIFY_SOCKET",
+		"-u", "WATCHDOG_PID",
+		"-u", "WATCHDOG_USEC",
+		"--", name)
+	return append(argv, args...)
+}
+
+// hostExecCtx runs name args... on the host through the shared
+// systemd client — nsenter-wrapped to host PID 1's namespaces inside
+// the DaemonSet, so systemctl/journalctl/ss act on the host's systemd,
+// journal and network namespace (the raw container-side execs this
+// replaces saw the pod's empty journal view and had no dbus socket).
+// combined selects ExecCombined — stderr folded into the returned
+// output, required for probes whose evidence lives off stdout
+// (journalctl prints "No journal files were found." / "File ... is
+// corrupt" on stderr). A nil client reports the unwired wiring
+// instead of returning empty output: a fake empty journal read would
+// feed the journal-unreadable tracker a bogus "journald-wide empty
+// reply" verdict (workerhygiene parity).
+func hostExecCtx(ctx context.Context, sd *systemd.Client,
+	combined bool, name string, args ...string) (string, error) {
+	return hostExecCtxBounded(ctx, sd, combined, 0, name, args...)
+}
+
+// hostExecCtxBounded is hostExecCtx with a per-call budget replacing
+// the shared client's Config.Timeout — for remediations whose shell
+// budget was longer than 30s (the apiserver wedge gate's `timeout
+// 90 systemctl restart`). budget <= 0 keeps the client default.
+func hostExecCtxBounded(ctx context.Context, sd *systemd.Client,
+	combined bool, budget time.Duration,
+	name string, args ...string) (string, error) {
+
+	if sd == nil {
+		return "", fmt.Errorf("no systemd client wired")
+	}
+	argv := scrubArgv(name, args...)
+	if combined {
+		return sd.ExecCombinedBounded(ctx, budget, argv[0], argv[1:]...)
+	}
+	return sd.ExecBounded(ctx, budget, argv[0], argv[1:]...)
+}
+
+// sdNotify sends msg as a datagram to the sd_notify unix socket —
+// `systemd-notify WATCHDOG=1` parity without the binary. '@'-prefixed
+// names are abstract sockets.
+func sdNotify(sock, msg string) error {
+	addr := sock
+	if strings.HasPrefix(addr, "@") {
+		addr = "\x00" + addr[1:]
+	}
+	conn, err := net.Dial("unixgram", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// A wedged notify socket must not hang the feeder loop —
+	// datagram writes are near-instant, so the deadline only covers
+	// pathological socket states.
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, err = conn.Write([]byte(msg))
+	return err
+}
