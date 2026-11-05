@@ -1,10 +1,10 @@
 // operator_watchdog_targets.go — the watched-operator table of the
 // operator-workqueue-watchdog check (W5.8): the opStuckResource /
-// operatorTarget wiring, the generic per-CRD stuck predicates (stale
-// observedGeneration, absent status.conditions/phase/status) and the
-// operatorTargets rows binding each operator's leader-election
-// Lease + pod selector to its CRD signature set. The gateway-API
-// stuck signatures and ownership filters live in gateway_targets.go.
+// operatorTarget wiring and the operatorTargets rows binding each
+// operator's leader-election Lease + pod selector to its CRD
+// signature set. The generic per-CRD stuck predicates live in
+// operator_stuck_signatures.go; the gateway-API stuck signatures
+// and ownership filters live in gateway_targets.go.
 package watchdogs
 
 import (
@@ -112,103 +112,6 @@ func targetPodNS(t operatorTarget) string {
 		return t.podNS
 	}
 	return t.leaseNS
-}
-
-// staleObservedGeneration is the canonical "controller never saw the
-// last spec write" signature: status.observedGeneration lags
-// metadata.generation. A missing observedGeneration reads as 0 — an
-// object never touched by its controller is the strongest stuck
-// signal there is (generation >= 1 for any real object).
-func staleObservedGeneration(o *unstructured.Unstructured) bool {
-	og, _ := shared.NestedInt64(o.Object, "status", "observedGeneration")
-	return og < o.GetGeneration()
-}
-
-// fluxUnsuspendedStaleGen is staleObservedGeneration with the flux
-// parking brake honored: a spec.suspend=true object is deliberately
-// not reconciled — suspended work is parked, not stuck.
-func fluxUnsuspendedStaleGen(o *unstructured.Unstructured) bool {
-	if suspended, _ := shared.NestedBool(o.Object, "spec", "suspend"); suspended {
-		return false
-	}
-	return staleObservedGeneration(o)
-}
-
-// helmRepoStaleGen is fluxUnsuspendedStaleGen plus the type=oci
-// carve-out: since Flux v2.2 an OCI HelmRepository is a static
-// reference — source-controller keeps no reconciler for it and never
-// writes status, so observedGeneration stays absent forever and the
-// generic signature would flag every healthy OCI repo (the actual
-// OCI pull health lives on the generated HelmChart objects, which
-// ARE watched by the helmcharts entry).
-func helmRepoStaleGen(o *unstructured.Unstructured) bool {
-	if t, _ := shared.NestedString(o.Object, "spec", "type"); t == "oci" {
-		return false
-	}
-	return fluxUnsuspendedStaleGen(o)
-}
-
-// noStatusConditions is the "never reconciled" signature for CR
-// types that lack a reliable observedGeneration (cert-manager
-// Certificates, ExternalSecrets, KEDA ScaledObjects): the controller
-// stamps status.conditions on its first reconcile pass, so an absent
-// or empty list means it never picked the object up (W7-C2).
-func noStatusConditions(o *unstructured.Unstructured) bool {
-	conds, found := shared.NestedSlice(o.Object, "status", "conditions")
-	return !found || len(conds) == 0
-}
-
-// emptyStatusPhase is the same never-reconciled signature for CR
-// types that report a status.phase (ArgoCD): an absent/empty phase
-// means the operator never touched the object (W7-C2).
-func emptyStatusPhase(o *unstructured.Unstructured) bool {
-	phase, found := shared.NestedString(o.Object, "status", "phase")
-	return !found || phase == ""
-}
-
-// noStatusAtAll is the never-reconciled signature for CR types whose
-// controllers write SPARSE status (medik8s NodeHealthCheck/
-// SelfNodeRemediation): neither status.phase nor status.conditions
-// means the operator never completed a reconcile pass. Either field
-// alone can be legitimately absent on a healthy object — a paused
-// NHC still carries phase=Paused, a finished SNR keeps its last
-// phase — so only the both-absent shape proves "never reconciled".
-func noStatusAtAll(o *unstructured.Unstructured) bool {
-	if phase, found := shared.NestedString(o.Object, "status", "phase"); found && phase != "" {
-		return false
-	}
-	conds, found := shared.NestedSlice(o.Object, "status", "conditions")
-	return !found || len(conds) == 0
-}
-
-// perconaUnpausedStaleGen is staleObservedGeneration with the Percona
-// pause brake honored: spec.pause=true (and psmdb's spec.mode=paused)
-// parks reconciliation deliberately — paused clusters are parked,
-// not stuck (W10-CP3).
-func perconaUnpausedStaleGen(o *unstructured.Unstructured) bool {
-	if paused, _ := shared.NestedBool(o.Object, "spec", "pause"); paused {
-		return false
-	}
-	if mode, _ := shared.NestedString(o.Object, "spec", "mode"); mode == "paused" {
-		return false
-	}
-	return staleObservedGeneration(o)
-}
-
-// condMaxObservedGeneration returns the largest observedGeneration
-// carried inside a conditions list. Gateway-API resources report the
-// generation their controller last processed inside each condition —
-// there is no top-level status.observedGeneration on
-// Gateway/HTTPRoute/GRPCRoute — so 0 means the attached controller
-// has never reported a spec generation.
-func condMaxObservedGeneration(conds []shared.Condition) int64 {
-	var max int64
-	for _, c := range conds {
-		if c.ObservedGeneration > max {
-			max = c.ObservedGeneration
-		}
-	}
-	return max
 }
 
 var operatorTargets = []operatorTarget{

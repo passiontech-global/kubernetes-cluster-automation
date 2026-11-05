@@ -56,7 +56,6 @@ import (
 	"context"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"k8s.io/client-go/dynamic"
@@ -76,26 +75,12 @@ import (
 )
 
 // healthProbeConfigFromEnv resolves the check knobs once at Setup.
-// The live manifests are the ground truth for the defaults (e.g.
-// http-content-check TARGET_URL is the prometheus /-/healthy
-// endpoint, not alertmanager).
+// It fills the sweep-level Timeouts itself and delegates each
+// domain's knobs to the package that consumes them — the ported
+// kuberhealthy checks to ported.ConfigFromEnv, the
+// kcm-workqueue-watchdog knobs to watchdogs.KCMConfigFromEnv.
 func healthProbeConfigFromEnv() probefw.Config {
-	// Second hostname is a ClusterIP Service (DNS record exists
-	// regardless of backend pod readiness) — a headless service like
-	// alertmanager-operated NXDOMAINs whenever its single pod is
-	// recreating, which would flap the DNS check during every
-	// alertmanager rollout despite CoreDNS being fine.
-	hosts := strings.Split(shared.Getenv("HEALTH_DNS_HOSTNAMES",
-		"kubernetes.default.svc.cluster.local,"+
-			"kube-prometheus-stack-prometheus.prometheus-operator.svc.cluster.local"), ",")
-	trimmed := hosts[:0]
-	for _, h := range hosts {
-		if h = strings.TrimSpace(h); h != "" {
-			trimmed = append(trimmed, h)
-		}
-	}
-	return probefw.Config{
-		DNS: probefw.DNSConfig{Hostnames: trimmed},
+	cfg := probefw.Config{
 		Timeouts: probefw.TimeoutsConfig{
 			// shared.GetenvDuration floors every duration knob at
 			// 1s (the retired helpers accepted any d > 0) —
@@ -112,32 +97,10 @@ func healthProbeConfigFromEnv() probefw.Config {
 			// bounded.
 			PerCheck: shared.GetenvDuration("HEALTH_PER_CHECK_TIMEOUT", 2*time.Minute),
 		},
-		HTTPContent: probefw.HTTPContentConfig{
-			URL:      shared.Getenv("HEALTH_HTTP_CONTENT_URL", "http://kube-prometheus-stack-prometheus.prometheus-operator.svc:9090/-/healthy"),
-			Expected: shared.Getenv("HEALTH_HTTP_EXPECTED_CONTENT", "Healthy"),
-		},
-		Pods: probefw.PodsConfig{
-			Namespace:    shared.Getenv("HEALTH_POD_CHECK_NAMESPACE", "kube-system"),
-			MaxRestarts:  int32(shared.GetenvIntMin("HEALTH_MAX_POD_RESTARTS", 10, 0)),
-			SkipDuration: shared.GetenvDuration("HEALTH_POD_SKIP_DURATION", 10*time.Minute),
-		},
-		Quota: probefw.QuotaConfig{
-			Threshold: shared.GetenvFloatPositive("HEALTH_RESOURCE_QUOTA_THRESHOLD", 0.9),
-		},
-		KCM: probefw.KCMConfig{
-			// KCM leader-election defaults are LeaseDuration 15s,
-			// RenewDeadline 10s, RetryPeriod ~2s, so a live holder's
-			// renewTime is never more than a few seconds old. 30s —
-			// 2× the lease duration — bounds "still renewing" with
-			// margin for apiserver latency; anything older means
-			// the holder is gone (a dead KCM, not a frozen one).
-			LeaseMaxAge: shared.GetenvDuration("HEALTH_KCM_LEASE_MAX_AGE", 30*time.Second),
-			// A freeze signature must persist this long before the
-			// gauge fires — a healthy reconcile legitimately lags a
-			// spec write by a sync period or two.
-			FreezeMinAge: shared.GetenvDuration("HEALTH_KCM_FREEZE_MIN_AGE", 10*time.Minute),
-		},
 	}
+	ported.ConfigFromEnv(&cfg)
+	watchdogs.KCMConfigFromEnv(&cfg)
+	return cfg
 }
 
 // checkEntry is one registry row: the check name — the

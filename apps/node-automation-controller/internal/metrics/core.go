@@ -14,6 +14,21 @@
 // metric touches only the file that owns it. Metric names, help
 // strings and label sets are unchanged from the original single-file
 // layout.
+//
+// API convention — two shapes, by design:
+//   - Exported vectors (VeleroBSLUnavailable, APIServiceUnavailable,
+//     ...) are the default: modules Set/Inc/DeleteLabelValues on them
+//     directly, usually through a shared.GaugeLedger that owns series
+//     lifecycle. Use this when a call site is a plain
+//     WithLabelValues().Set(...).
+//   - Accessor functions (IncError, ObserveHealthCheck,
+//     ObserveAPIBackend/ForgetAPIBackend) exist only where the call
+//     carries behavior a vec cannot express: fanning one call out to
+//     several series (the hook+reconcile dual counters, the
+//     status+staleness pair), or lifecycle semantics beyond a Set
+//     (ForgetAPIBackend's DeleteLabelValues prune). Do not add a thin
+//     wrapper that merely forwards to a vec — exported access is the
+//     convention, not something to hide.
 package metrics
 
 import (

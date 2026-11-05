@@ -18,6 +18,22 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
+// condMaxObservedGeneration returns the largest observedGeneration
+// carried inside a conditions list. Gateway-API resources report the
+// generation their controller last processed inside each condition —
+// there is no top-level status.observedGeneration on
+// Gateway/HTTPRoute/GRPCRoute — so 0 means the attached controller
+// has never reported a spec generation.
+func condMaxObservedGeneration(conds []shared.Condition) int64 {
+	var max int64
+	for _, c := range conds {
+		if c.ObservedGeneration > max {
+			max = c.ObservedGeneration
+		}
+	}
+	return max
+}
+
 // gatewayStatusStuck is the cilium-operator signature on the
 // gateway-API route resources its gateway controller reconciles: an
 // object reporting no status.parents (the controller attaches a
