@@ -158,26 +158,32 @@ func (h *Hygiene) restartK0sWorker(ctx context.Context) error {
 
 // --- Check: kubelet-stall (05-kubelet-stall.sh) ---
 
-// checkKubeletStall detects a zombie kubelet: informer-zombie journal
+// stallCheck detects a zombie kubelet: informer-zombie journal
 // spam, phantom pods (pod dirs but zero task records), or a dead
 // :10250 listener. 2 consecutive cycles → latch kubelet-runtime-stall
 // + restart k0sworker through the shared last-restart budget, gated
-// on overload / API reachability / settle.
-func (h *Hygiene) checkKubeletStall(ctx context.Context, apiOK bool,
-	journalOnce func() string, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkStall, "gated").Inc()
+// on overload / API reachability / settle. The streak stays on
+// Hygiene (stallFails) — pre-Check tests poke it directly.
+type stallCheck struct{ h *Hygiene }
+
+// Name returns the check label / WD_SIG key.
+func (c *stallCheck) Name() string { return checkStall }
+
+// Run executes one kubelet-stall round.
+func (c *stallCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkStall, "gated").Inc()
 		return
 	}
 	reason := ""
-	if hits := countMatchingLines(stallJournalRe, journalOnce()); hits > journalHitsThresh {
+	if hits := countMatchingLines(stallJournalRe, e.journalOnce()); hits > journalHitsThresh {
 		reason = fmt.Sprintf("informer-zombie hits=%d/10min", hits)
 	}
 	if reason == "" {
-		if poddirs, ok := h.podDirCount(); ok && poddirs >= poddirThreshold {
-			if _, err := os.ReadDir(h.cfg.CtrTaskRoot); err != nil {
+		if poddirs, ok := c.h.podDirCount(); ok && poddirs >= poddirThreshold {
+			if _, err := os.ReadDir(c.h.cfg.CtrTaskRoot); err != nil {
 				reason = fmt.Sprintf("phantom-pods poddirs=%d ctr=unreachable", poddirs)
-			} else if h.taskRecordCount() == 0 {
+			} else if c.h.taskRecordCount() == 0 {
 				reason = fmt.Sprintf("phantom-pods poddirs=%d tasks=0", poddirs)
 			}
 		}
@@ -187,87 +193,96 @@ func (h *Hygiene) checkKubeletStall(ctx context.Context, apiOK bool,
 		// k0sworker restart — all 3 probes must fail (curl -ks parity:
 		// ANY HTTP response, even 401/403, means the listener is
 		// alive).
-		if !h.kubelet10250Alive(ctx) {
+		if !c.h.kubelet10250Alive(ctx) {
 			reason = "kubelet-10250-down"
 		}
 	}
 	if reason == "" {
-		h.stallFails = 0
-		h.state.Exit("kubelet-runtime-stall", nil)
-		h.cycles.WithLabelValues(checkStall, "ok").Inc()
+		c.h.stallFails = 0
+		c.h.state.Exit("kubelet-runtime-stall", nil)
+		c.h.cycles.WithLabelValues(checkStall, "ok").Inc()
 		return
 	}
-	h.stallFails++
-	if h.stallFails < h.cfg.ConsecNeeded {
-		h.state.AppendLog(fmt.Sprintf("suspect: %s (check %d/%d)",
-			reason, h.stallFails, h.cfg.ConsecNeeded))
-		h.cycles.WithLabelValues(checkStall, "ok").Inc()
+	c.h.stallFails++
+	if c.h.stallFails < c.h.cfg.ConsecNeeded {
+		c.h.state.AppendLog(fmt.Sprintf("suspect: %s (check %d/%d)",
+			reason, c.h.stallFails, c.h.cfg.ConsecNeeded))
+		c.h.cycles.WithLabelValues(checkStall, "ok").Inc()
 		return
 	}
-	overloaded := h.state.Exists("node-overloaded")
+	overloaded := c.h.state.Exists("node-overloaded")
 	if strings.HasPrefix(reason, "phantom-pods") || strings.HasPrefix(reason, "kubelet-10250-down") {
 		if !overloaded {
-			h.state.Enter("kubelet-runtime-stall", reason)
-		} else if !h.state.Exists("kubelet-runtime-stall") {
+			c.h.state.Enter("kubelet-runtime-stall", reason)
+		} else if !c.h.state.Exists("kubelet-runtime-stall") {
 			// Wedge under CPU starvation is a symptom, not a dead
 			// node — latching would kick NHC→SNR and dump 100% of
 			// load onto the survivors (amplifier). Log-only.
-			h.state.AppendLog(fmt.Sprintf("runtime-stall-suppressed-overloaded - %s", reason))
+			c.h.state.AppendLog(fmt.Sprintf("runtime-stall-suppressed-overloaded - %s", reason))
 		}
 	} else {
-		h.state.Exit("kubelet-runtime-stall", nil)
+		c.h.state.Exit("kubelet-runtime-stall", nil)
 	}
 	switch {
 	case overloaded:
-		h.state.AppendLog(fmt.Sprintf("suspect: %s - node overloaded, skip restart k0sworker", reason))
-	case !apiOK:
-		h.state.AppendLog(fmt.Sprintf("suspect: %s - API unreachable (isolated?), skip restart k0sworker", reason))
-	case !h.k0sWorkerSettled(ctx):
-		h.state.AppendLog(fmt.Sprintf("suspect: %s - k0sworker not settled (<180s), skip restart", reason))
-	case !h.state.RateTrySpend("last-restart", h.cfg.MinRestartInterval):
-		h.state.AppendLog(fmt.Sprintf("suspect: %s - in restart cooldown (<30m), skip", reason))
+		c.h.state.AppendLog(fmt.Sprintf("suspect: %s - node overloaded, skip restart k0sworker", reason))
+	case !e.apiOK:
+		c.h.state.AppendLog(fmt.Sprintf("suspect: %s - API unreachable (isolated?), skip restart k0sworker", reason))
+	case !c.h.k0sWorkerSettled(ctx):
+		c.h.state.AppendLog(fmt.Sprintf("suspect: %s - k0sworker not settled (<180s), skip restart", reason))
+	case !c.h.state.RateTrySpend("last-restart", c.h.cfg.MinRestartInterval):
+		c.h.state.AppendLog(fmt.Sprintf("suspect: %s - in restart cooldown (<30m), skip", reason))
 	default:
 		// Budget already spent atomically by the rateTrySpend case —
 		// the feeder goroutine competes for the same file.
-		h.state.AppendLog(fmt.Sprintf("ACTION: restarting k0sworker - %s (persisted %dx)",
-			reason, h.stallFails))
-		h.stallFails = 0
-		if err := h.restartK0sWorker(ctx); err != nil {
-			h.state.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
+		c.h.state.AppendLog(fmt.Sprintf("ACTION: restarting k0sworker - %s (persisted %dx)",
+			reason, c.h.stallFails))
+		c.h.stallFails = 0
+		if err := c.h.restartK0sWorker(ctx); err != nil {
+			c.h.state.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
 		} else {
-			h.actions.WithLabelValues(checkStall, "restart").Inc()
+			c.h.actions.WithLabelValues(checkStall, "restart").Inc()
 		}
 	}
-	h.cycles.WithLabelValues(checkStall, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkStall, "ok").Inc()
 }
 
 // --- Check: kubelet-watch-wedge (06-kubelet-watch-wedge.sh) ---
 
-// checkKubeletWatchWedge detects a wedged kubelet pod-watch stream:
-// pods assigned to this node (not Terminating, not terminal, older
-// than KubeletWatchMinAge) whose kubelet pod dir was never created.
+// watchWedgeCheck detects a wedged kubelet pod-watch stream: pods
+// assigned to this node (not Terminating, not terminal, older than
+// KubeletWatchMinAge) whose kubelet pod dir was never created.
 // Journal spam is early-warning only. 2 consecutive cycles → latch
 // kubelet-watch-wedge + restart k0sworker — unless EVERY apiserver
 // backend is stale (upstream wedge: the missing pods are a phantom of
-// stale LIST data, restarting kubelet is useless churn).
-func (h *Hygiene) checkKubeletWatchWedge(ctx context.Context, pods []corev1.Pod,
-	apiOK bool, journalOnce func() string, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkWatch, "gated").Inc()
+// stale LIST data, restarting kubelet is useless churn). fails is the
+// consecutive unseen-pods streak (ex-Hygiene.watchFails).
+type watchWedgeCheck struct {
+	h     *Hygiene
+	fails int
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *watchWedgeCheck) Name() string { return checkWatch }
+
+// Run executes one watch-wedge round.
+func (c *watchWedgeCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkWatch, "gated").Inc()
 		return
 	}
-	if spam := countMatchingLines(watchJournalRe, journalOnce()); spam > journalHitsThresh {
-		h.state.AppendLog(fmt.Sprintf(
+	if spam := countMatchingLines(watchJournalRe, e.journalOnce()); spam > journalHitsThresh {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-watch-wedge early-warn spam=%d/10min (not-registered/no-relationship)", spam))
 	}
-	if !apiOK {
+	if !e.apiOK {
 		// Inconclusive — keep counters/latch exactly like the shell
 		// (a flapping API must not clear wedge evidence). Only log
 		// when there is something worth keeping.
-		if h.state.Exists("kubelet-watch-wedge") || h.watchFails > 0 {
-			h.state.AppendLog("suspect: kubelet-watch-wedge pods query fail — inconclusive, keeping state")
+		if c.h.state.Exists("kubelet-watch-wedge") || c.fails > 0 {
+			c.h.state.AppendLog("suspect: kubelet-watch-wedge pods query fail — inconclusive, keeping state")
 		}
-		h.cycles.WithLabelValues(checkWatch, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkWatch, "abort").Inc()
 		return
 	}
 	// Stat the pods ROOT once before the per-pod sweep: with the dir
@@ -278,89 +293,89 @@ func (h *Hygiene) checkKubeletWatchWedge(ctx context.Context, pods []corev1.Pod,
 	// cleanly but every per-pod join then fails ENOTDIR — the same
 	// false wedge via a different syscall. Inconclusive — keep
 	// counters/latch exactly like the !apiOK path.
-	st, err := os.Stat(h.cfg.KubeletPodsDir)
+	st, err := os.Stat(c.h.cfg.KubeletPodsDir)
 	if err != nil || !st.IsDir() {
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: kubelet pods dir %s unstatable or not a directory (isdir=%v, err=%v) — watch-wedge inconclusive, keeping state",
-			h.cfg.KubeletPodsDir, err == nil && st.IsDir(), err))
-		h.cycles.WithLabelValues(checkWatch, "abort").Inc()
+			c.h.cfg.KubeletPodsDir, err == nil && st.IsDir(), err))
+		c.h.cycles.WithLabelValues(checkWatch, "abort").Inc()
 		return
 	}
-	now := h.cfg.nowFn()
+	now := c.h.cfg.nowFn()
 	missing := 0
-	for i := range pods {
-		p := &pods[i]
+	for i := range e.pods {
+		p := &e.pods[i]
 		if p.DeletionTimestamp != nil ||
 			p.Status.Phase == corev1.PodSucceeded ||
 			p.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		ct := p.CreationTimestamp.Time
-		if ct.IsZero() || now.Sub(ct) < h.cfg.KubeletWatchMinAge {
+		if ct.IsZero() || now.Sub(ct) < c.h.cfg.KubeletWatchMinAge {
 			continue
 		}
-		if st, err := os.Stat(filepath.Join(h.cfg.KubeletPodsDir,
+		if st, err := os.Stat(filepath.Join(c.h.cfg.KubeletPodsDir,
 			string(p.UID))); err != nil || !st.IsDir() {
 			missing++
 		}
 	}
 	if missing == 0 {
-		h.watchFails = 0
-		h.state.Exit("kubelet-watch-wedge", nil)
-		h.cycles.WithLabelValues(checkWatch, "ok").Inc()
+		c.fails = 0
+		c.h.state.Exit("kubelet-watch-wedge", nil)
+		c.h.cycles.WithLabelValues(checkWatch, "ok").Inc()
 		return
 	}
-	h.watchFails++
-	if h.watchFails < h.cfg.ConsecNeeded {
-		h.state.AppendLog(fmt.Sprintf(
+	c.fails++
+	if c.fails < c.h.cfg.ConsecNeeded {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-watch-wedge %d pod(s) assigned but no pod dir on node (check %d/%d)",
-			missing, h.watchFails, h.cfg.ConsecNeeded))
-		h.cycles.WithLabelValues(checkWatch, "ok").Inc()
+			missing, c.fails, c.h.cfg.ConsecNeeded))
+		c.h.cycles.WithLabelValues(checkWatch, "ok").Inc()
 		return
 	}
-	h.state.Enter("kubelet-watch-wedge", fmt.Sprintf("unseen-pods=%d", missing))
+	c.h.state.Enter("kubelet-watch-wedge", fmt.Sprintf("unseen-pods=%d", missing))
 	// Upstream gate: EVERY apiserver backend stale → the unseen pods
 	// are stale-LIST fallout, not a kubelet wedge (sig14 latches the
 	// state-apiserver-backend-stale-<ip> files).
-	if len(h.cfg.APIBackends) > 0 {
+	if len(c.h.cfg.APIBackends) > 0 {
 		nstale := 0
-		for _, be := range h.cfg.APIBackends {
-			if h.state.Exists("apiserver-backend-stale-" + dashedHost(be)) {
+		for _, be := range c.h.cfg.APIBackends {
+			if c.h.state.Exists("apiserver-backend-stale-" + dashedHost(be)) {
 				nstale++
 			}
 		}
-		if nstale == len(h.cfg.APIBackends) {
-			h.state.AppendLog(fmt.Sprintf(
+		if nstale == len(c.h.cfg.APIBackends) {
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: kubelet-watch-wedge unseen=%d but %d/%d api backend stale — upstream wedge, skip restart k0sworker",
-				missing, nstale, len(h.cfg.APIBackends)))
-			h.cycles.WithLabelValues(checkWatch, "ok").Inc()
+				missing, nstale, len(c.h.cfg.APIBackends)))
+			c.h.cycles.WithLabelValues(checkWatch, "ok").Inc()
 			return
 		}
 	}
 	switch {
-	case h.state.Exists("node-overloaded"):
-		h.state.AppendLog(fmt.Sprintf(
+	case c.h.state.Exists("node-overloaded"):
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-watch-wedge unseen=%d - node overloaded, skip restart k0sworker", missing))
-	case !h.k0sWorkerSettled(ctx):
-		h.state.AppendLog(fmt.Sprintf(
+	case !c.h.k0sWorkerSettled(ctx):
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-watch-wedge unseen=%d - k0sworker not settled (<180s), skip restart", missing))
-	case !h.state.RateTrySpend("last-restart", h.cfg.MinRestartInterval):
-		h.state.AppendLog(fmt.Sprintf(
+	case !c.h.state.RateTrySpend("last-restart", c.h.cfg.MinRestartInterval):
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-watch-wedge unseen=%d - in restart cooldown (<30m), skip", missing))
 	default:
 		// Budget already spent atomically by the rateTrySpend case —
 		// the feeder goroutine competes for the same file.
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"ACTION: restarting k0sworker - kubelet-watch-wedge unseen-pods=%d (persisted %dx)",
-			missing, h.watchFails))
-		h.watchFails = 0
-		if err := h.restartK0sWorker(ctx); err != nil {
-			h.state.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
+			missing, c.fails))
+		c.fails = 0
+		if err := c.h.restartK0sWorker(ctx); err != nil {
+			c.h.state.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
 		} else {
-			h.actions.WithLabelValues(checkWatch, "restart").Inc()
+			c.h.actions.WithLabelValues(checkWatch, "restart").Inc()
 		}
 	}
-	h.cycles.WithLabelValues(checkWatch, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkWatch, "ok").Inc()
 }
 
 // --- Check: ctr-tasks (31-ctr-tasks.sh) ---
@@ -663,9 +678,22 @@ func (h *Hygiene) resetFailedK0sWorker(ctx context.Context) {
 // (overload / settle / last-restart budget) instead of waiting for
 // 05/T15 to notice.
 
-func (h *Hygiene) checkKubeletSyncloop(ctx context.Context, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkSyncloop, "gated").Inc()
+// syncloopCheck is the A4 PLEG probe as a Check; it owns the
+// consecutive-fail streak and the unauth-logged flag (ex-Hygiene
+// .syncloopFails/.syncloopUnauth).
+type syncloopCheck struct {
+	h      *Hygiene
+	fails  int
+	unauth bool // last probe was 401/403 — log the streak once
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *syncloopCheck) Name() string { return checkSyncloop }
+
+// Run executes one kubelet-syncloop round.
+func (c *syncloopCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkSyncloop, "gated").Inc()
 		return
 	}
 	var lastErr error
@@ -673,10 +701,10 @@ func (h *Hygiene) checkKubeletSyncloop(ctx context.Context, workerActive bool) {
 	unauth := false
 	// The bearer token is re-read every cycle — the file is small
 	// and bound SA tokens rotate.
-	bearer := h.kubeletBearer()
+	bearer := c.h.kubeletBearer()
 	for i := 0; i < probeAttempts; i++ {
-		code, err := h.cfg.probeHTTPStatus(ctx,
-			h.cfg.KubeletSyncloopURL, bearer, probeTimeout)
+		code, err := c.h.cfg.probeHTTPStatus(ctx,
+			c.h.cfg.KubeletSyncloopURL, bearer, probeTimeout)
 		if err == nil {
 			switch {
 			case code == http.StatusOK:
@@ -697,9 +725,9 @@ func (h *Hygiene) checkKubeletSyncloop(ctx context.Context, workerActive bool) {
 		if i+1 < probeAttempts {
 			select {
 			case <-ctx.Done():
-				h.cycles.WithLabelValues(checkSyncloop, "abort").Inc()
+				c.h.cycles.WithLabelValues(checkSyncloop, "abort").Inc()
 				return
-			case <-time.After(h.cfg.ProbeGap):
+			case <-time.After(c.h.cfg.ProbeGap):
 			}
 		}
 	}
@@ -708,67 +736,67 @@ func (h *Hygiene) checkKubeletSyncloop(ctx context.Context, workerActive bool) {
 		// inconclusive like the other keep-state paths, NOT a down
 		// signal. Logged once per unauth streak so a permanently
 		// unauthenticated deployment doesn't spam every cycle.
-		if !h.syncloopUnauth {
-			h.state.AppendLog("suspect: kubelet-syncloop-down probe unauthorized " +
+		if !c.unauth {
+			c.h.state.AppendLog("suspect: kubelet-syncloop-down probe unauthorized " +
 				"(401/403 — token missing or RBAC nonResourceURL /healthz/* not " +
 				"granted) — inconclusive, keeping state")
-			h.syncloopUnauth = true
+			c.unauth = true
 		}
-		h.cycles.WithLabelValues(checkSyncloop, "inconclusive").Inc()
+		c.h.cycles.WithLabelValues(checkSyncloop, "inconclusive").Inc()
 		return
 	}
-	h.syncloopUnauth = false
+	c.unauth = false
 	if alive {
-		h.syncloopFails = 0
-		h.state.Exit("kubelet-syncloop-down", nil)
-		h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
+		c.fails = 0
+		c.h.state.Exit("kubelet-syncloop-down", nil)
+		c.h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
 		return
 	}
-	h.syncloopFails++
-	if h.syncloopFails < h.cfg.ConsecNeeded {
-		h.state.AppendLog(fmt.Sprintf(
+	c.fails++
+	if c.fails < c.h.cfg.ConsecNeeded {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-syncloop-down /healthz/syncloop fail (PLEG?) err=%v (check %d/%d)",
-			lastErr, h.syncloopFails, h.cfg.ConsecNeeded))
-		h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
+			lastErr, c.fails, c.h.cfg.ConsecNeeded))
+		c.h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
 		return
 	}
 	// BUG-H4: a frozen PLEG is a kubelet stall the 05 probe can't
 	// see — confirmed consecutive fails now self-heal through the
 	// shared k0sworker restart gates (overload / settle /
 	// last-restart budget), checkKubeletStall parity.
-	overloaded := h.state.Exists("node-overloaded")
+	overloaded := c.h.state.Exists("node-overloaded")
 	if !overloaded {
-		h.state.Enter("kubelet-syncloop-down",
+		c.h.state.Enter("kubelet-syncloop-down",
 			fmt.Sprintf("pleg-frozen last_err=%v", lastErr))
-	} else if !h.state.Exists("kubelet-syncloop-down") {
+	} else if !c.h.state.Exists("kubelet-syncloop-down") {
 		// A stall under CPU starvation is a symptom — latching
 		// would escalate to NHC→SNR and dump 100% of the load
 		// onto the survivors (amplifier). Log-only.
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"kubelet-syncloop-down suppressed-overloaded - pleg-frozen last_err=%v", lastErr))
 	}
 	switch {
 	case overloaded:
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-syncloop-down - node overloaded, skip restart k0sworker (err=%v)", lastErr))
-	case !h.k0sWorkerSettled(ctx):
-		h.state.AppendLog("suspect: kubelet-syncloop-down - k0sworker not settled (<180s), skip restart")
-	case !h.state.RateTrySpend("last-restart", h.cfg.MinRestartInterval):
-		h.state.AppendLog("suspect: kubelet-syncloop-down - in restart cooldown (<30m), skip")
+	case !c.h.k0sWorkerSettled(ctx):
+		c.h.state.AppendLog("suspect: kubelet-syncloop-down - k0sworker not settled (<180s), skip restart")
+	case !c.h.state.RateTrySpend("last-restart", c.h.cfg.MinRestartInterval):
+		c.h.state.AppendLog("suspect: kubelet-syncloop-down - in restart cooldown (<30m), skip")
 	default:
 		// Budget already spent atomically by the rateTrySpend
 		// case — the feeder goroutine competes for the same file.
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"ACTION: restarting k0sworker - kubelet-syncloop-down pleg-frozen (persisted %dx)",
-			h.syncloopFails))
-		h.syncloopFails = 0
-		if err := h.restartK0sWorker(ctx); err != nil {
-			h.state.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
+			c.fails))
+		c.fails = 0
+		if err := c.h.restartK0sWorker(ctx); err != nil {
+			c.h.state.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
 		} else {
-			h.actions.WithLabelValues(checkSyncloop, "restart").Inc()
+			c.h.actions.WithLabelValues(checkSyncloop, "restart").Inc()
 		}
 	}
-	h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
 }
 
 // kubeletBearer reads the service-account token kubelet's :10250
@@ -783,60 +811,71 @@ func (h *Hygiene) kubeletBearer() string {
 	return strings.TrimSpace(string(b))
 }
 
-func (h *Hygiene) checkContainerdSock(ctx context.Context, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkCtrSock, "gated").Inc()
+// ctrsockCheck is the A4 containerd-socket hang probe as a Check;
+// it owns the consecutive-fail streak (ex-Hygiene.ctrsockFails).
+type ctrsockCheck struct {
+	h     *Hygiene
+	fails int
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *ctrsockCheck) Name() string { return checkCtrSock }
+
+// Run executes one containerd-sock round.
+func (c *ctrsockCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkCtrSock, "gated").Inc()
 		return
 	}
-	err := h.cfg.probeUnixSock(ctx, h.cfg.ContainerdSocket, unixSockProbeTimeout)
+	err := c.h.cfg.probeUnixSock(ctx, c.h.cfg.ContainerdSocket, unixSockProbeTimeout)
 	if err == nil {
-		h.ctrsockFails = 0
-		h.state.Exit("containerd-sock-down", nil)
-		h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
+		c.fails = 0
+		c.h.state.Exit("containerd-sock-down", nil)
+		c.h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
 		return
 	}
-	h.ctrsockFails++
-	if h.ctrsockFails < h.cfg.ConsecNeeded {
-		h.state.AppendLog(fmt.Sprintf(
+	c.fails++
+	if c.fails < c.h.cfg.ConsecNeeded {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: containerd-sock-down %s probe fail: %v (check %d/%d)",
-			h.cfg.ContainerdSocket, err, h.ctrsockFails, h.cfg.ConsecNeeded))
-		h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
+			c.h.cfg.ContainerdSocket, err, c.fails, c.h.cfg.ConsecNeeded))
+		c.h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
 		return
 	}
 	// BUG-H4: a hung containerd socket wedges PLEG and every pod
 	// lifecycle op — confirmed consecutive fails self-heal through
 	// the shared k0sworker restart gates, checkKubeletSyncloop
 	// parity.
-	overloaded := h.state.Exists("node-overloaded")
+	overloaded := c.h.state.Exists("node-overloaded")
 	if !overloaded {
-		h.state.Enter("containerd-sock-down",
+		c.h.state.Enter("containerd-sock-down",
 			fmt.Sprintf("probe_err=%v", err))
-	} else if !h.state.Exists("containerd-sock-down") {
-		h.state.AppendLog(fmt.Sprintf(
+	} else if !c.h.state.Exists("containerd-sock-down") {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"containerd-sock-down suppressed-overloaded - probe_err=%v", err))
 	}
 	switch {
 	case overloaded:
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: containerd-sock-down - node overloaded, skip restart k0sworker (err=%v)", err))
-	case !h.k0sWorkerSettled(ctx):
-		h.state.AppendLog("suspect: containerd-sock-down - k0sworker not settled (<180s), skip restart")
-	case !h.state.RateTrySpend("last-restart", h.cfg.MinRestartInterval):
-		h.state.AppendLog("suspect: containerd-sock-down - in restart cooldown (<30m), skip")
+	case !c.h.k0sWorkerSettled(ctx):
+		c.h.state.AppendLog("suspect: containerd-sock-down - k0sworker not settled (<180s), skip restart")
+	case !c.h.state.RateTrySpend("last-restart", c.h.cfg.MinRestartInterval):
+		c.h.state.AppendLog("suspect: containerd-sock-down - in restart cooldown (<30m), skip")
 	default:
 		// Budget already spent atomically by the rateTrySpend
 		// case — the feeder goroutine competes for the same file.
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"ACTION: restarting k0sworker - containerd-sock-down %s (persisted %dx)",
-			h.cfg.ContainerdSocket, h.ctrsockFails))
-		h.ctrsockFails = 0
-		if err := h.restartK0sWorker(ctx); err != nil {
-			h.state.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
+			c.h.cfg.ContainerdSocket, c.fails))
+		c.fails = 0
+		if err := c.h.restartK0sWorker(ctx); err != nil {
+			c.h.state.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
 		} else {
-			h.actions.WithLabelValues(checkCtrSock, "restart").Inc()
+			c.h.actions.WithLabelValues(checkCtrSock, "restart").Inc()
 		}
 	}
-	h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
 }
 
 // --- Check: containerd stale ingest GC (A3 — 39-ctr-ingest-gc) ---

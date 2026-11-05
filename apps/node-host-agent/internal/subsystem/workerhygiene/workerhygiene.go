@@ -1075,14 +1075,14 @@ type Hygiene struct {
 	// In-memory consecutive counters — the shell kept these as
 	// consecutive-* files; in-agent state survives between cycles and
 	// an agent restart just re-arms the count (bounded by Interval).
-	wedgeFails      int
-	konnFails       int
-	dnsFails        int
-	stallFails      int
-	watchFails      int
-	ciliumFails     int
-	ciliumInitFails int
-	ciliumIPAMFails int
+	// Most streaks live on their Check structs now; the four below
+	// stay on Hygiene because pre-Check tests poke them by name
+	// (e.h.stallFails et al. — more than five call sites each, so
+	// keeping the field beats churning the test contract).
+	stallFails      int // kubelet-stall streak (stallCheck)
+	ciliumInitFails int // cilium-init-stuck streak (ciliumInitCheck)
+	ciliumIPAMFails int // cilium-ipam streak (ciliumIPAMCheck)
+	ciliumWGFails   int // cilium_wg0 peer-deficit streak (ciliumWGCheck)
 	// kubeletWdFails is the T15 feeder's consecutive-fail counter —
 	// in-memory like the others (the shell counted within one feeder
 	// process anyway; an agent restart re-arms bounded by the 15s tick).
@@ -1094,63 +1094,23 @@ type Hygiene struct {
 	kubeletFeederWasActive bool
 	taskMapBuilds          int // buildTaskMap invocation count (tests)
 
-	// Wave-2 counters/state: A4 syncloop + containerd-sock, A3
-	// ingest GC, A2 zombie storm (per-parent streaks), A5 journald,
-	// B1 cilium-envoy, B4 MTU drift.
-	syncloopFails  int
-	syncloopUnauth bool // last probe was 401/403 — log the streak once
-	ctrsockFails   int
-	envoyFails     int
-	journaldFails  int
-	// ciliumWGFails counts consecutive cycles the WireGuard peer
-	// table reads below expectation (W5.6).
-	ciliumWGFails int
-	// lastBloatScan stamps the last bounded disk-bloat walk — the
-	// tree scan costs IO on the very disk that is full, so above
-	// the warn watermark it runs at most once per
-	// DiskBloatScanInterval (W6.3).
-	lastBloatScan time.Time
 	// journalReads is the journal-unreadable accounting — every
 	// journal read (k0sworker snapshot + A5 probes) is classified
 	// into it; the tracker fires the state-journal-unreadable latch
 	// on persistent blindness while journal storage exists.
 	journalReads journalwatch.Tracker
-	// zombieStreaks counts consecutive cycles each parent has
-	// produced > ZombieStormThreshold defunct children (A2). Keyed
-	// by zombieParent (pid + stat starttime), NOT raw pid — a pid
-	// recycled between cycles must not inherit a dead process's
-	// streak and hold the latch open for a storm that is over.
-	zombieStreaks map[zombieParent]int
-	// ciliumAgentKilled is set by killCiliumAgent — B1 restarts
-	// cilium-envoy the same cycle so its xDS listener can't hold a
-	// stale socket across the agent restart.
+	// ciliumAgentKilled is shared between the cilium check family
+	// and the envoy check: killCiliumAgent sets it (the agent kill
+	// can come from the cilium, cilium-init or wg-peers check —
+	// whichever wins the shared last-cilium-restart budget first),
+	// and the envoy check restarts cilium-envoy the same cycle so
+	// its xDS listener can't hold a stale socket across the agent
+	// restart. Cycle resets it before the checks run.
 	ciliumAgentKilled bool
-	// lastIngestScan is the last time the ingest GC walked the
-	// ingest dir — the 6h periodic trigger (A3).
-	lastIngestScan time.Time
 
-	// Wave-7 counters/state: H1 d-state storm streak, H2 last
-	// systemd scope sweep, H3 envoy xDS NACK streak (+ the
-	// baseline/last-seen reject sums) and the node-local-dns probe
-	// streak, H4 spegel ready-fail streak, H7 calico veth-leak and
-	// felix readiness streaks.
-	dstateFails      int
-	lastScopeScan    time.Time
-	envoyXDSInit     bool
-	envoyXDSLast     uint64
-	envoyXDSFails    int
-	nldFails         int
-	spegelFails      int
-	calicoVethFails  int
-	calicoFelixFails int
-
-	// Wave-8 counters: the W2 PSI memory-thrash streak.
-	psiThrashFails int
-
-	// Wave-10 counters/state: KR3 meta.db corruption streak, ST2
-	// orphan-hostpath gauge values (the textfile writer reads them
-	// at end of Cycle).
-	ctrMetaFails        int
+	// Wave-10 ST2 gauge values — shared between orphanHPCheck
+	// (writes them each cycle) and writeNodeAgentPromTextfile
+	// (reads them at end of Cycle); tests poke them too.
 	orphanHostPathBytes int64
 	orphanHostPathDirs  int
 
@@ -1160,6 +1120,42 @@ type Hygiene struct {
 	ciliumLeaked    prometheus.Gauge       // allocated − in-use (38)
 	// ctrIngestsCleaned counts ingest dirs removed by the A3 GC.
 	ctrIngestsCleaned prometheus.Counter
+
+	// checks is the ordered per-Cycle dispatch list — initChecks
+	// fills it; the order preserves the sequence the checks ran
+	// before the table existed. The checks are also named fields
+	// so tests can reach per-check state and the old
+	// Hygiene-method forwarders resolve without a list walk.
+	checks      []Check
+	stall       *stallCheck
+	watch       *watchWedgeCheck
+	teardown    *podTeardownCheck
+	konn        *konnCheck
+	dns         *dnsResolvCheck
+	syncloop    *syncloopCheck
+	ctrsock     *ctrsockCheck
+	ctrTasks    *ctrTasksCheck
+	ingestGC    *ingestGCCheck
+	cilium      *ciliumCheck
+	ciliumInit  *ciliumInitCheck
+	ctrImages   *ctrImagesCheck
+	ciliumIPAM  *ciliumIPAMCheck
+	ciliumEnvoy *ciliumEnvoyCheck
+	ciliumMTU   *ciliumMTUCheck
+	ciliumWG    *ciliumWGCheck
+	diskBloat   *diskBloatCheck
+	journald    *journaldCheck
+	zombies     *zombieStormCheck
+	dstate      *dstateCheck
+	scopes      *scopesCheck
+	ciliumLRP   *ciliumLRPCheck
+	spegel      *spegelCheck
+	calico      *calicoCheck
+	cniNetns    *cniNetnsCheck
+	psiThrash   *psiThrashCheck
+	ctrMeta     *ctrMetaCheck
+	hostOOM     *hostOOMCheck
+	orphanHP    *orphanHPCheck
 }
 
 // New returns a Hygiene and registers its metrics on reg.
@@ -1170,8 +1166,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		return nil, fmt.Errorf("workerhygiene: Config.Client is required")
 	}
 	cfg.applyDefaults()
-	h := &Hygiene{cfg: cfg, proc: procfs.New(cfg.ProcRoot),
-		zombieStreaks: map[zombieParent]int{}}
+	h := &Hygiene{cfg: cfg, proc: procfs.New(cfg.ProcRoot)}
 	// Now MUST close over the live config field, not the cfg
 	// parameter: tests re-stub h.cfg.nowFn after New returns and
 	// the store has to observe the new clock (hoststate.New doc).
@@ -1214,6 +1209,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 			}
 		}
 	}
+	h.initChecks()
 	return h, nil
 }
 
@@ -1271,10 +1267,11 @@ func (h *Hygiene) Run(ctx context.Context) {
 	cycle.Every("workerhygiene", h.cfg.Interval, h.Cycle).Run(ctx)
 }
 
-// Cycle runs one round of all three checks. The k0sworker unit file
-// gates everything (WD_REQUIRES: k0sworker) — controllers and test
-// envs without the unit are a silent no-op. Each check must never
-// panic and degrades to no-op on missing files.
+// Cycle runs one round of every check in the ordered dispatch
+// list. The k0sworker unit file gates everything (WD_REQUIRES:
+// k0sworker) — controllers and test envs without the unit are a
+// silent no-op. Each check must never panic and degrades to no-op
+// on missing files.
 func (h *Hygiene) Cycle(ctx context.Context) {
 	if _, err := os.Stat(h.cfg.K0sWorkerUnitFile); err != nil {
 		h.cycles.WithLabelValues("all", "gated").Inc()
@@ -1388,100 +1385,25 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	sigOn := func(name string) bool {
 		return h.cfg.Watchdog == nil || h.cfg.Watchdog.SignalEnabled(name)
 	}
-	run := func(name string, fn func()) {
-		if sigOn(name) {
-			fn()
+	// The checks dispatch through the ordered list initChecks
+	// built — the order preserves the sequence the checks ran
+	// before the table existed. Disabled checks (WD_SIG_<NAME>=off)
+	// count cycles{check,disabled} exactly like the old run gate.
+	env := &cycleEnv{
+		pods:         pods,
+		apiOK:        apiOK,
+		workerActive: workerActive,
+		tasksOnce:    tasksOnce,
+		pidsOnce:     pidsOnce,
+		journalOnce:  journalOnce,
+	}
+	for _, c := range h.checks {
+		if sigOn(c.Name()) {
+			c.Run(ctx, env)
 		} else {
-			h.cycles.WithLabelValues(name, "disabled").Inc()
+			h.cycles.WithLabelValues(c.Name(), "disabled").Inc()
 		}
 	}
-	run(checkStall, func() {
-		h.checkKubeletStall(ctx, apiOK, journalOnce, workerActive)
-	})
-	run(checkWatch, func() {
-		h.checkKubeletWatchWedge(ctx, pods, apiOK, journalOnce, workerActive)
-	})
-	run(checkTeardown, func() {
-		h.checkPodTeardown(ctx, pods, apiOK, tasksOnce, workerActive)
-	})
-	run(checkKonn, func() {
-		h.checkKonnectivity(ctx, pods, pidsOnce, workerActive)
-	})
-	run(checkDNS, func() {
-		h.checkDNSResolvDrift(pods, apiOK, tasksOnce, workerActive)
-	})
-	run(checkSyncloop, func() {
-		h.checkKubeletSyncloop(ctx, workerActive)
-	})
-	run(checkCtrSock, func() {
-		h.checkContainerdSock(ctx, workerActive)
-	})
-	run(checkCtrTasks, func() {
-		h.checkCtrTasks(ctx, pidsOnce, workerActive)
-	})
-	run(checkIngestGC, func() {
-		h.checkCtrIngestGC(ctx, workerActive)
-	})
-	run(checkCilium, func() {
-		h.checkCilium(ctx, apiOK, workerActive)
-	})
-	run(checkCiliumInit, func() {
-		h.checkCiliumInitStuck(ctx, apiOK, workerActive)
-	})
-	run(checkCtrImages, func() {
-		h.checkCtrImages(ctx, pods, apiOK, workerActive)
-	})
-	run(checkCiliumIPAM, func() {
-		h.checkCiliumIPAM(ctx, pods, apiOK, workerActive)
-	})
-	run(checkCiliumEnvoy, func() {
-		h.checkCiliumEnvoy(ctx, workerActive)
-	})
-	run(checkCiliumMTU, func() {
-		h.checkCiliumMTU(workerActive)
-	})
-	run(checkCiliumWG, func() {
-		h.checkCiliumWGPeers(ctx, apiOK, workerActive)
-	})
-	run(checkDiskBloat, func() {
-		h.checkDiskBloat(ctx, pods, apiOK, workerActive)
-	})
-	run(checkZombieStorm, func() {
-		h.checkZombieStorm(pidsOnce, workerActive)
-	})
-	run(checkJournald, func() {
-		h.checkJournaldIntegrity(ctx, workerActive)
-	})
-	run(checkDState, func() {
-		h.checkDStateTasks(pidsOnce, workerActive)
-	})
-	run(checkSysScopes, func() {
-		h.checkSystemdScopes(ctx, workerActive)
-	})
-	run(checkCiliumLRP, func() {
-		h.checkCiliumLRPDNS(ctx, pods, apiOK, workerActive)
-	})
-	run(checkSpegel, func() {
-		h.checkSpegelMirror(ctx, pods, apiOK, workerActive)
-	})
-	run(checkCalico, func() {
-		h.checkCalicoHygiene(ctx, pods, apiOK, workerActive)
-	})
-	run(checkCNINetns, func() {
-		h.checkOrphanCNINetns(ctx, pidsOnce, workerActive)
-	})
-	run(checkPSIThrash, func() {
-		h.checkPSIThrash(ctx, pods, apiOK, pidsOnce, workerActive)
-	})
-	run(checkCtrMeta, func() {
-		h.checkContainerdHealth(ctx, pidsOnce, workerActive)
-	})
-	run(checkHostOOM, func() {
-		h.checkHostOOMVictims(ctx)
-	})
-	run(checkOrphanHP, func() {
-		h.checkOrphanedHostPathVolumes(ctx, workerActive)
-	})
 	// W10 node_agent_* gauges — one textfile per cycle carrying the
 	// OOM/conntrack counters and the orphan-hostpath measurements
 	// the checks above just refreshed.

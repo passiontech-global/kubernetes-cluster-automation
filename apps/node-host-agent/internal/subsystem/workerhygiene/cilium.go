@@ -102,150 +102,170 @@ func (h *Hygiene) killCiliumAgent(tasks []ctrTask) bool {
 	return false
 }
 
-// checkCilium — sig9: cilium-agent :9879 healthz down → latch
+// ciliumCheck — sig9: cilium-agent :9879 healthz down → latch
 // cilium-agent-down + SIGKILL the agent container (kubelet restarts
 // it immediately, bypassing CrashLoopBackOff). Gates: apiOK (restart
 // while the API is dead can't resync), node-overloaded, shared
-// last-cilium-restart 30m budget.
-func (h *Hygiene) checkCilium(ctx context.Context, apiOK, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkCilium, "gated").Inc()
+// last-cilium-restart 30m budget. The W8-NM3 BPF map-pressure probe
+// rides inside this check (checkBPFMaps) — it only runs on a green
+// healthz, off the same agent socket. fails is the healthz streak
+// (ex-Hygiene.ciliumFails).
+type ciliumCheck struct {
+	h     *Hygiene
+	fails int
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *ciliumCheck) Name() string { return checkCilium }
+
+// Run executes one cilium round.
+func (c *ciliumCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkCilium, "gated").Inc()
 		return
 	}
-	tasks, reachable := h.ciliumAgentTasks()
+	tasks, reachable := c.h.ciliumAgentTasks()
 	if !reachable {
 		// ctr unreachable → inconclusive, keep everything.
-		h.cycles.WithLabelValues(checkCilium, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkCilium, "abort").Inc()
 		return
 	}
 	if len(tasks) == 0 {
 		// No cilium-agent container → this node runs no cilium
 		// (calico cluster, hub): clear any false-positive state.
-		h.ciliumFails = 0
-		h.state.Exit("cilium-agent-down", nil)
-		h.cycles.WithLabelValues(checkCilium, "ok").Inc()
+		c.fails = 0
+		c.h.state.Exit("cilium-agent-down", nil)
+		c.h.cycles.WithLabelValues(checkCilium, "ok").Inc()
 		return
 	}
-	err := h.probeHTTPSeries(ctx, h.cfg.CiliumHealthzURL,
-		probeAttempts, ciliumProbeTime, h.cfg.ProbeGap)
+	err := c.h.probeHTTPSeries(ctx, c.h.cfg.CiliumHealthzURL,
+		probeAttempts, ciliumProbeTime, c.h.cfg.ProbeGap)
 	if err == nil {
-		h.ciliumFails = 0
-		h.state.Exit("cilium-agent-down", nil)
+		c.fails = 0
+		c.h.state.Exit("cilium-agent-down", nil)
 		// W8-NM3: a healthy healthz doesn't prove the datapath —
 		// conntrack/SNAT/LB BPF maps can sit at capacity while the
 		// agent still answers 200. Evaluate the map fill ratios on
 		// the same agent socket.
-		h.checkCiliumBPFMaps(ctx)
-		h.cycles.WithLabelValues(checkCilium, "ok").Inc()
+		c.checkBPFMaps(ctx)
+		c.h.cycles.WithLabelValues(checkCilium, "ok").Inc()
 		return
 	}
-	h.state.Enter("cilium-agent-down", "")
-	h.ciliumFails++
+	c.h.state.Enter("cilium-agent-down", "")
+	c.fails++
 	switch {
-	case !apiOK:
-		h.state.AppendLog(fmt.Sprintf(
+	case !e.apiOK:
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-agent-down healthz fail %dx but API unreachable — skip kill (agent still cannot sync even after restart)",
-			h.ciliumFails))
-	case h.ciliumFails >= h.cfg.ConsecNeeded &&
-		!h.state.Exists("node-overloaded") &&
-		h.state.RateTrySpend("last-cilium-restart", h.cfg.MinRestartInterval):
+			c.fails))
+	case c.fails >= c.h.cfg.ConsecNeeded &&
+		!c.h.state.Exists("node-overloaded") &&
+		c.h.state.RateTrySpend("last-cilium-restart", c.h.cfg.MinRestartInterval):
 		// Budget spent atomically BEFORE acting (rate_spend
 		// parity): a missed kill still consumed it — the feeder
 		// goroutine competes for the same file.
-		if h.killCiliumAgent(tasks) {
-			h.state.AppendLog(fmt.Sprintf(
+		if c.h.killCiliumAgent(tasks) {
+			c.h.state.AppendLog(fmt.Sprintf(
 				"ACTION: killed cilium-agent container - healthz down %dx (kubelet will restart)",
-				h.ciliumFails))
-			h.ciliumFails = 0
-			h.actions.WithLabelValues(checkCilium, "sigkill").Inc()
+				c.fails))
+			c.fails = 0
+			c.h.actions.WithLabelValues(checkCilium, "sigkill").Inc()
 		} else {
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: cilium-agent-down healthz fail %dx, no running task to kill (kubelet retries itself)",
-				h.ciliumFails))
+				c.fails))
 		}
 	default:
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-agent-down healthz 127.0.0.1:9879 fail (check %d/%d)",
-			h.ciliumFails, h.cfg.ConsecNeeded))
+			c.fails, c.h.cfg.ConsecNeeded))
 	}
-	h.cycles.WithLabelValues(checkCilium, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkCilium, "ok").Inc()
 }
 
-// checkCiliumInitStuck — sig15: endpoints stuck in reserved:init
+// ciliumInitCheck — sig15: endpoints stuck in reserved:init
 // while healthz stays green (informer wedge — every new pod gets a
 // black-holed datapath). The shell ran `cilium-dbg endpoint list` via
 // ctr exec; the agent reads the same data from the cilium agent unix
 // socket (/v1/endpoint) — reserved:init counting is identical.
-// Inconclusive (socket/exec fail) → keep counters, never reset.
-func (h *Hygiene) checkCiliumInitStuck(ctx context.Context, apiOK, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkCiliumInit, "gated").Inc()
+// Inconclusive (socket/exec fail) → keep counters, never reset. The
+// streak stays on Hygiene (ciliumInitFails) — pre-Check tests poke
+// it directly.
+type ciliumInitCheck struct{ h *Hygiene }
+
+// Name returns the check label / WD_SIG key.
+func (c *ciliumInitCheck) Name() string { return checkCiliumInit }
+
+// Run executes one cilium-init-stuck round.
+func (c *ciliumInitCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkCiliumInit, "gated").Inc()
 		return
 	}
-	tasks, reachable := h.ciliumAgentTasks()
+	tasks, reachable := c.h.ciliumAgentTasks()
 	if !reachable {
-		h.cycles.WithLabelValues(checkCiliumInit, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkCiliumInit, "abort").Inc()
 		return
 	}
 	if len(tasks) == 0 {
-		h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
+		c.h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
 		return
 	}
-	body, err := h.cfg.unixGet(ctx, h.cfg.CiliumSocket, "/v1/endpoint")
+	body, err := c.h.cfg.unixGet(ctx, c.h.cfg.CiliumSocket, "/v1/endpoint")
 	if err != nil {
 		// Endpoint list unreadable — inconclusive: don't count, don't
 		// reset (shell: tasks exec fail → exit 0).
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck endpoint query on %s failed: %v — inconclusive, keeping state",
-			h.cfg.CiliumSocket, err))
-		h.cycles.WithLabelValues(checkCiliumInit, "abort").Inc()
+			c.h.cfg.CiliumSocket, err))
+		c.h.cycles.WithLabelValues(checkCiliumInit, "abort").Inc()
 		return
 	}
 	initEps := strings.Count(string(body), "reserved:init")
 	if initEps == 0 {
-		h.ciliumInitFails = 0
-		h.state.Exit("cilium-init-stuck", nil)
-		h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
+		c.h.ciliumInitFails = 0
+		c.h.state.Exit("cilium-init-stuck", nil)
+		c.h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
 		return
 	}
-	h.ciliumInitFails++
-	if h.ciliumInitFails < h.cfg.ConsecNeeded {
-		h.state.AppendLog(fmt.Sprintf("suspect: cilium-init-stuck init_eps=%d (check %d/%d)",
-			initEps, h.ciliumInitFails, h.cfg.ConsecNeeded))
-		h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
+	c.h.ciliumInitFails++
+	if c.h.ciliumInitFails < c.h.cfg.ConsecNeeded {
+		c.h.state.AppendLog(fmt.Sprintf("suspect: cilium-init-stuck init_eps=%d (check %d/%d)",
+			initEps, c.h.ciliumInitFails, c.h.cfg.ConsecNeeded))
+		c.h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
 		return
 	}
 	// Wedge confirmed — latch before any gate like the shell.
-	h.state.Enter("cilium-init-stuck", fmt.Sprintf("init_eps=%d", initEps))
+	c.h.state.Enter("cilium-init-stuck", fmt.Sprintf("init_eps=%d", initEps))
 	switch {
-	case !apiOK:
-		h.state.AppendLog(fmt.Sprintf(
+	case !e.apiOK:
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but API unreachable — skip kill (agent still cannot resync even after restart)",
-			initEps, h.ciliumInitFails))
-	case h.state.Exists("node-overloaded"):
-		h.state.AppendLog(fmt.Sprintf(
+			initEps, c.h.ciliumInitFails))
+	case c.h.state.Exists("node-overloaded"):
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but node overloaded — skip kill",
-			initEps, h.ciliumInitFails))
-	case !h.state.RateTrySpend("last-cilium-restart", h.cfg.MinRestartInterval):
-		h.state.AppendLog(fmt.Sprintf(
+			initEps, c.h.ciliumInitFails))
+	case !c.h.state.RateTrySpend("last-cilium-restart", c.h.cfg.MinRestartInterval):
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but restart cooldown — skip kill",
-			initEps, h.ciliumInitFails))
+			initEps, c.h.ciliumInitFails))
 	default:
 		// Budget already spent atomically by the rateTrySpend case —
 		// the feeder goroutine competes for the same file.
-		if h.killCiliumAgent(tasks) {
-			h.state.AppendLog(fmt.Sprintf(
+		if c.h.killCiliumAgent(tasks) {
+			c.h.state.AppendLog(fmt.Sprintf(
 				"ACTION: killed cilium-agent container - init_eps=%d %dx (kubelet will restart -> informer resync)",
-				initEps, h.ciliumInitFails))
-			h.ciliumInitFails = 0
-			h.actions.WithLabelValues(checkCiliumInit, "sigkill").Inc()
+				initEps, c.h.ciliumInitFails))
+			c.h.ciliumInitFails = 0
+			c.h.actions.WithLabelValues(checkCiliumInit, "sigkill").Inc()
 		} else {
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: cilium-init-stuck init_eps=%d %dx, no running task to kill (kubelet retries itself)",
-				initEps, h.ciliumInitFails))
+				initEps, c.h.ciliumInitFails))
 		}
 	}
-	h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
 }
 
 // --- W8-NM3: cilium BPF map pressure ---
@@ -334,35 +354,41 @@ func parseCiliumBPFMaps(body []byte) map[string][2]int64 {
 	return out
 }
 
-// checkCiliumBPFMaps reads the map fill ratios off the agent socket
+// checkBPFMaps reads the map fill ratios off the agent socket
 // and latches state-cilium-bpf-map-pressure when a critical map
 // exceeds BPFMapHighRatio. An unreadable socket or unparseable body
 // is inconclusive (the cilium checks' keep-state rule) — the latch
 // is neither entered nor cleared on missing evidence.
-func (h *Hygiene) checkCiliumBPFMaps(ctx context.Context) {
-	body, err := h.cfg.unixGet(ctx, h.cfg.CiliumSocket, "/v1/map")
+func (c *ciliumCheck) checkBPFMaps(ctx context.Context) {
+	body, err := c.h.cfg.unixGet(ctx, c.h.cfg.CiliumSocket, "/v1/map")
 	if err != nil {
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-bpf-maps map query on %s failed: %v — inconclusive, keeping state",
-			h.cfg.CiliumSocket, err))
-		h.cycles.WithLabelValues(checkCiliumBPF, "abort").Inc()
+			c.h.cfg.CiliumSocket, err))
+		c.h.cycles.WithLabelValues(checkCiliumBPF, "abort").Inc()
 		return
 	}
 	maps := parseCiliumBPFMaps(body)
 	var over []string
 	for name, um := range maps {
-		if float64(um[0]) >= h.cfg.BPFMapHighRatio*float64(um[1]) {
+		if float64(um[0]) >= c.h.cfg.BPFMapHighRatio*float64(um[1]) {
 			over = append(over, fmt.Sprintf("%s=%d/%d", name, um[0], um[1]))
 		}
 	}
 	if len(over) == 0 {
-		h.state.Exit("cilium-bpf-map-pressure", nil)
-		h.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
+		c.h.state.Exit("cilium-bpf-map-pressure", nil)
+		c.h.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
 		return
 	}
 	sort.Strings(over)
-	h.state.Enter("cilium-bpf-map-pressure", strings.Join(over, " "))
-	h.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
+	c.h.state.Enter("cilium-bpf-map-pressure", strings.Join(over, " "))
+	c.h.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
+}
+
+// checkCiliumBPFMaps forwards to the migrated Check — tests written
+// before the interface still call the old method shape.
+func (h *Hygiene) checkCiliumBPFMaps(ctx context.Context) {
+	h.cilium.checkBPFMaps(ctx)
 }
 
 // --- Check: ctr-image-healer (37-ctr-image-healer.sh) ---
@@ -494,42 +520,49 @@ func parseCiliumIPAM(body []byte) (used, available int, ok bool) {
 	}
 }
 
-// checkCiliumIPAM reads the agent's IPAM usage off the unix socket
+// ciliumIPAMCheck reads the agent's IPAM usage off the unix socket
 // and cross-checks it against the non-hostNetwork Running pods on
 // this node: allocated − in-use = leaked IPs still held for dead
 // pods (a real pod eventually can't get an address — the black-hole
 // datapath this module exists to catch early). A small constant leak
 // (~2: router + health reserved IPs) is normal, so the latch needs
 // leaked >30 or available <=2 for ConsecNeeded consecutive cycles.
-// The gauges update on every successful probe regardless.
-func (h *Hygiene) checkCiliumIPAM(ctx context.Context, pods []corev1.Pod,
-	apiOK, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkCiliumIPAM, "gated").Inc()
+// The gauges update on every successful probe regardless. The
+// streak stays on Hygiene (ciliumIPAMFails) — pre-Check tests poke
+// it directly.
+type ciliumIPAMCheck struct{ h *Hygiene }
+
+// Name returns the check label / WD_SIG key.
+func (c *ciliumIPAMCheck) Name() string { return checkCiliumIPAM }
+
+// Run executes one cilium-ipam round.
+func (c *ciliumIPAMCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkCiliumIPAM, "gated").Inc()
 		return
 	}
-	if !apiOK {
+	if !e.apiOK {
 		// The in-use count comes from the API — a failed LIST would
 		// make EVERY allocated IP look leaked.
-		h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
 		return
 	}
-	body, err := h.cfg.unixGet(ctx, h.cfg.CiliumSocket, "/v1/healthz")
+	body, err := c.h.cfg.unixGet(ctx, c.h.cfg.CiliumSocket, "/v1/healthz")
 	if err != nil {
 		// Socket unreadable — inconclusive: keep counters/latch
 		// (same rule as checkCiliumInitStuck).
-		h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
 		return
 	}
 	used, available, ok := parseCiliumIPAM(body)
 	if !ok {
-		h.state.AppendLog("suspect: cilium-ipam healthz has no parseable ipam.ipv4 data — inconclusive")
-		h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
+		c.h.state.AppendLog("suspect: cilium-ipam healthz has no parseable ipam.ipv4 data — inconclusive")
+		c.h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
 		return
 	}
 	inUse := 0
-	for i := range pods {
-		p := &pods[i]
+	for i := range e.pods {
+		p := &e.pods[i]
 		// The denominator is "pods holding an address", not
 		// "Running pods": the CNI call happens at sandbox create,
 		// so a Pending/ContainerCreating pod already owns its IP —
@@ -547,25 +580,25 @@ func (h *Hygiene) checkCiliumIPAM(ctx context.Context, pods []corev1.Pod,
 	if leaked < 0 {
 		leaked = 0
 	}
-	h.ciliumAllocated.Set(float64(used))
-	h.ciliumLeaked.Set(float64(leaked))
+	c.h.ciliumAllocated.Set(float64(used))
+	c.h.ciliumLeaked.Set(float64(leaked))
 	exhausted := leaked > 30 || (available >= 0 && available <= 2)
 	if !exhausted {
-		h.ciliumIPAMFails = 0
-		h.state.Exit("cilium-ipam-exhausted", nil)
-		h.cycles.WithLabelValues(checkCiliumIPAM, "ok").Inc()
+		c.h.ciliumIPAMFails = 0
+		c.h.state.Exit("cilium-ipam-exhausted", nil)
+		c.h.cycles.WithLabelValues(checkCiliumIPAM, "ok").Inc()
 		return
 	}
-	h.ciliumIPAMFails++
-	if h.ciliumIPAMFails >= h.cfg.ConsecNeeded {
-		h.state.Enter("cilium-ipam-exhausted", fmt.Sprintf(
+	c.h.ciliumIPAMFails++
+	if c.h.ciliumIPAMFails >= c.h.cfg.ConsecNeeded {
+		c.h.state.Enter("cilium-ipam-exhausted", fmt.Sprintf(
 			"used=%d in-use=%d leaked=%d available=%d", used, inUse, leaked, available))
 	} else {
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-ipam-exhausted used=%d in-use=%d leaked=%d available=%d (check %d/%d)",
-			used, inUse, leaked, available, h.ciliumIPAMFails, h.cfg.ConsecNeeded))
+			used, inUse, leaked, available, c.h.ciliumIPAMFails, c.h.cfg.ConsecNeeded))
 	}
-	h.cycles.WithLabelValues(checkCiliumIPAM, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkCiliumIPAM, "ok").Inc()
 }
 
 // --- kubelet watchdog feeder + remediate (T15) ---
@@ -624,39 +657,57 @@ func ciliumUnhealthySubsystems(body []byte) []string {
 	return bad
 }
 
-func (h *Hygiene) checkCiliumEnvoy(ctx context.Context, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkCiliumEnvoy, "gated").Inc()
+// ciliumEnvoyCheck is the B1/W7-H3 envoy guard as a Check. It owns
+// the /ready fail streak and the xDS NACK bookkeeping
+// (ex-Hygiene.envoyFails/.envoyXDS*). The ciliumAgentKilled flag
+// stays on Hygiene — it's shared state: any of the cilium,
+// cilium-init or wg-peers checks can set it through
+// killCiliumAgent earlier in the same Cycle.
+type ciliumEnvoyCheck struct {
+	h        *Hygiene
+	fails    int    // consecutive /ready fails (ConsecNeeded → kill)
+	xdsInit  bool   // baseline update_rejected sum established
+	xdsLast  uint64 // last-seen update_rejected sum
+	xdsFails int    // consecutive cycles the sum grew
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *ciliumEnvoyCheck) Name() string { return checkCiliumEnvoy }
+
+// Run executes one cilium-envoy round.
+func (c *ciliumEnvoyCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "gated").Inc()
 		return
 	}
-	tasks, reachable := h.ciliumNamedTasks("cilium-envoy")
+	tasks, reachable := c.h.ciliumNamedTasks("cilium-envoy")
 	if !reachable {
-		h.cycles.WithLabelValues(checkCiliumEnvoy, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "abort").Inc()
 		return
 	}
 	if len(tasks) == 0 {
 		// No cilium-envoy container — older cilium or no L7 proxy:
 		// clear any stale latch like checkCilium does.
-		h.envoyFails = 0
-		h.state.Exit("cilium-envoy-down", nil)
-		h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+		c.fails = 0
+		c.h.state.Exit("cilium-envoy-down", nil)
+		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
 	// 2.5: subsystem/datapath health off the agent socket is
 	// evidence only — an unreadable socket must not block the envoy
 	// verdict (the admin port is the primary signal).
-	if body, err := h.cfg.unixGet(ctx, h.cfg.CiliumSocket, "/v1/healthz"); err == nil {
+	if body, err := c.h.cfg.unixGet(ctx, c.h.cfg.CiliumSocket, "/v1/healthz"); err == nil {
 		if bad := ciliumUnhealthySubsystems(body); len(bad) > 0 {
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: cilium subsystem health degraded: %s",
 				strings.Join(bad, ",")))
 		}
 	}
 	// Trigger 1: the agent was SIGKILLed this cycle — envoy may hold
 	// the stale socket, restart it alongside (B1).
-	if h.ciliumAgentKilled {
-		h.killCiliumEnvoy(tasks, "cilium-agent restarted this cycle")
-		h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+	if c.h.ciliumAgentKilled {
+		c.killCiliumEnvoy(tasks, "cilium-agent restarted this cycle")
+		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
 	// W7-H3: xDS NACK guard — envoy can answer /ready=200 while
@@ -667,62 +718,68 @@ func (h *Hygiene) checkCiliumEnvoy(ctx context.Context, workerActive bool) {
 	// state-cilium-envoy-xds-reject and restart envoy through the
 	// same last-cilium-envoy-restart budget. Runs BEFORE the ready
 	// probe's early-return so a green /ready can't hide the wedge.
-	if reject, inconclusive := h.evalEnvoyXDS(ctx); inconclusive {
+	if reject, inconclusive := c.evalEnvoyXDS(ctx); inconclusive {
 		// Stats page unreadable — inconclusive, keep the streak
 		// (a dead envoy fails its own ready probe next).
 	} else if reject {
-		h.envoyXDSFails++
+		c.xdsFails++
 	} else {
-		h.envoyXDSFails = 0
-		h.state.Exit("cilium-envoy-xds-reject", nil)
+		c.xdsFails = 0
+		c.h.state.Exit("cilium-envoy-xds-reject", nil)
 	}
-	if h.envoyXDSFails >= h.cfg.ConsecNeeded {
-		h.state.Enter("cilium-envoy-xds-reject",
+	if c.xdsFails >= c.h.cfg.ConsecNeeded {
+		c.h.state.Enter("cilium-envoy-xds-reject",
 			fmt.Sprintf("update_rejected=%d fails=%d",
-				h.envoyXDSLast, h.envoyXDSFails))
-		h.killCiliumEnvoy(tasks,
+				c.xdsLast, c.xdsFails))
+		c.killCiliumEnvoy(tasks,
 			fmt.Sprintf("xDS update_rejected deltas %d consecutive cycles",
-				h.envoyXDSFails))
+				c.xdsFails))
 	}
-	code, err := h.cfg.probeHTTPStatus(ctx,
-		h.cfg.CiliumEnvoyReadyURL, "", ciliumProbeTime)
+	code, err := c.h.cfg.probeHTTPStatus(ctx,
+		c.h.cfg.CiliumEnvoyReadyURL, "", ciliumProbeTime)
 	if err == nil && code == http.StatusOK {
-		h.envoyFails = 0
-		h.state.Exit("cilium-envoy-down", nil)
-		h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+		c.fails = 0
+		c.h.state.Exit("cilium-envoy-down", nil)
+		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
-	h.envoyFails++
-	if h.envoyFails < h.cfg.ConsecNeeded {
-		h.state.AppendLog(fmt.Sprintf(
+	c.fails++
+	if c.fails < c.h.cfg.ConsecNeeded {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-envoy-down ready probe code=%d err=%v (check %d/%d)",
-			code, err, h.envoyFails, h.cfg.ConsecNeeded))
-		h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+			code, err, c.fails, c.h.cfg.ConsecNeeded))
+		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
-	h.state.Enter("cilium-envoy-down",
-		fmt.Sprintf("ready_probe_fails=%d", h.envoyFails))
-	h.killCiliumEnvoy(tasks,
-		fmt.Sprintf("unready %d consecutive cycles", h.envoyFails))
-	h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+	c.h.state.Enter("cilium-envoy-down",
+		fmt.Sprintf("ready_probe_fails=%d", c.fails))
+	c.killCiliumEnvoy(tasks,
+		fmt.Sprintf("unready %d consecutive cycles", c.fails))
+	c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+}
+
+// checkCiliumEnvoy forwards to the migrated Check — tests written
+// before the interface still call the old method shape.
+func (h *Hygiene) checkCiliumEnvoy(ctx context.Context, workerActive bool) {
+	h.ciliumEnvoy.Run(ctx, &cycleEnv{workerActive: workerActive})
 }
 
 // killCiliumEnvoy restarts the envoy container through its init
 // pids — kubelet rebuilds it like the agent path. The dedicated
 // budget keeps envoy kills from eating the agent's restart rate.
-func (h *Hygiene) killCiliumEnvoy(tasks []ctrTask, why string) {
-	if !h.state.RateTrySpend("last-cilium-envoy-restart", h.cfg.MinRestartInterval) {
-		h.state.AppendLog(fmt.Sprintf(
+func (c *ciliumEnvoyCheck) killCiliumEnvoy(tasks []ctrTask, why string) {
+	if !c.h.state.RateTrySpend("last-cilium-envoy-restart", c.h.cfg.MinRestartInterval) {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-envoy kill skipped (%s) — restart cooldown (<30m)", why))
 		return
 	}
-	if h.killNamedTasks(tasks, "cilium-envoy") {
-		h.state.AppendLog(fmt.Sprintf(
+	if c.h.killNamedTasks(tasks, "cilium-envoy") {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"ACTION: killed cilium-envoy container - %s (kubelet will restart -> xDS resync)", why))
-		h.envoyFails = 0
-		h.actions.WithLabelValues(checkCiliumEnvoy, "sigkill").Inc()
+		c.fails = 0
+		c.h.actions.WithLabelValues(checkCiliumEnvoy, "sigkill").Inc()
 	} else {
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-envoy kill skipped (%s) — no running task to kill", why))
 	}
 }
@@ -738,27 +795,35 @@ func (h *Hygiene) killCiliumEnvoy(tasks []ctrTask, why string) {
 // hostutil.RuntimeConfigMTU (sysfs mtu file + agent-runtime-config.json
 // fallback, MAX-wins over several `mtu` keys).
 
-func (h *Hygiene) checkCiliumMTU(workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkCiliumMTU, "gated").Inc()
+// ciliumMTUCheck is the B4 MTU-drift guard as a Check (no streak —
+// the latch IS the state).
+type ciliumMTUCheck struct{ h *Hygiene }
+
+// Name returns the check label / WD_SIG key.
+func (c *ciliumMTUCheck) Name() string { return checkCiliumMTU }
+
+// Run executes one cilium-mtu round.
+func (c *ciliumMTUCheck) Run(_ context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkCiliumMTU, "gated").Inc()
 		return
 	}
-	neb, nebOK := hostutil.MTUOfIface(h.cfg.SysClassNet, h.cfg.NebulaIface)
-	cil, cilOK := hostutil.MTUOfIface(h.cfg.SysClassNet, h.cfg.CiliumIface)
+	neb, nebOK := hostutil.MTUOfIface(c.h.cfg.SysClassNet, c.h.cfg.NebulaIface)
+	cil, cilOK := hostutil.MTUOfIface(c.h.cfg.SysClassNet, c.h.cfg.CiliumIface)
 	if !cilOK {
-		cil, cilOK = hostutil.RuntimeConfigMTU(h.cfg.CiliumRuntimeConfig)
+		cil, cilOK = hostutil.RuntimeConfigMTU(c.h.cfg.CiliumRuntimeConfig)
 	}
 	// W9 double-encap guard: on the WireGuard datapath cilium_wg0
 	// carries pod traffic INSIDE the nebula overlay — its MTU must
 	// leave room for the WG header (~60B) under the overlay MTU.
 	// A wg0 MTU above neb−60 means pod packets exceed what the
 	// double-encapsulated path can carry → silent blackhole.
-	wg, wgOK := hostutil.MTUOfIface(h.cfg.SysClassNet, h.cfg.CiliumWG0Iface)
+	wg, wgOK := hostutil.MTUOfIface(c.h.cfg.SysClassNet, c.h.cfg.CiliumWG0Iface)
 	if !nebOK {
 		// No overlay to compare against — a drift latch from
 		// before must not linger.
-		h.state.Exit("cilium-mtu-drift", nil)
-		h.cycles.WithLabelValues(checkCiliumMTU, "ok").Inc()
+		c.h.state.Exit("cilium-mtu-drift", nil)
+		c.h.cycles.WithLabelValues(checkCiliumMTU, "ok").Inc()
 		return
 	}
 	var driftWhy string
@@ -770,17 +835,23 @@ func (h *Hygiene) checkCiliumMTU(workerActive bool) {
 			wg, neb, wgEncapOverheadBytes)
 	}
 	if driftWhy != "" {
-		if !h.state.Exists("cilium-mtu-drift") {
-			h.state.Enter("cilium-mtu-drift", driftWhy)
+		if !c.h.state.Exists("cilium-mtu-drift") {
+			c.h.state.Enter("cilium-mtu-drift", driftWhy)
 			// NPD contract: nodereporter maps this line to the
 			// CiliumMTUExceedsOverlay Event + problem_counter.
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"ACTION cilium-mtu-drift: %s", driftWhy))
 		}
 	} else {
-		h.state.Exit("cilium-mtu-drift", nil)
+		c.h.state.Exit("cilium-mtu-drift", nil)
 	}
-	h.cycles.WithLabelValues(checkCiliumMTU, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkCiliumMTU, "ok").Inc()
+}
+
+// checkCiliumMTU forwards to the migrated Check — tests written
+// before the interface still call the old method shape.
+func (h *Hygiene) checkCiliumMTU(workerActive bool) {
+	h.ciliumMTU.Run(context.Background(), &cycleEnv{workerActive: workerActive})
 }
 
 // --- Check: cilium WireGuard peer-gc drift healer (W5.6) ---
@@ -898,35 +969,42 @@ func (h *Hygiene) readyNodeCount(ctx context.Context) int {
 	return n
 }
 
-// checkCiliumWGPeers detects the wiped peer table: it runs only on
+// ciliumWGCheck detects the wiped peer table: it runs only on
 // nodes where cilium_wg0 exists, the API answered, and a
 // cilium-agent task is running — every other shape is another
 // check's signal. actual < expected for ConsecNeeded consecutive
 // cycles latches state-cilium-wg-peer-wipe and SIGKILLs the agent
 // (kubelet restarts it; the shared last-cilium-restart 30m budget
-// and the node-overloaded gate apply like sig9).
-func (h *Hygiene) checkCiliumWGPeers(ctx context.Context, apiOK, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkCiliumWG, "gated").Inc()
+// and the node-overloaded gate apply like sig9). The streak stays
+// on Hygiene (ciliumWGFails) — pre-Check tests poke it directly.
+type ciliumWGCheck struct{ h *Hygiene }
+
+// Name returns the check label / WD_SIG key.
+func (c *ciliumWGCheck) Name() string { return checkCiliumWG }
+
+// Run executes one cilium-wg-peers round.
+func (c *ciliumWGCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkCiliumWG, "gated").Inc()
 		return
 	}
-	if !apiOK {
+	if !e.apiOK {
 		// Inconclusive — keep counters/latch exactly like the other
 		// API-dependent checks.
-		h.cycles.WithLabelValues(checkCiliumWG, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkCiliumWG, "abort").Inc()
 		return
 	}
-	if _, err := os.Stat(filepath.Join(h.cfg.SysClassNet, "cilium_wg0")); err != nil {
+	if _, err := os.Stat(filepath.Join(c.h.cfg.SysClassNet, "cilium_wg0")); err != nil {
 		// No WireGuard datapath on this node (calico, tunnel mode,
 		// hub) — nothing to heal; drop stale evidence.
-		h.ciliumWGFails = 0
-		h.state.Exit("cilium-wg-peer-wipe", nil)
-		h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+		c.h.ciliumWGFails = 0
+		c.h.state.Exit("cilium-wg-peer-wipe", nil)
+		c.h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
 		return
 	}
-	tasks, reachable := h.ciliumAgentTasks()
+	tasks, reachable := c.h.ciliumAgentTasks()
 	if !reachable {
-		h.cycles.WithLabelValues(checkCiliumWG, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkCiliumWG, "abort").Inc()
 		return
 	}
 	running := false
@@ -939,22 +1017,22 @@ func (h *Hygiene) checkCiliumWGPeers(ctx context.Context, apiOK, workerActive bo
 	if !running {
 		// No live cilium-agent — sig9 owns agent-down; killing
 		// nothing here is correct, not a miss.
-		h.ciliumWGFails = 0
-		h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+		c.h.ciliumWGFails = 0
+		c.h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
 		return
 	}
-	actual, err := h.cfg.wgAllowedIPsFn(ctx)
+	actual, err := c.h.cfg.wgAllowedIPsFn(ctx)
 	if err != nil {
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers wg allowed-ips probe failed: %v — inconclusive, keeping state", err))
-		h.cycles.WithLabelValues(checkCiliumWG, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkCiliumWG, "abort").Inc()
 		return
 	}
-	expected, err := h.cfg.ciliumEncryptPeersFn(ctx)
+	expected, err := c.h.cfg.ciliumEncryptPeersFn(ctx)
 	if err != nil || expected <= 0 {
 		// encrypt status unreadable or carries no count — fall back
 		// to ReadyNodes-1 (every OTHER Ready node is a peer).
-		if n := h.readyNodeCount(ctx); n > 1 {
+		if n := c.h.readyNodeCount(ctx); n > 1 {
 			expected = n - 1
 		} else {
 			expected = 0
@@ -963,51 +1041,57 @@ func (h *Hygiene) checkCiliumWGPeers(ctx context.Context, apiOK, workerActive bo
 	if expected <= 0 {
 		// No expectation available — inconclusive but not harmful:
 		// neither count nor clear a streak we cannot verify.
-		h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+		c.h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
 		return
 	}
 	if actual >= expected {
-		h.ciliumWGFails = 0
-		h.state.Exit("cilium-wg-peer-wipe", nil)
-		h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+		c.h.ciliumWGFails = 0
+		c.h.state.Exit("cilium-wg-peer-wipe", nil)
+		c.h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
 		return
 	}
-	h.ciliumWGFails++
-	if h.ciliumWGFails < h.cfg.ConsecNeeded {
-		h.state.AppendLog(fmt.Sprintf(
+	c.h.ciliumWGFails++
+	if c.h.ciliumWGFails < c.h.cfg.ConsecNeeded {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers allowed_ips=%d expected=%d (check %d/%d)",
-			actual, expected, h.ciliumWGFails, h.cfg.ConsecNeeded))
-		h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+			actual, expected, c.h.ciliumWGFails, c.h.cfg.ConsecNeeded))
+		c.h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
 		return
 	}
-	h.state.Enter("cilium-wg-peer-wipe",
+	c.h.state.Enter("cilium-wg-peer-wipe",
 		fmt.Sprintf("allowed_ips=%d expected=%d", actual, expected))
 	switch {
-	case h.state.Exists("node-overloaded"):
-		h.state.AppendLog(fmt.Sprintf(
+	case c.h.state.Exists("node-overloaded"):
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers allowed_ips=%d expected=%d %dx but node overloaded — skip kill",
-			actual, expected, h.ciliumWGFails))
-	case !h.state.RateTrySpend("last-cilium-restart", h.cfg.MinRestartInterval):
-		h.state.AppendLog(fmt.Sprintf(
+			actual, expected, c.h.ciliumWGFails))
+	case !c.h.state.RateTrySpend("last-cilium-restart", c.h.cfg.MinRestartInterval):
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers allowed_ips=%d expected=%d %dx but restart cooldown — skip kill",
-			actual, expected, h.ciliumWGFails))
+			actual, expected, c.h.ciliumWGFails))
 	default:
 		// Budget already spent atomically by the rateTrySpend case.
-		if h.killCiliumAgent(tasks) {
+		if c.h.killCiliumAgent(tasks) {
 			// NPD contract: the cilium_wg0 line feeds
 			// CiliumWireGuardPeerDrift (events.go).
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"ACTION: killed cilium-agent container - cilium_wg0 has %d allowed-ip peers while expected %d (kubelet will restart -> wireguard peer resync)",
 				actual, expected))
-			h.ciliumWGFails = 0
-			h.actions.WithLabelValues(checkCiliumWG, "sigkill").Inc()
+			c.h.ciliumWGFails = 0
+			c.h.actions.WithLabelValues(checkCiliumWG, "sigkill").Inc()
 		} else {
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: cilium-wg-peers allowed_ips=%d expected=%d, no running task to kill",
 				actual, expected))
 		}
 	}
-	h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
+}
+
+// checkCiliumWGPeers forwards to the migrated Check — tests written
+// before the interface still call the old method shape.
+func (h *Hygiene) checkCiliumWGPeers(ctx context.Context, apiOK, workerActive bool) {
+	h.ciliumWG.Run(ctx, &cycleEnv{apiOK: apiOK, workerActive: workerActive})
 }
 
 // --- Check: disk-bloat runaway detector + emergency evictor (W6.3) ---
@@ -1057,22 +1141,22 @@ func parseEnvoyXDSRejected(body []byte) uint64 {
 // inconclusive=true means the page could not be evaluated — the
 // caller keeps the streak untouched (a dead envoy also fails its
 // /ready probe and the B1 path owns that verdict).
-func (h *Hygiene) evalEnvoyXDS(ctx context.Context) (reject, inconclusive bool) {
-	if h.cfg.CiliumEnvoyAdminURL == "" {
+func (c *ciliumEnvoyCheck) evalEnvoyXDS(ctx context.Context) (reject, inconclusive bool) {
+	if c.h.cfg.CiliumEnvoyAdminURL == "" {
 		return false, true
 	}
-	body, err := h.cfg.httpGetBody(ctx, h.cfg.CiliumEnvoyAdminURL, ciliumProbeTime)
+	body, err := c.h.cfg.httpGetBody(ctx, c.h.cfg.CiliumEnvoyAdminURL, ciliumProbeTime)
 	if err != nil {
 		return false, true
 	}
 	total := parseEnvoyXDSRejected(body)
-	if !h.envoyXDSInit {
-		h.envoyXDSInit = true
-		h.envoyXDSLast = total
+	if !c.xdsInit {
+		c.xdsInit = true
+		c.xdsLast = total
 		return false, false
 	}
-	reject = total > h.envoyXDSLast
-	h.envoyXDSLast = total
+	reject = total > c.xdsLast
+	c.xdsLast = total
 	return reject, false
 }
 
@@ -1117,43 +1201,53 @@ func probeDNSUDP(addr, name string, timeout time.Duration) bool {
 // (the DaemonSet respawns it with a fresh socket; last-nld-restart
 // 30m budget). Only evaluated on cilium nodes (cilium_host present)
 // — calico nodes serve local DNS without the LRP datapath.
-func (h *Hygiene) checkCiliumLRPDNS(ctx context.Context, pods []corev1.Pod,
-	apiOK, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkCiliumLRP, "gated").Inc()
+// ciliumLRPCheck is the W7-H3 node-local-dns datapath guard as a
+// Check; it owns the :53 probe fail streak (ex-Hygiene.nldFails).
+type ciliumLRPCheck struct {
+	h     *Hygiene
+	fails int
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *ciliumLRPCheck) Name() string { return checkCiliumLRP }
+
+// Run executes one cilium-lrp-dns round.
+func (c *ciliumLRPCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkCiliumLRP, "gated").Inc()
 		return
 	}
-	if _, err := os.Stat(filepath.Join(h.cfg.SysClassNet, "cilium_host")); err != nil {
+	if _, err := os.Stat(filepath.Join(c.h.cfg.SysClassNet, "cilium_host")); err != nil {
 		// No cilium datapath — the LRP wedge can't exist here.
-		h.nldFails = 0
-		h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		c.fails = 0
+		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return
 	}
 	// The plan gates on cilium-agent actually running: cilium_host
 	// persists while the agent is down, and a dead/wedged agent can
 	// break the :53 datapath itself — killing the nld pod then would
 	// mask the real failure (checkCilium owns the agent-down verdict).
-	agentTasks, ctrOK := h.ciliumAgentTasks()
+	agentTasks, ctrOK := c.h.ciliumAgentTasks()
 	if !ctrOK {
-		h.cycles.WithLabelValues(checkCiliumLRP, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkCiliumLRP, "abort").Inc()
 		return
 	}
 	if len(agentTasks) == 0 {
 		// Agent absent/dead — datapath verdict inconclusive; the LRP
 		// check stands down rather than punish a healthy pod.
-		h.nldFails = 0
-		h.cycles.WithLabelValues(checkCiliumLRP, "gated").Inc()
+		c.fails = 0
+		c.h.cycles.WithLabelValues(checkCiliumLRP, "gated").Inc()
 		return
 	}
-	if !apiOK {
+	if !e.apiOK {
 		// Inconclusive — keep the streak like the other API-gated
 		// checks (a LIST flake must not count or clear evidence).
-		h.cycles.WithLabelValues(checkCiliumLRP, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkCiliumLRP, "abort").Inc()
 		return
 	}
 	var nld *corev1.Pod
-	for i := range pods {
-		p := &pods[i]
+	for i := range e.pods {
+		p := &e.pods[i]
 		if p.Namespace == "kube-system" && nldPodRe.MatchString(p.Name) &&
 			p.DeletionTimestamp == nil && p.Status.Phase == corev1.PodRunning &&
 			podReady(p) {
@@ -1164,46 +1258,54 @@ func (h *Hygiene) checkCiliumLRPDNS(ctx context.Context, pods []corev1.Pod,
 	if nld == nil {
 		// No Ready node-local-dns pod → nothing owes a datapath
 		// answer (not-Running/NotReady pods are kubelet's problem).
-		h.nldFails = 0
-		h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		c.fails = 0
+		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return
 	}
-	if h.cfg.dnsProbe(h.cfg.LocalDNSProbeAddr, h.cfg.LocalDNSProbeName,
+	if c.h.cfg.dnsProbe(c.h.cfg.LocalDNSProbeAddr, c.h.cfg.LocalDNSProbeName,
 		ciliumProbeTime) {
-		h.nldFails = 0
-		h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		c.fails = 0
+		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return
 	}
-	h.nldFails++
-	if h.nldFails < h.cfg.ConsecNeeded {
-		h.state.AppendLog(fmt.Sprintf(
+	c.fails++
+	if c.fails < c.h.cfg.ConsecNeeded {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns :53 probe of %s failed while %s/%s Ready=True (check %d/%d)",
-			h.cfg.LocalDNSProbeAddr, nld.Namespace, nld.Name,
-			h.nldFails, h.cfg.ConsecNeeded))
-		h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+			c.h.cfg.LocalDNSProbeAddr, nld.Namespace, nld.Name,
+			c.fails, c.h.cfg.ConsecNeeded))
+		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return
 	}
-	if !h.state.RateTrySpend("last-nld-restart", h.cfg.MinRestartInterval) {
-		h.state.AppendLog(fmt.Sprintf(
+	if !c.h.state.RateTrySpend("last-nld-restart", c.h.cfg.MinRestartInterval) {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns :53 probe fails %dx but pod restart in cooldown (<30m), skip",
-			h.nldFails))
-		h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+			c.fails))
+		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return
 	}
 	// Budget spent atomically BEFORE the delete (rate_spend parity).
-	h.state.AppendLog(fmt.Sprintf(
+	c.h.state.AppendLog(fmt.Sprintf(
 		"ACTION: cilium-lrp-dns deleted pod %s/%s - :53 probe failed %dx while Ready=True (LRP datapath wedge)",
-		nld.Namespace, nld.Name, h.nldFails))
-	if err := h.cfg.Client.CoreV1().Pods(nld.Namespace).Delete(ctx, nld.Name,
+		nld.Namespace, nld.Name, c.fails))
+	if err := c.h.cfg.Client.CoreV1().Pods(nld.Namespace).Delete(ctx, nld.Name,
 		metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}); err != nil {
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns delete %s/%s failed: %v",
 			nld.Namespace, nld.Name, err))
 	} else {
-		h.actions.WithLabelValues(checkCiliumLRP, "pod_delete").Inc()
+		c.h.actions.WithLabelValues(checkCiliumLRP, "pod_delete").Inc()
 	}
-	h.nldFails = 0
-	h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+	c.fails = 0
+	c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+}
+
+// checkCiliumLRPDNS forwards to the migrated Check — tests written
+// before the interface still call the old method shape.
+func (h *Hygiene) checkCiliumLRPDNS(ctx context.Context, pods []corev1.Pod,
+	apiOK, workerActive bool) {
+	h.ciliumLRP.Run(ctx, &cycleEnv{
+		pods: pods, apiOK: apiOK, workerActive: workerActive})
 }
 
 // --- Check: spegel-mirror (W7-H4) ---
