@@ -1,11 +1,13 @@
 // The watchdog-state janitor — a self-healing sweep for the two
 // cleanup classes the shell→Go port left behind (field findings,
-// 2026-11). It lives in this package because the conventions it
-// guards are the node-watchdog state-dir contract this file
-// documents, but it is registered as its OWN agent subsystem (not
-// gated on k0sworker): the state dir is shared by workerhygiene,
-// nethealth, controllerhygiene, hostmetrics and apiprober, and ghost
-// units exist on controllers and standalone hubs too.
+// 2026-11). It lives in its own package (extracted from
+// workerhygiene, whose checks produce most of the latches it
+// guards): the conventions it guards are the node-watchdog
+// state-dir contract, not workerhygiene internals, and it is
+// registered as its OWN agent subsystem (not gated on k0sworker):
+// the state dir is shared by workerhygiene, nethealth,
+// controllerhygiene, hostmetrics and apiprober, and ghost units
+// exist on controllers and standalone hubs too.
 //
 // A. Stale state latches — state-* files are latch memory: presence
 // suppresses repeat alerts and drives gates (NPD conditions,
@@ -42,7 +44,7 @@
 // netlink socket (nethealth/routeguard.go) — it never forks an `ip
 // monitor` child — but anything ambiguous is logged `suspect:` and
 // skipped rather than killed.
-package workerhygiene
+package janitor
 
 import (
 	"context"
@@ -76,6 +78,17 @@ const (
 	latchMaxAge = 24 * time.Hour
 )
 
+// Host-fs defaults — duplicated from workerhygiene (which owns the
+// same watchdog-state contract). They only apply when the wiring
+// layer leaves the dep empty; cmd/agent always passes the resolved
+// /host-prefixed paths, so drift between the two copies can't change
+// observable behavior.
+const (
+	defaultWatchdogStateDir = "/host/var/lib/node-watchdog"
+	defaultWatchdogLogFile  = "/host/var/log/node-watchdog.log"
+	defaultProcRoot         = "/proc" // hostPID:true makes pod /proc == host /proc
+)
+
 // Janitor check names — prometheus `check` label + log context.
 const (
 	checkLatchReaper = "latch-reaper"
@@ -86,7 +99,7 @@ const (
 // knownLatchNames — every state-<name> latch an enabled check can
 // currently produce, collected from the real latch-write sites:
 //
-//	workerhygiene (stateEnter callers in this package):
+//	workerhygiene (stateEnter callers):
 //	  pod-teardown-wedged (36), konnectivity-ip-mismatch (30),
 //	  dns-resolv-stale (33), kubelet-runtime-stall (05),
 //	  kubelet-watch-wedge (06), cilium-agent-down (32),

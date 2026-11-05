@@ -9,8 +9,8 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
-// EnvDeps carries the non-env inputs ConfigFromEnv and
-// JanitorConfigFromEnv need — the values cmd/agent used to splice
+// EnvDeps carries the non-env inputs ConfigFromEnv needs — the
+// values cmd/agent used to splice
 // into the configs directly: the shared lazily-built kube clientset
 // (its csOnce — the build-failure → disable-the-subsystem contract
 // stays in the caller, which invokes csOnce BEFORE calling
@@ -137,21 +137,6 @@ func kubeletWatchdogHosts(varsDir, nodeName string) []string {
 	return t.Vars.StrList("systemd_watchdog_hosts")
 }
 
-// JanitorConfigFromEnv resolves the NODE_HOST_AGENT_* knobs the
-// watchdog-state janitor reads and returns a JanitorConfig ready for
-// NewJanitor — the env contract lives in the package, not in
-// cmd/agent. Enabled is always true here: the wire func set it
-// unconditionally and the enable gate
-// (NODE_HOST_AGENT_ENABLE_JANITOR) stays in the caller. Consumes only
-// EnvDeps.WatchdogStateDir, .WatchdogLogFile and .Systemd.
-func JanitorConfigFromEnv(d EnvDeps) JanitorConfig {
-	return JanitorConfig{
-		Enabled:          true,
-		Interval:         envx.Duration("NODE_HOST_AGENT_JANITOR_INTERVAL", defaultJanitorInterval),
-		WatchdogStateDir: d.WatchdogStateDir,
-		WatchdogLogFile:  d.WatchdogLogFile,
-		ProcRoot:         envx.String("NODE_HOST_AGENT_PROC_ROOT", defaultProcRoot),
-		LatchMaxAge:      envx.Duration("NODE_HOST_AGENT_JANITOR_LATCH_MAX_AGE", latchMaxAge),
-		Systemd:          d.Systemd,
-	}
-}
+// The watchdog-state janitor (stale-latch reaper + retired-unit
+// sweep) moved to internal/subsystem/janitor — see
+// janitor.JanitorConfigFromEnv.
