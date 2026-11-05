@@ -1,7 +1,7 @@
 // clockskew.go — W10-KR5 checkClockSkew: chronyc tracking (adjtimex
 // offset fallback) → state-clock-skew (ClockSkewDetected) + a
 // rate-limited `chronyc makestep`. The Wave-10 contract overview
-// lives in wave10.go.
+// lives in kernel_failure_latches.go.
 package hostmetrics
 
 import (

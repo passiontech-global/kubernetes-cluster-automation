@@ -26,6 +26,22 @@ const (
 	maxSeenStates = 256
 )
 
+var (
+	descWatchdog = prometheus.NewDesc(
+		"node_host_agent_watchdog_state",
+		"node-watchdog state-* latch present (1) or previously seen and cleared (0).",
+		[]string{"node", "state"}, nil)
+	// descWatchdogLegacy is the prom_emit node_watchdog_state{signal}
+	// alias — the fluxcd PrometheusRules still alert on it. Emitted
+	// alongside the node_host_agent_* name so the same registry
+	// serves pods AND the standalone textfile writer keeps the
+	// node-exporter contract on out-of-cluster hosts.
+	descWatchdogLegacy = prometheus.NewDesc(
+		"node_watchdog_state",
+		"Signal currently active on node-watchdog (1 = state file exists).",
+		[]string{"signal"}, nil)
+)
+
 // collectWatchdog scans state-* latch files. certDays/certOK fold the
 // agent-computed nebula cert expiry into the latch bookkeeping: the
 // shell module 13 used to own the state-nebula-cert-expiring file —
@@ -70,9 +86,9 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, certDays int64,
 			if active {
 				v = 1
 			}
-			ch <- prometheus.MustNewConstMetric(c.descWatchdog,
+			ch <- prometheus.MustNewConstMetric(descWatchdog,
 				prometheus.GaugeValue, v, c.cfg.NodeName, name)
-			ch <- prometheus.MustNewConstMetric(c.descWatchdogLegacy,
+			ch <- prometheus.MustNewConstMetric(descWatchdogLegacy,
 				prometheus.GaugeValue, v, name)
 		}
 		return
@@ -136,11 +152,11 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, certDays int64,
 		if present[name] {
 			v = 1
 		}
-		ch <- prometheus.MustNewConstMetric(c.descWatchdog,
+		ch <- prometheus.MustNewConstMetric(descWatchdog,
 			prometheus.GaugeValue, v, c.cfg.NodeName, name)
 		// Legacy alias: prom_emit's node_watchdog_state{signal} —
 		// the fluxcd PrometheusRules query this exact series.
-		ch <- prometheus.MustNewConstMetric(c.descWatchdogLegacy,
+		ch <- prometheus.MustNewConstMetric(descWatchdogLegacy,
 			prometheus.GaugeValue, v, name)
 	}
 }

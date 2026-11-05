@@ -1,7 +1,7 @@
 // fsreadonly.go — W10-ST1 updateFSReadonlyEvidence: ro ext4/xfs/btrfs
 // mounts under the PVC provisioner roots parsed out of
 // /proc/<pid>/mounts → state-fs-readonly (FilesystemReadOnly) ahead
-// of statfs. The Wave-10 contract overview lives in wave10.go.
+// of statfs. The Wave-10 contract overview lives in kernel_failure_latches.go.
 package hostmetrics
 
 import (

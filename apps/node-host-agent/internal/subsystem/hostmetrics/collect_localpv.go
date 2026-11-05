@@ -23,6 +23,11 @@ const (
 
 // --- W9: OpenEBS LocalPV per-PVC dir bytes ---
 
+var descLocalPVDirBytes = prometheus.NewDesc(
+	"node_host_agent_localpv_dir_bytes",
+	"Bytes under the OpenEBS LocalPV pvc-* volume dir (bounded walk; emitted per pvc-* dir present).",
+	[]string{"node", "pvc_volume"}, nil)
+
 // collectLocalPVUsage emits node_host_agent_localpv_dir_bytes per
 // pvc-* volume dir under OpenEBSLocalDir. The du walk is cached
 // for LocalPVScanInterval — a node with hundreds of LocalPVs would
@@ -49,7 +54,7 @@ func (c *Collector) collectLocalPVUsage(ch chan<- prometheus.Metric) {
 		// good snapshot rather than blanking every series.
 	}
 	for pvc, b := range bytes {
-		ch <- prometheus.MustNewConstMetric(c.descLocalPVDirBytes,
+		ch <- prometheus.MustNewConstMetric(descLocalPVDirBytes,
 			prometheus.GaugeValue, float64(b), c.cfg.NodeName, pvc)
 	}
 }

@@ -168,6 +168,17 @@ func (c *Collector) warnInotifyTop(kind string, over bool,
 		"kind", kind)
 }
 
+var (
+	descInotifyInst = prometheus.NewDesc(
+		"node_host_agent_inotify_instances_used_ratio",
+		"inotify fds in use / max_user_instances (emitted only when the limit parses and is > 0).",
+		[]string{"node"}, nil)
+	descInotifyWatches = prometheus.NewDesc(
+		"node_host_agent_inotify_watches_used_ratio",
+		"inotify watches in use / max_user_watches (emitted only when the limit parses and is > 0).",
+		[]string{"node"}, nil)
+)
+
 // collectInotify emits the two fill ratios — each only when its own
 // limit file parses (same per-source rule as conntrack).
 func (c *Collector) collectInotify(ch chan<- prometheus.Metric) {
@@ -176,13 +187,13 @@ func (c *Collector) collectInotify(ch chan<- prometheus.Metric) {
 	maxW, watchOK := hostutil.ReadUintFile(c.cfg.InotifyMaxWatchesFile)
 	if instOK && maxI > 0 {
 		r := float64(inst) / float64(maxI)
-		ch <- prometheus.MustNewConstMetric(c.descInotifyInst,
+		ch <- prometheus.MustNewConstMetric(descInotifyInst,
 			prometheus.GaugeValue, r, c.cfg.NodeName)
 		c.warnInotifyTop("instances", r >= inotifyWarnRatio, top)
 	}
 	if watchOK && maxW > 0 {
 		r := float64(watch) / float64(maxW)
-		ch <- prometheus.MustNewConstMetric(c.descInotifyWatches,
+		ch <- prometheus.MustNewConstMetric(descInotifyWatches,
 			prometheus.GaugeValue, r, c.cfg.NodeName)
 		c.warnInotifyTop("watches", r >= inotifyWarnRatio, top)
 	}

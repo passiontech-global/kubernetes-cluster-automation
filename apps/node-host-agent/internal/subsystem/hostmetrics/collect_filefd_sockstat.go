@@ -20,6 +20,43 @@ const (
 
 // --- H6: FD + socket pressure (file-nr, sockstat) ---
 
+var (
+	descFileFDAlloc = prometheus.NewDesc(
+		"node_host_agent_filefd_allocated",
+		"file-nr field 0 — file handles currently allocated.",
+		[]string{"node"}, nil)
+	descFileFDMax = prometheus.NewDesc(
+		"node_host_agent_filefd_maximum",
+		"file-nr field 2 — file handle limit.",
+		[]string{"node"}, nil)
+	descFileFDRatio = prometheus.NewDesc(
+		"node_host_agent_filefd_used_ratio",
+		"file-nr allocated/maximum (emitted only when file-nr parses and max > 0).",
+		[]string{"node"}, nil)
+	descSockTCPInuse = prometheus.NewDesc(
+		"node_host_agent_sockstat_tcp_inuse",
+		"sockstat TCP inuse — TCP sockets in use.",
+		[]string{"node"}, nil)
+	descSockTCPOrphan = prometheus.NewDesc(
+		"node_host_agent_sockstat_tcp_orphan",
+		"sockstat TCP orphan — orphaned (not attached to a socket) TCP connections.",
+		[]string{"node"}, nil)
+	descSockTCPTW = prometheus.NewDesc(
+		"node_host_agent_sockstat_tcp_tw",
+		"sockstat TCP tw — TCP sockets in TIME_WAIT.",
+		[]string{"node"}, nil)
+	descSockUsed = prometheus.NewDesc(
+		"node_host_agent_sockstat_sockets_used",
+		"sockstat 'sockets: used' — total sockets in use across protocols.",
+		[]string{"node"}, nil)
+	// W8: TCP close_wait — sockets stuck half-closed waiting for
+	// local close().
+	descSockTCPCW = prometheus.NewDesc(
+		"node_host_agent_sockstat_tcp_close_wait",
+		"sockstat TCP close_wait — sockets stuck half-closed waiting for local close().",
+		[]string{"node"}, nil)
+)
+
 // collectFileFD parses /proc/sys/fs/file-nr — "allocated unused
 // max" (fields 0 and 2; the middle "unused" field is always ~0 on
 // modern kernels). Absent/malformed → no series.
@@ -37,12 +74,12 @@ func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
 	if errA != nil || errM != nil {
 		return
 	}
-	ch <- prometheus.MustNewConstMetric(c.descFileFDAlloc,
+	ch <- prometheus.MustNewConstMetric(descFileFDAlloc,
 		prometheus.GaugeValue, alloc, c.cfg.NodeName)
-	ch <- prometheus.MustNewConstMetric(c.descFileFDMax,
+	ch <- prometheus.MustNewConstMetric(descFileFDMax,
 		prometheus.GaugeValue, maxFD, c.cfg.NodeName)
 	if maxFD > 0 {
-		ch <- prometheus.MustNewConstMetric(c.descFileFDRatio,
+		ch <- prometheus.MustNewConstMetric(descFileFDRatio,
 			prometheus.GaugeValue, alloc/maxFD, c.cfg.NodeName)
 	}
 }
@@ -105,23 +142,23 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 		}
 	}
 	if sockUsedOK {
-		ch <- prometheus.MustNewConstMetric(c.descSockUsed,
+		ch <- prometheus.MustNewConstMetric(descSockUsed,
 			prometheus.GaugeValue, sockUsed, c.cfg.NodeName)
 	}
 	if tcpInuseOK {
-		ch <- prometheus.MustNewConstMetric(c.descSockTCPInuse,
+		ch <- prometheus.MustNewConstMetric(descSockTCPInuse,
 			prometheus.GaugeValue, tcpInuse, c.cfg.NodeName)
 	}
 	if tcpOrphanOK {
-		ch <- prometheus.MustNewConstMetric(c.descSockTCPOrphan,
+		ch <- prometheus.MustNewConstMetric(descSockTCPOrphan,
 			prometheus.GaugeValue, tcpOrphan, c.cfg.NodeName)
 	}
 	if tcpTWOK {
-		ch <- prometheus.MustNewConstMetric(c.descSockTCPTW,
+		ch <- prometheus.MustNewConstMetric(descSockTCPTW,
 			prometheus.GaugeValue, tcpTW, c.cfg.NodeName)
 	}
 	if tcpCWOK {
-		ch <- prometheus.MustNewConstMetric(c.descSockTCPCW,
+		ch <- prometheus.MustNewConstMetric(descSockTCPCW,
 			prometheus.GaugeValue, tcpCW, c.cfg.NodeName)
 	}
 }

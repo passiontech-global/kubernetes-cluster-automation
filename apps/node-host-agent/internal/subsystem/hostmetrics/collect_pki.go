@@ -29,6 +29,11 @@ var defaultPKIHostPaths = []string{
 
 // --- 2.4: on-disk PKI cert expiry ---
 
+var descPKIDays = prometheus.NewDesc(
+	"node_host_agent_pki_cert_days_left",
+	"Days until the earliest notAfter of the on-disk PKI cert at this path (emitted only when a cert parses).",
+	[]string{"node", "path"}, nil)
+
 // pkiCertFiles expands one PKICertPaths entry: a directory yields
 // its *.crt/*.pem children one level deep, a regular file is taken
 // as-is.
@@ -109,7 +114,7 @@ func (c *Collector) collectPKICerts(ch chan<- prometheus.Metric) {
 			if !strings.HasPrefix(label, "/") {
 				label = "/" + label
 			}
-			ch <- prometheus.MustNewConstMetric(c.descPKIDays,
+			ch <- prometheus.MustNewConstMetric(descPKIDays,
 				prometheus.GaugeValue, days, c.cfg.NodeName, label)
 		}
 	}

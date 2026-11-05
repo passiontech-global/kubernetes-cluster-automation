@@ -1,9 +1,9 @@
-// wave10.go — shared Wave-10 kernel deep-failure contract: the
-// cross-domain constants, the host-command seam and the state-dir
-// latch helpers the domain files (kmsg.go, pidfd.go, clockskew.go,
-// fsreadonly.go) share. Split out of kernel_failure_latches.go —
-// the latch ticker itself (refreshLatches) stays in latches.go and
-// calls into the domain updaters.
+// kernel_failure_latches.go — shared kernel deep-failure latch
+// contract: the cross-domain constants, the host-command seam and
+// the state-dir latch helpers the domain files (kmsg.go, pidfd.go,
+// clockskew.go, fsreadonly.go) share. The latch ticker itself
+// (refreshLatches) stays in latches.go and calls into the domain
+// updaters.
 package hostmetrics
 
 import (
@@ -17,9 +17,9 @@ import (
 )
 
 // ===========================================================================
-// Wave-10 — kernel deep-failure modes (W10-KR1/KR2/KR5, W10-ST1)
+// Kernel deep-failure modes (W10-KR1/KR2/KR5, W10-ST1)
 //
-// The domain files extend the latch ticker with the Wave-10 contract:
+// The domain files extend the latch ticker with this contract:
 //
 //   - W10-KR1 checkKernelDmesg (kmsg.go): /dev/kmsg drain (dmesg -T
 //     fallback) classifying filesystem/block errors, nf_conntrack
@@ -31,8 +31,9 @@ import (
 //     utilization ratios → state-pid-fd-pressure
 //     (KernelResourceExhaustion) + the node_agent_*_utilization_ratio
 //     textfile gauges (the W10 metric channel — same convention the
-//     controllerhygiene textfile channel uses; prometheus descs
-//     can't be added outside hostmetrics.go's New()).
+//     controllerhygiene textfile channel uses; a new prometheus desc
+//     would mean a descTable row in hostmetrics.go, the textfile
+//     channel needs no registry change).
 //   - W10-KR5 checkClockSkew (clockskew.go): chronyc tracking
 //     (adjtimex offset fallback) → state-clock-skew
 //     (ClockSkewDetected) + a rate-limited `chronyc makestep`.
@@ -42,7 +43,7 @@ import (
 //     (FilesystemReadOnly) ahead of statfs.
 // ===========================================================================
 
-// --- shared Wave-10 helpers ---
+// --- shared kernel-failure helpers ---
 
 // kmsgFsErrorFile is the cross-domain evidence marker: kmsg.go's
 // noteKernelFsError writes it and fsreadonly.go's
@@ -90,7 +91,7 @@ func (l *Latches) ensureStateLatch(path, name, evidence string) {
 		"path", path)
 }
 
-// --- small Wave-10 helpers (uniquely named per file rules) ---
+// --- small shared helpers (uniquely named per file rules) ---
 //
 // The last-* rate budgets (conntrackBumpBudgetFile,
 // clockStepBudgetFile) go through l.c.state — the shared hoststate

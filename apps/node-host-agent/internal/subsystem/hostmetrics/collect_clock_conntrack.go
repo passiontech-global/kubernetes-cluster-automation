@@ -24,6 +24,19 @@ const (
 
 // --- H1: clock sync (adjtimex) ---
 
+// The gray-failure descs all carry the node label so a federated
+// store can attribute them back to the agent host.
+var (
+	descClockUnsync = prometheus.NewDesc(
+		"node_host_agent_clock_unsynchronized",
+		"Kernel clock reports STA_UNSYNC via adjtimex (1 = not synchronized; emitted only when the syscall succeeds).",
+		[]string{"node"}, nil)
+	descClockEstErr = prometheus.NewDesc(
+		"node_host_agent_clock_estimated_error_seconds",
+		"adjtimex Timex.Esterror exported as seconds — the kernel's own bound on clock error.",
+		[]string{"node"}, nil)
+)
+
 // collectClock emits the clock-sync gauges only when adjtimex
 // succeeds — an absent series means the syscall failed
 // (inconclusive), never a fake "synchronized" 0.
@@ -36,14 +49,38 @@ func (c *Collector) collectClock(ch chan<- prometheus.Metric) {
 	if tx.Status&unix.STA_UNSYNC != 0 {
 		unsync = 1
 	}
-	ch <- prometheus.MustNewConstMetric(c.descClockUnsync,
+	ch <- prometheus.MustNewConstMetric(descClockUnsync,
 		prometheus.GaugeValue, unsync, c.cfg.NodeName)
 	// Timex.Esterror is microseconds — export seconds.
-	ch <- prometheus.MustNewConstMetric(c.descClockEstErr,
+	ch <- prometheus.MustNewConstMetric(descClockEstErr,
 		prometheus.GaugeValue, float64(tx.Esterror)/1e6, c.cfg.NodeName)
 }
 
 // --- H2: conntrack table pressure ---
+
+var (
+	descCtEntries = prometheus.NewDesc(
+		"node_host_agent_conntrack_entries",
+		"nf_conntrack_count — conntrack table entries currently tracked.",
+		[]string{"node"}, nil)
+	descCtLimit = prometheus.NewDesc(
+		"node_host_agent_conntrack_limit",
+		"nf_conntrack_max — conntrack table capacity.",
+		[]string{"node"}, nil)
+	descCtRatio = prometheus.NewDesc(
+		"node_host_agent_conntrack_used_ratio",
+		"Conntrack table fill ratio (entries/limit; emitted only when both files parse and limit > 0).",
+		[]string{"node"}, nil)
+	// W7-H5 conntrack per-CPU stat counters + ARP table fill.
+	descCtInsertFail = prometheus.NewDesc(
+		"node_host_agent_conntrack_insert_failed_total",
+		"Sum of the insert_failed column across all CPU rows of /proc/net/stat/nf_conntrack (UDP tuple-collision drops).",
+		[]string{"node"}, nil)
+	descCtDrops = prometheus.NewDesc(
+		"node_host_agent_conntrack_drops_total",
+		"Sum of the drop column across all CPU rows of /proc/net/stat/nf_conntrack.",
+		[]string{"node"}, nil)
+)
 
 // collectConntrack emits entries/limit each only when its own file
 // parses (a node without the conntrack module has no files → absent
@@ -53,15 +90,15 @@ func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
 	count, countOK := hostutil.ReadUintFile(c.cfg.ConntrackCountFile)
 	limit, limitOK := hostutil.ReadUintFile(c.cfg.ConntrackMaxFile)
 	if countOK {
-		ch <- prometheus.MustNewConstMetric(c.descCtEntries,
+		ch <- prometheus.MustNewConstMetric(descCtEntries,
 			prometheus.GaugeValue, float64(count), c.cfg.NodeName)
 	}
 	if limitOK {
-		ch <- prometheus.MustNewConstMetric(c.descCtLimit,
+		ch <- prometheus.MustNewConstMetric(descCtLimit,
 			prometheus.GaugeValue, float64(limit), c.cfg.NodeName)
 	}
 	if countOK && limitOK && limit > 0 {
-		ch <- prometheus.MustNewConstMetric(c.descCtRatio,
+		ch <- prometheus.MustNewConstMetric(descCtRatio,
 			prometheus.GaugeValue,
 			float64(count)/float64(limit), c.cfg.NodeName)
 	}
@@ -72,11 +109,11 @@ func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
 	if st, ok := conntrackStatCounters(c.cfg.ConntrackStatFile,
 		"insert_failed", "drop"); ok {
 		if v, found := st["insert_failed"]; found {
-			ch <- prometheus.MustNewConstMetric(c.descCtInsertFail,
+			ch <- prometheus.MustNewConstMetric(descCtInsertFail,
 				prometheus.CounterValue, float64(v), c.cfg.NodeName)
 		}
 		if v, found := st["drop"]; found {
-			ch <- prometheus.MustNewConstMetric(c.descCtDrops,
+			ch <- prometheus.MustNewConstMetric(descCtDrops,
 				prometheus.CounterValue, float64(v), c.cfg.NodeName)
 		}
 	}
@@ -123,6 +160,11 @@ func conntrackStatCounters(path string, keys ...string) (map[string]uint64, bool
 	return out, true
 }
 
+var descARPEntries = prometheus.NewDesc(
+	"node_host_agent_arp_entries",
+	"Entries in /proc/net/arp — ARP neighbour-table fill vs gc_thresh headroom.",
+	[]string{"node"}, nil)
+
 // collectARP counts /proc/net/arp entry rows (header skipped) — the
 // ARP neighbour-table fill half of W7-H5 (gc_thresh overflow drops
 // outbound packets while every other signal stays green). Emits
@@ -139,6 +181,6 @@ func (c *Collector) collectARP(ch chan<- prometheus.Metric) {
 		}
 		n++
 	}
-	ch <- prometheus.MustNewConstMetric(c.descARPEntries,
+	ch <- prometheus.MustNewConstMetric(descARPEntries,
 		prometheus.GaugeValue, n, c.cfg.NodeName)
 }
