@@ -154,6 +154,14 @@ var knownLatchNames = map[string]bool{
 	"cp-component-frozen":      true, // controllerhygiene KCM/scheduler freeze (W8-CP3)
 	"kernel-slab-leak":         true, // workerhygiene SUnreclaim guard (W9-KR3)
 	"nebula-pmtu-blackhole":    true, // nethealth DF PMTU probe (W9-NM1)
+	// W10 latch names — same reap rule either way; listed so the
+	// janitor log classifies them under `rule=` correctly.
+	"pid-fd-pressure":          true, // hostmetrics KR2 pid/thread/fd pressure
+	"clock-skew":               true, // hostmetrics KR5 chrony/NTP skew
+	"fs-readonly":              true, // hostmetrics ST1 ro sub-mount prober
+	"containerd-corrupt":       true, // workerhygiene KR3 BoltDB/orphan shims
+	"kubeconfig-cert-expiring": true, // cpwave CP5 embedded kubeconfig certs
+	"nebula-mtu-blackhole":     true, // nethealth routeguard NM4 DF-probe MTU
 }
 
 // knownLatchPrefixes — parameterized latch families whose suffix is

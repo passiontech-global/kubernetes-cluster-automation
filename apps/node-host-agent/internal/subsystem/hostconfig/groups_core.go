@@ -220,6 +220,22 @@ TasksMax=infinity
 		}
 	}
 
+	// W10-KR4 k0scontroller limits drop-in — same fd/task headroom as
+	// the worker unit so systemd never caps the controller's thread
+	// count below kernel pid_max during reconcile bursts.
+	if c.controller() {
+		c.r.ensureDir("/etc/systemd/system/k0scontroller.service.d", 0o755)
+		if ch, _ := r.writeManaged("/etc/systemd/system/k0scontroller.service.d/10-limits.conf",
+			[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for k0s controller
+[Service]
+LimitNOFILE=%s
+LimitNPROC=infinity
+TasksMax=infinity
+`, c.v("k0scontroller_limit_nofile"))), 0o644); ch {
+			r.daemonReload(ctx)
+		}
+	}
+
 	// hostname -> 127.0.1.1 in /etc/hosts (lineinfile parity).
 	hosts, hostsErr := os.ReadFile(r.hp("/etc/hosts"))
 	if hostsErr != nil && !os.IsNotExist(hostsErr) {
@@ -508,6 +524,13 @@ func (c *cyc) t16Pairs() [][2]string {
 		// listener's next bind or blackholes its replies.
 		{"net.ipv4.ip_local_reserved_ports", "10248-10260,20256,30000-32767,45670,51871"},
 		{"fs.file-max", "2097152"},
+		// W10-KR2: pid_max headroom for the thread/FD exhaustion
+		// guard (node_agent_threads_utilization_ratio latch).
+		{"kernel.pid_max", "4194304"},
+		// W10-NM2: QUIC (cloudflared) UDP buffers — the 208KB
+		// default drops edge streams under load.
+		{"net.core.rmem_max", "7500000"},
+		{"net.core.wmem_max", "7500000"},
 		{"vm.max_map_count", "524288"},
 		{"net.ipv4.neigh.default.gc_thresh1", "8192"},
 		{"net.ipv4.neigh.default.gc_thresh2", "32768"},

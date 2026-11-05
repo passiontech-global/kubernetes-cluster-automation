@@ -187,6 +187,9 @@ func TestAllConditionDefaults(t *testing.T) {
 		"ClockUnsynchronized": {"ClockSynchronized", "kernel clock disciplined (adjtimex synced, esterror <= 500ms)"},
 		"KernelSlabLeak":      {"KernelSlabNormal", "unreclaimable kernel slab below pressure threshold"},
 		"NebulaPMTUBlackhole": {"NebulaPMTUOk", "nebula overlay passes DF probes at probe size"},
+		// Wave-10 latch→condition surface.
+		"KernelResourceExhaustion": {"KernelResourcesNormal", "kernel threads/pids and fd table below exhaustion threshold"},
+		"ClockSkewDetected":        {"ClockSkewOk", "clock offset within 2.0s of NTP source"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

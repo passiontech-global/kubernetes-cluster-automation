@@ -1,11 +1,13 @@
 package hostmetrics
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -38,7 +40,7 @@ func fixture(t *testing.T) (Config, map[string]string) {
 			t.Fatal(err)
 		}
 	}
-	return Config{
+	cfg := Config{
 		NodeName:         "node-a",
 		WatchdogStateDir: dirs["state"],
 		SysClassNet:      dirs["sysnet"],
@@ -84,7 +86,25 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		// Never wait the real 2s in tests — the stall tests inject
 		// their own hanging statfsFn against this shortened deadline.
 		fsProbeTimeout: 50 * time.Millisecond,
-	}, dirs
+	}
+	fixtureSeams(root)
+	return cfg, dirs
+}
+
+// init pins the Wave-10 seams to a nonexistent path for the whole
+// test binary — fixture() re-points them at its own temp root per
+// test; tests that exercise kmsg/dmesg/chronyc re-point the vars
+// themselves after calling fixture(). Without this every
+// refreshLatches would open the REAL /dev/kmsg and exec REAL
+// dmesg/chronyc on the test host.
+func fixtureSeams(root string) {
+	kmsgDevicePaths = func(string) []string {
+		return []string{filepath.Join(root, "dev", "kmsg")}
+	}
+	w10RunCmd = func(context.Context, ...string) (string, error) {
+		return "", errors.New("exec disabled in tests")
+	}
+	w10TextfileDirOverride = ""
 }
 
 func write(t *testing.T, path, content string) {

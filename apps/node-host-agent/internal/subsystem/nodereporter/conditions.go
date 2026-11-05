@@ -80,11 +80,15 @@ var conditionDefs = []conditionDef{
 		stateKey:       "kubelet-runtime-stall",
 		// BUG-H4: the PLEG/syncloop freeze and the hung containerd
 		// socket are runtime stalls too — every latch must light
-		// the condition.
+		// the condition. W10-KR6 adds the kubelet watch-stream wedge
+		// and the containerd meta.db corruption latch (restart can't
+		// recover a corrupt store — same remediation class).
 		altStateKeys: []string{
 			"kubelet-healthz-down",
 			"kubelet-syncloop-down",
 			"containerd-sock-down",
+			"kubelet-watch-wedge",
+			"containerd-corrupt",
 		},
 	},
 	{
@@ -130,11 +134,16 @@ var conditionDefs = []conditionDef{
 		// Agent-added (W5.3): hostmetrics' statfs probes found a
 		// mount reporting ST_RDONLY — the fs remounted read-only
 		// (kernel error path) and every write on it silently fails.
+		// W10-ST1/KR1: the same condition also trips on the
+		// state-fs-readonly evidence latch — a PVC backing mount
+		// found ro in /proc/1/mounts or a fresh kernel fs-error
+		// record, before statfs ever sees ST_RDONLY.
 		typ:            "FilesystemReadOnly",
 		defaultReason:  "FilesystemReadWrite",
 		defaultMessage: "all probed filesystems are read-write",
 		problemReason:  "FilesystemReadOnlyDetected",
 		stateKey:       "filesystem-readonly",
+		altStateKeys:   []string{"fs-readonly"},
 	},
 	{
 		// Agent-added (W7-H1): workerhygiene's D-state storm
@@ -276,6 +285,29 @@ var conditionDefs = []conditionDef{
 		defaultMessage: "nebula overlay passes DF probes at probe size",
 		problemReason:  "NebulaPMTUBlackholeDetected",
 		stateKey:       "nebula-pmtu-blackhole",
+	},
+	// --- Wave-10 latch→condition surface ---
+	{
+		// hostmetrics' W10-KR2 kernel resource exhaustion guard —
+		// threads/pid or fd utilization above 0.90 for 3 consecutive
+		// scrapes. PID/FD exhaustion precedes fork() failures and the
+		// classic "can't start new process" node outage.
+		typ:            "KernelResourceExhaustion",
+		defaultReason:  "KernelResourcesNormal",
+		defaultMessage: "kernel threads/pids and fd table below exhaustion threshold",
+		problemReason:  "KernelResourceExhaustionDetected",
+		stateKey:       "pid-fd-pressure",
+	},
+	{
+		// nethealth's W10-KR5 clock-skew guard — chronyc/adjtimex
+		// offset above 2.0s for 5 consecutive cycles. Distinct from
+		// ClockUnsynchronized: the clock HAS a sync source but sits
+		// far enough off to break cert validity/raft leases.
+		typ:            "ClockSkewDetected",
+		defaultReason:  "ClockSkewOk",
+		defaultMessage: "clock offset within 2.0s of NTP source",
+		problemReason:  "ClockSkewDetected",
+		stateKey:       "clock-skew",
 	},
 }
 
