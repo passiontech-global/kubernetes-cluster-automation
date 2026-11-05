@@ -25,3 +25,13 @@ tasks:
     toolchains: 'system'
     inputs:
       - '**/*.go'
+
+  # golangci-lint (pinned in mise.toml). Advisory for now — not wired
+  # into the `moon ci` gate; run locally with `moon run :lint`.
+  lint:
+    command: 'golangci-lint run ./...'
+    toolchains: 'system'
+    inputs:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
