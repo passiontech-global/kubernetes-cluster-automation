@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -337,40 +336,7 @@ func TestIsEnabledAcceptsEnabledVocabulary(t *testing.T) {
 	}
 }
 
-// TestWaitDelayUnsticksInheritedPipe: a daemonized grandchild
-// inheriting the stdout pipe holds EOF open after the child exits —
-// without WaitDelay the runner blocks in ReadAll past the timeout.
-// The real exec seam (nil RunCmd/RunCmdCombined) is exercised here,
-// HostRoot "/" so no nsenter wrapper is needed.
-func TestWaitDelayUnsticksInheritedPipe(t *testing.T) {
-	if _, err := exec.LookPath("sh"); err != nil {
-		t.Skip("no sh on PATH")
-	}
-	c := New(Config{HostRoot: "/"})
-	start := time.Now()
-	// `sleep 10 &` keeps the stdout pipe open well past cmdWaitDelay
-	// (5s) after sh exits; WaitDelay must force it closed,
-	// surfacing ErrWaitDelay with the partial output intact.
-	out, err := c.Exec(context.Background(), "sh", "-c", "sleep 10 & echo done")
-	if !errors.Is(err, exec.ErrWaitDelay) {
-		t.Fatalf("exec err=%v want ErrWaitDelay", err)
-	}
-	if !strings.Contains(out, "done") {
-		t.Fatalf("out=%q want partial output before the stuck pipe", out)
-	}
-	if took := time.Since(start); took > cmdWaitDelay+3*time.Second {
-		t.Fatalf("took %v — pipe-close grace not enforced", took)
-	}
-
-	start = time.Now()
-	out, err = c.ExecCombined(context.Background(), "sh", "-c", "sleep 10 >&2 & echo done")
-	if !errors.Is(err, exec.ErrWaitDelay) {
-		t.Fatalf("execCombined err=%v want ErrWaitDelay", err)
-	}
-	if !strings.Contains(out, "done") {
-		t.Fatalf("combined out=%q", out)
-	}
-	if took := time.Since(start); took > cmdWaitDelay+3*time.Second {
-		t.Fatalf("combined took %v — pipe-close grace not enforced", took)
-	}
-}
+// NOTE: the inherited-pipe WaitDelay test lives in
+// platform/hostexec now — that package owns the default
+// exec.CommandContext runners, the capped output sink and the
+// pipe-close grace bound.
