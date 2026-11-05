@@ -73,7 +73,7 @@ func normalizeCtrAddr(a string) string {
 // root dir, not inside it).
 func (h *Hygiene) ctrShimSockets() map[string]bool {
 	out := map[string]bool{}
-	if s := normalizeCtrAddr(hostSidePath(h.cfg.ContainerdSocket)); s != "" {
+	if s := normalizeCtrAddr(hostSidePath(h.cfg.Ctr.Socket)); s != "" {
 		out[s] = true
 	}
 	derived := filepath.Join(
@@ -181,7 +181,7 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 	nShim := 0
 	pids := e.pidsOnce()
 	for _, pid := range pids {
-		if nShim >= c.h.cfg.MaxShimKill {
+		if nShim >= c.h.cfg.Ctr.MaxShimKill {
 			break
 		}
 		argv := c.h.proc.Cmdline(pid)
@@ -212,7 +212,7 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.state.AppendLog(fmt.Sprintf(
 			"ACTION: kill orphan shim pid=%d id=%.12s ns=%s - task dir missing",
 			pid, sid, ns))
-		if err := c.h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
+		if err := c.h.cfg.Seams.killFn(pid, syscall.SIGKILL); err != nil {
 			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: kill orphan shim pid=%d failed: %v", pid, err))
 		}
@@ -276,9 +276,9 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 	nClean := 0
 	for _, d := range wedged {
 		id := filepath.Base(d)
-		if nClean >= c.h.cfg.MaxCtrTaskClean {
+		if nClean >= c.h.cfg.Ctr.MaxTaskClean {
 			c.h.state.AppendLog(fmt.Sprintf("suspect: ctr-task-wedged still pending cap=%d",
-				c.h.cfg.MaxCtrTaskClean))
+				c.h.cfg.Ctr.MaxTaskClean))
 			break
 		}
 		// Marker removal only once the dir is actually being
@@ -293,7 +293,7 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 				pid > 0 && c.h.pidLive(pid) {
 				c.h.state.AppendLog(fmt.Sprintf(
 					"ACTION: kill -9 init %d of %.12s - log.json missing", pid, id))
-				if err := c.h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
+				if err := c.h.cfg.Seams.killFn(pid, syscall.SIGKILL); err != nil {
 					c.h.state.AppendLog(fmt.Sprintf(
 						"suspect: kill init %d of %.12s failed: %v", pid, id, err))
 				}
@@ -303,7 +303,7 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 		// the task id, then remove the dir — containerd GCs the task
 		// record once the shim is gone.
 		for _, pid := range c.h.pidsWithCmdline(id, pids) {
-			if err := c.h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
+			if err := c.h.cfg.Seams.killFn(pid, syscall.SIGKILL); err != nil {
 				c.h.state.AppendLog(fmt.Sprintf(
 					"suspect: kill leftover pid=%d holding task %.12s failed: %v",
 					pid, id, err))
@@ -449,7 +449,7 @@ func (c *ctrImagesCheck) Run(ctx context.Context, e *cycleEnv) {
 	// Budget spent atomically BEFORE acting (lib.sh rate_spend
 	// parity): a failed rm still consumed the budget.
 	for _, img := range images {
-		if err := c.h.cfg.ctrRmImage(ctx, img); err != nil {
+		if err := c.h.cfg.Seams.ctrRmImage(ctx, img); err != nil {
 			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: ctr image rm %s failed: %v", img, err))
 			continue
@@ -489,12 +489,12 @@ func (c *ingestGCCheck) Run(ctx context.Context, e *cycleEnv) {
 	// free-side field is Bavail, not Bfree: kubelet/containerd run
 	// unprivileged against the root-reserved block margin, so
 	// unprivileged-free is the signal that trips ENOSPC first.
-	if err := c.h.cfg.statfsFn(c.h.cfg.K0sDataDir, &st); err == nil &&
+	if err := c.h.cfg.Seams.statfsFn(c.h.cfg.Disk.K0sDataDir, &st); err == nil &&
 		st.Blocks > 0 && st.Bavail <= st.Blocks {
 		used := float64(st.Blocks-st.Bavail) / float64(st.Blocks)
-		diskHigh = used > c.h.cfg.K0sDiskHighWatermark
+		diskHigh = used > c.h.cfg.Disk.HighWatermark
 	}
-	due := c.h.cfg.nowFn().Sub(c.lastScan) >= c.h.cfg.CtrIngestScanInterval
+	due := c.h.cfg.Seams.nowFn().Sub(c.lastScan) >= c.h.cfg.Ctr.IngestScanInterval
 	if !diskHigh && !due {
 		c.h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
 		return
@@ -506,12 +506,12 @@ func (c *ingestGCCheck) Run(ctx context.Context, e *cycleEnv) {
 	if diskHigh {
 		c.h.maybePruneContentStore(ctx)
 	}
-	entries, err := os.ReadDir(c.h.cfg.CtrIngestDir)
+	entries, err := os.ReadDir(c.h.cfg.Ctr.IngestDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Absent dir = nothing to scan — stamp like a clean
 			// walk so the 6h cadence still applies.
-			c.lastScan = c.h.cfg.nowFn()
+			c.lastScan = c.h.cfg.Seams.nowFn()
 			c.h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
 			return
 		}
@@ -520,20 +520,20 @@ func (c *ingestGCCheck) Run(ctx context.Context, e *cycleEnv) {
 		// CtrIngestScanInterval (6h).
 		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: ctr ingest dir %s unreadable: %v — ingest GC skipped",
-			c.h.cfg.CtrIngestDir, err))
+			c.h.cfg.Ctr.IngestDir, err))
 		c.h.cycles.WithLabelValues(checkIngestGC, "abort").Inc()
 		return
 	}
-	c.lastScan = c.h.cfg.nowFn()
-	now := c.h.cfg.nowFn()
+	c.lastScan = c.h.cfg.Seams.nowFn()
+	now := c.h.cfg.Seams.nowFn()
 	n := 0
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		if n >= c.h.cfg.MaxCtrTaskClean {
+		if n >= c.h.cfg.Ctr.MaxTaskClean {
 			c.h.state.AppendLog(fmt.Sprintf(
-				"suspect: ctr-ingest-gc still pending cap=%d", c.h.cfg.MaxCtrTaskClean))
+				"suspect: ctr-ingest-gc still pending cap=%d", c.h.cfg.Ctr.MaxTaskClean))
 			break
 		}
 		fi, err := e.Info()
@@ -541,12 +541,12 @@ func (c *ingestGCCheck) Run(ctx context.Context, e *cycleEnv) {
 			continue
 		}
 		age := now.Sub(fi.ModTime())
-		if age < c.h.cfg.CtrIngestMaxAge {
+		if age < c.h.cfg.Ctr.IngestMaxAge {
 			continue
 		}
 		ref := e.Name()
-		d := filepath.Join(c.h.cfg.CtrIngestDir, ref)
-		if rerr := c.h.cfg.ctrRmIngest(ctx, ref); rerr != nil {
+		d := filepath.Join(c.h.cfg.Ctr.IngestDir, ref)
+		if rerr := c.h.cfg.Seams.ctrRmIngest(ctx, ref); rerr != nil {
 			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: ctr content ingest rm %s failed: %v — removing dir directly", ref, rerr))
 		}
@@ -586,7 +586,7 @@ func (h *Hygiene) maybePruneContentStore(ctx context.Context) {
 	if !h.state.RateTrySpend("last-content-gc", contentPruneInterval) {
 		return
 	}
-	if err := h.cfg.ctrPruneContent(ctx); err != nil {
+	if err := h.cfg.Seams.ctrPruneContent(ctx); err != nil {
 		h.state.AppendLog(fmt.Sprintf(
 			"suspect: ctr-ingest-gc content prune failed: %v", err))
 		return

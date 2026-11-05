@@ -101,33 +101,24 @@ package workerhygiene
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/procfs"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // Defaults mirror the shell modules + the DaemonSet host mounts.
@@ -325,689 +316,6 @@ const (
 // nodereporter journal monitors are blind until it clears.
 const stateJournalUnreadable = "journal-unreadable"
 
-// Config carries the hygiene knobs — all test-injectable.
-type Config struct {
-	NodeName          string        // this node (spec.nodeName)
-	Interval          time.Duration // check cadence
-	Enabled           bool          // false → Run idles until ctx done
-	WatchdogStateDir  string        // state-*/last-*/consecutive-* files
-	WatchdogLogFile   string        // appended watchdog log (NPD filelog)
-	ProcRoot          string        // host /proc
-	CtrTaskRoot       string        // containerd runtime-v2 task dirs
-	SandboxCtlRoot    string        // sandbox-controller shim dirs
-	HostResolvConf    string        // host resolv.conf (dns drift baseline)
-	K0sWorkerUnitFile string        // presence gates all checks
-	KubeletPodsDir    string        // host kubelet pod dirs (05/06)
-	KubeletHealthzURL string        // kubelet :10250 probe (05)
-	CiliumHealthzURL  string        // cilium-agent :9879 probe (32)
-	CiliumSocket      string        // cilium agent unix socket (35)
-	Client            kubernetes.Interface
-	// Systemd drives host restarts/probes (nsenter-wrapped inside the
-	// container). nil → all systemd-dependent checks degrade to the
-	// "cannot determine → keep" branch (log-only).
-	Systemd *systemd.Client
-	// Watchdog is the parsed node-watchdog.conf — feeds the runner's
-	// per-module kill switch (WD_SIG_<NAME>=off) and, through
-	// APIBackendIPs, the upstream-stale gate of the watch-wedge
-	// check. nil → every check runs (pre-conf behaviour).
-	Watchdog *watchdogconf.Config
-	// WatchdogSrc, when set, re-reads the conf every Cycle so
-	// hostconfig rewrites (WD_SIG_*, API_BACKENDS) apply live —
-	// APIBackends below is then refreshed from the file each cycle.
-	WatchdogSrc *watchdogconf.Reloader
-	// APIBackends are the "ip[:port]" apiserver endpoints module 06
-	// gates on — wired from watchdogconf.APIBackendIPs() by main
-	// (kept current by WatchdogSrc when set).
-	APIBackends []string
-	// KubeletWatchdogHosts is the cluster var systemd_watchdog_hosts —
-	// the T15 opt-in host list the shell feeder unit gated on (wired
-	// by main from the vars dir / env). The feeder activates when this
-	// node is listed here OR by default on any worker node
-	// (K0sWorkerUnitFile present) — in the agent port the T15 pilot
-	// graduated fleet-wide, so an empty list never disables it.
-	KubeletWatchdogHosts []string
-	KubeletWdInterval    time.Duration // feeder probe cadence (15s)
-	KubeletWdMaxFail     int           // consecutive fails → remediate gates (4 = ~60s)
-	KubeletWdProbeURL    string        // kubelet :10248 healthz — body must be "ok"
-	// KubeletWdReprobeGap is the sleep between the remediate Gate-0
-	// re-probes — the shell's "probe twice 3s apart" self-correct
-	// window before any gate runs.
-	KubeletWdReprobeGap time.Duration
-	// APIFallbackURL is the G4 last-resort /livez target when no
-	// API backends are configured (worker-local api-local-lb :7443).
-	APIFallbackURL     string
-	StuckDeleteAge     time.Duration // Terminating age → force-delete candidate
-	StuckWedgeAge      time.Duration // Terminating age + task dir → wedge latch
-	KubeletWatchMinAge time.Duration // pod age without pod dir → watch wedge (06)
-	MaxForceDelete     int           // force-delete cap per cycle
-	MaxCtrTaskClean    int           // wedged ctr task dir cap per cycle (31)
-	MaxShimKill        int           // orphan shim kill cap per cycle (31)
-	ConsecNeeded       int           // consecutive suspect cycles before action
-	MinRestartInterval time.Duration // rate-limit budget for recreating actions
-	ProbeGap           time.Duration // sleep between probe retries (05/32)
-	// Wave-2 checks: A4 syncloop/containerd probes, A3 ingest GC,
-	// A2 zombie storm, A5 journald integrity, B1 cilium-envoy, B4
-	// MTU drift — all default-injected like the other knobs.
-	KubeletSyncloopURL string // kubelet :10250 /healthz/syncloop (PLEG)
-	// KubeletTokenPath is the bearer-token file attached to kubelet's
-	// secure-port probes — kubelet denies anonymous /healthz access,
-	// so the syncloop probe authenticates with the pod SA token
-	// (requires get on nonResourceURL /healthz/syncloop). Empty or
-	// unreadable → the probe runs unauthenticated and 401/403
-	// answers mark the check inconclusive, not down.
-	KubeletTokenPath      string
-	ContainerdSocket      string        // containerd grpc unix socket under /host/run
-	CiliumEnvoyReadyURL   string        // cilium-envoy admin :9964/ready
-	CtrIngestDir          string        // containerd content ingest dir (39)
-	K0sDataDir            string        // /var/lib/k0s — disk-high ingest-GC trigger
-	SysClassNet           string        // /sys/class/net — MTU reads (B4)
-	NebulaIface           string        // overlay iface MTU baseline (neb1 = 1300)
-	CiliumIface           string        // cilium host iface (cilium_net)
-	CiliumRuntimeConfig   string        // agent-runtime-config.json MTU fallback
-	ZombieStormThreshold  int           // defunct children of one parent → storm
-	CtrIngestMaxAge       time.Duration // ingest dir mtime older than → stale (3h)
-	CtrIngestScanInterval time.Duration // periodic rescan even under disk WM (6h)
-	K0sDiskHighWatermark  float64       // /var/lib/k0s used ratio triggering GC
-	// W6.3 disk-bloat runaway detector: above K0sDiskBloatWatermark
-	// the bounded emptyDir/snapshot walk runs (gated by
-	// DiskBloatScanInterval — the walk costs IO on the disk that is
-	// already full); above K0sDiskBloatCriticalWatermark a
-	// non-system pod holding more than DiskBloatPodThresholdBytes
-	// may be evicted through the API (last-disk-bloat-evict budget).
-	K0sDiskBloatWatermark         float64
-	K0sDiskBloatCriticalWatermark float64
-	DiskBloatPodThresholdBytes    int64
-	DiskBloatScanInterval         time.Duration
-	// Wave-7 knobs: H1 D-state storm threshold, H3 envoy admin
-	// stats URL + the node-local-dns :53 datapath probe target,
-	// H7 calico orphan-veth headroom + felix readiness probe.
-	DStateStormThreshold      int    // total D-state procs → storm latch (5)
-	CiliumEnvoyAdminURL       string // envoy :9901 /stats?filter=update_rejected
-	LocalDNSProbeAddr         string // node-local-dns :53 probe target (169.254.20.10:53)
-	LocalDNSProbeName         string // query name the DNS probe resolves
-	CalicoFelixReadyURL       string // calico-node felix :9099/readiness probe
-	CalicoOrphanVethThreshold int    // cali* ifaces above the pod count → leak (50)
-	// Wave-8 knobs: the /var/log/pods walk added to disk-bloat
-	// (BUG-H8), the critical BPF map fill ratio for the cilium-bpf
-	// latch (W8-NM3), and the PSI memory-thrash guard (W2): latch
-	// when /proc/pressure/memory `full avg60` exceeds PSIFullAvg60
-	// (percent) AND MemAvailable/MemTotal drops under
-	// MemFreeMinRatio for ConsecNeeded cycles.
-	PodLogsDir      string  // /var/log/pods walk root (BUG-H8)
-	BPFMapHighRatio float64 // critical-map fill ratio → latch (0.90)
-	PSIFullAvg60    float64 // PSI memory full avg60 percent (25)
-	MemFreeMinRatio float64 // free-mem ratio floor (0.08)
-	// Wave-9 knobs: the cilium WireGuard datapath iface for the
-	// double-encap MTU check (B4 extension), and the host
-	// /run/netns mount the orphan cni-* reaper scans.
-	CiliumWG0Iface string // cilium WG tunnel iface (cilium_wg0)
-	NetnsDir       string // host /run/netns — orphan cni-* netns files
-	// Wave-10 knobs (KR1/KR3/ST2):
-	// ContainerdMetaJournalFn is the KR3 journal probe — `journalctl
-	// -u k0sworker -u containerd --since "3 minutes ago"`. nil →
-	// Systemd.ExecCombined default; a nil Systemd leaves the journal
-	// half of the check inconclusive (the orphan-shim half still runs).
-	ContainerdMetaJournalFn func(ctx context.Context) (string, error)
-	// OrphanHostPathDirs are the host-side local-provisioner roots
-	// ST2 scans for pvc-* dirs whose PV is gone.
-	OrphanHostPathDirs []string
-	// HostOOM* are the hostmetrics kmsg scanner's markers this check
-	// consumes (KR1) — defaults derive from WatchdogStateDir so both
-	// subsystems agree on the file contract without wiring.
-	HostOOMVictimFile  string // "<epoch> <comm>" latest host-level victim
-	HostOOMCountFile   string // cumulative host-level OOM kills
-	ConntrackDropsFile string // cumulative nf_conntrack table-full records
-	// EventNamespace receives the SystemOOMVictim node event.
-	EventNamespace string
-
-	// killFn delivers signals — seam for tests (SIGKILL on pause /
-	// proxy-agent/shim/cilium pids, and signal-0 liveness probes).
-	killFn func(pid int, sig syscall.Signal) error
-	// nowFn supplies the current time — seam for tests.
-	nowFn func() time.Time
-	// probeHTTP does one GET and returns nil only on a 2xx response
-	// (BUG-H7 — a 500/503 means the probed service is wedged, not
-	// "the listener is alive"). Seam.
-	probeHTTP func(ctx context.Context, url string, timeout time.Duration) error
-	// unixGet GETs path over a unix socket and returns the body —
-	// the cilium-dbg endpoint list replacement (35). Seam.
-	unixGet func(ctx context.Context, socket, path string) ([]byte, error)
-	// ctrRmImage removes one image from the k8s.io containerd
-	// namespace — the corrupted-layer remedy (37), `k0s ctr
-	// --namespace k8s.io images rm --sync <image>` via the systemd
-	// exec wrapper. nil → Systemd.Exec default. Seam.
-	ctrRmImage func(ctx context.Context, image string) error
-	// journalFn returns the k0sworker journal window — the runner's
-	// shared -10min snapshot (05/06). nil → Systemd.Journal.
-	journalFn func(ctx context.Context) (string, error)
-	// journalAnyFn is the A5 second probe — `journalctl -n 1
-	// --no-pager` with NO unit filter. An empty k0sworker window is
-	// only corruption evidence when journald ITSELF has nothing (or
-	// only corrupt warnings) to say — a quiet unit on a healthy
-	// journald must not trigger the rotate+vacuum remedy. nil →
-	// Systemd.ExecCombined (stderr folded in — journald's own
-	// diagnostics, e.g. "File ... is corrupt", never reach stdout).
-	journalAnyFn func(ctx context.Context) (string, error)
-	// probeBodyOK does one GET and reports whether the trimmed body is
-	// exactly "ok" — the :10248 healthz contract (curl -s body compare
-	// parity: a wedged kubelet can still answer HTTP with a non-ok
-	// body, so any-HTTP-code-alive is not enough here). Seam.
-	probeBodyOK func(ctx context.Context, url string, timeout time.Duration) bool
-	// probeHTTPStatus does one GET and returns the status code — the
-	// probeHTTP variant for endpoints where the CODE is the verdict
-	// (syncloop 500 vs healthz 200, envoy /ready 503) or where ANY
-	// answer proves liveness (kubelet :10250 /healthz, api /livez —
-	// a 401/403 is an auth denial, not a dead listener). bearer != ""
-	// attaches an Authorization header (kubelet :10250 requires
-	// auth). Seam.
-	probeHTTPStatus func(ctx context.Context, url, bearer string, timeout time.Duration) (int, error)
-	// probeUnixSock connects to a unix socket under a deadline — the
-	// containerd-socket hang probe (A4). Seam.
-	probeUnixSock func(ctx context.Context, socket string, timeout time.Duration) error
-	// statfsFn reads fs usage for the ingest-GC disk trigger (A3).
-	// Seam for tests (default unix.Statfs).
-	statfsFn func(string, *unix.Statfs_t) error
-	// ctrRmIngest removes one stale ingest ref — `k0s ctr -n k8s.io
-	// content ingest rm <ref>` via the systemd exec wrapper (A3).
-	// nil → Systemd.Exec default. Seam.
-	ctrRmIngest func(ctx context.Context, ref string) error
-	// ctrPruneContent runs the store-wide content GC — `k0s ctr -n
-	// k8s.io content prune` via the systemd exec wrapper (W9). It
-	// only fires while /var/lib/k0s sits above the high watermark,
-	// on the last-content-gc 6h budget. nil → Systemd.Exec
-	// default. Seam.
-	ctrPruneContent func(ctx context.Context) error
-	// wgAllowedIPsFn returns how many cilium_wg0 peers carry a real
-	// allowed-ips set — `wg show cilium_wg0 allowed-ips` parsed
-	// (peers at "(none)" are wiped). nil → Systemd.Exec default.
-	// Seam for the W5.6 check.
-	wgAllowedIPsFn func(ctx context.Context) (int, error)
-	// ciliumEncryptPeersFn returns the expected WG peer count —
-	// `cilium-dbg encrypt status` parsed. An error or a count <=0
-	// makes the caller fall back to ReadyNodes-1. nil →
-	// Systemd.Exec default. Seam.
-	ciliumEncryptPeersFn func(ctx context.Context) (int, error)
-	// httpGetBody GETs a plain-HTTP endpoint and returns the body —
-	// the envoy admin stats page (W7-H3 xDS NACK guard). Seam.
-	httpGetBody func(ctx context.Context, url string, timeout time.Duration) ([]byte, error)
-	// dnsProbe sends one UDP DNS query for a fixed cluster name to
-	// addr and reports whether a well-formed answer returns before
-	// the deadline — the node-local-dns :53 datapath probe
-	// (W7-H3). Seam.
-	dnsProbe func(addr, name string, timeout time.Duration) bool
-
-	// JournalDirs are the host journal storage roots — the
-	// journal-unreadable latch may only fire while at least one
-	// exists (a host with no journald at all fails every read by
-	// configuration, not by fault).
-	JournalDirs []string
-	// JournalUnreadableNeeded is the consecutive-failed-read budget
-	// before state-journal-unreadable latches; <=0 → 5.
-	JournalUnreadableNeeded int
-}
-
-func (c *Config) applyDefaults() {
-	if c.Interval <= 0 {
-		c.Interval = defaultInterval
-	}
-	if c.WatchdogStateDir == "" {
-		c.WatchdogStateDir = defaultWatchdogStateDir
-	}
-	if c.WatchdogLogFile == "" {
-		c.WatchdogLogFile = defaultWatchdogLogFile
-	}
-	if c.ProcRoot == "" {
-		c.ProcRoot = defaultProcRoot
-	}
-	if c.CtrTaskRoot == "" {
-		c.CtrTaskRoot = defaultCtrTaskRoot
-	}
-	if c.SandboxCtlRoot == "" {
-		c.SandboxCtlRoot = defaultSandboxCtlRoot
-	}
-	if c.HostResolvConf == "" {
-		c.HostResolvConf = defaultHostResolvConf
-	}
-	if c.K0sWorkerUnitFile == "" {
-		c.K0sWorkerUnitFile = defaultK0sWorkerUnitFile
-	}
-	if c.KubeletPodsDir == "" {
-		c.KubeletPodsDir = defaultKubeletPodsDir
-	}
-	if c.KubeletHealthzURL == "" {
-		c.KubeletHealthzURL = defaultKubeletHealthzURL
-	}
-	if c.CiliumHealthzURL == "" {
-		c.CiliumHealthzURL = defaultCiliumHealthzURL
-	}
-	if c.CiliumSocket == "" {
-		c.CiliumSocket = defaultCiliumSocket
-	}
-	if c.StuckDeleteAge <= 0 {
-		c.StuckDeleteAge = defaultStuckDeleteAge
-	}
-	if c.StuckWedgeAge <= 0 {
-		c.StuckWedgeAge = defaultStuckWedgeAge
-	}
-	if c.KubeletWatchMinAge <= 0 {
-		c.KubeletWatchMinAge = defaultKubeletWatchMinAge
-	}
-	if c.MaxForceDelete <= 0 {
-		c.MaxForceDelete = defaultMaxForceDelete
-	}
-	if c.MaxCtrTaskClean <= 0 {
-		c.MaxCtrTaskClean = defaultMaxCtrTaskClean
-	}
-	if c.MaxShimKill <= 0 {
-		c.MaxShimKill = defaultMaxShimKill
-	}
-	if c.ConsecNeeded <= 0 {
-		c.ConsecNeeded = defaultConsecNeeded
-	}
-	if c.MinRestartInterval <= 0 {
-		c.MinRestartInterval = defaultMinRestartInterval
-	}
-	if c.ProbeGap <= 0 {
-		c.ProbeGap = probeGap
-	}
-	if c.KubeletWdInterval <= 0 {
-		c.KubeletWdInterval = defaultKubeletWdInterval
-	}
-	if c.KubeletWdMaxFail <= 0 {
-		c.KubeletWdMaxFail = defaultKubeletWdMaxFail
-	}
-	if c.KubeletWdProbeURL == "" {
-		c.KubeletWdProbeURL = defaultKubeletWdProbeURL
-	}
-	if c.KubeletWdReprobeGap <= 0 {
-		c.KubeletWdReprobeGap = defaultKubeletWdReprobeGap
-	}
-	if c.APIFallbackURL == "" {
-		c.APIFallbackURL = defaultAPIFallbackURL
-	}
-	if c.KubeletSyncloopURL == "" {
-		c.KubeletSyncloopURL = defaultKubeletSyncloopURL
-	}
-	if c.KubeletTokenPath == "" {
-		c.KubeletTokenPath = defaultKubeletTokenPath
-	}
-	if c.ContainerdSocket == "" {
-		c.ContainerdSocket = defaultContainerdSocket
-	}
-	if c.CiliumEnvoyReadyURL == "" {
-		c.CiliumEnvoyReadyURL = defaultCiliumEnvoyReadyURL
-	}
-	if c.CtrIngestDir == "" {
-		c.CtrIngestDir = defaultCtrIngestDir
-	}
-	if c.K0sDataDir == "" {
-		c.K0sDataDir = defaultK0sDataDir
-	}
-	if c.SysClassNet == "" {
-		c.SysClassNet = defaultSysClassNet
-	}
-	if c.NebulaIface == "" {
-		c.NebulaIface = defaultNebulaIface
-	}
-	if c.CiliumIface == "" {
-		c.CiliumIface = defaultCiliumIface
-	}
-	if c.CiliumWG0Iface == "" {
-		c.CiliumWG0Iface = defaultCiliumWG0Iface
-	}
-	if c.NetnsDir == "" {
-		c.NetnsDir = defaultNetnsDir
-	}
-	if c.CiliumRuntimeConfig == "" {
-		c.CiliumRuntimeConfig = defaultCiliumRuntimeConfig
-	}
-	if c.ZombieStormThreshold <= 0 {
-		c.ZombieStormThreshold = zombieStormThreshold
-	}
-	if c.CtrIngestMaxAge <= 0 {
-		c.CtrIngestMaxAge = ctrIngestMaxAge
-	}
-	if c.CtrIngestScanInterval <= 0 {
-		c.CtrIngestScanInterval = ctrIngestScanInterval
-	}
-	if c.K0sDiskHighWatermark <= 0 {
-		c.K0sDiskHighWatermark = k0sDiskHighWatermark
-	}
-	if c.K0sDiskBloatWatermark <= 0 {
-		c.K0sDiskBloatWatermark = k0sDiskBloatWatermark
-	}
-	if c.K0sDiskBloatCriticalWatermark <= 0 {
-		c.K0sDiskBloatCriticalWatermark = k0sDiskBloatCriticalWatermark
-	}
-	if c.DiskBloatPodThresholdBytes <= 0 {
-		c.DiskBloatPodThresholdBytes = diskBloatPodThresholdBytes
-	}
-	if c.DiskBloatScanInterval <= 0 {
-		c.DiskBloatScanInterval = diskBloatScanInterval
-	}
-	if c.DStateStormThreshold <= 0 {
-		c.DStateStormThreshold = defaultDStateStormThreshold
-	}
-	if c.CiliumEnvoyAdminURL == "" {
-		c.CiliumEnvoyAdminURL = defaultCiliumEnvoyAdminURL
-	}
-	if c.LocalDNSProbeAddr == "" {
-		c.LocalDNSProbeAddr = defaultLocalDNSProbeAddr
-	}
-	if c.LocalDNSProbeName == "" {
-		c.LocalDNSProbeName = defaultLocalDNSProbeName
-	}
-	if c.CalicoFelixReadyURL == "" {
-		c.CalicoFelixReadyURL = defaultCalicoFelixReadyURL
-	}
-	if c.CalicoOrphanVethThreshold <= 0 {
-		c.CalicoOrphanVethThreshold = defaultCalicoOrphanVethThresh
-	}
-	if c.PodLogsDir == "" {
-		c.PodLogsDir = defaultPodLogsDir
-	}
-	if c.BPFMapHighRatio <= 0 {
-		c.BPFMapHighRatio = defaultBPFMapHighRatio
-	}
-	if c.PSIFullAvg60 <= 0 {
-		c.PSIFullAvg60 = defaultPSIFullAvg60
-	}
-	if c.MemFreeMinRatio <= 0 {
-		c.MemFreeMinRatio = defaultMemFreeMinRatio
-	}
-	// Wave-10 (KR1/KR3/ST2) defaults — WatchdogStateDir is already
-	// resolved above, so the marker-file paths derive from the same
-	// dir hostmetrics writes into.
-	if len(c.OrphanHostPathDirs) == 0 {
-		// Paths are used RAW (no HostRoot prefix): the DaemonSet
-		// mounts host /var/openebs/local at the SAME container path
-		// (sweeper contract). /opt/local-path-provisioner has no
-		// container mount — ReadDir just misses there — but is the
-		// real host path in standalone mode. Extra provisioner
-		// roots need a matching DS hostPath mount to be scanned.
-		c.OrphanHostPathDirs = []string{
-			"/var/openebs/local",
-			"/opt/local-path-provisioner",
-		}
-	}
-	if c.HostOOMVictimFile == "" {
-		c.HostOOMVictimFile = filepath.Join(c.WatchdogStateDir,
-			"kmsg-host-oom-victim")
-	}
-	if c.HostOOMCountFile == "" {
-		c.HostOOMCountFile = filepath.Join(c.WatchdogStateDir,
-			"kmsg-host-oom-count")
-	}
-	if c.ConntrackDropsFile == "" {
-		c.ConntrackDropsFile = filepath.Join(c.WatchdogStateDir,
-			"kmsg-conntrack-drops")
-	}
-	if c.EventNamespace == "" {
-		c.EventNamespace = "default"
-	}
-	if c.httpGetBody == nil {
-		// Plain HTTP (no TLS) — the envoy admin stats page lives on
-		// loopback :9901. A non-200 is an error: the reject-delta
-		// verdict is unreadable, not "zero".
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.IdleConnTimeout = 90 * time.Second
-		client := &http.Client{Transport: tr}
-		c.httpGetBody = func(ctx context.Context, url string, timeout time.Duration) ([]byte, error) {
-			pctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
-			if err != nil {
-				return nil, err
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				return nil, err
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-				return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
-			}
-			return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		}
-	}
-	if c.dnsProbe == nil {
-		c.dnsProbe = probeDNSUDP
-	}
-	if c.killFn == nil {
-		c.killFn = func(pid int, sig syscall.Signal) error {
-			return syscall.Kill(pid, sig)
-		}
-	}
-	if c.nowFn == nil {
-		c.nowFn = time.Now
-	}
-	if c.probeHTTP == nil {
-		// BUG-H7: an HTTP response no longer counts as alive on its
-		// own — a wedged cilium-agent :9879/healthz answering 500/503
-		// must read as DOWN. Only a 2xx is a pass; insecure TLS stays
-		// (kubelet cert SANs don't cover 127.0.0.1, curl -ks parity).
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
-		tr.IdleConnTimeout = 90 * time.Second
-		client := &http.Client{Transport: tr}
-		c.probeHTTP = func(ctx context.Context, url string, timeout time.Duration) error {
-			pctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
-			if err != nil {
-				return err
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				return err
-			}
-			defer resp.Body.Close()
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
-			}
-			return nil
-		}
-	}
-	if c.unixGet == nil {
-		c.unixGet = func(ctx context.Context, socket, path string) ([]byte, error) {
-			// DisableKeepAlives: the transport is built per call, so a
-			// kept-alive unix conn would pin the readLoop/writeLoop
-			// goroutines for the transport's whole IdleConnTimeout —
-			// with keep-alives off the conn closes on Body.Close and
-			// they finish immediately. Draining the body first lets
-			// the close happen promptly.
-			tr := &http.Transport{
-				DisableKeepAlives: true,
-				DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
-					d := net.Dialer{Timeout: 5 * time.Second}
-					return d.DialContext(dctx, "unix", socket)
-				},
-			}
-			cl := &http.Client{Transport: tr, Timeout: 10 * time.Second}
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-				"http://localhost"+path, nil)
-			if err != nil {
-				return nil, err
-			}
-			resp, err := cl.Do(req)
-			if err != nil {
-				return nil, err
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-				return nil, fmt.Errorf("cilium api %s: status %d", path, resp.StatusCode)
-			}
-			body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-			return body, err
-		}
-	}
-	if c.ctrRmImage == nil {
-		sd := c.Systemd
-		c.ctrRmImage = func(ctx context.Context, image string) error {
-			if sd == nil {
-				return fmt.Errorf("no systemd client wired")
-			}
-			_, err := sd.Exec(ctx,
-				"k0s", "ctr", "--namespace", "k8s.io", "images", "rm", "--sync", image)
-			return err
-		}
-	}
-	if c.journalFn == nil {
-		sd := c.Systemd
-		c.journalFn = func(ctx context.Context) (string, error) {
-			if sd == nil {
-				// Fail, not empty: a nil client fed the unreadable
-				// tracker a fake "journald-wide empty reply" verdict.
-				return "", fmt.Errorf("no systemd client wired")
-			}
-			return sd.Journal(ctx, "k0sworker.service", journalWindow)
-		}
-	}
-	if c.journalAnyFn == nil {
-		sd := c.Systemd
-		c.journalAnyFn = func(ctx context.Context) (string, error) {
-			if sd == nil {
-				return "", fmt.Errorf("no systemd client wired")
-			}
-			return sd.ExecCombined(ctx,
-				"journalctl", "-n", "1", "--no-pager")
-		}
-	}
-	if c.probeBodyOK == nil {
-		// kubelet :10248 contract (curl -s parity): the healthz port is
-		// unauthenticated plaintext and the body must be exactly "ok" —
-		// a wedged kubelet can still answer HTTP with a non-ok body.
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.IdleConnTimeout = 90 * time.Second
-		client := &http.Client{Transport: tr}
-		c.probeBodyOK = func(ctx context.Context, url string, timeout time.Duration) bool {
-			pctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
-			if err != nil {
-				return false
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				return false
-			}
-			defer resp.Body.Close()
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			return strings.TrimSpace(string(body)) == "ok"
-		}
-	}
-	if c.probeHTTPStatus == nil {
-		// Same insecure-TLS transport as probeHTTP — the status code
-		// is the verdict (syncloop 500, envoy /ready 503).
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
-		tr.IdleConnTimeout = 90 * time.Second
-		client := &http.Client{Transport: tr}
-		c.probeHTTPStatus = func(ctx context.Context, url, bearer string, timeout time.Duration) (int, error) {
-			pctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
-			if err != nil {
-				return 0, err
-			}
-			if bearer != "" {
-				req.Header.Set("Authorization", "Bearer "+bearer)
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				return 0, err
-			}
-			defer resp.Body.Close()
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-			return resp.StatusCode, nil
-		}
-	}
-	if c.probeUnixSock == nil {
-		c.probeUnixSock = func(ctx context.Context, socket string, timeout time.Duration) error {
-			d := net.Dialer{Timeout: timeout}
-			conn, err := d.DialContext(ctx, "unix", socket)
-			if err != nil {
-				return err
-			}
-			// A successful dial IS the verdict — a close error
-			// (e.g. the peer reset first) must not downgrade it.
-			_ = conn.Close()
-			return nil
-		}
-	}
-	if c.statfsFn == nil {
-		c.statfsFn = unix.Statfs
-	}
-	if c.ctrRmIngest == nil {
-		sd := c.Systemd
-		c.ctrRmIngest = func(ctx context.Context, ref string) error {
-			if sd == nil {
-				return fmt.Errorf("no systemd client wired")
-			}
-			_, err := sd.Exec(ctx,
-				"k0s", "ctr", "-n", "k8s.io", "content", "ingest", "rm", ref)
-			return err
-		}
-	}
-	if c.ctrPruneContent == nil {
-		sd := c.Systemd
-		c.ctrPruneContent = func(ctx context.Context) error {
-			if sd == nil {
-				return fmt.Errorf("no systemd client wired")
-			}
-			_, err := sd.Exec(ctx,
-				"k0s", "ctr", "-n", "k8s.io", "content", "prune")
-			return err
-		}
-	}
-	if c.wgAllowedIPsFn == nil {
-		sd := c.Systemd
-		c.wgAllowedIPsFn = func(ctx context.Context) (int, error) {
-			if sd == nil {
-				return 0, fmt.Errorf("no systemd client wired")
-			}
-			out, err := sd.Exec(ctx, "wg", "show", "cilium_wg0", "allowed-ips")
-			if err != nil {
-				return 0, err
-			}
-			return parseWGAllowedIPs(out), nil
-		}
-	}
-	if c.ciliumEncryptPeersFn == nil {
-		c.ciliumEncryptPeersFn = func(ctx context.Context) (int, error) {
-			// The agent's own API beats `cilium-dbg`: the binary only
-			// lives INSIDE the cilium-agent container — an sd.Exec on
-			// the host always fails and silently degrades every cycle
-			// to the ReadyNodes-1 fallback. /v1/healthz's
-			// cluster.nodes[] lists exactly the remote cilium members
-			// this node should peer with (virtual/liqo nodes run no
-			// agent, so they never appear).
-			body, err := c.unixGet(ctx, c.CiliumSocket, "/v1/healthz")
-			if err != nil {
-				return 0, err
-			}
-			n, ok := parseCiliumHealthNodes(body)
-			if !ok {
-				return 0, fmt.Errorf("no cluster.nodes in cilium healthz")
-			}
-			return n, nil
-		}
-	}
-	if len(c.JournalDirs) == 0 {
-		// /host mount convention like the other defaults; standalone
-		// wiring passes the unprefixed host paths.
-		c.JournalDirs = []string{
-			"/host/var/log/journal", "/host/run/log/journal"}
-	}
-	if c.JournalUnreadableNeeded <= 0 {
-		c.JournalUnreadableNeeded = defaultJournalUnreadableNeeded
-	}
-}
-
 // Regexes — anchored where the shell learned to anchor (the konn pod
 // name and the DNS pod names MUST be anchored: unanchored ~= filters
 // previously matched konnectivity-agent-patcher-* and coredns-* job
@@ -1066,7 +374,7 @@ type Hygiene struct {
 	// state is the shared hoststate.Store for the watchdog state-dir
 	// contract (state-* latches, last-* rate budgets, installed/
 	// last-run heartbeat, watchdog log appends). Its clock is a
-	// closure over the LIVE cfg.nowFn so post-construction test
+	// closure over the LIVE cfg.Seams.nowFn so post-construction test
 	// stubs still apply; its RateTrySpend mutex serialises the
 	// feeder-vs-Cycle check+spend pairs the old rateMu guarded
 	// (TOCTOU double-restart on the shared last-* budgets).
@@ -1168,13 +476,13 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	cfg.applyDefaults()
 	h := &Hygiene{cfg: cfg, proc: procfs.New(cfg.ProcRoot)}
 	// Now MUST close over the live config field, not the cfg
-	// parameter: tests re-stub h.cfg.nowFn after New returns and
+	// parameter: tests re-stub h.cfg.Seams.nowFn after New returns and
 	// the store has to observe the new clock (hoststate.New doc).
 	h.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
-		func() time.Time { return h.cfg.nowFn() }, logger)
+		func() time.Time { return h.cfg.Seams.nowFn() }, logger)
 	h.journalReads = journalwatch.Tracker{
-		Needed: cfg.JournalUnreadableNeeded,
-		Dirs:   cfg.JournalDirs,
+		Needed: cfg.Journal.UnreadableNeeded,
+		Dirs:   cfg.Journal.Dirs,
 	}
 
 	h.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -1329,7 +637,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	journalOnce := func() string {
 		if !journalSet {
 			journalSet = true
-			j, err := h.cfg.journalFn(ctx)
+			j, err := h.cfg.Seams.journalFn(ctx)
 			switch {
 			case err != nil:
 				h.state.AppendLog(fmt.Sprintf("k0sworker journal snapshot failed: %v", err))
@@ -1452,10 +760,10 @@ func (h *Hygiene) listNodePods(ctx context.Context) ([]corev1.Pod, bool) {
 // seams (killFn/nowFn are re-stubbed by tests after New).
 
 // pidLive is procfs.FS.Live bound to this subsystem's killFn seam —
-// h.cfg.killFn is read at call time because tests re-stub it after
+// h.cfg.Seams.killFn is read at call time because tests re-stub it after
 // New returns.
 func (h *Hygiene) pidLive(pid int) bool {
-	return h.proc.Live(pid, h.cfg.killFn)
+	return h.proc.Live(pid, h.cfg.Seams.killFn)
 }
 
 // ctrTask is one containerd task dir (runtime-v2 task or sandbox
@@ -1575,7 +883,7 @@ func (h *Hygiene) forceDeletePod(ctx context.Context, p *corev1.Pod) error {
 	h.state.AppendLog(fmt.Sprintf(
 		"POD-TEARDOWN-FORCE-DELETE: force-delete pod %s/%s (uid %.8s) - Terminating %ds, zero live tasks",
 		p.Namespace, p.Name, string(p.UID),
-		int64(h.cfg.nowFn().Sub(p.DeletionTimestamp.Time).Seconds())))
+		int64(h.cfg.Seams.nowFn().Sub(p.DeletionTimestamp.Time).Seconds())))
 	return h.cfg.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
 		metav1.DeleteOptions{
 			GracePeriodSeconds: ptr.To[int64](0),
@@ -1584,9 +892,9 @@ func (h *Hygiene) forceDeletePod(ctx context.Context, p *corev1.Pod) error {
 }
 
 // procAge is procfs.FS.Age bound to the nowFn seam (tests re-stub
-// h.cfg.nowFn after New).
+// h.cfg.Seams.nowFn after New).
 func (h *Hygiene) procAge(pid int) time.Duration {
-	return h.proc.Age(pid, h.cfg.nowFn())
+	return h.proc.Age(pid, h.cfg.Seams.nowFn())
 }
 
 // pidsWithCmdline returns pids whose joined cmdline contains sub —

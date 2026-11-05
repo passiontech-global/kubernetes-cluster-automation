@@ -52,7 +52,7 @@ func (h *Hygiene) probeHTTPSeries(ctx context.Context, url string,
 	attempts int, timeout, gap time.Duration) error {
 	var last error
 	for i := 0; i < attempts; i++ {
-		last = h.cfg.probeHTTP(ctx, url, timeout)
+		last = h.cfg.Seams.probeHTTP(ctx, url, timeout)
 		if last == nil {
 			return nil
 		}
@@ -81,8 +81,8 @@ func (h *Hygiene) probeHTTPSeries(ctx context.Context, url string,
 func (h *Hygiene) kubelet10250Alive(ctx context.Context) bool {
 	bearer := h.kubeletBearer()
 	for i := 0; i < probeAttempts; i++ {
-		if _, err := h.cfg.probeHTTPStatus(ctx,
-			h.cfg.KubeletHealthzURL, bearer, probeTimeout); err == nil {
+		if _, err := h.cfg.Seams.probeHTTPStatus(ctx,
+			h.cfg.Kubelet.HealthzURL, bearer, probeTimeout); err == nil {
 			return true
 		}
 		if i+1 < probeAttempts {
@@ -100,7 +100,7 @@ func (h *Hygiene) kubelet10250Alive(ctx context.Context) bool {
 // `find $KUBELET_PODS_DIR -mindepth 1 -maxdepth 1 -type d | wc -l`.
 // ok=false means the dir is unreadable (treated like missing).
 func (h *Hygiene) podDirCount() (n int, ok bool) {
-	entries, err := os.ReadDir(h.cfg.KubeletPodsDir)
+	entries, err := os.ReadDir(h.cfg.Kubelet.PodsDir)
 	if err != nil {
 		return 0, false
 	}
@@ -293,15 +293,15 @@ func (c *watchWedgeCheck) Run(ctx context.Context, e *cycleEnv) {
 	// cleanly but every per-pod join then fails ENOTDIR — the same
 	// false wedge via a different syscall. Inconclusive — keep
 	// counters/latch exactly like the !apiOK path.
-	st, err := os.Stat(c.h.cfg.KubeletPodsDir)
+	st, err := os.Stat(c.h.cfg.Kubelet.PodsDir)
 	if err != nil || !st.IsDir() {
 		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: kubelet pods dir %s unstatable or not a directory (isdir=%v, err=%v) — watch-wedge inconclusive, keeping state",
-			c.h.cfg.KubeletPodsDir, err == nil && st.IsDir(), err))
+			c.h.cfg.Kubelet.PodsDir, err == nil && st.IsDir(), err))
 		c.h.cycles.WithLabelValues(checkWatch, "abort").Inc()
 		return
 	}
-	now := c.h.cfg.nowFn()
+	now := c.h.cfg.Seams.nowFn()
 	missing := 0
 	for i := range e.pods {
 		p := &e.pods[i]
@@ -311,10 +311,10 @@ func (c *watchWedgeCheck) Run(ctx context.Context, e *cycleEnv) {
 			continue
 		}
 		ct := p.CreationTimestamp.Time
-		if ct.IsZero() || now.Sub(ct) < c.h.cfg.KubeletWatchMinAge {
+		if ct.IsZero() || now.Sub(ct) < c.h.cfg.Kubelet.WatchMinAge {
 			continue
 		}
-		if st, err := os.Stat(filepath.Join(c.h.cfg.KubeletPodsDir,
+		if st, err := os.Stat(filepath.Join(c.h.cfg.Kubelet.PodsDir,
 			string(p.UID))); err != nil || !st.IsDir() {
 			missing++
 		}
@@ -386,7 +386,7 @@ func (c *watchWedgeCheck) Run(ctx context.Context, e *cycleEnv) {
 // here — the goroutine also runs on nodes where the feeder never
 // activates.
 func (h *Hygiene) runKubeletFeeder(ctx context.Context) {
-	cycle.Every("kubelet-feeder", h.cfg.KubeletWdInterval,
+	cycle.Every("kubelet-feeder", h.cfg.Kubelet.WdInterval,
 		h.kubeletFeedTick).Run(ctx)
 }
 
@@ -400,7 +400,7 @@ func (h *Hygiene) kubeletFeederActive() bool {
 	if wd := h.feederWatchdogConf(); wd != nil && !wd.SignalEnabled(checkKubeletWd) {
 		return false
 	}
-	for _, name := range h.cfg.KubeletWatchdogHosts {
+	for _, name := range h.cfg.Kubelet.WatchdogHosts {
 		if name == h.cfg.NodeName {
 			return true
 		}
@@ -433,8 +433,8 @@ func (h *Hygiene) kubeletFeedTick(ctx context.Context) {
 		// stale evidence and must not count toward a restart.
 		h.state.AppendLog(fmt.Sprintf(
 			"kubelet-feeder: start interval=%ds maxfail=%d url=%s",
-			int(h.cfg.KubeletWdInterval.Seconds()), h.cfg.KubeletWdMaxFail,
-			h.cfg.KubeletWdProbeURL))
+			int(h.cfg.Kubelet.WdInterval.Seconds()), h.cfg.Kubelet.WdMaxFail,
+			h.cfg.Kubelet.WdProbeURL))
 		if h.kubeletWdFails > 0 {
 			h.state.AppendLog(fmt.Sprintf(
 				"kubelet-feeder: re-activated — dropping %d stale fails", h.kubeletWdFails))
@@ -445,7 +445,7 @@ func (h *Hygiene) kubeletFeedTick(ctx context.Context) {
 	if !active {
 		return
 	}
-	if h.cfg.probeBodyOK(ctx, h.cfg.KubeletWdProbeURL, kubeletWdProbeTimeout) {
+	if h.cfg.Seams.probeBodyOK(ctx, h.cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
 		if h.kubeletWdFails > 0 {
 			h.state.AppendLog(fmt.Sprintf(
 				"kubelet-feeder: probe OK again after %d fail", h.kubeletWdFails))
@@ -482,14 +482,14 @@ func (h *Hygiene) kubeletFeedTick(ctx context.Context) {
 	}
 	h.kubeletWdFails++
 	h.state.AppendLog(fmt.Sprintf("kubelet-feeder: probe fail %d/%d",
-		h.kubeletWdFails, h.cfg.KubeletWdMaxFail))
-	if h.kubeletWdFails < h.cfg.KubeletWdMaxFail {
+		h.kubeletWdFails, h.cfg.Kubelet.WdMaxFail))
+	if h.kubeletWdFails < h.cfg.Kubelet.WdMaxFail {
 		return
 	}
 	h.state.AppendLog(fmt.Sprintf(
 		"kubelet-feeder: %d consecutive fails (~%ds) — running remediation gates",
 		h.kubeletWdFails,
-		int(h.cfg.KubeletWdInterval.Seconds())*h.cfg.KubeletWdMaxFail))
+		int(h.cfg.Kubelet.WdInterval.Seconds())*h.cfg.Kubelet.WdMaxFail))
 	h.runKubeletRemediate(ctx)
 	// Re-arm like the shell's exit-1 → unit fail → OnFailure →
 	// Restart=always round: the remediate pass ENDS this fails run
@@ -512,7 +512,7 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 	// (drop the fail streak and any escalation latch), never spend a
 	// restart on a healthy kubelet.
 	for i := 1; i <= 2; i++ {
-		if h.cfg.probeBodyOK(ctx, h.cfg.KubeletWdProbeURL, kubeletWdProbeTimeout) {
+		if h.cfg.Seams.probeBodyOK(ctx, h.cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
 			h.state.AppendLog(fmt.Sprintf(
 				"kubelet-remediate: SKIP(G0-reprobe) :10248 answered 'ok' on re-probe %d — false alarm (steal blip), self-correcting", i))
 			h.kubeletWdFails = 0
@@ -523,7 +523,7 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(h.cfg.KubeletWdReprobeGap):
+			case <-time.After(h.cfg.Kubelet.WdReprobeGap):
 			}
 		}
 	}
@@ -580,7 +580,7 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 	// first so a stale failed state can't wedge the unit's next start.
 	h.state.AppendLog(fmt.Sprintf(
 		"ACTION: restarting k0sworker (reason=systemd-watchdog-kubelet-healthz-60s fails=%d)",
-		h.cfg.KubeletWdMaxFail))
+		h.cfg.Kubelet.WdMaxFail))
 	h.resetFailedK0sWorker(ctx)
 	if err := h.restartK0sWorker(ctx); err != nil {
 		h.state.AppendLog(fmt.Sprintf(
@@ -616,7 +616,7 @@ func (h *Hygiene) anyAPIBackendLive(ctx context.Context) bool {
 		}
 	}
 	if len(urls) == 0 {
-		urls = []string{h.cfg.APIFallbackURL}
+		urls = []string{h.cfg.Kubelet.APIFallbackURL}
 	}
 	for _, url := range urls {
 		// probeHTTPStatus, not probeHTTP: the verdict is liveness,
@@ -624,7 +624,7 @@ func (h *Hygiene) anyAPIBackendLive(ctx context.Context) bool {
 		// answered (curl -sk parity; a 2xx-only read made an
 		// auth-refusing or LB-degraded endpoint look "unreachable"
 		// and falsely gated remediation as isolated).
-		if _, err := h.cfg.probeHTTPStatus(ctx, url, "",
+		if _, err := h.cfg.Seams.probeHTTPStatus(ctx, url, "",
 			apiLivezProbeTimeout); err == nil {
 			return true
 		}
@@ -703,8 +703,8 @@ func (c *syncloopCheck) Run(ctx context.Context, e *cycleEnv) {
 	// and bound SA tokens rotate.
 	bearer := c.h.kubeletBearer()
 	for i := 0; i < probeAttempts; i++ {
-		code, err := c.h.cfg.probeHTTPStatus(ctx,
-			c.h.cfg.KubeletSyncloopURL, bearer, probeTimeout)
+		code, err := c.h.cfg.Seams.probeHTTPStatus(ctx,
+			c.h.cfg.Kubelet.SyncloopURL, bearer, probeTimeout)
 		if err == nil {
 			switch {
 			case code == http.StatusOK:
@@ -804,7 +804,7 @@ func (c *syncloopCheck) Run(ctx context.Context, e *cycleEnv) {
 // needs no caching logic. Missing/unreadable file → "" (the probe
 // runs unauthenticated and 401/403 marks the check inconclusive).
 func (h *Hygiene) kubeletBearer() string {
-	b, err := os.ReadFile(h.cfg.KubeletTokenPath)
+	b, err := os.ReadFile(h.cfg.Kubelet.TokenPath)
 	if err != nil {
 		return ""
 	}
@@ -827,7 +827,7 @@ func (c *ctrsockCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCtrSock, "gated").Inc()
 		return
 	}
-	err := c.h.cfg.probeUnixSock(ctx, c.h.cfg.ContainerdSocket, unixSockProbeTimeout)
+	err := c.h.cfg.Seams.probeUnixSock(ctx, c.h.cfg.Ctr.Socket, unixSockProbeTimeout)
 	if err == nil {
 		c.fails = 0
 		c.h.state.Exit("containerd-sock-down", nil)
@@ -838,7 +838,7 @@ func (c *ctrsockCheck) Run(ctx context.Context, e *cycleEnv) {
 	if c.fails < c.h.cfg.ConsecNeeded {
 		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: containerd-sock-down %s probe fail: %v (check %d/%d)",
-			c.h.cfg.ContainerdSocket, err, c.fails, c.h.cfg.ConsecNeeded))
+			c.h.cfg.Ctr.Socket, err, c.fails, c.h.cfg.ConsecNeeded))
 		c.h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
 		return
 	}
@@ -867,7 +867,7 @@ func (c *ctrsockCheck) Run(ctx context.Context, e *cycleEnv) {
 		// case — the feeder goroutine competes for the same file.
 		c.h.state.AppendLog(fmt.Sprintf(
 			"ACTION: restarting k0sworker - containerd-sock-down %s (persisted %dx)",
-			c.h.cfg.ContainerdSocket, c.fails))
+			c.h.cfg.Ctr.Socket, c.fails))
 		c.fails = 0
 		if err := c.h.restartK0sWorker(ctx); err != nil {
 			c.h.state.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))

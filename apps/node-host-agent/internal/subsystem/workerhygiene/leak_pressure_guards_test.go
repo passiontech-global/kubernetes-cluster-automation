@@ -444,7 +444,7 @@ func netnsFixture(t *testing.T, e *env) string {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	e.h.cfg.NetnsDir = dir
+	e.h.cfg.Net.NetnsDir = dir
 	return dir
 }
 
@@ -619,7 +619,7 @@ func TestCtrIngestGCContentPruneAboveWatermark(t *testing.T) {
 	e := fixture(t)
 	e.diskUsed = 0.80
 	prunes := 0
-	e.h.cfg.ctrPruneContent = func(context.Context) error {
+	e.h.cfg.Seams.ctrPruneContent = func(context.Context) error {
 		prunes++
 		return nil
 	}
@@ -653,7 +653,7 @@ func TestCtrIngestGCNoPruneBelowWatermark(t *testing.T) {
 	e := fixture(t)
 	e.diskUsed = 0.50
 	prunes := 0
-	e.h.cfg.ctrPruneContent = func(context.Context) error {
+	e.h.cfg.Seams.ctrPruneContent = func(context.Context) error {
 		prunes++
 		return nil
 	}
@@ -669,7 +669,7 @@ func TestCtrIngestGCNoPruneBelowWatermark(t *testing.T) {
 func TestCtrIngestGCPruneFailureSuspect(t *testing.T) {
 	e := fixture(t)
 	e.diskUsed = 0.80
-	e.h.cfg.ctrPruneContent = func(context.Context) error {
+	e.h.cfg.Seams.ctrPruneContent = func(context.Context) error {
 		return fmt.Errorf("ctr content prune: exit status 1")
 	}
 	e.h.checkCtrIngestGC(context.Background(), true)
@@ -682,7 +682,7 @@ func TestCtrIngestGCPruneFailureSuspect(t *testing.T) {
 	}
 	// Budget spent → an immediate retry does not re-run the prune.
 	calls := 0
-	e.h.cfg.ctrPruneContent = func(context.Context) error {
+	e.h.cfg.Seams.ctrPruneContent = func(context.Context) error {
 		calls++
 		return nil
 	}

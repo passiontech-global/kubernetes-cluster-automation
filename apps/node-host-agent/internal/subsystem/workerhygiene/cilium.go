@@ -81,7 +81,7 @@ func (h *Hygiene) killNamedTasks(tasks []ctrTask, name string) bool {
 	killed := false
 	for _, t := range tasks {
 		if t.live && t.pid > 0 {
-			if err := h.cfg.killFn(t.pid, syscall.SIGKILL); err != nil {
+			if err := h.cfg.Seams.killFn(t.pid, syscall.SIGKILL); err != nil {
 				h.state.AppendLog(fmt.Sprintf(
 					"suspect: kill %s pid=%d failed: %v", name, t.pid, err))
 			} else {
@@ -138,7 +138,7 @@ func (c *ciliumCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCilium, "ok").Inc()
 		return
 	}
-	err := c.h.probeHTTPSeries(ctx, c.h.cfg.CiliumHealthzURL,
+	err := c.h.probeHTTPSeries(ctx, c.h.cfg.Cilium.HealthzURL,
 		probeAttempts, ciliumProbeTime, c.h.cfg.ProbeGap)
 	if err == nil {
 		c.fails = 0
@@ -211,13 +211,13 @@ func (c *ciliumInitCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
 		return
 	}
-	body, err := c.h.cfg.unixGet(ctx, c.h.cfg.CiliumSocket, "/v1/endpoint")
+	body, err := c.h.cfg.Seams.unixGet(ctx, c.h.cfg.Cilium.Socket, "/v1/endpoint")
 	if err != nil {
 		// Endpoint list unreadable — inconclusive: don't count, don't
 		// reset (shell: tasks exec fail → exit 0).
 		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck endpoint query on %s failed: %v — inconclusive, keeping state",
-			c.h.cfg.CiliumSocket, err))
+			c.h.cfg.Cilium.Socket, err))
 		c.h.cycles.WithLabelValues(checkCiliumInit, "abort").Inc()
 		return
 	}
@@ -360,18 +360,18 @@ func parseCiliumBPFMaps(body []byte) map[string][2]int64 {
 // is inconclusive (the cilium checks' keep-state rule) — the latch
 // is neither entered nor cleared on missing evidence.
 func (c *ciliumCheck) checkBPFMaps(ctx context.Context) {
-	body, err := c.h.cfg.unixGet(ctx, c.h.cfg.CiliumSocket, "/v1/map")
+	body, err := c.h.cfg.Seams.unixGet(ctx, c.h.cfg.Cilium.Socket, "/v1/map")
 	if err != nil {
 		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-bpf-maps map query on %s failed: %v — inconclusive, keeping state",
-			c.h.cfg.CiliumSocket, err))
+			c.h.cfg.Cilium.Socket, err))
 		c.h.cycles.WithLabelValues(checkCiliumBPF, "abort").Inc()
 		return
 	}
 	maps := parseCiliumBPFMaps(body)
 	var over []string
 	for name, um := range maps {
-		if float64(um[0]) >= c.h.cfg.BPFMapHighRatio*float64(um[1]) {
+		if float64(um[0]) >= c.h.cfg.Cilium.BPFMapHighRatio*float64(um[1]) {
 			over = append(over, fmt.Sprintf("%s=%d/%d", name, um[0], um[1]))
 		}
 	}
@@ -547,7 +547,7 @@ func (c *ciliumIPAMCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
 		return
 	}
-	body, err := c.h.cfg.unixGet(ctx, c.h.cfg.CiliumSocket, "/v1/healthz")
+	body, err := c.h.cfg.Seams.unixGet(ctx, c.h.cfg.Cilium.Socket, "/v1/healthz")
 	if err != nil {
 		// Socket unreadable — inconclusive: keep counters/latch
 		// (same rule as checkCiliumInitStuck).
@@ -696,7 +696,7 @@ func (c *ciliumEnvoyCheck) Run(ctx context.Context, e *cycleEnv) {
 	// 2.5: subsystem/datapath health off the agent socket is
 	// evidence only — an unreadable socket must not block the envoy
 	// verdict (the admin port is the primary signal).
-	if body, err := c.h.cfg.unixGet(ctx, c.h.cfg.CiliumSocket, "/v1/healthz"); err == nil {
+	if body, err := c.h.cfg.Seams.unixGet(ctx, c.h.cfg.Cilium.Socket, "/v1/healthz"); err == nil {
 		if bad := ciliumUnhealthySubsystems(body); len(bad) > 0 {
 			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: cilium subsystem health degraded: %s",
@@ -735,8 +735,8 @@ func (c *ciliumEnvoyCheck) Run(ctx context.Context, e *cycleEnv) {
 			fmt.Sprintf("xDS update_rejected deltas %d consecutive cycles",
 				c.xdsFails))
 	}
-	code, err := c.h.cfg.probeHTTPStatus(ctx,
-		c.h.cfg.CiliumEnvoyReadyURL, "", ciliumProbeTime)
+	code, err := c.h.cfg.Seams.probeHTTPStatus(ctx,
+		c.h.cfg.Cilium.EnvoyReadyURL, "", ciliumProbeTime)
 	if err == nil && code == http.StatusOK {
 		c.fails = 0
 		c.h.state.Exit("cilium-envoy-down", nil)
@@ -808,17 +808,17 @@ func (c *ciliumMTUCheck) Run(_ context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCiliumMTU, "gated").Inc()
 		return
 	}
-	neb, nebOK := hostutil.MTUOfIface(c.h.cfg.SysClassNet, c.h.cfg.NebulaIface)
-	cil, cilOK := hostutil.MTUOfIface(c.h.cfg.SysClassNet, c.h.cfg.CiliumIface)
+	neb, nebOK := hostutil.MTUOfIface(c.h.cfg.Net.SysClassNet, c.h.cfg.Net.NebulaIface)
+	cil, cilOK := hostutil.MTUOfIface(c.h.cfg.Net.SysClassNet, c.h.cfg.Cilium.Iface)
 	if !cilOK {
-		cil, cilOK = hostutil.RuntimeConfigMTU(c.h.cfg.CiliumRuntimeConfig)
+		cil, cilOK = hostutil.RuntimeConfigMTU(c.h.cfg.Cilium.RuntimeConfig)
 	}
 	// W9 double-encap guard: on the WireGuard datapath cilium_wg0
 	// carries pod traffic INSIDE the nebula overlay — its MTU must
 	// leave room for the WG header (~60B) under the overlay MTU.
 	// A wg0 MTU above neb−60 means pod packets exceed what the
 	// double-encapsulated path can carry → silent blackhole.
-	wg, wgOK := hostutil.MTUOfIface(c.h.cfg.SysClassNet, c.h.cfg.CiliumWG0Iface)
+	wg, wgOK := hostutil.MTUOfIface(c.h.cfg.Net.SysClassNet, c.h.cfg.Cilium.WG0Iface)
 	if !nebOK {
 		// No overlay to compare against — a drift latch from
 		// before must not linger.
@@ -994,7 +994,7 @@ func (c *ciliumWGCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCiliumWG, "abort").Inc()
 		return
 	}
-	if _, err := os.Stat(filepath.Join(c.h.cfg.SysClassNet, "cilium_wg0")); err != nil {
+	if _, err := os.Stat(filepath.Join(c.h.cfg.Net.SysClassNet, "cilium_wg0")); err != nil {
 		// No WireGuard datapath on this node (calico, tunnel mode,
 		// hub) — nothing to heal; drop stale evidence.
 		c.h.ciliumWGFails = 0
@@ -1021,14 +1021,14 @@ func (c *ciliumWGCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
 		return
 	}
-	actual, err := c.h.cfg.wgAllowedIPsFn(ctx)
+	actual, err := c.h.cfg.Seams.wgAllowedIPsFn(ctx)
 	if err != nil {
 		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers wg allowed-ips probe failed: %v — inconclusive, keeping state", err))
 		c.h.cycles.WithLabelValues(checkCiliumWG, "abort").Inc()
 		return
 	}
-	expected, err := c.h.cfg.ciliumEncryptPeersFn(ctx)
+	expected, err := c.h.cfg.Seams.ciliumEncryptPeersFn(ctx)
 	if err != nil || expected <= 0 {
 		// encrypt status unreadable or carries no count — fall back
 		// to ReadyNodes-1 (every OTHER Ready node is a peer).
@@ -1142,10 +1142,10 @@ func parseEnvoyXDSRejected(body []byte) uint64 {
 // caller keeps the streak untouched (a dead envoy also fails its
 // /ready probe and the B1 path owns that verdict).
 func (c *ciliumEnvoyCheck) evalEnvoyXDS(ctx context.Context) (reject, inconclusive bool) {
-	if c.h.cfg.CiliumEnvoyAdminURL == "" {
+	if c.h.cfg.Cilium.EnvoyAdminURL == "" {
 		return false, true
 	}
-	body, err := c.h.cfg.httpGetBody(ctx, c.h.cfg.CiliumEnvoyAdminURL, ciliumProbeTime)
+	body, err := c.h.cfg.Seams.httpGetBody(ctx, c.h.cfg.Cilium.EnvoyAdminURL, ciliumProbeTime)
 	if err != nil {
 		return false, true
 	}
@@ -1217,7 +1217,7 @@ func (c *ciliumLRPCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCiliumLRP, "gated").Inc()
 		return
 	}
-	if _, err := os.Stat(filepath.Join(c.h.cfg.SysClassNet, "cilium_host")); err != nil {
+	if _, err := os.Stat(filepath.Join(c.h.cfg.Net.SysClassNet, "cilium_host")); err != nil {
 		// No cilium datapath — the LRP wedge can't exist here.
 		c.fails = 0
 		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
@@ -1262,7 +1262,7 @@ func (c *ciliumLRPCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return
 	}
-	if c.h.cfg.dnsProbe(c.h.cfg.LocalDNSProbeAddr, c.h.cfg.LocalDNSProbeName,
+	if c.h.cfg.Seams.dnsProbe(c.h.cfg.Net.LocalDNSProbeAddr, c.h.cfg.Net.LocalDNSProbeName,
 		ciliumProbeTime) {
 		c.fails = 0
 		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
@@ -1272,7 +1272,7 @@ func (c *ciliumLRPCheck) Run(ctx context.Context, e *cycleEnv) {
 	if c.fails < c.h.cfg.ConsecNeeded {
 		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns :53 probe of %s failed while %s/%s Ready=True (check %d/%d)",
-			c.h.cfg.LocalDNSProbeAddr, nld.Namespace, nld.Name,
+			c.h.cfg.Net.LocalDNSProbeAddr, nld.Namespace, nld.Name,
 			c.fails, c.h.cfg.ConsecNeeded))
 		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return

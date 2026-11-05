@@ -79,7 +79,7 @@ func (c *ctrMetaCheck) Run(ctx context.Context, e *cycleEnv) {
 		return
 	}
 	evidence := ""
-	journalFn := c.h.cfg.ContainerdMetaJournalFn
+	journalFn := c.h.cfg.Ctr.MetaJournalFn
 	if journalFn == nil && c.h.cfg.Systemd != nil {
 		journalFn = func(ctx context.Context) (string, error) {
 			return c.h.cfg.Systemd.ExecCombined(ctx, "journalctl",
@@ -157,7 +157,7 @@ func (h *Hygiene) countMetaOrphanShims(pids []int) int {
 		if err != nil || !fi.IsDir() {
 			continue // dir gone → checkCtrTasks' orphan-shim path
 		}
-		if h.cfg.nowFn().Sub(fi.ModTime()) < ctrMetaOrphanMinAge {
+		if h.cfg.Seams.nowFn().Sub(fi.ModTime()) < ctrMetaOrphanMinAge {
 			continue
 		}
 		if h.ctrTaskInitLive(dir) {
@@ -201,7 +201,7 @@ func (c *hostOOMCheck) Name() string { return checkHostOOM }
 // node_agent_host_oom_kills_total delta. Pod-cgroup kills never
 // reach the markers — hostmetrics already classified them out.
 func (c *hostOOMCheck) Run(ctx context.Context, _ *cycleEnv) {
-	victim := strings.TrimSpace(readSmallFile(c.h.cfg.HostOOMVictimFile))
+	victim := strings.TrimSpace(readSmallFile(c.h.cfg.Host.OOMVictimFile))
 	fv := strings.Fields(victim)
 	if len(fv) < 2 {
 		c.h.cycles.WithLabelValues(checkHostOOM, "ok").Inc()
@@ -210,7 +210,7 @@ func (c *hostOOMCheck) Run(ctx context.Context, _ *cycleEnv) {
 	epoch, _ := strconv.ParseInt(fv[0], 10, 64)
 	comm := fv[1]
 	var count int64 = -1
-	if b, err := os.ReadFile(c.h.cfg.HostOOMCountFile); err == nil {
+	if b, err := os.ReadFile(c.h.cfg.Host.OOMCountFile); err == nil {
 		count, _ = strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
 	}
 	// Dedup on the cumulative count — the marker's epoch only moves
@@ -263,7 +263,7 @@ func (h *Hygiene) emitOOMEvent(ctx context.Context, comm string,
 	if h.cfg.Client == nil {
 		return
 	}
-	now := h.cfg.nowFn()
+	now := h.cfg.Seams.nowFn()
 	when := now
 	if epoch > 0 {
 		when = time.Unix(epoch, 0)
@@ -275,7 +275,7 @@ func (h *Hygiene) emitOOMEvent(ctx context.Context, comm string,
 			// (tests) or two kills land in the same nanosecond.
 			Name: fmt.Sprintf("%s.%x.%x", h.cfg.NodeName, total,
 				now.UnixNano()),
-			Namespace: h.cfg.EventNamespace,
+			Namespace: h.cfg.Host.EventNamespace,
 		},
 		EventTime: metav1.NewMicroTime(when),
 		Reason:    "SystemOOMVictim",
@@ -292,7 +292,7 @@ func (h *Hygiene) emitOOMEvent(ctx context.Context, comm string,
 			Name:       h.cfg.NodeName,
 		},
 	}
-	if _, err := h.cfg.Client.EventsV1().Events(h.cfg.EventNamespace).
+	if _, err := h.cfg.Client.EventsV1().Events(h.cfg.Host.EventNamespace).
 		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
 		h.state.AppendLog(fmt.Sprintf(
 			"suspect: SystemOOMVictim event create failed: %v", err))
@@ -332,7 +332,7 @@ func (c *orphanHPCheck) Run(ctx context.Context, e *cycleEnv) {
 		path, name string
 	}
 	var cands []cand
-	for _, root := range c.h.cfg.OrphanHostPathDirs {
+	for _, root := range c.h.cfg.Disk.OrphanHostPathDirs {
 		ents, err := os.ReadDir(root)
 		if err != nil {
 			continue
@@ -374,7 +374,7 @@ func (c *orphanHPCheck) Run(ctx context.Context, e *cycleEnv) {
 		if err != nil {
 			continue
 		}
-		if c.h.cfg.nowFn().Sub(fi.ModTime()) < orphanHostPathMinAge {
+		if c.h.cfg.Seams.nowFn().Sub(fi.ModTime()) < orphanHostPathMinAge {
 			continue // inside the deletion grace window
 		}
 		if !c.h.diskUsageAboveWatermark(filepath.Dir(cd.path)) {
@@ -445,7 +445,7 @@ func orphanHPRemovable(dir string) (bool, string) {
 // the ST2 removal watermark — statfs through the injectable seam.
 func (h *Hygiene) diskUsageAboveWatermark(dir string) bool {
 	var st unix.Statfs_t
-	if err := h.cfg.statfsFn(dir, &st); err != nil || st.Blocks == 0 {
+	if err := h.cfg.Seams.statfsFn(dir, &st); err != nil || st.Blocks == 0 {
 		return false // can't measure → don't remove (fail closed)
 	}
 	used := 1.0 - float64(st.Bavail)/float64(st.Blocks)
@@ -466,7 +466,7 @@ func (h *Hygiene) promTextfileDir() string {
 	if promTextfileDirOverride != "" {
 		return promTextfileDirOverride
 	}
-	return filepath.Join(filepath.Dir(h.cfg.K0sDataDir),
+	return filepath.Join(filepath.Dir(h.cfg.Disk.K0sDataDir),
 		"node-exporter", "textfile")
 }
 
@@ -496,7 +496,7 @@ func (h *Hygiene) writeNodeAgentPromTextfile() {
 			name, help, name, name, v)
 	}
 	if v, err := strconv.ParseInt(strings.TrimSpace(
-		readSmallFile(h.cfg.HostOOMCountFile)), 10, 64); err == nil {
+		readSmallFile(h.cfg.Host.OOMCountFile)), 10, 64); err == nil {
 		counter("node_agent_host_oom_kills_total",
 			"Host-level OOM kills observed by the kernel dmesg scanner (outside /kubepods or host daemons).", v)
 	} else {
@@ -504,7 +504,7 @@ func (h *Hygiene) writeNodeAgentPromTextfile() {
 			"Host-level OOM kills observed by the kernel dmesg scanner (outside /kubepods or host daemons).", 0)
 	}
 	if v, err := strconv.ParseInt(strings.TrimSpace(
-		readSmallFile(h.cfg.ConntrackDropsFile)), 10, 64); err == nil {
+		readSmallFile(h.cfg.Host.ConntrackDropsFile)), 10, 64); err == nil {
 		counter("node_agent_conntrack_drops_detected_total",
 			"nf_conntrack table-full records observed by the kernel dmesg scanner.", v)
 	} else {
