@@ -494,7 +494,7 @@ func TestPartitionEvictNamespacesParsing(t *testing.T) {
 	// Unset: save + clear the ambient value so the default branch is
 	// deterministic regardless of the shell the test runs under.
 	if old, had := os.LookupEnv(partitionNSsEnv); had {
-		t.Cleanup(func() { os.Setenv(partitionNSsEnv, old) }) //nolint:errcheck
+		t.Cleanup(func() { _ = os.Setenv(partitionNSsEnv, old) })
 	}
 	if err := os.Unsetenv(partitionNSsEnv); err != nil {
 		t.Fatal(err)

@@ -78,9 +78,9 @@ func TestAtomicWriteIdempotent(t *testing.T) {
 
 func TestModePreserved(t *testing.T) {
 	r := newTestReconciler(t, t.TempDir())
-	os.MkdirAll(filepath.Join(r.cfg.HostRoot, "etc"), 0o755)
+	_ = os.MkdirAll(filepath.Join(r.cfg.HostRoot, "etc"), 0o755)
 	p := filepath.Join(r.cfg.HostRoot, "etc/x.conf")
-	os.WriteFile(p, []byte("old"), 0o600)
+	_ = os.WriteFile(p, []byte("old"), 0o600)
 	if ch, _ := r.writeManaged("/etc/x.conf", []byte("new"), 0o644); !ch {
 		t.Fatal("expected change")
 	}
@@ -92,12 +92,12 @@ func TestModePreserved(t *testing.T) {
 
 func TestPinUnpinHosts(t *testing.T) {
 	vars := t.TempDir()
-	os.WriteFile(filepath.Join(vars, "interdc_nodes.yaml"), []byte("node-b: {name: b, ip: 10.0.0.1, site: s1}\n"), 0o644)
-	os.WriteFile(filepath.Join(vars, "defaults.yaml"), []byte("cp_endpoint: api.test.internal\n"), 0o644)
-	os.WriteFile(filepath.Join(vars, "cluster.yaml"), []byte("{}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(vars, "interdc_nodes.yaml"), []byte("node-b: {name: b, ip: 10.0.0.1, site: s1}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(vars, "defaults.yaml"), []byte("cp_endpoint: api.test.internal\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(vars, "cluster.yaml"), []byte("{}\n"), 0o644)
 	r := newTestReconciler(t, vars)
-	os.MkdirAll(filepath.Join(r.cfg.HostRoot, "etc"), 0o755)
-	os.WriteFile(filepath.Join(r.cfg.HostRoot, "etc/hosts"), []byte("127.0.0.1 localhost\n"), 0o644)
+	_ = os.MkdirAll(filepath.Join(r.cfg.HostRoot, "etc"), 0o755)
+	_ = os.WriteFile(filepath.Join(r.cfg.HostRoot, "etc/hosts"), []byte("127.0.0.1 localhost\n"), 0o644)
 	topo, err := topology.Load(topology.Config{VarsDir: vars, NodeName: "node-b"})
 	if err != nil {
 		t.Fatal(err)
@@ -248,8 +248,8 @@ func TestRunLongUsesLongBudget(t *testing.T) {
 	br := &budgetRunner{}
 	r.cfg.Runner = br
 	ctx := context.Background()
-	r.run(ctx, "systemctl", "is-active", "x")
-	r.runLong(ctx, "apt-get", "install", "-y", "x")
+	_, _ = r.run(ctx, "systemctl", "is-active", "x")
+	_, _ = r.runLong(ctx, "apt-get", "install", "-y", "x")
 	if d := br.dls["systemctl is-active x"]; d <= 115*time.Second || d > 120*time.Second {
 		t.Fatalf("run budget = %v, want ~120s", d)
 	}

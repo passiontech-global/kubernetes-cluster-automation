@@ -50,7 +50,7 @@ func TestSetupDisabled(t *testing.T) {
 // through setupModules for one ConfigMap typo.
 func TestSetupRejectsInvalidZoneWhen(t *testing.T) {
 	errsBefore := testutil.QueueErrorCount(t, "coredns-patcher")
-	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "ScheduleAnywway") //nolint:misspell — a typo is the point
+	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "ScheduleAnywway") // a typo is the point
 	t.Setenv("COREDNS_PATCHER_ZONE_MIN_DOMAINS", "0")
 	t.Setenv("COREDNS_MIN_REPLICAS", "0")
 	t.Setenv("COREDNS_NODES_PER_REPLICA", "0")
@@ -81,7 +81,7 @@ func TestSetupRejectsInvalidZoneWhen(t *testing.T) {
 	// A disabled module never validates — an unused knob must not
 	// disable or error.
 	m = testutil.NewStubManager()
-	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "ScheduleAnywway") //nolint:misspell
+	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "ScheduleAnywway")
 	if err := Setup(shared.Deps{Name: "coredns-patcher", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must ignore zoneWhen, got %v", err)

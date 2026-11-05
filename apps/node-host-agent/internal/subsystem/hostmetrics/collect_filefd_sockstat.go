@@ -57,7 +57,7 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var tcpInuse, tcpOrphan, tcpTW, tcpCW, sockUsed float64
 	var tcpInuseOK, tcpOrphanOK, tcpTWOK, tcpCWOK, sockUsedOK bool
 	sc := bufio.NewScanner(f)

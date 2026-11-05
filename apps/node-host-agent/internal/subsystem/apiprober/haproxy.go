@@ -27,7 +27,7 @@ func (p *Prober) socketCmd(ctx context.Context, cmd string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	deadline := time.Now().Add(p.cfg.TCPTimeout)
 	_ = conn.SetDeadline(deadline)
 	if _, err := io.WriteString(conn, cmd+"\n"); err != nil {

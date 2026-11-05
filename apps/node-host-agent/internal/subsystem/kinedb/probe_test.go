@@ -46,7 +46,7 @@ func wireListener(t *testing.T, resp byte) string {
 	if err != nil {
 		t.Skip("no loopback")
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -54,7 +54,7 @@ func wireListener(t *testing.T, resp byte) string {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				buf := make([]byte, 64)
 				_, _ = c.Read(buf)
 				_, _ = c.Write([]byte{resp})

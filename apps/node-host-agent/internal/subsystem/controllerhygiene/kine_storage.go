@@ -149,9 +149,11 @@ func (h *Hygiene) kineStoreSizes() (dbBytes, walBytes int64, ok bool) {
 func dirSizeBounded(root string, maxFiles int) (int64, error) {
 	var total int64
 	n := 0
-	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil //nolint:nilerr // skip unreadable entries
+			logger().Debug("controllerhygiene: kine store walk entry skipped — unreadable",
+				"path", path, "error", err)
+			return nil // skip unreadable entries
 		}
 		if d.IsDir() {
 			return nil

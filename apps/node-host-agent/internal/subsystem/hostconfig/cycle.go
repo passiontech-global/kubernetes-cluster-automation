@@ -492,7 +492,7 @@ func downloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
 	}
@@ -520,15 +520,15 @@ func downloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time
 		err = cerr
 	}
 	if err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
 	if wantSHA256 != "" && !strings.EqualFold(wantSHA256, hex.EncodeToString(h.Sum(nil))) {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return fmt.Errorf("download %s: sha256 mismatch", url)
 	}
 	if err := os.Rename(tmp, dst); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
 	return nil
@@ -548,7 +548,7 @@ func untarInstall(tgz, member, dst string, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 	tr := tar.NewReader(gz)
 	for {
 		hd, err := tr.Next()
@@ -581,11 +581,11 @@ func untarInstall(tgz, member, dst string, mode os.FileMode) error {
 			if err != nil {
 				// sweep the partial tmp — a truncated member must not
 				// linger next to the live binary.
-				os.Remove(tmp)
+				_ = os.Remove(tmp)
 				return err
 			}
 			if err := os.Rename(tmp, dst); err != nil {
-				os.Remove(tmp)
+				_ = os.Remove(tmp)
 				return err
 			}
 			return nil

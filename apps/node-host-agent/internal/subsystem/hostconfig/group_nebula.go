@@ -296,10 +296,7 @@ func (c *cyc) nebulaNeedsRestart(old, new []byte) bool {
 	}
 	ot := strip(sub(oldV, "tun"))
 	nt := strip(sub(newV, "tun"))
-	if fmt.Sprint(ot) != fmt.Sprint(nt) {
-		return true
-	}
-	return false
+	return fmt.Sprint(ot) != fmt.Sprint(nt)
 }
 
 func deepEqJ(a, b any) bool {

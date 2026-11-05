@@ -201,7 +201,7 @@ func (r *Reporter) readNewLogLines() ([][]byte, bool, error) {
 	if err != nil {
 		return nil, replay, fmt.Errorf("open %s: %w", r.cfg.WatchdogLogFile, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.Seek(r.logOffset, io.SeekStart); err != nil {
 		return nil, replay, fmt.Errorf("seek %s: %w", r.cfg.WatchdogLogFile, err)
 	}

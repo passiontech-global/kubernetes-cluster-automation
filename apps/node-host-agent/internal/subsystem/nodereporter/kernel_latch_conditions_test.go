@@ -50,12 +50,12 @@ func TestKernelLatchConditions(t *testing.T) {
 			got.status, got.reason)
 	}
 	// kubelet-watch-wedge is the other new alt key.
-	os.Remove(filepath.Join(e.dir, "state-containerd-corrupt"))
+	_ = os.Remove(filepath.Join(e.dir, "state-containerd-corrupt"))
 	state("kubelet-watch-wedge")
 	if got := condEvalFor(t, r, "KubeletRuntimeStall"); got.status != corev1.ConditionTrue {
 		t.Fatal("KubeletRuntimeStall not tripped by kubelet-watch-wedge")
 	}
-	os.Remove(filepath.Join(e.dir, "state-kubelet-watch-wedge"))
+	_ = os.Remove(filepath.Join(e.dir, "state-kubelet-watch-wedge"))
 	// fs-readonly alt key + pid-fd-pressure + clock-skew.
 	state("fs-readonly")
 	state("pid-fd-pressure")
@@ -75,10 +75,10 @@ func TestKernelLatchConditions(t *testing.T) {
 	// FilesystemReadOnly's primary stateKey "filesystem-readonly"? —
 	// primary is "filesystem-readonly"; the W10 latch is "fs-readonly"
 	// covered by altStateKeys. Verify a DIFFERENT key does NOT trip.
-	os.Remove(filepath.Join(e.dir, "state-fs-readonly"))
-	os.Remove(filepath.Join(e.dir, "state-pid-fd-pressure"))
-	os.Remove(filepath.Join(e.dir, "state-clock-skew"))
-	os.Remove(filepath.Join(e.dir, "state-fs-readonly"))
+	_ = os.Remove(filepath.Join(e.dir, "state-fs-readonly"))
+	_ = os.Remove(filepath.Join(e.dir, "state-pid-fd-pressure"))
+	_ = os.Remove(filepath.Join(e.dir, "state-clock-skew"))
+	_ = os.Remove(filepath.Join(e.dir, "state-fs-readonly"))
 	if got := condEvalFor(t, r, "ClockSkewDetected"); got.status != corev1.ConditionFalse {
 		t.Fatal("ClockSkewDetected stuck True after latch removal")
 	}

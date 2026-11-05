@@ -123,10 +123,8 @@ func TestDeriveMultiSite(t *testing.T) {
 	if topo.DNSFallbackMap != want {
 		t.Fatalf("fallbackMap=%q want %q", topo.DNSFallbackMap, want)
 	}
-	// lazy jinja: cluster.yaml referencing interdc_nodes
-	if got := topo.Vars.StrList("api_lb_backends"); len(got) != 0 {
-		// it's a list of maps — check via List accessor instead
-	}
+	// lazy jinja: cluster.yaml referencing interdc_nodes — the list
+	// holds maps, so it must come through the List accessor.
 	be := topo.Vars.List("api_lb_backends")
 	if len(be) != 1 {
 		t.Fatalf("api_lb_backends=%v", be)
@@ -148,7 +146,7 @@ node-b:
   site: s2
   marker_octet: 7
 `
-	os.WriteFile(filepath.Join(dir, "interdc_nodes.yaml"), []byte(nodes), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "interdc_nodes.yaml"), []byte(nodes), 0o644)
 	topo, err := Load(Config{VarsDir: dir, NodeName: "node-b"})
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +161,7 @@ node-b:
 // raw {{...}} text leaked into rendered config files.
 func TestVarsResolveFailClosed(t *testing.T) {
 	dir := writeVars(t)
-	os.WriteFile(filepath.Join(dir, "cluster.yaml"),
+	_ = os.WriteFile(filepath.Join(dir, "cluster.yaml"),
 		[]byte("broken: '{{ no_such_func(1) }}'\n"), 0o644)
 	topo, err := Load(Config{VarsDir: dir, NodeName: "node-b"})
 	if err != nil {
@@ -209,7 +207,7 @@ func TestLookupFailLoud(t *testing.T) {
 // vars-dir-rooted env Load/NewEnv build.
 func TestLookupFileViaEnv(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("s3cr3t\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("s3cr3t\n"), 0o644)
 	got, err := Render("{{ lookup('file', 'secret.txt') | trim }}",
 		map[string]any{}, NewEnv(dir, nil))
 	if err != nil {
@@ -243,8 +241,8 @@ func TestLookupFileViaEnv(t *testing.T) {
 // vars dir through the env Load wires — end-to-end coverage.
 func TestVarsFileLookup(t *testing.T) {
 	dir := writeVars(t)
-	os.WriteFile(filepath.Join(dir, "mesh_token"), []byte("tok-1\n"), 0o644)
-	os.WriteFile(filepath.Join(dir, "cluster.yaml"),
+	_ = os.WriteFile(filepath.Join(dir, "mesh_token"), []byte("tok-1\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "cluster.yaml"),
 		[]byte("token: \"{{ lookup('file', 'mesh_token') | trim }}\"\n"), 0o644)
 	topo, err := Load(Config{VarsDir: dir, NodeName: "node-b"})
 	if err != nil {
@@ -257,7 +255,7 @@ func TestVarsFileLookup(t *testing.T) {
 
 func TestVarsCycleLogged(t *testing.T) {
 	dir := writeVars(t)
-	os.WriteFile(filepath.Join(dir, "cluster.yaml"),
+	_ = os.WriteFile(filepath.Join(dir, "cluster.yaml"),
 		[]byte("a: '{{ b }}'\nb: '{{ a }}'\n"), 0o644)
 	topo, err := Load(Config{VarsDir: dir, NodeName: "node-b"})
 	if err != nil {

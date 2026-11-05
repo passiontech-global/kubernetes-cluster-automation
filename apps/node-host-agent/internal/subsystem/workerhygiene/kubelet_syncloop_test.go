@@ -159,7 +159,7 @@ func TestProbeUnixSockDefaultReturnsNilOnConnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	c := Config{}
 	c.applyDefaults()
 	if err := c.Seams.probeUnixSock(context.Background(), sock, time.Second); err != nil {

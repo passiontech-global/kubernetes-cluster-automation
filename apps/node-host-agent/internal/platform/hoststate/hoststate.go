@@ -351,8 +351,8 @@ func (s *Store) appendFile(msg string) {
 			"file", s.LogFile, "error", err)
 		return
 	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s %s\n", s.Now().Format(time.RFC3339), msg)
+	defer func() { _ = f.Close() }()
+	_, _ = fmt.Fprintf(f, "%s %s\n", s.Now().Format(time.RFC3339), msg)
 }
 
 // --- heartbeat (installed/last-run pair) ---

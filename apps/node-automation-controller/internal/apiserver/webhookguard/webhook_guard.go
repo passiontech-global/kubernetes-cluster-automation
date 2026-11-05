@@ -476,7 +476,7 @@ func tcpTLSEndpointProber(ctx context.Context, ip string, port int32) bool {
 	d := &net.Dialer{Timeout: 2 * time.Second}
 	conn, err := tls.DialWithDialer(d, "tcp",
 		net.JoinHostPort(ip, strconv.Itoa(int(port))),
-		&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // liveness probe only
+		&tls.Config{InsecureSkipVerify: true}) // liveness probe only
 	if err != nil {
 		return false
 	}

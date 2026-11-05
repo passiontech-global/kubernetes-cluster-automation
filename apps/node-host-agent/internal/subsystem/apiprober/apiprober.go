@@ -285,7 +285,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Prober, error) {
 	if cfg.HTTPClient != nil {
 		p.client = cfg.HTTPClient
 	} else if cfg.InsecureTLS {
-		//nolint:gosec // explicit opt-in, mirrors curl -sk
+		// explicit opt-in, mirrors curl -sk
 		p.client = &http.Client{Transport: baseTransport(
 			&tls.Config{InsecureSkipVerify: true})}
 	} else {

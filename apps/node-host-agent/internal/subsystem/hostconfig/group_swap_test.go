@@ -31,14 +31,14 @@ func (s *swapRunner) Run(ctx context.Context, name string, args ...string) (stri
 		mb, _ := strconv.ParseInt(strings.TrimSuffix(args[1], "M"), 10, 64)
 		p := filepath.Join(s.hostRoot, args[2])
 		if f, ferr := os.Create(p); ferr == nil {
-			f.Truncate(mb * 1048576)
-			f.Close()
+			_ = f.Truncate(mb * 1048576)
+			_ = f.Close()
 		}
 	}
 	if name == "dd" {
 		for _, a := range args {
 			if strings.HasPrefix(a, "of=") {
-				os.WriteFile(filepath.Join(s.hostRoot, a[3:]), []byte{}, 0o644)
+				_ = os.WriteFile(filepath.Join(s.hostRoot, a[3:]), []byte{}, 0o644)
 			}
 		}
 	}
@@ -178,7 +178,7 @@ func TestSwapSkipsRecreateWhenRightSize(t *testing.T) {
 	if err := f.Truncate(12288 * 1048576); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
+	_ = f.Close()
 	c := loadCyc(t, r, vars, "node-a")
 	c.groupSwap()
 	if len(sr.callsMatching("fallocate")) > 0 {
@@ -212,7 +212,7 @@ func TestSwapSwaponProbeFailureSkipsCycle(t *testing.T) {
 	if err := f.Truncate(2048 * 1048576); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	c := loadCyc(t, r, vars, "node-a")
 	c.groupSwap()
@@ -252,7 +252,7 @@ func TestSwapActiveMatchExactLine(t *testing.T) {
 		if err := f.Truncate(mb * 1048576); err != nil {
 			t.Fatal(err)
 		}
-		f.Close()
+		_ = f.Close()
 	}
 
 	// /swapfile probed while only /swapfile-kine is active: NOT active

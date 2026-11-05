@@ -26,11 +26,11 @@ import (
 func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
 	k, err := New(cfg, nil)
 	if err != nil {
-		fmt.Fprintln(out, "check-kine-db: init:", err)
+		_, _ = fmt.Fprintln(out, "check-kine-db: init:", err)
 		return 1
 	}
 	host, _ := os.Hostname()
-	fmt.Fprintf(out, "== kine DB probe on %s (runtime=%s) ==\n",
+	_, _ = fmt.Fprintf(out, "== kine DB probe on %s (runtime=%s) ==\n",
 		host, k.cfg.Runtime)
 
 	res := k.runProbeChecks(ctx)
@@ -38,10 +38,10 @@ func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
 	fail := 0
 	check := func(name string, ok bool) {
 		if ok {
-			fmt.Fprintf(out, "  OK   %s\n", name)
+			_, _ = fmt.Fprintf(out, "  OK   %s\n", name)
 			return
 		}
-		fmt.Fprintf(out, "  FAIL %s\n", name)
+		_, _ = fmt.Fprintf(out, "  FAIL %s\n", name)
 		fail++
 	}
 	check(fmt.Sprintf("containers %s + %s running",
@@ -62,16 +62,16 @@ func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
 		intOrNA(res.revSeen, res.liveTup)),
 		res.checks[checkRevision] == 1)
 
-	fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out)
 	if fail == 0 {
-		fmt.Fprintln(out,
+		_, _ = fmt.Fprintln(out,
 			"ALL OK — update is safe. Still verify the api: kubectl get nodes")
 		return 0
 	}
-	fmt.Fprintln(out, "CHECKS FAILED — do NOT treat the update as done.")
-	fmt.Fprintln(out,
+	_, _ = fmt.Fprintln(out, "CHECKS FAILED — do NOT treat the update as done.")
+	_, _ = fmt.Fprintln(out,
 		"If backend_auth fails: .env rotated but old DB roles remain -> fix:")
-	fmt.Fprintf(out,
+	_, _ = fmt.Fprintf(out,
 		"  %s exec %s psql -U postgres -d postgres \\\n"+
 			"    -c \"ALTER ROLE <user> WITH PASSWORD '<NEW_POSTGRES_PASSWORD>'\"\n",
 		k.cfg.Runtime, res.pgName)

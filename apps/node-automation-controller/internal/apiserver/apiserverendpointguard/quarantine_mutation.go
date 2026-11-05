@@ -5,7 +5,10 @@
 // pure Endpoints/EndpointSlice mutation helpers run() applies to the
 // SSOT object's deep copy before Update.
 //
-//nolint:staticcheck // SA1019: the deprecated corev1 Endpoints object is deliberate here — it is the writable SSOT the guard manages on hosted planes where EndpointSlice mirroring does not apply.
+// The deprecated core/v1 Endpoints object stays the writable SSOT on
+// hosted planes where EndpointSlice mirroring does not apply — it is
+// reached as unstructured maps (dynamic client) so the deprecated
+// type is never named in code.
 package apiserverendpointguard
 
 import (
@@ -13,26 +16,76 @@ import (
 	"slices"
 	"strings"
 
-	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // ---------------------------------------------------------------------------
-// Endpoint / EndpointSlice mutation helpers.
+// Endpoints (unstructured) navigation.
+//
+// Nested* accessors deep-copy, so read helpers can consume them
+// directly while mutators build a fresh subsets slice and write it
+// back through unstructured.SetNestedSlice.
+// ---------------------------------------------------------------------------
+
+// endpointSubsets decodes subsets[] into maps — absent/garbage-shaped
+// entries are skipped rather than panicking on a hand-edited object.
+func endpointSubsets(ep *unstructured.Unstructured) []map[string]any {
+	subs, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
+	out := make([]map[string]any, 0, len(subs))
+	for _, s := range subs {
+		if m, ok := s.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// nestedMaps decodes a map-typed list field (addresses,
+// notReadyAddresses, ports) into maps — same skip-garbage contract.
+func nestedMaps(m map[string]any, field string) []map[string]any {
+	l, _, _ := unstructured.NestedSlice(m, field)
+	out := make([]map[string]any, 0, len(l))
+	for _, e := range l {
+		if em, ok := e.(map[string]any); ok {
+			out = append(out, em)
+		}
+	}
+	return out
+}
+
+// num64 reads an unstructured scalar as int64 — JSON ints decode as
+// int64, but hand-built fixtures (or JSONNumber decoders) can carry
+// other numeric shapes.
+func num64(v any) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case float64:
+		return int64(n)
+	}
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Endpoints mutation helpers.
 // ---------------------------------------------------------------------------
 
 // endpointIPs returns the sorted deduped controller IPs currently in
 // the Endpoints subsets — notReadyAddresses count too: a not-ready
 // backend is still a controller IP (and a wedge suspect).
-func endpointIPs(ep *corev1.Endpoints) []string {
+func endpointIPs(ep *unstructured.Unstructured) []string {
 	set := map[string]bool{}
-	for _, sub := range ep.Subsets {
-		for _, a := range sub.Addresses {
-			set[a.IP] = true
-		}
-		for _, a := range sub.NotReadyAddresses {
-			set[a.IP] = true
+	for _, sub := range endpointSubsets(ep) {
+		for _, field := range []string{"addresses", "notReadyAddresses"} {
+			for _, a := range nestedMaps(sub, field) {
+				if ip, _ := a["ip"].(string); ip != "" {
+					set[ip] = true
+				}
+			}
 		}
 	}
 	return slices.Sorted(maps.Keys(set))
@@ -42,11 +95,13 @@ func endpointIPs(ep *corev1.Endpoints) []string {
 // subsets[].Addresses ONLY — a notReadyAddresses entry is probed and
 // quarantined like any backend, but it can never serve traffic, so it
 // must not count as a healthy peer when deciding removals.
-func routableEndpointIPs(ep *corev1.Endpoints) map[string]bool {
+func routableEndpointIPs(ep *unstructured.Unstructured) map[string]bool {
 	set := map[string]bool{}
-	for _, sub := range ep.Subsets {
-		for _, a := range sub.Addresses {
-			set[a.IP] = true
+	for _, sub := range endpointSubsets(ep) {
+		for _, a := range nestedMaps(sub, "addresses") {
+			if ip, _ := a["ip"].(string); ip != "" {
+				set[ip] = true
+			}
 		}
 	}
 	return set
@@ -68,14 +123,19 @@ func parseQuarantineAnnotation(obj metav1.Object) map[string]bool {
 func writeQuarantineAnnotation(obj metav1.Object, set map[string]bool) {
 	a := obj.GetAnnotations()
 	if len(set) == 0 {
+		if _, ok := a[endpointGuardAnno]; !ok {
+			return
+		}
 		delete(a, endpointGuardAnno)
-		return
+	} else {
+		if a == nil {
+			a = map[string]string{}
+		}
+		a[endpointGuardAnno] = strings.Join(slices.Sorted(maps.Keys(set)), ",")
 	}
-	if a == nil {
-		a = map[string]string{}
-		obj.SetAnnotations(a)
-	}
-	a[endpointGuardAnno] = strings.Join(slices.Sorted(maps.Keys(set)), ",")
+	// GetAnnotations returns a COPY for unstructured objects — always
+	// write the map back (harmless on typed objects where it is live).
+	obj.SetAnnotations(a)
 }
 
 func unionIPs(a []string, b map[string]bool) []string {
@@ -92,47 +152,68 @@ func unionIPs(a []string, b map[string]bool) []string {
 // removeEndpointIP drops ip from every subset's Addresses AND
 // NotReadyAddresses; a subset left with zero addresses is dropped so
 // the object never serializes an empty-addresses subset.
-func removeEndpointIP(ep *corev1.Endpoints, ip string) {
-	subsets := ep.Subsets[:0]
-	for _, sub := range ep.Subsets {
-		sub.Addresses = dropAddr(sub.Addresses, ip)
-		sub.NotReadyAddresses = dropAddr(sub.NotReadyAddresses, ip)
-		if len(sub.Addresses) > 0 || len(sub.NotReadyAddresses) > 0 {
-			subsets = append(subsets, sub)
+func removeEndpointIP(ep *unstructured.Unstructured, ip string) {
+	subs, found, _ := unstructured.NestedSlice(ep.Object, "subsets")
+	if !found {
+		return
+	}
+	out := make([]any, 0, len(subs))
+	for _, s := range subs {
+		m, ok := s.(map[string]any)
+		if !ok {
+			out = append(out, s)
+			continue
+		}
+		empty := true
+		for _, f := range []string{"addresses", "notReadyAddresses"} {
+			if kept := dropAddrField(m, f, ip); len(kept) > 0 {
+				empty = false
+			}
+		}
+		if !empty {
+			out = append(out, m)
 		}
 	}
-	// Zero the tail — stale subset copies would otherwise keep the
-	// dropped address strings reachable through the backing array.
-	clear(ep.Subsets[len(subsets):])
-	ep.Subsets = subsets
+	_ = unstructured.SetNestedSlice(ep.Object, out, "subsets")
 }
 
-func dropAddr(addrs []corev1.EndpointAddress, ip string) []corev1.EndpointAddress {
-	out := addrs[:0]
+// dropAddrField filters ip out of m[field] in place and returns the
+// kept entries — an absent field is already empty.
+func dropAddrField(m map[string]any, field, ip string) []any {
+	addrs, found, _ := unstructured.NestedSlice(m, field)
+	if !found {
+		return nil
+	}
+	kept := addrs[:0]
 	for _, a := range addrs {
-		if a.IP != ip {
-			out = append(out, a)
+		if am, ok := a.(map[string]any); !ok || am["ip"] != ip {
+			kept = append(kept, a)
 		}
 	}
-	clear(addrs[len(out):])
-	return out
+	clear(addrs[len(kept):])
+	_ = unstructured.SetNestedSlice(m, kept, field)
+	return kept
 }
 
 // addEndpointIP appends ip to the subset serving :443 (the kubernetes
 // API port — falls back to the first subset, then to a fresh subset so
 // a cluster whose object was emptied can still be re-seeded).
-func addEndpointIP(ep *corev1.Endpoints, ip string) {
-	for _, sub := range ep.Subsets {
-		for _, a := range sub.Addresses {
-			if a.IP == ip {
-				return // already back — reconciler beat us to it
+func addEndpointIP(ep *unstructured.Unstructured, ip string) {
+	subs, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
+	for _, sub := range subs {
+		if m, ok := sub.(map[string]any); ok {
+			for _, a := range nestedMaps(m, "addresses") {
+				if a["ip"] == ip {
+					return // already back — reconciler beat us to it
+				}
 			}
 		}
 	}
 	idx := -1
-	for i, sub := range ep.Subsets {
-		for _, p := range sub.Ports {
-			if p.Port == 6443 || p.Name == "https" {
+	for i, s := range subs {
+		m, _ := s.(map[string]any)
+		for _, p := range nestedMaps(m, "ports") {
+			if num64(p["port"]) == 6443 || p["name"] == "https" {
 				idx = i
 				break
 			}
@@ -141,20 +222,32 @@ func addEndpointIP(ep *corev1.Endpoints, ip string) {
 			break
 		}
 	}
-	if idx < 0 && len(ep.Subsets) > 0 {
+	if idx < 0 && len(subs) > 0 {
 		idx = 0
 	}
 	if idx < 0 {
-		ep.Subsets = []corev1.EndpointSubset{{
-			Addresses: []corev1.EndpointAddress{{IP: ip}},
-			Ports: []corev1.EndpointPort{
-				{Name: "https", Port: 6443, Protocol: corev1.ProtocolTCP},
+		subs = []any{map[string]any{
+			"addresses": []any{map[string]any{"ip": ip}},
+			"ports": []any{map[string]any{
+				"name": "https", "port": int64(6443), "protocol": "TCP"},
 			},
 		}}
-		return
+	} else if m, ok := subs[idx].(map[string]any); ok {
+		addrs, _, _ := unstructured.NestedSlice(m, "addresses")
+		addrs = append(addrs, map[string]any{"ip": ip})
+		_ = unstructured.SetNestedSlice(m, addrs, "addresses")
+		subs[idx] = m
+	} else {
+		// Garbage-shaped subset entry: append a fresh well-formed
+		// subset rather than dropping the unknown blob.
+		subs = append(subs, map[string]any{
+			"addresses": []any{map[string]any{"ip": ip}},
+			"ports": []any{map[string]any{
+				"name": "https", "port": int64(6443), "protocol": "TCP"},
+			},
+		})
 	}
-	ep.Subsets[idx].Addresses = append(ep.Subsets[idx].Addresses,
-		corev1.EndpointAddress{IP: ip})
+	_ = unstructured.SetNestedSlice(ep.Object, subs, "subsets")
 }
 
 // sliceIPs returns the sorted deduped backend IPs across all

@@ -89,9 +89,11 @@ func (c *Collector) walkLocalPVDirs() map[string]int64 {
 func dirSizeBytes(root string, maxEntries int) int64 {
 	var total int64
 	n := 0
-	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil //nolint:nilerr // skip unreadable entries, never fatal
+			logger().Debug("hostmetrics: localpv walk entry skipped — unreadable",
+				"path", path, "error", err)
+			return nil // skip unreadable entries, never fatal
 		}
 		n++
 		if n > maxEntries {

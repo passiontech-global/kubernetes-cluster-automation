@@ -82,12 +82,12 @@ func runCheck(ctx context.Context, cfg hostmetrics.K0sDriftConfig,
 	scan := hostmetrics.ScanK0sDrift(cfg)
 	cfg = scan.Config // print the normalized (defaults-applied) paths
 	if scan.NotController {
-		fmt.Fprintf(out, "check-k0s-drift: %s absent — "+
+		_, _ = fmt.Fprintf(out, "check-k0s-drift: %s absent — "+
 			"not a k0s controller, skip\n", cfg.UnitFile)
 		return 0
 	}
 	if len(scan.Findings) == 0 {
-		fmt.Fprintln(out, "check-k0s-drift: OK (no drift)")
+		_, _ = fmt.Fprintln(out, "check-k0s-drift: OK (no drift)")
 		return 0
 	}
 
@@ -108,24 +108,24 @@ func runCheck(ctx context.Context, cfg hostmetrics.K0sDriftConfig,
 		}
 	}
 	if unreadable {
-		fmt.Fprintf(out,
+		_, _ = fmt.Fprintf(out,
 			"DRIFT %s: cannot read / parse k0s.yaml\n",
 			cfg.ConfigFile)
 	}
 	if len(extra) > 0 {
 		slices.Sort(extra)
-		fmt.Fprintf(out,
+		_, _ = fmt.Fprintf(out,
 			"DRIFT %s: key present on node but not in expected set: %s\n",
 			cfg.ConfigFile, strings.Join(extra, " "))
 	}
 	if len(missing) > 0 {
-		fmt.Fprintf(out,
+		_, _ = fmt.Fprintf(out,
 			"DRIFT %s: key in expected set but missing on node: %s\n",
 			cfg.ConfigFile, strings.Join(missing, " "))
 	}
 	slices.Sort(removed)
 	for _, flag := range removed {
-		fmt.Fprintf(out,
+		_, _ = fmt.Fprintf(out,
 			"REMOVED-FLAG %s: k0s.yaml still has '%s' "+
 				"(removed upstream -> component will crashloop after upgrade)\n",
 			cfg.ConfigFile, flag)

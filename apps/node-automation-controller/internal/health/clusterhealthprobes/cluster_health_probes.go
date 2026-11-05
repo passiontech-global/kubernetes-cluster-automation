@@ -268,8 +268,10 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 		// is not a health signal: emitting FAIL=1 or a run error now
 		// would leave fake series behind on the dying pod. Bail out
 		// silently — the surviving leader's next cycle reports.
-		if ctx.Err() != nil {
-			return nil //nolint:nilerr // cancelled ctx is not a run error — bail silently
+		if err := ctx.Err(); err != nil {
+			log.V(1).Info("sweep context cancelled — bailing without reporting",
+				"check", c.name, "error", err)
+			return nil // cancelled ctx is not a run error — bail silently
 		}
 		if cctx.Err() == context.DeadlineExceeded {
 			log.Info("health check exceeded per-check timeout",

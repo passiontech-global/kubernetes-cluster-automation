@@ -38,7 +38,7 @@ func UnixGet(ctx context.Context, socket, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return nil, fmt.Errorf("GET %s: status %d", path, resp.StatusCode)

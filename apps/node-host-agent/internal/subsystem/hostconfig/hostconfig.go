@@ -449,8 +449,8 @@ func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode)
 	// A short write is a failed write — n < len(content) means a
 	// truncated file would be promoted by the rename below.
 	if n, err := f.Write(content); err != nil || n < len(content) {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		if err == nil {
 			err = io.ErrShortWrite
 		}
@@ -459,8 +459,8 @@ func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode)
 	// fsync BEFORE rename — the content must be durable at the final
 	// name, so a crash after rename can never expose a zeroed file.
 	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return fail(err)
 	}
 	// Evict the just-written pages — a staged binary's cache charge
@@ -468,15 +468,15 @@ func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode)
 	// the pages are clean, so DONTNEED drops them outright.
 	pagecache.Drop(f)
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return fail(err)
 	}
 	if err := os.Chmod(tmp, mode); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return fail(err)
 	}
 	if err := os.Rename(tmp, dst); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return fail(err)
 	}
 	// Parent-dir fsync: the rename is only durable once the new

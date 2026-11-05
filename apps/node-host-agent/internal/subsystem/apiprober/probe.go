@@ -168,7 +168,7 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 	if err != nil {
 		return 0, classifyTransport(err), err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// A metadata-only list is a few hundred bytes — the 1 MiB cap is
 	// a safety bound only. Drain any tail to EOF so keep-alive can
 	// reuse the connection.

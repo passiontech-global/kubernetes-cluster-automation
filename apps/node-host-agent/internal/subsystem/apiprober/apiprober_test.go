@@ -70,7 +70,7 @@ func newFakeHAProxy(t *testing.T, rows ...[2]string) *fakeHAProxy {
 			go f.handle(conn)
 		}
 	}()
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	return f
 }
 
@@ -91,7 +91,7 @@ func (f *fakeHAProxy) statCSV() string {
 }
 
 func (f *fakeHAProxy) handle(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	buf := make([]byte, 8192)
 	n, err := conn.Read(buf)
 	if err != nil {
@@ -102,7 +102,7 @@ func (f *fakeHAProxy) handle(conn net.Conn) {
 	defer f.mu.Unlock()
 	f.cmds = append(f.cmds, cmd)
 	if strings.HasPrefix(cmd, "show stat") {
-		io.WriteString(conn, f.statCSV())
+		_, _ = io.WriteString(conn, f.statCSV())
 		return
 	}
 	// "<enable|disable> server kube_apiserver/<name>" — apply like
@@ -114,7 +114,7 @@ func (f *fakeHAProxy) handle(conn net.Conn) {
 			reply, fail = f.failReply[parts[0]+" "+parts[1]]
 		}
 		if fail {
-			io.WriteString(conn, reply)
+			_, _ = io.WriteString(conn, reply)
 			return
 		}
 	}
@@ -186,7 +186,7 @@ func newAPIStubOn(t *testing.T, listenAddr string) *apiStub {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"apiVersion":"v1","kind":"List","metadata":{"resourceVersion":"%d"},"items":[]}`, rv)
+		_, _ = fmt.Fprintf(w, `{"apiVersion":"v1","kind":"List","metadata":{"resourceVersion":"%d"},"items":[]}`, rv)
 	}))
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -365,7 +365,7 @@ func pipeDial(reply string) func(context.Context, string) (net.Conn, error) {
 	return func(_ context.Context, _ string) (net.Conn, error) {
 		c1, c2 := net.Pipe()
 		go func() {
-			defer c2.Close()
+			defer func() { _ = c2.Close() }()
 			buf := make([]byte, 256)
 			_, _ = c2.Read(buf) // consume the command — pipe is synchronous
 			if reply != "" {

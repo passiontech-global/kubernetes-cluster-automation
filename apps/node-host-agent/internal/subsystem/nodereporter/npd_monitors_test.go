@@ -257,8 +257,8 @@ func (e *env) appendKmsg(t *testing.T, record string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	f.WriteString(record + "\n")
+	defer func() { _ = f.Close() }()
+	_, _ = f.WriteString(record + "\n")
 }
 
 // TestKmsgTail: records drained from the (fake) kmsg device bump
@@ -365,7 +365,7 @@ func TestReadKmsgAvailCaughtUpFlag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	// Fixture kmsg is empty → EOF on first read → caught up.
 	if _, caughtUp, err := readKmsgAvail(f); err != nil || !caughtUp {
 		t.Fatalf("empty kmsg: caughtUp=%v err=%v, want true,nil", caughtUp, err)

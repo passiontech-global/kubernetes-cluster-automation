@@ -46,9 +46,11 @@ func readDirNames(dir string) []string {
 // orphan-hostpath check (deep_failure_checks.go) walks with it too.
 func (h *Hygiene) walkBytes(root string) (total int64, truncated bool) {
 	entries := 0
-	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+			logger().Debug("workerhygiene: bloat walk entry skipped — unreadable",
+				"path", path, "error", err)
+			return nil // unreadable entries are skipped, never fatal
 		}
 		entries++
 		if entries > maxBloatWalkEntries {

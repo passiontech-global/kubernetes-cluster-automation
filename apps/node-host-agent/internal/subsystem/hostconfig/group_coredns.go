@@ -194,7 +194,7 @@ func (c *cyc) writeResolvConf(isHub bool, pub1 string) {
 		`grep -E '^(search|domain|options)' /etc/resolv.conf | grep -vFx 'options timeout:2 attempts:2' || true`)
 	dst := r.hp("/etc/resolv.conf")
 	if fi, err := os.Lstat(dst); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		os.Remove(dst)
+		_ = os.Remove(dst)
 	}
 	var rc strings.Builder
 	if isHub {

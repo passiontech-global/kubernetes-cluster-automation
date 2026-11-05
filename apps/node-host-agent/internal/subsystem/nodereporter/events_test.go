@@ -20,8 +20,8 @@ func (e *env) appendLog(t *testing.T, msg string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s %s\n", e.now.Format(time.RFC3339), msg)
+	defer func() { _ = f.Close() }()
+	_, _ = fmt.Fprintf(f, "%s %s\n", e.now.Format(time.RFC3339), msg)
 }
 
 // appendRawLog appends bytes verbatim (rotation/partial-line tests).
@@ -31,8 +31,8 @@ func (e *env) appendRawLog(t *testing.T, data string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	f.WriteString(data)
+	defer func() { _ = f.Close() }()
+	_, _ = f.WriteString(data)
 }
 
 // events returns all EventsV1 objects in the event namespace.

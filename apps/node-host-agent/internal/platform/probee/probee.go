@@ -61,7 +61,7 @@ import (
 // loopback/IP addresses the agent dials.
 var insecureClient = func() *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
+	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // mirrors curl -ks
 	tr.IdleConnTimeout = 90 * time.Second
 	return &http.Client{Transport: tr}
 }()

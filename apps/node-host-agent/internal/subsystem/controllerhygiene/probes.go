@@ -31,7 +31,7 @@ func pgWireOK(ctx context.Context, hostport string) bool {
 	if err != nil {
 		return false
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(8 * time.Second))
 	params := "user\x00postgres\x00database\x00postgres\x00\x00"
 	msg := append([]byte{0, 3, 0, 0}, params...) // 196608 big-endian

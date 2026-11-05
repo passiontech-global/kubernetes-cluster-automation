@@ -44,12 +44,12 @@ func (c *cyc) groupNLD() {
 				if fi == nil || fi.Mode()&os.ModeSymlink == 0 ||
 					func() bool { l, _ := os.Readlink(dst); return l != "/run/systemd/resolve/resolv.conf" }() {
 					tmp := dst + ".hostconfig.tmp"
-					os.Remove(tmp) // stale temp from a crashed converge
+					_ = os.Remove(tmp) // stale temp from a crashed converge
 					if err := os.Symlink("/run/systemd/resolve/resolv.conf", tmp); err != nil {
 						c.err("T4: resolv.conf temp symlink failed — DNS not repointed",
 							"path", dst, "error", err)
 					} else if err := os.Rename(tmp, dst); err != nil {
-						os.Remove(tmp)
+						_ = os.Remove(tmp)
 						c.err("T4: resolv.conf symlink repoint failed — DNS not repointed",
 							"path", dst, "error", err)
 					}

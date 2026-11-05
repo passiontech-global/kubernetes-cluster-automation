@@ -17,7 +17,7 @@ func TestDropOnOpenFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	Drop(f) // must not panic / must be callable on a regular file
 }
 

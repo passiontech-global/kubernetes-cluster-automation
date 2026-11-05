@@ -186,7 +186,7 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte) err
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Passwordless-sudo gate first: hub_converge ran become:true, so
 	// a non-root ssh_user needs `sudo -n` for EVERY remote op (the
@@ -238,7 +238,7 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte) err
 		// The streamed binary's pages were only needed for the put —
 		// same every-cycle charge problem as sha256File below.
 		pagecache.Drop(f)
-		f.Close()
+		_ = f.Close()
 		if err != nil {
 			return err
 		}

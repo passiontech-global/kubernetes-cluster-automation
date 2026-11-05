@@ -216,7 +216,7 @@ func TestKineServiceConverge(t *testing.T) {
 	bin := []byte("fake-kine-binary")
 	sum := sha256.Sum256(bin)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(bin)
+		_, _ = w.Write(bin)
 	}))
 	t.Cleanup(srv.Close)
 	vars := writeVarsDir(t, fmt.Sprintf(`kine_service_hosts: [node-a]

@@ -252,9 +252,9 @@ func (e *env) mkSock(t *testing.T, pid int, fd int, inode string, dbPort int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	// Columns: sl local rem st tx:rx tr:tm retr uid timeout inode ...
-	fmt.Fprintf(f, "   1: 0100007F:1234 0A0000FF:%04X 01 00000000:00000000 00:00000000 00000000 0 0 %s 1 0000000000000000\n",
+	_, _ = fmt.Fprintf(f, "   1: 0100007F:1234 0A0000FF:%04X 01 00000000:00000000 00:00000000 00000000 0 0 %s 1 0000000000000000\n",
 		dbPort, inode)
 }
 

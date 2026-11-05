@@ -194,7 +194,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	probeLn, err := net.Listen("tcp", a.cfg.ProbeAddr)
 	if err != nil {
-		metricsLn.Close()
+		_ = metricsLn.Close()
 		return fmt.Errorf("probe listener: %w", err)
 	}
 	a.ready.Store(true)

@@ -46,7 +46,7 @@ func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) 
 	cfg := &ssh.ClientConfig{
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // hub_converge parity
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // hub_converge parity
 		Timeout:         timeout,
 	}
 	addr := net.JoinHostPort(j.IP, "22")
@@ -58,7 +58,7 @@ func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) 
 		jcfg := &ssh.ClientConfig{
 			User:            juser,
 			Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-			HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 			Timeout:         timeout,
 		}
 		jc, err := dialSSH(ctx, net.JoinHostPort(jhost, jport), jcfg, timeout)
@@ -66,14 +66,14 @@ func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) 
 			return "", fmt.Errorf("jump %s: %w", j.ProxyJump, err)
 		}
 		jumpClient = jc
-		defer jumpClient.Close()
+		defer func() { _ = jumpClient.Close() }()
 		nc, err := jc.Dial("tcp", addr)
 		if err != nil {
 			return "", fmt.Errorf("jump %s -> %s: %w", j.ProxyJump, addr, err)
 		}
 		c, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
 		if err != nil {
-			nc.Close()
+			_ = nc.Close()
 			return "", fmt.Errorf("handshake via %s: %w", j.ProxyJump, err)
 		}
 		client = ssh.NewClient(c, chans, reqs)
@@ -83,13 +83,13 @@ func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) 
 			return "", err
 		}
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	sess, err := client.NewSession()
 	if err != nil {
 		return "", err
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 	type result struct {
 		out []byte
 		err error
@@ -102,7 +102,7 @@ func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) 
 	}()
 	select {
 	case <-ctx.Done():
-		sess.Close()
+		_ = sess.Close()
 		return "", ctx.Err()
 	case r := <-done:
 		if r.err != nil {
@@ -127,7 +127,7 @@ func dialSSH(ctx context.Context, addr string, cfg *ssh.ClientConfig,
 	_ = nc.SetDeadline(dl)
 	c, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
 	if err != nil {
-		nc.Close()
+		_ = nc.Close()
 		return nil, err
 	}
 	_ = nc.SetDeadline(time.Time{})

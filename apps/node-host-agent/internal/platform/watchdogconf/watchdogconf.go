@@ -188,9 +188,7 @@ func parseKV(data string) map[string]string {
 
 func wordList(v string) []string {
 	var out []string
-	for _, w := range strings.Fields(v) {
-		out = append(out, w)
-	}
+	out = append(out, strings.Fields(v)...)
 	return out
 }
 
