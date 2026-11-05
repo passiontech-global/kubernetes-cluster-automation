@@ -14,7 +14,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -42,8 +42,13 @@ func oescSliceExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 }
 
 func oescCleaner(cs *fake.Clientset) *orphanEndpointSliceCleaner {
-	return &orphanEndpointSliceCleaner{cs: cs, now: time.Now,
-		absentStreak: map[string]int{}}
+	return &orphanEndpointSliceCleaner{cs: cs, now: time.Now}
+}
+
+// oescStreakKey is the absentStreak ledger key run() builds for a
+// slice — "ns/name/uid".
+func oescStreakKey(s *discoveryv1.EndpointSlice) string {
+	return s.Namespace + "/" + s.Name + "/" + string(s.UID)
 }
 
 // ---------------------------------------------------------------------------
@@ -86,9 +91,9 @@ func TestOrphanEndpointSliceTwoCycleReap(t *testing.T) {
 // slice re-arms from zero.
 func TestOrphanEndpointSliceStreakResets(t *testing.T) {
 	svc := oescService("apps", "flap")
+	slice := oescSlice("apps", "flap-abc", "flap", 30*time.Minute)
 	cs := fake.NewSimpleClientset(
-		oescService("default", "kubernetes"),
-		oescSlice("apps", "flap-abc", "flap", 30*time.Minute))
+		oescService("default", "kubernetes"), slice)
 	c := oescCleaner(cs)
 
 	if err := c.run(ctx); err != nil {
@@ -101,7 +106,7 @@ func TestOrphanEndpointSliceStreakResets(t *testing.T) {
 	if err := c.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(c.absentStreak) != 0 {
+	if c.absentStreak.Count(oescStreakKey(slice)) != 0 {
 		t.Fatal("streak kept after the Service reappeared")
 	}
 	// Service vanishes again — the count starts over, so the next
@@ -138,8 +143,8 @@ func TestOrphanEndpointSliceTooFresh(t *testing.T) {
 // default/kubernetes* is control-plane — never a candidate, streak
 // or delete.
 func TestOrphanEndpointSliceSkipsDefaultKubernetes(t *testing.T) {
-	cs := fake.NewSimpleClientset(
-		oescSlice("default", "kubernetes", "kubernetes", time.Hour))
+	slice := oescSlice("default", "kubernetes", "kubernetes", time.Hour)
+	cs := fake.NewSimpleClientset(slice)
 	c := oescCleaner(cs)
 
 	// Note: NO services at all except none — wait, the fail-closed
@@ -156,7 +161,7 @@ func TestOrphanEndpointSliceSkipsDefaultKubernetes(t *testing.T) {
 	if !oescSliceExists(t, cs, "default", "kubernetes") {
 		t.Fatal("control-plane slice reaped")
 	}
-	if len(c.absentStreak) != 0 {
+	if c.absentStreak.Count(oescStreakKey(slice)) != 0 {
 		t.Fatal("control-plane slice tracked as absent")
 	}
 }
@@ -215,7 +220,7 @@ func TestOrphanEndpointSliceStaleSnapshotConfirmKeeps(t *testing.T) {
 	if !oescSliceExists(t, cs, "apps", "flaky-abc") {
 		t.Fatal("slice deleted on a stale snapshot — Get re-confirm failed")
 	}
-	if len(c.absentStreak) != 0 {
+	if c.absentStreak.Count(oescStreakKey(slice)) != 0 {
 		t.Fatal("streak kept after Get found the Service")
 	}
 }
@@ -274,7 +279,7 @@ func TestOrphanEndpointSliceSkipsTerminating(t *testing.T) {
 	if deletes != 0 {
 		t.Fatalf("terminating slice consumed %d delete attempt(s)", deletes)
 	}
-	if len(c.absentStreak) != 0 {
+	if c.absentStreak.Count(oescStreakKey(slice)) != 0 {
 		t.Fatal("terminating slice accrued an absent streak")
 	}
 	if !oescSliceExists(t, cs, "apps", "gone-abc") {

@@ -2,12 +2,13 @@ package datastore
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,16 +23,13 @@ type perconaQuorumCheck struct {
 	//     cluster read "initializing" — the 30m stuck-initializing
 	//     window for checkPerconaClusterQuorum (W10-ST5). Pruned on
 	//     resolve so a later re-init re-arms.
-	perconaInitSeen map[string]time.Time
+	perconaInitSeen shared.FirstSeenLedger
 }
 
-// newPerconaQuorumCheck builds the W10-ST5 check with a fresh
-// first-seen map — the state-map initialization that used to live in
-// the monolithic newClusterHealthProber literal.
+// newPerconaQuorumCheck builds the W10-ST5 check — the first-seen
+// ledger arms lazily on first use.
 func NewPerconaQuorumCheck(d *probefw.Deps) probefw.Check {
-	return &perconaQuorumCheck{Deps: d,
-		perconaInitSeen: map[string]time.Time{},
-	}
+	return &perconaQuorumCheck{Deps: d}
 }
 
 // ---------------------------------------------------------------------------
@@ -62,13 +60,10 @@ var perconaClusterGVRs = shared.PerconaClusterGVRs
 // "percona-cluster-quorum".
 func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 	if p.Dyn == nil {
-		return probefw.Result{Infra: fmt.Errorf(
+		return probefw.Result{Infra: errors.New(
 			"no dynamic client — percona quorum check unverifiable")}
 	}
 	now := p.Now()
-	if p.perconaInitSeen == nil {
-		p.perconaInitSeen = map[string]time.Time{}
-	}
 
 	var offenders []string
 	live := map[string]bool{}
@@ -123,15 +118,11 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 	// Prune init timers for clusters that disappeared entirely.
-	for k := range p.perconaInitSeen {
-		if !live[k] {
-			delete(p.perconaInitSeen, k)
-		}
-	}
+	p.perconaInitSeen.Prune(func(k string) bool { return live[k] })
 
 	if len(offenders) > 0 {
-		return probefw.Result{Why: fmt.Sprintf(
-			"percona cluster quorum: %s", strings.Join(offenders, ", "))}
+		return probefw.Result{Why: "percona cluster quorum: " +
+			strings.Join(offenders, ", ")}
 	}
 	if firstErr != nil {
 		return probefw.Result{Infra: firstErr}
@@ -178,16 +169,12 @@ func perconaStateLabel(state, statusField string) string {
 // perconaInitAge records (or returns the age of) the first sweep this
 // cluster was seen initializing — the 30m stuck-initializing clock.
 func (p *perconaQuorumCheck) perconaInitAge(key string, now time.Time) time.Duration {
-	since, ok := p.perconaInitSeen[key]
-	if !ok {
-		p.perconaInitSeen[key] = now
-		return 0
-	}
+	since, _ := p.perconaInitSeen.Observe(key, now)
 	return now.Sub(since)
 }
 
 // clearPerconaInit drops a cluster's initializing timer — resolved,
 // errored or otherwise no longer initializing.
 func (p *perconaQuorumCheck) clearPerconaInit(key string) {
-	delete(p.perconaInitSeen, key)
+	p.perconaInitSeen.Forget(key)
 }

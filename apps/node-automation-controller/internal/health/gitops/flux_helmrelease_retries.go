@@ -3,14 +3,15 @@ package gitops
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,16 +30,14 @@ type fluxHRRetriesCheck struct {
 	//     the 30m per-HelmRelease cooldown for the retries-exhausted
 	//     remediator (W10-CP4). The requestedAt annotation we stamp is
 	//     the durable half across restarts.
-	hrRetryHealed map[string]time.Time
+	hrRetryHealed shared.CooldownSet
 }
 
-// newFluxHRRetriesCheck builds the W10-CP4 check with a fresh
-// cooldown map — the state-map initialization that used to live in
-// the monolithic newClusterHealthProber literal.
+// newFluxHRRetriesCheck builds the W10-CP4 check — the constructor
+// that used to seed the cooldown map inside the monolithic
+// newClusterHealthProber literal; the ledger is zero-value ready.
 func NewFluxHRRetriesCheck(d *probefw.Deps) probefw.Check {
-	return &fluxHRRetriesCheck{Deps: d,
-		hrRetryHealed: map[string]time.Time{},
-	}
+	return &fluxHRRetriesCheck{Deps: d}
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +93,7 @@ var fluxHRFailureReasons = map[string]bool{
 func (p *fluxHRRetriesCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	if p.Dyn == nil {
-		return probefw.Result{Infra: fmt.Errorf(
+		return probefw.Result{Infra: errors.New(
 			"no dynamic client — helmrelease retry check unverifiable")}
 	}
 	now := p.Now()
@@ -224,8 +223,7 @@ func fluxHRReadyStrings(obj *unstructured.Unstructured) (status, reason, message
 func (p *fluxHRRetriesCheck) maybePatchHRRetry(ctx context.Context, log logr.Logger,
 	gvr schema.GroupVersionResource, hr *unstructured.Unstructured,
 	key string, now time.Time) {
-	last, ok := p.hrRetryHealed[key]
-	if ok && now.Sub(last) < fluxHRHealCooldown {
+	if p.hrRetryHealed.CooledDown(key, fluxHRHealCooldown, now) {
 		return
 	}
 	// The requestedAt annotation is the durable half: a stamp younger
@@ -259,7 +257,7 @@ func (p *fluxHRRetriesCheck) maybePatchHRRetry(ctx context.Context, log logr.Log
 		log.Error(err, "helmrelease retry patch failed", "hr", key)
 		return
 	}
-	p.hrRetryHealed[key] = now
+	p.hrRetryHealed.Stamp(key, now)
 	log.Info("patched helmrelease reconcile annotations",
 		"hr", key, "requestedAt", token)
 }

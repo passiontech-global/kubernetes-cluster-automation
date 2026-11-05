@@ -32,6 +32,7 @@ package metricsserverpatcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -51,8 +52,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // Exact patch body from the CronJob — strategic merge lands the
@@ -125,30 +126,41 @@ var nodeCountChanges = predicate.Funcs{
 // minReplicas/nodesPerReplica are the CPA-linear replica pin — see
 // proportionalReplicas. minReplicas<=0 disables the pin entirely.
 func Setup(d shared.Deps) error {
-	// Parse before the Disabled check — see corednspatcher: invalid
-	// knob values must warn even when the module is disabled.
-	minReplicas := shared.GetenvInt("METRICS_SERVER_MIN_REPLICAS", 3)
-	nodesPerReplica := shared.GetenvInt("METRICS_SERVER_NODES_PER_REPLICA", 1)
-	if d.Disabled {
-		return nil
+	return shared.SetupWithConfig(d, configFromEnv, func(cfg metricsServerPatcherConfig) error {
+		logf.Log.WithName(d.Name).Info("registered",
+			"minReplicas", cfg.minReplicas, "nodesPerReplica", cfg.nodesPerReplica)
+		b := ctrl.NewControllerManagedBy(d.Mgr).
+			Named(d.Name).
+			For(&appsv1.Deployment{}, builder.WithPredicates(onlyMetricsServerDeployment))
+		if cfg.minReplicas > 0 {
+			// Node add/remove changes the proportional replica total —
+			// see nodeCountChanges for why only create/delete fire.
+			// Collapses to one fixed key: Reconcile ignores the request
+			// name anyway. With the pin disabled the count is never read,
+			// so the watch is not registered at all.
+			b = b.Watches(&corev1.Node{},
+				handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("metrics-server-patcher-sweep")),
+				builder.WithPredicates(nodeCountChanges))
+		}
+		return b.Complete(&metricsServerPatcher{cs: d.CS, queue: d.Name,
+			minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica})
+	})
+}
+
+// metricsServerPatcherConfig is the module's env-resolved knob set.
+type metricsServerPatcherConfig struct {
+	minReplicas     int
+	nodesPerReplica int
+}
+
+// configFromEnv resolves the METRICS_SERVER_* knobs. SetupWithConfig
+// runs it before the Deps.Disabled gate — see corednspatcher: invalid
+// knob values must warn even when the module is disabled.
+func configFromEnv() metricsServerPatcherConfig {
+	return metricsServerPatcherConfig{
+		minReplicas:     shared.GetenvInt("METRICS_SERVER_MIN_REPLICAS", 3),
+		nodesPerReplica: shared.GetenvInt("METRICS_SERVER_NODES_PER_REPLICA", 1),
 	}
-	logf.Log.WithName(d.Name).Info("registered",
-		"minReplicas", minReplicas, "nodesPerReplica", nodesPerReplica)
-	b := ctrl.NewControllerManagedBy(d.Mgr).
-		Named(d.Name).
-		For(&appsv1.Deployment{}, builder.WithPredicates(onlyMetricsServerDeployment))
-	if minReplicas > 0 {
-		// Node add/remove changes the proportional replica total —
-		// see nodeCountChanges for why only create/delete fire.
-		// Collapses to one fixed key: Reconcile ignores the request
-		// name anyway. With the pin disabled the count is never read,
-		// so the watch is not registered at all.
-		b = b.Watches(&corev1.Node{},
-			handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("metrics-server-patcher-sweep")),
-			builder.WithPredicates(nodeCountChanges))
-	}
-	return b.Complete(&metricsServerPatcher{cs: d.CS, queue: d.Name,
-		minReplicas: minReplicas, nodesPerReplica: nodesPerReplica})
 }
 
 func (r *metricsServerPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -227,7 +239,7 @@ func metricsServerPatchBody(wantReplicas int32) ([]byte, error) {
 	}
 	spec, ok := body["spec"].(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("metricsServerPatch missing spec object")
+		return nil, errors.New("metricsServerPatch missing spec object")
 	}
 	spec["replicas"] = wantReplicas
 	return json.Marshal(body)

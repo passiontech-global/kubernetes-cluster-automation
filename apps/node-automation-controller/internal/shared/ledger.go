@@ -26,7 +26,7 @@ package shared
 
 import "slices"
 
-// GaugeLedger[K comparable] tracks which label-value tuples of one
+// GaugeLedger tracks which label-value tuples of one
 // gauge were emitted during the previous sweep versus the current
 // one. The zero value is ready to use — Emit allocates lazily, so
 // modules constructed literally in tests need no Setup path (the

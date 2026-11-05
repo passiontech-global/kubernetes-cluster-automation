@@ -21,8 +21,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -55,7 +55,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 		}
 		return fmt.Errorf("list kustomizations: %w", err)
 	}
-	now := time.Now()
+	now := u.now.Now()
 	for i := range kustomizations.Items {
 		k := &kustomizations.Items[i]
 		if suspended, _ := shared.NestedBool(k.Object, "spec", "suspend"); suspended {
@@ -78,13 +78,15 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 		}
 		key := k.GetNamespace() + "/" + k.GetName()
 		// Cooldown: wider of the in-RAM ledger and the persisted stamp.
-		last := u.immutableJobHealed[key]
+		cooled := u.immutableJobHealed.CooledDown(key, immutableJobCooldown, now)
 		if t, err := time.Parse(time.RFC3339,
-			k.GetAnnotations()[immutableJobHealAnno]); err == nil && t.After(last) {
-			last = t
+			k.GetAnnotations()[immutableJobHealAnno]); err == nil &&
+			now.Sub(t) < immutableJobCooldown {
+			// Fold the persisted stamp into the ledger.
+			u.immutableJobHealed.Stamp(key, t)
+			cooled = true
 		}
-		if now.Sub(last) < immutableJobCooldown {
-			u.immutableJobHealed[key] = last
+		if cooled {
 			continue
 		}
 		// The Job lives where the manifests apply — spec.targetNamespace
@@ -94,13 +96,14 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 			jobNS = tns
 		}
 		job, err := u.cs.BatchV1().Jobs(jobNS).Get(ctx, m[1], metav1.GetOptions{})
+		gone, err := shared.ConfirmAbsent(err)
 		if err != nil {
-			if apierrors.IsNotFound(err) {
-				continue // already gone — nothing to reap
-			}
 			metrics.IncError(u.queue)
 			log.Error(err, "immutable-job lookup failed", "kustomization", key, "job", jobNS+"/"+m[1])
 			continue
+		}
+		if gone {
+			continue // already gone — nothing to reap
 		}
 		done := job.Status.Succeeded >= 1 || jobFailed(job)
 		for _, c := range job.Status.Conditions {
@@ -122,7 +125,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 			continue
 		}
 		// Persist the stamp — the durable half of the 30m cooldown.
-		u.immutableJobHealed[key] = now
+		u.immutableJobHealed.Stamp(key, now)
 		payload, err := json.Marshal(map[string]any{
 			"metadata": map[string]any{"annotations": map[string]string{
 				immutableJobHealAnno: now.UTC().Format(time.RFC3339),

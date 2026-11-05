@@ -15,8 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // recover applies cooldown/storm-gate/rollout gates, then either
@@ -33,7 +33,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 	// roll the pods (unlike a pod-template annotation).
 	if last, ok := deploy.Annotations[corednsTSAnno]; ok {
 		if ts, err := strconv.ParseInt(last, 10, 64); err == nil {
-			if ago := time.Now().Unix() - ts; ago < corednsCooldownS {
+			if ago := w.now.Now().Unix() - ts; ago < corednsCooldownS {
 				metrics.IncError(w.queue)
 				log.Info("SKIP recovery: inside cooldown",
 					"pods", suspects, "agoS", ago, "cooldownS", corednsCooldownS)
@@ -72,7 +72,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 				"template": map[string]any{
 					"metadata": map[string]any{
 						"annotations": map[string]string{
-							"kubectl.kubernetes.io/restartedAt": time.Now().UTC().Format(time.RFC3339),
+							"kubectl.kubernetes.io/restartedAt": w.now.Now().UTC().Format(time.RFC3339),
 						},
 					},
 				},
@@ -98,7 +98,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 	patch, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{
 			"annotations": map[string]string{
-				corednsTSAnno: strconv.FormatInt(time.Now().Unix(), 10),
+				corednsTSAnno: strconv.FormatInt(w.now.Now().Unix(), 10),
 			},
 		},
 	})

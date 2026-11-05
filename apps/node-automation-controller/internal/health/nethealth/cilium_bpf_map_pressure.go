@@ -9,7 +9,7 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,7 +18,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // ciliumBPFMapPressureCheck is the cilium BPF map pressure watchdog.
@@ -70,9 +70,8 @@ func (p *ciliumBPFMapPressureCheck) Run(ctx context.Context) probefw.Result {
 	// check" escape) and rejects <=0 — the same contract the retired
 	// healthEnvFloat had.
 	threshold := shared.GetenvFloatPositive("CILIUM_BPF_MAP_PRESSURE_THRESHOLD", ciliumBPFDefaultThreshold)
-	query := fmt.Sprintf(
-		`max by (node, map_name) (cilium_bpf_map_pressure) > %s`,
-		strconv.FormatFloat(threshold, 'f', -1, 64))
+	query := `max by (node, map_name) (cilium_bpf_map_pressure) > ` +
+		strconv.FormatFloat(threshold, 'f', -1, 64)
 	series, err := p.PromQuery(ctx, query)
 	if err != nil {
 		log.Info("WARN: cilium bpf map pressure query failed — check inconclusive",

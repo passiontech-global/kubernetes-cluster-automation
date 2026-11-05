@@ -11,6 +11,7 @@ package webhookguard
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -22,8 +23,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -95,7 +96,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 		return fmt.Errorf("list namespaces — unmeshed audit skipped: %w", snap.nsErr)
 	}
 	if len(snap.ns.Items) == 0 {
-		return fmt.Errorf("empty namespace list (API flap) — unmeshed audit skipped")
+		return errors.New("empty namespace list (API flap) — unmeshed audit skipped")
 	}
 	nsInject := make(map[string]string, len(snap.ns.Items))
 	for _, ns := range snap.ns.Items {

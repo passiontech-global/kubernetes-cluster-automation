@@ -38,6 +38,7 @@ package deadnodesweeper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -53,8 +54,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -312,7 +313,7 @@ func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string)
 	// evidence" — unverifiable fails closed like every other check
 	// (same contract as descheduler-storm-gate's dyn guard).
 	if s.dyn == nil {
-		return false, fmt.Errorf("no dynamic client — remediation CR check unverifiable")
+		return false, errors.New("no dynamic client — remediation CR check unverifiable")
 	}
 	for _, gvr := range []schema.GroupVersionResource{
 		selfNodeRemediationGVR, fenceAgentsRemediationGVR,

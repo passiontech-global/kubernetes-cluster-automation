@@ -3,7 +3,7 @@
 package watchdogs
 
 import (
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -115,7 +115,8 @@ func TestCheckKCMWorkqueueFreezeAfterMinAge(t *testing.T) {
 	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
-	if _, ok := mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen["daemonset_desired_zero/daemonset/cilium"]; !ok {
+	if _, ok := mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen.
+		Seen("daemonset_desired_zero/daemonset/cilium", base); !ok {
 		t.Fatal("signature not tracked in kcmFirstSeen")
 	}
 	if v, ok := kcmFrozenGauge(t, "daemonset_desired_zero"); ok && v != 0 {
@@ -183,11 +184,12 @@ func TestCheckKCMWorkqueueStaleObservedGeneration(t *testing.T) {
 	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
-	if _, ok := mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen["stale_observed_generation/deployment/coredns"]; !ok {
+	if _, ok := mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen.
+		Seen("stale_observed_generation/deployment/coredns", base); !ok {
 		t.Fatal("deployment signature not tracked")
 	}
-	if len(mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen) != 1 {
-		t.Fatalf("settled DS must not be tracked: %v", mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen)
+	if keys := wdTrackedKeys(&mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 1 {
+		t.Fatalf("settled DS must not be tracked: %v", keys)
 	}
 
 	at := base.Add(11 * time.Minute)
@@ -224,8 +226,8 @@ func TestCheckKCMWorkqueueQuietOnStaleLease(t *testing.T) {
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
 		t.Fatalf("frozen gauge = %v on stale lease, want absent/0", v)
 	}
-	if len(mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen) != 0 {
-		t.Fatalf("stale lease left %d tracked signatures", len(mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen))
+	if keys := wdTrackedKeys(&mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
+		t.Fatalf("stale lease left %d tracked signatures", len(keys))
 	}
 
 	// A previously-frozen gauge also clears when the holder dies.
@@ -276,8 +278,8 @@ func TestCheckKCMWorkqueueQuietOnNoReadyNodes(t *testing.T) {
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
 		t.Fatalf("frozen gauge = %v with no ready nodes, want absent/0", v)
 	}
-	if len(mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen) != 0 {
-		t.Fatalf("no-ready-nodes left %d tracked signatures", len(mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen))
+	if keys := wdTrackedKeys(&mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
+		t.Fatalf("no-ready-nodes left %d tracked signatures", len(keys))
 	}
 }
 
@@ -329,8 +331,8 @@ func TestCheckKCMWorkqueueRecoveryClearsGauge(t *testing.T) {
 	if v, ok := kcmFrozenGauge(t, "daemonset_desired_zero"); !ok || v != 0 {
 		t.Fatalf("frozen gauge after recovery = %v,%v want 0", v, ok)
 	}
-	if len(mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen) != 0 {
-		t.Fatalf("resolved signature not pruned: %v", mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen)
+	if keys := wdTrackedKeys(&mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
+		t.Fatalf("resolved signature not pruned: %v", keys)
 	}
 }
 
@@ -377,7 +379,7 @@ func TestCheckKCMWorkqueueIgnoresEmptyDaemonSet(t *testing.T) {
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
 		t.Fatalf("frozen gauge = %v, want absent/0", v)
 	}
-	if len(mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen) != 0 {
-		t.Fatalf("non-signature must not be tracked: %v", mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen)
+	if keys := wdTrackedKeys(&mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
+		t.Fatalf("non-signature must not be tracked: %v", keys)
 	}
 }

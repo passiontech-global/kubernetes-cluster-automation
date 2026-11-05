@@ -83,8 +83,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -114,6 +114,10 @@ type helmReleaseUnlocker struct {
 	// come from one place.
 	queue string
 	mu    sync.Mutex
+	// now is the clock seam — tests pin it so the first-seen
+	// windows and the 24h cooldowns are deterministic. nil →
+	// time.Now.
+	now shared.Clock
 	// firstSeen: ns/name → first tick that saw the HR stuck on
 	// "in progress". Pruned when the HR recovers; an operator restart
 	// re-arms it, biasing conservative.
@@ -140,9 +144,12 @@ type helmReleaseUnlocker struct {
 	// persisted via node.ops/last-helm-stall-unwedge), and the
 	// once-per-cooldown alert dedup shared by "re-stalled after
 	// unwedge" and "signature matched but a guard refused".
+	// CooldownSets are zero-value ready and deliberately unbounded:
+	// stamps past the window read uncooled and entries for
+	// vanished HRs are dead weight.
 	stallFirstSeen shared.FirstSeenLedger
-	unwedged       map[string]time.Time
-	stallAlerted   map[string]time.Time
+	unwedged       shared.CooldownSet
+	stallAlerted   shared.CooldownSet
 	// stallAttempts caps the stall-unwedge retry cycle per
 	// lastAttemptedRevision (W8-GO2): at most 2 attempts for one
 	// revision, each at least 6h apart — a revision that could not
@@ -152,7 +159,7 @@ type helmReleaseUnlocker struct {
 	// Job delete (W8-GO1) — the 30m in-RAM half of the cooldown; the
 	// durable half is node.ops/last-immutable-job-heal on the
 	// Kustomization itself.
-	immutableJobHealed map[string]time.Time
+	immutableJobHealed shared.CooldownSet
 }
 
 // stallAttempt counts unwedge tries against one lastAttemptedRevision.
@@ -168,16 +175,14 @@ type stallAttempt struct {
 // healer run unconditionally like before.
 func Setup(d shared.Deps) error {
 	u := &helmReleaseUnlocker{
-		cs:                 d.CS,
-		dyn:                d.Dyn,
-		queue:              d.Name,
-		unlocked:           map[string]time.Time{},
-		alerted:            map[string]bool{},
-		stallEnabled:       shared.Gate("HELM_STALL_UNWEDGE_ENABLED", false),
-		unwedged:           map[string]time.Time{},
-		stallAlerted:       map[string]time.Time{},
-		stallAttempts:      map[string]*stallAttempt{},
-		immutableJobHealed: map[string]time.Time{},
+		cs:            d.CS,
+		dyn:           d.Dyn,
+		queue:         d.Name,
+		now:           shared.SystemClock,
+		unlocked:      map[string]time.Time{},
+		alerted:       map[string]bool{},
+		stallEnabled:  shared.Gate("HELM_STALL_UNWEDGE_ENABLED", false),
+		stallAttempts: map[string]*stallAttempt{},
 	}
 	return shared.AddPeriodic(d.Mgr, u.queue, helmUnlockInterval, u.run)
 }
@@ -188,18 +193,10 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	defer u.mu.Unlock()
 	// Lazy-init for literal-constructed structs (tests) — Setup
 	// always initializes, but a fixture must not panic on a nil map.
-	// The FirstSeenLedger fields are zero-value ready — no arm needed.
-	if u.unwedged == nil {
-		u.unwedged = map[string]time.Time{}
-	}
-	if u.stallAlerted == nil {
-		u.stallAlerted = map[string]time.Time{}
-	}
+	// The FirstSeenLedger and CooldownSet fields are zero-value
+	// ready — no arm needed.
 	if u.stallAttempts == nil {
 		u.stallAttempts = map[string]*stallAttempt{}
-	}
-	if u.immutableJobHealed == nil {
-		u.immutableJobHealed = map[string]time.Time{}
 	}
 
 	list, gvr, err := u.listHelmReleases(ctx)
@@ -207,7 +204,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 		return err
 	}
 
-	now := time.Now()
+	now := u.now.Now()
 	stuck := map[string]*unstructured.Unstructured{}
 	stalled := map[string]*unstructured.Unstructured{}
 	present := map[string]bool{} // every listed HR, stuck or not
@@ -248,17 +245,9 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 			delete(u.alerted, key)
 		}
 	}
-	// Identical prune for the unwedge ledger + its alert dedup.
-	for key, last := range u.unwedged {
-		if !present[key] || now.Sub(last) >= helmUnlockCooldown {
-			delete(u.unwedged, key)
-		}
-	}
-	for key, last := range u.stallAlerted {
-		if !present[key] || now.Sub(last) >= helmUnlockCooldown {
-			delete(u.stallAlerted, key)
-		}
-	}
+	// The unwedge ledger + its alert dedup need no prune pass:
+	// CooldownSet stamps past the window read uncooled and entries
+	// for vanished HRs are dead weight (no enumeration).
 
 	var due []string
 	for key := range stuck {

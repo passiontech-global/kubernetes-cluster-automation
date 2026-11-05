@@ -109,8 +109,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
@@ -480,7 +480,7 @@ func (j *concourseWorkdirJanitor) maybePruneWorker(ctx context.Context, podName 
 			s, err := j.atc.workerState(ctx, podName)
 			if err != nil {
 				lastErr = err
-				return false, nil // transient — keep polling inside the bound
+				return false, nil //nolint:nilerr // transient — keep polling inside the bound
 			}
 			lastErr = nil
 			st = s

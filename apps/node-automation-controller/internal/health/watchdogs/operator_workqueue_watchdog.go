@@ -2,13 +2,15 @@ package watchdogs
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -36,9 +38,9 @@ type operatorWorkqueueCheck struct {
 	//   - opHealed: operator → last leader-pod delete — the in-RAM
 	//     half of the 1h heal cooldown (the Lease annotation is the
 	//     durable half).
-	opFirstSeen map[string]time.Time
+	opFirstSeen shared.FirstSeenLedger
 	opFrozen    map[string]bool
-	opHealed    map[string]time.Time
+	opHealed    shared.CooldownSet
 
 	// gwClassCtlr caches GatewayClass name → spec.controllerName for
 	// ~a minute so the gateway-API ownership filter doesn't LIST the
@@ -47,15 +49,14 @@ type operatorWorkqueueCheck struct {
 	gwClassAt   time.Time
 }
 
-// newOperatorWorkqueueCheck builds the W5.8 watchdog with fresh
-// tracking maps — the state-map initialization that used to live in
-// the monolithic newClusterHealthProber literal (gwClassCtlr stays
-// lazily populated on first resolve).
+// newOperatorWorkqueueCheck builds the W5.8 watchdog — the ledgers
+// arm lazily on first use; only the frozen-reasons map needs the
+// explicit initialization that used to live in the monolithic
+// newClusterHealthProber literal (gwClassCtlr stays lazily
+// populated on first resolve).
 func NewOperatorWorkqueueCheck(d *probefw.Deps) probefw.Check {
 	return &operatorWorkqueueCheck{Deps: d,
-		opFirstSeen: map[string]time.Time{},
-		opFrozen:    map[string]bool{},
-		opHealed:    map[string]time.Time{},
+		opFrozen: map[string]bool{},
 	}
 }
 
@@ -99,18 +100,12 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 	// The CR scans and the maintenance mutex both need dyn — a
 	// missing client is a wiring bug, not "no signal".
 	if p.Dyn == nil {
-		return probefw.Result{Infra: fmt.Errorf(
+		return probefw.Result{Infra: errors.New(
 			"no dynamic client — operator workqueue check unverifiable")}
 	}
 	now := p.Now()
-	if p.opFirstSeen == nil {
-		p.opFirstSeen = map[string]time.Time{}
-	}
 	if p.opFrozen == nil {
 		p.opFrozen = map[string]bool{}
-	}
-	if p.opHealed == nil {
-		p.opHealed = map[string]time.Time{}
 	}
 
 	frozen := map[string]string{} // "operator/reason" → reason, for the why line
@@ -199,11 +194,8 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 				key := op.name + "/" + res.gvr.Resource + "/" +
 					o.GetNamespace() + "/" + o.GetName()
 				live[key] = true
-				first, ok := p.opFirstSeen[key]
-				if !ok {
-					p.opFirstSeen[key] = now
-				}
-				if !ok {
+				first, tracked := p.opFirstSeen.Observe(key, now)
+				if !tracked {
 					log.Info("operator stuck signature — tracking first-seen",
 						"operator", op.name, "resource", res.gvr.Resource,
 						"object", o.GetNamespace()+"/"+o.GetName())
@@ -220,11 +212,9 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 
-		for k := range p.opFirstSeen {
-			if strings.HasPrefix(k, op.name+"/") && !live[k] {
-				delete(p.opFirstSeen, k)
-			}
-		}
+		p.opFirstSeen.Prune(func(k string) bool {
+			return !strings.HasPrefix(k, op.name+"/") || live[k]
+		})
 		for k := range p.opFrozen {
 			if !strings.HasPrefix(k, op.name+"/") {
 				continue
@@ -263,9 +253,8 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	return probefw.Result{Infra: firstErr, Why: fmt.Sprintf(
-		"operator lease renews but target CRs unreconciled: %s",
-		strings.Join(keys, ", "))}
+	return probefw.Result{Infra: firstErr, Why: "operator lease renews but target CRs unreconciled: " +
+		strings.Join(keys, ", ")}
 }
 
 // operatorLease fetches the operator's leader-election Lease,
@@ -320,11 +309,9 @@ func (p *operatorWorkqueueCheck) operatorPodRunning(ctx context.Context, op oper
 // diagnosis cannot apply (absent/stale Lease) so a signature that
 // flaps around a precondition edge re-arms from scratch.
 func (p *operatorWorkqueueCheck) resetOperator(name string) {
-	for k := range p.opFirstSeen {
-		if strings.HasPrefix(k, name+"/") {
-			delete(p.opFirstSeen, k)
-		}
-	}
+	p.opFirstSeen.Prune(func(k string) bool {
+		return !strings.HasPrefix(k, name+"/")
+	})
 	for k := range p.opFrozen {
 		if !strings.HasPrefix(k, name+"/") {
 			continue

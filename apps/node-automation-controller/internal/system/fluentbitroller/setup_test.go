@@ -10,8 +10,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // Builder-based: .Complete() resolves the For() GVK via the real
@@ -33,14 +33,11 @@ func TestSetupRegistersController(t *testing.T) {
 // The ported roller skips mgr.Add entirely when Deps.Disabled is
 // stamped.
 func TestSetupDisabled(t *testing.T) {
-	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Name: "fluent-bit-config-roller", Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
-		t.Fatalf("disabled setup must return nil, got %v", err)
-	}
-	if len(m.Added) != 0 {
-		t.Fatalf("disabled module registered %d runnables, want 0", len(m.Added))
-	}
+	testutil.DisabledNoop(t, Setup, shared.Deps{
+		Name: "fluent-bit-config-roller",
+		CS:   fake.NewSimpleClientset(),
+		Dyn:  testutil.StubDyn(),
+	})
 }
 
 // The fluent-bit roller predicate pins the pipeline secret.

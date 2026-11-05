@@ -8,7 +8,7 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
 	"time"
@@ -20,7 +20,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // coreDNSUpstreamCheck is the CoreDNS upstream-failure watchdog with
@@ -176,9 +176,8 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 		keys = append(keys, k+"("+d+")")
 	}
 	sort.Strings(keys)
-	return probefw.Result{Why: fmt.Sprintf(
-		"coredns/node-local-dns upstream failures: %s",
-		strings.Join(keys, ", "))}
+	return probefw.Result{Why: "coredns/node-local-dns upstream failures: " +
+		strings.Join(keys, ", ")}
 }
 
 // hasHealthySibling reports whether another dns pod in the same

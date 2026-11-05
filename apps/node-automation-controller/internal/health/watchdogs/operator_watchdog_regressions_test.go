@@ -15,7 +15,7 @@
 package watchdogs
 
 import (
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"strings"
 	"testing"
 	"time"
@@ -27,7 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -138,9 +138,9 @@ func TestCheckOperatorWorkqueuesOCIHelmRepoIgnored(t *testing.T) {
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("OCI HelmRepository must not freeze the check: %+v", res)
 	}
-	for k := range mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen {
+	for _, k := range wdTrackedKeys(&mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
 		if strings.HasPrefix(k, "source-controller/helmrepositories/") {
-			t.Fatalf("OCI repo must not be tracked: %v", mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen)
+			t.Fatalf("OCI repo must not be tracked: %v", k)
 		}
 	}
 
@@ -149,8 +149,9 @@ func TestCheckOperatorWorkqueuesOCIHelmRepoIgnored(t *testing.T) {
 	stale := shHelmRepo("http-repo", 5, 3, "default", false)
 	p2 := testProberDyn(cs, probetest.OpDyn(ociRepo, stale))
 	p2.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p2).opFirstSeen["source-controller/helmrepositories/flux-system/http-repo"] =
-		base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p2).opFirstSeen.
+		Observe("source-controller/helmrepositories/flux-system/http-repo",
+			base.Add(-time.Hour))
 	if res := mustCheck[*operatorWorkqueueCheck](t, p2).Run(ctx); res.Pass {
 		t.Fatal("stale type=default HelmRepository must still FAIL")
 	}
@@ -238,7 +239,8 @@ func TestCheckOperatorWorkqueuesHealsOneReplicaOnly(t *testing.T) {
 		"scylla", "db", 9, 4)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("scylla-operator/scyllaclusters/scylla/db", base.Add(-time.Hour))
 	before := shOpHealsCount(t, "scylla-operator", kcmReasonStaleGen)
 
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
@@ -292,9 +294,9 @@ func TestCheckOperatorWorkqueuesNotificationObjectsIgnored(t *testing.T) {
 	}
 	// Zero resources means nothing is even scanned — no first-seen
 	// keys may be stamped for the static notification objects.
-	for k := range mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen {
+	for _, k := range wdTrackedKeys(&mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
 		if strings.HasPrefix(k, "notification-controller/") {
-			t.Fatalf("notification objects must not be tracked: %v", mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen)
+			t.Fatalf("notification objects must not be tracked: %v", k)
 		}
 	}
 }

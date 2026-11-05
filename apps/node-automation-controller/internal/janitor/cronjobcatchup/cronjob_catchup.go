@@ -39,8 +39,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -337,7 +337,7 @@ func (c *cronJobCatchup) deduped(ctx context.Context, log logr.Logger, cj *batch
 	for i := range jobs {
 		j := &jobs[i]
 		if j.Labels[catchupLabel] == cj.Name &&
-			time.Since(j.CreationTimestamp.Time) < catchupDedupeAge {
+			c.now.Now().Sub(j.CreationTimestamp.Time) < catchupDedupeAge {
 			log.Info("skip: a catch-up job already exists",
 				"cronjob", cj.Namespace+"/"+cj.Name, "job", j.Name)
 			return true

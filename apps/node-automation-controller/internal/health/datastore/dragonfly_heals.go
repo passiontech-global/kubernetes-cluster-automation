@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -67,10 +67,8 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 			continue
 		}
 		key := pod.Namespace + "/" + pod.Name
-		last, ok := p.drHealed[key]
-		if ok && now.Sub(last) < dragonflyHealCooldown {
-			log.Info("skip heal: dragonfly operator inside cooldown",
-				"pod", key, "ago", now.Sub(last).Truncate(time.Minute))
+		if p.drHealed.CooledDown(key, dragonflyHealCooldown, now) {
+			log.Info("skip heal: dragonfly operator inside cooldown", "pod", key)
 			continue
 		}
 		uid := pod.UID
@@ -82,7 +80,10 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 			log.Error(err, "dragonfly operator delete failed", "pod", key)
 			continue
 		}
-		p.drHealed[key] = now
+		p.drHealed.Stamp(key, now)
+		if now.After(p.drOpHealAt) {
+			p.drOpHealAt = now
+		}
 		deleted = true
 		log.Info("DELETE: dragonfly operator pod — masterless service, forcing re-election",
 			"pod", key, "service", sig.ns+"/"+sig.svc,
@@ -114,18 +115,13 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 // dragonflyOperatorHealedAt returns the most recent moment a
 // dragonfly-operator leader pod was deleted by step 1 — the wider
 // of the persisted node.ops/last-dragonfly-operator-heal stamp on
-// this STS and the in-RAM per-pod ledger (which survives an STS
+// this STS and the in-RAM drOpHealAt stamp (which survives an STS
 // patch failure). ok=false means no heal has landed yet: the
 // dual-replica heal must not skip ahead of step 1.
 func (p *statefulMasterlessCheck) dragonflyOperatorHealedAt(sig masterSvc) (time.Time, bool) {
-	var latest time.Time
+	latest := p.drOpHealAt
 	if ts := sig.sts.Annotations[dragonflyHealAnno]; ts != "" {
 		if t, err := time.Parse(time.RFC3339, ts); err == nil && t.After(latest) {
-			latest = t
-		}
-	}
-	for _, t := range p.drHealed {
-		if t.After(latest) {
 			latest = t
 		}
 	}
@@ -217,10 +213,9 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 
 	// Gate 3 — the 30m cooldown (wider of in-RAM + persisted), then
 	// the maintenance mutex.
-	last, ok := p.drPodHealed[stsKey]
-	if ok && now.Sub(last) < dragonflyPodHealCooldown {
+	if p.drPodHealed.CooledDown(stsKey, dragonflyPodHealCooldown, now) {
 		log.Info("skip heal: dragonfly pod inside cooldown",
-			"statefulset", stsKey, "ago", now.Sub(last).Truncate(time.Minute))
+			"statefulset", stsKey)
 		return
 	}
 	if ts := sig.sts.Annotations[dragonflyPodHealAnno]; ts != "" {
@@ -265,7 +260,7 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	}
 	metrics.DragonflyMasterlessPodHealsTotal.
 		WithLabelValues(sig.sts.Namespace, sig.sts.Name).Inc()
-	p.drPodHealed[stsKey] = now
+	p.drPodHealed.Stamp(stsKey, now)
 	log.Info("DELETE: dragonfly dual-replica deadlock — lowest-ordinal pod deleted to force master re-election",
 		"pod", target.Namespace+"/"+target.Name,
 		"statefulset", stsKey, "service", sig.ns+"/"+sig.svc)

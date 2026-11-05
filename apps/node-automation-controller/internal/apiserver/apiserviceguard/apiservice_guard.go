@@ -50,8 +50,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -197,14 +197,14 @@ func (g *apiServiceGuard) sweepOrphans(ctx context.Context, svcs *unstructured.U
 		// stale where a Get is fresh, so the delete only fires after
 		// the apiserver itself confirms NotFound (fail closed).
 		_, getErr := g.cs.CoreV1().Namespaces().Get(ctx, svcNs, metav1.GetOptions{})
-		switch {
-		case apierrors.IsNotFound(getErr):
-		case getErr != nil:
+		gone, err := shared.ConfirmAbsent(getErr)
+		if err != nil {
 			log.Info("WARN: namespace confirm failed — APIService kept (fail closed)",
-				"apiservice", svc.GetName(), "namespace", svcNs, "error", getErr)
+				"apiservice", svc.GetName(), "namespace", svcNs, "error", err)
 			metrics.IncError(g.queue)
 			continue
-		default:
+		}
+		if !gone {
 			// Namespace actually exists — the snapshot was stale.
 			continue
 		}

@@ -1,11 +1,12 @@
 package fluentbitroller
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -50,7 +51,7 @@ func fluentBitDS(generation, observed int64, desired, updated int32) *appsv1.Dae
 
 func getPipelineSecret(t *testing.T, cs *fake.Clientset) *corev1.Secret {
 	t.Helper()
-	s, err := cs.CoreV1().Secrets(fluentNS).Get(ctx, pipelineName, metav1.GetOptions{})
+	s, err := cs.CoreV1().Secrets(fluentNS).Get(context.Background(), pipelineName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get secret: %v", err)
 	}
@@ -59,7 +60,7 @@ func getPipelineSecret(t *testing.T, cs *fake.Clientset) *corev1.Secret {
 
 func getFluentBitDS(t *testing.T, cs *fake.Clientset) *appsv1.DaemonSet {
 	t.Helper()
-	ds, err := cs.AppsV1().DaemonSets(fluentNS).Get(ctx, "fluent-bit", metav1.GetOptions{})
+	ds, err := cs.AppsV1().DaemonSets(fluentNS).Get(context.Background(), "fluent-bit", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get daemonset: %v", err)
 	}
@@ -85,7 +86,7 @@ func rolledHash(s *corev1.Secret) string {
 func TestFluentBitRollerSecretAbsent(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	r := &fluentBitRoller{cs: cs}
-	res, err := r.Reconcile(ctx, reconcile.Request{})
+	res, err := r.Reconcile(context.Background(), reconcile.Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +105,7 @@ func TestFluentBitRollerNoDrift(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		fluentBitDS(2, 2, 3, 3))
 	r := &fluentBitRoller{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got != "" {
@@ -131,7 +132,7 @@ func TestFluentBitRollerRollsOnDrift(t *testing.T) {
 				testutil.Node("n2", corev1.ConditionTrue, nil),
 				fluentBitDS(2, 2, 3, 3))
 			r := &fluentBitRoller{cs: cs}
-			res, err := r.Reconcile(ctx, reconcile.Request{})
+			res, err := r.Reconcile(context.Background(), reconcile.Request{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -167,7 +168,7 @@ func TestFluentBitRollerSkipsOnNotReadyNode(t *testing.T) {
 		testutil.Node("n2", corev1.ConditionFalse, nil),
 		fluentBitDS(2, 2, 3, 3))
 	r := &fluentBitRoller{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got != "" {
@@ -190,7 +191,7 @@ func TestFluentBitRollerSkipsWhileDSUnsettled(t *testing.T) {
 				testutil.Node("n1", corev1.ConditionTrue, nil),
 				ds)
 			r := &fluentBitRoller{cs: cs}
-			if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+			if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 				t.Fatal(err)
 			}
 			if got := dsRestartedAt(getFluentBitDS(t, cs)); got != "" {
@@ -217,7 +218,7 @@ func TestFluentBitRollerResourceVersionFallback(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		fluentBitDS(2, 2, 3, 3))
 	r := &fluentBitRoller{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got == "" {
@@ -244,7 +245,7 @@ func TestFluentBitRollerFallbackNoReroll(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		fluentBitDS(2, 2, 3, 3))
 	r := &fluentBitRoller{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got == "" {
@@ -259,7 +260,7 @@ func TestFluentBitRollerFallbackNoReroll(t *testing.T) {
 	if patches != 1 {
 		t.Fatalf("daemonset patch count = %d, want 1", patches)
 	}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	patches = 0
@@ -291,7 +292,7 @@ func TestFluentBitRollerSecretGetError(t *testing.T) {
 			return true, nil, errors.New("etcd wedged")
 		})
 	r := &fluentBitRoller{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the secret get fails")
 	}
 }
@@ -304,7 +305,7 @@ func TestFluentBitRollerNodeListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := &fluentBitRoller{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
 }
@@ -317,7 +318,7 @@ func TestFluentBitRollerDSGetError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := &fluentBitRoller{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the daemonset get fails")
 	}
 }
@@ -332,7 +333,7 @@ func TestFluentBitRollerRestartPatchErrorKeepsDriftMarker(t *testing.T) {
 			return true, nil, errors.New("patch rejected")
 		})
 	r := &fluentBitRoller{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the restart patch fails")
 	}
 	if got := rolledHash(getPipelineSecret(t, cs)); got != "" {
@@ -350,7 +351,7 @@ func TestFluentBitRollerStatePatchError(t *testing.T) {
 			return true, nil, errors.New("secret patch rejected")
 		})
 	r := &fluentBitRoller{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the state patch fails")
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got == "" {

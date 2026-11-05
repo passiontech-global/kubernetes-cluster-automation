@@ -9,6 +9,7 @@ package webhookguard
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/go-logr/logr"
@@ -18,8 +19,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // orphanSweep owns the orphan-entry sweep — embedded in webhookGuard
@@ -53,7 +54,7 @@ func (o *orphanSweep) sweepOrphans(ctx context.Context, snap *sweepSnapshot) err
 		namespaces[ns.Name] = true
 	}
 	if !namespaces["kube-system"] {
-		return fmt.Errorf("kube-system absent from namespace list (API flap) — abort")
+		return errors.New("kube-system absent from namespace list (API flap) — abort")
 	}
 
 	// Service snapshot feeds only the WARN branch — a failure here
@@ -157,7 +158,7 @@ func (o *orphanSweep) sweepOrphans(ctx context.Context, snap *sweepSnapshot) err
 		}
 	}
 	if failed {
-		return fmt.Errorf("some webhook config patches failed — orphan webhooks may remain")
+		return errors.New("some webhook config patches failed — orphan webhooks may remain")
 	}
 	log.Info("sweep done: removed orphan webhook entries (namespace deleted)",
 		"configsPatched", len(patches))

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -76,7 +76,6 @@ func cdnsProbeService(name, ns string, age time.Duration, ready *bool) (*corev1.
 func newCDNSWatchdog(cs *fake.Clientset) *coreDNSWatchdog {
 	return &coreDNSWatchdog{
 		cs:       cs,
-		streak:   map[string]int{},
 		logHitFn: func(context.Context, string) string { return "" },
 		dnsFn:    func(context.Context, string, string) ([]string, error) { return []string{"10.1.2.3"}, nil },
 		panicsFn: func(context.Context, string) (float64, bool) { return 0, true },
@@ -118,10 +117,10 @@ func TestCoreDNSWatchdogLayer1LogHit(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Instant catch: streak is forced straight to max, no 2-run wait.
-	if got := w.streak["cdns-a"]; got != corednsStreakMax {
+	if got := w.streak.Count("cdns-a"); got != corednsStreakMax {
 		t.Fatalf("streak=%d, want %d", got, corednsStreakMax)
 	}
-	if _, ok := w.streak["cdns-b"]; ok {
+	if got := w.streak.Count("cdns-b"); got != 0 {
 		t.Fatal("clean pod got a streak")
 	}
 	// 1 of 2 stale -> subset recovery deletes only that pod.
@@ -210,7 +209,7 @@ func TestCoreDNSWatchdogLayer2StreakThenRecover(t *testing.T) {
 	if gotFQDN != "fresh-svc.app-ns.svc.cluster.local" {
 		t.Fatalf("probe fqdn=%q", gotFQDN)
 	}
-	if got := w.streak["cdns-a"]; got != 1 {
+	if got := w.streak.Count("cdns-a"); got != 1 {
 		t.Fatalf("first run streak=%d, want 1", got)
 	}
 	if !cdnsPodExists(t, cs, "cdns-a") {
@@ -224,7 +223,7 @@ func TestCoreDNSWatchdogLayer2StreakThenRecover(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := w.streak["cdns-a"]; got != corednsStreakMax {
+	if got := w.streak.Count("cdns-a"); got != corednsStreakMax {
 		t.Fatalf("second run streak=%d, want %d", got, corednsStreakMax)
 	}
 	if cdnsPodExists(t, cs, "cdns-a") {
@@ -247,7 +246,7 @@ func TestCoreDNSWatchdogLayer2AbortAllFail(t *testing.T) {
 		cdnsDeployment(2, 2, nil),
 		svc, es)
 	w := newCDNSWatchdog(cs)
-	w.streak["cdns-a"] = 1
+	w.streak.Set("cdns-a", 1)
 	// Every pod fails to resolve -> the probe path is broken, NOT the
 	// fleet. The layer must abort without bumping any streak.
 	w.dnsFn = func(context.Context, string, string) ([]string, error) { return nil, nil }
@@ -255,10 +254,10 @@ func TestCoreDNSWatchdogLayer2AbortAllFail(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := w.streak["cdns-a"]; got != 1 {
+	if got := w.streak.Count("cdns-a"); got != 1 {
 		t.Fatalf("abort bumped streak: got %d, want 1", got)
 	}
-	if _, ok := w.streak["cdns-b"]; ok {
+	if got := w.streak.Count("cdns-b"); got != 0 {
 		t.Fatal("abort seeded a streak for cdns-b")
 	}
 	for _, p := range []string{"cdns-a", "cdns-b"} {
@@ -290,7 +289,7 @@ func TestCoreDNSWatchdogLayer3Panics(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := w.streak["cdns-a"]; got != corednsStreakMax {
+	if got := w.streak.Count("cdns-a"); got != corednsStreakMax {
 		t.Fatalf("streak=%d, want %d", got, corednsStreakMax)
 	}
 	if cdnsPodExists(t, cs, "cdns-a") {
@@ -311,7 +310,7 @@ func TestCoreDNSWatchdogLayer3UnknownIsNotStale(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := w.streak["cdns-a"]; ok {
+	if got := w.streak.Count("cdns-a"); got != 0 {
 		t.Fatal("UNKNOWN metrics produced a streak")
 	}
 	if !cdnsPodExists(t, cs, "cdns-a") {
@@ -578,16 +577,16 @@ func TestCoreDNSWatchdogStreakBookkeeping(t *testing.T) {
 		cdnsDeployment(1, 1, nil),
 		svc, es)
 	w := newCDNSWatchdog(cs)
-	w.streak["ghost-pod"] = 2 // pod vanished between runs
-	w.streak["cdns-a"] = 1    // still alive and answering -> reset
+	w.streak.Set("ghost-pod", 2) // pod vanished between runs
+	w.streak.Set("cdns-a", 1)    // still alive and answering -> reset
 
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := w.streak["ghost-pod"]; ok {
+	if got := w.streak.Count("ghost-pod"); got != 0 {
 		t.Fatal("streak for vanished pod not pruned")
 	}
-	if _, ok := w.streak["cdns-a"]; ok {
+	if got := w.streak.Count("cdns-a"); got != 0 {
 		t.Fatal("streak for freshly-answering pod not reset")
 	}
 }

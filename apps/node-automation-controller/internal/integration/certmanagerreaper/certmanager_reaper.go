@@ -36,8 +36,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -91,8 +91,9 @@ type certManagerReaper struct {
 	now shared.Clock
 	// crReaped: cert key → last stuck-CertificateRequest delete —
 	// the 6h in-RAM half of the W8 CR-reap cooldown (the durable
-	// half shares node.ops/acme-order-resets).
-	crReaped map[string]time.Time
+	// half shares node.ops/acme-order-resets). CooldownSet is
+	// zero-value ready — no arm needed.
+	crReaped shared.CooldownSet
 	// crCache: per-run CertificateRequest list cache keyed by
 	// namespace — the Order-attribution path and the W8 stuck-CR
 	// path share ONE list per namespace per sweep (a failed list
@@ -116,19 +117,17 @@ func Setup(d shared.Deps) error {
 		return nil
 	}
 	r := &certManagerReaper{cs: cs, dyn: dyn, queue: d.Name,
-		resets: map[string]*certReset{}, crReaped: map[string]time.Time{}}
+		resets: map[string]*certReset{}}
 	return shared.AddPeriodic(mgr, r.queue, 15*time.Minute, r.run)
 }
 
 func (r *certManagerReaper) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	// Lazily arm the zero-value struct — unit tests construct the
-	// reaper literally without the Setup path.
+	// reaper literally without the Setup path. crReaped is a
+	// CooldownSet — zero-value ready, no arm.
 	if r.resets == nil {
 		r.resets = map[string]*certReset{}
-	}
-	if r.crReaped == nil {
-		r.crReaped = map[string]time.Time{}
 	}
 	r.crCache = map[string]crListResult{}
 	now := r.now.Now()

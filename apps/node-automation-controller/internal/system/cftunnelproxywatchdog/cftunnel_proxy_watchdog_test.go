@@ -1,11 +1,12 @@
 package cftunnelproxywatchdog
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -15,7 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const cfWatchdogTestNS = "cf-test"
@@ -74,7 +75,7 @@ func proxyDeploy(conds []appsv1.DeploymentCondition) *appsv1.Deployment {
 func getSlice(t *testing.T, cs *fake.Clientset, name string) *discoveryv1.EndpointSlice {
 	t.Helper()
 	s, err := cs.DiscoveryV1().EndpointSlices(cfWatchdogTestNS).
-		Get(ctx, name, metav1.GetOptions{})
+		Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get endpointslice %s: %v", name, err)
 	}
@@ -91,7 +92,7 @@ func TestWatchdogForcesResyncOnUnreadyPod(t *testing.T) {
 		proxySlice("proxy-headless-def"),
 		proxyDeploy(nil))
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS}
-	if err := w.run(ctx); err != nil {
+	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	for _, name := range []string{"proxy-headless-abc", "proxy-headless-def"} {
@@ -115,7 +116,7 @@ func TestWatchdogAllReadyNoSlicePatch(t *testing.T) {
 			return true, nil, nil
 		})
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS}
-	if err := w.run(ctx); err != nil {
+	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if patched {
@@ -141,7 +142,7 @@ func TestWatchdogPendingPodNoResync(t *testing.T) {
 			return true, nil, nil
 		})
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS}
-	if err := w.run(ctx); err != nil {
+	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if patched {
@@ -174,7 +175,7 @@ func TestWatchdogClearsStaleStall(t *testing.T) {
 			return true, nil, nil // don't apply; capture only
 		})
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS}
-	if err := w.run(ctx); err != nil {
+	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if gotType != types.JSONPatchType {
@@ -203,7 +204,7 @@ func TestWatchdogHealthyDeployNoPatch(t *testing.T) {
 			return true, nil, nil
 		})
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS}
-	if err := w.run(ctx); err != nil {
+	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if patched {
@@ -216,7 +217,7 @@ func TestWatchdogHealthyDeployNoPatch(t *testing.T) {
 func TestWatchdogDeploymentNotFound(t *testing.T) {
 	cs := fake.NewSimpleClientset(proxyPod("proxy-1", true))
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS}
-	if err := w.run(ctx); err != nil {
+	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run must be a no-op when the Deployment is absent: %v", err)
 	}
 }
@@ -230,7 +231,7 @@ func TestWatchdogPodListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS}
-	if err := w.run(ctx); err == nil {
+	if err := w.run(context.Background()); err == nil {
 		t.Fatal("expected error when the pod list fails")
 	}
 }
@@ -273,7 +274,7 @@ func cfLogReactor(body string) ktesting.ReactionFunc {
 
 func cfPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 	t.Helper()
-	_, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+	_, err := cs.CoreV1().Pods(ns).Get(context.Background(), name, metav1.GetOptions{})
 	return err == nil
 }
 
@@ -290,7 +291,7 @@ func TestWatchdogDeletesPodWithFatalLogs(t *testing.T) {
 	cs.PrependReactor("get", "pods", cfLogReactor(
 		"2026-11-20T00:00:00Z ERR Failed to sufficiently increase receive buffer size\n"))
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
-	if err := w.run(ctx); err != nil {
+	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if cfPodExists(t, cs, cfWatchdogTestNS, "proxy-wedged") {
@@ -314,7 +315,7 @@ func TestWatchdogAllUnreadyDeletesOldest(t *testing.T) {
 		proxyDeploy(nil))
 	cs.PrependReactor("get", "pods", cfLogReactor("INF tunnel running normally\n"))
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
-	if err := w.run(ctx); err != nil {
+	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if cfPodExists(t, cs, cfWatchdogTestNS, "proxy-old") {
@@ -333,7 +334,7 @@ func TestWatchdogAllUnreadyDeletesOldest(t *testing.T) {
 	w2 := &cfTunnelProxyWatchdog{cs: cs2, namespace: cfWatchdogTestNS}
 	w2.lastHeal.Stamp(cfWatchdogTestNS+"/proxy-old", now.Add(-5*time.Minute))
 	w2.now = func() time.Time { return now }
-	if err := w2.run(ctx); err != nil {
+	if err := w2.run(context.Background()); err != nil {
 		t.Fatalf("run2: %v", err)
 	}
 	if !cfPodExists(t, cs2, cfWatchdogTestNS, "proxy-old") {
@@ -358,7 +359,7 @@ func TestWatchdogYoungUnreadyPodUntouched(t *testing.T) {
 			return false, nil, nil
 		})
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
-	if err := w.run(ctx); err != nil {
+	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if !cfPodExists(t, cs, cfWatchdogTestNS, "proxy-fresh") {
@@ -381,7 +382,7 @@ func TestWatchdogHealsIngressControllerNamespace(t *testing.T) {
 	cs.PrependReactor("get", "pods", cfLogReactor(
 		"2026-11-20T00:00:00Z ERR Serve tunnel error error=\"connection refused\"\n"))
 	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, now: func() time.Time { return now }}
-	if err := w.run(ctx); err != nil {
+	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if cfPodExists(t, cs, cfTunnelConnectorNS, "ingress-wedged") {

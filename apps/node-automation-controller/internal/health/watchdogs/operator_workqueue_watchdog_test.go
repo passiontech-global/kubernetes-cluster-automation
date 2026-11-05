@@ -4,7 +4,7 @@
 package watchdogs
 
 import (
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"testing"
 	"time"
 
@@ -15,7 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -114,7 +114,8 @@ func TestCheckOperatorWorkqueuesSourceControllerHeals(t *testing.T) {
 		"apps", "repo", 5, 3)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["source-controller/gitrepositories/apps/repo"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("source-controller/gitrepositories/apps/repo", base.Add(-time.Hour))
 
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("stuck gitrepository with a renewing lease must FAIL")
@@ -144,7 +145,8 @@ func TestCheckOperatorWorkqueuesCertManagerNoConditions(t *testing.T) {
 	stuck := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate", "apps", "tls", 1, 0)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["cert-manager/certificates/apps/tls"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("cert-manager/certificates/apps/tls", base.Add(-time.Hour))
 
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("never-reconciled Certificate must FAIL")
@@ -171,7 +173,8 @@ func TestCheckOperatorWorkqueuesShipwrightOperatorNoConditions(t *testing.T) {
 		"", "build-1", 1, 0)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["shipwright-operator/shipwrightbuilds//build-1"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+		Observe("shipwright-operator/shipwrightbuilds//build-1", base.Add(-time.Hour))
 
 	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("never-reconciled ShipwrightBuild must FAIL")

@@ -42,6 +42,7 @@ package deschedulerstormgate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -63,8 +64,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -103,6 +104,9 @@ type deschedulerStormGate struct {
 	// registry row) so the controller name and every IncError label
 	// come from one place.
 	queue string
+	// now is the clock seam — tests pin it so the cordon-window and
+	// decision-stamp reads are deterministic. nil → time.Now.
+	now shared.Clock
 }
 
 // The watch wiring below installs these package-level units
@@ -148,7 +152,8 @@ func Setup(d shared.Deps) error {
 		Watches(&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
 			builder.WithPredicates(stormSignalChanges)).
-		Complete(&deschedulerStormGate{cs: d.CS, dyn: d.Dyn, queue: d.Name})
+		Complete(&deschedulerStormGate{cs: d.CS, dyn: d.Dyn, queue: d.Name,
+			now: shared.SystemClock})
 }
 
 func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -167,11 +172,11 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		// back up on blind data (same fail-closed posture as the
 		// statefulset-ondelete-roller's nodesSafe check).
 		metrics.IncError(r.queue)
-		return ctrl.Result{}, fmt.Errorf("empty node list (API flap) — refusing to compute a verdict")
+		return ctrl.Result{}, errors.New("empty node list (API flap) — refusing to compute a verdict")
 	}
 
 	var notReady, bad, tainted, cordoned []string
-	now := time.Now()
+	now := r.now.Now()
 	for i := range nodes {
 		n := &nodes[i]
 		if !shared.NodeReady(n) {
@@ -240,7 +245,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		curStr = strconv.Itoa(int(cur))
 	}
 	decision := fmt.Sprintf("%s verdict=%s want=%d cur=%s not_ready=[%s] bad=[%s] tainted=[%s] cordoned=[%s] maintenance=[%s]",
-		time.Now().UTC().Format(time.RFC3339), verdict, want, curStr,
+		r.now.Now().UTC().Format(time.RFC3339), verdict, want, curStr,
 		strings.Join(notReady, "\n"), strings.Join(bad, "\n"),
 		strings.Join(tainted, "\n"), strings.Join(cordoned, "\n"),
 		strings.Join(maintenance, "\n"))

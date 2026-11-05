@@ -9,7 +9,7 @@ package datastore
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"maps"
 	"slices"
 	"sort"
@@ -18,8 +18,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -46,21 +46,24 @@ type statefulMasterlessCheck struct {
 	//   - drPodHealed: "ns/sts" → last ordinal-0 pod delete — the
 	//     in-RAM half of the 30m dual-replica-deadlock cooldown
 	//     (W7-C3; the STS annotation is the durable half).
-	stsZeroSince   map[string]time.Time
+	//   - drOpHealAt: the newest drHealed stamp — the in-RAM half
+	//     of "when did step 1 last land" for the W7-C3 settle gate
+	//     (a CooldownSet suppresses repeats but cannot report the
+	//     latest stamp back, so the moment is carried alongside).
+	stsZeroSince   shared.FirstSeenLedger
 	stsZeroEmitted map[string]bool
-	drHealed       map[string]time.Time
-	drPodHealed    map[string]time.Time
+	drHealed       shared.CooldownSet
+	drPodHealed    shared.CooldownSet
+	drOpHealAt     time.Time
 }
 
-// newStatefulMasterlessCheck builds the W6.2 check with fresh
-// tracking maps — the state-map initialization that used to live in
-// the monolithic newClusterHealthProber literal.
+// newStatefulMasterlessCheck builds the W6.2 check — the ledgers
+// arm lazily on first use; only the emitted-series map needs the
+// explicit initialization that used to live in the monolithic
+// newClusterHealthProber literal.
 func NewStatefulMasterlessCheck(d *probefw.Deps) probefw.Check {
 	return &statefulMasterlessCheck{Deps: d,
-		stsZeroSince:   map[string]time.Time{},
 		stsZeroEmitted: map[string]bool{},
-		drHealed:       map[string]time.Time{},
-		drPodHealed:    map[string]time.Time{},
 	}
 }
 
@@ -205,17 +208,8 @@ func dragonflyOwned(sts *appsv1.StatefulSet) bool {
 func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	if p.stsZeroSince == nil {
-		p.stsZeroSince = map[string]time.Time{}
-	}
 	if p.stsZeroEmitted == nil {
 		p.stsZeroEmitted = map[string]bool{}
-	}
-	if p.drHealed == nil {
-		p.drHealed = map[string]time.Time{}
-	}
-	if p.drPodHealed == nil {
-		p.drPodHealed = map[string]time.Time{}
 	}
 
 	stsList, err := p.CS.AppsV1().StatefulSets(metav1.NamespaceAll).
@@ -288,11 +282,8 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 			continue // master reachable — drop any streak
 		}
 		seen[key] = true
-		first, ok := p.stsZeroSince[key]
-		if !ok {
-			p.stsZeroSince[key] = now
-		}
-		if !ok {
+		first, tracked := p.stsZeroSince.Observe(key, now)
+		if !tracked {
 			log.Info("master-role service at 0 ready endpoints — tracking first-seen",
 				"service", c.ns+"/"+c.svc, "statefulset", c.sts.Name)
 			continue
@@ -308,11 +299,7 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	for k := range p.stsZeroSince {
-		if !seen[k] {
-			delete(p.stsZeroSince, k)
-		}
-	}
+	p.stsZeroSince.Prune(func(k string) bool { return seen[k] })
 	for k := range p.stsZeroEmitted {
 		if emitted[k] {
 			continue

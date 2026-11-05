@@ -18,6 +18,7 @@ package shared
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -98,7 +99,7 @@ func KuredLockEvidence(ctx context.Context, cs kubernetes.Interface) ([]string, 
 // fails closed like every other check here.
 func AutopilotPlanEvidence(ctx context.Context, dyn dynamic.Interface) ([]string, error) {
 	if dyn == nil {
-		return nil, fmt.Errorf("no dynamic client — autopilot plan check unverifiable (maintenance mutex)")
+		return nil, errors.New("no dynamic client — autopilot plan check unverifiable (maintenance mutex)")
 	}
 	plans, err := dyn.Resource(AutopilotPlanGVR).
 		List(ctx, metav1.ListOptions{})

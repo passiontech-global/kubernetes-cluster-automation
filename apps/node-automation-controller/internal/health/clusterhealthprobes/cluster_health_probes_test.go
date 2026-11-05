@@ -18,9 +18,9 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/ported"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probetest"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/watchdogs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
 )
 
 // testProber builds a prober with the env-equivalent defaults but
@@ -58,7 +58,7 @@ func TestRunEmitsAllChecksPassing(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	if err := p.run(ctx); err != nil {
+	if err := p.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	for _, check := range []string{
@@ -90,7 +90,7 @@ func TestRunFailGrowsStaleness(t *testing.T) {
 	p.LookupHost = func(context.Context, string) ([]string, error) {
 		return nil, errors.New("SERVFAIL")
 	}
-	if err := p.run(ctx); err != nil {
+	if err := p.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if v, _ := probetest.HealthGauge(t, ported.CheckNameDNS, "FAIL"); v != 1 {
@@ -131,7 +131,7 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	}
 	before := errCount()
 
-	if err := p.run(ctx); err != nil {
+	if err := p.run(context.Background()); err != nil {
 		t.Fatalf("partial infra failure must not fail the cycle: %v", err)
 	}
 	if v, _ := probetest.HealthGauge(t, ported.CheckNamePodRestarts, "FAIL"); v != 1 {
@@ -161,7 +161,7 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 // DNS probe cancels mid-sweep to simulate the shutdown landing inside
 // the first check.
 func TestRunAbortEmitsNothing(t *testing.T) {
-	cctx, cancel := context.WithCancel(ctx)
+	cctx, cancel := context.WithCancel(context.Background())
 	p := testProber(fake.NewSimpleClientset())
 	p.LookupHost = func(context.Context, string) ([]string, error) {
 		cancel() // SIGTERM lands mid-sweep

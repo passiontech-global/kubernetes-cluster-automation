@@ -19,7 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // stalledDeployment resolves which Deployment helm was waiting on.
@@ -69,9 +69,8 @@ func (u *helmReleaseUnlocker) stalledDeployment(ctx context.Context,
 	}
 	switch len(candidates) {
 	case 0:
-		return nil, fmt.Sprintf(
-			"no Deployment named in the message and none ProgressDeadlineExceeded in ns %s",
-			releaseNS), nil
+		return nil, "no Deployment named in the message and none ProgressDeadlineExceeded in ns " +
+			releaseNS, nil
 	case 1:
 		return found, "", nil
 	default:

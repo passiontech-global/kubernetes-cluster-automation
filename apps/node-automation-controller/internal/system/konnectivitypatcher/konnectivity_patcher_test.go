@@ -1,6 +1,7 @@
 package konnectivitypatcher
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -55,7 +56,7 @@ func konnectivityDS(priorityClass, cpu, mem string) *appsv1.DaemonSet {
 func getKonnectivityDS(t *testing.T, cs *fake.Clientset) *appsv1.DaemonSet {
 	t.Helper()
 	ds, err := cs.AppsV1().DaemonSets("kube-system").
-		Get(ctx, "konnectivity-agent", metav1.GetOptions{})
+		Get(context.Background(), "konnectivity-agent", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get konnectivity-agent: %v", err)
 	}
@@ -118,7 +119,7 @@ func TestKonnectivityPatcherNoOpWhenCorrect(t *testing.T) {
 	forbidDSPatch(cs, &patched)
 
 	r := &konnectivityPatcher{cs: cs}
-	res, err := r.Reconcile(ctx, reconcile.Request{})
+	res, err := r.Reconcile(context.Background(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -142,7 +143,7 @@ func TestKonnectivityPatcherMissingContainerNoPatch(t *testing.T) {
 	forbidDSPatch(cs, &patched)
 
 	r := &konnectivityPatcher{cs: cs}
-	res, err := r.Reconcile(ctx, reconcile.Request{})
+	res, err := r.Reconcile(context.Background(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -158,7 +159,7 @@ func TestKonnectivityPatcherMissingContainerNoPatch(t *testing.T) {
 func TestKonnectivityPatcherMissingDS(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	r := &konnectivityPatcher{cs: cs}
-	res, err := r.Reconcile(ctx, reconcile.Request{})
+	res, err := r.Reconcile(context.Background(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -172,7 +173,7 @@ func TestKonnectivityPatcherPriorityClassDriftOnly(t *testing.T) {
 	// priorityClassName — drift is drift, the whole patch must land.
 	cs := fake.NewSimpleClientset(konnectivityDS("", "25m", "32Mi"))
 	r := &konnectivityPatcher{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	got := getKonnectivityDS(t, cs)
@@ -193,7 +194,7 @@ func TestKonnectivityPatcherRequestsDriftOnly(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		konnectivityDS("system-node-critical", "250m", "256Mi"))
 	r := &konnectivityPatcher{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	got := getKonnectivityDS(t, cs)
@@ -214,7 +215,7 @@ func TestKonnectivityPatcherGetError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := &konnectivityPatcher{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the daemonset get fails")
 	}
 }
@@ -229,7 +230,7 @@ func TestKonnectivityPatcherPatchError(t *testing.T) {
 			return true, nil, errors.New("patch rejected")
 		})
 	r := &konnectivityPatcher{cs: cs}
-	if _, err := r.Reconcile(ctx, reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the drift patch fails")
 	}
 	if got := getKonnectivityDS(t, cs).Spec.Template.Spec.PriorityClassName; got != "" {

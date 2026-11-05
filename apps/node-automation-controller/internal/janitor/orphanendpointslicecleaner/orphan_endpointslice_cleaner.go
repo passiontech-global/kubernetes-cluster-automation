@@ -33,6 +33,7 @@ package orphanendpointslicecleaner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -40,14 +41,13 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -85,7 +85,7 @@ type orphanEndpointSliceCleaner struct {
 	// orphanEndpointSliceStreak unlocks the re-confirm + delete.
 	// UID is part of the key so a recreated slice never inherits
 	// another object's streak.
-	absentStreak map[string]int
+	absentStreak shared.StreakLedger
 }
 
 // Setup registers the 15-minute sweep.
@@ -97,7 +97,7 @@ func Setup(d shared.Deps) error {
 		return nil
 	}
 	c := &orphanEndpointSliceCleaner{cs: d.CS, dyn: d.Dyn, queue: d.Name,
-		now: shared.SystemClock, absentStreak: map[string]int{}}
+		now: shared.SystemClock}
 	return shared.AddPeriodic(d.Mgr, c.queue, orphanEndpointSliceInterval, c.run)
 }
 
@@ -105,11 +105,6 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Lazily arm the zero-value struct — unit tests construct the
-	// cleaner literally without the Setup path.
-	if c.absentStreak == nil {
-		c.absentStreak = map[string]int{}
-	}
 
 	// Fail closed: the Service snapshot is the ONLY source of
 	// "deleted" truth. An error or an empty list aborts the run —
@@ -131,7 +126,7 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 		return fmt.Errorf("list services (API flap) — abort: %w", err)
 	}
 	if svcCount == 0 {
-		return fmt.Errorf("empty service list (API flap) — abort")
+		return errors.New("empty service list (API flap) — abort")
 	}
 
 	// Server-side label filter; the in-code check stays because
@@ -166,11 +161,11 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 		}
 		key := s.Namespace + "/" + s.Name + "/" + string(s.UID)
 		absentNow[key] = true
-		c.absentStreak[key]++
-		if c.absentStreak[key] < orphanEndpointSliceStreak {
+		streak := c.absentStreak.Hit(key)
+		if streak < orphanEndpointSliceStreak {
 			log.Info("orphan candidate: Service missing — tracking",
 				"endpointslice", s.Namespace+"/"+s.Name,
-				"service", svcName, "streak", c.absentStreak[key])
+				"service", svcName, "streak", streak)
 			continue
 		}
 		if now.Sub(s.CreationTimestamp.Time) < orphanEndpointSliceMinAge {
@@ -180,18 +175,19 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 		// apiserver before deleting (a List can lag a Get).
 		_, getErr := c.cs.CoreV1().Services(s.Namespace).
 			Get(ctx, svcName, metav1.GetOptions{})
+		gone, confirmErr := shared.ConfirmAbsent(getErr)
 		switch {
-		case apierrors.IsNotFound(getErr):
-		case getErr != nil:
+		case gone:
+		case confirmErr != nil:
 			log.Info("WARN: service confirm failed — slice kept (fail closed)",
 				"endpointslice", s.Namespace+"/"+s.Name,
-				"service", svcName, "error", getErr)
+				"service", svcName, "error", confirmErr)
 			metrics.IncError(c.queue)
 			continue
 		default:
 			// Service actually exists — the snapshot was stale.
 			// Clear the streak so the slice re-arms from zero.
-			delete(c.absentStreak, key)
+			c.absentStreak.Reset(key)
 			absentNow[key] = false
 			continue
 		}
@@ -208,7 +204,7 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 			metrics.IncError(c.queue)
 			continue
 		}
-		delete(c.absentStreak, key)
+		c.absentStreak.Reset(key)
 		delete(absentNow, key)
 		metrics.OrphanEndpointSlicesCleanedTotal.WithLabelValues(s.Namespace).Inc()
 		deleted++
@@ -218,11 +214,7 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	// Prune streaks for slices that vanished or whose Service came
 	// back — "consecutive" means any cycle with the Service present
 	// resets the count to zero.
-	for k := range c.absentStreak {
-		if !absentNow[k] {
-			delete(c.absentStreak, k)
-		}
-	}
+	c.absentStreak.Prune(func(k string) bool { return absentNow[k] })
 	log.Info("sweep done", "absent", len(absentNow), "deleted", deleted)
 	return nil
 }

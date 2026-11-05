@@ -34,8 +34,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -99,19 +99,30 @@ type cfTunnelProxyWatchdog struct {
 // clusters running the cloudflare-tunnel-gateway-controller release
 // (enabled=false skips registration entirely).
 func Setup(d shared.Deps) error {
-	// Parse before the Disabled check — see corednspatcher: invalid
-	// knob values must warn even when the module is disabled
-	// (CF_TUNNEL_WATCHDOG_ENABLED=false, resolved by setupModules
-	// into Deps.Disabled).
-	namespace := shared.Getenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "cloudflare-tunnel-system")
-	interval := shared.GetenvDuration("CF_TUNNEL_WATCHDOG_INTERVAL", 5*time.Minute)
-	if d.Disabled {
-		return nil
+	return shared.SetupWithConfig(d, configFromEnv, func(cfg watchdogConfig) error {
+		logf.Log.WithName(d.Name).Info("registered",
+			"namespace", cfg.namespace, "interval", cfg.interval)
+		w := &cfTunnelProxyWatchdog{cs: d.CS, queue: d.Name, namespace: cfg.namespace}
+		return shared.AddPeriodic(d.Mgr, w.queue, cfg.interval, w.run)
+	})
+}
+
+// watchdogConfig is the module's env-resolved knob set.
+type watchdogConfig struct {
+	namespace string
+	interval  time.Duration
+}
+
+// configFromEnv resolves the CF_TUNNEL_WATCHDOG_* knobs.
+// SetupWithConfig runs it before the Deps.Disabled gate — see
+// corednspatcher: invalid knob values must warn even when the module
+// is disabled (CF_TUNNEL_WATCHDOG_ENABLED=false, resolved by
+// setupModules into Deps.Disabled).
+func configFromEnv() watchdogConfig {
+	return watchdogConfig{
+		namespace: shared.Getenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "cloudflare-tunnel-system"),
+		interval:  shared.GetenvDuration("CF_TUNNEL_WATCHDOG_INTERVAL", 5*time.Minute),
 	}
-	logf.Log.WithName(d.Name).Info("registered",
-		"namespace", namespace, "interval", interval)
-	w := &cfTunnelProxyWatchdog{cs: d.CS, queue: d.Name, namespace: namespace}
-	return shared.AddPeriodic(d.Mgr, w.queue, interval, w.run)
 }
 
 func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {
@@ -169,7 +180,7 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 	// kubectl annotate --overwrite: merge patch sets/replaces the key.
 	patch := []byte(fmt.Sprintf(
 		`{"metadata":{"annotations":{%q:"%d"}}}`,
-		cfTunnelResyncAnno, time.Now().Unix()))
+		cfTunnelResyncAnno, w.now.Now().Unix()))
 	for i := range epsList.Items {
 		if _, err := w.cs.DiscoveryV1().EndpointSlices(w.namespace).Patch(ctx,
 			epsList.Items[i].Name, types.MergePatchType,

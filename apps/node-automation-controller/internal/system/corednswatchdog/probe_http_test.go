@@ -16,7 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ func TestCoreDNSPanics(t *testing.T) {
 		body := strings.Repeat("e", 64*1024)
 		tb := &testutil.TrackingBody{R: strings.NewReader(body)}
 		httpc := &http.Client{Transport: &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: 500, Body: tb, Header: http.Header{}}, nil
+			return &http.Response{StatusCode: http.StatusInternalServerError, Body: tb, Header: http.Header{}}, nil
 		}}}
 		w := &coreDNSWatchdog{http: httpc}
 		if _, ok := w.panics(ctx, "10.9.9.9"); ok {
@@ -136,7 +136,7 @@ func TestCoreDNSPanics(t *testing.T) {
 		body := strings.Repeat("x", 5*1024*1024)
 		tb := &testutil.TrackingBody{R: strings.NewReader(body)}
 		httpc := &http.Client{Transport: &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: 200, Body: tb, Header: http.Header{}}, nil
+			return &http.Response{StatusCode: http.StatusOK, Body: tb, Header: http.Header{}}, nil
 		}}}
 		w := &coreDNSWatchdog{http: httpc}
 		_, _ = w.panics(ctx, "10.9.9.9")
@@ -152,7 +152,7 @@ func TestCoreDNSPanics(t *testing.T) {
 	t.Run("truncated body is unknown", func(t *testing.T) {
 		httpc := &http.Client{Transport: &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
 			return &http.Response{
-				StatusCode: 200,
+				StatusCode: http.StatusOK,
 				Body:       testutil.ErrReadCloser{},
 				Header:     http.Header{},
 			}, nil

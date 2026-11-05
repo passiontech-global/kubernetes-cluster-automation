@@ -12,12 +12,11 @@ import (
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // bounceHungWebhookPods is the W9-CP1 stage-1 remediation: for every
@@ -107,14 +106,16 @@ func (b *circuitBreaker) bounceOldestPod(ctx context.Context, snap *sweepSnapsho
 	log := logf.FromContext(ctx)
 	var oldest *corev1.Pod
 	for _, r := range refs {
-		p, err := g.cs.CoreV1().Pods(r.namespace).Get(ctx, r.name, metav1.GetOptions{})
+		p, getErr := g.cs.CoreV1().Pods(r.namespace).Get(ctx, r.name, metav1.GetOptions{})
+		gone, err := shared.ConfirmAbsent(getErr)
 		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				metrics.IncError(g.queue)
-				log.Error(err, "webhook backing pod get failed",
-					"pod", r.namespace+"/"+r.name, "service", svcKey)
-			}
+			metrics.IncError(g.queue)
+			log.Error(err, "webhook backing pod get failed",
+				"pod", r.namespace+"/"+r.name, "service", svcKey)
 			continue
+		}
+		if gone {
+			continue // endpoint ref already stale — the pod is gone
 		}
 		if p.DeletionTimestamp != nil || p.Status.Phase != corev1.PodRunning ||
 			!shared.PodReadyCond(p) {

@@ -31,7 +31,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -90,13 +90,17 @@ type externalSecretNudge struct {
 	queue   string
 	enabled bool // EXTERNALSECRET_NUDGE_ENABLED — clusters without ESO skip
 	mu      sync.Mutex
+	// now is the clock seam — tests pin it so the stuck/cooldown
+	// windows are deterministic. nil → time.Now.
+	now shared.Clock
 	// storeReady: clustersecretstore name → last observed Ready state.
 	// Seeded on first sight; the False→True edge is what fires nudges.
 	storeReady map[string]bool
 	// nudged: ns/name → last force-sync stamp — the 1/hour rate
-	// limit. Pruned inside nudge() once past the cooldown or when
-	// the ES vanished.
-	nudged map[string]time.Time
+	// limit. CooldownSet is zero-value ready and deliberately
+	// unbounded: stamps for vanished ESs are dead weight that age
+	// out of the window on their own.
+	nudged shared.CooldownSet
 	// storeDownSince: store key → first sweep that observed
 	// Ready=False — the persistence clock for the connect auto-heal
 	// (a transient first False must not bounce the pod).
@@ -121,8 +125,8 @@ func Setup(d shared.Deps) error {
 		dyn:        d.Dyn,
 		queue:      d.Name,
 		enabled:    shared.Gate("EXTERNALSECRET_NUDGE_ENABLED", false),
+		now:        shared.SystemClock,
 		storeReady: map[string]bool{},
-		nudged:     map[string]time.Time{},
 	}
 	return shared.AddPeriodic(d.Mgr, n.queue, esNudgeInterval, n.run)
 }
@@ -160,7 +164,7 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 
 	recovered := false
 	seen := map[string]bool{}
-	now := time.Now()
+	now := n.now.Now()
 	track := func(kind, ns, name string, isReady bool) {
 		key := kind + "/" + ns + "/" + name
 		seen[key] = true

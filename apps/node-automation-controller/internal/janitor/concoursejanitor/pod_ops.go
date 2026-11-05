@@ -14,7 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ func (j *concourseWorkdirJanitor) deletePod(ctx context.Context, name string, ol
 				return true, nil
 			}
 			if err != nil {
-				return false, nil // transient — keep waiting
+				return false, nil //nolint:nilerr // transient — keep waiting
 			}
 			return p.UID != oldUID, nil // old object deleted (or still terminating)
 		})
@@ -83,7 +83,7 @@ func (j *concourseWorkdirJanitor) waitNewPod(ctx context.Context, name string, o
 		func(ctx context.Context) (bool, error) {
 			p, err := j.cs.CoreV1().Pods(cjNamespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
-				return false, nil // not created yet / transient — keep polling
+				return false, nil //nolint:nilerr // not created yet / transient — keep polling
 			}
 			return p.UID != oldUID, nil
 		})
@@ -102,7 +102,7 @@ func (j *concourseWorkdirJanitor) waitReady(ctx context.Context, name string) er
 		func(ctx context.Context) (bool, error) {
 			p, err := j.cs.CoreV1().Pods(cjNamespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
-				return false, nil
+				return false, nil //nolint:nilerr // transient — keep polling
 			}
 			return shared.PodReadyCond(p), nil
 		})
