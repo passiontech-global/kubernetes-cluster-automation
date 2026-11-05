@@ -5,14 +5,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
-	"os"
 	"path"
-	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sshclient"
 )
 
 // Conn is the remote-host seam — one SSH session channel to a target.
@@ -125,170 +124,50 @@ func putAtomic(ctx context.Context, c Conn, remotePath string, r io.Reader, mode
 }
 
 // --- real SSH implementation ---
+//
+// The dial mechanics (signer loading, client config, TCP dial +
+// bounded handshake, the ssh_proxyjump hop, per-op conn bounds) now
+// live in platform/sshclient — shared with the nebulasign host.pub
+// fetch that used to carry a second private copy. What stays here
+// is hubsync's own contract: the Conn/Dialer seams, the sudo
+// wrapping, streaming Write and ExitError.
 
+// sshDialer is the real Dialer — a thin Config→sshclient splice.
+// The signer is loaded inside Dial (sshclient.Config.LoadSigner
+// runs per dial) so Syncer.New succeeds while the optional:true
+// secret is not mounted yet, and a rotated key is picked up on the
+// next dial without a pod restart.
 type sshDialer struct {
-	keyPath string
-	port    int
-	timeout time.Duration
-	log     *slog.Logger
+	cfg sshclient.Config
+	log *slog.Logger
 }
 
-// newSSHDialer only records the key path — the signer is loaded at
-// Dial time so Syncer.New succeeds while the (optional:true) secret
-// is not mounted yet, and a rotated key is picked up on the next
-// dial without a pod restart.
+// newSSHDialer only records the dial config — nothing touches the
+// key path until Dial (see sshDialer above).
 func newSSHDialer(keyPath string, port int, timeout time.Duration,
 	log *slog.Logger) (*sshDialer, error) {
 	if log == nil {
 		log = logger()
 	}
-	return &sshDialer{keyPath: keyPath, port: port, timeout: timeout, log: log}, nil
-}
-
-func (d *sshDialer) loadSigner() (ssh.Signer, error) {
-	pem, err := os.ReadFile(d.keyPath)
-	if err != nil {
-		return nil, err
-	}
-	signer, err := ssh.ParsePrivateKey(pem)
-	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", d.keyPath, err)
-	}
-	return signer, nil
-}
-
-// clientConfig builds the per-target config. HostKeyCallback accepts
-// any host key — StrictHostKeyChecking=no parity with the ansible
-// converge (targets are infra VMs whose host keys rotate on rebuild;
-// the lease+keypair is the authentication boundary) — and logs the
-// negotiated fingerprint so a rotated/spoofed key leaves an audit
-// trail instead of passing silently.
-func (d *sshDialer) clientConfig(user string, signer ssh.Signer) *ssh.ClientConfig {
-	return &ssh.ClientConfig{
-		User: user,
-		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error { // documented parity
-			d.log.Info("hubsync: ssh host key accepted (no strict check)",
-				"addr", hostname, "remote", remote.String(),
-				"fingerprint", ssh.FingerprintSHA256(key))
-			return nil
+	return &sshDialer{
+		cfg: sshclient.Config{
+			KeyPath: keyPath,
+			Port:    port,
+			Timeout: timeout,
+			// hubsync audit-logs every accepted host key — Log set.
+			Log: log,
 		},
-		Timeout: d.timeout,
-	}
+		log: log,
+	}, nil
 }
 
 func (d *sshDialer) Dial(ctx context.Context, t Target) (Conn, error) {
-	user := t.SSHUser
-	if user == "" {
-		user = "root"
-	}
-	signer, err := d.loadSigner()
+	link, err := d.cfg.Dial(ctx, t.SSHUser, t.IP, t.ProxyJump)
 	if err != nil {
-		return nil, fmt.Errorf("ssh key %s: %w", d.keyPath, err)
-	}
-	addr := net.JoinHostPort(t.IP, strconv.Itoa(d.port))
-	cfg := d.clientConfig(user, signer)
-	sudo := needsSudo(user)
-
-	if t.ProxyJump != "" {
-		// ssh_proxyjump parity: hub_converge used ProxyCommand
-		// `ssh -W %h:%p <jump>` — same key, no host-key check.
-		juser, jhost, jport := splitUserHost(t.ProxyJump)
-		if jport == "" {
-			jport = strconv.Itoa(d.port)
-		}
-		jnc, jump, err := d.dialTCP(ctx, net.JoinHostPort(jhost, jport),
-			d.clientConfig(juser, signer))
-		if err != nil {
-			return nil, fmt.Errorf("jump %s: %w", t.ProxyJump, err)
-		}
-		// Channel-open on the jump has no ctx wiring — bound it on
-		// the jump's conn the same way the handshake is bounded.
-		clear := boundOp(ctx, d.log, jnc, d.timeout)
-		nc, err := jump.Dial("tcp", addr)
-		clear()
-		if err != nil {
-			_ = jump.Close()
-			return nil, fmt.Errorf("jump %s → %s: %w", t.ProxyJump, addr, err)
-		}
-		// nc here is a chanConn — SetDeadline always errors on it,
-		// so the handshake is bounded on jnc (the real TCP conn all
-		// muxed traffic rides).
-		client, err := d.handshake(ctx, nc, jnc, addr, cfg)
-		if err != nil {
-			_ = jump.Close()
-			return nil, fmt.Errorf("%s via %s: %w", addr, t.ProxyJump, err)
-		}
-		return &sshConn{client: client, netc: nc, jnc: jnc, jump: jump,
-			sudo: sudo, timeout: d.timeout, log: d.log}, nil
-	}
-
-	nc, client, err := d.dialTCP(ctx, addr, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", addr, err)
-	}
-	return &sshConn{client: client, netc: nc, sudo: sudo,
-		timeout: d.timeout, log: d.log}, nil
-}
-
-// dialTCP opens the TCP conn with ctx + handshake deadline and
-// returns the underlying net.Conn — callers keep it to bound later
-// channel ops (jump.Dial, NewSession) that take no ctx.
-func (d *sshDialer) dialTCP(ctx context.Context, addr string,
-	cfg *ssh.ClientConfig) (net.Conn, *ssh.Client, error) {
-	nd := net.Dialer{Timeout: d.timeout}
-	nc, err := nd.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, nil, err
-	}
-	c, err := d.handshake(ctx, nc, nc, addr, cfg)
-	if err != nil {
-		return nil, nil, err
-	}
-	return nc, c, nil
-}
-
-// handshake runs NewClientConn under a conn deadline covering the
-// SSH banner + auth exchange, then clears it so sessions get their
-// own deadlines. carrier is the conn SetDeadline actually works
-// on: nc itself for a direct dial, but the JUMP's TCP conn when nc
-// is the chanConn jump.Dial returned — a chanConn's SetDeadline
-// always errors while every muxed channel rides the jump conn.
-func (d *sshDialer) handshake(ctx context.Context, nc, carrier net.Conn,
-	addr string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
-	dl := time.Now().Add(d.timeout)
-	if cdl, ok := ctx.Deadline(); ok && cdl.Before(dl) {
-		dl = cdl
-	}
-	if err := carrier.SetDeadline(dl); err != nil {
-		d.log.Warn("hubsync: ssh handshake unbounded — SetDeadline unsupported",
-			"addr", addr, "error", err)
-	}
-	c, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
-	if err != nil {
-		_ = nc.Close()
 		return nil, err
 	}
-	_ = carrier.SetDeadline(time.Time{})
-	return ssh.NewClient(c, chans, reqs), nil
-}
-
-// boundOp sets a conn deadline covering one blocking channel op —
-// NewSession/Client.Dial take no ctx and the handshake clears the
-// conn deadline, so without this a wedged target blocks forever.
-// The deadline is min(now+timeout, ctx deadline); the returned func
-// clears it so steady-state session I/O stays governed by ctx +
-// Session.Close. A rejected SetDeadline leaves the op unbounded —
-// warn so a silent hang is at least loud in the logs.
-func boundOp(ctx context.Context, log *slog.Logger, nc net.Conn, timeout time.Duration) func() {
-	dl := time.Now().Add(timeout)
-	if cdl, ok := ctx.Deadline(); ok && cdl.Before(dl) {
-		dl = cdl
-	}
-	if err := nc.SetDeadline(dl); err != nil {
-		log.Warn("hubsync: conn deadline rejected — op unbounded", "error", err)
-	}
-	return func() { _ = nc.SetDeadline(time.Time{}) }
+	return &sshConn{link: link, sudo: needsSudo(t.SSHUser),
+		timeout: d.cfg.Timeout, log: d.log}, nil
 }
 
 // needsSudo reports whether remote ops on the target must escalate —
@@ -299,56 +178,32 @@ func boundOp(ctx context.Context, log *slog.Logger, nc net.Conn, timeout time.Du
 func needsSudo(user string) bool { return user != "" && user != "root" }
 
 // splitUserHost parses "user@host[:port]" / "host" from
-// ssh_proxyjump — the same spec cli.go's splitJump accepts: an
-// explicit port is honoured (empty return = caller's default port).
+// ssh_proxyjump — the spec asserted by sync_test.go; the parse
+// itself is sshclient.SplitUserHost (identical shape).
 func splitUserHost(j string) (user, host, port string) {
-	user = "root"
-	if u, h, ok := strings.Cut(j, "@"); ok {
-		user, j = u, h
-	}
-	host = j
-	if h, p, err := net.SplitHostPort(j); err == nil {
-		host, port = h, p
-	}
-	return user, host, port
+	return sshclient.SplitUserHost(j)
 }
 
+// sshConn is hubsync's Conn over an established sshclient.Link —
+// the sudo wrap, streaming Write and per-op conn bound are the
+// converge-specific parts that stayed.
 type sshConn struct {
-	client  *ssh.Client
-	netc    net.Conn    // deadline handle for channel ops (direct dial)
-	jnc     net.Conn    // jump's TCP conn — the deadline handle behind a bastion
-	jump    *ssh.Client // non-nil when dialed through a bastion
-	sudo    bool        // non-root SSH user → wrap ops in sudo -n
+	link    *sshclient.Link
+	sudo    bool // non-root SSH user → wrap ops in sudo -n
 	timeout time.Duration
 	log     *slog.Logger
 }
 
-// deadlineConn picks the conn a SetDeadline actually works on.
-// Direct dial: netc is the TCP conn. Behind a bastion netc is the
-// chanConn jump.Dial returned (SetDeadline always errors —
-// "deadline not supported") while ALL muxed channel traffic rides
-// the jump's real TCP conn, so the bound belongs on jnc.
-func (c *sshConn) deadlineConn() net.Conn {
-	if c.jnc != nil {
-		return c.jnc
-	}
-	return c.netc
-}
-
-func (c *sshConn) Close() error {
-	err := c.client.Close()
-	if c.jump != nil {
-		_ = c.jump.Close()
-	}
-	return err
-}
+func (c *sshConn) Close() error { return c.link.Close() }
 
 // newSession opens a session channel under a per-op conn deadline —
 // NewSession can block indefinitely on a wedged target since the
 // handshake cleared the conn deadline and the call takes no ctx.
+// link.DeadlineConn picks the conn SetDeadline actually works on
+// (the jump's TCP conn behind a bastion — see sshclient.Link).
 func (c *sshConn) newSession(ctx context.Context) (*ssh.Session, error) {
-	defer boundOp(ctx, c.log, c.deadlineConn(), c.timeout)()
-	return c.client.NewSession()
+	defer sshclient.BoundOp(ctx, c.log, c.link.DeadlineConn(), c.timeout)()
+	return c.link.Client.NewSession()
 }
 
 func (c *sshConn) Run(ctx context.Context, cmd string) (string, error) {

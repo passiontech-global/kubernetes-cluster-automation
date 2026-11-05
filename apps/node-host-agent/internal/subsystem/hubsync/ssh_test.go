@@ -10,12 +10,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sshclient"
 )
 
 // dlConn is a net.Conn that only records SetDeadline calls — the
-// seam for asserting boundOp behaviour without a real socket, and
-// for emulating the x/crypto chanConn jump.Dial returns whose
-// SetDeadline always errors ("deadline not supported").
+// seam for asserting the per-op bound behaviour (sshclient.BoundOp)
+// without a real socket, and for emulating the x/crypto chanConn
+// jump.Dial returns whose SetDeadline always errors ("deadline not
+// supported").
 type dlConn struct {
 	dls []time.Time
 	err error
@@ -39,7 +42,7 @@ func (c *dlConn) SetWriteDeadline(time.Time) error { return nil }
 func TestBoundOpSetsAndClearsDeadline(t *testing.T) {
 	nc := &dlConn{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	clear := boundOp(context.Background(), log, nc, time.Minute)
+	clear := sshclient.BoundOp(context.Background(), log, nc, time.Minute)
 	if len(nc.dls) != 1 || nc.dls[0].IsZero() {
 		t.Fatalf("deadline not applied: %v", nc.dls)
 	}
@@ -56,22 +59,23 @@ func TestBoundOpUnsupportedIsLoud(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, nil))
 	nc := &dlConn{err: errors.New("deadline not supported")}
-	clear := boundOp(context.Background(), log, nc, time.Minute)
+	clear := sshclient.BoundOp(context.Background(), log, nc, time.Minute)
 	clear()
 	if !strings.Contains(buf.String(), "unbounded") {
 		t.Fatalf("rejected SetDeadline not warned:\n%s", buf.String())
 	}
 }
 
-// TestDeadlineConnPrefersJump: behind a bastion netc is the chanConn
-// (SetDeadline always errors) while every muxed channel rides the
-// jump's real TCP conn — the per-op bound must land on jnc.
-func TestDeadlineConnPrefersJump(t *testing.T) {
+// TestSSHConnBindsSessionsOnLink: sshConn wires its per-op bound to
+// the link's deadline conn — the selection itself (chanConn vs the
+// jump's TCP conn) is sshclient.Link's job, covered in its own
+// package tests.
+func TestSSHConnBindsSessionsOnLink(t *testing.T) {
 	direct, jump := &dlConn{}, &dlConn{}
-	if got := (&sshConn{netc: direct}).deadlineConn(); got != direct {
+	if got := (&sshclient.Link{Net: direct}).DeadlineConn(); got != direct {
 		t.Fatal("direct conn must be its own deadline handle")
 	}
-	if got := (&sshConn{netc: direct, jnc: jump}).deadlineConn(); got != jump {
+	if got := (&sshclient.Link{Net: direct, JumpNet: jump}).DeadlineConn(); got != jump {
 		t.Fatal("bastion conn must bound on the jump's TCP conn")
 	}
 }
