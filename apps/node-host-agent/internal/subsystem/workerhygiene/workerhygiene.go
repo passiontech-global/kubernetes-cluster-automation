@@ -116,6 +116,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checks"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
@@ -432,8 +433,10 @@ type Hygiene struct {
 
 	// checks is the ordered per-Cycle dispatch list — initChecks
 	// fills it; the order preserves the sequence the checks ran
-	// before the table existed. The checks are also named fields
-	// so tests can reach per-check state and the old
+	// before the table existed. Cycle wraps it into a checks.Group
+	// for platform/checks.Dispatch (the Entry.Run closures bind
+	// the per-cycle env — see Cycle). The checks are also named
+	// fields so tests can reach per-check state and the old
 	// Hygiene-method forwarders resolve without a list walk.
 	checks      []Check
 	stall       *stallCheck
@@ -694,10 +697,19 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	sigOn := func(name string) bool {
 		return h.cfg.Watchdog == nil || h.cfg.Watchdog.SignalEnabled(name)
 	}
-	// The checks dispatch through the ordered list initChecks
-	// built — the order preserves the sequence the checks ran
-	// before the table existed. Disabled checks (WD_SIG_<NAME>=off)
-	// count cycles{check,disabled} exactly like the old run gate.
+	// The checks dispatch through the shared ordered dispatcher —
+	// the entries are rebuilt each cycle because checks.Entry.Run
+	// takes no env: every entry closes over THIS cycle's env (the
+	// pod LIST, the workerActive gate and the lazy once-per-cycle
+	// snapshots). One small slice per Interval. A single UNGATED
+	// group: the unit-file and uptime gates return early above,
+	// and workerActive gates inside each check (per-check
+	// cycles{check,"gated"}) — none map onto Group.GateOK, whose
+	// skip counts "uptime_gate" and would starve the "disabled"
+	// count of a kill-switched check. Entry order IS h.checks
+	// order — load-bearing, same as the hand-rolled loop; a
+	// WD_SIG_<NAME>=off check counts cycles{check,"disabled"}
+	// exactly like the old run gate.
 	env := &cycleEnv{
 		pods:         pods,
 		apiOK:        apiOK,
@@ -706,13 +718,14 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		pidsOnce:     pidsOnce,
 		journalOnce:  journalOnce,
 	}
+	entries := make([]checks.Entry, 0, len(h.checks))
 	for _, c := range h.checks {
-		if sigOn(c.Name()) {
-			c.Run(ctx, env)
-		} else {
-			h.cycles.WithLabelValues(c.Name(), "disabled").Inc()
-		}
+		entries = append(entries, checks.Entry{
+			Name: c.Name(),
+			Run:  func(ctx context.Context) { c.Run(ctx, env) },
+		})
 	}
+	checks.Dispatch(ctx, sigOn, h.cycles, []checks.Group{{Entries: entries}})
 	// W10 node_agent_* gauges — one textfile per cycle carrying the
 	// OOM/conntrack counters and the orphan-hostpath measurements
 	// the checks above just refreshed.
