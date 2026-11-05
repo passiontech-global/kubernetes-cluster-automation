@@ -19,7 +19,6 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -479,11 +478,12 @@ func TestCoreDNSPatcherPatchError(t *testing.T) {
 }
 
 // Disabled must be a clean no-op — nothing registered, no error.
+// Deps.Disabled is what setupModules stamps for
+// COREDNS_PATCHER_ENABLED=false.
 func TestSetupCoreDNSPatcherDisabled(t *testing.T) {
-	t.Setenv("COREDNS_PATCHER_ENABLED", "false")
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
+		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {
@@ -491,18 +491,11 @@ func TestSetupCoreDNSPatcherDisabled(t *testing.T) {
 	}
 }
 
-// The predicate pins ns/name on top of the shared Deployment
+// The For() predicate (onlyCoreDNSDeployment — the exact predicate
+// Setup installs) pins ns/name on top of the shared Deployment
 // informer — only kube-system/coredns may reconcile.
 func TestSetupCoreDNSPatcherPredicate(t *testing.T) {
-	t.Setenv("COREDNS_PATCHER_ENABLED", "true")
-	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule")
-	t.Setenv("COREDNS_PATCHER_ZONE_MIN_DOMAINS", "2")
-	t.Setenv("COREDNS_MIN_REPLICAS", "4")
-	t.Setenv("COREDNS_NODES_PER_REPLICA", "1")
-	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-			Dyn: testutil.StubDyn()})
-	})
+	p := onlyCoreDNSDeployment
 	coredns := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "kube-system", Name: "coredns"}}
 	if !p.Create(event.CreateEvent{Object: coredns}) {
@@ -520,30 +513,16 @@ func TestSetupCoreDNSPatcherPredicate(t *testing.T) {
 	}
 }
 
-// The Node watch (second watch source) drives the proportional
-// replica count: only create/delete may fire — includeUnschedulableNodes
-// counts every Node object, so updates never change the total and
-// would only add kubelet-heartbeat churn.
+// The Node watch predicate (nodeCountChanges — the exact
+// predicate.Funcs the conditional second watch installs when
+// minReplicas>0) drives the proportional replica count: only
+// create/delete may fire — includeUnschedulableNodes counts every
+// Node object, so updates never change the total and would only add
+// kubelet-heartbeat churn. The conditional registration of the watch
+// itself is no longer asserted (it required introspecting
+// controller-runtime internals).
 func TestSetupCoreDNSPatcherNodeWatch(t *testing.T) {
-	t.Setenv("COREDNS_PATCHER_ENABLED", "true")
-	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule")
-	t.Setenv("COREDNS_PATCHER_ZONE_MIN_DOMAINS", "2")
-	t.Setenv("COREDNS_MIN_REPLICAS", "4")
-	t.Setenv("COREDNS_NODES_PER_REPLICA", "1")
-	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	srcs := testutil.ControllerWatches(t, m.Added[0])
-	if len(srcs) != 2 {
-		t.Fatalf("patcher registered %d watches, want 2 (Deployment + Node)", len(srcs))
-	}
-	preds, _ := testutil.KindSource(t, srcs[1])
-	if len(preds) != 1 {
-		t.Fatalf("Node watch carries %d predicates, want 1", len(preds))
-	}
-	p := preds[0]
+	p := nodeCountChanges
 	n1 := testutil.Node("n1", corev1.ConditionTrue, nil)
 	if !p.Create(event.CreateEvent{Object: n1}) {
 		t.Fatal("node add did not fire")

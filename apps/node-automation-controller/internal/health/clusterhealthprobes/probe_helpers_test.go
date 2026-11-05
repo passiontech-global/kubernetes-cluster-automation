@@ -483,9 +483,9 @@ func linkerdDestinationPod(name string, age time.Duration) *corev1.Pod {
 func driveEndpointDesync(t *testing.T, p *clusterHealthProber, base time.Time) probeResult {
 	t.Helper()
 	p.now = func() time.Time { return base }
-	p.linkerdSync.run(ctx)
+	mustCheck[*linkerdEndpointSyncCheck](t, p).run(ctx)
 	p.now = func() time.Time { return base.Add(5 * time.Minute) }
-	p.linkerdSync.run(ctx)
+	mustCheck[*linkerdEndpointSyncCheck](t, p).run(ctx)
 	p.now = func() time.Time { return base.Add(linkerdEndpointDesyncMinAge + time.Minute) }
-	return p.linkerdSync.run(ctx)
+	return mustCheck[*linkerdEndpointSyncCheck](t, p).run(ctx)
 }

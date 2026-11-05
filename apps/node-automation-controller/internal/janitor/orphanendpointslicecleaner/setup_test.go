@@ -16,7 +16,9 @@ import (
 // crontab-equivalent interval — the pairing is what keeps
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
-	t.Setenv("ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED", "true")
+	// Zero-value Deps.Disabled = gate-on — the registration gate
+	// (ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED) is resolved by
+	// setupModules, not re-read here.
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{
 		Mgr: m,
@@ -28,15 +30,15 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	testutil.ExpectPeriodic(t, m, "orphan-endpointslice-cleaner", 15*time.Minute)
 }
 
-// The module skips mgr.Add entirely when disabled — same contract as
-// volumeattachment-cleaner.
+// The module skips mgr.Add entirely when Deps.Disabled is stamped —
+// same contract as volumeattachment-cleaner.
 func TestSetupDisabled(t *testing.T) {
-	t.Setenv("ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED", "false")
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{
-		Mgr: m,
-		CS:  fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn(),
+		Mgr:      m,
+		CS:       fake.NewSimpleClientset(),
+		Dyn:      testutil.StubDyn(),
+		Disabled: true,
 	}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}

@@ -163,8 +163,10 @@ func stuckFixture(ns, certName, orderName string) []runtime.Object {
 // ---------------------------------------------------------------------------
 
 func TestCertManagerReaperSetupDisabled(t *testing.T) {
-	t.Setenv("CERTMANAGER_REAPER_ENABLED", "false")
-	if err := Setup(shared.Deps{}); err != nil {
+	// Deps.Disabled is what setupModules stamps when
+	// CERTMANAGER_REAPER_ENABLED gates the module off — a disabled
+	// Setup must return nil without touching the (nil) manager.
+	if err := Setup(shared.Deps{Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 }

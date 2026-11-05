@@ -331,9 +331,7 @@ func TestWatchdogAllUnreadyDeletesOldest(t *testing.T) {
 		proxyDeploy(nil))
 	cs2.PrependReactor("get", "pods", cfLogReactor("INF ok\n"))
 	w2 := &cfTunnelProxyWatchdog{cs: cs2, namespace: cfWatchdogTestNS}
-	w2.lastHeal = map[string]time.Time{
-		cfWatchdogTestNS + "/proxy-old": now.Add(-5 * time.Minute),
-	}
+	w2.lastHeal.Stamp(cfWatchdogTestNS+"/proxy-old", now.Add(-5*time.Minute))
 	w2.nowFn = func() time.Time { return now }
 	if err := w2.run(ctx); err != nil {
 		t.Fatalf("run2: %v", err)
@@ -421,11 +419,12 @@ func TestCloudflaredLogsWedged(t *testing.T) {
 }
 
 // Disabled must be a clean no-op — nothing registered, no error.
+// Deps.Disabled is what setupModules stamps for
+// CF_TUNNEL_WATCHDOG_ENABLED=false.
 func TestSetupCFTunnelProxyWatchdogDisabled(t *testing.T) {
-	t.Setenv("CF_TUNNEL_WATCHDOG_ENABLED", "false")
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
+		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {
@@ -436,7 +435,8 @@ func TestSetupCFTunnelProxyWatchdogDisabled(t *testing.T) {
 // Enabled registration goes through shared.AddPeriodic with the legacy queue
 // name and the configured interval.
 func TestSetupCFTunnelProxyWatchdogPeriodic(t *testing.T) {
-	t.Setenv("CF_TUNNEL_WATCHDOG_ENABLED", "true")
+	// Zero-value Deps.Disabled = gate-on — CF_TUNNEL_WATCHDOG_ENABLED
+	// is resolved by setupModules, not re-read here.
 	t.Setenv("CF_TUNNEL_WATCHDOG_NAMESPACE", cfWatchdogTestNS)
 	t.Setenv("CF_TUNNEL_WATCHDOG_INTERVAL", "5m")
 	m := testutil.NewStubManager()

@@ -21,6 +21,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -332,7 +333,7 @@ func TestStuckTerminatingAuditPrunesFinished(t *testing.T) {
 	if err := j.auditStuckTerminating(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := j.stuckEmitted[stuckTerminatingKey{
+	if _, ok := j.stuckEmitted.Last()[stuckTerminatingKey{
 		kind: "PersistentVolumeClaim", ns: "data", name: "stuck-pvc"}]; !ok {
 		t.Fatal("stuck pvc not tracked")
 	}
@@ -348,8 +349,8 @@ func TestStuckTerminatingAuditPrunesFinished(t *testing.T) {
 		"PersistentVolumeClaim", "data", "stuck-pvc") {
 		t.Fatal("stale series survived the prune")
 	}
-	if len(j.stuckEmitted) != 0 {
-		t.Fatalf("stuckEmitted ledger holds %d entries, want 0", len(j.stuckEmitted))
+	if len(j.stuckEmitted.Last()) != 0 {
+		t.Fatalf("stuckEmitted ledger holds %d entries, want 0", len(j.stuckEmitted.Last()))
 	}
 }
 
@@ -503,7 +504,7 @@ func TestFailedJobsJanitorBuildRunTTL(t *testing.T) {
 	)
 	j := &failedJobsJanitor{
 		cs: fake.NewSimpleClientset(), dyn: dyn, nowFn: time.Now,
-		stuckEmitted: map[stuckTerminatingKey]struct{}{},
+		stuckEmitted: shared.GaugeLedger[stuckTerminatingKey]{},
 	}
 	if err := j.sweepBuildRuns(ctx); err != nil {
 		t.Fatal(err)
@@ -527,7 +528,7 @@ func TestFailedJobsJanitorBuildRunTTL(t *testing.T) {
 func TestFailedJobsJanitorBuildRunCRDAbsent(t *testing.T) {
 	j := &failedJobsJanitor{
 		cs: fake.NewSimpleClientset(), nowFn: time.Now,
-		stuckEmitted: map[stuckTerminatingKey]struct{}{},
+		stuckEmitted: shared.GaugeLedger[stuckTerminatingKey]{},
 	}
 	// dyn nil — the sweep must no-op without a dynamic client.
 	if err := j.sweepBuildRuns(ctx); err != nil {

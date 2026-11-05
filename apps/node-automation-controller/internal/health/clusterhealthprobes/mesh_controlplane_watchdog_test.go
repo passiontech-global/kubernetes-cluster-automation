@@ -39,7 +39,7 @@ func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(readyWorkerNode("w1", "", 0, false), pod)
 	p := testProberDyn(cs, shOpDyn())
-	if res := p.mesh.run(ctx); res.pass {
+	if res := mustCheck[*meshControlPlaneCheck](t, p).run(ctx); res.pass {
 		t.Fatal("wedged linkerd pod passed")
 	}
 	if _, err := cs.CoreV1().Pods(linkerdNS).
@@ -72,7 +72,7 @@ func TestHealNamedPodDefersDuringMaintenance(t *testing.T) {
 	}}
 	cs := fake.NewSimpleClientset(readyWorkerNode("w1", "", 0, false), kured, pod)
 	p := testProberDyn(cs, shOpDyn())
-	p.mesh.healNamedPod(ctx, logr.Discard(), linkerdDestinationName,
+	mustCheck[*meshControlPlaneCheck](t, p).healNamedPod(ctx, logr.Discard(), linkerdDestinationName,
 		pod.Namespace+"/"+pod.Name, pod, linkerdHealCooldown, time.Now())
 	if _, err := cs.CoreV1().Pods(linkerdNS).
 		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
@@ -92,7 +92,7 @@ func TestHealNamedPodDeletesWithoutMaintenance(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(readyWorkerNode("w1", "", 0, false), pod)
 	p := testProberDyn(cs, shOpDyn())
-	p.mesh.healNamedPod(ctx, logr.Discard(), linkerdDestinationName,
+	mustCheck[*meshControlPlaneCheck](t, p).healNamedPod(ctx, logr.Discard(), linkerdDestinationName,
 		pod.Namespace+"/"+pod.Name, pod, linkerdHealCooldown, time.Now())
 	if _, err := cs.CoreV1().Pods(linkerdNS).
 		Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {

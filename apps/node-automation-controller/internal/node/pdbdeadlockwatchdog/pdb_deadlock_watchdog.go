@@ -77,36 +77,30 @@ type pdbDeadlockWatchdog struct {
 	// with no gap. Any cycle where the precondition drops deletes the
 	// entry, restarting the window; any cycle where the PDB vanishes
 	// prunes all of its entries (and their gauge series).
-	firstSeen map[string]time.Time
+	firstSeen shared.FirstSeenLedger
 	// nowFn is the wall-clock seam so tests can age sightings without
 	// sleeping 30 minutes.
 	nowFn func() time.Time
 }
 
 // Setup registers the 5-minute sweep when the
-// PDB_WATCHDOG_ENABLED flag is on. Disabled clusters register nothing
-// at all — same contract as cilium-taint-reaper: no runnable, no
-// periodic cluster-wide LIST against the apiserver.
+// PDB_WATCHDOG_ENABLED flag is on (resolved by setupModules into
+// Deps.Disabled). Disabled clusters register nothing at all — same
+// contract as cilium-taint-reaper: no runnable, no periodic
+// cluster-wide LIST against the apiserver.
 func Setup(d shared.Deps) error {
-	if !shared.Gate("PDB_WATCHDOG_ENABLED", true) {
-		logf.Log.WithName(pdbDeadlockQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	w := &pdbDeadlockWatchdog{
-		cs:        d.CS,
-		firstSeen: map[string]time.Time{},
-		nowFn:     time.Now,
+		cs:    d.CS,
+		nowFn: time.Now,
 	}
 	return shared.AddPeriodic(d.Mgr, pdbDeadlockQueue, 5*time.Minute, w.run)
 }
 
 func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	if w.firstSeen == nil {
-		// Lazy-init for direct-constructed fixtures — same guard the
-		// other ledgers carry (Setup always initializes).
-		w.firstSeen = map[string]time.Time{}
-	}
 
 	// Node list first — "at least one cordoned node" is a cluster-wide
 	// input to the per-PDB verdict. Failing to read it must abort the
@@ -165,12 +159,12 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 			}
 			key := p.Namespace + "/" + p.Name + "/" + r.name
 			seen[key] = struct{}{}
-			first, ok := w.firstSeen[key]
-			if !ok {
-				// First sighting — open the continuity window; the
-				// gauge stays unset until the reason holds across its
-				// full threshold without a gap.
-				w.firstSeen[key] = now
+			first, tracked := w.firstSeen.Observe(key, now)
+			if !tracked {
+				// First sighting — the ledger just opened the
+				// continuity window; the gauge stays unset until
+				// the reason holds across its full threshold
+				// without a gap.
 				continue
 			}
 			if now.Sub(first) < r.minAge {
@@ -197,11 +191,10 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	// resets on any gap, and a stale label set must not outlive its
 	// object (same DeleteLabelValues hygiene as ForgetAPIBackend: the
 	// series disappears rather than lingering at 0 forever).
-	for key := range w.firstSeen {
+	w.firstSeen.Prune(func(key string) bool {
 		if _, ok := seen[key]; ok {
-			continue
+			return true
 		}
-		delete(w.firstSeen, key)
 		// Keys are built as ns/name/reason; ns+name are DNS-1123
 		// identifiers so "/" is unambiguous. Deleting a series that
 		// was never set is a harmless no-op.
@@ -209,7 +202,10 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 			metrics.PDBDrainBlocked.
 				DeleteLabelValues(parts[0], parts[1], parts[2])
 		}
-	}
-	log.Info("sweep done", "flagged", flagged, "tracked", len(w.firstSeen))
+		return false
+	})
+	// Post-prune the ledger holds exactly the keys still tracked —
+	// the same set `seen` collected this cycle.
+	log.Info("sweep done", "flagged", flagged, "tracked", len(seen))
 	return nil
 }

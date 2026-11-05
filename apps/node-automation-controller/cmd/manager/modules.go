@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/apiserver/apiserverendpointguard"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/apiserver/apiserviceguard"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/apiserver/webhookguard"
@@ -18,6 +21,7 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/orphanendpointslicecleaner"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/volumeattachmentcleaner"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/zombiesidecarreaper"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/ciliumtaintreaper"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/csrwatcher"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/deadnodesweeper"
@@ -36,74 +40,160 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/statefulsetroller"
 )
 
-// modules is the single registration point for every node-ops module.
-// The map (not a slice) keeps registration order deliberately random —
-// no module may rely on another being wired first. Every module has
-// the uniform signature `Setup(d shared.Deps) error` and resolves its
-// own feature gates/knobs from env inside Setup (the same flag
-// ConfigMaps the shell-operator read — see the contract in
+// modules is the single registration point for every node-ops module —
+// one shared.Module row each: the ops name, the REGISTRATION gate env
+// (when the module has one) and the uniform `Setup(d shared.Deps)
+// error` entry point. Registration gates live here and nowhere else:
+// setupModules evaluates GateEnv/DefaultOn and stamps Deps.Disabled,
+// so the env var is named in exactly one place instead of being
+// re-resolved inside each module's Setup. Modules still resolve their
+// own knobs and SUB-feature gates from env inside Setup (the same
+// flag ConfigMaps the shell-operator read — see the contract in
 // main.go's header comment), so adding a module is one import + one
-// map entry here and nothing in main().
+// row here and nothing in main().
 //
-// The map key is the module's ops name — it appears in boot logs and
-// must stay stable for anyone grepping journalctl.
-var modules = map[string]func(shared.Deps) error{
+// GateEnv semantics match shared.Gate: DefaultOn=false is the opt-in
+// convention (enabled only on "true"); DefaultOn=true opts out only
+// on an explicit "false". An empty GateEnv means always-on. Gates
+// that only alter run behavior while the module still registers —
+// CSR_APPROVER_ENABLED approve mode, HELM_STALL_UNWEDGE_ENABLED,
+// EXTERNALSECRET_NUDGE_ENABLED, CILIUM_IDENTITY_GC_ENABLED,
+// WEBHOOK_CIRCUIT_BREAKER_ENABLED, UNMESHED_POD_REMEDIATION_ENABLED —
+// are NOT listed: the module keeps reading those itself.
+//
+// The slice (not a map) makes registration order deterministic — the
+// sequence below is the boot order. No module may depend on it
+// anyway: every module wires only its own runnables, so the stability
+// is for log readability, not correctness.
+//
+// Name is the module's ops/queue name — it labels the run-error
+// counters and appears in boot logs, so it must stay byte-stable for
+// anyone grepping journalctl or querying Prometheus.
+var modules = []shared.Module{
 	// kube-system component patchers and watchdogs.
-	"konnectivity-patcher":        konnectivitypatcher.Setup,
-	"fluent-bit-config-roller":    fluentbitroller.Setup,
-	"coredns-stale-watchdog":      corednswatchdog.Setup,
-	"coredns-patcher":             corednspatcher.Setup,
-	"metrics-server-patcher":      metricsserverpatcher.Setup,
-	"cf-tunnel-proxy-watchdog":    cftunnelproxywatchdog.Setup,
-	"statefulset-ondelete-roller": statefulsetroller.Setup,
+	{Name: "konnectivity-patcher", Setup: konnectivitypatcher.Setup},
+	{Name: "fluent-bit-config-roller", GateEnv: "FLUENTBIT_ROLLER_ENABLED", Setup: fluentbitroller.Setup},
+	{Name: "coredns-stale-watchdog", Setup: corednswatchdog.Setup},
+	{Name: "coredns-patcher", GateEnv: "COREDNS_PATCHER_ENABLED", DefaultOn: true, Setup: corednspatcher.Setup},
+	{Name: "metrics-server-patcher", GateEnv: "METRICS_SERVER_PATCHER_ENABLED", DefaultOn: true, Setup: metricsserverpatcher.Setup},
+	{Name: "cf-tunnel-proxy-watchdog", GateEnv: "CF_TUNNEL_WATCHDOG_ENABLED", DefaultOn: true, Setup: cftunnelproxywatchdog.Setup},
+	{Name: "statefulset-ondelete-roller", GateEnv: "STATEFULSET_ONDELETE_ROLLER_ENABLED", DefaultOn: true, Setup: statefulsetroller.Setup},
 
 	// Node lifecycle and health sweeps.
-	"cilium-taint-reaper":     ciliumtaintreaper.Setup,
-	"descheduler-storm-gate":  deschedulerstormgate.Setup,
-	"node-labeler":            nodelabeler.Setup,
-	"kubelet-liveness-reaper": kubeletreaper.Setup,
-	"partition-pod-evictor":   partitionevictor.Setup,
-	"dead-node-sweeper":       deadnodesweeper.Setup,
-	"csr-watcher":             csrwatcher.Setup,
-	"pdb-deadlock-watchdog":   pdbdeadlockwatchdog.Setup,
+	{Name: "cilium-taint-reaper", GateEnv: "CILIUM_TAINT_REAPER_ENABLED", Setup: ciliumtaintreaper.Setup},
+	{Name: "descheduler-storm-gate", Setup: deschedulerstormgate.Setup},
+	{Name: "node-labeler", Setup: nodelabeler.Setup},
+	{Name: "kubelet-liveness-reaper", Setup: kubeletreaper.Setup},
+	{Name: "partition-pod-evictor", Setup: partitionevictor.Setup},
+	{Name: "dead-node-sweeper", Setup: deadnodesweeper.Setup},
+	{Name: "csr-watcher", Setup: csrwatcher.Setup},
+	{Name: "pdb-deadlock-watchdog", GateEnv: "PDB_WATCHDOG_ENABLED", DefaultOn: true, Setup: pdbdeadlockwatchdog.Setup},
 
 	// apiserver integrity guards.
-	"admission-webhook-guard":  webhookguard.Setup,
-	"apiserver-endpoint-guard": apiserverendpointguard.Setup,
-	"apiservice-guard":         apiserviceguard.Setup,
+	{Name: "admission-webhook-guard", Setup: webhookguard.Setup},
+	{Name: "apiserver-endpoint-guard", Setup: apiserverendpointguard.Setup},
+	{Name: "apiservice-guard", GateEnv: "APISERVICE_GUARD_ENABLED", DefaultOn: true, Setup: apiserviceguard.Setup},
 
 	// Resource cleanup sweeps.
-	"failed-jobs-janitor":          failedjobsjanitor.Setup,
-	"evicted-pod-janitor":          evictedpodjanitor.Setup,
-	"cronjob-catchup":              cronjobcatchup.Setup,
-	"concourse-workdir-janitor":    concoursejanitor.Setup,
-	"volumeattachment-cleaner":     volumeattachmentcleaner.Setup,
-	"zombie-sidecar-reaper":        zombiesidecarreaper.Setup,
-	"orphan-endpointslice-cleaner": orphanendpointslicecleaner.Setup,
+	{Name: "failed-jobs-janitor", Setup: failedjobsjanitor.Setup},
+	{Name: "evicted-pod-janitor", Setup: evictedpodjanitor.Setup},
+	{Name: "cronjob-catchup", Setup: cronjobcatchup.Setup},
+	{Name: "concourse-workdir-janitor", GateEnv: "CONCOURSE_JANITOR_ENABLED", Setup: concoursejanitor.Setup},
+	{Name: "volumeattachment-cleaner", GateEnv: "VOLUMEATTACHMENT_CLEANER_ENABLED", DefaultOn: true, Setup: volumeattachmentcleaner.Setup},
+	{Name: "zombie-sidecar-reaper", GateEnv: "ZOMBIE_SIDECAR_REAPER_ENABLED", DefaultOn: true, Setup: zombiesidecarreaper.Setup},
+	{Name: "orphan-endpointslice-cleaner", GateEnv: "ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED", DefaultOn: true, Setup: orphanendpointslicecleaner.Setup},
 
 	// Third-party controller unstuckers (dynamic client /
 	// CRD types).
-	"helmrelease-unlocker":    helmreleaseunlocker.Setup,
-	"externalsecret-nudge":    externalsecretnudge.Setup,
-	"certmanager-reaper":      certmanagerreaper.Setup,
-	"cilium-identity-auditor": ciliumidentityauditor.Setup,
-	"cert-drift-auditor":      certdriftauditor.Setup,
-	"velero-backup-auditor":   velerobackupauditor.Setup,
+	{Name: "helmrelease-unlocker", Setup: helmreleaseunlocker.Setup},
+	{Name: "externalsecret-nudge", Setup: externalsecretnudge.Setup},
+	{Name: "certmanager-reaper", GateEnv: "CERTMANAGER_REAPER_ENABLED", Setup: certmanagerreaper.Setup},
+	{Name: "cilium-identity-auditor", GateEnv: "CILIUM_IDENTITY_AUDITOR_ENABLED", Setup: ciliumidentityauditor.Setup},
+	{Name: "cert-drift-auditor", GateEnv: "CERT_DRIFT_AUDITOR_ENABLED", DefaultOn: true, Setup: certdriftauditor.Setup},
+	{Name: "velero-backup-auditor", GateEnv: "VELERO_BACKUP_AUDITOR_ENABLED", DefaultOn: true, Setup: velerobackupauditor.Setup},
 
 	// Cluster health probes.
-	"cluster-health-probes": clusterhealthprobes.Setup,
+	{Name: "cluster-health-probes", GateEnv: "CLUSTER_HEALTH_PROBES_ENABLED", DefaultOn: true, Setup: clusterhealthprobes.Setup},
 }
 
-// setupModules wires every module on the manager. A module's Setup
-// reads its own env gates — a disabled module logs and registers
-// nothing (same contract as before). A returned error aborts boot:
-// a module that fails to register is a broken operator, not a
+// parseModulesFlag splits the -modules flag value into names —
+// comma-separated, whitespace-tolerant, empty entries dropped so a
+// trailing comma or an all-whitespace value behaves as "unset".
+func parseModulesFlag(s string) []string {
+	var names []string
+	for n := range strings.SplitSeq(s, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
+// filterModules resolves the -modules allowlist against the registry.
+// An empty names slice means "flag unset" and returns the full
+// registry untouched. Otherwise it returns exactly the named modules
+// in REGISTRY order (not argv order), so boot order stays
+// deterministic however the operator wrote the list. An unrecognized
+// name is a boot error, not a skip — a typo'd allowlist silently
+// running the wrong subset is worse than refusing to start — so the
+// error names both the offenders and every valid name.
+func filterModules(names []string) ([]shared.Module, error) {
+	if len(names) == 0 {
+		return modules, nil
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var out []shared.Module
+	valid := make([]string, 0, len(modules))
+	for _, m := range modules {
+		valid = append(valid, m.Name)
+		if want[m.Name] {
+			out = append(out, m)
+			delete(want, m.Name) // matched — also dedupes repeat names
+		}
+	}
+	if len(want) > 0 {
+		// Report the offenders in the operator's argv order — what is
+		// left in `want` is exactly the names that matched nothing.
+		var bad []string
+		for _, n := range names {
+			if want[n] {
+				bad = append(bad, n)
+				delete(want, n)
+			}
+		}
+		return nil, fmt.Errorf("unknown module name(s) %s — valid names: %s",
+			strings.Join(bad, ", "), strings.Join(valid, ", "))
+	}
+	return out, nil
+}
+
+// setupModules wires the allowlisted modules on the manager, registry
+// order. The two loops are deliberate: the queue's error-metric
+// series are predeclared for the FULL registry — /metrics must
+// expose the complete 0-valued fleet even on a Deployment where
+// -modules (or a gate) runs only a subset, so a mid-flight flag
+// change can never gap a series — while only `mods` get the gate
+// check + Setup call. Each row's GateEnv (when set) is resolved ONCE
+// here: a module whose gate is off still has its Setup invoked, but
+// with Deps.Disabled stamped so it can parse its knobs (warning on
+// bad values) while registering nothing. A returned error aborts
+// boot: a module that fails to register is a broken operator, not a
 // degraded one.
-func setupModules(deps shared.Deps) error {
-	log := deps.Log.WithName("main")
-	for name, setup := range modules {
-		if err := setup(deps); err != nil {
-			log.Error(err, "unable to setup module", "module", name)
+func setupModules(deps shared.Deps, mods []shared.Module) error {
+	for _, m := range modules {
+		metrics.PredeclareQueue(m.Name)
+	}
+	for _, m := range mods {
+		d := deps
+		if m.GateEnv != "" && !shared.Gate(m.GateEnv, m.DefaultOn) {
+			d.Disabled = true
+			d.Log.WithName(m.Name).Info("disabled — module not registered", "gate", m.GateEnv)
+		}
+		if err := m.Setup(d); err != nil {
+			d.Log.WithName(m.Name).Error(err, "unable to setup module")
 			return err
 		}
 	}

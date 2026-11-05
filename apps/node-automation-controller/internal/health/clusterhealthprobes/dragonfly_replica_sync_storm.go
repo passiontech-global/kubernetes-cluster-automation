@@ -22,6 +22,12 @@ import (
 // watchdog.
 type dragonflyReplicaSyncStormCheck struct{ *deps }
 
+// newDragonflyReplicaSyncStormCheck builds the W10-ST4 check —
+// stateless, it reads only deps.
+func newDragonflyReplicaSyncStormCheck(d *deps) checkRunner {
+	return &dragonflyReplicaSyncStormCheck{deps: d}
+}
+
 const (
 	checkNameDragonflySyncStorm = "dragonfly-replica-sync-storm"
 

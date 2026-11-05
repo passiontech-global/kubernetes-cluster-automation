@@ -114,7 +114,7 @@ type ciliumIdentityAuditor struct {
 	// from object age — an identity must LOOK orphaned across ≥2
 	// consecutive sweeps. Pruned when the identity is referenced
 	// again or vanishes; a restart re-arms it, biasing conservative.
-	orphanFirstSeen map[string]time.Time
+	orphanFirstSeen shared.FirstSeenLedger
 	// nowFn is the clock seam — tests pin it so the grace/minAge
 	// windows are deterministic.
 	nowFn shared.Clock
@@ -122,19 +122,18 @@ type ciliumIdentityAuditor struct {
 
 // Setup registers the 15m sweep. Disabled on
 // clusters without the cilium component (Calico/cicd — the CRDs do
-// not exist there).
+// not exist there; CILIUM_IDENTITY_AUDITOR_ENABLED is opt-in and
+// resolved by setupModules into Deps.Disabled).
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	if !shared.Gate("CILIUM_IDENTITY_AUDITOR_ENABLED", false) {
-		logf.Log.WithName(ciliumAuditQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	a := &ciliumIdentityAuditor{
-		cs:              cs,
-		dyn:             dyn,
-		gcEnabled:       shared.Gate("CILIUM_IDENTITY_GC_ENABLED", true),
-		orphanFirstSeen: map[string]time.Time{},
-		nowFn:           time.Now,
+		cs:        cs,
+		dyn:       dyn,
+		gcEnabled: shared.Gate("CILIUM_IDENTITY_GC_ENABLED", true),
+		nowFn:     time.Now,
 	}
 	logf.Log.WithName(ciliumAuditQueue).Info("registered", "gcEnabled", a.gcEnabled)
 	return shared.AddPeriodic(mgr, ciliumAuditQueue, 15*time.Minute, a.run)
@@ -146,9 +145,6 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	// auditor literally without the Setup path.
 	if a.nowFn == nil {
 		a.nowFn = time.Now
-	}
-	if a.orphanFirstSeen == nil {
-		a.orphanFirstSeen = map[string]time.Time{}
 	}
 	now := a.nowFn()
 
@@ -255,15 +251,9 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		}
 		orphanSet[name] = true
 		orphans = append(orphans, name)
-		if _, ok := a.orphanFirstSeen[name]; !ok {
-			a.orphanFirstSeen[name] = now
-		}
+		a.orphanFirstSeen.Observe(name, now)
 	}
-	for name := range a.orphanFirstSeen {
-		if !orphanSet[name] {
-			delete(a.orphanFirstSeen, name)
-		}
-	}
+	a.orphanFirstSeen.Prune(func(name string) bool { return orphanSet[name] })
 
 	if len(orphans) == 0 {
 		log.Info("sweep done: identities clean", "total", len(idCreated))
@@ -311,7 +301,8 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 
 	var eligible []string
 	for _, name := range orphans {
-		if now.Sub(a.orphanFirstSeen[name]) < ciliumOrphanGracePeriod {
+		orphanedFor, _ := a.orphanFirstSeen.Seen(name, now)
+		if orphanedFor < ciliumOrphanGracePeriod {
 			continue // first seen this sweep or still inside grace
 		}
 		if created, ok := idCreated[name]; !ok || now.Sub(created) < ciliumOrphanMinAge {
@@ -355,9 +346,10 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 				"cap", ciliumGCMaxDelete, "remaining", len(eligible)-deleted)
 			break
 		}
+		orphanedFor, _ := a.orphanFirstSeen.Seen(name, now)
 		log.Info("ACTION: GC orphaned CiliumIdentity",
 			"identity", name,
-			"orphanedFor", now.Sub(a.orphanFirstSeen[name]).Truncate(time.Minute))
+			"orphanedFor", orphanedFor.Truncate(time.Minute))
 		// UID precondition closes the list→delete TOCTOU: a same-named
 		// identity recreated between the List above and this Delete is
 		// not the orphan this sweep vetted — the apiserver rejects the

@@ -11,7 +11,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
@@ -34,17 +34,10 @@ func TestSetupRegistersController(t *testing.T) {
 
 // The module's Node watch maps every node event onto its fixed sweep
 // key — a multi-node burst must set-collapse to a single queued
-// request.
+// request. Drives the exact MapFunc the watch installs
+// (nodeSweepRequests) through a real workqueue.
 func TestSetupSweepFixedKey(t *testing.T) {
-	t.Setenv("NODE_LABELER_CONFIG_PATH", "labels.txt")
-	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	_, h := testutil.KindSource(t, testutil.ControllerWatches(t, m.Added[0])[0])
-	if h == nil {
-		t.Fatal("node watch has no event handler")
-	}
+	h := handler.EnqueueRequestsFromMapFunc(nodeSweepRequests)
 	q := workqueue.NewTypedRateLimitingQueue(
 		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
 	defer q.ShutDown()
@@ -63,13 +56,12 @@ func TestSetupSweepFixedKey(t *testing.T) {
 	q.Done(item)
 }
 
-// The node-labeler predicate is the bash jqFilter='.metadata.labels':
-// only label drift fires, everything else is dropped.
+// The node-labeler predicate (nodeLabelChanges — the exact
+// predicate.Funcs Setup installs) is the bash
+// jqFilter='.metadata.labels': only label drift fires, everything
+// else is dropped.
 func TestSetupNodeLabelerPredicate(t *testing.T) {
-	t.Setenv("NODE_LABELER_CONFIG_PATH", "labels.txt")
-	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()})
-	})
+	p := nodeLabelChanges
 
 	if !p.Create(event.CreateEvent{Object: testutil.Node("n1", corev1.ConditionTrue, nil)}) {
 		t.Fatal("node add did not fire")

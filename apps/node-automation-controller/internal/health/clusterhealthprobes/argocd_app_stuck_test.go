@@ -36,7 +36,7 @@ func TestArgoCDAppStuckSkipsWhenCRDAbsent(t *testing.T) {
 		})
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, dyn)
-	if res := p.argoCD.run(ctx); !res.pass {
+	if res := mustCheck[*argoCDAppStuckCheck](t, p).run(ctx); !res.pass {
 		t.Fatalf("absent Application CRD must pass: %+v", res)
 	}
 }
@@ -53,11 +53,11 @@ func TestArgoCDAppStuckProgressingRefreshPatch(t *testing.T) {
 	p.now = func() time.Time { return base }
 
 	// First sighting stamps the first-seen ledger — still inside 45m.
-	if res := p.argoCD.run(ctx); !res.pass {
+	if res := mustCheck[*argoCDAppStuckCheck](t, p).run(ctx); !res.pass {
 		t.Fatalf("young Progressing app must pass: %+v", res)
 	}
 	base = base.Add(50 * time.Minute)
-	res := p.argoCD.run(ctx)
+	res := mustCheck[*argoCDAppStuckCheck](t, p).run(ctx)
 	if res.pass {
 		t.Fatalf("Progressing >45m must fail: %+v", res)
 	}
@@ -98,7 +98,7 @@ func TestArgoCDComparisonErrorsRestartOldestRepoServer(t *testing.T) {
 	cs := fake.NewSimpleClientset(older, newer)
 	p := testProberDyn(cs, dyn)
 
-	res := p.argoCD.run(ctx)
+	res := mustCheck[*argoCDAppStuckCheck](t, p).run(ctx)
 	if res.pass {
 		t.Fatalf("two ComparisonErrors must fail: %+v", res)
 	}

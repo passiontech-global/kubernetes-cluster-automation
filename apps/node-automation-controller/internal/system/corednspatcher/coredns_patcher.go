@@ -71,23 +71,47 @@ type corednsPatcher struct {
 	nodesPerReplica int
 }
 
+// The watch wiring below installs these package-level predicates
+// verbatim — tests exercise the exact units the controller runs
+// instead of introspecting controller-runtime internals.
+
+// onlyCoreDNSDeployment pins the For() watch to kube-system/coredns —
+// the informer sees every kube-system Deployment.
+var onlyCoreDNSDeployment = predicate.NewPredicateFuncs(func(o client.Object) bool {
+	return o.GetNamespace() == "kube-system" &&
+		o.GetName() == "coredns"
+})
+
+// nodeCountChanges is the Node watch predicate — node add/remove
+// changes the proportional replica total. The formula's
+// includeUnschedulableNodes=true counts EVERY Node object, so updates
+// (cordon flips, ~20s kubelet heartbeats) can never change the count
+// and must not enqueue — only create/delete fire.
+var nodeCountChanges = predicate.Funcs{
+	CreateFunc:  func(event.CreateEvent) bool { return true },
+	DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	UpdateFunc:  func(event.UpdateEvent) bool { return false },
+	GenericFunc: func(event.GenericEvent) bool { return false },
+}
+
 // Setup reconciles only the coredns Deployment (the
 // informer sees every kube-system Deployment — the predicate pins
-// ns/name). Clusters without the module (enabled=false, e.g. ones
+// ns/name). Clusters without the module (COREDNS_PATCHER_ENABLED=
+// false, resolved by setupModules into Deps.Disabled — e.g. ones
 // managing coredns themselves) skip registration entirely.
 //
 // minReplicas/nodesPerReplica are the CPA-linear replica pin — see
 // proportionalReplicas. minReplicas<=0 disables the pin entirely.
 func Setup(d shared.Deps) error {
-	// Parse the knobs BEFORE the gate — the old moduleConfigFromEnv
-	// resolved them at boot regardless of enabled state, so an
-	// unparseable COREDNS_* value still warned on a disabled module.
+	// Parse the knobs BEFORE the Disabled check — the old
+	// moduleConfigFromEnv resolved them at boot regardless of enabled
+	// state, so an unparseable COREDNS_* value still warned on a
+	// disabled module.
 	zoneWhen := shared.Getenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule")
 	zoneMinDomains := shared.GetenvInt("COREDNS_PATCHER_ZONE_MIN_DOMAINS", 2)
 	minReplicas := shared.GetenvInt("COREDNS_MIN_REPLICAS", 4)
 	nodesPerReplica := shared.GetenvInt("COREDNS_NODES_PER_REPLICA", 1)
-	if !shared.Gate("COREDNS_PATCHER_ENABLED", true) {
-		logf.Log.WithName("coredns-patcher").Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	// zoneWhen lands verbatim in the whenUnsatisfiable field of the
@@ -114,27 +138,16 @@ func Setup(d shared.Deps) error {
 		"minReplicas", minReplicas, "nodesPerReplica", nodesPerReplica)
 	b := ctrl.NewControllerManagedBy(d.Mgr).
 		Named("coredns-patcher").
-		For(&appsv1.Deployment{}, builder.WithPredicates(
-			predicate.NewPredicateFuncs(func(o client.Object) bool {
-				return o.GetNamespace() == "kube-system" &&
-					o.GetName() == "coredns"
-			})))
+		For(&appsv1.Deployment{}, builder.WithPredicates(onlyCoreDNSDeployment))
 	if minReplicas > 0 {
-		// Node add/remove changes the proportional replica total. The
-		// formula's includeUnschedulableNodes=true counts EVERY Node
-		// object, so updates (cordon flips, ~20s kubelet heartbeats)
-		// can never change the count and must not enqueue — only
-		// create/delete fire. Collapses to one fixed key: Reconcile
-		// ignores the request name anyway. With the pin disabled the
-		// count is never read, so the watch is not registered at all.
+		// Node add/remove changes the proportional replica total —
+		// see nodeCountChanges for why only create/delete fire.
+		// Collapses to one fixed key: Reconcile ignores the request
+		// name anyway. With the pin disabled the count is never read,
+		// so the watch is not registered at all.
 		b = b.Watches(&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("coredns-patcher-sweep")),
-			builder.WithPredicates(predicate.Funcs{
-				CreateFunc:  func(event.CreateEvent) bool { return true },
-				DeleteFunc:  func(event.DeleteEvent) bool { return true },
-				UpdateFunc:  func(event.UpdateEvent) bool { return false },
-				GenericFunc: func(event.GenericEvent) bool { return false },
-			}))
+			builder.WithPredicates(nodeCountChanges))
 	}
 	return b.Complete(&corednsPatcher{cs: d.CS, zoneWhen: zoneWhen, minDomains: zoneMinDomains,
 		minReplicas: minReplicas, nodesPerReplica: nodesPerReplica})

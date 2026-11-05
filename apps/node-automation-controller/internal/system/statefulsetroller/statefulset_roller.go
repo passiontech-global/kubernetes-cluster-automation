@@ -95,19 +95,18 @@ type statefulSetOnDeleteRoller struct {
 	// any cycle where the revisions agree, the set leaves, or the
 	// opt-in annotation drops prunes the entry, restarting the 30m
 	// window (same first-seen convention as pdb-deadlock-watchdog).
-	driftSince map[string]time.Time
+	driftSince shared.FirstSeenLedger
 }
 
 // Setup registers the 10-minute sweep.
-// Disabled clusters (STATEFULSET_ONDELETE_ROLLER_ENABLED=false) skip
-// registration entirely — same contract as cert-drift-auditor.
+// Disabled clusters (STATEFULSET_ONDELETE_ROLLER_ENABLED=false —
+// resolved by setupModules into Deps.Disabled) skip registration
+// entirely — same contract as cert-drift-auditor.
 func Setup(d shared.Deps) error {
-	if !shared.Gate("STATEFULSET_ONDELETE_ROLLER_ENABLED", true) {
-		logf.Log.WithName(stsOnDeleteRollerQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
-	r := &statefulSetOnDeleteRoller{cs: d.CS, nowFn: time.Now,
-		driftSince: map[string]time.Time{}}
+	r := &statefulSetOnDeleteRoller{cs: d.CS, nowFn: time.Now}
 	return shared.AddPeriodic(d.Mgr, stsOnDeleteRollerQueue, stsOnDeleteRollerInterval, r.run)
 }
 
@@ -119,9 +118,6 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 	// roller literally without the Setup path.
 	if r.nowFn == nil {
 		r.nowFn = time.Now
-	}
-	if r.driftSince == nil {
-		r.driftSince = map[string]time.Time{}
 	}
 
 	// Page the cluster-wide list — an unbounded List forces etcd to
@@ -153,22 +149,18 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 			continue // not opted in, not OnDelete, or no drift
 		}
 		drifting[key] = true
-		first, ok := r.driftSince[key]
-		if !ok {
-			// First sighting — open the continuity window; the
-			// roller waits out the full 30m before acting.
-			r.driftSince[key] = now
+		first, tracked := r.driftSince.Observe(key, now)
+		if !tracked {
+			// First sighting — the ledger just opened the
+			// continuity window; the roller waits out the full
+			// 30m before acting.
 			continue
 		}
 		if now.Sub(first) >= stsOnDeleteDriftMin {
 			due = append(due, candidate{idx: i, key: key})
 		}
 	}
-	for k := range r.driftSince {
-		if !drifting[k] {
-			delete(r.driftSince, k)
-		}
-	}
+	r.driftSince.Prune(func(k string) bool { return drifting[k] })
 	if len(due) == 0 {
 		log.Info("sweep done — no opted-in StatefulSet past the drift window")
 		return nil

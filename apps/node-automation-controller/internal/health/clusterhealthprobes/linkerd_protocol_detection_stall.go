@@ -31,6 +31,12 @@ import (
 // protocol-detection stall watchdog with linkerd template heal.
 type linkerdProtocolDetectionStallCheck struct{ *deps }
 
+// newLinkerdProtocolDetectionStallCheck builds the W10-NM3 check —
+// stateless, it reads only deps.
+func newLinkerdProtocolDetectionStallCheck(d *deps) checkRunner {
+	return &linkerdProtocolDetectionStallCheck{deps: d}
+}
+
 const (
 	checkNameLinkerdOpaqueStall = "linkerd-protocol-detection-stall"
 

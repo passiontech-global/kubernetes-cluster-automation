@@ -16,7 +16,8 @@ import (
 // crontab-equivalent interval — the pairing is what keeps
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
-	t.Setenv("CERT_DRIFT_AUDITOR_ENABLED", "true")
+	// Zero-value Deps.Disabled = gate-on — CERT_DRIFT_AUDITOR_ENABLED
+	// is resolved by setupModules, not re-read here.
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
@@ -25,13 +26,12 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	testutil.ExpectPeriodic(t, m, "cert-drift-auditor", 15*time.Minute)
 }
 
-// The module skips mgr.Add entirely when disabled — no Periodic, no
-// tick.
+// The module skips mgr.Add entirely when Deps.Disabled is stamped —
+// no Periodic, no tick.
 func TestSetupDisabled(t *testing.T) {
-	t.Setenv("CERT_DRIFT_AUDITOR_ENABLED", "false")
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
+		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {

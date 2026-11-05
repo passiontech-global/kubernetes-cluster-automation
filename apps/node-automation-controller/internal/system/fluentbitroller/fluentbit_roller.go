@@ -43,24 +43,28 @@ type fluentBitRoller struct {
 	cs kubernetes.Interface
 }
 
+// onlyPipelineSecret is the exact predicate the For() watch below
+// installs — a package var so the test exercises the predicate
+// directly instead of introspecting controller-runtime internals.
+var onlyPipelineSecret = predicate.NewPredicateFuncs(func(o client.Object) bool {
+	return o.GetNamespace() == "fluent-system" &&
+		o.GetName() == "passiontech-pipeline"
+})
+
 // Setup wires the fluent-bit-config-roller reconciler.
 // The informer is already field-selected to metadata.name=
 // passiontech-pipeline; the predicate also pins the namespace.
-// Disabled clusters (no fluentbit component) skip registration
-// entirely — same pattern as Setup.
+// Disabled clusters (no fluentbit component — FLUENTBIT_ROLLER_ENABLED
+// is opt-in, resolved by setupModules into Deps.Disabled) skip
+// registration entirely.
 func Setup(d shared.Deps) error {
-	if !shared.Gate("FLUENTBIT_ROLLER_ENABLED", false) {
-		logf.Log.WithName("fluent-bit-config-roller").Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	r := &fluentBitRoller{cs: d.CS}
 	return ctrl.NewControllerManagedBy(d.Mgr).
 		Named("fluent-bit-config-roller").
-		For(&corev1.Secret{}, builder.WithPredicates(
-			predicate.NewPredicateFuncs(func(o client.Object) bool {
-				return o.GetNamespace() == "fluent-system" &&
-					o.GetName() == "passiontech-pipeline"
-			}))).
+		For(&corev1.Secret{}, builder.WithPredicates(onlyPipelineSecret)).
 		Complete(r)
 }
 

@@ -113,6 +113,37 @@ type deschedulerStormGate struct {
 	dyn dynamic.Interface
 }
 
+// The watch wiring below installs these package-level units
+// verbatim — tests exercise the exact predicate/mapfunc the
+// controller runs instead of introspecting controller-runtime
+// internals.
+
+// nodeSweepRequests collapses every Node event onto the single fixed
+// sweep key (see shared.SweepRequests).
+var nodeSweepRequests = shared.SweepRequests("descheduler-storm-gate-sweep")
+
+// stormSignalChanges is the Node watch predicate — fire only when the
+// fields the verdict reads actually changed (bash jqFilter
+// equivalent: {conds: type=status, taints: keys}). Comparing raw
+// Status.Conditions would fire on every kubelet heartbeat —
+// lastHeartbeatTime/Reason/Message churn constantly.
+var stormSignalChanges = predicate.Funcs{
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		oldN, ok1 := e.ObjectOld.(*corev1.Node)
+		newN, ok2 := e.ObjectNew.(*corev1.Node)
+		if !ok1 || !ok2 {
+			return true
+		}
+		return oldN.Spec.Unschedulable != newN.Spec.Unschedulable ||
+			!reflect.DeepEqual(condStatusMap(oldN), condStatusMap(newN)) ||
+			!reflect.DeepEqual(taintKeys(oldN), taintKeys(newN))
+	},
+	// Node add/remove changes the storm verdict too.
+	CreateFunc:  func(event.CreateEvent) bool { return true },
+	DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	GenericFunc: func(event.GenericEvent) bool { return true },
+}
+
 func Setup(d shared.Deps) error {
 	return ctrl.NewControllerManagedBy(d.Mgr).
 		Named("descheduler-storm-gate").
@@ -123,28 +154,8 @@ func Setup(d shared.Deps) error {
 		// sync. One key collapses both to a single sweep (see
 		// shared.SweepRequests). Predicate semantics are unchanged.
 		Watches(&corev1.Node{},
-			handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("descheduler-storm-gate-sweep")),
-			builder.WithPredicates(predicate.Funcs{
-				// Fire only when the fields the verdict reads actually
-				// changed (bash jqFilter equivalent: {conds: type=status,
-				// taints: keys}). Comparing raw Status.Conditions would fire
-				// on every kubelet heartbeat — lastHeartbeatTime/Reason/
-				// Message churn constantly.
-				UpdateFunc: func(e event.UpdateEvent) bool {
-					oldN, ok1 := e.ObjectOld.(*corev1.Node)
-					newN, ok2 := e.ObjectNew.(*corev1.Node)
-					if !ok1 || !ok2 {
-						return true
-					}
-					return oldN.Spec.Unschedulable != newN.Spec.Unschedulable ||
-						!reflect.DeepEqual(condStatusMap(oldN), condStatusMap(newN)) ||
-						!reflect.DeepEqual(taintKeys(oldN), taintKeys(newN))
-				},
-				// Node add/remove changes the storm verdict too.
-				CreateFunc:  func(event.CreateEvent) bool { return true },
-				DeleteFunc:  func(event.DeleteEvent) bool { return true },
-				GenericFunc: func(event.GenericEvent) bool { return true },
-			})).
+			handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
+			builder.WithPredicates(stormSignalChanges)).
 		Complete(&deschedulerStormGate{cs: d.CS, dyn: d.Dyn})
 }
 

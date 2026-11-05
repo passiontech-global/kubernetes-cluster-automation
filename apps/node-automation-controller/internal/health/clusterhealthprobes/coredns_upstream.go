@@ -26,6 +26,12 @@ import (
 // the readiness-fallback heal.
 type coreDNSUpstreamCheck struct{ *deps }
 
+// newCoreDNSUpstreamCheck builds the W10-NM5 check — stateless, it
+// reads only deps.
+func newCoreDNSUpstreamCheck(d *deps) checkRunner {
+	return &coreDNSUpstreamCheck{deps: d}
+}
+
 const (
 	checkNameCoreDNSUpstream = "coredns-upstream"
 

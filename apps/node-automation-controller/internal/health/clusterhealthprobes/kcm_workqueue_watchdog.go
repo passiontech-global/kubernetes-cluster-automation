@@ -32,6 +32,16 @@ type kcmWorkqueueCheck struct {
 	kcmFrozenReasons map[string]bool
 }
 
+// newKcmWorkqueueCheck builds the C6 watchdog with fresh tracking
+// maps — the state-map initialization that used to live in the
+// monolithic newClusterHealthProber literal.
+func newKcmWorkqueueCheck(d *deps) checkRunner {
+	return &kcmWorkqueueCheck{deps: d,
+		kcmFirstSeen:     map[string]time.Time{},
+		kcmFrozenReasons: map[string]bool{},
+	}
+}
+
 // C6 watchdog knobs — the KCM leader Lease name and the
 // node_automation_kcm_workqueue_frozen{reason} label values.
 const (

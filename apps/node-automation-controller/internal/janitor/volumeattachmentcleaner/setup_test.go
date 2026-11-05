@@ -13,7 +13,8 @@ import (
 )
 
 func TestSetupRegistersPeriodic(t *testing.T) {
-	t.Setenv("VOLUMEATTACHMENT_CLEANER_ENABLED", "true")
+	// Zero-value Deps.Disabled = gate-on — VOLUMEATTACHMENT_CLEANER_ENABLED
+	// is resolved by setupModules, not re-read here.
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{
 		Mgr: m,
@@ -24,15 +25,16 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	testutil.ExpectPeriodic(t, m, "volumeattachment-cleaner", 5*time.Minute)
 }
 
-// volumeattachment-cleaner skips mgr.Add entirely when disabled
-// (VOLUMEATTACHMENT_CLEANER_ENABLED=false) — same contract as
-// certmanager-reaper / cilium-taint-reaper: no Periodic, no tick.
+// volumeattachment-cleaner skips mgr.Add entirely when Deps.Disabled
+// is stamped (setupModules resolves VOLUMEATTACHMENT_CLEANER_ENABLED) —
+// same contract as certmanager-reaper / cilium-taint-reaper: no
+// Periodic, no tick.
 func TestSetupDisabled(t *testing.T) {
-	t.Setenv("VOLUMEATTACHMENT_CLEANER_ENABLED", "false")
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{
-		Mgr: m,
-		CS:  fake.NewSimpleClientset(),
+		Mgr:      m,
+		CS:       fake.NewSimpleClientset(),
+		Disabled: true,
 	}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}

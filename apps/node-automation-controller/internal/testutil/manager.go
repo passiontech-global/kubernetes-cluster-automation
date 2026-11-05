@@ -1,17 +1,17 @@
 // Package testutil holds the shared fakes and assertion helpers the
 // internal/<domain>/ module tests use: a stub manager.Manager that
-// captures runnable registrations (Setup coverage without envtest),
-// plus the reflection-based watch-source introspection the
-// builder-based Setup functions need for predicate/mapfunc tests.
+// captures runnable registrations (Setup coverage without envtest)
+// plus small event constructors. Watch predicates and mapfuncs are
+// package-level vars in each module, installed verbatim by the
+// builder wiring, so tests exercise the exact units the controller
+// runs instead of introspecting controller-runtime internals.
 package testutil
 
 import (
 	"context"
 	"net/http"
-	"reflect"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -25,13 +25,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/recorder"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/conversion"
 
@@ -156,74 +152,20 @@ func RunPeriodic(t *testing.T, m *StubManager, ctx context.Context) error {
 }
 
 // ---------------------------------------------------------------------------
-// Watch-source introspection — exercises the predicate/mapfunc closures
-// the builder-based Setup functions install. The controller's .Watch()
-// calls land in the unexported `startWatches` field and are only
-// consumed by Start (never run against StubManager), so reflection +
-// unsafe is the only way to reach them without envtest. The
-// *internal.Kind source exposes Predicates/Handler as EXPORTED fields —
-// only the slice itself needs the unsafe read.
+// Watch-unit convention — the predicates and mapfuncs a builder-based
+// Setup installs are package-level vars/funcs in the module (e.g.
+// `var nodeLabelChanges = predicate.Funcs{...}`), referenced by name
+// in the Watches()/For() call. Tests exercise those vars directly
+// (drive predicate.Funcs with event.* fixtures, or wrap the mapfunc
+// in handler.EnqueueRequestsFromMapFunc and feed it a workqueue) —
+// no reflection into the built controller, which pins test coverage
+// to exactly what production runs. What is NOT covered this way: the
+// count/order of registered watch sources (previously read via unsafe
+// field access on the controller struct).
 // ---------------------------------------------------------------------------
 
-// ControllerWatches returns the watch sources a builder-built
-// controller registered, in registration order.
-func ControllerWatches(t *testing.T, r manager.Runnable) []source.TypedSource[reconcile.Request] {
-	t.Helper()
-	v := reflect.ValueOf(r)
-	if v.Kind() != reflect.Pointer || v.Elem().Kind() != reflect.Struct {
-		t.Fatalf("registered runnable is %T, want a controller pointer", r)
-	}
-	f := v.Elem().FieldByName("startWatches")
-	if !f.IsValid() {
-		t.Fatalf("%T has no startWatches field — controller-runtime internals changed?", r)
-	}
-	srcs, ok := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).
-		Elem().Interface().([]source.TypedSource[reconcile.Request])
-	if !ok {
-		t.Fatalf("startWatches type = %s, want []source.TypedSource[reconcile.Request]", f.Type())
-	}
-	if len(srcs) == 0 {
-		t.Fatal("controller registered no watch sources")
-	}
-	return srcs
-}
-
-// KindSource unwraps the *internal Kind source For()/Watches() produce
-// and returns its exported Predicates + Handler fields.
-func KindSource(t *testing.T, src source.TypedSource[reconcile.Request]) ([]predicate.Predicate, handler.EventHandler) {
-	t.Helper()
-	v := reflect.ValueOf(src)
-	if v.Kind() != reflect.Pointer {
-		t.Fatalf("watch source is %T, want *internal Kind", src)
-	}
-	pf := v.Elem().FieldByName("Predicates")
-	hf := v.Elem().FieldByName("Handler")
-	if !pf.IsValid() || !hf.IsValid() {
-		t.Fatalf("watch source %T lacks Predicates/Handler fields", src)
-	}
-	preds, _ := pf.Interface().([]predicate.Predicate)
-	h, _ := hf.Interface().(handler.EventHandler)
-	return preds, h
-}
-
-// ForPredicate returns the first predicate installed on the only
-// watch source of a single-watch builder module.
-func ForPredicate(t *testing.T, setup func(manager.Manager) error) predicate.Predicate {
-	t.Helper()
-	m := NewStubManager()
-	if err := setup(m); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	if len(m.Added) != 1 {
-		t.Fatalf("builder registered %d runnables, want 1", len(m.Added))
-	}
-	preds, _ := KindSource(t, ControllerWatches(t, m.Added[0])[0])
-	if len(preds) != 1 {
-		t.Fatalf("For watch carries %d predicates, want 1", len(preds))
-	}
-	return preds[0]
-}
-
+// UpdateEvent builds an event.UpdateEvent fixture — the predicate
+// tests' one-liner for the old/new object pair.
 func UpdateEvent(old, new client.Object) event.UpdateEvent {
 	return event.UpdateEvent{ObjectOld: old, ObjectNew: new}
 }

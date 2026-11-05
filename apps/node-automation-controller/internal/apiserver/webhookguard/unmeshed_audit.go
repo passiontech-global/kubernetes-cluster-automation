@@ -12,7 +12,6 @@ package webhookguard
 import (
 	"context"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -63,7 +62,7 @@ const (
 // flip takes effect on the next sweep without a code change (same
 // pattern as circuitBreakerEnabled).
 func unmeshedRemediationEnabled() bool {
-	return os.Getenv("UNMESHED_POD_REMEDIATION_ENABLED") != "false"
+	return shared.Gate("UNMESHED_POD_REMEDIATION_ENABLED", true)
 }
 
 // unmeshedPodAuditor owns the unmeshed-pod sweep's per-sweep state —
@@ -75,7 +74,7 @@ type unmeshedPodAuditor struct {
 	// unmeshedEmitted is the same ledger for UnmeshedPods
 	// ("namespace/pod") — deleted pods and pods that gained the
 	// sidecar get their series pruned each sweep.
-	unmeshedEmitted map[string]bool
+	unmeshedEmitted shared.GaugeLedger[string]
 }
 
 // sweepUnmeshedPods audits Running Pods that opted into linkerd
@@ -87,11 +86,6 @@ type unmeshedPodAuditor struct {
 func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepSnapshot) error {
 	g := snap.g
 	log := logf.FromContext(ctx)
-	if a.unmeshedEmitted == nil {
-		// Lazily arm for direct-constructed fixtures — Setup always
-		// initializes.
-		a.unmeshedEmitted = map[string]bool{}
-	}
 
 	// The namespace census carries the ns-level inject=enabled
 	// opt-in. An empty list is an API flap — a pod whose namespace
@@ -116,7 +110,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 	// page is processed then dropped instead of pinning the whole
 	// list for the sweep.
 	now := g.now()
-	emitted := map[string]bool{}
+	unmeshed := 0 // UnmeshedPods tuples re-asserted this sweep
 	var candidates []corev1.Pod
 	listOpts := metav1.ListOptions{
 		FieldSelector: "status.phase=Running",
@@ -136,7 +130,8 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 				if podHasSidecar(p) {
 					continue
 				}
-				emitted[p.Namespace+"/"+p.Name] = true
+				a.unmeshedEmitted.Emit(p.Namespace+"/"+p.Name, p.Namespace, p.Name)
+				unmeshed++
 				metrics.UnmeshedPods.WithLabelValues(p.Namespace, p.Name).Set(1)
 				log.Info("UNMESHED: pod running without linkerd-proxy sidecar",
 					"pod", p.Namespace+"/"+p.Name)
@@ -165,15 +160,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 
 	// Prune series for pods that vanished or gained the sidecar —
 	// same DeleteLabelValues hygiene as brokenEmitted.
-	for k := range a.unmeshedEmitted {
-		if emitted[k] {
-			continue
-		}
-		if parts := strings.SplitN(k, "/", 2); len(parts) == 2 {
-			metrics.UnmeshedPods.DeleteLabelValues(parts[0], parts[1])
-		}
-	}
-	a.unmeshedEmitted = emitted
+	a.unmeshedEmitted.Prune(metrics.UnmeshedPods.DeleteLabelValues)
 
 	if len(candidates) == 0 {
 		return nil
@@ -270,7 +257,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 		metrics.UnmeshedPodsRecreatedTotal.WithLabelValues(p.Namespace).Inc()
 		deleted++
 	}
-	log.Info("unmeshed audit done", "unmeshed", len(emitted),
+	log.Info("unmeshed audit done", "unmeshed", unmeshed,
 		"candidates", len(candidates), "deleted", deleted)
 	return nil
 }

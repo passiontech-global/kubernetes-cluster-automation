@@ -107,29 +107,27 @@ type volumeAttachmentCleaner struct {
 	// node that does not exist. Two consecutive sightings are
 	// required to delete — an operator restart re-arms the window,
 	// biasing conservative (same convention as helmrelease-unlocker).
-	orphanFirstSeen map[string]time.Time
+	orphanFirstSeen shared.FirstSeenLedger
 	// nodeNotReadySince: node name → first cycle the node was seen
 	// not-Ready. Only consumed for out-of-service candidates, but
 	// tracking every not-Ready node (not just tainted ones) means a
 	// node that gets fenced after a long outage does not start a
 	// fresh 15m window — its death clock was already running.
-	nodeNotReadySince map[string]time.Time
+	nodeNotReadySince shared.FirstSeenLedger
 }
 
 // Setup registers the 5-minute sweep. The
-// VOLUMEATTACHMENT_CLEANER_ENABLED gate (default on) is resolved here —
-// disabled skips registration entirely, matching the
-// certmanager-reaper / cilium-taint-reaper contract.
+// VOLUMEATTACHMENT_CLEANER_ENABLED gate (default on) is resolved by
+// setupModules into Deps.Disabled — disabled skips registration
+// entirely, matching the certmanager-reaper / cilium-taint-reaper
+// contract.
 func Setup(d shared.Deps) error {
-	if !shared.Gate("VOLUMEATTACHMENT_CLEANER_ENABLED", true) {
-		logf.Log.WithName(volumeAttachmentCleanerQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	c := &volumeAttachmentCleaner{
-		cs:                d.CS,
-		nowFn:             time.Now,
-		orphanFirstSeen:   map[string]time.Time{},
-		nodeNotReadySince: map[string]time.Time{},
+		cs:    d.CS,
+		nowFn: time.Now,
 	}
 	return shared.AddPeriodic(d.Mgr, volumeAttachmentCleanerQueue, vaCleanerInterval, c.run)
 }
@@ -166,18 +164,17 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		// a node that flapped back to life must prove another full
 		// 15m of death before its VAs are touched again.
 		if !shared.NodeReady(n) {
-			if _, ok := c.nodeNotReadySince[n.Name]; !ok {
-				c.nodeNotReadySince[n.Name] = now
-			}
+			c.nodeNotReadySince.Observe(n.Name, now)
 		} else {
-			delete(c.nodeNotReadySince, n.Name)
+			c.nodeNotReadySince.Forget(n.Name)
 		}
 	}
-	for name := range c.nodeNotReadySince {
-		if _, ok := nodeByName[name]; !ok {
-			delete(c.nodeNotReadySince, name)
-		}
-	}
+	// A node that vanished between cycles re-arms too — its
+	// not-Ready clock was measuring a node that no longer exists.
+	c.nodeNotReadySince.Prune(func(name string) bool {
+		_, ok := nodeByName[name]
+		return ok
+	})
 	nodes = nil
 
 	vas, err := shared.ListAll(ctx,
@@ -204,13 +201,12 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	// bump IncError.
 	livePods := map[string]podProbe{}
 
-	// seenPrior snapshots the ledger BEFORE this cycle's sightings —
+	// seenPrior records which of this cycle's missing-node sightings
+	// were already tracked BEFORE the pre-pass stamped them —
 	// "seen in >= 2 consecutive cycles" must compare against the
-	// previous cycle, not the entry the pre-pass below just wrote.
+	// previous cycle, not the stamp the pre-pass just wrote
+	// (Observe's 'seen' return is exactly that distinction).
 	seenPrior := map[string]bool{}
-	for name := range c.orphanFirstSeen {
-		seenPrior[name] = true
-	}
 
 	// Pre-pass: record this cycle's missing-node sightings for EVERY
 	// listed VA before any delete runs — a VA past the delete cap
@@ -223,8 +219,8 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		}
 		if _, ok := nodeByName[va.Spec.NodeName]; !ok {
 			orphanNow[va.Name] = true
-			if _, seen := c.orphanFirstSeen[va.Name]; !seen {
-				c.orphanFirstSeen[va.Name] = now
+			_, seenPrior[va.Name] = c.orphanFirstSeen.Observe(va.Name, now)
+			if !seenPrior[va.Name] {
 				log.Info("orphaned VA sighted — tracking for next cycle",
 					"va", va.Name, "node", va.Spec.NodeName)
 			}
@@ -301,17 +297,18 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 			continue
 		}
 		metrics.VolumeAttachmentsCleanedTotal.WithLabelValues(reason).Inc()
-		delete(c.orphanFirstSeen, va.Name)
+		c.orphanFirstSeen.Forget(va.Name)
 		deleted++
 	}
 	// Re-arm the grace window for every VA that stopped looking
 	// orphaned (node reappeared, or the VA vanished between cycles).
-	for name := range c.orphanFirstSeen {
-		if !orphanNow[name] {
-			delete(c.orphanFirstSeen, name)
-			log.Info("orphan sighting cleared — node reappeared or VA gone", "va", name)
+	c.orphanFirstSeen.Prune(func(name string) bool {
+		if orphanNow[name] {
+			return true
 		}
-	}
+		log.Info("orphan sighting cleared — node reappeared or VA gone", "va", name)
+		return false
+	})
 	if capped {
 		log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", vaDeleteCap))
 	}
@@ -408,14 +405,14 @@ func (c *volumeAttachmentCleaner) nodeFencedDead(ctx context.Context,
 	if shared.NodeReady(node) {
 		return false // fenced but alive — the taint is stale, VAs stay
 	}
-	since, ok := c.nodeNotReadySince[node.Name]
+	notReadyFor, ok := c.nodeNotReadySince.Seen(node.Name, now)
 	if !ok {
 		return false // node not in the not-Ready ledger — no verdict
 	}
-	if now.Sub(since) < vaOutOfServiceDownFor {
+	if notReadyFor < vaOutOfServiceDownFor {
 		log.Info("KEEP: fenced node still inside not-Ready window",
 			"node", node.Name,
-			"notReadyFor", now.Sub(since).Truncate(time.Minute),
+			"notReadyFor", notReadyFor.Truncate(time.Minute),
 			"required", vaOutOfServiceDownFor)
 		return false // not-Ready window still running
 	}

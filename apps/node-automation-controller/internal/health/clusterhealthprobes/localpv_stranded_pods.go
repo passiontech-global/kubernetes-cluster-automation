@@ -39,6 +39,18 @@ type localPVStrandedCheck struct {
 	pvcProvHealed     map[string]time.Time
 }
 
+// newLocalPVStrandedCheck builds the W7-C4 check with fresh
+// tracking maps — the state-map initialization that used to live in
+// the monolithic newClusterHealthProber literal.
+func newLocalPVStrandedCheck(d *deps) checkRunner {
+	return &localPVStrandedCheck{deps: d,
+		localPVEmitted:    map[string]bool{},
+		pvcStalledEmitted: map[string]bool{},
+		localPVHealed:     map[string]time.Time{},
+		pvcProvHealed:     map[string]time.Time{},
+	}
+}
+
 // ---------------------------------------------------------------------------
 // localpv-stranded-pods (W7-C4) — local-PV dead-node diagnostics +
 // ephemeral-PVC rescue + provisioner watchdog.

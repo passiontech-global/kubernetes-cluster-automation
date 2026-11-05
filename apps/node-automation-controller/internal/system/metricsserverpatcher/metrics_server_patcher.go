@@ -88,46 +88,60 @@ type metricsServerPatcher struct {
 	nodesPerReplica int
 }
 
+// The watch wiring below installs these package-level predicates
+// verbatim — tests exercise the exact units the controller runs
+// instead of introspecting controller-runtime internals.
+
+// onlyMetricsServerDeployment pins the For() watch to
+// kube-system/metrics-server — the informer sees every kube-system
+// Deployment.
+var onlyMetricsServerDeployment = predicate.NewPredicateFuncs(func(o client.Object) bool {
+	return o.GetNamespace() == "kube-system" &&
+		o.GetName() == "metrics-server"
+})
+
+// nodeCountChanges is the Node watch predicate — node add/remove
+// changes the proportional replica total. The formula's
+// includeUnschedulableNodes=true counts EVERY Node object, so updates
+// (cordon flips, ~20s kubelet heartbeats) can never change the count
+// and must not enqueue — only create/delete fire.
+var nodeCountChanges = predicate.Funcs{
+	CreateFunc:  func(event.CreateEvent) bool { return true },
+	DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	UpdateFunc:  func(event.UpdateEvent) bool { return false },
+	GenericFunc: func(event.GenericEvent) bool { return false },
+}
+
 // Setup reconciles only the metrics-server
 // Deployment (the informer sees every kube-system Deployment — the
-// predicate pins ns/name). enabled=false skips registration entirely.
+// predicate pins ns/name). METRICS_SERVER_PATCHER_ENABLED=false
+// (resolved by setupModules into Deps.Disabled) skips registration
+// entirely.
 //
 // minReplicas/nodesPerReplica are the CPA-linear replica pin — see
 // proportionalReplicas. minReplicas<=0 disables the pin entirely.
 func Setup(d shared.Deps) error {
-	// Parse before the gate — see corednspatcher: invalid knob values
-	// must warn even when the module is disabled.
+	// Parse before the Disabled check — see corednspatcher: invalid
+	// knob values must warn even when the module is disabled.
 	minReplicas := shared.GetenvInt("METRICS_SERVER_MIN_REPLICAS", 3)
 	nodesPerReplica := shared.GetenvInt("METRICS_SERVER_NODES_PER_REPLICA", 1)
-	if !shared.Gate("METRICS_SERVER_PATCHER_ENABLED", true) {
-		logf.Log.WithName("metrics-server-patcher").Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	logf.Log.WithName("metrics-server-patcher").Info("registered",
 		"minReplicas", minReplicas, "nodesPerReplica", nodesPerReplica)
 	b := ctrl.NewControllerManagedBy(d.Mgr).
 		Named("metrics-server-patcher").
-		For(&appsv1.Deployment{}, builder.WithPredicates(
-			predicate.NewPredicateFuncs(func(o client.Object) bool {
-				return o.GetNamespace() == "kube-system" &&
-					o.GetName() == "metrics-server"
-			})))
+		For(&appsv1.Deployment{}, builder.WithPredicates(onlyMetricsServerDeployment))
 	if minReplicas > 0 {
-		// Node add/remove changes the proportional replica total. The
-		// formula's includeUnschedulableNodes=true counts EVERY Node
-		// object, so updates (cordon flips, ~20s kubelet heartbeats)
-		// can never change the count and must not enqueue — only
-		// create/delete fire. Collapses to one fixed key: Reconcile
-		// ignores the request name anyway. With the pin disabled the
-		// count is never read, so the watch is not registered at all.
+		// Node add/remove changes the proportional replica total —
+		// see nodeCountChanges for why only create/delete fire.
+		// Collapses to one fixed key: Reconcile ignores the request
+		// name anyway. With the pin disabled the count is never read,
+		// so the watch is not registered at all.
 		b = b.Watches(&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("metrics-server-patcher-sweep")),
-			builder.WithPredicates(predicate.Funcs{
-				CreateFunc:  func(event.CreateEvent) bool { return true },
-				DeleteFunc:  func(event.DeleteEvent) bool { return true },
-				UpdateFunc:  func(event.UpdateEvent) bool { return false },
-				GenericFunc: func(event.GenericEvent) bool { return false },
-			}))
+			builder.WithPredicates(nodeCountChanges))
 	}
 	return b.Complete(&metricsServerPatcher{cs: d.CS,
 		minReplicas: minReplicas, nodesPerReplica: nodesPerReplica})

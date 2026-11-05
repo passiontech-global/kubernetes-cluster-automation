@@ -23,7 +23,7 @@ func TestCoreDNSUpstreamDeletesIsolatedFailingPod(t *testing.T) {
 	p.cfg.httpURL = srv.URL
 	p.httpClient = srv.Client()
 
-	res := p.coreDNS.run(ctx)
+	res := mustCheck[*coreDNSUpstreamCheck](t, p).run(ctx)
 	if res.pass {
 		t.Fatalf("isolated upstream failure must fail: %+v", res)
 	}
@@ -56,7 +56,7 @@ func TestCoreDNSUpstreamFleetWideDoesNotDelete(t *testing.T) {
 	p.cfg.httpURL = srv.URL
 	p.httpClient = srv.Client()
 
-	res := p.coreDNS.run(ctx)
+	res := mustCheck[*coreDNSUpstreamCheck](t, p).run(ctx)
 	if res.pass {
 		t.Fatalf("fleet-wide failure must fail: %+v", res)
 	}
@@ -74,7 +74,7 @@ func TestCoreDNSFallbackUnreadyPod(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, good)
 	p := testProber(cs) // dead httpURL -> both prom queries fail
 
-	res := p.coreDNS.run(ctx)
+	res := mustCheck[*coreDNSUpstreamCheck](t, p).run(ctx)
 	if res.pass {
 		t.Fatalf("fallback must detect the unready dns pod: %+v", res)
 	}

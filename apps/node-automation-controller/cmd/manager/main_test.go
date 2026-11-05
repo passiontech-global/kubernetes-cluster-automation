@@ -333,34 +333,45 @@ func TestMainManagerStartFails(t *testing.T) {
 
 // ---- setupModules ----------------------------------------------------
 //
-// Every module resolves its own env gates inside Setup now — the
-// registry in modules.go is a flat name→Setup map, so these tests
-// drive the whole fleet through t.Setenv + a shared.Deps.
+// Registration gates live on the shared.Module rows now — setupModules
+// resolves each GateEnv and stamps Deps.Disabled before calling Setup,
+// so these tests drive the whole fleet through t.Setenv + a
+// shared.Deps exactly like boot does.
 
-// moduleGateEnvs lists every feature-gate env var a module reads.
-// Setting them all "true" enables every gate (opt-in and default-on
-// alike); setting them all "false" disables every gate.
-var moduleGateEnvs = []string{
-	"CILIUM_TAINT_REAPER_ENABLED",
-	"FLUENTBIT_ROLLER_ENABLED",
-	"CERTMANAGER_REAPER_ENABLED",
-	"CILIUM_IDENTITY_AUDITOR_ENABLED",
-	"EXTERNALSECRET_NUDGE_ENABLED",
-	"CSR_APPROVER_ENABLED",
-	"HELM_STALL_UNWEDGE_ENABLED",
-	"CONCOURSE_JANITOR_ENABLED",
-	"COREDNS_PATCHER_ENABLED",
-	"METRICS_SERVER_PATCHER_ENABLED",
-	"CF_TUNNEL_WATCHDOG_ENABLED",
-	"CLUSTER_HEALTH_PROBES_ENABLED",
-	"VOLUMEATTACHMENT_CLEANER_ENABLED",
-	"PDB_WATCHDOG_ENABLED",
-	"CERT_DRIFT_AUDITOR_ENABLED",
-	"APISERVICE_GUARD_ENABLED",
-	"ZOMBIE_SIDECAR_REAPER_ENABLED",
-	"ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED",
-	"STATEFULSET_ONDELETE_ROLLER_ENABLED",
-	"VELERO_BACKUP_AUDITOR_ENABLED",
+// moduleGateEnvs derives the registration-gate env vars from the
+// registry itself — a hand-maintained list could drift from modules
+// silently. Setting every GateEnv "true" enables every gate (opt-in
+// and default-on alike); "false" disables them all. Sub-feature gates
+// (CSR_APPROVER_ENABLED, HELM_STALL_UNWEDGE_ENABLED, ...) are
+// deliberately absent — they alter run behavior, not runnable counts.
+func moduleGateEnvs() []string {
+	var envs []string
+	for _, m := range modules {
+		if m.GateEnv != "" {
+			envs = append(envs, m.GateEnv)
+		}
+	}
+	return envs
+}
+
+// The registry is the contract every other piece keys on: names must
+// be non-empty and unique (they label metric series and boot logs —
+// a dup would merge two modules' error accounting) and every row must
+// carry a Setup — a nil one would nil-call at boot.
+func TestModuleRegistry(t *testing.T) {
+	seen := map[string]bool{}
+	for _, m := range modules {
+		if m.Name == "" {
+			t.Fatal("module row with empty Name")
+		}
+		if seen[m.Name] {
+			t.Fatalf("duplicate module name %q", m.Name)
+		}
+		seen[m.Name] = true
+		if m.Setup == nil {
+			t.Fatalf("module %q has nil Setup", m.Name)
+		}
+	}
 }
 
 func testDeps(m *testutil.StubManager) shared.Deps {
@@ -372,21 +383,92 @@ func testDeps(m *testutil.StubManager) shared.Deps {
 	}
 }
 
+// filterModules is the -modules allowlist: unset means the full
+// registry; a set value returns exactly the named modules in
+// registry order regardless of argv order; an unknown name is an
+// error that names the offender (fail fast — a silently skipped typo
+// would run the wrong subset).
+func TestFilterModules(t *testing.T) {
+	t.Run("empty means full registry", func(t *testing.T) {
+		got, err := filterModules(nil)
+		if err != nil {
+			t.Fatalf("filterModules(nil): %v", err)
+		}
+		if len(got) != len(modules) {
+			t.Fatalf("got %d modules, want all %d", len(got), len(modules))
+		}
+		for i := range got {
+			if got[i].Name != modules[i].Name {
+				t.Fatalf("got[%d] = %q, want %q", i, got[i].Name, modules[i].Name)
+			}
+		}
+	})
+
+	t.Run("subset keeps registry order", func(t *testing.T) {
+		// argv order reversed vs the registry — the result must still
+		// follow the registry so boot order stays deterministic.
+		got, err := filterModules([]string{"csr-watcher", "node-labeler"})
+		if err != nil {
+			t.Fatalf("filterModules: %v", err)
+		}
+		var names []string
+		for _, m := range got {
+			names = append(names, m.Name)
+		}
+		if want := []string{"node-labeler", "csr-watcher"}; !slices.Equal(names, want) {
+			t.Fatalf("names = %v, want %v", names, want)
+		}
+	})
+
+	t.Run("unknown name fails", func(t *testing.T) {
+		_, err := filterModules([]string{"node-labeler", "no-such-module"})
+		if err == nil {
+			t.Fatal("filterModules accepted an unknown name")
+		}
+		if !strings.Contains(err.Error(), "no-such-module") {
+			t.Fatalf("error missing the bad name: %v", err)
+		}
+		if !strings.Contains(err.Error(), "node-labeler") {
+			t.Fatalf("error missing the valid-name list: %v", err)
+		}
+	})
+}
+
+// parseModulesFlag is whitespace-tolerant and drops empty entries —
+// " a, ,b " is exactly ["a","b"], and an all-whitespace value is
+// "unset" rather than a bogus name.
+func TestParseModulesFlag(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want []string
+	}{
+		{"", nil},
+		{"  ", nil},
+		{"a", []string{"a"}},
+		{"a,b", []string{"a", "b"}},
+		{" a , b,", []string{"a", "b"}},
+	} {
+		if got := parseModulesFlag(tc.in); !slices.Equal(got, tc.want) {
+			t.Fatalf("parseModulesFlag(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 // Every module registers exactly one runnable on the manager — 32 in
-// the map — except the gate-skippers, which skip mgr.Add entirely
-// while disabled. Modules whose flag only gates the tick body
-// (csr-watcher approve mode, helmrelease-unlocker stall-unwedge,
-// externalsecret-nudge, webhookguard, and the no-gate always-on
-// modules) still register.
+// the registry — except the gate-skippers, which setupModules hands
+// Deps.Disabled and which then skip mgr.Add entirely. Modules whose
+// flag only gates the tick body (csr-watcher approve mode,
+// helmrelease-unlocker stall-unwedge, externalsecret-nudge,
+// webhookguard, and the no-gate always-on modules) still register.
 func TestSetupModules(t *testing.T) {
 	t.Run("all gates enabled", func(t *testing.T) {
-		for _, k := range moduleGateEnvs {
+		for _, k := range moduleGateEnvs() {
 			t.Setenv(k, "true")
 		}
 		t.Setenv("NODE_LABELER_CONFIG_PATH",
 			filepath.Join(t.TempDir(), "labels.txt"))
 		m := testutil.NewStubManager()
-		if err := setupModules(testDeps(m)); err != nil {
+		if err := setupModules(testDeps(m), modules); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
 		if len(m.Added) != 32 {
@@ -400,16 +482,33 @@ func TestSetupModules(t *testing.T) {
 	})
 
 	t.Run("all gates disabled", func(t *testing.T) {
-		for _, k := range moduleGateEnvs {
+		for _, k := range moduleGateEnvs() {
 			t.Setenv(k, "false")
 		}
 		m := testutil.NewStubManager()
-		if err := setupModules(testDeps(m)); err != nil {
+		if err := setupModules(testDeps(m), modules); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
 		// 32 modules minus the 17 gate-skippers = 15 runnables.
 		if len(m.Added) != 15 {
 			t.Fatalf("registered %d runnables, want 15", len(m.Added))
+		}
+	})
+
+	// The -modules allowlist narrows what Setup runs: two gateless
+	// always-on modules → exactly two runnables, no matter what the
+	// gate envs say.
+	t.Run("allowlist subset", func(t *testing.T) {
+		mods, err := filterModules([]string{"node-labeler", "csr-watcher"})
+		if err != nil {
+			t.Fatalf("filterModules: %v", err)
+		}
+		m := testutil.NewStubManager()
+		if err := setupModules(testDeps(m), mods); err != nil {
+			t.Fatalf("setupModules: %v", err)
+		}
+		if len(m.Added) != 2 {
+			t.Fatalf("registered %d runnables, want 2", len(m.Added))
 		}
 	})
 }
@@ -483,7 +582,7 @@ func TestSetupModulesErrorPropagates(t *testing.T) {
 	want := errors.New("manager rejected runnable")
 	m := testutil.NewStubManager()
 	m.AddErr = want
-	err := setupModules(testDeps(m))
+	err := setupModules(testDeps(m), modules)
 	if !errors.Is(err, want) {
 		t.Fatalf("setupModules error = %v, want %v", err, want)
 	}

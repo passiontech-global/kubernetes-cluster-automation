@@ -24,6 +24,13 @@ import (
 // cilium-operator / linkerd control-plane pod heals.
 type meshControlPlaneCheck struct{ *deps }
 
+// newMeshControlPlaneCheck builds the W8-NM2/NM3 watchdog —
+// stateless itself; heal cooldowns ride the shared deps.meshHealed
+// ledger.
+func newMeshControlPlaneCheck(d *deps) checkRunner {
+	return &meshControlPlaneCheck{deps: d}
+}
+
 const (
 	// W8-NM2/NM3 — mesh-controlplane-watchdog knobs.
 	checkNameMeshWatchdog  = "mesh-controlplane-watchdog"

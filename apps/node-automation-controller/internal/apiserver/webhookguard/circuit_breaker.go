@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -74,7 +73,7 @@ const (
 // circuitBreakerEnabled reads the kill-switch every run — an env flip
 // takes effect on the next sweep without a code change.
 func circuitBreakerEnabled() bool {
-	return os.Getenv("WEBHOOK_CIRCUIT_BREAKER_ENABLED") != "false"
+	return shared.Gate("WEBHOOK_CIRCUIT_BREAKER_ENABLED", true)
 }
 
 // circuitBreaker owns the C1 sweep's per-sweep state — embedded in
@@ -83,19 +82,19 @@ func circuitBreakerEnabled() bool {
 // (cs/dyn/nowFn/endpointProber) are reached through snap.g; only the
 // breaker-specific ledgers and cooldowns live here.
 type circuitBreaker struct {
-	// deadSince is the first-seen timestamp of each
+	// deadSince is the first-seen ledger of each
 	// kind/config/sub-webhook sighted fail-closed against a Service
 	// with 0 Ready endpoints. A sighting that disappears (endpoints
 	// back, entry removed) resets the streak.
-	deadSince map[string]time.Time
+	deadSince shared.FirstSeenLedger
 	// brokenEmitted is the ledger of WebhookCircuitBroken label tuples
 	// ("kind/config/webhook") currently held at =1. Each sweep
-	// rebuilds it from the triples it re-asserted; a tuple not
-	// re-seen — config deleted, recreated without the annotation,
-	// entry pruned by the orphan sweep — gets its series deleted via
+	// re-asserts the triples still broken; a tuple not re-seen —
+	// config deleted, recreated without the annotation, entry pruned
+	// by the orphan sweep — gets its series deleted via
 	// DeleteLabelValues instead of pinning the alert forever (same
 	// seen-set hygiene as the cert drift auditor).
-	brokenEmitted map[string]bool
+	brokenEmitted shared.GaugeLedger[string]
 	// zeroThreshold / partitionZeroThreshold override the two trip
 	// windows — tests shrink them; a zero value falls back to
 	// webhookDeadThreshold / webhookPartitionedThreshold.
@@ -103,7 +102,7 @@ type circuitBreaker struct {
 	partitionZeroThreshold time.Duration
 	// bounceAt: webhook backend service key ("ns/name") → last pod
 	// bounce — the in-memory half of the 15m per-service cooldown.
-	bounceAt map[string]time.Time
+	bounceAt shared.CooldownSet
 }
 
 // sweepCircuitBreaker trips fail-closed sub-webhooks whose backend
@@ -116,12 +115,6 @@ func (b *circuitBreaker) sweepCircuitBreaker(ctx context.Context, snap *sweepSna
 	g := snap.g
 	log := logf.FromContext(ctx)
 	now := g.now()
-	if b.deadSince == nil {
-		b.deadSince = map[string]time.Time{}
-	}
-	if b.brokenEmitted == nil {
-		b.brokenEmitted = map[string]bool{}
-	}
 
 	ready, err := snap.readyCounts()
 	if err != nil {
@@ -138,15 +131,12 @@ func (b *circuitBreaker) sweepCircuitBreaker(ctx context.Context, snap *sweepSna
 	// seen marks the deadSince keys still under evaluation — streaks
 	// for entries gone since the last sweep are pruned below.
 	seen := map[string]bool{}
-	// emitted collects the WebhookCircuitBroken label tuples
-	// re-asserted at =1 this sweep — the new brokenEmitted ledger.
-	emitted := map[string]bool{}
 	var failed []string
 	for i := range mwcs.Items {
 		cfg := &mwcs.Items[i]
 		payload, trips, recovered := b.circuitPatch(log, webhookKindMutating,
 			cfg.Name, cfg.Annotations[webhookCircuitAnno],
-			mutHookViews(cfg.Webhooks), ready, now, seen, emitted)
+			mutHookViews(cfg.Webhooks), ready, now, seen, &b.brokenEmitted)
 		if payload == nil {
 			continue
 		}
@@ -157,13 +147,13 @@ func (b *circuitBreaker) sweepCircuitBreaker(ctx context.Context, snap *sweepSna
 			failed = append(failed, cfg.Name)
 			continue
 		}
-		circuitMetrics(emitted, webhookKindMutating, cfg.Name, trips, recovered)
+		circuitMetrics(&b.brokenEmitted, webhookKindMutating, cfg.Name, trips, recovered)
 	}
 	for i := range vwcs.Items {
 		cfg := &vwcs.Items[i]
 		payload, trips, recovered := b.circuitPatch(log, webhookKindValidating,
 			cfg.Name, cfg.Annotations[webhookCircuitAnno],
-			valHookViews(cfg.Webhooks), ready, now, seen, emitted)
+			valHookViews(cfg.Webhooks), ready, now, seen, &b.brokenEmitted)
 		if payload == nil {
 			continue
 		}
@@ -174,7 +164,7 @@ func (b *circuitBreaker) sweepCircuitBreaker(ctx context.Context, snap *sweepSna
 			failed = append(failed, cfg.Name)
 			continue
 		}
-		circuitMetrics(emitted, webhookKindValidating, cfg.Name, trips, recovered)
+		circuitMetrics(&b.brokenEmitted, webhookKindValidating, cfg.Name, trips, recovered)
 	}
 
 	// W9-CP1 stage 1 — rolling pod bounce: a webhook backend whose
@@ -187,25 +177,13 @@ func (b *circuitBreaker) sweepCircuitBreaker(ctx context.Context, snap *sweepSna
 
 	// Prune broken series whose label tuple was not re-seen — a config
 	// deleted while broken, recreated without the annotation, or an
-	// entry removed must not pin circuit_broken=1 forever. Keys are
-	// "kind/config/webhook"; all three are DNS-1123 identifiers so "/"
-	// is unambiguous (same SplitN convention as the PDB watchdog).
-	for k := range b.brokenEmitted {
-		if emitted[k] {
-			continue
-		}
-		if parts := strings.SplitN(k, "/", 3); len(parts) == 3 {
-			metrics.WebhookCircuitBroken.
-				DeleteLabelValues(parts[0], parts[1], parts[2])
-		}
-	}
-	b.brokenEmitted = emitted
+	// entry removed must not pin circuit_broken=1 forever.
+	b.brokenEmitted.Prune(metrics.WebhookCircuitBroken.DeleteLabelValues)
 
-	for k := range b.deadSince {
-		if !seen[k] {
-			delete(b.deadSince, k)
-		}
-	}
+	// Same prune for the dead-backend streaks: keys not re-evaluated
+	// this sweep (Service recovered, entry flipped to Ignore) re-arm
+	// their window.
+	b.deadSince.Prune(func(k string) bool { return seen[k] })
 	if len(failed) > 0 {
 		return fmt.Errorf("circuit breaker patches failed for: %s",
 			strings.Join(failed, ", "))
@@ -271,15 +249,15 @@ func (b *circuitBreaker) tripThreshold(rawReady int) time.Duration {
 // ...} — the webhooks list is patchMergeKey=name + patchStrategy=merge
 // (+listType=map), so only the touched element's failurePolicy is
 // rewritten and a concurrent writer's sibling entries survive instead
-// of being reverted by a whole-array reserialize. emitted records the
-// WebhookCircuitBroken label tuples re-asserted at =1 this sweep — the
-// caller rebuilds the guard's series ledger from it and prunes
-// whatever was not re-seen. Returns nil payload when nothing changed;
+// of being reverted by a whole-array reserialize. emitted is the
+// sweep's WebhookCircuitBroken series ledger — tuples re-asserted at
+// =1 are Emitted into it so the caller's Prune deletes whatever was
+// not re-seen. Returns nil payload when nothing changed;
 // trips/recovered are the names whose metric updates the caller must
 // apply only after the patch lands.
 func (b *circuitBreaker) circuitPatch(log logr.Logger, kind, cfgName, annoVal string,
 	hooks []hookView, ready endpointCensus, now time.Time,
-	seen, emitted map[string]bool) ([]byte, []string, []string) {
+	seen map[string]bool, emitted *shared.GaugeLedger[string]) ([]byte, []string, []string) {
 
 	broken := parseCircuitAnnotation(annoVal)
 	// present holds every live sub-webhook name — the staleness check
@@ -348,12 +326,11 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, kind, cfgName, annoVal st
 				changed = true
 			}
 			metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, h.name).Set(1)
-			emitted[key] = true
+			emitted.Emit(key, kind, cfgName, h.name)
 		case (svcEffective == 0 || unresponsive) && failClosed(h.fp):
 			seen[key] = true
-			first, ok := b.deadSince[key]
-			if !ok {
-				b.deadSince[key] = now
+			first, tracked := b.deadSince.Observe(key, now)
+			if !tracked {
 				log.Info("circuit breaker: fail-closed webhook on a dead Service — tracking",
 					"kind", kind, "config", cfgName, "webhook", h.name,
 					"service", svc, "rawReady", svcRaw)
@@ -428,14 +405,14 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, kind, cfgName, annoVal st
 
 // circuitMetrics applies the trip/recovery side-effects — called only
 // after the config patch landed, so a failed patch retries next sweep
-// without double-counting trips. A tripped series is recorded in
-// emitted (the sweep's new ledger); a recovered one is deleted
-// outright — a cleared breaker emits no series, not a 0, and the
-// sweep-end ledger rebuild drops it for good.
-func circuitMetrics(emitted map[string]bool, kind, cfgName string, trips, recovered []string) {
+// without double-counting trips. A tripped series is Emitted into the
+// sweep's ledger; a recovered one is deleted outright — a cleared
+// breaker emits no series, not a 0, and the sweep-end ledger prune
+// drops it for good.
+func circuitMetrics(emitted *shared.GaugeLedger[string], kind, cfgName string, trips, recovered []string) {
 	for _, n := range trips {
 		metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, n).Set(1)
-		emitted[kind+"/"+cfgName+"/"+n] = true
+		emitted.Emit(kind+"/"+cfgName+"/"+n, kind, cfgName, n)
 		metrics.WebhookCircuitBreakerTripsTotal.WithLabelValues(kind, cfgName).Inc()
 	}
 	for _, n := range recovered {
@@ -457,9 +434,6 @@ func (b *circuitBreaker) bounceHungWebhookPods(ctx context.Context,
 	g := snap.g
 	log := logf.FromContext(ctx)
 	now := g.now()
-	if b.bounceAt == nil {
-		b.bounceAt = map[string]time.Time{} // literal-constructed fixtures
-	}
 	// Distinct unresponsive webhook backend services, deduped across
 	// configs and kinds — several webhooks routinely share one
 	// Service, and one hung pod set is one bounce.
@@ -476,7 +450,7 @@ func (b *circuitBreaker) bounceHungWebhookPods(ctx context.Context,
 		if !(ready.effective[key] > 0 && ready.probed[key] && !ready.responsive[key]) {
 			return // not brownout-hung — healthy, partitioned or unprobed
 		}
-		if t, ok := b.bounceAt[key]; ok && now.Sub(t) < webhookBounceCooldown {
+		if b.bounceAt.CooledDown(key, webhookBounceCooldown, now) {
 			return // inside the 15m per-service cooldown
 		}
 		seen[key] = true
@@ -570,7 +544,7 @@ func (b *circuitBreaker) bounceOldestPod(ctx context.Context, snap *sweepSnapsho
 	}
 	// The cooldown stamps on a DELIVERED bounce only — a failed
 	// delete leaves the pod hung and the next sweep retries.
-	b.bounceAt[svcKey] = now
+	b.bounceAt.Stamp(svcKey, now)
 }
 
 // failClosed reports whether the entry currently fails closed. A nil

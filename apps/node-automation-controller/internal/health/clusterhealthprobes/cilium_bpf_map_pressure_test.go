@@ -23,7 +23,7 @@ func TestCiliumBPFMapPressureFailsAboveThreshold(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset())
 	p.cfg.httpURL = srv.URL
 	p.httpClient = srv.Client()
-	res := p.ciliumBPF.run(ctx)
+	res := mustCheck[*ciliumBPFMapPressureCheck](t, p).run(ctx)
 	if res.pass {
 		t.Fatalf("expected FAIL above threshold, got %+v", res)
 	}
@@ -46,14 +46,14 @@ func TestCiliumBPFMapPressureEmptyPasses(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset())
 	p.cfg.httpURL = srv.URL
 	p.httpClient = srv.Client()
-	if res := p.ciliumBPF.run(ctx); !res.pass {
+	if res := mustCheck[*ciliumBPFMapPressureCheck](t, p).run(ctx); !res.pass {
 		t.Fatalf("empty result must pass: %+v", res)
 	}
 }
 
 func TestCiliumBPFMapPressurePromDownInconclusive(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset()) // httpURL is dead by default
-	if res := p.ciliumBPF.run(ctx); !res.pass {
+	if res := mustCheck[*ciliumBPFMapPressureCheck](t, p).run(ctx); !res.pass {
 		t.Fatalf("prometheus outage must be inconclusive-pass, got %+v", res)
 	}
 }

@@ -13,6 +13,14 @@
 // reporting FAIL on its own kuberhealthy_check series plus the
 // dedicated node_automation_kcm_workqueue_frozen{reason} gauge.
 //
+// Layout: each check lives in its own file alongside the state maps
+// and the newXxxCheck constructor that builds it (the five ported
+// checks share ported_probes.go); the checkDefs registry below is the
+// single sweep-order roster. Adding a check is two touch points — a
+// checkDefs row + the constructor in the check's file — instead of
+// the five (constant, prober field, lastPass seed, constructor
+// literal, checks row) the monolithic prober needed.
+//
 // Three more self-healing checks ride the same plumbing:
 //   - operator-workqueue-watchdog (W5.8) generalizes the C6 shape to
 //     third-party operators — cilium/scylla/dragonfly/flux controllers
@@ -54,8 +62,6 @@ import (
 	"context"
 	"net"
 	"net/http"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -132,84 +138,7 @@ type healthProbeConfig struct {
 	quotaThreshold      float64       // HEALTH_RESOURCE_QUOTA_THRESHOLD
 	kcmLeaseMaxAge      time.Duration // HEALTH_KCM_LEASE_MAX_AGE
 	kcmFreezeMinAge     time.Duration // HEALTH_KCM_FREEZE_MIN_AGE
-}
-
-func healthEnv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-// healthEnvDuration parses a duration env knob, warning + defaulting
-// on two failure shapes: unparseable values (typos, unit-less numbers)
-// and non-positive durations — a 0s/negative check timeout would make
-// every probe fail instantly, and a 0s interval would panic the
-// periodic ticker registration downstream.
-func healthEnvDuration(key string, def time.Duration) time.Duration {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		logf.Log.WithName(clusterHealthQueue).Info(
-			"invalid env duration — using default", "key", key, "value", v,
-			"default", def)
-		return def
-	}
-	if d <= 0 {
-		logf.Log.WithName(clusterHealthQueue).Info(
-			"non-positive env duration — using default", "key", key,
-			"value", v, "default", def)
-		return def
-	}
-	return d
-}
-
-// healthEnvInt parses an integer env knob, warning + defaulting on
-// unparseable values and negatives — e.g. HEALTH_MAX_POD_RESTARTS=-1
-// would flag every container as over-limit.
-func healthEnvInt(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		logf.Log.WithName(clusterHealthQueue).Info(
-			"invalid env int — using default", "key", key, "value", v,
-			"default", def)
-		return def
-	}
-	if n < 0 {
-		logf.Log.WithName(clusterHealthQueue).Info(
-			"negative env int — using default", "key", key, "value", v,
-			"default", def)
-		return def
-	}
-	return n
-}
-
-// healthEnvFloat parses a float env knob, warning + defaulting on
-// unparseable values (a garbage threshold string must not silently
-// collapse to the default without an operator-visible note).
-func healthEnvFloat(key string, def float64) float64 {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil || f <= 0 {
-		// Non-positive thresholds are never meaningful (a <=0
-		// quota threshold flags EVERYTHING); >1 is kept as the
-		// operator's documented "disable this check" escape.
-		logf.Log.WithName(clusterHealthQueue).Info(
-			"invalid env float — using default", "key", key, "value", v,
-			"default", def)
-		return def
-	}
-	return f
+	perCheckTimeout     time.Duration // HEALTH_PER_CHECK_TIMEOUT
 }
 
 // healthProbeConfigFromEnv resolves the check knobs once at Setup.
@@ -222,7 +151,7 @@ func healthProbeConfigFromEnv() healthProbeConfig {
 	// alertmanager-operated NXDOMAINs whenever its single pod is
 	// recreating, which would flap the DNS check during every
 	// alertmanager rollout despite CoreDNS being fine.
-	hosts := strings.Split(healthEnv("HEALTH_DNS_HOSTNAMES",
+	hosts := strings.Split(shared.Getenv("HEALTH_DNS_HOSTNAMES",
 		"kubernetes.default.svc.cluster.local,"+
 			"kube-prometheus-stack-prometheus.prometheus-operator.svc.cluster.local"), ",")
 	trimmed := hosts[:0]
@@ -232,25 +161,37 @@ func healthProbeConfigFromEnv() healthProbeConfig {
 		}
 	}
 	return healthProbeConfig{
-		dnsHostnames:        trimmed,
-		checkTimeout:        healthEnvDuration("HEALTH_CHECK_TIMEOUT", 30*time.Second),
-		httpURL:             healthEnv("HEALTH_HTTP_CONTENT_URL", "http://kube-prometheus-stack-prometheus.prometheus-operator.svc:9090/-/healthy"),
-		httpExpectedContent: healthEnv("HEALTH_HTTP_EXPECTED_CONTENT", "Healthy"),
-		podCheckNamespace:   healthEnv("HEALTH_POD_CHECK_NAMESPACE", "kube-system"),
-		maxPodRestarts:      int32(healthEnvInt("HEALTH_MAX_POD_RESTARTS", 10)),
-		podSkipDuration:     healthEnvDuration("HEALTH_POD_SKIP_DURATION", 10*time.Minute),
-		quotaThreshold:      healthEnvFloat("HEALTH_RESOURCE_QUOTA_THRESHOLD", 0.9),
+		dnsHostnames: trimmed,
+		// shared.GetenvDuration floors every duration knob at 1s
+		// (the retired helpers accepted any d > 0) — sub-second
+		// probe timeouts and persistence windows were already
+		// pathological, so the tightened bound changes no sane
+		// configuration.
+		checkTimeout:        shared.GetenvDuration("HEALTH_CHECK_TIMEOUT", 30*time.Second),
+		httpURL:             shared.Getenv("HEALTH_HTTP_CONTENT_URL", "http://kube-prometheus-stack-prometheus.prometheus-operator.svc:9090/-/healthy"),
+		httpExpectedContent: shared.Getenv("HEALTH_HTTP_EXPECTED_CONTENT", "Healthy"),
+		podCheckNamespace:   shared.Getenv("HEALTH_POD_CHECK_NAMESPACE", "kube-system"),
+		maxPodRestarts:      int32(shared.GetenvIntMin("HEALTH_MAX_POD_RESTARTS", 10, 0)),
+		podSkipDuration:     shared.GetenvDuration("HEALTH_POD_SKIP_DURATION", 10*time.Minute),
+		quotaThreshold:      shared.GetenvFloatPositive("HEALTH_RESOURCE_QUOTA_THRESHOLD", 0.9),
 		// KCM leader-election defaults are LeaseDuration 15s,
 		// RenewDeadline 10s, RetryPeriod ~2s, so a live holder's
 		// renewTime is never more than a few seconds old. 30s — 2×
 		// the lease duration — bounds "still renewing" with margin
 		// for apiserver latency; anything older means the holder is
 		// gone (a dead KCM, not a frozen one).
-		kcmLeaseMaxAge: healthEnvDuration("HEALTH_KCM_LEASE_MAX_AGE", 30*time.Second),
+		kcmLeaseMaxAge: shared.GetenvDuration("HEALTH_KCM_LEASE_MAX_AGE", 30*time.Second),
 		// A freeze signature must persist this long before the gauge
 		// fires — a healthy reconcile legitimately lags a spec write
 		// by a sync period or two.
-		kcmFreezeMinAge: healthEnvDuration("HEALTH_KCM_FREEZE_MIN_AGE", 10*time.Minute),
+		kcmFreezeMinAge: shared.GetenvDuration("HEALTH_KCM_FREEZE_MIN_AGE", 10*time.Minute),
+		// Bounds one check's share of the serial sweep — a hung
+		// apiserver call used to stretch the whole cycle; past the
+		// deadline the check's context is cancelled (the in-flight
+		// call unwinds) and the sweep moves on. The check's own
+		// error still surfaces as FAIL/infra, so reporting semantics
+		// are unchanged — only the wait is bounded.
+		perCheckTimeout: shared.GetenvDuration("HEALTH_PER_CHECK_TIMEOUT", 2*time.Minute),
 	}
 }
 
@@ -302,65 +243,87 @@ type deps struct {
 	ledger healLedger
 }
 
-// checkEntry is one registry row: the check name — the
-// kuberhealthy_check label value alerts key on — and the check's
-// run func.
-type checkEntry struct {
-	name  string
-	probe func(ctx context.Context) probeResult
+// checkRunner is the uniform shape every sweep check satisfies — the
+// per-check types each carry a run method with this signature, so the
+// registry needs no per-check adapter.
+type checkRunner interface {
+	run(ctx context.Context) probeResult
 }
 
-// clusterHealthProber is the thin sweep runner: the shared deps, one
-// instance per check (each colocating its own state with its logic
-// in its own file), the kuberhealthy series reporter, and the check
-// registry run() iterates. Check names are metric label values and
-// must not change.
+// checkEntry is one registry row: the check name — the
+// kuberhealthy_check label value alerts key on — and the check
+// instance run() invokes.
+type checkEntry struct {
+	name  string
+	check checkRunner
+}
+
+// checkDefs is the data-driven check registry — the single sweep-order
+// roster the prober is built from. Order is the ops contract: the
+// historical sweep order is preserved verbatim and the names are the
+// kuberhealthy_check label values, so neither may change. Each row's
+// constructor lives in the check's own file so its state-map
+// initialization colocates with the check logic.
+var checkDefs = []struct {
+	name string
+	new  func(*deps) checkRunner
+}{
+	{checkNameDNS, newDNSStatusCheck},
+	{checkNameHTTPContent, newHTTPContentCheck},
+	{checkNamePodRestarts, newPodRestartsCheck},
+	{checkNamePodStatus, newPodStatusCheck},
+	{checkNameResourceQuota, newResourceQuotaCheck},
+	{checkNameKCMWorkqueue, newKcmWorkqueueCheck},
+	{checkNameOperatorWorkqueue, newOperatorWorkqueueCheck},
+	{checkNameStatefulMasterless, newStatefulMasterlessCheck},
+	{checkNameRabbitMQSuspended, newRabbitMQSuspendedCheck},
+	{checkNameLocalPVStranded, newLocalPVStrandedCheck},
+	{checkNameOLMHealth, newOlmHealthCheck},
+	{checkNameSchedulerWatchdog, newSchedulerWatchdogCheck},
+	{checkNameMeshWatchdog, newMeshControlPlaneCheck},
+	{checkNameNodeHang, newNodeHangCheck},
+	{checkNameLinkerdEndpointSync, newLinkerdEndpointSyncCheck},
+	{checkNameScyllaHealth, newScyllaHealthCheck},
+	{checkNameFluxHRRetries, newFluxHRRetriesCheck},
+	{checkNamePerconaQuorum, newPerconaQuorumCheck},
+	{checkNameCiliumBPFMapPressure, newCiliumBPFMapPressureCheck},
+	{checkNameLinkerdOpaqueStall, newLinkerdProtocolDetectionStallCheck},
+	{checkNameCoreDNSUpstream, newCoreDNSUpstreamCheck},
+	{checkNameCiliumNodeIPAM, newCiliumNodeIPAMExhaustionCheck},
+	{checkNameNamespaceWedged, newNamespaceTerminatingWedgedCheck},
+	{checkNameArgoCDAppStuck, newArgoCDAppStuckCheck},
+	{checkNameRabbitMQQuorum, newRabbitMQQuorumHealthCheck},
+	{checkNameDragonflySyncStorm, newDragonflyReplicaSyncStormCheck},
+	{checkNameImagePullStorm, newImagePullStormCheck},
+}
+
+// clusterHealthProber is the thin sweep runner: the shared deps, the
+// check registry run() iterates (built once at construction in the
+// historical sweep order — each check instance colocates its own
+// state with its logic in its own file), and the kuberhealthy series
+// reporter. Check names are metric label values and must not change.
 type clusterHealthProber struct {
 	*deps
 
+	// boot stamps prober construction — report() lazily seeds a
+	// never-passed check's staleness from boot (the semantics the
+	// old 27-entry boot literal encoded), matching kuberhealthy's
+	// count-from-check-creation behavior.
+	boot time.Time
+
 	// lastPass tracks the last OK per check name for the
-	// seconds_since_success gauge — seeded to boot time so a check
-	// that never passed still reports a growing staleness, matching
-	// kuberhealthy (which counts from check creation).
+	// seconds_since_success gauge — it holds REAL passes only; a
+	// check with no entry yet counts staleness from p.boot (see
+	// report), so a check that never passed still reports a growing
+	// staleness.
 	lastPass map[string]time.Time
 
-	// One instance per check — the checks registry references these
-	// same objects so per-check state persists across sweeps.
-	dns             *dnsStatusCheck
-	httpContent     *httpContentCheck
-	podRestarts     *podRestartsCheck
-	podStatus       *podStatusCheck
-	resourceQuota   *resourceQuotaCheck
-	kcm             *kcmWorkqueueCheck
-	operator        *operatorWorkqueueCheck
-	masterless      *statefulMasterlessCheck
-	rabbitSuspended *rabbitMQSuspendedCheck
-	localPV         *localPVStrandedCheck
-	olm             *olmHealthCheck
-	scheduler       *schedulerWatchdogCheck
-	mesh            *meshControlPlaneCheck
-	nodeHang        *nodeHangCheck
-	linkerdSync     *linkerdEndpointSyncCheck
-	scylla          *scyllaHealthCheck
-	fluxHR          *fluxHRRetriesCheck
-	percona         *perconaQuorumCheck
-	ciliumBPF       *ciliumBPFMapPressureCheck
-	linkerdStall    *linkerdProtocolDetectionStallCheck
-	coreDNS         *coreDNSUpstreamCheck
-	ciliumIPAM      *ciliumNodeIPAMExhaustionCheck
-	nsWedged        *namespaceTerminatingWedgedCheck
-	argoCD          *argoCDAppStuckCheck
-	rabbitQuorum    *rabbitMQQuorumHealthCheck
-	dragonflyStorm  *dragonflyReplicaSyncStormCheck
-	imagePull       *imagePullStormCheck
-
-	// checks is the run() registry — built once at construction in
-	// the historical sweep order.
+	// checks is the run() registry — built once at construction from
+	// checkDefs, in the historical sweep order.
 	checks []checkEntry
 }
 
 func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg healthProbeConfig) *clusterHealthProber {
-	boot := time.Now()
 	d := &deps{
 		cs:         cs,
 		dyn:        dyn,
@@ -375,151 +338,44 @@ func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg 
 		},
 	}
 	p := &clusterHealthProber{
-		deps: d,
-		lastPass: map[string]time.Time{
-			checkNameDNS:                  boot,
-			checkNameHTTPContent:          boot,
-			checkNamePodRestarts:          boot,
-			checkNamePodStatus:            boot,
-			checkNameResourceQuota:        boot,
-			checkNameKCMWorkqueue:         boot,
-			checkNameOperatorWorkqueue:    boot,
-			checkNameStatefulMasterless:   boot,
-			checkNameRabbitMQSuspended:    boot,
-			checkNameLocalPVStranded:      boot,
-			checkNameOLMHealth:            boot,
-			checkNameSchedulerWatchdog:    boot,
-			checkNameMeshWatchdog:         boot,
-			checkNameNodeHang:             boot,
-			checkNameLinkerdEndpointSync:  boot,
-			checkNameScyllaHealth:         boot,
-			checkNameFluxHRRetries:        boot,
-			checkNamePerconaQuorum:        boot,
-			checkNameCiliumBPFMapPressure: boot,
-			checkNameLinkerdOpaqueStall:   boot,
-			checkNameCoreDNSUpstream:      boot,
-			checkNameCiliumNodeIPAM:       boot,
-			checkNameNamespaceWedged:      boot,
-			checkNameArgoCDAppStuck:       boot,
-			checkNameRabbitMQQuorum:       boot,
-			checkNameDragonflySyncStorm:   boot,
-			checkNameImagePullStorm:       boot,
-		},
-		dns:           &dnsStatusCheck{deps: d},
-		httpContent:   &httpContentCheck{deps: d},
-		podRestarts:   &podRestartsCheck{deps: d},
-		podStatus:     &podStatusCheck{deps: d},
-		resourceQuota: &resourceQuotaCheck{deps: d},
-		kcm: &kcmWorkqueueCheck{deps: d,
-			kcmFirstSeen:     map[string]time.Time{},
-			kcmFrozenReasons: map[string]bool{},
-		},
-		operator: &operatorWorkqueueCheck{deps: d,
-			opFirstSeen: map[string]time.Time{},
-			opFrozen:    map[string]bool{},
-			opHealed:    map[string]time.Time{},
-		},
-		masterless: &statefulMasterlessCheck{deps: d,
-			stsZeroSince:   map[string]time.Time{},
-			stsZeroEmitted: map[string]bool{},
-			drHealed:       map[string]time.Time{},
-			drPodHealed:    map[string]time.Time{},
-		},
-		rabbitSuspended: &rabbitMQSuspendedCheck{deps: d,
-			rbSuspendedSince: map[string]time.Time{},
-			rbHealed:         map[string]time.Time{},
-		},
-		localPV: &localPVStrandedCheck{deps: d,
-			localPVEmitted:    map[string]bool{},
-			pvcStalledEmitted: map[string]bool{},
-			localPVHealed:     map[string]time.Time{},
-			pvcProvHealed:     map[string]time.Time{},
-		},
-		olm: &olmHealthCheck{deps: d,
-			olmFirstSeen: map[string]time.Time{},
-			olmEmitted:   map[string]bool{},
-			olmHealed:    map[string]time.Time{},
-		},
-		scheduler: &schedulerWatchdogCheck{deps: d},
-		mesh:      &meshControlPlaneCheck{deps: d},
-		nodeHang:  &nodeHangCheck{deps: d},
-		linkerdSync: &linkerdEndpointSyncCheck{deps: d,
-			linkerdDesyncSince:   map[string]time.Time{},
-			linkerdDesyncEmitted: map[string]bool{},
-			linkerdDesyncHealed:  map[string]time.Time{},
-		},
-		scylla: &scyllaHealthCheck{deps: d,
-			scyllaFirstSeen: map[string]time.Time{},
-			scyllaEmitted:   map[string]bool{},
-		},
-		fluxHR: &fluxHRRetriesCheck{deps: d,
-			hrRetryHealed: map[string]time.Time{},
-		},
-		percona: &perconaQuorumCheck{deps: d,
-			perconaInitSeen: map[string]time.Time{},
-		},
-		ciliumBPF:      &ciliumBPFMapPressureCheck{deps: d},
-		linkerdStall:   &linkerdProtocolDetectionStallCheck{deps: d},
-		coreDNS:        &coreDNSUpstreamCheck{deps: d},
-		ciliumIPAM:     &ciliumNodeIPAMExhaustionCheck{deps: d},
-		nsWedged:       &namespaceTerminatingWedgedCheck{deps: d},
-		argoCD:         &argoCDAppStuckCheck{deps: d},
-		rabbitQuorum:   &rabbitMQQuorumHealthCheck{deps: d},
-		dragonflyStorm: &dragonflyReplicaSyncStormCheck{deps: d},
-		imagePull:      &imagePullStormCheck{deps: d},
+		deps:     d,
+		boot:     time.Now(),
+		lastPass: map[string]time.Time{},
 	}
-	p.checks = []checkEntry{
-		{checkNameDNS, p.dns.run},
-		{checkNameHTTPContent, p.httpContent.run},
-		{checkNamePodRestarts, p.podRestarts.run},
-		{checkNamePodStatus, p.podStatus.run},
-		{checkNameResourceQuota, p.resourceQuota.run},
-		{checkNameKCMWorkqueue, p.kcm.run},
-		{checkNameOperatorWorkqueue, p.operator.run},
-		{checkNameStatefulMasterless, p.masterless.run},
-		{checkNameRabbitMQSuspended, p.rabbitSuspended.run},
-		{checkNameLocalPVStranded, p.localPV.run},
-		{checkNameOLMHealth, p.olm.run},
-		{checkNameSchedulerWatchdog, p.scheduler.run},
-		{checkNameMeshWatchdog, p.mesh.run},
-		{checkNameNodeHang, p.nodeHang.run},
-		{checkNameLinkerdEndpointSync, p.linkerdSync.run},
-		{checkNameScyllaHealth, p.scylla.run},
-		{checkNameFluxHRRetries, p.fluxHR.run},
-		{checkNamePerconaQuorum, p.percona.run},
-		{checkNameCiliumBPFMapPressure, p.ciliumBPF.run},
-		{checkNameLinkerdOpaqueStall, p.linkerdStall.run},
-		{checkNameCoreDNSUpstream, p.coreDNS.run},
-		{checkNameCiliumNodeIPAM, p.ciliumIPAM.run},
-		{checkNameNamespaceWedged, p.nsWedged.run},
-		{checkNameArgoCDAppStuck, p.argoCD.run},
-		{checkNameRabbitMQQuorum, p.rabbitQuorum.run},
-		{checkNameDragonflySyncStorm, p.dragonflyStorm.run},
-		{checkNameImagePullStorm, p.imagePull.run},
+	for _, def := range checkDefs {
+		p.checks = append(p.checks, checkEntry{name: def.name, check: def.new(d)})
 	}
 	return p
 }
 
 // Setup registers the 5-minute probe sweep. The
-// kuberhealthy checks ran always-on, so the gate lives in
-// CLUSTER_HEALTH_PROBES_ENABLED (default ON — explicit "false" opts
-// out); disabled skips mgr.Add entirely, matching the
+// kuberhealthy checks ran always-on, so the registration gate lives
+// in CLUSTER_HEALTH_PROBES_ENABLED (default ON — explicit "false"
+// opts out); setupModules evaluates it and stamps Deps.Disabled —
+// disabled skips mgr.Add entirely, matching the
 // cilium-taint-reaper pattern. dyn feeds the CRD scans inside the
 // self-healing checks (W5.8/W6.2) — wired like every other
 // dynamic-client module.
 func Setup(d shared.Deps) error {
-	if !shared.Gate("CLUSTER_HEALTH_PROBES_ENABLED", true) {
-		logf.Log.WithName(clusterHealthQueue).Info("disabled — module not registered")
+	// Config resolution stays BEFORE the disabled early-return so
+	// knob-parse warnings still fire for a gated-off module — the
+	// codebase's parse-before-gate contract.
+	cfg := healthProbeConfigFromEnv()
+	// shared.GetenvDuration rejects <1s (the retired helper accepted
+	// any d > 0) — a sub-second sweep interval was already a
+	// hot-loop bug, never a sane setting.
+	interval := shared.GetenvDuration("CLUSTER_HEALTH_PROBES_INTERVAL", 5*time.Minute)
+	if d.Disabled {
 		return nil
 	}
-	p := newClusterHealthProber(d.CS, d.Dyn, healthProbeConfigFromEnv())
-	interval := healthEnvDuration("CLUSTER_HEALTH_PROBES_INTERVAL", 5*time.Minute)
+	p := newClusterHealthProber(d.CS, d.Dyn, cfg)
 	// Surface the resolved HEALTH_* knobs once at registration so an
 	// operator can tell from the logs which targets/thresholds the
 	// checks run with (an unparseable env value silently falls back
 	// to the default — the effective value is what matters here).
 	logf.Log.WithName(clusterHealthQueue).Info("registered",
-		"interval", interval, "dnsHostnames", p.cfg.dnsHostnames,
+		"interval", interval, "perCheckTimeout", p.cfg.perCheckTimeout,
+		"dnsHostnames", p.cfg.dnsHostnames,
 		"checkTimeout", p.cfg.checkTimeout, "httpURL", p.cfg.httpURL,
 		"httpExpectedContent", p.cfg.httpExpectedContent,
 		"podCheckNamespace", p.cfg.podCheckNamespace,
@@ -534,13 +390,24 @@ func Setup(d shared.Deps) error {
 func (p *clusterHealthProber) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	for _, c := range p.checks {
-		res := c.probe(ctx)
+		// Bound one check's share of the serial sweep — a hung
+		// apiserver call used to stretch the whole cycle. The child
+		// deadline cancels the in-flight client call; the check's own
+		// error usually surfaces as infra below, so FAIL/reporting
+		// semantics are unchanged — only the wait is bounded.
+		cctx, cancel := context.WithTimeout(ctx, p.cfg.perCheckTimeout)
+		res := c.check.run(cctx)
+		cancel()
 		// A cancelled sweep context (SIGTERM during rollout/shutdown)
 		// is not a health signal: emitting FAIL=1 or a run error now
 		// would leave fake series behind on the dying pod. Bail out
 		// silently — the surviving leader's next cycle reports.
 		if ctx.Err() != nil {
 			return nil
+		}
+		if cctx.Err() == context.DeadlineExceeded {
+			log.Info("health check exceeded per-check timeout",
+				"check", c.name)
 		}
 		p.report(c.name, res.pass)
 		// A check FAIL is the product — it is reported via metrics and
@@ -564,7 +431,14 @@ func (p *clusterHealthProber) report(name string, ok bool) {
 	if ok {
 		p.lastPass[name] = now
 	}
-	since := now.Sub(p.lastPass[name]).Seconds()
+	// Lazy seed: a check with no recorded pass yet counts staleness
+	// from prober boot — the semantics the old boot-time lastPass
+	// literal encoded — so a never-passing check still alerts stale.
+	last, seeded := p.lastPass[name]
+	if !seeded {
+		last = p.boot
+	}
+	since := now.Sub(last).Seconds()
 	p.mu.Unlock()
 	metrics.ObserveHealthCheck(name, ok, since)
 }

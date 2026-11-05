@@ -16,10 +16,18 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
 // ciliumBPFMapPressureCheck is the cilium BPF map pressure watchdog.
 type ciliumBPFMapPressureCheck struct{ *deps }
+
+// newCiliumBPFMapPressureCheck builds the W10-NM1 check — stateless,
+// it reads only deps (emitted-gauge hygiene rides deps.ledger).
+func newCiliumBPFMapPressureCheck(d *deps) checkRunner {
+	return &ciliumBPFMapPressureCheck{deps: d}
+}
 
 const (
 	checkNameCiliumBPFMapPressure = "cilium-bpf-map-pressure"
@@ -49,7 +57,10 @@ func init() {
 // false FAIL.
 func (p *ciliumBPFMapPressureCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
-	threshold := healthEnvFloat("CILIUM_BPF_MAP_PRESSURE_THRESHOLD", ciliumBPFDefaultThreshold)
+	// GetenvFloatPositive keeps >1 (the documented "disable this
+	// check" escape) and rejects <=0 — the same contract the retired
+	// healthEnvFloat had.
+	threshold := shared.GetenvFloatPositive("CILIUM_BPF_MAP_PRESSURE_THRESHOLD", ciliumBPFDefaultThreshold)
 	query := fmt.Sprintf(
 		`max by (node, map_name) (cilium_bpf_map_pressure) > %s`,
 		strconv.FormatFloat(threshold, 'f', -1, 64))

@@ -16,7 +16,9 @@ import (
 // crontab-equivalent interval — the pairing is what keeps
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
-	t.Setenv("CONCOURSE_JANITOR_ENABLED", "true") // opt-in gate
+	// Zero-value Deps.Disabled = gate-on — the opt-in
+	// CONCOURSE_JANITOR_ENABLED gate is resolved by setupModules, not
+	// re-read here.
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{
 		Mgr: m,

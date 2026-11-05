@@ -94,7 +94,7 @@ func TestLocalPVStrandedConcourseHeals(t *testing.T) {
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
 
-	res := p.localPV.run(ctx)
+	res := mustCheck[*localPVStrandedCheck](t, p).run(ctx)
 	if res.pass {
 		t.Fatal("stranded pod must FAIL")
 	}
@@ -136,7 +136,7 @@ func TestLocalPVStrandedDatabaseNoHeal(t *testing.T) {
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
 
-	if res := p.localPV.run(ctx); res.pass {
+	if res := mustCheck[*localPVStrandedCheck](t, p).run(ctx); res.pass {
 		t.Fatal("stranded database pod must FAIL")
 	}
 	if _, err := cs.CoreV1().PersistentVolumeClaims("scylla").
@@ -167,7 +167,7 @@ func TestLocalPVStrandedAnnotatedEphemeralHeals(t *testing.T) {
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
 
-	_ = p.localPV.run(ctx)
+	_ = mustCheck[*localPVStrandedCheck](t, p).run(ctx)
 	m := findMetric(t, "node_automation_localpv_stranded_pods",
 		map[string]string{"namespace": "apps", "pod": "cache-0",
 			"pvc": "data-cache-0", "node": "node-f", "reason": strandedReasonOutOfService})
@@ -204,7 +204,7 @@ func TestLocalPVStrandedSoftStatesAlertOnly(t *testing.T) {
 			defer metrics.LocalPVStrandedPods.DeleteLabelValues(
 				"concourse", "concourse-worker-0", "pvc-w", "n1", tc.reason)
 
-			if res := p.localPV.run(ctx); res.pass {
+			if res := mustCheck[*localPVStrandedCheck](t, p).run(ctx); res.pass {
 				t.Fatal("stranded pod must FAIL")
 			}
 			if _, err := cs.CoreV1().PersistentVolumeClaims("concourse").
@@ -230,7 +230,7 @@ func TestLocalPVStrandedTooYoungForHeal(t *testing.T) {
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
 
-	if res := p.localPV.run(ctx); res.pass {
+	if res := mustCheck[*localPVStrandedCheck](t, p).run(ctx); res.pass {
 		t.Fatal("stranded pod must FAIL")
 	}
 	if _, err := cs.CoreV1().PersistentVolumeClaims("concourse").
@@ -251,7 +251,7 @@ func TestLocalPVStrandedMaintenanceDefers(t *testing.T) {
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
 
-	_ = p.localPV.run(ctx)
+	_ = mustCheck[*localPVStrandedCheck](t, p).run(ctx)
 	if _, err := cs.CoreV1().PersistentVolumeClaims("concourse").
 		Get(ctx, "pvc-w", metav1.GetOptions{}); err != nil {
 		t.Fatal("PVC deleted during maintenance")
@@ -275,7 +275,7 @@ func TestPVCStalledProvisionerHeals(t *testing.T) {
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
 
-	if res := p.localPV.run(ctx); res.pass {
+	if res := mustCheck[*localPVStrandedCheck](t, p).run(ctx); res.pass {
 		t.Fatal("stalled provisioning must FAIL")
 	}
 	m := findMetric(t, "node_automation_pvc_provisioning_stalled",
@@ -301,7 +301,7 @@ func TestPVCStalledNeedsAWorker(t *testing.T) {
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
 
-	if res := p.localPV.run(ctx); !res.pass {
+	if res := mustCheck[*localPVStrandedCheck](t, p).run(ctx); !res.pass {
 		t.Fatalf("no schedulable worker must pass quietly: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("openebs").

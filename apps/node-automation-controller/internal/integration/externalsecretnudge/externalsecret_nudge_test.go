@@ -713,12 +713,10 @@ func TestExternalSecretNudgeConnectHeal(t *testing.T) {
 		enabled:    true,
 		storeReady: map[string]bool{},
 		nudged:     map[string]time.Time{},
-		// The store has been observed down since 20m ago — past the
-		// 15m persistence window.
-		storeDownSince: map[string]time.Time{
-			"ClusterSecretStore//store": time.Now().Add(-20 * time.Minute),
-		},
 	}
+	// The store has been observed down since 20m ago — past the
+	// 15m persistence window.
+	n.storeDownSince.Observe("ClusterSecretStore//store", time.Now().Add(-20*time.Minute))
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
 	}

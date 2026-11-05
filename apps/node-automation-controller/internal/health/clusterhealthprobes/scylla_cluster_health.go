@@ -43,6 +43,16 @@ type scyllaHealthCheck struct {
 	scyllaEmitted   map[string]bool
 }
 
+// newScyllaHealthCheck builds the W9-ST1 check with fresh tracking
+// maps — the state-map initialization that used to live in the
+// monolithic newClusterHealthProber literal.
+func newScyllaHealthCheck(d *deps) checkRunner {
+	return &scyllaHealthCheck{deps: d,
+		scyllaFirstSeen: map[string]time.Time{},
+		scyllaEmitted:   map[string]bool{},
+	}
+}
+
 const (
 	// W9-ST1 — scylla-cluster-health knobs.
 	checkNameScyllaHealth    = "scylla-cluster-health"

@@ -23,6 +23,12 @@ import (
 // rabbitMQQuorumHealthCheck is the RabbitMQ quorum-health watchdog.
 type rabbitMQQuorumHealthCheck struct{ *deps }
 
+// newRabbitMQQuorumHealthCheck builds the W10-ST3 check — stateless,
+// it reads only deps.
+func newRabbitMQQuorumHealthCheck(d *deps) checkRunner {
+	return &rabbitMQQuorumHealthCheck{deps: d}
+}
+
 const (
 	checkNameRabbitMQQuorum = "rabbitmq-quorum-health"
 

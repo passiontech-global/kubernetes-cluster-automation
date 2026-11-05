@@ -42,6 +42,37 @@ type nodeLabeler struct {
 	configPath string
 }
 
+// The watch wiring below installs these package-level units
+// verbatim — tests exercise the exact predicate/mapfunc the
+// controller runs instead of introspecting controller-runtime
+// internals.
+
+// nodeSweepRequests collapses every Node event onto the single fixed
+// sweep key (see shared.SweepRequests).
+var nodeSweepRequests = shared.SweepRequests("node-labeler-sweep")
+
+// nodeLabelChanges is the Node watch predicate — the bash
+// jqFilter='.metadata.labels': only label drift fires, everything
+// else is dropped.
+var nodeLabelChanges = predicate.Funcs{
+	CreateFunc:  func(event.CreateEvent) bool { return true },
+	DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	GenericFunc: func(event.GenericEvent) bool { return true },
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		// client.Object is an interface: == nil cannot
+		// catch a typed-nil pointer (GetLabels would
+		// panic on it). The ok-comma assert siblings use
+		// covers both — a nil interface fails the assert,
+		// a typed nil lands in oldN/newN.
+		oldN, ok1 := e.ObjectOld.(*corev1.Node)
+		newN, ok2 := e.ObjectNew.(*corev1.Node)
+		if !ok1 || !ok2 || oldN == nil || newN == nil {
+			return false // missing objects never fire
+		}
+		return !reflect.DeepEqual(oldN.GetLabels(), newN.GetLabels())
+	},
+}
+
 // Setup wires the node-labeler reconciler. configPath is the
 // labels.txt file (default /etc/node-labeler/labels.txt).
 func Setup(d shared.Deps) error {
@@ -58,26 +89,8 @@ func Setup(d shared.Deps) error {
 		// sync. One key collapses both to a single sweep (see
 		// shared.SweepRequests). Predicate semantics are unchanged.
 		Watches(&corev1.Node{},
-			handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("node-labeler-sweep")),
-			builder.WithPredicates(predicate.Funcs{
-				CreateFunc:  func(event.CreateEvent) bool { return true },
-				DeleteFunc:  func(event.DeleteEvent) bool { return true },
-				GenericFunc: func(event.GenericEvent) bool { return true },
-				// bash jqFilter='.metadata.labels' — only label drift fires.
-				UpdateFunc: func(e event.UpdateEvent) bool {
-					// client.Object is an interface: == nil cannot
-					// catch a typed-nil pointer (GetLabels would
-					// panic on it). The ok-comma assert siblings use
-					// covers both — a nil interface fails the assert,
-					// a typed nil lands in oldN/newN.
-					oldN, ok1 := e.ObjectOld.(*corev1.Node)
-					newN, ok2 := e.ObjectNew.(*corev1.Node)
-					if !ok1 || !ok2 || oldN == nil || newN == nil {
-						return false // missing objects never fire
-					}
-					return !reflect.DeepEqual(oldN.GetLabels(), newN.GetLabels())
-				},
-			})).
+			handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
+			builder.WithPredicates(nodeLabelChanges)).
 		Complete(r)
 }
 

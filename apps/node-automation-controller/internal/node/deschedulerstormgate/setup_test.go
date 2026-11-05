@@ -12,7 +12,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
@@ -35,17 +35,10 @@ func TestSetupRegistersController(t *testing.T) {
 
 // The module's Node watch maps every node event onto its fixed sweep
 // key — a multi-node burst must set-collapse to a single queued
-// request.
+// request. Drives the exact MapFunc the watch installs
+// (nodeSweepRequests) through a real workqueue.
 func TestSetupSweepFixedKey(t *testing.T) {
-	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	_, h := testutil.KindSource(t, testutil.ControllerWatches(t, m.Added[0])[0])
-	if h == nil {
-		t.Fatal("node watch has no event handler")
-	}
+	h := handler.EnqueueRequestsFromMapFunc(nodeSweepRequests)
 	q := workqueue.NewTypedRateLimitingQueue(
 		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
 	defer q.ShutDown()
@@ -64,14 +57,12 @@ func TestSetupSweepFixedKey(t *testing.T) {
 	q.Done(item)
 }
 
-// The storm-gate For(Node) predicate must fire on node add/remove and
-// on changes to the verdict inputs (condition statuses, taint keys) —
+// The storm-gate Node watch predicate (stormSignalChanges — the exact
+// predicate.Funcs Setup installs) must fire on node add/remove and on
+// changes to the verdict inputs (condition statuses, taint keys) —
 // but not on kubelet heartbeat churn.
 func TestSetupStormGatePredicate(t *testing.T) {
-	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-			Dyn: testutil.StubDyn()})
-	})
+	p := stormSignalChanges
 
 	if !p.Create(event.CreateEvent{Object: testutil.Node("n1", corev1.ConditionTrue, nil)}) {
 		t.Fatal("node add did not fire")

@@ -20,9 +20,17 @@ import (
 //   - Dyn is the dynamic client for CRD types (helmreleases,
 //     cert-manager, externalsecrets, ...).
 //   - Log is the manager logger, for Setup-time registration lines.
+//   - Disabled is set by setupModules when the module's registration
+//     gate (Module.GateEnv) evaluated off. Setup STILL RUNS so
+//     knob-parsing warnings fire even for a disabled module (the
+//     corednspatcher/metricsserverpatcher contract), but it must
+//     return nil before registering anything. The zero value is
+//     enabled — literally-constructed Deps in tests behave as
+//     gate-on.
 type Deps struct {
-	Mgr manager.Manager
-	CS  kubernetes.Interface
-	Dyn dynamic.Interface
-	Log logr.Logger
+	Mgr      manager.Manager
+	CS       kubernetes.Interface
+	Dyn      dynamic.Interface
+	Log      logr.Logger
+	Disabled bool
 }

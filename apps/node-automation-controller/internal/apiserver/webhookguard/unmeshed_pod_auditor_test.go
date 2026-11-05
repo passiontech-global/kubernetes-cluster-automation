@@ -98,8 +98,7 @@ func upPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 
 func upGuard(cs *fake.Clientset) *webhookGuard {
 	return &webhookGuard{cs: cs, nowFn: time.Now,
-		unmeshedPodAuditor: unmeshedPodAuditor{
-			unmeshedEmitted: map[string]bool{}}}
+		unmeshedPodAuditor: unmeshedPodAuditor{}}
 }
 
 // ---------------------------------------------------------------------------
@@ -162,8 +161,8 @@ func TestUnmeshedAuditSkips(t *testing.T) {
 	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if len(g.unmeshedEmitted) != 0 {
-		t.Fatalf("skippable pods flagged: %v", g.unmeshedEmitted)
+	if len(g.unmeshedEmitted.Last()) != 0 {
+		t.Fatalf("skippable pods flagged: %v", g.unmeshedEmitted.Last())
 	}
 }
 
@@ -193,7 +192,7 @@ func TestUnmeshedAuditPodDirectiveOverridesNamespace(t *testing.T) {
 		metrics.UnmeshedPods.WithLabelValues("plain", "pod-enabled")); got != 1 {
 		t.Fatalf("pod-level enabled not flagged: %v", got)
 	}
-	if g.unmeshedEmitted["meshed/ns-enabled-pod-disabled"] {
+	if _, ok := g.unmeshedEmitted.Last()["meshed/ns-enabled-pod-disabled"]; ok {
 		t.Fatal("pod-level disabled flagged inside an enabled ns")
 	}
 }
@@ -210,8 +209,8 @@ func TestUnmeshedAuditSkipsNonRunning(t *testing.T) {
 	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if len(g.unmeshedEmitted) != 0 {
-		t.Fatalf("pending pod flagged: %v", g.unmeshedEmitted)
+	if len(g.unmeshedEmitted.Last()) != 0 {
+		t.Fatalf("pending pod flagged: %v", g.unmeshedEmitted.Last())
 	}
 }
 
@@ -384,8 +383,8 @@ func TestUnmeshedRemediationRequiresOwnerAndAge(t *testing.T) {
 			t.Fatalf("pod %s deleted — age/owner gate failed", n)
 		}
 	}
-	if len(g.unmeshedEmitted) != 3 {
-		t.Fatalf("fresh/orphan/bare-owner pods not flagged: %v", g.unmeshedEmitted)
+	if len(g.unmeshedEmitted.Last()) != 3 {
+		t.Fatalf("fresh/orphan/bare-owner pods not flagged: %v", g.unmeshedEmitted.Last())
 	}
 }
 
@@ -417,8 +416,8 @@ func TestUnmeshedRemediationSkipsTerminatingAndMirror(t *testing.T) {
 			t.Fatalf("pod %s deleted — terminating/mirror skip failed", n)
 		}
 	}
-	if len(g.unmeshedEmitted) != 2 {
-		t.Fatalf("terminating/mirror pods not flagged: %v", g.unmeshedEmitted)
+	if len(g.unmeshedEmitted.Last()) != 2 {
+		t.Fatalf("terminating/mirror pods not flagged: %v", g.unmeshedEmitted.Last())
 	}
 }
 
@@ -453,7 +452,7 @@ func TestUnmeshedAuditPaginatesPodList(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("pod list calls = %d, want 2 (continue followed)", calls)
 	}
-	if !g.unmeshedEmitted["meshed/web-a"] {
+	if _, ok := g.unmeshedEmitted.Last()["meshed/web-a"]; !ok {
 		t.Fatal("pod on the continued page was not audited")
 	}
 }
@@ -668,8 +667,7 @@ func TestUnmeshedRemediationAutopilotPlanDefers(t *testing.T) {
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"))
 	g := &webhookGuard{cs: cs, dyn: dyn, nowFn: time.Now,
-		unmeshedPodAuditor: unmeshedPodAuditor{
-			unmeshedEmitted: map[string]bool{}}}
+		unmeshedPodAuditor: unmeshedPodAuditor{}}
 	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}

@@ -31,6 +31,15 @@ type fluxHRRetriesCheck struct {
 	hrRetryHealed map[string]time.Time
 }
 
+// newFluxHRRetriesCheck builds the W10-CP4 check with a fresh
+// cooldown map — the state-map initialization that used to live in
+// the monolithic newClusterHealthProber literal.
+func newFluxHRRetriesCheck(d *deps) checkRunner {
+	return &fluxHRRetriesCheck{deps: d,
+		hrRetryHealed: map[string]time.Time{},
+	}
+}
+
 // ---------------------------------------------------------------------------
 // W10-CP4 — flux HelmRelease retries-exhausted remediator.
 // ---------------------------------------------------------------------------

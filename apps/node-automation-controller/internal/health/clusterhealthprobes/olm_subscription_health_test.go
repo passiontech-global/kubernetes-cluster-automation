@@ -50,7 +50,7 @@ func TestCheckOLMHealthAbsentCRDsQuiet(t *testing.T) {
 				olmSubGVR.GroupResource(), "")
 		})
 	p := testProberDyn(fake.NewSimpleClientset(), dyn)
-	if res := p.olm.run(ctx); !res.pass {
+	if res := mustCheck[*olmHealthCheck](t, p).run(ctx); !res.pass {
 		t.Fatalf("absent OLM CRDs must pass quietly: %+v", res)
 	}
 }
@@ -75,14 +75,14 @@ func TestCheckOLMHealthStuckCSVHeals(t *testing.T) {
 	p.now = func() time.Time { return base }
 
 	// First sighting — tracked, quiet.
-	if res := p.olm.run(ctx); !res.pass {
+	if res := mustCheck[*olmHealthCheck](t, p).run(ctx); !res.pass {
 		t.Fatalf("first-seen CSV must pass: %+v", res)
 	}
 
 	// 16m — gauge fires, still under the heal window.
 	at := base.Add(16 * time.Minute)
 	p.now = func() time.Time { return at }
-	if res := p.olm.run(ctx); res.pass {
+	if res := mustCheck[*olmHealthCheck](t, p).run(ctx); res.pass {
 		t.Fatal("CSV stuck >=15m must FAIL")
 	}
 	m := findMetric(t, "node_automation_olm_unhealthy_resources",
@@ -99,7 +99,7 @@ func TestCheckOLMHealthStuckCSVHeals(t *testing.T) {
 	// 21m — the operator is bounced.
 	at = base.Add(21 * time.Minute)
 	p.now = func() time.Time { return at }
-	if res := p.olm.run(ctx); res.pass {
+	if res := mustCheck[*olmHealthCheck](t, p).run(ctx); res.pass {
 		t.Fatal("still stuck — must keep FAILING")
 	}
 	if _, err := cs.CoreV1().Pods("olm").
@@ -127,10 +127,10 @@ func TestCheckOLMHealthUnhealthySubscription(t *testing.T) {
 		})
 	p := testProberDyn(cs, shOpDyn(sub))
 	p.now = func() time.Time { return base }
-	p.olm.olmFirstSeen["Subscription/operators/keda/"+olmReasonCatalogUnhealthy] =
+	mustCheck[*olmHealthCheck](t, p).olmFirstSeen["Subscription/operators/keda/"+olmReasonCatalogUnhealthy] =
 		base.Add(-time.Hour)
 
-	if res := p.olm.run(ctx); res.pass {
+	if res := mustCheck[*olmHealthCheck](t, p).run(ctx); res.pass {
 		t.Fatal("unhealthy subscription must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("olm").
@@ -158,10 +158,10 @@ func TestCheckOLMHealthCertRotationOverdue(t *testing.T) {
 		})
 	p := testProberDyn(cs, shOpDyn(csv))
 	p.now = func() time.Time { return base }
-	p.olm.olmFirstSeen["ClusterServiceVersion/operators/nhc.v1/"+olmReasonCertOverdue] =
+	mustCheck[*olmHealthCheck](t, p).olmFirstSeen["ClusterServiceVersion/operators/nhc.v1/"+olmReasonCertOverdue] =
 		base.Add(-25 * time.Minute)
 
-	if res := p.olm.run(ctx); res.pass {
+	if res := mustCheck[*olmHealthCheck](t, p).run(ctx); res.pass {
 		t.Fatal("overdue cert rotation past the heal window must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("olm").
@@ -175,10 +175,10 @@ func TestCheckOLMHealthHealthyPasses(t *testing.T) {
 	csv := olmUnstructured("operators.coreos.com/v1alpha1", "ClusterServiceVersion",
 		"operators", "nhc.v1", map[string]any{"phase": "Succeeded"})
 	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(csv))
-	if res := p.olm.run(ctx); !res.pass {
+	if res := mustCheck[*olmHealthCheck](t, p).run(ctx); !res.pass {
 		t.Fatalf("healthy OLM state must pass: %+v", res)
 	}
-	if len(p.olm.olmFirstSeen) != 0 {
-		t.Fatalf("healthy objects must not be tracked: %v", p.olm.olmFirstSeen)
+	if len(mustCheck[*olmHealthCheck](t, p).olmFirstSeen) != 0 {
+		t.Fatalf("healthy objects must not be tracked: %v", mustCheck[*olmHealthCheck](t, p).olmFirstSeen)
 	}
 }
