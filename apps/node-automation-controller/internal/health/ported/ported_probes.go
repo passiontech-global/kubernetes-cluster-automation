@@ -75,7 +75,7 @@ func (p *httpContentCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Why: fmt.Sprintf("GET %s: %v", p.Cfg.HTTPContent.URL, err)}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return probefw.Result{Why: fmt.Sprintf("GET %s: status %d, want 200",
 			p.Cfg.HTTPContent.URL, resp.StatusCode)}

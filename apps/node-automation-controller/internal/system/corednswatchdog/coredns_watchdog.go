@@ -327,7 +327,7 @@ func (w *coreDNSWatchdog) logHit(ctx context.Context, pod string) string {
 		log.Info("log: cannot stream pod logs — layer 1 inconclusive", "pod", pod, "error", err)
 		return ""
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	data, err := io.ReadAll(io.LimitReader(stream, corednsMaxLogBytes))
 	if err != nil {
 		log.Info("log: cannot read pod log stream — layer 1 inconclusive", "pod", pod, "error", err)
@@ -369,7 +369,7 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) (string, map[string]boo
 		return "", nil
 	}
 	sort.Slice(svcItems, func(i, j int) bool {
-		return svcItems[i].CreationTimestamp.Time.
+		return svcItems[i].CreationTimestamp.
 			After(svcItems[j].CreationTimestamp.Time)
 	})
 	type svcCand struct {
@@ -544,7 +544,7 @@ func (w *coreDNSWatchdog) panics(ctx context.Context, podIP string) (float64, bo
 		// guard). Bounded to the same 4MiB as the scan so a
 		// pathological body cannot pin the sweep either.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024*1024))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode != http.StatusOK {
 		return 0, false

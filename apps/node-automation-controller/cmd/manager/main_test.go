@@ -84,8 +84,8 @@ func runMainInSubprocess(t *testing.T, args []string, extraEnv ...string) (stdou
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
 	err := cmd.Run()
-	switch {
-	case err == nil:
+	switch err {
+	case nil:
 		code = 0
 	default:
 		var exitErr *exec.ExitError
@@ -162,21 +162,21 @@ func fakeDiscoveryAPIServer(t *testing.T) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"kind":"APIVersions","apiVersion":"v1","versions":["v1"]}`)
+		_, _ = fmt.Fprint(w, `{"kind":"APIVersions","apiVersion":"v1","versions":["v1"]}`)
 	})
 	mux.HandleFunc("GET /apis", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"kind":"APIGroupList","apiVersion":"v1","groups":[`+
+		_, _ = fmt.Fprint(w, `{"kind":"APIGroupList","apiVersion":"v1","groups":[`+
 			`{"name":"apps","versions":[{"groupVersion":"apps/v1","version":"v1"}],`+
 			`"preferredVersion":{"groupVersion":"apps/v1","version":"v1"}}]}`)
 	})
 	mux.HandleFunc("GET /api/v1", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, resourcesV1)
+		_, _ = fmt.Fprint(w, resourcesV1)
 	})
 	mux.HandleFunc("GET /apis/apps/v1", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"apps/v1","resources":[`+
+		_, _ = fmt.Fprint(w, `{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"apps/v1","resources":[`+
 			`{"name":"daemonsets","singularName":"","namespaced":true,"kind":"DaemonSet","verbs":["get","list","watch"]},`+
 			`{"name":"deployments","singularName":"","namespaced":true,"kind":"Deployment","verbs":["get","list","watch"]}]}`)
 	})
@@ -211,7 +211,7 @@ func fakeDiscoveryAPIServer(t *testing.T) *httptest.Server {
 			<-r.Context().Done()
 			return
 		}
-		fmt.Fprintf(w, `{"apiVersion":%q,"kind":%q,"metadata":{"resourceVersion":"1"},"items":[]}`,
+		_, _ = fmt.Fprintf(w, `{"apiVersion":%q,"kind":%q,"metadata":{"resourceVersion":"1"},"items":[]}`,
 			apiVersion, kind)
 	})
 	srv := httptest.NewServer(mux)

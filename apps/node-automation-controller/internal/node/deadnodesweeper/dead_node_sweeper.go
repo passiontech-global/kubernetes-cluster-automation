@@ -67,9 +67,8 @@ const (
 	// before path (b) is even considered — covers monitor-grace
 	// (40s), lease retry storms and short network partitions.
 	deadNodeUnknownAge = 30 * time.Minute
-	// deadNodeProbeTimeout: per-probe apiserver timeout, same as
-	// the kubelet reaper's.
-	deadNodeProbeTimeout = 8 * time.Second
+	// per-probe apiserver timeout (8s) lives in shared.KubeletHealthz —
+	// this module used to define it as "same as the kubelet reaper's".
 	// deadNodeCap: nodes tainted per cycle — wrong verdicts must
 	// never take more than one node at a time.
 	deadNodeCap = 1
@@ -335,16 +334,11 @@ func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string)
 	return false, nil
 }
 
-// probe GETs /api/v1/nodes/<node>/proxy/healthz through the apiserver
-// (the konnectivity tunnel path, same as the kubelet reaper): a body
-// starting with "ok" is healthy. 8s timeout, single attempt — the
-// 30m Unknown window already absorbed transient wobble.
+// probe is a single shared.KubeletHealthz attempt — a body starting
+// with "ok" is healthy. No retries: the 30m Unknown window already
+// absorbed transient wobble.
 func (s *deadNodeSweeper) probe(ctx context.Context, nodeName string) (bool, error) {
-	body, err := s.cs.CoreV1().RESTClient().Get().
-		Resource("nodes").Name(nodeName).SubResource("proxy").
-		Suffix("healthz").
-		Timeout(deadNodeProbeTimeout).
-		DoRaw(ctx)
+	body, err := shared.KubeletHealthz(ctx, s.cs, nodeName)
 	if err != nil {
 		return false, err
 	}

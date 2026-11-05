@@ -6,7 +6,10 @@
 // layout.
 package metrics
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+)
 
 // ---------------------------------------------------------------------------
 // Self-healing / gray-failure defense metrics (Quick-Wins + C1-C6).
@@ -175,3 +178,23 @@ var VeleroWedgedObjectsCleanedTotal = prometheus.NewCounterVec(prometheus.Counte
 	Name: "node_automation_velero_wedged_objects_cleaned_total",
 	Help: "Wedged velero PodVolumeBackups deleted and pods bounced, by namespace and action.",
 }, []string{"namespace", "action"})
+
+// init registers exactly the vectors declared in this file — the
+// per-domain init() split means adding an integration-domain metric
+// touches only this file, not a central registry list. Order
+// follows declaration order.
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		CiliumIdentitiesCollectedTotal,
+		HelmHookJobsCleanedTotal,
+		WebhookCABundleMismatch, TLSSecretDaysToExpiry,
+		WebhookCABundleDaysToExpiry, TrustBundleDaysToExpiry,
+		FluxSourceReconcilesTriggeredTotal, HelmStallUnwedgesTotal,
+		VeleroSchedulePaused, VeleroBackupEmptyOrErrored,
+		ReplicatedSecretDrift,
+		VeleroBSLUnavailable,
+		HelmSecretsPrunedTotal, DBBackupUnhealthy,
+		ExternalSecretStormSuppressed,
+		VeleroBackupStuck, VeleroPodVolumeBackupWedged,
+		VeleroWedgedObjectsCleanedTotal)
+}

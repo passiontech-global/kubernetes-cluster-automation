@@ -50,7 +50,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *clusterHealthProb
 // HealthCheck names and the literal "kuberhealthy" namespace label.
 func TestRunEmitsAllChecksPassing(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, "Prometheus Server is Healthy.")
+		_, _ = fmt.Fprint(w, "Prometheus Server is Healthy.")
 	}))
 	t.Cleanup(srv.Close)
 
@@ -108,12 +108,12 @@ func TestRunFailGrowsStaleness(t *testing.T) {
 // fine — check failures are the metric, not the run result.
 func TestRunInfraErrorMarksFail(t *testing.T) {
 	cs := fake.NewSimpleClientset()
-	cs.Fake.PrependReactor("list", "pods",
+	cs.PrependReactor("list", "pods",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("apiserver boom")
 		})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, "Prometheus Server is Healthy.")
+		_, _ = fmt.Fprint(w, "Prometheus Server is Healthy.")
 	}))
 	t.Cleanup(srv.Close)
 

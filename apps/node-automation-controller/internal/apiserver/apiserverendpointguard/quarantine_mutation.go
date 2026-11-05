@@ -4,6 +4,8 @@
 // the quarantine set, mirrored in memory by g.memQuarantine) and the
 // pure Endpoints/EndpointSlice mutation helpers run() applies to the
 // SSOT object's deep copy before Update.
+//
+//nolint:staticcheck // SA1019: the deprecated corev1 Endpoints object is deliberate here — it is the writable SSOT the guard manages on hosted planes where EndpointSlice mirroring does not apply.
 package apiserverendpointguard
 
 import (

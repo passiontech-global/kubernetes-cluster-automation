@@ -26,10 +26,6 @@ type prober struct {
 	checks []probefw.Check
 }
 
-func testProber(cs *fake.Clientset) *prober {
-	return testProberDyn(cs, probetest.OpDyn())
-}
-
 func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *prober {
 	d := probetest.NewDeps(cs, dyn)
 	return &prober{

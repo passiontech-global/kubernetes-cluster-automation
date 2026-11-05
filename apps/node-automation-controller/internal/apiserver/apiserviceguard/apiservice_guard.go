@@ -179,8 +179,6 @@ func (g *apiServiceGuard) sweepOrphans(ctx context.Context, svcs *unstructured.U
 	for _, ns := range nss {
 		namespaces[ns.Name] = true
 	}
-	nss = nil
-
 	if svcsErr != nil {
 		return fmt.Errorf("list apiservices — abort orphan pass: %w", svcsErr)
 	}

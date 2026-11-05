@@ -8,7 +8,10 @@
 // metrics.go layout.
 package metrics
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+)
 
 // ---------------------------------------------------------------------------
 // Self-healing / gray-failure defense metrics (Quick-Wins + C1-C6).
@@ -103,3 +106,18 @@ var CFTunnelWedgePodsDeletedTotal = prometheus.NewCounterVec(prometheus.CounterO
 	Name: "node_automation_cftunnel_wedge_pods_deleted_total",
 	Help: "Wedged cloudflared connector pods deleted, by namespace and reason.",
 }, []string{"namespace", "reason"})
+
+// init registers exactly the vectors declared in this file — the
+// per-domain init() split means adding an operations-domain metric
+// touches only this file, not a central registry list. Order
+// follows declaration order.
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		PDBDrainBlocked, StuckTerminatingResources,
+		VolumeAttachmentsCleanedTotal,
+		ZombieSidecarPodsReapedTotal, OrphanEndpointSlicesCleanedTotal,
+		StatefulSetOnDeletePodsRolledTotal,
+		CronJobTooManyMissedStarts,
+		VolumeAttachmentFinalizersRemovedTotal,
+		CFTunnelWedgePodsDeletedTotal)
+}

@@ -16,7 +16,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
@@ -97,7 +96,7 @@ func upPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 }
 
 func upGuard(cs *fake.Clientset) *webhookGuard {
-	return &webhookGuard{cs: cs, now: time.Now,
+	return &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient(), now: time.Now,
 		unmeshedPodAuditor: unmeshedPodAuditor{}}
 }
 
@@ -589,12 +588,22 @@ func TestUnmeshedRemediationPDBRefusalDefers(t *testing.T) {
 	}
 }
 
-// A cordoned node means a drain is in flight — the maintenance mutex
-// defers the whole remediation even though the injector is healthy.
+// An ACTIVELY cordoned node means a drain is in flight — the
+// maintenance mutex defers the whole remediation even though the
+// injector is healthy. The fixture carries a fresh unschedulable
+// taint: the canonical NodeActivelyCordoned check wants the cordon
+// provably inside the 45m window, not just spec.unschedulable.
 func TestUnmeshedRemediationMaintenanceDefers(t *testing.T) {
+	fresh := metav1.NewTime(time.Now())
 	cordoned := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "w1"},
-		Spec:       corev1.NodeSpec{Unschedulable: true},
+		Spec: corev1.NodeSpec{
+			Unschedulable: true,
+			Taints: []corev1.Taint{{
+				Key:       shared.UnschedulableTaintKey,
+				TimeAdded: &fresh,
+			}},
+		},
 	}
 	cs := fake.NewSimpleClientset(cordoned,
 		upNamespace("kube-system", ""),
@@ -623,8 +632,42 @@ func TestUnmeshedRemediationMaintenanceDefers(t *testing.T) {
 	}
 }
 
-// The kured reboot lock is the second clientset-only mutex signal —
-// honored on the nil-dyn path (unit-test construction).
+// A STATICALLY cordoned node — unschedulable held past the 45m
+// cordon window — is deliberate state, not maintenance: the
+// canonical NodeActivelyCordoned check does not hold the mutex for
+// it, so remediation still evicts. (The removed nil-dyn degraded
+// copy checked spec.unschedulable alone and would have deferred
+// forever — this is the regression test for that drift.)
+func TestUnmeshedRemediationStaticCordonDoesNotDefer(t *testing.T) {
+	stale := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+	cordoned := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "w1"},
+		Spec: corev1.NodeSpec{
+			Unschedulable: true,
+			Taints: []corev1.Taint{{
+				Key:       shared.UnschedulableTaintKey,
+				TimeAdded: &stale,
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(cordoned,
+		upNamespace("kube-system", ""),
+		upNamespace("meshed", "enabled"),
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		upPod("meshed", "web-a"))
+	emulateEviction(cs)
+	g := upGuard(cs)
+	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	if upPodExists(t, cs, "meshed", "web-a") {
+		t.Fatal("static cordon held the mutex — remediation must not defer")
+	}
+}
+
+// The kured reboot lock is the second mutex signal — honored like
+// every other caller of the shared check.
 func TestUnmeshedRemediationKuredLockDefers(t *testing.T) {
 	kured := &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -657,9 +700,7 @@ func TestUnmeshedRemediationAutopilotPlanDefers(t *testing.T) {
 		"metadata":   map[string]any{"name": "upgrade-1"},
 	}}
 	_ = unstructured.SetNestedField(plan.Object, "Running", "status", "state")
-	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		shared.AutopilotPlanGVR: "PlanList",
-	}, plan)
+	dyn := testutil.NewDynamicClient(plan)
 	cs := fake.NewSimpleClientset(
 		upNamespace("kube-system", ""),
 		upNamespace("meshed", "enabled"),

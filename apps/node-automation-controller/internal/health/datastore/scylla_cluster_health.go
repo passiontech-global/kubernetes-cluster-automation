@@ -154,7 +154,7 @@ func (p *scyllaHealthCheck) scyllaGossipLogHit(ctx context.Context, pod *corev1.
 	if err != nil {
 		return false, err
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	data, err := io.ReadAll(io.LimitReader(stream, scyllaGossipLogMaxBytes))
 	if err != nil {
 		return false, err

@@ -7,13 +7,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
@@ -21,14 +21,10 @@ import (
 )
 
 // stormGateDynFake returns a dynamic fake that knows the PlanList
-// kind for the maintenance-mutex autopilot check.
+// kind for the maintenance-mutex autopilot check (the autopilot Plan
+// CRD is in testutil.NewDynamicClient's baked-in table).
 func stormGateDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{
-			autopilotPlanGVR: "PlanList",
-		},
-		objs...)
+	return testutil.NewDynamicClient(objs...)
 }
 
 // autopilotPlan builds a Plan CR in `state` — "" renders no status at
@@ -409,7 +405,7 @@ func TestStormGateScalesDownOnKuredLock(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		deschedulerDeploy(1, nil),
-		kuredDaemonSet(map[string]string{kuredLockAnno: "w1"}))
+		kuredDaemonSet(map[string]string{shared.KuredLockAnno: "w1"}))
 	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)

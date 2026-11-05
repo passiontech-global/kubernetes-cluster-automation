@@ -41,8 +41,8 @@ const (
 	kubeletReaperTaint    = "node.ops/kubelet-unresponsive"
 	kubeletReaperProbes   = 4                // all probes fail -> really down
 	kubeletReaperProbeGap = 10 * time.Second // between probes
-	kubeletReaperProbeTO  = 8 * time.Second  // per-probe apiserver timeout
-	kubeletReaperHBStaleS = 120              // Ready heartbeat older -> dead kubelet
+	// per-probe apiserver timeout (8s) lives in shared.KubeletHealthz
+	kubeletReaperHBStaleS = 120 // Ready heartbeat older -> dead kubelet
 )
 
 type kubeletReaper struct {
@@ -136,8 +136,10 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	return nil
 }
 
-// probe GETs /api/v1/nodes/<node>/proxy/healthz through the apiserver
-// up to 4 times (10s apart, 8s each) — a body starting with "ok" wins.
+// probe asks shared.KubeletHealthz up to 4 times (10s apart, 8s per
+// attempt) — a body starting with "ok" wins. The REST-path details
+// live in the helper; the retry loop and the taint decision it feeds
+// are this module's policy.
 func (r *kubeletReaper) probe(ctx context.Context, node string) bool {
 	// One timer reused across the inter-probe gaps — a fresh
 	// time.After per attempt leaves each channel allocated until GC.
@@ -158,10 +160,7 @@ func (r *kubeletReaper) probe(ctx context.Context, node string) bool {
 			case <-gap.C:
 			}
 		}
-		body, err := r.cs.CoreV1().RESTClient().Get().
-			AbsPath("/api/v1/nodes", node, "proxy", "healthz").
-			Timeout(kubeletReaperProbeTO).
-			DoRaw(ctx)
+		body, err := shared.KubeletHealthz(ctx, r.cs, node)
 		if err == nil && strings.HasPrefix(strings.TrimSpace(string(body)), "ok") {
 			return true
 		}

@@ -1,0 +1,203 @@
+// gateway_targets.go — the gateway-API stuck signatures and
+// ownership filters of the operator-workqueue-watchdog check (W5.8):
+// the parent/listener/Accepted-condition staleness predicates for
+// the GatewayClass, Gateway and route kinds (their status has no
+// top-level observedGeneration), the cached GatewayClass →
+// controllerName resolution, and the ciliumOwns* filters that keep
+// gateway-API resources shared by several controllers attributed to
+// the right operator. Split out of operator_watchdog_targets.go —
+// see that file for the watched-operator table.
+package watchdogs
+
+import (
+	"context"
+	"time"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+)
+
+// gatewayStatusStuck is the cilium-operator signature on the
+// gateway-API route resources its gateway controller reconciles: an
+// object reporting no status.parents (the controller attaches a
+// parent status when it programs the route), or one whose parents'
+// conditions still report only older observedGenerations — the
+// controller attached once but never saw the last spec write.
+func gatewayStatusStuck(o *unstructured.Unstructured) bool {
+	parents, found := shared.NestedSlice(o.Object, "status", "parents")
+	if !found || len(parents) == 0 {
+		return true
+	}
+	var maxOG int64
+	for _, pr := range parents {
+		m, ok := pr.(map[string]any)
+		if !ok {
+			continue
+		}
+		if og := condMaxObservedGeneration(
+			shared.Conditions(m, "conditions")); og > maxOG {
+			maxOG = og
+		}
+	}
+	return maxOG < o.GetGeneration()
+}
+
+// gatewayObjectStuck is the same signature for the Gateway kind
+// itself: Gateways carry status.listeners, not status.parents — the
+// route predicate would flag every healthy Gateway forever. A
+// programmed Gateway reports one status.listeners entry per
+// spec.listeners entry; a spec with listeners but an empty/absent
+// status.listeners means the controller never programmed it.
+// Generation lag is judged from the conditions' observedGeneration
+// (top-level status.conditions plus per-listener conditions) —
+// Gateway status has no top-level observedGeneration field.
+func gatewayObjectStuck(o *unstructured.Unstructured) bool {
+	spec, found := shared.NestedSlice(o.Object, "spec", "listeners")
+	if !found || len(spec) == 0 {
+		return false
+	}
+	status, found := shared.NestedSlice(o.Object, "status", "listeners")
+	if !found || len(status) == 0 {
+		return true
+	}
+	var maxOG int64
+	maxOG = condMaxObservedGeneration(
+		shared.Conditions(o.Object, "status", "conditions"))
+	for _, l := range status {
+		m, ok := l.(map[string]any)
+		if !ok {
+			continue
+		}
+		if og := condMaxObservedGeneration(
+			shared.Conditions(m, "conditions")); og > maxOG {
+			maxOG = og
+		}
+	}
+	return maxOG < o.GetGeneration()
+}
+
+// gatewayClassStuck is the signature for the GatewayClass kind
+// itself: the class carries no top-level status.observedGeneration —
+// the serving controller reports the last reconciled generation only
+// inside status.conditions[type=Accepted].observedGeneration. No
+// conditions, or none of them an Accepted entry, means the class was
+// never picked up; an Accepted observedGeneration lagging
+// metadata.generation means the last spec write was never seen. The
+// Accepted status value (True/False) is irrelevant — a fresh
+// rejection still proves the controller read the object.
+func gatewayClassStuck(o *unstructured.Unstructured) bool {
+	conds := shared.Conditions(o.Object, "status", "conditions")
+	if len(conds) == 0 {
+		return true
+	}
+	c, ok := shared.FindCondition(conds, "Accepted")
+	if !ok {
+		return true
+	}
+	return c.ObservedGeneration < o.GetGeneration()
+}
+
+// gatewayClassController resolves a GatewayClass name to its
+// spec.controllerName, caching the class set for a minute so a
+// stuck-object sweep doesn't LIST per object. ok=false means the
+// class set is unavailable or the class is unknown — callers treat
+// that as "cannot disprove ownership" and keep the object.
+func (p *operatorWorkqueueCheck) gatewayClassController(ctx context.Context, class string) (string, bool) {
+	cached, at := p.gwClassCtlr, p.gwClassAt
+	if cached == nil || p.Now().Sub(at) > time.Minute {
+		list, err := p.Dyn.Resource(shared.GVRGatewayClass).
+			List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return "", false
+		}
+		m := map[string]string{}
+		for i := range list.Items {
+			ctlr, _ := shared.NestedString(
+				list.Items[i].Object, "spec", "controllerName")
+			m[list.Items[i].GetName()] = ctlr
+		}
+		p.gwClassCtlr, p.gwClassAt = m, p.Now()
+		cached = m
+	}
+	ctlr, ok := cached[class]
+	return ctlr, ok
+}
+
+// ciliumOwnsGatewayObject is the ownership filter for the Gateways
+// resource: only a Gateway whose class is served by cilium's gateway
+// controller belongs in cilium-operator's stuck set. Unresolvable
+// class data keeps the object — a Gateway whose class cannot be
+// attributed is still worth flagging under the cluster's gateway-API
+// watcher.
+func ciliumOwnsGatewayObject(ctx context.Context, p *operatorWorkqueueCheck,
+	o *unstructured.Unstructured) bool {
+	class, _ := shared.NestedString(o.Object, "spec", "gatewayClassName")
+	ctlr, ok := p.gatewayClassController(ctx, class)
+	if !ok {
+		return true
+	}
+	return ctlr == ciliumGatewayController
+}
+
+// ciliumOwnsGatewayClass attributes a GatewayClass to cilium
+// directly — spec.controllerName sits on the object itself, so no
+// lookup is needed. An absent controllerName keeps the object (a
+// malformed class cannot disprove ownership, same rule as the other
+// gateway-API filters); a PROVEN foreign controller drops it.
+func ciliumOwnsGatewayClass(_ context.Context, _ *operatorWorkqueueCheck,
+	o *unstructured.Unstructured) bool {
+	ctlr, _ := shared.NestedString(o.Object, "spec", "controllerName")
+	return ctlr == "" || ctlr == ciliumGatewayController
+}
+
+// ciliumOwnsRouteParent is the same filter for the route kinds: it
+// resolves each spec.parentRefs[] entry to its Gateway and reports
+// whether any parent's class is cilium's. Objects with no Gateway
+// parents, or parents that fail to resolve, stay in the stuck set —
+// an unattributable route is still a gateway-API-plane problem —
+// while a route provably owned by another gateway controller is
+// that controller's problem, not cilium-operator's.
+func ciliumOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
+	o *unstructured.Unstructured) bool {
+	refs, found := shared.NestedSlice(o.Object, "spec", "parentRefs")
+	if !found || len(refs) == 0 {
+		return true
+	}
+	resolved := false
+	for _, ref := range refs {
+		m, ok := ref.(map[string]any)
+		if !ok {
+			continue
+		}
+		if k, _ := shared.NestedString(m, "kind"); k != "" && k != "Gateway" {
+			continue
+		}
+		if g, _ := shared.NestedString(m, "group"); g != "" && g != "gateway.networking.k8s.io" {
+			continue
+		}
+		name, _ := shared.NestedString(m, "name")
+		if name == "" {
+			continue
+		}
+		ns, _ := shared.NestedString(m, "namespace")
+		if ns == "" {
+			ns = o.GetNamespace()
+		}
+		gw, err := p.Dyn.Resource(shared.GVRGateway).Namespace(ns).
+			Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			continue
+		}
+		class, _ := shared.NestedString(gw.Object, "spec", "gatewayClassName")
+		ctlr, ok := p.gatewayClassController(ctx, class)
+		if !ok {
+			continue
+		}
+		resolved = true
+		if ctlr == ciliumGatewayController {
+			return true
+		}
+	}
+	return !resolved
+}

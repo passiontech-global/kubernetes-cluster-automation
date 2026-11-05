@@ -21,6 +21,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -119,14 +120,10 @@ func cjLocalUsers() *corev1.Secret {
 var cjPodsGVR = schema.GroupVersionResource{Version: "v1", Resource: "pods"}
 
 // cjPlanDynFake returns a dynamic fake that knows the PlanList kind
-// for the maintenance-mutex autopilot check.
+// for the maintenance-mutex autopilot check (the autopilot Plan CRD
+// is in testutil.NewDynamicClient's baked-in table).
 func cjPlanDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{
-			cjAutopilotPlanGVR: "PlanList",
-		},
-		objs...)
+	return testutil.NewDynamicClient(objs...)
 }
 
 // cjAutopilotPlan builds a Plan CR in `state`.
@@ -220,7 +217,7 @@ func TestConcourseJanitorMaintenanceMutexDefers(t *testing.T) {
 		}()}, nil},
 		{"kured lock", []runtime.Object{&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "kube-system", Name: "kured",
-			Annotations: map[string]string{cjKuredLockAnno: "w1"}}}}, nil},
+			Annotations: map[string]string{shared.KuredLockAnno: "w1"}}}}, nil},
 		{"active plan", nil,
 			[]runtime.Object{cjAutopilotPlan("autopilot", "InProgress")}},
 	} {
@@ -775,8 +772,8 @@ func (r *atcRecorder) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r.requests = append(r.requests,
 			fmt.Sprintf("%s %s auth=%q", req.Method, req.URL.Path, req.Header.Get("Authorization")))
-		switch {
-		case req.URL.Path == "/sky/issuer/token":
+		switch req.URL.Path {
+		case "/sky/issuer/token":
 			_ = req.ParseForm()
 			r.tokenForm = map[string]string{}
 			for k := range req.PostForm {
@@ -784,7 +781,7 @@ func (r *atcRecorder) handler() http.Handler {
 			}
 			w.WriteHeader(r.tokenCode)
 			_, _ = w.Write([]byte(r.tokenBody))
-		case req.URL.Path == "/api/v1/workers":
+		case "/api/v1/workers":
 			_, _ = w.Write([]byte(r.workers))
 		default:
 			code := r.putCode

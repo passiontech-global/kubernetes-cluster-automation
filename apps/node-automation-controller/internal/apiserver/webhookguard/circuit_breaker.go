@@ -451,7 +451,7 @@ func (b *circuitBreaker) bounceHungWebhookPods(ctx context.Context,
 		if seen[key] {
 			return
 		}
-		if !(ready.effective[key] > 0 && ready.probed[key] && !ready.responsive[key]) {
+		if ready.effective[key] <= 0 || !ready.probed[key] || ready.responsive[key] {
 			return // not brownout-hung — healthy, partitioned or unprobed
 		}
 		if b.bounceAt.CooledDown(key, webhookBounceCooldown, now) {

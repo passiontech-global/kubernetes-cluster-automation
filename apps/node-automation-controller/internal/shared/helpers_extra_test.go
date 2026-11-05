@@ -328,7 +328,9 @@ func TestPeriodicErrorIncrementsErrorMetric(t *testing.T) {
 		t.Fatal("loop did not continue after a failed run")
 	}
 	cancel()
-	<-done
+	if err := <-done; err != nil {
+		t.Fatalf("periodic start: %v", err)
+	}
 
 	if got := reconcileErrorCount(t, "test-periodic-err"); got != before+1 {
 		t.Fatalf("error counter = %v, want %v", got, before+1)

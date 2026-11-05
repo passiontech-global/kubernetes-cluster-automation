@@ -391,7 +391,7 @@ func (w *cfTunnelProxyWatchdog) podLogWedged(ctx context.Context,
 	if err != nil {
 		return false, err
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	data, err := io.ReadAll(io.LimitReader(stream, cfTunnelLogMaxBytes))
 	if err != nil {
 		return false, err

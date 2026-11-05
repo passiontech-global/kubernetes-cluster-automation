@@ -7,10 +7,13 @@
 // unchanged. reconcileErrors is the new native counterpart.
 //
 // The package is split by emitting domain: core.go (this file) holds
-// the run-error counters, init(), PredeclareQueue and IncError;
+// the run-error counters, PredeclareQueue and IncError;
 // apiserver.go / health.go / integration.go / operations.go hold the
-// per-domain vectors. Registration order and label values are
-// unchanged from the original single-file layout.
+// per-domain vectors AND register them — each file's init() calls
+// MustRegister on exactly the vectors it declares, so adding a
+// metric touches only the file that owns it. Metric names, help
+// strings and label sets are unchanged from the original single-file
+// layout.
 package metrics
 
 import (
@@ -36,39 +39,13 @@ var reconcileErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 // module's 0-valued series before the first scrape, matching the
 // eager emission shell-operator had.
 
+// init registers ONLY the two run-error counters this file owns.
+// Every other vector lives in — and is registered by — its own
+// domain file's init() (apiserver.go / health.go / integration.go /
+// operations.go), so this list no longer has to be edited when a
+// domain adds a series.
 func init() {
-	ctrlmetrics.Registry.MustRegister(hookRunErrors, reconcileErrors,
-		apiBackendRVGap, apiBackendQuarantined,
-		healthCheckStatus, healthCheckSecondsSinceSuccess,
-		CiliumIdentitiesCollectedTotal,
-		WebhookCircuitBroken, WebhookCircuitBreakerTripsTotal,
-		PDBDrainBlocked, StuckTerminatingResources,
-		HelmHookJobsCleanedTotal, VolumeAttachmentsCleanedTotal,
-		WebhookCABundleMismatch, TLSSecretDaysToExpiry,
-		KCMWorkqueueFrozen,
-		APIServiceUnavailable, WebhookCABundleDaysToExpiry,
-		TrustBundleDaysToExpiry, UnmeshedPods,
-		UnmeshedPodsRecreatedTotal, ZombieSidecarPodsReapedTotal,
-		OrphanEndpointSlicesCleanedTotal,
-		FluxSourceReconcilesTriggeredTotal, HelmStallUnwedgesTotal,
-		StatefulSetOnDeletePodsRolledTotal, VeleroSchedulePaused,
-		VeleroBackupEmptyOrErrored,
-		OperatorWorkqueueFrozen, OperatorWorkqueueHealsTotal,
-		CronJobTooManyMissedStarts, StatefulServiceZeroEndpoints,
-		RabbitMQSuspendedHealsTotal,
-		DragonflyMasterlessPodHealsTotal, LocalPVStrandedPods,
-		LocalPVEphemeralHealsTotal, PVCProvisioningStalled,
-		PVCProvisionerHealsTotal, OLMUnhealthyResources,
-		OLMOperatorHealsTotal, ReplicatedSecretDrift,
-		SchedulerFrozen, VeleroBSLUnavailable,
-		ControlPlanePodHealsTotal, NodeHangCordonsTotal,
-		NodeHangUncordonsTotal,
-		VolumeAttachmentFinalizersRemovedTotal,
-		LinkerdEndpointDesync, ScyllaClusterUnhealthy,
-		HelmSecretsPrunedTotal, DBBackupUnhealthy,
-		ExternalSecretStormSuppressed, CFTunnelWedgePodsDeletedTotal,
-		VeleroBackupStuck, VeleroPodVolumeBackupWedged,
-		VeleroWedgedObjectsCleanedTotal, APIServiceUnblockHealsTotal)
+	ctrlmetrics.Registry.MustRegister(hookRunErrors, reconcileErrors)
 }
 
 // PredeclareQueue instantiates both error counters for module `name`

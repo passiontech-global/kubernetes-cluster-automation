@@ -7,6 +7,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -40,7 +42,7 @@ func TestWebhookGuardRemovesOrphan(t *testing.T) {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "alive"}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "alive", Name: "svc"}},
 		mwc)
-	g := &webhookGuard{cs: cs}
+	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +58,7 @@ func TestWebhookGuardRemovesOrphan(t *testing.T) {
 
 func TestWebhookGuardAbortsWithoutNamespaceSnapshot(t *testing.T) {
 	cs := fake.NewSimpleClientset() // no kube-system -> API flap guard
-	g := &webhookGuard{cs: cs}
+	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
 	if err := g.run(ctx); err == nil {
 		t.Fatal("expected abort when kube-system is missing from the list")
 	}

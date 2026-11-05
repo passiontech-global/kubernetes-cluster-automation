@@ -105,7 +105,7 @@ func ProbeHealthzHandler(status int, body string) http.HandlerFunc {
 			return
 		}
 		w.WriteHeader(status)
-		fmt.Fprint(w, body)
+		_, _ = fmt.Fprint(w, body)
 	}
 }
 

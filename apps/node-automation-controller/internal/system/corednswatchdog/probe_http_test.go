@@ -174,7 +174,7 @@ func TestCoreDNSLogHit(t *testing.T) {
 	// verbatim for the operator log.
 	t.Run("signature line returned", func(t *testing.T) {
 		cs := fake.NewSimpleClientset()
-		cs.Fake.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 			"INFO booted\nFailed to watch *v1.Endpoints: failed to list: Unauthorized\n",
 			nil))
 		w := &coreDNSWatchdog{cs: cs}
@@ -185,7 +185,7 @@ func TestCoreDNSLogHit(t *testing.T) {
 
 	t.Run("clean logs return empty", func(t *testing.T) {
 		cs := fake.NewSimpleClientset()
-		cs.Fake.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 			"INFO booted\nINFO plugin ready\n", nil))
 		w := &coreDNSWatchdog{cs: cs}
 		if hit := w.logHit(ctx, "coredns-abc"); hit != "" {
@@ -196,7 +196,7 @@ func TestCoreDNSLogHit(t *testing.T) {
 	// Unreadable logs (API flap) are inconclusive, never a false stale.
 	t.Run("log fetch error returns empty", func(t *testing.T) {
 		cs := fake.NewSimpleClientset()
-		cs.Fake.PrependReactor("get", "pods",
+		cs.PrependReactor("get", "pods",
 			testutil.ProbeLogReactor("", errors.New("api down")))
 		w := &coreDNSWatchdog{cs: cs}
 		if hit := w.logHit(ctx, "coredns-abc"); hit != "" {
@@ -226,7 +226,7 @@ func TestCoreDNSDNSProbeCancelled(t *testing.T) {
 
 func TestCoreDNSProbeFQDNListError(t *testing.T) {
 	cs := fake.NewSimpleClientset()
-	cs.Fake.PrependReactor("list", "services",
+	cs.PrependReactor("list", "services",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})

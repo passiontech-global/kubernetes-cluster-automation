@@ -368,7 +368,7 @@ func PromTestServer(t *testing.T, respond func(query string) []PromTestSample) (
 		}
 		lastQuery = r.URL.Query().Get("query")
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, promTestBody(respond(lastQuery)))
+		_, _ = fmt.Fprint(w, promTestBody(respond(lastQuery)))
 	}))
 	t.Cleanup(srv.Close)
 	return srv, &lastQuery
