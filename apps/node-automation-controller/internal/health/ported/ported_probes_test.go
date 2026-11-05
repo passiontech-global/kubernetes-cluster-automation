@@ -61,7 +61,7 @@ func TestProbeDNS(t *testing.T) {
 
 func TestProbeHTTPContent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, "Prometheus Server is Healthy.")
+		_, _ = fmt.Fprint(w, "Prometheus Server is Healthy.")
 	}))
 	t.Cleanup(srv.Close)
 

@@ -63,7 +63,7 @@ func (c *atcClient) login(ctx context.Context, user, pass string) error {
 		// reused; bounded so a misbehaving endpoint cannot stall the
 		// return (same 64KiB cap as doJSON).
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("atc token: status %s", resp.Status)
@@ -134,7 +134,7 @@ func (c *atcClient) doJSON(ctx context.Context, method, endpoint string, out any
 		// bounded like login's drain so a misbehaving endpoint
 		// cannot stall the return.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("atc %s %s: status %s", method, endpoint, resp.Status)

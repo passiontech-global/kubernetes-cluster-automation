@@ -37,7 +37,7 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 			default:
 			}
 			w.WriteHeader(200)
-			fmt.Fprint(w, "error trying to reach service")
+			_, _ = fmt.Fprint(w, "error trying to reach service")
 		})
 		r := &kubeletReaper{cs: cs}
 		pctx, cancel := context.WithCancel(ctx)
@@ -74,7 +74,7 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 		cs := testutil.ProbeClientset(t, func(w http.ResponseWriter, r *http.Request) {
 			attempts.Add(1)
 			w.WriteHeader(200)
-			fmt.Fprint(w, "error trying to reach service")
+			_, _ = fmt.Fprint(w, "error trying to reach service")
 		})
 		r := &kubeletReaper{cs: cs}
 		done := make(chan bool, 1)
@@ -99,10 +99,10 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 		cs := testutil.ProbeClientset(t, func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 			if attempts.Add(1) >= 2 {
-				fmt.Fprint(w, "ok")
+				_, _ = fmt.Fprint(w, "ok")
 				return
 			}
-			fmt.Fprint(w, "error trying to reach service")
+			_, _ = fmt.Fprint(w, "error trying to reach service")
 		})
 		r := &kubeletReaper{cs: cs}
 		done := make(chan bool, 1)

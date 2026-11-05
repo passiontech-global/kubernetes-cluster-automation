@@ -335,7 +335,7 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	// Endpoints is fetched only when it can actually be the SSOT — on a
 	// >=1.33 self-managed cluster (non-mirrored slice) the deprecated
 	// object is never touched at all.
-	var ep *corev1.Endpoints
+	var ep *corev1.Endpoints //nolint:staticcheck // SA1019: deliberate — the deprecated Endpoints object is the writable SSOT on hosted planes
 	if primary == nil || mirrorManagedSlice(primary) || !preferSlice {
 		e, err := g.cs.CoreV1().Endpoints(endpointGuardNS).
 			Get(ctx, endpointGuardName, metav1.GetOptions{})

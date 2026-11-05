@@ -33,8 +33,10 @@
 //	   status.state is neither Schedulable nor Completed — a k0s
 //	   cluster upgrade is in flight.
 //
-// concourse-workdir-janitor shares the same three signals (it defers
-// its worker wipe cycle entirely) — keep the checks in sync.
+// concourse-workdir-janitor defers on the same three signals — all
+// of them now live in internal/shared (MaintenanceActive plus the
+// per-signal *Evidence helpers), the single canonical implementation
+// every deferring module runs.
 package deschedulerstormgate
 
 import (
@@ -49,9 +51,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -70,19 +70,7 @@ import (
 const (
 	stormGateHoldAnno     = "passiontech.dev/storm-gate-hold"
 	stormGateDecisionAnno = "passiontech.dev/storm-gate-decision"
-
-	// kuredLockAnno is the reboot-coordination lock kured holds
-	// while a node drains for its reboot window (2.7 signal b).
-	kuredLockAnno = "weave.works/kured-node-lock"
-	// kuredDaemonSet is where the lock annotation lives.
-	kuredDaemonSetNS   = "kube-system"
-	kuredDaemonSetName = "kured"
 )
-
-// autopilotPlanGVR is the k0s autopilot Plan resource — a Plan in a
-// non-terminal state means a cluster upgrade is in flight (2.7
-// signal c).
-var autopilotPlanGVR = shared.AutopilotPlanGVR
 
 // stormConds mirrors STORM_CONDS (see package comment for sources).
 // NebulaIsolated/NebulaDegraded/NebulaPMTUBlackhole are the
@@ -300,61 +288,27 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 
 // ---------------------------------------------------------------------------
 // 2.7 — Cluster Maintenance Mutex (signals b + c; signal a is the
-// spec.unschedulable scan inside Reconcile). Keep in sync with the
-// copy inside concourse-workdir-janitor.
+// NodeActivelyCordoned scan inside Reconcile).
 // ---------------------------------------------------------------------------
 
 // maintenanceEvidence returns the human-readable evidence strings for
 // maintenance-mutex signals (b) kured lock and (c) active autopilot
-// Plan — an empty slice means "no maintenance in flight". A missing
-// kured DaemonSet or an absent autopilot CRD is not evidence; real
-// API failures are errors — a "clear" verdict must never be computed
-// on blind data.
+// Plan — an empty slice means "no maintenance in flight". The checks
+// themselves are the shared mutex helpers (one implementation for
+// every deferring module): a missing kured DaemonSet or an absent
+// autopilot CRD is not evidence; real API failures — including a nil
+// dynamic client — are errors, so a "clear" verdict is never
+// computed on blind data.
 func (r *deschedulerStormGate) maintenanceEvidence(ctx context.Context) ([]string, error) {
-	var ev []string
-
-	// (b) kured holding its node-lock annotation means a reboot
-	// drain is in progress right now.
-	ds, err := r.cs.AppsV1().DaemonSets(kuredDaemonSetNS).
-		Get(ctx, kuredDaemonSetName, metav1.GetOptions{})
-	switch {
-	case apierrors.IsNotFound(err):
-		// kured not installed on this cluster — no signal.
-	case err != nil:
-		return nil, fmt.Errorf("get daemonset %s/%s (maintenance mutex): %w",
-			kuredDaemonSetNS, kuredDaemonSetName, err)
-	default:
-		if v := ds.Annotations[kuredLockAnno]; v != "" {
-			ev = append(ev, "kured-lock="+v)
-		}
+	kured, err := shared.KuredLockEvidence(ctx, r.cs)
+	if err != nil {
+		return nil, err
 	}
-
-	// (c) Any autopilot Plan outside its terminal states means a
-	// k0s upgrade is in flight. An absent CRD is not evidence —
-	// clusters without autopilot skip quietly. A missing dynamic
-	// client is a wiring bug, not "no signal" — unverifiable fails
-	// closed like every other check in this function.
-	if r.dyn == nil {
-		return nil, fmt.Errorf("no dynamic client — autopilot plan check unverifiable (maintenance mutex)")
+	plans, err := shared.AutopilotPlanEvidence(ctx, r.dyn)
+	if err != nil {
+		return nil, err
 	}
-	plans, err := r.dyn.Resource(autopilotPlanGVR).
-		List(ctx, metav1.ListOptions{})
-	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		// autopilot CRD not installed — no signal.
-	case err != nil:
-		return nil, fmt.Errorf("list autopilot plans (maintenance mutex): %w", err)
-	default:
-		for i := range plans.Items {
-			state, _, _ := unstructured.NestedString(
-				plans.Items[i].Object, "status", "state")
-			if state != "Schedulable" && state != "Completed" {
-				ev = append(ev, fmt.Sprintf("plan=%s state=%s",
-					plans.Items[i].GetName(), state))
-			}
-		}
-	}
-	return ev, nil
+	return append(kured, plans...), nil
 }
 
 // condStatusMap is the jqFilter projection: condition type -> status,

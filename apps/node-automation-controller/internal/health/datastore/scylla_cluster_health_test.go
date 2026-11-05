@@ -62,9 +62,11 @@ func TestCheckScyllaHealthMemberDesync(t *testing.T) {
 		"bino-scylla-bino-dc-rack-1-0", pod.Name)
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod, svc)
 	// EndpointSlice exists but carries a stale address.
-	cs.DiscoveryV1().EndpointSlices("bino-scylla").Create(ctx,
+	if _, err := cs.DiscoveryV1().EndpointSlices("bino-scylla").Create(ctx,
 		probetest.EndpointSliceForService("bino-scylla", svc.Name, "10.244.1.9"),
-		metav1.CreateOptions{})
+		metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 	if res := mustCheck[*scyllaHealthCheck](t, p).Run(ctx); !res.Pass {
@@ -110,7 +112,7 @@ func TestCheckScyllaHealthGossipStall(t *testing.T) {
 		Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
 	}
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
-	cs.Fake.PrependReactor("get", "pods",
+	cs.PrependReactor("get", "pods",
 		testutil.ProbeLogReactor(
 			"INFO gossip - InetAddress /10.244.1.5 is already present in gossip, cancelling join\n",
 			nil))
@@ -139,7 +141,7 @@ func TestCheckScyllaHealthCleanLogsPass(t *testing.T) {
 	pod := scyllaMemberPod("bino-scylla", "bino-scylla-bino-dc-rack-1-0",
 		"bino-scylla", "10.244.1.5", false)
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
-	cs.Fake.PrependReactor("get", "pods",
+	cs.PrependReactor("get", "pods",
 		testutil.ProbeLogReactor("INFO scylla - starting up normally\n", nil))
 	p := testProberDyn(cs, probetest.OpDyn())
 	base := time.Now()

@@ -79,8 +79,9 @@
 // 2.7 — Cluster Maintenance Mutex: the whole wipe cycle defers while
 // deliberate maintenance is in flight — replacing a worker pod
 // mid-drain/upgrade fights the operator doing the work and can wedge
-// a PDB for hours. Same three signals as descheduler-storm-gate
-// (keep the checks in sync):
+// a PDB for hours. The check itself is shared.MaintenanceActive —
+// the canonical implementation every deferring module runs (cordon/
+// drain, kured reboot lock, autopilot Plan):
 //
 //	a) any node spec.unschedulable — a cordon/drain is running;
 //	b) DaemonSet kube-system/kured carrying the
@@ -92,27 +93,25 @@
 //
 // A check that cannot be evaluated (API failure) errors the run —
 // the wipe is destructive enough that "unknown" must mean "no".
+//
+// File layout: this file holds the module contract, the janitor
+// struct and the run pipeline; kubelet_stats.go the stats/summary
+// reading, pod_ops.go the pod lifecycle calls, helpers.go the ATC
+// credential/baseline helpers, concourse_janitor_atc.go the ATC HTTP
+// client.
 package concoursejanitor
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -153,18 +152,7 @@ const (
 	cjATCTimeout        = 15 * time.Second
 	cjFastPoll          = 5 * time.Second  // uid/delete waits (bash `sleep 5`)
 	cjSlowPoll          = 10 * time.Second // drain/ready waits (bash `sleep 10`)
-
-	// cjKuredLockAnno is the reboot-coordination lock kured holds
-	// while a node drains for its reboot window (2.7 signal b).
-	cjKuredLockAnno      = "weave.works/kured-node-lock"
-	cjKuredDaemonSetNS   = "kube-system"
-	cjKuredDaemonSetName = "kured"
 )
-
-// cjAutopilotPlanGVR is the k0s autopilot Plan resource — a Plan in a
-// non-terminal state means a cluster upgrade is in flight (2.7
-// signal c).
-var cjAutopilotPlanGVR = shared.AutopilotPlanGVR
 
 // nodeStatsReader reads kubelet stats/summary through the apiserver
 // node proxy. Missing counters return -1 so callers can distinguish
@@ -259,16 +247,28 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	// reboot lock, autopilot upgrade). An unverifiable check errors
 	// the run: the wipe is destructive enough that "unknown" must
 	// mean "no".
-	if held, why, err := j.maintenanceHeld(ctx); err != nil {
+	//
+	// The mutex runs BEFORE the whole-run timeout installs, so the
+	// check gets its own bound — an apiserver hang must not pin the
+	// periodic sweep forever. One overall reqTimeout covers all
+	// three signal reads inside shared.MaintenanceActive (the old
+	// in-package copy wrapped each call separately; an aggregate
+	// bound is strictly tighter and avoids growing a
+	// per-call-timeout variant of the shared API).
+	mctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
+	held, why, err := shared.MaintenanceActive(mctx, j.cs, j.dyn)
+	cancel()
+	if err != nil {
 		return err
-	} else if held {
+	}
+	if held {
 		log.Info("DEFER: cluster maintenance in progress — wipe cycle skipped",
 			"why", why)
 		return nil
 	}
 
 	// Whole-run bound — replaces the CronJob's activeDeadlineSeconds.
-	ctx, cancel := context.WithTimeout(ctx, j.runTimeout)
+	ctx, cancel = context.WithTimeout(ctx, j.runTimeout)
 	defer cancel()
 
 	// ATC login is fail-open: on any failure land/drain/prune are
@@ -505,372 +505,4 @@ func (j *concourseWorkdirJanitor) maybePruneWorker(ctx context.Context, podName 
 		log.Info("=== worker state — no prune needed ===",
 			"pod", podName, "workerState", strOr(st, "gone"))
 	}
-}
-
-// ---------------------------------------------------------------------------
-// Kubernetes API helpers — every call carries ctx (+ reqTimeout where
-// bash used --request-timeout).
-// ---------------------------------------------------------------------------
-
-func (j *concourseWorkdirJanitor) getPod(ctx context.Context, name string) (*corev1.Pod, error) {
-	cctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
-	defer cancel()
-	return j.cs.CoreV1().Pods(cjNamespace).Get(cctx, name, metav1.GetOptions{})
-}
-
-func (j *concourseWorkdirJanitor) workerReplicas(ctx context.Context) (int32, error) {
-	cctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
-	defer cancel()
-	sts, err := j.cs.AppsV1().StatefulSets(cjNamespace).Get(cctx, cjStatefulSet, metav1.GetOptions{})
-	if err != nil {
-		return 0, fmt.Errorf("get sts %s: %w", cjStatefulSet, err)
-	}
-	if sts.Spec.Replicas == nil {
-		return 0, fmt.Errorf("sts %s: spec.replicas unset", cjStatefulSet)
-	}
-	return *sts.Spec.Replicas, nil
-}
-
-// deletePod issues the delete and waits (bounded by deleteTimeout)
-// until the OLD object is actually gone — `kubectl delete --wait`.
-// "Gone" is uid-scoped: a same-named replacement created before our
-// first poll still confirms the old object's deletion.
-func (j *concourseWorkdirJanitor) deletePod(ctx context.Context, name string, oldUID types.UID) error {
-	dctx, cancel := context.WithTimeout(ctx, j.deleteTimeout)
-	defer cancel()
-	// UID precondition: oldUID was re-fetched right before this call
-	// — if the object already churned to a new UID, the delete must
-	// conflict rather than remove a pod we never vetted.
-	if err := j.cs.CoreV1().Pods(cjNamespace).Delete(dctx, name,
-		shared.UIDDeleteOptions(oldUID, "")); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete pod %s: %w", name, err)
-	}
-	err := wait.PollUntilContextCancel(dctx, j.fastPoll, true,
-		func(ctx context.Context) (bool, error) {
-			p, err := j.cs.CoreV1().Pods(cjNamespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return true, nil
-			}
-			if err != nil {
-				return false, nil // transient — keep waiting
-			}
-			return p.UID != oldUID, nil // old object deleted (or still terminating)
-		})
-	if err != nil {
-		return fmt.Errorf("pod %s still present after %s: %w", name, j.deleteTimeout, err)
-	}
-	return nil
-}
-
-// waitNewPod blocks until a pod with a DIFFERENT uid exists — the old
-// object can linger in terminating, so waiting on the name alone
-// would pin onto the old pod. No replacement inside uidPollTimeout is
-// a run error (bash `exit 1`: "new pod not created").
-func (j *concourseWorkdirJanitor) waitNewPod(ctx context.Context, name string, oldUID types.UID) error {
-	dctx, cancel := context.WithTimeout(ctx, j.uidPollTimeout)
-	defer cancel()
-	err := wait.PollUntilContextCancel(dctx, j.fastPoll, true,
-		func(ctx context.Context) (bool, error) {
-			p, err := j.cs.CoreV1().Pods(cjNamespace).Get(ctx, name, metav1.GetOptions{})
-			if err != nil {
-				return false, nil // not created yet / transient — keep polling
-			}
-			return p.UID != oldUID, nil
-		})
-	if err != nil {
-		return fmt.Errorf("pod %s: new pod not created within %s: %w", name, j.uidPollTimeout, err)
-	}
-	return nil
-}
-
-// waitReady blocks until the pod's Ready condition is True — init-rm
-// of a huge work-dir is why the window is so generous.
-func (j *concourseWorkdirJanitor) waitReady(ctx context.Context, name string) error {
-	dctx, cancel := context.WithTimeout(ctx, j.readyTimeout)
-	defer cancel()
-	err := wait.PollUntilContextCancel(dctx, j.slowPoll, true,
-		func(ctx context.Context) (bool, error) {
-			p, err := j.cs.CoreV1().Pods(cjNamespace).Get(ctx, name, metav1.GetOptions{})
-			if err != nil {
-				return false, nil
-			}
-			return shared.PodReadyCond(p), nil
-		})
-	if err != nil {
-		return fmt.Errorf("pod %s not Ready after %s: %w", name, j.readyTimeout, err)
-	}
-	return nil
-}
-
-// atcCredentials reads the break-glass local user from the
-// concourse-web/local-users Secret (ES-managed): first line is
-// "user:password", split on the FIRST colon (the password itself may
-// contain colons).
-func (j *concourseWorkdirJanitor) atcCredentials(ctx context.Context) (string, string, error) {
-	cctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
-	defer cancel()
-	sec, err := j.cs.CoreV1().Secrets(cjNamespace).Get(cctx, cjSecretName, metav1.GetOptions{})
-	if err != nil {
-		return "", "", err
-	}
-	line, _, _ := strings.Cut(string(sec.Data[cjSecretKey]), "\n")
-	// Trim a possible CRLF — a stray \r inside the password would 401
-	// every login and silently degrade the whole module to
-	// delete-only mode.
-	line = strings.TrimRight(line, "\r\n")
-	user, pass, ok := strings.Cut(line, ":")
-	if !ok || user == "" {
-		return "", "", fmt.Errorf("secret %s key %s has no \"user:password\" first line",
-			cjSecretName, cjSecretKey)
-	}
-	return user, pass, nil
-}
-
-// annotateBaseline merge-patches baseline-nodefs-gib=<nodefsGiB> onto
-// the pod (kubectl annotate --overwrite). The annotation is what the
-// next run subtracts from nodefs to get the work-dir usage.
-func (j *concourseWorkdirJanitor) annotateBaseline(ctx context.Context, pod string, nodefsGiB int64) error {
-	cctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
-	defer cancel()
-	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]string{
-			cjBaselineAnno: strconv.FormatInt(nodefsGiB, 10),
-		}},
-	})
-	if err != nil {
-		return err
-	}
-	_, err = j.cs.CoreV1().Pods(cjNamespace).Patch(cctx, pod,
-		types.MergePatchType, patch, metav1.PatchOptions{})
-	return err
-}
-
-// ---------------------------------------------------------------------------
-// Stats — replaces the read_stats() sed pipeline.
-// ---------------------------------------------------------------------------
-
-const gib = 1024 * 1024 * 1024
-
-// cjStats is the typed projection of a pod's disk reading; the *OK
-// flags mirror the bash "-n $VAR" checks (empty = unknown → fail-open).
-type cjStats struct {
-	node       string
-	usedGiB    int64
-	capGiB     int64
-	pct        int64
-	nodefsOK   bool
-	workdirGiB int64
-	workdirOK  bool
-}
-
-// readStats turns kubelet stats/summary + the baseline annotation
-// into the numbers the wipe decision needs.
-func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod) cjStats {
-	s := cjStats{node: pod.Spec.NodeName}
-	if s.node == "" {
-		return s
-	}
-	cctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
-	defer cancel()
-	used, capBytes, imgUsed, err := j.stats.Summary(cctx, s.node)
-	if err != nil {
-		// Fail-open is deliberate, but a persistently-broken
-		// stats/summary path must show up on the error metric —
-		// every pod will blind-wipe until it is fixed.
-		metrics.IncError(j.queue)
-		logf.FromContext(ctx).Info(
-			"WARN: stats/summary unreadable — disk unknown, fail-open",
-			"pod", pod.Name, "node", s.node, "error", err)
-		return s
-	}
-	if used >= 0 && capBytes > 0 {
-		s.usedGiB = used / gib
-		s.capGiB = capBytes / gib
-		s.pct = used * 100 / capBytes
-		s.nodefsOK = true
-	}
-	if !s.nodefsOK {
-		return s
-	}
-	// workdir = nodefs_used - baseline. Baseline comes from the
-	// annotation when it is a non-negative integer (bash case-match
-	// `''|*[!0-9]*`), else imageFs_used + 32GiB for OS/k0s/other pods.
-	var wd int64
-	switch base, err := strconv.ParseUint(pod.Annotations[cjBaselineAnno], 10, 64); {
-	case err == nil:
-		wd = s.usedGiB - int64(base)
-	case imgUsed >= 0:
-		if anno := pod.Annotations[cjBaselineAnno]; anno != "" {
-			logf.FromContext(ctx).Info(
-				"WARN: baseline annotation invalid — estimating from imageFs",
-				"pod", pod.Name, "annotation", anno,
-				"osBaselineGiB", cjOSBaselineGiB)
-		}
-		wd = s.usedGiB - imgUsed/gib - cjOSBaselineGiB
-	default:
-		// No baseline path at all → workdir unknown → fail-open wipe.
-		logf.FromContext(ctx).Info(
-			"WARN: no usable baseline (imageFs missing) — workdir unknown, fail-open",
-			"pod", pod.Name, "annotation", pod.Annotations[cjBaselineAnno])
-		return s
-	}
-	if wd < 0 {
-		wd = 0
-	}
-	s.workdirGiB = wd
-	s.workdirOK = true
-	return s
-}
-
-// ---------------------------------------------------------------------------
-// Production implementations of the seams.
-// ---------------------------------------------------------------------------
-
-// kubeletSummary is the typed shape of GET
-// /api/v1/nodes/<node>/proxy/stats/summary — replaces the bash sed
-// pipeline that carved pretty-printed "fs"/"imageFs" blocks out of
-// `kubectl get --raw` output.
-type kubeletSummary struct {
-	Node struct {
-		FS struct {
-			UsedBytes     *int64 `json:"usedBytes"`
-			CapacityBytes *int64 `json:"capacityBytes"`
-		} `json:"fs"`
-		Runtime struct {
-			ImageFS struct {
-				UsedBytes *int64 `json:"usedBytes"`
-			} `json:"imageFs"`
-		} `json:"runtime"`
-	} `json:"node"`
-}
-
-// kubeletStatsReader is the production nodeStatsReader — the apiserver
-// node-proxy subresource, same path the bash hit via `get --raw`.
-type kubeletStatsReader struct {
-	cs kubernetes.Interface
-}
-
-func (r *kubeletStatsReader) Summary(ctx context.Context, node string) (nodefsUsed, nodefsCap, imageFsUsed int64, err error) {
-	raw, err := r.cs.CoreV1().RESTClient().Get().
-		Resource("nodes").Name(node).
-		SubResource("proxy").Suffix("stats", "summary").
-		DoRaw(ctx)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	var s kubeletSummary
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return 0, 0, 0, fmt.Errorf("parse stats/summary for node %s: %w", node, err)
-	}
-	deref := func(p *int64) int64 {
-		if p == nil {
-			return -1 // absent counter — not a real 0
-		}
-		return *p
-	}
-	return deref(s.Node.FS.UsedBytes), deref(s.Node.FS.CapacityBytes), deref(s.Node.Runtime.ImageFS.UsedBytes), nil
-}
-
-// ---------------------------------------------------------------------------
-// 2.7 — Cluster Maintenance Mutex. Keep in sync with the copy inside
-// descheduler-storm-gate.
-// ---------------------------------------------------------------------------
-
-// maintenanceHeld reports whether deliberate cluster maintenance is
-// in flight — the wipe cycle defers entirely while any signal holds:
-//
-//	a) any node spec.unschedulable — a cordon/drain is running;
-//	b) DaemonSet kube-system/kured holding weave.works/kured-node-lock;
-//	c) an autopilot Plan whose status.state is neither Schedulable
-//	   nor Completed — a k0s upgrade in flight.
-//
-// Returns (held, human-readable why, error). A missing kured
-// DaemonSet or absent autopilot CRD is not evidence; real API
-// failures are errors — "cannot verify" must never read as "clear".
-func (j *concourseWorkdirJanitor) maintenanceHeld(ctx context.Context) (bool, string, error) {
-	// The mutex runs BEFORE the whole-run timeout installs, so every
-	// call here carries its own reqTimeout — an apiserver hang must
-	// not pin the periodic sweep forever.
-	// (a) cordon/drain in progress. W10-FIX5: NodeActivelyCordoned —
-	// a statically-cordoned node whose cordon-ttl already expired is
-	// deliberate state, not a drain in flight, and must not freeze
-	// the wipe cycle forever.
-	nctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
-	nodes, err := shared.ListNodes(nctx, j.cs)
-	cancel()
-	if err != nil {
-		return false, "", fmt.Errorf("list nodes (maintenance mutex): %w", err)
-	}
-	for i := range nodes {
-		if shared.NodeActivelyCordoned(&nodes[i], time.Now()) {
-			return true, "node " + nodes[i].Name + " actively cordoned", nil
-		}
-	}
-
-	// (b) kured holding its node-lock annotation means a reboot
-	// drain is in progress right now.
-	dctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
-	ds, err := j.cs.AppsV1().DaemonSets(cjKuredDaemonSetNS).
-		Get(dctx, cjKuredDaemonSetName, metav1.GetOptions{})
-	cancel()
-	switch {
-	case apierrors.IsNotFound(err):
-		// kured not installed on this cluster — no signal.
-	case err != nil:
-		return false, "", fmt.Errorf("get daemonset %s/%s (maintenance mutex): %w",
-			cjKuredDaemonSetNS, cjKuredDaemonSetName, err)
-	default:
-		if v := ds.Annotations[cjKuredLockAnno]; v != "" {
-			return true, "kured lock held by " + v, nil
-		}
-	}
-
-	// (c) Any autopilot Plan outside its terminal states means a
-	// k0s upgrade is in flight. An absent CRD is not evidence. A
-	// missing dynamic client is a wiring bug, not "no signal" —
-	// unverifiable fails closed like every other check here (the
-	// run aborts, the wipe defers).
-	if j.dyn == nil {
-		return false, "", fmt.Errorf("no dynamic client — autopilot plan check unverifiable (maintenance mutex)")
-	}
-	pctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
-	plans, err := j.dyn.Resource(cjAutopilotPlanGVR).
-		List(pctx, metav1.ListOptions{})
-	cancel()
-	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		// autopilot CRD not installed — no signal.
-	case err != nil:
-		return false, "", fmt.Errorf("list autopilot plans (maintenance mutex): %w", err)
-	default:
-		for i := range plans.Items {
-			state, _, _ := unstructured.NestedString(
-				plans.Items[i].Object, "status", "state")
-			if state != "Schedulable" && state != "Completed" {
-				return true, fmt.Sprintf("autopilot plan %s state=%s",
-					plans.Items[i].GetName(), state), nil
-			}
-		}
-	}
-	return false, "", nil
-}
-
-// ---------------------------------------------------------------------------
-// Small formatting helpers (bash's ${VAR:-?} fallback).
-// ---------------------------------------------------------------------------
-
-func strOr(s, def string) string {
-	if s == "" {
-		return def
-	}
-	return s
-}
-
-// intOr prints the number or "?" — used for both GiB and % fields
-// (bash's ${VAR:-?} fallback).
-func intOr(v int64, ok bool) string {
-	if !ok {
-		return "?"
-	}
-	return strconv.FormatInt(v, 10)
 }

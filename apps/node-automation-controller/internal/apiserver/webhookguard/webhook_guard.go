@@ -76,7 +76,6 @@ import (
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -108,9 +107,9 @@ type webhookGuard struct {
 	queue string
 	// dyn feeds the autopilot-Plan signal of the maintenance mutex
 	// (W7-C1) — wired through Setup like every other dynamic-client
-	// module. A nil dyn (unit tests that build the guard directly)
-	// narrows the mutex to the clientset-only signals (node cordon +
-	// kured lock) instead of failing closed.
+	// module. A nil dyn makes the Plan check unverifiable, which the
+	// mutex reports as an error: unverifiable fails closed, never a
+	// silently-narrowed check.
 	dyn dynamic.Interface
 	// now is the clock seam for the dead-backend streak — tests pin
 	// a scripted now to reach past webhookDeadThreshold. nil → time.Now.
@@ -486,36 +485,12 @@ func tcpTLSEndpointProber(ctx context.Context, ip string, port int32) bool {
 }
 
 // maintenanceActive runs the cluster maintenance mutex (W7-C1) —
-// the shared three-signal check when a dynamic client is wired
-// (node cordon + kured lock + autopilot Plan), narrowed to the
-// clientset-only signals (node cordon + kured lock) when it is not:
-// a missing dyn is a test-only construction, so the check degrades
-// instead of failing closed like a real client outage must.
+// the shared three-signal check (node cordon + kured lock +
+// autopilot Plan), exactly like every other deferring module. An
+// earlier version carried a nil-dyn degraded copy that checked
+// spec.unschedulable instead of shared.NodeActivelyCordoned — a
+// statically-cordoned node would then have held the mutex forever;
+// the shared implementation fails closed on a missing dyn instead.
 func (g *webhookGuard) maintenanceActive(ctx context.Context) (bool, string, error) {
-	if g.dyn != nil {
-		return shared.MaintenanceActive(ctx, g.cs, g.dyn)
-	}
-	nodes, err := shared.ListNodes(ctx, g.cs)
-	if err != nil {
-		return false, "", fmt.Errorf("list nodes (maintenance mutex): %w", err)
-	}
-	for i := range nodes {
-		if nodes[i].Spec.Unschedulable {
-			return true, "node " + nodes[i].Name + " unschedulable", nil
-		}
-	}
-	ds, err := g.cs.AppsV1().DaemonSets(shared.KuredDaemonSetNS).
-		Get(ctx, shared.KuredDaemonSetName, metav1.GetOptions{})
-	switch {
-	case apierrors.IsNotFound(err):
-		// kured not installed — no signal.
-	case err != nil:
-		return false, "", fmt.Errorf("get daemonset %s/%s (maintenance mutex): %w",
-			shared.KuredDaemonSetNS, shared.KuredDaemonSetName, err)
-	default:
-		if v := ds.Annotations[shared.KuredLockAnno]; v != "" {
-			return true, "kured lock held by " + v, nil
-		}
-	}
-	return false, "", nil
+	return shared.MaintenanceActive(ctx, g.cs, g.dyn)
 }

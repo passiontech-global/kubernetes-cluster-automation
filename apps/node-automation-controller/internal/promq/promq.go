@@ -80,7 +80,7 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 	if err != nil {
 		return nil, fmt.Errorf("prometheus query: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read prometheus response: %w", err)

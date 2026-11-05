@@ -1,3 +1,4 @@
+//nolint:staticcheck // SA1019: fixtures deliberately build deprecated corev1 Endpoints/EndpointSubset objects — that is the API the guard manages on hosted planes.
 package apiserverendpointguard
 
 import (

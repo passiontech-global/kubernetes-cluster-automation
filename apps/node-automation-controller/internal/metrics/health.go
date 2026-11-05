@@ -4,7 +4,10 @@
 // order and comments follow the original metrics.go layout.
 package metrics
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+)
 
 // cluster-health-probes gauges — the EXACT series kuberhealthy
 // exported for the five ported HealthChecks, so the
@@ -208,6 +211,25 @@ var ScyllaClusterUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_scylla_unhealthy",
 	Help: "1 while the ScyllaCluster/member shows a sustained unhealthy signature.",
 }, []string{"namespace", "cluster", "reason"})
+
+// init registers exactly the vectors declared in this file — the
+// per-domain init() split means adding a health-domain metric
+// touches only this file, not a central registry list. Order
+// follows declaration order.
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		healthCheckStatus, healthCheckSecondsSinceSuccess,
+		KCMWorkqueueFrozen,
+		OperatorWorkqueueFrozen, OperatorWorkqueueHealsTotal,
+		StatefulServiceZeroEndpoints, RabbitMQSuspendedHealsTotal,
+		DragonflyMasterlessPodHealsTotal,
+		LocalPVStrandedPods, LocalPVEphemeralHealsTotal,
+		PVCProvisioningStalled, PVCProvisionerHealsTotal,
+		OLMUnhealthyResources, OLMOperatorHealsTotal,
+		SchedulerFrozen, ControlPlanePodHealsTotal,
+		NodeHangCordonsTotal, NodeHangUncordonsTotal,
+		LinkerdEndpointDesync, ScyllaClusterUnhealthy)
+}
 
 // ObserveHealthCheck records one result of a ported kuberhealthy check
 // under its original HealthCheck name: the status=OK|FAIL gauges

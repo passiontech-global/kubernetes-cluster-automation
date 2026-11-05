@@ -331,7 +331,7 @@ func TestDeadNodeSweeperVolumeAttachments(t *testing.T) {
 		cs := fake.NewSimpleClientset(
 			testutil.Node("w1", corev1.ConditionFalse, nil),
 			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
-		cs.Fake.PrependReactor("list", "volumeattachments",
+		cs.PrependReactor("list", "volumeattachments",
 			func(ktesting.Action) (bool, runtime.Object, error) {
 				return true, nil, errors.New("va list boom")
 			})

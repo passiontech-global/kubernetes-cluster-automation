@@ -6,7 +6,10 @@
 // layout.
 package metrics
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+)
 
 // apiserver-endpoint-guard per-backend gauges — the wedge signal
 // itself, so alerting can fire on rv_gap growth BEFORE a quarantine
@@ -82,6 +85,19 @@ var APIServiceUnblockHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpt
 	Name: "node_automation_apiservice_unblock_heals_total",
 	Help: "APIService heals forced past the skip-namespace gate, by namespace and reason.",
 }, []string{"namespace", "reason"})
+
+// init registers exactly the vectors declared in this file — the
+// per-domain init() split means adding an apiserver-domain metric
+// touches only this file, not a central registry list. Order
+// follows declaration order.
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		apiBackendRVGap, apiBackendQuarantined,
+		WebhookCircuitBroken, WebhookCircuitBreakerTripsTotal,
+		APIServiceUnavailable,
+		UnmeshedPods, UnmeshedPodsRecreatedTotal,
+		APIServiceUnblockHealsTotal)
+}
 
 // ObserveAPIBackend records one probe cycle of the
 // apiserver-endpoint-guard for backend `ip`: rvGap is live_rv-cache_rv

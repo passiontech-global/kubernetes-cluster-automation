@@ -543,7 +543,7 @@ func zombieSidecarShutdown(ctx context.Context, podIP, sidecar string) error {
 		// reused; bounded so a chatty endpoint cannot stall the
 		// sweep.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("sidecar %s returned %s", target.path, resp.Status)

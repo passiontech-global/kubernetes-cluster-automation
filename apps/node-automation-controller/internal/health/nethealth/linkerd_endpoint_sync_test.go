@@ -154,8 +154,10 @@ func TestCheckLinkerdEndpointSyncResyncClears(t *testing.T) {
 		"headless-svc-abc", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	cs.DiscoveryV1().EndpointSlices("app").Create(ctx,
-		probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.5"), metav1.CreateOptions{})
+	if _, err := cs.DiscoveryV1().EndpointSlices("app").Create(ctx,
+		probetest.EndpointSliceForService("app", "headless-svc", "10.244.0.5"), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
 	p.Now = func() time.Time { return base.Add(2*linkerdEndpointDesyncMinAge + time.Minute) }
 	if res := mustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("resynced service must pass: %+v", res)

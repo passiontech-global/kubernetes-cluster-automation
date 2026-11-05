@@ -133,7 +133,7 @@ func fetchListRV(ctx context.Context, client *http.Client, ip, path string) (int
 		// unreusable, which silently defeated keep-alive on the
 		// shared transport (new TCP+TLS handshake per probe).
 		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)

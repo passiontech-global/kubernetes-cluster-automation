@@ -275,10 +275,10 @@ func podWantsMesh(p *corev1.Pod, nsDirective string) bool {
 			return false // batch pods are never injected
 		}
 	}
-	switch d := injectDirective(p.Labels, p.Annotations); {
-	case d == "disabled":
+	switch d := injectDirective(p.Labels, p.Annotations); d {
+	case "disabled":
 		return false
-	case d == "enabled":
+	case "enabled":
 		return true
 	default:
 		return nsDirective == "enabled"
