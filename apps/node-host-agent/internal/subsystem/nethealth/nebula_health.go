@@ -3,8 +3,6 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -381,26 +379,4 @@ func minRTT(out string) float64 {
 		}
 	}
 	return best
-}
-
-// probeHTTPGet is the default probeHTTP: GET with deadline, nil on
-// 2xx only (curl -sf parity for nebula stats — a wedged daemon still
-// serves TCP, only the metrics endpoint failing counts).
-func probeHTTPGet(ctx context.Context, url string, timeout time.Duration) error {
-	pctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("status %d", resp.StatusCode)
-	}
-	return nil
 }

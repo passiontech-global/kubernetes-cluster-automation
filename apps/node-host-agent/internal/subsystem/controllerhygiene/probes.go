@@ -1,16 +1,15 @@
 // probes.go — the network liveness probes behind the Config seams:
-// the shared insecure probeClient (probeAnyCode, and the CP-freeze
-// probeHTTP2xx/httpGetInsecure in cp_freeze_heal.go) plus the pg-wire
-// StartupMessage check behind pgWireFn (lib.sh pg_wire_ok).
+// the pg-wire StartupMessage check behind pgWireFn (lib.sh
+// pg_wire_ok). The HTTP probes (the old probeClient + probeAnyCode
+// and the CP-freeze probeHTTP2xx/httpGetInsecure) now live in
+// platform/probee — same shared insecure client, same semantics.
 package controllerhygiene
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/binary"
 	"io"
 	"net"
-	"net/http"
 	"strings"
 	"time"
 )
@@ -47,35 +46,4 @@ func pgWireOK(ctx context.Context, hostport string) bool {
 		return false
 	}
 	return strings.IndexByte(pgAuthOK, b[0]) >= 0
-}
-
-// probeClient is shared by every probeAnyCode call — a fresh
-// Transport per probe would pin an idle connection (and its TLS
-// buffers) on the apiserver between cycles. IdleConnTimeout bounds
-// that pool (90s > the 60s cycle, so the conn is reused each probe).
-var probeClient = func() *http.Client {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
-	tr.IdleConnTimeout = 90 * time.Second
-	return &http.Client{Transport: tr}
-}()
-
-// probeAnyCode is the default liveness probe: ANY HTTP response code
-// means ALIVE — the shell targets a process-level wedge (event loop
-// dead, no TLS accept), not readyz content. `curl -ks --max-time 5
-// -o /dev/null -w '%{http_code}' != 000` parity.
-func probeAnyCode(ctx context.Context, url string, timeout time.Duration) bool {
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
-	if err != nil {
-		return false
-	}
-	resp, err := probeClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	return true
 }

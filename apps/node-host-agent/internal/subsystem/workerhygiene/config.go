@@ -2,19 +2,15 @@ package workerhygiene
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -577,30 +573,10 @@ func (s *Seams) applyDefaults(c *Config) {
 		// Plain HTTP (no TLS) — the envoy admin stats page lives on
 		// loopback :9901. A non-200 is an error: the reject-delta
 		// verdict is unreadable, not "zero".
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.IdleConnTimeout = 90 * time.Second
-		client := &http.Client{Transport: tr}
-		s.httpGetBody = func(ctx context.Context, url string, timeout time.Duration) ([]byte, error) {
-			pctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
-			if err != nil {
-				return nil, err
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				return nil, err
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-				return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
-			}
-			return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		}
+		s.httpGetBody = probee.HTTPBody
 	}
 	if s.dnsProbe == nil {
-		s.dnsProbe = probeDNSUDP
+		s.dnsProbe = probee.DNSQuery
 	}
 	if s.killFn == nil {
 		s.killFn = func(pid int, sig syscall.Signal) error {
@@ -615,63 +591,10 @@ func (s *Seams) applyDefaults(c *Config) {
 		// own — a wedged cilium-agent :9879/healthz answering 500/503
 		// must read as DOWN. Only a 2xx is a pass; insecure TLS stays
 		// (kubelet cert SANs don't cover 127.0.0.1, curl -ks parity).
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
-		tr.IdleConnTimeout = 90 * time.Second
-		client := &http.Client{Transport: tr}
-		s.probeHTTP = func(ctx context.Context, url string, timeout time.Duration) error {
-			pctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
-			if err != nil {
-				return err
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				return err
-			}
-			defer resp.Body.Close()
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
-			}
-			return nil
-		}
+		s.probeHTTP = probee.HTTPGet
 	}
 	if s.unixGet == nil {
-		s.unixGet = func(ctx context.Context, socket, path string) ([]byte, error) {
-			// DisableKeepAlives: the transport is built per call, so a
-			// kept-alive unix conn would pin the readLoop/writeLoop
-			// goroutines for the transport's whole IdleConnTimeout —
-			// with keep-alives off the conn closes on Body.Close and
-			// they finish immediately. Draining the body first lets
-			// the close happen promptly.
-			tr := &http.Transport{
-				DisableKeepAlives: true,
-				DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
-					d := net.Dialer{Timeout: 5 * time.Second}
-					return d.DialContext(dctx, "unix", socket)
-				},
-			}
-			cl := &http.Client{Transport: tr, Timeout: 10 * time.Second}
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-				"http://localhost"+path, nil)
-			if err != nil {
-				return nil, err
-			}
-			resp, err := cl.Do(req)
-			if err != nil {
-				return nil, err
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-				return nil, fmt.Errorf("cilium api %s: status %d", path, resp.StatusCode)
-			}
-			body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-			return body, err
-		}
+		s.unixGet = probee.UnixGet
 	}
 	if s.ctrRmImage == nil {
 		sd := c.Systemd
@@ -709,63 +632,17 @@ func (s *Seams) applyDefaults(c *Config) {
 		// kubelet :10248 contract (curl -s parity): the healthz port is
 		// unauthenticated plaintext and the body must be exactly "ok" —
 		// a wedged kubelet can still answer HTTP with a non-ok body.
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.IdleConnTimeout = 90 * time.Second
-		client := &http.Client{Transport: tr}
-		s.probeBodyOK = func(ctx context.Context, url string, timeout time.Duration) bool {
-			pctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
-			if err != nil {
-				return false
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				return false
-			}
-			defer resp.Body.Close()
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			return strings.TrimSpace(string(body)) == "ok"
-		}
+		s.probeBodyOK = probee.BodyOK
 	}
 	if s.probeHTTPStatus == nil {
 		// Same insecure-TLS transport as probeHTTP — the status code
 		// is the verdict (syncloop 500, envoy /ready 503).
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
-		tr.IdleConnTimeout = 90 * time.Second
-		client := &http.Client{Transport: tr}
-		s.probeHTTPStatus = func(ctx context.Context, url, bearer string, timeout time.Duration) (int, error) {
-			pctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
-			if err != nil {
-				return 0, err
-			}
-			if bearer != "" {
-				req.Header.Set("Authorization", "Bearer "+bearer)
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				return 0, err
-			}
-			defer resp.Body.Close()
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-			return resp.StatusCode, nil
-		}
+		s.probeHTTPStatus = probee.HTTPStatus
 	}
 	if s.probeUnixSock == nil {
-		s.probeUnixSock = func(ctx context.Context, socket string, timeout time.Duration) error {
-			d := net.Dialer{Timeout: timeout}
-			conn, err := d.DialContext(ctx, "unix", socket)
-			if err != nil {
-				return err
-			}
-			// A successful dial IS the verdict — a close error
-			// (e.g. the peer reset first) must not downgrade it.
-			_ = conn.Close()
-			return nil
-		}
+		// A successful dial IS the verdict — a close error (e.g. the
+		// peer reset first) must not downgrade it.
+		s.probeUnixSock = probee.UnixDial
 	}
 	if s.statfsFn == nil {
 		s.statfsFn = unix.Statfs

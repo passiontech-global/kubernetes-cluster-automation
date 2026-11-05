@@ -20,8 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -54,45 +52,8 @@ const (
 	kcmSnapshotMaxGap = 15 * time.Minute
 )
 
-// probeHTTP2xx is cpHealthFn's default: GET url, true on a 2xx — the
-// KCM/scheduler healthz contract (500 = component wedged, any other
-// failure = unreachable). KCM/scheduler serve self-signed certs, so
-// the shared insecure transport is used.
-func probeHTTP2xx(ctx context.Context, url string, timeout time.Duration) bool {
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
-	if err != nil {
-		return false
-	}
-	resp, err := probeClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
-}
-
-// httpGetInsecure is kcmMetricsFn's default — body or error.
-func httpGetInsecure(ctx context.Context, url string, timeout time.Duration) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := probeClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
+// The cpHealthFn/kcmMetricsFn defaults live in platform/probee
+// (HTTP2xx / HTTPBodyInsecure) — same insecure client, same drains.
 
 // kcmQueueSnapshot is one scrape of the KCM /metrics workqueue
 // state, persisted under WatchdogStateDir so consecutive scrapes
@@ -291,9 +252,9 @@ func (h *Hygiene) peerHealthy(ctx context.Context) bool {
 	if ep == "" {
 		ep = h.cfg.Hub.SelfEndpoint
 	}
-	// ANY HTTP code = the apiserver event loop is alive (probeAnyCode
-	// parity — a wedged apiserver is the wedge guard's problem, not
-	// this check's).
+	// ANY HTTP code = the apiserver event loop is alive
+	// (probee.HTTPAnyCode parity — a wedged apiserver is the wedge
+	// guard's problem, not this check's).
 	return h.cfg.probeFn(ctx, "https://"+ep+"/readyz")
 }
 
