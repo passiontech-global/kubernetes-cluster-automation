@@ -19,10 +19,12 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/apiprober"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/concoursecache"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hubsync"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/janitor"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/kinedb"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/nethealth"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/nodereporter"
@@ -86,8 +88,8 @@ func (w *wiring) wireSweeper() {
 // off. Replaces the old CronJob + pods/exec path.
 func (w *wiring) wireConcourseCache() {
 	if envx.Bool("NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE", w.defKube) {
-		knobs := sweeper.ConcourseCacheFromEnv()
-		pr, err := sweeper.NewConcourseCachePruner(knobs.Config, w.reg)
+		knobs := concoursecache.ConcourseCacheFromEnv()
+		pr, err := concoursecache.NewConcourseCachePruner(knobs.Config, w.reg)
 		if err != nil {
 			logger().Error("concourse-cache pruner setup failed", "error", err)
 		} else {
@@ -235,8 +237,8 @@ func (w *wiring) wireNethealth() {
 // pruned unit files. No kube client needed.
 func (w *wiring) wireJanitor() {
 	if envx.Bool("NODE_HOST_AGENT_ENABLE_JANITOR", true) {
-		jn, err := workerhygiene.NewJanitor(workerhygiene.JanitorConfigFromEnv(
-			workerhygiene.EnvDeps{
+		jn, err := janitor.NewJanitor(janitor.JanitorConfigFromEnv(
+			janitor.EnvDeps{
 				Systemd:          w.sdClient,
 				WatchdogStateDir: w.watchdogStateDir,
 				WatchdogLogFile:  w.watchdogLogFile,

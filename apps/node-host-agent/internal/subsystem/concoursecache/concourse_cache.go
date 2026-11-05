@@ -25,7 +25,7 @@
 //   - Size caps free oldest-first exactly like
 //     `find -printf '%T@' | sort -n`; du -sk semantics are kept via
 //     allocated blocks (st_blocks), not apparent size.
-package sweeper
+package concoursecache
 
 import (
 	"cmp"
@@ -33,6 +33,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"syscall"
@@ -40,6 +41,14 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+// pvcNameRe is the last-deletion-belt name check — exactly
+// pvc-<uuid>, duplicated from sweeper (the orphan-dir sweeper owns
+// the same contract). Kept as a copy rather than an exported symbol
+// so this package carries no sweeper dependency; the regexp is one
+// line and the openebs pvc-* naming convention is stable.
+var pvcNameRe = regexp.MustCompile(
+	`^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // DefaultConcourseCacheInterval is the cadence the caller should
 // schedule — 15m vs the 30m the prune ran inside the janitor.
@@ -193,7 +202,7 @@ type ConcourseCachePruner struct {
 }
 
 // NewConcourseCachePruner returns a pruner and registers its metrics
-// on reg — same contract as sweeper.New.
+// on reg — same contract as the orphan sweeper's New.
 func NewConcourseCachePruner(cfg ConcourseCacheConfig, reg prometheus.Registerer) (*ConcourseCachePruner, error) {
 	cfg.applyDefaults()
 	p := &ConcourseCachePruner{cfg: cfg}
