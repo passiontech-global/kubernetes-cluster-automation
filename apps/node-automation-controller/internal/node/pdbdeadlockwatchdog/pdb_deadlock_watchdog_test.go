@@ -14,6 +14,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -212,6 +213,36 @@ func TestPDBWatchdogCordonedNodeBlocked(t *testing.T) {
 	}
 	if _, ok := pdwDrainBlocked(t, "pdw-c", "drain-wedged", pdbReasonProlonged); ok {
 		t.Fatal("prolonged fired before 30m")
+	}
+}
+
+// W10-FIX5 — a statically-cordoned node (spec.unschedulable held past
+// the cordon-active window, companion taint older than 45m) is
+// deliberate state, not a drain in flight: cordoned_node_blocked must
+// not open its continuity window for it.
+func TestPDBWatchdogStaleCordonIgnored(t *testing.T) {
+	now := time.Now()
+	stale := pdwCordonedNode("n-stale")
+	stale.Spec.Taints = []corev1.Taint{{
+		Key:       shared.UnschedulableTaintKey,
+		TimeAdded: &metav1.Time{Time: now.Add(-time.Hour)},
+	}}
+	cs := fake.NewSimpleClientset(
+		stale,
+		pdwBlockedPDB("pdw-e", "stale-cordon", 3, 1, 1))
+	w := newPDWWatchdog(cs, &now)
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(20 * time.Minute)
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := w.firstSeen["pdw-e/stale-cordon/"+pdbReasonCordonedNode]; ok {
+		t.Fatal("cordoned window opened for a stale (>45m) cordon")
+	}
+	if _, ok := pdwDrainBlocked(t, "pdw-e", "stale-cordon", pdbReasonCordonedNode); ok {
+		t.Fatal("cordoned_node_blocked fired on a static cordon")
 	}
 }
 

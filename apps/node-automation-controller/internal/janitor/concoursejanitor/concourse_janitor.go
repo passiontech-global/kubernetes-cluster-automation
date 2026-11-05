@@ -774,7 +774,10 @@ func (j *concourseWorkdirJanitor) maintenanceHeld(ctx context.Context) (bool, st
 	// The mutex runs BEFORE the whole-run timeout installs, so every
 	// call here carries its own reqTimeout — an apiserver hang must
 	// not pin the periodic sweep forever.
-	// (a) cordon/drain in progress.
+	// (a) cordon/drain in progress. W10-FIX5: NodeActivelyCordoned —
+	// a statically-cordoned node whose cordon-ttl already expired is
+	// deliberate state, not a drain in flight, and must not freeze
+	// the wipe cycle forever.
 	nctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
 	nodes, err := shared.ListNodes(nctx, j.cs)
 	cancel()
@@ -782,8 +785,8 @@ func (j *concourseWorkdirJanitor) maintenanceHeld(ctx context.Context) (bool, st
 		return false, "", fmt.Errorf("list nodes (maintenance mutex): %w", err)
 	}
 	for i := range nodes {
-		if nodes[i].Spec.Unschedulable {
-			return true, "node " + nodes[i].Name + " unschedulable", nil
+		if shared.NodeActivelyCordoned(&nodes[i], time.Now()) {
+			return true, "node " + nodes[i].Name + " actively cordoned", nil
 		}
 	}
 

@@ -4,6 +4,7 @@
 package clusterhealthprobes
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -65,6 +66,14 @@ func shOpDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 		{Group: "kargo.akuity.io", Version: "v1alpha1", Resource: "warehouses"}:              "WarehouseList",
 		{Group: "everest.percona.com", Version: "v1alpha1", Resource: "databaseclusters"}:    "DatabaseClusterList",
 		{Group: "shipwright.io", Version: "v1beta1", Resource: "builds"}:                     "BuildList",
+		// W10-CP3 — the nine additional watched operators' CRDs.
+		{Group: "remediation.medik8s.io", Version: "v1alpha1", Resource: "nodehealthchecks"}:               "NodeHealthCheckList",
+		{Group: "self-node-remediation.medik8s.io", Version: "v1alpha1", Resource: "selfnoderemediations"}: "SelfNodeRemediationList",
+		{Group: "pxc.percona.com", Version: "v1", Resource: "perconaxtradbclusters"}:                       "PerconaXtraDBClusterList",
+		{Group: "pgv2.percona.com", Version: "v2", Resource: "perconapgclusters"}:                          "PerconaPGClusterList",
+		{Group: "psmdb.percona.com", Version: "v1", Resource: "perconaservermongodbs"}:                     "PerconaServerMongoDBList",
+		{Group: "tekton.dev", Version: "v1", Resource: "pipelineruns"}:                                     "PipelineRunList",
+		{Group: "shipwright.io", Version: "v1alpha1", Resource: "shipwrightbuilds"}:                        "ShipwrightBuildList",
 		// W7-C5 — OLM reads.
 		olmCSVGVR: "ClusterServiceVersionList",
 		olmSubGVR: "SubscriptionList",
@@ -883,5 +892,339 @@ func TestCheckRabbitMQSuspendedCooldown(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("mq").
 		Get(ctx, "rabbitmq-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted inside the 30m heal cooldown")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W10-FIX2 — podNS override + leaseOptional + multi-candidate leases
+// ---------------------------------------------------------------------------
+
+// cert-manager elects its leader in kube-system but runs its pods in
+// the cert-manager namespace — the heal must resolve and delete the
+// pod in cert-manager, never a same-named pod in kube-system.
+func TestCheckOperatorWorkqueuesCertManagerPodNS(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		shLease("kube-system", "cert-manager-controller",
+			"cert-manager-cm-7d9f_uid", 2*time.Second, base),
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "cert-manager", Name: "cert-manager-cm-7d9f",
+			UID:    types.UID("cm-leader-1"),
+			Labels: map[string]string{"app.kubernetes.io/name": "cert-manager"},
+		}},
+		// Decoy: same selector, wrong namespace — must survive.
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "kube-system", Name: "cert-manager-cm-7d9f",
+			UID:    types.UID("cm-decoy"),
+			Labels: map[string]string{"app.kubernetes.io/name": "cert-manager"},
+		}})
+	stuck := shUnstructured("cert-manager.io/v1", "Certificate",
+		"apps", "tls", 5, 3)
+	p := testProberDyn(cs, shOpDyn(stuck))
+	p.now = func() time.Time { return base }
+	p.opFirstSeen["cert-manager/certificates/apps/tls"] = base.Add(-time.Hour)
+
+	res := p.checkOperatorWorkqueues(ctx)
+	if res.pass {
+		t.Fatal("stuck certificate must FAIL")
+	}
+	if _, err := cs.CoreV1().Pods("cert-manager").
+		Get(ctx, "cert-manager-cm-7d9f", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("cert-manager-ns leader pod must be deleted, err=%v", err)
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").
+		Get(ctx, "cert-manager-cm-7d9f", metav1.GetOptions{}); err != nil {
+		t.Fatal("kube-system decoy pod must NOT be touched (podNS override)")
+	}
+}
+
+// dragonfly-operator runs --leader-elect disabled (replicas:1): no
+// Lease exists at all, so the Running-pod fallback must carry both
+// the liveness proof and the heal path.
+func TestCheckOperatorWorkqueuesDragonflyLeaseOptional(t *testing.T) {
+	base := time.Now()
+	opPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: dragonflyOperatorNS,
+			Name:      "dragonfly-operator-controller-manager-6f8bc-xy",
+			UID:       types.UID("dr-op-1"),
+			Labels:    map[string]string{"control-plane": "controller-manager"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	// NO lease — leaseOptional must carry the check.
+	cs := fake.NewSimpleClientset(opPod)
+	stuck := shUnstructured("dragonflydb.io/v1alpha1", "Dragonfly",
+		"db", "cache", 9, 4)
+	p := testProberDyn(cs, shOpDyn(stuck))
+	p.now = func() time.Time { return base }
+	p.opFirstSeen["dragonfly-operator/dragonflies/db/cache"] = base.Add(-time.Hour)
+
+	res := p.checkOperatorWorkqueues(ctx)
+	if res.pass {
+		t.Fatal("stuck dragonfly with live pod must FAIL (leaseOptional)")
+	}
+	if _, err := cs.CoreV1().Pods(dragonflyOperatorNS).
+		Get(ctx, opPod.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("selector-fallback heal must delete the pod, err=%v", err)
+	}
+}
+
+// operatorLease tries every candidate name — the second entry wins
+// when the first is absent (Percona/medik8s election-id rotation).
+func TestOperatorLeaseCandidateFallback(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		shLease("operators", "second-choice",
+			"holder_uid", 2*time.Second, base))
+	op := operatorTarget{
+		name: "x", leaseNS: "operators",
+		leaseNames: []string{"missing-first", "second-choice"},
+	}
+	p := testProberDyn(cs, shOpDyn())
+	lease, err := p.operatorLease(ctx, op)
+	if err != nil {
+		t.Fatalf("operatorLease: %v", err)
+	}
+	if lease == nil || lease.Name != "second-choice" {
+		t.Fatalf("lease = %v, want second-choice", lease)
+	}
+	// All candidates absent → (nil, nil), not an error.
+	op.leaseNames = []string{"missing-first", "missing-second"}
+	lease, err = p.operatorLease(ctx, op)
+	if err != nil || lease != nil {
+		t.Fatalf("absent candidates must give (nil,nil), got %v, %v", lease, err)
+	}
+}
+
+// A W10-CP3 target end-to-end: node-healthcheck-operator's renewing
+// lease plus a never-reconciled NodeHealthCheck freezes the gauge.
+func TestCheckOperatorWorkqueuesMedik8sTarget(t *testing.T) {
+	metrics.OperatorWorkqueueFrozen.DeleteLabelValues(
+		"node-healthcheck-operator", opReasonNoStatus)
+	t.Cleanup(func() {
+		metrics.OperatorWorkqueueFrozen.DeleteLabelValues(
+			"node-healthcheck-operator", opReasonNoStatus)
+	})
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		shLease("operators", "e1f13584.medik8s.io",
+			"nhc-aa_uid", 2*time.Second, base))
+	nhc := shUnstructured("remediation.medik8s.io/v1alpha1",
+		"NodeHealthCheck", "operators", "nhc", 3, 0)
+	p := testProberDyn(cs, shOpDyn(nhc))
+	p.now = func() time.Time { return base }
+	p.opFirstSeen["node-healthcheck-operator/nodehealthchecks/operators/nhc"] =
+		base.Add(-time.Hour)
+
+	if res := p.checkOperatorWorkqueues(ctx); res.pass {
+		t.Fatal("never-reconciled NodeHealthCheck must FAIL")
+	}
+	if v, _ := shOpFrozenGauge(t, "node-healthcheck-operator",
+		opReasonNoStatus); v != 1 {
+		t.Fatalf("frozen gauge = %v, want 1", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W10-CP4 — flux HelmRelease retries-exhausted remediator
+// ---------------------------------------------------------------------------
+
+// shHR builds a HelmRelease carrying a Ready condition at `since`.
+func shHR(ns, name, status, reason, message string, since time.Time) *unstructured.Unstructured {
+	hr := shUnstructured("helm.toolkit.fluxcd.io/v2", "HelmRelease",
+		ns, name, 5, 3)
+	_ = unstructured.SetNestedSlice(hr.Object, []any{
+		map[string]any{
+			"type":               "Ready",
+			"status":             status,
+			"reason":             reason,
+			"message":            message,
+			"lastTransitionTime": since.UTC().Format(time.RFC3339),
+		},
+	}, "status", "conditions")
+	return hr
+}
+
+var hrRetryGVR = schema.GroupVersionResource{
+	Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"}
+
+// A HelmRelease parked Ready=False/UpgradeFailed for 20m gets patched
+// with the reconcile annotations and the check FAILs.
+func TestCheckFluxHelmReleaseRetriesPatches(t *testing.T) {
+	base := time.Now()
+	hr := shHR("apps", "hr", "False", "UpgradeFailed",
+		"upgrade failed: timed out", base.Add(-20*time.Minute))
+	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(hr))
+	p.now = func() time.Time { return base }
+
+	res := p.checkFluxHelmReleaseRetries(ctx)
+	if res.pass {
+		t.Fatal("retries-exhausted HelmRelease must FAIL")
+	}
+	got, err := p.dyn.Resource(hrRetryGVR).Namespace("apps").
+		Get(ctx, "hr", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, anno := range []string{fluxHRRequestedAtAnno, fluxHRForceAtAnno} {
+		v, found, _ := unstructured.NestedString(
+			got.Object, "metadata", "annotations", anno)
+		if !found || v == "" {
+			t.Fatalf("annotation %s not stamped: %v", anno, got.GetAnnotations())
+		}
+	}
+}
+
+// A failure younger than 15m is still inside the retry window — quiet.
+func TestCheckFluxHelmReleaseRetriesFreshQuiet(t *testing.T) {
+	base := time.Now()
+	hr := shHR("apps", "hr", "False", "UpgradeFailed",
+		"upgrade failed", base.Add(-5*time.Minute))
+	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(hr))
+	p.now = func() time.Time { return base }
+
+	if res := p.checkFluxHelmReleaseRetries(ctx); !res.pass {
+		t.Fatalf("fresh failure must pass: %+v", res)
+	}
+}
+
+// A dependsOn HelmRelease that is itself not Ready blocks the patch —
+// the HR still FAILs (detection is independent of remediation).
+func TestCheckFluxHelmReleaseRetriesDepNotReady(t *testing.T) {
+	base := time.Now()
+	hr := shHR("apps", "hr", "False", "RetriesExhausted",
+		"retries exhausted", base.Add(-20*time.Minute))
+	_ = unstructured.SetNestedSlice(hr.Object, []any{
+		map[string]any{"name": "upstream"},
+	}, "spec", "dependsOn")
+	dep := shHR("apps", "upstream", "False", "InstallFailed",
+		"install failed", base.Add(-time.Hour))
+	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(hr, dep))
+	p.now = func() time.Time { return base }
+
+	res := p.checkFluxHelmReleaseRetries(ctx)
+	if res.pass {
+		t.Fatal("stuck HR must FAIL even when remediation is deferred")
+	}
+	got, _ := p.dyn.Resource(hrRetryGVR).Namespace("apps").
+		Get(ctx, "hr", metav1.GetOptions{})
+	if _, found, _ := unstructured.NestedString(
+		got.Object, "metadata", "annotations", fluxHRRequestedAtAnno); found {
+		t.Fatal("patch applied despite unready dependsOn")
+	}
+}
+
+// The 30m cooldown: a second sweep inside the window must not re-patch
+// — the requestedAt stamp we left is the durable half.
+func TestCheckFluxHelmReleaseRetriesCooldown(t *testing.T) {
+	base := time.Now()
+	hr := shHR("apps", "hr", "False", "UpgradeFailed",
+		"upgrade failed", base.Add(-time.Hour))
+	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(hr))
+	p.now = func() time.Time { return base }
+
+	if res := p.checkFluxHelmReleaseRetries(ctx); res.pass {
+		t.Fatal("precondition: stuck HR must FAIL")
+	}
+	first, _ := p.dyn.Resource(hrRetryGVR).Namespace("apps").
+		Get(ctx, "hr", metav1.GetOptions{})
+	firstToken, _, _ := unstructured.NestedString(
+		first.Object, "metadata", "annotations", fluxHRRequestedAtAnno)
+
+	// 10m later — still inside the 30m cooldown.
+	p.now = func() time.Time { return base.Add(10 * time.Minute) }
+	if res := p.checkFluxHelmReleaseRetries(ctx); res.pass {
+		t.Fatal("still-stuck HR must keep FAILING")
+	}
+	got, _ := p.dyn.Resource(hrRetryGVR).Namespace("apps").
+		Get(ctx, "hr", metav1.GetOptions{})
+	token, _, _ := unstructured.NestedString(
+		got.Object, "metadata", "annotations", fluxHRRequestedAtAnno)
+	if token != firstToken {
+		t.Fatal("re-patched inside the 30m cooldown")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W10-ST5 — percona-cluster-quorum
+// ---------------------------------------------------------------------------
+
+func TestCheckPerconaClusterQuorum(t *testing.T) {
+	base := time.Now()
+	errCluster := shUnstructured("pxc.percona.com/v1",
+		"PerconaXtraDBCluster", "db", "pxc", 3, 3)
+	_ = unstructured.SetNestedField(errCluster.Object, "error",
+		"status", "state")
+	paused := shUnstructured("psmdb.percona.com/v1",
+		"PerconaServerMongoDB", "db", "mongo", 3, 3)
+	_ = unstructured.SetNestedField(paused.Object, true, "spec", "pause")
+	_ = unstructured.SetNestedField(paused.Object, "error",
+		"status", "state")
+	ready := shUnstructured("pgv2.percona.com/v2",
+		"PerconaPGCluster", "db", "pg", 3, 3)
+	_ = unstructured.SetNestedField(ready.Object, "ready",
+		"status", "state")
+	_ = unstructured.SetNestedField(ready.Object, int64(2),
+		"status", "postgres", "ready")
+	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(
+		errCluster, paused, ready))
+	p.now = func() time.Time { return base }
+
+	res := p.checkPerconaClusterQuorum(ctx)
+	if res.pass {
+		t.Fatal("error-state cluster must FAIL")
+	}
+	if !strings.Contains(res.why, "pxc") {
+		t.Fatalf("offender must name the cluster: %q", res.why)
+	}
+	if strings.Contains(res.why, "mongo") {
+		t.Fatalf("paused cluster must not be flagged: %q", res.why)
+	}
+}
+
+// ready<1 (top-level AND the nested status.postgres.ready PG shape)
+// flags an unpaused cluster.
+func TestCheckPerconaClusterQuorumReadyZero(t *testing.T) {
+	base := time.Now()
+	pxc := shUnstructured("pxc.percona.com/v1",
+		"PerconaXtraDBCluster", "db", "pxc", 3, 3)
+	_ = unstructured.SetNestedField(pxc.Object, "ready", "status", "state")
+	_ = unstructured.SetNestedField(pxc.Object, int64(0), "status", "ready")
+	pg := shUnstructured("pgv2.percona.com/v2",
+		"PerconaPGCluster", "db", "pg", 3, 3)
+	_ = unstructured.SetNestedField(pg.Object, "ready", "status", "state")
+	_ = unstructured.SetNestedField(pg.Object, int64(0),
+		"status", "postgres", "ready")
+	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(pxc, pg))
+	p.now = func() time.Time { return base }
+
+	res := p.checkPerconaClusterQuorum(ctx)
+	if res.pass {
+		t.Fatal("ready<1 clusters must FAIL")
+	}
+	if !strings.Contains(res.why, "pxc") || !strings.Contains(res.why, "pg") {
+		t.Fatalf("both clusters must be flagged: %q", res.why)
+	}
+}
+
+// "initializing" gets the 30m grace window: first sighting passes,
+// past the window it FAILs; resolving clears the timer.
+func TestCheckPerconaClusterQuorumInitializing(t *testing.T) {
+	base := time.Now()
+	init := shUnstructured("pxc.percona.com/v1",
+		"PerconaXtraDBCluster", "db", "pxc", 3, 3)
+	_ = unstructured.SetNestedField(init.Object, "initializing",
+		"status", "state")
+	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(init))
+	p.now = func() time.Time { return base }
+
+	if res := p.checkPerconaClusterQuorum(ctx); !res.pass {
+		t.Fatalf("fresh initializing must pass: %+v", res)
+	}
+	// 31m later — still initializing → FAIL.
+	p.now = func() time.Time { return base.Add(31 * time.Minute) }
+	if res := p.checkPerconaClusterQuorum(ctx); res.pass {
+		t.Fatal("initializing >30m must FAIL")
 	}
 }

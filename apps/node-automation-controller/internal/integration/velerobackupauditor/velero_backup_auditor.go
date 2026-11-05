@@ -28,8 +28,10 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -60,6 +62,11 @@ var (
 		Group: "velero.io", Version: "v1", Resource: "backups"}
 	veleroBSLGVR = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v1", Resource: "backupstoragelocations"}
+	// W10-ST6 — podvolumebackups.velero.io: per-volume snapshots
+	// taken by the node-agent DaemonSet; a wedged InProgress PVB
+	// blocks the next backup's volume phase.
+	veleroPVBGVR = schema.GroupVersionResource{
+		Group: "velero.io", Version: "v1", Resource: "podvolumebackups"}
 	// W9-ST3 — Percona Everest operator CRDs: the DatabaseCluster
 	// declares spec.backup.enabled and the DatabaseClusterBackup
 	// carries spec.dbClusterName + status.state.
@@ -83,6 +90,21 @@ var veleroStuckPhases = map[string]string{
 }
 
 const veleroStuckMaxAge = 6 * time.Hour
+
+// veleroMissingBackupMaxAge is the W10-FIX6 zero-backup threshold:
+// a Schedule (or backup-enabled DatabaseCluster) older than 36h
+// that has produced ZERO backup objects is silently unprotected —
+// same horizon as the Everest stale check.
+const veleroMissingBackupMaxAge = 36 * time.Hour
+
+// veleroPVBCleanup* bound the W10-ST6 wedged-PVB cleaner: only
+// InProgress PVBs past the 6h stuck window are candidates, at most
+// this many are cleaned per sweep, and a cleaned PVB name cools down
+// so a still-broken agent cannot be delete-looped.
+const (
+	veleroPVBCleanupMaxPerRun = 3
+	veleroPVBCleanupCooldown  = 30 * time.Minute
+)
 
 // W9-ST3 — Everest backup health thresholds: a backup still
 // Running/Starting after 6h lost the thread (same window as the
@@ -131,6 +153,14 @@ type veleroBackupAuditor struct {
 	// DeleteLabelValues'd so a recovered or deleted
 	// DatabaseCluster never pins the gauge.
 	seenEverest map[everestKey]bool
+	// seenStuckBackup / seenWedgedPVB: series ledgers for the
+	// W10-ST6 in-flight gauges — same prune-on-resolve contract.
+	seenStuckBackup map[pausedKey]bool
+	seenWedgedPVB   map[pausedKey]bool
+	// pvbHealed: "<ns>/<name>" -> last wedged-PVB cleanup time —
+	// the per-object cooldown that stops a still-broken node-agent
+	// from being delete-looped every sweep.
+	pvbHealed map[string]time.Time
 }
 
 // Setup registers the 15m sweep — or nothing when
@@ -151,6 +181,9 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
 		seenBSL:         map[pausedKey]bool{},
 		firstSeenPaused: map[pausedLedgerKey]time.Time{},
 		seenEverest:     map[everestKey]bool{},
+		seenStuckBackup: map[pausedKey]bool{},
+		seenWedgedPVB:   map[pausedKey]bool{},
+		pvbHealed:       map[string]time.Time{},
 	}
 	return shared.AddPeriodic(mgr, veleroAuditQueue, veleroAuditInterval, a.run)
 }
@@ -176,6 +209,15 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	}
 	if a.seenEverest == nil {
 		a.seenEverest = map[everestKey]bool{}
+	}
+	if a.seenStuckBackup == nil {
+		a.seenStuckBackup = map[pausedKey]bool{}
+	}
+	if a.seenWedgedPVB == nil {
+		a.seenWedgedPVB = map[pausedKey]bool{}
+	}
+	if a.pvbHealed == nil {
+		a.pvbHealed = map[string]time.Time{}
 	}
 
 	// W9-ST3 — the Everest DB-backup audit is independent of Velero:
@@ -218,7 +260,8 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		// real pause duration from first sight; an entry pruned on
 		// unpause means a re-pause restarts the clock, and the UID in
 		// the key keeps a delete+recreate from inheriting pause time.
-		if paused, _, _ := unstructured.NestedBool(s.Object, "spec", "paused"); paused {
+		isPaused, _, _ := unstructured.NestedBool(s.Object, "spec", "paused")
+		if isPaused {
 			lk := pausedLedgerKey{string(s.GetUID()), ns, name}
 			pausedNow[lk] = true
 			if _, ok := a.firstSeenPaused[lk]; !ok {
@@ -238,7 +281,15 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		// Check 2 — the latest schedule-owned Backup empty/errored.
 		b := latest[ns+"/"+name]
 		if b == nil {
-			continue // never produced a backup — nothing to judge
+			// W10-FIX6 — zero Backup objects is not "nothing to
+			// judge" once the Schedule itself is old enough to have
+			// produced some. A paused Schedule is exempt: it
+			// legitimately stops producing (check 1 already covers
+			// it).
+			if !isPaused {
+				a.flagMissingBackups(ctx, s, ns, name, currentBad)
+			}
+			continue
 		}
 		a.flagBadBackup(ctx, b, ns, name, currentBad)
 	}
@@ -301,10 +352,17 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	}
 	a.seenBSL = currentBSL
 
+	// W10-ST6 — in-flight transfer audit: mark Backups/PVBs wedged
+	// InProgress|Deleting >6h, and clean up PVBs whose node-agent
+	// provably lost the Kopia thread. Runs on the already-listed
+	// backups plus its own PVB/pod reads; independent of the
+	// schedule checks above.
+	stuckErr := a.auditInFlightTransfers(ctx, backups)
+
 	log.Info("sweep done", "schedules", len(schedules.Items),
 		"paused", len(currentPaused), "badBackups", len(currentBad),
 		"bslUnavailable", len(currentBSL))
-	return everestErr
+	return errors.Join(everestErr, stuckErr)
 }
 
 // latestBackupsBySchedule indexes the newest Backup per owning
@@ -328,6 +386,31 @@ func latestBackupsBySchedule(backups *unstructured.UnstructuredList) map[string]
 		}
 	}
 	return out
+}
+
+// flagMissingBackups is the W10-FIX6 zero-backup check: a Schedule
+// older than veleroMissingBackupMaxAge (36h) that has produced ZERO
+// Backup objects is silently unprotected — the schedule fires, the
+// backups vanish (or never ran), and every other check sees
+// "nothing to judge". Flags reason=missing on the same
+// VeleroBackupEmptyOrErrored series the other rot signatures use.
+// A zero creationTimestamp cannot prove age — skipped (fail closed).
+func (a *veleroBackupAuditor) flagMissingBackups(ctx context.Context,
+	s *unstructured.Unstructured, ns, schedule string, current map[backupKey]bool) {
+	log := logf.FromContext(ctx)
+	created := s.GetCreationTimestamp()
+	if created.IsZero() {
+		return
+	}
+	age := a.nowFn().Sub(created.Time)
+	if age <= veleroMissingBackupMaxAge {
+		return
+	}
+	current[backupKey{ns, schedule, "missing"}] = true
+	metrics.VeleroBackupEmptyOrErrored.
+		WithLabelValues(ns, schedule, "missing").Set(1)
+	log.Info("velero schedule older than 36h has zero backups — silently unprotected",
+		"schedule", ns+"/"+schedule, "age", age.Truncate(time.Hour))
 }
 
 // flagBadBackup evaluates the latest Backup's status against the
@@ -478,6 +561,18 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 		}
 		clusterBackups := byCluster[ns+"/"+name]
 		reasons := everestBackupReasons(clusterBackups, now)
+		// W10-FIX6 — same zero-backup blind spot as the Velero
+		// Schedule check: a backup-enabled DatabaseCluster older
+		// than 36h with ZERO DatabaseClusterBackups is silently
+		// unprotected. Caller-side because the age clock belongs to
+		// the cluster, not the (empty) backup list.
+		if len(clusterBackups) == 0 {
+			dcCreated := dc.GetCreationTimestamp()
+			if !dcCreated.IsZero() &&
+				now.Sub(dcCreated.Time) > veleroMissingBackupMaxAge {
+				reasons = append(reasons, "missing")
+			}
+		}
 		for _, reason := range reasons {
 			k := everestKey{ns, name, reason}
 			current[k] = true
@@ -553,4 +648,244 @@ func everestBackupReasons(backups []*unstructured.Unstructured,
 		break // newest Succeeded decides — older ones are history
 	}
 	return reasons
+}
+
+// ---------------------------------------------------------------------------
+// W10-ST6 — in-flight Backup / PodVolumeBackup wedge audit
+// ---------------------------------------------------------------------------
+
+// auditInFlightTransfers is the W10-ST6 sweep: every Backup and
+// PodVolumeBackup held InProgress or Deleting past veleroStuckMaxAge
+// (6h) has lost the thread — the velero server or node-agent that
+// owned it is gone. Backups are mark-only (deleting a Backup CR can
+// abort a genuinely-running backup); PodVolumeBackups get the
+// stronger treatment the plan calls for: when the owning node-agent
+// provably lost its Kopia thread (pod gone, recreated after the PVB
+// started, not Running, or a container restarted mid-backup), the
+// wedged PVB is deleted AND its node-agent pod bounced so the next
+// scheduled backup is not blocked behind it.
+func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
+	backups *unstructured.UnstructuredList) error {
+	log := logf.FromContext(ctx)
+	now := a.nowFn()
+
+	// --- Backups: mark-only gauge over the already-listed set ---
+	currentStuck := map[pausedKey]bool{}
+	if backups != nil {
+		for i := range backups.Items {
+			b := &backups.Items[i]
+			phase, _, _ := unstructured.NestedString(b.Object, "status", "phase")
+			if phase != "InProgress" && phase != "Deleting" {
+				continue
+			}
+			since := inFlightSince(b)
+			if now.Sub(since) <= veleroStuckMaxAge {
+				continue
+			}
+			k := pausedKey{b.GetNamespace(), b.GetName()}
+			currentStuck[k] = true
+			metrics.VeleroBackupStuck.WithLabelValues(k.namespace, k.schedule).Set(1)
+			log.Info("velero backup wedged in-flight >6h",
+				"backup", k.namespace+"/"+k.schedule, "phase", phase)
+		}
+	}
+	for k := range a.seenStuckBackup {
+		if !currentStuck[k] {
+			metrics.VeleroBackupStuck.DeleteLabelValues(k.namespace, k.schedule)
+		}
+	}
+	a.seenStuckBackup = currentStuck
+
+	// --- PodVolumeBackups: mark + conditional cleanup ---
+	pvbs, err := a.dyn.Resource(veleroPVBGVR).List(ctx, metav1.ListOptions{})
+	switch {
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		// CRD absent — clear any stale wedge series and stop.
+		for k := range a.seenWedgedPVB {
+			metrics.VeleroPodVolumeBackupWedged.DeleteLabelValues(k.namespace, k.schedule)
+		}
+		a.seenWedgedPVB = map[pausedKey]bool{}
+		return nil
+	case err != nil:
+		return fmt.Errorf("list velero podvolumebackups: %w", err)
+	}
+
+	currentWedged := map[pausedKey]bool{}
+	cleaned := 0
+	for i := range pvbs.Items {
+		pvb := &pvbs.Items[i]
+		phase, _, _ := unstructured.NestedString(pvb.Object, "status", "phase")
+		if phase != "InProgress" && phase != "Deleting" {
+			continue
+		}
+		since := inFlightSince(pvb)
+		if now.Sub(since) <= veleroStuckMaxAge {
+			continue
+		}
+		ns, name := pvb.GetNamespace(), pvb.GetName()
+		k := pausedKey{ns, name}
+		currentWedged[k] = true
+		metrics.VeleroPodVolumeBackupWedged.WithLabelValues(ns, name).Set(1)
+		log.Info("velero podvolumebackup wedged in-flight >6h",
+			"pvb", ns+"/"+name, "phase", phase)
+
+		// Only an InProgress PVB is a cleanup candidate — a
+		// Deleting one is already on its way out.
+		if phase != "InProgress" || cleaned >= veleroPVBCleanupMaxPerRun {
+			continue
+		}
+		if last, ok := a.pvbHealed[ns+"/"+name]; ok &&
+			now.Sub(last) < veleroPVBCleanupCooldown {
+			continue
+		}
+		if a.cleanWedgedPVB(ctx, pvb, since) {
+			a.pvbHealed[ns+"/"+name] = now
+			cleaned++
+		}
+	}
+	for k := range a.seenWedgedPVB {
+		if !currentWedged[k] {
+			metrics.VeleroPodVolumeBackupWedged.DeleteLabelValues(k.namespace, k.schedule)
+		}
+	}
+	a.seenWedgedPVB = currentWedged
+	return nil
+}
+
+// inFlightSince is the wedge-age clock for an in-flight velero
+// object: status.startTimestamp when parseable, else
+// creationTimestamp — the same convention flagBadBackup uses.
+func inFlightSince(u *unstructured.Unstructured) time.Time {
+	since := u.GetCreationTimestamp().Time
+	if st, found, _ := unstructured.NestedString(u.Object, "status", "startTimestamp"); found {
+		if t, err := time.Parse(time.RFC3339, st); err == nil {
+			since = t
+		}
+	}
+	return since
+}
+
+// cleanWedgedPVB decides whether the PVB's node-agent provably lost
+// its Kopia thread and, if so, deletes the PVB and bounces the agent
+// pod. Returns true when the cleanup ran (cooldown-worthy).
+func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
+	pvb *unstructured.Unstructured, pvbStart time.Time) bool {
+	log := logf.FromContext(ctx)
+	agent, err := a.pvbAgentPod(ctx, pvb)
+	if err != nil {
+		log.Error(err, "pvb agent pod lookup failed — cleanup skipped",
+			"pvb", pvb.GetNamespace()+"/"+pvb.GetName())
+		metrics.IncError(veleroAuditQueue)
+		return false
+	}
+	if !pvbAgentWedged(pvbStart, agent) {
+		return false // agent still owns the thread — not provably wedged
+	}
+	ns, name := pvb.GetNamespace(), pvb.GetName()
+	uid := pvb.GetUID()
+	if err := a.dyn.Resource(veleroPVBGVR).Namespace(ns).Delete(ctx, name,
+		metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &uid},
+		}); err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "wedged pvb delete failed", "pvb", ns+"/"+name)
+		metrics.IncError(veleroAuditQueue)
+		return false
+	}
+	metrics.VeleroWedgedObjectsCleanedTotal.
+		WithLabelValues(ns, "pvb_deleted").Inc()
+	log.Info("ACTION: deleted wedged podvolumebackup",
+		"pvb", ns+"/"+name, "agentPod", agentPodName(agent))
+
+	// Bounce the node-agent pod so its next scheduled backup starts
+	// clean — the DaemonSet recreates it. A missing agent pod needs
+	// no bounce (it is already gone).
+	if agent != nil {
+		agentUID := agent.UID
+		if err := a.cs.CoreV1().Pods(agent.Namespace).Delete(ctx, agent.Name,
+			metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &agentUID},
+			}); err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "node-agent bounce failed",
+				"pod", agent.Namespace+"/"+agent.Name)
+			metrics.IncError(veleroAuditQueue)
+		} else {
+			metrics.VeleroWedgedObjectsCleanedTotal.
+				WithLabelValues(ns, "pod_restarted").Inc()
+			log.Info("ACTION: bounced node-agent pod",
+				"pod", agent.Namespace+"/"+agent.Name)
+		}
+	}
+	return true
+}
+
+// pvbAgentPod resolves the node-agent pod that owns the PVB's Kopia
+// thread. PodVolumeBackupSpec carries spec.node (the node the
+// snapshot runs on) and spec.pod (the WORKLOAD pod — not the
+// agent); status has no pod/node fields. The velero node-agent
+// DaemonSet runs one pod per node, so spec.node identifies it.
+// nil,nil means "no agent pod found" which IS wedge evidence.
+func (a *veleroBackupAuditor) pvbAgentPod(ctx context.Context,
+	pvb *unstructured.Unstructured) (*corev1.Pod, error) {
+	ns := pvb.GetNamespace()
+	node, found, _ := unstructured.NestedString(pvb.Object, "spec", "node")
+	if !found || node == "" {
+		// Older velero wrote the node under status — accept it as a
+		// fallback so pre-upgrade PVBs still resolve.
+		node, _, _ = unstructured.NestedString(pvb.Object, "status", "node")
+	}
+	if node == "" {
+		return nil, nil
+	}
+	pods, err := a.cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + node,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Prefer an actual node-agent pod; the DaemonSet names them
+	// "node-agent-*". Fall back to the first pod on the node —
+	// velero's namespace is otherwise quiet.
+	for i := range pods.Items {
+		if strings.Contains(pods.Items[i].Name, "node-agent") {
+			return &pods.Items[i], nil
+		}
+	}
+	if len(pods.Items) > 0 {
+		return &pods.Items[0], nil
+	}
+	return nil, nil
+}
+
+// pvbAgentWedged reports whether the agent pod provably lost its
+// Kopia thread: the pod is gone, not Running, was (re)created after
+// the PVB started, or any container restarted/terminated after the
+// PVB started — in every case the in-process kopia backup is dead
+// while the PVB object still claims InProgress.
+func pvbAgentWedged(pvbStart time.Time, pod *corev1.Pod) bool {
+	if pod == nil {
+		return true // agent gone — nothing owns the thread
+	}
+	if pod.Status.Phase != corev1.PodRunning {
+		return true
+	}
+	if pod.Status.StartTime != nil && pod.Status.StartTime.Time.After(pvbStart) {
+		return true
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Running != nil && cs.State.Running.StartedAt.After(pvbStart) {
+			return true
+		}
+		if cs.LastTerminationState.Terminated != nil &&
+			cs.LastTerminationState.Terminated.FinishedAt.After(pvbStart) {
+			return true
+		}
+	}
+	return false
+}
+
+func agentPodName(p *corev1.Pod) string {
+	if p == nil {
+		return "<none>"
+	}
+	return p.Namespace + "/" + p.Name
 }

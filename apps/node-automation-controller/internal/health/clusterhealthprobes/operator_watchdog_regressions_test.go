@@ -5,9 +5,10 @@
 //     are static references since Flux v2.2 (no reconciler writes
 //     status on them), so the generic stale-generation signature
 //     flagged every healthy OCI repo forever.
-//   - notification-controller dropped from operatorTargets — its
-//     v1beta3 Alert/Provider/Receiver are static objects for the same
-//     reason (the passiontech-k0s-nonprod false-positive incident).
+//   - notification-controller carries ZERO CR resources — its
+//     v1beta3 Alert/Provider/Receiver are static objects (W10-CP3
+//     restored the target for lease liveness only; the
+//     passiontech-k0s-nonprod false-positive incident still applies).
 //   - leaderPods selector fallback capped at ONE pod (the oldest)
 //     instead of deleting every matched replica — the cilium-operator
 //     triple-delete that wedged the operator outright.
@@ -261,14 +262,14 @@ func TestCheckOperatorWorkqueuesHealsOneReplicaOnly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// notification-controller — target removed entirely
+// notification-controller — zero CR resources (W10-CP3)
 // ---------------------------------------------------------------------------
 
-// The notification-controller entry is gone from operatorTargets, so
-// a renewing notification lease beside never-reconciled v1beta3
-// Alert/Provider/Receiver objects keeps the check quiet AND leaves
-// nothing tracked — the objects are static (no reconciler writes
-// status.observedGeneration on them since the API dropped the
+// The notification-controller target is back for lease-liveness
+// parity but watches NO CRs: a renewing notification lease beside
+// never-reconciled v1beta3 Alert/Provider/Receiver objects keeps the
+// check quiet AND leaves nothing tracked — the objects are static
+// (no reconciler writes status on them since the API dropped the
 // reconcilers), so watching them could only produce permanent false
 // positives.
 func TestCheckOperatorWorkqueuesNotificationObjectsIgnored(t *testing.T) {
@@ -288,8 +289,8 @@ func TestCheckOperatorWorkqueuesNotificationObjectsIgnored(t *testing.T) {
 	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
 		t.Fatalf("static notification objects must keep the check quiet: %+v", res)
 	}
-	// No target means nothing is even scanned — no first-seen keys
-	// may be stamped for the removed operator.
+	// Zero resources means nothing is even scanned — no first-seen
+	// keys may be stamped for the static notification objects.
 	for k := range p.opFirstSeen {
 		if strings.HasPrefix(k, "notification-controller/") {
 			t.Fatalf("notification objects must not be tracked: %v", p.opFirstSeen)

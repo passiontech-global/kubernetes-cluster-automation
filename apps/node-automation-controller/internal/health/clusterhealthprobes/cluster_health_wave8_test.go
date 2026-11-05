@@ -169,5 +169,30 @@ func TestDBOperatorFor(t *testing.T) {
 	}
 }
 
+// W10-FIX4 — dbOperatorPodPrefixes resolves BOTH spellings of a
+// Percona operator to the same alias group: the long Deployment
+// name AND the short chart alias must yield every pod-name prefix,
+// whichever spelling dbOperatorFor matched.
+func TestDBOperatorPodPrefixes(t *testing.T) {
+	want := []string{"percona-xtradb-cluster-operator", "pxc-operator"}
+	for _, in := range []string{
+		"percona-xtradb-cluster-operator", "pxc-operator"} {
+		got := dbOperatorPodPrefixes(in)
+		if len(got) != len(want) {
+			t.Fatalf("dbOperatorPodPrefixes(%q)=%v, want %v", in, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("dbOperatorPodPrefixes(%q)=%v, want %v", in, got, want)
+			}
+		}
+	}
+	// Non-aliased operator → bare name only.
+	if got := dbOperatorPodPrefixes("scylla-operator"); len(got) != 1 ||
+		got[0] != "scylla-operator" {
+		t.Fatalf("dbOperatorPodPrefixes(scylla)=%v, want [scylla-operator]", got)
+	}
+}
+
 // findMetric/healthGauge/testProberDyn live in
 // cluster_health_probes_test.go — same package.

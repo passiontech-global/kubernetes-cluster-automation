@@ -233,6 +233,191 @@ func TestWatchdogPodListError(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// W10-NM2 — wedged cloudflared connector healer.
+// ---------------------------------------------------------------------------
+
+// staleUnreadyProxyPod is proxyPod plus a Ready=False condition whose
+// LastTransitionTime is `age` in the past — old enough for the
+// wedge healer to consider it.
+func staleUnreadyProxyPod(name string, created, unreadyFor time.Time) *corev1.Pod {
+	p := proxyPod(name, false)
+	p.CreationTimestamp = metav1.NewTime(created)
+	lt := metav1.NewTime(unreadyFor)
+	p.Status.Conditions[0].LastTransitionTime = lt
+	return p
+}
+
+// connectorPod builds a pod in the ingress-controller namespace with
+// the controlled-cloudflared-connector label.
+func connectorPod(name string, created, unreadyFor time.Time) *corev1.Pod {
+	p := staleUnreadyProxyPod(name, created, unreadyFor)
+	p.Namespace = cfTunnelConnectorNS
+	p.Labels = map[string]string{"app": "controlled-cloudflared-connector"}
+	return p
+}
+
+// cfLogReactor answers pod log reads in cfWatchdogTestNS (the fake
+// GetLogs action carries no pod name, so the body is shared across
+// pods in a namespace).
+func cfLogReactor(body string) ktesting.ReactionFunc {
+	return func(a ktesting.Action) (bool, runtime.Object, error) {
+		if a.GetSubresource() != "log" {
+			return false, nil, nil
+		}
+		return true, &runtime.Unknown{Raw: []byte(body)}, nil
+	}
+}
+
+func cfPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
+	t.Helper()
+	_, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+	return err == nil
+}
+
+// A stale-unready pod whose logs carry a fatal cloudflared signature
+// is deleted even while siblings stay Ready — config resync cannot
+// revive "Couldn't start tunnel".
+func TestWatchdogDeletesPodWithFatalLogs(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		proxyPod("proxy-ok", true),
+		staleUnreadyProxyPod("proxy-wedged",
+			now.Add(-time.Hour), now.Add(-10*time.Minute)),
+		proxyDeploy(nil))
+	cs.PrependReactor("get", "pods", cfLogReactor(
+		"2026-11-20T00:00:00Z ERR Failed to sufficiently increase receive buffer size\n"))
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, nowFn: func() time.Time { return now }}
+	if err := w.run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if cfPodExists(t, cs, cfWatchdogTestNS, "proxy-wedged") {
+		t.Fatal("fatal-log pod not deleted")
+	}
+	if !cfPodExists(t, cs, cfWatchdogTestNS, "proxy-ok") {
+		t.Fatal("ready pod deleted")
+	}
+}
+
+// readyCount==0 deadlock: every running replica unready >=5m with
+// clean logs — the resync loop can never converge, so the OLDEST
+// pod is deleted once per cooldown instead of skipping forever.
+func TestWatchdogAllUnreadyDeletesOldest(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		staleUnreadyProxyPod("proxy-new",
+			now.Add(-30*time.Minute), now.Add(-6*time.Minute)),
+		staleUnreadyProxyPod("proxy-old",
+			now.Add(-time.Hour), now.Add(-20*time.Minute)),
+		proxyDeploy(nil))
+	cs.PrependReactor("get", "pods", cfLogReactor("INF tunnel running normally\n"))
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, nowFn: func() time.Time { return now }}
+	if err := w.run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if cfPodExists(t, cs, cfWatchdogTestNS, "proxy-old") {
+		t.Fatal("oldest all-unready pod not deleted")
+	}
+	if !cfPodExists(t, cs, cfWatchdogTestNS, "proxy-new") {
+		t.Fatal("younger pod deleted — only ONE pod per sweep")
+	}
+	// Within the 10m cooldown a recreated same-name pod must not be
+	// deleted again.
+	cs2 := fake.NewSimpleClientset(
+		staleUnreadyProxyPod("proxy-old",
+			now.Add(-5*time.Minute), now.Add(-time.Minute)),
+		proxyDeploy(nil))
+	cs2.PrependReactor("get", "pods", cfLogReactor("INF ok\n"))
+	w2 := &cfTunnelProxyWatchdog{cs: cs2, namespace: cfWatchdogTestNS}
+	w2.lastHeal = map[string]time.Time{
+		cfWatchdogTestNS + "/proxy-old": now.Add(-5 * time.Minute),
+	}
+	w2.nowFn = func() time.Time { return now }
+	if err := w2.run(ctx); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+	if !cfPodExists(t, cs2, cfWatchdogTestNS, "proxy-old") {
+		t.Fatal("pod deleted inside the 10m cooldown")
+	}
+}
+
+// Pods unready for less than 5m are startup churn — never deleted,
+// logs never even read.
+func TestWatchdogYoungUnreadyPodUntouched(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		staleUnreadyProxyPod("proxy-fresh",
+			now.Add(-2*time.Minute), now.Add(-30*time.Second)),
+		proxyDeploy(nil))
+	var logReads int
+	cs.PrependReactor("get", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetSubresource() == "log" {
+				logReads++
+			}
+			return false, nil, nil
+		})
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, nowFn: func() time.Time { return now }}
+	if err := w.run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !cfPodExists(t, cs, cfWatchdogTestNS, "proxy-fresh") {
+		t.Fatal("young unready pod deleted")
+	}
+	if logReads != 0 {
+		t.Fatalf("logs read %d times for a pod inside the 5m grace window", logReads)
+	}
+}
+
+// The ingress-controller namespace is scanned too: a wedged
+// controlled-cloudflared-connector pod is deleted under its own
+// label scheme.
+func TestWatchdogHealsIngressControllerNamespace(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(
+		connectorPod("ingress-wedged",
+			now.Add(-time.Hour), now.Add(-15*time.Minute)),
+		proxyDeploy(nil))
+	cs.PrependReactor("get", "pods", cfLogReactor(
+		"2026-11-20T00:00:00Z ERR Serve tunnel error error=\"connection refused\"\n"))
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS, nowFn: func() time.Time { return now }}
+	if err := w.run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if cfPodExists(t, cs, cfTunnelConnectorNS, "ingress-wedged") {
+		t.Fatal("wedged ingress-controller connector not deleted")
+	}
+}
+
+// cloudflaredLogsWedged signature table — the fatal strings match
+// case-insensitively; the edge-error loop needs >=3 error lines.
+func TestCloudflaredLogsWedged(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		logs string
+		want bool
+	}{
+		{"clean", "INF Registered tunnel connection\nINF metrics server started\n", false},
+		{"couldnt start", "ERR Couldn't start tunnel\n", true},
+		{"recv buffer", "ERR Failed to sufficiently increase receive buffer size\n", true},
+		{"serve tunnel", "ERR Serve tunnel error error=\"dial tcp: timeout\"\n", true},
+		{"edge loop", "ERR connection with edge closed\n" +
+			"ERR connection with edge closed\n" +
+			"ERR connection with edge reset\n", true},
+		{"edge single blip", "ERR connection with edge closed\nINF retrying\n", false},
+		{"edge info lines only",
+			"INF connection with edge established\n" +
+				"INF connection with edge registered\n" +
+				"INF connection with edge ready\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cloudflaredLogsWedged(tc.logs); got != tc.want {
+				t.Fatalf("cloudflaredLogsWedged = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // Disabled must be a clean no-op — nothing registered, no error.
 func TestSetupCFTunnelProxyWatchdogDisabled(t *testing.T) {
 	m := testutil.NewStubManager()

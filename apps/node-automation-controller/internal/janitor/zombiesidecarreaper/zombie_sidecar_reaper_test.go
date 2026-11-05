@@ -19,6 +19,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -431,6 +432,182 @@ func TestZombieSidecarNonZeroExitReaped(t *testing.T) {
 	}
 	if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("non-zero-exit pod kept — Job gate must not apply")
+	}
+}
+
+// W10-FIX3 — a failed direct pod-IP shutdown falls back to the
+// apiserver pods/<name>:<port>/proxy subresource: the pod is poked
+// (one graceful cycle) instead of deleted on the spot, and the next
+// cycle still reaps it when it keeps qualifying.
+func TestZombieSidecarProxyFallbackOnDirectFailure(t *testing.T) {
+	metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
+	t.Cleanup(func() { metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs") })
+
+	pod := zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0)
+	cs := fake.NewSimpleClientset(pod)
+	probe := &zsrShutdownProbe{err: errors.New("dial tcp 10.0.0.9:4191: i/o timeout")}
+	proxyCalls := 0
+	r := &zombieSidecarReaper{cs: cs, nowFn: time.Now,
+		shutdownFn: probe.fn,
+		proxyFn: func(_ context.Context, p *corev1.Pod, sidecar string) error {
+			proxyCalls++
+			if p.Name != "job-x-abcde" || p.Namespace != "jobs" ||
+				sidecar != "linkerd-proxy" {
+				t.Errorf("proxyFn args = %s/%s %q", p.Namespace, p.Name, sidecar)
+			}
+			return nil
+		},
+		poked: map[string]bool{}, tried: map[string]bool{}}
+
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if proxyCalls != 1 {
+		t.Fatalf("proxy fallback calls = %d, want 1", proxyCalls)
+	}
+	if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		t.Fatal("pod deleted on the graceful-proxy cycle — must survive one shutdown")
+	}
+	if !r.poked[zombieKey(pod)] {
+		t.Fatal("pod not recorded in poked ledger after proxy shutdown")
+	}
+
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		t.Fatal("pod still alive after the graceful cycle — should be reaped")
+	}
+	if proxyCalls != 1 {
+		t.Fatal("proxy shutdown retried on the delete cycle")
+	}
+}
+
+// A pod with no podIP cannot take the direct admin call at all —
+// the proxy fallback is the only graceful path and must run.
+func TestZombieSidecarProxyFallbackNoPodIP(t *testing.T) {
+	pod := zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0)
+	pod.Status.PodIP = ""
+	cs := fake.NewSimpleClientset(pod)
+	probe := &zsrShutdownProbe{}
+	proxyCalls := 0
+	r := zsrReaper(cs, probe)
+	r.proxyFn = func(_ context.Context, _ *corev1.Pod, _ string) error {
+		proxyCalls++
+		return nil
+	}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(probe.calls) != 0 {
+		t.Fatalf("direct shutdown called %d times with no podIP", len(probe.calls))
+	}
+	if proxyCalls != 1 {
+		t.Fatalf("proxy fallback calls = %d, want 1", proxyCalls)
+	}
+	if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		t.Fatal("pod deleted on the graceful cycle")
+	}
+}
+
+// W10-FIX3 — backoffLimit==0 Jobs spawn no replacement pod, so an
+// all-exit-0 zombie may be reaped even while job.Status.Succeeded is
+// still 0 — but only AFTER a shutdown attempt already ran.
+func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
+	zero := int32(0)
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "jobs", Name: "job-x"},
+		Spec:       batchv1.JobSpec{BackoffLimit: &zero},
+		// Status.Succeeded stays 0 — the zombie pod never let the
+		// Job controller count the completion.
+	}
+
+	t.Run("graceful-then-reap", func(t *testing.T) {
+		metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
+		t.Cleanup(func() {
+			metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
+		})
+		cs := fake.NewSimpleClientset(
+			zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0), job.DeepCopy())
+		r := zsrReaper(cs, &zsrShutdownProbe{})
+		if err := r.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+			t.Fatal("pod reaped on the graceful cycle")
+		}
+		if err := r.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+			t.Fatal("backoffLimit=0 zombie kept after the shutdown cycle")
+		}
+	})
+
+	t.Run("failed-shutdown-prior-cycle", func(t *testing.T) {
+		metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
+		t.Cleanup(func() {
+			metrics.ZombieSidecarPodsReapedTotal.DeleteLabelValues("jobs")
+		})
+		cs := fake.NewSimpleClientset(
+			zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0), job.DeepCopy())
+		r := zsrReaper(cs, &zsrShutdownProbe{err: errors.New("refused")})
+		r.proxyFn = func(_ context.Context, _ *corev1.Pod, _ string) error {
+			return errors.New("proxy refused")
+		}
+		// Cycle 1: both shutdown paths failed but NO prior attempt
+		// exists — the pod is kept (the plan's "prior cycle" rule).
+		if err := r.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+			t.Fatal("reaped on first sight — shutdown attempt must precede")
+		}
+		// Cycle 2: a shutdown attempt ran last cycle — reap now.
+		if err := r.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+			t.Fatal("backoffLimit=0 zombie kept after a prior shutdown attempt")
+		}
+	})
+
+	t.Run("nonzero-backofflimit-still-kept", func(t *testing.T) {
+		three := int32(3)
+		j := job.DeepCopy()
+		j.Spec.BackoffLimit = &three
+		cs := fake.NewSimpleClientset(
+			zsrPod("jobs", "job-x-abcde", 10*time.Minute, 0), j)
+		r := zsrReaper(cs, &zsrShutdownProbe{})
+		for i := 0; i < 3; i++ {
+			if err := r.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+			t.Fatal("backoffLimit=3 zombie reaped — Job could respawn it")
+		}
+	})
+}
+
+// The proxy fallback must hit the real apiserver path
+// POST /api/v1/namespaces/<ns>/pods/<name>:<port>/proxy/<path> —
+// verified against a clientset pointed at httptest (the fake
+// clientset's RESTClient is a typed nil).
+func TestZombieSidecarProxyShutdownRequest(t *testing.T) {
+	var gotMethod, gotPath string
+	cs := testutil.ProbeClientset(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	})
+	r := &zombieSidecarReaper{cs: cs}
+	p := zsrPod("jobs", "job-x-abcde", time.Minute, 0)
+	if err := r.proxyShutdown(ctx, p, "linkerd-proxy"); err != nil {
+		t.Fatalf("proxyShutdown: %v", err)
+	}
+	want := "/api/v1/namespaces/jobs/pods/job-x-abcde:4191/proxy/shutdown"
+	if gotMethod != http.MethodPost || gotPath != want {
+		t.Fatalf("proxy request = %s %s, want POST %s", gotMethod, gotPath, want)
 	}
 }
 

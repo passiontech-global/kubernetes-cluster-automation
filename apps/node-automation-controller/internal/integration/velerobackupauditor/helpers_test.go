@@ -22,6 +22,7 @@ func newDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 		veleroScheduleGVR:   "ScheduleList",
 		veleroBackupGVR:     "BackupList",
 		veleroBSLGVR:        "BackupStorageLocationList",
+		veleroPVBGVR:        "PodVolumeBackupList",
 		everestDBClusterGVR: "DatabaseClusterList",
 		everestDBBackupGVR:  "DatabaseClusterBackupList",
 	}, objs...)

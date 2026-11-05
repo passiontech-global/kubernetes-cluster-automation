@@ -45,6 +45,15 @@ func testProber(cs *fake.Clientset) *clusterHealthProber {
 		olmSubGVR:               "SubscriptionList",
 		scyllaClusterGVR:        "ScyllaClusterList",
 		shared.AutopilotPlanGVR: "PlanList",
+		// W10 — GVRs the new sweep checks List unconditionally: the
+		// fake PANICS on an unregistered List, so every always-listed
+		// kind must be registered even when the check tolerates
+		// NotFound/NoMatch in production.
+		{Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"}:     "HelmReleaseList",
+		{Group: "pxc.percona.com", Version: "v1", Resource: "perconaxtradbclusters"}:   "PerconaXtraDBClusterList",
+		{Group: "pgv2.percona.com", Version: "v2", Resource: "perconapgclusters"}:      "PerconaPGClusterList",
+		{Group: "psmdb.percona.com", Version: "v1", Resource: "perconaservermongodbs"}: "PerconaServerMongoDBList",
+		{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}:          "ApplicationList",
 	}))
 }
 
@@ -190,13 +199,49 @@ func TestProbeHTTPContentNon200(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestProbePodRestarts(t *testing.T) {
+	// W10-FIX5: an over-threshold RestartCount only FAILs while the
+	// restarts are live signal — a recent last termination or a
+	// container currently Waiting (CrashLoopBackOff).
 	over := chPod("kube-system", "restarty", corev1.PodRunning, time.Hour)
 	over.Status.ContainerStatuses = []corev1.ContainerStatus{
-		{Name: "c", RestartCount: 11}, // > max(10) -> FAIL
+		{Name: "c", RestartCount: 11, // > max(10)
+			LastTerminationState: corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{
+					FinishedAt: metav1.NewTime(time.Now().Add(-time.Hour)),
+				},
+			}},
 	}
 	p := testProber(fake.NewSimpleClientset(over))
 	if res := p.probePodRestarts(ctx); res.pass {
-		t.Fatal("expected FAIL on RestartCount 11")
+		t.Fatal("expected FAIL on RestartCount 11 with a recent termination")
+	}
+
+	// A CrashLoopBackOff Waiting state is live signal even with no
+	// LastTerminationState recorded.
+	waiting := chPod("kube-system", "crashloop", corev1.PodRunning, time.Hour)
+	waiting.Status.ContainerStatuses = []corev1.ContainerStatus{
+		{Name: "c", RestartCount: 11,
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+				Reason: "CrashLoopBackOff"}}},
+	}
+	if res := testProber(fake.NewSimpleClientset(waiting)).probePodRestarts(ctx); res.pass {
+		t.Fatal("expected FAIL on CrashLoopBackOff over threshold")
+	}
+
+	// W10-FIX5: the same count with a STALE last termination (>24h)
+	// and a Running state is historical — the check must recover.
+	stale := chPod("kube-system", "oldcrash", corev1.PodRunning, time.Hour)
+	stale.Status.ContainerStatuses = []corev1.ContainerStatus{
+		{Name: "c", RestartCount: 11,
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+			LastTerminationState: corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{
+					FinishedAt: metav1.NewTime(time.Now().Add(-48 * time.Hour)),
+				},
+			}},
+	}
+	if res := testProber(fake.NewSimpleClientset(stale)).probePodRestarts(ctx); !res.pass {
+		t.Fatal("stale (>24h) termination must not FAIL the check")
 	}
 
 	// Boundary: exactly at the limit is still a pass.
@@ -210,7 +255,12 @@ func TestProbePodRestarts(t *testing.T) {
 	// reaches the app statuses).
 	init := chPod("kube-system", "initcrash", corev1.PodRunning, time.Hour)
 	init.Status.InitContainerStatuses = []corev1.ContainerStatus{
-		{Name: "init", RestartCount: 42},
+		{Name: "init", RestartCount: 42,
+			LastTerminationState: corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{
+					FinishedAt: metav1.NewTime(time.Now()),
+				},
+			}},
 	}
 	if res := testProber(fake.NewSimpleClientset(init)).probePodRestarts(ctx); res.pass {
 		t.Fatal("expected FAIL on init-container restarts")
@@ -390,10 +440,14 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// localpv-stranded-pods scan, the W8-CP3 scheduler-watchdog
 	// pending-pods List AND the W9-ST1 scylla-cluster-health census
 	// all hit the same cluster-wide pods List error -> six run
-	// errors. (linkerd-endpoint-sync skips its pod census entirely
-	// when no namespace carries linkerd.io/inject=enabled.)
-	if got := errCount() - before; got != 6 {
-		t.Fatalf("run errors delta = %v, want 6", got)
+	// errors, plus five W10 checks that also census pods:
+	// linkerd-protocol-detection-stall, cilium-node-ipam-exhaustion
+	// (pod-count fallback), rabbitmq-quorum-health,
+	// coredns-upstream (readiness fallback), image-pull-storm ->
+	// eleven total. (linkerd-endpoint-sync skips its pod census
+	// entirely when no namespace carries linkerd.io/inject=enabled.)
+	if got := errCount() - before; got != 11 {
+		t.Fatalf("run errors delta = %v, want 11", got)
 	}
 }
 

@@ -41,9 +41,11 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -60,7 +62,30 @@ const (
 	apiServiceUnavailMinAge  = 10 * time.Minute
 	apiServiceAvailableCond  = "Available"
 	apiServiceConditionFalse = "False"
+
+	// W10-CP1 — dead-APIService unblocker. An aggregated APIService
+	// in a protected namespace that stays Available=False wedges
+	// every namespace termination whose GC still references its API
+	// group. The unblock pass is the ONLY path allowed to restart
+	// those backends, and only when the wedge is proven: unavailable
+	// >=15m AND a namespace stuck Terminating >=15m whose
+	// conditions/events name the group.
+	apiServiceUnblockMinAge   = 15 * time.Minute
+	apiServiceUnblockPodCap   = 10
+	apiServiceUnblockCooldown = 15 * time.Minute
 )
+
+// apiServiceProtectedNamespaces is the plan's skipNamespaces set —
+// APIServices backed in these namespaces are core-ish infra the
+// guard otherwise never touches. Membership here does NOT skip the
+// availability metric; it scopes which backends the unblock healer
+// may restart.
+var apiServiceProtectedNamespaces = map[string]bool{
+	"kube-system": true,
+	"linkerd":     true,
+	"linkerd-viz": true,
+	"monitoring":  true,
+}
 
 // apiServiceGVR is the apiregistration.k8s.io/v1 APIService resource —
 // cluster-scoped, no typed client in client-go.
@@ -81,6 +106,10 @@ type apiServiceGuard struct {
 	// not re-seen this sweep gets its series deleted via
 	// DeleteLabelValues (same seen-set hygiene as brokenEmitted).
 	emitted map[string]bool
+	// unblocked is "<apiservice name>" -> last unblock-heal time —
+	// bounds restart churn on a backend that wedges again right
+	// after its pods are recreated.
+	unblocked map[string]time.Time
 }
 
 // Setup registers the 5-minute sweep. Disabled
@@ -106,6 +135,9 @@ func (g *apiServiceGuard) run(ctx context.Context) error {
 	if g.emitted == nil {
 		g.emitted = map[string]bool{}
 	}
+	if g.unblocked == nil {
+		g.unblocked = map[string]time.Time{}
+	}
 	// The orphan sweep and the availability watchdog are
 	// independent duties — a failure in one must never blind the
 	// other, so both run and their errors join (nil+nil → nil). Both
@@ -115,7 +147,8 @@ func (g *apiServiceGuard) run(ctx context.Context) error {
 	svcs, svcsErr := g.dyn.Resource(apiServiceGVR).List(ctx, metav1.ListOptions{})
 	orphanErr := g.sweepOrphans(ctx, svcs, svcsErr)
 	watchErr := g.sweepAvailability(ctx, svcs, svcsErr)
-	return errors.Join(orphanErr, watchErr)
+	unblockErr := g.sweepUnblock(ctx, svcs, svcsErr)
+	return errors.Join(orphanErr, watchErr, unblockErr)
 }
 
 // ---------------------------------------------------------------------------
@@ -289,4 +322,218 @@ func apiServiceUnavailableSince(u *unstructured.Unstructured) (time.Time, bool) 
 		return t, true
 	}
 	return time.Time{}, false
+}
+
+// ---------------------------------------------------------------------------
+// (c) W10-CP1 — dead-APIService unblocker.
+// ---------------------------------------------------------------------------
+
+// sweepUnblock consumes the same per-run snapshot. It heals ONLY the
+// protected-namespace backends (the plan's skipNamespaces set) and
+// ONLY when the wedge is proven end-to-end:
+//
+//	spec.service.namespace in apiServiceProtectedNamespaces
+//	AND Available=False for >= apiServiceUnblockMinAge (15m)
+//	AND >=1 Namespace stuck Terminating >=15m whose conditions or
+//	    events reference the APIService's API group.
+//
+// The heal is a backing-pod restart: the aggregated-apiserver pods
+// behind spec.service are deleted (UID-preconditioned, capped) so
+// their controllers recreate them — the least destructive action
+// that clears a wedged aggregation without touching the
+// operator-owned APIService object itself.
+func (g *apiServiceGuard) sweepUnblock(ctx context.Context, svcs *unstructured.UnstructuredList, svcsErr error) error {
+	log := logf.FromContext(ctx)
+	if svcsErr != nil {
+		return fmt.Errorf("list apiservices — unblock pass skipped: %w", svcsErr)
+	}
+	now := g.nowFn()
+
+	// Candidate pass — cheap unstructured reads only; the namespace
+	// scan below is skipped entirely when nothing qualifies.
+	type candidate struct {
+		svc   *unstructured.Unstructured
+		group string
+	}
+	var cands []candidate
+	for i := range svcs.Items {
+		svc := &svcs.Items[i]
+		unavailSince, ok := apiServiceUnavailableSince(svc)
+		if !ok || now.Sub(unavailSince) < apiServiceUnblockMinAge {
+			continue
+		}
+		svcNs, _, _ := apiServiceBackend(svc)
+		if !apiServiceProtectedNamespaces[svcNs] {
+			continue
+		}
+		group := apiServiceGroup(svc.GetName())
+		if group == "" {
+			continue // "v1." core registration — never unblocked
+		}
+		cands = append(cands, candidate{svc: svc, group: group})
+	}
+	if len(cands) == 0 {
+		return nil
+	}
+
+	// Wedge evidence: namespaces stuck Terminating >=15m, each with
+	// a lowercased corpus of its conditions + events for group
+	// matching.
+	stuck, err := g.stuckTerminatingNamespaces(ctx, now)
+	if err != nil {
+		return err
+	}
+	if len(stuck) == 0 {
+		return nil
+	}
+
+	healed := 0
+	for _, c := range cands {
+		if last, ok := g.unblocked[c.svc.GetName()]; ok &&
+			now.Sub(last) < apiServiceUnblockCooldown {
+			continue
+		}
+		var refs []string
+		for ns, corpus := range stuck {
+			if strings.Contains(corpus, c.group) {
+				refs = append(refs, ns)
+			}
+		}
+		if len(refs) == 0 {
+			continue
+		}
+		svcNs, svcName, _ := apiServiceBackend(c.svc)
+		deleted, err := g.restartBackingPods(ctx, svcNs, svcName)
+		if err != nil {
+			log.Error(err, "unblock heal failed",
+				"apiservice", c.svc.GetName(), "service", svcNs+"/"+svcName)
+			metrics.IncError(apiServiceGuardQueue)
+			continue
+		}
+		g.unblocked[c.svc.GetName()] = now
+		healed++
+		if deleted > 0 {
+			metrics.APIServiceUnblockHealsTotal.
+				WithLabelValues(svcNs, "backing_pods_deleted").Inc()
+		}
+		log.Info("ACTION: unblocked dead APIService wedging namespace termination",
+			"apiservice", c.svc.GetName(), "group", c.group,
+			"service", svcNs+"/"+svcName,
+			"terminatingNamespaces", refs, "podsDeleted", deleted)
+	}
+	return nil
+}
+
+// stuckTerminatingNamespaces returns "<ns name>" -> lowercased
+// reference corpus (conditions + events) for every namespace that
+// has been in phase Terminating for >= apiServiceUnblockMinAge. A
+// namespace without a deletionTimestamp cannot prove its age — it
+// is skipped (fail closed).
+func (g *apiServiceGuard) stuckTerminatingNamespaces(ctx context.Context, now time.Time) (map[string]string, error) {
+	log := logf.FromContext(ctx)
+	nsList, err := g.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list namespaces (unblock pass): %w", err)
+	}
+	out := map[string]string{}
+	for i := range nsList.Items {
+		ns := &nsList.Items[i]
+		if ns.Status.Phase != corev1.NamespaceTerminating ||
+			ns.DeletionTimestamp == nil ||
+			now.Sub(ns.DeletionTimestamp.Time) < apiServiceUnblockMinAge {
+			continue
+		}
+		var corpus strings.Builder
+		for _, c := range ns.Status.Conditions {
+			corpus.WriteString(strings.ToLower(string(c.Type)))
+			corpus.WriteByte(' ')
+			corpus.WriteString(strings.ToLower(c.Reason))
+			corpus.WriteByte(' ')
+			corpus.WriteString(strings.ToLower(c.Message))
+			corpus.WriteByte('\n')
+		}
+		evs, err := g.cs.CoreV1().Events(ns.Name).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			// Conditions-only corpus still carries
+			// NamespaceContentRemaining/DiscoveryFailed detail —
+			// a partial corpus beats skipping the namespace.
+			log.Info("WARN: events list failed — conditions-only corpus",
+				"namespace", ns.Name, "error", err)
+		} else {
+			for j := range evs.Items {
+				e := &evs.Items[j]
+				corpus.WriteString(strings.ToLower(e.Reason))
+				corpus.WriteByte(' ')
+				corpus.WriteString(strings.ToLower(e.Message))
+				corpus.WriteByte('\n')
+			}
+		}
+		out[ns.Name] = corpus.String()
+	}
+	return out, nil
+}
+
+// apiServiceGroup extracts the API group from an APIService name —
+// "v1beta1.metrics.k8s.io" -> "metrics.k8s.io". "" for names without
+// a group suffix (the core "v1." registration).
+func apiServiceGroup(name string) string {
+	idx := strings.Index(name, ".")
+	if idx < 0 || idx == len(name)-1 {
+		return ""
+	}
+	return name[idx+1:]
+}
+
+// restartBackingPods deletes the running pods selected by the
+// APIService's backing Service so their controllers recreate them —
+// the aggregated-apiserver restart that clears a wedged aggregation.
+// Capped per call; NotFound service/pod races are quiet no-ops.
+func (g *apiServiceGuard) restartBackingPods(ctx context.Context, svcNs, svcName string) (int, error) {
+	log := logf.FromContext(ctx)
+	svc, err := g.cs.CoreV1().Services(svcNs).Get(ctx, svcName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		// The backend Service itself is gone — pod restart is
+		// impossible; the operator that owns it must recreate it.
+		log.Info("unblock heal skipped — backing service gone",
+			"service", svcNs+"/"+svcName)
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("get backing service %s/%s: %w", svcNs, svcName, err)
+	}
+	if len(svc.Spec.Selector) == 0 {
+		log.Info("unblock heal skipped — backing service has no selector",
+			"service", svcNs+"/"+svcName)
+		return 0, nil
+	}
+	pods, err := g.cs.CoreV1().Pods(svcNs).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("list backing pods %s: %w", svcNs, err)
+	}
+	deleted := 0
+	for i := range pods.Items {
+		if deleted >= apiServiceUnblockPodCap {
+			break
+		}
+		p := &pods.Items[i]
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		uid := p.UID
+		if err := g.cs.CoreV1().Pods(svcNs).Delete(ctx, p.Name,
+			metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &uid},
+			}); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			log.Error(err, "backing pod delete failed",
+				"pod", svcNs+"/"+p.Name)
+			continue
+		}
+		deleted++
+	}
+	return deleted, nil
 }

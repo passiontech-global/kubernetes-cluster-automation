@@ -30,8 +30,11 @@ package cftunnelproxywatchdog
 import (
 	"context"
 	"fmt"
+	"io"
+	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -50,11 +53,44 @@ const (
 	cfTunnelProxyPodSelector  = "app.kubernetes.io/component=proxy,app.kubernetes.io/instance=cloudflare-tunnel-gateway-controller"
 	cfTunnelProxySliceService = "cloudflare-tunnel-gateway-controller-proxy-headless"
 	cfTunnelResyncAnno        = "watchdog.passiontech.dev/force-resync"
+
+	// W10-NM2 — cloudflared wedge healer. The proxy gateway's pods
+	// are cloudflared connectors; the ingress controller release
+	// (cloudflare-tunnel-ingress-controller ns) runs the same binary
+	// under a different label scheme. A connector stuck on a fatal
+	// startup error or a dead edge-connection loop reports
+	// Ready=False forever and config resyncs cannot revive it —
+	// only a pod restart can.
+	cfTunnelConnectorNS       = "cloudflare-tunnel-ingress-controller"
+	cfTunnelConnectorSelector = "app=controlled-cloudflared-connector"
+	// A pod must hold Ready=False this long before its logs are even
+	// read — protects normal rollout startup churn.
+	cfTunnelUnreadyMinAge = 5 * time.Minute
+	// Per-pod delete cooldown: the Deployment's own backoff plus this
+	// guard keeps a crash-looping connector from being deleted every
+	// sweep.
+	cfTunnelHealCooldown      = 10 * time.Minute
+	cfTunnelMaxHealsPerTarget = 2
+	cfTunnelLogTailLines      = 200
+	cfTunnelLogMaxBytes       = 256 << 10
+	cfTunnelLogTimeout        = 8 * time.Second
 )
+
+// cfTunnelConnectorTarget is one label-selected pod population that
+// runs cloudflared and can wedge the same way.
+type cfTunnelConnectorTarget struct {
+	namespace string
+	selector  string
+}
 
 type cfTunnelProxyWatchdog struct {
 	cs        kubernetes.Interface
 	namespace string
+	// lastHeal is "<ns>/<name>" -> last delete time; bounds restart
+	// churn on a pod that wedges again immediately after recreation.
+	lastHeal map[string]time.Time
+	// nowFn is a test seam for cooldown/age checks.
+	nowFn func() time.Time
 }
 
 // Setup registers the periodic sweep — only on
@@ -79,7 +115,15 @@ func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Info("sweep done", "resyncedSlices", resynced, "stallCleared", cleared)
+	// W10-NM2 — third check: wedged cloudflared connectors need a
+	// pod restart, not a config resync. Runs after the resync pass
+	// so freshly-configured pods get their grace window first.
+	healed, err := w.healCloudflaredWedges(ctx)
+	if err != nil {
+		return err
+	}
+	log.Info("sweep done", "resyncedSlices", resynced, "stallCleared", cleared,
+		"wedgesHealed", healed)
 	return nil
 }
 
@@ -178,4 +222,220 @@ func (w *cfTunnelProxyWatchdog) clearStaleStall(ctx context.Context) (bool, erro
 		"helm can upgrade again",
 		"deployment", w.namespace+"/"+cfTunnelProxyDeployName)
 	return true, nil
+}
+
+// ---------------------------------------------------------------------------
+// W10-NM2 — wedged cloudflared connector healer.
+// ---------------------------------------------------------------------------
+
+// connectorTargets is the full population of cloudflared pods the
+// healer watches: the gateway proxy Deployment AND the ingress
+// controller release, which uses a different namespace + label
+// scheme for the same binary.
+func (w *cfTunnelProxyWatchdog) connectorTargets() []cfTunnelConnectorTarget {
+	return []cfTunnelConnectorTarget{
+		{namespace: w.namespace, selector: cfTunnelProxyPodSelector},
+		{namespace: cfTunnelConnectorNS, selector: cfTunnelConnectorSelector},
+	}
+}
+
+// healCloudflaredWedges is check 3: delete cloudflared pods that are
+// provably wedged — fatal startup errors in the log tail, or an
+// edge-connection error loop — plus the readyCount==0 deadlock fix:
+// when EVERY running replica of a target is unready >= 5m, delete
+// the single oldest one (10m cooldown) so the Deployment recreates
+// it instead of skipping forever. Returns pods deleted.
+func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int, error) {
+	log := logf.FromContext(ctx)
+	if w.lastHeal == nil {
+		w.lastHeal = map[string]time.Time{}
+	}
+	if w.nowFn == nil {
+		w.nowFn = time.Now
+	}
+	now := w.nowFn()
+	healed := 0
+	for _, tgt := range w.connectorTargets() {
+		n, err := w.healConnectorTarget(ctx, tgt, now)
+		if err != nil {
+			return healed, err
+		}
+		healed += n
+	}
+	if healed > 0 {
+		log.Info("ACTION: deleted wedged cloudflared pod(s)", "deleted", healed)
+	}
+	return healed, nil
+}
+
+// healConnectorTarget scans one pod population. Only Running pods
+// are candidates; Ready=True pods are never touched. Unready pods
+// younger than cfTunnelUnreadyMinAge are left alone — rollout
+// startup churn must not trigger deletes.
+func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
+	tgt cfTunnelConnectorTarget, now time.Time) (int, error) {
+	pods, err := w.cs.CoreV1().Pods(tgt.namespace).List(ctx,
+		metav1.ListOptions{LabelSelector: tgt.selector})
+	if err != nil {
+		return 0, fmt.Errorf("list connector pods in %s: %w",
+			tgt.namespace, err)
+	}
+	var running []*corev1.Pod
+	var unreadyStale []*corev1.Pod
+	ready := 0
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		running = append(running, p)
+		if shared.PodReadyCond(p) {
+			ready++
+			continue
+		}
+		if age, ok := podUnreadyFor(p, now); ok && age >= cfTunnelUnreadyMinAge {
+			unreadyStale = append(unreadyStale, p)
+		}
+	}
+	if len(running) == 0 || len(unreadyStale) == 0 {
+		return 0, nil
+	}
+	log := logf.FromContext(ctx)
+	healed := 0
+	// Fatal-signature pods: unready >= 5m AND wedged logs — doomed
+	// pods a config resync cannot revive. Bounded per target per
+	// sweep so a mass-wedge cannot delete the whole fleet at once.
+	for _, p := range unreadyStale {
+		if healed >= cfTunnelMaxHealsPerTarget {
+			break
+		}
+		wedged, err := w.podLogWedged(ctx, p)
+		if err != nil {
+			// Log read failure is not proof of health — skip this
+			// pod this cycle; the all-unready path below can still
+			// cover it.
+			log.Info("connector log read failed — skipping wedge check",
+				"pod", p.Namespace+"/"+p.Name, "error", err.Error())
+			continue
+		}
+		if !wedged || w.healOnCooldown(p, now) {
+			continue
+		}
+		if err := w.deleteConnectorPod(ctx, p, "fatal_logs"); err != nil {
+			log.Error(err, "delete wedged connector pod failed",
+				"pod", p.Namespace+"/"+p.Name)
+			continue
+		}
+		w.lastHeal[p.Namespace+"/"+p.Name] = now
+		healed++
+	}
+	// readyCount==0 deadlock: every running replica unready — the
+	// resync loop can never converge. Delete the single OLDEST
+	// stale-unready pod (10m cooldown) so its Deployment recreates
+	// it; one per sweep bounds churn during a genuine outage.
+	if ready == 0 && healed < cfTunnelMaxHealsPerTarget {
+		oldest := unreadyStale[0]
+		for _, p := range unreadyStale[1:] {
+			if p.CreationTimestamp.Before(&oldest.CreationTimestamp) {
+				oldest = p
+			}
+		}
+		if !w.healOnCooldown(oldest, now) {
+			if err := w.deleteConnectorPod(ctx, oldest,
+				"all_unready_oldest"); err != nil {
+				log.Error(err, "delete oldest unready connector pod failed",
+					"pod", oldest.Namespace+"/"+oldest.Name)
+			} else {
+				w.lastHeal[oldest.Namespace+"/"+oldest.Name] = now
+				healed++
+			}
+		}
+	}
+	return healed, nil
+}
+
+// healOnCooldown reports whether this pod was already deleted within
+// cfTunnelHealCooldown — a recreated pod that wedges again must wait
+// out the window instead of being killed every sweep.
+func (w *cfTunnelProxyWatchdog) healOnCooldown(p *corev1.Pod, now time.Time) bool {
+	last, ok := w.lastHeal[p.Namespace+"/"+p.Name]
+	return ok && now.Sub(last) < cfTunnelHealCooldown
+}
+
+// deleteConnectorPod deletes a connector pod with a UID precondition
+// — the listed pod could already have been replaced by a same-named
+// fresh pod, and killing the replacement would undo the heal.
+func (w *cfTunnelProxyWatchdog) deleteConnectorPod(ctx context.Context,
+	p *corev1.Pod, reason string) error {
+	metrics.CFTunnelWedgePodsDeletedTotal.WithLabelValues(
+		p.Namespace, reason).Inc()
+	err := w.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
+		metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &p.UID},
+		})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// podLogWedged fetches the tail of the pod's log and matches the
+// cloudflared wedge signatures.
+func (w *cfTunnelProxyWatchdog) podLogWedged(ctx context.Context,
+	p *corev1.Pod) (bool, error) {
+	lctx, cancel := context.WithTimeout(ctx, cfTunnelLogTimeout)
+	defer cancel()
+	tail := int64(cfTunnelLogTailLines)
+	stream, err := w.cs.CoreV1().Pods(p.Namespace).GetLogs(p.Name,
+		&corev1.PodLogOptions{TailLines: &tail}).Stream(lctx)
+	if err != nil {
+		return false, err
+	}
+	defer stream.Close()
+	data, err := io.ReadAll(io.LimitReader(stream, cfTunnelLogMaxBytes))
+	if err != nil {
+		return false, err
+	}
+	return cloudflaredLogsWedged(string(data)), nil
+}
+
+// podUnreadyFor reports how long the pod's Ready condition has been
+// non-True. Missing/zero transition time or a Ready=True condition
+// both fail closed (not counted as stale-unready).
+func podUnreadyFor(p *corev1.Pod, now time.Time) (time.Duration, bool) {
+	for _, c := range p.Status.Conditions {
+		if c.Type != corev1.PodReady {
+			continue
+		}
+		if c.Status == corev1.ConditionTrue || c.LastTransitionTime.IsZero() {
+			return 0, false
+		}
+		return now.Sub(c.LastTransitionTime.Time), true
+	}
+	return 0, false
+}
+
+// cloudflaredLogsWedged matches the observed cloudflared failure
+// signatures: fatal startup/config errors, and a sustained
+// "connection with edge" error loop (>=3 error lines in the tail —
+// a single blip during an edge rollout is normal).
+func cloudflaredLogsWedged(logs string) bool {
+	edgeErrs := 0
+	for _, line := range strings.Split(logs, "\n") {
+		l := strings.ToLower(line)
+		if strings.Contains(l, "couldn't start tunnel") ||
+			strings.Contains(l, "failed to sufficiently increase receive buffer") ||
+			strings.Contains(l, "serve tunnel error") {
+			return true
+		}
+		if strings.Contains(l, "connection with edge") &&
+			(strings.Contains(l, "err") ||
+				strings.Contains(l, "failed") ||
+				strings.Contains(l, "timeout") ||
+				strings.Contains(l, "reset") ||
+				strings.Contains(l, "closed")) {
+			edgeErrs++
+		}
+	}
+	return edgeErrs >= 3
 }

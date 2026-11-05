@@ -25,12 +25,13 @@ import (
 // W7-C2 — operator watchdog expansion
 // ---------------------------------------------------------------------------
 
-// The watchdog must cover the original five plus nine of the ten
-// W7-C2 additions — notification-controller is excluded on purpose:
-// its v1beta3 Alert/Provider/Receiver objects are static (no
-// reconciler writes status on them), so no stuck signature can ever
-// be accurate — and never a duplicate name (a dup would share a
-// first-seen keyspace and double-report).
+// The watchdog must cover the original five plus the W7-C2 additions
+// and the W10-CP3 expansion — notification-controller IS a target
+// again but carries ZERO resources: its v1beta3 Alert/Provider/
+// Receiver objects are static (no reconciler writes status on them),
+// so no stuck signature can ever be accurate — the entry exists for
+// lease liveness parity only — and never a duplicate name (a dup
+// would share a first-seen keyspace and double-report).
 func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 	seen := map[string]bool{}
 	for _, op := range operatorTargets {
@@ -39,22 +40,33 @@ func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 		}
 		seen[op.name] = true
 	}
-	if len(operatorTargets) != 14 {
-		t.Fatalf("operatorTargets = %d, want 14", len(operatorTargets))
+	if len(operatorTargets) != 23 {
+		t.Fatalf("operatorTargets = %d, want 23", len(operatorTargets))
 	}
 	for _, want := range []string{
 		"source-controller", "cert-manager",
 		"external-secrets", "rabbitmq-cluster-operator", "keda-operator",
 		"argocd-operator", "kargo-controller", "everest-operator",
 		"shipwright-build-controller",
+		// W10-CP3 additions.
+		"notification-controller", "node-healthcheck-operator",
+		"self-node-remediation-operator",
+		"percona-xtradb-cluster-operator", "percona-postgresql-operator",
+		"percona-server-mongodb-operator", "fluent-operator",
+		"tekton-pipelines-controller", "shipwright-operator",
 	} {
 		if !seen[want] {
 			t.Fatalf("missing operator target %q", want)
 		}
 	}
-	if seen["notification-controller"] {
-		t.Fatal("notification-controller must not be a target — " +
-			"v1beta3 Alert/Provider/Receiver never get status")
+	// notification-controller may only ever watch the Lease — any
+	// CR resource on it would resurrect the static-object false
+	// positive the W7-C2 incident fix removed.
+	for _, op := range operatorTargets {
+		if op.name == "notification-controller" && len(op.resources) != 0 {
+			t.Fatalf("notification-controller must carry no CR resources, got %d",
+				len(op.resources))
+		}
 	}
 }
 

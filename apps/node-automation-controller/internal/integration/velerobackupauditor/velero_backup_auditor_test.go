@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -545,6 +546,233 @@ func TestVeleroAuditorEverestClearsResolved(t *testing.T) {
 	}
 	if _, ok := everestSeries(t, "data", "db", "failed"); ok {
 		t.Fatal("recovered cluster must not keep the failed series")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W10-FIX6 — zero-backup blind spot
+// ---------------------------------------------------------------------------
+
+// A Schedule older than 36h that has produced ZERO Backup objects
+// flags reason=missing — the old code returned early on b == nil and
+// never noticed the schedule was silently unprotected.
+func TestVeleroAuditorScheduleMissingBackups(t *testing.T) {
+	now := time.Now()
+	old := veleroSchedule("velero", "daily-old", false, 48*time.Hour)
+	young := veleroSchedule("velero", "daily-young", false, 10*time.Hour)
+	pausedOld := veleroSchedule("velero", "daily-paused", true, 72*time.Hour)
+	dyn := newDynFake(old, young, pausedOld)
+	a := newVeleroAuditor(dyn, now)
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := badSeries(t, "velero", "daily-old", "missing"); !ok || v != 1 {
+		t.Fatalf("old zero-backup schedule missing series = %v,%v want 1,true", v, ok)
+	}
+	for _, s := range []string{"daily-young", "daily-paused"} {
+		if _, ok := badSeries(t, "velero", s, "missing"); ok {
+			t.Fatalf("%s must not flag missing", s)
+		}
+	}
+}
+
+// The same zero-backup check applies to backup-enabled Everest
+// DatabaseClusters: >36h old with zero DatabaseClusterBackups.
+func TestVeleroAuditorEverestMissingBackups(t *testing.T) {
+	now := time.Now()
+	oldDC := everestDBCluster("data", "db-old", true, false)
+	oldDC.SetCreationTimestamp(metav1.NewTime(now.Add(-48 * time.Hour)))
+	youngDC := everestDBCluster("data", "db-young", true, false)
+	youngDC.SetCreationTimestamp(metav1.NewTime(now.Add(-10 * time.Hour)))
+	disabledDC := everestDBCluster("data", "db-disabled", false, false)
+	disabledDC.SetCreationTimestamp(metav1.NewTime(now.Add(-72 * time.Hour)))
+	a := newVeleroAuditor(newDynFake(oldDC, youngDC, disabledDC), now)
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := everestSeries(t, "data", "db-old", "missing"); !ok || v != 1 {
+		t.Fatalf("db-old/missing series = %v,%v want 1,true", v, ok)
+	}
+	for _, c := range []string{"db-young", "db-disabled"} {
+		if _, ok := everestSeries(t, "data", c, "missing"); ok {
+			t.Fatalf("%s must not flag missing", c)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W10-ST6 — wedged in-flight Backup / PodVolumeBackup audit
+// ---------------------------------------------------------------------------
+
+// veleroPVB builds a PodVolumeBackup — phase + startTimestamp drive
+// the wedge verdict; spec.node names the node whose node-agent owns
+// the Kopia thread (spec.pod is the workload pod, unused here).
+func veleroPVB(ns, name, phase string, age time.Duration,
+	pod, node string) *unstructured.Unstructured {
+	start := time.Now().Add(-age).UTC().Format(time.RFC3339)
+	o := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "velero.io/v1",
+		"kind":       "PodVolumeBackup",
+		"metadata":   map[string]any{"namespace": ns, "name": name},
+		"spec": map[string]any{
+			"pod":  map[string]any{"name": pod},
+			"node": node,
+		},
+		"status": map[string]any{
+			"phase":          phase,
+			"startTimestamp": start,
+		},
+	}}
+	o.SetUID(types.UID(ns + "/" + name))
+	o.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-age)))
+	return o
+}
+
+// nodeAgentPod builds the velero node-agent DaemonSet pod — start
+// times drive the "agent restarted mid-backup" verdict.
+func nodeAgentPod(ns, name, node string, podStart, containerStart time.Time) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: ns,
+			Labels: map[string]string{"name": "node-agent"},
+		},
+		Spec: corev1.PodSpec{NodeName: node},
+		Status: corev1.PodStatus{
+			Phase:     corev1.PodRunning,
+			StartTime: &metav1.Time{Time: podStart},
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "node-agent",
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Time{Time: containerStart}}},
+			}},
+		},
+	}
+}
+
+func pvbExists(t *testing.T, dyn *fake.FakeDynamicClient, ns, name string) bool {
+	t.Helper()
+	_, err := dyn.Resource(veleroPVBGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	return err == nil
+}
+
+func stuckSeries(t *testing.T, ns, backup string) (float64, bool) {
+	t.Helper()
+	return testutil.GaugeSeriesValue(t, "node_automation_velero_backup_stuck",
+		map[string]string{"namespace": ns, "backup": backup})
+}
+
+func wedgedSeries(t *testing.T, ns, pvb string) (float64, bool) {
+	t.Helper()
+	return testutil.GaugeSeriesValue(t, "node_automation_velero_podvolumebackup_wedged",
+		map[string]string{"namespace": ns, "pvb": pvb})
+}
+
+// A Backup held InProgress >6h marks the stuck gauge; a fresh one
+// and a Completed one do not.
+func TestVeleroAuditorStuckBackupGauge(t *testing.T) {
+	now := time.Now()
+	stuck := veleroBackup("velero", "b-stuck", "daily", "InProgress", 7*time.Hour, 0, 0, 0, 0)
+	fresh := veleroBackup("velero", "b-fresh", "daily", "InProgress", time.Hour, 0, 0, 0, 0)
+	done := veleroBackup("velero", "b-done", "daily", "Completed", 7*time.Hour, 5, 5, 0, 0)
+	dyn := newDynFake(
+		veleroSchedule("velero", "daily", false, time.Hour),
+		stuck, fresh, done)
+	a := newVeleroAuditor(dyn, now)
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := stuckSeries(t, "velero", "b-stuck"); !ok || v != 1 {
+		t.Fatalf("b-stuck series = %v,%v want 1,true", v, ok)
+	}
+	for _, n := range []string{"b-fresh", "b-done"} {
+		if _, ok := stuckSeries(t, "velero", n); ok {
+			t.Fatalf("%s must not flag stuck", n)
+		}
+	}
+}
+
+// The full ST6 cleanup: a PVB InProgress >6h whose node-agent
+// container restarted AFTER the PVB started is deleted, and the
+// agent pod is bounced so the next backup starts clean.
+func TestVeleroAuditorWedgedPVBCleaned(t *testing.T) {
+	now := time.Now()
+	pvb := veleroPVB("velero", "pvb-1", "InProgress", 7*time.Hour,
+		"node-agent-aaa", "node-1")
+	// Agent pod itself is old (started before the PVB) but its
+	// container restarted 6h ago — after the PVB began 7h ago.
+	agent := nodeAgentPod("velero", "node-agent-aaa", "node-1",
+		now.Add(-24*time.Hour), now.Add(-6*time.Hour))
+	cs := kfake.NewSimpleClientset(agent)
+	dyn := newDynFake(
+		veleroSchedule("velero", "daily", false, time.Hour),
+		pvb)
+	a := newVeleroAuditor(dyn, now)
+	a.cs = cs
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if pvbExists(t, dyn, "velero", "pvb-1") {
+		t.Fatal("wedged PVB not deleted")
+	}
+	if _, err := cs.CoreV1().Pods("velero").Get(ctx, "node-agent-aaa",
+		metav1.GetOptions{}); err == nil {
+		t.Fatal("node-agent pod not bounced")
+	}
+	if v, ok := wedgedSeries(t, "velero", "pvb-1"); !ok || v != 1 {
+		t.Fatalf("pvb-1 wedged series = %v,%v want 1,true", v, ok)
+	}
+}
+
+// A PVB whose agent pod is healthy (Running, started before the
+// PVB, no restarts) is marked wedged-age but NOT cleaned — the
+// agent still owns the Kopia thread.
+func TestVeleroAuditorWedgedPVBHealthyAgentKept(t *testing.T) {
+	now := time.Now()
+	pvb := veleroPVB("velero", "pvb-ok", "InProgress", 7*time.Hour,
+		"node-agent-bbb", "node-2")
+	agent := nodeAgentPod("velero", "node-agent-bbb", "node-2",
+		now.Add(-24*time.Hour), now.Add(-24*time.Hour))
+	cs := kfake.NewSimpleClientset(agent)
+	dyn := newDynFake(
+		veleroSchedule("velero", "daily", false, time.Hour),
+		pvb)
+	a := newVeleroAuditor(dyn, now)
+	a.cs = cs
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !pvbExists(t, dyn, "velero", "pvb-ok") {
+		t.Fatal("PVB deleted although its node-agent is healthy")
+	}
+	if _, err := cs.CoreV1().Pods("velero").Get(ctx, "node-agent-bbb",
+		metav1.GetOptions{}); err != nil {
+		t.Fatal("healthy node-agent pod bounced")
+	}
+	// Still old enough to mark — the gauge reports the wedge age
+	// even when the agent looks alive.
+	if v, ok := wedgedSeries(t, "velero", "pvb-ok"); !ok || v != 1 {
+		t.Fatalf("pvb-ok wedged series = %v,%v want 1,true", v, ok)
+	}
+}
+
+// A PVB in Deleting is marked but never cleaned — it is already on
+// its way out; deleting it again buys nothing.
+func TestVeleroAuditorDeletingPVBNotCleaned(t *testing.T) {
+	now := time.Now()
+	pvb := veleroPVB("velero", "pvb-del", "Deleting", 8*time.Hour,
+		"node-agent-ccc", "node-3")
+	dyn := newDynFake(
+		veleroSchedule("velero", "daily", false, time.Hour),
+		pvb)
+	a := newVeleroAuditor(dyn, now)
+	a.cs = kfake.NewSimpleClientset() // no agent pod at all
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !pvbExists(t, dyn, "velero", "pvb-del") {
+		t.Fatal("Deleting PVB deleted — already terminating")
+	}
+	if v, ok := wedgedSeries(t, "velero", "pvb-del"); !ok || v != 1 {
+		t.Fatalf("pvb-del wedged series = %v,%v want 1,true", v, ok)
 	}
 }
 

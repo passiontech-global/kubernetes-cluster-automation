@@ -67,6 +67,18 @@ const (
 	mirrorPodAnno = "kubernetes.io/config.mirror"
 )
 
+// partitionNodePinnedStorageClasses are StorageClasses whose volumes
+// are backed by the node's local disk — the provisioned PV carries
+// node affinity, so a pod mounted to one can ONLY ever reschedule
+// onto the node holding the data. Evicting such a pod off a
+// partitioned node is pure churn: the replacement lands right back
+// on the same broken host (or pends forever) — W10-FIX5 adds
+// openebs-hostpath alongside local-path, both hostPath-backed.
+var partitionNodePinnedStorageClasses = map[string]bool{
+	"local-path":       true,
+	"openebs-hostpath": true,
+}
+
 // partitionCondTypes covers upstream NWPD K8sExporter plurals, the
 // singular spellings some builds emit, NebulaIsolated — the
 // node-host-agent's overlay-partition condition: a node cut off from
@@ -161,6 +173,46 @@ func partitionEvictable(p *corev1.Pod, namespaces map[string]struct{}) bool {
 	return p.Annotations[partitionEvictAnno] == "true"
 }
 
+// nodePinnedPVCs returns the set of "ns/name" PVCs whose
+// spec.storageClassName is node-pinned (see
+// partitionNodePinnedStorageClasses). A list failure is a real
+// error — the caller fails the eviction pass closed rather than
+// evicting pods it cannot prove are movable.
+func (e *partitionEvictor) nodePinnedPVCs(ctx context.Context) (map[string]struct{}, error) {
+	pvcs, err := e.cs.CoreV1().PersistentVolumeClaims(metav1.NamespaceAll).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list persistentvolumeclaims: %w", err)
+	}
+	out := map[string]struct{}{}
+	for i := range pvcs.Items {
+		sc := pvcs.Items[i].Spec.StorageClassName
+		if sc != nil && partitionNodePinnedStorageClasses[*sc] {
+			out[pvcs.Items[i].Namespace+"/"+pvcs.Items[i].Name] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+// podOnNodePinnedPVC reports whether any of the pod's volumes mounts
+// a PVC in the pinned set — such a pod is bound to its current node
+// by the volume's node affinity and cannot be usefully evicted.
+func podOnNodePinnedPVC(p *corev1.Pod, pinned map[string]struct{}) bool {
+	if len(pinned) == 0 {
+		return false
+	}
+	for _, v := range p.Spec.Volumes {
+		pvc := v.PersistentVolumeClaim
+		if pvc == nil {
+			continue
+		}
+		if _, ok := pinned[p.Namespace+"/"+pvc.ClaimName]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *partitionEvictor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
@@ -245,6 +297,19 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		}
 	}
 
+	// W10-FIX5 — resolve the node-pinned PVC set once per run: pods
+	// mounted to local-path / openebs-hostpath volumes can only run
+	// on the node holding the data, so evicting them off a
+	// partitioned node is useless churn. A PVC list failure skips
+	// the whole eviction pass (fail closed — taints above still
+	// fence new scheduling).
+	pinnedPVCs, err := e.nodePinnedPVCs(ctx)
+	if err != nil {
+		metrics.IncError(partitionEvictorQueue)
+		log.Error(err, "pvc list failed — pod eviction skipped this run")
+		return nil
+	}
+
 	evicted := 0
 loop:
 	for _, name := range names {
@@ -271,6 +336,12 @@ loop:
 				continue
 			}
 			if !partitionEvictable(p, namespaces) {
+				continue
+			}
+			// Node-pinned volume — the pod can only ever run on
+			// this node again; deleting it just recreates the same
+			// stranded pod (or a Pending one) on the broken host.
+			if podOnNodePinnedPVC(p, pinnedPVCs) {
 				continue
 			}
 			log.Info("EVICT: pod off partitioned node",

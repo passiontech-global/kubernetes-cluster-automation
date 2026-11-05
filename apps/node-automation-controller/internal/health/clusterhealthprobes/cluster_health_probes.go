@@ -113,6 +113,13 @@ const (
 	// alerting path under their own check names.
 	checkNameLocalPVStranded = "localpv-stranded-pods"
 	checkNameOLMHealth       = "olm-subscription-health"
+	// W10-CP4/W10-ST5 — Flux HelmRelease retry remediation and the
+	// Percona cluster quorum watchdog live in this file; their
+	// check-name constants sit here alongside the code. The nine
+	// Wave-10 probes live in cluster_health_wave10.go with their
+	// constants declared there.
+	checkNameFluxHRRetries = "flux-helmrelease-retries"
+	checkNamePerconaQuorum = "percona-cluster-quorum"
 	// W8/W9 — the Wave-8/9 checks live in cluster_health_wave8.go;
 	// their check-name constants are declared there alongside the code.
 )
@@ -167,6 +174,10 @@ const (
 	// a status.phase (argocd): an empty phase means the operator
 	// never reconciled the object (W7-C2).
 	opReasonNoPhase = "no_status_phase"
+	// opReasonNoStatus is the medik8s variant: status.phase AND
+	// status.conditions both absent — the operator never completed
+	// a reconcile pass on either channel (W10-CP3).
+	opReasonNoStatus = "no_status_at_all"
 )
 
 // W6.2 — stateful-masterless-services knobs.
@@ -502,6 +513,18 @@ type clusterHealthProber struct {
 	//     same DeleteLabelValues hygiene as the other emitted sets.
 	scyllaFirstSeen map[string]time.Time
 	scyllaEmitted   map[string]bool
+
+	// W10 watchdog state (under mu):
+	//   - hrRetryHealed: "ns/name" → last reconcile-annotation patch —
+	//     the 30m per-HelmRelease cooldown for the retries-exhausted
+	//     remediator (W10-CP4). The requestedAt annotation we stamp is
+	//     the durable half across restarts.
+	//   - perconaInitSeen: "gvr/ns/name" → first sweep the Percona
+	//     cluster read "initializing" — the 30m stuck-initializing
+	//     window for checkPerconaClusterQuorum (W10-ST5). Pruned on
+	//     resolve so a later re-init re-arms.
+	hrRetryHealed   map[string]time.Time
+	perconaInitSeen map[string]time.Time
 }
 
 func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg healthProbeConfig) *clusterHealthProber {
@@ -514,22 +537,33 @@ func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg 
 		httpClient: &http.Client{},
 		now:        time.Now,
 		lastPass: map[string]time.Time{
-			checkNameDNS:                 boot,
-			checkNameHTTPContent:         boot,
-			checkNamePodRestarts:         boot,
-			checkNamePodStatus:           boot,
-			checkNameResourceQuota:       boot,
-			checkNameKCMWorkqueue:        boot,
-			checkNameOperatorWorkqueue:   boot,
-			checkNameStatefulMasterless:  boot,
-			checkNameRabbitMQSuspended:   boot,
-			checkNameLocalPVStranded:     boot,
-			checkNameOLMHealth:           boot,
-			checkNameSchedulerWatchdog:   boot,
-			checkNameMeshWatchdog:        boot,
-			checkNameNodeHang:            boot,
-			checkNameLinkerdEndpointSync: boot,
-			checkNameScyllaHealth:        boot,
+			checkNameDNS:                  boot,
+			checkNameHTTPContent:          boot,
+			checkNamePodRestarts:          boot,
+			checkNamePodStatus:            boot,
+			checkNameResourceQuota:        boot,
+			checkNameKCMWorkqueue:         boot,
+			checkNameOperatorWorkqueue:    boot,
+			checkNameStatefulMasterless:   boot,
+			checkNameRabbitMQSuspended:    boot,
+			checkNameLocalPVStranded:      boot,
+			checkNameOLMHealth:            boot,
+			checkNameSchedulerWatchdog:    boot,
+			checkNameMeshWatchdog:         boot,
+			checkNameNodeHang:             boot,
+			checkNameLinkerdEndpointSync:  boot,
+			checkNameScyllaHealth:         boot,
+			checkNameFluxHRRetries:        boot,
+			checkNamePerconaQuorum:        boot,
+			checkNameCiliumBPFMapPressure: boot,
+			checkNameLinkerdOpaqueStall:   boot,
+			checkNameCoreDNSUpstream:      boot,
+			checkNameCiliumNodeIPAM:       boot,
+			checkNameNamespaceWedged:      boot,
+			checkNameArgoCDAppStuck:       boot,
+			checkNameRabbitMQQuorum:       boot,
+			checkNameDragonflySyncStorm:   boot,
+			checkNameImagePullStorm:       boot,
 		},
 		kcmFirstSeen:         map[string]time.Time{},
 		kcmFrozenReasons:     map[string]bool{},
@@ -555,6 +589,8 @@ func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg 
 		linkerdDesyncHealed:  map[string]time.Time{},
 		scyllaFirstSeen:      map[string]time.Time{},
 		scyllaEmitted:        map[string]bool{},
+		hrRetryHealed:        map[string]time.Time{},
+		perconaInitSeen:      map[string]time.Time{},
 	}
 }
 
@@ -611,6 +647,17 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 		{checkNameNodeHang, p.checkNodeHangPreCordon},
 		{checkNameLinkerdEndpointSync, p.checkLinkerdEndpointSync},
 		{checkNameScyllaHealth, p.checkScyllaHealth},
+		{checkNameFluxHRRetries, p.checkFluxHelmReleaseRetries},
+		{checkNamePerconaQuorum, p.checkPerconaClusterQuorum},
+		{checkNameCiliumBPFMapPressure, p.checkCiliumBPFMapPressure},
+		{checkNameLinkerdOpaqueStall, p.checkLinkerdProtocolDetectionStall},
+		{checkNameCoreDNSUpstream, p.checkCoreDNSUpstream},
+		{checkNameCiliumNodeIPAM, p.checkCiliumNodeIPAMExhaustion},
+		{checkNameNamespaceWedged, p.checkNamespaceTerminatingWedged},
+		{checkNameArgoCDAppStuck, p.checkArgoCDAppStuck},
+		{checkNameRabbitMQQuorum, p.checkRabbitMQQuorumHealth},
+		{checkNameDragonflySyncStorm, p.checkDragonflyReplicaSyncStorm},
+		{checkNameImagePullStorm, p.checkImagePullStorm},
 	}
 	for _, c := range checks {
 		res := c.probe(ctx)
@@ -695,7 +742,11 @@ func (p *clusterHealthProber) probeHTTPContent(ctx context.Context) probeResult 
 
 // probePodRestarts ports pod-restarts-check: FAIL when any container
 // status — app, init or ephemeral — in the target namespace has
-// RestartCount over the limit (live check: kube-system, 10).
+// RestartCount over the limit (live check: kube-system, 10) AND the
+// restarts are still live signal (W10-FIX5): a container that crossed
+// the threshold weeks ago and has been stable since must not hold the
+// check red forever — RestartCount is monotonic, so the raw count
+// alone can never recover.
 func (p *clusterHealthProber) probePodRestarts(ctx context.Context) probeResult {
 	pods, err := p.cs.CoreV1().Pods(p.cfg.podCheckNamespace).
 		List(ctx, metav1.ListOptions{})
@@ -703,6 +754,7 @@ func (p *clusterHealthProber) probePodRestarts(ctx context.Context) probeResult 
 		return probeResult{infra: fmt.Errorf("list pods in %s: %w",
 			p.cfg.podCheckNamespace, err)}
 	}
+	now := p.now()
 	var offenders []string
 	for i := range pods.Items {
 		pod := &pods.Items[i]
@@ -712,7 +764,8 @@ func (p *clusterHealthProber) probePodRestarts(ctx context.Context) probeResult 
 			pod.Status.EphemeralContainerStatuses,
 		} {
 			for _, s := range statuses {
-				if s.RestartCount > p.cfg.maxPodRestarts {
+				if s.RestartCount > p.cfg.maxPodRestarts &&
+					restartRecentlyActive(s, now) {
 					offenders = append(offenders,
 						fmt.Sprintf("%s/%s=%d", pod.Name, s.Name, s.RestartCount))
 				}
@@ -724,6 +777,27 @@ func (p *clusterHealthProber) probePodRestarts(ctx context.Context) probeResult 
 			p.cfg.maxPodRestarts, strings.Join(offenders, ", "))}
 	}
 	return probeResult{pass: true}
+}
+
+// podRestartRecentWindow bounds how far back the last termination may
+// sit before an over-threshold RestartCount reads as historical rather
+// than live (W10-FIX5).
+const podRestartRecentWindow = 24 * time.Hour
+
+// restartRecentlyActive reports whether an over-threshold restart
+// count still represents an ACTIVE failure: the last termination
+// finished inside podRestartRecentWindow, or the container is
+// currently Waiting (CrashLoopBackOff and friends — the kubelet only
+// reports Waiting while the restart loop is live). A container that
+// crossed the threshold and has run clean since reports neither and
+// is ignored.
+func restartRecentlyActive(s corev1.ContainerStatus, now time.Time) bool {
+	if t := s.LastTerminationState.Terminated; t != nil &&
+		!t.FinishedAt.IsZero() &&
+		now.Sub(t.FinishedAt.Time) < podRestartRecentWindow {
+		return true
+	}
+	return s.State.Waiting != nil
 }
 
 // probePodStatus ports pod-status-check: pods younger than
@@ -985,20 +1059,42 @@ type opStuckResource struct {
 // and the CRD resources it is responsible for reconciling. A nil
 // opStuckResource.owns means every stuck object counts.
 //
+// leaseNames lists every leader-election Lease id the operator may
+// hold — upstream ships more than one across versions (Percona
+// operators rotate their election ids, medik8s uses a fixed hash),
+// so a single hardcoded name would silently disable the watch on the
+// others. The first existing candidate wins.
+//
+// podNS overrides the namespace pods are looked up in when it differs
+// from the Lease's namespace — the cert-manager chart elects leaders
+// in kube-system while its pods live in cert-manager (W10-FIX2).
+//
 // leaseOptional marks operators that legitimately run without a
 // leader-election Lease (external-secrets runs replicas:1 with
-// leaderElect:false): when the Lease is absent the watchdog falls
-// back to a Running pod matching podSelector as the liveness proof —
-// a live pod whose CRs still sit unreconciled is the same zombie
-// shape the Lease renewTime proves for electing operators.
+// leaderElect:false, dragonfly-operator has --leader-elect patched
+// out — W10-FIX2): when no candidate Lease is found the watchdog
+// falls back to a Running pod matching podSelector as the liveness
+// proof — a live pod whose CRs still sit unreconciled is the same
+// zombie shape the Lease renewTime proves for electing operators.
 type operatorTarget struct {
 	name          string
 	leaseNS       string
-	leaseName     string
+	leaseNames    []string
+	podNS         string
 	podSelector   string
 	leaseOptional bool
 	stuckMinAge   time.Duration
 	resources     []opStuckResource
+}
+
+// targetPodNS resolves the namespace operator pods live in: the
+// explicit podNS override when set (lease and pods split across
+// namespaces), else the Lease's own namespace.
+func targetPodNS(t operatorTarget) string {
+	if t.podNS != "" {
+		return t.podNS
+	}
+	return t.leaseNS
 }
 
 // staleObservedGeneration is the canonical "controller never saw the
@@ -1051,6 +1147,35 @@ func noStatusConditions(o *unstructured.Unstructured) bool {
 func emptyStatusPhase(o *unstructured.Unstructured) bool {
 	phase, found, _ := unstructured.NestedString(o.Object, "status", "phase")
 	return !found || phase == ""
+}
+
+// noStatusAtAll is the never-reconciled signature for CR types whose
+// controllers write SPARSE status (medik8s NodeHealthCheck/
+// SelfNodeRemediation): neither status.phase nor status.conditions
+// means the operator never completed a reconcile pass. Either field
+// alone can be legitimately absent on a healthy object — a paused
+// NHC still carries phase=Paused, a finished SNR keeps its last
+// phase — so only the both-absent shape proves "never reconciled".
+func noStatusAtAll(o *unstructured.Unstructured) bool {
+	if phase, found, _ := unstructured.NestedString(o.Object, "status", "phase"); found && phase != "" {
+		return false
+	}
+	conds, found, _ := unstructured.NestedSlice(o.Object, "status", "conditions")
+	return !found || len(conds) == 0
+}
+
+// perconaUnpausedStaleGen is staleObservedGeneration with the Percona
+// pause brake honored: spec.pause=true (and psmdb's spec.mode=paused)
+// parks reconciliation deliberately — paused clusters are parked,
+// not stuck (W10-CP3).
+func perconaUnpausedStaleGen(o *unstructured.Unstructured) bool {
+	if paused, _, _ := unstructured.NestedBool(o.Object, "spec", "pause"); paused {
+		return false
+	}
+	if mode, _, _ := unstructured.NestedString(o.Object, "spec", "mode"); mode == "paused" {
+		return false
+	}
+	return staleObservedGeneration(o)
 }
 
 // condMaxObservedGeneration returns the largest observedGeneration
@@ -1279,7 +1404,7 @@ var operatorTargets = []operatorTarget{
 	{
 		name:        "cilium-operator",
 		leaseNS:     "kube-system",
-		leaseName:   "cilium-operator-resource-lock",
+		leaseNames:  []string{"cilium-operator-resource-lock"},
 		podSelector: "io.cilium/app=operator",
 		stuckMinAge: ciliumStuckMinAge,
 		resources: []opStuckResource{
@@ -1299,7 +1424,7 @@ var operatorTargets = []operatorTarget{
 	{
 		name:        "scylla-operator",
 		leaseNS:     "scylla-operator",
-		leaseName:   "scylla-operator-lock",
+		leaseNames:  []string{"scylla-operator-lock"},
 		podSelector: "app.kubernetes.io/name=scylla-operator",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
@@ -1309,11 +1434,12 @@ var operatorTargets = []operatorTarget{
 		}},
 	},
 	{
-		name:        "dragonfly-operator",
-		leaseNS:     dragonflyOperatorNS,
-		leaseName:   "7898635c.dragonflydb.io",
-		podSelector: "control-plane=controller-manager",
-		stuckMinAge: operatorStuckMinAge,
+		name:          "dragonfly-operator",
+		leaseNS:       dragonflyOperatorNS,
+		leaseNames:    []string{"7898635c.dragonflydb.io"},
+		podSelector:   "control-plane=controller-manager",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{{
 			gvr: schema.GroupVersionResource{
 				Group: "dragonflydb.io", Version: "v1alpha1", Resource: "dragonflies"},
@@ -1323,7 +1449,7 @@ var operatorTargets = []operatorTarget{
 	{
 		name:        "helm-controller",
 		leaseNS:     "flux-system",
-		leaseName:   "helm-controller-leader-election",
+		leaseNames:  []string{"helm-controller-leader-election"},
 		podSelector: "app=helm-controller",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
@@ -1335,7 +1461,7 @@ var operatorTargets = []operatorTarget{
 	{
 		name:        "kustomize-controller",
 		leaseNS:     "flux-system",
-		leaseName:   "kustomize-controller-leader-election",
+		leaseNames:  []string{"kustomize-controller-leader-election"},
 		podSelector: "app=kustomize-controller",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
@@ -1351,7 +1477,7 @@ var operatorTargets = []operatorTarget{
 	{
 		name:        "source-controller",
 		leaseNS:     "flux-system",
-		leaseName:   "source-controller-leader-election",
+		leaseNames:  []string{"source-controller-leader-election"},
 		podSelector: "app=source-controller",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
@@ -1384,8 +1510,12 @@ var operatorTargets = []operatorTarget{
 		// The cert-manager helm chart elects leaders in kube-system
 		// (global.leaderElection.namespace default) — the lease does
 		// NOT live in the release namespace.
-		leaseNS:     "kube-system",
-		leaseName:   "cert-manager-controller",
+		leaseNS:    "kube-system",
+		leaseNames: []string{"cert-manager-controller"},
+		// The chart elects in kube-system but runs its pods in the
+		// release namespace — pod lookups must not scan kube-system
+		// (W10-FIX2).
+		podNS:       "cert-manager",
 		podSelector: "app.kubernetes.io/name=cert-manager",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
@@ -1409,7 +1539,7 @@ var operatorTargets = []operatorTarget{
 		// fallback carries the liveness proof until HA is switched
 		// on. externalsecret-operator-leader-election is the
 		// OLM-installed name, not the helm chart's.
-		leaseName:     "external-secrets-controller",
+		leaseNames:    []string{"external-secrets-controller"},
 		podSelector:   "app.kubernetes.io/name=external-secrets",
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
@@ -1431,7 +1561,7 @@ var operatorTargets = []operatorTarget{
 	{
 		name:        "rabbitmq-cluster-operator",
 		leaseNS:     "operators",
-		leaseName:   "9c433e27.rabbitmq.com",
+		leaseNames:  []string{"9c433e27.rabbitmq.com"},
 		podSelector: "app.kubernetes.io/name=rabbitmq-cluster-operator",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
@@ -1443,7 +1573,7 @@ var operatorTargets = []operatorTarget{
 	{
 		name:        "keda-operator",
 		leaseNS:     "operators",
-		leaseName:   "operator.keda.sh",
+		leaseNames:  []string{"operator.keda.sh"},
 		podSelector: "app=keda-operator",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
@@ -1463,7 +1593,7 @@ var operatorTargets = []operatorTarget{
 		// there, and the manager pods carry the kubebuilder
 		// control-plane label, not name=argocd-operator.
 		leaseNS:     "argocd-operator-system",
-		leaseName:   "b23f6029.argoproj.io",
+		leaseNames:  []string{"b23f6029.argoproj.io"},
 		podSelector: "control-plane=controller-manager",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
@@ -1478,7 +1608,7 @@ var operatorTargets = []operatorTarget{
 	{
 		name:        "kargo-controller",
 		leaseNS:     "kargo",
-		leaseName:   "kargo-controller",
+		leaseNames:  []string{"kargo-controller"},
 		podSelector: "app.kubernetes.io/name=kargo,app.kubernetes.io/component=controller",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
@@ -1493,7 +1623,7 @@ var operatorTargets = []operatorTarget{
 	{
 		name:        "everest-operator",
 		leaseNS:     "everest-system",
-		leaseName:   "a8916322.percona.com",
+		leaseNames:  []string{"a8916322.percona.com"},
 		podSelector: "control-plane=controller-manager",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
@@ -1505,13 +1635,152 @@ var operatorTargets = []operatorTarget{
 	{
 		name:        "shipwright-build-controller",
 		leaseNS:     "shipwright-build",
-		leaseName:   "shipwright-build-controller",
+		leaseNames:  []string{"shipwright-build-controller"},
 		podSelector: "app.kubernetes.io/name=shipwright-build-controller",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
 			gvr: schema.GroupVersionResource{
 				Group: "shipwright.io", Version: "v1beta1", Resource: "builds"},
 			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
+		}},
+	},
+
+	// ------------------------------------------------------------------
+	// W10-CP3 — the remaining operators whose stuck queues still gate
+	// the self-healing path. Lease ids, namespaces, pod selectors and
+	// CRD anchors were verified against the cluster's Flux manifests
+	// and upstream kubebuilder scaffolds (medik8s election ids
+	// e1f13584/547f6cb6.medik8s.io, fluent 45c4fdd2.fluent.io,
+	// shipwright 01a9b2d1.shipwright.io); where upstream can
+	// legitimately run without a Lease (single replica or
+	// leader-elect patched out) leaseOptional lets the Running-pod
+	// fallback carry the liveness proof.
+	// ------------------------------------------------------------------
+	{
+		// flux notification-controller: the v1beta3
+		// Alert/Provider/Receiver objects are STATIC user config —
+		// the controller reconciles no status into them, so there
+		// is no CR signature to watch (the watchdog entry exists so
+		// the Lease liveness signal is still covered).
+		name:        "notification-controller",
+		leaseNS:     "flux-system",
+		leaseNames:  []string{"notification-controller-leader-election"},
+		podSelector: "app=notification-controller",
+		stuckMinAge: operatorStuckMinAge,
+	},
+	{
+		name:        "node-healthcheck-operator",
+		leaseNS:     "operators",
+		leaseNames:  []string{"e1f13584.medik8s.io"},
+		podSelector: "app.kubernetes.io/name=node-healthcheck-operator",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "remediation.medik8s.io", Version: "v1alpha1",
+				Resource: "nodehealthchecks"},
+			reason: opReasonNoStatus, stuck: noStatusAtAll,
+		}},
+	},
+	{
+		name:        "self-node-remediation-operator",
+		leaseNS:     "operators",
+		leaseNames:  []string{"547f6cb6.medik8s.io"},
+		podSelector: "control-plane=controller-manager,self-node-remediation-operator",
+		stuckMinAge: operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "self-node-remediation.medik8s.io", Version: "v1alpha1",
+				Resource: "selfnoderemediations"},
+			reason: opReasonNoStatus, stuck: noStatusAtAll,
+		}},
+	},
+	{
+		// Percona DB operators are installed by the everest
+		// dbNamespace (openeverest values dbNamespace.
+		// namespaceOverride: everest) — NOT everest-system, which
+		// only runs the everest server + DatabaseCluster CRs.
+		// Each ships multiple election-id generations across
+		// releases, so leaseNames carries every candidate and
+		// leaseOptional lets the pod fallback cover a total id
+		// rotation (W10-CP3).
+		name:          "percona-xtradb-cluster-operator",
+		leaseNS:       "everest",
+		leaseNames:    []string{"90888d0c.percona.com", "percona-xtradb-cluster-operator-lock"},
+		podSelector:   "app.kubernetes.io/name=percona-xtradb-cluster-operator",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "pxc.percona.com", Version: "v1",
+				Resource: "perconaxtradbclusters"},
+			reason: kcmReasonStaleGen, stuck: perconaUnpausedStaleGen,
+		}},
+	},
+	{
+		name:          "percona-postgresql-operator",
+		leaseNS:       "everest",
+		leaseNames:    []string{"pgo-controller-lease", "percona-postgresql-operator-lock"},
+		podSelector:   "app.kubernetes.io/name=percona-postgresql-operator",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "pgv2.percona.com", Version: "v2",
+				Resource: "perconapgclusters"},
+			reason: kcmReasonStaleGen, stuck: perconaUnpausedStaleGen,
+		}},
+	},
+	{
+		name:          "percona-server-mongodb-operator",
+		leaseNS:       "everest",
+		leaseNames:    []string{"087f5a08.percona.com", "percona-server-mongodb-operator-lock"},
+		podSelector:   "app.kubernetes.io/name=percona-server-mongodb-operator",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "psmdb.percona.com", Version: "v1",
+				Resource: "perconaservermongodbs"},
+			reason: kcmReasonStaleGen, stuck: perconaUnpausedStaleGen,
+		}},
+	},
+	{
+		// fluent-operator (fluent-system): every fluentbit.fluent.io
+		// CRD ships an EMPTY status struct — there is no status
+		// channel to fingerprint, so the entry exists purely for
+		// lease/pod liveness parity with the other operators.
+		name:          "fluent-operator",
+		leaseNS:       "fluent-system",
+		leaseNames:    []string{"fluent-operator-leader-election", "45c4fdd2.fluent.io"},
+		podSelector:   "app.kubernetes.io/name=fluent-operator",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+	},
+	{
+		name:          "tekton-pipelines-controller",
+		leaseNS:       "tekton-pipelines",
+		leaseNames:    []string{"tekton-pipelines-controller.tkn-leader-election", "tekton-pipelines-controller.pipelinerun.00-of-01"},
+		podSelector:   "app.kubernetes.io/component=controller,app.kubernetes.io/part-of=tekton-pipelines",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "tekton.dev", Version: "v1", Resource: "pipelineruns"},
+			reason: opReasonNoConditions, stuck: noStatusConditions,
+		}},
+	},
+	{
+		name:          "shipwright-operator",
+		leaseNS:       "operators",
+		leaseNames:    []string{"01a9b2d1.shipwright.io"},
+		podSelector:   "app=shipwright-operator,control-plane=controller-manager",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+		resources: []opStuckResource{{
+			gvr: schema.GroupVersionResource{
+				Group: "operator.shipwright.io", Version: "v1alpha1",
+				Resource: "shipwrightbuilds"},
+			reason: opReasonNoConditions, stuck: noStatusConditions,
 		}},
 	},
 }
@@ -1557,36 +1826,35 @@ func (p *clusterHealthProber) checkOperatorWorkqueues(ctx context.Context) probe
 	frozen := map[string]string{} // "operator/reason" → reason, for the why line
 	var firstErr error
 	for _, op := range operatorTargets {
-		lease, err := p.cs.CoordinationV1().Leases(op.leaseNS).
-			Get(ctx, op.leaseName, metav1.GetOptions{})
+		lease, lerr := p.operatorLease(ctx, op)
 		switch {
-		case apierrors.IsNotFound(err) && op.leaseOptional:
-			// No leader-election Lease by design (replicas:1) —
-			// a Running pod under the selector is the liveness
-			// proof a renewing Lease provides elsewhere. lease
-			// stays nil: healOperatorLeader/leaderPods both
-			// tolerate it (selector fallback, no stamp persist).
+		case lerr != nil:
+			if firstErr == nil {
+				firstErr = lerr
+			}
+			continue
+		case lease == nil && op.leaseOptional:
+			// No candidate Lease by design (replicas:1 or
+			// leader-elect patched out) — a Running pod under the
+			// selector is the liveness proof a renewing Lease
+			// provides elsewhere. lease stays nil:
+			// healOperatorLeader/leaderPods both tolerate it
+			// (selector fallback, no stamp persist).
 			alive, aerr := p.operatorPodRunning(ctx, op)
 			switch {
 			case aerr != nil:
 				if firstErr == nil {
 					firstErr = fmt.Errorf("list pods %s selector %q (%s): %w",
-						op.leaseNS, op.podSelector, op.name, aerr)
+						targetPodNS(op), op.podSelector, op.name, aerr)
 				}
 				continue
 			case !alive:
 				p.resetOperator(op.name)
 				continue
 			}
-		case apierrors.IsNotFound(err):
+		case lease == nil:
 			// No leader Lease — no elected operator to judge.
 			p.resetOperator(op.name)
-			continue
-		case err != nil:
-			if firstErr == nil {
-				firstErr = fmt.Errorf("get lease %s/%s (%s): %w",
-					op.leaseNS, op.leaseName, op.name, err)
-			}
 			continue
 		case lease.Spec.RenewTime == nil ||
 			now.Sub(lease.Spec.RenewTime.Time) > operatorLeaseMaxAge:
@@ -1714,12 +1982,40 @@ func (p *clusterHealthProber) checkOperatorWorkqueues(ctx context.Context) probe
 		strings.Join(keys, ", "))}
 }
 
+// operatorLease fetches the operator's leader-election Lease,
+// trying each candidate name in op.leaseNames order — upstream
+// ships more than one election id across versions, so a single
+// hardcoded name would silently disable the watch on the others.
+// Returns (nil, nil) when every candidate is absent; a non-NotFound
+// error on any candidate is returned (errors are per-request, not
+// per-name — RBAC/network failures hit all names equally).
+func (p *clusterHealthProber) operatorLease(ctx context.Context, op operatorTarget) (*coordinationv1.Lease, error) {
+	var firstErr error
+	for _, name := range op.leaseNames {
+		lease, err := p.cs.CoordinationV1().Leases(op.leaseNS).
+			Get(ctx, name, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			continue
+		case err != nil:
+			if firstErr == nil {
+				firstErr = fmt.Errorf("get lease %s/%s (%s): %w",
+					op.leaseNS, name, op.name, err)
+			}
+			continue
+		default:
+			return lease, nil
+		}
+	}
+	return nil, firstErr
+}
+
 // operatorPodRunning is the leaseOptional liveness fallback: at
-// least one pod in the operator's namespace matching podSelector is
-// Running — a live pod whose CRs sit unreconciled is the same zombie
-// signature a renewing-lease zombie leader presents.
+// least one pod in the operator's pod namespace matching podSelector
+// is Running — a live pod whose CRs sit unreconciled is the same
+// zombie signature a renewing-lease zombie leader presents.
 func (p *clusterHealthProber) operatorPodRunning(ctx context.Context, op operatorTarget) (bool, error) {
-	pods, err := p.cs.CoreV1().Pods(op.leaseNS).List(ctx,
+	pods, err := p.cs.CoreV1().Pods(targetPodNS(op)).List(ctx,
 		metav1.ListOptions{LabelSelector: op.podSelector})
 	if err != nil {
 		return false, err
@@ -1874,11 +2170,12 @@ func (p *clusterHealthProber) healOperatorLeader(ctx context.Context, log logr.L
 func (p *clusterHealthProber) leaderPods(ctx context.Context, op operatorTarget,
 	lease *coordinationv1.Lease) ([]corev1.Pod, error) {
 	holder := ""
-	// The pod namespace is the Lease's own — for a nil lease
-	// (leaseOptional operators) the selector scans op.leaseNS.
-	podNS := op.leaseNS
+	// The pod namespace is the operator's own — podNS when the Lease
+	// lives elsewhere (cert-manager elects in kube-system, runs in
+	// cert-manager), else the Lease's namespace; for a nil lease
+	// (leaseOptional operators) the selector scans targetPodNS(op).
+	podNS := targetPodNS(op)
 	if lease != nil {
-		podNS = lease.Namespace
 		if lease.Spec.HolderIdentity != nil {
 			holder = *lease.Spec.HolderIdentity
 		}
@@ -1923,6 +2220,411 @@ func (p *clusterHealthProber) leaderPods(ctx context.Context, op operatorTarget,
 		return pods.Items[:1], nil
 	}
 	return pods.Items, nil
+}
+
+// ---------------------------------------------------------------------------
+// W10-CP4 — flux HelmRelease retries-exhausted remediator.
+// ---------------------------------------------------------------------------
+
+const (
+	// fluxHRStuckMinAge: a Ready=False HelmRelease must hold the
+	// failure this long before it counts as stuck — transient helm
+	// errors self-heal inside the controller's own retry backoff.
+	fluxHRStuckMinAge = 15 * time.Minute
+	// fluxHRHealCooldown bounds reconcile-annotation patches to one
+	// per HelmRelease per 30m.
+	fluxHRHealCooldown = 30 * time.Minute
+	// fluxHRRequestedAtAnno / fluxHRForceAtAnno are the flux
+	// reconcile-request annotations stamped with the SAME timestamp
+	// token — requestedAt asks for a reconcile, forceAt skips the
+	// artifact-cache freshness check (same pair the flux
+	// CLI `reconcile --with-source` writes).
+	fluxHRRequestedAtAnno = "reconcile.fluxcd.io/requestedAt"
+	fluxHRForceAtAnno     = "reconcile.fluxcd.io/forceAt"
+)
+
+// helmReleaseRetryGVRs are the HelmRelease API versions the check
+// probes — v2 is current, v2beta2 the previous storage version; the
+// first List that succeeds wins.
+var helmReleaseRetryGVRs = []schema.GroupVersionResource{
+	{Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"},
+	{Group: "helm.toolkit.fluxcd.io", Version: "v2beta2", Resource: "helmreleases"},
+}
+
+// fluxHRFailureReasons are the Ready=False reasons that mean the
+// helm action itself failed — combined with the "retries exhausted"
+// message substring they cover every spelling helm-controller uses
+// once spec.upgrade.remediation.retries is spent (W10-CP4).
+var fluxHRFailureReasons = map[string]bool{
+	"InstallFailed":    true,
+	"UpgradeFailed":    true,
+	"RetriesExhausted": true,
+	"RetriesExceeded":  true,
+}
+
+// checkFluxHelmReleaseRetries detects HelmReleases parked at
+// Ready=False past fluxHRStuckMinAge whose failure reads as
+// retries-exhausted, and — when every spec.dependsOn HelmRelease is
+// itself Ready — nudges the object back to work by stamping the
+// reconcile.fluxcd.io/requestedAt+forceAt annotations (30m per-HR
+// cooldown, wider of the in-RAM ledger and the requestedAt stamp we
+// leave behind). The check FAILs while qualifying HRs exist —
+// remediation is best-effort, detection is the contract.
+func (p *clusterHealthProber) checkFluxHelmReleaseRetries(ctx context.Context) probeResult {
+	log := logf.FromContext(ctx)
+	if p.dyn == nil {
+		return probeResult{infra: fmt.Errorf(
+			"no dynamic client — helmrelease retry check unverifiable")}
+	}
+	now := p.now()
+
+	// Find the served HelmRelease version — try v2 then v2beta2.
+	var gvr schema.GroupVersionResource
+	var hrs *unstructured.UnstructuredList
+	var listErr error
+	for _, g := range helmReleaseRetryGVRs {
+		l, err := p.dyn.Resource(g).List(ctx, metav1.ListOptions{})
+		if err == nil {
+			gvr, hrs = g, l
+			break
+		}
+		if !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
+			listErr = err
+		}
+	}
+	if hrs == nil {
+		if listErr != nil {
+			return probeResult{infra: fmt.Errorf(
+				"list helmreleases: %w", listErr)}
+		}
+		return probeResult{pass: true} // CRD not installed
+	}
+
+	var stuck []string
+	for i := range hrs.Items {
+		hr := &hrs.Items[i]
+		if suspended, _, _ := unstructured.NestedBool(
+			hr.Object, "spec", "suspend"); suspended {
+			continue
+		}
+		status, reason, message, since, ok := fluxHRReadyCondition(hr)
+		if !ok || status != "False" {
+			continue
+		}
+		if !fluxHRFailureReasons[reason] &&
+			!strings.Contains(strings.ToLower(message), "retries exhausted") {
+			continue
+		}
+		// The failure must persist — a HR still inside its first
+		// retry window is working as designed. No transition
+		// timestamp → cannot prove the 15m window; stay quiet
+		// rather than remediate blind.
+		if since.IsZero() || now.Sub(since) < fluxHRStuckMinAge {
+			continue
+		}
+		key := hr.GetNamespace() + "/" + hr.GetName()
+		stuck = append(stuck, key)
+
+		// Only remediate once every upstream dependsOn
+		// HelmRelease is Ready — patching a HR whose dependency is
+		// itself broken just re-fails on the same wall.
+		if !p.fluxHRDepsReady(ctx, gvr, hr) {
+			continue
+		}
+		p.maybePatchHRRetry(ctx, log, gvr, hr, key, now)
+	}
+	if len(stuck) > 0 {
+		return probeResult{why: fmt.Sprintf(
+			"helmreleases retries-exhausted >=%s: %s",
+			fluxHRStuckMinAge, strings.Join(stuck, ", "))}
+	}
+	return probeResult{pass: true}
+}
+
+// fluxHRReadyCondition extracts the Ready condition's status, reason,
+// message and lastTransitionTime from a HelmRelease. ok=false when no
+// Ready condition exists at all.
+func fluxHRReadyCondition(hr *unstructured.Unstructured) (status, reason, message string, since time.Time, ok bool) {
+	for _, c := range shared.ReadyConds(hr) {
+		if c["type"] != "Ready" {
+			continue
+		}
+		status, _ = c["status"].(string)
+		reason, _ = c["reason"].(string)
+		message, _ = c["message"].(string)
+		if ts, _ := c["lastTransitionTime"].(string); ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				since = t
+			}
+		}
+		return status, reason, message, since, true
+	}
+	return "", "", "", time.Time{}, false
+}
+
+// fluxHRDepsReady reports whether every spec.dependsOn HelmRelease
+// reference resolves to a Ready=True object. A missing or unreadable
+// dependency fails closed — never remediate on an unverifiable chain.
+func (p *clusterHealthProber) fluxHRDepsReady(ctx context.Context,
+	gvr schema.GroupVersionResource, hr *unstructured.Unstructured) bool {
+	deps, found, err := unstructured.NestedSlice(hr.Object, "spec", "dependsOn")
+	if err != nil || !found {
+		return true // no dependsOn — vacuously ready
+	}
+	for _, d := range deps {
+		m, ok := d.(map[string]any)
+		if !ok {
+			return false
+		}
+		name, _ := m["name"].(string)
+		if name == "" {
+			return false
+		}
+		ns, _ := m["namespace"].(string)
+		if ns == "" {
+			ns = hr.GetNamespace()
+		}
+		dep, err := p.dyn.Resource(gvr).Namespace(ns).
+			Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		if st, _, _ := fluxHRReadyStrings(dep); st != "True" {
+			return false
+		}
+	}
+	return true
+}
+
+// fluxHRReadyStrings is the status-only half of fluxHRReadyCondition
+// for dependency checks.
+func fluxHRReadyStrings(obj *unstructured.Unstructured) (status, reason, message string) {
+	for _, c := range shared.ReadyConds(obj) {
+		if c["type"] != "Ready" {
+			continue
+		}
+		status, _ = c["status"].(string)
+		reason, _ = c["reason"].(string)
+		message, _ = c["message"].(string)
+		return status, reason, message
+	}
+	return "", "", ""
+}
+
+// maybePatchHRRetry stamps the reconcile annotations on a stuck
+// HelmRelease unless the 30m cooldown (in-RAM ledger OR the
+// requestedAt stamp a previous patch — ours or an operator's —
+// already left) is still warm.
+func (p *clusterHealthProber) maybePatchHRRetry(ctx context.Context, log logr.Logger,
+	gvr schema.GroupVersionResource, hr *unstructured.Unstructured,
+	key string, now time.Time) {
+	p.mu.Lock()
+	last, ok := p.hrRetryHealed[key]
+	p.mu.Unlock()
+	if ok && now.Sub(last) < fluxHRHealCooldown {
+		return
+	}
+	// The requestedAt annotation is the durable half: a stamp younger
+	// than the cooldown — whether we wrote it or `flux reconcile`
+	// did — means a reconcile is already queued.
+	if v, found, _ := unstructured.NestedString(
+		hr.Object, "metadata", "annotations", fluxHRRequestedAtAnno); found {
+		if t, err := time.Parse(time.RFC3339, v); err == nil &&
+			now.Sub(t) < fluxHRHealCooldown {
+			return
+		}
+	}
+	token := now.UTC().Format(time.RFC3339Nano)
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"annotations": map[string]string{
+				fluxHRRequestedAtAnno: token,
+				fluxHRForceAtAnno:     token,
+			},
+		},
+	})
+	if err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Error(err, "marshal hr retry patch failed", "hr", key)
+		return
+	}
+	if _, err := p.dyn.Resource(gvr).Namespace(hr.GetNamespace()).
+		Patch(ctx, hr.GetName(), types.MergePatchType, patch,
+			metav1.PatchOptions{}); err != nil {
+		metrics.IncError(clusterHealthQueue)
+		log.Error(err, "helmrelease retry patch failed", "hr", key)
+		return
+	}
+	p.mu.Lock()
+	p.hrRetryHealed[key] = now
+	p.mu.Unlock()
+	log.Info("patched helmrelease reconcile annotations",
+		"hr", key, "requestedAt", token)
+}
+
+// ---------------------------------------------------------------------------
+// W10-ST5 — percona-cluster-quorum.
+// ---------------------------------------------------------------------------
+
+const (
+	// perconaInitMinAge bounds how long a Percona cluster may sit in
+	// "initializing" before the quorum check calls it stuck — fresh
+	// clusters legitimately take tens of minutes to bootstrap.
+	perconaInitMinAge = 30 * time.Minute
+)
+
+// perconaClusterGVRs are the three Percona operator CRDs the quorum
+// check sweeps cluster-wide; a cluster without a given operator
+// simply has no objects (CRD absent → the List misses quietly).
+var perconaClusterGVRs = []schema.GroupVersionResource{
+	{Group: "pxc.percona.com", Version: "v1", Resource: "perconaxtradbclusters"},
+	{Group: "pgv2.percona.com", Version: "v2", Resource: "perconapgclusters"},
+	{Group: "psmdb.percona.com", Version: "v1", Resource: "perconaservermongodbs"},
+}
+
+// checkPerconaClusterQuorum flags Percona database clusters that
+// report an error state, sit in "initializing" past
+// perconaInitMinAge, or show fewer than one ready instance while not
+// paused (W10-ST5). Suggested run() registration name:
+// "percona-cluster-quorum".
+func (p *clusterHealthProber) checkPerconaClusterQuorum(ctx context.Context) probeResult {
+	if p.dyn == nil {
+		return probeResult{infra: fmt.Errorf(
+			"no dynamic client — percona quorum check unverifiable")}
+	}
+	now := p.now()
+	p.mu.Lock()
+	if p.perconaInitSeen == nil {
+		p.perconaInitSeen = map[string]time.Time{}
+	}
+	p.mu.Unlock()
+
+	var offenders []string
+	live := map[string]bool{}
+	var firstErr error
+	for _, gvr := range perconaClusterGVRs {
+		list, err := p.dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+				continue // operator/CRD not installed on this cluster
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("list %s: %w", gvr.Resource, err)
+			}
+			continue
+		}
+		for i := range list.Items {
+			o := &list.Items[i]
+			key := gvr.Resource + "/" + o.GetNamespace() + "/" + o.GetName()
+			live[key] = true
+			if perconaClusterPaused(o) {
+				p.clearPerconaInit(key)
+				continue
+			}
+			state, _, _ := unstructured.NestedString(o.Object, "status", "state")
+			statusField, _, _ := unstructured.NestedString(o.Object, "status", "status")
+			switch {
+			case strings.EqualFold(state, "error") ||
+				strings.EqualFold(statusField, "error"):
+				offenders = append(offenders, fmt.Sprintf(
+					"%s/%s state=%s", o.GetNamespace(), o.GetName(),
+					perconaStateLabel(state, statusField)))
+				p.clearPerconaInit(key)
+			case strings.EqualFold(state, "initializing") ||
+				strings.EqualFold(statusField, "initializing"):
+				// Initializing is checked BEFORE ready<1: a fresh
+				// cluster's operator writes status.ready:0 while
+				// bootstrapping — flagging it here would bypass
+				// the perconaInitMinAge grace and flap new
+				// clusters (W10-ST5 review).
+				if p.perconaInitAge(key, now) >= perconaInitMinAge {
+					offenders = append(offenders, fmt.Sprintf(
+						"%s/%s initializing>%s", o.GetNamespace(),
+						o.GetName(), perconaInitMinAge))
+				}
+			case perconaReadyBelowOne(o):
+				offenders = append(offenders, fmt.Sprintf(
+					"%s/%s ready<1", o.GetNamespace(), o.GetName()))
+				p.clearPerconaInit(key)
+			default:
+				p.clearPerconaInit(key)
+			}
+		}
+	}
+	// Prune init timers for clusters that disappeared entirely.
+	p.mu.Lock()
+	for k := range p.perconaInitSeen {
+		if !live[k] {
+			delete(p.perconaInitSeen, k)
+		}
+	}
+	p.mu.Unlock()
+
+	if len(offenders) > 0 {
+		return probeResult{why: fmt.Sprintf(
+			"percona cluster quorum: %s", strings.Join(offenders, ", "))}
+	}
+	if firstErr != nil {
+		return probeResult{infra: firstErr}
+	}
+	return probeResult{pass: true}
+}
+
+// perconaClusterPaused reports spec.pause==true or spec.mode=="paused"
+// — a deliberately parked cluster is not a quorum failure.
+func perconaClusterPaused(o *unstructured.Unstructured) bool {
+	if paused, _, _ := unstructured.NestedBool(o.Object, "spec", "pause"); paused {
+		return true
+	}
+	if mode, _, _ := unstructured.NestedString(o.Object, "spec", "mode"); mode == "paused" {
+		return true
+	}
+	return false
+}
+
+// perconaReadyBelowOne reads the ready-instance count across the
+// Percona status shapes: top-level status.ready (PXC, PSMDB) or the
+// nested status.postgres.ready (PGv2 keeps readiness under the
+// postgres component). Absent fields read as "unknown", not zero —
+// an operator that never wrote a count must not false-positive.
+func perconaReadyBelowOne(o *unstructured.Unstructured) bool {
+	if ready, found, _ := unstructured.NestedInt64(o.Object, "status", "ready"); found {
+		return ready < 1
+	}
+	if ready, found, _ := unstructured.NestedInt64(o.Object, "status", "postgres", "ready"); found {
+		return ready < 1
+	}
+	return false
+}
+
+// perconaStateLabel picks the non-empty state/status string for the
+// offender message.
+func perconaStateLabel(state, statusField string) string {
+	if state != "" {
+		return state
+	}
+	return statusField
+}
+
+// perconaInitAge records (or returns the age of) the first sweep this
+// cluster was seen initializing — the 30m stuck-initializing clock.
+func (p *clusterHealthProber) perconaInitAge(key string, now time.Time) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	since, ok := p.perconaInitSeen[key]
+	if !ok {
+		p.perconaInitSeen[key] = now
+		return 0
+	}
+	return now.Sub(since)
+}
+
+// clearPerconaInit drops a cluster's initializing timer — resolved,
+// errored or otherwise no longer initializing.
+func (p *clusterHealthProber) clearPerconaInit(key string) {
+	p.mu.Lock()
+	delete(p.perconaInitSeen, key)
+	p.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -2349,10 +3051,45 @@ func smallestOrdinalPod(pods []corev1.Pod, stsName string) *corev1.Pod {
 
 // dbOperatorNames are the operators whose role-assignment wedge this
 // check heals — matched against the StatefulSet's labels, pod-template
-// labels and ownerReferences.
+// labels and ownerReferences. The long Percona deployment names sit
+// alongside the short chart aliases (W10-FIX4): an STS owned by the
+// percona-xtradb-cluster-operator Deployment labels itself with the
+// long name, while older charts/labels still carry pxc-operator.
 var dbOperatorNames = []string{
 	"mariadb-operator", "pxc-operator", "psmdb-operator",
 	"pg-operator", "scylla-operator",
+	"percona-xtradb-cluster-operator", "percona-server-mongodb-operator",
+	"percona-postgresql-operator",
+}
+
+// dbOperatorDeploymentAliases groups the Deployment/pod-name spellings
+// one logical db operator answers to (W10-FIX4): the short chart alias
+// (pxc-operator) and the long upstream Deployment name
+// (percona-xtradb-cluster-operator) produce DIFFERENT pod name
+// prefixes, so a heal keyed on whichever spelling dbOperatorFor
+// matched would miss the real pods.
+var dbOperatorDeploymentAliases = map[string][]string{
+	"percona-xtradb-cluster-operator": {"percona-xtradb-cluster-operator", "pxc-operator"},
+	"percona-server-mongodb-operator": {"percona-server-mongodb-operator", "psmdb-operator"},
+	"percona-postgresql-operator":     {"percona-postgresql-operator", "pg-operator"},
+}
+
+// dbOperatorPodPrefixes returns every pod-name prefix the logical
+// operator may deploy under — the alias group when one exists, else
+// the bare operator name. Order is stable: the canonical (key) name
+// first, then aliases.
+func dbOperatorPodPrefixes(operator string) []string {
+	if aliases, ok := dbOperatorDeploymentAliases[operator]; ok {
+		return aliases
+	}
+	for _, aliases := range dbOperatorDeploymentAliases {
+		for _, a := range aliases {
+			if a == operator {
+				return aliases
+			}
+		}
+	}
+	return []string{operator}
 }
 
 // dbOperatorFor returns the db operator name owning this StatefulSet,
@@ -2415,13 +3152,26 @@ func (p *clusterHealthProber) healDBOperator(ctx context.Context, log logr.Logge
 	}
 	// Find the oldest Running pod of the operator — its namespace is
 	// not fixed across installs, so the prefix match runs
-	// cluster-wide and the blast radius is capped at one pod.
+	// cluster-wide and the blast radius is capped at one pod. The
+	// Percona operators answer to two Deployment spellings (W10-FIX4)
+	// — every alias prefix is tried so a short-name match still finds
+	// the long-named pods.
+	prefixes := dbOperatorPodPrefixes(operator)
 	var target *corev1.Pod
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if !strings.HasPrefix(pod.Name, operator+"-") ||
-			pod.Status.Phase != corev1.PodRunning ||
+		if pod.Status.Phase != corev1.PodRunning ||
 			pod.DeletionTimestamp != nil {
+			continue
+		}
+		matched := false
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(pod.Name, prefix+"-") {
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			continue
 		}
 		if target == nil || pod.CreationTimestamp.Before(&target.CreationTimestamp) {

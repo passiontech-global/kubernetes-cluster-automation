@@ -112,14 +112,18 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	// Node list first — "at least one cordoned node" is a cluster-wide
 	// input to the per-PDB verdict. Failing to read it must abort the
 	// run: treating it as "no cordon" would silently clear every
-	// cordoned_node_blocked series mid-incident.
+	// cordoned_node_blocked series mid-incident. W10-FIX5:
+	// NodeActivelyCordoned — a statically-cordoned node past the
+	// cordon-active window is deliberate state, not a drain in
+	// flight, and must not pin cordoned_node_blocked forever.
+	now := w.nowFn()
 	nodes, err := shared.ListNodes(ctx, w.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}
 	anyCordoned := false
 	for i := range nodes {
-		if nodes[i].Spec.Unschedulable {
+		if shared.NodeActivelyCordoned(&nodes[i], now) {
 			anyCordoned = true
 			break
 		}
@@ -131,8 +135,6 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list poddisruptionbudgets: %w", err)
 	}
-
-	now := w.nowFn()
 	// seen collects every "<ns>/<name>/<reason>" key whose precondition
 	// held THIS cycle — the prune pass below treats anything else in
 	// firstSeen as either resolved or gone.

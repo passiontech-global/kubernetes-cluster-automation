@@ -310,6 +310,168 @@ func TestAPIServiceGuardListsOncePerRun(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// (c) W10-CP1 — dead-APIService unblocker
+// ---------------------------------------------------------------------------
+
+// asgStuckNS builds a namespace stuck in Terminating for `age`,
+// carrying one NamespaceContentRemaining condition whose message
+// references `groupRef`.
+func asgStuckNS(name string, age time.Duration, groupRef string) *corev1.Namespace {
+	return &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			DeletionTimestamp: &metav1.Time{Time: time.Now().Add(-age)},
+		},
+		Status: corev1.NamespaceStatus{
+			Phase: corev1.NamespaceTerminating,
+			Conditions: []corev1.NamespaceCondition{{
+				Type:    corev1.NamespaceContentRemaining,
+				Status:  corev1.ConditionTrue,
+				Reason:  "ContentRemaining",
+				Message: "some resources are remaining: APIservices." + groupRef + " cannot be deleted",
+			}},
+		},
+	}
+}
+
+// asgBackendSvc + asgBackendPod build the backing Service and one
+// selected pod for a protected-namespace APIService.
+func asgBackendSvc(ns, name, app string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec:       corev1.ServiceSpec{Selector: map[string]string{"app": app}},
+	}
+}
+
+func asgBackendPod(ns, name, app string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: ns, Labels: map[string]string{"app": app},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func asgPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
+	t.Helper()
+	_, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+	return err == nil
+}
+
+// The full wedge signature — protected-namespace APIService
+// Available=False >=15m AND a namespace Terminating >=15m whose
+// condition names the API group — restarts the backing pods.
+func TestAPIServiceGuardUnblockRestartsBackingPods(t *testing.T) {
+	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
+	asgUnavailable(apiSvc, 30*time.Minute)
+	cs := fake.NewSimpleClientset(
+		testutil.Namespace("kube-system"),
+		asgStuckNS("dying-ns", 20*time.Minute, "metrics.k8s.io"),
+		asgBackendSvc("kube-system", "metrics-server", "metrics-server"),
+		asgBackendPod("kube-system", "ms-0", "metrics-server"),
+		asgBackendPod("kube-system", "ms-1", "metrics-server"))
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"ms-0", "ms-1"} {
+		if asgPodExists(t, cs, "kube-system", name) {
+			t.Fatalf("backing pod %s not restarted", name)
+		}
+	}
+	if !asgExists(t, dyn, "v1beta1.metrics.k8s.io") {
+		t.Fatal("APIService object itself deleted — only pods should restart")
+	}
+}
+
+// Every gate leg is required: a Terminating namespace younger than
+// 15m must not trigger the heal even with a long-dead APIService.
+func TestAPIServiceGuardUnblockYoungTerminatingSkipped(t *testing.T) {
+	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
+	asgUnavailable(apiSvc, 30*time.Minute)
+	cs := fake.NewSimpleClientset(
+		testutil.Namespace("kube-system"),
+		asgStuckNS("dying-ns", 5*time.Minute, "metrics.k8s.io"),
+		asgBackendSvc("kube-system", "metrics-server", "metrics-server"),
+		asgBackendPod("kube-system", "ms-0", "metrics-server"))
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !asgPodExists(t, cs, "kube-system", "ms-0") {
+		t.Fatal("backing pod deleted although the namespace only just started terminating")
+	}
+}
+
+// A Terminating namespace referencing a DIFFERENT API group does
+// not unblock this APIService.
+func TestAPIServiceGuardUnblockWrongGroupSkipped(t *testing.T) {
+	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
+	asgUnavailable(apiSvc, 30*time.Minute)
+	cs := fake.NewSimpleClientset(
+		testutil.Namespace("kube-system"),
+		asgStuckNS("dying-ns", 20*time.Minute, "other.example.com"),
+		asgBackendSvc("kube-system", "metrics-server", "metrics-server"),
+		asgBackendPod("kube-system", "ms-0", "metrics-server"))
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !asgPodExists(t, cs, "kube-system", "ms-0") {
+		t.Fatal("backing pod deleted for an unrelated API group")
+	}
+}
+
+// The unblock healer is scoped to the protected-namespace set: a
+// broken APIService backed in a regular namespace gets the metric
+// only — no pod restarts.
+func TestAPIServiceGuardUnblockNonProtectedSkipped(t *testing.T) {
+	apiSvc := asgObj("v1beta1.custom.example.com", "custom-ns", "custom-apiserver")
+	asgUnavailable(apiSvc, 30*time.Minute)
+	cs := fake.NewSimpleClientset(
+		testutil.Namespace("custom-ns"),
+		asgStuckNS("dying-ns", 20*time.Minute, "custom.example.com"),
+		asgBackendSvc("custom-ns", "custom-apiserver", "custom"),
+		asgBackendPod("custom-ns", "custom-0", "custom"))
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !asgPodExists(t, cs, "custom-ns", "custom-0") {
+		t.Fatal("non-protected APIService backend restarted — scope violated")
+	}
+}
+
+// A healthy protected-namespace APIService is never touched even
+// while a namespace sits Terminating.
+func TestAPIServiceGuardUnblockHealthySkipped(t *testing.T) {
+	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
+	asgUnavailable(apiSvc, 2*time.Minute) // under the 15m unblock gate
+	cs := fake.NewSimpleClientset(
+		testutil.Namespace("kube-system"),
+		asgStuckNS("dying-ns", 20*time.Minute, "metrics.k8s.io"),
+		asgBackendSvc("kube-system", "metrics-server", "metrics-server"),
+		asgBackendPod("kube-system", "ms-0", "metrics-server"))
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !asgPodExists(t, cs, "kube-system", "ms-0") {
+		t.Fatal("backing pod deleted for a sub-threshold APIService failure")
+	}
+}
+
 // An apiservices list failure inside the watchdog is a real error —
 // but the orphan pass must have already run (independence).
 func TestAPIServiceGuardListErrorIsolated(t *testing.T) {
