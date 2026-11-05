@@ -1,8 +1,9 @@
-// groups_hub.go — task groups ported from hub_converge.yaml
+// group_hub.go — task groups ported from hub_converge.yaml
 // scopes: swap safety-net
 // (tasks/node_tuning_swap.yaml), hub/infra node-exporter firewall
-// (tasks/node_exporter_hub.yaml) and the API-LB VM guard converge
-// (tasks/api_lb_guard.yaml).
+// (tasks/node_exporter_hub.yaml), journald persistence (standalone
+// hosts) and the API-LB VM guard converge (tasks/api_lb_guard.yaml),
+// plus the etcdctl/kine splits.
 package hostconfig
 
 import (

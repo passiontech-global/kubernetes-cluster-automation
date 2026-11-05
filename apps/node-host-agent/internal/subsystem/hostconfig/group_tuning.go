@@ -1,19 +1,14 @@
-// groups_tuning.go — the remaining node_tuning.yaml task groups:
+// group_tuning.go — the remaining node_tuning.yaml task groups:
 // T7/T17 image-pulls+kubelet, T8/T10 nodeip+cpu, T9 coredns stub/hub,
-// T11 bw audit, security, T12 api-local-lb, verify + download helpers.
+// T11 bw audit, security, T12 api-local-lb and the informational verify.
 package hostconfig
 
 import (
-	"archive/tar"
-	"compress/gzip"
-	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
 )
 
@@ -96,45 +90,6 @@ func (c *cyc) kubeletCfgPath() string {
 		}
 	}
 	return ""
-}
-
-// lineInFile is ansible lineinfile parity: replace the LAST line
-// matching re with line; when absent insert after the last line
-// matching insAfter (or append at EOF).
-func lineInFile(s, re, line, insAfter string) string {
-	rex := regexp.MustCompile(re)
-	if loc := findLastMatch(rex, s); loc != nil {
-		nl := strings.IndexByte(s[loc[0]:], '\n')
-		end := len(s)
-		if nl >= 0 {
-			end = loc[0] + nl + 1
-		}
-		if !strings.HasSuffix(line, "\n") {
-			line += "\n"
-		}
-		return s[:loc[0]] + line + s[end:]
-	}
-	if insAfter != "" {
-		ia := regexp.MustCompile(insAfter)
-		if loc := findLastMatch(ia, s); loc != nil {
-			nl := strings.IndexByte(s[loc[0]:], '\n')
-			end := loc[0] + nl + 1
-			if nl < 0 {
-				end = len(s)
-				return s[:end] + "\n" + line + "\n"
-			}
-			return s[:end] + line + "\n" + s[end:]
-		}
-	}
-	return s + line + "\n"
-}
-
-func findLastMatch(re *regexp.Regexp, s string) []int {
-	var last []int
-	for _, loc := range re.FindAllStringIndex(s, -1) {
-		last = loc
-	}
-	return last
 }
 
 // evictionMinReclaimMap returns the expected evictionMinimumReclaim
@@ -1302,125 +1257,5 @@ func (c *cyc) groupVerify() {
 		logger().Info("hostconfig verify: cc/qdisc", "sysctl", out)
 	} else {
 		logger().Warn("hostconfig verify: cc/qdisc unreadable", "error", err)
-	}
-}
-
-// ---------- download helpers ----------
-
-// download fetches url to dst under the Config.HTTPTimeout client
-// deadline (nebula/coredns/etcdctl tarballs, haproxy + kine deb/bin).
-func (r *Reconciler) download(ctx context.Context, url, dst, wantSHA256 string) error {
-	return downloadFile(ctx, url, dst, wantSHA256, r.cfg.HTTPTimeout)
-}
-
-// downloadFile streams url to dst atomically: tmp file + sha256
-// verify + fsync + rename, partial tmp swept on every failure path.
-func downloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time.Duration) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := (&http.Client{Timeout: timeout}).Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	tmp := dst + ".dl"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	h := sha256.New()
-	_, err = io.Copy(io.MultiWriter(f, h), resp.Body)
-	if err == nil {
-		// fsync before rename — the staged artifact must be durable;
-		// Close's error counts too (NFS/delayed-write failures only
-		// surface there). Drop the just-written pages after Sync —
-		// archives are staged for untarInstall/sha256FileOK, not for
-		// serving, and their cache would pin the pod's cgroup charge.
-		if err = f.Sync(); err == nil {
-			pagecache.Drop(f)
-		}
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if wantSHA256 != "" && !strings.EqualFold(wantSHA256, fmt.Sprintf("%x", h.Sum(nil))) {
-		os.Remove(tmp)
-		return fmt.Errorf("download %s: sha256 mismatch", url)
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
-// untarInstall extracts member name from a .tar.gz and atomically
-// installs to dst.
-func untarInstall(tgz, member, dst string, mode os.FileMode) error {
-	f, err := os.Open(tgz)
-	if err != nil {
-		return err
-	}
-	// Drop the archive's read-behind pages on the way out — the tgz
-	// is only scanned once per install.
-	defer func() { pagecache.Drop(f); _ = f.Close() }()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return err
-	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	for {
-		hd, err := tr.Next()
-		if err != nil {
-			return fmt.Errorf("%s not found in %s", member, tgz)
-		}
-		if filepath.Base(hd.Name) == member {
-			tmp := dst + ".tmp"
-			out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-			if err != nil {
-				return err
-			}
-			_, err = io.Copy(out, tr)
-			if err == nil {
-				// fsync before rename (writeManaged parity) — a
-				// crash after rename must never expose a zeroed
-				// binary at the install path. Then drop the staged
-				// pages: a freshly installed binary's cache charge
-				// belongs to whoever execs it, not to this pod's
-				// working set.
-				if err = out.Sync(); err == nil {
-					pagecache.Drop(out)
-				}
-			}
-			// Close's error counts too — delayed-write failures only
-			// surface there.
-			if cerr := out.Close(); err == nil {
-				err = cerr
-			}
-			if err != nil {
-				// sweep the partial tmp — a truncated member must not
-				// linger next to the live binary.
-				os.Remove(tmp)
-				return err
-			}
-			if err := os.Rename(tmp, dst); err != nil {
-				os.Remove(tmp)
-				return err
-			}
-			return nil
-		}
 	}
 }
