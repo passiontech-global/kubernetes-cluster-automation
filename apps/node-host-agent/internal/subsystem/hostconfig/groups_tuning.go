@@ -1016,11 +1016,28 @@ func (c *cyc) groupAPILB() {
 		c.err("T12 render", "error", err)
 		return
 	}
-	// haproxy install only when missing or wrong pinned version.
+	// haproxy install only when missing or OLDER than the pinned
+	// version — a NEWER host haproxy (unattended-upgrades/security
+	// pocket) already satisfies the pin, and apt refuses the
+	// downgrade anyway (exit-100 ERROR loop, incident
+	// 2026-11-05 lanit-cloud-worker-nonprod-05: installed
+	// 2.8.30-0ubuntu0.24.04.2 vs pin 2.8.16-0ubuntu0.24.04.3).
+	// dpkg --compare-versions does the Debian-version compare on
+	// the host; a missing/malformed compare falls back to
+	// installing (same as the old mismatch path).
 	out, _ := r.run(ctx, "dpkg-query", "-W", "-f=${Status} ${Version}", "haproxy")
 	ver := c.v("api_lb_haproxy_version")
-	if !strings.Contains(out, "install ok installed") ||
-		(ver != "" && !strings.Contains(out, ver)) {
+	needDeb := !strings.Contains(out, "install ok installed")
+	if !needDeb && ver != "" {
+		f := strings.Fields(out)
+		if len(f) < 4 {
+			needDeb = true
+		} else if _, err := r.run(ctx, "dpkg", "--compare-versions",
+			f[len(f)-1], "ge", ver); err != nil {
+			needDeb = true
+		}
+	}
+	if needDeb {
 		// The deb must live on a host-visible path: download() writes
 		// in the container mount ns while apt-get runs via nsenter in
 		// the host's — /tmp/hostconfig doesn't exist there. The

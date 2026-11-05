@@ -257,8 +257,18 @@ func (c *cyc) hubMetricsNodeExporter() {
 	}
 	out, _ := r.run(ctx, "dpkg-query", "-W",
 		"-f=${Status} ${Version}", "prometheus-node-exporter")
-	if strings.Contains(out, "install ok installed") && strings.Contains(out, ver) {
-		return // right version already installed — ansible skipped the whole chain
+	// Skip only when installed >= pin — a NEWER node_exporter
+	// (unattended-upgrades/security pocket) already satisfies it,
+	// and apt refuses the downgrade anyway (same exit-100 loop
+	// class as the T12 haproxy deb, incident 2026-11-05). Older,
+	// missing or unparseable falls through to download+install.
+	if strings.Contains(out, "install ok installed") {
+		if f := strings.Fields(out); len(f) >= 4 {
+			if _, err := r.run(ctx, "dpkg", "--compare-versions",
+				f[len(f)-1], "ge", ver); err == nil {
+				return // installed satisfies the pin — ansible skipped the whole chain
+			}
+		}
 	}
 	// Host path /tmp/<file> (get_url dest). Download to the
 	// HostRoot-joined path so the agent fs op lands on the host file

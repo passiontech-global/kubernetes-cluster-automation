@@ -1025,6 +1025,43 @@ interdc_nexp_deb_file: "nexp.deb"
 	}
 }
 
+// TestHubMetricsNexpSkipsNewerVersion — installed NEWER than the pin
+// satisfies it (unattended-upgrades/security pocket): no download,
+// no apt-get — apt would refuse the downgrade (same exit-100 loop
+// class as the T12 haproxy deb fix, incident 2026-11-05).
+func TestHubMetricsNexpSkipsNewerVersion(t *testing.T) {
+	deb := []byte("fake-deb-payload")
+	sum := sha256.Sum256(deb)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(deb)
+	}))
+	t.Cleanup(srv.Close)
+	vars := writeVarsDir(t, fmt.Sprintf(`interdc_nexp_version: "1.7.0-1ubuntu0.3"
+interdc_nexp_deb_url: "%s/nexp.deb"
+interdc_nexp_deb_sha256: "%x"
+`, srv.URL, sum))
+	sr := &scriptedRunner{
+		res: map[string]string{
+			"dpkg-query -W -f=${Status} ${Version} prometheus-node-exporter": "install ok installed 1.7.0-1ubuntu0.4",
+		},
+		errs: map[string]bool{},
+	}
+	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupHubMetricsFW()
+	if len(sr.callsMatching("apt-get install")) > 0 {
+		t.Fatalf("newer node_exporter triggered deb install: %v",
+			sr.callsMatching("apt-get"))
+	}
+	if len(sr.callsMatching("dpkg --compare-versions")) == 0 {
+		t.Fatal("version compare not run")
+	}
+}
+
 func TestHubMetricsNexpInstallsPinnedDeb(t *testing.T) {
 	deb := []byte("fake-deb-payload")
 	sum := sha256.Sum256(deb)
@@ -2406,6 +2443,69 @@ func TestAPILBRestartsOnUnitDrift(t *testing.T) {
 	if len(sr.callsMatching("systemctl restart api-local-lb.service")) == 0 {
 		t.Fatalf("unit drift did not restart api-local-lb: %v",
 			sr.callsMatching("api-local-lb"))
+	}
+}
+
+// lbVarsDebStaged — lbVars plus an empty deb sha256 (any staged file
+// passes sha256FileOK) so a regression reaches the apt-get call
+// instead of dying in downloadFile on the dead "deadbeef" pin.
+func lbVarsDebStaged(t *testing.T) string {
+	return writeVarsDir(t, `api_lb_vip_ip: "203.0.113.14"
+api_lb_haproxy_version: "2.8.16-0ubuntu0.24.04.3"
+api_lb_haproxy_deb_sha256: ""
+api_lb_backends:
+  - name: api_datahub
+    addr: "10.0.1.10:6443"
+`)
+}
+
+func stageHaproxyDeb(t *testing.T, r *Reconciler) {
+	t.Helper()
+	hostWrite(t, r, "/var/lib/node-watchdog/haproxy.deb", "fake deb")
+}
+
+// TestAPILBNewerHaproxySkipsDeb — a host haproxy NEWER than the pin
+// (unattended-upgrades/security pocket) satisfies it: dpkg
+// --compare-versions ge passes, no deb download, no apt-get install
+// (which would fail on the refused downgrade — incident
+// 2026-11-05 lanit-cloud-worker-nonprod-05 exit-100 loop).
+func TestAPILBNewerHaproxySkipsDeb(t *testing.T) {
+	vars := lbVarsDebStaged(t)
+	sr := lbRunner()
+	sr.res["dpkg-query -W -f=${Status} ${Version} haproxy"] =
+		"install ok installed 2.8.30-0ubuntu0.24.04.2"
+	r := newLBHost(t, vars, sr)
+	stageHaproxyDeb(t, r)
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupAPILB()
+	if len(sr.callsMatching("apt-get install -y /var/lib/node-watchdog/haproxy.deb")) > 0 {
+		t.Fatalf("newer haproxy triggered deb install: %v",
+			sr.callsMatching("apt-get install"))
+	}
+	if len(sr.callsMatching("dpkg --compare-versions")) == 0 {
+		t.Fatal("version compare not run")
+	}
+	if c.errs != 0 {
+		t.Fatalf("cycle errors on satisfied pin: %d", c.errs)
+	}
+}
+
+// TestAPILBOlderHaproxyInstallsDeb — installed OLDER than the pin
+// still converges: compare-versions ge fails, the staged deb goes to
+// apt-get.
+func TestAPILBOlderHaproxyInstallsDeb(t *testing.T) {
+	vars := lbVarsDebStaged(t)
+	sr := lbRunner()
+	sr.res["dpkg-query -W -f=${Status} ${Version} haproxy"] =
+		"install ok installed 2.8.10-1"
+	sr.errs["dpkg --compare-versions"] = true // ge fails: 2.8.10 < pin
+	r := newLBHost(t, vars, sr)
+	stageHaproxyDeb(t, r)
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupAPILB()
+	if len(sr.callsMatching("apt-get install -y /var/lib/node-watchdog/haproxy.deb")) == 0 {
+		t.Fatalf("older haproxy did not install pinned deb: %v",
+			sr.callsMatching("apt-get"))
 	}
 }
 
