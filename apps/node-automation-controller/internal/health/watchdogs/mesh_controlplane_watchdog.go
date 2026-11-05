@@ -18,7 +18,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // meshControlPlaneCheck is the W8 mesh control-plane watchdog —
@@ -71,13 +71,13 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 	var findings []string
 
 	// (a) CiliumIPAMExhausted latch.
-	nodes, err := shared.ListNodes(ctx, p.CS)
+	nodes, err := kube.ListNodes(ctx, p.CS)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
 	var ipamNodes []string
 	for i := range nodes {
-		c := shared.NodeCondition(&nodes[i], "CiliumIPAMExhausted")
+		c := kube.NodeCondition(&nodes[i], "CiliumIPAMExhausted")
 		if c != nil && c.Status == corev1.ConditionTrue &&
 			!c.LastTransitionTime.IsZero() &&
 			now.Sub(c.LastTransitionTime.Time) >= ciliumIPAMMinAge {
@@ -155,7 +155,7 @@ func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.L
 		log.Info("skip heal: component inside cooldown", "component", component)
 		return
 	}
-	held, why, err := shared.MaintenanceActive(ctx, p.CS, p.Dyn)
+	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
@@ -199,7 +199,7 @@ func (p *meshControlPlaneCheck) healNamedPod(ctx context.Context, log logr.Logge
 		log.Info("skip heal: component inside cooldown", "component", component)
 		return
 	}
-	held, why, err := shared.MaintenanceActive(ctx, p.CS, p.Dyn)
+	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",

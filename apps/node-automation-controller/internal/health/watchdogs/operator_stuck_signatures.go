@@ -11,7 +11,7 @@
 package watchdogs
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -21,7 +21,7 @@ import (
 // object never touched by its controller is the strongest stuck
 // signal there is (generation >= 1 for any real object).
 func staleObservedGeneration(o *unstructured.Unstructured) bool {
-	og, _ := shared.NestedInt64(o.Object, "status", "observedGeneration")
+	og, _ := kube.NestedInt64(o.Object, "status", "observedGeneration")
 	return og < o.GetGeneration()
 }
 
@@ -29,7 +29,7 @@ func staleObservedGeneration(o *unstructured.Unstructured) bool {
 // parking brake honored: a spec.suspend=true object is deliberately
 // not reconciled — suspended work is parked, not stuck.
 func fluxUnsuspendedStaleGen(o *unstructured.Unstructured) bool {
-	if suspended, _ := shared.NestedBool(o.Object, "spec", "suspend"); suspended {
+	if suspended, _ := kube.NestedBool(o.Object, "spec", "suspend"); suspended {
 		return false
 	}
 	return staleObservedGeneration(o)
@@ -43,7 +43,7 @@ func fluxUnsuspendedStaleGen(o *unstructured.Unstructured) bool {
 // OCI pull health lives on the generated HelmChart objects, which
 // ARE watched by the helmcharts entry).
 func helmRepoStaleGen(o *unstructured.Unstructured) bool {
-	if t, _ := shared.NestedString(o.Object, "spec", "type"); t == "oci" {
+	if t, _ := kube.NestedString(o.Object, "spec", "type"); t == "oci" {
 		return false
 	}
 	return fluxUnsuspendedStaleGen(o)
@@ -55,7 +55,7 @@ func helmRepoStaleGen(o *unstructured.Unstructured) bool {
 // stamps status.conditions on its first reconcile pass, so an absent
 // or empty list means it never picked the object up (W7-C2).
 func noStatusConditions(o *unstructured.Unstructured) bool {
-	conds, found := shared.NestedSlice(o.Object, "status", "conditions")
+	conds, found := kube.NestedSlice(o.Object, "status", "conditions")
 	return !found || len(conds) == 0
 }
 
@@ -63,7 +63,7 @@ func noStatusConditions(o *unstructured.Unstructured) bool {
 // types that report a status.phase (ArgoCD): an absent/empty phase
 // means the operator never touched the object (W7-C2).
 func emptyStatusPhase(o *unstructured.Unstructured) bool {
-	phase, found := shared.NestedString(o.Object, "status", "phase")
+	phase, found := kube.NestedString(o.Object, "status", "phase")
 	return !found || phase == ""
 }
 
@@ -75,10 +75,10 @@ func emptyStatusPhase(o *unstructured.Unstructured) bool {
 // NHC still carries phase=Paused, a finished SNR keeps its last
 // phase — so only the both-absent shape proves "never reconciled".
 func noStatusAtAll(o *unstructured.Unstructured) bool {
-	if phase, found := shared.NestedString(o.Object, "status", "phase"); found && phase != "" {
+	if phase, found := kube.NestedString(o.Object, "status", "phase"); found && phase != "" {
 		return false
 	}
-	conds, found := shared.NestedSlice(o.Object, "status", "conditions")
+	conds, found := kube.NestedSlice(o.Object, "status", "conditions")
 	return !found || len(conds) == 0
 }
 
@@ -87,10 +87,10 @@ func noStatusAtAll(o *unstructured.Unstructured) bool {
 // parks reconciliation deliberately — paused clusters are parked,
 // not stuck (W10-CP3).
 func perconaUnpausedStaleGen(o *unstructured.Unstructured) bool {
-	if paused, _ := shared.NestedBool(o.Object, "spec", "pause"); paused {
+	if paused, _ := kube.NestedBool(o.Object, "spec", "pause"); paused {
 		return false
 	}
-	if mode, _ := shared.NestedString(o.Object, "spec", "mode"); mode == "paused" {
+	if mode, _ := kube.NestedString(o.Object, "spec", "mode"); mode == "paused" {
 		return false
 	}
 	return staleObservedGeneration(o)

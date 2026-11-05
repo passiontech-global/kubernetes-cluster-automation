@@ -123,7 +123,7 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "dragonflydb.io", Version: "v1alpha1", Kind: "Dragonfly"},
 
 	// k0s autopilot Plan — the maintenance-mutex signal every
-	// sweep module's dyn client reads (shared.AutopilotPlanGVR).
+	// sweep module's dyn client reads (kube.AutopilotPlanGVR).
 	{Group: "autopilot.k0sproject.io", Version: "v1beta2", Kind: "Plan"},
 
 	// gateway-api (clusterhealthprobes' cilium gateway signature).

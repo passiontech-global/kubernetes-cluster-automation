@@ -15,7 +15,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -101,7 +101,7 @@ func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.L
 		log.Info("skip heal: db operator inside cooldown", "operator", operator)
 		return
 	}
-	held, why, err := shared.MaintenanceActive(ctx, p.CS, p.Dyn)
+	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",

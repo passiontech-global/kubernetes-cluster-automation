@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -74,7 +75,7 @@ type Deps struct {
 	// and the db-operator masterless heals key operator names — one
 	// keyspace so a heal under any spelling honors the same stamp
 	// (the former deps.meshHealed map).
-	Heals shared.CooldownSet
+	Heals state.CooldownSet
 
 	// Prom is the shared Prometheus instant-query client the
 	// metrics-backed checks run through PromQuery; Timeout bounds

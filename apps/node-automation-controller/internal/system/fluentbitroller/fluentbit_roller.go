@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -116,7 +117,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 
 	// Storm gate: never restart the DS while nodes are down — adds
 	// churn; positionDB guarantees resume once stable.
-	notReady, err := shared.CountNotReadyNodes(ctx, r.cs)
+	notReady, err := kube.CountNotReadyNodes(ctx, r.cs)
 	if err != nil {
 		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("count not-ready nodes (storm gate): %w", err)
@@ -134,7 +135,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	}
 	// Bash settled check exactly: generation observed AND updated ==
 	// desired. NumberReady is deliberately NOT required (bash didn't —
-	// do not use shared.DaemonSetSettled, which is stricter).
+	// do not use kube.DaemonSetSettled, which is stricter).
 	if ds.Generation != ds.Status.ObservedGeneration ||
 		ds.Status.UpdatedNumberScheduled != ds.Status.DesiredNumberScheduled {
 		log.Info("rollout in progress — skip",

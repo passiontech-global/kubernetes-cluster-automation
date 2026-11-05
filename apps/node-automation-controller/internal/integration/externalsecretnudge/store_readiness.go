@@ -8,7 +8,7 @@ package externalsecretnudge
 import (
 	"context"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -21,9 +21,9 @@ func (n *externalSecretNudge) listFirst(ctx context.Context,
 	gvrs []schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
 	var lastErr error
 	for _, gvr := range gvrs {
-		items, err := shared.ListAll(ctx,
+		items, err := kube.ListAll(ctx,
 			metav1.ListOptions{Limit: esListPageSize},
-			shared.DynamicPage(n.dyn.Resource(gvr)))
+			kube.DynamicPage(n.dyn.Resource(gvr)))
 		if err == nil {
 			return &unstructured.UnstructuredList{Items: items}, nil
 		}
@@ -37,9 +37,9 @@ func (n *externalSecretNudge) listFirst(ctx context.Context,
 func (n *externalSecretNudge) listES(ctx context.Context) (*unstructured.UnstructuredList, schema.GroupVersionResource, error) {
 	var lastErr error
 	for _, gvr := range externalSecretGVRs {
-		items, err := shared.ListAll(ctx,
+		items, err := kube.ListAll(ctx,
 			metav1.ListOptions{Limit: esListPageSize},
-			shared.DynamicPage(n.dyn.Resource(gvr)))
+			kube.DynamicPage(n.dyn.Resource(gvr)))
 		if err == nil {
 			return &unstructured.UnstructuredList{Items: items}, gvr, nil
 		}
@@ -84,24 +84,24 @@ func (n *externalSecretNudge) esStoreReady(es *unstructured.Unstructured) bool {
 // a store. Refs without a name are genuinely absent; generator refs
 // (sourceRef.generatorRef) are not stores and never reach fn.
 func esStoreRefs(es *unstructured.Unstructured, fn func(name, kind string)) {
-	if name, ok := shared.NestedString(
+	if name, ok := kube.NestedString(
 		es.Object, "spec", "secretStoreRef", "name"); ok && name != "" {
-		kind, _ := shared.NestedString(
+		kind, _ := kube.NestedString(
 			es.Object, "spec", "secretStoreRef", "kind")
 		fn(name, kind)
 	}
 	// dataFrom[].sourceRef.storeRef and data[].sourceRef.storeRef are
 	// the same per-entry override shape under two parent lists.
 	for _, field := range []string{"dataFrom", "data"} {
-		entries, _ := shared.NestedSlice(es.Object, "spec", field)
+		entries, _ := kube.NestedSlice(es.Object, "spec", field)
 		for _, e := range entries {
 			m, ok := e.(map[string]any)
 			if !ok {
 				continue
 			}
-			if name, ok := shared.NestedString(
+			if name, ok := kube.NestedString(
 				m, "sourceRef", "storeRef", "name"); ok && name != "" {
-				kind, _ := shared.NestedString(
+				kind, _ := kube.NestedString(
 					m, "sourceRef", "storeRef", "kind")
 				fn(name, kind)
 			}

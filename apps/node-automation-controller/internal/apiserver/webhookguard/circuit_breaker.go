@@ -26,7 +26,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 const (
@@ -63,7 +64,7 @@ const (
 // circuitBreakerEnabled reads the kill-switch every run — an env flip
 // takes effect on the next sweep without a code change.
 func circuitBreakerEnabled() bool {
-	return shared.Gate("WEBHOOK_CIRCUIT_BREAKER_ENABLED", true)
+	return envx.Gate("WEBHOOK_CIRCUIT_BREAKER_ENABLED", true)
 }
 
 // circuitBreaker owns the C1 sweep's per-sweep state — embedded in
@@ -76,7 +77,7 @@ type circuitBreaker struct {
 	// kind/config/sub-webhook sighted fail-closed against a Service
 	// with 0 Ready endpoints. A sighting that disappears (endpoints
 	// back, entry removed) resets the streak.
-	deadSince shared.FirstSeenLedger
+	deadSince state.FirstSeenLedger
 	// brokenEmitted is the ledger of WebhookCircuitBroken label tuples
 	// ("kind/config/webhook") currently held at =1. Each sweep
 	// re-asserts the triples still broken; a tuple not re-seen —
@@ -84,7 +85,7 @@ type circuitBreaker struct {
 	// by the orphan sweep — gets its series deleted via
 	// DeleteLabelValues instead of pinning the alert forever (same
 	// seen-set hygiene as the cert drift auditor).
-	brokenEmitted shared.GaugeLedger[string]
+	brokenEmitted state.GaugeLedger[string]
 	// zeroThreshold / partitionZeroThreshold override the two trip
 	// windows — tests shrink them; a zero value falls back to
 	// webhookDeadThreshold / webhookPartitionedThreshold.
@@ -92,7 +93,7 @@ type circuitBreaker struct {
 	partitionZeroThreshold time.Duration
 	// bounceAt: webhook backend service key ("ns/name") → last pod
 	// bounce — the in-memory half of the 15m per-service cooldown.
-	bounceAt shared.CooldownSet
+	bounceAt state.CooldownSet
 }
 
 // sweepCircuitBreaker trips fail-closed sub-webhooks whose backend
@@ -247,7 +248,7 @@ func (b *circuitBreaker) tripThreshold(rawReady int) time.Duration {
 // apply only after the patch lands.
 func (b *circuitBreaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal string,
 	hooks []hookView, ready endpointCensus, now time.Time,
-	seen map[string]bool, emitted *shared.GaugeLedger[string]) ([]byte, []string, []string) {
+	seen map[string]bool, emitted *state.GaugeLedger[string]) ([]byte, []string, []string) {
 
 	broken := parseCircuitAnnotation(annoVal)
 	// present holds every live sub-webhook name — the staleness check

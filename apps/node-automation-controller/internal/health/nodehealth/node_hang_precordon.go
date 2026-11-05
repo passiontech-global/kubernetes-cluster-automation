@@ -19,7 +19,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // nodeHangCheck is the node-hang pre-cordon watchdog.
@@ -78,14 +78,14 @@ var nodeHangConds = []corev1.NodeConditionType{
 // before the node counts as hanging.
 func nodeHangLatch(n *corev1.Node, now time.Time) string {
 	for _, t := range nodeHangConds {
-		c := shared.NodeCondition(n, t)
+		c := kube.NodeCondition(n, t)
 		if c != nil && c.Status == corev1.ConditionTrue &&
 			!c.LastTransitionTime.IsZero() &&
 			now.Sub(c.LastTransitionTime.Time) >= nodeHangCondMinAge {
 			return string(t)
 		}
 	}
-	if c := shared.NodeCondition(n, nodeClockSkewCond); c != nil &&
+	if c := kube.NodeCondition(n, nodeClockSkewCond); c != nil &&
 		c.Status == corev1.ConditionTrue &&
 		!c.LastTransitionTime.IsZero() &&
 		now.Sub(c.LastTransitionTime.Time) >= nodeClockSkewCordonAge {
@@ -100,12 +100,12 @@ func nodeHangLatch(n *corev1.Node, now time.Time) string {
 // hanging, so the pre-cordon stays.
 func nodeHangLatchActive(n *corev1.Node) bool {
 	for _, t := range nodeHangConds {
-		if c := shared.NodeCondition(n, t); c != nil &&
+		if c := kube.NodeCondition(n, t); c != nil &&
 			c.Status == corev1.ConditionTrue {
 			return true
 		}
 	}
-	if c := shared.NodeCondition(n, nodeClockSkewCond); c != nil &&
+	if c := kube.NodeCondition(n, nodeClockSkewCond); c != nil &&
 		c.Status == corev1.ConditionTrue {
 		return true
 	}
@@ -127,7 +127,7 @@ func nodeHangLatchActive(n *corev1.Node) bool {
 func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	nodes, err := shared.ListNodes(ctx, p.CS)
+	nodes, err := kube.ListNodes(ctx, p.CS)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
@@ -136,7 +136,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 	var uncordon, staleStamp []string
 	for i := range nodes {
 		n := &nodes[i]
-		if shared.IsControlPlane(n) {
+		if kube.IsControlPlane(n) {
 			continue
 		}
 		workers++

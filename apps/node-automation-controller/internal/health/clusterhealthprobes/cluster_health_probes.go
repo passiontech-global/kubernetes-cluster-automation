@@ -70,6 +70,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -82,12 +83,12 @@ import (
 func healthProbeConfigFromEnv() probefw.Config {
 	cfg := probefw.Config{
 		Timeouts: probefw.TimeoutsConfig{
-			// shared.GetenvDuration floors every duration knob at
+			// envx.GetenvDuration floors every duration knob at
 			// 1s (the retired helpers accepted any d > 0) —
 			// sub-second probe timeouts and persistence windows
 			// were already pathological, so the tightened bound
 			// changes no sane configuration.
-			Check: shared.GetenvDuration("HEALTH_CHECK_TIMEOUT", 30*time.Second),
+			Check: envx.GetenvDuration("HEALTH_CHECK_TIMEOUT", 30*time.Second),
 			// Bounds one check's share of the serial sweep — a hung
 			// apiserver call used to stretch the whole cycle; past
 			// the deadline the check's context is cancelled (the
@@ -95,7 +96,7 @@ func healthProbeConfigFromEnv() probefw.Config {
 			// check's own error still surfaces as FAIL/infra, so
 			// reporting semantics are unchanged — only the wait is
 			// bounded.
-			PerCheck: shared.GetenvDuration("HEALTH_PER_CHECK_TIMEOUT", 2*time.Minute),
+			PerCheck: envx.GetenvDuration("HEALTH_PER_CHECK_TIMEOUT", 2*time.Minute),
 		},
 	}
 	ported.ConfigFromEnv(&cfg)
@@ -246,10 +247,10 @@ type setupConfig struct {
 func setupConfigFromEnv() setupConfig {
 	return setupConfig{
 		probes: healthProbeConfigFromEnv(),
-		// shared.GetenvDuration rejects <1s (the retired helper accepted
+		// envx.GetenvDuration rejects <1s (the retired helper accepted
 		// any d > 0) — a sub-second sweep interval was already a
 		// hot-loop bug, never a sane setting.
-		interval: shared.GetenvDuration("CLUSTER_HEALTH_PROBES_INTERVAL", 5*time.Minute),
+		interval: envx.GetenvDuration("CLUSTER_HEALTH_PROBES_INTERVAL", 5*time.Minute),
 	}
 }
 

@@ -15,7 +15,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // allZeroExit reports whether every app (non-sidecar) container in
@@ -73,7 +73,7 @@ func (r *zombieSidecarReaper) jobAllowsReap(ctx context.Context, p *corev1.Pod, 
 	}
 	log := logf.FromContext(ctx)
 	job, getErr := r.cs.BatchV1().Jobs(p.Namespace).Get(ctx, jobName, metav1.GetOptions{})
-	jobGone, err := shared.ConfirmAbsent(getErr)
+	jobGone, err := kube.ConfirmAbsent(getErr)
 	switch {
 	case jobGone:
 		return true // Job gone — nobody recreates the pod
@@ -110,7 +110,7 @@ func (r *zombieSidecarReaper) reap(ctx context.Context, p *corev1.Pod, why strin
 	// not inherit this delete.
 	uid := p.UID
 	if err := r.cs.CoreV1().Pods(p.Namespace).
-		Delete(ctx, p.Name, shared.UIDDeleteOptions(uid, "")); err != nil {
+		Delete(ctx, p.Name, kube.UIDDeleteOptions(uid, "")); err != nil {
 		log.Error(err, "zombie pod delete failed", "pod", p.Namespace+"/"+p.Name)
 		metrics.IncError(r.queue)
 		return err

@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -125,13 +125,13 @@ var operatorTargets = []operatorTarget{
 			// GatewayClass has no top-level status.observedGeneration
 			// — the serving controller stamps the reconciled
 			// generation inside conditions[type=Accepted] only.
-			{gvr: shared.GVRGatewayClass, reason: opReasonStaleGWStatus,
+			{gvr: kube.GVRGatewayClass, reason: opReasonStaleGWStatus,
 				stuck: gatewayClassStuck, owns: ciliumOwnsGatewayClass},
-			{gvr: shared.GVRGateway, reason: opReasonStaleGWStatus,
+			{gvr: kube.GVRGateway, reason: opReasonStaleGWStatus,
 				stuck: gatewayObjectStuck, owns: ciliumOwnsGatewayObject},
-			{gvr: shared.GVRHTTPRoute, reason: opReasonStaleGWStatus,
+			{gvr: kube.GVRHTTPRoute, reason: opReasonStaleGWStatus,
 				stuck: gatewayStatusStuck, owns: ciliumOwnsRouteParent},
-			{gvr: shared.GVRGRPCRoute, reason: opReasonStaleGWStatus,
+			{gvr: kube.GVRGRPCRoute, reason: opReasonStaleGWStatus,
 				stuck: gatewayStatusStuck, owns: ciliumOwnsRouteParent},
 		},
 	},
@@ -142,7 +142,7 @@ var operatorTargets = []operatorTarget{
 		podSelector: "app.kubernetes.io/name=scylla-operator",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRScyllaCluster,
+			gvr:    kube.GVRScyllaCluster,
 			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
 		}},
 	},
@@ -154,7 +154,7 @@ var operatorTargets = []operatorTarget{
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRDragonfly,
+			gvr:    kube.GVRDragonfly,
 			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
 		}},
 	},
@@ -165,7 +165,7 @@ var operatorTargets = []operatorTarget{
 		podSelector: "app=helm-controller",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRHelmReleaseV2,
+			gvr:    kube.GVRHelmReleaseV2,
 			reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen,
 		}},
 	},
@@ -176,7 +176,7 @@ var operatorTargets = []operatorTarget{
 		podSelector: "app=kustomize-controller",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRFluxKustomization,
+			gvr:    kube.GVRFluxKustomization,
 			reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen,
 		}},
 	},
@@ -191,15 +191,15 @@ var operatorTargets = []operatorTarget{
 		podSelector: "app=source-controller",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
-			{gvr: shared.GVRFluxGitRepository,
+			{gvr: kube.GVRFluxGitRepository,
 				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
-			{gvr: shared.GVRFluxHelmRepository,
+			{gvr: kube.GVRFluxHelmRepository,
 				reason: kcmReasonStaleGen, stuck: helmRepoStaleGen},
-			{gvr: shared.GVRFluxHelmChart,
+			{gvr: kube.GVRFluxHelmChart,
 				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
-			{gvr: shared.GVRFluxOCIRepository,
+			{gvr: kube.GVRFluxOCIRepository,
 				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
-			{gvr: shared.GVRFluxBucket,
+			{gvr: kube.GVRFluxBucket,
 				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
 		},
 	},
@@ -224,13 +224,13 @@ var operatorTargets = []operatorTarget{
 		podSelector: "app.kubernetes.io/name=cert-manager",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
-			{gvr: shared.GVRCertificate,
+			{gvr: kube.GVRCertificate,
 				reason: opReasonNoConditions, stuck: noStatusConditions},
 			// BUG-C5 — the same GVR additionally watched for
 			// observedGeneration lag: a Certificate the controller
 			// DID once reconcile can still be skipped by every
 			// later spec write.
-			{gvr: shared.GVRCertificate,
+			{gvr: kube.GVRCertificate,
 				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
 		},
 	},
@@ -247,13 +247,13 @@ var operatorTargets = []operatorTarget{
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{
-			{gvr: shared.GVRExternalSecretV1,
+			{gvr: kube.GVRExternalSecretV1,
 				reason: opReasonNoConditions, stuck: noStatusConditions},
-			{gvr: shared.GVRExternalSecretV1,
+			{gvr: kube.GVRExternalSecretV1,
 				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
-			{gvr: shared.GVRExternalSecretV1Beta1,
+			{gvr: kube.GVRExternalSecretV1Beta1,
 				reason: opReasonNoConditions, stuck: noStatusConditions},
-			{gvr: shared.GVRExternalSecretV1Beta1,
+			{gvr: kube.GVRExternalSecretV1Beta1,
 				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
 		},
 	},
@@ -264,7 +264,7 @@ var operatorTargets = []operatorTarget{
 		podSelector: "app.kubernetes.io/name=rabbitmq-cluster-operator",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRRabbitMQCluster,
+			gvr:    kube.GVRRabbitMQCluster,
 			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
 		}},
 	},
@@ -275,9 +275,9 @@ var operatorTargets = []operatorTarget{
 		podSelector: "app=keda-operator",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
-			{gvr: shared.GVRKedaScaledObject,
+			{gvr: kube.GVRKedaScaledObject,
 				reason: opReasonNoConditions, stuck: noStatusConditions},
-			{gvr: shared.GVRKedaScaledObject,
+			{gvr: kube.GVRKedaScaledObject,
 				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
 		},
 	},
@@ -293,9 +293,9 @@ var operatorTargets = []operatorTarget{
 		podSelector: "control-plane=controller-manager",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
-			{gvr: shared.GVRArgoCD,
+			{gvr: kube.GVRArgoCD,
 				reason: opReasonNoPhase, stuck: emptyStatusPhase},
-			{gvr: shared.GVRArgoCD,
+			{gvr: kube.GVRArgoCD,
 				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
 		},
 	},
@@ -306,9 +306,9 @@ var operatorTargets = []operatorTarget{
 		podSelector: "app.kubernetes.io/name=kargo,app.kubernetes.io/component=controller",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
-			{gvr: shared.GVRKargoStage,
+			{gvr: kube.GVRKargoStage,
 				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
-			{gvr: shared.GVRKargoWarehouse,
+			{gvr: kube.GVRKargoWarehouse,
 				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
 		},
 	},
@@ -319,7 +319,7 @@ var operatorTargets = []operatorTarget{
 		podSelector: "control-plane=controller-manager",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVREverestDatabaseCluster,
+			gvr:    kube.GVREverestDatabaseCluster,
 			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
 		}},
 	},
@@ -330,7 +330,7 @@ var operatorTargets = []operatorTarget{
 		podSelector: "app.kubernetes.io/name=shipwright-build-controller",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRShipwrightBuild,
+			gvr:    kube.GVRShipwrightBuild,
 			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
 		}},
 	},
@@ -365,7 +365,7 @@ var operatorTargets = []operatorTarget{
 		podSelector: "app.kubernetes.io/name=node-healthcheck-operator",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRNodeHealthCheck,
+			gvr:    kube.GVRNodeHealthCheck,
 			reason: opReasonNoStatus, stuck: noStatusAtAll,
 		}},
 	},
@@ -376,7 +376,7 @@ var operatorTargets = []operatorTarget{
 		podSelector: "control-plane=controller-manager,self-node-remediation-operator",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRSelfNodeRemediation,
+			gvr:    kube.GVRSelfNodeRemediation,
 			reason: opReasonNoStatus, stuck: noStatusAtAll,
 		}},
 	},
@@ -396,7 +396,7 @@ var operatorTargets = []operatorTarget{
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRPerconaXtraDBCluster,
+			gvr:    kube.GVRPerconaXtraDBCluster,
 			reason: kcmReasonStaleGen, stuck: perconaUnpausedStaleGen,
 		}},
 	},
@@ -408,7 +408,7 @@ var operatorTargets = []operatorTarget{
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRPerconaPGCluster,
+			gvr:    kube.GVRPerconaPGCluster,
 			reason: kcmReasonStaleGen, stuck: perconaUnpausedStaleGen,
 		}},
 	},
@@ -420,7 +420,7 @@ var operatorTargets = []operatorTarget{
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRPerconaServerMongoDB,
+			gvr:    kube.GVRPerconaServerMongoDB,
 			reason: kcmReasonStaleGen, stuck: perconaUnpausedStaleGen,
 		}},
 	},
@@ -444,7 +444,7 @@ var operatorTargets = []operatorTarget{
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRTektonPipelineRun,
+			gvr:    kube.GVRTektonPipelineRun,
 			reason: opReasonNoConditions, stuck: noStatusConditions,
 		}},
 	},
@@ -456,7 +456,7 @@ var operatorTargets = []operatorTarget{
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{{
-			gvr:    shared.GVRShipwrightOperatorBuild,
+			gvr:    kube.GVRShipwrightOperatorBuild,
 			reason: opReasonNoConditions, stuck: noStatusConditions,
 		}},
 	},

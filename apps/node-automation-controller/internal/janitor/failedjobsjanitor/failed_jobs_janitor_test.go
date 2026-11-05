@@ -21,7 +21,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -504,7 +504,7 @@ func TestFailedJobsJanitorBuildRunTTL(t *testing.T) {
 	)
 	j := &failedJobsJanitor{
 		cs: fake.NewSimpleClientset(), dyn: dyn, now: time.Now,
-		stuckEmitted: shared.GaugeLedger[stuckTerminatingKey]{},
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
 	}
 	if err := j.sweepBuildRuns(ctx); err != nil {
 		t.Fatal(err)
@@ -528,7 +528,7 @@ func TestFailedJobsJanitorBuildRunTTL(t *testing.T) {
 func TestFailedJobsJanitorBuildRunCRDAbsent(t *testing.T) {
 	j := &failedJobsJanitor{
 		cs: fake.NewSimpleClientset(), now: time.Now,
-		stuckEmitted: shared.GaugeLedger[stuckTerminatingKey]{},
+		stuckEmitted: state.GaugeLedger[stuckTerminatingKey]{},
 	}
 	// dyn nil — the sweep must no-op without a dynamic client.
 	if err := j.sweepBuildRuns(ctx); err != nil {

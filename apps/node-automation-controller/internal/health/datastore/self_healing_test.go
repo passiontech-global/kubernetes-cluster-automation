@@ -89,18 +89,18 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 	p.Now = func() time.Time { return base }
 
 	// First sighting — tracked, quiet.
-	if res := mustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first-seen zero endpoints must pass: %+v", res)
 	}
 	key := "db/dragonfly-master/dragonfly"
-	if _, ok := mustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.Seen(key, base); !ok {
+	if _, ok := probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.Seen(key, base); !ok {
 		t.Fatal("zero-endpoint tuple not tracked")
 	}
 
 	// 4m in — gauge fires, but under the 5m heal window.
 	at := base.Add(4 * time.Minute)
 	p.Now = func() time.Time { return at }
-	if res := mustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("zero endpoints >=3m must FAIL")
 	}
 	if v, _ := shStatefulZeroGauge(t, "db", "dragonfly-master", "dragonfly"); v != 1 {
@@ -114,7 +114,7 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 	// 6m in — the dragonfly operator leader is bounced.
 	at = base.Add(6 * time.Minute)
 	p.Now = func() time.Time { return at }
-	if res := mustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("still masterless — must keep FAILING")
 	}
 	if _, err := cs.CoreV1().Pods(probefw.DragonflyOperatorNS).
@@ -143,10 +143,10 @@ func TestCheckStatefulMasterlessNonDragonflyNoHeal(t *testing.T) {
 	cs := fake.NewSimpleClientset(sts, svc, opPod)
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	mustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("cache/redis-master/redis", base.Add(-time.Hour))
 
-	if res := mustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("masterless redis must FAIL")
 	}
 	if v, _ := shStatefulZeroGauge(t, "cache", "redis-master", "redis"); v != 1 {
@@ -170,10 +170,10 @@ func TestCheckStatefulMasterlessRecovers(t *testing.T) {
 	cs := fake.NewSimpleClientset(sts, svc)
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	mustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-time.Hour))
 
-	if res := mustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("precondition: masterless service must FAIL")
 	}
 	// Endpoint comes back.
@@ -194,10 +194,10 @@ func TestCheckStatefulMasterlessRecovers(t *testing.T) {
 	}
 	at := base.Add(time.Minute)
 	p.Now = func() time.Time { return at }
-	if res := mustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("recovered master must pass: %+v", res)
 	}
-	if _, ok := mustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+	if _, ok := probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Seen("db/dragonfly-master/dragonfly", at); ok {
 		t.Fatal("recovered tuple must leave the first-seen ledger")
 	}
@@ -223,10 +223,10 @@ func TestCheckStatefulMasterlessNonCandidates(t *testing.T) {
 		sts, notReadySTS, headless, noRole, wrongSel, roleOnly), probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := mustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("non-candidates must pass, got %+v", res)
 	}
-	if keys := dsTrackedKeys(&mustCheck[*statefulMasterlessCheck](t, p).stsZeroSince); len(keys) != 0 {
+	if keys := probetest.LedgerKeys(&probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince); len(keys) != 0 {
 		t.Fatalf("non-candidates must not be tracked: %v", keys)
 	}
 }
@@ -316,7 +316,7 @@ func TestCheckRabbitMQSuspendedHeals(t *testing.T) {
 	})
 
 	// First sighting — tracked, quiet, pod kept.
-	if res := mustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first-seen suspended pod must pass: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -326,7 +326,7 @@ func TestCheckRabbitMQSuspendedHeals(t *testing.T) {
 
 	at := base.Add(11 * time.Minute)
 	p.Now = func() time.Time { return at }
-	if res := mustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("suspended >=10m with quorum safe must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -360,10 +360,10 @@ func TestCheckRabbitMQSuspendedQuorumUnsafe(t *testing.T) {
 	cs := fake.NewSimpleClientset(sts, stuck, peerDown)
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	mustCheck[*rabbitMQSuspendedCheck](t, p).rbSuspendedSince.
+	probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).rbSuspendedSince.
 		Observe("mq/rabbitmq-0/u0", base.Add(-time.Hour))
 
-	if res := mustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("suspended pod must still FAIL — quorum gate only blocks the heal")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -381,10 +381,10 @@ func TestCheckRabbitMQSuspendedNoSTSOwner(t *testing.T) {
 	cs := fake.NewSimpleClientset(stuck)
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	mustCheck[*rabbitMQSuspendedCheck](t, p).rbSuspendedSince.
+	probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).rbSuspendedSince.
 		Observe("mq/rabbitmq-0/u0", base.Add(-time.Hour))
 
-	if res := mustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("suspended pod must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -408,12 +408,12 @@ func TestCheckRabbitMQSuspendedCooldown(t *testing.T) {
 	cs := fake.NewSimpleClientset(sts, stuck, peer)
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	mustCheck[*rabbitMQSuspendedCheck](t, p).rbSuspendedSince.
+	probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).rbSuspendedSince.
 		Observe("mq/rabbitmq-0/u0", base.Add(-time.Hour))
-	mustCheck[*rabbitMQSuspendedCheck](t, p).rbHealed.
+	probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).rbHealed.
 		Stamp("mq/rabbitmq-0", base.Add(-10*time.Minute))
 
-	if res := mustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("suspended pod must FAIL even inside the heal cooldown")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -447,7 +447,7 @@ func TestCheckPerconaClusterQuorum(t *testing.T) {
 		errCluster, paused, ready))
 	p.Now = func() time.Time { return base }
 
-	res := mustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatal("error-state cluster must FAIL")
 	}
@@ -475,7 +475,7 @@ func TestCheckPerconaClusterQuorumReadyZero(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(pxc, pg))
 	p.Now = func() time.Time { return base }
 
-	res := mustCheck[*perconaQuorumCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatal("ready<1 clusters must FAIL")
 	}
@@ -495,12 +495,12 @@ func TestCheckPerconaClusterQuorumInitializing(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(init))
 	p.Now = func() time.Time { return base }
 
-	if res := mustCheck[*perconaQuorumCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("fresh initializing must pass: %+v", res)
 	}
 	// 31m later — still initializing → FAIL.
 	p.Now = func() time.Time { return base.Add(31 * time.Minute) }
-	if res := mustCheck[*perconaQuorumCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*perconaQuorumCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("initializing >30m must FAIL")
 	}
 }

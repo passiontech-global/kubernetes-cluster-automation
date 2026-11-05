@@ -35,6 +35,9 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -62,14 +65,14 @@ type csrWatcher struct {
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
 	queue    string
-	warned   shared.SeenSet // detect mode: warn-logged once per CSR
-	reported shared.SeenSet // approve mode: IncError fired once per CSR
+	warned   state.SeenSet // detect mode: warn-logged once per CSR
+	reported state.SeenSet // approve mode: IncError fired once per CSR
 }
 
 // Setup registers the 10m sweep — always runs (detect mode
 // still reports pending CSRs); `approve` only controls the action.
 func Setup(d shared.Deps) error {
-	approve := shared.Gate("CSR_APPROVER_ENABLED", false)
+	approve := envx.Gate("CSR_APPROVER_ENABLED", false)
 	w := &csrWatcher{cs: d.CS, approve: approve, queue: d.Name}
 	return shared.AddPeriodic(d.Mgr, w.queue, 10*time.Minute, w.run)
 }
@@ -80,8 +83,8 @@ func (w *csrWatcher) run(ctx context.Context) error {
 	// Paged list — CSRs accumulate forever on clusters where nothing
 	// auto-approves them, so bound each apiserver response instead of
 	// decoding the whole pile in one shot.
-	csrs, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
-		shared.CertificateSigningRequests(w.cs))
+	csrs, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+		kube.CertificateSigningRequests(w.cs))
 	if err != nil {
 		return fmt.Errorf("list certificatesigningrequests: %w", err)
 	}

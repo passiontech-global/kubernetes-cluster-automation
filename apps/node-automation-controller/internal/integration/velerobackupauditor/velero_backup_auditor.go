@@ -44,6 +44,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -56,18 +58,18 @@ const (
 )
 
 var (
-	veleroScheduleGVR = shared.GVVeleroSchedule
-	veleroBackupGVR   = shared.GVVeleroBackup
-	veleroBSLGVR      = shared.GVVeleroBackupStorageLocation
+	veleroScheduleGVR = kube.GVVeleroSchedule
+	veleroBackupGVR   = kube.GVVeleroBackup
+	veleroBSLGVR      = kube.GVVeleroBackupStorageLocation
 	// W10-ST6 — podvolumebackups.velero.io: per-volume snapshots
 	// taken by the node-agent DaemonSet; a wedged InProgress PVB
 	// blocks the next backup's volume phase.
-	veleroPVBGVR = shared.GVVeleroPodVolumeBackup
+	veleroPVBGVR = kube.GVVeleroPodVolumeBackup
 	// W9-ST3 — Percona Everest operator CRDs: the DatabaseCluster
 	// declares spec.backup.enabled and the DatabaseClusterBackup
 	// carries spec.dbClusterName + status.state.
-	everestDBClusterGVR = shared.GVREverestDatabaseCluster
-	everestDBBackupGVR  = shared.GVREverestDatabaseClusterBackup
+	everestDBClusterGVR = kube.GVREverestDatabaseCluster
+	everestDBBackupGVR  = kube.GVREverestDatabaseClusterBackup
 )
 
 // veleroStuckPhases are terminal-failure and wedged-in-flight
@@ -95,9 +97,9 @@ const veleroListPageSize = 500
 // cluster-wide).
 func (a *veleroBackupAuditor) veleroList(ctx context.Context,
 	gvr schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
-	items, err := shared.ListAll(ctx,
+	items, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: veleroListPageSize},
-		shared.DynamicPage(a.dyn.Resource(gvr)))
+		kube.DynamicPage(a.dyn.Resource(gvr)))
 	if err != nil {
 		return nil, err
 	}
@@ -157,31 +159,31 @@ type veleroBackupAuditor struct {
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
 	queue      string
-	seenPaused shared.GaugeLedger[pausedKey]
-	seenBad    shared.GaugeLedger[backupKey]
+	seenPaused state.GaugeLedger[pausedKey]
+	seenBad    state.GaugeLedger[backupKey]
 	// seenBSL: series ledger for VeleroBSLUnavailable — an
 	// Available-again or deleted BSL gets DeleteLabelValues.
-	seenBSL shared.GaugeLedger[pausedKey]
+	seenBSL state.GaugeLedger[pausedKey]
 	// firstSeenPaused: when the sweep first saw this Schedule
 	// generation paused — measures the actual pause duration. A
 	// Schedule carries no "paused since" timestamp, so the ledger is
 	// the only honest clock; it resets on unpause and prunes on
 	// delete, and a controller restart re-arms it (biased to
 	// under-page, never to alert on an unmeasurable pause).
-	firstSeenPaused shared.FirstSeenLedger
+	firstSeenPaused state.FirstSeenLedger
 	// seenEverest: series ledger for DBBackupUnhealthy — an
 	// everestKey the sweep stops re-asserting gets
 	// DeleteLabelValues'd so a recovered or deleted
 	// DatabaseCluster never pins the gauge.
-	seenEverest shared.GaugeLedger[everestKey]
+	seenEverest state.GaugeLedger[everestKey]
 	// seenStuckBackup / seenWedgedPVB: series ledgers for the
 	// W10-ST6 in-flight gauges — same prune-on-resolve contract.
-	seenStuckBackup shared.GaugeLedger[pausedKey]
-	seenWedgedPVB   shared.GaugeLedger[pausedKey]
+	seenStuckBackup state.GaugeLedger[pausedKey]
+	seenWedgedPVB   state.GaugeLedger[pausedKey]
 	// pvbHealed: "<ns>/<name>" -> last wedged-PVB cleanup time —
 	// the per-object cooldown that stops a still-broken node-agent
 	// from being delete-looped every sweep.
-	pvbHealed shared.CooldownSet
+	pvbHealed state.CooldownSet
 }
 
 // Setup registers the 15m sweep — or nothing when
@@ -243,7 +245,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		// real pause duration from first sight; an entry pruned on
 		// unpause means a re-pause restarts the clock, and the UID in
 		// the key keeps a delete+recreate from inheriting pause time.
-		isPaused, _ := shared.NestedBool(s.Object, "spec", "paused")
+		isPaused, _ := kube.NestedBool(s.Object, "spec", "paused")
 		if isPaused {
 			lk := pausedLedgerKey(string(s.GetUID()), ns, name)
 			pausedNow[lk] = true
@@ -299,7 +301,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		for i := range bsls.Items {
 			bsl := &bsls.Items[i]
 			ns, name := bsl.GetNamespace(), bsl.GetName()
-			phase, _ := shared.NestedString(bsl.Object, "status", "phase")
+			phase, _ := kube.NestedString(bsl.Object, "status", "phase")
 			if phase == "Available" {
 				continue
 			}

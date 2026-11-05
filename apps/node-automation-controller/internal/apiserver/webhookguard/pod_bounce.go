@@ -16,7 +16,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // bounceHungWebhookPods is the W9-CP1 stage-1 remediation: for every
@@ -107,7 +107,7 @@ func (b *circuitBreaker) bounceOldestPod(ctx context.Context, snap *sweepSnapsho
 	var oldest *corev1.Pod
 	for _, r := range refs {
 		p, getErr := g.cs.CoreV1().Pods(r.namespace).Get(ctx, r.name, metav1.GetOptions{})
-		gone, err := shared.ConfirmAbsent(getErr)
+		gone, err := kube.ConfirmAbsent(getErr)
 		if err != nil {
 			metrics.IncError(g.queue)
 			log.Error(err, "webhook backing pod get failed",
@@ -118,7 +118,7 @@ func (b *circuitBreaker) bounceOldestPod(ctx context.Context, snap *sweepSnapsho
 			continue // endpoint ref already stale — the pod is gone
 		}
 		if p.DeletionTimestamp != nil || p.Status.Phase != corev1.PodRunning ||
-			!shared.PodReadyCond(p) {
+			!kube.PodReadyCond(p) {
 			continue
 		}
 		if oldest == nil ||
@@ -136,7 +136,7 @@ func (b *circuitBreaker) bounceOldestPod(ctx context.Context, snap *sweepSnapsho
 		"age", now.Sub(oldest.CreationTimestamp.Time).Truncate(time.Second))
 	uid := oldest.UID
 	if err := g.cs.CoreV1().Pods(oldest.Namespace).Delete(ctx, oldest.Name,
-		shared.UIDDeleteOptions(uid, "")); err != nil {
+		kube.UIDDeleteOptions(uid, "")); err != nil {
 		metrics.IncError(g.queue)
 		log.Error(err, "webhook pod bounce delete failed",
 			"pod", oldest.Namespace+"/"+oldest.Name, "service", svcKey)

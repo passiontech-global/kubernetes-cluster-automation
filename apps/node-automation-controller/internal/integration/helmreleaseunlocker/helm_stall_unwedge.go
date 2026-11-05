@@ -95,7 +95,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 const (
@@ -137,13 +137,13 @@ var stalledWorkloadRe = regexp.MustCompile(
 // workload-layer check in deadlockPlan decides whether it is really
 // the surge deadlock — this gate only decides who gets analyzed.
 func hrStalledRollout(hr *unstructured.Unstructured) bool {
-	if suspended, _ := shared.NestedBool(hr.Object, "spec", "suspend"); suspended {
+	if suspended, _ := kube.NestedBool(hr.Object, "spec", "suspend"); suspended {
 		return false // parked, not broken — same rule as the artifact healer
 	}
 	if status, _, _ := hrCondition(hr, "Stalled"); status == "True" {
 		return true
 	}
-	c, _ := shared.ConditionOf(hr.Object, "Ready")
+	c, _ := kube.ConditionOf(hr.Object, "Ready")
 	if c.Status != "False" {
 		return false
 	}
@@ -159,7 +159,7 @@ func hrStalledRollout(hr *unstructured.Unstructured) bool {
 // hrCondition returns a named condition's status/reason/message —
 // ("","","") when the condition is absent.
 func hrCondition(o *unstructured.Unstructured, condType string) (status, reason, message string) {
-	c, _ := shared.ConditionOf(o.Object, condType)
+	c, _ := kube.ConditionOf(o.Object, condType)
 	return c.Status, c.Reason, c.Message
 }
 
@@ -209,7 +209,7 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		// lastAttemptedRevision, each at least
 		// stallAttemptCooldown apart. A revision change re-arms —
 		// the new revision has not had its window yet.
-		revision, _ := shared.NestedString(
+		revision, _ := kube.NestedString(
 			hr.Object, "status", "lastAttemptedRevision")
 		att := u.stallAttempts[key]
 		if att == nil || att.revision != revision {

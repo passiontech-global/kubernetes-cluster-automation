@@ -21,7 +21,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -41,10 +41,10 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	// Server-side type filter + continue-token pagination: the
 	// all-namespaces secret read is the biggest this module makes —
 	// page it at certDriftListPage so no single response dominates.
-	err := shared.ListEach(ctx, metav1.ListOptions{
+	err := kube.ListEach(ctx, metav1.ListOptions{
 		FieldSelector: "type=kubernetes.io/tls",
 		Limit:         certDriftListPage,
-	}, shared.Secrets(a.cs, metav1.NamespaceAll),
+	}, kube.Secrets(a.cs, metav1.NamespaceAll),
 		func(items []corev1.Secret) error {
 			for i := range items {
 				s := &items[i]

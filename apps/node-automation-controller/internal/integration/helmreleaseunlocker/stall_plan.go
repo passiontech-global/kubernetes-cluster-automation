@@ -22,7 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // stallPlan is the verified remediation plan for a surge-deadlocked
@@ -62,9 +62,9 @@ func (u *helmReleaseUnlocker) deadlockPlan(ctx context.Context,
 	if err != nil {
 		return nil, "", fmt.Errorf("list replicasets in %s: %w", dep.Namespace, err)
 	}
-	pods, err := shared.ListAll(ctx,
+	pods, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: helmListPageSize},
-		shared.Pods(u.cs, dep.Namespace))
+		kube.Pods(u.cs, dep.Namespace))
 	if err != nil {
 		return nil, "", fmt.Errorf("list pods in %s: %w", dep.Namespace, err)
 	}
@@ -206,9 +206,9 @@ func (u *helmReleaseUnlocker) deadlockPlan(ctx context.Context,
 // statefulset-ondelete-roller).
 func (u *helmReleaseUnlocker) pdbBlocksScaleDown(ctx context.Context,
 	ns string, podLabels map[string]string, remove int) (string, error) {
-	pdbs, err := shared.ListAll(ctx,
+	pdbs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: helmListPageSize},
-		shared.PodDisruptionBudgets(u.cs, ns))
+		kube.PodDisruptionBudgets(u.cs, ns))
 	if err != nil {
 		return "", fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w", ns, err)
 	}

@@ -35,6 +35,9 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -90,7 +93,7 @@ type cfTunnelProxyWatchdog struct {
 	namespace string
 	// lastHeal is "<ns>/<name>" -> last delete time; bounds restart
 	// churn on a pod that wedges again immediately after recreation.
-	lastHeal shared.CooldownSet
+	lastHeal state.CooldownSet
 	// now is a test seam for cooldown/age checks.
 	now shared.Clock
 }
@@ -120,8 +123,8 @@ type watchdogConfig struct {
 // setupModules into Deps.Disabled).
 func configFromEnv() watchdogConfig {
 	return watchdogConfig{
-		namespace: shared.Getenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "cloudflare-tunnel-system"),
-		interval:  shared.GetenvDuration("CF_TUNNEL_WATCHDOG_INTERVAL", 5*time.Minute),
+		namespace: envx.Getenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "cloudflare-tunnel-system"),
+		interval:  envx.GetenvDuration("CF_TUNNEL_WATCHDOG_INTERVAL", 5*time.Minute),
 	}
 }
 
@@ -162,7 +165,7 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 	var unready []string
 	for i := range pods.Items {
 		if pods.Items[i].Status.Phase == corev1.PodRunning &&
-			!shared.PodReadyCond(&pods.Items[i]) {
+			!kube.PodReadyCond(&pods.Items[i]) {
 			unready = append(unready, pods.Items[i].Name)
 		}
 	}
@@ -303,7 +306,7 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 			continue
 		}
 		running = append(running, p)
-		if shared.PodReadyCond(p) {
+		if kube.PodReadyCond(p) {
 			ready++
 			continue
 		}
@@ -383,7 +386,7 @@ func (w *cfTunnelProxyWatchdog) deleteConnectorPod(ctx context.Context,
 	metrics.CFTunnelWedgePodsDeletedTotal.WithLabelValues(
 		p.Namespace, reason).Inc()
 	err := w.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
-		shared.UIDDeleteOptions(p.UID, ""))
+		kube.UIDDeleteOptions(p.UID, ""))
 	if apierrors.IsNotFound(err) {
 		return nil
 	}

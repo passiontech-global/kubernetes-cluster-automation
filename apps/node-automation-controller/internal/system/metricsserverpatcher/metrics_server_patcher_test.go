@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/pinnedworkload"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -444,8 +445,8 @@ func TestSetupMetricsServerPatcherPredicate(t *testing.T) {
 	}
 }
 
-// The Node watch predicate (nodeCountChanges — the exact
-// predicate.Funcs the conditional second watch installs when
+// The Node watch predicate (pinnedworkload.NodeCountChanges — the
+// exact predicate.Funcs the conditional second watch installs when
 // minReplicas>0) drives the proportional replica count: only
 // create/delete may fire — includeUnschedulableNodes counts every
 // Node object, so updates never change the total and would only add
@@ -453,7 +454,7 @@ func TestSetupMetricsServerPatcherPredicate(t *testing.T) {
 // itself is no longer asserted (it required introspecting
 // controller-runtime internals).
 func TestSetupMetricsServerPatcherNodeWatch(t *testing.T) {
-	p := nodeCountChanges
+	p := pinnedworkload.NodeCountChanges
 	n1 := testutil.Node("n1", corev1.ConditionTrue, nil)
 	if !p.Create(event.CreateEvent{Object: n1}) {
 		t.Fatal("node add did not fire")

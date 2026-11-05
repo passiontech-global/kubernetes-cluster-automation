@@ -18,13 +18,14 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // vaTrackedCount reports how many keys a FirstSeenLedger holds —
 // the ledger exposes no Len, so a keep-all Prune does the counting.
-func vaTrackedCount(l *shared.FirstSeenLedger) int {
+func vaTrackedCount(l *state.FirstSeenLedger) int {
 	n := 0
 	l.Prune(func(string) bool { n++; return true })
 	return n

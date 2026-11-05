@@ -35,6 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -59,7 +60,7 @@ type coreDNSWatchdog struct {
 	// streak replaces the bash /tmp/coredns-streak-* files: pod ->
 	// consecutive layer-2 failures. Resets on operator restart,
 	// biasing conservative like the old tmpfs files did.
-	streak shared.StreakLedger
+	streak state.StreakLedger
 	// now is the clock seam — tests pin it so the recovery cooldown
 	// window and the stamped timestamps are deterministic.
 	// nil → time.Now.

@@ -45,6 +45,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -69,7 +71,7 @@ const (
 // buildRunGVR is the Shipwright BuildRun CRD — absent on clusters
 // without the Shipwright operator, in which case the sweep is a quiet
 // no-op (404/NoMatch tolerated, same contract as the Velero audit).
-var buildRunGVR = shared.GVRShipwrightBuildRun
+var buildRunGVR = kube.GVRShipwrightBuildRun
 
 // stuckTerminatingKey identifies one emitted
 // StuckTerminatingResources series — the label triple needed to
@@ -94,7 +96,7 @@ type failedJobsJanitor struct {
 	// previous sweep. A resource that finished terminating (or
 	// vanished) gets its series deleted so /metrics never leaks a
 	// stale "stuck" series.
-	stuckEmitted shared.GaugeLedger[stuckTerminatingKey]
+	stuckEmitted state.GaugeLedger[stuckTerminatingKey]
 }
 
 // Setup registers the hourly sweep (was crontab 17 * * * *). d.Dyn
@@ -113,9 +115,9 @@ func Setup(d shared.Deps) error {
 func (j *failedJobsJanitor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	jobs, err := shared.ListAll(ctx,
+	jobs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: failedJobListPageSize},
-		shared.Jobs(j.cs, metav1.NamespaceAll))
+		kube.Jobs(j.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list jobs: %w", err)
 	}
@@ -169,7 +171,7 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 		// same-named Job recreated in between must not inherit the
 		// delete.
 		if err := j.cs.BatchV1().Jobs(t.ns).Delete(ctx, t.name,
-			shared.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground)); err != nil {
+			kube.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground)); err != nil {
 			metrics.IncError(j.queue)
 			log.Error(err, "job delete failed",
 				"job", t.ns+"/"+t.name, "failedForHours", t.ageHours)
@@ -205,9 +207,9 @@ func (j *failedJobsJanitor) sweepBuildRuns(ctx context.Context) error {
 		return nil // no dynamic client wired — typed sweeps unaffected
 	}
 	log := logf.FromContext(ctx)
-	brs, err := shared.ListAll(ctx,
+	brs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: failedJobListPageSize},
-		shared.DynamicPage(j.dyn.Resource(buildRunGVR)))
+		kube.DynamicPage(j.dyn.Resource(buildRunGVR)))
 	if err != nil {
 		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			return nil // Shipwright not installed — nothing to reap
@@ -221,7 +223,7 @@ func (j *failedJobsJanitor) sweepBuildRuns(ctx context.Context) error {
 		if br.GetDeletionTimestamp() != nil || !buildRunCompleted(br) {
 			continue
 		}
-		ct, found := shared.NestedString(
+		ct, found := kube.NestedString(
 			br.Object, "status", "completionTime")
 		if !found {
 			continue // completed but no timestamp — can't age it, keep
@@ -236,7 +238,7 @@ func (j *failedJobsJanitor) sweepBuildRuns(ctx context.Context) error {
 		uid := br.GetUID()
 		if err := j.dyn.Resource(buildRunGVR).
 			Namespace(br.GetNamespace()).Delete(ctx, br.GetName(),
-			shared.UIDDeleteOptions(uid, "")); err != nil {
+			kube.UIDDeleteOptions(uid, "")); err != nil {
 			metrics.IncError(j.queue)
 			log.Error(err, "buildrun delete failed",
 				"buildrun", br.GetNamespace()+"/"+br.GetName())
@@ -255,7 +257,7 @@ func (j *failedJobsJanitor) sweepBuildRuns(ctx context.Context) error {
 // True (passed) or False (failed). Running builds and builds whose
 // controller never wrote the condition stay.
 func buildRunCompleted(br *unstructured.Unstructured) bool {
-	c, found := shared.ConditionOf(br.Object, "Succeeded")
+	c, found := kube.ConditionOf(br.Object, "Succeeded")
 	return found && (c.Status == "True" || c.Status == "False")
 }
 
@@ -279,21 +281,21 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 
 	// All lists land before any series is emitted — a failed later
 	// list must not leave the gauge half-populated for an hour.
-	nss, err := shared.ListAll(ctx,
+	nss, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: failedJobListPageSize},
-		shared.Namespaces(j.cs))
+		kube.Namespaces(j.cs))
 	if err != nil {
 		return fmt.Errorf("list namespaces: %w", err)
 	}
-	pvcs, err := shared.ListAll(ctx,
+	pvcs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: failedJobListPageSize},
-		shared.PersistentVolumeClaims(j.cs, metav1.NamespaceAll))
+		kube.PersistentVolumeClaims(j.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list persistentvolumeclaims: %w", err)
 	}
-	vas, err := shared.ListAll(ctx,
+	vas, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: failedJobListPageSize},
-		shared.VolumeAttachments(j.cs))
+		kube.VolumeAttachments(j.cs))
 	if err != nil {
 		return fmt.Errorf("list volumeattachments: %w", err)
 	}
@@ -378,9 +380,9 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 	pr, ok := cache[pvc.Namespace]
 	if !ok {
 		pr = pvcUseProbe{claims: map[string]bool{}}
-		pods, err := shared.ListAll(ctx,
+		pods, err := kube.ListAll(ctx,
 			metav1.ListOptions{Limit: failedJobListPageSize},
-			shared.Pods(j.cs, pvc.Namespace))
+			kube.Pods(j.cs, pvc.Namespace))
 		if err != nil {
 			pr.err = err
 		} else {

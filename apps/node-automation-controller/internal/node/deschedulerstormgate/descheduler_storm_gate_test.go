@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -405,7 +405,7 @@ func TestStormGateScalesDownOnKuredLock(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		deschedulerDeploy(1, nil),
-		kuredDaemonSet(map[string]string{shared.KuredLockAnno: "w1"}))
+		kuredDaemonSet(map[string]string{kube.KuredLockAnno: "w1"}))
 	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)

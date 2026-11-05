@@ -63,6 +63,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -101,7 +103,7 @@ const (
 
 // certificateGVR resolves a Certificate's spec.secretName — the only
 // cert-manager type this module reads.
-var certificateGVR = shared.GVRCertificate
+var certificateGVR = kube.GVRCertificate
 
 // webhookMetricKey / secretMetricKey are the exact label tuples of the
 // two exported gauge vecs — keeping them as map keys makes the
@@ -152,13 +154,13 @@ type certDriftAuditor struct {
 	// that disappears (webhook removed, annotation dropped, config
 	// deleted) gets its series pruned instead of pinning drift=1
 	// forever.
-	seenWebhooks shared.GaugeLedger[webhookMetricKey]
+	seenWebhooks state.GaugeLedger[webhookMetricKey]
 	// seenSecrets: same lifecycle for the TLS-expiry gauge.
-	seenSecrets shared.GaugeLedger[secretMetricKey]
+	seenSecrets state.GaugeLedger[secretMetricKey]
 	// seenWebhookExpiry / seenTrustBundles: same lifecycle for the
 	// caBundle days-to-expiry and linkerd trust-bundle gauges.
-	seenWebhookExpiry shared.GaugeLedger[webhookMetricKey]
-	seenTrustBundles  shared.GaugeLedger[secretMetricKey]
+	seenWebhookExpiry state.GaugeLedger[webhookMetricKey]
+	seenTrustBundles  state.GaugeLedger[secretMetricKey]
 	// replicationMismatch counts consecutive scans where a
 	// replicated secret's tls.crt differed from its source — drift
 	// fires only at replicationDriftScans, so a replicator mid-sync
@@ -167,7 +169,7 @@ type certDriftAuditor struct {
 	// seenReplication: series ledger for ReplicatedSecretDrift —
 	// re-synced or gone replicas get DeleteLabelValues, never a
 	// parked 1.
-	seenReplication shared.GaugeLedger[replicationMetricKey]
+	seenReplication state.GaugeLedger[replicationMetricKey]
 	// resyncNudged: replicationMetricKey → last replicated-from-
 	// version annotation strip (1h cooldown, in-RAM only).
 	resyncNudged map[replicationMetricKey]time.Time

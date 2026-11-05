@@ -22,7 +22,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -600,7 +600,7 @@ func TestUnmeshedRemediationMaintenanceDefers(t *testing.T) {
 		Spec: corev1.NodeSpec{
 			Unschedulable: true,
 			Taints: []corev1.Taint{{
-				Key:       shared.UnschedulableTaintKey,
+				Key:       kube.UnschedulableTaintKey,
 				TimeAdded: &fresh,
 			}},
 		},
@@ -645,7 +645,7 @@ func TestUnmeshedRemediationStaticCordonDoesNotDefer(t *testing.T) {
 		Spec: corev1.NodeSpec{
 			Unschedulable: true,
 			Taints: []corev1.Taint{{
-				Key:       shared.UnschedulableTaintKey,
+				Key:       kube.UnschedulableTaintKey,
 				TimeAdded: &stale,
 			}},
 		},

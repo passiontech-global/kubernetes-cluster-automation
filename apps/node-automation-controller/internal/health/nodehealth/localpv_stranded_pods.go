@@ -11,7 +11,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,8 +37,8 @@ type localPVStrandedCheck struct {
 	//     the 1h cooldown.
 	localPVEmitted    map[string]bool
 	pvcStalledEmitted map[string]bool
-	localPVHealed     shared.CooldownSet
-	pvcProvHealed     shared.CooldownSet
+	localPVHealed     state.CooldownSet
+	pvcProvHealed     state.CooldownSet
 }
 
 // newLocalPVStrandedCheck builds the W7-C4 check with fresh
@@ -136,10 +137,10 @@ func strandedNodeReason(nodes map[string]*corev1.Node, name string) string {
 	if n == nil {
 		return strandedReasonMissingNode
 	}
-	if shared.HasTaint(n.Spec.Taints, corev1.TaintNodeOutOfService) {
+	if kube.HasTaint(n.Spec.Taints, corev1.TaintNodeOutOfService) {
 		return strandedReasonOutOfService
 	}
-	if !shared.NodeReady(n) {
+	if !kube.NodeReady(n) {
 		return strandedReasonNotReady
 	}
 	if n.Spec.Unschedulable {
@@ -190,7 +191,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 		p.pvcStalledEmitted = map[string]bool{}
 	}
 
-	nodes, err := shared.ListNodes(ctx, p.CS)
+	nodes, err := kube.ListNodes(ctx, p.CS)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
@@ -198,8 +199,8 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	hasSchedulableWorker := false
 	for i := range nodes {
 		nodesByName[nodes[i].Name] = &nodes[i]
-		if shared.NodeReady(&nodes[i]) && !nodes[i].Spec.Unschedulable &&
-			!shared.IsControlPlane(&nodes[i]) {
+		if kube.NodeReady(&nodes[i]) && !nodes[i].Spec.Unschedulable &&
+			!kube.IsControlPlane(&nodes[i]) {
 			hasSchedulableWorker = true
 		}
 	}
@@ -208,9 +209,9 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	// masterless EndpointSlice census: a partial read cannot tell
 	// "stranded" from "no data", so a list error aborts the check.
 	pvsByName := map[string]*corev1.PersistentVolume{}
-	err = shared.ListEach(ctx,
+	err = kube.ListEach(ctx,
 		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		shared.PersistentVolumes(p.CS),
+		kube.PersistentVolumes(p.CS),
 		func(items []corev1.PersistentVolume) error {
 			for i := range items {
 				pvsByName[items[i].Name] = &items[i]
@@ -221,9 +222,9 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list persistentvolumes: %w", err)}
 	}
 	pvcsByKey := map[string]*corev1.PersistentVolumeClaim{}
-	err = shared.ListEach(ctx,
+	err = kube.ListEach(ctx,
 		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		shared.PersistentVolumeClaims(p.CS, metav1.NamespaceAll),
+		kube.PersistentVolumeClaims(p.CS, metav1.NamespaceAll),
 		func(items []corev1.PersistentVolumeClaim) error {
 			for i := range items {
 				pvcsByKey[items[i].Namespace+"/"+items[i].Name] = &items[i]
@@ -242,8 +243,8 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 		FieldSelector: "status.phase=Pending",
 		Limit:         probefw.HealthListPageSize,
 	}
-	err = shared.ListEach(ctx, podOpts,
-		shared.Pods(p.CS, metav1.NamespaceAll),
+	err = kube.ListEach(ctx, podOpts,
+		kube.Pods(p.CS, metav1.NamespaceAll),
 		func(items []corev1.Pod) error {
 			for i := range items {
 				pod := &items[i]
@@ -343,7 +344,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	var maintWhy string
 	var maintErr error
 	if len(heals) > 0 || len(stalled) > 0 {
-		maintHeld, maintWhy, maintErr = shared.MaintenanceActive(ctx, p.CS, p.Dyn)
+		maintHeld, maintWhy, maintErr = kube.MaintenanceActive(ctx, p.CS, p.Dyn)
 		if maintErr != nil {
 			metrics.IncError(p.Name)
 			log.Info("WARN: maintenance check unverifiable — localpv heals deferred (fail closed)",

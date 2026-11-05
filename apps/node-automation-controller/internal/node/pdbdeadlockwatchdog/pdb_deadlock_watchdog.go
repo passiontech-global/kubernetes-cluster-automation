@@ -48,6 +48,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -75,7 +77,7 @@ type pdbDeadlockWatchdog struct {
 	// with no gap. Any cycle where the precondition drops deletes the
 	// entry, restarting the window; any cycle where the PDB vanishes
 	// prunes all of its entries (and their gauge series).
-	firstSeen shared.FirstSeenLedger
+	firstSeen state.FirstSeenLedger
 	// now is the wall-clock seam so tests can age sightings without
 	// sleeping 30 minutes.
 	now shared.Clock
@@ -112,22 +114,22 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	// cordon-active window is deliberate state, not a drain in
 	// flight, and must not pin cordoned_node_blocked forever.
 	now := w.now.Now()
-	nodes, err := shared.ListNodes(ctx, w.cs)
+	nodes, err := kube.ListNodes(ctx, w.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}
 	anyCordoned := false
 	for i := range nodes {
-		if shared.NodeActivelyCordoned(&nodes[i], now) {
+		if kube.NodeActivelyCordoned(&nodes[i], now) {
 			anyCordoned = true
 			break
 		}
 	}
 	nodes = nil
 
-	pdbs, err := shared.ListAll(ctx,
+	pdbs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: 500},
-		shared.PodDisruptionBudgets(w.cs, metav1.NamespaceAll))
+		kube.PodDisruptionBudgets(w.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list poddisruptionbudgets: %w", err)
 	}

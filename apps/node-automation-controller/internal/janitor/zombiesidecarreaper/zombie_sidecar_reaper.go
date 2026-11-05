@@ -58,6 +58,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -137,10 +138,10 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	// Server-side phase filter — zombies are always Running; the
 	// in-code phase check stays for fake clients (field selectors
 	// are ignored there).
-	pods, err := shared.ListAll(ctx, metav1.ListOptions{
+	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		FieldSelector: "status.phase=Running",
 		Limit:         zombieSidecarListPageSize,
-	}, shared.Pods(r.cs, metav1.NamespaceAll))
+	}, kube.Pods(r.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list pods: %w", err)
 	}

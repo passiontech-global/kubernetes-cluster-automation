@@ -22,7 +22,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // listCRs returns the CertificateRequests of one namespace, caching
@@ -70,7 +70,7 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 		if cn, ok := certNameForCR(cr); !ok || cn != name {
 			continue
 		}
-		st, _ := shared.ConditionOf(cr.Object, "Ready")
+		st, _ := kube.ConditionOf(cr.Object, "Ready")
 		if st.Status == "True" {
 			continue // issued — not stuck
 		}
@@ -117,7 +117,7 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 		"cert", key, "certificaterequest", stuck.GetName())
 	uid := stuck.GetUID()
 	if err := r.dyn.Resource(certificateRequestGVR).Namespace(ns).
-		Delete(ctx, stuck.GetName(), shared.UIDDeleteOptions(uid, "")); err != nil {
+		Delete(ctx, stuck.GetName(), kube.UIDDeleteOptions(uid, "")); err != nil {
 		metrics.IncError(r.queue)
 		log.Error(err, "certificaterequest delete failed",
 			"cert", key, "certificaterequest", stuck.GetName())

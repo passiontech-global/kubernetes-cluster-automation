@@ -18,7 +18,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // dragonflyReplicaSyncStormCheck is the dragonfly replica sync-storm
@@ -29,11 +29,11 @@ type dragonflyReplicaSyncStormCheck struct {
 	// seen tracks each link-down pod's first-seen sweep — the 5m
 	// persistence window the storm signature requires; pruned when
 	// the link recovers so a later drop re-arms.
-	seen shared.FirstSeenLedger
+	seen state.FirstSeenLedger
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1.
-	emitted shared.GaugeLedger[string]
+	emitted state.GaugeLedger[string]
 }
 
 // newDragonflyReplicaSyncStormCheck builds the W10-ST4 check — its

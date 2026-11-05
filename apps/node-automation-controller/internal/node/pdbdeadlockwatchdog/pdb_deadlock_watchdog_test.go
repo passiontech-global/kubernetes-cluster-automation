@@ -14,7 +14,8 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -57,7 +58,7 @@ func newPDWWatchdog(cs *fake.Clientset, clock *time.Time) *pdbDeadlockWatchdog {
 
 // pdbTrackedCount reports how many keys a FirstSeenLedger holds —
 // the ledger exposes no Len, so a keep-all Prune does the counting.
-func pdbTrackedCount(l *shared.FirstSeenLedger) int {
+func pdbTrackedCount(l *state.FirstSeenLedger) int {
 	n := 0
 	l.Prune(func(string) bool { n++; return true })
 	return n
@@ -231,7 +232,7 @@ func TestPDBWatchdogStaleCordonIgnored(t *testing.T) {
 	now := time.Now()
 	stale := pdwCordonedNode("n-stale")
 	stale.Spec.Taints = []corev1.Taint{{
-		Key:       shared.UnschedulableTaintKey,
+		Key:       kube.UnschedulableTaintKey,
 		TimeAdded: &metav1.Time{Time: now.Add(-time.Hour)},
 	}}
 	cs := fake.NewSimpleClientset(

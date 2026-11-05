@@ -15,7 +15,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 const (
@@ -46,9 +46,9 @@ func (u *helmReleaseUnlocker) pruneSupersededSecrets(ctx context.Context) error 
 	// Cluster-wide, server-side filtered to helm release secrets —
 	// owner=helm is the same label unlock() selects on. Paged like
 	// every cluster-wide list in this module.
-	secrets, err := shared.ListAll(ctx, metav1.ListOptions{
+	secrets, err := kube.ListAll(ctx, metav1.ListOptions{
 		LabelSelector: "owner=helm", Limit: helmListPageSize},
-		shared.Secrets(u.cs, metav1.NamespaceAll))
+		kube.Secrets(u.cs, metav1.NamespaceAll))
 	if err != nil {
 		// Hygiene sweep — a list failure must not fail the run
 		// (same posture as cleanFailedHookJobs): the next sweep
@@ -111,7 +111,7 @@ func (u *helmReleaseUnlocker) pruneSupersededSecrets(ctx context.Context) error 
 				"release", k.ns+"/"+k.name, "secret", cand.s.Name,
 				"version", cand.v, "supersededTotal", len(superseded))
 			if err := u.cs.CoreV1().Secrets(cand.s.Namespace).Delete(ctx,
-				cand.s.Name, shared.UIDDeleteOptions(cand.s.UID, "")); err != nil {
+				cand.s.Name, kube.UIDDeleteOptions(cand.s.UID, "")); err != nil {
 				metrics.IncError(u.queue)
 				log.Error(err, "superseded secret delete failed",
 					"secret", cand.s.Namespace+"/"+cand.s.Name)

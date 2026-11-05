@@ -14,9 +14,14 @@ forks, no hook ConfigMap. The image is `distroless/static:nonroot`
 
 Each module is its own package under `internal/<domain>/` (one
 package per module, grouped by domain — same convention as
-`node-host-agent`). Shared machinery lives in `internal/shared`, test
-fakes/builders in `internal/testutil`, metric vectors in
-`internal/metrics`.
+`node-host-agent`). The module contract (Deps/Module/Periodic) lives
+in `internal/shared`; reusable leaf machinery in
+`internal/platform/{envx,state,kube}`; the module registry in
+`internal/registry`; test
+fakes/builders in `internal/testutil`, shared metric vectors in
+`internal/metrics` (a health check's own private gauge may instead
+colocate with the check file — see the convention note in
+`internal/metrics/core.go`).
 Queue names below are what `shell_operator_hook_run_errors_total{queue}` /
 `node_automation_reconcile_errors_total{controller}` report.
 
@@ -88,7 +93,7 @@ Queue names below are what `shell_operator_hook_run_errors_total{queue}` /
   (backwards-compatible with existing PrometheusRule alerts) plus
   `node_automation_reconcile_errors_total{controller}` and the default
   controller-runtime/workqueue metrics.
-- Module metrics (`internal/metrics/metrics.go`): `node_automation_apiserver_rv_gap{backend}`,
+- Module metrics (`internal/metrics/`): `node_automation_apiserver_rv_gap{backend}`,
   `node_automation_apiserver_quarantined{backend}`, `node_automation_webhook_circuit_broken`,
   `node_automation_webhook_circuit_breaker_trips_total`, `node_automation_pdb_drain_blocked`,
   `node_automation_stuck_terminating_resources`, `node_automation_helm_hook_jobs_cleaned_total`,

@@ -34,26 +34,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/pinnedworkload"
 )
 
 var (
@@ -75,28 +69,14 @@ type corednsPatcher struct {
 	nodesPerReplica int
 }
 
-// The watch wiring below installs these package-level predicates
-// verbatim — tests exercise the exact units the controller runs
-// instead of introspecting controller-runtime internals.
+// The watch wiring below installs this package-level predicate
+// verbatim — tests exercise the exact unit the controller runs
+// instead of introspecting controller-runtime internals. The Node
+// watch predicate is the shared pinnedworkload.NodeCountChanges.
 
 // onlyCoreDNSDeployment pins the For() watch to kube-system/coredns —
 // the informer sees every kube-system Deployment.
-var onlyCoreDNSDeployment = predicate.NewPredicateFuncs(func(o client.Object) bool {
-	return o.GetNamespace() == "kube-system" &&
-		o.GetName() == "coredns"
-})
-
-// nodeCountChanges is the Node watch predicate — node add/remove
-// changes the proportional replica total. The formula's
-// includeUnschedulableNodes=true counts EVERY Node object, so updates
-// (cordon flips, ~20s kubelet heartbeats) can never change the count
-// and must not enqueue — only create/delete fire.
-var nodeCountChanges = predicate.Funcs{
-	CreateFunc:  func(event.CreateEvent) bool { return true },
-	DeleteFunc:  func(event.DeleteEvent) bool { return true },
-	UpdateFunc:  func(event.UpdateEvent) bool { return false },
-	GenericFunc: func(event.GenericEvent) bool { return false },
-}
+var onlyCoreDNSDeployment = pinnedworkload.OnlyNamespacedName("kube-system", "coredns")
 
 // Setup reconciles only the coredns Deployment (the
 // informer sees every kube-system Deployment — the predicate pins
@@ -105,7 +85,7 @@ var nodeCountChanges = predicate.Funcs{
 // managing coredns themselves) skip registration entirely.
 //
 // minReplicas/nodesPerReplica are the CPA-linear replica pin — see
-// proportionalReplicas. minReplicas<=0 disables the pin entirely.
+// pinnedworkload.ReplicaPin. minReplicas<=0 disables the pin entirely.
 func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, configFromEnv, func(cfg corednsPatcherConfig) error {
 		// zoneWhen lands verbatim in the whenUnsatisfiable field of the
@@ -133,16 +113,13 @@ func Setup(d shared.Deps) error {
 		b := ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
 			For(&appsv1.Deployment{}, builder.WithPredicates(onlyCoreDNSDeployment))
-		if cfg.minReplicas > 0 {
-			// Node add/remove changes the proportional replica total —
-			// see nodeCountChanges for why only create/delete fire.
-			// Collapses to one fixed key: Reconcile ignores the request
-			// name anyway. With the pin disabled the count is never read,
-			// so the watch is not registered at all.
-			b = b.Watches(&corev1.Node{},
-				handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("coredns-patcher-sweep")),
-				builder.WithPredicates(nodeCountChanges))
-		}
+		// Node add/remove changes the proportional replica total; the
+		// watch is registered only while the pin is enabled — see
+		// pinnedworkload.ReplicaPin.WatchNodes.
+		b = pinnedworkload.ReplicaPin{
+			MinReplicas:     cfg.minReplicas,
+			NodesPerReplica: cfg.nodesPerReplica,
+		}.WatchNodes(b, "coredns-patcher-sweep")
 		return b.Complete(&corednsPatcher{cs: d.CS, queue: d.Name, zoneWhen: cfg.zoneWhen,
 			minDomains: cfg.zoneMinDomains, minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica})
 	})
@@ -164,73 +141,35 @@ type corednsPatcherConfig struct {
 // unparseable COREDNS_* value still warns on a disabled module.
 func configFromEnv() corednsPatcherConfig {
 	return corednsPatcherConfig{
-		zoneWhen:        shared.Getenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule"),
-		zoneMinDomains:  shared.GetenvInt("COREDNS_PATCHER_ZONE_MIN_DOMAINS", 2),
-		minReplicas:     shared.GetenvInt("COREDNS_MIN_REPLICAS", 4),
-		nodesPerReplica: shared.GetenvInt("COREDNS_NODES_PER_REPLICA", 1),
+		zoneWhen:        envx.Getenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule"),
+		zoneMinDomains:  envx.GetenvInt("COREDNS_PATCHER_ZONE_MIN_DOMAINS", 2),
+		minReplicas:     envx.GetenvInt("COREDNS_MIN_REPLICAS", 4),
+		nodesPerReplica: envx.GetenvInt("COREDNS_NODES_PER_REPLICA", 1),
 	}
 }
 
+// Reconcile delegates to the shared pinned-Deployment skeleton —
+// this module only supplies the kube-system/coredns identity, the
+// drift check and the patch body.
 func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-	res := ctrl.Result{RequeueAfter: 15 * time.Minute}
-
-	d, err := r.cs.AppsV1().Deployments("kube-system").
-		Get(ctx, "coredns", metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		// cluster without the k0s coredns addon
-		log.Info("SKIP: deployment not found", "deployment", "kube-system/coredns")
-		return res, nil
-	}
-	if err != nil {
-		metrics.IncError(r.queue)
-		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/coredns: %w", err)
-	}
-
-	// Proportional replica pin — disabled when minReplicas<=0
-	// (wantReplicas stays 0: neither needsPatch nor the patch body
-	// touches .spec.replicas then).
-	wantReplicas := int32(0)
-	if r.minReplicas > 0 {
-		nodes, err := shared.ListNodes(ctx, r.cs)
-		if err != nil {
-			metrics.IncError(r.queue)
-			return ctrl.Result{}, fmt.Errorf("list nodes for proportional replica count: %w", err)
-		}
-		wantReplicas = shared.ProportionalReplicas(len(nodes), r.minReplicas, r.nodesPerReplica)
-	}
-
-	if !corednsNeedsPatch(d, r.zoneWhen, r.minDomains, wantReplicas) {
-		log.Info("probes/resources/topology/replicas already pinned - nothing to do",
-			"deployment", "kube-system/coredns", "wantReplicas", wantReplicas)
-		return res, nil
-	}
-	// A missing coredns container reads as drift, but the
-	// strategic-merge patch merges containers BY NAME — applied to a
-	// spec without it, it would append a container entry with no
-	// image that the apiserver rejects forever. We cannot reconstruct
-	// the image, so warn and leave the Deployment for the stack
-	// applier rather than emitting a guaranteed-invalid patch.
-	if !shared.PodSpecHasContainer(&d.Spec.Template.Spec, "coredns") {
-		log.Info("WARN: coredns container missing from pod spec — "+
-			"skipping patch (strategic merge cannot create it without an image)",
-			"deployment", "kube-system/coredns")
-		return res, nil
-	}
-	patch, err := corednsPatchBody(r.zoneWhen, r.minDomains, wantReplicas)
-	if err != nil {
-		metrics.IncError(r.queue)
-		return ctrl.Result{}, fmt.Errorf("render patch body for deployment kube-system/coredns: %w", err)
-	}
-	log.Info("PATCH: coredns drifted — restoring pinned spec",
-		"deployment", "kube-system/coredns", "wantReplicas", wantReplicas)
-	if _, err := r.cs.AppsV1().Deployments("kube-system").Patch(ctx,
-		"coredns", types.StrategicMergePatchType,
-		patch, metav1.PatchOptions{}); err != nil {
-		metrics.IncError(r.queue)
-		return ctrl.Result{}, fmt.Errorf("patch deployment kube-system/coredns: %w", err)
-	}
-	return res, nil
+	return pinnedworkload.DeploymentSpec{
+		CS:        r.cs,
+		Queue:     r.queue,
+		Namespace: "kube-system",
+		Name:      "coredns",
+		Container: "coredns",
+		Replicas: pinnedworkload.ReplicaPin{
+			MinReplicas:     r.minReplicas,
+			NodesPerReplica: r.nodesPerReplica,
+		},
+		NoDriftLog: "probes/resources/topology/replicas already pinned - nothing to do",
+		Drifted: func(d *appsv1.Deployment, wantReplicas int32) bool {
+			return corednsNeedsPatch(d, r.zoneWhen, r.minDomains, wantReplicas)
+		},
+		PatchBody: func(wantReplicas int32) ([]byte, error) {
+			return corednsPatchBody(r.zoneWhen, r.minDomains, wantReplicas)
+		},
+	}.Reconcile(ctx)
 }
 
 // corednsMinDomainsWanted gates minDomains onto DoNotSchedule only —

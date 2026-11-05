@@ -39,6 +39,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -111,7 +113,7 @@ func Setup(d shared.Deps) error {
 // (bash's `[ -n "$ts" ]` guard) does NOT flag the node.
 func nodePartitioned(n *corev1.Node) bool {
 	for _, t := range partitionCondTypes {
-		c := shared.NodeCondition(n, t)
+		c := kube.NodeCondition(n, t)
 		if c != nil && c.Status == corev1.ConditionTrue &&
 			!c.LastTransitionTime.IsZero() &&
 			time.Since(c.LastTransitionTime.Time) > partitionMinAge {
@@ -126,7 +128,7 @@ func nodePartitioned(n *corev1.Node) bool {
 // trimmed, blanks dropped (so "a, ,b" and trailing commas produce no
 // phantom namespace). Unset or all-empty falls back to partitionPodNS.
 func partitionEvictNamespaces() map[string]struct{} {
-	raw := strings.TrimSpace(shared.Getenv(partitionNSsEnv, ""))
+	raw := strings.TrimSpace(envx.Getenv(partitionNSsEnv, ""))
 	if raw == "" {
 		raw = partitionPodNS
 	}
@@ -180,9 +182,9 @@ func partitionEvictable(p *corev1.Pod, namespaces map[string]struct{}) bool {
 // error — the caller fails the eviction pass closed rather than
 // evicting pods it cannot prove are movable.
 func (e *partitionEvictor) nodePinnedPVCs(ctx context.Context) (map[string]struct{}, error) {
-	pvcs, err := shared.ListAll(ctx,
+	pvcs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: 500},
-		shared.PersistentVolumeClaims(e.cs, metav1.NamespaceAll))
+		kube.PersistentVolumeClaims(e.cs, metav1.NamespaceAll))
 	if err != nil {
 		return nil, fmt.Errorf("list persistentvolumeclaims: %w", err)
 	}
@@ -218,7 +220,7 @@ func podOnNodePinnedPVC(p *corev1.Pod, pinned map[string]struct{}) bool {
 func (e *partitionEvictor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	nodes, err := shared.ListNodes(ctx, e.cs)
+	nodes, err := kube.ListNodes(ctx, e.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}
@@ -227,7 +229,7 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	total := 0
 	for i := range nodes {
 		byName[nodes[i].Name] = &nodes[i]
-		if shared.IsControlPlane(&nodes[i]) {
+		if kube.IsControlPlane(&nodes[i]) {
 			// k0s control planes run no kubelet and no evictable
 			// workload — a partition condition there must neither
 			// taint nor count toward the mesh-wide guard (counting
@@ -245,8 +247,8 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	// exactly like bash.
 	for i := range nodes {
 		n := &nodes[i]
-		if shared.HasTaint(n.Spec.Taints, partitionTaintKey) && !flagged[n.Name] {
-			if err := shared.UntaintNode(ctx, e.cs, n.Name, partitionTaintKey); err != nil {
+		if kube.HasTaint(n.Spec.Taints, partitionTaintKey) && !flagged[n.Name] {
+			if err := kube.UntaintNode(ctx, e.cs, n.Name, partitionTaintKey); err != nil {
 				metrics.IncError(e.queue)
 				log.Error(err, "untaint failed", "node", n.Name)
 				continue
@@ -289,8 +291,8 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	// next run while their pods sit on a blackholed node.
 	for _, name := range names {
 		node := byName[name]
-		if !shared.HasTaint(node.Spec.Taints, partitionTaintKey) {
-			if err := shared.TaintNode(ctx, e.cs, name, partitionTaintKey, "true", corev1.TaintEffectNoSchedule); err != nil {
+		if !kube.HasTaint(node.Spec.Taints, partitionTaintKey) {
+			if err := kube.TaintNode(ctx, e.cs, name, partitionTaintKey, "true", corev1.TaintEffectNoSchedule); err != nil {
 				metrics.IncError(e.queue)
 				log.Error(err, "taint failed", "node", name)
 			} else {
@@ -315,10 +317,10 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	evicted := 0
 loop:
 	for _, name := range names {
-		pods, err := shared.ListAll(ctx, metav1.ListOptions{
+		pods, err := kube.ListAll(ctx, metav1.ListOptions{
 			FieldSelector: "spec.nodeName=" + name,
 			Limit:         500,
-		}, shared.Pods(e.cs, metav1.NamespaceAll))
+		}, kube.Pods(e.cs, metav1.NamespaceAll))
 		if err != nil {
 			metrics.IncError(e.queue)
 			log.Error(err, "list pods failed", "node", name)
@@ -353,7 +355,7 @@ loop:
 			// same-named fresh pod before the delete lands — never
 			// kill the replacement.
 			if err := e.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
-				shared.UIDDeleteOptions(p.UID, "")); err != nil {
+				kube.UIDDeleteOptions(p.UID, "")); err != nil {
 				metrics.IncError(e.queue)
 				log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name,
 					"node", name)

@@ -17,7 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -52,7 +52,7 @@ func TestNamespaceTerminatingWedged(t *testing.T) {
 	cs := fake.NewSimpleClientset(wedged, fresh)
 	p := testProber(cs)
 
-	res := mustCheck[*namespaceTerminatingWedgedCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatalf("wedged namespace must fail: %+v", res)
 	}
@@ -95,12 +95,12 @@ func TestMaybeStripFinalizersDeadOwner(t *testing.T) {
 	}}
 	cs := fake.NewSimpleClientset() // owner Deployment absent
 	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		gvr:                     "FooList",
-		shared.AutopilotPlanGVR: "PlanList",
+		gvr:                   "FooList",
+		kube.AutopilotPlanGVR: "PlanList",
 	}, obj)
 	p := testProberDyn(cs, dyn)
 
-	if !mustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if !probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
 		t.Fatal("dead-owner CR should be stripped")
 	}
 	got, err := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-1", metav1.GetOptions{})
@@ -135,12 +135,12 @@ func TestMaybeStripFinalizersLiveOwnerSkipped(t *testing.T) {
 	}}
 	cs := fake.NewSimpleClientset(dep)
 	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		gvr:                     "FooList",
-		shared.AutopilotPlanGVR: "PlanList",
+		gvr:                   "FooList",
+		kube.AutopilotPlanGVR: "PlanList",
 	}, obj)
 	p := testProberDyn(cs, dyn)
 
-	if mustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
 		t.Fatal("live-owner CR must not be stripped")
 	}
 	got, _ := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-2", metav1.GetOptions{})
@@ -168,7 +168,7 @@ func TestMaybeStripFinalizersProtectedOnly(t *testing.T) {
 	}, obj)
 	p := testProberDyn(cs, dyn)
 
-	if mustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
 		t.Fatal("protected-only finalizers must never be stripped")
 	}
 }

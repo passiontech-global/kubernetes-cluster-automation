@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,7 +42,7 @@ const (
 	kubeletReaperTaint    = "node.ops/kubelet-unresponsive"
 	kubeletReaperProbes   = 4                // all probes fail -> really down
 	kubeletReaperProbeGap = 10 * time.Second // between probes
-	// per-probe apiserver timeout (8s) lives in shared.KubeletHealthz
+	// per-probe apiserver timeout (8s) lives in kube.KubeletHealthz
 	kubeletReaperHBStaleS = 120 // Ready heartbeat older -> dead kubelet
 )
 
@@ -65,7 +66,7 @@ func Setup(d shared.Deps) error {
 
 func (r *kubeletReaper) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	nodes, err := shared.ListNodes(ctx, r.cs)
+	nodes, err := kube.ListNodes(ctx, r.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}
@@ -80,7 +81,7 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for i := range nodes {
 		n := &nodes[i]
-		if shared.IsControlPlane(n) {
+		if kube.IsControlPlane(n) {
 			// k0s control planes run no kubelet — the probe would
 			// always fail and taint an innocent node.
 			log.Info("SKIP-CP", "node", n.Name)
@@ -112,7 +113,7 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	sweepErrs := 0
 	for i := range nodes {
 		n := &nodes[i]
-		if shared.IsControlPlane(n) {
+		if kube.IsControlPlane(n) {
 			continue
 		}
 		if err := r.sweep(ctx, n, ok[n.Name]); err != nil {
@@ -136,7 +137,7 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	return nil
 }
 
-// probe asks shared.KubeletHealthz up to 4 times (10s apart, 8s per
+// probe asks kube.KubeletHealthz up to 4 times (10s apart, 8s per
 // attempt) — a body starting with "ok" wins. The REST-path details
 // live in the helper; the retry loop and the taint decision it feeds
 // are this module's policy.
@@ -160,7 +161,7 @@ func (r *kubeletReaper) probe(ctx context.Context, node string) bool {
 			case <-gap.C:
 			}
 		}
-		body, err := shared.KubeletHealthz(ctx, r.cs, node)
+		body, err := kube.KubeletHealthz(ctx, r.cs, node)
 		if err == nil && strings.HasPrefix(strings.TrimSpace(string(body)), "ok") {
 			return true
 		}
@@ -201,11 +202,11 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	log := logf.FromContext(ctx)
 
 	if ok {
-		if shared.HasTaint(listed.Spec.Taints, kubeletReaperTaint) {
-			// shared.UntaintNode re-Gets the node inside before patching,
+		if kube.HasTaint(listed.Spec.Taints, kubeletReaperTaint) {
+			// kube.UntaintNode re-Gets the node inside before patching,
 			// so a stale listed snapshot cannot remove a taint that
 			// is already gone — no separate Get needed here either.
-			if err := shared.UntaintNode(ctx, r.cs, listed.Name, kubeletReaperTaint); err != nil {
+			if err := kube.UntaintNode(ctx, r.cs, listed.Name, kubeletReaperTaint); err != nil {
 				return fmt.Errorf("remove taint %s on node %s: %w",
 					kubeletReaperTaint, listed.Name, err)
 			}
@@ -223,7 +224,7 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	if err != nil {
 		return fmt.Errorf("get node %s: %w", listed.Name, err)
 	}
-	has := shared.HasTaint(node.Spec.Taints, kubeletReaperTaint)
+	has := kube.HasTaint(node.Spec.Taints, kubeletReaperTaint)
 	name := listed.Name
 
 	// Probe failed — heartbeat gate: fresh Ready heartbeat = broken
@@ -234,7 +235,7 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	// life — fresh (no taint); conflating skew with staleness would
 	// mass-taint on an NTP flap.
 	age := -1 // sentinel: no usable timestamp -> stale
-	if c := shared.NodeCondition(node, corev1.NodeReady); c != nil &&
+	if c := kube.NodeCondition(node, corev1.NodeReady); c != nil &&
 		!c.LastHeartbeatTime.IsZero() {
 		age = int(time.Since(c.LastHeartbeatTime.Time) / time.Second)
 		if age < 0 {
@@ -246,7 +247,7 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	}
 	if age == -1 || age > kubeletReaperHBStaleS {
 		if !has {
-			if err := shared.TaintNode(ctx, r.cs, name, kubeletReaperTaint, "true",
+			if err := kube.TaintNode(ctx, r.cs, name, kubeletReaperTaint, "true",
 				corev1.TaintEffectNoSchedule); err != nil {
 				return fmt.Errorf("taint %s on node %s: %w",
 					kubeletReaperTaint, name, err)
@@ -259,7 +260,7 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 		return nil
 	}
 	if has {
-		if err := shared.UntaintNode(ctx, r.cs, name, kubeletReaperTaint); err != nil {
+		if err := kube.UntaintNode(ctx, r.cs, name, kubeletReaperTaint); err != nil {
 			return fmt.Errorf("remove taint %s on node %s: %w",
 				kubeletReaperTaint, name, err)
 		}

@@ -13,7 +13,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // orderOwnedByCert reports whether the Order's CertificateRequest
@@ -59,13 +59,13 @@ func stuckChallengeForOrder(order *unstructured.Unstructured,
 // status.lastTransitionTime when present (real objects do not carry
 // it — fixtures may), else creationTimestamp.
 func challengeWedged(ch *unstructured.Unstructured, now time.Time) bool {
-	presented, _ := shared.NestedBool(ch.Object, "status", "presented")
-	processing, _ := shared.NestedBool(ch.Object, "status", "processing")
+	presented, _ := kube.NestedBool(ch.Object, "status", "presented")
+	processing, _ := kube.NestedBool(ch.Object, "status", "processing")
 	if !presented || !processing {
 		return false
 	}
 	since := ch.GetCreationTimestamp().Time
-	if ts, ok := shared.NestedString(
+	if ts, ok := kube.NestedString(
 		ch.Object, "status", "lastTransitionTime"); ok {
 		if t, err := time.Parse(time.RFC3339, ts); err == nil {
 			since = t

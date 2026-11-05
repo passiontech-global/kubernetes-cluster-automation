@@ -22,7 +22,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 const (
@@ -58,10 +58,10 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 	now := u.now.Now()
 	for i := range kustomizations.Items {
 		k := &kustomizations.Items[i]
-		if suspended, _ := shared.NestedBool(k.Object, "spec", "suspend"); suspended {
+		if suspended, _ := kube.NestedBool(k.Object, "spec", "suspend"); suspended {
 			continue
 		}
-		c, _ := shared.ConditionOf(k.Object, "Ready")
+		c, _ := kube.ConditionOf(k.Object, "Ready")
 		if c.Status != "False" || !strings.Contains(strings.ToLower(c.Message), "field is immutable") {
 			continue
 		}
@@ -92,11 +92,11 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 		// The Job lives where the manifests apply — spec.targetNamespace
 		// wins, else the Kustomization's own namespace.
 		jobNS := k.GetNamespace()
-		if tns, _ := shared.NestedString(k.Object, "spec", "targetNamespace"); tns != "" {
+		if tns, _ := kube.NestedString(k.Object, "spec", "targetNamespace"); tns != "" {
 			jobNS = tns
 		}
 		job, err := u.cs.BatchV1().Jobs(jobNS).Get(ctx, m[1], metav1.GetOptions{})
-		gone, err := shared.ConfirmAbsent(err)
+		gone, err := kube.ConfirmAbsent(err)
 		if err != nil {
 			metrics.IncError(u.queue)
 			log.Error(err, "immutable-job lookup failed", "kustomization", key, "job", jobNS+"/"+m[1])
@@ -119,7 +119,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 		log.Info("ACTION: delete completed/failed immutable Job — apply can recreate it",
 			"kustomization", key, "job", jobNS+"/"+job.Name)
 		if err := u.cs.BatchV1().Jobs(jobNS).Delete(ctx, job.Name,
-			shared.UIDDeleteOptions(job.UID, metav1.DeletePropagationBackground)); err != nil {
+			kube.UIDDeleteOptions(job.UID, metav1.DeletePropagationBackground)); err != nil {
 			metrics.IncError(u.queue)
 			log.Error(err, "immutable job delete failed", "job", jobNS+"/"+job.Name)
 			continue

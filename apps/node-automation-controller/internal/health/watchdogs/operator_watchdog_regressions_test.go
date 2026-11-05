@@ -135,10 +135,10 @@ func TestCheckOperatorWorkqueuesOCIHelmRepoIgnored(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(ociRepo))
 	p.Now = func() time.Time { return base }
 
-	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("OCI HelmRepository must not freeze the check: %+v", res)
 	}
-	for _, k := range wdTrackedKeys(&mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
+	for _, k := range probetest.LedgerKeys(&probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
 		if strings.HasPrefix(k, "source-controller/helmrepositories/") {
 			t.Fatalf("OCI repo must not be tracked: %v", k)
 		}
@@ -149,10 +149,10 @@ func TestCheckOperatorWorkqueuesOCIHelmRepoIgnored(t *testing.T) {
 	stale := shHelmRepo("http-repo", 5, 3, "default", false)
 	p2 := testProberDyn(cs, probetest.OpDyn(ociRepo, stale))
 	p2.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p2).opFirstSeen.
+	probetest.MustCheck[*operatorWorkqueueCheck](t, p2).opFirstSeen.
 		Observe("source-controller/helmrepositories/flux-system/http-repo",
 			base.Add(-time.Hour))
-	if res := mustCheck[*operatorWorkqueueCheck](t, p2).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p2).Run(ctx); res.Pass {
 		t.Fatal("stale type=default HelmRepository must still FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "source-controller", kcmReasonStaleGen); v != 1 {
@@ -185,7 +185,7 @@ func TestLeaderPodsSelectorFallbackCapsAtOne(t *testing.T) {
 	lease := shLease("scylla-operator", "scylla-operator-lock",
 		"missing-pod_uuid", 2*time.Second, base)
 
-	pods, err := mustCheck[*operatorWorkqueueCheck](t, p).leaderPods(ctx, op, lease)
+	pods, err := probetest.MustCheck[*operatorWorkqueueCheck](t, p).leaderPods(ctx, op, lease)
 	if err != nil {
 		t.Fatalf("leaderPods: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestLeaderPodsSelectorFallbackCapsAtOne(t *testing.T) {
 	lease2 := shLease("scylla-operator", "scylla-operator-lock",
 		"scylla-operator-leader_9f8e", 2*time.Second, base)
 
-	pods, err = mustCheck[*operatorWorkqueueCheck](t, p2).leaderPods(ctx, op, lease2)
+	pods, err = probetest.MustCheck[*operatorWorkqueueCheck](t, p2).leaderPods(ctx, op, lease2)
 	if err != nil {
 		t.Fatalf("leaderPods: %v", err)
 	}
@@ -239,11 +239,11 @@ func TestCheckOperatorWorkqueuesHealsOneReplicaOnly(t *testing.T) {
 		"scylla", "db", 9, 4)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
-	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
+	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("scylla-operator/scyllaclusters/scylla/db", base.Add(-time.Hour))
 	before := shOpHealsCount(t, "scylla-operator", kcmReasonStaleGen)
 
-	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("stuck ScyllaCluster past 20m with a renewing lease must FAIL")
 	}
 
@@ -289,12 +289,12 @@ func TestCheckOperatorWorkqueuesNotificationObjectsIgnored(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(alert, provider, receiver))
 	p.Now = func() time.Time { return base }
 
-	if res := mustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("static notification objects must keep the check quiet: %+v", res)
 	}
 	// Zero resources means nothing is even scanned — no first-seen
 	// keys may be stamped for the static notification objects.
-	for _, k := range wdTrackedKeys(&mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
+	for _, k := range probetest.LedgerKeys(&probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen) {
 		if strings.HasPrefix(k, "notification-controller/") {
 			t.Fatalf("notification objects must not be tracked: %v", k)
 		}

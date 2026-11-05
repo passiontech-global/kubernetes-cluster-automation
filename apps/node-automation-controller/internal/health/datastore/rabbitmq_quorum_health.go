@@ -18,7 +18,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // rabbitMQQuorumHealthCheck is the RabbitMQ quorum-health watchdog.
@@ -28,11 +29,11 @@ type rabbitMQQuorumHealthCheck struct {
 	// seen tracks each Prometheus-flagged pod's first-seen sweep —
 	// the >=10m persistence window for the alarm/partition heal;
 	// pruned when the signal clears so a later flap re-arms.
-	seen shared.FirstSeenLedger
+	seen state.FirstSeenLedger
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1.
-	emitted shared.GaugeLedger[string]
+	emitted state.GaugeLedger[string]
 }
 
 // newRabbitMQQuorumHealthCheck builds the W10-ST3 check — its state
@@ -142,7 +143,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		for _, pod := range members {
 			if pod.DeletionTimestamp == nil &&
 				pod.Status.Phase == corev1.PodRunning &&
-				shared.PodReadyCond(pod) {
+				kube.PodReadyCond(pod) {
 				readyByNS[ns]++
 			}
 		}

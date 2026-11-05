@@ -12,7 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -35,7 +35,7 @@ func shHR(ns, name, status, reason, message string, since time.Time) *unstructur
 	return hr
 }
 
-var hrRetryGVR = shared.GVRHelmReleaseV2
+var hrRetryGVR = kube.GVRHelmReleaseV2
 
 // A HelmRelease parked Ready=False/UpgradeFailed for 20m gets patched
 // with the reconcile annotations and the check FAILs.
@@ -46,7 +46,7 @@ func TestCheckFluxHelmReleaseRetriesPatches(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(hr))
 	p.Now = func() time.Time { return base }
 
-	res := mustCheck[*fluxHRRetriesCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatal("retries-exhausted HelmRelease must FAIL")
 	}
@@ -72,7 +72,7 @@ func TestCheckFluxHelmReleaseRetriesFreshQuiet(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(hr))
 	p.Now = func() time.Time { return base }
 
-	if res := mustCheck[*fluxHRRetriesCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("fresh failure must pass: %+v", res)
 	}
 }
@@ -91,7 +91,7 @@ func TestCheckFluxHelmReleaseRetriesDepNotReady(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(hr, dep))
 	p.Now = func() time.Time { return base }
 
-	res := mustCheck[*fluxHRRetriesCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatal("stuck HR must FAIL even when remediation is deferred")
 	}
@@ -112,7 +112,7 @@ func TestCheckFluxHelmReleaseRetriesCooldown(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(hr))
 	p.Now = func() time.Time { return base }
 
-	if res := mustCheck[*fluxHRRetriesCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("precondition: stuck HR must FAIL")
 	}
 	first, _ := p.Dyn.Resource(hrRetryGVR).Namespace("apps").
@@ -122,7 +122,7 @@ func TestCheckFluxHelmReleaseRetriesCooldown(t *testing.T) {
 
 	// 10m later — still inside the 30m cooldown.
 	p.Now = func() time.Time { return base.Add(10 * time.Minute) }
-	if res := mustCheck[*fluxHRRetriesCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*fluxHRRetriesCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("still-stuck HR must keep FAILING")
 	}
 	got, _ := p.Dyn.Resource(hrRetryGVR).Namespace("apps").

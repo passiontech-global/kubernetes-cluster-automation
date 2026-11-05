@@ -16,7 +16,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/pinnedworkload"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -211,7 +213,7 @@ func TestProportionalReplicas(t *testing.T) {
 		{"min 0 still ceils", 2, 0, 3, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shared.ProportionalReplicas(tc.nodes, tc.min,
+			if got := kube.ProportionalReplicas(tc.nodes, tc.min,
 				tc.nodesPerReplica); got != tc.want {
 				t.Fatalf("proportionalReplicas=%d, want %d", got, tc.want)
 			}
@@ -514,8 +516,8 @@ func TestSetupCoreDNSPatcherPredicate(t *testing.T) {
 	}
 }
 
-// The Node watch predicate (nodeCountChanges — the exact
-// predicate.Funcs the conditional second watch installs when
+// The Node watch predicate (pinnedworkload.NodeCountChanges — the
+// exact predicate.Funcs the conditional second watch installs when
 // minReplicas>0) drives the proportional replica count: only
 // create/delete may fire — includeUnschedulableNodes counts every
 // Node object, so updates never change the total and would only add
@@ -523,7 +525,7 @@ func TestSetupCoreDNSPatcherPredicate(t *testing.T) {
 // itself is no longer asserted (it required introspecting
 // controller-runtime internals).
 func TestSetupCoreDNSPatcherNodeWatch(t *testing.T) {
-	p := nodeCountChanges
+	p := pinnedworkload.NodeCountChanges
 	n1 := testutil.Node("n1", corev1.ConditionTrue, nil)
 	if !p.Create(event.CreateEvent{Object: n1}) {
 		t.Fatal("node add did not fire")

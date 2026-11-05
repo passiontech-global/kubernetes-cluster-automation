@@ -16,7 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // probeFQDN picks the layer-2 probe target: the newest Service <10m
@@ -38,8 +38,8 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) (string, map[string]boo
 	// Page the cluster-wide Service list — an unbounded List forces
 	// etcd to serialize every Service into one response; 500-per-page
 	// keeps each request cheap at fleet scale.
-	svcItems, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
-		shared.Services(w.cs, metav1.NamespaceAll))
+	svcItems, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+		kube.Services(w.cs, metav1.NamespaceAll))
 	if err != nil {
 		log.Info("dns: cannot list services — layer 2 inconclusive", "error", err)
 		return "", nil
@@ -99,8 +99,8 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 	log := logf.FromContext(ctx)
 	var best *discoveryv1.EndpointSlice
 	var bestRV int64
-	err := shared.ListEach(ctx, metav1.ListOptions{Limit: 500},
-		shared.EndpointSlices(w.cs, metav1.NamespaceAll),
+	err := kube.ListEach(ctx, metav1.ListOptions{Limit: 500},
+		kube.EndpointSlices(w.cs, metav1.NamespaceAll),
 		func(items []discoveryv1.EndpointSlice) error {
 			for i := range items {
 				es := &items[i]

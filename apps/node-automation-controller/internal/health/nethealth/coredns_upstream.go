@@ -20,7 +20,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // coreDNSUpstreamCheck is the CoreDNS upstream-failure watchdog with
@@ -31,7 +32,7 @@ type coreDNSUpstreamCheck struct {
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1 (zero value usable; the serial sweep needs no lock).
-	emitted shared.GaugeLedger[string]
+	emitted state.GaugeLedger[string]
 }
 
 // newCoreDNSUpstreamCheck builds the W10-NM5 check — its only state
@@ -192,7 +193,7 @@ func hasHealthySibling(pod *corev1.Pod, siblings []*corev1.Pod,
 		if _, bad := flagged[s.Namespace+"/"+s.Name]; bad {
 			continue
 		}
-		if s.Status.Phase == corev1.PodRunning && shared.PodReadyCond(s) {
+		if s.Status.Phase == corev1.PodRunning && kube.PodReadyCond(s) {
 			return true
 		}
 	}

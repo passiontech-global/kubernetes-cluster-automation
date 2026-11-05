@@ -22,7 +22,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 const (
@@ -39,19 +39,19 @@ const (
 // fluxKustomizationGVR is the second consumer kind the artifact
 // healer scans (kustomize-controller owns the same stale-artifact
 // failure class as helm-controller).
-var fluxKustomizationGVR = shared.GVRFluxKustomization
+var fluxKustomizationGVR = kube.GVRFluxKustomization
 
 // fluxSourceGVRs maps the sourceRef kinds flux consumers carry to
 // their source.toolkit.fluxcd.io/v1 GVRs — the objects a stale-
 // artifact nudge actually lands on.
 var fluxSourceGVRs = map[string]schema.GroupVersionResource{
-	"HelmChart":      shared.GVRFluxHelmChart,
-	"GitRepository":  shared.GVRFluxGitRepository,
-	"HelmRepository": shared.GVRFluxHelmRepository,
-	"OCIRepository":  shared.GVRFluxOCIRepository,
+	"HelmChart":      kube.GVRFluxHelmChart,
+	"GitRepository":  kube.GVRFluxGitRepository,
+	"HelmRepository": kube.GVRFluxHelmRepository,
+	"OCIRepository":  kube.GVRFluxOCIRepository,
 	// Bucket is a first-class v1 source kind — a Kustomization or HR
 	// sourcing artifacts from an S3/GCS bucket needs the same nudge.
-	"Bucket": shared.GVRFluxBucket,
+	"Bucket": kube.GVRFluxBucket,
 }
 
 // artifactFailMsgs are the Ready=False message fragments marking a
@@ -119,10 +119,10 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 // with a message pointing at the source's artifact (not the
 // consumer's own logic).
 func fluxArtifactStale(o *unstructured.Unstructured, now time.Time) bool {
-	if suspended, _ := shared.NestedBool(o.Object, "spec", "suspend"); suspended {
+	if suspended, _ := kube.NestedBool(o.Object, "spec", "suspend"); suspended {
 		return false // suspended objects are parked, not broken
 	}
-	c, _ := shared.ConditionOf(o.Object, "Ready")
+	c, _ := kube.ConditionOf(o.Object, "Ready")
 	if c.Status != "False" {
 		return false
 	}
@@ -149,15 +149,15 @@ func fluxArtifactStale(o *unstructured.Unstructured, now time.Time) bool {
 // spec.chart.spec.sourceRef (HelmRepository/GitRepository). The
 // namespace defaults to the HR's own (flux convention).
 func hrSourceRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
-	kind, _ := shared.NestedString(hr.Object, "spec", "chartRef", "kind")
-	name, _ := shared.NestedString(hr.Object, "spec", "chartRef", "name")
-	ns, _ := shared.NestedString(hr.Object, "spec", "chartRef", "namespace")
+	kind, _ := kube.NestedString(hr.Object, "spec", "chartRef", "kind")
+	name, _ := kube.NestedString(hr.Object, "spec", "chartRef", "name")
+	ns, _ := kube.NestedString(hr.Object, "spec", "chartRef", "namespace")
 	if kind == "" || name == "" {
-		kind, _ = shared.NestedString(
+		kind, _ = kube.NestedString(
 			hr.Object, "spec", "chart", "spec", "sourceRef", "kind")
-		name, _ = shared.NestedString(
+		name, _ = kube.NestedString(
 			hr.Object, "spec", "chart", "spec", "sourceRef", "name")
-		ns, _ = shared.NestedString(
+		ns, _ = kube.NestedString(
 			hr.Object, "spec", "chart", "spec", "sourceRef", "namespace")
 	}
 	if kind == "" || name == "" {
@@ -174,10 +174,10 @@ func hrSourceRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
 // spec.chart.spec.sourceRef (not spec.chartRef: HelmChart), so both the
 // upstream repository and the HelmChart artifact are nudged.
 func hrStatusHelmChartRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
-	if cKind, _ := shared.NestedString(hr.Object, "spec", "chartRef", "kind"); cKind == "HelmChart" {
+	if cKind, _ := kube.NestedString(hr.Object, "spec", "chartRef", "kind"); cKind == "HelmChart" {
 		return fluxSourceRef{}, false
 	}
-	hc, _ := shared.NestedString(hr.Object, "status", "helmChart")
+	hc, _ := kube.NestedString(hr.Object, "status", "helmChart")
 	ns, name, ok := strings.Cut(hc, "/")
 	if !ok || ns == "" || name == "" {
 		return fluxSourceRef{}, false
@@ -188,9 +188,9 @@ func hrStatusHelmChartRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
 // ksSourceRef is spec.sourceRef on a Kustomization — same flux
 // convention (namespace defaults to the object's own).
 func ksSourceRef(k *unstructured.Unstructured) (fluxSourceRef, bool) {
-	kind, _ := shared.NestedString(k.Object, "spec", "sourceRef", "kind")
-	name, _ := shared.NestedString(k.Object, "spec", "sourceRef", "name")
-	ns, _ := shared.NestedString(k.Object, "spec", "sourceRef", "namespace")
+	kind, _ := kube.NestedString(k.Object, "spec", "sourceRef", "kind")
+	name, _ := kube.NestedString(k.Object, "spec", "sourceRef", "name")
+	ns, _ := kube.NestedString(k.Object, "spec", "sourceRef", "namespace")
 	if kind == "" || name == "" {
 		return fluxSourceRef{}, false
 	}
@@ -220,7 +220,7 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 	}
 	src, err := u.dyn.Resource(gvr).Namespace(ref.namespace).
 		Get(ctx, ref.name, metav1.GetOptions{})
-	gone, err := shared.ConfirmAbsent(err)
+	gone, err := kube.ConfirmAbsent(err)
 	if err != nil {
 		metrics.IncError(u.queue)
 		log.Error(err, "flux source get failed", "kind", ref.kind, "source", key)

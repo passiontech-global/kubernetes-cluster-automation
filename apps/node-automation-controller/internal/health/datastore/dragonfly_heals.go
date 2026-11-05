@@ -16,7 +16,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -31,7 +31,7 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	sig masterSvc, now time.Time) {
 	// Maintenance mutex — never kill an operator mid-drain/upgrade;
 	// "cannot verify" fails closed like healOperatorLeader (W5.8).
-	held, why, err := shared.MaintenanceActive(ctx, p.CS, p.Dyn)
+	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
@@ -193,7 +193,7 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	hasMaster := false
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if !shared.PodReadyCond(pod) {
+		if !kube.PodReadyCond(pod) {
 			allReady = false
 		}
 		if podMasterRole(pod) {
@@ -229,7 +229,7 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	}
 	// Maintenance mutex — never kill a stateful pod mid-drain/
 	// upgrade; "cannot verify" fails closed like every other caller.
-	held, why, err := shared.MaintenanceActive(ctx, p.CS, p.Dyn)
+	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",

@@ -1,9 +1,9 @@
 // Package envdoc holds a single source-coverage test keeping docs/env.md
 // honest. docs/env.md is the operator-facing catalog of every env var the
-// controller reads — the REGISTRATION gates in the cmd/manager/modules.go
-// registry (the GateEnv column) plus the run-behavior knobs and
-// sub-feature gates each module resolves through the shared.Getenv* /
-// shared.Gate helpers in internal/shared/env.go. The catalog is
+// controller reads — the REGISTRATION gates in the internal/registry
+// module table (the GateEnv column) plus the run-behavior knobs and
+// sub-feature gates each module resolves through the envx.Getenv* /
+// envx.Gate helpers in internal/platform/envx/env.go. The catalog is
 // maintained by hand, so it drifts the moment a knob lands in code
 // without a matching table row; TestEnvDocCoversSource walks the module
 // source, collects every env-var name the code can read, and fails with a
@@ -35,8 +35,8 @@ import (
 const moduleRoot = "../.."
 
 // envHelpers is the complete set of env-reading helpers exported by
-// internal/shared/env.go. A call `shared.Xxx("NAME", ...)` — or an
-// unqualified `Xxx("NAME", ...)` inside package shared itself — reads the
+// internal/platform/envx/env.go. A call `envx.Xxx("NAME", ...)` — or an
+// unqualified `Xxx("NAME", ...)` inside package envx itself — reads the
 // env var named by its first argument. Keep this set in sync with env.go:
 // adding a new helper there without listing it here silently drops its
 // call sites from coverage.
@@ -68,13 +68,13 @@ var knownGaps = map[string]string{}
 // TestEnvDocCoversSource fails when source introduces an env knob not
 // documented in docs/env.md. Three sources feed the check:
 //
-//   - `GateEnv: "NAME"` literals in cmd/manager/*.go — the registration
-//     gates on shared.Module registry rows;
-//   - first arguments of shared.Getenv*/shared.Gate call sites in
+//   - `GateEnv: "NAME"` literals in internal/registry/*.go — the
+//     registration gates on shared.Module registry rows;
+//   - first arguments of envx.Getenv*/envx.Gate call sites in
 //     cmd/manager/*.go and internal/**/*.go — both string literals and
 //     package-level string consts used as the key (partition-evictor keys
 //     its call off `const partitionNSsEnv`);
-//   - unqualified Getenv/Gate-family calls inside internal/shared itself
+//   - unqualified Getenv/Gate-family calls inside internal/platform/envx itself
 //     (there are none today, but a future helper calling another helper
 //     would land here). env.go's own DEFINITIONS take a `key` parameter,
 //     not a literal, so they collect nothing.
@@ -89,8 +89,9 @@ func TestEnvDocCoversSource(t *testing.T) {
 	// nothing passes vacuously, which is worse than no test.
 	if len(where) == 0 {
 		t.Fatalf("env scan collected 0 names — the scanner is broken " +
-			"(checked GateEnv literals under cmd/manager and shared.Getenv*/" +
-			"shared.Gate call sites under cmd/manager + internal)")
+			"(checked GateEnv literals under internal/registry and " +
+			"envx.Getenv*/envx.Gate call sites under cmd/manager + " +
+			"internal)")
 	}
 	// PARTITION_EVICT_NAMESPACES is the one call site whose env key is a
 	// package const rather than a literal; its presence proves const-key
@@ -127,8 +128,9 @@ func TestEnvDocCoversSource(t *testing.T) {
 
 	// An env key the scanner cannot name is an env key docs/env.md cannot
 	// be checked against — fail rather than skip it silently. Dynamic
-	// selector keys (m.GateEnv in modules.go) are excluded by collectEnvNames
-	// because the same literal is caught at its registry declaration.
+	// selector keys (m.GateEnv in internal/registry) are excluded by
+	// collectEnvNames because the same literal is caught at its registry
+	// declaration.
 	for _, u := range unresolved {
 		t.Errorf("unresolvable env key at %s — pass a string literal or a "+
 			"package-level string const so the coverage test can see it", u)
@@ -146,14 +148,15 @@ func TestEnvDocCoversSource(t *testing.T) {
 //
 // Keys written as arbitrary other expressions (a field read like
 // `m.GateEnv`, a concatenation, a call) are ignored rather than flagged:
-// modules.go resolves `shared.Gate(m.GateEnv, ...)` per registry row, and
-// the literal it dereferences is caught by the GateEnv composite-literal
-// scan where it is declared.
+// internal/registry resolves `envx.Gate(m.GateEnv, ...)` per registry
+// row, and the literal it dereferences is caught by the GateEnv
+// composite-literal scan where it is declared.
 func collectEnvNames(t *testing.T) (map[string]string, []string) {
 	t.Helper()
 
 	envdocDir := filepath.Join(moduleRoot, "internal", "envdoc")
-	sharedDir := filepath.Join(moduleRoot, "internal", "shared")
+	envxDir := filepath.Join(moduleRoot, "internal", "platform", "envx")
+	registryDir := filepath.Join(moduleRoot, "internal", "registry")
 
 	dirs := []string{filepath.Join(moduleRoot, "cmd", "manager")}
 	internalRoot := filepath.Join(moduleRoot, "internal")
@@ -214,7 +217,7 @@ func collectEnvNames(t *testing.T) (map[string]string, []string) {
 		}
 
 		// Pass 1 — collect this package's string consts so an env key
-		// written as `shared.Getenv(someConst, ...)` still resolves to a
+		// written as `envx.Getenv(someConst, ...)` still resolves to a
 		// name. Bare rows in a const block repeat the previous expression,
 		// handled by carrying `vals` forward.
 		consts := make(map[string]string)
@@ -249,10 +252,10 @@ func collectEnvNames(t *testing.T) (map[string]string, []string) {
 			}
 		}
 
-		// Pass 2 — walk each file for env-reading call sites and, under
-		// cmd/manager, GateEnv keys on registry rows.
-		inManager := dir == filepath.Join(moduleRoot, "cmd", "manager")
-		inShared := dir == sharedDir
+		// Pass 2 — walk each file for env-reading call sites and, in the
+		// registry package, GateEnv keys on module registry rows.
+		inRegistry := dir == registryDir
+		inEnvx := dir == envxDir
 
 		addKey := func(expr ast.Expr, pos token.Pos) {
 			switch k := expr.(type) {
@@ -286,12 +289,12 @@ func collectEnvNames(t *testing.T) (map[string]string, []string) {
 			ast.Inspect(f, func(n ast.Node) bool {
 				switch e := n.(type) {
 				case *ast.CallExpr:
-					if !isEnvCall(e, inShared) || len(e.Args) == 0 {
+					if !isEnvCall(e, inEnvx) || len(e.Args) == 0 {
 						return true
 					}
 					addKey(e.Args[0], e.Pos())
 				case *ast.KeyValueExpr:
-					if !inManager {
+					if !inRegistry {
 						return true
 					}
 					key, ok := e.Key.(*ast.Ident)
@@ -309,17 +312,17 @@ func collectEnvNames(t *testing.T) (map[string]string, []string) {
 }
 
 // isEnvCall reports whether call is a read of an env var through one of
-// the shared helpers — either the qualified `shared.Xxx(...)` form used
+// the shared helpers — either the qualified `envx.Xxx(...)` form used
 // everywhere, or the bare `Xxx(...)` form that can only mean the env.go
-// helper when it appears inside package shared itself. An unqualified
+// helper when it appears inside package envx itself. An unqualified
 // same-named function anywhere else is not our business.
-func isEnvCall(call *ast.CallExpr, inShared bool) bool {
+func isEnvCall(call *ast.CallExpr, inEnvx bool) bool {
 	switch fun := call.Fun.(type) {
 	case *ast.SelectorExpr:
 		recv, ok := fun.X.(*ast.Ident)
-		return ok && recv.Name == "shared" && envHelpers[fun.Sel.Name]
+		return ok && recv.Name == "envx" && envHelpers[fun.Sel.Name]
 	case *ast.Ident:
-		return inShared && envHelpers[fun.Name]
+		return inEnvx && envHelpers[fun.Name]
 	}
 	return false
 }

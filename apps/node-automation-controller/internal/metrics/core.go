@@ -18,7 +18,7 @@
 // API convention — two shapes, by design:
 //   - Exported vectors (VeleroBSLUnavailable, APIServiceUnavailable,
 //     ...) are the default: modules Set/Inc/DeleteLabelValues on them
-//     directly, usually through a shared.GaugeLedger that owns series
+//     directly, usually through a state.GaugeLedger that owns series
 //     lifecycle. Use this when a call site is a plain
 //     WithLabelValues().Set(...).
 //   - Accessor functions (IncError, ObserveHealthCheck,
@@ -29,6 +29,13 @@
 //     (ForgetAPIBackend's DeleteLabelValues prune). Do not add a thin
 //     wrapper that merely forwards to a vec — exported access is the
 //     convention, not something to hide.
+//
+// One deliberate exception: a cluster-health check whose series is
+// private to that check (node_automation_image_pull_backoff,
+// node_automation_argocd_app_stuck, ...) declares and registers its
+// own gauge in the check file's init() instead of here — the vector
+// lives next to the only code that sets it. Shared or
+// multi-consumer series always live in this package.
 package metrics
 
 import (

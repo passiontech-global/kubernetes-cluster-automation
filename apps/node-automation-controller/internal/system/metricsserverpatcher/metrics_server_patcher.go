@@ -33,27 +33,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/pinnedworkload"
 )
 
 // Exact patch body from the CronJob — strategic merge lands the
@@ -93,29 +85,15 @@ type metricsServerPatcher struct {
 	nodesPerReplica int
 }
 
-// The watch wiring below installs these package-level predicates
-// verbatim — tests exercise the exact units the controller runs
-// instead of introspecting controller-runtime internals.
+// The watch wiring below installs this package-level predicate
+// verbatim — tests exercise the exact unit the controller runs
+// instead of introspecting controller-runtime internals. The Node
+// watch predicate is the shared pinnedworkload.NodeCountChanges.
 
 // onlyMetricsServerDeployment pins the For() watch to
 // kube-system/metrics-server — the informer sees every kube-system
 // Deployment.
-var onlyMetricsServerDeployment = predicate.NewPredicateFuncs(func(o client.Object) bool {
-	return o.GetNamespace() == "kube-system" &&
-		o.GetName() == "metrics-server"
-})
-
-// nodeCountChanges is the Node watch predicate — node add/remove
-// changes the proportional replica total. The formula's
-// includeUnschedulableNodes=true counts EVERY Node object, so updates
-// (cordon flips, ~20s kubelet heartbeats) can never change the count
-// and must not enqueue — only create/delete fire.
-var nodeCountChanges = predicate.Funcs{
-	CreateFunc:  func(event.CreateEvent) bool { return true },
-	DeleteFunc:  func(event.DeleteEvent) bool { return true },
-	UpdateFunc:  func(event.UpdateEvent) bool { return false },
-	GenericFunc: func(event.GenericEvent) bool { return false },
-}
+var onlyMetricsServerDeployment = pinnedworkload.OnlyNamespacedName("kube-system", "metrics-server")
 
 // Setup reconciles only the metrics-server
 // Deployment (the informer sees every kube-system Deployment — the
@@ -124,7 +102,7 @@ var nodeCountChanges = predicate.Funcs{
 // entirely.
 //
 // minReplicas/nodesPerReplica are the CPA-linear replica pin — see
-// proportionalReplicas. minReplicas<=0 disables the pin entirely.
+// pinnedworkload.ReplicaPin. minReplicas<=0 disables the pin entirely.
 func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, configFromEnv, func(cfg metricsServerPatcherConfig) error {
 		logf.Log.WithName(d.Name).Info("registered",
@@ -132,16 +110,13 @@ func Setup(d shared.Deps) error {
 		b := ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
 			For(&appsv1.Deployment{}, builder.WithPredicates(onlyMetricsServerDeployment))
-		if cfg.minReplicas > 0 {
-			// Node add/remove changes the proportional replica total —
-			// see nodeCountChanges for why only create/delete fire.
-			// Collapses to one fixed key: Reconcile ignores the request
-			// name anyway. With the pin disabled the count is never read,
-			// so the watch is not registered at all.
-			b = b.Watches(&corev1.Node{},
-				handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("metrics-server-patcher-sweep")),
-				builder.WithPredicates(nodeCountChanges))
-		}
+		// Node add/remove changes the proportional replica total; the
+		// watch is registered only while the pin is enabled — see
+		// pinnedworkload.ReplicaPin.WatchNodes.
+		b = pinnedworkload.ReplicaPin{
+			MinReplicas:     cfg.minReplicas,
+			NodesPerReplica: cfg.nodesPerReplica,
+		}.WatchNodes(b, "metrics-server-patcher-sweep")
 		return b.Complete(&metricsServerPatcher{cs: d.CS, queue: d.Name,
 			minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica})
 	})
@@ -158,71 +133,29 @@ type metricsServerPatcherConfig struct {
 // knob values must warn even when the module is disabled.
 func configFromEnv() metricsServerPatcherConfig {
 	return metricsServerPatcherConfig{
-		minReplicas:     shared.GetenvInt("METRICS_SERVER_MIN_REPLICAS", 3),
-		nodesPerReplica: shared.GetenvInt("METRICS_SERVER_NODES_PER_REPLICA", 1),
+		minReplicas:     envx.GetenvInt("METRICS_SERVER_MIN_REPLICAS", 3),
+		nodesPerReplica: envx.GetenvInt("METRICS_SERVER_NODES_PER_REPLICA", 1),
 	}
 }
 
+// Reconcile delegates to the shared pinned-Deployment skeleton —
+// this module only supplies the kube-system/metrics-server identity,
+// the drift check and the patch body.
 func (r *metricsServerPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-	res := ctrl.Result{RequeueAfter: 15 * time.Minute}
-
-	d, err := r.cs.AppsV1().Deployments("kube-system").
-		Get(ctx, "metrics-server", metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		// cluster without the k0s metrics-server addon
-		log.Info("SKIP: deployment not found", "deployment", "kube-system/metrics-server")
-		return res, nil
-	}
-	if err != nil {
-		metrics.IncError(r.queue)
-		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/metrics-server: %w", err)
-	}
-
-	// Proportional replica pin — disabled when minReplicas<=0
-	// (wantReplicas stays 0: neither needsPatch nor the patch body
-	// touches .spec.replicas then).
-	wantReplicas := int32(0)
-	if r.minReplicas > 0 {
-		nodes, err := shared.ListNodes(ctx, r.cs)
-		if err != nil {
-			metrics.IncError(r.queue)
-			return ctrl.Result{}, fmt.Errorf("list nodes for proportional replica count: %w", err)
-		}
-		wantReplicas = shared.ProportionalReplicas(len(nodes), r.minReplicas, r.nodesPerReplica)
-	}
-
-	if !metricsServerNeedsPatch(d, wantReplicas) {
-		log.Info("args/probes/resources/topology/tolerations/replicas already pinned - nothing to do",
-			"deployment", "kube-system/metrics-server", "wantReplicas", wantReplicas)
-		return res, nil
-	}
-	// A missing metrics-server container reads as drift, but the
-	// strategic-merge patch below merges containers BY NAME — applied
-	// to a spec without it, it would append a container entry with no
-	// image that the apiserver rejects forever. We cannot reconstruct
-	// the image, so warn and leave the Deployment for the stack
-	// applier rather than emitting a guaranteed-invalid patch.
-	if !shared.PodSpecHasContainer(&d.Spec.Template.Spec, "metrics-server") {
-		log.Info("WARN: metrics-server container missing from pod spec — "+
-			"skipping patch (strategic merge cannot create it without an image)",
-			"deployment", "kube-system/metrics-server")
-		return res, nil
-	}
-	patch, err := metricsServerPatchBody(wantReplicas)
-	if err != nil {
-		metrics.IncError(r.queue)
-		return ctrl.Result{}, fmt.Errorf("render patch body for deployment kube-system/metrics-server: %w", err)
-	}
-	log.Info("PATCH: metrics-server drifted — restoring pinned spec",
-		"deployment", "kube-system/metrics-server", "wantReplicas", wantReplicas)
-	if _, err := r.cs.AppsV1().Deployments("kube-system").Patch(ctx,
-		"metrics-server", types.StrategicMergePatchType,
-		patch, metav1.PatchOptions{}); err != nil {
-		metrics.IncError(r.queue)
-		return ctrl.Result{}, fmt.Errorf("patch deployment kube-system/metrics-server: %w", err)
-	}
-	return res, nil
+	return pinnedworkload.DeploymentSpec{
+		CS:        r.cs,
+		Queue:     r.queue,
+		Namespace: "kube-system",
+		Name:      "metrics-server",
+		Container: "metrics-server",
+		Replicas: pinnedworkload.ReplicaPin{
+			MinReplicas:     r.minReplicas,
+			NodesPerReplica: r.nodesPerReplica,
+		},
+		NoDriftLog: "args/probes/resources/topology/tolerations/replicas already pinned - nothing to do",
+		Drifted:    metricsServerNeedsPatch,
+		PatchBody:  metricsServerPatchBody,
+	}.Reconcile(ctx)
 }
 
 // metricsServerPatchBody renders the pinned CronJob patch plus the

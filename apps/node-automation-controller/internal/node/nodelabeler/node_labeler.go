@@ -32,6 +32,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -80,7 +82,7 @@ var nodeLabelChanges = predicate.Funcs{
 // Setup wires the node-labeler reconciler. configPath is the
 // labels.txt file (default /etc/node-labeler/labels.txt).
 func Setup(d shared.Deps) error {
-	configPath := shared.Getenv("NODE_LABELER_CONFIG_PATH",
+	configPath := envx.Getenv("NODE_LABELER_CONFIG_PATH",
 		"/etc/node-labeler/labels.txt")
 	logf.Log.WithName(d.Name).Info("registered", "configPath", configPath)
 	r := &nodeLabeler{cs: d.CS, queue: d.Name, configPath: configPath}
@@ -103,7 +105,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 	res := ctrl.Result{RequeueAfter: 30 * time.Minute}
 
 	// (a) worker role on every non-control-plane node lacking it.
-	nodes, err := shared.ListNodes(ctx, r.cs)
+	nodes, err := kube.ListNodes(ctx, r.cs)
 	if err != nil {
 		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
@@ -116,13 +118,13 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 	for i := range nodes {
 		n := &nodes[i]
 		byName[n.Name] = n
-		if shared.IsControlPlane(n) {
+		if kube.IsControlPlane(n) {
 			continue
 		}
 		if _, ok := n.Labels[workerRoleLabel]; ok {
 			continue
 		}
-		if err := shared.PatchNodeLabels(ctx, r.cs, n.Name, map[string]string{workerRoleLabel: ""}); err != nil {
+		if err := kube.PatchNodeLabels(ctx, r.cs, n.Name, map[string]string{workerRoleLabel: ""}); err != nil {
 			// bash exit "$failed" here — the metric must surface a
 			// persistent patch failure even though the sweep continues.
 			metrics.IncError(r.queue)
@@ -185,7 +187,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 			if node.Labels[key] == val {
 				continue
 			}
-			if err := shared.PatchNodeLabels(ctx, r.cs, name, map[string]string{key: val}); err != nil {
+			if err := kube.PatchNodeLabels(ctx, r.cs, name, map[string]string{key: val}); err != nil {
 				metrics.IncError(r.queue)
 				log.Info("WARN: cannot label node", "node", name, "label", label, "error", err)
 				continue

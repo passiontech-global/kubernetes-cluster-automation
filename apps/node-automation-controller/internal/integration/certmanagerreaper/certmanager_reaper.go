@@ -37,6 +37,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -59,10 +61,10 @@ const (
 )
 
 var (
-	certificateGVR        = shared.GVRCertificate
-	certificateRequestGVR = shared.GVRCertificateRequest
-	orderGVR              = shared.GVRACMEOrder
-	challengeGVR          = shared.GVRACMEChallenge
+	certificateGVR        = kube.GVRCertificate
+	certificateRequestGVR = kube.GVRCertificateRequest
+	orderGVR              = kube.GVRACMEOrder
+	challengeGVR          = kube.GVRACMEChallenge
 )
 
 // certReset is the per-certificate reset budget tracked in memory.
@@ -93,7 +95,7 @@ type certManagerReaper struct {
 	// the 6h in-RAM half of the W8 CR-reap cooldown (the durable
 	// half shares node.ops/acme-order-resets). CooldownSet is
 	// zero-value ready — no arm needed.
-	crReaped shared.CooldownSet
+	crReaped state.CooldownSet
 	// crCache: per-run CertificateRequest list cache keyed by
 	// namespace — the Order-attribution path and the W8 stuck-CR
 	// path share ONE list per namespace per sweep (a failed list
@@ -132,8 +134,8 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 	r.crCache = map[string]crListResult{}
 	now := r.now.Now()
 
-	certs, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
-		shared.DynamicPage(r.dyn.Resource(certificateGVR).Namespace(metav1.NamespaceAll)))
+	certs, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+		kube.DynamicPage(r.dyn.Resource(certificateGVR).Namespace(metav1.NamespaceAll)))
 	if err != nil {
 		return fmt.Errorf("list certificates: %w", err)
 	}

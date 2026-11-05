@@ -81,6 +81,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -197,7 +198,7 @@ func (g *webhookGuard) takeSnapshot(ctx context.Context) *sweepSnapshot {
 	// "Ready" webhook pod on a partitioned node cannot be called by
 	// the apiserver, so it must not count toward backend health.
 	s.unhealthyNodes = map[string]bool{}
-	nodes, err := shared.ListNodes(ctx, g.cs)
+	nodes, err := kube.ListNodes(ctx, g.cs)
 	s.nodesErr = err
 	if err == nil {
 		for i := range nodes {
@@ -228,11 +229,11 @@ var webhookUnhealthyNodeTaints = []string{
 // cases the apiserver's webhook call to that pod times out, so the
 // endpoint is Ready in name only.
 func nodeUnhealthyForEndpoints(n *corev1.Node) bool {
-	if !shared.NodeReady(n) {
+	if !kube.NodeReady(n) {
 		return true
 	}
 	for _, k := range webhookUnhealthyNodeTaints {
-		if shared.HasTaint(n.Spec.Taints, k) {
+		if kube.HasTaint(n.Spec.Taints, k) {
 			return true
 		}
 	}
@@ -335,9 +336,9 @@ func (g *webhookGuard) readyEndpointCounts(ctx context.Context, snap *sweepSnaps
 	// flap) yields an empty probeSet — the census still counts, the
 	// breaker just sees no probe data (unresponsive stays false).
 	probeSet := webhookBackendServices(snap)
-	err := shared.ListEach(ctx,
+	err := kube.ListEach(ctx,
 		metav1.ListOptions{Limit: listPageSize},
-		shared.EndpointSlices(g.cs, metav1.NamespaceAll),
+		kube.EndpointSlices(g.cs, metav1.NamespaceAll),
 		func(items []discoveryv1.EndpointSlice) error {
 			for _, s := range items {
 				svc := s.Labels[discoveryv1.LabelServiceName]
@@ -488,9 +489,9 @@ func tcpTLSEndpointProber(ctx context.Context, ip string, port int32) bool {
 // the shared three-signal check (node cordon + kured lock +
 // autopilot Plan), exactly like every other deferring module. An
 // earlier version carried a nil-dyn degraded copy that checked
-// spec.unschedulable instead of shared.NodeActivelyCordoned — a
+// spec.unschedulable instead of kube.NodeActivelyCordoned — a
 // statically-cordoned node would then have held the mutex forever;
 // the shared implementation fails closed on a missing dyn instead.
 func (g *webhookGuard) maintenanceActive(ctx context.Context) (bool, string, error) {
-	return shared.MaintenanceActive(ctx, g.cs, g.dyn)
+	return kube.MaintenanceActive(ctx, g.cs, g.dyn)
 }

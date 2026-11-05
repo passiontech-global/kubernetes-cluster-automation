@@ -105,11 +105,11 @@ func TestDeadlockDeletesLowestOrdinal(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-1", "replica", true))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	mustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
-	mustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = base.Add(-4 * time.Minute)
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = base.Add(-4 * time.Minute)
 
-	if res := mustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("deadlocked masterless service must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("db").
@@ -147,11 +147,11 @@ func TestDeadlockWaitsForOperatorSettle(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-1", "replica", true))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	mustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
-	mustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = base.Add(-time.Minute)
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = base.Add(-time.Minute)
 
-	_ = mustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted while the operator heal is still settling")
@@ -170,10 +170,10 @@ func TestDeadlockRequiresOperatorHeal(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-0", "replica", true))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	mustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 
-	_ = mustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted with no operator heal on record")
@@ -193,11 +193,11 @@ func TestDeadlockSkipsWhenMasterPresent(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-1", "replica", true))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	mustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
-	mustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = base.Add(-4 * time.Minute)
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = base.Add(-4 * time.Minute)
 
-	_ = mustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted while a pod already holds the master role")
@@ -216,13 +216,13 @@ func TestDeadlockHealCooldown(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-0", "replica", true))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	mustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
-	mustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = base.Add(-4 * time.Minute)
-	mustCheck[*statefulMasterlessCheck](t, p).drPodHealed.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = base.Add(-4 * time.Minute)
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drPodHealed.
 		Stamp("db/dragonfly", base.Add(-10*time.Minute))
 
-	_ = mustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted inside the 30m deadlock cooldown")
@@ -242,11 +242,11 @@ func TestDeadlockMaintenanceDefers(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-0", "replica", true))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
-	mustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
-	mustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = base.Add(-4 * time.Minute)
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = base.Add(-4 * time.Minute)
 
-	_ = mustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted during maintenance")

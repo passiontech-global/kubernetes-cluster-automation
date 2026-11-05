@@ -13,7 +13,7 @@
 //
 // The first-seen streak and emitted-gauge bookkeeping these checks
 // used to share on deps.ledger lives per check as
-// shared.FirstSeenLedger / shared.GaugeLedger[string] fields (the
+// state.FirstSeenLedger / state.GaugeLedger[string] fields (the
 // zero values are usable — the serial sweep needs no locking).
 package probefw
 
@@ -27,8 +27,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // The linkerd control-plane identifiers two domain checks both key
@@ -54,7 +55,7 @@ const DragonflyOperatorNS = "dragonfly-operator-system"
 // env var is re-read per call (tests Setenv mid-test).
 func (d *Deps) PromEndpoint() (string, error) {
 	return promq.ResolveEndpoint(
-		shared.Getenv("HEALTH_PROMETHEUS_QUERY_URL", ""), d.Cfg.HTTPContent.URL)
+		envx.Getenv("HEALTH_PROMETHEUS_QUERY_URL", ""), d.Cfg.HTTPContent.URL)
 }
 
 // PromQuery runs an instant PromQL query against the resolved
@@ -86,7 +87,7 @@ func (d *Deps) DeletePodHeal(ctx context.Context, log logr.Logger,
 			"target", targetKey)
 		return
 	}
-	held, why, err := shared.MaintenanceActive(ctx, d.CS, d.Dyn)
+	held, why, err := kube.MaintenanceActive(ctx, d.CS, d.Dyn)
 	if err != nil {
 		metrics.IncError(d.Name)
 		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",

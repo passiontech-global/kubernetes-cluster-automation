@@ -26,6 +26,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -78,10 +79,10 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 	// Running/Pending pod in the cluster to throw them away below.
 	// The in-code phase check stays — fake clientsets ignore field
 	// selectors and the belt costs nothing.
-	pods, err := shared.ListAll(ctx, metav1.ListOptions{
+	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		FieldSelector: "status.phase=" + string(corev1.PodFailed),
 		Limit:         evictedPodListPageSize,
-	}, shared.Pods(j.cs, metav1.NamespaceAll))
+	}, kube.Pods(j.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list failed pods: %w", err) // periodic wrapper IncErrors j.queue
 	}
@@ -136,7 +137,7 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 		// UID precondition: the listed object is what we vetted — a
 		// same-named pod recreated in between is not ours to reap.
 		if err := j.cs.CoreV1().Pods(t.ns).Delete(ctx, t.name,
-			shared.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground)); err != nil {
+			kube.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground)); err != nil {
 			metrics.IncError(j.queue)
 			log.Error(err, "pod delete failed",
 				"pod", t.ns+"/"+t.name, "node", t.node, "reason", t.reason)

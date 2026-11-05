@@ -19,7 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // stalledDeployment resolves which Deployment helm was waiting on.
@@ -31,7 +31,7 @@ import (
 func (u *helmReleaseUnlocker) stalledDeployment(ctx context.Context,
 	hr *unstructured.Unstructured) (*appsv1.Deployment, string, error) {
 	releaseNS := hrReleaseNS(hr)
-	for _, c := range shared.Conditions(hr.Object, "status", "conditions") {
+	for _, c := range kube.Conditions(hr.Object, "status", "conditions") {
 		m := stalledWorkloadRe.FindStringSubmatch(c.Message)
 		if m == nil {
 			continue

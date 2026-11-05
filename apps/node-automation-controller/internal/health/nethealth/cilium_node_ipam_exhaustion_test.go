@@ -37,7 +37,7 @@ func TestCiliumIPAMExhaustionFailsAndReapsTerminalPods(t *testing.T) {
 	testutil.EmulatePodNodeNameSelector(cs)
 	p := testProber(cs) // dead prom -> pod-count fallback
 
-	res := mustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatalf("exhausted node must fail: %+v", res)
 	}
@@ -59,7 +59,7 @@ func TestCiliumIPAMHealthyNodePasses(t *testing.T) {
 		Spec: corev1.NodeSpec{PodCIDR: "10.240.1.0/24"}}
 	cs := fake.NewSimpleClientset(node)
 	p := testProber(cs)
-	if res := mustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("empty /24 must pass: %+v", res)
 	}
 }

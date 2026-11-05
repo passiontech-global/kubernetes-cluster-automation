@@ -20,7 +20,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -46,7 +46,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 	if backups != nil {
 		for i := range backups.Items {
 			b := &backups.Items[i]
-			phase, _ := shared.NestedString(b.Object, "status", "phase")
+			phase, _ := kube.NestedString(b.Object, "status", "phase")
 			if phase != "InProgress" && phase != "Deleting" {
 				continue
 			}
@@ -77,7 +77,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 	cleaned := 0
 	for i := range pvbs.Items {
 		pvb := &pvbs.Items[i]
-		phase, _ := shared.NestedString(pvb.Object, "status", "phase")
+		phase, _ := kube.NestedString(pvb.Object, "status", "phase")
 		if phase != "InProgress" && phase != "Deleting" {
 			continue
 		}
@@ -114,7 +114,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 // creationTimestamp — the same convention flagBadBackup uses.
 func inFlightSince(u *unstructured.Unstructured) time.Time {
 	since := u.GetCreationTimestamp().Time
-	if st, ok := shared.NestedString(u.Object, "status", "startTimestamp"); ok {
+	if st, ok := kube.NestedString(u.Object, "status", "startTimestamp"); ok {
 		if t, err := time.Parse(time.RFC3339, st); err == nil {
 			since = t
 		}
@@ -141,7 +141,7 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 	ns, name := pvb.GetNamespace(), pvb.GetName()
 	uid := pvb.GetUID()
 	if err := a.dyn.Resource(veleroPVBGVR).Namespace(ns).Delete(ctx, name,
-		shared.UIDDeleteOptions(uid, "")); err != nil && !apierrors.IsNotFound(err) {
+		kube.UIDDeleteOptions(uid, "")); err != nil && !apierrors.IsNotFound(err) {
 		log.Error(err, "wedged pvb delete failed", "pvb", ns+"/"+name)
 		metrics.IncError(a.queue)
 		return false
@@ -157,7 +157,7 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 	if agent != nil {
 		agentUID := agent.UID
 		if err := a.cs.CoreV1().Pods(agent.Namespace).Delete(ctx, agent.Name,
-			shared.UIDDeleteOptions(agentUID, "")); err != nil && !apierrors.IsNotFound(err) {
+			kube.UIDDeleteOptions(agentUID, "")); err != nil && !apierrors.IsNotFound(err) {
 			log.Error(err, "node-agent bounce failed",
 				"pod", agent.Namespace+"/"+agent.Name)
 			metrics.IncError(a.queue)
@@ -180,19 +180,19 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 func (a *veleroBackupAuditor) pvbAgentPod(ctx context.Context,
 	pvb *unstructured.Unstructured) (*corev1.Pod, error) {
 	ns := pvb.GetNamespace()
-	node, ok := shared.NestedString(pvb.Object, "spec", "node")
+	node, ok := kube.NestedString(pvb.Object, "spec", "node")
 	if !ok || node == "" {
 		// Older velero wrote the node under status — accept it as a
 		// fallback so pre-upgrade PVBs still resolve.
-		node, _ = shared.NestedString(pvb.Object, "status", "node")
+		node, _ = kube.NestedString(pvb.Object, "status", "node")
 	}
 	if node == "" {
 		return nil, nil
 	}
-	pods, err := shared.ListAll(ctx, metav1.ListOptions{
+	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		FieldSelector: "spec.nodeName=" + node,
 		Limit:         veleroListPageSize,
-	}, shared.Pods(a.cs, ns))
+	}, kube.Pods(a.cs, ns))
 	if err != nil {
 		return nil, err
 	}
