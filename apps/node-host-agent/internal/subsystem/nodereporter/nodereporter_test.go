@@ -18,6 +18,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+
+	nhatestutil "github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
 )
 
 // env is the shared fixture: tempdir watchdog state dir + log file, a
@@ -69,7 +71,7 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 			ObjectMeta: metav1.ObjectMeta{Name: "n1"},
 		}}
 	}
-	e.cs = fake.NewSimpleClientset(objs...)
+	e.cs = nhatestutil.FakeKube(objs...)
 	e.reg = prometheus.NewRegistry()
 	r, err := New(Config{
 		NodeName:         "n1",
@@ -141,7 +143,7 @@ func TestNewRequiresClientAndNode(t *testing.T) {
 	if _, err := New(Config{NodeName: "n1"}, nil); err == nil {
 		t.Fatal("expected error for nil Client")
 	}
-	cs := fake.NewSimpleClientset()
+	cs := nhatestutil.FakeKube()
 	if _, err := New(Config{Client: cs}, nil); err == nil {
 		t.Fatal("expected error for empty NodeName")
 	}

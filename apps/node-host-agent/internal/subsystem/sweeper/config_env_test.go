@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/client-go/kubernetes/fake"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestConfigFromEnv(t *testing.T) {
@@ -15,7 +15,7 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("NODE_HOST_AGENT_MOUNTS_FILE", "/host/proc/mounts")
 	t.Setenv("NODE_HOST_AGENT_REQUEST_TIMEOUT", "5s")
 
-	cs := fake.NewSimpleClientset()
+	cs := testutil.FakeKube()
 	cfg := ConfigFromEnv(EnvDeps{Client: cs})
 	if cfg.Client != cs {
 		t.Fatal("ConfigFromEnv did not pass the client through")

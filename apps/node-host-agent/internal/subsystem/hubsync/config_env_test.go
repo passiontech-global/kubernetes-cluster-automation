@@ -3,14 +3,14 @@ package hubsync
 import (
 	"testing"
 
-	"k8s.io/client-go/kubernetes/fake"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", "/keys/converge")
 	t.Setenv("NODE_HOST_AGENT_NEBULA_CERTS_DIR", "/certs")
 
-	cs := fake.NewSimpleClientset()
+	cs := testutil.FakeKube()
 	cfg := ConfigFromEnv(EnvDeps{
 		Client:      cs,
 		Identity:    "pod-abc",

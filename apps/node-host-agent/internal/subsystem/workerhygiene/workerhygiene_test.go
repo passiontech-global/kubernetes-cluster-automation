@@ -30,6 +30,7 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	nhatestutil "github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
 )
 
 // env is the fixture: tempdir host trees + a stubbed kill function +
@@ -132,7 +133,7 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 	// konnectivity expected IP. Tests that need the gate OFF remove it.
 	writeFile(t, e.unit, "[Service]\nExecStart=/usr/bin/k0s worker --node-ip=10.1.2.3\n")
 
-	e.cs = fake.NewSimpleClientset(objs...)
+	e.cs = nhatestutil.FakeKube(objs...)
 	// Host up 2h — the uptime file feeds BOTH the Cycle G1 uptime
 	// gate (hostutil.UptimeSeconds)
 	// and systemd.ActiveAge's monotonic compare, so one file is one

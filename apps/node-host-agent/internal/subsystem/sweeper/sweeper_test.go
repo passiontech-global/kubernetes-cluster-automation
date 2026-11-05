@@ -17,6 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+
+	nhatestutil "github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
 )
 
 const pvcUUID = "pvc-12345678-90ab-cdef-1234-567890abcdef"
@@ -84,7 +86,7 @@ func skipCount(t *testing.T, s *Sweeper, reason string) float64 {
 func TestSweepOrphanDirDeleted(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	s, base, _ := fixture(t, nhatestutil.FakeKube(other))
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 
 	s.Sweep(context.Background())
@@ -101,7 +103,7 @@ func TestSweepOrphanDirDeleted(t *testing.T) {
 }
 
 func TestAbortWhenPVListEmptyAndDirsExist(t *testing.T) {
-	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	s, base, _ := fixture(t, nhatestutil.FakeKube())
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 
 	s.Sweep(context.Background())
@@ -115,7 +117,7 @@ func TestAbortWhenPVListEmptyAndDirsExist(t *testing.T) {
 }
 
 func TestAbortOnPVListError(t *testing.T) {
-	cs := fake.NewSimpleClientset()
+	cs := nhatestutil.FakeKube()
 	cs.PrependReactor("list", "persistentvolumes",
 		func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("apiserver down")
@@ -136,7 +138,7 @@ func TestAbortOnPVListError(t *testing.T) {
 func TestSkipNameMismatch(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	s, base, _ := fixture(t, nhatestutil.FakeKube(other))
 	dir := mkPVC(t, base, "pvc-not-a-uuid", 2*time.Hour)
 
 	s.Sweep(context.Background())
@@ -152,7 +154,7 @@ func TestSkipNameMismatch(t *testing.T) {
 func TestSkipTooYoung(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	s, base, _ := fixture(t, nhatestutil.FakeKube(other))
 	dir := mkPVC(t, base, pvcUUID, 10*time.Minute) // younger than 60m MinAge
 
 	s.Sweep(context.Background())
@@ -167,7 +169,7 @@ func TestSkipTooYoung(t *testing.T) {
 
 func TestSkipPVStillBound(t *testing.T) {
 	pv := mkPV(pvcUUID, "Bound", corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, _ := fixture(t, fake.NewSimpleClientset(pv))
+	s, base, _ := fixture(t, nhatestutil.FakeKube(pv))
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 
 	s.Sweep(context.Background())
@@ -185,7 +187,7 @@ func TestReleasedPVClaimRefGoneDeletesPVAndDir(t *testing.T) {
 	pv.Finalizers = []string{"kubernetes.io/pv-protection"}
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	cs := fake.NewSimpleClientset(pv, other)
+	cs := nhatestutil.FakeKube(pv, other)
 	s, base, _ := fixture(t, cs)
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 
@@ -205,7 +207,7 @@ func TestReleasedPVClaimRefExistsSkips(t *testing.T) {
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "data"},
 	}
-	cs := fake.NewSimpleClientset(pv, pvc)
+	cs := nhatestutil.FakeKube(pv, pvc)
 	s, base, _ := fixture(t, cs)
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 
@@ -221,7 +223,7 @@ func TestReleasedPVClaimRefExistsSkips(t *testing.T) {
 
 func TestReleasedPVClaimRefGetErrorSkips(t *testing.T) {
 	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "app", "data")
-	cs := fake.NewSimpleClientset(pv)
+	cs := nhatestutil.FakeKube(pv)
 	cs.PrependReactor("get", "persistentvolumeclaims",
 		func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewServiceUnavailable("api degraded")
@@ -242,7 +244,7 @@ func TestReleasedPVClaimRefGetErrorSkips(t *testing.T) {
 func TestReGetNonNotFoundErrorSkips(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	cs := fake.NewSimpleClientset(other)
+	cs := nhatestutil.FakeKube(other)
 	cs.PrependReactor("get", "persistentvolumes",
 		func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewInternalError(errors.New("etcd slow"))
@@ -263,7 +265,7 @@ func TestReGetNonNotFoundErrorSkips(t *testing.T) {
 func TestMountInsideDirSkips(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, mountsFile := fixture(t, fake.NewSimpleClientset(other))
+	s, base, mountsFile := fixture(t, nhatestutil.FakeKube(other))
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 	// Host mount table shows a mount inside the candidate dir.
 	mounts := "overlay " + dir + "/rootfs overlay rw 0 0\n" +
@@ -285,7 +287,7 @@ func TestMountInsideDirSkips(t *testing.T) {
 func TestMountAtDirSkips(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, mountsFile := fixture(t, fake.NewSimpleClientset(other))
+	s, base, mountsFile := fixture(t, nhatestutil.FakeKube(other))
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 	mounts := "tmpfs " + dir + " tmpfs rw 0 0\n"
 	if err := os.WriteFile(mountsFile, []byte(mounts), 0o644); err != nil {
@@ -306,7 +308,7 @@ func TestMountAtDirSkips(t *testing.T) {
 func TestMountAppearingMidSweepSkips(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	cs := fake.NewSimpleClientset(other)
+	cs := nhatestutil.FakeKube(other)
 	s, base, mountsFile := fixture(t, cs)
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 	cs.PrependReactor("get", "persistentvolumes",
@@ -332,7 +334,7 @@ func TestMountAppearingMidSweepSkips(t *testing.T) {
 func TestMaxDeleteCap(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	s, base, _ := fixture(t, nhatestutil.FakeKube(other))
 	s.cfg.MaxDelete = 2
 	var dirs []string
 	for i := 0; i < 4; i++ {
@@ -364,7 +366,7 @@ func TestMaxDeleteCountsPVObjectDelete(t *testing.T) {
 	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "", "")
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	cs := fake.NewSimpleClientset(pv, other)
+	cs := nhatestutil.FakeKube(pv, other)
 	s, base, _ := fixture(t, cs)
 	s.cfg.MaxDelete = 1
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
@@ -394,7 +396,7 @@ func TestUnescapeMountField(t *testing.T) {
 }
 
 func TestName(t *testing.T) {
-	s, _, _ := fixture(t, fake.NewSimpleClientset())
+	s, _, _ := fixture(t, nhatestutil.FakeKube())
 	if s.Name() != "sweeper" {
 		t.Fatalf("Name()=%q want %q", s.Name(), "sweeper")
 	}
@@ -405,7 +407,7 @@ func TestApplyDefaults(t *testing.T) {
 	// mount-boundary string compare in mountedInside.
 	s, err := New(Config{
 		BaseDir: "/var/openebs/local/",
-		Client:  fake.NewSimpleClientset(),
+		Client:  nhatestutil.FakeKube(),
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -414,7 +416,7 @@ func TestApplyDefaults(t *testing.T) {
 		t.Fatalf("BaseDir=%q want trailing slash trimmed", s.cfg.BaseDir)
 	}
 
-	s, err = New(Config{Client: fake.NewSimpleClientset()}, nil)
+	s, err = New(Config{Client: nhatestutil.FakeKube()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +449,7 @@ func TestUsedBytes(t *testing.T) {
 }
 
 func TestRunSweepsOnceThenStopsOnCancel(t *testing.T) {
-	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	s, base, _ := fixture(t, nhatestutil.FakeKube())
 	s.cfg.BaseDir = filepath.Join(base, "gone") // absent → cheap no-op sweep
 	s.cfg.Interval = time.Hour                  // only the immediate sweep runs
 
@@ -475,7 +477,7 @@ func TestRunSweepsOnceThenStopsOnCancel(t *testing.T) {
 }
 
 func TestSweepBaseDirAbsent(t *testing.T) {
-	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	s, base, _ := fixture(t, nhatestutil.FakeKube())
 	s.cfg.BaseDir = filepath.Join(base, "gone")
 
 	s.Sweep(context.Background())
@@ -489,7 +491,7 @@ func TestSweepBaseDirAbsent(t *testing.T) {
 }
 
 func TestSweepBaseDirIsFile(t *testing.T) {
-	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	s, base, _ := fixture(t, nhatestutil.FakeKube())
 	f := filepath.Join(base, "not-a-dir")
 	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
@@ -504,7 +506,7 @@ func TestSweepBaseDirIsFile(t *testing.T) {
 }
 
 func TestListPVDirsError(t *testing.T) {
-	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	s, base, _ := fixture(t, nhatestutil.FakeKube())
 	f := filepath.Join(base, "not-a-dir")
 	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
@@ -521,7 +523,7 @@ func TestAbortWhenBaseDirUnreadable(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root — permission bits are not enforced")
 	}
-	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	s, base, _ := fixture(t, nhatestutil.FakeKube())
 	if err := os.Chmod(base, 0o000); err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +539,7 @@ func TestAbortWhenBaseDirUnreadable(t *testing.T) {
 func TestZeroDirsSkipsPVList(t *testing.T) {
 	// No pvc-* candidates on disk → the whole-cluster PV List is
 	// skipped entirely; the reactor fails the test if it ever runs.
-	cs := fake.NewSimpleClientset()
+	cs := nhatestutil.FakeKube()
 	listed := 0
 	cs.PrependReactor("list", "persistentvolumes",
 		func(k8stesting.Action) (bool, runtime.Object, error) {
@@ -576,7 +578,7 @@ func TestStatfsErrorTolerated(t *testing.T) {
 	// delete orphans; statfs feeds logging/bytesFreed only.
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	s, base, _ := fixture(t, nhatestutil.FakeKube(other))
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 
 	s.Sweep(context.Background())
@@ -592,7 +594,7 @@ func TestStatfsErrorTolerated(t *testing.T) {
 func TestBytesFreedCounted(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	s, base, _ := fixture(t, nhatestutil.FakeKube(other))
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 
 	// statfs call order per cycle: uStart, u0 (pre-rm), u1 (post-rm),
@@ -620,7 +622,7 @@ func TestBytesFreedCounted(t *testing.T) {
 func TestMountsFileUnreadableSkips(t *testing.T) {
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, mountsFile := fixture(t, fake.NewSimpleClientset(other))
+	s, base, mountsFile := fixture(t, nhatestutil.FakeKube(other))
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 	if err := os.Remove(mountsFile); err != nil {
 		t.Fatal(err)
@@ -641,7 +643,7 @@ func TestReleasedPVPatchFailsSkips(t *testing.T) {
 	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "", "")
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	cs := fake.NewSimpleClientset(pv, other)
+	cs := nhatestutil.FakeKube(pv, other)
 	cs.PrependReactor("patch", "persistentvolumes",
 		func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewInternalError(errors.New("patch denied"))
@@ -663,7 +665,7 @@ func TestReleasedPVDeleteFailsSkips(t *testing.T) {
 	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "", "")
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	cs := fake.NewSimpleClientset(pv, other)
+	cs := nhatestutil.FakeKube(pv, other)
 	cs.PrependReactor("delete", "persistentvolumes",
 		func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewInternalError(errors.New("delete denied"))
@@ -686,7 +688,7 @@ func TestReGetPVReturnsObjectSkips(t *testing.T) {
 	// must not be removed (fail closed on a reappearing PV).
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	cs := fake.NewSimpleClientset(other)
+	cs := nhatestutil.FakeKube(other)
 	cs.PrependReactor("get", "persistentvolumes",
 		func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, mkPV(pvcUUID, "Bound",
@@ -710,7 +712,7 @@ func TestMountEscapedPathInsideDirSkips(t *testing.T) {
 	// unescape must happen before the boundary compare.
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, mountsFile := fixture(t, fake.NewSimpleClientset(other))
+	s, base, mountsFile := fixture(t, nhatestutil.FakeKube(other))
 	spaceBase := filepath.Join(base, "my base")
 	if err := os.MkdirAll(spaceBase, 0o755); err != nil {
 		t.Fatal(err)
@@ -740,7 +742,7 @@ func TestNewRegisterError(t *testing.T) {
 	reg.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_sweeper_cycles_total",
 	}))
-	_, err := New(Config{Client: fake.NewSimpleClientset()}, reg)
+	_, err := New(Config{Client: nhatestutil.FakeKube()}, reg)
 	if err == nil || !strings.Contains(err.Error(), "register sweeper metrics") {
 		t.Fatalf("New err=%v want 'register sweeper metrics'", err)
 	}
@@ -749,7 +751,7 @@ func TestNewRegisterError(t *testing.T) {
 func TestRunTicksSweepAgain(t *testing.T) {
 	// The ticker branch: Interval small enough to fire within the
 	// test deadline — cycles accumulate, then cancel stops Run.
-	s, base, _ := fixture(t, fake.NewSimpleClientset())
+	s, base, _ := fixture(t, nhatestutil.FakeKube())
 	s.cfg.BaseDir = filepath.Join(base, "gone") // absent → cheap no-op sweep
 	s.cfg.Interval = 20 * time.Millisecond
 
@@ -780,7 +782,7 @@ func TestSweepCtxCancelledInDirLoop(t *testing.T) {
 	// examined gauge) instead of returning uncounted.
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	s, base, _ := fixture(t, nhatestutil.FakeKube(other))
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -818,7 +820,7 @@ func TestStatErrorOnChildDirSkips(t *testing.T) {
 	}
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	s, base, _ := fixture(t, nhatestutil.FakeKube(other))
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 	if err := os.Chmod(base, 0o400); err != nil {
 		t.Fatal(err)
@@ -848,7 +850,7 @@ func TestRemoveAllFailureWarns(t *testing.T) {
 	}
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
-	s, base, _ := fixture(t, fake.NewSimpleClientset(other))
+	s, base, _ := fixture(t, nhatestutil.FakeKube(other))
 	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
 	if err := os.Chmod(base, 0o555); err != nil {
 		t.Fatal(err)

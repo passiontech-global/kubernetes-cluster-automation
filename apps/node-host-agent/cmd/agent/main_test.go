@@ -21,13 +21,13 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/hostconverge"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostconfig"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
 )
 
 // Env-parse semantics live in internal/platform/envx (envx_test.go
@@ -530,7 +530,7 @@ func enableBothKubeConsumers(t *testing.T) {
 // csOnce — the clientset is built exactly once for the process.
 func TestCsOnceSharesOneClientset(t *testing.T) {
 	calls := stubKubeClient(t, func() (kubernetes.Interface, error) {
-		return fake.NewSimpleClientset(), nil
+		return testutil.FakeKube(), nil
 	})
 	enableBothKubeConsumers(t)
 
@@ -580,7 +580,7 @@ func TestCsOnceErrorRetried(t *testing.T) {
 // standalone does not — and an explicit env override still wins.
 func TestStandaloneDefaultFlips(t *testing.T) {
 	stubKubeClient(t, func() (kubernetes.Interface, error) {
-		return fake.NewSimpleClientset(), nil
+		return testutil.FakeKube(), nil
 	})
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
@@ -1014,7 +1014,7 @@ func TestHubsyncGating(t *testing.T) {
 
 	t.Run("no key → registered, polls for key", func(t *testing.T) {
 		stubKubeClient(t, func() (kubernetes.Interface, error) {
-			return fake.NewSimpleClientset(), nil
+			return testutil.FakeKube(), nil
 		})
 		t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY",
 			filepath.Join(sandboxed, "absent"))
@@ -1031,7 +1031,7 @@ func TestHubsyncGating(t *testing.T) {
 
 	t.Run("key + kube client → on", func(t *testing.T) {
 		stubKubeClient(t, func() (kubernetes.Interface, error) {
-			return fake.NewSimpleClientset(), nil
+			return testutil.FakeKube(), nil
 		})
 		t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", writeEd25519Key(t))
 		cfg, _ := buildAgentConfig("n", "pod-a", "ns", "v",
@@ -1058,7 +1058,7 @@ func TestHubsyncGating(t *testing.T) {
 
 	t.Run("standalone never runs hubsync", func(t *testing.T) {
 		stubKubeClient(t, func() (kubernetes.Interface, error) {
-			return fake.NewSimpleClientset(), nil
+			return testutil.FakeKube(), nil
 		})
 		t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", writeEd25519Key(t))
 		cfg, _ := buildAgentConfig("n", "pod-a", "ns", "v",
