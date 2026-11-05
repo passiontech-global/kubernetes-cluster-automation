@@ -41,6 +41,16 @@ type wiring struct {
 	reg        *prometheus.Registry
 	subsystems []agent.Subsystem
 
+	// Per-descriptor wire outcome, recorded by resolveAndBuild:
+	// resolved is the RESOLVED enable mode (env flag vs default,
+	// ModeAuto run through Auto) — true even when a needs-gate or
+	// Build failure keeps the subsystem out of w.subsystems; built
+	// marks only the descriptors that appended. The startup log
+	// splits the missing names on the pair: resolved-off → "off",
+	// resolved-on-but-not-built → "skipped".
+	resolved map[string]bool
+	built    map[string]bool
+
 	csOnce     func() (kubernetes.Interface, error)
 	wdCfg      *watchdogconf.Config
 	wdReloader *watchdogconf.Reloader
@@ -396,35 +406,37 @@ func (w *wiring) descriptors() []Descriptor {
 }
 
 // resolveAndBuild drives one descriptor: resolve the enable mode,
-// apply the needs-gates, Build, append. The named result is the
-// RESOLVED enable mode — needs-gate skips and Build failures still
-// report it (it is not "subsystem constructed"), so the caller can
-// report the apiprober flag on the startup log line even when
-// construction failed.
-func (w *wiring) resolveAndBuild(d Descriptor) (enabled bool) {
-	enabled = true
+// apply the needs-gates, Build, append. The resolved mode lands in
+// w.resolved BEFORE the gates run — a needs-gate skip or Build
+// failure still counts as "resolved on" (it is not "subsystem
+// constructed"), so the startup log can tell configured-off apart
+// from wanted-but-held-back. w.built marks only the descriptors
+// that actually appended a subsystem.
+func (w *wiring) resolveAndBuild(d Descriptor) {
+	resolved := true
 	if d.EnvFlag != "" {
 		switch mode := envx.ModeEnv(d.EnvFlag, d.Default); mode {
 		case envx.ModeOff:
-			enabled = false
+			resolved = false
 		case envx.ModeAuto:
-			enabled = d.Auto != nil && d.Auto(w)
+			resolved = d.Auto != nil && d.Auto(w)
 		}
 	}
-	if !enabled {
-		return enabled
+	w.resolved[d.Name] = resolved
+	if !resolved {
+		return
 	}
 	if d.Needs.PodModeOnly && w.standalone {
-		return enabled
+		return
 	}
 	if d.Needs.NodeName && w.hnode == "" {
 		logger().Error(d.Name + " disabled: node name empty " +
 			"(NODE_HOST_AGENT_NODE_NAME/NODE_NAME unset)")
-		return enabled
+		return
 	}
 	if d.Needs.PodName && w.podName == "" {
 		logger().Error(d.Name + " disabled: pod name empty (POD_NAME unset)")
-		return enabled
+		return
 	}
 	var cs kubernetes.Interface
 	if d.Needs.Kube {
@@ -432,20 +444,20 @@ func (w *wiring) resolveAndBuild(d Descriptor) (enabled bool) {
 		if cs, err = w.csOnce(); err != nil {
 			logger().Error(d.Name+" disabled: cannot build kubernetes client",
 				"error", err)
-			return enabled
+			return
 		}
 	}
 	sub, err := d.Build(w, cs)
 	if err != nil {
 		logger().Error(d.Name+" setup failed", "error", err)
-		return enabled
+		return
 	}
 	if sub == nil {
-		return enabled // Build already logged its own failure
+		return // Build already logged its own failure
 	}
 	w.subsystems = append(w.subsystems, sub)
+	w.built[d.Name] = true
 	if d.Extra != nil {
 		d.Extra(w, sub)
 	}
-	return enabled
 }

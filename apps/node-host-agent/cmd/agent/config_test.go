@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +15,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
-// Env-parse semantics live in internal/platform/envx (envx_test.go
+// Env-parse semantics live in libs/hostkit/envx (envx_test.go
 // covers them); only the warn behaviour cmd/agent operators see is
 // still asserted here.
 
@@ -71,12 +72,12 @@ func TestBuildAgentConfigSubsystems(t *testing.T) {
 
 	t.Run("all disabled", func(t *testing.T) {
 		disableAllSubsystems(t)
-		cfg, apiproberOn := buildAgentConfig(testAgentParams("n", "p", false))
+		cfg, report := buildAgentConfig(testAgentParams("n", "p", false))
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%d want 0", len(cfg.Subsystems))
 		}
-		if apiproberOn {
-			t.Fatal("apiproberEnabled=true want false")
+		if !slices.Contains(report.Off, "apiprober") {
+			t.Fatalf("report.Off=%v missing apiprober", report.Off)
 		}
 		if cfg.Registry == nil {
 			t.Fatal("Registry is nil")
@@ -136,9 +137,9 @@ users:
 		// "auto" is the production default — the prober enables
 		// itself without a socket gate.
 		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto")
-		cfg, apiproberOn := buildAgentConfig(testAgentParams("n", "p", false))
-		if !apiproberOn {
-			t.Fatal("apiproberEnabled=false want true (auto default)")
+		cfg, report := buildAgentConfig(testAgentParams("n", "p", false))
+		if slices.Contains(report.Off, "apiprober") {
+			t.Fatalf("apiprober resolved off want on (auto default): %+v", report)
 		}
 		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "apiprober" {
 			t.Fatalf("subsystems=%v want [apiprober]", names)
@@ -165,9 +166,11 @@ users:
 		disableAllSubsystems(t)
 		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto")
 		t.Setenv("NODE_HOST_AGENT_APIPROBER_MODE", "bogus")
-		cfg, apiproberOn := buildAgentConfig(testAgentParams("n", "p", false))
-		if !apiproberOn {
-			t.Fatal("apiproberEnabled=false want true")
+		cfg, report := buildAgentConfig(testAgentParams("n", "p", false))
+		// Resolved ON (auto) but Build failed — that is exactly the
+		// skipped bucket the startup log reports.
+		if !slices.Contains(report.Skipped, "apiprober") {
+			t.Fatalf("report.Skipped=%v missing apiprober", report.Skipped)
 		}
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%d want 0 (apiprober setup failed, not fatal)", len(cfg.Subsystems))
