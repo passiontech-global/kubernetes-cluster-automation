@@ -15,6 +15,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/apiprober"
@@ -61,7 +62,7 @@ type wiring struct {
 
 // --- sweeper: openebs orphan pvc-* dir cleanup ---
 func (w *wiring) wireSweeper() {
-	if envBool("NODE_HOST_AGENT_ENABLE_SWEEPER", w.defKube) {
+	if envx.Bool("NODE_HOST_AGENT_ENABLE_SWEEPER", w.defKube) {
 		cs, err := w.csOnce()
 		if err != nil {
 			// Not fatal: the metrics/probe endpoints and other
@@ -84,7 +85,7 @@ func (w *wiring) wireSweeper() {
 // nodes running concourse workers, so standalone hosts default it
 // off. Replaces the old CronJob + pods/exec path.
 func (w *wiring) wireConcourseCache() {
-	if envBool("NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE", w.defKube) {
+	if envx.Bool("NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE", w.defKube) {
 		knobs := sweeper.ConcourseCacheFromEnv()
 		pr, err := sweeper.NewConcourseCachePruner(knobs.Config, w.reg)
 		if err != nil {
@@ -114,7 +115,7 @@ func (w *wiring) wireConcourseCache() {
 //
 // Returns the enabled flag for the startup log line.
 func (w *wiring) wireApiprober() bool {
-	apiproberEnabled := getenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto") != "false"
+	apiproberEnabled := envx.String("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto") != "false"
 	if apiproberEnabled {
 		pb, err := apiprober.New(apiprober.ConfigFromEnv(apiprober.EnvDeps{
 			Watchdog:         w.wdCfg,
@@ -132,7 +133,7 @@ func (w *wiring) wireApiprober() bool {
 
 // --- hostmetrics: scrape-time collector ---
 func (w *wiring) wireHostmetrics() {
-	if envBool("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", true) {
+	if envx.Bool("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", true) {
 		hm := hostmetrics.New(hostmetrics.ConfigFromEnv(hostmetrics.EnvDeps{
 			NodeName:            w.hnode,
 			WatchdogStateDir:    w.watchdogStateDir,
@@ -152,7 +153,7 @@ func (w *wiring) wireHostmetrics() {
 		if w.standalone {
 			w.subsystems = append(w.subsystems, cycle.Every(
 				"hostmetrics-textfile",
-				envDuration("NODE_HOST_AGENT_TEXTFILE_INTERVAL",
+				envx.Duration("NODE_HOST_AGENT_TEXTFILE_INTERVAL",
 					30*time.Second),
 				func(ctx context.Context) {
 					if err := hm.WriteTextfile(w.textfileDir); err != nil {
@@ -169,7 +170,7 @@ func (w *wiring) wireHostmetrics() {
 // kube client; either missing skips the subsystem — never aborts
 // the agent.
 func (w *wiring) wireWorkerHygiene() {
-	if envBool("NODE_HOST_AGENT_ENABLE_HYGIENE", w.defKube) {
+	if envx.Bool("NODE_HOST_AGENT_ENABLE_HYGIENE", w.defKube) {
 		// DaemonSet sets NODE_HOST_AGENT_NODE_NAME and NODE_NAME via
 		// the downward API — prefer the explicit override env.
 		switch {
@@ -209,7 +210,7 @@ func (w *wiring) wireWorkerHygiene() {
 // --- nethealth: DNS/overlay/nebula/fail2ban watchdog modules ---
 // Runs on workers AND hub nodes; no kube client needed.
 func (w *wiring) wireNethealth() {
-	if envBool("NODE_HOST_AGENT_ENABLE_NETHEALTH", true) {
+	if envx.Bool("NODE_HOST_AGENT_ENABLE_NETHEALTH", true) {
 		nh, err := nethealth.New(nethealth.ConfigFromEnv(nethealth.EnvDeps{
 			WatchdogStateDir: w.watchdogStateDir,
 			WatchdogLogFile:  w.watchdogLogFile,
@@ -233,7 +234,7 @@ func (w *wiring) wireNethealth() {
 // latches from every subsystem and ghost unit records outlive the
 // pruned unit files. No kube client needed.
 func (w *wiring) wireJanitor() {
-	if envBool("NODE_HOST_AGENT_ENABLE_JANITOR", true) {
+	if envx.Bool("NODE_HOST_AGENT_ENABLE_JANITOR", true) {
 		jn, err := workerhygiene.NewJanitor(workerhygiene.JanitorConfigFromEnv(
 			workerhygiene.EnvDeps{
 				Systemd:          w.sdClient,
@@ -253,7 +254,7 @@ func (w *wiring) wireJanitor() {
 // Replaces the NPD watchdog-state/filelog monitors; needs the
 // kube client and a node name.
 func (w *wiring) wireNodereporter() {
-	if envBool("NODE_HOST_AGENT_ENABLE_REPORTER", w.defKube) {
+	if envx.Bool("NODE_HOST_AGENT_ENABLE_REPORTER", w.defKube) {
 		switch {
 		case w.hnode == "":
 			logger().Error("nodereporter disabled: node name empty " +
@@ -285,7 +286,7 @@ func (w *wiring) wireNodereporter() {
 // "auto" (default): enabled iff this host runs k0scontroller —
 // workers and bare API LB VMs self-disable.
 func (w *wiring) wireControllerHygiene() {
-	chMode := getenv("NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE", "auto")
+	chMode := envx.String("NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE", "auto")
 	if chMode == "true" || (chMode == "auto" && controllerhygiene.ShouldRun(w.hostRoot)) {
 		ch, err := controllerhygiene.New(controllerhygiene.ConfigFromEnv(
 			controllerhygiene.EnvDeps{
@@ -310,7 +311,7 @@ func (w *wiring) wireControllerHygiene() {
 // defaults.yaml — pods without the node-config-vars mount and
 // standalone hosts without config self-disable.
 func (w *wiring) wireHostconfig() {
-	hcMode := getenv("NODE_HOST_AGENT_ENABLE_HOSTCONFIG", "auto")
+	hcMode := envx.String("NODE_HOST_AGENT_ENABLE_HOSTCONFIG", "auto")
 	_, varsErr := os.Stat(w.varsDir + "/defaults.yaml")
 	if hcMode == "true" || (hcMode == "auto" && varsErr == nil) {
 		hostname, _ := os.Hostname()
@@ -371,7 +372,7 @@ func (w *wiring) wireHubsync() {
 // "auto" (default): Detect() — the postgres .env exists under
 // hostRoot or a kine_db:true extra-host entry names this host.
 func (w *wiring) wireKinedb() {
-	kinedbMode := getenv("NODE_HOST_AGENT_ENABLE_KINEDB", "auto")
+	kinedbMode := envx.String("NODE_HOST_AGENT_ENABLE_KINEDB", "auto")
 	if kinedbMode == "true" ||
 		(kinedbMode == "auto" && kinedb.Detect(w.hostRoot, w.varsDir)) {
 		kd, err := kinedb.New(kinedb.ConfigFromEnv(kinedb.EnvDeps{
