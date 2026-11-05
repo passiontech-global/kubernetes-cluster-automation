@@ -2,7 +2,7 @@
 //
 //	The cicd cluster runs k0s embedded etcd; it once hit the
 //	backend quota (mvcc: database space exceeded — runbook
-//	k0s-etcd-rescue-runbook.md) while the remedy (evpurge +
+//	k0s-etcd-rescue-runbook.md) while the remedy (eventpurge +
 //	compact + defrag + alarm disarm) sat behind manual CLI
 //	commands. The guard automates that: every cycle on hosts
 //	whose K0sDir carries bin/etcdctl + pki/etcd/ca.crt (kine
@@ -10,8 +10,8 @@
 //	`endpoint status -w json` — plus `alarm list` while under
 //	the size trigger — and exports the db-size / nospace gauges.
 //	A NOSPACE alarm or dbSize >= EtcdDBSizeLimit spends the
-//	last-etcd-guard budget (EtcdGuardMinRun, 1h) on evpurge.Run
-//	+ etcdrescue.Run with OnlineOnly, all inside a bounded ctx —
+//	last-etcd-guard budget (EtcdGuardMinRun, 1h) on eventpurge.Run
+//	+ etcdmaint.Run with OnlineOnly, all inside a bounded ctx —
 //	the offline defrag stops k0scontroller and is NEVER a
 //	background action.
 package controllerhygiene
@@ -26,21 +26,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdrescue"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/etcdmaint"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/eventpurge"
 )
 
 // etcdguard knobs (embedded-etcd quota self-defence — cicd
 // controllers; kine hosts lack <K0sDir>/bin/etcdctl and no-op).
 const (
 	checkEtcd              = "etcd-quota"      // prometheus check label
-	fileRateEtcdGuard      = "last-etcd-guard" // evpurge+rescue budget
+	fileRateEtcdGuard      = "last-etcd-guard" // eventpurge+rescue budget
 	defaultEtcdEndpoint    = "https://127.0.0.1:2379"
 	defaultEtcdDBSizeLimit = int64(1610612736) // 1.5 GiB
 	defaultEtcdGuardMinRun = time.Hour         // last-etcd-guard budget
 	defaultEtcdctlBudget   = 60 * time.Second  // ctx cap per etcdctl call
 	etcdctlCmdTimeout      = "30s"             // etcdctl --command-timeout
-	// Bound on the whole evpurge+rescue remediation block: evpurge
+	// Bound on the whole eventpurge+rescue remediation block: eventpurge
 	// is unbounded pagination + delete work at the apiserver's pace
 	// and the rescue is ~12 sequential etcdctl calls — driven by
 	// the process-lifetime ctx, a degraded backend could stall one
@@ -49,13 +49,13 @@ const (
 	// defers the remainder to the next EtcdGuardMinRun window.
 	defaultEtcdGuardBudget = 10 * time.Minute
 	// Each rescue-spawned command gets a far shorter cap than
-	// etcdrescue's defaultCallTimeout (10m — sized for an operator
+	// etcdmaint's defaultCallTimeout (10m — sized for an operator
 	// at a shell): ~12 sequential calls then stay near the guard
 	// budget instead of ~2h.
 	defaultEtcdGuardCallTimeout = time.Minute
 	// eventStaleAge is the apiserver's own 1h event TTL — anything
 	// older is GC debt the purge may safely delete (fresh, debuggable
-	// events survive the guard's evpurge pass).
+	// events survive the guard's eventpurge pass).
 	eventStaleAge = time.Hour
 )
 
@@ -136,7 +136,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	h.state.RateSpend(fileRateEtcdGuard)
 	out := &guardLogWriter{h: h}
 
-	// The whole remediation runs under a bounded ctx: evpurge is
+	// The whole remediation runs under a bounded ctx: eventpurge is
 	// unbounded pagination + delete work against a possibly
 	// degraded apiserver and the rescue is ~12 sequential etcdctl
 	// calls — on the process-lifetime ctx either could stall this
@@ -150,7 +150,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	// control-plane outage — purge first so the rescue's compaction
 	// has garbage to drop. Cutoff keeps the apiserver's own 1h event
 	// TTL: only GC debt is deleted, fresh events survive.
-	perr := h.cfg.evpurgeRunFn(gctx, evpurge.Config{
+	perr := h.cfg.evpurgeRunFn(gctx, eventpurge.Config{
 		API:      "https://" + h.cfg.Hub.SelfEndpoint,
 		CAFile:   h.cfg.AdminCA,
 		CertFile: h.cfg.AdminCert,
@@ -163,16 +163,16 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 		h.state.AppendLogWarn(fmt.Sprintf("etcdguard: evpurge failed: %v", perr))
 	}
 	// remediated tracks the step that actually relieves the quota:
-	// the online rescue (compact+defrag). evpurge only drops event
+	// the online rescue (compact+defrag). eventpurge only drops event
 	// GC debt so the rescue has garbage to free — when the rescue
-	// ran, its result IS the verdict, even if evpurge failed
+	// ran, its result IS the verdict, even if eventpurge failed
 	// upstream (the purge failure stays logged above either way).
 	remediated := perr == nil
-	// A dead gctx here means evpurge (or a cancelled parent) ate
+	// A dead gctx here means eventpurge (or a cancelled parent) ate
 	// the whole budget — spawn no further calls that can only fail;
 	// the rescue is idempotent and retries in the next window.
 	if gctx.Err() == nil {
-		rerr := h.cfg.etcdRescueFn(gctx, etcdrescue.Config{
+		rerr := h.cfg.etcdRescueFn(gctx, etcdmaint.Config{
 			K0sDir:   h.cfg.K0sDir,
 			Endpoint: h.cfg.EtcdGuard.Endpoint,
 			// OnlineOnly: this is background auto-maintenance — the
@@ -181,7 +181,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 			// action.
 			OnlineOnly: true,
 			// The guard is a loop, not an operator: cap each spawned
-			// command far below etcdrescue's interactive default
+			// command far below etcdmaint's interactive default
 			// (defaultCallTimeout = 10m) so ~12 sequential calls
 			// stay near the guard budget instead of ~2h.
 			CallTimeout: defaultEtcdGuardCallTimeout,
@@ -192,7 +192,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 		}
 		remediated = rerr == nil
 	} else {
-		// The budget died inside evpurge — the rescue never ran,
+		// The budget died inside eventpurge — the rescue never ran,
 		// so the cycle is incomplete, not a clean ok.
 		remediated = false
 	}
@@ -212,7 +212,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 
 // etcdStatus fetches `endpoint status -w json` and returns the db
 // file size + in-use size of element[0] (same JSON shape
-// etcdrescue.parseStatusJSON consumes).
+// etcdmaint.parseStatusJSON consumes).
 func (h *Hygiene) etcdStatus(ctx context.Context) (dbSize, dbUse int64, err error) {
 	b, err := h.cfg.etcdctlFn(ctx, "endpoint", "status", "-w", "json")
 	if err != nil {
@@ -243,7 +243,7 @@ func (h *Hygiene) etcdNospaceArmed(ctx context.Context) (bool, error) {
 	return strings.Contains(string(b), "NOSPACE"), nil
 }
 
-// guardLogWriter adapts the evpurge/etcdrescue io.Writer output to
+// guardLogWriter adapts the eventpurge/etcdmaint io.Writer output to
 // the watchdog log — each completed line lands as its own timestamped
 // appendLog entry (the "<rfc3339> <msg>" filelog contract), prefixed
 // so the sub-command output is attributable in the NPD tail.

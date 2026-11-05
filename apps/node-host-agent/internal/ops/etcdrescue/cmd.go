@@ -8,6 +8,10 @@
 // Compact -> online defrag -> offline defrag when the online pass
 // reclaims nothing (or --force-offline) -> alarm disarm -> write
 // canary.
+//
+// The rescue itself lives in internal/etcdmaint (Run): this file is
+// only the flag layer so the controllerhygiene etcd guard can share
+// the domain logic without importing a CLI package.
 package etcdrescue
 
 import (
@@ -16,6 +20,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/etcdmaint"
 )
 
 // Cmd is the `rescue-etcd` subcommand entrypoint.
@@ -34,7 +40,7 @@ func Cmd(ctx context.Context, args []string) int {
 		}
 		return 2
 	}
-	if err := Run(ctx, Config{
+	if err := etcdmaint.Run(ctx, etcdmaint.Config{
 		K0sDir:       *k0sDir,
 		Endpoint:     *endpoint,
 		ForceOffline: *forceOffline,

@@ -1,4 +1,4 @@
-package evpurge
+package eventpurge
 
 import (
 	"bytes"
