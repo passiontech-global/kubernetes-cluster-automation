@@ -51,6 +51,46 @@ func TestBool(t *testing.T) {
 	}
 }
 
+func TestModeEnv(t *testing.T) {
+	const key = "ENVX_TEST_MODE"
+	for _, v := range []string{"1", "true", "yes", "on"} {
+		t.Run("on/"+v, func(t *testing.T) {
+			t.Setenv(key, v)
+			if got := ModeEnv(key, ModeAuto); got != ModeOn {
+				t.Fatalf("%q: got %d want ModeOn", v, got)
+			}
+		})
+	}
+	for _, v := range []string{"0", "false", "no", "off"} {
+		t.Run("off/"+v, func(t *testing.T) {
+			t.Setenv(key, v)
+			if got := ModeEnv(key, ModeAuto); got != ModeOff {
+				t.Fatalf("%q: got %d want ModeOff", v, got)
+			}
+		})
+	}
+	// "auto", unset, empty and unrecognised values all resolve to the
+	// caller's default — ModeAuto included.
+	for _, v := range []string{"auto", "", "TRUE", "2", "maybe", " on"} {
+		t.Run("def/"+v, func(t *testing.T) {
+			t.Setenv(key, v)
+			if got := ModeEnv(key, ModeAuto); got != ModeAuto {
+				t.Fatalf("%q: got %d want ModeAuto (def)", v, got)
+			}
+			if got := ModeEnv(key, ModeOn); got != ModeOn {
+				t.Fatalf("%q: got %d want ModeOn (def)", v, got)
+			}
+			if got := ModeEnv(key, ModeOff); got != ModeOff {
+				t.Fatalf("%q: got %d want ModeOff (def)", v, got)
+			}
+		})
+	}
+	// Fully unset env also yields def.
+	if got := ModeEnv("ENVX_TEST_MODE_UNSET", ModeOff); got != ModeOff {
+		t.Fatalf("unset: got %d want ModeOff", got)
+	}
+}
+
 func TestInt(t *testing.T) {
 	const key = "ENVX_TEST_INT"
 	cases := []struct {

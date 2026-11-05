@@ -51,11 +51,13 @@ type Config struct {
 
 // Agent serves the metrics and probe endpoints.
 type Agent struct {
-	cfg     Config
-	reg     *prometheus.Registry
-	started atomic.Int64 // unixnano — read by the scrape-time GaugeFunc
-	ready   atomic.Bool
-	info    *prometheus.GaugeVec
+	cfg      Config
+	reg      *prometheus.Registry
+	started  atomic.Int64 // unixnano — read by the scrape-time GaugeFunc
+	ready    atomic.Bool
+	info     *prometheus.GaugeVec
+	restarts *prometheus.CounterVec
+	subUp    *prometheus.GaugeVec
 }
 
 // New returns an Agent for cfg and registers the built-in identity
@@ -74,6 +76,22 @@ func New(cfg Config) *Agent {
 	a.info.WithLabelValues(cfg.NodeName, cfg.PodName, cfg.Namespace,
 		cfg.Version, runtime.Version()).Set(1)
 	reg.MustRegister(a.info)
+
+	// Supervisor health, labelled by subsystem name: restarts counts
+	// every Run exit while ctx is live (panic-recovered included),
+	// up is 1 inside Run and 0 during the restart backoff. The vecs
+	// register once here and Run resolves WithLabelValues per
+	// subsystem — duplicate subsystem names share a series, so a
+	// MustRegister conflict is impossible.
+	a.restarts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "node_host_agent_subsystem_restarts_total",
+		Help: "Subsystem Run exits while the context was live, restarted by the supervisor.",
+	}, []string{"name"})
+	a.subUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_host_agent_subsystem_up",
+		Help: "1 while the subsystem's Run is executing; 0 during restart backoff.",
+	}, []string{"name"})
+	reg.MustRegister(a.restarts, a.subUp)
 
 	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "node_host_agent_uptime_seconds",
@@ -125,7 +143,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	for _, sub := range a.cfg.Subsystems {
 		sub := sub
 		go func() {
-			logger().Info("subsystem started", "name", sub.Name())
+			name := sub.Name()
+			logger().Info("subsystem started", "name", name)
+			up := a.subUp.WithLabelValues(name)
+			restarts := a.restarts.WithLabelValues(name)
 			// Restart backoff doubles per early exit (5s → 5m cap) so
 			// a subsystem that returns instantly can't spam a restart
 			// + error log every cycle; a run that outlived the
@@ -133,18 +154,21 @@ func (a *Agent) Run(ctx context.Context) error {
 			backoff := 5 * time.Second
 			for {
 				began := time.Now()
+				up.Set(1)
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
 							logger().Error("subsystem panicked — restarting",
-								"subsystem", sub.Name(), "panic", r)
+								"subsystem", name, "panic", r)
 						}
 					}()
 					sub.Run(ctx)
 				}()
+				up.Set(0)
 				if ctx.Err() != nil {
 					return
 				}
+				restarts.Inc()
 				if time.Since(began) >= backoff {
 					backoff = 5 * time.Second
 				}

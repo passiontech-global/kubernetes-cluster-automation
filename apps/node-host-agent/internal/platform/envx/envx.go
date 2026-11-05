@@ -32,6 +32,36 @@ func Bool(key string, def bool) bool {
 	}
 }
 
+// Mode is the tri-state of the NODE_HOST_AGENT_ENABLE_* knobs: On
+// and Off are explicit operator choices; Auto defers the decision to
+// the consumer — a detect function or a compiled default (the
+// descriptor registry in cmd/agent is the consumer today).
+type Mode int
+
+const (
+	// ModeAuto leaves the enabled decision to the consumer's own
+	// detect logic.
+	ModeAuto Mode = iota
+	ModeOn
+	ModeOff
+)
+
+// ModeEnv parses a tri-state enable knob: "1"/"true"/"yes"/"on" →
+// ModeOn, "0"/"false"/"no"/"off" → ModeOff, and "auto"/unset/empty —
+// plus anything unrecognised, mirroring Bool's lenient contract —
+// → def (which may itself be ModeAuto). The getter is named ModeEnv,
+// not Mode, so it can't collide with the type.
+func ModeEnv(key string, def Mode) Mode {
+	switch os.Getenv(key) {
+	case "1", "true", "yes", "on":
+		return ModeOn
+	case "0", "false", "no", "off":
+		return ModeOff
+	default:
+		return def
+	}
+}
+
 // Int parses an int env var; unset/empty/non-numeric → def.
 func Int(key string, def int) int {
 	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
