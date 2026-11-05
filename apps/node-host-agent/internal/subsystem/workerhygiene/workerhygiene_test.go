@@ -1020,6 +1020,68 @@ func TestKubeletStall10250DownRestarts(t *testing.T) {
 	}
 }
 
+// TestKubeletStall10250AuthResponseIsUp: kubelet denying anonymous
+// /healthz with 401/403 is an ALIVE listener answering an auth
+// refusal — the anonymous probe read it as down and spent k0sworker
+// restarts on a healthy kubelet (prod false positive). Any HTTP code
+// must count as up; only transport errors count as down.
+func TestKubeletStall10250AuthResponseIsUp(t *testing.T) {
+	for _, code := range []int{401, 403} {
+		t.Run(fmt.Sprintf("code-%d", code), func(t *testing.T) {
+			e := fixture(t)
+			e.status[defaultKubeletHealthzURL] = code
+			latch := filepath.Join(e.state, "state-kubelet-runtime-stall")
+			for i := 0; i < 3; i++ {
+				e.h.Cycle(context.Background())
+			}
+			if _, err := os.Stat(latch); !os.IsNotExist(err) {
+				t.Fatalf("stall latch on %d (listener answered — alive)", code)
+			}
+			if e.sdRan("restart k0sworker.service") {
+				t.Fatalf("restart on %d auth response", code)
+			}
+			if e.h.stallFails != 0 {
+				t.Fatalf("stallFails=%d want 0 — %d counts as alive",
+					e.h.stallFails, code)
+			}
+		})
+	}
+}
+
+// TestKubeletStall10250AuthClearsStaleEvidence: a listener that went
+// from unreachable to answering 401 has RECOVERED — the fail streak
+// and any stale runtime-stall latch must clear, not stay latched for
+// the NHC→SNR escalation path.
+func TestKubeletStall10250AuthClearsStaleEvidence(t *testing.T) {
+	e := fixture(t)
+	latch := filepath.Join(e.state, "state-kubelet-runtime-stall")
+	e.h.stateEnter("kubelet-runtime-stall", "test")
+	e.h.stallFails = 1
+	e.status[defaultKubeletHealthzURL] = 401
+	e.h.Cycle(context.Background())
+	if e.h.stallFails != 0 {
+		t.Fatalf("stallFails=%d want 0 after 401 answer", e.h.stallFails)
+	}
+	if _, err := os.Stat(latch); !os.IsNotExist(err) {
+		t.Fatal("runtime-stall latch kept after the listener answered 401")
+	}
+}
+
+// TestKubeletStall10250ProbeSendsBearerToken: kubelet :10250 denies
+// anonymous /healthz — the SA token from KubeletTokenPath must ride
+// the probe (syncloop parity) so auth-requiring clusters return the
+// real verdict.
+func TestKubeletStall10250ProbeSendsBearerToken(t *testing.T) {
+	e := fixture(t)
+	tok := filepath.Join(e.state, "sa-token")
+	writeFile(t, tok, "tok-abc-123\n")
+	e.h.cfg.KubeletTokenPath = tok
+	e.h.Cycle(context.Background())
+	if got := e.bearer[defaultKubeletHealthzURL]; got != "tok-abc-123" {
+		t.Fatalf("10250 probe bearer = %q, want the SA token", got)
+	}
+}
+
 func TestKubeletStallPhantomPods(t *testing.T) {
 	e := fixture(t)
 	for i := 0; i < poddirThreshold; i++ {
@@ -1806,6 +1868,26 @@ func TestKubeletFeederGateAPIServer(t *testing.T) {
 	}
 	if !strings.Contains(logLines(t, e), "SKIP(G4-apiserver)") {
 		t.Fatalf("missing G4 log:\n%s", logLines(t, e))
+	}
+}
+
+// TestKubeletFeederGateAPIServerNon200StillLive: the G4 verdict is
+// listener-liveness, not health — an apiserver or api-local-lb
+// answering ANY HTTP code (503/401/403) means the node is NOT
+// isolated and remediation must proceed (curl -sk parity: the probe
+// used to demand 2xx and read a degraded endpoint as "unreachable").
+func TestKubeletFeederGateAPIServerNon200StillLive(t *testing.T) {
+	e := fixture(t)
+	e.status[e.h.cfg.APIFallbackURL] = 503
+	e.sdReply["restart k0sworker.service"] = ""
+	e.sdReply["reset-failed k0sworker.service"] = ""
+	feedTicks(e, defaultKubeletWdMaxFail)
+	if strings.Contains(logLines(t, e), "SKIP(G4-apiserver)") {
+		t.Fatalf("G4 skipped on a 503 answer — listener is alive:\n%s",
+			logLines(t, e))
+	}
+	if !e.sdRan("restart k0sworker.service") {
+		t.Fatal("remediation blocked although /livez answered 503")
 	}
 }
 

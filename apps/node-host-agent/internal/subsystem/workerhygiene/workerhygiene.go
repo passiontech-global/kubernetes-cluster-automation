@@ -455,7 +455,9 @@ type Config struct {
 	probeBodyOK func(ctx context.Context, url string, timeout time.Duration) bool
 	// probeHTTPStatus does one GET and returns the status code — the
 	// probeHTTP variant for endpoints where the CODE is the verdict
-	// (syncloop 500 vs healthz 200, envoy /ready 503). bearer != ""
+	// (syncloop 500 vs healthz 200, envoy /ready 503) or where ANY
+	// answer proves liveness (kubelet :10250 /healthz, api /livez —
+	// a 401/403 is an auth denial, not a dead listener). bearer != ""
 	// attaches an Authorization header (kubelet :10250 requires
 	// auth). Seam.
 	probeHTTPStatus func(ctx context.Context, url, bearer string, timeout time.Duration) (int, error)
@@ -2219,6 +2221,35 @@ func (h *Hygiene) probeHTTPSeries(ctx context.Context, url string,
 	return last
 }
 
+// kubelet10250Alive runs the kubelet :10250 /healthz liveness series
+// — the shell's `curl -ks` retry loop. ANY HTTP response proves the
+// listener is alive; only a transport error/timeout counts as down.
+// A 401/403 is kubelet answering an auth denial, NOT a dead listener
+// — probing anonymously read that as "down" → kubelet-10250-down →
+// k0sworker restarts spent on a healthy kubelet (same bug class the
+// syncloop probe fixed by authenticating + treating unauth answers
+// as non-verdicts). The SA bearer from KubeletTokenPath rides along
+// so clusters requiring auth return the real healthz verdict; a
+// missing token just falls back to anonymous, whose 401 still counts
+// as alive.
+func (h *Hygiene) kubelet10250Alive(ctx context.Context) bool {
+	bearer := h.kubeletBearer()
+	for i := 0; i < probeAttempts; i++ {
+		if _, err := h.cfg.probeHTTPStatus(ctx,
+			h.cfg.KubeletHealthzURL, bearer, probeTimeout); err == nil {
+			return true
+		}
+		if i+1 < probeAttempts {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(h.cfg.ProbeGap):
+			}
+		}
+	}
+	return false
+}
+
 // podDirCount counts kubelet pod dirs — the shell's
 // `find $KUBELET_PODS_DIR -mindepth 1 -maxdepth 1 -type d | wc -l`.
 // ok=false means the dir is unreadable (treated like missing).
@@ -2308,9 +2339,9 @@ func (h *Hygiene) checkKubeletStall(ctx context.Context, apiOK bool,
 	if reason == "" {
 		// kubelet-10250-down: the listener may take 30-60s after a
 		// k0sworker restart — all 3 probes must fail (curl -ks parity:
-		// any HTTP response, even 401, means the listener is alive).
-		if err := h.probeHTTPSeries(ctx, h.cfg.KubeletHealthzURL,
-			probeAttempts, probeTimeout, h.cfg.ProbeGap); err != nil {
+		// ANY HTTP response, even 401/403, means the listener is
+		// alive).
+		if !h.kubelet10250Alive(ctx) {
 			reason = "kubelet-10250-down"
 		}
 	}
@@ -3789,7 +3820,13 @@ func (h *Hygiene) anyAPIBackendLive(ctx context.Context) bool {
 		urls = []string{h.cfg.APIFallbackURL}
 	}
 	for _, url := range urls {
-		if h.cfg.probeHTTP(ctx, url, apiLivezProbeTimeout) == nil {
+		// probeHTTPStatus, not probeHTTP: the verdict is liveness,
+		// so ANY HTTP code — even 401/403/500 — proves the listener
+		// answered (curl -sk parity; a 2xx-only read made an
+		// auth-refusing or LB-degraded endpoint look "unreachable"
+		// and falsely gated remediation as isolated).
+		if _, err := h.cfg.probeHTTPStatus(ctx, url, "",
+			apiLivezProbeTimeout); err == nil {
 			return true
 		}
 	}
