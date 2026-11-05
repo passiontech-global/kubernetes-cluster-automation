@@ -1,0 +1,189 @@
+// collect_procs_cgroup.go — A2 zombie/d-state counts, cgroup
+// pids/memory.events pressure (W7-H2/H6), the kubepods
+// cri-containerd scope footprint, and B4/W9 MTU drift. Split out
+// of hostmetrics.go.
+package hostmetrics
+
+import (
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+const (
+	defaultCgroupRoot     = "/sys/fs/cgroup"
+	defaultCiliumIface    = "cilium_net"
+	defaultCiliumWG0Iface = "cilium_wg0"
+)
+
+// defaultCgroupPidsSlices are the cgroup-v2 dirs whose
+// pids.current/pids.max feed the pids-used-ratio gauge (A2) — the
+// k0s units plus the whole pod workload slice.
+var defaultCgroupPidsSlices = []string{
+	"system.slice/k0sworker.service",
+	"system.slice/k0scontroller.service",
+	"kubepods.slice",
+}
+
+// defaultCgroupMemUnits are the system.slice units whose
+// memory.events feed the W7-H6 reclaim-throttling counters — the
+// k0s daemons whose freeze-under-high is the classic gray failure.
+var defaultCgroupMemUnits = []string{
+	"k0scontroller.service",
+	"k0sworker.service",
+}
+
+// --- A2: zombie count + cgroup pids pressure ---
+
+// collectZombies counts state Z processes under ProcRoot — the
+// state char sits right after the LAST ')' because comm can
+// contain spaces and parens (same trick as workerhygiene's
+// pidLive). Emits only when the proc root scans.
+func (c *Collector) collectZombies(ch chan<- prometheus.Metric) {
+	entries, err := os.ReadDir(c.cfg.ProcRoot)
+	if err != nil {
+		return
+	}
+	var n, dstate float64
+	for _, e := range entries {
+		if !e.IsDir() || !pidDirRe.MatchString(e.Name()) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(c.cfg.ProcRoot, e.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		s := string(data)
+		if i := strings.LastIndexByte(s, ')'); i >= 0 {
+			if f := strings.Fields(s[i+1:]); len(f) > 0 {
+				switch f[0] {
+				case "Z":
+					n++
+				case "D": // W7-H1: uninterruptible-sleep count, same scan
+					dstate++
+				}
+			}
+		}
+	}
+	ch <- prometheus.MustNewConstMetric(c.descZombies,
+		prometheus.GaugeValue, n, c.cfg.NodeName)
+	ch <- prometheus.MustNewConstMetric(c.descDState,
+		prometheus.GaugeValue, dstate, c.cfg.NodeName)
+}
+
+// collectCgroupPids emits pids.current/pids.max per slice — a
+// missing or non-numeric ("max") limit yields no ratio (never a
+// fake 0). The pids.current/pids.max filenames are cgroup-v2
+// unified-hierarchy only — k0s hosts are v2; on a v1 host the
+// files simply don't exist and no series emits.
+func (c *Collector) collectCgroupPids(ch chan<- prometheus.Metric) {
+	for _, slice := range c.cfg.CgroupPidsSlices {
+		cur, ok := hostutil.ReadUintFile(filepath.Join(
+			c.cfg.CgroupRoot, slice, "pids.current"))
+		if !ok {
+			continue
+		}
+		mx, ok := hostutil.ReadUintFile(filepath.Join(
+			c.cfg.CgroupRoot, slice, "pids.max"))
+		if !ok || mx == 0 {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(c.descCgroupPids,
+			prometheus.GaugeValue, float64(cur)/float64(mx),
+			c.cfg.NodeName, slice)
+	}
+}
+
+// --- B4: MTU drift (cilium datapath vs nebula overlay) ---
+//
+// mtuOfIface/jsonFindInts/runtimeConfigMTU live in
+// internal/platform/hostutil now — the same helpers workerhygiene's
+// checkCiliumMTU uses (hostutil.MTUOfIface / JSONFindInts /
+// RuntimeConfigMTU).
+
+// wgEncapOverheadBytes is the WireGuard encapsulation overhead the
+// cilium_wg0 MTU must leave under the nebula overlay MTU (W9
+// double-encap guard — same constant as workerhygiene).
+const wgEncapOverheadBytes = 60
+
+// collectMTUDrift emits 1 when a pod-datapath MTU exceeds what the
+// overlay path can carry — a pod holding MTU 1500 dies silently on
+// FRAG_NEEDED through neb1 (1300). Two datapaths are checked:
+// cilium_net (sysfs, falling back to agent-runtime-config.json)
+// must stay <= neb, and cilium_wg0 must stay <= neb-60 to leave
+// room for the WG header inside the double-encapsulated path. The
+// series emits when the overlay MTU resolves AND at least one
+// datapath MTU resolves; absent interfaces simply don't vote.
+func (c *Collector) collectMTUDrift(ch chan<- prometheus.Metric) {
+	neb, ok := hostutil.MTUOfIface(c.cfg.SysClassNet, c.cfg.NebulaIface)
+	if !ok {
+		return
+	}
+	cil, cilOK := hostutil.MTUOfIface(c.cfg.SysClassNet, c.cfg.CiliumIface)
+	if !cilOK {
+		cil, cilOK = hostutil.RuntimeConfigMTU(c.cfg.CiliumRuntimeConfig)
+	}
+	wg, wgOK := hostutil.MTUOfIface(c.cfg.SysClassNet, c.cfg.CiliumWG0Iface)
+	if !cilOK && !wgOK {
+		return
+	}
+	drift := 0.0
+	if (cilOK && cil > neb) || (wgOK && wg > neb-wgEncapOverheadBytes) {
+		drift = 1
+	}
+	ch <- prometheus.MustNewConstMetric(c.descMTUDrift,
+		prometheus.GaugeValue, drift, c.cfg.NodeName)
+}
+
+// --- W7: systemd scope footprint, ARP entries, cgroup memory.events ---
+
+// collectSystemdScopes counts cri-containerd-*.scope dirs under the
+// kubepods cgroup slice (W7-H2): a leaking abandoned-scope
+// footprint is what slows every PID 1 D-Bus call down before
+// systemctl-level symptoms appear. Counted directly in the cgroup
+// fs — no systemctl fork per scrape. Emits only when the slice
+// root exists.
+func (c *Collector) collectSystemdScopes(ch chan<- prometheus.Metric) {
+	root := filepath.Join(c.cfg.CgroupRoot, "kubepods.slice")
+	if _, err := os.Stat(root); err != nil {
+		return
+	}
+	var n float64
+	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // unreadable entries are skipped, never fatal
+		}
+		if d.IsDir() && strings.HasPrefix(d.Name(), "cri-containerd-") &&
+			strings.HasSuffix(d.Name(), ".scope") {
+			n++
+		}
+		return nil
+	})
+	ch <- prometheus.MustNewConstMetric(c.descSystemdScopes,
+		prometheus.GaugeValue, n, c.cfg.NodeName)
+}
+
+// collectCgroupMemEvents reads memory.events of the configured
+// system.slice units (W7-H6): a climbing `high` count is
+// direct-reclaim throttling evidence — the unit freezes without an
+// OOMKill, the classic healthcheck-timeout-with-no-logs gray
+// failure; `oom_kill` counts the kills that do happen. Each series
+// emits only when its own field parses.
+func (c *Collector) collectCgroupMemEvents(ch chan<- prometheus.Metric) {
+	for _, unit := range c.cfg.CgroupMemUnits {
+		ev := vmstatCounters(filepath.Join(c.cfg.CgroupRoot,
+			"system.slice", unit, "memory.events"), "high", "oom_kill")
+		if v, ok := ev["high"]; ok {
+			ch <- prometheus.MustNewConstMetric(c.descCgMemHigh,
+				prometheus.CounterValue, float64(v), c.cfg.NodeName, unit)
+		}
+		if v, ok := ev["oom_kill"]; ok {
+			ch <- prometheus.MustNewConstMetric(c.descCgMemOOMKill,
+				prometheus.CounterValue, float64(v), c.cfg.NodeName, unit)
+		}
+	}
+}

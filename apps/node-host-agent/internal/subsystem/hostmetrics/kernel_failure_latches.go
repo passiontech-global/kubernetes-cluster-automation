@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 	"golang.org/x/sys/unix"
 )
 
@@ -1211,55 +1212,34 @@ func (c *Collector) textfileDir() string {
 		"var", "lib", "node-exporter", "textfile")
 }
 
-// writeTextfileProm atomically installs content as <dir>/<name> — tmp +
-// rename so node_exporter never reads a partial file (the .tmp
-// suffix stays outside its *.prom glob). Failures log at Debug:
-// refreshLatches runs every 30s and an unwritable mount must not
-// spam the watchdog tail.
-func (c *Collector) writeTextfileProm(name, content string) {
-	dir := c.textfileDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		logger().Debug("hostmetrics: kernel textfile mkdir failed",
-			"dir", dir, "error", err)
-		return
-	}
-	tmp := filepath.Join(dir, "."+name+".tmp")
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		logger().Debug("hostmetrics: kernel textfile write failed",
-			"path", tmp, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, name)); err != nil {
-		logger().Debug("hostmetrics: kernel textfile install failed",
-			"dir", dir, "error", err)
-	}
-}
-
 // writeKernelUtilProm emits the W10-KR2 utilization gauges —
 // node_agent_{pids,threads,file_nr}_utilization_ratio. Each series
 // appears only when its source parsed (no fake 0s — the
-// collectFileFD rule).
+// collectFileFD rule). promfile.Write stages + renames so
+// node_exporter never reads a partial file. Failures log at Debug:
+// refreshLatches runs every 30s and an unwritable mount must not
+// spam the watchdog tail.
 func (c *Collector) writeKernelUtilProm(pids, threads, filefd float64,
 	pidsOK, threadsOK, fdOK bool) {
-	var b strings.Builder
-	gauge := func(name, help string, v float64) {
-		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s gauge\n%s %s\n",
-			name, help, name, name,
-			strconv.FormatFloat(v, 'f', -1, 64))
-	}
+	var b promfile.Builder
 	if pidsOK {
-		gauge("node_agent_pids_utilization_ratio",
+		b.Gauge("node_agent_pids_utilization_ratio",
 			"Live /proc pid dirs over kernel.pid_max.", pids)
 	}
 	if threadsOK {
-		gauge("node_agent_threads_utilization_ratio",
+		b.Gauge("node_agent_threads_utilization_ratio",
 			"loadavg total entities over kernel.threads-max.", threads)
 	}
 	if fdOK {
-		gauge("node_agent_file_nr_utilization_ratio",
+		b.Gauge("node_agent_file_nr_utilization_ratio",
 			"file-nr allocated over maximum — fd table pressure.", filefd)
 	}
-	c.writeTextfileProm("node-agent-kernel.prom", b.String())
+	dir := c.textfileDir()
+	if err := promfile.Write(dir,
+		"node-agent-kernel.prom", []byte(b.String())); err != nil {
+		logger().Debug("hostmetrics: kernel textfile install failed",
+			"dir", dir, "error", err)
+	}
 }
 
 // --- small Wave-10 helpers (uniquely named per file rules) ---
