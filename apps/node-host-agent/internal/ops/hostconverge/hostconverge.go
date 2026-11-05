@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostconfig"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 )
 
 // HostRoot/RunnerFactory wire the production standalone contract

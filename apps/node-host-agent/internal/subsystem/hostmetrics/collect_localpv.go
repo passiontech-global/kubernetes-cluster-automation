@@ -91,7 +91,7 @@ func dirSizeBytes(root string, maxEntries int) int64 {
 	n := 0
 	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil // skip unreadable entries, never fatal
+			return nil //nolint:nilerr // skip unreadable entries, never fatal
 		}
 		n++
 		if n > maxEntries {

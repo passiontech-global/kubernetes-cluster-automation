@@ -7,12 +7,12 @@ package controllerhygiene
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"net"
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
 // defaultSystemctlBudget caps the query-shaped systemctl calls —
@@ -91,7 +91,7 @@ func hostExecCtxBounded(ctx context.Context, sd *systemd.Client,
 	name string, args ...string) (string, error) {
 
 	if sd == nil {
-		return "", fmt.Errorf("no systemd client wired")
+		return "", errors.New("no systemd client wired")
 	}
 	argv := scrubArgv(name, args...)
 	if combined {

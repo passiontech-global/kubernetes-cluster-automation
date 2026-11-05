@@ -9,6 +9,7 @@ package nebulasign
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -26,7 +27,7 @@ var nebulaNetRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) (string, error) {
 	if j.IP == "" {
-		return "", fmt.Errorf("no ip in registry")
+		return "", errors.New("no ip in registry")
 	}
 	keyPath = expandHome(keyPath)
 	pem, err := os.ReadFile(keyPath)

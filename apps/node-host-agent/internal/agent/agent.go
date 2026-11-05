@@ -141,7 +141,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.started.Store(time.Now().UnixNano())
 
 	for _, sub := range a.cfg.Subsystems {
-		sub := sub
 		go func() {
 			name := sub.Name()
 			logger().Info("subsystem started", "name", name)

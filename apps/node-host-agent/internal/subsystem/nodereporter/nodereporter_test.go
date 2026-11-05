@@ -2,7 +2,7 @@ package nodereporter
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,7 +19,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
-	nhatestutil "github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
+	nhatestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // env is the shared fixture: tempdir watchdog state dir + log file, a
@@ -522,7 +522,7 @@ func TestKubeErrorsNeverFatal(t *testing.T) {
 	failGets.Store(true)
 	e.cs.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
 		if failGets.Load() {
-			return true, nil, fmt.Errorf("apiserver down")
+			return true, nil, errors.New("apiserver down")
 		}
 		return false, nil, nil // fall through to the default tracker
 	})

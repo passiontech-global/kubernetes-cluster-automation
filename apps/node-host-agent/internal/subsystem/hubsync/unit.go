@@ -23,7 +23,7 @@ import (
 func systemdUnit(t Target, remoteBinary, remoteVarsDir, remoteCertsDir string) string {
 	return fmt.Sprintf(`[Unit]
 Description=node-host-agent (standalone host converge agent)
-Documentation=https://github.com/passiontech-global/kubernetes-node-automation
+Documentation=https://github.com/passiontech-global/kubernetes-cluster-automation
 After=network-online.target
 Wants=network-online.target
 

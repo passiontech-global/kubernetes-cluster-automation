@@ -284,7 +284,7 @@ func (h *Hygiene) deadFallback(ctx context.Context) {
 		if !h.cfg.pgWireFn(ctx, h.cfg.Hub.KineDBProbe) {
 			h.state.ResetCounter(fileCtrDead)
 			h.state.Enter(stateKineUnreachable,
-				fmt.Sprintf("%s pg-wire fail", h.cfg.Hub.KineDBProbe))
+				h.cfg.Hub.KineDBProbe+" pg-wire fail")
 			h.state.SuspectLog(stateKineUnreachable, fmt.Sprintf(
 				"suspect: kine-backend-unreachable %s — apiserver fail is a consequence of DB/pgbouncer, restarting the controller is useless",
 				h.cfg.Hub.KineDBProbe), h.cfg.SuspectLogCadence)

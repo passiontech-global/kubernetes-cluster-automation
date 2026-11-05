@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // deadTuplePct returns n_dead_tup as a percentage of estimated rows —
@@ -80,7 +80,7 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 
 	// (a) REINDEX CONCURRENTLY — always, cheap on a small table.
 	if _, err := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
-		"-qc", fmt.Sprintf("REINDEX TABLE CONCURRENTLY %s", k.cfg.Table)), ""); err == nil {
+		"-qc", "REINDEX TABLE CONCURRENTLY "+k.cfg.Table), ""); err == nil {
 		res.okReindex = true
 	} else {
 		note(fmt.Sprintf("reindex-fail: %v", err))
@@ -133,7 +133,7 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 			"free", free, "heap", res.heapBytes, "wal", wal)
 		res.repackState = "skipped-headroom"
 		if _, err := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
-			"-qc", fmt.Sprintf("VACUUM (ANALYZE) %s", k.cfg.Table)), ""); err != nil {
+			"-qc", "VACUUM (ANALYZE) "+k.cfg.Table), ""); err != nil {
 			note(fmt.Sprintf("fallback-vacuum-fail: %v", err))
 		}
 		return

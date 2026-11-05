@@ -101,6 +101,7 @@ package workerhygiene
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -115,10 +116,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/procfs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
 // Defaults mirror the shell modules + the DaemonSet host mounts.
@@ -471,7 +472,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	if cfg.Client == nil {
 		// The first Cycle LIST would nil-pointer panic — the check
 		// contract is "never panic", so reject at construction.
-		return nil, fmt.Errorf("workerhygiene: Config.Client is required")
+		return nil, errors.New("workerhygiene: Config.Client is required")
 	}
 	cfg.applyDefaults()
 	h := &Hygiene{cfg: cfg, proc: procfs.New(cfg.ProcRoot)}

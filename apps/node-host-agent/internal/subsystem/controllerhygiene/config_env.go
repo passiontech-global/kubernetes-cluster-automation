@@ -3,9 +3,9 @@ package controllerhygiene
 import (
 	"os"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
@@ -69,63 +69,14 @@ func ConfigFromEnv(d EnvDeps) Config {
 	if d.Watchdog != nil {
 		wd = *d.Watchdog
 	}
-	return Config{
+	cfg := Config{
 		Enabled:          true,
-		Interval:         envx.Duration("NODE_HOST_AGENT_CONTROLLER_INTERVAL", defaultInterval),
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogLogFile:  d.WatchdogLogFile,
 		WatchdogSrc:      d.WatchdogSrc,
-		ProcRoot:         envx.String("NODE_HOST_AGENT_PROC_ROOT", defaultProcRoot),
 		// No env knob — hostPath-derived like the Admin* paths.
 		K0sControllerUnitFile: hostPath("/etc/systemd/system/k0scontroller.service"),
-		// env → wdCfg → package defaults; SelfAPI stays EMPTY when
-		// neither is set (the solo/dead-fallback fences gate on
-		// non-empty — a made-up identity would crown every
-		// unconfigured controller first-hub).
-		Hub: HubConfig{
-			SelfAPI:     envx.Or("NODE_HOST_AGENT_API_SELF", wd.APISelf),
-			PeerAPI:     envx.Or("NODE_HOST_AGENT_API_PEER", wd.APIPeer),
-			KineDBProbe: envx.Or("NODE_HOST_AGENT_KINE_DB_PROBE", wd.KineDBProbe),
-		},
-		Sig13: Sig13Config{
-			Mode: envx.Or("NODE_HOST_AGENT_SIG13_AUTOFIX", wd.Sig13Autofix),
-			StaleMinErrs: envx.IntOr("NODE_HOST_AGENT_STALE_MIN_ERRS",
-				wd.Sig13StaleMinErrs, defaultStaleMinErrs),
-			GapMin: envx.Int64Or("NODE_HOST_AGENT_GAP_MIN",
-				wd.Sig13GapMin, defaultGapMin),
-			GapCycles: envx.IntOr("NODE_HOST_AGENT_GAP_CYCLES",
-				wd.Sig13GapCycles, defaultGapCycles),
-			FrozenCycles: envx.IntOr("NODE_HOST_AGENT_FROZEN_CYCLES",
-				wd.Sig13FrozenCycles, defaultFrozenCycles),
-			SoloCycles: envx.IntOr("NODE_HOST_AGENT_SOLO_CYCLES",
-				wd.Sig13SoloCycles, defaultSoloCycles),
-			MinRestart: envx.DurOr("NODE_HOST_AGENT_SIG13_MIN_RESTART_S",
-				wd.Sig13MinRestartS, defaultMinRestart),
-		},
-		KineTTL: KineTTLConfig{
-			Mode: envx.Or("NODE_HOST_AGENT_KINE_TTL_AUTOFIX", wd.KineTTLAutofix),
-			MinRestart: envx.DurOr("NODE_HOST_AGENT_KINE_TTL_MIN_RESTART_S",
-				wd.KineTTLMinRestartS, defaultTTLMinRestart),
-			CtlRestart: envx.DurOr("NODE_HOST_AGENT_KINE_TTL_CTL_RESTART_S",
-				wd.KineTTLCtlRestartS, defaultTTLCtlRestart),
-			RewedgeCycles: envx.IntOr("NODE_HOST_AGENT_KINE_TTL_REWEDGE_CYCLES",
-				wd.KineTTLRewedgeCycle, defaultTTLRewedgeCycles),
-		},
-		KinePool: KinePoolConfig{
-			Mode: envx.Or("NODE_HOST_AGENT_KINE_POOL_AUTOFIX", wd.KinePoolAutofix),
-			MaxConns: envx.IntOr("NODE_HOST_AGENT_KINE_POOL_MAX_CONNS",
-				wd.KinePoolMaxConns, defaultPoolMaxConns),
-			Cycles: envx.IntOr("NODE_HOST_AGENT_KINE_POOL_CYCLES",
-				wd.KinePoolCycles, defaultPoolCycles),
-			MinRestart: envx.DurOr("NODE_HOST_AGENT_KINE_POOL_MIN_RESTART_S",
-				wd.KinePoolMinRestartS, defaultPoolMinRestart),
-		},
 		OOMLoop: OOMLoopConfig{
-			Mode: envx.Or("NODE_HOST_AGENT_OOMLOOP_AUTOFIX", wd.OOMLoopAutofix),
-			MinKills: envx.IntOr("NODE_HOST_AGENT_OOMLOOP_MIN_KILLS",
-				wd.OOMLoopMinKills, defaultOOMMinKills),
-			Window: envx.DurOr("NODE_HOST_AGENT_OOMLOOP_WINDOW_S",
-				wd.OOMLoopWindowS, defaultOOMWindow),
 			// No env knob — hostPath-derived.
 			CGroupEventsFile: hostPath("/sys/fs/cgroup/system.slice/" +
 				"k0scontroller.service/memory.events"),
@@ -136,24 +87,69 @@ func ConfigFromEnv(d EnvDeps) Config {
 		AdminCert:       hostPath("/var/lib/k0s/pki/admin.crt"),
 		AdminKey:        hostPath("/var/lib/k0s/pki/admin.key"),
 		AdminCA:         hostPath("/var/lib/k0s/pki/ca.crt"),
-		InsecureTLS:     envx.Bool("NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS", true),
 		Feeder: FeederConfig{
-			Enabled: envx.Bool("NODE_HOST_AGENT_ENABLE_FEEDER", true),
-			// NOTIFY_SOCKET is a systemd contract, not a
-			// NODE_HOST_AGENT_* knob — read it directly.
-			NotifySocket:      os.Getenv("NOTIFY_SOCKET"),
 			StateDir:          hostPath("/var/lib/k0s-systemd-watchdog"),
 			RemediatePeerFile: hostPath("/etc/default/k0scontroller-watchdog"),
-		},
-		// hostPath default — NOT defaultK0sDir, which hardcodes "/host".
-		K0sDir: envx.String("NODE_HOST_AGENT_K0S_DIR",
-			hostPath("/var/lib/k0s")),
-		EtcdGuard: EtcdGuardConfig{
-			Endpoint:    envx.String("NODE_HOST_AGENT_ETCD_ENDPOINT", defaultEtcdEndpoint),
-			DBSizeLimit: envx.Int64("NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT", 0),
 		},
 		JournalDirs:             d.JournalDirs,
 		JournalUnreadableNeeded: d.JournalUnreadableNeeded,
 		Systemd:                 d.Systemd,
 	}
+	// The env surface, one row per knob in declaration order.
+	envx.Apply([]envx.Knob{
+		envx.DurationKnob("NODE_HOST_AGENT_CONTROLLER_INTERVAL", &cfg.Interval, defaultInterval),
+		envx.StringKnob("NODE_HOST_AGENT_PROC_ROOT", &cfg.ProcRoot, defaultProcRoot),
+		// env → wdCfg → package defaults; SelfAPI stays EMPTY when
+		// neither is set (the solo/dead-fallback fences gate on
+		// non-empty — a made-up identity would crown every
+		// unconfigured controller first-hub).
+		envx.OrKnob("NODE_HOST_AGENT_API_SELF", &cfg.Hub.SelfAPI, wd.APISelf),
+		envx.OrKnob("NODE_HOST_AGENT_API_PEER", &cfg.Hub.PeerAPI, wd.APIPeer),
+		envx.OrKnob("NODE_HOST_AGENT_KINE_DB_PROBE", &cfg.Hub.KineDBProbe, wd.KineDBProbe),
+		envx.OrKnob("NODE_HOST_AGENT_SIG13_AUTOFIX", &cfg.Sig13.Mode, wd.Sig13Autofix),
+		envx.IntOrKnob("NODE_HOST_AGENT_STALE_MIN_ERRS", &cfg.Sig13.StaleMinErrs,
+			wd.Sig13StaleMinErrs, defaultStaleMinErrs),
+		envx.Int64OrKnob("NODE_HOST_AGENT_GAP_MIN", &cfg.Sig13.GapMin,
+			wd.Sig13GapMin, defaultGapMin),
+		envx.IntOrKnob("NODE_HOST_AGENT_GAP_CYCLES", &cfg.Sig13.GapCycles,
+			wd.Sig13GapCycles, defaultGapCycles),
+		envx.IntOrKnob("NODE_HOST_AGENT_FROZEN_CYCLES", &cfg.Sig13.FrozenCycles,
+			wd.Sig13FrozenCycles, defaultFrozenCycles),
+		envx.IntOrKnob("NODE_HOST_AGENT_SOLO_CYCLES", &cfg.Sig13.SoloCycles,
+			wd.Sig13SoloCycles, defaultSoloCycles),
+		envx.DurOrKnob("NODE_HOST_AGENT_SIG13_MIN_RESTART_S", &cfg.Sig13.MinRestart,
+			wd.Sig13MinRestartS, defaultMinRestart),
+		envx.OrKnob("NODE_HOST_AGENT_KINE_TTL_AUTOFIX", &cfg.KineTTL.Mode, wd.KineTTLAutofix),
+		envx.DurOrKnob("NODE_HOST_AGENT_KINE_TTL_MIN_RESTART_S", &cfg.KineTTL.MinRestart,
+			wd.KineTTLMinRestartS, defaultTTLMinRestart),
+		envx.DurOrKnob("NODE_HOST_AGENT_KINE_TTL_CTL_RESTART_S", &cfg.KineTTL.CtlRestart,
+			wd.KineTTLCtlRestartS, defaultTTLCtlRestart),
+		envx.IntOrKnob("NODE_HOST_AGENT_KINE_TTL_REWEDGE_CYCLES", &cfg.KineTTL.RewedgeCycles,
+			wd.KineTTLRewedgeCycle, defaultTTLRewedgeCycles),
+		envx.OrKnob("NODE_HOST_AGENT_KINE_POOL_AUTOFIX", &cfg.KinePool.Mode, wd.KinePoolAutofix),
+		envx.IntOrKnob("NODE_HOST_AGENT_KINE_POOL_MAX_CONNS", &cfg.KinePool.MaxConns,
+			wd.KinePoolMaxConns, defaultPoolMaxConns),
+		envx.IntOrKnob("NODE_HOST_AGENT_KINE_POOL_CYCLES", &cfg.KinePool.Cycles,
+			wd.KinePoolCycles, defaultPoolCycles),
+		envx.DurOrKnob("NODE_HOST_AGENT_KINE_POOL_MIN_RESTART_S", &cfg.KinePool.MinRestart,
+			wd.KinePoolMinRestartS, defaultPoolMinRestart),
+		envx.OrKnob("NODE_HOST_AGENT_OOMLOOP_AUTOFIX", &cfg.OOMLoop.Mode, wd.OOMLoopAutofix),
+		envx.IntOrKnob("NODE_HOST_AGENT_OOMLOOP_MIN_KILLS", &cfg.OOMLoop.MinKills,
+			wd.OOMLoopMinKills, defaultOOMMinKills),
+		envx.DurOrKnob("NODE_HOST_AGENT_OOMLOOP_WINDOW_S", &cfg.OOMLoop.Window,
+			wd.OOMLoopWindowS, defaultOOMWindow),
+		envx.BoolKnob("NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS", &cfg.InsecureTLS, true),
+		envx.BoolKnob("NODE_HOST_AGENT_ENABLE_FEEDER", &cfg.Feeder.Enabled, true),
+		// NOTIFY_SOCKET is a systemd contract, not a
+		// NODE_HOST_AGENT_* knob — read it directly.
+		{Name: "NOTIFY_SOCKET", Resolve: func(k string) {
+			cfg.Feeder.NotifySocket = os.Getenv(k)
+		}},
+		// hostPath default — NOT defaultK0sDir, which hardcodes "/host".
+		envx.StringKnob("NODE_HOST_AGENT_K0S_DIR", &cfg.K0sDir,
+			hostPath("/var/lib/k0s")),
+		envx.StringKnob("NODE_HOST_AGENT_ETCD_ENDPOINT", &cfg.EtcdGuard.Endpoint, defaultEtcdEndpoint),
+		envx.Int64Knob("NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT", &cfg.EtcdGuard.DBSizeLimit, 0),
+	})
+	return cfg
 }

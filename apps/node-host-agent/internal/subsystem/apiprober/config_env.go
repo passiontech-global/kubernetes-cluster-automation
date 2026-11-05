@@ -1,8 +1,8 @@
 package apiprober
 
 import (
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
@@ -48,24 +48,30 @@ func resolveProberInputs(wd *watchdogconf.Config,
 			}
 		}
 	}
-	companions := envx.List("NODE_HOST_AGENT_APIPROBER_COMPANION_BACKENDS")
-	if companions == nil {
-		companions = g.CompanionBackends
-	}
-	return proberInputs{
-		socket: envx.Str(envx.Or("NODE_HOST_AGENT_APIPROBER_SOCKET",
-			g.SocketPath), defaultSocketPath),
-		backend: envx.Str(envx.Or("NODE_HOST_AGENT_APIPROBER_BACKEND",
-			g.BackendName), defaultBackendName),
-		companions: companions,
-		static:     static,
-		mode: envx.Str(envx.Or("NODE_HOST_AGENT_APIPROBER_MODE",
-			g.Mode), ModeDryRun),
-		tokenFile: envx.Str(envx.Or("NODE_HOST_AGENT_APIPROBER_TOKEN_FILE",
-			g.TokenFile), defaultTokenFile),
-		caFile: envx.Str(envx.Or("NODE_HOST_AGENT_APIPROBER_CA_FILE",
-			g.CAFile), defaultCAFile),
-	}
+	pi := proberInputs{static: static}
+	// The env → guard.conf → compiled-default surface, one row per
+	// knob in declaration order.
+	envx.Apply([]envx.Knob{
+		envx.StrOrKnob("NODE_HOST_AGENT_APIPROBER_SOCKET", &pi.socket,
+			g.SocketPath, defaultSocketPath),
+		envx.StrOrKnob("NODE_HOST_AGENT_APIPROBER_BACKEND", &pi.backend,
+			g.BackendName, defaultBackendName),
+		// empty env → nil → the conf's companion set.
+		{Name: "NODE_HOST_AGENT_APIPROBER_COMPANION_BACKENDS", Resolve: func(k string) {
+			if l := envx.List(k); l != nil {
+				pi.companions = l
+			} else {
+				pi.companions = g.CompanionBackends
+			}
+		}},
+		envx.StrOrKnob("NODE_HOST_AGENT_APIPROBER_MODE", &pi.mode,
+			g.Mode, ModeDryRun),
+		envx.StrOrKnob("NODE_HOST_AGENT_APIPROBER_TOKEN_FILE", &pi.tokenFile,
+			g.TokenFile, defaultTokenFile),
+		envx.StrOrKnob("NODE_HOST_AGENT_APIPROBER_CA_FILE", &pi.caFile,
+			g.CAFile, defaultCAFile),
+	})
+	return pi
 }
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob apiprober
@@ -86,31 +92,36 @@ func ConfigFromEnv(d EnvDeps) Config {
 		guardConf = GuardDefaults{}
 	}
 	pi := resolveProberInputs(d.Watchdog, guardConf)
-	return Config{
+	cfg := Config{
 		SocketPath:        pi.socket,
 		BackendName:       pi.backend,
 		CompanionBackends: pi.companions,
 		StaticBackends:    pi.static,
-		Interval:          envx.Duration("NODE_HOST_AGENT_APIPROBER_INTERVAL", defaultInterval),
 		Mode:              pi.mode,
-		GapMin:            envx.Int64("NODE_HOST_AGENT_APIPROBER_GAP_MIN", defaultGapMin),
-		FailCycles:        envx.Int("NODE_HOST_AGENT_APIPROBER_FAIL_CYCLES", defaultFailCycles),
-		FrozenCycles:      envx.Int("NODE_HOST_AGENT_APIPROBER_FROZEN_CYCLES", defaultFrozenCycles),
-		RecoverCycles:     envx.Int("NODE_HOST_AGENT_APIPROBER_RECOVER_CYCLES", defaultRecoverCycles),
 		TokenFile:         pi.tokenFile,
 		CAFile:            pi.caFile,
-		// Mirrors the shell version's `curl -sk` — apiserver certs
-		// are not guaranteed to carry the backend IP in SANs.
-		InsecureTLS: envx.Bool("NODE_HOST_AGENT_APIPROBER_INSECURE_TLS", true),
-		// Probe paths are overridable — the live path must be a
-		// consistent read returning .metadata.resourceVersion
-		// (swap to /api/v1/namespaces/default/services?limit=1
-		// if the cluster doesn't serve leases under core/v1).
-		LivePath:  envx.String("NODE_HOST_AGENT_APIPROBER_LIVE_PATH", defaultLivePath),
-		CachePath: envx.String("NODE_HOST_AGENT_APIPROBER_CACHE_PATH", defaultCachePath),
 		// Same env/dir hostmetrics uses — one shared watchdog
 		// state dir mount for the whole pod.
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogSrc:      d.WatchdogSrc,
 	}
+	// The env surface beyond the guard.conf chain, one row per knob
+	// in declaration order.
+	envx.Apply([]envx.Knob{
+		envx.DurationKnob("NODE_HOST_AGENT_APIPROBER_INTERVAL", &cfg.Interval, defaultInterval),
+		envx.Int64Knob("NODE_HOST_AGENT_APIPROBER_GAP_MIN", &cfg.GapMin, defaultGapMin),
+		envx.IntKnob("NODE_HOST_AGENT_APIPROBER_FAIL_CYCLES", &cfg.FailCycles, defaultFailCycles),
+		envx.IntKnob("NODE_HOST_AGENT_APIPROBER_FROZEN_CYCLES", &cfg.FrozenCycles, defaultFrozenCycles),
+		envx.IntKnob("NODE_HOST_AGENT_APIPROBER_RECOVER_CYCLES", &cfg.RecoverCycles, defaultRecoverCycles),
+		// Mirrors the shell version's `curl -sk` — apiserver certs
+		// are not guaranteed to carry the backend IP in SANs.
+		envx.BoolKnob("NODE_HOST_AGENT_APIPROBER_INSECURE_TLS", &cfg.InsecureTLS, true),
+		// Probe paths are overridable — the live path must be a
+		// consistent read returning .metadata.resourceVersion
+		// (swap to /api/v1/namespaces/default/services?limit=1
+		// if the cluster doesn't serve leases under core/v1).
+		envx.StringKnob("NODE_HOST_AGENT_APIPROBER_LIVE_PATH", &cfg.LivePath, defaultLivePath),
+		envx.StringKnob("NODE_HOST_AGENT_APIPROBER_CACHE_PATH", &cfg.CachePath, defaultCachePath),
+	})
+	return cfg
 }

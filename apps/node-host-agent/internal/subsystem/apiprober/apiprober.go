@@ -70,8 +70,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // Mode values — the shell script's dry-run default is preserved.
@@ -113,7 +113,6 @@ const (
 	defaultGuardConfPath = "/etc/api-backend-guard.conf"
 )
 
-// Config carries the prober's knobs — all test-injectable.
 // StaticBackend is an API_BACKENDS-style entry — an apiserver to
 // probe by name + ip:port independent of `show stat` (external API LB
 // VMs where the server line has no explicit address, or controllers

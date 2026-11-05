@@ -72,11 +72,12 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/procfs"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checks"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // Autofix modes — the shell *_AUTOFIX knobs are preserved verbatim:
@@ -314,6 +315,12 @@ type Hygiene struct {
 	// CPFreezeQuietFor (W8-CP3).
 	kcmQuietSince time.Time
 
+	// groups is the ordered per-Cycle dispatch table — initChecks
+	// fills it; the ungated-then-uptime-gated grouping preserves
+	// the shell timer/module split (only module 22 carried
+	// WD_REQUIRES:uptime).
+	groups []checks.Group
+
 	cycles    *prometheus.CounterVec // check, result
 	actions   *prometheus.CounterVec // check, action
 	rvGap     prometheus.Gauge
@@ -407,6 +414,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 			}
 		}
 	}
+	h.initChecks()
 	return h, nil
 }
 
@@ -470,9 +478,61 @@ func (h *Hygiene) runCycle(ctx context.Context) {
 	}
 }
 
-// Cycle runs one round of all four guards. The k0scontroller unit
-// file gates everything (WD_REQUIRES: unit:k0scontroller). Each check
-// must never panic and degrades to no-op on missing files.
+// initChecks builds the ordered dispatch table Cycle drives — the
+// workerhygiene initChecks pattern. Order + grouping are
+// load-bearing: the 60s-timer guards (kine pool, OOM loop) had no
+// uptime gate in shell and run first; only the module-22 checks
+// carried WD_REQUIRES: uptime. The controllerhygiene checks carry
+// no WD_SIG kill switch (the shell timers had none) — Dispatch gets
+// a nil sigOn and every entry runs.
+func (h *Hygiene) initChecks() {
+	h.groups = []checks.Group{
+		{
+			Entries: []checks.Entry{
+				{Name: checkKinePool, Run: h.checkKinePool},
+				{Name: checkOOMLoop, Run: h.checkOOMLoop},
+				// etcdguard is in the ungated group like
+				// kine-pool/oomloop — an embedded etcd that hit
+				// quota during boot needs the guard BEFORE the
+				// 20min wedge grace, and hosts without etcdctl
+				// no-op.
+				{Name: checkEtcd, Run: h.checkEtcdQuota},
+				// W8-CP3/CP4 are ungated like the 60s-timer
+				// guards: a frozen KCM/scheduler or a stale PKI
+				// reload must not wait out the module-22 boot
+				// grace — both probes are read-only until their
+				// own consecutive-cycle + rate budgets pass.
+				{Name: checkCPFreeze, Run: h.checkCPFreeze},
+				{Name: checkPKIDrift, Run: h.checkPKIReloadDrift},
+			},
+		},
+		{
+			// WD_REQUIRES: uptime unit:k0scontroller — 20min
+			// grace after boot before the destructive wedge/TTL
+			// checks. The skip counts ONCE under checkHub —
+			// the label the gated cycle always reported.
+			GateOK:    h.uptimeOK,
+			GateLabel: checkHub,
+			Entries: []checks.Entry{
+				{Name: checkHub, Run: h.checkApiserverHub},
+				{Name: checkKineTTL, Run: h.checkKineTTL},
+			},
+		},
+	}
+}
+
+// uptimeOK is the module-22 WD_REQUIRES:uptime group gate — a
+// /proc read error opens it (the shell's numeric test on an empty
+// UPTIME failed open the same way: the module ran).
+func (h *Hygiene) uptimeOK() bool {
+	up, err := h.proc.UptimeSeconds()
+	return err != nil || up >= minUptimeSeconds
+}
+
+// Cycle runs one round of every check in the declared dispatch
+// table. The k0scontroller unit file gates everything
+// (WD_REQUIRES: unit:k0scontroller). Each check must never panic
+// and degrades to no-op on missing files.
 func (h *Hygiene) Cycle(ctx context.Context) {
 	// BUG-H1: refresh <state>/last-run every cycle — the liveness
 	// stamp the watchdog-stalled alert reads (the alert keys on
@@ -488,29 +548,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// BUG-H9: hostconfig rewrites /etc/node-watchdog.conf mid-run —
 	// refresh the conf-derived knobs before the checks consume them.
 	h.refreshWatchdogConf()
-	// The 60s-timer guards (kine pool, OOM loop) had no uptime gate in
-	// shell — they run immediately. Only the module-22 checks carried
-	// WD_REQUIRES: uptime.
-	h.checkKinePool(ctx)
-	h.checkOOMLoop(ctx)
-	// etcdguard is in the ungated group like kine-pool/oomloop — an
-	// embedded etcd that hit quota during boot needs the guard
-	// BEFORE the 20min wedge grace, and hosts without etcdctl no-op.
-	h.checkEtcdQuota(ctx)
-	// W8-CP3/CP4 are ungated like the 60s-timer guards: a frozen
-	// KCM/scheduler or a stale PKI reload must not wait out the
-	// module-22 boot grace — both probes are read-only until their
-	// own consecutive-cycle + rate budgets pass.
-	h.checkCPFreeze(ctx)
-	h.checkPKIReloadDrift(ctx)
-	// uptime gate (WD_REQUIRES: uptime unit:k0scontroller — 20min
-	// grace after boot before the destructive wedge/TTL checks).
-	if up, err := h.proc.UptimeSeconds(); err == nil && up < minUptimeSeconds {
-		h.cycles.WithLabelValues(checkHub, "uptime_gate").Inc()
-		return
-	}
-	h.checkApiserverHub(ctx)
-	h.checkKineTTL(ctx)
+	checks.Dispatch(ctx, nil, h.cycles, h.groups)
 }
 
 // refreshWatchdogConf re-applies the watchdogconf-derived knobs each

@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 // ---------- T4 nodelocaldns guard ----------
@@ -85,7 +85,7 @@ table ip nodelocaldns_guard {
 	c.applyNftUnit("nodelocaldns-guard", "/etc/nodelocaldns-guard.nft",
 		[]byte(nft), "nodelocal-dns :53 guard (block non-cluster sources)")
 	// sweep the buggy nftables.d path this port originally wrote
-	r.removeManaged("/etc/nftables.d/nodelocaldns-guard.nft")
+	_, _ = r.removeManaged("/etc/nftables.d/nodelocaldns-guard.nft")
 	// W6.1: the node-internal listener ports get the same guard —
 	// non-cluster sources have no business reaching kubelet/NPD/
 	// exporter endpoints over the underlay.
@@ -138,15 +138,15 @@ func (c *cyc) convergeHostPortsGuard() {
 		enabled = c.vb("host_internal_ports_guard_enabled")
 	}
 	if !enabled {
-		r.run(ctx, "systemctl", "disable", "--now", "host-internal-ports-guard.service")
+		_, _ = r.run(ctx, "systemctl", "disable", "--now", "host-internal-ports-guard.service")
 		uch, _ := r.removeManaged("/etc/systemd/system/host-internal-ports-guard.service")
-		r.removeManaged("/etc/host-internal-ports-guard.nft")
+		_, _ = r.removeManaged("/etc/host-internal-ports-guard.nft")
 		if uch {
 			r.daemonReload(ctx)
 		}
 		// Drop the LIVE table too — disabling must actually reopen
 		// the ports, not only stop the oneshot.
-		r.run(ctx, "sh", "-c",
+		_, _ = r.run(ctx, "sh", "-c",
 			"nft delete table ip host_internal_ports_guard 2>/dev/null; true")
 		return
 	}

@@ -2,7 +2,7 @@ package workerhygiene
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -10,9 +10,9 @@ import (
 	"golang.org/x/sys/unix"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/probee"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // Config carries the hygiene knobs — all test-injectable. The knobs
@@ -600,7 +600,7 @@ func (s *Seams) applyDefaults(c *Config) {
 		sd := c.Systemd
 		s.ctrRmImage = func(ctx context.Context, image string) error {
 			if sd == nil {
-				return fmt.Errorf("no systemd client wired")
+				return errors.New("no systemd client wired")
 			}
 			_, err := sd.Exec(ctx,
 				"k0s", "ctr", "--namespace", "k8s.io", "images", "rm", "--sync", image)
@@ -613,7 +613,7 @@ func (s *Seams) applyDefaults(c *Config) {
 			if sd == nil {
 				// Fail, not empty: a nil client fed the unreadable
 				// tracker a fake "journald-wide empty reply" verdict.
-				return "", fmt.Errorf("no systemd client wired")
+				return "", errors.New("no systemd client wired")
 			}
 			return sd.Journal(ctx, "k0sworker.service", journalWindow)
 		}
@@ -622,7 +622,7 @@ func (s *Seams) applyDefaults(c *Config) {
 		sd := c.Systemd
 		s.journalAnyFn = func(ctx context.Context) (string, error) {
 			if sd == nil {
-				return "", fmt.Errorf("no systemd client wired")
+				return "", errors.New("no systemd client wired")
 			}
 			return sd.ExecCombined(ctx,
 				"journalctl", "-n", "1", "--no-pager")
@@ -651,7 +651,7 @@ func (s *Seams) applyDefaults(c *Config) {
 		sd := c.Systemd
 		s.ctrRmIngest = func(ctx context.Context, ref string) error {
 			if sd == nil {
-				return fmt.Errorf("no systemd client wired")
+				return errors.New("no systemd client wired")
 			}
 			_, err := sd.Exec(ctx,
 				"k0s", "ctr", "-n", "k8s.io", "content", "ingest", "rm", ref)
@@ -662,7 +662,7 @@ func (s *Seams) applyDefaults(c *Config) {
 		sd := c.Systemd
 		s.ctrPruneContent = func(ctx context.Context) error {
 			if sd == nil {
-				return fmt.Errorf("no systemd client wired")
+				return errors.New("no systemd client wired")
 			}
 			_, err := sd.Exec(ctx,
 				"k0s", "ctr", "-n", "k8s.io", "content", "prune")
@@ -673,7 +673,7 @@ func (s *Seams) applyDefaults(c *Config) {
 		sd := c.Systemd
 		s.wgAllowedIPsFn = func(ctx context.Context) (int, error) {
 			if sd == nil {
-				return 0, fmt.Errorf("no systemd client wired")
+				return 0, errors.New("no systemd client wired")
 			}
 			out, err := sd.Exec(ctx, "wg", "show", "cilium_wg0", "allowed-ips")
 			if err != nil {
@@ -697,7 +697,7 @@ func (s *Seams) applyDefaults(c *Config) {
 			}
 			n, ok := parseCiliumHealthNodes(body)
 			if !ok {
-				return 0, fmt.Errorf("no cluster.nodes in cilium healthz")
+				return 0, errors.New("no cluster.nodes in cilium healthz")
 			}
 			return n, nil
 		}

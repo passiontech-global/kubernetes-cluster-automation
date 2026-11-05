@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -185,7 +186,7 @@ func (d *sshDialer) Dial(ctx context.Context, t Target) (Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ssh key %s: %w", d.keyPath, err)
 	}
-	addr := net.JoinHostPort(t.IP, fmt.Sprint(d.port))
+	addr := net.JoinHostPort(t.IP, strconv.Itoa(d.port))
 	cfg := d.clientConfig(user, signer)
 	sudo := needsSudo(user)
 
@@ -194,7 +195,7 @@ func (d *sshDialer) Dial(ctx context.Context, t Target) (Conn, error) {
 		// `ssh -W %h:%p <jump>` — same key, no host-key check.
 		juser, jhost, jport := splitUserHost(t.ProxyJump)
 		if jport == "" {
-			jport = fmt.Sprint(d.port)
+			jport = strconv.Itoa(d.port)
 		}
 		jnc, jump, err := d.dialTCP(ctx, net.JoinHostPort(jhost, jport),
 			d.clientConfig(juser, signer))
@@ -368,7 +369,7 @@ func (c *sshConn) Run(ctx context.Context, cmd string) (string, error) {
 	}()
 	select {
 	case <-ctx.Done():
-		sess.Close()
+		_ = sess.Close()
 		<-done
 		return "", ctx.Err()
 	case <-done:
@@ -417,10 +418,10 @@ func (c *sshConn) Write(ctx context.Context, remotePath string, r io.Reader) err
 	}()
 	select {
 	case <-ctx.Done():
-		sess.Close()
+		_ = sess.Close()
 		// Wait for the copy goroutine to release r before returning
 		// — the caller closes the file/handle right after Write.
-		<-done
+		<-done //nolint:errcheck // value is sess.Wait() result — intentionally dropped on the cancel path
 		return ctx.Err()
 	case err := <-done:
 		return err

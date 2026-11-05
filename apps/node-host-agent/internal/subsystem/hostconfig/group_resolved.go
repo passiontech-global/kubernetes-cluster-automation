@@ -13,7 +13,7 @@ func (c *cyc) groupResolved() {
 	if !c.resolvedRunning() {
 		return
 	}
-	c.r.ensureDir("/etc/systemd/resolved.conf.d", 0o755)
+	_ = c.r.ensureDir("/etc/systemd/resolved.conf.d", 0o755)
 	if ch, _ := c.r.writeManaged("/etc/systemd/resolved.conf.d/99-fallback.conf",
 		[]byte(fmt.Sprintf(`# Managed by node-config-agent - diverse public fallback upstreams
 [Resolve]
@@ -29,7 +29,7 @@ Cache=yes
 		c.r.fileExists("/etc/systemd/system/systemd-timesyncd.service") ||
 		fileExistsNoRoot("/usr/lib/systemd/system/systemd-timesyncd.service") ||
 		fileExistsNoRoot("/lib/systemd/system/systemd-timesyncd.service") {
-		c.r.ensureDir("/etc/systemd/timesyncd.conf.d", 0o755)
+		_ = c.r.ensureDir("/etc/systemd/timesyncd.conf.d", 0o755)
 		if ch, _ := c.r.writeManaged("/etc/systemd/timesyncd.conf.d/99-fallback.conf",
 			[]byte(`# Managed by node-config-agent - public NTP fallbacks
 [Time]

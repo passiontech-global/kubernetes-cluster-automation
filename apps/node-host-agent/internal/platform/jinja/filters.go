@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -48,7 +49,7 @@ func runTest(name string, v any, args []any) (bool, error) {
 		}
 		re, err := regexp.Compile(Stringify(args[0]))
 		if err != nil {
-			return false, nil
+			return false, nil //nolint:nilerr // an unparseable pattern is no match, not a template error
 		}
 		return re.MatchString(Stringify(v)), nil
 	case "equalto", "eq":
@@ -463,7 +464,7 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		return runTest("search", v, args)
 	case "mandatory":
 		if IsNilOrUndef(v) {
-			return nil, fmt.Errorf("mandatory: value undefined")
+			return nil, errors.New("mandatory: value undefined")
 		}
 		return v, nil
 	}
@@ -823,7 +824,7 @@ func toPlainAt(v any, depth int) any {
 // a missing file converge to an empty config value.
 func doLookup(args []any, s *scope) (any, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("lookup: missing plugin name")
+		return nil, errors.New("lookup: missing plugin name")
 	}
 	kind := Stringify(args[0])
 	switch kind {

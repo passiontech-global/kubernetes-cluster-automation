@@ -6,7 +6,7 @@
 // The subcommands table IS the usage text — subcommandUsage renders
 // it, so the help can never drift from what dispatch accepts. Every
 // subcommand's flag parsing and run logic lives in its owning
-// internal/ops package (neblasign.Cmd is the precedent —
+// internal/ops package (nebulasign.Cmd is the precedent —
 // Cmd(ctx, args) int).
 package main
 
@@ -17,13 +17,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/concourseinit"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdrescue"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/hostconverge"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/k0sdrift"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/kinecheckdb"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/neblasign"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/concourseinit"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/etcdrescue"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/evpurge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/hostconverge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/k0sdrift"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/kinecheckdb"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/nebulasign"
 )
 
 // usageDescCol is the column descriptions start at in the usage

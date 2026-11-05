@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 const hostsBlockBegin = "# BEGIN node-watchdog-dns"
@@ -279,14 +279,14 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 		}
 	}
 	// Render the managed block from the pins.
-	block := ""
+	var block strings.Builder
 	for _, f := range n.pinFiles() {
 		if c := hostutil.ReadTrimmed(f); c != "" {
-			block += c + "\n"
+			block.WriteString(c + "\n")
 		}
 	}
-	if block != "" {
-		if n.renderHostsBlock(block) {
+	if block.Len() != 0 {
+		if n.renderHostsBlock(block.String()) {
 			n.state.AppendLog("ACTION: /etc/hosts dns-fallback block updated")
 			// Newly written pins mean DNS was dead — conntrack
 			// entries learned on the broken path blackhole lookups

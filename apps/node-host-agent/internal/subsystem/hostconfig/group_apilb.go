@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 // ---------- T12 api-local-lb ----------
@@ -23,7 +23,7 @@ func (c *cyc) groupAPILB() {
 	if !c.vb("api_lb_enabled") {
 		// rollback: unpin (BOTH marker styles) + stop/disable; cfg/unit
 		// files stay on disk for re-enable (ansible parity).
-		r.run(ctx, "systemctl", "disable", "--now", "api-local-lb.service")
+		_, _ = r.run(ctx, "systemctl", "disable", "--now", "api-local-lb.service")
 		c.unpinHosts()
 		return
 	}
@@ -78,7 +78,7 @@ func (c *cyc) groupAPILB() {
 		debFile := c.v("api_lb_haproxy_deb_file")
 		hostDeb := "/var/lib/node-watchdog/" + debFile
 		local := r.hp(hostDeb)
-		r.ensureDir("/var/lib/node-watchdog", 0o755)
+		_ = r.ensureDir("/var/lib/node-watchdog", 0o755)
 		if !(fileExistsNoRoot(local) && sha256FileOK(local, c.v("api_lb_haproxy_deb_sha256"))) {
 			if err := r.download(ctx, c.v("api_lb_haproxy_deb_url"), local, c.v("api_lb_haproxy_deb_sha256")); err != nil {
 				c.err("T12: haproxy deb download",
@@ -96,8 +96,8 @@ func (c *cyc) groupAPILB() {
 	}
 	// distro haproxy.service ships /etc/haproxy/haproxy.cfg (:80
 	// frontend) — A1 runs a dedicated unit; keep the distro one off.
-	r.run(ctx, "systemctl", "disable", "--now", "haproxy.service")
-	r.ensureDir("/etc/haproxy", 0o755)
+	_, _ = r.run(ctx, "systemctl", "disable", "--now", "haproxy.service")
+	_ = r.ensureDir("/etc/haproxy", 0o755)
 	// Candidate-staged validate-then-promote (applyNftUnit parity):
 	// haproxy -c runs on the CANDIDATE — a bad render never sits at
 	// the live path where ExecStart loads it on next start.
@@ -150,9 +150,9 @@ table ip api_local_dnat {
 		nftChanged = nch
 	}
 	// sweep the invented separate-unit deployment of the first port.
-	r.run(ctx, "systemctl", "disable", "--now", "api-lb-dnat.service")
-	r.removeManaged("/etc/systemd/system/api-lb-dnat.service")
-	r.removeManaged("/etc/nftables.d/api-lb-dnat.nft")
+	_, _ = r.run(ctx, "systemctl", "disable", "--now", "api-lb-dnat.service")
+	_, _ = r.removeManaged("/etc/systemd/system/api-lb-dnat.service")
+	_, _ = r.removeManaged("/etc/nftables.d/api-lb-dnat.nft")
 	unit, err := r.render("api-local-lb.service.j2", tctx)
 	if err != nil {
 		c.err("T12 unit render", "error", err)

@@ -151,9 +151,9 @@ func TestReplayLookback(t *testing.T) {
 	e := fixture(t)
 	old := e.now.Add(-time.Hour).Format(time.RFC3339)
 	fresh := e.now.Add(-time.Minute).Format(time.RFC3339)
-	raw := fmt.Sprintf("%s ACTION: restarting k0sworker - old\n", old) +
+	raw := old + " ACTION: restarting k0sworker - old\n" +
 		"no-timestamp ACTION: restarting k0sworker - bad\n" +
-		fmt.Sprintf("%s ACTION: restarting k0sworker - recent\n", fresh)
+		fresh + " ACTION: restarting k0sworker - recent\n"
 	e.appendRawLog(t, raw)
 	e.cycle()
 

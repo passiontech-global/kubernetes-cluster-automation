@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 // ---------- T9 coredns stub + hub ----------
@@ -50,7 +50,7 @@ func (c *cyc) groupCoreDNS() {
 	}
 
 	c.corednsInstallBinary()
-	r.ensureDir("/etc/coredns", 0o755)
+	_ = r.ensureDir("/etc/coredns", 0o755)
 
 	var corefile, desc string
 	if isHub {
@@ -116,7 +116,7 @@ func (c *cyc) groupCoreDNS() {
 	if ch, _ := r.writeManaged("/etc/coredns/Corefile", []byte(corefile), 0o644); ch {
 		cfgChanged = true
 	}
-	r.writeManaged("/etc/systemd/system/coredns.service", []byte(fmt.Sprintf(`# Managed by %s
+	_, _ = r.writeManaged("/etc/systemd/system/coredns.service", []byte(fmt.Sprintf(`# Managed by %s
 [Unit]
 Description=%s
 After=network-online.target %s
@@ -221,7 +221,7 @@ nameserver %s
 `, pub1, pub1, t.DNSResolvers[0])
 	}
 	fmt.Fprintf(&rc, "options timeout:2 attempts:2\n%s\n", extra)
-	r.writeManaged("/etc/resolv.conf", []byte(rc.String()), 0o644)
+	_, _ = r.writeManaged("/etc/resolv.conf", []byte(rc.String()), 0o644)
 }
 
 // pinZoneRecords — hub_converge blockinfile parity: full zone records

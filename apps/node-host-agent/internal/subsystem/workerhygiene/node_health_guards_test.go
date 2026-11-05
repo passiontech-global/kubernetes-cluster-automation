@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -20,11 +21,11 @@ import (
 // d-state check classifies by comm (runc/jbd2/...).
 func (e *env) mkStatProc(t *testing.T, pid int, comm, state, wchan string) {
 	t.Helper()
-	writeFile(t, filepath.Join(e.proc, fmt.Sprintf("%d", pid), "stat"),
+	writeFile(t, filepath.Join(e.proc, strconv.Itoa(pid), "stat"),
 		fmt.Sprintf("%d (%s) %s 1 0 0", pid, comm, state))
 	e.live[pid] = state != "Z"
 	if wchan != "" {
-		writeFile(t, filepath.Join(e.proc, fmt.Sprintf("%d", pid), "wchan"), wchan+"\n")
+		writeFile(t, filepath.Join(e.proc, strconv.Itoa(pid), "wchan"), wchan+"\n")
 	}
 }
 

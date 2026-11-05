@@ -13,6 +13,7 @@
 package topology
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/jinja"
 )
 
 // ---- re-exported jinja engine surface ----
@@ -29,7 +30,7 @@ import (
 // The mini-Jinja2 evaluator + its ordered-map/YAML values live in
 // internal/platform/jinja. These aliases and thin forwarders keep
 // the historical topology.X API so consumers (hostconfig, hubsync,
-// ops/neblasign, workerhygiene) compile unchanged.
+// ops/nebulasign, workerhygiene) compile unchanged.
 type (
 	// OMap is an insertion-ordered string-keyed map (see jinja.OMap).
 	OMap = jinja.OMap
@@ -55,7 +56,7 @@ func Render(text string, ctx map[string]any, env *Env) (string, error) {
 	return jinja.Render(text, ctx, env)
 }
 
-// Config: paths + node identity.
+// Config carries paths + node identity.
 type Config struct {
 	VarsDir  string // dir containing the four vars files (+ nebula certs)
 	NodeName string // registry key = OS hostname = k8s node name
@@ -282,7 +283,7 @@ func Load(cfg Config) (*Topology, error) {
 	}
 	nodes, ok := nodesV.(*OMap)
 	if !ok || nodes == nil {
-		return nil, fmt.Errorf("interdc_nodes.yaml: not a mapping")
+		return nil, errors.New("interdc_nodes.yaml: not a mapping")
 	}
 	t.Nodes = nodes
 

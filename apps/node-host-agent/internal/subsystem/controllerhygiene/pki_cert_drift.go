@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -38,7 +39,7 @@ func tlsDialCert(ctx context.Context, addr string) (*x509.Certificate, error) {
 	defer conn.Close()
 	state := conn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
-		return nil, fmt.Errorf("no peer certificate")
+		return nil, errors.New("no peer certificate")
 	}
 	return state.PeerCertificates[0], nil
 }

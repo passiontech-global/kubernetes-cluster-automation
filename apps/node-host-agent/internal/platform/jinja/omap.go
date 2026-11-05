@@ -10,6 +10,7 @@ package jinja
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -91,7 +92,7 @@ func DecodeYAML(data []byte) (any, error) {
 				return nil, verr
 			}
 			if v != nil {
-				return nil, fmt.Errorf("unexpected second yaml document")
+				return nil, errors.New("unexpected second yaml document")
 			}
 			// nil-decoding doc (bare `---`) — keep scanning.
 		case io.EOF:

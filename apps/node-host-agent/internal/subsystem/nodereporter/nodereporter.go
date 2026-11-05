@@ -35,6 +35,7 @@ package nodereporter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -43,9 +44,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
 // Defaults mirror the removed NPD config and the DaemonSet host mounts.
@@ -227,10 +228,10 @@ type Reporter struct {
 func New(cfg Config, reg prometheus.Registerer) (*Reporter, error) {
 	cfg.applyDefaults()
 	if cfg.Client == nil {
-		return nil, fmt.Errorf("nodereporter: Client is required")
+		return nil, errors.New("nodereporter: Client is required")
 	}
 	if cfg.NodeName == "" {
-		return nil, fmt.Errorf("nodereporter: NodeName is required")
+		return nil, errors.New("nodereporter: NodeName is required")
 	}
 	r := &Reporter{cfg: cfg, emittedEvts: map[string]*emittedEvent{}}
 	r.state = hoststate.New(cfg.WatchdogStateDir, "",

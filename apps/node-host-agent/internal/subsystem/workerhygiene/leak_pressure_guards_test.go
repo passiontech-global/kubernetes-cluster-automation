@@ -7,6 +7,7 @@ package workerhygiene
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -418,7 +419,7 @@ func TestPSIEvictorEvictionAPIError(t *testing.T) {
 	thrashEnv(t, e)
 	e.cs.PrependReactor("create", "pods",
 		func(k8stesting.Action) (bool, runtime.Object, error) {
-			return true, nil, fmt.Errorf("pods \"memhog\" is forbidden by pdb")
+			return true, nil, errors.New("pods \"memhog\" is forbidden by pdb")
 		})
 	pods := []corev1.Pod{*psiPod("memhog", "app", uidA)}
 	procRSSProc(t, e, 5001, uidA, 900000)
@@ -670,7 +671,7 @@ func TestCtrIngestGCPruneFailureSuspect(t *testing.T) {
 	e := fixture(t)
 	e.diskUsed = 0.80
 	e.h.cfg.Seams.ctrPruneContent = func(context.Context) error {
-		return fmt.Errorf("ctr content prune: exit status 1")
+		return errors.New("ctr content prune: exit status 1")
 	}
 	e.h.checkCtrIngestGC(context.Background(), true)
 	if got := logLines(t, e); !strings.Contains(got, "content prune failed") {

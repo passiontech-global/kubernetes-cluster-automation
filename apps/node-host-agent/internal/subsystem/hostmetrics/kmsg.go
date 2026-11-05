@@ -7,22 +7,19 @@
 package hostmetrics
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 )
 
 // --- kmsg/dmesg drain constants (W10-KR1) ---
@@ -55,7 +52,7 @@ const (
 // DaemonSet bind-mounts host /dev/kmsg; <HostRoot>/dev/kmsg covers
 // standalone layouts where only the host tree is mounted).
 var kmsgDevicePaths = func(hostRoot string) []string {
-	return []string{"/dev/kmsg", filepath.Join(hostRoot, "dev/kmsg")}
+	return kmsg.DevicePaths("/dev/kmsg", hostRoot)
 }
 
 // --- kernel-message detectors (W10-KR1) ---
@@ -148,7 +145,7 @@ type kmsgCursor struct {
 	bootID string
 	seq    uint64
 	usec   int64
-	unixTs int64
+	unixTS int64
 	lines  int
 	hash   uint64
 }
@@ -185,7 +182,7 @@ func (l *Latches) readKmsgCursor() *kmsgCursor {
 		if len(f) < 2 {
 			return nil
 		}
-		cur.unixTs, _ = strconv.ParseInt(f[1], 10, 64)
+		cur.unixTS, _ = strconv.ParseInt(f[1], 10, 64)
 		if len(f) >= 3 {
 			cur.lines, _ = strconv.Atoi(f[2])
 		} else {
@@ -215,7 +212,7 @@ func (l *Latches) writeKmsgCursor(cur *kmsgCursor) {
 	case "kmsg":
 		content = fmt.Sprintf("kmsg %s %d %d\n", cur.bootID, cur.seq, cur.usec)
 	case "dmesgT":
-		content = fmt.Sprintf("dmesgT %d %d\n", cur.unixTs, cur.lines)
+		content = fmt.Sprintf("dmesgT %d %d\n", cur.unixTS, cur.lines)
 	case "dmesgRaw":
 		content = fmt.Sprintf("dmesgRaw %d %d\n", cur.lines, cur.hash)
 	}
@@ -226,24 +223,18 @@ func (l *Latches) writeKmsgCursor(cur *kmsgCursor) {
 	}
 }
 
-// parseKmsgRecord splits "<pri>,<seq>,<usec>,<flags>;<msg>".
+// parseKmsgRecord splits "<pri>,<seq>,<usec>,<flags>;<msg>" — the
+// strict-decode gate (platform/kmsg.ParseRecord's Parsed flag) is
+// what makes a record cursor-eligible; the msg is whitespace-trimmed
+// for the classifiers.
 func parseKmsgRecord(line string) (kmsgRecord, bool) {
-	i := strings.IndexByte(line, ';')
-	if i < 0 {
-		return kmsgRecord{}, false
-	}
-	hdr := strings.Split(line[:i], ",")
-	if len(hdr) < 3 {
-		return kmsgRecord{}, false
-	}
-	seq, errS := strconv.ParseUint(hdr[1], 10, 64)
-	usec, errU := strconv.ParseInt(hdr[2], 10, 64)
-	if errS != nil || errU != nil {
+	r := kmsg.ParseRecord([]byte(line))
+	if !r.Parsed {
 		return kmsgRecord{}, false
 	}
 	return kmsgRecord{
-		seq: seq, usec: usec,
-		msg: strings.TrimSpace(line[i+1:]), parsed: true,
+		seq: r.Seq, usec: r.Usec,
+		msg: strings.TrimSpace(r.Msg), parsed: true,
 	}, true
 }
 
@@ -268,12 +259,7 @@ func (l *Latches) checkKernelDmesg() {
 // openKMSSession tries the kmsgDevicePaths candidates and parks the
 // first openable fd on the state.
 func (l *Latches) openKMSSession(st *kernelScanState) bool {
-	for _, p := range kmsgDevicePaths(l.c.cfg.HostRoot) {
-		f, err := os.OpenFile(p,
-			os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
-		if err != nil {
-			continue
-		}
+	if f := kmsg.Open(kmsgDevicePaths(l.c.cfg.HostRoot)...); f != nil {
 		st.sess = &kmsgSession{f: f}
 		return true
 	}
@@ -349,38 +335,25 @@ func (l *Latches) drainKmsg(st *kernelScanState) bool {
 // plus the highest seq/usec seen (0 when nothing parsed).
 func (l *Latches) readKmsgAvail(sess *kmsgSession) (
 	[]kmsgRecord, uint64, int64, error) {
-	data := sess.pending
+	// The pending carry counts against this tick's drain budget —
+	// the cap bounds pending+fresh bytes, not just the fd reads.
+	pending := sess.pending
 	sess.pending = nil
-	buf := make([]byte, 32*1024)
-	for len(data) < kmsgDrainCap {
-		n, err := sess.f.Read(buf)
-		if n > 0 {
-			data = append(data, buf[:n]...)
+	fresh, _, err := kmsg.Drain(sess.f, kmsgDrainCap-len(pending))
+	if err != nil {
+		if len(fresh) == 0 {
+			// Hard error with nothing delivered — the carry is
+			// already consumed; the caller drops the session.
+			return nil, 0, 0, err
 		}
-		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) ||
-				errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
-				break
-			}
-			if n == 0 {
-				return nil, 0, 0, err
-			}
-			break // delivered bytes + a sticky error — keep them
-		}
-		if n == 0 {
-			break
-		}
+		// Delivered bytes + a sticky error — keep them.
 	}
 	var recs []kmsgRecord
 	var maxSeq uint64
 	var maxUsec int64
-	for {
-		i := bytes.IndexByte(data, '\n')
-		if i < 0 {
-			break
-		}
-		line := string(data[:i])
-		data = data[i+1:]
+	lines, rest := kmsg.SplitLines(pending, fresh)
+	for _, lb := range lines {
+		line := string(lb)
 		if r, ok := parseKmsgRecord(line); ok {
 			recs = append(recs, r)
 			if r.seq > maxSeq {
@@ -395,12 +368,12 @@ func (l *Latches) readKmsgAvail(sess *kmsgSession) (
 			recs = append(recs, kmsgRecord{msg: line})
 		}
 	}
-	if len(data) > kmsgMaxPending {
+	if len(rest) > kmsgMaxPending {
 		// A single record can't exceed this sanely — drop the
 		// carry rather than grow without bound.
-		data = nil
+		rest = nil
 	}
-	sess.pending = data
+	sess.pending = rest
 	return recs, maxSeq, maxUsec, nil
 }
 
@@ -582,7 +555,7 @@ func (l *Latches) drainDmesg(st *kernelScanState) {
 			}
 			if newest > 0 {
 				l.writeKmsgCursor(&kmsgCursor{
-					mode: "dmesgT", unixTs: newest, lines: atNewest})
+					mode: "dmesgT", unixTS: newest, lines: atNewest})
 			}
 		default:
 			l.writeKmsgCursor(&kmsgCursor{
@@ -592,10 +565,10 @@ func (l *Latches) drainDmesg(st *kernelScanState) {
 		return
 	}
 	var fresh []string
-	var maxTs int64
+	var maxTS int64
 	switch mode {
 	case "dmesgT":
-		lastTs := cur.unixTs
+		lastTS := cur.unixTS
 		pending := cur.lines // same-second records already consumed
 		if pending < 0 {
 			pending = len(lines) + 1 // legacy cursor — boundary unknown
@@ -606,16 +579,16 @@ func (l *Latches) drainDmesg(st *kernelScanState) {
 			if !ok {
 				continue // can't order it — never reprocess blindly
 			}
-			if ts > lastTs {
+			if ts > lastTS {
 				fresh = append(fresh, dmesgMessage(ln))
-				if ts > maxTs {
-					maxTs = ts
+				if ts > maxTS {
+					maxTS = ts
 					atMax = 0
 				}
-				if ts == maxTs {
+				if ts == maxTS {
 					atMax++
 				}
-			} else if ts == lastTs {
+			} else if ts == lastTS {
 				atLast++
 				if atLast > pending {
 					fresh = append(fresh, dmesgMessage(ln))
@@ -623,14 +596,14 @@ func (l *Latches) drainDmesg(st *kernelScanState) {
 			}
 		}
 		switch {
-		case maxTs > 0:
+		case maxTS > 0:
 			l.writeKmsgCursor(&kmsgCursor{
-				mode: "dmesgT", unixTs: maxTs, lines: atMax})
+				mode: "dmesgT", unixTS: maxTS, lines: atMax})
 		case atLast > pending:
 			// Only same-second arrivals — advance the consumed
 			// count so they aren't reprocessed next tick.
 			l.writeKmsgCursor(&kmsgCursor{
-				mode: "dmesgT", unixTs: lastTs, lines: atLast})
+				mode: "dmesgT", unixTS: lastTS, lines: atLast})
 		}
 	default: // dmesgRaw — content-anchored, see drainDmesg doc.
 		trimmed := lines

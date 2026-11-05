@@ -29,7 +29,7 @@ import (
 // (STATE_DIR is intentionally unmapped — the Go port keeps per-
 // backend counters in memory; the watchdog compat files live in
 // WatchdogStateDir, a different dir with different contents.)
-//
+
 // GuardDefaults is the parsed api-backend-guard.conf — every field
 // zero means "fall through to the compiled default".
 type GuardDefaults struct {

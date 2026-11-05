@@ -357,3 +357,204 @@ func TestIntList(t *testing.T) {
 		t.Fatalf("all invalid: got %v want nil", got)
 	}
 }
+
+// Apply must run rows in table order and hand each row its own
+// declared Name — the contract bespoke {Name, Resolve} rows rely on.
+func TestApplyOrderAndName(t *testing.T) {
+	var got []string
+	Apply([]Knob{
+		{Name: "ENVX_TEST_KNOB_B", Resolve: func(k string) { got = append(got, k) }},
+		{Name: "ENVX_TEST_KNOB_A", Resolve: func(k string) { got = append(got, k) }},
+		{Name: "ENVX_TEST_KNOB_C", Resolve: func(k string) { got = append(got, k) }},
+	})
+	want := []string{"ENVX_TEST_KNOB_B", "ENVX_TEST_KNOB_A", "ENVX_TEST_KNOB_C"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("apply order = %v, want %v", got, want)
+	}
+}
+
+// The *Knob constructors must resolve through the same helpers the
+// imperative code called — env set wins, unset falls to def/conf.
+func TestStringKnob(t *testing.T) {
+	const key = "ENVX_TEST_STRING_KNOB"
+	var s string
+	Apply([]Knob{StringKnob(key, &s, "def")})
+	if s != "def" {
+		t.Fatalf("unset: got %q want def", s)
+	}
+	t.Setenv(key, "v")
+	Apply([]Knob{StringKnob(key, &s, "def")})
+	if s != "v" {
+		t.Fatalf("set: got %q want v", s)
+	}
+}
+
+func TestBoolKnob(t *testing.T) {
+	const key = "ENVX_TEST_BOOL_KNOB"
+	var b bool
+	Apply([]Knob{BoolKnob(key, &b, true)})
+	if !b {
+		t.Fatal("unset: got false want def true")
+	}
+	t.Setenv(key, "0")
+	Apply([]Knob{BoolKnob(key, &b, true)})
+	if b {
+		t.Fatal("set 0: got true want false")
+	}
+}
+
+func TestIntKnob(t *testing.T) {
+	const key = "ENVX_TEST_INT_KNOB"
+	var n int
+	Apply([]Knob{IntKnob(key, &n, 7)})
+	if n != 7 {
+		t.Fatalf("unset: got %d want 7", n)
+	}
+	t.Setenv(key, "42")
+	Apply([]Knob{IntKnob(key, &n, 7)})
+	if n != 42 {
+		t.Fatalf("set: got %d want 42", n)
+	}
+}
+
+func TestInt64Knob(t *testing.T) {
+	const key = "ENVX_TEST_INT64_KNOB"
+	var n int64
+	t.Setenv(key, "42")
+	Apply([]Knob{Int64Knob(key, &n, 9)})
+	if n != 42 {
+		t.Fatalf("set: got %d want 42", n)
+	}
+}
+
+func TestDurationKnob(t *testing.T) {
+	const key = "ENVX_TEST_DURATION_KNOB"
+	var d time.Duration
+	def := 10 * time.Second
+	Apply([]Knob{DurationKnob(key, &d, def)})
+	if d != def {
+		t.Fatalf("unset: got %v want %v", d, def)
+	}
+	t.Setenv(key, "2m")
+	Apply([]Knob{DurationKnob(key, &d, def)})
+	if d != 2*time.Minute {
+		t.Fatalf("set: got %v want 2m", d)
+	}
+}
+
+func TestOrKnob(t *testing.T) {
+	const key = "ENVX_TEST_OR_KNOB"
+	var s string
+	Apply([]Knob{OrKnob(key, &s, "conf")})
+	if s != "conf" {
+		t.Fatalf("unset: got %q want conf", s)
+	}
+	t.Setenv(key, "env")
+	Apply([]Knob{OrKnob(key, &s, "conf")})
+	if s != "env" {
+		t.Fatalf("set: got %q want env", s)
+	}
+}
+
+// StrOrKnob is the only three-tier constructor: env → conf → def,
+// with a set-but-unparseable env still winning verbatim (Or string
+// semantics — no parse layer to fall through).
+func TestStrOrKnob(t *testing.T) {
+	const key = "ENVX_TEST_STROR_KNOB"
+	var s string
+	Apply([]Knob{StrOrKnob(key, &s, "", "def")})
+	if s != "def" {
+		t.Fatalf("all empty: got %q want def", s)
+	}
+	Apply([]Knob{StrOrKnob(key, &s, "conf", "def")})
+	if s != "conf" {
+		t.Fatalf("conf only: got %q want conf", s)
+	}
+	t.Setenv(key, "env")
+	Apply([]Knob{StrOrKnob(key, &s, "conf", "def")})
+	if s != "env" {
+		t.Fatalf("env set: got %q want env", s)
+	}
+}
+
+func TestIntOrKnob(t *testing.T) {
+	const key = "ENVX_TEST_INTOR_KNOB"
+	var n int
+	Apply([]Knob{IntOrKnob(key, &n, 3, 9)})
+	if n != 3 {
+		t.Fatalf("unset: got %d want 3 (conf)", n)
+	}
+	t.Setenv(key, "bogus")
+	Apply([]Knob{IntOrKnob(key, &n, 3, 9)})
+	if n != 9 {
+		t.Fatalf("env invalid: got %d want 9 (def, not conf)", n)
+	}
+	t.Setenv(key, "5")
+	Apply([]Knob{IntOrKnob(key, &n, 3, 9)})
+	if n != 5 {
+		t.Fatalf("env set: got %d want 5", n)
+	}
+}
+
+func TestInt64OrKnob(t *testing.T) {
+	const key = "ENVX_TEST_INT64OR_KNOB"
+	var n int64
+	t.Setenv(key, "42")
+	Apply([]Knob{Int64OrKnob(key, &n, 3, 9)})
+	if n != 42 {
+		t.Fatalf("env set: got %d want 42", n)
+	}
+	t.Setenv(key, "")
+	Apply([]Knob{Int64OrKnob(key, &n, 3, 9)})
+	if n != 3 {
+		t.Fatalf("env empty: got %d want 3 (conf)", n)
+	}
+}
+
+func TestDurOrKnob(t *testing.T) {
+	const key = "ENVX_TEST_DUROR_KNOB"
+	var d time.Duration
+	def := 10 * time.Second
+	Apply([]Knob{DurOrKnob(key, &d, 30, def)})
+	if d != 30*time.Second {
+		t.Fatalf("unset: got %v want 30s (conf)", d)
+	}
+	t.Setenv(key, "bogus")
+	Apply([]Knob{DurOrKnob(key, &d, 30, def)})
+	if d != def {
+		t.Fatalf("env invalid: got %v want def %v", d, def)
+	}
+	t.Setenv(key, "2m")
+	Apply([]Knob{DurOrKnob(key, &d, 30, def)})
+	if d != 2*time.Minute {
+		t.Fatalf("env set: got %v want 2m", d)
+	}
+}
+
+func TestListKnob(t *testing.T) {
+	const key = "ENVX_TEST_LIST_KNOB"
+	var l []string
+	Apply([]Knob{ListKnob(key, &l)})
+	if l != nil {
+		t.Fatalf("unset: got %v want nil", l)
+	}
+	t.Setenv(key, "a, b")
+	Apply([]Knob{ListKnob(key, &l)})
+	if !slices.Equal(l, []string{"a", "b"}) {
+		t.Fatalf("set: got %v", l)
+	}
+}
+
+func TestIntListKnob(t *testing.T) {
+	const key = "ENVX_TEST_INTLIST_KNOB"
+	var l []int
+	Apply([]Knob{IntListKnob(key, &l)})
+	if l != nil {
+		t.Fatalf("unset: got %v want nil", l)
+	}
+	t.Setenv(key, "1,x,2")
+	Apply([]Knob{IntListKnob(key, &l)})
+	if !slices.Equal(l, []int{1, 2}) {
+		t.Fatalf("set: got %v", l)
+	}
+}

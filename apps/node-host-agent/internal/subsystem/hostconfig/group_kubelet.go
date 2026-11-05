@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 // ---------- T7 + T17 ----------
@@ -270,14 +270,14 @@ func (c *cyc) groupPulls() {
 					strings.TrimSuffix(evictionBlock(want), "\n"),
 					`(?m)^kind: KubeletConfiguration`)
 			}
-			r.writeManaged(cfgPath, []byte(s), 0o644)
+			_, _ = r.writeManaged(cfgPath, []byte(s), 0o644)
 		}
 	}
 
 	// containerd drop-ins — containerd-2.x plugin paths
 	// ([plugins.'io.containerd.cri.v1.images']). NO restart.
-	r.ensureDir("/etc/k0s/containerd.d", 0o755)
-	r.writeManaged("/etc/k0s/containerd.d/90-parallel-pulls.toml", []byte(fmt.Sprintf(
+	_ = r.ensureDir("/etc/k0s/containerd.d", 0o755)
+	_, _ = r.writeManaged("/etc/k0s/containerd.d/90-parallel-pulls.toml", []byte(fmt.Sprintf(
 		`# Managed by node-config-agent - T7 parallel image pulls.
 # Cap concurrent layer downloads now that kubelet has
 # serializeImagePulls off — bounds pull-storm bandwidth;
@@ -285,7 +285,7 @@ func (c *cyc) groupPulls() {
 [plugins.'io.containerd.cri.v1.images']
   max_concurrent_downloads = %s
 `, maxPar, dl)), 0o644)
-	r.writeManaged("/etc/k0s/containerd.d/91-registry-mirror.toml", []byte(
+	_, _ = r.writeManaged("/etc/k0s/containerd.d/91-registry-mirror.toml", []byte(
 		`# Managed by node-config-agent - T7 spegel P2P mirror prep.
 # The spegel init container writes /etc/containerd/certs.d/*/hosts.toml
 # (mirror http://<node-ip>:30020); containerd only reads certs.d when
@@ -299,7 +299,7 @@ func (c *cyc) groupPulls() {
 [plugins.'io.containerd.cri.v1.images'.registry]
   config_path = '/etc/containerd/certs.d'
 `), 0o644)
-	r.ensureDir("/etc/containerd/certs.d", 0o755)
+	_ = r.ensureDir("/etc/containerd/certs.d", 0o755)
 	// sweep the buggy drop-in + restart behaviour of the first port
-	r.removeManaged("/etc/k0s/containerd.d/parallel-pulls.toml")
+	_, _ = r.removeManaged("/etc/k0s/containerd.d/parallel-pulls.toml")
 }

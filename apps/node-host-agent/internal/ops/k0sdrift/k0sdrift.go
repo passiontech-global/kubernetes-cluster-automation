@@ -22,7 +22,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
 )
 
 // Cmd is the `check-k0s-drift` subcommand entrypoint: flag parsing +

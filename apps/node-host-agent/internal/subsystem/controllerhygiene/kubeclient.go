@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -88,7 +89,7 @@ func (h *Hygiene) buildClient() (*http.Client, error) {
 	if !h.cfg.InsecureTLS && len(caPEM) > 0 {
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(caPEM) {
-			return nil, fmt.Errorf("no certificates in CA data")
+			return nil, errors.New("no certificates in CA data")
 		}
 		tlsCfg.RootCAs = pool
 	}
@@ -155,7 +156,7 @@ func (h *Hygiene) loadCreds() (cert, key, ca []byte, err error) {
 		return cert, key, ca, nil
 	}
 	if _, statErr := os.Stat(h.cfg.AdminCert); statErr != nil {
-		return nil, nil, nil, nil // not a controller / k0s not initialised
+		return nil, nil, nil, nil //nolint:nilerr // not a controller / k0s not initialised
 	}
 	cert, err = os.ReadFile(h.cfg.AdminCert)
 	if err != nil {
