@@ -1,9 +1,9 @@
-// kernel_failure_latches.go — kernel deep-failure latch maintenance:
-// the /dev/kmsg + dmesg kernel-log classifiers (filesystem/block
-// errors, conntrack table-full, host-level OOM kills), pid/thread/fd
-// utilization pressure, clock-skew probing and the read-only-PVC-mount
-// evidence latch. Split out of latches.go — the latch ticker itself
-// (refreshLatches) stays there and calls into this file's updaters.
+// kmsg.go — W10-KR1 checkKernelDmesg: the /dev/kmsg + dmesg
+// kernel-log classifiers (filesystem/block errors, nf_conntrack
+// table-full drops, host-level OOM kills) → stateDir evidence
+// markers. workerhygiene consumes the OOM markers for the
+// SystemOOMVictim node event; this file owns the latches + counters.
+// The Wave-10 contract overview lives in wave10.go.
 package hostmetrics
 
 import (
@@ -13,9 +13,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -24,44 +22,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
-	"golang.org/x/sys/unix"
 )
 
-// ===========================================================================
-// Wave-10 — kernel deep-failure modes (W10-KR1/KR2/KR5, W10-ST1)
-//
-// The sections below extend the latch ticker with the Wave-10 contract:
-//
-//   - W10-KR1 checkKernelDmesg: /dev/kmsg drain (dmesg -T fallback)
-//     classifying filesystem/block errors, nf_conntrack table-full
-//     drops and host-level OOM kills into stateDir evidence markers.
-//     workerhygiene consumes the OOM markers for the SystemOOMVictim
-//     node event; this file owns the latches + counters.
-//   - W10-KR2 updatePidFDPressure: pid/thread/fd utilization ratios
-//     → state-pid-fd-pressure (KernelResourceExhaustion) + the
-//     node_agent_*_utilization_ratio textfile gauges (the W10 metric
-//     channel — same convention the controllerhygiene textfile
-//     channel uses;
-//     prometheus descs can't be added outside hostmetrics.go's New()).
-//   - W10-KR5 checkClockSkew: chronyc tracking (adjtimex offset
-//     fallback) → state-clock-skew (ClockSkewDetected) + a
-//     rate-limited `chronyc makestep`.
-//   - W10-ST1 updateFSReadonlyEvidence: ro ext4/xfs/btrfs mounts under the
-//     PVC provisioner roots parsed out of /proc/<pid>/mounts →
-//     state-fs-readonly (FilesystemReadOnly) ahead of statfs.
-// ===========================================================================
-
-// --- shared Wave-10 constants ---
+// --- kmsg/dmesg drain constants (W10-KR1) ---
 
 const (
-	// fsErrorLatchTTL bounds state-fs-readonly's kernel-error
-	// evidence: a marker older than this no longer holds the latch
-	// (a single ext4 error from a transient USB reset must not
-	// latch FilesystemReadOnly forever).
-	fsErrorLatchTTL = 30 * time.Minute
 	// conntrackBumpEvery rate-limits the nf_conntrack_max doubling —
 	// table-full bursts must not ratchet the sysctl every tick.
 	conntrackBumpEvery = 30 * time.Minute
@@ -72,30 +38,16 @@ const (
 	kmsgDrainCap = 8 << 20
 	// kmsgMaxPending bounds the partial-line carry.
 	kmsgMaxPending = 1 << 20
-	// kernelProcPressureRatio/Needed arm state-pid-fd-pressure —
-	// 90% utilization for 3 consecutive latch ticks.
-	kernelProcPressureRatio  = 0.90
-	kernelProcPressureNeeded = 3
-	// clockSkew thresholds (W10-KR5): makestep fires above 0.5s or
-	// on "Not synchronised"; the latch needs >2.0s for 5 ticks.
-	clockSkewStepOffset  = 0.5
-	clockSkewLatchOffset = 2.0
-	clockSkewLatchNeeded = 5
-	clockSkewMakestepGap = 10 * time.Minute
 )
 
 // Marker/state file names inside WatchdogStateDir — shared with
 // workerhygiene (the SystemOOMVictim consumer) by convention.
 const (
 	kmsgCursorFile          = "kmsg-cursor"
-	kmsgFsErrorFile         = "kmsg-fs-error"
 	kmsgConntrackDropsFile  = "kmsg-conntrack-drops"
 	kmsgOOMVictimFile       = "kmsg-host-oom-victim"
 	kmsgOOMCountFile        = "kmsg-host-oom-count"
-	pidFDCountFile          = "pid-fd-pressure-count"
-	clockSkewCountFile      = "clock-skew-count"
 	conntrackBumpBudgetFile = "last-conntrack-bump"
-	clockStepBudgetFile     = "last-clock-makestep"
 )
 
 // kmsgDevicePaths returns the /dev/kmsg candidates — a package var
@@ -105,20 +57,6 @@ const (
 var kmsgDevicePaths = func(hostRoot string) []string {
 	return []string{"/dev/kmsg", filepath.Join(hostRoot, "dev/kmsg")}
 }
-
-// runHostCmd executes a host binary for the Wave-10 probes that have
-// no Config seam (chronyc, dmesg) — a package var so tests stub it.
-// The 30s cap matches the nethealth runHostCmd convention.
-var runHostCmd = func(ctx context.Context, argv ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(cctx, argv[0], argv[1:]...).CombinedOutput()
-	return string(out), err
-}
-
-// textfileDirOverride wins over the HostRoot-derived textfile
-// dir in tests (controllerhygiene's kineTextfileDirOverride parity).
-var textfileDirOverride string
 
 // --- kernel-message detectors (W10-KR1) ---
 
@@ -223,10 +161,6 @@ func (l *Latches) kernelBootID() string {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
-}
-
-func (l *Latches) statePath(name string) string {
-	return filepath.Join(l.c.cfg.WatchdogStateDir, name)
 }
 
 func (l *Latches) readKmsgCursor() *kmsgCursor {
@@ -784,468 +718,3 @@ func dmesgMessage(line string) string {
 	}
 	return strings.TrimSpace(line)
 }
-
-// --- W10-KR2: pid/thread/fd exhaustion ---
-
-// kernelProcRatios computes the three utilization ratios the
-// state-pid-fd-pressure latch and the node_agent_* textfile gauges
-// share:
-//
-//	pids    — live /proc/<pid> dirs / pid_max
-//	threads — loadavg "running/total" entities / threads-max
-//	filefd  — file-nr allocated / max
-//
-// Each ratio carries its own ok flag — a source that didn't parse
-// must not emit a fake 0 gauge (the collectFileFD rule); ok=false
-// overall means NO source parsed — inconclusive evidence must not
-// move the latch (the kernelKeysUsedRatio rule).
-func (l *Latches) kernelProcRatios() (pids, threads, filefd float64,
-	pidsOK, threadsOK, fdOK, ok bool) {
-	seen := false
-	if entries, err := os.ReadDir(l.c.cfg.ProcRoot); err == nil {
-		tasks := 0
-		for _, e := range entries {
-			if e.IsDir() && pidDirRe.MatchString(e.Name()) {
-				tasks++
-			}
-		}
-		if max, mok := l.readProcFloat("sys/kernel/pid_max"); mok && max > 0 {
-			pids, pidsOK, seen = float64(tasks)/max, true, true
-		}
-	}
-	if b, err := os.ReadFile(filepath.Join(l.c.cfg.ProcRoot, "loadavg")); err == nil {
-		if f := strings.Fields(string(b)); len(f) >= 4 {
-			if pair := strings.Split(f[3], "/"); len(pair) == 2 {
-				if total, err := strconv.ParseFloat(pair[1], 64); err == nil {
-					if max, mok := l.readProcFloat("sys/kernel/threads-max"); mok && max > 0 {
-						threads, threadsOK, seen = total/max, true, true
-					}
-				}
-			}
-		}
-	}
-	if b, err := os.ReadFile(l.c.cfg.FileNRFile); err == nil {
-		if f := strings.Fields(string(b)); len(f) >= 3 {
-			alloc, errA := strconv.ParseFloat(f[0], 64)
-			max, errM := strconv.ParseFloat(f[2], 64)
-			if errA == nil && errM == nil && max > 0 {
-				filefd, fdOK, seen = alloc/max, true, true
-			}
-		}
-	}
-	return pids, threads, filefd, pidsOK, threadsOK, fdOK, seen
-}
-
-// readProcFloat reads one numeric file under ProcRoot.
-func (l *Latches) readProcFloat(elem string) (float64, bool) {
-	b, err := os.ReadFile(filepath.Join(l.c.cfg.ProcRoot, elem))
-	if err != nil {
-		return 0, false
-	}
-	v, err := strconv.ParseFloat(strings.TrimSpace(string(b)), 64)
-	if err != nil {
-		return 0, false
-	}
-	return v, true
-}
-
-// updatePidFDPressure drives state-pid-fd-pressure (W10-KR2 →
-// KernelResourceExhaustion): the WORST of the pid/thread/fd ratios
-// above 0.90 for kernelProcPressureNeeded consecutive latch ticks.
-// The count persists in the state dir so an agent restart keeps the
-// streak; any sub-threshold or inconclusive-free tick resets it.
-// The node_agent_*_utilization_ratio gauges ride the same evaluation
-// into the node-exporter textfile.
-func (l *Latches) updatePidFDPressure() {
-	pids, threads, filefd, pidsOK, threadsOK, fdOK, ok := l.kernelProcRatios()
-	if !ok {
-		return // inconclusive — leave count, latch and gauges alone
-	}
-	l.writeKernelUtilProm(pids, threads, filefd, pidsOK, threadsOK, fdOK)
-	worst, what := -1.0, ""
-	for _, r := range []struct {
-		v    float64
-		ok   bool
-		name string
-	}{{pids, pidsOK, "pids"}, {threads, threadsOK, "threads"}, {filefd, fdOK, "file-nr"}} {
-		if r.ok && r.v > worst {
-			worst, what = r.v, r.name
-		}
-	}
-	countPath := l.statePath(pidFDCountFile)
-	latchPath := l.c.state.Path(hoststate.LatchPIDFDPressure)
-	if worst > kernelProcPressureRatio {
-		n := int64(1)
-		if b, err := os.ReadFile(countPath); err == nil {
-			if v, perr := strconv.ParseInt(
-				strings.TrimSpace(string(b)), 10, 64); perr == nil {
-				n = v + 1
-			}
-		}
-		if err := os.WriteFile(countPath,
-			[]byte(strconv.FormatInt(n, 10)+"\n"), 0o644); err != nil {
-			logger().Debug("hostmetrics: pid-fd count write failed",
-				"path", countPath, "error", err)
-		}
-		if n >= kernelProcPressureNeeded {
-			l.ensureStateLatch(latchPath, hoststate.LatchFilePrefix+hoststate.LatchPIDFDPressure,
-				fmt.Sprintf("%s ratio=%.3f", what, worst))
-		} else if _, err := os.Stat(latchPath); err == nil {
-			// A latch from an earlier episode outliving a fresh
-			// sub-threshold streak can't happen (the else branch
-			// clears it) — remove defensively anyway.
-			_ = os.Remove(latchPath)
-		}
-		return
-	}
-	// Below threshold — reset the streak and release the latch.
-	_ = os.Remove(countPath)
-	if _, err := os.Stat(latchPath); err == nil {
-		if rerr := os.Remove(latchPath); rerr != nil {
-			logger().Warn("hostmetrics: pid-fd-pressure latch remove failed",
-				"path", latchPath, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: pid-fd-pressure latch cleared",
-				"worst", what, "ratio", worst, "path", latchPath)
-		}
-	}
-}
-
-// ensureStateLatch installs a state latch when absent (epoch content,
-// atomic tmp+rename — the updateKernelKeysLatch pattern) and logs
-// the transition once; BUG-H6's refresh loop owns the mtime while
-// held.
-func (l *Latches) ensureStateLatch(path, name, evidence string) {
-	if _, err := os.Stat(path); err == nil {
-		return
-	}
-	content := strconv.FormatInt(l.c.cfg.nowFn().Unix(), 10) + "\n"
-	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		logger().Warn("hostmetrics: "+name+" latch write failed",
-			"path", path, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		logger().Warn("hostmetrics: "+name+" latch install failed",
-			"path", path, "error", err)
-		return
-	}
-	logger().Warn("hostmetrics: "+name+" latch set — "+evidence,
-		"path", path)
-}
-
-// --- W10-KR5: clock skew ---
-
-// clockSkewProbe returns (offsetSeconds, synchronized, ok). Primary
-// source is `chronyc tracking` — its "System time" offset is the
-// measured skew and "Leap status" the sync verdict. Fallback is a
-// read-only adjtimex: Timex.Offset (µs) is the kernel's offset
-// estimate and STA_UNSYNC the sync verdict — enough to makestep and
-// (when the estimate exceeds 2s) to latch.
-func (l *Latches) clockSkewProbe() (float64, bool, bool) {
-	out, err := runHostCmd(context.Background(), "chronyc", "tracking")
-	if err == nil {
-		if off, synced, ok := parseChronycTracking(out); ok {
-			return off, synced, true
-		}
-	}
-	var tx unix.Timex
-	if _, err := l.c.cfg.adjtimexFn(&tx); err != nil {
-		return 0, false, false
-	}
-	return float64(tx.Offset) / 1e6,
-		tx.Status&unix.STA_UNSYNC == 0, true
-}
-
-// chronycSystemTimeRe parses "System time     : 0.0012 seconds fast
-// of NTP time" — signed seconds, fast positive.
-var chronycSystemTimeRe = regexp.MustCompile(
-	`System time\s*:\s*([0-9.]+)\s+seconds\s+(fast|slow)`)
-
-// parseChronycTracking extracts offset + sync state; ok=false when
-// the output lacks the expected fields (wrong chronyc version,
-// partial capture).
-func parseChronycTracking(out string) (float64, bool, bool) {
-	var off float64
-	found := false
-	for _, ln := range strings.Split(out, "\n") {
-		if m := chronycSystemTimeRe.FindStringSubmatch(ln); m != nil {
-			v, err := strconv.ParseFloat(m[1], 64)
-			if err != nil {
-				continue
-			}
-			if m[2] == "slow" {
-				v = -v
-			}
-			off, found = v, true
-		}
-	}
-	if !found {
-		return 0, false, false
-	}
-	synced := !strings.Contains(out, "Not synchronised")
-	return off, synced, true
-}
-
-// checkClockSkew drives state-clock-skew (W10-KR5 →
-// ClockSkewDetected): |offset| > 2.0s for clockSkewLatchNeeded
-// consecutive ticks. A >0.5s offset OR an unsynchronised clock earns
-// a `chronyc makestep` — rate-limited to one per 10m. Inconclusive
-// probes (no chronyc, adjtimex failure) leave count+latch alone.
-func (l *Latches) checkClockSkew() {
-	off, synced, ok := l.clockSkewProbe()
-	if !ok {
-		return
-	}
-	if (!synced || math.Abs(off) > clockSkewStepOffset) &&
-		l.c.state.RateTrySpend(clockStepBudgetFile, clockSkewMakestepGap) {
-		out, err := runHostCmd(context.Background(), "chronyc", "makestep")
-		if err != nil {
-			logger().Warn("hostmetrics: chronyc makestep failed",
-				"error", err, "out", strings.TrimSpace(out))
-		} else {
-			logger().Warn("hostmetrics: ACTION chronyc makestep — "+
-				"clock offset beyond step threshold",
-				"offset", off, "synced", synced)
-		}
-	}
-	countPath := l.statePath(clockSkewCountFile)
-	latchPath := l.c.state.Path(hoststate.LatchClockSkew)
-	if math.Abs(off) > clockSkewLatchOffset {
-		n := int64(1)
-		if b, err := os.ReadFile(countPath); err == nil {
-			if v, perr := strconv.ParseInt(
-				strings.TrimSpace(string(b)), 10, 64); perr == nil {
-				n = v + 1
-			}
-		}
-		if err := os.WriteFile(countPath,
-			[]byte(strconv.FormatInt(n, 10)+"\n"), 0o644); err != nil {
-			logger().Debug("hostmetrics: clock-skew count write failed",
-				"path", countPath, "error", err)
-		}
-		if n >= clockSkewLatchNeeded {
-			l.ensureStateLatch(latchPath, hoststate.LatchFilePrefix+hoststate.LatchClockSkew,
-				fmt.Sprintf("offset=%.3fs synced=%v", off, synced))
-		}
-		return
-	}
-	_ = os.Remove(countPath)
-	if _, err := os.Stat(latchPath); err == nil {
-		if rerr := os.Remove(latchPath); rerr != nil {
-			logger().Warn("hostmetrics: clock-skew latch remove failed",
-				"path", latchPath, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: clock-skew latch cleared",
-				"offset", off, "path", latchPath)
-		}
-	}
-}
-
-// --- W10-ST1: read-only mounts under PVC dirs ---
-
-// pvcMountFSTypes are the journaled filesystems a PVC backing mount
-// realistically uses — the plan's ext4/xfs plus btrfs (same failure
-// class, same ro-remount signature).
-var pvcMountFSTypes = map[string]bool{
-	"ext4": true, "xfs": true, "btrfs": true,
-}
-
-// k8sROBindExcludeRe filters the EXPECTED read-only binds Kubernetes
-// creates under pod volume dirs — configmap/secret/projected/
-// downwardapi/serviceaccount mounts are ro by design and must never
-// count as filesystem faults.
-var k8sROBindExcludeRe = regexp.MustCompile(
-	`kubernetes\.io~(configmap|secret|projected|downwardapi)|` +
-		`kubernetes\.io/serviceaccount`)
-
-// procMount is one parsed /proc/*/mounts line.
-type procMount struct {
-	mp     string
-	fstype string
-	src    string
-	ro     bool
-}
-
-// parseProcMounts parses mount-table content —
-// "src mp fstype opts dump pass" per line, octal escapes ignored
-// (mountpoints with spaces are rare under the PVC roots and a
-// missed escape only narrows matching, never widens it).
-func parseProcMounts(data []byte) []procMount {
-	var out []procMount
-	for _, ln := range strings.Split(string(data), "\n") {
-		f := strings.Fields(ln)
-		if len(f) < 4 {
-			continue
-		}
-		opts := strings.Split(f[3], ",")
-		m := procMount{src: f[0], mp: f[1], fstype: f[2]}
-		for _, o := range opts {
-			if o == "ro" {
-				m.ro = true
-			}
-		}
-		out = append(out, m)
-	}
-	return out
-}
-
-// pvcMountRoots returns the host-side roots whose submounts are PVC
-// backing volumes — OpenEBS LocalPV, local-path-provisioner, and the
-// kubelet pods dir (hostPath + PVC bind mounts alike). The mount
-// table reports HOST paths, so these are literal host paths —
-// OpenEBSLocalDir already follows that convention.
-func (l *Latches) pvcMountRoots() []string {
-	return []string{
-		l.c.cfg.OpenEBSLocalDir,
-		"/opt/local-path-provisioner",
-		"/var/lib/k0s/kubelet/pods",
-	}
-}
-
-// roPVCMounts returns "mp (fstype)" for every ro ext4/xfs/btrfs
-// mount under a PVC root that isn't an expected Kubernetes ro bind.
-func (l *Latches) roPVCMounts() []string {
-	// /proc/1/mounts is the host mount table under hostPID (the
-	// DaemonSet contract); ProcRoot/mounts covers odd layouts.
-	var data []byte
-	var err error
-	for _, p := range []string{
-		filepath.Join(l.c.cfg.ProcRoot, "1", "mounts"),
-		filepath.Join(l.c.cfg.ProcRoot, "mounts"),
-	} {
-		if data, err = os.ReadFile(p); err == nil {
-			break
-		}
-	}
-	if err != nil {
-		return nil
-	}
-	roots := l.pvcMountRoots()
-	var out []string
-	for _, m := range parseProcMounts(data) {
-		if !m.ro || !pvcMountFSTypes[m.fstype] {
-			continue
-		}
-		under := false
-		for _, r := range roots {
-			if r == "" {
-				continue
-			}
-			if m.mp == r || strings.HasPrefix(m.mp, r+"/") {
-				under = true
-				break
-			}
-		}
-		if !under {
-			continue
-		}
-		if k8sROBindExcludeRe.MatchString(m.mp) ||
-			k8sROBindExcludeRe.MatchString(m.src) {
-			continue
-		}
-		out = append(out, m.mp+" ("+m.fstype+")")
-	}
-	return out
-}
-
-// updateFSReadonlyEvidence drives state-fs-readonly — the Wave-10
-// evidence latch feeding FilesystemReadOnly. Two evidence sources,
-// either sufficient:
-//
-//   - a kmsg-fs-error marker younger than fsErrorLatchTTL (kernel
-//     saw a filesystem/block error — the fs may already be remounted
-//     ro or heading there), and
-//   - an ro ext4/xfs/btrfs mount under a PVC root in the host mount
-//     table (W10-ST1 — catches the remount statfs hasn't probed).
-//
-// The latch clears only when BOTH evidences are absent; an
-// unreadable mounts file contributes nothing (fail-safe, not
-// fail-latch).
-func (l *Latches) updateFSReadonlyEvidence() {
-	p := l.c.state.Path(hoststate.LatchFSReadonly)
-	_, lerr := os.Stat(p)
-	evidence := ""
-	if b, err := os.ReadFile(l.statePath(kmsgFsErrorFile)); err == nil {
-		if f := strings.Fields(string(b)); len(f) > 0 {
-			if epoch, perr := strconv.ParseInt(f[0], 10, 64); perr == nil {
-				age := l.c.cfg.nowFn().Unix() - epoch
-				if age >= 0 && age < int64(fsErrorLatchTTL.Seconds()) {
-					evidence = "kernel-fs-error"
-				} else {
-					_ = os.Remove(l.statePath(kmsgFsErrorFile))
-				}
-			}
-		}
-	}
-	if ros := l.roPVCMounts(); len(ros) > 0 {
-		if evidence != "" {
-			evidence += " + "
-		}
-		evidence += "ro-mount: " + strings.Join(ros, ", ")
-	}
-	switch {
-	case evidence != "" && lerr != nil:
-		l.ensureStateLatch(p, hoststate.LatchFilePrefix+hoststate.LatchFSReadonly, evidence)
-	case evidence == "" && lerr == nil:
-		if rerr := os.Remove(p); rerr != nil {
-			logger().Warn("hostmetrics: fs-readonly latch remove failed",
-				"path", p, "error", rerr)
-		} else {
-			logger().Info("hostmetrics: fs-readonly latch cleared — "+
-				"no fresh kernel fs errors, no ro PVC mounts",
-				"path", p)
-		}
-	}
-}
-
-// --- W10 textfile metrics (node-exporter channel) ---
-
-// textfileDir resolves the node-exporter textfile drop dir —
-// <HostRoot>/var/lib/node-exporter/textfile (the controllerhygiene
-// textfile-dir override parity: K0sDir's sibling under the same
-// convention).
-func (l *Latches) textfileDir() string {
-	if textfileDirOverride != "" {
-		return textfileDirOverride
-	}
-	return filepath.Join(l.c.cfg.HostRoot,
-		"var", "lib", "node-exporter", "textfile")
-}
-
-// writeKernelUtilProm emits the W10-KR2 utilization gauges —
-// node_agent_{pids,threads,file_nr}_utilization_ratio. Each series
-// appears only when its source parsed (no fake 0s — the
-// collectFileFD rule). promfile.Write stages + renames so
-// node_exporter never reads a partial file. Failures log at Debug:
-// refreshLatches runs every 30s and an unwritable mount must not
-// spam the watchdog tail.
-func (l *Latches) writeKernelUtilProm(pids, threads, filefd float64,
-	pidsOK, threadsOK, fdOK bool) {
-	var b promfile.Builder
-	if pidsOK {
-		b.Gauge("node_agent_pids_utilization_ratio",
-			"Live /proc pid dirs over kernel.pid_max.", pids)
-	}
-	if threadsOK {
-		b.Gauge("node_agent_threads_utilization_ratio",
-			"loadavg total entities over kernel.threads-max.", threads)
-	}
-	if fdOK {
-		b.Gauge("node_agent_file_nr_utilization_ratio",
-			"file-nr allocated over maximum — fd table pressure.", filefd)
-	}
-	dir := l.textfileDir()
-	if err := promfile.Write(dir,
-		"node-agent-kernel.prom", []byte(b.String())); err != nil {
-		logger().Debug("hostmetrics: kernel textfile install failed",
-			"dir", dir, "error", err)
-	}
-}
-
-// --- small Wave-10 helpers (uniquely named per file rules) ---
-//
-// The last-* rate budgets (conntrackBumpBudgetFile,
-// clockStepBudgetFile) go through l.c.state — the shared hoststate
-// rateOK/rateSpend parity (atomic spend, same file format).
