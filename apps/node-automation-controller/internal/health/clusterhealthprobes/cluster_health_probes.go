@@ -113,8 +113,8 @@ const (
 	// alerting path under their own check names.
 	checkNameLocalPVStranded = "localpv-stranded-pods"
 	checkNameOLMHealth       = "olm-subscription-health"
-	// W8 — the Wave-8 checks live in cluster_health_wave8.go; their
-	// check-name constants are declared there alongside the code.
+	// W8/W9 — the Wave-8/9 checks live in cluster_health_wave8.go;
+	// their check-name constants are declared there alongside the code.
 )
 
 // C6 watchdog knobs — the KCM leader Lease name and the
@@ -477,6 +477,31 @@ type clusterHealthProber struct {
 	//     the W8-NM2 cilium-operator (1h) and W8-NM3 linkerd (30m)
 	//     cooldowns, plus the W4 db-operator masterless heals.
 	meshHealed map[string]time.Time
+
+	// W9-NM2 watchdog state (under mu):
+	//   - linkerdDesyncSince: "ns/svc" → first sweep the headless
+	//     Service's EndpointSlice diverged from its Ready pod IPs;
+	//     pruned when the divergence resolves so a later desync
+	//     re-arms the window.
+	//   - linkerdDesyncEmitted: gauge tuples held at 1 — a tuple not
+	//     re-seen gets DeleteLabelValues, not a stale 1.
+	//   - linkerdDesyncHealed: "ns/svc" → last linkerd-destination
+	//     bounce — the 1h per-service cooldown (in-RAM: the pod is
+	//     the heal target, nothing else can carry the stamp).
+	linkerdDesyncSince   map[string]time.Time
+	linkerdDesyncEmitted map[string]bool
+	linkerdDesyncHealed  map[string]time.Time
+
+	// W9-ST1 watchdog state (under mu):
+	//   - scyllaFirstSeen: "member/ns/svc" | "gossip/ns/pod/uid" →
+	//     first sweep the signature showed; it must persist
+	//     scyllaSignatureMinAge before the gauge fires (the
+	//     degraded_condition reason carries its own clock — the CR
+	//     condition's lastTransitionTime). Pruned on resolve.
+	//   - scyllaEmitted: "ns/cluster/reason" gauge tuples held at 1 —
+	//     same DeleteLabelValues hygiene as the other emitted sets.
+	scyllaFirstSeen map[string]time.Time
+	scyllaEmitted   map[string]bool
 }
 
 func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg healthProbeConfig) *clusterHealthProber {
@@ -489,40 +514,47 @@ func newClusterHealthProber(cs kubernetes.Interface, dyn dynamic.Interface, cfg 
 		httpClient: &http.Client{},
 		now:        time.Now,
 		lastPass: map[string]time.Time{
-			checkNameDNS:                boot,
-			checkNameHTTPContent:        boot,
-			checkNamePodRestarts:        boot,
-			checkNamePodStatus:          boot,
-			checkNameResourceQuota:      boot,
-			checkNameKCMWorkqueue:       boot,
-			checkNameOperatorWorkqueue:  boot,
-			checkNameStatefulMasterless: boot,
-			checkNameRabbitMQSuspended:  boot,
-			checkNameLocalPVStranded:    boot,
-			checkNameOLMHealth:          boot,
-			checkNameSchedulerWatchdog:  boot,
-			checkNameMeshWatchdog:       boot,
-			checkNameNodeHang:           boot,
+			checkNameDNS:                 boot,
+			checkNameHTTPContent:         boot,
+			checkNamePodRestarts:         boot,
+			checkNamePodStatus:           boot,
+			checkNameResourceQuota:       boot,
+			checkNameKCMWorkqueue:        boot,
+			checkNameOperatorWorkqueue:   boot,
+			checkNameStatefulMasterless:  boot,
+			checkNameRabbitMQSuspended:   boot,
+			checkNameLocalPVStranded:     boot,
+			checkNameOLMHealth:           boot,
+			checkNameSchedulerWatchdog:   boot,
+			checkNameMeshWatchdog:        boot,
+			checkNameNodeHang:            boot,
+			checkNameLinkerdEndpointSync: boot,
+			checkNameScyllaHealth:        boot,
 		},
-		kcmFirstSeen:      map[string]time.Time{},
-		kcmFrozenReasons:  map[string]bool{},
-		opFirstSeen:       map[string]time.Time{},
-		opFrozen:          map[string]bool{},
-		opHealed:          map[string]time.Time{},
-		stsZeroSince:      map[string]time.Time{},
-		stsZeroEmitted:    map[string]bool{},
-		drHealed:          map[string]time.Time{},
-		drPodHealed:       map[string]time.Time{},
-		rbSuspendedSince:  map[string]time.Time{},
-		rbHealed:          map[string]time.Time{},
-		localPVEmitted:    map[string]bool{},
-		pvcStalledEmitted: map[string]bool{},
-		localPVHealed:     map[string]time.Time{},
-		pvcProvHealed:     map[string]time.Time{},
-		olmFirstSeen:      map[string]time.Time{},
-		olmEmitted:        map[string]bool{},
-		olmHealed:         map[string]time.Time{},
-		meshHealed:        map[string]time.Time{},
+		kcmFirstSeen:         map[string]time.Time{},
+		kcmFrozenReasons:     map[string]bool{},
+		opFirstSeen:          map[string]time.Time{},
+		opFrozen:             map[string]bool{},
+		opHealed:             map[string]time.Time{},
+		stsZeroSince:         map[string]time.Time{},
+		stsZeroEmitted:       map[string]bool{},
+		drHealed:             map[string]time.Time{},
+		drPodHealed:          map[string]time.Time{},
+		rbSuspendedSince:     map[string]time.Time{},
+		rbHealed:             map[string]time.Time{},
+		localPVEmitted:       map[string]bool{},
+		pvcStalledEmitted:    map[string]bool{},
+		localPVHealed:        map[string]time.Time{},
+		pvcProvHealed:        map[string]time.Time{},
+		olmFirstSeen:         map[string]time.Time{},
+		olmEmitted:           map[string]bool{},
+		olmHealed:            map[string]time.Time{},
+		meshHealed:           map[string]time.Time{},
+		linkerdDesyncSince:   map[string]time.Time{},
+		linkerdDesyncEmitted: map[string]bool{},
+		linkerdDesyncHealed:  map[string]time.Time{},
+		scyllaFirstSeen:      map[string]time.Time{},
+		scyllaEmitted:        map[string]bool{},
 	}
 }
 
@@ -577,6 +609,8 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 		{checkNameSchedulerWatchdog, p.checkSchedulerFrozen},
 		{checkNameMeshWatchdog, p.checkMeshControlPlane},
 		{checkNameNodeHang, p.checkNodeHangPreCordon},
+		{checkNameLinkerdEndpointSync, p.checkLinkerdEndpointSync},
+		{checkNameScyllaHealth, p.checkScyllaHealth},
 	}
 	for _, c := range checks {
 		res := c.probe(ctx)

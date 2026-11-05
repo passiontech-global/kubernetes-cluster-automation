@@ -692,3 +692,24 @@ func TestPartitionEvictorLeavesPodsOnHealthyNodes(t *testing.T) {
 		}
 	}
 }
+
+// W9-CP3 — NebulaPMTUBlackhole (the node-host-agent PMTU latch) flags
+// the node for partition eviction exactly like NebulaIsolated.
+func TestPartitionEvictorNebulaPMTUBlackhole(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "NebulaPMTUBlackhole", 20*time.Minute),
+		pePod("flux-system", "p1", "victim"),
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	e := &partitionEvictor{cs: cs}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !shared.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+		t.Fatal("PMTU-blackholed node not tainted")
+	}
+	if pePodExists(t, cs, "flux-system", "victim") {
+		t.Fatal("pod not evicted off a PMTU-blackholed node")
+	}
+}

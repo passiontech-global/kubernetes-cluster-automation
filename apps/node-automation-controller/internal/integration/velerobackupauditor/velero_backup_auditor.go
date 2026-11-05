@@ -25,10 +25,13 @@ package velerobackupauditor
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -57,6 +60,13 @@ var (
 		Group: "velero.io", Version: "v1", Resource: "backups"}
 	veleroBSLGVR = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v1", Resource: "backupstoragelocations"}
+	// W9-ST3 — Percona Everest operator CRDs: the DatabaseCluster
+	// declares spec.backup.enabled and the DatabaseClusterBackup
+	// carries spec.dbClusterName + status.state.
+	everestDBClusterGVR = schema.GroupVersionResource{
+		Group: "everest.percona.com", Version: "v1alpha1", Resource: "databaseclusters"}
+	everestDBBackupGVR = schema.GroupVersionResource{
+		Group: "everest.percona.com", Version: "v1alpha1", Resource: "databaseclusterbackups"}
 )
 
 // veleroStuckPhases are terminal-failure and wedged-in-flight
@@ -74,11 +84,25 @@ var veleroStuckPhases = map[string]string{
 
 const veleroStuckMaxAge = 6 * time.Hour
 
+// W9-ST3 — Everest backup health thresholds: a backup still
+// Running/Starting after 6h lost the thread (same window as the
+// Velero in-flight check), and the newest Succeeded backup older
+// than 36h means the schedule stopped producing restorable points.
+const (
+	everestBackupStuckMaxAge = 6 * time.Hour
+	everestBackupStaleMaxAge = 36 * time.Hour
+)
+
 // pausedKey / backupKey are the exact label tuples of the two
 // exported gauge vecs — the seen-set prune pattern from
 // cert-drift-auditor, kept as map keys so re-emit needs no splitting.
 type pausedKey struct{ namespace, schedule string }
 type backupKey struct{ namespace, schedule, reason string }
+
+// everestKey identifies one DBBackupUnhealthy series — the label
+// triple (namespace, DatabaseCluster name, reason) needed to delete
+// it again once the cluster's backup posture recovers.
+type everestKey struct{ namespace, cluster, reason string }
 
 // pausedLedgerKey identifies one Schedule generation for the
 // firstSeenPaused clock — the UID distinguishes a delete+recreate
@@ -102,6 +126,11 @@ type veleroBackupAuditor struct {
 	// delete, and a controller restart re-arms it (biased to
 	// under-page, never to alert on an unmeasurable pause).
 	firstSeenPaused map[pausedLedgerKey]time.Time
+	// seenEverest: series ledger for DBBackupUnhealthy — an
+	// everestKey the sweep stops re-asserting gets
+	// DeleteLabelValues'd so a recovered or deleted
+	// DatabaseCluster never pins the gauge.
+	seenEverest map[everestKey]bool
 }
 
 // Setup registers the 15m sweep — or nothing when
@@ -121,6 +150,7 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
 		seenBad:         map[backupKey]bool{},
 		seenBSL:         map[pausedKey]bool{},
 		firstSeenPaused: map[pausedLedgerKey]time.Time{},
+		seenEverest:     map[everestKey]bool{},
 	}
 	return shared.AddPeriodic(mgr, veleroAuditQueue, veleroAuditInterval, a.run)
 }
@@ -144,6 +174,15 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	if a.firstSeenPaused == nil {
 		a.firstSeenPaused = map[pausedLedgerKey]time.Time{}
 	}
+	if a.seenEverest == nil {
+		a.seenEverest = map[everestKey]bool{}
+	}
+
+	// W9-ST3 — the Everest DB-backup audit is independent of Velero:
+	// a cluster can run the Percona operator with no Velero at all,
+	// so it runs before (and regardless of) the schedule 404 early
+	// return below. Its error joins the run's, never masks it.
+	everestErr := a.auditEverestBackups(ctx)
 
 	schedules, err := a.dyn.Resource(veleroScheduleGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -151,16 +190,18 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		// contract as externalsecret-nudge.
 		if apierrors.IsNotFound(err) {
 			log.Info("skip: velero CRDs not installed")
-			return nil
+			return everestErr
 		}
-		return fmt.Errorf("list velero schedules: %w", err)
+		return errors.Join(everestErr,
+			fmt.Errorf("list velero schedules: %w", err))
 	}
 	backups, err := a.dyn.Resource(veleroBackupGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			backups = nil // schedules exist but backups CRD absent — check 1 still runs
 		} else {
-			return fmt.Errorf("list velero backups: %w", err)
+			return errors.Join(everestErr,
+				fmt.Errorf("list velero backups: %w", err))
 		}
 	}
 	latest := latestBackupsBySchedule(backups)
@@ -236,7 +277,8 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	case apierrors.IsNotFound(err):
 		// CRD absent — nothing to audit.
 	case err != nil:
-		return fmt.Errorf("list velero backupstoragelocations: %w", err)
+		return errors.Join(everestErr,
+			fmt.Errorf("list velero backupstoragelocations: %w", err))
 	default:
 		for i := range bsls.Items {
 			bsl := &bsls.Items[i]
@@ -262,7 +304,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	log.Info("sweep done", "schedules", len(schedules.Items),
 		"paused", len(currentPaused), "badBackups", len(currentBad),
 		"bslUnavailable", len(currentBSL))
-	return nil
+	return everestErr
 }
 
 // latestBackupsBySchedule indexes the newest Backup per owning
@@ -359,4 +401,156 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 			"backup", b.GetNamespace()+"/"+b.GetName(), "schedule", ns+"/"+schedule,
 			"warnings", warns)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// W9-ST3 — Everest (Percona) DatabaseCluster backup auditor
+// ---------------------------------------------------------------------------
+
+// auditEverestBackups evaluates every unpaused DatabaseCluster with
+// spec.backup.enabled against its DatabaseClusterBackups (matched on
+// spec.dbClusterName in the same namespace) and marks unhealthy
+// postures on metrics.DBBackupUnhealthy{namespace,cluster,reason}:
+//
+//	failed — the LATEST backup's status.state is "Failed";
+//	stuck  — ANY backup sits in "Running"/"Starting" for >6h;
+//	stale  — the newest "Succeeded" backup is older than 36h.
+//
+// Multiple reasons can co-flag (a stuck run beside a stale success
+// is both signals at once); a cluster with none emits nothing and
+// the seen-set prune clears whatever it used to flag. Clusters
+// without the Everest CRDs 404/NoMatch on the list — a quiet no-op,
+// same contract as the Velero half of this module.
+func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
+	log := logf.FromContext(ctx)
+	current := map[everestKey]bool{}
+
+	clusters, err := a.dyn.Resource(everestDBClusterGVR).List(ctx, metav1.ListOptions{})
+	switch {
+	case err == nil:
+		// proceed below
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		// Everest operator not installed — current stays empty so the
+		// prune below still clears any stale series.
+		clusters = &unstructured.UnstructuredList{}
+	default:
+		return fmt.Errorf("list everest databaseclusters: %w", err)
+	}
+
+	var backups *unstructured.UnstructuredList
+	if clusters != nil {
+		backups, err = a.dyn.Resource(everestDBBackupGVR).List(ctx, metav1.ListOptions{})
+		switch {
+		case err == nil:
+			// proceed
+		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+			backups = nil // backup CRD absent — clusters audit as "no backups"
+		default:
+			return fmt.Errorf("list everest databaseclusterbackups: %w", err)
+		}
+	}
+
+	// Index backups by owning DatabaseCluster ("ns/name") once —
+	// each cluster then judges only its own history.
+	byCluster := map[string][]*unstructured.Unstructured{}
+	if backups != nil {
+		for i := range backups.Items {
+			b := &backups.Items[i]
+			owner, _, _ := unstructured.NestedString(b.Object, "spec", "dbClusterName")
+			if owner == "" {
+				continue
+			}
+			key := b.GetNamespace() + "/" + owner
+			byCluster[key] = append(byCluster[key], b)
+		}
+	}
+
+	now := a.nowFn()
+	for i := range clusters.Items {
+		dc := &clusters.Items[i]
+		ns, name := dc.GetNamespace(), dc.GetName()
+		// Only clusters that opted into backups AND are not paused —
+		// a paused cluster's stale backups are deliberate, not rot.
+		enabled, _, _ := unstructured.NestedBool(dc.Object, "spec", "backup", "enabled")
+		paused, _, _ := unstructured.NestedBool(dc.Object, "spec", "paused")
+		if !enabled || paused {
+			continue
+		}
+		clusterBackups := byCluster[ns+"/"+name]
+		reasons := everestBackupReasons(clusterBackups, now)
+		for _, reason := range reasons {
+			k := everestKey{ns, name, reason}
+			current[k] = true
+			metrics.DBBackupUnhealthy.WithLabelValues(ns, name, reason).Set(1)
+			log.Info("everest databasecluster backup unhealthy",
+				"cluster", ns+"/"+name, "reason", reason,
+				"backups", len(clusterBackups))
+		}
+	}
+
+	for k := range a.seenEverest {
+		if !current[k] {
+			metrics.DBBackupUnhealthy.DeleteLabelValues(
+				k.namespace, k.cluster, k.reason)
+		}
+	}
+	a.seenEverest = current
+	return nil
+}
+
+// everestBackupReasons evaluates one DatabaseCluster's backup list
+// and returns the unhealthy reasons that apply (possibly several,
+// possibly none). Backup ordering is by creationTimestamp — the same
+// "latest" convention latestBackupsBySchedule uses for Velero.
+func everestBackupReasons(backups []*unstructured.Unstructured,
+	now time.Time) []string {
+	if len(backups) == 0 {
+		return nil // never produced a backup — can't judge, not rot
+	}
+	// Newest first by creationTimestamp.
+	sorted := slices.Clone(backups)
+	slices.SortFunc(sorted, func(x, y *unstructured.Unstructured) int {
+		return y.GetCreationTimestamp().Time.Compare(x.GetCreationTimestamp().Time)
+	})
+	var reasons []string
+
+	// failed — the LATEST backup ended Failed.
+	if state, _, _ := unstructured.NestedString(
+		sorted[0].Object, "status", "state"); state == "Failed" {
+		reasons = append(reasons, "failed")
+	}
+
+	// stuck — ANY backup wedged in Running/Starting past 6h.
+	for _, b := range sorted {
+		state, _, _ := unstructured.NestedString(b.Object, "status", "state")
+		if state != "Running" && state != "Starting" {
+			continue
+		}
+		if now.Sub(b.GetCreationTimestamp().Time) > everestBackupStuckMaxAge {
+			reasons = append(reasons, "stuck")
+			break
+		}
+	}
+
+	// stale — the newest Succeeded backup is older than 36h. Age is
+	// measured from status.completionTime when present (the moment
+	// the restorable point actually landed), else creationTimestamp.
+	for _, b := range sorted {
+		state, _, _ := unstructured.NestedString(b.Object, "status", "state")
+		if state != "Succeeded" {
+			continue
+		}
+		done := b.GetCreationTimestamp().Time
+		if ct, found, _ := unstructured.NestedString(
+			b.Object, "status", "completionTime"); found {
+			if t, err := time.Parse(time.RFC3339, ct); err == nil {
+				done = t
+			}
+		}
+		if now.Sub(done) > everestBackupStaleMaxAge {
+			reasons = append(reasons, "stale")
+		}
+		break // newest Succeeded decides — older ones are history
+	}
+	return reasons
 }

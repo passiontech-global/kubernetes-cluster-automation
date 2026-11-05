@@ -380,11 +380,20 @@ var ControlPlanePodHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 }, []string{"component"})
 
 // NodeHangCordonsTotal counts nodes preemptively cordoned by the W8-ST2
-// hang guard (FilesystemReadOnly / KernelHungTasks) before NHC/SNR
-// reboots them.
+// hang guard (FilesystemReadOnly / KernelHungTasks / ClockUnsynchronized)
+// before NHC/SNR reboots them.
 var NodeHangCordonsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "node_automation_node_hang_cordons_total",
 	Help: "Worker nodes patched spec.unschedulable after a sustained hang condition.",
+}, []string{"node"})
+
+// NodeHangUncordonsTotal counts nodes the W8-ST2 pre-cordon guard put
+// back into the scheduling pool after every hang latch cleared —
+// transient recovery or a post-SNR reboot that kept
+// spec.unschedulable.
+var NodeHangUncordonsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_node_hang_uncordons_total",
+	Help: "Worker nodes patched schedulable after the pre-cordon hang latch cleared.",
 }, []string{"node"})
 
 // VolumeAttachmentFinalizersRemovedTotal counts wedged VolumeAttachment
@@ -394,6 +403,31 @@ var VolumeAttachmentFinalizersRemovedTotal = prometheus.NewCounterVec(prometheus
 	Name: "node_automation_volumeattachment_finalizers_removed_total",
 	Help: "Stuck VolumeAttachment finalizers stripped to free the volume, by node.",
 }, []string{"node"})
+
+// ---------------------------------------------------------------------------
+// Wave 9 metrics (W9-CP3/W9-NM2/W9-ST1).
+// ---------------------------------------------------------------------------
+
+// LinkerdEndpointDesync marks (1) a headless Service in a
+// linkerd-injected namespace whose EndpointSlice stayed desynced from
+// its Ready pod IPs — missing a Ready pod IP or holding a deleted
+// pod's address — past the persistence window (W9-NM2). Past the
+// window the check also rolling-bounces the oldest
+// linkerd-destination pod (1h per-service cooldown) to force a
+// resync.
+var LinkerdEndpointDesync = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_linkerd_endpoint_desync",
+	Help: "1 while the headless Service's EndpointSlice misses a Ready pod IP or holds a deleted pod's address.",
+}, []string{"namespace", "service"})
+
+// ScyllaClusterUnhealthy marks (1) a ScyllaCluster or one of its
+// member services/pods reporting a sustained unhealthy signature past
+// its persistence window (W9-ST1). reason is degraded_condition |
+// member_service_desync | gossip_or_raft_stall.
+var ScyllaClusterUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_scylla_unhealthy",
+	Help: "1 while the ScyllaCluster/member shows a sustained unhealthy signature.",
+}, []string{"namespace", "cluster", "reason"})
 
 // queues are the legacy shell-operator queue names — pre-instantiated
 // at 0 so /metrics always exposes every series (an empty CounterVec
@@ -449,7 +483,9 @@ func init() {
 		OLMOperatorHealsTotal, ReplicatedSecretDrift,
 		SchedulerFrozen, VeleroBSLUnavailable,
 		ControlPlanePodHealsTotal, NodeHangCordonsTotal,
-		VolumeAttachmentFinalizersRemovedTotal)
+		NodeHangUncordonsTotal,
+		VolumeAttachmentFinalizersRemovedTotal,
+		LinkerdEndpointDesync, ScyllaClusterUnhealthy)
 	for _, q := range queues {
 		hookRunErrors.WithLabelValues(q)
 		reconcileErrors.WithLabelValues(q)

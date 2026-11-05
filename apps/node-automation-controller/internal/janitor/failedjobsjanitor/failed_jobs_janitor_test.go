@@ -12,12 +12,16 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -437,5 +441,108 @@ func TestAuditStuckPVCReferencedKept(t *testing.T) {
 	got, _ := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, "data", metav1.GetOptions{})
 	if len(got.Finalizers) == 0 {
 		t.Fatal("finalizer stripped while a pod still references the claim")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W9-GO2 — Shipwright BuildRun TTL sweep
+// ---------------------------------------------------------------------------
+
+// fjjBuildRun builds a BuildRun — succeeded is the Succeeded condition
+// status ("True"/"False"/"" for none), completedAgo backs
+// status.completionTime (0 omits it).
+func fjjBuildRun(ns, name, succeeded string, completedAgo time.Duration) *unstructured.Unstructured {
+	status := map[string]any{}
+	if completedAgo > 0 {
+		status["completionTime"] = time.Now().Add(-completedAgo).UTC().Format(time.RFC3339)
+	}
+	if succeeded != "" {
+		status["conditions"] = []any{map[string]any{
+			"type":   "Succeeded",
+			"status": succeeded,
+		}}
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "shipwright.io/v1beta1",
+		"kind":       "BuildRun",
+		"metadata":   map[string]any{"namespace": ns, "name": name},
+		"status":     status,
+	}}
+}
+
+func fjjDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	return testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
+		buildRunGVR: "BuildRunList",
+	}, objs...)
+}
+
+func fjjBuildRunExists(t *testing.T, dyn *dynamicfake.FakeDynamicClient, ns, name string) bool {
+	t.Helper()
+	_, err := dyn.Resource(buildRunGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return true
+	}
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+	t.Fatalf("get buildrun %s/%s: %v", ns, name, err)
+	return false
+}
+
+// Completed BuildRuns older than 24h are reaped; fresh completions,
+// still-running builds and builds with no Succeeded condition all
+// stay.
+func TestFailedJobsJanitorBuildRunTTL(t *testing.T) {
+	dyn := fjjDynFake(
+		fjjBuildRun("cicd", "old-ok", "True", 25*time.Hour),    // delete
+		fjjBuildRun("cicd", "old-fail", "False", 30*time.Hour), // delete
+		fjjBuildRun("cicd", "fresh", "True", 2*time.Hour),      // keep — inside TTL
+		fjjBuildRun("cicd", "running", "", 0),                  // keep — not completed
+		fjjBuildRun("cicd", "no-cond", "", 48*time.Hour),       // keep — no condition
+		fjjBuildRun("other", "old-ok", "True", 48*time.Hour),   // delete — all namespaces
+	)
+	j := &failedJobsJanitor{
+		cs: fake.NewSimpleClientset(), dyn: dyn, nowFn: time.Now,
+		stuckEmitted: map[stuckTerminatingKey]struct{}{},
+	}
+	if err := j.sweepBuildRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"old-ok", "old-fail"} {
+		if fjjBuildRunExists(t, dyn, "cicd", name) {
+			t.Fatalf("completed BuildRun %s older than TTL must be deleted", name)
+		}
+	}
+	if fjjBuildRunExists(t, dyn, "other", "old-ok") {
+		t.Fatal("completed BuildRun in another namespace must be deleted")
+	}
+	for _, name := range []string{"fresh", "running", "no-cond"} {
+		if !fjjBuildRunExists(t, dyn, "cicd", name) {
+			t.Fatalf("BuildRun %s must survive", name)
+		}
+	}
+}
+
+// No Shipwright CRD → the sweep is a quiet no-op, not an error.
+func TestFailedJobsJanitorBuildRunCRDAbsent(t *testing.T) {
+	j := &failedJobsJanitor{
+		cs: fake.NewSimpleClientset(), nowFn: time.Now,
+		stuckEmitted: map[stuckTerminatingKey]struct{}{},
+	}
+	// dyn nil — the sweep must no-op without a dynamic client.
+	if err := j.sweepBuildRuns(ctx); err != nil {
+		t.Fatalf("nil dyn must no-op: %v", err)
+	}
+	// A dyn fake without the BuildRun GVR registered panics on List —
+	// simulate the absent-CRD contract via a reactor returning 404.
+	dyn := fjjDynFake()
+	dyn.PrependReactor("list", "buildruns",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(
+				schema.GroupResource{Group: "shipwright.io", Resource: "buildruns"}, "x")
+		})
+	j.dyn = dyn
+	if err := j.sweepBuildRuns(ctx); err != nil {
+		t.Fatalf("absent Shipwright CRD must be a quiet no-op: %v", err)
 	}
 }

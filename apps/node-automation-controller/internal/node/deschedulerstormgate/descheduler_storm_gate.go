@@ -90,8 +90,9 @@ var autopilotPlanGVR = schema.GroupVersionResource{
 }
 
 // stormConds mirrors STORM_CONDS (see package comment for sources).
-// NebulaIsolated/NebulaDegraded are the node-host-agent overlay
-// conditions; KernelHungTasks, CalicoFelixDown and
+// NebulaIsolated/NebulaDegraded/NebulaPMTUBlackhole are the
+// node-host-agent overlay conditions; KernelHungTasks,
+// KernelSlabLeak, ClockUnsynchronized, CalicoFelixDown and
 // CiliumIPAMExhausted are the node-problem-detector/CNI latches that
 // make rebalancing actively harmful — same posture as the existing
 // network-problem conditions.
@@ -100,7 +101,8 @@ var stormConds = []corev1.NodeConditionType{
 	"WatchdogStale", "HostNetworkProblems", "ClusterNetworkProblems",
 	"HostNetworkProblem", "ClusterNetworkProblem", "MemoryPressure",
 	"DiskPressure", "NetworkUnavailable", "FilesystemReadOnly",
-	"NebulaIsolated", "NebulaDegraded", "KernelHungTasks",
+	"NebulaIsolated", "NebulaDegraded", "NebulaPMTUBlackhole",
+	"KernelHungTasks", "KernelSlabLeak", "ClockUnsynchronized",
 	"CalicoFelixDown", "CiliumIPAMExhausted",
 }
 

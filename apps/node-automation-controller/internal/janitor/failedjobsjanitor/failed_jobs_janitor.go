@@ -29,14 +29,20 @@ package failedjobsjanitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -59,7 +65,16 @@ const (
 	// continue-token pagination keeps a huge Job/PVC/VA fleet from
 	// arriving as one giant response body.
 	failedJobListPageSize = 500
+	// buildRunTTL is the W9-GO2 retention window for completed
+	// Shipwright BuildRuns — same 24h horizon as failed Jobs.
+	buildRunTTL = 24 * time.Hour
 )
+
+// buildRunGVR is the Shipwright BuildRun CRD — absent on clusters
+// without the Shipwright operator, in which case the sweep is a quiet
+// no-op (404/NoMatch tolerated, same contract as the Velero audit).
+var buildRunGVR = schema.GroupVersionResource{
+	Group: "shipwright.io", Version: "v1beta1", Resource: "buildruns"}
 
 // stuckTerminatingKey identifies one emitted
 // StuckTerminatingResources series — the label triple needed to
@@ -70,6 +85,10 @@ type stuckTerminatingKey struct {
 
 type failedJobsJanitor struct {
 	cs kubernetes.Interface
+	// dyn reads/writes CRDs (Shipwright BuildRuns, W9-GO2) — nil
+	// disables the BuildRun sweep only; every typed sweep is
+	// unaffected. main.go always wires the manager's dynamic client.
+	dyn dynamic.Interface
 	// nowFn is the clock seam — tests pin it to a fixed instant.
 	nowFn func() time.Time
 	// stuckEmitted: the kind/ns/name triples the audit marked on the
@@ -79,10 +98,14 @@ type failedJobsJanitor struct {
 	stuckEmitted map[stuckTerminatingKey]struct{}
 }
 
-// Setup registers the hourly sweep (was crontab 17 * * * *).
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface) error {
+// Setup registers the hourly sweep (was crontab 17 * * * *). dyn
+// carries the dynamic client the W9-GO2 BuildRun TTL sweep needs —
+// pass nil only in tests that never exercise it.
+func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
+	dyn dynamic.Interface) error {
 	j := &failedJobsJanitor{
 		cs:           cs,
+		dyn:          dyn,
 		nowFn:        time.Now,
 		stuckEmitted: map[stuckTerminatingKey]struct{}{},
 	}
@@ -178,8 +201,93 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 	log.Info("sweep done", "deleted", deleted, "failed", failed)
 
 	// C3b audit rides the same hourly tick — detect-only, it shares
-	// neither the job list nor the delete cap.
-	return j.auditStuckTerminating(ctx)
+	// neither the job list nor the delete cap. W9-GO2's BuildRun TTL
+	// sweep joins it: both are cluster-wide retention hygiene.
+	return errors.Join(j.sweepBuildRuns(ctx), j.auditStuckTerminating(ctx))
+}
+
+// ---------------------------------------------------------------------------
+// W9-GO2 — Shipwright BuildRun TTL janitor
+// ---------------------------------------------------------------------------
+
+// sweepBuildRuns deletes completed Shipwright BuildRuns whose
+// status.completionTime is older than buildRunTTL. "Completed" means
+// status.conditions carries Succeeded=True OR Succeeded=False — both
+// are terminal; a build still running or one that never reported a
+// condition is kept. Deletes carry the UID precondition like every
+// other delete in this module, and the whole sweep is a quiet no-op
+// when the Shipwright CRD is absent.
+func (j *failedJobsJanitor) sweepBuildRuns(ctx context.Context) error {
+	if j.dyn == nil {
+		return nil // no dynamic client wired — typed sweeps unaffected
+	}
+	log := logf.FromContext(ctx)
+	list, err := j.dyn.Resource(buildRunGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return nil // Shipwright not installed — nothing to reap
+		}
+		return fmt.Errorf("list buildruns: %w", err)
+	}
+	now := j.nowFn()
+	deleted := 0
+	for i := range list.Items {
+		br := &list.Items[i]
+		if br.GetDeletionTimestamp() != nil || !buildRunCompleted(br) {
+			continue
+		}
+		ct, found, _ := unstructured.NestedString(
+			br.Object, "status", "completionTime")
+		if !found {
+			continue // completed but no timestamp — can't age it, keep
+		}
+		completedAt, err := time.Parse(time.RFC3339, ct)
+		if err != nil || now.Sub(completedAt) <= buildRunTTL {
+			continue
+		}
+		log.Info("DELETE buildrun: completed past TTL",
+			"buildrun", br.GetNamespace()+"/"+br.GetName(),
+			"completedFor", now.Sub(completedAt).Truncate(time.Hour))
+		uid := br.GetUID()
+		if err := j.dyn.Resource(buildRunGVR).
+			Namespace(br.GetNamespace()).Delete(ctx, br.GetName(),
+			metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil {
+			metrics.IncError(failedJobQueue)
+			log.Error(err, "buildrun delete failed",
+				"buildrun", br.GetNamespace()+"/"+br.GetName())
+			continue
+		}
+		deleted++
+	}
+	if deleted > 0 {
+		log.Info("buildrun TTL sweep done", "deleted", deleted)
+	}
+	return nil
+}
+
+// buildRunCompleted reports whether the BuildRun reached a terminal
+// state — status.conditions contains type=Succeeded with status
+// True (passed) or False (failed). Running builds and builds whose
+// controller never wrote the condition stay.
+func buildRunCompleted(br *unstructured.Unstructured) bool {
+	conds, found, _ := unstructured.NestedSlice(
+		br.Object, "status", "conditions")
+	if !found {
+		return false
+	}
+	for _, c := range conds {
+		m, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		typ, _, _ := unstructured.NestedString(m, "type")
+		status, _, _ := unstructured.NestedString(m, "status")
+		if typ == "Succeeded" && (status == "True" || status == "False") {
+			return true
+		}
+	}
+	return false
 }
 
 // auditStuckTerminating marks every namespace/PVC/VolumeAttachment

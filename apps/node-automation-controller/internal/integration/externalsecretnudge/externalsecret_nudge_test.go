@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -14,8 +15,10 @@ import (
 	"k8s.io/client-go/dynamic/fake"
 	kfake "k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
+	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	ktesting "k8s.io/client-go/testing"
 )
 
@@ -387,7 +390,7 @@ func TestExternalSecretNudgePrunesNudgedLedger(t *testing.T) {
 	n.nudged["apps/es-healed"] = stale  // healed → prune, nothing re-adds
 	n.nudged["apps/es-gone"] = fresh    // vanished → prune
 
-	if err := n.nudge(ctx, true); err != nil { // edge path — all stuck ESs eligible
+	if err := n.nudge(ctx, true, true); err != nil { // edge path — all stuck ESs eligible
 		t.Fatal(err)
 	}
 	if _, ok := n.nudged["apps/es-gone"]; ok {
@@ -488,7 +491,7 @@ func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 		})
 	n := newNudge(dyn, true)
 	before := testutil.QueueErrorCount(t, esNudgeQueue)
-	if err := n.nudge(ctx, true); err != nil {
+	if err := n.nudge(ctx, true, true); err != nil {
 		t.Fatalf("per-ES patch failure must not fail the nudge: %v", err)
 	}
 	if _, ok := n.nudged["apps/es-bad"]; ok {
@@ -544,10 +547,22 @@ func TestExternalSecretNudgeStateBasedWithoutEdge(t *testing.T) {
 	mixedDataBroken := esObj("apps", "es-mixed-data-broken", "False", time.Hour)
 	esStoreRef(mixedDataBroken, "ClusterSecretStore", "css1")
 	esDataStoreRef(mixedDataBroken, "ClusterSecretStore", "css2")
-	dyn := newDynFake(
+	// W9-GO1 storm guard: this fixture carries 10 failing ESs — enough
+	// to trip the >=5 && >=50% storm signature and suppress every
+	// stamp. Pad the population with healthy ESs so the failing ratio
+	// stays under half and the per-store gating assertions below still
+	// exercise the nudge path.
+	var healthyObjs []runtime.Object
+	for i := 0; i < 11; i++ {
+		healthy := esObj("apps", fmt.Sprintf("es-healthy-%d", i), "True", time.Hour)
+		esStoreRef(healthy, "ClusterSecretStore", "css1")
+		healthyObjs = append(healthyObjs, healthy)
+	}
+	dyn := newDynFake(append([]runtime.Object{
 		cssObj("css1", "True"), cssObj("css2", "False"),
 		stuck, other, namespaced, defaulted, broken,
-		viaDataFrom, mixedBroken, mixedNamespaced, viaData, mixedDataBroken)
+		viaDataFrom, mixedBroken, mixedNamespaced, viaData, mixedDataBroken,
+	}, healthyObjs...)...)
 	n := newNudge(dyn, true)
 
 	if err := n.run(ctx); err != nil { // seeds both stores, no edge
@@ -600,5 +615,157 @@ func TestExternalSecretNudgePersistedCooldown(t *testing.T) {
 	}
 	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stale", esForceSyncAnno); got == "" {
 		t.Fatal("ES with a stale last-es-nudge stamp not re-nudged")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W9-GO1 — storm guard + 1Password Connect auto-heal
+// ---------------------------------------------------------------------------
+
+// esNudgeDynFake builds the dyn fake with every ESO GVR plus the
+// autopilot Plan GVR shared.MaintenanceActive lists — without the
+// latter the maintenance mutex panics inside the fake.
+func esNudgeDynFake(objs ...runtime.Object) *fake.FakeDynamicClient {
+	kinds := map[schema.GroupVersionResource]string{}
+	for _, gvr := range clusterSecretStoreGVRs {
+		kinds[gvr] = "ClusterSecretStoreList"
+	}
+	for _, gvr := range secretStoreGVRs {
+		kinds[gvr] = "SecretStoreList"
+	}
+	for _, gvr := range externalSecretGVRs {
+		kinds[gvr] = "ExternalSecretList"
+	}
+	kinds[shared.AutopilotPlanGVR] = "PlanList"
+	return testutil.NewFakeDyn(kinds, objs...)
+}
+
+// A mass ExternalSecret failure (>=5 failing AND >=half the fleet)
+// is an upstream ESO/1Password outage: the storm guard suppresses
+// every force-sync stamp, sets the gauge and logs STORM-GUARD —
+// poking each wedged ES would only amplify the outage.
+func TestExternalSecretNudgeStormGuardSuppresses(t *testing.T) {
+	var objs []runtime.Object
+	objs = append(objs, cssObj("store", "True"))
+	for i := 0; i < 5; i++ {
+		es := esObj("apps", fmt.Sprintf("es-bad-%d", i), "False", 2*time.Hour)
+		esStoreRef(es, "ClusterSecretStore", "store")
+		objs = append(objs, es)
+	}
+	ok := esObj("apps", "es-ok", "True", time.Hour)
+	esStoreRef(ok, "ClusterSecretStore", "store")
+	objs = append(objs, ok)
+
+	dyn := esNudgeDynFake(objs...)
+	n := newNudge(dyn, true)
+	if err := n.run(ctx); err != nil { // seed store state
+		t.Fatal(err)
+	}
+	if err := n.run(ctx); err != nil { // storm census
+		t.Fatal(err)
+	}
+	if got := ptestutil.ToFloat64(metrics.ExternalSecretStormSuppressed); got != 1 {
+		t.Fatalf("storm gauge = %v, want 1", got)
+	}
+	for i := 0; i < 5; i++ {
+		if v := esAnnotation(t, dyn, externalSecretGVRs[0], "apps",
+			fmt.Sprintf("es-bad-%d", i), esForceSyncAnno); v != "" {
+			t.Fatalf("storm must suppress force-sync on es-bad-%d, got %q", i, v)
+		}
+	}
+	// A non-storm population resets the gauge.
+	healthy := esNudgeDynFake(cssObj("store", "True"),
+		esObj("apps", "es-fine", "True", time.Hour))
+	n2 := newNudge(healthy, true)
+	if err := n2.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.ToFloat64(metrics.ExternalSecretStormSuppressed); got != 0 {
+		t.Fatalf("non-storm gauge = %v, want 0", got)
+	}
+}
+
+// A ClusterSecretStore down for >=15m triggers the connect auto-heal:
+// the oldest running onepassword-connect pod is deleted with a UID
+// precondition, once per hour.
+func TestExternalSecretNudgeConnectHeal(t *testing.T) {
+	oldPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "external-secrets",
+			Name:              "onepassword-connect-aaa",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-48 * time.Hour)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	newPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "external-secrets",
+			Name:              "onepassword-connect-bbb",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	cs := kfake.NewSimpleClientset(oldPod, newPod)
+	dyn := esNudgeDynFake(cssObj("store", "False"))
+	n := &externalSecretNudge{
+		cs:         cs,
+		dyn:        dyn,
+		enabled:    true,
+		storeReady: map[string]bool{},
+		nudged:     map[string]time.Time{},
+		// The store has been observed down since 20m ago — past the
+		// 15m persistence window.
+		storeDownSince: map[string]time.Time{
+			"ClusterSecretStore//store": time.Now().Add(-20 * time.Minute),
+		},
+	}
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.CoreV1().Pods("external-secrets").Get(ctx,
+		"onepassword-connect-aaa", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("oldest connect pod must be deleted, get err=%v", err)
+	}
+	if _, err := cs.CoreV1().Pods("external-secrets").Get(ctx,
+		"onepassword-connect-bbb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("younger connect pod must survive, get err=%v", err)
+	}
+	// Cooldown: a second sweep inside the hour must not delete the
+	// survivor even though the store is still down.
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.CoreV1().Pods("external-secrets").Get(ctx,
+		"onepassword-connect-bbb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("cooldown must protect the surviving pod, get err=%v", err)
+	}
+}
+
+// A transient first False observation must NOT heal — the down-since
+// clock starts at first sight and needs the full 15m.
+func TestExternalSecretNudgeConnectHealTransient(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "external-secrets",
+			Name:              "onepassword-connect-aaa",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-48 * time.Hour)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	cs := kfake.NewSimpleClientset(pod)
+	dyn := esNudgeDynFake(cssObj("store", "False"))
+	n := &externalSecretNudge{
+		cs:         cs,
+		dyn:        dyn,
+		enabled:    true,
+		storeReady: map[string]bool{},
+		nudged:     map[string]time.Time{},
+	}
+	if err := n.run(ctx); err != nil { // first sight — clock starts now
+		t.Fatal(err)
+	}
+	if _, err := cs.CoreV1().Pods("external-secrets").Get(ctx,
+		"onepassword-connect-aaa", metav1.GetOptions{}); err != nil {
+		t.Fatalf("transient observation must not delete the pod, get err=%v", err)
 	}
 }

@@ -16,7 +16,9 @@ import (
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset()); err != nil {
+	// dyn is only used by the W9-GO2 BuildRun sweep — nil is fine for
+	// the registration check.
+	if err := Setup(m, fake.NewSimpleClientset(), nil); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "failed-jobs-janitor", 60*time.Minute)

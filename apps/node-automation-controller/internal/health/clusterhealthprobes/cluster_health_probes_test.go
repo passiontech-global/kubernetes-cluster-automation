@@ -43,6 +43,7 @@ func testProber(cs *fake.Clientset) *clusterHealthProber {
 	return testProberDyn(cs, testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
 		olmCSVGVR:               "ClusterServiceVersionList",
 		olmSubGVR:               "SubscriptionList",
+		scyllaClusterGVR:        "ScyllaClusterList",
 		shared.AutopilotPlanGVR: "PlanList",
 	}))
 }
@@ -386,11 +387,13 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 		t.Fatalf("pod-status FAIL gauge = %v, want 1 on List error", v)
 	}
 	// The two pod checks, the rabbitmq-suspended-listener sweep, the
-	// localpv-stranded-pods scan AND the W8-CP3 scheduler-watchdog
-	// pending-pods List all hit the same cluster-wide pods List
-	// error -> five run errors.
-	if got := errCount() - before; got != 5 {
-		t.Fatalf("run errors delta = %v, want 5", got)
+	// localpv-stranded-pods scan, the W8-CP3 scheduler-watchdog
+	// pending-pods List AND the W9-ST1 scylla-cluster-health census
+	// all hit the same cluster-wide pods List error -> six run
+	// errors. (linkerd-endpoint-sync skips its pod census entirely
+	// when no namespace carries linkerd.io/inject=enabled.)
+	if got := errCount() - before; got != 6 {
+		t.Fatalf("run errors delta = %v, want 6", got)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic/fake"
 	kfake "k8s.io/client-go/kubernetes/fake"
@@ -408,5 +409,159 @@ func TestVeleroBackupAuditorFailedAndBSL(t *testing.T) {
 	if got, ok := testutil.GaugeSeriesValue(t, "node_automation_velero_bsl_unavailable",
 		map[string]string{"namespace": "velero", "name": "main"}); !ok || got != 1 {
 		t.Fatal("unavailable BSL not flagged")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W9-ST3 — Everest DatabaseCluster backup auditor
+// ---------------------------------------------------------------------------
+
+// everestDBCluster builds a DatabaseCluster — backupEnabled toggles
+// spec.backup.enabled, paused spec.paused.
+func everestDBCluster(ns, name string, backupEnabled, paused bool) *unstructured.Unstructured {
+	o := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "everest.percona.com/v1alpha1",
+		"kind":       "DatabaseCluster",
+		"metadata":   map[string]any{"namespace": ns, "name": name},
+		"spec": map[string]any{
+			"backup": map[string]any{"enabled": backupEnabled},
+			"paused": paused,
+		},
+	}}
+	return o
+}
+
+// everestBackup builds a DatabaseClusterBackup for cluster `dc` —
+// state is status.state, age backs creationTimestamp, completion is
+// status.completionTime (RFC3339, "" omits it).
+func everestBackup(ns, name, dc, state string, age time.Duration,
+	completion string) *unstructured.Unstructured {
+	status := map[string]any{"state": state}
+	if completion != "" {
+		status["completionTime"] = completion
+	}
+	o := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "everest.percona.com/v1alpha1",
+		"kind":       "DatabaseClusterBackup",
+		"metadata":   map[string]any{"namespace": ns, "name": name},
+		"spec":       map[string]any{"dbClusterName": dc},
+		"status":     status,
+	}}
+	o.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-age)))
+	return o
+}
+
+func everestSeries(t *testing.T, ns, cluster, reason string) (float64, bool) {
+	t.Helper()
+	return testutil.GaugeSeriesValue(t, "node_automation_db_backup_unhealthy",
+		map[string]string{
+			"namespace": ns, "cluster": cluster, "reason": reason})
+}
+
+// A cluster whose LATEST backup Failed flags reason=failed; one with
+// a Running backup older than 6h flags stuck; a newest Succeeded
+// older than 36h flags stale — and a healthy cluster emits nothing.
+func TestVeleroAuditorEverestBackupHealth(t *testing.T) {
+	now := time.Now()
+	failedCluster := everestDBCluster("data", "db-failed", true, false)
+	failedBackup := everestBackup("data", "b-failed", "db-failed",
+		"Failed", 2*time.Hour, now.Add(-2*time.Hour).Format(time.RFC3339))
+	stuckCluster := everestDBCluster("data", "db-stuck", true, false)
+	stuckBackup := everestBackup("data", "b-stuck", "db-stuck",
+		"Running", 7*time.Hour, "")
+	staleCluster := everestDBCluster("data", "db-stale", true, false)
+	staleBackup := everestBackup("data", "b-stale", "db-stale",
+		"Succeeded", 48*time.Hour,
+		now.Add(-40*time.Hour).Format(time.RFC3339))
+	healthyCluster := everestDBCluster("data", "db-ok", true, false)
+	healthyBackup := everestBackup("data", "b-ok", "db-ok",
+		"Succeeded", 2*time.Hour, now.Add(-time.Hour).Format(time.RFC3339))
+	pausedCluster := everestDBCluster("data", "db-paused", true, true)
+	pausedBackup := everestBackup("data", "b-paused", "db-paused",
+		"Failed", 48*time.Hour, "")
+	disabledCluster := everestDBCluster("data", "db-disabled", false, false)
+	disabledBackup := everestBackup("data", "b-disabled", "db-disabled",
+		"Failed", 48*time.Hour, "")
+
+	a := newVeleroAuditor(newDynFake(
+		failedCluster, failedBackup,
+		stuckCluster, stuckBackup,
+		staleCluster, staleBackup,
+		healthyCluster, healthyBackup,
+		pausedCluster, pausedBackup,
+		disabledCluster, disabledBackup), now)
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := everestSeries(t, "data", "db-failed", "failed"); !ok || v != 1 {
+		t.Fatalf("db-failed/failed series = %v,%v want 1,true", v, ok)
+	}
+	if v, ok := everestSeries(t, "data", "db-stuck", "stuck"); !ok || v != 1 {
+		t.Fatalf("db-stuck/stuck series = %v,%v want 1,true", v, ok)
+	}
+	if v, ok := everestSeries(t, "data", "db-stale", "stale"); !ok || v != 1 {
+		t.Fatalf("db-stale/stale series = %v,%v want 1,true", v, ok)
+	}
+	for _, r := range []string{"failed", "stuck", "stale"} {
+		if _, ok := everestSeries(t, "data", "db-ok", r); ok {
+			t.Fatalf("healthy db-ok must emit no %s series", r)
+		}
+		if _, ok := everestSeries(t, "data", "db-paused", r); ok {
+			t.Fatalf("paused db-paused must emit no %s series", r)
+		}
+		if _, ok := everestSeries(t, "data", "db-disabled", r); ok {
+			t.Fatalf("backup-disabled db-disabled must emit no %s series", r)
+		}
+	}
+}
+
+// Recovery and deletion clear the series — the seen-set prune keeps
+// /metrics honest once a cluster heals or disappears.
+func TestVeleroAuditorEverestClearsResolved(t *testing.T) {
+	now := time.Now()
+	dc := everestDBCluster("data", "db", true, false)
+	bad := everestBackup("data", "b1", "db", "Failed", time.Hour,
+		now.Add(-time.Hour).Format(time.RFC3339))
+	a := newVeleroAuditor(newDynFake(dc, bad), now)
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := everestSeries(t, "data", "db", "failed"); !ok {
+		t.Fatal("failed backup must flag the cluster")
+	}
+	// The latest backup succeeds — the failed series must clear.
+	good := everestBackup("data", "b2", "db", "Succeeded", 30*time.Minute,
+		now.Add(-30*time.Minute).Format(time.RFC3339))
+	if err := a.dyn.Resource(everestDBBackupGVR).Namespace("data").
+		Delete(ctx, "b1", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.dyn.Resource(everestDBBackupGVR).Namespace("data").
+		Create(ctx, good, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := everestSeries(t, "data", "db", "failed"); ok {
+		t.Fatal("recovered cluster must not keep the failed series")
+	}
+}
+
+// Clusters without the Everest CRDs are a quiet no-op — same
+// contract as the Velero half of this module.
+func TestVeleroAuditorEverestCRDAbsent(t *testing.T) {
+	// newDynFake registers the GVRs; an absent-CRD cluster is
+	// simulated by a dyn fake whose List reactor 404s the Everest
+	// resources — auditEverestBackups must return nil, not error.
+	dyn := newDynFake()
+	dyn.PrependReactor("list", "databaseclusters",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(
+				schema.GroupResource{Group: "everest.percona.com", Resource: "databaseclusters"}, "x")
+		})
+	a := newVeleroAuditor(dyn, time.Now())
+	if err := a.auditEverestBackups(ctx); err != nil {
+		t.Fatalf("absent Everest CRDs must be a quiet no-op: %v", err)
 	}
 }

@@ -68,16 +68,19 @@ const (
 )
 
 // partitionCondTypes covers upstream NWPD K8sExporter plurals, the
-// singular spellings some builds emit, and NebulaIsolated — the
+// singular spellings some builds emit, NebulaIsolated — the
 // node-host-agent's overlay-partition condition: a node cut off from
 // the Nebula mesh is pod-unreachable from other sites in exactly the
-// way this evictor exists for.
+// way this evictor exists for — and NebulaPMTUBlackhole, the
+// node-host-agent's PMTU-blackhole latch (overlay path up but large
+// packets dropped — same unreachable-from-peers shape).
 var partitionCondTypes = []corev1.NodeConditionType{
 	"HostNetworkProblems",
 	"ClusterNetworkProblems",
 	"HostNetworkProblem",
 	"ClusterNetworkProblem",
 	"NebulaIsolated",
+	"NebulaPMTUBlackhole",
 }
 
 type partitionEvictor struct {

@@ -13,11 +13,16 @@ import (
 var ctx = context.Background()
 
 // newDynFake seeds the Velero types the auditor lists — schedules,
-// backups, and the W8-ST1 backupstoragelocations.
+// backups, and the W8-ST1 backupstoragelocations — plus the W9-ST3
+// Everest DatabaseCluster/DatabaseClusterBackup GVRs (the fake
+// PANICS on a List for an unregistered GVR, so every type the audit
+// touches must be mapped even when a test seeds none).
 func newDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	return testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		veleroScheduleGVR: "ScheduleList",
-		veleroBackupGVR:   "BackupList",
-		veleroBSLGVR:      "BackupStorageLocationList",
+		veleroScheduleGVR:   "ScheduleList",
+		veleroBackupGVR:     "BackupList",
+		veleroBSLGVR:        "BackupStorageLocationList",
+		everestDBClusterGVR: "DatabaseClusterList",
+		everestDBBackupGVR:  "DatabaseClusterBackupList",
 	}, objs...)
 }

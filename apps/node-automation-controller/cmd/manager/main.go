@@ -482,7 +482,9 @@ func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interfa
 		},
 
 		// Resource cleanup sweeps.
-		"failed-jobs-janitor": func() error { return failedjobsjanitor.Setup(mgr, cs) },
+		"failed-jobs-janitor": func() error {
+			return failedjobsjanitor.Setup(mgr, cs, dyn)
+		},
 		"evicted-pod-janitor": func() error { return evictedpodjanitor.Setup(mgr, cs) },
 		"cronjob-catchup":     func() error { return cronjobcatchup.Setup(mgr, cs) },
 		"concourse-workdir-janitor": func() error {

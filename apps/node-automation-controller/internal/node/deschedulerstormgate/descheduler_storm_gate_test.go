@@ -485,3 +485,23 @@ func TestStormGateMaintenanceCheckError(t *testing.T) {
 		t.Fatal("expected error when the kured get fails")
 	}
 }
+
+// W9-CP3 — the node-host-agent overlay/kernel latches added to
+// stormConds gate the descheduler exactly like the existing storm
+// conditions.
+func TestStormGateScalesDownOnWave9Conditions(t *testing.T) {
+	for _, cond := range []corev1.NodeConditionType{
+		"NebulaPMTUBlackhole", "KernelSlabLeak", "ClockUnsynchronized",
+	} {
+		cs := fake.NewSimpleClientset(
+			withStormCond(testutil.Node("n1", corev1.ConditionTrue, nil), cond),
+			deschedulerDeploy(1, nil))
+		r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+		if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		if got := getDeschedulerReplicas(t, cs); got != 0 {
+			t.Fatalf("condition %s must gate the descheduler, replicas=%d", cond, got)
+		}
+	}
+}

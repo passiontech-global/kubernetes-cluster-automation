@@ -1,6 +1,7 @@
 package webhookguard
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -463,10 +465,16 @@ func TestWebhookGuardPatchFailureReturnsError(t *testing.T) {
 
 // wgBreakerGuard builds a guard with a scripted clock — advance *now
 // between runs to walk the deadSince streak past webhookDeadThreshold.
+// The endpointProber stub answers "responsive" for every IP so the
+// W9-CP1 brownout probe never fires in tests that predate it — those
+// fixtures have no TLS server to dial anyway.
 func wgBreakerGuard(cs *fake.Clientset, now *time.Time) *webhookGuard {
 	return &webhookGuard{cs: cs,
 		nowFn:     func() time.Time { return *now },
-		deadSince: map[string]time.Time{}}
+		deadSince: map[string]time.Time{},
+		endpointProber: func(context.Context, string, int32) bool {
+			return true
+		}}
 }
 
 func wgFP(v admissionv1.FailurePolicyType) *admissionv1.FailurePolicyType {
@@ -1368,5 +1376,162 @@ func TestWebhookCircuitBreakerNodeListErrorSkips(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(patches); got != 0 {
 		t.Fatalf("blind node census must not patch, got %d patch(es)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W9-CP1 — brownout probe, pod bounce, unresponsive breaker
+// ---------------------------------------------------------------------------
+
+// wgPod builds a Running+Ready Pod fixture for the bounce path.
+func wgPod(ns, name string, age time.Duration) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         ns,
+			Name:              name,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-age)),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
+	}
+}
+
+// wgHungSlice builds a slice whose single Ready endpoint targets a
+// Pod and carries no NodeName — effective-ready by benefit of the
+// doubt, exactly the brownout shape W9-CP1 probes.
+func wgHungSlice(ns, svc, pod string) *discoveryv1.EndpointSlice {
+	es := wgEndpointSlice(ns, svc, 0, 0)
+	up := true
+	es.Endpoints = []discoveryv1.Endpoint{{
+		Addresses:  []string{"10.10.7.7"},
+		TargetRef:  &corev1.ObjectReference{Kind: "Pod", Name: pod},
+		Conditions: discoveryv1.EndpointConditions{Ready: &up},
+	}}
+	return es
+}
+
+// A webhook backend whose Ready endpoints ALL fail the TCP+TLS
+// handshake is "unresponsive": stage 1 bounces the oldest Ready
+// backing pod immediately (15m per-service cooldown), and stage 2
+// trips the breaker to Ignore after the 90s partition threshold —
+// then restores Fail once a probe answers again.
+func TestWebhookCircuitBreakerUnresponsiveTripsAndBounces(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "brownout"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "hung.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "hung-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "hung-svc"),
+		wgHungSlice("backend", "hung-svc", "wh-old"),
+		wgPod("backend", "wh-old", 48*time.Hour),
+		wgPod("backend", "wh-new", time.Hour),
+		mwc)
+	now := time.Unix(1_700_000_000, 0)
+	// endpointProber=false — every handshake fails: the pods are hung.
+	g := &webhookGuard{cs: cs,
+		nowFn:     func() time.Time { return now },
+		deadSince: map[string]time.Time{},
+		endpointProber: func(context.Context, string, int32) bool {
+			return false
+		}}
+	t.Cleanup(func() {
+		metrics.WebhookCircuitBroken.DeleteLabelValues(
+			webhookKindMutating, "brownout", "hung.example.com")
+	})
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Stage 1 fired on first sight: the OLDEST Ready pod is gone,
+	// its younger sibling survives.
+	if _, err := cs.CoreV1().Pods("backend").Get(ctx, "wh-old",
+		metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("oldest hung pod must be bounced, get err=%v", err)
+	}
+	if _, err := cs.CoreV1().Pods("backend").Get(ctx, "wh-new",
+		metav1.GetOptions{}); err != nil {
+		t.Fatalf("younger pod must survive the single-pod bounce: %v", err)
+	}
+	// Too early for the breaker — inside the 90s partition window.
+	if got := wgMutatingFP(t, cs, "brownout", "hung.example.com"); got != admissionv1.Fail {
+		t.Fatalf("unresponsive backend must not trip inside threshold, failurePolicy=%q", got)
+	}
+
+	// Past the threshold the breaker trips to Ignore.
+	now = now.Add(webhookPartitionedThreshold + time.Second)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgMutatingFP(t, cs, "brownout", "hung.example.com"); got != admissionv1.Ignore {
+		t.Fatalf("unresponsive backend past threshold must trip to Ignore, got %q", got)
+	}
+	// Bounce cooldown: the surviving pod is NOT deleted again.
+	if _, err := cs.CoreV1().Pods("backend").Get(ctx, "wh-new",
+		metav1.GetOptions{}); err != nil {
+		t.Fatalf("15m bounce cooldown must protect the surviving pod: %v", err)
+	}
+
+	// The pod came back healthy — the next probe answers and the
+	// declared Fail policy is restored.
+	g.endpointProber = func(context.Context, string, int32) bool { return true }
+	now = now.Add(time.Minute)
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgMutatingFP(t, cs, "brownout", "hung.example.com"); got != admissionv1.Fail {
+		t.Fatalf("responsive backend must recover to Fail, got %q", got)
+	}
+}
+
+// A responsive backend never bounces and never trips — the probe's
+// ANY-success verdict keeps one healthy replica honest even when a
+// sibling hangs.
+func TestWebhookCircuitBreakerResponsiveSkipsBounce(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "healthy-brownout"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "ok.example.com",
+			FailurePolicy: wgFP(admissionv1.Fail),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: wgSvcRef("backend", "ok-svc"),
+			},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "ok-svc"),
+		wgHungSlice("backend", "ok-svc", "ok-pod"),
+		wgPod("backend", "ok-pod", 48*time.Hour),
+		mwc)
+	now := time.Unix(1_700_000_000, 0)
+	g := &webhookGuard{cs: cs,
+		nowFn:     func() time.Time { return now },
+		deadSince: map[string]time.Time{},
+		endpointProber: func(context.Context, string, int32) bool {
+			return true // at least one endpoint answers
+		}}
+	for i := 0; i < 3; i++ {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := cs.CoreV1().Pods("backend").Get(ctx, "ok-pod",
+		metav1.GetOptions{}); err != nil {
+		t.Fatalf("responsive backend must never bounce its pod: %v", err)
+	}
+	if got := wgMutatingFP(t, cs, "healthy-brownout", "ok.example.com"); got != admissionv1.Fail {
+		t.Fatalf("responsive backend must never trip, got %q", got)
 	}
 }

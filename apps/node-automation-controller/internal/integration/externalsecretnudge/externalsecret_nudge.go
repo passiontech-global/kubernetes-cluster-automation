@@ -30,11 +30,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -56,6 +58,23 @@ const (
 	// cooldown — force-sync is a bare unix stamp ESO consumes,
 	// node.ops/last-es-nudge is the same moment for operators.
 	esLastNudgeAnno = "node.ops/last-es-nudge"
+	// W9-GO1 — storm guard + 1Password Connect auto-heal thresholds.
+	// A storm is >=5 failing ExternalSecrets making up >=half the
+	// population; either a ClusterSecretStore down or a storm must
+	// persist esConnectHealMinAge before the connect pod is bounced,
+	// and the bounce itself is capped at one per esConnectHealCooldown.
+	esStormMinFailing     = 5
+	esConnectHealMinAge   = 15 * time.Minute
+	esConnectHealCooldown = time.Hour
+)
+
+// esConnectNamespaces are where the 1Password Connect pod can live —
+// the ESO namespace on these clusters, or a dedicated connect ns.
+// esConnectPodPrefix matches the helm-release pod names
+// (onepassword-connect-<replica-hash>).
+var (
+	esConnectNamespaces = []string{"external-secrets", "onepassword"}
+	esConnectPodPrefix  = "onepassword-connect"
 )
 
 // The external-secrets API exists at v1 AND v1beta1 — both GVRs are
@@ -90,6 +109,18 @@ type externalSecretNudge struct {
 	// limit. Pruned inside nudge() once past the cooldown or when
 	// the ES vanished.
 	nudged map[string]time.Time
+	// storeDownSince: store key → first sweep that observed
+	// Ready=False — the persistence clock for the connect auto-heal
+	// (a transient first False must not bounce the pod).
+	storeDownSince map[string]time.Time
+	// stormSince: first sweep of the current ExternalSecret failure
+	// storm — same persistence clock, storm-triggered heal path.
+	stormSince time.Time
+	// connectHealAt: last delivered connect-pod bounce — the 1/hour
+	// cooldown. In-memory only, like nudged: a restart re-arms it,
+	// which is safe because the heal still needs 15m of fresh
+	// down/storm observations first.
+	connectHealAt time.Time
 }
 
 // Setup registers the 10-minute sweep. With
@@ -97,11 +128,12 @@ type externalSecretNudge struct {
 // signature/queue uniform across clusters with and without ESO.
 func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, enabled bool) error {
 	n := &externalSecretNudge{
-		cs:         cs,
-		dyn:        dyn,
-		enabled:    enabled,
-		storeReady: map[string]bool{},
-		nudged:     map[string]time.Time{},
+		cs:             cs,
+		dyn:            dyn,
+		enabled:        enabled,
+		storeReady:     map[string]bool{},
+		nudged:         map[string]time.Time{},
+		storeDownSince: map[string]time.Time{},
 	}
 	return shared.AddPeriodic(mgr, esNudgeQueue, esNudgeInterval, n.run)
 }
@@ -114,6 +146,9 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.storeDownSince == nil {
+		n.storeDownSince = map[string]time.Time{} // literal-constructed fixtures
+	}
 
 	stores, err := n.listFirst(ctx, clusterSecretStoreGVRs)
 	if err != nil {
@@ -139,11 +174,19 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 
 	recovered := false
 	seen := map[string]bool{}
+	now := time.Now()
 	track := func(kind, ns, name string, isReady bool) {
 		key := kind + "/" + ns + "/" + name
 		seen[key] = true
 		prev, tracked := n.storeReady[key]
 		n.storeReady[key] = isReady
+		// W9-GO1 — the down-since clock for the connect auto-heal:
+		// first observed False starts it, True or vanish clears it.
+		if isReady {
+			delete(n.storeDownSince, key)
+		} else if _, down := n.storeDownSince[key]; !down {
+			n.storeDownSince[key] = now
+		}
 		if tracked && !prev && isReady {
 			recovered = true
 			log.Info("SecretStore recovered (Ready False→True) — nudging stuck ExternalSecrets",
@@ -162,10 +205,12 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 			track("SecretStore", s.GetNamespace(), s.GetName(), ready == "True")
 		}
 	}
-	// Drop vanished stores so a delete+recreate re-seeds fresh.
+	// Drop vanished stores so a delete+recreate re-seeds fresh —
+	// storeReady and storeDownSince prune together.
 	for name := range n.storeReady {
 		if !seen[name] {
 			delete(n.storeReady, name)
+			delete(n.storeDownSince, name)
 		}
 	}
 	// A store currently Ready=True arms the state-based nudge — the
@@ -179,11 +224,12 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 			break
 		}
 	}
-	if !recovered && !anyReady {
-		log.Info("sweep done", "stores", len(stores.Items), "storeRecovered", false)
-		return nil
-	}
-	return n.nudge(ctx, recovered)
+	// W9-GO1 — always census the ExternalSecrets: the storm guard
+	// and the connect auto-heal must see a mass-failure storm even
+	// when NO store is healthy and no recovery edge fired — a full
+	// ESO/1Password outage is exactly that case, and skipping the
+	// list here would blind both features to it.
+	return n.nudge(ctx, recovered, anyReady)
 }
 
 // listFirst lists the first working GVR of a candidate set — the ESO
@@ -220,18 +266,70 @@ func (n *externalSecretNudge) listES(ctx context.Context) (*unstructured.Unstruc
 // False for longer than esStuckAge, at most once per esNudgeCooldown.
 // recovered=true is the edge fast-path (any stuck ES qualifies); with
 // recovered=false only ESs whose referenced stores are ALL Ready=True
-// qualify (state-based path).
-func (n *externalSecretNudge) nudge(ctx context.Context, recovered bool) error {
+// qualify (state-based path). anyReady reports whether at least one
+// store is currently Ready=True — with neither it and no recovery
+// edge there is nobody to poke, so the sweep is a no-op census.
+//
+// W9-GO1 storm guard: when >=esStormMinFailing ExternalSecrets are
+// Ready=False AND they are at least half the population, the failure
+// is an upstream ESO/1Password outage, not N independent wedged ESs —
+// stamping force-sync on all of them would amplify the outage, so the
+// pass logs STORM-GUARD, sets the suppression gauge and skips every
+// stamp. A storm (or a ClusterSecretStore down) persisting
+// esConnectHealMinAge also triggers the onepassword-connect pod
+// bounce via maybeHealConnect.
+func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady bool) error {
 	log := logf.FromContext(ctx)
 	list, esGVR, err := n.listES(ctx)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			metrics.ExternalSecretStormSuppressed.Set(0)
 			log.Info("skip: external-secrets CRDs not installed")
 			return nil
 		}
 		return fmt.Errorf("list externalsecrets: %w", err)
 	}
 	now := time.Now()
+
+	// W9-GO1 — storm census over the WHOLE population: totalES is
+	// every ExternalSecret, failingES every Ready=False one. The
+	// ratio clause keeps a big healthy fleet from tripping on a
+	// handful of unrelated failures.
+	totalES, failingES := 0, 0
+	for i := range list.Items {
+		totalES++
+		if status, _ := shared.ReadyCond(&list.Items[i]); status == "False" {
+			failingES++
+		}
+	}
+	storm := failingES >= esStormMinFailing && failingES*2 >= totalES
+	if storm {
+		metrics.ExternalSecretStormSuppressed.Set(1)
+		if n.stormSince.IsZero() {
+			n.stormSince = now
+		}
+		log.Info("STORM-GUARD: ExternalSecret failure storm — "+
+			"suppressing force-sync nudges (upstream ESO/1Password outage)",
+			"failing", failingES, "total", totalES,
+			"stormFor", now.Sub(n.stormSince).Truncate(time.Minute))
+	} else {
+		metrics.ExternalSecretStormSuppressed.Set(0)
+		n.stormSince = time.Time{}
+	}
+
+	// W9-GO1 — connect auto-heal runs on every census, storm or not:
+	// a ClusterSecretStore down >=15m is itself a trigger.
+	n.maybeHealConnect(ctx, storm, now)
+
+	if storm {
+		log.Info("sweep done", "nudged", 0, "storm", true)
+		return nil
+	}
+	if !recovered && !anyReady {
+		log.Info("sweep done", "stores", "no-store-signal", "nudged", 0)
+		return nil
+	}
+
 	// Drop nudged entries past the cooldown or whose ExternalSecret
 	// vanished — the map only ever shrinks here (nudged is written
 	// solely in this function), same prune pattern as storeReady.
@@ -400,4 +498,115 @@ func esNudgeStamp(es *unstructured.Unstructured) (time.Time, bool) {
 		}
 	}
 	return latest, found
+}
+
+// ---------------------------------------------------------------------------
+// W9-GO1 — 1Password Connect auto-heal
+// ---------------------------------------------------------------------------
+
+// maybeHealConnect bounces the oldest running onepassword-connect pod
+// when the ESO data path has been broken long enough that a stuck
+// connect pod is the likely culprit: either a ClusterSecretStore has
+// reported Ready=False for >=esConnectHealMinAge, or the ExternalSecret
+// storm has persisted that long. The delete is maintenance-gated,
+// UID-preconditioned, and capped at one bounce per
+// esConnectHealCooldown — and it NEVER fires on a transient first
+// observation, because both clocks only start after the first sweep
+// that sees the bad state.
+func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
+	storm bool, now time.Time) {
+	log := logf.FromContext(ctx)
+
+	// Trigger 1 — a ClusterSecretStore (cluster-scoped only; a
+	// namespaced SecretStore outage does not bounce the shared
+	// connect pod) down past the persistence window.
+	storeDown := false
+	for key, since := range n.storeDownSince {
+		if strings.HasPrefix(key, "ClusterSecretStore/") &&
+			now.Sub(since) >= esConnectHealMinAge {
+			storeDown = true
+			break
+		}
+	}
+	// Trigger 2 — the ES storm itself persisting past the window.
+	stormLong := storm && now.Sub(n.stormSince) >= esConnectHealMinAge
+	if !storeDown && !stormLong {
+		return
+	}
+	if now.Sub(n.connectHealAt) < esConnectHealCooldown {
+		log.Info("DEFER: connect pod heal inside cooldown",
+			"storeDown", storeDown, "stormLong", stormLong,
+			"lastHeal", now.Sub(n.connectHealAt).Truncate(time.Minute))
+		return
+	}
+
+	// Same fail-closed maintenance gate as every pod kill in this
+	// module — cordon/drain/kured or an in-flight upgrade defers the
+	// bounce, and "cannot verify" skips it.
+	held, why, err := shared.MaintenanceActive(ctx, n.cs, n.dyn)
+	if err != nil {
+		metrics.IncError(esNudgeQueue)
+		log.Info("WARN: maintenance check unverifiable — "+
+			"DEFER: connect pod heal skipped (fail closed)", "error", err)
+		return
+	}
+	if held {
+		log.Info("DEFER: maintenance active — connect pod heal skipped",
+			"why", why)
+		return
+	}
+
+	pod := n.oldestConnectPod(ctx)
+	if pod == nil {
+		log.Info("connect heal: no running onepassword-connect pod found")
+		return
+	}
+	log.Info("ACTION: deleting oldest running onepassword-connect pod — "+
+		"sustained store outage/storm", "pod", pod.Namespace+"/"+pod.Name,
+		"storeDown", storeDown, "stormLong", stormLong)
+	uid := pod.UID
+	if err := n.cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
+		metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil {
+		metrics.IncError(esNudgeQueue)
+		log.Error(err, "connect pod delete failed",
+			"pod", pod.Namespace+"/"+pod.Name)
+		return
+	}
+	// Cooldown stamps on a DELIVERED delete only — a failed delete
+	// leaves the pod stuck and the next sweep retries.
+	n.connectHealAt = now
+}
+
+// oldestConnectPod returns the oldest Running pod named
+// onepassword-connect* across the candidate namespaces, or nil when
+// none qualifies. List errors other than NotFound are logged and
+// skipped — an unverifiable namespace must not block the heal on the
+// other one, but it also cannot produce a delete target.
+func (n *externalSecretNudge) oldestConnectPod(ctx context.Context) *corev1.Pod {
+	log := logf.FromContext(ctx)
+	var oldest *corev1.Pod
+	for _, ns := range esConnectNamespaces {
+		pods, err := n.cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				metrics.IncError(esNudgeQueue)
+				log.Error(err, "connect pod list failed", "namespace", ns)
+			}
+			continue
+		}
+		for i := range pods.Items {
+			p := &pods.Items[i]
+			if p.DeletionTimestamp != nil ||
+				p.Status.Phase != corev1.PodRunning ||
+				!strings.HasPrefix(p.Name, esConnectPodPrefix) {
+				continue
+			}
+			if oldest == nil ||
+				p.CreationTimestamp.Time.Before(oldest.CreationTimestamp.Time) {
+				oldest = p
+			}
+		}
+	}
+	return oldest
 }

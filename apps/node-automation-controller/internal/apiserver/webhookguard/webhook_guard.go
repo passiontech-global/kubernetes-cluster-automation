@@ -64,12 +64,15 @@ package webhookguard
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -144,6 +147,19 @@ const (
 	// apiserver in partial outage) would be retried for every
 	// candidate, turning the sweep itself into an API storm.
 	unmeshedDeleteAttempts = 4
+
+	// W9-CP1 — Admission Webhook gray-failure TCP/TLS brownout
+	// probe: a webhook backend whose EndpointSlice still reports
+	// Ready endpoints on healthy nodes but whose pods all fail the
+	// TCP+TLS handshake is hung, not partitioned. The breaker treats
+	// it as effective=0 (90s partition threshold), and stage 1 bounces
+	// the oldest Ready backing pod — one bounce per service per
+	// webhookBounceCooldown so a wedged pod cannot be restarted every
+	// sweep.
+	webhookBounceCooldown   = 15 * time.Minute
+	webhookProbeMaxPerSvc   = 2  // endpoint IPs dialed per service
+	webhookProbeMaxPodRefs  = 32 // backing-pod candidates kept per service
+	webhookProbeDefaultPort = 443
 )
 
 type webhookGuard struct {
@@ -179,6 +195,13 @@ type webhookGuard struct {
 	// webhookDeadThreshold / webhookPartitionedThreshold.
 	zeroThreshold          time.Duration
 	partitionZeroThreshold time.Duration
+	// endpointProber is the W9-CP1 brownout probe — a TCP connect +
+	// TLS handshake against a Ready endpoint IP on the webhook port.
+	// Injectable for tests; nil falls back to tcpTLSEndpointProber.
+	endpointProber func(ctx context.Context, ip string, port int32) bool
+	// bounceAt: webhook backend service key ("ns/name") → last pod
+	// bounce — the in-memory half of the 15m per-service cooldown.
+	bounceAt map[string]time.Time
 }
 
 // Setup registers the 5-minute sweep (was crontab */5). dyn feeds
@@ -190,7 +213,8 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface) err
 	g := &webhookGuard{cs: cs, dyn: dyn, nowFn: time.Now,
 		deadSince:       map[string]time.Time{},
 		brokenEmitted:   map[string]bool{},
-		unmeshedEmitted: map[string]bool{}}
+		unmeshedEmitted: map[string]bool{},
+		bounceAt:        map[string]time.Time{}}
 	return shared.AddPeriodic(mgr, webhookGuardQueue, 5*time.Minute, g.run)
 }
 
@@ -316,10 +340,34 @@ func nodeUnhealthyForEndpoints(n *corev1.Node) bool {
 // every Ready endpoint; effective excludes the Ready endpoints whose
 // pod sits on an unhealthy node (partitioned/unresponsive — reachable
 // in the API sense but dead for webhook traffic).
+//
+// W9-CP1 adds the brownout fields, populated ONLY for services a
+// webhook config's clientConfig.service references (the probeSet in
+// readyEndpointCounts — probing every Service cluster-wide would be
+// a dial storm):
+//   - probeIPs/probePort: up to webhookProbeMaxPerSvc Ready endpoint
+//     IPs on healthy nodes plus the port the handshake targets.
+//   - backingPods: Ready endpoint pod refs for the stage-1 bounce.
+//   - probed/responsive: per-service handshake outcome — probed marks
+//     a service whose endpoints were actually dialed this run;
+//     responsive is true when ANY probed IP completed TCP+TLS. A
+//     probed service with responsive=false is "unresponsive": its
+//     pods are hung, which the breaker treats as effective=0.
 type endpointCensus struct {
 	raw       map[string]int
 	effective map[string]int
+	probeIPs  map[string][]string
+	probePort map[string]int32
+	// podRef identifies one Ready endpoint's backing Pod — the
+	// bounce candidates for an unresponsive service.
+	backingPods map[string][]podRef
+	probed      map[string]bool
+	responsive  map[string]bool
 }
+
+// podRef is a namespace/name pair for a Pod discovered through an
+// EndpointSlice targetRef.
+type podRef struct{ namespace, name string }
 
 // readyCounts returns the EndpointSlice ready census, listing it at
 // most once per run — the circuit breaker and the injector-health
@@ -575,6 +623,14 @@ func (g *webhookGuard) sweepCircuitBreaker(ctx context.Context, snap *sweepSnaps
 		circuitMetrics(emitted, webhookKindValidating, cfg.Name, trips, recovered)
 	}
 
+	// W9-CP1 stage 1 — rolling pod bounce: a webhook backend whose
+	// Ready endpoints ALL fail the TCP+TLS handshake has a hung pod,
+	// not a partitioned one. Bounce the oldest Ready backing pod so
+	// its controller recreates it fresh — this runs even while the
+	// breaker holds the entry open, because a pod that never comes
+	// back would keep the webhook circuit-broken forever.
+	g.bounceHungWebhookPods(ctx, snap, ready)
+
 	// Prune broken series whose label tuple was not re-seen — a config
 	// deleted while broken, recreated without the annotation, or an
 	// entry removed must not pin circuit_broken=1 forever. Keys are
@@ -618,7 +674,22 @@ func (g *webhookGuard) readyEndpointCounts(ctx context.Context, snap *sweepSnaps
 	if snap.nodesErr != nil {
 		return endpointCensus{}, fmt.Errorf("list nodes — circuit breaker skipped: %w", snap.nodesErr)
 	}
-	ready := endpointCensus{raw: map[string]int{}, effective: map[string]int{}}
+	ready := endpointCensus{
+		raw:         map[string]int{},
+		effective:   map[string]int{},
+		probeIPs:    map[string][]string{},
+		probePort:   map[string]int32{},
+		backingPods: map[string][]podRef{},
+		probed:      map[string]bool{},
+		responsive:  map[string]bool{},
+	}
+	// W9-CP1 — only Services a webhook config actually calls get
+	// probed: the brownout check exists to keep admission webhooks
+	// honest, and dialing every Service in the cluster would be a
+	// handshake storm for zero signal. A missing config list (API
+	// flap) yields an empty probeSet — the census still counts, the
+	// breaker just sees no probe data (unresponsive stays false).
+	probeSet := webhookBackendServices(snap)
 	opts := metav1.ListOptions{Limit: listPageSize}
 	for {
 		sliceList, err := g.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).
@@ -632,23 +703,143 @@ func (g *webhookGuard) readyEndpointCounts(ctx context.Context, snap *sweepSnaps
 				continue // no owning Service — cannot map to a webhook backend
 			}
 			key := s.Namespace + "/" + svc
+			probeSvc := probeSet[key]
 			for _, ep := range s.Endpoints {
 				if ep.Conditions.Ready == nil || *ep.Conditions.Ready {
 					ready.raw[key]++
 					// A nil NodeName (off-cluster target, not yet
 					// bound) cannot be attributed to a bad node —
 					// benefit of the doubt, count it effective.
-					if ep.NodeName == nil || !snap.unhealthyNodes[*ep.NodeName] {
+					effective := ep.NodeName == nil || !snap.unhealthyNodes[*ep.NodeName]
+					if effective {
 						ready.effective[key]++
+					}
+					// W9-CP1 — collect probe candidates and backing
+					// pod refs ONLY for effective-ready endpoints on
+					// webhook backends: endpoints stranded on
+					// unhealthy nodes are already discounted, and
+					// probing them would just re-measure the
+					// partition.
+					if probeSvc && effective {
+						g.collectProbeCandidates(&ready, key, &s, &ep)
 					}
 				}
 			}
 		}
 		if sliceList.Continue == "" {
-			return ready, nil
+			break
 		}
 		opts.Continue = sliceList.Continue
 	}
+	// W9-CP1 — TCP+TLS brownout probe, up to webhookProbeMaxPerSvc
+	// Ready endpoint IPs per webhook backend. responsive is an
+	// ANY-success verdict: one answering endpoint means the Service
+	// is not brownout-hung even if siblings are.
+	prober := g.endpointProber
+	if prober == nil {
+		prober = tcpTLSEndpointProber
+	}
+	for key, ips := range ready.probeIPs {
+		ready.probed[key] = true
+		ok := false
+		for _, ip := range ips {
+			if prober(ctx, ip, ready.probePort[key]) {
+				ok = true
+				break
+			}
+		}
+		ready.responsive[key] = ok
+	}
+	return ready, nil
+}
+
+// webhookBackendServices returns the set of "namespace/name" Service
+// keys referenced by any sub-webhook's clientConfig.service across
+// both webhook-config kinds — the only services the W9-CP1 probe
+// dials. Nil config lists (API flap) contribute nothing.
+func webhookBackendServices(snap *sweepSnapshot) map[string]bool {
+	out := map[string]bool{}
+	add := func(svc *admissionv1.ServiceReference) {
+		if svc != nil && svc.Namespace != "" && svc.Name != "" {
+			out[svc.Namespace+"/"+svc.Name] = true
+		}
+	}
+	if snap.mwc != nil {
+		for i := range snap.mwc.Items {
+			for _, h := range mutHookViews(snap.mwc.Items[i].Webhooks) {
+				add(h.svc)
+			}
+		}
+	}
+	if snap.vwc != nil {
+		for i := range snap.vwc.Items {
+			for _, h := range valHookViews(snap.vwc.Items[i].Webhooks) {
+				add(h.svc)
+			}
+		}
+	}
+	return out
+}
+
+// collectProbeCandidates records one effective-ready endpoint's
+// address (up to webhookProbeMaxPerSvc distinct IPs) and its backing
+// Pod ref (up to webhookProbeMaxPodRefs) for service key — the probe
+// and bounce inputs of the W9-CP1 brownout path.
+func (g *webhookGuard) collectProbeCandidates(ready *endpointCensus,
+	key string, s *discoveryv1.EndpointSlice, ep *discoveryv1.Endpoint) {
+	if len(ready.probeIPs[key]) < webhookProbeMaxPerSvc && len(ep.Addresses) > 0 {
+		for _, addr := range ep.Addresses {
+			if !slices.Contains(ready.probeIPs[key], addr) {
+				ready.probeIPs[key] = append(ready.probeIPs[key], addr)
+				break
+			}
+		}
+	}
+	if _, ok := ready.probePort[key]; !ok {
+		// The webhook port: the slice's first declared port, default
+		// 443 — admission webhooks are HTTPS-only, and a slice with
+		// no ports still targets the Service's own port mapping.
+		port := int32(webhookProbeDefaultPort)
+		for _, p := range s.Ports {
+			if p.Port != nil {
+				port = *p.Port
+				break
+			}
+		}
+		ready.probePort[key] = port
+	}
+	if ep.TargetRef != nil && ep.TargetRef.Kind == "Pod" && ep.TargetRef.Name != "" {
+		ns := ep.TargetRef.Namespace
+		if ns == "" {
+			ns = s.Namespace // endpointSlice-local pods carry no namespace on the ref
+		}
+		ref := podRef{namespace: ns, name: ep.TargetRef.Name}
+		if len(ready.backingPods[key]) < webhookProbeMaxPodRefs &&
+			!slices.Contains(ready.backingPods[key], ref) {
+			ready.backingPods[key] = append(ready.backingPods[key], ref)
+		}
+	}
+}
+
+// tcpTLSEndpointProber is the production endpointProber: a 2s
+// TCP-connect + TLS handshake against ip:port. InsecureSkipVerify —
+// the probe answers "is the webhook port serving TLS at all", not
+// "is the certificate valid": a brownout pod fails the handshake
+// entirely, while a healthy one completes it regardless of SANs the
+// probe cannot vouch for.
+func tcpTLSEndpointProber(ctx context.Context, ip string, port int32) bool {
+	if err := ctx.Err(); err != nil {
+		return false
+	}
+	d := &net.Dialer{Timeout: 2 * time.Second}
+	conn, err := tls.DialWithDialer(d, "tcp",
+		net.JoinHostPort(ip, strconv.Itoa(int(port))),
+		&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // liveness probe only
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // hookView is the breaker's uniform projection over MutatingWebhook /
@@ -747,19 +938,31 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 		// the threshold pick.
 		svcEffective, svcRaw := -1, -1
 		svc := ""
+		// unresponsive is the W9-CP1 brownout verdict: the Service
+		// reports Ready endpoints on healthy nodes but EVERY probed
+		// endpoint IP failed the TCP+TLS handshake — the pods are
+		// hung, which is as dead for admission as a partition. It is
+		// only ever true when svcEffective > 0 (effective==0 is
+		// already covered by the W5.5 path) and the service was
+		// actually probed this run.
+		unresponsive := false
 		if h.svc != nil && h.svc.Namespace != "" && h.svc.Name != "" {
 			svc = h.svc.Namespace + "/" + h.svc.Name
 			svcEffective = ready.effective[svc]
 			svcRaw = ready.raw[svc]
+			unresponsive = svcEffective > 0 &&
+				ready.probed[svc] && !ready.responsive[svc]
 		}
 		switch {
-		case isBroken && svcEffective != 0:
+		case isBroken && svcEffective != 0 && !unresponsive:
 			// RECOVER — the Service has >= 1 reachable Ready endpoint
 			// again, or the entry was repointed off its Service
 			// entirely (svcEffective < 0): the breaker cannot measure
 			// a URL, so it hands back the declared Fail and steps
 			// out. Endpoints on partitioned nodes do NOT count —
-			// they still fail every apiserver call.
+			// they still fail every apiserver call — and neither do
+			// endpoints whose pods are still failing the handshake
+			// (W9-CP1): "Ready" in the EndpointSlice is not "serving".
 			flip(h, admissionv1.Fail)
 			delete(broken, h.name)
 			recovered = append(recovered, h.name)
@@ -775,7 +978,7 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 			}
 			metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, h.name).Set(1)
 			emitted[key] = true
-		case svcEffective == 0 && failClosed(h.fp):
+		case (svcEffective == 0 || unresponsive) && failClosed(h.fp):
 			seen[key] = true
 			first, ok := g.deadSince[key]
 			if !ok {
@@ -799,10 +1002,17 @@ func (g *webhookGuard) circuitPatch(log logr.Logger, kind, cfgName, annoVal stri
 			broken[h.name] = true
 			trips = append(trips, h.name)
 			changed = true
-			if svcRaw > 0 {
+			switch {
+			case unresponsive:
+				// W9-CP1 — every probed Ready endpoint failed the
+				// TCP+TLS handshake: hung pods, not a partition.
+				// svcRaw > 0 keeps the 90s partition threshold.
+				log.Info(fmt.Sprintf("CIRCUIT-TRIP: %s/%s webhook %q -> %s (unresponsive: all probed ready endpoints fail TCP+TLS handshake >= %s) — patching failurePolicy=Ignore",
+					kind, cfgName, h.name, svc, threshold))
+			case svcRaw > 0:
 				log.Info(fmt.Sprintf("CIRCUIT-TRIP: %s/%s webhook %q -> %s (all %d ready endpoints on partitioned/unresponsive nodes >= %s) — patching failurePolicy=Ignore",
 					kind, cfgName, h.name, svc, svcRaw, threshold))
-			} else {
+			default:
 				log.Info(fmt.Sprintf("CIRCUIT-TRIP: %s/%s webhook %q -> %s (0 ready endpoints >= %s) — patching failurePolicy=Ignore",
 					kind, cfgName, h.name, svc, threshold))
 			}
@@ -860,6 +1070,134 @@ func circuitMetrics(emitted map[string]bool, kind, cfgName string, trips, recove
 	for _, n := range recovered {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(kind, cfgName, n)
 	}
+}
+
+// bounceHungWebhookPods is the W9-CP1 stage-1 remediation: for every
+// Service referenced by a webhook config whose census verdict is
+// "unresponsive" (Ready endpoints on healthy nodes, ALL probed IPs
+// failing TCP+TLS), delete the oldest Ready backing pod — its owner
+// controller (Deployment/ReplicaSet) recreates it fresh, which is
+// the rolling bounce a hung webhook process needs. One bounce per
+// service per webhookBounceCooldown; the whole pass is gated by the
+// shared maintenance mutex and fails closed like every other pod
+// kill in this module.
+func (g *webhookGuard) bounceHungWebhookPods(ctx context.Context,
+	snap *sweepSnapshot, ready endpointCensus) {
+	log := logf.FromContext(ctx)
+	now := g.now()
+	if g.bounceAt == nil {
+		g.bounceAt = map[string]time.Time{} // literal-constructed fixtures
+	}
+	// Distinct unresponsive webhook backend services, deduped across
+	// configs and kinds — several webhooks routinely share one
+	// Service, and one hung pod set is one bounce.
+	var keys []string
+	seen := map[string]bool{}
+	add := func(svc *admissionv1.ServiceReference) {
+		if svc == nil || svc.Namespace == "" || svc.Name == "" {
+			return
+		}
+		key := svc.Namespace + "/" + svc.Name
+		if seen[key] {
+			return
+		}
+		if !(ready.effective[key] > 0 && ready.probed[key] && !ready.responsive[key]) {
+			return // not brownout-hung — healthy, partitioned or unprobed
+		}
+		if t, ok := g.bounceAt[key]; ok && now.Sub(t) < webhookBounceCooldown {
+			return // inside the 15m per-service cooldown
+		}
+		seen[key] = true
+		keys = append(keys, key)
+	}
+	if snap.mwc != nil {
+		for i := range snap.mwc.Items {
+			for _, h := range mutHookViews(snap.mwc.Items[i].Webhooks) {
+				add(h.svc)
+			}
+		}
+	}
+	if snap.vwc != nil {
+		for i := range snap.vwc.Items {
+			for _, h := range valHookViews(snap.vwc.Items[i].Webhooks) {
+				add(h.svc)
+			}
+		}
+	}
+	if len(keys) == 0 {
+		return
+	}
+
+	// The maintenance mutex gates the bounce (W7-C1 posture): a
+	// cordon/drain/kured reboot or in-flight k0s upgrade defers the
+	// pod kill, and "cannot verify" fails closed.
+	held, why, err := g.maintenanceActive(ctx)
+	if err != nil {
+		metrics.IncError(webhookGuardQueue)
+		log.Info("WARN: maintenance check unverifiable — "+
+			"DEFER: webhook pod bounce skipped (fail closed)",
+			"error", err, "services", keys)
+		return
+	}
+	if held {
+		log.Info("DEFER: maintenance active — webhook pod bounce skipped",
+			"why", why, "services", keys)
+		return
+	}
+	for _, key := range keys {
+		g.bounceOldestPod(ctx, key, ready.backingPods[key], now)
+	}
+}
+
+// bounceOldestPod deletes the oldest Ready, non-terminating backing
+// pod of an unresponsive webhook Service — "oldest" because the hung
+// process is usually the longest-lived replica, and one pod per
+// bounce keeps the rollout gentle. The delete carries the pod's UID
+// as a precondition so a same-named replacement admitted between the
+// census and the delete is never killed by mistake.
+func (g *webhookGuard) bounceOldestPod(ctx context.Context, svcKey string,
+	refs []podRef, now time.Time) {
+	log := logf.FromContext(ctx)
+	var oldest *corev1.Pod
+	for _, r := range refs {
+		p, err := g.cs.CoreV1().Pods(r.namespace).Get(ctx, r.name, metav1.GetOptions{})
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				metrics.IncError(webhookGuardQueue)
+				log.Error(err, "webhook backing pod get failed",
+					"pod", r.namespace+"/"+r.name, "service", svcKey)
+			}
+			continue
+		}
+		if p.DeletionTimestamp != nil || p.Status.Phase != corev1.PodRunning ||
+			!shared.PodReadyCond(p) {
+			continue
+		}
+		if oldest == nil ||
+			p.CreationTimestamp.Time.Before(oldest.CreationTimestamp.Time) {
+			oldest = p
+		}
+	}
+	if oldest == nil {
+		log.Info("webhook bounce: no Ready backing pod found — endpoint refs are stale",
+			"service", svcKey)
+		return
+	}
+	log.Info("BOUNCE: deleting oldest Ready webhook pod — hung TCP+TLS handshake",
+		"service", svcKey, "pod", oldest.Namespace+"/"+oldest.Name,
+		"age", now.Sub(oldest.CreationTimestamp.Time).Truncate(time.Second))
+	uid := oldest.UID
+	if err := g.cs.CoreV1().Pods(oldest.Namespace).Delete(ctx, oldest.Name,
+		metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil {
+		metrics.IncError(webhookGuardQueue)
+		log.Error(err, "webhook pod bounce delete failed",
+			"pod", oldest.Namespace+"/"+oldest.Name, "service", svcKey)
+		return
+	}
+	// The cooldown stamps on a DELIVERED bounce only — a failed
+	// delete leaves the pod hung and the next sweep retries.
+	g.bounceAt[svcKey] = now
 }
 
 // failClosed reports whether the entry currently fails closed. A nil
