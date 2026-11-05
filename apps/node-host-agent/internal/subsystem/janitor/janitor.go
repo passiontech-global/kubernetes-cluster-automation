@@ -65,7 +65,7 @@ import (
 )
 
 const (
-	defaultJanitorInterval = 10 * time.Minute
+	defaultInterval = 10 * time.Minute
 	// latchMaxAge is the reap age for every state-* latch: since
 	// BUG-H6 a live latch's mtime is refreshed by its owner's
 	// stateEnter every cycle the condition still holds, so an
@@ -164,8 +164,8 @@ var legacyProcMarkers = []string{
 	"node-watchdog",
 }
 
-// JanitorConfig carries the janitor knobs — all test-injectable.
-type JanitorConfig struct {
+// Config carries the janitor knobs — all test-injectable.
+type Config struct {
 	Enabled          bool          // false → Run idles until ctx done
 	Interval         time.Duration // sweep cadence
 	WatchdogStateDir string        // the shared node-watchdog state dir
@@ -187,9 +187,9 @@ type JanitorConfig struct {
 	nowFn func() time.Time
 }
 
-func (c *JanitorConfig) applyDefaults() {
+func (c *Config) applyDefaults() {
 	if c.Interval <= 0 {
-		c.Interval = defaultJanitorInterval
+		c.Interval = defaultInterval
 	}
 	if c.WatchdogStateDir == "" {
 		c.WatchdogStateDir = defaultWatchdogStateDir
@@ -215,19 +215,19 @@ func (c *JanitorConfig) applyDefaults() {
 
 // Janitor runs the state-dir + systemd ghost sweeps on one ticker.
 type Janitor struct {
-	cfg     JanitorConfig
+	cfg     Config
 	proc    procfs.FS              // /proc view bound to cfg.ProcRoot
 	state   *hoststate.Store       // shared watchdog-state contract (log appends)
 	cycles  *prometheus.CounterVec // check, result
 	actions *prometheus.CounterVec // check, action
 }
 
-// NewJanitor returns a Janitor and registers its metrics on reg.
-func NewJanitor(cfg JanitorConfig, reg prometheus.Registerer) (*Janitor, error) {
+// New returns a Janitor and registers its metrics on reg.
+func New(cfg Config, reg prometheus.Registerer) (*Janitor, error) {
 	cfg.applyDefaults()
 	j := &Janitor{cfg: cfg, proc: procfs.New(cfg.ProcRoot)}
 	// Now closes over the live config field — tests re-stub
-	// j.cfg.nowFn after NewJanitor returns (hoststate.New doc).
+	// j.cfg.nowFn after New returns (hoststate.New doc).
 	// The Log func keeps the "subsystem"="janitor" slog attr the old
 	// appendLog attached to every mirror line.
 	j.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,

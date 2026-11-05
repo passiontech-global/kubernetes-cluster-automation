@@ -40,4 +40,5 @@ func TestConfigFromEnv(t *testing.T) {
 	}
 }
 
-// TestConcourseCacheFromEnv moved to internal/subsystem/concoursecache.
+// The concourse-cache env-config test moved to
+// internal/subsystem/concoursecache (TestConfigFromEnv).

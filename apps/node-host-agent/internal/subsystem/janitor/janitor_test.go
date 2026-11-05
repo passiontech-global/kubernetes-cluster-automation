@@ -75,7 +75,7 @@ func jfixture(t *testing.T) *jenv {
 	}
 	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: e.sdRun,
 		ProcUptimeFile: filepath.Join(e.proc, "uptime")})
-	j, err := NewJanitor(JanitorConfig{
+	j, err := New(Config{
 		Enabled:          true,
 		Interval:         time.Hour,
 		WatchdogStateDir: e.state,
@@ -163,7 +163,7 @@ func writeFile(t *testing.T, path, content string) {
 
 // --- A: latch reaper ---
 
-func TestJanitorReapsUnknownLatchAfterMaxAge(t *testing.T) {
+func TestReapsUnknownLatchAfterMaxAge(t *testing.T) {
 	e := jfixture(t)
 	// Name no current check produces — the removed/renamed-check
 	// case. FRESH unknowns survive the sweep: a foreign-schema
@@ -186,7 +186,7 @@ func TestJanitorReapsUnknownLatchAfterMaxAge(t *testing.T) {
 	}
 }
 
-func TestJanitorKnownLatchAgeGated(t *testing.T) {
+func TestKnownLatchAgeGated(t *testing.T) {
 	e := jfixture(t)
 	fresh := filepath.Join(e.state, "state-node-overloaded")
 	stale := filepath.Join(e.state, "state-conntrack-pressure")
@@ -207,7 +207,7 @@ func TestJanitorKnownLatchAgeGated(t *testing.T) {
 	}
 }
 
-func TestJanitorParameterizedPrefixLatch(t *testing.T) {
+func TestParameterizedPrefixLatch(t *testing.T) {
 	e := jfixture(t)
 	fresh := filepath.Join(e.state, "state-apiserver-backend-stale-10-0-0-1")
 	stale := filepath.Join(e.state, "state-apiserver-backend-stale-10-0-0-2")
@@ -225,7 +225,7 @@ func TestJanitorParameterizedPrefixLatch(t *testing.T) {
 	}
 }
 
-func TestJanitorPreservesNonStateFiles(t *testing.T) {
+func TestPreservesNonStateFiles(t *testing.T) {
 	e := jfixture(t)
 	keep := []string{
 		"last-restart",          // rate budget — deleting bypasses cooldowns
@@ -255,7 +255,7 @@ func TestJanitorPreservesNonStateFiles(t *testing.T) {
 	}
 }
 
-func TestJanitorSkipsStateDirectory(t *testing.T) {
+func TestSkipsStateDirectory(t *testing.T) {
 	e := jfixture(t)
 	dir := filepath.Join(e.state, "state-weird-dir")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -270,7 +270,7 @@ func TestJanitorSkipsStateDirectory(t *testing.T) {
 	}
 }
 
-func TestJanitorMissingStateDirAbortsCleanly(t *testing.T) {
+func TestMissingStateDirAbortsCleanly(t *testing.T) {
 	e := jfixture(t)
 	if err := os.RemoveAll(e.state); err != nil {
 		t.Fatal(err)
@@ -283,7 +283,7 @@ func TestJanitorMissingStateDirAbortsCleanly(t *testing.T) {
 	}
 }
 
-func TestJanitorMetricsBumpOnReap(t *testing.T) {
+func TestMetricsBumpOnReap(t *testing.T) {
 	e := jfixture(t)
 	p := filepath.Join(e.state, "state-bogus-old-check")
 	writeFile(t, p, "1\n")
@@ -297,7 +297,7 @@ func TestJanitorMetricsBumpOnReap(t *testing.T) {
 
 // --- B: ghost systemd units ---
 
-func TestJanitorResetFailedGhostUnits(t *testing.T) {
+func TestResetFailedGhostUnits(t *testing.T) {
 	e := jfixture(t)
 	e.sdReply["systemctl list-units"] = "" +
 		"k0sworker.service              loaded    active   running k0s worker\n" +
@@ -339,7 +339,7 @@ func TestJanitorResetFailedGhostUnits(t *testing.T) {
 	}
 }
 
-func TestJanitorUnitsSweepNoGhosts(t *testing.T) {
+func TestUnitsSweepNoGhosts(t *testing.T) {
 	e := jfixture(t)
 	e.sdReply["systemctl list-units"] =
 		"k0sworker.service loaded active running k0s worker\n" +
@@ -352,9 +352,9 @@ func TestJanitorUnitsSweepNoGhosts(t *testing.T) {
 	}
 }
 
-func TestJanitorUnitsSweepGatedWithoutSystemd(t *testing.T) {
+func TestUnitsSweepGatedWithoutSystemd(t *testing.T) {
 	e := jfixture(t)
-	j, err := NewJanitor(JanitorConfig{
+	j, err := New(Config{
 		Enabled:          true,
 		WatchdogStateDir: e.state,
 		WatchdogLogFile:  e.logFile,
@@ -386,7 +386,7 @@ func TestJanitorUnitsSweepGatedWithoutSystemd(t *testing.T) {
 
 // --- B: orphan `ip monitor` ---
 
-func TestJanitorKillsOrphanIPMonitor(t *testing.T) {
+func TestKillsOrphanIPMonitor(t *testing.T) {
 	e := jfixture(t)
 	// The field case: `ip -ts monitor` reparented to init after the
 	// retired route-guard unit was pruned.
@@ -402,7 +402,7 @@ func TestJanitorKillsOrphanIPMonitor(t *testing.T) {
 	}
 }
 
-func TestJanitorKillsLegacyScriptTree(t *testing.T) {
+func TestKillsLegacyScriptTree(t *testing.T) {
 	e := jfixture(t)
 	// The retired script itself still loops → kill the loop AND the
 	// monitor so it can't respawn.
@@ -423,7 +423,7 @@ func TestJanitorKillsLegacyScriptTree(t *testing.T) {
 	}
 }
 
-func TestJanitorSkipsIPMonitorWithForeignParent(t *testing.T) {
+func TestSkipsIPMonitorWithForeignParent(t *testing.T) {
 	e := jfixture(t)
 	// Ambiguous ownership → suspect, never kill.
 	e.mkProc(t, 6666, 1, "/usr/sbin/NetworkManager", "--no-daemon")
@@ -439,7 +439,7 @@ func TestJanitorSkipsIPMonitorWithForeignParent(t *testing.T) {
 	}
 }
 
-func TestJanitorIgnoresNonMonitorIPCommands(t *testing.T) {
+func TestIgnoresNonMonitorIPCommands(t *testing.T) {
 	e := jfixture(t)
 	// `ip netns monitor` is a different subcommand — first non-flag
 	// arg is "netns", not "monitor".
@@ -455,8 +455,8 @@ func TestJanitorIgnoresNonMonitorIPCommands(t *testing.T) {
 	}
 }
 
-func TestJanitorRunDisabledIdles(t *testing.T) {
-	j, err := NewJanitor(JanitorConfig{Enabled: false}, nil)
+func TestRunDisabledIdles(t *testing.T) {
+	j, err := New(Config{Enabled: false}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +475,7 @@ func TestJanitorRunDisabledIdles(t *testing.T) {
 // knownLatchNames — sweepLatches deletes unregistered state-* files
 // immediately, so a missing entry would eat the latch the moment a
 // check writes it.
-func TestJanitorRuntimeDatapathLatchesAreKnown(t *testing.T) {
+func TestRuntimeDatapathLatchesAreKnown(t *testing.T) {
 	e := jfixture(t)
 	for _, n := range []string{
 		"kubelet-syncloop-down", "containerd-sock-down",
@@ -497,7 +497,7 @@ func TestJanitorRuntimeDatapathLatchesAreKnown(t *testing.T) {
 // The wave-8 latches must be registered in knownLatchNames —
 // sweepLatches deletes unregistered state-* files immediately, so a
 // missing entry would eat the latch the moment a check writes it.
-func TestJanitorPressureFleetLatchesAreKnown(t *testing.T) {
+func TestPressureFleetLatchesAreKnown(t *testing.T) {
 	e := jfixture(t)
 	names := []string{
 		"cilium-bpf-map-pressure", "psi-memory-thrash",
@@ -524,7 +524,7 @@ func TestJanitorPressureFleetLatchesAreKnown(t *testing.T) {
 // The wave-9 latches must be registered in knownLatchNames —
 // sweepLatches deletes unregistered state-* files immediately, so a
 // missing entry would eat the latch the moment a check writes it.
-func TestJanitorClockKernelNebulaLatchesAreKnown(t *testing.T) {
+func TestClockKernelNebulaLatchesAreKnown(t *testing.T) {
 	e := jfixture(t)
 	names := []string{
 		"clock-unsync", "kernel-slab-leak", "nebula-pmtu-blackhole",

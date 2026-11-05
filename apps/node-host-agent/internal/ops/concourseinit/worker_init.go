@@ -28,7 +28,7 @@ import (
 const btrfsCmdTimeout = 60 * time.Second
 
 // Config carries the init knobs — the zero value IS the production
-// config (same convention as concoursecache.ConcourseCacheConfig).
+// config (same convention as concoursecache.Config).
 //
 // OwnerUID/OwnerGID -1 skips chown entirely for unprivileged test
 // runs; the zero value is NOT "chown to root" — chown-to-root was

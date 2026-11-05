@@ -7,7 +7,7 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
-func TestJanitorConfigFromEnv(t *testing.T) {
+func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("NODE_HOST_AGENT_JANITOR_INTERVAL", "2m")
 	t.Setenv("NODE_HOST_AGENT_JANITOR_LATCH_MAX_AGE", "48h")
 	t.Setenv("NODE_HOST_AGENT_PROC_ROOT", "/host/proc")
@@ -17,7 +17,7 @@ func TestJanitorConfigFromEnv(t *testing.T) {
 		WatchdogStateDir: "/sd",
 		WatchdogLogFile:  "/lf",
 	}
-	cfg := JanitorConfigFromEnv(d)
+	cfg := ConfigFromEnv(d)
 	if !cfg.Enabled {
 		t.Fatal("Enabled should be true — the enable gate stays in the caller")
 	}

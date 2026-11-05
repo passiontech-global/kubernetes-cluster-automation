@@ -5,7 +5,7 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
-// EnvDeps carries the non-env inputs JanitorConfigFromEnv needs — the
+// EnvDeps carries the non-env inputs ConfigFromEnv needs — the
 // values cmd/agent used to splice into the config directly: the
 // systemd client and the shared watchdog state dir/log file. It is a
 // deliberate copy of the four fields the wire call passes (the
@@ -20,17 +20,17 @@ type EnvDeps struct {
 	HostPath func(string) string
 }
 
-// JanitorConfigFromEnv resolves the NODE_HOST_AGENT_* knobs the
-// watchdog-state janitor reads and returns a JanitorConfig ready for
-// NewJanitor — the env contract lives in the package, not in
+// ConfigFromEnv resolves the NODE_HOST_AGENT_* knobs the
+// watchdog-state janitor reads and returns a Config ready for
+// New — the env contract lives in the package, not in
 // cmd/agent. Enabled is always true here: the wire func set it
 // unconditionally and the enable gate
 // (NODE_HOST_AGENT_ENABLE_JANITOR) stays in the caller. Consumes only
 // EnvDeps.WatchdogStateDir, .WatchdogLogFile and .Systemd.
-func JanitorConfigFromEnv(d EnvDeps) JanitorConfig {
-	return JanitorConfig{
+func ConfigFromEnv(d EnvDeps) Config {
+	return Config{
 		Enabled:          true,
-		Interval:         envx.Duration("NODE_HOST_AGENT_JANITOR_INTERVAL", defaultJanitorInterval),
+		Interval:         envx.Duration("NODE_HOST_AGENT_JANITOR_INTERVAL", defaultInterval),
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogLogFile:  d.WatchdogLogFile,
 		ProcRoot:         envx.String("NODE_HOST_AGENT_PROC_ROOT", defaultProcRoot),

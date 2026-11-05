@@ -158,4 +158,4 @@ func kubeletWatchdogHosts(varsDir, nodeName string) []string {
 
 // The watchdog-state janitor (stale-latch reaper + retired-unit
 // sweep) moved to internal/subsystem/janitor — see
-// janitor.JanitorConfigFromEnv.
+// janitor.ConfigFromEnv.

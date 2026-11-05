@@ -136,8 +136,8 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE",
 			Default: onOff(w.defKube),
 			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
-				knobs := concoursecache.ConcourseCacheFromEnv()
-				pr, err := concoursecache.NewConcourseCachePruner(knobs.Config, w.reg)
+				knobs := concoursecache.ConfigFromEnv()
+				pr, err := concoursecache.New(knobs.Config, w.reg)
 				if err != nil {
 					logger().Error("concourse-cache pruner setup failed", "error", err)
 					return nil, nil
@@ -276,7 +276,7 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_JANITOR",
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
-				return janitor.NewJanitor(janitor.JanitorConfigFromEnv(
+				return janitor.New(janitor.ConfigFromEnv(
 					janitor.EnvDeps{
 						Systemd:          w.sdClient,
 						WatchdogStateDir: w.watchdogStateDir,
