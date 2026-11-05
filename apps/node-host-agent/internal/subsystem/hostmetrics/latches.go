@@ -193,6 +193,11 @@ func (l *Latches) updateKernelKeysLatch(ratio float64) {
 	}
 }
 
+var descKernelKeys = prometheus.NewDesc(
+	"node_host_agent_kernel_keys_used_ratio",
+	"Highest per-UID keyring fill ratio from /proc/key-users (instantiated/max; >0.80 latches state-kernel-keys-pressure).",
+	[]string{"node"}, nil)
+
 // collectKernelKeys emits the W8-KR3 used-ratio gauge — absent when
 // the file doesn't parse (no fake 0).
 func (c *Collector) collectKernelKeys(ch chan<- prometheus.Metric) {
@@ -200,6 +205,6 @@ func (c *Collector) collectKernelKeys(ch chan<- prometheus.Metric) {
 	if !ok {
 		return
 	}
-	ch <- prometheus.MustNewConstMetric(c.descKernelKeys,
+	ch <- prometheus.MustNewConstMetric(descKernelKeys,
 		prometheus.GaugeValue, ratio, c.cfg.NodeName)
 }

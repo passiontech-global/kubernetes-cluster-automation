@@ -39,6 +39,18 @@ var defaultCgroupMemUnits = []string{
 
 // --- A2: zombie count + cgroup pids pressure ---
 
+var (
+	descZombies = prometheus.NewDesc(
+		"node_host_agent_processes_zombie_count",
+		"Processes in state Z under the host proc root (emitted only when the scan succeeds).",
+		[]string{"node"}, nil)
+	// W7-H1: uninterruptible-sleep count — the same /proc walk.
+	descDState = prometheus.NewDesc(
+		"node_host_agent_dstate_processes",
+		"Processes in state D (uninterruptible sleep) under the host proc root (emitted only when the scan succeeds).",
+		[]string{"node"}, nil)
+)
+
 // collectZombies counts state Z processes under ProcRoot — the
 // state char sits right after the LAST ')' because comm can
 // contain spaces and parens (same trick as workerhygiene's
@@ -69,11 +81,16 @@ func (c *Collector) collectZombies(ch chan<- prometheus.Metric) {
 			}
 		}
 	}
-	ch <- prometheus.MustNewConstMetric(c.descZombies,
+	ch <- prometheus.MustNewConstMetric(descZombies,
 		prometheus.GaugeValue, n, c.cfg.NodeName)
-	ch <- prometheus.MustNewConstMetric(c.descDState,
+	ch <- prometheus.MustNewConstMetric(descDState,
 		prometheus.GaugeValue, dstate, c.cfg.NodeName)
 }
+
+var descCgroupPids = prometheus.NewDesc(
+	"node_host_agent_cgroup_pids_used_ratio",
+	"pids.current / pids.max of the slice (emitted only when both files parse and max > 0).",
+	[]string{"node", "slice"}, nil)
 
 // collectCgroupPids emits pids.current/pids.max per slice — a
 // missing or non-numeric ("max") limit yields no ratio (never a
@@ -92,7 +109,7 @@ func (c *Collector) collectCgroupPids(ch chan<- prometheus.Metric) {
 		if !ok || mx == 0 {
 			continue
 		}
-		ch <- prometheus.MustNewConstMetric(c.descCgroupPids,
+		ch <- prometheus.MustNewConstMetric(descCgroupPids,
 			prometheus.GaugeValue, float64(cur)/float64(mx),
 			c.cfg.NodeName, slice)
 	}
@@ -104,6 +121,11 @@ func (c *Collector) collectCgroupPids(ch chan<- prometheus.Metric) {
 // internal/platform/hostutil now — the same helpers workerhygiene's
 // checkCiliumMTU uses (hostutil.MTUOfIface / JSONFindInts /
 // RuntimeConfigMTU).
+
+var descMTUDrift = prometheus.NewDesc(
+	"node_host_agent_mtu_drift",
+	"cilium datapath MTU exceeds the nebula overlay MTU (1 = drift; emitted only when both MTUs resolve).",
+	[]string{"node"}, nil)
 
 // wgEncapOverheadBytes is the WireGuard encapsulation overhead the
 // cilium_wg0 MTU must leave under the nebula overlay MTU (W9
@@ -135,11 +157,28 @@ func (c *Collector) collectMTUDrift(ch chan<- prometheus.Metric) {
 	if (cilOK && cil > neb) || (wgOK && wg > neb-wgEncapOverheadBytes) {
 		drift = 1
 	}
-	ch <- prometheus.MustNewConstMetric(c.descMTUDrift,
+	ch <- prometheus.MustNewConstMetric(descMTUDrift,
 		prometheus.GaugeValue, drift, c.cfg.NodeName)
 }
 
 // --- W7: systemd scope footprint, ARP entries, cgroup memory.events ---
+
+var (
+	// W7-H2: the abandoned cri-containerd scope footprint.
+	descSystemdScopes = prometheus.NewDesc(
+		"node_host_agent_systemd_scopes_count",
+		"cri-containerd-*.scope dirs under the kubepods cgroup slice — the abandoned-scope footprint slowing PID 1 D-Bus.",
+		[]string{"node"}, nil)
+	// W7-H6: memory.events reclaim-throttling counters.
+	descCgMemHigh = prometheus.NewDesc(
+		"node_host_agent_cgroup_memory_high_events_total",
+		"memory.events `high` of the unit — direct-reclaim throttling episodes (freeze, not OOMKill).",
+		[]string{"node", "unit"}, nil)
+	descCgMemOOMKill = prometheus.NewDesc(
+		"node_host_agent_cgroup_memory_oom_kill_events_total",
+		"memory.events `oom_kill` of the unit — actual OOM kills counted by the cgroup.",
+		[]string{"node", "unit"}, nil)
+)
 
 // collectSystemdScopes counts cri-containerd-*.scope dirs under the
 // kubepods cgroup slice (W7-H2): a leaking abandoned-scope
@@ -165,7 +204,7 @@ func (c *Collector) collectSystemdScopes(ch chan<- prometheus.Metric) {
 		}
 		return nil
 	})
-	ch <- prometheus.MustNewConstMetric(c.descSystemdScopes,
+	ch <- prometheus.MustNewConstMetric(descSystemdScopes,
 		prometheus.GaugeValue, n, c.cfg.NodeName)
 }
 
@@ -180,11 +219,11 @@ func (c *Collector) collectCgroupMemEvents(ch chan<- prometheus.Metric) {
 		ev := vmstatCounters(filepath.Join(c.cfg.CgroupRoot,
 			"system.slice", unit, "memory.events"), "high", "oom_kill")
 		if v, ok := ev["high"]; ok {
-			ch <- prometheus.MustNewConstMetric(c.descCgMemHigh,
+			ch <- prometheus.MustNewConstMetric(descCgMemHigh,
 				prometheus.CounterValue, float64(v), c.cfg.NodeName, unit)
 		}
 		if v, ok := ev["oom_kill"]; ok {
-			ch <- prometheus.MustNewConstMetric(c.descCgMemOOMKill,
+			ch <- prometheus.MustNewConstMetric(descCgMemOOMKill,
 				prometheus.CounterValue, float64(v), c.cfg.NodeName, unit)
 		}
 	}

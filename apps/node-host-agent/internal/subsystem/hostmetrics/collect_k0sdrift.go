@@ -142,6 +142,14 @@ func scanK0sDrift(data []byte, parsed map[string]any, parseOK bool,
 	return findings
 }
 
+var descK0sDrift = prometheus.NewDesc(
+	"node_k0s_config_drift",
+	"/etc/k0s/k0s.yaml drifted vs expected config (1=drift): "+
+		"removed-flag still present, extra/missing KCM extraArgs key, "+
+		"or unreadable config (emitted only on nodes running "+
+		"k0scontroller.service).",
+	[]string{"reason", "key"}, nil)
+
 // collectK0sDrift emits node_k0s_config_drift{reason,key} on
 // controller nodes (detected via the k0scontroller.service unit file).
 // One series per finding at value 1; a clean config emits
@@ -154,12 +162,12 @@ func (c *Collector) collectK0sDrift(ch chan<- prometheus.Metric) {
 	findings := scanK0sDrift(data, parsed, ok, c.removedFlagRe,
 		c.expectedKCM, c.cfg.ExpectedKCMArgs)
 	if len(findings) == 0 {
-		ch <- prometheus.MustNewConstMetric(c.descK0sDrift,
+		ch <- prometheus.MustNewConstMetric(descK0sDrift,
 			prometheus.GaugeValue, 0, "none", "none")
 		return
 	}
 	for _, f := range findings {
-		ch <- prometheus.MustNewConstMetric(c.descK0sDrift,
+		ch <- prometheus.MustNewConstMetric(descK0sDrift,
 			prometheus.GaugeValue, 1, f.reason, f.key)
 	}
 }

@@ -14,6 +14,11 @@ import (
 
 // --- fail2ban banned counts (50-fail2ban.sh + prom_emit) ---
 
+var descF2B = prometheus.NewDesc(
+	"node_fail2ban_banned_ips",
+	"Currently banned IPs per fail2ban jail (emitted only when the banned file exists).",
+	[]string{"jail"}, nil)
+
 // collectFail2ban emits node_fail2ban_banned_ips{jail} from the
 // fail2ban-banned file — absent when the file is (node without
 // fail2ban → absent series, never a fake 0).
@@ -32,7 +37,7 @@ func (c *Collector) collectFail2ban(ch chan<- prometheus.Metric) {
 		if err != nil {
 			continue // malformed entry — never emit junk (file contract)
 		}
-		ch <- prometheus.MustNewConstMetric(c.descF2B,
+		ch <- prometheus.MustNewConstMetric(descF2B,
 			prometheus.GaugeValue, v, jail)
 	}
 }

@@ -82,6 +82,29 @@ func (c *Collector) probeFS(mount string) (st unix.Statfs_t, stalled, ok bool) {
 	}
 }
 
+var (
+	descFSInodesTotal = prometheus.NewDesc(
+		"node_host_agent_filesystem_inodes_total",
+		"Total inodes on the probed mount (statfs Files).",
+		[]string{"node", "mount"}, nil)
+	descFSInodesFree = prometheus.NewDesc(
+		"node_host_agent_filesystem_inodes_free",
+		"Free inodes on the probed mount (statfs Ffree).",
+		[]string{"node", "mount"}, nil)
+	descFSInodesRatio = prometheus.NewDesc(
+		"node_host_agent_filesystem_inodes_used_ratio",
+		"Used-inode share of the probed mount ((Files-Ffree)/Files; emitted only when statfs succeeds).",
+		[]string{"node", "mount"}, nil)
+	descFSProbeStalled = prometheus.NewDesc(
+		"node_host_agent_filesystem_probe_stalled",
+		"statfs probe of this mount exceeded the deadline (1 = hung mount; emitted for every configured target).",
+		[]string{"node", "mount"}, nil)
+	descFSReadonly = prometheus.NewDesc(
+		"node_host_agent_filesystem_readonly",
+		"Probed mount reports ST_RDONLY via statfs (1 = filesystem remounted read-only; emitted only when statfs succeeds).",
+		[]string{"node", "mount"}, nil)
+)
+
 // collectFilesystem emits per-mount inode gauges plus the
 // probe_stalled signal for EVERY configured target — a 0 means the
 // probe answered in time (even with an error), so "reachable but
@@ -122,7 +145,7 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 				"mount recovered",
 				"mount", mount)
 		}
-		ch <- prometheus.MustNewConstMetric(c.descFSProbeStalled,
+		ch <- prometheus.MustNewConstMetric(descFSProbeStalled,
 			prometheus.GaugeValue, v, c.cfg.NodeName, mount)
 		if !ok {
 			continue
@@ -133,17 +156,17 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 			ro = 1
 			anyRO = true
 		}
-		ch <- prometheus.MustNewConstMetric(c.descFSReadonly,
+		ch <- prometheus.MustNewConstMetric(descFSReadonly,
 			prometheus.GaugeValue, ro, c.cfg.NodeName, mount)
-		ch <- prometheus.MustNewConstMetric(c.descFSInodesTotal,
+		ch <- prometheus.MustNewConstMetric(descFSInodesTotal,
 			prometheus.GaugeValue, float64(st.Files), c.cfg.NodeName, mount)
-		ch <- prometheus.MustNewConstMetric(c.descFSInodesFree,
+		ch <- prometheus.MustNewConstMetric(descFSInodesFree,
 			prometheus.GaugeValue, float64(st.Ffree), c.cfg.NodeName, mount)
 		if st.Files > 0 && st.Ffree <= st.Files {
 			// Ffree > Files wraps uint64 — pseudo/network filesystems
 			// can report free inodes above the total.
 			used := float64(st.Files-st.Ffree) / float64(st.Files)
-			ch <- prometheus.MustNewConstMetric(c.descFSInodesRatio,
+			ch <- prometheus.MustNewConstMetric(descFSInodesRatio,
 				prometheus.GaugeValue, used, c.cfg.NodeName, mount)
 		}
 	}

@@ -171,87 +171,6 @@ type Collector struct {
 	k0sParsed map[string]any
 	k0sOK     bool
 
-	descWatchdog    *prometheus.Desc
-	descNebUp       *prometheus.Desc
-	descNebRoute    *prometheus.Desc
-	descNebCertDays *prometheus.Desc
-	descK0sDrift    *prometheus.Desc
-	descPSI         *prometheus.Desc
-	descCPURatio    *prometheus.Desc
-	descCPUWall     *prometheus.Desc
-	descF2B         *prometheus.Desc
-	descEgressRelay *prometheus.Desc
-
-	// Gray-failure telemetry (H1 clock, H2 conntrack, H3 inodes,
-	// H6 fd/sockets, H7 hung-mount probe).
-	descClockUnsync    *prometheus.Desc
-	descClockEstErr    *prometheus.Desc
-	descCtEntries      *prometheus.Desc
-	descCtLimit        *prometheus.Desc
-	descCtRatio        *prometheus.Desc
-	descFSInodesTotal  *prometheus.Desc
-	descFSInodesFree   *prometheus.Desc
-	descFSInodesRatio  *prometheus.Desc
-	descFSProbeStalled *prometheus.Desc
-	descFSReadonly     *prometheus.Desc
-	descFileFDAlloc    *prometheus.Desc
-	descFileFDMax      *prometheus.Desc
-	descFileFDRatio    *prometheus.Desc
-	descSockTCPInuse   *prometheus.Desc
-	descSockTCPOrphan  *prometheus.Desc
-	descSockTCPTW      *prometheus.Desc
-	descSockUsed       *prometheus.Desc
-
-	// Wave-2 additions: 2.4 PKI certs, A1 inotify, A2 zombie/cgroup
-	// pids, B4 MTU drift.
-	descPKIDays        *prometheus.Desc
-	descInotifyInst    *prometheus.Desc
-	descInotifyWatches *prometheus.Desc
-	descZombies        *prometheus.Desc
-	descCgroupPids     *prometheus.Desc
-	descMTUDrift       *prometheus.Desc
-
-	// W5.7 PSI memory/io avg60 gauges + vmstat swap-thrash counters.
-	descPSIMemSome *prometheus.Desc
-	descPSIMemFull *prometheus.Desc
-	descPSIIOSome  *prometheus.Desc
-	descPSIIOFull  *prometheus.Desc
-	descPSWPIn     *prometheus.Desc
-	descPSWPOut    *prometheus.Desc
-
-	// W7 additions: H1 d-state processes, H2 cri-containerd scope
-	// footprint, H5 conntrack insert_failed/drop + ARP entries,
-	// H6 cgroup memory.events counters.
-	descDState        *prometheus.Desc
-	descSystemdScopes *prometheus.Desc
-	descCtInsertFail  *prometheus.Desc
-	descCtDrops       *prometheus.Desc
-	descARPEntries    *prometheus.Desc
-	descCgMemHigh     *prometheus.Desc
-	descCgMemOOMKill  *prometheus.Desc
-
-	// W8 additions: KR3 kernel keyring quota + TCP close_wait.
-	descKernelKeys *prometheus.Desc
-	descSockTCPCW  *prometheus.Desc
-
-	// W9 additions: per-PVC LocalPV dir bytes.
-	descLocalPVDirBytes *prometheus.Desc
-
-	// Legacy node-watchdog aliases — the prom_emit textfile series
-	// the fluxcd PrometheusRules still alert on
-	// (node_watchdog_state{signal}, node_watchdog_egress_relay{target}).
-	// Emitted alongside the node_host_agent_* names so the same
-	// registry serves pods AND the standalone textfile writer keeps
-	// the node-exporter contract on out-of-cluster hosts.
-	descWatchdogLegacy    *prometheus.Desc
-	descEgressRelayLegacy *prometheus.Desc
-
-	// descMeta maps each desc to its fqName/help for textfile
-	// rendering — a prometheus.Metric carries the Desc but the
-	// fqName is only reachable through Desc.String(), so the writer
-	// keeps its own table.
-	descMeta map[*prometheus.Desc]descMeta
-
 	// cpu-delivered probe bookkeeping (mu): the busy-loop runs in a
 	// goroutine — a scrape triggers it and serves the last result;
 	// a scrape must never block up to ~6s on steal measurement.
@@ -312,340 +231,6 @@ func New(cfg Config) *Collector {
 	for _, k := range cfg.ExpectedKCMArgs {
 		c.expectedKCM[k] = true
 	}
-	c.descWatchdog = prometheus.NewDesc(
-		"node_host_agent_watchdog_state",
-		"node-watchdog state-* latch present (1) or previously seen and cleared (0).",
-		[]string{"node", "state"}, nil)
-	c.descNebUp = prometheus.NewDesc(
-		"node_host_agent_nebula_interface_up",
-		"Nebula interface operstate is up (emitted only when the interface exists).",
-		nil, nil)
-	c.descNebRoute = prometheus.NewDesc(
-		"node_host_agent_nebula_route_present",
-		"A host route via the Nebula interface exists (emitted only when the interface exists).",
-		nil, nil)
-	c.descNebCertDays = prometheus.NewDesc(
-		"node_host_agent_nebula_cert_days_left",
-		"Days until the nebula host certificate notAfter (emitted only when the cert parses).",
-		nil, nil)
-	c.descK0sDrift = prometheus.NewDesc(
-		"node_k0s_config_drift",
-		"/etc/k0s/k0s.yaml drifted vs expected config (1=drift): "+
-			"removed-flag still present, extra/missing KCM extraArgs key, "+
-			"or unreadable config (emitted only on nodes running "+
-			"k0scontroller.service).",
-		[]string{"reason", "key"}, nil)
-	c.descPSI = prometheus.NewDesc(
-		"node_watchdog_psi_cpu_some_avg60",
-		"PSI cpu some avg60 — share of time runnable tasks stalled (runner's overload signal).",
-		nil, nil)
-	c.descCPURatio = prometheus.NewDesc(
-		"node_cpu_delivered_ratio",
-		"Share of 1 vCPU actually delivered by the hypervisor — busy-loop probe (~0.3 cpu-s, 1.0 = no steal).",
-		nil, nil)
-	c.descCPUWall = prometheus.NewDesc(
-		"node_cpu_delivered_probe_wall_seconds",
-		"Wall-clock the cpu-delivered probe ran — abnormal growth = the probe itself stalled.",
-		nil, nil)
-	c.descF2B = prometheus.NewDesc(
-		"node_fail2ban_banned_ips",
-		"Currently banned IPs per fail2ban jail (emitted only when the banned file exists).",
-		[]string{"jail"}, nil)
-	c.descEgressRelay = prometheus.NewDesc(
-		"node_overlay_egress_relay_active",
-		"Egress target currently routed via the overlay relay (1) or direct underlay (0).",
-		[]string{"target"}, nil)
-	c.descWatchdogLegacy = prometheus.NewDesc(
-		"node_watchdog_state",
-		"Signal currently active on node-watchdog (1 = state file exists).",
-		[]string{"signal"}, nil)
-	c.descEgressRelayLegacy = prometheus.NewDesc(
-		"node_watchdog_egress_relay",
-		"Egress target currently routed via overlay relay (1) or direct (0).",
-		[]string{"target"}, nil)
-
-	// Gray-failure telemetry — all carry the node label so a
-	// federated store can attribute them back to the agent host.
-	c.descClockUnsync = prometheus.NewDesc(
-		"node_host_agent_clock_unsynchronized",
-		"Kernel clock reports STA_UNSYNC via adjtimex (1 = not synchronized; emitted only when the syscall succeeds).",
-		[]string{"node"}, nil)
-	c.descClockEstErr = prometheus.NewDesc(
-		"node_host_agent_clock_estimated_error_seconds",
-		"adjtimex Timex.Esterror exported as seconds — the kernel's own bound on clock error.",
-		[]string{"node"}, nil)
-	c.descCtEntries = prometheus.NewDesc(
-		"node_host_agent_conntrack_entries",
-		"nf_conntrack_count — conntrack table entries currently tracked.",
-		[]string{"node"}, nil)
-	c.descCtLimit = prometheus.NewDesc(
-		"node_host_agent_conntrack_limit",
-		"nf_conntrack_max — conntrack table capacity.",
-		[]string{"node"}, nil)
-	c.descCtRatio = prometheus.NewDesc(
-		"node_host_agent_conntrack_used_ratio",
-		"Conntrack table fill ratio (entries/limit; emitted only when both files parse and limit > 0).",
-		[]string{"node"}, nil)
-	c.descFSInodesTotal = prometheus.NewDesc(
-		"node_host_agent_filesystem_inodes_total",
-		"Total inodes on the probed mount (statfs Files).",
-		[]string{"node", "mount"}, nil)
-	c.descFSInodesFree = prometheus.NewDesc(
-		"node_host_agent_filesystem_inodes_free",
-		"Free inodes on the probed mount (statfs Ffree).",
-		[]string{"node", "mount"}, nil)
-	c.descFSInodesRatio = prometheus.NewDesc(
-		"node_host_agent_filesystem_inodes_used_ratio",
-		"Used-inode share of the probed mount ((Files-Ffree)/Files; emitted only when statfs succeeds).",
-		[]string{"node", "mount"}, nil)
-	c.descFSProbeStalled = prometheus.NewDesc(
-		"node_host_agent_filesystem_probe_stalled",
-		"statfs probe of this mount exceeded the deadline (1 = hung mount; emitted for every configured target).",
-		[]string{"node", "mount"}, nil)
-	c.descFileFDAlloc = prometheus.NewDesc(
-		"node_host_agent_filefd_allocated",
-		"file-nr field 0 — file handles currently allocated.",
-		[]string{"node"}, nil)
-	c.descFileFDMax = prometheus.NewDesc(
-		"node_host_agent_filefd_maximum",
-		"file-nr field 2 — file handle limit.",
-		[]string{"node"}, nil)
-	c.descFileFDRatio = prometheus.NewDesc(
-		"node_host_agent_filefd_used_ratio",
-		"file-nr allocated/maximum (emitted only when file-nr parses and max > 0).",
-		[]string{"node"}, nil)
-	c.descSockTCPInuse = prometheus.NewDesc(
-		"node_host_agent_sockstat_tcp_inuse",
-		"sockstat TCP inuse — TCP sockets in use.",
-		[]string{"node"}, nil)
-	c.descSockTCPOrphan = prometheus.NewDesc(
-		"node_host_agent_sockstat_tcp_orphan",
-		"sockstat TCP orphan — orphaned (not attached to a socket) TCP connections.",
-		[]string{"node"}, nil)
-	c.descSockTCPTW = prometheus.NewDesc(
-		"node_host_agent_sockstat_tcp_tw",
-		"sockstat TCP tw — TCP sockets in TIME_WAIT.",
-		[]string{"node"}, nil)
-	c.descSockUsed = prometheus.NewDesc(
-		"node_host_agent_sockstat_sockets_used",
-		"sockstat 'sockets: used' — total sockets in use across protocols.",
-		[]string{"node"}, nil)
-
-	// Wave-2 gray-failure telemetry — same node-label convention.
-	c.descPKIDays = prometheus.NewDesc(
-		"node_host_agent_pki_cert_days_left",
-		"Days until the earliest notAfter of the on-disk PKI cert at this path (emitted only when a cert parses).",
-		[]string{"node", "path"}, nil)
-	c.descInotifyInst = prometheus.NewDesc(
-		"node_host_agent_inotify_instances_used_ratio",
-		"inotify fds in use / max_user_instances (emitted only when the limit parses and is > 0).",
-		[]string{"node"}, nil)
-	c.descInotifyWatches = prometheus.NewDesc(
-		"node_host_agent_inotify_watches_used_ratio",
-		"inotify watches in use / max_user_watches (emitted only when the limit parses and is > 0).",
-		[]string{"node"}, nil)
-	c.descZombies = prometheus.NewDesc(
-		"node_host_agent_processes_zombie_count",
-		"Processes in state Z under the host proc root (emitted only when the scan succeeds).",
-		[]string{"node"}, nil)
-	c.descCgroupPids = prometheus.NewDesc(
-		"node_host_agent_cgroup_pids_used_ratio",
-		"pids.current / pids.max of the slice (emitted only when both files parse and max > 0).",
-		[]string{"node", "slice"}, nil)
-	c.descMTUDrift = prometheus.NewDesc(
-		"node_host_agent_mtu_drift",
-		"cilium datapath MTU exceeds the nebula overlay MTU (1 = drift; emitted only when both MTUs resolve).",
-		[]string{"node"}, nil)
-	c.descFSReadonly = prometheus.NewDesc(
-		"node_host_agent_filesystem_readonly",
-		"Probed mount reports ST_RDONLY via statfs (1 = filesystem remounted read-only; emitted only when statfs succeeds).",
-		[]string{"node", "mount"}, nil)
-
-	// W5.7 — PSI memory/io some+full avg60 and vmstat swap counters.
-	c.descPSIMemSome = prometheus.NewDesc(
-		"node_host_agent_psi_memory_some_avg60",
-		"PSI memory some avg60 — share of time any task stalled on memory reclaim.",
-		[]string{"node"}, nil)
-	c.descPSIMemFull = prometheus.NewDesc(
-		"node_host_agent_psi_memory_full_avg60",
-		"PSI memory full avg60 — share of time ALL non-idle tasks stalled on memory reclaim (thrashing).",
-		[]string{"node"}, nil)
-	c.descPSIIOSome = prometheus.NewDesc(
-		"node_host_agent_psi_io_some_avg60",
-		"PSI io some avg60 — share of time any task stalled on block IO.",
-		[]string{"node"}, nil)
-	c.descPSIIOFull = prometheus.NewDesc(
-		"node_host_agent_psi_io_full_avg60",
-		"PSI io full avg60 — share of time ALL non-idle tasks stalled on block IO (disk saturation).",
-		[]string{"node"}, nil)
-	c.descPSWPIn = prometheus.NewDesc(
-		"node_host_agent_vmstat_pswpin_total",
-		"/proc/vmstat pswpin — cumulative pages swapped in (swap thrash evidence).",
-		[]string{"node"}, nil)
-	c.descPSWPOut = prometheus.NewDesc(
-		"node_host_agent_vmstat_pswpout_total",
-		"/proc/vmstat pswpout — cumulative pages swapped out (swap thrash evidence).",
-		[]string{"node"}, nil)
-
-	// W7 gray-failure telemetry — same node-label convention.
-	c.descDState = prometheus.NewDesc(
-		"node_host_agent_dstate_processes",
-		"Processes in state D (uninterruptible sleep) under the host proc root (emitted only when the scan succeeds).",
-		[]string{"node"}, nil)
-	c.descSystemdScopes = prometheus.NewDesc(
-		"node_host_agent_systemd_scopes_count",
-		"cri-containerd-*.scope dirs under the kubepods cgroup slice — the abandoned-scope footprint slowing PID 1 D-Bus.",
-		[]string{"node"}, nil)
-	c.descCtInsertFail = prometheus.NewDesc(
-		"node_host_agent_conntrack_insert_failed_total",
-		"Sum of the insert_failed column across all CPU rows of /proc/net/stat/nf_conntrack (UDP tuple-collision drops).",
-		[]string{"node"}, nil)
-	c.descCtDrops = prometheus.NewDesc(
-		"node_host_agent_conntrack_drops_total",
-		"Sum of the drop column across all CPU rows of /proc/net/stat/nf_conntrack.",
-		[]string{"node"}, nil)
-	c.descARPEntries = prometheus.NewDesc(
-		"node_host_agent_arp_entries",
-		"Entries in /proc/net/arp — ARP neighbour-table fill vs gc_thresh headroom.",
-		[]string{"node"}, nil)
-	c.descCgMemHigh = prometheus.NewDesc(
-		"node_host_agent_cgroup_memory_high_events_total",
-		"memory.events `high` of the unit — direct-reclaim throttling episodes (freeze, not OOMKill).",
-		[]string{"node", "unit"}, nil)
-	c.descCgMemOOMKill = prometheus.NewDesc(
-		"node_host_agent_cgroup_memory_oom_kill_events_total",
-		"memory.events `oom_kill` of the unit — actual OOM kills counted by the cgroup.",
-		[]string{"node", "unit"}, nil)
-
-	// W8-KR3 — /proc/key-users: worst per-UID keyring quota fill;
-	// /proc/net/sockstat TCP close_wait (hung client sockets).
-	c.descKernelKeys = prometheus.NewDesc(
-		"node_host_agent_kernel_keys_used_ratio",
-		"Highest per-UID keyring fill ratio from /proc/key-users (instantiated/max; >0.80 latches state-kernel-keys-pressure).",
-		[]string{"node"}, nil)
-	c.descSockTCPCW = prometheus.NewDesc(
-		"node_host_agent_sockstat_tcp_close_wait",
-		"sockstat TCP close_wait — sockets stuck half-closed waiting for local close().",
-		[]string{"node"}, nil)
-
-	// W9 — OpenEBS LocalPV per-volume dir bytes (bounded du walk,
-	// 15m cache).
-	c.descLocalPVDirBytes = prometheus.NewDesc(
-		"node_host_agent_localpv_dir_bytes",
-		"Bytes under the OpenEBS LocalPV pvc-* volume dir (bounded walk; emitted per pvc-* dir present).",
-		[]string{"node", "pvc_volume"}, nil)
-
-	c.descMeta = map[*prometheus.Desc]descMeta{}
-	for _, d := range []struct {
-		desc *prometheus.Desc
-		name string
-		help string
-	}{
-		{c.descWatchdog, "node_host_agent_watchdog_state",
-			"node-watchdog state-* latch present (1) or previously seen and cleared (0)."},
-		{c.descWatchdogLegacy, "node_watchdog_state",
-			"Signal currently active on node-watchdog (1 = state file exists)."},
-		{c.descNebUp, "node_host_agent_nebula_interface_up",
-			"Nebula interface operstate is up (emitted only when the interface exists)."},
-		{c.descNebRoute, "node_host_agent_nebula_route_present",
-			"A host route via the Nebula interface exists (emitted only when the interface exists)."},
-		{c.descNebCertDays, "node_host_agent_nebula_cert_days_left",
-			"Days until the nebula host certificate notAfter (emitted only when the cert parses)."},
-		{c.descK0sDrift, "node_k0s_config_drift",
-			"/etc/k0s/k0s.yaml drifted vs expected config (1=drift)."},
-		{c.descPSI, "node_watchdog_psi_cpu_some_avg60",
-			"PSI cpu some avg60 — share of time runnable tasks stalled (runner's overload signal)."},
-		{c.descCPURatio, "node_cpu_delivered_ratio",
-			"Share of 1 vCPU actually delivered by the hypervisor — busy-loop probe (~0.3 cpu-s, 1.0 = no steal)."},
-		{c.descCPUWall, "node_cpu_delivered_probe_wall_seconds",
-			"Wall-clock the cpu-delivered probe ran — abnormal growth = the probe itself stalled."},
-		{c.descF2B, "node_fail2ban_banned_ips",
-			"Currently banned IPs per fail2ban jail (emitted only when the banned file exists)."},
-		{c.descEgressRelay, "node_overlay_egress_relay_active",
-			"Egress target currently routed via the overlay relay (1) or direct underlay (0)."},
-		{c.descEgressRelayLegacy, "node_watchdog_egress_relay",
-			"Egress target currently routed via overlay relay (1) or direct (0)."},
-		{c.descClockUnsync, "node_host_agent_clock_unsynchronized",
-			"Kernel clock reports STA_UNSYNC via adjtimex (1 = not synchronized)."},
-		{c.descClockEstErr, "node_host_agent_clock_estimated_error_seconds",
-			"adjtimex Timex.Esterror exported as seconds."},
-		{c.descCtEntries, "node_host_agent_conntrack_entries",
-			"nf_conntrack_count — conntrack table entries currently tracked."},
-		{c.descCtLimit, "node_host_agent_conntrack_limit",
-			"nf_conntrack_max — conntrack table capacity."},
-		{c.descCtRatio, "node_host_agent_conntrack_used_ratio",
-			"Conntrack table fill ratio (entries/limit)."},
-		{c.descFSInodesTotal, "node_host_agent_filesystem_inodes_total",
-			"Total inodes on the probed mount (statfs Files)."},
-		{c.descFSInodesFree, "node_host_agent_filesystem_inodes_free",
-			"Free inodes on the probed mount (statfs Ffree)."},
-		{c.descFSInodesRatio, "node_host_agent_filesystem_inodes_used_ratio",
-			"Used-inode share of the probed mount."},
-		{c.descFSProbeStalled, "node_host_agent_filesystem_probe_stalled",
-			"statfs probe of this mount exceeded the deadline (1 = hung mount)."},
-		{c.descFileFDAlloc, "node_host_agent_filefd_allocated",
-			"file-nr field 0 — file handles currently allocated."},
-		{c.descFileFDMax, "node_host_agent_filefd_maximum",
-			"file-nr field 2 — file handle limit."},
-		{c.descFileFDRatio, "node_host_agent_filefd_used_ratio",
-			"file-nr allocated/maximum."},
-		{c.descSockTCPInuse, "node_host_agent_sockstat_tcp_inuse",
-			"sockstat TCP inuse — TCP sockets in use."},
-		{c.descSockTCPOrphan, "node_host_agent_sockstat_tcp_orphan",
-			"sockstat TCP orphan — orphaned TCP connections."},
-		{c.descSockTCPTW, "node_host_agent_sockstat_tcp_tw",
-			"sockstat TCP tw — TCP sockets in TIME_WAIT."},
-		{c.descSockUsed, "node_host_agent_sockstat_sockets_used",
-			"sockstat 'sockets: used' — total sockets in use."},
-		{c.descPKIDays, "node_host_agent_pki_cert_days_left",
-			"Days until the earliest notAfter of the on-disk PKI cert at this path."},
-		{c.descInotifyInst, "node_host_agent_inotify_instances_used_ratio",
-			"inotify fds in use / max_user_instances."},
-		{c.descInotifyWatches, "node_host_agent_inotify_watches_used_ratio",
-			"inotify watches in use / max_user_watches."},
-		{c.descZombies, "node_host_agent_processes_zombie_count",
-			"Processes in state Z under the host proc root."},
-		{c.descCgroupPids, "node_host_agent_cgroup_pids_used_ratio",
-			"pids.current / pids.max of the slice."},
-		{c.descMTUDrift, "node_host_agent_mtu_drift",
-			"cilium datapath MTU exceeds the nebula overlay MTU (1 = drift)."},
-		{c.descFSReadonly, "node_host_agent_filesystem_readonly",
-			"Probed mount reports ST_RDONLY via statfs (1 = filesystem remounted read-only)."},
-		{c.descPSIMemSome, "node_host_agent_psi_memory_some_avg60",
-			"PSI memory some avg60 — share of time any task stalled on memory reclaim."},
-		{c.descPSIMemFull, "node_host_agent_psi_memory_full_avg60",
-			"PSI memory full avg60 — share of time all tasks stalled on memory reclaim."},
-		{c.descPSIIOSome, "node_host_agent_psi_io_some_avg60",
-			"PSI io some avg60 — share of time any task stalled on block IO."},
-		{c.descPSIIOFull, "node_host_agent_psi_io_full_avg60",
-			"PSI io full avg60 — share of time all tasks stalled on block IO."},
-		{c.descPSWPIn, "node_host_agent_vmstat_pswpin_total",
-			"/proc/vmstat pswpin — cumulative pages swapped in."},
-		{c.descPSWPOut, "node_host_agent_vmstat_pswpout_total",
-			"/proc/vmstat pswpout — cumulative pages swapped out."},
-		{c.descDState, "node_host_agent_dstate_processes",
-			"Processes in state D (uninterruptible sleep) under the host proc root."},
-		{c.descSystemdScopes, "node_host_agent_systemd_scopes_count",
-			"cri-containerd-*.scope dirs under the kubepods cgroup slice."},
-		{c.descCtInsertFail, "node_host_agent_conntrack_insert_failed_total",
-			"insert_failed column sum over all CPU rows of nf_conntrack stats."},
-		{c.descCtDrops, "node_host_agent_conntrack_drops_total",
-			"drop column sum over all CPU rows of nf_conntrack stats."},
-		{c.descARPEntries, "node_host_agent_arp_entries",
-			"Entries in the ARP neighbour table."},
-		{c.descCgMemHigh, "node_host_agent_cgroup_memory_high_events_total",
-			"memory.events high of the unit — direct-reclaim throttling."},
-		{c.descCgMemOOMKill, "node_host_agent_cgroup_memory_oom_kill_events_total",
-			"memory.events oom_kill of the unit."},
-		{c.descKernelKeys, "node_host_agent_kernel_keys_used_ratio",
-			"Highest per-UID keyring fill ratio from /proc/key-users."},
-		{c.descSockTCPCW, "node_host_agent_sockstat_tcp_close_wait",
-			"sockstat TCP close_wait."},
-		{c.descLocalPVDirBytes, "node_host_agent_localpv_dir_bytes",
-			"Bytes under the OpenEBS LocalPV pvc-* volume dir."},
-	} {
-		c.descMeta[d.desc] = descMeta{name: d.name, help: d.help}
-	}
 	return c
 }
 
@@ -657,59 +242,188 @@ type descMeta struct {
 	help string
 }
 
+// descTable is the ordered descriptor registry — one row per
+// exported series family, in Describe() order. The descs themselves
+// are package vars next to the collect_*.go file that emits them;
+// the name/help here are the textfile writer's short form (the full
+// help sentence lives on the desc's NewDesc call). Adding a family
+// means one row here AND one row in the collectors() table.
+var descTable = []struct {
+	desc *prometheus.Desc
+	name string
+	help string
+}{
+	{descWatchdog, "node_host_agent_watchdog_state",
+		"node-watchdog state-* latch present (1) or previously seen and cleared (0)."},
+	{descWatchdogLegacy, "node_watchdog_state",
+		"Signal currently active on node-watchdog (1 = state file exists)."},
+	{descNebUp, "node_host_agent_nebula_interface_up",
+		"Nebula interface operstate is up (emitted only when the interface exists)."},
+	{descNebRoute, "node_host_agent_nebula_route_present",
+		"A host route via the Nebula interface exists (emitted only when the interface exists)."},
+	{descNebCertDays, "node_host_agent_nebula_cert_days_left",
+		"Days until the nebula host certificate notAfter (emitted only when the cert parses)."},
+	{descK0sDrift, "node_k0s_config_drift",
+		"/etc/k0s/k0s.yaml drifted vs expected config (1=drift)."},
+	{descPSI, "node_watchdog_psi_cpu_some_avg60",
+		"PSI cpu some avg60 — share of time runnable tasks stalled (runner's overload signal)."},
+	{descCPURatio, "node_cpu_delivered_ratio",
+		"Share of 1 vCPU actually delivered by the hypervisor — busy-loop probe (~0.3 cpu-s, 1.0 = no steal)."},
+	{descCPUWall, "node_cpu_delivered_probe_wall_seconds",
+		"Wall-clock the cpu-delivered probe ran — abnormal growth = the probe itself stalled."},
+	{descF2B, "node_fail2ban_banned_ips",
+		"Currently banned IPs per fail2ban jail (emitted only when the banned file exists)."},
+	{descEgressRelay, "node_overlay_egress_relay_active",
+		"Egress target currently routed via the overlay relay (1) or direct underlay (0)."},
+	{descEgressRelayLegacy, "node_watchdog_egress_relay",
+		"Egress target currently routed via overlay relay (1) or direct (0)."},
+	{descClockUnsync, "node_host_agent_clock_unsynchronized",
+		"Kernel clock reports STA_UNSYNC via adjtimex (1 = not synchronized)."},
+	{descClockEstErr, "node_host_agent_clock_estimated_error_seconds",
+		"adjtimex Timex.Esterror exported as seconds."},
+	{descCtEntries, "node_host_agent_conntrack_entries",
+		"nf_conntrack_count — conntrack table entries currently tracked."},
+	{descCtLimit, "node_host_agent_conntrack_limit",
+		"nf_conntrack_max — conntrack table capacity."},
+	{descCtRatio, "node_host_agent_conntrack_used_ratio",
+		"Conntrack table fill ratio (entries/limit)."},
+	{descFSInodesTotal, "node_host_agent_filesystem_inodes_total",
+		"Total inodes on the probed mount (statfs Files)."},
+	{descFSInodesFree, "node_host_agent_filesystem_inodes_free",
+		"Free inodes on the probed mount (statfs Ffree)."},
+	{descFSInodesRatio, "node_host_agent_filesystem_inodes_used_ratio",
+		"Used-inode share of the probed mount."},
+	{descFSProbeStalled, "node_host_agent_filesystem_probe_stalled",
+		"statfs probe of this mount exceeded the deadline (1 = hung mount)."},
+	{descFileFDAlloc, "node_host_agent_filefd_allocated",
+		"file-nr field 0 — file handles currently allocated."},
+	{descFileFDMax, "node_host_agent_filefd_maximum",
+		"file-nr field 2 — file handle limit."},
+	{descFileFDRatio, "node_host_agent_filefd_used_ratio",
+		"file-nr allocated/maximum."},
+	{descSockTCPInuse, "node_host_agent_sockstat_tcp_inuse",
+		"sockstat TCP inuse — TCP sockets in use."},
+	{descSockTCPOrphan, "node_host_agent_sockstat_tcp_orphan",
+		"sockstat TCP orphan — orphaned TCP connections."},
+	{descSockTCPTW, "node_host_agent_sockstat_tcp_tw",
+		"sockstat TCP tw — TCP sockets in TIME_WAIT."},
+	{descSockUsed, "node_host_agent_sockstat_sockets_used",
+		"sockstat 'sockets: used' — total sockets in use."},
+	{descPKIDays, "node_host_agent_pki_cert_days_left",
+		"Days until the earliest notAfter of the on-disk PKI cert at this path."},
+	{descInotifyInst, "node_host_agent_inotify_instances_used_ratio",
+		"inotify fds in use / max_user_instances."},
+	{descInotifyWatches, "node_host_agent_inotify_watches_used_ratio",
+		"inotify watches in use / max_user_watches."},
+	{descZombies, "node_host_agent_processes_zombie_count",
+		"Processes in state Z under the host proc root."},
+	{descCgroupPids, "node_host_agent_cgroup_pids_used_ratio",
+		"pids.current / pids.max of the slice."},
+	{descMTUDrift, "node_host_agent_mtu_drift",
+		"cilium datapath MTU exceeds the nebula overlay MTU (1 = drift)."},
+	{descFSReadonly, "node_host_agent_filesystem_readonly",
+		"Probed mount reports ST_RDONLY via statfs (1 = filesystem remounted read-only)."},
+	{descPSIMemSome, "node_host_agent_psi_memory_some_avg60",
+		"PSI memory some avg60 — share of time any task stalled on memory reclaim."},
+	{descPSIMemFull, "node_host_agent_psi_memory_full_avg60",
+		"PSI memory full avg60 — share of time all tasks stalled on memory reclaim."},
+	{descPSIIOSome, "node_host_agent_psi_io_some_avg60",
+		"PSI io some avg60 — share of time any task stalled on block IO."},
+	{descPSIIOFull, "node_host_agent_psi_io_full_avg60",
+		"PSI io full avg60 — share of time all tasks stalled on block IO."},
+	{descPSWPIn, "node_host_agent_vmstat_pswpin_total",
+		"/proc/vmstat pswpin — cumulative pages swapped in."},
+	{descPSWPOut, "node_host_agent_vmstat_pswpout_total",
+		"/proc/vmstat pswpout — cumulative pages swapped out."},
+	{descDState, "node_host_agent_dstate_processes",
+		"Processes in state D (uninterruptible sleep) under the host proc root."},
+	{descSystemdScopes, "node_host_agent_systemd_scopes_count",
+		"cri-containerd-*.scope dirs under the kubepods cgroup slice."},
+	{descCtInsertFail, "node_host_agent_conntrack_insert_failed_total",
+		"insert_failed column sum over all CPU rows of nf_conntrack stats."},
+	{descCtDrops, "node_host_agent_conntrack_drops_total",
+		"drop column sum over all CPU rows of nf_conntrack stats."},
+	{descARPEntries, "node_host_agent_arp_entries",
+		"Entries in the ARP neighbour table."},
+	{descCgMemHigh, "node_host_agent_cgroup_memory_high_events_total",
+		"memory.events high of the unit — direct-reclaim throttling."},
+	{descCgMemOOMKill, "node_host_agent_cgroup_memory_oom_kill_events_total",
+		"memory.events oom_kill of the unit."},
+	{descKernelKeys, "node_host_agent_kernel_keys_used_ratio",
+		"Highest per-UID keyring fill ratio from /proc/key-users."},
+	{descSockTCPCW, "node_host_agent_sockstat_tcp_close_wait",
+		"sockstat TCP close_wait."},
+	{descLocalPVDirBytes, "node_host_agent_localpv_dir_bytes",
+		"Bytes under the OpenEBS LocalPV pvc-* volume dir."},
+}
+
+// descMetaTable maps each desc to its textfile fqName/help — a
+// prometheus.Metric carries the Desc but the fqName is only
+// reachable through Desc.String(), so the writer keeps its own
+// table keyed off the same descTable Describe() serves.
+var descMetaTable = func() map[*prometheus.Desc]descMeta {
+	m := make(map[*prometheus.Desc]descMeta, len(descTable))
+	for _, e := range descTable {
+		m[e.desc] = descMeta{name: e.name, help: e.help}
+	}
+	return m
+}()
+
 // Describe implements prometheus.Collector.
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- c.descWatchdog
-	ch <- c.descWatchdogLegacy
-	ch <- c.descNebUp
-	ch <- c.descNebRoute
-	ch <- c.descNebCertDays
-	ch <- c.descK0sDrift
-	ch <- c.descPSI
-	ch <- c.descCPURatio
-	ch <- c.descCPUWall
-	ch <- c.descF2B
-	ch <- c.descEgressRelay
-	ch <- c.descEgressRelayLegacy
-	ch <- c.descClockUnsync
-	ch <- c.descClockEstErr
-	ch <- c.descCtEntries
-	ch <- c.descCtLimit
-	ch <- c.descCtRatio
-	ch <- c.descFSInodesTotal
-	ch <- c.descFSInodesFree
-	ch <- c.descFSInodesRatio
-	ch <- c.descFSProbeStalled
-	ch <- c.descFileFDAlloc
-	ch <- c.descFileFDMax
-	ch <- c.descFileFDRatio
-	ch <- c.descSockTCPInuse
-	ch <- c.descSockTCPOrphan
-	ch <- c.descSockTCPTW
-	ch <- c.descSockUsed
-	ch <- c.descPKIDays
-	ch <- c.descInotifyInst
-	ch <- c.descInotifyWatches
-	ch <- c.descZombies
-	ch <- c.descCgroupPids
-	ch <- c.descMTUDrift
-	ch <- c.descFSReadonly
-	ch <- c.descPSIMemSome
-	ch <- c.descPSIMemFull
-	ch <- c.descPSIIOSome
-	ch <- c.descPSIIOFull
-	ch <- c.descPSWPIn
-	ch <- c.descPSWPOut
-	ch <- c.descDState
-	ch <- c.descSystemdScopes
-	ch <- c.descCtInsertFail
-	ch <- c.descCtDrops
-	ch <- c.descARPEntries
-	ch <- c.descCgMemHigh
-	ch <- c.descCgMemOOMKill
-	ch <- c.descKernelKeys
-	ch <- c.descSockTCPCW
-	ch <- c.descLocalPVDirBytes
+	for _, e := range descTable {
+		ch <- e.desc
+	}
+}
+
+// collectEntry is one row of the scrape-time dispatch table — the
+// domain name plus the emit function. Rows run in declaration order
+// inside collectors().
+type collectEntry struct {
+	name string
+	emit func(chan<- prometheus.Metric)
+}
+
+// collectors returns the scrape-time dispatch table — one row per
+// metric domain, in emission order. Adding a domain means a
+// collect_<domain>.go file (with its desc vars), one row here and
+// one row in descTable. Domains that share a per-scrape probe
+// result (the PSI avg60, the parsed nebula cert days) close over
+// the values Collect computed once.
+func (c *Collector) collectors(avg60 float64, psiOK bool,
+	certDays int64, certOK bool) []collectEntry {
+	return []collectEntry{
+		{"watchdog", func(ch chan<- prometheus.Metric) {
+			c.collectWatchdog(ch, certDays, certOK)
+		}},
+		{"nebula", c.collectNebula},
+		{"nebula-cert", func(ch chan<- prometheus.Metric) {
+			c.collectNebulaCert(ch, certDays, certOK)
+		}},
+		{"k0s-drift", c.collectK0sDrift},
+		{"psi", func(ch chan<- prometheus.Metric) {
+			c.collectPSI(ch, avg60, psiOK)
+		}},
+		{"cpu-delivered", c.collectCPUDelivered},
+		{"fail2ban", c.collectFail2ban},
+		{"egress-relay", c.collectEgressRelay},
+		{"clock", c.collectClock},
+		{"conntrack", c.collectConntrack},
+		{"filesystem", c.collectFilesystem},
+		{"filefd", c.collectFileFD},
+		{"sockstat", c.collectSockstat},
+		{"pki-certs", c.collectPKICerts},
+		{"inotify", c.collectInotify},
+		{"zombies", c.collectZombies},
+		{"cgroup-pids", c.collectCgroupPids},
+		{"mtu-drift", c.collectMTUDrift},
+		{"memory-io", c.collectMemoryIO},
+		{"systemd-scopes", c.collectSystemdScopes},
+		{"arp", c.collectARP},
+		{"cgroup-mem-events", c.collectCgroupMemEvents},
+		{"kernel-keys", c.collectKernelKeys},
+		{"localpv", c.collectLocalPVUsage},
+	}
 }
 
 // Collect implements prometheus.Collector.
@@ -725,30 +439,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	// watchdog-state latch bookkeeping and the days-left gauge.
 	certDays, certOK := c.nebulaCertDaysLeft()
 	c.updateCertLatch(certDays, certOK)
-	c.collectWatchdog(ch, certDays, certOK)
-	c.collectNebula(ch)
-	c.collectNebulaCert(ch, certDays, certOK)
-	c.collectK0sDrift(ch)
-	c.collectPSI(ch, avg60, psiOK)
-	c.collectCPUDelivered(ch)
-	c.collectFail2ban(ch)
-	c.collectEgressRelay(ch)
-	c.collectClock(ch)
-	c.collectConntrack(ch)
-	c.collectFilesystem(ch)
-	c.collectFileFD(ch)
-	c.collectSockstat(ch)
-	c.collectPKICerts(ch)
-	c.collectInotify(ch)
-	c.collectZombies(ch)
-	c.collectCgroupPids(ch)
-	c.collectMTUDrift(ch)
-	c.collectMemoryIO(ch)
-	c.collectSystemdScopes(ch)
-	c.collectARP(ch)
-	c.collectCgroupMemEvents(ch)
-	c.collectKernelKeys(ch)
-	c.collectLocalPVUsage(ch)
+	for _, e := range c.collectors(avg60, psiOK, certDays, certOK) {
+		e.emit(ch)
+	}
 }
 
 // --- node-exporter textfile rendering (standalone prom_emit port) ---
@@ -786,7 +479,7 @@ func (c *Collector) WriteTextfile(dir string) error {
 	counterSeries := map[string]bool{}
 	var names []string
 	for _, m := range c.collectAll() {
-		meta, ok := c.descMeta[m.Desc()]
+		meta, ok := descMetaTable[m.Desc()]
 		if !ok {
 			continue
 		}

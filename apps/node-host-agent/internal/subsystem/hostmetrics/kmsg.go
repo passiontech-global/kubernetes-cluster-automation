@@ -3,7 +3,7 @@
 // table-full drops, host-level OOM kills) → stateDir evidence
 // markers. workerhygiene consumes the OOM markers for the
 // SystemOOMVictim node event; this file owns the latches + counters.
-// The Wave-10 contract overview lives in wave10.go.
+// The Wave-10 contract overview lives in kernel_failure_latches.go.
 package hostmetrics
 
 import (

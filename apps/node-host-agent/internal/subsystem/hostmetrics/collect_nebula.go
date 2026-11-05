@@ -28,6 +28,21 @@ const (
 // many days to notAfter latches the nebula-cert-expiring signal.
 const nebulaCertWarnDays = 30
 
+var (
+	descNebUp = prometheus.NewDesc(
+		"node_host_agent_nebula_interface_up",
+		"Nebula interface operstate is up (emitted only when the interface exists).",
+		nil, nil)
+	descNebRoute = prometheus.NewDesc(
+		"node_host_agent_nebula_route_present",
+		"A host route via the Nebula interface exists (emitted only when the interface exists).",
+		nil, nil)
+	descNebCertDays = prometheus.NewDesc(
+		"node_host_agent_nebula_cert_days_left",
+		"Days until the nebula host certificate notAfter (emitted only when the cert parses).",
+		nil, nil)
+)
+
 // collectNebula emits interface + route state, only when the nebula
 // interface exists on the node.
 func (c *Collector) collectNebula(ch chan<- prometheus.Metric) {
@@ -43,7 +58,7 @@ func (c *Collector) collectNebula(ch chan<- prometheus.Metric) {
 	case "up", "unknown":
 		up = 1
 	}
-	ch <- prometheus.MustNewConstMetric(c.descNebUp,
+	ch <- prometheus.MustNewConstMetric(descNebUp,
 		prometheus.GaugeValue, up)
 
 	present := 0.0
@@ -59,7 +74,7 @@ func (c *Collector) collectNebula(ch chan<- prometheus.Metric) {
 			}
 		}
 	}
-	ch <- prometheus.MustNewConstMetric(c.descNebRoute,
+	ch <- prometheus.MustNewConstMetric(descNebRoute,
 		prometheus.GaugeValue, present)
 }
 
@@ -121,7 +136,7 @@ func (c *Collector) collectNebulaCert(ch chan<- prometheus.Metric, daysLeft int6
 	if !ok {
 		return
 	}
-	ch <- prometheus.MustNewConstMetric(c.descNebCertDays,
+	ch <- prometheus.MustNewConstMetric(descNebCertDays,
 		prometheus.GaugeValue, float64(daysLeft))
 }
 

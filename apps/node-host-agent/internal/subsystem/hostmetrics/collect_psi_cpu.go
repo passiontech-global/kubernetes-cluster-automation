@@ -103,16 +103,34 @@ func (c *Collector) updateOverloadLatch(avg60 float64) {
 	}
 }
 
+// descPSI is the node-overloaded signal's metric half — the same
+// avg60 the latch hysteresis above acts on.
+var descPSI = prometheus.NewDesc(
+	"node_watchdog_psi_cpu_some_avg60",
+	"PSI cpu some avg60 — share of time runnable tasks stalled (runner's overload signal).",
+	nil, nil)
+
 // collectPSI emits the avg60 gauge only when PSI parsed.
 func (c *Collector) collectPSI(ch chan<- prometheus.Metric, avg60 float64, ok bool) {
 	if !ok {
 		return
 	}
-	ch <- prometheus.MustNewConstMetric(c.descPSI,
+	ch <- prometheus.MustNewConstMetric(descPSI,
 		prometheus.GaugeValue, avg60)
 }
 
 // --- cpu-delivered probe (lib.sh measure_cpu_delivered) ---
+
+var (
+	descCPURatio = prometheus.NewDesc(
+		"node_cpu_delivered_ratio",
+		"Share of 1 vCPU actually delivered by the hypervisor — busy-loop probe (~0.3 cpu-s, 1.0 = no steal).",
+		nil, nil)
+	descCPUWall = prometheus.NewDesc(
+		"node_cpu_delivered_probe_wall_seconds",
+		"Wall-clock the cpu-delivered probe ran — abnormal growth = the probe itself stalled.",
+		nil, nil)
+)
 
 // maybeMeasureCPU re-arms the busy-loop probe every
 // CPUDeliveredInterval. The probe itself runs in a goroutine so a
@@ -203,13 +221,43 @@ func (c *Collector) collectCPUDelivered(ch chan<- prometheus.Metric) {
 	if !ok {
 		return
 	}
-	ch <- prometheus.MustNewConstMetric(c.descCPURatio,
+	ch <- prometheus.MustNewConstMetric(descCPURatio,
 		prometheus.GaugeValue, ratio)
-	ch <- prometheus.MustNewConstMetric(c.descCPUWall,
+	ch <- prometheus.MustNewConstMetric(descCPUWall,
 		prometheus.GaugeValue, wall)
 }
 
 // --- W5.7: PSI memory/IO pressure + vmstat swap-thrash counters ---
+
+// The memory/io PSI descs carry the node label so a federated store
+// can attribute them back to the agent host — same convention as the
+// other gray-failure telemetry.
+var (
+	descPSIMemSome = prometheus.NewDesc(
+		"node_host_agent_psi_memory_some_avg60",
+		"PSI memory some avg60 — share of time any task stalled on memory reclaim.",
+		[]string{"node"}, nil)
+	descPSIMemFull = prometheus.NewDesc(
+		"node_host_agent_psi_memory_full_avg60",
+		"PSI memory full avg60 — share of time ALL non-idle tasks stalled on memory reclaim (thrashing).",
+		[]string{"node"}, nil)
+	descPSIIOSome = prometheus.NewDesc(
+		"node_host_agent_psi_io_some_avg60",
+		"PSI io some avg60 — share of time any task stalled on block IO.",
+		[]string{"node"}, nil)
+	descPSIIOFull = prometheus.NewDesc(
+		"node_host_agent_psi_io_full_avg60",
+		"PSI io full avg60 — share of time ALL non-idle tasks stalled on block IO (disk saturation).",
+		[]string{"node"}, nil)
+	descPSWPIn = prometheus.NewDesc(
+		"node_host_agent_vmstat_pswpin_total",
+		"/proc/vmstat pswpin — cumulative pages swapped in (swap thrash evidence).",
+		[]string{"node"}, nil)
+	descPSWPOut = prometheus.NewDesc(
+		"node_host_agent_vmstat_pswpout_total",
+		"/proc/vmstat pswpout — cumulative pages swapped out (swap thrash evidence).",
+		[]string{"node"}, nil)
+)
 
 // psiAvg60Full parses BOTH avg60 values of a PSI file — the "some"
 // line (any-task stalled) and the "full" line (all-tasks stalled).
@@ -277,21 +325,21 @@ func vmstatCounters(path string, keys ...string) map[string]uint64 {
 func (c *Collector) collectMemoryIO(ch chan<- prometheus.Metric) {
 	if some, full, someOK, fullOK := psiAvg60Full(c.cfg.PSIMemoryFile); someOK || fullOK {
 		if someOK {
-			ch <- prometheus.MustNewConstMetric(c.descPSIMemSome,
+			ch <- prometheus.MustNewConstMetric(descPSIMemSome,
 				prometheus.GaugeValue, some, c.cfg.NodeName)
 		}
 		if fullOK {
-			ch <- prometheus.MustNewConstMetric(c.descPSIMemFull,
+			ch <- prometheus.MustNewConstMetric(descPSIMemFull,
 				prometheus.GaugeValue, full, c.cfg.NodeName)
 		}
 	}
 	if some, full, someOK, fullOK := psiAvg60Full(c.cfg.PSIIOFile); someOK || fullOK {
 		if someOK {
-			ch <- prometheus.MustNewConstMetric(c.descPSIIOSome,
+			ch <- prometheus.MustNewConstMetric(descPSIIOSome,
 				prometheus.GaugeValue, some, c.cfg.NodeName)
 		}
 		if fullOK {
-			ch <- prometheus.MustNewConstMetric(c.descPSIIOFull,
+			ch <- prometheus.MustNewConstMetric(descPSIIOFull,
 				prometheus.GaugeValue, full, c.cfg.NodeName)
 		}
 	}
@@ -300,8 +348,8 @@ func (c *Collector) collectMemoryIO(ch chan<- prometheus.Metric) {
 		key  string
 		desc *prometheus.Desc
 	}{
-		{"pswpin", c.descPSWPIn},
-		{"pswpout", c.descPSWPOut},
+		{"pswpin", descPSWPIn},
+		{"pswpout", descPSWPOut},
 	} {
 		if v, ok := vm[k.key]; ok {
 			ch <- prometheus.MustNewConstMetric(k.desc,
