@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-	corev1 "k8s.io/api/core/v1"
 )
 
 // shimFlagValue extracts `-name value` / `-name=value` (double-dash
@@ -123,7 +122,7 @@ func (h *Hygiene) ctrShimScope(argv []string) (ns, sid string, inScope bool) {
 	return ns, m[1], true
 }
 
-// checkCtrTasks cleans wedged containerd task dirs and orphan shims —
+// ctrTasksCheck cleans wedged containerd task dirs and orphan shims —
 // the filesystem port of the shell's ctr-based checks (no ctr socket
 // needed in the agent pod):
 //
@@ -138,18 +137,23 @@ func (h *Hygiene) ctrShimScope(argv []string) (ns, sid string, inScope bool) {
 //     "dead >=5m": dir age can't distinguish a just-exited init from
 //     a real wedge). Confirmed → SIGKILL live init + any process
 //     holding the id, then remove the dir (cap MaxCtrTaskClean/cycle).
-func (h *Hygiene) checkCtrTasks(ctx context.Context,
-	pidsOnce func() []int, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkCtrTasks, "gated").Inc()
+type ctrTasksCheck struct{ h *Hygiene }
+
+// Name returns the check label / WD_SIG key.
+func (c *ctrTasksCheck) Name() string { return checkCtrTasks }
+
+// Run executes one ctr-tasks round.
+func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkCtrTasks, "gated").Inc()
 		return
 	}
-	entries, err := os.ReadDir(h.cfg.CtrTaskRoot)
+	entries, err := os.ReadDir(c.h.cfg.CtrTaskRoot)
 	if err != nil {
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: ctr task root %s unreadable: %v — ctr-tasks check skipped",
-			h.cfg.CtrTaskRoot, err))
-		h.cycles.WithLabelValues(checkCtrTasks, "abort").Inc()
+			c.h.cfg.CtrTaskRoot, err))
+		c.h.cycles.WithLabelValues(checkCtrTasks, "abort").Inc()
 		return
 	}
 	liveDirs := map[string]bool{}
@@ -159,7 +163,7 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context,
 		}
 	}
 	sbDirs := map[string]bool{}
-	if es, err := os.ReadDir(h.cfg.SandboxCtlRoot); err == nil {
+	if es, err := os.ReadDir(c.h.cfg.SandboxCtlRoot); err == nil {
 		for _, e := range es {
 			if e.IsDir() {
 				sbDirs[e.Name()] = true
@@ -175,17 +179,17 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context,
 	// SIGKILLed every sweep — cold-restarting every foreign container
 	// and saturating the node (NodeOverloaded incident 2026-11).
 	nShim := 0
-	pids := pidsOnce()
+	pids := e.pidsOnce()
 	for _, pid := range pids {
-		if nShim >= h.cfg.MaxShimKill {
+		if nShim >= c.h.cfg.MaxShimKill {
 			break
 		}
-		argv := h.proc.Cmdline(pid)
+		argv := c.h.proc.Cmdline(pid)
 		joined := strings.Join(argv, " ")
 		if !strings.Contains(joined, "containerd-shim-runc-v2") {
 			continue
 		}
-		ns, sid, inScope := h.ctrShimScope(argv)
+		ns, sid, inScope := c.h.ctrShimScope(argv)
 		if !inScope {
 			continue
 		}
@@ -197,28 +201,28 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context,
 			// Foreign namespace on OUR containerd (e.g. a `ctr -n`
 			// task): resolve the dir under the sibling namespace
 			// root — only a genuinely missing dir is an orphan.
-			if _, err := os.Stat(h.shimTaskDir(ns, sid)); err == nil ||
+			if _, err := os.Stat(c.h.shimTaskDir(ns, sid)); err == nil ||
 				sbDirs[sid] {
 				continue
 			}
 		}
-		if h.procAge(pid) < 5*time.Minute {
+		if c.h.procAge(pid) < 5*time.Minute {
 			continue
 		}
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"ACTION: kill orphan shim pid=%d id=%.12s ns=%s - task dir missing",
 			pid, sid, ns))
-		if err := h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
-			h.state.AppendLog(fmt.Sprintf(
+		if err := c.h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: kill orphan shim pid=%d failed: %v", pid, err))
 		}
 		nShim++
-		h.actions.WithLabelValues(checkCtrTasks, "shim_kill").Inc()
+		c.h.actions.WithLabelValues(checkCtrTasks, "shim_kill").Inc()
 	}
 	// Prune wedged-seen markers for dirs that disappeared between
 	// runs (teardown finished or a previous cleanup won the race).
 	if ms, err := filepath.Glob(
-		filepath.Join(h.cfg.WatchdogStateDir, "wedged-seen-*")); err == nil {
+		filepath.Join(c.h.cfg.WatchdogStateDir, "wedged-seen-*")); err == nil {
 		for _, m := range ms {
 			if !liveDirs[strings.TrimPrefix(filepath.Base(m), "wedged-seen-")] {
 				_ = os.Remove(m)
@@ -232,12 +236,12 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context,
 			continue
 		}
 		id := e.Name()
-		d := filepath.Join(h.cfg.CtrTaskRoot, id)
+		d := filepath.Join(c.h.cfg.CtrTaskRoot, id)
 		marker := "wedged-seen-" + id
 		dead := false
 		pidData, err := os.ReadFile(filepath.Join(d, "init.pid"))
 		ipid, _ := strconv.Atoi(strings.TrimSpace(string(pidData)))
-		if err != nil || ipid <= 0 || !h.pidLive(ipid) {
+		if err != nil || ipid <= 0 || !c.h.pidLive(ipid) {
 			// Unreadable init.pid = half-written dir (containerd
 			// restart mid-create) or an exited init — both are
 			// wedge-shaped, but a task STARTING writes init.pid a
@@ -256,15 +260,15 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context,
 		}
 		if !dead {
 			// Recovered between runs → cancel the pending confirm.
-			_ = os.Remove(filepath.Join(h.cfg.WatchdogStateDir, marker))
+			_ = os.Remove(filepath.Join(c.h.cfg.WatchdogStateDir, marker))
 			continue
 		}
-		if !h.stateFileExists(marker) {
-			h.state.RateSpend(marker)
-			h.state.AppendLog(fmt.Sprintf("ctr-task-dead candidate %.12s - confirm next run", id))
+		if !c.h.stateFileExists(marker) {
+			c.h.state.RateSpend(marker)
+			c.h.state.AppendLog(fmt.Sprintf("ctr-task-dead candidate %.12s - confirm next run", id))
 			continue
 		}
-		if !h.state.RateOK(marker, 5*time.Minute) {
+		if !c.h.state.RateOK(marker, 5*time.Minute) {
 			continue
 		}
 		wedged = append(wedged, d)
@@ -272,25 +276,25 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context,
 	nClean := 0
 	for _, d := range wedged {
 		id := filepath.Base(d)
-		if nClean >= h.cfg.MaxCtrTaskClean {
-			h.state.AppendLog(fmt.Sprintf("suspect: ctr-task-wedged still pending cap=%d",
-				h.cfg.MaxCtrTaskClean))
+		if nClean >= c.h.cfg.MaxCtrTaskClean {
+			c.h.state.AppendLog(fmt.Sprintf("suspect: ctr-task-wedged still pending cap=%d",
+				c.h.cfg.MaxCtrTaskClean))
 			break
 		}
 		// Marker removal only once the dir is actually being
 		// cleaned: a dir dropped by the cap must KEEP its
 		// confirmed marker — removing it first made over-cap
 		// dirs re-confirm for another 5m forever.
-		_ = os.Remove(filepath.Join(h.cfg.WatchdogStateDir, "wedged-seen-"+id))
+		_ = os.Remove(filepath.Join(c.h.cfg.WatchdogStateDir, "wedged-seen-"+id))
 		// Live init with missing log.json → SIGKILL it first so the
 		// shim can drain and exit (shell's kill -9 init).
 		if pidData, err := os.ReadFile(filepath.Join(d, "init.pid")); err == nil {
 			if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil &&
-				pid > 0 && h.pidLive(pid) {
-				h.state.AppendLog(fmt.Sprintf(
+				pid > 0 && c.h.pidLive(pid) {
+				c.h.state.AppendLog(fmt.Sprintf(
 					"ACTION: kill -9 init %d of %.12s - log.json missing", pid, id))
-				if err := h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
-					h.state.AppendLog(fmt.Sprintf(
+				if err := c.h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
+					c.h.state.AppendLog(fmt.Sprintf(
 						"suspect: kill init %d of %.12s failed: %v", pid, id, err))
 				}
 			}
@@ -298,21 +302,21 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context,
 		// pkill -9 -f "$id" parity: kill shim/runc leftovers holding
 		// the task id, then remove the dir — containerd GCs the task
 		// record once the shim is gone.
-		for _, pid := range h.pidsWithCmdline(id, pids) {
-			if err := h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
-				h.state.AppendLog(fmt.Sprintf(
+		for _, pid := range c.h.pidsWithCmdline(id, pids) {
+			if err := c.h.cfg.killFn(pid, syscall.SIGKILL); err != nil {
+				c.h.state.AppendLog(fmt.Sprintf(
 					"suspect: kill leftover pid=%d holding task %.12s failed: %v",
 					pid, id, err))
 			}
 		}
-		h.state.AppendLog(fmt.Sprintf("ACTION: rm wedged task dir %.12s - dead >=5m", id))
+		c.h.state.AppendLog(fmt.Sprintf("ACTION: rm wedged task dir %.12s - dead >=5m", id))
 		if err := os.RemoveAll(d); err != nil {
-			h.state.AppendLog(fmt.Sprintf("suspect: rm task dir %.12s failed: %v", id, err))
+			c.h.state.AppendLog(fmt.Sprintf("suspect: rm task dir %.12s failed: %v", id, err))
 		}
 		nClean++
-		h.actions.WithLabelValues(checkCtrTasks, "rm_dir").Inc()
+		c.h.actions.WithLabelValues(checkCtrTasks, "rm_dir").Inc()
 	}
-	h.cycles.WithLabelValues(checkCtrTasks, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkCtrTasks, "ok").Inc()
 }
 
 // corruptImageWaitingReason mirrors the shell reason list — pull
@@ -364,7 +368,7 @@ func normalizeCRIImageName(spec string) string {
 	return domain + "/" + rest + digest
 }
 
-// checkCtrImages scans this node's pods for containers stuck Waiting
+// ctrImagesCheck scans this node's pods for containers stuck Waiting
 // on a corrupted containerd layer/content-store error and removes the
 // broken image (`k0s ctr images rm --sync`) so kubelet's next pull
 // re-fetches the missing layer — the pod recovers without a reboot.
@@ -388,23 +392,28 @@ func normalizeCRIImageName(spec string) string {
 // Normalization is preferred over `ctr images ls` reconciliation —
 // one exec per ref keeps the seam shape; a normalized name that still
 // isn't in the store just makes ctr warn and exit 0 (accepted).
-func (h *Hygiene) checkCtrImages(ctx context.Context, pods []corev1.Pod,
-	apiOK, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkCtrImages, "gated").Inc()
+type ctrImagesCheck struct{ h *Hygiene }
+
+// Name returns the check label / WD_SIG key.
+func (c *ctrImagesCheck) Name() string { return checkCtrImages }
+
+// Run executes one ctr-image-healer round.
+func (c *ctrImagesCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkCtrImages, "gated").Inc()
 		return
 	}
-	if !apiOK {
+	if !e.apiOK {
 		// Inconclusive — same "keep state, never act" rule as the
 		// other pod-list checks.
-		h.cycles.WithLabelValues(checkCtrImages, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkCtrImages, "abort").Inc()
 		return
 	}
 	// Dedupe refs across pods and statuses — several containers
 	// pinned to one corrupted image need a single rm, not one each.
 	seen := map[string]bool{}
-	for i := range pods {
-		p := &pods[i]
+	for i := range e.pods {
+		p := &e.pods[i]
 		statuses := slices.Concat(p.Status.InitContainerStatuses,
 			p.Status.ContainerStatuses, p.Status.EphemeralContainerStatuses)
 		for _, cs := range statuses {
@@ -422,7 +431,7 @@ func (h *Hygiene) checkCtrImages(ctx context.Context, pods []corev1.Pod,
 		}
 	}
 	if len(seen) == 0 {
-		h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
+		c.h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
 		return
 	}
 	images := make([]string, 0, len(seen))
@@ -430,34 +439,45 @@ func (h *Hygiene) checkCtrImages(ctx context.Context, pods []corev1.Pod,
 		images = append(images, img)
 	}
 	sort.Strings(images) // deterministic order — same convention as dnsStale
-	if !h.state.RateTrySpend("last-ctr-image-rm", ctrImageRmInterval) {
-		h.state.AppendLog(fmt.Sprintf(
+	if !c.h.state.RateTrySpend("last-ctr-image-rm", ctrImageRmInterval) {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: ctr-image-healer corrupted image(s) %s - in rm cooldown (<15m), skip",
 			strings.Join(images, " ")))
-		h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
+		c.h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
 		return
 	}
 	// Budget spent atomically BEFORE acting (lib.sh rate_spend
 	// parity): a failed rm still consumed the budget.
 	for _, img := range images {
-		if err := h.cfg.ctrRmImage(ctx, img); err != nil {
-			h.state.AppendLog(fmt.Sprintf(
+		if err := c.h.cfg.ctrRmImage(ctx, img); err != nil {
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: ctr image rm %s failed: %v", img, err))
 			continue
 		}
 		// NPD contract: "removed corrupted image" feeds the
 		// CorruptedImageRemoved filelog pattern.
-		h.state.AppendLog(fmt.Sprintf("ACTION: removed corrupted image %s", img))
-		h.actions.WithLabelValues(checkCtrImages, "image_rm").Inc()
+		c.h.state.AppendLog(fmt.Sprintf("ACTION: removed corrupted image %s", img))
+		c.h.actions.WithLabelValues(checkCtrImages, "image_rm").Inc()
 	}
-	h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
 }
 
 // --- Check: cilium-bpf-ipam (38-cilium-bpf-ipam.sh) ---
 
-func (h *Hygiene) checkCtrIngestGC(ctx context.Context, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkIngestGC, "gated").Inc()
+// ingestGCCheck is the A3 stale-ingest reaper as a Check; it owns
+// the 6h rescan stamp (ex-Hygiene.lastIngestScan).
+type ingestGCCheck struct {
+	h        *Hygiene
+	lastScan time.Time
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *ingestGCCheck) Name() string { return checkIngestGC }
+
+// Run executes one ctr-ingest-gc round.
+func (c *ingestGCCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkIngestGC, "gated").Inc()
 		return
 	}
 	var st unix.Statfs_t
@@ -469,14 +489,14 @@ func (h *Hygiene) checkCtrIngestGC(ctx context.Context, workerActive bool) {
 	// free-side field is Bavail, not Bfree: kubelet/containerd run
 	// unprivileged against the root-reserved block margin, so
 	// unprivileged-free is the signal that trips ENOSPC first.
-	if err := h.cfg.statfsFn(h.cfg.K0sDataDir, &st); err == nil &&
+	if err := c.h.cfg.statfsFn(c.h.cfg.K0sDataDir, &st); err == nil &&
 		st.Blocks > 0 && st.Bavail <= st.Blocks {
 		used := float64(st.Blocks-st.Bavail) / float64(st.Blocks)
-		diskHigh = used > h.cfg.K0sDiskHighWatermark
+		diskHigh = used > c.h.cfg.K0sDiskHighWatermark
 	}
-	due := h.cfg.nowFn().Sub(h.lastIngestScan) >= h.cfg.CtrIngestScanInterval
+	due := c.h.cfg.nowFn().Sub(c.lastScan) >= c.h.cfg.CtrIngestScanInterval
 	if !diskHigh && !due {
-		h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
+		c.h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
 		return
 	}
 	// W9: above the high watermark the content store itself may be
@@ -484,36 +504,36 @@ func (h *Hygiene) checkCtrIngestGC(ctx context.Context, workerActive bool) {
 	// ADDITION to the stale-ingest sweep below. Below the
 	// watermark (periodic rescan only) it never fires.
 	if diskHigh {
-		h.maybePruneContentStore(ctx)
+		c.h.maybePruneContentStore(ctx)
 	}
-	entries, err := os.ReadDir(h.cfg.CtrIngestDir)
+	entries, err := os.ReadDir(c.h.cfg.CtrIngestDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Absent dir = nothing to scan — stamp like a clean
 			// walk so the 6h cadence still applies.
-			h.lastIngestScan = h.cfg.nowFn()
-			h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
+			c.lastScan = c.h.cfg.nowFn()
+			c.h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
 			return
 		}
-		// A transient read failure must NOT stamp lastIngestScan —
+		// A transient read failure must NOT stamp lastScan —
 		// stamping here would defer the retry by a full
 		// CtrIngestScanInterval (6h).
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: ctr ingest dir %s unreadable: %v — ingest GC skipped",
-			h.cfg.CtrIngestDir, err))
-		h.cycles.WithLabelValues(checkIngestGC, "abort").Inc()
+			c.h.cfg.CtrIngestDir, err))
+		c.h.cycles.WithLabelValues(checkIngestGC, "abort").Inc()
 		return
 	}
-	h.lastIngestScan = h.cfg.nowFn()
-	now := h.cfg.nowFn()
+	c.lastScan = c.h.cfg.nowFn()
+	now := c.h.cfg.nowFn()
 	n := 0
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		if n >= h.cfg.MaxCtrTaskClean {
-			h.state.AppendLog(fmt.Sprintf(
-				"suspect: ctr-ingest-gc still pending cap=%d", h.cfg.MaxCtrTaskClean))
+		if n >= c.h.cfg.MaxCtrTaskClean {
+			c.h.state.AppendLog(fmt.Sprintf(
+				"suspect: ctr-ingest-gc still pending cap=%d", c.h.cfg.MaxCtrTaskClean))
 			break
 		}
 		fi, err := e.Info()
@@ -521,30 +541,36 @@ func (h *Hygiene) checkCtrIngestGC(ctx context.Context, workerActive bool) {
 			continue
 		}
 		age := now.Sub(fi.ModTime())
-		if age < h.cfg.CtrIngestMaxAge {
+		if age < c.h.cfg.CtrIngestMaxAge {
 			continue
 		}
 		ref := e.Name()
-		d := filepath.Join(h.cfg.CtrIngestDir, ref)
-		if rerr := h.cfg.ctrRmIngest(ctx, ref); rerr != nil {
-			h.state.AppendLog(fmt.Sprintf(
+		d := filepath.Join(c.h.cfg.CtrIngestDir, ref)
+		if rerr := c.h.cfg.ctrRmIngest(ctx, ref); rerr != nil {
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: ctr content ingest rm %s failed: %v — removing dir directly", ref, rerr))
 		}
 		if _, serr := os.Stat(d); serr == nil {
 			if rerr := os.RemoveAll(d); rerr != nil {
-				h.state.AppendLog(fmt.Sprintf(
+				c.h.state.AppendLog(fmt.Sprintf(
 					"suspect: rm orphan ingest dir %s failed: %v", d, rerr))
 				continue
 			}
 		}
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"ACTION: ctr-ingest-gc removed stale ingest %s (age=%.1fh disk_high=%v)",
 			ref, age.Hours(), diskHigh))
 		n++
-		h.ctrIngestsCleaned.Inc()
-		h.actions.WithLabelValues(checkIngestGC, "ingest_rm").Inc()
+		c.h.ctrIngestsCleaned.Inc()
+		c.h.actions.WithLabelValues(checkIngestGC, "ingest_rm").Inc()
 	}
-	h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
+}
+
+// checkCtrIngestGC forwards to the migrated Check — tests written
+// before the interface still call the old method shape.
+func (h *Hygiene) checkCtrIngestGC(ctx context.Context, workerActive bool) {
+	h.ingestGC.Run(ctx, &cycleEnv{workerActive: workerActive})
 }
 
 // maybePruneContentStore runs `k0s ctr -n k8s.io content prune` —

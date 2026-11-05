@@ -58,12 +58,25 @@ func (h *Hygiene) noteJournalRead(ok bool, detail string) {
 // rotate+vacuum remedy only covers the CORRUPT subset, a dead or
 // mute journald needs surfacing, not vacuuming.
 
-func (h *Hygiene) checkJournaldIntegrity(ctx context.Context, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkJournald, "gated").Inc()
+// journaldCheck is the A5 probe as a Check. It owns the
+// corrupt/empty streak (ex-Hygiene.journaldFails); the
+// journal-unreadable tracker stays on Hygiene — Cycle's shared
+// journalOnce snapshot also feeds it through noteJournalRead.
+type journaldCheck struct {
+	h     *Hygiene
+	fails int // consecutive corrupt/empty cycles (ConsecNeeded → remedy)
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *journaldCheck) Name() string { return checkJournald }
+
+// Run executes one journald-integrity round.
+func (c *journaldCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkJournald, "gated").Inc()
 		return
 	}
-	out, err := h.cfg.journalFn(ctx)
+	out, err := c.h.cfg.journalFn(ctx)
 	// Only OUTPUT evidence counts as corruption: an exec-level error
 	// (nsenter/journalctl timeout, transient host exec failure) means
 	// journald never answered — that is journal-UNREADABLE, not
@@ -83,7 +96,7 @@ func (h *Hygiene) checkJournaldIntegrity(ctx context.Context, workerActive bool)
 		// Any line means journald is fine and the unit is just
 		// silent; an error, an empty reply, or a "corrupt" warning
 		// is journald-level anomaly — only then remediate.
-		unfiltered, uerr = h.cfg.journalAnyFn(ctx)
+		unfiltered, uerr = c.h.cfg.journalAnyFn(ctx)
 		if uerr == nil && strings.TrimSpace(unfiltered) != "" &&
 			!strings.Contains(strings.ToLower(unfiltered), "corrupt") {
 			empty = false
@@ -112,51 +125,51 @@ func (h *Hygiene) checkJournaldIntegrity(ctx context.Context, workerActive bool)
 			unreadable, udetail = true, "journald-wide empty reply"
 		}
 	}
-	h.noteJournalRead(!unreadable, udetail)
+	c.h.noteJournalRead(!unreadable, udetail)
 	switch {
 	case corrupt, empty:
-		h.journaldFails++
-		if h.journaldFails < h.cfg.ConsecNeeded {
-			h.state.AppendLog(fmt.Sprintf(
+		c.fails++
+		if c.fails < c.h.cfg.ConsecNeeded {
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: journald-integrity journal corrupt=%v empty=%v err=%v while k0sworker active (check %d/%d)",
-				corrupt, empty, err, h.journaldFails, h.cfg.ConsecNeeded))
-			h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+				corrupt, empty, err, c.fails, c.h.cfg.ConsecNeeded))
+			c.h.cycles.WithLabelValues(checkJournald, "ok").Inc()
 			return
 		}
 	case err != nil:
 		// Exec failure without corruption evidence — inconclusive
 		// (the unreadable tracker owns this signal): keep the fail
 		// streak intact but never grow it, and never vacuum.
-		h.cycles.WithLabelValues(checkJournald, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkJournald, "abort").Inc()
 		return
 	default:
-		h.journaldFails = 0
-		h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+		c.fails = 0
+		c.h.cycles.WithLabelValues(checkJournald, "ok").Inc()
 		return
 	}
-	if h.cfg.Systemd == nil {
-		h.cycles.WithLabelValues(checkJournald, "gated").Inc()
+	if c.h.cfg.Systemd == nil {
+		c.h.cycles.WithLabelValues(checkJournald, "gated").Inc()
 		return
 	}
-	if !h.state.RateTrySpend("last-journald-vacuum", journaldVacuumInterval) {
-		h.state.AppendLog("suspect: journald-integrity confirmed but vacuum " +
+	if !c.h.state.RateTrySpend("last-journald-vacuum", journaldVacuumInterval) {
+		c.h.state.AppendLog("suspect: journald-integrity confirmed but vacuum " +
 			"cooldown active — skip")
-		h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+		c.h.cycles.WithLabelValues(checkJournald, "ok").Inc()
 		return
 	}
-	h.state.AppendLog(fmt.Sprintf(
+	c.h.state.AppendLog(fmt.Sprintf(
 		"ACTION: journalctl --rotate --vacuum-time=3d - journal corrupt=%v empty=%v err=%v for active k0sworker",
 		corrupt, empty, err))
-	if jout, jerr := h.cfg.Systemd.Exec(ctx,
+	if jout, jerr := c.h.cfg.Systemd.Exec(ctx,
 		"journalctl", "--rotate", "--vacuum-time=3d"); jerr != nil {
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: journalctl --rotate --vacuum-time=3d failed: %v (%s)",
 			jerr, strings.TrimSpace(jout)))
 	} else {
-		h.actions.WithLabelValues(checkJournald, "rotate_vacuum").Inc()
+		c.h.actions.WithLabelValues(checkJournald, "rotate_vacuum").Inc()
 	}
-	h.journaldFails = 0
-	h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+	c.fails = 0
+	c.h.cycles.WithLabelValues(checkJournald, "ok").Inc()
 }
 
 // --- Check: cilium-envoy readiness + agent healthz (2.5 & B1) ---

@@ -312,61 +312,71 @@ func (h *Hygiene) highestRSSPod(pods []corev1.Pod, pids []int) (victim *corev1.P
 	return nil, 0
 }
 
-func (h *Hygiene) checkPSIThrash(ctx context.Context, pods []corev1.Pod,
-	apiOK bool, pidsOnce func() []int, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkPSIThrash, "gated").Inc()
+// psiThrashCheck is the W2 memory-thrash evictor as a Check; it
+// owns the thrash streak (ex-Hygiene.psiThrashFails).
+type psiThrashCheck struct {
+	h     *Hygiene
+	fails int
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *psiThrashCheck) Name() string { return checkPSIThrash }
+
+// Run executes one psi-memory-thrash round.
+func (c *psiThrashCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkPSIThrash, "gated").Inc()
 		return
 	}
-	avg60, psiOK := h.psiMemoryFullAvg60()
-	m := h.readMeminfo()
+	avg60, psiOK := c.h.psiMemoryFullAvg60()
+	m := c.h.readMeminfo()
 	if !m.parsed {
 		// meminfo unreadable — inconclusive, keep streak/latch
 		// exactly like a failed probe (a transient read error must
 		// not clear a live latch).
-		h.cycles.WithLabelValues(checkPSIThrash, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkPSIThrash, "abort").Inc()
 		return
 	}
 	// W9-KR3: the slab-leak guard runs on EVERY readable-meminfo
 	// cycle — its latch is this check's eviction circuit breaker,
 	// and it must arm even on kernels without PSI or while PSI is
 	// quiet (a kernel slab leak is a kernel problem, not a PSI one).
-	slabLeaking := h.guardKernelSlabLeak(m)
+	slabLeaking := c.h.guardKernelSlabLeak(m)
 	if !psiOK {
 		// PSI disabled on this kernel — the whole thrash check is
 		// dormant, but the slab guard above still evaluated.
-		h.cycles.WithLabelValues(checkPSIThrash, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkPSIThrash, "abort").Inc()
 		return
 	}
 	free := float64(m.availKB) / float64(m.totalKB)
-	thrash := avg60 > h.cfg.PSIFullAvg60 && free < h.cfg.MemFreeMinRatio
+	thrash := avg60 > c.h.cfg.PSIFullAvg60 && free < c.h.cfg.MemFreeMinRatio
 	if !thrash {
-		h.psiThrashFails = 0
-		h.state.Exit("psi-memory-thrash", nil)
-		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		c.fails = 0
+		c.h.state.Exit("psi-memory-thrash", nil)
+		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
-	h.psiThrashFails++
-	if h.psiThrashFails < h.cfg.ConsecNeeded {
-		h.state.AppendLog(fmt.Sprintf(
+	c.fails++
+	if c.fails < c.h.cfg.ConsecNeeded {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: psi-memory-thrash psi_full_avg60=%.1f mem_free=%.3f (check %d/%d)",
-			avg60, free, h.psiThrashFails, h.cfg.ConsecNeeded))
-		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+			avg60, free, c.fails, c.h.cfg.ConsecNeeded))
+		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
-	if !h.state.Exists("psi-memory-thrash") {
+	if !c.h.state.Exists("psi-memory-thrash") {
 		// NPD contract: nodereporter maps this line to the
 		// NodeMemoryPSIThrashing Event + problem_counter — logged
 		// once per latch entry (checkCiliumMTU parity).
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"ACTION psi-memory-thrash: psi_full_avg60=%.1f mem_free=%.3f fails=%d",
-			avg60, free, h.psiThrashFails))
+			avg60, free, c.fails))
 	}
-	h.state.Enter("psi-memory-thrash",
+	c.h.state.Enter("psi-memory-thrash",
 		fmt.Sprintf("psi_full_avg60=%.1f mem_free=%.3f", avg60, free))
-	if !apiOK {
-		h.state.AppendLog("suspect: psi-memory-thrash but API unreachable — skip pod evict")
-		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+	if !e.apiOK {
+		c.h.state.AppendLog("suspect: psi-memory-thrash but API unreachable — skip pod evict")
+		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
 	if slabLeaking {
@@ -374,23 +384,23 @@ func (h *Hygiene) checkPSIThrash(ctx context.Context, pods []corev1.Pod,
 		// pod cannot fix that and would only remove capacity the
 		// node needs to recover. drop_caches owns the reclaim;
 		// the latch stays so the condition remains visible.
-		h.state.AppendLog("suspect: psi-memory-thrash pod evict suppressed - kernel-slab-leak latched")
-		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		c.h.state.AppendLog("suspect: psi-memory-thrash pod evict suppressed - kernel-slab-leak latched")
+		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
-	victim, rss := h.highestRSSPod(pods, pidsOnce())
+	victim, rss := c.h.highestRSSPod(e.pods, e.pidsOnce())
 	if victim == nil {
 		// No eligible victim above the RSS floor — latch only;
 		// the kernel OOM verdict then stands (nothing ours worth
 		// giving it).
-		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
-	if !h.state.RateTrySpend("last-psi-evict", psiEvictInterval) {
-		h.state.AppendLog(fmt.Sprintf(
+	if !c.h.state.RateTrySpend("last-psi-evict", psiEvictInterval) {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: psi-memory-thrash victim %s/%s rss=%d - in evict cooldown (<15m), skip",
 			victim.Namespace, victim.Name, rss))
-		h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
 	// Budget spent atomically BEFORE the eviction (rate_spend
@@ -404,16 +414,25 @@ func (h *Hygiene) checkPSIThrash(ctx context.Context, pods []corev1.Pod,
 			Namespace: victim.Namespace,
 		},
 	}
-	h.state.AppendLog(fmt.Sprintf(
+	c.h.state.AppendLog(fmt.Sprintf(
 		"ACTION: psi-memory-thrash evicted pod %s/%s - rss=%d bytes, psi_full_avg60=%.1f mem_free=%.3f",
 		victim.Namespace, victim.Name, rss, avg60, free))
-	if err := h.cfg.Client.PolicyV1().Evictions(victim.Namespace).
+	if err := c.h.cfg.Client.PolicyV1().Evictions(victim.Namespace).
 		Evict(ctx, ev); err != nil {
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: psi-memory-thrash evict %s/%s failed: %v",
 			victim.Namespace, victim.Name, err))
 	} else {
-		h.actions.WithLabelValues(checkPSIThrash, "pod_evict").Inc()
+		c.h.actions.WithLabelValues(checkPSIThrash, "pod_evict").Inc()
 	}
-	h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+}
+
+// checkPSIThrash forwards to the migrated Check — tests written
+// before the interface still call the old method shape.
+func (h *Hygiene) checkPSIThrash(ctx context.Context, pods []corev1.Pod,
+	apiOK bool, pidsOnce func() []int, workerActive bool) {
+	h.psiThrash.Run(ctx, &cycleEnv{
+		pods: pods, apiOK: apiOK, pidsOnce: pidsOnce,
+		workerActive: workerActive})
 }

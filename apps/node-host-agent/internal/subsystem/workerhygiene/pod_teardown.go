@@ -13,41 +13,51 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-func (h *Hygiene) checkPodTeardown(ctx context.Context, pods []corev1.Pod,
-	apiOK bool, tasksOnce func() (map[string][]ctrTask, bool), workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkTeardown, "gated").Inc()
+// podTeardownCheck is the 36-pod-teardown check as a Check; it owns
+// the wedged-pod streak (ex-Hygiene.wedgeFails).
+type podTeardownCheck struct {
+	h     *Hygiene
+	fails int
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *podTeardownCheck) Name() string { return checkTeardown }
+
+// Run executes one pod-teardown round.
+func (c *podTeardownCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkTeardown, "gated").Inc()
 		return
 	}
-	if !apiOK {
+	if !e.apiOK {
 		// Inconclusive — shell "exit 0" semantics: abort silently,
 		// keep counters and latches (no state_exit flap on API blip).
-		h.cycles.WithLabelValues(checkTeardown, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkTeardown, "abort").Inc()
 		return
 	}
 	// The task map is only worth building once a Terminating pod
 	// exists — with none, the whole loop below is a no-op.
 	var tasks map[string][]ctrTask
-	now := h.cfg.nowFn()
+	now := c.h.cfg.nowFn()
 	wedged := 0
 	ndel := 0
-	for i := range pods {
-		p := &pods[i]
+	for i := range e.pods {
+		p := &e.pods[i]
 		if p.DeletionTimestamp == nil {
 			continue
 		}
 		if tasks == nil {
 			var complete bool
-			tasks, complete = tasksOnce()
+			tasks, complete = e.tasksOnce()
 			if !complete {
 				// A task root was unreadable — "zero live tasks"
 				// is unverifiable, so a force-delete could reap a
 				// pod whose tasks the map never saw. Inconclusive
 				// cycle: keep counters/latch, act on nothing
 				// (checkCtrTasks unreadable-root parity).
-				h.state.AppendLog(
+				c.h.state.AppendLog(
 					"suspect: pod-teardown aborted — ctr task map incomplete, force-deletes unverifiable")
-				h.cycles.WithLabelValues(checkTeardown, "abort").Inc()
+				c.h.cycles.WithLabelValues(checkTeardown, "abort").Inc()
 				return
 			}
 		}
@@ -57,10 +67,10 @@ func (h *Hygiene) checkPodTeardown(ctx context.Context, pods []corev1.Pod,
 		// past StuckWedgeAge AND containerd still holds a task dir
 		// (live or not) — sig7/force-delete had their chance; only a
 		// reboot clears a shim/kernel-level wedge.
-		if age >= h.cfg.StuckWedgeAge && len(tasks[uid]) >= 1 {
+		if age >= c.h.cfg.StuckWedgeAge && len(tasks[uid]) >= 1 {
 			wedged++
 		}
-		if age < h.cfg.StuckDeleteAge {
+		if age < c.h.cfg.StuckDeleteAge {
 			continue
 		}
 		// Rule C: external resources or kubelet mirrors → never
@@ -72,43 +82,43 @@ func (h *Hygiene) checkPodTeardown(ctx context.Context, pods []corev1.Pod,
 		if countLive(tasks[uid]) > 0 {
 			continue // a live task exists — kubelet may still be tearing down
 		}
-		if ndel >= h.cfg.MaxForceDelete {
+		if ndel >= c.h.cfg.MaxForceDelete {
 			continue // per-cycle cap bounds the blast radius
 		}
-		if err := h.forceDeletePod(ctx, p); err != nil {
-			h.state.AppendLog(fmt.Sprintf("suspect: force-delete %s/%s failed: %v",
+		if err := c.h.forceDeletePod(ctx, p); err != nil {
+			c.h.state.AppendLog(fmt.Sprintf("suspect: force-delete %s/%s failed: %v",
 				p.Namespace, p.Name, err))
 			continue
 		}
 		ndel++
-		h.actions.WithLabelValues(checkTeardown, "force_delete").Inc()
+		c.h.actions.WithLabelValues(checkTeardown, "force_delete").Inc()
 	}
 
 	switch {
 	case wedged >= 1:
-		h.wedgeFails++
-		if h.wedgeFails >= h.cfg.ConsecNeeded {
-			if h.state.Exists("node-overloaded") {
+		c.fails++
+		if c.fails >= c.h.cfg.ConsecNeeded {
+			if c.h.state.Exists("node-overloaded") {
 				// Suppression parity: a wedge under overload is a
 				// symptom — rebooting would dump 100% of its load
 				// onto the remaining nodes (amplifier). Log-only,
 				// once per suppression episode.
-				if !h.state.Exists("pod-teardown-wedged") {
-					h.state.AppendLog(fmt.Sprintf(
+				if !c.h.state.Exists("pod-teardown-wedged") {
+					c.h.state.AppendLog(fmt.Sprintf(
 						"pod-teardown-wedged suppressed-overloaded stuck=%d", wedged))
 				}
 			} else {
-				h.state.Enter("pod-teardown-wedged", fmt.Sprintf("stuck=%d", wedged))
+				c.h.state.Enter("pod-teardown-wedged", fmt.Sprintf("stuck=%d", wedged))
 			}
 		} else {
-			h.state.AppendLog(fmt.Sprintf("suspect: pod-teardown-wedged stuck=%d (check %d/%d)",
-				wedged, h.wedgeFails, h.cfg.ConsecNeeded))
+			c.h.state.AppendLog(fmt.Sprintf("suspect: pod-teardown-wedged stuck=%d (check %d/%d)",
+				wedged, c.fails, c.h.cfg.ConsecNeeded))
 		}
 	default:
-		h.wedgeFails = 0
-		h.state.Exit("pod-teardown-wedged", nil)
+		c.fails = 0
+		c.h.state.Exit("pod-teardown-wedged", nil)
 	}
-	h.cycles.WithLabelValues(checkTeardown, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkTeardown, "ok").Inc()
 }
 
 // --- Check 2: konnectivity IP drift (30-konnectivity.sh) ---
@@ -172,13 +182,23 @@ func (h *Hygiene) deleteKonnectivityPod(ctx context.Context, pods []corev1.Pod) 
 	return false
 }
 
-func (h *Hygiene) checkKonnectivity(ctx context.Context, pods []corev1.Pod,
-	pidsOnce func() []int, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkKonn, "gated").Inc()
+// konnCheck is the 30-konnectivity stale-identifier guard as a
+// Check; it owns the mismatch streak (ex-Hygiene.konnFails).
+type konnCheck struct {
+	h     *Hygiene
+	fails int
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *konnCheck) Name() string { return checkKonn }
+
+// Run executes one konnectivity round.
+func (c *konnCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkKonn, "gated").Inc()
 		return
 	}
-	nodeIP := h.k0sWorkerNodeIP()
+	nodeIP := c.h.k0sWorkerNodeIP()
 	// Healthy = ANY proxy-agent process baked with the current node
 	// IP. Scan ALL processes, never take the first match: an orphaned
 	// agent (task dir gone, process alive under a dead shim) keeps its
@@ -189,12 +209,12 @@ func (h *Hygiene) checkKonnectivity(ctx context.Context, pods []corev1.Pod,
 	healthy := false
 	agentHost := ""
 	stalePID := 0
-	for _, pid := range pidsOnce() {
-		argv := h.proc.Cmdline(pid)
+	for _, pid := range e.pidsOnce() {
+		argv := c.h.proc.Cmdline(pid)
 		if !isProxyAgent(argv) {
 			continue
 		}
-		phost := h.proxyAgentHost(pid, argv)
+		phost := c.h.proxyAgentHost(pid, argv)
 		if nodeIP != "" && phost == nodeIP {
 			healthy = true
 			break
@@ -208,50 +228,50 @@ func (h *Hygiene) checkKonnectivity(ctx context.Context, pods []corev1.Pod,
 	if healthy || nodeIP == "" || agentHost == "" {
 		// Healthy or inconclusive (no node-ip parsed / no proxy-agent
 		// found — e.g. konnectivity not deployed): reset, drop latch.
-		h.konnFails = 0
-		h.state.Exit("konnectivity-ip-mismatch", nil)
-		h.cycles.WithLabelValues(checkKonn, "ok").Inc()
+		c.fails = 0
+		c.h.state.Exit("konnectivity-ip-mismatch", nil)
+		c.h.cycles.WithLabelValues(checkKonn, "ok").Inc()
 		return
 	}
 
-	h.konnFails++
-	h.state.Enter("konnectivity-ip-mismatch",
+	c.fails++
+	c.h.state.Enter("konnectivity-ip-mismatch",
 		fmt.Sprintf("host=%s node-ip=%s", agentHost, nodeIP))
-	if h.konnFails >= h.cfg.ConsecNeeded &&
-		h.state.RateTrySpend("last-konn-restart", h.cfg.MinRestartInterval) {
+	if c.fails >= c.h.cfg.ConsecNeeded &&
+		c.h.state.RateTrySpend("last-konn-restart", c.h.cfg.MinRestartInterval) {
 		// Budget spent atomically BEFORE acting — a failed action
 		// still consumed it (conservative, rate_spend parity).
-		h.konnFails = 0
+		c.fails = 0
 		// NPD contract: "recreating konnectivity-agent ..." fires the
 		// KonnectivityStaleId filelog pattern.
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"KONNECTIVITY-IP-RESTART: recreating konnectivity-agent sandbox - stale identifier host=%s != node-ip=%s",
 			agentHost, nodeIP))
-		if h.deleteKonnectivityPod(ctx, pods) {
-			h.actions.WithLabelValues(checkKonn, "pod_delete").Inc()
+		if c.h.deleteKonnectivityPod(ctx, e.pods) {
+			c.h.actions.WithLabelValues(checkKonn, "pod_delete").Inc()
 		} else if stalePID > 0 {
 			// No API pod found (list failed or pod renamed) — kill
 			// the stale proxy-agent directly. Least-bad: a container
 			// restart alone can't fix env baked at pod create, but
 			// it still clears a hung agent while humans look.
-			if err := h.cfg.killFn(stalePID, syscall.SIGKILL); err != nil {
-				h.state.AppendLog(fmt.Sprintf(
+			if err := c.h.cfg.killFn(stalePID, syscall.SIGKILL); err != nil {
+				c.h.state.AppendLog(fmt.Sprintf(
 					"suspect: kill stale proxy-agent pid=%d failed: %v", stalePID, err))
 			} else {
-				h.state.AppendLog(fmt.Sprintf(
+				c.h.state.AppendLog(fmt.Sprintf(
 					"ACTION: killed stale proxy-agent pid=%d — no API pod found",
 					stalePID))
 			}
-			h.actions.WithLabelValues(checkKonn, "sigkill").Inc()
+			c.h.actions.WithLabelValues(checkKonn, "sigkill").Inc()
 		}
 	} else {
 		// NPD contract: "konnectivity stale identifier ..." fires the
 		// same KonnectivityStaleId pattern while accumulating.
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: konnectivity stale identifier host=%s != node-ip=%s (check %d/%d)",
-			agentHost, nodeIP, h.konnFails, h.cfg.ConsecNeeded))
+			agentHost, nodeIP, c.fails, c.h.cfg.ConsecNeeded))
 	}
-	h.cycles.WithLabelValues(checkKonn, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkKonn, "ok").Inc()
 }
 
 // --- Check 3: DNS resolv.conf drift (33-dns-resolv-drift.sh) ---
@@ -312,27 +332,37 @@ func pausePIDOf(tasks []ctrTask) int {
 	return 0
 }
 
-func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
-	tasksOnce func() (map[string][]ctrTask, bool), workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkDNS, "gated").Inc()
+// dnsResolvCheck is the 33-dns-resolv-drift guard as a Check; it
+// owns the stale-pause streak (ex-Hygiene.dnsFails).
+type dnsResolvCheck struct {
+	h     *Hygiene
+	fails int
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *dnsResolvCheck) Name() string { return checkDNS }
+
+// Run executes one dns-resolv round.
+func (c *dnsResolvCheck) Run(_ context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkDNS, "gated").Inc()
 		return
 	}
-	if !apiOK {
+	if !e.apiOK {
 		// Same inconclusive rule as teardown: a failed LIST keeps
 		// counters and the latch (no flap on API blip).
-		h.cycles.WithLabelValues(checkDNS, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkDNS, "abort").Inc()
 		return
 	}
-	hostNS, _ := nameserverSet(h.cfg.HostResolvConf)
+	hostNS, _ := nameserverSet(c.h.cfg.HostResolvConf)
 
 	var stale []dnsStale
 	if len(hostNS) > 0 { // empty host set → nothing to compare (shell parity)
 		// Task map is built only when a Running dns-pod actually
 		// needs its pause pid looked up.
 		var tasks map[string][]ctrTask
-		for i := range pods {
-			p := &pods[i]
+		for i := range e.pods {
+			p := &e.pods[i]
 			// Namespace pin like deleteKonnectivityPod: the name
 			// regex alone would match a user pod named coredns-*/
 			// node-local-dns-* in ANY namespace — the pause SIGKILL
@@ -343,7 +373,7 @@ func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
 				continue
 			}
 			if tasks == nil {
-				tasks, _ = tasksOnce()
+				tasks, _ = e.tasksOnce()
 				// An incomplete map is fail-closed here already:
 				// an unseen pause pid reads as pid==0 → the pod
 				// is skipped, never killed.
@@ -355,7 +385,7 @@ func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
 			// Read the POD's resolv.conf through the pause mount ns —
 			// ProcRoot/<pid>/root is the task's filesystem view.
 			podNS, clusterLocal := nameserverSet(
-				h.proc.File(pid, "root/etc/resolv.conf"))
+				c.h.proc.File(pid, "root/etc/resolv.conf"))
 			if clusterLocal || len(podNS) == 0 {
 				continue
 			}
@@ -366,9 +396,9 @@ func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
 	}
 
 	if len(stale) == 0 {
-		h.dnsFails = 0
-		h.state.Exit("dns-resolv-stale", nil)
-		h.cycles.WithLabelValues(checkDNS, "ok").Inc()
+		c.fails = 0
+		c.h.state.Exit("dns-resolv-stale", nil)
+		c.h.cycles.WithLabelValues(checkDNS, "ok").Inc()
 		return
 	}
 
@@ -379,31 +409,31 @@ func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
 	staleStr := strings.Join(specs, " ")
 	// Latch first — the state file is what NPD's permanent
 	// DnsResolvStale condition checks; the counter gates the action.
-	h.state.Enter("dns-resolv-stale", staleStr)
-	h.dnsFails++
+	c.h.state.Enter("dns-resolv-stale", staleStr)
+	c.fails++
 	switch {
-	case h.dnsFails >= h.cfg.ConsecNeeded &&
-		h.state.RateTrySpend("last-dnsresolv-restart", h.cfg.MinRestartInterval):
+	case c.fails >= c.h.cfg.ConsecNeeded &&
+		c.h.state.RateTrySpend("last-dnsresolv-restart", c.h.cfg.MinRestartInterval):
 		// budget already spent atomically — spend BEFORE action (lib.sh)
 		for _, s := range stale {
 			// SIGKILL on the PAUSE pid — NOT the app container
 			// (restarting the app keeps the old sandbox +
 			// resolv.conf; the pod object itself is fine).
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"DNS-RESOLV-RESTART: killing pause %d (%s) - dns-resolv-stale, resolv.conf pod stale vs host",
 				s.pid, s.pod))
-			if err := h.cfg.killFn(s.pid, syscall.SIGKILL); err != nil {
-				h.state.AppendLog(fmt.Sprintf(
+			if err := c.h.cfg.killFn(s.pid, syscall.SIGKILL); err != nil {
+				c.h.state.AppendLog(fmt.Sprintf(
 					"suspect: kill pause %d (%s) failed: %v", s.pid, s.pod, err))
 			}
-			h.actions.WithLabelValues(checkDNS, "pause_kill").Inc()
+			c.h.actions.WithLabelValues(checkDNS, "pause_kill").Inc()
 		}
-		h.dnsFails = 0
+		c.fails = 0
 	default:
-		h.state.AppendLog(fmt.Sprintf("suspect: dns-resolv-stale %s (check %d/%d)",
-			staleStr, h.dnsFails, h.cfg.ConsecNeeded))
+		c.h.state.AppendLog(fmt.Sprintf("suspect: dns-resolv-stale %s (check %d/%d)",
+			staleStr, c.fails, c.h.cfg.ConsecNeeded))
 	}
-	h.cycles.WithLabelValues(checkDNS, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkDNS, "ok").Inc()
 }
 
 // --- shared helpers for the ported kubelet/cilium/ctr checks ---

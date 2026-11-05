@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // procStatStatePPID parses /proc/<pid>/stat for state + ppid — the
@@ -65,14 +66,29 @@ func (h *Hygiene) procStartTime(pid int) string {
 	return st.Fields[19]
 }
 
-func (h *Hygiene) checkZombieStorm(pidsOnce func() []int, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkZombieStorm, "gated").Inc()
+// zombieStormCheck is the A2 storm detector as a Check. streaks
+// counts consecutive cycles each parent has produced >
+// ZombieStormThreshold defunct children (ex-Hygiene.zombieStreaks).
+// Keyed by zombieParent (pid + stat starttime), NOT raw pid — a
+// pid recycled between cycles must not inherit a dead process's
+// streak and hold the latch open for a storm that is over.
+type zombieStormCheck struct {
+	h       *Hygiene
+	streaks map[zombieParent]int
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *zombieStormCheck) Name() string { return checkZombieStorm }
+
+// Run executes one zombie-storm round.
+func (c *zombieStormCheck) Run(_ context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkZombieStorm, "gated").Inc()
 		return
 	}
 	byPPID := map[int]int{}
-	for _, pid := range pidsOnce() {
-		state, ppid, ok := h.procStatStatePPID(pid)
+	for _, pid := range e.pidsOnce() {
+		state, ppid, ok := c.h.procStatStatePPID(pid)
 		if !ok || state != "Z" {
 			continue
 		}
@@ -84,7 +100,7 @@ func (h *Hygiene) checkZombieStorm(pidsOnce func() []int, workerActive bool) {
 	keyOf := func(ppid int) zombieParent {
 		k, ok := parents[ppid]
 		if !ok {
-			k = zombieParent{pid: ppid, start: h.procStartTime(ppid)}
+			k = zombieParent{pid: ppid, start: c.h.procStartTime(ppid)}
 			parents[ppid] = k
 		}
 		return k
@@ -95,44 +111,44 @@ func (h *Hygiene) checkZombieStorm(pidsOnce func() []int, workerActive bool) {
 	// one extra cycle. Loop 2 re-validates against the current count
 	// before any streak contributes to storm.
 	storm := false
-	for parent := range h.zombieStreaks {
+	for parent := range c.streaks {
 		if _, ok := byPPID[parent.pid]; !ok || keyOf(parent.pid) != parent {
-			delete(h.zombieStreaks, parent) // parent gone or pid recycled — streak dead
+			delete(c.streaks, parent) // parent gone or pid recycled — streak dead
 		}
 	}
 	for ppid, n := range byPPID {
 		key := keyOf(ppid)
-		if n <= h.cfg.ZombieStormThreshold {
-			delete(h.zombieStreaks, key)
+		if n <= c.h.cfg.ZombieStormThreshold {
+			delete(c.streaks, key)
 			continue
 		}
-		h.zombieStreaks[key]++
-		switch streak := h.zombieStreaks[key]; {
-		case streak == h.cfg.ConsecNeeded:
+		c.streaks[key]++
+		switch streak := c.streaks[key]; {
+		case streak == c.h.cfg.ConsecNeeded:
 			storm = true
-			uid := h.podUIDForPID(ppid)
+			uid := c.h.podUIDForPID(ppid)
 			// NPD contract: nodereporter maps this line to the
 			// ZombieProcessStorm Event + problem_counter. Logged
 			// on streak ENTRY only — repeating it every cycle while
 			// the storm persists would spawn a fresh K8s Event per
 			// interval (the !stateExists gating checkCiliumMTU
 			// uses).
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"ACTION zombie-storm: pod_uid=%s zombies=%d ppid=%d", uid, n, ppid))
-		case streak > h.cfg.ConsecNeeded:
+		case streak > c.h.cfg.ConsecNeeded:
 			storm = true // latched storm continues — no repeated ACTION line
 		default:
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: zombie-storm ppid=%d zombies=%d (check %d/%d)",
-				ppid, n, streak, h.cfg.ConsecNeeded))
+				ppid, n, streak, c.h.cfg.ConsecNeeded))
 		}
 	}
 	if storm {
-		h.state.Enter("zombie-storm", "")
+		c.h.state.Enter("zombie-storm", "")
 	} else {
-		h.state.Exit("zombie-storm", nil)
+		c.h.state.Exit("zombie-storm", nil)
 	}
-	h.cycles.WithLabelValues(checkZombieStorm, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkZombieStorm, "ok").Inc()
 }
 
 // procStatCommState parses /proc/<pid>/stat for comm + state — comm
@@ -180,9 +196,20 @@ func dstateRuntimeComm(comm string) bool {
 	return false
 }
 
-func (h *Hygiene) checkDStateTasks(pidsOnce func() []int, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkDState, "gated").Inc()
+// dstateCheck is the W7-H1 storm detector as a Check; it owns the
+// over-threshold streak (ex-Hygiene.dstateFails).
+type dstateCheck struct {
+	h     *Hygiene
+	fails int
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *dstateCheck) Name() string { return checkDState }
+
+// Run executes one d-state-storm round.
+func (c *dstateCheck) Run(_ context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkDState, "gated").Inc()
 		return
 	}
 	total, runtime := 0, 0
@@ -190,8 +217,8 @@ func (h *Hygiene) checkDStateTasks(pidsOnce func() []int, workerActive bool) {
 	// function holding the tasks is the triage hint (umount_tree /
 	// wait_transaction_locked / blk_mq_get_tag).
 	wchans := make([]string, 0, 4)
-	for _, pid := range pidsOnce() {
-		comm, state, ok := h.procStatCommState(pid)
+	for _, pid := range e.pidsOnce() {
+		comm, state, ok := c.h.procStatCommState(pid)
 		if !ok || state != "D" {
 			continue
 		}
@@ -200,36 +227,43 @@ func (h *Hygiene) checkDStateTasks(pidsOnce func() []int, workerActive bool) {
 			runtime++
 		}
 		if len(wchans) < 4 {
-			if w := h.procWchan(pid); w != "" {
+			if w := c.h.procWchan(pid); w != "" {
 				wchans = append(wchans, comm+"="+w)
 			}
 		}
 	}
-	if total < h.cfg.DStateStormThreshold && runtime < dStateRuntimeMin {
-		h.dstateFails = 0
-		h.state.Exit("d-state-storm", nil)
-		h.cycles.WithLabelValues(checkDState, "ok").Inc()
+	if total < c.h.cfg.DStateStormThreshold && runtime < dStateRuntimeMin {
+		c.fails = 0
+		c.h.state.Exit("d-state-storm", nil)
+		c.h.cycles.WithLabelValues(checkDState, "ok").Inc()
 		return
 	}
-	h.dstateFails++
-	if h.dstateFails < h.cfg.ConsecNeeded {
-		h.state.AppendLog(fmt.Sprintf(
+	c.fails++
+	if c.fails < c.h.cfg.ConsecNeeded {
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: d-state-storm count=%d runtime=%d (check %d/%d)",
-			total, runtime, h.dstateFails, h.cfg.ConsecNeeded))
-		h.cycles.WithLabelValues(checkDState, "ok").Inc()
+			total, runtime, c.fails, c.h.cfg.ConsecNeeded))
+		c.h.cycles.WithLabelValues(checkDState, "ok").Inc()
 		return
 	}
-	if !h.state.Exists("d-state-storm") {
+	if !c.h.state.Exists("d-state-storm") {
 		// NPD contract: nodereporter maps this line to the
 		// KernelHungTasks Event + problem_counter — logged once per
 		// latch entry (the !stateExists gate, checkCiliumMTU parity).
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"ACTION d-state-storm: count=%d runtime=%d wchan=%s",
 			total, runtime, strings.Join(wchans, ",")))
 	}
-	h.state.Enter("d-state-storm",
+	c.h.state.Enter("d-state-storm",
 		fmt.Sprintf("count=%d runtime=%d", total, runtime))
-	h.cycles.WithLabelValues(checkDState, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkDState, "ok").Inc()
+}
+
+// checkDStateTasks forwards to the migrated Check — tests written
+// before the interface still call the old method shape.
+func (h *Hygiene) checkDStateTasks(pidsOnce func() []int, workerActive bool) {
+	h.dstate.Run(context.Background(), &cycleEnv{
+		pidsOnce: pidsOnce, workerActive: workerActive})
 }
 
 // --- Check: systemd-scopes (W7-H2) ---
@@ -242,33 +276,44 @@ func (h *Hygiene) checkDStateTasks(pidsOnce func() []int, workerActive bool) {
 // reset-failed is safe on live scopes (it only clears the failed
 // bookkeeping of already-dead units).
 
-func (h *Hygiene) checkSystemdScopes(ctx context.Context, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkSysScopes, "gated").Inc()
+// scopesCheck is the W7-H2 failed-scope reaper as a Check; it owns
+// the 30m sweep stamp (ex-Hygiene.lastScopeScan).
+type scopesCheck struct {
+	h        *Hygiene
+	lastScan time.Time
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *scopesCheck) Name() string { return checkSysScopes }
+
+// Run executes one systemd-scopes round.
+func (c *scopesCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkSysScopes, "gated").Inc()
 		return
 	}
-	if h.cfg.Systemd == nil {
-		h.cycles.WithLabelValues(checkSysScopes, "gated").Inc()
+	if c.h.cfg.Systemd == nil {
+		c.h.cycles.WithLabelValues(checkSysScopes, "gated").Inc()
 		return
 	}
-	if h.cfg.nowFn().Sub(h.lastScopeScan) < systemdScopeScanInterval {
-		h.cycles.WithLabelValues(checkSysScopes, "ok").Inc()
+	if c.h.cfg.nowFn().Sub(c.lastScan) < systemdScopeScanInterval {
+		c.h.cycles.WithLabelValues(checkSysScopes, "ok").Inc()
 		return
 	}
-	out, err := h.cfg.Systemd.Exec(ctx, "systemctl", "list-units",
+	out, err := c.h.cfg.Systemd.Exec(ctx, "systemctl", "list-units",
 		"--type=scope", "--state=failed", "--no-legend", "--plain",
 		"cri-containerd-*.scope")
 	if err != nil {
 		// A transient systemctl/D-Bus failure is inconclusive — the
 		// scan must NOT stamp (a stamped failure defers the retry a
 		// full interval) and zero evidence was gathered.
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: systemd-scopes list-units failed: %v (%s) — scan skipped",
 			err, strings.TrimSpace(out)))
-		h.cycles.WithLabelValues(checkSysScopes, "abort").Inc()
+		c.h.cycles.WithLabelValues(checkSysScopes, "abort").Inc()
 		return
 	}
-	h.lastScopeScan = h.cfg.nowFn()
+	c.lastScan = c.h.cfg.nowFn()
 	n := 0
 	for _, line := range strings.Split(out, "\n") {
 		if f := strings.Fields(line); len(f) > 0 &&
@@ -277,20 +322,26 @@ func (h *Hygiene) checkSystemdScopes(ctx context.Context, workerActive bool) {
 		}
 	}
 	if n == 0 {
-		h.cycles.WithLabelValues(checkSysScopes, "ok").Inc()
+		c.h.cycles.WithLabelValues(checkSysScopes, "ok").Inc()
 		return
 	}
 	// NPD contract line (reset-failed evidence in the watchdog log).
-	h.state.AppendLog(fmt.Sprintf("ACTION: systemd-scopes reset-failed count=%d", n))
-	if rout, rerr := h.cfg.Systemd.Exec(ctx,
+	c.h.state.AppendLog(fmt.Sprintf("ACTION: systemd-scopes reset-failed count=%d", n))
+	if rout, rerr := c.h.cfg.Systemd.Exec(ctx,
 		"systemctl", "reset-failed", "cri-containerd-*.scope"); rerr != nil {
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: systemd-scopes reset-failed failed: %v (%s)",
 			rerr, strings.TrimSpace(rout)))
 	} else {
-		h.actions.WithLabelValues(checkSysScopes, "reset_failed").Inc()
+		c.h.actions.WithLabelValues(checkSysScopes, "reset_failed").Inc()
 	}
-	h.cycles.WithLabelValues(checkSysScopes, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkSysScopes, "ok").Inc()
+}
+
+// checkSystemdScopes forwards to the migrated Check — tests
+// written before the interface still call the old method shape.
+func (h *Hygiene) checkSystemdScopes(ctx context.Context, workerActive bool) {
+	h.scopes.Run(ctx, &cycleEnv{workerActive: workerActive})
 }
 
 // --- Check: cilium-envoy xDS NACK + node-local-dns LRP (W7-H3) ---

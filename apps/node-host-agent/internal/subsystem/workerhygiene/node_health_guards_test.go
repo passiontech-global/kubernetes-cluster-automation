@@ -224,8 +224,8 @@ func TestCheckCiliumLRPDNSGates(t *testing.T) {
 		return false
 	}
 	e.h.checkCiliumLRPDNS(context.Background(), nil, true, true)
-	if e.h.nldFails != 0 {
-		t.Fatalf("nldFails = %d, want 0 on non-cilium node", e.h.nldFails)
+	if e.h.ciliumLRP.fails != 0 {
+		t.Fatalf("nldFails = %d, want 0 on non-cilium node", e.h.ciliumLRP.fails)
 	}
 
 	// cilium_host present but no cilium-agent task → gated (agent
@@ -234,8 +234,8 @@ func TestCheckCiliumLRPDNSGates(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.h.checkCiliumLRPDNS(context.Background(), nil, true, true)
-	if e.h.nldFails != 0 {
-		t.Fatalf("nldFails = %d, want 0 with cilium-agent absent", e.h.nldFails)
+	if e.h.ciliumLRP.fails != 0 {
+		t.Fatalf("nldFails = %d, want 0 with cilium-agent absent", e.h.ciliumLRP.fails)
 	}
 }
 
@@ -281,7 +281,7 @@ func TestCheckSpegelMirrorTooYoung(t *testing.T) {
 	}
 	e.h.checkSpegelMirror(context.Background(), []corev1.Pod{*pod}, true, true)
 	e.h.checkSpegelMirror(context.Background(), []corev1.Pod{*pod}, true, true)
-	if e.h.spegelFails != 0 || e.h.state.Exists("spegel-mirror-degraded") {
+	if e.h.spegel.fails != 0 || e.h.state.Exists("spegel-mirror-degraded") {
 		t.Fatal("3m-old spegel pod counted toward the streak — startup grace violated")
 	}
 }
@@ -338,10 +338,10 @@ func TestCheckCalicoHygieneCiliumGate(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(e.sysnet, "cali00"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	e.h.calicoVethFails = 1
+	e.h.calico.vethFails = 1
 	writeFile(t, filepath.Join(e.state, "state-calico-veth-leak"), "1\n")
 	e.h.checkCalicoHygiene(context.Background(), nil, true, true)
-	if e.h.calicoVethFails != 0 || e.h.state.Exists("calico-veth-leak") {
+	if e.h.calico.vethFails != 0 || e.h.state.Exists("calico-veth-leak") {
 		t.Fatal("calico checks ran/cleared nothing on a cilium node")
 	}
 }

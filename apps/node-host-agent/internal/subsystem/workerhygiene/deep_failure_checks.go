@@ -47,11 +47,12 @@ const orphanHostPathDiskHigh = 0.80
 var ctrMetaCorruptRe = regexp.MustCompile(
 	`failed to loadmeta|invalid freelist page|bbolt|meta\.db: Somethings wrong`)
 
-// checkContainerdHealth is the W10-KR3 containerd meta.db corruption
-// guard. Two evidence channels, either sufficient for
-// state-containerd-corrupt (KubeletRuntimeStall altStateKey — a
-// corrupt store survives k0sworker restarts, so the NHC→SNR path
-// needs the latch, not just a restart):
+// ctrMetaCheck is the W10-KR3 containerd meta.db corruption
+// guard as a Check; it owns the evidence streak
+// (ex-Hygiene.ctrMetaFails). Two evidence channels, either
+// sufficient for state-containerd-corrupt (KubeletRuntimeStall
+// altStateKey — a corrupt store survives k0sworker restarts, so the
+// NHC→SNR path needs the latch, not just a restart):
 //
 //   - journalctl -u k0sworker -u containerd --since "3 minutes ago"
 //     matching the bbolt/meta.db corruption signatures, and
@@ -63,17 +64,25 @@ var ctrMetaCorruptRe = regexp.MustCompile(
 // ConsecNeeded consecutive evidence cycles latch; a clean cycle
 // clears. An unreadable journal is inconclusive for that half —
 // the shim half still evaluates.
-func (h *Hygiene) checkContainerdHealth(ctx context.Context,
-	pidsOnce func() []int, workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkCtrMeta, "gated").Inc()
+type ctrMetaCheck struct {
+	h     *Hygiene
+	fails int
+}
+
+// Name returns the check label / WD_SIG key.
+func (c *ctrMetaCheck) Name() string { return checkCtrMeta }
+
+// Run executes one containerd-meta round.
+func (c *ctrMetaCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkCtrMeta, "gated").Inc()
 		return
 	}
 	evidence := ""
-	journalFn := h.cfg.ContainerdMetaJournalFn
-	if journalFn == nil && h.cfg.Systemd != nil {
+	journalFn := c.h.cfg.ContainerdMetaJournalFn
+	if journalFn == nil && c.h.cfg.Systemd != nil {
 		journalFn = func(ctx context.Context) (string, error) {
-			return h.cfg.Systemd.ExecCombined(ctx, "journalctl",
+			return c.h.cfg.Systemd.ExecCombined(ctx, "journalctl",
 				"-u", "k0sworker.service", "-u", "containerd.service",
 				"--since", ctrMetaJournalWindow, "--no-pager")
 		}
@@ -81,32 +90,40 @@ func (h *Hygiene) checkContainerdHealth(ctx context.Context,
 	if journalFn != nil {
 		out, err := journalFn(ctx)
 		if err != nil {
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: containerd-meta journal probe failed: %v — journal half inconclusive",
 				err))
 		} else if m := ctrMetaCorruptRe.FindString(out); m != "" {
 			evidence = "journal: " + m
 		}
 	}
-	if orphans := h.countMetaOrphanShims(pidsOnce()); orphans > 0 {
+	if orphans := c.h.countMetaOrphanShims(e.pidsOnce()); orphans > 0 {
 		if evidence != "" {
 			evidence += "; "
 		}
 		evidence += fmt.Sprintf("%d orphan shim(s) ppid=1", orphans)
 	}
 	if evidence != "" {
-		h.ctrMetaFails++
-		h.state.AppendLog(fmt.Sprintf(
+		c.fails++
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: containerd meta.db corruption evidence (%s) — run %d/%d",
-			evidence, h.ctrMetaFails, h.cfg.ConsecNeeded))
-		if h.ctrMetaFails >= h.cfg.ConsecNeeded {
-			h.state.Enter("containerd-corrupt", evidence)
+			evidence, c.fails, c.h.cfg.ConsecNeeded))
+		if c.fails >= c.h.cfg.ConsecNeeded {
+			c.h.state.Enter("containerd-corrupt", evidence)
 		}
 	} else {
-		h.ctrMetaFails = 0
-		h.state.Exit("containerd-corrupt", nil)
+		c.fails = 0
+		c.h.state.Exit("containerd-corrupt", nil)
 	}
-	h.cycles.WithLabelValues(checkCtrMeta, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkCtrMeta, "ok").Inc()
+}
+
+// checkContainerdHealth forwards to the migrated Check — tests
+// written before the interface still call the old method shape.
+func (h *Hygiene) checkContainerdHealth(ctx context.Context,
+	pidsOnce func() []int, workerActive bool) {
+	h.ctrMeta.Run(ctx, &cycleEnv{
+		pidsOnce: pidsOnce, workerActive: workerActive})
 }
 
 // countMetaOrphanShims counts containerd-shim-runc-v2 processes that
@@ -171,36 +188,43 @@ func (h *Hygiene) ctrTaskInitLive(dir string) bool {
 // files are cumulative, so "already emitted" is a count/epoch pair.
 const lastHostOOMEventFile = "last-host-oom-event"
 
-// checkHostOOMVictims consumes the hostmetrics kmsg scanner's
-// markers: a NEW host-level OOM kill (count advanced since the last
-// emitted event) produces a Warning Event on this Node plus the
+// hostOOMCheck is the W10-KR1 hostmetrics kmsg-marker consumer as
+// a Check (no streak — the dedup marker file is the state).
+type hostOOMCheck struct{ h *Hygiene }
+
+// Name returns the check label / WD_SIG key.
+func (c *hostOOMCheck) Name() string { return checkHostOOM }
+
+// Run consumes the hostmetrics kmsg scanner's markers: a NEW
+// host-level OOM kill (count advanced since the last emitted
+// event) produces a Warning Event on this Node plus the
 // node_agent_host_oom_kills_total delta. Pod-cgroup kills never
 // reach the markers — hostmetrics already classified them out.
-func (h *Hygiene) checkHostOOMVictims(ctx context.Context) {
-	victim := strings.TrimSpace(readSmallFile(h.cfg.HostOOMVictimFile))
+func (c *hostOOMCheck) Run(ctx context.Context, _ *cycleEnv) {
+	victim := strings.TrimSpace(readSmallFile(c.h.cfg.HostOOMVictimFile))
 	fv := strings.Fields(victim)
 	if len(fv) < 2 {
-		h.cycles.WithLabelValues(checkHostOOM, "ok").Inc()
+		c.h.cycles.WithLabelValues(checkHostOOM, "ok").Inc()
 		return
 	}
 	epoch, _ := strconv.ParseInt(fv[0], 10, 64)
 	comm := fv[1]
 	var count int64 = -1
-	if b, err := os.ReadFile(h.cfg.HostOOMCountFile); err == nil {
+	if b, err := os.ReadFile(c.h.cfg.HostOOMCountFile); err == nil {
 		count, _ = strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
 	}
 	// Dedup on the cumulative count — the marker's epoch only moves
 	// forward anyway, but count is the authoritative "kills seen".
 	lastCount := int64(-1)
 	if b, err := os.ReadFile(filepath.Join(
-		h.cfg.WatchdogStateDir, lastHostOOMEventFile)); err == nil {
+		c.h.cfg.WatchdogStateDir, lastHostOOMEventFile)); err == nil {
 		lf := strings.Fields(string(b))
 		if len(lf) > 0 {
 			lastCount, _ = strconv.ParseInt(lf[0], 10, 64)
 		}
 	}
 	if count >= 0 && count <= lastCount {
-		h.cycles.WithLabelValues(checkHostOOM, "ok").Inc()
+		c.h.cycles.WithLabelValues(checkHostOOM, "ok").Inc()
 		return
 	}
 	delta := int64(1)
@@ -210,19 +234,25 @@ func (h *Hygiene) checkHostOOMVictims(ctx context.Context) {
 	if delta < 1 {
 		delta = 1
 	}
-	h.emitOOMEvent(ctx, comm, epoch, delta, count)
+	c.h.emitOOMEvent(ctx, comm, epoch, delta, count)
 	// Record the emission — count first so a failed event create
 	// retries next cycle instead of being swallowed.
 	if count >= 0 {
-		p := filepath.Join(h.cfg.WatchdogStateDir, lastHostOOMEventFile)
+		p := filepath.Join(c.h.cfg.WatchdogStateDir, lastHostOOMEventFile)
 		content := strconv.FormatInt(count, 10) + " " +
 			strconv.FormatInt(epoch, 10) + "\n"
 		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: host-oom dedup marker write failed: %v", err))
 		}
 	}
-	h.cycles.WithLabelValues(checkHostOOM, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkHostOOM, "ok").Inc()
+}
+
+// checkHostOOMVictims forwards to the migrated Check — tests
+// written before the interface still call the old method shape.
+func (h *Hygiene) checkHostOOMVictims(ctx context.Context) {
+	h.hostOOM.Run(ctx, &cycleEnv{})
 }
 
 // emitOOMEvent creates the SystemOOMVictim Warning Event on this
@@ -275,28 +305,34 @@ func (h *Hygiene) emitOOMEvent(ctx context.Context, comm string,
 
 // --- W10-ST2: orphaned hostPath volume dirs ---
 
-// checkOrphanedHostPathVolumes finds pvc-* dirs under the
-// local-provisioner roots whose PersistentVolume is gone from the
-// apiserver — the disk leak a deleted PV leaves behind (the
-// provisioner removes the PV object; the hostPath dir is its
-// problem). Metrics always report confirmed orphans; removal is
-// deliberately narrow: dir mtime >24h (deletion grace), backing
-// filesystem >80% used, and the dir EMPTY or holding only a
-// ".deleted" marker — anything with real data is reported, never
-// touched. An apiserver LIST failure makes "PV not found"
-// unverifiable → the whole removal half stands down (metrics keep
-// their last values).
-func (h *Hygiene) checkOrphanedHostPathVolumes(ctx context.Context,
-	workerActive bool) {
-	if !workerActive {
-		h.cycles.WithLabelValues(checkOrphanHP, "gated").Inc()
+// orphanHPCheck finds pvc-* dirs under the local-provisioner roots
+// whose PersistentVolume is gone from the apiserver — the disk leak
+// a deleted PV leaves behind (the provisioner removes the PV
+// object; the hostPath dir is its problem). Metrics always report
+// confirmed orphans; removal is deliberately narrow: dir mtime
+// >24h (deletion grace), backing filesystem >80% used, and the dir
+// EMPTY or holding only a ".deleted" marker — anything with real
+// data is reported, never touched. An apiserver LIST failure makes
+// "PV not found" unverifiable → the whole removal half stands down
+// (metrics keep their last values). The gauge values live on
+// Hygiene (orphanHostPathBytes/Dirs) — writeNodeAgentPromTextfile
+// reads them at end of Cycle.
+type orphanHPCheck struct{ h *Hygiene }
+
+// Name returns the check label / WD_SIG key.
+func (c *orphanHPCheck) Name() string { return checkOrphanHP }
+
+// Run executes one orphan-hostpath round.
+func (c *orphanHPCheck) Run(ctx context.Context, e *cycleEnv) {
+	if !e.workerActive {
+		c.h.cycles.WithLabelValues(checkOrphanHP, "gated").Inc()
 		return
 	}
 	type cand struct {
 		path, name string
 	}
 	var cands []cand
-	for _, root := range h.cfg.OrphanHostPathDirs {
+	for _, root := range c.h.cfg.OrphanHostPathDirs {
 		ents, err := os.ReadDir(root)
 		if err != nil {
 			continue
@@ -311,10 +347,10 @@ func (h *Hygiene) checkOrphanedHostPathVolumes(ctx context.Context,
 	}
 	pvNames := map[string]bool{}
 	apiOK := true
-	if pvs, err := h.cfg.Client.CoreV1().PersistentVolumes().
+	if pvs, err := c.h.cfg.Client.CoreV1().PersistentVolumes().
 		List(ctx, metav1.ListOptions{}); err != nil {
 		apiOK = false
-		h.state.AppendLog(fmt.Sprintf(
+		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: orphan-hostpath PV list failed: %v — removal half inconclusive",
 			err))
 	} else {
@@ -332,39 +368,47 @@ func (h *Hygiene) checkOrphanedHostPathVolumes(ctx context.Context,
 			continue // can't confirm "PV gone" — not an orphan yet
 		}
 		orphans++
-		size, _ := h.walkBytes(cd.path)
+		size, _ := c.h.walkBytes(cd.path)
 		totalBytes += size
 		fi, err := os.Stat(cd.path)
 		if err != nil {
 			continue
 		}
-		if h.cfg.nowFn().Sub(fi.ModTime()) < orphanHostPathMinAge {
+		if c.h.cfg.nowFn().Sub(fi.ModTime()) < orphanHostPathMinAge {
 			continue // inside the deletion grace window
 		}
-		if !h.diskUsageAboveWatermark(filepath.Dir(cd.path)) {
+		if !c.h.diskUsageAboveWatermark(filepath.Dir(cd.path)) {
 			continue // disk pressure gate — keep the evidence
 		}
 		if ok, why := orphanHPRemovable(cd.path); ok {
 			if rerr := os.RemoveAll(cd.path); rerr != nil {
-				h.state.AppendLog(fmt.Sprintf(
+				c.h.state.AppendLog(fmt.Sprintf(
 					"suspect: orphan-hostpath remove %s failed: %v", cd.path, rerr))
 			} else {
-				h.state.AppendLog(fmt.Sprintf(
+				c.h.state.AppendLog(fmt.Sprintf(
 					"ACTION: removed orphaned hostpath volume dir %s (%s, %d bytes)",
 					cd.path, why, size))
-				h.actions.WithLabelValues(checkOrphanHP, "rm_dir").Inc()
+				c.h.actions.WithLabelValues(checkOrphanHP, "rm_dir").Inc()
 			}
 		} else {
-			h.state.AppendLog(fmt.Sprintf(
+			c.h.state.AppendLog(fmt.Sprintf(
 				"suspect: orphan hostpath %s holds data (%s, %d bytes) — left in place",
 				cd.path, why, size))
 		}
 	}
 	if apiOK {
-		h.orphanHostPathBytes = totalBytes
-		h.orphanHostPathDirs = orphans
+		c.h.orphanHostPathBytes = totalBytes
+		c.h.orphanHostPathDirs = orphans
 	}
-	h.cycles.WithLabelValues(checkOrphanHP, "ok").Inc()
+	c.h.cycles.WithLabelValues(checkOrphanHP, "ok").Inc()
+}
+
+// checkOrphanedHostPathVolumes forwards to the migrated Check —
+// tests written before the interface still call the old method
+// shape.
+func (h *Hygiene) checkOrphanedHostPathVolumes(ctx context.Context,
+	workerActive bool) {
+	h.orphanHP.Run(ctx, &cycleEnv{workerActive: workerActive})
 }
 
 // orphanHPKnownPV reports whether a pvc-* dir name still maps to a

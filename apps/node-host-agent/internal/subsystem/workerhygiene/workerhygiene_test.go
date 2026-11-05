@@ -645,8 +645,8 @@ func TestKonnectivityMismatchRestartAndRateLimit(t *testing.T) {
 	if !strings.Contains(logLines(t, e), "recreating konnectivity-agent sandbox") {
 		t.Fatalf("missing restart log:\n%s", logLines(t, e))
 	}
-	if e.h.konnFails != 0 {
-		t.Fatalf("counter=%d want 0 after action", e.h.konnFails)
+	if e.h.konn.fails != 0 {
+		t.Fatalf("counter=%d want 0 after action", e.h.konn.fails)
 	}
 
 	// Cycle 3+4: mismatch persists (process still stale) — the
@@ -1278,7 +1278,7 @@ func TestKubeletWatchWedgeUpstreamGate(t *testing.T) {
 	}
 	// Only ONE backend stale → not an upstream wedge → restart.
 	writeFile(t, filepath.Join(e.state, "state-apiserver-backend-stale-10-0-0-1"), "1\n")
-	e.h.watchFails = 2
+	e.h.watch.fails = 2
 	e.h.Cycle(context.Background())
 	if !e.sdRan("restart k0sworker.service") {
 		t.Fatal("restart blocked by partial staleness")
@@ -1286,7 +1286,7 @@ func TestKubeletWatchWedgeUpstreamGate(t *testing.T) {
 	// ALL backends stale → upstream gate blocks the restart.
 	e.sdcmds = nil
 	writeFile(t, filepath.Join(e.state, "state-apiserver-backend-stale-10-0-0-2"), "1\n")
-	e.h.watchFails = 2
+	e.h.watch.fails = 2
 	e.h.Cycle(context.Background())
 	if e.sdRan("restart k0sworker.service") {
 		t.Fatal("restart fired despite all backends stale")
