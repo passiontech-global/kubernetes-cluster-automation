@@ -3,6 +3,7 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,11 +24,11 @@ func TestLocalPVDirBytes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(t, filepath.Join(root, "pvc-aaa", "data.bin"), strings.Repeat("x", 1000))
-	write(t, filepath.Join(root, "pvc-aaa", "sub", "more.bin"), strings.Repeat("y", 500))
-	write(t, filepath.Join(root, "pvc-bbb", "vol.bin"), strings.Repeat("z", 2000))
+	testutil.WriteFile(t, filepath.Join(root, "pvc-aaa", "data.bin"), strings.Repeat("x", 1000))
+	testutil.WriteFile(t, filepath.Join(root, "pvc-aaa", "sub", "more.bin"), strings.Repeat("y", 500))
+	testutil.WriteFile(t, filepath.Join(root, "pvc-bbb", "vol.bin"), strings.Repeat("z", 2000))
 	// Not a pvc-* dir → ignored entirely.
-	write(t, filepath.Join(root, "provisioning", "junk.bin"), strings.Repeat("j", 9999))
+	testutil.WriteFile(t, filepath.Join(root, "provisioning", "junk.bin"), strings.Repeat("j", 9999))
 
 	c := New(cfg)
 	got, ok := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
@@ -73,7 +74,7 @@ func TestLocalPVDirBytesCache(t *testing.T) {
 	if err := os.MkdirAll(vol, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(vol, "a.bin"), strings.Repeat("x", 100))
+	testutil.WriteFile(t, filepath.Join(vol, "a.bin"), strings.Repeat("x", 100))
 
 	c := New(cfg)
 	got, _ := metricValue(t, c, "node_host_agent_localpv_dir_bytes",
@@ -83,7 +84,7 @@ func TestLocalPVDirBytesCache(t *testing.T) {
 	}
 	// Grow the volume — inside the cache window the old snapshot
 	// is still served.
-	write(t, filepath.Join(vol, "b.bin"), strings.Repeat("y", 400))
+	testutil.WriteFile(t, filepath.Join(vol, "b.bin"), strings.Repeat("y", 400))
 	got, _ = metricValue(t, c, "node_host_agent_localpv_dir_bytes",
 		map[string]string{"node": "node-a", "pvc_volume": "pvc-cache"})
 	if got != 100 {
@@ -111,7 +112,7 @@ func TestLocalPVDirBytesFailedWalkKeepsSnapshot(t *testing.T) {
 	if err := os.MkdirAll(vol, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(vol, "a.bin"), strings.Repeat("x", 100))
+	testutil.WriteFile(t, filepath.Join(vol, "a.bin"), strings.Repeat("x", 100))
 
 	c := New(cfg)
 	got, _ := metricValue(t, c, "node_host_agent_localpv_dir_bytes",

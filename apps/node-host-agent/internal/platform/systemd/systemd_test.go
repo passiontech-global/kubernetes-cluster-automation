@@ -8,65 +8,43 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
-// fake records every argv the client ran and serves canned replies
-// keyed on a substring match of the joined command line.
-type fake struct {
-	cmds  [][]string
-	reply map[string]string // substring → stdout
-	fail  map[string]bool   // substring → error
-}
-
-func (f *fake) run(_ context.Context, argv []string) (string, error) {
-	f.cmds = append(f.cmds, argv)
-	joined := strings.Join(argv, " ")
-	for k := range f.fail {
-		if strings.Contains(joined, k) {
-			return "", errors.New("exit 3")
-		}
-	}
-	for k, v := range f.reply {
-		if strings.Contains(joined, k) {
-			return v, nil
-		}
-	}
-	return "", nil
-}
-
-func newFake() *fake {
-	return &fake{reply: map[string]string{}, fail: map[string]bool{}}
+func newFake() *testutil.FakeExec {
+	return testutil.NewFakeExec()
 }
 
 func TestExecWrapsNsenterUnderHostRoot(t *testing.T) {
 	f := newFake()
-	c := New(Config{HostRoot: "/host", RunCmd: f.run})
+	c := New(Config{HostRoot: "/host", RunCmd: f.Run})
 	if _, err := c.systemctl(context.Background(), "is-active", "k0sworker.service"); err != nil {
 		t.Fatal(err)
 	}
 	want := "nsenter -t 1 -m -u -i -n -p -- systemctl is-active k0sworker.service"
-	if len(f.cmds) != 1 || strings.Join(f.cmds[0], " ") != want {
-		t.Fatalf("argv=%v want [%s]", f.cmds, want)
+	if f.Count() != 1 || f.Nth(0) != want {
+		t.Fatalf("argv=%s want [%s]", f.Joined(), want)
 	}
 }
 
 func TestExecPlainOnHost(t *testing.T) {
 	f := newFake()
-	c := New(Config{HostRoot: "/", RunCmd: f.run})
+	c := New(Config{HostRoot: "/", RunCmd: f.Run})
 	if _, err := c.systemctl(context.Background(), "daemon-reload"); err != nil {
 		t.Fatal(err)
 	}
 	want := "systemctl daemon-reload"
-	if len(f.cmds) != 1 || strings.Join(f.cmds[0], " ") != want {
-		t.Fatalf("argv=%v want [%s]", f.cmds, want)
+	if f.Count() != 1 || f.Nth(0) != want {
+		t.Fatalf("argv=%s want [%s]", f.Joined(), want)
 	}
 }
 
 func TestIsActive(t *testing.T) {
 	f := newFake()
-	f.reply["is-active k0sworker.service"] = "active\n"
-	f.reply["is-active coredns.service"] = "inactive\n"
-	c := New(Config{HostRoot: "/", RunCmd: f.run})
+	f.On("is-active k0sworker.service", "active\n")
+	f.On("is-active coredns.service", "inactive\n")
+	c := New(Config{HostRoot: "/", RunCmd: f.Run})
 	ctx := context.Background()
 	if !c.IsActive(ctx, "k0sworker.service") {
 		t.Fatal("active unit reported down")
@@ -74,7 +52,7 @@ func TestIsActive(t *testing.T) {
 	if c.IsActive(ctx, "coredns.service") {
 		t.Fatal("inactive unit reported up")
 	}
-	f.fail["is-active nebula.service"] = true
+	f.FailOn("is-active nebula.service", errors.New("exit 3"))
 	if c.IsActive(ctx, "nebula.service") {
 		t.Fatal("errored is-active reported up")
 	}
@@ -82,22 +60,22 @@ func TestIsActive(t *testing.T) {
 
 func TestActiveSeparatesStateFromProbeFailure(t *testing.T) {
 	f := newFake()
-	c := New(Config{HostRoot: "/", RunCmd: f.run})
+	c := New(Config{HostRoot: "/", RunCmd: f.Run})
 	ctx := context.Background()
 	// `is-active` exits non-zero for every non-active state — a real
 	// state word on stdout is a definitive "down", NOT a probe error.
-	f.reply["is-active coredns.service"] = "inactive\n"
+	f.On("is-active coredns.service", "inactive\n")
 	if active, err := c.Active(ctx, "coredns.service"); err != nil || active {
 		t.Fatalf("Active(inactive)=%v,%v want false,nil", active, err)
 	}
 	// An error with no state word means the check itself failed —
 	// the caller must see the error, not a bare false.
-	f.fail["is-active dbus.service"] = true
+	f.FailOn("is-active dbus.service", errors.New("exit 3"))
 	if _, err := c.Active(ctx, "dbus.service"); err == nil {
 		t.Fatal("broken systemctl want Active error")
 	}
 	// Garbage output without an error is still not a state word.
-	f.reply["is-active weird.service"] = "??\n"
+	f.On("is-active weird.service", "??\n")
 	if _, err := c.Active(ctx, "weird.service"); err == nil {
 		t.Fatal("unparseable is-active output want Active error")
 	}
@@ -105,9 +83,9 @@ func TestActiveSeparatesStateFromProbeFailure(t *testing.T) {
 
 func TestUnitExists(t *testing.T) {
 	f := newFake()
-	f.reply["LoadState --value k0sworker.service"] = "loaded\n"
-	f.reply["LoadState --value missing.service"] = "not-found\n"
-	c := New(Config{HostRoot: "/", RunCmd: f.run})
+	f.On("LoadState --value k0sworker.service", "loaded\n")
+	f.On("LoadState --value missing.service", "not-found\n")
+	c := New(Config{HostRoot: "/", RunCmd: f.Run})
 	if !c.UnitExists("k0sworker.service") {
 		t.Fatal("present unit reported missing")
 	}
@@ -115,7 +93,7 @@ func TestUnitExists(t *testing.T) {
 		t.Fatal("absent unit reported present")
 	}
 	// Probe failure folds to false for the bool wrapper...
-	f.fail["LoadState --value coredns.service"] = true
+	f.FailOn("LoadState --value coredns.service", errors.New("exit 3"))
 	if c.UnitExists("coredns.service") {
 		t.Fatal("errored LoadState probe reported present")
 	}
@@ -135,7 +113,7 @@ func TestUnitExists(t *testing.T) {
 
 func TestExistsLoadStateClassification(t *testing.T) {
 	f := newFake()
-	c := New(Config{HostRoot: "/", RunCmd: f.run})
+	c := New(Config{HostRoot: "/", RunCmd: f.Run})
 	ctx := context.Background()
 	// Every LoadState word systemd emits: only a working, loaded
 	// definition counts as present — masked/bad-setting/stub units
@@ -159,9 +137,9 @@ func TestExistsLoadStateClassification(t *testing.T) {
 	} {
 		key := "LoadState --value u.service"
 		if tc.state == "" {
-			delete(f.reply, key)
+			f.Clear(key)
 		} else {
-			f.reply[key] = tc.state
+			f.On(key, tc.state)
 		}
 		got, err := c.Exists(ctx, "u.service")
 		if err != nil {
@@ -173,7 +151,7 @@ func TestExistsLoadStateClassification(t *testing.T) {
 	}
 	// rc!=0 is probe failure, not a state answer — Exists reports
 	// the error so callers can fail closed.
-	f.fail["LoadState --value u.service"] = true
+	f.FailOn("LoadState --value u.service", errors.New("exit 3"))
 	if _, err := c.Exists(ctx, "u.service"); err == nil {
 		t.Fatal("rc!=0 LoadState probe want Exists error")
 	}
@@ -188,9 +166,9 @@ func TestActiveAge(t *testing.T) {
 	if err := os.WriteFile(uptime, []byte("10000.25 8000.5\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	f.reply["show -p ActiveEnterTimestampMonotonic --value k0sworker.service"] = "7000000000\n"
-	f.reply["show -p ActiveEnterTimestampMonotonic --value dead.service"] = "0\n"
-	c := New(Config{HostRoot: "/", RunCmd: f.run, ProcUptimeFile: uptime})
+	f.On("show -p ActiveEnterTimestampMonotonic --value k0sworker.service", "7000000000\n")
+	f.On("show -p ActiveEnterTimestampMonotonic --value dead.service", "0\n")
+	c := New(Config{HostRoot: "/", RunCmd: f.Run, ProcUptimeFile: uptime})
 	ctx := context.Background()
 	age, err := c.ActiveAge(ctx, "k0sworker.service")
 	if err != nil {
@@ -202,25 +180,25 @@ func TestActiveAge(t *testing.T) {
 	// The exact argv must ask for the monotonic property — the
 	// formatted ActiveEnterTimestamp carries an unparseable local
 	// zone abbrev.
-	joined := strings.Join(f.cmds[len(f.cmds)-1], " ")
+	joined := f.Last()
 	if !strings.Contains(joined, "ActiveEnterTimestampMonotonic --value k0sworker.service") {
 		t.Fatalf("argv=%q want the monotonic property", joined)
 	}
 	if _, err := c.ActiveAge(ctx, "dead.service"); err == nil {
 		t.Fatal("zero monotonic timestamp want error")
 	}
-	f.reply["show -p ActiveEnterTimestampMonotonic --value bad.service"] = "not-a-number\n"
+	f.On("show -p ActiveEnterTimestampMonotonic --value bad.service", "not-a-number\n")
 	if _, err := c.ActiveAge(ctx, "bad.service"); err == nil {
 		t.Fatal("garbage timestamp want error")
 	}
 	// Unreadable /proc/uptime → error (never settle blind).
-	c2 := New(Config{HostRoot: "/", RunCmd: f.run,
+	c2 := New(Config{HostRoot: "/", RunCmd: f.Run,
 		ProcUptimeFile: filepath.Join(t.TempDir(), "missing")})
 	if _, err := c2.ActiveAge(ctx, "k0sworker.service"); err == nil {
 		t.Fatal("missing uptime file want error")
 	}
 	// A just-started unit: mono == uptime → age clamps at 0.
-	f.reply["show -p ActiveEnterTimestampMonotonic --value fresh.service"] = "10000250000\n"
+	f.On("show -p ActiveEnterTimestampMonotonic --value fresh.service", "10000250000\n")
 	age, err = c.ActiveAge(ctx, "fresh.service")
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +210,7 @@ func TestActiveAge(t *testing.T) {
 
 func TestActionCommands(t *testing.T) {
 	f := newFake()
-	c := New(Config{HostRoot: "/", RunCmd: f.run})
+	c := New(Config{HostRoot: "/", RunCmd: f.Run})
 	ctx := context.Background()
 	for _, call := range []func() error{
 		func() error { return c.Restart(ctx, "k0sworker.service") },
@@ -250,11 +228,11 @@ func TestActionCommands(t *testing.T) {
 		"systemctl kill -s SIGUSR1 coredns.service",
 		"systemctl daemon-reload",
 	}
-	if len(f.cmds) != len(want) {
-		t.Fatalf("cmds=%v", f.cmds)
+	if f.Count() != len(want) {
+		t.Fatalf("cmds=%s", f.Joined())
 	}
 	for i, w := range want {
-		if got := strings.Join(f.cmds[i], " "); got != w {
+		if got := f.Nth(i); got != w {
 			t.Fatalf("cmd[%d]=%q want %q", i, got, w)
 		}
 	}
@@ -262,9 +240,9 @@ func TestActionCommands(t *testing.T) {
 
 func TestJournal(t *testing.T) {
 	f := newFake()
-	f.reply["journalctl -u k0sworker.service --since -10 min --no-pager"] =
-		"Jan 01 00:00:00 node k0sworker[1]: line\n"
-	c := New(Config{HostRoot: "/", RunCmd: f.run, RunCmdCombined: f.run})
+	f.On("journalctl -u k0sworker.service --since -10 min --no-pager",
+		"Jan 01 00:00:00 node k0sworker[1]: line\n")
+	c := New(Config{HostRoot: "/", RunCmd: f.Run, RunCmdCombined: f.Run})
 	out, err := c.Journal(context.Background(), "k0sworker.service", "-10 min")
 	if err != nil {
 		t.Fatal(err)
@@ -279,8 +257,8 @@ func TestJournal(t *testing.T) {
 // integrity check's "corrupt" substring test never fires.
 func TestJournalFoldsStderr(t *testing.T) {
 	combined := newFake()
-	combined.reply["journalctl -u k0sworker.service --since -10 min --no-pager"] =
-		"File /var/log/journal/a.journal is corrupt, ignoring journal files.\n"
+	combined.On("journalctl -u k0sworker.service --since -10 min --no-pager",
+		"File /var/log/journal/a.journal is corrupt, ignoring journal files.\n")
 	stdoutOnlyCalled := false
 	c := New(Config{
 		HostRoot: "/",
@@ -288,7 +266,7 @@ func TestJournalFoldsStderr(t *testing.T) {
 			stdoutOnlyCalled = true
 			return "", nil
 		},
-		RunCmdCombined: combined.run,
+		RunCmdCombined: combined.Run,
 	})
 	out, err := c.Journal(context.Background(), "k0sworker.service", "-10 min")
 	if err != nil {
@@ -306,14 +284,14 @@ func TestJournalFoldsStderr(t *testing.T) {
 // host-namespace wrapping Exec applies.
 func TestExecCombinedWrapsNsenter(t *testing.T) {
 	f := newFake()
-	c := New(Config{HostRoot: "/host", RunCmdCombined: f.run})
+	c := New(Config{HostRoot: "/host", RunCmdCombined: f.Run})
 	if _, err := c.ExecCombined(context.Background(),
 		"journalctl", "-n", "1", "--no-pager"); err != nil {
 		t.Fatal(err)
 	}
 	want := "nsenter -t 1 -m -u -i -n -p -- journalctl -n 1 --no-pager"
-	if len(f.cmds) != 1 || strings.Join(f.cmds[0], " ") != want {
-		t.Fatalf("argv=%v want [%s]", f.cmds, want)
+	if f.Count() != 1 || f.Nth(0) != want {
+		t.Fatalf("argv=%s want [%s]", f.Joined(), want)
 	}
 }
 
@@ -321,16 +299,16 @@ func TestIsEnabledAcceptsEnabledVocabulary(t *testing.T) {
 	// The runner probed `systemctl is-enabled >/dev/null` — rc=0
 	// covers every installed-state word, not just literal "enabled".
 	f := newFake()
-	c := New(Config{HostRoot: "/", RunCmd: f.run})
+	c := New(Config{HostRoot: "/", RunCmd: f.Run})
 	for _, word := range []string{"enabled", "static", "indirect", "alias", "generated", "enabled-runtime", "transient"} {
-		f.reply["is-enabled u.service"] = word + "\n"
+		f.On("is-enabled u.service", word+"\n")
 		if !c.IsEnabled(context.Background(), "u.service") {
 			t.Fatalf("is-enabled %q reported disabled", word)
 		}
 	}
 	// disabled / masked / not-found exit non-zero → off.
-	delete(f.reply, "is-enabled u.service")
-	f.fail["is-enabled u.service"] = true
+	f.Clear("is-enabled u.service")
+	f.FailOn("is-enabled u.service", errors.New("exit 3"))
 	if c.IsEnabled(context.Background(), "u.service") {
 		t.Fatal("disabled unit reported enabled")
 	}

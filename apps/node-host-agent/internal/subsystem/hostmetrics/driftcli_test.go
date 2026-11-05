@@ -1,6 +1,7 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -39,8 +40,8 @@ func TestScanK0sDriftClean(t *testing.T) {
 	dir := t.TempDir()
 	unit := filepath.Join(dir, "k0scontroller.service")
 	config := filepath.Join(dir, "k0s.yaml")
-	write(t, unit, "[Unit]\n")
-	write(t, config, k0sCleanYAML())
+	testutil.WriteFile(t, unit, "[Unit]\n")
+	testutil.WriteFile(t, config, k0sCleanYAML())
 	scan := ScanK0sDrift(K0sDriftConfig{
 		ConfigFile: config,
 		UnitFile:   unit,
@@ -62,9 +63,9 @@ func TestScanK0sDriftFindings(t *testing.T) {
 	dir := t.TempDir()
 	unit := filepath.Join(dir, "k0scontroller.service")
 	config := filepath.Join(dir, "k0s.yaml")
-	write(t, unit, "[Unit]\n")
+	testutil.WriteFile(t, unit, "[Unit]\n")
 	// Removed flag + a bogus extra key inside the otherwise-clean set.
-	write(t, config,
+	testutil.WriteFile(t, config,
 		k0sCleanYAML("concurrent-service-syncs", "bogus-extra-flag"))
 	scan := ScanK0sDrift(K0sDriftConfig{
 		ConfigFile: config,
@@ -89,8 +90,8 @@ func TestScanK0sDriftMissingKey(t *testing.T) {
 	dir := t.TempDir()
 	unit := filepath.Join(dir, "k0scontroller.service")
 	config := filepath.Join(dir, "k0s.yaml")
-	write(t, unit, "[Unit]\n")
-	write(t, config,
+	testutil.WriteFile(t, unit, "[Unit]\n")
+	testutil.WriteFile(t, config,
 		"apiVersion: k0s.k0sproject.io/v1beta1\nkind: ClusterConfig\n"+
 			"spec:\n  controllerManager:\n    extraArgs: {}\n")
 	scan := ScanK0sDrift(K0sDriftConfig{
@@ -111,7 +112,7 @@ func TestScanK0sDriftUnreadable(t *testing.T) {
 	dir := t.TempDir()
 	unit := filepath.Join(dir, "k0scontroller.service")
 	config := filepath.Join(dir, "k0s.yaml")
-	write(t, unit, "[Unit]\n")
+	testutil.WriteFile(t, unit, "[Unit]\n")
 	// Missing file → unreadable finding.
 	scan := ScanK0sDrift(K0sDriftConfig{
 		ConfigFile: config,
@@ -122,7 +123,7 @@ func TestScanK0sDriftUnreadable(t *testing.T) {
 		t.Fatalf("missing file: unreadable=%v", got)
 	}
 	// Unparseable → same finding.
-	write(t, config, "  {not: [valid: yaml\n")
+	testutil.WriteFile(t, config, "  {not: [valid: yaml\n")
 	scan = ScanK0sDrift(K0sDriftConfig{
 		ConfigFile: config,
 		UnitFile:   unit,
@@ -137,8 +138,8 @@ func TestScanK0sDriftCustomSets(t *testing.T) {
 	dir := t.TempDir()
 	unit := filepath.Join(dir, "k0scontroller.service")
 	config := filepath.Join(dir, "k0s.yaml")
-	write(t, unit, "[Unit]\n")
-	write(t, config,
+	testutil.WriteFile(t, unit, "[Unit]\n")
+	testutil.WriteFile(t, config,
 		"spec:\n  controllerManager:\n    extraArgs:\n      a: \"1\"\n      dead-flag: \"2\"\n")
 	scan := ScanK0sDrift(K0sDriftConfig{
 		ConfigFile:   config,

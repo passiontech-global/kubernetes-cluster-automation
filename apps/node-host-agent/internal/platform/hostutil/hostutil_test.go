@@ -11,26 +11,9 @@ import (
 	"testing"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
-
-func readFile(t *testing.T, path string) string {
-	t.Helper()
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	return string(b)
-}
-
-func writeFile(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
 
 func dirNames(t *testing.T, dir string) []string {
 	t.Helper()
@@ -59,7 +42,7 @@ func TestWriteFileAtomicHappyPath(t *testing.T) {
 	if err := WriteFileAtomic(path, "epoch=123\n"); err != nil {
 		t.Fatal(err)
 	}
-	if got := readFile(t, path); got != "epoch=123\n" {
+	if got := testutil.ReadFile(t, path); got != "epoch=123\n" {
 		t.Fatalf("content = %q", got)
 	}
 	// tmp+rename contract: the .tmp-<base> staging file is gone.
@@ -78,7 +61,7 @@ func TestWriteFileAtomicFallbackOnBindMountErrno(t *testing.T) {
 		t.Run(errno.Error(), func(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "hosts")
-			writeFile(t, path, "old-content")
+			testutil.WriteFile(t, path, "old-content")
 
 			var gotOld, gotNew string
 			stubRename(t, func(oldpath, newpath string) error {
@@ -89,7 +72,7 @@ func TestWriteFileAtomicFallbackOnBindMountErrno(t *testing.T) {
 			if err := WriteFileAtomic(path, "new-content"); err != nil {
 				t.Fatal(err)
 			}
-			if got := readFile(t, path); got != "new-content" {
+			if got := testutil.ReadFile(t, path); got != "new-content" {
 				t.Fatalf("direct-write fallback landed %q", got)
 			}
 			wantTmp := filepath.Join(dir, ".tmp-hosts")
@@ -139,7 +122,7 @@ func TestWriteFileDirect(t *testing.T) {
 	if err := WriteFileDirect(path, "xy"); err != nil {
 		t.Fatal(err)
 	}
-	if got := readFile(t, path); got != "xy" {
+	if got := testutil.ReadFile(t, path); got != "xy" {
 		t.Fatalf("content = %q", got)
 	}
 	if err := WriteFileDirect(filepath.Join(dir, "gone", "f"), "x"); err == nil {
@@ -159,7 +142,7 @@ func TestWriteFileAtomicBytes(t *testing.T) {
 	if err := WriteFileAtomicBytes(path, []byte("\x00bytes\xff")); err != nil {
 		t.Fatal(err)
 	}
-	if got := readFile(t, path); got != "\x00bytes\xff" {
+	if got := testutil.ReadFile(t, path); got != "\x00bytes\xff" {
 		t.Fatalf("content = %q", got)
 	}
 }
@@ -177,7 +160,7 @@ func TestUptimeSeconds(t *testing.T) {
 		{"garbage 1", 0, true},
 	} {
 		p := filepath.Join(dir, fmt.Sprintf("up%d", i))
-		writeFile(t, p, tc.content)
+		testutil.WriteFile(t, p, tc.content)
 		got, err := UptimeSeconds(p)
 		if (err != nil) != tc.wantErr {
 			t.Errorf("%q: err=%v, wantErr=%v", tc.content, err, tc.wantErr)
@@ -194,7 +177,7 @@ func TestUptimeSeconds(t *testing.T) {
 func TestReadTrimmed(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "f")
-	writeFile(t, p, "  padded content \n\n")
+	testutil.WriteFile(t, p, "  padded content \n\n")
 	if got := ReadTrimmed(p); got != "padded content" {
 		t.Fatalf("ReadTrimmed = %q", got)
 	}
@@ -206,15 +189,15 @@ func TestReadTrimmed(t *testing.T) {
 func TestReadUintFile(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "n")
-	writeFile(t, p, "1500\n")
+	testutil.WriteFile(t, p, "1500\n")
 	if got, ok := ReadUintFile(p); !ok || got != 1500 {
 		t.Fatalf("ReadUintFile = %d,%v, want 1500,true", got, ok)
 	}
-	writeFile(t, p, "not-a-number")
+	testutil.WriteFile(t, p, "not-a-number")
 	if _, ok := ReadUintFile(p); ok {
 		t.Fatal("garbage content parsed ok")
 	}
-	writeFile(t, p, "-5") // unsigned parse must reject
+	testutil.WriteFile(t, p, "-5") // unsigned parse must reject
 	if _, ok := ReadUintFile(p); ok {
 		t.Fatal("negative content parsed ok")
 	}
@@ -264,11 +247,11 @@ func TestJSONFindIntsCollectsAllMatches(t *testing.T) {
 
 func TestMTUOfIface(t *testing.T) {
 	sysnet := t.TempDir()
-	writeFile(t, filepath.Join(sysnet, "eth0", "mtu"), "1500\n")
+	testutil.WriteFile(t, filepath.Join(sysnet, "eth0", "mtu"), "1500\n")
 	if got, ok := MTUOfIface(sysnet, "eth0"); !ok || got != 1500 {
 		t.Fatalf("MTUOfIface = %d,%v, want 1500,true", got, ok)
 	}
-	writeFile(t, filepath.Join(sysnet, "bad0", "mtu"), "jumbo!")
+	testutil.WriteFile(t, filepath.Join(sysnet, "bad0", "mtu"), "jumbo!")
 	if _, ok := MTUOfIface(sysnet, "bad0"); ok {
 		t.Fatal("unparseable mtu must read ok=false")
 	}
@@ -283,16 +266,16 @@ func TestRuntimeConfigMTU(t *testing.T) {
 
 	// Several mtu keys at different nesting depths — the MAX wins,
 	// deterministic regardless of Go map order.
-	writeFile(t, p, `{"datapath":{"mtu":1450},"mtu":9000,"list":[{"mtu":1280}]}`)
+	testutil.WriteFile(t, p, `{"datapath":{"mtu":1450},"mtu":9000,"list":[{"mtu":1280}]}`)
 	if got, ok := RuntimeConfigMTU(p); !ok || got != 9000 {
 		t.Fatalf("RuntimeConfigMTU = %d,%v, want 9000,true", got, ok)
 	}
 
-	writeFile(t, p, `{"no":"mtu here"}`)
+	testutil.WriteFile(t, p, `{"no":"mtu here"}`)
 	if _, ok := RuntimeConfigMTU(p); ok {
 		t.Fatal("config without mtu must read ok=false")
 	}
-	writeFile(t, p, `not json`)
+	testutil.WriteFile(t, p, `not json`)
 	if _, ok := RuntimeConfigMTU(p); ok {
 		t.Fatal("invalid JSON must read ok=false")
 	}

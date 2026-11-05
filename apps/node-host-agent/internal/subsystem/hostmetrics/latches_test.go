@@ -1,6 +1,7 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,7 +17,7 @@ func TestKernelKeysUsedRatio(t *testing.T) {
 	if _, ok := c.kernelKeysUsedRatio(); ok {
 		t.Fatal("missing key-users reported as ok")
 	}
-	write(t, f,
+	testutil.WriteFile(t, f,
 		"     0: 1234 5678 100 1000000 25000000\n"+
 			"  1000: 42 82000 81000 100000 2500000\n")
 	got, ok := c.kernelKeysUsedRatio()

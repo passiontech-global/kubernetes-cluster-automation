@@ -8,15 +8,15 @@ import (
 	"errors"
 	"io"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestDiscoverParsesBackends(t *testing.T) {
@@ -64,7 +64,7 @@ func TestDiscoverFailCounted(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.Cycle(context.Background())
-	if got := testutil.ToFloat64(p.cycles.WithLabelValues("discover_fail")); got != 1 {
+	if got := promtest.ToFloat64(p.cycles.WithLabelValues("discover_fail")); got != 1 {
 		t.Fatalf("discover_fail=%v want 1", got)
 	}
 }
@@ -271,20 +271,20 @@ func TestSocketFlapAcrossCycles(t *testing.T) {
 	}
 
 	p.Cycle(context.Background())
-	if got := testutil.ToFloat64(p.cycles.WithLabelValues("discover_fail")); got != 1 {
+	if got := promtest.ToFloat64(p.cycles.WithLabelValues("discover_fail")); got != 1 {
 		t.Fatalf("discover_fail=%v want 1 while socket absent", got)
 	}
-	if got := testutil.ToFloat64(p.backendCount); got != 0 {
+	if got := promtest.ToFloat64(p.backendCount); got != 0 {
 		t.Fatalf("backendCount=%v want 0", got)
 	}
 
 	// api-local-lb installed mid-run → the next cycle discovers it.
 	sockDown.Store(false)
 	p.Cycle(context.Background())
-	if got := testutil.ToFloat64(p.cycles.WithLabelValues("ok")); got != 1 {
+	if got := promtest.ToFloat64(p.cycles.WithLabelValues("ok")); got != 1 {
 		t.Fatalf("cycles ok=%v want 1 after socket appeared", got)
 	}
-	if got := testutil.ToFloat64(p.backendCount); got != 1 {
+	if got := promtest.ToFloat64(p.backendCount); got != 1 {
 		t.Fatalf("backendCount=%v want 1", got)
 	}
 }
@@ -306,10 +306,10 @@ func TestMissingSocketGatesDiscovery(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		p.Cycle(context.Background())
 	}
-	if got := testutil.ToFloat64(p.cycles.WithLabelValues("no_socket")); got != 3 {
+	if got := promtest.ToFloat64(p.cycles.WithLabelValues("no_socket")); got != 3 {
 		t.Fatalf("no_socket=%v want 3", got)
 	}
-	if got := testutil.ToFloat64(p.cycles.WithLabelValues("discover_fail")); got != 0 {
+	if got := promtest.ToFloat64(p.cycles.WithLabelValues("discover_fail")); got != 0 {
 		t.Fatalf("discover_fail=%v want 0 — a missing socket is gated, not an error", got)
 	}
 	logs := buf.String()
@@ -340,7 +340,7 @@ func TestSocketGateRecoversWhenSocketAppears(t *testing.T) {
 	}
 
 	p.Cycle(context.Background()) // absent → gated
-	if got := testutil.ToFloat64(p.cycles.WithLabelValues("no_socket")); got != 1 {
+	if got := promtest.ToFloat64(p.cycles.WithLabelValues("no_socket")); got != 1 {
 		t.Fatalf("no_socket=%v want 1", got)
 	}
 
@@ -368,10 +368,10 @@ func TestSocketGateRecoversWhenSocketAppears(t *testing.T) {
 	}()
 
 	p.Cycle(context.Background())
-	if got := testutil.ToFloat64(p.cycles.WithLabelValues("ok")); got != 1 {
+	if got := promtest.ToFloat64(p.cycles.WithLabelValues("ok")); got != 1 {
 		t.Fatalf("cycles ok=%v want 1 after socket appeared", got)
 	}
-	if got := testutil.ToFloat64(p.backendCount); got != 1 {
+	if got := promtest.ToFloat64(p.backendCount); got != 1 {
 		t.Fatalf("backendCount=%v want 1", got)
 	}
 	logs := buf.String()
@@ -393,9 +393,7 @@ func TestBrokenSocketStillErrors(t *testing.T) {
 	// counts and the ERROR line stays.
 	buf := captureSlog(t)
 	sockPath := filepath.Join(t.TempDir(), "not-a-socket")
-	if err := os.WriteFile(sockPath, []byte("regular file"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, sockPath, "regular file")
 	p, err := New(Config{
 		SocketPath:  sockPath,
 		BackendName: "kube_apiserver",
@@ -405,10 +403,10 @@ func TestBrokenSocketStillErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.Cycle(context.Background())
-	if got := testutil.ToFloat64(p.cycles.WithLabelValues("discover_fail")); got != 1 {
+	if got := promtest.ToFloat64(p.cycles.WithLabelValues("discover_fail")); got != 1 {
 		t.Fatalf("discover_fail=%v want 1 — existing-but-broken socket is a real error", got)
 	}
-	if got := testutil.ToFloat64(p.cycles.WithLabelValues("no_socket")); got != 0 {
+	if got := promtest.ToFloat64(p.cycles.WithLabelValues("no_socket")); got != 0 {
 		t.Fatalf("no_socket=%v want 0", got)
 	}
 	if logs := buf.String(); !strings.Contains(logs, "level=ERROR") {

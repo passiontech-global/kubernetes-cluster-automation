@@ -4,6 +4,7 @@ package hostmetrics
 
 import (
 	"encoding/pem"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"testing"
 	"time"
@@ -128,7 +129,7 @@ func TestNebulaCertAbsentEmitsNothing(t *testing.T) {
 
 func TestNebulaCertUnparseableEmitsNothing(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.NebulaCertFile, "-----BEGIN NEBULA CERTIFICATE-----\nnot-base64!!!\n-----END NEBULA CERTIFICATE-----\n")
+	testutil.WriteFile(t, cfg.NebulaCertFile, "-----BEGIN NEBULA CERTIFICATE-----\nnot-base64!!!\n-----END NEBULA CERTIFICATE-----\n")
 	c := New(cfg)
 	if _, ok := metricValue(t, c, "node_host_agent_nebula_cert_days_left", nil); ok {
 		t.Fatal("cert_days_left emitted for garbage PEM")

@@ -3,6 +3,7 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,8 +15,8 @@ func TestNebulaUpWithRoute(t *testing.T) {
 	if err := os.MkdirAll(iface, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(iface, "operstate"), "up\n")
-	write(t, cfg.RouteFile,
+	testutil.WriteFile(t, filepath.Join(iface, "operstate"), "up\n")
+	testutil.WriteFile(t, cfg.RouteFile,
 		"Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"+
 			"eth0\t00000000\t0102A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"+
 			"neb1\t00C0A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n")
@@ -35,8 +36,8 @@ func TestNebulaDownNoRoute(t *testing.T) {
 	if err := os.MkdirAll(iface, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(iface, "operstate"), "down\n")
-	write(t, cfg.RouteFile,
+	testutil.WriteFile(t, filepath.Join(iface, "operstate"), "down\n")
+	testutil.WriteFile(t, cfg.RouteFile,
 		"Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"+
 			"eth0\t00000000\t0102A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n")
 	c := New(cfg)

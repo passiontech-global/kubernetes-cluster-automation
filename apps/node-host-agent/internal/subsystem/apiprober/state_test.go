@@ -13,8 +13,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // --- watchdog state files (module 34 backward-compat contract) ---
@@ -146,9 +147,7 @@ func TestWatchdogPruneRemovesRetiredBackends(t *testing.T) {
 	oldGap := gapFilePath(dir, "10.9.9.9:6443")
 	oldLatch := staleFilePath(dir, "10.9.9.9:6443")
 	for _, f := range []string{oldGap, oldLatch} {
-		if err := os.WriteFile(f, []byte("1\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		testutil.WriteFile(t, f, "1\n")
 	}
 	good.set(50, 50)
 	p.Cycle(context.Background())
@@ -172,9 +171,7 @@ func TestWatchdogNoPruneOnEmptyDiscovery(t *testing.T) {
 	dir := t.TempDir()
 	p.cfg.WatchdogStateDir = dir
 	f := staleFilePath(dir, "10.9.9.9:6443")
-	if err := os.WriteFile(f, []byte("1\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, f, "1\n")
 	p.Cycle(context.Background())
 	if _, err := os.Stat(f); err != nil {
 		t.Fatal("latch pruned on an empty backend list")
@@ -218,7 +215,7 @@ func TestDashedIP(t *testing.T) {
 }
 
 // --- stale-backend pruning (p.states + per-backend metric series) ---
-// Series counts go through testutil.CollectAndCount rather than
+// Series counts go through promtest.CollectAndCount rather than
 // ToFloat64 — a WithLabelValues probe would re-create the very series
 // the prune is supposed to have deleted.
 
@@ -244,8 +241,8 @@ func TestPruneStaleBackendsRemovesStateAndSeries(t *testing.T) {
 	if _, ok := p.states["hub1"]; !ok {
 		t.Fatal("hub1 states entry missing before retire")
 	}
-	if testutil.CollectAndCount(p.probeFailures) != 1 ||
-		testutil.CollectAndCount(p.actions) != 1 {
+	if promtest.CollectAndCount(p.probeFailures) != 1 ||
+		promtest.CollectAndCount(p.actions) != 1 {
 		t.Fatal("expected one hub1 probeFailures/actions series before retire")
 	}
 
@@ -259,18 +256,18 @@ func TestPruneStaleBackendsRemovesStateAndSeries(t *testing.T) {
 	if _, ok := p.states["hub1"]; ok {
 		t.Fatal("stale hub1 states entry survived prune")
 	}
-	if got := testutil.CollectAndCount(p.rvGap); got != 1 {
+	if got := promtest.CollectAndCount(p.rvGap); got != 1 {
 		t.Fatalf("rvGap series=%d want 1 (hub2 only)", got)
 	}
-	if got := testutil.CollectAndCount(p.enabled); got != 1 {
+	if got := promtest.CollectAndCount(p.enabled); got != 1 {
 		t.Fatalf("enabled series=%d want 1 (hub2 only)", got)
 	}
 	// The two-label vecs must lose every series whose backend label
 	// matches — DeletePartialMatch coverage.
-	if got := testutil.CollectAndCount(p.probeFailures); got != 0 {
+	if got := promtest.CollectAndCount(p.probeFailures); got != 0 {
 		t.Fatalf("probeFailures series=%d want 0 after prune", got)
 	}
-	if got := testutil.CollectAndCount(p.actions); got != 0 {
+	if got := promtest.CollectAndCount(p.actions); got != 0 {
 		t.Fatalf("actions series=%d want 0 after prune", got)
 	}
 }
@@ -296,7 +293,7 @@ func TestPruneStaleBackendsSkippedOnEmptyOrFailedDiscovery(t *testing.T) {
 			"probeFailures": p.probeFailures,
 			"actions":       p.actions,
 		} {
-			if got := testutil.CollectAndCount(vec); got != 1 {
+			if got := promtest.CollectAndCount(vec); got != 1 {
 				t.Fatalf("%s series=%d want 1 kept", name, got)
 			}
 		}
@@ -343,7 +340,7 @@ func TestPruneStaleBackendsKeepsVIP(t *testing.T) {
 	if _, ok := p.states["api_datahub_lb"]; !ok {
 		t.Fatal("VIP states entry pruned while still in discovery")
 	}
-	if got := testutil.CollectAndCount(p.enabled); got != 2 {
+	if got := promtest.CollectAndCount(p.enabled); got != 2 {
 		t.Fatalf("enabled series=%d want 2 (ctrl + VIP)", got)
 	}
 }

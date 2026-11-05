@@ -14,6 +14,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // --- dns-fallback (20) ---
@@ -25,18 +26,18 @@ func TestDNSFallbackPinAndRecover(t *testing.T) {
 				Candidates: []string{"10.0.0.1", "10.0.0.2"}},
 		},
 	})
-	writeFile(t, e.resv, "nameserver 10.1.1.1\n")
+	testutil.WriteFile(t, e.resv, "nameserver 10.1.1.1\n")
 	latch := "dns-fallback"
 
 	// All NS fail → counter, no pin yet (need 2 cycles).
 	e.n.Cycle(context.Background())
-	if strings.Contains(readFileT(t, e.hosts), "node-watchdog-dns") {
+	if strings.Contains(testutil.ReadFile(t, e.hosts), "node-watchdog-dns") {
 		t.Fatal("pinned before ConsecNeeded")
 	}
 	// Cycle 2: still failing → pin last-good/candidates that TCP-answer.
 	e.tcpOK["10.0.0.2:6443"] = true
 	e.n.Cycle(context.Background())
-	hosts := readFileT(t, e.hosts)
+	hosts := testutil.ReadFile(t, e.hosts)
 	if !strings.Contains(hosts, "10.0.0.2 api.test.internal") {
 		t.Fatalf("no pin written:\n%s", hosts)
 	}
@@ -46,7 +47,7 @@ func TestDNSFallbackPinAndRecover(t *testing.T) {
 	// DNS recovers → block + pin + latch removed.
 	e.dnsOK["10.1.1.1|api.test.internal"] = "10.0.0.1"
 	e.n.Cycle(context.Background())
-	hosts = readFileT(t, e.hosts)
+	hosts = testutil.ReadFile(t, e.hosts)
 	if strings.Contains(hosts, "node-watchdog-dns") {
 		t.Fatalf("block not removed after recovery:\n%s", hosts)
 	}
@@ -69,15 +70,15 @@ func TestDNSFallbackKeepsDeadPinWithoutReplacement(t *testing.T) {
 				Candidates: []string{"10.0.0.1"}},
 		},
 	})
-	writeFile(t, e.resv, "nameserver 10.1.1.1\n")
+	testutil.WriteFile(t, e.resv, "nameserver 10.1.1.1\n")
 	// Pre-existing pin; DNS fails; candidate unreachable → keep pin.
-	writeFile(t, filepath.Join(e.state, "dnsfb-pin-api.test.internal"),
+	testutil.WriteFile(t, filepath.Join(e.state, "dnsfb-pin-api.test.internal"),
 		"10.0.0.1 api.test.internal\n")
-	writeFile(t, e.hosts, "127.0.0.1 localhost\n# BEGIN node-watchdog-dns\n"+
+	testutil.WriteFile(t, e.hosts, "127.0.0.1 localhost\n# BEGIN node-watchdog-dns\n"+
 		"10.0.0.1 api.test.internal\n# END node-watchdog-dns\n")
 	e.n.Cycle(context.Background())
 	e.n.Cycle(context.Background())
-	if !strings.Contains(readFileT(t, e.hosts), "10.0.0.1 api.test.internal") {
+	if !strings.Contains(testutil.ReadFile(t, e.hosts), "10.0.0.1 api.test.internal") {
 		t.Fatal("dead pin removed — a dead IP beats NXDOMAIN")
 	}
 	if !stateExists(e, "dns-fallback") {
@@ -90,13 +91,13 @@ func TestDNSFallbackKeepsDeadPinWithoutReplacement(t *testing.T) {
 // ordinary content and the rewritten file is well-formed again.
 func TestRenderHostsBlockUnterminatedBegin(t *testing.T) {
 	e := fixture(t, nil)
-	writeFile(t, e.hosts, "127.0.0.1 localhost\n"+
+	testutil.WriteFile(t, e.hosts, "127.0.0.1 localhost\n"+
 		hostsBlockBegin+"\n10.0.0.1 stranded.example\n")
 
 	if !e.n.renderHostsBlock("10.0.0.2 api.y\n") {
 		t.Fatal("unterminated block not rewritten")
 	}
-	hosts := readFileT(t, e.hosts)
+	hosts := testutil.ReadFile(t, e.hosts)
 	if !strings.Contains(hosts, "10.0.0.1 stranded.example") {
 		t.Fatalf("tail after unterminated BEGIN dropped:\n%s", hosts)
 	}
@@ -106,16 +107,16 @@ func TestRenderHostsBlockUnterminatedBegin(t *testing.T) {
 	}
 	// The rewrite is convergent: the next render sees a clean file.
 	if e.n.renderHostsBlock("10.0.0.2 api.y\n") {
-		t.Fatalf("rewrite not idempotent:\n%s", readFileT(t, e.hosts))
+		t.Fatalf("rewrite not idempotent:\n%s", testutil.ReadFile(t, e.hosts))
 	}
 
 	// Removing the block keeps the tail too.
-	writeFile(t, e.hosts, "127.0.0.1 localhost\n"+
+	testutil.WriteFile(t, e.hosts, "127.0.0.1 localhost\n"+
 		hostsBlockBegin+"\n10.0.0.1 stranded.example\n")
 	if !e.n.renderHostsBlock("") {
 		t.Fatal("unterminated block removal not rewritten")
 	}
-	hosts = readFileT(t, e.hosts)
+	hosts = testutil.ReadFile(t, e.hosts)
 	if !strings.Contains(hosts, "10.0.0.1 stranded.example") {
 		t.Fatalf("tail dropped on block removal:\n%s", hosts)
 	}
@@ -135,7 +136,7 @@ func TestRenderHostsBlockTailDropsStaleManagedPins(t *testing.T) {
 				Candidates: []string{"10.0.0.2"}},
 		},
 	})
-	writeFile(t, e.hosts, "127.0.0.1 localhost\n"+
+	testutil.WriteFile(t, e.hosts, "127.0.0.1 localhost\n"+
 		hostsBlockBegin+"\n"+
 		"10.0.0.9 api.test.internal\n"+ // stale pin on a managed name
 		"10.0.0.7 stranded.example\n") // foreign entry — rescued
@@ -143,7 +144,7 @@ func TestRenderHostsBlockTailDropsStaleManagedPins(t *testing.T) {
 	if !e.n.renderHostsBlock("10.0.0.2 api.test.internal\n") {
 		t.Fatal("unterminated block not rewritten")
 	}
-	hosts := readFileT(t, e.hosts)
+	hosts := testutil.ReadFile(t, e.hosts)
 	if !strings.Contains(hosts, "10.0.0.7 stranded.example") {
 		t.Fatalf("foreign tail entry dropped:\n%s", hosts)
 	}
@@ -162,7 +163,7 @@ func TestRenderHostsBlockTailDropsStaleManagedPins(t *testing.T) {
 func TestWriteFileAtomicBusyFallback(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "hosts")
-	writeFile(t, target, "127.0.0.1 localhost\n")
+	testutil.WriteFile(t, target, "127.0.0.1 localhost\n")
 
 	old := hostutil.RenameFile
 	defer func() { hostutil.RenameFile = old }()
@@ -171,7 +172,7 @@ func TestWriteFileAtomicBusyFallback(t *testing.T) {
 	if err := hostutil.WriteFileAtomic(target, "1.2.3.4 pinned.example\n"); err != nil {
 		t.Fatalf("WriteFileAtomic EBUSY fallback failed: %v", err)
 	}
-	if got := readFileT(t, target); got != "1.2.3.4 pinned.example\n" {
+	if got := testutil.ReadFile(t, target); got != "1.2.3.4 pinned.example\n" {
 		t.Fatalf("content after fallback=%q", got)
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".tmp-hosts")); !os.IsNotExist(err) {
@@ -184,20 +185,20 @@ func TestWriteFileAtomicBusyFallback(t *testing.T) {
 	if err := hostutil.WriteFileAtomic(target, "9.9.9.9 evil\n"); !errors.Is(err, unix.EPERM) {
 		t.Fatalf("WriteFileAtomic err=%v want EPERM", err)
 	}
-	if got := readFileT(t, target); got != "1.2.3.4 pinned.example\n" {
+	if got := testutil.ReadFile(t, target); got != "1.2.3.4 pinned.example\n" {
 		t.Fatalf("target overwritten on non-fallback rename error:\n%s", got)
 	}
 }
 
 func TestDNSFallbackEmptyMapCleans(t *testing.T) {
 	e := fixture(t, nil) // empty conf
-	writeFile(t, e.resv, "nameserver 10.1.1.1\n")
-	writeFile(t, e.hosts, "127.0.0.1 localhost\n# BEGIN node-watchdog-dns\n"+
+	testutil.WriteFile(t, e.resv, "nameserver 10.1.1.1\n")
+	testutil.WriteFile(t, e.hosts, "127.0.0.1 localhost\n# BEGIN node-watchdog-dns\n"+
 		"10.0.0.1 api.x\n# END node-watchdog-dns\n")
-	writeFile(t, filepath.Join(e.state, "dnsfb-pin-api.x"), "10.0.0.1 api.x\n")
-	writeFile(t, filepath.Join(e.state, "state-dns-fallback"), "1\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "dnsfb-pin-api.x"), "10.0.0.1 api.x\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "state-dns-fallback"), "1\n")
 	e.n.Cycle(context.Background())
-	if strings.Contains(readFileT(t, e.hosts), "node-watchdog-dns") {
+	if strings.Contains(testutil.ReadFile(t, e.hosts), "node-watchdog-dns") {
 		t.Fatal("block kept with empty map")
 	}
 	if stateExists(e, "dns-fallback") {
@@ -220,7 +221,7 @@ func TestDNSFallbackPrunesFailCounters(t *testing.T) {
 				Candidates: []string{"10.0.0.1"}},
 		},
 	})
-	writeFile(t, e.resv, "nameserver 10.1.1.1\n")
+	testutil.WriteFile(t, e.resv, "nameserver 10.1.1.1\n")
 	// All lookups fail → both names accumulate fail counters.
 	e.n.Cycle(context.Background())
 	if len(e.n.dnsfails) != 2 {
@@ -245,9 +246,9 @@ func TestDNSFallbackPrunesFailCounters(t *testing.T) {
 
 func TestDNSFallbackEmptyMapRemovesAllDNSFBFiles(t *testing.T) {
 	e := fixture(t, nil)
-	writeFile(t, e.resv, "nameserver 10.1.1.1\n")
+	testutil.WriteFile(t, e.resv, "nameserver 10.1.1.1\n")
 	for _, f := range []string{"dnsfb-pin-api.x", "dnsfb-lg-api.x", "dnsfb-ctr-api.x"} {
-		writeFile(t, filepath.Join(e.state, f), "x\n")
+		testutil.WriteFile(t, filepath.Join(e.state, f), "x\n")
 	}
 	e.n.Cycle(context.Background())
 	for _, f := range []string{"dnsfb-pin-api.x", "dnsfb-lg-api.x", "dnsfb-ctr-api.x"} {

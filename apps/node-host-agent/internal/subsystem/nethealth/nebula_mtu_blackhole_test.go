@@ -24,8 +24,8 @@ func nebulaWD() *watchdogconf.Config {
 func mtuEnv(t *testing.T) *env {
 	t.Helper()
 	e := fixture(t, nebulaWD())
-	e.sdReply["is-enabled nebula@interdc"] = "enabled\n"
-	e.sdReply["is-active nebula@interdc"] = "active\n"
+	e.sd.On("is-enabled nebula@interdc", "enabled\n")
+	e.sd.On("is-active nebula@interdc", "active\n")
 	return e
 }
 
@@ -36,7 +36,7 @@ func TestNebulaMTUBlackholeLatch(t *testing.T) {
 	st := n.mtuState()
 	// Small ping OK, DF ping fails → 3 consecutive → latch + clamp.
 	e.pingOK["10.128.0.2|false"] = true
-	e.cmdFail["-M do -s 1252"] = true
+	e.host.FailOn("-M do -s 1252", errCmdFail)
 	for i := 0; i < mtuBlackholeNeeded; i++ {
 		n.checkNebulaMTUBlackhole(ctx, st)
 	}
@@ -45,11 +45,11 @@ func TestNebulaMTUBlackholeLatch(t *testing.T) {
 		t.Fatal("nebula-mtu-blackhole latch missing after 3 DF fails")
 	}
 	// MSS clamp attempted on neb1 (iptables -C fails → -A runs).
-	if !e.cmdRan("clamp-mss-to-pmtu") {
+	if !e.host.Ran("clamp-mss-to-pmtu") {
 		t.Fatal("MSS clamp not attempted")
 	}
 	// DF ping succeeding clears the latch.
-	delete(e.cmdFail, "-M do -s 1252")
+	e.host.Clear("-M do -s 1252")
 	n.checkNebulaMTUBlackhole(ctx, st)
 	if _, err := os.Stat(filepath.Join(e.state,
 		"state-nebula-mtu-blackhole")); !os.IsNotExist(err) {
@@ -73,7 +73,7 @@ func TestNebulaMTUBlackholeNeedsSmallOK(t *testing.T) {
 	// Overlay not active → gated out entirely.
 	n.cfg.Watchdog.OverlayActive = "tinc"
 	n.checkNebulaMTUBlackhole(ctx, st)
-	if e.cmdRan("-M do") {
+	if e.host.Ran("-M do") {
 		t.Fatal("DF probe ran while overlay=tinc")
 	}
 }

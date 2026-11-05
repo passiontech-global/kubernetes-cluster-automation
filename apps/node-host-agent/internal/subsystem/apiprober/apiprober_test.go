@@ -21,8 +21,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // fakeHAProxy is a fake HAProxy admin unix socket: `show stat` returns
@@ -319,9 +320,7 @@ func TestCAPool(t *testing.T) {
 	}
 
 	garbage := filepath.Join(t.TempDir(), "garbage.pem")
-	if err := os.WriteFile(garbage, []byte("not a pem"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, garbage, "not a pem")
 	if _, err := caPool(garbage); err == nil ||
 		!strings.Contains(err.Error(), "no certificates") {
 		t.Fatalf("caPool(garbage) err=%v want 'no certificates'", err)
@@ -330,9 +329,7 @@ func TestCAPool(t *testing.T) {
 
 func TestNewTLSClientBranches(t *testing.T) {
 	garbage := filepath.Join(t.TempDir(), "ca.crt")
-	if err := os.WriteFile(garbage, []byte("not a pem"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, garbage, "not a pem")
 
 	// Verify-TLS + unreadable CA bundle → New fails fast.
 	_, err := New(Config{InsecureTLS: false, CAFile: garbage},
@@ -400,7 +397,7 @@ func TestRunTicksCycles(t *testing.T) {
 	go func() { p.Run(ctx); close(done) }()
 
 	deadline := time.After(5 * time.Second)
-	for testutil.ToFloat64(p.cycles.WithLabelValues("ok")) < 2 {
+	for promtest.ToFloat64(p.cycles.WithLabelValues("ok")) < 2 {
 		select {
 		case <-deadline:
 			t.Fatal("ticker cycles never ran")

@@ -13,14 +13,13 @@ import (
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // dfProbeRan reports whether the DF ping ran against target — the
 // exact argv the W9 probe emits.
 func dfProbeRan(e *env, target string) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for _, c := range e.cmds {
+	for _, c := range e.host.Cmds() {
 		j := strings.Join(c, " ")
 		if strings.Contains(j, "-M do") && strings.Contains(j, "1200") &&
 			strings.HasSuffix(j, " "+target) {
@@ -35,7 +34,7 @@ func dfProbeRan(e *env, target string) bool {
 // nebula-pmtu-blackhole latch enters.
 func TestNebulaPMTUDFProbeLatchesBlackhole(t *testing.T) {
 	e := nebulaEnv(t, nil)
-	e.cmdFail["-M do"] = true // DF ping errors; small pings unaffected
+	e.host.FailOn("-M do", errCmdFail) // DF ping errors; small pings unaffected
 
 	e.n.Cycle(context.Background())
 	if stateExists(e, "nebula-pmtu-blackhole") {
@@ -46,7 +45,7 @@ func TestNebulaPMTUDFProbeLatchesBlackhole(t *testing.T) {
 		t.Fatal("no nebula-pmtu-blackhole latch after ConsecNeeded DF failures")
 	}
 	if !dfProbeRan(e, "10.8.0.1") {
-		t.Fatalf("DF probe did not target the first alive overlay target; cmds=%v", e.cmds)
+		t.Fatalf("DF probe did not target the first alive overlay target; cmds=%v", e.host.Cmds())
 	}
 	// Neither isolated nor degraded may fire — the small pings are
 	// all green; PMTU owns this diagnosis alone.
@@ -59,13 +58,13 @@ func TestNebulaPMTUDFProbeLatchesBlackhole(t *testing.T) {
 // streak and the latch.
 func TestNebulaPMTUClearsOnRecovery(t *testing.T) {
 	e := nebulaEnv(t, nil)
-	e.cmdFail["-M do"] = true
+	e.host.FailOn("-M do", errCmdFail)
 	e.n.Cycle(context.Background())
 	e.n.Cycle(context.Background())
 	if !stateExists(e, "nebula-pmtu-blackhole") {
 		t.Fatal("no latch to clear")
 	}
-	delete(e.cmdFail, "-M do")
+	e.host.Clear("-M do")
 	e.n.Cycle(context.Background())
 	if stateExists(e, "nebula-pmtu-blackhole") {
 		t.Fatal("pmtu latch not cleared after a passing DF probe")
@@ -77,11 +76,11 @@ func TestNebulaPMTUClearsOnRecovery(t *testing.T) {
 // CONSECUTIVE failures.
 func TestNebulaPMTUStreakResetsOnSuccess(t *testing.T) {
 	e := nebulaEnv(t, nil)
-	e.cmdFail["-M do"] = true
+	e.host.FailOn("-M do", errCmdFail)
 	e.n.Cycle(context.Background()) // fail 1
-	delete(e.cmdFail, "-M do")
+	e.host.Clear("-M do")
 	e.n.Cycle(context.Background()) // success → streak reset
-	e.cmdFail["-M do"] = true
+	e.host.FailOn("-M do", errCmdFail)
 	e.n.Cycle(context.Background()) // fail 1 again
 	if stateExists(e, "nebula-pmtu-blackhole") {
 		t.Fatal("latch after an interleaved success — streak did not reset")
@@ -105,7 +104,7 @@ func TestNebulaPMTUSkippedWhenNoAliveTarget(t *testing.T) {
 	if stateExists(e, "nebula-pmtu-blackhole") {
 		t.Fatal("pmtu latch on total overlay failure")
 	}
-	if dfProbeRan(e, "10.8.0.1") || e.cmdRan("-M do") {
+	if dfProbeRan(e, "10.8.0.1") || e.host.Ran("-M do") {
 		t.Fatal("DF probe ran with no alive overlay target")
 	}
 }
@@ -116,14 +115,14 @@ func TestNebulaPMTUClearedWhenOverlayLeavesNebula(t *testing.T) {
 	e := nebulaEnv(t, func(wd *watchdogconf.Config) {
 		wd.OverlayActive = "tinc"
 	})
-	e.cmdFail["-M do"] = true
+	e.host.FailOn("-M do", errCmdFail)
 	// Seed a stale latch — the tinc path must clear it.
-	writeFile(t, e.state+"/state-nebula-pmtu-blackhole", "1\n")
+	testutil.WriteFile(t, e.state+"/state-nebula-pmtu-blackhole", "1\n")
 	e.n.Cycle(context.Background())
 	if stateExists(e, "nebula-pmtu-blackhole") {
 		t.Fatal("pmtu latch kept while tinc is the active overlay")
 	}
-	if e.cmdRan("-M do") {
+	if e.host.Ran("-M do") {
 		t.Fatal("DF probe ran while tinc is the active overlay")
 	}
 }
@@ -135,10 +134,10 @@ func TestNebulaPMTUFirstAliveTarget(t *testing.T) {
 	e := nebulaEnv(t, nil)
 	// 10.8.0.1 dead; 10.8.0.2 + markers alive → probe hits 10.8.0.2.
 	e.pingOK["10.8.0.1|false"] = false
-	e.cmdFail["-M do"] = true
+	e.host.FailOn("-M do", errCmdFail)
 	e.n.Cycle(context.Background())
 	if !dfProbeRan(e, "10.8.0.2") {
-		t.Fatalf("DF probe did not target the first ALIVE target; cmds=%v", e.cmds)
+		t.Fatalf("DF probe did not target the first ALIVE target; cmds=%v", e.host.Cmds())
 	}
 	if dfProbeRan(e, "10.8.0.1") {
 		t.Fatal("DF probe ran against a dead target")

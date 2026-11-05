@@ -8,17 +8,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
-)
 
-func writeFile(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+)
 
 func mkDir(t *testing.T, path string) {
 	t.Helper()
@@ -50,8 +42,8 @@ func TestPIDsListsNumericDirsInFilenameOrder(t *testing.T) {
 	mkDir(t, filepath.Join(root, "self"))
 	mkDir(t, filepath.Join(root, "99999999999999999999"))
 	// Files never count, even numeric-named ones.
-	writeFile(t, filepath.Join(root, "987"), "")
-	writeFile(t, filepath.Join(root, "meminfo"), "x")
+	testutil.WriteFile(t, filepath.Join(root, "987"), "")
+	testutil.WriteFile(t, filepath.Join(root, "meminfo"), "x")
 
 	pids, err := New(root).PIDs()
 	if err != nil {
@@ -81,12 +73,12 @@ func TestPIDsMissingRootErrors(t *testing.T) {
 
 func TestCmdlineSplitsNulSeparatedArgv(t *testing.T) {
 	fs := New(t.TempDir())
-	writeFile(t, fs.File(1, "cmdline"), "agent\x00--root=/host/proc\x00")
+	testutil.WriteFile(t, fs.File(1, "cmdline"), "agent\x00--root=/host/proc\x00")
 	if got, want := fs.Cmdline(1), []string{"agent", "--root=/host/proc"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Cmdline = %v, want %v", got, want)
 	}
 	// No trailing NUL still splits.
-	writeFile(t, fs.File(2, "cmdline"), "a\x00b")
+	testutil.WriteFile(t, fs.File(2, "cmdline"), "a\x00b")
 	if got, want := fs.Cmdline(2), []string{"a", "b"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Cmdline = %v, want %v", got, want)
 	}
@@ -97,7 +89,7 @@ func TestCmdlineSplitsNulSeparatedArgv(t *testing.T) {
 
 func TestEnvValue(t *testing.T) {
 	fs := New(t.TempDir())
-	writeFile(t, fs.File(1, "environ"), "HOME=/root\x00FOO=bar\x00FOOBAR=x\x00EMPTY=\x00")
+	testutil.WriteFile(t, fs.File(1, "environ"), "HOME=/root\x00FOO=bar\x00FOOBAR=x\x00EMPTY=\x00")
 	for _, tc := range []struct {
 		key, want string
 	}{
@@ -113,7 +105,7 @@ func TestEnvValue(t *testing.T) {
 		}
 	}
 	// Key "FOO" must not match entry "FOOBAR=x" — the '=' anchors it.
-	writeFile(t, fs.File(2, "environ"), "FOOBAR=x\x00")
+	testutil.WriteFile(t, fs.File(2, "environ"), "FOOBAR=x\x00")
 	if got := fs.EnvValue(2, "FOO"); got != "" {
 		t.Errorf("EnvValue(FOO) matched FOOBAR=x: %q", got)
 	}
@@ -126,7 +118,7 @@ func TestStatParsesPostCommFields(t *testing.T) {
 	fs := New(t.TempDir())
 	// comm itself contains spaces AND parens — every field must be
 	// read after the LAST ')'.
-	writeFile(t, fs.File(99, "stat"), "99 (weird (name) x) R 7 8\n")
+	testutil.WriteFile(t, fs.File(99, "stat"), "99 (weird (name) x) R 7 8\n")
 	st, ok := fs.Stat(99)
 	if !ok {
 		t.Fatal("Stat ok=false on valid stat")
@@ -146,13 +138,13 @@ func TestStatMalformed(t *testing.T) {
 		"1 (cmd)",         // nothing after the ')'
 		"1 (cmd)   \n",    // only whitespace after the ')'
 	} {
-		writeFile(t, fs.File(100+i, "stat"), content)
+		testutil.WriteFile(t, fs.File(100+i, "stat"), content)
 		if _, ok := fs.Stat(100 + i); ok {
 			t.Errorf("stat %q parsed as ok", content)
 		}
 	}
 	// Misordered parens: fields still parse, but no valid comm.
-	writeFile(t, fs.File(200, "stat"), "200 )bad( S 2")
+	testutil.WriteFile(t, fs.File(200, "stat"), "200 )bad( S 2")
 	st, ok := fs.Stat(200)
 	if !ok {
 		t.Fatal("misordered parens must still yield fields")
@@ -168,8 +160,8 @@ func TestStatMalformed(t *testing.T) {
 
 func TestLive(t *testing.T) {
 	fs := New(t.TempDir())
-	writeFile(t, fs.File(100, "stat"), "100 (z) Z 1")
-	writeFile(t, fs.File(200, "stat"), "200 (s) S 1")
+	testutil.WriteFile(t, fs.File(100, "stat"), "100 (z) Z 1")
+	testutil.WriteFile(t, fs.File(200, "stat"), "200 (s) S 1")
 	mkDir(t, fs.File(300)) // pid dir with no stat — fail-open case
 
 	var lastPid int
@@ -212,13 +204,13 @@ func TestLive(t *testing.T) {
 
 func TestPPID(t *testing.T) {
 	fs := New(t.TempDir())
-	writeFile(t, fs.File(1, "stat"), "1 (bash) S 1234 9 10")
+	testutil.WriteFile(t, fs.File(1, "stat"), "1 (bash) S 1234 9 10")
 	if got, ok := fs.PPID(1); !ok || got != 1234 {
 		t.Fatalf("PPID = %d,%v, want 1234,true", got, ok)
 	}
-	writeFile(t, fs.File(2, "stat"), "2 (x) S")     // no field 4
-	writeFile(t, fs.File(3, "stat"), "3 (x) S abc") // unparseable ppid
-	writeFile(t, fs.File(4, "stat"), "4 (x) S -1")  // negative ppid
+	testutil.WriteFile(t, fs.File(2, "stat"), "2 (x) S")     // no field 4
+	testutil.WriteFile(t, fs.File(3, "stat"), "3 (x) S abc") // unparseable ppid
+	testutil.WriteFile(t, fs.File(4, "stat"), "4 (x) S -1")  // negative ppid
 	for _, pid := range []int{2, 3, 4, 5 /* stat missing */} {
 		if got, ok := fs.PPID(pid); ok {
 			t.Errorf("PPID(%d) = %d,true, want ok=false", pid, got)
@@ -244,7 +236,7 @@ func TestAge(t *testing.T) {
 
 func TestUptimeSeconds(t *testing.T) {
 	root := t.TempDir()
-	writeFile(t, filepath.Join(root, "uptime"), "12345.67 89012.34\n")
+	testutil.WriteFile(t, filepath.Join(root, "uptime"), "12345.67 89012.34\n")
 	if got, err := New(root).UptimeSeconds(); err != nil || got != 12345.67 {
 		t.Fatalf("UptimeSeconds = %v,%v, want 12345.67,nil", got, err)
 	}
@@ -257,9 +249,9 @@ func TestPIDAgeSeconds(t *testing.T) {
 	root := t.TempDir()
 	fs := New(root)
 	// 20 post-comm fields; Fields[19]=starttime=1000 jiffies.
-	writeFile(t, fs.File(42, "stat"),
+	testutil.WriteFile(t, fs.File(42, "stat"),
 		"42 (agent) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 1000")
-	writeFile(t, filepath.Join(root, "uptime"), "100.00 400.00")
+	testutil.WriteFile(t, filepath.Join(root, "uptime"), "100.00 400.00")
 
 	// clkTck 100 → start = 10s after boot, uptime 100s → age 90s.
 	got, err := fs.PIDAgeSeconds(42, 100)
@@ -268,7 +260,7 @@ func TestPIDAgeSeconds(t *testing.T) {
 	}
 
 	// Stat jiffies ahead of uptime clamps to 0, never negative.
-	writeFile(t, filepath.Join(root, "uptime"), "5.0 0.0")
+	testutil.WriteFile(t, filepath.Join(root, "uptime"), "5.0 0.0")
 	if got, err := fs.PIDAgeSeconds(42, 100); err != nil || got != 0 {
 		t.Fatalf("negative age = %v,%v, want clamped 0,nil", got, err)
 	}
@@ -277,11 +269,11 @@ func TestPIDAgeSeconds(t *testing.T) {
 func TestPIDAgeSecondsBadInput(t *testing.T) {
 	root := t.TempDir()
 	fs := New(root)
-	writeFile(t, fs.File(2, "stat"), "2 no paren") // no ')'
-	writeFile(t, fs.File(3, "stat"), "3 (x) S 1 2")
-	writeFile(t, fs.File(4, "stat"),
+	testutil.WriteFile(t, fs.File(2, "stat"), "2 no paren") // no ')'
+	testutil.WriteFile(t, fs.File(3, "stat"), "3 (x) S 1 2")
+	testutil.WriteFile(t, fs.File(4, "stat"),
 		"4 (x) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 1000")
-	writeFile(t, fs.File(5, "stat"),
+	testutil.WriteFile(t, fs.File(5, "stat"),
 		"5 (x) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 junk")
 	for _, pid := range []int{1 /* missing */, 2 /* bad */, 3 /* short */, 5 /* bad starttime */} {
 		if _, err := fs.PIDAgeSeconds(pid, 100); err == nil {
@@ -297,9 +289,9 @@ func TestPIDAgeSecondsBadInput(t *testing.T) {
 func TestFindByComm(t *testing.T) {
 	root := t.TempDir()
 	fs := New(root)
-	writeFile(t, fs.File(50, "comm"), "other\n")
-	writeFile(t, fs.File(100, "comm"), "target\n") // trailing newline trimmed
-	writeFile(t, fs.File(200, "comm"), "target")
+	testutil.WriteFile(t, fs.File(50, "comm"), "other\n")
+	testutil.WriteFile(t, fs.File(100, "comm"), "target\n") // trailing newline trimmed
+	testutil.WriteFile(t, fs.File(200, "comm"), "target")
 	mkDir(t, fs.File(300)) // pid dir with no comm file — skipped
 
 	// Both 100 and 200 match — lowest pid wins (pgrep|head -1 parity).

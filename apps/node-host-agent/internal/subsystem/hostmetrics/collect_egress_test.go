@@ -3,6 +3,7 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"path/filepath"
 	"testing"
 )
@@ -12,8 +13,8 @@ import (
 func TestEgressRelayGauge(t *testing.T) {
 	cfg, dirs := fixture(t)
 	cfg.EgressRelays = []string{"8.8.8.8", "1.1.1.1"}
-	write(t, filepath.Join(dirs["state"], "egress-state-8.8.8.8"), "relay\n")
-	write(t, filepath.Join(dirs["state"], "egress-state-1.1.1.1"), "direct\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "egress-state-8.8.8.8"), "relay\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "egress-state-1.1.1.1"), "direct\n")
 	c := New(cfg)
 	if v, ok := metricValue(t, c, "node_overlay_egress_relay_active",
 		map[string]string{"target": "8.8.8.8"}); !ok || v != 1 {
@@ -32,8 +33,8 @@ func TestEgressRelayGauge(t *testing.T) {
 func TestEgressRelayLegacyAlias(t *testing.T) {
 	cfg, dirs := fixture(t)
 	cfg.EgressRelays = []string{"8.8.8.8", "1.1.1.1"}
-	write(t, filepath.Join(dirs["state"], "egress-state-8.8.8.8"), "relay\n")
-	write(t, filepath.Join(dirs["state"], "egress-state-1.1.1.1"), "direct\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "egress-state-8.8.8.8"), "relay\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "egress-state-1.1.1.1"), "direct\n")
 	c := New(cfg)
 
 	if v, ok := metricValue(t, c, "node_watchdog_egress_relay",

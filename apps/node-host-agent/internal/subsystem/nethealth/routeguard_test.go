@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
@@ -210,11 +212,11 @@ func TestScanDeleteEventsDevMissing(t *testing.T) {
 // still work).
 func TestNebulaIfindex(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "neb1", "ifindex"), "9\n")
+	testutil.WriteFile(t, filepath.Join(dir, "neb1", "ifindex"), "9\n")
 	if got := nebulaIfindex(dir, "neb1"); got != 9 {
 		t.Fatalf("ifindex=%d want 9", got)
 	}
-	writeFile(t, filepath.Join(dir, "junk", "ifindex"), "abc\n")
+	testutil.WriteFile(t, filepath.Join(dir, "junk", "ifindex"), "abc\n")
 	if got := nebulaIfindex(dir, "junk"); got != 0 {
 		t.Fatalf("garbage ifindex=%d want 0", got)
 	}
@@ -237,7 +239,7 @@ func TestNebulaRouteFilterFromConf(t *testing.T) {
 		OverlayEgressTable: 105,
 	})
 	sysdir := t.TempDir()
-	writeFile(t, filepath.Join(sysdir, "neb9", "ifindex"), "9\n")
+	testutil.WriteFile(t, filepath.Join(sysdir, "neb9", "ifindex"), "9\n")
 	e.n.cfg.sysClassNet = sysdir
 	f := e.n.nebulaRouteFilter()
 	if f.nebIf != 9 {
@@ -308,7 +310,7 @@ func TestOpenRouteNetlinkSetnsAndHostRootFallback(t *testing.T) {
 	old := routeInitNetns
 	defer func() { routeInitNetns = old }()
 	init := filepath.Join(t.TempDir(), "net")
-	writeFile(t, init, "")
+	testutil.WriteFile(t, init, "")
 	routeInitNetns = init
 
 	// No mounted host /proc → the setns error propagates.
@@ -323,7 +325,7 @@ func TestOpenRouteNetlinkSetnsAndHostRootFallback(t *testing.T) {
 	// Mounted host /proc under hostRoot → attempted as last resort.
 	root := t.TempDir()
 	fake := filepath.Join(root, "proc/1/ns/net")
-	writeFile(t, fake, "")
+	testutil.WriteFile(t, fake, "")
 	fd, err := openRouteNetlink(root)
 	if fd >= 0 {
 		_ = unix.Close(fd)
@@ -443,20 +445,20 @@ func routeGuardFixture(t *testing.T) *env {
 	// No real sysfs — the event filter arms with nebIf=0 unless the
 	// test plants an ifindex file (table/pref matching always on).
 	e.n.cfg.sysClassNet = t.TempDir()
-	writeFile(t, filepath.Join(root, "etc/nebula/interdc/nebula-up.sh"),
+	testutil.WriteFile(t, filepath.Join(root, "etc/nebula/interdc/nebula-up.sh"),
 		"#!/bin/bash\nexit 0\n")
-	e.sdReply["is-active nebula@interdc"] = "active\n"
+	e.sd.On("is-active nebula@interdc", "active\n")
 	return e
 }
 
 func restoredCount(e *env) float64 {
-	return testutil.ToFloat64(
+	return promtest.ToFloat64(
 		e.n.actions.WithLabelValues(checkRouteGuard, "restored"))
 }
 
 func execCount(e *env, sub string) int {
 	n := 0
-	for _, c := range e.cmds {
+	for _, c := range e.host.Cmds() {
 		if strings.Contains(strings.Join(c, " "), sub) {
 			n++
 		}
@@ -468,7 +470,7 @@ func TestRouteGuardRestoreExecsScript(t *testing.T) {
 	e := routeGuardFixture(t)
 	e.n.restoreRouteGuard(context.Background())
 	if execCount(e, "nebula-up.sh") != 1 {
-		t.Fatalf("nebula-up.sh execs=%v", e.cmds)
+		t.Fatalf("nebula-up.sh execs=%v", e.host.Cmds())
 	}
 	if got := restoredCount(e); got != 1 {
 		t.Fatalf("restored metric=%v want 1", got)
@@ -481,10 +483,10 @@ func TestRouteGuardRestoreExecsScript(t *testing.T) {
 
 func TestRouteGuardRestoreUnitDownNoExec(t *testing.T) {
 	e := routeGuardFixture(t)
-	delete(e.sdReply, "is-active nebula@interdc") // is-active fails
+	e.sd.Clear("is-active nebula@interdc") // is-active fails
 	e.n.restoreRouteGuard(context.Background())
 	if execCount(e, "nebula-up.sh") != 0 {
-		t.Fatalf("restore ran while nebula inactive: %v", e.cmds)
+		t.Fatalf("restore ran while nebula inactive: %v", e.host.Cmds())
 	}
 	if got := restoredCount(e); got != 0 {
 		t.Fatalf("restored=%v want 0", got)
@@ -495,16 +497,16 @@ func TestRouteGuardRestoreMissingScriptNoOp(t *testing.T) {
 	e := fixture(t, &watchdogconf.Config{NebulaNet: "interdc"})
 	root := filepath.Dir(e.state)
 	e.n.cfg.HostRoot = root // no nebula-up.sh under root
-	e.sdReply["is-active nebula@interdc"] = "active\n"
+	e.sd.On("is-active nebula@interdc", "active\n")
 	e.n.restoreRouteGuard(context.Background())
 	if execCount(e, "nebula-up.sh") != 0 {
-		t.Fatalf("restore ran without script: %v", e.cmds)
+		t.Fatalf("restore ran without script: %v", e.host.Cmds())
 	}
 	// The script stat gates before the systemd probe — no
 	// is-active call should have leaked either.
-	for _, c := range e.sdcmds {
+	for _, c := range e.sd.Cmds() {
 		if strings.Contains(strings.Join(c, " "), "is-active") {
-			t.Fatalf("is-active probed without script: %v", e.sdcmds)
+			t.Fatalf("is-active probed without script: %v", e.sd.Cmds())
 		}
 	}
 }
@@ -514,21 +516,21 @@ func TestRouteGuardRestoreSigDisabled(t *testing.T) {
 	e.n.cfg.Watchdog.Disabled = map[string]bool{"route-guard": true}
 	e.n.restoreRouteGuard(context.Background())
 	if execCount(e, "nebula-up.sh") != 0 {
-		t.Fatalf("restore ran despite WD_SIG_ROUTE_GUARD=off: %v", e.cmds)
+		t.Fatalf("restore ran despite WD_SIG_ROUTE_GUARD=off: %v", e.host.Cmds())
 	}
 }
 
 func TestRouteGuardRestoreExecFailureNotCounted(t *testing.T) {
 	e := routeGuardFixture(t)
-	e.cmdFail["nebula-up.sh"] = true
+	e.host.FailOn("nebula-up.sh", errCmdFail)
 	e.n.restoreRouteGuard(context.Background())
 	if execCount(e, "nebula-up.sh") != 1 {
-		t.Fatalf("script not attempted: %v", e.cmds)
+		t.Fatalf("script not attempted: %v", e.host.Cmds())
 	}
 	if got := restoredCount(e); got != 0 {
 		t.Fatalf("restored=%v want 0 on failure", got)
 	}
-	if got := testutil.ToFloat64(e.n.cycles.WithLabelValues(
+	if got := promtest.ToFloat64(e.n.cycles.WithLabelValues(
 		checkRouteGuard, "restore_error")); got != 1 {
 		t.Fatalf("restore_error metric=%v want 1", got)
 	}
@@ -546,7 +548,7 @@ func TestRouteGuardEventDrivesRestore(t *testing.T) {
 	// Deterministic neb1 ifindex (7) — the CNI-noise deletes below
 	// use foreign oif 42.
 	sysdir := t.TempDir()
-	writeFile(t, filepath.Join(sysdir, "neb1", "ifindex"), "7\n")
+	testutil.WriteFile(t, filepath.Join(sysdir, "neb1", "ifindex"), "7\n")
 	e.n.cfg.sysClassNet = sysdir
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -612,7 +614,7 @@ func TestRouteGuardEventDrivesRestore(t *testing.T) {
 	wg.Wait()
 	// After cancel, reading the fake's command log is race-free.
 	if execCount(e, "nebula-up.sh") < 3 {
-		t.Fatalf("netlink DEL events did not re-run the script: %v", e.cmds)
+		t.Fatalf("netlink DEL events did not re-run the script: %v", e.host.Cmds())
 	}
 }
 
@@ -660,13 +662,13 @@ func TestRouteGuardBindFailureStillRestores(t *testing.T) {
 	}()
 	waitForCond(t, 2*time.Second, func() bool { return restoredCount(e) >= 1 })
 	waitForCond(t, 2*time.Second, func() bool {
-		return testutil.ToFloat64(e.n.cycles.WithLabelValues(
+		return promtest.ToFloat64(e.n.cycles.WithLabelValues(
 			checkRouteGuard, "open_error")) >= 1
 	})
 	cancel()
 	wg.Wait()
 	if execCount(e, "nebula-up.sh") < 1 {
-		t.Fatalf("bind failure skipped the gated restore: %v", e.cmds)
+		t.Fatalf("bind failure skipped the gated restore: %v", e.host.Cmds())
 	}
 	if !strings.Contains(logLines(t, e), "netlink socket failed") {
 		t.Fatalf("missing bind-failure log:\n%s", logLines(t, e))

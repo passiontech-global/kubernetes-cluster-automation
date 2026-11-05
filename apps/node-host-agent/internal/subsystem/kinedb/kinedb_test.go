@@ -5,73 +5,18 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
-
-// rule is one fake-runner reply: first matching substring wins.
-type rule struct {
-	substr string
-	reply  string
-	err    error
-}
-
-// fakeRun records every argv + stdin and replies by ordered
-// substring rules — the same seam style as nethealth's env fixture.
-type fakeRun struct {
-	mu     sync.Mutex
-	cmds   [][]string
-	stdins []string
-	rules  []rule
-}
-
-func (f *fakeRun) run(_ context.Context, argv []string, stdin string) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.cmds = append(f.cmds, append([]string{}, argv...))
-	f.stdins = append(f.stdins, stdin)
-	j := strings.Join(argv, " ")
-	for _, r := range f.rules {
-		if strings.Contains(j, r.substr) {
-			return r.reply, r.err
-		}
-	}
-	return "", nil
-}
-
-func (f *fakeRun) joined() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var b strings.Builder
-	for _, c := range f.cmds {
-		b.WriteString(strings.Join(c, " "))
-		b.WriteByte('\n')
-	}
-	return b.String()
-}
-
-// lastStdin returns the stdin of the last recorded command ("" if the
-// runner never saw stdin).
-func (f *fakeRun) lastStdin() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for i := len(f.stdins) - 1; i >= 0; i-- {
-		if f.stdins[i] != "" {
-			return f.stdins[i]
-		}
-	}
-	return ""
-}
 
 const testNow = 1700000000
 
 // fixture builds a KineDB with temp paths, a fake runner and a frozen
 // clock. rules answer commands in order.
-func fixture(t *testing.T, rules []rule) (*KineDB, *fakeRun, string) {
+func fixture(t *testing.T, rules []testutil.ExecRule) (*KineDB, *testutil.FakeExec, string) {
 	t.Helper()
 	dir := t.TempDir()
 	envFile := filepath.Join(dir, ".env")
@@ -79,7 +24,7 @@ func fixture(t *testing.T, rules []rule) (*KineDB, *fakeRun, string) {
 		[]byte("POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	fr := &fakeRun{rules: rules}
+	fr := testutil.NewFakeExec(rules...)
 	k, err := New(Config{
 		Enabled:       true,
 		EnvFile:       envFile,
@@ -87,7 +32,7 @@ func fixture(t *testing.T, rules []rule) (*KineDB, *fakeRun, string) {
 		GuardStateDir: filepath.Join(dir, "guard"),
 		Runtime:       "podman",
 		nowFn:         func() time.Time { return time.Unix(testNow, 0) },
-		run:           fr.run,
+		run:           fr.RunStdin,
 		wireFn:        func(context.Context, string) bool { return true },
 	}, nil)
 	if err != nil {
@@ -245,10 +190,10 @@ func TestDiscoverContainer(t *testing.T) {
 	// Preferred name gone → auto-discover the running postgres-ish
 	// container that is not pgbouncer (the 2026-10-01 rename
 	// resilience).
-	k, _, _ := fixture(t, []rule{
-		{substr: "inspect kine-postgres", err: errors.New("no such container")},
-		{substr: "ps --format", reply: "kine-pgbouncer\npercona-postgres\ncleanup-old\n"},
-		{substr: "inspect -f", reply: "true"},
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect kine-postgres", Err: errors.New("no such container")},
+		{Substr: "ps --format", Out: "kine-pgbouncer\npercona-postgres\ncleanup-old\n"},
+		{Substr: "inspect -f", Out: "true"},
 	})
 	pg := k.pgContainerName(context.Background())
 	if pg != "percona-postgres" {

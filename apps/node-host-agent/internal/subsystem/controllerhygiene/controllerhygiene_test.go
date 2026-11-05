@@ -16,6 +16,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/etcdmaint"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/eventpurge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // env is the fixture: tempdir host trees + stubbed externals + a
@@ -109,9 +110,9 @@ func fixture(t *testing.T) *env {
 			t.Fatal(err)
 		}
 	}
-	writeFile(t, e.unit, "[Service]\nExecStart=/usr/bin/k0s controller\n")
+	testutil.WriteFile(t, e.unit, "[Service]\nExecStart=/usr/bin/k0s controller\n")
 	// Past the 20min uptime gate by default.
-	writeFile(t, filepath.Join(e.proc, "uptime"), "86400.00 12345.00\n")
+	testutil.WriteFile(t, filepath.Join(e.proc, "uptime"), "86400.00 12345.00\n")
 
 	h, err := New(Config{
 		Enabled:               true,
@@ -191,16 +192,6 @@ func fixture(t *testing.T) *env {
 	return e
 }
 
-func writeFile(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // setRV scripts a LIST response for an endpoint: "self"|"peer",
 // cached or consistent.
 func (e *env) setRV(ep string, cached bool, rv int64, ok bool) {
@@ -218,8 +209,8 @@ func (e *env) mkProc(t *testing.T, pid int, comm string, args []string, age floa
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, filepath.Join(d, "comm"), comm+"\n")
-	writeFile(t, filepath.Join(d, "cmdline"), strings.Join(args, "\x00")+"\x00")
+	testutil.WriteFile(t, filepath.Join(d, "comm"), comm+"\n")
+	testutil.WriteFile(t, filepath.Join(d, "cmdline"), strings.Join(args, "\x00")+"\x00")
 	// starttime = field 22 (index 19 after ')') in jiffies.
 	start := int64((86400.0 - age) * clkTck)
 	fields := make([]string, 20)
@@ -228,7 +219,7 @@ func (e *env) mkProc(t *testing.T, pid int, comm string, args []string, age floa
 	}
 	fields[0] = "S" // state
 	fields[19] = strconv.FormatInt(start, 10)
-	writeFile(t, filepath.Join(d, "stat"),
+	testutil.WriteFile(t, filepath.Join(d, "stat"),
 		fmt.Sprintf("%d (%s) %s", pid, comm, strings.Join(fields, " ")))
 }
 
@@ -246,7 +237,7 @@ func (e *env) mkSock(t *testing.T, pid int, fd int, inode string, dbPort int) {
 	}
 	tcp := filepath.Join(e.proc, strconv.Itoa(pid), "net", "tcp")
 	if _, err := os.Stat(tcp); os.IsNotExist(err) {
-		writeFile(t, tcp, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+		testutil.WriteFile(t, tcp, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
 	}
 	f, err := os.OpenFile(tcp, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -283,7 +274,7 @@ func TestShouldRun(t *testing.T) {
 	if ShouldRun(root) {
 		t.Fatal("expected false without unit file")
 	}
-	writeFile(t, filepath.Join(root, "etc/systemd/system/k0scontroller.service"), "[Service]\n")
+	testutil.WriteFile(t, filepath.Join(root, "etc/systemd/system/k0scontroller.service"), "[Service]\n")
 	if !ShouldRun(root) {
 		t.Fatal("expected true with unit file")
 	}
@@ -303,7 +294,7 @@ func TestCycleGated(t *testing.T) {
 
 func TestUptimeGate(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.proc, "uptime"), "300.00 1.00\n")
+	testutil.WriteFile(t, filepath.Join(e.proc, "uptime"), "300.00 1.00\n")
 	e.setRV("127.0.0.1:6443", false, 100000, true)
 	e.setRV("127.0.0.1:6443", true, 1, true)
 	e.h.Cycle(context.Background())

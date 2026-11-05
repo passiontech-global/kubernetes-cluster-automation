@@ -3,6 +3,7 @@ package kinedb
 import (
 	"context"
 	"errors"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"strings"
 	"testing"
 )
@@ -26,16 +27,16 @@ func TestDeadTuplePct(t *testing.T) {
 // the bash measured indexes directly; total−heap inflates on TOAST).
 // dead 800000/(800000+800000) = 50%, heap 300MB > 200MB → repack
 // fires.
-var maintBloatRules = []rule{
-	{substr: "inspect", reply: "true"},
-	{substr: "pg_repack -h", reply: "ok"},
-	{substr: "pg_repack", reply: "/usr/pgsql-16/bin/pg_repack\n"},
-	{substr: "REINDEX TABLE CONCURRENTLY", reply: "REINDEX\n"},
-	{substr: "pg_indexes_size", reply: "300000000|14572800|800000|800000\n"},
+var maintBloatRules = []testutil.ExecRule{
+	{Substr: "inspect", Out: "true"},
+	{Substr: "pg_repack -h", Out: "ok"},
+	{Substr: "pg_repack", Out: "/usr/pgsql-16/bin/pg_repack\n"},
+	{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+	{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
 	// W8-CP2 headroom gate: 0 WAL bytes, 100GiB free — ample for the
 	// 300MB heap (needs >= 2.5*heap).
-	{substr: "pg_ls_waldir", reply: "0\n"},
-	{substr: "df", reply: "Avail\n107374182400\n"},
+	{Substr: "pg_ls_waldir", Out: "0\n"},
+	{Substr: "df", Out: "Avail\n107374182400\n"},
 }
 
 func TestMaintCycleRepacksWhenBloated(t *testing.T) {
@@ -47,7 +48,7 @@ func TestMaintCycleRepacksWhenBloated(t *testing.T) {
 	if res.heapBytes != 300000000 || res.indexBytes != 14572800 || res.deadPct != 50 {
 		t.Fatalf("res=%+v", res)
 	}
-	j := fr.joined()
+	j := fr.Joined()
 	if !strings.Contains(j,
 		"pg_repack -h 127.0.0.1 -U postgres -d postgres -t public.kine --no-superuser-check --no-order") {
 		t.Fatalf("repack argv wrong:\n%s", j)
@@ -78,30 +79,30 @@ func TestMaintCycleRepacksWhenBloated(t *testing.T) {
 }
 
 func TestMaintCycleSkipsRepackBelowThreshold(t *testing.T) {
-	k, fr, _ := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "REINDEX TABLE CONCURRENTLY", reply: "REINDEX\n"},
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
 		// dead 1% on a huge heap → no repack (autovacuum copes).
-		{substr: "pg_indexes_size", reply: "500000000|14572800|10000|800000\n"},
+		{Substr: "pg_indexes_size", Out: "500000000|14572800|10000|800000\n"},
 	})
 	res := k.maintCycle(context.Background())
 	if res.repackState != "skipped" {
 		t.Fatalf("repackState=%s", res.repackState)
 	}
-	if strings.Contains(fr.joined(), "pg_repack") {
+	if strings.Contains(fr.Joined(), "pg_repack") {
 		t.Fatal("repack ran below threshold")
 	}
 }
 
 func TestMaintCycleRepackMissingBinary(t *testing.T) {
-	k, fr, _ := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "REINDEX TABLE CONCURRENTLY", reply: "REINDEX\n"},
-		{substr: "pg_indexes_size", reply: "300000000|14572800|800000|800000\n"},
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
 		// headroom gate passes, then repackGlob finds nothing →
 		// empty reply.
-		{substr: "pg_ls_waldir", reply: "0\n"},
-		{substr: "df", reply: "Avail\n107374182400\n"},
+		{Substr: "pg_ls_waldir", Out: "0\n"},
+		{Substr: "df", Out: "Avail\n107374182400\n"},
 	})
 	res := k.maintCycle(context.Background())
 	if res.repackState != "no-binary" {
@@ -112,26 +113,26 @@ func TestMaintCycleRepackMissingBinary(t *testing.T) {
 		// shell (ok_repack stays 1).
 		t.Fatal("no-binary should keep repack ok")
 	}
-	if strings.Contains(fr.joined(), " --no-superuser-check") {
+	if strings.Contains(fr.Joined(), " --no-superuser-check") {
 		t.Fatal("repack ran without a binary")
 	}
 }
 
 func TestMaintCycleRepackSkippedOnLowHeadroom(t *testing.T) {
-	k, fr, _ := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "REINDEX TABLE CONCURRENTLY", reply: "REINDEX\n"},
-		{substr: "pg_indexes_size", reply: "300000000|14572800|800000|800000\n"},
-		{substr: "pg_ls_waldir", reply: "50000000\n"},
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
+		{Substr: "pg_ls_waldir", Out: "50000000\n"},
 		// 800MB free < 2.5*(300MB heap + 50MB wal) = 875MB →
 		// VACUUM-only fallback, no repack.
-		{substr: "df", reply: "Avail\n800000000\n"},
+		{Substr: "df", Out: "Avail\n800000000\n"},
 	})
 	res := k.maintCycle(context.Background())
 	if res.repackState != "skipped-headroom" {
 		t.Fatalf("repackState=%s", res.repackState)
 	}
-	j := fr.joined()
+	j := fr.Joined()
 	if !strings.Contains(j, "VACUUM (ANALYZE) kine") {
 		t.Fatalf("fallback vacuum missing:\n%s", j)
 	}
@@ -141,14 +142,14 @@ func TestMaintCycleRepackSkippedOnLowHeadroom(t *testing.T) {
 }
 
 func TestMaintCycleRepackFailure(t *testing.T) {
-	k, _, dir := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "-t public.kine --no-superuser-check", err: errors.New("exit 1")},
-		{substr: "pg_repack", reply: "/usr/pgsql-16/bin/pg_repack\n"},
-		{substr: "REINDEX TABLE CONCURRENTLY", reply: "REINDEX\n"},
-		{substr: "pg_indexes_size", reply: "300000000|14572800|800000|800000\n"},
-		{substr: "pg_ls_waldir", reply: "0\n"},
-		{substr: "df", reply: "Avail\n107374182400\n"},
+	k, _, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "-t public.kine --no-superuser-check", Err: errors.New("exit 1")},
+		{Substr: "pg_repack", Out: "/usr/pgsql-16/bin/pg_repack\n"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
+		{Substr: "pg_ls_waldir", Out: "0\n"},
+		{Substr: "df", Out: "Avail\n107374182400\n"},
 	})
 	res := k.maintCycle(context.Background())
 	if res.okRepack || res.repackState != "fail" {
@@ -161,10 +162,10 @@ func TestMaintCycleRepackFailure(t *testing.T) {
 }
 
 func TestMaintCycleReindexFailure(t *testing.T) {
-	k, _, dir := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "REINDEX TABLE CONCURRENTLY", err: errors.New("lock timeout")},
-		{substr: "pg_indexes_size", reply: "100000000|4857600|10|90\n"},
+	k, _, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Err: errors.New("lock timeout")},
+		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
 	})
 	res := k.maintCycle(context.Background())
 	if res.okReindex {
@@ -177,15 +178,15 @@ func TestMaintCycleReindexFailure(t *testing.T) {
 }
 
 func TestMaintCycleContainerDown(t *testing.T) {
-	k, fr, _ := fixture(t, []rule{
-		{substr: "inspect", err: errors.New("down")},
-		{substr: "ps --format", reply: ""},
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Err: errors.New("down")},
+		{Substr: "ps --format", Out: ""},
 	})
 	res := k.maintCycle(context.Background())
 	if res.okReindex {
 		t.Fatal("reindex must fail with the container down")
 	}
-	if strings.Contains(fr.joined(), "REINDEX") {
+	if strings.Contains(fr.Joined(), "REINDEX") {
 		t.Fatal("reindex ran with the container down")
 	}
 }
@@ -195,10 +196,10 @@ func TestMaintCycleContainerDown(t *testing.T) {
 // statsOK gating emitGuard applies. The failure still reads as a
 // repack check failure.
 func TestMaintCycleAssessFailGatesGauges(t *testing.T) {
-	k, _, dir := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "REINDEX TABLE CONCURRENTLY", reply: "REINDEX\n"},
-		{substr: "pg_indexes_size", err: errors.New("connection reset")},
+	k, _, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Err: errors.New("connection reset")},
 	})
 	res := k.maintCycle(context.Background())
 	if res.repackState != "assess-fail" || res.okRepack {

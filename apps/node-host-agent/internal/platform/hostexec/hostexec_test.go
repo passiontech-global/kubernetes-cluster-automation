@@ -7,34 +7,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
-// fake records every argv the runner ran and serves canned replies
-// keyed on a substring match of the joined command line.
-type fake struct {
-	cmds  [][]string
-	reply map[string]string // substring → stdout
-	fail  map[string]bool   // substring → error
-}
-
-func (f *fake) run(_ context.Context, argv []string) (string, error) {
-	f.cmds = append(f.cmds, argv)
-	joined := strings.Join(argv, " ")
-	for k := range f.fail {
-		if strings.Contains(joined, k) {
-			return "", errors.New("exit 3")
-		}
-	}
-	for k, v := range f.reply {
-		if strings.Contains(joined, k) {
-			return v, nil
-		}
-	}
-	return "", nil
-}
-
-func newFake() *fake {
-	return &fake{reply: map[string]string{}, fail: map[string]bool{}}
+func newFake() *testutil.FakeExec {
+	return testutil.NewFakeExec()
 }
 
 // TestArgvNsenterFlagSets: each NS value must render the exact
@@ -61,13 +39,13 @@ func TestArgvNsenterFlagSets(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFake()
-			r := New(Config{HostRoot: "/host", RunCmd: f.run})
+			r := New(Config{HostRoot: "/host", RunCmd: f.Run})
 			if _, err := r.Exec(context.Background(), tc.ns,
 				"ip", "link", "show"); err != nil {
 				t.Fatal(err)
 			}
-			if len(f.cmds) != 1 || strings.Join(f.cmds[0], " ") != tc.want {
-				t.Fatalf("argv=%v want [%s]", f.cmds, tc.want)
+			if f.Count() != 1 || f.Nth(0) != tc.want {
+				t.Fatalf("argv=%s want [%s]", f.Joined(), tc.want)
 			}
 		})
 	}
@@ -77,7 +55,7 @@ func TestArgvNsenterFlagSets(t *testing.T) {
 // in the host namespaces — no nsenter whatever the flags ask for.
 func TestArgvPlainOnHost(t *testing.T) {
 	f := newFake()
-	r := New(Config{HostRoot: "/", RunCmd: f.run})
+	r := New(Config{HostRoot: "/", RunCmd: f.Run})
 	for _, ns := range []NS{NSAll, NSNet, NSMountNet, NSNone} {
 		if _, err := r.Exec(context.Background(), ns,
 			"systemctl", "daemon-reload"); err != nil {
@@ -85,10 +63,10 @@ func TestArgvPlainOnHost(t *testing.T) {
 		}
 	}
 	want := "systemctl daemon-reload"
-	if len(f.cmds) != 4 {
-		t.Fatalf("cmds=%v", f.cmds)
+	if f.Count() != 4 {
+		t.Fatalf("cmds=%s", f.Joined())
 	}
-	for i, cmd := range f.cmds {
+	for i, cmd := range f.Cmds() {
 		if got := strings.Join(cmd, " "); got != want {
 			t.Fatalf("cmd[%d]=%q want %q — HostRoot / must never wrap", i, got, want)
 		}
@@ -99,13 +77,13 @@ func TestArgvPlainOnHost(t *testing.T) {
 // takes the DaemonSet mount default — the wrap still applies.
 func TestArgvEmptyHostRootDefaultsContainerized(t *testing.T) {
 	f := newFake()
-	r := New(Config{RunCmd: f.run})
+	r := New(Config{RunCmd: f.Run})
 	if _, err := r.Exec(context.Background(), NSAll, "true"); err != nil {
 		t.Fatal(err)
 	}
 	want := "nsenter -t 1 -m -u -i -n -p -- true"
-	if len(f.cmds) != 1 || strings.Join(f.cmds[0], " ") != want {
-		t.Fatalf("argv=%v want [%s]", f.cmds, want)
+	if f.Count() != 1 || f.Nth(0) != want {
+		t.Fatalf("argv=%s want [%s]", f.Joined(), want)
 	}
 }
 
@@ -115,8 +93,8 @@ func TestArgvEmptyHostRootDefaultsContainerized(t *testing.T) {
 // nsenter wrap applies.
 func TestExecCombinedUsesCombinedSeam(t *testing.T) {
 	combined := newFake()
-	combined.reply["journalctl -n 1 --no-pager"] =
-		"File /var/log/journal/a.journal is corrupt, ignoring journal files.\n"
+	combined.On("journalctl -n 1 --no-pager",
+		"File /var/log/journal/a.journal is corrupt, ignoring journal files.\n")
 	stdoutOnlyCalled := false
 	r := New(Config{
 		HostRoot: "/host",
@@ -124,7 +102,7 @@ func TestExecCombinedUsesCombinedSeam(t *testing.T) {
 			stdoutOnlyCalled = true
 			return "", nil
 		},
-		RunCmdCombined: combined.run,
+		RunCmdCombined: combined.Run,
 	})
 	out, err := r.ExecCombined(context.Background(), NSAll,
 		"journalctl", "-n", "1", "--no-pager")
@@ -138,8 +116,8 @@ func TestExecCombinedUsesCombinedSeam(t *testing.T) {
 		t.Fatalf("out=%q want the stderr corruption notice", out)
 	}
 	want := "nsenter -t 1 -m -u -i -n -p -- journalctl -n 1 --no-pager"
-	if len(combined.cmds) != 1 || strings.Join(combined.cmds[0], " ") != want {
-		t.Fatalf("argv=%v want [%s]", combined.cmds, want)
+	if combined.Count() != 1 || combined.Nth(0) != want {
+		t.Fatalf("argv=%s want [%s]", combined.Joined(), want)
 	}
 }
 

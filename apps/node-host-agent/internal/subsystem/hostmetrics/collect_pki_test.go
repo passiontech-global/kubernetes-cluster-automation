@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -46,9 +47,9 @@ func TestPKICertDaysLeft(t *testing.T) {
 	if err := os.MkdirAll(pkiDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(pkiDir, "ca.crt"),
+	testutil.WriteFile(t, filepath.Join(pkiDir, "ca.crt"),
 		string(mkTestCertPEM(t, time.Now().Add(40*24*time.Hour))))
-	write(t, filepath.Join(pkiDir, "notacert.key"), "PRIVATE KEY")
+	testutil.WriteFile(t, filepath.Join(pkiDir, "notacert.key"), "PRIVATE KEY")
 	c := New(cfg)
 	got, ok := metricValue(t, c, "node_host_agent_pki_cert_days_left",
 		map[string]string{"node": "node-a",
@@ -69,7 +70,7 @@ func TestPKICertDaysLeft(t *testing.T) {
 func TestPKICertDaysLeftStandaloneFile(t *testing.T) {
 	cfg, _ := fixture(t)
 	f := filepath.Join(t.TempDir(), "kubelet-client-current.pem")
-	write(t, f, string(mkTestCertPEM(t, time.Now().Add(10*24*time.Hour))))
+	testutil.WriteFile(t, f, string(mkTestCertPEM(t, time.Now().Add(10*24*time.Hour))))
 	cfg.PKICertPaths = []string{f}
 	c := New(cfg)
 	got, ok := metricValue(t, c, "node_host_agent_pki_cert_days_left",
@@ -87,7 +88,7 @@ func TestPKICertPathLabelLeadingSlash(t *testing.T) {
 	cfg, _ := fixture(t)
 	cfg.HostRoot = "/"
 	pkiDir := t.TempDir()
-	write(t, filepath.Join(pkiDir, "ca.crt"),
+	testutil.WriteFile(t, filepath.Join(pkiDir, "ca.crt"),
 		string(mkTestCertPEM(t, time.Now().Add(40*24*time.Hour))))
 	cfg.PKICertPaths = []string{pkiDir}
 	c := New(cfg)
@@ -107,7 +108,7 @@ func TestPKICertDaysLeftExpiredFloors(t *testing.T) {
 		t.Fatal(err)
 	}
 	// ~45h past expiry → −1.875d.
-	write(t, filepath.Join(pkiDir, "expired.crt"),
+	testutil.WriteFile(t, filepath.Join(pkiDir, "expired.crt"),
 		string(mkTestCertPEM(t, time.Now().Add(-45*time.Hour))))
 	c := New(cfg)
 	got, ok := metricValue(t, c, "node_host_agent_pki_cert_days_left",

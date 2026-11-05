@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +13,7 @@ import (
 
 // cliConfig builds a Config for RunCheckCLI — the same seams
 // fixture() injects, but the runner needs no KineDB wrapper.
-func cliConfig(t *testing.T, rules []rule) (Config, *fakeRun) {
+func cliConfig(t *testing.T, rules []testutil.ExecRule) (Config, *testutil.FakeExec) {
 	t.Helper()
 	dir := t.TempDir()
 	envFile := filepath.Join(dir, ".env")
@@ -20,11 +21,11 @@ func cliConfig(t *testing.T, rules []rule) (Config, *fakeRun) {
 		[]byte("POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	fr := &fakeRun{rules: rules}
+	fr := testutil.NewFakeExec(rules...)
 	return Config{
 		EnvFile: envFile,
 		Runtime: "podman",
-		run:     fr.run,
+		run:     fr.RunStdin,
 		wireFn:  func(context.Context, string) bool { return true },
 	}, fr
 }
@@ -59,14 +60,14 @@ func TestRunCheckCLIAllOK(t *testing.T) {
 }
 
 func TestRunCheckCLIFailures(t *testing.T) {
-	cfg, _ := cliConfig(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "SHOW POOLS",
-			reply: "database|sv_active|sv_idle|cl_waiting\npostgres|0|0|300\n"},
-		{substr: "logs --since",
-			reply: "server_login_retry\npassword authentication failed\n"},
-		{substr: "MAX(id)", reply: "1000|200|290\n"},
-		{substr: "select 1", reply: "1\n"},
+	cfg, _ := cliConfig(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "SHOW POOLS",
+			Out: "database|sv_active|sv_idle|cl_waiting\npostgres|0|0|300\n"},
+		{Substr: "logs --since",
+			Out: "server_login_retry\npassword authentication failed\n"},
+		{Substr: "MAX(id)", Out: "1000|200|290\n"},
+		{Substr: "select 1", Out: "1\n"},
 	})
 	cfg.wireFn = func(context.Context, string) bool { return false }
 	var out bytes.Buffer
@@ -89,9 +90,9 @@ func TestRunCheckCLIFailures(t *testing.T) {
 }
 
 func TestRunCheckCLIContainersDown(t *testing.T) {
-	cfg, _ := cliConfig(t, []rule{
-		{substr: "inspect", err: errors.New("down")},
-		{substr: "ps --format", reply: ""},
+	cfg, _ := cliConfig(t, []testutil.ExecRule{
+		{Substr: "inspect", Err: errors.New("down")},
+		{Substr: "ps --format", Out: ""},
 	})
 	var out bytes.Buffer
 	if code := RunCheckCLI(context.Background(), cfg, &out); code != 1 {

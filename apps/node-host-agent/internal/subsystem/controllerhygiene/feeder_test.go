@@ -4,6 +4,7 @@ package controllerhygiene
 
 import (
 	"context"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -149,7 +150,7 @@ func TestPeerAPIServerCRLF(t *testing.T) {
 	e := fixture(t)
 	// A CRLF peer file must not leave '\r' glued to the URL — the
 	// peer probe against the garbage URL always read dead.
-	writeFile(t, e.h.cfg.Feeder.RemediatePeerFile,
+	testutil.WriteFile(t, e.h.cfg.Feeder.RemediatePeerFile,
 		"PEER_APISERVER=\"https://10.0.0.2:6443\"\r\n")
 	if got := e.h.peerAPIServer(); got != "https://10.0.0.2:6443" {
 		t.Fatalf("peerAPIServer=%q want https://10.0.0.2:6443", got)

@@ -4,6 +4,7 @@ package hostmetrics
 
 import (
 	"fmt"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -50,8 +51,8 @@ func mkFdinfo(t *testing.T, proc string, pid, fd, n int) {
 
 func TestInotifyRatios(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.InotifyMaxInstancesFile, "10\n")
-	write(t, cfg.InotifyMaxWatchesFile, "100\n")
+	testutil.WriteFile(t, cfg.InotifyMaxInstancesFile, "10\n")
+	testutil.WriteFile(t, cfg.InotifyMaxWatchesFile, "100\n")
 	mkFdinfo(t, cfg.ProcRoot, 111, 3, 5)  // 1 fd, 5 watches
 	mkFdinfo(t, cfg.ProcRoot, 111, 4, 5)  // another fd → 2 inst
 	mkFdinfo(t, cfg.ProcRoot, 222, 6, 10) // other pid → 3rd inst
@@ -70,7 +71,7 @@ func TestInotifyRatios(t *testing.T) {
 
 func TestInotifyCacheServesWithinInterval(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.InotifyMaxInstancesFile, "10\n")
+	testutil.WriteFile(t, cfg.InotifyMaxInstancesFile, "10\n")
 	mkFdinfo(t, cfg.ProcRoot, 111, 3, 1)
 	c := New(cfg)
 	if got, _ := metricValue(t, c, "node_host_agent_inotify_instances_used_ratio",
@@ -92,8 +93,8 @@ func TestInotifyCacheServesWithinInterval(t *testing.T) {
 // while the host hits max_user_instances.
 func TestInotifyZeroWatchInstanceCounts(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.InotifyMaxInstancesFile, "10\n")
-	write(t, cfg.InotifyMaxWatchesFile, "100\n")
+	testutil.WriteFile(t, cfg.InotifyMaxInstancesFile, "10\n")
+	testutil.WriteFile(t, cfg.InotifyMaxWatchesFile, "100\n")
 	// fd 3: leaked inotify group — symlink present, NO fdinfo at
 	// all (not even a header): instance, 0 watches.
 	mkFdLink(t, cfg.ProcRoot, 111, 3, "anon_inode:inotify")

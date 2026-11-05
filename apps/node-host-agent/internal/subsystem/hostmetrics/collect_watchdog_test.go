@@ -4,6 +4,7 @@ package hostmetrics
 
 import (
 	"fmt"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,9 +13,9 @@ import (
 
 func TestWatchdogStates(t *testing.T) {
 	cfg, dirs := fixture(t)
-	write(t, filepath.Join(dirs["state"], "state-kubelet-runtime-stall"), "1730000000\n")
-	write(t, filepath.Join(dirs["state"], "state-node-overloaded"), "1730000001\n")
-	write(t, filepath.Join(dirs["state"], "consecutive-x"), "3\n") // not a latch
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "state-kubelet-runtime-stall"), "1730000000\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "state-node-overloaded"), "1730000001\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "consecutive-x"), "3\n") // not a latch
 	c := New(cfg)
 
 	for _, st := range []string{"kubelet-runtime-stall", "node-overloaded"} {
@@ -33,7 +34,7 @@ func TestWatchdogStates(t *testing.T) {
 func TestWatchdogStateClearsToZero(t *testing.T) {
 	cfg, dirs := fixture(t)
 	latch := filepath.Join(dirs["state"], "state-dns-fallback")
-	write(t, latch, "1730000000\n")
+	testutil.WriteFile(t, latch, "1730000000\n")
 	c := New(cfg)
 	_, _ = metricValue(t, c, "node_host_agent_watchdog_state",
 		map[string]string{"node": "node-a", "state": "dns-fallback"})
@@ -56,7 +57,7 @@ func TestSeenStatesTTLExpiry(t *testing.T) {
 	now := time.Now()
 	cfg.nowFn = func() time.Time { return now }
 	latch := filepath.Join(dirs["state"], "state-tmp-latch")
-	write(t, latch, "1730000000\n")
+	testutil.WriteFile(t, latch, "1730000000\n")
 	c := New(cfg)
 	labels := map[string]string{"node": "node-a", "state": "tmp-latch"}
 
@@ -92,7 +93,7 @@ func TestSeenStatesCapEvictsOldestCleared(t *testing.T) {
 	cfg, dirs := fixture(t)
 	now := time.Now()
 	cfg.nowFn = func() time.Time { return now }
-	write(t, filepath.Join(dirs["state"], "state-real"), "1730000000\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "state-real"), "1730000000\n")
 	c := New(cfg)
 	// Pre-seed over-cap cleared entries, oldest first.
 	for i := 0; i < maxSeenStates+10; i++ {
@@ -123,8 +124,8 @@ func TestWatchdogTmpStateFileIgnored(t *testing.T) {
 	// writeFileAtomic, workerhygiene's stateEnter) must NOT register
 	// a watchdog_state series — the old "state-x.tmp" shape would
 	// have cut to a phantom "x.tmp" latch that then sits at 0 forever.
-	write(t, filepath.Join(dirs["state"], ".tmp-state-atomic"), "1730000000\n")
-	write(t, filepath.Join(dirs["state"], "state-real"), "1730000000\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], ".tmp-state-atomic"), "1730000000\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "state-real"), "1730000000\n")
 	c := New(cfg)
 
 	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
@@ -147,9 +148,9 @@ func TestWatchdogSkipsNonRegularAndEmptyNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A file named exactly "state-" has an empty latch name — skipped.
-	write(t, filepath.Join(dirs["state"], "state-"), "1730000000\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "state-"), "1730000000\n")
 	// A real latch alongside — still collected.
-	write(t, filepath.Join(dirs["state"], "state-real"), "1730000000\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "state-real"), "1730000000\n")
 	c := New(cfg)
 
 	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
@@ -172,7 +173,7 @@ func TestWatchdogStateDirAbsentStillEmitsSeen(t *testing.T) {
 	// tolerated, not fatal.
 	cfg, dirs := fixture(t)
 	latch := filepath.Join(dirs["state"], "state-net-fail")
-	write(t, latch, "1730000000\n")
+	testutil.WriteFile(t, latch, "1730000000\n")
 	c := New(cfg)
 	_, _ = metricValue(t, c, "node_host_agent_watchdog_state",
 		map[string]string{"node": "node-a", "state": "net-fail"})
@@ -192,7 +193,7 @@ func TestWatchdogStateDirAbsentStillEmitsSeen(t *testing.T) {
 
 func TestWatchdogLegacyAlias(t *testing.T) {
 	cfg, dirs := fixture(t)
-	write(t, filepath.Join(dirs["state"], "state-fail2ban-down"), "1730000000\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "state-fail2ban-down"), "1730000000\n")
 	c := New(cfg)
 
 	// Alias mirrors the latch with signal=state (no node label).

@@ -5,6 +5,7 @@ package apiprober
 
 import (
 	"context"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -40,9 +41,7 @@ TOKEN_FILE=/etc/api-backend-guard/token
 CA_FILE='/etc/api-backend-guard/ca.crt'
 export EXTRA=ignored
 `
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, path, content)
 	g, err := LoadGuardConf(path)
 	if err != nil {
 		t.Fatal(err)
@@ -105,9 +104,7 @@ FAIL_CYCLES=2
 FROZEN_CYCLES=2
 RECOVER_CYCLES=3
 `
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, path, content)
 	g, err := LoadGuardConf(path)
 	if err != nil {
 		t.Fatal(err)
@@ -131,9 +128,7 @@ API_TOKEN_FILE=/orig/token
 CA_FILE=/short/ca
 API_CA_FILE=/orig/ca
 `
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, path, content)
 	g, err := LoadGuardConf(path)
 	if err != nil {
 		t.Fatal(err)
@@ -150,15 +145,11 @@ func TestGuardReloaderRefreshesAndKeepsLastGood(t *testing.T) {
 	if g := rl.Get(); g.Mode != "" {
 		t.Fatalf("missing conf Mode=%q want zero", g.Mode)
 	}
-	if err := os.WriteFile(path, []byte("MODE=dry-run\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, path, "MODE=dry-run\n")
 	if g := rl.Get(); g.Mode != "dry-run" {
 		t.Fatalf("Mode=%q want dry-run", g.Mode)
 	}
-	if err := os.WriteFile(path, []byte("MODE=enforce\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, path, "MODE=enforce\n")
 	if g := rl.Get(); g.Mode != "enforce" {
 		t.Fatalf("edited conf not picked up: Mode=%q", g.Mode)
 	}
@@ -197,9 +188,7 @@ func TestGuardConfAppliesMidRun(t *testing.T) {
 		t.Fatalf("drain under dry-run: %v", ha.commands())
 	}
 	// hostconfig's first render lands mid-run.
-	if err := os.WriteFile(confPath, []byte("MODE=enforce\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, confPath, "MODE=enforce\n")
 	p.Cycle(context.Background())
 	if !hasCmd(ha.commands(), "disable server kube_apiserver/hub1") {
 		t.Fatalf("enforce MODE from mid-run conf not applied: %v", ha.commands())
@@ -218,9 +207,7 @@ API_CA_FILE=/g/ca
 GAP_MIN=500
 FAIL_CYCLES=4
 `
-	if err := os.WriteFile(confPath, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, confPath, content)
 	ha := newFakeHAProxy(t, [2]string{"hub1", "10.0.0.1:6443"})
 	p := fixtureExt(t, ha, ModeDryRun, nil, func(c *Config) {
 		c.GuardSrc = NewGuardReloader(confPath, GuardDefaults{})

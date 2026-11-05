@@ -3,6 +3,7 @@ package hostmetrics
 import (
 	"context"
 	"fmt"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,8 +22,8 @@ func kmsgFixture(t *testing.T, cfg Config, records ...string) {
 	if err := os.MkdirAll(bootDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(bootDir, "boot_id"), "testboot\n")
-	write(t, filepath.Join(cfg.WatchdogStateDir, kmsgCursorFile),
+	testutil.WriteFile(t, filepath.Join(bootDir, "boot_id"), "testboot\n")
+	testutil.WriteFile(t, filepath.Join(cfg.WatchdogStateDir, kmsgCursorFile),
 		"kmsg testboot 0 0\n")
 	var b strings.Builder
 	for i, m := range records {
@@ -32,7 +33,7 @@ func kmsgFixture(t *testing.T, cfg Config, records ...string) {
 	if err := os.MkdirAll(devDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, kmsgDevicePaths(cfg.HostRoot)[0], b.String())
+	testutil.WriteFile(t, kmsgDevicePaths(cfg.HostRoot)[0], b.String())
 }
 
 func TestKmsgFSAndConntrack(t *testing.T) {
@@ -45,7 +46,7 @@ func TestKmsgFSAndConntrack(t *testing.T) {
 		"nf_conntrack: table full, dropping packet",
 		"random unrelated kernel line")
 	// Conntrack max file for the sysctl-bump path.
-	write(t, cfg.ConntrackMaxFile, "262144\n")
+	testutil.WriteFile(t, cfg.ConntrackMaxFile, "262144\n")
 	// Sysctl write target — point the bump at a writable file by
 	// faking the path through ConntrackMaxFile's sibling? The bump
 	// writes /proc/sys/... via a fixed path — check maybeBumpConntrackMax.
@@ -54,14 +55,14 @@ func TestKmsgFSAndConntrack(t *testing.T) {
 		kmsgFsErrorFile)); err != nil {
 		t.Fatal("kmsg-fs-error marker missing")
 	}
-	got := strings.TrimSpace(readFile(t,
+	got := strings.TrimSpace(testutil.ReadFile(t,
 		filepath.Join(cfg.WatchdogStateDir, kmsgConntrackDropsFile)))
 	if got != "2" {
 		t.Fatalf("conntrack drops=%q want 2", got)
 	}
 	// Second drain must not double-count — the fd sits at EOF.
 	c.Latches().checkKernelDmesg()
-	got = strings.TrimSpace(readFile(t,
+	got = strings.TrimSpace(testutil.ReadFile(t,
 		filepath.Join(cfg.WatchdogStateDir, kmsgConntrackDropsFile)))
 	if got != "2" {
 		t.Fatalf("conntrack drops after re-drain=%q want 2", got)
@@ -89,12 +90,12 @@ func TestKmsgOOMClassification(t *testing.T) {
 			"task=kubelet,pid=88",
 		"Memory cgroup out of memory: Killed process 88 (kubelet) total-vm:5kB")
 	c.Latches().checkKernelDmesg()
-	victim := strings.TrimSpace(readFile(t, filepath.Join(
+	victim := strings.TrimSpace(testutil.ReadFile(t, filepath.Join(
 		cfg.WatchdogStateDir, kmsgOOMVictimFile)))
 	if !strings.Contains(victim, "kubelet") {
 		t.Fatalf("host OOM victim=%q want kubelet (last host kill)", victim)
 	}
-	count := strings.TrimSpace(readFile(t, filepath.Join(
+	count := strings.TrimSpace(testutil.ReadFile(t, filepath.Join(
 		cfg.WatchdogStateDir, kmsgOOMCountFile)))
 	if count != "2" {
 		t.Fatalf("host oom count=%q want 2 (pod kills excluded)", count)
@@ -107,10 +108,10 @@ func TestKmsgFirstOpenPrimesBacklog(t *testing.T) {
 	// NO cursor — first open must discard the retained backlog.
 	bootDir := filepath.Join(cfg.ProcRoot, "sys", "kernel", "random")
 	_ = os.MkdirAll(bootDir, 0o755)
-	write(t, filepath.Join(bootDir, "boot_id"), "testboot\n")
+	testutil.WriteFile(t, filepath.Join(bootDir, "boot_id"), "testboot\n")
 	devDir := filepath.Dir(kmsgDevicePaths(cfg.HostRoot)[0])
 	_ = os.MkdirAll(devDir, 0o755)
-	write(t, kmsgDevicePaths(cfg.HostRoot)[0],
+	testutil.WriteFile(t, kmsgDevicePaths(cfg.HostRoot)[0],
 		"6,1,1000,0;EXT4-fs error old history\n")
 	c.Latches().checkKernelDmesg()
 	if _, err := os.Stat(filepath.Join(cfg.WatchdogStateDir,
@@ -129,7 +130,7 @@ func TestKernelProcRatios(t *testing.T) {
 		t.Fatal("empty proc reported ok")
 	}
 	// file-nr only → fd ratio.
-	write(t, cfg.FileNRFile, "900 100 1000\n")
+	testutil.WriteFile(t, cfg.FileNRFile, "900 100 1000\n")
 	_, _, fd, _, _, fdOK, ok := c.Latches().kernelProcRatios()
 	if !ok || !fdOK || fd != 0.9 {
 		t.Fatalf("fd ratio=%v ok=%v fdOK=%v want 0.9", fd, ok, fdOK)
@@ -147,9 +148,9 @@ func TestKernelProcRatios(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(t, filepath.Join(cfg.ProcRoot, "sys/kernel/pid_max"), "10\n")
-	write(t, filepath.Join(cfg.ProcRoot, "sys/kernel/threads-max"), "100\n")
-	write(t, filepath.Join(cfg.ProcRoot, "loadavg"),
+	testutil.WriteFile(t, filepath.Join(cfg.ProcRoot, "sys/kernel/pid_max"), "10\n")
+	testutil.WriteFile(t, filepath.Join(cfg.ProcRoot, "sys/kernel/threads-max"), "100\n")
+	testutil.WriteFile(t, filepath.Join(cfg.ProcRoot, "loadavg"),
 		"0.5 0.4 0.3 95/200 1234\n")
 	pids, threads, _, pOK, tOK, _, ok := c.Latches().kernelProcRatios()
 	if !ok || !pOK || !tOK {
@@ -166,7 +167,7 @@ func TestKernelProcRatios(t *testing.T) {
 func TestPidFDPressureLatch(t *testing.T) {
 	cfg, _ := fixture(t)
 	c := New(cfg)
-	write(t, cfg.FileNRFile, "950 50 1000\n") // 0.95 > 0.90
+	testutil.WriteFile(t, cfg.FileNRFile, "950 50 1000\n") // 0.95 > 0.90
 	for i := 0; i < kernelProcPressureNeeded-1; i++ {
 		c.Latches().updatePidFDPressure()
 		if _, err := os.Stat(filepath.Join(cfg.WatchdogStateDir,
@@ -180,7 +181,7 @@ func TestPidFDPressureLatch(t *testing.T) {
 		t.Fatal("pid-fd-pressure latch missing after 3 ticks")
 	}
 	// Below threshold clears.
-	write(t, cfg.FileNRFile, "100 900 1000\n")
+	testutil.WriteFile(t, cfg.FileNRFile, "100 900 1000\n")
 	c.Latches().updatePidFDPressure()
 	if _, err := os.Stat(filepath.Join(cfg.WatchdogStateDir,
 		"state-pid-fd-pressure")); !os.IsNotExist(err) {
@@ -271,7 +272,7 @@ func TestROPVCMounts(t *testing.T) {
 	if err := os.MkdirAll(proc1, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(proc1, "mounts"),
+	testutil.WriteFile(t, filepath.Join(proc1, "mounts"),
 		"/dev/sda1 /var/openebs/local/pvc-abc ext4 rw,relatime 0 0\n"+
 			"/dev/sdb1 /var/openebs/local/pvc-def xfs ro,relatime 0 0\n"+
 			"/dev/sdc1 /opt/local-path-provisioner/pvc-ghi ext4 ro 0 0\n"+
@@ -290,20 +291,11 @@ func TestROPVCMounts(t *testing.T) {
 	// Fresh kmsg fs-error marker alone also latches.
 	cfg2, _ := fixture(t)
 	c2 := New(cfg2)
-	write(t, filepath.Join(cfg2.WatchdogStateDir, kmsgFsErrorFile),
+	testutil.WriteFile(t, filepath.Join(cfg2.WatchdogStateDir, kmsgFsErrorFile),
 		strconv.FormatInt(time.Now().Unix(), 10)+" ext4 died\n")
 	c2.Latches().updateFSReadonlyEvidence()
 	if _, err := os.Stat(filepath.Join(cfg2.WatchdogStateDir,
 		"state-fs-readonly")); err != nil {
 		t.Fatal("fs-readonly latch missing from kmsg marker")
 	}
-}
-
-func readFile(t *testing.T, p string) string {
-	t.Helper()
-	b, err := os.ReadFile(p)
-	if err != nil {
-		t.Fatalf("read %s: %v", p, err)
-	}
-	return string(b)
 }
