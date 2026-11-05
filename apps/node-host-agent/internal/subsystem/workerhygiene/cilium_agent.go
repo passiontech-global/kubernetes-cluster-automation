@@ -15,6 +15,12 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
+const (
+	// defaultBPFMapHighRatio is the critical BPF map fill ratio
+	// (W8-NM3) — past it the bpf-maps sub-check latches.
+	defaultBPFMapHighRatio = 0.90
+)
+
 // ciliumCheck — sig9: cilium-agent :9879 healthz down → latch
 // cilium-agent-down + SIGKILL the agent container (kubelet restarts
 // it immediately, bypassing CrashLoopBackOff). Gates: apiOK (restart
@@ -24,7 +30,7 @@ import (
 // healthz, off the same agent socket. fails is the healthz streak
 // (ex-Hygiene.ciliumFails).
 type ciliumCheck struct {
-	h     *Hygiene
+	d     *deps
 	fails int
 }
 
@@ -34,66 +40,66 @@ func (c *ciliumCheck) Name() string { return checkCilium }
 // Run executes one cilium round.
 func (c *ciliumCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkCilium, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkCilium, "gated").Inc()
 		return
 	}
-	tasks, reachable := c.h.ciliumAgentTasks()
+	tasks, reachable := c.d.ciliumAgentTasks()
 	if !reachable {
 		// ctr unreachable → inconclusive, keep everything.
-		c.h.cycles.WithLabelValues(checkCilium, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkCilium, "abort").Inc()
 		return
 	}
 	if len(tasks) == 0 {
 		// No cilium-agent container → this node runs no cilium
 		// (calico cluster, hub): clear any false-positive state.
 		c.fails = 0
-		c.h.state.Exit(hoststate.LatchCiliumAgentDown, nil)
-		c.h.cycles.WithLabelValues(checkCilium, "ok").Inc()
+		c.d.state.Exit(hoststate.LatchCiliumAgentDown, nil)
+		c.d.cycles.WithLabelValues(checkCilium, "ok").Inc()
 		return
 	}
-	err := c.h.probeHTTPSeries(ctx, c.h.cfg.Cilium.HealthzURL,
-		probeAttempts, ciliumProbeTime, c.h.cfg.ProbeGap)
+	err := c.d.probeHTTPSeries(ctx, c.d.cfg.Cilium.HealthzURL,
+		probeAttempts, ciliumProbeTime, c.d.cfg.ProbeGap)
 	if err == nil {
 		c.fails = 0
-		c.h.state.Exit(hoststate.LatchCiliumAgentDown, nil)
+		c.d.state.Exit(hoststate.LatchCiliumAgentDown, nil)
 		// W8-NM3: a healthy healthz doesn't prove the datapath —
 		// conntrack/SNAT/LB BPF maps can sit at capacity while the
 		// agent still answers 200. Evaluate the map fill ratios on
 		// the same agent socket.
 		c.checkBPFMaps(ctx)
-		c.h.cycles.WithLabelValues(checkCilium, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkCilium, "ok").Inc()
 		return
 	}
-	c.h.state.Enter(hoststate.LatchCiliumAgentDown, "")
+	c.d.state.Enter(hoststate.LatchCiliumAgentDown, "")
 	c.fails++
 	switch {
 	case !e.apiOK:
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-agent-down healthz fail %dx but API unreachable — skip kill (agent still cannot sync even after restart)",
 			c.fails))
-	case c.fails >= c.h.cfg.ConsecNeeded &&
-		!c.h.state.Exists(hoststate.LatchNodeOverloaded) &&
-		c.h.state.RateTrySpend("last-cilium-restart", c.h.cfg.MinRestartInterval):
+	case c.fails >= c.d.cfg.ConsecNeeded &&
+		!c.d.state.Exists(hoststate.LatchNodeOverloaded) &&
+		c.d.state.RateTrySpend("last-cilium-restart", c.d.cfg.MinRestartInterval):
 		// Budget spent atomically BEFORE acting (rate_spend
 		// parity): a missed kill still consumed it — the feeder
 		// goroutine competes for the same file.
-		if c.h.killCiliumAgent(tasks) {
-			c.h.state.AppendLog(fmt.Sprintf(
+		if c.d.killCiliumAgent(tasks) {
+			c.d.state.AppendLog(fmt.Sprintf(
 				"ACTION: killed cilium-agent container - healthz down %dx (kubelet will restart)",
 				c.fails))
 			c.fails = 0
-			c.h.actions.WithLabelValues(checkCilium, "sigkill").Inc()
+			c.d.actions.WithLabelValues(checkCilium, "sigkill").Inc()
 		} else {
-			c.h.state.AppendLog(fmt.Sprintf(
+			c.d.state.AppendLog(fmt.Sprintf(
 				"suspect: cilium-agent-down healthz fail %dx, no running task to kill (kubelet retries itself)",
 				c.fails))
 		}
 	default:
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-agent-down healthz 127.0.0.1:9879 fail (check %d/%d)",
-			c.fails, c.h.cfg.ConsecNeeded))
+			c.fails, c.d.cfg.ConsecNeeded))
 	}
-	c.h.cycles.WithLabelValues(checkCilium, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkCilium, "ok").Inc()
 }
 
 // --- W8-NM3: cilium BPF map pressure ---
@@ -188,29 +194,29 @@ func parseCiliumBPFMaps(body []byte) map[string][2]int64 {
 // is inconclusive (the cilium checks' keep-state rule) — the latch
 // is neither entered nor cleared on missing evidence.
 func (c *ciliumCheck) checkBPFMaps(ctx context.Context) {
-	body, err := c.h.cfg.Seams.unixGet(ctx, c.h.cfg.Cilium.Socket, "/v1/map")
+	body, err := c.d.cfg.Seams.unixGet(ctx, c.d.cfg.Cilium.Socket, "/v1/map")
 	if err != nil {
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-bpf-maps map query on %s failed: %v — inconclusive, keeping state",
-			c.h.cfg.Cilium.Socket, err))
-		c.h.cycles.WithLabelValues(checkCiliumBPF, "abort").Inc()
+			c.d.cfg.Cilium.Socket, err))
+		c.d.cycles.WithLabelValues(checkCiliumBPF, "abort").Inc()
 		return
 	}
 	maps := parseCiliumBPFMaps(body)
 	var over []string
 	for name, um := range maps {
-		if float64(um[0]) >= c.h.cfg.Cilium.BPFMapHighRatio*float64(um[1]) {
+		if float64(um[0]) >= c.d.cfg.Cilium.BPFMapHighRatio*float64(um[1]) {
 			over = append(over, fmt.Sprintf("%s=%d/%d", name, um[0], um[1]))
 		}
 	}
 	if len(over) == 0 {
-		c.h.state.Exit(hoststate.LatchCiliumBPFMapPressure, nil)
-		c.h.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
+		c.d.state.Exit(hoststate.LatchCiliumBPFMapPressure, nil)
+		c.d.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
 		return
 	}
 	sort.Strings(over)
-	c.h.state.Enter(hoststate.LatchCiliumBPFMapPressure, strings.Join(over, " "))
-	c.h.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
+	c.d.state.Enter(hoststate.LatchCiliumBPFMapPressure, strings.Join(over, " "))
+	c.d.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
 }
 
 // checkCiliumBPFMaps forwards to the migrated Check — tests written

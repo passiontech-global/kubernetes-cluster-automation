@@ -15,6 +15,22 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
+// Subsystem wiring defaults — the /host mount convention mirrors the
+// shell DaemonSet host mounts; the per-domain knobs live next to
+// their checks.
+const (
+	defaultInterval           = 2 * time.Minute
+	defaultWatchdogStateDir   = "/host/var/lib/node-watchdog"
+	defaultWatchdogLogFile    = "/host/var/log/node-watchdog.log"
+	defaultProcRoot           = "/proc" // hostPID:true makes pod /proc == host /proc
+	defaultK0sWorkerUnitFile  = "/host/etc/systemd/system/k0sworker.service"
+	defaultConsecNeeded       = 2                // shell CONSEC_NEEDED=2
+	defaultMinRestartInterval = 30 * time.Minute // shell MIN_RESTART_INTERVAL_S=1800
+	// defaultSysClassNet is the host sysfs net mount the iface
+	// checks (MTU drift, calico veth, netns reaper) read through.
+	defaultSysClassNet = "/sys/class/net"
+)
+
 // Config carries the hygiene knobs — all test-injectable. The knobs
 // are grouped into per-domain sub-structs mirroring the check
 // families (Kubelet/Teardown/Ctr/Cilium/Disk/Net/Pressure/Calico/

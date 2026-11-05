@@ -16,6 +16,26 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
+// W6.3 disk-bloat thresholds: above the warn watermark the
+// bounded walk runs (at most once per DiskBloatScanInterval —
+// the walk itself costs IO on the disk that is already full);
+// above the critical watermark a non-system offender may be
+// evicted outright. Any single dir past the pod threshold is a
+// runaway target.
+const (
+	defaultK0sDataDir             = "/host/var/lib/k0s"
+	k0sDiskHighWatermark          = 0.75
+	k0sDiskBloatWatermark         = 0.85
+	k0sDiskBloatCriticalWatermark = 0.92
+	diskBloatPodThresholdBytes    = int64(15) << 30 // 15 GiB
+	diskBloatScanInterval         = 15 * time.Minute
+	diskBloatEvictInterval        = 15 * time.Minute // last-disk-bloat-evict budget
+	maxBloatWalkEntries           = 10000            // walk cap per scanned dir
+	// defaultPodLogsDir is the /var/log/pods host mount — the
+	// BUG-H8 pod-log attribution walk scans it.
+	defaultPodLogsDir = "/host/var/log/pods"
+)
+
 // bloatHit is one over-threshold directory found by the walk.
 type bloatHit struct {
 	label string
@@ -44,7 +64,7 @@ func readDirNames(dir string) []string {
 // huge is bloat by definition, but the walk must never become its
 // own IO problem on the disk that is already full). Shared: the
 // orphan-hostpath check (deep_failure_checks.go) walks with it too.
-func (h *Hygiene) walkBytes(root string) (total int64, truncated bool) {
+func (d *deps) walkBytes(root string) (total int64, truncated bool) {
 	entries := 0
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -93,18 +113,18 @@ func (c *diskBloatCheck) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 	for i := range pods {
 		podByUID[string(pods[i].UID)] = &pods[i]
 	}
-	threshold := c.h.cfg.Disk.BloatPodThresholdBytes
+	threshold := c.d.cfg.Disk.BloatPodThresholdBytes
 	// (1) emptyDir volumes: pods/<uid>/volumes/kubernetes.io~empty-dir/<vol>.
-	for _, uidDir := range readDirNames(c.h.cfg.Kubelet.PodsDir) {
+	for _, uidDir := range readDirNames(c.d.cfg.Kubelet.PodsDir) {
 		uid := filepath.Base(uidDir)
 		for _, vol := range readDirNames(filepath.Join(
 			uidDir, "volumes", "kubernetes.io~empty-dir")) {
 			var vst unix.Statfs_t
-			if err := c.h.cfg.Seams.statfsFn(vol, &vst); err == nil &&
+			if err := c.d.cfg.Seams.statfsFn(vol, &vst); err == nil &&
 				vst.Type == int64(unix.TMPFS_MAGIC) {
 				continue // medium=Memory emptyDir — can't fill the disk
 			}
-			size, _ := c.h.walkBytes(vol)
+			size, _ := c.d.walkBytes(vol)
 			podTotals[uid] += size
 			if size > threshold {
 				label := "pod-uid " + uid
@@ -123,11 +143,11 @@ func (c *diskBloatCheck) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 	// snapshot key, so a live task dir maps the snapshot back to
 	// its pod's uid for the eviction decision; unresolvable
 	// snapshots stay hits-only.
-	snapRoot := filepath.Join(c.h.cfg.Disk.K0sDataDir, "containerd",
+	snapRoot := filepath.Join(c.d.cfg.Disk.K0sDataDir, "containerd",
 		"io.containerd.snapshotter.v1.overlayfs", "snapshots")
 	for _, snap := range readDirNames(snapRoot) {
 		id := filepath.Base(snap)
-		size, _ := c.h.walkBytes(filepath.Join(snap, "fs"))
+		size, _ := c.d.walkBytes(filepath.Join(snap, "fs"))
 		if size <= 0 {
 			continue
 		}
@@ -143,10 +163,10 @@ func (c *diskBloatCheck) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 	// containerd CRI writes container logs here (rotated at 10MiB ×
 	// 5 by kubelet, but a chatty container under a stuck rotation —
 	// or a pod with hundreds of short-lived restarts — outruns it).
-	for _, logDir := range readDirNames(c.h.cfg.Disk.PodLogsDir) {
+	for _, logDir := range readDirNames(c.d.cfg.Disk.PodLogsDir) {
 		base := filepath.Base(logDir)
 		uid := podLogDirUID(base)
-		size, _ := c.h.walkBytes(logDir)
+		size, _ := c.d.walkBytes(logDir)
 		if uid != "" {
 			podTotals[uid] += size
 		}
@@ -168,7 +188,7 @@ func (c *diskBloatCheck) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 // may hold it). "" when no task dir resolves (leaked/orphan
 // snapshot — no pod to bill it to).
 func (c *diskBloatCheck) snapshotPodUID(id string) string {
-	for _, root := range []string{c.h.cfg.CtrTaskRoot, c.h.cfg.SandboxCtlRoot} {
+	for _, root := range []string{c.d.cfg.CtrTaskRoot, c.d.cfg.SandboxCtlRoot} {
 		cfgData, err := os.ReadFile(filepath.Join(root, id, "config.json"))
 		if err != nil {
 			continue
@@ -185,7 +205,7 @@ func (c *diskBloatCheck) snapshotPodUID(id string) string {
 // walk costs IO on the very disk that is full, so above the warn
 // watermark it runs at most once per DiskBloatScanInterval.
 type diskBloatCheck struct {
-	h        *Hygiene
+	d        *deps
 	lastScan time.Time
 }
 
@@ -195,60 +215,60 @@ func (c *diskBloatCheck) Name() string { return checkDiskBloat }
 // Run executes one disk-bloat round.
 func (c *diskBloatCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkDiskBloat, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkDiskBloat, "gated").Inc()
 		return
 	}
 	var st unix.Statfs_t
 	used := -1.0
-	if err := c.h.cfg.Seams.statfsFn(c.h.cfg.Disk.K0sDataDir, &st); err == nil &&
+	if err := c.d.cfg.Seams.statfsFn(c.d.cfg.Disk.K0sDataDir, &st); err == nil &&
 		st.Blocks > 0 && st.Bavail <= st.Blocks {
 		used = float64(st.Blocks-st.Bavail) / float64(st.Blocks)
 	}
 	if used < 0 {
 		// statfs failed or returned garbage — inconclusive; keep
 		// the latch like a failed probe.
-		c.h.cycles.WithLabelValues(checkDiskBloat, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkDiskBloat, "abort").Inc()
 		return
 	}
-	if used <= c.h.cfg.Disk.BloatWatermark {
-		c.h.state.Exit(hoststate.LatchDiskBloat, nil)
-		c.h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+	if used <= c.d.cfg.Disk.BloatWatermark {
+		c.d.state.Exit(hoststate.LatchDiskBloat, nil)
+		c.d.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
 		return
 	}
 	// The walk is IO on the disk that is full — at most once per
 	// DiskBloatScanInterval; an existing latch persists meanwhile.
-	if c.h.cfg.Seams.nowFn().Sub(c.lastScan) < c.h.cfg.Disk.BloatScanInterval {
-		c.h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+	if c.d.cfg.Seams.nowFn().Sub(c.lastScan) < c.d.cfg.Disk.BloatScanInterval {
+		c.d.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
 		return
 	}
-	c.lastScan = c.h.cfg.Seams.nowFn()
+	c.lastScan = c.d.cfg.Seams.nowFn()
 	hits, podTotals, podByUID := c.scanBloat(e.pods)
 	if len(hits) == 0 {
-		c.h.state.Exit(hoststate.LatchDiskBloat, nil)
-		c.h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+		c.d.state.Exit(hoststate.LatchDiskBloat, nil)
+		c.d.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
 		return
 	}
-	c.h.state.Enter(hoststate.LatchDiskBloat, fmt.Sprintf("targets=%d", len(hits)))
+	c.d.state.Enter(hoststate.LatchDiskBloat, fmt.Sprintf("targets=%d", len(hits)))
 	for _, hit := range hits {
 		// NPD contract: "ACTION disk-bloat: target=... bytes=...
 		// used_pct=..." feeds DiskBloatRunaway (events.go).
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"ACTION disk-bloat: target=%s bytes=%d used_pct=%.1f",
 			hit.label, hit.bytes, used*100))
 	}
-	c.h.actions.WithLabelValues(checkDiskBloat, "detect").Inc()
+	c.d.actions.WithLabelValues(checkDiskBloat, "detect").Inc()
 	// Critical band: emergency-evict the largest non-system pod
 	// holding more than the threshold — kube-system/node-ops are
 	// never deleted by this check.
-	if used <= c.h.cfg.Disk.BloatCriticalWatermark || !e.apiOK {
-		c.h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+	if used <= c.d.cfg.Disk.BloatCriticalWatermark || !e.apiOK {
+		c.d.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
 		return
 	}
 	var victim *corev1.Pod
 	var victimBytes int64
 	for uid, total := range podTotals {
 		p := podByUID[uid]
-		if total <= c.h.cfg.Disk.BloatPodThresholdBytes || p == nil ||
+		if total <= c.d.cfg.Disk.BloatPodThresholdBytes || p == nil ||
 			p.DeletionTimestamp != nil ||
 			p.Namespace == "kube-system" || p.Namespace == "node-ops" {
 			continue
@@ -258,30 +278,30 @@ func (c *diskBloatCheck) Run(ctx context.Context, e *cycleEnv) {
 		}
 	}
 	if victim == nil {
-		c.h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
 		return
 	}
-	if !c.h.state.RateTrySpend("last-disk-bloat-evict", diskBloatEvictInterval) {
-		c.h.state.AppendLog(fmt.Sprintf(
+	if !c.d.state.RateTrySpend("last-disk-bloat-evict", diskBloatEvictInterval) {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: disk-bloat victim %s/%s bytes=%d - in evict cooldown (<15m), skip",
 			victim.Namespace, victim.Name, victimBytes))
-		c.h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
 		return
 	}
 	// Budget spent atomically BEFORE the delete (rate_spend parity —
 	// a failed delete still consumed it).
-	if err := c.h.cfg.Client.CoreV1().Pods(victim.Namespace).Delete(
+	if err := c.d.cfg.Client.CoreV1().Pods(victim.Namespace).Delete(
 		ctx, victim.Name, metav1.DeleteOptions{}); err != nil {
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: disk-bloat evict %s/%s failed: %v",
 			victim.Namespace, victim.Name, err))
 	} else {
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"ACTION: disk-bloat evicted pod %s/%s - emptyDir holds %d bytes, /var/lib/k0s at %.1f%%",
 			victim.Namespace, victim.Name, victimBytes, used*100))
-		c.h.actions.WithLabelValues(checkDiskBloat, "pod_evict").Inc()
+		c.d.actions.WithLabelValues(checkDiskBloat, "pod_evict").Inc()
 	}
-	c.h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
 }
 
 // checkDiskBloat forwards to the migrated Check — tests written

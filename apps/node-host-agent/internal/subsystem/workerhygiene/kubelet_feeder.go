@@ -17,6 +17,27 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
+// T15 kubelet watchdog feeder defaults (k0s-kubelet-watchdog.sh). The
+// shell unit probed every 20s inside a 200s WatchdogSec grace —
+// ~200s of continuous silence before the remediate oneshot ran.
+// The agent deliberately tightens this to a 15s cadence with
+// KWD_MAX_FAIL=4 consecutive fails (~60s) and NO additional grace:
+// detection is faster, and the shell's slack is replaced by the
+// remediate Gate-0 re-probe + the ordered gates (every one is a
+// chance to stop before the restart). curl --max-time 5 bounds
+// every probe.
+const (
+	defaultKubeletWdInterval   = 15 * time.Second
+	defaultKubeletWdMaxFail    = 4
+	defaultKubeletWdProbeURL   = "http://127.0.0.1:10248/healthz"
+	defaultKubeletWdReprobeGap = 3 * time.Second // remediate Gate-0: two probes ~3s apart
+	// G4 fallback when no API backends are configured — the
+	// worker-local api-local-lb listener (k0s haproxy).
+	defaultAPIFallbackURL = "https://localhost:7443/livez"
+	kubeletWdProbeTimeout = 5 * time.Second
+	apiLivezProbeTimeout  = 5 * time.Second
+)
+
 // --- Check: ctr-tasks (31-ctr-tasks.sh) ---
 
 // runKubeletFeeder is the T15 feeder's forever loop — returns only
@@ -24,9 +45,9 @@ import (
 // line is logged on each activation transition inside the tick, not
 // here — the goroutine also runs on nodes where the feeder never
 // activates.
-func (h *Hygiene) runKubeletFeeder(ctx context.Context) {
-	cycle.Every("kubelet-feeder", h.cfg.Kubelet.WdInterval,
-		h.kubeletFeedTick).Run(ctx)
+func (d *deps) runKubeletFeeder(ctx context.Context) {
+	cycle.Every("kubelet-feeder", d.cfg.Kubelet.WdInterval,
+		d.kubeletFeedTick).Run(ctx)
 }
 
 // kubeletFeederActive reports whether the feeder should probe this
@@ -35,29 +56,29 @@ func (h *Hygiene) runKubeletFeeder(ctx context.Context) {
 // ALSO passes by default on any worker node (k0sworker.service
 // present — the pilot graduated fleet-wide). WD_SIG_KUBELET_WATCHDOG
 // =off is the per-module kill switch, honoured live via WatchdogSrc.
-func (h *Hygiene) kubeletFeederActive() bool {
-	if wd := h.feederWatchdogConf(); wd != nil && !wd.SignalEnabled(checkKubeletWd) {
+func (d *deps) kubeletFeederActive() bool {
+	if wd := d.feederWatchdogConf(); wd != nil && !wd.SignalEnabled(checkKubeletWd) {
 		return false
 	}
-	for _, name := range h.cfg.Kubelet.WatchdogHosts {
-		if name == h.cfg.NodeName {
+	for _, name := range d.cfg.Kubelet.WatchdogHosts {
+		if name == d.cfg.NodeName {
 			return true
 		}
 	}
-	_, err := os.Stat(h.cfg.K0sWorkerUnitFile)
+	_, err := os.Stat(d.cfg.K0sWorkerUnitFile)
 	return err == nil
 }
 
 // feederWatchdogConf returns the freshest parsed node-watchdog.conf
 // WITHOUT mutating cfg — Cycle refreshes cfg.Watchdog itself; the
 // feeder goroutine must never write cfg fields (data race).
-func (h *Hygiene) feederWatchdogConf() *watchdogconf.Config {
-	if h.cfg.WatchdogSrc != nil {
-		return h.cfg.WatchdogSrc.Get()
+func (d *deps) feederWatchdogConf() *watchdogconf.Config {
+	if d.cfg.WatchdogSrc != nil {
+		return d.cfg.WatchdogSrc.Get()
 	}
 	// Without a reloader cfg.Watchdog is immutable — Cycle's refresh
 	// block is guarded by WatchdogSrc != nil too.
-	return h.cfg.Watchdog
+	return d.cfg.Watchdog
 }
 
 // --- kubelet watchdog feeder + remediate (T15) ---
@@ -88,34 +109,34 @@ func (h *Hygiene) feederWatchdogConf() *watchdogconf.Config {
 // kubeletFeedTick is one feeder round: probe :10248, count fails, run
 // the remediate gates at MaxFail — k0s-kubelet-watchdog.sh's loop
 // body minus the sd_notify feed (no watchdog unit exists in-agent).
-func (h *Hygiene) kubeletFeedTick(ctx context.Context) {
-	active := h.kubeletFeederActive()
-	if active && !h.kubeletFeederWasActive {
+func (d *deps) kubeletFeedTick(ctx context.Context) {
+	active := d.kubeletFeederActive()
+	if active && !d.kubeletFeederWasActive {
 		// false→true activation (first active tick, node re-added to
 		// systemd_watchdog_hosts, unit file reinstalled, WD_SIG
 		// lifted) — a partial fail-streak from before the gap is
 		// stale evidence and must not count toward a restart.
-		h.state.AppendLog(fmt.Sprintf(
+		d.state.AppendLog(fmt.Sprintf(
 			"kubelet-feeder: start interval=%ds maxfail=%d url=%s",
-			int(h.cfg.Kubelet.WdInterval.Seconds()), h.cfg.Kubelet.WdMaxFail,
-			h.cfg.Kubelet.WdProbeURL))
-		if h.kubeletWdFails > 0 {
-			h.state.AppendLog(fmt.Sprintf(
-				"kubelet-feeder: re-activated — dropping %d stale fails", h.kubeletWdFails))
+			int(d.cfg.Kubelet.WdInterval.Seconds()), d.cfg.Kubelet.WdMaxFail,
+			d.cfg.Kubelet.WdProbeURL))
+		if d.kubeletWdFails > 0 {
+			d.state.AppendLog(fmt.Sprintf(
+				"kubelet-feeder: re-activated — dropping %d stale fails", d.kubeletWdFails))
 		}
-		h.kubeletWdFails = 0
+		d.kubeletWdFails = 0
 	}
-	h.kubeletFeederWasActive = active
+	d.kubeletFeederWasActive = active
 	if !active {
 		return
 	}
-	if h.cfg.Seams.probeBodyOK(ctx, h.cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
-		if h.kubeletWdFails > 0 {
-			h.state.AppendLog(fmt.Sprintf(
-				"kubelet-feeder: probe OK again after %d fail", h.kubeletWdFails))
+	if d.cfg.Seams.probeBodyOK(ctx, d.cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
+		if d.kubeletWdFails > 0 {
+			d.state.AppendLog(fmt.Sprintf(
+				"kubelet-feeder: probe OK again after %d fail", d.kubeletWdFails))
 		}
-		h.kubeletWdFails = 0
-		h.state.Exit(hoststate.LatchKubeletHealthzDown, nil)
+		d.kubeletWdFails = 0
+		d.state.Exit(hoststate.LatchKubeletHealthzDown, nil)
 		return
 	}
 	// PartOf=k0sworker.service parity: the shell feeder unit stood
@@ -123,8 +144,8 @@ func (h *Hygiene) kubeletFeedTick(ctx context.Context) {
 	// accumulate fails toward a restart it doesn't want, and must not
 	// keep a healthz-down latch that escalates a deliberate stop into
 	// an NHC→SNR reboot.
-	if h.cfg.Systemd != nil {
-		active, err := h.cfg.Systemd.Active(ctx, "k0sworker.service")
+	if d.cfg.Systemd != nil {
+		active, err := d.cfg.Systemd.Active(ctx, "k0sworker.service")
 		if err != nil {
 			// Fail closed: the gate can't be evaluated — freeze
 			// this tick entirely. Accumulating fails could escalate
@@ -136,38 +157,38 @@ func (h *Hygiene) kubeletFeedTick(ctx context.Context) {
 			return
 		}
 		if !active {
-			if h.kubeletWdFails > 0 {
-				h.state.AppendLog("kubelet-feeder: k0sworker not active — fails reset (PartOf parity)")
+			if d.kubeletWdFails > 0 {
+				d.state.AppendLog("kubelet-feeder: k0sworker not active — fails reset (PartOf parity)")
 			}
-			h.kubeletWdFails = 0
-			h.state.Exit(hoststate.LatchKubeletHealthzDown, nil)
+			d.kubeletWdFails = 0
+			d.state.Exit(hoststate.LatchKubeletHealthzDown, nil)
 			return
 		}
 	}
-	h.kubeletWdFails++
-	h.state.AppendLog(fmt.Sprintf("kubelet-feeder: probe fail %d/%d",
-		h.kubeletWdFails, h.cfg.Kubelet.WdMaxFail))
-	if h.kubeletWdFails < h.cfg.Kubelet.WdMaxFail {
+	d.kubeletWdFails++
+	d.state.AppendLog(fmt.Sprintf("kubelet-feeder: probe fail %d/%d",
+		d.kubeletWdFails, d.cfg.Kubelet.WdMaxFail))
+	if d.kubeletWdFails < d.cfg.Kubelet.WdMaxFail {
 		return
 	}
-	h.state.AppendLog(fmt.Sprintf(
+	d.state.AppendLog(fmt.Sprintf(
 		"kubelet-feeder: %d consecutive fails (~%ds) — running remediation gates",
-		h.kubeletWdFails,
-		int(h.cfg.Kubelet.WdInterval.Seconds())*h.cfg.Kubelet.WdMaxFail))
-	h.runKubeletRemediate(ctx)
+		d.kubeletWdFails,
+		int(d.cfg.Kubelet.WdInterval.Seconds())*d.cfg.Kubelet.WdMaxFail))
+	d.runKubeletRemediate(ctx)
 	// Re-arm like the shell's exit-1 → unit fail → OnFailure →
 	// Restart=always round: the remediate pass ENDS this fails run
 	// whatever the gates decided.
-	h.kubeletWdFails = 0
+	d.kubeletWdFails = 0
 }
 
 // runKubeletRemediate is the ordered-gate port of
 // k0sworker-remediate.sh — a probe failure does NOT prove the kubelet
 // is dead (the probe may just be timing out under steal); every gate
 // is a chance to stop before the shared last-restart budget is spent.
-func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
-	h.actions.WithLabelValues(checkKubeletWd, "remediate").Inc()
-	h.state.AppendLog("kubelet-remediate: healthz :10248 down ~60s — running ordered gates before k0sworker restart")
+func (d *deps) runKubeletRemediate(ctx context.Context) {
+	d.actions.WithLabelValues(checkKubeletWd, "remediate").Inc()
+	d.state.AppendLog("kubelet-remediate: healthz :10248 down ~60s — running ordered gates before k0sworker restart")
 
 	// G0 re-probe — the shell's Gate 1: probe :10248 twice ~3s apart
 	// before ANYTHING else. Four failed ticks do not prove a dead
@@ -176,27 +197,27 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 	// (drop the fail streak and any escalation latch), never spend a
 	// restart on a healthy kubelet.
 	for i := 1; i <= 2; i++ {
-		if h.cfg.Seams.probeBodyOK(ctx, h.cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
-			h.state.AppendLog(fmt.Sprintf(
+		if d.cfg.Seams.probeBodyOK(ctx, d.cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
+			d.state.AppendLog(fmt.Sprintf(
 				"kubelet-remediate: SKIP(G0-reprobe) :10248 answered 'ok' on re-probe %d — false alarm (steal blip), self-correcting", i))
-			h.kubeletWdFails = 0
-			h.state.Exit(hoststate.LatchKubeletHealthzDown, nil)
+			d.kubeletWdFails = 0
+			d.state.Exit(hoststate.LatchKubeletHealthzDown, nil)
 			return
 		}
 		if i < 2 {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(h.cfg.Kubelet.WdReprobeGap):
+			case <-time.After(d.cfg.Kubelet.WdReprobeGap):
 			}
 		}
 	}
-	h.state.AppendLog("kubelet-remediate: G0 :10248 still dead after 2 re-probes — continuing ordered gates")
+	d.state.AppendLog("kubelet-remediate: G0 :10248 still dead after 2 re-probes — continuing ordered gates")
 
 	// G1 uptime (WD_REQUIRES: uptime) — a node <20m up is still
 	// bringing kubelet online; a restart inside the window only churns.
-	if up, err := h.proc.UptimeSeconds(); err == nil && up < minUptimeSeconds {
-		h.state.AppendLog(fmt.Sprintf(
+	if up, err := d.proc.UptimeSeconds(); err == nil && up < minUptimeSeconds {
+		d.state.AppendLog(fmt.Sprintf(
 			"kubelet-remediate: SKIP(G1-uptime) uptime %.0fs < %ds", up, minUptimeSeconds))
 		return
 	}
@@ -206,23 +227,23 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 	// still be initialising; spending the budget now just resets that
 	// init cycle. An unreadable timestamp also skips (never restart
 	// blind).
-	if !h.k0sWorkerSettled(ctx) {
-		h.state.AppendLog("kubelet-remediate: SKIP(G2-settle) k0sworker active <180s or timestamp unreadable")
+	if !d.k0sWorkerSettled(ctx) {
+		d.state.AppendLog("kubelet-remediate: SKIP(G2-settle) k0sworker active <180s or timestamp unreadable")
 		return
 	}
 
 	// G3 overload — a kubelet wedge under CPU starvation is a
 	// symptom, not a dead kubelet; restarting dumps its load onto the
 	// surviving nodes (amplifier).
-	if h.state.Exists(hoststate.LatchNodeOverloaded) {
-		h.state.AppendLog("kubelet-remediate: SKIP(G3-overload) state-node-overloaded latched")
+	if d.state.Exists(hoststate.LatchNodeOverloaded) {
+		d.state.AppendLog("kubelet-remediate: SKIP(G3-overload) state-node-overloaded latched")
 		return
 	}
 
 	// G4 apiserver — a node that reaches NO API backend is isolated;
 	// restarting kubelet only adds a NotReady blip + resync churn.
-	if !h.anyAPIBackendLive(ctx) {
-		h.state.AppendLog("kubelet-remediate: SKIP(G4-apiserver) no API backend answers /livez — node isolated")
+	if !d.anyAPIBackendLive(ctx) {
+		d.state.AppendLog("kubelet-remediate: SKIP(G4-apiserver) no API backend answers /livez — node isolated")
 		return
 	}
 
@@ -232,9 +253,9 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 	// (rateTrySpend) or a stall/watch restart could pass the same
 	// window and double-restart. Exhausted → escalate to the NHC→SNR
 	// reboot path via the latch instead of piling on.
-	if !h.state.RateTrySpend("last-restart", h.cfg.MinRestartInterval) {
-		h.state.Enter(hoststate.LatchKubeletHealthzDown, "restart-budget-exhausted")
-		h.state.AppendLog("kubelet-remediate: SKIP(G5-ratelimit) k0sworker restart <30m ago — " +
+	if !d.state.RateTrySpend("last-restart", d.cfg.MinRestartInterval) {
+		d.state.Enter(hoststate.LatchKubeletHealthzDown, "restart-budget-exhausted")
+		d.state.AppendLog("kubelet-remediate: SKIP(G5-ratelimit) k0sworker restart <30m ago — " +
 			"state-kubelet-healthz-down latched (NHC→SNR escalation)")
 		return
 	}
@@ -242,17 +263,17 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 	// G6 act — the budget was already spent atomically above (shell
 	// parity: a hung/failed restart still consumed it). reset-failed
 	// first so a stale failed state can't wedge the unit's next start.
-	h.state.AppendLog(fmt.Sprintf(
+	d.state.AppendLog(fmt.Sprintf(
 		"ACTION: restarting k0sworker (reason=systemd-watchdog-kubelet-healthz-60s fails=%d)",
-		h.cfg.Kubelet.WdMaxFail))
-	h.resetFailedK0sWorker(ctx)
-	if err := h.restartK0sWorker(ctx); err != nil {
-		h.state.AppendLog(fmt.Sprintf(
+		d.cfg.Kubelet.WdMaxFail))
+	d.resetFailedK0sWorker(ctx)
+	if err := d.restartK0sWorker(ctx); err != nil {
+		d.state.AppendLog(fmt.Sprintf(
 			"kubelet-remediate: G6 restart k0sworker FAIL: %v (budget spent)", err))
 		return
 	}
-	h.state.AppendLog("kubelet-remediate: G6 k0sworker restarted")
-	h.actions.WithLabelValues(checkKubeletWd, "restart").Inc()
+	d.state.AppendLog("kubelet-remediate: G6 k0sworker restarted")
+	d.actions.WithLabelValues(checkKubeletWd, "restart").Inc()
 }
 
 // anyAPIBackendLive is the G4 probe — the shell TCP-checked the
@@ -262,9 +283,9 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 // ANY HTTP response as reachable (curl -sk parity — even a 500 means
 // the listener is alive). With no backends configured it falls back
 // to the worker-local api-local-lb listener (APIFallbackURL).
-func (h *Hygiene) anyAPIBackendLive(ctx context.Context) bool {
+func (d *deps) anyAPIBackendLive(ctx context.Context) bool {
 	var urls []string
-	if wd := h.feederWatchdogConf(); wd != nil {
+	if wd := d.feederWatchdogConf(); wd != nil {
 		for _, b := range wd.APIBackends {
 			if b.Addr != "" {
 				urls = append(urls,
@@ -272,15 +293,15 @@ func (h *Hygiene) anyAPIBackendLive(ctx context.Context) bool {
 			}
 		}
 	}
-	if len(urls) == 0 && h.cfg.WatchdogSrc == nil {
+	if len(urls) == 0 && d.cfg.WatchdogSrc == nil {
 		// No reloader → cfg.APIBackends is immutable (Cycle refreshes
 		// it from the conf only when a reloader exists).
-		for _, a := range h.cfg.APIBackends {
+		for _, a := range d.cfg.APIBackends {
 			urls = append(urls, "https://"+withDefaultAPIPort(a)+"/livez")
 		}
 	}
 	if len(urls) == 0 {
-		urls = []string{h.cfg.Kubelet.APIFallbackURL}
+		urls = []string{d.cfg.Kubelet.APIFallbackURL}
 	}
 	for _, url := range urls {
 		// probeHTTPStatus, not probeHTTP: the verdict is liveness,
@@ -288,7 +309,7 @@ func (h *Hygiene) anyAPIBackendLive(ctx context.Context) bool {
 		// answered (curl -sk parity; a 2xx-only read made an
 		// auth-refusing or LB-degraded endpoint look "unreachable"
 		// and falsely gated remediation as isolated).
-		if _, err := h.cfg.Seams.probeHTTPStatus(ctx, url, "",
+		if _, err := d.cfg.Seams.probeHTTPStatus(ctx, url, "",
 			apiLivezProbeTimeout); err == nil {
 			return true
 		}
@@ -320,13 +341,13 @@ func withDefaultAPIPort(addr string) string {
 // start, not a retry of a queued failed job. Best-effort: an error is
 // logged, never fatal; a nil Systemd client (unwired agent/tests) is
 // a no-op.
-func (h *Hygiene) resetFailedK0sWorker(ctx context.Context) {
-	if h.cfg.Systemd == nil {
+func (d *deps) resetFailedK0sWorker(ctx context.Context) {
+	if d.cfg.Systemd == nil {
 		return
 	}
-	if out, err := h.cfg.Systemd.Exec(ctx,
+	if out, err := d.cfg.Systemd.Exec(ctx,
 		"systemctl", "reset-failed", "k0sworker.service"); err != nil {
-		h.state.AppendLog(fmt.Sprintf(
+		d.state.AppendLog(fmt.Sprintf(
 			"kubelet-remediate: reset-failed k0sworker failed: %v (%s)",
 			err, strings.TrimSpace(out)))
 	}

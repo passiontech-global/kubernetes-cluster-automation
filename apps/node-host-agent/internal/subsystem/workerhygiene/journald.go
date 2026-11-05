@@ -4,9 +4,31 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 )
+
+const (
+	// journalWindow mirrors the runner's `journalctl -u k0sworker
+	// --since "-10 min"` shared snapshot.
+	journalWindow = "-10 min"
+	// journaldVacuumInterval bounds how often the A5 remedy runs —
+	// journalctl --rotate is cheap but --vacuum-time does real IO.
+	journaldVacuumInterval = 30 * time.Minute
+	// defaultJournalUnreadableNeeded is the consecutive-failed-read
+	// budget for the journal-unreadable blindness latch (cicd
+	// controller incident: broken journald left every journal-based
+	// check silently seeing "0 hits").
+	defaultJournalUnreadableNeeded = 5
+)
+
+// stateJournalUnreadable is the blindness latch the journal-read
+// accounting sets: journald installed (journal storage exists) but
+// every read produces nothing — the 05/06 signature greps and the
+// nodereporter journal monitors are blind until it clears.
+const stateJournalUnreadable = hoststate.LatchJournalUnreadable
 
 // noteJournalRead feeds one classified journal read into the
 // journal-unreadable tracker and drives the latch on transitions:
@@ -17,27 +39,27 @@ import (
 // vanished — config change, not blindness). The journalDir gate
 // lives inside the tracker: a host with no journald storage never
 // fires — every read failing is then configuration, not a fault.
-func (h *Hygiene) noteJournalRead(ok bool, detail string) {
-	enter, exit := h.journalReads.NoteRead(ok)
-	if enter && !h.state.Exists(stateJournalUnreadable) {
-		h.state.Enter(stateJournalUnreadable, detail)
-		h.state.AppendLog(fmt.Sprintf(
+func (d *deps) noteJournalRead(ok bool, detail string) {
+	enter, exit := d.journalReads.NoteRead(ok)
+	if enter && !d.state.Exists(stateJournalUnreadable) {
+		d.state.Enter(stateJournalUnreadable, detail)
+		d.state.AppendLog(fmt.Sprintf(
 			"suspect: journal-unreadable %s — %d consecutive journal "+
 				"reads produced nothing while journal storage exists; "+
 				"every journal-grep check is blind",
-			detail, h.journalReads.Fails()))
-		h.cycles.WithLabelValues(checkJournald, "journal_unreadable").Inc()
-	} else if h.journalReads.Latched() &&
-		!h.state.Exists(stateJournalUnreadable) {
+			detail, d.journalReads.Fails()))
+		d.cycles.WithLabelValues(checkJournald, "journal_unreadable").Inc()
+	} else if d.journalReads.Latched() &&
+		!d.state.Exists(stateJournalUnreadable) {
 		// Re-establish after external removal: the latch file can
 		// vanish while the tracker stays latched (janitor 24h reap,
 		// manual rm) and `enter` is a once-per-episode edge that
 		// won't fire again — without this the metric/condition go
 		// dark mid-episode.
-		h.state.Enter(stateJournalUnreadable, detail)
+		d.state.Enter(stateJournalUnreadable, detail)
 	}
 	if exit {
-		h.state.Exit(stateJournalUnreadable, nil)
+		d.state.Exit(stateJournalUnreadable, nil)
 	}
 }
 
@@ -60,10 +82,10 @@ func (h *Hygiene) noteJournalRead(ok bool, detail string) {
 
 // journaldCheck is the A5 probe as a Check. It owns the
 // corrupt/empty streak (ex-Hygiene.journaldFails); the
-// journal-unreadable tracker stays on Hygiene — Cycle's shared
+// journal-unreadable tracker stays on deps — Cycle's shared
 // journalOnce snapshot also feeds it through noteJournalRead.
 type journaldCheck struct {
-	h     *Hygiene
+	d     *deps
 	fails int // consecutive corrupt/empty cycles (ConsecNeeded → remedy)
 }
 
@@ -73,10 +95,10 @@ func (c *journaldCheck) Name() string { return checkJournald }
 // Run executes one journald-integrity round.
 func (c *journaldCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkJournald, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkJournald, "gated").Inc()
 		return
 	}
-	out, err := c.h.cfg.Seams.journalFn(ctx)
+	out, err := c.d.cfg.Seams.journalFn(ctx)
 	// Only OUTPUT evidence counts as corruption: an exec-level error
 	// (nsenter/journalctl timeout, transient host exec failure) means
 	// journald never answered — that is journal-UNREADABLE, not
@@ -96,7 +118,7 @@ func (c *journaldCheck) Run(ctx context.Context, e *cycleEnv) {
 		// Any line means journald is fine and the unit is just
 		// silent; an error, an empty reply, or a "corrupt" warning
 		// is journald-level anomaly — only then remediate.
-		unfiltered, uerr = c.h.cfg.Seams.journalAnyFn(ctx)
+		unfiltered, uerr = c.d.cfg.Seams.journalAnyFn(ctx)
 		if uerr == nil && strings.TrimSpace(unfiltered) != "" &&
 			!strings.Contains(strings.ToLower(unfiltered), "corrupt") {
 			empty = false
@@ -125,51 +147,51 @@ func (c *journaldCheck) Run(ctx context.Context, e *cycleEnv) {
 			unreadable, udetail = true, "journald-wide empty reply"
 		}
 	}
-	c.h.noteJournalRead(!unreadable, udetail)
+	c.d.noteJournalRead(!unreadable, udetail)
 	switch {
 	case corrupt, empty:
 		c.fails++
-		if c.fails < c.h.cfg.ConsecNeeded {
-			c.h.state.AppendLog(fmt.Sprintf(
+		if c.fails < c.d.cfg.ConsecNeeded {
+			c.d.state.AppendLog(fmt.Sprintf(
 				"suspect: journald-integrity journal corrupt=%v empty=%v err=%v while k0sworker active (check %d/%d)",
-				corrupt, empty, err, c.fails, c.h.cfg.ConsecNeeded))
-			c.h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+				corrupt, empty, err, c.fails, c.d.cfg.ConsecNeeded))
+			c.d.cycles.WithLabelValues(checkJournald, "ok").Inc()
 			return
 		}
 	case err != nil:
 		// Exec failure without corruption evidence — inconclusive
 		// (the unreadable tracker owns this signal): keep the fail
 		// streak intact but never grow it, and never vacuum.
-		c.h.cycles.WithLabelValues(checkJournald, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkJournald, "abort").Inc()
 		return
 	default:
 		c.fails = 0
-		c.h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkJournald, "ok").Inc()
 		return
 	}
-	if c.h.cfg.Systemd == nil {
-		c.h.cycles.WithLabelValues(checkJournald, "gated").Inc()
+	if c.d.cfg.Systemd == nil {
+		c.d.cycles.WithLabelValues(checkJournald, "gated").Inc()
 		return
 	}
-	if !c.h.state.RateTrySpend("last-journald-vacuum", journaldVacuumInterval) {
-		c.h.state.AppendLog("suspect: journald-integrity confirmed but vacuum " +
+	if !c.d.state.RateTrySpend("last-journald-vacuum", journaldVacuumInterval) {
+		c.d.state.AppendLog("suspect: journald-integrity confirmed but vacuum " +
 			"cooldown active — skip")
-		c.h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkJournald, "ok").Inc()
 		return
 	}
-	c.h.state.AppendLog(fmt.Sprintf(
+	c.d.state.AppendLog(fmt.Sprintf(
 		"ACTION: journalctl --rotate --vacuum-time=3d - journal corrupt=%v empty=%v err=%v for active k0sworker",
 		corrupt, empty, err))
-	if jout, jerr := c.h.cfg.Systemd.Exec(ctx,
+	if jout, jerr := c.d.cfg.Systemd.Exec(ctx,
 		"journalctl", "--rotate", "--vacuum-time=3d"); jerr != nil {
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: journalctl --rotate --vacuum-time=3d failed: %v (%s)",
 			jerr, strings.TrimSpace(jout)))
 	} else {
-		c.h.actions.WithLabelValues(checkJournald, "rotate_vacuum").Inc()
+		c.d.actions.WithLabelValues(checkJournald, "rotate_vacuum").Inc()
 	}
 	c.fails = 0
-	c.h.cycles.WithLabelValues(checkJournald, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkJournald, "ok").Inc()
 }
 
 // --- Check: cilium-envoy readiness + agent healthz (2.5 & B1) ---

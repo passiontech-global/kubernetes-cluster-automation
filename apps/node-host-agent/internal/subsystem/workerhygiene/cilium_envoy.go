@@ -16,6 +16,11 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
+const (
+	defaultCiliumEnvoyReadyURL = "http://127.0.0.1:9964/ready"
+	defaultCiliumEnvoyAdminURL = "http://127.0.0.1:9901/stats?filter=update_rejected"
+)
+
 // ciliumUnhealthySubsystems lists healthz subsystem paths whose
 // state is neither Ok nor Disabled — nested maps are walked so
 // {"cluster":{"cilium":{"state":"Failure"}}} resolves too.
@@ -50,11 +55,11 @@ func ciliumUnhealthySubsystems(body []byte) []string {
 // ciliumEnvoyCheck is the B1/W7-H3 envoy guard as a Check. It owns
 // the /ready fail streak and the xDS NACK bookkeeping
 // (ex-Hygiene.envoyFails/.envoyXDS*). The ciliumAgentKilled flag
-// stays on Hygiene — it's shared state: any of the cilium,
+// stays on deps — it's shared state: any of the cilium,
 // cilium-init or wg-peers checks can set it through
 // killCiliumAgent earlier in the same Cycle.
 type ciliumEnvoyCheck struct {
-	h        *Hygiene
+	d        *deps
 	fails    int    // consecutive /ready fails (ConsecNeeded → kill)
 	xdsInit  bool   // baseline update_rejected sum established
 	xdsLast  uint64 // last-seen update_rejected sum
@@ -67,37 +72,37 @@ func (c *ciliumEnvoyCheck) Name() string { return checkCiliumEnvoy }
 // Run executes one cilium-envoy round.
 func (c *ciliumEnvoyCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumEnvoy, "gated").Inc()
 		return
 	}
-	tasks, reachable := c.h.ciliumNamedTasks("cilium-envoy")
+	tasks, reachable := c.d.ciliumNamedTasks("cilium-envoy")
 	if !reachable {
-		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumEnvoy, "abort").Inc()
 		return
 	}
 	if len(tasks) == 0 {
 		// No cilium-envoy container — older cilium or no L7 proxy:
 		// clear any stale latch like checkCilium does.
 		c.fails = 0
-		c.h.state.Exit(hoststate.LatchCiliumEnvoyDown, nil)
-		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+		c.d.state.Exit(hoststate.LatchCiliumEnvoyDown, nil)
+		c.d.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
 	// 2.5: subsystem/datapath health off the agent socket is
 	// evidence only — an unreadable socket must not block the envoy
 	// verdict (the admin port is the primary signal).
-	if body, err := c.h.cfg.Seams.unixGet(ctx, c.h.cfg.Cilium.Socket, "/v1/healthz"); err == nil {
+	if body, err := c.d.cfg.Seams.unixGet(ctx, c.d.cfg.Cilium.Socket, "/v1/healthz"); err == nil {
 		if bad := ciliumUnhealthySubsystems(body); len(bad) > 0 {
-			c.h.state.AppendLog(
+			c.d.state.AppendLog(
 				"suspect: cilium subsystem health degraded: " +
 					strings.Join(bad, ","))
 		}
 	}
 	// Trigger 1: the agent was SIGKILLed this cycle — envoy may hold
 	// the stale socket, restart it alongside (B1).
-	if c.h.ciliumAgentKilled {
+	if c.d.ciliumAgentKilled {
 		c.killCiliumEnvoy(tasks, "cilium-agent restarted this cycle")
-		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
 	// W7-H3: xDS NACK guard — envoy can answer /ready=200 while
@@ -115,37 +120,37 @@ func (c *ciliumEnvoyCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.xdsFails++
 	} else {
 		c.xdsFails = 0
-		c.h.state.Exit(hoststate.LatchCiliumEnvoyXDSReject, nil)
+		c.d.state.Exit(hoststate.LatchCiliumEnvoyXDSReject, nil)
 	}
-	if c.xdsFails >= c.h.cfg.ConsecNeeded {
-		c.h.state.Enter(hoststate.LatchCiliumEnvoyXDSReject,
+	if c.xdsFails >= c.d.cfg.ConsecNeeded {
+		c.d.state.Enter(hoststate.LatchCiliumEnvoyXDSReject,
 			fmt.Sprintf("update_rejected=%d fails=%d",
 				c.xdsLast, c.xdsFails))
 		c.killCiliumEnvoy(tasks,
 			fmt.Sprintf("xDS update_rejected deltas %d consecutive cycles",
 				c.xdsFails))
 	}
-	code, err := c.h.cfg.Seams.probeHTTPStatus(ctx,
-		c.h.cfg.Cilium.EnvoyReadyURL, "", ciliumProbeTime)
+	code, err := c.d.cfg.Seams.probeHTTPStatus(ctx,
+		c.d.cfg.Cilium.EnvoyReadyURL, "", ciliumProbeTime)
 	if err == nil && code == http.StatusOK {
 		c.fails = 0
-		c.h.state.Exit(hoststate.LatchCiliumEnvoyDown, nil)
-		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+		c.d.state.Exit(hoststate.LatchCiliumEnvoyDown, nil)
+		c.d.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
 	c.fails++
-	if c.fails < c.h.cfg.ConsecNeeded {
-		c.h.state.AppendLog(fmt.Sprintf(
+	if c.fails < c.d.cfg.ConsecNeeded {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-envoy-down ready probe code=%d err=%v (check %d/%d)",
-			code, err, c.fails, c.h.cfg.ConsecNeeded))
-		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+			code, err, c.fails, c.d.cfg.ConsecNeeded))
+		c.d.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
-	c.h.state.Enter(hoststate.LatchCiliumEnvoyDown,
+	c.d.state.Enter(hoststate.LatchCiliumEnvoyDown,
 		fmt.Sprintf("ready_probe_fails=%d", c.fails))
 	c.killCiliumEnvoy(tasks,
 		fmt.Sprintf("unready %d consecutive cycles", c.fails))
-	c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 }
 
 // checkCiliumEnvoy forwards to the migrated Check — tests written
@@ -158,18 +163,18 @@ func (h *Hygiene) checkCiliumEnvoy(ctx context.Context, workerActive bool) {
 // pids — kubelet rebuilds it like the agent path. The dedicated
 // budget keeps envoy kills from eating the agent's restart rate.
 func (c *ciliumEnvoyCheck) killCiliumEnvoy(tasks []ctrTask, why string) {
-	if !c.h.state.RateTrySpend("last-cilium-envoy-restart", c.h.cfg.MinRestartInterval) {
-		c.h.state.AppendLog(fmt.Sprintf(
+	if !c.d.state.RateTrySpend("last-cilium-envoy-restart", c.d.cfg.MinRestartInterval) {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-envoy kill skipped (%s) — restart cooldown (<30m)", why))
 		return
 	}
-	if c.h.killNamedTasks(tasks, "cilium-envoy") {
-		c.h.state.AppendLog(fmt.Sprintf(
+	if c.d.killNamedTasks(tasks, "cilium-envoy") {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"ACTION: killed cilium-envoy container - %s (kubelet will restart -> xDS resync)", why))
 		c.fails = 0
-		c.h.actions.WithLabelValues(checkCiliumEnvoy, "sigkill").Inc()
+		c.d.actions.WithLabelValues(checkCiliumEnvoy, "sigkill").Inc()
 	} else {
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-envoy kill skipped (%s) — no running task to kill", why))
 	}
 }
@@ -212,10 +217,10 @@ func parseEnvoyXDSRejected(body []byte) uint64 {
 // caller keeps the streak untouched (a dead envoy also fails its
 // /ready probe and the B1 path owns that verdict).
 func (c *ciliumEnvoyCheck) evalEnvoyXDS(ctx context.Context) (reject, inconclusive bool) {
-	if c.h.cfg.Cilium.EnvoyAdminURL == "" {
+	if c.d.cfg.Cilium.EnvoyAdminURL == "" {
 		return false, true
 	}
-	body, err := c.h.cfg.Seams.httpGetBody(ctx, c.h.cfg.Cilium.EnvoyAdminURL, ciliumProbeTime)
+	body, err := c.d.cfg.Seams.httpGetBody(ctx, c.d.cfg.Cilium.EnvoyAdminURL, ciliumProbeTime)
 	if err != nil {
 		return false, true
 	}
