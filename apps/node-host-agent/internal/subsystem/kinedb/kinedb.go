@@ -48,7 +48,6 @@
 package kinedb
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -64,6 +63,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	yaml "go.yaml.in/yaml/v3"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 )
@@ -146,7 +146,7 @@ var (
 
 // runner executes argv with optional stdin — the single command seam
 // (podman/docker exec, logs, inspect). The default wires
-// exec.CommandContext and returns CLEAN stdout: stderr is captured
+// hostexec.Run and returns CLEAN stdout: stderr is captured
 // separately — folded into the error on failure, debug-logged on
 // success — so psql WARNING/NOTICE/version-skew lines cannot poison
 // the exact-match stdout parsers.
@@ -290,27 +290,21 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.run == nil {
 		c.run = func(ctx context.Context, argv []string, stdin string) (string, error) {
-			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-			if stdin != "" {
-				cmd.Stdin = strings.NewReader(stdin)
-			}
+			out, serr, err := hostexec.Run(ctx, argv, stdin)
 			// stderr stays out of the returned output — the same
-			// split as etcdrescue's CmdRunner. A psql WARNING or a
+			// split as etcdmaint's CmdRunner. A psql WARNING or a
 			// "server version" notice on stderr would otherwise
 			// merge into stdout and break the `== "1"` and a|b|c
 			// parsers.
-			var stderr bytes.Buffer
-			cmd.Stderr = &stderr
-			out, err := cmd.Output()
-			serr := strings.TrimSpace(stderr.String())
+			serr = strings.TrimSpace(serr)
 			switch {
 			case err != nil && serr != "":
-				return string(out), fmt.Errorf("%w: %s", err, serr)
+				return out, fmt.Errorf("%w: %s", err, serr)
 			case serr != "":
 				logger().Debug("kinedb command stderr",
 					"cmd", argv[0], "stderr", serr)
 			}
-			return string(out), err
+			return out, err
 		}
 	}
 	if c.wireFn == nil {
