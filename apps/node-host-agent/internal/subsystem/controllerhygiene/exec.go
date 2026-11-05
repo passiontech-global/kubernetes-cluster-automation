@@ -30,9 +30,10 @@ const defaultRestartBudget = 90 * time.Second
 // journalctl processes cannot sd_notify back to our unit — the
 // `env -u NOTIFY_SOCKET -u WATCHDOG_PID -u WATCHDOG_USEC` fix the
 // feeder applies (systemd>=255 auto-sends EXIT_STATUS otherwise).
-// Used by the commands that still run container-side (etcdctl's
-// stderr capture needs exec.Cmd fields the hostexec seam does not
-// expose; kine_storage's sqlite3 runs the pod-visible binary).
+// Used by the container-side exec whose env the argv form cannot
+// reach: kine_storage's sqlite3 passes the scrubbed environ through
+// hostexec.RunCombinedEnv (etcdctl needs no scrub — it goes through
+// hostexec.Run for the separate-stderr capture instead).
 // Commands routed through the shared systemd client get the argv
 // equivalent — scrubArgv.
 func scrubSystemdEnv(env []string) []string {
