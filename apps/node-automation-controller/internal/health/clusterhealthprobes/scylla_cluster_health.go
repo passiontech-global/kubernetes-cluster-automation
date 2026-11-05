@@ -21,12 +21,27 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
+
+// scyllaHealthCheck is the W9-ST1 scylla cluster health watchdog.
+type scyllaHealthCheck struct {
+	*deps
+
+	// W9-ST1 watchdog state (under mu):
+	//   - scyllaFirstSeen: "member/ns/svc" | "gossip/ns/pod/uid" →
+	//     first sweep the signature showed; it must persist
+	//     scyllaSignatureMinAge before the gauge fires (the
+	//     degraded_condition reason carries its own clock — the CR
+	//     condition's lastTransitionTime). Pruned on resolve.
+	//   - scyllaEmitted: "ns/cluster/reason" gauge tuples held at 1 —
+	//     same DeleteLabelValues hygiene as the other emitted sets.
+	scyllaFirstSeen map[string]time.Time
+	scyllaEmitted   map[string]bool
+}
 
 const (
 	// W9-ST1 — scylla-cluster-health knobs.
@@ -45,8 +60,7 @@ const (
 
 // scyllaClusterGVR is the ScyllaCluster CR the W9-ST1 auditor reads —
 // the same GVR the W5.8 scylla-operator watchdog scans.
-var scyllaClusterGVR = schema.GroupVersionResource{
-	Group: "scylla.scylladb.com", Version: "v1", Resource: "scyllaclusters"}
+var scyllaClusterGVR = shared.GVRScyllaCluster
 
 // ---------------------------------------------------------------------------
 // W9-ST1 — scylla-cluster-health
@@ -74,19 +88,11 @@ var scyllaGossipPatterns = []*regexp.Regexp{
 // status.conditions entry's status and lastTransitionTime — ""
 // and the zero time when absent or malformed.
 func unstructuredCondStatus(obj *unstructured.Unstructured, typ string) (string, time.Time) {
-	for _, c := range shared.ReadyConds(obj) {
-		if c["type"] != typ {
-			continue
-		}
-		s, _ := c["status"].(string)
-		ts, _ := c["lastTransitionTime"].(string)
-		t, err := time.Parse(time.RFC3339, ts)
-		if err != nil {
-			return s, time.Time{}
-		}
-		return s, t
+	c, ok := shared.ConditionOf(obj.Object, typ)
+	if !ok {
+		return "", time.Time{}
 	}
-	return "", time.Time{}
+	return c.Status, c.LastTransitionTime
 }
 
 // scyllaFinding is one live unhealthy signature resolved to its gauge
@@ -125,7 +131,7 @@ func scyllaPodTroubled(pod *corev1.Pod) bool {
 // (same posture as the coredns watchdog's log probe); a stream/read
 // failure is inconclusive — returned as an error so the caller logs
 // it rather than reading "no match" as "healthy".
-func (p *clusterHealthProber) scyllaGossipLogHit(ctx context.Context, pod *corev1.Pod) (bool, error) {
+func (p *scyllaHealthCheck) scyllaGossipLogHit(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	lctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	tail := scyllaGossipTailLines
@@ -171,7 +177,7 @@ func (p *clusterHealthProber) scyllaGossipLogHit(ctx context.Context, pod *corev
 // Every signature must persist its window before
 // node_automation_scylla_unhealthy{reason}=1 fires; a resolved tuple
 // is DeleteLabelValues'd, never left stale at 1.
-func (p *clusterHealthProber) checkScyllaHealth(ctx context.Context) probeResult {
+func (p *scyllaHealthCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	// The CR scan needs dyn — a missing client is a wiring bug, not
 	// "no signal" (same posture as the OLM check).
@@ -237,40 +243,37 @@ func (p *clusterHealthProber) checkScyllaHealth(ctx context.Context) probeResult
 		return probeResult{infra: fmt.Errorf("list services: %w", err)}
 	}
 	esAddrs := map[string]map[string]bool{} // "ns/svc" -> endpoint addresses
-	sliceOpts := metav1.ListOptions{Limit: healthListPageSize}
-	for {
-		page, err := p.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).
-			List(ctx, sliceOpts)
-		if err != nil {
-			return probeResult{infra: fmt.Errorf("list endpointslices: %w", err)}
-		}
-		for _, s := range page.Items {
-			svc := s.Labels[discoveryv1.LabelServiceName]
-			if svc == "" {
-				continue
-			}
-			key := s.Namespace + "/" + svc
-			set := esAddrs[key]
-			if set == nil {
-				set = map[string]bool{}
-				esAddrs[key] = set
-			}
-			for _, ep := range s.Endpoints {
-				// Ready-only — a slice holding the pod IP but
-				// marked unready is still a desync for traffic.
-				// nil Ready counts as ready (k8s convention).
-				if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+	err = shared.ListEach(ctx,
+		metav1.ListOptions{Limit: healthListPageSize},
+		shared.EndpointSlices(p.cs, metav1.NamespaceAll),
+		func(items []discoveryv1.EndpointSlice) error {
+			for _, s := range items {
+				svc := s.Labels[discoveryv1.LabelServiceName]
+				if svc == "" {
 					continue
 				}
-				for _, a := range ep.Addresses {
-					set[a] = true
+				key := s.Namespace + "/" + svc
+				set := esAddrs[key]
+				if set == nil {
+					set = map[string]bool{}
+					esAddrs[key] = set
+				}
+				for _, ep := range s.Endpoints {
+					// Ready-only — a slice holding the pod IP but
+					// marked unready is still a desync for traffic.
+					// nil Ready counts as ready (k8s convention).
+					if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+						continue
+					}
+					for _, a := range ep.Addresses {
+						set[a] = true
+					}
 				}
 			}
-		}
-		if page.Continue == "" {
-			break
-		}
-		sliceOpts.Continue = page.Continue
+			return nil
+		})
+	if err != nil {
+		return probeResult{infra: fmt.Errorf("list endpointslices: %w", err)}
 	}
 
 	podsByKey := map[string]*corev1.Pod{}

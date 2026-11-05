@@ -8,12 +8,15 @@ import (
 
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
 func TestSetupRegistersPeriodic(t *testing.T) {
+	t.Setenv("APISERVICE_GUARD_ENABLED", "true")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), testutil.StubDyn(), true); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "apiservice-guard", 5*time.Minute)
@@ -23,9 +26,10 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 // (APISERVICE_GUARD_ENABLED=false) — same contract as
 // cert-drift-auditor: no Periodic, no tick.
 func TestSetupDisabled(t *testing.T) {
+	t.Setenv("APISERVICE_GUARD_ENABLED", "false")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(),
-		testutil.StubDyn(), false); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {

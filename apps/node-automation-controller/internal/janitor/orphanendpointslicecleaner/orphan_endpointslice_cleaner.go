@@ -38,12 +38,12 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -88,14 +88,14 @@ type orphanEndpointSliceCleaner struct {
 // Setup registers the 15-minute sweep.
 // Disabled clusters (ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED=false) skip
 // registration entirely — same contract as volumeattachment-cleaner.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, enabled bool) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	if !shared.Gate("ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED", true) {
 		logf.Log.WithName(orphanEndpointSliceQueue).Info("disabled — module not registered")
 		return nil
 	}
-	c := &orphanEndpointSliceCleaner{cs: cs, dyn: dyn, nowFn: time.Now,
+	c := &orphanEndpointSliceCleaner{cs: d.CS, dyn: d.Dyn, nowFn: time.Now,
 		absentStreak: map[string]int{}}
-	return shared.AddPeriodic(mgr, orphanEndpointSliceQueue, orphanEndpointSliceInterval, c.run)
+	return shared.AddPeriodic(d.Mgr, orphanEndpointSliceQueue, orphanEndpointSliceInterval, c.run)
 }
 
 func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
@@ -117,21 +117,18 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	// an empty answer is an apiserver/RBAC flap, never a real state.
 	svcCount := 0
 	services := map[string]bool{}
-	cont := ""
-	for {
-		page, err := c.cs.CoreV1().Services(metav1.NamespaceAll).
-			List(ctx, metav1.ListOptions{
-				Limit: orphanEndpointSliceListPageSize, Continue: cont})
-		if err != nil {
-			return fmt.Errorf("list services (API flap) — abort: %w", err)
-		}
-		for _, s := range page.Items {
-			services[s.Namespace+"/"+s.Name] = true
-		}
-		svcCount += len(page.Items)
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	err := shared.ListEach(ctx,
+		metav1.ListOptions{Limit: orphanEndpointSliceListPageSize},
+		shared.Services(c.cs, metav1.NamespaceAll),
+		func(items []corev1.Service) error {
+			for _, s := range items {
+				services[s.Namespace+"/"+s.Name] = true
+			}
+			svcCount += len(items)
+			return nil
+		})
+	if err != nil {
+		return fmt.Errorf("list services (API flap) — abort: %w", err)
 	}
 	if svcCount == 0 {
 		return fmt.Errorf("empty service list (API flap) — abort")
@@ -139,21 +136,12 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 
 	// Server-side label filter; the in-code check stays because
 	// fake clientsets ignore ListOptions selectors.
-	var slices []discoveryv1.EndpointSlice
-	for {
-		page, err := c.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).
-			List(ctx, metav1.ListOptions{
-				LabelSelector: discoveryv1.LabelServiceName,
-				Limit:         orphanEndpointSliceListPageSize,
-				Continue:      cont,
-			})
-		if err != nil {
-			return fmt.Errorf("list endpointslices: %w", err)
-		}
-		slices = append(slices, page.Items...)
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	slices, err := shared.ListAll(ctx, metav1.ListOptions{
+		LabelSelector: discoveryv1.LabelServiceName,
+		Limit:         orphanEndpointSliceListPageSize,
+	}, shared.EndpointSlices(c.cs, metav1.NamespaceAll))
+	if err != nil {
+		return fmt.Errorf("list endpointslices: %w", err)
 	}
 
 	now := c.nowFn()

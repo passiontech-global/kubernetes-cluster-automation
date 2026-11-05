@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -19,7 +20,8 @@ import (
 // mgr.Add — assert exactly one runnable per Setup.
 func TestSetupRegistersController(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset()); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	if len(m.Added) != 1 {
@@ -31,7 +33,8 @@ func TestSetupRegistersController(t *testing.T) {
 // field-selected informer — belt-and-suspenders against cache misses.
 func TestSetupPredicate(t *testing.T) {
 	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return Setup(m, fake.NewSimpleClientset())
+		return Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+			Dyn: testutil.StubDyn()})
 	})
 	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "kube-system", Name: "konnectivity-agent"}}

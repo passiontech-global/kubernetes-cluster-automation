@@ -22,6 +22,10 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
+// coreDNSUpstreamCheck is the CoreDNS upstream-failure watchdog with
+// the readiness-fallback heal.
+type coreDNSUpstreamCheck struct{ *deps }
+
 const (
 	checkNameCoreDNSUpstream = "coredns-upstream"
 
@@ -68,7 +72,7 @@ func isDNSPod(pod *corev1.Pod) bool {
 // state a restart clears. Both queries failing is inconclusive and
 // falls back to the pod-readiness signature (unready >10m with a
 // healthy sibling) rather than false-FAILing on a Prometheus outage.
-func (p *clusterHealthProber) checkCoreDNSUpstream(ctx context.Context) probeResult {
+func (p *coreDNSUpstreamCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	now := p.now()
 
@@ -147,7 +151,7 @@ func (p *clusterHealthProber) checkCoreDNSUpstream(ctx context.Context) probeRes
 				ns+"/"+name, pod, coreDNSUpstreamHealCool, now)
 		}
 	}
-	reconcileEmittedGauges(checkNameCoreDNSUpstream,
+	p.reconcileEmittedGauges(checkNameCoreDNSUpstream,
 		coreDNSUpstreamFailingGauge, current)
 
 	if len(flagged) == 0 {
@@ -185,7 +189,7 @@ func hasHealthySibling(pod *corev1.Pod, siblings []*corev1.Pod,
 // corednsReadinessFallback is the Prometheus-unreachable path: the same
 // isolated-failure shape detected from pod readiness — a dns pod
 // unready >=10m while a sibling stays Ready.
-func (p *clusterHealthProber) corednsReadinessFallback(ctx context.Context,
+func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 	log logr.Logger, now time.Time) probeResult {
 
 	pods, err := p.cs.CoreV1().Pods(metav1.NamespaceAll).
@@ -235,7 +239,7 @@ func (p *clusterHealthProber) corednsReadinessFallback(ctx context.Context,
 		findings = append(findings, key+"("+detail+")")
 	}
 	sort.Strings(findings)
-	reconcileEmittedGauges(checkNameCoreDNSUpstream,
+	p.reconcileEmittedGauges(checkNameCoreDNSUpstream,
 		coreDNSUpstreamFailingGauge, current)
 	if len(findings) == 0 {
 		return probeResult{pass: true}

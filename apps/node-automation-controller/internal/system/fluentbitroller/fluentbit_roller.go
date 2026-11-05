@@ -48,13 +48,13 @@ type fluentBitRoller struct {
 // passiontech-pipeline; the predicate also pins the namespace.
 // Disabled clusters (no fluentbit component) skip registration
 // entirely — same pattern as Setup.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	if !shared.Gate("FLUENTBIT_ROLLER_ENABLED", false) {
 		logf.Log.WithName("fluent-bit-config-roller").Info("disabled — module not registered")
 		return nil
 	}
-	r := &fluentBitRoller{cs: cs}
-	return ctrl.NewControllerManagedBy(mgr).
+	r := &fluentBitRoller{cs: d.CS}
+	return ctrl.NewControllerManagedBy(d.Mgr).
 		Named("fluent-bit-config-roller").
 		For(&corev1.Secret{}, builder.WithPredicates(
 			predicate.NewPredicateFuncs(func(o client.Object) bool {

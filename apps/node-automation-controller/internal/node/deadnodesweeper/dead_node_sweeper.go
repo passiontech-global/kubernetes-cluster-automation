@@ -44,13 +44,13 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -84,16 +84,8 @@ const (
 // medik8s remediation CRs — a fencer naming a node is the strongest
 // death certificate available in-cluster.
 var (
-	selfNodeRemediationGVR = schema.GroupVersionResource{
-		Group:    "self-node-remediation.medik8s.io",
-		Version:  "v1alpha1",
-		Resource: "selfnoderemediations",
-	}
-	fenceAgentsRemediationGVR = schema.GroupVersionResource{
-		Group:    "fence-agents-remediation.medik8s.io",
-		Version:  "v1alpha1",
-		Resource: "fenceagentsremediations",
-	}
+	selfNodeRemediationGVR    = shared.GVRSelfNodeRemediation
+	fenceAgentsRemediationGVR = shared.GVRFenceAgentsRemediation
 )
 
 type deadNodeSweeper struct {
@@ -106,10 +98,10 @@ type deadNodeSweeper struct {
 }
 
 // Setup registers the 5-minute sweep.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface) error {
-	s := &deadNodeSweeper{cs: cs, dyn: dyn}
+func Setup(d shared.Deps) error {
+	s := &deadNodeSweeper{cs: d.CS, dyn: d.Dyn}
 	s.probeFn = s.probe
-	return shared.AddPeriodic(mgr, deadNodeSweeperQueue, 5*time.Minute, s.run)
+	return shared.AddPeriodic(d.Mgr, deadNodeSweeperQueue, 5*time.Minute, s.run)
 }
 
 func (s *deadNodeSweeper) run(ctx context.Context) error {
@@ -170,33 +162,29 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// not every pod in the cluster (which is the same footprint the
 	// unbounded List had).
 	stuck := map[string]int{}
-	cont := ""
-	for {
-		page, err := s.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-			FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
-			Limit:         500,
-			Continue:      cont,
+	err = shared.ListEach(ctx, metav1.ListOptions{
+		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
+		Limit:         500,
+	}, shared.Pods(s.cs, metav1.NamespaceAll),
+		func(items []corev1.Pod) error {
+			for i := range items {
+				p := &items[i]
+				if p.Status.Phase == corev1.PodSucceeded ||
+					p.Status.Phase == corev1.PodFailed {
+					continue // mirrors the FieldSelector for fake clients
+				}
+				if p.DeletionTimestamp == nil || p.Spec.NodeName == "" {
+					continue
+				}
+				if time.Since(p.DeletionTimestamp.Time) <= deadNodeStuckPodAge {
+					continue // still inside a legitimate graceful shutdown
+				}
+				stuck[p.Spec.NodeName]++
+			}
+			return nil
 		})
-		if err != nil {
-			return fmt.Errorf("list pods: %w", err)
-		}
-		for i := range page.Items {
-			p := &page.Items[i]
-			if p.Status.Phase == corev1.PodSucceeded ||
-				p.Status.Phase == corev1.PodFailed {
-				continue // mirrors the FieldSelector for fake clients
-			}
-			if p.DeletionTimestamp == nil || p.Spec.NodeName == "" {
-				continue
-			}
-			if time.Since(p.DeletionTimestamp.Time) <= deadNodeStuckPodAge {
-				continue // still inside a legitimate graceful shutdown
-			}
-			stuck[p.Spec.NodeName]++
-		}
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	if err != nil {
+		return fmt.Errorf("list pods: %w", err)
 	}
 	if len(stuck) == 0 {
 		log.Info("sweep done — no stuck Terminating pods", "untainted", untainted)
@@ -368,24 +356,20 @@ func (s *deadNodeSweeper) logVolumeAttachments(ctx context.Context, nodeName str
 	// Paged like the pod list above — VolumeAttachments are
 	// cluster-scoped and unbounded, and this read is signal-only.
 	var names []string
-	cont := ""
-	for {
-		page, err := s.cs.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{
-			Limit: 500, Continue: cont,
-		})
-		if err != nil {
-			log.Error(err, "volumeattachment list failed — signal only", "node", nodeName)
-			metrics.IncError(deadNodeSweeperQueue)
-			return
-		}
-		for i := range page.Items {
-			if page.Items[i].Spec.NodeName == nodeName {
-				names = append(names, page.Items[i].Name)
+	err := shared.ListEach(ctx, metav1.ListOptions{Limit: 500},
+		shared.VolumeAttachments(s.cs),
+		func(items []storagev1.VolumeAttachment) error {
+			for i := range items {
+				if items[i].Spec.NodeName == nodeName {
+					names = append(names, items[i].Name)
+				}
 			}
-		}
-		if cont = page.Continue; cont == "" {
-			break
-		}
+			return nil
+		})
+	if err != nil {
+		log.Error(err, "volumeattachment list failed — signal only", "node", nodeName)
+		metrics.IncError(deadNodeSweeperQueue)
+		return
 	}
 	if len(names) > 0 {
 		log.Info("node holds volumeattachments — taint will force-detach",

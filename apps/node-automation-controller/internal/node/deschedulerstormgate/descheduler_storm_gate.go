@@ -52,7 +52,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -83,11 +82,7 @@ const (
 // autopilotPlanGVR is the k0s autopilot Plan resource — a Plan in a
 // non-terminal state means a cluster upgrade is in flight (2.7
 // signal c).
-var autopilotPlanGVR = schema.GroupVersionResource{
-	Group:    "autopilot.k0sproject.io",
-	Version:  "v1beta2",
-	Resource: "plans",
-}
+var autopilotPlanGVR = shared.AutopilotPlanGVR
 
 // stormConds mirrors STORM_CONDS (see package comment for sources).
 // NebulaIsolated/NebulaDegraded/NebulaPMTUBlackhole are the
@@ -118,8 +113,8 @@ type deschedulerStormGate struct {
 	dyn dynamic.Interface
 }
 
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface) error {
-	return ctrl.NewControllerManagedBy(mgr).
+func Setup(d shared.Deps) error {
+	return ctrl.NewControllerManagedBy(d.Mgr).
 		Named("descheduler-storm-gate").
 		// Watches with a single fixed workqueue key, not For(): the
 		// reconcile ignores req.Name and always sweeps the whole
@@ -150,7 +145,7 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface) err
 				DeleteFunc:  func(event.DeleteEvent) bool { return true },
 				GenericFunc: func(event.GenericEvent) bool { return true },
 			})).
-		Complete(&deschedulerStormGate{cs: cs, dyn: dyn})
+		Complete(&deschedulerStormGate{cs: d.CS, dyn: d.Dyn})
 }
 
 func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {

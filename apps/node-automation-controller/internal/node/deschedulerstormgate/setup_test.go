@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -23,7 +24,8 @@ import (
 // mgr.Add.
 func TestSetupRegistersController(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), testutil.StubDyn()); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	if len(m.Added) != 1 {
@@ -36,7 +38,8 @@ func TestSetupRegistersController(t *testing.T) {
 // request.
 func TestSetupSweepFixedKey(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), testutil.StubDyn()); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	_, h := testutil.KindSource(t, testutil.ControllerWatches(t, m.Added[0])[0])
@@ -66,7 +69,8 @@ func TestSetupSweepFixedKey(t *testing.T) {
 // but not on kubelet heartbeat churn.
 func TestSetupStormGatePredicate(t *testing.T) {
 	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return Setup(m, fake.NewSimpleClientset(), testutil.StubDyn())
+		return Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+			Dyn: testutil.StubDyn()})
 	})
 
 	if !p.Create(event.CreateEvent{Object: testutil.Node("n1", corev1.ConditionTrue, nil)}) {

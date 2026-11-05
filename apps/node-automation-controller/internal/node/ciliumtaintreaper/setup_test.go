@@ -13,14 +13,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // The reaper skips mgr.Add entirely when disabled — no informer, no
 // RequeueAfter loop, no periodic LIST against the apiserver.
 func TestSetupDisabled(t *testing.T) {
+	t.Setenv("CILIUM_TAINT_REAPER_ENABLED", "false")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), false); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {
@@ -33,8 +35,9 @@ func TestSetupDisabled(t *testing.T) {
 // mgr.Add — enabled registers two sources (.Watches on Nodes + cilium
 // Pods), still one controller runnable.
 func TestSetupRegistersController(t *testing.T) {
+	t.Setenv("CILIUM_TAINT_REAPER_ENABLED", "true")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), true); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	if len(m.Added) != 1 {
@@ -47,8 +50,9 @@ func TestSetupRegistersController(t *testing.T) {
 // request (the reconcile ignores the request name; only the dedup
 // contract matters).
 func TestSetupSweepFixedKey(t *testing.T) {
+	t.Setenv("CILIUM_TAINT_REAPER_ENABLED", "true")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), true); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	_, h := testutil.KindSource(t, testutil.ControllerWatches(t, m.Added[0])[0])
@@ -78,8 +82,9 @@ func TestSetupSweepFixedKey(t *testing.T) {
 // watches kube-system cilium Pods and collapses them onto the same
 // fixed sweep key.
 func TestSetupCiliumTaintReaperWatches(t *testing.T) {
+	t.Setenv("CILIUM_TAINT_REAPER_ENABLED", "true")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), true); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	srcs := testutil.ControllerWatches(t, m.Added[0])

@@ -27,6 +27,10 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
+// linkerdProtocolDetectionStallCheck is the linkerd opaque-port /
+// protocol-detection stall watchdog with linkerd template heal.
+type linkerdProtocolDetectionStallCheck struct{ *deps }
+
 const (
 	checkNameLinkerdOpaqueStall = "linkerd-protocol-detection-stall"
 
@@ -150,7 +154,7 @@ func missingBinaryPorts(pod *corev1.Pod) []int {
 // annotation-only patch cannot heal. The pod is only deleted when the
 // template patch succeeded (otherwise the replacement would inherit
 // the same violation); 30m per-pod cooldown, maintenance-gated.
-func (p *clusterHealthProber) checkLinkerdProtocolDetectionStall(ctx context.Context) probeResult {
+func (p *linkerdProtocolDetectionStallCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	now := p.now()
 	pods, err := p.cs.CoreV1().Pods(metav1.NamespaceAll).
@@ -182,7 +186,7 @@ func (p *clusterHealthProber) checkLinkerdProtocolDetectionStall(ctx context.Con
 		p.healLinkerdOpaquePorts(ctx, log, pod, missing, now)
 	}
 	sort.Strings(findings)
-	reconcileEmittedGauges(checkNameLinkerdOpaqueStall,
+	p.reconcileEmittedGauges(checkNameLinkerdOpaqueStall,
 		linkerdOpaquePortMissingGauge, current)
 	if len(findings) == 0 {
 		return probeResult{pass: true}
@@ -195,7 +199,7 @@ func (p *clusterHealthProber) checkLinkerdProtocolDetectionStall(ctx context.Con
 // violating pod: cooldown → maintenance gate → template patch → pod
 // annotation patch → pod delete (only when the template took the
 // annotation, else the replacement re-inherits the violation).
-func (p *clusterHealthProber) healLinkerdOpaquePorts(ctx context.Context,
+func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.Context,
 	log logr.Logger, pod *corev1.Pod, missing []int, now time.Time) {
 
 	ck := "selfheal/" + checkNameLinkerdOpaqueStall + "/" + pod.Namespace + "/" + pod.Name
@@ -247,7 +251,7 @@ func (p *clusterHealthProber) healLinkerdOpaquePorts(ctx context.Context,
 // the ports (patched now, or already covered — the pod just needs a
 // restart). False when no workload owner resolves or the patch fails
 // (RBAC/not-found) — the caller must not delete the pod then.
-func (p *clusterHealthProber) patchLinkerdTemplate(ctx context.Context,
+func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Context,
 	log logr.Logger, pod *corev1.Pod, missing []int) bool {
 
 	ref := metav1.GetControllerOf(pod)
@@ -330,7 +334,7 @@ func (p *clusterHealthProber) patchLinkerdTemplate(ctx context.Context,
 // annotations — when they already cover `missing` the patch is
 // skipped but the template is still reported covered (the pod only
 // needs a restart). Returns false on patch failure.
-func (p *clusterHealthProber) patchTemplatePorts(ctx context.Context,
+func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Context,
 	log logr.Logger, kind, ns, name string, existing map[string]string,
 	missing []int, cronJob bool) bool {
 
@@ -417,7 +421,7 @@ func (p *clusterHealthProber) patchTemplatePorts(ctx context.Context,
 // opaque-ports annotation — best-effort bookkeeping (a running
 // proxy does not re-read it; the template patch + restart is the
 // real heal). Failures are logged, never fatal.
-func (p *clusterHealthProber) patchLinkerdPodAnno(ctx context.Context,
+func (p *linkerdProtocolDetectionStallCheck) patchLinkerdPodAnno(ctx context.Context,
 	log logr.Logger, pod *corev1.Pod, missing []int) {
 
 	set := parsePortSet(pod.Annotations[linkerdOpaquePortsAnno])

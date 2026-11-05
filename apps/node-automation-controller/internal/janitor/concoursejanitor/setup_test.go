@@ -8,6 +8,7 @@ import (
 
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -15,8 +16,13 @@ import (
 // crontab-equivalent interval — the pairing is what keeps
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
+	t.Setenv("CONCOURSE_JANITOR_ENABLED", "true") // opt-in gate
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), testutil.StubDyn(), true); err != nil {
+	if err := Setup(shared.Deps{
+		Mgr: m,
+		CS:  fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn(),
+	}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "concourse-workdir-janitor", 30*time.Minute)

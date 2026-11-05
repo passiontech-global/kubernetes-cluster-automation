@@ -49,11 +49,11 @@ func testProber(cs *fake.Clientset) *clusterHealthProber {
 		// fake PANICS on an unregistered List, so every always-listed
 		// kind must be registered even when the check tolerates
 		// NotFound/NoMatch in production.
-		{Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"}:     "HelmReleaseList",
-		{Group: "pxc.percona.com", Version: "v1", Resource: "perconaxtradbclusters"}:   "PerconaXtraDBClusterList",
-		{Group: "pgv2.percona.com", Version: "v2", Resource: "perconapgclusters"}:      "PerconaPGClusterList",
-		{Group: "psmdb.percona.com", Version: "v1", Resource: "perconaservermongodbs"}: "PerconaServerMongoDBList",
-		{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}:          "ApplicationList",
+		shared.GVRHelmReleaseV2:        "HelmReleaseList",
+		shared.GVRPerconaXtraDBCluster: "PerconaXtraDBClusterList",
+		shared.GVRPerconaPGCluster:     "PerconaPGClusterList",
+		shared.GVRPerconaServerMongoDB: "PerconaServerMongoDBList",
+		shared.GVRArgoCDApplication:    "ApplicationList",
 	}))
 }
 
@@ -135,7 +135,7 @@ func chPod(ns, name string, phase corev1.PodPhase, age time.Duration) *corev1.Po
 
 func TestProbeDNS(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset())
-	if res := p.probeDNS(ctx); !res.pass {
+	if res := p.dns.run(ctx); !res.pass {
 		t.Fatalf("expected pass, got %+v", res)
 	}
 
@@ -146,7 +146,7 @@ func TestProbeDNS(t *testing.T) {
 		}
 		return []string{"10.0.0.1"}, nil
 	}
-	res := p.probeDNS(ctx)
+	res := p.dns.run(ctx)
 	if res.pass || res.infra != nil {
 		t.Fatalf("expected clean FAIL, got %+v", res)
 	}
@@ -169,13 +169,13 @@ func TestProbeHTTPContent(t *testing.T) {
 	p.cfg.httpURL = srv.URL
 	p.httpClient = srv.Client()
 
-	if res := p.probeHTTPContent(ctx); !res.pass {
+	if res := p.httpContent.run(ctx); !res.pass {
 		t.Fatalf("expected pass on 'Healthy' body, got %+v", res)
 	}
 
 	// Expected substring missing -> FAIL.
 	p.cfg.httpExpectedContent = "Absolutely"
-	if res := p.probeHTTPContent(ctx); res.pass {
+	if res := p.httpContent.run(ctx); res.pass {
 		t.Fatal("expected FAIL when body lacks the expected content")
 	}
 }
@@ -189,7 +189,7 @@ func TestProbeHTTPContentNon200(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset())
 	p.cfg.httpURL = srv.URL
 	p.httpClient = srv.Client()
-	if res := p.probeHTTPContent(ctx); res.pass {
+	if res := p.httpContent.run(ctx); res.pass {
 		t.Fatal("expected FAIL on non-200")
 	}
 }
@@ -212,7 +212,7 @@ func TestProbePodRestarts(t *testing.T) {
 			}},
 	}
 	p := testProber(fake.NewSimpleClientset(over))
-	if res := p.probePodRestarts(ctx); res.pass {
+	if res := p.podRestarts.run(ctx); res.pass {
 		t.Fatal("expected FAIL on RestartCount 11 with a recent termination")
 	}
 
@@ -224,7 +224,7 @@ func TestProbePodRestarts(t *testing.T) {
 			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
 				Reason: "CrashLoopBackOff"}}},
 	}
-	if res := testProber(fake.NewSimpleClientset(waiting)).probePodRestarts(ctx); res.pass {
+	if res := testProber(fake.NewSimpleClientset(waiting)).podRestarts.run(ctx); res.pass {
 		t.Fatal("expected FAIL on CrashLoopBackOff over threshold")
 	}
 
@@ -240,14 +240,14 @@ func TestProbePodRestarts(t *testing.T) {
 				},
 			}},
 	}
-	if res := testProber(fake.NewSimpleClientset(stale)).probePodRestarts(ctx); !res.pass {
+	if res := testProber(fake.NewSimpleClientset(stale)).podRestarts.run(ctx); !res.pass {
 		t.Fatal("stale (>24h) termination must not FAIL the check")
 	}
 
 	// Boundary: exactly at the limit is still a pass.
 	over.Status.ContainerStatuses[0].RestartCount = 10
 	cs := fake.NewSimpleClientset(over)
-	if res := testProber(cs).probePodRestarts(ctx); !res.pass {
+	if res := testProber(cs).podRestarts.run(ctx); !res.pass {
 		t.Fatal("RestartCount == max must pass")
 	}
 
@@ -262,7 +262,7 @@ func TestProbePodRestarts(t *testing.T) {
 				},
 			}},
 	}
-	if res := testProber(fake.NewSimpleClientset(init)).probePodRestarts(ctx); res.pass {
+	if res := testProber(fake.NewSimpleClientset(init)).podRestarts.run(ctx); res.pass {
 		t.Fatal("expected FAIL on init-container restarts")
 	}
 }
@@ -274,21 +274,21 @@ func TestProbePodRestarts(t *testing.T) {
 func TestProbePodStatus(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset(
 		chPod("kube-system", "stuck", corev1.PodPending, 15*time.Minute)))
-	if res := p.probePodStatus(ctx); res.pass {
+	if res := p.podStatus.run(ctx); res.pass {
 		t.Fatal("expected FAIL on old Pending pod")
 	}
 
 	// Younger than SKIP_DURATION -> ignored (image still pulling).
 	p = testProber(fake.NewSimpleClientset(
 		chPod("kube-system", "fresh", corev1.PodPending, 5*time.Minute)))
-	if res := p.probePodStatus(ctx); !res.pass {
+	if res := p.podStatus.run(ctx); !res.pass {
 		t.Fatal("young Pending pod must be skipped")
 	}
 
 	for _, phase := range []corev1.PodPhase{corev1.PodFailed, corev1.PodUnknown} {
 		p = testProber(fake.NewSimpleClientset(
 			chPod("kube-system", "dead", phase, time.Hour)))
-		if res := p.probePodStatus(ctx); res.pass {
+		if res := p.podStatus.run(ctx); res.pass {
 			t.Fatalf("expected FAIL on phase %s", phase)
 		}
 	}
@@ -296,7 +296,7 @@ func TestProbePodStatus(t *testing.T) {
 	p = testProber(fake.NewSimpleClientset(
 		chPod("kube-system", "ok", corev1.PodRunning, time.Hour),
 		chPod("kube-system", "done", corev1.PodSucceeded, time.Hour)))
-	if res := p.probePodStatus(ctx); !res.pass {
+	if res := p.podStatus.run(ctx); !res.pass {
 		t.Fatal("Running+Succeeded must pass")
 	}
 }
@@ -321,19 +321,19 @@ func quota(ns, name, used, hard string) *corev1.ResourceQuota {
 func TestProbeResourceQuota(t *testing.T) {
 	// 95% of hard -> FAIL.
 	p := testProber(fake.NewSimpleClientset(quota("a", "q", "950m", "1")))
-	if res := p.probeResourceQuota(ctx); res.pass {
+	if res := p.resourceQuota.run(ctx); res.pass {
 		t.Fatal("expected FAIL at 0.95 used/hard")
 	}
 
 	// Boundary: exactly at threshold is a pass (only '>' fails).
 	p = testProber(fake.NewSimpleClientset(quota("a", "q", "900m", "1")))
-	if res := p.probeResourceQuota(ctx); !res.pass {
+	if res := p.resourceQuota.run(ctx); !res.pass {
 		t.Fatal("used/hard == threshold must pass")
 	}
 
 	// No usage recorded -> used=0 -> pass.
 	p = testProber(fake.NewSimpleClientset(quota("a", "q", "", "1")))
-	if res := p.probeResourceQuota(ctx); !res.pass {
+	if res := p.resourceQuota.run(ctx); !res.pass {
 		t.Fatal("absent Used entry must pass")
 	}
 }
@@ -593,10 +593,10 @@ func TestCheckKCMWorkqueueFreezeAfterMinAge(t *testing.T) {
 	p.now = func() time.Time { return base }
 
 	// First sighting stamps first-seen — quiet.
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
-	if _, ok := p.kcmFirstSeen["daemonset_desired_zero/daemonset/cilium"]; !ok {
+	if _, ok := p.kcm.kcmFirstSeen["daemonset_desired_zero/daemonset/cilium"]; !ok {
 		t.Fatal("signature not tracked in kcmFirstSeen")
 	}
 	if v, ok := kcmFrozenGauge(t, "daemonset_desired_zero"); ok && v != 0 {
@@ -607,7 +607,7 @@ func TestCheckKCMWorkqueueFreezeAfterMinAge(t *testing.T) {
 	at := base.Add(9 * time.Minute)
 	renewKCMLease(t, cs, at)
 	p.now = func() time.Time { return at }
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("signature at 9m must still pass: %+v", res)
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
@@ -618,7 +618,7 @@ func TestCheckKCMWorkqueueFreezeAfterMinAge(t *testing.T) {
 	at = base.Add(10 * time.Minute)
 	renewKCMLease(t, cs, at)
 	p.now = func() time.Time { return at }
-	if res := p.checkKCMWorkqueue(ctx); res.pass {
+	if res := p.kcm.run(ctx); res.pass {
 		t.Fatal("signature persisted >=10m must FAIL")
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 1 {
@@ -661,20 +661,20 @@ func TestCheckKCMWorkqueueStaleObservedGeneration(t *testing.T) {
 	p := testProber(cs)
 	p.now = func() time.Time { return base }
 
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
-	if _, ok := p.kcmFirstSeen["stale_observed_generation/deployment/coredns"]; !ok {
+	if _, ok := p.kcm.kcmFirstSeen["stale_observed_generation/deployment/coredns"]; !ok {
 		t.Fatal("deployment signature not tracked")
 	}
-	if len(p.kcmFirstSeen) != 1 {
-		t.Fatalf("settled DS must not be tracked: %v", p.kcmFirstSeen)
+	if len(p.kcm.kcmFirstSeen) != 1 {
+		t.Fatalf("settled DS must not be tracked: %v", p.kcm.kcmFirstSeen)
 	}
 
 	at := base.Add(11 * time.Minute)
 	renewKCMLease(t, cs, at)
 	p.now = func() time.Time { return at }
-	res := p.checkKCMWorkqueue(ctx)
+	res := p.kcm.run(ctx)
 	if res.pass {
 		t.Fatal("stale observedGeneration >=10m must FAIL")
 	}
@@ -699,20 +699,20 @@ func TestCheckKCMWorkqueueQuietOnStaleLease(t *testing.T) {
 	p := testProber(cs)
 	p.now = func() time.Time { return base }
 
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("stale KCM lease must stay quiet: %+v", res)
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
 		t.Fatalf("frozen gauge = %v on stale lease, want absent/0", v)
 	}
-	if len(p.kcmFirstSeen) != 0 {
-		t.Fatalf("stale lease left %d tracked signatures", len(p.kcmFirstSeen))
+	if len(p.kcm.kcmFirstSeen) != 0 {
+		t.Fatalf("stale lease left %d tracked signatures", len(p.kcm.kcmFirstSeen))
 	}
 
 	// A previously-frozen gauge also clears when the holder dies.
-	p.kcmFrozenReasons["daemonset_desired_zero"] = true
+	p.kcm.kcmFrozenReasons["daemonset_desired_zero"] = true
 	metrics.KCMWorkqueueFrozen.WithLabelValues("daemonset_desired_zero").Set(1)
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("stale KCM lease must stay quiet: %+v", res)
 	}
 	if v, ok := kcmFrozenGauge(t, "daemonset_desired_zero"); !ok || v != 0 {
@@ -722,7 +722,7 @@ func TestCheckKCMWorkqueueQuietOnStaleLease(t *testing.T) {
 	// No Lease object at all — same quiet path.
 	p = testProber(fake.NewSimpleClientset(kcmReadyNode(), kcmDesiredZeroDS()))
 	p.now = func() time.Time { return base }
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("missing KCM lease must stay quiet: %+v", res)
 	}
 }
@@ -736,7 +736,7 @@ func TestCheckKCMWorkqueueQuietOnNoReadyNodes(t *testing.T) {
 	cs := fake.NewSimpleClientset(kcmLease(2*time.Second, base), kcmDesiredZeroDS())
 	p := testProber(cs)
 	p.now = func() time.Time { return base }
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("no nodes must stay quiet: %+v", res)
 	}
 
@@ -751,14 +751,14 @@ func TestCheckKCMWorkqueueQuietOnNoReadyNodes(t *testing.T) {
 	cs = fake.NewSimpleClientset(notReady, kcmLease(2*time.Second, base), kcmDesiredZeroDS())
 	p = testProber(cs)
 	p.now = func() time.Time { return base }
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("all nodes NotReady must stay quiet: %+v", res)
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
 		t.Fatalf("frozen gauge = %v with no ready nodes, want absent/0", v)
 	}
-	if len(p.kcmFirstSeen) != 0 {
-		t.Fatalf("no-ready-nodes left %d tracked signatures", len(p.kcmFirstSeen))
+	if len(p.kcm.kcmFirstSeen) != 0 {
+		t.Fatalf("no-ready-nodes left %d tracked signatures", len(p.kcm.kcmFirstSeen))
 	}
 }
 
@@ -776,13 +776,13 @@ func TestCheckKCMWorkqueueRecoveryClearsGauge(t *testing.T) {
 	p.now = func() time.Time { return base }
 
 	// Drive past the window into frozen.
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
 	at := base.Add(11 * time.Minute)
 	renewKCMLease(t, cs, at)
 	p.now = func() time.Time { return at }
-	if res := p.checkKCMWorkqueue(ctx); res.pass {
+	if res := p.kcm.run(ctx); res.pass {
 		t.Fatal("expected frozen FAIL")
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 1 {
@@ -804,14 +804,14 @@ func TestCheckKCMWorkqueueRecoveryClearsGauge(t *testing.T) {
 		t.Fatalf("update ds: %v", err)
 	}
 
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("recovered signature must pass: %+v", res)
 	}
 	if v, ok := kcmFrozenGauge(t, "daemonset_desired_zero"); !ok || v != 0 {
 		t.Fatalf("frozen gauge after recovery = %v,%v want 0", v, ok)
 	}
-	if len(p.kcmFirstSeen) != 0 {
-		t.Fatalf("resolved signature not pruned: %v", p.kcmFirstSeen)
+	if len(p.kcm.kcmFirstSeen) != 0 {
+		t.Fatalf("resolved signature not pruned: %v", p.kcm.kcmFirstSeen)
 	}
 }
 
@@ -898,19 +898,19 @@ func TestCheckKCMWorkqueueIgnoresEmptyDaemonSet(t *testing.T) {
 	p := testProber(cs)
 	p.now = func() time.Time { return base }
 
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("empty DaemonSet must pass: %+v", res)
 	}
 	at := base.Add(30 * time.Minute)
 	renewKCMLease(t, cs, at)
 	p.now = func() time.Time { return at }
-	if res := p.checkKCMWorkqueue(ctx); !res.pass {
+	if res := p.kcm.run(ctx); !res.pass {
 		t.Fatalf("empty DaemonSet must never freeze: %+v", res)
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
 		t.Fatalf("frozen gauge = %v, want absent/0", v)
 	}
-	if len(p.kcmFirstSeen) != 0 {
-		t.Fatalf("non-signature must not be tracked: %v", p.kcmFirstSeen)
+	if len(p.kcm.kcmFirstSeen) != 0 {
+		t.Fatalf("non-signature must not be tracked: %v", p.kcm.kcmFirstSeen)
 	}
 }

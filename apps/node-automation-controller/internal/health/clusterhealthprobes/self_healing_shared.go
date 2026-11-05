@@ -2,13 +2,13 @@
 // self-healing probe checks (the checks formerly grouped under the
 // Wave-10 workstream, W10-NM*/CP*/ST*/GI*):
 //
-//   - probeHealLedger: package-level first-seen streak ledger +
-//     emitted-gauge hygiene shared by every check that needs a
-//     persistence window (the prober struct's fields live in
-//     cluster_health_probes.go).
+//   - healLedger on deps: first-seen streak ledger + emitted-gauge
+//     hygiene shared by every check that needs a persistence window
+//     (there is exactly one prober per process, so deps has the same
+//     lifetime the package-level probeHealLedger had).
 //   - healCooledDown / markHealStamp / deletePodHeal: the shared
-//     pod-delete heal shape — per-target cooldown on the
-//     p.meshHealed ledger, maintenance mutex (fail closed),
+//     pod-delete heal shape — per-target cooldown on the deps
+//     meshHealed ledger, maintenance mutex (fail closed),
 //     UID-preconditioned delete.
 //   - podUnreadySince / podFromList: pod readiness helpers.
 //   - promSample / promLabelValue / promInstantQuery: the Prometheus
@@ -36,52 +36,49 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
-// probeHealLedger is the package-level Wave-10 ledger. The prober struct
-// is owned by cluster_health_probes.go, so first-seen streak windows
-// and emitted-gauge tuples live here; there is exactly one prober per
-// process so package scope is the correct lifetime.
-var probeHealLedger = struct {
+// healLedger is the first-seen streak + emitted-gauge ledger shared
+// by every check that needs a persistence window. It lives on deps —
+// the prober struct is the thin runner in cluster_health_probes.go,
+// so the ledger moved off package scope onto the shared context.
+type healLedger struct {
 	sync.Mutex
 	// seen: "<check>/<signature>" → first sweep the signature was
 	// observed; pruned per-check when the signature resolves so a
 	// later stall re-arms the window (same lifecycle as
 	// stsZeroSince/scyllaFirstSeen).
 	seen map[string]time.Time
-	// emitted: check → dedup key → label values, so a gauge tuple
+	// emitted: check → emitted-gauge ledger, so a gauge tuple
 	// that stops being reported gets DeleteLabelValues'd rather than
 	// leaking a stale 1 (same hygiene as stsZeroEmitted).
-	emitted map[string]map[string][]string
-}{
-	seen:    map[string]time.Time{},
-	emitted: map[string]map[string][]string{},
+	emitted map[string]*shared.GaugeLedger[string]
 }
 
 // seenFirstStreak returns the first-seen time for a signature,
 // stamping `now` on first observation. ok=false means this is the
 // first sighting — callers treat it as "inside the window".
-func seenFirstStreak(check, key string, now time.Time) (time.Time, bool) {
-	probeHealLedger.Lock()
-	defer probeHealLedger.Unlock()
+func (d *deps) seenFirstStreak(check, key string, now time.Time) (time.Time, bool) {
+	d.ledger.Lock()
+	defer d.ledger.Unlock()
 	k := check + "/" + key
-	if t, ok := probeHealLedger.seen[k]; ok {
+	if t, ok := d.ledger.seen[k]; ok {
 		return t, true
 	}
-	probeHealLedger.seen[k] = now
+	d.ledger.seen[k] = now
 	return now, false
 }
 
 // pruneSeenStreaks drops first-seen entries under `check` whose
 // signature key is absent from keep — resolved signatures re-arm.
-func pruneSeenStreaks(check string, keep map[string]bool) {
-	probeHealLedger.Lock()
-	defer probeHealLedger.Unlock()
+func (d *deps) pruneSeenStreaks(check string, keep map[string]bool) {
+	d.ledger.Lock()
+	defer d.ledger.Unlock()
 	prefix := check + "/"
-	for k := range probeHealLedger.seen {
+	for k := range d.ledger.seen {
 		if !strings.HasPrefix(k, prefix) {
 			continue
 		}
 		if !keep[strings.TrimPrefix(k, prefix)] {
-			delete(probeHealLedger.seen, k)
+			delete(d.ledger.seen, k)
 		}
 	}
 }
@@ -90,65 +87,58 @@ func pruneSeenStreaks(check string, keep map[string]bool) {
 // tuples in `current` (dedup key → label values) stay; previously
 // emitted tuples absent from current are DeleteLabelValues'd. Callers
 // Set() their gauge values BEFORE calling this.
-func reconcileEmittedGauges(check string, vec *prometheus.GaugeVec,
+func (d *deps) reconcileEmittedGauges(check string, vec *prometheus.GaugeVec,
 	current map[string][]string) {
-	probeHealLedger.Lock()
-	defer probeHealLedger.Unlock()
-	em := probeHealLedger.emitted[check]
-	if em == nil {
-		em = map[string][]string{}
-		probeHealLedger.emitted[check] = em
-	}
-	for k, lv := range em {
-		if _, ok := current[k]; !ok {
-			vec.DeleteLabelValues(lv...)
-			delete(em, k)
-		}
+	d.ledger.Lock()
+	defer d.ledger.Unlock()
+	g := d.ledger.emitted[check]
+	if g == nil {
+		g = &shared.GaugeLedger[string]{}
+		d.ledger.emitted[check] = g
 	}
 	for k, lv := range current {
-		if _, ok := em[k]; !ok {
-			em[k] = lv
-		}
+		g.Emit(k, lv...)
 	}
+	g.Prune(vec.DeleteLabelValues)
 }
 
 // healCooledDown reports whether key was healed inside cooldown — the
-// read half of the shared p.meshHealed ledger under selfheal/ keys.
-func (p *clusterHealthProber) healCooledDown(key string, cooldown time.Duration, now time.Time) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.meshHealed == nil {
-		p.meshHealed = map[string]time.Time{}
+// read half of the shared deps meshHealed ledger under selfheal/ keys.
+func (d *deps) healCooledDown(key string, cooldown time.Duration, now time.Time) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.meshHealed == nil {
+		d.meshHealed = map[string]time.Time{}
 	}
-	last, ok := p.meshHealed[key]
+	last, ok := d.meshHealed[key]
 	return ok && now.Sub(last) < cooldown
 }
 
 // markHealStamp stamps key on the shared heal ledger.
-func (p *clusterHealthProber) markHealStamp(key string, now time.Time) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.meshHealed == nil {
-		p.meshHealed = map[string]time.Time{}
+func (d *deps) markHealStamp(key string, now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.meshHealed == nil {
+		d.meshHealed = map[string]time.Time{}
 	}
-	p.meshHealed[key] = now
+	d.meshHealed[key] = now
 }
 
 // deletePodHeal is the Wave-10 pod-delete heal: per-target cooldown
 // on the shared ledger, the maintenance mutex (fail closed on
 // unverifiable), a UID-preconditioned delete, and the shared
 // ControlPlanePodHealsTotal counter under the check name.
-func (p *clusterHealthProber) deletePodHeal(ctx context.Context, log logr.Logger,
+func (d *deps) deletePodHeal(ctx context.Context, log logr.Logger,
 	checkName, targetKey string, pod *corev1.Pod,
 	cooldown time.Duration, now time.Time) {
 
 	key := "selfheal/" + checkName + "/" + targetKey
-	if p.healCooledDown(key, cooldown, now) {
+	if d.healCooledDown(key, cooldown, now) {
 		log.Info("skip heal: inside cooldown", "check", checkName,
 			"target", targetKey)
 		return
 	}
-	held, why, err := shared.MaintenanceActive(ctx, p.cs, p.dyn)
+	held, why, err := shared.MaintenanceActive(ctx, d.cs, d.dyn)
 	if err != nil {
 		metrics.IncError(clusterHealthQueue)
 		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
@@ -161,7 +151,7 @@ func (p *clusterHealthProber) deletePodHeal(ctx context.Context, log logr.Logger
 		return
 	}
 	uid := pod.UID
-	if err := p.cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
+	if err := d.cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
 		metav1.DeleteOptions{
 			Preconditions: &metav1.Preconditions{UID: &uid},
 		}); err != nil {
@@ -170,7 +160,7 @@ func (p *clusterHealthProber) deletePodHeal(ctx context.Context, log logr.Logger
 			"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
 		return
 	}
-	p.markHealStamp(key, now)
+	d.markHealStamp(key, now)
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(checkName).Inc()
 	log.Info("DELETE: pod heal — forcing pod restart",
 		"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
@@ -217,16 +207,16 @@ func promLabelValue(s promSample, keys ...string) string {
 // Prometheus and returns the vector series. The endpoint resolves
 // from HEALTH_PROMETHEUS_QUERY_URL (full /api/v1/query URL) or is
 // derived from cfg.httpURL's scheme://host — the same Prometheus the
-// http-content-check health-probes. p.httpClient is the shared seam
+// http-content-check health-probes. d.httpClient is the shared seam
 // tests already drive with httptest servers.
-func (p *clusterHealthProber) promInstantQuery(ctx context.Context, query string) ([]promSample, error) {
-	ctx, cancel := context.WithTimeout(ctx, p.cfg.checkTimeout)
+func (d *deps) promInstantQuery(ctx context.Context, query string) ([]promSample, error) {
+	ctx, cancel := context.WithTimeout(ctx, d.cfg.checkTimeout)
 	defer cancel()
 	endpoint := healthEnv("HEALTH_PROMETHEUS_QUERY_URL", "")
 	if endpoint == "" {
-		u, err := url.Parse(p.cfg.httpURL)
+		u, err := url.Parse(d.cfg.httpURL)
 		if err != nil || u.Scheme == "" || u.Host == "" {
-			return nil, fmt.Errorf("cannot derive prometheus base from httpURL %q", p.cfg.httpURL)
+			return nil, fmt.Errorf("cannot derive prometheus base from httpURL %q", d.cfg.httpURL)
 		}
 		endpoint = u.Scheme + "://" + u.Host + "/api/v1/query"
 	}
@@ -235,7 +225,7 @@ func (p *clusterHealthProber) promInstantQuery(ctx context.Context, query string
 	if err != nil {
 		return nil, fmt.Errorf("build prometheus query: %w", err)
 	}
-	resp, err := p.httpClient.Do(req)
+	resp, err := d.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("prometheus query: %w", err)
 	}

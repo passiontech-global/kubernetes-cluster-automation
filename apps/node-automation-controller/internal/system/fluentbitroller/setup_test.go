@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -18,8 +19,10 @@ import (
 // scheme, builds a controller through controller.New and lands it in
 // mgr.Add — assert exactly one runnable per Setup.
 func TestSetupRegistersController(t *testing.T) {
+	t.Setenv("FLUENTBIT_ROLLER_ENABLED", "true")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), true); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	if len(m.Added) != 1 {
@@ -29,8 +32,10 @@ func TestSetupRegistersController(t *testing.T) {
 
 // The ported roller skips mgr.Add entirely when disabled.
 func TestSetupDisabled(t *testing.T) {
+	t.Setenv("FLUENTBIT_ROLLER_ENABLED", "false")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), false); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {
@@ -40,8 +45,10 @@ func TestSetupDisabled(t *testing.T) {
 
 // The fluent-bit roller predicate pins the pipeline secret.
 func TestSetupPredicate(t *testing.T) {
+	t.Setenv("FLUENTBIT_ROLLER_ENABLED", "true")
 	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return Setup(m, fake.NewSimpleClientset(), true)
+		return Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+			Dyn: testutil.StubDyn()})
 	})
 	pipeline := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "fluent-system", Name: "passiontech-pipeline"}}

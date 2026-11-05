@@ -24,7 +24,7 @@ func TestLinkerdOpaquePortsHealPatchesTemplateAndDeletesPod(t *testing.T) {
 	cs := fake.NewSimpleClientset(sts, pod)
 	p := testProber(cs)
 
-	res := p.checkLinkerdProtocolDetectionStall(ctx)
+	res := p.linkerdStall.run(ctx)
 	if res.pass {
 		t.Fatalf("unannotated binary port must fail: %+v", res)
 	}
@@ -52,7 +52,7 @@ func TestLinkerdOpaquePortsAnnotatedPasses(t *testing.T) {
 	pod := meshedPodWithPorts("apps", "cache-0", []int32{6379}, "6379", "")
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	if res := p.checkLinkerdProtocolDetectionStall(ctx); !res.pass {
+	if res := p.linkerdStall.run(ctx); !res.pass {
 		t.Fatalf("annotated port must pass: %+v", res)
 	}
 }
@@ -61,7 +61,7 @@ func TestLinkerdSkipInboundCoversPort(t *testing.T) {
 	pod := meshedPodWithPorts("apps", "cache-0", []int32{6379}, "", "6379")
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	if res := p.checkLinkerdProtocolDetectionStall(ctx); !res.pass {
+	if res := p.linkerdStall.run(ctx); !res.pass {
 		t.Fatalf("skip-inbound-ports must cover the port: %+v", res)
 	}
 }
@@ -70,7 +70,7 @@ func TestLinkerdNonBinaryPortPasses(t *testing.T) {
 	pod := meshedPodWithPorts("apps", "web-0", []int32{8080, 9090}, "", "")
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	if res := p.checkLinkerdProtocolDetectionStall(ctx); !res.pass {
+	if res := p.linkerdStall.run(ctx); !res.pass {
 		t.Fatalf("non-binary ports must pass: %+v", res)
 	}
 }

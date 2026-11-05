@@ -46,7 +46,9 @@ type ciliumTaintReaper struct {
 	enabled bool
 }
 
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
+func Setup(d shared.Deps) error {
+	mgr, cs := d.Mgr, d.CS
+	enabled := shared.Gate("CILIUM_TAINT_REAPER_ENABLED", false)
 	if !enabled {
 		// Like Setup: clusters without the cilium
 		// component (and thus without pods watch RBAC) skip

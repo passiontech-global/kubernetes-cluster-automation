@@ -37,43 +37,51 @@ import (
 // plus the OLM/autopilot reads must be mapped.
 func shOpDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	return testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		gwv1("gateways"):   "GatewayList",
-		gwv1("httproutes"): "HTTPRouteList",
-		gwv1("grpcroutes"): "GRPCRouteList",
+		shared.GVRGateway:   "GatewayList",
+		shared.GVRHTTPRoute: "HTTPRouteList",
+		shared.GVRGRPCRoute: "GRPCRouteList",
 		// The owns filter LISTs classes once per stuck gateway-api
 		// object — unregistered GVR panics the fake.
-		gwv1("gatewayclasses"): "GatewayClassList",
-		{Group: "scylla.scylladb.com", Version: "v1", Resource: "scyllaclusters"}:         "ScyllaClusterList",
-		{Group: "dragonflydb.io", Version: "v1alpha1", Resource: "dragonflies"}:           "DragonflyList",
-		{Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"}:        "HelmReleaseList",
-		{Group: "kustomize.toolkit.fluxcd.io", Version: "v1", Resource: "kustomizations"}: "KustomizationList",
+		shared.GVRGatewayClass:  "GatewayClassList",
+		shared.GVRScyllaCluster: "ScyllaClusterList",
+		shared.GVRDragonfly:     "DragonflyList",
+		shared.GVRHelmReleaseV2: "HelmReleaseList",
+		// The flux retry check falls back to the previous storage
+		// version when v2 is unserved — register it too so that
+		// probe order cannot panic the fake.
+		shared.GVRHelmReleaseV2Beta2: "HelmReleaseList",
+		shared.GVRFluxKustomization:  "KustomizationList",
 		// W7-C2 — the ten additional watched operators' CRDs.
-		{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "gitrepositories"}:      "GitRepositoryList",
-		{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmrepositories"}:     "HelmRepositoryList",
-		{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmcharts"}:           "HelmChartList",
-		{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "ocirepositories"}:      "OCIRepositoryList",
-		{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "buckets"}:              "BucketList",
+		shared.GVRFluxGitRepository:  "GitRepositoryList",
+		shared.GVRFluxHelmRepository: "HelmRepositoryList",
+		shared.GVRFluxHelmChart:      "HelmChartList",
+		shared.GVRFluxOCIRepository:  "OCIRepositoryList",
+		shared.GVRFluxBucket:         "BucketList",
 		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "alerts"}:    "AlertList",
 		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "providers"}: "ProviderList",
 		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "receivers"}: "ReceiverList",
-		{Group: "cert-manager.io", Version: "v1", Resource: "certificates"}:                  "CertificateList",
-		{Group: "external-secrets.io", Version: "v1", Resource: "externalsecrets"}:           "ExternalSecretList",
-		{Group: "external-secrets.io", Version: "v1beta1", Resource: "externalsecrets"}:      "ExternalSecretList",
-		{Group: "rabbitmq.com", Version: "v1beta1", Resource: "rabbitmqclusters"}:            "RabbitmqClusterList",
-		{Group: "keda.sh", Version: "v1alpha1", Resource: "scaledobjects"}:                   "ScaledObjectList",
-		{Group: "argoproj.io", Version: "v1beta1", Resource: "argocds"}:                      "ArgoCDList",
-		{Group: "kargo.akuity.io", Version: "v1alpha1", Resource: "stages"}:                  "StageList",
-		{Group: "kargo.akuity.io", Version: "v1alpha1", Resource: "warehouses"}:              "WarehouseList",
-		{Group: "everest.percona.com", Version: "v1alpha1", Resource: "databaseclusters"}:    "DatabaseClusterList",
-		{Group: "shipwright.io", Version: "v1beta1", Resource: "builds"}:                     "BuildList",
+		shared.GVRCertificate:           "CertificateList",
+		shared.GVRExternalSecretV1:      "ExternalSecretList",
+		shared.GVRExternalSecretV1Beta1: "ExternalSecretList",
+		shared.GVRRabbitMQCluster:       "RabbitmqClusterList",
+		shared.GVRKedaScaledObject:      "ScaledObjectList",
+		shared.GVRArgoCD:                "ArgoCDList",
+		// argocd_app_stuck Lists Applications unconditionally every
+		// sweep — same unregistered-GVR panic exposure as the
+		// watchdog table.
+		shared.GVRArgoCDApplication:      "ApplicationList",
+		shared.GVRKargoStage:             "StageList",
+		shared.GVRKargoWarehouse:         "WarehouseList",
+		shared.GVREverestDatabaseCluster: "DatabaseClusterList",
+		shared.GVRShipwrightBuild:        "BuildList",
 		// W10-CP3 — the nine additional watched operators' CRDs.
-		{Group: "remediation.medik8s.io", Version: "v1alpha1", Resource: "nodehealthchecks"}:               "NodeHealthCheckList",
-		{Group: "self-node-remediation.medik8s.io", Version: "v1alpha1", Resource: "selfnoderemediations"}: "SelfNodeRemediationList",
-		{Group: "pxc.percona.com", Version: "v1", Resource: "perconaxtradbclusters"}:                       "PerconaXtraDBClusterList",
-		{Group: "pgv2.percona.com", Version: "v2", Resource: "perconapgclusters"}:                          "PerconaPGClusterList",
-		{Group: "psmdb.percona.com", Version: "v1", Resource: "perconaservermongodbs"}:                     "PerconaServerMongoDBList",
-		{Group: "tekton.dev", Version: "v1", Resource: "pipelineruns"}:                                     "PipelineRunList",
-		{Group: "shipwright.io", Version: "v1alpha1", Resource: "shipwrightbuilds"}:                        "ShipwrightBuildList",
+		shared.GVRNodeHealthCheck:         "NodeHealthCheckList",
+		shared.GVRSelfNodeRemediation:     "SelfNodeRemediationList",
+		shared.GVRPerconaXtraDBCluster:    "PerconaXtraDBClusterList",
+		shared.GVRPerconaPGCluster:        "PerconaPGClusterList",
+		shared.GVRPerconaServerMongoDB:    "PerconaServerMongoDBList",
+		shared.GVRTektonPipelineRun:       "PipelineRunList",
+		shared.GVRShipwrightOperatorBuild: "ShipwrightBuildList",
 		// W7-C5 — OLM reads.
 		olmCSVGVR: "ClusterServiceVersionList",
 		olmSubGVR: "SubscriptionList",
@@ -215,7 +223,7 @@ func TestOperatorStuckPredicates(t *testing.T) {
 // No Lease at all → nothing to judge, the check stays quiet.
 func TestCheckOperatorWorkqueuesNoLeaseQuiet(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn())
-	if res := p.checkOperatorWorkqueues(ctx); !res.pass || res.infra != nil {
+	if res := p.operator.run(ctx); !res.pass || res.infra != nil {
 		t.Fatalf("absent leases must pass quietly, got %+v", res)
 	}
 }
@@ -232,11 +240,11 @@ func TestCheckOperatorWorkqueuesStaleLeaseQuiet(t *testing.T) {
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
 
-	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
+	if res := p.operator.run(ctx); !res.pass {
 		t.Fatalf("stale lease must pass quietly, got %+v", res)
 	}
-	if len(p.opFirstSeen) != 0 {
-		t.Fatalf("stale-lease operator must not be tracked: %v", p.opFirstSeen)
+	if len(p.operator.opFirstSeen) != 0 {
+		t.Fatalf("stale-lease operator must not be tracked: %v", p.operator.opFirstSeen)
 	}
 }
 
@@ -268,11 +276,11 @@ func TestCheckOperatorWorkqueuesStuckThenHeals(t *testing.T) {
 	before := shOpHealsCount(t, "scylla-operator", kcmReasonStaleGen)
 
 	// First sighting — tracked, not frozen, no heal.
-	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
+	if res := p.operator.run(ctx); !res.pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
-	if len(p.opFirstSeen) != 1 {
-		t.Fatalf("signature not tracked: %v", p.opFirstSeen)
+	if len(p.operator.opFirstSeen) != 1 {
+		t.Fatalf("signature not tracked: %v", p.operator.opFirstSeen)
 	}
 	if v, ok := shOpFrozenGauge(t, "scylla-operator", kcmReasonStaleGen); ok && v != 0 {
 		t.Fatalf("frozen gauge = %v before the window, want absent/0", v)
@@ -286,7 +294,7 @@ func TestCheckOperatorWorkqueuesStuckThenHeals(t *testing.T) {
 	at := base.Add(21 * time.Minute)
 	shRenewLease(t, cs, "scylla-operator", "scylla-operator-lock", at)
 	p.now = func() time.Time { return at }
-	res := p.checkOperatorWorkqueues(ctx)
+	res := p.operator.run(ctx)
 	if res.pass {
 		t.Fatal("stuck >=20m with a renewing lease must FAIL")
 	}
@@ -333,9 +341,9 @@ func TestCheckOperatorWorkqueuesHealCooldown(t *testing.T) {
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
 	// Seed first-seen long ago so the signature is already frozen.
-	p.opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
+	p.operator.opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
 
-	res := p.checkOperatorWorkqueues(ctx)
+	res := p.operator.run(ctx)
 	if res.pass {
 		t.Fatal("precondition: stuck signature must FAIL")
 	}
@@ -361,7 +369,7 @@ func TestCheckOperatorWorkqueuesHealCooldown(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.now = func() time.Time { return at }
-	res = p.checkOperatorWorkqueues(ctx)
+	res = p.operator.run(ctx)
 	if res.pass {
 		t.Fatal("still-stuck signature must keep FAILING")
 	}
@@ -395,9 +403,9 @@ func TestCheckOperatorWorkqueuesPersistedCooldown(t *testing.T) {
 		"scylla", "db", 5, 3)
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
-	p.opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
+	p.operator.opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
 
-	res := p.checkOperatorWorkqueues(ctx)
+	res := p.operator.run(ctx)
 	if res.pass {
 		t.Fatal("stuck signature must FAIL regardless of heal cooldown")
 	}
@@ -431,9 +439,9 @@ func TestCheckOperatorWorkqueuesMaintenanceDefers(t *testing.T) {
 		"scylla", "db", 5, 3)
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
-	p.opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
+	p.operator.opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
 
-	res := p.checkOperatorWorkqueues(ctx)
+	res := p.operator.run(ctx)
 	if res.pass {
 		t.Fatal("maintenance must defer the heal, not the detection")
 	}
@@ -459,12 +467,12 @@ func TestCheckOperatorWorkqueuesSuspendedFluxIgnored(t *testing.T) {
 	_ = unstructured.SetNestedField(suspended.Object, true, "spec", "suspend")
 	p := testProberDyn(cs, shOpDyn(suspended))
 	p.now = func() time.Time { return base }
-	p.opFirstSeen["helm-controller/helmreleases/apps/hr"] = base.Add(-time.Hour)
+	p.operator.opFirstSeen["helm-controller/helmreleases/apps/hr"] = base.Add(-time.Hour)
 
-	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
+	if res := p.operator.run(ctx); !res.pass {
 		t.Fatalf("suspended HelmRelease must not freeze the check: %+v", res)
 	}
-	if _, ok := p.opFirstSeen["helm-controller/helmreleases/apps/hr"]; ok {
+	if _, ok := p.operator.opFirstSeen["helm-controller/helmreleases/apps/hr"]; ok {
 		t.Fatal("suspended-object tracking must be pruned")
 	}
 }
@@ -493,9 +501,9 @@ func TestCheckOperatorWorkqueuesSelectorFallback(t *testing.T) {
 		"db", "cache", 9, 4)
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
-	p.opFirstSeen["dragonfly-operator/dragonflies/db/cache"] = base.Add(-time.Hour)
+	p.operator.opFirstSeen["dragonfly-operator/dragonflies/db/cache"] = base.Add(-time.Hour)
 
-	if res := p.checkOperatorWorkqueues(ctx); res.pass {
+	if res := p.operator.run(ctx); res.pass {
 		t.Fatal("stuck dragonfly must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("dragonfly-operator-system").
@@ -569,18 +577,18 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 	p.now = func() time.Time { return base }
 
 	// First sighting — tracked, quiet.
-	if res := p.checkStatefulMasterlessServices(ctx); !res.pass {
+	if res := p.masterless.run(ctx); !res.pass {
 		t.Fatalf("first-seen zero endpoints must pass: %+v", res)
 	}
 	key := "db/dragonfly-master/dragonfly"
-	if _, ok := p.stsZeroSince[key]; !ok {
+	if _, ok := p.masterless.stsZeroSince[key]; !ok {
 		t.Fatal("zero-endpoint tuple not tracked")
 	}
 
 	// 4m in — gauge fires, but under the 5m heal window.
 	at := base.Add(4 * time.Minute)
 	p.now = func() time.Time { return at }
-	if res := p.checkStatefulMasterlessServices(ctx); res.pass {
+	if res := p.masterless.run(ctx); res.pass {
 		t.Fatal("zero endpoints >=3m must FAIL")
 	}
 	if v, _ := shStatefulZeroGauge(t, "db", "dragonfly-master", "dragonfly"); v != 1 {
@@ -594,7 +602,7 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 	// 6m in — the dragonfly operator leader is bounced.
 	at = base.Add(6 * time.Minute)
 	p.now = func() time.Time { return at }
-	if res := p.checkStatefulMasterlessServices(ctx); res.pass {
+	if res := p.masterless.run(ctx); res.pass {
 		t.Fatal("still masterless — must keep FAILING")
 	}
 	if _, err := cs.CoreV1().Pods(dragonflyOperatorNS).
@@ -623,9 +631,9 @@ func TestCheckStatefulMasterlessNonDragonflyNoHeal(t *testing.T) {
 	cs := fake.NewSimpleClientset(sts, svc, opPod)
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.stsZeroSince["cache/redis-master/redis"] = base.Add(-time.Hour)
+	p.masterless.stsZeroSince["cache/redis-master/redis"] = base.Add(-time.Hour)
 
-	if res := p.checkStatefulMasterlessServices(ctx); res.pass {
+	if res := p.masterless.run(ctx); res.pass {
 		t.Fatal("masterless redis must FAIL")
 	}
 	if v, _ := shStatefulZeroGauge(t, "cache", "redis-master", "redis"); v != 1 {
@@ -649,9 +657,9 @@ func TestCheckStatefulMasterlessRecovers(t *testing.T) {
 	cs := fake.NewSimpleClientset(sts, svc)
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-time.Hour)
+	p.masterless.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-time.Hour)
 
-	if res := p.checkStatefulMasterlessServices(ctx); res.pass {
+	if res := p.masterless.run(ctx); res.pass {
 		t.Fatal("precondition: masterless service must FAIL")
 	}
 	// Endpoint comes back.
@@ -672,10 +680,10 @@ func TestCheckStatefulMasterlessRecovers(t *testing.T) {
 	}
 	at := base.Add(time.Minute)
 	p.now = func() time.Time { return at }
-	if res := p.checkStatefulMasterlessServices(ctx); !res.pass {
+	if res := p.masterless.run(ctx); !res.pass {
 		t.Fatalf("recovered master must pass: %+v", res)
 	}
-	if _, ok := p.stsZeroSince["db/dragonfly-master/dragonfly"]; ok {
+	if _, ok := p.masterless.stsZeroSince["db/dragonfly-master/dragonfly"]; ok {
 		t.Fatal("recovered tuple must leave the first-seen ledger")
 	}
 	if metrics.StatefulServiceZeroEndpoints.DeleteLabelValues("db", "dragonfly-master", "dragonfly") {
@@ -700,11 +708,11 @@ func TestCheckStatefulMasterlessNonCandidates(t *testing.T) {
 		sts, notReadySTS, headless, noRole, wrongSel, roleOnly), shOpDyn())
 	p.now = func() time.Time { return base }
 
-	if res := p.checkStatefulMasterlessServices(ctx); !res.pass {
+	if res := p.masterless.run(ctx); !res.pass {
 		t.Fatalf("non-candidates must pass, got %+v", res)
 	}
-	if len(p.stsZeroSince) != 0 {
-		t.Fatalf("non-candidates must not be tracked: %v", p.stsZeroSince)
+	if len(p.masterless.stsZeroSince) != 0 {
+		t.Fatalf("non-candidates must not be tracked: %v", p.masterless.stsZeroSince)
 	}
 }
 
@@ -793,7 +801,7 @@ func TestCheckRabbitMQSuspendedHeals(t *testing.T) {
 	})
 
 	// First sighting — tracked, quiet, pod kept.
-	if res := p.checkRabbitMQSuspendedPods(ctx); !res.pass {
+	if res := p.rabbitSuspended.run(ctx); !res.pass {
 		t.Fatalf("first-seen suspended pod must pass: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -803,7 +811,7 @@ func TestCheckRabbitMQSuspendedHeals(t *testing.T) {
 
 	at := base.Add(11 * time.Minute)
 	p.now = func() time.Time { return at }
-	if res := p.checkRabbitMQSuspendedPods(ctx); res.pass {
+	if res := p.rabbitSuspended.run(ctx); res.pass {
 		t.Fatal("suspended >=10m with quorum safe must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -837,9 +845,9 @@ func TestCheckRabbitMQSuspendedQuorumUnsafe(t *testing.T) {
 	cs := fake.NewSimpleClientset(sts, stuck, peerDown)
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.rbSuspendedSince["mq/rabbitmq-0/u0"] = base.Add(-time.Hour)
+	p.rabbitSuspended.rbSuspendedSince["mq/rabbitmq-0/u0"] = base.Add(-time.Hour)
 
-	if res := p.checkRabbitMQSuspendedPods(ctx); res.pass {
+	if res := p.rabbitSuspended.run(ctx); res.pass {
 		t.Fatal("suspended pod must still FAIL — quorum gate only blocks the heal")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -857,9 +865,9 @@ func TestCheckRabbitMQSuspendedNoSTSOwner(t *testing.T) {
 	cs := fake.NewSimpleClientset(stuck)
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.rbSuspendedSince["mq/rabbitmq-0/u0"] = base.Add(-time.Hour)
+	p.rabbitSuspended.rbSuspendedSince["mq/rabbitmq-0/u0"] = base.Add(-time.Hour)
 
-	if res := p.checkRabbitMQSuspendedPods(ctx); res.pass {
+	if res := p.rabbitSuspended.run(ctx); res.pass {
 		t.Fatal("suspended pod must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -883,10 +891,10 @@ func TestCheckRabbitMQSuspendedCooldown(t *testing.T) {
 	cs := fake.NewSimpleClientset(sts, stuck, peer)
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.rbSuspendedSince["mq/rabbitmq-0/u0"] = base.Add(-time.Hour)
-	p.rbHealed["mq/rabbitmq-0"] = base.Add(-10 * time.Minute)
+	p.rabbitSuspended.rbSuspendedSince["mq/rabbitmq-0/u0"] = base.Add(-time.Hour)
+	p.rabbitSuspended.rbHealed["mq/rabbitmq-0"] = base.Add(-10 * time.Minute)
 
-	if res := p.checkRabbitMQSuspendedPods(ctx); res.pass {
+	if res := p.rabbitSuspended.run(ctx); res.pass {
 		t.Fatal("suspended pod must FAIL even inside the heal cooldown")
 	}
 	if _, err := cs.CoreV1().Pods("mq").
@@ -922,9 +930,9 @@ func TestCheckOperatorWorkqueuesCertManagerPodNS(t *testing.T) {
 		"apps", "tls", 5, 3)
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
-	p.opFirstSeen["cert-manager/certificates/apps/tls"] = base.Add(-time.Hour)
+	p.operator.opFirstSeen["cert-manager/certificates/apps/tls"] = base.Add(-time.Hour)
 
-	res := p.checkOperatorWorkqueues(ctx)
+	res := p.operator.run(ctx)
 	if res.pass {
 		t.Fatal("stuck certificate must FAIL")
 	}
@@ -958,9 +966,9 @@ func TestCheckOperatorWorkqueuesDragonflyLeaseOptional(t *testing.T) {
 		"db", "cache", 9, 4)
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
-	p.opFirstSeen["dragonfly-operator/dragonflies/db/cache"] = base.Add(-time.Hour)
+	p.operator.opFirstSeen["dragonfly-operator/dragonflies/db/cache"] = base.Add(-time.Hour)
 
-	res := p.checkOperatorWorkqueues(ctx)
+	res := p.operator.run(ctx)
 	if res.pass {
 		t.Fatal("stuck dragonfly with live pod must FAIL (leaseOptional)")
 	}
@@ -982,7 +990,7 @@ func TestOperatorLeaseCandidateFallback(t *testing.T) {
 		leaseNames: []string{"missing-first", "second-choice"},
 	}
 	p := testProberDyn(cs, shOpDyn())
-	lease, err := p.operatorLease(ctx, op)
+	lease, err := p.operator.operatorLease(ctx, op)
 	if err != nil {
 		t.Fatalf("operatorLease: %v", err)
 	}
@@ -991,7 +999,7 @@ func TestOperatorLeaseCandidateFallback(t *testing.T) {
 	}
 	// All candidates absent → (nil, nil), not an error.
 	op.leaseNames = []string{"missing-first", "missing-second"}
-	lease, err = p.operatorLease(ctx, op)
+	lease, err = p.operator.operatorLease(ctx, op)
 	if err != nil || lease != nil {
 		t.Fatalf("absent candidates must give (nil,nil), got %v, %v", lease, err)
 	}
@@ -1014,10 +1022,10 @@ func TestCheckOperatorWorkqueuesMedik8sTarget(t *testing.T) {
 		"NodeHealthCheck", "operators", "nhc", 3, 0)
 	p := testProberDyn(cs, shOpDyn(nhc))
 	p.now = func() time.Time { return base }
-	p.opFirstSeen["node-healthcheck-operator/nodehealthchecks/operators/nhc"] =
+	p.operator.opFirstSeen["node-healthcheck-operator/nodehealthchecks/operators/nhc"] =
 		base.Add(-time.Hour)
 
-	if res := p.checkOperatorWorkqueues(ctx); res.pass {
+	if res := p.operator.run(ctx); res.pass {
 		t.Fatal("never-reconciled NodeHealthCheck must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "node-healthcheck-operator",
@@ -1046,8 +1054,7 @@ func shHR(ns, name, status, reason, message string, since time.Time) *unstructur
 	return hr
 }
 
-var hrRetryGVR = schema.GroupVersionResource{
-	Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"}
+var hrRetryGVR = shared.GVRHelmReleaseV2
 
 // A HelmRelease parked Ready=False/UpgradeFailed for 20m gets patched
 // with the reconcile annotations and the check FAILs.
@@ -1058,7 +1065,7 @@ func TestCheckFluxHelmReleaseRetriesPatches(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(hr))
 	p.now = func() time.Time { return base }
 
-	res := p.checkFluxHelmReleaseRetries(ctx)
+	res := p.fluxHR.run(ctx)
 	if res.pass {
 		t.Fatal("retries-exhausted HelmRelease must FAIL")
 	}
@@ -1084,7 +1091,7 @@ func TestCheckFluxHelmReleaseRetriesFreshQuiet(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(hr))
 	p.now = func() time.Time { return base }
 
-	if res := p.checkFluxHelmReleaseRetries(ctx); !res.pass {
+	if res := p.fluxHR.run(ctx); !res.pass {
 		t.Fatalf("fresh failure must pass: %+v", res)
 	}
 }
@@ -1103,7 +1110,7 @@ func TestCheckFluxHelmReleaseRetriesDepNotReady(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(hr, dep))
 	p.now = func() time.Time { return base }
 
-	res := p.checkFluxHelmReleaseRetries(ctx)
+	res := p.fluxHR.run(ctx)
 	if res.pass {
 		t.Fatal("stuck HR must FAIL even when remediation is deferred")
 	}
@@ -1124,7 +1131,7 @@ func TestCheckFluxHelmReleaseRetriesCooldown(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(hr))
 	p.now = func() time.Time { return base }
 
-	if res := p.checkFluxHelmReleaseRetries(ctx); res.pass {
+	if res := p.fluxHR.run(ctx); res.pass {
 		t.Fatal("precondition: stuck HR must FAIL")
 	}
 	first, _ := p.dyn.Resource(hrRetryGVR).Namespace("apps").
@@ -1134,7 +1141,7 @@ func TestCheckFluxHelmReleaseRetriesCooldown(t *testing.T) {
 
 	// 10m later — still inside the 30m cooldown.
 	p.now = func() time.Time { return base.Add(10 * time.Minute) }
-	if res := p.checkFluxHelmReleaseRetries(ctx); res.pass {
+	if res := p.fluxHR.run(ctx); res.pass {
 		t.Fatal("still-stuck HR must keep FAILING")
 	}
 	got, _ := p.dyn.Resource(hrRetryGVR).Namespace("apps").
@@ -1171,7 +1178,7 @@ func TestCheckPerconaClusterQuorum(t *testing.T) {
 		errCluster, paused, ready))
 	p.now = func() time.Time { return base }
 
-	res := p.checkPerconaClusterQuorum(ctx)
+	res := p.percona.run(ctx)
 	if res.pass {
 		t.Fatal("error-state cluster must FAIL")
 	}
@@ -1199,7 +1206,7 @@ func TestCheckPerconaClusterQuorumReadyZero(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(pxc, pg))
 	p.now = func() time.Time { return base }
 
-	res := p.checkPerconaClusterQuorum(ctx)
+	res := p.percona.run(ctx)
 	if res.pass {
 		t.Fatal("ready<1 clusters must FAIL")
 	}
@@ -1219,12 +1226,12 @@ func TestCheckPerconaClusterQuorumInitializing(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), shOpDyn(init))
 	p.now = func() time.Time { return base }
 
-	if res := p.checkPerconaClusterQuorum(ctx); !res.pass {
+	if res := p.percona.run(ctx); !res.pass {
 		t.Fatalf("fresh initializing must pass: %+v", res)
 	}
 	// 31m later — still initializing → FAIL.
 	p.now = func() time.Time { return base.Add(31 * time.Minute) }
-	if res := p.checkPerconaClusterQuorum(ctx); res.pass {
+	if res := p.percona.run(ctx); res.pass {
 		t.Fatal("initializing >30m must FAIL")
 	}
 }

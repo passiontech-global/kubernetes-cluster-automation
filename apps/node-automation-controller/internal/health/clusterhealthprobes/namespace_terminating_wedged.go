@@ -27,6 +27,10 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 )
 
+// namespaceTerminatingWedgedCheck is the namespace-terminating-wedged
+// watchdog with the finalizer sweep.
+type namespaceTerminatingWedgedCheck struct{ *deps }
+
 const (
 	checkNameNamespaceWedged = "namespace-terminating-wedged"
 
@@ -57,7 +61,7 @@ func init() {
 // conservative dead-owner finalizer sweep: CRs in the namespace
 // whose controller ownerRef resolves to a workload that no longer
 // exists get their non-protected finalizers stripped.
-func (p *clusterHealthProber) checkNamespaceTerminatingWedged(ctx context.Context) probeResult {
+func (p *namespaceTerminatingWedgedCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	now := p.now()
 	nss, err := p.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
@@ -79,7 +83,7 @@ func (p *clusterHealthProber) checkNamespaceTerminatingWedged(ctx context.Contex
 		p.nsFinalizerSweep(ctx, log, ns.Name, now)
 	}
 	sort.Strings(wedged)
-	reconcileEmittedGauges(checkNameNamespaceWedged,
+	p.reconcileEmittedGauges(checkNameNamespaceWedged,
 		namespaceTerminatingWedgedGauge, current)
 	if len(wedged) == 0 {
 		return probeResult{pass: true}
@@ -123,7 +127,7 @@ func protectedFinalizer(f string) bool {
 // terminating CRs whose controller owner no longer exists. Throttled
 // per namespace; a discovery failure skips the sweep (detection
 // already FAILed the check).
-func (p *clusterHealthProber) nsFinalizerSweep(ctx context.Context,
+func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 	log logr.Logger, nsName string, now time.Time) {
 
 	if p.dyn == nil {
@@ -188,7 +192,7 @@ func (p *clusterHealthProber) nsFinalizerSweep(ctx context.Context,
 // terminating object — only when its controller ownerRef resolves to
 // a workload that provably no longer exists. Returns true when a
 // patch was applied.
-func (p *clusterHealthProber) maybeStripFinalizers(ctx context.Context,
+func (p *namespaceTerminatingWedgedCheck) maybeStripFinalizers(ctx context.Context,
 	log logr.Logger, gvr schema.GroupVersionResource,
 	obj *unstructured.Unstructured) bool {
 
@@ -244,7 +248,7 @@ func (p *clusterHealthProber) maybeStripFinalizers(ctx context.Context,
 // points at a workload that no longer exists — the "dead operator"
 // proof required before stripping. Unknown kinds and lookup errors
 // fail closed (owner presumed alive).
-func (p *clusterHealthProber) ownerGone(ctx context.Context,
+func (p *namespaceTerminatingWedgedCheck) ownerGone(ctx context.Context,
 	obj *unstructured.Unstructured) bool {
 
 	ref := metav1.GetControllerOf(obj)

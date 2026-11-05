@@ -44,9 +44,12 @@ type nodeLabeler struct {
 
 // Setup wires the node-labeler reconciler. configPath is the
 // labels.txt file (default /etc/node-labeler/labels.txt).
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, configPath string) error {
-	r := &nodeLabeler{cs: cs, configPath: configPath}
-	return ctrl.NewControllerManagedBy(mgr).
+func Setup(d shared.Deps) error {
+	configPath := shared.Getenv("NODE_LABELER_CONFIG_PATH",
+		"/etc/node-labeler/labels.txt")
+	logf.Log.WithName("node-labeler").Info("registered", "configPath", configPath)
+	r := &nodeLabeler{cs: d.CS, configPath: configPath}
+	return ctrl.NewControllerManagedBy(d.Mgr).
 		Named("node-labeler").
 		// Watches with a single fixed workqueue key, not For(): the
 		// reconcile ignores req.Name and always sweeps the whole

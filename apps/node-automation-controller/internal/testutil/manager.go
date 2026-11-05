@@ -127,6 +127,34 @@ func ExpectPeriodic(t *testing.T, m *StubManager, name string, interval time.Dur
 	}
 }
 
+// RunPeriodic fires the Fn of the single *shared.Periodic m captured,
+// exactly once, with ctx — "run the sweep now" for tests that
+// exercise the real Setup wiring end-to-end (Setup(m, cs, dyn, true)
+// then RunPeriodic(t, m, ctx) runs the module's actual sweep closure
+// against the fake clients it was built with). Periodic.Start cannot
+// serve here: it phase-delays the first tick by up to Interval
+// (de-phasing jitter) and then loops forever.
+//
+// The returned error is fn's raw return value — Start would
+// metrics.IncError it, a direct Fn call does not, so
+// shell_operator_hook_run_errors_total assertions observe exactly
+// what the sweep produced. Callers asserting an EXPECTED error get it
+// back for inspection instead of a t.Fatal.
+func RunPeriodic(t *testing.T, m *StubManager, ctx context.Context) error {
+	t.Helper()
+	if len(m.Added) != 1 {
+		t.Fatalf("expected exactly 1 registered runnable, got %d", len(m.Added))
+	}
+	p, ok := m.Added[0].(*shared.Periodic)
+	if !ok {
+		t.Fatalf("registered runnable is %T, want *shared.Periodic", m.Added[0])
+	}
+	if p.Fn == nil {
+		t.Fatal("periodic registered with nil fn")
+	}
+	return p.Fn(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // Watch-source introspection — exercises the predicate/mapfunc closures
 // the builder-based Setup functions install. The controller's .Watch()

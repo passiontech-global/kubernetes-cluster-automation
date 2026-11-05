@@ -7,6 +7,7 @@ import (
 
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -15,7 +16,7 @@ import (
 func TestSetup(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	m := testutil.NewStubManager()
-	if err := Setup(m, cs); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: cs}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	if len(m.Added) != 1 {

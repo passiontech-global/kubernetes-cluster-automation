@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -21,8 +22,9 @@ import (
 // scheme, builds a controller through controller.New and lands it in
 // mgr.Add.
 func TestSetupRegistersController(t *testing.T) {
+	t.Setenv("NODE_LABELER_CONFIG_PATH", "labels.txt")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), "labels.txt"); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	if len(m.Added) != 1 {
@@ -34,8 +36,9 @@ func TestSetupRegistersController(t *testing.T) {
 // key — a multi-node burst must set-collapse to a single queued
 // request.
 func TestSetupSweepFixedKey(t *testing.T) {
+	t.Setenv("NODE_LABELER_CONFIG_PATH", "labels.txt")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), "labels.txt"); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	_, h := testutil.KindSource(t, testutil.ControllerWatches(t, m.Added[0])[0])
@@ -63,8 +66,9 @@ func TestSetupSweepFixedKey(t *testing.T) {
 // The node-labeler predicate is the bash jqFilter='.metadata.labels':
 // only label drift fires, everything else is dropped.
 func TestSetupNodeLabelerPredicate(t *testing.T) {
+	t.Setenv("NODE_LABELER_CONFIG_PATH", "labels.txt")
 	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return Setup(m, fake.NewSimpleClientset(), "labels.txt")
+		return Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()})
 	})
 
 	if !p.Create(event.CreateEvent{Object: testutil.Node("n1", corev1.ConditionTrue, nil)}) {

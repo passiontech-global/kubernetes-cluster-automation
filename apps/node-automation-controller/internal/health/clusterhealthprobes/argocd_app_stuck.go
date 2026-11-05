@@ -19,7 +19,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -27,6 +26,10 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
+
+// argoCDAppStuckCheck is the ArgoCD stuck-application watchdog with
+// repo-server restart heal.
+type argoCDAppStuckCheck struct{ *deps }
 
 const (
 	checkNameArgoCDAppStuck = "argocd-app-stuck"
@@ -42,8 +45,7 @@ const (
 // argocdAppGVR is the Application CRD the W10-CP6 auditor reads —
 // argoproj.io/v1alpha1 (distinct from the argoproj.io/v1beta1
 // ArgoCD cluster CR the operator watchdog already scans).
-var argocdAppGVR = schema.GroupVersionResource{
-	Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+var argocdAppGVR = shared.GVRArgoCDApplication
 
 var (
 	// W10-CP6 — ArgoCD Application stuck.
@@ -67,7 +69,7 @@ func init() {
 // simultaneous ComparisonErrors additionally restart the oldest
 // argocd-repo-server pod — the shared stale-cache signature. An
 // absent Application CRD is a clean pass (ArgoCD not installed).
-func (p *clusterHealthProber) checkArgoCDAppStuck(ctx context.Context) probeResult {
+func (p *argoCDAppStuckCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	if p.dyn == nil {
 		return probeResult{infra: fmt.Errorf(
@@ -91,12 +93,12 @@ func (p *clusterHealthProber) checkArgoCDAppStuck(ctx context.Context) probeResu
 		ns, name := app.GetNamespace(), app.GetName()
 		var reasons []string
 
-		health, _, _ := unstructured.NestedString(app.Object,
+		health, _ := shared.NestedString(app.Object,
 			"status", "health", "status")
 		if health == "Progressing" {
 			sig := "prog/" + ns + "/" + name
 			seenKeep[sig] = true
-			first, _ := seenFirstStreak(checkNameArgoCDAppStuck, sig, now)
+			first, _ := p.seenFirstStreak(checkNameArgoCDAppStuck, sig, now)
 			if now.Sub(first) >= argocdAppProgressingMinAge {
 				reasons = append(reasons,
 					fmt.Sprintf("progressing>%s", argocdAppProgressingMinAge))
@@ -104,8 +106,8 @@ func (p *clusterHealthProber) checkArgoCDAppStuck(ctx context.Context) probeResu
 		}
 		reasonSet := map[string]bool{}
 		hasComparisonError := false
-		for _, c := range shared.ReadyConds(app) {
-			typ, _ := c["type"].(string)
+		for _, c := range shared.Conditions(app.Object, "status", "conditions") {
+			typ := c.Type
 			lower := strings.ToLower(typ)
 			isCmp := strings.Contains(lower, "comparisonerror")
 			isInvalid := strings.Contains(lower, "invalidspecerror")
@@ -120,14 +122,12 @@ func (p *clusterHealthProber) checkArgoCDAppStuck(ctx context.Context) probeResu
 			// absent/malformed falls back to first-seen.
 			age := time.Duration(0)
 			known := false
-			if ts, _ := c["lastTransitionTime"].(string); ts != "" {
-				if t, err := time.Parse(time.RFC3339, ts); err == nil {
-					age = now.Sub(t)
-					known = true
-				}
+			if !c.LastTransitionTime.IsZero() {
+				age = now.Sub(c.LastTransitionTime)
+				known = true
 			}
 			if !known {
-				first, _ := seenFirstStreak(checkNameArgoCDAppStuck, sig, now)
+				first, _ := p.seenFirstStreak(checkNameArgoCDAppStuck, sig, now)
 				age = now.Sub(first)
 			}
 			if age < argocdConditionMinAge {
@@ -157,8 +157,8 @@ func (p *clusterHealthProber) checkArgoCDAppStuck(ctx context.Context) probeResu
 		stuck = append(stuck, fmt.Sprintf("%s/%s(%s)", ns, name, reason))
 		p.refreshArgoCDApp(ctx, log, app, now)
 	}
-	pruneSeenStreaks(checkNameArgoCDAppStuck, seenKeep)
-	reconcileEmittedGauges(checkNameArgoCDAppStuck, argoCDAppStuckGauge, current)
+	p.pruneSeenStreaks(checkNameArgoCDAppStuck, seenKeep)
+	p.reconcileEmittedGauges(checkNameArgoCDAppStuck, argoCDAppStuckGauge, current)
 
 	// >=2 simultaneous ComparisonErrors = shared stale repo-server
 	// cache — restart the oldest repo-server pod to flush it.
@@ -174,7 +174,7 @@ func (p *clusterHealthProber) checkArgoCDAppStuck(ctx context.Context) probeResu
 
 // refreshArgoCDApp patches argocd.argoproj.io/refresh=hard on a
 // stuck Application — 30m per-app cooldown on the shared ledger.
-func (p *clusterHealthProber) refreshArgoCDApp(ctx context.Context,
+func (p *argoCDAppStuckCheck) refreshArgoCDApp(ctx context.Context,
 	log logr.Logger, app *unstructured.Unstructured, now time.Time) {
 
 	ck := "selfheal/" + checkNameArgoCDAppStuck + "/refresh/" +
@@ -201,7 +201,7 @@ func (p *clusterHealthProber) refreshArgoCDApp(ctx context.Context,
 // is the stale-cache signature and one restart flushes it. Matched
 // by the argocd-operator label scheme (app.kubernetes.io/name or
 // component) with a name-prefix fallback.
-func (p *clusterHealthProber) restartArgoCDRepoServer(ctx context.Context,
+func (p *argoCDAppStuckCheck) restartArgoCDRepoServer(ctx context.Context,
 	log logr.Logger, now time.Time) {
 
 	pods, err := p.cs.CoreV1().Pods(metav1.NamespaceAll).

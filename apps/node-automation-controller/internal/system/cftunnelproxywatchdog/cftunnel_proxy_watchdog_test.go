@@ -14,6 +14,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
 const cfWatchdogTestNS = "cf-test"
@@ -420,9 +422,10 @@ func TestCloudflaredLogsWedged(t *testing.T) {
 
 // Disabled must be a clean no-op — nothing registered, no error.
 func TestSetupCFTunnelProxyWatchdogDisabled(t *testing.T) {
+	t.Setenv("CF_TUNNEL_WATCHDOG_ENABLED", "false")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(),
-		false, cfWatchdogTestNS, 5*time.Minute); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {
@@ -433,9 +436,12 @@ func TestSetupCFTunnelProxyWatchdogDisabled(t *testing.T) {
 // Enabled registration goes through shared.AddPeriodic with the legacy queue
 // name and the configured interval.
 func TestSetupCFTunnelProxyWatchdogPeriodic(t *testing.T) {
+	t.Setenv("CF_TUNNEL_WATCHDOG_ENABLED", "true")
+	t.Setenv("CF_TUNNEL_WATCHDOG_NAMESPACE", cfWatchdogTestNS)
+	t.Setenv("CF_TUNNEL_WATCHDOG_INTERVAL", "5m")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(),
-		true, cfWatchdogTestNS, 5*time.Minute); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, cfTunnelWatchdogQueue, 5*time.Minute)

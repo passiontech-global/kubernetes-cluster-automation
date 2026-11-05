@@ -46,10 +46,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -89,18 +87,14 @@ var apiServiceProtectedNamespaces = map[string]bool{
 
 // apiServiceGVR is the apiregistration.k8s.io/v1 APIService resource —
 // cluster-scoped, no typed client in client-go.
-var apiServiceGVR = schema.GroupVersionResource{
-	Group:    "apiregistration.k8s.io",
-	Version:  "v1",
-	Resource: "apiservices",
-}
+var apiServiceGVR = shared.GVRAPIService
 
 type apiServiceGuard struct {
 	cs  kubernetes.Interface
 	dyn dynamic.Interface
 	// nowFn is the clock seam — tests pin it so the >10m
 	// unavailable window is deterministic. nil → time.Now.
-	nowFn func() time.Time
+	nowFn shared.Clock
 	// emitted is the ledger of APIServiceUnavailable label tuples
 	// ("name/service_namespace/service_name") held at =1 — a tuple
 	// not re-seen this sweep gets its series deleted via
@@ -116,8 +110,9 @@ type apiServiceGuard struct {
 // clusters (APISERVICE_GUARD_ENABLED=false) skip registration
 // entirely — same contract as cert-drift-auditor: no runnable, no
 // periodic cluster LIST against the apiserver.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, enabled bool) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
+	if !shared.Gate("APISERVICE_GUARD_ENABLED", true) {
 		logf.Log.WithName(apiServiceGuardQueue).Info("disabled — module not registered")
 		return nil
 	}
@@ -284,8 +279,8 @@ func (g *apiServiceGuard) sweepAvailability(ctx context.Context, svcs *unstructu
 // namespace/name — ok=false when the APIService is not Service-backed
 // (e.g. the local "v1." core registration).
 func apiServiceBackend(u *unstructured.Unstructured) (namespace, name string, ok bool) {
-	ns, _, _ := unstructured.NestedString(u.Object, "spec", "service", "namespace")
-	n, _, _ := unstructured.NestedString(u.Object, "spec", "service", "name")
+	ns, _ := shared.NestedString(u.Object, "spec", "service", "namespace")
+	n, _ := shared.NestedString(u.Object, "spec", "service", "name")
 	if ns == "" || n == "" {
 		return "", "", false
 	}
@@ -297,31 +292,11 @@ func apiServiceBackend(u *unstructured.Unstructured) (namespace, name string, ok
 // False, or the timestamp is unparseable (an APIService with no
 // provable failure age is never flagged).
 func apiServiceUnavailableSince(u *unstructured.Unstructured) (time.Time, bool) {
-	conds, found, err := unstructured.NestedSlice(u.Object, "status", "conditions")
-	if err != nil || !found {
+	c, ok := shared.ConditionOf(u.Object, apiServiceAvailableCond)
+	if !ok || c.Status != apiServiceConditionFalse || c.LastTransitionTime.IsZero() {
 		return time.Time{}, false
 	}
-	for _, c := range conds {
-		m, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		typ, _ := m["type"].(string)
-		status, _ := m["status"].(string)
-		if typ != apiServiceAvailableCond {
-			continue
-		}
-		if status != apiServiceConditionFalse {
-			return time.Time{}, false
-		}
-		ts, _ := m["lastTransitionTime"].(string)
-		t, err := time.Parse(time.RFC3339, ts)
-		if err != nil {
-			return time.Time{}, false
-		}
-		return t, true
-	}
-	return time.Time{}, false
+	return c.LastTransitionTime, true
 }
 
 // ---------------------------------------------------------------------------

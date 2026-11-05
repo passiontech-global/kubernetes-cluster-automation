@@ -37,7 +37,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -100,9 +99,9 @@ type partitionEvictor struct {
 }
 
 // Setup registers the 5-minute sweep (was crontab */5).
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface) error {
-	e := &partitionEvictor{cs: cs}
-	return shared.AddPeriodic(mgr, partitionEvictorQueue, 5*time.Minute, e.run)
+func Setup(d shared.Deps) error {
+	e := &partitionEvictor{cs: d.CS}
+	return shared.AddPeriodic(d.Mgr, partitionEvictorQueue, 5*time.Minute, e.run)
 }
 
 // nodePartitioned reports whether any NWPD network condition has been

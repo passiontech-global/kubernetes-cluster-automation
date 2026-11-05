@@ -8,12 +8,14 @@ import (
 
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
 func TestSetupRegistersPeriodic(t *testing.T) {
+	t.Setenv("CSR_APPROVER_ENABLED", "true")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), true); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "csr-watcher", 10*time.Minute)
@@ -22,8 +24,9 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 // csr-watcher registers unconditionally — the flag only gates the tick
 // body, like the bash exit-early at the top of the hook.
 func TestSetupRegistersWhenDisabled(t *testing.T) {
+	t.Setenv("CSR_APPROVER_ENABLED", "false")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), false); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("detect-only csr setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "csr-watcher", 10*time.Minute)

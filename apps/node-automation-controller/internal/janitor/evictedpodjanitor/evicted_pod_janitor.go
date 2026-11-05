@@ -23,7 +23,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -63,9 +62,9 @@ type evictedPodJanitor struct {
 }
 
 // Setup registers the 10-minute sweep.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface) error {
-	j := &evictedPodJanitor{cs: cs}
-	return shared.AddPeriodic(mgr, evictedPodQueue, 10*time.Minute, j.run)
+func Setup(d shared.Deps) error {
+	j := &evictedPodJanitor{cs: d.CS}
+	return shared.AddPeriodic(d.Mgr, evictedPodQueue, 10*time.Minute, j.run)
 }
 
 func (j *evictedPodJanitor) run(ctx context.Context) error {
@@ -76,21 +75,12 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 	// Running/Pending pod in the cluster to throw them away below.
 	// The in-code phase check stays — fake clientsets ignore field
 	// selectors and the belt costs nothing.
-	var pods []corev1.Pod
-	cont := ""
-	for {
-		page, err := j.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-			FieldSelector: "status.phase=" + string(corev1.PodFailed),
-			Limit:         evictedPodListPageSize,
-			Continue:      cont,
-		})
-		if err != nil {
-			return fmt.Errorf("list failed pods: %w", err) // periodic wrapper IncErrors evictedPodQueue
-		}
-		pods = append(pods, page.Items...)
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	pods, err := shared.ListAll(ctx, metav1.ListOptions{
+		FieldSelector: "status.phase=" + string(corev1.PodFailed),
+		Limit:         evictedPodListPageSize,
+	}, shared.Pods(j.cs, metav1.NamespaceAll))
+	if err != nil {
+		return fmt.Errorf("list failed pods: %w", err) // periodic wrapper IncErrors evictedPodQueue
 	}
 
 	type target struct {

@@ -29,7 +29,7 @@ func TestCheckLinkerdEndpointSyncHealthy(t *testing.T) {
 		endpointSliceForService("app", "headless-svc", "10.244.0.5"),
 		readyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, shOpDyn())
-	if res := p.checkLinkerdEndpointSync(ctx); !res.pass {
+	if res := p.linkerdSync.run(ctx); !res.pass {
 		t.Fatalf("synced endpoints must pass: %+v", res)
 	}
 	if m := findMetric(t, "node_automation_linkerd_endpoint_desync",
@@ -49,7 +49,7 @@ func TestCheckLinkerdEndpointSyncSkipsUninjected(t *testing.T) {
 		// No EndpointSlice at all — would desync if audited.
 		readyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, shOpDyn())
-	if res := p.checkLinkerdEndpointSync(ctx); !res.pass {
+	if res := p.linkerdSync.run(ctx); !res.pass {
 		t.Fatalf("uninjected namespace must pass: %+v", res)
 	}
 }
@@ -88,18 +88,18 @@ func TestCheckLinkerdEndpointSyncDesyncHeal(t *testing.T) {
 	p.now = func() time.Time { return base }
 
 	// First sighting: tracked, still passing.
-	if res := p.checkLinkerdEndpointSync(ctx); !res.pass {
+	if res := p.linkerdSync.run(ctx); !res.pass {
 		t.Fatalf("first-seen desync must pass: %+v", res)
 	}
 	// Inside the window: still quiet.
 	p.now = func() time.Time { return base.Add(5 * time.Minute) }
-	if res := p.checkLinkerdEndpointSync(ctx); !res.pass {
+	if res := p.linkerdSync.run(ctx); !res.pass {
 		t.Fatalf("desync inside window must pass: %+v", res)
 	}
 	// Past the window: FAIL + gauge + oldest destination pod gone.
 	at := base.Add(linkerdEndpointDesyncMinAge + time.Minute)
 	p.now = func() time.Time { return at }
-	if res := p.checkLinkerdEndpointSync(ctx); res.pass {
+	if res := p.linkerdSync.run(ctx); res.pass {
 		t.Fatal("persisted desync did not fail the check")
 	}
 	m := findMetric(t, "node_automation_linkerd_endpoint_desync",
@@ -119,7 +119,7 @@ func TestCheckLinkerdEndpointSyncDesyncHeal(t *testing.T) {
 	// Inside the 1h per-service cooldown the newer pod survives even
 	// though the desync persists.
 	p.now = func() time.Time { return at.Add(30 * time.Minute) }
-	if res := p.checkLinkerdEndpointSync(ctx); res.pass {
+	if res := p.linkerdSync.run(ctx); res.pass {
 		t.Fatal("persisted desync stopped failing inside cooldown")
 	}
 	if _, err := cs.CoreV1().Pods(linkerdNS).
@@ -141,9 +141,9 @@ func TestCheckLinkerdEndpointSyncResyncClears(t *testing.T) {
 		readyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.checkLinkerdEndpointSync(ctx)
+	p.linkerdSync.run(ctx)
 	p.now = func() time.Time { return base.Add(linkerdEndpointDesyncMinAge + time.Minute) }
-	if res := p.checkLinkerdEndpointSync(ctx); res.pass {
+	if res := p.linkerdSync.run(ctx); res.pass {
 		t.Fatal("persisted desync did not fail")
 	}
 	// EndpointSlice resyncs — the tuple must drop off /metrics.
@@ -154,7 +154,7 @@ func TestCheckLinkerdEndpointSyncResyncClears(t *testing.T) {
 	cs.DiscoveryV1().EndpointSlices("app").Create(ctx,
 		endpointSliceForService("app", "headless-svc", "10.244.0.5"), metav1.CreateOptions{})
 	p.now = func() time.Time { return base.Add(2*linkerdEndpointDesyncMinAge + time.Minute) }
-	if res := p.checkLinkerdEndpointSync(ctx); !res.pass {
+	if res := p.linkerdSync.run(ctx); !res.pass {
 		t.Fatalf("resynced service must pass: %+v", res)
 	}
 	if m := findMetric(t, "node_automation_linkerd_endpoint_desync",
@@ -285,9 +285,9 @@ func TestLinkerdEndpointSyncKeepsHealthySlice(t *testing.T) {
 		readyWorkerNode("w1", "", 0, false))
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.checkLinkerdEndpointSync(ctx)
+	p.linkerdSync.run(ctx)
 	p.now = func() time.Time { return base.Add(linkerdEndpointDesyncMinAge + time.Minute) }
-	if res := p.checkLinkerdEndpointSync(ctx); !res.pass {
+	if res := p.linkerdSync.run(ctx); !res.pass {
 		t.Fatalf("synced endpoints must pass: %+v", res)
 	}
 	if _, err := cs.DiscoveryV1().EndpointSlices("desyncapp").

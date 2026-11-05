@@ -45,7 +45,6 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -88,17 +87,17 @@ type pdbDeadlockWatchdog struct {
 // PDB_WATCHDOG_ENABLED flag is on. Disabled clusters register nothing
 // at all — same contract as cilium-taint-reaper: no runnable, no
 // periodic cluster-wide LIST against the apiserver.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	if !shared.Gate("PDB_WATCHDOG_ENABLED", true) {
 		logf.Log.WithName(pdbDeadlockQueue).Info("disabled — module not registered")
 		return nil
 	}
 	w := &pdbDeadlockWatchdog{
-		cs:        cs,
+		cs:        d.CS,
 		firstSeen: map[string]time.Time{},
 		nowFn:     time.Now,
 	}
-	return shared.AddPeriodic(mgr, pdbDeadlockQueue, 5*time.Minute, w.run)
+	return shared.AddPeriodic(d.Mgr, pdbDeadlockQueue, 5*time.Minute, w.run)
 }
 
 func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {

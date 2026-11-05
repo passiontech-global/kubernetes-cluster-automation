@@ -44,7 +44,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -87,16 +86,16 @@ type coreDNSWatchdog struct {
 	panicsFn func(ctx context.Context, podIP string) (float64, bool)
 }
 
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface) error {
+func Setup(d shared.Deps) error {
 	w := &coreDNSWatchdog{
-		cs:     cs,
+		cs:     d.CS,
 		http:   &http.Client{Timeout: 5 * time.Second},
 		streak: map[string]int{},
 	}
 	w.logHitFn = w.logHit
 	w.dnsFn = w.dnsProbe
 	w.panicsFn = w.panics
-	return shared.AddPeriodic(mgr, corednsQueue, time.Minute, w.run)
+	return shared.AddPeriodic(d.Mgr, corednsQueue, time.Minute, w.run)
 }
 
 func (w *coreDNSWatchdog) run(ctx context.Context) error {
@@ -359,20 +358,11 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) (string, map[string]boo
 	// Page the cluster-wide Service list — an unbounded List forces
 	// etcd to serialize every Service into one response; 500-per-page
 	// keeps each request cheap at fleet scale.
-	var svcItems []corev1.Service
-	cont := ""
-	for {
-		page, err := w.cs.CoreV1().Services(metav1.NamespaceAll).List(ctx,
-			metav1.ListOptions{Limit: 500, Continue: cont})
-		if err != nil {
-			log.Info("dns: cannot list services — layer 2 inconclusive", "error", err)
-			return "", nil
-		}
-		svcItems = append(svcItems, page.Items...)
-		if page.Continue == "" {
-			break
-		}
-		cont = page.Continue
+	svcItems, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
+		shared.Services(w.cs, metav1.NamespaceAll))
+	if err != nil {
+		log.Info("dns: cannot list services — layer 2 inconclusive", "error", err)
+		return "", nil
 	}
 	sort.Slice(svcItems, func(i, j int) bool {
 		return svcItems[i].CreationTimestamp.Time.
@@ -429,39 +419,35 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 	log := logf.FromContext(ctx)
 	var best *discoveryv1.EndpointSlice
 	var bestRV int64
-	opts := metav1.ListOptions{Limit: 500}
-	for {
-		page, err := w.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).
-			List(ctx, opts)
-		if err != nil {
-			log.Info("dns: cannot list endpointslices — fallback inconclusive", "error", err)
-			return "", nil
-		}
-		for i := range page.Items {
-			es := &page.Items[i]
-			if es.Labels[discoveryv1.LabelServiceName] == "" {
-				continue
-			}
-			ready := false
-			for _, ep := range es.Endpoints {
-				if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
-					ready = true
-					break
+	err := shared.ListEach(ctx, metav1.ListOptions{Limit: 500},
+		shared.EndpointSlices(w.cs, metav1.NamespaceAll),
+		func(items []discoveryv1.EndpointSlice) error {
+			for i := range items {
+				es := &items[i]
+				if es.Labels[discoveryv1.LabelServiceName] == "" {
+					continue
 				}
+				ready := false
+				for _, ep := range es.Endpoints {
+					if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
+						ready = true
+						break
+					}
+				}
+				if !ready {
+					continue
+				}
+				rv, err := strconv.ParseInt(es.ResourceVersion, 10, 64)
+				if err != nil || rv <= bestRV {
+					continue
+				}
+				best, bestRV = es, rv
 			}
-			if !ready {
-				continue
-			}
-			rv, err := strconv.ParseInt(es.ResourceVersion, 10, 64)
-			if err != nil || rv <= bestRV {
-				continue
-			}
-			best, bestRV = es, rv
-		}
-		if page.Continue == "" {
-			break
-		}
-		opts.Continue = page.Continue
+			return nil
+		})
+	if err != nil {
+		log.Info("dns: cannot list endpointslices — fallback inconclusive", "error", err)
+		return "", nil
 	}
 	if best == nil {
 		return "", nil

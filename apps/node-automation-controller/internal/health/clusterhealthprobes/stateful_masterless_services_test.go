@@ -104,11 +104,11 @@ func TestDeadlockDeletesLowestOrdinal(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-1", "replica", true))
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
-	p.drHealed["dragonfly-operator-system/dragonfly-operator-controller-manager-x"] =
+	p.masterless.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
+	p.masterless.drHealed["dragonfly-operator-system/dragonfly-operator-controller-manager-x"] =
 		base.Add(-4 * time.Minute)
 
-	if res := p.checkStatefulMasterlessServices(ctx); res.pass {
+	if res := p.masterless.run(ctx); res.pass {
 		t.Fatal("deadlocked masterless service must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("db").
@@ -146,10 +146,10 @@ func TestDeadlockWaitsForOperatorSettle(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-1", "replica", true))
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
-	p.drHealed["dragonfly-operator-system/x"] = base.Add(-time.Minute)
+	p.masterless.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
+	p.masterless.drHealed["dragonfly-operator-system/x"] = base.Add(-time.Minute)
 
-	_ = p.checkStatefulMasterlessServices(ctx)
+	_ = p.masterless.run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted while the operator heal is still settling")
@@ -168,9 +168,9 @@ func TestDeadlockRequiresOperatorHeal(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-0", "replica", true))
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
+	p.masterless.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
 
-	_ = p.checkStatefulMasterlessServices(ctx)
+	_ = p.masterless.run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted with no operator heal on record")
@@ -190,10 +190,10 @@ func TestDeadlockSkipsWhenMasterPresent(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-1", "replica", true))
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
-	p.drHealed["dragonfly-operator-system/x"] = base.Add(-4 * time.Minute)
+	p.masterless.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
+	p.masterless.drHealed["dragonfly-operator-system/x"] = base.Add(-4 * time.Minute)
 
-	_ = p.checkStatefulMasterlessServices(ctx)
+	_ = p.masterless.run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted while a pod already holds the master role")
@@ -212,11 +212,11 @@ func TestDeadlockHealCooldown(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-0", "replica", true))
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
-	p.drHealed["dragonfly-operator-system/x"] = base.Add(-4 * time.Minute)
-	p.drPodHealed["db/dragonfly"] = base.Add(-10 * time.Minute)
+	p.masterless.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
+	p.masterless.drHealed["dragonfly-operator-system/x"] = base.Add(-4 * time.Minute)
+	p.masterless.drPodHealed["db/dragonfly"] = base.Add(-10 * time.Minute)
 
-	_ = p.checkStatefulMasterlessServices(ctx)
+	_ = p.masterless.run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted inside the 30m deadlock cooldown")
@@ -236,10 +236,10 @@ func TestDeadlockMaintenanceDefers(t *testing.T) {
 		dragonflyRolePod("db", "dragonfly-0", "replica", true))
 	p := testProberDyn(cs, shOpDyn())
 	p.now = func() time.Time { return base }
-	p.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
-	p.drHealed["dragonfly-operator-system/x"] = base.Add(-4 * time.Minute)
+	p.masterless.stsZeroSince["db/dragonfly-master/dragonfly"] = base.Add(-12 * time.Minute)
+	p.masterless.drHealed["dragonfly-operator-system/x"] = base.Add(-4 * time.Minute)
 
-	_ = p.checkStatefulMasterlessServices(ctx)
+	_ = p.masterless.run(ctx)
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted during maintenance")

@@ -94,12 +94,18 @@ type metricsServerPatcher struct {
 //
 // minReplicas/nodesPerReplica are the CPA-linear replica pin — see
 // proportionalReplicas. minReplicas<=0 disables the pin entirely.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, minReplicas, nodesPerReplica int) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	// Parse before the gate — see corednspatcher: invalid knob values
+	// must warn even when the module is disabled.
+	minReplicas := shared.GetenvInt("METRICS_SERVER_MIN_REPLICAS", 3)
+	nodesPerReplica := shared.GetenvInt("METRICS_SERVER_NODES_PER_REPLICA", 1)
+	if !shared.Gate("METRICS_SERVER_PATCHER_ENABLED", true) {
 		logf.Log.WithName("metrics-server-patcher").Info("disabled — module not registered")
 		return nil
 	}
-	b := ctrl.NewControllerManagedBy(mgr).
+	logf.Log.WithName("metrics-server-patcher").Info("registered",
+		"minReplicas", minReplicas, "nodesPerReplica", nodesPerReplica)
+	b := ctrl.NewControllerManagedBy(d.Mgr).
 		Named("metrics-server-patcher").
 		For(&appsv1.Deployment{}, builder.WithPredicates(
 			predicate.NewPredicateFuncs(func(o client.Object) bool {
@@ -123,7 +129,7 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, minReplicas,
 				GenericFunc: func(event.GenericEvent) bool { return false },
 			}))
 	}
-	return b.Complete(&metricsServerPatcher{cs: cs,
+	return b.Complete(&metricsServerPatcher{cs: d.CS,
 		minReplicas: minReplicas, nodesPerReplica: nodesPerReplica})
 }
 

@@ -26,6 +26,27 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
+// linkerdEndpointSyncCheck is the W9-NM2 linkerd endpoint-sync
+// watchdog — a headless Service whose EndpointSlice diverges from
+// its Ready pod IPs, healed by bouncing linkerd-destination.
+type linkerdEndpointSyncCheck struct {
+	*deps
+
+	// W9-NM2 watchdog state (under mu):
+	//   - linkerdDesyncSince: "ns/svc" → first sweep the headless
+	//     Service's EndpointSlice diverged from its Ready pod IPs;
+	//     pruned when the divergence resolves so a later desync
+	//     re-arms the window.
+	//   - linkerdDesyncEmitted: gauge tuples held at 1 — a tuple not
+	//     re-seen gets DeleteLabelValues, not a stale 1.
+	//   - linkerdDesyncHealed: "ns/svc" → last linkerd-destination
+	//     bounce — the 1h per-service cooldown (in-RAM: the pod is
+	//     the heal target, nothing else can carry the stamp).
+	linkerdDesyncSince   map[string]time.Time
+	linkerdDesyncEmitted map[string]bool
+	linkerdDesyncHealed  map[string]time.Time
+}
+
 const (
 	// W9-NM2 — linkerd-endpoint-sync knobs.
 	checkNameLinkerdEndpointSync = "linkerd-endpoint-sync"
@@ -159,7 +180,7 @@ func staleLinkerdSlices(slices []linkerdSliceRef,
 // corrected data. Only managed-by=endpointslice-controller.k8s.io
 // slices are delete candidates: mirror/third-party slices are not
 // ours to reap.
-func (p *clusterHealthProber) checkLinkerdEndpointSync(ctx context.Context) probeResult {
+func (p *linkerdEndpointSyncCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	now := p.now()
 	p.mu.Lock()
@@ -222,52 +243,49 @@ func (p *clusterHealthProber) checkLinkerdEndpointSync(ctx context.Context) prob
 		// endpointslice-controller-owned EndpointSlices with their
 		// Ready address sets — the W10-FIX7 delete candidates.
 		managedSlices := map[string][]linkerdSliceRef{}
-		sliceOpts := metav1.ListOptions{Limit: healthListPageSize}
-		for {
-			page, err := p.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).
-				List(ctx, sliceOpts)
-			if err != nil {
-				return probeResult{infra: fmt.Errorf("list endpointslices: %w", err)}
-			}
-			for _, s := range page.Items {
-				svc := s.Labels[discoveryv1.LabelServiceName]
-				if svc == "" {
-					continue
-				}
-				key := s.Namespace + "/" + svc
-				managed := audited[key] &&
-					s.Labels[discoveryv1.LabelManagedBy] == linkerdSliceManagedByESC &&
-					s.DeletionTimestamp == nil
-				var sliceAddrs map[string]bool
-				if managed {
-					sliceAddrs = map[string]bool{}
-				}
-				set := esReady[key]
-				if set == nil {
-					set = map[string]bool{}
-					esReady[key] = set
-				}
-				for _, ep := range s.Endpoints {
-					if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+		err = shared.ListEach(ctx,
+			metav1.ListOptions{Limit: healthListPageSize},
+			shared.EndpointSlices(p.cs, metav1.NamespaceAll),
+			func(items []discoveryv1.EndpointSlice) error {
+				for _, s := range items {
+					svc := s.Labels[discoveryv1.LabelServiceName]
+					if svc == "" {
 						continue
 					}
-					for _, a := range ep.Addresses {
-						set[a] = true
-						if managed {
-							sliceAddrs[a] = true
+					key := s.Namespace + "/" + svc
+					managed := audited[key] &&
+						s.Labels[discoveryv1.LabelManagedBy] == linkerdSliceManagedByESC &&
+						s.DeletionTimestamp == nil
+					var sliceAddrs map[string]bool
+					if managed {
+						sliceAddrs = map[string]bool{}
+					}
+					set := esReady[key]
+					if set == nil {
+						set = map[string]bool{}
+						esReady[key] = set
+					}
+					for _, ep := range s.Endpoints {
+						if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+							continue
+						}
+						for _, a := range ep.Addresses {
+							set[a] = true
+							if managed {
+								sliceAddrs[a] = true
+							}
 						}
 					}
+					if managed {
+						managedSlices[key] = append(managedSlices[key],
+							linkerdSliceRef{ns: s.Namespace, name: s.Name,
+								uid: s.UID, addrs: sliceAddrs})
+					}
 				}
-				if managed {
-					managedSlices[key] = append(managedSlices[key],
-						linkerdSliceRef{ns: s.Namespace, name: s.Name,
-							uid: s.UID, addrs: sliceAddrs})
-				}
-			}
-			if page.Continue == "" {
-				break
-			}
-			sliceOpts.Continue = page.Continue
+				return nil
+			})
+		if err != nil {
+			return probeResult{infra: fmt.Errorf("list endpointslices: %w", err)}
 		}
 
 		podsByNS := map[string][]*corev1.Pod{}
@@ -396,7 +414,7 @@ func (p *clusterHealthProber) checkLinkerdEndpointSync(ctx context.Context) prob
 // mutex, same shape as every pod-delete heal in this package. The
 // cooldown stamps when ANY heal action succeeded — a failed delete
 // retries next sweep instead of burning the hour.
-func (p *clusterHealthProber) healLinkerdDestination(ctx context.Context,
+func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 	log logr.Logger, svcKey string, now time.Time, stale []linkerdSliceRef) {
 
 	p.mu.Lock()

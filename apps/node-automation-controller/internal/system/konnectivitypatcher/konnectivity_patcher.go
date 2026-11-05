@@ -52,15 +52,15 @@ type konnectivityPatcher struct {
 // Setup reconciles only the konnectivity-agent
 // DaemonSet (the informer is already field-scoped to it via the
 // manager cache; the predicate is a cheap belt on top).
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface) error {
-	return ctrl.NewControllerManagedBy(mgr).
+func Setup(d shared.Deps) error {
+	return ctrl.NewControllerManagedBy(d.Mgr).
 		Named("konnectivity-patcher").
 		For(&appsv1.DaemonSet{}, builder.WithPredicates(
 			predicate.NewPredicateFuncs(func(o client.Object) bool {
 				return o.GetNamespace() == "kube-system" &&
 					o.GetName() == "konnectivity-agent"
 			}))).
-		Complete(&konnectivityPatcher{cs: cs})
+		Complete(&konnectivityPatcher{cs: d.CS})
 }
 
 func (r *konnectivityPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {

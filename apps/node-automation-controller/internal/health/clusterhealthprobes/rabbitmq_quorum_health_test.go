@@ -33,7 +33,7 @@ func TestRabbitMQQuorumAlarmFails(t *testing.T) {
 	p.cfg.httpURL = srv.URL
 	p.httpClient = srv.Client()
 
-	res := p.checkRabbitMQQuorumHealth(ctx)
+	res := p.rabbitQuorum.run(ctx)
 	if res.pass {
 		t.Fatalf("fd-limit alarm must fail: %+v", res)
 	}
@@ -53,7 +53,7 @@ func TestRabbitMQQuorumStuckUnreadyHeal(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, r1, r2)
 	p := testProber(cs)
 
-	res := p.checkRabbitMQQuorumHealth(ctx)
+	res := p.rabbitQuorum.run(ctx)
 	if res.pass {
 		t.Fatalf("stuck-unready quorum member must fail: %+v", res)
 	}
@@ -70,7 +70,7 @@ func TestRabbitMQQuorumHealthyPasses(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(pods...)
 	p := testProber(cs)
-	if res := p.checkRabbitMQQuorumHealth(ctx); !res.pass {
+	if res := p.rabbitQuorum.run(ctx); !res.pass {
 		t.Fatalf("healthy quorum must pass: %+v", res)
 	}
 }

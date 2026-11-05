@@ -98,10 +98,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
@@ -211,7 +211,8 @@ type apiServerEndpointGuard struct {
 }
 
 // Setup registers the 30s wedge sweep.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface) error {
+func Setup(d shared.Deps) error {
+	mgr, cs := d.Mgr, d.CS
 	g := &apiServerEndpointGuard{cs: cs, backends: map[string]*backendProbeState{}}
 	g.probeFn = g.probe
 	g.log = mgr.GetLogger().WithName(endpointGuardQueue)

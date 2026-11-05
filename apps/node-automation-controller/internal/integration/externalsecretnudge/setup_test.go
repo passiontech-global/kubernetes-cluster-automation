@@ -8,6 +8,7 @@ import (
 
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -15,8 +16,10 @@ import (
 // crontab-equivalent interval — the pairing is what keeps
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
+	t.Setenv("EXTERNALSECRET_NUDGE_ENABLED", "true")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), testutil.StubDyn(), true); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "externalsecret-nudge", 10*time.Minute)
@@ -25,8 +28,10 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 // externalsecret-nudge registers unconditionally — the flag only gates
 // the tick body.
 func TestSetupRegistersWhenDisabled(t *testing.T) {
+	t.Setenv("EXTERNALSECRET_NUDGE_ENABLED", "false")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), testutil.StubDyn(), false); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("disabled nudge setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "externalsecret-nudge", 10*time.Minute)

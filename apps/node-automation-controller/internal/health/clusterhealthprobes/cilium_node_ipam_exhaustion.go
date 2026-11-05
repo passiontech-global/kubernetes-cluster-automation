@@ -25,6 +25,10 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
+// ciliumNodeIPAMExhaustionCheck is the cilium node IPAM exhaustion
+// watchdog with terminal-pod reaping.
+type ciliumNodeIPAMExhaustionCheck struct{ *deps }
+
 const (
 	checkNameCiliumNodeIPAM = "cilium-node-ipam-exhaustion"
 
@@ -81,7 +85,7 @@ func podCIDRCapacity(podCIDR string) (int, bool) {
 // deleting the pod object makes kubelet tear down the sandbox and
 // release the IP. Orphaned CRI sandboxes (pod object already gone)
 // have no apiserver handle — noted, not actionable from here.
-func (p *clusterHealthProber) checkCiliumNodeIPAMExhaustion(ctx context.Context) probeResult {
+func (p *ciliumNodeIPAMExhaustionCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	now := p.now()
 	minFree := healthEnvFloat("CILIUM_NODE_IPAM_MIN_FREE_RATIO", ciliumIPAMMinFreeRatio)
@@ -184,7 +188,7 @@ func (p *clusterHealthProber) checkCiliumNodeIPAMExhaustion(ctx context.Context)
 		p.reapTerminalPodsOnNode(ctx, log, node.Name, now)
 	}
 	sort.Strings(exhausted)
-	reconcileEmittedGauges(checkNameCiliumNodeIPAM,
+	p.reconcileEmittedGauges(checkNameCiliumNodeIPAM,
 		ciliumIPAMFreeRatioGauge, current)
 	if len(exhausted) == 0 {
 		return probeResult{pass: true}
@@ -199,7 +203,7 @@ func (p *clusterHealthProber) checkCiliumNodeIPAMExhaustion(ctx context.Context)
 // pod IPs — once per node per cooldown, maintenance-gated. Terminal
 // pods hold no traffic; the delete is the safe existing shape (same
 // as the evicted-pod janitor, scoped to the exhausted node).
-func (p *clusterHealthProber) reapTerminalPodsOnNode(ctx context.Context,
+func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Context,
 	log logr.Logger, node string, now time.Time) {
 
 	ck := "selfheal/" + checkNameCiliumNodeIPAM + "/reap/" + node

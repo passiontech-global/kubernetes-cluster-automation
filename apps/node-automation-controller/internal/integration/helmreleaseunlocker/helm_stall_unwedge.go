@@ -135,7 +135,7 @@ var stalledWorkloadRe = regexp.MustCompile(
 // workload-layer check in deadlockPlan decides whether it is really
 // the surge deadlock — this gate only decides who gets analyzed.
 func hrStalledRollout(hr *unstructured.Unstructured) bool {
-	if suspended, _, _ := unstructured.NestedBool(hr.Object, "spec", "suspend"); suspended {
+	if suspended, _ := shared.NestedBool(hr.Object, "spec", "suspend"); suspended {
 		return false // parked, not broken — same rule as the artifact healer
 	}
 	if status, _, _ := hrCondition(hr, "Stalled"); status == "True" {
@@ -211,7 +211,7 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		// lastAttemptedRevision, each at least
 		// stallAttemptCooldown apart. A revision change re-arms —
 		// the new revision has not had its window yet.
-		revision, _, _ := unstructured.NestedString(
+		revision, _ := shared.NestedString(
 			hr.Object, "status", "lastAttemptedRevision")
 		att := u.stallAttempts[key]
 		if att == nil || att.revision != revision {

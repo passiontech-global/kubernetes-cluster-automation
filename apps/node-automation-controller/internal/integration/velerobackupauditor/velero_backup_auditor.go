@@ -36,10 +36,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -56,24 +54,18 @@ const (
 )
 
 var (
-	veleroScheduleGVR = schema.GroupVersionResource{
-		Group: "velero.io", Version: "v1", Resource: "schedules"}
-	veleroBackupGVR = schema.GroupVersionResource{
-		Group: "velero.io", Version: "v1", Resource: "backups"}
-	veleroBSLGVR = schema.GroupVersionResource{
-		Group: "velero.io", Version: "v1", Resource: "backupstoragelocations"}
+	veleroScheduleGVR = shared.GVVeleroSchedule
+	veleroBackupGVR   = shared.GVVeleroBackup
+	veleroBSLGVR      = shared.GVVeleroBackupStorageLocation
 	// W10-ST6 — podvolumebackups.velero.io: per-volume snapshots
 	// taken by the node-agent DaemonSet; a wedged InProgress PVB
 	// blocks the next backup's volume phase.
-	veleroPVBGVR = schema.GroupVersionResource{
-		Group: "velero.io", Version: "v1", Resource: "podvolumebackups"}
+	veleroPVBGVR = shared.GVVeleroPodVolumeBackup
 	// W9-ST3 — Percona Everest operator CRDs: the DatabaseCluster
 	// declares spec.backup.enabled and the DatabaseClusterBackup
 	// carries spec.dbClusterName + status.state.
-	everestDBClusterGVR = schema.GroupVersionResource{
-		Group: "everest.percona.com", Version: "v1alpha1", Resource: "databaseclusters"}
-	everestDBBackupGVR = schema.GroupVersionResource{
-		Group: "everest.percona.com", Version: "v1alpha1", Resource: "databaseclusterbackups"}
+	everestDBClusterGVR = shared.GVREverestDatabaseCluster
+	everestDBBackupGVR  = shared.GVREverestDatabaseClusterBackup
 )
 
 // veleroStuckPhases are terminal-failure and wedged-in-flight
@@ -135,12 +127,12 @@ type pausedLedgerKey struct{ uid, namespace, schedule string }
 type veleroBackupAuditor struct {
 	cs         kubernetes.Interface // reserved for future typed reads
 	dyn        dynamic.Interface
-	nowFn      func() time.Time // clock seam — same pattern as certDriftAuditor
-	seenPaused map[pausedKey]bool
-	seenBad    map[backupKey]bool
+	nowFn      shared.Clock // clock seam — same pattern as certDriftAuditor
+	seenPaused shared.GaugeLedger[pausedKey]
+	seenBad    shared.GaugeLedger[backupKey]
 	// seenBSL: series ledger for VeleroBSLUnavailable — an
 	// Available-again or deleted BSL gets DeleteLabelValues.
-	seenBSL map[pausedKey]bool
+	seenBSL shared.GaugeLedger[pausedKey]
 	// firstSeenPaused: when the sweep first saw this Schedule
 	// generation paused — measures the actual pause duration. A
 	// Schedule carries no "paused since" timestamp, so the ledger is
@@ -152,11 +144,11 @@ type veleroBackupAuditor struct {
 	// everestKey the sweep stops re-asserting gets
 	// DeleteLabelValues'd so a recovered or deleted
 	// DatabaseCluster never pins the gauge.
-	seenEverest map[everestKey]bool
+	seenEverest shared.GaugeLedger[everestKey]
 	// seenStuckBackup / seenWedgedPVB: series ledgers for the
 	// W10-ST6 in-flight gauges — same prune-on-resolve contract.
-	seenStuckBackup map[pausedKey]bool
-	seenWedgedPVB   map[pausedKey]bool
+	seenStuckBackup shared.GaugeLedger[pausedKey]
+	seenWedgedPVB   shared.GaugeLedger[pausedKey]
 	// pvbHealed: "<ns>/<name>" -> last wedged-PVB cleanup time —
 	// the per-object cooldown that stops a still-broken node-agent
 	// from being delete-looped every sweep.
@@ -164,11 +156,11 @@ type veleroBackupAuditor struct {
 }
 
 // Setup registers the 15m sweep — or nothing when
-// the cluster opts out (VELERO_BACKUP_AUDITOR_ENABLED in main.go feeds
-// `enabled`): same disabled-flag pattern as cert-drift-auditor.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
-	dyn dynamic.Interface, enabled bool) error {
-	if !enabled {
+// the cluster opts out (VELERO_BACKUP_AUDITOR_ENABLED=false): same
+// disabled-flag pattern as cert-drift-auditor.
+func Setup(d shared.Deps) error {
+	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
+	if !shared.Gate("VELERO_BACKUP_AUDITOR_ENABLED", true) {
 		logf.Log.WithName(veleroAuditQueue).Info("disabled — module not registered")
 		return nil
 	}
@@ -176,13 +168,7 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
 		cs:              cs,
 		dyn:             dyn,
 		nowFn:           time.Now,
-		seenPaused:      map[pausedKey]bool{},
-		seenBad:         map[backupKey]bool{},
-		seenBSL:         map[pausedKey]bool{},
 		firstSeenPaused: map[pausedLedgerKey]time.Time{},
-		seenEverest:     map[everestKey]bool{},
-		seenStuckBackup: map[pausedKey]bool{},
-		seenWedgedPVB:   map[pausedKey]bool{},
 		pvbHealed:       map[string]time.Time{},
 	}
 	return shared.AddPeriodic(mgr, veleroAuditQueue, veleroAuditInterval, a.run)
@@ -195,26 +181,8 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	if a.nowFn == nil {
 		a.nowFn = time.Now
 	}
-	if a.seenPaused == nil {
-		a.seenPaused = map[pausedKey]bool{}
-	}
-	if a.seenBad == nil {
-		a.seenBad = map[backupKey]bool{}
-	}
-	if a.seenBSL == nil {
-		a.seenBSL = map[pausedKey]bool{}
-	}
 	if a.firstSeenPaused == nil {
 		a.firstSeenPaused = map[pausedLedgerKey]time.Time{}
-	}
-	if a.seenEverest == nil {
-		a.seenEverest = map[everestKey]bool{}
-	}
-	if a.seenStuckBackup == nil {
-		a.seenStuckBackup = map[pausedKey]bool{}
-	}
-	if a.seenWedgedPVB == nil {
-		a.seenWedgedPVB = map[pausedKey]bool{}
 	}
 	if a.pvbHealed == nil {
 		a.pvbHealed = map[string]time.Time{}
@@ -248,8 +216,6 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	}
 	latest := latestBackupsBySchedule(backups)
 
-	currentPaused := map[pausedKey]bool{}
-	currentBad := map[backupKey]bool{}
 	pausedNow := map[pausedLedgerKey]bool{}
 	for i := range schedules.Items {
 		s := &schedules.Items[i]
@@ -260,7 +226,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		// real pause duration from first sight; an entry pruned on
 		// unpause means a re-pause restarts the clock, and the UID in
 		// the key keeps a delete+recreate from inheriting pause time.
-		isPaused, _, _ := unstructured.NestedBool(s.Object, "spec", "paused")
+		isPaused, _ := shared.NestedBool(s.Object, "spec", "paused")
 		if isPaused {
 			lk := pausedLedgerKey{string(s.GetUID()), ns, name}
 			pausedNow[lk] = true
@@ -268,7 +234,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 				a.firstSeenPaused[lk] = a.nowFn()
 			}
 			k := pausedKey{ns, name}
-			currentPaused[k] = true
+			a.seenPaused.Emit(k, ns, name)
 			v := 0.0
 			if pausedFor := a.nowFn().Sub(a.firstSeenPaused[lk]); pausedFor > veleroPausedMinAge {
 				v = 1
@@ -287,22 +253,17 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 			// legitimately stops producing (check 1 already covers
 			// it).
 			if !isPaused {
-				a.flagMissingBackups(ctx, s, ns, name, currentBad)
+				a.flagMissingBackups(ctx, s, ns, name)
 			}
 			continue
 		}
-		a.flagBadBackup(ctx, b, ns, name, currentBad)
+		a.flagBadBackup(ctx, b, ns, name)
 	}
 
 	// Prune series whose condition resolved since the last sweep —
 	// a schedule unpaused or a fresh healthy backup must clear the
 	// gauge, not pin it at 1.
-	for k := range a.seenPaused {
-		if !currentPaused[k] {
-			metrics.VeleroSchedulePaused.DeleteLabelValues(k.namespace, k.schedule)
-		}
-	}
-	a.seenPaused = currentPaused
+	a.seenPaused.Prune(metrics.VeleroSchedulePaused.DeleteLabelValues)
 	// Drop first-seen entries for schedules that unpaused or vanished
 	// — a later re-pause measures a fresh duration, not the
 	// cumulative time it once spent paused.
@@ -311,18 +272,11 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 			delete(a.firstSeenPaused, lk)
 		}
 	}
-	for k := range a.seenBad {
-		if !currentBad[k] {
-			metrics.VeleroBackupEmptyOrErrored.
-				DeleteLabelValues(k.namespace, k.schedule, k.reason)
-		}
-	}
-	a.seenBad = currentBad
+	a.seenBad.Prune(metrics.VeleroBackupEmptyOrErrored.DeleteLabelValues)
 
 	// W8-ST1 — BackupStorageLocation availability: a BSL not
 	// phase=Available means backups run to an unreachable bucket and
 	// the next restore has nothing to read.
-	currentBSL := map[pausedKey]bool{}
 	bsls, err := a.dyn.Resource(veleroBSLGVR).List(ctx, metav1.ListOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
@@ -334,23 +288,18 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		for i := range bsls.Items {
 			bsl := &bsls.Items[i]
 			ns, name := bsl.GetNamespace(), bsl.GetName()
-			phase, _, _ := unstructured.NestedString(bsl.Object, "status", "phase")
+			phase, _ := shared.NestedString(bsl.Object, "status", "phase")
 			if phase == "Available" {
 				continue
 			}
 			k := pausedKey{ns, name}
-			currentBSL[k] = true
+			a.seenBSL.Emit(k, ns, name)
 			metrics.VeleroBSLUnavailable.WithLabelValues(ns, name).Set(1)
 			log.Info("velero BSL unavailable — backups/restore at risk",
 				"bsl", ns+"/"+name, "phase", phase)
 		}
 	}
-	for k := range a.seenBSL {
-		if !currentBSL[k] {
-			metrics.VeleroBSLUnavailable.DeleteLabelValues(k.namespace, k.schedule)
-		}
-	}
-	a.seenBSL = currentBSL
+	a.seenBSL.Prune(metrics.VeleroBSLUnavailable.DeleteLabelValues)
 
 	// W10-ST6 — in-flight transfer audit: mark Backups/PVBs wedged
 	// InProgress|Deleting >6h, and clean up PVBs whose node-agent
@@ -360,8 +309,8 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	stuckErr := a.auditInFlightTransfers(ctx, backups)
 
 	log.Info("sweep done", "schedules", len(schedules.Items),
-		"paused", len(currentPaused), "badBackups", len(currentBad),
-		"bslUnavailable", len(currentBSL))
+		"paused", len(a.seenPaused.Last()), "badBackups", len(a.seenBad.Last()),
+		"bslUnavailable", len(a.seenBSL.Last()))
 	return errors.Join(everestErr, stuckErr)
 }
 
@@ -396,7 +345,7 @@ func latestBackupsBySchedule(backups *unstructured.UnstructuredList) map[string]
 // VeleroBackupEmptyOrErrored series the other rot signatures use.
 // A zero creationTimestamp cannot prove age — skipped (fail closed).
 func (a *veleroBackupAuditor) flagMissingBackups(ctx context.Context,
-	s *unstructured.Unstructured, ns, schedule string, current map[backupKey]bool) {
+	s *unstructured.Unstructured, ns, schedule string) {
 	log := logf.FromContext(ctx)
 	created := s.GetCreationTimestamp()
 	if created.IsZero() {
@@ -406,7 +355,7 @@ func (a *veleroBackupAuditor) flagMissingBackups(ctx context.Context,
 	if age <= veleroMissingBackupMaxAge {
 		return
 	}
-	current[backupKey{ns, schedule, "missing"}] = true
+	a.seenBad.Emit(backupKey{ns, schedule, "missing"}, ns, schedule, "missing")
 	metrics.VeleroBackupEmptyOrErrored.
 		WithLabelValues(ns, schedule, "missing").Set(1)
 	log.Info("velero schedule older than 36h has zero backups — silently unprotected",
@@ -419,9 +368,9 @@ func (a *veleroBackupAuditor) flagMissingBackups(ctx context.Context,
 // backup that protected nothing" — errors/warnings on an in-flight
 // or failed backup are partial counters, not rot.
 func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
-	b *unstructured.Unstructured, ns, schedule string, current map[backupKey]bool) {
+	b *unstructured.Unstructured, ns, schedule string) {
 	log := logf.FromContext(ctx)
-	phase, _, _ := unstructured.NestedString(b.Object, "status", "phase")
+	phase, _ := shared.NestedString(b.Object, "status", "phase")
 	// W8-ST1 — terminal failures and wedged in-flight phases are
 	// flagged on their own reason series before the Completed path
 	// runs: Failed/PartiallyFailed/FailedValidation flag immediately,
@@ -431,8 +380,8 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 		flag := reason == "failed"
 		if reason == "stuck" {
 			since := b.GetCreationTimestamp().Time
-			if st, found, _ := unstructured.NestedString(
-				b.Object, "status", "startTimestamp"); found {
+			if st, ok := shared.NestedString(
+				b.Object, "status", "startTimestamp"); ok {
 				if t, err := time.Parse(time.RFC3339, st); err == nil {
 					since = t
 				}
@@ -440,7 +389,7 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 			flag = a.nowFn().Sub(since) > veleroStuckMaxAge
 		}
 		if flag {
-			current[backupKey{ns, schedule, reason}] = true
+			a.seenBad.Emit(backupKey{ns, schedule, reason}, ns, schedule, reason)
 			metrics.VeleroBackupEmptyOrErrored.
 				WithLabelValues(ns, schedule, reason).Set(1)
 			log.Info("velero backup in a bad phase",
@@ -457,27 +406,27 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 	// gate on `found`: a Completed backup with no progress block at
 	// all (older Velero, stripped status) is "can't tell", not empty —
 	// without the gate every absent-progress backup false-flags.
-	items, itemsFound, _ := unstructured.NestedInt64(
+	items, itemsFound := shared.NestedInt64(
 		b.Object, "status", "progress", "itemsBackedUp")
-	total, totalFound, _ := unstructured.NestedInt64(
+	total, totalFound := shared.NestedInt64(
 		b.Object, "status", "progress", "totalItems")
 	if (itemsFound && items == 0) || (totalFound && total == 0) {
-		current[backupKey{ns, schedule, "zero_items"}] = true
+		a.seenBad.Emit(backupKey{ns, schedule, "zero_items"}, ns, schedule, "zero_items")
 		metrics.VeleroBackupEmptyOrErrored.
 			WithLabelValues(ns, schedule, "zero_items").Set(1)
 		log.Info("velero backup completed with zero items",
 			"backup", b.GetNamespace()+"/"+b.GetName(), "schedule", ns+"/"+schedule)
 	}
-	if errs, _, _ := unstructured.NestedInt64(b.Object, "status", "errors"); errs > 0 {
-		current[backupKey{ns, schedule, "errors"}] = true
+	if errs, _ := shared.NestedInt64(b.Object, "status", "errors"); errs > 0 {
+		a.seenBad.Emit(backupKey{ns, schedule, "errors"}, ns, schedule, "errors")
 		metrics.VeleroBackupEmptyOrErrored.
 			WithLabelValues(ns, schedule, "errors").Set(1)
 		log.Info("velero backup completed with item errors",
 			"backup", b.GetNamespace()+"/"+b.GetName(), "schedule", ns+"/"+schedule,
 			"errors", errs)
 	}
-	if warns, _, _ := unstructured.NestedInt64(b.Object, "status", "warnings"); warns > 0 {
-		current[backupKey{ns, schedule, "warnings"}] = true
+	if warns, _ := shared.NestedInt64(b.Object, "status", "warnings"); warns > 0 {
+		a.seenBad.Emit(backupKey{ns, schedule, "warnings"}, ns, schedule, "warnings")
 		metrics.VeleroBackupEmptyOrErrored.
 			WithLabelValues(ns, schedule, "warnings").Set(1)
 		log.Info("velero backup completed with item warnings",
@@ -506,7 +455,6 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 // same contract as the Velero half of this module.
 func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	current := map[everestKey]bool{}
 
 	clusters, err := a.dyn.Resource(everestDBClusterGVR).List(ctx, metav1.ListOptions{})
 	switch {
@@ -539,7 +487,7 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 	if backups != nil {
 		for i := range backups.Items {
 			b := &backups.Items[i]
-			owner, _, _ := unstructured.NestedString(b.Object, "spec", "dbClusterName")
+			owner, _ := shared.NestedString(b.Object, "spec", "dbClusterName")
 			if owner == "" {
 				continue
 			}
@@ -554,8 +502,8 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 		ns, name := dc.GetNamespace(), dc.GetName()
 		// Only clusters that opted into backups AND are not paused —
 		// a paused cluster's stale backups are deliberate, not rot.
-		enabled, _, _ := unstructured.NestedBool(dc.Object, "spec", "backup", "enabled")
-		paused, _, _ := unstructured.NestedBool(dc.Object, "spec", "paused")
+		enabled, _ := shared.NestedBool(dc.Object, "spec", "backup", "enabled")
+		paused, _ := shared.NestedBool(dc.Object, "spec", "paused")
 		if !enabled || paused {
 			continue
 		}
@@ -575,7 +523,7 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 		}
 		for _, reason := range reasons {
 			k := everestKey{ns, name, reason}
-			current[k] = true
+			a.seenEverest.Emit(k, ns, name, reason)
 			metrics.DBBackupUnhealthy.WithLabelValues(ns, name, reason).Set(1)
 			log.Info("everest databasecluster backup unhealthy",
 				"cluster", ns+"/"+name, "reason", reason,
@@ -583,13 +531,7 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 		}
 	}
 
-	for k := range a.seenEverest {
-		if !current[k] {
-			metrics.DBBackupUnhealthy.DeleteLabelValues(
-				k.namespace, k.cluster, k.reason)
-		}
-	}
-	a.seenEverest = current
+	a.seenEverest.Prune(metrics.DBBackupUnhealthy.DeleteLabelValues)
 	return nil
 }
 
@@ -610,14 +552,14 @@ func everestBackupReasons(backups []*unstructured.Unstructured,
 	var reasons []string
 
 	// failed — the LATEST backup ended Failed.
-	if state, _, _ := unstructured.NestedString(
+	if state, _ := shared.NestedString(
 		sorted[0].Object, "status", "state"); state == "Failed" {
 		reasons = append(reasons, "failed")
 	}
 
 	// stuck — ANY backup wedged in Running/Starting past 6h.
 	for _, b := range sorted {
-		state, _, _ := unstructured.NestedString(b.Object, "status", "state")
+		state, _ := shared.NestedString(b.Object, "status", "state")
 		if state != "Running" && state != "Starting" {
 			continue
 		}
@@ -631,13 +573,13 @@ func everestBackupReasons(backups []*unstructured.Unstructured,
 	// measured from status.completionTime when present (the moment
 	// the restorable point actually landed), else creationTimestamp.
 	for _, b := range sorted {
-		state, _, _ := unstructured.NestedString(b.Object, "status", "state")
+		state, _ := shared.NestedString(b.Object, "status", "state")
 		if state != "Succeeded" {
 			continue
 		}
 		done := b.GetCreationTimestamp().Time
-		if ct, found, _ := unstructured.NestedString(
-			b.Object, "status", "completionTime"); found {
+		if ct, ok := shared.NestedString(
+			b.Object, "status", "completionTime"); ok {
 			if t, err := time.Parse(time.RFC3339, ct); err == nil {
 				done = t
 			}
@@ -670,11 +612,10 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 	now := a.nowFn()
 
 	// --- Backups: mark-only gauge over the already-listed set ---
-	currentStuck := map[pausedKey]bool{}
 	if backups != nil {
 		for i := range backups.Items {
 			b := &backups.Items[i]
-			phase, _, _ := unstructured.NestedString(b.Object, "status", "phase")
+			phase, _ := shared.NestedString(b.Object, "status", "phase")
 			if phase != "InProgress" && phase != "Deleting" {
 				continue
 			}
@@ -683,38 +624,29 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 				continue
 			}
 			k := pausedKey{b.GetNamespace(), b.GetName()}
-			currentStuck[k] = true
+			a.seenStuckBackup.Emit(k, k.namespace, k.schedule)
 			metrics.VeleroBackupStuck.WithLabelValues(k.namespace, k.schedule).Set(1)
 			log.Info("velero backup wedged in-flight >6h",
 				"backup", k.namespace+"/"+k.schedule, "phase", phase)
 		}
 	}
-	for k := range a.seenStuckBackup {
-		if !currentStuck[k] {
-			metrics.VeleroBackupStuck.DeleteLabelValues(k.namespace, k.schedule)
-		}
-	}
-	a.seenStuckBackup = currentStuck
+	a.seenStuckBackup.Prune(metrics.VeleroBackupStuck.DeleteLabelValues)
 
 	// --- PodVolumeBackups: mark + conditional cleanup ---
 	pvbs, err := a.dyn.Resource(veleroPVBGVR).List(ctx, metav1.ListOptions{})
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// CRD absent — clear any stale wedge series and stop.
-		for k := range a.seenWedgedPVB {
-			metrics.VeleroPodVolumeBackupWedged.DeleteLabelValues(k.namespace, k.schedule)
-		}
-		a.seenWedgedPVB = map[pausedKey]bool{}
+		a.seenWedgedPVB.Prune(metrics.VeleroPodVolumeBackupWedged.DeleteLabelValues)
 		return nil
 	case err != nil:
 		return fmt.Errorf("list velero podvolumebackups: %w", err)
 	}
 
-	currentWedged := map[pausedKey]bool{}
 	cleaned := 0
 	for i := range pvbs.Items {
 		pvb := &pvbs.Items[i]
-		phase, _, _ := unstructured.NestedString(pvb.Object, "status", "phase")
+		phase, _ := shared.NestedString(pvb.Object, "status", "phase")
 		if phase != "InProgress" && phase != "Deleting" {
 			continue
 		}
@@ -724,7 +656,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 		}
 		ns, name := pvb.GetNamespace(), pvb.GetName()
 		k := pausedKey{ns, name}
-		currentWedged[k] = true
+		a.seenWedgedPVB.Emit(k, ns, name)
 		metrics.VeleroPodVolumeBackupWedged.WithLabelValues(ns, name).Set(1)
 		log.Info("velero podvolumebackup wedged in-flight >6h",
 			"pvb", ns+"/"+name, "phase", phase)
@@ -743,12 +675,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 			cleaned++
 		}
 	}
-	for k := range a.seenWedgedPVB {
-		if !currentWedged[k] {
-			metrics.VeleroPodVolumeBackupWedged.DeleteLabelValues(k.namespace, k.schedule)
-		}
-	}
-	a.seenWedgedPVB = currentWedged
+	a.seenWedgedPVB.Prune(metrics.VeleroPodVolumeBackupWedged.DeleteLabelValues)
 	return nil
 }
 
@@ -757,7 +684,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 // creationTimestamp — the same convention flagBadBackup uses.
 func inFlightSince(u *unstructured.Unstructured) time.Time {
 	since := u.GetCreationTimestamp().Time
-	if st, found, _ := unstructured.NestedString(u.Object, "status", "startTimestamp"); found {
+	if st, ok := shared.NestedString(u.Object, "status", "startTimestamp"); ok {
 		if t, err := time.Parse(time.RFC3339, st); err == nil {
 			since = t
 		}
@@ -827,11 +754,11 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 func (a *veleroBackupAuditor) pvbAgentPod(ctx context.Context,
 	pvb *unstructured.Unstructured) (*corev1.Pod, error) {
 	ns := pvb.GetNamespace()
-	node, found, _ := unstructured.NestedString(pvb.Object, "spec", "node")
-	if !found || node == "" {
+	node, ok := shared.NestedString(pvb.Object, "spec", "node")
+	if !ok || node == "" {
 		// Older velero wrote the node under status — accept it as a
 		// fallback so pre-upgrade PVBs still resolve.
-		node, _, _ = unstructured.NestedString(pvb.Object, "status", "node")
+		node, _ = shared.NestedString(pvb.Object, "status", "node")
 	}
 	if node == "" {
 		return nil, nil

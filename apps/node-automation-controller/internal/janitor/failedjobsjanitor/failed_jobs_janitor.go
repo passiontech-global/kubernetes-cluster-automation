@@ -35,16 +35,13 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -73,8 +70,7 @@ const (
 // buildRunGVR is the Shipwright BuildRun CRD — absent on clusters
 // without the Shipwright operator, in which case the sweep is a quiet
 // no-op (404/NoMatch tolerated, same contract as the Velero audit).
-var buildRunGVR = schema.GroupVersionResource{
-	Group: "shipwright.io", Version: "v1beta1", Resource: "buildruns"}
+var buildRunGVR = shared.GVRShipwrightBuildRun
 
 // stuckTerminatingKey identifies one emitted
 // StuckTerminatingResources series — the label triple needed to
@@ -98,18 +94,17 @@ type failedJobsJanitor struct {
 	stuckEmitted map[stuckTerminatingKey]struct{}
 }
 
-// Setup registers the hourly sweep (was crontab 17 * * * *). dyn
+// Setup registers the hourly sweep (was crontab 17 * * * *). d.Dyn
 // carries the dynamic client the W9-GO2 BuildRun TTL sweep needs —
 // pass nil only in tests that never exercise it.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
-	dyn dynamic.Interface) error {
+func Setup(d shared.Deps) error {
 	j := &failedJobsJanitor{
-		cs:           cs,
-		dyn:          dyn,
+		cs:           d.CS,
+		dyn:          d.Dyn,
 		nowFn:        time.Now,
 		stuckEmitted: map[stuckTerminatingKey]struct{}{},
 	}
-	return shared.AddPeriodic(mgr, failedJobQueue, 60*time.Minute, j.run)
+	return shared.AddPeriodic(d.Mgr, failedJobQueue, 60*time.Minute, j.run)
 }
 
 func (j *failedJobsJanitor) run(ctx context.Context) error {
@@ -122,18 +117,11 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 		j.nowFn = time.Now
 	}
 
-	var jobs []batchv1.Job
-	cont := ""
-	for {
-		page, err := j.cs.BatchV1().Jobs(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-			Limit: failedJobListPageSize, Continue: cont})
-		if err != nil {
-			return fmt.Errorf("list jobs: %w", err)
-		}
-		jobs = append(jobs, page.Items...)
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	jobs, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: failedJobListPageSize},
+		shared.Jobs(j.cs, metav1.NamespaceAll))
+	if err != nil {
+		return fmt.Errorf("list jobs: %w", err)
 	}
 
 	type target struct {
@@ -314,30 +302,17 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list namespaces: %w", err)
 	}
-	var pvcs []corev1.PersistentVolumeClaim
-	cont := ""
-	for {
-		page, err := j.cs.CoreV1().PersistentVolumeClaims(metav1.NamespaceAll).
-			List(ctx, metav1.ListOptions{Limit: failedJobListPageSize, Continue: cont})
-		if err != nil {
-			return fmt.Errorf("list persistentvolumeclaims: %w", err)
-		}
-		pvcs = append(pvcs, page.Items...)
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	pvcs, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: failedJobListPageSize},
+		shared.PersistentVolumeClaims(j.cs, metav1.NamespaceAll))
+	if err != nil {
+		return fmt.Errorf("list persistentvolumeclaims: %w", err)
 	}
-	var vas []storagev1.VolumeAttachment
-	for {
-		page, err := j.cs.StorageV1().VolumeAttachments().
-			List(ctx, metav1.ListOptions{Limit: failedJobListPageSize, Continue: cont})
-		if err != nil {
-			return fmt.Errorf("list volumeattachments: %w", err)
-		}
-		vas = append(vas, page.Items...)
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	vas, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: failedJobListPageSize},
+		shared.VolumeAttachments(j.cs))
+	if err != nil {
+		return fmt.Errorf("list volumeattachments: %w", err)
 	}
 
 	current := map[stuckTerminatingKey]struct{}{}

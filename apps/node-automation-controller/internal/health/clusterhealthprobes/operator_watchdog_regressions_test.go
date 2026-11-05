@@ -134,12 +134,12 @@ func TestCheckOperatorWorkqueuesOCIHelmRepoIgnored(t *testing.T) {
 	p := testProberDyn(cs, shOpDyn(ociRepo))
 	p.now = func() time.Time { return base }
 
-	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
+	if res := p.operator.run(ctx); !res.pass {
 		t.Fatalf("OCI HelmRepository must not freeze the check: %+v", res)
 	}
-	for k := range p.opFirstSeen {
+	for k := range p.operator.opFirstSeen {
 		if strings.HasPrefix(k, "source-controller/helmrepositories/") {
-			t.Fatalf("OCI repo must not be tracked: %v", p.opFirstSeen)
+			t.Fatalf("OCI repo must not be tracked: %v", p.operator.opFirstSeen)
 		}
 	}
 
@@ -148,9 +148,9 @@ func TestCheckOperatorWorkqueuesOCIHelmRepoIgnored(t *testing.T) {
 	stale := shHelmRepo("http-repo", 5, 3, "default", false)
 	p2 := testProberDyn(cs, shOpDyn(ociRepo, stale))
 	p2.now = func() time.Time { return base }
-	p2.opFirstSeen["source-controller/helmrepositories/flux-system/http-repo"] =
+	p2.operator.opFirstSeen["source-controller/helmrepositories/flux-system/http-repo"] =
 		base.Add(-time.Hour)
-	if res := p2.checkOperatorWorkqueues(ctx); res.pass {
+	if res := p2.operator.run(ctx); res.pass {
 		t.Fatal("stale type=default HelmRepository must still FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "source-controller", kcmReasonStaleGen); v != 1 {
@@ -183,7 +183,7 @@ func TestLeaderPodsSelectorFallbackCapsAtOne(t *testing.T) {
 	lease := shLease("scylla-operator", "scylla-operator-lock",
 		"missing-pod_uuid", 2*time.Second, base)
 
-	pods, err := p.leaderPods(ctx, op, lease)
+	pods, err := p.operator.leaderPods(ctx, op, lease)
 	if err != nil {
 		t.Fatalf("leaderPods: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestLeaderPodsSelectorFallbackCapsAtOne(t *testing.T) {
 	lease2 := shLease("scylla-operator", "scylla-operator-lock",
 		"scylla-operator-leader_9f8e", 2*time.Second, base)
 
-	pods, err = p2.leaderPods(ctx, op, lease2)
+	pods, err = p2.operator.leaderPods(ctx, op, lease2)
 	if err != nil {
 		t.Fatalf("leaderPods: %v", err)
 	}
@@ -237,10 +237,10 @@ func TestCheckOperatorWorkqueuesHealsOneReplicaOnly(t *testing.T) {
 		"scylla", "db", 9, 4)
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
-	p.opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
+	p.operator.opFirstSeen["scylla-operator/scyllaclusters/scylla/db"] = base.Add(-time.Hour)
 	before := shOpHealsCount(t, "scylla-operator", kcmReasonStaleGen)
 
-	if res := p.checkOperatorWorkqueues(ctx); res.pass {
+	if res := p.operator.run(ctx); res.pass {
 		t.Fatal("stuck ScyllaCluster past 20m with a renewing lease must FAIL")
 	}
 
@@ -286,14 +286,14 @@ func TestCheckOperatorWorkqueuesNotificationObjectsIgnored(t *testing.T) {
 	p := testProberDyn(cs, shOpDyn(alert, provider, receiver))
 	p.now = func() time.Time { return base }
 
-	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
+	if res := p.operator.run(ctx); !res.pass {
 		t.Fatalf("static notification objects must keep the check quiet: %+v", res)
 	}
 	// Zero resources means nothing is even scanned — no first-seen
 	// keys may be stamped for the static notification objects.
-	for k := range p.opFirstSeen {
+	for k := range p.operator.opFirstSeen {
 		if strings.HasPrefix(k, "notification-controller/") {
-			t.Fatalf("notification objects must not be tracked: %v", p.opFirstSeen)
+			t.Fatalf("notification objects must not be tracked: %v", p.operator.opFirstSeen)
 		}
 	}
 }

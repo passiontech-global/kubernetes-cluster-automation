@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"k8s.io/client-go/kubernetes/fake"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -17,11 +17,12 @@ func TestSetupPeriodicModules(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		interval time.Duration
-		setup    func(manager.Manager) error
+		setup    func(*testutil.StubManager) error
 	}{
 		{"cluster-health-probes", 5 * time.Minute,
-			func(m manager.Manager) error {
-				return Setup(m, cs, testutil.NewFakeDyn(nil), true)
+			func(m *testutil.StubManager) error {
+				return Setup(shared.Deps{
+					Mgr: m, CS: cs, Dyn: testutil.NewFakeDyn(nil)})
 			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -41,8 +42,10 @@ func TestSetupPeriodicModules(t *testing.T) {
 // The prober skips mgr.Add entirely when disabled — the kuberhealthy
 // checker Pods were always-on, but a cluster can still opt out.
 func TestSetupFeatureFlagVariants(t *testing.T) {
+	t.Setenv("CLUSTER_HEALTH_PROBES_ENABLED", "false")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(), testutil.NewFakeDyn(nil), false); err != nil {
+	if err := Setup(shared.Deps{
+		Mgr: m, CS: fake.NewSimpleClientset(), Dyn: testutil.NewFakeDyn(nil)}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {

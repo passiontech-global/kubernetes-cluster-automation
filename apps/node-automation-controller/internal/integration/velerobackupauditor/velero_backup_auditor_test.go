@@ -10,7 +10,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic/fake"
 	kfake "k8s.io/client-go/kubernetes/fake"
@@ -72,8 +71,6 @@ func newVeleroAuditor(dyn *fake.FakeDynamicClient, now time.Time) *veleroBackupA
 		cs:              kfake.NewSimpleClientset(),
 		dyn:             dyn,
 		nowFn:           func() time.Time { return now },
-		seenPaused:      map[pausedKey]bool{},
-		seenBad:         map[backupKey]bool{},
 		firstSeenPaused: map[pausedLedgerKey]time.Time{},
 	}
 }
@@ -398,8 +395,7 @@ func TestVeleroBackupAuditorFailedAndBSL(t *testing.T) {
 		"status":   map[string]any{"phase": "Unavailable"}}}
 	dyn := newDynFake(sched, failed, bsl)
 	a := &veleroBackupAuditor{dyn: dyn, nowFn: time.Now,
-		seenPaused: map[pausedKey]bool{}, seenBad: map[backupKey]bool{},
-		seenBSL: map[pausedKey]bool{}, firstSeenPaused: map[pausedLedgerKey]time.Time{}}
+		firstSeenPaused: map[pausedLedgerKey]time.Time{}}
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -786,7 +782,7 @@ func TestVeleroAuditorEverestCRDAbsent(t *testing.T) {
 	dyn.PrependReactor("list", "databaseclusters",
 		func(a ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewNotFound(
-				schema.GroupResource{Group: "everest.percona.com", Resource: "databaseclusters"}, "x")
+				everestDBClusterGVR.GroupResource(), "x")
 		})
 	a := newVeleroAuditor(dyn, time.Now())
 	if err := a.auditEverestBackups(ctx); err != nil {

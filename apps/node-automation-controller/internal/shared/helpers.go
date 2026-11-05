@@ -38,7 +38,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -478,13 +477,9 @@ const (
 	KuredLockAnno = "weave.works/kured-node-lock"
 )
 
-// AutopilotPlanGVR is the k0s autopilot Plan resource — a Plan in a
-// non-terminal state means a cluster upgrade is in flight.
-var AutopilotPlanGVR = schema.GroupVersionResource{
-	Group:    "autopilot.k0sproject.io",
-	Version:  "v1beta2",
-	Resource: "plans",
-}
+// AutopilotPlanGVR moved to gvr.go — the named GVR registry — same
+// package, same exported identifier, unchanged value (its original
+// doc comment moved with it).
 
 // MaintenanceActive reports whether deliberate cluster maintenance is
 // in flight — destructive remediation (pod deletes, leader kills)

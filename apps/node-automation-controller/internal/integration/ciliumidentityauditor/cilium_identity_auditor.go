@@ -48,7 +48,6 @@ package ciliumidentityauditor
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,11 +57,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -98,15 +95,12 @@ const (
 )
 
 var (
-	ciliumIdentityGVR = schema.GroupVersionResource{
-		Group: "cilium.io", Version: "v2", Resource: "ciliumidentities"}
-	ciliumEndpointGVR = schema.GroupVersionResource{
-		Group: "cilium.io", Version: "v2", Resource: "ciliumendpoints"}
+	ciliumIdentityGVR = shared.GVRCiliumIdentity
+	ciliumEndpointGVR = shared.GVRCiliumEndpoint
 	// ciliumEndpointSliceGVR is the v2alpha1 CiliumEndpointSlice —
 	// on CES-enabled clusters the agent stops writing CiliumEndpoints
 	// entirely and records identity usage here instead.
-	ciliumEndpointSliceGVR = schema.GroupVersionResource{
-		Group: "cilium.io", Version: "v2alpha1", Resource: "ciliumendpointslices"}
+	ciliumEndpointSliceGVR = shared.GVRCiliumEndpointSlice
 )
 
 type ciliumIdentityAuditor struct {
@@ -123,25 +117,26 @@ type ciliumIdentityAuditor struct {
 	orphanFirstSeen map[string]time.Time
 	// nowFn is the clock seam — tests pin it so the grace/minAge
 	// windows are deterministic.
-	nowFn func() time.Time
+	nowFn shared.Clock
 }
 
 // Setup registers the 15m sweep. Disabled on
 // clusters without the cilium component (Calico/cicd — the CRDs do
 // not exist there).
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
-	dyn dynamic.Interface, enabled bool) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
+	if !shared.Gate("CILIUM_IDENTITY_AUDITOR_ENABLED", false) {
 		logf.Log.WithName(ciliumAuditQueue).Info("disabled — module not registered")
 		return nil
 	}
 	a := &ciliumIdentityAuditor{
 		cs:              cs,
 		dyn:             dyn,
-		gcEnabled:       os.Getenv("CILIUM_IDENTITY_GC_ENABLED") != "false",
+		gcEnabled:       shared.Gate("CILIUM_IDENTITY_GC_ENABLED", true),
 		orphanFirstSeen: map[string]time.Time{},
 		nowFn:           time.Now,
 	}
+	logf.Log.WithName(ciliumAuditQueue).Info("registered", "gcEnabled", a.gcEnabled)
 	return shared.AddPeriodic(mgr, ciliumAuditQueue, 15*time.Minute, a.run)
 }
 
@@ -228,26 +223,23 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
 		Limit:         ciliumListPageSize,
 	}
-	for {
-		page, err := a.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, podOpts)
-		if err != nil {
-			return fmt.Errorf("list pods: %w", err) // wrapper IncErrors — a returned error must not count itself
-		}
-		for i := range page.Items {
-			p := &page.Items[i]
-			if p.Status.Phase == corev1.PodSucceeded ||
-				p.Status.Phase == corev1.PodFailed {
-				continue
+	err = shared.ListEach(ctx, podOpts, shared.Pods(a.cs, metav1.NamespaceAll),
+		func(items []corev1.Pod) error {
+			for i := range items {
+				p := &items[i]
+				if p.Status.Phase == corev1.PodSucceeded ||
+					p.Status.Phase == corev1.PodFailed {
+					continue
+				}
+				if v := strings.TrimSpace(
+					p.Annotations[ciliumIDAnnotation]); v != "" {
+					used[v] = struct{}{}
+				}
 			}
-			if v := strings.TrimSpace(
-				p.Annotations[ciliumIDAnnotation]); v != "" {
-				used[v] = struct{}{}
-			}
-		}
-		if page.Continue == "" {
-			break
-		}
-		podOpts.Continue = page.Continue
+			return nil
+		})
+	if err != nil {
+		return fmt.Errorf("list pods: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
 
 	// orphanSet doubles as the prune filter: entries whose identity is
@@ -398,12 +390,12 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 // endpointIdentityID extracts .status.identity.id — numeric in real
 // objects (int64) but float64 in hand-built fixtures.
 func endpointIdentityID(ep *unstructured.Unstructured) string {
-	if id, found, _ := unstructured.NestedInt64(
-		ep.Object, "status", "identity", "id"); found {
+	if id, ok := shared.NestedInt64(
+		ep.Object, "status", "identity", "id"); ok {
 		return strconv.FormatInt(id, 10)
 	}
-	if f, found, _ := unstructured.NestedFloat64(
-		ep.Object, "status", "identity", "id"); found {
+	if f, ok := shared.NestedFloat64(
+		ep.Object, "status", "identity", "id"); ok {
 		return strconv.FormatInt(int64(f), 10)
 	}
 	return ""
@@ -414,7 +406,7 @@ func endpointIdentityID(ep *unstructured.Unstructured) string {
 // replacement for the CEP's .status.identity.id. Non-numeric entries
 // are skipped like the CEP path does.
 func sliceIdentityIDs(ces *unstructured.Unstructured) []string {
-	endpoints, _, _ := unstructured.NestedSlice(
+	endpoints, _ := shared.NestedSlice(
 		ces.Object, "spec", "endpoints")
 	out := make([]string, 0, len(endpoints))
 	for _, e := range endpoints {
@@ -422,13 +414,13 @@ func sliceIdentityIDs(ces *unstructured.Unstructured) []string {
 		if !ok {
 			continue
 		}
-		if id, found, _ := unstructured.NestedInt64(
-			m, "identity", "id"); found {
+		if id, ok := shared.NestedInt64(
+			m, "identity", "id"); ok {
 			out = append(out, strconv.FormatInt(id, 10))
 			continue
 		}
-		if f, found, _ := unstructured.NestedFloat64(
-			m, "identity", "id"); found {
+		if f, ok := shared.NestedFloat64(
+			m, "identity", "id"); ok {
 			out = append(out, strconv.FormatInt(int64(f), 10))
 		}
 	}

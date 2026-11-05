@@ -95,7 +95,7 @@ func parentStatus(og int64) map[string]any {
 // "gateways" GVR the ownership filter queries.
 func putGateway(t *testing.T, dyn dynamic.Interface, o *unstructured.Unstructured) {
 	t.Helper()
-	if _, err := dyn.Resource(gwv1("gateways")).Namespace(o.GetNamespace()).
+	if _, err := dyn.Resource(shared.GVRGateway).Namespace(o.GetNamespace()).
 		Create(ctx, o, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("seed gateway %s/%s: %v", o.GetNamespace(), o.GetName(), err)
 	}
@@ -107,10 +107,10 @@ func putGateway(t *testing.T, dyn dynamic.Interface, o *unstructured.Unstructure
 // Plan the maintenance mutex reads if a heal ever fires.
 func gatewayDynKinds() map[schema.GroupVersionResource]string {
 	return map[schema.GroupVersionResource]string{
-		gwv1("gatewayclasses"):  "GatewayClassList",
-		gwv1("gateways"):        "GatewayList",
-		gwv1("httproutes"):      "HTTPRouteList",
-		gwv1("grpcroutes"):      "GRPCRouteList",
+		shared.GVRGatewayClass:  "GatewayClassList",
+		shared.GVRGateway:       "GatewayList",
+		shared.GVRHTTPRoute:     "HTTPRouteList",
+		shared.GVRGRPCRoute:     "GRPCRouteList",
 		shared.AutopilotPlanGVR: "PlanList",
 	}
 }
@@ -267,23 +267,23 @@ func TestGatewayObjectStuck(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // 0 is the "no generation ever reported" reading: nil/empty slices
-// and non-map entries must not poison the max — the caller compares
-// it against metadata.generation which is always >= 1.
+// and generation-less entries must not poison the max — the caller
+// compares it against metadata.generation which is always >= 1.
+// (Malformed serialized conditions are skipped one layer down, by
+// shared.Conditions — covered in the shared package's tests.)
 func TestCondMaxObservedGeneration(t *testing.T) {
 	if got := condMaxObservedGeneration(nil); got != 0 {
 		t.Fatalf("nil conditions = %v, want 0", got)
 	}
-	if got := condMaxObservedGeneration([]any{}); got != 0 {
+	if got := condMaxObservedGeneration([]shared.Condition{}); got != 0 {
 		t.Fatalf("empty conditions = %v, want 0", got)
 	}
-	// Non-map entries (defensive: malformed serialized conditions)
-	// are skipped, and the max over real entries wins.
-	got := condMaxObservedGeneration([]any{
-		"not-a-map",
-		int64(42),
-		map[string]any{"type": "Accepted", "observedGeneration": int64(2)},
-		map[string]any{"type": "ResolvedRefs", "observedGeneration": int64(7)},
-		map[string]any{"type": "Orphan"}, // no observedGeneration at all
+	// Entries that never reported a generation read as 0 and are
+	// skipped by the max — the largest real observedGeneration wins.
+	got := condMaxObservedGeneration([]shared.Condition{
+		{Type: "Accepted", ObservedGeneration: 2},
+		{Type: "ResolvedRefs", ObservedGeneration: 7},
+		{Type: "Orphan"}, // no observedGeneration at all
 	})
 	if got != 7 {
 		t.Fatalf("condMaxObservedGeneration = %v, want 7", got)
@@ -304,13 +304,13 @@ func TestCiliumOwnsGatewayObject(t *testing.T) {
 	}
 
 	p := newGatewayClassAwareProber(classes...)
-	if !ciliumOwnsGatewayObject(ctx, p, gwFixture("apps", "gw", "cilium", 1)) {
+	if !ciliumOwnsGatewayObject(ctx, p.operator, gwFixture("apps", "gw", "cilium", 1)) {
 		t.Fatal("cilium-class Gateway must be owned by cilium-operator")
 	}
-	if ciliumOwnsGatewayObject(ctx, p, gwFixture("apps", "gw", "cloudflare-tunnel", 1)) {
+	if ciliumOwnsGatewayObject(ctx, p.operator, gwFixture("apps", "gw", "cloudflare-tunnel", 1)) {
 		t.Fatal("foreign-class Gateway must NOT be owned by cilium-operator")
 	}
-	if !ciliumOwnsGatewayObject(ctx, p, gwFixture("apps", "gw", "no-such-class", 1)) {
+	if !ciliumOwnsGatewayObject(ctx, p.operator, gwFixture("apps", "gw", "no-such-class", 1)) {
 		t.Fatal("unresolvable class must keep the object (cannot disprove ownership)")
 	}
 }
@@ -332,7 +332,7 @@ func TestCiliumOwnsRouteParent(t *testing.T) {
 	// Parent resolves to a cilium-class Gateway → cilium's problem.
 	p := newGatewayClassAwareProber(classes...)
 	putGateway(t, p.dyn, gwFixture("apps", "gw-cilium", "cilium", 1))
-	if !ciliumOwnsRouteParent(ctx, p,
+	if !ciliumOwnsRouteParent(ctx, p.operator,
 		routeFixture("apps", "r", 1, []any{map[string]any{"name": "gw-cilium"}})) {
 		t.Fatal("route attached to a cilium-class Gateway must be owned by cilium")
 	}
@@ -340,7 +340,7 @@ func TestCiliumOwnsRouteParent(t *testing.T) {
 	// Parent resolves to a foreign-class Gateway → proven foreign.
 	p = newGatewayClassAwareProber(classes...)
 	putGateway(t, p.dyn, gwFixture("apps", "gw-foreign", "cloudflare-tunnel", 1))
-	if ciliumOwnsRouteParent(ctx, p,
+	if ciliumOwnsRouteParent(ctx, p.operator,
 		routeFixture("apps", "r", 1, []any{map[string]any{"name": "gw-foreign"}})) {
 		t.Fatal("route attached to a foreign-class Gateway must NOT be owned by cilium")
 	}
@@ -348,13 +348,13 @@ func TestCiliumOwnsRouteParent(t *testing.T) {
 	// ParentRef names a Gateway that does not exist — attribution
 	// unresolvable → kept.
 	p = newGatewayClassAwareProber(classes...)
-	if !ciliumOwnsRouteParent(ctx, p,
+	if !ciliumOwnsRouteParent(ctx, p.operator,
 		routeFixture("apps", "r", 1, []any{map[string]any{"name": "missing-gw"}})) {
 		t.Fatal("unresolvable parent Gateway must keep the route")
 	}
 
 	// No parentRefs at all → nothing to attribute → kept.
-	if !ciliumOwnsRouteParent(ctx, p, routeFixture("apps", "r", 1, nil)) {
+	if !ciliumOwnsRouteParent(ctx, p.operator, routeFixture("apps", "r", 1, nil)) {
 		t.Fatal("route without parentRefs must keep the route")
 	}
 
@@ -362,7 +362,7 @@ func TestCiliumOwnsRouteParent(t *testing.T) {
 	// namespace field is honored over the route's.
 	p = newGatewayClassAwareProber(classes...)
 	putGateway(t, p.dyn, gwFixture("infra", "gw-foreign", "cloudflare-tunnel", 1))
-	if ciliumOwnsRouteParent(ctx, p,
+	if ciliumOwnsRouteParent(ctx, p.operator,
 		routeFixture("apps", "r", 1,
 			[]any{map[string]any{"name": "gw-foreign", "namespace": "infra"}})) {
 		t.Fatal("cross-namespace foreign parent must NOT be owned by cilium")
@@ -373,7 +373,7 @@ func TestCiliumOwnsRouteParent(t *testing.T) {
 	p = newGatewayClassAwareProber(classes...)
 	putGateway(t, p.dyn, gwFixture("apps", "gw-foreign", "cloudflare-tunnel", 1))
 	putGateway(t, p.dyn, gwFixture("apps", "gw-cilium", "cilium", 1))
-	if !ciliumOwnsRouteParent(ctx, p,
+	if !ciliumOwnsRouteParent(ctx, p.operator,
 		routeFixture("apps", "r", 1, []any{
 			map[string]any{"name": "gw-foreign"},
 			map[string]any{"name": "gw-cilium"},
@@ -383,7 +383,7 @@ func TestCiliumOwnsRouteParent(t *testing.T) {
 
 	// Non-Gateway parent kinds (kind/group filters) are skipped
 	// entirely — a Service-only parentRef proves nothing → kept.
-	if !ciliumOwnsRouteParent(ctx, p,
+	if !ciliumOwnsRouteParent(ctx, p.operator,
 		routeFixture("apps", "r", 1, []any{
 			map[string]any{"name": "backend", "kind": "Service"},
 			map[string]any{"name": "other", "group": "example.io"},
@@ -489,15 +489,15 @@ func gwClassFixtureBare(name, controller string, gen int64) *unstructured.Unstru
 // an absent controllerName cannot disprove ownership.
 func TestCiliumOwnsGatewayClass(t *testing.T) {
 	p := newGatewayClassAwareProber()
-	if !ciliumOwnsGatewayClass(ctx, p,
+	if !ciliumOwnsGatewayClass(ctx, p.operator,
 		gwClassFixtureBare("cilium", ciliumGatewayController, 1)) {
 		t.Fatal("cilium-controller class must be owned by cilium-operator")
 	}
-	if ciliumOwnsGatewayClass(ctx, p,
+	if ciliumOwnsGatewayClass(ctx, p.operator,
 		gwClassFixtureBare("cloudflare-tunnel", foreignGatewayController, 1)) {
 		t.Fatal("foreign-controller class must NOT be owned by cilium-operator")
 	}
-	if !ciliumOwnsGatewayClass(ctx, p, gwClassFixtureBare("orphan", "", 1)) {
+	if !ciliumOwnsGatewayClass(ctx, p.operator, gwClassFixtureBare("orphan", "", 1)) {
 		t.Fatal("absent controllerName must keep the class (cannot disprove)")
 	}
 }
@@ -508,7 +508,7 @@ func TestCiliumOwnsGatewayClass(t *testing.T) {
 
 // The class set is cached ~1 minute so a stuck sweep doesn't LIST
 // GatewayClasses once per object: a second resolution inside the
-// window must answer from p.gwClassCtlr even if the class objects
+// window must answer from p.operator.gwClassCtlr even if the class objects
 // disappear from the apiserver underneath.
 func TestGatewayClassControllerCache(t *testing.T) {
 	base := time.Now()
@@ -516,22 +516,22 @@ func TestGatewayClassControllerCache(t *testing.T) {
 		gwClassFixture("cilium", ciliumGatewayController))
 	p.now = func() time.Time { return base }
 
-	ctlr, ok := p.gatewayClassController(ctx, "cilium")
+	ctlr, ok := p.operator.gatewayClassController(ctx, "cilium")
 	if !ok || ctlr != ciliumGatewayController {
 		t.Fatalf("first resolve = %q,%v want %q,true", ctlr, ok, ciliumGatewayController)
 	}
-	if p.gwClassCtlr == nil {
+	if p.operator.gwClassCtlr == nil {
 		t.Fatal("class map not cached after first resolve")
 	}
 
 	// Delete the class object — inside the cache window the answer
-	// must come from p.gwClassCtlr, not a fresh LIST (which would now
+	// must come from p.operator.gwClassCtlr, not a fresh LIST (which would now
 	// return an empty set and ok=false).
-	if err := p.dyn.Resource(gwv1("gatewayclasses")).
+	if err := p.dyn.Resource(shared.GVRGatewayClass).
 		Delete(ctx, "cilium", metav1.DeleteOptions{}); err != nil {
 		t.Fatalf("delete class: %v", err)
 	}
-	ctlr, ok = p.gatewayClassController(ctx, "cilium")
+	ctlr, ok = p.operator.gatewayClassController(ctx, "cilium")
 	if !ok || ctlr != ciliumGatewayController {
 		t.Fatalf("cached resolve = %q,%v want %q,true", ctlr, ok, ciliumGatewayController)
 	}
@@ -565,10 +565,10 @@ func TestCheckOperatorWorkqueuesForeignGatewaySkipped(t *testing.T) {
 	p.now = func() time.Time { return base }
 	putGateway(t, p.dyn, gwFixture("apps", "gw-foreign", "cloudflare-tunnel", 1))
 
-	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
+	if res := p.operator.run(ctx); !res.pass {
 		t.Fatalf("foreign-owned stuck route must pass quietly: %+v", res)
 	}
-	for k := range p.opFirstSeen {
+	for k := range p.operator.opFirstSeen {
 		t.Fatalf("foreign-owned route entered cilium's stuck set: %s", k)
 	}
 }
@@ -595,12 +595,12 @@ func TestCheckOperatorWorkqueuesCiliumGatewayTracked(t *testing.T) {
 	p.now = func() time.Time { return base }
 	putGateway(t, p.dyn, gwFixture("apps", "gw-cilium", "cilium", 1))
 
-	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
+	if res := p.operator.run(ctx); !res.pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
 	want := "cilium-operator/httproutes/apps/r-cilium"
-	if _, ok := p.opFirstSeen[want]; !ok {
-		t.Fatalf("cilium-owned stuck route not tracked under %q: %v", want, p.opFirstSeen)
+	if _, ok := p.operator.opFirstSeen[want]; !ok {
+		t.Fatalf("cilium-owned stuck route not tracked under %q: %v", want, p.operator.opFirstSeen)
 	}
 }
 
@@ -629,13 +629,13 @@ func TestCheckOperatorWorkqueuesGatewayClassOwnership(t *testing.T) {
 	p := testProberDyn(cs, dyn)
 	p.now = func() time.Time { return base }
 
-	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
+	if res := p.operator.run(ctx); !res.pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
-	if _, ok := p.opFirstSeen["cilium-operator/gatewayclasses//cilium"]; !ok {
-		t.Fatalf("never-accepted cilium class not tracked: %v", p.opFirstSeen)
+	if _, ok := p.operator.opFirstSeen["cilium-operator/gatewayclasses//cilium"]; !ok {
+		t.Fatalf("never-accepted cilium class not tracked: %v", p.operator.opFirstSeen)
 	}
-	for k := range p.opFirstSeen {
+	for k := range p.operator.opFirstSeen {
 		if strings.Contains(k, "cloudflare-tunnel") {
 			t.Fatalf("foreign-owned class entered cilium's stuck set: %s", k)
 		}
@@ -662,9 +662,9 @@ func TestCheckOperatorWorkqueuesGatewayClassStaleFreezes(t *testing.T) {
 	dyn := testutil.NewFakeDyn(gatewayDynKinds(), stale)
 	p := testProberDyn(cs, dyn)
 	p.now = func() time.Time { return base }
-	p.opFirstSeen["cilium-operator/gatewayclasses//cilium"] = base.Add(-time.Hour)
+	p.operator.opFirstSeen["cilium-operator/gatewayclasses//cilium"] = base.Add(-time.Hour)
 
-	if res := p.checkOperatorWorkqueues(ctx); res.pass {
+	if res := p.operator.run(ctx); res.pass {
 		t.Fatal("stale cilium GatewayClass past the window must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "cilium-operator", opReasonStaleGWStatus); v != 1 {
@@ -688,10 +688,10 @@ func TestCheckOperatorWorkqueuesGatewayClassHealthyQuiet(t *testing.T) {
 	p := testProberDyn(cs, dyn)
 	p.now = func() time.Time { return base }
 
-	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
+	if res := p.operator.run(ctx); !res.pass {
 		t.Fatalf("healthy accepted class must keep the check quiet: %+v", res)
 	}
-	for k := range p.opFirstSeen {
+	for k := range p.operator.opFirstSeen {
 		t.Fatalf("healthy class entered the stuck set: %s", k)
 	}
 }

@@ -64,7 +64,6 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -147,15 +146,15 @@ var zombieSidecarHTTPClient = &http.Client{Timeout: zombieSidecarShutdownTimeout
 // Setup registers the 5-minute sweep. Disabled
 // clusters (ZOMBIE_SIDECAR_REAPER_ENABLED=false) skip registration
 // entirely — same contract as volumeattachment-cleaner.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, enabled bool) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	if !shared.Gate("ZOMBIE_SIDECAR_REAPER_ENABLED", true) {
 		logf.Log.WithName(zombieSidecarReaperQueue).Info("disabled — module not registered")
 		return nil
 	}
-	r := &zombieSidecarReaper{cs: cs, dyn: dyn, nowFn: time.Now,
+	r := &zombieSidecarReaper{cs: d.CS, dyn: d.Dyn, nowFn: time.Now,
 		shutdownFn: zombieSidecarShutdown, poked: map[string]bool{},
 		tried: map[string]bool{}}
-	return shared.AddPeriodic(mgr, zombieSidecarReaperQueue, zombieSidecarReaperInterval, r.run)
+	return shared.AddPeriodic(d.Mgr, zombieSidecarReaperQueue, zombieSidecarReaperInterval, r.run)
 }
 
 func (r *zombieSidecarReaper) run(ctx context.Context) error {
@@ -180,21 +179,12 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	// Server-side phase filter — zombies are always Running; the
 	// in-code phase check stays for fake clients (field selectors
 	// are ignored there).
-	var pods []corev1.Pod
-	cont := ""
-	for {
-		page, err := r.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-			FieldSelector: "status.phase=Running",
-			Limit:         zombieSidecarListPageSize,
-			Continue:      cont,
-		})
-		if err != nil {
-			return fmt.Errorf("list pods: %w", err)
-		}
-		pods = append(pods, page.Items...)
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	pods, err := shared.ListAll(ctx, metav1.ListOptions{
+		FieldSelector: "status.phase=Running",
+		Limit:         zombieSidecarListPageSize,
+	}, shared.Pods(r.cs, metav1.NamespaceAll))
+	if err != nil {
+		return fmt.Errorf("list pods: %w", err)
 	}
 
 	now := r.nowFn()

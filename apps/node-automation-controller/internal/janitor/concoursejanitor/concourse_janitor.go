@@ -112,12 +112,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -167,11 +165,7 @@ const (
 // cjAutopilotPlanGVR is the k0s autopilot Plan resource — a Plan in a
 // non-terminal state means a cluster upgrade is in flight (2.7
 // signal c).
-var cjAutopilotPlanGVR = schema.GroupVersionResource{
-	Group:    "autopilot.k0sproject.io",
-	Version:  "v1beta2",
-	Resource: "plans",
-}
+var cjAutopilotPlanGVR = shared.AutopilotPlanGVR
 
 // nodeStatsReader reads kubelet stats/summary through the apiserver
 // node proxy. Missing counters return -1 so callers can distinguish
@@ -214,10 +208,16 @@ type concourseWorkdirJanitor struct {
 }
 
 // Setup registers the 30-minute sweep (was the
-// CronJob schedule `7,37 * * * *`). With enabled=false the tick only
-// logs and returns nil — the module stays wired uniformly across
-// clusters with and without Concourse (CONCOURSE_JANITOR_ENABLED).
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, enabled bool) error {
+// CronJob schedule `7,37 * * * *`). The CONCOURSE_JANITOR_ENABLED
+// gate is opt-in — disabled clusters skip registration entirely,
+// same contract as volumeattachment-cleaner.
+func Setup(d shared.Deps) error {
+	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
+	enabled := shared.Gate("CONCOURSE_JANITOR_ENABLED", false)
+	if !enabled {
+		logf.Log.WithName(cjQueue).Info("disabled — module not registered")
+		return nil
+	}
 	j := &concourseWorkdirJanitor{
 		cs:      cs,
 		stats:   &kubeletStatsReader{cs: cs},

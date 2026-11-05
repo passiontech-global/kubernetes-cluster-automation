@@ -18,6 +18,10 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
+// dragonflyReplicaSyncStormCheck is the dragonfly replica sync-storm
+// watchdog.
+type dragonflyReplicaSyncStormCheck struct{ *deps }
+
 const (
 	checkNameDragonflySyncStorm = "dragonfly-replica-sync-storm"
 
@@ -63,7 +67,7 @@ func isDragonflyPod(pod *corev1.Pod) bool {
 // Only the DESYNCED REPLICA pod is restarted — never the master
 // (podMasterRole on role/redis-role/app.kubernetes.io/role labels)
 // — 30m cooldown.
-func (p *clusterHealthProber) checkDragonflyReplicaSyncStorm(ctx context.Context) probeResult {
+func (p *dragonflyReplicaSyncStormCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	now := p.now()
 
@@ -128,7 +132,7 @@ func (p *clusterHealthProber) checkDragonflyReplicaSyncStorm(ctx context.Context
 		key := ns + "/" + name
 		sig := "link/" + key
 		seenKeep[sig] = true
-		first, _ := seenFirstStreak(checkNameDragonflySyncStorm, sig, now)
+		first, _ := p.seenFirstStreak(checkNameDragonflySyncStorm, sig, now)
 		if now.Sub(first) < dragonflyLinkMinAge {
 			continue // link down must persist the window
 		}
@@ -158,9 +162,9 @@ func (p *clusterHealthProber) checkDragonflyReplicaSyncStorm(ctx context.Context
 		p.deletePodHeal(ctx, log, checkNameDragonflySyncStorm,
 			key, pod, dragonflySyncHealCool, now)
 	}
-	pruneSeenStreaks(checkNameDragonflySyncStorm, seenKeep)
+	p.pruneSeenStreaks(checkNameDragonflySyncStorm, seenKeep)
 	sort.Strings(desynced)
-	reconcileEmittedGauges(checkNameDragonflySyncStorm,
+	p.reconcileEmittedGauges(checkNameDragonflySyncStorm,
 		dragonflyReplicaSyncStormGauge, current)
 	if len(desynced) == 0 {
 		return probeResult{pass: true}

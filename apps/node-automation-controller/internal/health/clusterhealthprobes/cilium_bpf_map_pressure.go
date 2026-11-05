@@ -18,6 +18,9 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
+// ciliumBPFMapPressureCheck is the cilium BPF map pressure watchdog.
+type ciliumBPFMapPressureCheck struct{ *deps }
+
 const (
 	checkNameCiliumBPFMapPressure = "cilium-bpf-map-pressure"
 
@@ -44,7 +47,7 @@ func init() {
 // Prometheus-unreachable is inconclusive (http-content-check already
 // owns Prometheus liveness) — the check passes with a WARN, never a
 // false FAIL.
-func (p *clusterHealthProber) checkCiliumBPFMapPressure(ctx context.Context) probeResult {
+func (p *ciliumBPFMapPressureCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	threshold := healthEnvFloat("CILIUM_BPF_MAP_PRESSURE_THRESHOLD", ciliumBPFDefaultThreshold)
 	query := fmt.Sprintf(
@@ -71,7 +74,7 @@ func (p *clusterHealthProber) checkCiliumBPFMapPressure(ctx context.Context) pro
 			fmt.Sprintf("%s/%s=%.2f", node, mapName, s.value))
 	}
 	sort.Strings(findings)
-	reconcileEmittedGauges(checkNameCiliumBPFMapPressure,
+	p.reconcileEmittedGauges(checkNameCiliumBPFMapPressure,
 		ciliumBPFMapPressureGauge, current)
 	if len(findings) == 0 {
 		return probeResult{pass: true}

@@ -78,8 +78,15 @@ type corednsPatcher struct {
 //
 // minReplicas/nodesPerReplica are the CPA-linear replica pin — see
 // proportionalReplicas. minReplicas<=0 disables the pin entirely.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, zoneWhen string, zoneMinDomains, minReplicas, nodesPerReplica int) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	// Parse the knobs BEFORE the gate — the old moduleConfigFromEnv
+	// resolved them at boot regardless of enabled state, so an
+	// unparseable COREDNS_* value still warned on a disabled module.
+	zoneWhen := shared.Getenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule")
+	zoneMinDomains := shared.GetenvInt("COREDNS_PATCHER_ZONE_MIN_DOMAINS", 2)
+	minReplicas := shared.GetenvInt("COREDNS_MIN_REPLICAS", 4)
+	nodesPerReplica := shared.GetenvInt("COREDNS_NODES_PER_REPLICA", 1)
+	if !shared.Gate("COREDNS_PATCHER_ENABLED", true) {
 		logf.Log.WithName("coredns-patcher").Info("disabled — module not registered")
 		return nil
 	}
@@ -102,7 +109,10 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, zoneWhen str
 		metrics.IncError("coredns-patcher")
 		return nil
 	}
-	b := ctrl.NewControllerManagedBy(mgr).
+	logf.Log.WithName("coredns-patcher").Info("registered",
+		"zoneWhen", zoneWhen, "zoneMinDomains", zoneMinDomains,
+		"minReplicas", minReplicas, "nodesPerReplica", nodesPerReplica)
+	b := ctrl.NewControllerManagedBy(d.Mgr).
 		Named("coredns-patcher").
 		For(&appsv1.Deployment{}, builder.WithPredicates(
 			predicate.NewPredicateFuncs(func(o client.Object) bool {
@@ -126,7 +136,7 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, zoneWhen str
 				GenericFunc: func(event.GenericEvent) bool { return false },
 			}))
 	}
-	return b.Complete(&corednsPatcher{cs: cs, zoneWhen: zoneWhen, minDomains: zoneMinDomains,
+	return b.Complete(&corednsPatcher{cs: d.CS, zoneWhen: zoneWhen, minDomains: zoneMinDomains,
 		minReplicas: minReplicas, nodesPerReplica: nodesPerReplica})
 }
 

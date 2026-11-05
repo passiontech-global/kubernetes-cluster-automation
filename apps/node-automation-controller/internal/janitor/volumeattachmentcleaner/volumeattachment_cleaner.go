@@ -60,7 +60,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -118,21 +117,21 @@ type volumeAttachmentCleaner struct {
 }
 
 // Setup registers the 5-minute sweep. The
-// enabled flag is wired by the caller (VOLUMEATTACHMENT_CLEANER_ENABLED,
-// default on) — disabled skips registration entirely, matching the
+// VOLUMEATTACHMENT_CLEANER_ENABLED gate (default on) is resolved here —
+// disabled skips registration entirely, matching the
 // certmanager-reaper / cilium-taint-reaper contract.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	if !shared.Gate("VOLUMEATTACHMENT_CLEANER_ENABLED", true) {
 		logf.Log.WithName(volumeAttachmentCleanerQueue).Info("disabled — module not registered")
 		return nil
 	}
 	c := &volumeAttachmentCleaner{
-		cs:                cs,
+		cs:                d.CS,
 		nowFn:             time.Now,
 		orphanFirstSeen:   map[string]time.Time{},
 		nodeNotReadySince: map[string]time.Time{},
 	}
-	return shared.AddPeriodic(mgr, volumeAttachmentCleanerQueue, vaCleanerInterval, c.run)
+	return shared.AddPeriodic(d.Mgr, volumeAttachmentCleanerQueue, vaCleanerInterval, c.run)
 }
 
 func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
@@ -181,18 +180,11 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	}
 	nodes = nil
 
-	var vas []storagev1.VolumeAttachment
-	cont := ""
-	for {
-		page, err := c.cs.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{
-			Limit: vaListPageSize, Continue: cont})
-		if err != nil {
-			return fmt.Errorf("list volumeattachments: %w", err)
-		}
-		vas = append(vas, page.Items...)
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	vas, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: vaListPageSize},
+		shared.VolumeAttachments(c.cs))
+	if err != nil {
+		return fmt.Errorf("list volumeattachments: %w", err)
 	}
 	// Deterministic order — the per-cycle cap must always pick the
 	// same victims, not whichever ordering the apiserver returned.
@@ -466,23 +458,14 @@ func (c *volumeAttachmentCleaner) livePodCount(ctx context.Context,
 	if pr, ok := cache[node]; ok {
 		return pr.count, pr.err
 	}
-	var pods []corev1.Pod
-	cont := ""
-	for {
-		page, err := c.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-			FieldSelector: "spec.nodeName=" + node,
-			Limit:         vaListPageSize,
-			Continue:      cont,
-		})
-		if err != nil {
-			err = fmt.Errorf("list pods on %s: %w", node, err)
-			cache[node] = podProbe{err: err}
-			return 0, err
-		}
-		pods = append(pods, page.Items...)
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	pods, err := shared.ListAll(ctx, metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + node,
+		Limit:         vaListPageSize,
+	}, shared.Pods(c.cs, metav1.NamespaceAll))
+	if err != nil {
+		err = fmt.Errorf("list pods on %s: %w", node, err)
+		cache[node] = podProbe{err: err}
+		return 0, err
 	}
 	live := 0
 	for i := range pods {

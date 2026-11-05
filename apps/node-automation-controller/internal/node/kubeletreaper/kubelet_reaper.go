@@ -34,7 +34,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -55,10 +54,10 @@ type kubeletReaper struct {
 	probeFn func(ctx context.Context, node string) bool
 }
 
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface) error {
-	r := &kubeletReaper{cs: cs}
+func Setup(d shared.Deps) error {
+	r := &kubeletReaper{cs: d.CS}
 	r.probeFn = r.probe
-	return shared.AddPeriodic(mgr, kubeletReaperQueue, 2*time.Minute, r.run)
+	return shared.AddPeriodic(d.Mgr, kubeletReaperQueue, 2*time.Minute, r.run)
 }
 
 func (r *kubeletReaper) run(ctx context.Context) error {

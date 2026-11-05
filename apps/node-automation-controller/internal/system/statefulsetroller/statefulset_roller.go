@@ -58,7 +58,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -102,14 +101,14 @@ type statefulSetOnDeleteRoller struct {
 // Setup registers the 10-minute sweep.
 // Disabled clusters (STATEFULSET_ONDELETE_ROLLER_ENABLED=false) skip
 // registration entirely — same contract as cert-drift-auditor.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	if !shared.Gate("STATEFULSET_ONDELETE_ROLLER_ENABLED", true) {
 		logf.Log.WithName(stsOnDeleteRollerQueue).Info("disabled — module not registered")
 		return nil
 	}
-	r := &statefulSetOnDeleteRoller{cs: cs, nowFn: time.Now,
+	r := &statefulSetOnDeleteRoller{cs: d.CS, nowFn: time.Now,
 		driftSince: map[string]time.Time{}}
-	return shared.AddPeriodic(mgr, stsOnDeleteRollerQueue, stsOnDeleteRollerInterval, r.run)
+	return shared.AddPeriodic(d.Mgr, stsOnDeleteRollerQueue, stsOnDeleteRollerInterval, r.run)
 }
 
 func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
@@ -128,19 +127,10 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 	// Page the cluster-wide list — an unbounded List forces etcd to
 	// serialize every StatefulSet into one response; 500-per-page
 	// keeps each request cheap at fleet scale.
-	var stsItems []appsv1.StatefulSet
-	cont := ""
-	for {
-		page, err := r.cs.AppsV1().StatefulSets(metav1.NamespaceAll).
-			List(ctx, metav1.ListOptions{Limit: 500, Continue: cont})
-		if err != nil {
-			return fmt.Errorf("list statefulsets: %w", err)
-		}
-		stsItems = append(stsItems, page.Items...)
-		if page.Continue == "" {
-			break
-		}
-		cont = page.Continue
+	stsItems, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
+		shared.StatefulSets(r.cs, metav1.NamespaceAll))
+	if err != nil {
+		return fmt.Errorf("list statefulsets: %w", err)
 	}
 
 	now := r.nowFn()
@@ -299,20 +289,11 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	// allow a disruption — a 0 means the workload is already at its
 	// floor and eviction would refuse the delete anyway. Paged like
 	// the StatefulSet list above.
-	var pdbItems []policyv1.PodDisruptionBudget
-	cont := ""
-	for {
-		page, err := r.cs.PolicyV1().PodDisruptionBudgets(sts.Namespace).
-			List(ctx, metav1.ListOptions{Limit: 500, Continue: cont})
-		if err != nil {
-			return fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w",
-				sts.Namespace, err)
-		}
-		pdbItems = append(pdbItems, page.Items...)
-		if page.Continue == "" {
-			break
-		}
-		cont = page.Continue
+	pdbItems, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
+		shared.PodDisruptionBudgets(r.cs, sts.Namespace))
+	if err != nil {
+		return fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w",
+			sts.Namespace, err)
 	}
 	for i := range pdbItems {
 		pdb := &pdbItems[i]

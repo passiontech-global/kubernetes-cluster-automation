@@ -19,6 +19,11 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
+// schedulerWatchdogCheck is the W8-CP3 scheduler-watchdog — a stopped
+// kube-scheduler detected via Pending pods with no PodScheduled
+// condition while Ready uncordoned workers exist.
+type schedulerWatchdogCheck struct{ *deps }
+
 const (
 	// W8-CP3 — scheduler-watchdog knobs.
 	checkNameSchedulerWatchdog = "scheduler-watchdog"
@@ -36,7 +41,7 @@ const (
 // workers exist to place them on. Detect-only — restarting the
 // scheduler is the platform's job; this check makes the freeze
 // visible on node_automation_scheduler_frozen.
-func (p *clusterHealthProber) checkSchedulerFrozen(ctx context.Context) probeResult {
+func (p *schedulerWatchdogCheck) run(ctx context.Context) probeResult {
 	nodes, err := shared.ListNodes(ctx, p.cs)
 	if err != nil {
 		return probeResult{infra: fmt.Errorf("list nodes: %w", err)}

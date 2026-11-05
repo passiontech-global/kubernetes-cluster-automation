@@ -17,7 +17,7 @@ func TestImagePullStormSingleNamespace(t *testing.T) {
 		"Back-off pulling image \"registry.example.com/app:v1\"", 15*time.Minute)
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	res := p.checkImagePullStorm(ctx)
+	res := p.imagePull.run(ctx)
 	if res.pass {
 		t.Fatalf("pull backoff must fail: %+v", res)
 	}
@@ -31,7 +31,7 @@ func TestImagePullStormMultiNamespaceIsOutage(t *testing.T) {
 	p2 := imagePullWaitingPod("team-b", "api-1", "ErrImagePull", "manifest unknown", 20*time.Minute)
 	cs := fake.NewSimpleClientset(p1, p2)
 	p := testProber(cs)
-	res := p.checkImagePullStorm(ctx)
+	res := p.imagePull.run(ctx)
 	if res.pass {
 		t.Fatalf("multi-namespace pull failures must fail: %+v", res)
 	}
@@ -50,7 +50,7 @@ func TestImagePullStormRegistryMarkerIsOutage(t *testing.T) {
 		"failed to pull: 429 Too Many Requests", 15*time.Minute)
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	res := p.checkImagePullStorm(ctx)
+	res := p.imagePull.run(ctx)
 	if res.pass {
 		t.Fatalf("registry-rate-limit message must fail: %+v", res)
 	}
@@ -63,7 +63,7 @@ func TestImagePullStormFreshPodIgnored(t *testing.T) {
 	pod := imagePullWaitingPod("team-a", "web-1", "ImagePullBackOff", "pulling", 2*time.Minute)
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	if res := p.checkImagePullStorm(ctx); !res.pass {
+	if res := p.imagePull.run(ctx); !res.pass {
 		t.Fatalf("fresh pull failure must pass: %+v", res)
 	}
 }
@@ -76,7 +76,7 @@ func TestImagePullStormHealthyPasses(t *testing.T) {
 	}}
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	if res := p.checkImagePullStorm(ctx); !res.pass {
+	if res := p.imagePull.run(ctx); !res.pass {
 		t.Fatalf("healthy pod must pass: %+v", res)
 	}
 }

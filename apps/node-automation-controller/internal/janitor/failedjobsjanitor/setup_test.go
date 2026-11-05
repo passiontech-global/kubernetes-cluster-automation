@@ -8,6 +8,7 @@ import (
 
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -18,7 +19,11 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	m := testutil.NewStubManager()
 	// dyn is only used by the W9-GO2 BuildRun sweep — nil is fine for
 	// the registration check.
-	if err := Setup(m, fake.NewSimpleClientset(), nil); err != nil {
+	if err := Setup(shared.Deps{
+		Mgr: m,
+		CS:  fake.NewSimpleClientset(),
+		Dyn: nil,
+	}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	testutil.ExpectPeriodic(t, m, "failed-jobs-janitor", 60*time.Minute)

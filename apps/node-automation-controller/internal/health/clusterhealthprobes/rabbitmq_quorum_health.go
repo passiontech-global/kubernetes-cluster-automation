@@ -20,6 +20,9 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
+// rabbitMQQuorumHealthCheck is the RabbitMQ quorum-health watchdog.
+type rabbitMQQuorumHealthCheck struct{ *deps }
+
 const (
 	checkNameRabbitMQQuorum = "rabbitmq-quorum-health"
 
@@ -56,7 +59,7 @@ func isRabbitMQPod(pod *corev1.Pod) bool {
 // stuck-unready pod signature — a rabbitmq pod unready >=10m while
 // >=2 siblings stay Ready gets deleted (30m cooldown) so the
 // cluster re-forms quorum around it.
-func (p *clusterHealthProber) checkRabbitMQQuorumHealth(ctx context.Context) probeResult {
+func (p *rabbitMQQuorumHealthCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	now := p.now()
 
@@ -169,7 +172,7 @@ func (p *clusterHealthProber) checkRabbitMQQuorumHealth(ctx context.Context) pro
 		}
 		sig := "prom/" + key
 		seenKeep[sig] = true
-		first, _ := seenFirstStreak(checkNameRabbitMQQuorum, sig, now)
+		first, _ := p.seenFirstStreak(checkNameRabbitMQQuorum, sig, now)
 		if now.Sub(first) < rabbitUnreadyMinAge {
 			continue
 		}
@@ -178,7 +181,7 @@ func (p *clusterHealthProber) checkRabbitMQQuorumHealth(ctx context.Context) pro
 				key, pod, rabbitQuorumHealCool, now)
 		}
 	}
-	pruneSeenStreaks(checkNameRabbitMQQuorum, seenKeep)
+	p.pruneSeenStreaks(checkNameRabbitMQQuorum, seenKeep)
 
 	current := map[string][]string{}
 	var out []string
@@ -198,7 +201,7 @@ func (p *clusterHealthProber) checkRabbitMQQuorumHealth(ctx context.Context) pro
 		out = append(out, key+"("+strings.Join(rs, "+")+")")
 	}
 	sort.Strings(out)
-	reconcileEmittedGauges(checkNameRabbitMQQuorum,
+	p.reconcileEmittedGauges(checkNameRabbitMQQuorum,
 		rabbitMQQuorumUnhealthyGauge, current)
 	if len(out) == 0 {
 		return probeResult{pass: true}

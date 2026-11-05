@@ -60,12 +60,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -108,8 +105,7 @@ const (
 
 // certificateGVR resolves a Certificate's spec.secretName — the only
 // cert-manager type this module reads.
-var certificateGVR = schema.GroupVersionResource{
-	Group: "cert-manager.io", Version: "v1", Resource: "certificates"}
+var certificateGVR = shared.GVRCertificate
 
 // webhookMetricKey / secretMetricKey are the exact label tuples of the
 // two exported gauge vecs — keeping them as map keys makes the
@@ -151,18 +147,18 @@ type certDriftAuditor struct {
 	dyn dynamic.Interface
 	// nowFn is the clock seam — tests pin it so days-until-expiry and
 	// staleness windows are deterministic.
-	nowFn func() time.Time
+	nowFn shared.Clock
 	// seenWebhooks: gauge series emitted last sweep, kept so an entry
 	// that disappears (webhook removed, annotation dropped, config
 	// deleted) gets its series pruned instead of pinning drift=1
 	// forever.
-	seenWebhooks map[webhookMetricKey]bool
+	seenWebhooks shared.GaugeLedger[webhookMetricKey]
 	// seenSecrets: same lifecycle for the TLS-expiry gauge.
-	seenSecrets map[secretMetricKey]bool
+	seenSecrets shared.GaugeLedger[secretMetricKey]
 	// seenWebhookExpiry / seenTrustBundles: same lifecycle for the
 	// caBundle days-to-expiry and linkerd trust-bundle gauges.
-	seenWebhookExpiry map[webhookMetricKey]bool
-	seenTrustBundles  map[secretMetricKey]bool
+	seenWebhookExpiry shared.GaugeLedger[webhookMetricKey]
+	seenTrustBundles  shared.GaugeLedger[secretMetricKey]
 	// replicationMismatch counts consecutive scans where a
 	// replicated secret's tls.crt differed from its source — drift
 	// fires only at replicationDriftScans, so a replicator mid-sync
@@ -171,7 +167,7 @@ type certDriftAuditor struct {
 	// seenReplication: series ledger for ReplicatedSecretDrift —
 	// re-synced or gone replicas get DeleteLabelValues, never a
 	// parked 1.
-	seenReplication map[replicationMetricKey]bool
+	seenReplication shared.GaugeLedger[replicationMetricKey]
 	// resyncNudged: replicationMetricKey → last replicated-from-
 	// version annotation strip (1h cooldown, in-RAM only).
 	resyncNudged map[replicationMetricKey]time.Time
@@ -183,11 +179,11 @@ type certDriftAuditor struct {
 }
 
 // Setup registers the 15m sweep — or nothing when the
-// cluster opts out (CERT_DRIFT_AUDITOR_ENABLED=false in main.go feeds
-// `enabled`): same disabled-flag pattern as certmanager-reaper.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
-	dyn dynamic.Interface, enabled bool) error {
-	if !enabled {
+// cluster opts out (CERT_DRIFT_AUDITOR_ENABLED=false): same
+// disabled-flag pattern as certmanager-reaper.
+func Setup(d shared.Deps) error {
+	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
+	if !shared.Gate("CERT_DRIFT_AUDITOR_ENABLED", true) {
 		logf.Log.WithName(certDriftQueue).Info("disabled — module not registered")
 		return nil
 	}
@@ -195,12 +191,7 @@ func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
 		cs:                  cs,
 		dyn:                 dyn,
 		nowFn:               time.Now,
-		seenWebhooks:        map[webhookMetricKey]bool{},
-		seenSecrets:         map[secretMetricKey]bool{},
-		seenWebhookExpiry:   map[webhookMetricKey]bool{},
-		seenTrustBundles:    map[secretMetricKey]bool{},
 		replicationMismatch: map[replicationMetricKey]int{},
-		seenReplication:     map[replicationMetricKey]bool{},
 		resyncNudged:        map[replicationMetricKey]time.Time{},
 	}
 	return shared.AddPeriodic(mgr, certDriftQueue, 15*time.Minute, a.run)
@@ -213,23 +204,8 @@ func (a *certDriftAuditor) run(ctx context.Context) error {
 	if a.nowFn == nil {
 		a.nowFn = time.Now
 	}
-	if a.seenWebhooks == nil {
-		a.seenWebhooks = map[webhookMetricKey]bool{}
-	}
-	if a.seenSecrets == nil {
-		a.seenSecrets = map[secretMetricKey]bool{}
-	}
-	if a.seenWebhookExpiry == nil {
-		a.seenWebhookExpiry = map[webhookMetricKey]bool{}
-	}
-	if a.seenTrustBundles == nil {
-		a.seenTrustBundles = map[secretMetricKey]bool{}
-	}
 	if a.replicationMismatch == nil {
 		a.replicationMismatch = map[replicationMetricKey]int{}
-	}
-	if a.seenReplication == nil {
-		a.seenReplication = map[replicationMetricKey]bool{}
 	}
 
 	// The audits are independent: a broken webhook list must not
@@ -272,34 +248,22 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 		return fmt.Errorf("list validatingwebhookconfigurations: %w", err)
 	}
 
-	current := map[webhookMetricKey]bool{}
-	currentExpiry := map[webhookMetricKey]bool{}
 	for i := range mutating.Items {
 		m := &mutating.Items[i]
 		a.auditOneWebhookConfig(ctx, "MutatingWebhookConfiguration",
-			m.Name, m.Annotations, mutatingEntries(m.Webhooks), current, currentExpiry)
+			m.Name, m.Annotations, mutatingEntries(m.Webhooks))
 	}
 	for i := range validating.Items {
 		v := &validating.Items[i]
 		a.auditOneWebhookConfig(ctx, "ValidatingWebhookConfiguration",
-			v.Name, v.Annotations, validatingEntries(v.Webhooks), current, currentExpiry)
+			v.Name, v.Annotations, validatingEntries(v.Webhooks))
 	}
 
 	// Prune series for entries no longer covered — a webhook entry
 	// deleted or an annotation removed must not pin drift=1 (or a
 	// dead expiry figure) forever.
-	for k := range a.seenWebhooks {
-		if !current[k] {
-			metrics.WebhookCABundleMismatch.DeleteLabelValues(k.kind, k.name, k.webhook)
-		}
-	}
-	for k := range a.seenWebhookExpiry {
-		if !currentExpiry[k] {
-			metrics.WebhookCABundleDaysToExpiry.DeleteLabelValues(k.kind, k.name, k.webhook)
-		}
-	}
-	a.seenWebhooks = current
-	a.seenWebhookExpiry = currentExpiry
+	a.seenWebhooks.Prune(metrics.WebhookCABundleMismatch.DeleteLabelValues)
+	a.seenWebhookExpiry.Prune(metrics.WebhookCABundleDaysToExpiry.DeleteLabelValues)
 	return nil
 }
 
@@ -313,7 +277,7 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 // drift alert off.
 func (a *certDriftAuditor) auditOneWebhookConfig(ctx context.Context,
 	kind, cfgName string, annos map[string]string,
-	entries []webhookEntry, current, currentExpiry map[webhookMetricKey]bool) {
+	entries []webhookEntry) {
 	log := logf.FromContext(ctx)
 
 	// 2.4 — full surface: expiry + empty-bundle checks apply with or
@@ -328,7 +292,7 @@ func (a *certDriftAuditor) auditOneWebhookConfig(ctx context.Context,
 			// mismatch=1. url-targeted entries legitimately carry
 			// no bundle (public CA), so they skip.
 			if e.service != nil && e.fail {
-				current[k] = true
+				a.seenWebhooks.Emit(k, k.kind, k.name, k.webhook)
 				metrics.WebhookCABundleMismatch.
 					WithLabelValues(k.kind, k.name, k.webhook).Set(1)
 				log.Info("webhook entry has empty caBundle with failurePolicy=Fail — admission calls will fail",
@@ -337,7 +301,7 @@ func (a *certDriftAuditor) auditOneWebhookConfig(ctx context.Context,
 			continue
 		}
 		if days, ok := earliestCertExpiryDays(e.caBundle, a.nowFn()); ok {
-			currentExpiry[k] = true
+			a.seenWebhookExpiry.Emit(k, k.kind, k.name, k.webhook)
 			metrics.WebhookCABundleDaysToExpiry.
 				WithLabelValues(k.kind, k.name, k.webhook).Set(days)
 		} else {
@@ -362,16 +326,16 @@ func (a *certDriftAuditor) auditOneWebhookConfig(ctx context.Context,
 		// Keep any previously-emitted series for this config alive —
 		// an unresolved source is "can't tell", not "clean", so the
 		// alert must not silently flap off on a transient lookup miss.
-		for k := range a.seenWebhooks {
+		for k, lv := range a.seenWebhooks.Last() {
 			if k.kind == kind && k.name == cfgName {
-				current[k] = true
+				a.seenWebhooks.Emit(k, lv...)
 			}
 		}
 		return
 	}
 	for _, e := range entries {
 		k := webhookMetricKey{kind, cfgName, e.name}
-		current[k] = true
+		a.seenWebhooks.Emit(k, k.kind, k.name, k.webhook)
 		v := 0.0
 		if !bytes.Equal(e.caBundle, ca) {
 			v = 1
@@ -444,8 +408,8 @@ func (a *certDriftAuditor) certSecretName(ctx context.Context, ns, certName stri
 			"cert", ns+"/"+certName)
 		return "", false
 	}
-	if sn, _, _ := unstructured.NestedString(
-		cert.Object, "spec", "secretName"); sn != "" {
+	if sn, ok := shared.NestedString(
+		cert.Object, "spec", "secretName"); ok && sn != "" {
 		return sn, true
 	}
 	return certName, true
@@ -519,7 +483,6 @@ func validatingEntries(ws []admissionv1.ValidatingWebhook) []webhookEntry {
 func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	current := map[secretMetricKey]bool{}
 	// W7-C6 — the sweep collects two extra payloads on the same
 	// paged read: tlsData snapshots every TLS secret's raw tls.crt
 	// (parseable or not — drift is a byte comparison, not a cert
@@ -530,65 +493,56 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	// Server-side type filter + continue-token pagination: the
 	// all-namespaces secret read is the biggest this module makes —
 	// page it at certDriftListPage so no single response dominates.
-	opts := metav1.ListOptions{
+	err := shared.ListEach(ctx, metav1.ListOptions{
 		FieldSelector: "type=kubernetes.io/tls",
 		Limit:         certDriftListPage,
-	}
-	for {
-		page, err := a.cs.CoreV1().Secrets(metav1.NamespaceAll).List(ctx, opts)
-		if err != nil {
-			return fmt.Errorf("list tls secrets: %w", err)
-		}
-		for i := range page.Items {
-			s := &page.Items[i]
-			// Belt-and-suspenders: the type field selector is applied
-			// server-side on a real apiserver, but fake clientsets
-			// ignore it — an in-code check keeps both honest (same
-			// rule as the pod-phase filter in cilium_identity_auditor).
-			if s.Type != corev1.SecretTypeTLS {
-				continue
+	}, shared.Secrets(a.cs, metav1.NamespaceAll),
+		func(items []corev1.Secret) error {
+			for i := range items {
+				s := &items[i]
+				// Belt-and-suspenders: the type field selector is applied
+				// server-side on a real apiserver, but fake clientsets
+				// ignore it — an in-code check keeps both honest (same
+				// rule as the pod-phase filter in cilium_identity_auditor).
+				if s.Type != corev1.SecretTypeTLS {
+					continue
+				}
+				tlsData[s.Namespace+"/"+s.Name] = s.Data["tls.crt"]
+				if src := strings.TrimSpace(s.Annotations[replicatedFromAnno]); src != "" {
+					replicated = append(replicated, replicatedSecretRef{
+						namespace: s.Namespace, name: s.Name,
+						source: src, dest: s.Data["tls.crt"],
+					})
+				}
+				block, _ := pem.Decode(s.Data["tls.crt"])
+				if block == nil {
+					log.Info("skip: tls secret carries no decodable tls.crt PEM",
+						"secret", s.Namespace+"/"+s.Name)
+					continue
+				}
+				cert, err := x509.ParseCertificate(block.Bytes)
+				if err != nil {
+					log.Error(err, "tls.crt parse failed",
+						"secret", s.Namespace+"/"+s.Name)
+					continue
+				}
+				key := secretMetricKey{s.Namespace, s.Name}
+				a.seenSecrets.Emit(key, s.Namespace, s.Name)
+				// Days, not seconds — the alert budget this feeds ("fires
+				// <30d, pages <7d") thinks in days; negatives mean expired.
+				days := cert.NotAfter.Sub(a.nowFn()).Hours() / 24
+				metrics.TLSSecretDaysToExpiry.
+					WithLabelValues(s.Namespace, s.Name).Set(days)
 			}
-			tlsData[s.Namespace+"/"+s.Name] = s.Data["tls.crt"]
-			if src := strings.TrimSpace(s.Annotations[replicatedFromAnno]); src != "" {
-				replicated = append(replicated, replicatedSecretRef{
-					namespace: s.Namespace, name: s.Name,
-					source: src, dest: s.Data["tls.crt"],
-				})
-			}
-			block, _ := pem.Decode(s.Data["tls.crt"])
-			if block == nil {
-				log.Info("skip: tls secret carries no decodable tls.crt PEM",
-					"secret", s.Namespace+"/"+s.Name)
-				continue
-			}
-			cert, err := x509.ParseCertificate(block.Bytes)
-			if err != nil {
-				log.Error(err, "tls.crt parse failed",
-					"secret", s.Namespace+"/"+s.Name)
-				continue
-			}
-			key := secretMetricKey{s.Namespace, s.Name}
-			current[key] = true
-			// Days, not seconds — the alert budget this feeds ("fires
-			// <30d, pages <7d") thinks in days; negatives mean expired.
-			days := cert.NotAfter.Sub(a.nowFn()).Hours() / 24
-			metrics.TLSSecretDaysToExpiry.
-				WithLabelValues(s.Namespace, s.Name).Set(days)
-		}
-		if page.Continue == "" {
-			break
-		}
-		opts.Continue = page.Continue
+			return nil
+		})
+	if err != nil {
+		return fmt.Errorf("list tls secrets: %w", err)
 	}
 
 	// Prune series for secrets gone (or no longer parseable) since the
 	// last sweep — otherwise /metrics keeps reporting a dead secret.
-	for k := range a.seenSecrets {
-		if !current[k] {
-			metrics.TLSSecretDaysToExpiry.DeleteLabelValues(k.namespace, k.name)
-		}
-	}
-	a.seenSecrets = current
+	a.seenSecrets.Prune(metrics.TLSSecretDaysToExpiry.DeleteLabelValues)
 
 	// W7-C6 — the replicator drift diff rides the same read: every
 	// replicated destination's tls.crt is compared against its
@@ -613,7 +567,6 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 	tlsData map[string][]byte, replicated []replicatedSecretRef) {
 	log := logf.FromContext(ctx)
 
-	current := map[replicationMetricKey]bool{}
 	for _, d := range replicated {
 		k := replicationMetricKey{
 			namespace: d.namespace, name: d.name, source: d.source}
@@ -643,16 +596,16 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 			default:
 				log.Error(err, "replicated source get failed — verdict carried forward",
 					"secret", d.namespace+"/"+d.name, "source", d.source)
-				if a.seenReplication[k] {
-					current[k] = true
+				if lv, ok := a.seenReplication.Last()[k]; ok {
+					a.seenReplication.Emit(k, lv...)
 				}
 				continue
 			}
 		}
-		current[k] = true
+		a.seenReplication.Emit(k, k.namespace, k.name, k.source)
 		if bytes.Equal(d.dest, src) {
 			delete(a.replicationMismatch, k)
-			if a.seenReplication[k] {
+			if _, ok := a.seenReplication.Last()[k]; ok {
 				metrics.ReplicatedSecretDrift.
 					DeleteLabelValues(k.namespace, k.name, k.source)
 			}
@@ -675,15 +628,9 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 
 	// Prune series + streaks for replicas gone (or sources no longer
 	// comparable) since the last sweep.
-	for k := range a.seenReplication {
-		if !current[k] {
-			metrics.ReplicatedSecretDrift.
-				DeleteLabelValues(k.namespace, k.name, k.source)
-		}
-	}
-	a.seenReplication = current
+	a.seenReplication.Prune(metrics.ReplicatedSecretDrift.DeleteLabelValues)
 	for k := range a.replicationMismatch {
-		if !current[k] {
+		if _, ok := a.seenReplication.Last()[k]; !ok {
 			delete(a.replicationMismatch, k)
 		}
 	}
@@ -834,8 +781,6 @@ const (
 // proxy handshake (no mTLS) while existing connections still work —
 // the classic "mesh died silently" failure.
 func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
-	current := map[secretMetricKey]bool{}
-
 	// The trust-roots ConfigMap is optional — clusters without
 	// linkerd (or a differently-named install) simply skip.
 	cm, err := a.cs.CoreV1().ConfigMaps(linkerdNS).
@@ -843,7 +788,7 @@ func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
 	switch {
 	case err == nil:
 		a.emitTrustBundle(ctx, linkerdNS, linkerdTrustRootsCM,
-			[]byte(cm.Data[linkerdTrustRootsKey]), current)
+			[]byte(cm.Data[linkerdTrustRootsKey]))
 	case !apierrors.IsNotFound(err):
 		return fmt.Errorf("get linkerd trust-roots configmap: %w", err)
 	}
@@ -863,7 +808,7 @@ func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
 		if len(bundle) == 0 {
 			continue
 		}
-		a.emitTrustBundle(ctx, s.Namespace, s.Name, bundle, current)
+		a.emitTrustBundle(ctx, s.Namespace, s.Name, bundle)
 		if s.Name == linkerdIssuerSecret {
 			a.auditLinkerdIssuer(ctx, s)
 		}
@@ -871,19 +816,14 @@ func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
 
 	// Prune series for bundles deleted since the last sweep — the
 	// same seen-set lifecycle as the other two gauges.
-	for k := range a.seenTrustBundles {
-		if !current[k] {
-			metrics.TrustBundleDaysToExpiry.DeleteLabelValues(k.namespace, k.name)
-		}
-	}
-	a.seenTrustBundles = current
+	a.seenTrustBundles.Prune(metrics.TrustBundleDaysToExpiry.DeleteLabelValues)
 	return nil
 }
 
 // emitTrustBundle parses the earliest cert expiry out of a PEM bundle
 // and lands it on the gauge — unparseable bundles log + emit nothing.
 func (a *certDriftAuditor) emitTrustBundle(ctx context.Context, ns, name string,
-	bundle []byte, current map[secretMetricKey]bool) {
+	bundle []byte) {
 	if len(bundle) == 0 {
 		return
 	}
@@ -893,6 +833,6 @@ func (a *certDriftAuditor) emitTrustBundle(ctx context.Context, ns, name string,
 			"object", ns+"/"+name)
 		return
 	}
-	current[secretMetricKey{ns, name}] = true
+	a.seenTrustBundles.Emit(secretMetricKey{ns, name}, ns, name)
 	metrics.TrustBundleDaysToExpiry.WithLabelValues(ns, name).Set(days)
 }

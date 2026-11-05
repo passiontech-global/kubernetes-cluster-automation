@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -413,9 +414,10 @@ func TestMetricsServerPatcherPatchError(t *testing.T) {
 
 // Disabled must be a clean no-op — nothing registered, no error.
 func TestSetupMetricsServerPatcherDisabled(t *testing.T) {
+	t.Setenv("METRICS_SERVER_PATCHER_ENABLED", "false")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(),
-		false, 3, 1); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {
@@ -426,8 +428,12 @@ func TestSetupMetricsServerPatcherDisabled(t *testing.T) {
 // The predicate pins ns/name on top of the shared Deployment
 // informer — only kube-system/metrics-server may reconcile.
 func TestSetupMetricsServerPatcherPredicate(t *testing.T) {
+	t.Setenv("METRICS_SERVER_PATCHER_ENABLED", "true")
+	t.Setenv("METRICS_SERVER_MIN_REPLICAS", "3")
+	t.Setenv("METRICS_SERVER_NODES_PER_REPLICA", "1")
 	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return Setup(m, fake.NewSimpleClientset(), true, 3, 1)
+		return Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+			Dyn: testutil.StubDyn()})
 	})
 	ms := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "kube-system", Name: "metrics-server"}}
@@ -446,9 +452,12 @@ func TestSetupMetricsServerPatcherPredicate(t *testing.T) {
 // counts every Node object, so updates never change the total and
 // would only add kubelet-heartbeat churn.
 func TestSetupMetricsServerPatcherNodeWatch(t *testing.T) {
+	t.Setenv("METRICS_SERVER_PATCHER_ENABLED", "true")
+	t.Setenv("METRICS_SERVER_MIN_REPLICAS", "3")
+	t.Setenv("METRICS_SERVER_NODES_PER_REPLICA", "1")
 	m := testutil.NewStubManager()
-	if err := Setup(m, fake.NewSimpleClientset(),
-		true, 3, 1); err != nil {
+	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	srcs := testutil.ControllerWatches(t, m.Added[0])

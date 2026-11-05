@@ -32,7 +32,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -66,12 +65,13 @@ type csrWatcher struct {
 
 // Setup registers the 10m sweep — always runs (detect mode
 // still reports pending CSRs); `approve` only controls the action.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, approve bool) error {
+func Setup(d shared.Deps) error {
+	approve := shared.Gate("CSR_APPROVER_ENABLED", false)
 	w := &csrWatcher{
-		cs: cs, approve: approve,
+		cs: d.CS, approve: approve,
 		warned: map[string]struct{}{}, reported: map[string]struct{}{},
 	}
-	return shared.AddPeriodic(mgr, csrWatcherQueue, 10*time.Minute, w.run)
+	return shared.AddPeriodic(d.Mgr, csrWatcherQueue, 10*time.Minute, w.run)
 }
 
 func (w *csrWatcher) run(ctx context.Context) error {
@@ -80,22 +80,14 @@ func (w *csrWatcher) run(ctx context.Context) error {
 	// Paged list — CSRs accumulate forever on clusters where nothing
 	// auto-approves them, so bound each apiserver response instead of
 	// decoding the whole pile in one shot.
-	list := &certificatesv1.CertificateSigningRequestList{}
-	cont := ""
-	for {
-		page, err := w.cs.CertificatesV1().CertificateSigningRequests().
-			List(ctx, metav1.ListOptions{Limit: 500, Continue: cont})
-		if err != nil {
-			return fmt.Errorf("list certificatesigningrequests: %w", err)
-		}
-		list.Items = append(list.Items, page.Items...)
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	csrs, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
+		shared.CertificateSigningRequests(w.cs))
+	if err != nil {
+		return fmt.Errorf("list certificatesigningrequests: %w", err)
 	}
 	approved, pending := 0, 0
-	for i := range list.Items {
-		csr := &list.Items[i]
+	for i := range csrs {
+		csr := &csrs[i]
 		if csr.Spec.SignerName != kubeletServingSigner {
 			continue
 		}
@@ -154,8 +146,8 @@ func (w *csrWatcher) run(ctx context.Context) error {
 	// main loop breaks on the approval cap, so this needs its own
 	// pass over the full list.
 	seen := map[string]struct{}{}
-	for i := range list.Items {
-		seen[list.Items[i].Name] = struct{}{}
+	for i := range csrs {
+		seen[csrs[i].Name] = struct{}{}
 	}
 	for name := range w.warned {
 		if _, ok := seen[name]; !ok {

@@ -37,7 +37,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -102,9 +101,9 @@ type cronJobCatchup struct {
 }
 
 // Setup registers the 15-minute sweep.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface) error {
-	c := &cronJobCatchup{cs: cs, nowFn: time.Now, lastCatchup: map[string]string{}}
-	return shared.AddPeriodic(mgr, catchupQueue, 15*time.Minute, c.run)
+func Setup(d shared.Deps) error {
+	c := &cronJobCatchup{cs: d.CS, nowFn: time.Now, lastCatchup: map[string]string{}}
+	return shared.AddPeriodic(d.Mgr, catchupQueue, 15*time.Minute, c.run)
 }
 
 func (c *cronJobCatchup) run(ctx context.Context) error {

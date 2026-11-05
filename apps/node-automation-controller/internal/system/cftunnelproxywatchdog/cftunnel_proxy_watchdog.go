@@ -43,7 +43,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -96,13 +95,19 @@ type cfTunnelProxyWatchdog struct {
 // Setup registers the periodic sweep — only on
 // clusters running the cloudflare-tunnel-gateway-controller release
 // (enabled=false skips registration entirely).
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, enabled bool, namespace string, interval time.Duration) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	// Parse before the gate — see corednspatcher: invalid knob values
+	// must warn even when the module is disabled.
+	namespace := shared.Getenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "cloudflare-tunnel-system")
+	interval := shared.GetenvDuration("CF_TUNNEL_WATCHDOG_INTERVAL", 5*time.Minute)
+	if !shared.Gate("CF_TUNNEL_WATCHDOG_ENABLED", true) {
 		logf.Log.WithName(cfTunnelWatchdogQueue).Info("disabled — module not registered")
 		return nil
 	}
-	w := &cfTunnelProxyWatchdog{cs: cs, namespace: namespace}
-	return shared.AddPeriodic(mgr, cfTunnelWatchdogQueue, interval, w.run)
+	logf.Log.WithName(cfTunnelWatchdogQueue).Info("registered",
+		"namespace", namespace, "interval", interval)
+	w := &cfTunnelProxyWatchdog{cs: d.CS, namespace: namespace}
+	return shared.AddPeriodic(d.Mgr, cfTunnelWatchdogQueue, interval, w.run)
 }
 
 func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {

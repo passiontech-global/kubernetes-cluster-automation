@@ -113,9 +113,9 @@ func TestCheckOperatorWorkqueuesSourceControllerHeals(t *testing.T) {
 		"apps", "repo", 5, 3)
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
-	p.opFirstSeen["source-controller/gitrepositories/apps/repo"] = base.Add(-time.Hour)
+	p.operator.opFirstSeen["source-controller/gitrepositories/apps/repo"] = base.Add(-time.Hour)
 
-	if res := p.checkOperatorWorkqueues(ctx); res.pass {
+	if res := p.operator.run(ctx); res.pass {
 		t.Fatal("stuck gitrepository with a renewing lease must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "source-controller", kcmReasonStaleGen); v != 1 {
@@ -143,12 +143,39 @@ func TestCheckOperatorWorkqueuesCertManagerNoConditions(t *testing.T) {
 	stuck := shUnstructured("cert-manager.io/v1", "Certificate", "apps", "tls", 1, 0)
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
-	p.opFirstSeen["cert-manager/certificates/apps/tls"] = base.Add(-time.Hour)
+	p.operator.opFirstSeen["cert-manager/certificates/apps/tls"] = base.Add(-time.Hour)
 
-	if res := p.checkOperatorWorkqueues(ctx); res.pass {
+	if res := p.operator.run(ctx); res.pass {
 		t.Fatal("never-reconciled Certificate must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "cert-manager", opReasonNoConditions); v != 1 {
+		t.Fatalf("frozen gauge = %v, want 1", v)
+	}
+}
+
+// A shipwright-operator ShipwrightBuild never reconciled (no
+// status.conditions) freezes under the no_status_conditions reason —
+// this exercises the operator.shipwright.io GVR row end-to-end so the
+// shOpDyn registration cannot silently drift from production again.
+func TestCheckOperatorWorkqueuesShipwrightOperatorNoConditions(t *testing.T) {
+	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("shipwright-operator", opReasonNoConditions)
+	t.Cleanup(func() {
+		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("shipwright-operator", opReasonNoConditions)
+	})
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		shLease("operators", "01a9b2d1.shipwright.io",
+			"shipwright-operator-abc_uid", 2*time.Second, base))
+	stuck := shUnstructured("operator.shipwright.io/v1alpha1", "ShipwrightBuild",
+		"", "build-1", 1, 0)
+	p := testProberDyn(cs, shOpDyn(stuck))
+	p.now = func() time.Time { return base }
+	p.operator.opFirstSeen["shipwright-operator/shipwrightbuilds//build-1"] = base.Add(-time.Hour)
+
+	if res := p.operator.run(ctx); res.pass {
+		t.Fatal("never-reconciled ShipwrightBuild must FAIL")
+	}
+	if v, _ := shOpFrozenGauge(t, "shipwright-operator", opReasonNoConditions); v != 1 {
 		t.Fatalf("frozen gauge = %v, want 1", v)
 	}
 }

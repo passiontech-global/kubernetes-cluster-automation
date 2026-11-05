@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,125 +16,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/record"
-	"k8s.io/utils/ptr"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/config"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/recorder"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
-	"sigs.k8s.io/controller-runtime/pkg/webhook/conversion"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
-
-func TestGetenv(t *testing.T) {
-	const key = "NAC_TEST_GETENV"
-
-	t.Run("unset returns default", func(t *testing.T) {
-		t.Setenv(key, "")
-		if got := getenv(key, "def"); got != "def" {
-			t.Fatalf("getenv=%q, want %q", got, "def")
-		}
-	})
-
-	t.Run("set returns value", func(t *testing.T) {
-		t.Setenv(key, "/custom/labels.txt")
-		if got := getenv(key, "def"); got != "/custom/labels.txt" {
-			t.Fatalf("getenv=%q, want %q", got, "/custom/labels.txt")
-		}
-	})
-}
-
-func TestGetenvInt(t *testing.T) {
-	const key = "NAC_TEST_GETENV_INT"
-
-	t.Run("unset returns default", func(t *testing.T) {
-		t.Setenv(key, "")
-		if got := getenvInt(key, 4); got != 4 {
-			t.Fatalf("getenvInt=%d, want 4", got)
-		}
-	})
-	t.Run("valid returns value", func(t *testing.T) {
-		t.Setenv(key, "7")
-		if got := getenvInt(key, 4); got != 7 {
-			t.Fatalf("getenvInt=%d, want 7", got)
-		}
-	})
-	t.Run("zero and negative are honored", func(t *testing.T) {
-		// minReplicas<=0 is the documented "disable the pin" setting —
-		// getenvInt must not clamp it away.
-		for v, want := range map[string]int{"0": 0, "-2": -2} {
-			t.Setenv(key, v)
-			if got := getenvInt(key, 4); got != want {
-				t.Fatalf("getenvInt(%q)=%d, want %d", v, got, want)
-			}
-		}
-	})
-	t.Run("unparseable falls back to default", func(t *testing.T) {
-		t.Setenv(key, "not-a-number")
-		if got := getenvInt(key, 4); got != 4 {
-			t.Fatalf("getenvInt=%d, want 4", got)
-		}
-	})
-}
-
-func TestGetenvDuration(t *testing.T) {
-	const key = "NAC_TEST_GETENV_DURATION"
-
-	t.Run("unset returns default", func(t *testing.T) {
-		t.Setenv(key, "")
-		if got := getenvDuration(key, 5*time.Minute); got != 5*time.Minute {
-			t.Fatalf("getenvDuration=%s, want 5m", got)
-		}
-	})
-	t.Run("valid returns value", func(t *testing.T) {
-		t.Setenv(key, "10m")
-		if got := getenvDuration(key, 5*time.Minute); got != 10*time.Minute {
-			t.Fatalf("getenvDuration=%s, want 10m", got)
-		}
-	})
-	// Every duration knob feeds a ticker interval — <=0 would panic
-	// time.NewTicker and a sub-second one would hot-loop the sweep,
-	// so both must fall back to the default, not be honored.
-	t.Run("non-positive falls back to default", func(t *testing.T) {
-		for _, v := range []string{"0s", "-5m"} {
-			t.Setenv(key, v)
-			if got := getenvDuration(key, 5*time.Minute); got != 5*time.Minute {
-				t.Fatalf("getenvDuration(%q)=%s, want 5m", v, got)
-			}
-		}
-	})
-	t.Run("sub-second falls back to default", func(t *testing.T) {
-		for _, v := range []string{"1ns", "500ms", "999ms"} {
-			t.Setenv(key, v)
-			if got := getenvDuration(key, 5*time.Minute); got != 5*time.Minute {
-				t.Fatalf("getenvDuration(%q)=%s, want 5m", v, got)
-			}
-		}
-	})
-	t.Run("one second is honored", func(t *testing.T) {
-		t.Setenv(key, "1s")
-		if got := getenvDuration(key, 5*time.Minute); got != time.Second {
-			t.Fatalf("getenvDuration=%s, want 1s", got)
-		}
-	})
-	t.Run("unparseable falls back to default", func(t *testing.T) {
-		t.Setenv(key, "not-a-duration")
-		if got := getenvDuration(key, 5*time.Minute); got != 5*time.Minute {
-			t.Fatalf("getenvDuration=%s, want 5m", got)
-		}
-	})
-}
 
 // ---- subprocess tests for main() -------------------------------------
 //
@@ -334,7 +221,7 @@ func fakeDiscoveryAPIServer(t *testing.T) *httptest.Server {
 
 // With a kubeconfig pointing at the fake apiserver, main() must run the
 // entire boot path — GetConfigOrDie, NewManager, clientset + dynamic
-// client, all 27 module setups, health probes, "starting manager" —
+// client, all module setups, health probes, "starting manager" —
 // then block in mgr.Start. SIGINT (what SetupSignalHandler maps to ctx
 // cancel on pod termination) must unwind it to a clean exit 0.
 func TestMainStartsManagerUntilSignal(t *testing.T) {
@@ -444,297 +331,68 @@ func TestMainManagerStartFails(t *testing.T) {
 	}
 }
 
-// ---- moduleConfigFromEnv / setupModules ------------------------------
+// ---- setupModules ----------------------------------------------------
+//
+// Every module resolves its own env gates inside Setup now — the
+// registry in modules.go is a flat name→Setup map, so these tests
+// drive the whole fleet through t.Setenv + a shared.Deps.
 
-func TestModuleConfigFromEnv(t *testing.T) {
-	keys := []string{
-		"CILIUM_TAINT_REAPER_ENABLED",
-		"FLUENTBIT_ROLLER_ENABLED",
-		"CERTMANAGER_REAPER_ENABLED",
-		"CILIUM_IDENTITY_AUDITOR_ENABLED",
-		"EXTERNALSECRET_NUDGE_ENABLED",
-		"CSR_APPROVER_ENABLED",
-		"HELM_STALL_UNWEDGE_ENABLED",
-		"CONCOURSE_JANITOR_ENABLED",
-		"NODE_LABELER_CONFIG_PATH",
-		"COREDNS_PATCHER_ENABLED",
-		"COREDNS_PATCHER_ZONE_WHEN",
-		"COREDNS_PATCHER_ZONE_MIN_DOMAINS",
-		"COREDNS_MIN_REPLICAS",
-		"COREDNS_NODES_PER_REPLICA",
-		"METRICS_SERVER_PATCHER_ENABLED",
-		"METRICS_SERVER_MIN_REPLICAS",
-		"METRICS_SERVER_NODES_PER_REPLICA",
-		"CF_TUNNEL_WATCHDOG_ENABLED",
-		"CF_TUNNEL_WATCHDOG_NAMESPACE",
-		"CF_TUNNEL_WATCHDOG_INTERVAL",
-		"CLUSTER_HEALTH_PROBES_ENABLED",
-		"VOLUMEATTACHMENT_CLEANER_ENABLED",
-		"PDB_WATCHDOG_ENABLED",
-		"CERT_DRIFT_AUDITOR_ENABLED",
-		"APISERVICE_GUARD_ENABLED",
-		"ZOMBIE_SIDECAR_REAPER_ENABLED",
-		"ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED",
-		"STATEFULSET_ONDELETE_ROLLER_ENABLED",
-		"VELERO_BACKUP_AUDITOR_ENABLED",
+// moduleGateEnvs lists every feature-gate env var a module reads.
+// Setting them all "true" enables every gate (opt-in and default-on
+// alike); setting them all "false" disables every gate.
+var moduleGateEnvs = []string{
+	"CILIUM_TAINT_REAPER_ENABLED",
+	"FLUENTBIT_ROLLER_ENABLED",
+	"CERTMANAGER_REAPER_ENABLED",
+	"CILIUM_IDENTITY_AUDITOR_ENABLED",
+	"EXTERNALSECRET_NUDGE_ENABLED",
+	"CSR_APPROVER_ENABLED",
+	"HELM_STALL_UNWEDGE_ENABLED",
+	"CONCOURSE_JANITOR_ENABLED",
+	"COREDNS_PATCHER_ENABLED",
+	"METRICS_SERVER_PATCHER_ENABLED",
+	"CF_TUNNEL_WATCHDOG_ENABLED",
+	"CLUSTER_HEALTH_PROBES_ENABLED",
+	"VOLUMEATTACHMENT_CLEANER_ENABLED",
+	"PDB_WATCHDOG_ENABLED",
+	"CERT_DRIFT_AUDITOR_ENABLED",
+	"APISERVICE_GUARD_ENABLED",
+	"ZOMBIE_SIDECAR_REAPER_ENABLED",
+	"ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED",
+	"STATEFULSET_ONDELETE_ROLLER_ENABLED",
+	"VELERO_BACKUP_AUDITOR_ENABLED",
+}
+
+func testDeps(m *testutil.StubManager) shared.Deps {
+	return shared.Deps{
+		Mgr: m,
+		CS:  fake.NewSimpleClientset(),
+		Dyn: testutil.StubDyn(),
+		Log: m.GetLogger(),
 	}
-	clear := func(t *testing.T) {
-		for _, k := range keys {
-			t.Setenv(k, "")
-		}
-	}
-
-	t.Run("defaults", func(t *testing.T) {
-		clear(t)
-		mc := moduleConfigFromEnv()
-		if mc.ciliumEnabled || mc.fluentbitEnabled || mc.certReaperEnabled ||
-			mc.ciliumAuditEnabled || mc.esNudgeEnabled || mc.csrApproveEnabled ||
-			mc.helmStallUnwedgeEnabled || mc.concourseJanitorEnabled {
-			t.Fatalf("expected all gates disabled, got %+v", mc)
-		}
-		if mc.labelerPath != "/etc/node-labeler/labels.txt" {
-			t.Fatalf("labelerPath = %q, want default", mc.labelerPath)
-		}
-		// The ported patcher/watchdog/prober modules default ON — only
-		// an explicit "false" opts a cluster out.
-		if !mc.corednsPatcherEnabled || !mc.metricsServerPatcherEnabled ||
-			!mc.cfTunnelWatchdogEnabled || !mc.clusterHealthProbesEnabled {
-			t.Fatalf("expected ported modules default-on, got %+v", mc)
-		}
-		if !mc.volumeAttachmentCleanerEnabled || !mc.pdbWatchdogEnabled ||
-			!mc.certDriftAuditorEnabled {
-			t.Fatalf("expected self-healing modules default-on, got %+v", mc)
-		}
-		// The wave 1-3 operations modules default ON the same way.
-		if !mc.apiServiceGuardEnabled || !mc.zombieSidecarReaperEnabled ||
-			!mc.orphanEndpointSliceEnabled || !mc.statefulSetRollerEnabled ||
-			!mc.veleroBackupAuditorEnabled {
-			t.Fatalf("expected wave 1-3 modules default-on, got %+v", mc)
-		}
-		if mc.corednsZoneWhen != "DoNotSchedule" {
-			t.Fatalf("corednsZoneWhen = %q, want DoNotSchedule", mc.corednsZoneWhen)
-		}
-		if mc.corednsZoneMinDomains != 2 {
-			t.Fatalf("corednsZoneMinDomains = %d, want 2", mc.corednsZoneMinDomains)
-		}
-		// Proportional replica pins default to the multi-zone values
-		// the cluster-proportional-autoscaler carried.
-		if mc.corednsMinReplicas != 4 {
-			t.Fatalf("corednsMinReplicas = %d, want 4", mc.corednsMinReplicas)
-		}
-		if mc.corednsNodesPerReplica != 1 {
-			t.Fatalf("corednsNodesPerReplica = %d, want 1", mc.corednsNodesPerReplica)
-		}
-		if mc.metricsServerMinReplicas != 3 {
-			t.Fatalf("metricsServerMinReplicas = %d, want 3", mc.metricsServerMinReplicas)
-		}
-		if mc.metricsServerNodesPerReplica != 1 {
-			t.Fatalf("metricsServerNodesPerReplica = %d, want 1",
-				mc.metricsServerNodesPerReplica)
-		}
-		if mc.cfTunnelWatchdogNamespace != "cloudflare-tunnel-system" {
-			t.Fatalf("cfTunnelWatchdogNamespace = %q, want default",
-				mc.cfTunnelWatchdogNamespace)
-		}
-		if mc.cfTunnelWatchdogInterval != 5*time.Minute {
-			t.Fatalf("cfTunnelWatchdogInterval = %s, want 5m",
-				mc.cfTunnelWatchdogInterval)
-		}
-	})
-
-	t.Run("all enabled", func(t *testing.T) {
-		clear(t)
-		t.Setenv("CILIUM_TAINT_REAPER_ENABLED", "true")
-		t.Setenv("FLUENTBIT_ROLLER_ENABLED", "true")
-		t.Setenv("CERTMANAGER_REAPER_ENABLED", "true")
-		t.Setenv("CILIUM_IDENTITY_AUDITOR_ENABLED", "true")
-		t.Setenv("EXTERNALSECRET_NUDGE_ENABLED", "true")
-		t.Setenv("CSR_APPROVER_ENABLED", "true")
-		t.Setenv("HELM_STALL_UNWEDGE_ENABLED", "true")
-		t.Setenv("CONCOURSE_JANITOR_ENABLED", "true")
-		t.Setenv("NODE_LABELER_CONFIG_PATH", "/custom/labels.txt")
-		mc := moduleConfigFromEnv()
-		if !mc.ciliumEnabled || !mc.fluentbitEnabled || !mc.certReaperEnabled ||
-			!mc.ciliumAuditEnabled || !mc.esNudgeEnabled || !mc.csrApproveEnabled ||
-			!mc.helmStallUnwedgeEnabled || !mc.concourseJanitorEnabled {
-			t.Fatalf("expected all gates enabled, got %+v", mc)
-		}
-		if mc.labelerPath != "/custom/labels.txt" {
-			t.Fatalf("labelerPath = %q, want /custom/labels.txt", mc.labelerPath)
-		}
-	})
-
-	t.Run("ported module overrides", func(t *testing.T) {
-		clear(t)
-		t.Setenv("COREDNS_PATCHER_ENABLED", "false")
-		t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "ScheduleAnyway")
-		t.Setenv("COREDNS_PATCHER_ZONE_MIN_DOMAINS", "0")
-		// cicd single-zone pin + an explicit 0 disable (a cluster
-		// re-enabling standalone CPA sets minReplicas<=0).
-		t.Setenv("COREDNS_MIN_REPLICAS", "1")
-		t.Setenv("COREDNS_NODES_PER_REPLICA", "2")
-		t.Setenv("METRICS_SERVER_PATCHER_ENABLED", "false")
-		t.Setenv("METRICS_SERVER_MIN_REPLICAS", "0")
-		t.Setenv("METRICS_SERVER_NODES_PER_REPLICA", "5")
-		t.Setenv("CF_TUNNEL_WATCHDOG_ENABLED", "false")
-		t.Setenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "custom-ns")
-		t.Setenv("CF_TUNNEL_WATCHDOG_INTERVAL", "10m")
-		t.Setenv("CLUSTER_HEALTH_PROBES_ENABLED", "false")
-		t.Setenv("VOLUMEATTACHMENT_CLEANER_ENABLED", "false")
-		t.Setenv("PDB_WATCHDOG_ENABLED", "false")
-		t.Setenv("CERT_DRIFT_AUDITOR_ENABLED", "false")
-		t.Setenv("APISERVICE_GUARD_ENABLED", "false")
-		t.Setenv("ZOMBIE_SIDECAR_REAPER_ENABLED", "false")
-		t.Setenv("ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED", "false")
-		t.Setenv("STATEFULSET_ONDELETE_ROLLER_ENABLED", "false")
-		t.Setenv("VELERO_BACKUP_AUDITOR_ENABLED", "false")
-		mc := moduleConfigFromEnv()
-		if mc.corednsPatcherEnabled || mc.metricsServerPatcherEnabled ||
-			mc.cfTunnelWatchdogEnabled || mc.clusterHealthProbesEnabled {
-			t.Fatalf("explicit false must disable the ported modules, got %+v", mc)
-		}
-		if mc.volumeAttachmentCleanerEnabled || mc.pdbWatchdogEnabled ||
-			mc.certDriftAuditorEnabled {
-			t.Fatalf("explicit false must disable the self-healing modules, got %+v", mc)
-		}
-		if mc.apiServiceGuardEnabled || mc.zombieSidecarReaperEnabled ||
-			mc.orphanEndpointSliceEnabled || mc.statefulSetRollerEnabled ||
-			mc.veleroBackupAuditorEnabled {
-			t.Fatalf("explicit false must disable the wave 1-3 modules, got %+v", mc)
-		}
-		if mc.corednsZoneWhen != "ScheduleAnyway" || mc.corednsZoneMinDomains != 0 {
-			t.Fatalf("zone override not applied: %q/%d",
-				mc.corednsZoneWhen, mc.corednsZoneMinDomains)
-		}
-		if mc.corednsMinReplicas != 1 || mc.corednsNodesPerReplica != 2 {
-			t.Fatalf("coredns proportional override not applied: %d/%d",
-				mc.corednsMinReplicas, mc.corednsNodesPerReplica)
-		}
-		if mc.metricsServerMinReplicas != 0 || mc.metricsServerNodesPerReplica != 5 {
-			t.Fatalf("metrics-server proportional override not applied: %d/%d",
-				mc.metricsServerMinReplicas, mc.metricsServerNodesPerReplica)
-		}
-		if mc.cfTunnelWatchdogNamespace != "custom-ns" {
-			t.Fatalf("cfTunnelWatchdogNamespace = %q, want custom-ns",
-				mc.cfTunnelWatchdogNamespace)
-		}
-		if mc.cfTunnelWatchdogInterval != 10*time.Minute {
-			t.Fatalf("cfTunnelWatchdogInterval = %s, want 10m",
-				mc.cfTunnelWatchdogInterval)
-		}
-	})
-}
-
-// stubManager mirrors testutil.StubManager:
-// Add appends to `added` (addErr injects a registration failure), and
-// only GetScheme/GetControllerOptions/GetLogger return anything
-// meaningful because those are the only getters the builder and
-// AddPeriodic call — source.TypedKind only stores the cache until
-// Start (never invoked), so nil cache/client/mapper are safe, but the
-// scheme MUST be real: apiutil.GVKForObject resolves at build time.
-var _ manager.Manager = (*stubManager)(nil)
-
-type stubManager struct {
-	added  []manager.Runnable
-	addErr error
-	scheme *runtime.Scheme
-}
-
-func newStubManager() *stubManager {
-	scheme := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		panic(err)
-	}
-	return &stubManager{scheme: scheme}
-}
-
-func (m *stubManager) Add(r manager.Runnable) error {
-	if m.addErr != nil {
-		return m.addErr
-	}
-	m.added = append(m.added, r)
-	return nil
-}
-
-// GetControllerOptions disables the process-global controller-name
-// uniqueness check — all modules are built in one test binary, which
-// would otherwise collide on repeated runs.
-func (m *stubManager) GetControllerOptions() config.Controller {
-	return config.Controller{SkipNameValidation: ptr.To(true)}
-}
-
-func (m *stubManager) GetScheme() *runtime.Scheme                      { return m.scheme }
-func (m *stubManager) GetLogger() logr.Logger                          { return logr.Discard() }
-func (m *stubManager) GetCache() cache.Cache                           { return nil }
-func (m *stubManager) GetClient() client.Client                        { return nil }
-func (m *stubManager) GetFieldIndexer() client.FieldIndexer            { return nil }
-func (m *stubManager) GetRESTMapper() meta.RESTMapper                  { return nil }
-func (m *stubManager) GetAPIReader() client.Reader                     { return nil }
-func (m *stubManager) GetHTTPClient() *http.Client                     { return nil }
-func (m *stubManager) GetConfig() *rest.Config                         { return nil }
-func (m *stubManager) GetEventRecorderFor(string) record.EventRecorder { return nil }
-func (m *stubManager) GetEventRecorder(string) recorder.EventRecorder  { return nil }
-func (m *stubManager) GetWebhookServer() webhook.Server                { return nil }
-func (m *stubManager) GetConverterRegistry() conversion.Registry       { return nil }
-func (m *stubManager) Start(context.Context) error                     { return nil }
-func (m *stubManager) Elected() <-chan struct{}                        { return nil }
-func (m *stubManager) AddHealthzCheck(string, healthz.Checker) error   { return nil }
-func (m *stubManager) AddReadyzCheck(string, healthz.Checker) error    { return nil }
-
-func (m *stubManager) AddMetricsServerExtraHandler(string, http.Handler) error {
-	return nil
-}
-
-func stubDyn() *dynamicfake.FakeDynamicClient {
-	return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
 }
 
 // Every module registers exactly one runnable on the manager — 32 in
-// the map — except the sixteen gate-skippers (certmanager-reaper,
-// cilium-identity-auditor, cilium-taint-reaper, fluent-bit-config-roller,
-// coredns-patcher, metrics-server-patcher, cf-tunnel-proxy-watchdog,
-// statefulset-ondelete-roller, cluster-health-probes,
-// pdb-deadlock-watchdog, volumeattachment-cleaner,
-// zombie-sidecar-reaper, orphan-endpointslice-cleaner,
-// cert-drift-auditor, apiservice-guard, velero-backup-auditor), which
-// skip mgr.Add entirely while disabled (16 runnables then). The other
-// feature flags only gate the tick body, not registration.
+// the map — except the gate-skippers, which skip mgr.Add entirely
+// while disabled. Modules whose flag only gates the tick body
+// (csr-watcher approve mode, helmrelease-unlocker stall-unwedge,
+// externalsecret-nudge, webhookguard, and the no-gate always-on
+// modules) still register.
 func TestSetupModules(t *testing.T) {
 	t.Run("all gates enabled", func(t *testing.T) {
-		m := newStubManager()
-		mc := moduleConfig{
-			ciliumEnabled:                  true,
-			fluentbitEnabled:               true,
-			certReaperEnabled:              true,
-			ciliumAuditEnabled:             true,
-			esNudgeEnabled:                 true,
-			csrApproveEnabled:              true,
-			concourseJanitorEnabled:        true,
-			labelerPath:                    filepath.Join(t.TempDir(), "labels.txt"),
-			corednsPatcherEnabled:          true,
-			corednsZoneWhen:                "DoNotSchedule",
-			corednsZoneMinDomains:          2,
-			metricsServerPatcherEnabled:    true,
-			cfTunnelWatchdogEnabled:        true,
-			cfTunnelWatchdogNamespace:      "cloudflare-tunnel-system",
-			cfTunnelWatchdogInterval:       5 * time.Minute,
-			clusterHealthProbesEnabled:     true,
-			volumeAttachmentCleanerEnabled: true,
-			pdbWatchdogEnabled:             true,
-			certDriftAuditorEnabled:        true,
-			apiServiceGuardEnabled:         true,
-			zombieSidecarReaperEnabled:     true,
-			orphanEndpointSliceEnabled:     true,
-			statefulSetRollerEnabled:       true,
-			veleroBackupAuditorEnabled:     true,
+		for _, k := range moduleGateEnvs {
+			t.Setenv(k, "true")
 		}
-		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), mc); err != nil {
+		t.Setenv("NODE_LABELER_CONFIG_PATH",
+			filepath.Join(t.TempDir(), "labels.txt"))
+		m := testutil.NewStubManager()
+		if err := setupModules(testDeps(m)); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
-		if len(m.added) != 32 {
-			t.Fatalf("registered %d runnables, want 32", len(m.added))
+		if len(m.Added) != 32 {
+			t.Fatalf("registered %d runnables, want 32", len(m.Added))
 		}
-		for i, r := range m.added {
+		for i, r := range m.Added {
 			if r == nil {
 				t.Fatalf("runnable %d is nil", i)
 			}
@@ -742,12 +400,16 @@ func TestSetupModules(t *testing.T) {
 	})
 
 	t.Run("all gates disabled", func(t *testing.T) {
-		m := newStubManager()
-		if err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), moduleConfig{}); err != nil {
+		for _, k := range moduleGateEnvs {
+			t.Setenv(k, "false")
+		}
+		m := testutil.NewStubManager()
+		if err := setupModules(testDeps(m)); err != nil {
 			t.Fatalf("setupModules: %v", err)
 		}
-		if len(m.added) != 16 {
-			t.Fatalf("registered %d runnables, want 16", len(m.added))
+		// 32 modules minus the 17 gate-skippers = 15 runnables.
+		if len(m.Added) != 15 {
+			t.Fatalf("registered %d runnables, want 15", len(m.Added))
 		}
 	})
 }
@@ -819,13 +481,13 @@ func TestDefaultCacheTransform(t *testing.T) {
 // first setup error instead of silently losing a module.
 func TestSetupModulesErrorPropagates(t *testing.T) {
 	want := errors.New("manager rejected runnable")
-	m := newStubManager()
-	m.addErr = want
-	err := setupModules(m, fake.NewSimpleClientset(), stubDyn(), moduleConfig{})
+	m := testutil.NewStubManager()
+	m.AddErr = want
+	err := setupModules(testDeps(m))
 	if !errors.Is(err, want) {
 		t.Fatalf("setupModules error = %v, want %v", err, want)
 	}
-	if len(m.added) != 0 {
-		t.Fatalf("registered %d runnables, want 0", len(m.added))
+	if len(m.Added) != 0 {
+		t.Fatalf("registered %d runnables, want 0", len(m.Added))
 	}
 }

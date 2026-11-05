@@ -87,7 +87,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -140,28 +139,24 @@ const (
 // helmReleaseGVRs tried in order — v2 on current flux, v2beta2 on
 // installs that have not bumped the CRDs yet. The first listable GVR
 // wins and is reused for the requestedAt patches.
-var helmReleaseGVRs = []schema.GroupVersionResource{
-	{Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"},
-	{Group: "helm.toolkit.fluxcd.io", Version: "v2beta2", Resource: "helmreleases"},
-}
+var helmReleaseGVRs = shared.HelmReleaseGVRs
 
 // fluxKustomizationGVR is the second consumer kind the artifact
 // healer scans (kustomize-controller owns the same stale-artifact
 // failure class as helm-controller).
-var fluxKustomizationGVR = schema.GroupVersionResource{
-	Group: "kustomize.toolkit.fluxcd.io", Version: "v1", Resource: "kustomizations"}
+var fluxKustomizationGVR = shared.GVRFluxKustomization
 
 // fluxSourceGVRs maps the sourceRef kinds flux consumers carry to
 // their source.toolkit.fluxcd.io/v1 GVRs — the objects a stale-
 // artifact nudge actually lands on.
 var fluxSourceGVRs = map[string]schema.GroupVersionResource{
-	"HelmChart":      {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmcharts"},
-	"GitRepository":  {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "gitrepositories"},
-	"HelmRepository": {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmrepositories"},
-	"OCIRepository":  {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "ocirepositories"},
+	"HelmChart":      shared.GVRFluxHelmChart,
+	"GitRepository":  shared.GVRFluxGitRepository,
+	"HelmRepository": shared.GVRFluxHelmRepository,
+	"OCIRepository":  shared.GVRFluxOCIRepository,
 	// Bucket is a first-class v1 source kind — a Kustomization or HR
 	// sourcing artifacts from an S3/GCS bucket needs the same nudge.
-	"Bucket": {Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "buckets"},
+	"Bucket": shared.GVRFluxBucket,
 }
 
 type helmReleaseUnlocker struct {
@@ -216,25 +211,25 @@ type stallAttempt struct {
 	last     time.Time
 }
 
-// Setup registers the 10-minute sweep. stallUnwedgeEnabled gates ONLY
-// the stalled-rollout unwedge pass (the pod-affecting signature); the
-// pending-secret unlock and the artifact-source healer run
-// unconditionally like before.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, stallUnwedgeEnabled bool) error {
+// Setup registers the 10-minute sweep. HELM_STALL_UNWEDGE_ENABLED
+// gates ONLY the stalled-rollout unwedge pass (the pod-affecting
+// signature); the pending-secret unlock and the artifact-source
+// healer run unconditionally like before.
+func Setup(d shared.Deps) error {
 	u := &helmReleaseUnlocker{
-		cs:                 cs,
-		dyn:                dyn,
+		cs:                 d.CS,
+		dyn:                d.Dyn,
 		firstSeen:          map[string]time.Time{},
 		unlocked:           map[string]time.Time{},
 		alerted:            map[string]bool{},
-		stallEnabled:       stallUnwedgeEnabled,
+		stallEnabled:       shared.Gate("HELM_STALL_UNWEDGE_ENABLED", false),
 		stallFirstSeen:     map[string]time.Time{},
 		unwedged:           map[string]time.Time{},
 		stallAlerted:       map[string]time.Time{},
 		stallAttempts:      map[string]*stallAttempt{},
 		immutableJobHealed: map[string]time.Time{},
 	}
-	return shared.AddPeriodic(mgr, helmUnlockQueue, helmUnlockInterval, u.run)
+	return shared.AddPeriodic(d.Mgr, helmUnlockQueue, helmUnlockInterval, u.run)
 }
 
 func (u *helmReleaseUnlocker) run(ctx context.Context) error {
@@ -462,19 +457,12 @@ func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructur
 // it so no single response hauls the whole resource across the wire.
 func (u *helmReleaseUnlocker) listAllPages(ctx context.Context,
 	ri dynamic.ResourceInterface) (*unstructured.UnstructuredList, error) {
-	out := &unstructured.UnstructuredList{}
-	opts := metav1.ListOptions{Limit: helmListPageSize}
-	for {
-		page, err := ri.List(ctx, opts)
-		if err != nil {
-			return nil, err
-		}
-		out.Items = append(out.Items, page.Items...)
-		if page.GetContinue() == "" {
-			return out, nil
-		}
-		opts.Continue = page.GetContinue()
+	items, err := shared.ListAll(ctx, metav1.ListOptions{Limit: helmListPageSize},
+		shared.DynamicPage(ri))
+	if err != nil {
+		return nil, err
 	}
+	return &unstructured.UnstructuredList{Items: items}, nil
 }
 
 // hrStuckInProgress reports whether the HR's Ready condition is False
@@ -641,24 +629,16 @@ func (u *helmReleaseUnlocker) pruneSupersededSecrets(ctx context.Context) error 
 	// Cluster-wide, server-side filtered to helm release secrets —
 	// owner=helm is the same label unlock() selects on. Paged like
 	// every cluster-wide list in this module.
-	var secrets []corev1.Secret
-	cont := ""
-	for {
-		page, err := u.cs.CoreV1().Secrets(metav1.NamespaceAll).List(ctx,
-			metav1.ListOptions{LabelSelector: "owner=helm",
-				Limit: helmListPageSize, Continue: cont})
-		if err != nil {
-			// Hygiene sweep — a list failure must not fail the run
-			// (same posture as cleanFailedHookJobs): the next sweep
-			// retries, and IncError keeps it on the alert path.
-			metrics.IncError(helmUnlockQueue)
-			log.Error(err, "superseded secret prune: list failed — skipped")
-			return nil
-		}
-		secrets = append(secrets, page.Items...)
-		if cont = page.Continue; cont == "" {
-			break
-		}
+	secrets, err := shared.ListAll(ctx, metav1.ListOptions{
+		LabelSelector: "owner=helm", Limit: helmListPageSize},
+		shared.Secrets(u.cs, metav1.NamespaceAll))
+	if err != nil {
+		// Hygiene sweep — a list failure must not fail the run
+		// (same posture as cleanFailedHookJobs): the next sweep
+		// retries, and IncError keeps it on the alert path.
+		metrics.IncError(helmUnlockQueue)
+		log.Error(err, "superseded secret prune: list failed — skipped")
+		return nil
 	}
 	// Group by storage namespace + release name.
 	type relKey struct{ ns, name string }
@@ -857,7 +837,7 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 // consumer Ready=False continuously for >=15m with a message pointing
 // at the source's artifact (not the consumer's own logic).
 func fluxArtifactStale(o *unstructured.Unstructured) bool {
-	if suspended, _, _ := unstructured.NestedBool(o.Object, "spec", "suspend"); suspended {
+	if suspended, _ := shared.NestedBool(o.Object, "spec", "suspend"); suspended {
 		return false // suspended objects are parked, not broken
 	}
 	status, msg := shared.ReadyCond(o)
@@ -887,15 +867,15 @@ func fluxArtifactStale(o *unstructured.Unstructured) bool {
 // spec.chart.spec.sourceRef (HelmRepository/GitRepository). The
 // namespace defaults to the HR's own (flux convention).
 func hrSourceRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
-	kind, _, _ := unstructured.NestedString(hr.Object, "spec", "chartRef", "kind")
-	name, _, _ := unstructured.NestedString(hr.Object, "spec", "chartRef", "name")
-	ns, _, _ := unstructured.NestedString(hr.Object, "spec", "chartRef", "namespace")
+	kind, _ := shared.NestedString(hr.Object, "spec", "chartRef", "kind")
+	name, _ := shared.NestedString(hr.Object, "spec", "chartRef", "name")
+	ns, _ := shared.NestedString(hr.Object, "spec", "chartRef", "namespace")
 	if kind == "" || name == "" {
-		kind, _, _ = unstructured.NestedString(
+		kind, _ = shared.NestedString(
 			hr.Object, "spec", "chart", "spec", "sourceRef", "kind")
-		name, _, _ = unstructured.NestedString(
+		name, _ = shared.NestedString(
 			hr.Object, "spec", "chart", "spec", "sourceRef", "name")
-		ns, _, _ = unstructured.NestedString(
+		ns, _ = shared.NestedString(
 			hr.Object, "spec", "chart", "spec", "sourceRef", "namespace")
 	}
 	if kind == "" || name == "" {
@@ -912,10 +892,10 @@ func hrSourceRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
 // spec.chart.spec.sourceRef (not spec.chartRef: HelmChart), so both the
 // upstream repository and the HelmChart artifact are nudged.
 func hrStatusHelmChartRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
-	if cKind, _, _ := unstructured.NestedString(hr.Object, "spec", "chartRef", "kind"); cKind == "HelmChart" {
+	if cKind, _ := shared.NestedString(hr.Object, "spec", "chartRef", "kind"); cKind == "HelmChart" {
 		return fluxSourceRef{}, false
 	}
-	hc, _, _ := unstructured.NestedString(hr.Object, "status", "helmChart")
+	hc, _ := shared.NestedString(hr.Object, "status", "helmChart")
 	ns, name, ok := strings.Cut(hc, "/")
 	if !ok || ns == "" || name == "" {
 		return fluxSourceRef{}, false
@@ -926,9 +906,9 @@ func hrStatusHelmChartRef(hr *unstructured.Unstructured) (fluxSourceRef, bool) {
 // ksSourceRef is spec.sourceRef on a Kustomization — same flux
 // convention (namespace defaults to the object's own).
 func ksSourceRef(k *unstructured.Unstructured) (fluxSourceRef, bool) {
-	kind, _, _ := unstructured.NestedString(k.Object, "spec", "sourceRef", "kind")
-	name, _, _ := unstructured.NestedString(k.Object, "spec", "sourceRef", "name")
-	ns, _, _ := unstructured.NestedString(k.Object, "spec", "sourceRef", "namespace")
+	kind, _ := shared.NestedString(k.Object, "spec", "sourceRef", "kind")
+	name, _ := shared.NestedString(k.Object, "spec", "sourceRef", "name")
+	ns, _ := shared.NestedString(k.Object, "spec", "sourceRef", "namespace")
 	if kind == "" || name == "" {
 		return fluxSourceRef{}, false
 	}
@@ -1007,10 +987,10 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 // bare object name. It is the `name=` label helm puts on its release
 // secrets.
 func hrReleaseName(hr *unstructured.Unstructured) string {
-	if n, _, _ := unstructured.NestedString(hr.Object, "spec", "releaseName"); n != "" {
+	if n, _ := shared.NestedString(hr.Object, "spec", "releaseName"); n != "" {
 		return n
 	}
-	if ns, _, _ := unstructured.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
+	if ns, _ := shared.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
 		return ns + "-" + hr.GetName()
 	}
 	return hr.GetName()
@@ -1022,7 +1002,7 @@ func hrReleaseName(hr *unstructured.Unstructured) string {
 // workload the chart renders). Hook Jobs live here, not in the
 // storage namespace.
 func hrReleaseNS(hr *unstructured.Unstructured) string {
-	if ns, _, _ := unstructured.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
+	if ns, _ := shared.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
 		return ns
 	}
 	return hr.GetNamespace()
@@ -1034,7 +1014,7 @@ func hrReleaseNS(hr *unstructured.Unstructured) string {
 // part of the chain (it only locates the installed release, not its
 // bookkeeping).
 func hrStorageNS(hr *unstructured.Unstructured) string {
-	if ns, _, _ := unstructured.NestedString(hr.Object, "spec", "storageNamespace"); ns != "" {
+	if ns, _ := shared.NestedString(hr.Object, "spec", "storageNamespace"); ns != "" {
 		return ns
 	}
 	return hr.GetNamespace()
@@ -1067,7 +1047,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 	now := time.Now()
 	for i := range kustomizations.Items {
 		k := &kustomizations.Items[i]
-		if suspended, _, _ := unstructured.NestedBool(k.Object, "spec", "suspend"); suspended {
+		if suspended, _ := shared.NestedBool(k.Object, "spec", "suspend"); suspended {
 			continue
 		}
 		status, msg := shared.ReadyCond(k)
@@ -1099,7 +1079,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 		// The Job lives where the manifests apply — spec.targetNamespace
 		// wins, else the Kustomization's own namespace.
 		jobNS := k.GetNamespace()
-		if tns, _, _ := unstructured.NestedString(k.Object, "spec", "targetNamespace"); tns != "" {
+		if tns, _ := shared.NestedString(k.Object, "spec", "targetNamespace"); tns != "" {
 			jobNS = tns
 		}
 		job, err := u.cs.BatchV1().Jobs(jobNS).Get(ctx, m[1], metav1.GetOptions{})

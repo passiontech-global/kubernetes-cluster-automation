@@ -24,14 +24,17 @@
 //     .spec.replicas untouched so standalone CPA can be re-enabled.
 //   - The ported kuberhealthy HealthChecks are default-ON too:
 //     CLUSTER_HEALTH_PROBES_ENABLED / _INTERVAL plus the per-check
-//     HEALTH_* knobs (see internal/clusterhealthprobes/cluster_health_probes.go).
+//     HEALTH_* knobs (see internal/clusterhealthprobes).
+//
+// Every module resolves its own env gates inside Setup — see
+// modules.go for the registry and internal/shared/env.go for the
+// parsing helpers.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -51,79 +54,10 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/apiserver/apiserverendpointguard"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/apiserver/apiserviceguard"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/apiserver/webhookguard"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/clusterhealthprobes"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/certdriftauditor"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/certmanagerreaper"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/ciliumidentityauditor"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/externalsecretnudge"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/helmreleaseunlocker"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/integration/velerobackupauditor"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/concoursejanitor"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/cronjobcatchup"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/evictedpodjanitor"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/failedjobsjanitor"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/orphanendpointslicecleaner"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/volumeattachmentcleaner"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/janitor/zombiesidecarreaper"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/ciliumtaintreaper"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/csrwatcher"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/deadnodesweeper"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/deschedulerstormgate"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/kubeletreaper"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/nodelabeler"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/partitionevictor"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/node/pdbdeadlockwatchdog"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/cftunnelproxywatchdog"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/corednspatcher"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/corednswatchdog"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/fluentbitroller"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/konnectivitypatcher"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/metricsserverpatcher"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/system/statefulsetroller"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
 var version = "dev"
-
-func getenv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-// getenvInt reads an integer env knob. An unparseable value warns and
-// falls back to def rather than being silently discarded — a mistyped
-// flag must surface in the logs instead of looking configured. The
-// parsed value is kept verbatim: <=0 is a legitimate setting for the
-// replica-pin knobs (minReplicas<=0 disables the pin).
-func getenvInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-		ctrl.Log.WithName("env").Info("unparseable integer env value, using default",
-			"key", key, "value", v, "default", def)
-	}
-	return def
-}
-
-// getenvDuration reads a duration env knob. Unparseable values warn and
-// fall back to def; so do parsed values < 1s — every duration knob is
-// a sweep interval, where <=0 is never meaningful and would panic
-// time.NewTicker downstream in shared.Periodic, and a sub-second
-// interval would hot-loop the sweep.
-func getenvDuration(key string, def time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= time.Second {
-			return d
-		}
-		ctrl.Log.WithName("env").Info("invalid duration env value, using default",
-			"key", key, "value", v, "default", def)
-	}
-	return def
-}
 
 // stripManagedFields is the shared managedFields stripper — a factory
 // product built once, not re-allocated per transformed object.
@@ -295,9 +229,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	mc := moduleConfigFromEnv()
-
-	if err := setupModules(mgr, cs, dyn, mc); err != nil {
+	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn, Log: ctrl.Log}
+	if err := setupModules(deps); err != nil {
 		os.Exit(1)
 	}
 
@@ -316,216 +249,9 @@ func main() {
 		// 0s in this line means "controller-runtime default" — see the
 		// flag comments above.
 		"leaseDuration", leaseDuration, "renewDeadline", renewDeadline,
-		"retryPeriod", retryPeriod,
-		"nodeLabelerConfig", mc.labelerPath,
-		"ciliumTaintReaper", mc.ciliumEnabled, "fluentBitRoller", mc.fluentbitEnabled,
-		"certManagerReaper", mc.certReaperEnabled, "ciliumAudit", mc.ciliumAuditEnabled,
-		"externalSecretNudge", mc.esNudgeEnabled, "csrApprove", mc.csrApproveEnabled,
-		"helmStallUnwedge", mc.helmStallUnwedgeEnabled,
-		"concourseJanitor", mc.concourseJanitorEnabled,
-		"corednsPatcher", mc.corednsPatcherEnabled,
-		"corednsZoneWhen", mc.corednsZoneWhen,
-		"corednsZoneMinDomains", mc.corednsZoneMinDomains,
-		"corednsMinReplicas", mc.corednsMinReplicas,
-		"corednsNodesPerReplica", mc.corednsNodesPerReplica,
-		"metricsServerPatcher", mc.metricsServerPatcherEnabled,
-		"metricsServerMinReplicas", mc.metricsServerMinReplicas,
-		"metricsServerNodesPerReplica", mc.metricsServerNodesPerReplica,
-		"cfTunnelWatchdog", mc.cfTunnelWatchdogEnabled,
-		"cfTunnelWatchdogNamespace", mc.cfTunnelWatchdogNamespace,
-		"cfTunnelWatchdogInterval", mc.cfTunnelWatchdogInterval,
-		"clusterHealthProbes", mc.clusterHealthProbesEnabled,
-		"volumeAttachmentCleaner", mc.volumeAttachmentCleanerEnabled,
-		"pdbWatchdog", mc.pdbWatchdogEnabled,
-		"certDriftAuditor", mc.certDriftAuditorEnabled,
-		"apiServiceGuard", mc.apiServiceGuardEnabled,
-		"zombieSidecarReaper", mc.zombieSidecarReaperEnabled,
-		"orphanEndpointSliceCleaner", mc.orphanEndpointSliceEnabled,
-		"statefulSetOnDeleteRoller", mc.statefulSetRollerEnabled,
-		"veleroBackupAuditor", mc.veleroBackupAuditorEnabled)
+		"retryPeriod", retryPeriod)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited")
 		os.Exit(1)
 	}
-}
-
-// moduleConfig holds the env-resolved feature gates and config paths
-// the modules need — the same flags the shell-operator read from its
-// ConfigMaps (see header contract).
-type moduleConfig struct {
-	ciliumEnabled                  bool
-	fluentbitEnabled               bool
-	certReaperEnabled              bool
-	ciliumAuditEnabled             bool
-	esNudgeEnabled                 bool
-	csrApproveEnabled              bool
-	helmStallUnwedgeEnabled        bool
-	labelerPath                    string
-	concourseJanitorEnabled        bool
-	corednsPatcherEnabled          bool
-	corednsZoneWhen                string
-	corednsZoneMinDomains          int
-	corednsMinReplicas             int
-	corednsNodesPerReplica         int
-	metricsServerPatcherEnabled    bool
-	metricsServerMinReplicas       int
-	metricsServerNodesPerReplica   int
-	cfTunnelWatchdogEnabled        bool
-	cfTunnelWatchdogNamespace      string
-	cfTunnelWatchdogInterval       time.Duration
-	clusterHealthProbesEnabled     bool
-	volumeAttachmentCleanerEnabled bool
-	pdbWatchdogEnabled             bool
-	certDriftAuditorEnabled        bool
-	apiServiceGuardEnabled         bool
-	zombieSidecarReaperEnabled     bool
-	orphanEndpointSliceEnabled     bool
-	statefulSetRollerEnabled       bool
-	veleroBackupAuditorEnabled     bool
-}
-
-// moduleConfigFromEnv resolves every feature-gate env var once, after
-// the clients exist and before any module is wired.
-func moduleConfigFromEnv() moduleConfig {
-	return moduleConfig{
-		ciliumEnabled:      os.Getenv("CILIUM_TAINT_REAPER_ENABLED") == "true",
-		fluentbitEnabled:   os.Getenv("FLUENTBIT_ROLLER_ENABLED") == "true",
-		certReaperEnabled:  os.Getenv("CERTMANAGER_REAPER_ENABLED") == "true",
-		ciliumAuditEnabled: os.Getenv("CILIUM_IDENTITY_AUDITOR_ENABLED") == "true",
-		esNudgeEnabled:     os.Getenv("EXTERNALSECRET_NUDGE_ENABLED") == "true",
-		csrApproveEnabled:  os.Getenv("CSR_APPROVER_ENABLED") == "true",
-		// Opt-in like the other destructive-gate flags: the stall
-		// unwedge scales workload ReplicaSets (a brief availability
-		// dip) and needs apps/replicasets+deployments RBAC the base
-		// ClusterRole does not carry — a cluster must consciously
-		// grant both before enabling the signature.
-		helmStallUnwedgeEnabled: os.Getenv("HELM_STALL_UNWEDGE_ENABLED") == "true",
-		labelerPath:             getenv("NODE_LABELER_CONFIG_PATH", "/etc/node-labeler/labels.txt"),
-		concourseJanitorEnabled: os.Getenv("CONCOURSE_JANITOR_ENABLED") == "true",
-		// The three ported patcher/watchdog CronJobs were always-on
-		// base components — default-ON here too (explicit "false"
-		// opts a cluster out), unlike the opt-in gates above.
-		corednsPatcherEnabled:        os.Getenv("COREDNS_PATCHER_ENABLED") != "false",
-		corednsZoneWhen:              getenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule"),
-		corednsZoneMinDomains:        getenvInt("COREDNS_PATCHER_ZONE_MIN_DOMAINS", 2),
-		corednsMinReplicas:           getenvInt("COREDNS_MIN_REPLICAS", 4),
-		corednsNodesPerReplica:       getenvInt("COREDNS_NODES_PER_REPLICA", 1),
-		metricsServerPatcherEnabled:  os.Getenv("METRICS_SERVER_PATCHER_ENABLED") != "false",
-		metricsServerMinReplicas:     getenvInt("METRICS_SERVER_MIN_REPLICAS", 3),
-		metricsServerNodesPerReplica: getenvInt("METRICS_SERVER_NODES_PER_REPLICA", 1),
-		cfTunnelWatchdogEnabled:      os.Getenv("CF_TUNNEL_WATCHDOG_ENABLED") != "false",
-		cfTunnelWatchdogNamespace: getenv("CF_TUNNEL_WATCHDOG_NAMESPACE",
-			"cloudflare-tunnel-system"),
-		cfTunnelWatchdogInterval: getenvDuration("CF_TUNNEL_WATCHDOG_INTERVAL",
-			5*time.Minute),
-		// The kuberhealthy checker Pods ran always-on — default-ON
-		// here too; the HEALTH_* check knobs are read inside the
-		// prober package (Setup).
-		clusterHealthProbesEnabled: os.Getenv("CLUSTER_HEALTH_PROBES_ENABLED") != "false",
-		// The self-healing / gray-failure defense modules default ON
-		// like the ported CronJobs — an explicit "false" opts a
-		// cluster out via the base-flags ConfigMap.
-		volumeAttachmentCleanerEnabled: os.Getenv("VOLUMEATTACHMENT_CLEANER_ENABLED") != "false",
-		pdbWatchdogEnabled:             os.Getenv("PDB_WATCHDOG_ENABLED") != "false",
-		certDriftAuditorEnabled:        os.Getenv("CERT_DRIFT_AUDITOR_ENABLED") != "false",
-		apiServiceGuardEnabled:         os.Getenv("APISERVICE_GUARD_ENABLED") != "false",
-		zombieSidecarReaperEnabled:     os.Getenv("ZOMBIE_SIDECAR_REAPER_ENABLED") != "false",
-		orphanEndpointSliceEnabled:     os.Getenv("ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED") != "false",
-		statefulSetRollerEnabled:       os.Getenv("STATEFULSET_ONDELETE_ROLLER_ENABLED") != "false",
-		veleroBackupAuditorEnabled:     os.Getenv("VELERO_BACKUP_AUDITOR_ENABLED") != "false",
-	}
-}
-
-// setupModules registers every node-ops module on the manager. The map
-// (not a slice) keeps registration order deliberately random — no
-// module may rely on another being wired first.
-func setupModules(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, mc moduleConfig) error {
-	log := ctrl.Log.WithName("main")
-	for name, setup := range map[string]func() error{
-		// kube-system component patchers and watchdogs.
-		"konnectivity-patcher":     func() error { return konnectivitypatcher.Setup(mgr, cs) },
-		"fluent-bit-config-roller": func() error { return fluentbitroller.Setup(mgr, cs, mc.fluentbitEnabled) },
-		"coredns-stale-watchdog":   func() error { return corednswatchdog.Setup(mgr, cs) },
-		"coredns-patcher": func() error {
-			return corednspatcher.Setup(mgr, cs,
-				mc.corednsPatcherEnabled, mc.corednsZoneWhen, mc.corednsZoneMinDomains,
-				mc.corednsMinReplicas, mc.corednsNodesPerReplica)
-		},
-		"metrics-server-patcher": func() error {
-			return metricsserverpatcher.Setup(mgr, cs, mc.metricsServerPatcherEnabled,
-				mc.metricsServerMinReplicas, mc.metricsServerNodesPerReplica)
-		},
-		"cf-tunnel-proxy-watchdog": func() error {
-			return cftunnelproxywatchdog.Setup(mgr, cs,
-				mc.cfTunnelWatchdogEnabled, mc.cfTunnelWatchdogNamespace,
-				mc.cfTunnelWatchdogInterval)
-		},
-		"statefulset-ondelete-roller": func() error {
-			return statefulsetroller.Setup(mgr, cs, mc.statefulSetRollerEnabled)
-		},
-
-		// Node lifecycle and health sweeps.
-		"cilium-taint-reaper":     func() error { return ciliumtaintreaper.Setup(mgr, cs, mc.ciliumEnabled) },
-		"descheduler-storm-gate":  func() error { return deschedulerstormgate.Setup(mgr, cs, dyn) },
-		"node-labeler":            func() error { return nodelabeler.Setup(mgr, cs, mc.labelerPath) },
-		"kubelet-liveness-reaper": func() error { return kubeletreaper.Setup(mgr, cs) },
-		"partition-pod-evictor":   func() error { return partitionevictor.Setup(mgr, cs) },
-		"dead-node-sweeper":       func() error { return deadnodesweeper.Setup(mgr, cs, dyn) },
-		"csr-watcher":             func() error { return csrwatcher.Setup(mgr, cs, mc.csrApproveEnabled) },
-		"pdb-deadlock-watchdog":   func() error { return pdbdeadlockwatchdog.Setup(mgr, cs, mc.pdbWatchdogEnabled) },
-
-		// apiserver integrity guards.
-		"admission-webhook-guard":  func() error { return webhookguard.Setup(mgr, cs, dyn) },
-		"apiserver-endpoint-guard": func() error { return apiserverendpointguard.Setup(mgr, cs) },
-		"apiservice-guard": func() error {
-			return apiserviceguard.Setup(mgr, cs, dyn, mc.apiServiceGuardEnabled)
-		},
-
-		// Resource cleanup sweeps.
-		"failed-jobs-janitor": func() error {
-			return failedjobsjanitor.Setup(mgr, cs, dyn)
-		},
-		"evicted-pod-janitor": func() error { return evictedpodjanitor.Setup(mgr, cs) },
-		"cronjob-catchup":     func() error { return cronjobcatchup.Setup(mgr, cs) },
-		"concourse-workdir-janitor": func() error {
-			return concoursejanitor.Setup(mgr, cs, dyn,
-				mc.concourseJanitorEnabled)
-		},
-		"volumeattachment-cleaner": func() error {
-			return volumeattachmentcleaner.Setup(mgr, cs, mc.volumeAttachmentCleanerEnabled)
-		},
-		"zombie-sidecar-reaper": func() error {
-			return zombiesidecarreaper.Setup(mgr, cs, dyn, mc.zombieSidecarReaperEnabled)
-		},
-		"orphan-endpointslice-cleaner": func() error {
-			return orphanendpointslicecleaner.Setup(mgr, cs, dyn, mc.orphanEndpointSliceEnabled)
-		},
-
-		// Third-party controller unstuckers (dynamic client /
-		// CRD types).
-		"helmrelease-unlocker": func() error {
-			return helmreleaseunlocker.Setup(mgr, cs, dyn, mc.helmStallUnwedgeEnabled)
-		},
-		"externalsecret-nudge":    func() error { return externalsecretnudge.Setup(mgr, cs, dyn, mc.esNudgeEnabled) },
-		"certmanager-reaper":      func() error { return certmanagerreaper.Setup(mgr, cs, dyn, mc.certReaperEnabled) },
-		"cilium-identity-auditor": func() error { return ciliumidentityauditor.Setup(mgr, cs, dyn, mc.ciliumAuditEnabled) },
-		"cert-drift-auditor": func() error {
-			return certdriftauditor.Setup(mgr, cs, dyn, mc.certDriftAuditorEnabled)
-		},
-		"velero-backup-auditor": func() error {
-			return velerobackupauditor.Setup(mgr, cs, dyn, mc.veleroBackupAuditorEnabled)
-		},
-
-		// Cluster health probes.
-		"cluster-health-probes": func() error {
-			return clusterhealthprobes.Setup(mgr, cs, dyn,
-				mc.clusterHealthProbesEnabled)
-		},
-	} {
-		if err := setup(); err != nil {
-			log.Error(err, "unable to setup module", "module", name)
-			return err
-		}
-	}
-	return nil
 }

@@ -470,8 +470,9 @@ func TestWebhookGuardPatchFailureReturnsError(t *testing.T) {
 // fixtures have no TLS server to dial anyway.
 func wgBreakerGuard(cs *fake.Clientset, now *time.Time) *webhookGuard {
 	return &webhookGuard{cs: cs,
-		nowFn:     func() time.Time { return *now },
-		deadSince: map[string]time.Time{},
+		nowFn: func() time.Time { return *now },
+		circuitBreaker: circuitBreaker{
+			deadSince: map[string]time.Time{}},
 		endpointProber: func(context.Context, string, int32) bool {
 			return true
 		}}
@@ -1228,7 +1229,9 @@ func TestTripThresholdSelection(t *testing.T) {
 	if got := g.tripThreshold(3); got != webhookPartitionedThreshold {
 		t.Fatalf("raw>0 threshold = %s, want %s", got, webhookPartitionedThreshold)
 	}
-	g = &webhookGuard{zeroThreshold: 7 * time.Minute, partitionZeroThreshold: 42 * time.Second}
+	g = &webhookGuard{circuitBreaker: circuitBreaker{
+		zeroThreshold:          7 * time.Minute,
+		partitionZeroThreshold: 42 * time.Second}}
 	if got := g.tripThreshold(0); got != 7*time.Minute {
 		t.Fatalf("zeroThreshold override ignored: %s", got)
 	}
@@ -1441,8 +1444,9 @@ func TestWebhookCircuitBreakerUnresponsiveTripsAndBounces(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	// endpointProber=false — every handshake fails: the pods are hung.
 	g := &webhookGuard{cs: cs,
-		nowFn:     func() time.Time { return now },
-		deadSince: map[string]time.Time{},
+		nowFn: func() time.Time { return now },
+		circuitBreaker: circuitBreaker{
+			deadSince: map[string]time.Time{}},
 		endpointProber: func(context.Context, string, int32) bool {
 			return false
 		}}
@@ -1517,8 +1521,9 @@ func TestWebhookCircuitBreakerResponsiveSkipsBounce(t *testing.T) {
 		mwc)
 	now := time.Unix(1_700_000_000, 0)
 	g := &webhookGuard{cs: cs,
-		nowFn:     func() time.Time { return now },
-		deadSince: map[string]time.Time{},
+		nowFn: func() time.Time { return now },
+		circuitBreaker: circuitBreaker{
+			deadSince: map[string]time.Time{}},
 		endpointProber: func(context.Context, string, int32) bool {
 			return true // at least one endpoint answers
 		}}

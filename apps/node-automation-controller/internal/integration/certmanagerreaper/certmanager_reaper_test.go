@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -162,7 +163,8 @@ func stuckFixture(ns, certName, orderName string) []runtime.Object {
 // ---------------------------------------------------------------------------
 
 func TestCertManagerReaperSetupDisabled(t *testing.T) {
-	if err := Setup(nil, nil, nil, false); err != nil {
+	t.Setenv("CERTMANAGER_REAPER_ENABLED", "false")
+	if err := Setup(shared.Deps{}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 }

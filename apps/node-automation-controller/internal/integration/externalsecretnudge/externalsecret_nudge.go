@@ -44,7 +44,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -83,18 +82,9 @@ var (
 // defaults spec.secretStoreRef.kind to the namespaced SecretStore,
 // which is the common shape on these clusters.
 var (
-	clusterSecretStoreGVRs = []schema.GroupVersionResource{
-		{Group: "external-secrets.io", Version: "v1", Resource: "clustersecretstores"},
-		{Group: "external-secrets.io", Version: "v1beta1", Resource: "clustersecretstores"},
-	}
-	secretStoreGVRs = []schema.GroupVersionResource{
-		{Group: "external-secrets.io", Version: "v1", Resource: "secretstores"},
-		{Group: "external-secrets.io", Version: "v1beta1", Resource: "secretstores"},
-	}
-	externalSecretGVRs = []schema.GroupVersionResource{
-		{Group: "external-secrets.io", Version: "v1", Resource: "externalsecrets"},
-		{Group: "external-secrets.io", Version: "v1beta1", Resource: "externalsecrets"},
-	}
+	clusterSecretStoreGVRs = shared.ClusterSecretStoreGVRs
+	secretStoreGVRs        = shared.SecretStoreGVRs
+	externalSecretGVRs     = shared.ExternalSecretGVRs
 )
 
 type externalSecretNudge struct {
@@ -123,19 +113,20 @@ type externalSecretNudge struct {
 	connectHealAt time.Time
 }
 
-// Setup registers the 10-minute sweep. With
-// enabled=false the tick only logs and returns nil — keeps the
-// signature/queue uniform across clusters with and without ESO.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface, dyn dynamic.Interface, enabled bool) error {
+// Setup registers the 10-minute sweep. With the module gate off
+// (EXTERNALSECRET_NUDGE_ENABLED != "true") the tick only logs and
+// returns nil — keeps the signature/queue uniform across clusters
+// with and without ESO.
+func Setup(d shared.Deps) error {
 	n := &externalSecretNudge{
-		cs:             cs,
-		dyn:            dyn,
-		enabled:        enabled,
+		cs:             d.CS,
+		dyn:            d.Dyn,
+		enabled:        shared.Gate("EXTERNALSECRET_NUDGE_ENABLED", false),
 		storeReady:     map[string]bool{},
 		nudged:         map[string]time.Time{},
 		storeDownSince: map[string]time.Time{},
 	}
-	return shared.AddPeriodic(mgr, esNudgeQueue, esNudgeInterval, n.run)
+	return shared.AddPeriodic(d.Mgr, esNudgeQueue, esNudgeInterval, n.run)
 }
 
 func (n *externalSecretNudge) run(ctx context.Context) error {
@@ -444,24 +435,24 @@ func (n *externalSecretNudge) esStoreReady(es *unstructured.Unstructured) bool {
 // a store. Refs without a name are genuinely absent; generator refs
 // (sourceRef.generatorRef) are not stores and never reach fn.
 func esStoreRefs(es *unstructured.Unstructured, fn func(name, kind string)) {
-	if name, _, _ := unstructured.NestedString(
-		es.Object, "spec", "secretStoreRef", "name"); name != "" {
-		kind, _, _ := unstructured.NestedString(
+	if name, ok := shared.NestedString(
+		es.Object, "spec", "secretStoreRef", "name"); ok && name != "" {
+		kind, _ := shared.NestedString(
 			es.Object, "spec", "secretStoreRef", "kind")
 		fn(name, kind)
 	}
 	// dataFrom[].sourceRef.storeRef and data[].sourceRef.storeRef are
 	// the same per-entry override shape under two parent lists.
 	for _, field := range []string{"dataFrom", "data"} {
-		entries, _, _ := unstructured.NestedSlice(es.Object, "spec", field)
+		entries, _ := shared.NestedSlice(es.Object, "spec", field)
 		for _, e := range entries {
 			m, ok := e.(map[string]any)
 			if !ok {
 				continue
 			}
-			if name, _, _ := unstructured.NestedString(
-				m, "sourceRef", "storeRef", "name"); name != "" {
-				kind, _, _ := unstructured.NestedString(
+			if name, ok := shared.NestedString(
+				m, "sourceRef", "storeRef", "name"); ok && name != "" {
+				kind, _ := shared.NestedString(
 					m, "sourceRef", "storeRef", "kind")
 				fn(name, kind)
 			}

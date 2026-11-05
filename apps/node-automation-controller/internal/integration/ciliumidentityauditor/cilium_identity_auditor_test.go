@@ -20,6 +20,7 @@ import (
 	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -87,7 +88,8 @@ func identityPod(ns, name, identityID string) *corev1.Pod {
 }
 
 func TestCiliumIdentityAuditorSetupDisabled(t *testing.T) {
-	if err := Setup(nil, nil, nil, false); err != nil {
+	t.Setenv("CILIUM_IDENTITY_AUDITOR_ENABLED", "false")
+	if err := Setup(shared.Deps{}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 }

@@ -50,7 +50,7 @@ func TestNamespaceTerminatingWedged(t *testing.T) {
 	cs := fake.NewSimpleClientset(wedged, fresh)
 	p := testProber(cs)
 
-	res := p.checkNamespaceTerminatingWedged(ctx)
+	res := p.nsWedged.run(ctx)
 	if res.pass {
 		t.Fatalf("wedged namespace must fail: %+v", res)
 	}
@@ -98,7 +98,7 @@ func TestMaybeStripFinalizersDeadOwner(t *testing.T) {
 	}, obj)
 	p := testProberDyn(cs, dyn)
 
-	if !p.maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if !p.nsWedged.maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
 		t.Fatal("dead-owner CR should be stripped")
 	}
 	got, err := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-1", metav1.GetOptions{})
@@ -138,7 +138,7 @@ func TestMaybeStripFinalizersLiveOwnerSkipped(t *testing.T) {
 	}, obj)
 	p := testProberDyn(cs, dyn)
 
-	if p.maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if p.nsWedged.maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
 		t.Fatal("live-owner CR must not be stripped")
 	}
 	got, _ := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-2", metav1.GetOptions{})
@@ -166,7 +166,7 @@ func TestMaybeStripFinalizersProtectedOnly(t *testing.T) {
 	}, obj)
 	p := testProberDyn(cs, dyn)
 
-	if p.maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if p.nsWedged.maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
 		t.Fatal("protected-only finalizers must never be stripped")
 	}
 }

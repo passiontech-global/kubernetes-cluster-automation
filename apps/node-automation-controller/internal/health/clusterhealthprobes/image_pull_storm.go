@@ -18,6 +18,9 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
+// imagePullStormCheck is the image-pull-storm watchdog.
+type imagePullStormCheck struct{ *deps }
+
 const (
 	checkNameImagePullStorm = "image-pull-storm"
 
@@ -65,7 +68,7 @@ func init() {
 // a workload problem (workload_image_pull_backoff); >=2 namespaces
 // or a registry-outage message marker is a cluster pull outage
 // (cluster_registry_pull_outage → ClusterImagePullStorm alert).
-func (p *clusterHealthProber) checkImagePullStorm(ctx context.Context) probeResult {
+func (p *imagePullStormCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	now := p.now()
 	pods, err := p.cs.CoreV1().Pods(metav1.NamespaceAll).
@@ -129,7 +132,7 @@ func (p *clusterHealthProber) checkImagePullStorm(ctx context.Context) probeResu
 		current[o.ns+"/"+o.name] = lv
 		imagePullBackoffPodsGauge.WithLabelValues(lv...).Set(1)
 	}
-	reconcileEmittedGauges(checkNameImagePullStorm,
+	p.reconcileEmittedGauges(checkNameImagePullStorm,
 		imagePullBackoffPodsGauge, current)
 	if len(namespaces) >= 2 {
 		outage = true

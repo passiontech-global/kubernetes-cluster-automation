@@ -35,11 +35,9 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
@@ -66,14 +64,10 @@ const (
 )
 
 var (
-	certificateGVR = schema.GroupVersionResource{
-		Group: "cert-manager.io", Version: "v1", Resource: "certificates"}
-	certificateRequestGVR = schema.GroupVersionResource{
-		Group: "cert-manager.io", Version: "v1", Resource: "certificaterequests"}
-	orderGVR = schema.GroupVersionResource{
-		Group: "acme.cert-manager.io", Version: "v1", Resource: "orders"}
-	challengeGVR = schema.GroupVersionResource{
-		Group: "acme.cert-manager.io", Version: "v1", Resource: "challenges"}
+	certificateGVR        = shared.GVRCertificate
+	certificateRequestGVR = shared.GVRCertificateRequest
+	orderGVR              = shared.GVRACMEOrder
+	challengeGVR          = shared.GVRACMEChallenge
 )
 
 // certReset is the per-certificate reset budget tracked in memory.
@@ -95,7 +89,7 @@ type certManagerReaper struct {
 	// nowFn is the clock seam — tests pin it so the pending/wedged
 	// windows, the renewal window and the hourly reset gap are
 	// deterministic. nil → time.Now.
-	nowFn func() time.Time
+	nowFn shared.Clock
 	// crReaped: cert key → last stuck-CertificateRequest delete —
 	// the 6h in-RAM half of the W8 CR-reap cooldown (the durable
 	// half shares node.ops/acme-order-resets).
@@ -115,9 +109,9 @@ type crListResult struct {
 
 // Setup registers the 15m sweep. Disabled clusters
 // (no cert-manager component / no ACME) skip registration entirely.
-func Setup(mgr ctrl.Manager, cs kubernetes.Interface,
-	dyn dynamic.Interface, enabled bool) error {
-	if !enabled {
+func Setup(d shared.Deps) error {
+	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
+	if !shared.Gate("CERTMANAGER_REAPER_ENABLED", false) {
 		logf.Log.WithName(certReaperQueue).Info("disabled — module not registered")
 		return nil
 	}
@@ -215,8 +209,8 @@ func certReady(cert *unstructured.Unstructured) bool {
 // have a stuck issuance worth resetting. cert-manager publishes the
 // next renewal under STATUS.renewalTime (spec carries no such field).
 func certNeedsReap(cert *unstructured.Unstructured, now time.Time) bool {
-	if conds, found, _ := unstructured.NestedSlice(
-		cert.Object, "status", "conditions"); found {
+	if conds, ok := shared.NestedSlice(
+		cert.Object, "status", "conditions"); ok {
 		for _, c := range conds {
 			m, ok := c.(map[string]interface{})
 			if !ok {
@@ -227,8 +221,8 @@ func certNeedsReap(cert *unstructured.Unstructured, now time.Time) bool {
 			}
 		}
 	}
-	if rt, found, _ := unstructured.NestedString(
-		cert.Object, "status", "renewalTime"); found {
+	if rt, ok := shared.NestedString(
+		cert.Object, "status", "renewalTime"); ok {
 		if t, err := time.Parse(time.RFC3339, rt); err == nil &&
 			!t.After(now.Add(certRenewalWindow)) {
 			return true
@@ -280,7 +274,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		if !orderOwnedByCert(o, name, crToCert) {
 			continue // not this cert's order — never ours to reap
 		}
-		if st, _, _ := unstructured.NestedString(o.Object, "status", "state"); st != "pending" {
+		if st, _ := shared.NestedString(o.Object, "status", "state"); st != "pending" {
 			continue
 		}
 		if now.Sub(o.GetCreationTimestamp().Time) <= orderPendingMinAge {
@@ -381,8 +375,8 @@ func certReadyFalse(cert *unstructured.Unstructured) bool {
 // next 14 days — an expiring cert with a wedged child CR is a renewal
 // that silently died.
 func certExpiringSoon(cert *unstructured.Unstructured, now time.Time) bool {
-	if v, found, _ := unstructured.NestedString(
-		cert.Object, "status", "notAfter"); found {
+	if v, ok := shared.NestedString(
+		cert.Object, "status", "notAfter"); ok {
 		if t, err := time.Parse(time.RFC3339, v); err == nil {
 			return t.Before(now.Add(certExpirySoonWin))
 		}
@@ -591,14 +585,14 @@ func stuckChallengeForOrder(order *unstructured.Unstructured,
 // status.lastTransitionTime when present (real objects do not carry
 // it — fixtures may), else creationTimestamp.
 func challengeWedged(ch *unstructured.Unstructured, now time.Time) bool {
-	presented, _, _ := unstructured.NestedBool(ch.Object, "status", "presented")
-	processing, _, _ := unstructured.NestedBool(ch.Object, "status", "processing")
+	presented, _ := shared.NestedBool(ch.Object, "status", "presented")
+	processing, _ := shared.NestedBool(ch.Object, "status", "processing")
 	if !presented || !processing {
 		return false
 	}
 	since := ch.GetCreationTimestamp().Time
-	if ts, found, _ := unstructured.NestedString(
-		ch.Object, "status", "lastTransitionTime"); found {
+	if ts, ok := shared.NestedString(
+		ch.Object, "status", "lastTransitionTime"); ok {
 		if t, err := time.Parse(time.RFC3339, ts); err == nil {
 			since = t
 		}

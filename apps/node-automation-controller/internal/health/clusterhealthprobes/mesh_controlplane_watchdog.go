@@ -20,6 +20,10 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
+// meshControlPlaneCheck is the W8 mesh control-plane watchdog —
+// cilium-operator / linkerd control-plane pod heals.
+type meshControlPlaneCheck struct{ *deps }
+
 const (
 	// W8-NM2/NM3 — mesh-controlplane-watchdog knobs.
 	checkNameMeshWatchdog  = "mesh-controlplane-watchdog"
@@ -52,7 +56,7 @@ const (
 //
 // Cooldowns live in the in-RAM ledger — the heal target is the pod
 // itself, nothing else can carry the stamp.
-func (p *clusterHealthProber) checkMeshControlPlane(ctx context.Context) probeResult {
+func (p *meshControlPlaneCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	now := p.now()
 	p.mu.Lock()
@@ -154,7 +158,7 @@ func linkerdPodWedged(pod *corev1.Pod, now time.Time) bool {
 // healComponentPod deletes one pod matching prefix in ns — the
 // generic W8-NM2 shape: same cooldown bookkeeping as every pod-delete
 // heal in this package.
-func (p *clusterHealthProber) healComponentPod(ctx context.Context, log logr.Logger,
+func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.Logger,
 	component, ns, prefix string, cooldown time.Duration, now time.Time) {
 	p.mu.Lock()
 	last, ok := p.meshHealed[component]
@@ -202,7 +206,7 @@ func (p *clusterHealthProber) healComponentPod(ctx context.Context, log logr.Log
 // checkMeshControlPlane calls this directly for the wedged linkerd
 // pods — every pod-delete heal defers while a drain/upgrade is in
 // flight, and "cannot verify" fails closed.
-func (p *clusterHealthProber) healNamedPod(ctx context.Context, log logr.Logger,
+func (p *meshControlPlaneCheck) healNamedPod(ctx context.Context, log logr.Logger,
 	component, key string, pod *corev1.Pod, cooldown time.Duration, now time.Time) {
 	p.mu.Lock()
 	last, ok := p.meshHealed[component]

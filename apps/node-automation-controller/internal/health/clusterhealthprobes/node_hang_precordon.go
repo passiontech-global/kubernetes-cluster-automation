@@ -21,6 +21,9 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 )
 
+// nodeHangCheck is the node-hang pre-cordon watchdog.
+type nodeHangCheck struct{ *deps }
+
 const (
 	// W8-ST2 — node-hang-precordon knobs.
 	checkNameNodeHang        = "node-hang-precordon"
@@ -114,7 +117,7 @@ func nodeHangLatchActive(n *corev1.Node) bool {
 // never inherit the auto-uncordon. The 35% cap stops the guard from
 // unnoding the fleet during a correlated event (bad kernel rollout,
 // storage backend outage).
-func (p *clusterHealthProber) checkNodeHangPreCordon(ctx context.Context) probeResult {
+func (p *nodeHangCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	now := p.now()
 	nodes, err := shared.ListNodes(ctx, p.cs)
