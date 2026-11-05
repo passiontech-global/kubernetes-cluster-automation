@@ -422,6 +422,31 @@ func (h *Hygiene) feederWatchdogConf() *watchdogconf.Config {
 	return h.cfg.Watchdog
 }
 
+// --- kubelet watchdog feeder + remediate (T15) ---
+// Port of scripts/k0s-kubelet-watchdog.sh + k0sworker-remediate.sh.
+// The shell feeder was a dedicated systemd unit (k0sworker-watchdog)
+// feeding WATCHDOG=1 into its own WatchdogSec and dying `exit 1`
+// after KWD_MAX_FAIL consecutive :10248 failures — OnFailure then ran
+// the remediate oneshot. In-agent there is no watchdog unit to feed:
+// the agent IS the loop — probe every KubeletWdInterval, and on
+// KubeletWdMaxFail consecutive fails (~60s) run the same ordered
+// gates inline, then re-arm like the unit's Restart=always.
+//
+// Remediate gates (k0sworker-remediate.sh order — every SKIP exits
+// without action; restart only when ALL agree):
+//   G0 re-probe :10248 twice ~3s apart → one "ok" = steal blip,
+//                                      self-correct (the shell's
+//                                      Gate-1, numbered G0 here so the
+//                                      existing G1–G6 strings stay)
+//   G1 uptime <1200s                 → fresh boot, kubelet still up-coming
+//   G2 k0sworker active <180s        → settle window (kubelet init)
+//   G3 state-node-overloaded latched → wedge is a load symptom
+//   G4 no API backend answers /livez → node isolated, restart = churn
+//   G5 last-restart <30m             → shared budget spent → latch
+//                                      state-kubelet-healthz-down so
+//                                      NHC→SNR escalates to reboot
+//   G6 spend budget + reset-failed + systemctl restart k0sworker
+
 // kubeletFeedTick is one feeder round: probe :10248, count fails, run
 // the remediate gates at MaxFail — k0s-kubelet-watchdog.sh's loop
 // body minus the sd_notify feed (no watchdog unit exists in-agent).
