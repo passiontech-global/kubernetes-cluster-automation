@@ -23,7 +23,6 @@ import (
 	"io/fs"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -34,6 +33,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
@@ -67,21 +67,30 @@ type Runner interface {
 
 // NsenterRunner enters PID 1 mount/uts/ipc/net/pid namespaces —
 // the same access community.docker.nsenter gave the ansible pod.
+// The flag set is hostexec.NSAll spelled out in argv: it is NOT
+// routed through hostexec.Runner because that would stack its own
+// Config.Timeout on top of the deadline runBudget already applied
+// to ctx — only the exec plumbing (capped output, WaitDelay) is
+// shared, via hostexec.RunCombined.
 type NsenterRunner struct{}
 
 func (NsenterRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	a := append([]string{"-t", "1", "-m", "-u", "-i", "-n", "-p", "--", name}, args...)
-	out, err := exec.CommandContext(ctx, "nsenter", a...).CombinedOutput()
-	return strings.TrimRight(string(out), "\n"), err
+	argv := append([]string{"nsenter", "-t", "1",
+		"-m", "-u", "-i", "-n", "-p", "--", name}, args...)
+	out, err := hostexec.RunCombined(ctx, argv...)
+	return strings.TrimRight(out, "\n"), err
 }
 
 // DirectRunner runs commands unwrapped — the standalone systemd
 // deployment (HostRoot "/") is already inside the host namespaces.
+// Same hostexec.RunCombined container-side exec as NsenterRunner,
+// minus the wrap.
 type DirectRunner struct{}
 
 func (DirectRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
-	return strings.TrimRight(string(out), "\n"), err
+	out, err := hostexec.RunCombined(ctx,
+		append([]string{name}, args...)...)
+	return strings.TrimRight(out, "\n"), err
 }
 
 // Watcher detects input changes (injectable for tests).
