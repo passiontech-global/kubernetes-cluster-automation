@@ -48,7 +48,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
 	"sync/atomic"
 	"time"
@@ -109,12 +108,6 @@ const (
 // into /etc/nebula/<net>/nebula-up.sh + the T5b ip-rule converge;
 // the guard re-adds a rule the kernel dropped.
 var defaultNebulaDirectTCPPorts = []int{22, 6443, 8132, 9443, 39901}
-
-// fileSuspectLog prefixes the suspectLog dedupe budgets:
-// last-suspect-<key> epoch files spent at most once per
-// suspectLogCadence — the same rateOK/last-* convention as the
-// action budgets, applied to log noise.
-const fileSuspectLog = "last-suspect-"
 
 // Config carries the nethealth knobs — all test-injectable. Per-node
 // values come from Watchdog (the parsed node-watchdog.conf); nil →
@@ -497,29 +490,20 @@ func (n *NetHealth) Cycle(ctx context.Context) {
 // is the single Store implementation of state_enter/state_exit,
 // rate_ok/rate_spend, the last-suspect-* dedupe budgets, the
 // watchdog log append and the last-run stamp (BUG-H1). Atomic file
-// writes go through platform/hostutil. What remains below is only
-// what Store does not cover: nethealth's stateExit divergence — the
-// whole last-suspect-* family resets with the latch.
+// writes go through platform/hostutil.
 
 // stateExit removes state-<name> if present and logs the
-// transition — clears the NPD permanent condition. The divergence
-// hoststate keeps behind Store.Exit's cleanup hook: the suspect-log
-// dedupe budgets drop with the latch — a later re-entry must log a
-// fresh first line, not stay throttled by a stale epoch from the
-// previous incident. That covers the latch-paired
-// last-suspect-<name>, and the whole rest of the family goes with
-// it: the NON-latch keys (egress-probe-<ip>, conntrack-parse,
-// clock-adjtimex, ...) have no state-* twin to exit with, so a
-// cleared condition would otherwise suppress the first line of a
-// re-incident for up to suspectLogCadence. No clean per-key pairing
-// exists — a latch exit IS an incident boundary, so the whole family
-// resets; a still-held condition pays at most one early re-log line.
+// transition — clears the NPD permanent condition — plus the
+// nethealth divergence, named on the Store:
+// Store.ExitClearAllSuspects drops the WHOLE last-suspect-* family
+// with the latch. The NON-latch keys (egress-probe-<ip>,
+// conntrack-parse, clock-adjtimex, ...) have no state-* twin to exit
+// with, so a cleared condition would otherwise suppress the first
+// line of a re-incident for up to suspectLogCadence — a latch exit
+// IS an incident boundary; a still-held condition pays at most one
+// early re-log line.
 func (n *NetHealth) stateExit(name string) {
-	n.state.Exit(name, func() {
-		for _, f := range n.egressFiles(fileSuspectLog) {
-			_ = os.Remove(f)
-		}
-	})
+	n.state.ExitClearAllSuspects(name)
 }
 
 // --- shared helpers ---
