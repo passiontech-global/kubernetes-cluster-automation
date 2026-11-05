@@ -51,7 +51,7 @@ func tlsDialCert(ctx context.Context, addr string) (*x509.Certificate, error) {
 // under the last-cp-cert-restart budget.
 func (h *Hygiene) checkPKIReloadDrift(ctx context.Context) {
 	anyDrift := false
-	for i, pair := range h.cfg.PKIDriftPairs {
+	for i, pair := range h.cfg.PKIDrift.Pairs {
 		ctr := fileCtrPKIDriftPre + strconv.Itoa(i)
 		disk, err := readLeafCert(pair.CertFile)
 		if err != nil {
@@ -73,7 +73,7 @@ func (h *Hygiene) checkPKIReloadDrift(ctx context.Context) {
 		}
 		anyDrift = true
 		n := h.state.Incr(ctr)
-		if n < h.cfg.PKIDriftCycles {
+		if n < h.cfg.PKIDrift.Cycles {
 			continue
 		}
 		h.state.Enter(statePKIReloadStale, fmt.Sprintf(
@@ -82,14 +82,14 @@ func (h *Hygiene) checkPKIReloadDrift(ctx context.Context) {
 			disk.NotAfter.UTC().Format(time.RFC3339),
 			sock.NotAfter.UTC().Format(time.RFC3339)))
 		if !h.state.RateOK(fileRatePKIRestart,
-			h.cfg.PKIRestartInterval) {
+			h.cfg.PKIDrift.RestartInterval) {
 			h.state.SuspectLog(statePKIReloadStale, fmt.Sprintf(
 				"suspect: cp-cert-reload-stale %s but in restart cooldown (<%dm), skip",
-				pair.CertFile, int(h.cfg.PKIRestartInterval.Minutes())),
+				pair.CertFile, int(h.cfg.PKIDrift.RestartInterval.Minutes())),
 				h.cfg.SuspectLogCadence)
 			continue
 		}
-		switch h.cfg.Sig13Mode {
+		switch h.cfg.Sig13.Mode {
 		case ModeEnforce:
 			h.state.AppendLog(fmt.Sprintf(
 				"ACTION: restarting %s - cp-cert-reload-stale %s newer than %s",

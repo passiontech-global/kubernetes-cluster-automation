@@ -57,6 +57,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 )
 
 // pvcNameRe is the last-deletion-belt name check — exactly pvc-<uuid>,
@@ -204,17 +206,7 @@ func (s *Sweeper) Name() string { return "sweeper" }
 // Run sweeps immediately, then every Interval until ctx is cancelled.
 // Matches the shell loop: first sweep at pod start, then sleep.
 func (s *Sweeper) Run(ctx context.Context) {
-	s.Sweep(ctx)
-	t := time.NewTicker(s.cfg.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s.Sweep(ctx)
-		}
-	}
+	cycle.Every("sweeper", s.cfg.Interval, s.Sweep).Run(ctx)
 }
 
 // usedBytes reports used bytes on the filesystem holding path via

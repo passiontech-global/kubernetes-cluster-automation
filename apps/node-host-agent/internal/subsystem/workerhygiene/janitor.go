@@ -50,14 +50,15 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
@@ -299,6 +300,7 @@ func (c *JanitorConfig) applyDefaults() {
 // Janitor runs the state-dir + systemd ghost sweeps on one ticker.
 type Janitor struct {
 	cfg     JanitorConfig
+	proc    procfs.FS              // /proc view bound to cfg.ProcRoot
 	state   *hoststate.Store       // shared watchdog-state contract (log appends)
 	cycles  *prometheus.CounterVec // check, result
 	actions *prometheus.CounterVec // check, action
@@ -307,7 +309,7 @@ type Janitor struct {
 // NewJanitor returns a Janitor and registers its metrics on reg.
 func NewJanitor(cfg JanitorConfig, reg prometheus.Registerer) (*Janitor, error) {
 	cfg.applyDefaults()
-	j := &Janitor{cfg: cfg}
+	j := &Janitor{cfg: cfg, proc: procfs.New(cfg.ProcRoot)}
 	// Now closes over the live config field — tests re-stub
 	// j.cfg.nowFn after NewJanitor returns (hoststate.New doc).
 	// The Log func keeps the "subsystem"="janitor" slog attr the old
@@ -342,20 +344,10 @@ func (j *Janitor) Run(ctx context.Context) {
 	if !j.cfg.Enabled {
 		// Constructed but disabled — idle instead of returning: the
 		// agent restarts a returned Run in a hot loop.
-		<-ctx.Done()
+		cycle.Idle(ctx)
 		return
 	}
-	j.Sweep(ctx)
-	t := time.NewTicker(j.cfg.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			j.Sweep(ctx)
-		}
-	}
+	cycle.Every("janitor", j.cfg.Interval, j.Sweep).Run(ctx)
 }
 
 // Sweep runs one round of all three cleanups. Order matters: the
@@ -502,12 +494,12 @@ func (j *Janitor) resetFailedUnit(ctx context.Context, unit, load, active string
 // process; anything else is logged `suspect:` and skipped.
 func (j *Janitor) sweepIPMonitors() {
 	for _, pid := range j.procPIDs() {
-		argv := j.procCmdline(pid)
+		argv := j.proc.Cmdline(pid)
 		if !isIPMonitorArgv(argv) {
 			continue
 		}
 		cmdline := strings.Join(argv, " ")
-		ppid, ok := j.procPPID(pid)
+		ppid, ok := j.proc.PPID(pid)
 		if !ok {
 			j.state.AppendLog(fmt.Sprintf(
 				"suspect: ip monitor pid=%d (%s) — ppid unreadable, skipping",
@@ -518,7 +510,7 @@ func (j *Janitor) sweepIPMonitors() {
 			j.killIPMonitor(pid, cmdline, "reparented to init")
 			continue
 		}
-		parent := strings.Join(j.procCmdline(ppid), " ")
+		parent := strings.Join(j.proc.Cmdline(ppid), " ")
 		switch {
 		case parent == "":
 			// Parent exited mid-scan — the kernel reparents the
@@ -595,62 +587,19 @@ func isLegacyProcCmdline(cmdline string) bool {
 }
 
 // --- /proc helpers (hostPID: pod /proc == host /proc) ---
+// The reads themselves live in platform/procfs (j.proc); only the
+// logging wrapper below remains.
 
-// procPIDs lists the numeric pid dirs under ProcRoot. An unreadable
-// root is logged — a silent nil would make the monitor sweep no-op
-// invisibly.
+// procPIDs lists the numeric pid dirs under ProcRoot via procfs.
+// An unreadable root is logged — a silent nil would make the
+// monitor sweep no-op invisibly.
 func (j *Janitor) procPIDs() []int {
-	entries, err := os.ReadDir(j.cfg.ProcRoot)
+	pids, err := j.proc.PIDs()
 	if err != nil {
 		j.state.AppendLog(fmt.Sprintf(
 			"janitor: proc root %s unreadable: %v — ip monitor sweep skipped",
 			j.cfg.ProcRoot, err))
 		return nil
 	}
-	var pids []int
-	for _, e := range entries {
-		if !e.IsDir() || !pidDirRe.MatchString(e.Name()) {
-			continue
-		}
-		if pid, err := strconv.Atoi(e.Name()); err == nil {
-			pids = append(pids, pid)
-		}
-	}
 	return pids
-}
-
-// procCmdline returns the argv of pid (NUL-separated in /proc).
-func (j *Janitor) procCmdline(pid int) []string {
-	data, err := os.ReadFile(filepath.Join(
-		j.cfg.ProcRoot, strconv.Itoa(pid), "cmdline"))
-	if err != nil {
-		return nil
-	}
-	return strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
-}
-
-// procPPID returns the parent pid from /proc/<pid>/stat field 4 — the
-// field sits right after the comm field, parsed after the LAST ')'
-// because comm can contain spaces and parens (same trick as
-// Hygiene.pidLive).
-func (j *Janitor) procPPID(pid int) (int, bool) {
-	data, err := os.ReadFile(filepath.Join(
-		j.cfg.ProcRoot, strconv.Itoa(pid), "stat"))
-	if err != nil {
-		return 0, false
-	}
-	s := string(data)
-	i := strings.LastIndexByte(s, ')')
-	if i < 0 {
-		return 0, false
-	}
-	f := strings.Fields(s[i+1:])
-	if len(f) < 2 { // f[0]=state, f[1]=ppid
-		return 0, false
-	}
-	ppid, err := strconv.Atoi(f[1])
-	if err != nil || ppid < 0 {
-		return 0, false
-	}
-	return ppid, true
 }

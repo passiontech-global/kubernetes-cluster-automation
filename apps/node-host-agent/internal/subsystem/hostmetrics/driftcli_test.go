@@ -1,40 +1,64 @@
 package hostmetrics
 
 import (
-	"bytes"
 	"path/filepath"
-	"strings"
+	"slices"
 	"testing"
 )
 
-// driftCLI runs RunK0sDriftCLI against temp files and returns
-// (exit code, output).
-func driftCLI(t *testing.T, unit, config string) (int, string) {
-	t.Helper()
-	var out bytes.Buffer
-	code := RunK0sDriftCLI(K0sDriftConfig{
-		ConfigFile: config,
-		UnitFile:   unit,
-	}, &out)
-	return code, out.String()
+// findingKeys returns the keys of every finding with the given
+// reason, in scan order.
+func findingKeys(scan K0sDriftScan, reason string) []string {
+	var out []string
+	for _, f := range scan.Findings {
+		if f.Reason == reason {
+			out = append(out, f.Key)
+		}
+	}
+	return out
 }
 
-func TestRunK0sDriftCLIClean(t *testing.T) {
+func TestScanK0sDriftNotAController(t *testing.T) {
+	dir := t.TempDir()
+	// No unit file → the gate skips the check entirely (worker
+	// nodes carry a differently-shaped k0s.yaml — running there
+	// would report phantom missing-key drift).
+	scan := ScanK0sDrift(K0sDriftConfig{
+		ConfigFile: filepath.Join(dir, "k0s.yaml"),
+		UnitFile:   filepath.Join(dir, "k0scontroller.service"),
+	})
+	if !scan.NotController {
+		t.Fatal("NotController=false want true (unit file absent)")
+	}
+	if len(scan.Findings) != 0 {
+		t.Fatalf("findings=%v want none", scan.Findings)
+	}
+}
+
+func TestScanK0sDriftClean(t *testing.T) {
 	dir := t.TempDir()
 	unit := filepath.Join(dir, "k0scontroller.service")
 	config := filepath.Join(dir, "k0s.yaml")
 	write(t, unit, "[Unit]\n")
 	write(t, config, k0sCleanYAML())
-	code, out := driftCLI(t, unit, config)
-	if code != 0 {
-		t.Fatalf("exit=%d want 0:\n%s", code, out)
+	scan := ScanK0sDrift(K0sDriftConfig{
+		ConfigFile: config,
+		UnitFile:   unit,
+	})
+	if scan.NotController {
+		t.Fatal("NotController=true want false")
 	}
-	if !strings.Contains(out, "check-k0s-drift: OK") {
-		t.Fatalf("missing OK line:\n%s", out)
+	if len(scan.Findings) != 0 {
+		t.Fatalf("findings=%v want none", scan.Findings)
+	}
+	// The normalized config echoes the resolved paths back for the
+	// CLI's report lines.
+	if scan.Config.ConfigFile != config || scan.Config.UnitFile != unit {
+		t.Fatalf("normalized config=%+v", scan.Config)
 	}
 }
 
-func TestRunK0sDriftCLIFindings(t *testing.T) {
+func TestScanK0sDriftFindings(t *testing.T) {
 	dir := t.TempDir()
 	unit := filepath.Join(dir, "k0scontroller.service")
 	config := filepath.Join(dir, "k0s.yaml")
@@ -42,26 +66,26 @@ func TestRunK0sDriftCLIFindings(t *testing.T) {
 	// Removed flag + a bogus extra key inside the otherwise-clean set.
 	write(t, config,
 		k0sCleanYAML("concurrent-service-syncs", "bogus-extra-flag"))
-	code, out := driftCLI(t, unit, config)
-	if code != 1 {
-		t.Fatalf("exit=%d want 1:\n%s", code, out)
+	scan := ScanK0sDrift(K0sDriftConfig{
+		ConfigFile: config,
+		UnitFile:   unit,
+	})
+	if got := findingKeys(scan, "removed-flag"); !slices.Equal(got,
+		[]string{"concurrent-service-syncs"}) {
+		t.Fatalf("removed-flag=%v", got)
 	}
-	for _, want := range []string{
-		"REMOVED-FLAG", "'concurrent-service-syncs'",
-		"bogus-extra-flag",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("output missing %q:\n%s", want, out)
-		}
+	if got := findingKeys(scan, "extra-key"); !slices.Equal(got,
+		[]string{"bogus-extra-flag"}) {
+		t.Fatalf("extra-key=%v", got)
 	}
 	// The removed flag must not double-report as an extra key.
-	if strings.Contains(out,
-		"not in expected set: concurrent-service-syncs") {
-		t.Fatalf("removed flag double-counted as extra:\n%s", out)
+	if slices.Contains(findingKeys(scan, "extra-key"),
+		"concurrent-service-syncs") {
+		t.Fatalf("removed flag double-counted as extra: %+v", scan.Findings)
 	}
 }
 
-func TestRunK0sDriftCLIMissingKey(t *testing.T) {
+func TestScanK0sDriftMissingKey(t *testing.T) {
 	dir := t.TempDir()
 	unit := filepath.Join(dir, "k0scontroller.service")
 	config := filepath.Join(dir, "k0s.yaml")
@@ -69,77 +93,71 @@ func TestRunK0sDriftCLIMissingKey(t *testing.T) {
 	write(t, config,
 		"apiVersion: k0s.k0sproject.io/v1beta1\nkind: ClusterConfig\n"+
 			"spec:\n  controllerManager:\n    extraArgs: {}\n")
-	code, out := driftCLI(t, unit, config)
-	if code != 1 {
-		t.Fatalf("exit=%d want 1:\n%s", code, out)
+	scan := ScanK0sDrift(K0sDriftConfig{
+		ConfigFile: config,
+		UnitFile:   unit,
+	})
+	missing := findingKeys(scan, "missing-key")
+	if !slices.Contains(missing, "kube-api-qps") {
+		t.Fatalf("missing-key findings lack kube-api-qps: %v", missing)
 	}
-	if !strings.Contains(out, "missing on node:") ||
-		!strings.Contains(out, "kube-api-qps") {
-		t.Fatalf("missing-key line absent:\n%s", out)
+	if len(missing) != len(defaultExpectedKCMArgs) {
+		t.Fatalf("missing-key count=%d want %d (all expected keys)",
+			len(missing), len(defaultExpectedKCMArgs))
 	}
 }
 
-func TestRunK0sDriftCLIUnreadable(t *testing.T) {
+func TestScanK0sDriftUnreadable(t *testing.T) {
 	dir := t.TempDir()
 	unit := filepath.Join(dir, "k0scontroller.service")
 	config := filepath.Join(dir, "k0s.yaml")
 	write(t, unit, "[Unit]\n")
-	// Missing file → unreadable drift.
-	code, out := driftCLI(t, unit, config)
-	if code != 1 || !strings.Contains(out, "DRIFT") {
-		t.Fatalf("missing file: exit=%d:\n%s", code, out)
+	// Missing file → unreadable finding.
+	scan := ScanK0sDrift(K0sDriftConfig{
+		ConfigFile: config,
+		UnitFile:   unit,
+	})
+	if got := findingKeys(scan, "unreadable"); !slices.Equal(got,
+		[]string{"k0s.yaml"}) {
+		t.Fatalf("missing file: unreadable=%v", got)
 	}
 	// Unparseable → same finding.
 	write(t, config, "  {not: [valid: yaml\n")
-	code, out = driftCLI(t, unit, config)
-	if code != 1 || !strings.Contains(out, "DRIFT") {
-		t.Fatalf("unparseable: exit=%d:\n%s", code, out)
+	scan = ScanK0sDrift(K0sDriftConfig{
+		ConfigFile: config,
+		UnitFile:   unit,
+	})
+	if got := findingKeys(scan, "unreadable"); !slices.Equal(got,
+		[]string{"k0s.yaml"}) {
+		t.Fatalf("unparseable: unreadable=%v", got)
 	}
 }
 
-func TestRunK0sDriftCLINotAController(t *testing.T) {
-	dir := t.TempDir()
-	// No unit file → the gate skips the check entirely (worker
-	// nodes carry a differently-shaped k0s.yaml — running there
-	// would report phantom missing-key drift).
-	code, out := driftCLI(t,
-		filepath.Join(dir, "k0scontroller.service"),
-		filepath.Join(dir, "k0s.yaml"))
-	if code != 0 {
-		t.Fatalf("exit=%d want 0:\n%s", code, out)
-	}
-	if !strings.Contains(out, "not a k0s controller") {
-		t.Fatalf("missing skip line:\n%s", out)
-	}
-}
-
-func TestRunK0sDriftCLICustomSets(t *testing.T) {
+func TestScanK0sDriftCustomSets(t *testing.T) {
 	dir := t.TempDir()
 	unit := filepath.Join(dir, "k0scontroller.service")
 	config := filepath.Join(dir, "k0s.yaml")
 	write(t, unit, "[Unit]\n")
 	write(t, config,
 		"spec:\n  controllerManager:\n    extraArgs:\n      a: \"1\"\n      dead-flag: \"2\"\n")
-	var out bytes.Buffer
-	code := RunK0sDriftCLI(K0sDriftConfig{
+	scan := ScanK0sDrift(K0sDriftConfig{
 		ConfigFile:   config,
 		UnitFile:     unit,
 		ExpectedKeys: []string{"a", "b"},
 		RemovedFlags: []string{"dead-flag"},
-	}, &out)
-	if code != 1 {
-		t.Fatalf("exit=%d want 1:\n%s", code, out.String())
-	}
-	got := out.String()
-	if !strings.Contains(got, "'dead-flag'") {
-		t.Fatalf("custom removed flag not flagged:\n%s", got)
+	})
+	if got := findingKeys(scan, "removed-flag"); !slices.Equal(got,
+		[]string{"dead-flag"}) {
+		t.Fatalf("custom removed flag not flagged: %v", got)
 	}
 	// "a" present → only "b" is missing.
-	if !strings.Contains(got, "missing on node: b") {
-		t.Fatalf("missing-key b absent:\n%s", got)
+	if got := findingKeys(scan, "missing-key"); !slices.Equal(got,
+		[]string{"b"}) {
+		t.Fatalf("missing-key=%v want [b]", got)
 	}
 	// The default removed flag must not fire when overridden.
-	if strings.Contains(got, "concurrent-service-syncs") {
-		t.Fatalf("default removed flag leaked:\n%s", got)
+	if slices.Contains(findingKeys(scan, "removed-flag"),
+		"concurrent-service-syncs") {
+		t.Fatalf("default removed flag leaked: %+v", scan.Findings)
 	}
 }

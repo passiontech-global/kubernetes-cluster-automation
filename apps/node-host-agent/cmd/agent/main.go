@@ -109,9 +109,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/apiprober"
 )
 
 var version = "dev"
@@ -146,60 +144,6 @@ func envInt(key string, def int) int {
 func envInt64(key string, def int64) int64 {
 	if v, err := strconv.ParseInt(os.Getenv(key), 10, 64); err == nil {
 		return v
-	}
-	return def
-}
-
-// envOr is the env → conf → consumer-default chain for string knobs:
-// an unset env falls through to the conf value (which may itself be
-// empty — the package default then applies).
-func envOr(key, confVal string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return confVal
-}
-
-// orStr returns a unless empty — the conf → compiled-default tail of
-// the fallback chains.
-func orStr(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
-}
-
-// envIntOr is env → conf-int → def for int knobs (conf ints are raw
-// counts; 0 = unset).
-func envIntOr(key string, confVal, def int) int {
-	if os.Getenv(key) != "" {
-		return envInt(key, def)
-	}
-	if confVal > 0 {
-		return confVal
-	}
-	return def
-}
-
-// envInt64Or is env → conf-int64 → def for int64 knobs.
-func envInt64Or(key string, confVal, def int64) int64 {
-	if os.Getenv(key) != "" {
-		return envInt64(key, def)
-	}
-	if confVal > 0 {
-		return confVal
-	}
-	return def
-}
-
-// envDurOr is env → conf-seconds → def for duration knobs (conf
-// carries bare seconds like the shell *_S knobs).
-func envDurOr(key string, confSeconds int, def time.Duration) time.Duration {
-	if os.Getenv(key) != "" {
-		return envDuration(key, def)
-	}
-	if confSeconds > 0 {
-		return time.Duration(confSeconds) * time.Second
 	}
 	return def
 }
@@ -247,23 +191,6 @@ func envList(key string) []string {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}
-	}
-	return out
-}
-
-// envIntList parses a comma-separated env var of ints; unset/empty →
-// nil (the consumer applies its own defaults). Non-numeric entries
-// are skipped.
-func envIntList(key string) []int {
-	var out []int
-	for _, p := range envList(key) {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			logger().Warn("non-numeric env list entry ignored",
-				"env", key, "value", p)
-			continue
-		}
-		out = append(out, n)
 	}
 	return out
 }
@@ -318,92 +245,6 @@ var kubeClient = func() (kubernetes.Interface, error) {
 			30*time.Second)
 	}
 	return kubernetes.NewForConfig(cfg)
-}
-
-// periodic adapts a plain cycle func to the agent.Subsystem contract:
-// run immediately, then every interval until ctx is cancelled.
-type periodic struct {
-	name     string
-	interval time.Duration
-	fn       func(ctx context.Context)
-}
-
-func (p periodic) Name() string { return p.name }
-
-func (p periodic) Run(ctx context.Context) {
-	p.fn(ctx)
-	t := time.NewTicker(p.interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			p.fn(ctx)
-		}
-	}
-}
-
-// kubeletWatchdogHosts resolves workerhygiene's T15 opt-in list:
-// NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS → systemd_watchdog_hosts in
-// cluster.yaml (topology.Load over the vars dir). A missing/broken
-// vars dir yields nil — the feeder self-gates on k0sworker.service,
-// so the list is advisory.
-func kubeletWatchdogHosts(varsDir, nodeName string) []string {
-	if l := envList("NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS"); l != nil {
-		return l
-	}
-	t, err := topology.Load(topology.Config{VarsDir: varsDir, NodeName: nodeName})
-	if err != nil {
-		return nil
-	}
-	return t.Vars.StrList("systemd_watchdog_hosts")
-}
-
-// proberInputs is the resolved env → guard.conf → default layer for
-// the apiprober knobs the standalone conf may carry. Extracted so
-// tests can assert the precedence chain without standing a prober up.
-type proberInputs struct {
-	socket     string
-	backend    string
-	companions []string
-	static     []apiprober.StaticBackend
-	mode       string
-	tokenFile  string
-	caFile     string
-}
-
-func resolveProberInputs(wdCfg *watchdogconf.Config,
-	g apiprober.GuardDefaults) proberInputs {
-
-	var static []apiprober.StaticBackend
-	switch {
-	case len(g.StaticBackends) > 0:
-		static = g.StaticBackends
-	default:
-		for _, b := range wdCfg.APIBackends {
-			static = append(static,
-				apiprober.StaticBackend{Name: b.Name, Addr: b.Addr})
-		}
-	}
-	companions := envList("NODE_HOST_AGENT_APIPROBER_COMPANION_BACKENDS")
-	if companions == nil {
-		companions = g.CompanionBackends
-	}
-	return proberInputs{
-		socket: envOr("NODE_HOST_AGENT_APIPROBER_SOCKET",
-			orStr(g.SocketPath, "/run/api-local-lb-admin.sock")),
-		backend: envOr("NODE_HOST_AGENT_APIPROBER_BACKEND",
-			orStr(g.BackendName, "api_local_back")),
-		companions: companions,
-		static:     static,
-		mode: envOr("NODE_HOST_AGENT_APIPROBER_MODE",
-			orStr(g.Mode, apiprober.ModeDryRun)),
-		tokenFile: envOr("NODE_HOST_AGENT_APIPROBER_TOKEN_FILE",
-			orStr(g.TokenFile, "/var/run/secrets/kubernetes.io/serviceaccount/token")),
-		caFile: envOr("NODE_HOST_AGENT_APIPROBER_CA_FILE",
-			orStr(g.CAFile, "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")),
-	}
 }
 
 // buildAgentConfig wires the environment into an agent.Config: one

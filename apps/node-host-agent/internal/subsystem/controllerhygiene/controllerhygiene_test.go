@@ -122,19 +122,22 @@ func fixture(t *testing.T) *env {
 		WatchdogLogFile:       filepath.Join(root, "watchdog.log"),
 		ProcRoot:              e.proc,
 		K0sControllerUnitFile: e.unit,
-		SelfEndpoint:          "127.0.0.1:6443",
-		SelfAPI:               "10.0.0.1:6443",
-		PeerAPI:               "10.0.0.2:6443",
-		AdminKubeconfig:       filepath.Join(root, "missing-admin.conf"),
-		AdminCert:             filepath.Join(root, "missing-admin.crt"),
-		CGroupEventsFile:      e.cg,
-		FeederStateDir:        e.fstate,
-		RemediatePeerFile:     filepath.Join(root, "peer.conf"),
-		Sig13Mode:             ModeEnforce,
-		KineTTLMode:           ModeEnforce,
-		KinePoolMode:          ModeEnforce,
-		OOMLoopMode:           ModeEnforce,
-		JournalDirs:           []string{e.jdir},
+		Hub: HubConfig{
+			SelfEndpoint: "127.0.0.1:6443",
+			SelfAPI:      "10.0.0.1:6443",
+			PeerAPI:      "10.0.0.2:6443",
+		},
+		AdminKubeconfig: filepath.Join(root, "missing-admin.conf"),
+		AdminCert:       filepath.Join(root, "missing-admin.crt"),
+		OOMLoop:         OOMLoopConfig{Mode: ModeEnforce, CGroupEventsFile: e.cg},
+		Feeder: FeederConfig{
+			StateDir:          e.fstate,
+			RemediatePeerFile: filepath.Join(root, "peer.conf"),
+		},
+		Sig13:       Sig13Config{Mode: ModeEnforce},
+		KineTTL:     KineTTLConfig{Mode: ModeEnforce},
+		KinePool:    KinePoolConfig{Mode: ModeEnforce},
+		JournalDirs: []string{e.jdir},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -356,7 +359,7 @@ func TestGapWedgePeerStaleHeld(t *testing.T) {
 func TestFrozenWedgeSoloAfterCycles(t *testing.T) {
 	e := fixture(t)
 	self := "127.0.0.1:6443"
-	e.h.cfg.PeerAPI = "" // single-hub => always first
+	e.h.cfg.Hub.PeerAPI = "" // single-hub => always first
 	rvN := int64(100)
 	// rv_cache frozen at 50 while rv_now grows — the first cycle
 	// only seeds last-rvc, so FrozenCycles=2 trips on cycle 3.
@@ -420,8 +423,8 @@ func TestRecoveryClearsWedge(t *testing.T) {
 
 func TestDeadFallbackKineOK(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.PeerAPI = "" // single hub
-	e.h.cfg.KineDBProbe = "10.0.0.9:6432"
+	e.h.cfg.Hub.PeerAPI = "" // single hub
+	e.h.cfg.Hub.KineDBProbe = "10.0.0.9:6432"
 	e.journal = "x required revision has been compacted\n" // cache_errs > 0
 	// Both queries dead, DB healthy → dead-fallback after SoloCycles.
 	for i := 0; i < 9 && e.rstN() == 0; i++ {
@@ -437,7 +440,7 @@ func TestDeadFallbackKineOK(t *testing.T) {
 
 func TestDeadFallbackKineDead(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.KineDBProbe = "10.0.0.9:6432"
+	e.h.cfg.Hub.KineDBProbe = "10.0.0.9:6432"
 	e.journal = "x required revision has been compacted\n"
 	e.pgOK = false // DB broken → apiserver restart is useless
 	for i := 0; i < 12; i++ {
@@ -454,8 +457,8 @@ func TestDeadFallbackKineDead(t *testing.T) {
 func TestSecondHubNeverSolo(t *testing.T) {
 	e := fixture(t)
 	// Self sorts AFTER peer → second hub.
-	e.h.cfg.SelfAPI = "10.0.0.9:6443"
-	e.h.cfg.PeerAPI = "10.0.0.2:6443"
+	e.h.cfg.Hub.SelfAPI = "10.0.0.9:6443"
+	e.h.cfg.Hub.PeerAPI = "10.0.0.2:6443"
 	self := "127.0.0.1:6443"
 	e.setRV(self, false, 90000, true)
 	e.setRV(self, true, 5000, true)
@@ -592,7 +595,7 @@ func TestOOMModeOffUnshields(t *testing.T) {
 	}
 	// Mode flips off while the loop is still in-window — the shield
 	// must come off, not persist for the process's lifetime.
-	e.h.cfg.OOMLoopMode = ModeOff
+	e.h.cfg.OOMLoop.Mode = ModeOff
 	writeEvents(t, e, 4)
 	e.h.Cycle(context.Background())
 	if v := readAdj(t, e, 2001); v != "0" {
@@ -641,7 +644,7 @@ func TestOOMShieldSkippedWhenLatchUnwritable(t *testing.T) {
 	writeEvents(t, e, 0)
 	e.h.Cycle(context.Background())
 	for _, pid := range []int{2001, 2002} {
-		if _, err := os.Stat(e.h.procFile(pid, "oom_score_adj")); err == nil {
+		if _, err := os.Stat(e.h.proc.File(pid, "oom_score_adj")); err == nil {
 			t.Fatalf("pid %d shielded without a persisted latch", pid)
 		}
 	}
@@ -716,13 +719,13 @@ func TestTTLRewedgeLoopSuppressesFastKill(t *testing.T) {
 // control: we expose the body via a context cancelled after n feeds.
 func TestFeederGraceThenFail(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.FeederEnabled = true
-	e.h.cfg.FeedInterval = time.Millisecond
+	e.h.cfg.Feeder.Enabled = true
+	e.h.cfg.Feeder.Interval = time.Millisecond
 	e.props["k0scontroller.service:MainPID"] = "4242"
 	e.active["k0scontroller.service"] = "active"
 	// G3 passes: unit started long ago.
 	e.setUnitStart("k0scontroller.service", time.Hour)
-	e.alive[e.h.cfg.FeedProbeURL] = false
+	e.alive[e.h.cfg.Feeder.ProbeURL] = false
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -763,12 +766,12 @@ func remediateLogged(e *env) bool {
 
 func TestFeederFailPathRestarts(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.FeederEnabled = true
-	e.h.cfg.FeedInterval = time.Millisecond
+	e.h.cfg.Feeder.Enabled = true
+	e.h.cfg.Feeder.Interval = time.Millisecond
 	e.props["k0scontroller.service:MainPID"] = "4242"
 	e.active["k0scontroller.service"] = "active"
 	e.setUnitStart("k0scontroller.service", time.Hour)
-	e.alive[e.h.cfg.FeedProbeURL] = false
+	e.alive[e.h.cfg.Feeder.ProbeURL] = false
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -792,11 +795,11 @@ func TestFeederFailPathRestarts(t *testing.T) {
 
 func TestFeederFeedsWhileAlive(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.FeederEnabled = true
-	e.h.cfg.FeedInterval = time.Millisecond
+	e.h.cfg.Feeder.Enabled = true
+	e.h.cfg.Feeder.Interval = time.Millisecond
 	e.props["k0scontroller.service:MainPID"] = "4242"
 	e.active["k0scontroller.service"] = "active"
-	e.alive[e.h.cfg.FeedProbeURL] = true
+	e.alive[e.h.cfg.Feeder.ProbeURL] = true
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -821,7 +824,7 @@ func TestFeederFeedsWhileAlive(t *testing.T) {
 func TestRemediateG1PassNoRestart(t *testing.T) {
 	e := fixture(t)
 	e.active["k0scontroller.service"] = "active"
-	e.alive[e.h.cfg.FeedProbeURL] = true // re-probe says alive
+	e.alive[e.h.cfg.Feeder.ProbeURL] = true // re-probe says alive
 	e.h.runRemediate(context.Background())
 	if e.rstN() != 0 {
 		t.Fatal("G1 false-alarm still restarted")
@@ -832,7 +835,7 @@ func TestRemediateG5RateLimited(t *testing.T) {
 	e := fixture(t)
 	e.active["k0scontroller.service"] = "active"
 	e.setUnitStart("k0scontroller.service", time.Hour)
-	e.alive[e.h.cfg.FeedProbeURL] = false
+	e.alive[e.h.cfg.Feeder.ProbeURL] = false
 	// Fresh budget: last restart just now.
 	h := e.h
 	h.state.WriteEpochFile(filepath.Join(e.fstate, fileFeederLastRst),
@@ -847,7 +850,7 @@ func TestPeerAPIServerCRLF(t *testing.T) {
 	e := fixture(t)
 	// A CRLF peer file must not leave '\r' glued to the URL — the
 	// peer probe against the garbage URL always read dead.
-	writeFile(t, e.h.cfg.RemediatePeerFile,
+	writeFile(t, e.h.cfg.Feeder.RemediatePeerFile,
 		"PEER_APISERVER=\"https://10.0.0.2:6443\"\r\n")
 	if got := e.h.peerAPIServer(); got != "https://10.0.0.2:6443" {
 		t.Fatalf("peerAPIServer=%q want https://10.0.0.2:6443", got)
@@ -965,7 +968,7 @@ func TestRemediateMarksBudgetBeforeRestart(t *testing.T) {
 	e := fixture(t)
 	e.active["k0scontroller.service"] = "active"
 	e.setUnitStart("k0scontroller.service", time.Hour)
-	e.alive[e.h.cfg.FeedProbeURL] = false
+	e.alive[e.h.cfg.Feeder.ProbeURL] = false
 	// restartFn asserts the G5 budget file ALREADY exists when the
 	// restart executes — a mid-restart kill must not leave it unspent.
 	e.h.cfg.restartFn = func(_ context.Context, unit string) error {
@@ -987,7 +990,7 @@ func TestRemediateCreatesFeederStateDir(t *testing.T) {
 	e := fixture(t)
 	e.active["k0scontroller.service"] = "active"
 	e.setUnitStart("k0scontroller.service", time.Hour)
-	e.alive[e.h.cfg.FeedProbeURL] = false
+	e.alive[e.h.cfg.Feeder.ProbeURL] = false
 	if err := os.RemoveAll(e.fstate); err != nil {
 		t.Fatal(err)
 	}
@@ -1005,8 +1008,8 @@ func TestSelfAPIStaysEmptyWhenUnset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.cfg.SelfAPI != "" {
-		t.Fatalf("SelfAPI=%q want empty (no loopback default)", h.cfg.SelfAPI)
+	if h.cfg.Hub.SelfAPI != "" {
+		t.Fatalf("SelfAPI=%q want empty (no loopback default)", h.cfg.Hub.SelfAPI)
 	}
 }
 

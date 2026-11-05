@@ -349,7 +349,7 @@ func netnsInode(path string) (uint64, bool) {
 func (h *Hygiene) liveNetnsInodes(pids []int) map[uint64]bool {
 	out := map[uint64]bool{}
 	for _, pid := range pids {
-		if ino, ok := netnsInode(h.procFile(pid, "ns", "net")); ok {
+		if ino, ok := netnsInode(h.proc.File(pid, "ns", "net")); ok {
 			out[ino] = true
 		}
 	}

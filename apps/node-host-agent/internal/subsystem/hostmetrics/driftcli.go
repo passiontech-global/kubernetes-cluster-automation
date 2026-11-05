@@ -1,10 +1,9 @@
-// driftcli.go — `node-host-agent check-k0s-drift`: the on-node half
-// of scripts/check-node-config-drift.sh. The bash compared each
-// controller's /etc/k0s/k0s.yaml extraArgs against the repo's
-// k0sctl.yaml over SSH; the CLI runs the same three findings the
-// node_k0s_config_drift collector already exports — removed-flag,
-// extra-key, missing-key — but on THIS node's file, printed for a
-// human and mapped onto a 0/1 exit.
+// driftcli.go — the library half of `node-host-agent check-k0s-drift`:
+// the on-node half of scripts/check-node-config-drift.sh. The bash
+// compared each controller's /etc/k0s/k0s.yaml extraArgs against the
+// repo's k0sctl.yaml over SSH; the scan reports the same three
+// findings the node_k0s_config_drift collector already exports —
+// removed-flag, extra-key, missing-key — but on THIS node's file.
 //
 // Why it matters: k0sctl does NOT regenerate /etc/k0s/k0s.yaml on
 // upgrade, so a config key dropped from the repo lives on the node
@@ -12,15 +11,15 @@
 // crashloops on the next restart (incident 2026-10-30:
 // concurrent-service-syncs removed in k8s 1.37 → KCM dead → PDB
 // freeze → drain autopilot stalled → rabbitmq lost a replica).
+//
+// The flag parsing and the human-readable DRIFT/REMOVED-FLAG report
+// live in internal/ops/k0sdrift; this file owns K0sDriftConfig and
+// the scan so both the CLI and the collector share one code path.
 package hostmetrics
 
 import (
-	"fmt"
-	"io"
 	"os"
 	"regexp"
-	"slices"
-	"strings"
 
 	"sigs.k8s.io/yaml"
 )
@@ -63,16 +62,36 @@ func (c *K0sDriftConfig) applyDefaults() {
 	}
 }
 
-// RunK0sDriftCLI scans the k0s config and prints one DRIFT /
-// REMOVED-FLAG line per finding in the shell script's phrasing.
-// Returns the process exit code: 0 when clean (or the node is not a
-// k0s controller), 1 on any drift.
-func RunK0sDriftCLI(cfg K0sDriftConfig, out io.Writer) int {
+// DriftFinding is one drift finding — Reason is removed-flag /
+// extra-key / missing-key / unreadable (the collector's
+// node_k0s_config_drift{reason,key} label values); Key is the flag
+// or extraArgs key it fired on ("k0s.yaml" for unreadable).
+type DriftFinding struct {
+	Reason string
+	Key    string
+}
+
+// K0sDriftScan is ScanK0sDrift's result: the normalized config
+// (defaults applied — callers print THESE paths, not their raw
+// input), whether the unit-file gate skipped the scan, and every
+// finding in scanK0sDrift's sorted order.
+type K0sDriftScan struct {
+	Config        K0sDriftConfig
+	NotController bool
+	Findings      []DriftFinding
+}
+
+// ScanK0sDrift runs the check-k0s-drift scan: the k0scontroller
+// unit-file gate (absent → NotController, no findings), the k0s.yaml
+// read + parse and the shared scanK0sDrift pass. The check-k0s-drift
+// CLI renders the findings; the collector keeps its own scrape-time
+// path through scanK0sDrift directly.
+func ScanK0sDrift(cfg K0sDriftConfig) K0sDriftScan {
 	cfg.applyDefaults()
+	scan := K0sDriftScan{Config: cfg}
 	if _, err := os.Stat(cfg.UnitFile); err != nil {
-		fmt.Fprintf(out, "check-k0s-drift: %s absent — "+
-			"not a k0s controller, skip\n", cfg.UnitFile)
-		return 0
+		scan.NotController = true
+		return scan
 	}
 	data, err := os.ReadFile(cfg.ConfigFile)
 	var parsed map[string]any
@@ -88,51 +107,10 @@ func RunK0sDriftCLI(cfg K0sDriftConfig, out io.Writer) int {
 	for _, k := range cfg.ExpectedKeys {
 		expected[k] = true
 	}
-	findings := scanK0sDrift(data, parsed, parseOK,
-		removedRe, expected, cfg.ExpectedKeys)
-	if len(findings) == 0 {
-		fmt.Fprintln(out, "check-k0s-drift: OK (no drift)")
-		return 0
+	for _, f := range scanK0sDrift(data, parsed, parseOK,
+		removedRe, expected, cfg.ExpectedKeys) {
+		scan.Findings = append(scan.Findings,
+			DriftFinding{Reason: f.reason, Key: f.key})
 	}
-
-	// Aggregate the way the script did: one line listing every extra
-	// key, one for every missing key, one REMOVED-FLAG line per flag.
-	var extra, missing, removed []string
-	unreadable := false
-	for _, f := range findings {
-		switch f.reason {
-		case "extra-key":
-			extra = append(extra, f.key)
-		case "missing-key":
-			missing = append(missing, f.key)
-		case "removed-flag":
-			removed = append(removed, f.key)
-		default: // unreadable
-			unreadable = true
-		}
-	}
-	if unreadable {
-		fmt.Fprintf(out,
-			"DRIFT %s: cannot read / parse k0s.yaml\n",
-			cfg.ConfigFile)
-	}
-	if len(extra) > 0 {
-		slices.Sort(extra)
-		fmt.Fprintf(out,
-			"DRIFT %s: key present on node but not in expected set: %s\n",
-			cfg.ConfigFile, strings.Join(extra, " "))
-	}
-	if len(missing) > 0 {
-		fmt.Fprintf(out,
-			"DRIFT %s: key in expected set but missing on node: %s\n",
-			cfg.ConfigFile, strings.Join(missing, " "))
-	}
-	slices.Sort(removed)
-	for _, flag := range removed {
-		fmt.Fprintf(out,
-			"REMOVED-FLAG %s: k0s.yaml still has '%s' "+
-				"(removed upstream -> component will crashloop after upgrade)\n",
-			cfg.ConfigFile, flag)
-	}
-	return 1
+	return scan
 }

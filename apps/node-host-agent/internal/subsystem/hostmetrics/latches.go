@@ -20,8 +20,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -30,17 +30,8 @@ func (c *Collector) Name() string { return "hostmetrics" }
 
 // Run drives the latch-maintenance ticker until ctx is cancelled.
 func (c *Collector) Run(ctx context.Context) {
-	c.refreshLatches()
-	t := time.NewTicker(c.cfg.LatchInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			c.refreshLatches()
-		}
-	}
+	cycle.Every("hostmetrics", c.cfg.LatchInterval,
+		func(context.Context) { c.refreshLatches() }).Run(ctx)
 }
 
 // refreshLatches re-evaluates every file-contract latch once — the

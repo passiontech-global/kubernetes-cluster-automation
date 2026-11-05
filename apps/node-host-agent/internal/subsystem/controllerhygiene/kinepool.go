@@ -36,7 +36,7 @@ import (
 
 // checkKinePool runs one pool-guard cycle.
 func (h *Hygiene) checkKinePool(_ context.Context) {
-	kpid := h.findProcByComm("kine")
+	kpid := h.proc.FindByComm("kine")
 	if kpid == 0 {
 		// No kine process: etcd controller or k0s not initialised —
 		// the probe is a silent no-op (the shell exited the same way).
@@ -47,7 +47,7 @@ func (h *Hygiene) checkKinePool(_ context.Context) {
 	conns := h.kineDBConns(kpid, dbPort)
 	h.kineConns.Set(float64(conns))
 
-	if conns <= h.cfg.KinePoolMaxConns {
+	if conns <= h.cfg.KinePool.MaxConns {
 		h.state.ResetCounter(fileCtrPool)
 		h.stateExit(stateKinePoolRunaway)
 		h.cycles.WithLabelValues(checkKinePool, "ok").Inc()
@@ -55,32 +55,32 @@ func (h *Hygiene) checkKinePool(_ context.Context) {
 	}
 
 	n := h.state.Incr(fileCtrPool)
-	if n < h.cfg.KinePoolCycles {
+	if n < h.cfg.KinePool.Cycles {
 		h.state.AppendLog(fmt.Sprintf(
 			"suspect: kine conns-to-db=%d > %d — pool spiral? (check %d/%d)",
-			conns, h.cfg.KinePoolMaxConns, n, h.cfg.KinePoolCycles))
+			conns, h.cfg.KinePool.MaxConns, n, h.cfg.KinePool.Cycles))
 		h.cycles.WithLabelValues(checkKinePool, "ok").Inc()
 		return
 	}
 
 	// --- spiral confirmed ---
 	h.state.Enter(stateKinePoolRunaway, fmt.Sprintf(
-		"conns=%d>%d x%d pid=%d", conns, h.cfg.KinePoolMaxConns, n, kpid))
+		"conns=%d>%d x%d pid=%d", conns, h.cfg.KinePool.MaxConns, n, kpid))
 
-	if !h.state.RateOK(fileRatePoolKill, h.cfg.KinePoolMinRestart) {
+	if !h.state.RateOK(fileRatePoolKill, h.cfg.KinePool.MinRestart) {
 		h.state.SuspectLog(stateKinePoolRunaway, fmt.Sprintf(
 			"kine-pool-runaway conns=%d (%dx) but in kill cooldown (<%dm), skip",
-			conns, n, int(h.cfg.KinePoolMinRestart.Minutes())),
+			conns, n, int(h.cfg.KinePool.MinRestart.Minutes())),
 			h.cfg.SuspectLogCadence)
 		h.cycles.WithLabelValues(checkKinePool, "ok").Inc()
 		return
 	}
 
-	switch h.cfg.KinePoolMode {
+	switch h.cfg.KinePool.Mode {
 	case ModeEnforce:
 		h.state.AppendLog(fmt.Sprintf(
 			"ACTION: kill kine pid=%d — conns-to-db=%d > %d x%d (k0s supervisor respawns with a clean pool)",
-			kpid, conns, h.cfg.KinePoolMaxConns, n))
+			kpid, conns, h.cfg.KinePool.MaxConns, n))
 		h.state.RateSpend(fileRatePoolKill)
 		h.state.ResetCounter(fileCtrPool)
 		if err := h.cfg.killFn(kpid, syscall.SIGTERM); err != nil {
@@ -91,7 +91,7 @@ func (h *Hygiene) checkKinePool(_ context.Context) {
 	case ModeDryRun:
 		h.state.AppendLog(fmt.Sprintf(
 			"DRY-RUN: would kill kine pid=%d — conns-to-db=%d > %d x%d",
-			kpid, conns, h.cfg.KinePoolMaxConns, n))
+			kpid, conns, h.cfg.KinePool.MaxConns, n))
 		h.actions.WithLabelValues(checkKinePool, "dryrun_kill").Inc()
 	}
 	h.cycles.WithLabelValues(checkKinePool, "ok").Inc()
@@ -101,14 +101,14 @@ func (h *Hygiene) checkKinePool(_ context.Context) {
 // `--endpoint=postgres://...:PORT/db`. Fallback 6432 when absent —
 // the same default the probe's shell header documents.
 func (h *Hygiene) kineDBPort(kpid int) int {
-	for _, arg := range h.procCmdline(kpid) {
+	for _, arg := range h.proc.Cmdline(kpid) {
 		if m := endpointPortRe.FindStringSubmatch(arg); m != nil {
 			if p, err := strconv.Atoi(m[1]); err == nil {
 				return p
 			}
 		}
 	}
-	return h.cfg.KineDBPortFallback
+	return h.cfg.KinePool.DBPortFallback
 }
 
 // kineDBConns counts pid's TCP sockets whose remote port is dbPort —
@@ -122,7 +122,7 @@ func (h *Hygiene) kineDBConns(pid, dbPort int) int {
 	}
 	n := 0
 	for _, f := range []string{"net/tcp", "net/tcp6"} {
-		data, err := os.ReadFile(h.procFile(pid, f))
+		data, err := os.ReadFile(h.proc.File(pid, f))
 		if err != nil {
 			continue
 		}
@@ -134,13 +134,13 @@ func (h *Hygiene) kineDBConns(pid, dbPort int) int {
 // socketInodes returns the socket inode set of a process — the fd
 // symlinks of the form socket:[<inode>].
 func (h *Hygiene) socketInodes(pid int) map[string]bool {
-	entries, err := os.ReadDir(h.procFile(pid, "fd"))
+	entries, err := os.ReadDir(h.proc.File(pid, "fd"))
 	if err != nil {
 		return nil
 	}
 	set := make(map[string]bool, len(entries))
 	for _, e := range entries {
-		link, err := os.Readlink(h.procFile(pid, "fd", e.Name()))
+		link, err := os.Readlink(h.proc.File(pid, "fd", e.Name()))
 		if err != nil {
 			continue
 		}

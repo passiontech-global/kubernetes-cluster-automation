@@ -63,6 +63,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
@@ -424,7 +425,7 @@ func (n *NetHealth) Name() string { return "nethealth" }
 func (n *NetHealth) Run(ctx context.Context) {
 	if !n.cfg.Enabled {
 		logger().Info("nethealth disabled — idling until shutdown")
-		<-ctx.Done()
+		cycle.Idle(ctx)
 		return
 	}
 	// Route guard: netlink-driven restore of the nebula policy
@@ -436,21 +437,13 @@ func (n *NetHealth) Run(ctx context.Context) {
 	// <HostRoot>/etc/nebula/<net>/nebula-up.sh (plain workers) or
 	// while `systemctl is-active nebula@<net>` is down.
 	n.spawnRouteGuard(ctx)
-	n.Cycle(ctx)
-	t := time.NewTicker(n.cfg.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			// Re-arm a dead guard every tick — a panic must not
-			// leave route deletes unmonitored until the next
-			// full Run restart.
-			n.spawnRouteGuard(ctx)
-			n.Cycle(ctx)
-		}
-	}
+	cycle.Every("nethealth", n.cfg.Interval, func(ctx context.Context) {
+		// Re-arm a dead guard every tick — a panic must not
+		// leave route deletes unmonitored until the next
+		// full Run restart.
+		n.spawnRouteGuard(ctx)
+		n.Cycle(ctx)
+	}).Run(ctx)
 }
 
 // Cycle runs one round of all checks. The DNS modules carry the
