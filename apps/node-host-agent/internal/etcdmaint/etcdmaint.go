@@ -1,4 +1,4 @@
-// Package etcdrescue ports scripts/rescue-etcd.sh — rescues a k0s
+// Package etcdmaint ports scripts/rescue-etcd.sh — rescues a k0s
 // controller etcd that hit the backend quota.
 //
 // Symptom: every write fails with
@@ -22,7 +22,7 @@
 // online defrag can report OK yet reclaim nothing while the apiserver
 // is crash-looping writes — hence the dbSize/dbSizeInUse comparison —
 // and `alarm disarm` is mandatory because NOSPACE never clears itself.
-package etcdrescue
+package etcdmaint
 
 import (
 	"bytes"

@@ -1,4 +1,4 @@
-package etcdrescue
+package etcdmaint
 
 import (
 	"context"

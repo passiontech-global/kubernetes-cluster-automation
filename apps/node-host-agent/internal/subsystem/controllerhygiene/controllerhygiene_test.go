@@ -16,8 +16,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdrescue"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/etcdmaint"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/eventpurge"
 )
 
 // env is the fixture: tempdir host trees + stubbed externals + a
@@ -1023,7 +1023,7 @@ type etcdGuardFake struct {
 	alarms   string // canned `alarm list`
 	purges   int
 	cutoffs  []time.Time
-	rescues  []etcdrescue.Config
+	rescues  []etcdmaint.Config
 }
 
 func (g *etcdGuardFake) ctl(_ context.Context, args ...string) ([]byte, error) {
@@ -1055,14 +1055,14 @@ func (e *env) wireEtcdGuard(t *testing.T, g *etcdGuardFake) {
 	t.Helper()
 	e.h.cfg.K0sDir = e.mkEtcdHost(t)
 	e.h.cfg.etcdctlFn = g.ctl
-	e.h.cfg.evpurgeRunFn = func(_ context.Context, _ evpurge.Config,
+	e.h.cfg.evpurgeRunFn = func(_ context.Context, _ eventpurge.Config,
 		cutoff time.Time, _ io.Writer) error {
 		g.purges++
 		g.cutoffs = append(g.cutoffs, cutoff)
 		return nil
 	}
 	e.h.cfg.etcdRescueFn = func(_ context.Context,
-		cfg etcdrescue.Config, _ io.Writer) error {
+		cfg etcdmaint.Config, _ io.Writer) error {
 		g.rescues = append(g.rescues, cfg)
 		return nil
 	}
@@ -1072,13 +1072,13 @@ func (e *env) wireEtcdGuard(t *testing.T, g *etcdGuardFake) {
 // tree — the no-op tests assert the probe is never even spawned.
 func (e *env) wireEtcdSeamsOnly(g *etcdGuardFake) {
 	e.h.cfg.etcdctlFn = g.ctl
-	e.h.cfg.evpurgeRunFn = func(context.Context, evpurge.Config,
+	e.h.cfg.evpurgeRunFn = func(context.Context, eventpurge.Config,
 		time.Time, io.Writer) error {
 		g.purges++
 		return nil
 	}
 	e.h.cfg.etcdRescueFn = func(_ context.Context,
-		cfg etcdrescue.Config, _ io.Writer) error {
+		cfg etcdmaint.Config, _ io.Writer) error {
 		g.rescues = append(g.rescues, cfg)
 		return nil
 	}
@@ -1164,7 +1164,7 @@ func TestEtcdGuardNospaceTriggers(t *testing.T) {
 	}
 	if g.rescues[0].CallTimeout != defaultEtcdGuardCallTimeout {
 		t.Fatalf("rescue CallTimeout=%v want %v (the short guard cap, "+
-			"not etcdrescue's 10m interactive default)",
+			"not etcdmaint's 10m interactive default)",
 			g.rescues[0].CallTimeout, defaultEtcdGuardCallTimeout)
 	}
 	if g.rescues[0].K0sDir != e.h.cfg.K0sDir {
@@ -1246,7 +1246,7 @@ func TestEtcdGuardEvpurgeFailRescueOkStillRemediated(t *testing.T) {
 		status: etcdStatusJSON(defaultEtcdDBSizeLimit+1, 1<<30),
 	}
 	e.wireEtcdGuard(t, g)
-	e.h.cfg.evpurgeRunFn = func(context.Context, evpurge.Config,
+	e.h.cfg.evpurgeRunFn = func(context.Context, eventpurge.Config,
 		time.Time, io.Writer) error {
 		g.purges++
 		return fmt.Errorf("purge boom")
@@ -1277,8 +1277,8 @@ func TestEtcdGuardRescueFailCountsRemediateError(t *testing.T) {
 	}
 	e.wireEtcdGuard(t, g)
 	e.h.cfg.etcdRescueFn = func(context.Context,
-		etcdrescue.Config, io.Writer) error {
-		g.rescues = append(g.rescues, etcdrescue.Config{})
+		etcdmaint.Config, io.Writer) error {
+		g.rescues = append(g.rescues, etcdmaint.Config{})
 		return fmt.Errorf("rescue boom")
 	}
 	e.h.Cycle(context.Background())
@@ -1325,7 +1325,7 @@ func TestEtcdGuardRunCtxBounded(t *testing.T) {
 	e.h.cfg.K0sDir = e.mkEtcdHost(t)
 	e.h.cfg.etcdctlFn = g.ctl
 	var purgeDL, rescueDL time.Time
-	e.h.cfg.evpurgeRunFn = func(ctx context.Context, _ evpurge.Config,
+	e.h.cfg.evpurgeRunFn = func(ctx context.Context, _ eventpurge.Config,
 		_ time.Time, _ io.Writer) error {
 		g.purges++
 		d, ok := ctx.Deadline()
@@ -1337,7 +1337,7 @@ func TestEtcdGuardRunCtxBounded(t *testing.T) {
 		return nil
 	}
 	e.h.cfg.etcdRescueFn = func(ctx context.Context,
-		cfg etcdrescue.Config, _ io.Writer) error {
+		cfg etcdmaint.Config, _ io.Writer) error {
 		g.rescues = append(g.rescues, cfg)
 		d, ok := ctx.Deadline()
 		if !ok {
@@ -1369,15 +1369,15 @@ func TestEtcdGuardBudgetExhaustedDefers(t *testing.T) {
 	}
 	e.h.cfg.K0sDir = e.mkEtcdHost(t)
 	e.h.cfg.etcdctlFn = g.ctl
-	e.h.cfg.evpurgeRunFn = func(ctx context.Context, _ evpurge.Config,
+	e.h.cfg.evpurgeRunFn = func(ctx context.Context, _ eventpurge.Config,
 		_ time.Time, _ io.Writer) error {
 		g.purges++
 		<-ctx.Done()
 		return ctx.Err()
 	}
 	e.h.cfg.etcdRescueFn = func(context.Context,
-		etcdrescue.Config, io.Writer) error {
-		g.rescues = append(g.rescues, etcdrescue.Config{})
+		etcdmaint.Config, io.Writer) error {
+		g.rescues = append(g.rescues, etcdmaint.Config{})
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
@@ -1416,12 +1416,12 @@ func TestRunCycleDeadlineAbortsStall(t *testing.T) {
 		sawErr = ctx.Err()
 		return nil, ctx.Err()
 	}
-	e.h.cfg.evpurgeRunFn = func(context.Context, evpurge.Config,
+	e.h.cfg.evpurgeRunFn = func(context.Context, eventpurge.Config,
 		time.Time, io.Writer) error {
 		return nil
 	}
 	e.h.cfg.etcdRescueFn = func(context.Context,
-		etcdrescue.Config, io.Writer) error {
+		etcdmaint.Config, io.Writer) error {
 		return nil
 	}
 	start := time.Now()

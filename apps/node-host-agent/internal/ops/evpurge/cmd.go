@@ -9,6 +9,10 @@
 // bare positional RFC3339 arg, like the script's sys.argv[1]; the
 // empty default is the script's "1970-01-01T00:00:00Z" (delete
 // everything).
+//
+// The purge itself lives in internal/eventpurge (Run): this file is
+// only the flag layer so the controllerhygiene etcd guard can share
+// the domain logic without importing a CLI package.
 package evpurge
 
 import (
@@ -20,6 +24,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/eventpurge"
 )
 
 // Cmd is the `purge-events` subcommand entrypoint.
@@ -90,7 +96,7 @@ func Cmd(ctx context.Context, args []string) int {
 		fmt.Fprintf(os.Stderr, "purge-events: bad cutoff %q: %v\n", cutStr, err)
 		return 2
 	}
-	if err := Run(ctx, Config{
+	if err := eventpurge.Run(ctx, eventpurge.Config{
 		API:      *api,
 		CAFile:   *ca,
 		CertFile: *cert,

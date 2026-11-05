@@ -78,8 +78,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdrescue"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/etcdmaint"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/eventpurge"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
@@ -404,10 +404,10 @@ type Config struct {
 	// stderr captured separately so -w json parses).
 	etcdctlFn func(ctx context.Context, args ...string) ([]byte, error)
 	// evpurgeRunFn / etcdRescueFn are the guard's remediation seams —
-	// nil → evpurge.Run / etcdrescue.Run.
-	evpurgeRunFn func(ctx context.Context, cfg evpurge.Config,
+	// nil → eventpurge.Run / etcdmaint.Run.
+	evpurgeRunFn func(ctx context.Context, cfg eventpurge.Config,
 		cutoff time.Time, out io.Writer) error
-	etcdRescueFn func(ctx context.Context, cfg etcdrescue.Config,
+	etcdRescueFn func(ctx context.Context, cfg etcdmaint.Config,
 		out io.Writer) error
 	// journalAnyFn is the unfiltered second probe used to classify an
 	// empty unit-window read — `journalctl -n 1 --no-pager` with
@@ -531,13 +531,13 @@ type FeederConfig struct {
 // EtcdGuardConfig is the embedded-etcd quota self-defence (k0s
 // embedded-etcd controllers only — kine hosts no-op on the missing
 // <K0sDir>/bin/etcdctl + pki/etcd/ca.crt). Trigger = NOSPACE alarm or
-// dbSize >= DBSizeLimit → evpurge + ONLINE-ONLY etcd rescue under the
+// dbSize >= DBSizeLimit → eventpurge + ONLINE-ONLY etcd rescue under the
 // last-etcd-guard budget (the offline defrag stops k0scontroller and
 // stays a manual action).
 type EtcdGuardConfig struct {
 	Endpoint    string // "" → https://127.0.0.1:2379
 	DBSizeLimit int64  // dbSize trigger bytes; <=0 → 1.5 GiB
-	// MinRun is the evpurge+rescue rate budget; <=0 → 1h.
+	// MinRun is the eventpurge+rescue rate budget; <=0 → 1h.
 	MinRun time.Duration
 }
 
@@ -870,10 +870,10 @@ func (c *Config) applyDefaults() {
 		}
 	}
 	if c.evpurgeRunFn == nil {
-		c.evpurgeRunFn = evpurge.Run
+		c.evpurgeRunFn = eventpurge.Run
 	}
 	if c.etcdRescueFn == nil {
-		c.etcdRescueFn = etcdrescue.Run
+		c.etcdRescueFn = etcdmaint.Run
 	}
 	if c.CPFreeze.KCMHealthURL == "" {
 		c.CPFreeze.KCMHealthURL = "https://127.0.0.1:10257/healthz"

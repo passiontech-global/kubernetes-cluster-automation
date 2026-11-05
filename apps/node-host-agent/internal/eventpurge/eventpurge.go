@@ -1,4 +1,4 @@
-// Package evpurge ports scripts/purge-events.py — bulk-deletes stale
+// Package eventpurge ports scripts/purge-events.py — bulk-deletes stale
 // Events through the API server (never etcd directly).
 //
 // Context: Events carry a 1h TTL but the GC loop dies with the
@@ -17,7 +17,7 @@
 //
 //	to delete: <N>
 //	deleted=<ok> errors=<err>
-package evpurge
+package eventpurge
 
 import (
 	"context"
