@@ -11,6 +11,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 const (
@@ -155,7 +157,7 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 // evidence must neither set nor clear it, the same rule the
 // overload latch follows on an unparseable PSI file.
 func (c *Collector) updateFSReadonlyLatch(anyRO, probed bool) {
-	p := filepath.Join(c.cfg.WatchdogStateDir, "state-filesystem-readonly")
+	p := c.state.Path(hoststate.LatchFilesystemReadonly)
 	_, err := os.Stat(p)
 	switch {
 	case anyRO && err != nil:

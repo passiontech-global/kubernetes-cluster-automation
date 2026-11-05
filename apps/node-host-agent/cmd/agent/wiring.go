@@ -175,12 +175,13 @@ func (w *wiring) descriptors() []Descriptor {
 				}), w.reg)
 			},
 		},
-		// hostmetrics: scrape-time collector.
+		// hostmetrics: scrape-time collector + latch-ticker
+		// subsystem.
 		// BUG-H5: the latch-maintenance ticker runs in BOTH modes —
 		// on the DaemonSet Prometheus may not scrape for long
 		// stretches, so latches can't ride Collect() alone; the
-		// collector registers on the shared registry AND runs as a
-		// subsystem.
+		// collector registers on the shared registry AND its Latches
+		// half runs as the subsystem.
 		{
 			Name:    "hostmetrics",
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_HOSTMETRICS",
@@ -195,7 +196,7 @@ func (w *wiring) descriptors() []Descriptor {
 					HostPath:            w.hostPath,
 				}))
 				w.reg.MustRegister(hm)
-				return hm, nil
+				return hm.Latches(), nil
 			},
 			// Standalone hosts have no Prometheus scrape — the
 			// legacy prom_emit contract is kept by rendering the
@@ -205,7 +206,7 @@ func (w *wiring) descriptors() []Descriptor {
 				if !w.standalone {
 					return
 				}
-				hm := sub.(*hostmetrics.Collector)
+				hm := sub.(*hostmetrics.Latches).Collector()
 				w.subsystems = append(w.subsystems, cycle.Every(
 					"hostmetrics-textfile",
 					envx.Duration("NODE_HOST_AGENT_TEXTFILE_INTERVAL",

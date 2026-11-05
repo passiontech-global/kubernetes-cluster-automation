@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 	"golang.org/x/sys/unix"
@@ -151,7 +152,8 @@ type oomKillCtx struct {
 
 // kernelScanState is the per-Collector scanner state — the kmsg fd
 // session plus the cross-line OOM pairing. NetHealth-style keyed
-// state because Collector's struct lives in hostmetrics.go.
+// state because the Latches wrapper is recreated per call — the
+// Collector underneath is the stable identity.
 type kernelScanState struct {
 	sess       *kmsgSession // nil until /dev/kmsg opens
 	oomPending *oomKillCtx  // constraint line awaiting its kill line
@@ -159,12 +161,12 @@ type kernelScanState struct {
 
 var kernelScanStates sync.Map // *Collector → *kernelScanState
 
-func (c *Collector) kernelScan() *kernelScanState {
-	if v, ok := kernelScanStates.Load(c); ok {
+func (l *Latches) kernelScan() *kernelScanState {
+	if v, ok := kernelScanStates.Load(l.c); ok {
 		return v.(*kernelScanState)
 	}
 	st := &kernelScanState{}
-	actual, _ := kernelScanStates.LoadOrStore(c, st)
+	actual, _ := kernelScanStates.LoadOrStore(l.c, st)
 	return actual.(*kernelScanState)
 }
 
@@ -214,8 +216,8 @@ type kmsgCursor struct {
 }
 
 // kernelBootID reads /proc/sys/kernel/random/boot_id under ProcRoot.
-func (c *Collector) kernelBootID() string {
-	b, err := os.ReadFile(filepath.Join(c.cfg.ProcRoot,
+func (l *Latches) kernelBootID() string {
+	b, err := os.ReadFile(filepath.Join(l.c.cfg.ProcRoot,
 		"sys/kernel/random/boot_id"))
 	if err != nil {
 		return ""
@@ -223,12 +225,12 @@ func (c *Collector) kernelBootID() string {
 	return strings.TrimSpace(string(b))
 }
 
-func (c *Collector) statePath(name string) string {
-	return filepath.Join(c.cfg.WatchdogStateDir, name)
+func (l *Latches) statePath(name string) string {
+	return filepath.Join(l.c.cfg.WatchdogStateDir, name)
 }
 
-func (c *Collector) readKmsgCursor() *kmsgCursor {
-	b, err := os.ReadFile(c.statePath(kmsgCursorFile))
+func (l *Latches) readKmsgCursor() *kmsgCursor {
+	b, err := os.ReadFile(l.statePath(kmsgCursorFile))
 	if err != nil {
 		return nil
 	}
@@ -273,7 +275,7 @@ func (c *Collector) readKmsgCursor() *kmsgCursor {
 	return cur
 }
 
-func (c *Collector) writeKmsgCursor(cur *kmsgCursor) {
+func (l *Latches) writeKmsgCursor(cur *kmsgCursor) {
 	var content string
 	switch cur.mode {
 	case "kmsg":
@@ -283,7 +285,7 @@ func (c *Collector) writeKmsgCursor(cur *kmsgCursor) {
 	case "dmesgRaw":
 		content = fmt.Sprintf("dmesgRaw %d %d\n", cur.lines, cur.hash)
 	}
-	p := c.statePath(kmsgCursorFile)
+	p := l.statePath(kmsgCursorFile)
 	if err := hostutil.WriteFileAtomicBytes(p, []byte(content)); err != nil {
 		logger().Debug("hostmetrics: kmsg cursor write failed",
 			"path", p, "error", err)
@@ -316,23 +318,23 @@ func parseKmsgRecord(line string) (kmsgRecord, bool) {
 // `dmesg -T` (timestamps) then plain `dmesg` (line-count cursor) when
 // the device can't be opened. An unreadable kernel log is
 // inconclusive — no markers, no latch movement.
-func (c *Collector) checkKernelDmesg() {
-	st := c.kernelScan()
-	if st.sess != nil || c.openKMSSession(st) {
-		if c.drainKmsg(st) {
+func (l *Latches) checkKernelDmesg() {
+	st := l.kernelScan()
+	if st.sess != nil || l.openKMSSession(st) {
+		if l.drainKmsg(st) {
 			return
 		}
 		// Read/open failure — drop the session; the dmesg fallback
 		// covers this tick and kmsg is retried next tick.
-		c.closeKMSSession(st)
+		l.closeKMSSession(st)
 	}
-	c.drainDmesg(st)
+	l.drainDmesg(st)
 }
 
 // openKMSSession tries the kmsgDevicePaths candidates and parks the
 // first openable fd on the state.
-func (c *Collector) openKMSSession(st *kernelScanState) bool {
-	for _, p := range kmsgDevicePaths(c.cfg.HostRoot) {
+func (l *Latches) openKMSSession(st *kernelScanState) bool {
+	for _, p := range kmsgDevicePaths(l.c.cfg.HostRoot) {
 		f, err := os.OpenFile(p,
 			os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 		if err != nil {
@@ -344,7 +346,7 @@ func (c *Collector) openKMSSession(st *kernelScanState) bool {
 	return false
 }
 
-func (c *Collector) closeKMSSession(st *kernelScanState) {
+func (l *Latches) closeKMSSession(st *kernelScanState) {
 	if st.sess != nil {
 		_ = st.sess.f.Close()
 		st.sess = nil
@@ -354,10 +356,10 @@ func (c *Collector) closeKMSSession(st *kernelScanState) {
 // drainKmsg reads every record the kernel currently offers (bounded
 // by kmsgDrainCap), classifies the new ones and advances the cursor.
 // Returns false when the fd itself fails — the caller falls back.
-func (c *Collector) drainKmsg(st *kernelScanState) bool {
+func (l *Latches) drainKmsg(st *kernelScanState) bool {
 	sess := st.sess
-	cur := c.readKmsgCursor()
-	bootID := c.kernelBootID()
+	cur := l.readKmsgCursor()
+	bootID := l.kernelBootID()
 	// Resume only on a cursor from THIS boot — a stale cursor after
 	// reboot would skip every new record (seqs restart low).
 	resume := cur != nil && cur.mode == "kmsg" &&
@@ -372,7 +374,7 @@ func (c *Collector) drainKmsg(st *kernelScanState) bool {
 		sess.seq = cur.seq
 	}
 
-	recs, maxSeq, maxUsec, err := c.readKmsgAvail(sess)
+	recs, maxSeq, maxUsec, err := l.readKmsgAvail(sess)
 	if err != nil {
 		return false
 	}
@@ -384,7 +386,7 @@ func (c *Collector) drainKmsg(st *kernelScanState) bool {
 		// records were already processed pre-restart.)
 		sess.seq = maxSeq
 		sess.primed = true
-		c.writeKmsgCursor(&kmsgCursor{
+		l.writeKmsgCursor(&kmsgCursor{
 			mode: "kmsg", bootID: bootID, seq: sess.seq, usec: maxUsec})
 		return true
 	}
@@ -393,7 +395,7 @@ func (c *Collector) drainKmsg(st *kernelScanState) bool {
 		if resume && (!r.parsed || r.seq <= minSeq) {
 			continue
 		}
-		c.classifyKernelLine(r.msg, st)
+		l.classifyKernelLine(r.msg, st)
 	}
 	// Advance the persisted position past everything consumed —
 	// including records skipped by the resume filter.
@@ -402,7 +404,7 @@ func (c *Collector) drainKmsg(st *kernelScanState) bool {
 		newSeq = maxSeq
 	}
 	if newSeq > 0 || resume {
-		c.writeKmsgCursor(&kmsgCursor{
+		l.writeKmsgCursor(&kmsgCursor{
 			mode: "kmsg", bootID: bootID, seq: newSeq, usec: maxUsec})
 	}
 	return true
@@ -411,7 +413,7 @@ func (c *Collector) drainKmsg(st *kernelScanState) bool {
 // readKmsgAvail drains the fd until EAGAIN/EOF/cap, carrying a
 // partial trailing line in sess.pending. Returns the parsed records
 // plus the highest seq/usec seen (0 when nothing parsed).
-func (c *Collector) readKmsgAvail(sess *kmsgSession) (
+func (l *Latches) readKmsgAvail(sess *kmsgSession) (
 	[]kmsgRecord, uint64, int64, error) {
 	data := sess.pending
 	sess.pending = nil
@@ -471,16 +473,16 @@ func (c *Collector) readKmsgAvail(sess *kmsgSession) (
 // classifyKernelLine feeds one kernel message into the detectors.
 // Order matters: the oom-kill constraint line is captured as pending
 // context for the kill line that follows it.
-func (c *Collector) classifyKernelLine(msg string, st *kernelScanState) {
+func (l *Latches) classifyKernelLine(msg string, st *kernelScanState) {
 	switch {
 	case oomConstraintRe.MatchString(msg):
 		st.oomPending = parseOOMConstraint(msg)
 	case oomKillRe.MatchString(msg):
-		c.noteHostOOMKill(msg, st)
+		l.noteHostOOMKill(msg, st)
 	case fsErrorRe.MatchString(msg):
-		c.noteKernelFsError(msg)
+		l.noteKernelFsError(msg)
 	case conntrackFullRe.MatchString(msg):
-		c.noteConntrackFull()
+		l.noteConntrackFull()
 	}
 }
 
@@ -510,7 +512,7 @@ func isHostOOMComm(comm string) bool {
 // kubepods hierarchy, or the victim comm is a host daemon
 // (containerd/k0s/kubelet). Pod-cgroup kills are routine kubelet
 // eviction traffic — they must not fire SystemOOMVictim.
-func (c *Collector) noteHostOOMKill(msg string, st *kernelScanState) {
+func (l *Latches) noteHostOOMKill(msg string, st *kernelScanState) {
 	m := oomKillRe.FindStringSubmatch(msg)
 	if m == nil {
 		return
@@ -528,9 +530,9 @@ func (c *Collector) noteHostOOMKill(msg string, st *kernelScanState) {
 	if !host {
 		return
 	}
-	c.state.Incr(kmsgOOMCountFile)
-	now := c.cfg.nowFn()
-	p := c.statePath(kmsgOOMVictimFile)
+	l.c.state.Incr(kmsgOOMCountFile)
+	now := l.c.cfg.nowFn()
+	p := l.statePath(kmsgOOMVictimFile)
 	content := strconv.FormatInt(now.Unix(), 10) + " " + comm + "\n"
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 		logger().Warn("hostmetrics: host-oom victim marker write failed",
@@ -549,13 +551,13 @@ func ctxMemcg(ctx *oomKillCtx) string {
 
 // noteKernelFsError records the latest kernel filesystem/block error —
 // updateFSReadonlyEvidence turns a fresh marker into state-fs-readonly.
-func (c *Collector) noteKernelFsError(msg string) {
+func (l *Latches) noteKernelFsError(msg string) {
 	detail := msg
 	if len(detail) > 200 {
 		detail = detail[:200]
 	}
-	p := c.statePath(kmsgFsErrorFile)
-	content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + " " +
+	p := l.statePath(kmsgFsErrorFile)
+	content := strconv.FormatInt(l.c.cfg.nowFn().Unix(), 10) + " " +
 		detail + "\n"
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 		logger().Warn("hostmetrics: kmsg fs-error marker write failed",
@@ -567,20 +569,20 @@ func (c *Collector) noteKernelFsError(msg string) {
 // the rate budget + ceiling — doubles nf_conntrack_max so the table
 // stops dropping packets. A failed sysctl write is a Warn, never
 // fatal (read-only /proc/sys in unprivileged pods just logs).
-func (c *Collector) noteConntrackFull() {
-	c.state.Incr(kmsgConntrackDropsFile)
-	c.maybeBumpConntrackMax()
+func (l *Latches) noteConntrackFull() {
+	l.c.state.Incr(kmsgConntrackDropsFile)
+	l.maybeBumpConntrackMax()
 }
 
 // maybeBumpConntrackMax doubles ConntrackMaxFile when a table-full
 // record lands — rate-limited and ceiling-capped. The write targets
 // the sysctl path directly; containerized agents without a writable
 // /proc/sys get a Warn and move on.
-func (c *Collector) maybeBumpConntrackMax() {
-	if !c.state.RateOK(conntrackBumpBudgetFile, conntrackBumpEvery) {
+func (l *Latches) maybeBumpConntrackMax() {
+	if !l.c.state.RateOK(conntrackBumpBudgetFile, conntrackBumpEvery) {
 		return
 	}
-	cur, ok := hostutil.ReadUintFile(c.cfg.ConntrackMaxFile)
+	cur, ok := hostutil.ReadUintFile(l.c.cfg.ConntrackMaxFile)
 	if !ok || cur == 0 || cur >= conntrackMaxCeiling {
 		return
 	}
@@ -588,13 +590,13 @@ func (c *Collector) maybeBumpConntrackMax() {
 	if next > conntrackMaxCeiling {
 		next = conntrackMaxCeiling
 	}
-	if err := os.WriteFile(c.cfg.ConntrackMaxFile,
+	if err := os.WriteFile(l.c.cfg.ConntrackMaxFile,
 		[]byte(strconv.FormatUint(next, 10)+"\n"), 0o644); err != nil {
 		logger().Warn("hostmetrics: nf_conntrack_max bump failed",
-			"path", c.cfg.ConntrackMaxFile, "error", err)
+			"path", l.c.cfg.ConntrackMaxFile, "error", err)
 		return
 	}
-	c.state.RateSpend(conntrackBumpBudgetFile)
+	l.c.state.RateSpend(conntrackBumpBudgetFile)
 	logger().Warn("hostmetrics: nf_conntrack table full — bumped "+
 		"nf_conntrack_max",
 		"from", cur, "to", next)
@@ -609,7 +611,7 @@ func (c *Collector) maybeBumpConntrackMax() {
 // a count cursor would go permanently blind; a lost anchor skips
 // the tick and re-anchors at the tail rather than reprocessing the
 // whole retained ring).
-func (c *Collector) drainDmesg(st *kernelScanState) {
+func (l *Latches) drainDmesg(st *kernelScanState) {
 	out, err := runHostCmd(context.Background(), "dmesg", "-T")
 	mode := "dmesgT"
 	if err != nil {
@@ -621,7 +623,7 @@ func (c *Collector) drainDmesg(st *kernelScanState) {
 		return
 	}
 	lines := strings.Split(out, "\n")
-	cur := c.readKmsgCursor()
+	cur := l.readKmsgCursor()
 	// First sighting in this mode (no cursor, or a cursor from the
 	// OTHER fallback mode): dmesg output is the whole retained ring
 	// — history, not news. Prime the cursor at the tail and
@@ -645,11 +647,11 @@ func (c *Collector) drainDmesg(st *kernelScanState) {
 				}
 			}
 			if newest > 0 {
-				c.writeKmsgCursor(&kmsgCursor{
+				l.writeKmsgCursor(&kmsgCursor{
 					mode: "dmesgT", unixTs: newest, lines: atNewest})
 			}
 		default:
-			c.writeKmsgCursor(&kmsgCursor{
+			l.writeKmsgCursor(&kmsgCursor{
 				mode: "dmesgRaw", lines: len(lines),
 				hash: dmesgTailHash(lines)})
 		}
@@ -688,12 +690,12 @@ func (c *Collector) drainDmesg(st *kernelScanState) {
 		}
 		switch {
 		case maxTs > 0:
-			c.writeKmsgCursor(&kmsgCursor{
+			l.writeKmsgCursor(&kmsgCursor{
 				mode: "dmesgT", unixTs: maxTs, lines: atMax})
 		case atLast > pending:
 			// Only same-second arrivals — advance the consumed
 			// count so they aren't reprocessed next tick.
-			c.writeKmsgCursor(&kmsgCursor{
+			l.writeKmsgCursor(&kmsgCursor{
 				mode: "dmesgT", unixTs: lastTs, lines: atLast})
 		}
 	default: // dmesgRaw — content-anchored, see drainDmesg doc.
@@ -719,19 +721,19 @@ func (c *Collector) drainDmesg(st *kernelScanState) {
 			// line-count cursor — can't order the retained window.
 			// Skip this tick and re-anchor at the tail: missed
 			// detections beat double-counted ones.
-			c.writeKmsgCursor(&kmsgCursor{
+			l.writeKmsgCursor(&kmsgCursor{
 				mode: "dmesgRaw", lines: len(lines), hash: tail})
 			break
 		}
 		fresh = trimmed[anchor+1:]
-		c.writeKmsgCursor(&kmsgCursor{
+		l.writeKmsgCursor(&kmsgCursor{
 			mode: "dmesgRaw", lines: len(lines), hash: tail})
 	}
 	for _, msg := range fresh {
 		if msg == "" {
 			continue
 		}
-		c.classifyKernelLine(msg, st)
+		l.classifyKernelLine(msg, st)
 	}
 }
 
@@ -797,32 +799,32 @@ func dmesgMessage(line string) string {
 // must not emit a fake 0 gauge (the collectFileFD rule); ok=false
 // overall means NO source parsed — inconclusive evidence must not
 // move the latch (the kernelKeysUsedRatio rule).
-func (c *Collector) kernelProcRatios() (pids, threads, filefd float64,
+func (l *Latches) kernelProcRatios() (pids, threads, filefd float64,
 	pidsOK, threadsOK, fdOK, ok bool) {
 	seen := false
-	if entries, err := os.ReadDir(c.cfg.ProcRoot); err == nil {
+	if entries, err := os.ReadDir(l.c.cfg.ProcRoot); err == nil {
 		tasks := 0
 		for _, e := range entries {
 			if e.IsDir() && pidDirRe.MatchString(e.Name()) {
 				tasks++
 			}
 		}
-		if max, mok := c.readProcFloat("sys/kernel/pid_max"); mok && max > 0 {
+		if max, mok := l.readProcFloat("sys/kernel/pid_max"); mok && max > 0 {
 			pids, pidsOK, seen = float64(tasks)/max, true, true
 		}
 	}
-	if b, err := os.ReadFile(filepath.Join(c.cfg.ProcRoot, "loadavg")); err == nil {
+	if b, err := os.ReadFile(filepath.Join(l.c.cfg.ProcRoot, "loadavg")); err == nil {
 		if f := strings.Fields(string(b)); len(f) >= 4 {
 			if pair := strings.Split(f[3], "/"); len(pair) == 2 {
 				if total, err := strconv.ParseFloat(pair[1], 64); err == nil {
-					if max, mok := c.readProcFloat("sys/kernel/threads-max"); mok && max > 0 {
+					if max, mok := l.readProcFloat("sys/kernel/threads-max"); mok && max > 0 {
 						threads, threadsOK, seen = total/max, true, true
 					}
 				}
 			}
 		}
 	}
-	if b, err := os.ReadFile(c.cfg.FileNRFile); err == nil {
+	if b, err := os.ReadFile(l.c.cfg.FileNRFile); err == nil {
 		if f := strings.Fields(string(b)); len(f) >= 3 {
 			alloc, errA := strconv.ParseFloat(f[0], 64)
 			max, errM := strconv.ParseFloat(f[2], 64)
@@ -835,8 +837,8 @@ func (c *Collector) kernelProcRatios() (pids, threads, filefd float64,
 }
 
 // readProcFloat reads one numeric file under ProcRoot.
-func (c *Collector) readProcFloat(elem string) (float64, bool) {
-	b, err := os.ReadFile(filepath.Join(c.cfg.ProcRoot, elem))
+func (l *Latches) readProcFloat(elem string) (float64, bool) {
+	b, err := os.ReadFile(filepath.Join(l.c.cfg.ProcRoot, elem))
 	if err != nil {
 		return 0, false
 	}
@@ -854,12 +856,12 @@ func (c *Collector) readProcFloat(elem string) (float64, bool) {
 // streak; any sub-threshold or inconclusive-free tick resets it.
 // The node_agent_*_utilization_ratio gauges ride the same evaluation
 // into the node-exporter textfile.
-func (c *Collector) updatePidFDPressure() {
-	pids, threads, filefd, pidsOK, threadsOK, fdOK, ok := c.kernelProcRatios()
+func (l *Latches) updatePidFDPressure() {
+	pids, threads, filefd, pidsOK, threadsOK, fdOK, ok := l.kernelProcRatios()
 	if !ok {
 		return // inconclusive — leave count, latch and gauges alone
 	}
-	c.writeKernelUtilProm(pids, threads, filefd, pidsOK, threadsOK, fdOK)
+	l.writeKernelUtilProm(pids, threads, filefd, pidsOK, threadsOK, fdOK)
 	worst, what := -1.0, ""
 	for _, r := range []struct {
 		v    float64
@@ -870,8 +872,8 @@ func (c *Collector) updatePidFDPressure() {
 			worst, what = r.v, r.name
 		}
 	}
-	countPath := c.statePath(pidFDCountFile)
-	latchPath := c.statePath("state-pid-fd-pressure")
+	countPath := l.statePath(pidFDCountFile)
+	latchPath := l.c.state.Path(hoststate.LatchPIDFDPressure)
 	if worst > kernelProcPressureRatio {
 		n := int64(1)
 		if b, err := os.ReadFile(countPath); err == nil {
@@ -886,7 +888,7 @@ func (c *Collector) updatePidFDPressure() {
 				"path", countPath, "error", err)
 		}
 		if n >= kernelProcPressureNeeded {
-			c.ensureStateLatch(latchPath, "state-pid-fd-pressure",
+			l.ensureStateLatch(latchPath, hoststate.LatchFilePrefix+hoststate.LatchPIDFDPressure,
 				fmt.Sprintf("%s ratio=%.3f", what, worst))
 		} else if _, err := os.Stat(latchPath); err == nil {
 			// A latch from an earlier episode outliving a fresh
@@ -913,11 +915,11 @@ func (c *Collector) updatePidFDPressure() {
 // atomic tmp+rename — the updateKernelKeysLatch pattern) and logs
 // the transition once; BUG-H6's refresh loop owns the mtime while
 // held.
-func (c *Collector) ensureStateLatch(path, name, evidence string) {
+func (l *Latches) ensureStateLatch(path, name, evidence string) {
 	if _, err := os.Stat(path); err == nil {
 		return
 	}
-	content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
+	content := strconv.FormatInt(l.c.cfg.nowFn().Unix(), 10) + "\n"
 	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
 		logger().Warn("hostmetrics: "+name+" latch write failed",
@@ -941,7 +943,7 @@ func (c *Collector) ensureStateLatch(path, name, evidence string) {
 // read-only adjtimex: Timex.Offset (µs) is the kernel's offset
 // estimate and STA_UNSYNC the sync verdict — enough to makestep and
 // (when the estimate exceeds 2s) to latch.
-func (c *Collector) clockSkewProbe() (float64, bool, bool) {
+func (l *Latches) clockSkewProbe() (float64, bool, bool) {
 	out, err := runHostCmd(context.Background(), "chronyc", "tracking")
 	if err == nil {
 		if off, synced, ok := parseChronycTracking(out); ok {
@@ -949,7 +951,7 @@ func (c *Collector) clockSkewProbe() (float64, bool, bool) {
 		}
 	}
 	var tx unix.Timex
-	if _, err := c.cfg.adjtimexFn(&tx); err != nil {
+	if _, err := l.c.cfg.adjtimexFn(&tx); err != nil {
 		return 0, false, false
 	}
 	return float64(tx.Offset) / 1e6,
@@ -991,13 +993,13 @@ func parseChronycTracking(out string) (float64, bool, bool) {
 // consecutive ticks. A >0.5s offset OR an unsynchronised clock earns
 // a `chronyc makestep` — rate-limited to one per 10m. Inconclusive
 // probes (no chronyc, adjtimex failure) leave count+latch alone.
-func (c *Collector) checkClockSkew() {
-	off, synced, ok := c.clockSkewProbe()
+func (l *Latches) checkClockSkew() {
+	off, synced, ok := l.clockSkewProbe()
 	if !ok {
 		return
 	}
 	if (!synced || math.Abs(off) > clockSkewStepOffset) &&
-		c.state.RateTrySpend(clockStepBudgetFile, clockSkewMakestepGap) {
+		l.c.state.RateTrySpend(clockStepBudgetFile, clockSkewMakestepGap) {
 		out, err := runHostCmd(context.Background(), "chronyc", "makestep")
 		if err != nil {
 			logger().Warn("hostmetrics: chronyc makestep failed",
@@ -1008,8 +1010,8 @@ func (c *Collector) checkClockSkew() {
 				"offset", off, "synced", synced)
 		}
 	}
-	countPath := c.statePath(clockSkewCountFile)
-	latchPath := c.statePath("state-clock-skew")
+	countPath := l.statePath(clockSkewCountFile)
+	latchPath := l.c.state.Path(hoststate.LatchClockSkew)
 	if math.Abs(off) > clockSkewLatchOffset {
 		n := int64(1)
 		if b, err := os.ReadFile(countPath); err == nil {
@@ -1024,7 +1026,7 @@ func (c *Collector) checkClockSkew() {
 				"path", countPath, "error", err)
 		}
 		if n >= clockSkewLatchNeeded {
-			c.ensureStateLatch(latchPath, "state-clock-skew",
+			l.ensureStateLatch(latchPath, hoststate.LatchFilePrefix+hoststate.LatchClockSkew,
 				fmt.Sprintf("offset=%.3fs synced=%v", off, synced))
 		}
 		return
@@ -1094,9 +1096,9 @@ func parseProcMounts(data []byte) []procMount {
 // kubelet pods dir (hostPath + PVC bind mounts alike). The mount
 // table reports HOST paths, so these are literal host paths —
 // OpenEBSLocalDir already follows that convention.
-func (c *Collector) pvcMountRoots() []string {
+func (l *Latches) pvcMountRoots() []string {
 	return []string{
-		c.cfg.OpenEBSLocalDir,
+		l.c.cfg.OpenEBSLocalDir,
 		"/opt/local-path-provisioner",
 		"/var/lib/k0s/kubelet/pods",
 	}
@@ -1104,14 +1106,14 @@ func (c *Collector) pvcMountRoots() []string {
 
 // roPVCMounts returns "mp (fstype)" for every ro ext4/xfs/btrfs
 // mount under a PVC root that isn't an expected Kubernetes ro bind.
-func (c *Collector) roPVCMounts() []string {
+func (l *Latches) roPVCMounts() []string {
 	// /proc/1/mounts is the host mount table under hostPID (the
 	// DaemonSet contract); ProcRoot/mounts covers odd layouts.
 	var data []byte
 	var err error
 	for _, p := range []string{
-		filepath.Join(c.cfg.ProcRoot, "1", "mounts"),
-		filepath.Join(c.cfg.ProcRoot, "mounts"),
+		filepath.Join(l.c.cfg.ProcRoot, "1", "mounts"),
+		filepath.Join(l.c.cfg.ProcRoot, "mounts"),
 	} {
 		if data, err = os.ReadFile(p); err == nil {
 			break
@@ -1120,7 +1122,7 @@ func (c *Collector) roPVCMounts() []string {
 	if err != nil {
 		return nil
 	}
-	roots := c.pvcMountRoots()
+	roots := l.pvcMountRoots()
 	var out []string
 	for _, m := range parseProcMounts(data) {
 		if !m.ro || !pvcMountFSTypes[m.fstype] {
@@ -1161,23 +1163,23 @@ func (c *Collector) roPVCMounts() []string {
 // The latch clears only when BOTH evidences are absent; an
 // unreadable mounts file contributes nothing (fail-safe, not
 // fail-latch).
-func (c *Collector) updateFSReadonlyEvidence() {
-	p := c.statePath("state-fs-readonly")
+func (l *Latches) updateFSReadonlyEvidence() {
+	p := l.c.state.Path(hoststate.LatchFSReadonly)
 	_, lerr := os.Stat(p)
 	evidence := ""
-	if b, err := os.ReadFile(c.statePath(kmsgFsErrorFile)); err == nil {
+	if b, err := os.ReadFile(l.statePath(kmsgFsErrorFile)); err == nil {
 		if f := strings.Fields(string(b)); len(f) > 0 {
 			if epoch, perr := strconv.ParseInt(f[0], 10, 64); perr == nil {
-				age := c.cfg.nowFn().Unix() - epoch
+				age := l.c.cfg.nowFn().Unix() - epoch
 				if age >= 0 && age < int64(fsErrorLatchTTL.Seconds()) {
 					evidence = "kernel-fs-error"
 				} else {
-					_ = os.Remove(c.statePath(kmsgFsErrorFile))
+					_ = os.Remove(l.statePath(kmsgFsErrorFile))
 				}
 			}
 		}
 	}
-	if ros := c.roPVCMounts(); len(ros) > 0 {
+	if ros := l.roPVCMounts(); len(ros) > 0 {
 		if evidence != "" {
 			evidence += " + "
 		}
@@ -1185,7 +1187,7 @@ func (c *Collector) updateFSReadonlyEvidence() {
 	}
 	switch {
 	case evidence != "" && lerr != nil:
-		c.ensureStateLatch(p, "state-fs-readonly", evidence)
+		l.ensureStateLatch(p, hoststate.LatchFilePrefix+hoststate.LatchFSReadonly, evidence)
 	case evidence == "" && lerr == nil:
 		if rerr := os.Remove(p); rerr != nil {
 			logger().Warn("hostmetrics: fs-readonly latch remove failed",
@@ -1204,11 +1206,11 @@ func (c *Collector) updateFSReadonlyEvidence() {
 // <HostRoot>/var/lib/node-exporter/textfile (the controllerhygiene
 // textfile-dir override parity: K0sDir's sibling under the same
 // convention).
-func (c *Collector) textfileDir() string {
+func (l *Latches) textfileDir() string {
 	if textfileDirOverride != "" {
 		return textfileDirOverride
 	}
-	return filepath.Join(c.cfg.HostRoot,
+	return filepath.Join(l.c.cfg.HostRoot,
 		"var", "lib", "node-exporter", "textfile")
 }
 
@@ -1219,7 +1221,7 @@ func (c *Collector) textfileDir() string {
 // node_exporter never reads a partial file. Failures log at Debug:
 // refreshLatches runs every 30s and an unwritable mount must not
 // spam the watchdog tail.
-func (c *Collector) writeKernelUtilProm(pids, threads, filefd float64,
+func (l *Latches) writeKernelUtilProm(pids, threads, filefd float64,
 	pidsOK, threadsOK, fdOK bool) {
 	var b promfile.Builder
 	if pidsOK {
@@ -1234,7 +1236,7 @@ func (c *Collector) writeKernelUtilProm(pids, threads, filefd float64,
 		b.Gauge("node_agent_file_nr_utilization_ratio",
 			"file-nr allocated over maximum — fd table pressure.", filefd)
 	}
-	dir := c.textfileDir()
+	dir := l.textfileDir()
 	if err := promfile.Write(dir,
 		"node-agent-kernel.prom", []byte(b.String())); err != nil {
 		logger().Debug("hostmetrics: kernel textfile install failed",
@@ -1245,5 +1247,5 @@ func (c *Collector) writeKernelUtilProm(pids, threads, filefd float64,
 // --- small Wave-10 helpers (uniquely named per file rules) ---
 //
 // The last-* rate budgets (conntrackBumpBudgetFile,
-// clockStepBudgetFile) go through c.state — the shared hoststate
+// clockStepBudgetFile) go through l.c.state — the shared hoststate
 // rateOK/rateSpend parity (atomic spend, same file format).
