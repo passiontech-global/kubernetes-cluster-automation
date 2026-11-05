@@ -189,26 +189,27 @@ const (
 )
 
 // State latch names — identical to the shell signal names (NPD +
-// prom_emit contract, node_watchdog_state{signal=...}).
+// prom_emit contract, node_watchdog_state{signal=...}); the values
+// come from the canonical hoststate latch registry.
 const (
-	stateCacheStale       = "apiserver-cache-stale"
-	stateCacheWedged      = "apiserver-cache-wedged"
-	stateKineUnreachable  = "kine-backend-unreachable"
-	stateKinePoolRunaway  = "kine-pool-runaway"
-	stateKineTTLDead      = "kine-ttl-dead"
-	stateKineTTLLoop      = "kine-ttl-loop"
-	stateControllerOOMLop = "k0scontroller-oom-loop"
+	stateCacheStale       = hoststate.LatchAPIServerCacheStale
+	stateCacheWedged      = hoststate.LatchAPIServerCacheWedged
+	stateKineUnreachable  = hoststate.LatchKineBackendUnreachable
+	stateKinePoolRunaway  = hoststate.LatchKinePoolRunaway
+	stateKineTTLDead      = hoststate.LatchKineTTLDead
+	stateKineTTLLoop      = hoststate.LatchKineTTLLoop
+	stateControllerOOMLop = hoststate.LatchK0sControllerOOMLoop
 	// stateJournalUnreadable latches while journal reads keep
 	// producing nothing although journal storage exists — every
 	// journal-grep check is blind until it clears (suspectLog's
 	// last-suspect- budget drops with the latch via stateExit).
-	stateJournalUnreadable = "journal-unreadable"
+	stateJournalUnreadable = hoststate.LatchJournalUnreadable
 	// W8-CP3 latch: a KCM/scheduler component frozen while the peer
 	// apiserver stays healthy.
-	stateCPComponentFrozen = "cp-component-frozen"
+	stateCPComponentFrozen = hoststate.LatchCPComponentFrozen
 	// W8-CP4 latch: an on-disk PKI cert newer than what the live
 	// socket presents — the daemon never reloaded the rotated cert.
-	statePKIReloadStale = "cp-cert-reload-stale"
+	statePKIReloadStale = hoststate.LatchCPCertReloadStale
 )
 
 // On-disk bookkeeping file names under WatchdogStateDir — same names

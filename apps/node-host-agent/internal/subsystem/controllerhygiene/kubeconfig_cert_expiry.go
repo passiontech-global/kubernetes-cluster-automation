@@ -19,6 +19,7 @@ import (
 
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
@@ -30,7 +31,7 @@ const checkKubeCert = "kubeconfig-cert"
 // client cert sits inside the warn window — surfaces through
 // node_host_agent_watchdog_state{state=...} like every other
 // state-* latch.
-const stateKubeCertExpiring = "kubeconfig-cert-expiring"
+const stateKubeCertExpiring = hoststate.LatchKubeconfigCertExpiring
 
 // kubeconfigCertMinDays is the W10-CP5 warn window (plan: <14d).
 var kubeconfigCertMinDays = 14.0

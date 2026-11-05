@@ -11,6 +11,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // podTeardownCheck is the 36-pod-teardown check as a Check; it owns
@@ -98,17 +100,17 @@ func (c *podTeardownCheck) Run(ctx context.Context, e *cycleEnv) {
 	case wedged >= 1:
 		c.fails++
 		if c.fails >= c.h.cfg.ConsecNeeded {
-			if c.h.state.Exists("node-overloaded") {
+			if c.h.state.Exists(hoststate.LatchNodeOverloaded) {
 				// Suppression parity: a wedge under overload is a
 				// symptom — rebooting would dump 100% of its load
 				// onto the remaining nodes (amplifier). Log-only,
 				// once per suppression episode.
-				if !c.h.state.Exists("pod-teardown-wedged") {
+				if !c.h.state.Exists(hoststate.LatchPodTeardownWedged) {
 					c.h.state.AppendLog(fmt.Sprintf(
 						"pod-teardown-wedged suppressed-overloaded stuck=%d", wedged))
 				}
 			} else {
-				c.h.state.Enter("pod-teardown-wedged", fmt.Sprintf("stuck=%d", wedged))
+				c.h.state.Enter(hoststate.LatchPodTeardownWedged, fmt.Sprintf("stuck=%d", wedged))
 			}
 		} else {
 			c.h.state.AppendLog(fmt.Sprintf("suspect: pod-teardown-wedged stuck=%d (check %d/%d)",
@@ -116,7 +118,7 @@ func (c *podTeardownCheck) Run(ctx context.Context, e *cycleEnv) {
 		}
 	default:
 		c.fails = 0
-		c.h.state.Exit("pod-teardown-wedged", nil)
+		c.h.state.Exit(hoststate.LatchPodTeardownWedged, nil)
 	}
 	c.h.cycles.WithLabelValues(checkTeardown, "ok").Inc()
 }
@@ -229,13 +231,13 @@ func (c *konnCheck) Run(ctx context.Context, e *cycleEnv) {
 		// Healthy or inconclusive (no node-ip parsed / no proxy-agent
 		// found — e.g. konnectivity not deployed): reset, drop latch.
 		c.fails = 0
-		c.h.state.Exit("konnectivity-ip-mismatch", nil)
+		c.h.state.Exit(hoststate.LatchKonnectivityIPMismatch, nil)
 		c.h.cycles.WithLabelValues(checkKonn, "ok").Inc()
 		return
 	}
 
 	c.fails++
-	c.h.state.Enter("konnectivity-ip-mismatch",
+	c.h.state.Enter(hoststate.LatchKonnectivityIPMismatch,
 		fmt.Sprintf("host=%s node-ip=%s", agentHost, nodeIP))
 	if c.fails >= c.h.cfg.ConsecNeeded &&
 		c.h.state.RateTrySpend("last-konn-restart", c.h.cfg.MinRestartInterval) {
@@ -397,7 +399,7 @@ func (c *dnsResolvCheck) Run(_ context.Context, e *cycleEnv) {
 
 	if len(stale) == 0 {
 		c.fails = 0
-		c.h.state.Exit("dns-resolv-stale", nil)
+		c.h.state.Exit(hoststate.LatchDNSResolvStale, nil)
 		c.h.cycles.WithLabelValues(checkDNS, "ok").Inc()
 		return
 	}
@@ -409,7 +411,7 @@ func (c *dnsResolvCheck) Run(_ context.Context, e *cycleEnv) {
 	staleStr := strings.Join(specs, " ")
 	// Latch first — the state file is what NPD's permanent
 	// DnsResolvStale condition checks; the counter gates the action.
-	c.h.state.Enter("dns-resolv-stale", staleStr)
+	c.h.state.Enter(hoststate.LatchDNSResolvStale, staleStr)
 	c.fails++
 	switch {
 	case c.fails >= c.h.cfg.ConsecNeeded &&

@@ -96,110 +96,13 @@ const (
 	checkIPMonitor   = "ip-monitor"
 )
 
-// knownLatchNames — every state-<name> latch an enabled check can
-// currently produce, collected from the real latch-write sites:
-//
-//	workerhygiene (stateEnter callers):
-//	  pod-teardown-wedged (36), konnectivity-ip-mismatch (30),
-//	  dns-resolv-stale (33), kubelet-runtime-stall (05),
-//	  kubelet-watch-wedge (06), cilium-agent-down (32),
-//	  cilium-init-stuck (35), kubelet-healthz-down (T15 remediate),
-//	  kubelet-syncloop-down / containerd-sock-down (A4),
-//	  cilium-envoy-down (B1), cilium-mtu-drift (B4),
-//	  zombie-storm (A2), d-state-storm (W7-H1),
-//	  cilium-envoy-xds-reject (W7-H3), spegel-mirror-degraded (W7-H4),
-//	  calico-veth-leak / calico-felix-down (W7-H7),
-//	  cilium-bpf-map-pressure (W8-NM3), psi-memory-thrash (W2),
-//	  kernel-slab-leak (W9-KR3)
-//	nethealth: dns-fallback (20), nebula-isolated/-degraded/-slowpath/
-//	  -siteedge (13), fail2ban-down (50), clock-unsync (H1),
-//	  conntrack-pressure (H2), nebula-pmtu-blackhole (W9-NM1)
-//	controllerhygiene: apiserver-cache-stale/-wedged (sig13),
-//	  kine-backend-unreachable, kine-pool-runaway, kine-ttl-dead,
-//	  kine-ttl-loop, k0scontroller-oom-loop, cp-cert-reload-stale (W8-CP4),
-//	  cp-component-frozen (W8-CP3)
-//	controllerhygiene + workerhygiene (shared journalwatch tracker):
-//	  journal-unreadable
-//	hostmetrics: node-overloaded (PSI hysteresis), filesystem-readonly,
-//	  nebula-cert-expiring, kernel-keys-pressure (W8-KR3)
-var knownLatchNames = map[string]bool{
-	"pod-teardown-wedged":      true,
-	"konnectivity-ip-mismatch": true,
-	"dns-resolv-stale":         true,
-	"kubelet-runtime-stall":    true,
-	"kubelet-watch-wedge":      true,
-	"cilium-agent-down":        true,
-	"cilium-init-stuck":        true,
-	"cilium-ipam-exhausted":    true,
-	"kubelet-healthz-down":     true,
-	"dns-fallback":             true,
-	"nebula-isolated":          true,
-	"nebula-degraded":          true,
-	"nebula-slowpath":          true,
-	"nebula-siteedge":          true,
-	"fail2ban-down":            true,
-	"clock-unsync":             true,
-	"conntrack-pressure":       true,
-	"apiserver-cache-stale":    true,
-	"apiserver-cache-wedged":   true,
-	"kine-backend-unreachable": true,
-	"kine-pool-runaway":        true,
-	"kine-ttl-dead":            true,
-	"kine-ttl-loop":            true,
-	"k0scontroller-oom-loop":   true,
-	"node-overloaded":          true,
-	"nebula-cert-expiring":     true,
-	"kubelet-syncloop-down":    true, // A4
-	"containerd-sock-down":     true, // A4
-	"cilium-envoy-down":        true, // B1
-	"cilium-mtu-drift":         true, // B4
-	"zombie-storm":             true, // A2
-	"journal-unreadable":       true, // journalwatch tracker (both hygienes)
-	"filesystem-readonly":      true, // W5.3 hostmetrics ST_RDONLY
-	"cilium-wg-peer-wipe":      true, // W5.6 cilium WireGuard drift
-	"disk-bloat":               true, // W6.3 disk-bloat runaway
-	"d-state-storm":            true, // W7-H1 kernel hung tasks
-	"cilium-envoy-xds-reject":  true, // W7-H3 envoy xDS NACK
-	"spegel-mirror-degraded":   true, // W7-H4 spegel P2P mirror
-	"calico-veth-leak":         true, // W7-H7 orphan cali* veth leak
-	"calico-felix-down":        true, // W7-H7 felix readiness
-	"cilium-bpf-map-pressure":  true, // W8-NM3 cilium BPF map fill ratio
-	"psi-memory-thrash":        true, // W2 PSI memory thrash guard
-	"kernel-keys-pressure":     true, // hostmetrics kernel keyring quota (W8-KR3)
-	"cp-cert-reload-stale":     true, // controllerhygiene cert reload (W8-CP4)
-	"cp-component-frozen":      true, // controllerhygiene KCM/scheduler freeze (W8-CP3)
-	"kernel-slab-leak":         true, // workerhygiene SUnreclaim guard (W9-KR3)
-	"nebula-pmtu-blackhole":    true, // nethealth DF PMTU probe (W9-NM1)
-	// W10 latch names — same reap rule either way; listed so the
-	// janitor log classifies them under `rule=` correctly.
-	"pid-fd-pressure":          true, // hostmetrics KR2 pid/thread/fd pressure
-	"clock-skew":               true, // hostmetrics KR5 chrony/NTP skew
-	"fs-readonly":              true, // hostmetrics ST1 ro sub-mount prober
-	"containerd-corrupt":       true, // workerhygiene KR3 BoltDB/orphan shims
-	"kubeconfig-cert-expiring": true, // controllerhygiene kubeconfig_cert_expiry.go
-	"nebula-mtu-blackhole":     true, // nethealth routeguard NM4 DF-probe MTU
-}
-
-// knownLatchPrefixes — parameterized latch families whose suffix is
-// minted per target at write time.
-var knownLatchPrefixes = []string{
-	"apiserver-backend-stale-", // apiprober per-backend <ip-dashed>
-	"cilium-ipam-",             // cilium IPAM family (38) — exhausted, ...
-}
-
-// isKnownLatchName reports whether a state-<?> suffix is in the
-// registry of currently-producible latch names.
-func isKnownLatchName(key string) bool {
-	if knownLatchNames[key] {
-		return true
-	}
-	for _, p := range knownLatchPrefixes {
-		if strings.HasPrefix(key, p) {
-			return true
-		}
-	}
-	return false
-}
+// The registry of currently-producible state-<name> latch names
+// (exact names + the parameterized families whose suffix is minted
+// per target at write time) lives in platform/hoststate —
+// hoststate.LatchDefs / hoststate.KnownLatchName, cross-checked
+// against every latch-write site. The janitor only consumes it: a
+// reaped latch is classified rule=max-age for a registered name and
+// rule=unknown for anything else.
 
 // legacyUnitNames — the retired shell-watchdog units, mirroring
 // hostconfig's legacyWatchdogUnits list (hostconfig owns the unit
@@ -391,7 +294,7 @@ func (j *Janitor) sweepLatches() {
 	}
 	now := j.cfg.nowFn()
 	for _, e := range entries {
-		key, ok := strings.CutPrefix(e.Name(), "state-")
+		key, ok := strings.CutPrefix(e.Name(), hoststate.LatchFilePrefix)
 		if !ok {
 			continue
 		}
@@ -411,7 +314,7 @@ func (j *Janitor) sweepLatches() {
 		switch {
 		case age < 0 || age <= j.cfg.LatchMaxAge:
 			continue
-		case !isKnownLatchName(key):
+		case !hoststate.KnownLatchName(key):
 			rule = "unknown"
 		default:
 			rule = "max-age"

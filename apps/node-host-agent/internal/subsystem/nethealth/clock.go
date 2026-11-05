@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 const (
@@ -51,7 +53,7 @@ func (n *NetHealth) checkClockSync(ctx context.Context) {
 	}
 	if bad == "" {
 		n.clockFails = 0
-		n.stateExit("clock-unsync")
+		n.stateExit(hoststate.LatchClockUnsync)
 		n.cycles.WithLabelValues(checkClock, "ok").Inc()
 		return
 	}
@@ -62,11 +64,11 @@ func (n *NetHealth) checkClockSync(ctx context.Context) {
 		n.cycles.WithLabelValues(checkClock, "ok").Inc()
 		return
 	}
-	n.state.Enter("clock-unsync", bad)
+	n.state.Enter(hoststate.LatchClockUnsync, bad)
 	if n.state.RateOK("last-ntp-restart", ntpRestartInterval) {
 		n.restartNTPDaemon(ctx)
 	} else {
-		n.state.SuspectLog("clock-unsync", "suspect: clock-unsync persists "+
+		n.state.SuspectLog(hoststate.LatchClockUnsync, "suspect: clock-unsync persists "+
 			"but ntp restart cooldown (<30m), skip", suspectLogCadence)
 	}
 	n.cycles.WithLabelValues(checkClock, "ok").Inc()

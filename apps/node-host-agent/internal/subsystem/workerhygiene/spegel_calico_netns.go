@@ -12,6 +12,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // spegelCheck is the W7-H4 mirror-peer guard as a Check; it owns
@@ -53,7 +55,7 @@ func (c *spegelCheck) Run(ctx context.Context, e *cycleEnv) {
 		// way the mirror datapath isn't our problem; clear stale
 		// evidence like checkCilium's no-agent path.
 		c.fails = 0
-		c.h.state.Exit("spegel-mirror-degraded", nil)
+		c.h.state.Exit(hoststate.LatchSpegelMirrorDegraded, nil)
 		c.h.cycles.WithLabelValues(checkSpegel, "ok").Inc()
 		return
 	}
@@ -65,7 +67,7 @@ func (c *spegelCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkSpegel, "ok").Inc()
 		return
 	}
-	c.h.state.Enter("spegel-mirror-degraded",
+	c.h.state.Enter(hoststate.LatchSpegelMirrorDegraded,
 		fmt.Sprintf("pod=%s/%s ready_fails=%d", sp.Namespace, sp.Name, c.fails))
 	if !c.h.state.RateTrySpend("last-spegel-restart", c.h.cfg.MinRestartInterval) {
 		c.h.state.AppendLog(fmt.Sprintf(
@@ -153,8 +155,8 @@ func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 		// guard family; drop stale evidence like checkCiliumWGPeers.
 		c.vethFails = 0
 		c.felixFails = 0
-		c.h.state.Exit("calico-veth-leak", nil)
-		c.h.state.Exit("calico-felix-down", nil)
+		c.h.state.Exit(hoststate.LatchCalicoVethLeak, nil)
+		c.h.state.Exit(hoststate.LatchCalicoFelixDown, nil)
 		c.h.cycles.WithLabelValues(checkCalico, "ok").Inc()
 		return
 	}
@@ -164,8 +166,8 @@ func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 		// sysfs reports -1 the same way: nothing to verify).
 		c.vethFails = 0
 		c.felixFails = 0
-		c.h.state.Exit("calico-veth-leak", nil)
-		c.h.state.Exit("calico-felix-down", nil)
+		c.h.state.Exit(hoststate.LatchCalicoVethLeak, nil)
+		c.h.state.Exit(hoststate.LatchCalicoFelixDown, nil)
 		c.h.cycles.WithLabelValues(checkCalico, "ok").Inc()
 		return
 	}
@@ -179,12 +181,12 @@ func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 	if cali > len(e.pods)+c.h.cfg.Calico.OrphanVethThreshold {
 		c.vethFails++
 		if c.vethFails >= c.h.cfg.ConsecNeeded {
-			if !c.h.state.Exists("calico-veth-leak") {
+			if !c.h.state.Exists(hoststate.LatchCalicoVethLeak) {
 				c.h.state.AppendLog(fmt.Sprintf(
 					"suspect: calico-hygiene orphan veth leak cali=%d pods=%d threshold=%d — CNI DEL cleanup is leaking veth pairs",
 					cali, len(e.pods), c.h.cfg.Calico.OrphanVethThreshold))
 			}
-			c.h.state.Enter("calico-veth-leak",
+			c.h.state.Enter(hoststate.LatchCalicoVethLeak,
 				fmt.Sprintf("cali=%d pods=%d", cali, len(e.pods)))
 		} else {
 			c.h.state.AppendLog(fmt.Sprintf(
@@ -193,7 +195,7 @@ func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 		}
 	} else {
 		c.vethFails = 0
-		c.h.state.Exit("calico-veth-leak", nil)
+		c.h.state.Exit(hoststate.LatchCalicoVethLeak, nil)
 	}
 	// Check 1b — orphan-veth GC (W8-NM3): while the leak latch is
 	// set, reap cali* host veths that stayed DOWN (carrier 0) for
@@ -203,7 +205,7 @@ func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 	// confirm-marker shape as wedged-seen-* (a veth must not be
 	// deleted on a single read: an interface mid-creation can read
 	// carrier 0 for a moment).
-	if c.h.state.Exists("calico-veth-leak") {
+	if c.h.state.Exists(hoststate.LatchCalicoVethLeak) {
 		c.h.gcCalicoOrphanVeths(ctx)
 	}
 	// Check 2 — felix readiness, gated on a Running calico-node pod
@@ -221,13 +223,13 @@ func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 	switch {
 	case felix == nil || c.h.cfg.Calico.FelixReadyURL == "":
 		c.felixFails = 0
-		c.h.state.Exit("calico-felix-down", nil)
+		c.h.state.Exit(hoststate.LatchCalicoFelixDown, nil)
 	default:
 		code, err := c.h.cfg.Seams.probeHTTPStatus(ctx,
 			c.h.cfg.Calico.FelixReadyURL, "", ciliumProbeTime)
 		if err == nil && code == http.StatusOK {
 			c.felixFails = 0
-			c.h.state.Exit("calico-felix-down", nil)
+			c.h.state.Exit(hoststate.LatchCalicoFelixDown, nil)
 			break
 		}
 		c.felixFails++
@@ -237,7 +239,7 @@ func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 				code, err, c.felixFails, c.h.cfg.ConsecNeeded))
 			break
 		}
-		c.h.state.Enter("calico-felix-down",
+		c.h.state.Enter(hoststate.LatchCalicoFelixDown,
 			fmt.Sprintf("readiness_probe_fails=%d", c.felixFails))
 		// W8-NM3: a felix datapath whose readiness stayed dark
 		// across calicoFelixRestartFails consecutive cycles is a
@@ -245,7 +247,7 @@ func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 		// the DaemonSet rebuilds it (last-calico-restart budget).
 		if c.felixFails >= calicoFelixRestartFails {
 			switch {
-			case c.h.state.Exists("node-overloaded"):
+			case c.h.state.Exists(hoststate.LatchNodeOverloaded):
 				c.h.state.AppendLog(fmt.Sprintf(
 					"suspect: calico-felix-down %dx but node overloaded — skip pod restart", c.felixFails))
 			case !c.h.state.RateTrySpend("last-calico-restart", c.h.cfg.MinRestartInterval):

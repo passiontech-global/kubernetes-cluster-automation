@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -157,7 +158,7 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 		st.mu.Lock()
 		st.mtuFails = 0
 		st.mu.Unlock()
-		n.stateExit("nebula-mtu-blackhole")
+		n.stateExit(hoststate.LatchNebulaMTUBlackhole)
 	}
 	if wd == nil || wd.NebulaNet == "" ||
 		!n.unitEnabledActive(ctx, "nebula@"+wd.NebulaNet) ||
@@ -194,12 +195,12 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 		st.mtuFails++
 		fails := st.mtuFails
 		st.mu.Unlock()
-		n.state.SuspectLog("nebula-mtu-blackhole", fmt.Sprintf(
+		n.state.SuspectLog(hoststate.LatchNebulaMTUBlackhole, fmt.Sprintf(
 			"suspect: nebula-mtu-blackhole df_probe_failed peer=%s size=%s (check %d/%d): %v (%s)",
 			peer, mtuDFSize, fails, mtuBlackholeNeeded, err,
 			trimRunErr(out)), suspectLogCadence)
 		if fails >= mtuBlackholeNeeded {
-			n.state.Enter("nebula-mtu-blackhole",
+			n.state.Enter(hoststate.LatchNebulaMTUBlackhole,
 				fmt.Sprintf("peer=%s df_size=%s", peer, mtuDFSize))
 			n.maybeClampNebulaMSS(ctx, wd, st)
 		}
@@ -207,7 +208,7 @@ func (n *NetHealth) checkNebulaMTUBlackhole(ctx context.Context,
 	}
 	st.mtuFails = 0
 	st.mu.Unlock()
-	n.stateExit("nebula-mtu-blackhole")
+	n.stateExit(hoststate.LatchNebulaMTUBlackhole)
 }
 
 // maybeClampNebulaMSS installs the TCPMSS clamp on the overlay dev —
@@ -259,7 +260,7 @@ func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 // skip the rewrite so the file's mtime tracks real changes.
 func (n *NetHealth) writeMTUBHMetric(st *mtuProbeState) {
 	v := "0"
-	if n.state.Exists("nebula-mtu-blackhole") {
+	if n.state.Exists(hoststate.LatchNebulaMTUBlackhole) {
 		v = "1"
 	}
 	st.mu.Lock()

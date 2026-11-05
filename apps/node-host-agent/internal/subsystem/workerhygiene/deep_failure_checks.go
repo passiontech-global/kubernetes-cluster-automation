@@ -15,6 +15,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // ===========================================================================
@@ -109,11 +111,11 @@ func (c *ctrMetaCheck) Run(ctx context.Context, e *cycleEnv) {
 			"suspect: containerd meta.db corruption evidence (%s) — run %d/%d",
 			evidence, c.fails, c.h.cfg.ConsecNeeded))
 		if c.fails >= c.h.cfg.ConsecNeeded {
-			c.h.state.Enter("containerd-corrupt", evidence)
+			c.h.state.Enter(hoststate.LatchContainerdCorrupt, evidence)
 		}
 	} else {
 		c.fails = 0
-		c.h.state.Exit("containerd-corrupt", nil)
+		c.h.state.Exit(hoststate.LatchContainerdCorrupt, nil)
 	}
 	c.h.cycles.WithLabelValues(checkCtrMeta, "ok").Inc()
 }
