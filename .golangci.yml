@@ -36,14 +36,16 @@ linters:
       # cover every form. App scoping comes from the deny `pkg`
       # prefixes, which carry the node-host-agent module path (the
       # other apps have no internal/platform|internal/agent layout
-      # anyway). The two real invariants (see
+      # anyway). The three real invariants (see
       # apps/node-host-agent/AGENTS.md):
-      #   - internal/platform/** is the leaf layer (envx, logx,
-      #     hoststate, systemd, ...): it must never import the
-      #     runtime or domain layers above it.
+      #   - internal/platform/** is the leaf layer (hoststate,
+      #     systemd, ...; envx/logx moved out to libs/hostkit): it
+      #     must never import the runtime or domain layers above it.
       #   - internal/agent/** is the runtime (metrics/probe servers +
       #     subsystem supervisor): it must not import the domain
       #     layers either — subsystems get wired in cmd/agent.
+      #   - libs/hostkit is the shared stdlib-only leaf module: it
+      #     must never import back into an app module.
       # Deliberately NOT denied: internal/subsystem <-> internal/ops
       # cross-imports are the documented two-way convention (domain
       # logic usable by both a periodic subsystem and a one-shot op
@@ -70,6 +72,12 @@ linters:
               desc: "internal/agent is the runtime layer; subsystems are wired in cmd/agent, not imported here"
             - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops"
               desc: "internal/agent is the runtime layer; ops are wired in cmd/agent, not imported here"
+        hostkit-is-leaf:
+          files:
+            - "**/libs/hostkit/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps"
+              desc: "libs/hostkit is a shared stdlib-only leaf module; it must not import any app module"
 
     staticcheck:
       # -QF*: quick-fix style suggestions (De Morgan's law, tagged

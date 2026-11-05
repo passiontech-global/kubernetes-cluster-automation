@@ -21,8 +21,11 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
 - `internal/agent` — the runtime: shared `prometheus.Registry`,
   metrics/probe HTTP servers, and the subsystem supervisor
   (`Subsystem` = `Name() + Run(ctx)`, a blocking loop).
-- `internal/platform/*` — leaf libraries: envx (env knobs/Mode),
-  logx (slog), cycle (period loop), checks (check-group dispatch),
+- `libs/hostkit` (repo root, separate Go module wired via replace +
+  go.work) — shared leaf libraries that used to live here:
+  `envx` (env knobs/Mode/Knob tables) and `logx` (named slog loggers).
+- `internal/platform/*` — leaf libraries: cycle (period loop),
+  checks (check-group dispatch),
   hoststate (`state-*`/`last-*` latch files), hostexec, hostutil,
   systemd, watchdogconf, probee, procfs, journalwatch, promfile,
   kmsg, pagecache, topology, jinja, sshclient.

@@ -1,7 +1,8 @@
-// Package envx packages the env-getter helpers cmd/agent used to parse
-// NODE_HOST_AGENT_* knobs, so subsystem packages can own their env
-// contracts. Each func reads os.Getenv itself; unset/empty semantics
-// mirror the original helpers exactly.
+// Package envx packages the env-getter helpers shared by the apps in
+// this monorepo — originally lifted out of node-host-agent's cmd/agent,
+// which used them to parse its NODE_HOST_AGENT_* knobs — so subsystem
+// packages can own their env contracts. Each func reads os.Getenv
+// itself; unset/empty semantics mirror the original helpers exactly.
 package envx
 
 import (

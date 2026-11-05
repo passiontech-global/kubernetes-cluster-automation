@@ -12,6 +12,7 @@ on:
     branches: [main]
     paths:
       - "apps/node-host-agent/**"
+      - "libs/hostkit/**"
       - ".moon/**"
       - "mise.toml"
       - ".github/workflows/release-app.yml"

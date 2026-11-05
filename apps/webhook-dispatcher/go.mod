@@ -2,7 +2,10 @@ module github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-
 
 go 1.27.3
 
-require github.com/prometheus/client_golang v1.25.0
+require (
+	github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit v0.0.0
+	github.com/prometheus/client_golang v1.25.0
+)
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -18,3 +21,5 @@ require (
 	golang.org/x/sys v0.49.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+replace github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit => ../../libs/hostkit

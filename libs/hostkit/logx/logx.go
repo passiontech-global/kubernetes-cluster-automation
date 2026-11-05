@@ -1,4 +1,5 @@
-// Package logx provides named slog loggers for packages in this module.
+// Package logx provides named slog loggers for packages across the
+// apps in this monorepo (it lives in libs/hostkit, shared via replace).
 //
 // For resolves slog.With per call so the handler picked up is always the
 // current slog.Default() — a package-level var would bind the pre-main

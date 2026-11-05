@@ -4,4 +4,5 @@ use (
 	./apps/node-automation-controller
 	./apps/node-host-agent
 	./apps/webhook-dispatcher
+	./libs/hostkit
 )

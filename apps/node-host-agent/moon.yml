@@ -4,6 +4,10 @@ language: 'go'
 layer: 'application'
 stack: 'backend'
 
+# hostkit change -> this project's tasks are affected (moon ci).
+dependsOn:
+  - 'hostkit'
+
 project:
   title: 'node-host-agent'
   description: 'Per-node agent (DaemonSet) for the kubernetes-node-automation stack.'
@@ -31,13 +35,17 @@ tasks:
     # install packages. .ko.yaml is kept as a local-only fallback.
     # Callers (release-app.yml) export KO_DOCKER_REPO + TAGS + VERSION
     # and have already `docker login`'d ghcr.io.
+    # Build context is the repo ROOT (moon runs this script from the
+    # project dir) so the go.mod `replace ../../libs/hostkit` target is
+    # inside the context; .dockerignore resolution likewise moves to
+    # the root .dockerignore.
     script: |
       set -eu
       args=""
       for t in $(echo "${TAGS:-latest}" | tr ',' ' '); do
         args="$args -t ${KO_DOCKER_REPO:?KO_DOCKER_REPO unset}:$t"
       done
-      docker build --build-arg "VERSION=${VERSION:-dev}" $args .
+      docker build --build-arg "VERSION=${VERSION:-dev}" $args -f "$PWD/Dockerfile" "$PWD/../.."
       for t in $(echo "${TAGS:-latest}" | tr ',' ' '); do
         docker push "${KO_DOCKER_REPO}:$t"
       done
@@ -48,7 +56,9 @@ tasks:
       - 'go.mod'
       - 'go.sum'
       - 'Dockerfile'
-      - '.dockerignore'
+      - '/.dockerignore'
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
     options:
       # script is a multi-line shell snippet — must run via shell.
       shell: true
