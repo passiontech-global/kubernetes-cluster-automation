@@ -269,7 +269,7 @@ func (h *Hygiene) saveKCMSnapshot(s *kcmQueueSnapshot) {
 	if err != nil {
 		return
 	}
-	dir := h.cfg.WatchdogStateDir
+	dir := h.state.Dir
 	tmp := filepath.Join(dir, ".tmp-"+fileKCMQueueSnap)
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		logger().Warn("controllerhygiene: kcm snapshot write failed",

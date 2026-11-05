@@ -292,6 +292,7 @@ func (w *wiring) wireControllerHygiene() {
 			controllerhygiene.EnvDeps{
 				Watchdog:                w.wdCfg,
 				WatchdogSrc:             w.wdReloader,
+				Systemd:                 w.sdClient,
 				WatchdogStateDir:        w.watchdogStateDir,
 				WatchdogLogFile:         w.watchdogLogFile,
 				JournalDirs:             w.journalDirs,

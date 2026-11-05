@@ -209,7 +209,19 @@ func New(cfg Config) *Runner {
 // stderr goes to the child's stderr. ctx is additionally bounded by
 // Config.Timeout.
 func (r *Runner) Exec(ctx context.Context, ns NS, name string, args ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, r.cfg.Timeout)
+	return r.ExecBounded(ctx, ns, r.cfg.Timeout, name, args...)
+}
+
+// ExecBounded is Exec with a per-call budget in place of
+// Config.Timeout — for remediations whose bound is deliberately
+// longer than the runner default (the apiserver wedge gate's
+// `timeout 90 systemctl restart`). ctx still bounds the call from
+// above. budget <= 0 falls back to Config.Timeout.
+func (r *Runner) ExecBounded(ctx context.Context, ns NS, budget time.Duration, name string, args ...string) (string, error) {
+	if budget <= 0 {
+		budget = r.cfg.Timeout
+	}
+	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	return r.cfg.RunCmd(cctx, r.argv(ns, name, args))
 }
@@ -221,7 +233,16 @@ func (r *Runner) Exec(ctx context.Context, ns NS, name string, args ...string) (
 // code). Callers that only want stdout keep Exec — the signature
 // contract is unchanged.
 func (r *Runner) ExecCombined(ctx context.Context, ns NS, name string, args ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, r.cfg.Timeout)
+	return r.ExecCombinedBounded(ctx, ns, r.cfg.Timeout, name, args...)
+}
+
+// ExecCombinedBounded is ExecBounded with stderr folded into the
+// returned output — the ExecCombined/ExecBounded pairing.
+func (r *Runner) ExecCombinedBounded(ctx context.Context, ns NS, budget time.Duration, name string, args ...string) (string, error) {
+	if budget <= 0 {
+		budget = r.cfg.Timeout
+	}
+	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	return r.cfg.RunCmdCombined(cctx, r.argv(ns, name, args))
 }

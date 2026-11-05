@@ -40,9 +40,15 @@
 //   - journalctl greps go through an injectable journal reader; a
 //     journal read error maps to empty output (grep -c == 0), the
 //     same degraded behaviour as `timeout 15 journalctl ... || true`.
+//     The default reader is the shared platform/systemd client —
+//     nsenter-wrapped to the HOST journald, so the checks see real
+//     journal data inside the DaemonSet (the pod's own journal view
+//     is empty).
 //   - systemctl invocations go through injectable funcs defaulting to
-//     `systemctl` exec with NOTIFY_SOCKET/WATCHDOG_* scrubbed from the
-//     child env (the journal-spam fix the shell feeder applied).
+//     the shared platform/systemd client — nsenter-wrapped host exec —
+//     with NOTIFY_SOCKET/WATCHDOG_* scrubbed from the child env via an
+//     `env -u` argv prefix (the journal-spam fix the shell feeder
+//     applied; the shared exec seam carries no env slot).
 //   - The feeder cannot "exit 1": on max-fail/notify-fail it runs the
 //     remediate gates inline and re-arms — the in-agent equivalent of
 //     unit failed -> OnFailure oneshot -> Restart=always.
@@ -56,27 +62,21 @@ package controllerhygiene
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"crypto/x509"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdrescue"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
@@ -84,6 +84,7 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/procfs"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -162,31 +163,9 @@ const (
 	defaultRemediateGrace  = 90 * time.Second // WDREM_FRESH_GRACE_S=90
 	defaultPeerFile        = "/host/etc/default/k0scontroller-watchdog"
 
-	// etcdguard (embedded-etcd quota self-defence — cicd
-	// controllers; kine hosts lack <K0sDir>/bin/etcdctl and no-op).
-	defaultK0sDir          = "/host/var/lib/k0s" // DaemonSet host mount
-	defaultEtcdEndpoint    = "https://127.0.0.1:2379"
-	defaultEtcdDBSizeLimit = int64(1610612736) // 1.5 GiB
-	defaultEtcdGuardMinRun = time.Hour         // last-etcd-guard budget
-	defaultEtcdctlBudget   = 60 * time.Second  // ctx cap per etcdctl call
-	etcdctlCmdTimeout      = "30s"             // etcdctl --command-timeout
-	// Bound on the whole evpurge+rescue remediation block: evpurge
-	// is unbounded pagination + delete work at the apiserver's pace
-	// and the rescue is ~12 sequential etcdctl calls — driven by
-	// the process-lifetime ctx, a degraded backend could stall one
-	// (synchronous) cycle for hours. Both steps are idempotent and
-	// last-etcd-guard is spent up front, so exhausting this only
-	// defers the remainder to the next EtcdGuardMinRun window.
-	defaultEtcdGuardBudget = 10 * time.Minute
-	// Each rescue-spawned command gets a far shorter cap than
-	// etcdrescue's defaultCallTimeout (10m — sized for an operator
-	// at a shell): ~12 sequential calls then stay near the guard
-	// budget instead of ~2h.
-	defaultEtcdGuardCallTimeout = time.Minute
-	// eventStaleAge is the apiserver's own 1h event TTL — anything
-	// older is GC debt the purge may safely delete (fresh, debuggable
-	// events survive the guard's evpurge pass).
-	eventStaleAge = time.Hour
+	// defaultK0sDir is the shared k0s data dir — etcdguard probes
+	// under it and the PKI-drift default pairs derive from it.
+	defaultK0sDir = "/host/var/lib/k0s" // DaemonSet host mount
 	// defaultSuspectLogCadence is the re-reminder interval suspectLog
 	// applies to suspect/hold lines whose latch stays held: STATE-
 	// ENTER announces the transition and the raw line then repeats
@@ -203,7 +182,6 @@ const (
 	checkKinePool = "kine-pool"
 	checkOOMLoop  = "oomloop"
 	checkFeeder   = "feeder"
-	checkEtcd     = "etcd-quota"
 	// checkJournal is the pseudo-check label the journal-unreadable
 	// blindness accounting counts under — journald readability is a
 	// cross-cutting witness, not one of the gated checks.
@@ -239,7 +217,6 @@ const (
 	fileRateRestart   = "last-sig13-restart" // shared restart budget
 	fileRateTTLKill   = "last-ttl-restart"
 	fileRatePoolKill  = "last-kinepool-kill"
-	fileRateEtcdGuard = "last-etcd-guard" // evpurge+rescue budget
 	fileCtrGap        = "consecutive-sig13-gap"
 	fileCtrFrozen     = "consecutive-sig13-frozen"
 	fileCtrPeerFrozen = "consecutive-sig13-peer-frozen"
@@ -349,6 +326,17 @@ type Config struct {
 	// HTTPClient, when set, is used for ALL apiserver queries (rv
 	// probes) and overrides the credential files — test seam.
 	HTTPClient *http.Client
+	// Systemd drives every host command the seam defaults spawn —
+	// journalctl (journalFn/journalAnyFn), systemctl restart/show/
+	// is-active (restartFn/propFn/isActive) and `ss -K` (ssKillFn) —
+	// nsenter-wrapped to host PID 1's namespaces inside the
+	// DaemonSet, so they act on the host's systemd, journald and
+	// network namespace instead of the pod's (a container-side
+	// journalctl reads the pod's empty journal view; a
+	// container-side systemctl has no dbus socket). nil → the seam
+	// defaults report "no systemd client wired" and the dependent
+	// checks degrade (workerhygiene parity).
+	Systemd *systemd.Client
 
 	// JournalDirs are the host journal storage roots — the
 	// journal-unreadable latch may only fire while at least one
@@ -426,7 +414,7 @@ type Config struct {
 	// stderr folded in. A quiet unit on a healthy journald must NOT
 	// count as blindness; only when journald itself has nothing (or
 	// only "No journal files") to say does the empty window count.
-	// nil → journalctlAny.
+	// nil → the shared systemd client (hostExecCtx, ExecCombined).
 	journalAnyFn func(ctx context.Context) (string, error)
 
 	// --- injectable seams for W8 additions (defaults follow) ---
@@ -750,37 +738,71 @@ func (c *Config) applyDefaults() {
 			return syscall.Kill(pid, sig)
 		}
 	}
+	sd := c.Systemd
 	if c.journalFn == nil {
-		c.journalFn = journalctl
+		// `timeout 15 journalctl -u <unit> --since <ts> --no-pager` —
+		// routed through the shared client: nsenter-wrapped to the
+		// HOST journald (the previous raw exec read the container's
+		// journal view, empty in the DaemonSet), stderr folded in so
+		// the corrupt/no-journal-files diagnostics stay visible to
+		// classifyJournalRead, env-scrubbed via `env -u` argv
+		// (scrubArgv — scrubSystemdEnv parity; the exec seam carries
+		// no env slot) and bounded at 16MiB by hostexec's capture
+		// cap (the old maxJournalBytes).
+		c.journalFn = func(ctx context.Context, unit string, since time.Time) (string, error) {
+			cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
+			defer cancel()
+			return hostExecCtx(cctx, sd, true, "journalctl",
+				"-u", unit, "--since",
+				since.Format(journalSinceLayout), "--no-pager")
+		}
 	}
 	if c.journalAnyFn == nil {
-		c.journalAnyFn = journalctlAny
+		// `timeout 15 journalctl -n 1 --no-pager` — same routing as
+		// journalFn: stderr folded in so journald's own diagnostics
+		// ("No journal files were found.", "File ... is corrupt")
+		// are visible to the empty-window classifier.
+		c.journalAnyFn = func(ctx context.Context) (string, error) {
+			cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
+			defer cancel()
+			return hostExecCtx(cctx, sd, true,
+				"journalctl", "-n", "1", "--no-pager")
+		}
 	}
 	if c.pgWireFn == nil {
 		c.pgWireFn = pgWireOK
 	}
 	if c.restartFn == nil {
 		c.restartFn = func(ctx context.Context, unit string) error {
-			// The remediate gate used `timeout 90` — the restart
-			// keeps its own 90s budget, not the 10s query cap (a
-			// 10s clamp SIGKILLed a slow restart mid-flight and
-			// logged FAIL while systemd finished asynchronously).
-			_, err := systemctl(ctx, 90*time.Second, "restart", unit)
+			// The remediate gate's `timeout 90` budget survives as a
+			// per-call ExecBounded — a tighter wrap SIGKILLed a slow
+			// restart mid-flight while systemd finished
+			// asynchronously and the gate logged FAIL. Routed
+			// through the host exec so the restart reaches the HOST
+			// systemd — the old raw exec had no dbus socket inside
+			// the DaemonSet and could never work.
+			_, err := hostExecCtxBounded(ctx, sd, true,
+				defaultRestartBudget, "systemctl", "restart", unit)
 			return err
 		}
 	}
 	if c.propFn == nil {
 		c.propFn = func(ctx context.Context, unit, prop string) (string, error) {
-			return systemctl(ctx, defaultSystemctlBudget,
+			cctx, cancel := context.WithTimeout(ctx, defaultSystemctlBudget)
+			defer cancel()
+			out, err := hostExecCtx(cctx, sd, false, "systemctl",
 				"show", unit, "-p", prop, "--value")
+			return strings.TrimSpace(out), err
 		}
 	}
 	if c.isActive == nil {
 		c.isActive = func(ctx context.Context, unit string) (string, error) {
 			// is-active exits non-zero for inactive — the output is
 			// the value, not an error (shell `|| true` parity).
-			out, _ := systemctl(ctx, defaultSystemctlBudget, "is-active", unit)
-			return out, nil
+			cctx, cancel := context.WithTimeout(ctx, defaultSystemctlBudget)
+			defer cancel()
+			out, _ := hostExecCtx(cctx, sd, false, "systemctl", "is-active", unit)
+			return strings.TrimSpace(out), nil
 		}
 	}
 	if c.notifyFn == nil && c.Feeder.NotifySocket != "" {
@@ -824,6 +846,14 @@ func (c *Config) applyDefaults() {
 			argv := append(append([]string{}, certArgs...), args...)
 			cctx, cancel := context.WithTimeout(ctx, defaultEtcdctlBudget)
 			defer cancel()
+			// Deliberately container-side, NOT the shared host exec:
+			// bin is a hostPath-prefixed path (<hostRoot>/var/lib/k0s/
+			// bin/etcdctl) that only exists in the pod's mount view —
+			// an nsenter -m wrap would look for "/host/..." on the
+			// host fs where it does not exist — and stderr must stay
+			// a separate stream (below), which the hostexec seam
+			// cannot express. The endpoint is loopback, reachable
+			// because the DaemonSet is hostNetwork.
 			cmd := exec.CommandContext(cctx, bin, argv...)
 			// etcdctl >=3.7 warns "unrecognized environment variable
 			// ETCDCTL_API" on stderr — v3 is the default API anyway.
@@ -892,13 +922,19 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ssKillFn == nil {
 		c.ssKillFn = func(ctx context.Context) error {
+			// `ss -K sport = :6443` is a HOST command — it drops the
+			// apiserver's hung HTTP/2 watch streams in the host
+			// network namespace, so it goes through the shared
+			// client (host ss binary + host netns) rather than
+			// relying on an ss binary inside the agent image (the
+			// old raw exec only worked because the pod is
+			// hostNetwork AND happened to carry ss).
 			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(cctx, "ss", "-K", "sport", "=", ":6443")
-			cmd.Env = scrubSystemdEnv(os.Environ())
-			out, err := cmd.CombinedOutput()
+			out, err := hostExecCtx(cctx, sd, true,
+				"ss", "-K", "sport", "=", ":6443")
 			if err != nil {
-				return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+				return fmt.Errorf("%w: %s", err, strings.TrimSpace(out))
 			}
 			return nil
 		}
@@ -1338,31 +1374,33 @@ func (h *Hygiene) stateExit(name string) {
 	})
 }
 
-// readState reads an arbitrary bookkeeping file under the state dir.
+// readState reads an arbitrary bookkeeping file under the Store's
+// dir and returns its trimmed contents ("" on any error). Kept as a
+// thin helper because Store has no "read raw text" equivalent —
+// Store.Epoch collapses absent/garbage to int64 0, which would make
+// an absent last-rvc/last-prvc file compare EQUAL to a real
+// resourceVersion of 0; the string compare preserves the
+// empty-vs-zero distinction the frozen-rv check needs.
 func (h *Hygiene) readState(name string) string {
-	data, err := os.ReadFile(filepath.Join(h.cfg.WatchdogStateDir, name))
+	data, err := os.ReadFile(filepath.Join(h.state.Dir, name))
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
 }
 
-// removeStateFile deletes a bookkeeping file (ttl-last-wedged-pid etc.).
-func removeStateFile(dir, name string) error {
-	err := os.Remove(filepath.Join(dir, name))
-	if os.IsNotExist(err) {
-		return nil
-	}
-	return err
-}
-
 // splitLines was removed: line iteration is done in place with
 // strings.Cut at each call site — no intermediate []string on
 // potentially multi-MiB journal/proc text.
 
-// writeState writes a bookkeeping file under the state dir.
+// writeState writes "<content>\n" under the Store's dir, warn-only
+// on error — kept for the one non-epoch bookkeeping file
+// (oomloop-shielded, whose content is an empty line — Store only
+// writes "<epoch>\n" via WriteEpochFile; epoch-valued files
+// (last-rvc/last-prvc/ttl-last-wedged-pid/oomloop-seen) use
+// h.state.WriteEpochFile directly).
 func (h *Hygiene) writeState(name, content string) {
-	p := filepath.Join(h.cfg.WatchdogStateDir, name)
+	p := filepath.Join(h.state.Dir, name)
 	if err := os.WriteFile(p, []byte(content+"\n"), 0o644); err != nil {
 		logger().Warn("controllerhygiene: state file write failed",
 			"path", p, "error", err)
@@ -1374,705 +1412,18 @@ func (h *Hygiene) writeState(name, content string) {
 // listing, cmdline/comm reads, stat parsing (pid age, PPID) and
 // the pgrep -x | head -1 lowest-pid comm lookup.
 
-// --- external interaction defaults (all behind Config seams) ---
-
-// maxJournalBytes caps the journal text retained per read — a log
-// storm between probe cycles must not push unbounded stdout into the
-// agent's heap (the rest is drained and discarded so the child can
-// still exit cleanly).
-const maxJournalBytes = 16 << 20
-
-// journalctl is the default journal reader: `timeout 15 journalctl -u
-// <unit> --since <ts> --no-pager`. Output-only on error is NOT done
-// here — callers map errors to empty text (grep -c == 0 parity).
-func journalctl(ctx context.Context, unit string, since time.Time) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, "journalctl", "-u", unit,
-		"--since", since.Format("2006-01-02 15:04:05"), "--no-pager")
-	cmd.Env = scrubSystemdEnv(os.Environ())
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", err
-	}
-	// journald's own diagnostics ("No journal files were found.",
-	// "File ... is corrupt") go to STDERR with exit 0 — a stdout-only
-	// capture classifies a broken journald as a quiet unit and the
-	// journal-unreadable latch never fires. Fold stderr in; the
-	// bounded buffer is tiny because journald diagnostics are a few
-	// lines (payload data is on stdout).
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return "", err
-	}
-	out, _ := io.ReadAll(io.LimitReader(stdout, maxJournalBytes))
-	_, _ = io.Copy(io.Discard, stdout) // drain so Wait cannot deadlock
-	if err := cmd.Wait(); err != nil {
-		return "", err
-	}
-	return string(out) + stderr.String(), nil
-}
-
-// journalctlAny is the default unfiltered probe — `timeout 15
-// journalctl -n 1 --no-pager` with stderr folded in: journald's own
-// diagnostics ("No journal files were found.", "File ... is
-// corrupt") are emitted on stderr, so a stdout-only capture cannot
-// see them.
-func journalctlAny(ctx context.Context) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, "journalctl", "-n", "1", "--no-pager")
-	cmd.Env = scrubSystemdEnv(os.Environ())
-	out, err := cmd.CombinedOutput()
-	return string(out), err
-}
-
-// journalText returns the unit journal since `since`, mapping errors
-// to empty — `journalctl ... 2>/dev/null | grep -c` parity (a failed
-// journal read counts as 0 hits, never as wedge evidence). Every
-// read also feeds the journal-unreadable accounting: a journald that
-// persistently answers nothing while journal storage exists blinds
-// ALL journal-grep checks, and that blindness must latch+log, not
-// stay a per-cycle warning line.
-func (h *Hygiene) journalText(ctx context.Context, since time.Time) string {
-	out, err := h.cfg.journalFn(ctx, h.cfg.JournalUnit, since)
-	h.noteJournalRead(ctx, out, err)
-	if err != nil {
-		h.state.AppendLogWarn(fmt.Sprintf(
-			"controllerhygiene: journal read failed (unit=%s): %v — journal checks see 0 hits",
-			h.cfg.JournalUnit, err))
-		return ""
-	}
-	return out
-}
-
-// classifyJournalRead reduces one journal-read result to the
-// readable/unreadable verdict the tracker counts. A legitimately
-// quiet unit window (err==nil, empty output) is ambiguous, so the
-// unfiltered `journalctl -n 1` probe disambiguates — journald
-// answering ANY line (even "-- No entries --") means the empty
-// window was a quiet unit, while an error, a files-gone notice or
-// literally zero bytes is journald-level blindness.
-func (h *Hygiene) classifyJournalRead(ctx context.Context, out string, err error) (bool, string) {
-	switch {
-	case err != nil:
-		return false, fmt.Sprintf("read failed: %v", err)
-	case journalwatch.FilesGone(out):
-		return false, "journalctl reports no journal files"
-	case strings.TrimSpace(out) == "":
-		uout, uerr := h.cfg.journalAnyFn(ctx)
-		switch {
-		case uerr != nil:
-			return false, fmt.Sprintf("unfiltered probe failed: %v", uerr)
-		case journalwatch.FilesGone(uout):
-			return false, "journalctl reports no journal files"
-		case strings.TrimSpace(uout) == "":
-			return false, "journald-wide empty reply"
-		}
-	}
-	return true, ""
-}
-
-// noteJournalRead feeds one classified journal read into the
-// journal-unreadable tracker and drives the latch on transitions:
-// enter → state-journal-unreadable + the suspect line (suspectLog
-// then re-reminds at most once per SuspectLogCadence while the
-// latch stays held); exit → STATE-EXIT. The journalDir gate lives
-// inside the tracker — a host with no journal storage never fires.
-func (h *Hygiene) noteJournalRead(ctx context.Context, out string, err error) {
-	ok, detail := h.classifyJournalRead(ctx, out, err)
-	enter, exit := h.journalReads.NoteRead(ok)
-	// Re-establish after external removal: janitor's 24h reap or a
-	// manual rm can delete the file while the tracker stays latched,
-	// and `enter` won't fire twice per episode — without this the
-	// latch/metric/condition go dark mid-episode.
-	if enter || (h.journalReads.Latched() &&
-		!h.state.Exists(stateJournalUnreadable)) {
-		h.state.Enter(stateJournalUnreadable, detail)
-		if enter {
-			h.cycles.WithLabelValues(checkJournal, "journal_unreadable").Inc()
-		}
-	}
-	if !ok && h.journalReads.Latched() {
-		h.state.SuspectLog(stateJournalUnreadable, fmt.Sprintf(
-			"suspect: journal-unreadable %s — %d consecutive journal "+
-				"reads produced nothing while journal storage exists; "+
-				"every journal-grep check is blind",
-			detail, h.journalReads.Fails()), h.cfg.SuspectLogCadence)
-	}
-	if exit {
-		h.stateExit(stateJournalUnreadable)
-	}
-}
-
-// scrubSystemdEnv drops NOTIFY_SOCKET/WATCHDOG_* so child systemctl /
-// journalctl processes cannot sd_notify back to our unit — the
-// `env -u NOTIFY_SOCKET -u WATCHDOG_PID -u WATCHDOG_USEC` fix the
-// feeder applies (systemd>=255 auto-sends EXIT_STATUS otherwise).
-func scrubSystemdEnv(env []string) []string {
-	out := env[:0]
-	for _, e := range env {
-		if strings.HasPrefix(e, "NOTIFY_SOCKET=") ||
-			strings.HasPrefix(e, "WATCHDOG_PID=") ||
-			strings.HasPrefix(e, "WATCHDOG_USEC=") {
-			continue
-		}
-		out = append(out, e)
-	}
-	clear(env[len(out):]) // drop refs held by the filtered tail
-	return out
-}
-
-// defaultSystemctlBudget caps the query-shaped systemctl calls —
-// shell `timeout 10` parity.
-const defaultSystemctlBudget = 10 * time.Second
-
-// systemctl runs `timeout <budget> systemctl <args>` with the
-// scrubbed env. The budget is a caller parameter, not a fixed 10s:
-// the restart path needs its own 90s (an unconditional 10s wrap
-// SIGKILLed a slow `systemctl restart` mid-flight — the unit still
-// restarted asynchronously, but the gate logged FAIL).
-func systemctl(ctx context.Context, budget time.Duration, args ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, "systemctl", args...)
-	cmd.Env = scrubSystemdEnv(os.Environ())
-	out, err := cmd.CombinedOutput()
-	return strings.TrimSpace(string(out)), err
-}
-
-// sdNotify sends msg as a datagram to the sd_notify unix socket —
-// `systemd-notify WATCHDOG=1` parity without the binary. '@'-prefixed
-// names are abstract sockets.
-func sdNotify(sock, msg string) error {
-	addr := sock
-	if strings.HasPrefix(addr, "@") {
-		addr = "\x00" + addr[1:]
-	}
-	conn, err := net.Dial("unixgram", addr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	// A wedged notify socket must not hang the feeder loop —
-	// datagram writes are near-instant, so the deadline only covers
-	// pathological socket states.
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	_, err = conn.Write([]byte(msg))
-	return err
-}
-
-// pgWireOK is the native-Go port of lib.sh pg_wire_ok: send a
-// Postgres StartupMessage (user=postgres db=postgres, protocol 3.0)
-// and check the first response byte — 'R' auth request / 'S' param
-// status / 'N' notice / 'K' backend key = healthy; 'E' error, RST or
-// timeout = broken (pgbouncer "server login has been failing").
-func pgWireOK(ctx context.Context, hostport string) bool {
-	host, port, err := net.SplitHostPort(hostport)
-	if err != nil {
-		host, port = hostport, "5432"
-	}
-	d := net.Dialer{Timeout: 8 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(8 * time.Second))
-	params := "user\x00postgres\x00database\x00postgres\x00\x00"
-	msg := append([]byte{0, 3, 0, 0}, params...) // 196608 big-endian
-	pkt := make([]byte, 4, 4+len(msg))
-	binary.BigEndian.PutUint32(pkt, uint32(len(msg)+4)) // length incl. itself
-	pkt = append(pkt, msg...)
-	if _, err := conn.Write(pkt); err != nil {
-		return false
-	}
-	b := make([]byte, 1)
-	if _, err := io.ReadFull(conn, b); err != nil {
-		return false
-	}
-	return strings.IndexByte(pgAuthOK, b[0]) >= 0
-}
-
-// probeClient is shared by every probeAnyCode call — a fresh
-// Transport per probe would pin an idle connection (and its TLS
-// buffers) on the apiserver between cycles. IdleConnTimeout bounds
-// that pool (90s > the 60s cycle, so the conn is reused each probe).
-var probeClient = func() *http.Client {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // mirrors curl -ks
-	tr.IdleConnTimeout = 90 * time.Second
-	return &http.Client{Transport: tr}
-}()
-
-// probeAnyCode is the default liveness probe: ANY HTTP response code
-// means ALIVE — the shell targets a process-level wedge (event loop
-// dead, no TLS accept), not readyz content. `curl -ks --max-time 5
-// -o /dev/null -w '%{http_code}' != 000` parity.
-func probeAnyCode(ctx context.Context, url string, timeout time.Duration) bool {
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
-	if err != nil {
-		return false
-	}
-	resp, err := probeClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	return true
-}
-
-// --- apiserver credential loading + rv LIST probe ---
-
-// ensureClient lazily builds the mTLS HTTP client the first time the
-// credential source exists — the per-run `[ -f admin.crt ]` gate of
-// the shell maps to "no client → hub checks skipped this cycle".
-// The shell re-read the cert files EVERY probe; the client is rebuilt
-// whenever the credential files' mtime/size fingerprint changes —
-// caching a rotated cert forever would make post-rotation probes fail
-// permanently and the dead-fallback could restart a healthy apiserver.
-func (h *Hygiene) ensureClient() *http.Client {
-	if h.cfg.HTTPClient != nil {
-		return h.client // injected test seam — never rebuilt
-	}
-	fp := h.credFingerprint()
-	if h.client != nil && fp == h.credFP {
-		return h.client
-	}
-	c, err := h.buildClient()
-	if err != nil {
-		h.state.AppendLogWarn(fmt.Sprintf(
-			"controllerhygiene: apiserver credential load failed: %v — wedge checks blind this cycle",
-			err))
-		return nil
-	}
-	if c == nil {
-		return nil
-	}
-	if h.client != nil {
-		h.client.CloseIdleConnections() // drop the rotated client's pool
-	}
-	h.client = c
-	h.credFP = fp
-	return c
-}
-
-// credFingerprint stamps mtime+size of every credential source file —
-// a k0s admin.conf/cert rotation changes it and triggers a rebuild.
-func (h *Hygiene) credFingerprint() string {
-	var b strings.Builder
-	for _, f := range []string{
-		h.cfg.AdminKubeconfig, h.cfg.AdminCert, h.cfg.AdminKey, h.cfg.AdminCA,
-	} {
-		if fi, err := os.Stat(f); err == nil {
-			fmt.Fprintf(&b, "%s:%x:%x;", f, fi.ModTime().UnixNano(), fi.Size())
-		}
-	}
-	return b.String()
-}
-
-// buildClient loads client credentials from admin.conf (kubeconfig
-// with embedded cert/key) or the admin.crt/admin.key + ca.crt triple,
-// mirroring `curl -sk --cacert ca --cert crt --key key`.
-func (h *Hygiene) buildClient() (*http.Client, error) {
-	certPEM, keyPEM, caPEM, err := h.loadCreds()
-	if err != nil || len(certPEM) == 0 || len(keyPEM) == 0 {
-		return nil, err
-	}
-	pair, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("admin client cert: %w", err)
-	}
-	tlsCfg := &tls.Config{
-		Certificates:       []tls.Certificate{pair},
-		InsecureSkipVerify: h.cfg.InsecureTLS, //nolint:gosec // mirrors curl -sk
-	}
-	if !h.cfg.InsecureTLS && len(caPEM) > 0 {
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caPEM) {
-			return nil, fmt.Errorf("no certificates in CA data")
-		}
-		tlsCfg.RootCAs = pool
-	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.TLSClientConfig = tlsCfg
-	tr.IdleConnTimeout = 90 * time.Second
-	return &http.Client{Transport: tr}, nil
-}
-
-// loadCreds resolves the admin client cert/key (+optional CA) PEM
-// blocks: admin.conf kubeconfig first (embedded *-data fields, file
-// refs resolved relative to the kubeconfig dir), then the flat
-// cert/key/ca files.
-func (h *Hygiene) loadCreds() (cert, key, ca []byte, err error) {
-	if _, statErr := os.Stat(h.cfg.AdminKubeconfig); statErr == nil {
-		kc, kerr := clientcmd.LoadFromFile(h.cfg.AdminKubeconfig)
-		if kerr != nil {
-			return nil, nil, nil, fmt.Errorf("load %s: %w", h.cfg.AdminKubeconfig, kerr)
-		}
-		for _, a := range kc.AuthInfos {
-			if len(a.ClientCertificateData) > 0 {
-				cert = a.ClientCertificateData
-			} else if a.ClientCertificate != "" {
-				// A kubeconfig that REFERENCES cert/key files and
-				// cannot read them is not "no creds" — warn so the
-				// blind-cycle no_creds result stays attributable.
-				ref := resolveRel(h.cfg.AdminKubeconfig, a.ClientCertificate)
-				if b, rerr := os.ReadFile(ref); rerr != nil {
-					h.state.AppendLogWarn(fmt.Sprintf(
-						"controllerhygiene: kubeconfig client-cert %s unreadable: %v",
-						ref, rerr))
-				} else {
-					cert = b
-				}
-			}
-			if len(a.ClientKeyData) > 0 {
-				key = a.ClientKeyData
-			} else if a.ClientKey != "" {
-				ref := resolveRel(h.cfg.AdminKubeconfig, a.ClientKey)
-				if b, rerr := os.ReadFile(ref); rerr != nil {
-					h.state.AppendLogWarn(fmt.Sprintf(
-						"controllerhygiene: kubeconfig client-key %s unreadable: %v",
-						ref, rerr))
-				} else {
-					key = b
-				}
-			}
-			if len(cert) > 0 && len(key) > 0 {
-				break
-			}
-		}
-		for _, cl := range kc.Clusters {
-			if len(cl.CertificateAuthorityData) > 0 {
-				ca = cl.CertificateAuthorityData
-				break
-			}
-			if cl.CertificateAuthority != "" {
-				if b, rerr := os.ReadFile(resolveRel(h.cfg.AdminKubeconfig, cl.CertificateAuthority)); rerr == nil {
-					ca = b
-					break
-				}
-			}
-		}
-		return cert, key, ca, nil
-	}
-	if _, statErr := os.Stat(h.cfg.AdminCert); statErr != nil {
-		return nil, nil, nil, nil // not a controller / k0s not initialised
-	}
-	cert, err = os.ReadFile(h.cfg.AdminCert)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	key, err = os.ReadFile(h.cfg.AdminKey)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if b, rerr := os.ReadFile(h.cfg.AdminCA); rerr == nil {
-		ca = b
-	}
-	return cert, key, ca, nil
-}
-
-// resolveRel resolves a kubeconfig file reference relative to the
-// kubeconfig's directory (clientcmd semantics for non-absolute paths).
-func resolveRel(kubeconfig, ref string) string {
-	if filepath.IsAbs(ref) {
-		return ref
-	}
-	return filepath.Join(filepath.Dir(kubeconfig), ref)
-}
-
-// listRV returns the LIST-level resourceVersion of one apiserver
-// endpoint — api_list_rv parity. cached=true → ?resourceVersion=0
-// (watch-cache), cached=false → ?resourceVersion= (consistent read →
-// storage backend). ok=false on any transport/HTTP/parse failure.
-func (h *Hygiene) listRV(ctx context.Context, endpoint string, cached bool) (int64, bool) {
-	if h.cfg.listRVFn != nil {
-		return h.cfg.listRVFn(ctx, endpoint, cached)
-	}
-	client := h.ensureClient()
-	if client == nil {
-		return 0, false
-	}
-	q := "resourceVersion="
-	if cached {
-		q = "resourceVersion=0"
-	}
-	qctx, cancel := context.WithTimeout(ctx, h.cfg.QueryTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(qctx, http.MethodGet,
-		"https://"+endpoint+h.cfg.APIPath+"?"+q+"&limit=1", nil)
-	if err != nil {
-		return 0, false
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		logger().Warn("controllerhygiene: rv probe failed",
-			"endpoint", endpoint, "cached", cached, "error", err,
-		)
-		return 0, false
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return 0, false
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	if resp.StatusCode != http.StatusOK {
-		logger().Warn("controllerhygiene: rv probe non-200",
-			"endpoint", endpoint, "cached", cached,
-			"status", resp.StatusCode)
-		return 0, false
-	}
-	var list struct {
-		Metadata struct {
-			ResourceVersion string `json:"resourceVersion"`
-		} `json:"metadata"`
-	}
-	if err := json.Unmarshal(body, &list); err != nil {
-		return 0, false
-	}
-	rv, err := strconv.ParseInt(list.Metadata.ResourceVersion, 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return rv, true
-}
-
-// --- etcdguard: embedded-etcd quota self-defence ---
-//
-// The cicd cluster runs k0s embedded etcd; it once hit the backend
-// quota (mvcc: database space exceeded — runbook
-// k0s-etcd-rescue-runbook.md) while the remedy (evpurge + compact +
-// defrag + alarm disarm) sat behind manual CLI commands. The guard
-// automates that: every cycle on hosts whose K0sDir carries
-// bin/etcdctl + pki/etcd/ca.crt (kine hosts have neither and no-op
-// silently) it reads `endpoint status -w json` — plus `alarm list`
-// while under the size trigger — and exports the db-size / nospace
-// gauges. A NOSPACE alarm or dbSize >= EtcdDBSizeLimit spends the
-// last-etcd-guard budget (EtcdGuardMinRun, 1h) on evpurge.Run +
-// etcdrescue.Run with OnlineOnly, all inside a bounded ctx — the
-// offline defrag stops k0scontroller and is NEVER a background
-// action.
-
-// checkEtcdQuota runs one etcdguard cycle.
-func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
-	if _, err := os.Stat(filepath.Join(h.cfg.K0sDir, "bin", "etcdctl")); err != nil {
-		h.cycles.WithLabelValues(checkEtcd, "no_etcdctl").Inc()
-		return
-	}
-	if _, err := os.Stat(filepath.Join(h.cfg.K0sDir,
-		"pki", "etcd", "ca.crt")); err != nil {
-		h.cycles.WithLabelValues(checkEtcd, "no_etcd_pki").Inc()
-		return
-	}
-
-	dbSize, dbUse, err := h.etcdStatus(ctx)
-	if err != nil {
-		// etcd unreachable — nothing measurable; the wedge/feeder
-		// guards own the control-plane-down story.
-		h.state.AppendLogWarn(fmt.Sprintf(
-			"etcdguard: endpoint status failed (endpoint=%s): %v — quota check skipped",
-			h.cfg.EtcdGuard.Endpoint, err))
-		h.cycles.WithLabelValues(checkEtcd, "status_error").Inc()
-		return
-	}
-	h.etcdDBSize.Set(float64(dbSize))
-	h.etcdDBUse.Set(float64(dbUse))
-
-	// The alarm-list probe only runs while dbSize is below the
-	// trigger: over-limit the action decision is already made, so a
-	// second etcdctl would only double the routine probe cost —
-	// against a hung etcd each call can burn its whole command
-	// timeout. A skipped probe leaves the nospace gauge at its last
-	// value, the same "keep last, never force-clear a
-	// possibly-armed alarm" semantics as a probe error.
-	var nospace bool
-	if dbSize < h.cfg.EtcdGuard.DBSizeLimit {
-		ns, aerr := h.etcdNospaceArmed(ctx)
-		if aerr != nil {
-			// A failed alarm read must not hide a real alarm —
-			// treat the size signal as authoritative this cycle,
-			// surface the error once in the log, and LEAVE the
-			// gauge at its last value.
-			h.state.AppendLogWarn(fmt.Sprintf("etcdguard: alarm list failed: %v", aerr))
-		} else if ns {
-			nospace = true
-			h.etcdNospace.Set(1)
-		} else {
-			h.etcdNospace.Set(0)
-		}
-	}
-
-	var reason string
-	switch {
-	case nospace:
-		reason = "nospace-alarm"
-	case dbSize >= h.cfg.EtcdGuard.DBSizeLimit:
-		reason = fmt.Sprintf("dbSize=%d>=%d", dbSize, h.cfg.EtcdGuard.DBSizeLimit)
-	default:
-		h.cycles.WithLabelValues(checkEtcd, "ok").Inc()
-		return
-	}
-
-	if !h.state.RateOK(fileRateEtcdGuard,
-		h.cfg.EtcdGuard.MinRun) {
-		h.state.SuspectLog(checkEtcd, fmt.Sprintf(
-			"etcdguard: %s but in guard cooldown (<%dm), skip",
-			reason, int(h.cfg.EtcdGuard.MinRun.Minutes())),
-			h.cfg.SuspectLogCadence)
-		h.cycles.WithLabelValues(checkEtcd, "cooldown").Inc()
-		return
-	}
-	h.state.AppendLog(fmt.Sprintf(
-		"ACTION: etcdguard %s — evpurge stale events + ONLINE-ONLY "+
-			"etcd rescue (offline defrag forbidden)", reason))
-	// Budget spent before the action — a kill mid-rescue must not
-	// allow a second run inside the window (feeder G6 parity).
-	h.state.RateSpend(fileRateEtcdGuard)
-	out := &guardLogWriter{h: h}
-
-	// The whole remediation runs under a bounded ctx: evpurge is
-	// unbounded pagination + delete work against a possibly
-	// degraded apiserver and the rescue is ~12 sequential etcdctl
-	// calls — on the process-lifetime ctx either could stall this
-	// (synchronous) cycle for hours. Both steps are idempotent and
-	// the rate budget was already spent, so exhausting the deadline
-	// only defers the remainder to the next EtcdGuardMinRun window.
-	gctx, gcancel := context.WithTimeout(ctx, defaultEtcdGuardBudget)
-	defer gcancel()
-
-	// Stale apiserver events are the classic quota-filler after a
-	// control-plane outage — purge first so the rescue's compaction
-	// has garbage to drop. Cutoff keeps the apiserver's own 1h event
-	// TTL: only GC debt is deleted, fresh events survive.
-	perr := h.cfg.evpurgeRunFn(gctx, evpurge.Config{
-		API:      "https://" + h.cfg.Hub.SelfEndpoint,
-		CAFile:   h.cfg.AdminCA,
-		CertFile: h.cfg.AdminCert,
-		KeyFile:  h.cfg.AdminKey,
-	}, h.cfg.nowFn().Add(-eventStaleAge), out)
-	out.flush()
-	if perr != nil {
-		// Logged on its own — a purge miss does NOT fail the cycle
-		// when the quota-remediating step still lands below.
-		h.state.AppendLogWarn(fmt.Sprintf("etcdguard: evpurge failed: %v", perr))
-	}
-	// remediated tracks the step that actually relieves the quota:
-	// the online rescue (compact+defrag). evpurge only drops event
-	// GC debt so the rescue has garbage to free — when the rescue
-	// ran, its result IS the verdict, even if evpurge failed
-	// upstream (the purge failure stays logged above either way).
-	remediated := perr == nil
-	// A dead gctx here means evpurge (or a cancelled parent) ate
-	// the whole budget — spawn no further calls that can only fail;
-	// the rescue is idempotent and retries in the next window.
-	if gctx.Err() == nil {
-		rerr := h.cfg.etcdRescueFn(gctx, etcdrescue.Config{
-			K0sDir:   h.cfg.K0sDir,
-			Endpoint: h.cfg.EtcdGuard.Endpoint,
-			// OnlineOnly: this is background auto-maintenance — the
-			// systemctl-stop + standalone-etcd defrag would take the
-			// control plane down and stays a manual rescue-etcd
-			// action.
-			OnlineOnly: true,
-			// The guard is a loop, not an operator: cap each spawned
-			// command far below etcdrescue's interactive default
-			// (defaultCallTimeout = 10m) so ~12 sequential calls
-			// stay near the guard budget instead of ~2h.
-			CallTimeout: defaultEtcdGuardCallTimeout,
-		}, out)
-		out.flush()
-		if rerr != nil {
-			h.state.AppendLogWarn(fmt.Sprintf("etcdguard: rescue incomplete: %v", rerr))
-		}
-		remediated = rerr == nil
-	} else {
-		// The budget died inside evpurge — the rescue never ran,
-		// so the cycle is incomplete, not a clean ok.
-		remediated = false
-	}
-	if errors.Is(gctx.Err(), context.DeadlineExceeded) {
-		h.state.AppendLogWarn(fmt.Sprintf(
-			"etcdguard: run budget (%s) exhausted — remaining steps "+
-				"deferred to the next %s window",
-			defaultEtcdGuardBudget, h.cfg.EtcdGuard.MinRun))
-	}
-	h.actions.WithLabelValues(checkEtcd, "evpurge_rescue").Inc()
-	if remediated {
-		h.cycles.WithLabelValues(checkEtcd, "ok").Inc()
-	} else {
-		h.cycles.WithLabelValues(checkEtcd, "remediate_error").Inc()
-	}
-}
-
-// etcdStatus fetches `endpoint status -w json` and returns the db
-// file size + in-use size of element[0] (same JSON shape
-// etcdrescue.parseStatusJSON consumes).
-func (h *Hygiene) etcdStatus(ctx context.Context) (dbSize, dbUse int64, err error) {
-	b, err := h.cfg.etcdctlFn(ctx, "endpoint", "status", "-w", "json")
-	if err != nil {
-		return 0, 0, err
-	}
-	var arr []struct {
-		Status struct {
-			DBSize      int64 `json:"dbSize"`
-			DBSizeInUse int64 `json:"dbSizeInUse"`
-		} `json:"Status"`
-	}
-	if err := json.Unmarshal(b, &arr); err != nil {
-		return 0, 0, fmt.Errorf("parse endpoint status: %w", err)
-	}
-	if len(arr) == 0 {
-		return 0, 0, fmt.Errorf("parse endpoint status: empty endpoint list")
-	}
-	return arr[0].Status.DBSize, arr[0].Status.DBSizeInUse, nil
-}
-
-// etcdNospaceArmed reports whether `alarm list` carries a NOSPACE
-// entry — the memberID:xxx alarm:NOSPACE grep the manual flow used.
-func (h *Hygiene) etcdNospaceArmed(ctx context.Context) (bool, error) {
-	b, err := h.cfg.etcdctlFn(ctx, "alarm", "list")
-	if err != nil {
-		return false, err
-	}
-	return strings.Contains(string(b), "NOSPACE"), nil
-}
-
-// guardLogWriter adapts the evpurge/etcdrescue io.Writer output to
-// the watchdog log — each completed line lands as its own timestamped
-// appendLog entry (the "<rfc3339> <msg>" filelog contract), prefixed
-// so the sub-command output is attributable in the NPD tail.
-type guardLogWriter struct {
-	h   *Hygiene
-	buf strings.Builder
-}
-
-func (w *guardLogWriter) Write(p []byte) (int, error) {
-	w.buf.Write(p)
-	for {
-		s := w.buf.String()
-		i := strings.IndexByte(s, '\n')
-		if i < 0 {
-			return len(p), nil
-		}
-		if line := strings.TrimSpace(s[:i]); line != "" {
-			w.h.state.AppendLog("etcdguard: " + line)
-		}
-		w.buf.Reset()
-		w.buf.WriteString(s[i+1:])
-	}
-}
-
-// flush emits any trailing partial line — called after each sub-run
-// so a stream ending without '\n' still reaches the log.
-func (w *guardLogWriter) flush() {
-	if line := strings.TrimSpace(w.buf.String()); line != "" {
-		w.h.state.AppendLog("etcdguard: " + line)
-	}
-	w.buf.Reset()
-}
+// --- satellite files ---
+// journal.go    : journalText + the journal-unreadable blindness
+//                 accounting (classifyJournalRead/noteJournalRead)
+// exec.go       : the host-exec/env plumbing — scrubSystemdEnv,
+//                 scrubArgv, hostExecCtx (the nil-tolerant
+//                 systemd.Client wrapper every host command's seam
+//                 default routes through), sdNotify
+// probes.go     : probeClient + probeAnyCode + pgWireOK
+// kubeclient.go : apiserver credential loading + the rv LIST probe
+//                 (ensureClient/buildClient/loadCreds/resolveRel/
+//                 credFingerprint/listRV)
+// etcdguard.go  : embedded-etcd quota self-defence (checkEtcdQuota,
+//                 etcdStatus, etcdNospaceArmed, guardLogWriter)
+// All external interactions stay behind the Config seams — only the
+// default implementations moved.

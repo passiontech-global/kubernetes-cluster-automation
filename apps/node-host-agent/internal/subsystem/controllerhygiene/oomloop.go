@@ -45,7 +45,7 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 		return
 	}
 
-	dir := h.cfg.WatchdogStateDir
+	dir := h.state.Dir
 	now := h.cfg.nowFn().Unix()
 
 	// First run (no baseline file): seed the baseline only — the
@@ -62,7 +62,9 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 			prev, hadBaseline = v, true
 		}
 	}
-	h.writeState(fileOOMSeen, strconv.FormatInt(oomNow, 10))
+	// "<oomNow>\n" via the Store's atomic epoch write — byte-
+	// identical to the old writeState for integer content.
+	h.state.WriteEpochFile(seenPath, oomNow)
 
 	killsPath := filepath.Join(dir, fileOOMKills)
 	// The counter resets to 0 when the cgroup is destroyed (unit
@@ -163,7 +165,7 @@ func (h *Hygiene) unshieldOOM(dir, why string) {
 		"oom-loop %s — unshield kube-apiserver/kine (oom_score_adj=0)", why))
 	h.setAdj("kube-apiserver", 0)
 	h.setAdj("kine", 0)
-	_ = removeStateFile(dir, fileOOMShielded)
+	h.state.ResetCounter(fileOOMShielded)
 	h.actions.WithLabelValues(checkOOMLoop, "unshield").Inc()
 }
 
