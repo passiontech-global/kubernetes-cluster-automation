@@ -33,11 +33,11 @@ func TestNebulaMTUBlackholeLatch(t *testing.T) {
 	e := mtuEnv(t)
 	n := e.n
 	ctx := context.Background()
-	st := n.wave10State()
+	st := n.mtuState()
 	// Small ping OK, DF ping fails → 3 consecutive → latch + clamp.
 	e.pingOK["10.128.0.2|false"] = true
 	e.cmdFail["-M do -s 1252"] = true
-	for i := 0; i < wave10MTUBHNeeded; i++ {
+	for i := 0; i < mtuBlackholeNeeded; i++ {
 		n.checkNebulaMTUBlackhole(ctx, st)
 	}
 	if _, err := os.Stat(filepath.Join(e.state,
@@ -61,9 +61,9 @@ func TestNebulaMTUBlackholeNeedsSmallOK(t *testing.T) {
 	e := mtuEnv(t)
 	n := e.n
 	ctx := context.Background()
-	st := n.wave10State()
+	st := n.mtuState()
 	// NO small ping → total overlay failure is NOT a PMTU latch.
-	for i := 0; i < wave10MTUBHNeeded+1; i++ {
+	for i := 0; i < mtuBlackholeNeeded+1; i++ {
 		n.checkNebulaMTUBlackhole(ctx, st)
 	}
 	if _, err := os.Stat(filepath.Join(e.state,
@@ -81,10 +81,10 @@ func TestNebulaMTUBlackholeNeedsSmallOK(t *testing.T) {
 func TestNebulaMTUMetric(t *testing.T) {
 	e := mtuEnv(t)
 	n := e.n
-	st := n.wave10State()
+	st := n.mtuState()
 	dir := t.TempDir()
-	wave10TextfileDirOverride = dir
-	defer func() { wave10TextfileDirOverride = "" }()
+	textfileDirOverride = dir
+	defer func() { textfileDirOverride = "" }()
 	n.writeMTUBHMetric(st)
 	b, err := os.ReadFile(filepath.Join(dir, "node-agent-nebula-mtu.prom"))
 	if err != nil {

@@ -244,11 +244,11 @@ func TestLatchSetsConditionTrue(t *testing.T) {
 	}
 }
 
-// TestWave9LatchConditions: the three Wave-9 state-* latches each
+// TestClockSlabPMTULatchConditions: the three Wave-9 state-* latches each
 // flip their permanent NodeCondition to True with the problem
 // reason — clock-unsync (nethealth H1), kernel-slab-leak
 // (workerhygiene W9-KR3), nebula-pmtu-blackhole (nethealth W9-NM1).
-func TestWave9LatchConditions(t *testing.T) {
+func TestClockSlabPMTULatchConditions(t *testing.T) {
 	e := fixture(t)
 	e.writeFile("state-clock-unsync", "1700000001\n")
 	e.writeFile("state-kernel-slab-leak", "1700000002\n")
@@ -649,10 +649,10 @@ func TestKubeletRuntimeStallA4Latches(t *testing.T) {
 	}
 }
 
-// TestWave8LatchConditions: every Wave-8 latch maps 1:1 to its
+// TestInfraLatchConditions: every Wave-8 latch maps 1:1 to its
 // permanent NodeCondition — the NHC→SNR chain and the
 // problem_gauge series cover the full latch set.
-func TestWave8LatchConditions(t *testing.T) {
+func TestInfraLatchConditions(t *testing.T) {
 	for latch, typ := range map[string]string{
 		"state-nebula-isolated":         "NebulaIsolated",
 		"state-nebula-degraded":         "NebulaDegraded",

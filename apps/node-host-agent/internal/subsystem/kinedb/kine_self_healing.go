@@ -1,4 +1,4 @@
-// w8cp2.go — Wave 8 kine-DB self-healing:
+// kine_self_healing.go — Wave 8 kine-DB self-healing:
 //
 //  1. Session reaper — every probe round terminates stuck kine
 //     sessions (idle-in-transaction >5m, non-maintenance active

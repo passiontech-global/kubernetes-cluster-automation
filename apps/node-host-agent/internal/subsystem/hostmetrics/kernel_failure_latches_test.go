@@ -22,7 +22,7 @@ func kmsgFixture(t *testing.T, cfg Config, records ...string) {
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(bootDir, "boot_id"), "testboot\n")
-	write(t, filepath.Join(cfg.WatchdogStateDir, w10KmsgCursorFile),
+	write(t, filepath.Join(cfg.WatchdogStateDir, kmsgCursorFile),
 		"kmsg testboot 0 0\n")
 	var b strings.Builder
 	for i, m := range records {
@@ -51,18 +51,18 @@ func TestKmsgFSAndConntrack(t *testing.T) {
 	// writes /proc/sys/... via a fixed path — check maybeBumpConntrackMax.
 	c.checkKernelDmesg()
 	if _, err := os.Stat(filepath.Join(cfg.WatchdogStateDir,
-		w10KmsgFSErrorFile)); err != nil {
+		kmsgFsErrorFile)); err != nil {
 		t.Fatal("kmsg-fs-error marker missing")
 	}
 	got := strings.TrimSpace(readFile(t,
-		filepath.Join(cfg.WatchdogStateDir, w10KmsgCtDropsFile)))
+		filepath.Join(cfg.WatchdogStateDir, kmsgConntrackDropsFile)))
 	if got != "2" {
 		t.Fatalf("conntrack drops=%q want 2", got)
 	}
 	// Second drain must not double-count — the fd sits at EOF.
 	c.checkKernelDmesg()
 	got = strings.TrimSpace(readFile(t,
-		filepath.Join(cfg.WatchdogStateDir, w10KmsgCtDropsFile)))
+		filepath.Join(cfg.WatchdogStateDir, kmsgConntrackDropsFile)))
 	if got != "2" {
 		t.Fatalf("conntrack drops after re-drain=%q want 2", got)
 	}
@@ -90,12 +90,12 @@ func TestKmsgOOMClassification(t *testing.T) {
 		"Memory cgroup out of memory: Killed process 88 (kubelet) total-vm:5kB")
 	c.checkKernelDmesg()
 	victim := strings.TrimSpace(readFile(t, filepath.Join(
-		cfg.WatchdogStateDir, w10KmsgOOMVictimFile)))
+		cfg.WatchdogStateDir, kmsgOOMVictimFile)))
 	if !strings.Contains(victim, "kubelet") {
 		t.Fatalf("host OOM victim=%q want kubelet (last host kill)", victim)
 	}
 	count := strings.TrimSpace(readFile(t, filepath.Join(
-		cfg.WatchdogStateDir, w10KmsgOOMCountFile)))
+		cfg.WatchdogStateDir, kmsgOOMCountFile)))
 	if count != "2" {
 		t.Fatalf("host oom count=%q want 2 (pod kills excluded)", count)
 	}
@@ -114,7 +114,7 @@ func TestKmsgFirstOpenPrimesBacklog(t *testing.T) {
 		"6,1,1000,0;EXT4-fs error old history\n")
 	c.checkKernelDmesg()
 	if _, err := os.Stat(filepath.Join(cfg.WatchdogStateDir,
-		w10KmsgFSErrorFile)); !os.IsNotExist(err) {
+		kmsgFsErrorFile)); !os.IsNotExist(err) {
 		t.Fatal("backlog record classified on first open")
 	}
 }
@@ -187,9 +187,9 @@ func TestPidFDPressureLatch(t *testing.T) {
 		t.Fatal("latch not cleared below threshold")
 	}
 	// Textfile gauge emitted.
-	w10TextfileDirOverride = t.TempDir()
+	textfileDirOverride = t.TempDir()
 	c.updatePidFDPressure()
-	b, err := os.ReadFile(filepath.Join(w10TextfileDirOverride,
+	b, err := os.ReadFile(filepath.Join(textfileDirOverride,
 		"node-agent-kernel.prom"))
 	if err != nil {
 		t.Fatalf("kernel prom missing: %v", err)
@@ -221,14 +221,14 @@ func TestParseChronycTracking(t *testing.T) {
 	}
 }
 
-func TestClockSkewW10(t *testing.T) {
+func TestClockSkew(t *testing.T) {
 	cfg, _ := fixture(t)
 	c := New(cfg)
 	// chronyc stub: 3s fast + unsynchronised → step + latch path.
-	orig := w10RunCmd
-	defer func() { w10RunCmd = orig }()
+	orig := runHostCmd
+	defer func() { runHostCmd = orig }()
 	var stepped bool
-	w10RunCmd = func(ctx context.Context, argv ...string) (string, error) {
+	runHostCmd = func(ctx context.Context, argv ...string) (string, error) {
 		if len(argv) > 1 && argv[1] == "makestep" {
 			stepped = true
 			return "", nil
@@ -237,7 +237,7 @@ func TestClockSkewW10(t *testing.T) {
 			"Leap status     : Not synchronised\n", nil
 	}
 	for i := 0; i < clockSkewLatchNeeded; i++ {
-		c.checkClockSkewW10()
+		c.checkClockSkew()
 	}
 	if !stepped {
 		t.Fatal("chronyc makestep not attempted")
@@ -250,8 +250,8 @@ func TestClockSkewW10(t *testing.T) {
 
 // --- W10-ST1: ro mounts ---
 
-func TestParseProcMountsW10(t *testing.T) {
-	ms := parseProcMountsW10([]byte(
+func TestParseProcMounts(t *testing.T) {
+	ms := parseProcMounts([]byte(
 		"/dev/sda1 /var/openebs/local/pvc-abc ext4 rw,relatime 0 0\n" +
 			"/dev/sdb1 /var/openebs/local/pvc-def xfs ro,relatime 0 0\n" +
 			"tmpfs /var/openebs/local/pvc-ghi tmpfs ro 0 0\n" +
@@ -282,7 +282,7 @@ func TestROPVCMounts(t *testing.T) {
 	if len(ros) != 2 {
 		t.Fatalf("roPVCMounts=%v want 2 (secret excluded, /etc excluded)", ros)
 	}
-	c.updateFSReadonlyW10()
+	c.updateFSReadonlyEvidence()
 	if _, err := os.Stat(filepath.Join(cfg.WatchdogStateDir,
 		"state-fs-readonly")); err != nil {
 		t.Fatal("fs-readonly latch missing")
@@ -290,9 +290,9 @@ func TestROPVCMounts(t *testing.T) {
 	// Fresh kmsg fs-error marker alone also latches.
 	cfg2, _ := fixture(t)
 	c2 := New(cfg2)
-	write(t, filepath.Join(cfg2.WatchdogStateDir, w10KmsgFSErrorFile),
+	write(t, filepath.Join(cfg2.WatchdogStateDir, kmsgFsErrorFile),
 		strconv.FormatInt(time.Now().Unix(), 10)+" ext4 died\n")
-	c2.updateFSReadonlyW10()
+	c2.updateFSReadonlyEvidence()
 	if _, err := os.Stat(filepath.Join(cfg2.WatchdogStateDir,
 		"state-fs-readonly")); err != nil {
 		t.Fatal("fs-readonly latch missing from kmsg marker")

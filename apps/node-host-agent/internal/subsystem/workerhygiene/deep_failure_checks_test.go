@@ -156,15 +156,15 @@ func TestOrphanHostPathVolumes(t *testing.T) {
 	}
 }
 
-func TestWave10PromWrite(t *testing.T) {
+func TestNodeAgentPromTextfileWrite(t *testing.T) {
 	e := fixture(t)
 	h := e.h
 	dir := t.TempDir()
-	wave10PromDirOverride = dir
-	defer func() { wave10PromDirOverride = "" }()
+	promTextfileDirOverride = dir
+	defer func() { promTextfileDirOverride = "" }()
 	h.orphanHostPathBytes = 4096
 	h.orphanHostPathDirs = 2
-	h.writeWave10Prom()
+	h.writeNodeAgentPromTextfile()
 	b, err := os.ReadFile(filepath.Join(dir, "node-agent-hygiene.prom"))
 	if err != nil {
 		t.Fatalf("prom file missing: %v", err)

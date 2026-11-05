@@ -457,7 +457,7 @@ func TestJanitorRunDisabledIdles(t *testing.T) {
 // knownLatchNames — sweepLatches deletes unregistered state-* files
 // immediately, so a missing entry would eat the latch the moment a
 // check writes it.
-func TestJanitorNewWave2LatchesAreKnown(t *testing.T) {
+func TestJanitorRuntimeDatapathLatchesAreKnown(t *testing.T) {
 	e := jfixture(t)
 	for _, n := range []string{
 		"kubelet-syncloop-down", "containerd-sock-down",
@@ -479,7 +479,7 @@ func TestJanitorNewWave2LatchesAreKnown(t *testing.T) {
 // The wave-8 latches must be registered in knownLatchNames —
 // sweepLatches deletes unregistered state-* files immediately, so a
 // missing entry would eat the latch the moment a check writes it.
-func TestJanitorWave8LatchesAreKnown(t *testing.T) {
+func TestJanitorPressureFleetLatchesAreKnown(t *testing.T) {
 	e := jfixture(t)
 	names := []string{
 		"cilium-bpf-map-pressure", "psi-memory-thrash",
@@ -506,7 +506,7 @@ func TestJanitorWave8LatchesAreKnown(t *testing.T) {
 // The wave-9 latches must be registered in knownLatchNames —
 // sweepLatches deletes unregistered state-* files immediately, so a
 // missing entry would eat the latch the moment a check writes it.
-func TestJanitorWave9LatchesAreKnown(t *testing.T) {
+func TestJanitorClockKernelNebulaLatchesAreKnown(t *testing.T) {
 	e := jfixture(t)
 	names := []string{
 		"clock-unsync", "kernel-slab-leak", "nebula-pmtu-blackhole",

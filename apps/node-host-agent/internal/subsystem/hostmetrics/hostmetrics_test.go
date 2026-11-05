@@ -101,10 +101,10 @@ func fixtureSeams(root string) {
 	kmsgDevicePaths = func(string) []string {
 		return []string{filepath.Join(root, "dev", "kmsg")}
 	}
-	w10RunCmd = func(context.Context, ...string) (string, error) {
+	runHostCmd = func(context.Context, ...string) (string, error) {
 		return "", errors.New("exec disabled in tests")
 	}
-	w10TextfileDirOverride = ""
+	textfileDirOverride = ""
 }
 
 func write(t *testing.T, path, content string) {

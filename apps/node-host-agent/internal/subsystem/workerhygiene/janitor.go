@@ -160,7 +160,7 @@ var knownLatchNames = map[string]bool{
 	"clock-skew":               true, // hostmetrics KR5 chrony/NTP skew
 	"fs-readonly":              true, // hostmetrics ST1 ro sub-mount prober
 	"containerd-corrupt":       true, // workerhygiene KR3 BoltDB/orphan shims
-	"kubeconfig-cert-expiring": true, // cpwave CP5 embedded kubeconfig certs
+	"kubeconfig-cert-expiring": true, // controllerhygiene kubeconfig_cert_expiry.go
 	"nebula-mtu-blackhole":     true, // nethealth routeguard NM4 DF-probe MTU
 }
 
