@@ -2,4 +2,5 @@
 go = "1.27.3"
 git-cliff = "2.14.2"
 ko = "0.19.1"
+golangci-lint = "2.15.0"
 "github:moonrepo/moon" = "2.6.5"
