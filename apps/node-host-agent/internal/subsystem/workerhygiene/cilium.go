@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1161,39 +1159,11 @@ func (c *ciliumEnvoyCheck) evalEnvoyXDS(ctx context.Context) (reject, inconclusi
 	return reject, false
 }
 
-// probeDNSUDP sends one minimal A-record query to addr over UDP and
-// reports whether a well-formed reply returns before the deadline —
-// the node-local-dns datapath probe (W7-H3). Any reply matching the
-// query id proves :53 answers: NXDOMAIN/SERVFAIL still mean the
-// listener is alive; silence means the LRP datapath is wedged.
-func probeDNSUDP(addr, name string, timeout time.Duration) bool {
-	id := uint16(time.Now().UnixNano())
-	// Header: ID, flags 0x0100 (RD), QDCOUNT=1, AN/NS/AR=0.
-	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
-	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
-		if label == "" {
-			continue
-		}
-		q = append(q, byte(len(label)))
-		q = append(q, label...)
-	}
-	q = append(q, 0, 0, 1, 0, 1) // root label + QTYPE A + QCLASS IN
-	conn, err := net.DialTimeout("udp", addr, timeout)
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
-	if _, err := conn.Write(q); err != nil {
-		return false
-	}
-	buf := make([]byte, 512)
-	n, err := conn.Read(buf)
-	// ID echo + QR bit set (a response, not another query or a stray
-	// datagram sharing the id).
-	return err == nil && n >= 4 && buf[0] == q[0] && buf[1] == q[1] &&
-		buf[2]&0x80 != 0
-}
+// The dnsProbe seam default is probee.DNSQuery (the old probeDNSUDP
+// verbatim) — one minimal A-record query to addr over UDP; any
+// well-formed reply matching the query id proves :53 answers:
+// NXDOMAIN/SERVFAIL still mean the listener is alive, silence means
+// the LRP datapath is wedged.
 
 // checkCiliumLRPDNS probes the node-local resolver's :53 listener
 // while its pod claims Ready — a hung listener inside an LRP path

@@ -60,6 +60,7 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -317,9 +318,10 @@ func (c *Config) applyDefaults() {
 		}
 	}
 	if c.probeHTTP == nil {
-		c.probeHTTP = func(ctx context.Context, url string, timeout time.Duration) error {
-			return probeHTTPGet(ctx, url, timeout)
-		}
+		// probee.HTTPGet is the old probeHTTPGet verbatim — the
+		// nebula stats target is plaintext http so the shared
+		// insecure-TLS client is a superset with zero delta.
+		c.probeHTTP = probee.HTTPGet
 	}
 	if c.sysClassNet == "" {
 		c.sysClassNet = defaultSysClassNet

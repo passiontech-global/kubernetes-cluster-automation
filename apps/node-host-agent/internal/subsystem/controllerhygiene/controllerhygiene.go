@@ -83,6 +83,7 @@ import (
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
@@ -423,10 +424,10 @@ type Config struct {
 	// streams before a wedge restart (W8-CP1).
 	ssKillFn func(ctx context.Context) error
 	// cpHealthFn is the KCM/scheduler healthz probe: true on a 2xx
-	// response. nil → probeHTTP2xx.
+	// response. nil → probee.HTTP2xx.
 	cpHealthFn func(ctx context.Context, url string) bool
 	// kcmMetricsFn fetches the KCM /metrics body (leader-without-
-	// workers evidence). nil → httpGET insecure.
+	// workers evidence). nil → probee.HTTPBodyInsecure.
 	kcmMetricsFn func(ctx context.Context, url string) (string, error)
 	// tlsCertFn returns the leaf certificate a TLS listener
 	// presents. nil → tlsDialCert (InsecureSkipVerify — only the
@@ -813,7 +814,7 @@ func (c *Config) applyDefaults() {
 	if c.probeFn == nil {
 		to := c.Feeder.ProbeTO
 		c.probeFn = func(ctx context.Context, url string) bool {
-			return probeAnyCode(ctx, url, to)
+			return probee.HTTPAnyCode(ctx, url, to)
 		}
 	}
 	if c.K0sDir == "" {
@@ -942,12 +943,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.cpHealthFn == nil {
 		c.cpHealthFn = func(ctx context.Context, url string) bool {
-			return probeHTTP2xx(ctx, url, 5*time.Second)
+			return probee.HTTP2xx(ctx, url, 5*time.Second)
 		}
 	}
 	if c.kcmMetricsFn == nil {
 		c.kcmMetricsFn = func(ctx context.Context, url string) (string, error) {
-			return httpGetInsecure(ctx, url, 8*time.Second)
+			return probee.HTTPBodyInsecure(ctx, url, 8*time.Second)
 		}
 	}
 	if c.tlsCertFn == nil {
@@ -1420,7 +1421,7 @@ func (h *Hygiene) writeState(name, content string) {
 //                 scrubArgv, hostExecCtx (the nil-tolerant
 //                 systemd.Client wrapper every host command's seam
 //                 default routes through), sdNotify
-// probes.go     : probeClient + probeAnyCode + pgWireOK
+// probes.go     : pgWireOK (the HTTP probes moved to platform/probee)
 // kubeclient.go : apiserver credential loading + the rv LIST probe
 //                 (ensureClient/buildClient/loadCreds/resolveRel/
 //                 credFingerprint/listRV)
