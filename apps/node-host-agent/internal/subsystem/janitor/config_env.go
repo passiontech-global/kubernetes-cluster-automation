@@ -1,8 +1,8 @@
 package janitor
 
 import (
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the
@@ -28,13 +28,17 @@ type EnvDeps struct {
 // (NODE_HOST_AGENT_ENABLE_JANITOR) stays in the caller. Consumes only
 // EnvDeps.WatchdogStateDir, .WatchdogLogFile and .Systemd.
 func ConfigFromEnv(d EnvDeps) Config {
-	return Config{
+	cfg := Config{
 		Enabled:          true,
-		Interval:         envx.Duration("NODE_HOST_AGENT_JANITOR_INTERVAL", defaultInterval),
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogLogFile:  d.WatchdogLogFile,
-		ProcRoot:         envx.String("NODE_HOST_AGENT_PROC_ROOT", defaultProcRoot),
-		LatchMaxAge:      envx.Duration("NODE_HOST_AGENT_JANITOR_LATCH_MAX_AGE", latchMaxAge),
 		Systemd:          d.Systemd,
 	}
+	// The env surface, one row per knob in declaration order.
+	envx.Apply([]envx.Knob{
+		envx.DurationKnob("NODE_HOST_AGENT_JANITOR_INTERVAL", &cfg.Interval, defaultInterval),
+		envx.StringKnob("NODE_HOST_AGENT_PROC_ROOT", &cfg.ProcRoot, defaultProcRoot),
+		envx.DurationKnob("NODE_HOST_AGENT_JANITOR_LATCH_MAX_AGE", &cfg.LatchMaxAge, latchMaxAge),
+	})
+	return cfg
 }

@@ -2,6 +2,7 @@ package apiprober
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -78,7 +79,7 @@ func (p *Prober) discover(ctx context.Context) ([]backend, error) {
 			continue
 		}
 		if header == nil {
-			return nil, fmt.Errorf("show stat: data row before header")
+			return nil, errors.New("show stat: data row before header")
 		}
 		fields := strings.Split(line, ",")
 		get := func(col string) string {
@@ -125,7 +126,7 @@ func (p *Prober) discover(ctx context.Context) ([]backend, error) {
 		})
 	}
 	if header == nil {
-		return nil, fmt.Errorf("show stat: no CSV header found")
+		return nil, errors.New("show stat: no CSV header found")
 	}
 	return backends, nil
 }

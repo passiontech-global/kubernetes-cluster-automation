@@ -1,7 +1,7 @@
 package hostconfig
 
 import (
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
@@ -29,24 +29,29 @@ type EnvDeps struct {
 // (NODE_HOST_AGENT_ENABLE_HOSTCONFIG=true|auto + the vars-dir
 // defaults.yaml probe) passed.
 func ConfigFromEnv(d EnvDeps) Config {
-	nebulaCertsDir := envx.String("NODE_HOST_AGENT_NEBULA_CERTS_DIR",
-		defaultNebulaCertsDir)
 	var runner Runner = NsenterRunner{}
 	if d.HostRoot == "/" {
 		runner = DirectRunner{}
 	}
-	return Config{
-		Enabled:        true,
-		NodeName:       d.NodeName,
-		Hostname:       d.Hostname,
-		HostRoot:       d.HostRoot,
-		VarsDir:        d.VarsDir,
-		NebulaCertsDir: nebulaCertsDir,
-		WatchdogScriptsDir: envx.String("NODE_HOST_AGENT_WATCHDOG_SCRIPTS_DIR",
-			defaultWatchdogDir),
-		Interval: envx.Duration("NODE_HOST_AGENT_HOSTCONFIG_INTERVAL",
-			defaultInterval),
-		Runner:  runner,
-		Watcher: &DirWatcher{Dirs: []string{d.VarsDir, nebulaCertsDir}},
+	cfg := Config{
+		Enabled:  true,
+		NodeName: d.NodeName,
+		Hostname: d.Hostname,
+		HostRoot: d.HostRoot,
+		VarsDir:  d.VarsDir,
+		Runner:   runner,
 	}
+	// The env surface, one row per knob in declaration order.
+	envx.Apply([]envx.Knob{
+		envx.StringKnob("NODE_HOST_AGENT_NEBULA_CERTS_DIR", &cfg.NebulaCertsDir,
+			defaultNebulaCertsDir),
+		envx.StringKnob("NODE_HOST_AGENT_WATCHDOG_SCRIPTS_DIR", &cfg.WatchdogScriptsDir,
+			defaultWatchdogDir),
+		envx.DurationKnob("NODE_HOST_AGENT_HOSTCONFIG_INTERVAL", &cfg.Interval,
+			defaultInterval),
+	})
+	// vars dir + nebula certs mount — vars/cert changes converge on
+	// the next poll instead of waiting out the full interval.
+	cfg.Watcher = &DirWatcher{Dirs: []string{d.VarsDir, cfg.NebulaCertsDir}}
+	return cfg
 }

@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // checkNebulaDirectTCP enforces the pref-1499 Direct-Underlay TCP
@@ -140,7 +140,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 	case !n.udpSocketBound(wd.NebulaPort):
 		reason = fmt.Sprintf("nebula-no-socket udp/%d not bound", wd.NebulaPort)
 	case !n.hasIPv4Addr(ctx, wd.NebulaDev):
-		reason = fmt.Sprintf("nebula-no-tun-addr dev=%s", wd.NebulaDev)
+		reason = "nebula-no-tun-addr dev=" + wd.NebulaDev
 	case wd.NebulaStatsURL != "":
 		if err := n.cfg.probeHTTP(ctx, wd.NebulaStatsURL, 5*time.Second); err != nil {
 			reason = fmt.Sprintf("nebula-stats-dead %s: %v",
@@ -169,7 +169,6 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 		var mu sync.Mutex
 		var wg sync.WaitGroup
 		for _, t := range targets {
-			t := t
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -206,9 +205,8 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 			}
 		}
 		if len(slowpath) > 0 {
-			n.state.SuspectLog(hoststate.LatchNebulaSlowpath, fmt.Sprintf(
-				"suspect: nebula-dataplane-slowpath (reroute via remote site) %s",
-				strings.Join(slowpath, " ")), suspectLogCadence)
+			n.state.SuspectLog(hoststate.LatchNebulaSlowpath, "suspect: nebula-dataplane-slowpath (reroute via remote site) "+
+				strings.Join(slowpath, " "), suspectLogCadence)
 			n.state.Enter(hoststate.LatchNebulaSlowpath, strings.Join(slowpath, " "))
 		} else {
 			n.stateExit(hoststate.LatchNebulaSlowpath)
@@ -226,9 +224,8 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 				}
 			}
 			if len(siteedge) > 0 {
-				n.state.SuspectLog(hoststate.LatchNebulaSiteedge, fmt.Sprintf(
-					"suspect: nebula-siteedge-degraded (site-mesh edge lost) %s",
-					strings.Join(siteedge, " ")), suspectLogCadence)
+				n.state.SuspectLog(hoststate.LatchNebulaSiteedge, "suspect: nebula-siteedge-degraded (site-mesh edge lost) "+
+					strings.Join(siteedge, " "), suspectLogCadence)
 				n.state.Enter(hoststate.LatchNebulaSiteedge, strings.Join(siteedge, " "))
 			} else {
 				n.stateExit(hoststate.LatchNebulaSiteedge)

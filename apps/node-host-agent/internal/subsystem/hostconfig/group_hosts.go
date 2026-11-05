@@ -38,7 +38,7 @@ func (c *cyc) blockInHosts(mark, block string) {
 	} else {
 		nh = append(append([]byte{}, hosts...), []byte(block)...)
 	}
-	c.r.writeManaged("/etc/hosts", nh, 0o644)
+	_, _ = c.r.writeManaged("/etc/hosts", nh, 0o644)
 }
 
 func (c *cyc) removeFromHosts(mark string) {
@@ -50,7 +50,7 @@ func (c *cyc) removeFromHosts(mark string) {
 	}
 	nh := hostsBlockRe(mark).ReplaceAll(hosts, nil)
 	if string(nh) != string(hosts) {
-		c.r.writeManaged("/etc/hosts", nh, 0o644)
+		_, _ = c.r.writeManaged("/etc/hosts", nh, 0o644)
 	}
 }
 

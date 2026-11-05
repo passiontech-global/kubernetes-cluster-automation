@@ -1,7 +1,7 @@
 package hostmetrics
 
 import (
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
@@ -36,42 +36,47 @@ func ConfigFromEnv(d EnvDeps) Config {
 		NodeName:         d.NodeName,
 		WatchdogStateDir: d.WatchdogStateDir,
 		Standalone:       d.Standalone,
-		KeyUsersFile: envx.String("NODE_HOST_AGENT_KEY_USERS_FILE",
+		EgressRelays:     d.OverlayEgressRelays,
+	}
+	// The env surface, one row per knob in declaration order.
+	envx.Apply([]envx.Knob{
+		envx.StringKnob("NODE_HOST_AGENT_KEY_USERS_FILE", &cfg.KeyUsersFile,
 			defaultKeyUsersFile),
-		LatchInterval: envx.Duration("NODE_HOST_AGENT_LATCH_INTERVAL",
+		envx.DurationKnob("NODE_HOST_AGENT_LATCH_INTERVAL", &cfg.LatchInterval,
 			defaultLatchInterval),
-		SysClassNet: envx.String("NODE_HOST_AGENT_SYS_CLASS_NET", defaultSysClassNet),
-		NebulaIface: envx.String("NODE_HOST_AGENT_NEBULA_IFACE", defaultNebulaIface),
-		RouteFile:   envx.String("NODE_HOST_AGENT_HOST_ROUTE_FILE", defaultRouteFile),
-		K0sConfigFile: envx.String("NODE_HOST_AGENT_K0S_CONFIG",
+		envx.StringKnob("NODE_HOST_AGENT_SYS_CLASS_NET", &cfg.SysClassNet, defaultSysClassNet),
+		envx.StringKnob("NODE_HOST_AGENT_NEBULA_IFACE", &cfg.NebulaIface, defaultNebulaIface),
+		envx.StringKnob("NODE_HOST_AGENT_HOST_ROUTE_FILE", &cfg.RouteFile, defaultRouteFile),
+		envx.StringKnob("NODE_HOST_AGENT_K0S_CONFIG", &cfg.K0sConfigFile,
 			defaultK0sConfigFile),
-		K0sUnitFile: envx.String("NODE_HOST_AGENT_K0S_UNIT",
+		envx.StringKnob("NODE_HOST_AGENT_K0S_UNIT", &cfg.K0sUnitFile,
 			hostPath(defaultK0sUnitFile)),
-		NebulaCertFile: envx.String("NODE_HOST_AGENT_NEBULA_CERT",
+		envx.StringKnob("NODE_HOST_AGENT_NEBULA_CERT", &cfg.NebulaCertFile,
 			hostPath("/etc/nebula/"+d.NebulaNet+"/host.crt")),
 		// empty env → nil → applyDefaults' expected key set.
-		ExpectedKCMArgs: envx.List("NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS"),
-		PSIFile:         envx.String("NODE_HOST_AGENT_PSI_FILE", defaultPSIFile),
-		EgressRelays:    d.OverlayEgressRelays,
-		CPUDeliveredInterval: envx.Duration(
-			"NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL", defaultCPUDeliveredIn),
+		envx.ListKnob("NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS", &cfg.ExpectedKCMArgs),
+		envx.StringKnob("NODE_HOST_AGENT_PSI_FILE", &cfg.PSIFile, defaultPSIFile),
+		envx.DurationKnob("NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL",
+			&cfg.CPUDeliveredInterval, defaultCPUDeliveredIn),
 		// W7-H5/H6 telemetry files.
-		ConntrackStatFile: envx.String("NODE_HOST_AGENT_CONNTRACK_STAT_FILE",
+		envx.StringKnob("NODE_HOST_AGENT_CONNTRACK_STAT_FILE", &cfg.ConntrackStatFile,
 			defaultConntrackStatFile),
-		ARPTableFile: envx.String("NODE_HOST_AGENT_ARP_TABLE_FILE",
+		envx.StringKnob("NODE_HOST_AGENT_ARP_TABLE_FILE", &cfg.ARPTableFile,
 			defaultARPTableFile),
-		CgroupMemUnits: envx.List("NODE_HOST_AGENT_CGROUP_MEM_UNITS"),
-	}
-	// envList → default-closure: a set env wins verbatim (even an
-	// empty-looking parse is nil → defaults); unset falls back to the
-	// hostPath-joined mount set — NOT defaultFilesystemTargets, which
-	// assumes the "/host" prefix literally.
-	if l := envx.List("NODE_HOST_AGENT_FILESYSTEM_TARGETS"); l != nil {
-		cfg.FilesystemTargets = l
-	} else {
-		cfg.FilesystemTargets = []string{
-			hostPath("/etc"), hostPath("/var/lib/k0s"), "/var/openebs/local",
-		}
-	}
+		envx.ListKnob("NODE_HOST_AGENT_CGROUP_MEM_UNITS", &cfg.CgroupMemUnits),
+		// envList → default-closure: a set env wins verbatim (even an
+		// empty-looking parse is nil → defaults); unset falls back to
+		// the hostPath-joined mount set — NOT defaultFilesystemTargets,
+		// which assumes the "/host" prefix literally.
+		{Name: "NODE_HOST_AGENT_FILESYSTEM_TARGETS", Resolve: func(k string) {
+			if l := envx.List(k); l != nil {
+				cfg.FilesystemTargets = l
+			} else {
+				cfg.FilesystemTargets = []string{
+					hostPath("/etc"), hostPath("/var/lib/k0s"), "/var/openebs/local",
+				}
+			}
+		}},
+	})
 	return cfg
 }

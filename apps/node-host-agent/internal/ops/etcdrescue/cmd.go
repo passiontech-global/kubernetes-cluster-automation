@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdmaint"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/etcdmaint"
 )
 
 // Cmd is the `rescue-etcd` subcommand entrypoint.

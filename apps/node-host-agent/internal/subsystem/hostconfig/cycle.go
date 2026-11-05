@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/pagecache"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 //go:embed all:templates
@@ -223,11 +224,11 @@ func (c *cyc) checkedDeploy(path string, content []byte, mode os.FileMode, errMs
 		c.err(errMsg,
 			"path", path, "candidate", cand,
 			"check", strings.Join(check, " "), "out", out, "error", err)
-		r.removeManaged(cand)
+		_, _ = r.removeManaged(cand)
 		return false, false
 	}
 	changed, _ = r.writeManaged(path, content, mode)
-	r.removeManaged(cand)
+	_, _ = r.removeManaged(cand)
 	return changed, true
 }
 
@@ -492,7 +493,7 @@ func downloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
@@ -522,7 +523,7 @@ func downloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time
 		os.Remove(tmp)
 		return err
 	}
-	if wantSHA256 != "" && !strings.EqualFold(wantSHA256, fmt.Sprintf("%x", h.Sum(nil))) {
+	if wantSHA256 != "" && !strings.EqualFold(wantSHA256, hex.EncodeToString(h.Sum(nil))) {
 		os.Remove(tmp)
 		return fmt.Errorf("download %s: sha256 mismatch", url)
 	}

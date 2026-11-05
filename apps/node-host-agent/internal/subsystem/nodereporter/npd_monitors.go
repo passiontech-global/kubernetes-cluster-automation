@@ -45,21 +45,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 )
 
 // kubelet-stale-monitor.json rules — journald plugin, temporary
@@ -239,45 +236,19 @@ type kernelLine struct {
 // into its message and boot-relative timestamp. Lines without the
 // kmsg header pass through whole with an unknown timestamp.
 func parseKmsgRecord(line []byte) kernelLine {
-	s := strings.TrimRight(string(line), "\r")
-	i := strings.IndexByte(s, ';')
-	if i < 0 {
-		return kernelLine{msg: s, usec: -1}
-	}
-	usec := int64(-1)
-	if f := strings.Split(s[:i], ","); len(f) >= 3 {
-		if v, err := strconv.ParseInt(f[2], 10, 64); err == nil {
-			usec = v
-		}
-	}
-	return kernelLine{msg: s[i+1:], usec: usec}
+	r := kmsg.ParseRecord(line)
+	return kernelLine{msg: r.Msg, usec: r.Usec}
 }
 
 // splitPendingLines carries a trailing partial line into the next
 // drain, same contract as the watchdog log tail.
 func splitPendingLines(pending, data []byte) (lines [][]byte, rest []byte) {
-	buf := append(pending, data...)
-	last := bytes.LastIndexByte(buf, '\n')
-	if last < 0 {
-		if len(buf) > maxLogPendingBytes {
-			buf = buf[len(buf)-maxLogPendingBytes:]
-		}
-		return nil, buf
-	}
-	if rem := buf[last+1:]; len(rem) > 0 {
-		if len(rem) > maxLogPendingBytes {
-			rem = rem[len(rem)-maxLogPendingBytes:]
-		}
-		rest = append([]byte(nil), rem...)
-	}
-	for b := buf[:last]; len(b) > 0; {
-		i := bytes.IndexByte(b, '\n')
-		if i < 0 {
-			lines = append(lines, b)
-			break
-		}
-		lines = append(lines, b[:i])
-		b = b[i+1:]
+	lines, rest = kmsg.SplitLines(pending, data)
+	// maxLogPendingBytes bounds the carried partial-line buffer — a
+	// never-terminated line keeps only its tail so the carry cannot
+	// grow without bound.
+	if len(rest) > maxLogPendingBytes {
+		rest = rest[len(rest)-maxLogPendingBytes:]
 	}
 	return lines, rest
 }
@@ -286,17 +257,7 @@ func splitPendingLines(pending, data []byte) (lines [][]byte, rest []byte) {
 // mounts host /dev/kmsg at the same path; <HostRoot>/dev/kmsg covers
 // layouts that mount the whole host /dev (or host root) instead.
 func openKmsg(cfg *Config) *os.File {
-	seen := map[string]bool{}
-	for _, p := range []string{cfg.KmsgFile, filepath.Join(cfg.HostRoot, "dev/kmsg")} {
-		if p == "" || seen[p] {
-			continue
-		}
-		seen[p] = true
-		if f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0); err == nil {
-			return f
-		}
-	}
-	return nil
+	return kmsg.Open(kmsg.DevicePaths(cfg.KmsgFile, cfg.HostRoot)...)
 }
 
 // readKmsgAvail drains all currently-available records from an
@@ -307,24 +268,7 @@ func openKmsg(cfg *Config) *os.File {
 // ring backlog consumed) rather than being cut at the byte cap; the
 // caller keeps the lookback age filter armed until it sees it.
 func readKmsgAvail(f *os.File) (data []byte, caughtUp bool, err error) {
-	var buf bytes.Buffer
-	tmp := make([]byte, 8192)
-	for buf.Len() <= maxKmsgReadBytes {
-		n, err := f.Read(tmp)
-		if n > 0 {
-			buf.Write(tmp[:n])
-		}
-		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, io.EOF) {
-				return buf.Bytes(), true, nil
-			}
-			return buf.Bytes(), false, err
-		}
-		if n == 0 {
-			return buf.Bytes(), true, nil
-		}
-	}
-	return buf.Bytes(), false, nil
+	return kmsg.Drain(f, maxKmsgReadBytes)
 }
 
 // kernelLines returns new kernel records and whether they must pass

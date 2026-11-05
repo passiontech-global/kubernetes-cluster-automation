@@ -46,6 +46,7 @@ package nethealth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -55,13 +56,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostexec"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/probee"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checks"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // Defaults mirror the shell modules + DaemonSet host mounts.
@@ -273,7 +275,7 @@ func (c *Config) applyDefaults() {
 			ips, err := r.LookupIP(dctx, "ip4", name)
 			if err != nil || len(ips) == 0 {
 				if err == nil {
-					err = fmt.Errorf("no A records")
+					err = errors.New("no A records")
 				}
 				return "", err
 			}
@@ -344,6 +346,12 @@ type NetHealth struct {
 	cycles  *prometheus.CounterVec // check, result
 	actions *prometheus.CounterVec // check, action
 
+	// groups is the ordered per-Cycle dispatch table — initChecks
+	// fills it; the order + the uptime-gated first group preserve
+	// the shell runner's module order (20/21 alone carried
+	// WD_REQUIRES:uptime).
+	groups []checks.Group
+
 	// routeGuardRunning keeps the route guard single-flight while
 	// still allowing a respawn: set when the goroutine spawns,
 	// cleared when it exits (clean cancel, read error unwind, or a
@@ -385,6 +393,7 @@ func New(cfg Config, reg prometheus.Registerer) (*NetHealth, error) {
 			}
 		}
 	}
+	n.initChecks()
 	return n, nil
 }
 
@@ -416,12 +425,47 @@ func (n *NetHealth) Run(ctx context.Context) {
 	}).Run(ctx)
 }
 
-// Cycle runs one round of all checks. The DNS modules carry the
-// uptime gate (WD_REQUIRES: uptime) — egress/nebula/fail2ban run
-// regardless, like the shell runner. Each check additionally honours
-// the runner's per-module kill switch: WD_SIG_<NAME>=off in the conf
-// skips it (SignalEnabled), and the conf is re-read every cycle when
-// WatchdogSrc is wired (hostconfig rewrites land next cycle).
+// initChecks builds the ordered dispatch table Cycle drives — the
+// workerhygiene initChecks pattern. Order + grouping are
+// load-bearing: the uptime gate covers ONLY the two DNS modules
+// (20/21 carried WD_REQUIRES: uptime); the rest ran regardless,
+// like the shell runner. Each entry's Name is the check* constant —
+// the prometheus `check` label AND the WD_SIG_<NAME> key.
+func (n *NetHealth) initChecks() {
+	n.groups = []checks.Group{
+		{
+			GateOK: n.uptimeOK,
+			Entries: []checks.Entry{
+				{Name: checkDNSFB, Run: n.checkDNSFallback},
+				{Name: checkCoreDNS, Run: n.checkCoreDNSStub},
+			},
+		},
+		{
+			Entries: []checks.Entry{
+				{Name: checkEgress, Run: n.checkOverlayEgress},
+				{Name: checkNebula, Run: n.checkNebulaHealth},
+				{Name: checkF2B, Run: n.checkFail2ban},
+				{Name: checkClock, Run: n.checkClockSync},
+				{Name: checkCT, Run: n.checkConntrack},
+				{Name: checkNebTCP, Run: n.checkNebulaDirectTCP},
+			},
+		},
+	}
+}
+
+// uptimeOK is the 20/21 WD_REQUIRES:uptime group gate — a read
+// error opens it (the shell's `[ $UP -lt $MIN ]` test on an empty
+// UPTIME failed the same way: the modules ran).
+func (n *NetHealth) uptimeOK() bool {
+	up, err := hostutil.UptimeSeconds(n.cfg.UptimeFile)
+	return err != nil || up >= minUptimeSeconds
+}
+
+// Cycle runs one round of all checks through the declared dispatch
+// table. Each check honours the runner's per-module kill switch:
+// WD_SIG_<NAME>=off in the conf skips it (SignalEnabled), and the
+// conf is re-read every cycle when WatchdogSrc is wired (hostconfig
+// rewrites land next cycle).
 func (n *NetHealth) Cycle(ctx context.Context) {
 	// Deferred so even an early-returned cycle proves the loop is
 	// alive (BUG-H1 — Store.StampLastRun no-ops on an empty dir).
@@ -432,56 +476,7 @@ func (n *NetHealth) Cycle(ctx context.Context) {
 	sigOn := func(name string) bool {
 		return n.cfg.Watchdog == nil || n.cfg.Watchdog.SignalEnabled(name)
 	}
-	upOk := true
-	if up, err := hostutil.UptimeSeconds(n.cfg.UptimeFile); err == nil &&
-		up < minUptimeSeconds {
-		upOk = false
-	}
-	if upOk {
-		if sigOn(checkDNSFB) {
-			n.checkDNSFallback(ctx)
-		} else {
-			n.cycles.WithLabelValues(checkDNSFB, "disabled").Inc()
-		}
-		if sigOn(checkCoreDNS) {
-			n.checkCoreDNSStub(ctx)
-		} else {
-			n.cycles.WithLabelValues(checkCoreDNS, "disabled").Inc()
-		}
-	} else {
-		n.cycles.WithLabelValues(checkDNSFB, "uptime_gate").Inc()
-		n.cycles.WithLabelValues(checkCoreDNS, "uptime_gate").Inc()
-	}
-	if sigOn(checkEgress) {
-		n.checkOverlayEgress(ctx)
-	} else {
-		n.cycles.WithLabelValues(checkEgress, "disabled").Inc()
-	}
-	if sigOn(checkNebula) {
-		n.checkNebulaHealth(ctx)
-	} else {
-		n.cycles.WithLabelValues(checkNebula, "disabled").Inc()
-	}
-	if sigOn(checkF2B) {
-		n.checkFail2ban(ctx)
-	} else {
-		n.cycles.WithLabelValues(checkF2B, "disabled").Inc()
-	}
-	if sigOn(checkClock) {
-		n.checkClockSync(ctx)
-	} else {
-		n.cycles.WithLabelValues(checkClock, "disabled").Inc()
-	}
-	if sigOn(checkCT) {
-		n.checkConntrack(ctx)
-	} else {
-		n.cycles.WithLabelValues(checkCT, "disabled").Inc()
-	}
-	if sigOn(checkNebTCP) {
-		n.checkNebulaDirectTCP(ctx)
-	} else {
-		n.cycles.WithLabelValues(checkNebTCP, "disabled").Inc()
-	}
+	checks.Dispatch(ctx, sigOn, n.cycles, n.groups)
 }
 
 // --- watchdog file helpers (lib.sh parity) ---

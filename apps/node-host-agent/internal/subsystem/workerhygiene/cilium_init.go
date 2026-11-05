@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // ciliumInitCheck — sig15: endpoints stuck in reserved:init

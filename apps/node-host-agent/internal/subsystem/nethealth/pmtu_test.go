@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // dfProbeRan reports whether the DF ping ran against target — the

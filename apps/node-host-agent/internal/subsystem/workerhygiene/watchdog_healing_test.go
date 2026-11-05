@@ -9,6 +9,7 @@ package workerhygiene
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -130,10 +131,10 @@ func TestProbeHTTPDefaultNon2xxIsError(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv200 := httptest.NewServer(http.HandlerFunc(
-		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
 	defer srv200.Close()
 	srv503 := httptest.NewServer(http.HandlerFunc(
-		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(503) }))
+		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
 	defer srv503.Close()
 
 	if err := h.cfg.Seams.probeHTTP(context.Background(), srv200.URL, time.Second); err != nil {
@@ -219,7 +220,7 @@ func TestSyncloopDownRestartCooldown(t *testing.T) {
 // the socket probe's BUG-H4 remedy.
 func TestContainerdSockDownRestartsK0sWorker(t *testing.T) {
 	e := fixture(t)
-	e.sockErrs[e.h.cfg.Ctr.Socket] = fmt.Errorf("connection refused")
+	e.sockErrs[e.h.cfg.Ctr.Socket] = errors.New("connection refused")
 	e.h.Cycle(context.Background())
 	if e.sdRan("restart k0sworker.service") {
 		t.Fatal("k0sworker restarted on the first suspect cycle")

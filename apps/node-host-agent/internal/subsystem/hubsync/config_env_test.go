@@ -3,7 +3,7 @@ package hubsync
 import (
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestConfigFromEnv(t *testing.T) {

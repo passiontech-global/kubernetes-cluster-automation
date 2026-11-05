@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/pagecache"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 )
 
 // ---------- T1/T2/A4/T16 + hostname hosts pin ----------
@@ -82,7 +82,7 @@ func (c *cyc) groupBase() {
 
 	// T2 k0sworker limits drop-in.
 	if c.worker() {
-		c.r.ensureDir("/etc/systemd/system/k0sworker.service.d", 0o755)
+		_ = c.r.ensureDir("/etc/systemd/system/k0sworker.service.d", 0o755)
 		if ch, _ := r.writeManaged("/etc/systemd/system/k0sworker.service.d/10-limits.conf",
 			[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for k0s worker
 [Service]
@@ -98,7 +98,7 @@ TasksMax=infinity
 	// the worker unit so systemd never caps the controller's thread
 	// count below kernel pid_max during reconcile bursts.
 	if c.controller() {
-		c.r.ensureDir("/etc/systemd/system/k0scontroller.service.d", 0o755)
+		_ = c.r.ensureDir("/etc/systemd/system/k0scontroller.service.d", 0o755)
 		if ch, _ := r.writeManaged("/etc/systemd/system/k0scontroller.service.d/10-limits.conf",
 			[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for k0s controller
 [Service]
@@ -125,7 +125,7 @@ TasksMax=infinity
 		if !re.MatchString(string(hosts)) || !strings.Contains(string(hosts), line) {
 			nh := re.ReplaceAll(hosts, []byte(line))
 			if string(nh) != string(hosts) {
-				r.writeManaged("/etc/hosts", nh, 0o644)
+				_, _ = r.writeManaged("/etc/hosts", nh, 0o644)
 			}
 		}
 	} else {
@@ -135,7 +135,7 @@ TasksMax=infinity
 			hosts = append(hosts, '\n')
 		}
 		nh := append(hosts, []byte(line+"\n")...)
-		r.writeManaged("/etc/hosts", nh, 0o644)
+		_, _ = r.writeManaged("/etc/hosts", nh, 0o644)
 	}
 
 	// Journald persistence BEFORE the integrity probe: on standalone
@@ -249,7 +249,7 @@ func (c *cyc) journaldIntegrity() {
 		r.actions.WithLabelValues("journalctl --rotate --vacuum-time=3d").Inc()
 		// Spend on the attempt: a failing rotate retries next cycle no
 		// more than once per cooldown window.
-		r.ensureDir(watchdogStateDir, 0o755)
+		_ = r.ensureDir(watchdogStateDir, 0o755)
 		r.state.RateSpend("last-journald-rotate")
 		// runLong: vacuum of a multi-GB journal on a slow disk blows past
 		// the interactive command budget.
@@ -276,7 +276,7 @@ func (c *cyc) journaldIntegrity() {
 			"probe_out", out)
 		// Spend on the attempt: a failing restart retries no more
 		// than once per cooldown window.
-		r.ensureDir(watchdogStateDir, 0o755)
+		_ = r.ensureDir(watchdogStateDir, 0o755)
 		r.state.RateSpend("last-journald-restart")
 		r.restartService(ctx, "systemd-journald.service")
 	}

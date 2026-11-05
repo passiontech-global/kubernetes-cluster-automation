@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -13,7 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
 // jenv is the janitor fixture: tempdir state dir + fake procfs + a
@@ -107,7 +108,7 @@ func jfixture(t *testing.T) *jenv {
 func (e *jenv) mkProc(t *testing.T, pid, ppid int, argv ...string) {
 	t.Helper()
 	e.live[pid] = true
-	dir := filepath.Join(e.proc, fmt.Sprint(pid))
+	dir := filepath.Join(e.proc, strconv.Itoa(pid))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}

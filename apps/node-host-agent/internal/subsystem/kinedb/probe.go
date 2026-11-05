@@ -37,7 +37,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // pgStartupMessage builds the protocol-3.0 StartupMessage — the same
@@ -215,7 +215,7 @@ func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
 	if k.cfg.wireFn(ctx, k.cfg.WireAddr) {
 		res.checks[checkWire] = 1
 	} else {
-		note(fmt.Sprintf("wire-probe-fail %s", k.cfg.WireAddr))
+		note("wire-probe-fail " + k.cfg.WireAddr)
 	}
 
 	user, pass, credOK := k.creds()
@@ -347,7 +347,7 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	if err == nil && strings.TrimSpace(out) == "1" {
 		res.checks[checkBackendEnv] = 1
 	} else {
-		note(fmt.Sprintf("backend-env-drift user=%s", user))
+		note("backend-env-drift user=" + user)
 	}
 
 	// (g) revision horizon — head vs compact_rev + the live-tuple

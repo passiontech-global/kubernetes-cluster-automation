@@ -1,6 +1,7 @@
 package jinja
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -161,7 +162,7 @@ func parseTemplate(text string) ([]tnode, error) {
 			containers = append(containers, &in.arms[len(in.arms)-1].body)
 		case "endif":
 			if len(frames) == 0 || frames[len(frames)-1].kind != "if" {
-				return nil, fmt.Errorf("endif without if")
+				return nil, errors.New("endif without if")
 			}
 			frames = frames[:len(frames)-1]
 			containers = containers[:len(containers)-1]

@@ -351,9 +351,9 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 	}
 	switch h.cfg.Sig13.Mode {
 	case ModeEnforce:
-		h.state.AppendLog(fmt.Sprintf(
-			"ACTION: restarting k0scontroller - cp-component-frozen %s",
-			reason))
+		h.state.AppendLog(
+			"ACTION: restarting k0scontroller - cp-component-frozen " +
+				reason)
 		h.state.RateSpend(fileRateCPRestart)
 		h.state.ResetCounter(fileCtrCPFreeze)
 		h.state.ResetCounter(fileCtrKCMQuiet)
@@ -364,9 +364,9 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 		}
 		h.actions.WithLabelValues(checkCPFreeze, "restart_controller").Inc()
 	case ModeDryRun:
-		h.state.AppendLog(fmt.Sprintf(
-			"DRY-RUN: would restart k0scontroller - cp-component-frozen %s",
-			reason))
+		h.state.AppendLog(
+			"DRY-RUN: would restart k0scontroller - cp-component-frozen " +
+				reason)
 		h.actions.WithLabelValues(checkCPFreeze, "dryrun_restart").Inc()
 	}
 	h.cycles.WithLabelValues(checkCPFreeze, "ok").Inc()

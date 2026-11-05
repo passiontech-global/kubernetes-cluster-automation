@@ -3,7 +3,7 @@ package concoursecache
 import (
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
 )
 
 // defaultBaseDir is the openebs hostdir root — duplicated from
@@ -30,6 +30,11 @@ type Knobs struct {
 // shared with the orphan sweeper (same openebs root — the pruner
 // walks its pvc-*/shared-cache children); the enable gate
 // (NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE) stays in the caller.
+//
+// Unlike every other subsystem env loader this takes no EnvDeps:
+// the pruner is pure host-fs work — nothing injectable (no kube
+// client, watchdog conf, systemd or host-path seams) — so the env
+// surface stays self-contained and callers have nothing to wire.
 func ConfigFromEnv() Knobs {
 	return Knobs{
 		Config: Config{},

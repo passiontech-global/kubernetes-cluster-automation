@@ -35,7 +35,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 // SuspectBudgetPrefix prefixes the suspect-log dedupe budgets:
@@ -129,7 +129,7 @@ func (s *Store) Enter(name, extra string) {
 	if extra != "" {
 		s.AppendLog(fmt.Sprintf("STATE-ENTER: %s %s", name, extra))
 	} else {
-		s.AppendLog(fmt.Sprintf("STATE-ENTER: %s", name))
+		s.AppendLog("STATE-ENTER: " + name)
 	}
 }
 
@@ -154,7 +154,7 @@ func (s *Store) Exit(name string, cleanup func()) {
 	if cleanup != nil {
 		cleanup()
 	}
-	s.AppendLog(fmt.Sprintf("STATE-EXIT: %s", name))
+	s.AppendLog("STATE-EXIT: " + name)
 }
 
 // ExitClearSuspect is Exit plus removal of this latch's suspect-log

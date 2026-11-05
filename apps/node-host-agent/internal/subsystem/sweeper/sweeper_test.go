@@ -18,7 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
-	nhatestutil "github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/testutil"
+	nhatestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 const pvcUUID = "pvc-12345678-90ab-cdef-1234-567890abcdef"

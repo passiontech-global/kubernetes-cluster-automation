@@ -36,7 +36,7 @@ table inet interdc_acct {
 	c.applyNftUnit("interdc-acct", "/etc/interdc-acct.nft",
 		[]byte(nft), "interdc per-peer bandwidth accounting (nft counters)")
 	// sweep the invented first-port deployment (wrong table + paths)
-	c.r.run(c.ctx, "systemctl", "disable", "--now", "interdc-bw-audit.service")
-	c.r.removeManaged("/etc/systemd/system/interdc-bw-audit.service")
-	c.r.removeManaged("/etc/nftables.d/interdc-bw-audit.nft")
+	_, _ = c.r.run(c.ctx, "systemctl", "disable", "--now", "interdc-bw-audit.service")
+	_, _ = c.r.removeManaged("/etc/systemd/system/interdc-bw-audit.service")
+	_, _ = c.r.removeManaged("/etc/nftables.d/interdc-bw-audit.nft")
 }

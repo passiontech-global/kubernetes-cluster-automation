@@ -13,7 +13,7 @@
 package procfs
 
 import (
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,7 +23,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 // FS is a /proc filesystem view bound to one proc root.
@@ -208,11 +208,11 @@ func (f FS) PIDAgeSeconds(pid int, clkTck float64) (float64, error) {
 	s := string(data)
 	i := strings.LastIndexByte(s, ')')
 	if i < 0 {
-		return 0, fmt.Errorf("bad stat")
+		return 0, errors.New("bad stat")
 	}
 	fields := strings.Fields(s[i+1:])
 	if len(fields) < 20 {
-		return 0, fmt.Errorf("short stat")
+		return 0, errors.New("short stat")
 	}
 	start, err := strconv.ParseFloat(fields[19], 64) // field 22 overall
 	if err != nil {

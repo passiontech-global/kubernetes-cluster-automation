@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // ciliumUnhealthySubsystems lists healthz subsystem paths whose
@@ -88,9 +88,9 @@ func (c *ciliumEnvoyCheck) Run(ctx context.Context, e *cycleEnv) {
 	// verdict (the admin port is the primary signal).
 	if body, err := c.h.cfg.Seams.unixGet(ctx, c.h.cfg.Cilium.Socket, "/v1/healthz"); err == nil {
 		if bad := ciliumUnhealthySubsystems(body); len(bad) > 0 {
-			c.h.state.AppendLog(fmt.Sprintf(
-				"suspect: cilium subsystem health degraded: %s",
-				strings.Join(bad, ",")))
+			c.h.state.AppendLog(
+				"suspect: cilium subsystem health degraded: " +
+					strings.Join(bad, ","))
 		}
 	}
 	// Trigger 1: the agent was SIGKILLed this cycle — envoy may hold

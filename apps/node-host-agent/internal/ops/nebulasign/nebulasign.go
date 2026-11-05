@@ -21,7 +21,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 // signJob is one cert request, mirroring sign.yaml's nebula_sign_jobs
@@ -273,7 +273,7 @@ func signAll(ctx context.Context, certBin string, cfg signConfig, jobs []signJob
 		pemPub := "-----BEGIN NEBULA X25519 PUBLIC KEY-----\n" + j.Pub +
 			"\n-----END NEBULA X25519 PUBLIC KEY-----\n"
 		if err := os.WriteFile(pubPath, []byte(pemPub), 0o600); err != nil {
-			os.RemoveAll(tmp)
+			_ = os.RemoveAll(tmp)
 			return fmt.Errorf("%s: %w", j.Hostname, err)
 		}
 		caCrt := filepath.Join(cfg.CaDir, "ca.crt")
@@ -284,28 +284,28 @@ func signAll(ctx context.Context, certBin string, cfg signConfig, jobs []signJob
 			"-ip", j.IPCIDR, "-subnets", j.Subnets,
 			"-duration", cfg.Duration, "-out-crt", crtPath)
 		if out, err := sign.CombinedOutput(); err != nil {
-			os.RemoveAll(tmp)
+			_ = os.RemoveAll(tmp)
 			return fmt.Errorf("%s: nebula-cert sign: %w\n%s", j.Hostname, err, out)
 		}
 		verify := exec.CommandContext(ctx, certBin, "verify",
 			"-ca", caCrt, "-crt", crtPath)
 		if out, err := verify.CombinedOutput(); err != nil {
-			os.RemoveAll(tmp)
+			_ = os.RemoveAll(tmp)
 			return fmt.Errorf("%s: nebula-cert verify: %w\n%s", j.Hostname, err, out)
 		}
 		crt, err := os.ReadFile(crtPath)
-		os.RemoveAll(tmp)
+		_ = os.RemoveAll(tmp)
 		if err != nil {
 			return fmt.Errorf("%s: %w", j.Hostname, err)
 		}
 		dst := filepath.Join(cfg.VarsDir, "nebula-"+j.Name+".crt")
 		tmpDst := dst + ".tmp"
 		if err := os.WriteFile(tmpDst, crt, 0o644); err != nil {
-			os.Remove(tmpDst)
+			_ = os.Remove(tmpDst)
 			return fmt.Errorf("%s: %w", j.Hostname, err)
 		}
 		if err := os.Rename(tmpDst, dst); err != nil {
-			os.Remove(tmpDst)
+			_ = os.Remove(tmpDst)
 			return fmt.Errorf("%s: %w", j.Hostname, err)
 		}
 		fmt.Fprintf(os.Stderr, "nebula-sign: signed %s (%s) -> %s\n",

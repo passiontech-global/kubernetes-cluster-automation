@@ -8,7 +8,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 // ---------- T5b nebula mesh ----------
@@ -30,8 +30,8 @@ func (c *cyc) groupNebula() {
 		// nebula-owned ip rules and flush BOTH policy tables. The
 		// systemctl cleanup interpolates nothing, so it runs even
 		// when a vars value would fail the charset gate below.
-		r.run(ctx, "systemctl", "disable", "--now", "nebula-route-guard.service")
-		r.run(ctx, "systemctl", "disable", "--now", unit)
+		_, _ = r.run(ctx, "systemctl", "disable", "--now", "nebula-route-guard.service")
+		_, _ = r.run(ctx, "systemctl", "disable", "--now", unit)
 		pub, mark := c.tablePub(), c.tableMark()
 		// Vars land unquoted inside the sh -c below — charset-gate
 		// before building the command (nebulaRouting does the same);
@@ -41,7 +41,7 @@ func (c *cyc) groupNebula() {
 			c.shMarkerBase("interdc_marker_base", c.markerBase())) {
 			return
 		}
-		r.run(ctx, "sh", "-c", fmt.Sprintf(
+		_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 			`ip rule list pref 1500 | sed -n "s/.*to \([0-9./]*\).*/\1/p" | while read -r d; do ip rule del pref 1500 to "$d" lookup %s 2>/dev/null; done; `+
 				`ip rule del pref 1490 to %s.0/24 lookup %s 2>/dev/null; `+
 				`ip route flush table %s 2>/dev/null; ip route flush table %s 2>/dev/null; `+
@@ -59,7 +59,7 @@ func (c *cyc) groupNebula() {
 		return
 	}
 	c.nebulaInstallBinary()
-	c.r.ensureDir("/etc/nebula/"+net, 0o755)
+	_ = c.r.ensureDir("/etc/nebula/"+net, 0o755)
 
 	// certs from CM mounts (NebulaCertsDir, fallback VarsDir).
 	certFile := func(name string) (string, bool) {
@@ -121,7 +121,7 @@ func (c *cyc) groupNebula() {
 	// script+unit are NOT rendered here anymore — the whole resident
 	// watchdog stack is retired (pruneLegacyWatchdog sweeps it; the
 	// agent's own converge heals rules/routes every cycle).
-	r.writeManaged("/etc/nebula/"+net+"/overlay", []byte(t.Overlay+"\n"), 0o644)
+	_, _ = r.writeManaged("/etc/nebula/"+net+"/overlay", []byte(t.Overlay+"\n"), 0o644)
 	tctx := c.tplCtx()
 	for _, name := range []string{"nebula-up.sh", "nebula-down.sh"} {
 		b, err := c.r.render(name+".j2", tctx)
@@ -129,12 +129,12 @@ func (c *cyc) groupNebula() {
 			c.err("T5b render", "tpl", name, "error", err)
 			continue
 		}
-		r.writeManaged("/etc/nebula/"+net+"/"+name, b, 0o755)
+		_, _ = r.writeManaged("/etc/nebula/"+net+"/"+name, b, 0o755)
 	}
 	uch, _ := r.writeManaged("/etc/systemd/system/"+unit,
-		[]byte(fmt.Sprintf(`# Managed by node-config-agent
+		[]byte(`# Managed by node-config-agent
 [Unit]
-Description=Nebula overlay network (%%i)
+Description=Nebula overlay network (%i)
 Wants=network-online.target
 After=network-online.target
 # Marker IP (k8s --node-ip) lives on neb1 — k0sworker waits for the
@@ -143,19 +143,19 @@ Before=k0sworker.service
 
 [Service]
 Type=notify
-ExecStart=/usr/local/bin/nebula -config /etc/nebula/%%i/config.yaml
+ExecStart=/usr/local/bin/nebula -config /etc/nebula/%i/config.yaml
 # ExecReload=SIGHUP: nebula >=1.9 hot-reloads pki creds,
 # lighthouse.*, firewall, punchy, tun.unsafe_routes, logging,
 # preferred_ranges — tunnels do not drop.
 ExecReload=/bin/kill -HUP $MAINPID
-ExecStartPost=/etc/nebula/%%i/nebula-up.sh
-ExecStopPost=/etc/nebula/%%i/nebula-down.sh
+ExecStartPost=/etc/nebula/%i/nebula-up.sh
+ExecStopPost=/etc/nebula/%i/nebula-down.sh
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-`)), 0o644)
+`), 0o644)
 	if uch {
 		r.daemonReload(ctx)
 	}
@@ -424,18 +424,18 @@ func (c *cyc) nebulaRouting() {
 	// fwmark for transport
 	for _, p := range []string{"dport", "sport"} {
 		for _, chain := range []string{"OUTPUT", "PREROUTING"} {
-			r.run(ctx, "sh", "-c", fmt.Sprintf(
+			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 				"iptables -t mangle -C %s -p udp --%s %s -j MARK --set-mark 0x1000 2>/dev/null || "+
 					"iptables -t mangle -A %s -p udp --%s %s -j MARK --set-mark 0x1000",
 				chain, p, port(c), chain, p, port(c)))
 		}
 	}
-	r.run(ctx, "sh", "-c", `ip rule list | grep -q "fwmark 0x1000" || ip rule add pref 1400 fwmark 0x1000 lookup main`)
+	_, _ = r.run(ctx, "sh", "-c", `ip rule list | grep -q "fwmark 0x1000" || ip rule add pref 1400 fwmark 0x1000 lookup main`)
 
 	// Populate overlay tables ALWAYS (warm standby even when
 	// overlay=tinc). pub table src = public ip; marker table src =
 	// NODE_IP only when it is a marker-base IP, else flush.
-	r.run(ctx, "sh", "-c", fmt.Sprintf(
+	_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 		`ip link show dev %s >/dev/null 2>&1 || exit 0; `+
 			`ip route replace default dev %s src %s table %s; `+
 			`case "%s" in %s.*) ip route replace default dev %s src %s table %s ;; `+
@@ -448,50 +448,50 @@ func (c *cyc) nebulaRouting() {
 		targets := append(append([]string{}, t.Targets...), t.EgressRelays...)
 		targets = append(targets, mb+".0/24")
 		for _, d := range targets {
-			r.run(ctx, "sh", "-c", fmt.Sprintf(
+			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 				`for t in $(ip rule list pref 1500 | sed -n "s|.*to %s .*lookup \([0-9]*\).*|\1|p"); do [ "$t" = %s ] || ip rule del pref 1500 to %s lookup "$t" 2>/dev/null; done`,
 				d, pub, d))
 		}
 		for _, d := range append(append([]string{}, t.Targets...), mb+".0/24") {
-			r.run(ctx, "sh", "-c", fmt.Sprintf(
+			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 				`ip rule list | grep -q "to %s lookup %s" || ip rule add pref 1500 to %s lookup %s`, d, pub, d, pub))
 		}
 		for _, d := range t.EgressRelays {
-			r.run(ctx, "sh", "-c", fmt.Sprintf(
+			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 				`[ "$(cat /var/lib/node-watchdog/egress-state-%s 2>/dev/null)" = relay ] && { ip rule list | grep -q "to %s lookup %s" || ip rule add pref 1500 to %s lookup %s; }; true`,
 				d, d, pub, d, pub))
 		}
-		r.run(ctx, "sh", "-c", fmt.Sprintf(
+		_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 			`for t in $(ip rule list pref 1490 | sed -n "s|.*to %s\.0/24 .*lookup \([0-9]*\).*|\1|p"); do [ "$t" = %s ] || ip rule del pref 1490 to %s.0/24 lookup "$t" 2>/dev/null; done`,
 			mb, mark, mb))
 		if strings.HasPrefix(nodeIPV, mb+".") {
-			r.run(ctx, "sh", "-c", fmt.Sprintf(
+			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 				`ip rule list | grep -q "to %s.0/24 lookup %s" || ip rule add pref 1490 to %s.0/24 lookup %s`,
 				mb, mark, mb, mark))
 		} else {
-			r.run(ctx, "sh", "-c", fmt.Sprintf(
+			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 				`ip rule del pref 1490 to %s.0/24 lookup %s 2>/dev/null || true`, mb, mark))
 		}
 		// pref-1499 Direct-Underlay TCP bypass: management/CP TCP
 		// dports must never be sucked into the tunnel — rule them
 		// into the main table (nethealth re-adds lost ones).
 		for _, p := range c.nebulaDirectTCPPorts() {
-			r.run(ctx, "sh", "-c", fmt.Sprintf(
+			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 				`ip rule list pref 1499 | grep -q "ipproto tcp dport %s " || ip rule add pref 1499 ipproto tcp dport %s lookup main`,
 				p, p))
 		}
 		// flush foreign dev tables (stale nebula-era tables).
-		r.run(ctx, "sh", "-c", fmt.Sprintf(
+		_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 			`ip -o route show table all dev %s 2>/dev/null | sed -n "s|.* table \([0-9]*\) .*|\1|p" | sort -u | while read -r t; do [ "$t" = "%s" ] || [ "$t" = "%s" ] || ip route flush table "$t" 2>/dev/null; done`,
 			dev, pub, mark))
 	} else {
 		// overlay=tinc: pref-1499 bypass rules go too.
 		for _, p := range c.nebulaDirectTCPPorts() {
-			r.run(ctx, "sh", "-c", fmt.Sprintf(
+			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 				`ip rule del pref 1499 ipproto tcp dport %s lookup main 2>/dev/null || true`, p))
 		}
 		// overlay=tinc rollback: drop nebula-owned rules.
-		r.run(ctx, "sh", "-c", fmt.Sprintf(
+		_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
 			`ip rule list pref 1500 | sed -n "s/.*to \([0-9./]*\).*/\1/p" | while read -r d; do ip rule del pref 1500 to "$d" lookup %s 2>/dev/null; done; ip rule del pref 1490 to %s.0/24 lookup %s 2>/dev/null; true`,
 			pub, mb, mark))
 	}
@@ -515,7 +515,7 @@ func (c *cyc) nebulaRouting() {
 		fmt.Fprintf(&sb, "nft list chain ip nebnat post | grep -q \"saddr %s return\" || nft insert rule ip nebnat post oifname %s ip saddr %s return\n", e.IP, dev, e.IP)
 		fmt.Fprintf(&sb, "nft list chain ip nebnat post | grep -q \"daddr %s snat\" || nft add rule ip nebnat post oifname != %s ip daddr %s snat to %s\n", e.IP, dev, e.IP, pubIP)
 	}
-	r.run(ctx, "sh", "-c", sb.String()+"\ntrue")
+	_, _ = r.run(ctx, "sh", "-c", sb.String()+"\ntrue")
 }
 
 func port(c *cyc) string {

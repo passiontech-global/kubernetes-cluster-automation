@@ -3,7 +3,7 @@ package sweeper
 import (
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
@@ -20,15 +20,17 @@ type EnvDeps struct {
 // (NODE_HOST_AGENT_ENABLE_SWEEPER) and the kube-client build stay in
 // the caller.
 func ConfigFromEnv(d EnvDeps) Config {
-	return Config{
-		BaseDir:        envx.String("NODE_HOST_AGENT_SWEEP_BASE_DIR", defaultBaseDir),
-		MinAge:         envx.Duration("NODE_HOST_AGENT_SWEEP_MIN_AGE", defaultMinAge),
-		MaxDelete:      envx.Int("NODE_HOST_AGENT_SWEEP_MAX_DELETE", defaultMaxDelete),
-		Interval:       envx.Duration("NODE_HOST_AGENT_SWEEP_INTERVAL", defaultInterval),
-		MountsFile:     envx.String("NODE_HOST_AGENT_MOUNTS_FILE", defaultMountsFile),
-		RequestTimeout: envx.Duration("NODE_HOST_AGENT_REQUEST_TIMEOUT", defaultRequestTimeout),
-		Client:         d.Client,
-	}
+	cfg := Config{Client: d.Client}
+	// The env surface, one row per knob in declaration order.
+	envx.Apply([]envx.Knob{
+		envx.StringKnob("NODE_HOST_AGENT_SWEEP_BASE_DIR", &cfg.BaseDir, defaultBaseDir),
+		envx.DurationKnob("NODE_HOST_AGENT_SWEEP_MIN_AGE", &cfg.MinAge, defaultMinAge),
+		envx.IntKnob("NODE_HOST_AGENT_SWEEP_MAX_DELETE", &cfg.MaxDelete, defaultMaxDelete),
+		envx.DurationKnob("NODE_HOST_AGENT_SWEEP_INTERVAL", &cfg.Interval, defaultInterval),
+		envx.StringKnob("NODE_HOST_AGENT_MOUNTS_FILE", &cfg.MountsFile, defaultMountsFile),
+		envx.DurationKnob("NODE_HOST_AGENT_REQUEST_TIMEOUT", &cfg.RequestTimeout, defaultRequestTimeout),
+	})
+	return cfg
 }
 
 // The concourse shared-cache pruner moved to

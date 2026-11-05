@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -155,7 +155,7 @@ func (c *Collector) collectSystemdScopes(ch chan<- prometheus.Metric) {
 	var n float64
 	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil // unreadable entries are skipped, never fatal
+			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
 		}
 		if d.IsDir() && strings.HasPrefix(d.Name(), "cri-containerd-") &&
 			strings.HasSuffix(d.Name(), ".scope") {

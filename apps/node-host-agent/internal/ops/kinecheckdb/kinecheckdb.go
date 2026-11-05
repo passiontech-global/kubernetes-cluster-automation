@@ -20,7 +20,7 @@ import (
 	"flag"
 	"os"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/kinedb"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
 )
 
 // Cmd is the `check-kine-db` subcommand entrypoint: flag parsing +

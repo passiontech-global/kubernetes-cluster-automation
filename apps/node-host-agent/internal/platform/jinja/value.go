@@ -1,6 +1,7 @@
 package jinja
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -373,12 +374,12 @@ func binOp(op string, l, r any) (any, error) {
 				return li * ri, nil
 			case "//":
 				if ri == 0 {
-					return nil, fmt.Errorf("division by zero")
+					return nil, errors.New("division by zero")
 				}
 				return li / ri, nil
 			case "%":
 				if ri == 0 {
-					return nil, fmt.Errorf("modulo by zero")
+					return nil, errors.New("modulo by zero")
 				}
 				return li % ri, nil
 			}
@@ -390,12 +391,12 @@ func binOp(op string, l, r any) (any, error) {
 			return lf * rf, nil
 		case "/", "//":
 			if rf == 0 {
-				return nil, fmt.Errorf("division by zero")
+				return nil, errors.New("division by zero")
 			}
 			return lf / rf, nil
 		case "%":
 			if rf == 0 {
-				return nil, fmt.Errorf("modulo by zero")
+				return nil, errors.New("modulo by zero")
 			}
 			return float64(int64(lf) % int64(rf)), nil
 		}
@@ -523,7 +524,7 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 	case "get":
 		if om, ok := m.obj.(*OMap); ok {
 			if len(args) == 0 {
-				return nil, fmt.Errorf("get: missing key argument")
+				return nil, errors.New("get: missing key argument")
 			}
 			if v, ok := om.Get(Stringify(args[0])); ok {
 				return v, nil
@@ -552,18 +553,18 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 		return strings.TrimSpace(Stringify(m.obj)), nil
 	case "index":
 		if len(args) == 0 {
-			return nil, fmt.Errorf("index: missing argument")
+			return nil, errors.New("index: missing argument")
 		}
 		for i, it := range ToIter(m.obj) {
 			if deepEq(it, args[0]) {
 				return int64(i), nil
 			}
 		}
-		return nil, fmt.Errorf("index: not found")
+		return nil, errors.New("index: not found")
 	case "pop":
 		if l, ok := m.obj.(*List); ok {
 			if len(l.V) == 0 {
-				return nil, fmt.Errorf("pop: empty list")
+				return nil, errors.New("pop: empty list")
 			}
 			i := int64(len(l.V)) - 1
 			if len(args) > 0 {

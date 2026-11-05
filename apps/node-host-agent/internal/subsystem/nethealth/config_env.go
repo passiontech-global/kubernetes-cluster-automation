@@ -1,9 +1,9 @@
 package nethealth
 
 import (
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
@@ -34,29 +34,33 @@ func ConfigFromEnv(d EnvDeps) Config {
 	if hostPath == nil {
 		hostPath = func(p string) string { return p }
 	}
-	return Config{
+	cfg := Config{
 		Enabled:          true,
-		Interval:         envx.Duration("NODE_HOST_AGENT_NETHEALTH_INTERVAL", defaultInterval),
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogLogFile:  d.WatchdogLogFile,
+		HostRoot:         d.HostRoot,
+		Watchdog:         d.Watchdog,
+		WatchdogSrc:      d.WatchdogSrc,
+		Systemd:          d.Systemd,
+	}
+	// The env surface, one row per knob in declaration order.
+	envx.Apply([]envx.Knob{
+		envx.DurationKnob("NODE_HOST_AGENT_NETHEALTH_INTERVAL", &cfg.Interval, defaultInterval),
 		// hostPath defaults — NOT defaultHostResolvConf/defaultHostsFile,
 		// which hardcode the "/host" prefix and would be wrong on a
 		// standalone host (hostRoot "/").
-		HostResolvConf: envx.String("NODE_HOST_AGENT_HOST_RESOLV_CONF",
+		envx.StringKnob("NODE_HOST_AGENT_HOST_RESOLV_CONF", &cfg.HostResolvConf,
 			hostPath("/etc/resolv.conf")),
-		HostsFile: envx.String("NODE_HOST_AGENT_HOSTS_FILE",
+		envx.StringKnob("NODE_HOST_AGENT_HOSTS_FILE", &cfg.HostsFile,
 			hostPath("/etc/hosts")),
-		ProcNetUDP:   envx.String("NODE_HOST_AGENT_PROC_NET_UDP", defaultProcNetUDP),
-		ProcNetUDP6:  envx.String("NODE_HOST_AGENT_PROC_NET_UDP6", defaultProcNetUDP6),
-		UptimeFile:   envx.String("NODE_HOST_AGENT_UPTIME_FILE", defaultUptimeFile),
-		HostRoot:     d.HostRoot,
-		Watchdog:     d.Watchdog,
-		WatchdogSrc:  d.WatchdogSrc,
-		Systemd:      d.Systemd,
-		ConsecNeeded: envx.Int("NODE_HOST_AGENT_NETHEALTH_CONSEC_NEEDED", defaultConsecNeeded),
-		MinRestart:   envx.Duration("NODE_HOST_AGENT_NETHEALTH_MIN_RESTART", defaultMinRestart),
+		envx.StringKnob("NODE_HOST_AGENT_PROC_NET_UDP", &cfg.ProcNetUDP, defaultProcNetUDP),
+		envx.StringKnob("NODE_HOST_AGENT_PROC_NET_UDP6", &cfg.ProcNetUDP6, defaultProcNetUDP6),
+		envx.StringKnob("NODE_HOST_AGENT_UPTIME_FILE", &cfg.UptimeFile, defaultUptimeFile),
+		envx.IntKnob("NODE_HOST_AGENT_NETHEALTH_CONSEC_NEEDED", &cfg.ConsecNeeded, defaultConsecNeeded),
+		envx.DurationKnob("NODE_HOST_AGENT_NETHEALTH_MIN_RESTART", &cfg.MinRestart, defaultMinRestart),
 		// W8: pref-1499 direct-underlay TCP bypass; empty env → nil →
 		// applyDefaults' package default [22 6443 8132 9443 39901].
-		NebulaDirectTCPPorts: envx.IntList("NODE_HOST_AGENT_NEBULA_DIRECT_TCP_PORTS"),
-	}
+		envx.IntListKnob("NODE_HOST_AGENT_NEBULA_DIRECT_TCP_PORTS", &cfg.NebulaDirectTCPPorts),
+	})
+	return cfg
 }

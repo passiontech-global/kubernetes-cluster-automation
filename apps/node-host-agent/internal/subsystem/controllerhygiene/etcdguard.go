@@ -26,8 +26,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdmaint"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/eventpurge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/etcdmaint"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/eventpurge"
 )
 
 // etcdguard knobs (embedded-etcd quota self-defence — cicd
@@ -167,7 +167,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	// GC debt so the rescue has garbage to free — when the rescue
 	// ran, its result IS the verdict, even if eventpurge failed
 	// upstream (the purge failure stays logged above either way).
-	remediated := perr == nil
+	var remediated bool
 	// A dead gctx here means eventpurge (or a cancelled parent) ate
 	// the whole budget — spawn no further calls that can only fail;
 	// the rescue is idempotent and retries in the next window.
@@ -228,7 +228,7 @@ func (h *Hygiene) etcdStatus(ctx context.Context) (dbSize, dbUse int64, err erro
 		return 0, 0, fmt.Errorf("parse endpoint status: %w", err)
 	}
 	if len(arr) == 0 {
-		return 0, 0, fmt.Errorf("parse endpoint status: empty endpoint list")
+		return 0, 0, errors.New("parse endpoint status: empty endpoint list")
 	}
 	return arr[0].Status.DBSize, arr[0].Status.DBSizeInUse, nil
 }

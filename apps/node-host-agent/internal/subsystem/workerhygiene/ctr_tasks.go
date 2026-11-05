@@ -456,7 +456,7 @@ func (c *ctrImagesCheck) Run(ctx context.Context, e *cycleEnv) {
 		}
 		// NPD contract: "removed corrupted image" feeds the
 		// CorruptedImageRemoved filelog pattern.
-		c.h.state.AppendLog(fmt.Sprintf("ACTION: removed corrupted image %s", img))
+		c.h.state.AppendLog("ACTION: removed corrupted image " + img)
 		c.h.actions.WithLabelValues(checkCtrImages, "image_rm").Inc()
 	}
 	c.h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()

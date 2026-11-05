@@ -13,7 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // bloatHit is one over-threshold directory found by the walk.
@@ -48,7 +48,7 @@ func (h *Hygiene) walkBytes(root string) (total int64, truncated bool) {
 	entries := 0
 	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil // unreadable entries are skipped, never fatal
+			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
 		}
 		entries++
 		if entries > maxBloatWalkEntries {
@@ -99,7 +99,7 @@ func (c *diskBloatCheck) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 			uidDir, "volumes", "kubernetes.io~empty-dir")) {
 			var vst unix.Statfs_t
 			if err := c.h.cfg.Seams.statfsFn(vol, &vst); err == nil &&
-				int64(vst.Type) == int64(unix.TMPFS_MAGIC) {
+				vst.Type == int64(unix.TMPFS_MAGIC) {
 				continue // medium=Memory emptyDir — can't fill the disk
 			}
 			size, _ := c.h.walkBytes(vol)

@@ -8,7 +8,7 @@ package hostconfig
 func (c *cyc) groupNodeCPU() {
 	r, ctx := c.r, c.ctx
 	if c.worker() && !c.t.AmLighthouse {
-		r.ensureDir("/etc/systemd/system/k0sworker.service.d", 0o755)
+		_ = r.ensureDir("/etc/systemd/system/k0sworker.service.d", 0o755)
 		if ch, _ := r.writeManaged("/etc/systemd/system/k0sworker.service.d/20-wait-nodeip.conf",
 			[]byte(`# Managed by node-config-agent - T8: wait for the marker IP
 # on neb1 before k0sworker binds --node-ip (nebula Before=k0sworker).
@@ -41,7 +41,7 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip addr show dev neb1 | grep -
 		}
 	}
 	if c.t.Found {
-		r.ensureDir("/etc/systemd/system/nebula@interdc.service.d", 0o755)
+		_ = r.ensureDir("/etc/systemd/system/nebula@interdc.service.d", 0o755)
 		quota := c.v("interdc_nebula_cpu_quota")
 		if quota == "" || quota == "None" {
 			quota = "150%"

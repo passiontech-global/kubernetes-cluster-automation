@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // ===========================================================================
@@ -232,13 +232,12 @@ func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 	args := []string{"-t", "mangle", "-C", "POSTROUTING",
 		"-o", dev, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
 		"-j", "TCPMSS", "--clamp-mss-to-pmtu"}
-	out, err := n.cfg.runMountCmd(ctx,
-		append([]string{"iptables"}, args...))
-	if err == nil {
+	if _, err := n.cfg.runMountCmd(ctx,
+		append([]string{"iptables"}, args...)); err == nil {
 		// Rule already present — nothing to do.
 		return
 	}
-	out, err = n.cfg.runMountCmd(ctx,
+	out, err := n.cfg.runMountCmd(ctx,
 		[]string{"iptables", "-t", "mangle", "-A",
 			"POSTROUTING", "-o", dev, "-p", "tcp",
 			"--tcp-flags", "SYN,RST", "SYN",
@@ -250,8 +249,7 @@ func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 		return
 	}
 	n.actions.WithLabelValues(mtuCheckName, "mss_clamp").Inc()
-	n.state.AppendLog(fmt.Sprintf(
-		"ACTION: nebula-mtu-blackhole clamped TCP MSS to PMTU on %s", dev))
+	n.state.AppendLog("ACTION: nebula-mtu-blackhole clamped TCP MSS to PMTU on " + dev)
 }
 
 // writeMTUBHMetric emits node_agent_nebula_mtu_blackhole (0/1) to

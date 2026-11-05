@@ -103,10 +103,10 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 var version = "dev"
@@ -135,15 +135,27 @@ var kubeClient = func() (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(cfg)
 }
 
+// agentParams bundles the inputs buildAgentConfig consumes — one
+// field per former positional parameter so the call sites read by
+// name. StandaloneFlag is the --standalone CLI switch; the
+// NODE_HOST_AGENT_STANDALONE env is OR-ed in by buildAgentConfig so
+// either spelling selects standalone mode.
+type agentParams struct {
+	nodeName       string
+	podName        string
+	namespace      string
+	version        string
+	metricsAddr    string
+	probeAddr      string
+	standaloneFlag bool
+}
+
 // buildAgentConfig wires the environment into an agent.Config: one
 // shared registry plus the subsystem list in startup order.
 // hostmetrics registers on the shared registry directly. The bool
 // reports whether apiprober was enabled — it feeds the startup log
-// line only. standaloneFlag is the --standalone CLI switch; the
-// NODE_HOST_AGENT_STANDALONE env is OR-ed in here so either spelling
-// selects standalone mode.
-func buildAgentConfig(nodeName, podName, namespace, version,
-	metricsAddr, probeAddr string, standaloneFlag bool) (agent.Config, bool) {
+// line only.
+func buildAgentConfig(p agentParams) (agent.Config, bool) {
 
 	// Standalone = on-host systemd mode (API LB VMs, interdc hubs,
 	// the kine DB VM): the enable-set inverts — every subsystem
@@ -152,7 +164,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 	// of the same envx knobs, never by hard ifs, so the
 	// env contract is intact (NODE_HOST_AGENT_ENABLE_HYGIENE=true
 	// still forces workerhygiene on a standalone host).
-	standalone := standaloneFlag ||
+	standalone := p.standaloneFlag ||
 		envx.Bool("NODE_HOST_AGENT_STANDALONE", false)
 	defKube := !standalone // default for kube/pod-context subsystems
 
@@ -198,7 +210,7 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 		hostPath("/var/lib/node-watchdog"))
 	watchdogLogFile := envx.String("NODE_HOST_AGENT_WATCHDOG_LOG",
 		hostPath("/var/log/node-watchdog.log"))
-	hnode := envx.String("NODE_HOST_AGENT_NODE_NAME", nodeName)
+	hnode := envx.String("NODE_HOST_AGENT_NODE_NAME", p.nodeName)
 
 	// Shared journald inputs for the journal-unreadable blindness
 	// detector (workerhygiene + controllerhygiene): the storage dirs
@@ -261,27 +273,27 @@ func buildAgentConfig(nodeName, podName, namespace, version,
 		journalUnreadableNeeded: journalUnreadableNeeded,
 		varsDir:                 varsDir,
 		textfileDir:             textfileDir,
-		podName:                 podName,
+		podName:                 p.podName,
 	}
 
 	// One Descriptor per subsystem, in the same order the sequential
-	// blocks ran — w.subsystems startup order is unchanged. wire
-	// returns the resolved enable mode; apiprober's feeds the startup
-	// log line (a setup failure does not clear it).
+	// blocks ran — w.subsystems startup order is unchanged.
+	// resolveAndBuild returns the resolved enable mode; apiprober's
+	// feeds the startup log line (a setup failure does not clear it).
 	apiproberEnabled := false
 	for _, d := range w.descriptors() {
-		if w.wire(d) && d.Name == "apiprober" {
+		if w.resolveAndBuild(d) && d.Name == "apiprober" {
 			apiproberEnabled = true
 		}
 	}
 
 	return agent.Config{
-		NodeName:    nodeName,
-		PodName:     podName,
-		Namespace:   namespace,
-		Version:     version,
-		MetricsAddr: metricsAddr,
-		ProbeAddr:   probeAddr,
+		NodeName:    p.nodeName,
+		PodName:     p.podName,
+		Namespace:   p.namespace,
+		Version:     p.version,
+		MetricsAddr: p.metricsAddr,
+		ProbeAddr:   p.probeAddr,
 		Registry:    reg,
 		Subsystems:  w.subsystems,
 	}, apiproberEnabled
@@ -327,8 +339,15 @@ func main() {
 	podName := envx.String("POD_NAME", "")
 	namespace := envx.String("POD_NAMESPACE", "")
 
-	cfg, apiproberEnabled := buildAgentConfig(nodeName, podName,
-		namespace, version, metricsAddr, probeAddr, standaloneFlag)
+	cfg, apiproberEnabled := buildAgentConfig(agentParams{
+		nodeName:       nodeName,
+		podName:        podName,
+		namespace:      namespace,
+		version:        version,
+		metricsAddr:    metricsAddr,
+		probeAddr:      probeAddr,
+		standaloneFlag: standaloneFlag,
+	})
 	a := agent.New(cfg)
 
 	// The enabled set is an operator's first question when a check

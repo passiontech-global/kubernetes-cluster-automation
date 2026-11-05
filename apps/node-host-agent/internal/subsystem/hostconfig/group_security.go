@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 // ---------- security (fail2ban + sshd hardening) ----------
@@ -29,23 +29,23 @@ func (c *cyc) groupSecurity() {
 			c.err("fail2ban render", "error", err)
 			return
 		}
-		r.ensureDir("/etc/fail2ban/jail.d", 0o755)
+		_ = r.ensureDir("/etc/fail2ban/jail.d", 0o755)
 		// bootstrap-era jail whitelists only localhost and would
 		// shadow the mesh whitelist (.local reads after .conf).
 		legacyRm, _ := r.removeManaged("/etc/fail2ban/jail.d/sshd.local")
 		ch, _ := r.writeManaged("/etc/fail2ban/jail.d/90-cluster-sshd.conf", b, 0o644)
 		// stale filename of the first port
-		r.removeManaged("/etc/fail2ban/jail.d/cluster.conf")
+		_, _ = r.removeManaged("/etc/fail2ban/jail.d/cluster.conf")
 		r.ensureService(ctx, "fail2ban.service", true, true)
 		if ch || legacyRm {
 			r.restartService(ctx, "fail2ban.service")
 		}
-		r.run(ctx, "fail2ban-client", "status", "sshd") // informational
+		_, _ = r.run(ctx, "fail2ban-client", "status", "sshd") // informational
 	} else if _, u := c.t.Vars.Get("fail2ban_enabled").(topology.Undefined); !u {
 		// ansible: only when fail2ban_enabled is defined and false —
 		// remove the jail AND purge the package.
-		r.removeManaged("/etc/fail2ban/jail.d/90-cluster-sshd.conf")
-		r.removeManaged("/etc/fail2ban/jail.d/cluster.conf")
+		_, _ = r.removeManaged("/etc/fail2ban/jail.d/90-cluster-sshd.conf")
+		_, _ = r.removeManaged("/etc/fail2ban/jail.d/cluster.conf")
 		// runLong: same slow-egress budget as the install above.
 		if _, err := r.runLong(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
 			"apt-get", "purge", "-y", "fail2ban"); err != nil {
@@ -57,7 +57,7 @@ func (c *cyc) groupSecurity() {
 		// 60- file was renamed to 00- (first-match-wins vs
 		// 50-cloud-init.conf) — always purge the old name.
 		rm60, _ := r.removeManaged("/etc/ssh/sshd_config.d/60-passiontech-hardening.conf")
-		r.ensureDir("/etc/ssh/sshd_config.d", 0o755)
+		_ = r.ensureDir("/etc/ssh/sshd_config.d", 0o755)
 		ch, _ := r.writeManaged("/etc/ssh/sshd_config.d/00-passiontech-hardening.conf",
 			[]byte(`# Managed by Ansible - node-config-agent (port tu bootstrap/ansible/ssh_hardening.yaml)
 PasswordAuthentication no

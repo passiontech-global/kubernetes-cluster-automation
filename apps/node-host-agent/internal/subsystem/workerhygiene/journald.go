@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 )
 
 // noteJournalRead feeds one classified journal read into the

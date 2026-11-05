@@ -7,8 +7,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
 // --- Check: MTU drift, cilium datapath vs overlay (B4) ---
@@ -66,8 +66,8 @@ func (c *ciliumMTUCheck) Run(_ context.Context, e *cycleEnv) {
 			c.h.state.Enter(hoststate.LatchCiliumMTUDrift, driftWhy)
 			// NPD contract: nodereporter maps this line to the
 			// CiliumMTUExceedsOverlay Event + problem_counter.
-			c.h.state.AppendLog(fmt.Sprintf(
-				"ACTION cilium-mtu-drift: %s", driftWhy))
+			c.h.state.AppendLog(
+				"ACTION cilium-mtu-drift: " + driftWhy)
 		}
 	} else {
 		c.h.state.Exit(hoststate.LatchCiliumMTUDrift, nil)

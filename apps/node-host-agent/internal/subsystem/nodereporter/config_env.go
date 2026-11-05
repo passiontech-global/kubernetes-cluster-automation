@@ -3,7 +3,7 @@ package nodereporter
 import (
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
@@ -26,12 +26,16 @@ type EnvDeps struct {
 // port knobs keep their applyDefaults values (they were never
 // env-driven).
 func ConfigFromEnv(d EnvDeps) Config {
-	return Config{
+	cfg := Config{
 		NodeName:         d.NodeName,
 		Client:           d.Client,
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogLogFile:  d.WatchdogLogFile,
-		Interval:         envx.Duration("NODE_HOST_AGENT_REPORTER_INTERVAL", defaultInterval),
-		EventNamespace:   envx.String("NODE_HOST_AGENT_EVENT_NAMESPACE", defaultEventNamespace),
 	}
+	// The env surface, one row per knob in declaration order.
+	envx.Apply([]envx.Knob{
+		envx.DurationKnob("NODE_HOST_AGENT_REPORTER_INTERVAL", &cfg.Interval, defaultInterval),
+		envx.StringKnob("NODE_HOST_AGENT_EVENT_NAMESPACE", &cfg.EventNamespace, defaultEventNamespace),
+	})
+	return cfg
 }

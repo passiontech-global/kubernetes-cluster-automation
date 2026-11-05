@@ -3,7 +3,7 @@ package hubsync
 import (
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
@@ -27,12 +27,16 @@ type EnvDeps struct {
 // the caller — read the returned cfg.SSHKeyPath for the resolved
 // converge-key path (Enabled(cfg.SSHKeyPath) is the same check).
 func ConfigFromEnv(d EnvDeps) Config {
-	return Config{
-		Client:         d.Client,
-		Identity:       d.Identity,
-		VarsDir:        d.VarsDir,
-		NebulaCertsDir: envx.String("NODE_HOST_AGENT_NEBULA_CERTS_DIR", defaultNebulaCertsDir),
-		SSHKeyPath:     envx.String("NODE_HOST_AGENT_CONVERGE_SSH_KEY", defaultSSHKeyPath),
-		LocalBinary:    d.LocalBinary,
+	cfg := Config{
+		Client:      d.Client,
+		Identity:    d.Identity,
+		VarsDir:     d.VarsDir,
+		LocalBinary: d.LocalBinary,
 	}
+	// The env surface, one row per knob in declaration order.
+	envx.Apply([]envx.Knob{
+		envx.StringKnob("NODE_HOST_AGENT_NEBULA_CERTS_DIR", &cfg.NebulaCertsDir, defaultNebulaCertsDir),
+		envx.StringKnob("NODE_HOST_AGENT_CONVERGE_SSH_KEY", &cfg.SSHKeyPath, defaultSSHKeyPath),
+	})
+	return cfg
 }

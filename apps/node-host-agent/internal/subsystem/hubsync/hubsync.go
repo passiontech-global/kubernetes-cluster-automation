@@ -46,6 +46,7 @@ package hubsync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -55,7 +56,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostconfig"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 )
 
 const (
@@ -261,10 +262,10 @@ type Syncer struct {
 func New(cfg Config, reg prometheus.Registerer) (*Syncer, error) {
 	cfg.applyDefaults()
 	if cfg.Client == nil {
-		return nil, fmt.Errorf("hubsync: Client is required")
+		return nil, errors.New("hubsync: Client is required")
 	}
 	if cfg.Identity == "" {
-		return nil, fmt.Errorf("hubsync: Identity is required")
+		return nil, errors.New("hubsync: Identity is required")
 	}
 
 	s := &Syncer{cfg: cfg, cycleCh: make(chan struct{}, 1)}

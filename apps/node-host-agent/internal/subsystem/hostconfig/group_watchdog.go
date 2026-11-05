@@ -5,9 +5,10 @@ package hostconfig
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
 // ---------- T6 watchdog (+ T15 systemd watchdog) ----------
@@ -104,7 +105,7 @@ func (c *cyc) groupWatchdog() {
 		fmt.Fprintf(&b, "K0S_OOMLOOP_MIN_KILLS=\"%s\"\n", defStr(c.v("k0s_oomloop_min_kills"), "3"))
 		fmt.Fprintf(&b, "K0S_OOMLOOP_WINDOW_S=\"%s\"\n", defStr(c.v("k0s_oomloop_window_s"), "3600"))
 	}
-	r.writeManaged("/etc/node-watchdog.conf", []byte(b.String()), 0o644)
+	_, _ = r.writeManaged("/etc/node-watchdog.conf", []byte(b.String()), 0o644)
 
 	// log file + textfile dir + state dir + installed marker — still
 	// converged: nethealth latches state-*/egress-state-* files in the
@@ -118,11 +119,11 @@ func (c *cyc) groupWatchdog() {
 		logger().Warn("watchdog: cannot create log file — state consumers may miss it",
 			"path", "/var/log/node-watchdog.log", "error", err)
 	}
-	r.ensureDir("/var/lib/node-exporter/textfile", 0o755)
-	r.ensureDir("/var/lib/node-watchdog", 0o755)
+	_ = r.ensureDir("/var/lib/node-exporter/textfile", 0o755)
+	_ = r.ensureDir("/var/lib/node-watchdog", 0o755)
 	if !r.fileExists("/var/lib/node-watchdog/installed") {
-		r.writeManaged("/var/lib/node-watchdog/installed",
-			[]byte(fmt.Sprint(c.r.cfg.NowFn().Unix())), 0o644)
+		_, _ = r.writeManaged("/var/lib/node-watchdog/installed",
+			[]byte(strconv.FormatInt(c.r.cfg.NowFn().Unix(), 10)), 0o644)
 	}
 	c.controllerTuning()
 }
@@ -275,7 +276,7 @@ var legacyWatchdogScripts = []string{
 func (c *cyc) pruneLegacyWatchdog() {
 	r, ctx := c.r, c.ctx
 	for _, u := range legacyWatchdogUnits {
-		r.run(ctx, "systemctl", "disable", "--now", u)
+		_, _ = r.run(ctx, "systemctl", "disable", "--now", u)
 	}
 	removed := false
 	for _, u := range legacyWatchdogUnits {
@@ -289,7 +290,7 @@ func (c *cyc) pruneLegacyWatchdog() {
 		}
 	}
 	for _, s := range legacyWatchdogScripts {
-		r.removeManaged(s)
+		_, _ = r.removeManaged(s)
 	}
 	// module lib dir (lib.sh + modules/*.sh) — removeManaged refuses
 	// dirs on purpose, this one is pruned wholesale.
@@ -305,7 +306,7 @@ func (c *cyc) pruneLegacyWatchdog() {
 	// stale prom of the shell emitter — standalone hosts keep theirs
 	// (hostmetrics still reads state latches from the same dir).
 	if !r.cfg.Standalone {
-		r.removeManaged("/var/lib/node-exporter/textfile/node-watchdog.prom")
+		_, _ = r.removeManaged("/var/lib/node-exporter/textfile/node-watchdog.prom")
 	}
 }
 
@@ -340,7 +341,7 @@ Environment=GOGC=50
 	})
 	// sshd CPUWeight=10000 (controller responsiveness under churn).
 	for _, d := range []string{"ssh.service.d", "ssh@.service.d", "sshd.service.d"} {
-		r.ensureDir("/etc/systemd/system/"+d, 0o755)
+		_ = r.ensureDir("/etc/systemd/system/"+d, 0o755)
 		if ch, _ := r.writeManaged("/etc/systemd/system/"+d+"/10-cpuweight.conf",
 			[]byte(`# Managed by passiontech base/node-watchdog - systemd-watchdog-controller.yaml
 # Keep sshd responsive when the control plane saturates CPU.
@@ -365,7 +366,7 @@ func (c *cyc) ctrlDropIn(varName, file string, render func(string) []byte) {
 		}
 		return
 	}
-	r.ensureDir("/etc/systemd/system/k0scontroller.service.d", 0o755)
+	_ = r.ensureDir("/etc/systemd/system/k0scontroller.service.d", 0o755)
 	if ch, _ := r.writeManaged(path, render(fmt.Sprint(val)), 0o644); ch {
 		r.daemonReload(c.ctx)
 	}

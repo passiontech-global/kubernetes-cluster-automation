@@ -1,6 +1,7 @@
 package jinja
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -42,7 +43,7 @@ func (s *scope) get(name string) any {
 			if step == 0 {
 				// lo<hi with step 0 never advances — unbounded
 				// append = hang+OOM. Python raises ValueError.
-				return nil, fmt.Errorf("range: step cannot be zero")
+				return nil, errors.New("range: step cannot be zero")
 			}
 			// Compute the length arithmetically BEFORE looping —
 			// a `for i += step` condition check can't see step
@@ -166,7 +167,7 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 	// where python raises "cannot unpack"). Fail loud: the idiom is
 	// `.items()`/`dict2items`, which yields real pairs.
 	if _, ok := v.(*OMap); ok && len(n.names) == 2 {
-		return fmt.Errorf("for: cannot unpack mapping keys — use .items() or dict2items")
+		return errors.New("for: cannot unpack mapping keys — use .items() or dict2items")
 	}
 	// Jinja scopes a for body: the loop var(s) and any {% set %}
 	// inside do NOT leak past {% endfor %}. Run the loop on a copy

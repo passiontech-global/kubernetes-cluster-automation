@@ -13,23 +13,23 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/envx"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/apiprober"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/concoursecache"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostconfig"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hubsync"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/janitor"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/kinedb"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/nethealth"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/nodereporter"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/sweeper"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hubsync"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/janitor"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/sweeper"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene"
 )
 
 // wiring carries the shared inputs buildAgentConfig computes once —
@@ -395,34 +395,36 @@ func (w *wiring) descriptors() []Descriptor {
 	}
 }
 
-// wire drives one descriptor: resolve the enable mode, apply the
-// needs-gates, Build, append. Returns the resolved mode — Build/gate
-// outcomes don't change it, so the caller can report the apiprober
-// flag on the startup log line even when construction failed.
-func (w *wiring) wire(d Descriptor) bool {
-	on := true
+// resolveAndBuild drives one descriptor: resolve the enable mode,
+// apply the needs-gates, Build, append. The named result is the
+// RESOLVED enable mode — needs-gate skips and Build failures still
+// report it (it is not "subsystem constructed"), so the caller can
+// report the apiprober flag on the startup log line even when
+// construction failed.
+func (w *wiring) resolveAndBuild(d Descriptor) (enabled bool) {
+	enabled = true
 	if d.EnvFlag != "" {
 		switch mode := envx.ModeEnv(d.EnvFlag, d.Default); mode {
 		case envx.ModeOff:
-			on = false
+			enabled = false
 		case envx.ModeAuto:
-			on = d.Auto != nil && d.Auto(w)
+			enabled = d.Auto != nil && d.Auto(w)
 		}
 	}
-	if !on {
-		return false
+	if !enabled {
+		return enabled
 	}
 	if d.Needs.PodModeOnly && w.standalone {
-		return true
+		return enabled
 	}
 	if d.Needs.NodeName && w.hnode == "" {
 		logger().Error(d.Name + " disabled: node name empty " +
 			"(NODE_HOST_AGENT_NODE_NAME/NODE_NAME unset)")
-		return true
+		return enabled
 	}
 	if d.Needs.PodName && w.podName == "" {
 		logger().Error(d.Name + " disabled: pod name empty (POD_NAME unset)")
-		return true
+		return enabled
 	}
 	var cs kubernetes.Interface
 	if d.Needs.Kube {
@@ -430,20 +432,20 @@ func (w *wiring) wire(d Descriptor) bool {
 		if cs, err = w.csOnce(); err != nil {
 			logger().Error(d.Name+" disabled: cannot build kubernetes client",
 				"error", err)
-			return true
+			return enabled
 		}
 	}
 	sub, err := d.Build(w, cs)
 	if err != nil {
 		logger().Error(d.Name+" setup failed", "error", err)
-		return true
+		return enabled
 	}
 	if sub == nil {
-		return true // Build already logged its own failure
+		return enabled // Build already logged its own failure
 	}
 	w.subsystems = append(w.subsystems, sub)
 	if d.Extra != nil {
 		d.Extra(w, sub)
 	}
-	return true
+	return enabled
 }

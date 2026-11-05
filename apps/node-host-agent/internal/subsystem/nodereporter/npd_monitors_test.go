@@ -3,8 +3,10 @@ package nodereporter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -125,8 +127,8 @@ func TestJournalCursorAdvancement(t *testing.T) {
 	}
 	since1 := calls[0][len(calls[0])-4]
 	since2 := calls[1][len(calls[1])-4]
-	want1 := "@" + fmt.Sprint(e.now.Add(-e.r.cfg.LogLookback).Unix())
-	want2 := "@" + fmt.Sprint(e.now.Unix())
+	want1 := "@" + strconv.FormatInt(e.now.Add(-e.r.cfg.LogLookback).Unix(), 10)
+	want2 := "@" + strconv.FormatInt(e.now.Unix(), 10)
 	if since1 != want1 || since2 != want2 {
 		t.Fatalf("--since args = %q then %q, want %q then %q", since1, since2, want1, want2)
 	}
@@ -139,7 +141,7 @@ func TestJournalFetchErrorKeepsCursor(t *testing.T) {
 	fail := true
 	e.r.cfg.journalFetch = func(_ context.Context, args ...string) (string, error) {
 		if fail {
-			return "", fmt.Errorf("journald busy")
+			return "", errors.New("journald busy")
 		}
 		return journalJSON(e.now.UnixMicro(), `err="node \"n1\" not found"`), nil
 	}

@@ -3,7 +3,7 @@ package kinedb
 import (
 	"log/slog"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/logx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/logx"
 )
 
 // logger returns the package logger; see logx.For for why resolution is per call.
