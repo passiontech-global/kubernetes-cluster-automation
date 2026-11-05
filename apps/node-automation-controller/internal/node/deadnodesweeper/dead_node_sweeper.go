@@ -58,7 +58,6 @@ import (
 )
 
 const (
-	deadNodeSweeperQueue = "dead-node-sweeper"
 	// deadNodeStuckPodAge: how long a pod may sit in Terminating
 	// before its node is suspected. Longer than any legitimate
 	// graceful shutdown (default grace 30s, worst-case preStop +
@@ -91,6 +90,10 @@ var (
 type deadNodeSweeper struct {
 	cs  kubernetes.Interface
 	dyn dynamic.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
 	// Probe seam — same trick as kubeletReaper: the node/proxy REST
 	// path cannot be served by the fake clientset, so tests stub the
 	// healthz outcome per node.
@@ -99,9 +102,9 @@ type deadNodeSweeper struct {
 
 // Setup registers the 5-minute sweep.
 func Setup(d shared.Deps) error {
-	s := &deadNodeSweeper{cs: d.CS, dyn: d.Dyn}
+	s := &deadNodeSweeper{cs: d.CS, dyn: d.Dyn, queue: d.Name}
 	s.probeFn = s.probe
-	return shared.AddPeriodic(d.Mgr, deadNodeSweeperQueue, 5*time.Minute, s.run)
+	return shared.AddPeriodic(d.Mgr, s.queue, 5*time.Minute, s.run)
 }
 
 func (s *deadNodeSweeper) run(ctx context.Context) error {
@@ -126,7 +129,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 		if shared.HasTaint(n.Spec.Taints, outOfServiceTaintKey) && shared.NodeReady(n) {
 			if err := shared.UntaintNode(ctx, s.cs, n.Name, outOfServiceTaintKey); err != nil {
 				log.Error(err, "untaint failed", "node", n.Name)
-				metrics.IncError(deadNodeSweeperQueue)
+				metrics.IncError(s.queue)
 				continue
 			}
 			untainted++
@@ -230,7 +233,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 		if err != nil {
 			log.Error(err, "death check failed — node skipped (fail closed)",
 				"node", nodeName, "stuckPods", count)
-			metrics.IncError(deadNodeSweeperQueue)
+			metrics.IncError(s.queue)
 			continue
 		}
 		if !dead {
@@ -247,7 +250,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 			outOfServiceTaintValue, corev1.TaintEffectNoExecute); err != nil {
 			log.Error(err, "out-of-service taint failed", "node", nodeName,
 				"stuckPods", count)
-			metrics.IncError(deadNodeSweeperQueue)
+			metrics.IncError(s.queue)
 			continue
 		}
 		tainted++
@@ -315,16 +318,16 @@ func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string)
 	for _, gvr := range []schema.GroupVersionResource{
 		selfNodeRemediationGVR, fenceAgentsRemediationGVR,
 	} {
-		list, err := s.dyn.Resource(gvr).Namespace(metav1.NamespaceAll).
-			List(ctx, metav1.ListOptions{})
+		items, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
+			shared.DynamicPage(s.dyn.Resource(gvr).Namespace(metav1.NamespaceAll)))
 		if err != nil {
 			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 				continue // CRD not installed on this cluster
 			}
 			return false, fmt.Errorf("list %s: %w", gvr.Resource, err)
 		}
-		for i := range list.Items {
-			if list.Items[i].GetName() == nodeName {
+		for i := range items {
+			if items[i].GetName() == nodeName {
 				return true, nil
 			}
 		}
@@ -368,7 +371,7 @@ func (s *deadNodeSweeper) logVolumeAttachments(ctx context.Context, nodeName str
 		})
 	if err != nil {
 		log.Error(err, "volumeattachment list failed — signal only", "node", nodeName)
-		metrics.IncError(deadNodeSweeperQueue)
+		metrics.IncError(s.queue)
 		return
 	}
 	if len(names) > 0 {

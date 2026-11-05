@@ -20,7 +20,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	// CONCOURSE_JANITOR_ENABLED gate is resolved by setupModules, not
 	// re-read here.
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{
+	if err := Setup(shared.Deps{Name: "concourse-workdir-janitor",
 		Mgr: m,
 		CS:  fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(),

@@ -71,7 +71,7 @@ func (o *orphanSweep) sweepOrphans(ctx context.Context, snap *sweepSnapshot) err
 			return nil
 		})
 	if err != nil {
-		metrics.IncError(webhookGuardQueue)
+		metrics.IncError(g.queue)
 		log.Info("WARN: cannot list services — skipping service check (namespace check still runs)", "error", err)
 		haveSvc = false
 	}
@@ -104,7 +104,7 @@ func (o *orphanSweep) sweepOrphans(ctx context.Context, snap *sweepSnapshot) err
 		if err != nil {
 			// Absorbed sub-failure: the sweep logs and continues —
 			// metered so the dropped work is still counted.
-			metrics.IncError(webhookGuardQueue)
+			metrics.IncError(g.queue)
 			log.Error(err, "marshal webhook patch",
 				"config", cfgName, "mutating", mutating)
 			return
@@ -172,13 +172,15 @@ func orphanEntry(log logr.Logger, kind, cfg string, idx int, svcRef *admissionv1
 		return false // malformed/no-service entry — not an orphan
 	}
 	if !namespaces[svcRef.Namespace] {
-		log.Info(fmt.Sprintf("ORPHAN: %s/%s webhook[%d] -> %s/%s (namespace gone) — removing entry",
-			kind, cfg, idx, svcRef.Namespace, svcRef.Name))
+		log.Info("ORPHAN: namespace gone — removing entry",
+			"kind", kind, "config", cfg, "webhookIndex", idx,
+			"service", svcRef.Namespace+"/"+svcRef.Name)
 		return true
 	}
 	if haveSvc && !services[svcRef.Namespace+"/"+svcRef.Name] {
-		log.Info(fmt.Sprintf("WARN: %s/%s webhook[%d] -> %s/%s (Service missing) — warn only, not patched",
-			kind, cfg, idx, svcRef.Namespace, svcRef.Name))
+		log.Info("WARN: Service missing — warn only, not patched",
+			"kind", kind, "config", cfg, "webhookIndex", idx,
+			"service", svcRef.Namespace+"/"+svcRef.Name)
 	}
 	return false
 }

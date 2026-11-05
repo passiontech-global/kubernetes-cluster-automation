@@ -64,10 +64,11 @@ func vacPod(ns, name, node string, phase corev1.PodPhase) *corev1.Pod {
 	}
 }
 
-func newVACleaner(cs *fake.Clientset, nowFn func() time.Time) *volumeAttachmentCleaner {
+func newVACleaner(cs *fake.Clientset, now shared.Clock) *volumeAttachmentCleaner {
 	return &volumeAttachmentCleaner{
 		cs:    cs,
-		nowFn: nowFn,
+		queue: "volumeattachment-cleaner",
+		now:   now,
 	}
 }
 
@@ -399,7 +400,7 @@ func TestVACleanerEmptyNodeListAborts(t *testing.T) {
 		vacAttachment("va-orphan", "gone-node", now.Add(-time.Hour)))
 	c := newVACleaner(cs, func() time.Time { return now })
 
-	before := testutil.QueueErrorCount(t, volumeAttachmentCleanerQueue)
+	before := testutil.QueueErrorCount(t, "volumeattachment-cleaner")
 	if err := c.run(ctx); err != nil {
 		t.Fatalf("empty node list must abort cleanly, got %v", err)
 	}
@@ -409,7 +410,7 @@ func TestVACleanerEmptyNodeListAborts(t *testing.T) {
 	if vaTrackedCount(&c.orphanFirstSeen) != 0 {
 		t.Fatal("orphan sightings recorded on an aborted run")
 	}
-	if got := testutil.QueueErrorCount(t, volumeAttachmentCleanerQueue) - before; got != 1 {
+	if got := testutil.QueueErrorCount(t, "volumeattachment-cleaner") - before; got != 1 {
 		t.Fatalf("empty node list not metered: error delta = %v, want 1", got)
 	}
 }
@@ -458,14 +459,14 @@ func TestVACleanerPodListErrorFailsClosed(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	before := testutil.QueueErrorCount(t, volumeAttachmentCleanerQueue)
+	before := testutil.QueueErrorCount(t, "volumeattachment-cleaner")
 	if err := c.run(ctx); err != nil {
 		t.Fatalf("pod list failure must not error the run: %v", err)
 	}
 	if !vaExists(t, cs, "va-fenced") {
 		t.Fatal("VA deleted when the pod count could not be confirmed")
 	}
-	if got := testutil.QueueErrorCount(t, volumeAttachmentCleanerQueue) - before; got != 1 {
+	if got := testutil.QueueErrorCount(t, "volumeattachment-cleaner") - before; got != 1 {
 		t.Fatalf("queue error delta = %v, want 1", got)
 	}
 }

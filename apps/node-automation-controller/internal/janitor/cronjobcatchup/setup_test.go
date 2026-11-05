@@ -17,7 +17,7 @@ import (
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{
+	if err := Setup(shared.Deps{Name: "cronjob-catchup",
 		Mgr: m,
 		CS:  fake.NewSimpleClientset(),
 	}); err != nil {

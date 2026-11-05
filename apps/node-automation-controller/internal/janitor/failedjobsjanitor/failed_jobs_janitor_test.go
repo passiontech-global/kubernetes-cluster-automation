@@ -65,7 +65,7 @@ func TestFailedJobsJanitorKeepsZeroTimestamp(t *testing.T) {
 		// LastTransitionTime deliberately zero
 	})
 	cs := fake.NewSimpleClientset(noTS)
-	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	j := &failedJobsJanitor{cs: cs, now: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestFailedJobsJanitorCapFifty(t *testing.T) {
 			failedJob("ns-a", fmt.Sprintf("old-failed-%02d", i), 25*time.Hour))
 	}
 	cs := fake.NewSimpleClientset(objs...)
-	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	j := &failedJobsJanitor{cs: cs, now: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestFailedJobsJanitorMultipleNamespaces(t *testing.T) {
 		failedJob("ns-b", "old-failed-b", 72*time.Hour),
 		failedJob("ns-b", "recent-failed-b", time.Hour), // fresh — must survive
 	)
-	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	j := &failedJobsJanitor{cs: cs, now: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestFailedJobsJanitorKeepsFailedFalseAndNoCondition(t *testing.T) {
 		LastTransitionTime: metav1.NewTime(time.Now().Add(-72 * time.Hour)),
 	})
 	cs := fake.NewSimpleClientset(failedFalse, running, suspended)
-	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	j := &failedJobsJanitor{cs: cs, now: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestFailedJobsJanitorListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	j := &failedJobsJanitor{cs: cs, now: time.Now}
 	if err := j.run(ctx); err == nil {
 		t.Fatal("expected error when the jobs list fails")
 	}
@@ -171,7 +171,7 @@ func TestFailedJobsJanitorSkipsTerminating(t *testing.T) {
 			atomic.AddInt32(&attempts, 1)
 			return false, nil, nil
 		})
-	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	j := &failedJobsJanitor{cs: cs, now: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestFailedJobsJanitorDeleteUIDPrecondition(t *testing.T) {
 			}
 			return false, nil, nil // fall through to the tracker
 		})
-	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	j := &failedJobsJanitor{cs: cs, now: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestFailedJobsJanitorDeleteErrorTolerated(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("delete rejected")
 		})
-	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	j := &failedJobsJanitor{cs: cs, now: time.Now}
 	if err := j.run(ctx); err != nil {
 		t.Fatalf("job delete failures must not error the run: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestStuckTerminatingAuditMarksStuck(t *testing.T) {
 		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "data", Name: "live-pvc"}},
 	)
-	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }}
 	if err := j.auditStuckTerminating(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +303,7 @@ func TestStuckTerminatingAuditMarksStuckVA(t *testing.T) {
 		&storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{
 			Name: "va-live"}},
 	)
-	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }}
 	if err := j.auditStuckTerminating(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,7 @@ func TestStuckTerminatingAuditPrunesFinished(t *testing.T) {
 		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "data", Name: "stuck-pvc", DeletionTimestamp: &old}},
 	)
-	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }}
 	if err := j.auditStuckTerminating(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func TestStuckTerminatingAuditRunsInsideSweep(t *testing.T) {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 			Name: "stuck-ns", DeletionTimestamp: &old}},
 	)
-	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +381,7 @@ func TestStuckTerminatingAuditListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	j := &failedJobsJanitor{cs: cs, nowFn: time.Now}
+	j := &failedJobsJanitor{cs: cs, now: time.Now}
 	if err := j.auditStuckTerminating(ctx); err == nil {
 		t.Fatal("expected error when the namespaces list fails")
 	}
@@ -401,7 +401,7 @@ func TestAuditStuckPVCFinalizerStrip(t *testing.T) {
 		},
 	}
 	cs := fake.NewSimpleClientset(pvc)
-	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }}
 	if err := j.auditStuckTerminating(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +435,7 @@ func TestAuditStuckPVCReferencedKept(t *testing.T) {
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 	cs := fake.NewSimpleClientset(pvc, pod)
-	j := &failedJobsJanitor{cs: cs, nowFn: func() time.Time { return now }}
+	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }}
 	if err := j.auditStuckTerminating(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +503,7 @@ func TestFailedJobsJanitorBuildRunTTL(t *testing.T) {
 		fjjBuildRun("other", "old-ok", "True", 48*time.Hour),   // delete — all namespaces
 	)
 	j := &failedJobsJanitor{
-		cs: fake.NewSimpleClientset(), dyn: dyn, nowFn: time.Now,
+		cs: fake.NewSimpleClientset(), dyn: dyn, now: time.Now,
 		stuckEmitted: shared.GaugeLedger[stuckTerminatingKey]{},
 	}
 	if err := j.sweepBuildRuns(ctx); err != nil {
@@ -527,7 +527,7 @@ func TestFailedJobsJanitorBuildRunTTL(t *testing.T) {
 // No Shipwright CRD → the sweep is a quiet no-op, not an error.
 func TestFailedJobsJanitorBuildRunCRDAbsent(t *testing.T) {
 	j := &failedJobsJanitor{
-		cs: fake.NewSimpleClientset(), nowFn: time.Now,
+		cs: fake.NewSimpleClientset(), now: time.Now,
 		stuckEmitted: shared.GaugeLedger[stuckTerminatingKey]{},
 	}
 	// dyn nil — the sweep must no-op without a dynamic client.

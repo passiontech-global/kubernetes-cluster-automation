@@ -387,15 +387,16 @@ func TestKubeletReaperRun(t *testing.T) {
 			})
 		r := &kubeletReaper{
 			cs:      cs,
+			queue:   "kubelet-liveness-reaper",
 			probeFn: func(_ context.Context, name string) bool { return name == "w2" },
 		}
-		before := testutil.QueueErrorCount(t, kubeletReaperQueue)
+		before := testutil.QueueErrorCount(t, "kubelet-liveness-reaper")
 		if err := r.run(ctx); err != nil {
 			t.Fatalf("per-node sweep failure must not fail the run: %v", err)
 		}
 		// The failure was absorbed (nil return) but must still be
 		// metered — an uncounted skip is invisible to alerting.
-		if got := testutil.QueueErrorCount(t, kubeletReaperQueue) - before; got != 1 {
+		if got := testutil.QueueErrorCount(t, "kubelet-liveness-reaper") - before; got != 1 {
 			t.Fatalf("absorbed sweep failure not IncError'd, delta %v", got)
 		}
 	})

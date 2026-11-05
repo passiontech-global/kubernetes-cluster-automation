@@ -44,7 +44,6 @@ import (
 )
 
 const (
-	catchupQueue = "cronjob-catchup"
 	// catchupAnno is the opt-in annotation — a backlog replay is only
 	// safe for jobs whose side effects are idempotent.
 	catchupAnno = "node-ops.passiontech.dev/catchup"
@@ -78,13 +77,22 @@ const (
 	// CronJob — operator-visible provenance on an object GitOps did
 	// not write the deadline into.
 	deadlinePatchedAnno = "node.ops/starting-deadline-patched"
+
+	// catchupListPageSize bounds each List page — the CronJob census
+	// is cluster-wide and the per-namespace Job dedupe list is
+	// unbounded on busy CI namespaces.
+	catchupListPageSize = 500
 )
 
 type cronJobCatchup struct {
 	cs kubernetes.Interface
-	// nowFn is the clock seam — tests pin it so schedule-relative
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
+	// now is the clock seam — tests pin it so schedule-relative
 	// staleness is deterministic. nil → time.Now.
-	nowFn func() time.Time
+	now shared.Clock
 	// lastCatchup enforces the 1-per-cronjob-per-day cap in memory —
 	// keyed "ns/name" -> "2006-01-02" (UTC), pruned each sweep for
 	// CronJobs that vanished. An apiserver-restart-clean map only
@@ -102,27 +110,25 @@ type cronJobCatchup struct {
 
 // Setup registers the 15-minute sweep.
 func Setup(d shared.Deps) error {
-	c := &cronJobCatchup{cs: d.CS, nowFn: time.Now, lastCatchup: map[string]string{}}
-	return shared.AddPeriodic(d.Mgr, catchupQueue, 15*time.Minute, c.run)
+	c := &cronJobCatchup{cs: d.CS, queue: d.Name, now: shared.SystemClock,
+		lastCatchup: map[string]string{}}
+	return shared.AddPeriodic(d.Mgr, c.queue, 15*time.Minute, c.run)
 }
 
 func (c *cronJobCatchup) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	// Lazily arm the zero-value struct — unit tests construct the
-	// module literally without the Setup path.
-	if c.nowFn == nil {
-		c.nowFn = time.Now
-	}
-	now := c.nowFn()
+	now := c.now.Now()
 
-	cronjobs, err := c.cs.BatchV1().CronJobs(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	cronjobs, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: catchupListPageSize},
+		shared.CronJobs(c.cs, metav1.NamespaceAll))
 	if err != nil {
-		return fmt.Errorf("list cronjobs: %w", err) // periodic wrapper IncErrors catchupQueue
+		return fmt.Errorf("list cronjobs: %w", err) // periodic wrapper IncErrors c.queue
 	}
 
 	spawned := 0
-	for i := range cronjobs.Items {
-		cj := &cronjobs.Items[i]
+	for i := range cronjobs {
+		cj := &cronjobs[i]
 		if cj.Spec.Suspend != nil && *cj.Spec.Suspend {
 			continue // deliberately paused — honor the operator's intent
 		}
@@ -173,8 +179,8 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 	// Drop daily-cap entries for CronJobs that no longer exist — the
 	// map is otherwise append-only per opted-in job ever caught up.
 	present := map[string]struct{}{}
-	for i := range cronjobs.Items {
-		cj := &cronjobs.Items[i]
+	for i := range cronjobs {
+		cj := &cronjobs[i]
 		present[cj.Namespace+"/"+cj.Name] = struct{}{}
 	}
 	c.mu.Lock()
@@ -241,7 +247,7 @@ func (c *cronJobCatchup) stale(log logr.Logger, cj *batchv1.CronJob) (bool, bool
 		anchor = cj.Status.LastScheduleTime.Time
 	}
 	missed := sched.Next(anchor)
-	now := c.nowFn()
+	now := c.now.Now()
 	if !missed.Before(now) {
 		return false, true
 	}
@@ -295,14 +301,14 @@ func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, 
 		},
 	})
 	if err != nil {
-		metrics.IncError(catchupQueue)
+		metrics.IncError(c.queue)
 		log.Error(err, "marshal deadline patch",
 			"cronjob", cj.Namespace+"/"+cj.Name)
 		return
 	}
 	if _, err := c.cs.BatchV1().CronJobs(cj.Namespace).Patch(ctx, cj.Name,
 		types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
-		metrics.IncError(catchupQueue)
+		metrics.IncError(c.queue)
 		log.Error(err, "startingDeadlineSeconds patch failed",
 			"cronjob", cj.Namespace+"/"+cj.Name)
 		return
@@ -317,17 +323,19 @@ func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, 
 // Active Job still owned by the CronJob (a scheduled run in flight —
 // replaying on top of it double-fires the workload).
 func (c *cronJobCatchup) deduped(ctx context.Context, log logr.Logger, cj *batchv1.CronJob) bool {
-	jobs, err := c.cs.BatchV1().Jobs(cj.Namespace).List(ctx, metav1.ListOptions{})
+	jobs, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: catchupListPageSize},
+		shared.Jobs(c.cs, cj.Namespace))
 	if err != nil {
 		// List failure = empty dedupe list, still create — a missed
 		// catch-up is worse than one extra idempotent Job.
-		metrics.IncError(catchupQueue)
+		metrics.IncError(c.queue)
 		log.Info("WARN: list jobs failed — skipping dedupe",
 			"cronjob", cj.Namespace+"/"+cj.Name, "error", err)
 		return false
 	}
-	for i := range jobs.Items {
-		j := &jobs.Items[i]
+	for i := range jobs {
+		j := &jobs[i]
 		if j.Labels[catchupLabel] == cj.Name &&
 			time.Since(j.CreationTimestamp.Time) < catchupDedupeAge {
 			log.Info("skip: a catch-up job already exists",
@@ -353,13 +361,9 @@ func (c *cronJobCatchup) capped(key string) bool {
 	if c.lastCatchup == nil {
 		c.lastCatchup = map[string]string{}
 	}
-	// Same lazy arm as run() — tests call capped() on a zero-value
-	// struct, and the day stamp must come from the clock seam so a
-	// pinned nowFn really pins "today".
-	if c.nowFn == nil {
-		c.nowFn = time.Now
-	}
-	return c.lastCatchup[key] == c.nowFn().UTC().Format("2006-01-02")
+	// The day stamp comes from the clock seam so a pinned now really
+	// pins "today" — tests call capped() on a literally-built struct.
+	return c.lastCatchup[key] == c.now.Now().UTC().Format("2006-01-02")
 }
 
 // spawn clones the CronJob's JobTemplate into a <cj>-catchup-<unix>
@@ -371,12 +375,9 @@ func (c *cronJobCatchup) capped(key string) bool {
 // cap — the next tick retries. Reports whether the Job was created.
 func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1.CronJob, key string) bool {
 	// One read of the clock seam feeds both the Job-name suffix and
-	// the daily-cap stamp — a pinned nowFn (tests) must pin both,
+	// the daily-cap stamp — a pinned now (tests) must pin both,
 	// and on a real clock the two can never straddle midnight.
-	if c.nowFn == nil {
-		c.nowFn = time.Now
-	}
-	now := c.nowFn()
+	now := c.now.Now()
 	labels := maps.Clone(cj.Spec.JobTemplate.Labels)
 	if labels == nil {
 		labels = map[string]string{}
@@ -407,7 +408,7 @@ func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1
 		Spec: *cj.Spec.JobTemplate.Spec.DeepCopy(),
 	}
 	if _, err := c.cs.BatchV1().Jobs(cj.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
-		metrics.IncError(catchupQueue)
+		metrics.IncError(c.queue)
 		log.Error(err, "create catch-up job failed",
 			"cronjob", cj.Namespace+"/"+cj.Name, "job", job.Name)
 		return false

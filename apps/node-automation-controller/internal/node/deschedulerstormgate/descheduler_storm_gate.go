@@ -111,6 +111,10 @@ type deschedulerStormGate struct {
 	// dyn reads the autopilot Plan CR for maintenance-mutex
 	// signal (c) — no typed client exists for it.
 	dyn dynamic.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the controller name and every IncError label
+	// come from one place.
+	queue string
 }
 
 // The watch wiring below installs these package-level units
@@ -146,7 +150,7 @@ var stormSignalChanges = predicate.Funcs{
 
 func Setup(d shared.Deps) error {
 	return ctrl.NewControllerManagedBy(d.Mgr).
-		Named("descheduler-storm-gate").
+		Named(d.Name).
 		// Watches with a single fixed workqueue key, not For(): the
 		// reconcile ignores req.Name and always sweeps the whole
 		// cluster, so per-node keys only produced N duplicate queued
@@ -156,7 +160,7 @@ func Setup(d shared.Deps) error {
 		Watches(&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
 			builder.WithPredicates(stormSignalChanges)).
-		Complete(&deschedulerStormGate{cs: d.CS, dyn: d.Dyn})
+		Complete(&deschedulerStormGate{cs: d.CS, dyn: d.Dyn, queue: d.Name})
 }
 
 func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -165,7 +169,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 
 	nodes, err := shared.ListNodes(ctx, r.cs)
 	if err != nil {
-		metrics.IncError("descheduler-storm-gate")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
 	if len(nodes) == 0 {
@@ -174,7 +178,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		// below yields a "clear" verdict and scales the descheduler
 		// back up on blind data (same fail-closed posture as the
 		// statefulset-ondelete-roller's nodesSafe check).
-		metrics.IncError("descheduler-storm-gate")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("empty node list (API flap) — refusing to compute a verdict")
 	}
 
@@ -215,7 +219,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		return res, nil
 	}
 	if err != nil {
-		metrics.IncError("descheduler-storm-gate")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/descheduler: %w", err)
 	}
 
@@ -224,7 +228,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	// descheduler exactly like a storm does.
 	maintenance, err := r.maintenanceEvidence(ctx)
 	if err != nil {
-		metrics.IncError("descheduler-storm-gate")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, err
 	}
 
@@ -271,20 +275,20 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		if _, err := r.cs.AppsV1().Deployments("kube-system").
 			Patch(ctx, "descheduler", types.MergePatchType, patch,
 				metav1.PatchOptions{}); err != nil {
-			metrics.IncError("descheduler-storm-gate")
+			metrics.IncError(r.queue)
 			return ctrl.Result{}, fmt.Errorf(
 				"scale deployment kube-system/descheduler to %d replicas: %w",
 				want, err)
 		}
 		if err := annotateStormDecision(ctx, r.cs, decision); err != nil {
-			metrics.IncError("descheduler-storm-gate")
+			metrics.IncError(r.queue)
 			return ctrl.Result{}, err
 		}
 	case deploy.Annotations[stormGateDecisionAnno] == "":
 		// Replicas already right but no decision recorded yet —
 		// annotate anyway so the verdict is auditable (bash elif).
 		if err := annotateStormDecision(ctx, r.cs, decision); err != nil {
-			metrics.IncError("descheduler-storm-gate")
+			metrics.IncError(r.queue)
 			return ctrl.Result{}, err
 		}
 	default:

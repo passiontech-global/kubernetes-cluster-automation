@@ -39,7 +39,6 @@ import (
 )
 
 const (
-	csrWatcherQueue      = "csr-watcher"
 	kubeletServingSigner = "kubernetes.io/kubelet-serving"
 	nodeUserPrefix       = "system:node:"
 	nodesGroup           = "system:nodes"
@@ -57,21 +56,22 @@ var kubeletServingUsages = map[certificatesv1.KeyUsage]struct{}{
 }
 
 type csrWatcher struct {
-	cs       kubernetes.Interface
-	approve  bool
-	warned   map[string]struct{} // detect mode: warn-logged once per CSR
-	reported map[string]struct{} // approve mode: IncError fired once per CSR
+	cs      kubernetes.Interface
+	approve bool
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue    string
+	warned   shared.SeenSet // detect mode: warn-logged once per CSR
+	reported shared.SeenSet // approve mode: IncError fired once per CSR
 }
 
 // Setup registers the 10m sweep — always runs (detect mode
 // still reports pending CSRs); `approve` only controls the action.
 func Setup(d shared.Deps) error {
 	approve := shared.Gate("CSR_APPROVER_ENABLED", false)
-	w := &csrWatcher{
-		cs: d.CS, approve: approve,
-		warned: map[string]struct{}{}, reported: map[string]struct{}{},
-	}
-	return shared.AddPeriodic(d.Mgr, csrWatcherQueue, 10*time.Minute, w.run)
+	w := &csrWatcher{cs: d.CS, approve: approve, queue: d.Name}
+	return shared.AddPeriodic(d.Mgr, w.queue, 10*time.Minute, w.run)
 }
 
 func (w *csrWatcher) run(ctx context.Context) error {
@@ -99,8 +99,7 @@ func (w *csrWatcher) run(ctx context.Context) error {
 		}
 		pending++
 		if !w.approve {
-			if _, ok := w.warned[csr.Name]; !ok {
-				w.warned[csr.Name] = struct{}{}
+			if w.warned.Add(csr.Name) {
 				log.Info("WARN: pending kubelet-serving CSR — "+
 					"auto-approve disabled, manual `kubectl certificate approve` needed",
 					"csr", csr.Name, "username", csr.Spec.Username)
@@ -131,7 +130,7 @@ func (w *csrWatcher) run(ctx context.Context) error {
 			})
 		if _, err := w.cs.CertificatesV1().CertificateSigningRequests().
 			UpdateApproval(ctx, csr.Name, csr, metav1.UpdateOptions{}); err != nil {
-			metrics.IncError(csrWatcherQueue)
+			metrics.IncError(w.queue)
 			log.Error(err, "CSR approval failed", "csr", csr.Name)
 			continue
 		}
@@ -149,16 +148,12 @@ func (w *csrWatcher) run(ctx context.Context) error {
 	for i := range csrs {
 		seen[csrs[i].Name] = struct{}{}
 	}
-	for name := range w.warned {
-		if _, ok := seen[name]; !ok {
-			delete(w.warned, name)
-		}
+	live := func(name string) bool {
+		_, ok := seen[name]
+		return ok
 	}
-	for name := range w.reported {
-		if _, ok := seen[name]; !ok {
-			delete(w.reported, name)
-		}
-	}
+	w.warned.Prune(live)
+	w.reported.Prune(live)
 	log.Info("sweep done", "pending", pending, "approved", approved)
 	return nil
 }
@@ -176,9 +171,8 @@ func (w *csrWatcher) validNodeCSR(ctx context.Context,
 	csr *certificatesv1.CertificateSigningRequest) bool {
 	log := logf.FromContext(ctx)
 	fail := func(reason string) bool {
-		if _, ok := w.reported[csr.Name]; !ok {
-			w.reported[csr.Name] = struct{}{}
-			metrics.IncError(csrWatcherQueue)
+		if w.reported.Add(csr.Name) {
+			metrics.IncError(w.queue)
 		}
 		log.Info("WARN: CSR failed validation — skipping",
 			"csr", csr.Name, "username", csr.Spec.Username, "reason", reason)

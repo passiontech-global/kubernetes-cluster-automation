@@ -51,7 +51,6 @@ import (
 )
 
 const (
-	orphanEndpointSliceQueue    = "orphan-endpointslice-cleaner"
 	orphanEndpointSliceInterval = 15 * time.Minute
 	// orphanEndpointSliceMinAge: a slice must exist this long before
 	// its missing Service counts against it — created-before-service
@@ -70,13 +69,17 @@ const (
 
 type orphanEndpointSliceCleaner struct {
 	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
 	// dyn is accepted for Setup-signature parity with the other
 	// wave modules — EndpointSlices are typed via cs.DiscoveryV1().
 	dyn dynamic.Interface
-	// nowFn is the clock seam — tests pin it so the >15m age gate
+	// now is the clock seam — tests pin it so the >15m age gate
 	// is deterministic. nil → time.Now.
-	nowFn func() time.Time
-	mu    sync.Mutex
+	now shared.Clock
+	mu  sync.Mutex
 	// absentStreak counts consecutive cycles each "ns/name/uid"
 	// slice has been seen without its Service — reaching
 	// orphanEndpointSliceStreak unlocks the re-confirm + delete.
@@ -93,9 +96,9 @@ func Setup(d shared.Deps) error {
 	if d.Disabled {
 		return nil
 	}
-	c := &orphanEndpointSliceCleaner{cs: d.CS, dyn: d.Dyn, nowFn: time.Now,
-		absentStreak: map[string]int{}}
-	return shared.AddPeriodic(d.Mgr, orphanEndpointSliceQueue, orphanEndpointSliceInterval, c.run)
+	c := &orphanEndpointSliceCleaner{cs: d.CS, dyn: d.Dyn, queue: d.Name,
+		now: shared.SystemClock, absentStreak: map[string]int{}}
+	return shared.AddPeriodic(d.Mgr, c.queue, orphanEndpointSliceInterval, c.run)
 }
 
 func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
@@ -104,9 +107,6 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	defer c.mu.Unlock()
 	// Lazily arm the zero-value struct — unit tests construct the
 	// cleaner literally without the Setup path.
-	if c.nowFn == nil {
-		c.nowFn = time.Now
-	}
 	if c.absentStreak == nil {
 		c.absentStreak = map[string]int{}
 	}
@@ -144,7 +144,7 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 		return fmt.Errorf("list endpointslices: %w", err)
 	}
 
-	now := c.nowFn()
+	now := c.now.Now()
 	absentNow := map[string]bool{}
 	deleted := 0
 	for i := range slices {
@@ -186,7 +186,7 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 			log.Info("WARN: service confirm failed — slice kept (fail closed)",
 				"endpointslice", s.Namespace+"/"+s.Name,
 				"service", svcName, "error", getErr)
-			metrics.IncError(orphanEndpointSliceQueue)
+			metrics.IncError(c.queue)
 			continue
 		default:
 			// Service actually exists — the snapshot was stale.
@@ -202,12 +202,10 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 		// recreated in between is not the object we vetted.
 		uid := s.UID
 		if err := c.cs.DiscoveryV1().EndpointSlices(s.Namespace).
-			Delete(ctx, s.Name, metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
+			Delete(ctx, s.Name, shared.UIDDeleteOptions(uid, "")); err != nil {
 			log.Error(err, "orphan endpointslice delete failed",
 				"endpointslice", s.Namespace+"/"+s.Name)
-			metrics.IncError(orphanEndpointSliceQueue)
+			metrics.IncError(c.queue)
 			continue
 		}
 		delete(c.absentStreak, key)

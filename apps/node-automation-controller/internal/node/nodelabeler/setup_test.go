@@ -24,7 +24,7 @@ import (
 func TestSetupRegistersController(t *testing.T) {
 	t.Setenv("NODE_LABELER_CONFIG_PATH", "labels.txt")
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
+	if err := Setup(shared.Deps{Name: "node-labeler", Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	if len(m.Added) != 1 {

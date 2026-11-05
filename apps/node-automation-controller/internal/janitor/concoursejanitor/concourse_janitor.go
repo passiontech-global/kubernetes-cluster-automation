@@ -120,7 +120,6 @@ import (
 )
 
 const (
-	cjQueue       = "concourse-workdir-janitor"
 	cjNamespace   = "concourse"
 	cjStatefulSet = "concourse-worker"
 	// The controller runs in ns node-ops — the cross-namespace short
@@ -184,7 +183,11 @@ type atcIface interface {
 }
 
 type concourseWorkdirJanitor struct {
-	cs      kubernetes.Interface
+	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue   string
 	stats   nodeStatsReader
 	atc     atcIface
 	enabled bool
@@ -219,6 +222,7 @@ func Setup(d shared.Deps) error {
 	}
 	j := &concourseWorkdirJanitor{
 		cs:    cs,
+		queue: d.Name,
 		stats: &kubeletStatsReader{cs: cs},
 		atc:   newATCClient(cjATCBase, &http.Client{Timeout: cjATCTimeout}),
 		// Reaching this line means the registration gate was on, so
@@ -238,7 +242,7 @@ func Setup(d shared.Deps) error {
 		fastPoll:       cjFastPoll,
 		slowPoll:       cjSlowPoll,
 	}
-	return shared.AddPeriodic(mgr, cjQueue, 30*time.Minute, j.run)
+	return shared.AddPeriodic(mgr, j.queue, 30*time.Minute, j.run)
 }
 
 func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
@@ -258,8 +262,8 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	if held, why, err := j.maintenanceHeld(ctx); err != nil {
 		return err
 	} else if held {
-		log.Info(fmt.Sprintf(
-			"DEFER: cluster maintenance in progress (%s) — wipe cycle skipped", why))
+		log.Info("DEFER: cluster maintenance in progress — wipe cycle skipped",
+			"why", why)
 		return nil
 	}
 
@@ -272,12 +276,11 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	// retire + grace remains the fallback.
 	flyOK := false
 	if user, pass, err := j.atcCredentials(ctx); err != nil {
-		log.Info(fmt.Sprintf(
-			"WARN: %s/%s unreadable — land/drain/prune skipped, pod delete only: %v",
-			cjSecretName, cjSecretKey, err))
+		log.Info("WARN: ATC credentials unreadable — land/drain/prune skipped, pod delete only",
+			"secret", cjSecretName, "key", cjSecretKey, "error", err)
 	} else if err := j.atc.login(ctx, user, pass); err != nil {
-		log.Info(fmt.Sprintf(
-			"WARN: ATC login failed — land/drain/prune skipped, pod delete only: %v", err))
+		log.Info("WARN: ATC login failed — land/drain/prune skipped, pod delete only",
+			"error", err)
 	} else {
 		flyOK = true
 		log.Info("fly login OK", "user", user)
@@ -287,7 +290,8 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	if err != nil {
 		return err // bash: "FAIL: sts concourse-worker not found" + exit 1
 	}
-	log.Info(fmt.Sprintf("concourse-worker replicas=%d", replicas))
+	log.Info("concourse-worker replicas", "statefulset", cjStatefulSet,
+		"replicas", replicas)
 
 	wiped, skipped := 0, 0
 	// Descending ordinals — order is irrelevant (Parallel policy) as
@@ -304,7 +308,7 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 			skipped++
 		}
 	}
-	log.Info(fmt.Sprintf("workdir-janitor done: wiped=%d skipped=%d", wiped, skipped))
+	log.Info("workdir-janitor done", "wiped", wiped, "skipped", skipped)
 	return nil
 }
 
@@ -316,35 +320,40 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 	if err != nil {
 		// bash: any `kubectl get pod` failure → skip + continue.
 		if apierrors.IsNotFound(err) {
-			log.Info(fmt.Sprintf("SKIP %s: not found", podName))
+			log.Info("SKIP: pod not found", "pod", podName)
 		} else {
-			log.Info(fmt.Sprintf("SKIP %s: get failed: %v", podName, err))
+			log.Info("SKIP: pod get failed", "pod", podName, "error", err)
 		}
 		return false, nil
 	}
 
 	s := j.readStats(ctx, pod)
-	log.Info(fmt.Sprintf("=== %s: nodefs %s %sGiB/%sGiB (%s%%), workdir %sGiB/%dGiB cap ===",
-		podName, strOr(s.node, "?"), intOr(s.usedGiB, s.nodefsOK),
-		intOr(s.capGiB, s.nodefsOK), intOr(s.pct, s.nodefsOK),
-		intOr(s.workdirGiB, s.workdirOK), cjMaxWorkdirGiB))
+	log.Info("=== stats ===",
+		"pod", podName, "node", strOr(s.node, "?"),
+		"nodefsUsedGiB", intOr(s.usedGiB, s.nodefsOK),
+		"nodefsCapGiB", intOr(s.capGiB, s.nodefsOK),
+		"nodefsPct", intOr(s.pct, s.nodefsOK),
+		"workdirGiB", intOr(s.workdirGiB, s.workdirOK),
+		"workdirCapGiB", cjMaxWorkdirGiB)
 
 	// Keep the cache only when we KNOW workdir <= cap AND nodefs has
 	// headroom; over-cap, over-threshold or unreadable stats all wipe
 	// (fail-open).
 	if s.workdirOK && s.workdirGiB <= cjMaxWorkdirGiB &&
 		s.nodefsOK && s.pct < cjMinNodefsPct {
-		log.Info(fmt.Sprintf("SKIP %s: workdir %dGiB <= %dGiB, nodefs %d%% < %d%% — keep cache",
-			podName, s.workdirGiB, cjMaxWorkdirGiB, s.pct, cjMinNodefsPct))
+		log.Info("SKIP: under caps — keep cache",
+			"pod", podName, "workdirGiB", s.workdirGiB,
+			"workdirCapGiB", cjMaxWorkdirGiB,
+			"nodefsPct", s.pct, "nodefsMinPct", cjMinNodefsPct)
 		return false, nil
 	}
 	if !s.nodefsOK || !s.workdirOK {
 		// A blind wipe is deliberate fail-open policy, but a
 		// persistently-unreadable stats path must be visible on the
 		// error metric — not just in logs.
-		metrics.IncError(cjQueue)
-		log.Info(fmt.Sprintf("WARN %s: wiping with unreadable stats (nodefsOK=%v workdirOK=%v)",
-			podName, s.nodefsOK, s.workdirOK))
+		metrics.IncError(j.queue)
+		log.Info("WARN: wiping with unreadable stats",
+			"pod", podName, "nodefsOK", s.nodefsOK, "workdirOK", s.workdirOK)
 	}
 
 	// A pod created < readyTimeout ago that is still not Ready is
@@ -355,9 +364,10 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 	// a wedged-not-Ready pod can still be replaced (bash had no such
 	// guard; an interrupted CronJob could thrash the same pod).
 	if !shared.PodReadyCond(pod) && time.Since(pod.CreationTimestamp.Time) < j.readyTimeout {
-		log.Info(fmt.Sprintf("SKIP %s: not Ready %s after creation (< %s) — mid init-rm",
-			podName, time.Since(pod.CreationTimestamp.Time).Truncate(time.Minute),
-			j.readyTimeout))
+		log.Info("SKIP: not Ready after creation — mid init-rm",
+			"pod", podName,
+			"createdAgo", time.Since(pod.CreationTimestamp.Time).Truncate(time.Minute),
+			"readyTimeout", j.readyTimeout)
 		return false, nil
 	}
 
@@ -374,7 +384,7 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 		return false, fmt.Errorf("re-get pod %s before delete: %w", podName, err)
 	}
 	oldUID := fresh.UID
-	log.Info(fmt.Sprintf("=== %s: delete (init-rm will wipe work-dir) ===", podName))
+	log.Info("=== delete — init-rm will wipe work-dir ===", "pod", podName)
 	if err := j.deletePod(ctx, podName, oldUID); err != nil {
 		return false, err
 	}
@@ -389,7 +399,7 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 	if err := j.waitNewPod(ctx, podName, oldUID); err != nil {
 		return false, err
 	}
-	log.Info(fmt.Sprintf("=== %s: new pod created — waiting Ready ===", podName))
+	log.Info("=== new pod created — waiting Ready ===", "pod", podName)
 	if err := j.waitReady(ctx, podName); err != nil {
 		return false, err
 	}
@@ -399,18 +409,21 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 	// run). All failures are non-fatal — bash `|| true`.
 	wd := "?"
 	if np, err := j.getPod(ctx, podName); err != nil {
-		log.Info(fmt.Sprintf("WARN %s: re-read pod after wipe failed: %v", podName, err))
+		log.Info("WARN: re-read pod after wipe failed", "pod", podName, "error", err)
 	} else {
 		s2 := j.readStats(ctx, np)
 		if s2.nodefsOK {
 			if err := j.annotateBaseline(ctx, podName, s2.usedGiB); err != nil {
-				log.Info(fmt.Sprintf("WARN %s: baseline annotate failed: %v", podName, err))
+				log.Info("WARN: baseline annotate failed", "pod", podName, "error", err)
 			}
 			wd = "0"
 		}
-		log.Info(fmt.Sprintf("=== %s: after wipe nodefs %sGiB/%sGiB (%s%%), workdir %sGiB ===",
-			podName, intOr(s2.usedGiB, s2.nodefsOK), intOr(s2.capGiB, s2.nodefsOK),
-			intOr(s2.pct, s2.nodefsOK), wd))
+		log.Info("=== after wipe ===",
+			"pod", podName,
+			"nodefsUsedGiB", intOr(s2.usedGiB, s2.nodefsOK),
+			"nodefsCapGiB", intOr(s2.capGiB, s2.nodefsOK),
+			"nodefsPct", intOr(s2.pct, s2.nodefsOK),
+			"workdirGiB", wd)
 	}
 	return true, nil
 }
@@ -423,10 +436,10 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 // is shortened to landFailWait — a state read of "running" is then
 // the expected steady state, not a drain in progress.
 func (j *concourseWorkdirJanitor) drain(ctx context.Context, podName string, log logr.Logger) {
-	log.Info(fmt.Sprintf("=== %s: land-worker ===", podName))
+	log.Info("=== land-worker ===", "pod", podName)
 	bound := j.drainTimeout
 	if err := j.atc.landWorker(ctx, podName); err != nil {
-		log.Info(fmt.Sprintf("WARN %s: land-worker failed: %v", podName, err))
+		log.Info("WARN: land-worker failed", "pod", podName, "error", err)
 		bound = j.landFailWait
 	}
 	dctx, cancel := context.WithTimeout(ctx, bound)
@@ -441,10 +454,10 @@ func (j *concourseWorkdirJanitor) drain(ctx context.Context, podName string, log
 			return (werr == nil && st == "") || st == "landed" || st == "retired", nil
 		})
 	if err != nil {
-		log.Info(fmt.Sprintf("WARN %s: drain exceeded %s — still deleting pod",
-			podName, bound))
+		log.Info("WARN: drain exceeded bound — still deleting pod",
+			"pod", podName, "bound", bound)
 	} else {
-		log.Info(fmt.Sprintf("=== %s: drained ===", podName))
+		log.Info("=== drained ===", "pod", podName)
 	}
 }
 
@@ -474,7 +487,8 @@ func (j *concourseWorkdirJanitor) maybePruneWorker(ctx context.Context, podName 
 			return s != "running", nil
 		})
 	if lastErr != nil {
-		log.Info(fmt.Sprintf("WARN %s: worker state unreadable (%v) — no prune", podName, lastErr))
+		log.Info("WARN: worker state unreadable — no prune",
+			"pod", podName, "error", lastErr)
 		return
 	}
 	switch st {
@@ -482,13 +496,14 @@ func (j *concourseWorkdirJanitor) maybePruneWorker(ctx context.Context, podName 
 	// ghost worker record (and its claimed volumes) at the ATC — the
 	// worker already stopped picking up builds, so pruning is safe.
 	case "stalled", "landing", "landed", "retired", "retiring":
-		log.Info(fmt.Sprintf("=== %s: worker state=%s — prune before new pod Ready ===", podName, st))
+		log.Info("=== worker prune before new pod Ready ===",
+			"pod", podName, "workerState", st)
 		if err := j.atc.pruneWorker(ctx, podName); err != nil {
-			log.Info(fmt.Sprintf("WARN %s: prune-worker failed: %v", podName, err))
+			log.Info("WARN: prune-worker failed", "pod", podName, "error", err)
 		}
 	default:
-		log.Info(fmt.Sprintf("=== %s: worker state=%s — no prune needed ===",
-			podName, strOr(st, "gone")))
+		log.Info("=== worker state — no prune needed ===",
+			"pod", podName, "workerState", strOr(st, "gone"))
 	}
 }
 
@@ -526,9 +541,8 @@ func (j *concourseWorkdirJanitor) deletePod(ctx context.Context, name string, ol
 	// UID precondition: oldUID was re-fetched right before this call
 	// — if the object already churned to a new UID, the delete must
 	// conflict rather than remove a pod we never vetted.
-	if err := j.cs.CoreV1().Pods(cjNamespace).Delete(dctx, name, metav1.DeleteOptions{
-		Preconditions: &metav1.Preconditions{UID: &oldUID},
-	}); err != nil && !apierrors.IsNotFound(err) {
+	if err := j.cs.CoreV1().Pods(cjNamespace).Delete(dctx, name,
+		shared.UIDDeleteOptions(oldUID, "")); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete pod %s: %w", name, err)
 	}
 	err := wait.PollUntilContextCancel(dctx, j.fastPoll, true,
@@ -663,10 +677,10 @@ func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod
 		// Fail-open is deliberate, but a persistently-broken
 		// stats/summary path must show up on the error metric —
 		// every pod will blind-wipe until it is fixed.
-		metrics.IncError(cjQueue)
-		logf.FromContext(ctx).Info(fmt.Sprintf(
-			"WARN %s: stats/summary unreadable on node %s: %v — disk unknown, fail-open",
-			pod.Name, s.node, err))
+		metrics.IncError(j.queue)
+		logf.FromContext(ctx).Info(
+			"WARN: stats/summary unreadable — disk unknown, fail-open",
+			"pod", pod.Name, "node", s.node, "error", err)
 		return s
 	}
 	if used >= 0 && capBytes > 0 {
@@ -687,16 +701,17 @@ func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod
 		wd = s.usedGiB - int64(base)
 	case imgUsed >= 0:
 		if anno := pod.Annotations[cjBaselineAnno]; anno != "" {
-			logf.FromContext(ctx).Info(fmt.Sprintf(
-				"WARN %s: baseline annotation %q invalid — estimating from imageFs+%dGiB",
-				pod.Name, anno, cjOSBaselineGiB))
+			logf.FromContext(ctx).Info(
+				"WARN: baseline annotation invalid — estimating from imageFs",
+				"pod", pod.Name, "annotation", anno,
+				"osBaselineGiB", cjOSBaselineGiB)
 		}
 		wd = s.usedGiB - imgUsed/gib - cjOSBaselineGiB
 	default:
 		// No baseline path at all → workdir unknown → fail-open wipe.
-		logf.FromContext(ctx).Info(fmt.Sprintf(
-			"WARN %s: no usable baseline (annotation %q, imageFs missing) — workdir unknown, fail-open",
-			pod.Name, pod.Annotations[cjBaselineAnno]))
+		logf.FromContext(ctx).Info(
+			"WARN: no usable baseline (imageFs missing) — workdir unknown, fail-open",
+			"pod", pod.Name, "annotation", pod.Annotations[cjBaselineAnno])
 		return s
 	}
 	if wd < 0 {

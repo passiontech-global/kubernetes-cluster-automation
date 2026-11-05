@@ -97,8 +97,7 @@ func addressedNode(name string, addrs ...corev1.NodeAddress) *corev1.Node {
 }
 
 func newCSRWatcher(cs *fake.Clientset, approve bool) *csrWatcher {
-	return &csrWatcher{cs: cs, approve: approve,
-		warned: map[string]struct{}{}, reported: map[string]struct{}{}}
+	return &csrWatcher{cs: cs, approve: approve, queue: "csr-watcher"}
 }
 
 func csrApproved(t *testing.T, cs *fake.Clientset, name string) (approved bool, reason string) {
@@ -121,7 +120,7 @@ func TestCSRWatcherDetectOnly(t *testing.T) {
 	old := csr("csr-1", kubeletServingSigner, "system:node:n1", time.Hour, false)
 	cs := fake.NewSimpleClientset(old)
 	w := newCSRWatcher(cs, false)
-	before := testutil.QueueErrorCount(t, csrWatcherQueue)
+	before := testutil.QueueErrorCount(t, "csr-watcher")
 	for i := 0; i < 2; i++ { // warn-once set must not break the second run
 		if err := w.run(ctx); err != nil {
 			t.Fatal(err)
@@ -130,10 +129,10 @@ func TestCSRWatcherDetectOnly(t *testing.T) {
 	if ok, _ := csrApproved(t, cs, "csr-1"); ok {
 		t.Fatal("detect mode approved a CSR")
 	}
-	if got := testutil.QueueErrorCount(t, csrWatcherQueue) - before; got != 0 {
+	if got := testutil.QueueErrorCount(t, "csr-watcher") - before; got != 0 {
 		t.Fatalf("pending CSR in detect mode is not an error, delta %v", got)
 	}
-	if _, ok := w.warned["csr-1"]; !ok {
+	if !w.warned.Has("csr-1") {
 		t.Fatal("CSR not recorded in the warn-once set")
 	}
 }
@@ -360,7 +359,7 @@ func TestCSRWatcherUsernameMismatch(t *testing.T) {
 		"system:serviceaccount:kube-system:privesc", time.Hour, false)
 	cs := fake.NewSimpleClientset(bad)
 	w := newCSRWatcher(cs, true)
-	before := testutil.QueueErrorCount(t, csrWatcherQueue)
+	before := testutil.QueueErrorCount(t, "csr-watcher")
 	for i := 0; i < 2; i++ {
 		if err := w.run(ctx); err != nil {
 			t.Fatal(err)
@@ -369,7 +368,7 @@ func TestCSRWatcherUsernameMismatch(t *testing.T) {
 	if ok, _ := csrApproved(t, cs, "csr-evil"); ok {
 		t.Fatal("CSR with non-node username was approved")
 	}
-	if got := testutil.QueueErrorCount(t, csrWatcherQueue) - before; got != 1 {
+	if got := testutil.QueueErrorCount(t, "csr-watcher") - before; got != 1 {
 		t.Fatalf("expected exactly 1 IncError for bad username, delta %v", got)
 	}
 }
@@ -379,14 +378,14 @@ func TestCSRWatcherNodeMissing(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		servingCSR(t, "csr-ghost", "ghost", time.Hour, nil, nil))
 	w := newCSRWatcher(cs, true)
-	before := testutil.QueueErrorCount(t, csrWatcherQueue)
+	before := testutil.QueueErrorCount(t, "csr-watcher")
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if ok, _ := csrApproved(t, cs, "csr-ghost"); ok {
 		t.Fatal("CSR approved for a nonexistent node")
 	}
-	if got := testutil.QueueErrorCount(t, csrWatcherQueue) - before; got != 1 {
+	if got := testutil.QueueErrorCount(t, "csr-watcher") - before; got != 1 {
 		t.Fatalf("expected IncError for missing node, delta %v", got)
 	}
 }
@@ -431,7 +430,7 @@ func TestCSRWatcherPrunesWarnedForDeletedCSR(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := w.warned["csr-1"]; !ok {
+	if !w.warned.Has("csr-1") {
 		t.Fatal("pending CSR not recorded in the warn-once set")
 	}
 	if err := cs.CertificatesV1().CertificateSigningRequests().
@@ -441,7 +440,7 @@ func TestCSRWatcherPrunesWarnedForDeletedCSR(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := w.warned["csr-1"]; ok {
+	if w.warned.Has("csr-1") {
 		t.Fatal("deleted CSR still pinned in the warn-once set")
 	}
 	// Recreated under the same name: warns (re-records) again.
@@ -452,7 +451,7 @@ func TestCSRWatcherPrunesWarnedForDeletedCSR(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := w.warned["csr-1"]; !ok {
+	if !w.warned.Has("csr-1") {
 		t.Fatal("recreated CSR not re-warned — stale prune kept the name")
 	}
 }
@@ -464,11 +463,11 @@ func TestCSRWatcherPrunesReportedForDeletedCSR(t *testing.T) {
 		"system:serviceaccount:kube-system:privesc", time.Hour, false)
 	cs := fake.NewSimpleClientset(bad)
 	w := newCSRWatcher(cs, true)
-	before := testutil.QueueErrorCount(t, csrWatcherQueue)
+	before := testutil.QueueErrorCount(t, "csr-watcher")
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := w.reported["csr-evil"]; !ok {
+	if !w.reported.Has("csr-evil") {
 		t.Fatal("validation failure not recorded in reported")
 	}
 	if err := cs.CertificatesV1().CertificateSigningRequests().
@@ -478,7 +477,7 @@ func TestCSRWatcherPrunesReportedForDeletedCSR(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := w.reported["csr-evil"]; ok {
+	if w.reported.Has("csr-evil") {
 		t.Fatal("deleted CSR still pinned in reported")
 	}
 	if _, err := cs.CertificatesV1().CertificateSigningRequests().
@@ -488,7 +487,7 @@ func TestCSRWatcherPrunesReportedForDeletedCSR(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := testutil.QueueErrorCount(t, csrWatcherQueue) - before; got != 2 {
+	if got := testutil.QueueErrorCount(t, "csr-watcher") - before; got != 2 {
 		t.Fatalf("recreated CSR did not re-report once, total delta %v", got)
 	}
 }
@@ -525,7 +524,7 @@ func TestCSRWatcherApprovalErrorContinues(t *testing.T) {
 			return false, nil, nil
 		})
 	w := newCSRWatcher(cs, true)
-	before := testutil.QueueErrorCount(t, csrWatcherQueue)
+	before := testutil.QueueErrorCount(t, "csr-watcher")
 	if err := w.run(ctx); err != nil {
 		t.Fatalf("an approval write failure must not error the run: %v", err)
 	}
@@ -535,7 +534,7 @@ func TestCSRWatcherApprovalErrorContinues(t *testing.T) {
 	if ok, _ := csrApproved(t, cs, "csr-good"); !ok {
 		t.Fatal("csr-good skipped after the sibling approval failed")
 	}
-	if got := testutil.QueueErrorCount(t, csrWatcherQueue) - before; got < 1 {
+	if got := testutil.QueueErrorCount(t, "csr-watcher") - before; got < 1 {
 		t.Fatalf("approval write failure did not IncError, delta %v", got)
 	}
 }

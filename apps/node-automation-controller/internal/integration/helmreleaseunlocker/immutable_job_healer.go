@@ -61,16 +61,16 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 		if suspended, _ := shared.NestedBool(k.Object, "spec", "suspend"); suspended {
 			continue
 		}
-		status, msg := shared.ReadyCond(k)
-		if status != "False" || !strings.Contains(strings.ToLower(msg), "field is immutable") {
+		c, _ := shared.ConditionOf(k.Object, "Ready")
+		if c.Status != "False" || !strings.Contains(strings.ToLower(c.Message), "field is immutable") {
 			continue
 		}
-		m := immutableJobRe.FindStringSubmatch(msg)
+		m := immutableJobRe.FindStringSubmatch(c.Message)
 		if m == nil {
 			continue
 		}
-		since, ok := shared.ReadySince(k)
-		if !ok {
+		since := c.LastTransitionTime
+		if since.IsZero() {
 			since = k.GetCreationTimestamp().Time
 		}
 		if now.Sub(since) < immutableJobMinAge {
@@ -98,7 +98,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 			if apierrors.IsNotFound(err) {
 				continue // already gone — nothing to reap
 			}
-			metrics.IncError(helmUnlockQueue)
+			metrics.IncError(u.queue)
 			log.Error(err, "immutable-job lookup failed", "kustomization", key, "job", jobNS+"/"+m[1])
 			continue
 		}
@@ -115,11 +115,9 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 		}
 		log.Info("ACTION: delete completed/failed immutable Job — apply can recreate it",
 			"kustomization", key, "job", jobNS+"/"+job.Name)
-		bg := metav1.DeletePropagationBackground
 		if err := u.cs.BatchV1().Jobs(jobNS).Delete(ctx, job.Name,
-			metav1.DeleteOptions{PropagationPolicy: &bg,
-				Preconditions: &metav1.Preconditions{UID: &job.UID}}); err != nil {
-			metrics.IncError(helmUnlockQueue)
+			shared.UIDDeleteOptions(job.UID, metav1.DeletePropagationBackground)); err != nil {
+			metrics.IncError(u.queue)
 			log.Error(err, "immutable job delete failed", "job", jobNS+"/"+job.Name)
 			continue
 		}
@@ -135,7 +133,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 		}
 		if _, err := u.dyn.Resource(fluxKustomizationGVR).Namespace(k.GetNamespace()).
 			Patch(ctx, k.GetName(), types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
-			metrics.IncError(helmUnlockQueue)
+			metrics.IncError(u.queue)
 			log.Error(err, "immutable-job heal stamp failed", "kustomization", key)
 		}
 	}

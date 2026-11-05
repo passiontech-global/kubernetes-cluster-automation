@@ -23,7 +23,7 @@ import (
 // no RequeueAfter loop, no periodic LIST against the apiserver.
 func TestSetupDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(), Disabled: true}); err != nil {
+	if err := Setup(shared.Deps{Name: "cilium-taint-reaper", Mgr: m, CS: fake.NewSimpleClientset(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {
@@ -39,7 +39,7 @@ func TestSetupDisabled(t *testing.T) {
 // setupModules' registry tests in cmd/manager).
 func TestSetupRegistersController(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
+	if err := Setup(shared.Deps{Name: "cilium-taint-reaper", Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	if len(m.Added) != 1 {

@@ -43,11 +43,10 @@ import (
 )
 
 const (
-	partitionEvictorQueue = "partition-pod-evictor"
-	partitionTaintKey     = "node.ops/network-partitioned"
-	partitionMinAge       = 600 * time.Second // condition True >10m before evicting
-	partitionPodNS        = "flux-system"     // default for partitionNSsEnv
-	partitionEvictCap     = 8                 // bound churn per run
+	partitionTaintKey = "node.ops/network-partitioned"
+	partitionMinAge   = 600 * time.Second // condition True >10m before evicting
+	partitionPodNS    = "flux-system"     // default for partitionNSsEnv
+	partitionEvictCap = 8                 // bound churn per run
 	// partitionNSsEnv is the comma-separated namespace allow-list the
 	// sweep evicts from; unset/whitespace keeps the bash default
 	// (partitionPodNS) so a misconfigured flag degrades to the
@@ -95,12 +94,16 @@ var partitionCondTypes = []corev1.NodeConditionType{
 
 type partitionEvictor struct {
 	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
 }
 
 // Setup registers the 5-minute sweep (was crontab */5).
 func Setup(d shared.Deps) error {
-	e := &partitionEvictor{cs: d.CS}
-	return shared.AddPeriodic(d.Mgr, partitionEvictorQueue, 5*time.Minute, e.run)
+	e := &partitionEvictor{cs: d.CS, queue: d.Name}
+	return shared.AddPeriodic(d.Mgr, e.queue, 5*time.Minute, e.run)
 }
 
 // nodePartitioned reports whether any NWPD network condition has been
@@ -177,16 +180,17 @@ func partitionEvictable(p *corev1.Pod, namespaces map[string]struct{}) bool {
 // error — the caller fails the eviction pass closed rather than
 // evicting pods it cannot prove are movable.
 func (e *partitionEvictor) nodePinnedPVCs(ctx context.Context) (map[string]struct{}, error) {
-	pvcs, err := e.cs.CoreV1().PersistentVolumeClaims(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pvcs, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: 500},
+		shared.PersistentVolumeClaims(e.cs, metav1.NamespaceAll))
 	if err != nil {
 		return nil, fmt.Errorf("list persistentvolumeclaims: %w", err)
 	}
 	out := map[string]struct{}{}
-	for i := range pvcs.Items {
-		sc := pvcs.Items[i].Spec.StorageClassName
+	for i := range pvcs {
+		sc := pvcs[i].Spec.StorageClassName
 		if sc != nil && partitionNodePinnedStorageClasses[*sc] {
-			out[pvcs.Items[i].Namespace+"/"+pvcs.Items[i].Name] = struct{}{}
+			out[pvcs[i].Namespace+"/"+pvcs[i].Name] = struct{}{}
 		}
 	}
 	return out, nil
@@ -243,7 +247,7 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		n := &nodes[i]
 		if shared.HasTaint(n.Spec.Taints, partitionTaintKey) && !flagged[n.Name] {
 			if err := shared.UntaintNode(ctx, e.cs, n.Name, partitionTaintKey); err != nil {
-				metrics.IncError(partitionEvictorQueue)
+				metrics.IncError(e.queue)
 				log.Error(err, "untaint failed", "node", n.Name)
 				continue
 			}
@@ -287,7 +291,7 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		node := byName[name]
 		if !shared.HasTaint(node.Spec.Taints, partitionTaintKey) {
 			if err := shared.TaintNode(ctx, e.cs, name, partitionTaintKey, "true", corev1.TaintEffectNoSchedule); err != nil {
-				metrics.IncError(partitionEvictorQueue)
+				metrics.IncError(e.queue)
 				log.Error(err, "taint failed", "node", name)
 			} else {
 				log.Info("TAINT: network partitioned -> NoSchedule", "node", name)
@@ -303,7 +307,7 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	// fence new scheduling).
 	pinnedPVCs, err := e.nodePinnedPVCs(ctx)
 	if err != nil {
-		metrics.IncError(partitionEvictorQueue)
+		metrics.IncError(e.queue)
 		log.Error(err, "pvc list failed — pod eviction skipped this run")
 		return nil
 	}
@@ -311,16 +315,17 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	evicted := 0
 loop:
 	for _, name := range names {
-		pods, err := e.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+		pods, err := shared.ListAll(ctx, metav1.ListOptions{
 			FieldSelector: "spec.nodeName=" + name,
-		})
+			Limit:         500,
+		}, shared.Pods(e.cs, metav1.NamespaceAll))
 		if err != nil {
-			metrics.IncError(partitionEvictorQueue)
+			metrics.IncError(e.queue)
 			log.Error(err, "list pods failed", "node", name)
 			continue
 		}
-		for i := range pods.Items {
-			p := &pods.Items[i]
+		for i := range pods {
+			p := &pods[i]
 			if evicted >= partitionEvictCap {
 				log.Info("SKIP rest: cap reached", "cap", partitionEvictCap,
 					"node", name)
@@ -348,10 +353,8 @@ loop:
 			// same-named fresh pod before the delete lands — never
 			// kill the replacement.
 			if err := e.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
-				metav1.DeleteOptions{
-					Preconditions: &metav1.Preconditions{UID: &p.UID},
-				}); err != nil {
-				metrics.IncError(partitionEvictorQueue)
+				shared.UIDDeleteOptions(p.UID, "")); err != nil {
+				metrics.IncError(e.queue)
 				log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name,
 					"node", name)
 			}

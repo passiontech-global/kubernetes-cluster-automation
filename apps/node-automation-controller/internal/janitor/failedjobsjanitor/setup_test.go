@@ -19,7 +19,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	m := testutil.NewStubManager()
 	// dyn is only used by the W9-GO2 BuildRun sweep — nil is fine for
 	// the registration check.
-	if err := Setup(shared.Deps{
+	if err := Setup(shared.Deps{Name: "failed-jobs-janitor",
 		Mgr: m,
 		CS:  fake.NewSimpleClientset(),
 		Dyn: nil,

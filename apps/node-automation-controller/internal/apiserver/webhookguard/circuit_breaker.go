@@ -79,7 +79,7 @@ func circuitBreakerEnabled() bool {
 // circuitBreaker owns the C1 sweep's per-sweep state — embedded in
 // webhookGuard so the facade's method set (and every in-package test
 // fixture built on it) is unchanged by the split. Shared deps
-// (cs/dyn/nowFn/endpointProber) are reached through snap.g; only the
+// (cs/dyn/now/endpointProber) are reached through snap.g; only the
 // breaker-specific ledgers and cooldowns live here.
 type circuitBreaker struct {
 	// deadSince is the first-seen ledger of each
@@ -114,7 +114,7 @@ type circuitBreaker struct {
 func (b *circuitBreaker) sweepCircuitBreaker(ctx context.Context, snap *sweepSnapshot) error {
 	g := snap.g
 	log := logf.FromContext(ctx)
-	now := g.now()
+	now := g.now.Now()
 
 	ready, err := snap.readyCounts()
 	if err != nil {
@@ -134,7 +134,7 @@ func (b *circuitBreaker) sweepCircuitBreaker(ctx context.Context, snap *sweepSna
 	var failed []string
 	for i := range mwcs.Items {
 		cfg := &mwcs.Items[i]
-		payload, trips, recovered := b.circuitPatch(log, webhookKindMutating,
+		payload, trips, recovered := b.circuitPatch(log, g.queue, webhookKindMutating,
 			cfg.Name, cfg.Annotations[webhookCircuitAnno],
 			mutHookViews(cfg.Webhooks), ready, now, seen, &b.brokenEmitted)
 		if payload == nil {
@@ -151,7 +151,7 @@ func (b *circuitBreaker) sweepCircuitBreaker(ctx context.Context, snap *sweepSna
 	}
 	for i := range vwcs.Items {
 		cfg := &vwcs.Items[i]
-		payload, trips, recovered := b.circuitPatch(log, webhookKindValidating,
+		payload, trips, recovered := b.circuitPatch(log, g.queue, webhookKindValidating,
 			cfg.Name, cfg.Annotations[webhookCircuitAnno],
 			valHookViews(cfg.Webhooks), ready, now, seen, &b.brokenEmitted)
 		if payload == nil {
@@ -255,7 +255,7 @@ func (b *circuitBreaker) tripThreshold(rawReady int) time.Duration {
 // not re-seen. Returns nil payload when nothing changed;
 // trips/recovered are the names whose metric updates the caller must
 // apply only after the patch lands.
-func (b *circuitBreaker) circuitPatch(log logr.Logger, kind, cfgName, annoVal string,
+func (b *circuitBreaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal string,
 	hooks []hookView, ready endpointCensus, now time.Time,
 	seen map[string]bool, emitted *shared.GaugeLedger[string]) ([]byte, []string, []string) {
 
@@ -316,8 +316,9 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, kind, cfgName, annoVal st
 			delete(broken, h.name)
 			recovered = append(recovered, h.name)
 			changed = true
-			log.Info(fmt.Sprintf("CIRCUIT-RECOVER: %s/%s webhook %q -> %s — restoring failurePolicy=Fail",
-				kind, cfgName, h.name, svcRefString(h.svc)))
+			log.Info("CIRCUIT-RECOVER: restoring failurePolicy=Fail",
+				"kind", kind, "config", cfgName, "webhook", h.name,
+				"service", svcRefString(h.svc))
 		case isBroken:
 			// Still dead — the annotation is the SSOT, so re-assert
 			// Ignore if the policy was flipped back externally.
@@ -355,14 +356,17 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, kind, cfgName, annoVal st
 				// W9-CP1 — every probed Ready endpoint failed the
 				// TCP+TLS handshake: hung pods, not a partition.
 				// svcRaw > 0 keeps the 90s partition threshold.
-				log.Info(fmt.Sprintf("CIRCUIT-TRIP: %s/%s webhook %q -> %s (unresponsive: all probed ready endpoints fail TCP+TLS handshake >= %s) — patching failurePolicy=Ignore",
-					kind, cfgName, h.name, svc, threshold))
+				log.Info("CIRCUIT-TRIP: unresponsive — all probed ready endpoints fail TCP+TLS handshake — patching failurePolicy=Ignore",
+					"kind", kind, "config", cfgName, "webhook", h.name,
+					"service", svc, "threshold", threshold)
 			case svcRaw > 0:
-				log.Info(fmt.Sprintf("CIRCUIT-TRIP: %s/%s webhook %q -> %s (all %d ready endpoints on partitioned/unresponsive nodes >= %s) — patching failurePolicy=Ignore",
-					kind, cfgName, h.name, svc, svcRaw, threshold))
+				log.Info("CIRCUIT-TRIP: all ready endpoints on partitioned/unresponsive nodes — patching failurePolicy=Ignore",
+					"kind", kind, "config", cfgName, "webhook", h.name,
+					"service", svc, "rawReady", svcRaw, "threshold", threshold)
 			default:
-				log.Info(fmt.Sprintf("CIRCUIT-TRIP: %s/%s webhook %q -> %s (0 ready endpoints >= %s) — patching failurePolicy=Ignore",
-					kind, cfgName, h.name, svc, threshold))
+				log.Info("CIRCUIT-TRIP: 0 ready endpoints — patching failurePolicy=Ignore",
+					"kind", kind, "config", cfgName, "webhook", h.name,
+					"service", svc, "threshold", threshold)
 			}
 		}
 	}
@@ -396,7 +400,7 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, kind, cfgName, annoVal st
 	if err != nil {
 		// Absorbed sub-failure: the sweep logs and continues —
 		// metered so the dropped work is still counted.
-		metrics.IncError(webhookGuardQueue)
+		metrics.IncError(queue)
 		log.Error(err, "marshal circuit breaker patch", "config", cfgName)
 		return nil, nil, nil
 	}
@@ -433,7 +437,7 @@ func (b *circuitBreaker) bounceHungWebhookPods(ctx context.Context,
 	snap *sweepSnapshot, ready endpointCensus) {
 	g := snap.g
 	log := logf.FromContext(ctx)
-	now := g.now()
+	now := g.now.Now()
 	// Distinct unresponsive webhook backend services, deduped across
 	// configs and kinds — several webhooks routinely share one
 	// Service, and one hung pod set is one bounce.
@@ -479,7 +483,7 @@ func (b *circuitBreaker) bounceHungWebhookPods(ctx context.Context,
 	// pod kill, and "cannot verify" fails closed.
 	held, why, err := g.maintenanceActive(ctx)
 	if err != nil {
-		metrics.IncError(webhookGuardQueue)
+		metrics.IncError(g.queue)
 		log.Info("WARN: maintenance check unverifiable — "+
 			"DEFER: webhook pod bounce skipped (fail closed)",
 			"error", err, "services", keys)
@@ -510,7 +514,7 @@ func (b *circuitBreaker) bounceOldestPod(ctx context.Context, snap *sweepSnapsho
 		p, err := g.cs.CoreV1().Pods(r.namespace).Get(ctx, r.name, metav1.GetOptions{})
 		if err != nil {
 			if !apierrors.IsNotFound(err) {
-				metrics.IncError(webhookGuardQueue)
+				metrics.IncError(g.queue)
 				log.Error(err, "webhook backing pod get failed",
 					"pod", r.namespace+"/"+r.name, "service", svcKey)
 			}
@@ -535,9 +539,8 @@ func (b *circuitBreaker) bounceOldestPod(ctx context.Context, snap *sweepSnapsho
 		"age", now.Sub(oldest.CreationTimestamp.Time).Truncate(time.Second))
 	uid := oldest.UID
 	if err := g.cs.CoreV1().Pods(oldest.Namespace).Delete(ctx, oldest.Name,
-		metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil {
-		metrics.IncError(webhookGuardQueue)
+		shared.UIDDeleteOptions(uid, "")); err != nil {
+		metrics.IncError(g.queue)
 		log.Error(err, "webhook pod bounce delete failed",
 			"pod", oldest.Namespace+"/"+oldest.Name, "service", svcKey)
 		return

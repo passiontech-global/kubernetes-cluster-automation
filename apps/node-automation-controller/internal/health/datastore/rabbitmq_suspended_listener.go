@@ -1,0 +1,251 @@
+package datastore
+
+import (
+	"context"
+	"fmt"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/health/probefw"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+// rabbitMQSuspendedCheck is the W6.4 suspended-listener healer.
+type rabbitMQSuspendedCheck struct {
+	*probefw.Deps
+
+	// W6.4 watchdog state (serial sweep — unguarded):
+	//   - rbSuspendedSince: "ns/pod/uid" → first sweep the pod
+	//     showed the suspended-listener signature (uid in the key
+	//     keeps a same-named replacement from inheriting the streak).
+	//   - rbHealed: "ns/pod" → last delete — the 30m heal cooldown.
+	rbSuspendedSince map[string]time.Time
+	rbHealed         map[string]time.Time
+}
+
+// newRabbitMQSuspendedCheck builds the W6.4 check with fresh
+// tracking maps — the state-map initialization that used to live in
+// the monolithic newClusterHealthProber literal.
+func NewRabbitMQSuspendedCheck(d *probefw.Deps) probefw.Check {
+	return &rabbitMQSuspendedCheck{Deps: d,
+		rbSuspendedSince: map[string]time.Time{},
+		rbHealed:         map[string]time.Time{},
+	}
+}
+
+// W6.4 — rabbitmq-suspended-listener knobs.
+const (
+	// CheckNameRabbitMQSuspended is the check's kuberhealthy_check
+	// label value — W6.4; not a ported HealthCheck but reports
+	// under its own check name so the generic FAIL alerting path
+	// covers it.
+	CheckNameRabbitMQSuspended = "rabbitmq-suspended-listener"
+	rabbitComponentLabel       = "app.kubernetes.io/component=rabbitmq"
+	rabbitSuspendedMinAge      = 10 * time.Minute
+	rabbitHealCooldown         = 30 * time.Minute
+)
+
+// ---------------------------------------------------------------------------
+// rabbitmq-suspended-listener (W6.4) — suspended listener healer.
+// ---------------------------------------------------------------------------
+
+// rabbitSuspended reports the suspended-listener signature: the pod
+// is Running and every container Started (kubelet launched them) but
+// none ever went Ready — the rabbit listener sits on the
+// ranch:suspended branch refusing port 5672 while the pod looks
+// "almost healthy" to every coarse check.
+func rabbitSuspended(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodRunning || pod.DeletionTimestamp != nil {
+		return false
+	}
+	if len(pod.Status.ContainerStatuses) == 0 {
+		return false
+	}
+	for _, s := range pod.Status.ContainerStatuses {
+		if s.Started == nil || !*s.Started || s.Ready {
+			return false
+		}
+	}
+	return true
+}
+
+// rabbitQuorumSafe verifies deleting the suspended pod cannot break
+// the cluster quorum: the pod must be owned by a StatefulSet whose
+// every OTHER replica is Ready — a peer that is itself suspended or
+// down means the delete could take the cluster below quorum, so the
+// heal stands down and the FAIL series keeps alerting instead.
+func (p *rabbitMQSuspendedCheck) rabbitQuorumSafe(ctx context.Context, pod *corev1.Pod) (bool, error) {
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil || owner.Kind != "StatefulSet" {
+		return false, nil // cannot verify peers — do not touch
+	}
+	sts, err := p.CS.AppsV1().StatefulSets(pod.Namespace).
+		Get(ctx, owner.Name, metav1.GetOptions{})
+	if err != nil {
+		return false, fmt.Errorf("get statefulset %s/%s: %w",
+			pod.Namespace, owner.Name, err)
+	}
+	sel, err := metav1.LabelSelectorAsSelector(sts.Spec.Selector)
+	if err != nil {
+		return false, fmt.Errorf("statefulset selector %s/%s: %w",
+			pod.Namespace, owner.Name, err)
+	}
+	peers, err := p.CS.CoreV1().Pods(pod.Namespace).List(ctx,
+		metav1.ListOptions{LabelSelector: sel.String()})
+	if err != nil {
+		return false, fmt.Errorf("list peer pods of %s/%s: %w",
+			pod.Namespace, owner.Name, err)
+	}
+	// BUG-C2: quorum must be verified against the DESIRED membership,
+	// not just "every listed peer is Ready" — a scaled-down or
+	// mid-churn set where fewer than spec.replicas pods even exist
+	// cannot prove the delete leaves quorum intact. Require the full
+	// pod count AND replicas-1 READY peers (the suspended pod itself
+	// holds the remaining vote).
+	if sts.Spec.Replicas == nil {
+		return false, nil
+	}
+	want := int(*sts.Spec.Replicas)
+	if len(peers.Items) < want {
+		return false, nil
+	}
+	readyPeers := 0
+	for i := range peers.Items {
+		peer := &peers.Items[i]
+		if peer.UID == pod.UID {
+			continue
+		}
+		if shared.PodReadyCond(peer) {
+			readyPeers++
+		}
+	}
+	if readyPeers < want-1 {
+		return false, nil
+	}
+	return true, nil
+}
+
+// checkRabbitMQSuspendedPods heals the RabbitMQ suspended-listener
+// wedge: a pod whose containers all started but never went Ready is
+// partitioned from its own cluster while holding a peer slot. Stuck
+// >=10m AND all other replicas Ready (quorum survives) → delete the
+// pod so the StatefulSet controller brings up a clean replica; the
+// RabbitMQSuspendedHealsTotal counter records each heal.
+func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
+	log := logf.FromContext(ctx)
+	now := p.Now()
+	if p.rbSuspendedSince == nil {
+		p.rbSuspendedSince = map[string]time.Time{}
+	}
+	if p.rbHealed == nil {
+		p.rbHealed = map[string]time.Time{}
+	}
+
+	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).List(ctx,
+		metav1.ListOptions{LabelSelector: rabbitComponentLabel})
+	if err != nil {
+		return probefw.Result{Infra: fmt.Errorf("list rabbitmq pods: %w", err)}
+	}
+
+	live := map[string]bool{} // "ns/pod/uid" suspended signatures this sweep
+	var due []corev1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !rabbitSuspended(pod) {
+			continue
+		}
+		key := pod.Namespace + "/" + pod.Name + "/" + string(pod.UID)
+		live[key] = true
+		first, ok := p.rbSuspendedSince[key]
+		if !ok {
+			p.rbSuspendedSince[key] = now
+		}
+		if !ok {
+			log.Info("rabbitmq suspended-listener signature — tracking first-seen",
+				"pod", pod.Namespace+"/"+pod.Name)
+			continue
+		}
+		if now.Sub(first) >= rabbitSuspendedMinAge {
+			due = append(due, *pod)
+		}
+	}
+	for k := range p.rbSuspendedSince {
+		if !live[k] {
+			delete(p.rbSuspendedSince, k)
+		}
+	}
+
+	// Maintenance mutex — evaluated once per sweep and only when
+	// there is something to delete: pod kills during a drain/upgrade
+	// are exactly what the mutex exists to prevent; "cannot verify"
+	// fails closed.
+	var maintHeld bool
+	var maintWhy string
+	var maintErr error
+	if len(due) > 0 {
+		maintHeld, maintWhy, maintErr = shared.MaintenanceActive(ctx, p.CS, p.Dyn)
+		if maintErr != nil {
+			metrics.IncError(p.Name)
+			log.Info("WARN: maintenance check unverifiable — heals deferred (fail closed)",
+				"error", maintErr)
+		}
+	}
+	for i := range due {
+		pod := &due[i]
+		key := pod.Namespace + "/" + pod.Name
+		if maintErr != nil || maintHeld {
+			log.Info("maintenance gate — suspended rabbitmq pod kept",
+				"pod", key, "why", maintWhy)
+			continue
+		}
+		last, ok := p.rbHealed[key]
+		if ok && now.Sub(last) < rabbitHealCooldown {
+			log.Info("skip heal: rabbitmq pod inside cooldown",
+				"pod", key, "ago", now.Sub(last).Truncate(time.Minute))
+			continue
+		}
+		safe, err := p.rabbitQuorumSafe(ctx, pod)
+		if err != nil {
+			metrics.IncError(p.Name)
+			log.Info("WARN: quorum check failed — heal deferred",
+				"pod", key, "error", err)
+			continue
+		}
+		if !safe {
+			log.Info("quorum unsafe — suspended rabbitmq pod kept (peers not all Ready)",
+				"pod", key)
+			continue
+		}
+		uid := pod.UID
+		if err := p.CS.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
+			metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &uid},
+			}); err != nil {
+			metrics.IncError(p.Name)
+			log.Error(err, "suspended rabbitmq pod delete failed", "pod", key)
+			continue
+		}
+		p.rbHealed[key] = now
+		metrics.RabbitMQSuspendedHealsTotal.
+			WithLabelValues(pod.Namespace, pod.Name).Inc()
+		log.Info("DELETE: suspended-listener rabbitmq pod — quorum verified",
+			"pod", key)
+	}
+
+	if len(due) == 0 {
+		return probefw.Result{Pass: true}
+	}
+	names := make([]string, 0, len(due))
+	for i := range due {
+		names = append(names, due[i].Namespace+"/"+due[i].Name)
+	}
+	sort.Strings(names)
+	return probefw.Result{Why: fmt.Sprintf(
+		"rabbitmq pods running suspended >=%s: %s",
+		rabbitSuspendedMinAge, strings.Join(names, ", "))}
+}

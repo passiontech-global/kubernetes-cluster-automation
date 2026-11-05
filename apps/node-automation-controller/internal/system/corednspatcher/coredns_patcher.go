@@ -64,7 +64,11 @@ var (
 )
 
 type corednsPatcher struct {
-	cs              kubernetes.Interface
+	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the controller name, the setup log lines and
+	// every IncError label come from one place.
+	queue           string
 	zoneWhen        string
 	minDomains      int
 	minReplicas     int
@@ -129,15 +133,15 @@ func Setup(d shared.Deps) error {
 		err := fmt.Errorf("invalid zoneWhen %q — must be %q or %q "+
 			"(UnsatisfiableConstraintAction); module disabled",
 			zoneWhen, corev1.DoNotSchedule, corev1.ScheduleAnyway)
-		logf.Log.WithName("coredns-patcher").Error(err, "setup failed")
-		metrics.IncError("coredns-patcher")
+		logf.Log.WithName(d.Name).Error(err, "setup failed")
+		metrics.IncError(d.Name)
 		return nil
 	}
-	logf.Log.WithName("coredns-patcher").Info("registered",
+	logf.Log.WithName(d.Name).Info("registered",
 		"zoneWhen", zoneWhen, "zoneMinDomains", zoneMinDomains,
 		"minReplicas", minReplicas, "nodesPerReplica", nodesPerReplica)
 	b := ctrl.NewControllerManagedBy(d.Mgr).
-		Named("coredns-patcher").
+		Named(d.Name).
 		For(&appsv1.Deployment{}, builder.WithPredicates(onlyCoreDNSDeployment))
 	if minReplicas > 0 {
 		// Node add/remove changes the proportional replica total —
@@ -149,8 +153,8 @@ func Setup(d shared.Deps) error {
 			handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("coredns-patcher-sweep")),
 			builder.WithPredicates(nodeCountChanges))
 	}
-	return b.Complete(&corednsPatcher{cs: d.CS, zoneWhen: zoneWhen, minDomains: zoneMinDomains,
-		minReplicas: minReplicas, nodesPerReplica: nodesPerReplica})
+	return b.Complete(&corednsPatcher{cs: d.CS, queue: d.Name, zoneWhen: zoneWhen,
+		minDomains: zoneMinDomains, minReplicas: minReplicas, nodesPerReplica: nodesPerReplica})
 }
 
 func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -165,7 +169,7 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 		return res, nil
 	}
 	if err != nil {
-		metrics.IncError("coredns-patcher")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/coredns: %w", err)
 	}
 
@@ -176,7 +180,7 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 	if r.minReplicas > 0 {
 		nodes, err := shared.ListNodes(ctx, r.cs)
 		if err != nil {
-			metrics.IncError("coredns-patcher")
+			metrics.IncError(r.queue)
 			return ctrl.Result{}, fmt.Errorf("list nodes for proportional replica count: %w", err)
 		}
 		wantReplicas = shared.ProportionalReplicas(len(nodes), r.minReplicas, r.nodesPerReplica)
@@ -201,7 +205,7 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 	}
 	patch, err := corednsPatchBody(r.zoneWhen, r.minDomains, wantReplicas)
 	if err != nil {
-		metrics.IncError("coredns-patcher")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("render patch body for deployment kube-system/coredns: %w", err)
 	}
 	log.Info("PATCH: coredns drifted — restoring pinned spec",
@@ -209,7 +213,7 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 	if _, err := r.cs.AppsV1().Deployments("kube-system").Patch(ctx,
 		"coredns", types.StrategicMergePatchType,
 		patch, metav1.PatchOptions{}); err != nil {
-		metrics.IncError("coredns-patcher")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("patch deployment kube-system/coredns: %w", err)
 	}
 	return res, nil

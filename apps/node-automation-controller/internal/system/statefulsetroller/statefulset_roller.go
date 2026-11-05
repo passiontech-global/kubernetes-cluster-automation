@@ -65,7 +65,6 @@ import (
 )
 
 const (
-	stsOnDeleteRollerQueue    = "statefulset-ondelete-roller"
 	stsOnDeleteRollerInterval = 10 * time.Minute
 	// stsAutoRollAnno is the opt-in switch — only annotated
 	// StatefulSets are ever rolled.
@@ -86,10 +85,14 @@ const (
 
 type statefulSetOnDeleteRoller struct {
 	cs kubernetes.Interface
-	// nowFn is the clock seam — tests pin it so the 30m drift and
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
+	// now is the clock seam — tests pin it so the 30m drift and
 	// 5m stability windows are deterministic. nil → time.Now.
-	nowFn func() time.Time
-	mu    sync.Mutex
+	now shared.Clock
+	mu  sync.Mutex
 	// driftSince records when each "ns/name" StatefulSet's
 	// updateRevision != currentRevision drift was FIRST observed —
 	// any cycle where the revisions agree, the set leaves, or the
@@ -106,19 +109,14 @@ func Setup(d shared.Deps) error {
 	if d.Disabled {
 		return nil
 	}
-	r := &statefulSetOnDeleteRoller{cs: d.CS, nowFn: time.Now}
-	return shared.AddPeriodic(d.Mgr, stsOnDeleteRollerQueue, stsOnDeleteRollerInterval, r.run)
+	r := &statefulSetOnDeleteRoller{cs: d.CS, queue: d.Name, now: shared.SystemClock}
+	return shared.AddPeriodic(d.Mgr, r.queue, stsOnDeleteRollerInterval, r.run)
 }
 
 func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// Lazily arm the zero-value struct — unit tests construct the
-	// roller literally without the Setup path.
-	if r.nowFn == nil {
-		r.nowFn = time.Now
-	}
 
 	// Page the cluster-wide list — an unbounded List forces etcd to
 	// serialize every StatefulSet into one response; 500-per-page
@@ -129,7 +127,7 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 		return fmt.Errorf("list statefulsets: %w", err)
 	}
 
-	now := r.nowFn()
+	now := r.now.Now()
 	// drifting collects the "ns/name" keys whose revision drift held
 	// THIS cycle — the prune pass below treats anything else in
 	// driftSince as settled, gone, or de-opted.
@@ -194,7 +192,7 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 			// sub-operation failure, counted here so the nil return
 			// still leaves a trace.
 			log.Error(err, "ondelete roll failed", "statefulset", d.key)
-			metrics.IncError(stsOnDeleteRollerQueue)
+			metrics.IncError(r.queue)
 			continue
 		}
 		rolled++

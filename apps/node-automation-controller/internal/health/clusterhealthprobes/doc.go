@@ -1,5 +1,7 @@
-// Package clusterhealthprobes is the in-process port of the kuberhealthy
-// "passive" HealthChecks: periodic DNS, apiserver-endpoint and pod-DNS
-// probes reporting on the same metric series the checker Pods used to
-// emit.
+// Package clusterhealthprobes is the cluster-health sweep module
+// root: Setup, the prober and the checkDefs registry. The checks it
+// drives — the in-process ports of the kuberhealthy "passive"
+// HealthChecks plus the self-healing watchdog checks — live in
+// per-domain subpackages under internal/health on top of the shared
+// probefw framework.
 package clusterhealthprobes

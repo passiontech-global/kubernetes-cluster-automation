@@ -92,7 +92,7 @@ func TestCiliumIdentityAuditorSetupDisabled(t *testing.T) {
 	// CILIUM_IDENTITY_AUDITOR_ENABLED gates the module off — a
 	// disabled Setup must return nil without touching the (nil)
 	// manager.
-	if err := Setup(shared.Deps{Disabled: true}); err != nil {
+	if err := Setup(shared.Deps{Name: "cilium-identity-auditor", Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 }
@@ -105,12 +105,12 @@ func TestCiliumIdentityAuditorDetectsOrphansBelowThreshold(t *testing.T) {
 		ciliumIdentity("1000"), ciliumIdentity("2000"), ciliumIdentity("3000"),
 		ciliumEndpoint("app", "cep-1", 1000))
 	cs := fake.NewSimpleClientset(identityPod("app", "p-1", "2000"))
-	a := &ciliumIdentityAuditor{cs: cs, dyn: dyn}
-	before := testutil.QueueErrorCount(t, ciliumAuditQueue)
+	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor", cs: cs, dyn: dyn}
+	before := testutil.QueueErrorCount(t, "cilium-identity-auditor")
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := testutil.QueueErrorCount(t, ciliumAuditQueue) - before; got != 0 {
+	if got := testutil.QueueErrorCount(t, "cilium-identity-auditor") - before; got != 0 {
 		t.Fatalf("below-threshold orphans must not IncError, delta %v", got)
 	}
 	// Detect-only fixture (gcEnabled=false): nothing is ever deleted.
@@ -128,7 +128,7 @@ func TestCiliumIdentityAuditorCleanCluster(t *testing.T) {
 		ciliumIdentity("1001"), ciliumIdentity("1002"),
 		ciliumEndpoint("a", "cep-1", 1001),
 		ciliumEndpoint("b", "cep-2", 1002))
-	a := &ciliumIdentityAuditor{cs: fake.NewSimpleClientset(), dyn: dyn}
+	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor", cs: fake.NewSimpleClientset(), dyn: dyn}
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -142,12 +142,12 @@ func TestCiliumIdentityAuditorOrphanThreshold(t *testing.T) {
 		objs = append(objs, ciliumIdentity(fmt.Sprintf("%d", 5000+i)))
 	}
 	dyn := testutil.NewFakeDyn(ciliumAuditListKinds, objs...)
-	a := &ciliumIdentityAuditor{cs: fake.NewSimpleClientset(), dyn: dyn}
-	before := testutil.QueueErrorCount(t, ciliumAuditQueue)
+	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor", cs: fake.NewSimpleClientset(), dyn: dyn}
+	before := testutil.QueueErrorCount(t, "cilium-identity-auditor")
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := testutil.QueueErrorCount(t, ciliumAuditQueue) - before; got != 1 {
+	if got := testutil.QueueErrorCount(t, "cilium-identity-auditor") - before; got != 1 {
 		t.Fatalf("expected exactly 1 IncError above threshold, got %v", got)
 	}
 	list, err := dyn.Resource(ciliumIdentityGVR).List(ctx, metav1.ListOptions{})
@@ -166,7 +166,7 @@ func TestCiliumIdentityAuditorAPIError(t *testing.T) {
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	a := &ciliumIdentityAuditor{cs: fake.NewSimpleClientset(), dyn: dyn}
+	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor", cs: fake.NewSimpleClientset(), dyn: dyn}
 	// run() only returns the error — run-level IncError is the
 	// periodic wrapper's job (proven end-to-end by shared's
 	// TestPeriodicErrorIncrementsErrorMetric), so this test asserts
@@ -184,7 +184,7 @@ func TestCiliumIdentityAuditorEndpointListError(t *testing.T) {
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	a := &ciliumIdentityAuditor{cs: fake.NewSimpleClientset(), dyn: dyn}
+	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor", cs: fake.NewSimpleClientset(), dyn: dyn}
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when the ciliumendpoint list fails")
 	}
@@ -199,7 +199,7 @@ func TestCiliumIdentityAuditorPodListError(t *testing.T) {
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	a := &ciliumIdentityAuditor{cs: cs, dyn: dyn}
+	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor", cs: cs, dyn: dyn}
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when the pod list fails")
 	}
@@ -255,13 +255,13 @@ func notReadyNode(name string) *corev1.Node {
 }
 
 // newGCAuditor builds the v2 auditor with GC armed and a pinned clock —
-// the grace/minAge gates need deterministic nowFn in tests.
+// the grace/minAge gates need deterministic now in tests.
 func newGCAuditor(cs kubernetes.Interface, dyn dynamic.Interface, now time.Time) *ciliumIdentityAuditor {
-	return &ciliumIdentityAuditor{
+	return &ciliumIdentityAuditor{queue: "cilium-identity-auditor",
 		cs:        cs,
 		dyn:       dyn,
 		gcEnabled: true,
-		nowFn:     func() time.Time { return now },
+		now:       func() time.Time { return now },
 	}
 }
 
@@ -332,7 +332,7 @@ func TestCiliumIdentityAuditorGCGracePeriod(t *testing.T) {
 
 	// Advance the clock past the grace window — the second sweep collects.
 	later := now.Add(ciliumOrphanGracePeriod + time.Minute)
-	a.nowFn = func() time.Time { return later }
+	a.now = func() time.Time { return later }
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -483,11 +483,11 @@ func TestCiliumIdentityAuditorGCConflictSkipsDelete(t *testing.T) {
 	a := newGCAuditor(cs, dyn, now)
 	a.orphanFirstSeen.Observe("5002", now.Add(-time.Hour))
 
-	before := testutil.QueueErrorCount(t, ciliumAuditQueue)
+	before := testutil.QueueErrorCount(t, "cilium-identity-auditor")
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := testutil.QueueErrorCount(t, ciliumAuditQueue) - before; got != 0 {
+	if got := testutil.QueueErrorCount(t, "cilium-identity-auditor") - before; got != 0 {
 		t.Fatalf("a raced delete must not IncError, delta %v", got)
 	}
 	if !identityExists(t, dyn, "5002") {

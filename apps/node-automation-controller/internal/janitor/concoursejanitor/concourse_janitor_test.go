@@ -166,7 +166,7 @@ func cjReplaceOnDelete(cs *fake.Clientset, events *[]string, ready bool) {
 // failure tests. dyn is an empty autopilot-aware fake — tests that
 // exercise the maintenance mutex install a real Plan themselves.
 func cjTestJanitor(cs *fake.Clientset, st nodeStatsReader, atc atcIface) *concourseWorkdirJanitor {
-	return &concourseWorkdirJanitor{
+	return &concourseWorkdirJanitor{queue: "concourse-workdir-janitor",
 		cs: cs, stats: st, atc: atc,
 		enabled:        true,
 		dyn:            cjPlanDynFake(),
@@ -198,7 +198,7 @@ func cjPod(t *testing.T, cs *fake.Clientset, name string) *corev1.Pod {
 
 // Disabled: the tick logs and returns without touching anything.
 func TestConcourseJanitorDisabled(t *testing.T) {
-	j := &concourseWorkdirJanitor{enabled: false}
+	j := &concourseWorkdirJanitor{queue: "concourse-workdir-janitor", enabled: false}
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +405,7 @@ func TestConcourseJanitorStatsErrorFailOpen(t *testing.T) {
 		}}
 	j := cjTestJanitor(cs, st,
 		&cjFakeATC{events: &events, states: map[string]string{}})
-	before := testutil.QueueErrorCount(t, cjQueue)
+	before := testutil.QueueErrorCount(t, "concourse-workdir-janitor")
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +423,7 @@ func TestConcourseJanitorStatsErrorFailOpen(t *testing.T) {
 	}
 	// stats read error + blind-wipe decision + the post-wipe re-read
 	// all meter — at least the read + the wipe must count.
-	if got := testutil.QueueErrorCount(t, cjQueue) - before; got < 2 {
+	if got := testutil.QueueErrorCount(t, "concourse-workdir-janitor") - before; got < 2 {
 		t.Fatalf("fail-open wipe under-metered: error delta = %v, want >= 2", got)
 	}
 }
@@ -735,7 +735,7 @@ func TestConcourseJanitorATCCredentials(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Namespace: cjNamespace, Name: cjSecretName},
 				Data:       tc.data,
 			})
-			j := &concourseWorkdirJanitor{cs: cs, reqTimeout: 10 * time.Second}
+			j := &concourseWorkdirJanitor{queue: "concourse-workdir-janitor", cs: cs, reqTimeout: 10 * time.Second}
 			u, p, err := j.atcCredentials(ctx)
 			if tc.wantErr {
 				if err == nil {
@@ -750,7 +750,7 @@ func TestConcourseJanitorATCCredentials(t *testing.T) {
 	}
 	// Missing secret object entirely → error → flyOK=false.
 	cs := fake.NewSimpleClientset()
-	j := &concourseWorkdirJanitor{cs: cs, reqTimeout: 10 * time.Second}
+	j := &concourseWorkdirJanitor{queue: "concourse-workdir-janitor", cs: cs, reqTimeout: 10 * time.Second}
 	if _, _, err := j.atcCredentials(ctx); err == nil {
 		t.Fatal("expected error for missing secret")
 	}

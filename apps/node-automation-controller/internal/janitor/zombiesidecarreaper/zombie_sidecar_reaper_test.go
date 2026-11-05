@@ -91,7 +91,7 @@ func (s *zsrShutdownProbe) fn(_ context.Context, podIP, _ string) error {
 }
 
 func zsrReaper(cs *fake.Clientset, probe *zsrShutdownProbe) *zombieSidecarReaper {
-	return &zombieSidecarReaper{cs: cs, nowFn: time.Now,
+	return &zombieSidecarReaper{cs: cs, now: time.Now,
 		shutdownFn: probe.fn, poked: map[string]bool{}}
 }
 
@@ -447,7 +447,7 @@ func TestZombieSidecarProxyFallbackOnDirectFailure(t *testing.T) {
 	cs := fake.NewSimpleClientset(pod)
 	probe := &zsrShutdownProbe{err: errors.New("dial tcp 10.0.0.9:4191: i/o timeout")}
 	proxyCalls := 0
-	r := &zombieSidecarReaper{cs: cs, nowFn: time.Now,
+	r := &zombieSidecarReaper{cs: cs, now: time.Now,
 		shutdownFn: probe.fn,
 		proxyFn: func(_ context.Context, p *corev1.Pod, sidecar string) error {
 			proxyCalls++
@@ -632,7 +632,7 @@ func TestZombieSidecarShutdownTargets(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(p)
 	var gotSidecar string
-	r := &zombieSidecarReaper{cs: cs, nowFn: time.Now,
+	r := &zombieSidecarReaper{cs: cs, now: time.Now,
 		shutdownFn: func(_ context.Context, _ string, sidecar string) error {
 			gotSidecar = sidecar
 			return nil

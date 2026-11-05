@@ -49,7 +49,6 @@ import (
 )
 
 const (
-	failedJobQueue  = "failed-jobs-janitor"
 	failedJobMaxAge = 24 * time.Hour
 	failedJobCap    = 50 // bound delete churn per run
 
@@ -85,8 +84,12 @@ type failedJobsJanitor struct {
 	// disables the BuildRun sweep only; every typed sweep is
 	// unaffected. main.go always wires the manager's dynamic client.
 	dyn dynamic.Interface
-	// nowFn is the clock seam — tests pin it to a fixed instant.
-	nowFn func() time.Time
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
+	// now is the clock seam — tests pin it to a fixed instant.
+	now shared.Clock
 	// stuckEmitted: the kind/ns/name triples the audit marked on the
 	// previous sweep. A resource that finished terminating (or
 	// vanished) gets its series deleted so /metrics never leaks a
@@ -101,19 +104,14 @@ func Setup(d shared.Deps) error {
 	j := &failedJobsJanitor{
 		cs:    d.CS,
 		dyn:   d.Dyn,
-		nowFn: time.Now,
+		queue: d.Name,
+		now:   shared.SystemClock,
 	}
-	return shared.AddPeriodic(d.Mgr, failedJobQueue, 60*time.Minute, j.run)
+	return shared.AddPeriodic(d.Mgr, j.queue, 60*time.Minute, j.run)
 }
 
 func (j *failedJobsJanitor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	// Lazily arm the zero-value struct — unit tests construct the
-	// module literally without the Setup path. stuckEmitted needs
-	// no such guard: the GaugeLedger zero value is ready to use.
-	if j.nowFn == nil {
-		j.nowFn = time.Now
-	}
 
 	jobs, err := shared.ListAll(ctx,
 		metav1.ListOptions{Limit: failedJobListPageSize},
@@ -145,7 +143,7 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 		if failedAt == nil {
 			continue // not failed, or no timestamp — keep
 		}
-		age := j.nowFn().Sub(failedAt.Time)
+		age := j.now.Now().Sub(failedAt.Time)
 		if age <= failedJobMaxAge {
 			continue
 		}
@@ -163,17 +161,16 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 	// Release the cluster-wide job slice before issuing Delete calls.
 	jobs = nil
 
-	background := metav1.DeletePropagationBackground
 	deleted, failed := 0, 0
 	for _, t := range targets {
-		log.Info(fmt.Sprintf("DELETE %s/%s: Failed for %dh", t.ns, t.name, t.ageHours))
+		log.Info("DELETE: Failed past retention",
+			"job", t.ns+"/"+t.name, "failedForHours", t.ageHours)
 		// UID precondition: the listed object is what we vetted — a
 		// same-named Job recreated in between must not inherit the
 		// delete.
 		if err := j.cs.BatchV1().Jobs(t.ns).Delete(ctx, t.name,
-			metav1.DeleteOptions{PropagationPolicy: &background,
-				Preconditions: &metav1.Preconditions{UID: &t.uid}}); err != nil {
-			metrics.IncError(failedJobQueue)
+			shared.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground)); err != nil {
+			metrics.IncError(j.queue)
 			log.Error(err, "job delete failed",
 				"job", t.ns+"/"+t.name, "failedForHours", t.ageHours)
 			failed++
@@ -182,7 +179,7 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 		deleted++
 	}
 	if capped {
-		log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", failedJobCap))
+		log.Info("SKIP rest: cap reached", "cap", failedJobCap)
 	}
 	log.Info("sweep done", "deleted", deleted, "failed", failed)
 
@@ -208,17 +205,19 @@ func (j *failedJobsJanitor) sweepBuildRuns(ctx context.Context) error {
 		return nil // no dynamic client wired — typed sweeps unaffected
 	}
 	log := logf.FromContext(ctx)
-	list, err := j.dyn.Resource(buildRunGVR).List(ctx, metav1.ListOptions{})
+	brs, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: failedJobListPageSize},
+		shared.DynamicPage(j.dyn.Resource(buildRunGVR)))
 	if err != nil {
 		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			return nil // Shipwright not installed — nothing to reap
 		}
 		return fmt.Errorf("list buildruns: %w", err)
 	}
-	now := j.nowFn()
+	now := j.now.Now()
 	deleted := 0
-	for i := range list.Items {
-		br := &list.Items[i]
+	for i := range brs {
+		br := &brs[i]
 		if br.GetDeletionTimestamp() != nil || !buildRunCompleted(br) {
 			continue
 		}
@@ -237,9 +236,8 @@ func (j *failedJobsJanitor) sweepBuildRuns(ctx context.Context) error {
 		uid := br.GetUID()
 		if err := j.dyn.Resource(buildRunGVR).
 			Namespace(br.GetNamespace()).Delete(ctx, br.GetName(),
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil {
-			metrics.IncError(failedJobQueue)
+			shared.UIDDeleteOptions(uid, "")); err != nil {
+			metrics.IncError(j.queue)
 			log.Error(err, "buildrun delete failed",
 				"buildrun", br.GetNamespace()+"/"+br.GetName())
 			continue
@@ -292,11 +290,13 @@ func buildRunCompleted(br *unstructured.Unstructured) bool {
 // would only make the two labels redundant.
 func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	now := j.nowFn()
+	now := j.now.Now()
 
 	// All lists land before any series is emitted — a failed later
 	// list must not leave the gauge half-populated for an hour.
-	nss, err := j.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	nss, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: failedJobListPageSize},
+		shared.Namespaces(j.cs))
 	if err != nil {
 		return fmt.Errorf("list namespaces: %w", err)
 	}
@@ -328,8 +328,8 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 			"terminatingFor", now.Sub(terminatingSince.Time).Truncate(time.Minute),
 			"finalizers", finalizers)
 	}
-	for i := range nss.Items {
-		n := &nss.Items[i]
+	for i := range nss {
+		n := &nss[i]
 		// spec.finalizers is the list the namespace controller drains
 		// (metadata.finalizers is not what wedges a Terminating ns).
 		mark("Namespace", "", n.Name, n.DeletionTimestamp, nsFinalizerNames(n))
@@ -393,12 +393,14 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 	pr, ok := cache[pvc.Namespace]
 	if !ok {
 		pr = pvcUseProbe{claims: map[string]bool{}}
-		pods, err := j.cs.CoreV1().Pods(pvc.Namespace).List(ctx, metav1.ListOptions{})
+		pods, err := shared.ListAll(ctx,
+			metav1.ListOptions{Limit: failedJobListPageSize},
+			shared.Pods(j.cs, pvc.Namespace))
 		if err != nil {
 			pr.err = err
 		} else {
-			for i := range pods.Items {
-				p := &pods.Items[i]
+			for i := range pods {
+				p := &pods[i]
 				if p.Status.Phase == corev1.PodSucceeded ||
 					p.Status.Phase == corev1.PodFailed {
 					continue
@@ -413,7 +415,7 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 		cache[pvc.Namespace] = pr
 	}
 	if pr.err != nil {
-		metrics.IncError(failedJobQueue)
+		metrics.IncError(j.queue)
 		log.Error(pr.err, "pod list failed — keeping pvc-protection finalizer (fail closed)",
 			"pvc", pvc.Namespace+"/"+pvc.Name)
 		return
@@ -423,7 +425,7 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 	}
 	log.Info("PATCH-FINALIZER: stuck PVC unreferenced by every live pod — removing pvc-protection",
 		"pvc", pvc.Namespace+"/"+pvc.Name,
-		"terminatingFor", j.nowFn().Sub(pvc.DeletionTimestamp.Time).Truncate(time.Minute))
+		"terminatingFor", j.now.Now().Sub(pvc.DeletionTimestamp.Time).Truncate(time.Minute))
 	payload, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{
 			"resourceVersion": pvc.ResourceVersion,
@@ -431,12 +433,12 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 		},
 	})
 	if err != nil {
-		metrics.IncError(failedJobQueue)
+		metrics.IncError(j.queue)
 		return
 	}
 	if _, err := j.cs.CoreV1().PersistentVolumeClaims(pvc.Namespace).Patch(ctx,
 		pvc.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
-		metrics.IncError(failedJobQueue)
+		metrics.IncError(j.queue)
 		log.Error(err, "pvc-protection finalizer strip failed",
 			"pvc", pvc.Namespace+"/"+pvc.Name)
 	}

@@ -55,7 +55,6 @@ import (
 )
 
 const (
-	apiServiceGuardQueue     = "apiservice-guard"
 	apiServiceGuardInterval  = 5 * time.Minute
 	apiServiceUnavailMinAge  = 10 * time.Minute
 	apiServiceAvailableCond  = "Available"
@@ -71,6 +70,11 @@ const (
 	apiServiceUnblockMinAge   = 15 * time.Minute
 	apiServiceUnblockPodCap   = 10
 	apiServiceUnblockCooldown = 15 * time.Minute
+
+	// apiServiceListPageSize bounds each List page — continue-token
+	// pagination keeps a large APIService/event set from arriving as
+	// one giant response body.
+	apiServiceListPageSize = 500
 )
 
 // apiServiceProtectedNamespaces is the plan's skipNamespaces set —
@@ -92,9 +96,13 @@ var apiServiceGVR = shared.GVRAPIService
 type apiServiceGuard struct {
 	cs  kubernetes.Interface
 	dyn dynamic.Interface
-	// nowFn is the clock seam — tests pin it so the >10m
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
+	// now is the clock seam — tests pin it so the >10m
 	// unavailable window is deterministic. nil → time.Now.
-	nowFn shared.Clock
+	now shared.Clock
 	// emitted is the ledger of APIServiceUnavailable label tuples
 	// ("name/service_namespace/service_name") held at =1 — a tuple
 	// not re-seen this sweep gets its series deleted via
@@ -116,25 +124,25 @@ func Setup(d shared.Deps) error {
 	if d.Disabled {
 		return nil
 	}
-	g := &apiServiceGuard{cs: cs, dyn: dyn, nowFn: time.Now}
-	return shared.AddPeriodic(mgr, apiServiceGuardQueue, apiServiceGuardInterval, g.run)
+	g := &apiServiceGuard{cs: cs, dyn: dyn, queue: d.Name, now: shared.SystemClock}
+	return shared.AddPeriodic(mgr, g.queue, apiServiceGuardInterval, g.run)
 }
 
 func (g *apiServiceGuard) run(ctx context.Context) error {
-	// Lazily arm the zero-value struct — unit tests construct the
-	// guard literally without the Setup path. The bookkeeping
-	// ledgers need no such guard: shared.GaugeLedger/CooldownSet
-	// zero values are ready to use.
-	if g.nowFn == nil {
-		g.nowFn = time.Now
-	}
+	// No lazy arming: a nil Clock reads as system time and the
+	// GaugeLedger/CooldownSet bookkeeping zero values are ready to
+	// use, so unit tests can construct the guard literally without
+	// the Setup path.
 	// The orphan sweep and the availability watchdog are
 	// independent duties — a failure in one must never blind the
 	// other, so both run and their errors join (nil+nil → nil). Both
 	// read the same APIService set, so it is listed ONCE per run and
 	// shared; a list failure is handed to each duty separately
 	// (either may still act on the parts it does not need).
-	svcs, svcsErr := g.dyn.Resource(apiServiceGVR).List(ctx, metav1.ListOptions{})
+	svcItems, svcsErr := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: apiServiceListPageSize},
+		shared.DynamicPage(g.dyn.Resource(apiServiceGVR)))
+	svcs := &unstructured.UnstructuredList{Items: svcItems}
 	orphanErr := g.sweepOrphans(ctx, svcs, svcsErr)
 	watchErr := g.sweepAvailability(ctx, svcs, svcsErr)
 	unblockErr := g.sweepUnblock(ctx, svcs, svcsErr)
@@ -157,19 +165,21 @@ func (g *apiServiceGuard) sweepOrphans(ctx context.Context, svcs *unstructured.U
 	// apiserver/RBAC lied (every APIService would look orphaned), so
 	// the pass skips itself without failing the run — the
 	// availability watchdog still evaluates.
-	nsList, err := g.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	nss, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: apiServiceListPageSize},
+		shared.Namespaces(g.cs))
 	if err != nil {
 		return fmt.Errorf("list namespaces (API flap) — abort orphan pass: %w", err)
 	}
-	if len(nsList.Items) == 0 {
+	if len(nss) == 0 {
 		log.Info("WARN: empty namespace list (API flap) — orphan pass skipped")
 		return nil
 	}
-	namespaces := make(map[string]bool, len(nsList.Items))
-	for _, ns := range nsList.Items {
+	namespaces := make(map[string]bool, len(nss))
+	for _, ns := range nss {
 		namespaces[ns.Name] = true
 	}
-	nsList = nil
+	nss = nil
 
 	if svcsErr != nil {
 		return fmt.Errorf("list apiservices — abort orphan pass: %w", svcsErr)
@@ -194,7 +204,7 @@ func (g *apiServiceGuard) sweepOrphans(ctx context.Context, svcs *unstructured.U
 		case getErr != nil:
 			log.Info("WARN: namespace confirm failed — APIService kept (fail closed)",
 				"apiservice", svc.GetName(), "namespace", svcNs, "error", getErr)
-			metrics.IncError(apiServiceGuardQueue)
+			metrics.IncError(g.queue)
 			continue
 		default:
 			// Namespace actually exists — the snapshot was stale.
@@ -207,12 +217,10 @@ func (g *apiServiceGuard) sweepOrphans(ctx context.Context, svcs *unstructured.U
 		// APIService recreated in between is not ours to reap.
 		uid := svc.GetUID()
 		if err := g.dyn.Resource(apiServiceGVR).
-			Delete(ctx, svc.GetName(), metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
+			Delete(ctx, svc.GetName(), shared.UIDDeleteOptions(uid, "")); err != nil {
 			log.Error(err, "orphan apiservice delete failed",
 				"apiservice", svc.GetName())
-			metrics.IncError(apiServiceGuardQueue)
+			metrics.IncError(g.queue)
 			continue
 		}
 		deleted++
@@ -234,7 +242,7 @@ func (g *apiServiceGuard) sweepAvailability(ctx context.Context, svcs *unstructu
 		return fmt.Errorf("list apiservices — watchdog skipped: %w", svcsErr)
 	}
 
-	now := g.nowFn()
+	now := g.now.Now()
 	for i := range svcs.Items {
 		svc := &svcs.Items[i]
 		unavailSince, ok := apiServiceUnavailableSince(svc)
@@ -305,7 +313,7 @@ func (g *apiServiceGuard) sweepUnblock(ctx context.Context, svcs *unstructured.U
 	if svcsErr != nil {
 		return fmt.Errorf("list apiservices — unblock pass skipped: %w", svcsErr)
 	}
-	now := g.nowFn()
+	now := g.now.Now()
 
 	// Candidate pass — cheap unstructured reads only; the namespace
 	// scan below is skipped entirely when nothing qualifies.
@@ -364,7 +372,7 @@ func (g *apiServiceGuard) sweepUnblock(ctx context.Context, svcs *unstructured.U
 		if err != nil {
 			log.Error(err, "unblock heal failed",
 				"apiservice", c.svc.GetName(), "service", svcNs+"/"+svcName)
-			metrics.IncError(apiServiceGuardQueue)
+			metrics.IncError(g.queue)
 			continue
 		}
 		g.unblocked.Stamp(c.svc.GetName(), now)
@@ -388,13 +396,15 @@ func (g *apiServiceGuard) sweepUnblock(ctx context.Context, svcs *unstructured.U
 // is skipped (fail closed).
 func (g *apiServiceGuard) stuckTerminatingNamespaces(ctx context.Context, now time.Time) (map[string]string, error) {
 	log := logf.FromContext(ctx)
-	nsList, err := g.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	nss, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: apiServiceListPageSize},
+		shared.Namespaces(g.cs))
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces (unblock pass): %w", err)
 	}
 	out := map[string]string{}
-	for i := range nsList.Items {
-		ns := &nsList.Items[i]
+	for i := range nss {
+		ns := &nss[i]
 		if ns.Status.Phase != corev1.NamespaceTerminating ||
 			ns.DeletionTimestamp == nil ||
 			now.Sub(ns.DeletionTimestamp.Time) < apiServiceUnblockMinAge {
@@ -409,7 +419,9 @@ func (g *apiServiceGuard) stuckTerminatingNamespaces(ctx context.Context, now ti
 			corpus.WriteString(strings.ToLower(c.Message))
 			corpus.WriteByte('\n')
 		}
-		evs, err := g.cs.CoreV1().Events(ns.Name).List(ctx, metav1.ListOptions{})
+		evs, err := shared.ListAll(ctx,
+			metav1.ListOptions{Limit: apiServiceListPageSize},
+			shared.Events(g.cs, ns.Name))
 		if err != nil {
 			// Conditions-only corpus still carries
 			// NamespaceContentRemaining/DiscoveryFailed detail —
@@ -417,8 +429,8 @@ func (g *apiServiceGuard) stuckTerminatingNamespaces(ctx context.Context, now ti
 			log.Info("WARN: events list failed — conditions-only corpus",
 				"namespace", ns.Name, "error", err)
 		} else {
-			for j := range evs.Items {
-				e := &evs.Items[j]
+			for j := range evs {
+				e := &evs[j]
 				corpus.WriteString(strings.ToLower(e.Reason))
 				corpus.WriteByte(' ')
 				corpus.WriteString(strings.ToLower(e.Message))
@@ -463,26 +475,25 @@ func (g *apiServiceGuard) restartBackingPods(ctx context.Context, svcNs, svcName
 			"service", svcNs+"/"+svcName)
 		return 0, nil
 	}
-	pods, err := g.cs.CoreV1().Pods(svcNs).List(ctx, metav1.ListOptions{
+	pods, err := shared.ListAll(ctx, metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
-	})
+		Limit:         apiServiceListPageSize,
+	}, shared.Pods(g.cs, svcNs))
 	if err != nil {
 		return 0, fmt.Errorf("list backing pods %s: %w", svcNs, err)
 	}
 	deleted := 0
-	for i := range pods.Items {
+	for i := range pods {
 		if deleted >= apiServiceUnblockPodCap {
 			break
 		}
-		p := &pods.Items[i]
+		p := &pods[i]
 		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		uid := p.UID
 		if err := g.cs.CoreV1().Pods(svcNs).Delete(ctx, p.Name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
+			shared.UIDDeleteOptions(uid, "")); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}

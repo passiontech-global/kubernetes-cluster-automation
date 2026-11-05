@@ -52,8 +52,6 @@ import (
 )
 
 const (
-	pdbDeadlockQueue = "pdb-deadlock-watchdog"
-
 	// reason label values for metrics.PDBDrainBlocked — keep in sync
 	// with the metric's Help text and the alert rules consuming it.
 	pdbReasonImpossiblePolicy = "impossible_policy"
@@ -78,9 +76,12 @@ type pdbDeadlockWatchdog struct {
 	// entry, restarting the window; any cycle where the PDB vanishes
 	// prunes all of its entries (and their gauge series).
 	firstSeen shared.FirstSeenLedger
-	// nowFn is the wall-clock seam so tests can age sightings without
+	// now is the wall-clock seam so tests can age sightings without
 	// sleeping 30 minutes.
-	nowFn func() time.Time
+	now shared.Clock
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name comes from one place.
+	queue string
 }
 
 // Setup registers the 5-minute sweep when the
@@ -94,9 +95,10 @@ func Setup(d shared.Deps) error {
 	}
 	w := &pdbDeadlockWatchdog{
 		cs:    d.CS,
-		nowFn: time.Now,
+		now:   shared.SystemClock,
+		queue: d.Name,
 	}
-	return shared.AddPeriodic(d.Mgr, pdbDeadlockQueue, 5*time.Minute, w.run)
+	return shared.AddPeriodic(d.Mgr, w.queue, 5*time.Minute, w.run)
 }
 
 func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
@@ -109,7 +111,7 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	// NodeActivelyCordoned — a statically-cordoned node past the
 	// cordon-active window is deliberate state, not a drain in
 	// flight, and must not pin cordoned_node_blocked forever.
-	now := w.nowFn()
+	now := w.now.Now()
 	nodes, err := shared.ListNodes(ctx, w.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
@@ -123,8 +125,9 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	}
 	nodes = nil
 
-	pdbs, err := w.cs.PolicyV1().PodDisruptionBudgets(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pdbs, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: 500},
+		shared.PodDisruptionBudgets(w.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list poddisruptionbudgets: %w", err)
 	}
@@ -133,8 +136,8 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	// firstSeen as either resolved or gone.
 	seen := make(map[string]struct{})
 	flagged := 0
-	for i := range pdbs.Items {
-		p := &pdbs.Items[i]
+	for i := range pdbs {
+		p := &pdbs[i]
 		// The shared base condition for every reason: the PDB is
 		// actually blocking drains right now. expectedPods == 0 means
 		// it protects nothing (selector drifted off every pod — status

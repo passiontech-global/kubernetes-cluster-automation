@@ -144,7 +144,7 @@ key-without-equals-sign-and-no-nodes
 			map[string]string{"passiontech.dev/already": "set"}),
 		testutil.Node("w2", corev1.ConditionTrue, nil),
 	)
-	r := &nodeLabeler{cs: cs, configPath: cfg}
+	r := &nodeLabeler{cs: cs, queue: "node-labeler", configPath: cfg}
 	before := testutil.QueueErrorCount(t, "node-labeler")
 	res, err := r.Reconcile(ctx, reconcile.Request{})
 	if err != nil {

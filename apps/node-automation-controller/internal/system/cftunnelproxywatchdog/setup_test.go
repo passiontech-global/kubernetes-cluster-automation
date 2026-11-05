@@ -18,7 +18,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	t.Setenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "cloudflare-tunnel-system")
 	t.Setenv("CF_TUNNEL_WATCHDOG_INTERVAL", "5m")
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "cf-tunnel-proxy-watchdog", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 // stamped.
 func TestSetupDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "cf-tunnel-proxy-watchdog", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}

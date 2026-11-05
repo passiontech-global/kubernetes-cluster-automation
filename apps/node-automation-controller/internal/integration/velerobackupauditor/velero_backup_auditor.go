@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -45,7 +46,6 @@ import (
 )
 
 const (
-	veleroAuditQueue    = "velero-backup-auditor"
 	veleroAuditInterval = 15 * time.Minute
 	veleroPausedMinAge  = 24 * time.Hour // paused schedule must be this old to alert
 	// veleroScheduleLabel links a Backup to the Schedule that made it
@@ -82,6 +82,25 @@ var veleroStuckPhases = map[string]string{
 }
 
 const veleroStuckMaxAge = 6 * time.Hour
+
+// veleroListPageSize bounds each List page — Backup/PVB objects are
+// cluster-wide and accumulate unboundedly on busy schedules.
+const veleroListPageSize = 500
+
+// veleroList pages a full dynamic List through veleroListPageSize —
+// same contract as a raw .List but bounded per response (Velero and
+// Everest CRDs are cluster-scoped here, so every audit read is
+// cluster-wide).
+func (a *veleroBackupAuditor) veleroList(ctx context.Context,
+	gvr schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
+	items, err := shared.ListAll(ctx,
+		metav1.ListOptions{Limit: veleroListPageSize},
+		shared.DynamicPage(a.dyn.Resource(gvr)))
+	if err != nil {
+		return nil, err
+	}
+	return &unstructured.UnstructuredList{Items: items}, nil
+}
 
 // veleroMissingBackupMaxAge is the W10-FIX6 zero-backup threshold:
 // a Schedule (or backup-enabled DatabaseCluster) older than 36h
@@ -129,9 +148,13 @@ func pausedLedgerKey(uid, namespace, schedule string) string {
 }
 
 type veleroBackupAuditor struct {
-	cs         kubernetes.Interface // reserved for future typed reads
-	dyn        dynamic.Interface
-	nowFn      shared.Clock // clock seam — same pattern as certDriftAuditor
+	cs  kubernetes.Interface // reserved for future typed reads
+	dyn dynamic.Interface
+	now shared.Clock // clock seam — same pattern as certDriftAuditor
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue      string
 	seenPaused shared.GaugeLedger[pausedKey]
 	seenBad    shared.GaugeLedger[backupKey]
 	// seenBSL: series ledger for VeleroBSLUnavailable — an
@@ -171,18 +194,14 @@ func Setup(d shared.Deps) error {
 	a := &veleroBackupAuditor{
 		cs:    cs,
 		dyn:   dyn,
-		nowFn: time.Now,
+		now:   shared.SystemClock,
+		queue: d.Name,
 	}
-	return shared.AddPeriodic(mgr, veleroAuditQueue, veleroAuditInterval, a.run)
+	return shared.AddPeriodic(mgr, a.queue, veleroAuditInterval, a.run)
 }
 
 func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	// Lazily arm the zero-value struct — unit tests construct the
-	// auditor literally without the Setup path.
-	if a.nowFn == nil {
-		a.nowFn = time.Now
-	}
 
 	// W9-ST3 — the Everest DB-backup audit is independent of Velero:
 	// a cluster can run the Percona operator with no Velero at all,
@@ -190,7 +209,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// return below. Its error joins the run's, never masks it.
 	everestErr := a.auditEverestBackups(ctx)
 
-	schedules, err := a.dyn.Resource(veleroScheduleGVR).List(ctx, metav1.ListOptions{})
+	schedules, err := a.veleroList(ctx, veleroScheduleGVR)
 	if err != nil {
 		// Clusters without Velero have no CRDs — quiet skip, same
 		// contract as externalsecret-nudge.
@@ -201,7 +220,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		return errors.Join(everestErr,
 			fmt.Errorf("list velero schedules: %w", err))
 	}
-	backups, err := a.dyn.Resource(veleroBackupGVR).List(ctx, metav1.ListOptions{})
+	backups, err := a.veleroList(ctx, veleroBackupGVR)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			backups = nil // schedules exist but backups CRD absent — check 1 still runs
@@ -226,11 +245,11 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		if isPaused {
 			lk := pausedLedgerKey(string(s.GetUID()), ns, name)
 			pausedNow[lk] = true
-			first, _ := a.firstSeenPaused.Observe(lk, a.nowFn())
+			first, _ := a.firstSeenPaused.Observe(lk, a.now.Now())
 			k := pausedKey{ns, name}
 			a.seenPaused.Emit(k, ns, name)
 			v := 0.0
-			if pausedFor := a.nowFn().Sub(first); pausedFor > veleroPausedMinAge {
+			if pausedFor := a.now.Now().Sub(first); pausedFor > veleroPausedMinAge {
 				v = 1
 				log.Info("velero schedule paused >24h — backups silently stopped",
 					"schedule", ns+"/"+name, "pausedFor", pausedFor.Truncate(time.Hour))
@@ -267,7 +286,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// W8-ST1 — BackupStorageLocation availability: a BSL not
 	// phase=Available means backups run to an unreachable bucket and
 	// the next restore has nothing to read.
-	bsls, err := a.dyn.Resource(veleroBSLGVR).List(ctx, metav1.ListOptions{})
+	bsls, err := a.veleroList(ctx, veleroBSLGVR)
 	switch {
 	case apierrors.IsNotFound(err):
 		// CRD absent — nothing to audit.
@@ -341,7 +360,7 @@ func (a *veleroBackupAuditor) flagMissingBackups(ctx context.Context,
 	if created.IsZero() {
 		return
 	}
-	age := a.nowFn().Sub(created.Time)
+	age := a.now.Now().Sub(created.Time)
 	if age <= veleroMissingBackupMaxAge {
 		return
 	}
@@ -376,7 +395,7 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 					since = t
 				}
 			}
-			flag = a.nowFn().Sub(since) > veleroStuckMaxAge
+			flag = a.now.Now().Sub(since) > veleroStuckMaxAge
 		}
 		if flag {
 			a.seenBad.Emit(backupKey{ns, schedule, reason}, ns, schedule, reason)
@@ -446,7 +465,7 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	clusters, err := a.dyn.Resource(everestDBClusterGVR).List(ctx, metav1.ListOptions{})
+	clusters, err := a.veleroList(ctx, everestDBClusterGVR)
 	switch {
 	case err == nil:
 		// proceed below
@@ -460,7 +479,7 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 
 	var backups *unstructured.UnstructuredList
 	if clusters != nil {
-		backups, err = a.dyn.Resource(everestDBBackupGVR).List(ctx, metav1.ListOptions{})
+		backups, err = a.veleroList(ctx, everestDBBackupGVR)
 		switch {
 		case err == nil:
 			// proceed
@@ -486,7 +505,7 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 		}
 	}
 
-	now := a.nowFn()
+	now := a.now.Now()
 	for i := range clusters.Items {
 		dc := &clusters.Items[i]
 		ns, name := dc.GetNamespace(), dc.GetName()
@@ -599,7 +618,7 @@ func everestBackupReasons(backups []*unstructured.Unstructured,
 func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 	backups *unstructured.UnstructuredList) error {
 	log := logf.FromContext(ctx)
-	now := a.nowFn()
+	now := a.now.Now()
 
 	// --- Backups: mark-only gauge over the already-listed set ---
 	if backups != nil {
@@ -623,7 +642,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 	a.seenStuckBackup.Prune(metrics.VeleroBackupStuck.DeleteLabelValues)
 
 	// --- PodVolumeBackups: mark + conditional cleanup ---
-	pvbs, err := a.dyn.Resource(veleroPVBGVR).List(ctx, metav1.ListOptions{})
+	pvbs, err := a.veleroList(ctx, veleroPVBGVR)
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// CRD absent — clear any stale wedge series and stop.
@@ -691,7 +710,7 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 	if err != nil {
 		log.Error(err, "pvb agent pod lookup failed — cleanup skipped",
 			"pvb", pvb.GetNamespace()+"/"+pvb.GetName())
-		metrics.IncError(veleroAuditQueue)
+		metrics.IncError(a.queue)
 		return false
 	}
 	if !pvbAgentWedged(pvbStart, agent) {
@@ -700,11 +719,9 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 	ns, name := pvb.GetNamespace(), pvb.GetName()
 	uid := pvb.GetUID()
 	if err := a.dyn.Resource(veleroPVBGVR).Namespace(ns).Delete(ctx, name,
-		metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid},
-		}); err != nil && !apierrors.IsNotFound(err) {
+		shared.UIDDeleteOptions(uid, "")); err != nil && !apierrors.IsNotFound(err) {
 		log.Error(err, "wedged pvb delete failed", "pvb", ns+"/"+name)
-		metrics.IncError(veleroAuditQueue)
+		metrics.IncError(a.queue)
 		return false
 	}
 	metrics.VeleroWedgedObjectsCleanedTotal.
@@ -718,12 +735,10 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 	if agent != nil {
 		agentUID := agent.UID
 		if err := a.cs.CoreV1().Pods(agent.Namespace).Delete(ctx, agent.Name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &agentUID},
-			}); err != nil && !apierrors.IsNotFound(err) {
+			shared.UIDDeleteOptions(agentUID, "")); err != nil && !apierrors.IsNotFound(err) {
 			log.Error(err, "node-agent bounce failed",
 				"pod", agent.Namespace+"/"+agent.Name)
-			metrics.IncError(veleroAuditQueue)
+			metrics.IncError(a.queue)
 		} else {
 			metrics.VeleroWedgedObjectsCleanedTotal.
 				WithLabelValues(ns, "pod_restarted").Inc()
@@ -752,22 +767,23 @@ func (a *veleroBackupAuditor) pvbAgentPod(ctx context.Context,
 	if node == "" {
 		return nil, nil
 	}
-	pods, err := a.cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
+	pods, err := shared.ListAll(ctx, metav1.ListOptions{
 		FieldSelector: "spec.nodeName=" + node,
-	})
+		Limit:         veleroListPageSize,
+	}, shared.Pods(a.cs, ns))
 	if err != nil {
 		return nil, err
 	}
 	// Prefer an actual node-agent pod; the DaemonSet names them
 	// "node-agent-*". Fall back to the first pod on the node —
 	// velero's namespace is otherwise quiet.
-	for i := range pods.Items {
-		if strings.Contains(pods.Items[i].Name, "node-agent") {
-			return &pods.Items[i], nil
+	for i := range pods {
+		if strings.Contains(pods[i].Name, "node-agent") {
+			return &pods[i], nil
 		}
 	}
-	if len(pods.Items) > 0 {
-		return &pods.Items[0], nil
+	if len(pods) > 0 {
+		return &pods[0], nil
 	}
 	return nil, nil
 }

@@ -470,7 +470,7 @@ func TestWebhookGuardPatchFailureReturnsError(t *testing.T) {
 // fixtures have no TLS server to dial anyway.
 func wgBreakerGuard(cs *fake.Clientset, now *time.Time) *webhookGuard {
 	return &webhookGuard{cs: cs,
-		nowFn:          func() time.Time { return *now },
+		now:            func() time.Time { return *now },
 		circuitBreaker: circuitBreaker{},
 		endpointProber: func(context.Context, string, int32) bool {
 			return true
@@ -1443,7 +1443,7 @@ func TestWebhookCircuitBreakerUnresponsiveTripsAndBounces(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	// endpointProber=false — every handshake fails: the pods are hung.
 	g := &webhookGuard{cs: cs,
-		nowFn:          func() time.Time { return now },
+		now:            func() time.Time { return now },
 		circuitBreaker: circuitBreaker{},
 		endpointProber: func(context.Context, string, int32) bool {
 			return false
@@ -1519,7 +1519,7 @@ func TestWebhookCircuitBreakerResponsiveSkipsBounce(t *testing.T) {
 		mwc)
 	now := time.Unix(1_700_000_000, 0)
 	g := &webhookGuard{cs: cs,
-		nowFn:          func() time.Time { return now },
+		now:            func() time.Time { return now },
 		circuitBreaker: circuitBreaker{},
 		endpointProber: func(context.Context, string, int32) bool {
 			return true // at least one endpoint answers

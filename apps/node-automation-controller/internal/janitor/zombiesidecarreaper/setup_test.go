@@ -19,7 +19,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	// Zero-value Deps.Disabled = gate-on — ZOMBIE_SIDECAR_REAPER_ENABLED
 	// is resolved by setupModules, not re-read here.
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{
+	if err := Setup(shared.Deps{Name: "zombie-sidecar-reaper",
 		Mgr: m,
 		CS:  fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(),
@@ -33,7 +33,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 // same contract as volumeattachment-cleaner.
 func TestSetupDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{
+	if err := Setup(shared.Deps{Name: "zombie-sidecar-reaper",
 		Mgr:      m,
 		CS:       fake.NewSimpleClientset(),
 		Dyn:      testutil.StubDyn(),

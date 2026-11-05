@@ -47,7 +47,6 @@ import (
 )
 
 const (
-	cfTunnelWatchdogQueue     = "cf-tunnel-proxy-watchdog"
 	cfTunnelProxyDeployName   = "cloudflare-tunnel-gateway-controller-proxy"
 	cfTunnelProxyPodSelector  = "app.kubernetes.io/component=proxy,app.kubernetes.io/instance=cloudflare-tunnel-gateway-controller"
 	cfTunnelProxySliceService = "cloudflare-tunnel-gateway-controller-proxy-headless"
@@ -83,13 +82,17 @@ type cfTunnelConnectorTarget struct {
 }
 
 type cfTunnelProxyWatchdog struct {
-	cs        kubernetes.Interface
+	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and the registration log
+	// come from one place.
+	queue     string
 	namespace string
 	// lastHeal is "<ns>/<name>" -> last delete time; bounds restart
 	// churn on a pod that wedges again immediately after recreation.
 	lastHeal shared.CooldownSet
-	// nowFn is a test seam for cooldown/age checks.
-	nowFn func() time.Time
+	// now is a test seam for cooldown/age checks.
+	now shared.Clock
 }
 
 // Setup registers the periodic sweep — only on
@@ -105,10 +108,10 @@ func Setup(d shared.Deps) error {
 	if d.Disabled {
 		return nil
 	}
-	logf.Log.WithName(cfTunnelWatchdogQueue).Info("registered",
+	logf.Log.WithName(d.Name).Info("registered",
 		"namespace", namespace, "interval", interval)
-	w := &cfTunnelProxyWatchdog{cs: d.CS, namespace: namespace}
-	return shared.AddPeriodic(d.Mgr, cfTunnelWatchdogQueue, interval, w.run)
+	w := &cfTunnelProxyWatchdog{cs: d.CS, queue: d.Name, namespace: namespace}
+	return shared.AddPeriodic(d.Mgr, w.queue, interval, w.run)
 }
 
 func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {
@@ -253,10 +256,7 @@ func (w *cfTunnelProxyWatchdog) connectorTargets() []cfTunnelConnectorTarget {
 // it instead of skipping forever. Returns pods deleted.
 func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int, error) {
 	log := logf.FromContext(ctx)
-	if w.nowFn == nil {
-		w.nowFn = time.Now
-	}
-	now := w.nowFn()
+	now := w.now.Now()
 	healed := 0
 	for _, tgt := range w.connectorTargets() {
 		n, err := w.healConnectorTarget(ctx, tgt, now)
@@ -372,9 +372,7 @@ func (w *cfTunnelProxyWatchdog) deleteConnectorPod(ctx context.Context,
 	metrics.CFTunnelWedgePodsDeletedTotal.WithLabelValues(
 		p.Namespace, reason).Inc()
 	err := w.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
-		metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &p.UID},
-		})
+		shared.UIDDeleteOptions(p.UID, ""))
 	if apierrors.IsNotFound(err) {
 		return nil
 	}

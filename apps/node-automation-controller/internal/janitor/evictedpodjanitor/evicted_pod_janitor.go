@@ -30,7 +30,6 @@ import (
 )
 
 const (
-	evictedPodQueue  = "evicted-pod-janitor"
 	evictedPodMaxAge = time.Hour
 	evictedPodCap    = 10 // bound delete churn per run
 	// evictedPodListPageSize bounds each Failed-pod List page —
@@ -59,12 +58,16 @@ var evictedPodReasons = map[string]struct{}{
 
 type evictedPodJanitor struct {
 	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
 }
 
 // Setup registers the 10-minute sweep.
 func Setup(d shared.Deps) error {
-	j := &evictedPodJanitor{cs: d.CS}
-	return shared.AddPeriodic(d.Mgr, evictedPodQueue, 10*time.Minute, j.run)
+	j := &evictedPodJanitor{cs: d.CS, queue: d.Name}
+	return shared.AddPeriodic(d.Mgr, j.queue, 10*time.Minute, j.run)
 }
 
 func (j *evictedPodJanitor) run(ctx context.Context) error {
@@ -80,7 +83,7 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 		Limit:         evictedPodListPageSize,
 	}, shared.Pods(j.cs, metav1.NamespaceAll))
 	if err != nil {
-		return fmt.Errorf("list failed pods: %w", err) // periodic wrapper IncErrors evictedPodQueue
+		return fmt.Errorf("list failed pods: %w", err) // periodic wrapper IncErrors j.queue
 	}
 
 	type target struct {
@@ -125,17 +128,16 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 	// Release the pod slice before issuing Delete calls.
 	pods = nil
 
-	background := metav1.DeletePropagationBackground
 	deleted, failed := 0, 0
 	for _, t := range targets {
-		log.Info(fmt.Sprintf("DELETE %s/%s on %s: reason=%s age=%dh",
-			t.ns, t.name, t.node, t.reason, t.ageHours))
+		log.Info("DELETE: evicted pod past retention",
+			"pod", t.ns+"/"+t.name, "node", t.node,
+			"reason", t.reason, "ageHours", t.ageHours)
 		// UID precondition: the listed object is what we vetted — a
 		// same-named pod recreated in between is not ours to reap.
 		if err := j.cs.CoreV1().Pods(t.ns).Delete(ctx, t.name,
-			metav1.DeleteOptions{PropagationPolicy: &background,
-				Preconditions: &metav1.Preconditions{UID: &t.uid}}); err != nil {
-			metrics.IncError(evictedPodQueue)
+			shared.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground)); err != nil {
+			metrics.IncError(j.queue)
 			log.Error(err, "pod delete failed",
 				"pod", t.ns+"/"+t.name, "node", t.node, "reason", t.reason)
 			failed++
@@ -144,7 +146,7 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 		deleted++
 	}
 	if capped {
-		log.Info(fmt.Sprintf("SKIP rest: cap=%d reached", evictedPodCap))
+		log.Info("SKIP rest: cap reached", "cap", evictedPodCap)
 	}
 	log.Info("sweep done", "deleted", deleted, "failed", failed)
 	return nil

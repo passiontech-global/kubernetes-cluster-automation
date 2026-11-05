@@ -19,7 +19,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	// Zero-value Deps.Disabled = gate-on — CERT_DRIFT_AUDITOR_ENABLED
 	// is resolved by setupModules, not re-read here.
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "cert-drift-auditor", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 // no Periodic, no tick.
 func TestSetupDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "cert-drift-auditor", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}

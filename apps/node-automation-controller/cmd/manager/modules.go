@@ -188,6 +188,7 @@ func setupModules(deps shared.Deps, mods []shared.Module) error {
 	}
 	for _, m := range mods {
 		d := deps
+		d.Name = m.Name
 		if m.GateEnv != "" && !shared.Gate(m.GateEnv, m.DefaultOn) {
 			d.Disabled = true
 			d.Log.WithName(m.Name).Info("disabled — module not registered", "gate", m.GateEnv)

@@ -100,10 +100,9 @@ import (
 )
 
 const (
-	endpointGuardQueue = "apiserver-endpoint-guard"
-	endpointGuardNS    = "default"
-	endpointGuardName  = "kubernetes"
-	endpointGuardPort  = "6443"
+	endpointGuardNS   = "default"
+	endpointGuardName = "kubernetes"
+	endpointGuardPort = "6443"
 	// endpointGuardAnno records the comma-separated IPs the guard pulled
 	// out of default/kubernetes — the wedge evidence survives pod
 	// restarts and is human-readable in `kubectl describe ep kubernetes`.
@@ -146,6 +145,10 @@ const (
 
 type apiServerEndpointGuard struct {
 	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the named logger and every IncError label
+	// come from one place.
+	queue string
 	// Probe seam — same convention as kubeletReaper.probeFn /
 	// deadNodeSweeper.probeFn: probing a backend's own :6443 is a raw
 	// HTTPS call the fake clientset cannot serve, so tests stub the
@@ -187,9 +190,9 @@ type apiServerEndpointGuard struct {
 // Setup registers the 30s wedge sweep.
 func Setup(d shared.Deps) error {
 	mgr, cs := d.Mgr, d.CS
-	g := &apiServerEndpointGuard{cs: cs, backends: map[string]*backendProbeState{}}
+	g := &apiServerEndpointGuard{cs: cs, queue: d.Name, backends: map[string]*backendProbeState{}}
 	g.probeFn = g.probe
-	g.log = mgr.GetLogger().WithName(endpointGuardQueue)
+	g.log = mgr.GetLogger().WithName(g.queue)
 	// Dedicated clientset filtering the "v1 Endpoints is deprecated"
 	// 299 warning: on hosted planes the guard writes the deprecated
 	// object deliberately every sweep (it is the SSOT behind the
@@ -272,7 +275,7 @@ func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
 	// rather than silently discarding.
 	log := g.log
 	if log.GetSink() == nil {
-		log = logf.FromContext(ctx).WithName(endpointGuardQueue)
+		log = logf.FromContext(ctx).WithName(g.queue)
 	}
 	ctx = logf.IntoContext(ctx, log)
 	interval := endpointGuardInterval
@@ -290,7 +293,7 @@ func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
 		err := g.run(runCtx)
 		cancel()
 		if err != nil {
-			metrics.IncError(endpointGuardQueue)
+			metrics.IncError(g.queue)
 			log.Error(err, "sweep failed")
 		}
 		if g.quarantineActive {
@@ -641,7 +644,7 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 				// Logged/metered, not returned: Endpoints already
 				// persisted the decision and the next cycle re-applies
 				// the slice diff.
-				metrics.IncError(endpointGuardQueue)
+				metrics.IncError(g.queue)
 				log.Error(err, "EndpointSlice update failed — retries next cycle",
 					"slice", s.Name)
 			}

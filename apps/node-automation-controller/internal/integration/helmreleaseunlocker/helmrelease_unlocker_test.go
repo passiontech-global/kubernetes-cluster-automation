@@ -104,7 +104,7 @@ func hrAnnotation(t *testing.T, dyn *fake.FakeDynamicClient, gvr schema.GroupVer
 }
 
 func newUnlocker(cs *kfake.Clientset, dyn *fake.FakeDynamicClient, stuckFor time.Duration, key string) *helmReleaseUnlocker {
-	u := &helmReleaseUnlocker{
+	u := &helmReleaseUnlocker{queue: "helmrelease-unlocker",
 		cs:       cs,
 		dyn:      dyn,
 		unlocked: map[string]time.Time{},
@@ -194,7 +194,7 @@ func TestHelmReleaseUnlockerCooldownAlert(t *testing.T) {
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
 	u.unlocked["apps/myapp"] = time.Now().Add(-time.Hour) // unlocked 1h ago
 
-	before := testutil.ReconcileErrorCount(t, helmUnlockQueue)
+	before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestHelmReleaseUnlockerCooldownAlert(t *testing.T) {
 	if got := hrAnnotation(t, dyn, helmReleaseGVRs[0], "apps", "myapp", fluxReconcileAnno); got != "" {
 		t.Fatal("HR annotated inside the 24h cooldown")
 	}
-	if got := testutil.ReconcileErrorCount(t, helmUnlockQueue); got != before+1 {
+	if got := testutil.ReconcileErrorCount(t, "helmrelease-unlocker"); got != before+1 {
 		t.Fatalf("cooldown alert did not IncError: got %v, want %v", got, before+1)
 	}
 }
@@ -483,11 +483,11 @@ func TestHelmReleaseUnlockerUnlockFailureIncError(t *testing.T) {
 		})
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
 
-	before := testutil.ReconcileErrorCount(t, helmUnlockQueue)
+	before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 	if err := u.run(ctx); err != nil {
 		t.Fatalf("a per-HR unlock failure must not error the run: %v", err)
 	}
-	if got := testutil.ReconcileErrorCount(t, helmUnlockQueue); got != before+1 {
+	if got := testutil.ReconcileErrorCount(t, "helmrelease-unlocker"); got != before+1 {
 		t.Fatalf("tolerated unlock failure did not IncError: got %v, want %v", got, before+1)
 	}
 }
@@ -929,14 +929,14 @@ func TestHelmReleaseUnlockerPersistedCooldown(t *testing.T) {
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v2", "myapp", 2, "pending-upgrade"))
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
 
-	before := testutil.ReconcileErrorCount(t, helmUnlockQueue)
+	before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if !secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
 		t.Fatal("secret deleted inside the persisted 24h cooldown")
 	}
-	if got := testutil.ReconcileErrorCount(t, helmUnlockQueue); got != before+1 {
+	if got := testutil.ReconcileErrorCount(t, "helmrelease-unlocker"); got != before+1 {
 		t.Fatalf("persisted-cooldown alert did not IncError: got %v, want %v", got, before+1)
 	}
 }

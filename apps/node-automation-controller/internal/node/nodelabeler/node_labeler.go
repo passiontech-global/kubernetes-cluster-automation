@@ -38,7 +38,11 @@ import (
 const workerRoleLabel = "node-role.kubernetes.io/worker"
 
 type nodeLabeler struct {
-	cs         kubernetes.Interface
+	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the controller name, the registration log and
+	// every IncError label come from one place.
+	queue      string
 	configPath string
 }
 
@@ -78,10 +82,10 @@ var nodeLabelChanges = predicate.Funcs{
 func Setup(d shared.Deps) error {
 	configPath := shared.Getenv("NODE_LABELER_CONFIG_PATH",
 		"/etc/node-labeler/labels.txt")
-	logf.Log.WithName("node-labeler").Info("registered", "configPath", configPath)
-	r := &nodeLabeler{cs: d.CS, configPath: configPath}
+	logf.Log.WithName(d.Name).Info("registered", "configPath", configPath)
+	r := &nodeLabeler{cs: d.CS, queue: d.Name, configPath: configPath}
 	return ctrl.NewControllerManagedBy(d.Mgr).
-		Named("node-labeler").
+		Named(d.Name).
 		// Watches with a single fixed workqueue key, not For(): the
 		// reconcile ignores req.Name and always sweeps the whole
 		// cluster, so per-node keys only produced N duplicate queued
@@ -101,7 +105,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 	// (a) worker role on every non-control-plane node lacking it.
 	nodes, err := shared.ListNodes(ctx, r.cs)
 	if err != nil {
-		metrics.IncError("node-labeler")
+		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
 	// The listed snapshot doubles as the labels.txt lookup index —
@@ -121,7 +125,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 		if err := shared.PatchNodeLabels(ctx, r.cs, n.Name, map[string]string{workerRoleLabel: ""}); err != nil {
 			// bash exit "$failed" here — the metric must surface a
 			// persistent patch failure even though the sweep continues.
-			metrics.IncError("node-labeler")
+			metrics.IncError(r.queue)
 			log.Info("WARN: cannot label worker role on node", "node", n.Name, "error", err)
 			continue
 		}
@@ -174,7 +178,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 				// The run absorbs the miss (returns nil), so count it
 				// here: a ghost entry that lingers for weeks would
 				// otherwise stay invisible to alerting.
-				metrics.IncError("node-labeler")
+				metrics.IncError(r.queue)
 				log.Info("WARN: node in labels.txt not found", "node", name, "label", label)
 				continue
 			}
@@ -182,7 +186,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 				continue
 			}
 			if err := shared.PatchNodeLabels(ctx, r.cs, name, map[string]string{key: val}); err != nil {
-				metrics.IncError("node-labeler")
+				metrics.IncError(r.queue)
 				log.Info("WARN: cannot label node", "node", name, "label", label, "error", err)
 				continue
 			}

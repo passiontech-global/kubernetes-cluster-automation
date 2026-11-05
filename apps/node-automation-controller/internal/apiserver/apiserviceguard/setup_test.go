@@ -16,7 +16,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	// Zero-value Deps.Disabled = gate-on — APISERVICE_GUARD_ENABLED
 	// is resolved by setupModules, not re-read here.
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "apiservice-guard", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -28,7 +28,7 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 // contract as cert-drift-auditor: no Periodic, no tick.
 func TestSetupDisabled(t *testing.T) {
 	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
+	if err := Setup(shared.Deps{Name: "apiservice-guard", Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
