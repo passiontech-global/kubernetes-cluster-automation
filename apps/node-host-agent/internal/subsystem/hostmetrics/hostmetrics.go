@@ -121,6 +121,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"golang.org/x/sys/unix"
@@ -2713,12 +2714,6 @@ func (c *Collector) collectCgroupMemEvents(ch chan<- prometheus.Metric) {
 // node-watchdog.prom, the same name prom_emit used.
 const TextfileName = "node-watchdog.prom"
 
-// textfileTmpName is WriteTextfile's staging name. It MUST NOT
-// match node_exporter's *.prom textfile glob — the collector would
-// ingest a partially-written file (and a ".*-name.prom" prefix
-// scheme DOES match: glob * swallows the leading dot).
-const textfileTmpName = TextfileName + ".tmp"
-
 // --- W9: OpenEBS LocalPV per-PVC dir bytes ---
 
 // collectLocalPVUsage emits node_host_agent_localpv_dir_bytes per
@@ -2866,7 +2861,7 @@ func (c *Collector) WriteTextfile(dir string) error {
 				}
 				sb.WriteString(l.GetName())
 				sb.WriteString(`="`)
-				sb.WriteString(escapeLabelValue(l.GetValue()))
+				sb.WriteString(promfile.EscapeLabelValue(l.GetValue()))
 				sb.WriteByte('"')
 			}
 			sb.WriteByte('}')
@@ -2884,14 +2879,13 @@ func (c *Collector) WriteTextfile(dir string) error {
 	}
 	sort.Strings(names)
 
-	var b strings.Builder
+	var b promfile.Builder
 	for _, name := range names {
 		typ := "gauge"
 		if counterSeries[name] {
 			typ = "counter"
 		}
-		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n",
-			name, metaByName[name].help, name, typ)
+		b.HeaderType(name, metaByName[name].help, typ)
 		samples := series[name]
 		sort.Strings(samples)
 		// Dedupe identical sample lines — a duplicated series makes
@@ -2903,24 +2897,9 @@ func (c *Collector) WriteTextfile(dir string) error {
 				continue
 			}
 			last = s
-			b.WriteString(s)
-			b.WriteByte('\n')
+			b.Line(s)
 		}
 	}
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp := filepath.Join(dir, textfileTmpName)
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(dir, TextfileName))
-}
-
-// escapeLabelValue applies the textfile-format label escaping
-// (backslash, double-quote and newline).
-func escapeLabelValue(v string) string {
-	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
-	return r.Replace(v)
+	return promfile.Write(dir, TextfileName, []byte(b.String()))
 }

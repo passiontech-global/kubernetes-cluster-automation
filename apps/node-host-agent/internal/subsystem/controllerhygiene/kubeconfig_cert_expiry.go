@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // checkKubeCert is the prometheus `check` label + log context for
@@ -79,16 +81,16 @@ func (h *Hygiene) checkKubeconfigCertExpiry(_ context.Context) {
 			}
 		}
 	}
-	var p textfileProm
+	var p promfile.Builder
 	if seen == 0 {
-		p.header(certDaysMetric,
+		p.Header(certDaysMetric,
 			"Minimum days until the soonest-expiring embedded client "+
 				"certificate across the k0s kubeconfigs (admin/ccm/"+
 				"scheduler/kubelet).")
 		h.stateExit(stateKubeCertExpiring) // no certs → nothing to expire
 		h.cycles.WithLabelValues(checkKubeCert, "no_certs").Inc()
 	} else {
-		p.gauge(certDaysMetric,
+		p.Gauge(certDaysMetric,
 			"Minimum days until the soonest-expiring embedded client "+
 				"certificate across the k0s kubeconfigs (admin/ccm/"+
 				"scheduler/kubelet).",

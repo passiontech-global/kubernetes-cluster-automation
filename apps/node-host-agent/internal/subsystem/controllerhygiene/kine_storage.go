@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // checkKineStorage is the prometheus `check` label + log context
@@ -192,21 +194,21 @@ func sqlite3WALCheckpoint(ctx context.Context, dbPath string) error {
 // emitKineStorageTextfile writes the two kine gauges — present=false
 // emits headers only so the series goes absent rather than stale.
 func (h *Hygiene) emitKineStorageTextfile(dbBytes, walBytes int64, present bool) {
-	var p textfileProm
+	var p promfile.Builder
 	if present {
-		p.gauge(kineDBBytesMetric,
+		p.Gauge(kineDBBytesMetric,
 			"Size in bytes of the Kine backing store (state.db, or "+
 				"the etcd/JetStream filestore total on non-SQLite backends).",
 			float64(dbBytes))
-		p.gauge(kineWALBytesMetric,
+		p.Gauge(kineWALBytesMetric,
 			"Size in bytes of the Kine SQLite WAL (state.db-wal); "+
 				"absent on non-SQLite backends.",
 			float64(walBytes))
 	} else {
-		p.header(kineDBBytesMetric,
+		p.Header(kineDBBytesMetric,
 			"Size in bytes of the Kine backing store (state.db, or "+
 				"the etcd/JetStream filestore total on non-SQLite backends).")
-		p.header(kineWALBytesMetric,
+		p.Header(kineWALBytesMetric,
 			"Size in bytes of the Kine SQLite WAL (state.db-wal); "+
 				"absent on non-SQLite backends.")
 	}

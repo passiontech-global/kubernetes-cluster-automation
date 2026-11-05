@@ -19,6 +19,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // deadTuplePct returns n_dead_tup as a percentage of estimated rows —
@@ -174,7 +176,7 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 
 // emitMaint renders the textfile and updates the collectors.
 func (k *KineDB) emitMaint(res *maintResult) {
-	var p promBuf
+	var p promfile.Builder
 	reindex, repack := 0.0, 0.0
 	if res.okReindex {
 		reindex = 1
@@ -182,26 +184,26 @@ func (k *KineDB) emitMaint(res *maintResult) {
 	if res.okRepack {
 		repack = 1
 	}
-	p.gaugeLabels("kine_db_maint_ok",
+	p.GaugeLabels("kine_db_maint_ok",
 		"Maintenance job result on the kine DB (1 = ok/skip, 0 = fail)",
 		`check="reindex"`, reindex)
-	p.gaugeLabels("kine_db_maint_ok",
+	p.GaugeLabels("kine_db_maint_ok",
 		"Maintenance job result on the kine DB (1 = ok/skip, 0 = fail)",
 		`check="repack"`, repack)
 	k.m.maintOK.WithLabelValues("reindex").Set(reindex)
 	k.m.maintOK.WithLabelValues("repack").Set(repack)
 	ts := float64(k.cfg.nowFn().Unix())
-	p.gauge("kine_db_maint_last_run_timestamp_seconds",
+	p.Gauge("kine_db_maint_last_run_timestamp_seconds",
 		"Last maintenance run", ts)
 	k.m.maintLastRun.Set(ts)
 	// relation_bytes comes out of the stats read — emitGuard's
 	// statsOK gating applied here too: on assess-fail a fabricated
 	// 0 overwriting a meaningful size is worse than a stale gauge.
 	if res.statsOK {
-		p.gaugeLabels("kine_db_maint_relation_bytes",
+		p.GaugeLabels("kine_db_maint_relation_bytes",
 			"Heap/index size of the kine table", `kind="heap"`,
 			float64(res.heapBytes))
-		p.gaugeLabels("kine_db_maint_relation_bytes",
+		p.GaugeLabels("kine_db_maint_relation_bytes",
 			"Heap/index size of the kine table", `kind="indexes"`,
 			float64(res.indexBytes))
 		k.m.maintRelBytes.WithLabelValues("heap").Set(float64(res.heapBytes))

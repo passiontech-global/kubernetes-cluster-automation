@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // rule is one fake-runner reply: first matching substring wins.
@@ -129,7 +131,7 @@ func TestEnvValue(t *testing.T) {
 
 func TestWriteTextfileAtomic(t *testing.T) {
 	dir := t.TempDir()
-	if err := writeTextfileAtomic(dir, "kine-db.prom", []byte("m 1\n")); err != nil {
+	if err := promfile.Write(dir, "kine-db.prom", []byte("m 1\n")); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "kine-db.prom"))
@@ -142,7 +144,7 @@ func TestWriteTextfileAtomic(t *testing.T) {
 		t.Fatalf("leftovers: %v", ents)
 	}
 	// second write replaces
-	if err := writeTextfileAtomic(dir, "kine-db.prom", []byte("m 2\n")); err != nil {
+	if err := promfile.Write(dir, "kine-db.prom", []byte("m 2\n")); err != nil {
 		t.Fatal(err)
 	}
 	data, _ = os.ReadFile(filepath.Join(dir, "kine-db.prom"))

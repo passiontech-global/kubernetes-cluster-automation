@@ -36,6 +36,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // pgStartupMessage builds the protocol-3.0 StartupMessage — the same
@@ -412,21 +414,21 @@ func (k *KineDB) probeLogScan(ctx context.Context, pgb string,
 
 // emitProbe renders the textfile and updates the collectors.
 func (k *KineDB) emitProbe(res *probeResult) {
-	var p promBuf
+	var p promfile.Builder
 	for _, c := range probeChecks {
-		p.gaugeLabels("kine_db_probe_ok",
+		p.GaugeLabels("kine_db_probe_ok",
 			"App-layer probe result on the kine DB VM (1 = ok, 0 = fail)",
 			fmt.Sprintf("check=%q", c), float64(res.checks[c]))
 		k.m.probeOK.WithLabelValues(c).Set(float64(res.checks[c]))
 	}
 	if res.poolSeen {
-		p.gaugeLabels("kine_db_pgbouncer_server_conns",
+		p.GaugeLabels("kine_db_pgbouncer_server_conns",
 			"pgbouncer server connections for the postgres pool by state",
 			`state="active"`, float64(res.pool.svActive))
-		p.gaugeLabels("kine_db_pgbouncer_server_conns",
+		p.GaugeLabels("kine_db_pgbouncer_server_conns",
 			"pgbouncer server connections for the postgres pool by state",
 			`state="idle"`, float64(res.pool.svIdle))
-		p.gauge("kine_db_pgbouncer_clients_waiting",
+		p.Gauge("kine_db_pgbouncer_clients_waiting",
 			"cl_waiting of the postgres pool — deep queue = client spiral",
 			float64(res.pool.clWaiting))
 		k.m.serverConns.WithLabelValues("active").Set(float64(res.pool.svActive))
@@ -434,13 +436,13 @@ func (k *KineDB) emitProbe(res *probeResult) {
 		k.m.clientsWaiting.Set(float64(res.pool.clWaiting))
 	}
 	if res.revSeen {
-		p.gauge("kine_db_head_revision",
+		p.Gauge("kine_db_head_revision",
 			"MAX(id) of the kine table — newest revision on the DB",
 			float64(res.head))
-		p.gauge("kine_db_compact_revision",
+		p.Gauge("kine_db_compact_revision",
 			"Current compact horizon (MAX prev_revision of compact_rev_key)",
 			float64(res.compact))
-		p.gauge("kine_db_retained_revisions",
+		p.Gauge("kine_db_retained_revisions",
 			"head - compact_rev: revisions still retained",
 			float64(res.head-res.compact))
 		// kine_db_rows deliberately absent — emitted by the guard
@@ -450,7 +452,7 @@ func (k *KineDB) emitProbe(res *probeResult) {
 		k.m.retained.Set(float64(res.head - res.compact))
 	}
 	ts := float64(k.cfg.nowFn().Unix())
-	p.gauge("kine_db_probe_last_run_timestamp_seconds",
+	p.Gauge("kine_db_probe_last_run_timestamp_seconds",
 		"Last probe run", ts)
 	k.m.probeLastRun.Set(ts)
 	k.emitTextfile("kine-db.prom", &p)
