@@ -136,10 +136,11 @@ func (s *Store) Enter(name, extra string) {
 // Exit removes state-<name> if present and logs the transition —
 // clears the NPD permanent condition. cleanup, when non-nil, runs
 // after the removal and before the log line: subsystems drop their
-// per-latch dedupe budgets there (nethealth clears the whole
-// last-suspect-* family — the latch is an incident boundary;
-// controllerhygiene clears only last-suspect-<name>; workerhygiene
-// passes nil).
+// per-latch dedupe budgets there. The two shared suspect-budget
+// divergences have named wrappers — ExitClearSuspect (drop only
+// last-suspect-<name>; controllerhygiene) and ExitClearAllSuspects
+// (drop the whole last-suspect-* family; nethealth) — workerhygiene
+// and everyone else pass nil.
 func (s *Store) Exit(name string, cleanup func()) {
 	p := s.Path(name)
 	if _, err := os.Stat(p); err != nil {
@@ -154,6 +155,44 @@ func (s *Store) Exit(name string, cleanup func()) {
 		cleanup()
 	}
 	s.AppendLog(fmt.Sprintf("STATE-EXIT: %s", name))
+}
+
+// ExitClearSuspect is Exit plus removal of this latch's suspect-log
+// dedupe budget (last-suspect-<name>): the budget is spent under the
+// Store's own dir by SuspectLog, and a cleared condition must not
+// suppress the first line of a re-incident under a stale epoch from
+// the previous one.
+func (s *Store) ExitClearSuspect(name string) {
+	s.Exit(name, func() { s.ClearSuspect(name) })
+}
+
+// ExitClearAllSuspects is Exit plus removal of the WHOLE
+// last-suspect-* family — a latch exit IS an incident boundary. The
+// NON-latch keys (egress-probe-<ip>, conntrack-parse, ...) have no
+// state-* twin to exit with, so a cleared condition would otherwise
+// suppress the first line of a re-incident for up to the suspect
+// cadence. No clean per-key pairing exists; a still-held condition
+// pays at most one early re-log line.
+func (s *Store) ExitClearAllSuspects(name string) {
+	s.Exit(name, func() { s.ClearAllSuspects() })
+}
+
+// ClearSuspect drops the last-suspect-<name> dedupe budget so the
+// next SuspectLog for the key logs immediately.
+func (s *Store) ClearSuspect(name string) {
+	_ = os.Remove(filepath.Join(s.Dir, SuspectBudgetPrefix+name))
+}
+
+// ClearAllSuspects drops every last-suspect-* dedupe budget in the
+// Store's dir.
+func (s *Store) ClearAllSuspects() {
+	files, err := filepath.Glob(filepath.Join(s.Dir, SuspectBudgetPrefix+"*"))
+	if err != nil {
+		return
+	}
+	for _, f := range files {
+		_ = os.Remove(f)
+	}
 }
 
 // --- epoch files ---
