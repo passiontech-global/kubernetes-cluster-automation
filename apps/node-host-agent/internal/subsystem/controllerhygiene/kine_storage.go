@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
@@ -180,13 +181,14 @@ func sqlite3WALCheckpoint(ctx context.Context, dbPath string) error {
 	}
 	cctx, cancel := context.WithTimeout(ctx, kineCheckpointBudget)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, bin, dbPath,
-		"PRAGMA busy_timeout=5000; PRAGMA wal_checkpoint(TRUNCATE);")
-	cmd.Env = scrubSystemdEnv(os.Environ())
-	out, err := cmd.CombinedOutput()
+	// scrubSystemdEnv through the env slot, not scrubArgv: the
+	// `env -u` prefix would have to resolve `env` on the pod
+	// image's PATH — the filtered environ is applied directly.
+	out, err := hostexec.RunCombinedEnv(cctx, scrubSystemdEnv(os.Environ()),
+		bin, dbPath, "PRAGMA busy_timeout=5000; PRAGMA wal_checkpoint(TRUNCATE);")
 	if err != nil {
 		return fmt.Errorf("sqlite3 wal_checkpoint: %w: %s",
-			err, strings.TrimSpace(string(out)))
+			err, strings.TrimSpace(out))
 	}
 	return nil
 }

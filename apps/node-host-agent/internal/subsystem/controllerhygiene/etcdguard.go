@@ -26,8 +26,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/etcdmaint"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/eventpurge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdmaint"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/eventpurge"
 )
 
 // etcdguard knobs (embedded-etcd quota self-defence — cicd

@@ -41,6 +41,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostexec"
 )
 
 // Defaults mirror rescue-etcd.sh.
@@ -76,7 +78,7 @@ const (
 
 // CmdRunner executes `name args...` and returns stdout with stderr
 // captured separately — the single exec seam (etcdctl + systemctl).
-// The default wires exec.CommandContext; ETCDCTL_API is NOT set
+// The default wires hostexec.Run; ETCDCTL_API is NOT set
 // (etcdctl >=3.7 warns on it and v3 is the default anyway).
 type CmdRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
@@ -140,19 +142,18 @@ func (c *Config) applyDefaults() {
 	}
 	if c.CmdRunner == nil {
 		c.CmdRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			cmd := exec.CommandContext(ctx, name, args...)
 			// etcdctl >=3.7 warns "unrecognized environment variable
 			// ETCDCTL_API" on stderr — v3 is the default API anyway.
-			// stderr is kept separate: -w json output must parse, so
-			// CombinedOutput would poison the payload.
-			var stderr bytes.Buffer
-			cmd.Stderr = &stderr
-			out, err := cmd.Output()
+			// stderr stays a separate stream (hostexec.Run): -w json
+			// output must parse, so a combined capture would poison
+			// the payload.
+			out, serr, err := hostexec.Run(ctx,
+				append([]string{name}, args...), "")
 			if err != nil {
-				return out, fmt.Errorf("%w: %s", err,
-					strings.TrimSpace(stderr.String()))
+				return []byte(out), fmt.Errorf("%w: %s", err,
+					strings.TrimSpace(serr))
 			}
-			return out, nil
+			return []byte(out), nil
 		}
 	}
 	if c.StartTempEtcd == nil {
