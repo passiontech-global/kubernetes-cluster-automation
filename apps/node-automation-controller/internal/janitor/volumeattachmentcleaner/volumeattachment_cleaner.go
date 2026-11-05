@@ -63,6 +63,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -110,13 +112,13 @@ type volumeAttachmentCleaner struct {
 	// node that does not exist. Two consecutive sightings are
 	// required to delete — an operator restart re-arms the window,
 	// biasing conservative (same convention as helmrelease-unlocker).
-	orphanFirstSeen shared.FirstSeenLedger
+	orphanFirstSeen state.FirstSeenLedger
 	// nodeNotReadySince: node name → first cycle the node was seen
 	// not-Ready. Only consumed for out-of-service candidates, but
 	// tracking every not-Ready node (not just tainted ones) means a
 	// node that gets fenced after a long outage does not start a
 	// fresh 15m window — its death clock was already running.
-	nodeNotReadySince shared.FirstSeenLedger
+	nodeNotReadySince state.FirstSeenLedger
 }
 
 // Setup registers the 5-minute sweep. The
@@ -145,7 +147,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	// Gate 1: the node list is the single source of truth for
 	// "should this attachment exist". Abort on error — a partial or
 	// blippy list would brand healthy attachments orphaned.
-	nodes, err := shared.ListNodes(ctx, c.cs)
+	nodes, err := kube.ListNodes(ctx, c.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err) // periodic wrapper IncErrors volumeattachment-cleaner
 	}
@@ -167,7 +169,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		// Recovery (or a vanished node, below) re-arms the window —
 		// a node that flapped back to life must prove another full
 		// 15m of death before its VAs are touched again.
-		if !shared.NodeReady(n) {
+		if !kube.NodeReady(n) {
 			c.nodeNotReadySince.Observe(n.Name, now)
 		} else {
 			c.nodeNotReadySince.Forget(n.Name)
@@ -181,9 +183,9 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	})
 	nodes = nil
 
-	vas, err := shared.ListAll(ctx,
+	vas, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: vaListPageSize},
-		shared.VolumeAttachments(c.cs))
+		kube.VolumeAttachments(c.cs))
 	if err != nil {
 		return fmt.Errorf("list volumeattachments: %w", err)
 	}
@@ -290,7 +292,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		// be removed.
 		uid := va.UID
 		if err := c.cs.StorageV1().VolumeAttachments().Delete(ctx, va.Name,
-			shared.UIDDeleteOptions(uid, "")); err != nil {
+			kube.UIDDeleteOptions(uid, "")); err != nil {
 			metrics.IncError(c.queue)
 			log.Error(err, "volumeattachment delete failed",
 				"va", va.Name, "node", va.Spec.NodeName,
@@ -332,7 +334,7 @@ func (c *volumeAttachmentCleaner) stuckTerminatingNodeDead(ctx context.Context,
 	if !ok {
 		return true // node object gone — nothing left to detach from
 	}
-	if !shared.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
+	if !kube.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
 		return false
 	}
 	live, err := c.livePodCount(ctx, livePods, node.Name)
@@ -401,10 +403,10 @@ type podProbe struct {
 func (c *volumeAttachmentCleaner) nodeFencedDead(ctx context.Context,
 	node *corev1.Node, livePods map[string]podProbe, now time.Time) bool {
 	log := logf.FromContext(ctx)
-	if !shared.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
+	if !kube.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
 		return false // not fenced — NotReady alone is never a verdict
 	}
-	if shared.NodeReady(node) {
+	if kube.NodeReady(node) {
 		return false // fenced but alive — the taint is stale, VAs stay
 	}
 	notReadyFor, ok := c.nodeNotReadySince.Seen(node.Name, now)
@@ -457,10 +459,10 @@ func (c *volumeAttachmentCleaner) livePodCount(ctx context.Context,
 	if pr, ok := cache[node]; ok {
 		return pr.count, pr.err
 	}
-	pods, err := shared.ListAll(ctx, metav1.ListOptions{
+	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		FieldSelector: "spec.nodeName=" + node,
 		Limit:         vaListPageSize,
-	}, shared.Pods(c.cs, metav1.NamespaceAll))
+	}, kube.Pods(c.cs, metav1.NamespaceAll))
 	if err != nil {
 		err = fmt.Errorf("list pods on %s: %w", node, err)
 		cache[node] = podProbe{err: err}

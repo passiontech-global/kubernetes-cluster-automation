@@ -26,7 +26,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // scyllaHealthCheck is the W9-ST1 scylla cluster health watchdog.
@@ -41,7 +42,7 @@ type scyllaHealthCheck struct {
 	//     condition's lastTransitionTime). Pruned on resolve.
 	//   - scyllaEmitted: "ns/cluster/reason" gauge tuples held at 1 —
 	//     same DeleteLabelValues hygiene as the other emitted sets.
-	scyllaFirstSeen shared.FirstSeenLedger
+	scyllaFirstSeen state.FirstSeenLedger
 	scyllaEmitted   map[string]bool
 }
 
@@ -72,7 +73,7 @@ const (
 
 // scyllaClusterGVR is the ScyllaCluster CR the W9-ST1 auditor reads —
 // the same GVR the W5.8 scylla-operator watchdog scans.
-var scyllaClusterGVR = shared.GVRScyllaCluster
+var scyllaClusterGVR = kube.GVRScyllaCluster
 
 // ---------------------------------------------------------------------------
 // W9-ST1 — scylla-cluster-health
@@ -100,7 +101,7 @@ var scyllaGossipPatterns = []*regexp.Regexp{
 // status.conditions entry's status and lastTransitionTime — ""
 // and the zero time when absent or malformed.
 func unstructuredCondStatus(obj *unstructured.Unstructured, typ string) (string, time.Time) {
-	c, ok := shared.ConditionOf(obj.Object, typ)
+	c, ok := kube.ConditionOf(obj.Object, typ)
 	if !ok {
 		return "", time.Time{}
 	}
@@ -126,7 +127,7 @@ func scyllaPodTroubled(pod *corev1.Pod) bool {
 	if pod.Status.Phase != corev1.PodRunning {
 		return true
 	}
-	if !shared.PodReadyCond(pod) {
+	if !kube.PodReadyCond(pod) {
 		return true
 	}
 	for _, cs := range pod.Status.ContainerStatuses {
@@ -250,9 +251,9 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list services: %w", err)}
 	}
 	esAddrs := map[string]map[string]bool{} // "ns/svc" -> endpoint addresses
-	err = shared.ListEach(ctx,
+	err = kube.ListEach(ctx,
 		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		shared.EndpointSlices(p.CS, metav1.NamespaceAll),
+		kube.EndpointSlices(p.CS, metav1.NamespaceAll),
 		func(items []discoveryv1.EndpointSlice) error {
 			for _, s := range items {
 				svc := s.Labels[discoveryv1.LabelServiceName]

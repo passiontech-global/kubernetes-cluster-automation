@@ -18,7 +18,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // ciliumBPFMapPressureCheck is the cilium BPF map pressure watchdog.
@@ -29,7 +30,7 @@ type ciliumBPFMapPressureCheck struct {
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale value (zero value usable; the serial sweep needs no
 	// lock).
-	emitted shared.GaugeLedger[string]
+	emitted state.GaugeLedger[string]
 }
 
 // newCiliumBPFMapPressureCheck builds the W10-NM1 check — its only
@@ -69,7 +70,7 @@ func (p *ciliumBPFMapPressureCheck) Run(ctx context.Context) probefw.Result {
 	// GetenvFloatPositive keeps >1 (the documented "disable this
 	// check" escape) and rejects <=0 — the same contract the retired
 	// healthEnvFloat had.
-	threshold := shared.GetenvFloatPositive("CILIUM_BPF_MAP_PRESSURE_THRESHOLD", ciliumBPFDefaultThreshold)
+	threshold := envx.GetenvFloatPositive("CILIUM_BPF_MAP_PRESSURE_THRESHOLD", ciliumBPFDefaultThreshold)
 	query := `max by (node, map_name) (cilium_bpf_map_pressure) > ` +
 		strconv.FormatFloat(threshold, 'f', -1, 64)
 	series, err := p.PromQuery(ctx, query)

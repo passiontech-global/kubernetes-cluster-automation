@@ -14,7 +14,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // flagMissingBackups is the W10-FIX6 zero-backup check: a Schedule
@@ -50,7 +50,7 @@ func (a *veleroBackupAuditor) flagMissingBackups(ctx context.Context,
 func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 	b *unstructured.Unstructured, ns, schedule string) {
 	log := logf.FromContext(ctx)
-	phase, _ := shared.NestedString(b.Object, "status", "phase")
+	phase, _ := kube.NestedString(b.Object, "status", "phase")
 	// W8-ST1 — terminal failures and wedged in-flight phases are
 	// flagged on their own reason series before the Completed path
 	// runs: Failed/PartiallyFailed/FailedValidation flag immediately,
@@ -60,7 +60,7 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 		flag := reason == "failed"
 		if reason == "stuck" {
 			since := b.GetCreationTimestamp().Time
-			if st, ok := shared.NestedString(
+			if st, ok := kube.NestedString(
 				b.Object, "status", "startTimestamp"); ok {
 				if t, err := time.Parse(time.RFC3339, st); err == nil {
 					since = t
@@ -86,9 +86,9 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 	// gate on `found`: a Completed backup with no progress block at
 	// all (older Velero, stripped status) is "can't tell", not empty —
 	// without the gate every absent-progress backup false-flags.
-	items, itemsFound := shared.NestedInt64(
+	items, itemsFound := kube.NestedInt64(
 		b.Object, "status", "progress", "itemsBackedUp")
-	total, totalFound := shared.NestedInt64(
+	total, totalFound := kube.NestedInt64(
 		b.Object, "status", "progress", "totalItems")
 	if (itemsFound && items == 0) || (totalFound && total == 0) {
 		a.seenBad.Emit(backupKey{ns, schedule, "zero_items"}, ns, schedule, "zero_items")
@@ -97,7 +97,7 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 		log.Info("velero backup completed with zero items",
 			"backup", b.GetNamespace()+"/"+b.GetName(), "schedule", ns+"/"+schedule)
 	}
-	if errs, _ := shared.NestedInt64(b.Object, "status", "errors"); errs > 0 {
+	if errs, _ := kube.NestedInt64(b.Object, "status", "errors"); errs > 0 {
 		a.seenBad.Emit(backupKey{ns, schedule, "errors"}, ns, schedule, "errors")
 		metrics.VeleroBackupEmptyOrErrored.
 			WithLabelValues(ns, schedule, "errors").Set(1)
@@ -105,7 +105,7 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 			"backup", b.GetNamespace()+"/"+b.GetName(), "schedule", ns+"/"+schedule,
 			"errors", errs)
 	}
-	if warns, _ := shared.NestedInt64(b.Object, "status", "warnings"); warns > 0 {
+	if warns, _ := kube.NestedInt64(b.Object, "status", "warnings"); warns > 0 {
 		a.seenBad.Emit(backupKey{ns, schedule, "warnings"}, ns, schedule, "warnings")
 		metrics.VeleroBackupEmptyOrErrored.
 			WithLabelValues(ns, schedule, "warnings").Set(1)

@@ -31,6 +31,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/dynamic"
@@ -76,9 +79,9 @@ var (
 // defaults spec.secretStoreRef.kind to the namespaced SecretStore,
 // which is the common shape on these clusters.
 var (
-	clusterSecretStoreGVRs = shared.ClusterSecretStoreGVRs
-	secretStoreGVRs        = shared.SecretStoreGVRs
-	externalSecretGVRs     = shared.ExternalSecretGVRs
+	clusterSecretStoreGVRs = kube.ClusterSecretStoreGVRs
+	secretStoreGVRs        = kube.SecretStoreGVRs
+	externalSecretGVRs     = kube.ExternalSecretGVRs
 )
 
 type externalSecretNudge struct {
@@ -100,11 +103,11 @@ type externalSecretNudge struct {
 	// limit. CooldownSet is zero-value ready and deliberately
 	// unbounded: stamps for vanished ESs are dead weight that age
 	// out of the window on their own.
-	nudged shared.CooldownSet
+	nudged state.CooldownSet
 	// storeDownSince: store key → first sweep that observed
 	// Ready=False — the persistence clock for the connect auto-heal
 	// (a transient first False must not bounce the pod).
-	storeDownSince shared.FirstSeenLedger
+	storeDownSince state.FirstSeenLedger
 	// stormSince: first sweep of the current ExternalSecret failure
 	// storm — same persistence clock, storm-triggered heal path.
 	stormSince time.Time
@@ -124,7 +127,7 @@ func Setup(d shared.Deps) error {
 		cs:         d.CS,
 		dyn:        d.Dyn,
 		queue:      d.Name,
-		enabled:    shared.Gate("EXTERNALSECRET_NUDGE_ENABLED", false),
+		enabled:    envx.Gate("EXTERNALSECRET_NUDGE_ENABLED", false),
 		now:        shared.SystemClock,
 		storeReady: map[string]bool{},
 	}
@@ -185,13 +188,13 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 	}
 	for i := range stores.Items {
 		s := &stores.Items[i]
-		c, _ := shared.ConditionOf(s.Object, "Ready")
+		c, _ := kube.ConditionOf(s.Object, "Ready")
 		track("ClusterSecretStore", "", s.GetName(), c.Status == "True")
 	}
 	if namespacedStores != nil {
 		for i := range namespacedStores.Items {
 			s := &namespacedStores.Items[i]
-			c, _ := shared.ConditionOf(s.Object, "Ready")
+			c, _ := kube.ConditionOf(s.Object, "Ready")
 			track("SecretStore", s.GetNamespace(), s.GetName(), c.Status == "True")
 		}
 	}

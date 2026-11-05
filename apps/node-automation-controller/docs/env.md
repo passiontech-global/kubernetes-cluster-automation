@@ -2,14 +2,14 @@
 
 Operator-facing catalog of every env var the controller reads. The table is
 hand-maintained and **verified against source** by the envdoc coverage test
-(`internal/envdoc`), which walks `cmd/manager/modules.go`,
+(`internal/envdoc`), which walks `internal/registry/registry.go`,
 `cmd/manager/main.go`, and every `shared.Getenv*` / `shared.Gate` call under
 `internal/` — update this file when adding a knob.
 
 Parsing rules (`internal/shared/env.go`):
 
 - **Registration gates** live in the `GateEnv` column of the module registry
-  (`cmd/manager/modules.go`). `DefaultOn=false` = opt-in: enabled only when
+  (`internal/registry/registry.go`). `DefaultOn=false` = opt-in: enabled only when
   the value is exactly `"true"`. `DefaultOn=true` = opt-out: enabled unless
   the value is exactly `"false"`. A gated-off module registers nothing.
 - **Run-behavior knobs** are read inside each module's `Setup` (or per sweep).
@@ -113,4 +113,4 @@ knobs (always-on, no gates).
 | `-leader-elect-lease-duration` | `0` | Time non-leaders wait before force-acquiring the Lease; `0` = controller-runtime default (15s). |
 | `-leader-elect-renew-deadline` | `0` | Time the leader retries renewing before giving up; `0` = default (10s). |
 | `-leader-elect-retry-period` | `0` | Interval between Lease renew/acquire attempts; `0` = default (2s). |
-| `-modules` | `""` (all) | Comma-separated allowlist of registry ops names or `@group` selectors (see `modules.go`) — only those modules wire runnables. Groups: `@system`, `@node`, `@apiserver`, `@janitors`, `@integration`, `@health`. Unknown names/groups abort boot; metric series are predeclared for the full registry regardless. |
+| `-modules` | `""` (all) | Comma-separated allowlist of registry ops names or `@group` selectors (see `internal/registry`) — only those modules wire runnables. Groups: `@system`, `@node`, `@apiserver`, `@janitors`, `@integration`, `@health`. Unknown names/groups abort boot; metric series are predeclared for the full registry regardless. |

@@ -18,7 +18,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // imagePullStormCheck is the image-pull-storm watchdog.
@@ -28,7 +28,7 @@ type imagePullStormCheck struct {
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1 (zero value usable; the serial sweep needs no lock).
-	emitted shared.GaugeLedger[string]
+	emitted state.GaugeLedger[string]
 }
 
 // newImagePullStormCheck builds the W10-GI5 check — its only state

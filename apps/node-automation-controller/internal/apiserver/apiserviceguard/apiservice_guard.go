@@ -51,6 +51,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -91,7 +93,7 @@ var apiServiceProtectedNamespaces = map[string]bool{
 
 // apiServiceGVR is the apiregistration.k8s.io/v1 APIService resource —
 // cluster-scoped, no typed client in client-go.
-var apiServiceGVR = shared.GVRAPIService
+var apiServiceGVR = kube.GVRAPIService
 
 type apiServiceGuard struct {
 	cs  kubernetes.Interface
@@ -107,11 +109,11 @@ type apiServiceGuard struct {
 	// ("name/service_namespace/service_name") held at =1 — a tuple
 	// not re-seen this sweep gets its series deleted via
 	// DeleteLabelValues (same seen-set hygiene as brokenEmitted).
-	emitted shared.GaugeLedger[string]
+	emitted state.GaugeLedger[string]
 	// unblocked is "<apiservice name>" -> last unblock-heal time —
 	// bounds restart churn on a backend that wedges again right
 	// after its pods are recreated.
-	unblocked shared.CooldownSet
+	unblocked state.CooldownSet
 }
 
 // Setup registers the 5-minute sweep. Disabled
@@ -139,9 +141,9 @@ func (g *apiServiceGuard) run(ctx context.Context) error {
 	// read the same APIService set, so it is listed ONCE per run and
 	// shared; a list failure is handed to each duty separately
 	// (either may still act on the parts it does not need).
-	svcItems, svcsErr := shared.ListAll(ctx,
+	svcItems, svcsErr := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: apiServiceListPageSize},
-		shared.DynamicPage(g.dyn.Resource(apiServiceGVR)))
+		kube.DynamicPage(g.dyn.Resource(apiServiceGVR)))
 	svcs := &unstructured.UnstructuredList{Items: svcItems}
 	orphanErr := g.sweepOrphans(ctx, svcs, svcsErr)
 	watchErr := g.sweepAvailability(ctx, svcs, svcsErr)
@@ -165,9 +167,9 @@ func (g *apiServiceGuard) sweepOrphans(ctx context.Context, svcs *unstructured.U
 	// apiserver/RBAC lied (every APIService would look orphaned), so
 	// the pass skips itself without failing the run — the
 	// availability watchdog still evaluates.
-	nss, err := shared.ListAll(ctx,
+	nss, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: apiServiceListPageSize},
-		shared.Namespaces(g.cs))
+		kube.Namespaces(g.cs))
 	if err != nil {
 		return fmt.Errorf("list namespaces (API flap) — abort orphan pass: %w", err)
 	}
@@ -197,7 +199,7 @@ func (g *apiServiceGuard) sweepOrphans(ctx context.Context, svcs *unstructured.U
 		// stale where a Get is fresh, so the delete only fires after
 		// the apiserver itself confirms NotFound (fail closed).
 		_, getErr := g.cs.CoreV1().Namespaces().Get(ctx, svcNs, metav1.GetOptions{})
-		gone, err := shared.ConfirmAbsent(getErr)
+		gone, err := kube.ConfirmAbsent(getErr)
 		if err != nil {
 			log.Info("WARN: namespace confirm failed — APIService kept (fail closed)",
 				"apiservice", svc.GetName(), "namespace", svcNs, "error", err)
@@ -215,7 +217,7 @@ func (g *apiServiceGuard) sweepOrphans(ctx context.Context, svcs *unstructured.U
 		// APIService recreated in between is not ours to reap.
 		uid := svc.GetUID()
 		if err := g.dyn.Resource(apiServiceGVR).
-			Delete(ctx, svc.GetName(), shared.UIDDeleteOptions(uid, "")); err != nil {
+			Delete(ctx, svc.GetName(), kube.UIDDeleteOptions(uid, "")); err != nil {
 			log.Error(err, "orphan apiservice delete failed",
 				"apiservice", svc.GetName())
 			metrics.IncError(g.queue)
@@ -268,8 +270,8 @@ func (g *apiServiceGuard) sweepAvailability(ctx context.Context, svcs *unstructu
 // namespace/name — ok=false when the APIService is not Service-backed
 // (e.g. the local "v1." core registration).
 func apiServiceBackend(u *unstructured.Unstructured) (namespace, name string, ok bool) {
-	ns, _ := shared.NestedString(u.Object, "spec", "service", "namespace")
-	n, _ := shared.NestedString(u.Object, "spec", "service", "name")
+	ns, _ := kube.NestedString(u.Object, "spec", "service", "namespace")
+	n, _ := kube.NestedString(u.Object, "spec", "service", "name")
 	if ns == "" || n == "" {
 		return "", "", false
 	}
@@ -281,7 +283,7 @@ func apiServiceBackend(u *unstructured.Unstructured) (namespace, name string, ok
 // False, or the timestamp is unparseable (an APIService with no
 // provable failure age is never flagged).
 func apiServiceUnavailableSince(u *unstructured.Unstructured) (time.Time, bool) {
-	c, ok := shared.ConditionOf(u.Object, apiServiceAvailableCond)
+	c, ok := kube.ConditionOf(u.Object, apiServiceAvailableCond)
 	if !ok || c.Status != apiServiceConditionFalse || c.LastTransitionTime.IsZero() {
 		return time.Time{}, false
 	}
@@ -394,9 +396,9 @@ func (g *apiServiceGuard) sweepUnblock(ctx context.Context, svcs *unstructured.U
 // is skipped (fail closed).
 func (g *apiServiceGuard) stuckTerminatingNamespaces(ctx context.Context, now time.Time) (map[string]string, error) {
 	log := logf.FromContext(ctx)
-	nss, err := shared.ListAll(ctx,
+	nss, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: apiServiceListPageSize},
-		shared.Namespaces(g.cs))
+		kube.Namespaces(g.cs))
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces (unblock pass): %w", err)
 	}
@@ -417,9 +419,9 @@ func (g *apiServiceGuard) stuckTerminatingNamespaces(ctx context.Context, now ti
 			corpus.WriteString(strings.ToLower(c.Message))
 			corpus.WriteByte('\n')
 		}
-		evs, err := shared.ListAll(ctx,
+		evs, err := kube.ListAll(ctx,
 			metav1.ListOptions{Limit: apiServiceListPageSize},
-			shared.Events(g.cs, ns.Name))
+			kube.Events(g.cs, ns.Name))
 		if err != nil {
 			// Conditions-only corpus still carries
 			// NamespaceContentRemaining/DiscoveryFailed detail —
@@ -473,10 +475,10 @@ func (g *apiServiceGuard) restartBackingPods(ctx context.Context, svcNs, svcName
 			"service", svcNs+"/"+svcName)
 		return 0, nil
 	}
-	pods, err := shared.ListAll(ctx, metav1.ListOptions{
+	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
 		Limit:         apiServiceListPageSize,
-	}, shared.Pods(g.cs, svcNs))
+	}, kube.Pods(g.cs, svcNs))
 	if err != nil {
 		return 0, fmt.Errorf("list backing pods %s: %w", svcNs, err)
 	}
@@ -491,7 +493,7 @@ func (g *apiServiceGuard) restartBackingPods(ctx context.Context, svcNs, svcName
 		}
 		uid := p.UID
 		if err := g.cs.CoreV1().Pods(svcNs).Delete(ctx, p.Name,
-			shared.UIDDeleteOptions(uid, "")); err != nil {
+			kube.UIDDeleteOptions(uid, "")); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}

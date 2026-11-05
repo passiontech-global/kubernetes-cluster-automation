@@ -16,12 +16,12 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // certReady reports whether the Certificate's Ready condition is True.
 func certReady(cert *unstructured.Unstructured) bool {
-	c, _ := shared.ConditionOf(cert.Object, "Ready")
+	c, _ := kube.ConditionOf(cert.Object, "Ready")
 	return c.Status == "True"
 }
 
@@ -30,7 +30,7 @@ func certReady(cert *unstructured.Unstructured) bool {
 // have a stuck issuance worth resetting. cert-manager publishes the
 // next renewal under STATUS.renewalTime (spec carries no such field).
 func certNeedsReap(cert *unstructured.Unstructured, now time.Time) bool {
-	if conds, ok := shared.NestedSlice(
+	if conds, ok := kube.NestedSlice(
 		cert.Object, "status", "conditions"); ok {
 		for _, c := range conds {
 			m, ok := c.(map[string]interface{})
@@ -42,7 +42,7 @@ func certNeedsReap(cert *unstructured.Unstructured, now time.Time) bool {
 			}
 		}
 	}
-	if rt, ok := shared.NestedString(
+	if rt, ok := kube.NestedString(
 		cert.Object, "status", "renewalTime"); ok {
 		if t, err := time.Parse(time.RFC3339, rt); err == nil &&
 			!t.After(now.Add(certRenewalWindow)) {
@@ -95,7 +95,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		if !orderOwnedByCert(o, name, crToCert) {
 			continue // not this cert's order — never ours to reap
 		}
-		if st, _ := shared.NestedString(o.Object, "status", "state"); st != "pending" {
+		if st, _ := kube.NestedString(o.Object, "status", "state"); st != "pending" {
 			continue
 		}
 		if now.Sub(o.GetCreationTimestamp().Time) <= orderPendingMinAge {
@@ -151,7 +151,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		"cert", key, "order", stuck.GetName())
 	stuckUID := stuck.GetUID()
 	if err := r.dyn.Resource(orderGVR).Namespace(ns).
-		Delete(ctx, stuck.GetName(), shared.UIDDeleteOptions(stuckUID, "")); err != nil {
+		Delete(ctx, stuck.GetName(), kube.UIDDeleteOptions(stuckUID, "")); err != nil {
 		metrics.IncError(r.queue)
 		log.Error(err, "order delete failed", "cert", key, "order", stuck.GetName())
 		return false
@@ -170,7 +170,7 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 
 // certReadyFalse reports the Ready=False half of the W8 CR candidacy.
 func certReadyFalse(cert *unstructured.Unstructured) bool {
-	c, _ := shared.ConditionOf(cert.Object, "Ready")
+	c, _ := kube.ConditionOf(cert.Object, "Ready")
 	return c.Status == "False"
 }
 
@@ -178,7 +178,7 @@ func certReadyFalse(cert *unstructured.Unstructured) bool {
 // next 14 days — an expiring cert with a wedged child CR is a renewal
 // that silently died.
 func certExpiringSoon(cert *unstructured.Unstructured, now time.Time) bool {
-	if v, ok := shared.NestedString(
+	if v, ok := kube.NestedString(
 		cert.Object, "status", "notAfter"); ok {
 		if t, err := time.Parse(time.RFC3339, v); err == nil {
 			return t.Before(now.Add(certExpirySoonWin))

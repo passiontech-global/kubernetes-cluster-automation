@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -105,7 +105,7 @@ func TestDeadNodeSweeperTaintsFencedNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := testutil.GetNode(t, cs, "w1")
-	if !shared.HasTaint(got.Spec.Taints, outOfServiceTaintKey) {
+	if !kube.HasTaint(got.Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("fenced node with stuck Terminating pods not tainted")
 	}
 	for _, tn := range got.Spec.Taints {
@@ -133,7 +133,7 @@ func TestDeadNodeSweeperSkipsReadyNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"w1", "w2"} {
-		if shared.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, outOfServiceTaintKey) {
+		if kube.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, outOfServiceTaintKey) {
 			t.Fatalf("node %s tainted — should have been skipped", name)
 		}
 	}
@@ -151,7 +151,7 @@ func TestDeadNodeSweeperFailClosedNoEvidence(t *testing.T) {
 		if err := s.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 			t.Fatal("node tainted with zero fencing evidence")
 		}
 	})
@@ -173,7 +173,7 @@ func TestDeadNodeSweeperFailClosedNoEvidence(t *testing.T) {
 		if probeCalled {
 			t.Fatal("probe invoked before the 30m Unknown window elapsed")
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 			t.Fatal("node tainted inside the 30m Unknown window")
 		}
 	})
@@ -188,7 +188,7 @@ func TestDeadNodeSweeperFailClosedNoEvidence(t *testing.T) {
 		if err := s.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 			t.Fatal("node tainted for a pod still inside its grace window")
 		}
 	})
@@ -206,7 +206,7 @@ func TestDeadNodeSweeperProbePath(t *testing.T) {
 		if err := s.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 			t.Fatal("Unknown>30m + dead kubelet not tainted")
 		}
 	})
@@ -224,7 +224,7 @@ func TestDeadNodeSweeperProbePath(t *testing.T) {
 		if err := s.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 			t.Fatal("probe error (kubelet unreachable) not treated as dead")
 		}
 	})
@@ -239,7 +239,7 @@ func TestDeadNodeSweeperProbePath(t *testing.T) {
 		if err := s.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 			t.Fatal("node tainted though its kubelet answers healthz")
 		}
 	})
@@ -255,7 +255,7 @@ func TestDeadNodeSweeperFenceAgentsCR(t *testing.T) {
 	if err := s.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("fenceagentsremediation CR not accepted as fencing evidence")
 	}
 }
@@ -269,7 +269,7 @@ func TestDeadNodeSweeperUntaintsRecoveredNode(t *testing.T) {
 	if err := s.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("recovered node still carries out-of-service taint")
 	}
 }
@@ -290,7 +290,7 @@ func TestDeadNodeSweeperCapOnePerCycle(t *testing.T) {
 	}
 	tainted := 0
 	for _, name := range []string{"w1", "w2"} {
-		if shared.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, outOfServiceTaintKey) {
+		if kube.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, outOfServiceTaintKey) {
 			tainted++
 		}
 	}
@@ -298,7 +298,7 @@ func TestDeadNodeSweeperCapOnePerCycle(t *testing.T) {
 		t.Fatalf("expected exactly %d node tainted per cycle, got %d", deadNodeCap, tainted)
 	}
 	// Deterministic order: w1 sorts first, so it is the one tainted.
-	if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("expected w1 (first sorted) to be the capped-out node")
 	}
 }
@@ -322,7 +322,7 @@ func TestDeadNodeSweeperVolumeAttachments(t *testing.T) {
 		if err := s.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 			t.Fatal("node not tainted")
 		}
 	})
@@ -341,7 +341,7 @@ func TestDeadNodeSweeperVolumeAttachments(t *testing.T) {
 		if err := s.run(ctx); err != nil {
 			t.Fatalf("volumeattachment list failure must not fail the run: %v", err)
 		}
-		if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 			t.Fatal("taint vetoed by a volumeattachment list failure")
 		}
 	})
@@ -453,7 +453,7 @@ func TestDeadNodeSweeperRecoveryUntaintErrorTolerated(t *testing.T) {
 	if err := s.run(ctx); err != nil {
 		t.Fatalf("untaint failure must not fail the run: %v", err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("taint removed despite the failed patch")
 	}
 }
@@ -476,7 +476,7 @@ func TestDeadNodeSweeperIgnoresNonStuckPods(t *testing.T) {
 	if err := s.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("node tainted without any stuck pod")
 	}
 }
@@ -492,7 +492,7 @@ func TestDeadNodeSweeperKeepsAlreadyFencedNode(t *testing.T) {
 	if err := s.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("already-fenced node's taint was dropped")
 	}
 }
@@ -512,7 +512,7 @@ func TestDeadNodeSweeperTaintPatchErrorTolerated(t *testing.T) {
 	if err := s.run(ctx); err != nil {
 		t.Fatalf("taint failure must not fail the run: %v", err)
 	}
-	if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("taint applied despite the rejected patch")
 	}
 }
@@ -553,7 +553,7 @@ func TestDeadNodeSweeperDynamicListError(t *testing.T) {
 	if err := s.run(ctx); err != nil {
 		t.Fatalf("per-node fencing check failure must not fail the run: %v", err)
 	}
-	if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
 		t.Fatal("node tainted though the fencing check itself errored")
 	}
 }

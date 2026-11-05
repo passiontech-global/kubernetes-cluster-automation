@@ -20,7 +20,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // orphanSweep owns the orphan-entry sweep — embedded in webhookGuard
@@ -62,9 +62,9 @@ func (o *orphanSweep) sweepOrphans(ctx context.Context, snap *sweepSnapshot) err
 	// Paged like every cluster-wide list in this module.
 	haveSvc := true
 	services := map[string]bool{}
-	err := shared.ListEach(ctx,
+	err := kube.ListEach(ctx,
 		metav1.ListOptions{Limit: listPageSize},
-		shared.Services(g.cs, metav1.NamespaceAll),
+		kube.Services(g.cs, metav1.NamespaceAll),
 		func(items []corev1.Service) error {
 			for i := range items {
 				services[items[i].Namespace+"/"+items[i].Name] = true

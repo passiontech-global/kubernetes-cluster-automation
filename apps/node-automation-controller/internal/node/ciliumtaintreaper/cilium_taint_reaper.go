@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -131,7 +132,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 
 	// Sweep every node like bash — a node/pod event is only the
 	// trigger, the verdict always covers the whole cluster.
-	nodes, err := shared.ListNodes(ctx, r.cs)
+	nodes, err := kube.ListNodes(ctx, r.cs)
 	if err != nil {
 		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
@@ -140,7 +141,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 	reaped := 0
 	for i := range nodes {
 		node := &nodes[i]
-		if !shared.HasTaint(node.Spec.Taints, ciliumNotReadyTaint) {
+		if !kube.HasTaint(node.Spec.Taints, ciliumNotReadyTaint) {
 			continue
 		}
 		pods, err := r.cs.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{
@@ -171,7 +172,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 		if healthy != nil {
 			log.Info("REAP: agent healthy but stale taint -> removing",
 				"node", node.Name, "pod", healthy.Name)
-			if err := shared.UntaintNode(ctx, r.cs, node.Name, ciliumNotReadyTaint); err != nil {
+			if err := kube.UntaintNode(ctx, r.cs, node.Name, ciliumNotReadyTaint); err != nil {
 				metrics.IncError(r.queue)
 				return ctrl.Result{}, fmt.Errorf("remove taint %s on node %s: %w",
 					ciliumNotReadyTaint, node.Name, err)
@@ -184,7 +185,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 				"pod", pod.Name,
 				"phase", pod.Status.Phase,
 				"terminating", pod.DeletionTimestamp != nil,
-				"ready", shared.PodReadyCond(pod))
+				"ready", kube.PodReadyCond(pod))
 		}
 	}
 	log.Info("sweep done", "reaped", reaped, "nodes", len(nodes))
@@ -207,5 +208,5 @@ func ciliumStaleTaints(n *corev1.Node) []corev1.Taint {
 // terminating, phase Running and Ready condition True.
 func ciliumPodHealthy(p *corev1.Pod) bool {
 	return p.DeletionTimestamp == nil &&
-		p.Status.Phase == corev1.PodRunning && shared.PodReadyCond(p)
+		p.Status.Phase == corev1.PodRunning && kube.PodReadyCond(p)
 }

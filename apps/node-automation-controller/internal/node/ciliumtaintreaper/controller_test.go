@@ -8,7 +8,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -21,7 +21,7 @@ func TestCiliumTaintReaper(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, stale.Key) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, stale.Key) {
 		t.Fatal("disabled reaper removed taint")
 	}
 
@@ -33,7 +33,7 @@ func TestCiliumTaintReaper(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, stale.Key) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, stale.Key) {
 		t.Fatal("stale taint not reaped with healthy agent")
 	}
 
@@ -45,7 +45,7 @@ func TestCiliumTaintReaper(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, stale.Key) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, stale.Key) {
 		t.Fatal("taint removed while agent still not ready")
 	}
 }

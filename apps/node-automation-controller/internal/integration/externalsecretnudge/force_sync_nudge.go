@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -60,7 +60,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 	totalES, failingES := 0, 0
 	for i := range list.Items {
 		totalES++
-		if c, _ := shared.ConditionOf(list.Items[i].Object, "Ready"); c.Status == "False" {
+		if c, _ := kube.ConditionOf(list.Items[i].Object, "Ready"); c.Status == "False" {
 			failingES++
 		}
 	}
@@ -99,7 +99,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 	for i := range list.Items {
 		es := &list.Items[i]
 		key := es.GetNamespace() + "/" + es.GetName()
-		c, _ := shared.ConditionOf(es.Object, "Ready")
+		c, _ := kube.ConditionOf(es.Object, "Ready")
 		if c.Status != "False" {
 			continue
 		}

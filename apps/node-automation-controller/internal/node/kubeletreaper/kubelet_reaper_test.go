@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,7 +46,7 @@ func TestKubeletReaperSweep(t *testing.T) {
 		if err := r.sweep(ctx, kubeletWorker("w1", 0, kubeletDeadTaint), true); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("taint kept though kubelet :10250 answers")
 		}
 	})
@@ -68,7 +68,7 @@ func TestKubeletReaperSweep(t *testing.T) {
 		if err := r.sweep(ctx, kubeletWorker("w1", 0), false); err != nil {
 			t.Fatal(err)
 		}
-		if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("dead kubelet (heartbeat 300s old) not tainted")
 		}
 	})
@@ -79,7 +79,7 @@ func TestKubeletReaperSweep(t *testing.T) {
 		if err := r.sweep(ctx, kubeletWorker("w1", 0), false); err != nil {
 			t.Fatal(err)
 		}
-		if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("missing heartbeat timestamp not tainted")
 		}
 	})
@@ -92,7 +92,7 @@ func TestKubeletReaperSweep(t *testing.T) {
 		if err := r.sweep(ctx, kubeletWorker("w1", 0), false); err != nil {
 			t.Fatal(err)
 		}
-		if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("absent Ready condition not tainted")
 		}
 	})
@@ -105,7 +105,7 @@ func TestKubeletReaperSweep(t *testing.T) {
 		if err := r.sweep(ctx, kubeletWorker("w1", 0), false); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("tainted despite fresh heartbeat")
 		}
 	})
@@ -121,7 +121,7 @@ func TestKubeletReaperSweep(t *testing.T) {
 		if err := r.sweep(ctx, kubeletWorker("w1", 0), false); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("tainted on a future-dated (skewed) heartbeat — clock skew is not staleness")
 		}
 	})
@@ -136,7 +136,7 @@ func TestKubeletReaperSweep(t *testing.T) {
 		if err := r.sweep(ctx, kubeletWorker("w1", 0), false); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("taint kept though the skewed heartbeat is fresh")
 		}
 	})
@@ -147,7 +147,7 @@ func TestKubeletReaperSweep(t *testing.T) {
 		if err := r.sweep(ctx, kubeletWorker("w1", 0), false); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("taint kept though heartbeat is fresh")
 		}
 	})
@@ -158,7 +158,7 @@ func TestKubeletReaperSweep(t *testing.T) {
 		if err := r.sweep(ctx, kubeletWorker("w1", 0), false); err != nil {
 			t.Fatal(err)
 		}
-		if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("taint dropped though kubelet is still dead")
 		}
 	})
@@ -204,7 +204,7 @@ func TestKubeletReaperSweepGetCalls(t *testing.T) {
 		}
 	})
 
-	t.Run("probe ok + listed taint untaints via ONE get inside shared.UntaintNode", func(t *testing.T) {
+	t.Run("probe ok + listed taint untaints via ONE get inside kube.UntaintNode", func(t *testing.T) {
 		cs := fake.NewSimpleClientset(kubeletWorker("w1", 0, kubeletDeadTaint))
 		gets := nodeGetCount(cs)
 		r := &kubeletReaper{cs: cs}
@@ -214,16 +214,16 @@ func TestKubeletReaperSweepGetCalls(t *testing.T) {
 		// Read the count before testutil.GetNode() below — the assertion
 		// helper's own Get would inflate it.
 		if gets() != 1 {
-			t.Fatalf("node gets = %d, want exactly 1 (shared.UntaintNode's own re-read)", gets())
+			t.Fatalf("node gets = %d, want exactly 1 (kube.UntaintNode's own re-read)", gets())
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("listed taint not removed on a healthy probe")
 		}
 	})
 
 	t.Run("probe ok + stale listed taint on a clean node is a safe no-op", func(t *testing.T) {
 		// The listed snapshot still shows our taint but the stored
-		// node lost it — shared.UntaintNode's internal re-Get must see the
+		// node lost it — kube.UntaintNode's internal re-Get must see the
 		// fresh truth and patch nothing.
 		cs := fake.NewSimpleClientset(kubeletWorker("w1", 0))
 		var patches int32
@@ -253,7 +253,7 @@ func TestKubeletReaperSweepGetCalls(t *testing.T) {
 		if gets() == 0 {
 			t.Fatal("probe-failed sweep decided without a fresh node read")
 		}
-		if !shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("stale stored heartbeat not tainted — listed copy won?")
 		}
 	})
@@ -279,7 +279,7 @@ func TestKubeletReaperRun(t *testing.T) {
 		// no decision may be applied even though both heartbeats
 		// look stale.
 		for _, name := range []string{"w1", "w2"} {
-			if shared.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, kubeletReaperTaint) {
+			if kube.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, kubeletReaperTaint) {
 				t.Fatalf("node %s tainted during probe-path abort", name)
 			}
 		}
@@ -298,10 +298,10 @@ func TestKubeletReaperRun(t *testing.T) {
 		if err := r.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("w1 tainted though its probe passed")
 		}
-		if !shared.HasTaint(testutil.GetNode(t, cs, "w2").Spec.Taints, kubeletReaperTaint) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w2").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("w2 not tainted — probe failed with a stale heartbeat")
 		}
 	})
@@ -333,7 +333,7 @@ func TestKubeletReaperRun(t *testing.T) {
 		if !probed["w1"] {
 			t.Fatal("worker node was not probed")
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "cp1").Spec.Taints, kubeletReaperTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "cp1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("control-plane node tainted")
 		}
 	})
@@ -349,7 +349,7 @@ func TestKubeletReaperRun(t *testing.T) {
 		if err := r.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 			t.Fatal("recovered node still tainted")
 		}
 	})
@@ -403,7 +403,7 @@ func TestKubeletReaperRun(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// sweep() — patch-failure paths through shared.UntaintNode/shared.TaintNode
+// sweep() — patch-failure paths through kube.UntaintNode/kube.TaintNode
 // ---------------------------------------------------------------------------
 
 func TestKubeletReaperSweepPatchErrors(t *testing.T) {

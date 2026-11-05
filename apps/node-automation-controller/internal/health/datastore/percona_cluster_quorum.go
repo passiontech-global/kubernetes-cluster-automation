@@ -8,7 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,7 +24,7 @@ type perconaQuorumCheck struct {
 	//     cluster read "initializing" — the 30m stuck-initializing
 	//     window for checkPerconaClusterQuorum (W10-ST5). Pruned on
 	//     resolve so a later re-init re-arms.
-	perconaInitSeen shared.FirstSeenLedger
+	perconaInitSeen state.FirstSeenLedger
 }
 
 // newPerconaQuorumCheck builds the W10-ST5 check — the first-seen
@@ -51,7 +52,7 @@ const (
 // perconaClusterGVRs are the three Percona operator CRDs the quorum
 // check sweeps cluster-wide; a cluster without a given operator
 // simply has no objects (CRD absent → the List misses quietly).
-var perconaClusterGVRs = shared.PerconaClusterGVRs
+var perconaClusterGVRs = kube.PerconaClusterGVRs
 
 // checkPerconaClusterQuorum flags Percona database clusters that
 // report an error state, sit in "initializing" past
@@ -87,8 +88,8 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 				p.clearPerconaInit(key)
 				continue
 			}
-			state, _ := shared.NestedString(o.Object, "status", "state")
-			statusField, _ := shared.NestedString(o.Object, "status", "status")
+			state, _ := kube.NestedString(o.Object, "status", "state")
+			statusField, _ := kube.NestedString(o.Object, "status", "status")
 			switch {
 			case strings.EqualFold(state, "error") ||
 				strings.EqualFold(statusField, "error"):
@@ -133,10 +134,10 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 // perconaClusterPaused reports spec.pause==true or spec.mode=="paused"
 // — a deliberately parked cluster is not a quorum failure.
 func perconaClusterPaused(o *unstructured.Unstructured) bool {
-	if paused, _ := shared.NestedBool(o.Object, "spec", "pause"); paused {
+	if paused, _ := kube.NestedBool(o.Object, "spec", "pause"); paused {
 		return true
 	}
-	if mode, _ := shared.NestedString(o.Object, "spec", "mode"); mode == "paused" {
+	if mode, _ := kube.NestedString(o.Object, "spec", "mode"); mode == "paused" {
 		return true
 	}
 	return false
@@ -148,10 +149,10 @@ func perconaClusterPaused(o *unstructured.Unstructured) bool {
 // postgres component). Absent fields read as "unknown", not zero —
 // an operator that never wrote a count must not false-positive.
 func perconaReadyBelowOne(o *unstructured.Unstructured) bool {
-	if ready, found := shared.NestedInt64(o.Object, "status", "ready"); found {
+	if ready, found := kube.NestedInt64(o.Object, "status", "ready"); found {
 		return ready < 1
 	}
-	if ready, found := shared.NestedInt64(o.Object, "status", "postgres", "ready"); found {
+	if ready, found := kube.NestedInt64(o.Object, "status", "postgres", "ready"); found {
 		return ready < 1
 	}
 	return false

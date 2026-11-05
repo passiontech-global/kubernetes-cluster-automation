@@ -8,7 +8,7 @@ package webhookguard
 
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // circuitMetrics applies the trip/recovery side-effects — called only
@@ -17,7 +17,7 @@ import (
 // sweep's ledger; a recovered one is deleted outright — a cleared
 // breaker emits no series, not a 0, and the sweep-end ledger prune
 // drops it for good.
-func circuitMetrics(emitted *shared.GaugeLedger[string], kind, cfgName string, trips, recovered []string) {
+func circuitMetrics(emitted *state.GaugeLedger[string], kind, cfgName string, trips, recovered []string) {
 	for _, n := range trips {
 		metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, n).Set(1)
 		emitted.Emit(kind+"/"+cfgName+"/"+n, kind, cfgName, n)

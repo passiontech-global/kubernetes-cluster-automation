@@ -23,7 +23,9 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // ciliumNodeIPAMExhaustionCheck is the cilium node IPAM exhaustion
@@ -35,7 +37,7 @@ type ciliumNodeIPAMExhaustionCheck struct {
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale value (zero value usable; the serial sweep needs no
 	// lock).
-	emitted shared.GaugeLedger[string]
+	emitted state.GaugeLedger[string]
 }
 
 // newCiliumNodeIPAMExhaustionCheck builds the W10-NM6 check — its
@@ -107,7 +109,7 @@ func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result 
 	// GetenvFloatPositive keeps >1 (the documented "disable this
 	// check" escape) and rejects <=0 — the same contract the retired
 	// healthEnvFloat had.
-	minFree := shared.GetenvFloatPositive("CILIUM_NODE_IPAM_MIN_FREE_RATIO", ciliumIPAMMinFreeRatio)
+	minFree := envx.GetenvFloatPositive("CILIUM_NODE_IPAM_MIN_FREE_RATIO", ciliumIPAMMinFreeRatio)
 
 	// Prometheus operator IPAM census — cilium_operator_ipam_{used,
 	// available}_ips{target_node} (cilium >=1.15; the old
@@ -141,7 +143,7 @@ func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result 
 			"error", err)
 	}
 
-	nodes, err := shared.ListNodes(ctx, p.CS)
+	nodes, err := kube.ListNodes(ctx, p.CS)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
@@ -228,7 +230,7 @@ func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Conte
 	if p.Heals.CooledDown(ck, ciliumIPAMNodeCool, now) {
 		return
 	}
-	held, why, err := shared.MaintenanceActive(ctx, p.CS, p.Dyn)
+	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: maintenance check unverifiable — ipam reap deferred (fail closed)",

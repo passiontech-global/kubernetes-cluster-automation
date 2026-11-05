@@ -31,11 +31,11 @@ func TestDragonflySyncStormRestartsReplicaNotMaster(t *testing.T) {
 
 	// First sweep stamps the link-down first-seen; second (past the
 	// 5m persistence window) confirms the storm.
-	if res := mustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first sighting inside window must pass: %+v", res)
 	}
 	base = base.Add(6 * time.Minute)
-	res := mustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatalf("sustained link-down + sync storm must fail: %+v", res)
 	}
@@ -69,9 +69,9 @@ func TestDragonflyLinkDownAloneDoesNotRestart(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	base := time.Now()
 	p.Now = func() time.Time { return base }
-	mustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx)
+	probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx)
 	base = base.Add(6 * time.Minute)
-	res := mustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatalf("sustained link-down must still fail: %+v", res)
 	}

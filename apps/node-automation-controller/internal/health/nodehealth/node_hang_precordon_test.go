@@ -21,7 +21,7 @@ func TestCheckNodeHangPreCordon(t *testing.T) {
 		probetest.ReadyWorkerNode("w-hang", "KernelHungTasks", 5*time.Minute, false),
 		probetest.ReadyWorkerNode("w-ok", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := mustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("hung node did not fail the check")
 	}
 	n, err := cs.CoreV1().Nodes().Get(ctx, "w-hang", metav1.GetOptions{})
@@ -46,7 +46,7 @@ func TestCheckNodeHangPreCordonTooFresh(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "FilesystemReadOnly", time.Minute, false),
 		probetest.ReadyWorkerNode("w2", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := mustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("fresh latch failed the check: %+v", res)
 	}
 	n, _ := cs.CoreV1().Nodes().Get(ctx, "w1", metav1.GetOptions{})
@@ -66,7 +66,7 @@ func TestCheckNodeHangPreCordonStampsAnnotation(t *testing.T) {
 		probetest.ReadyWorkerNode("w-hang", "KernelHungTasks", 5*time.Minute, false),
 		probetest.ReadyWorkerNode("w-ok", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := mustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("hung node did not fail the check")
 	}
 	n, err := cs.CoreV1().Nodes().Get(ctx, "w-hang", metav1.GetOptions{})
@@ -88,7 +88,7 @@ func TestCheckNodeHangAutoUncordon(t *testing.T) {
 		precordonedWorkerNode("w-recover", true),
 		probetest.ReadyWorkerNode("w-ok", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := mustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("cleared node must pass: %+v", res)
 	}
 	n, err := cs.CoreV1().Nodes().Get(ctx, "w-recover", metav1.GetOptions{})
@@ -114,7 +114,7 @@ func TestCheckNodeHangLeavesForeignCordon(t *testing.T) {
 	foreign := probetest.ReadyWorkerNode("w-manual", "", 0, true) // unschedulable, no stamp
 	cs := fake.NewSimpleClientset(foreign, probetest.ReadyWorkerNode("w-ok", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := mustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("no latch must pass: %+v", res)
 	}
 	n, _ := cs.CoreV1().Nodes().Get(ctx, "w-manual", metav1.GetOptions{})
@@ -132,7 +132,7 @@ func TestCheckNodeHangUncordonBlockedByFreshLatch(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(n, probetest.ReadyWorkerNode("w-ok", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := mustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("fresh latch must not fail the check: %+v", res)
 	}
 	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-fresh", metav1.GetOptions{})
@@ -151,7 +151,7 @@ func TestCheckNodeHangStaleStampCleanup(t *testing.T) {
 	n := precordonedWorkerNode("w-stale", false) // schedulable but still stamped
 	cs := fake.NewSimpleClientset(n, probetest.ReadyWorkerNode("w-ok", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := mustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("stale stamp must pass: %+v", res)
 	}
 	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-stale", metav1.GetOptions{})
@@ -175,7 +175,7 @@ func TestCheckNodeHangClockSkewCordon(t *testing.T) {
 		probetest.ReadyWorkerNode("w-skew-fresh", nodeClockSkewCond, 5*time.Minute, false),
 		probetest.ReadyWorkerNode("w-ok", "", 0, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := mustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("sustained clock skew did not fail the check")
 	}
 	old, _ := cs.CoreV1().Nodes().Get(ctx, "w-skew", metav1.GetOptions{})
@@ -205,7 +205,7 @@ func TestNodeHangPreCordonNewLatches(t *testing.T) {
 			probetest.ReadyWorkerNode(name, cond, 5*time.Minute, false),
 			probetest.ReadyWorkerNode("w-ok-"+string(rune('a'+i)), "", 0, false))
 		p := testProberDyn(cs, probetest.OpDyn())
-		if res := mustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
+		if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(ctx); res.Pass {
 			t.Fatalf("%s latch did not fail the check", cond)
 		}
 		n, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})

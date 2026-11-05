@@ -17,7 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // schedulerWatchdogCheck is the W8-CP3 scheduler-watchdog — a stopped
@@ -49,14 +49,14 @@ const (
 // scheduler is the platform's job; this check makes the freeze
 // visible on node_automation_scheduler_frozen.
 func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
-	nodes, err := shared.ListNodes(ctx, p.CS)
+	nodes, err := kube.ListNodes(ctx, p.CS)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
 	schedulable := false
 	for i := range nodes {
-		if shared.NodeReady(&nodes[i]) && !nodes[i].Spec.Unschedulable &&
-			!shared.IsControlPlane(&nodes[i]) {
+		if kube.NodeReady(&nodes[i]) && !nodes[i].Spec.Unschedulable &&
+			!kube.IsControlPlane(&nodes[i]) {
 			schedulable = true
 			break
 		}

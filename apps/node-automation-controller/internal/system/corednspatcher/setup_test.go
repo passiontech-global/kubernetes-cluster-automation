@@ -67,7 +67,7 @@ func TestSetupRejectsInvalidZoneWhen(t *testing.T) {
 			got-errsBefore)
 	}
 	// An empty zoneWhen env falls back to the DoNotSchedule default
-	// (shared.Getenv treats empty as unset) and registers normally —
+	// (envx.Getenv treats empty as unset) and registers normally —
 	// only a non-empty invalid value can reach the validation above.
 	m = testutil.NewStubManager()
 	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "")

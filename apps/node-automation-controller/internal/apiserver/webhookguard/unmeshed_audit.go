@@ -24,7 +24,9 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 const (
@@ -63,7 +65,7 @@ const (
 // flip takes effect on the next sweep without a code change (same
 // pattern as circuitBreakerEnabled).
 func unmeshedRemediationEnabled() bool {
-	return shared.Gate("UNMESHED_POD_REMEDIATION_ENABLED", true)
+	return envx.Gate("UNMESHED_POD_REMEDIATION_ENABLED", true)
 }
 
 // unmeshedPodAuditor owns the unmeshed-pod sweep's per-sweep state —
@@ -75,7 +77,7 @@ type unmeshedPodAuditor struct {
 	// unmeshedEmitted is the same ledger for UnmeshedPods
 	// ("namespace/pod") — deleted pods and pods that gained the
 	// sidecar get their series pruned each sweep.
-	unmeshedEmitted shared.GaugeLedger[string]
+	unmeshedEmitted state.GaugeLedger[string]
 }
 
 // sweepUnmeshedPods audits Running Pods that opted into linkerd
@@ -117,8 +119,8 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 		FieldSelector: "status.phase=Running",
 		Limit:         listPageSize,
 	}
-	err := shared.ListEach(ctx, listOpts,
-		shared.Pods(g.cs, metav1.NamespaceAll),
+	err := kube.ListEach(ctx, listOpts,
+		kube.Pods(g.cs, metav1.NamespaceAll),
 		func(items []corev1.Pod) error {
 			for i := range items {
 				p := &items[i]
@@ -193,7 +195,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 	// W7-C1 — the maintenance mutex gates the evictions: killing
 	// pods mid-drain/upgrade is exactly what the mutex exists to
 	// prevent, and "cannot verify" fails closed like every other
-	// caller of shared.MaintenanceActive.
+	// caller of kube.MaintenanceActive.
 	held, why, err := g.maintenanceActive(ctx)
 	if err != nil {
 		metrics.IncError(g.queue)
@@ -231,7 +233,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 		// same-named pod recreated in between was admitted after
 		// the injector recovered and is not ours to reap.
 		uid := p.UID
-		deleteOpts := shared.UIDDeleteOptions(uid, "")
+		deleteOpts := kube.UIDDeleteOptions(uid, "")
 		eviction := &policyv1.Eviction{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      p.Name,

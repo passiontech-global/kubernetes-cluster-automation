@@ -79,7 +79,7 @@
 // 2.7 — Cluster Maintenance Mutex: the whole wipe cycle defers while
 // deliberate maintenance is in flight — replacing a worker pod
 // mid-drain/upgrade fights the operator doing the work and can wedge
-// a PDB for hours. The check itself is shared.MaintenanceActive —
+// a PDB for hours. The check itself is kube.MaintenanceActive —
 // the canonical implementation every deferring module runs (cordon/
 // drain, kured reboot lock, autopilot Plan):
 //
@@ -110,6 +110,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -251,12 +252,12 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	// The mutex runs BEFORE the whole-run timeout installs, so the
 	// check gets its own bound — an apiserver hang must not pin the
 	// periodic sweep forever. One overall reqTimeout covers all
-	// three signal reads inside shared.MaintenanceActive (the old
+	// three signal reads inside kube.MaintenanceActive (the old
 	// in-package copy wrapped each call separately; an aggregate
 	// bound is strictly tighter and avoids growing a
 	// per-call-timeout variant of the shared API).
 	mctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
-	held, why, err := shared.MaintenanceActive(mctx, j.cs, j.dyn)
+	held, why, err := kube.MaintenanceActive(mctx, j.cs, j.dyn)
 	cancel()
 	if err != nil {
 		return err
@@ -363,7 +364,7 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 	// serving builds anyway. Once the window passes the guard lifts so
 	// a wedged-not-Ready pod can still be replaced (bash had no such
 	// guard; an interrupted CronJob could thrash the same pod).
-	if !shared.PodReadyCond(pod) && time.Since(pod.CreationTimestamp.Time) < j.readyTimeout {
+	if !kube.PodReadyCond(pod) && time.Since(pod.CreationTimestamp.Time) < j.readyTimeout {
 		log.Info("SKIP: not Ready after creation — mid init-rm",
 			"pod", podName,
 			"createdAgo", time.Since(pod.CreationTimestamp.Time).Truncate(time.Minute),

@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
 )
 
 // ConfigFromEnv fills the ported-check knobs of c — c.DNS,
@@ -27,7 +27,7 @@ func ConfigFromEnv(c *probefw.Config) {
 	// alertmanager-operated NXDOMAINs whenever its single pod is
 	// recreating, which would flap the DNS check during every
 	// alertmanager rollout despite CoreDNS being fine.
-	hosts := strings.Split(shared.Getenv("HEALTH_DNS_HOSTNAMES",
+	hosts := strings.Split(envx.Getenv("HEALTH_DNS_HOSTNAMES",
 		"kubernetes.default.svc.cluster.local,"+
 			"kube-prometheus-stack-prometheus.prometheus-operator.svc.cluster.local"), ",")
 	trimmed := hosts[:0]
@@ -38,15 +38,15 @@ func ConfigFromEnv(c *probefw.Config) {
 	}
 	c.DNS = probefw.DNSConfig{Hostnames: trimmed}
 	c.HTTPContent = probefw.HTTPContentConfig{
-		URL:      shared.Getenv("HEALTH_HTTP_CONTENT_URL", "http://kube-prometheus-stack-prometheus.prometheus-operator.svc:9090/-/healthy"),
-		Expected: shared.Getenv("HEALTH_HTTP_EXPECTED_CONTENT", "Healthy"),
+		URL:      envx.Getenv("HEALTH_HTTP_CONTENT_URL", "http://kube-prometheus-stack-prometheus.prometheus-operator.svc:9090/-/healthy"),
+		Expected: envx.Getenv("HEALTH_HTTP_EXPECTED_CONTENT", "Healthy"),
 	}
 	c.Pods = probefw.PodsConfig{
-		Namespace:    shared.Getenv("HEALTH_POD_CHECK_NAMESPACE", "kube-system"),
-		MaxRestarts:  int32(shared.GetenvIntMin("HEALTH_MAX_POD_RESTARTS", 10, 0)),
-		SkipDuration: shared.GetenvDuration("HEALTH_POD_SKIP_DURATION", 10*time.Minute),
+		Namespace:    envx.Getenv("HEALTH_POD_CHECK_NAMESPACE", "kube-system"),
+		MaxRestarts:  int32(envx.GetenvIntMin("HEALTH_MAX_POD_RESTARTS", 10, 0)),
+		SkipDuration: envx.GetenvDuration("HEALTH_POD_SKIP_DURATION", 10*time.Minute),
 	}
 	c.Quota = probefw.QuotaConfig{
-		Threshold: shared.GetenvFloatPositive("HEALTH_RESOURCE_QUOTA_THRESHOLD", 0.9),
+		Threshold: envx.GetenvFloatPositive("HEALTH_RESOURCE_QUOTA_THRESHOLD", 0.9),
 	}
 }

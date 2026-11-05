@@ -26,16 +26,16 @@
 //     CLUSTER_HEALTH_PROBES_ENABLED / _INTERVAL plus the per-check
 //     HEALTH_* knobs (see internal/clusterhealthprobes).
 //   - `-modules name1,name2,@group` runs only the listed modules —
-//     registry ops names from modules.go, or a whole registry section
-//     via an @-selector (@system, @node, @apiserver, @janitors,
-//     @integration, @health); default: all — blast-radius control for
-//     isolating a module or splitting auditors from healers across
-//     Deployments.
+//     registry ops names from internal/registry, or a whole registry
+//     section via an @-selector (@system, @node, @apiserver,
+//     @janitors, @integration, @health); default: all — blast-radius
+//     control for isolating a module or splitting auditors from
+//     healers across Deployments.
 //
 // Registration gates (the *_ENABLED flags that decide whether a
 // module wires anything at all) live in the shared.Module registry —
-// see modules.go; setupModules evaluates them and stamps
-// Deps.Disabled. Modules still resolve their own knobs and
+// see internal/registry; registry.SetupModules evaluates them and
+// stamps Deps.Disabled. Modules still resolve their own knobs and
 // sub-feature gates from env inside Setup — see
 // internal/shared/env.go for the parsing helpers.
 package main
@@ -64,6 +64,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/apiserverendpointguard"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -121,7 +122,7 @@ func buildCacheOptions() cache.Options {
 			},
 			// cilium component Role: pods in kube-system — informer is
 			// only started when CILIUM_TAINT_REAPER_ENABLED=true (the
-			// registry gate in modules.go hands the module
+			// registry gate in internal/registry hands the module
 			// Deps.Disabled, so it registers nothing when off), so
 			// clusters without the component (and thus without pods
 			// watch RBAC) never open this watch. No other module
@@ -210,8 +211,8 @@ func main() {
 	// exists so /metrics shows the full fleet.
 	flag.StringVar(&modulesFilter, "modules", "",
 		"comma-separated module names or @groups to run (default: all); "+
-			"names are the registry ops names from modules.go and "+
-			"@<group> expands to a whole section (e.g. @janitors)")
+			"names are the registry ops names from internal/registry "+
+			"and @<group> expands to a whole section (e.g. @janitors)")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -227,8 +228,8 @@ func main() {
 	// Resolve the -modules allowlist before touching the cluster: an
 	// unknown name fails boot here (fail fast — a typo'd allowlist
 	// silently running the wrong subset is worse than not starting).
-	moduleNames := parseModulesFlag(modulesFilter)
-	mods, err := filterModules(moduleNames)
+	moduleNames := registry.ParseModulesFlag(modulesFilter)
+	mods, err := registry.FilterModules(moduleNames)
 	if err != nil {
 		log.Error(err, "invalid -modules allowlist")
 		os.Exit(1)
@@ -277,7 +278,7 @@ func main() {
 	}
 
 	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn, Log: ctrl.Log}
-	if err := setupModules(deps, mods); err != nil {
+	if err := registry.SetupModules(deps, mods); err != nil {
 		os.Exit(1)
 	}
 

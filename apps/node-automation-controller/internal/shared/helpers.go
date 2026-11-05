@@ -23,8 +23,11 @@
 //     modules register a reconciler and use Result.RequeueAfter as the
 //     old crontab safety-net.
 //
-// The old helpers.go grab-bag is split by concern: periodic.go
-// (schedule runnable + sweep fan-in), node.go (taints/conditions/
-// labels + ListNodes), pods.go (DaemonSet/pod checks), replicas.go
-// (CPA replica math), maintenance.go (cluster maintenance mutex).
+// This package keeps only the module contract layer: Module, Deps,
+// SetupWithConfig, Periodic/AddPeriodic + the sweep fan-in, and the
+// Clock seam. The reusable leaf machinery it used to also hold now
+// lives under internal/platform/: envx (env parsing + Gate), state
+// (the Gauge/Cooldown/FirstSeen/Streak/Seen ledgers), kube (list
+// pagination, node/pod/patch helpers, the GVR registry, replicas,
+// the maintenance mutex).
 package shared

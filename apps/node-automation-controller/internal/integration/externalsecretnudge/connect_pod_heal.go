@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -68,7 +68,7 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	// Same fail-closed maintenance gate as every pod kill in this
 	// module — cordon/drain/kured or an in-flight upgrade defers the
 	// bounce, and "cannot verify" skips it.
-	held, why, err := shared.MaintenanceActive(ctx, n.cs, n.dyn)
+	held, why, err := kube.MaintenanceActive(ctx, n.cs, n.dyn)
 	if err != nil {
 		metrics.IncError(n.queue)
 		log.Info("WARN: maintenance check unverifiable — "+
@@ -91,7 +91,7 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 		"storeDown", storeDown, "stormLong", stormLong)
 	uid := pod.UID
 	if err := n.cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-		shared.UIDDeleteOptions(uid, "")); err != nil {
+		kube.UIDDeleteOptions(uid, "")); err != nil {
 		metrics.IncError(n.queue)
 		log.Error(err, "connect pod delete failed",
 			"pod", pod.Namespace+"/"+pod.Name)
@@ -111,9 +111,9 @@ func (n *externalSecretNudge) oldestConnectPod(ctx context.Context) *corev1.Pod 
 	log := logf.FromContext(ctx)
 	var oldest *corev1.Pod
 	for _, ns := range esConnectNamespaces {
-		pods, err := shared.ListAll(ctx,
+		pods, err := kube.ListAll(ctx,
 			metav1.ListOptions{Limit: esListPageSize},
-			shared.Pods(n.cs, ns))
+			kube.Pods(n.cs, ns))
 		if err != nil {
 			if !apierrors.IsNotFound(err) {
 				metrics.IncError(n.queue)

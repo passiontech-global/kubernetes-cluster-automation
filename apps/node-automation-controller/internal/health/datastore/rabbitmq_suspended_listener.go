@@ -9,7 +9,8 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -24,8 +25,8 @@ type rabbitMQSuspendedCheck struct {
 	//     showed the suspended-listener signature (uid in the key
 	//     keeps a same-named replacement from inheriting the streak).
 	//   - rbHealed: "ns/pod" → last delete — the 30m heal cooldown.
-	rbSuspendedSince shared.FirstSeenLedger
-	rbHealed         shared.CooldownSet
+	rbSuspendedSince state.FirstSeenLedger
+	rbHealed         state.CooldownSet
 }
 
 // newRabbitMQSuspendedCheck builds the W6.4 check — both ledgers
@@ -116,7 +117,7 @@ func (p *rabbitMQSuspendedCheck) rabbitQuorumSafe(ctx context.Context, pod *core
 		if peer.UID == pod.UID {
 			continue
 		}
-		if shared.PodReadyCond(peer) {
+		if kube.PodReadyCond(peer) {
 			readyPeers++
 		}
 	}
@@ -171,7 +172,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 	var maintWhy string
 	var maintErr error
 	if len(due) > 0 {
-		maintHeld, maintWhy, maintErr = shared.MaintenanceActive(ctx, p.CS, p.Dyn)
+		maintHeld, maintWhy, maintErr = kube.MaintenanceActive(ctx, p.CS, p.Dyn)
 		if maintErr != nil {
 			metrics.IncError(p.Name)
 			log.Info("WARN: maintenance check unverifiable — heals deferred (fail closed)",

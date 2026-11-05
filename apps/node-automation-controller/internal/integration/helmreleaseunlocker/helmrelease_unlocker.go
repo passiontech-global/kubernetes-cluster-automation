@@ -84,6 +84,9 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -104,7 +107,7 @@ const (
 // helmReleaseGVRs tried in order — v2 on current flux, v2beta2 on
 // installs that have not bumped the CRDs yet. The first listable GVR
 // wins and is reused for the requestedAt patches.
-var helmReleaseGVRs = shared.HelmReleaseGVRs
+var helmReleaseGVRs = kube.HelmReleaseGVRs
 
 type helmReleaseUnlocker struct {
 	cs  kubernetes.Interface
@@ -121,18 +124,22 @@ type helmReleaseUnlocker struct {
 	// firstSeen: ns/name → first tick that saw the HR stuck on
 	// "in progress". Pruned when the HR recovers; an operator restart
 	// re-arms it, biasing conservative.
-	firstSeen shared.FirstSeenLedger
+	firstSeen state.FirstSeenLedger
 	// unlocked: ns/name → last successful unlock — enforces the
 	// 1-unlock/24h cap and detects "stuck again after unlock".
 	// Pruned each sweep once past the cooldown or when the HR
-	// vanished.
+	// vanished. Kept as a raw map (not state.CooldownSet): the
+	// cooldown merge reads the raw stamp to fold in the persisted
+	// node.ops/last-helm-unlock annotation and to compute the
+	// "unlockedAgo" alert field, and the prune needs the stamp for
+	// the expiry check — CooldownSet exposes neither.
 	unlocked map[string]time.Time
 	// alerted: ns/name → the "still stuck after unlock" page already
 	// fired for the CURRENT cooldown window — without it a stuck HR
 	// re-bumps the error metric every 10-minute sweep for up to
 	// 24h (~144 increments/day). Pruned alongside unlocked so a new
 	// cooldown window alerts afresh.
-	alerted map[string]bool
+	alerted state.SeenSet
 	// stallEnabled gates the stalled-rollout surge unwedge —
 	// HELM_STALL_UNWEDGE_ENABLED. Opt-in because the remediation
 	// scales workload ReplicaSets (brief availability dip) and needs
@@ -147,9 +154,9 @@ type helmReleaseUnlocker struct {
 	// CooldownSets are zero-value ready and deliberately unbounded:
 	// stamps past the window read uncooled and entries for
 	// vanished HRs are dead weight.
-	stallFirstSeen shared.FirstSeenLedger
-	unwedged       shared.CooldownSet
-	stallAlerted   shared.CooldownSet
+	stallFirstSeen state.FirstSeenLedger
+	unwedged       state.CooldownSet
+	stallAlerted   state.CooldownSet
 	// stallAttempts caps the stall-unwedge retry cycle per
 	// lastAttemptedRevision (W8-GO2): at most 2 attempts for one
 	// revision, each at least 6h apart — a revision that could not
@@ -159,7 +166,7 @@ type helmReleaseUnlocker struct {
 	// Job delete (W8-GO1) — the 30m in-RAM half of the cooldown; the
 	// durable half is node.ops/last-immutable-job-heal on the
 	// Kustomization itself.
-	immutableJobHealed shared.CooldownSet
+	immutableJobHealed state.CooldownSet
 }
 
 // stallAttempt counts unwedge tries against one lastAttemptedRevision.
@@ -180,8 +187,7 @@ func Setup(d shared.Deps) error {
 		queue:         d.Name,
 		now:           shared.SystemClock,
 		unlocked:      map[string]time.Time{},
-		alerted:       map[string]bool{},
-		stallEnabled:  shared.Gate("HELM_STALL_UNWEDGE_ENABLED", false),
+		stallEnabled:  envx.Gate("HELM_STALL_UNWEDGE_ENABLED", false),
 		stallAttempts: map[string]*stallAttempt{},
 	}
 	return shared.AddPeriodic(d.Mgr, u.queue, helmUnlockInterval, u.run)
@@ -193,8 +199,8 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	defer u.mu.Unlock()
 	// Lazy-init for literal-constructed structs (tests) — Setup
 	// always initializes, but a fixture must not panic on a nil map.
-	// The FirstSeenLedger and CooldownSet fields are zero-value
-	// ready — no arm needed.
+	// The FirstSeenLedger, SeenSet and CooldownSet fields are
+	// zero-value ready — no arm needed.
 	if u.stallAttempts == nil {
 		u.stallAttempts = map[string]*stallAttempt{}
 	}
@@ -242,7 +248,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	for key, last := range u.unlocked {
 		if !present[key] || now.Sub(last) >= helmUnlockCooldown {
 			delete(u.unlocked, key)
-			delete(u.alerted, key)
+			u.alerted.Forget(key)
 		}
 	}
 	// The unwedge ledger + its alert dedup need no prune pass:
@@ -335,8 +341,8 @@ func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructur
 // it so no single response hauls the whole resource across the wire.
 func (u *helmReleaseUnlocker) listAllPages(ctx context.Context,
 	ri dynamic.ResourceInterface) (*unstructured.UnstructuredList, error) {
-	items, err := shared.ListAll(ctx, metav1.ListOptions{Limit: helmListPageSize},
-		shared.DynamicPage(ri))
+	items, err := kube.ListAll(ctx, metav1.ListOptions{Limit: helmListPageSize},
+		kube.DynamicPage(ri))
 	if err != nil {
 		return nil, err
 	}
@@ -374,9 +380,9 @@ func (u *helmReleaseUnlocker) helmControllerDown(ctx context.Context) (bool, err
 // skipped — hook cleanup never fails the caller.
 func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string) {
 	log := logf.FromContext(ctx)
-	jobs, err := shared.ListAll(ctx,
+	jobs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: helmListPageSize},
-		shared.Jobs(u.cs, ns))
+		kube.Jobs(u.cs, ns))
 	if err != nil {
 		log.Error(err, "helm-hook job list failed — hook cleanup skipped", "ns", ns)
 		return
@@ -392,7 +398,7 @@ func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string
 		log.Info("ACTION: delete failed helm-hook Job",
 			"ns", ns, "job", j.Name)
 		if err := u.cs.BatchV1().Jobs(ns).Delete(ctx, j.Name,
-			shared.UIDDeleteOptions(j.UID, metav1.DeletePropagationBackground)); err != nil {
+			kube.UIDDeleteOptions(j.UID, metav1.DeletePropagationBackground)); err != nil {
 			log.Error(err, "helm-hook job delete failed", "ns", ns, "job", j.Name)
 			continue
 		}
@@ -417,10 +423,10 @@ func jobFailed(j *batchv1.Job) bool {
 // bare object name. It is the `name=` label helm puts on its release
 // secrets.
 func hrReleaseName(hr *unstructured.Unstructured) string {
-	if n, _ := shared.NestedString(hr.Object, "spec", "releaseName"); n != "" {
+	if n, _ := kube.NestedString(hr.Object, "spec", "releaseName"); n != "" {
 		return n
 	}
-	if ns, _ := shared.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
+	if ns, _ := kube.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
 		return ns + "-" + hr.GetName()
 	}
 	return hr.GetName()
@@ -432,7 +438,7 @@ func hrReleaseName(hr *unstructured.Unstructured) string {
 // workload the chart renders). Hook Jobs live here, not in the
 // storage namespace.
 func hrReleaseNS(hr *unstructured.Unstructured) string {
-	if ns, _ := shared.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
+	if ns, _ := kube.NestedString(hr.Object, "spec", "targetNamespace"); ns != "" {
 		return ns
 	}
 	return hr.GetNamespace()
@@ -444,7 +450,7 @@ func hrReleaseNS(hr *unstructured.Unstructured) string {
 // part of the chain (it only locates the installed release, not its
 // bookkeeping).
 func hrStorageNS(hr *unstructured.Unstructured) string {
-	if ns, _ := shared.NestedString(hr.Object, "spec", "storageNamespace"); ns != "" {
+	if ns, _ := kube.NestedString(hr.Object, "spec", "storageNamespace"); ns != "" {
 		return ns
 	}
 	return hr.GetNamespace()

@@ -18,7 +18,7 @@ func TestCheckSchedulerFrozen(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false),
 		probetest.PendingUnscheduledPod("apps", "stuck-1", 10*time.Minute, false))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := mustCheck[*schedulerWatchdogCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("frozen scheduler shape passed")
 	}
 	m := probetest.FindMetric(t, "node_automation_scheduler_frozen", map[string]string{})
@@ -32,7 +32,7 @@ func TestCheckSchedulerFrozenHealthy(t *testing.T) {
 		probetest.ReadyWorkerNode("w1", "", 0, false),
 		probetest.PendingUnscheduledPod("apps", "verdict", 10*time.Minute, true))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := mustCheck[*schedulerWatchdogCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*schedulerWatchdogCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("PodScheduled=False verdict pod misread as frozen: %+v", res)
 	}
 }

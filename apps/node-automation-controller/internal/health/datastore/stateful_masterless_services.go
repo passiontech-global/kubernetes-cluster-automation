@@ -19,7 +19,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -50,10 +51,10 @@ type statefulMasterlessCheck struct {
 	//     of "when did step 1 last land" for the W7-C3 settle gate
 	//     (a CooldownSet suppresses repeats but cannot report the
 	//     latest stamp back, so the moment is carried alongside).
-	stsZeroSince   shared.FirstSeenLedger
+	stsZeroSince   state.FirstSeenLedger
 	stsZeroEmitted map[string]bool
-	drHealed       shared.CooldownSet
-	drPodHealed    shared.CooldownSet
+	drHealed       state.CooldownSet
+	drPodHealed    state.CooldownSet
 	drOpHealAt     time.Time
 }
 
@@ -227,9 +228,9 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	// counts as ready). A list error skips the whole check: "0
 	// ready" is indistinguishable from "no data".
 	ready := map[string]int{}
-	err = shared.ListEach(ctx,
+	err = kube.ListEach(ctx,
 		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		shared.EndpointSlices(p.CS, metav1.NamespaceAll),
+		kube.EndpointSlices(p.CS, metav1.NamespaceAll),
 		func(items []discoveryv1.EndpointSlice) error {
 			for _, s := range items {
 				svc := s.Labels[discoveryv1.LabelServiceName]
@@ -418,7 +419,7 @@ func (p *statefulMasterlessCheck) logStatefulPodRoles(ctx context.Context, log l
 			"service", sig.ns+"/"+sig.svc,
 			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name,
 			"pod", pod.Name,
-			"ready", shared.PodReadyCond(pod),
+			"ready", kube.PodReadyCond(pod),
 			"roles", fmt.Sprintf("%v", roles))
 	}
 }

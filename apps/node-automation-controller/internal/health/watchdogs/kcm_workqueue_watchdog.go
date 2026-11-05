@@ -8,7 +8,8 @@ import (
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -28,7 +29,7 @@ type kcmWorkqueueCheck struct {
 	//   - kcmFrozenReasons: reason labels currently held at 1, so a
 	//     resolved signature flips its series back to 0 instead of
 	//     leaking a stale 1 forever.
-	kcmFirstSeen     shared.FirstSeenLedger
+	kcmFirstSeen     state.FirstSeenLedger
 	kcmFrozenReasons map[string]bool
 }
 
@@ -96,13 +97,13 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	nodes, err := shared.ListNodes(ctx, p.CS)
+	nodes, err := kube.ListNodes(ctx, p.CS)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
 	ready := false
 	for i := range nodes {
-		if shared.NodeReady(&nodes[i]) {
+		if kube.NodeReady(&nodes[i]) {
 			ready = true
 			break
 		}
@@ -211,7 +212,7 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 // nodes, absent/stale KCM Lease) so a signature that flaps around a
 // precondition edge re-arms its persistence window from scratch.
 func (p *kcmWorkqueueCheck) resetKCMWorkqueue() {
-	p.kcmFirstSeen = shared.FirstSeenLedger{}
+	p.kcmFirstSeen = state.FirstSeenLedger{}
 	for reason := range p.kcmFrozenReasons {
 		metrics.KCMWorkqueueFrozen.WithLabelValues(reason).Set(0)
 		delete(p.kcmFrozenReasons, reason)

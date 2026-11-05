@@ -15,7 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ func (j *concourseWorkdirJanitor) deletePod(ctx context.Context, name string, ol
 	// — if the object already churned to a new UID, the delete must
 	// conflict rather than remove a pod we never vetted.
 	if err := j.cs.CoreV1().Pods(cjNamespace).Delete(dctx, name,
-		shared.UIDDeleteOptions(oldUID, "")); err != nil && !apierrors.IsNotFound(err) {
+		kube.UIDDeleteOptions(oldUID, "")); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete pod %s: %w", name, err)
 	}
 	err := wait.PollUntilContextCancel(dctx, j.fastPoll, true,
@@ -108,7 +108,7 @@ func (j *concourseWorkdirJanitor) waitReady(ctx context.Context, name string) er
 				logf.FromContext(ctx).V(1).Info("pod get failed — keep polling", "pod", name, "error", err)
 				return false, nil // transient — keep polling
 			}
-			return shared.PodReadyCond(p), nil
+			return kube.PodReadyCond(p), nil
 		})
 	if err != nil {
 		return fmt.Errorf("pod %s not Ready after %s: %w", name, j.readyTimeout, err)

@@ -16,7 +16,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -50,9 +50,9 @@ func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
 		return fmt.Errorf("get linkerd trust-roots configmap: %w", err)
 	}
 
-	secrets, err := shared.ListAll(ctx,
+	secrets, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: certDriftListPage},
-		shared.Secrets(a.cs, linkerdNS))
+		kube.Secrets(a.cs, linkerdNS))
 	if err != nil {
 		return fmt.Errorf("list linkerd secrets: %w", err)
 	}

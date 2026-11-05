@@ -26,7 +26,8 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // argoCDAppStuckCheck is the ArgoCD stuck-application watchdog with
@@ -38,11 +39,11 @@ type argoCDAppStuckCheck struct {
 	// persistence clock for health/condition shapes that carry no
 	// timestamp of their own; pruned when the signature resolves so
 	// a later stall re-arms the window.
-	seen shared.FirstSeenLedger
+	seen state.FirstSeenLedger
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1.
-	emitted shared.GaugeLedger[string]
+	emitted state.GaugeLedger[string]
 }
 
 // newArgoCDAppStuckCheck builds the W10-CP6 check — its state is the
@@ -66,7 +67,7 @@ const (
 // argocdAppGVR is the Application CRD the W10-CP6 auditor reads —
 // argoproj.io/v1alpha1 (distinct from the argoproj.io/v1beta1
 // ArgoCD cluster CR the operator watchdog already scans).
-var argocdAppGVR = shared.GVRArgoCDApplication
+var argocdAppGVR = kube.GVRArgoCDApplication
 
 var (
 	// W10-CP6 — ArgoCD Application stuck.
@@ -114,7 +115,7 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		ns, name := app.GetNamespace(), app.GetName()
 		var reasons []string
 
-		health, _ := shared.NestedString(app.Object,
+		health, _ := kube.NestedString(app.Object,
 			"status", "health", "status")
 		if health == "Progressing" {
 			sig := "prog/" + ns + "/" + name
@@ -127,7 +128,7 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		}
 		reasonSet := map[string]bool{}
 		hasComparisonError := false
-		for _, c := range shared.Conditions(app.Object, "status", "conditions") {
+		for _, c := range kube.Conditions(app.Object, "status", "conditions") {
 			typ := c.Type
 			lower := strings.ToLower(typ)
 			isCmp := strings.Contains(lower, "comparisonerror")

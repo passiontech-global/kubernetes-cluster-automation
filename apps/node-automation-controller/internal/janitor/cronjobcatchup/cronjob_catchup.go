@@ -40,6 +40,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -105,7 +107,7 @@ type cronJobCatchup struct {
 	// got its deadline patched, was suspended, or vanished gets its
 	// series deleted instead of pinning the alert forever (same
 	// seen-set hygiene as the webhook guard's brokenEmitted).
-	missedEmitted shared.GaugeLedger[string]
+	missedEmitted state.GaugeLedger[string]
 }
 
 // Setup registers the 15-minute sweep.
@@ -119,9 +121,9 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	now := c.now.Now()
 
-	cronjobs, err := shared.ListAll(ctx,
+	cronjobs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: catchupListPageSize},
-		shared.CronJobs(c.cs, metav1.NamespaceAll))
+		kube.CronJobs(c.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list cronjobs: %w", err) // periodic wrapper IncErrors c.queue
 	}
@@ -323,9 +325,9 @@ func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, 
 // Active Job still owned by the CronJob (a scheduled run in flight —
 // replaying on top of it double-fires the workload).
 func (c *cronJobCatchup) deduped(ctx context.Context, log logr.Logger, cj *batchv1.CronJob) bool {
-	jobs, err := shared.ListAll(ctx,
+	jobs, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: catchupListPageSize},
-		shared.Jobs(c.cs, cj.Namespace))
+		kube.Jobs(c.cs, cj.Namespace))
 	if err != nil {
 		// List failure = empty dedupe list, still create — a missed
 		// catch-up is worse than one extra idempotent Job.

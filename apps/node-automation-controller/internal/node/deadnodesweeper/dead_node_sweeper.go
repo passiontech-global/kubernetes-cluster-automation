@@ -55,6 +55,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -68,7 +69,7 @@ const (
 	// before path (b) is even considered — covers monitor-grace
 	// (40s), lease retry storms and short network partitions.
 	deadNodeUnknownAge = 30 * time.Minute
-	// per-probe apiserver timeout (8s) lives in shared.KubeletHealthz —
+	// per-probe apiserver timeout (8s) lives in kube.KubeletHealthz —
 	// this module used to define it as "same as the kubelet reaper's".
 	// deadNodeCap: nodes tainted per cycle — wrong verdicts must
 	// never take more than one node at a time.
@@ -83,8 +84,8 @@ const (
 // medik8s remediation CRs — a fencer naming a node is the strongest
 // death certificate available in-cluster.
 var (
-	selfNodeRemediationGVR    = shared.GVRSelfNodeRemediation
-	fenceAgentsRemediationGVR = shared.GVRFenceAgentsRemediation
+	selfNodeRemediationGVR    = kube.GVRSelfNodeRemediation
+	fenceAgentsRemediationGVR = kube.GVRFenceAgentsRemediation
 )
 
 type deadNodeSweeper struct {
@@ -110,7 +111,7 @@ func Setup(d shared.Deps) error {
 func (s *deadNodeSweeper) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	nodes, err := shared.ListNodes(ctx, s.cs)
+	nodes, err := kube.ListNodes(ctx, s.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}
@@ -120,14 +121,14 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	for i := range nodes {
 		n := &nodes[i]
 		nodeByName[n.Name] = n
-		if !shared.NodeReady(n) {
+		if !kube.NodeReady(n) {
 			hasNotReady = true
 		}
 
 		// Recovery first: a node back to Ready=True must not keep
 		// the out-of-service taint or it stays unschedulable.
-		if shared.HasTaint(n.Spec.Taints, outOfServiceTaintKey) && shared.NodeReady(n) {
-			if err := shared.UntaintNode(ctx, s.cs, n.Name, outOfServiceTaintKey); err != nil {
+		if kube.HasTaint(n.Spec.Taints, outOfServiceTaintKey) && kube.NodeReady(n) {
+			if err := kube.UntaintNode(ctx, s.cs, n.Name, outOfServiceTaintKey); err != nil {
 				log.Error(err, "untaint failed", "node", n.Name)
 				metrics.IncError(s.queue)
 				continue
@@ -165,10 +166,10 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// not every pod in the cluster (which is the same footprint the
 	// unbounded List had).
 	stuck := map[string]int{}
-	err = shared.ListEach(ctx, metav1.ListOptions{
+	err = kube.ListEach(ctx, metav1.ListOptions{
 		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
 		Limit:         500,
-	}, shared.Pods(s.cs, metav1.NamespaceAll),
+	}, kube.Pods(s.cs, metav1.NamespaceAll),
 		func(items []corev1.Pod) error {
 			for i := range items {
 				p := &items[i]
@@ -211,14 +212,14 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 				"node", nodeName, "stuckPods", count)
 			continue
 		}
-		if shared.NodeReady(n) {
+		if kube.NodeReady(n) {
 			// Node is alive: Terminating pods there are a wedged
 			// runtime/finalizer problem — the host watchdog's job,
 			// not a fencing decision.
 			log.Info("SKIP: node still Ready", "node", nodeName, "stuckPods", count)
 			continue
 		}
-		if shared.HasTaint(n.Spec.Taints, outOfServiceTaintKey) {
+		if kube.HasTaint(n.Spec.Taints, outOfServiceTaintKey) {
 			// Already fenced — the node controller is working on
 			// the force-deletes; does not consume the cap.
 			log.Info("KEEP-TAINT: already out-of-service", "node", nodeName, "stuckPods", count)
@@ -246,7 +247,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 		// Failure here must not veto the taint decision.
 		s.logVolumeAttachments(ctx, nodeName)
 
-		if err := shared.TaintNode(ctx, s.cs, nodeName, outOfServiceTaintKey,
+		if err := kube.TaintNode(ctx, s.cs, nodeName, outOfServiceTaintKey,
 			outOfServiceTaintValue, corev1.TaintEffectNoExecute); err != nil {
 			log.Error(err, "out-of-service taint failed", "node", nodeName,
 				"stuckPods", count)
@@ -281,7 +282,7 @@ func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node) (bo
 	// Path (b): Ready=Unknown held for >30m (the node controller
 	// stopped getting heartbeats long ago) AND the kubelet does not
 	// answer /healthz through the apiserver proxy.
-	c := shared.NodeCondition(n, corev1.NodeReady)
+	c := kube.NodeCondition(n, corev1.NodeReady)
 	if c == nil || c.Status != corev1.ConditionUnknown {
 		return false, nil // NotReady/False alone is not a death certificate
 	}
@@ -318,8 +319,8 @@ func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string)
 	for _, gvr := range []schema.GroupVersionResource{
 		selfNodeRemediationGVR, fenceAgentsRemediationGVR,
 	} {
-		items, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
-			shared.DynamicPage(s.dyn.Resource(gvr).Namespace(metav1.NamespaceAll)))
+		items, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+			kube.DynamicPage(s.dyn.Resource(gvr).Namespace(metav1.NamespaceAll)))
 		if err != nil {
 			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 				continue // CRD not installed on this cluster
@@ -335,11 +336,11 @@ func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string)
 	return false, nil
 }
 
-// probe is a single shared.KubeletHealthz attempt — a body starting
+// probe is a single kube.KubeletHealthz attempt — a body starting
 // with "ok" is healthy. No retries: the 30m Unknown window already
 // absorbed transient wobble.
 func (s *deadNodeSweeper) probe(ctx context.Context, nodeName string) (bool, error) {
-	body, err := shared.KubeletHealthz(ctx, s.cs, nodeName)
+	body, err := kube.KubeletHealthz(ctx, s.cs, nodeName)
 	if err != nil {
 		return false, err
 	}
@@ -354,8 +355,8 @@ func (s *deadNodeSweeper) logVolumeAttachments(ctx context.Context, nodeName str
 	// Paged like the pod list above — VolumeAttachments are
 	// cluster-scoped and unbounded, and this read is signal-only.
 	var names []string
-	err := shared.ListEach(ctx, metav1.ListOptions{Limit: 500},
-		shared.VolumeAttachments(s.cs),
+	err := kube.ListEach(ctx, metav1.ListOptions{Limit: 500},
+		kube.VolumeAttachments(s.cs),
 		func(items []storagev1.VolumeAttachment) error {
 			for i := range items {
 				if items[i].Spec.NodeName == nodeName {

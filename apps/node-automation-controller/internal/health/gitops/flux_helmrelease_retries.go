@@ -11,7 +11,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,7 +31,7 @@ type fluxHRRetriesCheck struct {
 	//     the 30m per-HelmRelease cooldown for the retries-exhausted
 	//     remediator (W10-CP4). The requestedAt annotation we stamp is
 	//     the durable half across restarts.
-	hrRetryHealed shared.CooldownSet
+	hrRetryHealed state.CooldownSet
 }
 
 // newFluxHRRetriesCheck builds the W10-CP4 check — the constructor
@@ -69,7 +70,7 @@ const (
 // helmReleaseRetryGVRs are the HelmRelease API versions the check
 // probes — v2 is current, v2beta2 the previous storage version; the
 // first List that succeeds wins.
-var helmReleaseRetryGVRs = shared.HelmReleaseGVRs
+var helmReleaseRetryGVRs = kube.HelmReleaseGVRs
 
 // fluxHRFailureReasons are the Ready=False reasons that mean the
 // helm action itself failed — combined with the "retries exhausted"
@@ -123,7 +124,7 @@ func (p *fluxHRRetriesCheck) Run(ctx context.Context) probefw.Result {
 	var stuck []string
 	for i := range hrs.Items {
 		hr := &hrs.Items[i]
-		if suspended, _ := shared.NestedBool(
+		if suspended, _ := kube.NestedBool(
 			hr.Object, "spec", "suspend"); suspended {
 			continue
 		}
@@ -165,7 +166,7 @@ func (p *fluxHRRetriesCheck) Run(ctx context.Context) probefw.Result {
 // message and lastTransitionTime from a HelmRelease. ok=false when no
 // Ready condition exists at all.
 func fluxHRReadyCondition(hr *unstructured.Unstructured) (status, reason, message string, since time.Time, ok bool) {
-	c, ok := shared.ConditionOf(hr.Object, "Ready")
+	c, ok := kube.ConditionOf(hr.Object, "Ready")
 	if !ok {
 		return "", "", "", time.Time{}, false
 	}
@@ -177,7 +178,7 @@ func fluxHRReadyCondition(hr *unstructured.Unstructured) (status, reason, messag
 // dependency fails closed — never remediate on an unverifiable chain.
 func (p *fluxHRRetriesCheck) fluxHRDepsReady(ctx context.Context,
 	gvr schema.GroupVersionResource, hr *unstructured.Unstructured) bool {
-	deps, found := shared.NestedSlice(hr.Object, "spec", "dependsOn")
+	deps, found := kube.NestedSlice(hr.Object, "spec", "dependsOn")
 	if !found {
 		return true // no dependsOn — vacuously ready
 	}
@@ -209,7 +210,7 @@ func (p *fluxHRRetriesCheck) fluxHRDepsReady(ctx context.Context,
 // fluxHRReadyStrings is the status-only half of fluxHRReadyCondition
 // for dependency checks.
 func fluxHRReadyStrings(obj *unstructured.Unstructured) (status, reason, message string) {
-	c, ok := shared.ConditionOf(obj.Object, "Ready")
+	c, ok := kube.ConditionOf(obj.Object, "Ready")
 	if !ok {
 		return "", "", ""
 	}
@@ -229,7 +230,7 @@ func (p *fluxHRRetriesCheck) maybePatchHRRetry(ctx context.Context, log logr.Log
 	// The requestedAt annotation is the durable half: a stamp younger
 	// than the cooldown — whether we wrote it or `flux reconcile`
 	// did — means a reconcile is already queued.
-	if v, found := shared.NestedString(
+	if v, found := kube.NestedString(
 		hr.Object, "metadata", "annotations", fluxHRRequestedAtAnno); found {
 		if t, err := time.Parse(time.RFC3339, v); err == nil &&
 			now.Sub(t) < fluxHRHealCooldown {

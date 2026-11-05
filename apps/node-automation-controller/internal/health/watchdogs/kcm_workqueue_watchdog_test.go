@@ -112,10 +112,10 @@ func TestCheckKCMWorkqueueFreezeAfterMinAge(t *testing.T) {
 	p.Now = func() time.Time { return base }
 
 	// First sighting stamps first-seen — quiet.
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
-	if _, ok := mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen.
+	if _, ok := probetest.MustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen.
 		Seen("daemonset_desired_zero/daemonset/cilium", base); !ok {
 		t.Fatal("signature not tracked in kcmFirstSeen")
 	}
@@ -127,7 +127,7 @@ func TestCheckKCMWorkqueueFreezeAfterMinAge(t *testing.T) {
 	at := base.Add(9 * time.Minute)
 	renewKCMLease(t, cs, at)
 	p.Now = func() time.Time { return at }
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("signature at 9m must still pass: %+v", res)
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
@@ -138,7 +138,7 @@ func TestCheckKCMWorkqueueFreezeAfterMinAge(t *testing.T) {
 	at = base.Add(10 * time.Minute)
 	renewKCMLease(t, cs, at)
 	p.Now = func() time.Time { return at }
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("signature persisted >=10m must FAIL")
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 1 {
@@ -181,21 +181,21 @@ func TestCheckKCMWorkqueueStaleObservedGeneration(t *testing.T) {
 	p := testProber(cs)
 	p.Now = func() time.Time { return base }
 
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
-	if _, ok := mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen.
+	if _, ok := probetest.MustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen.
 		Seen("stale_observed_generation/deployment/coredns", base); !ok {
 		t.Fatal("deployment signature not tracked")
 	}
-	if keys := wdTrackedKeys(&mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 1 {
+	if keys := probetest.LedgerKeys(&probetest.MustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 1 {
 		t.Fatalf("settled DS must not be tracked: %v", keys)
 	}
 
 	at := base.Add(11 * time.Minute)
 	renewKCMLease(t, cs, at)
 	p.Now = func() time.Time { return at }
-	res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatal("stale observedGeneration >=10m must FAIL")
 	}
@@ -220,20 +220,20 @@ func TestCheckKCMWorkqueueQuietOnStaleLease(t *testing.T) {
 	p := testProber(cs)
 	p.Now = func() time.Time { return base }
 
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("stale KCM lease must stay quiet: %+v", res)
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
 		t.Fatalf("frozen gauge = %v on stale lease, want absent/0", v)
 	}
-	if keys := wdTrackedKeys(&mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
+	if keys := probetest.LedgerKeys(&probetest.MustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
 		t.Fatalf("stale lease left %d tracked signatures", len(keys))
 	}
 
 	// A previously-frozen gauge also clears when the holder dies.
-	mustCheck[*kcmWorkqueueCheck](t, p).kcmFrozenReasons["daemonset_desired_zero"] = true
+	probetest.MustCheck[*kcmWorkqueueCheck](t, p).kcmFrozenReasons["daemonset_desired_zero"] = true
 	metrics.KCMWorkqueueFrozen.WithLabelValues("daemonset_desired_zero").Set(1)
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("stale KCM lease must stay quiet: %+v", res)
 	}
 	if v, ok := kcmFrozenGauge(t, "daemonset_desired_zero"); !ok || v != 0 {
@@ -243,7 +243,7 @@ func TestCheckKCMWorkqueueQuietOnStaleLease(t *testing.T) {
 	// No Lease object at all — same quiet path.
 	p = testProber(fake.NewSimpleClientset(kcmReadyNode(), kcmDesiredZeroDS()))
 	p.Now = func() time.Time { return base }
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("missing KCM lease must stay quiet: %+v", res)
 	}
 }
@@ -257,7 +257,7 @@ func TestCheckKCMWorkqueueQuietOnNoReadyNodes(t *testing.T) {
 	cs := fake.NewSimpleClientset(kcmLease(2*time.Second, base), kcmDesiredZeroDS())
 	p := testProber(cs)
 	p.Now = func() time.Time { return base }
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("no nodes must stay quiet: %+v", res)
 	}
 
@@ -272,13 +272,13 @@ func TestCheckKCMWorkqueueQuietOnNoReadyNodes(t *testing.T) {
 	cs = fake.NewSimpleClientset(notReady, kcmLease(2*time.Second, base), kcmDesiredZeroDS())
 	p = testProber(cs)
 	p.Now = func() time.Time { return base }
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("all nodes NotReady must stay quiet: %+v", res)
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
 		t.Fatalf("frozen gauge = %v with no ready nodes, want absent/0", v)
 	}
-	if keys := wdTrackedKeys(&mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
+	if keys := probetest.LedgerKeys(&probetest.MustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
 		t.Fatalf("no-ready-nodes left %d tracked signatures", len(keys))
 	}
 }
@@ -297,13 +297,13 @@ func TestCheckKCMWorkqueueRecoveryClearsGauge(t *testing.T) {
 	p.Now = func() time.Time { return base }
 
 	// Drive past the window into frozen.
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
 	}
 	at := base.Add(11 * time.Minute)
 	renewKCMLease(t, cs, at)
 	p.Now = func() time.Time { return at }
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("expected frozen FAIL")
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 1 {
@@ -325,13 +325,13 @@ func TestCheckKCMWorkqueueRecoveryClearsGauge(t *testing.T) {
 		t.Fatalf("update ds: %v", err)
 	}
 
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("recovered signature must pass: %+v", res)
 	}
 	if v, ok := kcmFrozenGauge(t, "daemonset_desired_zero"); !ok || v != 0 {
 		t.Fatalf("frozen gauge after recovery = %v,%v want 0", v, ok)
 	}
-	if keys := wdTrackedKeys(&mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
+	if keys := probetest.LedgerKeys(&probetest.MustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
 		t.Fatalf("resolved signature not pruned: %v", keys)
 	}
 }
@@ -367,19 +367,19 @@ func TestCheckKCMWorkqueueIgnoresEmptyDaemonSet(t *testing.T) {
 	p := testProber(cs)
 	p.Now = func() time.Time { return base }
 
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("empty DaemonSet must pass: %+v", res)
 	}
 	at := base.Add(30 * time.Minute)
 	renewKCMLease(t, cs, at)
 	p.Now = func() time.Time { return at }
-	if res := mustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("empty DaemonSet must never freeze: %+v", res)
 	}
 	if v, _ := kcmFrozenGauge(t, "daemonset_desired_zero"); v != 0 {
 		t.Fatalf("frozen gauge = %v, want absent/0", v)
 	}
-	if keys := wdTrackedKeys(&mustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
+	if keys := probetest.LedgerKeys(&probetest.MustCheck[*kcmWorkqueueCheck](t, p).kcmFirstSeen); len(keys) != 0 {
 		t.Fatalf("non-signature must not be tracked: %v", keys)
 	}
 }

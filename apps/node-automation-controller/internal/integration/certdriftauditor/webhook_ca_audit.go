@@ -21,7 +21,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ func (a *certDriftAuditor) certSecretName(ctx context.Context, ns, certName stri
 			"cert", ns+"/"+certName)
 		return "", false
 	}
-	if sn, ok := shared.NestedString(
+	if sn, ok := kube.NestedString(
 		cert.Object, "spec", "secretName"); ok && sn != "" {
 		return sn, true
 	}

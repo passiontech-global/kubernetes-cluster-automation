@@ -31,8 +31,8 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -85,56 +85,56 @@ func NewDeps(cs kubernetes.Interface, dyn dynamic.Interface) *probefw.Deps {
 // plus the OLM/autopilot reads must be mapped.
 func OpDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	return testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		shared.GVRGateway:   "GatewayList",
-		shared.GVRHTTPRoute: "HTTPRouteList",
-		shared.GVRGRPCRoute: "GRPCRouteList",
+		kube.GVRGateway:   "GatewayList",
+		kube.GVRHTTPRoute: "HTTPRouteList",
+		kube.GVRGRPCRoute: "GRPCRouteList",
 		// The owns filter LISTs classes once per stuck gateway-api
 		// object — unregistered GVR panics the fake.
-		shared.GVRGatewayClass:  "GatewayClassList",
-		shared.GVRScyllaCluster: "ScyllaClusterList",
-		shared.GVRDragonfly:     "DragonflyList",
-		shared.GVRHelmReleaseV2: "HelmReleaseList",
+		kube.GVRGatewayClass:  "GatewayClassList",
+		kube.GVRScyllaCluster: "ScyllaClusterList",
+		kube.GVRDragonfly:     "DragonflyList",
+		kube.GVRHelmReleaseV2: "HelmReleaseList",
 		// The flux retry check falls back to the previous storage
 		// version when v2 is unserved — register it too so that
 		// probe order cannot panic the fake.
-		shared.GVRHelmReleaseV2Beta2: "HelmReleaseList",
-		shared.GVRFluxKustomization:  "KustomizationList",
+		kube.GVRHelmReleaseV2Beta2: "HelmReleaseList",
+		kube.GVRFluxKustomization:  "KustomizationList",
 		// W7-C2 — the ten additional watched operators' CRDs.
-		shared.GVRFluxGitRepository:  "GitRepositoryList",
-		shared.GVRFluxHelmRepository: "HelmRepositoryList",
-		shared.GVRFluxHelmChart:      "HelmChartList",
-		shared.GVRFluxOCIRepository:  "OCIRepositoryList",
-		shared.GVRFluxBucket:         "BucketList",
+		kube.GVRFluxGitRepository:  "GitRepositoryList",
+		kube.GVRFluxHelmRepository: "HelmRepositoryList",
+		kube.GVRFluxHelmChart:      "HelmChartList",
+		kube.GVRFluxOCIRepository:  "OCIRepositoryList",
+		kube.GVRFluxBucket:         "BucketList",
 		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "alerts"}:    "AlertList",
 		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "providers"}: "ProviderList",
 		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "receivers"}: "ReceiverList",
-		shared.GVRCertificate:           "CertificateList",
-		shared.GVRExternalSecretV1:      "ExternalSecretList",
-		shared.GVRExternalSecretV1Beta1: "ExternalSecretList",
-		shared.GVRRabbitMQCluster:       "RabbitmqClusterList",
-		shared.GVRKedaScaledObject:      "ScaledObjectList",
-		shared.GVRArgoCD:                "ArgoCDList",
+		kube.GVRCertificate:           "CertificateList",
+		kube.GVRExternalSecretV1:      "ExternalSecretList",
+		kube.GVRExternalSecretV1Beta1: "ExternalSecretList",
+		kube.GVRRabbitMQCluster:       "RabbitmqClusterList",
+		kube.GVRKedaScaledObject:      "ScaledObjectList",
+		kube.GVRArgoCD:                "ArgoCDList",
 		// argocd-app-stuck Lists Applications unconditionally every
 		// sweep — same unregistered-GVR panic exposure as the
 		// watchdog table.
-		shared.GVRArgoCDApplication:      "ApplicationList",
-		shared.GVRKargoStage:             "StageList",
-		shared.GVRKargoWarehouse:         "WarehouseList",
-		shared.GVREverestDatabaseCluster: "DatabaseClusterList",
-		shared.GVRShipwrightBuild:        "BuildList",
+		kube.GVRArgoCDApplication:      "ApplicationList",
+		kube.GVRKargoStage:             "StageList",
+		kube.GVRKargoWarehouse:         "WarehouseList",
+		kube.GVREverestDatabaseCluster: "DatabaseClusterList",
+		kube.GVRShipwrightBuild:        "BuildList",
 		// W10-CP3 — the nine additional watched operators' CRDs.
-		shared.GVRNodeHealthCheck:         "NodeHealthCheckList",
-		shared.GVRSelfNodeRemediation:     "SelfNodeRemediationList",
-		shared.GVRPerconaXtraDBCluster:    "PerconaXtraDBClusterList",
-		shared.GVRPerconaPGCluster:        "PerconaPGClusterList",
-		shared.GVRPerconaServerMongoDB:    "PerconaServerMongoDBList",
-		shared.GVRTektonPipelineRun:       "PipelineRunList",
-		shared.GVRShipwrightOperatorBuild: "ShipwrightBuildList",
+		kube.GVRNodeHealthCheck:         "NodeHealthCheckList",
+		kube.GVRSelfNodeRemediation:     "SelfNodeRemediationList",
+		kube.GVRPerconaXtraDBCluster:    "PerconaXtraDBClusterList",
+		kube.GVRPerconaPGCluster:        "PerconaPGClusterList",
+		kube.GVRPerconaServerMongoDB:    "PerconaServerMongoDBList",
+		kube.GVRTektonPipelineRun:       "PipelineRunList",
+		kube.GVRShipwrightOperatorBuild: "ShipwrightBuildList",
 		// W7-C5 — OLM reads.
-		shared.GVROLMClusterServiceVersion: "ClusterServiceVersionList",
-		shared.GVROLMSubscription:          "SubscriptionList",
+		kube.GVROLMClusterServiceVersion: "ClusterServiceVersionList",
+		kube.GVROLMSubscription:          "SubscriptionList",
 		// Maintenance mutex read.
-		shared.AutopilotPlanGVR: "PlanList",
+		kube.AutopilotPlanGVR: "PlanList",
 	}, objs...)
 }
 

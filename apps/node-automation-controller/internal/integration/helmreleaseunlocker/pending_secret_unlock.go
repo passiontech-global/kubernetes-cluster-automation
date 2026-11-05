@@ -23,7 +23,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 const (
@@ -37,7 +37,7 @@ const (
 // with a "…in progress" message — the deadlock signature. A missing or
 // non-False Ready never counts.
 func hrStuckInProgress(hr *unstructured.Unstructured) bool {
-	c, _ := shared.ConditionOf(hr.Object, "Ready")
+	c, _ := kube.ConditionOf(hr.Object, "Ready")
 	return c.Status == "False" && strings.Contains(c.Message, "in progress")
 }
 
@@ -63,12 +63,8 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 			// unlock did NOT resolve it — page instead of churning
 			// secrets every tick. The alert itself fires once per
 			// cooldown window (alerted ledger), not per sweep.
-			if u.alerted == nil {
-				u.alerted = map[string]bool{} // literal-constructed structs (tests)
-			}
-			if !u.alerted[key] {
+			if u.alerted.Add(key) {
 				metrics.IncError(u.queue)
-				u.alerted[key] = true
 				log.Info("ALERT: HR still stuck after unlock — not retrying inside cooldown",
 					"hr", key, "unlockedAgo", now.Sub(last).Truncate(time.Minute))
 			}
@@ -164,7 +160,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	log.Info("ACTION: delete stuck pending release secret",
 		"hr", key, "secret", pending.Name, "status", pending.Labels["status"], "rev", pendingRev)
 	if err := u.cs.CoreV1().Secrets(pending.Namespace).Delete(ctx, pending.Name,
-		shared.UIDDeleteOptions(pending.UID, "")); err != nil {
+		kube.UIDDeleteOptions(pending.UID, "")); err != nil {
 		return false, fmt.Errorf("delete pending secret %s/%s: %w", pending.Namespace, pending.Name, err)
 	}
 

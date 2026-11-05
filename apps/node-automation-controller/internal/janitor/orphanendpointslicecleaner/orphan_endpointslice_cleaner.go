@@ -47,6 +47,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -85,7 +87,7 @@ type orphanEndpointSliceCleaner struct {
 	// orphanEndpointSliceStreak unlocks the re-confirm + delete.
 	// UID is part of the key so a recreated slice never inherits
 	// another object's streak.
-	absentStreak shared.StreakLedger
+	absentStreak state.StreakLedger
 }
 
 // Setup registers the 15-minute sweep.
@@ -112,9 +114,9 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	// an empty answer is an apiserver/RBAC flap, never a real state.
 	svcCount := 0
 	services := map[string]bool{}
-	err := shared.ListEach(ctx,
+	err := kube.ListEach(ctx,
 		metav1.ListOptions{Limit: orphanEndpointSliceListPageSize},
-		shared.Services(c.cs, metav1.NamespaceAll),
+		kube.Services(c.cs, metav1.NamespaceAll),
 		func(items []corev1.Service) error {
 			for _, s := range items {
 				services[s.Namespace+"/"+s.Name] = true
@@ -131,10 +133,10 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 
 	// Server-side label filter; the in-code check stays because
 	// fake clientsets ignore ListOptions selectors.
-	slices, err := shared.ListAll(ctx, metav1.ListOptions{
+	slices, err := kube.ListAll(ctx, metav1.ListOptions{
 		LabelSelector: discoveryv1.LabelServiceName,
 		Limit:         orphanEndpointSliceListPageSize,
-	}, shared.EndpointSlices(c.cs, metav1.NamespaceAll))
+	}, kube.EndpointSlices(c.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list endpointslices: %w", err)
 	}
@@ -175,7 +177,7 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 		// apiserver before deleting (a List can lag a Get).
 		_, getErr := c.cs.CoreV1().Services(s.Namespace).
 			Get(ctx, svcName, metav1.GetOptions{})
-		gone, confirmErr := shared.ConfirmAbsent(getErr)
+		gone, confirmErr := kube.ConfirmAbsent(getErr)
 		switch {
 		case gone:
 		case confirmErr != nil:
@@ -198,7 +200,7 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 		// recreated in between is not the object we vetted.
 		uid := s.UID
 		if err := c.cs.DiscoveryV1().EndpointSlices(s.Namespace).
-			Delete(ctx, s.Name, shared.UIDDeleteOptions(uid, "")); err != nil {
+			Delete(ctx, s.Name, kube.UIDDeleteOptions(uid, "")); err != nil {
 			log.Error(err, "orphan endpointslice delete failed",
 				"endpointslice", s.Namespace+"/"+s.Name)
 			metrics.IncError(c.queue)

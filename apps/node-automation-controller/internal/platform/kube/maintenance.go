@@ -1,0 +1,189 @@
+// maintenance.go — the Cluster Maintenance Mutex (2.7): the single
+// canonical implementation of the check the deferring modules used
+// to each carry a copy of (descheduler-storm-gate,
+// concourse-workdir-janitor, admission-webhook-guard's nil-dyn
+// degraded path — all removed in favour of these helpers).
+// Remediation that could disturb a drain/upgrade in flight defers
+// while ANY signal holds.
+//
+// Two consumption shapes share the same per-signal helpers:
+//   - MaintenanceActive — the (held, why, error) verdict most
+//     modules want: the first active signal's evidence, evaluated
+//     in order with the historical short-circuit (a held signal
+//     means the later API calls never run).
+//   - MaintenanceEvidence and the *Evidence helpers — every active
+//     signal's evidence string, for callers that LOG all of them
+//     (the storm-gate's maintenance=[...] verdict list).
+package kube
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+)
+
+const (
+	// KuredDaemonSetNS/Name is where the kured reboot lock lives.
+	KuredDaemonSetNS   = "kube-system"
+	KuredDaemonSetName = "kured"
+	// KuredLockAnno is the reboot-coordination annotation kured holds
+	// while a node drains for its reboot window.
+	KuredLockAnno = "weave.works/kured-node-lock"
+)
+
+// AutopilotPlanGVR moved to gvr.go — the named GVR registry — same
+// package, same exported identifier, unchanged value (its original
+// doc comment moved with it).
+
+// NodeCordonEvidence returns the evidence strings for mutex signal
+// (a) — "node <name> actively cordoned" for every node inside the
+// active-cordon window: spec.unschedulable with the unschedulable
+// taint younger than 45m. A statically-cordoned node (>45m, no kured
+// lock, no live Plan) is deliberate state, not maintenance: counting
+// it would freeze every deferring remediation forever (W8). A node
+// LIST failure is an error — "cannot verify" must never read as
+// "clear".
+func NodeCordonEvidence(ctx context.Context, cs kubernetes.Interface) ([]string, error) {
+	// A node cordoned for longer than the active window with no
+	// other maintenance signal is a static cordon, not a drain.
+	now := time.Now()
+	nodes, err := ListNodes(ctx, cs)
+	if err != nil {
+		return nil, fmt.Errorf("list nodes (maintenance mutex): %w", err)
+	}
+	var ev []string
+	for i := range nodes {
+		if NodeActivelyCordoned(&nodes[i], now) {
+			ev = append(ev, "node "+nodes[i].Name+" actively cordoned")
+		}
+	}
+	return ev, nil
+}
+
+// KuredLockEvidence returns the evidence string for mutex signal
+// (b) — "kured lock held by <value>" while DaemonSet
+// kube-system/kured holds weave.works/kured-node-lock (a reboot
+// drain is in progress right now). A missing kured DaemonSet is not
+// evidence — kured is not installed on every cluster; a real API
+// failure is an error.
+func KuredLockEvidence(ctx context.Context, cs kubernetes.Interface) ([]string, error) {
+	ds, err := cs.AppsV1().DaemonSets(KuredDaemonSetNS).
+		Get(ctx, KuredDaemonSetName, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		// kured not installed on this cluster — no signal.
+	case err != nil:
+		return nil, fmt.Errorf("get daemonset %s/%s (maintenance mutex): %w",
+			KuredDaemonSetNS, KuredDaemonSetName, err)
+	default:
+		if v := ds.Annotations[KuredLockAnno]; v != "" {
+			return []string{"kured lock held by " + v}, nil
+		}
+	}
+	return nil, nil
+}
+
+// AutopilotPlanEvidence returns the evidence strings for mutex
+// signal (c) — "autopilot plan <name> state=<state>" for every Plan
+// whose status.state is neither Schedulable nor Completed (a k0s
+// upgrade in flight). An absent CRD is not evidence. A missing
+// dynamic client is a wiring bug, not "no signal" — unverifiable
+// fails closed like every other check here.
+func AutopilotPlanEvidence(ctx context.Context, dyn dynamic.Interface) ([]string, error) {
+	if dyn == nil {
+		return nil, errors.New("no dynamic client — autopilot plan check unverifiable (maintenance mutex)")
+	}
+	plans, err := dyn.Resource(AutopilotPlanGVR).
+		List(ctx, metav1.ListOptions{})
+	switch {
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		// autopilot CRD not installed — no signal.
+	case err != nil:
+		return nil, fmt.Errorf("list autopilot plans (maintenance mutex): %w", err)
+	default:
+		var ev []string
+		for i := range plans.Items {
+			state, _, _ := unstructured.NestedString(
+				plans.Items[i].Object, "status", "state")
+			if state != "Schedulable" && state != "Completed" {
+				ev = append(ev, fmt.Sprintf("autopilot plan %s state=%s",
+					plans.Items[i].GetName(), state))
+			}
+		}
+		return ev, nil
+	}
+	return nil, nil
+}
+
+// MaintenanceEvidence returns the evidence strings of EVERY active
+// signal — the concatenation of NodeCordonEvidence,
+// KuredLockEvidence and AutopilotPlanEvidence, in the canonical
+// signal order. An empty slice means "no maintenance in flight".
+// Unlike MaintenanceActive it does not short-circuit: callers that
+// log a verdict (descheduler-storm-gate's maintenance=[...]) want
+// the whole picture, so a held earlier signal does not suppress the
+// later API reads — and their failures still surface as errors.
+func MaintenanceEvidence(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface) ([]string, error) {
+	var ev []string
+	for _, signal := range []func(context.Context) ([]string, error){
+		func(ctx context.Context) ([]string, error) { return NodeCordonEvidence(ctx, cs) },
+		func(ctx context.Context) ([]string, error) { return KuredLockEvidence(ctx, cs) },
+		func(ctx context.Context) ([]string, error) { return AutopilotPlanEvidence(ctx, dyn) },
+	} {
+		e, err := signal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		ev = append(ev, e...)
+	}
+	return ev, nil
+}
+
+// MaintenanceActive reports whether deliberate cluster maintenance is
+// in flight — destructive remediation (pod deletes, leader kills)
+// defers while any signal holds:
+//
+//	a) any node ACTIVELY cordoned — spec.unschedulable with the
+//	   unschedulable taint younger than 45m. A statically-cordoned
+//	   node (>45m, no kured lock, no live Plan) is deliberate
+//	   state, not maintenance: counting it would freeze every
+//	   deferring remediation forever (W8).
+//	b) DaemonSet kube-system/kured holding weave.works/kured-node-lock;
+//	c) an autopilot Plan whose status.state is neither Schedulable
+//	   nor Completed — a k0s upgrade in flight.
+//
+// Returns (held, human-readable why, error). A missing kured
+// DaemonSet or absent autopilot CRD is not evidence; real API
+// failures are errors — "cannot verify" must never read as "clear".
+// A nil dynamic client makes the Plan check unverifiable and is
+// reported as an error, never silently skipped.
+//
+// Built on the per-signal helpers but deliberately NOT on
+// MaintenanceEvidence: the historical contract is the SHORT-CIRCUIT —
+// the first held signal answers the verdict without paying for (or
+// failing on) the later API reads. Signals evaluate in the canonical
+// a → b → c order and `why` is the first signal's first evidence.
+func MaintenanceActive(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface) (bool, string, error) {
+	for _, signal := range []func(context.Context) ([]string, error){
+		func(ctx context.Context) ([]string, error) { return NodeCordonEvidence(ctx, cs) },
+		func(ctx context.Context) ([]string, error) { return KuredLockEvidence(ctx, cs) },
+		func(ctx context.Context) ([]string, error) { return AutopilotPlanEvidence(ctx, dyn) },
+	} {
+		ev, err := signal(ctx)
+		if err != nil {
+			return false, "", err
+		}
+		if len(ev) > 0 {
+			return true, ev[0], nil
+		}
+	}
+	return false, "", nil
+}

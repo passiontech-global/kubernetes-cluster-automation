@@ -16,13 +16,13 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	natestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // srTrackedCount reports how many keys a FirstSeenLedger holds —
 // the ledger exposes no Len, so a keep-all Prune does the counting.
-func srTrackedCount(l *shared.FirstSeenLedger) int {
+func srTrackedCount(l *state.FirstSeenLedger) int {
 	n := 0
 	l.Prune(func(string) bool { n++; return true })
 	return n

@@ -19,7 +19,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 	if backups != nil {
 		for i := range backups.Items {
 			b := &backups.Items[i]
-			owner, _ := shared.NestedString(b.Object, "spec", "dbClusterName")
+			owner, _ := kube.NestedString(b.Object, "spec", "dbClusterName")
 			if owner == "" {
 				continue
 			}
@@ -89,8 +89,8 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 		ns, name := dc.GetNamespace(), dc.GetName()
 		// Only clusters that opted into backups AND are not paused —
 		// a paused cluster's stale backups are deliberate, not rot.
-		enabled, _ := shared.NestedBool(dc.Object, "spec", "backup", "enabled")
-		paused, _ := shared.NestedBool(dc.Object, "spec", "paused")
+		enabled, _ := kube.NestedBool(dc.Object, "spec", "backup", "enabled")
+		paused, _ := kube.NestedBool(dc.Object, "spec", "paused")
 		if !enabled || paused {
 			continue
 		}
@@ -139,14 +139,14 @@ func everestBackupReasons(backups []*unstructured.Unstructured,
 	var reasons []string
 
 	// failed — the LATEST backup ended Failed.
-	if state, _ := shared.NestedString(
+	if state, _ := kube.NestedString(
 		sorted[0].Object, "status", "state"); state == "Failed" {
 		reasons = append(reasons, "failed")
 	}
 
 	// stuck — ANY backup wedged in Running/Starting past 6h.
 	for _, b := range sorted {
-		state, _ := shared.NestedString(b.Object, "status", "state")
+		state, _ := kube.NestedString(b.Object, "status", "state")
 		if state != "Running" && state != "Starting" {
 			continue
 		}
@@ -160,12 +160,12 @@ func everestBackupReasons(backups []*unstructured.Unstructured,
 	// measured from status.completionTime when present (the moment
 	// the restorable point actually landed), else creationTimestamp.
 	for _, b := range sorted {
-		state, _ := shared.NestedString(b.Object, "status", "state")
+		state, _ := kube.NestedString(b.Object, "status", "state")
 		if state != "Succeeded" {
 			continue
 		}
 		done := b.GetCreationTimestamp().Time
-		if ct, ok := shared.NestedString(
+		if ct, ok := kube.NestedString(
 			b.Object, "status", "completionTime"); ok {
 			if t, err := time.Parse(time.RFC3339, ct); err == nil {
 				done = t

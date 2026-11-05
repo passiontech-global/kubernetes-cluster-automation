@@ -16,7 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // W8-NM3 — a wedged linkerd pod (started, never Ready, >5m) is
@@ -41,7 +41,7 @@ func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := mustCheck[*meshControlPlaneCheck](t, p).Run(ctx); res.Pass {
+	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("wedged linkerd pod passed")
 	}
 	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
@@ -70,11 +70,11 @@ func TestHealNamedPodDefersDuringMaintenance(t *testing.T) {
 	kured := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
 		Namespace:   "kube-system",
 		Name:        "kured",
-		Annotations: map[string]string{shared.KuredLockAnno: "w1"},
+		Annotations: map[string]string{kube.KuredLockAnno: "w1"},
 	}}
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), kured, pod)
 	p := testProberDyn(cs, probetest.OpDyn())
-	mustCheck[*meshControlPlaneCheck](t, p).healNamedPod(ctx, logr.Discard(), probefw.LinkerdDestinationName,
+	probetest.MustCheck[*meshControlPlaneCheck](t, p).healNamedPod(ctx, logr.Discard(), probefw.LinkerdDestinationName,
 		pod.Namespace+"/"+pod.Name, pod, linkerdHealCooldown, time.Now())
 	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
 		Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
@@ -94,7 +94,7 @@ func TestHealNamedPodDeletesWithoutMaintenance(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
 	p := testProberDyn(cs, probetest.OpDyn())
-	mustCheck[*meshControlPlaneCheck](t, p).healNamedPod(ctx, logr.Discard(), probefw.LinkerdDestinationName,
+	probetest.MustCheck[*meshControlPlaneCheck](t, p).healNamedPod(ctx, logr.Discard(), probefw.LinkerdDestinationName,
 		pod.Namespace+"/"+pod.Name, pod, linkerdHealCooldown, time.Now())
 	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
 		Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {

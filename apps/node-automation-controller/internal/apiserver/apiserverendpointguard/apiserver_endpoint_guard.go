@@ -97,6 +97,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -352,7 +353,7 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	if primary == nil || mirrorManagedSlice(primary) || !preferSlice {
 		e, getErr := g.dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
 			Get(ctx, endpointGuardName, metav1.GetOptions{})
-		gone, err := shared.ConfirmAbsent(getErr)
+		gone, err := kube.ConfirmAbsent(getErr)
 		if err != nil {
 			// periodic loop meters/logs — nothing to act on without it
 			return fmt.Errorf("get endpoints %s/%s: %w",

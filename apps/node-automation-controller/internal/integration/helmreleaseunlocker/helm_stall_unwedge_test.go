@@ -192,7 +192,6 @@ func newStallUnlocker(cs *kfake.Clientset, dyn *fake.FakeDynamicClient,
 		cs:           cs,
 		dyn:          dyn,
 		unlocked:     map[string]time.Time{},
-		alerted:      map[string]bool{},
 		stallEnabled: true,
 	}
 	if key != "" {

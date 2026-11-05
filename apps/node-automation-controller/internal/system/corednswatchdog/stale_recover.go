@@ -16,7 +16,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // recover applies cooldown/storm-gate/rollout gates, then either
@@ -43,7 +43,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 	}
 	// Storm-gate: never evict while nodes are NotReady — eviction
 	// only slows recovery during a cluster storm.
-	notReady, err := shared.CountNotReadyNodes(ctx, w.cs)
+	notReady, err := kube.CountNotReadyNodes(ctx, w.cs)
 	if err != nil {
 		return fmt.Errorf("count not-ready nodes (storm gate): %w", err)
 	}

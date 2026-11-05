@@ -13,7 +13,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -24,7 +24,7 @@ import (
 // there is no top-level status.observedGeneration on
 // Gateway/HTTPRoute/GRPCRoute — so 0 means the attached controller
 // has never reported a spec generation.
-func condMaxObservedGeneration(conds []shared.Condition) int64 {
+func condMaxObservedGeneration(conds []kube.Condition) int64 {
 	var max int64
 	for _, c := range conds {
 		if c.ObservedGeneration > max {
@@ -41,7 +41,7 @@ func condMaxObservedGeneration(conds []shared.Condition) int64 {
 // conditions still report only older observedGenerations — the
 // controller attached once but never saw the last spec write.
 func gatewayStatusStuck(o *unstructured.Unstructured) bool {
-	parents, found := shared.NestedSlice(o.Object, "status", "parents")
+	parents, found := kube.NestedSlice(o.Object, "status", "parents")
 	if !found || len(parents) == 0 {
 		return true
 	}
@@ -52,7 +52,7 @@ func gatewayStatusStuck(o *unstructured.Unstructured) bool {
 			continue
 		}
 		if og := condMaxObservedGeneration(
-			shared.Conditions(m, "conditions")); og > maxOG {
+			kube.Conditions(m, "conditions")); og > maxOG {
 			maxOG = og
 		}
 	}
@@ -69,24 +69,24 @@ func gatewayStatusStuck(o *unstructured.Unstructured) bool {
 // (top-level status.conditions plus per-listener conditions) —
 // Gateway status has no top-level observedGeneration field.
 func gatewayObjectStuck(o *unstructured.Unstructured) bool {
-	spec, found := shared.NestedSlice(o.Object, "spec", "listeners")
+	spec, found := kube.NestedSlice(o.Object, "spec", "listeners")
 	if !found || len(spec) == 0 {
 		return false
 	}
-	status, found := shared.NestedSlice(o.Object, "status", "listeners")
+	status, found := kube.NestedSlice(o.Object, "status", "listeners")
 	if !found || len(status) == 0 {
 		return true
 	}
 	var maxOG int64
 	maxOG = condMaxObservedGeneration(
-		shared.Conditions(o.Object, "status", "conditions"))
+		kube.Conditions(o.Object, "status", "conditions"))
 	for _, l := range status {
 		m, ok := l.(map[string]any)
 		if !ok {
 			continue
 		}
 		if og := condMaxObservedGeneration(
-			shared.Conditions(m, "conditions")); og > maxOG {
+			kube.Conditions(m, "conditions")); og > maxOG {
 			maxOG = og
 		}
 	}
@@ -103,11 +103,11 @@ func gatewayObjectStuck(o *unstructured.Unstructured) bool {
 // Accepted status value (True/False) is irrelevant — a fresh
 // rejection still proves the controller read the object.
 func gatewayClassStuck(o *unstructured.Unstructured) bool {
-	conds := shared.Conditions(o.Object, "status", "conditions")
+	conds := kube.Conditions(o.Object, "status", "conditions")
 	if len(conds) == 0 {
 		return true
 	}
-	c, ok := shared.FindCondition(conds, "Accepted")
+	c, ok := kube.FindCondition(conds, "Accepted")
 	if !ok {
 		return true
 	}
@@ -122,14 +122,14 @@ func gatewayClassStuck(o *unstructured.Unstructured) bool {
 func (p *operatorWorkqueueCheck) gatewayClassController(ctx context.Context, class string) (string, bool) {
 	cached, at := p.gwClassCtlr, p.gwClassAt
 	if cached == nil || p.Now().Sub(at) > time.Minute {
-		list, err := p.Dyn.Resource(shared.GVRGatewayClass).
+		list, err := p.Dyn.Resource(kube.GVRGatewayClass).
 			List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return "", false
 		}
 		m := map[string]string{}
 		for i := range list.Items {
-			ctlr, _ := shared.NestedString(
+			ctlr, _ := kube.NestedString(
 				list.Items[i].Object, "spec", "controllerName")
 			m[list.Items[i].GetName()] = ctlr
 		}
@@ -148,7 +148,7 @@ func (p *operatorWorkqueueCheck) gatewayClassController(ctx context.Context, cla
 // watcher.
 func ciliumOwnsGatewayObject(ctx context.Context, p *operatorWorkqueueCheck,
 	o *unstructured.Unstructured) bool {
-	class, _ := shared.NestedString(o.Object, "spec", "gatewayClassName")
+	class, _ := kube.NestedString(o.Object, "spec", "gatewayClassName")
 	ctlr, ok := p.gatewayClassController(ctx, class)
 	if !ok {
 		return true
@@ -163,7 +163,7 @@ func ciliumOwnsGatewayObject(ctx context.Context, p *operatorWorkqueueCheck,
 // gateway-API filters); a PROVEN foreign controller drops it.
 func ciliumOwnsGatewayClass(_ context.Context, _ *operatorWorkqueueCheck,
 	o *unstructured.Unstructured) bool {
-	ctlr, _ := shared.NestedString(o.Object, "spec", "controllerName")
+	ctlr, _ := kube.NestedString(o.Object, "spec", "controllerName")
 	return ctlr == "" || ctlr == ciliumGatewayController
 }
 
@@ -176,7 +176,7 @@ func ciliumOwnsGatewayClass(_ context.Context, _ *operatorWorkqueueCheck,
 // that controller's problem, not cilium-operator's.
 func ciliumOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
 	o *unstructured.Unstructured) bool {
-	refs, found := shared.NestedSlice(o.Object, "spec", "parentRefs")
+	refs, found := kube.NestedSlice(o.Object, "spec", "parentRefs")
 	if !found || len(refs) == 0 {
 		return true
 	}
@@ -186,26 +186,26 @@ func ciliumOwnsRouteParent(ctx context.Context, p *operatorWorkqueueCheck,
 		if !ok {
 			continue
 		}
-		if k, _ := shared.NestedString(m, "kind"); k != "" && k != "Gateway" {
+		if k, _ := kube.NestedString(m, "kind"); k != "" && k != "Gateway" {
 			continue
 		}
-		if g, _ := shared.NestedString(m, "group"); g != "" && g != "gateway.networking.k8s.io" {
+		if g, _ := kube.NestedString(m, "group"); g != "" && g != "gateway.networking.k8s.io" {
 			continue
 		}
-		name, _ := shared.NestedString(m, "name")
+		name, _ := kube.NestedString(m, "name")
 		if name == "" {
 			continue
 		}
-		ns, _ := shared.NestedString(m, "namespace")
+		ns, _ := kube.NestedString(m, "namespace")
 		if ns == "" {
 			ns = o.GetNamespace()
 		}
-		gw, err := p.Dyn.Resource(shared.GVRGateway).Namespace(ns).
+		gw, err := p.Dyn.Resource(kube.GVRGateway).Namespace(ns).
 			Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			continue
 		}
-		class, _ := shared.NestedString(gw.Object, "spec", "gatewayClassName")
+		class, _ := kube.NestedString(gw.Object, "spec", "gatewayClassName")
 		ctlr, ok := p.gatewayClassController(ctx, class)
 		if !ok {
 			continue

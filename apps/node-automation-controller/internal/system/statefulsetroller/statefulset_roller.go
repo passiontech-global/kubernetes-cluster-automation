@@ -61,6 +61,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -98,7 +100,7 @@ type statefulSetOnDeleteRoller struct {
 	// any cycle where the revisions agree, the set leaves, or the
 	// opt-in annotation drops prunes the entry, restarting the 30m
 	// window (same first-seen convention as pdb-deadlock-watchdog).
-	driftSince shared.FirstSeenLedger
+	driftSince state.FirstSeenLedger
 }
 
 // Setup registers the 10-minute sweep.
@@ -121,8 +123,8 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 	// Page the cluster-wide list — an unbounded List forces etcd to
 	// serialize every StatefulSet into one response; 500-per-page
 	// keeps each request cheap at fleet scale.
-	stsItems, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
-		shared.StatefulSets(r.cs, metav1.NamespaceAll))
+	stsItems, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+		kube.StatefulSets(r.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list statefulsets: %w", err)
 	}
@@ -166,14 +168,14 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 
 	// Gate 1 is cluster-wide — evaluate once for every due
 	// StatefulSet (a cluster failing it skips them all anyway).
-	nodes, err := shared.ListNodes(ctx, r.cs)
+	nodes, err := kube.ListNodes(ctx, r.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes (safety gate): %w", err)
 	}
 	nodesSafe := len(nodes) > 0
 	for i := range nodes {
-		if !shared.NodeReady(&nodes[i]) ||
-			shared.NodeActivelyCordoned(&nodes[i], now) {
+		if !kube.NodeReady(&nodes[i]) ||
+			kube.NodeActivelyCordoned(&nodes[i], now) {
 			nodesSafe = false
 			break
 		}
@@ -279,8 +281,8 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	// allow a disruption — a 0 means the workload is already at its
 	// floor and eviction would refuse the delete anyway. Paged like
 	// the StatefulSet list above.
-	pdbItems, err := shared.ListAll(ctx, metav1.ListOptions{Limit: 500},
-		shared.PodDisruptionBudgets(r.cs, sts.Namespace))
+	pdbItems, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+		kube.PodDisruptionBudgets(r.cs, sts.Namespace))
 	if err != nil {
 		return fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w",
 			sts.Namespace, err)

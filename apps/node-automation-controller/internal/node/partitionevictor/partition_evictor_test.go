@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -88,7 +88,7 @@ func TestPartitionEvictorFreshConditionNotFlagged(t *testing.T) {
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if shared.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("node with a fresh (<10m) condition must not be tainted")
 	}
 	if !pePodExists(t, cs, "flux-system", "src-ctrl") {
@@ -112,7 +112,7 @@ func TestPartitionEvictorZeroTimestampNotFlagged(t *testing.T) {
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if shared.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("node with timestamp-less condition must not be flagged")
 	}
 	if !pePodExists(t, cs, "flux-system", "src-ctrl") {
@@ -136,7 +136,7 @@ func TestPartitionEvictorEvictionCap(t *testing.T) {
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("flagged node not tainted")
 	}
 	remaining, err := cs.CoreV1().Pods(partitionPodNS).List(ctx, metav1.ListOptions{})
@@ -192,7 +192,7 @@ func TestPartitionEvictorMultipleFlaggedUnderHalf(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"p1", "p2"} {
-		if !shared.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, partitionTaintKey) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, partitionTaintKey) {
 			t.Fatalf("flagged node %s not tainted", name)
 		}
 	}
@@ -224,7 +224,7 @@ func TestPartitionEvictorTaintsAllFlaggedBeforeCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"p1", "p2"} {
-		if !shared.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, partitionTaintKey) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, partitionTaintKey) {
 			t.Fatalf("flagged node %s left untainted by the eviction cap", name)
 		}
 	}
@@ -250,7 +250,7 @@ func TestPartitionEvictorSkipsControlPlane(t *testing.T) {
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if shared.HasTaint(testutil.GetNode(t, cs, "cp1").Spec.Taints, partitionTaintKey) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "cp1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("control-plane node tainted")
 	}
 	if !pePodExists(t, cs, "flux-system", "cp-pod") {
@@ -282,7 +282,7 @@ func TestPartitionEvictorMeshGuardIgnoresControlPlanes(t *testing.T) {
 	}
 	for i := 1; i <= 3; i++ {
 		name := fmt.Sprintf("w%d", i)
-		if shared.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, partitionTaintKey) {
+		if kube.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, partitionTaintKey) {
 			t.Fatalf("worker %s tainted on a mesh-wide partition", name)
 		}
 		if !pePodExists(t, cs, "flux-system", "pod-"+name) {
@@ -337,11 +337,11 @@ func TestPartitionEvictorUntaintsRecoveredKeepsFlaggedTaint(t *testing.T) {
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if shared.HasTaint(testutil.GetNode(t, cs, "r1").Spec.Taints, partitionTaintKey) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "r1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("recovered node kept its partition taint")
 	}
 	taints := testutil.GetNode(t, cs, "p1").Spec.Taints
-	if !shared.HasTaint(taints, partitionTaintKey) {
+	if !kube.HasTaint(taints, partitionTaintKey) {
 		t.Fatal("still-flagged node lost its partition taint")
 	}
 	if n := peCountTaintsWithKey(taints, partitionTaintKey); n != 1 {
@@ -404,7 +404,7 @@ func TestPartitionEvictorPodListErrorContinues(t *testing.T) {
 		t.Fatal("p2's pod not evicted — sibling node skipped after p1's error")
 	}
 	for _, name := range []string{"p1", "p2"} {
-		if !shared.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, partitionTaintKey) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, partitionTaintKey) {
 			t.Fatalf("flagged node %s not tainted", name)
 		}
 	}
@@ -430,7 +430,7 @@ func TestPartitionEvictorPodDeleteErrorTolerated(t *testing.T) {
 	if !pePodExists(t, cs, "flux-system", "undeletable") {
 		t.Fatal("pod deleted despite the failing delete call")
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("flagged node not tainted")
 	}
 }
@@ -450,7 +450,7 @@ func TestPartitionEvictorUntaintErrorTolerated(t *testing.T) {
 	if err := e.run(ctx); err != nil {
 		t.Fatalf("untaint failure must not fail the run: %v", err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "h1").Spec.Taints, partitionTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "h1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("taint removed despite the rejected patch")
 	}
 }
@@ -475,7 +475,7 @@ func TestPartitionEvictorTaintErrorStillSweepsPods(t *testing.T) {
 	if err := e.run(ctx); err != nil {
 		t.Fatalf("taint failure must not fail the run: %v", err)
 	}
-	if shared.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("taint applied despite the rejected patch")
 	}
 	if pePodExists(t, cs, "flux-system", "src-ctrl") {
@@ -805,7 +805,7 @@ func TestPartitionEvictorPVCListErrorSkipsEviction(t *testing.T) {
 	if !pePodExists(t, cs, "flux-system", "victim") {
 		t.Fatal("pod evicted although the pinned-PVC view was unverifiable")
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("flagged node not tainted")
 	}
 }
@@ -823,7 +823,7 @@ func TestPartitionEvictorNebulaPMTUBlackhole(t *testing.T) {
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, partitionTaintKey) {
 		t.Fatal("PMTU-blackholed node not tainted")
 	}
 	if pePodExists(t, cs, "flux-system", "victim") {

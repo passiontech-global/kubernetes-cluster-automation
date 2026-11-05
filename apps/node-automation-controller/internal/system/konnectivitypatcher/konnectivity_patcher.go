@@ -15,25 +15,18 @@ package konnectivitypatcher
 
 import (
 	"context"
-	"fmt"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/pinnedworkload"
 )
 
 // Exact patch body from the bash hook — strategic merge lands the
@@ -56,10 +49,7 @@ type konnectivityPatcher struct {
 // onlyKonnectivityDaemonSet is the exact predicate the For() watch
 // below installs — a package var so the test exercises the predicate
 // directly instead of introspecting controller-runtime internals.
-var onlyKonnectivityDaemonSet = predicate.NewPredicateFuncs(func(o client.Object) bool {
-	return o.GetNamespace() == "kube-system" &&
-		o.GetName() == "konnectivity-agent"
-})
+var onlyKonnectivityDaemonSet = pinnedworkload.OnlyNamespacedName("kube-system", "konnectivity-agent")
 
 // Setup reconciles only the konnectivity-agent
 // DaemonSet (the informer is already field-scoped to it via the
@@ -71,59 +61,22 @@ func Setup(d shared.Deps) error {
 		Complete(&konnectivityPatcher{cs: d.CS, queue: d.Name})
 }
 
+// Reconcile delegates to the shared pinned-DaemonSet skeleton — this
+// module only supplies the kube-system/konnectivity-agent identity,
+// the drift check, the rollout-settled gate and the static patch.
 func (r *konnectivityPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-	res := ctrl.Result{RequeueAfter: 15 * time.Minute}
-
-	ds, err := r.cs.AppsV1().DaemonSets("kube-system").
-		Get(ctx, "konnectivity-agent", metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		// DS may not exist (cluster without konnectivity)
-		log.Info("SKIP: daemonset not found", "daemonset", "kube-system/konnectivity-agent")
-		return res, nil
-	}
-	if err != nil {
-		metrics.IncError(r.queue)
-		return ctrl.Result{}, fmt.Errorf("get daemonset kube-system/konnectivity-agent: %w", err)
-	}
-
-	if !konnectivityDrifted(ds) {
-		log.Info("requests+priorityClassName already set - nothing to do",
-			"daemonset", "kube-system/konnectivity-agent")
-		return res, nil
-	}
-	// A missing konnectivity-agent container reads as drift, but the
-	// strategic-merge patch merges containers BY NAME — applied to a
-	// spec without it, it would append a container entry with no
-	// image that the apiserver rejects forever. We cannot reconstruct
-	// the image, so warn and leave the DS for the stack applier
-	// rather than emitting a guaranteed-invalid patch.
-	if !shared.PodSpecHasContainer(&ds.Spec.Template.Spec, "konnectivity-agent") {
-		log.Info("WARN: konnectivity-agent container missing from pod spec — "+
-			"skipping patch (strategic merge cannot create it without an image)",
-			"daemonset", "kube-system/konnectivity-agent")
-		return res, nil
-	}
-	if !shared.DaemonSetSettled(ds) {
-		log.Info("SKIP: drifted but rollout in progress",
-			"daemonset", "kube-system/konnectivity-agent",
-			"generation", ds.Generation,
-			"observedGeneration", ds.Status.ObservedGeneration,
-			"updated", ds.Status.UpdatedNumberScheduled,
-			"ready", ds.Status.NumberReady,
-			"desired", ds.Status.DesiredNumberScheduled)
-		return res, nil
-	}
-
-	log.Info("PATCH: requests/priorityClassName drifted — rollout settled, restoring pinned spec",
-		"daemonset", "kube-system/konnectivity-agent")
-	if _, err := r.cs.AppsV1().DaemonSets("kube-system").Patch(ctx,
-		"konnectivity-agent", types.StrategicMergePatchType,
-		konnectivityPatch, metav1.PatchOptions{}); err != nil {
-		metrics.IncError(r.queue)
-		return ctrl.Result{}, fmt.Errorf("patch daemonset kube-system/konnectivity-agent: %w", err)
-	}
-	return res, nil
+	return pinnedworkload.DaemonSetSpec{
+		CS:         r.cs,
+		Queue:      r.queue,
+		Namespace:  "kube-system",
+		Name:       "konnectivity-agent",
+		Container:  "konnectivity-agent",
+		NoDriftLog: "requests+priorityClassName already set - nothing to do",
+		PatchLog:   "PATCH: requests/priorityClassName drifted — rollout settled, restoring pinned spec",
+		Settled:    kube.DaemonSetSettled,
+		Drifted:    konnectivityDrifted,
+		Patch:      konnectivityPatch,
+	}.Reconcile(ctx)
 }
 
 // konnectivityDrifted reports whether the DS lacks the pinned

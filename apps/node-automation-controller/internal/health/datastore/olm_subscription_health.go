@@ -12,7 +12,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,9 +35,9 @@ type olmHealthCheck struct {
 	//   - olmHealed: reason → last olm-operator pod delete — the 1h
 	//     cooldown (in-RAM: deleting the operator pod is the heal,
 	//     nothing else can carry the stamp).
-	olmFirstSeen shared.FirstSeenLedger
+	olmFirstSeen state.FirstSeenLedger
 	olmEmitted   map[string]bool
-	olmHealed    shared.CooldownSet
+	olmHealed    state.CooldownSet
 }
 
 // newOlmHealthCheck builds the W7-C5 check — the ledgers arm
@@ -85,8 +86,8 @@ const (
 // OLM GVRs — dynamic-client reads, skipped gracefully when the CRDs
 // are not installed on a cluster.
 var (
-	olmCSVGVR = shared.GVROLMClusterServiceVersion
-	olmSubGVR = shared.GVROLMSubscription
+	olmCSVGVR = kube.GVROLMClusterServiceVersion
+	olmSubGVR = kube.GVROLMSubscription
 )
 
 // checkOLMHealth audits the OLM control plane's two user-visible
@@ -133,11 +134,11 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 		for i := range csvs.Items {
 			csv := &csvs.Items[i]
 			obj := olmKindCSV + "/" + csv.GetNamespace() + "/" + csv.GetName()
-			phase, _ := shared.NestedString(csv.Object, "status", "phase")
+			phase, _ := kube.NestedString(csv.Object, "status", "phase")
 			if phase != "Succeeded" {
 				live[obj+"/"+olmReasonCSVStuck] = true
 			}
-			if ts, found := shared.NestedString(
+			if ts, found := kube.NestedString(
 				csv.Object, "status", "certsRotateAt"); found && ts != "" {
 				if t, err := time.Parse(time.RFC3339, ts); err == nil && now.After(t) {
 					live[obj+"/"+olmReasonCertOverdue] = true
@@ -155,7 +156,7 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 			sub := &subs.Items[i]
 			obj := olmKindSubscription + "/" +
 				sub.GetNamespace() + "/" + sub.GetName()
-			for _, c := range shared.Conditions(sub.Object, "status", "conditions") {
+			for _, c := range kube.Conditions(sub.Object, "status", "conditions") {
 				if c.Status != "True" {
 					continue
 				}
@@ -239,7 +240,7 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 		log.Info("skip heal: olm-operator inside cooldown")
 		return
 	}
-	held, why, err := shared.MaintenanceActive(ctx, p.CS, p.Dyn)
+	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",

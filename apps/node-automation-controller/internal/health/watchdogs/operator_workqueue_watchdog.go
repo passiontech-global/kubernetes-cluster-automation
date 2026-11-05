@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -38,9 +38,9 @@ type operatorWorkqueueCheck struct {
 	//   - opHealed: operator → last leader-pod delete — the in-RAM
 	//     half of the 1h heal cooldown (the Lease annotation is the
 	//     durable half).
-	opFirstSeen shared.FirstSeenLedger
+	opFirstSeen state.FirstSeenLedger
 	opFrozen    map[string]bool
-	opHealed    shared.CooldownSet
+	opHealed    state.CooldownSet
 
 	// gwClassCtlr caches GatewayClass name → spec.controllerName for
 	// ~a minute so the gateway-API ownership filter doesn't LIST the

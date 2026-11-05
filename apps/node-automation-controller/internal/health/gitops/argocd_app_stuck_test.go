@@ -18,7 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -28,8 +28,8 @@ import (
 
 func TestArgoCDAppStuckSkipsWhenCRDAbsent(t *testing.T) {
 	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		argocdAppGVR:            "ApplicationList",
-		shared.AutopilotPlanGVR: "PlanList",
+		argocdAppGVR:          "ApplicationList",
+		kube.AutopilotPlanGVR: "PlanList",
 	})
 	dyn.PrependReactor("list", "applications",
 		func(action ktesting.Action) (bool, runtime.Object, error) {
@@ -38,7 +38,7 @@ func TestArgoCDAppStuckSkipsWhenCRDAbsent(t *testing.T) {
 		})
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, dyn)
-	if res := mustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("absent Application CRD must pass: %+v", res)
 	}
 }
@@ -46,8 +46,8 @@ func TestArgoCDAppStuckSkipsWhenCRDAbsent(t *testing.T) {
 func TestArgoCDAppStuckProgressingRefreshPatch(t *testing.T) {
 	app := argoCDApplication("argocd", "my-app", "Progressing")
 	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		argocdAppGVR:            "ApplicationList",
-		shared.AutopilotPlanGVR: "PlanList",
+		argocdAppGVR:          "ApplicationList",
+		kube.AutopilotPlanGVR: "PlanList",
 	}, app)
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, dyn)
@@ -55,11 +55,11 @@ func TestArgoCDAppStuckProgressingRefreshPatch(t *testing.T) {
 	p.Now = func() time.Time { return base }
 
 	// First sighting stamps the first-seen ledger — still inside 45m.
-	if res := mustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("young Progressing app must pass: %+v", res)
 	}
 	base = base.Add(50 * time.Minute)
-	res := mustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatalf("Progressing >45m must fail: %+v", res)
 	}
@@ -89,8 +89,8 @@ func TestArgoCDComparisonErrorsRestartOldestRepoServer(t *testing.T) {
 	appA := argoCDApplication("argocd", "app-a", "", cond())
 	appB := argoCDApplication("argocd", "app-b", "", cond())
 	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		argocdAppGVR:            "ApplicationList",
-		shared.AutopilotPlanGVR: "PlanList",
+		argocdAppGVR:          "ApplicationList",
+		kube.AutopilotPlanGVR: "PlanList",
 	}, appA, appB)
 
 	older := probetest.PodWithPhase("argocd", "argocd-repo-server-0", corev1.PodRunning, true, 2*time.Hour)
@@ -100,7 +100,7 @@ func TestArgoCDComparisonErrorsRestartOldestRepoServer(t *testing.T) {
 	cs := fake.NewSimpleClientset(older, newer)
 	p := testProberDyn(cs, dyn)
 
-	res := mustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatalf("two ComparisonErrors must fail: %+v", res)
 	}

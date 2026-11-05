@@ -1,7 +1,7 @@
 // module.go — the Module descriptor: the single source of truth for
 // what a module is called and which env gate controls its
-// registration. cmd/manager/modules.go holds the fleet's table;
-// setupModules walks it, evaluating the gate and stamping
+// registration. internal/registry holds the fleet's table;
+// registry.SetupModules walks it, evaluating the gate and stamping
 // Deps.Disabled before calling Setup, so the gate env lives in ONE
 // place (the descriptor) instead of being re-named inside each
 // module's Setup.

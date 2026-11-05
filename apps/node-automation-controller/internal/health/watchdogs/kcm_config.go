@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
 )
 
 // KCMConfigFromEnv fills c.KCM — the kcm-workqueue-watchdog knobs —
@@ -25,10 +25,10 @@ func KCMConfigFromEnv(c *probefw.Config) {
 		// 2× the lease duration — bounds "still renewing" with
 		// margin for apiserver latency; anything older means
 		// the holder is gone (a dead KCM, not a frozen one).
-		LeaseMaxAge: shared.GetenvDuration("HEALTH_KCM_LEASE_MAX_AGE", 30*time.Second),
+		LeaseMaxAge: envx.GetenvDuration("HEALTH_KCM_LEASE_MAX_AGE", 30*time.Second),
 		// A freeze signature must persist this long before the
 		// gauge fires — a healthy reconcile legitimately lags a
 		// spec write by a sync period or two.
-		FreezeMinAge: shared.GetenvDuration("HEALTH_KCM_FREEZE_MIN_AGE", 10*time.Minute),
+		FreezeMinAge: envx.GetenvDuration("HEALTH_KCM_FREEZE_MIN_AGE", 10*time.Minute),
 	}
 }

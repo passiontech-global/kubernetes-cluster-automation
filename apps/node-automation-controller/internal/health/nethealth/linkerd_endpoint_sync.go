@@ -24,7 +24,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // linkerdEndpointSyncCheck is the W9-NM2 linkerd endpoint-sync
@@ -43,9 +44,9 @@ type linkerdEndpointSyncCheck struct {
 	//   - linkerdDesyncHealed: "ns/svc" → last linkerd-destination
 	//     bounce — the 1h per-service cooldown (in-RAM: the pod is
 	//     the heal target, nothing else can carry the stamp).
-	linkerdDesyncSince   shared.FirstSeenLedger
+	linkerdDesyncSince   state.FirstSeenLedger
 	linkerdDesyncEmitted map[string]bool
-	linkerdDesyncHealed  shared.CooldownSet
+	linkerdDesyncHealed  state.CooldownSet
 }
 
 // newLinkerdEndpointSyncCheck builds the W9-NM2 check with fresh
@@ -115,7 +116,7 @@ type linkerdSliceRef struct {
 
 // podReadySince returns the pod's PodReady=True LastTransitionTime —
 // the clock for the EndpointSlice heal's missing-IP fuse. ok=false
-// when the pod is not Ready (mirrors shared.PodReadyCond, which
+// when the pod is not Ready (mirrors kube.PodReadyCond, which
 // returns on the first PodReady-typed condition).
 func podReadySince(pod *corev1.Pod) (since time.Time, ok bool) {
 	for _, c := range pod.Status.Conditions {
@@ -246,9 +247,9 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		// endpointslice-controller-owned EndpointSlices with their
 		// Ready address sets — the W10-FIX7 delete candidates.
 		managedSlices := map[string][]linkerdSliceRef{}
-		err = shared.ListEach(ctx,
+		err = kube.ListEach(ctx,
 			metav1.ListOptions{Limit: probefw.HealthListPageSize},
-			shared.EndpointSlices(p.CS, metav1.NamespaceAll),
+			kube.EndpointSlices(p.CS, metav1.NamespaceAll),
 			func(items []discoveryv1.EndpointSlice) error {
 				for _, s := range items {
 					svc := s.Labels[discoveryv1.LabelServiceName]
@@ -411,7 +412,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 			"service", svcKey)
 		return
 	}
-	held, why, err := shared.MaintenanceActive(ctx, p.CS, p.Dyn)
+	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",

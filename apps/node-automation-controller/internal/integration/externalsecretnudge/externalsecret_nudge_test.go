@@ -17,7 +17,7 @@ import (
 	kfake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	ktesting "k8s.io/client-go/testing"
@@ -420,10 +420,10 @@ func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 		"kind":       "ExternalSecret",
 		"metadata":   map[string]any{"name": "bare"},
 	}}
-	if c, ok := shared.ConditionOf(bare.Object, "Ready"); ok || c.Status != "" || c.Message != "" {
+	if c, ok := kube.ConditionOf(bare.Object, "Ready"); ok || c.Status != "" || c.Message != "" {
 		t.Fatalf("ConditionOf on condition-less object = %v,%q,%q", ok, c.Status, c.Message)
 	}
-	if got := shared.Conditions(bare.Object, "status", "conditions"); len(got) != 0 {
+	if got := kube.Conditions(bare.Object, "status", "conditions"); len(got) != 0 {
 		t.Fatalf("Conditions on condition-less object = %v", got)
 	}
 
@@ -433,10 +433,10 @@ func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 			"conditions": []any{"garbage", int64(42), nil},
 		},
 	}}
-	if _, ok := shared.ConditionOf(junk.Object, "Ready"); ok {
+	if _, ok := kube.ConditionOf(junk.Object, "Ready"); ok {
 		t.Fatal("ConditionOf saw a non-map entry")
 	}
-	if got := shared.Conditions(junk.Object, "status", "conditions"); len(got) != 0 {
+	if got := kube.Conditions(junk.Object, "status", "conditions"); len(got) != 0 {
 		t.Fatalf("Conditions kept non-map entries: %v", got)
 	}
 
@@ -449,7 +449,7 @@ func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 			}},
 		},
 	}}
-	if _, ok := shared.ConditionOf(nonReady.Object, "Ready"); ok {
+	if _, ok := kube.ConditionOf(nonReady.Object, "Ready"); ok {
 		t.Fatal("ConditionOf returned a non-Ready condition")
 	}
 
@@ -462,7 +462,7 @@ func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 			}},
 		},
 	}}
-	c, ok := shared.ConditionOf(badTS.Object, "Ready")
+	c, ok := kube.ConditionOf(badTS.Object, "Ready")
 	if !ok || c.Status != "False" {
 		t.Fatalf("ConditionOf = %v,%q, want found/False", ok, c.Status)
 	}
@@ -620,7 +620,7 @@ func TestExternalSecretNudgePersistedCooldown(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // esNudgeDynFake builds the dyn fake with every ESO GVR plus the
-// autopilot Plan GVR shared.MaintenanceActive lists — without the
+// autopilot Plan GVR kube.MaintenanceActive lists — without the
 // latter the maintenance mutex panics inside the fake.
 func esNudgeDynFake(objs ...runtime.Object) *fake.FakeDynamicClient {
 	kinds := map[schema.GroupVersionResource]string{}
@@ -633,7 +633,7 @@ func esNudgeDynFake(objs ...runtime.Object) *fake.FakeDynamicClient {
 	for _, gvr := range externalSecretGVRs {
 		kinds[gvr] = "ExternalSecretList"
 	}
-	kinds[shared.AutopilotPlanGVR] = "PlanList"
+	kinds[kube.AutopilotPlanGVR] = "PlanList"
 	return testutil.NewFakeDyn(kinds, objs...)
 }
 

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,7 +36,7 @@ func TestCiliumTaintReaperNoPodKeepsTaint(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 		t.Fatal("taint removed with no cilium pod on the node")
 	}
 }
@@ -50,7 +50,7 @@ func TestCiliumTaintReaperUnreadyPodKeepsTaint(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 		t.Fatal("taint removed while agent Ready=False")
 	}
 }
@@ -66,7 +66,7 @@ func TestCiliumTaintReaperTerminatingPodKeepsTaint(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 		t.Fatal("taint removed while agent is terminating")
 	}
 }
@@ -90,10 +90,10 @@ func TestCiliumTaintReaperSweepsWholeCluster(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 		t.Fatal("n1: stale taint not reaped despite healthy agent")
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "n2").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n2").Spec.Taints, ciliumNotReadyTaint) {
 		t.Fatal("n2: taint removed while its agent is unready")
 	}
 	if got := testutil.GetNode(t, cs, "n3").Spec.Taints; len(got) != 0 {
@@ -118,7 +118,7 @@ func TestCiliumTaintReaperAnyHealthyPodReaps(t *testing.T) {
 		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 			t.Fatal("taint kept though a healthy agent runs on the node")
 		}
 	})
@@ -136,7 +136,7 @@ func TestCiliumTaintReaperAnyHealthyPodReaps(t *testing.T) {
 		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
-		if shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 			t.Fatal("taint kept though a healthy agent runs on the node")
 		}
 	})
@@ -153,7 +153,7 @@ func TestCiliumTaintReaperAnyHealthyPodReaps(t *testing.T) {
 		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
-		if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 			t.Fatal("taint removed with no healthy agent on the node")
 		}
 	})
@@ -170,7 +170,7 @@ func TestCiliumTaintReaperPodOnOtherNodeDoesNotCount(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 		t.Fatal("taint reaped by a cilium pod on a different node")
 	}
 }
@@ -188,7 +188,7 @@ func TestCiliumTaintReaperPodListError(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the cilium pod list fails")
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 		t.Fatal("taint removed despite the failed pod list")
 	}
 }
@@ -250,7 +250,7 @@ func TestCiliumTaintReaperUntaintError(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the untaint patch fails")
 	}
-	if !shared.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
 		t.Fatal("taint removed despite the rejected patch")
 	}
 }

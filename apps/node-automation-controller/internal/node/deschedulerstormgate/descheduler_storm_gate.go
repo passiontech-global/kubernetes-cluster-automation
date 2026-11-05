@@ -65,6 +65,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -160,7 +161,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	log := logf.FromContext(ctx)
 	res := ctrl.Result{RequeueAfter: 5 * time.Minute}
 
-	nodes, err := shared.ListNodes(ctx, r.cs)
+	nodes, err := kube.ListNodes(ctx, r.cs)
 	if err != nil {
 		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
@@ -179,13 +180,13 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	now := r.now.Now()
 	for i := range nodes {
 		n := &nodes[i]
-		if !shared.NodeReady(n) {
+		if !kube.NodeReady(n) {
 			notReady = append(notReady, n.Name)
 		}
 		// Only an ACTIVE cordon is a storm signal — a node statically
 		// cordoned past the cordon window is deliberate state, and
 		// counting it would pin the descheduler at 0 forever.
-		if shared.NodeActivelyCordoned(n, now) {
+		if kube.NodeActivelyCordoned(n, now) {
 			cordoned = append(cordoned, n.Name)
 		}
 		for _, c := range n.Status.Conditions {
@@ -305,11 +306,11 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 // dynamic client — are errors, so a "clear" verdict is never
 // computed on blind data.
 func (r *deschedulerStormGate) maintenanceEvidence(ctx context.Context) ([]string, error) {
-	kured, err := shared.KuredLockEvidence(ctx, r.cs)
+	kured, err := kube.KuredLockEvidence(ctx, r.cs)
 	if err != nil {
 		return nil, err
 	}
-	plans, err := shared.AutopilotPlanEvidence(ctx, r.dyn)
+	plans, err := kube.AutopilotPlanEvidence(ctx, r.dyn)
 	if err != nil {
 		return nil, err
 	}

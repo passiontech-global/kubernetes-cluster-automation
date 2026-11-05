@@ -63,6 +63,9 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -94,12 +97,12 @@ const (
 )
 
 var (
-	ciliumIdentityGVR = shared.GVRCiliumIdentity
-	ciliumEndpointGVR = shared.GVRCiliumEndpoint
+	ciliumIdentityGVR = kube.GVRCiliumIdentity
+	ciliumEndpointGVR = kube.GVRCiliumEndpoint
 	// ciliumEndpointSliceGVR is the v2alpha1 CiliumEndpointSlice —
 	// on CES-enabled clusters the agent stops writing CiliumEndpoints
 	// entirely and records identity usage here instead.
-	ciliumEndpointSliceGVR = shared.GVRCiliumEndpointSlice
+	ciliumEndpointSliceGVR = kube.GVRCiliumEndpointSlice
 )
 
 type ciliumIdentityAuditor struct {
@@ -113,7 +116,7 @@ type ciliumIdentityAuditor struct {
 	// from object age — an identity must LOOK orphaned across ≥2
 	// consecutive sweeps. Pruned when the identity is referenced
 	// again or vanishes; a restart re-arms it, biasing conservative.
-	orphanFirstSeen shared.FirstSeenLedger
+	orphanFirstSeen state.FirstSeenLedger
 	// now is the clock seam — tests pin it so the grace/minAge
 	// windows are deterministic.
 	now shared.Clock
@@ -146,16 +149,16 @@ func Setup(d shared.Deps) error {
 // unparseable CILIUM_IDENTITY_GC_ENABLED must warn even on a
 // gated-off cluster.
 func gcEnabledFromEnv() bool {
-	return shared.Gate("CILIUM_IDENTITY_GC_ENABLED", true)
+	return envx.Gate("CILIUM_IDENTITY_GC_ENABLED", true)
 }
 
 func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	now := a.now.Now()
 
-	ids, err := shared.ListAll(ctx,
+	ids, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: ciliumListPageSize},
-		shared.DynamicPage(a.dyn.Resource(ciliumIdentityGVR)))
+		kube.DynamicPage(a.dyn.Resource(ciliumIdentityGVR)))
 	if err != nil {
 		return fmt.Errorf("list ciliumidentities: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
@@ -179,9 +182,9 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	ids = nil
 
 	used := map[string]struct{}{}
-	eps, err := shared.ListAll(ctx,
+	eps, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: ciliumListPageSize},
-		shared.DynamicPage(a.dyn.Resource(ciliumEndpointGVR).Namespace(metav1.NamespaceAll)))
+		kube.DynamicPage(a.dyn.Resource(ciliumEndpointGVR).Namespace(metav1.NamespaceAll)))
 	if err != nil {
 		return fmt.Errorf("list ciliumendpoints: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
@@ -201,9 +204,9 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	// indeterminate — fail closed like the CEP/pod lists (a returned
 	// error aborts the run, so the GC path below is never reached on
 	// partial data).
-	slices, err := shared.ListAll(ctx,
+	slices, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: ciliumListPageSize},
-		shared.DynamicPage(a.dyn.Resource(ciliumEndpointSliceGVR).
+		kube.DynamicPage(a.dyn.Resource(ciliumEndpointSliceGVR).
 			Namespace(metav1.NamespaceAll)))
 	switch {
 	case err == nil:
@@ -229,7 +232,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
 		Limit:         ciliumListPageSize,
 	}
-	err = shared.ListEach(ctx, podOpts, shared.Pods(a.cs, metav1.NamespaceAll),
+	err = kube.ListEach(ctx, podOpts, kube.Pods(a.cs, metav1.NamespaceAll),
 		func(items []corev1.Pod) error {
 			for i := range items {
 				p := &items[i]
@@ -332,7 +335,7 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 	// nodes at all means the cluster is too broken to judge, so an
 	// empty list aborts too rather than vacuously passing "all
 	// Ready".
-	nodes, err := shared.ListNodes(ctx, a.cs)
+	nodes, err := kube.ListNodes(ctx, a.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err) // propagates to run()'s return — wrapper IncErrors
 	}
@@ -342,7 +345,7 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 		return nil
 	}
 	for i := range nodes {
-		if !shared.NodeReady(&nodes[i]) {
+		if !kube.NodeReady(&nodes[i]) {
 			log.Info("GC SKIP: node not Ready — identities may still be live on it",
 				"node", nodes[i].Name, "eligible", len(eligible))
 			return nil
@@ -366,7 +369,7 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 		// delete with a Conflict, skipped like the NotFound race below.
 		uid := idUIDs[name]
 		if err := a.dyn.Resource(ciliumIdentityGVR).
-			Delete(ctx, name, shared.UIDDeleteOptions(uid, "")); err != nil {
+			Delete(ctx, name, kube.UIDDeleteOptions(uid, "")); err != nil {
 			switch {
 			case apierrors.IsNotFound(err):
 				log.Info("SKIP: identity already gone — raced with cilium's own GC",
@@ -391,11 +394,11 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 // endpointIdentityID extracts .status.identity.id — numeric in real
 // objects (int64) but float64 in hand-built fixtures.
 func endpointIdentityID(ep *unstructured.Unstructured) string {
-	if id, ok := shared.NestedInt64(
+	if id, ok := kube.NestedInt64(
 		ep.Object, "status", "identity", "id"); ok {
 		return strconv.FormatInt(id, 10)
 	}
-	if f, ok := shared.NestedFloat64(
+	if f, ok := kube.NestedFloat64(
 		ep.Object, "status", "identity", "id"); ok {
 		return strconv.FormatInt(int64(f), 10)
 	}
@@ -407,7 +410,7 @@ func endpointIdentityID(ep *unstructured.Unstructured) string {
 // replacement for the CEP's .status.identity.id. Non-numeric entries
 // are skipped like the CEP path does.
 func sliceIdentityIDs(ces *unstructured.Unstructured) []string {
-	endpoints, _ := shared.NestedSlice(
+	endpoints, _ := kube.NestedSlice(
 		ces.Object, "spec", "endpoints")
 	out := make([]string, 0, len(endpoints))
 	for _, e := range endpoints {
@@ -415,12 +418,12 @@ func sliceIdentityIDs(ces *unstructured.Unstructured) []string {
 		if !ok {
 			continue
 		}
-		if id, ok := shared.NestedInt64(
+		if id, ok := kube.NestedInt64(
 			m, "identity", "id"); ok {
 			out = append(out, strconv.FormatInt(id, 10))
 			continue
 		}
-		if f, ok := shared.NestedFloat64(
+		if f, ok := kube.NestedFloat64(
 			m, "identity", "id"); ok {
 			out = append(out, strconv.FormatInt(int64(f), 10))
 		}
