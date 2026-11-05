@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,10 +18,33 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
+const (
+	// defaultNetnsDir is the host /run/netns mount — the CNI
+	// netns-file leak reaper scans cni-* entries here.
+	defaultNetnsDir               = "/host/run/netns"
+	spegelMinPodAge               = 3 * time.Minute
+	defaultCalicoFelixReadyURL    = "http://127.0.0.1:9099/readiness"
+	defaultCalicoOrphanVethThresh = 50 // cali* ifaces above the pod count → leak
+	// Wave-8 knobs: felix restart after the latch persisted this
+	// many consecutive failed cycles, and the orphan-veth down-age
+	// for the cali* GC.
+	calicoFelixRestartFails = 3
+	calicoVethGCMinAge      = 15 * time.Minute
+	// cniNetnsMinAge is the orphan CNI netns confirmation age
+	// (Wave-9).
+	cniNetnsMinAge = 30 * time.Minute
+)
+
+var (
+	// W7 pod matchers — anchored like konnPodRe/dnsPodRe.
+	spegelPodRe     = regexp.MustCompile(`^spegel-[a-z0-9]+$`)      // H4 P2P mirror
+	calicoNodePodRe = regexp.MustCompile(`^calico-node-[a-z0-9]+$`) // H7 felix
+)
+
 // spegelCheck is the W7-H4 mirror-peer guard as a Check; it owns
 // the Ready=False streak (ex-Hygiene.spegelFails).
 type spegelCheck struct {
-	h     *Hygiene
+	d     *deps
 	fails int
 }
 
@@ -29,12 +54,12 @@ func (c *spegelCheck) Name() string { return checkSpegel }
 // Run executes one spegel-mirror round.
 func (c *spegelCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkSpegel, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkSpegel, "gated").Inc()
 		return
 	}
 	if !e.apiOK {
 		// Inconclusive — keep streak/latch exactly like teardown.
-		c.h.cycles.WithLabelValues(checkSpegel, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkSpegel, "abort").Inc()
 		return
 	}
 	var sp *corev1.Pod
@@ -44,7 +69,7 @@ func (c *spegelCheck) Run(ctx context.Context, e *cycleEnv) {
 			!spegelPodRe.MatchString(p.Name) ||
 			p.DeletionTimestamp != nil ||
 			p.Status.Phase != corev1.PodRunning ||
-			c.h.cfg.Seams.nowFn().Sub(p.CreationTimestamp.Time) < spegelMinPodAge {
+			c.d.cfg.Seams.nowFn().Sub(p.CreationTimestamp.Time) < spegelMinPodAge {
 			continue
 		}
 		sp = p
@@ -55,41 +80,41 @@ func (c *spegelCheck) Run(ctx context.Context, e *cycleEnv) {
 		// way the mirror datapath isn't our problem; clear stale
 		// evidence like checkCilium's no-agent path.
 		c.fails = 0
-		c.h.state.Exit(hoststate.LatchSpegelMirrorDegraded, nil)
-		c.h.cycles.WithLabelValues(checkSpegel, "ok").Inc()
+		c.d.state.Exit(hoststate.LatchSpegelMirrorDegraded, nil)
+		c.d.cycles.WithLabelValues(checkSpegel, "ok").Inc()
 		return
 	}
 	c.fails++
-	if c.fails < c.h.cfg.ConsecNeeded {
-		c.h.state.AppendLog(fmt.Sprintf(
+	if c.fails < c.d.cfg.ConsecNeeded {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: spegel-mirror pod %s/%s Ready=False (check %d/%d)",
-			sp.Namespace, sp.Name, c.fails, c.h.cfg.ConsecNeeded))
-		c.h.cycles.WithLabelValues(checkSpegel, "ok").Inc()
+			sp.Namespace, sp.Name, c.fails, c.d.cfg.ConsecNeeded))
+		c.d.cycles.WithLabelValues(checkSpegel, "ok").Inc()
 		return
 	}
-	c.h.state.Enter(hoststate.LatchSpegelMirrorDegraded,
+	c.d.state.Enter(hoststate.LatchSpegelMirrorDegraded,
 		fmt.Sprintf("pod=%s/%s ready_fails=%d", sp.Namespace, sp.Name, c.fails))
-	if !c.h.state.RateTrySpend("last-spegel-restart", c.h.cfg.MinRestartInterval) {
-		c.h.state.AppendLog(fmt.Sprintf(
+	if !c.d.state.RateTrySpend("last-spegel-restart", c.d.cfg.MinRestartInterval) {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: spegel-mirror %s/%s Ready=False %dx but restart in cooldown (<30m), skip",
 			sp.Namespace, sp.Name, c.fails))
-		c.h.cycles.WithLabelValues(checkSpegel, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkSpegel, "ok").Inc()
 		return
 	}
 	// Budget spent atomically BEFORE the delete (rate_spend parity).
-	c.h.state.AppendLog(fmt.Sprintf(
+	c.d.state.AppendLog(fmt.Sprintf(
 		"ACTION: spegel-mirror deleted pod %s/%s - Ready=False %dx (containerd mirror points at a wedged peer)",
 		sp.Namespace, sp.Name, c.fails))
-	if err := c.h.cfg.Client.CoreV1().Pods(sp.Namespace).Delete(ctx, sp.Name,
+	if err := c.d.cfg.Client.CoreV1().Pods(sp.Namespace).Delete(ctx, sp.Name,
 		metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}); err != nil {
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: spegel-mirror delete %s/%s failed: %v",
 			sp.Namespace, sp.Name, err))
 	} else {
 		c.fails = 0
-		c.h.actions.WithLabelValues(checkSpegel, "pod_delete").Inc()
+		c.d.actions.WithLabelValues(checkSpegel, "pod_delete").Inc()
 	}
-	c.h.cycles.WithLabelValues(checkSpegel, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkSpegel, "ok").Inc()
 }
 
 // checkSpegelMirror forwards to the migrated Check — tests written
@@ -118,8 +143,8 @@ func (h *Hygiene) checkSpegelMirror(ctx context.Context, pods []corev1.Pod,
 
 // calicoIfaceCount counts cali* interfaces under SysClassNet; -1
 // when the sysfs root is unreadable (inconclusive).
-func (h *Hygiene) calicoIfaceCount() int {
-	entries, err := os.ReadDir(h.cfg.Net.SysClassNet)
+func (d *deps) calicoIfaceCount() int {
+	entries, err := os.ReadDir(d.cfg.Net.SysClassNet)
 	if err != nil {
 		return -1
 	}
@@ -136,7 +161,7 @@ func (h *Hygiene) calicoIfaceCount() int {
 // veth-leak and felix readiness streaks (ex-Hygiene.calicoVethFails/
 // .calicoFelixFails).
 type calicoCheck struct {
-	h          *Hygiene
+	d          *deps
 	vethFails  int
 	felixFails int
 }
@@ -147,55 +172,55 @@ func (c *calicoCheck) Name() string { return checkCalico }
 // Run executes one calico-hygiene round.
 func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkCalico, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkCalico, "gated").Inc()
 		return
 	}
-	if _, err := os.Stat(filepath.Join(c.h.cfg.Net.SysClassNet, "cilium_host")); err == nil {
+	if _, err := os.Stat(filepath.Join(c.d.cfg.Net.SysClassNet, "cilium_host")); err == nil {
 		// Cilium node — every calico verdict belongs to the cilium
 		// guard family; drop stale evidence like checkCiliumWGPeers.
 		c.vethFails = 0
 		c.felixFails = 0
-		c.h.state.Exit(hoststate.LatchCalicoVethLeak, nil)
-		c.h.state.Exit(hoststate.LatchCalicoFelixDown, nil)
-		c.h.cycles.WithLabelValues(checkCalico, "ok").Inc()
+		c.d.state.Exit(hoststate.LatchCalicoVethLeak, nil)
+		c.d.state.Exit(hoststate.LatchCalicoFelixDown, nil)
+		c.d.cycles.WithLabelValues(checkCalico, "ok").Inc()
 		return
 	}
-	cali := c.h.calicoIfaceCount()
+	cali := c.d.calicoIfaceCount()
 	if cali <= 0 {
 		// No cali* veth at all — not a calico node (unreadable
 		// sysfs reports -1 the same way: nothing to verify).
 		c.vethFails = 0
 		c.felixFails = 0
-		c.h.state.Exit(hoststate.LatchCalicoVethLeak, nil)
-		c.h.state.Exit(hoststate.LatchCalicoFelixDown, nil)
-		c.h.cycles.WithLabelValues(checkCalico, "ok").Inc()
+		c.d.state.Exit(hoststate.LatchCalicoVethLeak, nil)
+		c.d.state.Exit(hoststate.LatchCalicoFelixDown, nil)
+		c.d.cycles.WithLabelValues(checkCalico, "ok").Inc()
 		return
 	}
 	if !e.apiOK {
 		// Pod count is the leak baseline — an API flake makes the
 		// comparison invalid. Keep streaks/latches (inconclusive).
-		c.h.cycles.WithLabelValues(checkCalico, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkCalico, "abort").Inc()
 		return
 	}
 	// Check 1 — orphan veth leak.
-	if cali > len(e.pods)+c.h.cfg.Calico.OrphanVethThreshold {
+	if cali > len(e.pods)+c.d.cfg.Calico.OrphanVethThreshold {
 		c.vethFails++
-		if c.vethFails >= c.h.cfg.ConsecNeeded {
-			if !c.h.state.Exists(hoststate.LatchCalicoVethLeak) {
-				c.h.state.AppendLog(fmt.Sprintf(
+		if c.vethFails >= c.d.cfg.ConsecNeeded {
+			if !c.d.state.Exists(hoststate.LatchCalicoVethLeak) {
+				c.d.state.AppendLog(fmt.Sprintf(
 					"suspect: calico-hygiene orphan veth leak cali=%d pods=%d threshold=%d — CNI DEL cleanup is leaking veth pairs",
-					cali, len(e.pods), c.h.cfg.Calico.OrphanVethThreshold))
+					cali, len(e.pods), c.d.cfg.Calico.OrphanVethThreshold))
 			}
-			c.h.state.Enter(hoststate.LatchCalicoVethLeak,
+			c.d.state.Enter(hoststate.LatchCalicoVethLeak,
 				fmt.Sprintf("cali=%d pods=%d", cali, len(e.pods)))
 		} else {
-			c.h.state.AppendLog(fmt.Sprintf(
+			c.d.state.AppendLog(fmt.Sprintf(
 				"suspect: calico-hygiene veth leak candidate cali=%d pods=%d (check %d/%d)",
-				cali, len(e.pods), c.vethFails, c.h.cfg.ConsecNeeded))
+				cali, len(e.pods), c.vethFails, c.d.cfg.ConsecNeeded))
 		}
 	} else {
 		c.vethFails = 0
-		c.h.state.Exit(hoststate.LatchCalicoVethLeak, nil)
+		c.d.state.Exit(hoststate.LatchCalicoVethLeak, nil)
 	}
 	// Check 1b — orphan-veth GC (W8-NM3): while the leak latch is
 	// set, reap cali* host veths that stayed DOWN (carrier 0) for
@@ -205,8 +230,8 @@ func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 	// confirm-marker shape as wedged-seen-* (a veth must not be
 	// deleted on a single read: an interface mid-creation can read
 	// carrier 0 for a moment).
-	if c.h.state.Exists(hoststate.LatchCalicoVethLeak) {
-		c.h.gcCalicoOrphanVeths(ctx)
+	if c.d.state.Exists(hoststate.LatchCalicoVethLeak) {
+		c.d.gcCalicoOrphanVeths(ctx)
 	}
 	// Check 2 — felix readiness, gated on a Running calico-node pod
 	// on this node (no pod → nothing to probe).
@@ -221,25 +246,25 @@ func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 		}
 	}
 	switch {
-	case felix == nil || c.h.cfg.Calico.FelixReadyURL == "":
+	case felix == nil || c.d.cfg.Calico.FelixReadyURL == "":
 		c.felixFails = 0
-		c.h.state.Exit(hoststate.LatchCalicoFelixDown, nil)
+		c.d.state.Exit(hoststate.LatchCalicoFelixDown, nil)
 	default:
-		code, err := c.h.cfg.Seams.probeHTTPStatus(ctx,
-			c.h.cfg.Calico.FelixReadyURL, "", ciliumProbeTime)
+		code, err := c.d.cfg.Seams.probeHTTPStatus(ctx,
+			c.d.cfg.Calico.FelixReadyURL, "", ciliumProbeTime)
 		if err == nil && code == http.StatusOK {
 			c.felixFails = 0
-			c.h.state.Exit(hoststate.LatchCalicoFelixDown, nil)
+			c.d.state.Exit(hoststate.LatchCalicoFelixDown, nil)
 			break
 		}
 		c.felixFails++
-		if c.felixFails < c.h.cfg.ConsecNeeded {
-			c.h.state.AppendLog(fmt.Sprintf(
+		if c.felixFails < c.d.cfg.ConsecNeeded {
+			c.d.state.AppendLog(fmt.Sprintf(
 				"suspect: calico-felix-down readiness probe code=%d err=%v (check %d/%d)",
-				code, err, c.felixFails, c.h.cfg.ConsecNeeded))
+				code, err, c.felixFails, c.d.cfg.ConsecNeeded))
 			break
 		}
-		c.h.state.Enter(hoststate.LatchCalicoFelixDown,
+		c.d.state.Enter(hoststate.LatchCalicoFelixDown,
 			fmt.Sprintf("readiness_probe_fails=%d", c.felixFails))
 		// W8-NM3: a felix datapath whose readiness stayed dark
 		// across calicoFelixRestartFails consecutive cycles is a
@@ -247,30 +272,30 @@ func (c *calicoCheck) Run(ctx context.Context, e *cycleEnv) {
 		// the DaemonSet rebuilds it (last-calico-restart budget).
 		if c.felixFails >= calicoFelixRestartFails {
 			switch {
-			case c.h.state.Exists(hoststate.LatchNodeOverloaded):
-				c.h.state.AppendLog(fmt.Sprintf(
+			case c.d.state.Exists(hoststate.LatchNodeOverloaded):
+				c.d.state.AppendLog(fmt.Sprintf(
 					"suspect: calico-felix-down %dx but node overloaded — skip pod restart", c.felixFails))
-			case !c.h.state.RateTrySpend("last-calico-restart", c.h.cfg.MinRestartInterval):
-				c.h.state.AppendLog(fmt.Sprintf(
+			case !c.d.state.RateTrySpend("last-calico-restart", c.d.cfg.MinRestartInterval):
+				c.d.state.AppendLog(fmt.Sprintf(
 					"suspect: calico-felix-down %dx but pod restart in cooldown (<30m), skip", c.felixFails))
 			default:
 				// Budget spent atomically BEFORE the delete.
-				c.h.state.AppendLog(fmt.Sprintf(
+				c.d.state.AppendLog(fmt.Sprintf(
 					"ACTION: calico-hygiene deleted pod %s/%s - felix readiness down %dx",
 					felix.Namespace, felix.Name, c.felixFails))
-				if derr := c.h.cfg.Client.CoreV1().Pods(felix.Namespace).Delete(
+				if derr := c.d.cfg.Client.CoreV1().Pods(felix.Namespace).Delete(
 					ctx, felix.Name, metav1.DeleteOptions{
 						GracePeriodSeconds: ptr.To[int64](0)}); derr != nil {
-					c.h.state.AppendLog(fmt.Sprintf(
+					c.d.state.AppendLog(fmt.Sprintf(
 						"suspect: calico-hygiene delete %s/%s failed: %v",
 						felix.Namespace, felix.Name, derr))
 				} else {
-					c.h.actions.WithLabelValues(checkCalico, "pod_delete").Inc()
+					c.d.actions.WithLabelValues(checkCalico, "pod_delete").Inc()
 				}
 			}
 		}
 	}
-	c.h.cycles.WithLabelValues(checkCalico, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkCalico, "ok").Inc()
 }
 
 // checkCalicoHygiene forwards to the migrated Check — tests written
@@ -289,8 +314,8 @@ func (h *Hygiene) checkCalicoHygiene(ctx context.Context, pods []corev1.Pod,
 // wedged-seen-* pattern — a single down read is not enough: an
 // iface mid-creation reads carrier 0 briefly). Markers for ifaces
 // that vanished or came back up are pruned.
-func (h *Hygiene) gcCalicoOrphanVeths(ctx context.Context) {
-	entries, err := os.ReadDir(h.cfg.Net.SysClassNet)
+func (d *deps) gcCalicoOrphanVeths(ctx context.Context) {
+	entries, err := os.ReadDir(d.cfg.Net.SysClassNet)
 	if err != nil {
 		return
 	}
@@ -299,8 +324,8 @@ func (h *Hygiene) gcCalicoOrphanVeths(ctx context.Context) {
 		if !strings.HasPrefix(name, "cali") {
 			continue
 		}
-		marker := filepath.Join(h.cfg.WatchdogStateDir, "veth-seen-"+name)
-		carrier, err := os.ReadFile(filepath.Join(h.cfg.Net.SysClassNet, name, "carrier"))
+		marker := filepath.Join(d.cfg.WatchdogStateDir, "veth-seen-"+name)
+		carrier, err := os.ReadFile(filepath.Join(d.cfg.Net.SysClassNet, name, "carrier"))
 		if err != nil {
 			continue // racing an iface add/remove — neither up nor down
 		}
@@ -310,41 +335,41 @@ func (h *Hygiene) gcCalicoOrphanVeths(ctx context.Context) {
 			_ = os.Remove(marker)
 			continue
 		}
-		if !h.stateFileExists("veth-seen-" + name) {
-			h.state.RateSpend("veth-seen-" + name)
-			h.state.AppendLog(fmt.Sprintf(
+		if !d.stateFileExists("veth-seen-" + name) {
+			d.state.RateSpend("veth-seen-" + name)
+			d.state.AppendLog(fmt.Sprintf(
 				"calico-hygiene: orphan veth candidate %s - carrier down, confirm in %dm",
 				name, int(calicoVethGCMinAge.Minutes())))
 			continue
 		}
-		if !h.state.RateOK("veth-seen-"+name, calicoVethGCMinAge) {
+		if !d.state.RateOK("veth-seen-"+name, calicoVethGCMinAge) {
 			continue
 		}
-		if h.cfg.Systemd == nil {
-			h.state.AppendLog(fmt.Sprintf(
+		if d.cfg.Systemd == nil {
+			d.state.AppendLog(fmt.Sprintf(
 				"suspect: calico-hygiene orphan veth %s down >%dm but no systemd client — skip delete",
 				name, int(calicoVethGCMinAge.Minutes())))
 			continue
 		}
-		out, derr := h.cfg.Systemd.Exec(ctx, "ip", "link", "delete", name)
+		out, derr := d.cfg.Systemd.Exec(ctx, "ip", "link", "delete", name)
 		if derr != nil {
-			h.state.AppendLog(fmt.Sprintf(
+			d.state.AppendLog(fmt.Sprintf(
 				"suspect: calico-hygiene ip link delete %s failed: %v (%s)",
 				name, derr, strings.TrimSpace(out)))
 			continue
 		}
 		_ = os.Remove(marker)
-		h.state.AppendLog(fmt.Sprintf(
+		d.state.AppendLog(fmt.Sprintf(
 			"ACTION: calico-hygiene deleted orphan veth %s - carrier down >%dm (CNI DEL leak)",
 			name, int(calicoVethGCMinAge.Minutes())))
-		h.actions.WithLabelValues(checkCalico, "veth_delete").Inc()
+		d.actions.WithLabelValues(checkCalico, "veth_delete").Inc()
 	}
 	// Prune markers for ifaces that no longer exist.
 	if ms, err := filepath.Glob(
-		filepath.Join(h.cfg.WatchdogStateDir, "veth-seen-*")); err == nil {
+		filepath.Join(d.cfg.WatchdogStateDir, "veth-seen-*")); err == nil {
 		for _, m := range ms {
 			name := strings.TrimPrefix(filepath.Base(m), "veth-seen-")
-			if _, err := os.Stat(filepath.Join(h.cfg.Net.SysClassNet, name)); err != nil {
+			if _, err := os.Stat(filepath.Join(d.cfg.Net.SysClassNet, name)); err != nil {
 				_ = os.Remove(m)
 			}
 		}
@@ -386,10 +411,10 @@ func netnsInode(path string) (uint64, bool) {
 // liveNetnsInodes collects the nsfs inode of every live process's
 // network namespace. Unreadable entries are skipped — a pid that
 // vanished mid-scan is not a reference.
-func (h *Hygiene) liveNetnsInodes(pids []int) map[uint64]bool {
+func (d *deps) liveNetnsInodes(pids []int) map[uint64]bool {
 	out := map[uint64]bool{}
 	for _, pid := range pids {
-		if ino, ok := netnsInode(h.proc.File(pid, "ns", "net")); ok {
+		if ino, ok := netnsInode(d.proc.File(pid, "ns", "net")); ok {
 			out[ino] = true
 		}
 	}
@@ -397,7 +422,7 @@ func (h *Hygiene) liveNetnsInodes(pids []int) map[uint64]bool {
 }
 
 // cniNetnsCheck is the W9 orphan /run/netns/cni-* reaper as a Check.
-type cniNetnsCheck struct{ h *Hygiene }
+type cniNetnsCheck struct{ d *deps }
 
 // Name returns the check label / WD_SIG key.
 func (c *cniNetnsCheck) Name() string { return checkCNINetns }
@@ -405,22 +430,22 @@ func (c *cniNetnsCheck) Name() string { return checkCNINetns }
 // Run executes one cni-netns-gc round.
 func (c *cniNetnsCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkCNINetns, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkCNINetns, "gated").Inc()
 		return
 	}
-	entries, err := os.ReadDir(c.h.cfg.Net.NetnsDir)
+	entries, err := os.ReadDir(c.d.cfg.Net.NetnsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// No netns dir at all (non-CNI node, unmounted /run) —
 			// prune stale markers and go quiet.
-			c.h.pruneCNINetnsMarkers(nil)
-			c.h.cycles.WithLabelValues(checkCNINetns, "ok").Inc()
+			c.d.pruneCNINetnsMarkers(nil)
+			c.d.cycles.WithLabelValues(checkCNINetns, "ok").Inc()
 			return
 		}
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: cni-netns-gc read %s failed: %v — scan skipped",
-			c.h.cfg.Net.NetnsDir, err))
-		c.h.cycles.WithLabelValues(checkCNINetns, "abort").Inc()
+			c.d.cfg.Net.NetnsDir, err))
+		c.d.cycles.WithLabelValues(checkCNINetns, "abort").Inc()
 		return
 	}
 	// Collect cni-* candidates first — the /proc ns/net stat sweep
@@ -433,15 +458,15 @@ func (c *cniNetnsCheck) Run(ctx context.Context, e *cycleEnv) {
 		names = append(names, e.Name())
 	}
 	if len(names) == 0 {
-		c.h.pruneCNINetnsMarkers(nil)
-		c.h.cycles.WithLabelValues(checkCNINetns, "ok").Inc()
+		c.d.pruneCNINetnsMarkers(nil)
+		c.d.cycles.WithLabelValues(checkCNINetns, "ok").Inc()
 		return
 	}
-	live := c.h.liveNetnsInodes(e.pidsOnce())
+	live := c.d.liveNetnsInodes(e.pidsOnce())
 	seen := map[string]bool{}
 	for _, name := range names {
 		seen[name] = true
-		path := filepath.Join(c.h.cfg.Net.NetnsDir, name)
+		path := filepath.Join(c.d.cfg.Net.NetnsDir, name)
 		ino, ok := netnsInode(path)
 		if !ok {
 			continue // vanished or unreadable — next cycle re-reads
@@ -451,18 +476,18 @@ func (c *cniNetnsCheck) Run(ctx context.Context, e *cycleEnv) {
 			// is real. Drop any stale marker so a later orphan
 			// episode re-arms the full confirmation window.
 			_ = os.Remove(filepath.Join(
-				c.h.cfg.WatchdogStateDir, "cni-netns-seen-"+name))
+				c.d.cfg.WatchdogStateDir, "cni-netns-seen-"+name))
 			continue
 		}
 		marker := "cni-netns-seen-" + name
-		if !c.h.stateFileExists(marker) {
-			c.h.state.RateSpend(marker)
-			c.h.state.AppendLog(fmt.Sprintf(
+		if !c.d.stateFileExists(marker) {
+			c.d.state.RateSpend(marker)
+			c.d.state.AppendLog(fmt.Sprintf(
 				"cni-netns-gc: orphan netns candidate %s - no live process, confirm in %dm",
 				name, int(cniNetnsMinAge.Minutes())))
 			continue
 		}
-		if !c.h.state.RateOK(marker, cniNetnsMinAge) {
+		if !c.d.state.RateOK(marker, cniNetnsMinAge) {
 			continue
 		}
 		// Re-stat before acting: the inode must STILL be
@@ -472,10 +497,10 @@ func (c *cniNetnsCheck) Run(ctx context.Context, e *cycleEnv) {
 		if !ok2 || live[ino2] {
 			continue
 		}
-		c.h.reapCNINetns(ctx, name)
+		c.d.reapCNINetns(ctx, name)
 	}
-	c.h.pruneCNINetnsMarkers(seen)
-	c.h.cycles.WithLabelValues(checkCNINetns, "ok").Inc()
+	c.d.pruneCNINetnsMarkers(seen)
+	c.d.cycles.WithLabelValues(checkCNINetns, "ok").Inc()
 }
 
 // checkOrphanCNINetns forwards to the migrated Check — tests written
@@ -490,46 +515,46 @@ func (h *Hygiene) checkOrphanCNINetns(ctx context.Context,
 // the HOST mount namespace, then removes the file under the /host
 // view. The marker is dropped only after the umount succeeds — a
 // failed umount keeps the confirmation so the next cycle retries.
-func (h *Hygiene) reapCNINetns(ctx context.Context, name string) {
-	if h.cfg.Systemd == nil {
-		h.state.AppendLog(fmt.Sprintf(
+func (d *deps) reapCNINetns(ctx context.Context, name string) {
+	if d.cfg.Systemd == nil {
+		d.state.AppendLog(fmt.Sprintf(
 			"suspect: cni-netns-gc orphan netns %s confirmed but no systemd client — skip umount",
 			name))
 		return
 	}
 	// The umount path is the HOST's /run/netns — NOT NetnsDir,
 	// which is the /host-prefixed filesystem view used for scans.
-	out, err := h.cfg.Systemd.Exec(ctx, "umount", "-l",
+	out, err := d.cfg.Systemd.Exec(ctx, "umount", "-l",
 		"/run/netns/"+name)
 	if err != nil {
-		h.state.AppendLog(fmt.Sprintf(
+		d.state.AppendLog(fmt.Sprintf(
 			"suspect: cni-netns-gc umount /run/netns/%s failed: %v (%s) — keeping marker",
 			name, err, strings.TrimSpace(out)))
 		return
 	}
-	if rerr := os.Remove(filepath.Join(h.cfg.Net.NetnsDir, name)); rerr != nil &&
+	if rerr := os.Remove(filepath.Join(d.cfg.Net.NetnsDir, name)); rerr != nil &&
 		!os.IsNotExist(rerr) {
 		// The mount IS detached — the dangerous half is done; a
 		// leftover plain file re-arms as a fresh candidate next
 		// cycle rather than looping a doomed umount.
-		h.state.AppendLog(fmt.Sprintf(
+		d.state.AppendLog(fmt.Sprintf(
 			"suspect: cni-netns-gc rm %s failed: %v — mount detached, file remains",
-			filepath.Join(h.cfg.Net.NetnsDir, name), rerr))
+			filepath.Join(d.cfg.Net.NetnsDir, name), rerr))
 	}
 	_ = os.Remove(filepath.Join(
-		h.cfg.WatchdogStateDir, "cni-netns-seen-"+name))
-	h.state.AppendLog(fmt.Sprintf(
+		d.cfg.WatchdogStateDir, "cni-netns-seen-"+name))
+	d.state.AppendLog(fmt.Sprintf(
 		"ACTION: cni-netns-gc reaped orphan netns %s - unmounted + removed (no live process >%dm)",
 		name, int(cniNetnsMinAge.Minutes())))
-	h.actions.WithLabelValues(checkCNINetns, "umount_rm").Inc()
+	d.actions.WithLabelValues(checkCNINetns, "umount_rm").Inc()
 }
 
 // pruneCNINetnsMarkers drops cni-netns-seen-* markers whose netns
 // file vanished — a file that reappeared referenced or was cleaned
 // up by other means must not keep a stale confirmation armed.
-func (h *Hygiene) pruneCNINetnsMarkers(seen map[string]bool) {
+func (d *deps) pruneCNINetnsMarkers(seen map[string]bool) {
 	ms, err := filepath.Glob(filepath.Join(
-		h.cfg.WatchdogStateDir, "cni-netns-seen-*"))
+		d.cfg.WatchdogStateDir, "cni-netns-seen-*"))
 	if err != nil {
 		return
 	}
@@ -538,7 +563,7 @@ func (h *Hygiene) pruneCNINetnsMarkers(seen map[string]bool) {
 		if seen != nil && seen[name] {
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(h.cfg.Net.NetnsDir, name)); err != nil {
+		if _, err := os.Stat(filepath.Join(d.cfg.Net.NetnsDir, name)); err != nil {
 			_ = os.Remove(m)
 		}
 	}

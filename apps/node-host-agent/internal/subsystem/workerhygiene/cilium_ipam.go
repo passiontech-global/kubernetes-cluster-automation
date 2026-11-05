@@ -150,9 +150,9 @@ func parseCiliumIPAM(body []byte) (used, available int, ok bool) {
 // (~2: router + health reserved IPs) is normal, so the latch needs
 // leaked >30 or available <=2 for ConsecNeeded consecutive cycles.
 // The gauges update on every successful probe regardless. The
-// streak stays on Hygiene (ciliumIPAMFails) — pre-Check tests poke
+// streak stays on deps (ciliumIPAMFails) — pre-Check tests poke
 // it directly.
-type ciliumIPAMCheck struct{ h *Hygiene }
+type ciliumIPAMCheck struct{ d *deps }
 
 // Name returns the check label / WD_SIG key.
 func (c *ciliumIPAMCheck) Name() string { return checkCiliumIPAM }
@@ -160,26 +160,26 @@ func (c *ciliumIPAMCheck) Name() string { return checkCiliumIPAM }
 // Run executes one cilium-ipam round.
 func (c *ciliumIPAMCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkCiliumIPAM, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumIPAM, "gated").Inc()
 		return
 	}
 	if !e.apiOK {
 		// The in-use count comes from the API — a failed LIST would
 		// make EVERY allocated IP look leaked.
-		c.h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
 		return
 	}
-	body, err := c.h.cfg.Seams.unixGet(ctx, c.h.cfg.Cilium.Socket, "/v1/healthz")
+	body, err := c.d.cfg.Seams.unixGet(ctx, c.d.cfg.Cilium.Socket, "/v1/healthz")
 	if err != nil {
 		// Socket unreadable — inconclusive: keep counters/latch
 		// (same rule as checkCiliumInitStuck).
-		c.h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
 		return
 	}
 	used, available, ok := parseCiliumIPAM(body)
 	if !ok {
-		c.h.state.AppendLog("suspect: cilium-ipam healthz has no parseable ipam.ipv4 data — inconclusive")
-		c.h.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
+		c.d.state.AppendLog("suspect: cilium-ipam healthz has no parseable ipam.ipv4 data — inconclusive")
+		c.d.cycles.WithLabelValues(checkCiliumIPAM, "abort").Inc()
 		return
 	}
 	inUse := 0
@@ -202,23 +202,23 @@ func (c *ciliumIPAMCheck) Run(ctx context.Context, e *cycleEnv) {
 	if leaked < 0 {
 		leaked = 0
 	}
-	c.h.ciliumAllocated.Set(float64(used))
-	c.h.ciliumLeaked.Set(float64(leaked))
+	c.d.ciliumAllocated.Set(float64(used))
+	c.d.ciliumLeaked.Set(float64(leaked))
 	exhausted := leaked > 30 || (available >= 0 && available <= 2)
 	if !exhausted {
-		c.h.ciliumIPAMFails = 0
-		c.h.state.Exit(hoststate.LatchCiliumIPAMExhausted, nil)
-		c.h.cycles.WithLabelValues(checkCiliumIPAM, "ok").Inc()
+		c.d.ciliumIPAMFails = 0
+		c.d.state.Exit(hoststate.LatchCiliumIPAMExhausted, nil)
+		c.d.cycles.WithLabelValues(checkCiliumIPAM, "ok").Inc()
 		return
 	}
-	c.h.ciliumIPAMFails++
-	if c.h.ciliumIPAMFails >= c.h.cfg.ConsecNeeded {
-		c.h.state.Enter(hoststate.LatchCiliumIPAMExhausted, fmt.Sprintf(
+	c.d.ciliumIPAMFails++
+	if c.d.ciliumIPAMFails >= c.d.cfg.ConsecNeeded {
+		c.d.state.Enter(hoststate.LatchCiliumIPAMExhausted, fmt.Sprintf(
 			"used=%d in-use=%d leaked=%d available=%d", used, inUse, leaked, available))
 	} else {
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-ipam-exhausted used=%d in-use=%d leaked=%d available=%d (check %d/%d)",
-			used, inUse, leaked, available, c.h.ciliumIPAMFails, c.h.cfg.ConsecNeeded))
+			used, inUse, leaked, available, c.d.ciliumIPAMFails, c.d.cfg.ConsecNeeded))
 	}
-	c.h.cycles.WithLabelValues(checkCiliumIPAM, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkCiliumIPAM, "ok").Inc()
 }

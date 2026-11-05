@@ -7,12 +7,24 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+)
+
+const (
+	defaultPSIFullAvg60    = 25.0             // /proc/pressure/memory full avg60 in percent
+	defaultMemFreeMinRatio = 0.08             // MemAvailable/MemTotal floor
+	psiEvictInterval       = 15 * time.Minute // last-psi-evict budget
+	// Wave-9 slab-leak guard thresholds (SUnreclaim/MemTotal
+	// enter/clear hysteresis + the drop_caches budget).
+	slabLeakEnterRatio     = 0.35
+	slabLeakClearRatio     = 0.25
+	slabDropCachesInterval = time.Hour
 )
 
 // psiMemoryFullAvg60 parses <ProcRoot>/pressure/memory — the
@@ -24,8 +36,8 @@ import (
 //
 // ok=false when the file is unreadable or carries no full avg60
 // (PSI disabled on this kernel — the whole check is then dormant).
-func (h *Hygiene) psiMemoryFullAvg60() (float64, bool) {
-	data, err := os.ReadFile(filepath.Join(h.cfg.ProcRoot, "pressure", "memory"))
+func (d *deps) psiMemoryFullAvg60() (float64, bool) {
+	data, err := os.ReadFile(filepath.Join(d.cfg.ProcRoot, "pressure", "memory"))
 	if err != nil {
 		return 0, false
 	}
@@ -60,9 +72,9 @@ type memInfo struct {
 // MemTotal/MemAvailable drive the free-ratio floor, SUnreclaim the
 // W9-KR3 slab-leak guard. ok=false semantics live on the callers:
 // a missing MemTotal or MemAvailable means "unreadable".
-func (h *Hygiene) readMeminfo() memInfo {
+func (d *deps) readMeminfo() memInfo {
 	var m memInfo
-	data, err := os.ReadFile(filepath.Join(h.cfg.ProcRoot, "meminfo"))
+	data, err := os.ReadFile(filepath.Join(d.cfg.ProcRoot, "meminfo"))
 	if err != nil {
 		return m
 	}
@@ -103,22 +115,22 @@ func (h *Hygiene) readMeminfo() memInfo {
 // Hysteresis: enter >0.35, clear <=0.25; between the two the latch
 // (and its drop-caches cadence) simply persists. Returns true while
 // the latch is held.
-func (h *Hygiene) guardKernelSlabLeak(m memInfo) bool {
+func (d *deps) guardKernelSlabLeak(m memInfo) bool {
 	ratio := float64(m.slabUnrecKB) / float64(m.totalKB)
-	latched := h.state.Exists(hoststate.LatchKernelSlabLeak)
+	latched := d.state.Exists(hoststate.LatchKernelSlabLeak)
 	switch {
 	case ratio > slabLeakEnterRatio:
 		if !latched {
 			// NPD contract parity: the ACTION line announces the
 			// latch entry (nodereporter maps STATE-ENTER too).
-			h.state.AppendLog(fmt.Sprintf(
+			d.state.AppendLog(fmt.Sprintf(
 				"ACTION kernel-slab-leak: sunreclaim_ratio=%.3f sunreclaim_kb=%d memtotal_kb=%d",
 				ratio, m.slabUnrecKB, m.totalKB))
 		}
 		latched = true
 	case ratio <= slabLeakClearRatio:
 		if latched {
-			h.state.Exit(hoststate.LatchKernelSlabLeak, nil)
+			d.state.Exit(hoststate.LatchKernelSlabLeak, nil)
 		}
 		latched = false
 	}
@@ -127,10 +139,10 @@ func (h *Hygiene) guardKernelSlabLeak(m memInfo) bool {
 	}
 	// stateEnter refreshes the latch mtime every cycle it is held —
 	// the janitor's 24h reap must not retire a live condition.
-	h.state.Enter(hoststate.LatchKernelSlabLeak,
+	d.state.Enter(hoststate.LatchKernelSlabLeak,
 		fmt.Sprintf("sunreclaim_ratio=%.3f", ratio))
-	if h.state.RateTrySpend("last-slab-drop-caches", slabDropCachesInterval) {
-		h.dropKernelCaches()
+	if d.state.RateTrySpend("last-slab-drop-caches", slabDropCachesInterval) {
+		d.dropKernelCaches()
 	}
 	return true
 }
@@ -139,22 +151,22 @@ func (h *Hygiene) guardKernelSlabLeak(m memInfo) bool {
 // frees dentries/inodes/slab caches. Best-effort: a write failure
 // is logged suspect and never counted as an action — the budget
 // marker is already spent either way (rate_spend parity).
-func (h *Hygiene) dropKernelCaches() {
-	p := filepath.Join(h.cfg.ProcRoot, "sys", "vm", "drop_caches")
+func (d *deps) dropKernelCaches() {
+	p := filepath.Join(d.cfg.ProcRoot, "sys", "vm", "drop_caches")
 	if err := os.WriteFile(p, []byte("2\n"), 0o644); err != nil {
-		h.state.AppendLog(fmt.Sprintf(
+		d.state.AppendLog(fmt.Sprintf(
 			"suspect: kernel-slab-leak drop_caches write %s failed: %v",
 			p, err))
 		return
 	}
-	h.state.AppendLog("ACTION: kernel-slab-leak wrote 2 to sys/vm/drop_caches")
-	h.actions.WithLabelValues(checkPSIThrash, "drop_caches").Inc()
+	d.state.AppendLog("ACTION: kernel-slab-leak wrote 2 to sys/vm/drop_caches")
+	d.actions.WithLabelValues(checkPSIThrash, "drop_caches").Inc()
 }
 
 // procRSS reads /proc/<pid>/status VmRSS in bytes — the resident
 // footprint used to rank eviction victims.
-func (h *Hygiene) procRSS(pid int) int64 {
-	data, err := os.ReadFile(h.proc.File(pid, "status"))
+func (d *deps) procRSS(pid int) int64 {
+	data, err := os.ReadFile(d.proc.File(pid, "status"))
 	if err != nil {
 		return 0
 	}
@@ -258,7 +270,7 @@ func carriesDBQuorumLabel(p *corev1.Pod) bool {
 //
 // Pids are attributed to pods via the same /proc/<pid>/cgroup uid
 // extraction the zombie check uses.
-func (h *Hygiene) highestRSSPod(pods []corev1.Pod, pids []int) (victim *corev1.Pod, rss int64) {
+func (d *deps) highestRSSPod(pods []corev1.Pod, pids []int) (victim *corev1.Pod, rss int64) {
 	type candidate struct {
 		pod       *corev1.Pod
 		rss       int64
@@ -287,12 +299,12 @@ func (h *Hygiene) highestRSSPod(pods []corev1.Pod, pids []int) (victim *corev1.P
 		return nil, 0
 	}
 	for _, pid := range pids {
-		uid := h.podUIDForPID(pid)
+		uid := d.podUIDForPID(pid)
 		if uid == "unknown" {
 			continue
 		}
 		if c, ok := byUID[uid]; ok {
-			c.rss += h.procRSS(pid)
+			c.rss += d.procRSS(pid)
 		}
 	}
 	// Tiered selection: preferred candidates first; only when none
@@ -317,7 +329,7 @@ func (h *Hygiene) highestRSSPod(pods []corev1.Pod, pids []int) (victim *corev1.P
 // psiThrashCheck is the W2 memory-thrash evictor as a Check; it
 // owns the thrash streak (ex-Hygiene.psiThrashFails).
 type psiThrashCheck struct {
-	h     *Hygiene
+	d     *deps
 	fails int
 }
 
@@ -327,58 +339,58 @@ func (c *psiThrashCheck) Name() string { return checkPSIThrash }
 // Run executes one psi-memory-thrash round.
 func (c *psiThrashCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkPSIThrash, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkPSIThrash, "gated").Inc()
 		return
 	}
-	avg60, psiOK := c.h.psiMemoryFullAvg60()
-	m := c.h.readMeminfo()
+	avg60, psiOK := c.d.psiMemoryFullAvg60()
+	m := c.d.readMeminfo()
 	if !m.parsed {
 		// meminfo unreadable — inconclusive, keep streak/latch
 		// exactly like a failed probe (a transient read error must
 		// not clear a live latch).
-		c.h.cycles.WithLabelValues(checkPSIThrash, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkPSIThrash, "abort").Inc()
 		return
 	}
 	// W9-KR3: the slab-leak guard runs on EVERY readable-meminfo
 	// cycle — its latch is this check's eviction circuit breaker,
 	// and it must arm even on kernels without PSI or while PSI is
 	// quiet (a kernel slab leak is a kernel problem, not a PSI one).
-	slabLeaking := c.h.guardKernelSlabLeak(m)
+	slabLeaking := c.d.guardKernelSlabLeak(m)
 	if !psiOK {
 		// PSI disabled on this kernel — the whole thrash check is
 		// dormant, but the slab guard above still evaluated.
-		c.h.cycles.WithLabelValues(checkPSIThrash, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkPSIThrash, "abort").Inc()
 		return
 	}
 	free := float64(m.availKB) / float64(m.totalKB)
-	thrash := avg60 > c.h.cfg.Pressure.PSIFullAvg60 && free < c.h.cfg.Pressure.MemFreeMinRatio
+	thrash := avg60 > c.d.cfg.Pressure.PSIFullAvg60 && free < c.d.cfg.Pressure.MemFreeMinRatio
 	if !thrash {
 		c.fails = 0
-		c.h.state.Exit(hoststate.LatchPSIMemoryThrash, nil)
-		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		c.d.state.Exit(hoststate.LatchPSIMemoryThrash, nil)
+		c.d.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
 	c.fails++
-	if c.fails < c.h.cfg.ConsecNeeded {
-		c.h.state.AppendLog(fmt.Sprintf(
+	if c.fails < c.d.cfg.ConsecNeeded {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: psi-memory-thrash psi_full_avg60=%.1f mem_free=%.3f (check %d/%d)",
-			avg60, free, c.fails, c.h.cfg.ConsecNeeded))
-		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+			avg60, free, c.fails, c.d.cfg.ConsecNeeded))
+		c.d.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
-	if !c.h.state.Exists(hoststate.LatchPSIMemoryThrash) {
+	if !c.d.state.Exists(hoststate.LatchPSIMemoryThrash) {
 		// NPD contract: nodereporter maps this line to the
 		// NodeMemoryPSIThrashing Event + problem_counter — logged
 		// once per latch entry (checkCiliumMTU parity).
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"ACTION psi-memory-thrash: psi_full_avg60=%.1f mem_free=%.3f fails=%d",
 			avg60, free, c.fails))
 	}
-	c.h.state.Enter(hoststate.LatchPSIMemoryThrash,
+	c.d.state.Enter(hoststate.LatchPSIMemoryThrash,
 		fmt.Sprintf("psi_full_avg60=%.1f mem_free=%.3f", avg60, free))
 	if !e.apiOK {
-		c.h.state.AppendLog("suspect: psi-memory-thrash but API unreachable — skip pod evict")
-		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		c.d.state.AppendLog("suspect: psi-memory-thrash but API unreachable — skip pod evict")
+		c.d.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
 	if slabLeaking {
@@ -386,23 +398,23 @@ func (c *psiThrashCheck) Run(ctx context.Context, e *cycleEnv) {
 		// pod cannot fix that and would only remove capacity the
 		// node needs to recover. drop_caches owns the reclaim;
 		// the latch stays so the condition remains visible.
-		c.h.state.AppendLog("suspect: psi-memory-thrash pod evict suppressed - kernel-slab-leak latched")
-		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		c.d.state.AppendLog("suspect: psi-memory-thrash pod evict suppressed - kernel-slab-leak latched")
+		c.d.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
-	victim, rss := c.h.highestRSSPod(e.pods, e.pidsOnce())
+	victim, rss := c.d.highestRSSPod(e.pods, e.pidsOnce())
 	if victim == nil {
 		// No eligible victim above the RSS floor — latch only;
 		// the kernel OOM verdict then stands (nothing ours worth
 		// giving it).
-		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
-	if !c.h.state.RateTrySpend("last-psi-evict", psiEvictInterval) {
-		c.h.state.AppendLog(fmt.Sprintf(
+	if !c.d.state.RateTrySpend("last-psi-evict", psiEvictInterval) {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: psi-memory-thrash victim %s/%s rss=%d - in evict cooldown (<15m), skip",
 			victim.Namespace, victim.Name, rss))
-		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
 	// Budget spent atomically BEFORE the eviction (rate_spend
@@ -416,18 +428,18 @@ func (c *psiThrashCheck) Run(ctx context.Context, e *cycleEnv) {
 			Namespace: victim.Namespace,
 		},
 	}
-	c.h.state.AppendLog(fmt.Sprintf(
+	c.d.state.AppendLog(fmt.Sprintf(
 		"ACTION: psi-memory-thrash evicted pod %s/%s - rss=%d bytes, psi_full_avg60=%.1f mem_free=%.3f",
 		victim.Namespace, victim.Name, rss, avg60, free))
-	if err := c.h.cfg.Client.PolicyV1().Evictions(victim.Namespace).
+	if err := c.d.cfg.Client.PolicyV1().Evictions(victim.Namespace).
 		Evict(ctx, ev); err != nil {
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: psi-memory-thrash evict %s/%s failed: %v",
 			victim.Namespace, victim.Name, err))
 	} else {
-		c.h.actions.WithLabelValues(checkPSIThrash, "pod_evict").Inc()
+		c.d.actions.WithLabelValues(checkPSIThrash, "pod_evict").Inc()
 	}
-	c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 }
 
 // checkPSIThrash forwards to the migrated Check — tests written

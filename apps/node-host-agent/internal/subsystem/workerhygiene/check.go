@@ -30,8 +30,8 @@ type cycleEnv struct {
 // names, metric label values and log lines stay identical. Run
 // executes one round: implementations reach the shared seams
 // (kube client, procfs view, state store, metrics, cfg knobs)
-// through their Hygiene back-ref and own their own streak/latch
-// bookkeeping.
+// through their *deps (deps.go — the check-facing dependency
+// surface) and own their own streak/latch bookkeeping.
 type Check interface {
 	Name() string
 	Run(ctx context.Context, e *cycleEnv)
@@ -45,35 +45,35 @@ type Check interface {
 // forwarders resolve without a list walk) and takes its place in
 // the list here.
 func (h *Hygiene) initChecks() {
-	h.stall = &stallCheck{h: h}
-	h.watch = &watchWedgeCheck{h: h}
-	h.teardown = &podTeardownCheck{h: h}
-	h.konn = &konnCheck{h: h}
-	h.dns = &dnsResolvCheck{h: h}
-	h.syncloop = &syncloopCheck{h: h}
-	h.ctrsock = &ctrsockCheck{h: h}
-	h.ctrTasks = &ctrTasksCheck{h: h}
-	h.ingestGC = &ingestGCCheck{h: h}
-	h.cilium = &ciliumCheck{h: h}
-	h.ciliumInit = &ciliumInitCheck{h: h}
-	h.ctrImages = &ctrImagesCheck{h: h}
-	h.ciliumIPAM = &ciliumIPAMCheck{h: h}
-	h.ciliumEnvoy = &ciliumEnvoyCheck{h: h}
-	h.ciliumMTU = &ciliumMTUCheck{h: h}
-	h.ciliumWG = &ciliumWGCheck{h: h}
-	h.diskBloat = &diskBloatCheck{h: h}
-	h.journald = &journaldCheck{h: h}
-	h.zombies = &zombieStormCheck{h: h, streaks: map[zombieParent]int{}}
-	h.dstate = &dstateCheck{h: h}
-	h.scopes = &scopesCheck{h: h}
-	h.ciliumLRP = &ciliumLRPCheck{h: h}
-	h.spegel = &spegelCheck{h: h}
-	h.calico = &calicoCheck{h: h}
-	h.cniNetns = &cniNetnsCheck{h: h}
-	h.psiThrash = &psiThrashCheck{h: h}
-	h.ctrMeta = &ctrMetaCheck{h: h}
-	h.hostOOM = &hostOOMCheck{h: h}
-	h.orphanHP = &orphanHPCheck{h: h}
+	h.stall = &stallCheck{d: h.deps}
+	h.watch = &watchWedgeCheck{d: h.deps}
+	h.teardown = &podTeardownCheck{d: h.deps}
+	h.konn = &konnCheck{d: h.deps}
+	h.dns = &dnsResolvCheck{d: h.deps}
+	h.syncloop = &syncloopCheck{d: h.deps}
+	h.ctrsock = &ctrsockCheck{d: h.deps}
+	h.ctrTasks = &ctrTasksCheck{d: h.deps}
+	h.ingestGC = &ingestGCCheck{d: h.deps}
+	h.cilium = &ciliumCheck{d: h.deps}
+	h.ciliumInit = &ciliumInitCheck{d: h.deps}
+	h.ctrImages = &ctrImagesCheck{d: h.deps}
+	h.ciliumIPAM = &ciliumIPAMCheck{d: h.deps}
+	h.ciliumEnvoy = &ciliumEnvoyCheck{d: h.deps}
+	h.ciliumMTU = &ciliumMTUCheck{d: h.deps}
+	h.ciliumWG = &ciliumWGCheck{d: h.deps}
+	h.diskBloat = &diskBloatCheck{d: h.deps}
+	h.journald = &journaldCheck{d: h.deps}
+	h.zombies = &zombieStormCheck{d: h.deps, streaks: map[zombieParent]int{}}
+	h.dstate = &dstateCheck{d: h.deps}
+	h.scopes = &scopesCheck{d: h.deps}
+	h.ciliumLRP = &ciliumLRPCheck{d: h.deps}
+	h.spegel = &spegelCheck{d: h.deps}
+	h.calico = &calicoCheck{d: h.deps}
+	h.cniNetns = &cniNetnsCheck{d: h.deps}
+	h.psiThrash = &psiThrashCheck{d: h.deps}
+	h.ctrMeta = &ctrMetaCheck{d: h.deps}
+	h.hostOOM = &hostOOMCheck{d: h.deps}
+	h.orphanHP = &orphanHPCheck{d: h.deps}
 	h.checks = []Check{
 		h.stall,       // checkStall
 		h.watch,       // checkWatch

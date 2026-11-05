@@ -9,11 +9,27 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 )
+
+const (
+	// The LRP datapath probe targets the kube-dns ClusterIP — the
+	// CiliumLocalRedirectPolicy's serviceMatcher redirects
+	// 10.96.0.10:53 to the local cache pod, so this exercises the
+	// real frontend→backend path from the host netns (socket-LB).
+	// 169.254.20.10 only exists in the legacy hostNetwork/iptables
+	// mode (calico cluster, where this check is dormant) — probing
+	// it on a cilium node always fails → false-positive pod kills.
+	defaultLocalDNSProbeAddr = "10.96.0.10:53"
+	defaultLocalDNSProbeName = "kubernetes.default.svc.cluster.local"
+)
+
+// W7 pod matcher — anchored like konnPodRe/dnsPodRe.
+var nldPodRe = regexp.MustCompile(`^node-local-dns-[a-z0-9]+$`) // H3 LRP DNS guard
 
 // The dnsProbe seam default is probee.DNSQuery (the old probeDNSUDP
 // verbatim) — one minimal A-record query to addr over UDP; any
@@ -31,7 +47,7 @@ import (
 // ciliumLRPCheck is the W7-H3 node-local-dns datapath guard as a
 // Check; it owns the :53 probe fail streak (ex-Hygiene.nldFails).
 type ciliumLRPCheck struct {
-	h     *Hygiene
+	d     *deps
 	fails int
 }
 
@@ -41,35 +57,35 @@ func (c *ciliumLRPCheck) Name() string { return checkCiliumLRP }
 // Run executes one cilium-lrp-dns round.
 func (c *ciliumLRPCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkCiliumLRP, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumLRP, "gated").Inc()
 		return
 	}
-	if _, err := os.Stat(filepath.Join(c.h.cfg.Net.SysClassNet, "cilium_host")); err != nil {
+	if _, err := os.Stat(filepath.Join(c.d.cfg.Net.SysClassNet, "cilium_host")); err != nil {
 		// No cilium datapath — the LRP wedge can't exist here.
 		c.fails = 0
-		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return
 	}
 	// The plan gates on cilium-agent actually running: cilium_host
 	// persists while the agent is down, and a dead/wedged agent can
 	// break the :53 datapath itself — killing the nld pod then would
 	// mask the real failure (checkCilium owns the agent-down verdict).
-	agentTasks, ctrOK := c.h.ciliumAgentTasks()
+	agentTasks, ctrOK := c.d.ciliumAgentTasks()
 	if !ctrOK {
-		c.h.cycles.WithLabelValues(checkCiliumLRP, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumLRP, "abort").Inc()
 		return
 	}
 	if len(agentTasks) == 0 {
 		// Agent absent/dead — datapath verdict inconclusive; the LRP
 		// check stands down rather than punish a healthy pod.
 		c.fails = 0
-		c.h.cycles.WithLabelValues(checkCiliumLRP, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumLRP, "gated").Inc()
 		return
 	}
 	if !e.apiOK {
 		// Inconclusive — keep the streak like the other API-gated
 		// checks (a LIST flake must not count or clear evidence).
-		c.h.cycles.WithLabelValues(checkCiliumLRP, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumLRP, "abort").Inc()
 		return
 	}
 	var nld *corev1.Pod
@@ -86,45 +102,45 @@ func (c *ciliumLRPCheck) Run(ctx context.Context, e *cycleEnv) {
 		// No Ready node-local-dns pod → nothing owes a datapath
 		// answer (not-Running/NotReady pods are kubelet's problem).
 		c.fails = 0
-		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return
 	}
-	if c.h.cfg.Seams.dnsProbe(c.h.cfg.Net.LocalDNSProbeAddr, c.h.cfg.Net.LocalDNSProbeName,
+	if c.d.cfg.Seams.dnsProbe(c.d.cfg.Net.LocalDNSProbeAddr, c.d.cfg.Net.LocalDNSProbeName,
 		ciliumProbeTime) {
 		c.fails = 0
-		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return
 	}
 	c.fails++
-	if c.fails < c.h.cfg.ConsecNeeded {
-		c.h.state.AppendLog(fmt.Sprintf(
+	if c.fails < c.d.cfg.ConsecNeeded {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns :53 probe of %s failed while %s/%s Ready=True (check %d/%d)",
-			c.h.cfg.Net.LocalDNSProbeAddr, nld.Namespace, nld.Name,
-			c.fails, c.h.cfg.ConsecNeeded))
-		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+			c.d.cfg.Net.LocalDNSProbeAddr, nld.Namespace, nld.Name,
+			c.fails, c.d.cfg.ConsecNeeded))
+		c.d.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return
 	}
-	if !c.h.state.RateTrySpend("last-nld-restart", c.h.cfg.MinRestartInterval) {
-		c.h.state.AppendLog(fmt.Sprintf(
+	if !c.d.state.RateTrySpend("last-nld-restart", c.d.cfg.MinRestartInterval) {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns :53 probe fails %dx but pod restart in cooldown (<30m), skip",
 			c.fails))
-		c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 		return
 	}
 	// Budget spent atomically BEFORE the delete (rate_spend parity).
-	c.h.state.AppendLog(fmt.Sprintf(
+	c.d.state.AppendLog(fmt.Sprintf(
 		"ACTION: cilium-lrp-dns deleted pod %s/%s - :53 probe failed %dx while Ready=True (LRP datapath wedge)",
 		nld.Namespace, nld.Name, c.fails))
-	if err := c.h.cfg.Client.CoreV1().Pods(nld.Namespace).Delete(ctx, nld.Name,
+	if err := c.d.cfg.Client.CoreV1().Pods(nld.Namespace).Delete(ctx, nld.Name,
 		metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}); err != nil {
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns delete %s/%s failed: %v",
 			nld.Namespace, nld.Name, err))
 	} else {
-		c.h.actions.WithLabelValues(checkCiliumLRP, "pod_delete").Inc()
+		c.d.actions.WithLabelValues(checkCiliumLRP, "pod_delete").Inc()
 	}
 	c.fails = 0
-	c.h.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkCiliumLRP, "ok").Inc()
 }
 
 // checkCiliumLRPDNS forwards to the migrated Check — tests written

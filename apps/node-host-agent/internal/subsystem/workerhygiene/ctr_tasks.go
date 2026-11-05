@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -13,6 +14,37 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+)
+
+const (
+	defaultCtrTaskRoot     = "/host/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io"
+	defaultSandboxCtlRoot  = "/host/run/k0s/containerd/io.containerd.sandbox.controller.v1.shim"
+	defaultMaxCtrTaskClean = 5  // shell cap 5 per cycle
+	defaultMaxShimKill     = 10 // shell cap 5; 10 bounds orphan-shim storms with headroom
+	// ctrImageRmInterval is the 37-ctr-image-healer budget — image
+	// removal is idempotent so it needs no consecutive gate; the 15m
+	// cooldown alone bounds the churn.
+	ctrImageRmInterval    = 15 * time.Minute
+	defaultCtrIngestDir   = "/host/var/lib/k0s/containerd/io.containerd.content.v1.content/ingest"
+	ctrIngestMaxAge       = 3 * time.Hour
+	ctrIngestScanInterval = 6 * time.Hour
+	contentPruneInterval  = 6 * time.Hour // content-store prune budget (Wave-9)
+)
+
+var (
+	// `containerd-shim-runc-v2 ... -id <64hex>` — orphan-shim task id
+	// extraction (shell sed pattern).
+	shimIDRe = regexp.MustCompile(`-id ([0-9a-f]{64})`)
+	// cri.container-type=sandbox inside task config.json — pause
+	// tasks legitimately lack log.json (shell grep -q parity).
+	sandboxTypeRe = regexp.MustCompile(`cri\.container-type[^,]*sandbox`)
+	// Corrupted containerd layer/content-store signatures inside a
+	// pod's Waiting message (37) — a missing blob/snapshot never
+	// heals by retrying the pull; the image record must go.
+	corruptImageRe = regexp.MustCompile(
+		`content digest sha256:[0-9a-f]+: not found|` +
+			`failed to extract layer|` +
+			`parent snapshot .* does not exist`)
 )
 
 // shimFlagValue extracts `-name value` / `-name=value` (double-dash
@@ -71,13 +103,13 @@ func normalizeCtrAddr(a string) string {
 // (…/containerd/io.containerd.runtime.v2.task/k8s.io → the sibling
 // …/k0s/containerd.sock — k0s keeps the socket next to the containerd
 // root dir, not inside it).
-func (h *Hygiene) ctrShimSockets() map[string]bool {
+func (d *deps) ctrShimSockets() map[string]bool {
 	out := map[string]bool{}
-	if s := normalizeCtrAddr(hostSidePath(h.cfg.Ctr.Socket)); s != "" {
+	if s := normalizeCtrAddr(hostSidePath(d.cfg.Ctr.Socket)); s != "" {
 		out[s] = true
 	}
 	derived := filepath.Join(
-		filepath.Dir(filepath.Dir(filepath.Dir(h.cfg.CtrTaskRoot))),
+		filepath.Dir(filepath.Dir(filepath.Dir(d.cfg.CtrTaskRoot))),
 		"containerd.sock")
 	if s := normalizeCtrAddr(hostSidePath(derived)); s != "" {
 		out[s] = true
@@ -96,8 +128,8 @@ func validShimNamespace(ns string) bool {
 // own under THIS containerd: k8s.io is CtrTaskRoot itself, a foreign
 // namespace on the same daemon lives at the sibling
 // io.containerd.runtime.v2.task/<ns>/<id> dir.
-func (h *Hygiene) shimTaskDir(ns, id string) string {
-	return filepath.Join(filepath.Dir(h.cfg.CtrTaskRoot), ns, id)
+func (d *deps) shimTaskDir(ns, id string) string {
+	return filepath.Join(filepath.Dir(d.cfg.CtrTaskRoot), ns, id)
 }
 
 // ctrShimScope parses a containerd-shim-runc-v2 argv and reports the
@@ -106,7 +138,7 @@ func (h *Hygiene) shimTaskDir(ns, id string) string {
 // AND -address names our containerd socket — a missing/unparseable
 // flag means the instance can't be verified, so the shim is treated
 // as foreign (fail closed: never reap an unidentified shim).
-func (h *Hygiene) ctrShimScope(argv []string) (ns, sid string, inScope bool) {
+func (d *deps) ctrShimScope(argv []string) (ns, sid string, inScope bool) {
 	m := shimIDRe.FindStringSubmatch(strings.Join(argv, " "))
 	if m == nil {
 		return "", "", false
@@ -116,7 +148,7 @@ func (h *Hygiene) ctrShimScope(argv []string) (ns, sid string, inScope bool) {
 	if !nsOK || !addrOK || !validShimNamespace(ns) {
 		return "", "", false
 	}
-	if !h.ctrShimSockets()[normalizeCtrAddr(addr)] {
+	if !d.ctrShimSockets()[normalizeCtrAddr(addr)] {
 		return "", "", false
 	}
 	return ns, m[1], true
@@ -137,7 +169,7 @@ func (h *Hygiene) ctrShimScope(argv []string) (ns, sid string, inScope bool) {
 //     "dead >=5m": dir age can't distinguish a just-exited init from
 //     a real wedge). Confirmed → SIGKILL live init + any process
 //     holding the id, then remove the dir (cap MaxCtrTaskClean/cycle).
-type ctrTasksCheck struct{ h *Hygiene }
+type ctrTasksCheck struct{ d *deps }
 
 // Name returns the check label / WD_SIG key.
 func (c *ctrTasksCheck) Name() string { return checkCtrTasks }
@@ -145,15 +177,15 @@ func (c *ctrTasksCheck) Name() string { return checkCtrTasks }
 // Run executes one ctr-tasks round.
 func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkCtrTasks, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkCtrTasks, "gated").Inc()
 		return
 	}
-	entries, err := os.ReadDir(c.h.cfg.CtrTaskRoot)
+	entries, err := os.ReadDir(c.d.cfg.CtrTaskRoot)
 	if err != nil {
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: ctr task root %s unreadable: %v — ctr-tasks check skipped",
-			c.h.cfg.CtrTaskRoot, err))
-		c.h.cycles.WithLabelValues(checkCtrTasks, "abort").Inc()
+			c.d.cfg.CtrTaskRoot, err))
+		c.d.cycles.WithLabelValues(checkCtrTasks, "abort").Inc()
 		return
 	}
 	liveDirs := map[string]bool{}
@@ -163,7 +195,7 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 		}
 	}
 	sbDirs := map[string]bool{}
-	if es, err := os.ReadDir(c.h.cfg.SandboxCtlRoot); err == nil {
+	if es, err := os.ReadDir(c.d.cfg.SandboxCtlRoot); err == nil {
 		for _, e := range es {
 			if e.IsDir() {
 				sbDirs[e.Name()] = true
@@ -181,15 +213,15 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 	nShim := 0
 	pids := e.pidsOnce()
 	for _, pid := range pids {
-		if nShim >= c.h.cfg.Ctr.MaxShimKill {
+		if nShim >= c.d.cfg.Ctr.MaxShimKill {
 			break
 		}
-		argv := c.h.proc.Cmdline(pid)
+		argv := c.d.proc.Cmdline(pid)
 		joined := strings.Join(argv, " ")
 		if !strings.Contains(joined, "containerd-shim-runc-v2") {
 			continue
 		}
-		ns, sid, inScope := c.h.ctrShimScope(argv)
+		ns, sid, inScope := c.d.ctrShimScope(argv)
 		if !inScope {
 			continue
 		}
@@ -201,28 +233,28 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 			// Foreign namespace on OUR containerd (e.g. a `ctr -n`
 			// task): resolve the dir under the sibling namespace
 			// root — only a genuinely missing dir is an orphan.
-			if _, err := os.Stat(c.h.shimTaskDir(ns, sid)); err == nil ||
+			if _, err := os.Stat(c.d.shimTaskDir(ns, sid)); err == nil ||
 				sbDirs[sid] {
 				continue
 			}
 		}
-		if c.h.procAge(pid) < 5*time.Minute {
+		if c.d.procAge(pid) < 5*time.Minute {
 			continue
 		}
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"ACTION: kill orphan shim pid=%d id=%.12s ns=%s - task dir missing",
 			pid, sid, ns))
-		if err := c.h.cfg.Seams.killFn(pid, syscall.SIGKILL); err != nil {
-			c.h.state.AppendLog(fmt.Sprintf(
+		if err := c.d.cfg.Seams.killFn(pid, syscall.SIGKILL); err != nil {
+			c.d.state.AppendLog(fmt.Sprintf(
 				"suspect: kill orphan shim pid=%d failed: %v", pid, err))
 		}
 		nShim++
-		c.h.actions.WithLabelValues(checkCtrTasks, "shim_kill").Inc()
+		c.d.actions.WithLabelValues(checkCtrTasks, "shim_kill").Inc()
 	}
 	// Prune wedged-seen markers for dirs that disappeared between
 	// runs (teardown finished or a previous cleanup won the race).
 	if ms, err := filepath.Glob(
-		filepath.Join(c.h.cfg.WatchdogStateDir, "wedged-seen-*")); err == nil {
+		filepath.Join(c.d.cfg.WatchdogStateDir, "wedged-seen-*")); err == nil {
 		for _, m := range ms {
 			if !liveDirs[strings.TrimPrefix(filepath.Base(m), "wedged-seen-")] {
 				_ = os.Remove(m)
@@ -236,12 +268,12 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 			continue
 		}
 		id := e.Name()
-		d := filepath.Join(c.h.cfg.CtrTaskRoot, id)
+		d := filepath.Join(c.d.cfg.CtrTaskRoot, id)
 		marker := "wedged-seen-" + id
 		dead := false
 		pidData, err := os.ReadFile(filepath.Join(d, "init.pid"))
 		ipid, _ := strconv.Atoi(strings.TrimSpace(string(pidData)))
-		if err != nil || ipid <= 0 || !c.h.pidLive(ipid) {
+		if err != nil || ipid <= 0 || !c.d.pidLive(ipid) {
 			// Unreadable init.pid = half-written dir (containerd
 			// restart mid-create) or an exited init — both are
 			// wedge-shaped, but a task STARTING writes init.pid a
@@ -260,15 +292,15 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 		}
 		if !dead {
 			// Recovered between runs → cancel the pending confirm.
-			_ = os.Remove(filepath.Join(c.h.cfg.WatchdogStateDir, marker))
+			_ = os.Remove(filepath.Join(c.d.cfg.WatchdogStateDir, marker))
 			continue
 		}
-		if !c.h.stateFileExists(marker) {
-			c.h.state.RateSpend(marker)
-			c.h.state.AppendLog(fmt.Sprintf("ctr-task-dead candidate %.12s - confirm next run", id))
+		if !c.d.stateFileExists(marker) {
+			c.d.state.RateSpend(marker)
+			c.d.state.AppendLog(fmt.Sprintf("ctr-task-dead candidate %.12s - confirm next run", id))
 			continue
 		}
-		if !c.h.state.RateOK(marker, 5*time.Minute) {
+		if !c.d.state.RateOK(marker, 5*time.Minute) {
 			continue
 		}
 		wedged = append(wedged, d)
@@ -276,25 +308,25 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 	nClean := 0
 	for _, d := range wedged {
 		id := filepath.Base(d)
-		if nClean >= c.h.cfg.Ctr.MaxTaskClean {
-			c.h.state.AppendLog(fmt.Sprintf("suspect: ctr-task-wedged still pending cap=%d",
-				c.h.cfg.Ctr.MaxTaskClean))
+		if nClean >= c.d.cfg.Ctr.MaxTaskClean {
+			c.d.state.AppendLog(fmt.Sprintf("suspect: ctr-task-wedged still pending cap=%d",
+				c.d.cfg.Ctr.MaxTaskClean))
 			break
 		}
 		// Marker removal only once the dir is actually being
 		// cleaned: a dir dropped by the cap must KEEP its
 		// confirmed marker — removing it first made over-cap
 		// dirs re-confirm for another 5m forever.
-		_ = os.Remove(filepath.Join(c.h.cfg.WatchdogStateDir, "wedged-seen-"+id))
+		_ = os.Remove(filepath.Join(c.d.cfg.WatchdogStateDir, "wedged-seen-"+id))
 		// Live init with missing log.json → SIGKILL it first so the
 		// shim can drain and exit (shell's kill -9 init).
 		if pidData, err := os.ReadFile(filepath.Join(d, "init.pid")); err == nil {
 			if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil &&
-				pid > 0 && c.h.pidLive(pid) {
-				c.h.state.AppendLog(fmt.Sprintf(
+				pid > 0 && c.d.pidLive(pid) {
+				c.d.state.AppendLog(fmt.Sprintf(
 					"ACTION: kill -9 init %d of %.12s - log.json missing", pid, id))
-				if err := c.h.cfg.Seams.killFn(pid, syscall.SIGKILL); err != nil {
-					c.h.state.AppendLog(fmt.Sprintf(
+				if err := c.d.cfg.Seams.killFn(pid, syscall.SIGKILL); err != nil {
+					c.d.state.AppendLog(fmt.Sprintf(
 						"suspect: kill init %d of %.12s failed: %v", pid, id, err))
 				}
 			}
@@ -302,21 +334,21 @@ func (c *ctrTasksCheck) Run(ctx context.Context, e *cycleEnv) {
 		// pkill -9 -f "$id" parity: kill shim/runc leftovers holding
 		// the task id, then remove the dir — containerd GCs the task
 		// record once the shim is gone.
-		for _, pid := range c.h.pidsWithCmdline(id, pids) {
-			if err := c.h.cfg.Seams.killFn(pid, syscall.SIGKILL); err != nil {
-				c.h.state.AppendLog(fmt.Sprintf(
+		for _, pid := range c.d.pidsWithCmdline(id, pids) {
+			if err := c.d.cfg.Seams.killFn(pid, syscall.SIGKILL); err != nil {
+				c.d.state.AppendLog(fmt.Sprintf(
 					"suspect: kill leftover pid=%d holding task %.12s failed: %v",
 					pid, id, err))
 			}
 		}
-		c.h.state.AppendLog(fmt.Sprintf("ACTION: rm wedged task dir %.12s - dead >=5m", id))
+		c.d.state.AppendLog(fmt.Sprintf("ACTION: rm wedged task dir %.12s - dead >=5m", id))
 		if err := os.RemoveAll(d); err != nil {
-			c.h.state.AppendLog(fmt.Sprintf("suspect: rm task dir %.12s failed: %v", id, err))
+			c.d.state.AppendLog(fmt.Sprintf("suspect: rm task dir %.12s failed: %v", id, err))
 		}
 		nClean++
-		c.h.actions.WithLabelValues(checkCtrTasks, "rm_dir").Inc()
+		c.d.actions.WithLabelValues(checkCtrTasks, "rm_dir").Inc()
 	}
-	c.h.cycles.WithLabelValues(checkCtrTasks, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkCtrTasks, "ok").Inc()
 }
 
 // corruptImageWaitingReason mirrors the shell reason list — pull
@@ -392,7 +424,7 @@ func normalizeCRIImageName(spec string) string {
 // Normalization is preferred over `ctr images ls` reconciliation —
 // one exec per ref keeps the seam shape; a normalized name that still
 // isn't in the store just makes ctr warn and exit 0 (accepted).
-type ctrImagesCheck struct{ h *Hygiene }
+type ctrImagesCheck struct{ d *deps }
 
 // Name returns the check label / WD_SIG key.
 func (c *ctrImagesCheck) Name() string { return checkCtrImages }
@@ -400,13 +432,13 @@ func (c *ctrImagesCheck) Name() string { return checkCtrImages }
 // Run executes one ctr-image-healer round.
 func (c *ctrImagesCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkCtrImages, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkCtrImages, "gated").Inc()
 		return
 	}
 	if !e.apiOK {
 		// Inconclusive — same "keep state, never act" rule as the
 		// other pod-list checks.
-		c.h.cycles.WithLabelValues(checkCtrImages, "abort").Inc()
+		c.d.cycles.WithLabelValues(checkCtrImages, "abort").Inc()
 		return
 	}
 	// Dedupe refs across pods and statuses — several containers
@@ -431,7 +463,7 @@ func (c *ctrImagesCheck) Run(ctx context.Context, e *cycleEnv) {
 		}
 	}
 	if len(seen) == 0 {
-		c.h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
 		return
 	}
 	images := make([]string, 0, len(seen))
@@ -439,27 +471,27 @@ func (c *ctrImagesCheck) Run(ctx context.Context, e *cycleEnv) {
 		images = append(images, img)
 	}
 	sort.Strings(images) // deterministic order — same convention as dnsStale
-	if !c.h.state.RateTrySpend("last-ctr-image-rm", ctrImageRmInterval) {
-		c.h.state.AppendLog(fmt.Sprintf(
+	if !c.d.state.RateTrySpend("last-ctr-image-rm", ctrImageRmInterval) {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: ctr-image-healer corrupted image(s) %s - in rm cooldown (<15m), skip",
 			strings.Join(images, " ")))
-		c.h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
 		return
 	}
 	// Budget spent atomically BEFORE acting (lib.sh rate_spend
 	// parity): a failed rm still consumed the budget.
 	for _, img := range images {
-		if err := c.h.cfg.Seams.ctrRmImage(ctx, img); err != nil {
-			c.h.state.AppendLog(fmt.Sprintf(
+		if err := c.d.cfg.Seams.ctrRmImage(ctx, img); err != nil {
+			c.d.state.AppendLog(fmt.Sprintf(
 				"suspect: ctr image rm %s failed: %v", img, err))
 			continue
 		}
 		// NPD contract: "removed corrupted image" feeds the
 		// CorruptedImageRemoved filelog pattern.
-		c.h.state.AppendLog("ACTION: removed corrupted image " + img)
-		c.h.actions.WithLabelValues(checkCtrImages, "image_rm").Inc()
+		c.d.state.AppendLog("ACTION: removed corrupted image " + img)
+		c.d.actions.WithLabelValues(checkCtrImages, "image_rm").Inc()
 	}
-	c.h.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkCtrImages, "ok").Inc()
 }
 
 // --- Check: cilium-bpf-ipam (38-cilium-bpf-ipam.sh) ---
@@ -467,7 +499,7 @@ func (c *ctrImagesCheck) Run(ctx context.Context, e *cycleEnv) {
 // ingestGCCheck is the A3 stale-ingest reaper as a Check; it owns
 // the 6h rescan stamp (ex-Hygiene.lastIngestScan).
 type ingestGCCheck struct {
-	h        *Hygiene
+	d        *deps
 	lastScan time.Time
 }
 
@@ -477,7 +509,7 @@ func (c *ingestGCCheck) Name() string { return checkIngestGC }
 // Run executes one ctr-ingest-gc round.
 func (c *ingestGCCheck) Run(ctx context.Context, e *cycleEnv) {
 	if !e.workerActive {
-		c.h.cycles.WithLabelValues(checkIngestGC, "gated").Inc()
+		c.d.cycles.WithLabelValues(checkIngestGC, "gated").Inc()
 		return
 	}
 	var st unix.Statfs_t
@@ -489,14 +521,14 @@ func (c *ingestGCCheck) Run(ctx context.Context, e *cycleEnv) {
 	// free-side field is Bavail, not Bfree: kubelet/containerd run
 	// unprivileged against the root-reserved block margin, so
 	// unprivileged-free is the signal that trips ENOSPC first.
-	if err := c.h.cfg.Seams.statfsFn(c.h.cfg.Disk.K0sDataDir, &st); err == nil &&
+	if err := c.d.cfg.Seams.statfsFn(c.d.cfg.Disk.K0sDataDir, &st); err == nil &&
 		st.Blocks > 0 && st.Bavail <= st.Blocks {
 		used := float64(st.Blocks-st.Bavail) / float64(st.Blocks)
-		diskHigh = used > c.h.cfg.Disk.HighWatermark
+		diskHigh = used > c.d.cfg.Disk.HighWatermark
 	}
-	due := c.h.cfg.Seams.nowFn().Sub(c.lastScan) >= c.h.cfg.Ctr.IngestScanInterval
+	due := c.d.cfg.Seams.nowFn().Sub(c.lastScan) >= c.d.cfg.Ctr.IngestScanInterval
 	if !diskHigh && !due {
-		c.h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
 		return
 	}
 	// W9: above the high watermark the content store itself may be
@@ -504,36 +536,36 @@ func (c *ingestGCCheck) Run(ctx context.Context, e *cycleEnv) {
 	// ADDITION to the stale-ingest sweep below. Below the
 	// watermark (periodic rescan only) it never fires.
 	if diskHigh {
-		c.h.maybePruneContentStore(ctx)
+		c.d.maybePruneContentStore(ctx)
 	}
-	entries, err := os.ReadDir(c.h.cfg.Ctr.IngestDir)
+	entries, err := os.ReadDir(c.d.cfg.Ctr.IngestDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Absent dir = nothing to scan — stamp like a clean
 			// walk so the 6h cadence still applies.
-			c.lastScan = c.h.cfg.Seams.nowFn()
-			c.h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
+			c.lastScan = c.d.cfg.Seams.nowFn()
+			c.d.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
 			return
 		}
 		// A transient read failure must NOT stamp lastScan —
 		// stamping here would defer the retry by a full
 		// CtrIngestScanInterval (6h).
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: ctr ingest dir %s unreadable: %v — ingest GC skipped",
-			c.h.cfg.Ctr.IngestDir, err))
-		c.h.cycles.WithLabelValues(checkIngestGC, "abort").Inc()
+			c.d.cfg.Ctr.IngestDir, err))
+		c.d.cycles.WithLabelValues(checkIngestGC, "abort").Inc()
 		return
 	}
-	c.lastScan = c.h.cfg.Seams.nowFn()
-	now := c.h.cfg.Seams.nowFn()
+	c.lastScan = c.d.cfg.Seams.nowFn()
+	now := c.d.cfg.Seams.nowFn()
 	n := 0
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		if n >= c.h.cfg.Ctr.MaxTaskClean {
-			c.h.state.AppendLog(fmt.Sprintf(
-				"suspect: ctr-ingest-gc still pending cap=%d", c.h.cfg.Ctr.MaxTaskClean))
+		if n >= c.d.cfg.Ctr.MaxTaskClean {
+			c.d.state.AppendLog(fmt.Sprintf(
+				"suspect: ctr-ingest-gc still pending cap=%d", c.d.cfg.Ctr.MaxTaskClean))
 			break
 		}
 		fi, err := e.Info()
@@ -541,30 +573,30 @@ func (c *ingestGCCheck) Run(ctx context.Context, e *cycleEnv) {
 			continue
 		}
 		age := now.Sub(fi.ModTime())
-		if age < c.h.cfg.Ctr.IngestMaxAge {
+		if age < c.d.cfg.Ctr.IngestMaxAge {
 			continue
 		}
 		ref := e.Name()
-		d := filepath.Join(c.h.cfg.Ctr.IngestDir, ref)
-		if rerr := c.h.cfg.Seams.ctrRmIngest(ctx, ref); rerr != nil {
-			c.h.state.AppendLog(fmt.Sprintf(
+		d := filepath.Join(c.d.cfg.Ctr.IngestDir, ref)
+		if rerr := c.d.cfg.Seams.ctrRmIngest(ctx, ref); rerr != nil {
+			c.d.state.AppendLog(fmt.Sprintf(
 				"suspect: ctr content ingest rm %s failed: %v — removing dir directly", ref, rerr))
 		}
 		if _, serr := os.Stat(d); serr == nil {
 			if rerr := os.RemoveAll(d); rerr != nil {
-				c.h.state.AppendLog(fmt.Sprintf(
+				c.d.state.AppendLog(fmt.Sprintf(
 					"suspect: rm orphan ingest dir %s failed: %v", d, rerr))
 				continue
 			}
 		}
-		c.h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"ACTION: ctr-ingest-gc removed stale ingest %s (age=%.1fh disk_high=%v)",
 			ref, age.Hours(), diskHigh))
 		n++
-		c.h.ctrIngestsCleaned.Inc()
-		c.h.actions.WithLabelValues(checkIngestGC, "ingest_rm").Inc()
+		c.d.ctrIngestsCleaned.Inc()
+		c.d.actions.WithLabelValues(checkIngestGC, "ingest_rm").Inc()
 	}
-	c.h.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkIngestGC, "ok").Inc()
 }
 
 // checkCtrIngestGC forwards to the migrated Check — tests written
@@ -582,17 +614,17 @@ func (h *Hygiene) checkCtrIngestGC(ctx context.Context, workerActive bool) {
 // while the disk stays above the watermark. The budget is spent
 // BEFORE the command (rate_spend parity); a failed prune logs
 // suspect and does NOT count as an action.
-func (h *Hygiene) maybePruneContentStore(ctx context.Context) {
-	if !h.state.RateTrySpend("last-content-gc", contentPruneInterval) {
+func (d *deps) maybePruneContentStore(ctx context.Context) {
+	if !d.state.RateTrySpend("last-content-gc", contentPruneInterval) {
 		return
 	}
-	if err := h.cfg.Seams.ctrPruneContent(ctx); err != nil {
-		h.state.AppendLog(fmt.Sprintf(
+	if err := d.cfg.Seams.ctrPruneContent(ctx); err != nil {
+		d.state.AppendLog(fmt.Sprintf(
 			"suspect: ctr-ingest-gc content prune failed: %v", err))
 		return
 	}
-	h.state.AppendLog("ACTION: ctr-ingest-gc content prune ran (disk above watermark)")
-	h.actions.WithLabelValues(checkIngestGC, "content_gc").Inc()
+	d.state.AppendLog("ACTION: ctr-ingest-gc content prune ran (disk above watermark)")
+	d.actions.WithLabelValues(checkIngestGC, "content_gc").Inc()
 }
 
 // --- Check: zombie storm (A2) ---
