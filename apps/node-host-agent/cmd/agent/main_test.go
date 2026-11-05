@@ -24,8 +24,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/agent"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/apiprober"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/hostconverge"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 )
 
@@ -852,10 +852,12 @@ func TestDispatchConvergeOnceCleanExit0(t *testing.T) {
 	// Stub the host seams: a tempdir host root + a runner that never
 	// fails, so a fully self-gating converge reports errs==0 and the
 	// command exits 0 (the timer/CI "converged" contract).
-	oldRoot, oldRunner := convergeHostRoot, convergeRunner
-	defer func() { convergeHostRoot, convergeRunner = oldRoot, oldRunner }()
-	convergeHostRoot = t.TempDir()
-	convergeRunner = func() hostconfig.Runner { return quietRunner{} }
+	oldRoot, oldRunner := hostconverge.HostRoot, hostconverge.RunnerFactory
+	defer func() {
+		hostconverge.HostRoot, hostconverge.RunnerFactory = oldRoot, oldRunner
+	}()
+	hostconverge.HostRoot = t.TempDir()
+	hostconverge.RunnerFactory = func() hostconfig.Runner { return quietRunner{} }
 
 	dir := t.TempDir()
 	for name, content := range map[string]string{
@@ -962,7 +964,7 @@ func TestPurgeEventsDoesNotMutateArgs(t *testing.T) {
 		{"--", "not-a-timestamp", "--ca=/nonexistent/ca.crt"},
 	} {
 		want := slices.Clone(args)
-		if code := purgeEventsCmd(context.Background(), args); code != 1 && code != 2 {
+		if code := evpurge.Cmd(context.Background(), args); code != 1 && code != 2 {
 			t.Fatalf("purge-events %v=%d want 1 or 2", args, code)
 		}
 		if !slices.Equal(args, want) {
@@ -1022,106 +1024,6 @@ func TestDispatchRescueEtcdArgParsing(t *testing.T) {
 	if !handled || code != 1 {
 		t.Fatalf("rescue-etcd missing k0s-dir=(%d,%v) want (1,true)", code, handled)
 	}
-}
-
-// --- apiprober guard-conf precedence (env → conf → default) ---
-
-func TestResolveProberInputs(t *testing.T) {
-	wdCfg, _ := watchdogconf.Parse([]byte(
-		`API_BACKENDS="wd1=10.1.0.1:6443"`))
-	guard := apiprober.GuardDefaults{
-		SocketPath:        "/run/haproxy-admin/admin.sock",
-		BackendName:       "kubeAPI_backend",
-		CompanionBackends: []string{"konnectivity_back"},
-		StaticBackends: []apiprober.StaticBackend{
-			{Name: "hub1", Addr: "10.0.0.1:6443"},
-		},
-		Mode:      "enforce",
-		TokenFile: "/etc/api-backend-guard/token",
-		CAFile:    "/etc/api-backend-guard/ca.crt",
-	}
-
-	t.Run("defaults without env or conf", func(t *testing.T) {
-		pi := resolveProberInputs(wdCfg, apiprober.GuardDefaults{})
-		if pi.socket != "/run/api-local-lb-admin.sock" ||
-			pi.backend != "api_local_back" ||
-			pi.mode != apiprober.ModeDryRun ||
-			pi.tokenFile != "/var/run/secrets/kubernetes.io/serviceaccount/token" ||
-			pi.caFile != "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt" {
-			t.Fatalf("defaults=%+v", pi)
-		}
-		// wdCfg API_BACKENDS feed StaticBackends as before.
-		if len(pi.static) != 1 || pi.static[0].Name != "wd1" {
-			t.Fatalf("static=%v want wdCfg backends", pi.static)
-		}
-	})
-
-	t.Run("guard conf fills below env", func(t *testing.T) {
-		pi := resolveProberInputs(wdCfg, guard)
-		if pi.socket != guard.SocketPath || pi.backend != guard.BackendName ||
-			pi.mode != "enforce" || pi.tokenFile != guard.TokenFile ||
-			pi.caFile != guard.CAFile {
-			t.Fatalf("guard fallback=%+v", pi)
-		}
-		if len(pi.companions) != 1 || pi.companions[0] != "konnectivity_back" {
-			t.Fatalf("companions=%v", pi.companions)
-		}
-		// Guard API_BACKENDS win over the watchdog conf's.
-		if len(pi.static) != 1 || pi.static[0].Name != "hub1" {
-			t.Fatalf("static=%v want guard backends", pi.static)
-		}
-	})
-
-	t.Run("env beats guard conf", func(t *testing.T) {
-		t.Setenv("NODE_HOST_AGENT_APIPROBER_SOCKET", "/custom.sock")
-		t.Setenv("NODE_HOST_AGENT_APIPROBER_MODE", "dry-run")
-		t.Setenv("NODE_HOST_AGENT_APIPROBER_COMPANION_BACKENDS", "extra1,extra2")
-		pi := resolveProberInputs(wdCfg, guard)
-		if pi.socket != "/custom.sock" || pi.mode != "dry-run" {
-			t.Fatalf("env override=%+v", pi)
-		}
-		if len(pi.companions) != 2 || pi.companions[0] != "extra1" {
-			t.Fatalf("env companions=%v", pi.companions)
-		}
-		// Untouched envs still see the conf layer.
-		if pi.backend != guard.BackendName || pi.tokenFile != guard.TokenFile {
-			t.Fatalf("conf layer lost under env=%+v", pi)
-		}
-	})
-}
-
-// --- kubeletWatchdogHosts ---
-
-func TestKubeletWatchdogHosts(t *testing.T) {
-	t.Run("env list wins", func(t *testing.T) {
-		t.Setenv("NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS", "a , b")
-		got := kubeletWatchdogHosts(t.TempDir(), "n")
-		if len(got) != 2 || got[0] != "a" || got[1] != "b" {
-			t.Fatalf("env hosts=%v", got)
-		}
-	})
-
-	t.Run("systemd_watchdog_hosts from vars dir", func(t *testing.T) {
-		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "interdc_nodes.yaml"),
-			[]byte("{}\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, "cluster.yaml"),
-			[]byte("systemd_watchdog_hosts:\n  - node-x\n  - node-y\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		got := kubeletWatchdogHosts(dir, "node-a")
-		if len(got) != 2 || got[0] != "node-x" || got[1] != "node-y" {
-			t.Fatalf("vars hosts=%v", got)
-		}
-	})
-
-	t.Run("missing vars dir is nil not error", func(t *testing.T) {
-		if got := kubeletWatchdogHosts(t.TempDir(), "n"); got != nil {
-			t.Fatalf("hosts=%v want nil", got)
-		}
-	})
 }
 
 // --- resolveLocalBinary ---

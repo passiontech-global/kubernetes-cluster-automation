@@ -13,7 +13,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -371,16 +371,8 @@ func (h *Hygiene) checkKubeletWatchWedge(ctx context.Context, pods []corev1.Pod,
 // here — the goroutine also runs on nodes where the feeder never
 // activates.
 func (h *Hygiene) runKubeletFeeder(ctx context.Context) {
-	t := time.NewTicker(h.cfg.KubeletWdInterval)
-	defer t.Stop()
-	for {
-		h.kubeletFeedTick(ctx)
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-	}
+	cycle.Every("kubelet-feeder", h.cfg.KubeletWdInterval,
+		h.kubeletFeedTick).Run(ctx)
 }
 
 // kubeletFeederActive reports whether the feeder should probe this
@@ -524,8 +516,7 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 
 	// G1 uptime (WD_REQUIRES: uptime) — a node <20m up is still
 	// bringing kubelet online; a restart inside the window only churns.
-	if up, err := hostutil.UptimeSeconds(
-		filepath.Join(h.cfg.ProcRoot, "uptime")); err == nil && up < minUptimeSeconds {
+	if up, err := h.proc.UptimeSeconds(); err == nil && up < minUptimeSeconds {
 		h.state.AppendLog(fmt.Sprintf(
 			"kubelet-remediate: SKIP(G1-uptime) uptime %.0fs < %ds", up, minUptimeSeconds))
 		return

@@ -140,7 +140,7 @@ func isProxyAgent(argv []string) bool {
 // NODE_IP from environ (downward status.hostIP, set at pod create),
 // falling back to --agent-identifiers=host=<ip> on the cmdline.
 func (h *Hygiene) proxyAgentHost(pid int, argv []string) string {
-	if v := h.procEnvValue(pid, "NODE_IP"); v != "" {
+	if v := h.proc.EnvValue(pid, "NODE_IP"); v != "" {
 		return v
 	}
 	if m := agentHostRe.FindStringSubmatch(strings.Join(argv, " ")); m != nil {
@@ -190,7 +190,7 @@ func (h *Hygiene) checkKonnectivity(ctx context.Context, pods []corev1.Pod,
 	agentHost := ""
 	stalePID := 0
 	for _, pid := range pidsOnce() {
-		argv := h.procCmdline(pid)
+		argv := h.proc.Cmdline(pid)
 		if !isProxyAgent(argv) {
 			continue
 		}
@@ -355,7 +355,7 @@ func (h *Hygiene) checkDNSResolvDrift(pods []corev1.Pod, apiOK bool,
 			// Read the POD's resolv.conf through the pause mount ns —
 			// ProcRoot/<pid>/root is the task's filesystem view.
 			podNS, clusterLocal := nameserverSet(
-				h.procFile(pid, "root/etc/resolv.conf"))
+				h.proc.File(pid, "root/etc/resolv.conf"))
 			if clusterLocal || len(podNS) == 0 {
 				continue
 			}

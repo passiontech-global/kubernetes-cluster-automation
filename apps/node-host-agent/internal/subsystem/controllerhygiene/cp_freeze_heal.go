@@ -287,9 +287,9 @@ func (h *Hygiene) saveKCMSnapshot(s *kcmQueueSnapshot) {
 // control plane. Falls back to the local apiserver when no peer is
 // configured (single-hub).
 func (h *Hygiene) peerHealthy(ctx context.Context) bool {
-	ep := h.cfg.PeerAPI
+	ep := h.cfg.Hub.PeerAPI
 	if ep == "" {
-		ep = h.cfg.SelfEndpoint
+		ep = h.cfg.Hub.SelfEndpoint
 	}
 	// ANY HTTP code = the apiserver event loop is alive (probeAnyCode
 	// parity — a wedged apiserver is the wedge guard's problem, not
@@ -310,15 +310,15 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 	h.checkKineStorageHealth(ctx)
 	h.checkKubeconfigCertExpiry(ctx)
 
-	kcmOK := h.cfg.cpHealthFn(ctx, h.cfg.KCMHealthURL)
-	schedOK := h.cfg.cpHealthFn(ctx, h.cfg.SchedHealthURL)
+	kcmOK := h.cfg.cpHealthFn(ctx, h.cfg.CPFreeze.KCMHealthURL)
+	schedOK := h.cfg.cpHealthFn(ctx, h.cfg.CPFreeze.SchedHealthURL)
 
 	frozen := false
 	reason := ""
 	switch {
 	case !kcmOK || !schedOK:
 		n := h.state.Incr(fileCtrCPFreeze)
-		if n >= h.cfg.CPFreezeCycles {
+		if n >= h.cfg.CPFreeze.Cycles {
 			frozen = true
 			reason = fmt.Sprintf("healthz dead %dx (kcm=%v sched=%v)",
 				n, kcmOK, schedOK)
@@ -338,7 +338,7 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 	// already fire; every successful scrape refreshes the snapshot
 	// the next scrape compares against.
 	if !frozen {
-		body, err := h.cfg.kcmMetricsFn(ctx, h.cfg.KCMMetricsURL)
+		body, err := h.cfg.kcmMetricsFn(ctx, h.cfg.CPFreeze.KCMMetricsURL)
 		stalled := false
 		if err == nil {
 			if snap, parsed := parseKCMQueueSnapshot(
@@ -352,10 +352,10 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 				h.kcmQuietSince = h.cfg.nowFn()
 				h.state.Incr(fileCtrKCMQuiet)
 			}
-			if h.cfg.nowFn().Sub(h.kcmQuietSince) >= h.cfg.CPFreezeQuietFor {
+			if h.cfg.nowFn().Sub(h.kcmQuietSince) >= h.cfg.CPFreeze.QuietFor {
 				frozen = true
 				reason = fmt.Sprintf("kcm workqueue stalled >%s",
-					h.cfg.CPFreezeQuietFor)
+					h.cfg.CPFreeze.QuietFor)
 			}
 		} else {
 			h.kcmQuietSince = time.Time{}
@@ -380,15 +380,15 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 		return
 	}
 	if !h.state.RateOK(fileRateCPRestart,
-		h.cfg.CPFreezeMinRestart) {
+		h.cfg.CPFreeze.MinRestart) {
 		h.state.SuspectLog(stateCPComponentFrozen, fmt.Sprintf(
 			"suspect: cp-component-frozen %s but in restart cooldown (<%dm), skip",
-			reason, int(h.cfg.CPFreezeMinRestart.Minutes())),
+			reason, int(h.cfg.CPFreeze.MinRestart.Minutes())),
 			h.cfg.SuspectLogCadence)
 		h.cycles.WithLabelValues(checkCPFreeze, "cooldown").Inc()
 		return
 	}
-	switch h.cfg.Sig13Mode {
+	switch h.cfg.Sig13.Mode {
 	case ModeEnforce:
 		h.state.AppendLog(fmt.Sprintf(
 			"ACTION: restarting k0scontroller - cp-component-frozen %s",

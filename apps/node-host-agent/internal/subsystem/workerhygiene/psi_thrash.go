@@ -152,7 +152,7 @@ func (h *Hygiene) dropKernelCaches() {
 // procRSS reads /proc/<pid>/status VmRSS in bytes — the resident
 // footprint used to rank eviction victims.
 func (h *Hygiene) procRSS(pid int) int64 {
-	data, err := os.ReadFile(h.procFile(pid, "status"))
+	data, err := os.ReadFile(h.proc.File(pid, "status"))
 	if err != nil {
 		return 0
 	}

@@ -69,7 +69,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,9 +80,10 @@ import (
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/etcdrescue"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/ops/evpurge"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -303,7 +303,10 @@ var (
 	peerAPIServerRe = regexp.MustCompile(`(?m)^PEER_APISERVER=(.*)$`)
 )
 
-// Config carries the subsystem knobs — all test-injectable.
+// Config carries the subsystem knobs — all test-injectable. The
+// domain groups nest the knobs by their env-prefix family
+// (ConfigFromEnv fills them); shared paths/transport, the watchdog
+// conf reloader and the private test seams stay flat.
 type Config struct {
 	Enabled  bool          // false → Run idles until ctx done
 	Interval time.Duration // guard cycle cadence (60s)
@@ -325,17 +328,13 @@ type Config struct {
 	K0sControllerUnitFile string
 	JournalUnit           string // journalctl -u <unit>
 	RestartUnit           string // unit restarted by the wedge guard
-	// SelfEndpoint is the apiserver probed for rv_cache/rv_now —
-	// always the local listener (SELF_EP=127.0.0.1:6443).
-	SelfEndpoint string
-	// SelfAPI is API_SELF: this hub's apiserver "ip:port" used only
-	// for deterministic first-hub ordering vs PeerAPI.
-	SelfAPI string
-	// PeerAPI is API_PEER: the other hub's apiserver "ip:port"; empty
-	// = single-hub cluster (self always first).
-	PeerAPI         string
-	AdminKubeconfig string // k0s admin.conf (embedded client creds)
-	AdminCert       string // fallback client-cert triple
+	// K0sDir is the k0s data dir — etcdguard probes under it and the
+	// PKI-drift default pairs derive from it. "" → /host/var/lib/k0s.
+	K0sDir string
+	// AdminKubeconfig is the k0s admin.conf (embedded client creds);
+	// AdminCert/AdminKey/AdminCA are the fallback client-cert triple.
+	AdminKubeconfig string
+	AdminCert       string
 	AdminKey        string
 	AdminCA         string
 	// InsecureTLS mirrors `curl -sk`; CA pinning only applies when
@@ -343,85 +342,61 @@ type Config struct {
 	// 127.0.0.1, so verify works against the loopback endpoint —
 	// the missing-SAN caveat applies to the kubelet serving cert,
 	// see workerhygiene, not to this one.)
-	InsecureTLS  bool
-	APIPath      string        // LIST path returning .metadata.resourceVersion
-	QueryTimeout time.Duration // per-query deadline
-	// Sig13Mode is SIG13_AUTOFIX for k0scontroller restarts.
-	Sig13Mode          string
-	StaleMinErrs       int           // journal errs/6min → apiserver-cache-stale
-	GapMin             int64         // rv_now - rv_cache wedge threshold
-	GapCycles          int           // consecutive gap-over-threshold → wedge
-	FrozenCycles       int           // consecutive identical rv_cache → wedge
-	SoloCycles         int           // wedge cycles before first-hub may act alone
-	MinRestartInterval time.Duration // restart budget
-	// KineDBProbe is KINE_DB_PROBE "host:port" — pg-wire probe used
-	// by the dead-fallback; empty disables it (veto preserved).
-	KineDBProbe string
-
-	// KineTTLMode is KINE_TTL_AUTOFIX for kine process kills.
-	KineTTLMode          string
-	KineTTLMinRestart    time.Duration // fast-kill budget
-	KineTTLCtlRestart    time.Duration // rewedge-loop probe-kill cadence
-	KineTTLRewedgeCycles int           // distinct wedged pids → kine-ttl-loop
-	KineTTLMinProcAge    time.Duration // pid must outlive seed window
-
-	// KinePoolMode is KINE_POOL_AUTOFIX for pool-spiral kills.
-	KinePoolMode       string
-	KinePoolMaxConns   int           // conns-to-DB spiral threshold
-	KinePoolCycles     int           // consecutive over-threshold → kill
-	KinePoolMinRestart time.Duration // kill budget
-	KineDBPortFallback int           // DB port when --endpoint has none
-
-	// OOMLoopMode is K0S_OOMLOOP_AUTOFIX for the oom_score_adj shield.
-	OOMLoopMode        string
-	OOMLoopMinKills    int           // kills in window → loop
-	OOMLoopWindow      time.Duration // sliding window
-	CGroupEventsFile   string        // cgroup v2 memory.events
-	APIServerShieldAdj int           // kube-apiserver protection
-	KineShieldAdj      int           // kine sacrifice ranking
-
-	// Feeder: sd_notify WATCHDOG=1 loop gated on apiserver liveness.
-	// Active only when FeederEnabled AND (NotifySocket non-empty or a
-	// notifyFn seam is injected) — in a pod without NOTIFY_SOCKET the
-	// feeder is inert.
-	FeederEnabled  bool
-	NotifySocket   string        // sd_notify datagram address (env NOTIFY_SOCKET)
-	FeedInterval   time.Duration // probe/feed cadence
-	FeedMaxFail    int           // consecutive fails → remediate
-	FeedGraceFails int           // fail budget before first success
-	FeedProbeURL   string        // readyz-ish endpoint; any HTTP code = alive
-	FeedProbeTO    time.Duration
-	// FeederStateDir holds the remediate rate-limit file (shell
-	// STATE_DIR=/var/lib/k0s-systemd-watchdog).
-	FeederStateDir      string
-	RemediateMinRestart time.Duration // G5 budget
-	RemediateFreshGrace time.Duration // G3 fresh-start grace
-	RemediatePeerFile   string        // PEER_APISERVER= override file
-
-	// EtcdGuard (embedded-etcd quota self-defence): each cycle on
-	// hosts whose K0sDir carries bin/etcdctl + pki/etcd/ca.crt —
-	// k0s embedded-etcd controllers (cicd). Kine hosts have neither
-	// file and the check is a silent no-op. Trigger = NOSPACE alarm
-	// or dbSize >= EtcdDBSizeLimit → evpurge + ONLINE-ONLY etcd
-	// rescue under the last-etcd-guard budget (the offline defrag
-	// stops k0scontroller and stays a manual action).
-	K0sDir          string // "" → /host/var/lib/k0s
-	EtcdEndpoint    string // "" → https://127.0.0.1:2379
-	EtcdDBSizeLimit int64  // dbSize trigger bytes; <=0 → 1.5 GiB
-	// EtcdGuardMinRun is the evpurge+rescue rate budget; <=0 → 1h.
-	EtcdGuardMinRun time.Duration
-
-	// SuspectLogCadence throttles repeated suspect/hold log lines to
-	// at most one per interval per key (suspectLog backed by
-	// last-suspect-<key> budget files) — the state latch already
-	// dedupes the ALERT; this dedupes the raw log line to the same
-	// discipline while counters, latches and metrics still update
-	// every cycle. <=0 → defaultSuspectLogCadence (1h).
+	InsecureTLS       bool
+	APIPath           string        // LIST path returning .metadata.resourceVersion
+	QueryTimeout      time.Duration // per-query deadline
 	SuspectLogCadence time.Duration
-
 	// HTTPClient, when set, is used for ALL apiserver queries (rv
 	// probes) and overrides the credential files — test seam.
 	HTTPClient *http.Client
+
+	// JournalDirs are the host journal storage roots — the
+	// journal-unreadable latch may only fire while at least one
+	// exists (a host with no journald at all fails every read by
+	// configuration, not by fault).
+	JournalDirs []string
+	// JournalUnreadableNeeded is the consecutive-failed-read budget
+	// before state-journal-unreadable latches; <=0 → 5.
+	JournalUnreadableNeeded int
+
+	// WatchdogSrc, when set, re-reads /etc/node-watchdog.conf every
+	// Cycle and re-applies the conf-derived knobs (API_SELF/API_PEER,
+	// KINE_DB_PROBE, SIG13_*, KINE_TTL_*, KINE_POOL_*, K0S_OOMLOOP_*)
+	// — hostconfig rewrites land next cycle instead of needing an
+	// agent restart (nethealth's WatchdogSrc parity; BUG-H9). A knob
+	// set from elsewhere (env wiring) is preserved: only fields that
+	// still carry the PREVIOUS conf-derived value move to the new
+	// one.
+	WatchdogSrc *watchdogconf.Reloader
+
+	// --- env-prefix groups (ConfigFromEnv resolves these) ---
+	// Hub carries the apiserver-hub identity/probe knobs
+	// (NODE_HOST_AGENT_API_SELF/API_PEER/KINE_DB_PROBE).
+	Hub HubConfig
+	// Sig13 is the sig13 apiserver watch-cache wedge guard
+	// (NODE_HOST_AGENT_SIG13_*/STALE_MIN_ERRS/GAP_*/FROZEN_*/SOLO_*).
+	Sig13 Sig13Config
+	// KineTTL is the kine TTL dead/rewedge-loop kill guard
+	// (NODE_HOST_AGENT_KINE_TTL_*).
+	KineTTL KineTTLConfig
+	// KinePool is the kine -> DB connection-spiral guard
+	// (NODE_HOST_AGENT_KINE_POOL_*).
+	KinePool KinePoolConfig
+	// OOMLoop is the cgroup OOM-loop detector + shield
+	// (NODE_HOST_AGENT_OOMLOOP_*).
+	OOMLoop OOMLoopConfig
+	// Feeder is the systemd watchdog feeder + remediate gates
+	// (NODE_HOST_AGENT_ENABLE_FEEDER, NOTIFY_SOCKET passthrough).
+	Feeder FeederConfig
+	// EtcdGuard is the embedded-etcd quota self-defence
+	// (NODE_HOST_AGENT_ETCD_*).
+	EtcdGuard EtcdGuardConfig
+	// CPFreeze is the W8-CP3 KCM/scheduler freeze auto-heal — no env
+	// wiring; package defaults unless set programmatically.
+	CPFreeze CPFreezeConfig
+	// PKIDrift is the W8-CP4 on-disk-vs-served PKI cert drift check —
+	// no env wiring; package defaults unless set programmatically.
+	PKIDrift PKIDriftConfig
 
 	// --- injectable seams (defaults follow) ---
 	nowFn     func() time.Time
@@ -454,54 +429,6 @@ type Config struct {
 	// nil → journalctlAny.
 	journalAnyFn func(ctx context.Context) (string, error)
 
-	// JournalDirs are the host journal storage roots — the
-	// journal-unreadable latch may only fire while at least one
-	// exists (a host with no journald at all fails every read by
-	// configuration, not by fault).
-	JournalDirs []string
-	// JournalUnreadableNeeded is the consecutive-failed-read budget
-	// before state-journal-unreadable latches; <=0 → 5.
-	JournalUnreadableNeeded int
-
-	// WatchdogSrc, when set, re-reads /etc/node-watchdog.conf every
-	// Cycle and re-applies the conf-derived knobs (API_SELF/API_PEER,
-	// KINE_DB_PROBE, SIG13_*, KINE_TTL_*, KINE_POOL_*, K0S_OOMLOOP_*)
-	// — hostconfig rewrites land next cycle instead of needing an
-	// agent restart (nethealth's WatchdogSrc parity; BUG-H9). A knob
-	// set from elsewhere (env wiring) is preserved: only fields that
-	// still carry the PREVIOUS conf-derived value move to the new
-	// one.
-	WatchdogSrc *watchdogconf.Reloader
-
-	// --- W8-CP3: KCM/scheduler freeze auto-heal ---
-	// KCMHealthURL/SchedHealthURL are the healthz endpoints of the
-	// kube-controller-manager and kube-scheduler hosted inside
-	// k0scontroller; KCMMetricsURL feeds the leader-without-workers
-	// signal. Empty → the loopback defaults.
-	KCMHealthURL     string
-	SchedHealthURL   string
-	KCMMetricsURL    string
-	CPFreezeCycles   int           // consecutive healthz fails → act (default 3)
-	CPFreezeQuietFor time.Duration // KCM leader+idle grace (default 10m)
-	// CPFreezeMinRestart is the last-cp-restart budget (default 2h).
-	CPFreezeMinRestart time.Duration
-
-	// --- W8-CP4: PKI reload drift ---
-	// PKIDriftPairs pairs an on-disk cert with the socket that must
-	// present it and the unit restarted on drift; nil → the four
-	// defaults (apiserver.crt→:6443, konnectivity-server.crt→:8132,
-	// etcd/server.crt→:2379 — all k0scontroller.service —
-	// and /etc/kine/pki/server.crt→:2379 → kine.service). Paths may
-	// use the $K0SDIR placeholder, resolved against K0sDir.
-	PKIDriftPairs []PKIDriftPair
-	// PKIDriftCycles is the consecutive-newer-cycle gate (default 2);
-	// PKIRestartInterval the last-cp-cert-restart budget (default 1h).
-	PKIDriftCycles     int
-	PKIRestartInterval time.Duration
-	// KinePKIDir prefixes the default kine cert path ("" →
-	// "/host/etc/kine/pki").
-	KinePKIDir string
-
 	// --- injectable seams for W8 additions (defaults follow) ---
 	// ssKillFn runs `ss -K sport = :6443` — kills hung HTTP/2 watch
 	// streams before a wedge restart (W8-CP1).
@@ -525,6 +452,139 @@ type PKIDriftPair struct {
 	CertFile string
 	Addr     string
 	Unit     string
+}
+
+// HubConfig carries the apiserver-hub identity/probe knobs — the
+// NODE_HOST_AGENT_API_SELF / API_PEER / KINE_DB_PROBE env →
+// watchdogconf → (empty) chain. SelfAPI deliberately has NO default:
+// it is the first-hub ordering identity — solo/dead-fallback restarts
+// gate on it being non-empty, and inventing 127.0.0.1 here would make
+// every unconfigured controller believe it is the first hub.
+type HubConfig struct {
+	// SelfEndpoint is the apiserver probed for rv_cache/rv_now —
+	// always the local listener (SELF_EP=127.0.0.1:6443).
+	SelfEndpoint string
+	// SelfAPI is API_SELF: this hub's apiserver "ip:port" used only
+	// for deterministic first-hub ordering vs PeerAPI.
+	SelfAPI string
+	// PeerAPI is API_PEER: the other hub's apiserver "ip:port"; empty
+	// = single-hub cluster (self always first).
+	PeerAPI string
+	// KineDBProbe is KINE_DB_PROBE "host:port" — pg-wire probe used
+	// by the dead-fallback; empty disables it (veto preserved).
+	KineDBProbe string
+}
+
+// Sig13Config is the sig13 apiserver watch-cache wedge guard — also
+// the shared SIG13_AUTOFIX mode cp_freeze_heal and pki_cert_drift
+// restart under. Fields resolve env → watchdogconf → package default.
+type Sig13Config struct {
+	Mode         string        // SIG13_AUTOFIX for k0scontroller restarts
+	StaleMinErrs int           // journal errs/6min → apiserver-cache-stale
+	GapMin       int64         // rv_now - rv_cache wedge threshold
+	GapCycles    int           // consecutive gap-over-threshold → wedge
+	FrozenCycles int           // consecutive identical rv_cache → wedge
+	SoloCycles   int           // wedge cycles before first-hub may act alone
+	MinRestart   time.Duration // SIG13_MIN_RESTART_S restart budget
+}
+
+// KineTTLConfig is the kine TTL dead/rewedge-loop kill guard
+// (KINE_TTL_AUTOFIX for kine process kills).
+type KineTTLConfig struct {
+	Mode          string
+	MinRestart    time.Duration // fast-kill budget (KINE_TTL_MIN_RESTART_S)
+	CtlRestart    time.Duration // rewedge-loop probe-kill cadence (KINE_TTL_CTL_RESTART_S)
+	RewedgeCycles int           // distinct wedged pids → kine-ttl-loop
+	MinProcAge    time.Duration // pid must outlive seed window
+}
+
+// KinePoolConfig is the kine -> DB connection-spiral kill guard
+// (KINE_POOL_AUTOFIX for pool-spiral kills).
+type KinePoolConfig struct {
+	Mode           string
+	MaxConns       int           // conns-to-DB spiral threshold
+	Cycles         int           // consecutive over-threshold → kill
+	MinRestart     time.Duration // kill budget (KINE_POOL_MIN_RESTART_S)
+	DBPortFallback int           // DB port when --endpoint has none
+}
+
+// OOMLoopConfig is the cgroup v2 OOM-loop detector + oom_score_adj
+// shield (K0S_OOMLOOP_AUTOFIX).
+type OOMLoopConfig struct {
+	Mode               string
+	MinKills           int           // kills in window → loop
+	Window             time.Duration // sliding window
+	CGroupEventsFile   string        // cgroup v2 memory.events
+	APIServerShieldAdj int           // kube-apiserver protection
+	KineShieldAdj      int           // kine sacrifice ranking
+}
+
+// FeederConfig is the systemd watchdog feeder — sd_notify WATCHDOG=1
+// gated on apiserver liveness — plus the remediate ordered gates.
+// Active only when Enabled AND (NotifySocket non-empty or a notifyFn
+// seam is injected) — in a pod without NOTIFY_SOCKET the feeder is
+// inert.
+type FeederConfig struct {
+	Enabled      bool
+	NotifySocket string        // sd_notify datagram address (env NOTIFY_SOCKET)
+	Interval     time.Duration // probe/feed cadence
+	MaxFail      int           // consecutive fails → remediate
+	GraceFails   int           // fail budget before first success
+	ProbeURL     string        // readyz-ish endpoint; any HTTP code = alive
+	ProbeTO      time.Duration
+	// StateDir holds the remediate rate-limit file (shell
+	// STATE_DIR=/var/lib/k0s-systemd-watchdog).
+	StateDir            string
+	RemediateMinRestart time.Duration // G5 budget
+	RemediateFreshGrace time.Duration // G3 fresh-start grace
+	RemediatePeerFile   string        // PEER_APISERVER= override file
+}
+
+// EtcdGuardConfig is the embedded-etcd quota self-defence (k0s
+// embedded-etcd controllers only — kine hosts no-op on the missing
+// <K0sDir>/bin/etcdctl + pki/etcd/ca.crt). Trigger = NOSPACE alarm or
+// dbSize >= DBSizeLimit → evpurge + ONLINE-ONLY etcd rescue under the
+// last-etcd-guard budget (the offline defrag stops k0scontroller and
+// stays a manual action).
+type EtcdGuardConfig struct {
+	Endpoint    string // "" → https://127.0.0.1:2379
+	DBSizeLimit int64  // dbSize trigger bytes; <=0 → 1.5 GiB
+	// MinRun is the evpurge+rescue rate budget; <=0 → 1h.
+	MinRun time.Duration
+}
+
+// CPFreezeConfig is the W8-CP3 KCM/scheduler freeze auto-heal. No env
+// wiring — package defaults unless set programmatically.
+type CPFreezeConfig struct {
+	// KCMHealthURL/SchedHealthURL are the healthz endpoints of the
+	// kube-controller-manager and kube-scheduler hosted inside
+	// k0scontroller; KCMMetricsURL feeds the leader-without-workers
+	// signal. Empty → the loopback defaults.
+	KCMHealthURL   string
+	SchedHealthURL string
+	KCMMetricsURL  string
+	Cycles         int           // consecutive healthz fails → act (default 3)
+	QuietFor       time.Duration // KCM leader+idle grace (default 10m)
+	MinRestart     time.Duration // last-cp-restart budget (default 2h)
+}
+
+// PKIDriftConfig is the W8-CP4 on-disk-vs-served PKI cert drift check.
+// No env wiring — package defaults unless set programmatically.
+type PKIDriftConfig struct {
+	// Pairs pairs an on-disk cert with the socket that must present
+	// it and the unit restarted on drift; nil → the four defaults
+	// (apiserver.crt→:6443, konnectivity-server.crt→:8132,
+	// etcd/server.crt→:2379 — all k0scontroller.service —
+	// and /etc/kine/pki/server.crt→:2379 → kine.service). Paths may
+	// use the $K0SDIR placeholder, resolved against Config.K0sDir.
+	Pairs []PKIDriftPair
+	// Cycles is the consecutive-newer-cycle gate (default 2);
+	// RestartInterval the last-cp-cert-restart budget (default 1h).
+	Cycles          int
+	RestartInterval time.Duration
+	// KinePKIDir prefixes the default kine cert path ("" →
+	// "/host/etc/kine/pki").
+	KinePKIDir string
 }
 
 func (c *Config) applyDefaults() {
@@ -552,8 +612,8 @@ func (c *Config) applyDefaults() {
 	if c.RestartUnit == "" {
 		c.RestartUnit = defaultRestartUnit
 	}
-	if c.SelfEndpoint == "" {
-		c.SelfEndpoint = defaultSelfEndpoint
+	if c.Hub.SelfEndpoint == "" {
+		c.Hub.SelfEndpoint = defaultSelfEndpoint
 	}
 	// SelfAPI deliberately has NO loopback default: it is the
 	// first-hub ordering identity — solo/dead-fallback restarts gate
@@ -577,107 +637,107 @@ func (c *Config) applyDefaults() {
 	if c.QueryTimeout <= 0 {
 		c.QueryTimeout = defaultQueryTimeout
 	}
-	if c.Sig13Mode == "" {
-		c.Sig13Mode = ModeOff
+	if c.Sig13.Mode == "" {
+		c.Sig13.Mode = ModeOff
 	}
-	if c.StaleMinErrs <= 0 {
-		c.StaleMinErrs = defaultStaleMinErrs
+	if c.Sig13.StaleMinErrs <= 0 {
+		c.Sig13.StaleMinErrs = defaultStaleMinErrs
 	}
-	if c.GapMin <= 0 {
-		c.GapMin = defaultGapMin
+	if c.Sig13.GapMin <= 0 {
+		c.Sig13.GapMin = defaultGapMin
 	}
-	if c.GapCycles <= 0 {
-		c.GapCycles = defaultGapCycles
+	if c.Sig13.GapCycles <= 0 {
+		c.Sig13.GapCycles = defaultGapCycles
 	}
-	if c.FrozenCycles <= 0 {
-		c.FrozenCycles = defaultFrozenCycles
+	if c.Sig13.FrozenCycles <= 0 {
+		c.Sig13.FrozenCycles = defaultFrozenCycles
 	}
-	if c.SoloCycles <= 0 {
-		c.SoloCycles = defaultSoloCycles
+	if c.Sig13.SoloCycles <= 0 {
+		c.Sig13.SoloCycles = defaultSoloCycles
 	}
-	if c.MinRestartInterval <= 0 {
-		c.MinRestartInterval = defaultMinRestart
+	if c.Sig13.MinRestart <= 0 {
+		c.Sig13.MinRestart = defaultMinRestart
 	}
-	if c.KineTTLMode == "" {
-		c.KineTTLMode = ModeOff
+	if c.KineTTL.Mode == "" {
+		c.KineTTL.Mode = ModeOff
 	}
-	if c.KineTTLMinRestart <= 0 {
-		c.KineTTLMinRestart = defaultTTLMinRestart
+	if c.KineTTL.MinRestart <= 0 {
+		c.KineTTL.MinRestart = defaultTTLMinRestart
 	}
-	if c.KineTTLCtlRestart <= 0 {
-		c.KineTTLCtlRestart = defaultTTLCtlRestart
+	if c.KineTTL.CtlRestart <= 0 {
+		c.KineTTL.CtlRestart = defaultTTLCtlRestart
 	}
-	if c.KineTTLRewedgeCycles <= 0 {
-		c.KineTTLRewedgeCycles = defaultTTLRewedgeCycles
+	if c.KineTTL.RewedgeCycles <= 0 {
+		c.KineTTL.RewedgeCycles = defaultTTLRewedgeCycles
 	}
-	if c.KineTTLMinProcAge <= 0 {
-		c.KineTTLMinProcAge = defaultTTLMinProcAge
+	if c.KineTTL.MinProcAge <= 0 {
+		c.KineTTL.MinProcAge = defaultTTLMinProcAge
 	}
-	if c.KinePoolMode == "" {
-		c.KinePoolMode = ModeOff
+	if c.KinePool.Mode == "" {
+		c.KinePool.Mode = ModeOff
 	}
-	if c.KinePoolMaxConns <= 0 {
-		c.KinePoolMaxConns = defaultPoolMaxConns
+	if c.KinePool.MaxConns <= 0 {
+		c.KinePool.MaxConns = defaultPoolMaxConns
 	}
-	if c.KinePoolCycles <= 0 {
-		c.KinePoolCycles = defaultPoolCycles
+	if c.KinePool.Cycles <= 0 {
+		c.KinePool.Cycles = defaultPoolCycles
 	}
-	if c.KinePoolMinRestart <= 0 {
-		c.KinePoolMinRestart = defaultPoolMinRestart
+	if c.KinePool.MinRestart <= 0 {
+		c.KinePool.MinRestart = defaultPoolMinRestart
 	}
-	if c.KineDBPortFallback <= 0 {
-		c.KineDBPortFallback = defaultDBPortFallback
+	if c.KinePool.DBPortFallback <= 0 {
+		c.KinePool.DBPortFallback = defaultDBPortFallback
 	}
-	if c.OOMLoopMode == "" {
-		c.OOMLoopMode = ModeOff
+	if c.OOMLoop.Mode == "" {
+		c.OOMLoop.Mode = ModeOff
 	}
-	if c.OOMLoopMinKills <= 0 {
-		c.OOMLoopMinKills = defaultOOMMinKills
+	if c.OOMLoop.MinKills <= 0 {
+		c.OOMLoop.MinKills = defaultOOMMinKills
 	}
-	if c.OOMLoopWindow <= 0 {
-		c.OOMLoopWindow = defaultOOMWindow
+	if c.OOMLoop.Window <= 0 {
+		c.OOMLoop.Window = defaultOOMWindow
 	}
-	if c.CGroupEventsFile == "" {
-		c.CGroupEventsFile = defaultCGroupEvents
+	if c.OOMLoop.CGroupEventsFile == "" {
+		c.OOMLoop.CGroupEventsFile = defaultCGroupEvents
 	}
 	// Shield adjs are non-zero in both directions; an explicit 0
 	// would mean "shield to neutral" which is never what the loop
 	// wants — treat unset as unset.
-	if c.APIServerShieldAdj == 0 {
-		c.APIServerShieldAdj = defaultAPIServerAdj
+	if c.OOMLoop.APIServerShieldAdj == 0 {
+		c.OOMLoop.APIServerShieldAdj = defaultAPIServerAdj
 	}
-	if c.KineShieldAdj == 0 {
-		c.KineShieldAdj = defaultKineAdj
+	if c.OOMLoop.KineShieldAdj == 0 {
+		c.OOMLoop.KineShieldAdj = defaultKineAdj
 	}
-	if c.FeedInterval <= 0 {
-		c.FeedInterval = defaultFeedInterval
+	if c.Feeder.Interval <= 0 {
+		c.Feeder.Interval = defaultFeedInterval
 	}
-	if c.FeedMaxFail <= 0 {
-		c.FeedMaxFail = defaultFeedMaxFail
+	if c.Feeder.MaxFail <= 0 {
+		c.Feeder.MaxFail = defaultFeedMaxFail
 	}
-	if c.FeedGraceFails <= 0 {
-		c.FeedGraceFails = defaultFeedGraceFails
+	if c.Feeder.GraceFails <= 0 {
+		c.Feeder.GraceFails = defaultFeedGraceFails
 	}
-	if c.FeedProbeURL == "" {
-		c.FeedProbeURL = defaultFeedProbeURL
+	if c.Feeder.ProbeURL == "" {
+		c.Feeder.ProbeURL = defaultFeedProbeURL
 	}
-	if c.FeedProbeTO <= 0 {
-		c.FeedProbeTO = defaultFeedProbeTO
+	if c.Feeder.ProbeTO <= 0 {
+		c.Feeder.ProbeTO = defaultFeedProbeTO
 	}
-	if c.FeederStateDir == "" {
-		c.FeederStateDir = defaultFeederStateDir
+	if c.Feeder.StateDir == "" {
+		c.Feeder.StateDir = defaultFeederStateDir
 	}
-	if c.RemediateMinRestart <= 0 {
-		c.RemediateMinRestart = defaultRemediateMinRst
+	if c.Feeder.RemediateMinRestart <= 0 {
+		c.Feeder.RemediateMinRestart = defaultRemediateMinRst
 	}
-	if c.RemediateFreshGrace <= 0 {
-		c.RemediateFreshGrace = defaultRemediateGrace
+	if c.Feeder.RemediateFreshGrace <= 0 {
+		c.Feeder.RemediateFreshGrace = defaultRemediateGrace
 	}
-	if c.RemediatePeerFile == "" {
-		c.RemediatePeerFile = defaultPeerFile
+	if c.Feeder.RemediatePeerFile == "" {
+		c.Feeder.RemediatePeerFile = defaultPeerFile
 	}
-	if c.NotifySocket == "" {
-		c.NotifySocket = os.Getenv("NOTIFY_SOCKET")
+	if c.Feeder.NotifySocket == "" {
+		c.Feeder.NotifySocket = os.Getenv("NOTIFY_SOCKET")
 	}
 	if c.nowFn == nil {
 		c.nowFn = time.Now
@@ -723,12 +783,12 @@ func (c *Config) applyDefaults() {
 			return out, nil
 		}
 	}
-	if c.notifyFn == nil && c.NotifySocket != "" {
-		sock := c.NotifySocket
+	if c.notifyFn == nil && c.Feeder.NotifySocket != "" {
+		sock := c.Feeder.NotifySocket
 		c.notifyFn = func(msg string) error { return sdNotify(sock, msg) }
 	}
 	if c.probeFn == nil {
-		to := c.FeedProbeTO
+		to := c.Feeder.ProbeTO
 		c.probeFn = func(ctx context.Context, url string) bool {
 			return probeAnyCode(ctx, url, to)
 		}
@@ -736,20 +796,20 @@ func (c *Config) applyDefaults() {
 	if c.K0sDir == "" {
 		c.K0sDir = defaultK0sDir
 	}
-	if c.EtcdEndpoint == "" {
-		c.EtcdEndpoint = defaultEtcdEndpoint
+	if c.EtcdGuard.Endpoint == "" {
+		c.EtcdGuard.Endpoint = defaultEtcdEndpoint
 	}
-	if c.EtcdDBSizeLimit <= 0 {
-		c.EtcdDBSizeLimit = defaultEtcdDBSizeLimit
+	if c.EtcdGuard.DBSizeLimit <= 0 {
+		c.EtcdGuard.DBSizeLimit = defaultEtcdDBSizeLimit
 	}
-	if c.EtcdGuardMinRun <= 0 {
-		c.EtcdGuardMinRun = defaultEtcdGuardMinRun
+	if c.EtcdGuard.MinRun <= 0 {
+		c.EtcdGuard.MinRun = defaultEtcdGuardMinRun
 	}
 	if c.SuspectLogCadence <= 0 {
 		c.SuspectLogCadence = defaultSuspectLogCadence
 	}
 	if c.etcdctlFn == nil {
-		k0sDir, endpoint := c.K0sDir, c.EtcdEndpoint
+		k0sDir, endpoint := c.K0sDir, c.EtcdGuard.Endpoint
 		bin := filepath.Join(k0sDir, "bin", "etcdctl")
 		certArgs := []string{
 			// The apiserver's etcd client certs — the same triple
@@ -785,50 +845,50 @@ func (c *Config) applyDefaults() {
 	if c.etcdRescueFn == nil {
 		c.etcdRescueFn = etcdrescue.Run
 	}
-	if c.KCMHealthURL == "" {
-		c.KCMHealthURL = "https://127.0.0.1:10257/healthz"
+	if c.CPFreeze.KCMHealthURL == "" {
+		c.CPFreeze.KCMHealthURL = "https://127.0.0.1:10257/healthz"
 	}
-	if c.SchedHealthURL == "" {
-		c.SchedHealthURL = "https://127.0.0.1:10259/healthz"
+	if c.CPFreeze.SchedHealthURL == "" {
+		c.CPFreeze.SchedHealthURL = "https://127.0.0.1:10259/healthz"
 	}
-	if c.KCMMetricsURL == "" {
-		c.KCMMetricsURL = "https://127.0.0.1:10257/metrics"
+	if c.CPFreeze.KCMMetricsURL == "" {
+		c.CPFreeze.KCMMetricsURL = "https://127.0.0.1:10257/metrics"
 	}
-	if c.CPFreezeCycles <= 0 {
-		c.CPFreezeCycles = defaultCPFreezeCycles
+	if c.CPFreeze.Cycles <= 0 {
+		c.CPFreeze.Cycles = defaultCPFreezeCycles
 	}
-	if c.CPFreezeQuietFor <= 0 {
-		c.CPFreezeQuietFor = defaultCPFreezeQuietFor
+	if c.CPFreeze.QuietFor <= 0 {
+		c.CPFreeze.QuietFor = defaultCPFreezeQuietFor
 	}
-	if c.CPFreezeMinRestart <= 0 {
-		c.CPFreezeMinRestart = defaultCPFreezeMinRestart
+	if c.CPFreeze.MinRestart <= 0 {
+		c.CPFreeze.MinRestart = defaultCPFreezeMinRestart
 	}
-	if c.KinePKIDir == "" {
-		c.KinePKIDir = "/host/etc/kine/pki"
+	if c.PKIDrift.KinePKIDir == "" {
+		c.PKIDrift.KinePKIDir = "/host/etc/kine/pki"
 	}
-	if c.PKIDriftPairs == nil {
+	if c.PKIDrift.Pairs == nil {
 		k0s := c.K0sDir
-		c.PKIDriftPairs = []PKIDriftPair{
+		c.PKIDrift.Pairs = []PKIDriftPair{
 			{filepath.Join(k0s, "pki", "apiserver.crt"),
 				"127.0.0.1:6443", "k0scontroller.service"},
 			{filepath.Join(k0s, "pki", "konnectivity-server.crt"),
 				"127.0.0.1:8132", "k0scontroller.service"},
 			{filepath.Join(k0s, "pki", "etcd", "server.crt"),
 				"127.0.0.1:2379", "k0scontroller.service"},
-			{filepath.Join(c.KinePKIDir, "server.crt"),
+			{filepath.Join(c.PKIDrift.KinePKIDir, "server.crt"),
 				"127.0.0.1:2379", "kine.service"},
 		}
 	} else {
-		for i := range c.PKIDriftPairs {
-			c.PKIDriftPairs[i].CertFile = strings.ReplaceAll(
-				c.PKIDriftPairs[i].CertFile, "$K0SDIR", c.K0sDir)
+		for i := range c.PKIDrift.Pairs {
+			c.PKIDrift.Pairs[i].CertFile = strings.ReplaceAll(
+				c.PKIDrift.Pairs[i].CertFile, "$K0SDIR", c.K0sDir)
 		}
 	}
-	if c.PKIDriftCycles <= 0 {
-		c.PKIDriftCycles = defaultPKIDriftCycles
+	if c.PKIDrift.Cycles <= 0 {
+		c.PKIDrift.Cycles = defaultPKIDriftCycles
 	}
-	if c.PKIRestartInterval <= 0 {
-		c.PKIRestartInterval = defaultPKIRestartInterval
+	if c.PKIDrift.RestartInterval <= 0 {
+		c.PKIDrift.RestartInterval = defaultPKIRestartInterval
 	}
 	if c.ssKillFn == nil {
 		c.ssKillFn = func(ctx context.Context) error {
@@ -862,6 +922,7 @@ func (c *Config) applyDefaults() {
 // loop.
 type Hygiene struct {
 	cfg    Config
+	proc   procfs.FS    // /proc view bound to cfg.ProcRoot
 	client *http.Client // mTLS client for rv probes; nil when creds absent
 	credFP string       // credential-file fingerprint the client was built from
 
@@ -927,7 +988,7 @@ func ShouldRun(hostRoot string) bool {
 // New returns a Hygiene and registers its metrics on reg.
 func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	cfg.applyDefaults()
-	h := &Hygiene{cfg: cfg}
+	h := &Hygiene{cfg: cfg, proc: procfs.New(cfg.ProcRoot)}
 	// The Now closure must read h.cfg.nowFn at call time — tests
 	// re-stub the clock after New() and the store has to observe it
 	// (hoststate.Store.Now contract).
@@ -1001,7 +1062,7 @@ func (h *Hygiene) Name() string { return "controllerhygiene" }
 // feederActive reports whether the sd_notify feeder loop should run:
 // enabled AND a notify path exists (injected seam or NOTIFY_SOCKET).
 func (h *Hygiene) feederActive() bool {
-	return h.cfg.FeederEnabled && h.cfg.notifyFn != nil
+	return h.cfg.Feeder.Enabled && h.cfg.notifyFn != nil
 }
 
 // Run starts the feeder goroutine (when active), checks immediately,
@@ -1010,7 +1071,7 @@ func (h *Hygiene) Run(ctx context.Context) {
 	if !h.cfg.Enabled {
 		// Constructed but disabled — idle instead of returning: the
 		// agent restarts a returned Run in a hot loop.
-		<-ctx.Done()
+		cycle.Idle(ctx)
 		return
 	}
 	if h.feederActive() {
@@ -1032,17 +1093,7 @@ func (h *Hygiene) Run(ctx context.Context) {
 			}()
 		})
 	}
-	h.runCycle(ctx)
-	t := time.NewTicker(h.cfg.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			h.runCycle(ctx)
-		}
-	}
+	cycle.Every("controllerhygiene", h.cfg.Interval, h.runCycle).Run(ctx)
 }
 
 // runCycle executes one Cycle under the per-cycle deadline
@@ -1100,7 +1151,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	h.checkPKIReloadDrift(ctx)
 	// uptime gate (WD_REQUIRES: uptime unit:k0scontroller — 20min
 	// grace after boot before the destructive wedge/TTL checks).
-	if up, err := h.uptimeSeconds(); err == nil && up < minUptimeSeconds {
+	if up, err := h.proc.UptimeSeconds(); err == nil && up < minUptimeSeconds {
 		h.cycles.WithLabelValues(checkHub, "uptime_gate").Inc()
 		return
 	}
@@ -1137,32 +1188,32 @@ func (h *Hygiene) refreshWatchdogConf() {
 		}
 	}
 	// Strings.
-	apply(old.APISelf, wd.APISelf, func(v string) { h.cfg.SelfAPI = v },
-		func() string { return h.cfg.SelfAPI })
-	apply(old.APIPeer, wd.APIPeer, func(v string) { h.cfg.PeerAPI = v },
-		func() string { return h.cfg.PeerAPI })
-	apply(old.KineDBProbe, wd.KineDBProbe, func(v string) { h.cfg.KineDBProbe = v },
-		func() string { return h.cfg.KineDBProbe })
+	apply(old.APISelf, wd.APISelf, func(v string) { h.cfg.Hub.SelfAPI = v },
+		func() string { return h.cfg.Hub.SelfAPI })
+	apply(old.APIPeer, wd.APIPeer, func(v string) { h.cfg.Hub.PeerAPI = v },
+		func() string { return h.cfg.Hub.PeerAPI })
+	apply(old.KineDBProbe, wd.KineDBProbe, func(v string) { h.cfg.Hub.KineDBProbe = v },
+		func() string { return h.cfg.Hub.KineDBProbe })
 	apply(old.Sig13Autofix, wd.Sig13Autofix, func(v string) {
 		if v != "" {
-			h.cfg.Sig13Mode = v
+			h.cfg.Sig13.Mode = v
 		}
-	}, func() string { return h.cfg.Sig13Mode })
+	}, func() string { return h.cfg.Sig13.Mode })
 	apply(old.KineTTLAutofix, wd.KineTTLAutofix, func(v string) {
 		if v != "" {
-			h.cfg.KineTTLMode = v
+			h.cfg.KineTTL.Mode = v
 		}
-	}, func() string { return h.cfg.KineTTLMode })
+	}, func() string { return h.cfg.KineTTL.Mode })
 	apply(old.KinePoolAutofix, wd.KinePoolAutofix, func(v string) {
 		if v != "" {
-			h.cfg.KinePoolMode = v
+			h.cfg.KinePool.Mode = v
 		}
-	}, func() string { return h.cfg.KinePoolMode })
+	}, func() string { return h.cfg.KinePool.Mode })
 	apply(old.OOMLoopAutofix, wd.OOMLoopAutofix, func(v string) {
 		if v != "" {
-			h.cfg.OOMLoopMode = v
+			h.cfg.OOMLoop.Mode = v
 		}
-	}, func() string { return h.cfg.OOMLoopMode })
+	}, func() string { return h.cfg.OOMLoop.Mode })
 	// Ints — conf 0 derives to the package default.
 	intOf := func(v, def int) int {
 		if v > 0 {
@@ -1177,36 +1228,36 @@ func (h *Hygiene) refreshWatchdogConf() {
 	}
 	applyI(intOf(old.Sig13StaleMinErrs, defaultStaleMinErrs),
 		intOf(wd.Sig13StaleMinErrs, defaultStaleMinErrs),
-		func(v int) { h.cfg.StaleMinErrs = v },
-		func() int { return h.cfg.StaleMinErrs })
+		func(v int) { h.cfg.Sig13.StaleMinErrs = v },
+		func() int { return h.cfg.Sig13.StaleMinErrs })
 	applyI(intOf(old.Sig13SoloCycles, defaultSoloCycles),
 		intOf(wd.Sig13SoloCycles, defaultSoloCycles),
-		func(v int) { h.cfg.SoloCycles = v },
-		func() int { return h.cfg.SoloCycles })
+		func(v int) { h.cfg.Sig13.SoloCycles = v },
+		func() int { return h.cfg.Sig13.SoloCycles })
 	applyI(intOf(old.Sig13GapCycles, defaultGapCycles),
 		intOf(wd.Sig13GapCycles, defaultGapCycles),
-		func(v int) { h.cfg.GapCycles = v },
-		func() int { return h.cfg.GapCycles })
+		func(v int) { h.cfg.Sig13.GapCycles = v },
+		func() int { return h.cfg.Sig13.GapCycles })
 	applyI(intOf(old.Sig13FrozenCycles, defaultFrozenCycles),
 		intOf(wd.Sig13FrozenCycles, defaultFrozenCycles),
-		func(v int) { h.cfg.FrozenCycles = v },
-		func() int { return h.cfg.FrozenCycles })
+		func(v int) { h.cfg.Sig13.FrozenCycles = v },
+		func() int { return h.cfg.Sig13.FrozenCycles })
 	applyI(intOf(old.KineTTLRewedgeCycle, defaultTTLRewedgeCycles),
 		intOf(wd.KineTTLRewedgeCycle, defaultTTLRewedgeCycles),
-		func(v int) { h.cfg.KineTTLRewedgeCycles = v },
-		func() int { return h.cfg.KineTTLRewedgeCycles })
+		func(v int) { h.cfg.KineTTL.RewedgeCycles = v },
+		func() int { return h.cfg.KineTTL.RewedgeCycles })
 	applyI(intOf(old.KinePoolMaxConns, defaultPoolMaxConns),
 		intOf(wd.KinePoolMaxConns, defaultPoolMaxConns),
-		func(v int) { h.cfg.KinePoolMaxConns = v },
-		func() int { return h.cfg.KinePoolMaxConns })
+		func(v int) { h.cfg.KinePool.MaxConns = v },
+		func() int { return h.cfg.KinePool.MaxConns })
 	applyI(intOf(old.KinePoolCycles, defaultPoolCycles),
 		intOf(wd.KinePoolCycles, defaultPoolCycles),
-		func(v int) { h.cfg.KinePoolCycles = v },
-		func() int { return h.cfg.KinePoolCycles })
+		func(v int) { h.cfg.KinePool.Cycles = v },
+		func() int { return h.cfg.KinePool.Cycles })
 	applyI(intOf(old.OOMLoopMinKills, defaultOOMMinKills),
 		intOf(wd.OOMLoopMinKills, defaultOOMMinKills),
-		func(v int) { h.cfg.OOMLoopMinKills = v },
-		func() int { return h.cfg.OOMLoopMinKills })
+		func(v int) { h.cfg.OOMLoop.MinKills = v },
+		func() int { return h.cfg.OOMLoop.MinKills })
 	// int64.
 	apply64 := func(prevV, nextV int64, set func(int64), cur func() int64) {
 		if cur() == prevV {
@@ -1221,8 +1272,8 @@ func (h *Hygiene) refreshWatchdogConf() {
 	}
 	apply64(i64(old.Sig13GapMin, defaultGapMin),
 		i64(wd.Sig13GapMin, defaultGapMin),
-		func(v int64) { h.cfg.GapMin = v },
-		func() int64 { return h.cfg.GapMin })
+		func(v int64) { h.cfg.Sig13.GapMin = v },
+		func() int64 { return h.cfg.Sig13.GapMin })
 	// Durations — conf seconds 0 derives to the package default.
 	dur := func(v int, def time.Duration) time.Duration {
 		if v > 0 {
@@ -1237,24 +1288,24 @@ func (h *Hygiene) refreshWatchdogConf() {
 	}
 	applyD(dur(old.Sig13MinRestartS, defaultMinRestart),
 		dur(wd.Sig13MinRestartS, defaultMinRestart),
-		func(v time.Duration) { h.cfg.MinRestartInterval = v },
-		func() time.Duration { return h.cfg.MinRestartInterval })
+		func(v time.Duration) { h.cfg.Sig13.MinRestart = v },
+		func() time.Duration { return h.cfg.Sig13.MinRestart })
 	applyD(dur(old.KineTTLMinRestartS, defaultTTLMinRestart),
 		dur(wd.KineTTLMinRestartS, defaultTTLMinRestart),
-		func(v time.Duration) { h.cfg.KineTTLMinRestart = v },
-		func() time.Duration { return h.cfg.KineTTLMinRestart })
+		func(v time.Duration) { h.cfg.KineTTL.MinRestart = v },
+		func() time.Duration { return h.cfg.KineTTL.MinRestart })
 	applyD(dur(old.KineTTLCtlRestartS, defaultTTLCtlRestart),
 		dur(wd.KineTTLCtlRestartS, defaultTTLCtlRestart),
-		func(v time.Duration) { h.cfg.KineTTLCtlRestart = v },
-		func() time.Duration { return h.cfg.KineTTLCtlRestart })
+		func(v time.Duration) { h.cfg.KineTTL.CtlRestart = v },
+		func() time.Duration { return h.cfg.KineTTL.CtlRestart })
 	applyD(dur(old.KinePoolMinRestartS, defaultPoolMinRestart),
 		dur(wd.KinePoolMinRestartS, defaultPoolMinRestart),
-		func(v time.Duration) { h.cfg.KinePoolMinRestart = v },
-		func() time.Duration { return h.cfg.KinePoolMinRestart })
+		func(v time.Duration) { h.cfg.KinePool.MinRestart = v },
+		func() time.Duration { return h.cfg.KinePool.MinRestart })
 	applyD(dur(old.OOMLoopWindowS, defaultOOMWindow),
 		dur(wd.OOMLoopWindowS, defaultOOMWindow),
-		func(v time.Duration) { h.cfg.OOMLoopWindow = v },
-		func() time.Duration { return h.cfg.OOMLoopWindow })
+		func(v time.Duration) { h.cfg.OOMLoop.Window = v },
+		func() time.Duration { return h.cfg.OOMLoop.Window })
 	h.wdApplied = wd
 }
 
@@ -1319,97 +1370,9 @@ func (h *Hygiene) writeState(name, content string) {
 }
 
 // --- /proc helpers ---
-
-// procFile joins ProcRoot/<pid>/<elems...>.
-func (h *Hygiene) procFile(pid int, elems ...string) string {
-	parts := append([]string{h.cfg.ProcRoot, strconv.Itoa(pid)}, elems...)
-	return filepath.Join(parts...)
-}
-
-// uptimeSeconds parses <ProcRoot>/uptime — hostutil's shared
-// /proc/uptime reader.
-func (h *Hygiene) uptimeSeconds() (float64, error) {
-	return hostutil.UptimeSeconds(filepath.Join(h.cfg.ProcRoot, "uptime"))
-}
-
-var pidDirRe = regexp.MustCompile(`^[0-9]+$`)
-
-// procPIDs lists the numeric pid dirs under ProcRoot, ascending —
-// `pgrep -x | head -1` parity (lowest pid wins).
-func (h *Hygiene) procPIDs() []int {
-	entries, err := os.ReadDir(h.cfg.ProcRoot)
-	if err != nil {
-		return nil
-	}
-	var pids []int
-	for _, e := range entries {
-		if !e.IsDir() || !pidDirRe.MatchString(e.Name()) {
-			continue
-		}
-		if pid, err := strconv.Atoi(e.Name()); err == nil {
-			pids = append(pids, pid)
-		}
-	}
-	sort.Ints(pids)
-	return pids
-}
-
-// findProcByComm returns the lowest pid whose /proc/<pid>/comm equals
-// name — `pgrep -x <name> | head -1` parity. 0 when absent.
-func (h *Hygiene) findProcByComm(name string) int {
-	for _, pid := range h.procPIDs() {
-		data, err := os.ReadFile(h.procFile(pid, "comm"))
-		if err != nil {
-			continue
-		}
-		if strings.TrimSpace(string(data)) == name {
-			return pid
-		}
-	}
-	return 0
-}
-
-// procCmdline returns the argv of pid (NUL-separated in /proc).
-func (h *Hygiene) procCmdline(pid int) []string {
-	data, err := os.ReadFile(h.procFile(pid, "cmdline"))
-	if err != nil {
-		return nil
-	}
-	return strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
-}
-
-// pidAgeSeconds returns the process age in seconds — `ps -o etimes=`
-// parity. Computed from /proc/<pid>/stat starttime (field 22, jiffies)
-// against /proc/uptime; the post-comm parsing trick (fields after the
-// LAST ')') is the same as lib.sh read_cpu_jiffies.
-func (h *Hygiene) pidAgeSeconds(pid int) (float64, error) {
-	data, err := os.ReadFile(h.procFile(pid, "stat"))
-	if err != nil {
-		return 0, err
-	}
-	s := string(data)
-	i := strings.LastIndexByte(s, ')')
-	if i < 0 {
-		return 0, fmt.Errorf("bad stat")
-	}
-	f := strings.Fields(s[i+1:])
-	if len(f) < 20 {
-		return 0, fmt.Errorf("short stat")
-	}
-	start, err := strconv.ParseFloat(f[19], 64) // field 22 overall
-	if err != nil {
-		return 0, err
-	}
-	up, err := h.uptimeSeconds()
-	if err != nil {
-		return 0, err
-	}
-	age := up - start/clkTck
-	if age < 0 {
-		return 0, nil
-	}
-	return age, nil
-}
+// The /proc reads live in platform/procfs (h.proc): pid-dir
+// listing, cmdline/comm reads, stat parsing (pid age, PPID) and
+// the pgrep -x | head -1 lowest-pid comm lookup.
 
 // --- external interaction defaults (all behind Config seams) ---
 
@@ -1914,7 +1877,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 		// guards own the control-plane-down story.
 		h.state.AppendLogWarn(fmt.Sprintf(
 			"etcdguard: endpoint status failed (endpoint=%s): %v — quota check skipped",
-			h.cfg.EtcdEndpoint, err))
+			h.cfg.EtcdGuard.Endpoint, err))
 		h.cycles.WithLabelValues(checkEtcd, "status_error").Inc()
 		return
 	}
@@ -1929,7 +1892,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	// value, the same "keep last, never force-clear a
 	// possibly-armed alarm" semantics as a probe error.
 	var nospace bool
-	if dbSize < h.cfg.EtcdDBSizeLimit {
+	if dbSize < h.cfg.EtcdGuard.DBSizeLimit {
 		ns, aerr := h.etcdNospaceArmed(ctx)
 		if aerr != nil {
 			// A failed alarm read must not hide a real alarm —
@@ -1949,18 +1912,18 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	switch {
 	case nospace:
 		reason = "nospace-alarm"
-	case dbSize >= h.cfg.EtcdDBSizeLimit:
-		reason = fmt.Sprintf("dbSize=%d>=%d", dbSize, h.cfg.EtcdDBSizeLimit)
+	case dbSize >= h.cfg.EtcdGuard.DBSizeLimit:
+		reason = fmt.Sprintf("dbSize=%d>=%d", dbSize, h.cfg.EtcdGuard.DBSizeLimit)
 	default:
 		h.cycles.WithLabelValues(checkEtcd, "ok").Inc()
 		return
 	}
 
 	if !h.state.RateOK(fileRateEtcdGuard,
-		h.cfg.EtcdGuardMinRun) {
+		h.cfg.EtcdGuard.MinRun) {
 		h.state.SuspectLog(checkEtcd, fmt.Sprintf(
 			"etcdguard: %s but in guard cooldown (<%dm), skip",
-			reason, int(h.cfg.EtcdGuardMinRun.Minutes())),
+			reason, int(h.cfg.EtcdGuard.MinRun.Minutes())),
 			h.cfg.SuspectLogCadence)
 		h.cycles.WithLabelValues(checkEtcd, "cooldown").Inc()
 		return
@@ -1988,7 +1951,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	// has garbage to drop. Cutoff keeps the apiserver's own 1h event
 	// TTL: only GC debt is deleted, fresh events survive.
 	perr := h.cfg.evpurgeRunFn(gctx, evpurge.Config{
-		API:      "https://" + h.cfg.SelfEndpoint,
+		API:      "https://" + h.cfg.Hub.SelfEndpoint,
 		CAFile:   h.cfg.AdminCA,
 		CertFile: h.cfg.AdminCert,
 		KeyFile:  h.cfg.AdminKey,
@@ -2011,7 +1974,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	if gctx.Err() == nil {
 		rerr := h.cfg.etcdRescueFn(gctx, etcdrescue.Config{
 			K0sDir:   h.cfg.K0sDir,
-			Endpoint: h.cfg.EtcdEndpoint,
+			Endpoint: h.cfg.EtcdGuard.Endpoint,
 			// OnlineOnly: this is background auto-maintenance — the
 			// systemctl-stop + standalone-etcd defrag would take the
 			// control plane down and stays a manual rescue-etcd
@@ -2037,7 +2000,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 		h.state.AppendLogWarn(fmt.Sprintf(
 			"etcdguard: run budget (%s) exhausted — remaining steps "+
 				"deferred to the next %s window",
-			defaultEtcdGuardBudget, h.cfg.EtcdGuardMinRun))
+			defaultEtcdGuardBudget, h.cfg.EtcdGuard.MinRun))
 	}
 	h.actions.WithLabelValues(checkEtcd, "evpurge_rescue").Inc()
 	if remediated {

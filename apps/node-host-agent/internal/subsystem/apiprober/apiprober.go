@@ -78,6 +78,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -415,17 +416,7 @@ func (p *Prober) Name() string { return "apiprober" }
 
 // Run probes immediately, then every Interval until ctx is cancelled.
 func (p *Prober) Run(ctx context.Context) {
-	p.Cycle(ctx)
-	t := time.NewTicker(p.cfg.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			p.Cycle(ctx)
-		}
-	}
+	cycle.Every("apiprober", p.cfg.Interval, p.Cycle).Run(ctx)
 }
 
 // baseTransport clones http.DefaultTransport with our TLS config —

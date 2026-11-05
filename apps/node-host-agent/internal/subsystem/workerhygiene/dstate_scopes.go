@@ -11,24 +11,15 @@ import (
 // procStatStatePPID parses /proc/<pid>/stat for state + ppid — the
 // fields right after the LAST ')' (comm can hold spaces/parens).
 func (h *Hygiene) procStatStatePPID(pid int) (state string, ppid int, ok bool) {
-	data, err := os.ReadFile(h.procFile(pid, "stat"))
-	if err != nil {
+	st, ok := h.proc.Stat(pid)
+	if !ok || len(st.Fields) < 2 { // Fields[0]=state, Fields[1]=ppid
 		return "", 0, false
 	}
-	s := string(data)
-	i := strings.LastIndexByte(s, ')')
-	if i < 0 {
-		return "", 0, false
-	}
-	f := strings.Fields(s[i+1:])
-	if len(f) < 2 { // f[0]=state, f[1]=ppid
-		return "", 0, false
-	}
-	p, err := strconv.Atoi(f[1])
+	p, err := strconv.Atoi(st.Fields[1])
 	if err != nil || p < 0 {
 		return "", 0, false
 	}
-	return f[0], p, true
+	return st.Fields[0], p, true
 }
 
 // podUIDForPID extracts the pod UID owning a pid via
@@ -38,7 +29,7 @@ func (h *Hygiene) procStatStatePPID(pid int) (state string, ppid int, ok bool) {
 // kubepods*.slice naming — k0s hosts are v2; on v1 the per-
 // hierarchy lines differ and pod_uid resolves "unknown").
 func (h *Hygiene) podUIDForPID(pid int) string {
-	data, err := os.ReadFile(h.procFile(pid, "cgroup"))
+	data, err := os.ReadFile(h.proc.File(pid, "cgroup"))
 	if err != nil {
 		return "unknown"
 	}
@@ -65,22 +56,13 @@ type zombieParent struct {
 // generation tag inside zombieParent. "" when the stat is
 // unreadable or truncated (the parent exited mid-sweep).
 func (h *Hygiene) procStartTime(pid int) string {
-	data, err := os.ReadFile(h.procFile(pid, "stat"))
-	if err != nil {
+	st, ok := h.proc.Stat(pid)
+	// Fields after ')' start at field 3: Fields[0]=state,
+	// Fields[1]=ppid, … Fields[19]=starttime (field 22).
+	if !ok || len(st.Fields) <= 19 {
 		return ""
 	}
-	s := string(data)
-	i := strings.LastIndexByte(s, ')')
-	if i < 0 {
-		return ""
-	}
-	// Fields after ')' start at field 3: f[0]=state, f[1]=ppid,
-	// … f[19]=starttime (field 22).
-	f := strings.Fields(s[i+1:])
-	if len(f) <= 19 {
-		return ""
-	}
-	return f[19]
+	return st.Fields[19]
 }
 
 func (h *Hygiene) checkZombieStorm(pidsOnce func() []int, workerActive bool) {
@@ -158,28 +140,18 @@ func (h *Hygiene) checkZombieStorm(pidsOnce func() []int, workerActive bool) {
 // and parens), state is the first field after that ')' (same trick
 // as procStatStatePPID).
 func (h *Hygiene) procStatCommState(pid int) (comm, state string, ok bool) {
-	data, err := os.ReadFile(h.procFile(pid, "stat"))
-	if err != nil {
+	st, ok := h.proc.Stat(pid)
+	if !ok || !st.HasComm {
 		return "", "", false
 	}
-	s := string(data)
-	i := strings.LastIndexByte(s, ')')
-	open := strings.IndexByte(s, '(')
-	if i < 0 || open < 0 || open > i {
-		return "", "", false
-	}
-	f := strings.Fields(s[i+1:])
-	if len(f) == 0 {
-		return "", "", false
-	}
-	return s[open+1 : i], f[0], true
+	return st.Comm, st.Fields[0], true
 }
 
 // procWchan returns the kernel function a task is sleeping inside —
 // /proc/<pid>/wchan names it; "0" (running/not-sleeping) and
 // unreadable files report "".
 func (h *Hygiene) procWchan(pid int) string {
-	data, err := os.ReadFile(h.procFile(pid, "wchan"))
+	data, err := os.ReadFile(h.proc.File(pid, "wchan"))
 	if err != nil {
 		return ""
 	}

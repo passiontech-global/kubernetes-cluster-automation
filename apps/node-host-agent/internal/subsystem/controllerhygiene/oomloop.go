@@ -32,7 +32,7 @@ import (
 
 // checkOOMLoop runs one OOM-loop guard cycle.
 func (h *Hygiene) checkOOMLoop(_ context.Context) {
-	events, err := os.ReadFile(h.cfg.CGroupEventsFile)
+	events, err := os.ReadFile(h.cfg.OOMLoop.CGroupEventsFile)
 	if err != nil {
 		// Not a cgroup-v2 controller (or path not mounted) — the
 		// shell exited 0 the same way.
@@ -91,7 +91,7 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 	inWindow := h.pruneKills(killsPath, now)
 	h.oomWindow.Set(float64(inWindow))
 
-	if inWindow < h.cfg.OOMLoopMinKills {
+	if inWindow < h.cfg.OOMLoop.MinKills {
 		// Loop cleared: remove the shield — apiserver must not
 		// stay protected forever (a genuine runaway apiserver
 		// has to remain killable).
@@ -104,10 +104,10 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 	// --- OOM loop confirmed ---
 	h.state.Enter(stateControllerOOMLop, fmt.Sprintf(
 		"oom_kills_window=%d/%d in %ds (cum=%d)",
-		inWindow, h.cfg.OOMLoopMinKills,
-		int(h.cfg.OOMLoopWindow.Seconds()), oomNow))
+		inWindow, h.cfg.OOMLoop.MinKills,
+		int(h.cfg.OOMLoop.Window.Seconds()), oomNow))
 
-	switch h.cfg.OOMLoopMode {
+	switch h.cfg.OOMLoop.Mode {
 	case ModeEnforce:
 		// Idempotent: PIDs change on every respawn so the shield is
 		// re-applied every cycle while the loop is latched — only
@@ -115,7 +115,7 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 		// shield work + action metric stay per-cycle).
 		h.state.SuspectLog(stateControllerOOMLop, fmt.Sprintf(
 			"ACTION: shield kube-apiserver (oom_score_adj=%d), kine %+d — window_kills=%d",
-			h.cfg.APIServerShieldAdj, h.cfg.KineShieldAdj, inWindow),
+			h.cfg.OOMLoop.APIServerShieldAdj, h.cfg.OOMLoop.KineShieldAdj, inWindow),
 			h.cfg.SuspectLogCadence)
 		// Latch FIRST and confirm it landed: fileOOMShielded is the
 		// only record unshieldOOM keys on, so pinning an adj before
@@ -131,13 +131,13 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 				filepath.Join(dir, fileOOMShielded), err))
 			break
 		}
-		h.setAdj("kube-apiserver", h.cfg.APIServerShieldAdj)
-		h.setAdj("kine", h.cfg.KineShieldAdj)
+		h.setAdj("kube-apiserver", h.cfg.OOMLoop.APIServerShieldAdj)
+		h.setAdj("kine", h.cfg.OOMLoop.KineShieldAdj)
 		h.actions.WithLabelValues(checkOOMLoop, "shield").Inc()
 	case ModeDryRun:
 		h.state.SuspectLog(stateControllerOOMLop, fmt.Sprintf(
 			"DRY-RUN: would shield kube-apiserver oom_score_adj=%d, kine %+d — window_kills=%d",
-			h.cfg.APIServerShieldAdj, h.cfg.KineShieldAdj, inWindow),
+			h.cfg.OOMLoop.APIServerShieldAdj, h.cfg.OOMLoop.KineShieldAdj, inWindow),
 			h.cfg.SuspectLogCadence)
 		h.actions.WithLabelValues(checkOOMLoop, "dryrun_shield").Inc()
 	}
@@ -145,7 +145,7 @@ func (h *Hygiene) checkOOMLoop(_ context.Context) {
 	// leave oom_score_adj pinned on the apiserver for the process's
 	// lifetime — unshield on any non-enforce mode (off, dry-run, or
 	// an unrecognised value). Cheap: one stat per latched cycle.
-	if h.cfg.OOMLoopMode != ModeEnforce {
+	if h.cfg.OOMLoop.Mode != ModeEnforce {
 		h.unshieldOOM(dir, "mode not enforce")
 	}
 	h.cycles.WithLabelValues(checkOOMLoop, "ok").Inc()
@@ -192,7 +192,7 @@ func (h *Hygiene) pruneKills(killsPath string, now int64) int {
 	if err != nil {
 		return 0
 	}
-	cutoff := now - int64(h.cfg.OOMLoopWindow.Seconds())
+	cutoff := now - int64(h.cfg.OOMLoop.Window.Seconds())
 	var kept []string
 	for rest := string(data); rest != ""; {
 		line, after, _ := strings.Cut(rest, "\n")
@@ -225,11 +225,11 @@ func (h *Hygiene) pruneKills(killsPath string, now int64) int {
 // Idempotent and silent when the process is absent (the shell's
 // `|| return 0` / `|| true`).
 func (h *Hygiene) setAdj(comm string, adj int) {
-	pid := h.findProcByComm(comm)
+	pid := h.proc.FindByComm(comm)
 	if pid == 0 {
 		return
 	}
-	if err := os.WriteFile(h.procFile(pid, "oom_score_adj"),
+	if err := os.WriteFile(h.proc.File(pid, "oom_score_adj"),
 		[]byte(strconv.Itoa(adj)), 0o644); err != nil {
 		// A swallowed write failure leaves the shield half-applied
 		// and invisible — surface it once per call (per cycle).

@@ -43,6 +43,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 )
@@ -268,17 +269,7 @@ func (r *Reporter) Name() string { return "nodereporter" }
 // it is released when the subsystem stops.
 func (r *Reporter) Run(ctx context.Context) {
 	defer r.closeKmsg()
-	r.Cycle(ctx)
-	t := time.NewTicker(r.cfg.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			r.Cycle(ctx)
-		}
-	}
+	cycle.Every("nodereporter", r.cfg.Interval, r.Cycle).Run(ctx)
 }
 
 // Cycle runs one sync round: one-time heartbeat initialization,

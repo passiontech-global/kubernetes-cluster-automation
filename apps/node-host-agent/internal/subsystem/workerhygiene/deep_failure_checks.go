@@ -119,7 +119,7 @@ func (h *Hygiene) checkContainerdHealth(ctx context.Context,
 func (h *Hygiene) countMetaOrphanShims(pids []int) int {
 	n := 0
 	for _, pid := range pids {
-		argv := h.procCmdline(pid)
+		argv := h.proc.Cmdline(pid)
 		if len(argv) == 0 ||
 			!strings.Contains(strings.Join(argv, " "), "containerd-shim-runc-v2") {
 			continue

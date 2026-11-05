@@ -122,9 +122,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/journalwatch"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -1026,7 +1027,6 @@ var (
 	// DaemonSet pod names only (anchored — see comment block above).
 	konnPodRe = regexp.MustCompile(`^konnectivity-agent-[a-z0-9]+$`)
 	dnsPodRe  = regexp.MustCompile(`^(node-local-dns-[a-z0-9]+|coredns-[a-z0-9]+-[a-z0-9]+)$`)
-	pidDirRe  = regexp.MustCompile(`^[0-9]+$`)
 	// Journal signatures (05/06) — grep -cE parity: count MATCHING
 	// LINES, not occurrences.
 	stallJournalRe = regexp.MustCompile(`node "[^"]+" not found|not registered yet`)
@@ -1058,6 +1058,10 @@ var (
 // Hygiene runs the worker checks on one ticker.
 type Hygiene struct {
 	cfg Config
+	// proc is the /proc view bound to cfg.ProcRoot — the shared
+	// platform/procfs helpers (pid listing, cmdline/environ/stat
+	// reads, liveness) the checks below all go through.
+	proc procfs.FS
 
 	// state is the shared hoststate.Store for the watchdog state-dir
 	// contract (state-* latches, last-* rate budgets, installed/
@@ -1166,7 +1170,8 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		return nil, fmt.Errorf("workerhygiene: Config.Client is required")
 	}
 	cfg.applyDefaults()
-	h := &Hygiene{cfg: cfg, zombieStreaks: map[zombieParent]int{}}
+	h := &Hygiene{cfg: cfg, proc: procfs.New(cfg.ProcRoot),
+		zombieStreaks: map[zombieParent]int{}}
 	// Now MUST close over the live config field, not the cfg
 	// parameter: tests re-stub h.cfg.nowFn after New returns and
 	// the store has to observe the new clock (hoststate.New doc).
@@ -1223,7 +1228,7 @@ func (h *Hygiene) Run(ctx context.Context) {
 	if !h.cfg.Enabled {
 		// Constructed but disabled — idle instead of returning: the
 		// agent restarts a returned Run in a hot loop.
-		<-ctx.Done()
+		cycle.Idle(ctx)
 		return
 	}
 	// The tick self-gates on kubeletFeederActive() each round, so a
@@ -1263,17 +1268,7 @@ func (h *Hygiene) Run(ctx context.Context) {
 		stop()
 		wg.Wait()
 	}()
-	h.Cycle(ctx)
-	t := time.NewTicker(h.cfg.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			h.Cycle(ctx)
-		}
-	}
+	cycle.Every("workerhygiene", h.cfg.Interval, h.Cycle).Run(ctx)
 }
 
 // Cycle runs one round of all three checks. The k0sworker unit file
@@ -1289,8 +1284,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// required uptime >= 1200s): a freshly rebooted node gets grace
 	// before any destructive check runs — Terminating ages surviving
 	// a reboot must not trigger action inside the first minutes.
-	if up, err := hostutil.UptimeSeconds(
-		filepath.Join(h.cfg.ProcRoot, "uptime")); err == nil && up < minUptimeSeconds {
+	if up, err := h.proc.UptimeSeconds(); err == nil && up < minUptimeSeconds {
 		h.cycles.WithLabelValues("all", "uptime_gate").Inc()
 		return
 	}
@@ -1322,7 +1316,10 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	var pids []int
 	pidsOnce := func() []int {
 		if pids == nil {
-			pids = h.procPIDs()
+			// ReadDir-order pids, error swallowed like the old
+			// procPIDs — a nil result retries the scan on the
+			// next pidsOnce call (same as before).
+			pids, _ = h.proc.PIDs()
 		}
 		return pids
 	}
@@ -1527,79 +1524,16 @@ func (h *Hygiene) listNodePods(ctx context.Context) ([]corev1.Pod, bool) {
 // internal/platform/hoststate for the file-format docs.
 
 // --- /proc + containerd task helpers ---
+// The /proc reads themselves live in platform/procfs (h.proc) —
+// pid listing, cmdline/environ/stat parsing, liveness, uptime. What
+// remains below is only the part that must read the live config
+// seams (killFn/nowFn are re-stubbed by tests after New).
 
-// procFile joins ProcRoot/<pid>/<elems...>.
-func (h *Hygiene) procFile(pid int, elems ...string) string {
-	parts := append([]string{h.cfg.ProcRoot, strconv.Itoa(pid)}, elems...)
-	return filepath.Join(parts...)
-}
-
-// pidLive mirrors the shell liveness check: kill -0 succeeds AND the
-// /proc/<pid>/stat state field is not "Z" (zombie). An unreadable or
-// unparseable stat after a successful kill -0 counts as LIVE — fail
-// toward not-killing / not-force-deleting on uncertainty. The stat
-// state field is parsed after the LAST ')' because comm (field 2) can
-// contain spaces and parens (same trick as read_cpu_jiffies).
+// pidLive is procfs.FS.Live bound to this subsystem's killFn seam —
+// h.cfg.killFn is read at call time because tests re-stub it after
+// New returns.
 func (h *Hygiene) pidLive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	if h.cfg.killFn(pid, 0) != nil {
-		return false
-	}
-	data, err := os.ReadFile(h.procFile(pid, "stat"))
-	if err != nil {
-		return true
-	}
-	s := string(data)
-	if i := strings.LastIndexByte(s, ')'); i >= 0 {
-		if f := strings.Fields(s[i+1:]); len(f) > 0 {
-			return f[0] != "Z"
-		}
-	}
-	return true
-}
-
-// procPIDs lists the numeric pid dirs under ProcRoot.
-func (h *Hygiene) procPIDs() []int {
-	entries, err := os.ReadDir(h.cfg.ProcRoot)
-	if err != nil {
-		return nil
-	}
-	var pids []int
-	for _, e := range entries {
-		if !e.IsDir() || !pidDirRe.MatchString(e.Name()) {
-			continue
-		}
-		if pid, err := strconv.Atoi(e.Name()); err == nil {
-			pids = append(pids, pid)
-		}
-	}
-	return pids
-}
-
-// procCmdline returns the argv of pid (NUL-separated in /proc).
-func (h *Hygiene) procCmdline(pid int) []string {
-	data, err := os.ReadFile(h.procFile(pid, "cmdline"))
-	if err != nil {
-		return nil
-	}
-	return strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
-}
-
-// procEnvValue reads KEY=<value> from /proc/<pid>/environ.
-func (h *Hygiene) procEnvValue(pid int, key string) string {
-	data, err := os.ReadFile(h.procFile(pid, "environ"))
-	if err != nil {
-		return ""
-	}
-	prefix := key + "="
-	for _, e := range strings.Split(string(data), "\x00") {
-		if v, ok := strings.CutPrefix(e, prefix); ok {
-			return v
-		}
-	}
-	return ""
+	return h.proc.Live(pid, h.cfg.killFn)
 }
 
 // ctrTask is one containerd task dir (runtime-v2 task or sandbox
@@ -1727,15 +1661,10 @@ func (h *Hygiene) forceDeletePod(ctx context.Context, p *corev1.Pod) error {
 		})
 }
 
-// procAge returns the age of a /proc/<pid> dir (shell
-// `now - stat -c %Y` — a shim that just spawned still has a fresh
-// mtime, so the 5m window can't kill a starting task).
+// procAge is procfs.FS.Age bound to the nowFn seam (tests re-stub
+// h.cfg.nowFn after New).
 func (h *Hygiene) procAge(pid int) time.Duration {
-	fi, err := os.Stat(h.procFile(pid))
-	if err != nil {
-		return 0
-	}
-	return h.cfg.nowFn().Sub(fi.ModTime())
+	return h.proc.Age(pid, h.cfg.nowFn())
 }
 
 // pidsWithCmdline returns pids whose joined cmdline contains sub —
@@ -1745,7 +1674,7 @@ func (h *Hygiene) procAge(pid int) time.Duration {
 func (h *Hygiene) pidsWithCmdline(sub string, pids []int) []int {
 	var out []int
 	for _, pid := range pids {
-		if strings.Contains(strings.Join(h.procCmdline(pid), " "), sub) {
+		if strings.Contains(strings.Join(h.proc.Cmdline(pid), " "), sub) {
 			out = append(out, pid)
 		}
 	}

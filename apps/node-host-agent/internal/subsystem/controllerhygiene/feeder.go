@@ -64,7 +64,7 @@ func (h *Hygiene) runFeeder(ctx context.Context) {
 		return // ctx cancelled while waiting
 	}
 	h.state.AppendLog(fmt.Sprintf("feeder: start %s.MainPID=%s interval=%ds url=%s",
-		unit, mainPID, int(cfg.FeedInterval.Seconds()), cfg.FeedProbeURL))
+		unit, mainPID, int(cfg.Feeder.Interval.Seconds()), cfg.Feeder.ProbeURL))
 
 	fails := 0
 	everOK := false
@@ -82,7 +82,7 @@ func (h *Hygiene) runFeeder(ctx context.Context) {
 			everOK = false
 		}
 
-		alive := h.cfg.probeFn(ctx, cfg.FeedProbeURL)
+		alive := h.cfg.probeFn(ctx, cfg.Feeder.ProbeURL)
 		doFeed := false
 		if alive {
 			everOK = true
@@ -90,9 +90,9 @@ func (h *Hygiene) runFeeder(ctx context.Context) {
 			doFeed = true
 		} else {
 			fails++
-			limit := cfg.FeedMaxFail
+			limit := cfg.Feeder.MaxFail
 			if !everOK {
-				limit = cfg.FeedGraceFails
+				limit = cfg.Feeder.GraceFails
 			}
 			h.state.AppendLog(fmt.Sprintf("feeder: probe fail %d/%d", fails, limit))
 			if fails >= limit {
@@ -137,7 +137,7 @@ func (h *Hygiene) runFeeder(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(cfg.FeedInterval):
+		case <-time.After(cfg.Feeder.Interval):
 		}
 	}
 }
@@ -153,7 +153,7 @@ func (h *Hygiene) waitMainPID(ctx context.Context, unit string) string {
 		select {
 		case <-ctx.Done():
 			return ""
-		case <-time.After(h.cfg.FeedInterval):
+		case <-time.After(h.cfg.Feeder.Interval):
 		}
 	}
 }
@@ -181,7 +181,7 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 	// G1: re-probe twice 3s apart — one answer = apiserver alive =
 	// false alarm (self-correcting).
 	for i := 1; i <= 2; i++ {
-		if h.cfg.probeFn(ctx, cfg.FeedProbeURL) {
+		if h.cfg.probeFn(ctx, cfg.Feeder.ProbeURL) {
 			h.state.AppendLog(fmt.Sprintf(
 				"G1 PASS: apiserver answered on probe %d — false alarm, no restart", i))
 			return
@@ -217,10 +217,10 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 		return
 	}
 	ageS := int64(h.cfg.nowFn().Sub(entered).Seconds())
-	if ageS < int64(cfg.RemediateFreshGrace.Seconds()) {
+	if ageS < int64(cfg.Feeder.RemediateFreshGrace.Seconds()) {
 		h.state.AppendLog(fmt.Sprintf(
 			"G3 PASS: %s started %ds ago (< %ds grace) — apiserver may still be initialising, stop",
-			unit, ageS, int(cfg.RemediateFreshGrace.Seconds())))
+			unit, ageS, int(cfg.Feeder.RemediateFreshGrace.Seconds())))
 		return
 	}
 	h.state.AppendLog(fmt.Sprintf("G3: %s running %ds — not a fresh start", unit, ageS))
@@ -250,13 +250,13 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 	// the Store's Dir (WatchdogStateDir), and last-restart lives
 	// under FeederStateDir instead.
 	h.rateMu.Lock()
-	lastPath := filepath.Join(cfg.FeederStateDir, fileFeederLastRst)
+	lastPath := filepath.Join(cfg.Feeder.StateDir, fileFeederLastRst)
 	delta := h.cfg.nowFn().Unix() - h.state.Epoch(lastPath)
-	if delta < int64(cfg.RemediateMinRestart.Seconds()) {
+	if delta < int64(cfg.Feeder.RemediateMinRestart.Seconds()) {
 		h.rateMu.Unlock()
 		h.state.AppendLog(fmt.Sprintf(
 			"G5 PASS: last restart %ds ago (< %ds) — rate-limit, stop",
-			delta, int(cfg.RemediateMinRestart.Seconds())))
+			delta, int(cfg.Feeder.RemediateMinRestart.Seconds())))
 		return
 	}
 	h.state.AppendLog(fmt.Sprintf("G5: previous restart %ds ago — allowed", delta))
@@ -270,10 +270,10 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 	// a killed/hung restartFn with an unwritten budget would allow a
 	// second restart inside the 1800s window. FeederStateDir may not
 	// exist yet (mkdir -p parity) — create it so the mark lands.
-	if err := os.MkdirAll(cfg.FeederStateDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.Feeder.StateDir, 0o755); err != nil {
 		h.rateMu.Unlock()
 		h.state.AppendLogWarn(fmt.Sprintf("G6: mkdir %s failed: %v — restart skipped (budget file must exist)",
-			cfg.FeederStateDir, err))
+			cfg.Feeder.StateDir, err))
 		return
 	}
 	h.state.AppendLog("G6: all gates passed — systemctl restart " + unit)
@@ -292,7 +292,7 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 // remediate peer file — the sed 's/^PEER_APISERVER=//p' + strip
 // quotes/space parity.
 func (h *Hygiene) peerAPIServer() string {
-	data, err := os.ReadFile(h.cfg.RemediatePeerFile)
+	data, err := os.ReadFile(h.cfg.Feeder.RemediatePeerFile)
 	if err != nil {
 		return ""
 	}

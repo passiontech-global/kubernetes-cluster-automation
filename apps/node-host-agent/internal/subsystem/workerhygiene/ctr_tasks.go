@@ -180,7 +180,7 @@ func (h *Hygiene) checkCtrTasks(ctx context.Context,
 		if nShim >= h.cfg.MaxShimKill {
 			break
 		}
-		argv := h.procCmdline(pid)
+		argv := h.proc.Cmdline(pid)
 		joined := strings.Join(argv, " ")
 		if !strings.Contains(joined, "containerd-shim-runc-v2") {
 			continue
