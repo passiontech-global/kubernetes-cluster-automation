@@ -1,0 +1,93 @@
+# golangci-lint config (v2 format, golangci-lint 2.x, pinned via mise).
+#
+# Single root config for all three Go modules under apps/*/: each
+# `golangci-lint run ./...` invocation inside an app dir walks up and
+# finds this file. Paths in exclusion rules below are relative to the
+# app dir golangci-lint runs in, so they only match that app's files.
+#
+# Linter set: v2 defaults (errcheck, govet, ineffassign, staticcheck,
+# unused) plus a small pragmatic set of low-noise correctness/perf
+# linters. Deliberately NOT enabled:
+#   - gosec: this is infrastructure tooling that execs host commands
+#     (nsenter, systemctl, ip/ss) and shells out by design — G204 and
+#     friends would flag the codebase's core idiom, not real bugs.
+#   - revive/godox/wsl/lll/funlen/gocognit/cyclop/gochecknoinits and
+#     other style linters: they force churn without catching bugs.
+version: "2"
+
+linters:
+  default: standard
+
+  enable:
+    - copyloopvar     # unneeded loop-var copies (pre-1.22 idiom)
+    - misspell        # comment/doc typos
+    - nilerr          # `if err != nil { return nil }` swallows errors
+    - perfsprint      # faster drop-ins for fmt.Sprintf & friends
+    - unconvert       # redundant type conversions
+    - usestdlibvars   # http.MethodGet etc. instead of string literals
+
+  settings:
+    staticcheck:
+      # -QF*: quick-fix style suggestions (De Morgan's law, tagged
+      #   switches, WriteString(Sprintf) → Fprintf).
+      # -ST1000/-ST1020: doc-comment form requirements. The codebase
+      #   deliberately documents every file with `// file.go — purpose`
+      #   headers and free-form doc comments instead of the
+      #   `Package foo …` / `Foo …` convention; enforcing it would be
+      #   pure churn across ~50 files.
+      # All real correctness checks (SA*/S*/remaining ST*) stay on.
+      checks: ["all", "-QF*", "-ST1000", "-ST1020"]
+
+  exclusions:
+    rules:
+      # errcheck — deferred Close() is the codebase's fire-and-forget
+      # cleanup idiom (listeners, conns, ssh sessions, temp files);
+      # the error is never actionable at that point.
+      - linters: [errcheck]
+        text: 'Error return value of `.*\.Close` is not checked'
+      # errcheck — writes to report/log writers and best-effort
+      # parse/format helpers whose error cannot usefully be handled.
+      - linters: [errcheck]
+        text: 'Error return value of `(fmt\.Fprintf|fmt\.Fprintln|fmt\.Sscanf|io\.WriteString)` is not checked'
+      # errcheck — best-effort temp-file/socket cleanup on error
+      # paths; a failure there must not mask the real error.
+      - linters: [errcheck]
+        text: 'Error return value of `(os\.Remove|os\.RemoveAll|os\.WriteFile|unix\.Close)` is not checked'
+      # errcheck — tests deliberately ignore drain/close noise:
+      # <-done channel waits, listener Close, WriteFile fixtures.
+      - linters: [errcheck]
+        path: '_test\.go$'
+
+      # unused — every package keeps the logger() seam via logx.For
+      # for symmetry, even when nothing calls it yet (same one-liner
+      # in ~20 packages, e.g. hoststate, nebulasign).
+      - linters: [unused]
+        text: 'func logger is unused'
+      # unused — mapInt is pre-existing dead code in topology.go
+      # (sibling of the used mapString/mapBool helpers).
+      - linters: [unused]
+        text: 'func mapInt is unused'
+        path: internal/platform/topology/topology\.go
+
+      # staticcheck leftovers after -QF*: one simplification each in
+      # files owned by concurrent changes.
+      - linters: [staticcheck]
+        text: 'S1011'
+        path: internal/platform/watchdogconf/watchdogconf\.go
+      - linters: [staticcheck]
+        text: 'S1008'
+        path: internal/subsystem/hostconfig/group_nebula\.go
+      - linters: [staticcheck]
+        text: 'SA9003'
+        path: internal/platform/topology/topology_test\.go
+
+      # ineffassign — two pre-existing dead assignments in files
+      # owned by concurrent changes.
+      - linters: [ineffassign]
+        path: internal/subsystem/controllerhygiene/etcdguard\.go
+      - linters: [ineffassign]
+        path: internal/subsystem/nethealth/nebula_mtu_blackhole\.go
+
+formatters:
+  enable:
+    - gofmt

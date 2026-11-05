@@ -17,6 +17,9 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    env:
+      # committed go.work is for local dev; CI resolves deps per-module
+      GOWORK: off
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
