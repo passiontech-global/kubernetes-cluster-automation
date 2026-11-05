@@ -12,6 +12,12 @@
 //
 // While a latch stays held its mtime is refreshed (BUG-H6) so the
 // janitor's 24h reap can't retire an active signal.
+//
+// The subsystem role lives on Latches, a thin wrapper over the
+// Collector: the latch updaters share the collector's cfg + probe
+// seams (probeFS, psiAvg60, nebulaCertDaysLeft, the hoststate
+// Store), so the split keeps the same package — Latches reaches
+// them via l.c.
 package hostmetrics
 
 import (
@@ -22,22 +28,40 @@ import (
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// Latches is the agent.Subsystem half of hostmetrics — the
+// scrape-independent latch-maintenance ticker. The Collector keeps
+// the prometheus.Collector role; the split is in-package because the
+// latch updaters share its cfg and probe seams via l.c.
+type Latches struct{ c *Collector }
+
+// Latches returns the subsystem half of this Collector — the
+// latch-ticker Name/Run the agent loop drives. The Collector itself
+// stays a pure prometheus.Collector.
+func (c *Collector) Latches() *Latches { return &Latches{c: c} }
+
+// Collector returns the collector the latch runner wraps — the
+// wiring layer's standalone textfile writer needs it for
+// WriteTextfile.
+func (l *Latches) Collector() *Collector { return l.c }
+
 // Name identifies the subsystem for the agent loop.
-func (c *Collector) Name() string { return "hostmetrics" }
+func (l *Latches) Name() string { return "hostmetrics" }
 
 // Run drives the latch-maintenance ticker until ctx is cancelled.
-func (c *Collector) Run(ctx context.Context) {
-	cycle.Every("hostmetrics", c.cfg.LatchInterval,
-		func(context.Context) { c.refreshLatches() }).Run(ctx)
+func (l *Latches) Run(ctx context.Context) {
+	cycle.Every("hostmetrics", l.c.cfg.LatchInterval,
+		func(context.Context) { l.refreshLatches() }).Run(ctx)
 }
 
 // refreshLatches re-evaluates every file-contract latch once — the
 // same logic Collect runs per scrape, decoupled from scrapes
 // (BUG-H5). Each updater is already idempotent + hysteresis-safe.
-func (c *Collector) refreshLatches() {
+func (l *Latches) refreshLatches() {
+	c := l.c
 	if avg60, ok := c.psiAvg60(); ok {
 		c.updateOverloadLatch(avg60)
 	}
@@ -59,7 +83,7 @@ func (c *Collector) refreshLatches() {
 	c.updateFSReadonlyLatch(anyRO, probed)
 	// W8-KR3: kernel keyring quota pressure.
 	if ratio, ok := c.kernelKeysUsedRatio(); ok {
-		c.updateKernelKeysLatch(ratio)
+		l.updateKernelKeysLatch(ratio)
 	}
 	// W10-KR1: kernel dmesg/kmsg deep-error scan — filesystem/block
 	// errors, conntrack table-full drops, host-level OOM kills.
@@ -67,30 +91,30 @@ func (c *Collector) refreshLatches() {
 	// kmsg-host-oom-*) that the latches below and workerhygiene's
 	// SystemOOMVictim emitter consume. Ticker-only: a scrape-side
 	// drain would steal records from this loop.
-	c.checkKernelDmesg()
+	l.checkKernelDmesg()
 	// W10-KR2: pid/thread/fd utilization → state-pid-fd-pressure
 	// plus the node_agent_*_utilization_ratio textfile gauges.
-	c.updatePidFDPressure()
+	l.updatePidFDPressure()
 	// W10-KR5: chronyc/adjtimex clock-skew probe → state-clock-skew
 	// + rate-limited chronyc makestep.
-	c.checkClockSkew()
+	l.checkClockSkew()
 	// W10-ST1+KR1: the state-fs-readonly evidence latch — a fresh
 	// kernel fs error OR an ro ext4/xfs/btrfs mount under a PVC
 	// dir, ahead of statfs ever reporting ST_RDONLY.
-	c.updateFSReadonlyEvidence()
+	l.updateFSReadonlyEvidence()
 	// BUG-H6: while a latch stays held keep its mtime fresh so the
 	// janitor's LatchMaxAge reap can't retire an active signal.
 	for _, name := range []string{
-		"state-node-overloaded",
-		"state-filesystem-readonly",
-		"state-nebula-cert-expiring",
-		"state-kernel-keys-pressure",
+		hoststate.LatchNodeOverloaded,
+		hoststate.LatchFilesystemReadonly,
+		hoststate.LatchNebulaCertExpiring,
+		hoststate.LatchKernelKeysPressure,
 		// W10 maintained latches — same reap protection.
-		"state-fs-readonly",
-		"state-pid-fd-pressure",
-		"state-clock-skew",
+		hoststate.LatchFSReadonly,
+		hoststate.LatchPIDFDPressure,
+		hoststate.LatchClockSkew,
 	} {
-		p := filepath.Join(c.cfg.WatchdogStateDir, name)
+		p := c.state.Path(name)
 		if _, err := os.Stat(p); err == nil {
 			now := c.cfg.nowFn()
 			if cerr := os.Chtimes(p, now, now); cerr != nil {
@@ -141,12 +165,12 @@ func (c *Collector) kernelKeysUsedRatio() (float64, bool) {
 // updateKernelKeysLatch drives state-kernel-keys-pressure (W8-KR3):
 // set above 0.80 of the enforced quota — a full keyring fails
 // keyctl_join/add_key silently for new sessions.
-func (c *Collector) updateKernelKeysLatch(ratio float64) {
-	p := filepath.Join(c.cfg.WatchdogStateDir, "state-kernel-keys-pressure")
+func (l *Latches) updateKernelKeysLatch(ratio float64) {
+	p := l.c.state.Path(hoststate.LatchKernelKeysPressure)
 	_, err := os.Stat(p)
 	switch {
 	case ratio > kernelKeysPressureRatio && err != nil:
-		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
+		content := strconv.FormatInt(l.c.cfg.nowFn().Unix(), 10) + "\n"
 		tmp := filepath.Join(filepath.Dir(p), ".tmp-"+filepath.Base(p))
 		if werr := os.WriteFile(tmp, []byte(content), 0o644); werr != nil {
 			logger().Warn("hostmetrics: kernel-keys-pressure latch write failed",

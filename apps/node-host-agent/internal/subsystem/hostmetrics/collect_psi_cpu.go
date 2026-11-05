@@ -15,6 +15,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 const (
@@ -70,7 +72,7 @@ func (c *Collector) psiAvg60() (float64, bool) {
 // thresholds the current state persists. Written only on transition —
 // the file content is when the condition STARTED.
 func (c *Collector) updateOverloadLatch(avg60 float64) {
-	p := filepath.Join(c.cfg.WatchdogStateDir, "state-node-overloaded")
+	p := c.state.Path(hoststate.LatchNodeOverloaded)
 	_, err := os.Stat(p)
 	switch {
 	case avg60 >= psiOverloadedOn && err != nil:

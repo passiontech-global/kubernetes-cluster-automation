@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 const (
@@ -73,7 +75,7 @@ func (c *Collector) collectNebula(ch chan<- prometheus.Metric) {
 // gone cert cannot be "expiring").
 func (c *Collector) updateCertLatch(days int64, ok bool) {
 	dir := c.cfg.WatchdogStateDir
-	latch := filepath.Join(dir, "state-nebula-cert-expiring")
+	latch := c.state.Path(hoststate.LatchNebulaCertExpiring)
 	if !ok {
 		_ = os.Remove(latch)
 		_ = os.Remove(filepath.Join(dir, "nebula-cert-days-left"))

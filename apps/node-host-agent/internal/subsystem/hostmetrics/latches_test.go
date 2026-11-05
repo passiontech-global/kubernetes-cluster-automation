@@ -28,7 +28,7 @@ func TestKernelKeysUsedRatio(t *testing.T) {
 		t.Fatalf("ratio=%v want ~0.81", got)
 	}
 	// 0.81 > 0.80 → latch sets.
-	c.updateKernelKeysLatch(got)
+	c.Latches().updateKernelKeysLatch(got)
 	if _, err := os.Stat(filepath.Join(cfg.WatchdogStateDir,
 		"state-kernel-keys-pressure")); err != nil {
 		t.Fatal("kernel-keys-pressure latch missing")
@@ -38,7 +38,7 @@ func TestKernelKeysUsedRatio(t *testing.T) {
 func TestRefreshLatchesWritesFiles(t *testing.T) {
 	cfg, _ := fixture(t)
 	c := New(cfg)
-	c.refreshLatches()
+	c.Latches().refreshLatches()
 	// A healthy fixture clears/latches nothing fatal — the point is
 	// the loop runs every contract file without panic.
 }

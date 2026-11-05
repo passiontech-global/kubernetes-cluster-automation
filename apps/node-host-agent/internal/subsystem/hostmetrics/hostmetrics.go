@@ -552,7 +552,8 @@ type Collector struct {
 	lpvBytes map[string]int64
 }
 
-// New returns the Collector. Register it on the agent's registry.
+// New returns the Collector. Register it on the agent's registry,
+// and wire its Latches() half in as the latch-ticker subsystem.
 func New(cfg Config) *Collector {
 	cfg.applyDefaults()
 	c := &Collector{cfg: cfg, seenStates: map[string]time.Time{},
