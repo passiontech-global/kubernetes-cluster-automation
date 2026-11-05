@@ -1098,6 +1098,34 @@ func gatewayObjectStuck(o *unstructured.Unstructured) bool {
 	return maxOG < o.GetGeneration()
 }
 
+// gatewayClassStuck is the signature for the GatewayClass kind
+// itself: the class carries no top-level status.observedGeneration —
+// the serving controller reports the last reconciled generation only
+// inside status.conditions[type=Accepted].observedGeneration. No
+// conditions, or none of them an Accepted entry, means the class was
+// never picked up; an Accepted observedGeneration lagging
+// metadata.generation means the last spec write was never seen. The
+// Accepted status value (True/False) is irrelevant — a fresh
+// rejection still proves the controller read the object.
+func gatewayClassStuck(o *unstructured.Unstructured) bool {
+	conds, found, _ := unstructured.NestedSlice(o.Object, "status", "conditions")
+	if !found || len(conds) == 0 {
+		return true
+	}
+	for _, c := range conds {
+		m, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _, _ := unstructured.NestedString(m, "type"); t != "Accepted" {
+			continue
+		}
+		og, _, _ := unstructured.NestedInt64(m, "observedGeneration")
+		return og < o.GetGeneration()
+	}
+	return true
+}
+
 // gatewayClassController resolves a GatewayClass name to its
 // spec.controllerName, caching the class set for a minute so a
 // stuck-object sweep doesn't LIST per object. ok=false means the
@@ -1142,6 +1170,17 @@ func ciliumOwnsGatewayObject(ctx context.Context, p *clusterHealthProber,
 		return true
 	}
 	return ctlr == ciliumGatewayController
+}
+
+// ciliumOwnsGatewayClass attributes a GatewayClass to cilium
+// directly — spec.controllerName sits on the object itself, so no
+// lookup is needed. An absent controllerName keeps the object (a
+// malformed class cannot disprove ownership, same rule as the other
+// gateway-API filters); a PROVEN foreign controller drops it.
+func ciliumOwnsGatewayClass(_ context.Context, _ *clusterHealthProber,
+	o *unstructured.Unstructured) bool {
+	ctlr, _, _ := unstructured.NestedString(o.Object, "spec", "controllerName")
+	return ctlr == "" || ctlr == ciliumGatewayController
 }
 
 // ciliumOwnsRouteParent is the same filter for the route kinds: it
@@ -1210,6 +1249,11 @@ var operatorTargets = []operatorTarget{
 		podSelector: "io.cilium/app=operator",
 		stuckMinAge: ciliumStuckMinAge,
 		resources: []opStuckResource{
+			// GatewayClass has no top-level status.observedGeneration
+			// — the serving controller stamps the reconciled
+			// generation inside conditions[type=Accepted] only.
+			{gvr: gwv1("gatewayclasses"), reason: opReasonStaleGWStatus,
+				stuck: gatewayClassStuck, owns: ciliumOwnsGatewayClass},
 			{gvr: gwv1("gateways"), reason: opReasonStaleGWStatus,
 				stuck: gatewayObjectStuck, owns: ciliumOwnsGatewayObject},
 			{gvr: gwv1("httproutes"), reason: opReasonStaleGWStatus,

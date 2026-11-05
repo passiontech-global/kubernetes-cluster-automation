@@ -22,6 +22,7 @@
 package clusterhealthprobes
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -42,10 +43,17 @@ import (
 const foreignGatewayController = "cf.k8s.lex.la/tunnel-controller"
 
 // gwClassFixture builds a GatewayClass fixture carrying a
-// spec.controllerName — the ownership key the owns filters resolve.
+// spec.controllerName — the ownership key the owns filters resolve —
+// plus a healthy status.conditions[Accepted] stamped at the object's
+// generation: gatewayclasses is a watched resource too, so a
+// conditionless class would read as never-accepted and pollute
+// opFirstSeen inside the operator sweep tests.
 func gwClassFixture(name, controller string) *unstructured.Unstructured {
 	obj := shUnstructured("gateway.networking.k8s.io/v1", "GatewayClass", "", name, 1, 0)
 	_ = unstructured.SetNestedField(obj.Object, controller, "spec", "controllerName")
+	_ = unstructured.SetNestedSlice(obj.Object, []any{map[string]any{
+		"type": "Accepted", "status": "True", "observedGeneration": int64(1)}},
+		"status", "conditions")
 	return obj
 }
 
@@ -385,6 +393,116 @@ func TestCiliumOwnsRouteParent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// gatewayClassStuck — the GatewayClass-kind signature
+// ---------------------------------------------------------------------------
+
+// The class kind carries no top-level status.observedGeneration: the
+// serving controller reports the last reconciled generation inside
+// status.conditions[type=Accepted].observedGeneration. No Accepted
+// entry means never picked up; a lagging one means the last spec
+// write was never seen.
+func TestGatewayClassStuck(t *testing.T) {
+	accepted := func(og int64, status string) map[string]any {
+		return map[string]any{
+			"type": "Accepted", "status": status, "observedGeneration": og}
+	}
+
+	// Never accepted → the controller never picked the class up.
+	bare := gwClassFixtureBare("cilium", ciliumGatewayController, 1)
+	if !gatewayClassStuck(bare) {
+		t.Fatal("GatewayClass without status.conditions must read as stuck")
+	}
+
+	// Accepted at the current generation → healthy.
+	fresh := gwClassFixtureBare("cilium", ciliumGatewayController, 3)
+	_ = unstructured.SetNestedSlice(fresh.Object,
+		[]any{accepted(int64(3), "True")}, "status", "conditions")
+	if gatewayClassStuck(fresh) {
+		t.Fatal("Accepted at the current generation must not read as stuck")
+	}
+
+	// Accepted once but behind the last spec write (gen 5) → stuck.
+	stale := gwClassFixtureBare("cilium", ciliumGatewayController, 5)
+	_ = unstructured.SetNestedSlice(stale.Object,
+		[]any{accepted(int64(4), "True")}, "status", "conditions")
+	if !gatewayClassStuck(stale) {
+		t.Fatal("Accepted og 4 behind generation 5 must read as stuck")
+	}
+
+	// The Accepted VALUE is irrelevant — a fresh False verdict still
+	// proves the controller read the current generation.
+	rejected := gwClassFixtureBare("cilium", ciliumGatewayController, 2)
+	_ = unstructured.SetNestedSlice(rejected.Object,
+		[]any{accepted(int64(2), "False")}, "status", "conditions")
+	if gatewayClassStuck(rejected) {
+		t.Fatal("Accepted=False at the current generation must not read as stuck")
+	}
+
+	// Conditions exist but none of them is Accepted → never
+	// accepted (other condition types prove nothing on their own).
+	noAccepted := gwClassFixtureBare("cilium", ciliumGatewayController, 2)
+	_ = unstructured.SetNestedSlice(noAccepted.Object, []any{map[string]any{
+		"type": "SupportedVersion", "status": "True", "observedGeneration": int64(2)}},
+		"status", "conditions")
+	if !gatewayClassStuck(noAccepted) {
+		t.Fatal("conditions without an Accepted entry must read as stuck")
+	}
+
+	// An Accepted entry with no observedGeneration field reports no
+	// generation signal — reads as 0 < generation → stuck.
+	noOG := gwClassFixtureBare("cilium", ciliumGatewayController, 1)
+	_ = unstructured.SetNestedSlice(noOG.Object, []any{map[string]any{
+		"type": "Accepted", "status": "True"}},
+		"status", "conditions")
+	if !gatewayClassStuck(noOG) {
+		t.Fatal("Accepted without observedGeneration must read as stuck")
+	}
+
+	// Malformed entries are skipped without poisoning the verdict:
+	// the real Accepted condition still decides.
+	mixed := gwClassFixtureBare("cilium", ciliumGatewayController, 2)
+	_ = unstructured.SetNestedSlice(mixed.Object, []any{
+		"not-a-map",
+		accepted(int64(2), "True"),
+	}, "status", "conditions")
+	if gatewayClassStuck(mixed) {
+		t.Fatal("non-map entries must not poison a fresh Accepted verdict")
+	}
+}
+
+// gwClassFixtureBare is gwClassFixture without the status half — the
+// building block for gatewayClassStuck cases that shape their own
+// conditions. Generation is set explicitly (a real class bumps it on
+// every spec write).
+func gwClassFixtureBare(name, controller string, gen int64) *unstructured.Unstructured {
+	obj := shUnstructured("gateway.networking.k8s.io/v1", "GatewayClass", "", name, gen, 0)
+	_ = unstructured.SetNestedField(obj.Object, controller, "spec", "controllerName")
+	return obj
+}
+
+// ---------------------------------------------------------------------------
+// ciliumOwnsGatewayClass — direct controllerName attribution
+// ---------------------------------------------------------------------------
+
+// The class object carries its own spec.controllerName — no lookup.
+// Only a PROVEN foreign controller drops it from cilium's stuck set;
+// an absent controllerName cannot disprove ownership.
+func TestCiliumOwnsGatewayClass(t *testing.T) {
+	p := newGatewayClassAwareProber()
+	if !ciliumOwnsGatewayClass(ctx, p,
+		gwClassFixtureBare("cilium", ciliumGatewayController, 1)) {
+		t.Fatal("cilium-controller class must be owned by cilium-operator")
+	}
+	if ciliumOwnsGatewayClass(ctx, p,
+		gwClassFixtureBare("cloudflare-tunnel", foreignGatewayController, 1)) {
+		t.Fatal("foreign-controller class must NOT be owned by cilium-operator")
+	}
+	if !ciliumOwnsGatewayClass(ctx, p, gwClassFixtureBare("orphan", "", 1)) {
+		t.Fatal("absent controllerName must keep the class (cannot disprove)")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // gatewayClassController — class list caching
 // ---------------------------------------------------------------------------
 
@@ -483,5 +601,97 @@ func TestCheckOperatorWorkqueuesCiliumGatewayTracked(t *testing.T) {
 	want := "cilium-operator/httproutes/apps/r-cilium"
 	if _, ok := p.opFirstSeen[want]; !ok {
 		t.Fatalf("cilium-owned stuck route not tracked under %q: %v", want, p.opFirstSeen)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// checkOperatorWorkqueues — the gatewayclasses entry end-to-end
+// ---------------------------------------------------------------------------
+
+// A never-accepted GatewayClass served by cilium's controller is
+// tracked under "cilium-operator/gatewayclasses//<name>" — while the
+// same never-accepted class owned by a foreign controller must NOT
+// enter the stuck set: proven foreign ownership applies to the class
+// kind exactly as it does to Gateways and routes.
+func TestCheckOperatorWorkqueuesGatewayClassOwnership(t *testing.T) {
+	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+	t.Cleanup(func() {
+		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+	})
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		shLease("kube-system", "cilium-operator-resource-lock",
+			"cilium-operator-aa_uid", 2*time.Second, base))
+	dyn := testutil.NewFakeDyn(gatewayDynKinds(),
+		// Never accepted (no status.conditions) — stuck by signature.
+		gwClassFixtureBare("cilium", ciliumGatewayController, 1),
+		gwClassFixtureBare("cloudflare-tunnel", foreignGatewayController, 1))
+	p := testProberDyn(cs, dyn)
+	p.now = func() time.Time { return base }
+
+	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
+		t.Fatalf("first-seen signature must pass: %+v", res)
+	}
+	if _, ok := p.opFirstSeen["cilium-operator/gatewayclasses//cilium"]; !ok {
+		t.Fatalf("never-accepted cilium class not tracked: %v", p.opFirstSeen)
+	}
+	for k := range p.opFirstSeen {
+		if strings.Contains(k, "cloudflare-tunnel") {
+			t.Fatalf("foreign-owned class entered cilium's stuck set: %s", k)
+		}
+	}
+}
+
+// The genuinely-stale case: a cilium class whose Accepted condition
+// still reports an older generation past the stuck window freezes the
+// check and lifts the stale_gateway_status gauge — the real signal
+// the signature exists for.
+func TestCheckOperatorWorkqueuesGatewayClassStaleFreezes(t *testing.T) {
+	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+	t.Cleanup(func() {
+		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+	})
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		shLease("kube-system", "cilium-operator-resource-lock",
+			"cilium-operator-aa_uid", 2*time.Second, base))
+	stale := gwClassFixtureBare("cilium", ciliumGatewayController, 5)
+	_ = unstructured.SetNestedSlice(stale.Object, []any{map[string]any{
+		"type": "Accepted", "status": "True", "observedGeneration": int64(4)}},
+		"status", "conditions")
+	dyn := testutil.NewFakeDyn(gatewayDynKinds(), stale)
+	p := testProberDyn(cs, dyn)
+	p.now = func() time.Time { return base }
+	p.opFirstSeen["cilium-operator/gatewayclasses//cilium"] = base.Add(-time.Hour)
+
+	if res := p.checkOperatorWorkqueues(ctx); res.pass {
+		t.Fatal("stale cilium GatewayClass past the window must FAIL")
+	}
+	if v, _ := shOpFrozenGauge(t, "cilium-operator", opReasonStaleGWStatus); v != 1 {
+		t.Fatalf("frozen gauge = %v, want 1", v)
+	}
+}
+
+// The healthy mirror: a class Accepted at its current generation is
+// not even tracked — no first-seen, no gauge.
+func TestCheckOperatorWorkqueuesGatewayClassHealthyQuiet(t *testing.T) {
+	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+	t.Cleanup(func() {
+		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+	})
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		shLease("kube-system", "cilium-operator-resource-lock",
+			"cilium-operator-aa_uid", 2*time.Second, base))
+	dyn := testutil.NewFakeDyn(gatewayDynKinds(),
+		gwClassFixture("cilium", ciliumGatewayController))
+	p := testProberDyn(cs, dyn)
+	p.now = func() time.Time { return base }
+
+	if res := p.checkOperatorWorkqueues(ctx); !res.pass {
+		t.Fatalf("healthy accepted class must keep the check quiet: %+v", res)
+	}
+	for k := range p.opFirstSeen {
+		t.Fatalf("healthy class entered the stuck set: %s", k)
 	}
 }
