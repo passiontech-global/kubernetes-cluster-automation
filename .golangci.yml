@@ -20,6 +20,7 @@ linters:
 
   enable:
     - copyloopvar     # unneeded loop-var copies (pre-1.22 idiom)
+    - depguard        # import-layer rules (see settings.depguard)
     - misspell        # comment/doc typos
     - nilerr          # `if err != nil { return nil }` swallows errors
     - perfsprint      # faster drop-ins for fmt.Sprintf & friends
@@ -27,6 +28,49 @@ linters:
     - usestdlibvars   # http.MethodGet etc. instead of string literals
 
   settings:
+    depguard:
+      # Enforces apps/node-host-agent's layering. Empirically, the
+      # paths depguard matches `files` against are ABSOLUTE under
+      # `golangci-lint run ./...` and `./internal/...`-prefixed under
+      # `run ./internal/...` — so the globs use a leading `**/` to
+      # cover every form. App scoping comes from the deny `pkg`
+      # prefixes, which carry the node-host-agent module path (the
+      # other apps have no internal/platform|internal/agent layout
+      # anyway). The two real invariants (see
+      # apps/node-host-agent/AGENTS.md):
+      #   - internal/platform/** is the leaf layer (envx, logx,
+      #     hoststate, systemd, ...): it must never import the
+      #     runtime or domain layers above it.
+      #   - internal/agent/** is the runtime (metrics/probe servers +
+      #     subsystem supervisor): it must not import the domain
+      #     layers either — subsystems get wired in cmd/agent.
+      # Deliberately NOT denied: internal/subsystem <-> internal/ops
+      # cross-imports are the documented two-way convention (domain
+      # logic usable by both a periodic subsystem and a one-shot op
+      # lives in the lower layer, e.g. ops/kinecheckdb wraps
+      # subsystem/kinedb), and cmd/agent may import anything.
+      # deny `pkg` is a string prefix — `.../internal/subsystem`
+      # covers every .../internal/subsystem/* package too.
+      rules:
+        nha-platform-is-leaf:
+          files:
+            - "**/internal/platform/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem"
+              desc: "internal/platform is the leaf layer; subsystem must not be imported from it (push shared logic down into platform)"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
+              desc: "internal/platform is the leaf layer; the agent runtime must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops"
+              desc: "internal/platform is the leaf layer; ops must not be imported from it (push shared logic down into platform)"
+        nha-agent-no-domain:
+          files:
+            - "**/internal/agent/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem"
+              desc: "internal/agent is the runtime layer; subsystems are wired in cmd/agent, not imported here"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops"
+              desc: "internal/agent is the runtime layer; ops are wired in cmd/agent, not imported here"
+
     staticcheck:
       # -QF*: quick-fix style suggestions (De Morgan's law, tagged
       #   switches, WriteString(Sprintf) → Fprintf).
