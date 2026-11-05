@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestNebulaHealthy(t *testing.T) {
@@ -17,22 +18,22 @@ func TestNebulaHealthy(t *testing.T) {
 	if stateExists(e, "nebula-isolated") || stateExists(e, "nebula-degraded") {
 		t.Fatal("false latch on healthy nebula")
 	}
-	if e.sdRan("restart nebula") {
+	if e.sd.Ran("restart nebula") {
 		t.Fatal("restart on healthy nebula")
 	}
 }
 
 func TestNebulaNoSocketRestart(t *testing.T) {
 	e := nebulaEnv(t, nil)
-	writeFile(t, e.procudp, "  sl  local_address rem_address   st\n"+
+	testutil.WriteFile(t, e.procudp, "  sl  local_address rem_address   st\n"+
 		"  1: 0100007F:0050 00000000:0000 07\n") // no :B9B6 (45670)
 	e.n.Cycle(context.Background())
-	if e.sdRan("restart nebula") {
+	if e.sd.Ran("restart nebula") {
 		t.Fatal("restart before ConsecNeeded")
 	}
 	e.n.Cycle(context.Background())
-	if !e.sdRan("restart nebula@interdc") {
-		t.Fatalf("nebula not restarted, cmds=%v", e.sdcmds)
+	if !e.sd.Ran("restart nebula@interdc") {
+		t.Fatalf("nebula not restarted, cmds=%v", e.sd.Cmds())
 	}
 	if _, err := os.Stat(filepath.Join(e.state, "last-nebula-restart")); err != nil {
 		t.Fatal("budget not spent")
@@ -49,7 +50,7 @@ func TestNebulaDataplaneDeadIsolates(t *testing.T) {
 		t.Fatal("isolated latch missing on dataplane dead")
 	}
 	e.n.Cycle(context.Background())
-	if !e.sdRan("restart nebula@interdc") {
+	if !e.sd.Ran("restart nebula@interdc") {
 		t.Fatal("no restart on persistent dataplane dead")
 	}
 }
@@ -74,15 +75,15 @@ func TestNebulaDegradedLatch(t *testing.T) {
 	if stateExists(e, "nebula-isolated") {
 		t.Fatal("isolated latch on partial loss")
 	}
-	if e.sdRan("restart nebula") {
+	if e.sd.Ran("restart nebula") {
 		t.Fatal("degraded is not a restart reason")
 	}
 }
 
 func TestNebulaNotActiveCleansStates(t *testing.T) {
 	e := nebulaEnv(t, nil)
-	e.sdReply["is-active nebula@interdc"] = "inactive\n"
-	writeFile(t, filepath.Join(e.state, "state-nebula-isolated"), "1\n")
+	e.sd.On("is-active nebula@interdc", "inactive\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "state-nebula-isolated"), "1\n")
 	e.n.Cycle(context.Background())
 	if stateExists(e, "nebula-isolated") {
 		t.Fatal("nebula state kept while inactive")
@@ -102,7 +103,7 @@ func TestNebulaOverlayTincSkipsDataplane(t *testing.T) {
 	if stateExists(e, "nebula-isolated") || stateExists(e, "nebula-degraded") {
 		t.Fatal("dataplane latch while tinc is active overlay")
 	}
-	if e.sdRan("restart nebula") {
+	if e.sd.Ran("restart nebula") {
 		t.Fatal("restart while only dataplane evidence (asymmetric probe)")
 	}
 }

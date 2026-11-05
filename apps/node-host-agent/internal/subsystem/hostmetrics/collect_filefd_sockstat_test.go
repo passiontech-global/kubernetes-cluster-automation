@@ -3,6 +3,7 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"math"
 	"testing"
 )
@@ -11,7 +12,7 @@ import (
 
 func TestFileFDMetrics(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.FileNRFile, "12345\t0\t9999999\n")
+	testutil.WriteFile(t, cfg.FileNRFile, "12345\t0\t9999999\n")
 	c := New(cfg)
 	node := map[string]string{"node": "node-a"}
 	if v, ok := metricValue(t, c, "node_host_agent_filefd_allocated",
@@ -48,7 +49,7 @@ func TestFileFDAbsentOnMissingOrMalformed(t *testing.T) {
 		"abc\t0\tdef\n",   // non-numeric
 		"12345\t0\tmax\n", // non-numeric max
 	} {
-		write(t, cfg.FileNRFile, content)
+		testutil.WriteFile(t, cfg.FileNRFile, content)
 		for _, name := range names {
 			if _, ok := metricValue(t, c, name, node); ok {
 				t.Fatalf("%s emitted for malformed %q", name, content)
@@ -59,7 +60,7 @@ func TestFileFDAbsentOnMissingOrMalformed(t *testing.T) {
 
 func TestFileFDZeroMaxSkipsRatio(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.FileNRFile, "10\t0\t0\n")
+	testutil.WriteFile(t, cfg.FileNRFile, "10\t0\t0\n")
 	c := New(cfg)
 	node := map[string]string{"node": "node-a"}
 	if v, ok := metricValue(t, c, "node_host_agent_filefd_maximum",
@@ -74,7 +75,7 @@ func TestFileFDZeroMaxSkipsRatio(t *testing.T) {
 
 func TestSockstatMetrics(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.SockstatFile,
+	testutil.WriteFile(t, cfg.SockstatFile,
 		"sockets: used 1847\n"+
 			"TCP: inuse 25 orphan 2 tw 4 alloc 1200 mem 456\n"+
 			"UDP: inuse 10 mem 20\n"+
@@ -116,7 +117,7 @@ func TestSockstatMissingAndMalformedSections(t *testing.T) {
 	cfg, _ := fixture(t)
 	// No TCP line at all — sockets_used still emits, the TCP series
 	// stay absent rather than guessing 0.
-	write(t, cfg.SockstatFile, "sockets: used 99\nUDP: inuse 3\n")
+	testutil.WriteFile(t, cfg.SockstatFile, "sockets: used 99\nUDP: inuse 3\n")
 	c := New(cfg)
 	node := map[string]string{"node": "node-a"}
 	if v, ok := metricValue(t, c, "node_host_agent_sockstat_sockets_used",
@@ -130,7 +131,7 @@ func TestSockstatMissingAndMalformedSections(t *testing.T) {
 
 	// A malformed TCP line (odd field count / non-numeric value)
 	// is skipped entirely — never emit junk.
-	write(t, cfg.SockstatFile,
+	testutil.WriteFile(t, cfg.SockstatFile,
 		"sockets: used 99\nTCP: inuse five orphan 0\nTCP: dangling\n")
 	for _, name := range []string{
 		"node_host_agent_sockstat_tcp_inuse",

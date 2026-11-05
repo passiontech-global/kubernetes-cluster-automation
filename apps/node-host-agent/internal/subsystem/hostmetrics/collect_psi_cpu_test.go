@@ -3,6 +3,7 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,7 +17,7 @@ func TestPSIGaugeAndOverloadLatch(t *testing.T) {
 	cfg.PSIFile = filepath.Join(t.TempDir(), "cpu")
 	c := New(cfg)
 
-	write(t, cfg.PSIFile, "some avg10=10.00 avg60=45.50 avg300=20.00 total=123\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+	testutil.WriteFile(t, cfg.PSIFile, "some avg10=10.00 avg60=45.50 avg300=20.00 total=123\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
 	v, ok := metricValue(t, c, "node_watchdog_psi_cpu_some_avg60", map[string]string{})
 	if !ok || v != 45.5 {
 		t.Fatalf("psi=%v,%v want 45.5", v, ok)
@@ -26,13 +27,13 @@ func TestPSIGaugeAndOverloadLatch(t *testing.T) {
 		t.Fatalf("overload latch not created at avg60>=40: %v", err)
 	}
 	// Hysteresis: 30% is between 40/25 — latch persists.
-	write(t, cfg.PSIFile, "some avg10=5.00 avg60=30.00 avg300=10.00 total=9\n")
+	testutil.WriteFile(t, cfg.PSIFile, "some avg10=5.00 avg60=30.00 avg300=10.00 total=9\n")
 	metricValue(t, c, "node_watchdog_psi_cpu_some_avg60", map[string]string{})
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatal("latch dropped inside hysteresis band")
 	}
 	// Below 25 → released.
-	write(t, cfg.PSIFile, "some avg10=1.00 avg60=20.00 avg300=5.00 total=4\n")
+	testutil.WriteFile(t, cfg.PSIFile, "some avg10=1.00 avg60=20.00 avg300=5.00 total=4\n")
 	metricValue(t, c, "node_watchdog_psi_cpu_some_avg60", map[string]string{})
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("latch kept below the 25% release threshold")
@@ -43,7 +44,7 @@ func TestPSIUnreadableKeepsLatch(t *testing.T) {
 	cfg, dirs := fixture(t)
 	cfg.PSIFile = filepath.Join(t.TempDir(), "missing")
 	latch := filepath.Join(dirs["state"], "state-node-overloaded")
-	write(t, latch, "1\n")
+	testutil.WriteFile(t, latch, "1\n")
 	c := New(cfg)
 	if _, ok := metricValue(t, c, "node_watchdog_psi_cpu_some_avg60",
 		map[string]string{}); ok {

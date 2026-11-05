@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 type testClock struct{ now time.Time }
@@ -22,28 +24,19 @@ func newTestStore(t *testing.T) (*Store, *testClock, string) {
 	return s, clk, logFile
 }
 
-func readFile(t *testing.T, path string) string {
-	t.Helper()
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	return string(b)
-}
-
 func TestEnterCreatesLatchAndLogs(t *testing.T) {
 	s, clk, logFile := newTestStore(t)
 
 	s.Enter("kubelet-stall", "sig1")
 
 	p := s.Path("kubelet-stall")
-	if got := readFile(t, p); got != "1700000000\n" {
+	if got := testutil.ReadFile(t, p); got != "1700000000\n" {
 		t.Fatalf("latch content = %q", got)
 	}
 	if !s.Exists("kubelet-stall") {
 		t.Fatal("Exists false after Enter")
 	}
-	log := readFile(t, logFile)
+	log := testutil.ReadFile(t, logFile)
 	if !strings.Contains(log, "STATE-ENTER: kubelet-stall sig1") {
 		t.Fatalf("log missing STATE-ENTER: %q", log)
 	}
@@ -57,7 +50,7 @@ func TestEnterRefreshesMtimeNotContent(t *testing.T) {
 
 	s.Enter("overloaded", "")
 	p := s.Path("overloaded")
-	first := readFile(t, p)
+	first := testutil.ReadFile(t, p)
 
 	// Advance the clock; a held latch keeps its ORIGINAL epoch
 	// content but gets its mtime refreshed to the clock (BUG-H6 —
@@ -65,7 +58,7 @@ func TestEnterRefreshesMtimeNotContent(t *testing.T) {
 	clk.now = clk.now.Add(time.Hour)
 	s.Enter("overloaded", "")
 
-	if got := readFile(t, p); got != first {
+	if got := testutil.ReadFile(t, p); got != first {
 		t.Fatalf("latch content changed on re-enter: %q → %q", first, got)
 	}
 	after, _ := os.Stat(p)
@@ -87,7 +80,7 @@ func TestExitRemovesAndLogs(t *testing.T) {
 	if !cleaned {
 		t.Fatal("cleanup hook not run")
 	}
-	if !strings.Contains(readFile(t, logFile), "STATE-EXIT: stall") {
+	if !strings.Contains(testutil.ReadFile(t, logFile), "STATE-EXIT: stall") {
 		t.Fatal("log missing STATE-EXIT")
 	}
 }
@@ -171,15 +164,15 @@ func TestSuspectLogThrottles(t *testing.T) {
 
 	s.SuspectLog("k", "first", time.Hour)
 	s.SuspectLog("k", "second", time.Hour)
-	if n := strings.Count(readFile(t, logFile), "first"); n != 1 {
+	if n := strings.Count(testutil.ReadFile(t, logFile), "first"); n != 1 {
 		t.Fatalf("first logged %d times", n)
 	}
-	if strings.Contains(readFile(t, logFile), "second") {
+	if strings.Contains(testutil.ReadFile(t, logFile), "second") {
 		t.Fatal("throttled line leaked into log")
 	}
 	clk.now = clk.now.Add(61 * time.Minute)
 	s.SuspectLog("k", "third", time.Hour)
-	if !strings.Contains(readFile(t, logFile), "third") {
+	if !strings.Contains(testutil.ReadFile(t, logFile), "third") {
 		t.Fatal("cadence-expired reminder missing")
 	}
 }
@@ -190,17 +183,17 @@ func TestHeartbeatSeedsAndRefreshes(t *testing.T) {
 	s.Heartbeat()
 	installed := filepath.Join(s.Dir, "installed")
 	lastRun := filepath.Join(s.Dir, "last-run")
-	if readFile(t, installed) != "1700000000\n" {
+	if testutil.ReadFile(t, installed) != "1700000000\n" {
 		t.Fatal("installed not seeded")
 	}
 
 	// last-run refreshes every call; installed keeps baseline.
 	clk.now = clk.now.Add(time.Hour)
 	s.Heartbeat()
-	if readFile(t, lastRun) != strconv.FormatInt(clk.now.Unix(), 10)+"\n" {
+	if testutil.ReadFile(t, lastRun) != strconv.FormatInt(clk.now.Unix(), 10)+"\n" {
 		t.Fatal("last-run not refreshed")
 	}
-	if readFile(t, installed) != "1700000000\n" {
+	if testutil.ReadFile(t, installed) != "1700000000\n" {
 		t.Fatal("installed baseline moved")
 	}
 }

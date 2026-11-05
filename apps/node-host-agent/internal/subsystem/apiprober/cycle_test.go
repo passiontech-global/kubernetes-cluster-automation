@@ -12,9 +12,10 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestFrozenWedgeDisables(t *testing.T) {
@@ -37,13 +38,13 @@ func TestFrozenWedgeDisables(t *testing.T) {
 	if !hasCmd(ha.commands(), "disable server kube_apiserver/hub1") {
 		t.Fatalf("no disable command sent, cmds=%v", ha.commands())
 	}
-	if got := testutil.ToFloat64(p.enabled.WithLabelValues("hub1")); got != 0 {
+	if got := promtest.ToFloat64(p.enabled.WithLabelValues("hub1")); got != 0 {
 		t.Fatalf("enabled{hub1}=%v want 0", got)
 	}
-	if got := testutil.ToFloat64(p.enabled.WithLabelValues("hub2")); got != 1 {
+	if got := promtest.ToFloat64(p.enabled.WithLabelValues("hub2")); got != 1 {
 		t.Fatalf("enabled{hub2}=%v want 1", got)
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 1 {
 		t.Fatalf("actions disable=%v want 1", got)
 	}
 }
@@ -87,7 +88,7 @@ func TestQueryFailDeadDisables(t *testing.T) {
 	if !hasCmd(ha.commands(), "disable server kube_apiserver/hub1") {
 		t.Fatalf("no disable for dead backend, cmds=%v", ha.commands())
 	}
-	if got := testutil.ToFloat64(p.probeFailures.WithLabelValues("hub1", "query")); got < 2 {
+	if got := promtest.ToFloat64(p.probeFailures.WithLabelValues("hub1", "query")); got < 2 {
 		t.Fatalf("query probe failures=%v want >=2", got)
 	}
 }
@@ -120,7 +121,7 @@ func TestFenceKeepsLastUsableBackend(t *testing.T) {
 	if hasCmd(ha.commands(), "disable server kube_apiserver/hub2") {
 		t.Fatalf("last usable backend disabled: %v", ha.commands())
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub2", "fence_skip")); got < 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub2", "fence_skip")); got < 1 {
 		t.Fatalf("fence_skip=%v want >=1", got)
 	}
 }
@@ -164,7 +165,7 @@ func TestTCPUnreachableSkipped(t *testing.T) {
 	if hasCmd(ha.commands(), "disable server kube_apiserver/hub1") {
 		t.Fatalf("unreachable backend got disabled: %v", ha.commands())
 	}
-	if got := testutil.ToFloat64(p.probeFailures.WithLabelValues("hub1", "tcp")); got != 3 {
+	if got := promtest.ToFloat64(p.probeFailures.WithLabelValues("hub1", "tcp")); got != 3 {
 		t.Fatalf("tcp probe failures=%v want 3", got)
 	}
 }
@@ -197,7 +198,7 @@ func TestRecoveryReEnables(t *testing.T) {
 	// (the cycle that issues enable still sees MAINT).
 	bad.set(400, 300)
 	p.Cycle(context.Background())
-	if got := testutil.ToFloat64(p.enabled.WithLabelValues("hub1")); got != 1 {
+	if got := promtest.ToFloat64(p.enabled.WithLabelValues("hub1")); got != 1 {
 		t.Fatalf("enabled{hub1}=%v want 1 after recovery", got)
 	}
 }
@@ -222,7 +223,7 @@ func TestDryRunTakesNoAction(t *testing.T) {
 			t.Fatalf("dry-run issued socket action: %v", ha.commands())
 		}
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "dryrun_disable")); got != 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub1", "dryrun_disable")); got != 1 {
 		t.Fatalf("dryrun_disable=%v want 1", got)
 	}
 }
@@ -236,7 +237,7 @@ func TestRVGapMetric(t *testing.T) {
 	p := fixture(t, ha, ModeDryRun, map[string]bool{"127.0.0.1:1": false})
 	b.set(100, 900)
 	p.Cycle(context.Background())
-	if got := testutil.ToFloat64(p.rvGap.WithLabelValues("hub1")); got != 800 {
+	if got := promtest.ToFloat64(p.rvGap.WithLabelValues("hub1")); got != 800 {
 		t.Fatalf("rvGap=%v want 800", got)
 	}
 }
@@ -266,7 +267,7 @@ func TestVIPBackendFollowsDirectControllerState(t *testing.T) {
 	if !hasCmd(ha.commands(), "disable server kube_apiserver/api_datahub_lb") {
 		t.Fatalf("expected api_datahub_lb disable alongside wedged ctrl, cmds=%v", ha.commands())
 	}
-	if got := testutil.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 0 {
+	if got := promtest.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 0 {
 		t.Fatalf("enabled{api_datahub_lb}=%v want 0", got)
 	}
 
@@ -283,7 +284,7 @@ func TestVIPBackendFollowsDirectControllerState(t *testing.T) {
 		t.Fatalf("expected api_datahub_lb enable after ctrl recovery, cmds=%v", ha.commands())
 	}
 	p.Cycle(context.Background())
-	if got := testutil.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 1 {
+	if got := promtest.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 1 {
 		t.Fatalf("enabled{api_datahub_lb}=%v want 1", got)
 	}
 }
@@ -365,10 +366,10 @@ func TestEnableFailureKeepsDrained(t *testing.T) {
 	if !p.states["hub1"].drained {
 		t.Fatal("drained flag cleared despite failed enable")
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "enable")); got != 0 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub1", "enable")); got != 0 {
 		t.Fatalf("actions enable=%v want 0 (all enables failed)", got)
 	}
-	if got := testutil.ToFloat64(p.enabled.WithLabelValues("hub1")); got != 0 {
+	if got := promtest.ToFloat64(p.enabled.WithLabelValues("hub1")); got != 0 {
 		t.Fatalf("enabled{hub1}=%v want 0", got)
 	}
 }
@@ -395,7 +396,7 @@ func TestExternalMaintBackendRecoversToEnable(t *testing.T) {
 	if !hasCmd(ha.commands(), "enable server kube_apiserver/hub1") {
 		t.Fatalf("no enable for MAINT backend, cmds=%v", ha.commands())
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "enable")); got != 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub1", "enable")); got != 1 {
 		t.Fatalf("actions enable=%v want 1", got)
 	}
 }
@@ -418,7 +419,7 @@ func TestVIPKeptWhenNoFreshController(t *testing.T) {
 	if hasCmd(ha.commands(), "disable server kube_apiserver/api_datahub_lb") {
 		t.Fatalf("VIP disabled with no fresh controller: %v", ha.commands())
 	}
-	if got := testutil.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 1 {
+	if got := promtest.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 1 {
 		t.Fatalf("enabled{api_datahub_lb}=%v want 1 (least-bad)", got)
 	}
 }
@@ -454,7 +455,7 @@ func TestCycleReturnsOnCancelledCtx(t *testing.T) {
 	cancel()
 	p.Cycle(ctx)
 
-	if got := testutil.ToFloat64(p.cycles.WithLabelValues("ok")); got != 1 {
+	if got := promtest.ToFloat64(p.cycles.WithLabelValues("ok")); got != 1 {
 		t.Fatalf("cycles ok=%v want 1 (discover completed)", got)
 	}
 }
@@ -477,7 +478,7 @@ func TestDryRunEnableOnRecovery(t *testing.T) {
 		p.Cycle(context.Background())
 	}
 
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "dryrun_enable")); got < 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub1", "dryrun_enable")); got < 1 {
 		t.Fatalf("dryrun_enable=%v want >=1", got)
 	}
 	for _, c := range ha.commands() {
@@ -518,7 +519,7 @@ func TestEnableAfterHAProxyRestartCountsFresh(t *testing.T) {
 		p.Cycle(context.Background())
 	}
 
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "enable")); got != 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub1", "enable")); got != 1 {
 		t.Fatalf("actions enable=%v want 1", got)
 	}
 	if p.states["hub1"].drained {
@@ -551,7 +552,7 @@ func TestDrainDisableFailureLeavesUndrained(t *testing.T) {
 	if p.states["hub1"].drained {
 		t.Fatal("drained flag set despite failed disable")
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 0 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 0 {
 		t.Fatalf("actions disable=%v want 0 (all disables failed)", got)
 	}
 }
@@ -591,7 +592,7 @@ func TestReApplyDisableFailure(t *testing.T) {
 	if !p.states["hub1"].drained {
 		t.Fatal("drained flag cleared despite failed re-apply")
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 1 {
 		t.Fatalf("actions disable=%v want 1 (re-apply failed)", got)
 	}
 }
@@ -618,10 +619,10 @@ func TestVIPDisableFailureLeavesUPEnabled(t *testing.T) {
 	if !hasCmd(ha.commands(), "disable server kube_apiserver/api_datahub_lb") {
 		t.Fatalf("VIP disable never attempted, cmds=%v", ha.commands())
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "disable")); got != 0 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "disable")); got != 0 {
 		t.Fatalf("VIP actions disable=%v want 0 (disable failed)", got)
 	}
-	if got := testutil.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 1 {
+	if got := promtest.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 1 {
 		t.Fatalf("enabled{api_datahub_lb}=%v want 1 (still serving)", got)
 	}
 	if p.states["api_datahub_lb"].drained {
@@ -648,10 +649,10 @@ func TestVIPEnableFailure(t *testing.T) {
 	if !hasCmd(ha.commands(), "enable server kube_apiserver/api_datahub_lb") {
 		t.Fatalf("VIP enable never attempted, cmds=%v", ha.commands())
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "enable")); got != 0 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "enable")); got != 0 {
 		t.Fatalf("VIP actions enable=%v want 0 (enable failed)", got)
 	}
-	if got := testutil.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 0 {
+	if got := promtest.ToFloat64(p.enabled.WithLabelValues("api_datahub_lb")); got != 0 {
 		t.Fatalf("enabled{api_datahub_lb}=%v want 0 (still MAINT)", got)
 	}
 }
@@ -674,7 +675,7 @@ func TestVIPDryRunTransitions(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		p.Cycle(context.Background())
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "dryrun_disable")); got != 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "dryrun_disable")); got != 1 {
 		t.Fatalf("VIP dryrun_disable=%v want 1", got)
 	}
 
@@ -684,7 +685,7 @@ func TestVIPDryRunTransitions(t *testing.T) {
 	for i := 0; i < 4; i++ { // RecoverCycles=3 for the direct ctrl
 		p.Cycle(context.Background())
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "dryrun_enable")); got != 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("api_datahub_lb", "dryrun_enable")); got != 1 {
 		t.Fatalf("VIP dryrun_enable=%v want 1", got)
 	}
 	for _, c := range ha.commands() {
@@ -724,7 +725,7 @@ func TestCompanionBackendsReceiveActions(t *testing.T) {
 	}
 	// "No such server" on the companion is a no-op — the action
 	// still counted as a disable, not an error path.
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub1", "disable")); got != 1 {
 		t.Fatalf("actions disable=%v want 1", got)
 	}
 }
@@ -781,7 +782,7 @@ func TestStaticBackendsMergedAndDrained(t *testing.T) {
 	if !hasCmd(ha.commands(), "disable server kube_apiserver/hub1") {
 		t.Fatalf("static backend disable missing, cmds=%v", ha.commands())
 	}
-	if got := testutil.ToFloat64(p.backendCount); got != 2 {
+	if got := promtest.ToFloat64(p.backendCount); got != 2 {
 		t.Fatalf("backendCount=%v want 2 (static merged)", got)
 	}
 	// The stale latch is written for the static backend too — module
@@ -823,7 +824,7 @@ func TestStagedDrainSpendsFreshPerDisable(t *testing.T) {
 	if disables != 1 {
 		t.Fatalf("disables=%d want 1 (staged drain), cmds=%v", disables, ha.commands())
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("hub3", "fence_skip")); got < 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("hub3", "fence_skip")); got < 1 {
 		t.Fatalf("hub3 fence_skip=%v want >=1", got)
 	}
 }
@@ -836,9 +837,7 @@ func TestCycleStaticsClearedAfterCycle(t *testing.T) {
 	// out-of-Cycle callers forever.
 	confPath := filepath.Join(t.TempDir(), "node-watchdog.conf")
 	writeConf := func(s string) {
-		if err := os.WriteFile(confPath, []byte(s), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		testutil.WriteFile(t, confPath, s)
 	}
 	writeConf("API_BACKENDS=\"old=10.0.0.9:6443\"\n")
 
@@ -918,7 +917,7 @@ func TestAddrKeyedStaticDoesNotDuplicateDiscoveredBackend(t *testing.T) {
 	if _, ok := p.states[bad.addr()]; ok {
 		t.Fatal("addr-keyed phantom backend got its own probe state")
 	}
-	if got := testutil.ToFloat64(p.backendCount); got != 2 {
+	if got := promtest.ToFloat64(p.backendCount); got != 2 {
 		t.Fatalf("backendCount=%v want 2 (addr-keyed static deduped)", got)
 	}
 }
@@ -950,7 +949,7 @@ func TestStaticOnlyBackendMissingServerDrainOnce(t *testing.T) {
 	if !p.states["ghost"].drained {
 		t.Fatal("ghost not marked drained — tolerated 'No such server' must not block the drain record")
 	}
-	if got := testutil.ToFloat64(p.actions.WithLabelValues("ghost", "disable")); got != 1 {
+	if got := promtest.ToFloat64(p.actions.WithLabelValues("ghost", "disable")); got != 1 {
 		t.Fatalf("actions disable=%v want 1", got)
 	}
 
@@ -1004,11 +1003,11 @@ func TestProbeSideFailuresDoNotMarkDead(t *testing.T) {
 		t.Fatalf("probe-side failures touched the DEAD path: qfail=%d drained=%v",
 			st.qfail, st.drained)
 	}
-	if got := testutil.ToFloat64(
+	if got := promtest.ToFloat64(
 		p.probeFailures.WithLabelValues("hub1", "probe_error")); got != 4 {
 		t.Fatalf("probe_error=%v want 4", got)
 	}
-	if got := testutil.ToFloat64(
+	if got := promtest.ToFloat64(
 		p.probeFailures.WithLabelValues("hub1", "query")); got != 0 {
 		t.Fatalf("query=%v want 0 — probe-side faults are not apiserver evidence", got)
 	}
@@ -1016,7 +1015,7 @@ func TestProbeSideFailuresDoNotMarkDead(t *testing.T) {
 		"state-apiserver-backend-stale-127-0-0-2")); !os.IsNotExist(err) {
 		t.Fatalf("stale latch written for a probe-side outage: %v", err)
 	}
-	if got := testutil.ToFloat64(p.enabled.WithLabelValues("hub2")); got != 1 {
+	if got := promtest.ToFloat64(p.enabled.WithLabelValues("hub2")); got != 1 {
 		t.Fatalf("enabled{hub2}=%v want 1 — healthy backend unaffected", got)
 	}
 }
@@ -1041,11 +1040,11 @@ func TestMixedFailurePrefersApiserverSide(t *testing.T) {
 	if !hasCmd(ha.commands(), "disable server kube_apiserver/hub1") {
 		t.Fatalf("no disable for apiserver-side failure, cmds=%v", ha.commands())
 	}
-	if got := testutil.ToFloat64(
+	if got := promtest.ToFloat64(
 		p.probeFailures.WithLabelValues("hub1", "query")); got < 2 {
 		t.Fatalf("query=%v want >=2", got)
 	}
-	if got := testutil.ToFloat64(
+	if got := promtest.ToFloat64(
 		p.probeFailures.WithLabelValues("hub1", "probe_error")); got != 0 {
 		t.Fatalf("probe_error=%v want 0 — mixed failure is apiserver evidence", got)
 	}
@@ -1074,7 +1073,7 @@ func TestProbeErrorBackendIsNotFreshForFence(t *testing.T) {
 			t.Fatalf("disable issued for %s: %v", name, ha.commands())
 		}
 	}
-	if got := testutil.ToFloat64(
+	if got := promtest.ToFloat64(
 		p.actions.WithLabelValues("hub2", "fence_skip")); got < 1 {
 		t.Fatalf("fence_skip=%v want >=1 — wedged backend kept, no fresh backend", got)
 	}
@@ -1117,7 +1116,7 @@ func TestTokenRotationSelfHeals(t *testing.T) {
 
 	// Stale credential → 401 → probe_error, never DEAD.
 	p.Cycle(context.Background())
-	if got := testutil.ToFloat64(
+	if got := promtest.ToFloat64(
 		p.probeFailures.WithLabelValues("hub1", "probe_error")); got != 1 {
 		t.Fatalf("probe_error=%v want 1", got)
 	}
@@ -1138,10 +1137,10 @@ func TestTokenRotationSelfHeals(t *testing.T) {
 	if st.ok != 1 || st.qfail != 0 {
 		t.Fatalf("healed backend state ok=%d qfail=%d want 1/0", st.ok, st.qfail)
 	}
-	if got := testutil.ToFloat64(p.enabled.WithLabelValues("hub1")); got != 1 {
+	if got := promtest.ToFloat64(p.enabled.WithLabelValues("hub1")); got != 1 {
 		t.Fatalf("enabled=%v want 1 after credential rotation", got)
 	}
-	if got := testutil.ToFloat64(
+	if got := promtest.ToFloat64(
 		p.probeFailures.WithLabelValues("hub1", "probe_error")); got != 1 {
 		t.Fatalf("probe_error=%v want 1 — healed cycle counted no error", got)
 	}

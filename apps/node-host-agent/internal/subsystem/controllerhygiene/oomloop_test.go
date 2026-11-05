@@ -5,6 +5,7 @@ package controllerhygiene
 import (
 	"context"
 	"fmt"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,7 +18,7 @@ import (
 
 func writeEvents(t *testing.T, e *env, kills int) {
 	t.Helper()
-	writeFile(t, e.cg, fmt.Sprintf("low 0\nhigh 0\nmax 0\noom 0\noom_kill %d\noom_group_kill 0\n", kills))
+	testutil.WriteFile(t, e.cg, fmt.Sprintf("low 0\nhigh 0\nmax 0\noom 0\noom_kill %d\noom_group_kill 0\n", kills))
 }
 
 func TestOOMLoopShield(t *testing.T) {
@@ -64,7 +65,7 @@ func TestOOMUnparseableBaselineReseeds(t *testing.T) {
 	e := fixture(t)
 	// A garbage oomloop-seen file is NO baseline — prev=0 would
 	// replay the whole cumulative counter as "new kills".
-	writeFile(t, filepath.Join(e.state, fileOOMSeen), "garbage\n")
+	testutil.WriteFile(t, filepath.Join(e.state, fileOOMSeen), "garbage\n")
 	writeEvents(t, e, 50)
 	e.h.Cycle(context.Background())
 	if e.hasState(stateControllerOOMLop) {
@@ -126,12 +127,12 @@ func TestOOMShieldSkippedWhenLatchUnwritable(t *testing.T) {
 	// — an adj pinned with no latch would survive every later
 	// unshield (unshieldOOM keys on the file alone).
 	dir := filepath.Join(filepath.Dir(e.state), "ro-state")
-	writeFile(t, filepath.Join(dir, fileOOMSeen), "0\n")
+	testutil.WriteFile(t, filepath.Join(dir, fileOOMSeen), "0\n")
 	var kills strings.Builder
 	for i := 0; i < defaultOOMMinKills; i++ {
 		fmt.Fprintf(&kills, "%d\n", e.now.Unix())
 	}
-	writeFile(t, filepath.Join(dir, fileOOMKills), kills.String())
+	testutil.WriteFile(t, filepath.Join(dir, fileOOMKills), kills.String())
 	if err := os.Chmod(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}

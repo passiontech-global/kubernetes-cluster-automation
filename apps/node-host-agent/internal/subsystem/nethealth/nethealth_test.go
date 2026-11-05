@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -16,10 +14,22 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+)
+
+// errCmdFail / errNoUnit are the canned failures: host commands
+// fail like a non-zero exit, a unit the fixture did not stub reads
+// as absent to the systemd client.
+var (
+	errCmdFail = errors.New("exit 2")
+	errNoUnit  = errors.New("no such unit")
 )
 
 // env is the fixture: tempdir state/hosts/resolv + canned probes and
-// a fake host-command runner + fake systemd.
+// recording FakeExec runners for host commands and the systemd
+// client. The recorders serialize their own logs — Cycle
+// (checkNebulaDirectTCP → n.ip) and a spawned routeGuard goroutine
+// can invoke them concurrently (W8).
 type env struct {
 	n        *NetHealth
 	state    string
@@ -33,107 +43,27 @@ type env struct {
 	timex    unix.Timex
 	adjErr   error
 	now      time.Time
-	// mu guards cmds/sdcmds — Cycle (checkNebulaDirectTCP → n.ip)
-	// and a spawned routeGuard goroutine can invoke runHost
-	// concurrently (W8).
-	mu       sync.Mutex
-	cmds     [][]string
-	cmdReply map[string]string
-	cmdFail  map[string]bool
-	sdReply  map[string]string
-	sdcmds   [][]string
-	dnsOK    map[string]string // "ns|name" → ip; absent = fail
-	tcpOK    map[string]bool   // "host:port" → reachable
-	pingOK   map[string]bool   // "ip|marked" → alive
+	host     *testutil.FakeExec // runHostCmd + runMountCmd seam
+	sd       *testutil.FakeExec // systemd client's RunCmd seam
+	dnsOK    map[string]string  // "ns|name" → ip; absent = fail
+	tcpOK    map[string]bool    // "host:port" → reachable
+	pingOK   map[string]bool    // "ip|marked" → alive
 	pingRTT  map[string]float64
 	httpErr  map[string]error
-}
-
-// matchReply returns the reply for the LONGEST matching key — a
-// generic "rule list" key must not shadow "rule list pref 1500", nor
-// "fail2ban-client status" shadow "fail2ban-client status sshd".
-func matchReply(m map[string]string, j string) (string, bool) {
-	best, bestLen := "", -1
-	for k, v := range m {
-		if strings.Contains(j, k) && len(k) > bestLen {
-			best, bestLen = v, len(k)
-		}
-	}
-	return best, bestLen >= 0
-}
-
-func (e *env) runHost(ctx context.Context, argv []string) (string, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.cmds = append(e.cmds, argv)
-	j := strings.Join(argv, " ")
-	for k := range e.cmdFail {
-		if strings.Contains(j, k) {
-			return "", errors.New("exit 2")
-		}
-	}
-	if v, ok := matchReply(e.cmdReply, j); ok {
-		return v, nil
-	}
-	return "", nil
-}
-
-func (e *env) sdRun(ctx context.Context, argv []string) (string, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.sdcmds = append(e.sdcmds, argv)
-	j := strings.Join(argv, " ")
-	if v, ok := matchReply(e.sdReply, j); ok {
-		return v, nil
-	}
-	return "", errors.New("no such unit")
-}
-
-func (e *env) sdRan(sub string) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for _, c := range e.sdcmds {
-		if strings.Contains(strings.Join(c, " "), sub) {
-			return true
-		}
-	}
-	return false
-}
-
-func (e *env) cmdRan(sub string) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for _, c := range e.cmds {
-		if strings.Contains(strings.Join(c, " "), sub) {
-			return true
-		}
-	}
-	return false
-}
-
-func writeFile(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func fixture(t *testing.T, wd *watchdogconf.Config) *env {
 	t.Helper()
 	root := t.TempDir()
 	e := &env{
-		now:      time.Now(),
-		cmdReply: map[string]string{},
-		cmdFail:  map[string]bool{},
-		sdReply:  map[string]string{},
-		dnsOK:    map[string]string{},
-		tcpOK:    map[string]bool{},
-		pingOK:   map[string]bool{},
-		pingRTT:  map[string]float64{},
-		httpErr:  map[string]error{},
+		now:     time.Now(),
+		host:    testutil.NewFakeExec(),
+		sd:      testutil.NewFakeExec().Miss(errNoUnit),
+		dnsOK:   map[string]string{},
+		tcpOK:   map[string]bool{},
+		pingOK:  map[string]bool{},
+		pingRTT: map[string]float64{},
+		httpErr: map[string]error{},
 	}
 	e.state = filepath.Join(root, "watchdog")
 	e.hosts = filepath.Join(root, "hosts")
@@ -148,15 +78,15 @@ func fixture(t *testing.T, wd *watchdogconf.Config) *env {
 			t.Fatal(err)
 		}
 	}
-	writeFile(t, e.uptime, "3600.00 7200.00\n")
-	writeFile(t, e.hosts, "127.0.0.1 localhost\n::1 localhost\n")
+	testutil.WriteFile(t, e.uptime, "3600.00 7200.00\n")
+	testutil.WriteFile(t, e.hosts, "127.0.0.1 localhost\n::1 localhost\n")
 	// Healthy defaults: empty conntrack table, synchronized clock.
-	writeFile(t, e.ctcount, "0\n")
-	writeFile(t, e.ctmax, "262144\n")
+	testutil.WriteFile(t, e.ctcount, "0\n")
+	testutil.WriteFile(t, e.ctmax, "262144\n")
 	if wd == nil {
 		wd = &watchdogconf.Config{}
 	}
-	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: e.sdRun})
+	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: e.sd.Run})
 	n, err := New(Config{
 		Enabled:            true,
 		Interval:           time.Hour,
@@ -179,8 +109,8 @@ func fixture(t *testing.T, wd *watchdogconf.Config) *env {
 		t.Fatal(err)
 	}
 	n.cfg.nowFn = func() time.Time { return e.now }
-	n.cfg.runHostCmd = e.runHost
-	n.cfg.runMountCmd = e.runHost
+	n.cfg.runHostCmd = e.host.Run
+	n.cfg.runMountCmd = e.host.Run
 	n.cfg.dnsProbe = func(_ context.Context, ns, name string) (string, error) {
 		if ip, ok := e.dnsOK[ns+"|"+name]; ok {
 			return ip, nil
@@ -228,10 +158,10 @@ func stateExists(e *env, name string) bool {
 // the whole family, while ordinary last-* action budgets stay.
 func TestStateExitDropsSuspectBudgets(t *testing.T) {
 	e := fixture(t, nil)
-	writeFile(t, filepath.Join(e.state, "state-conntrack-pressure"), "1\n")
-	writeFile(t, filepath.Join(e.state, "last-suspect-conntrack-pressure"), "1\n")
-	writeFile(t, filepath.Join(e.state, "last-suspect-egress-probe-8.8.8.8"), "1\n")
-	writeFile(t, filepath.Join(e.state, "last-nebula-restart"), "1\n") // action budget — not a suspect key
+	testutil.WriteFile(t, filepath.Join(e.state, "state-conntrack-pressure"), "1\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "last-suspect-conntrack-pressure"), "1\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "last-suspect-egress-probe-8.8.8.8"), "1\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "last-nebula-restart"), "1\n") // action budget — not a suspect key
 
 	e.n.stateExit("conntrack-pressure")
 
@@ -249,15 +179,6 @@ func TestStateExitDropsSuspectBudgets(t *testing.T) {
 	}
 }
 
-func readFileT(t *testing.T, path string) string {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(data)
-}
-
 // --- overlay-egress (12) ---
 
 // overlayEnv wires a live nebula overlay + one relay.
@@ -271,9 +192,9 @@ func overlayEnv(t *testing.T, extra func(*watchdogconf.Config)) *env {
 		extra(wd)
 	}
 	e := fixture(t, wd)
-	e.sdReply["is-enabled nebula@interdc"] = "enabled\n"
-	e.sdReply["is-active nebula@interdc"] = "active\n"
-	e.cmdReply["rule list"] = "0:\tfrom all lookup local\n"
+	e.sd.On("is-enabled nebula@interdc", "enabled\n")
+	e.sd.On("is-active nebula@interdc", "active\n")
+	e.host.On("rule list", "0:\tfrom all lookup local\n")
 	return e
 }
 
@@ -296,13 +217,13 @@ func nebulaEnv(t *testing.T, mutate func(*watchdogconf.Config)) *env {
 		mutate(wd)
 	}
 	e := fixture(t, wd)
-	e.sdReply["is-enabled nebula@interdc"] = "enabled\n"
-	e.sdReply["is-active nebula@interdc"] = "active\n"
+	e.sd.On("is-enabled nebula@interdc", "enabled\n")
+	e.sd.On("is-active nebula@interdc", "active\n")
 	// UDP socket bound + tun has an addr + stats ok + all pings ok.
 	// 45670 = 0xB266.
-	writeFile(t, e.procudp, "  sl  local_address rem_address   st tx_queue rx_queue\n"+
+	testutil.WriteFile(t, e.procudp, "  sl  local_address rem_address   st tx_queue rx_queue\n"+
 		"  1: 0100007F:B266 00000000:0000 07 00000000:00000000\n")
-	e.cmdReply["addr show dev neb1"] = "3: neb1    inet 10.8.0.10/24 scope global neb1\n"
+	e.host.On("addr show dev neb1", "3: neb1    inet 10.8.0.10/24 scope global neb1\n")
 	for _, ip := range []string{"10.8.0.1", "10.8.0.2", "10.8.1.1", "10.8.1.2"} {
 		e.pingOK[ip+"|false"] = true
 		e.pingRTT[ip+"|false"] = 5
@@ -313,9 +234,9 @@ func nebulaEnv(t *testing.T, mutate func(*watchdogconf.Config)) *env {
 func TestSignalDisabledSkipsCheck(t *testing.T) {
 	e := nebulaEnv(t, nil)
 	e.n.cfg.Watchdog.Disabled = map[string]bool{"nebula-health": true}
-	writeFile(t, e.procudp, "  sl  local_address rem_address   st\n") // would fail
+	testutil.WriteFile(t, e.procudp, "  sl  local_address rem_address   st\n") // would fail
 	e.n.Cycle(context.Background())
-	if e.sdRan("restart nebula") {
+	if e.sd.Ran("restart nebula") {
 		t.Fatal("nebula check ran despite WD_SIG disable")
 	}
 }

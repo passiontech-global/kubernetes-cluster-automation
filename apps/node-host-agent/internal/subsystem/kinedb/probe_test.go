@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"net"
 	"os"
 	"strings"
@@ -131,12 +132,12 @@ func TestParseShowPools(t *testing.T) {
 // probeOKRules is the full-success command set. The revision query
 // answers head|compact_rev|live_tup — no COUNT(*) (the row count is
 // the guard's job; a per-2min seq-scan bloats what it measures).
-var probeOKRules = []rule{
-	{substr: "inspect", reply: "true"},
-	{substr: "SHOW POOLS", reply: showPoolsOut},
-	{substr: "logs --since", reply: "all quiet"},
-	{substr: "MAX(id)", reply: "1000|200|290\n"},
-	{substr: "select 1", reply: "1\n"},
+var probeOKRules = []testutil.ExecRule{
+	{Substr: "inspect", Out: "true"},
+	{Substr: "SHOW POOLS", Out: showPoolsOut},
+	{Substr: "logs --since", Out: "all quiet"},
+	{Substr: "MAX(id)", Out: "1000|200|290\n"},
+	{Substr: "select 1", Out: "1\n"},
 }
 
 func TestProbeCycleAllOK(t *testing.T) {
@@ -150,7 +151,7 @@ func TestProbeCycleAllOK(t *testing.T) {
 	if !res.succeeded {
 		t.Fatalf("probe did not succeed: %v", res.notes)
 	}
-	j := fr.joined()
+	j := fr.Joined()
 	// e2e goes through the pooler from inside the postgres container
 	// — in-container port 5432 on the podman network (6432 is only
 	// the published host port).
@@ -205,12 +206,12 @@ func TestProbeCycleAllOK(t *testing.T) {
 }
 
 func TestProbeCycleFailures(t *testing.T) {
-	k, _, dir := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "SHOW POOLS", reply: "database|sv_active|sv_idle|cl_waiting\npostgres|0|0|300\n"},
-		{substr: "logs --since", reply: "server_login_retry\npassword authentication failed\n"},
-		{substr: "MAX(id)", reply: "1000|200|290\n"},
-		{substr: "select 1", reply: "1\n"},
+	k, _, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "SHOW POOLS", Out: "database|sv_active|sv_idle|cl_waiting\npostgres|0|0|300\n"},
+		{Substr: "logs --since", Out: "server_login_retry\npassword authentication failed\n"},
+		{Substr: "MAX(id)", Out: "1000|200|290\n"},
+		{Substr: "select 1", Out: "1\n"},
 	})
 	k.cfg.wireFn = func(context.Context, string) bool { return false }
 	res := k.probeCycle(context.Background())
@@ -240,9 +241,9 @@ func TestProbeCycleFailures(t *testing.T) {
 // containers==1. With the env file missing, log_errors must still
 // evaluate while every cred-needing check stays 0.
 func TestProbeCycleLogScanWithoutCreds(t *testing.T) {
-	k, fr, _ := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "logs --since", reply: "all quiet"},
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "logs --since", Out: "all quiet"},
 	})
 	if err := os.Remove(k.cfg.EnvFile); err != nil {
 		t.Fatal(err)
@@ -256,17 +257,17 @@ func TestProbeCycleLogScanWithoutCreds(t *testing.T) {
 			t.Fatalf("check %s must stay 0 without creds", c)
 		}
 	}
-	if !strings.Contains(fr.joined(), "logs --since 301s") {
-		t.Fatalf("log scan did not run:\n%s", fr.joined())
+	if !strings.Contains(fr.Joined(), "logs --since 301s") {
+		t.Fatalf("log scan did not run:\n%s", fr.Joined())
 	}
 }
 
 func TestProbeCycleContainersDown(t *testing.T) {
-	k, _, _ := fixture(t, []rule{
+	k, _, _ := fixture(t, []testutil.ExecRule{
 		// inspect of the named containers fails AND no match in ps →
 		// discovery keeps the preferred names, then -f inspect fails.
-		{substr: "inspect", err: errors.New("down")},
-		{substr: "ps --format", reply: ""},
+		{Substr: "inspect", Err: errors.New("down")},
+		{Substr: "ps --format", Out: ""},
 	})
 	res := k.probeCycle(context.Background())
 	if res.checks[checkContainers] != 0 {
@@ -285,13 +286,13 @@ func TestProbeCycleContainersDown(t *testing.T) {
 // name reaches a `sh -c` STRING — the runtime and container words
 // must be single-quoted so a space/metachar cannot split or glob.
 func TestProbeLogScanQuoting(t *testing.T) {
-	k, fr, _ := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "logs --since", reply: "all quiet"},
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "logs --since", Out: "all quiet"},
 	})
 	k.probeCycle(context.Background())
-	if !strings.Contains(fr.joined(),
+	if !strings.Contains(fr.Joined(),
 		"'podman' logs --since 301s 'kine-pgbouncer' 2>&1") {
-		t.Fatalf("log scan argv unquoted:\n%s", fr.joined())
+		t.Fatalf("log scan argv unquoted:\n%s", fr.Joined())
 	}
 }

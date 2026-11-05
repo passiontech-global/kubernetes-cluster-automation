@@ -6,6 +6,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"golang.org/x/sys/unix"
 )
 
@@ -71,8 +72,8 @@ func TestClockAbsentWhenAdjtimexFails(t *testing.T) {
 
 func TestConntrackMetrics(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.ConntrackCountFile, "230000\n")
-	write(t, cfg.ConntrackMaxFile, "262144\n")
+	testutil.WriteFile(t, cfg.ConntrackCountFile, "230000\n")
+	testutil.WriteFile(t, cfg.ConntrackMaxFile, "262144\n")
 	c := New(cfg)
 	node := map[string]string{"node": "node-a"}
 
@@ -112,7 +113,7 @@ func TestConntrackPartialData(t *testing.T) {
 	cfg, _ := fixture(t)
 	// Only the count file reads — entries emits, limit+ratio stay
 	// absent (each gauge tracks its own source).
-	write(t, cfg.ConntrackCountFile, "42\n")
+	testutil.WriteFile(t, cfg.ConntrackCountFile, "42\n")
 	c := New(cfg)
 	node := map[string]string{"node": "node-a"}
 	if v, ok := metricValue(t, c, "node_host_agent_conntrack_entries",
@@ -131,8 +132,8 @@ func TestConntrackPartialData(t *testing.T) {
 
 func TestConntrackZeroLimitSkipsRatio(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.ConntrackCountFile, "10\n")
-	write(t, cfg.ConntrackMaxFile, "0\n")
+	testutil.WriteFile(t, cfg.ConntrackCountFile, "10\n")
+	testutil.WriteFile(t, cfg.ConntrackMaxFile, "0\n")
 	c := New(cfg)
 	node := map[string]string{"node": "node-a"}
 	if v, ok := metricValue(t, c, "node_host_agent_conntrack_limit",
@@ -147,8 +148,8 @@ func TestConntrackZeroLimitSkipsRatio(t *testing.T) {
 
 func TestConntrackMalformedSkipped(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.ConntrackCountFile, "not-a-number\n")
-	write(t, cfg.ConntrackMaxFile, "\n")
+	testutil.WriteFile(t, cfg.ConntrackCountFile, "not-a-number\n")
+	testutil.WriteFile(t, cfg.ConntrackMaxFile, "\n")
 	c := New(cfg)
 	node := map[string]string{"node": "node-a"}
 	for _, name := range []string{

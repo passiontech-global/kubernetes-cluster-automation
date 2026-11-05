@@ -12,9 +12,10 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // jenv is the janitor fixture: tempdir state dir + fake procfs + a
@@ -26,45 +27,24 @@ type jenv struct {
 	proc    string
 	logFile string
 	now     time.Time
-	sdcmds  [][]string
-	sdReply map[string]string // substring of joined argv → stdout
+	sd      *testutil.FakeExec
 	kills   []killRecord
 	live    map[int]bool // pids that answer signal-0
-}
-
-func (e *jenv) sdRun(_ context.Context, argv []string) (string, error) {
-	e.sdcmds = append(e.sdcmds, argv)
-	joined := strings.Join(argv, " ")
-	for k, v := range e.sdReply {
-		if strings.Contains(joined, k) {
-			return v, nil
-		}
-	}
-	// Mutating systemctl verbs succeed silently — only the READ side
-	// (list-units) needs a canned reply.
-	if len(argv) >= 2 && argv[0] == "systemctl" &&
-		(argv[1] == "reset-failed" || argv[1] == "stop") {
-		return "", nil
-	}
-	return "", syscall.ENOENT
-}
-
-func (e *jenv) sdRan(sub string) bool {
-	for _, c := range e.sdcmds {
-		if strings.Contains(strings.Join(c, " "), sub) {
-			return true
-		}
-	}
-	return false
 }
 
 func jfixture(t *testing.T) *jenv {
 	t.Helper()
 	root := t.TempDir()
 	e := &jenv{
-		now:     time.Now(),
-		live:    map[int]bool{},
-		sdReply: map[string]string{},
+		now:  time.Now(),
+		live: map[int]bool{},
+		// Mutating systemctl verbs succeed silently — only the READ
+		// side (list-units) needs a canned reply; anything else a
+		// test did not stub reads as an absent unit.
+		sd: testutil.NewFakeExec(
+			testutil.ExecRule{Substr: "systemctl reset-failed"},
+			testutil.ExecRule{Substr: "systemctl stop"},
+		).Miss(syscall.ENOENT),
 	}
 	e.state = filepath.Join(root, "watchdog")
 	e.proc = filepath.Join(root, "proc")
@@ -74,7 +54,7 @@ func jfixture(t *testing.T) *jenv {
 			t.Fatal(err)
 		}
 	}
-	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: e.sdRun,
+	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: e.sd.Run,
 		ProcUptimeFile: filepath.Join(e.proc, "uptime")})
 	j, err := New(Config{
 		Enabled:          true,
@@ -112,11 +92,11 @@ func (e *jenv) mkProc(t *testing.T, pid, ppid int, argv ...string) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, filepath.Join(dir, "cmdline"),
+	testutil.WriteFile(t, filepath.Join(dir, "cmdline"),
 		strings.Join(argv, "\x00")+"\x00")
 	// "pid (comm) state ppid ..." — ppid is the first field after the
 	// state char following the last ')'.
-	writeFile(t, filepath.Join(dir, "stat"),
+	testutil.WriteFile(t, filepath.Join(dir, "stat"),
 		fmt.Sprintf("%d (%s) S %d 0 0 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 50 0 0 0\n",
 			pid, filepath.Base(argv[0]), ppid))
 }
@@ -144,22 +124,12 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// killRecord and writeFile are duplicated from workerhygiene's test
-// helpers (tiny; a shared test util package would be heavier than the
-// copy).
+// killRecord mirrors workerhygiene's private test helper (that dir's
+// fakes are out of scope; the shared fs/exec helpers live in
+// internal/testutil).
 type killRecord struct {
 	pid int
 	sig syscall.Signal
-}
-
-func writeFile(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
 }
 
 // --- A: latch reaper ---
@@ -172,7 +142,7 @@ func TestReapsUnknownLatchAfterMaxAge(t *testing.T) {
 	// instant reap — its rewrites keep the mtime young, and the
 	// orphan is only reaped once it has stayed stale for max-age.
 	fresh := filepath.Join(e.state, "state-tinc-route-lost")
-	writeFile(t, fresh, "1\n")
+	testutil.WriteFile(t, fresh, "1\n")
 	e.j.Sweep(context.Background())
 	if !fileExists(fresh) {
 		t.Fatal("fresh unknown latch reaped — age floor broken")
@@ -191,8 +161,8 @@ func TestKnownLatchAgeGated(t *testing.T) {
 	e := jfixture(t)
 	fresh := filepath.Join(e.state, "state-node-overloaded")
 	stale := filepath.Join(e.state, "state-conntrack-pressure")
-	writeFile(t, fresh, "1\n")
-	writeFile(t, stale, "1\n")
+	testutil.WriteFile(t, fresh, "1\n")
+	testutil.WriteFile(t, stale, "1\n")
 	ageFile(t, stale, 25*time.Hour) // the ~11h field case, past 24h
 
 	e.j.Sweep(context.Background())
@@ -212,8 +182,8 @@ func TestParameterizedPrefixLatch(t *testing.T) {
 	e := jfixture(t)
 	fresh := filepath.Join(e.state, "state-apiserver-backend-stale-10-0-0-1")
 	stale := filepath.Join(e.state, "state-apiserver-backend-stale-10-0-0-2")
-	writeFile(t, fresh, "1\n")
-	writeFile(t, stale, "1\n")
+	testutil.WriteFile(t, fresh, "1\n")
+	testutil.WriteFile(t, stale, "1\n")
 	ageFile(t, stale, 48*time.Hour)
 
 	e.j.Sweep(context.Background())
@@ -245,7 +215,7 @@ func TestPreservesNonStateFiles(t *testing.T) {
 	}
 	for _, n := range keep {
 		p := filepath.Join(e.state, n)
-		writeFile(t, p, "1\n")
+		testutil.WriteFile(t, p, "1\n")
 		ageFile(t, p, 96*time.Hour) // even very old non-state files stay
 	}
 	e.j.Sweep(context.Background())
@@ -277,7 +247,7 @@ func TestMissingStateDirAbortsCleanly(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.j.Sweep(context.Background()) // must not panic
-	got := testutil.ToFloat64(
+	got := promtest.ToFloat64(
 		e.j.cycles.WithLabelValues(checkLatchReaper, "abort"))
 	if got != 1 {
 		t.Fatalf("latch-reaper abort=%v want 1", got)
@@ -287,10 +257,10 @@ func TestMissingStateDirAbortsCleanly(t *testing.T) {
 func TestMetricsBumpOnReap(t *testing.T) {
 	e := jfixture(t)
 	p := filepath.Join(e.state, "state-bogus-old-check")
-	writeFile(t, p, "1\n")
+	testutil.WriteFile(t, p, "1\n")
 	ageFile(t, p, 25*time.Hour) // unknown names reap past max-age too
 	e.j.Sweep(context.Background())
-	if got := testutil.ToFloat64(
+	if got := promtest.ToFloat64(
 		e.j.actions.WithLabelValues(checkLatchReaper, "reap")); got != 1 {
 		t.Fatalf("reap action count=%v want 1", got)
 	}
@@ -300,14 +270,14 @@ func TestMetricsBumpOnReap(t *testing.T) {
 
 func TestResetFailedGhostUnits(t *testing.T) {
 	e := jfixture(t)
-	e.sdReply["systemctl list-units"] = "" +
-		"k0sworker.service              loaded    active   running k0s worker\n" +
-		"node-watchdog.service          not-found failed   failed  node-watchdog.service\n" +
-		"node-watchdog.timer            not-found failed   failed  node-watchdog.timer\n" +
-		"nebula-route-guard.service     not-found active   running route guard\n" +
-		"node-config-agent.service      not-found failed   failed  node-config-agent.service\n" +
-		"unrelated-svc.service          not-found failed   failed  unrelated-svc.service\n" +
-		"other.timer                    loaded    active   waiting other timer\n"
+	e.sd.On("systemctl list-units", ""+
+		"k0sworker.service              loaded    active   running k0s worker\n"+
+		"node-watchdog.service          not-found failed   failed  node-watchdog.service\n"+
+		"node-watchdog.timer            not-found failed   failed  node-watchdog.timer\n"+
+		"nebula-route-guard.service     not-found active   running route guard\n"+
+		"node-config-agent.service      not-found failed   failed  node-config-agent.service\n"+
+		"unrelated-svc.service          not-found failed   failed  unrelated-svc.service\n"+
+		"other.timer                    loaded    active   waiting other timer\n")
 
 	e.j.Sweep(context.Background())
 
@@ -315,21 +285,21 @@ func TestResetFailedGhostUnits(t *testing.T) {
 		"node-watchdog.service", "node-watchdog.timer",
 		"node-config-agent.service", "nebula-route-guard.service",
 	} {
-		if !e.sdRan("systemctl reset-failed " + u) {
-			t.Fatalf("reset-failed missing for ghost unit %s (cmds=%v)", u, e.sdcmds)
+		if !e.sd.Ran("systemctl reset-failed " + u) {
+			t.Fatalf("reset-failed missing for ghost unit %s (cmds=%v)", u, e.sd.Cmds())
 		}
 	}
 	// The not-found-but-active ghost must be STOPPED (retired code
 	// still running), then its residue cleared.
-	if !e.sdRan("systemctl stop nebula-route-guard.service") {
-		t.Fatalf("stop missing for active ghost unit (cmds=%v)", e.sdcmds)
+	if !e.sd.Ran("systemctl stop nebula-route-guard.service") {
+		t.Fatalf("stop missing for active ghost unit (cmds=%v)", e.sd.Cmds())
 	}
 	// Non-legacy units are never touched — not even failed ones.
-	if e.sdRan("reset-failed unrelated-svc.service") ||
-		e.sdRan("stop unrelated-svc.service") {
-		t.Fatalf("non-legacy unit touched (cmds=%v)", e.sdcmds)
+	if e.sd.Ran("reset-failed unrelated-svc.service") ||
+		e.sd.Ran("stop unrelated-svc.service") {
+		t.Fatalf("non-legacy unit touched (cmds=%v)", e.sd.Cmds())
 	}
-	if e.sdRan("k0sworker") && !e.sdRan("list-units") {
+	if e.sd.Ran("k0sworker") && !e.sd.Ran("list-units") {
 		t.Fatal("unrelated command ran")
 	}
 	if !e.logContains(t, "ACTION: reset-failed ghost unit node-watchdog.service") {
@@ -342,14 +312,14 @@ func TestResetFailedGhostUnits(t *testing.T) {
 
 func TestUnitsSweepNoGhosts(t *testing.T) {
 	e := jfixture(t)
-	e.sdReply["systemctl list-units"] =
-		"k0sworker.service loaded active running k0s worker\n" +
-			"kubelet.service   loaded active running kubelet\n"
+	e.sd.On("systemctl list-units",
+		"k0sworker.service loaded active running k0s worker\n"+
+			"kubelet.service   loaded active running kubelet\n")
 
 	e.j.Sweep(context.Background())
 
-	if e.sdRan("reset-failed") || e.sdRan(" stop ") {
-		t.Fatalf("ghost actions on a clean host (cmds=%v)", e.sdcmds)
+	if e.sd.Ran("reset-failed") || e.sd.Ran(" stop ") {
+		t.Fatalf("ghost actions on a clean host (cmds=%v)", e.sd.Cmds())
 	}
 }
 
@@ -367,7 +337,7 @@ func TestUnitsSweepGatedWithoutSystemd(t *testing.T) {
 	}
 	e.j = j
 	p := filepath.Join(e.state, "state-ghost-from-old-check")
-	writeFile(t, p, "1\n")
+	testutil.WriteFile(t, p, "1\n")
 	ageFile(t, p, 25*time.Hour) // past max-age — reaps unknown names too
 
 	e.j.Sweep(context.Background())
@@ -376,12 +346,12 @@ func TestUnitsSweepGatedWithoutSystemd(t *testing.T) {
 	if fileExists(filepath.Join(e.state, "state-ghost-from-old-check")) {
 		t.Fatal("latch sweep skipped when systemd unwired")
 	}
-	if got := testutil.ToFloat64(
+	if got := promtest.ToFloat64(
 		e.j.cycles.WithLabelValues(checkLegacyUnits, "gated")); got != 1 {
 		t.Fatalf("legacy-units gated=%v want 1", got)
 	}
-	if len(e.sdcmds) != 0 {
-		t.Fatalf("systemd commands ran with nil client: %v", e.sdcmds)
+	if len(e.sd.Cmds()) != 0 {
+		t.Fatalf("systemd commands ran with nil client: %v", e.sd.Cmds())
 	}
 }
 
@@ -482,7 +452,7 @@ func TestRuntimeDatapathLatchesAreKnown(t *testing.T) {
 		"kubelet-syncloop-down", "containerd-sock-down",
 		"cilium-envoy-down", "cilium-mtu-drift", "zombie-storm",
 	} {
-		writeFile(t, filepath.Join(e.state, "state-"+n), "1\n")
+		testutil.WriteFile(t, filepath.Join(e.state, "state-"+n), "1\n")
 	}
 	e.j.Sweep(context.Background())
 	for _, n := range []string{
@@ -512,7 +482,7 @@ func TestPressureFleetLatchesAreKnown(t *testing.T) {
 		"conntrack-pressure",
 	}
 	for _, n := range names {
-		writeFile(t, filepath.Join(e.state, "state-"+n), "1\n")
+		testutil.WriteFile(t, filepath.Join(e.state, "state-"+n), "1\n")
 	}
 	e.j.Sweep(context.Background())
 	for _, n := range names {
@@ -531,7 +501,7 @@ func TestClockKernelNebulaLatchesAreKnown(t *testing.T) {
 		"clock-unsync", "kernel-slab-leak", "nebula-pmtu-blackhole",
 	}
 	for _, n := range names {
-		writeFile(t, filepath.Join(e.state, "state-"+n), "1\n")
+		testutil.WriteFile(t, filepath.Join(e.state, "state-"+n), "1\n")
 	}
 	e.j.Sweep(context.Background())
 	for _, n := range names {

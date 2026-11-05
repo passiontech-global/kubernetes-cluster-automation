@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestZombieCount(t *testing.T) {
@@ -19,14 +20,14 @@ func TestZombieCount(t *testing.T) {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		write(t, filepath.Join(d, "stat"),
+		testutil.WriteFile(t, filepath.Join(d, "stat"),
 			fmt.Sprintf("%d (x) Z 1 0 0", pid))
 	}
 	d := filepath.Join(cfg.ProcRoot, "303")
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(d, "stat"), "303 (y) S 1 0 0")
+	testutil.WriteFile(t, filepath.Join(d, "stat"), "303 (y) S 1 0 0")
 	c := New(cfg)
 	got, ok := metricValue(t, c, "node_host_agent_processes_zombie_count",
 		map[string]string{"node": "node-a"})
@@ -41,15 +42,15 @@ func TestCgroupPidsRatio(t *testing.T) {
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(d, "pids.current"), "900\n")
-	write(t, filepath.Join(d, "pids.max"), "1024\n")
+	testutil.WriteFile(t, filepath.Join(d, "pids.current"), "900\n")
+	testutil.WriteFile(t, filepath.Join(d, "pids.max"), "1024\n")
 	// "max" (unlimited) must emit no ratio — not a fake 0.
 	d2 := filepath.Join(cfg.CgroupRoot, "kubepods.slice")
 	if err := os.MkdirAll(d2, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(d2, "pids.current"), "50\n")
-	write(t, filepath.Join(d2, "pids.max"), "max\n")
+	testutil.WriteFile(t, filepath.Join(d2, "pids.current"), "50\n")
+	testutil.WriteFile(t, filepath.Join(d2, "pids.max"), "max\n")
 	c := New(cfg)
 	got, ok := metricValue(t, c, "node_host_agent_cgroup_pids_used_ratio",
 		map[string]string{"node": "node-a",
@@ -70,15 +71,15 @@ func TestMTUDrift(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
-	write(t, filepath.Join(dirs["sysnet"], "cilium_net", "mtu"), "1500\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "cilium_net", "mtu"), "1500\n")
 	c := New(cfg)
 	got, ok := metricValue(t, c, "node_host_agent_mtu_drift",
 		map[string]string{"node": "node-a"})
 	if !ok || got != 1 {
 		t.Fatalf("mtu_drift=%v ok=%v want 1", got, ok)
 	}
-	write(t, filepath.Join(dirs["sysnet"], "cilium_net", "mtu"), "1300\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "cilium_net", "mtu"), "1300\n")
 	got, ok = metricValue(t, c, "node_host_agent_mtu_drift",
 		map[string]string{"node": "node-a"})
 	if !ok || got != 0 {
@@ -91,8 +92,8 @@ func TestMTUDriftRuntimeConfigFallback(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dirs["sysnet"], "neb1"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
-	write(t, cfg.CiliumRuntimeConfig, `{"mtu":1500}`)
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	testutil.WriteFile(t, cfg.CiliumRuntimeConfig, `{"mtu":1500}`)
 	c := New(cfg)
 	got, ok := metricValue(t, c, "node_host_agent_mtu_drift",
 		map[string]string{"node": "node-a"})
@@ -107,7 +108,7 @@ func TestMTUDriftRuntimeConfigFallback(t *testing.T) {
 // under Go's random map iteration order.
 func TestRuntimeConfigMTUMaxDeterministic(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.CiliumRuntimeConfig,
+	testutil.WriteFile(t, cfg.CiliumRuntimeConfig,
 		`{"a":{"mtu":1300},"list":[{"mtu":1400},{"mtu":1500}],"z":{"MTU":900}}`)
 	got, ok := hostutil.RuntimeConfigMTU(cfg.CiliumRuntimeConfig)
 	if !ok || got != 1500 {
@@ -136,8 +137,8 @@ func TestMTUDriftWG0Encap(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
-	write(t, filepath.Join(dirs["sysnet"], "cilium_wg0", "mtu"), "1250\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "cilium_wg0", "mtu"), "1250\n")
 	c := New(cfg)
 	got, ok := metricValue(t, c, "node_host_agent_mtu_drift",
 		map[string]string{"node": "node-a"})
@@ -145,7 +146,7 @@ func TestMTUDriftWG0Encap(t *testing.T) {
 		t.Fatalf("wg0=1250 > 1300-60: drift=%v ok=%v want 1", got, ok)
 	}
 	// Exactly at budget → no drift.
-	write(t, filepath.Join(dirs["sysnet"], "cilium_wg0", "mtu"), "1240\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "cilium_wg0", "mtu"), "1240\n")
 	got, ok = metricValue(t, c, "node_host_agent_mtu_drift",
 		map[string]string{"node": "node-a"})
 	if !ok || got != 0 {
@@ -161,7 +162,7 @@ func TestMTUDriftWG0AbsentNoVote(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dirs["sysnet"], "neb1"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
 	c := New(cfg)
 	if _, ok := metricValue(t, c, "node_host_agent_mtu_drift",
 		map[string]string{"node": "node-a"}); ok {

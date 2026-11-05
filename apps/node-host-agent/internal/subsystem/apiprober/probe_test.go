@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -63,9 +64,7 @@ func TestListRV(t *testing.T) {
 	addr := strings.TrimPrefix(srv.URL, "https://")
 
 	tokenFile := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(tokenFile, []byte("tok-abc\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFile(t, tokenFile, "tok-abc\n")
 
 	// HTTPClient==nil exercises the production path: TLS client built
 	// from InsecureTLS + per-query bearer token read.

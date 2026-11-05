@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/etcdmaint"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/eventpurge"
@@ -49,8 +51,8 @@ func (g *etcdGuardFake) ctl(_ context.Context, args ...string) ([]byte, error) {
 func (e *env) mkEtcdHost(t *testing.T) string {
 	t.Helper()
 	dir := filepath.Join(filepath.Dir(e.state), "k0s")
-	writeFile(t, filepath.Join(dir, "bin", "etcdctl"), "#!/bin/sh\n")
-	writeFile(t, filepath.Join(dir, "pki", "etcd", "ca.crt"), "fake\n")
+	testutil.WriteFile(t, filepath.Join(dir, "bin", "etcdctl"), "#!/bin/sh\n")
+	testutil.WriteFile(t, filepath.Join(dir, "pki", "etcd", "ca.crt"), "fake\n")
 	return dir
 }
 
@@ -115,7 +117,7 @@ func TestEtcdGuardAbsentCANoop(t *testing.T) {
 	// bin/etcdctl present but pki/etcd/ca.crt absent — a half-seeded
 	// k0s dir must still no-op.
 	dir := filepath.Join(filepath.Dir(e.state), "k0s")
-	writeFile(t, filepath.Join(dir, "bin", "etcdctl"), "#!/bin/sh\n")
+	testutil.WriteFile(t, filepath.Join(dir, "bin", "etcdctl"), "#!/bin/sh\n")
 	e.h.cfg.K0sDir = dir
 	e.h.Cycle(context.Background())
 	if len(g.ctlCalls) != 0 || g.purges != 0 || len(g.rescues) != 0 {
@@ -136,13 +138,13 @@ func TestEtcdGuardBelowThreshold(t *testing.T) {
 		t.Fatalf("healthy etcd triggered remediation: purges=%d rescues=%d",
 			g.purges, len(g.rescues))
 	}
-	if got := testutil.ToFloat64(e.h.etcdDBSize); got != float64(100<<20) {
+	if got := promtest.ToFloat64(e.h.etcdDBSize); got != float64(100<<20) {
 		t.Fatalf("db_size gauge=%v want %v", got, 100<<20)
 	}
-	if got := testutil.ToFloat64(e.h.etcdDBUse); got != float64(90<<20) {
+	if got := promtest.ToFloat64(e.h.etcdDBUse); got != float64(90<<20) {
 		t.Fatalf("db_in_use gauge=%v want %v", got, 90<<20)
 	}
-	if got := testutil.ToFloat64(e.h.etcdNospace); got != 0 {
+	if got := promtest.ToFloat64(e.h.etcdNospace); got != 0 {
 		t.Fatalf("nospace gauge=%v want 0", got)
 	}
 	// Both probes ran exactly once.
@@ -175,7 +177,7 @@ func TestEtcdGuardNospaceTriggers(t *testing.T) {
 	if g.rescues[0].K0sDir != e.h.cfg.K0sDir {
 		t.Fatalf("rescue K0sDir=%q want %q", g.rescues[0].K0sDir, e.h.cfg.K0sDir)
 	}
-	if got := testutil.ToFloat64(e.h.etcdNospace); got != 1 {
+	if got := promtest.ToFloat64(e.h.etcdNospace); got != 1 {
 		t.Fatalf("nospace gauge=%v want 1", got)
 	}
 	// Rate budget spent.
@@ -261,11 +263,11 @@ func TestEtcdGuardEvpurgeFailRescueOkStillRemediated(t *testing.T) {
 		t.Fatalf("steps ran purges=%d rescues=%d want 1/1",
 			g.purges, len(g.rescues))
 	}
-	if got := testutil.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "ok")); got != 1 {
+	if got := promtest.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "ok")); got != 1 {
 		t.Fatalf("cycles{ok}=%v want 1 — a landed rescue must not "+
 			"count as remediate_error", got)
 	}
-	if got := testutil.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "remediate_error")); got != 0 {
+	if got := promtest.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "remediate_error")); got != 0 {
 		t.Fatalf("cycles{remediate_error}=%v want 0", got)
 	}
 	if log := watchdogLog(t, e); !strings.Contains(log, "evpurge failed") {
@@ -291,10 +293,10 @@ func TestEtcdGuardRescueFailCountsRemediateError(t *testing.T) {
 		t.Fatalf("steps ran purges=%d rescues=%d want 1/1",
 			g.purges, len(g.rescues))
 	}
-	if got := testutil.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "remediate_error")); got != 1 {
+	if got := promtest.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "remediate_error")); got != 1 {
 		t.Fatalf("cycles{remediate_error}=%v want 1", got)
 	}
-	if got := testutil.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "ok")); got != 0 {
+	if got := promtest.ToFloat64(e.h.cycles.WithLabelValues(checkEtcd, "ok")); got != 0 {
 		t.Fatalf("cycles{ok}=%v want 0 — failed rescue is not remediated", got)
 	}
 }

@@ -3,6 +3,7 @@ package kinedb
 import (
 	"context"
 	"errors"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,9 +43,9 @@ func TestGuardTrigger(t *testing.T) {
 }
 
 func TestGuardFreezeCounter(t *testing.T) {
-	k, _, _ := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "MAX(id)", reply: "300|50|1000\n"},
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "MAX(id)", Out: "300|50|1000\n"},
 	})
 	dir := k.cfg.GuardStateDir
 	// Previous run: head 100, compact_rev 50, 3 frozen cycles.
@@ -63,10 +64,10 @@ func TestGuardFreezeCounter(t *testing.T) {
 	}
 
 	// compact_rev moved → counter resets.
-	k.cfg.run = (&fakeRun{rules: []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "MAX(id)", reply: "400|300|1000\n"},
-	}}).run
+	k.cfg.run = testutil.NewFakeExec(
+		testutil.ExecRule{Substr: "inspect", Out: "true"},
+		testutil.ExecRule{Substr: "MAX(id)", Out: "400|300|1000\n"},
+	).RunStdin
 	res = k.guardCycle(context.Background())
 	if res.frozen != 0 {
 		t.Fatalf("frozen=%d want 0 after compact_rev advanced", res.frozen)
@@ -106,19 +107,19 @@ func TestBuildCompactScript(t *testing.T) {
 	}
 }
 
-var guardStatsRule = rule{substr: "MAX(id)", reply: "600000|100|700000\n"}
+var guardStatsRule = testutil.ExecRule{Substr: "MAX(id)", Out: "600000|100|700000\n"}
 
 // guardAfterRule answers the post-compact re-read (compact_rev|rows)
 // — the only query that opens with MAX(prev_revision).
-var guardAfterRule = rule{
-	substr: "SELECT COALESCE((SELECT MAX(prev_revision)",
-	reply:  "599000|695000\n",
+var guardAfterRule = testutil.ExecRule{
+	Substr: "SELECT COALESCE((SELECT MAX(prev_revision)",
+	Out:    "599000|695000\n",
 }
 
 func TestGuardCycleFiresAndLocks(t *testing.T) {
-	k, fr, dir := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "ON_ERROR_STOP", reply: "NOTICE:  deleted=10\nNOTICE:  deleted=5\nUPDATE 1\n"},
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "ON_ERROR_STOP", Out: "NOTICE:  deleted=10\nNOTICE:  deleted=5\nUPDATE 1\n"},
 		guardAfterRule,
 		guardStatsRule,
 	})
@@ -127,7 +128,7 @@ func TestGuardCycleFiresAndLocks(t *testing.T) {
 		t.Fatalf("res=%+v", res)
 	}
 	// retained = 599900 > 150000 → fired; target = head-1000.
-	script := fr.lastStdin()
+	script := fr.LastStdin()
 	if !strings.Contains(script, "pg_try_advisory_lock(20260921)") {
 		t.Fatalf("no advisory lock in session:\n%s", script)
 	}
@@ -166,16 +167,16 @@ func TestGuardCycleFiresAndLocks(t *testing.T) {
 		}
 	}
 	// Script went down a single psql session with stdin.
-	j := fr.joined()
+	j := fr.Joined()
 	if !strings.Contains(j, "psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -f -") {
 		t.Fatalf("compact session argv wrong:\n%s", j)
 	}
 }
 
 func TestGuardCycleLockBusy(t *testing.T) {
-	k, _, _ := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "ON_ERROR_STOP", reply: lockBusyMarker + "\n"},
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "ON_ERROR_STOP", Out: lockBusyMarker + "\n"},
 		guardStatsRule,
 	})
 	res := k.guardCycle(context.Background())
@@ -194,15 +195,15 @@ func TestGuardCycleLockBusy(t *testing.T) {
 }
 
 func TestGuardCycleQuiet(t *testing.T) {
-	k, fr, dir := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "MAX(id)", reply: "2000|1000|3000\n"},
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "MAX(id)", Out: "2000|1000|3000\n"},
 	})
 	res := k.guardCycle(context.Background())
 	if !res.ok || res.fired {
 		t.Fatalf("res=%+v", res)
 	}
-	if strings.Contains(fr.joined(), "pg_try_advisory_lock") {
+	if strings.Contains(fr.Joined(), "pg_try_advisory_lock") {
 		t.Fatal("compact session ran on a quiet cycle")
 	}
 	content := readText(t, dir, "kine-compact-guard.prom")
@@ -223,9 +224,9 @@ func TestGuardCycleQuiet(t *testing.T) {
 }
 
 func TestGuardCycleScriptError(t *testing.T) {
-	k, _, dir := fixture(t, []rule{
-		{substr: "inspect", reply: "true"},
-		{substr: "ON_ERROR_STOP", err: errors.New("psql error")},
+	k, _, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "ON_ERROR_STOP", Err: errors.New("psql error")},
 		guardStatsRule,
 	})
 	res := k.guardCycle(context.Background())

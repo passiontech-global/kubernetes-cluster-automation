@@ -3,6 +3,7 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"strings"
 	"testing"
@@ -33,8 +34,8 @@ func k0sCleanYAML(extraKeys ...string) string {
 
 func TestK0sDriftRemovedFlag(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.K0sUnitFile, "[Unit]\n")
-	write(t, cfg.K0sConfigFile,
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+	testutil.WriteFile(t, cfg.K0sConfigFile,
 		"apiVersion: k0s.k0sproject.io/v1beta1\nkind: ClusterConfig\n"+
 			"spec:\n  api:\n    extraArgs:\n      concurrent-service-syncs: \"5\"\n")
 	if v, ok := k0sDrift(t, New(cfg), "removed-flag", "concurrent-service-syncs"); !ok || v != 1 {
@@ -44,7 +45,7 @@ func TestK0sDriftRemovedFlag(t *testing.T) {
 
 func TestK0sDriftMissingConfig(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.K0sUnitFile, "[Unit]\n")
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
 	// k0s.yaml absent → unreadable finding (drift=1 under the new schema).
 	if v, ok := k0sDrift(t, New(cfg), "unreadable", "k0s.yaml"); !ok || v != 1 {
 		t.Fatalf("unreadable=%v ok=%v want 1 (config missing)", v, ok)
@@ -53,8 +54,8 @@ func TestK0sDriftMissingConfig(t *testing.T) {
 
 func TestK0sDriftUnparseable(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.K0sUnitFile, "[Unit]\n")
-	write(t, cfg.K0sConfigFile, "  {not: [valid: yaml\n")
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+	testutil.WriteFile(t, cfg.K0sConfigFile, "  {not: [valid: yaml\n")
 	if v, ok := k0sDrift(t, New(cfg), "unreadable", "k0s.yaml"); !ok || v != 1 {
 		t.Fatalf("unreadable=%v ok=%v want 1 (unparseable)", v, ok)
 	}
@@ -62,8 +63,8 @@ func TestK0sDriftUnparseable(t *testing.T) {
 
 func TestK0sNoDriftCleanConfig(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.K0sUnitFile, "[Unit]\n")
-	write(t, cfg.K0sConfigFile, k0sCleanYAML())
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+	testutil.WriteFile(t, cfg.K0sConfigFile, k0sCleanYAML())
 	if v, ok := k0sDrift(t, New(cfg), "none", "none"); !ok || v != 0 {
 		t.Fatalf("none=%v ok=%v want 0 (clean config)", v, ok)
 	}
@@ -71,9 +72,9 @@ func TestK0sNoDriftCleanConfig(t *testing.T) {
 
 func TestK0sDriftMissingKey(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.K0sUnitFile, "[Unit]\n")
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
 	// An empty extraArgs block → every expected KCM key is missing.
-	write(t, cfg.K0sConfigFile,
+	testutil.WriteFile(t, cfg.K0sConfigFile,
 		"apiVersion: k0s.k0sproject.io/v1beta1\nkind: ClusterConfig\n"+
 			"spec:\n  controllerManager:\n    extraArgs: {}\n")
 	c := New(cfg)
@@ -87,8 +88,8 @@ func TestK0sDriftMissingKey(t *testing.T) {
 
 func TestK0sDriftExtraKey(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.K0sUnitFile, "[Unit]\n")
-	write(t, cfg.K0sConfigFile, k0sCleanYAML("bogus-extra-flag"))
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+	testutil.WriteFile(t, cfg.K0sConfigFile, k0sCleanYAML("bogus-extra-flag"))
 	if v, ok := k0sDrift(t, New(cfg), "extra-key", "bogus-extra-flag"); !ok || v != 1 {
 		t.Fatalf("extra-key=%v ok=%v want 1", v, ok)
 	}
@@ -96,10 +97,10 @@ func TestK0sDriftExtraKey(t *testing.T) {
 
 func TestK0sDriftRemovedFlagNotDoubleCounted(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.K0sUnitFile, "[Unit]\n")
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
 	// The removed flag sits INSIDE controllerManager.extraArgs: it
 	// must report as removed-flag only, not also as extra-key.
-	write(t, cfg.K0sConfigFile, k0sCleanYAML("concurrent-service-syncs"))
+	testutil.WriteFile(t, cfg.K0sConfigFile, k0sCleanYAML("concurrent-service-syncs"))
 	c := New(cfg)
 	if v, ok := k0sDrift(t, c, "removed-flag", "concurrent-service-syncs"); !ok || v != 1 {
 		t.Fatalf("removed-flag=%v ok=%v want 1", v, ok)
@@ -112,7 +113,7 @@ func TestK0sDriftRemovedFlagNotDoubleCounted(t *testing.T) {
 func TestK0sMetricAbsentOnWorker(t *testing.T) {
 	cfg, _ := fixture(t)
 	// No k0scontroller.service → worker → no series even if config exists.
-	write(t, cfg.K0sConfigFile, "spec:\n  concurrent-service-syncs: true\n")
+	testutil.WriteFile(t, cfg.K0sConfigFile, "spec:\n  concurrent-service-syncs: true\n")
 	c := New(cfg)
 	for _, r := range []string{"removed-flag", "missing-key", "unreadable", "none"} {
 		key := "x"
@@ -133,8 +134,8 @@ func TestK0sDriftDuplicateRemovedFlagsDeduped(t *testing.T) {
 	// would make prometheus Gather fail outright (metricValue's
 	// Gather → t.Fatal covers that).
 	cfg, _ := fixture(t)
-	write(t, cfg.K0sUnitFile, "[Unit]\n")
-	write(t, cfg.K0sConfigFile, k0sCleanYAML("concurrent-service-syncs"))
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+	testutil.WriteFile(t, cfg.K0sConfigFile, k0sCleanYAML("concurrent-service-syncs"))
 	cfg.RemovedFlags = []string{"concurrent-service-syncs", "concurrent-service-syncs"}
 	c := New(cfg)
 	if v, ok := k0sDrift(t, c, "removed-flag", "concurrent-service-syncs"); !ok || v != 1 {
@@ -154,8 +155,8 @@ func bumpMtime(t *testing.T, path string) {
 
 func TestK0sConfigCacheRevalidates(t *testing.T) {
 	cfg, _ := fixture(t)
-	write(t, cfg.K0sUnitFile, "[Unit]\n")
-	write(t, cfg.K0sConfigFile, k0sCleanYAML())
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+	testutil.WriteFile(t, cfg.K0sConfigFile, k0sCleanYAML())
 	c := New(cfg)
 
 	// First scrape loads the file; unchanged mtime+size would serve
@@ -168,7 +169,7 @@ func TestK0sConfigCacheRevalidates(t *testing.T) {
 	}
 
 	// Content change + bumped mtime → the next scrape re-reads.
-	write(t, cfg.K0sConfigFile, k0sCleanYAML("bogus-extra-flag"))
+	testutil.WriteFile(t, cfg.K0sConfigFile, k0sCleanYAML("bogus-extra-flag"))
 	bumpMtime(t, cfg.K0sConfigFile)
 	if v, ok := k0sDrift(t, c, "extra-key", "bogus-extra-flag"); !ok || v != 1 {
 		t.Fatalf("extra-key=%v ok=%v want 1 after config change", v, ok)
@@ -183,7 +184,7 @@ func TestK0sConfigCacheRevalidates(t *testing.T) {
 	}
 
 	// Restored → findings track the new file again.
-	write(t, cfg.K0sConfigFile, k0sCleanYAML())
+	testutil.WriteFile(t, cfg.K0sConfigFile, k0sCleanYAML())
 	bumpMtime(t, cfg.K0sConfigFile)
 	if v, ok := k0sDrift(t, c, "none", "none"); !ok || v != 0 {
 		t.Fatalf("restored config none=%v ok=%v want 0", v, ok)
@@ -195,8 +196,8 @@ func TestRemovedFlagsCustom(t *testing.T) {
 	// carrying the default removed flag must not drift when the custom
 	// list doesn't contain it.
 	cfg, _ := fixture(t)
-	write(t, cfg.K0sUnitFile, "[Unit]\n")
-	write(t, cfg.K0sConfigFile,
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+	testutil.WriteFile(t, cfg.K0sConfigFile,
 		"spec:\n  api:\n    extraArgs:\n      concurrent-service-syncs: \"5\"\n")
 	cfg.RemovedFlags = []string{"some-other-flag"}
 	if _, ok := k0sDrift(t, New(cfg), "removed-flag", "concurrent-service-syncs"); ok {
@@ -204,7 +205,7 @@ func TestRemovedFlagsCustom(t *testing.T) {
 	}
 
 	// And the custom flag itself is honoured.
-	write(t, cfg.K0sConfigFile, "spec:\n  some-other-flag: true\n")
+	testutil.WriteFile(t, cfg.K0sConfigFile, "spec:\n  some-other-flag: true\n")
 	if v, ok := k0sDrift(t, New(cfg), "removed-flag", "some-other-flag"); !ok || v != 1 {
 		t.Fatalf("removed-flag=%v ok=%v want 1 (custom removed flag present)", v, ok)
 	}

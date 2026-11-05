@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -41,7 +42,7 @@ const conntrackStatBody = "  entries  searched found insert insert_failed drop e
 func TestConntrackStatCounters(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "nf_conntrack")
-	write(t, f, conntrackStatBody)
+	testutil.WriteFile(t, f, conntrackStatBody)
 	got, ok := conntrackStatCounters(f, "insert_failed", "drop")
 	if !ok {
 		t.Fatal("conntrackStatCounters reported unparsed")
@@ -58,7 +59,7 @@ func TestConntrackStatCounters(t *testing.T) {
 func TestCollectConntrackStat(t *testing.T) {
 	cfg, _ := fixture(t)
 	cfg.ConntrackStatFile = filepath.Join(t.TempDir(), "nf_conntrack")
-	write(t, cfg.ConntrackStatFile, conntrackStatBody)
+	testutil.WriteFile(t, cfg.ConntrackStatFile, conntrackStatBody)
 	c := New(cfg)
 	v, ok := counterValue(t, c, "node_host_agent_conntrack_insert_failed_total",
 		map[string]string{"node": "node-a"})
@@ -75,7 +76,7 @@ func TestCollectConntrackStat(t *testing.T) {
 func TestCollectARP(t *testing.T) {
 	cfg, _ := fixture(t)
 	cfg.ARPTableFile = filepath.Join(t.TempDir(), "arp")
-	write(t, cfg.ARPTableFile,
+	testutil.WriteFile(t, cfg.ARPTableFile,
 		"IP address       HW type     Flags       HW address            Mask     Device\n"+
 			"10.0.0.1         0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0\n"+
 			"10.0.0.2         0x1         0x0         00:00:00:00:00:00     *        eth0\n"+
@@ -97,7 +98,7 @@ func TestCollectDStateProcesses(t *testing.T) {
 		if err := os.MkdirAll(pd, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		write(t, filepath.Join(pd, "stat"),
+		testutil.WriteFile(t, filepath.Join(pd, "stat"),
 			"1 (fakeproc) "+state+" 0 0 0\n")
 	}
 	c := New(cfg)
@@ -146,7 +147,7 @@ func TestCollectCgroupMemEvents(t *testing.T) {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		write(t, filepath.Join(d, "memory.events"), body)
+		testutil.WriteFile(t, filepath.Join(d, "memory.events"), body)
 	}
 	c := New(cfg)
 	v, ok := counterValue(t, c, "node_host_agent_cgroup_memory_high_events_total",

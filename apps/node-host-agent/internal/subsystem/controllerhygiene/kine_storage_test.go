@@ -2,6 +2,7 @@ package controllerhygiene
 
 import (
 	"context"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,11 +25,11 @@ func setupKineStore(t *testing.T, e *env, dbSize, walSize int64) *int {
 		t.Fatal(err)
 	}
 	if dbSize >= 0 {
-		writeFile(t, filepath.Join(dbDir, "state.db"),
+		testutil.WriteFile(t, filepath.Join(dbDir, "state.db"),
 			strings.Repeat("x", int(dbSize)))
 	}
 	if walSize >= 0 {
-		writeFile(t, filepath.Join(dbDir, "state.db-wal"),
+		testutil.WriteFile(t, filepath.Join(dbDir, "state.db-wal"),
 			strings.Repeat("y", int(walSize)))
 	}
 	e.h.cfg.K0sDir = k0s

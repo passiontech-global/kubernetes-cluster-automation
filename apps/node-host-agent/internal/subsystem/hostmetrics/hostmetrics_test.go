@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"golang.org/x/sys/unix"
@@ -95,13 +96,6 @@ func fixtureSeams(root string) {
 		return "", errors.New("exec disabled in tests")
 	}
 	textfileDirOverride = ""
-}
-
-func write(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
 }
 
 // metricValue gathers the collector once and returns the value of the
@@ -221,8 +215,8 @@ func TestDescribe(t *testing.T) {
 func TestWriteTextfile(t *testing.T) {
 	cfg, dirs := fixture(t)
 	cfg.EgressRelays = []string{"8.8.8.8"}
-	write(t, filepath.Join(dirs["state"], "state-fail2ban-down"), "1730000000\n")
-	write(t, filepath.Join(dirs["state"], "egress-state-8.8.8.8"), "relay\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "state-fail2ban-down"), "1730000000\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "egress-state-8.8.8.8"), "relay\n")
 	c := New(cfg)
 
 	dir := filepath.Join(t.TempDir(), "textfile")
@@ -286,7 +280,7 @@ func TestWriteTextfileTmpNameEscapesPromGlob(t *testing.T) {
 func TestWriteTextfileNoDuplicateSeries(t *testing.T) {
 	cfg, dirs := fixture(t)
 	cfg.EgressRelays = []string{"8.8.8.8"}
-	write(t, filepath.Join(dirs["state"], "state-a"), "1\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "state-a"), "1\n")
 	c := New(cfg)
 	dir := t.TempDir()
 	if err := c.WriteTextfile(dir); err != nil {
@@ -314,10 +308,10 @@ func TestWriteTextfileIncludesGrayFailureMetrics(t *testing.T) {
 		tx.Esterror = 500_000
 		return 0, nil
 	}
-	write(t, cfg.ConntrackCountFile, "100\n")
-	write(t, cfg.ConntrackMaxFile, "1000\n")
-	write(t, cfg.FileNRFile, "50\t0\t500\n")
-	write(t, cfg.SockstatFile,
+	testutil.WriteFile(t, cfg.ConntrackCountFile, "100\n")
+	testutil.WriteFile(t, cfg.ConntrackMaxFile, "1000\n")
+	testutil.WriteFile(t, cfg.FileNRFile, "50\t0\t500\n")
+	testutil.WriteFile(t, cfg.SockstatFile,
 		"sockets: used 42\nTCP: inuse 7 orphan 1 tw 3 alloc 9 mem 2\n")
 	cfg.FilesystemTargets = []string{"/mnt/data"}
 	cfg.statfsFn = func(path string, st *unix.Statfs_t) error {
@@ -366,17 +360,17 @@ func TestWriteTextfileIncludesNewMetrics(t *testing.T) {
 	if err := os.MkdirAll(pkiDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(pkiDir, "ca.crt"),
+	testutil.WriteFile(t, filepath.Join(pkiDir, "ca.crt"),
 		string(mkTestCertPEM(t, time.Now().Add(40*24*time.Hour))))
-	write(t, cfg.InotifyMaxInstancesFile, "10\n")
-	write(t, cfg.InotifyMaxWatchesFile, "100\n")
+	testutil.WriteFile(t, cfg.InotifyMaxInstancesFile, "10\n")
+	testutil.WriteFile(t, cfg.InotifyMaxWatchesFile, "100\n")
 	for _, n := range []string{"neb1", "cilium_net"} {
 		if err := os.MkdirAll(filepath.Join(dirs["sysnet"], n), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	write(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
-	write(t, filepath.Join(dirs["sysnet"], "cilium_net", "mtu"), "1500\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "neb1", "mtu"), "1300\n")
+	testutil.WriteFile(t, filepath.Join(dirs["sysnet"], "cilium_net", "mtu"), "1500\n")
 	c := New(cfg)
 	out := filepath.Join(t.TempDir(), "textfile")
 	if err := c.WriteTextfile(out); err != nil {

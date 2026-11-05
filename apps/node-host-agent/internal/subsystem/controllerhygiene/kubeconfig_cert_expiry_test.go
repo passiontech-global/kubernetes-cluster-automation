@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -92,15 +93,15 @@ func TestKubeconfigCertExpiry(t *testing.T) {
 	defer func() { textfileDirOverride = oldTD }()
 
 	// admin.conf cert expiring in 5 days → inside the 14d window.
-	writeFile(t, filepath.Join(pki, "admin.conf"),
+	testutil.WriteFile(t, filepath.Join(pki, "admin.conf"),
 		kubeconfigWithCert(t, testClientCertPEM(t,
 			e.now.Add(5*24*time.Hour))))
 	// scheduler.conf cert healthy at 60 days — min stays 5d.
-	writeFile(t, filepath.Join(pki, "scheduler.conf"),
+	testutil.WriteFile(t, filepath.Join(pki, "scheduler.conf"),
 		kubeconfigWithCert(t, testClientCertPEM(t,
 			e.now.Add(60*24*time.Hour))))
 	// Garbage file → skipped gracefully.
-	writeFile(t, filepath.Join(k0s, "kubelet.conf"), "not yaml: [")
+	testutil.WriteFile(t, filepath.Join(k0s, "kubelet.conf"), "not yaml: [")
 
 	e.h.checkKubeconfigCertExpiry(context.Background())
 	if !e.hasState(stateKubeCertExpiring) {
@@ -114,7 +115,7 @@ func TestKubeconfigCertExpiry(t *testing.T) {
 	}
 
 	// Rotate to a healthy cert → latch clears, sample ~60d.
-	writeFile(t, filepath.Join(pki, "admin.conf"),
+	testutil.WriteFile(t, filepath.Join(pki, "admin.conf"),
 		kubeconfigWithCert(t, testClientCertPEM(t,
 			e.now.Add(60*24*time.Hour))))
 	e.h.checkKubeconfigCertExpiry(context.Background())

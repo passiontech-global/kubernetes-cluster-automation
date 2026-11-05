@@ -3,6 +3,7 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"path/filepath"
 	"testing"
 )
@@ -11,7 +12,7 @@ import (
 
 func TestFail2banBannedMetric(t *testing.T) {
 	cfg, dirs := fixture(t)
-	write(t, filepath.Join(dirs["state"], "fail2ban-banned"), "sshd=7 recidive=1\n")
+	testutil.WriteFile(t, filepath.Join(dirs["state"], "fail2ban-banned"), "sshd=7 recidive=1\n")
 	c := New(cfg)
 	v, ok := metricValue(t, c, "node_fail2ban_banned_ips",
 		map[string]string{"jail": "sshd"})
