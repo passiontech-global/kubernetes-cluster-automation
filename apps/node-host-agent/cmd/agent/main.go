@@ -150,12 +150,24 @@ type agentParams struct {
 	standaloneFlag bool
 }
 
+// wireReport is the wire loop's per-descriptor outcome summary —
+// the generalized form of the bool this signature used to return
+// for apiprober alone. Off lists descriptors whose env flag/auto
+// resolution said no; Skipped lists the ones that resolved ON but a
+// needs-gate or Build failure kept out of Config.Subsystems. Both
+// lists are in descriptor (startup) order.
+type wireReport struct {
+	Off     []string
+	Skipped []string
+}
+
 // buildAgentConfig wires the environment into an agent.Config: one
 // shared registry plus the subsystem list in startup order.
-// hostmetrics registers on the shared registry directly. The bool
-// reports whether apiprober was enabled — it feeds the startup log
-// line only.
-func buildAgentConfig(p agentParams) (agent.Config, bool) {
+// hostmetrics registers on the shared registry directly. The
+// wireReport feeds only the startup log line — it answers the
+// operator's second question (which subsystems did NOT wire up and
+// why) alongside the constructed set.
+func buildAgentConfig(p agentParams) (agent.Config, wireReport) {
 
 	// Standalone = on-host systemd mode (API LB VMs, interdc hubs,
 	// the kine DB VM): the enable-set inverts — every subsystem
@@ -266,6 +278,9 @@ func buildAgentConfig(p agentParams) (agent.Config, bool) {
 		standalone: standalone,
 		defKube:    defKube,
 
+		resolved: map[string]bool{},
+		built:    map[string]bool{},
+
 		watchdogStateDir:        watchdogStateDir,
 		watchdogLogFile:         watchdogLogFile,
 		hnode:                   hnode,
@@ -278,12 +293,22 @@ func buildAgentConfig(p agentParams) (agent.Config, bool) {
 
 	// One Descriptor per subsystem, in the same order the sequential
 	// blocks ran — w.subsystems startup order is unchanged.
-	// resolveAndBuild returns the resolved enable mode; apiprober's
-	// feeds the startup log line (a setup failure does not clear it).
-	apiproberEnabled := false
+	// resolveAndBuild records the resolved enable mode in w.resolved
+	// and whether Build appended in w.built; the report below splits
+	// the names that never wired up into off (flag/auto said no) vs
+	// skipped (needs-gate or Build held them back), in descriptor
+	// order so the startup log reads deterministically.
+	names := []string{}
 	for _, d := range w.descriptors() {
-		if w.resolveAndBuild(d) && d.Name == "apiprober" {
-			apiproberEnabled = true
+		names = append(names, d.Name)
+		w.resolveAndBuild(d)
+	}
+	report := wireReport{Off: []string{}, Skipped: []string{}}
+	for _, name := range names {
+		if !w.resolved[name] {
+			report.Off = append(report.Off, name)
+		} else if !w.built[name] {
+			report.Skipped = append(report.Skipped, name)
 		}
 	}
 
@@ -296,7 +321,7 @@ func buildAgentConfig(p agentParams) (agent.Config, bool) {
 		ProbeAddr:   p.probeAddr,
 		Registry:    reg,
 		Subsystems:  w.subsystems,
-	}, apiproberEnabled
+	}, report
 }
 
 func main() {
@@ -339,7 +364,7 @@ func main() {
 	podName := envx.String("POD_NAME", "")
 	namespace := envx.String("POD_NAMESPACE", "")
 
-	cfg, apiproberEnabled := buildAgentConfig(agentParams{
+	cfg, report := buildAgentConfig(agentParams{
 		nodeName:       nodeName,
 		podName:        podName,
 		namespace:      namespace,
@@ -351,8 +376,11 @@ func main() {
 	a := agent.New(cfg)
 
 	// The enabled set is an operator's first question when a check
-	// misbehaves — list every subsystem that actually wired up
-	// (env/auto gates resolved, setup errors already logged above).
+	// misbehaves — list every subsystem that actually wired up, and
+	// answer the second question too: off = flag/auto resolved
+	// disabled, skipped = resolved on but a needs-gate or Build
+	// failure held it back (setup errors already logged above). The
+	// old apiprober-only bool is subsumed by these two lists.
 	subsystems := make([]string, 0, len(cfg.Subsystems))
 	for _, s := range cfg.Subsystems {
 		subsystems = append(subsystems, s.Name())
@@ -361,7 +389,7 @@ func main() {
 		"version", version, "node", a.NodeName(), "pod", podName,
 		"standalone", standaloneFlag, "metricsAddr", metricsAddr,
 		"probeAddr", probeAddr, "subsystems", subsystems,
-		"apiprober", apiproberEnabled)
+		"off", report.Off, "skipped", report.Skipped)
 	if err := a.Run(ctx); err != nil {
 		logger().Error("agent exited", "error", err)
 		os.Exit(1)
