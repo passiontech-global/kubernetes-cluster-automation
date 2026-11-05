@@ -356,8 +356,11 @@ func moduleGateEnvs() []string {
 
 // The registry is the contract every other piece keys on: names must
 // be non-empty and unique (they label metric series and boot logs —
-// a dup would merge two modules' error accounting) and every row must
-// carry a Setup — a nil one would nil-call at boot.
+// a dup would merge two modules' error accounting), every row must
+// carry a known Group (a typo'd group string would silently shrink a
+// `-modules @group` expansion — the constants are unexported so only
+// this file can mint one) and every row must carry a Setup — a nil
+// one would nil-call at boot.
 func TestModuleRegistry(t *testing.T) {
 	seen := map[string]bool{}
 	for _, m := range modules {
@@ -368,6 +371,12 @@ func TestModuleRegistry(t *testing.T) {
 			t.Fatalf("duplicate module name %q", m.Name)
 		}
 		seen[m.Name] = true
+		switch m.Group {
+		case groupSystem, groupNode, groupAPIServer,
+			groupJanitors, groupIntegration, groupHealth:
+		default:
+			t.Fatalf("module %q has unknown Group %q", m.Name, m.Group)
+		}
 		if m.Setup == nil {
 			t.Fatalf("module %q has nil Setup", m.Name)
 		}
@@ -384,11 +393,21 @@ func testDeps(m *testutil.StubManager) shared.Deps {
 }
 
 // filterModules is the -modules allowlist: unset means the full
-// registry; a set value returns exactly the named modules in
-// registry order regardless of argv order; an unknown name is an
-// error that names the offender (fail fast — a silently skipped typo
+// registry; a set value returns exactly the selected modules in
+// registry order regardless of argv order — entries are ops names or
+// "@<group>" selectors that expand to a whole registry section;
+// an unknown name or @group is an error that names the offender plus
+// the valid names and groups (fail fast — a silently skipped typo
 // would run the wrong subset).
 func TestFilterModules(t *testing.T) {
+	moduleNames := func(mods []shared.Module) []string {
+		var names []string
+		for _, m := range mods {
+			names = append(names, m.Name)
+		}
+		return names
+	}
+
 	t.Run("empty means full registry", func(t *testing.T) {
 		got, err := filterModules(nil)
 		if err != nil {
@@ -411,12 +430,67 @@ func TestFilterModules(t *testing.T) {
 		if err != nil {
 			t.Fatalf("filterModules: %v", err)
 		}
-		var names []string
-		for _, m := range got {
-			names = append(names, m.Name)
+		if want := []string{"node-labeler", "csr-watcher"}; !slices.Equal(moduleNames(got), want) {
+			t.Fatalf("names = %v, want %v", moduleNames(got), want)
 		}
-		if want := []string{"node-labeler", "csr-watcher"}; !slices.Equal(names, want) {
-			t.Fatalf("names = %v, want %v", names, want)
+	})
+
+	t.Run("@group expands in registry order", func(t *testing.T) {
+		got, err := filterModules([]string{"@apiserver"})
+		if err != nil {
+			t.Fatalf("filterModules: %v", err)
+		}
+		want := []string{
+			"admission-webhook-guard",
+			"apiserver-endpoint-guard",
+			"apiservice-guard",
+		}
+		if !slices.Equal(moduleNames(got), want) {
+			t.Fatalf("names = %v, want %v", moduleNames(got), want)
+		}
+	})
+
+	t.Run("mixed names and @groups dedupe", func(t *testing.T) {
+		// "@apiserver" already covers apiservice-guard and the argv
+		// repeats it by name plus the group itself — the result must
+		// hold each module exactly once, in registry order.
+		got, err := filterModules([]string{
+			"cluster-health-probes", "@apiserver",
+			"apiservice-guard", "@apiserver",
+		})
+		if err != nil {
+			t.Fatalf("filterModules: %v", err)
+		}
+		want := []string{
+			"admission-webhook-guard",
+			"apiserver-endpoint-guard",
+			"apiservice-guard",
+			"cluster-health-probes",
+		}
+		if !slices.Equal(moduleNames(got), want) {
+			t.Fatalf("names = %v, want %v", moduleNames(got), want)
+		}
+	})
+
+	t.Run("every group expands to its stamped rows", func(t *testing.T) {
+		// Cross-check the @-selectors against the Group stamps: each
+		// group's expansion must be exactly the rows carrying it.
+		for _, g := range []string{
+			"system", "node", "apiserver", "janitors", "integration", "health",
+		} {
+			got, err := filterModules([]string{"@" + g})
+			if err != nil {
+				t.Fatalf("filterModules(@%s): %v", g, err)
+			}
+			var want []string
+			for _, m := range modules {
+				if m.Group == g {
+					want = append(want, m.Name)
+				}
+			}
+			if !slices.Equal(moduleNames(got), want) {
+				t.Fatalf("@%s = %v, want %v", g, moduleNames(got), want)
+			}
 		}
 	})
 
@@ -430,6 +504,36 @@ func TestFilterModules(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "node-labeler") {
 			t.Fatalf("error missing the valid-name list: %v", err)
+		}
+	})
+
+	t.Run("unknown @group fails and lists valid groups", func(t *testing.T) {
+		_, err := filterModules([]string{"node-labeler", "@bogus"})
+		if err == nil {
+			t.Fatal("filterModules accepted an unknown @group")
+		}
+		if !strings.Contains(err.Error(), "@bogus") {
+			t.Fatalf("error missing the bad @group: %v", err)
+		}
+		for _, g := range []string{
+			"@system", "@node", "@apiserver",
+			"@janitors", "@integration", "@health",
+		} {
+			if !strings.Contains(err.Error(), g) {
+				t.Fatalf("error missing valid group %q: %v", g, err)
+			}
+		}
+	})
+
+	t.Run("bare @ matches nothing", func(t *testing.T) {
+		// "@" is the empty-group lookup — no module may carry it, so
+		// it must surface as an offender like any other typo.
+		_, err := filterModules([]string{"@"})
+		if err == nil {
+			t.Fatal("filterModules accepted a bare @")
+		}
+		if !strings.Contains(err.Error(), "@") {
+			t.Fatalf("error missing the bad entry: %v", err)
 		}
 	})
 }

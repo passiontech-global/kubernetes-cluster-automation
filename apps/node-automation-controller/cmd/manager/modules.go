@@ -69,56 +69,73 @@ import (
 // Name is the module's ops/queue name — it labels the run-error
 // counters and appears in boot logs, so it must stay byte-stable for
 // anyone grepping journalctl or querying Prometheus.
+//
+// Group is the module's blast-radius set — a `-modules @<group>`
+// allowlist entry expands to the whole section. The group strings
+// below are an ops contract like Name: they land in Deployment args
+// and runbooks, so they must stay byte-stable, and re-grouping a
+// module changes what a pinned @-entry selects.
+const (
+	groupSystem      = "system"      // kube-system component patchers and watchdogs
+	groupNode        = "node"        // Node lifecycle and health sweeps
+	groupAPIServer   = "apiserver"   // apiserver integrity guards
+	groupJanitors    = "janitors"    // Resource cleanup sweeps
+	groupIntegration = "integration" // Third-party controller unstuckers
+	groupHealth      = "health"      // Cluster health probes
+)
+
 var modules = []shared.Module{
 	// kube-system component patchers and watchdogs.
-	{Name: "konnectivity-patcher", Setup: konnectivitypatcher.Setup},
-	{Name: "fluent-bit-config-roller", GateEnv: "FLUENTBIT_ROLLER_ENABLED", Setup: fluentbitroller.Setup},
-	{Name: "coredns-stale-watchdog", Setup: corednswatchdog.Setup},
-	{Name: "coredns-patcher", GateEnv: "COREDNS_PATCHER_ENABLED", DefaultOn: true, Setup: corednspatcher.Setup},
-	{Name: "metrics-server-patcher", GateEnv: "METRICS_SERVER_PATCHER_ENABLED", DefaultOn: true, Setup: metricsserverpatcher.Setup},
-	{Name: "cf-tunnel-proxy-watchdog", GateEnv: "CF_TUNNEL_WATCHDOG_ENABLED", DefaultOn: true, Setup: cftunnelproxywatchdog.Setup},
-	{Name: "statefulset-ondelete-roller", GateEnv: "STATEFULSET_ONDELETE_ROLLER_ENABLED", DefaultOn: true, Setup: statefulsetroller.Setup},
+	{Name: "konnectivity-patcher", Group: groupSystem, Setup: konnectivitypatcher.Setup},
+	{Name: "fluent-bit-config-roller", Group: groupSystem, GateEnv: "FLUENTBIT_ROLLER_ENABLED", Setup: fluentbitroller.Setup},
+	{Name: "coredns-stale-watchdog", Group: groupSystem, Setup: corednswatchdog.Setup},
+	{Name: "coredns-patcher", Group: groupSystem, GateEnv: "COREDNS_PATCHER_ENABLED", DefaultOn: true, Setup: corednspatcher.Setup},
+	{Name: "metrics-server-patcher", Group: groupSystem, GateEnv: "METRICS_SERVER_PATCHER_ENABLED", DefaultOn: true, Setup: metricsserverpatcher.Setup},
+	{Name: "cf-tunnel-proxy-watchdog", Group: groupSystem, GateEnv: "CF_TUNNEL_WATCHDOG_ENABLED", DefaultOn: true, Setup: cftunnelproxywatchdog.Setup},
+	{Name: "statefulset-ondelete-roller", Group: groupSystem, GateEnv: "STATEFULSET_ONDELETE_ROLLER_ENABLED", DefaultOn: true, Setup: statefulsetroller.Setup},
 
 	// Node lifecycle and health sweeps.
-	{Name: "cilium-taint-reaper", GateEnv: "CILIUM_TAINT_REAPER_ENABLED", Setup: ciliumtaintreaper.Setup},
-	{Name: "descheduler-storm-gate", Setup: deschedulerstormgate.Setup},
-	{Name: "node-labeler", Setup: nodelabeler.Setup},
-	{Name: "kubelet-liveness-reaper", Setup: kubeletreaper.Setup},
-	{Name: "partition-pod-evictor", Setup: partitionevictor.Setup},
-	{Name: "dead-node-sweeper", Setup: deadnodesweeper.Setup},
-	{Name: "csr-watcher", Setup: csrwatcher.Setup},
-	{Name: "pdb-deadlock-watchdog", GateEnv: "PDB_WATCHDOG_ENABLED", DefaultOn: true, Setup: pdbdeadlockwatchdog.Setup},
+	{Name: "cilium-taint-reaper", Group: groupNode, GateEnv: "CILIUM_TAINT_REAPER_ENABLED", Setup: ciliumtaintreaper.Setup},
+	{Name: "descheduler-storm-gate", Group: groupNode, Setup: deschedulerstormgate.Setup},
+	{Name: "node-labeler", Group: groupNode, Setup: nodelabeler.Setup},
+	{Name: "kubelet-liveness-reaper", Group: groupNode, Setup: kubeletreaper.Setup},
+	{Name: "partition-pod-evictor", Group: groupNode, Setup: partitionevictor.Setup},
+	{Name: "dead-node-sweeper", Group: groupNode, Setup: deadnodesweeper.Setup},
+	{Name: "csr-watcher", Group: groupNode, Setup: csrwatcher.Setup},
+	{Name: "pdb-deadlock-watchdog", Group: groupNode, GateEnv: "PDB_WATCHDOG_ENABLED", DefaultOn: true, Setup: pdbdeadlockwatchdog.Setup},
 
 	// apiserver integrity guards.
-	{Name: "admission-webhook-guard", Setup: webhookguard.Setup},
-	{Name: "apiserver-endpoint-guard", Setup: apiserverendpointguard.Setup},
-	{Name: "apiservice-guard", GateEnv: "APISERVICE_GUARD_ENABLED", DefaultOn: true, Setup: apiserviceguard.Setup},
+	{Name: "admission-webhook-guard", Group: groupAPIServer, Setup: webhookguard.Setup},
+	{Name: "apiserver-endpoint-guard", Group: groupAPIServer, Setup: apiserverendpointguard.Setup},
+	{Name: "apiservice-guard", Group: groupAPIServer, GateEnv: "APISERVICE_GUARD_ENABLED", DefaultOn: true, Setup: apiserviceguard.Setup},
 
 	// Resource cleanup sweeps.
-	{Name: "failed-jobs-janitor", Setup: failedjobsjanitor.Setup},
-	{Name: "evicted-pod-janitor", Setup: evictedpodjanitor.Setup},
-	{Name: "cronjob-catchup", Setup: cronjobcatchup.Setup},
-	{Name: "concourse-workdir-janitor", GateEnv: "CONCOURSE_JANITOR_ENABLED", Setup: concoursejanitor.Setup},
-	{Name: "volumeattachment-cleaner", GateEnv: "VOLUMEATTACHMENT_CLEANER_ENABLED", DefaultOn: true, Setup: volumeattachmentcleaner.Setup},
-	{Name: "zombie-sidecar-reaper", GateEnv: "ZOMBIE_SIDECAR_REAPER_ENABLED", DefaultOn: true, Setup: zombiesidecarreaper.Setup},
-	{Name: "orphan-endpointslice-cleaner", GateEnv: "ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED", DefaultOn: true, Setup: orphanendpointslicecleaner.Setup},
+	{Name: "failed-jobs-janitor", Group: groupJanitors, Setup: failedjobsjanitor.Setup},
+	{Name: "evicted-pod-janitor", Group: groupJanitors, Setup: evictedpodjanitor.Setup},
+	{Name: "cronjob-catchup", Group: groupJanitors, Setup: cronjobcatchup.Setup},
+	{Name: "concourse-workdir-janitor", Group: groupJanitors, GateEnv: "CONCOURSE_JANITOR_ENABLED", Setup: concoursejanitor.Setup},
+	{Name: "volumeattachment-cleaner", Group: groupJanitors, GateEnv: "VOLUMEATTACHMENT_CLEANER_ENABLED", DefaultOn: true, Setup: volumeattachmentcleaner.Setup},
+	{Name: "zombie-sidecar-reaper", Group: groupJanitors, GateEnv: "ZOMBIE_SIDECAR_REAPER_ENABLED", DefaultOn: true, Setup: zombiesidecarreaper.Setup},
+	{Name: "orphan-endpointslice-cleaner", Group: groupJanitors, GateEnv: "ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED", DefaultOn: true, Setup: orphanendpointslicecleaner.Setup},
 
 	// Third-party controller unstuckers (dynamic client /
 	// CRD types).
-	{Name: "helmrelease-unlocker", Setup: helmreleaseunlocker.Setup},
-	{Name: "externalsecret-nudge", Setup: externalsecretnudge.Setup},
-	{Name: "certmanager-reaper", GateEnv: "CERTMANAGER_REAPER_ENABLED", Setup: certmanagerreaper.Setup},
-	{Name: "cilium-identity-auditor", GateEnv: "CILIUM_IDENTITY_AUDITOR_ENABLED", Setup: ciliumidentityauditor.Setup},
-	{Name: "cert-drift-auditor", GateEnv: "CERT_DRIFT_AUDITOR_ENABLED", DefaultOn: true, Setup: certdriftauditor.Setup},
-	{Name: "velero-backup-auditor", GateEnv: "VELERO_BACKUP_AUDITOR_ENABLED", DefaultOn: true, Setup: velerobackupauditor.Setup},
+	{Name: "helmrelease-unlocker", Group: groupIntegration, Setup: helmreleaseunlocker.Setup},
+	{Name: "externalsecret-nudge", Group: groupIntegration, Setup: externalsecretnudge.Setup},
+	{Name: "certmanager-reaper", Group: groupIntegration, GateEnv: "CERTMANAGER_REAPER_ENABLED", Setup: certmanagerreaper.Setup},
+	{Name: "cilium-identity-auditor", Group: groupIntegration, GateEnv: "CILIUM_IDENTITY_AUDITOR_ENABLED", Setup: ciliumidentityauditor.Setup},
+	{Name: "cert-drift-auditor", Group: groupIntegration, GateEnv: "CERT_DRIFT_AUDITOR_ENABLED", DefaultOn: true, Setup: certdriftauditor.Setup},
+	{Name: "velero-backup-auditor", Group: groupIntegration, GateEnv: "VELERO_BACKUP_AUDITOR_ENABLED", DefaultOn: true, Setup: velerobackupauditor.Setup},
 
 	// Cluster health probes.
-	{Name: "cluster-health-probes", GateEnv: "CLUSTER_HEALTH_PROBES_ENABLED", DefaultOn: true, Setup: clusterhealthprobes.Setup},
+	{Name: "cluster-health-probes", Group: groupHealth, GateEnv: "CLUSTER_HEALTH_PROBES_ENABLED", DefaultOn: true, Setup: clusterhealthprobes.Setup},
 }
 
-// parseModulesFlag splits the -modules flag value into names —
+// parseModulesFlag splits the -modules flag value into entries —
 // comma-separated, whitespace-tolerant, empty entries dropped so a
-// trailing comma or an all-whitespace value behaves as "unset".
+// trailing comma or an all-whitespace value behaves as "unset". An
+// entry is either a module ops name or a "@<group>" group selector;
+// which one is resolved by filterModules, not here.
 func parseModulesFlag(s string) []string {
 	var names []string
 	for n := range strings.SplitSeq(s, ",") {
@@ -131,12 +148,17 @@ func parseModulesFlag(s string) []string {
 
 // filterModules resolves the -modules allowlist against the registry.
 // An empty names slice means "flag unset" and returns the full
-// registry untouched. Otherwise it returns exactly the named modules
-// in REGISTRY order (not argv order), so boot order stays
-// deterministic however the operator wrote the list. An unrecognized
-// name is a boot error, not a skip — a typo'd allowlist silently
-// running the wrong subset is worse than refusing to start — so the
-// error names both the offenders and every valid name.
+// registry untouched. Otherwise entries are module ops names or
+// "@<group>" selectors — an @-entry expands to every module whose
+// Group matches (a module with an empty Group can never match one:
+// "@x" is looked up against "@"+Group, so Group="" would need a bare
+// "@" entry, and even that is guarded out). The result is exactly the
+// selected modules in REGISTRY order (not argv order) with repeats
+// collapsed, so boot order stays deterministic however the operator
+// wrote the list. An unrecognized name OR @group is a boot error,
+// not a skip — a typo'd allowlist silently running the wrong subset
+// is worse than refusing to start — so the error names the offenders
+// plus every valid name and every valid group.
 func filterModules(names []string) ([]shared.Module, error) {
 	if len(names) == 0 {
 		return modules, nil
@@ -147,27 +169,56 @@ func filterModules(names []string) ([]shared.Module, error) {
 	}
 	var out []shared.Module
 	valid := make([]string, 0, len(modules))
+	// matched tracks which allowlist entries selected ≥1 module. `want`
+	// cannot double for this — an @group must stay live for its WHOLE
+	// section, so consuming it on first match would truncate the
+	// expansion at the first member.
+	matched := make(map[string]bool, len(names))
 	for _, m := range modules {
 		valid = append(valid, m.Name)
-		if want[m.Name] {
-			out = append(out, m)
-			delete(want, m.Name) // matched — also dedupes repeat names
+		switch {
+		case want[m.Name]:
+			matched[m.Name] = true
+		case m.Group != "" && want["@"+m.Group]:
+			matched["@"+m.Group] = true
+		default:
+			continue
 		}
+		out = append(out, m)
 	}
-	if len(want) > 0 {
-		// Report the offenders in the operator's argv order — what is
-		// left in `want` is exactly the names that matched nothing.
+	if len(matched) < len(want) {
+		// Report the offenders in the operator's argv order — the
+		// entries that matched nothing.
 		var bad []string
+		seen := make(map[string]bool)
 		for _, n := range names {
-			if want[n] {
+			if !matched[n] && !seen[n] {
 				bad = append(bad, n)
-				delete(want, n)
+				seen[n] = true
 			}
 		}
-		return nil, fmt.Errorf("unknown module name(s) %s — valid names: %s",
-			strings.Join(bad, ", "), strings.Join(valid, ", "))
+		return nil, fmt.Errorf("unknown module name(s) or @group(s) %s — valid names: %s — valid groups: %s",
+			strings.Join(bad, ", "), strings.Join(valid, ", "),
+			strings.Join(validGroups(), ", "))
 	}
 	return out, nil
+}
+
+// validGroups lists the registry's "@<group>" selectors in first-seen
+// registry order — what an operator may write after "@" in -modules —
+// for the unknown-entry error message. Deriving it from the registry
+// (instead of hardcoding the constants) means a new group can never
+// ship unstamped rows and a stale help list at the same time.
+func validGroups() []string {
+	seen := make(map[string]bool)
+	var groups []string
+	for _, m := range modules {
+		if m.Group != "" && !seen[m.Group] {
+			seen[m.Group] = true
+			groups = append(groups, "@"+m.Group)
+		}
+	}
+	return groups
 }
 
 // setupModules wires the allowlisted modules on the manager, registry

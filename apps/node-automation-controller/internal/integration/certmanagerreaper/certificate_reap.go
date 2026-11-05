@@ -1,0 +1,188 @@
+// certificate_reap.go — the Certificate reap half of
+// certmanager-reaper: the candidacy predicates (certReady,
+// certNeedsReap, certReadyFalse, certExpiringSoon) and reapCert,
+// which walks the Order→CertificateRequest→Certificate owner chain,
+// applies the per-cert reset budget, cross-checks a wedged Challenge
+// (wedged_challenge.go), then deletes the stuck pending Order so
+// cert-manager recreates it fresh.
+package certmanagerreaper
+
+import (
+	"context"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
+)
+
+// certReady reports whether the Certificate's Ready condition is True.
+func certReady(cert *unstructured.Unstructured) bool {
+	c, _ := shared.ConditionOf(cert.Object, "Ready")
+	return c.Status == "True"
+}
+
+// certNeedsReap mirrors the bash filter: Ready=False OR renewalTime
+// within 7d of now — a healthy cert with no upcoming renewal cannot
+// have a stuck issuance worth resetting. cert-manager publishes the
+// next renewal under STATUS.renewalTime (spec carries no such field).
+func certNeedsReap(cert *unstructured.Unstructured, now time.Time) bool {
+	if conds, ok := shared.NestedSlice(
+		cert.Object, "status", "conditions"); ok {
+		for _, c := range conds {
+			m, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if m["type"] == "Ready" && m["status"] == "False" {
+				return true
+			}
+		}
+	}
+	if rt, ok := shared.NestedString(
+		cert.Object, "status", "renewalTime"); ok {
+		if t, err := time.Parse(time.RFC3339, rt); err == nil &&
+			!t.After(now.Add(certRenewalWindow)) {
+			return true
+		}
+	}
+	return false
+}
+
+// reapCert finds the cert's stuck pending Order, verifies a Challenge
+// is genuinely wedged (not just slow), applies the reset budget, then
+// deletes the Order so cert-manager recreates it. Reports whether an
+// Order was actually deleted.
+func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Unstructured) bool {
+	log := logf.FromContext(ctx)
+	ns, name := cert.GetNamespace(), cert.GetName()
+	key := ns + "/" + name
+	now := r.now.Now()
+
+	orders, err := r.dyn.Resource(orderGVR).Namespace(ns).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		metrics.IncError(r.queue)
+		log.Error(err, "order list failed", "cert", key)
+		return false
+	}
+
+	// Attribute orders to THIS cert through the owner chain — an
+	// Order's ownerRef names its CertificateRequest and the CR's
+	// ownerRef names the Certificate (cert-manager also stamps the
+	// cert-manager.io/certificate-name ref on the CR). Picking the
+	// first pending order in the NAMESPACE would reap another cert's
+	// order while charging the reset budget to this cert. A failed
+	// CR list makes attribution impossible — fail closed.
+	crs, err := r.listCRs(ctx, ns)
+	if err != nil {
+		log.Error(err, "certificaterequest list failed", "cert", key)
+		return false
+	}
+	crToCert := make(map[string]string, len(crs.Items))
+	for i := range crs.Items {
+		if certName, ok := certNameForCR(&crs.Items[i]); ok {
+			crToCert[crs.Items[i].GetName()] = certName
+		}
+	}
+
+	var stuck *unstructured.Unstructured
+	for i := range orders.Items {
+		o := &orders.Items[i]
+		if !orderOwnedByCert(o, name, crToCert) {
+			continue // not this cert's order — never ours to reap
+		}
+		if st, _ := shared.NestedString(o.Object, "status", "state"); st != "pending" {
+			continue
+		}
+		if now.Sub(o.GetCreationTimestamp().Time) <= orderPendingMinAge {
+			continue
+		}
+		stuck = o
+		break
+	}
+	if stuck == nil {
+		return false
+	}
+
+	// Budget gate before the challenge call — no API work when the
+	// cert is already refused. A restart empties r.resets, so the
+	// first sight of a cert hydrates the budget back from its
+	// persisted annotation — the 3-per-cycle cap survives restarts.
+	st := r.resets[key]
+	if st == nil {
+		st = certResetFromAnnotation(cert)
+		r.resets[key] = st
+	}
+	if st.total >= certReaperMaxReset {
+		if !st.gaveUp {
+			st.gaveUp = true
+			metrics.IncError(r.queue)
+			log.Info("REFUSE: reset budget exhausted — cert config is broken, "+
+				"continuing would burn the ACME rate limit",
+				"cert", key, "order", stuck.GetName(), "resets", st.total)
+		}
+		return false
+	}
+	if !st.last.IsZero() && now.Sub(st.last) < certReaperMinGap {
+		log.Info("SKIP: reset rate-limited (max 1/hour)",
+			"cert", key, "order", stuck.GetName(),
+			"lastResetAgo", now.Sub(st.last).Truncate(time.Minute))
+		return false
+	}
+
+	chals, err := r.dyn.Resource(challengeGVR).Namespace(ns).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		metrics.IncError(r.queue)
+		log.Error(err, "challenge list failed", "cert", key)
+		return false
+	}
+	if !stuckChallengeForOrder(stuck, chals.Items, now) {
+		log.Info("KEEP: pending order but no wedged challenge — "+
+			"issuance still progressing", "cert", key, "order", stuck.GetName())
+		return false
+	}
+
+	log.Info("RESET: deleting stuck pending Order — cert-manager recreates fresh",
+		"cert", key, "order", stuck.GetName())
+	stuckUID := stuck.GetUID()
+	if err := r.dyn.Resource(orderGVR).Namespace(ns).
+		Delete(ctx, stuck.GetName(), shared.UIDDeleteOptions(stuckUID, "")); err != nil {
+		metrics.IncError(r.queue)
+		log.Error(err, "order delete failed", "cert", key, "order", stuck.GetName())
+		return false
+	}
+	st.total++
+	st.last = now
+	// Persist the consumed reset immediately — a controller restart
+	// between sweeps must not refund it. Best-effort: the Order is
+	// already deleted, so a failed write is flagged, not fatal.
+	if err := r.patchResetsAnnotation(ctx, cert, st); err != nil {
+		metrics.IncError(r.queue)
+		log.Error(err, "acme-resets annotation write failed", "cert", key)
+	}
+	return true
+}
+
+// certReadyFalse reports the Ready=False half of the W8 CR candidacy.
+func certReadyFalse(cert *unstructured.Unstructured) bool {
+	c, _ := shared.ConditionOf(cert.Object, "Ready")
+	return c.Status == "False"
+}
+
+// certExpiringSoon reports whether status.notAfter lands within the
+// next 14 days — an expiring cert with a wedged child CR is a renewal
+// that silently died.
+func certExpiringSoon(cert *unstructured.Unstructured, now time.Time) bool {
+	if v, ok := shared.NestedString(
+		cert.Object, "status", "notAfter"); ok {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			return t.Before(now.Add(certExpirySoonWin))
+		}
+	}
+	return false
+}

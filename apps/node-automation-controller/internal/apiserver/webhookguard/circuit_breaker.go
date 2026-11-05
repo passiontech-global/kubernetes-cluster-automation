@@ -21,8 +21,6 @@ import (
 
 	"github.com/go-logr/logr"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -32,14 +30,6 @@ import (
 )
 
 const (
-	// webhookCircuitAnno records, on the webhook config object itself,
-	// the comma-separated names of the sub-webhooks the C1 circuit
-	// breaker flipped to failurePolicy=Ignore — the trip record
-	// survives pod restarts and is human-readable in kubectl describe.
-	// Comma-separated is unambiguous: webhook names are DNS-1123
-	// subdomains, which can never contain a comma.
-	webhookCircuitAnno = "node.ops/circuit-broken-webhooks"
-
 	// webhookDeadThreshold is how long a fail-closed sub-webhook's
 	// backend Service must report 0 Ready endpoints before the breaker
 	// trips it to Ignore.
@@ -407,167 +397,11 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, queue, kind, cfgName, ann
 	return payload, trips, recovered
 }
 
-// circuitMetrics applies the trip/recovery side-effects — called only
-// after the config patch landed, so a failed patch retries next sweep
-// without double-counting trips. A tripped series is Emitted into the
-// sweep's ledger; a recovered one is deleted outright — a cleared
-// breaker emits no series, not a 0, and the sweep-end ledger prune
-// drops it for good.
-func circuitMetrics(emitted *shared.GaugeLedger[string], kind, cfgName string, trips, recovered []string) {
-	for _, n := range trips {
-		metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, n).Set(1)
-		emitted.Emit(kind+"/"+cfgName+"/"+n, kind, cfgName, n)
-		metrics.WebhookCircuitBreakerTripsTotal.WithLabelValues(kind, cfgName).Inc()
-	}
-	for _, n := range recovered {
-		metrics.WebhookCircuitBroken.DeleteLabelValues(kind, cfgName, n)
-	}
-}
-
-// bounceHungWebhookPods is the W9-CP1 stage-1 remediation: for every
-// Service referenced by a webhook config whose census verdict is
-// "unresponsive" (Ready endpoints on healthy nodes, ALL probed IPs
-// failing TCP+TLS), delete the oldest Ready backing pod — its owner
-// controller (Deployment/ReplicaSet) recreates it fresh, which is
-// the rolling bounce a hung webhook process needs. One bounce per
-// service per webhookBounceCooldown; the whole pass is gated by the
-// shared maintenance mutex and fails closed like every other pod
-// kill in this module.
-func (b *circuitBreaker) bounceHungWebhookPods(ctx context.Context,
-	snap *sweepSnapshot, ready endpointCensus) {
-	g := snap.g
-	log := logf.FromContext(ctx)
-	now := g.now.Now()
-	// Distinct unresponsive webhook backend services, deduped across
-	// configs and kinds — several webhooks routinely share one
-	// Service, and one hung pod set is one bounce.
-	var keys []string
-	seen := map[string]bool{}
-	add := func(svc *admissionv1.ServiceReference) {
-		if svc == nil || svc.Namespace == "" || svc.Name == "" {
-			return
-		}
-		key := svc.Namespace + "/" + svc.Name
-		if seen[key] {
-			return
-		}
-		if ready.effective[key] <= 0 || !ready.probed[key] || ready.responsive[key] {
-			return // not brownout-hung — healthy, partitioned or unprobed
-		}
-		if b.bounceAt.CooledDown(key, webhookBounceCooldown, now) {
-			return // inside the 15m per-service cooldown
-		}
-		seen[key] = true
-		keys = append(keys, key)
-	}
-	if snap.mwc != nil {
-		for i := range snap.mwc.Items {
-			for _, h := range mutHookViews(snap.mwc.Items[i].Webhooks) {
-				add(h.svc)
-			}
-		}
-	}
-	if snap.vwc != nil {
-		for i := range snap.vwc.Items {
-			for _, h := range valHookViews(snap.vwc.Items[i].Webhooks) {
-				add(h.svc)
-			}
-		}
-	}
-	if len(keys) == 0 {
-		return
-	}
-
-	// The maintenance mutex gates the bounce (W7-C1 posture): a
-	// cordon/drain/kured reboot or in-flight k0s upgrade defers the
-	// pod kill, and "cannot verify" fails closed.
-	held, why, err := g.maintenanceActive(ctx)
-	if err != nil {
-		metrics.IncError(g.queue)
-		log.Info("WARN: maintenance check unverifiable — "+
-			"DEFER: webhook pod bounce skipped (fail closed)",
-			"error", err, "services", keys)
-		return
-	}
-	if held {
-		log.Info("DEFER: maintenance active — webhook pod bounce skipped",
-			"why", why, "services", keys)
-		return
-	}
-	for _, key := range keys {
-		b.bounceOldestPod(ctx, snap, key, ready.backingPods[key], now)
-	}
-}
-
-// bounceOldestPod deletes the oldest Ready, non-terminating backing
-// pod of an unresponsive webhook Service — "oldest" because the hung
-// process is usually the longest-lived replica, and one pod per
-// bounce keeps the rollout gentle. The delete carries the pod's UID
-// as a precondition so a same-named replacement admitted between the
-// census and the delete is never killed by mistake.
-func (b *circuitBreaker) bounceOldestPod(ctx context.Context, snap *sweepSnapshot, svcKey string,
-	refs []podRef, now time.Time) {
-	g := snap.g
-	log := logf.FromContext(ctx)
-	var oldest *corev1.Pod
-	for _, r := range refs {
-		p, err := g.cs.CoreV1().Pods(r.namespace).Get(ctx, r.name, metav1.GetOptions{})
-		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				metrics.IncError(g.queue)
-				log.Error(err, "webhook backing pod get failed",
-					"pod", r.namespace+"/"+r.name, "service", svcKey)
-			}
-			continue
-		}
-		if p.DeletionTimestamp != nil || p.Status.Phase != corev1.PodRunning ||
-			!shared.PodReadyCond(p) {
-			continue
-		}
-		if oldest == nil ||
-			p.CreationTimestamp.Time.Before(oldest.CreationTimestamp.Time) {
-			oldest = p
-		}
-	}
-	if oldest == nil {
-		log.Info("webhook bounce: no Ready backing pod found — endpoint refs are stale",
-			"service", svcKey)
-		return
-	}
-	log.Info("BOUNCE: deleting oldest Ready webhook pod — hung TCP+TLS handshake",
-		"service", svcKey, "pod", oldest.Namespace+"/"+oldest.Name,
-		"age", now.Sub(oldest.CreationTimestamp.Time).Truncate(time.Second))
-	uid := oldest.UID
-	if err := g.cs.CoreV1().Pods(oldest.Namespace).Delete(ctx, oldest.Name,
-		shared.UIDDeleteOptions(uid, "")); err != nil {
-		metrics.IncError(g.queue)
-		log.Error(err, "webhook pod bounce delete failed",
-			"pod", oldest.Namespace+"/"+oldest.Name, "service", svcKey)
-		return
-	}
-	// The cooldown stamps on a DELIVERED bounce only — a failed
-	// delete leaves the pod hung and the next sweep retries.
-	b.bounceAt.Stamp(svcKey, now)
-}
-
 // failClosed reports whether the entry currently fails closed. A nil
 // failurePolicy defaults to Fail server-side; anything not explicitly
 // Ignore is treated as fail-closed.
 func failClosed(fp *admissionv1.FailurePolicyType) bool {
 	return fp == nil || *fp != admissionv1.Ignore
-}
-
-// parseCircuitAnnotation splits the comma-separated annotation value
-// into a name set. Webhook names are DNS-1123 subdomains — commas can
-// never appear in them, so the plain split is unambiguous.
-func parseCircuitAnnotation(v string) map[string]bool {
-	out := map[string]bool{}
-	for _, n := range strings.Split(v, ",") {
-		if n = strings.TrimSpace(n); n != "" {
-			out[n] = true
-		}
-	}
-	return out
 }
 
 // svcRefString renders a webhook's Service reference for log lines.

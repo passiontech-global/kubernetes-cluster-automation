@@ -221,7 +221,7 @@ func (j *failedJobsJanitor) sweepBuildRuns(ctx context.Context) error {
 		if br.GetDeletionTimestamp() != nil || !buildRunCompleted(br) {
 			continue
 		}
-		ct, found, _ := unstructured.NestedString(
+		ct, found := shared.NestedString(
 			br.Object, "status", "completionTime")
 		if !found {
 			continue // completed but no timestamp — can't age it, keep
@@ -255,23 +255,8 @@ func (j *failedJobsJanitor) sweepBuildRuns(ctx context.Context) error {
 // True (passed) or False (failed). Running builds and builds whose
 // controller never wrote the condition stay.
 func buildRunCompleted(br *unstructured.Unstructured) bool {
-	conds, found, _ := unstructured.NestedSlice(
-		br.Object, "status", "conditions")
-	if !found {
-		return false
-	}
-	for _, c := range conds {
-		m, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		typ, _, _ := unstructured.NestedString(m, "type")
-		status, _, _ := unstructured.NestedString(m, "status")
-		if typ == "Succeeded" && (status == "True" || status == "False") {
-			return true
-		}
-	}
-	return false
+	c, found := shared.ConditionOf(br.Object, "Succeeded")
+	return found && (c.Status == "True" || c.Status == "False")
 }
 
 // auditStuckTerminating marks every namespace/PVC/VolumeAttachment

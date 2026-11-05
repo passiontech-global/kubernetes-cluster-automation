@@ -25,10 +25,12 @@
 //   - The ported kuberhealthy HealthChecks are default-ON too:
 //     CLUSTER_HEALTH_PROBES_ENABLED / _INTERVAL plus the per-check
 //     HEALTH_* knobs (see internal/clusterhealthprobes).
-//   - `-modules name1,name2` runs only the listed modules (registry
-//     ops names from modules.go; default: all) — blast-radius control
-//     for isolating a module or splitting auditors from healers
-//     across Deployments.
+//   - `-modules name1,name2,@group` runs only the listed modules —
+//     registry ops names from modules.go, or a whole registry section
+//     via an @-selector (@system, @node, @apiserver, @janitors,
+//     @integration, @health); default: all — blast-radius control for
+//     isolating a module or splitting auditors from healers across
+//     Deployments.
 //
 // Registration gates (the *_ENABLED flags that decide whether a
 // module wires anything at all) live in the shared.Module registry —
@@ -202,12 +204,14 @@ func main() {
 		"interval between Lease renew/acquire attempts; 0 keeps the "+
 			"controller-runtime default (2s)")
 	// Blast-radius allowlist: an empty value (the default) runs the
-	// whole registry; otherwise only the named modules wire their
-	// runnables. Metrics predeclaration is NOT affected — every
-	// queue's series still exists so /metrics shows the full fleet.
+	// whole registry; otherwise only the named modules — or every
+	// module in a named @group — wire their runnables. Metrics
+	// predeclaration is NOT affected — every queue's series still
+	// exists so /metrics shows the full fleet.
 	flag.StringVar(&modulesFilter, "modules", "",
-		"comma-separated module names to run (default: all); names are "+
-			"the registry ops names from modules.go")
+		"comma-separated module names or @groups to run (default: all); "+
+			"names are the registry ops names from modules.go and "+
+			"@<group> expands to a whole section (e.g. @janitors)")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
