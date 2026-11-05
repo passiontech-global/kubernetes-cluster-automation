@@ -121,8 +121,12 @@ type everestKey struct{ namespace, cluster, reason string }
 // pausedLedgerKey identifies one Schedule generation for the
 // firstSeenPaused clock — the UID distinguishes a delete+recreate
 // with the same name (a fresh object re-arms the 24h measurement
-// instead of inheriting the dead one's pause time).
-type pausedLedgerKey struct{ uid, namespace, schedule string }
+// instead of inheriting the dead one's pause time). Joined as
+// "uid/ns/name" — UIDs and DNS-1123 names never contain a bare "/"
+// collision that matters here (the key is never split back).
+func pausedLedgerKey(uid, namespace, schedule string) string {
+	return uid + "/" + namespace + "/" + schedule
+}
 
 type veleroBackupAuditor struct {
 	cs         kubernetes.Interface // reserved for future typed reads
@@ -139,7 +143,7 @@ type veleroBackupAuditor struct {
 	// the only honest clock; it resets on unpause and prunes on
 	// delete, and a controller restart re-arms it (biased to
 	// under-page, never to alert on an unmeasurable pause).
-	firstSeenPaused map[pausedLedgerKey]time.Time
+	firstSeenPaused shared.FirstSeenLedger
 	// seenEverest: series ledger for DBBackupUnhealthy — an
 	// everestKey the sweep stops re-asserting gets
 	// DeleteLabelValues'd so a recovered or deleted
@@ -152,24 +156,22 @@ type veleroBackupAuditor struct {
 	// pvbHealed: "<ns>/<name>" -> last wedged-PVB cleanup time —
 	// the per-object cooldown that stops a still-broken node-agent
 	// from being delete-looped every sweep.
-	pvbHealed map[string]time.Time
+	pvbHealed shared.CooldownSet
 }
 
 // Setup registers the 15m sweep — or nothing when
-// the cluster opts out (VELERO_BACKUP_AUDITOR_ENABLED=false): same
-// disabled-flag pattern as cert-drift-auditor.
+// the cluster opts out (VELERO_BACKUP_AUDITOR_ENABLED=false, resolved
+// by setupModules into Deps.Disabled): same disabled-flag pattern as
+// cert-drift-auditor.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	if !shared.Gate("VELERO_BACKUP_AUDITOR_ENABLED", true) {
-		logf.Log.WithName(veleroAuditQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	a := &veleroBackupAuditor{
-		cs:              cs,
-		dyn:             dyn,
-		nowFn:           time.Now,
-		firstSeenPaused: map[pausedLedgerKey]time.Time{},
-		pvbHealed:       map[string]time.Time{},
+		cs:    cs,
+		dyn:   dyn,
+		nowFn: time.Now,
 	}
 	return shared.AddPeriodic(mgr, veleroAuditQueue, veleroAuditInterval, a.run)
 }
@@ -180,12 +182,6 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// auditor literally without the Setup path.
 	if a.nowFn == nil {
 		a.nowFn = time.Now
-	}
-	if a.firstSeenPaused == nil {
-		a.firstSeenPaused = map[pausedLedgerKey]time.Time{}
-	}
-	if a.pvbHealed == nil {
-		a.pvbHealed = map[string]time.Time{}
 	}
 
 	// W9-ST3 — the Everest DB-backup audit is independent of Velero:
@@ -216,7 +212,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	}
 	latest := latestBackupsBySchedule(backups)
 
-	pausedNow := map[pausedLedgerKey]bool{}
+	pausedNow := map[string]bool{}
 	for i := range schedules.Items {
 		s := &schedules.Items[i]
 		ns, name := s.GetNamespace(), s.GetName()
@@ -228,15 +224,13 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		// the key keeps a delete+recreate from inheriting pause time.
 		isPaused, _ := shared.NestedBool(s.Object, "spec", "paused")
 		if isPaused {
-			lk := pausedLedgerKey{string(s.GetUID()), ns, name}
+			lk := pausedLedgerKey(string(s.GetUID()), ns, name)
 			pausedNow[lk] = true
-			if _, ok := a.firstSeenPaused[lk]; !ok {
-				a.firstSeenPaused[lk] = a.nowFn()
-			}
+			first, _ := a.firstSeenPaused.Observe(lk, a.nowFn())
 			k := pausedKey{ns, name}
 			a.seenPaused.Emit(k, ns, name)
 			v := 0.0
-			if pausedFor := a.nowFn().Sub(a.firstSeenPaused[lk]); pausedFor > veleroPausedMinAge {
+			if pausedFor := a.nowFn().Sub(first); pausedFor > veleroPausedMinAge {
 				v = 1
 				log.Info("velero schedule paused >24h — backups silently stopped",
 					"schedule", ns+"/"+name, "pausedFor", pausedFor.Truncate(time.Hour))
@@ -267,11 +261,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// Drop first-seen entries for schedules that unpaused or vanished
 	// — a later re-pause measures a fresh duration, not the
 	// cumulative time it once spent paused.
-	for lk := range a.firstSeenPaused {
-		if !pausedNow[lk] {
-			delete(a.firstSeenPaused, lk)
-		}
-	}
+	a.firstSeenPaused.Prune(func(lk string) bool { return pausedNow[lk] })
 	a.seenBad.Prune(metrics.VeleroBackupEmptyOrErrored.DeleteLabelValues)
 
 	// W8-ST1 — BackupStorageLocation availability: a BSL not
@@ -666,12 +656,11 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 		if phase != "InProgress" || cleaned >= veleroPVBCleanupMaxPerRun {
 			continue
 		}
-		if last, ok := a.pvbHealed[ns+"/"+name]; ok &&
-			now.Sub(last) < veleroPVBCleanupCooldown {
+		if a.pvbHealed.CooledDown(ns+"/"+name, veleroPVBCleanupCooldown, now) {
 			continue
 		}
 		if a.cleanWedgedPVB(ctx, pvb, since) {
-			a.pvbHealed[ns+"/"+name] = now
+			a.pvbHealed.Stamp(ns+"/"+name, now)
 			cleaned++
 		}
 	}

@@ -47,6 +47,18 @@ type statefulMasterlessCheck struct {
 	drPodHealed    map[string]time.Time
 }
 
+// newStatefulMasterlessCheck builds the W6.2 check with fresh
+// tracking maps — the state-map initialization that used to live in
+// the monolithic newClusterHealthProber literal.
+func newStatefulMasterlessCheck(d *deps) checkRunner {
+	return &statefulMasterlessCheck{deps: d,
+		stsZeroSince:   map[string]time.Time{},
+		stsZeroEmitted: map[string]bool{},
+		drHealed:       map[string]time.Time{},
+		drPodHealed:    map[string]time.Time{},
+	}
+}
+
 // W6.2 — stateful-masterless-services knobs.
 const (
 	// masterlessZeroMinAge: a master-role Service must report 0

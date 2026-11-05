@@ -76,7 +76,8 @@ func rolledHash(s *corev1.Secret) string {
 	return s.Annotations["passiontech.dev/rolled-config-hash"]
 }
 
-// FLUENTBIT_ROLLER_ENABLED=false means Setup never registers the
+// A disabled module (Deps.Disabled stamped by setupModules for
+// FLUENTBIT_ROLLER_ENABLED=false) means Setup never registers the
 // reconciler (see TestSetupDisabled) — there is no in-Reconcile
 // disabled path to test.
 

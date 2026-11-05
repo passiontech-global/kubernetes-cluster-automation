@@ -68,10 +68,9 @@ func veleroBackup(ns, name, schedule, phase string, age time.Duration,
 
 func newVeleroAuditor(dyn *fake.FakeDynamicClient, now time.Time) *veleroBackupAuditor {
 	return &veleroBackupAuditor{
-		cs:              kfake.NewSimpleClientset(),
-		dyn:             dyn,
-		nowFn:           func() time.Time { return now },
-		firstSeenPaused: map[pausedLedgerKey]time.Time{},
+		cs:    kfake.NewSimpleClientset(),
+		dyn:   dyn,
+		nowFn: func() time.Time { return now },
 	}
 }
 
@@ -204,8 +203,9 @@ func TestVeleroBackupAuditorPauseLedgerReset(t *testing.T) {
 	if _, ok := pausedSeries(t, "velero", "flappy"); ok {
 		t.Fatal("paused series kept after unpause")
 	}
-	if len(a.firstSeenPaused) != 0 {
-		t.Fatalf("firstSeenPaused not pruned on unpause: %+v", a.firstSeenPaused)
+	if _, ok := a.firstSeenPaused.Seen(
+		pausedLedgerKey("velero/flappy", "velero", "flappy"), time.Now()); ok {
+		t.Fatal("firstSeenPaused not pruned on unpause")
 	}
 	setPaused(true)
 	if err := a.run(ctx); err != nil {
@@ -394,8 +394,7 @@ func TestVeleroBackupAuditorFailedAndBSL(t *testing.T) {
 		"metadata": map[string]any{"namespace": "velero", "name": "main"},
 		"status":   map[string]any{"phase": "Unavailable"}}}
 	dyn := newDynFake(sched, failed, bsl)
-	a := &veleroBackupAuditor{dyn: dyn, nowFn: time.Now,
-		firstSeenPaused: map[pausedLedgerKey]time.Time{}}
+	a := &veleroBackupAuditor{dyn: dyn, nowFn: time.Now}
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}

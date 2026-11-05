@@ -31,6 +31,12 @@ import (
 // repo-server restart heal.
 type argoCDAppStuckCheck struct{ *deps }
 
+// newArgoCDAppStuckCheck builds the W10-CP6 check — stateless, it
+// reads only deps.
+func newArgoCDAppStuckCheck(d *deps) checkRunner {
+	return &argoCDAppStuckCheck{deps: d}
+}
+
 const (
 	checkNameArgoCDAppStuck = "argocd-app-stuck"
 

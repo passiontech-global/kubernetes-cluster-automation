@@ -37,6 +37,17 @@ type olmHealthCheck struct {
 	olmHealed    map[string]time.Time
 }
 
+// newOlmHealthCheck builds the W7-C5 check with fresh tracking
+// maps — the state-map initialization that used to live in the
+// monolithic newClusterHealthProber literal.
+func newOlmHealthCheck(d *deps) checkRunner {
+	return &olmHealthCheck{deps: d,
+		olmFirstSeen: map[string]time.Time{},
+		olmEmitted:   map[string]bool{},
+		olmHealed:    map[string]time.Time{},
+	}
+}
+
 // ---------------------------------------------------------------------------
 // olm-subscription-health (W7-C5) — OLM CSV / webhook cert /
 // subscription guard + olm-operator auto-heal.

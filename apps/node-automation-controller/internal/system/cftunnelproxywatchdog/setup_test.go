@@ -13,7 +13,8 @@ import (
 )
 
 func TestSetupRegistersPeriodic(t *testing.T) {
-	t.Setenv("CF_TUNNEL_WATCHDOG_ENABLED", "true")
+	// Zero-value Deps.Disabled = gate-on — CF_TUNNEL_WATCHDOG_ENABLED
+	// is resolved by setupModules, not re-read here.
 	t.Setenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "cloudflare-tunnel-system")
 	t.Setenv("CF_TUNNEL_WATCHDOG_INTERVAL", "5m")
 	m := testutil.NewStubManager()
@@ -24,12 +25,12 @@ func TestSetupRegistersPeriodic(t *testing.T) {
 	testutil.ExpectPeriodic(t, m, "cf-tunnel-proxy-watchdog", 5*time.Minute)
 }
 
-// The ported watchdog skips mgr.Add entirely when disabled.
+// The ported watchdog skips mgr.Add entirely when Deps.Disabled is
+// stamped.
 func TestSetupDisabled(t *testing.T) {
-	t.Setenv("CF_TUNNEL_WATCHDOG_ENABLED", "false")
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
+		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {

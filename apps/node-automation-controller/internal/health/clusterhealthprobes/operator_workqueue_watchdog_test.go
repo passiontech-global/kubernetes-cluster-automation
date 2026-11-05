@@ -113,9 +113,9 @@ func TestCheckOperatorWorkqueuesSourceControllerHeals(t *testing.T) {
 		"apps", "repo", 5, 3)
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
-	p.operator.opFirstSeen["source-controller/gitrepositories/apps/repo"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["source-controller/gitrepositories/apps/repo"] = base.Add(-time.Hour)
 
-	if res := p.operator.run(ctx); res.pass {
+	if res := mustCheck[*operatorWorkqueueCheck](t, p).run(ctx); res.pass {
 		t.Fatal("stuck gitrepository with a renewing lease must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "source-controller", kcmReasonStaleGen); v != 1 {
@@ -143,9 +143,9 @@ func TestCheckOperatorWorkqueuesCertManagerNoConditions(t *testing.T) {
 	stuck := shUnstructured("cert-manager.io/v1", "Certificate", "apps", "tls", 1, 0)
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
-	p.operator.opFirstSeen["cert-manager/certificates/apps/tls"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["cert-manager/certificates/apps/tls"] = base.Add(-time.Hour)
 
-	if res := p.operator.run(ctx); res.pass {
+	if res := mustCheck[*operatorWorkqueueCheck](t, p).run(ctx); res.pass {
 		t.Fatal("never-reconciled Certificate must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "cert-manager", opReasonNoConditions); v != 1 {
@@ -170,9 +170,9 @@ func TestCheckOperatorWorkqueuesShipwrightOperatorNoConditions(t *testing.T) {
 		"", "build-1", 1, 0)
 	p := testProberDyn(cs, shOpDyn(stuck))
 	p.now = func() time.Time { return base }
-	p.operator.opFirstSeen["shipwright-operator/shipwrightbuilds//build-1"] = base.Add(-time.Hour)
+	mustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen["shipwright-operator/shipwrightbuilds//build-1"] = base.Add(-time.Hour)
 
-	if res := p.operator.run(ctx); res.pass {
+	if res := mustCheck[*operatorWorkqueueCheck](t, p).run(ctx); res.pass {
 		t.Fatal("never-reconciled ShipwrightBuild must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "shipwright-operator", opReasonNoConditions); v != 1 {

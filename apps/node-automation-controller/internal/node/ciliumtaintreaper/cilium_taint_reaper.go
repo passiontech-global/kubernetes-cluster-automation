@@ -46,16 +46,50 @@ type ciliumTaintReaper struct {
 	enabled bool
 }
 
+// The watch wiring below installs these package-level units
+// verbatim — tests exercise the exact predicate/mapfunc the
+// controller runs instead of introspecting controller-runtime
+// internals.
+
+// nodeSweepRequests collapses every Node event onto the single fixed
+// sweep key (see shared.SweepRequests).
+var nodeSweepRequests = shared.SweepRequests("cilium-taint-reaper-sweep")
+
+// ciliumPodSweepRequests maps a scheduled cilium pod onto the same
+// fixed sweep key; an unscheduled pod carries no verdict signal and
+// enqueues nothing.
+var ciliumPodSweepRequests handler.MapFunc = func(_ context.Context, o client.Object) []reconcile.Request {
+	if o.(*corev1.Pod).Spec.NodeName == "" {
+		return nil // unscheduled pod carries no verdict signal
+	}
+	return shared.FixedSweepRequest("cilium-taint-reaper-sweep")
+}
+
+// ciliumTaintChanges is the Node watch predicate — the bash jqFilter:
+// fire only when THIS taint's entries change, otherwise every kubelet
+// heartbeat (~20s/node) would enqueue a full-cluster sweep.
+var ciliumTaintChanges = predicate.Funcs{
+	CreateFunc:  func(event.CreateEvent) bool { return true },
+	DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	GenericFunc: func(event.GenericEvent) bool { return true },
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		oldN, ok1 := e.ObjectOld.(*corev1.Node)
+		newN, ok2 := e.ObjectNew.(*corev1.Node)
+		if !ok1 || !ok2 {
+			return true
+		}
+		return !reflect.DeepEqual(ciliumStaleTaints(oldN), ciliumStaleTaints(newN))
+	},
+}
+
 func Setup(d shared.Deps) error {
 	mgr, cs := d.Mgr, d.CS
-	enabled := shared.Gate("CILIUM_TAINT_REAPER_ENABLED", false)
-	if !enabled {
-		// Like Setup: clusters without the cilium
-		// component (and thus without pods watch RBAC) skip
-		// registration entirely — no controller, no informer, no
-		// RequeueAfter loop. The manager cache's cilium-pod ByObject
-		// entry exists only for this module.
-		logf.Log.WithName("cilium-taint-reaper").Info("disabled — module not registered")
+	// Clusters without the cilium component (and thus without pods
+	// watch RBAC) skip registration entirely — CILIUM_TAINT_REAPER_ENABLED
+	// is opt-in, resolved by setupModules into Deps.Disabled: no
+	// controller, no informer, no RequeueAfter loop. The manager
+	// cache's cilium-pod ByObject entry exists only for this module.
+	if d.Disabled {
 		return nil
 	}
 	return ctrl.NewControllerManagedBy(mgr).
@@ -67,37 +101,20 @@ func Setup(d shared.Deps) error {
 		// sync. One key collapses both to a single sweep (see
 		// shared.SweepRequests). Predicate semantics are unchanged.
 		Watches(&corev1.Node{},
-			handler.EnqueueRequestsFromMapFunc(shared.SweepRequests("cilium-taint-reaper-sweep")),
-			builder.WithPredicates(predicate.Funcs{
-				CreateFunc:  func(event.CreateEvent) bool { return true },
-				DeleteFunc:  func(event.DeleteEvent) bool { return true },
-				GenericFunc: func(event.GenericEvent) bool { return true },
-				// bash jqFilter: fire only when THIS taint's entries change —
-				// without it every kubelet heartbeat (~20s/node) would
-				// enqueue a full-cluster sweep.
-				UpdateFunc: func(e event.UpdateEvent) bool {
-					oldN, ok1 := e.ObjectOld.(*corev1.Node)
-					newN, ok2 := e.ObjectNew.(*corev1.Node)
-					if !ok1 || !ok2 {
-						return true
-					}
-					return !reflect.DeepEqual(ciliumStaleTaints(oldN), ciliumStaleTaints(newN))
-				},
-			})).
+			handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
+			builder.WithPredicates(ciliumTaintChanges)).
 		// Also react when a node's cilium pod flips Ready/not-Ready.
 		// The pod informer is already scoped to kube-system +
 		// k8s-app=cilium (manager cache options) and only exists
 		// because this module registered, so no extra predicate is
 		// needed. Same fixed sweep key — the reconcile never read
 		// the pod's node name anyway.
-		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(
-			func(_ context.Context, o client.Object) []reconcile.Request {
-				if o.(*corev1.Pod).Spec.NodeName == "" {
-					return nil // unscheduled pod carries no verdict signal
-				}
-				return shared.FixedSweepRequest("cilium-taint-reaper-sweep")
-			})).
-		Complete(&ciliumTaintReaper{cs: cs, enabled: enabled})
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(ciliumPodSweepRequests)).
+		// Registration implies the gate was on, so enabled is
+		// unconditionally true here — the field and its Reconcile
+		// check now only matter for literally-constructed reapers
+		// in tests.
+		Complete(&ciliumTaintReaper{cs: cs, enabled: true})
 }
 
 func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {

@@ -102,7 +102,7 @@ type externalSecretNudge struct {
 	// storeDownSince: store key → first sweep that observed
 	// Ready=False — the persistence clock for the connect auto-heal
 	// (a transient first False must not bounce the pod).
-	storeDownSince map[string]time.Time
+	storeDownSince shared.FirstSeenLedger
 	// stormSince: first sweep of the current ExternalSecret failure
 	// storm — same persistence clock, storm-triggered heal path.
 	stormSince time.Time
@@ -119,12 +119,11 @@ type externalSecretNudge struct {
 // with and without ESO.
 func Setup(d shared.Deps) error {
 	n := &externalSecretNudge{
-		cs:             d.CS,
-		dyn:            d.Dyn,
-		enabled:        shared.Gate("EXTERNALSECRET_NUDGE_ENABLED", false),
-		storeReady:     map[string]bool{},
-		nudged:         map[string]time.Time{},
-		storeDownSince: map[string]time.Time{},
+		cs:         d.CS,
+		dyn:        d.Dyn,
+		enabled:    shared.Gate("EXTERNALSECRET_NUDGE_ENABLED", false),
+		storeReady: map[string]bool{},
+		nudged:     map[string]time.Time{},
 	}
 	return shared.AddPeriodic(d.Mgr, esNudgeQueue, esNudgeInterval, n.run)
 }
@@ -137,9 +136,6 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.storeDownSince == nil {
-		n.storeDownSince = map[string]time.Time{} // literal-constructed fixtures
-	}
 
 	stores, err := n.listFirst(ctx, clusterSecretStoreGVRs)
 	if err != nil {
@@ -174,9 +170,9 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 		// W9-GO1 — the down-since clock for the connect auto-heal:
 		// first observed False starts it, True or vanish clears it.
 		if isReady {
-			delete(n.storeDownSince, key)
-		} else if _, down := n.storeDownSince[key]; !down {
-			n.storeDownSince[key] = now
+			n.storeDownSince.Forget(key)
+		} else {
+			n.storeDownSince.Observe(key, now)
 		}
 		if tracked && !prev && isReady {
 			recovered = true
@@ -201,7 +197,7 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 	for name := range n.storeReady {
 		if !seen[name] {
 			delete(n.storeReady, name)
-			delete(n.storeDownSince, name)
+			n.storeDownSince.Forget(name)
 		}
 	}
 	// A store currently Ready=True arms the state-based nudge — the
@@ -510,11 +506,17 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 
 	// Trigger 1 — a ClusterSecretStore (cluster-scoped only; a
 	// namespaced SecretStore outage does not bounce the shared
-	// connect pod) down past the persistence window.
+	// connect pod) down past the persistence window. The ledger
+	// cannot enumerate, so the check walks storeReady's CSS keys —
+	// down-since entries prune alongside storeReady, so every
+	// tracked-down store is still a known one.
 	storeDown := false
-	for key, since := range n.storeDownSince {
-		if strings.HasPrefix(key, "ClusterSecretStore/") &&
-			now.Sub(since) >= esConnectHealMinAge {
+	for key := range n.storeReady {
+		if !strings.HasPrefix(key, "ClusterSecretStore/") {
+			continue
+		}
+		if downFor, ok := n.storeDownSince.Seen(key, now); ok &&
+			downFor >= esConnectHealMinAge {
 			storeDown = true
 			break
 		}

@@ -86,11 +86,11 @@ type orphanEndpointSliceCleaner struct {
 }
 
 // Setup registers the 15-minute sweep.
-// Disabled clusters (ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED=false) skip
-// registration entirely — same contract as volumeattachment-cleaner.
+// Disabled clusters (ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED=false —
+// resolved by setupModules into Deps.Disabled) skip registration
+// entirely — same contract as volumeattachment-cleaner.
 func Setup(d shared.Deps) error {
-	if !shared.Gate("ORPHAN_ENDPOINTSLICE_CLEANER_ENABLED", true) {
-		logf.Log.WithName(orphanEndpointSliceQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	c := &orphanEndpointSliceCleaner{cs: d.CS, dyn: d.Dyn, nowFn: time.Now,

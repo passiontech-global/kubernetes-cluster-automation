@@ -47,6 +47,17 @@ type linkerdEndpointSyncCheck struct {
 	linkerdDesyncHealed  map[string]time.Time
 }
 
+// newLinkerdEndpointSyncCheck builds the W9-NM2 check with fresh
+// tracking maps — the state-map initialization that used to live in
+// the monolithic newClusterHealthProber literal.
+func newLinkerdEndpointSyncCheck(d *deps) checkRunner {
+	return &linkerdEndpointSyncCheck{deps: d,
+		linkerdDesyncSince:   map[string]time.Time{},
+		linkerdDesyncEmitted: map[string]bool{},
+		linkerdDesyncHealed:  map[string]time.Time{},
+	}
+}
+
 const (
 	// W9-NM2 — linkerd-endpoint-sync knobs.
 	checkNameLinkerdEndpointSync = "linkerd-endpoint-sync"

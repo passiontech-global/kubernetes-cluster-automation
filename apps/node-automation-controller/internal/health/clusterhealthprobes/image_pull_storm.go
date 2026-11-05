@@ -21,6 +21,12 @@ import (
 // imagePullStormCheck is the image-pull-storm watchdog.
 type imagePullStormCheck struct{ *deps }
 
+// newImagePullStormCheck builds the W10-GI5 check — stateless, it
+// reads only deps.
+func newImagePullStormCheck(d *deps) checkRunner {
+	return &imagePullStormCheck{deps: d}
+}
+
 const (
 	checkNameImagePullStorm = "image-pull-storm"
 

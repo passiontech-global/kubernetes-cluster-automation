@@ -179,12 +179,12 @@ type certDriftAuditor struct {
 }
 
 // Setup registers the 15m sweep — or nothing when the
-// cluster opts out (CERT_DRIFT_AUDITOR_ENABLED=false): same
-// disabled-flag pattern as certmanager-reaper.
+// cluster opts out (CERT_DRIFT_AUDITOR_ENABLED=false, resolved by
+// setupModules into Deps.Disabled): same disabled-flag pattern as
+// certmanager-reaper.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	if !shared.Gate("CERT_DRIFT_AUDITOR_ENABLED", true) {
-		logf.Log.WithName(certDriftQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	a := &certDriftAuditor{

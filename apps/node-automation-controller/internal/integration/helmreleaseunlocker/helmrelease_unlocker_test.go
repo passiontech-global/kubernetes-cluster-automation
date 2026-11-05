@@ -105,13 +105,12 @@ func hrAnnotation(t *testing.T, dyn *fake.FakeDynamicClient, gvr schema.GroupVer
 
 func newUnlocker(cs *kfake.Clientset, dyn *fake.FakeDynamicClient, stuckFor time.Duration, key string) *helmReleaseUnlocker {
 	u := &helmReleaseUnlocker{
-		cs:        cs,
-		dyn:       dyn,
-		firstSeen: map[string]time.Time{},
-		unlocked:  map[string]time.Time{},
+		cs:       cs,
+		dyn:      dyn,
+		unlocked: map[string]time.Time{},
 	}
 	if key != "" {
-		u.firstSeen[key] = time.Now().Add(-stuckFor)
+		u.firstSeen.Observe(key, time.Now().Add(-stuckFor))
 	}
 	return u
 }
@@ -277,7 +276,7 @@ func TestHelmReleaseUnlockerFirstSeenGate(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.firstSeen["apps/myapp"]; !ok {
+	if _, ok := u.firstSeen.Seen("apps/myapp", time.Now()); !ok {
 		t.Fatal("stuck HR not tracked in firstSeen")
 	}
 	if !secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
@@ -292,8 +291,10 @@ func TestHelmReleaseUnlockerFirstSeenGate(t *testing.T) {
 		t.Fatal("acted before the 30m window elapsed (2nd tick)")
 	}
 
-	// Window elapsed → act.
-	u.firstSeen["apps/myapp"] = time.Now().Add(-helmStuckThreshold - time.Minute)
+	// Window elapsed → act. Forget+Observe re-seeds the first-seen
+	// stamp unconditionally (Observe alone only stamps absent keys).
+	u.firstSeen.Forget("apps/myapp")
+	u.firstSeen.Observe("apps/myapp", time.Now().Add(-helmStuckThreshold-time.Minute))
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +315,7 @@ func TestHelmReleaseUnlockerRecoveryPrunesFirstSeen(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.firstSeen["apps/myapp"]; !ok {
+	if _, ok := u.firstSeen.Seen("apps/myapp", time.Now()); !ok {
 		t.Fatal("stuck HR not tracked")
 	}
 
@@ -327,7 +328,7 @@ func TestHelmReleaseUnlockerRecoveryPrunesFirstSeen(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.firstSeen["apps/myapp"]; ok {
+	if _, ok := u.firstSeen.Seen("apps/myapp", time.Now()); ok {
 		t.Fatal("recovered HR not pruned from firstSeen")
 	}
 }

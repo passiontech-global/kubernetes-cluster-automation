@@ -25,16 +25,24 @@
 //   - The ported kuberhealthy HealthChecks are default-ON too:
 //     CLUSTER_HEALTH_PROBES_ENABLED / _INTERVAL plus the per-check
 //     HEALTH_* knobs (see internal/clusterhealthprobes).
+//   - `-modules name1,name2` runs only the listed modules (registry
+//     ops names from modules.go; default: all) — blast-radius control
+//     for isolating a module or splitting auditors from healers
+//     across Deployments.
 //
-// Every module resolves its own env gates inside Setup — see
-// modules.go for the registry and internal/shared/env.go for the
-// parsing helpers.
+// Registration gates (the *_ENABLED flags that decide whether a
+// module wires anything at all) live in the shared.Module registry —
+// see modules.go; setupModules evaluates them and stamps
+// Deps.Disabled. Modules still resolve their own knobs and
+// sub-feature gates from env inside Setup — see
+// internal/shared/env.go for the parsing helpers.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -81,7 +89,7 @@ func defaultCacheTransform(obj interface{}) (interface{}, error) {
 }
 
 func main() {
-	var metricsAddr, probeAddr string
+	var metricsAddr, probeAddr, modulesFilter string
 	var showVersion, leaderElect bool
 	var leaseDuration, renewDeadline, retryPeriod time.Duration
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9115",
@@ -114,6 +122,13 @@ func main() {
 	flag.DurationVar(&retryPeriod, "leader-elect-retry-period", 0,
 		"interval between Lease renew/acquire attempts; 0 keeps the "+
 			"controller-runtime default (2s)")
+	// Blast-radius allowlist: an empty value (the default) runs the
+	// whole registry; otherwise only the named modules wire their
+	// runnables. Metrics predeclaration is NOT affected — every
+	// queue's series still exists so /metrics shows the full fleet.
+	flag.StringVar(&modulesFilter, "modules", "",
+		"comma-separated module names to run (default: all); names are "+
+			"the registry ops names from modules.go")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -125,6 +140,20 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	log := ctrl.Log.WithName("main")
+
+	// Resolve the -modules allowlist before touching the cluster: an
+	// unknown name fails boot here (fail fast — a typo'd allowlist
+	// silently running the wrong subset is worse than not starting).
+	moduleNames := parseModulesFlag(modulesFilter)
+	mods, err := filterModules(moduleNames)
+	if err != nil {
+		log.Error(err, "invalid -modules allowlist")
+		os.Exit(1)
+	}
+	if len(moduleNames) > 0 {
+		log.Info("modules allowlist active", "count", len(mods),
+			"names", strings.Join(moduleNames, ","))
+	}
 
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -173,11 +202,12 @@ func main() {
 						fields.Set{"metadata.name": "passiontech-pipeline"}),
 				},
 				// cilium component Role: pods in kube-system — informer is
-				// only started when CILIUM_TAINT_REAPER_ENABLED=true (see
-				// Setup, which now returns nil before
-				// registering when disabled), so clusters without the
-				// component (and thus without pods watch RBAC) never open
-				// this watch. No other module watches Pods.
+				// only started when CILIUM_TAINT_REAPER_ENABLED=true (the
+				// registry gate in modules.go hands the module
+				// Deps.Disabled, so it registers nothing when off), so
+				// clusters without the component (and thus without pods
+				// watch RBAC) never open this watch. No other module
+				// watches Pods.
 				&corev1.Pod{}: {
 					Namespaces: map[string]cache.Config{"kube-system": {}},
 					Label:      labels.SelectorFromSet(labels.Set{"k8s-app": "cilium"}),
@@ -230,7 +260,7 @@ func main() {
 	}
 
 	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn, Log: ctrl.Log}
-	if err := setupModules(deps); err != nil {
+	if err := setupModules(deps, mods); err != nil {
 		os.Exit(1)
 	}
 

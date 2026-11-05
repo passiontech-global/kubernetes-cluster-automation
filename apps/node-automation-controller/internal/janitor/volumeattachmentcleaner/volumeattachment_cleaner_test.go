@@ -18,8 +18,17 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
+
+// vaTrackedCount reports how many keys a FirstSeenLedger holds —
+// the ledger exposes no Len, so a keep-all Prune does the counting.
+func vaTrackedCount(l *shared.FirstSeenLedger) int {
+	n := 0
+	l.Prune(func(string) bool { n++; return true })
+	return n
+}
 
 // ---------------------------------------------------------------------------
 // Builders (vac-prefixed)
@@ -57,10 +66,8 @@ func vacPod(ns, name, node string, phase corev1.PodPhase) *corev1.Pod {
 
 func newVACleaner(cs *fake.Clientset, nowFn func() time.Time) *volumeAttachmentCleaner {
 	return &volumeAttachmentCleaner{
-		cs:                cs,
-		nowFn:             nowFn,
-		orphanFirstSeen:   map[string]time.Time{},
-		nodeNotReadySince: map[string]time.Time{},
+		cs:    cs,
+		nowFn: nowFn,
 	}
 }
 
@@ -107,7 +114,7 @@ func TestVACleanerMissingNodeTwoSightings(t *testing.T) {
 	if !vaExists(t, cs, "va-orphan") {
 		t.Fatal("VA deleted on first orphan sighting")
 	}
-	if _, ok := c.orphanFirstSeen["va-orphan"]; !ok {
+	if _, ok := c.orphanFirstSeen.Seen("va-orphan", time.Now()); !ok {
 		t.Fatal("first sighting not recorded in orphanFirstSeen")
 	}
 
@@ -121,7 +128,7 @@ func TestVACleanerMissingNodeTwoSightings(t *testing.T) {
 		metrics.VolumeAttachmentsCleanedTotal.WithLabelValues("missing_node")) - before; got != 1 {
 		t.Fatalf("missing_node counter delta = %v, want 1", got)
 	}
-	if _, ok := c.orphanFirstSeen["va-orphan"]; ok {
+	if _, ok := c.orphanFirstSeen.Seen("va-orphan", time.Now()); ok {
 		t.Fatal("deleted VA still tracked in orphanFirstSeen")
 	}
 }
@@ -174,7 +181,7 @@ func TestVACleanerNodeReappearsResetsGrace(t *testing.T) {
 	if err := c.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := c.orphanFirstSeen["va-flap"]; ok {
+	if _, ok := c.orphanFirstSeen.Seen("va-flap", time.Now()); ok {
 		t.Fatal("orphan tracking not pruned when the node reappeared")
 	}
 	if err := cs.CoreV1().Nodes().Delete(ctx, "flap-node", metav1.DeleteOptions{}); err != nil {
@@ -213,7 +220,7 @@ func TestVACleanerSkipsTerminatingVA(t *testing.T) {
 	if !vaExists(t, cs, "va-terminating") {
 		t.Fatal("terminating VA touched")
 	}
-	if _, ok := c.orphanFirstSeen["va-terminating"]; ok {
+	if _, ok := c.orphanFirstSeen.Seen("va-terminating", time.Now()); ok {
 		t.Fatal("terminating VA tracked as orphan")
 	}
 }
@@ -306,7 +313,7 @@ func TestVACleanerNotReadyWindowRearms(t *testing.T) {
 	if err := c.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := c.nodeNotReadySince["flap"]; ok {
+	if _, ok := c.nodeNotReadySince.Seen("flap", time.Now()); ok {
 		t.Fatal("not-Ready ledger not pruned on recovery")
 	}
 	// Node dies again — a fresh window starts now, so even after the
@@ -399,7 +406,7 @@ func TestVACleanerEmptyNodeListAborts(t *testing.T) {
 	if !vaExists(t, cs, "va-orphan") {
 		t.Fatal("VA deleted with an empty node list")
 	}
-	if len(c.orphanFirstSeen) != 0 {
+	if vaTrackedCount(&c.orphanFirstSeen) != 0 {
 		t.Fatal("orphan sightings recorded on an aborted run")
 	}
 	if got := testutil.QueueErrorCount(t, volumeAttachmentCleanerQueue) - before; got != 1 {

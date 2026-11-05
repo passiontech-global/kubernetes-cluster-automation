@@ -49,17 +49,21 @@ type konnectivityPatcher struct {
 	cs kubernetes.Interface
 }
 
+// onlyKonnectivityDaemonSet is the exact predicate the For() watch
+// below installs — a package var so the test exercises the predicate
+// directly instead of introspecting controller-runtime internals.
+var onlyKonnectivityDaemonSet = predicate.NewPredicateFuncs(func(o client.Object) bool {
+	return o.GetNamespace() == "kube-system" &&
+		o.GetName() == "konnectivity-agent"
+})
+
 // Setup reconciles only the konnectivity-agent
 // DaemonSet (the informer is already field-scoped to it via the
 // manager cache; the predicate is a cheap belt on top).
 func Setup(d shared.Deps) error {
 	return ctrl.NewControllerManagedBy(d.Mgr).
 		Named("konnectivity-patcher").
-		For(&appsv1.DaemonSet{}, builder.WithPredicates(
-			predicate.NewPredicateFuncs(func(o client.Object) bool {
-				return o.GetNamespace() == "kube-system" &&
-					o.GetName() == "konnectivity-agent"
-			}))).
+		For(&appsv1.DaemonSet{}, builder.WithPredicates(onlyKonnectivityDaemonSet)).
 		Complete(&konnectivityPatcher{cs: d.CS})
 }
 

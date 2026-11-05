@@ -134,13 +134,10 @@ func Setup(d shared.Deps) error {
 	logf.Log.WithName(webhookGuardQueue).Info("registered",
 		"interval", 5*time.Minute, "circuitBreaker", circuitBreakerEnabled(),
 		"unmeshedRemediation", unmeshedRemediationEnabled())
-	g := &webhookGuard{cs: d.CS, dyn: d.Dyn, nowFn: time.Now,
-		circuitBreaker: circuitBreaker{
-			deadSince:     map[string]time.Time{},
-			brokenEmitted: map[string]bool{},
-			bounceAt:      map[string]time.Time{}},
-		unmeshedPodAuditor: unmeshedPodAuditor{
-			unmeshedEmitted: map[string]bool{}}}
+	// The bookkeeping ledgers (brokenEmitted, unmeshedEmitted,
+	// deadSince, bounceAt) are shared.* zero-value types — nothing to
+	// initialize here.
+	g := &webhookGuard{cs: d.CS, dyn: d.Dyn, nowFn: time.Now}
 	return shared.AddPeriodic(d.Mgr, webhookGuardQueue, 5*time.Minute, g.run)
 }
 

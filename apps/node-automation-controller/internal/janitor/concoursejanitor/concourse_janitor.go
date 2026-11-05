@@ -209,20 +209,22 @@ type concourseWorkdirJanitor struct {
 
 // Setup registers the 30-minute sweep (was the
 // CronJob schedule `7,37 * * * *`). The CONCOURSE_JANITOR_ENABLED
-// gate is opt-in — disabled clusters skip registration entirely,
-// same contract as volumeattachment-cleaner.
+// gate is opt-in — resolved by setupModules into Deps.Disabled, so
+// disabled clusters skip registration entirely, same contract as
+// volumeattachment-cleaner.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	enabled := shared.Gate("CONCOURSE_JANITOR_ENABLED", false)
-	if !enabled {
-		logf.Log.WithName(cjQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	j := &concourseWorkdirJanitor{
-		cs:      cs,
-		stats:   &kubeletStatsReader{cs: cs},
-		atc:     newATCClient(cjATCBase, &http.Client{Timeout: cjATCTimeout}),
-		enabled: enabled,
+		cs:    cs,
+		stats: &kubeletStatsReader{cs: cs},
+		atc:   newATCClient(cjATCBase, &http.Client{Timeout: cjATCTimeout}),
+		// Reaching this line means the registration gate was on, so
+		// the field is unconditionally true — run()'s enabled check
+		// now only guards literally-constructed janitors in tests.
+		enabled: true,
 		dyn:     dyn,
 
 		runTimeout:     cjRunTimeout,

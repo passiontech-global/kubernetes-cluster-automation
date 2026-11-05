@@ -27,6 +27,16 @@ type rabbitMQSuspendedCheck struct {
 	rbHealed         map[string]time.Time
 }
 
+// newRabbitMQSuspendedCheck builds the W6.4 check with fresh
+// tracking maps — the state-map initialization that used to live in
+// the monolithic newClusterHealthProber literal.
+func newRabbitMQSuspendedCheck(d *deps) checkRunner {
+	return &rabbitMQSuspendedCheck{deps: d,
+		rbSuspendedSince: map[string]time.Time{},
+		rbHealed:         map[string]time.Time{},
+	}
+}
+
 // W6.4 — rabbitmq-suspended-listener knobs.
 const (
 	rabbitComponentLabel  = "app.kubernetes.io/component=rabbitmq"

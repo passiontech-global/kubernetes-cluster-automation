@@ -24,6 +24,12 @@ import (
 // condition while Ready uncordoned workers exist.
 type schedulerWatchdogCheck struct{ *deps }
 
+// newSchedulerWatchdogCheck builds the W8-CP3 watchdog — stateless,
+// it reads only deps.
+func newSchedulerWatchdogCheck(d *deps) checkRunner {
+	return &schedulerWatchdogCheck{deps: d}
+}
+
 const (
 	// W8-CP3 — scheduler-watchdog knobs.
 	checkNameSchedulerWatchdog = "scheduler-watchdog"

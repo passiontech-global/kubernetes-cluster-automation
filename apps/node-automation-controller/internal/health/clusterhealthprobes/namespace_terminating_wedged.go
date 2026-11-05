@@ -31,6 +31,12 @@ import (
 // watchdog with the finalizer sweep.
 type namespaceTerminatingWedgedCheck struct{ *deps }
 
+// newNamespaceTerminatingWedgedCheck builds the W10-CP1 check —
+// stateless, it reads only deps.
+func newNamespaceTerminatingWedgedCheck(d *deps) checkRunner {
+	return &namespaceTerminatingWedgedCheck{deps: d}
+}
+
 const (
 	checkNameNamespaceWedged = "namespace-terminating-wedged"
 

@@ -108,11 +108,12 @@ type crListResult struct {
 }
 
 // Setup registers the 15m sweep. Disabled clusters
-// (no cert-manager component / no ACME) skip registration entirely.
+// (no cert-manager component / no ACME — CERTMANAGER_REAPER_ENABLED is
+// opt-in and resolved by setupModules into Deps.Disabled) skip
+// registration entirely.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	if !shared.Gate("CERTMANAGER_REAPER_ENABLED", false) {
-		logf.Log.WithName(certReaperQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	r := &certManagerReaper{cs: cs, dyn: dyn,

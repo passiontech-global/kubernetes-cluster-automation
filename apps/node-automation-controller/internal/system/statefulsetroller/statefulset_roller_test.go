@@ -16,8 +16,17 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	natestutil "github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
 )
+
+// srTrackedCount reports how many keys a FirstSeenLedger holds —
+// the ledger exposes no Len, so a keep-all Prune does the counting.
+func srTrackedCount(l *shared.FirstSeenLedger) int {
+	n := 0
+	l.Prune(func(string) bool { n++; return true })
+	return n
+}
 
 // ---------------------------------------------------------------------------
 // Builders (sr-prefixed to stay unique across sibling test files)
@@ -95,7 +104,7 @@ func srPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 
 func srRoller(cs *fake.Clientset, now time.Time) *statefulSetOnDeleteRoller {
 	return &statefulSetOnDeleteRoller{cs: cs,
-		nowFn: func() time.Time { return now }, driftSince: map[string]time.Time{}}
+		nowFn: func() time.Time { return now }}
 }
 
 // emulateEviction teaches the fake clientset the apiserver's
@@ -214,7 +223,7 @@ func TestStatefulSetRollerRequiresOptIn(t *testing.T) {
 	if !srPodExists(t, cs, "apps", "db-0") {
 		t.Fatal("unannotated StatefulSet rolled")
 	}
-	if len(r.driftSince) != 0 {
+	if srTrackedCount(&r.driftSince) != 0 {
 		t.Fatal("unannotated StatefulSet tracked for drift")
 	}
 }
@@ -250,7 +259,7 @@ func TestStatefulSetRollerCordonedNodeGate(t *testing.T) {
 		srPod("db", 0, "rev-old", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
 	r := srRoller(cs, t0)
-	r.driftSince["apps/db"] = t0.Add(-time.Hour) // pre-aged drift
+	r.driftSince.Observe("apps/db", t0.Add(-time.Hour)) // pre-aged drift
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +290,7 @@ func TestStatefulSetRollerPDBGate(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	emulateEviction(cs)
 	r := srRoller(cs, t0)
-	r.driftSince["apps/db"] = t0.Add(-time.Hour)
+	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +337,7 @@ func TestStatefulSetRollerPDBEmptySelectorGate(t *testing.T) {
 		pdb)
 	cs := fake.NewSimpleClientset(objs...)
 	r := srRoller(cs, t0)
-	r.driftSince["apps/db"] = t0.Add(-time.Hour)
+	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +362,7 @@ func TestStatefulSetRollerMissingRevisionLabel(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	emulateEviction(cs)
 	r := srRoller(cs, t0)
-	r.driftSince["apps/db"] = t0.Add(-time.Hour)
+	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +394,7 @@ func TestStatefulSetRollerTerminatingPodBlocksRoll(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	emulateEviction(cs)
 	r := srRoller(cs, t0)
-	r.driftSince["apps/db"] = t0.Add(-time.Hour)
+	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +419,7 @@ func TestStatefulSetRollerPodTemplateAnnotationOptIn(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	emulateEviction(cs)
 	r := srRoller(cs, t0)
-	r.driftSince["apps/db"] = t0.Add(-time.Hour)
+	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +441,7 @@ func TestStatefulSetRollerNewestPodStabilityGate(t *testing.T) {
 		fresh)
 	cs := fake.NewSimpleClientset(objs...)
 	r := srRoller(cs, t0)
-	r.driftSince["apps/db"] = t0.Add(-time.Hour)
+	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +463,7 @@ func TestStatefulSetRollerAllReadyGate(t *testing.T) {
 		broken)
 	cs := fake.NewSimpleClientset(objs...)
 	r := srRoller(cs, t0)
-	r.driftSince["apps/db"] = t0.Add(-time.Hour)
+	r.driftSince.Observe("apps/db", t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -476,7 +485,7 @@ func TestStatefulSetRollerDriftReArms(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := r.driftSince["apps/db"]; !ok {
+	if _, ok := r.driftSince.Seen("apps/db", time.Now()); !ok {
 		t.Fatal("drift not tracked on first sighting")
 	}
 
@@ -493,7 +502,7 @@ func TestStatefulSetRollerDriftReArms(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := r.driftSince["apps/db"]; ok {
+	if _, ok := r.driftSince.Seen("apps/db", time.Now()); ok {
 		t.Fatal("settled drift still tracked")
 	}
 	if !srPodExists(t, cs, "apps", "db-0") {

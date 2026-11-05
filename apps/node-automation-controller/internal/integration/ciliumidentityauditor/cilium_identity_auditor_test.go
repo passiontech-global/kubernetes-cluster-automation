@@ -88,8 +88,11 @@ func identityPod(ns, name, identityID string) *corev1.Pod {
 }
 
 func TestCiliumIdentityAuditorSetupDisabled(t *testing.T) {
-	t.Setenv("CILIUM_IDENTITY_AUDITOR_ENABLED", "false")
-	if err := Setup(shared.Deps{}); err != nil {
+	// Deps.Disabled is what setupModules stamps when
+	// CILIUM_IDENTITY_AUDITOR_ENABLED gates the module off — a
+	// disabled Setup must return nil without touching the (nil)
+	// manager.
+	if err := Setup(shared.Deps{Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 }
@@ -255,11 +258,10 @@ func notReadyNode(name string) *corev1.Node {
 // the grace/minAge gates need deterministic nowFn in tests.
 func newGCAuditor(cs kubernetes.Interface, dyn dynamic.Interface, now time.Time) *ciliumIdentityAuditor {
 	return &ciliumIdentityAuditor{
-		cs:              cs,
-		dyn:             dyn,
-		gcEnabled:       true,
-		orphanFirstSeen: map[string]time.Time{},
-		nowFn:           func() time.Time { return now },
+		cs:        cs,
+		dyn:       dyn,
+		gcEnabled: true,
+		nowFn:     func() time.Time { return now },
 	}
 }
 
@@ -288,8 +290,8 @@ func TestCiliumIdentityAuditorGCDeletesEligibleOrphan(t *testing.T) {
 		ciliumEndpoint("app", "cep-1", 5002))
 	cs := fake.NewSimpleClientset(readyNode("n1"), readyNode("n2"))
 	a := newGCAuditor(cs, dyn, now)
-	a.orphanFirstSeen["5001"] = now.Add(-ciliumOrphanGracePeriod - time.Minute)
-	a.orphanFirstSeen["5003"] = now.Add(-time.Hour) // orphaned long — but too young
+	a.orphanFirstSeen.Observe("5001", now.Add(-ciliumOrphanGracePeriod-time.Minute))
+	a.orphanFirstSeen.Observe("5003", now.Add(-time.Hour)) // orphaned long — but too young
 
 	before := promtestutil.ToFloat64(metrics.CiliumIdentitiesCollectedTotal)
 	if err := a.run(ctx); err != nil {
@@ -321,7 +323,7 @@ func TestCiliumIdentityAuditorGCGracePeriod(t *testing.T) {
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := a.orphanFirstSeen["7001"]; !ok {
+	if _, ok := a.orphanFirstSeen.Seen("7001", now); !ok {
 		t.Fatal("first-sweep orphan not tracked in orphanFirstSeen")
 	}
 	if !identityExists(t, dyn, "7001") {
@@ -347,7 +349,7 @@ func TestCiliumIdentityAuditorGCAbortsOnNotReadyNode(t *testing.T) {
 		ciliumIdentityAged("8001", now.Add(-time.Hour)))
 	cs := fake.NewSimpleClientset(readyNode("n1"), notReadyNode("n2"))
 	a := newGCAuditor(cs, dyn, now)
-	a.orphanFirstSeen["8001"] = now.Add(-time.Hour)
+	a.orphanFirstSeen.Observe("8001", now.Add(-time.Hour))
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -364,7 +366,7 @@ func TestCiliumIdentityAuditorGCAbortsOnZeroNodes(t *testing.T) {
 	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
 		ciliumIdentityAged("8002", now.Add(-time.Hour)))
 	a := newGCAuditor(fake.NewSimpleClientset(), dyn, now)
-	a.orphanFirstSeen["8002"] = now.Add(-time.Hour)
+	a.orphanFirstSeen.Observe("8002", now.Add(-time.Hour))
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -383,7 +385,7 @@ func TestCiliumIdentityAuditorGCDisabledNeverDeletes(t *testing.T) {
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
 	a.gcEnabled = false
-	a.orphanFirstSeen["9001"] = now.Add(-time.Hour)
+	a.orphanFirstSeen.Observe("9001", now.Add(-time.Hour))
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -392,7 +394,7 @@ func TestCiliumIdentityAuditorGCDisabledNeverDeletes(t *testing.T) {
 		t.Fatal("identity deleted while gcEnabled=false")
 	}
 	// The ledger still accrues — flipping GC on later collects immediately.
-	if _, ok := a.orphanFirstSeen["9001"]; !ok {
+	if _, ok := a.orphanFirstSeen.Seen("9001", now); !ok {
 		t.Fatal("orphan tracking lost while GC disabled")
 	}
 }
@@ -411,7 +413,7 @@ func TestCiliumIdentityAuditorGCMaxDeleteCap(t *testing.T) {
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
 	for i := 0; i < ciliumGCMaxDelete+10; i++ {
-		a.orphanFirstSeen[fmt.Sprintf("%d", 20000+i)] = now.Add(-time.Hour)
+		a.orphanFirstSeen.Observe(fmt.Sprintf("%d", 20000+i), now.Add(-time.Hour))
 	}
 
 	before := promtestutil.ToFloat64(metrics.CiliumIdentitiesCollectedTotal)
@@ -441,7 +443,7 @@ func TestCiliumIdentityAuditorGCDeleteUIDPrecondition(t *testing.T) {
 	dyn := testutil.NewFakeDyn(ciliumAuditListKinds, orphan)
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
-	a.orphanFirstSeen["5001"] = now.Add(-time.Hour)
+	a.orphanFirstSeen.Observe("5001", now.Add(-time.Hour))
 
 	var gotUID *types.UID
 	dyn.PrependReactor("delete", "ciliumidentities",
@@ -479,7 +481,7 @@ func TestCiliumIdentityAuditorGCConflictSkipsDelete(t *testing.T) {
 		})
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
-	a.orphanFirstSeen["5002"] = now.Add(-time.Hour)
+	a.orphanFirstSeen.Observe("5002", now.Add(-time.Hour))
 
 	before := testutil.QueueErrorCount(t, ciliumAuditQueue)
 	if err := a.run(ctx); err != nil {
@@ -505,8 +507,8 @@ func TestCiliumIdentityAuditorGCPrunesOrphanLedger(t *testing.T) {
 	a := newGCAuditor(cs, dyn, now)
 	// Seed stale entries: one for an identity that will reappear
 	// (endpoint created below), one for an object that does not exist.
-	a.orphanFirstSeen["6001"] = now.Add(-5 * time.Minute)
-	a.orphanFirstSeen["9999"] = now.Add(-time.Hour) // vanished object
+	a.orphanFirstSeen.Observe("6001", now.Add(-5*time.Minute))
+	a.orphanFirstSeen.Observe("9999", now.Add(-time.Hour)) // vanished object
 
 	if _, err := dyn.Resource(ciliumEndpointGVR).Namespace("app").
 		Create(ctx, ciliumEndpoint("app", "cep-x", 6001), metav1.CreateOptions{}); err != nil {
@@ -515,10 +517,10 @@ func TestCiliumIdentityAuditorGCPrunesOrphanLedger(t *testing.T) {
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := a.orphanFirstSeen["6001"]; ok {
+	if _, ok := a.orphanFirstSeen.Seen("6001", now); ok {
 		t.Fatal("re-referenced identity kept its orphan stamp")
 	}
-	if _, ok := a.orphanFirstSeen["9999"]; ok {
+	if _, ok := a.orphanFirstSeen.Seen("9999", now); ok {
 		t.Fatal("vanished identity kept its orphan stamp")
 	}
 }
@@ -545,7 +547,7 @@ func TestCiliumIdentityAuditorSkipsReservedIdentities(t *testing.T) {
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
 	for _, name := range []string{"1", "255", "30000", "4000"} {
-		a.orphanFirstSeen[name] = now.Add(-time.Hour) // past every gate
+		a.orphanFirstSeen.Observe(name, now.Add(-time.Hour)) // past every gate
 	}
 
 	if err := a.run(ctx); err != nil {
@@ -555,7 +557,7 @@ func TestCiliumIdentityAuditorSkipsReservedIdentities(t *testing.T) {
 		if !identityExists(t, dyn, name) {
 			t.Fatalf("reserved identity %s was collected", name)
 		}
-		if _, ok := a.orphanFirstSeen[name]; ok {
+		if _, ok := a.orphanFirstSeen.Seen(name, now); ok {
 			t.Fatalf("reserved identity %s entered orphan tracking", name)
 		}
 	}
@@ -576,7 +578,7 @@ func TestCiliumIdentityAuditorCESCountsAsUsed(t *testing.T) {
 		ciliumEndpointSlice("app", "ces-1", 4001))
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
-	a.orphanFirstSeen["4001"] = now.Add(-time.Hour)
+	a.orphanFirstSeen.Observe("4001", now.Add(-time.Hour))
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -584,7 +586,7 @@ func TestCiliumIdentityAuditorCESCountsAsUsed(t *testing.T) {
 	if !identityExists(t, dyn, "4001") {
 		t.Fatal("identity referenced only by a CiliumEndpointSlice was collected")
 	}
-	if _, ok := a.orphanFirstSeen["4001"]; ok {
+	if _, ok := a.orphanFirstSeen.Seen("4001", now); ok {
 		t.Fatal("CES-referenced identity stayed in orphan tracking")
 	}
 }
@@ -602,7 +604,7 @@ func TestCiliumIdentityAuditorCESListErrorFailsClosed(t *testing.T) {
 		})
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
-	a.orphanFirstSeen["4002"] = now.Add(-time.Hour)
+	a.orphanFirstSeen.Observe("4002", now.Add(-time.Hour))
 
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when the ciliumendpointslice list fails")

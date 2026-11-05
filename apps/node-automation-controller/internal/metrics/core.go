@@ -7,7 +7,7 @@
 // unchanged. reconcileErrors is the new native counterpart.
 //
 // The package is split by emitting domain: core.go (this file) holds
-// the run-error counters, the queue list, init() and IncError;
+// the run-error counters, init(), PredeclareQueue and IncError;
 // apiserver.go / health.go / integration.go / operations.go hold the
 // per-domain vectors. Registration order and label values are
 // unchanged from the original single-file layout.
@@ -28,33 +28,13 @@ var reconcileErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Module run errors (node-automation-controller native counter).",
 }, []string{"controller"})
 
-// queues are the legacy shell-operator queue names — pre-instantiated
-// at 0 so /metrics always exposes every series (an empty CounterVec
-// emits nothing, and shell-operator emitted its counters eagerly).
-var queues = []string{
-	"konnectivity-patcher", "cilium-taint-reaper", "descheduler-storm-gate",
-	"node-labeler", "fluent-bit-config-roller", "coredns-stale-watchdog",
-	"kubelet-liveness-reaper", "admission-webhook-guard",
-	"partition-pod-evictor", "failed-jobs-janitor",
-	"concourse-workdir-janitor",
-	// remediation modules (v0.2.0)
-	"dead-node-sweeper", "helmrelease-unlocker", "externalsecret-nudge",
-	"evicted-pod-janitor", "cronjob-catchup", "certmanager-reaper",
-	"cilium-identity-auditor", "csr-watcher",
-	// watch-cache wedge guard
-	"apiserver-endpoint-guard",
-	// ported kubectl CronJobs (v0.8.0)
-	"coredns-patcher", "metrics-server-patcher", "cf-tunnel-proxy-watchdog",
-	// ported kuberhealthy HealthChecks
-	"cluster-health-probes",
-	// self-healing / gray-failure defense modules
-	"pdb-deadlock-watchdog", "volumeattachment-cleaner",
-	"cert-drift-auditor",
-	// waves 1-3 operations modules
-	"apiservice-guard", "zombie-sidecar-reaper",
-	"orphan-endpointslice-cleaner", "statefulset-ondelete-roller",
-	"velero-backup-auditor",
-}
+// The queue label values are NOT listed here — cmd/manager's module
+// registry is the single source of truth for the fleet's ops names,
+// and setupModules calls PredeclareQueue for every row (gated or
+// not) at boot. IncError below auto-creates a series on demand
+// anyway; predeclaration exists only so /metrics exposes every
+// module's 0-valued series before the first scrape, matching the
+// eager emission shell-operator had.
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(hookRunErrors, reconcileErrors,
@@ -89,10 +69,19 @@ func init() {
 		ExternalSecretStormSuppressed, CFTunnelWedgePodsDeletedTotal,
 		VeleroBackupStuck, VeleroPodVolumeBackupWedged,
 		VeleroWedgedObjectsCleanedTotal, APIServiceUnblockHealsTotal)
-	for _, q := range queues {
-		hookRunErrors.WithLabelValues(q)
-		reconcileErrors.WithLabelValues(q)
-	}
+}
+
+// PredeclareQueue instantiates both error counters for module `name`
+// at 0 — an empty CounterVec emits nothing on /metrics, and
+// shell-operator emitted its counters eagerly, so every registered
+// module's series must exist before the first scrape. setupModules
+// calls this for every registry row (a gated-off module still gets
+// its series — alert queries must not go absent when a module is
+// disabled). `name` is the module's ops name from the registry, which
+// is the legacy shell-operator queue name.
+func PredeclareQueue(name string) {
+	hookRunErrors.WithLabelValues(name)
+	reconcileErrors.WithLabelValues(name)
 }
 
 // IncError increments both counters for module `name`. `name` must be

@@ -190,18 +190,16 @@ func stallFixture() (*unstructured.Unstructured, []runtime.Object) {
 func newStallUnlocker(cs *kfake.Clientset, dyn *fake.FakeDynamicClient,
 	stuckFor time.Duration, key string) *helmReleaseUnlocker {
 	u := &helmReleaseUnlocker{
-		cs:             cs,
-		dyn:            dyn,
-		firstSeen:      map[string]time.Time{},
-		unlocked:       map[string]time.Time{},
-		alerted:        map[string]bool{},
-		stallEnabled:   true,
-		stallFirstSeen: map[string]time.Time{},
-		unwedged:       map[string]time.Time{},
-		stallAlerted:   map[string]time.Time{},
+		cs:           cs,
+		dyn:          dyn,
+		unlocked:     map[string]time.Time{},
+		alerted:      map[string]bool{},
+		stallEnabled: true,
+		unwedged:     map[string]time.Time{},
+		stallAlerted: map[string]time.Time{},
 	}
 	if key != "" {
-		u.stallFirstSeen[key] = time.Now().Add(-stuckFor)
+		u.stallFirstSeen.Observe(key, time.Now().Add(-stuckFor))
 	}
 	return u
 }
@@ -459,13 +457,14 @@ func TestHelmStallUnwedgeFirstSeenGate(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.stallFirstSeen["ops/connect"]; !ok {
+	if _, ok := u.stallFirstSeen.Seen("ops/connect", time.Now()); !ok {
 		t.Fatal("stalled HR not tracked in stallFirstSeen")
 	}
 	if got := rsReplicas(t, cs, "onepassword", "connect-old"); got != 2 {
 		t.Fatalf("acted before the 30m window: %d, want 2", got)
 	}
-	u.stallFirstSeen["ops/connect"] = time.Now().Add(-helmStuckThreshold - time.Minute)
+	u.stallFirstSeen.Forget("ops/connect")
+	u.stallFirstSeen.Observe("ops/connect", time.Now().Add(-helmStuckThreshold-time.Minute))
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -487,7 +486,7 @@ func TestHelmStallUnwedgeDisabledGate(t *testing.T) {
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.stallFirstSeen["ops/connect"]; ok {
+	if _, ok := u.stallFirstSeen.Seen("ops/connect", time.Now()); ok {
 		t.Fatal("disabled module tracked the stalled HR")
 	}
 	if got := rsReplicas(t, cs, "onepassword", "connect-old"); got != 2 {

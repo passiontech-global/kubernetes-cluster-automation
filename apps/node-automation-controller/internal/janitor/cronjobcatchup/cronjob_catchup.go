@@ -97,7 +97,7 @@ type cronJobCatchup struct {
 	// got its deadline patched, was suspended, or vanished gets its
 	// series deleted instead of pinning the alert forever (same
 	// seen-set hygiene as the webhook guard's brokenEmitted).
-	missedEmitted map[string]bool
+	missedEmitted shared.GaugeLedger[string]
 }
 
 // Setup registers the 15-minute sweep.
@@ -113,9 +113,6 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 	if c.nowFn == nil {
 		c.nowFn = time.Now
 	}
-	if c.missedEmitted == nil {
-		c.missedEmitted = map[string]bool{}
-	}
 	now := c.nowFn()
 
 	cronjobs, err := c.cs.BatchV1().CronJobs(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
@@ -124,7 +121,6 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 	}
 
 	spawned := 0
-	emitted := map[string]bool{} // TooManyMissedStarts tuples re-seen this sweep
 	for i := range cronjobs.Items {
 		cj := &cronjobs.Items[i]
 		if cj.Spec.Suspend != nil && *cj.Spec.Suspend {
@@ -143,7 +139,8 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 					anchor = cj.Status.LastScheduleTime.Time
 				}
 				if missedOver100(sched, anchor, now) {
-					emitted[cj.Namespace+"/"+cj.Name] = true
+					c.missedEmitted.Emit(cj.Namespace+"/"+cj.Name,
+						cj.Namespace, cj.Name)
 					metrics.CronJobTooManyMissedStarts.
 						WithLabelValues(cj.Namespace, cj.Name).Set(1)
 					c.unfreezeDeadline(ctx, log, cj, now)
@@ -190,16 +187,7 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 	// Prune TooManyMissedStarts series whose tuple was not re-seen —
 	// a patched (deadline now set), suspended or deleted CronJob
 	// must not pin the gauge at 1 forever.
-	for k := range c.missedEmitted {
-		if emitted[k] {
-			continue
-		}
-		if parts := strings.SplitN(k, "/", 2); len(parts) == 2 {
-			metrics.CronJobTooManyMissedStarts.
-				DeleteLabelValues(parts[0], parts[1])
-		}
-	}
-	c.missedEmitted = emitted
+	c.missedEmitted.Prune(metrics.CronJobTooManyMissedStarts.DeleteLabelValues)
 	log.Info("sweep done", "spawned", spawned)
 	return nil
 }

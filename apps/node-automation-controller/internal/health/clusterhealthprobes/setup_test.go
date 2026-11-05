@@ -40,12 +40,14 @@ func TestSetupPeriodicModules(t *testing.T) {
 }
 
 // The prober skips mgr.Add entirely when disabled — the kuberhealthy
-// checker Pods were always-on, but a cluster can still opt out.
+// checker Pods were always-on, but a cluster can still opt out via
+// CLUSTER_HEALTH_PROBES_ENABLED=false (setupModules evaluates the
+// gate and stamps Deps.Disabled).
 func TestSetupFeatureFlagVariants(t *testing.T) {
-	t.Setenv("CLUSTER_HEALTH_PROBES_ENABLED", "false")
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{
-		Mgr: m, CS: fake.NewSimpleClientset(), Dyn: testutil.NewFakeDyn(nil)}); err != nil {
+		Mgr: m, CS: fake.NewSimpleClientset(), Dyn: testutil.NewFakeDyn(nil),
+		Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {

@@ -24,6 +24,15 @@ type perconaQuorumCheck struct {
 	perconaInitSeen map[string]time.Time
 }
 
+// newPerconaQuorumCheck builds the W10-ST5 check with a fresh
+// first-seen map — the state-map initialization that used to live in
+// the monolithic newClusterHealthProber literal.
+func newPerconaQuorumCheck(d *deps) checkRunner {
+	return &perconaQuorumCheck{deps: d,
+		perconaInitSeen: map[string]time.Time{},
+	}
+}
+
 // ---------------------------------------------------------------------------
 // W10-ST5 — percona-cluster-quorum.
 // ---------------------------------------------------------------------------

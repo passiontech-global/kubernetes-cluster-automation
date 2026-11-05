@@ -9,7 +9,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
@@ -31,11 +30,10 @@ func TestSetupRegistersController(t *testing.T) {
 
 // The konnectivity-patcher predicate pins ns/name on top of the
 // field-selected informer — belt-and-suspenders against cache misses.
+// onlyKonnectivityDaemonSet is the exact predicate the For() watch
+// installs.
 func TestSetupPredicate(t *testing.T) {
-	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-			Dyn: testutil.StubDyn()})
-	})
+	p := onlyKonnectivityDaemonSet
 	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "kube-system", Name: "konnectivity-agent"}}
 	if !p.Create(event.CreateEvent{Object: ds}) {

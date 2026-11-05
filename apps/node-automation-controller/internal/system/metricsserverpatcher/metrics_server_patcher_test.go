@@ -17,7 +17,6 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -413,11 +412,12 @@ func TestMetricsServerPatcherPatchError(t *testing.T) {
 }
 
 // Disabled must be a clean no-op — nothing registered, no error.
+// Deps.Disabled is what setupModules stamps for
+// METRICS_SERVER_PATCHER_ENABLED=false.
 func TestSetupMetricsServerPatcherDisabled(t *testing.T) {
-	t.Setenv("METRICS_SERVER_PATCHER_ENABLED", "false")
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
+		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {
@@ -425,16 +425,12 @@ func TestSetupMetricsServerPatcherDisabled(t *testing.T) {
 	}
 }
 
-// The predicate pins ns/name on top of the shared Deployment
-// informer — only kube-system/metrics-server may reconcile.
+// The For() predicate (onlyMetricsServerDeployment — the exact
+// predicate Setup installs) pins ns/name on top of the shared
+// Deployment informer — only kube-system/metrics-server may
+// reconcile.
 func TestSetupMetricsServerPatcherPredicate(t *testing.T) {
-	t.Setenv("METRICS_SERVER_PATCHER_ENABLED", "true")
-	t.Setenv("METRICS_SERVER_MIN_REPLICAS", "3")
-	t.Setenv("METRICS_SERVER_NODES_PER_REPLICA", "1")
-	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-			Dyn: testutil.StubDyn()})
-	})
+	p := onlyMetricsServerDeployment
 	ms := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "kube-system", Name: "metrics-server"}}
 	if !p.Create(event.CreateEvent{Object: ms}) {
@@ -447,28 +443,16 @@ func TestSetupMetricsServerPatcherPredicate(t *testing.T) {
 	}
 }
 
-// The Node watch (second watch source) drives the proportional
-// replica count: only create/delete may fire — includeUnschedulableNodes
-// counts every Node object, so updates never change the total and
-// would only add kubelet-heartbeat churn.
+// The Node watch predicate (nodeCountChanges — the exact
+// predicate.Funcs the conditional second watch installs when
+// minReplicas>0) drives the proportional replica count: only
+// create/delete may fire — includeUnschedulableNodes counts every
+// Node object, so updates never change the total and would only add
+// kubelet-heartbeat churn. The conditional registration of the watch
+// itself is no longer asserted (it required introspecting
+// controller-runtime internals).
 func TestSetupMetricsServerPatcherNodeWatch(t *testing.T) {
-	t.Setenv("METRICS_SERVER_PATCHER_ENABLED", "true")
-	t.Setenv("METRICS_SERVER_MIN_REPLICAS", "3")
-	t.Setenv("METRICS_SERVER_NODES_PER_REPLICA", "1")
-	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	srcs := testutil.ControllerWatches(t, m.Added[0])
-	if len(srcs) != 2 {
-		t.Fatalf("patcher registered %d watches, want 2 (Deployment + Node)", len(srcs))
-	}
-	preds, _ := testutil.KindSource(t, srcs[1])
-	if len(preds) != 1 {
-		t.Fatalf("Node watch carries %d predicates, want 1", len(preds))
-	}
-	p := preds[0]
+	p := nodeCountChanges
 	n1 := testutil.Node("n1", corev1.ConditionTrue, nil)
 	if !p.Create(event.CreateEvent{Object: n1}) {
 		t.Fatal("node add did not fire")

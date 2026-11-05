@@ -29,7 +29,6 @@ package partitionevictor
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -124,7 +123,7 @@ func nodePartitioned(n *corev1.Node) bool {
 // trimmed, blanks dropped (so "a, ,b" and trailing commas produce no
 // phantom namespace). Unset or all-empty falls back to partitionPodNS.
 func partitionEvictNamespaces() map[string]struct{} {
-	raw := strings.TrimSpace(os.Getenv(partitionNSsEnv))
+	raw := strings.TrimSpace(shared.Getenv(partitionNSsEnv, ""))
 	if raw == "" {
 		raw = partitionPodNS
 	}

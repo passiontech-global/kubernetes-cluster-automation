@@ -91,7 +91,7 @@ type failedJobsJanitor struct {
 	// previous sweep. A resource that finished terminating (or
 	// vanished) gets its series deleted so /metrics never leaks a
 	// stale "stuck" series.
-	stuckEmitted map[stuckTerminatingKey]struct{}
+	stuckEmitted shared.GaugeLedger[stuckTerminatingKey]
 }
 
 // Setup registers the hourly sweep (was crontab 17 * * * *). d.Dyn
@@ -99,10 +99,9 @@ type failedJobsJanitor struct {
 // pass nil only in tests that never exercise it.
 func Setup(d shared.Deps) error {
 	j := &failedJobsJanitor{
-		cs:           d.CS,
-		dyn:          d.Dyn,
-		nowFn:        time.Now,
-		stuckEmitted: map[stuckTerminatingKey]struct{}{},
+		cs:    d.CS,
+		dyn:   d.Dyn,
+		nowFn: time.Now,
 	}
 	return shared.AddPeriodic(d.Mgr, failedJobQueue, 60*time.Minute, j.run)
 }
@@ -111,8 +110,7 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	// Lazily arm the zero-value struct — unit tests construct the
 	// module literally without the Setup path. stuckEmitted needs
-	// no such guard: it is only ranged over (nil-safe) and replaced
-	// wholesale each audit, never keyed-written like a cache.
+	// no such guard: the GaugeLedger zero value is ready to use.
 	if j.nowFn == nil {
 		j.nowFn = time.Now
 	}
@@ -315,13 +313,15 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 		return fmt.Errorf("list volumeattachments: %w", err)
 	}
 
-	current := map[stuckTerminatingKey]struct{}{}
+	stuck := 0 // tuples re-asserted this sweep (for the done log)
 	mark := func(kind, ns, name string, terminatingSince *metav1.Time, finalizers []string) {
 		if terminatingSince == nil ||
 			now.Sub(terminatingSince.Time) <= stuckTerminatingMaxAge {
 			return // not terminating, or still inside the grace window
 		}
-		current[stuckTerminatingKey{kind: kind, ns: ns, name: name}] = struct{}{}
+		j.stuckEmitted.Emit(
+			stuckTerminatingKey{kind: kind, ns: ns, name: name}, kind, ns, name)
+		stuck++
 		metrics.StuckTerminatingResources.WithLabelValues(kind, ns, name).Set(1)
 		log.Info("STUCK: still Terminating past threshold — inspect finalizers",
 			"kind", kind, "namespace", ns, "name", name,
@@ -364,15 +364,9 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 	// deleted, not zeroed — a Set(0) leaves the label triple in
 	// /metrics forever, which Prometheus still treats as a live
 	// series. Same convention as metrics.ForgetAPIBackend.
-	for key := range j.stuckEmitted {
-		if _, ok := current[key]; !ok {
-			metrics.StuckTerminatingResources.DeleteLabelValues(
-				key.kind, key.ns, key.name)
-		}
-	}
-	j.stuckEmitted = current
+	j.stuckEmitted.Prune(metrics.StuckTerminatingResources.DeleteLabelValues)
 
-	log.Info("stuck-terminating audit done", "stuck", len(current))
+	log.Info("stuck-terminating audit done", "stuck", stuck)
 	return nil
 }
 

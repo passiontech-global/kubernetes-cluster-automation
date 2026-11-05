@@ -50,10 +50,17 @@ func pdwCordonedNode(name string) *corev1.Node {
 // sleeping.
 func newPDWWatchdog(cs *fake.Clientset, clock *time.Time) *pdbDeadlockWatchdog {
 	return &pdbDeadlockWatchdog{
-		cs:        cs,
-		firstSeen: map[string]time.Time{},
-		nowFn:     func() time.Time { return *clock },
+		cs:    cs,
+		nowFn: func() time.Time { return *clock },
 	}
+}
+
+// pdbTrackedCount reports how many keys a FirstSeenLedger holds —
+// the ledger exposes no Len, so a keep-all Prune does the counting.
+func pdbTrackedCount(l *shared.FirstSeenLedger) int {
+	n := 0
+	l.Prune(func(string) bool { n++; return true })
+	return n
 }
 
 // pdwDrainBlocked reads the node_automation_pdb_drain_blocked series
@@ -139,11 +146,11 @@ func TestPDBWatchdogFirstSightingNotReported(t *testing.T) {
 		if _, ok := pdwDrainBlocked(t, "pdw-a", "impossible", r); ok {
 			t.Fatalf("series %s set on first sighting", r)
 		}
-		if _, ok := w.firstSeen["pdw-a/impossible/"+r]; !ok {
+		if _, ok := w.firstSeen.Seen("pdw-a/impossible/"+r, time.Now()); !ok {
 			t.Fatalf("first-seen window for %s not opened", r)
 		}
 	}
-	if _, ok := w.firstSeen["pdw-a/impossible/"+pdbReasonCordonedNode]; ok {
+	if _, ok := w.firstSeen.Seen("pdw-a/impossible/"+pdbReasonCordonedNode, time.Now()); ok {
 		t.Fatal("cordoned window opened without a cordoned node")
 	}
 }
@@ -238,7 +245,7 @@ func TestPDBWatchdogStaleCordonIgnored(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := w.firstSeen["pdw-e/stale-cordon/"+pdbReasonCordonedNode]; ok {
+	if _, ok := w.firstSeen.Seen("pdw-e/stale-cordon/"+pdbReasonCordonedNode, time.Now()); ok {
 		t.Fatal("cordoned window opened for a stale (>45m) cordon")
 	}
 	if _, ok := pdwDrainBlocked(t, "pdw-e", "stale-cordon", pdbReasonCordonedNode); ok {
@@ -258,7 +265,7 @@ func TestPDBWatchdogNoCordonNoWindow(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := w.firstSeen["pdw-d/no-cordon/"+pdbReasonCordonedNode]; ok {
+	if _, ok := w.firstSeen.Seen("pdw-d/no-cordon/"+pdbReasonCordonedNode, time.Now()); ok {
 		t.Fatal("cordoned window opened although no node is unschedulable")
 	}
 }
@@ -349,7 +356,7 @@ func TestPDBWatchdogRecoveryClearsSeries(t *testing.T) {
 			t.Fatalf("series %s survived recovery", r)
 		}
 	}
-	if len(w.firstSeen) != 0 {
+	if pdbTrackedCount(&w.firstSeen) != 0 {
 		t.Fatalf("first-seen entries leaked after recovery: %v", w.firstSeen)
 	}
 }
@@ -389,7 +396,7 @@ func TestPDBWatchdogDeletedPDBPrunesSeries(t *testing.T) {
 			t.Fatalf("series %s outlived its PDB", r)
 		}
 	}
-	if len(w.firstSeen) != 0 {
+	if pdbTrackedCount(&w.firstSeen) != 0 {
 		t.Fatalf("first-seen entries leaked for deleted PDB: %v", w.firstSeen)
 	}
 }
@@ -413,7 +420,7 @@ func TestPDBWatchdogContinuityResetsOnGap(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(w.firstSeen) != 0 {
+	if pdbTrackedCount(&w.firstSeen) != 0 {
 		t.Fatal("first-seen entry survived a gap in the precondition")
 	}
 	// The block returns — a NEW window opens at t+6m, not a resume
@@ -477,7 +484,7 @@ func TestPDBWatchdogReasonsResolveIndependently(t *testing.T) {
 	if _, ok := pdwDrainBlocked(t, "pdw-j", "mixed", pdbReasonImpossiblePolicy); ok {
 		t.Fatal("impossible_policy series survived its precondition")
 	}
-	if _, ok := w.firstSeen["pdw-j/mixed/"+pdbReasonImpossiblePolicy]; ok {
+	if _, ok := w.firstSeen.Seen("pdw-j/mixed/"+pdbReasonImpossiblePolicy, time.Now()); ok {
 		t.Fatal("impossible_policy window kept although precondition dropped")
 	}
 	if v, ok := pdwDrainBlocked(t, "pdw-j", "mixed",
@@ -501,8 +508,8 @@ func TestPDBWatchdogIgnoresNonBlockingPDBs(t *testing.T) {
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(w.firstSeen) != 0 {
-		t.Fatalf("non-blocking PDBs opened %d windows: %v", len(w.firstSeen), w.firstSeen)
+	if pdbTrackedCount(&w.firstSeen) != 0 {
+		t.Fatalf("non-blocking PDBs opened %d windows: %v", pdbTrackedCount(&w.firstSeen), w.firstSeen)
 	}
 	for _, name := range []string{"no-pods", "normal"} {
 		for _, r := range []string{

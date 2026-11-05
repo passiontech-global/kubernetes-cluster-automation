@@ -25,6 +25,15 @@ type podStatusCheck struct{ *deps }
 
 type resourceQuotaCheck struct{ *deps }
 
+// The ported-check constructors — every check exposes a
+// newXxxCheck(d *deps) checkRunner factory so the checkDefs registry
+// can stay data-driven; these five carry no per-check state.
+func newDNSStatusCheck(d *deps) checkRunner     { return &dnsStatusCheck{deps: d} }
+func newHTTPContentCheck(d *deps) checkRunner   { return &httpContentCheck{deps: d} }
+func newPodRestartsCheck(d *deps) checkRunner   { return &podRestartsCheck{deps: d} }
+func newPodStatusCheck(d *deps) checkRunner     { return &podStatusCheck{deps: d} }
+func newResourceQuotaCheck(d *deps) checkRunner { return &resourceQuotaCheck{deps: d} }
+
 // probeDNS ports dns-resolution-check: every configured hostname must
 // resolve. Per-check timeout comes from HEALTH_CHECK_TIMEOUT (the
 // checker pod's TIMEOUT_DURATION was 30s).

@@ -13,9 +13,10 @@ import (
 
 // Builder-based: .Complete() resolves the For() GVK via the real
 // scheme, builds a controller through controller.New and lands it in
-// mgr.Add — assert exactly one runnable per Setup.
+// mgr.Add — assert exactly one runnable per Setup. (Zero-value
+// Deps.Disabled = gate-on; the COREDNS_PATCHER_ENABLED wiring is
+// covered by setupModules' registry tests in cmd/manager.)
 func TestSetupRegistersController(t *testing.T) {
-	t.Setenv("COREDNS_PATCHER_ENABLED", "true")
 	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "DoNotSchedule")
 	t.Setenv("COREDNS_PATCHER_ZONE_MIN_DOMAINS", "2")
 	t.Setenv("COREDNS_MIN_REPLICAS", "4")
@@ -30,13 +31,13 @@ func TestSetupRegistersController(t *testing.T) {
 	}
 }
 
-// The ported patcher skips mgr.Add entirely when disabled — no
+// The ported patcher skips mgr.Add entirely when Deps.Disabled is
+// stamped (setupModules resolves COREDNS_PATCHER_ENABLED) — no
 // informer, no RequeueAfter loop.
 func TestSetupDisabled(t *testing.T) {
-	t.Setenv("COREDNS_PATCHER_ENABLED", "false")
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
+		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {
@@ -52,7 +53,6 @@ func TestSetupDisabled(t *testing.T) {
 // through setupModules for one ConfigMap typo.
 func TestSetupRejectsInvalidZoneWhen(t *testing.T) {
 	errsBefore := testutil.QueueErrorCount(t, "coredns-patcher")
-	t.Setenv("COREDNS_PATCHER_ENABLED", "true")
 	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "ScheduleAnywway") //nolint:misspell — a typo is the point
 	t.Setenv("COREDNS_PATCHER_ZONE_MIN_DOMAINS", "0")
 	t.Setenv("COREDNS_MIN_REPLICAS", "0")
@@ -81,13 +81,12 @@ func TestSetupRejectsInvalidZoneWhen(t *testing.T) {
 	if len(m.Added) != 1 {
 		t.Fatalf("default zoneWhen registered %d runnables, want 1", len(m.Added))
 	}
-	// A disabled module never validates — an unused env must not
+	// A disabled module never validates — an unused knob must not
 	// disable or error.
 	m = testutil.NewStubManager()
-	t.Setenv("COREDNS_PATCHER_ENABLED", "false")
 	t.Setenv("COREDNS_PATCHER_ZONE_WHEN", "ScheduleAnywway") //nolint:misspell
 	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
+		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must ignore zoneWhen, got %v", err)
 	}
 }

@@ -8,12 +8,15 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// Env helpers — every module resolves its own feature gates and knobs
-// from env inside Setup (the same flag ConfigMaps the shell-operator
-// read), so main.go carries no per-module config. Semantics match the
-// contract documented in cmd/manager/main.go's header: unparseable or
-// out-of-range values warn and fall back to the default rather than
-// being silently discarded.
+// Env helpers — every module resolves its own knobs and sub-feature
+// gates from env inside Setup (the same flag ConfigMaps the
+// shell-operator read), so main.go carries no per-module config.
+// REGISTRATION gates are the exception: they live in the shared.Module
+// registry (cmd/manager/modules.go) and arrive pre-resolved as
+// Deps.Disabled — a module must not re-read its own GateEnv here.
+// Semantics match the contract documented in cmd/manager/main.go's
+// header: unparseable or out-of-range values warn and fall back to the
+// default rather than being silently discarded.
 
 // Getenv reads a string env knob, returning def when unset or empty.
 func Getenv(key, def string) string {
@@ -62,6 +65,37 @@ func GetenvFloat(key string, def float64) float64 {
 			return f
 		}
 		logf.Log.WithName("env").Info("unparseable float env value, using default",
+			"key", key, "value", v, "default", def)
+	}
+	return def
+}
+
+// GetenvIntMin is GetenvInt with a lower bound: parsed values < min
+// warn and fall back to def (e.g. a negative restart-limit knob would
+// flag every object). min applies to the PARSED value only — def is
+// returned verbatim whether or not it satisfies the bound, so callers
+// may express "disabled" defaults outside the valid-input range.
+func GetenvIntMin(key string, def, min int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= min {
+			return n
+		}
+		logf.Log.WithName("env").Info("invalid integer env value, using default",
+			"key", key, "value", v, "default", def, "min", min)
+	}
+	return def
+}
+
+// GetenvFloatPositive is GetenvFloat restricted to strictly positive
+// values: unparseable input and f <= 0 warn and fall back to def.
+// Values > 1 are kept — several threshold knobs document ">1 disables
+// the check" as the operator escape hatch.
+func GetenvFloatPositive(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			return f
+		}
+		logf.Log.WithName("env").Info("invalid float env value, using default",
 			"key", key, "value", v, "default", def)
 	}
 	return def

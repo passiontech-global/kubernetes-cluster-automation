@@ -113,6 +113,10 @@ const (
 	// token value, so all three are stamped in one patch.
 	fluxResetAnno = "reconcile.fluxcd.io/resetAt"
 	fluxForceAnno = "reconcile.fluxcd.io/forceAt"
+	// W8-GO2 — the stall-unwedge retry cycle: max 2 attempts per
+	// lastAttemptedRevision, each at least 6h apart.
+	stallMaxAttemptsPerRevision = 2
+	stallAttemptCooldown        = 6 * time.Hour
 	// deployRevisionAnno orders ReplicaSets of one Deployment —
 	// the newest revision is the surge side of the deadlock.
 	deployRevisionAnno = "deployment.kubernetes.io/revision"

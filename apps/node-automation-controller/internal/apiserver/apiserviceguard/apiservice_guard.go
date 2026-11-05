@@ -99,39 +99,34 @@ type apiServiceGuard struct {
 	// ("name/service_namespace/service_name") held at =1 — a tuple
 	// not re-seen this sweep gets its series deleted via
 	// DeleteLabelValues (same seen-set hygiene as brokenEmitted).
-	emitted map[string]bool
+	emitted shared.GaugeLedger[string]
 	// unblocked is "<apiservice name>" -> last unblock-heal time —
 	// bounds restart churn on a backend that wedges again right
 	// after its pods are recreated.
-	unblocked map[string]time.Time
+	unblocked shared.CooldownSet
 }
 
 // Setup registers the 5-minute sweep. Disabled
-// clusters (APISERVICE_GUARD_ENABLED=false) skip registration
-// entirely — same contract as cert-drift-auditor: no runnable, no
-// periodic cluster LIST against the apiserver.
+// clusters (APISERVICE_GUARD_ENABLED=false — resolved by setupModules
+// into Deps.Disabled) skip registration entirely — same contract as
+// cert-drift-auditor: no runnable, no periodic cluster LIST against
+// the apiserver.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	if !shared.Gate("APISERVICE_GUARD_ENABLED", true) {
-		logf.Log.WithName(apiServiceGuardQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
-	g := &apiServiceGuard{cs: cs, dyn: dyn, nowFn: time.Now,
-		emitted: map[string]bool{}}
+	g := &apiServiceGuard{cs: cs, dyn: dyn, nowFn: time.Now}
 	return shared.AddPeriodic(mgr, apiServiceGuardQueue, apiServiceGuardInterval, g.run)
 }
 
 func (g *apiServiceGuard) run(ctx context.Context) error {
 	// Lazily arm the zero-value struct — unit tests construct the
-	// guard literally without the Setup path.
+	// guard literally without the Setup path. The bookkeeping
+	// ledgers need no such guard: shared.GaugeLedger/CooldownSet
+	// zero values are ready to use.
 	if g.nowFn == nil {
 		g.nowFn = time.Now
-	}
-	if g.emitted == nil {
-		g.emitted = map[string]bool{}
-	}
-	if g.unblocked == nil {
-		g.unblocked = map[string]time.Time{}
 	}
 	// The orphan sweep and the availability watchdog are
 	// independent duties — a failure in one must never blind the
@@ -240,7 +235,6 @@ func (g *apiServiceGuard) sweepAvailability(ctx context.Context, svcs *unstructu
 	}
 
 	now := g.nowFn()
-	emitted := map[string]bool{}
 	for i := range svcs.Items {
 		svc := &svcs.Items[i]
 		unavailSince, ok := apiServiceUnavailableSince(svc)
@@ -248,10 +242,10 @@ func (g *apiServiceGuard) sweepAvailability(ctx context.Context, svcs *unstructu
 			continue
 		}
 		svcNs, svcName, _ := apiServiceBackend(svc)
-		key := svc.GetName() + "/" + svcNs + "/" + svcName
+		g.emitted.Emit(svc.GetName()+"/"+svcNs+"/"+svcName,
+			svc.GetName(), svcNs, svcName)
 		metrics.APIServiceUnavailable.
 			WithLabelValues(svc.GetName(), svcNs, svcName).Set(1)
-		emitted[key] = true
 		log.Info("APIService unavailable past threshold",
 			"apiservice", svc.GetName(), "service", svcNs+"/"+svcName,
 			"since", unavailSince.Format(time.RFC3339))
@@ -259,19 +253,8 @@ func (g *apiServiceGuard) sweepAvailability(ctx context.Context, svcs *unstructu
 
 	// Prune series whose APIService recovered or vanished — a label
 	// tuple that stops being re-asserted must not pin
-	// apiservice_unavailable=1 forever. Keys are
-	// "name/service_namespace/service_name"; all three are DNS-1123
-	// identifiers (or empty) so "/" is unambiguous.
-	for k := range g.emitted {
-		if emitted[k] {
-			continue
-		}
-		if parts := strings.SplitN(k, "/", 3); len(parts) == 3 {
-			metrics.APIServiceUnavailable.
-				DeleteLabelValues(parts[0], parts[1], parts[2])
-		}
-	}
-	g.emitted = emitted
+	// apiservice_unavailable=1 forever.
+	g.emitted.Prune(metrics.APIServiceUnavailable.DeleteLabelValues)
 	return nil
 }
 
@@ -364,8 +347,7 @@ func (g *apiServiceGuard) sweepUnblock(ctx context.Context, svcs *unstructured.U
 
 	healed := 0
 	for _, c := range cands {
-		if last, ok := g.unblocked[c.svc.GetName()]; ok &&
-			now.Sub(last) < apiServiceUnblockCooldown {
+		if g.unblocked.CooledDown(c.svc.GetName(), apiServiceUnblockCooldown, now) {
 			continue
 		}
 		var refs []string
@@ -385,7 +367,7 @@ func (g *apiServiceGuard) sweepUnblock(ctx context.Context, svcs *unstructured.U
 			metrics.IncError(apiServiceGuardQueue)
 			continue
 		}
-		g.unblocked[c.svc.GetName()] = now
+		g.unblocked.Stamp(c.svc.GetName(), now)
 		healed++
 		if deleted > 0 {
 			metrics.APIServiceUnblockHealsTotal.

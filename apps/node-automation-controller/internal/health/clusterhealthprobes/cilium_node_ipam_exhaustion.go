@@ -29,6 +29,12 @@ import (
 // watchdog with terminal-pod reaping.
 type ciliumNodeIPAMExhaustionCheck struct{ *deps }
 
+// newCiliumNodeIPAMExhaustionCheck builds the W10-NM6 check —
+// stateless, it reads only deps.
+func newCiliumNodeIPAMExhaustionCheck(d *deps) checkRunner {
+	return &ciliumNodeIPAMExhaustionCheck{deps: d}
+}
+
 const (
 	checkNameCiliumNodeIPAM = "cilium-node-ipam-exhaustion"
 
@@ -88,7 +94,10 @@ func podCIDRCapacity(podCIDR string) (int, bool) {
 func (p *ciliumNodeIPAMExhaustionCheck) run(ctx context.Context) probeResult {
 	log := logf.FromContext(ctx)
 	now := p.now()
-	minFree := healthEnvFloat("CILIUM_NODE_IPAM_MIN_FREE_RATIO", ciliumIPAMMinFreeRatio)
+	// GetenvFloatPositive keeps >1 (the documented "disable this
+	// check" escape) and rejects <=0 — the same contract the retired
+	// healthEnvFloat had.
+	minFree := shared.GetenvFloatPositive("CILIUM_NODE_IPAM_MIN_FREE_RATIO", ciliumIPAMMinFreeRatio)
 
 	// Prometheus operator IPAM census — cilium_operator_ipam_{used,
 	// available}_ips{target_node} (cilium >=1.15; the old

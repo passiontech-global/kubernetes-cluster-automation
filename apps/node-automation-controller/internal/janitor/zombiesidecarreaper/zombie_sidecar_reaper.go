@@ -144,11 +144,11 @@ type zombieSidecarReaper struct {
 var zombieSidecarHTTPClient = &http.Client{Timeout: zombieSidecarShutdownTimeout}
 
 // Setup registers the 5-minute sweep. Disabled
-// clusters (ZOMBIE_SIDECAR_REAPER_ENABLED=false) skip registration
-// entirely — same contract as volumeattachment-cleaner.
+// clusters (ZOMBIE_SIDECAR_REAPER_ENABLED=false — resolved by
+// setupModules into Deps.Disabled) skip registration entirely — same
+// contract as volumeattachment-cleaner.
 func Setup(d shared.Deps) error {
-	if !shared.Gate("ZOMBIE_SIDECAR_REAPER_ENABLED", true) {
-		logf.Log.WithName(zombieSidecarReaperQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	r := &zombieSidecarReaper{cs: d.CS, dyn: d.Dyn, nowFn: time.Now,

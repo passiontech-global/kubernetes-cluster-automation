@@ -24,6 +24,12 @@ import (
 // nodeHangCheck is the node-hang pre-cordon watchdog.
 type nodeHangCheck struct{ *deps }
 
+// newNodeHangCheck builds the W8-ST2 watchdog — stateless, it reads
+// only deps.
+func newNodeHangCheck(d *deps) checkRunner {
+	return &nodeHangCheck{deps: d}
+}
+
 const (
 	// W8-ST2 — node-hang-precordon knobs.
 	checkNameNodeHang        = "node-hang-precordon"

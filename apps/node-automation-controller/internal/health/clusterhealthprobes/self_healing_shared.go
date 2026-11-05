@@ -212,7 +212,7 @@ func promLabelValue(s promSample, keys ...string) string {
 func (d *deps) promInstantQuery(ctx context.Context, query string) ([]promSample, error) {
 	ctx, cancel := context.WithTimeout(ctx, d.cfg.checkTimeout)
 	defer cancel()
-	endpoint := healthEnv("HEALTH_PROMETHEUS_QUERY_URL", "")
+	endpoint := shared.Getenv("HEALTH_PROMETHEUS_QUERY_URL", "")
 	if endpoint == "" {
 		u, err := url.Parse(d.cfg.httpURL)
 		if err != nil || u.Scheme == "" || u.Host == "" {

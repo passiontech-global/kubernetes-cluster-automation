@@ -9,7 +9,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-automation-controller/internal/testutil"
@@ -19,7 +18,8 @@ import (
 // scheme, builds a controller through controller.New and lands it in
 // mgr.Add — assert exactly one runnable per Setup.
 func TestSetupRegistersController(t *testing.T) {
-	t.Setenv("FLUENTBIT_ROLLER_ENABLED", "true")
+	// Zero-value Deps.Disabled = gate-on — FLUENTBIT_ROLLER_ENABLED
+	// is resolved by setupModules, not re-read here.
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
 		Dyn: testutil.StubDyn()}); err != nil {
@@ -30,12 +30,12 @@ func TestSetupRegistersController(t *testing.T) {
 	}
 }
 
-// The ported roller skips mgr.Add entirely when disabled.
+// The ported roller skips mgr.Add entirely when Deps.Disabled is
+// stamped.
 func TestSetupDisabled(t *testing.T) {
-	t.Setenv("FLUENTBIT_ROLLER_ENABLED", "false")
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
+		Dyn: testutil.StubDyn(), Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}
 	if len(m.Added) != 0 {
@@ -44,12 +44,9 @@ func TestSetupDisabled(t *testing.T) {
 }
 
 // The fluent-bit roller predicate pins the pipeline secret.
+// onlyPipelineSecret is the exact predicate the For() watch installs.
 func TestSetupPredicate(t *testing.T) {
-	t.Setenv("FLUENTBIT_ROLLER_ENABLED", "true")
-	p := testutil.ForPredicate(t, func(m manager.Manager) error {
-		return Setup(shared.Deps{Mgr: m, CS: fake.NewSimpleClientset(),
-			Dyn: testutil.StubDyn()})
-	})
+	p := onlyPipelineSecret
 	pipeline := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "fluent-system", Name: "passiontech-pipeline"}}
 	if !p.Create(event.CreateEvent{Object: pipeline}) {

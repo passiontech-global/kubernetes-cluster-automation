@@ -87,7 +87,7 @@ type cfTunnelProxyWatchdog struct {
 	namespace string
 	// lastHeal is "<ns>/<name>" -> last delete time; bounds restart
 	// churn on a pod that wedges again immediately after recreation.
-	lastHeal map[string]time.Time
+	lastHeal shared.CooldownSet
 	// nowFn is a test seam for cooldown/age checks.
 	nowFn func() time.Time
 }
@@ -96,12 +96,13 @@ type cfTunnelProxyWatchdog struct {
 // clusters running the cloudflare-tunnel-gateway-controller release
 // (enabled=false skips registration entirely).
 func Setup(d shared.Deps) error {
-	// Parse before the gate — see corednspatcher: invalid knob values
-	// must warn even when the module is disabled.
+	// Parse before the Disabled check — see corednspatcher: invalid
+	// knob values must warn even when the module is disabled
+	// (CF_TUNNEL_WATCHDOG_ENABLED=false, resolved by setupModules
+	// into Deps.Disabled).
 	namespace := shared.Getenv("CF_TUNNEL_WATCHDOG_NAMESPACE", "cloudflare-tunnel-system")
 	interval := shared.GetenvDuration("CF_TUNNEL_WATCHDOG_INTERVAL", 5*time.Minute)
-	if !shared.Gate("CF_TUNNEL_WATCHDOG_ENABLED", true) {
-		logf.Log.WithName(cfTunnelWatchdogQueue).Info("disabled — module not registered")
+	if d.Disabled {
 		return nil
 	}
 	logf.Log.WithName(cfTunnelWatchdogQueue).Info("registered",
@@ -252,9 +253,6 @@ func (w *cfTunnelProxyWatchdog) connectorTargets() []cfTunnelConnectorTarget {
 // it instead of skipping forever. Returns pods deleted.
 func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int, error) {
 	log := logf.FromContext(ctx)
-	if w.lastHeal == nil {
-		w.lastHeal = map[string]time.Time{}
-	}
 	if w.nowFn == nil {
 		w.nowFn = time.Now
 	}
@@ -331,7 +329,7 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 				"pod", p.Namespace+"/"+p.Name)
 			continue
 		}
-		w.lastHeal[p.Namespace+"/"+p.Name] = now
+		w.lastHeal.Stamp(p.Namespace+"/"+p.Name, now)
 		healed++
 	}
 	// readyCount==0 deadlock: every running replica unready — the
@@ -351,7 +349,7 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 				log.Error(err, "delete oldest unready connector pod failed",
 					"pod", oldest.Namespace+"/"+oldest.Name)
 			} else {
-				w.lastHeal[oldest.Namespace+"/"+oldest.Name] = now
+				w.lastHeal.Stamp(oldest.Namespace+"/"+oldest.Name, now)
 				healed++
 			}
 		}
@@ -363,8 +361,7 @@ func (w *cfTunnelProxyWatchdog) healConnectorTarget(ctx context.Context,
 // cfTunnelHealCooldown — a recreated pod that wedges again must wait
 // out the window instead of being killed every sweep.
 func (w *cfTunnelProxyWatchdog) healOnCooldown(p *corev1.Pod, now time.Time) bool {
-	last, ok := w.lastHeal[p.Namespace+"/"+p.Name]
-	return ok && now.Sub(last) < cfTunnelHealCooldown
+	return w.lastHeal.CooledDown(p.Namespace+"/"+p.Name, cfTunnelHealCooldown, now)
 }
 
 // deleteConnectorPod deletes a connector pod with a UID precondition
