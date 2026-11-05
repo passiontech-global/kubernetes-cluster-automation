@@ -160,34 +160,50 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		ProcRoot:           e.proc,
 		CtrTaskRoot:        e.ctr,
 		SandboxCtlRoot:     e.sb,
-		HostResolvConf:     e.resv,
 		K0sWorkerUnitFile:  e.unit,
-		KubeletPodsDir:     e.kubepods,
 		Client:             e.cs,
 		Systemd:            sd,
-		StuckDeleteAge:     15 * time.Minute,
-		StuckWedgeAge:      30 * time.Minute,
-		KubeletWatchMinAge: 15 * time.Minute,
-		MaxForceDelete:     5,
-		MaxCtrTaskClean:    5,
-		MaxShimKill:        10,
 		ConsecNeeded:       2,
 		MinRestartInterval: 30 * time.Minute,
+		Net: NetConfig{
+			HostResolvConf: e.resv,
+			SysClassNet:    e.sysnet,
+		},
+		Kubelet: KubeletConfig{
+			PodsDir:     e.kubepods,
+			WatchMinAge: 15 * time.Minute,
+		},
+		Teardown: TeardownConfig{
+			StuckDeleteAge: 15 * time.Minute,
+			StuckWedgeAge:  30 * time.Minute,
+			MaxForceDelete: 5,
+		},
 		// Wave-2 knobs: paths under the fixture root, never the real
 		// /sys or /var/lib/k0s.
-		CtrIngestDir:         e.ingest,
-		K0sDataDir:           filepath.Join(root, "k0sdata"),
-		SysClassNet:          e.sysnet,
-		CiliumRuntimeConfig:  e.ciliumRt,
-		ZombieStormThreshold: 500,
-		JournalDirs:          []string{e.jdir},
+		Ctr: CtrConfig{
+			IngestDir:    e.ingest,
+			MaxTaskClean: 5,
+			MaxShimKill:  10,
+		},
+		Cilium: CiliumConfig{
+			RuntimeConfig: e.ciliumRt,
+		},
+		Disk: DiskConfig{
+			K0sDataDir: filepath.Join(root, "k0sdata"),
+		},
+		Pressure: PressureConfig{
+			ZombieStormThreshold: 500,
+		},
+		Journal: JournalConfig{
+			Dirs: []string{e.jdir},
+		},
 	}, prometheus.NewRegistry())
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Test seams: signals never touch real processes, probes are
 	// canned, the journal snapshot is a string.
-	h.cfg.killFn = func(pid int, sig syscall.Signal) error {
+	h.cfg.Seams.killFn = func(pid int, sig syscall.Signal) error {
 		if sig == 0 {
 			if e.live[pid] {
 				return nil
@@ -197,28 +213,28 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		e.kills = append(e.kills, killRecord{pid, sig})
 		return nil
 	}
-	h.cfg.nowFn = func() time.Time { return e.now }
-	h.cfg.ProbeGap = 0            // tests run real-time — no 2s sleep between probes
-	h.cfg.KubeletWdReprobeGap = 0 // same: no 3s sleep between Gate-0 re-probes
-	h.cfg.probeHTTP = func(_ context.Context, url string, _ time.Duration) error {
+	h.cfg.Seams.nowFn = func() time.Time { return e.now }
+	h.cfg.ProbeGap = 0             // tests run real-time — no 2s sleep between probes
+	h.cfg.Kubelet.WdReprobeGap = 0 // same: no 3s sleep between Gate-0 re-probes
+	h.cfg.Seams.probeHTTP = func(_ context.Context, url string, _ time.Duration) error {
 		return e.probes[url]
 	}
 	// Feeder seam: bodyOK[url] answers "does :10248 return body 'ok'".
 	// Unset entry → false (unhealthy) — gate tests want fails anyway.
-	h.cfg.probeBodyOK = func(_ context.Context, url string, _ time.Duration) bool {
+	h.cfg.Seams.probeBodyOK = func(_ context.Context, url string, _ time.Duration) bool {
 		return e.bodyOK[url]
 	}
-	h.cfg.unixGet = func(_ context.Context, _, _ string) ([]byte, error) {
+	h.cfg.Seams.unixGet = func(_ context.Context, _, _ string) ([]byte, error) {
 		return e.unixBody, e.unixErr
 	}
-	h.cfg.journalFn = func(_ context.Context) (string, error) {
+	h.cfg.Seams.journalFn = func(_ context.Context) (string, error) {
 		return e.journal, e.journalErr
 	}
 	// Wave-2 seams: status-code probes default 200 (healthy) unless
 	// probes[url] errors or status[url] overrides; the unix socket
 	// probe answers from sockErrs (nil = connects); statfs reports
 	// e.diskUsed of 100 blocks.
-	h.cfg.probeHTTPStatus = func(_ context.Context, url, bearer string, _ time.Duration) (int, error) {
+	h.cfg.Seams.probeHTTPStatus = func(_ context.Context, url, bearer string, _ time.Duration) (int, error) {
 		e.bearer[url] = bearer
 		if err := e.probes[url]; err != nil {
 			return 0, err
@@ -228,15 +244,15 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		}
 		return 200, nil
 	}
-	h.cfg.probeUnixSock = func(_ context.Context, socket string, _ time.Duration) error {
+	h.cfg.Seams.probeUnixSock = func(_ context.Context, socket string, _ time.Duration) error {
 		return e.sockErrs[socket]
 	}
-	h.cfg.statfsFn = func(_ string, st *unix.Statfs_t) error {
+	h.cfg.Seams.statfsFn = func(_ string, st *unix.Statfs_t) error {
 		st.Blocks = 100
 		st.Bavail = uint64(100 - int(e.diskUsed*100))
 		return nil
 	}
-	h.cfg.ctrRmIngest = func(_ context.Context, ref string) error {
+	h.cfg.Seams.ctrRmIngest = func(_ context.Context, ref string) error {
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		e.sdcmds = append(e.sdcmds, []string{"ctr", "ingest", "rm", ref})
@@ -458,7 +474,7 @@ func TestForceDeleteSkipsProtectedPods(t *testing.T) {
 
 func TestForceDeleteCap(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.MaxForceDelete = 2
+	e.h.cfg.Teardown.MaxForceDelete = 2
 	for i, uid := range []string{uidA, uidB, uidC} {
 		p := terminatingPod(e, fmt.Sprintf("stuck-%d", i), "default", uid, 20*time.Minute)
 		if _, err := e.cs.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
@@ -1099,7 +1115,7 @@ func TestKubeletStall10250ProbeSendsBearerToken(t *testing.T) {
 	e := fixture(t)
 	tok := filepath.Join(e.state, "sa-token")
 	writeFile(t, tok, "tok-abc-123\n")
-	e.h.cfg.KubeletTokenPath = tok
+	e.h.cfg.Kubelet.TokenPath = tok
 	e.h.Cycle(context.Background())
 	if got := e.bearer[defaultKubeletHealthzURL]; got != "tok-abc-123" {
 		t.Fatalf("10250 probe bearer = %q, want the SA token", got)
@@ -1592,7 +1608,7 @@ func TestCtrTasksForeignNsSameSocketOrphanKilled(t *testing.T) {
 // capped pass forced over-cap dirs to re-confirm for 5m forever.
 func TestCtrTasksOverCapKeepsMarker(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.MaxCtrTaskClean = 2
+	e.h.cfg.Ctr.MaxTaskClean = 2
 	// 4 confirmed-wedged dirs (dead init: no init.pid at all), each
 	// with a marker already past the 5m confirm window.
 	for i := 0; i < 4; i++ {
@@ -1819,7 +1835,7 @@ func TestKubeletFeederProbeOKResetsFailsAndClearsLatch(t *testing.T) {
 	if e.h.kubeletWdFails != 2 {
 		t.Fatalf("fails=%d want 2", e.h.kubeletWdFails)
 	}
-	e.bodyOK[e.h.cfg.KubeletWdProbeURL] = true
+	e.bodyOK[e.h.cfg.Kubelet.WdProbeURL] = true
 	e.h.kubeletFeedTick(context.Background())
 	if e.h.kubeletWdFails != 0 {
 		t.Fatalf("fails=%d want 0 after probe OK", e.h.kubeletWdFails)
@@ -1838,7 +1854,7 @@ func TestKubeletFeederGateUptime(t *testing.T) {
 	// Gate-0 re-probe runs before every gate: 4 failed ticks + 2
 	// failed re-probes before G1 is even evaluated.
 	var probes int
-	e.h.cfg.probeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
+	e.h.cfg.Seams.probeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
 		probes++
 		return false
 	}
@@ -1885,7 +1901,7 @@ func TestKubeletFeederGateAPIServer(t *testing.T) {
 	e := fixture(t)
 	// No backends configured → fallback api-local-lb livez is probed;
 	// dead → node isolated → no restart.
-	e.probes[e.h.cfg.APIFallbackURL] = errors.New("refused")
+	e.probes[e.h.cfg.Kubelet.APIFallbackURL] = errors.New("refused")
 	feedTicks(e, defaultKubeletWdMaxFail)
 	if e.sdRan("restart k0sworker") {
 		t.Fatal("restart while API unreachable")
@@ -1902,7 +1918,7 @@ func TestKubeletFeederGateAPIServer(t *testing.T) {
 // used to demand 2xx and read a degraded endpoint as "unreachable").
 func TestKubeletFeederGateAPIServerNon200StillLive(t *testing.T) {
 	e := fixture(t)
-	e.status[e.h.cfg.APIFallbackURL] = 503
+	e.status[e.h.cfg.Kubelet.APIFallbackURL] = 503
 	e.sdReply["restart k0sworker.service"] = ""
 	e.sdReply["reset-failed k0sworker.service"] = ""
 	feedTicks(e, defaultKubeletWdMaxFail)
@@ -1929,7 +1945,7 @@ func TestKubeletFeederGateAPIServerConfiguredBackends(t *testing.T) {
 	}
 	e.probes["https://10.0.0.9:6443/livez"] = errors.New("refused")
 	// 10.0.0.10 unconfigured → probe map default nil = alive.
-	e.probes[e.h.cfg.APIFallbackURL] = errors.New("refused")
+	e.probes[e.h.cfg.Kubelet.APIFallbackURL] = errors.New("refused")
 	e.sdReply["restart k0sworker.service"] = ""
 	feedTicks(e, defaultKubeletWdMaxFail)
 	if !e.sdRan("restart k0sworker.service") {
@@ -1957,7 +1973,7 @@ func TestKubeletFeederGateRateLimitLatches(t *testing.T) {
 		t.Fatal("ACTION logged inside cooldown")
 	}
 	// A recovered kubelet clears the escalation latch again.
-	e.bodyOK[e.h.cfg.KubeletWdProbeURL] = true
+	e.bodyOK[e.h.cfg.Kubelet.WdProbeURL] = true
 	e.h.kubeletFeedTick(context.Background())
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("latch kept after kubelet recovered")
@@ -1999,7 +2015,7 @@ func TestKubeletFeederActivation(t *testing.T) {
 	}
 	// Listed in systemd_watchdog_hosts → active regardless of the
 	// unit file (the shell install gate).
-	e.h.cfg.KubeletWatchdogHosts = []string{"node-x", "node-a"}
+	e.h.cfg.Kubelet.WatchdogHosts = []string{"node-x", "node-a"}
 	if !e.h.kubeletFeederActive() {
 		t.Fatal("feeder inactive although node is listed")
 	}
@@ -2011,7 +2027,7 @@ func TestKubeletFeederActivation(t *testing.T) {
 		t.Fatal("feeder active with WD_SIG kill switch off")
 	}
 	e.h.cfg.Watchdog = nil
-	e.h.cfg.KubeletWatchdogHosts = nil
+	e.h.cfg.Kubelet.WatchdogHosts = nil
 	if e.h.kubeletFeederActive() {
 		t.Fatal("feeder active without unit file and unlisted")
 	}
@@ -2041,7 +2057,7 @@ func TestKubeletRemediateReprobeSelfCorrects(t *testing.T) {
 	latch := filepath.Join(e.state, "state-kubelet-healthz-down")
 	writeFile(t, latch, "1\n") // leftover from an earlier episode
 	var probes int
-	e.h.cfg.probeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
+	e.h.cfg.Seams.probeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
 		probes++
 		return probes > defaultKubeletWdMaxFail // ticks 1..4 fail, re-probe 1 OK
 	}
@@ -2068,7 +2084,7 @@ func TestKubeletRemediateReprobeSecondProbeOK(t *testing.T) {
 	e := fixture(t)
 	// First re-probe fails, second answers — still self-corrects.
 	var probes int
-	e.h.cfg.probeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
+	e.h.cfg.Seams.probeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
 		probes++
 		return probes > defaultKubeletWdMaxFail+1
 	}
@@ -2103,7 +2119,7 @@ func TestKubeletFeederReactivationResetsFails(t *testing.T) {
 	// Re-activation (unit file reappears) must drop the stale streak
 	// before it can reach MaxFail — and logs exactly one "start" per
 	// activation (the first active tick + this flip).
-	e.bodyOK[e.h.cfg.KubeletWdProbeURL] = true
+	e.bodyOK[e.h.cfg.Kubelet.WdProbeURL] = true
 	writeFile(t, e.unit, "[Service]\nExecStart=/usr/bin/k0s worker --node-ip=10.1.2.3\n")
 	e.h.kubeletFeedTick(context.Background())
 	if e.h.kubeletWdFails != 0 {
@@ -2173,7 +2189,7 @@ func waitingPod(name, ns, uid, image, imageID, reason, msg string) *corev1.Pod {
 func TestCtrImageHealerRemovesCorruptedImage(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -2203,7 +2219,7 @@ func TestCtrImageHealerRemovesCorruptedImage(t *testing.T) {
 func TestCtrImageHealerReasonAndMessageFilter(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -2245,7 +2261,7 @@ func TestCtrImageHealerReasonAndMessageFilter(t *testing.T) {
 func TestCtrImageHealerAllSignatures(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -2277,7 +2293,7 @@ func TestCtrImageHealerAllSignatures(t *testing.T) {
 func TestCtrImageHealerDedupesAndRateLimits(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -2312,7 +2328,7 @@ func TestCtrImageHealerDedupesAndRateLimits(t *testing.T) {
 
 func TestCtrImageHealerRmErrorKeepsGoing(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
 		if img == "docker.io/library/bad:1" {
 			return errors.New("ctr exploded")
 		}
@@ -2361,7 +2377,7 @@ func TestCtrImageHealerDefaultSeamUsesSystemdExec(t *testing.T) {
 func TestCtrImageHealerAPIFailNoAction(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -2419,7 +2435,7 @@ func TestNormalizeCRIImageName(t *testing.T) {
 func TestCtrImageHealerNormalizesDockerHubShortName(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -2441,7 +2457,7 @@ func TestCtrImageHealerNormalizesDockerHubShortName(t *testing.T) {
 func TestCtrImageHealerDigestRefDedupes(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -2462,7 +2478,7 @@ func TestCtrImageHealerDigestRefDedupes(t *testing.T) {
 func TestCtrImageHealerTagPlusDigestStripsTag(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -2484,7 +2500,7 @@ func TestCtrImageHealerTagPlusDigestStripsTag(t *testing.T) {
 func TestCtrImageHealerPrivateRegistryUntouched(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -2820,7 +2836,7 @@ func TestSyncloopProbeSendsBearerToken(t *testing.T) {
 	e.sdReply["is-active k0sworker.service"] = "active"
 	tok := filepath.Join(e.state, "sa-token")
 	writeFile(t, tok, "tok-abc-123\n")
-	e.h.cfg.KubeletTokenPath = tok
+	e.h.cfg.Kubelet.TokenPath = tok
 	e.h.Cycle(context.Background())
 	if got := e.bearer["https://127.0.0.1:10250/healthz/syncloop"]; got != "tok-abc-123" {
 		t.Fatalf("syncloop probe bearer = %q, want the SA token", got)
@@ -2830,14 +2846,14 @@ func TestSyncloopProbeSendsBearerToken(t *testing.T) {
 func TestContainerdSockDownLatches(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.sockErrs[e.h.cfg.ContainerdSocket] = fmt.Errorf("connection refused")
+	e.sockErrs[e.h.cfg.Ctr.Socket] = fmt.Errorf("connection refused")
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
 	if !e.h.state.Exists("containerd-sock-down") {
 		t.Fatal("state-containerd-sock-down should latch after 2 socket failures")
 	}
-	e.sockErrs[e.h.cfg.ContainerdSocket] = nil
+	e.sockErrs[e.h.cfg.Ctr.Socket] = nil
 	e.h.Cycle(context.Background())
 	if e.h.state.Exists("containerd-sock-down") {
 		t.Fatal("recovery should clear the containerd-sock latch")
@@ -2853,13 +2869,13 @@ func TestContainerdSockDownLatches(t *testing.T) {
 func TestContainerdSocketDefaultPinsK0sPath(t *testing.T) {
 	c := Config{}
 	c.applyDefaults()
-	if c.ContainerdSocket != "/host/run/k0s/containerd.sock" {
+	if c.Ctr.Socket != "/host/run/k0s/containerd.sock" {
 		t.Fatalf("default ContainerdSocket=%q, want /host/run/k0s/containerd.sock",
-			c.ContainerdSocket)
+			c.Ctr.Socket)
 	}
-	if c.KubeletTokenPath != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
+	if c.Kubelet.TokenPath != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
 		t.Fatalf("default KubeletTokenPath=%q, want the pod SA token path",
-			c.KubeletTokenPath)
+			c.Kubelet.TokenPath)
 	}
 }
 
@@ -2950,7 +2966,7 @@ func TestCtrIngestGCFailedScanRetriesNextCycle(t *testing.T) {
 func TestCtrIngestGCBavailOverBlocksSaturates(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.cfg.statfsFn = func(_ string, st *unix.Statfs_t) error {
+	e.h.cfg.Seams.statfsFn = func(_ string, st *unix.Statfs_t) error {
 		st.Blocks, st.Bavail = 100, 120 // free > total
 		return nil
 	}
@@ -2988,7 +3004,7 @@ func mkZombieProc(t *testing.T, e *env, pid, ppid int) {
 func TestZombieStormLatchesAndLogsAction(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.cfg.ZombieStormThreshold = 3 // fake proc trees are small
+	e.h.cfg.Pressure.ZombieStormThreshold = 3 // fake proc trees are small
 	uid := "11111111_2222_3333_4444_555555555555"
 	parent := filepath.Join(e.proc, "777")
 	if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -3035,7 +3051,7 @@ func mkParentProc(t *testing.T, e *env, pid int, starttime string) {
 func TestZombieStormActionLoggedOncePerEpisode(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.cfg.ZombieStormThreshold = 3
+	e.h.cfg.Pressure.ZombieStormThreshold = 3
 	mkParentProc(t, e, 777, "111111")
 	for pid := 800; pid < 805; pid++ {
 		mkZombieProc(t, e, pid, 777)
@@ -3057,7 +3073,7 @@ func TestZombieStormActionLoggedOncePerEpisode(t *testing.T) {
 func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.cfg.ZombieStormThreshold = 3
+	e.h.cfg.Pressure.ZombieStormThreshold = 3
 	mkParentProc(t, e, 777, "111111")
 	for pid := 800; pid < 805; pid++ {
 		mkZombieProc(t, e, pid, 777)
@@ -3097,7 +3113,7 @@ func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 func TestZombieStormLatchDropsBelowThreshold(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.cfg.ZombieStormThreshold = 3
+	e.h.cfg.Pressure.ZombieStormThreshold = 3
 	mkParentProc(t, e, 777, "111111")
 	for pid := 800; pid < 805; pid++ {
 		mkZombieProc(t, e, pid, 777)
@@ -3325,7 +3341,7 @@ func TestProbeUnixSockDefaultReturnsNilOnConnect(t *testing.T) {
 	defer ln.Close()
 	c := Config{}
 	c.applyDefaults()
-	if err := c.probeUnixSock(context.Background(), sock, time.Second); err != nil {
+	if err := c.Seams.probeUnixSock(context.Background(), sock, time.Second); err != nil {
 		t.Fatalf("successful unix dial want nil, got %v", err)
 	}
 }

@@ -118,7 +118,7 @@ func (c *zombieStormCheck) Run(_ context.Context, e *cycleEnv) {
 	}
 	for ppid, n := range byPPID {
 		key := keyOf(ppid)
-		if n <= c.h.cfg.ZombieStormThreshold {
+		if n <= c.h.cfg.Pressure.ZombieStormThreshold {
 			delete(c.streaks, key)
 			continue
 		}
@@ -232,7 +232,7 @@ func (c *dstateCheck) Run(_ context.Context, e *cycleEnv) {
 			}
 		}
 	}
-	if total < c.h.cfg.DStateStormThreshold && runtime < dStateRuntimeMin {
+	if total < c.h.cfg.Pressure.DStateStormThreshold && runtime < dStateRuntimeMin {
 		c.fails = 0
 		c.h.state.Exit("d-state-storm", nil)
 		c.h.cycles.WithLabelValues(checkDState, "ok").Inc()
@@ -296,7 +296,7 @@ func (c *scopesCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkSysScopes, "gated").Inc()
 		return
 	}
-	if c.h.cfg.nowFn().Sub(c.lastScan) < systemdScopeScanInterval {
+	if c.h.cfg.Seams.nowFn().Sub(c.lastScan) < systemdScopeScanInterval {
 		c.h.cycles.WithLabelValues(checkSysScopes, "ok").Inc()
 		return
 	}
@@ -313,7 +313,7 @@ func (c *scopesCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkSysScopes, "abort").Inc()
 		return
 	}
-	c.lastScan = c.h.cfg.nowFn()
+	c.lastScan = c.h.cfg.Seams.nowFn()
 	n := 0
 	for _, line := range strings.Split(out, "\n") {
 		if f := strings.Fields(line); len(f) > 0 &&

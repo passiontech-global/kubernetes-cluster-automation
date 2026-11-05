@@ -38,7 +38,7 @@ func (c *podTeardownCheck) Run(ctx context.Context, e *cycleEnv) {
 	// The task map is only worth building once a Terminating pod
 	// exists — with none, the whole loop below is a no-op.
 	var tasks map[string][]ctrTask
-	now := c.h.cfg.nowFn()
+	now := c.h.cfg.Seams.nowFn()
 	wedged := 0
 	ndel := 0
 	for i := range e.pods {
@@ -67,10 +67,10 @@ func (c *podTeardownCheck) Run(ctx context.Context, e *cycleEnv) {
 		// past StuckWedgeAge AND containerd still holds a task dir
 		// (live or not) — sig7/force-delete had their chance; only a
 		// reboot clears a shim/kernel-level wedge.
-		if age >= c.h.cfg.StuckWedgeAge && len(tasks[uid]) >= 1 {
+		if age >= c.h.cfg.Teardown.StuckWedgeAge && len(tasks[uid]) >= 1 {
 			wedged++
 		}
-		if age < c.h.cfg.StuckDeleteAge {
+		if age < c.h.cfg.Teardown.StuckDeleteAge {
 			continue
 		}
 		// Rule C: external resources or kubelet mirrors → never
@@ -82,7 +82,7 @@ func (c *podTeardownCheck) Run(ctx context.Context, e *cycleEnv) {
 		if countLive(tasks[uid]) > 0 {
 			continue // a live task exists — kubelet may still be tearing down
 		}
-		if ndel >= c.h.cfg.MaxForceDelete {
+		if ndel >= c.h.cfg.Teardown.MaxForceDelete {
 			continue // per-cycle cap bounds the blast radius
 		}
 		if err := c.h.forceDeletePod(ctx, p); err != nil {
@@ -254,7 +254,7 @@ func (c *konnCheck) Run(ctx context.Context, e *cycleEnv) {
 			// the stale proxy-agent directly. Least-bad: a container
 			// restart alone can't fix env baked at pod create, but
 			// it still clears a hung agent while humans look.
-			if err := c.h.cfg.killFn(stalePID, syscall.SIGKILL); err != nil {
+			if err := c.h.cfg.Seams.killFn(stalePID, syscall.SIGKILL); err != nil {
 				c.h.state.AppendLog(fmt.Sprintf(
 					"suspect: kill stale proxy-agent pid=%d failed: %v", stalePID, err))
 			} else {
@@ -354,7 +354,7 @@ func (c *dnsResolvCheck) Run(_ context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkDNS, "abort").Inc()
 		return
 	}
-	hostNS, _ := nameserverSet(c.h.cfg.HostResolvConf)
+	hostNS, _ := nameserverSet(c.h.cfg.Net.HostResolvConf)
 
 	var stale []dnsStale
 	if len(hostNS) > 0 { // empty host set → nothing to compare (shell parity)
@@ -422,7 +422,7 @@ func (c *dnsResolvCheck) Run(_ context.Context, e *cycleEnv) {
 			c.h.state.AppendLog(fmt.Sprintf(
 				"DNS-RESOLV-RESTART: killing pause %d (%s) - dns-resolv-stale, resolv.conf pod stale vs host",
 				s.pid, s.pod))
-			if err := c.h.cfg.killFn(s.pid, syscall.SIGKILL); err != nil {
+			if err := c.h.cfg.Seams.killFn(s.pid, syscall.SIGKILL); err != nil {
 				c.h.state.AppendLog(fmt.Sprintf(
 					"suspect: kill pause %d (%s) failed: %v", s.pid, s.pod, err))
 			}

@@ -136,10 +136,10 @@ func TestProbeHTTPDefaultNon2xxIsError(t *testing.T) {
 		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(503) }))
 	defer srv503.Close()
 
-	if err := h.cfg.probeHTTP(context.Background(), srv200.URL, time.Second); err != nil {
+	if err := h.cfg.Seams.probeHTTP(context.Background(), srv200.URL, time.Second); err != nil {
 		t.Fatalf("200 probe = %v, want nil", err)
 	}
-	if err := h.cfg.probeHTTP(context.Background(), srv503.URL, time.Second); err == nil {
+	if err := h.cfg.Seams.probeHTTP(context.Background(), srv503.URL, time.Second); err == nil {
 		t.Fatal("503 probe must error — a wedged /healthz is down")
 	}
 }
@@ -219,7 +219,7 @@ func TestSyncloopDownRestartCooldown(t *testing.T) {
 // the socket probe's BUG-H4 remedy.
 func TestContainerdSockDownRestartsK0sWorker(t *testing.T) {
 	e := fixture(t)
-	e.sockErrs[e.h.cfg.ContainerdSocket] = fmt.Errorf("connection refused")
+	e.sockErrs[e.h.cfg.Ctr.Socket] = fmt.Errorf("connection refused")
 	e.h.Cycle(context.Background())
 	if e.sdRan("restart k0sworker.service") {
 		t.Fatal("k0sworker restarted on the first suspect cycle")
@@ -243,8 +243,8 @@ func TestCheckDiskBloatPodLogEvicts(t *testing.T) {
 	e := fixture(t)
 	e.diskUsed = 0.95
 	logDir := filepath.Join(e.state, "podlogs")
-	e.h.cfg.PodLogsDir = logDir
-	e.h.cfg.DiskBloatPodThresholdBytes = 64
+	e.h.cfg.Disk.PodLogsDir = logDir
+	e.h.cfg.Disk.BloatPodThresholdBytes = 64
 	victim := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "logger", Namespace: "app", UID: types.UID("uid-1")},
@@ -281,14 +281,14 @@ func TestCheckDiskBloatPodLogEvicts(t *testing.T) {
 func TestCheckDiskBloatSnapshotEvicts(t *testing.T) {
 	e := fixture(t)
 	e.diskUsed = 0.95
-	e.h.cfg.DiskBloatPodThresholdBytes = 64
+	e.h.cfg.Disk.BloatPodThresholdBytes = 64
 	victim := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "layerhog", Namespace: "app", UID: types.UID(uidA)},
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	snap := filepath.Join(e.h.cfg.K0sDataDir, "containerd",
+	snap := filepath.Join(e.h.cfg.Disk.K0sDataDir, "containerd",
 		"io.containerd.snapshotter.v1.overlayfs", "snapshots", "snapctr1", "fs")
 	if err := os.MkdirAll(snap, 0o755); err != nil {
 		t.Fatal(err)
@@ -329,7 +329,7 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 	pod := calicoPod("calico-node-abc12", "uid-cal")
 	// cali* ifaces so the calico gate opens; felix probe fails.
 	writeFile(t, filepath.Join(e.sysnet, "cali00", "carrier"), "1\n")
-	e.status[e.h.cfg.CalicoFelixReadyURL] = 500
+	e.status[e.h.cfg.Calico.FelixReadyURL] = 500
 	pods := []corev1.Pod{*pod}
 
 	for i := 0; i < calicoFelixRestartFails; i++ {
@@ -368,7 +368,7 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 func TestCheckCalicoFelixLatchBeforeRestart(t *testing.T) {
 	e := fixture(t)
 	writeFile(t, filepath.Join(e.sysnet, "cali00", "carrier"), "1\n")
-	e.status[e.h.cfg.CalicoFelixReadyURL] = 500
+	e.status[e.h.cfg.Calico.FelixReadyURL] = 500
 	pods := []corev1.Pod{*calicoPod("calico-node-abc12", "uid-cal")}
 
 	for i := 0; i < 2; i++ {
@@ -391,7 +391,7 @@ func TestCheckCalicoVethGCDeletesOrphan(t *testing.T) {
 	writeFile(t, filepath.Join(e.sysnet, "cali99", "carrier"), "0\n")
 	// Leak still detected → latch persists: threshold+1 cali*
 	// ifaces over the (empty) pod count, all but cali99 live.
-	for i := 0; i < e.h.cfg.CalicoOrphanVethThreshold+1; i++ {
+	for i := 0; i < e.h.cfg.Calico.OrphanVethThreshold+1; i++ {
 		writeFile(t, filepath.Join(e.sysnet,
 			fmt.Sprintf("cali%02d", i+1), "carrier"), "1\n")
 	}

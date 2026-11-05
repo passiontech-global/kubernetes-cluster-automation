@@ -20,7 +20,7 @@ func TestContainerdMetaJournalLatch(t *testing.T) {
 	h := e.h
 	ctx := context.Background()
 	var journal string
-	h.cfg.ContainerdMetaJournalFn = func(context.Context) (string, error) {
+	h.cfg.Ctr.MetaJournalFn = func(context.Context) (string, error) {
 		return journal, nil
 	}
 	pids := func() []int { return nil }
@@ -74,9 +74,9 @@ func TestHostOOMVictimEvent(t *testing.T) {
 	}
 	// Marker pair → one Warning event on the Node.
 	now := time.Now().Unix()
-	writeFile(t, h.cfg.HostOOMVictimFile,
+	writeFile(t, h.cfg.Host.OOMVictimFile,
 		strconv.FormatInt(now, 10)+" containerd-shim\n")
-	writeFile(t, h.cfg.HostOOMCountFile, "3\n")
+	writeFile(t, h.cfg.Host.OOMCountFile, "3\n")
 	h.checkHostOOMVictims(ctx)
 	h.checkHostOOMVictims(ctx) // dedup — same count, no second event
 	evs, err = e.cs.EventsV1().Events("default").List(ctx,
@@ -94,7 +94,7 @@ func TestHostOOMVictimEvent(t *testing.T) {
 			ev.Reason, ev.Type, ev.Regarding.Name)
 	}
 	// Count advances → second event.
-	writeFile(t, h.cfg.HostOOMCountFile, "4\n")
+	writeFile(t, h.cfg.Host.OOMCountFile, "4\n")
 	h.checkHostOOMVictims(ctx)
 	evs, _ = e.cs.EventsV1().Events("default").List(ctx,
 		metav1.ListOptions{})
@@ -110,8 +110,8 @@ func TestOrphanHostPathVolumes(t *testing.T) {
 	h := e.h
 	ctx := context.Background()
 	root := t.TempDir()
-	h.cfg.OrphanHostPathDirs = []string{filepath.Join(root, "prov")}
-	prov := h.cfg.OrphanHostPathDirs[0]
+	h.cfg.Disk.OrphanHostPathDirs = []string{filepath.Join(root, "prov")}
+	prov := h.cfg.Disk.OrphanHostPathDirs[0]
 	if err := os.MkdirAll(filepath.Join(prov, "pvc-orphan1"), 0o755); err != nil {
 		t.Fatal(err)
 	}

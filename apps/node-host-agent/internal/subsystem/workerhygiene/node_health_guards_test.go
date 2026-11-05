@@ -159,7 +159,7 @@ func TestCheckCiliumEnvoyXDSReject(t *testing.T) {
 		"cluster_manager.cds.update_rejected: 9\n",
 	}
 	call := 0
-	e.h.cfg.httpGetBody = func(context.Context, string, time.Duration) ([]byte, error) {
+	e.h.cfg.Seams.httpGetBody = func(context.Context, string, time.Duration) ([]byte, error) {
 		defer func() { call++ }()
 		if call < len(stats) {
 			return []byte(stats[call]), nil
@@ -204,7 +204,7 @@ func TestCheckCiliumLRPDNS(t *testing.T) {
 	e.mkTask(t, uidB, "cilium-agent", 4343)
 	pod, _ := e.cs.CoreV1().Pods("kube-system").Get(
 		context.Background(), "node-local-dns-a1b2c", metav1.GetOptions{})
-	e.h.cfg.dnsProbe = func(string, string, time.Duration) bool { return false }
+	e.h.cfg.Seams.dnsProbe = func(string, string, time.Duration) bool { return false }
 	e.h.checkCiliumLRPDNS(context.Background(), []corev1.Pod{*pod}, true, true)
 	e.h.checkCiliumLRPDNS(context.Background(), []corev1.Pod{*pod}, true, true)
 	if _, err := e.cs.CoreV1().Pods("kube-system").Get(
@@ -219,7 +219,7 @@ func TestCheckCiliumLRPDNS(t *testing.T) {
 func TestCheckCiliumLRPDNSGates(t *testing.T) {
 	e := fixture(t)
 	// No cilium_host → dormant (calico node) — the probe must not run.
-	e.h.cfg.dnsProbe = func(string, string, time.Duration) bool {
+	e.h.cfg.Seams.dnsProbe = func(string, string, time.Duration) bool {
 		t.Fatal("dnsProbe ran without cilium datapath")
 		return false
 	}

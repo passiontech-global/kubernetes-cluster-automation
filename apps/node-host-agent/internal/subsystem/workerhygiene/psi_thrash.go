@@ -349,7 +349,7 @@ func (c *psiThrashCheck) Run(ctx context.Context, e *cycleEnv) {
 		return
 	}
 	free := float64(m.availKB) / float64(m.totalKB)
-	thrash := avg60 > c.h.cfg.PSIFullAvg60 && free < c.h.cfg.MemFreeMinRatio
+	thrash := avg60 > c.h.cfg.Pressure.PSIFullAvg60 && free < c.h.cfg.Pressure.MemFreeMinRatio
 	if !thrash {
 		c.fails = 0
 		c.h.state.Exit("psi-memory-thrash", nil)

@@ -72,46 +72,65 @@ func ConfigFromEnv(d EnvDeps) Config {
 			hostPath("/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io")),
 		SandboxCtlRoot: envx.String("NODE_HOST_AGENT_SANDBOX_CTL_ROOT",
 			hostPath("/run/k0s/containerd/io.containerd.sandbox.controller.v1.shim")),
-		HostResolvConf: envx.String("NODE_HOST_AGENT_HOST_RESOLV_CONF",
-			hostPath("/etc/resolv.conf")),
 		K0sWorkerUnitFile: envx.String("NODE_HOST_AGENT_K0S_WORKER_UNIT",
 			hostPath("/etc/systemd/system/k0sworker.service")),
-		KubeletPodsDir: envx.String("NODE_HOST_AGENT_KUBELET_PODS_DIR",
-			hostPath("/var/lib/k0s/kubelet/pods")),
-		CiliumSocket: envx.String("NODE_HOST_AGENT_CILIUM_SOCKET",
-			hostPath("/run/cilium/cilium.sock")),
-		// A4 probes: k0s puts the containerd socket at
-		// /run/k0s/containerd.sock (not inside the state dir); kubelet
-		// :10250 denies anonymous healthz, so the syncloop probe
-		// authenticates with the pod SA token.
-		ContainerdSocket: envx.String("NODE_HOST_AGENT_CONTAINERD_SOCKET",
-			hostPath("/run/k0s/containerd.sock")),
-		KubeletSyncloopURL: envx.String("NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL", ""),
-		KubeletTokenPath: envx.Or("NODE_HOST_AGENT_KUBELET_TOKEN_FILE",
-			defaultKubeletTokenPath),
-		Systemd:     d.Systemd,
-		Watchdog:    d.Watchdog,
-		WatchdogSrc: d.WatchdogSrc,
-		// T15 opt-in host list: env override →
-		// systemd_watchdog_hosts out of the vars dir
-		// (cluster.yaml). Absent vars dir is not an error — the
-		// feeder self-gates on k0sworker.service anyway.
-		KubeletWatchdogHosts:    kubeletWatchdogHosts(d.VarsDir, d.NodeName),
-		StuckDeleteAge:          envx.Duration("NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE", defaultStuckDeleteAge),
-		StuckWedgeAge:           envx.Duration("NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE", defaultStuckWedgeAge),
-		MaxForceDelete:          envx.Int("NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE", defaultMaxForceDelete),
-		ConsecNeeded:            envx.Int("NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED", defaultConsecNeeded),
-		MinRestartInterval:      envx.Duration("NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL", defaultMinRestartInterval),
-		JournalDirs:             d.JournalDirs,
-		JournalUnreadableNeeded: d.JournalUnreadableNeeded,
-		// W7 knobs — empty env → in-package defaults.
-		DStateStormThreshold:      envx.Int("NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD", defaultDStateStormThreshold),
-		CiliumEnvoyAdminURL:       envx.String("NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL", ""),
-		LocalDNSProbeAddr:         envx.String("NODE_HOST_AGENT_LOCALDNS_PROBE_ADDR", ""),
-		LocalDNSProbeName:         envx.String("NODE_HOST_AGENT_LOCALDNS_PROBE_NAME", ""),
-		CalicoFelixReadyURL:       envx.String("NODE_HOST_AGENT_CALICO_FELIX_READY_URL", ""),
-		CalicoOrphanVethThreshold: envx.Int("NODE_HOST_AGENT_CALICO_ORPHAN_VETH_THRESHOLD", defaultCalicoOrphanVethThresh),
-		Client:                    d.Client,
+		Net: NetConfig{
+			HostResolvConf: envx.String("NODE_HOST_AGENT_HOST_RESOLV_CONF",
+				hostPath("/etc/resolv.conf")),
+			// W7 knobs — empty env → in-package defaults.
+			LocalDNSProbeAddr: envx.String("NODE_HOST_AGENT_LOCALDNS_PROBE_ADDR", ""),
+			LocalDNSProbeName: envx.String("NODE_HOST_AGENT_LOCALDNS_PROBE_NAME", ""),
+		},
+		Kubelet: KubeletConfig{
+			PodsDir: envx.String("NODE_HOST_AGENT_KUBELET_PODS_DIR",
+				hostPath("/var/lib/k0s/kubelet/pods")),
+			// A4 probes: kubelet :10250 denies anonymous healthz, so
+			// the syncloop probe authenticates with the pod SA token.
+			SyncloopURL: envx.String("NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL", ""),
+			TokenPath: envx.Or("NODE_HOST_AGENT_KUBELET_TOKEN_FILE",
+				defaultKubeletTokenPath),
+			// T15 opt-in host list: env override →
+			// systemd_watchdog_hosts out of the vars dir
+			// (cluster.yaml). Absent vars dir is not an error — the
+			// feeder self-gates on k0sworker.service anyway.
+			WatchdogHosts: kubeletWatchdogHosts(d.VarsDir, d.NodeName),
+		},
+		Cilium: CiliumConfig{
+			Socket: envx.String("NODE_HOST_AGENT_CILIUM_SOCKET",
+				hostPath("/run/cilium/cilium.sock")),
+			// W7 knob — empty env → in-package default.
+			EnvoyAdminURL: envx.String("NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL", ""),
+		},
+		Ctr: CtrConfig{
+			// A4 probe: k0s puts the containerd socket at
+			// /run/k0s/containerd.sock (not inside the state dir).
+			Socket: envx.String("NODE_HOST_AGENT_CONTAINERD_SOCKET",
+				hostPath("/run/k0s/containerd.sock")),
+		},
+		Teardown: TeardownConfig{
+			StuckDeleteAge: envx.Duration("NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE", defaultStuckDeleteAge),
+			StuckWedgeAge:  envx.Duration("NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE", defaultStuckWedgeAge),
+			MaxForceDelete: envx.Int("NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE", defaultMaxForceDelete),
+		},
+		Pressure: PressureConfig{
+			// W7 knob — empty env → in-package default.
+			DStateStormThreshold: envx.Int("NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD", defaultDStateStormThreshold),
+		},
+		Calico: CalicoConfig{
+			// W7 knobs — empty env → in-package defaults.
+			FelixReadyURL:       envx.String("NODE_HOST_AGENT_CALICO_FELIX_READY_URL", ""),
+			OrphanVethThreshold: envx.Int("NODE_HOST_AGENT_CALICO_ORPHAN_VETH_THRESHOLD", defaultCalicoOrphanVethThresh),
+		},
+		Journal: JournalConfig{
+			Dirs:             d.JournalDirs,
+			UnreadableNeeded: d.JournalUnreadableNeeded,
+		},
+		Systemd:            d.Systemd,
+		Watchdog:           d.Watchdog,
+		WatchdogSrc:        d.WatchdogSrc,
+		ConsecNeeded:       envx.Int("NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED", defaultConsecNeeded),
+		MinRestartInterval: envx.Duration("NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL", defaultMinRestartInterval),
+		Client:             d.Client,
 	}
 	if d.Watchdog != nil {
 		// API_BACKENDS → the watch-wedge check's upstream-stale gate

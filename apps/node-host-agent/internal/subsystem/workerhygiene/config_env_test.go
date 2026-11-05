@@ -57,8 +57,8 @@ func TestConfigFromEnv(t *testing.T) {
 	if cfg.WatchdogStateDir != "/sd" || cfg.WatchdogLogFile != "/lf" {
 		t.Fatalf("state dirs: %+v", cfg)
 	}
-	if !reflect.DeepEqual(cfg.JournalDirs, d.JournalDirs) ||
-		cfg.JournalUnreadableNeeded != d.JournalUnreadableNeeded {
+	if !reflect.DeepEqual(cfg.Journal.Dirs, d.JournalDirs) ||
+		cfg.Journal.UnreadableNeeded != d.JournalUnreadableNeeded {
 		t.Fatalf("journal deps: %+v", cfg)
 	}
 	if cfg.Interval != 5*time.Minute {
@@ -72,26 +72,26 @@ func TestConfigFromEnv(t *testing.T) {
 	if cfg.CtrTaskRoot != "/host/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io" {
 		t.Fatalf("CtrTaskRoot=%q", cfg.CtrTaskRoot)
 	}
-	if cfg.ContainerdSocket != "/custom/containerd.sock" {
-		t.Fatalf("ContainerdSocket=%q", cfg.ContainerdSocket)
+	if cfg.Ctr.Socket != "/custom/containerd.sock" {
+		t.Fatalf("ContainerdSocket=%q", cfg.Ctr.Socket)
 	}
-	if cfg.KubeletTokenPath != "/custom/sa-token" {
-		t.Fatalf("KubeletTokenPath=%q", cfg.KubeletTokenPath)
+	if cfg.Kubelet.TokenPath != "/custom/sa-token" {
+		t.Fatalf("KubeletTokenPath=%q", cfg.Kubelet.TokenPath)
 	}
-	if !reflect.DeepEqual(cfg.KubeletWatchdogHosts, []string{"a", "b"}) {
-		t.Fatalf("KubeletWatchdogHosts=%v", cfg.KubeletWatchdogHosts)
+	if !reflect.DeepEqual(cfg.Kubelet.WatchdogHosts, []string{"a", "b"}) {
+		t.Fatalf("KubeletWatchdogHosts=%v", cfg.Kubelet.WatchdogHosts)
 	}
-	if cfg.StuckDeleteAge != 20*time.Minute {
-		t.Fatalf("StuckDeleteAge=%v", cfg.StuckDeleteAge)
+	if cfg.Teardown.StuckDeleteAge != 20*time.Minute {
+		t.Fatalf("StuckDeleteAge=%v", cfg.Teardown.StuckDeleteAge)
 	}
-	if cfg.MaxForceDelete != 9 {
-		t.Fatalf("MaxForceDelete=%d", cfg.MaxForceDelete)
+	if cfg.Teardown.MaxForceDelete != 9 {
+		t.Fatalf("MaxForceDelete=%d", cfg.Teardown.MaxForceDelete)
 	}
-	if cfg.DStateStormThreshold != 7 {
-		t.Fatalf("DStateStormThreshold=%d", cfg.DStateStormThreshold)
+	if cfg.Pressure.DStateStormThreshold != 7 {
+		t.Fatalf("DStateStormThreshold=%d", cfg.Pressure.DStateStormThreshold)
 	}
-	if cfg.CalicoOrphanVethThreshold != 77 {
-		t.Fatalf("CalicoOrphanVethThreshold=%d", cfg.CalicoOrphanVethThreshold)
+	if cfg.Calico.OrphanVethThreshold != 77 {
+		t.Fatalf("CalicoOrphanVethThreshold=%d", cfg.Calico.OrphanVethThreshold)
 	}
 	// APIBackends derives from the watchdog conf, not env.
 	if !reflect.DeepEqual(cfg.APIBackends, []string{"10.0.0.1"}) {
@@ -106,15 +106,15 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	if cfg.Interval != defaultInterval {
 		t.Fatalf("Interval=%v want %v", cfg.Interval, defaultInterval)
 	}
-	if cfg.KubeletTokenPath != defaultKubeletTokenPath {
-		t.Fatalf("KubeletTokenPath=%q", cfg.KubeletTokenPath)
+	if cfg.Kubelet.TokenPath != defaultKubeletTokenPath {
+		t.Fatalf("KubeletTokenPath=%q", cfg.Kubelet.TokenPath)
 	}
-	if cfg.CiliumSocket != "/host/run/cilium/cilium.sock" {
-		t.Fatalf("CiliumSocket=%q", cfg.CiliumSocket)
+	if cfg.Cilium.Socket != "/host/run/cilium/cilium.sock" {
+		t.Fatalf("CiliumSocket=%q", cfg.Cilium.Socket)
 	}
 	// Vars dir has no vars files → advisory host list is nil.
-	if cfg.KubeletWatchdogHosts != nil {
-		t.Fatalf("KubeletWatchdogHosts=%v want nil", cfg.KubeletWatchdogHosts)
+	if cfg.Kubelet.WatchdogHosts != nil {
+		t.Fatalf("KubeletWatchdogHosts=%v want nil", cfg.Kubelet.WatchdogHosts)
 	}
 	// nil Watchdog → no APIBackends, no panic.
 	cfg = ConfigFromEnv(EnvDeps{Client: d.Client, NodeName: "n"})

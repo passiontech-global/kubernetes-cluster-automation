@@ -67,8 +67,8 @@ func TestCheckCiliumWGPeers(t *testing.T) {
 	e.live[4242] = true
 	writeFile(t, filepath.Join(e.proc, "4242", "stat"), "1 (agent) S 0 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1000\n")
 	e.mkTask(t, "aabbccdd-1111-2222-3333-444455556666", "cilium-agent", 4242)
-	e.h.cfg.wgAllowedIPsFn = func(context.Context) (int, error) { return 0, nil }
-	e.h.cfg.ciliumEncryptPeersFn = func(context.Context) (int, error) { return 3, nil }
+	e.h.cfg.Seams.wgAllowedIPsFn = func(context.Context) (int, error) { return 0, nil }
+	e.h.cfg.Seams.ciliumEncryptPeersFn = func(context.Context) (int, error) { return 3, nil }
 	e.h.Cycle(context.Background())
 	if len(e.kills) != 0 {
 		t.Fatalf("first cycle: kills = %v, want none (streak 1/2)", e.kills)
@@ -96,7 +96,7 @@ func TestCheckCiliumWGPeers(t *testing.T) {
 func TestCheckCiliumWGPeersGates(t *testing.T) {
 	e := fixture(t)
 	// No cilium_wg0 in sysfs → the check is a silent no-op.
-	e.h.cfg.wgAllowedIPsFn = func(context.Context) (int, error) {
+	e.h.cfg.Seams.wgAllowedIPsFn = func(context.Context) (int, error) {
 		return 0, errors.New("must not be called")
 	}
 	e.h.checkCiliumWGPeers(context.Background(), true, true)
@@ -113,8 +113,8 @@ func TestCheckCiliumWGPeersGates(t *testing.T) {
 		t.Fatalf("api-down: ciliumWGFails = %d, want kept 1", e.h.ciliumWGFails)
 	}
 	// Healthy peers → streak resets, latch clears.
-	e.h.cfg.wgAllowedIPsFn = func(context.Context) (int, error) { return 5, nil }
-	e.h.cfg.ciliumEncryptPeersFn = func(context.Context) (int, error) { return 5, nil }
+	e.h.cfg.Seams.wgAllowedIPsFn = func(context.Context) (int, error) { return 5, nil }
+	e.h.cfg.Seams.ciliumEncryptPeersFn = func(context.Context) (int, error) { return 5, nil }
 	e.live[4242] = true
 	writeFile(t, filepath.Join(e.proc, "4242", "stat"), "1 (agent) S 0 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1000\n")
 	e.mkTask(t, "aabbccdd-1111-2222-3333-444455556666", "cilium-agent", 4242)
@@ -144,7 +144,7 @@ func TestCheckDiskBloatEvicts(t *testing.T) {
 			UID: types.UID("uid-1"), CreationTimestamp: metav1.Now(),
 		},
 	})
-	e.h.cfg.DiskBloatPodThresholdBytes = 64
+	e.h.cfg.Disk.BloatPodThresholdBytes = 64
 	e.diskUsed = 0.95 // above the 0.92 critical watermark
 	vol := filepath.Join(e.kubepods, "uid-1", "volumes",
 		"kubernetes.io~empty-dir", "data")
@@ -176,7 +176,7 @@ func TestCheckDiskBloatSystemPodSafe(t *testing.T) {
 			UID: types.UID("uid-sys"), CreationTimestamp: metav1.Now(),
 		},
 	})
-	e.h.cfg.DiskBloatPodThresholdBytes = 64
+	e.h.cfg.Disk.BloatPodThresholdBytes = 64
 	e.diskUsed = 0.95
 	vol := filepath.Join(e.kubepods, "uid-sys", "volumes",
 		"kubernetes.io~empty-dir", "data")
