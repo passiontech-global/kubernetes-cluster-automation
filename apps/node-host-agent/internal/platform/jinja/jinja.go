@@ -1,6 +1,7 @@
-// Mini-Jinja2 evaluator — just enough of jinja2 + the ansible filter
-// set to evaluate the vars files (defaults.yaml / cluster.yaml) and to
-// render the vendored .j2 templates byte-identically.
+// Package jinja is a mini-Jinja2 evaluator — just enough of jinja2 +
+// the ansible filter set to evaluate the vars files
+// (defaults.yaml / cluster.yaml) and to render the vendored .j2
+// templates byte-identically.
 //
 // Supported:
 //
@@ -25,7 +26,7 @@
 //
 // NOT supported (unused by the ported sources): namespace(), macros,
 // imports, raw blocks, slices, **.
-package topology
+package jinja
 
 import (
 	"crypto/sha256"
@@ -46,6 +47,10 @@ type Undefined struct{ name string }
 
 func (u Undefined) String() string { return "Undefined(" + u.name + ")" }
 
+// NewUndefined returns the `undefined` value for a missing name —
+// falsy, default()-able, stringifies to "".
+func NewUndefined(name string) Undefined { return Undefined{name} }
+
 // List wraps a slice so in-place mutation (append inside set/for)
 // behaves like python lists across scope bindings.
 type List struct{ V []any }
@@ -61,7 +66,7 @@ const flattenMaxDepth = 100
 // budgeted too.
 const flattenMaxOut = 100_000
 
-// walkMaxDepth bounds the recursive value walkers (stringify,
+// walkMaxDepth bounds the recursive value walkers (Stringify,
 // deepEq, toPlain, jsonValue). A cyclic *List/*OMap is
 // constructible in-template ({% set _ = l.append(l) %}) and would
 // otherwise recurse until the goroutine stack burst — python
@@ -99,6 +104,24 @@ func Render(text string, ctx map[string]any, env *Env) (string, error) {
 	return b.String(), nil
 }
 
+// RenderScoped renders template text where template names resolve
+// through lookup BEFORE the builtins (unlike Render, whose names come
+// from a fixed ctx map) — the lazy vars-file resolution path, where a
+// var's {{ }} sees every other var through the same resolver.
+// lookup returning nil or an Undefined falls through to the builtins.
+func RenderScoped(text string, env *Env, lookup func(name string) any) (string, error) {
+	nodes, err := parseTemplate(text)
+	if err != nil {
+		return "", err
+	}
+	s := &scope{vars: map[string]any{}, env: env, lookup: lookup}
+	var b strings.Builder
+	if err := renderNodes(nodes, s, &b); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
 type scope struct {
 	vars   map[string]any
 	env    *Env
@@ -125,13 +148,13 @@ func (s *scope) get(name string) any {
 		return builtinFunc(func(args []any, kw map[string]any, _ *scope) (any, error) {
 			var lo, hi, step int64 = 0, 0, 1
 			if len(args) == 1 {
-				hi, _ = toInt(args[0])
+				hi, _ = ToInt(args[0])
 			} else if len(args) >= 2 {
-				lo, _ = toInt(args[0])
-				hi, _ = toInt(args[1])
+				lo, _ = ToInt(args[0])
+				hi, _ = ToInt(args[1])
 			}
 			if len(args) > 2 {
-				step, _ = toInt(args[2])
+				step, _ = ToInt(args[2])
 			}
 			if step == 0 {
 				// lo<hi with step 0 never advances — unbounded
@@ -198,7 +221,7 @@ func (n exprNode) render(s *scope, b *strings.Builder) error {
 	if err != nil {
 		return err
 	}
-	b.WriteString(stringify(v))
+	b.WriteString(Stringify(v))
 	return nil
 }
 
@@ -240,7 +263,7 @@ func (n forNode) bind(s *scope, it any) error {
 	if _, ok := it.(*OMap); ok {
 		return fmt.Errorf("for: cannot unpack a mapping into %d names — use .items() or a single loop var", len(n.names))
 	}
-	pair := toIter(it)
+	pair := ToIter(it)
 	if len(pair) != len(n.names) {
 		return fmt.Errorf("for: cannot unpack item with %d values into %d names", len(pair), len(n.names))
 	}
@@ -275,11 +298,11 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 	}
 	s.vars = inner
 	// Apply the `if` filters first: the loop var is bound for each
-	// candidate and every condition must be truthy for the item to
+	// candidate and every condition must be Truthy for the item to
 	// iterate — loop.index/count then track the FILTERED sequence
 	// (jinja semantics).
 	var kept []any
-	for _, it := range toIter(v) {
+	for _, it := range ToIter(v) {
 		if err := n.bind(s, it); err != nil {
 			return err
 		}
@@ -289,7 +312,7 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 			if err != nil {
 				return err
 			}
-			if !truthy(cv) {
+			if !Truthy(cv) {
 				ok = false
 				break
 			}
@@ -335,7 +358,7 @@ func (n ifNode) render(s *scope, b *strings.Builder) error {
 		if err != nil {
 			return err
 		}
-		if truthy(v) {
+		if Truthy(v) {
 			return renderNodes(arm.body, s, b)
 		}
 	}
@@ -745,7 +768,7 @@ func (e unExpr) eval(s *scope) (any, error) {
 	}
 	switch e.op {
 	case "not":
-		return !truthy(v), nil
+		return !Truthy(v), nil
 	case "-":
 		return numNeg(v)
 	}
@@ -761,13 +784,13 @@ func (e binExpr) eval(s *scope) (any, error) {
 	switch e.op {
 	case "and":
 		l, err := e.l.eval(s)
-		if err != nil || !truthy(l) {
+		if err != nil || !Truthy(l) {
 			return l, err
 		}
 		return e.r.eval(s)
 	case "or":
 		l, err := e.l.eval(s)
-		if err != nil || truthy(l) {
+		if err != nil || Truthy(l) {
 			return l, err
 		}
 		return e.r.eval(s)
@@ -822,7 +845,7 @@ func (e condExpr) eval(s *scope) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if truthy(c) {
+	if Truthy(c) {
 		return e.t.eval(s)
 	}
 	if e.f == nil {
@@ -858,7 +881,7 @@ func (e dictExpr) eval(s *scope) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		m.Set(stringify(k), v)
+		m.Set(Stringify(k), v)
 	}
 	return m, nil
 }
@@ -1339,7 +1362,7 @@ func (p *parser) parsePrimary() (expr, error) {
 
 // ---------------- value helpers ----------------
 
-func truthy(v any) bool {
+func Truthy(v any) bool {
 	switch t := v.(type) {
 	case nil:
 		return false
@@ -1363,7 +1386,7 @@ func truthy(v any) bool {
 	return true
 }
 
-func stringify(v any) string { return stringifyAt(v, 0) }
+func Stringify(v any) string { return stringifyAt(v, 0) }
 
 // stringifyAt renders under a recursion budget (walkMaxDepth) —
 // a cyclic *List is constructible in-template and unbounded
@@ -1411,7 +1434,7 @@ func stringifyAt(v any, depth int) string {
 	return fmt.Sprint(v)
 }
 
-func toIter(v any) []any {
+func ToIter(v any) []any {
 	switch t := v.(type) {
 	case *List:
 		return t.V
@@ -1477,14 +1500,14 @@ func getAttr(v any, key string) any {
 func getIndex(v any, k any) (any, error) {
 	switch t := v.(type) {
 	case *OMap:
-		if val, ok := t.Get(stringify(k)); ok {
+		if val, ok := t.Get(Stringify(k)); ok {
 			return val, nil
 		}
-		return Undefined{stringify(k)}, nil
+		return Undefined{Stringify(k)}, nil
 	case *List:
 		return getIndex(t.V, k)
 	case []any:
-		i, ok := toInt(k)
+		i, ok := ToInt(k)
 		if !ok {
 			return nil, fmt.Errorf("non-integer index %v", k)
 		}
@@ -1496,7 +1519,7 @@ func getIndex(v any, k any) (any, error) {
 		}
 		return t[i], nil
 	case string:
-		i, ok := toInt(k)
+		i, ok := ToInt(k)
 		if !ok {
 			return Undefined{"index"}, nil
 		}
@@ -1512,7 +1535,7 @@ func getIndex(v any, k any) (any, error) {
 	return Undefined{"index"}, nil
 }
 
-func toInt(v any) (int64, bool) {
+func ToInt(v any) (int64, bool) {
 	switch t := v.(type) {
 	case int64:
 		return t, true
@@ -1566,7 +1589,7 @@ func numEq(l, r any) bool {
 	if lok && rok {
 		return lf == rf
 	}
-	return stringify(l) == stringify(r)
+	return Stringify(l) == Stringify(r)
 }
 
 func deepEq(l, r any) bool { return deepEqAt(l, r, 0) }
@@ -1625,7 +1648,7 @@ func deepEqAt(l, r any, depth int) bool {
 		return true
 	}
 	if l == nil || r == nil {
-		return isNilOrUndef(l) && isNilOrUndef(r)
+		return IsNilOrUndef(l) && IsNilOrUndef(r)
 	}
 	if _, ok := l.(Undefined); ok {
 		_, uok := r.(Undefined)
@@ -1634,7 +1657,7 @@ func deepEqAt(l, r any, depth int) bool {
 	return numEq(l, r)
 }
 
-func isNilOrUndef(v any) bool {
+func IsNilOrUndef(v any) bool {
 	if v == nil {
 		return true
 	}
@@ -1645,7 +1668,7 @@ func isNilOrUndef(v any) bool {
 func binOp(op string, l, r any) (any, error) {
 	switch op {
 	case "~":
-		return stringify(l) + stringify(r), nil
+		return Stringify(l) + Stringify(r), nil
 	case "+":
 		if ls, ok := l.(*List); ok {
 			if rs, ok := r.(*List); ok {
@@ -1676,8 +1699,8 @@ func binOp(op string, l, r any) (any, error) {
 		}
 		if lf, ok := toFloat(l); ok {
 			if rf, ok := toFloat(r); ok {
-				li, lInt := toInt(l)
-				ri, rInt := toInt(r)
+				li, lInt := ToInt(l)
+				ri, rInt := ToInt(r)
 				if lInt && rInt && isNum(l) && isNum(r) {
 					return li + ri, nil
 				}
@@ -1685,7 +1708,7 @@ func binOp(op string, l, r any) (any, error) {
 			}
 		}
 		// list+num, dict+num, none+num … used to fall through to
-		// a silent stringify-concat — same bug-hiding class as
+		// a silent Stringify-concat — same bug-hiding class as
 		// str+num. Only num+num, str+str and seq+seq are legal.
 		return nil, fmt.Errorf("unsupported operand types for +: %T and %T", l, r)
 	case "-", "*", "/", "//", "%":
@@ -1694,8 +1717,8 @@ func binOp(op string, l, r any) (any, error) {
 		if !lok || !rok {
 			return nil, fmt.Errorf("non-numeric %s operands", op)
 		}
-		li, lInt := toInt(l)
-		ri, rInt := toInt(r)
+		li, lInt := ToInt(l)
+		ri, rInt := ToInt(r)
 		if lInt && rInt && isNum(l) && isNum(r) && op != "/" {
 			switch op {
 			case "-":
@@ -1749,7 +1772,7 @@ func binOp(op string, l, r any) (any, error) {
 				return lf >= rf, nil
 			}
 		}
-		ls, rs := stringify(l), stringify(r)
+		ls, rs := Stringify(l), Stringify(r)
 		switch op {
 		case "<":
 			return ls < rs, nil
@@ -1763,7 +1786,7 @@ func binOp(op string, l, r any) (any, error) {
 	case "in":
 		switch rt := r.(type) {
 		case string:
-			return strings.Contains(rt, stringify(l)), nil
+			return strings.Contains(rt, Stringify(l)), nil
 		case *List:
 			return binOp("in", l, rt.V)
 		case []any:
@@ -1774,7 +1797,7 @@ func binOp(op string, l, r any) (any, error) {
 			}
 			return false, nil
 		case *OMap:
-			_, ok := rt.Get(stringify(l))
+			_, ok := rt.Get(Stringify(l))
 			return ok, nil
 		}
 		return false, nil
@@ -1803,7 +1826,7 @@ func minMaxLess(a, b any) bool {
 		bf, _ := toFloat(b)
 		return af < bf
 	}
-	return stringify(a) < stringify(b)
+	return Stringify(a) < Stringify(b)
 }
 
 func callValue(fn any, args []any, kw map[string]any, s *scope) (any, error) {
@@ -1856,7 +1879,7 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 			if len(args) == 0 {
 				return nil, fmt.Errorf("get: missing key argument")
 			}
-			if v, ok := om.Get(stringify(args[0])); ok {
+			if v, ok := om.Get(Stringify(args[0])); ok {
 				return v, nil
 			}
 			if len(args) > 1 {
@@ -1865,27 +1888,27 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 			return nil, nil
 		}
 	case "endswith", "startswith":
-		str := stringify(m.obj)
+		str := Stringify(m.obj)
 		if len(args) == 0 {
 			return false, nil
 		}
 		if m.name == "endswith" {
-			return strings.HasSuffix(str, stringify(args[0])), nil
+			return strings.HasSuffix(str, Stringify(args[0])), nil
 		}
-		return strings.HasPrefix(str, stringify(args[0])), nil
+		return strings.HasPrefix(str, Stringify(args[0])), nil
 	case "split":
-		str := stringify(m.obj)
+		str := Stringify(m.obj)
 		if len(args) == 0 {
 			return &List{splitWS(str)}, nil
 		}
-		return &List{splitAny(str, stringify(args[0]))}, nil
+		return &List{splitAny(str, Stringify(args[0]))}, nil
 	case "strip":
-		return strings.TrimSpace(stringify(m.obj)), nil
+		return strings.TrimSpace(Stringify(m.obj)), nil
 	case "index":
 		if len(args) == 0 {
 			return nil, fmt.Errorf("index: missing argument")
 		}
-		for i, it := range toIter(m.obj) {
+		for i, it := range ToIter(m.obj) {
 			if deepEq(it, args[0]) {
 				return int64(i), nil
 			}
@@ -1898,7 +1921,7 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 			}
 			i := int64(len(l.V)) - 1
 			if len(args) > 0 {
-				j, _ := toInt(args[0])
+				j, _ := ToInt(args[0])
 				i = j
 				// python list.pop accepts negative indices.
 				if i < 0 {
@@ -1938,7 +1961,7 @@ func splitAny(s, sep string) []any {
 func runTest(name string, v any, args []any) (bool, error) {
 	switch name {
 	case "defined":
-		return !isNilOrUndef(v), nil
+		return !IsNilOrUndef(v), nil
 	case "undefined":
 		_, u := v.(Undefined)
 		return u, nil
@@ -1965,11 +1988,11 @@ func runTest(name string, v any, args []any) (bool, error) {
 		if len(args) == 0 {
 			return false, nil
 		}
-		re, err := regexp.Compile(stringify(args[0]))
+		re, err := regexp.Compile(Stringify(args[0]))
 		if err != nil {
 			return false, nil
 		}
-		return re.MatchString(stringify(v)), nil
+		return re.MatchString(Stringify(v)), nil
 	case "equalto", "eq":
 		if len(args) == 0 {
 			return false, nil
@@ -2006,7 +2029,7 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if len(args) > 0 {
 			def = args[0]
 		}
-		useBool := len(args) > 1 && truthy(args[1])
+		useBool := len(args) > 1 && Truthy(args[1])
 		_, undef := v.(Undefined)
 		if undef {
 			return def, nil
@@ -2014,25 +2037,25 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if v == nil {
 			return def, nil
 		}
-		if useBool && !truthy(v) {
+		if useBool && !Truthy(v) {
 			return def, nil
 		}
 		return v, nil
 	case "basename":
-		sv := stringify(v)
+		sv := Stringify(v)
 		return sv[strings.LastIndex(sv, "/")+1:], nil
 	case "join":
 		sep := " "
 		if len(args) > 0 {
-			sep = stringify(args[0])
+			sep = Stringify(args[0])
 		}
 		parts := []string{}
-		for _, it := range toIter(v) {
-			parts = append(parts, stringify(it))
+		for _, it := range ToIter(v) {
+			parts = append(parts, Stringify(it))
 		}
 		return strings.Join(parts, sep), nil
 	case "list":
-		return &List{toIter(v)}, nil
+		return &List{ToIter(v)}, nil
 	case "length", "count":
 		switch t := v.(type) {
 		case string:
@@ -2046,19 +2069,19 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return int64(0), nil
 	case "first":
-		l := toIter(v)
+		l := ToIter(v)
 		if len(l) == 0 {
 			return Undefined{"first"}, nil
 		}
 		return l[0], nil
 	case "last":
-		l := toIter(v)
+		l := ToIter(v)
 		if len(l) == 0 {
 			return Undefined{"last"}, nil
 		}
 		return l[len(l)-1], nil
 	case "sort":
-		l := append([]any{}, toIter(v)...)
+		l := append([]any{}, ToIter(v)...)
 		sort.SliceStable(l, func(i, j int) bool {
 			if isNum(l[i]) && isNum(l[j]) {
 				fi, _ := toFloat(l[i])
@@ -2067,17 +2090,17 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 			}
 			if lp, ok := l[i].(*List); ok {
 				if rp, ok := l[j].(*List); ok && len(lp.V) > 0 && len(rp.V) > 0 {
-					return stringify(lp.V[0]) < stringify(rp.V[0])
+					return Stringify(lp.V[0]) < Stringify(rp.V[0])
 				}
 			}
-			return stringify(l[i]) < stringify(l[j])
+			return Stringify(l[i]) < Stringify(l[j])
 		})
 		return &List{l}, nil
 	case "unique":
 		seen := map[string]bool{}
 		var out []any
-		for _, it := range toIter(v) {
-			k := stringify(it)
+		for _, it := range ToIter(v) {
+			k := Stringify(it)
 			if !seen[k] {
 				seen[k] = true
 				out = append(out, it)
@@ -2087,10 +2110,10 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 	case "difference":
 		var excl []any
 		if len(args) > 0 {
-			excl = toIter(args[0])
+			excl = ToIter(args[0])
 		}
 		var out []any
-		for _, it := range toIter(v) {
+		for _, it := range ToIter(v) {
 			skip := false
 			for _, e := range excl {
 				if deepEq(it, e) {
@@ -2105,9 +2128,9 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		return &List{out}, nil
 	case "union":
 		var out []any
-		out = append(out, toIter(v)...)
+		out = append(out, ToIter(v)...)
 		for _, a := range args {
-			out = append(out, toIter(a)...)
+			out = append(out, ToIter(a)...)
 		}
 		return &List{out}, nil
 	case "dict2items":
@@ -2117,11 +2140,11 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		return &List{}, nil
 	case "items2dict":
 		m := NewOMap()
-		for _, it := range toIter(v) {
+		for _, it := range ToIter(v) {
 			if om, ok := it.(*OMap); ok {
 				k, _ := om.Get("key")
 				vv, _ := om.Get("value")
-				m.Set(stringify(k), vv)
+				m.Set(Stringify(k), vv)
 			}
 		}
 		return m, nil
@@ -2136,15 +2159,15 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 	case "select":
 		return filterTest(v, args, true)
 	case "bool":
-		return truthy(v), nil
+		return Truthy(v), nil
 	case "int":
 		def := int64(0)
 		if len(args) > 0 {
-			def, _ = toInt(args[0])
+			def, _ = ToInt(args[0])
 		}
 		base := int64(10)
 		if len(args) > 1 {
-			base, _ = toInt(args[1])
+			base, _ = ToInt(args[1])
 		}
 		switch t := v.(type) {
 		case int64:
@@ -2170,39 +2193,39 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		f, _ := toFloat(v)
 		return f, nil
 	case "string":
-		return stringify(v), nil
+		return Stringify(v), nil
 	case "trim":
-		return strings.TrimSpace(stringify(v)), nil
+		return strings.TrimSpace(Stringify(v)), nil
 	case "split":
-		str := stringify(v)
+		str := Stringify(v)
 		if len(args) == 0 {
 			return &List{splitWS(str)}, nil
 		}
-		return &List{splitAny(str, stringify(args[0]))}, nil
+		return &List{splitAny(str, Stringify(args[0]))}, nil
 	case "lower":
-		return strings.ToLower(stringify(v)), nil
+		return strings.ToLower(Stringify(v)), nil
 	case "upper":
-		return strings.ToUpper(stringify(v)), nil
+		return strings.ToUpper(Stringify(v)), nil
 	case "regex_escape":
-		return regexp.QuoteMeta(stringify(v)), nil
+		return regexp.QuoteMeta(Stringify(v)), nil
 	case "regex_replace":
 		if len(args) < 2 {
 			return v, nil
 		}
-		re, err := regexp.Compile(stringify(args[0]))
+		re, err := regexp.Compile(Stringify(args[0]))
 		if err != nil {
 			return nil, err
 		}
-		return re.ReplaceAllString(stringify(v), stringify(args[1])), nil
+		return re.ReplaceAllString(Stringify(v), Stringify(args[1])), nil
 	case "regex_findall":
 		if len(args) == 0 {
 			return &List{}, nil
 		}
-		re, err := regexp.Compile(stringify(args[0]))
+		re, err := regexp.Compile(Stringify(args[0]))
 		if err != nil {
 			return nil, err
 		}
-		matches := re.FindAllStringSubmatch(stringify(v), -1)
+		matches := re.FindAllStringSubmatch(Stringify(v), -1)
 		out := make([]any, 0, len(matches))
 		for _, m := range matches {
 			switch {
@@ -2225,11 +2248,11 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if len(args) == 0 {
 			return Undefined{"regex_search"}, nil
 		}
-		re, err := regexp.Compile(stringify(args[0]))
+		re, err := regexp.Compile(Stringify(args[0]))
 		if err != nil {
 			return nil, err
 		}
-		m := re.FindStringSubmatch(stringify(v))
+		m := re.FindStringSubmatch(Stringify(v))
 		if len(m) > 1 {
 			out := make([]any, 0, len(m)-1)
 			for _, g := range m[1:] {
@@ -2242,7 +2265,7 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return Undefined{"regex_search"}, nil
 	case "ternary":
-		if truthy(v) && len(args) > 0 {
+		if Truthy(v) && len(args) > 0 {
 			return args[0], nil
 		}
 		if len(args) > 1 {
@@ -2257,12 +2280,12 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		return string(b), nil
 	case "from_json":
 		var out any
-		if err := json.Unmarshal([]byte(stringify(v)), &out); err != nil {
+		if err := json.Unmarshal([]byte(Stringify(v)), &out); err != nil {
 			return nil, err
 		}
 		return fromJSON(out), nil
 	case "from_yaml":
-		return DecodeYAML([]byte(stringify(v)))
+		return DecodeYAML([]byte(Stringify(v)))
 	case "to_yaml", "to_nice_yaml":
 		b, err := yaml3.Marshal(toPlain(v))
 		if err != nil {
@@ -2270,18 +2293,18 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return string(b), nil
 	case "b64decode":
-		b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(stringify(v)))
+		b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(Stringify(v)))
 		if err != nil {
 			return nil, err
 		}
 		return string(b), nil
 	case "b64encode":
-		return base64.StdEncoding.EncodeToString([]byte(stringify(v))), nil
+		return base64.StdEncoding.EncodeToString([]byte(Stringify(v))), nil
 	case "hash":
-		h := sha256.Sum256([]byte(stringify(v)))
+		h := sha256.Sum256([]byte(Stringify(v)))
 		return hex.EncodeToString(h[:]), nil
 	case "min":
-		l := toIter(v)
+		l := ToIter(v)
 		if len(l) == 0 {
 			return Undefined{"min"}, nil
 		}
@@ -2293,7 +2316,7 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return best, nil
 	case "max":
-		l := toIter(v)
+		l := ToIter(v)
 		if len(l) == 0 {
 			return Undefined{"max"}, nil
 		}
@@ -2305,19 +2328,19 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return best, nil
 	case "format":
-		return pyFormat(stringify(v), args)
+		return pyFormat(Stringify(v), args)
 	case "indent":
 		n := int64(4)
 		if len(args) > 0 {
-			n, _ = toInt(args[0])
+			n, _ = ToInt(args[0])
 		}
 		pad := strings.Repeat(" ", int(n))
-		return pad + strings.ReplaceAll(stringify(v), "\n", "\n"+pad), nil
+		return pad + strings.ReplaceAll(Stringify(v), "\n", "\n"+pad), nil
 	case "flatten":
 		var out []any
 		var rec func(x any, depth int) error
 		rec = func(x any, depth int) error {
-			// Only real lists nest. toIter char-splits strings and
+			// Only real lists nest. ToIter char-splits strings and
 			// dumps map keys, so routing everything through it
 			// turned ["ab","cd"] into [a b c d]; a dict is an atom.
 			var items []any
@@ -2355,9 +2378,9 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		return &List{out}, nil
 	case "zip":
 		var out []any
-		lists := [][]any{toIter(v)}
+		lists := [][]any{ToIter(v)}
 		for _, a := range args {
-			lists = append(lists, toIter(a))
+			lists = append(lists, ToIter(a))
 		}
 		minLen := -1
 		for _, l := range lists {
@@ -2381,7 +2404,7 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 	case "search":
 		return runTest("search", v, args)
 	case "mandatory":
-		if isNilOrUndef(v) {
+		if IsNilOrUndef(v) {
 			return nil, fmt.Errorf("mandatory: value undefined")
 		}
 		return v, nil
@@ -2436,7 +2459,7 @@ func pyFormat(format string, args []any) (string, error) {
 		argi++
 		switch conv {
 		case 'd':
-			iv, ok := toInt(a)
+			iv, ok := ToInt(a)
 			if !ok {
 				return "", fmt.Errorf("format: %%%sd arg %v is not a number", spec, a)
 			}
@@ -2451,7 +2474,7 @@ func pyFormat(format string, args []any) (string, error) {
 				b.WriteString(fmt.Sprintf("%"+spec+"d", iv))
 			}
 		case 'x', 'X':
-			iv, ok := toInt(a)
+			iv, ok := ToInt(a)
 			if !ok {
 				return "", fmt.Errorf("format: %%%s%c arg %v is not a number", spec, conv, a)
 			}
@@ -2469,9 +2492,9 @@ func pyFormat(format string, args []any) (string, error) {
 			}
 			b.WriteString(fmt.Sprintf("%"+spec+string(conv), fv))
 		case 'c':
-			if iv, ok := toInt(a); ok {
+			if iv, ok := ToInt(a); ok {
 				b.WriteString(string(rune(iv)))
-			} else if sv := stringify(a); sv != "" {
+			} else if sv := Stringify(a); sv != "" {
 				// First RUNE, not first byte — sv[:1] split a
 				// multi-byte UTF-8 character.
 				for _, r := range sv {
@@ -2480,7 +2503,7 @@ func pyFormat(format string, args []any) (string, error) {
 				}
 			}
 		case 's', 'v', 'r':
-			sv := stringify(a)
+			sv := Stringify(a)
 			// %.Ns truncates the string form (python precision
 			// semantics on %s).
 			if dot := strings.IndexByte(spec, '.'); dot >= 0 {
@@ -2537,8 +2560,8 @@ func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
 	// map(attribute='x'[, default=y])
 	if attr, ok := kw["attribute"]; ok {
 		var out []any
-		for _, it := range toIter(v) {
-			got := selectAttrKey(it, stringify(attr))
+		for _, it := range ToIter(v) {
+			got := selectAttrKey(it, Stringify(attr))
 			if _, u := got.(Undefined); u && kw["default"] != nil {
 				got = kw["default"]
 			}
@@ -2547,12 +2570,12 @@ func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
 		return &List{out}, nil
 	}
 	if len(args) == 0 {
-		return &List{toIter(v)}, nil
+		return &List{ToIter(v)}, nil
 	}
-	name := stringify(args[0])
+	name := Stringify(args[0])
 	// map('basename') / map('regex_replace', p, r) — filter by name
 	var out []any
-	for _, it := range toIter(v) {
+	for _, it := range ToIter(v) {
 		fv, err := applyFilter(name, it, args[1:], nil, s)
 		if err != nil {
 			out = append(out, getAttr(it, name))
@@ -2576,21 +2599,21 @@ func selectAttrKey(v any, path string) any {
 
 func filterSelectAttr(v any, args []any, keep bool) (any, error) {
 	if len(args) == 0 {
-		return &List{toIter(v)}, nil
+		return &List{ToIter(v)}, nil
 	}
-	path := stringify(args[0])
+	path := Stringify(args[0])
 	testName := ""
 	var testArgs []any
 	if len(args) > 1 {
-		testName = stringify(args[1])
+		testName = Stringify(args[1])
 		testArgs = args[2:]
 	}
 	var out []any
-	for _, it := range toIter(v) {
+	for _, it := range ToIter(v) {
 		val := selectAttrKey(it, path)
 		var ok bool
 		if testName == "" {
-			ok = truthy(val)
+			ok = Truthy(val)
 		} else {
 			var err error
 			ok, err = runTest(testName, val, testArgs)
@@ -2609,17 +2632,17 @@ func filterTest(v any, args []any, keep bool) (any, error) {
 	var out []any
 	if len(args) == 0 {
 		// select/reject with no test filters on truthiness —
-		// `x | select` keeps truthy items, `| reject` drops them
+		// `x | select` keeps Truthy items, `| reject` drops them
 		// (previously the whole list passed through unchanged).
-		for _, it := range toIter(v) {
-			if truthy(it) == keep {
+		for _, it := range ToIter(v) {
+			if Truthy(it) == keep {
 				out = append(out, it)
 			}
 		}
 		return &List{out}, nil
 	}
-	testName := stringify(args[0])
-	for _, it := range toIter(v) {
+	testName := Stringify(args[0])
+	for _, it := range ToIter(v) {
 		ok, err := runTest(testName, it, args[1:])
 		if err != nil {
 			return nil, err
@@ -2744,7 +2767,7 @@ func doLookup(args []any, s *scope) (any, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("lookup: missing plugin name")
 	}
-	kind := stringify(args[0])
+	kind := Stringify(args[0])
 	switch kind {
 	case "file", "ansible.builtin.file":
 		if len(args) < 2 {
@@ -2753,7 +2776,7 @@ func doLookup(args []any, s *scope) (any, error) {
 		if s.env == nil || s.env.FileLookup == nil {
 			return nil, fmt.Errorf("lookup(%q): no file lookup configured", kind)
 		}
-		return s.env.FileLookup(stringify(args[1]))
+		return s.env.FileLookup(Stringify(args[1]))
 	case "pipe", "ansible.builtin.pipe":
 		if len(args) < 2 {
 			return nil, fmt.Errorf("lookup(%q): missing command", kind)
@@ -2761,7 +2784,7 @@ func doLookup(args []any, s *scope) (any, error) {
 		if s.env == nil || s.env.PipeLookup == nil {
 			return nil, fmt.Errorf("lookup(%q): no pipe lookup configured", kind)
 		}
-		return s.env.PipeLookup(stringify(args[1]))
+		return s.env.PipeLookup(Stringify(args[1]))
 	}
 	return nil, fmt.Errorf("lookup: unsupported plugin %q", kind)
 }

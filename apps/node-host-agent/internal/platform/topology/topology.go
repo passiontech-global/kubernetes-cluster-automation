@@ -20,7 +20,40 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/jinja"
 )
+
+// ---- re-exported jinja engine surface ----
+//
+// The mini-Jinja2 evaluator + its ordered-map/YAML values live in
+// internal/platform/jinja. These aliases and thin forwarders keep
+// the historical topology.X API so consumers (hostconfig, hubsync,
+// ops/neblasign, workerhygiene) compile unchanged.
+type (
+	// OMap is an insertion-ordered string-keyed map (see jinja.OMap).
+	OMap = jinja.OMap
+	// List wraps a slice so in-place mutation behaves like python
+	// lists across scope bindings (see jinja.List).
+	List = jinja.List
+	// Undefined is the jinja `undefined` — falsy, default()-able
+	// (see jinja.Undefined).
+	Undefined = jinja.Undefined
+	// Env carries render-time hooks (see jinja.Env).
+	Env = jinja.Env
+)
+
+// NewOMap returns an empty insertion-ordered map (see jinja.NewOMap).
+func NewOMap() *OMap { return jinja.NewOMap() }
+
+// DecodeYAML parses a YAML document into jinja values (see
+// jinja.DecodeYAML).
+func DecodeYAML(data []byte) (any, error) { return jinja.DecodeYAML(data) }
+
+// Render evaluates template text against ctx (see jinja.Render).
+func Render(text string, ctx map[string]any, env *Env) (string, error) {
+	return jinja.Render(text, ctx, env)
+}
 
 // Config: paths + node identity.
 type Config struct {
@@ -51,7 +84,7 @@ func (v *Vars) get(name string) any {
 	}
 	if v.resolving[name] {
 		v.errs = append(v.errs, "var "+name+": reference cycle")
-		return Undefined{name + "(cycle)"}
+		return jinja.NewUndefined(name + "(cycle)")
 	}
 	if x, ok := v.extra[name]; ok {
 		// Preloaded files (interdc_nodes/interdc_dns_zone) go
@@ -69,7 +102,7 @@ func (v *Vars) get(name string) any {
 	}
 	rv, ok := v.raw.Get(name)
 	if !ok {
-		return Undefined{name}
+		return jinja.NewUndefined(name)
 	}
 	v.resolving[name] = true
 	prev := v.cur
@@ -84,15 +117,14 @@ func (v *Vars) resolve(x any) any {
 	switch t := x.(type) {
 	case string:
 		if strings.Contains(t, "{{") || strings.Contains(t, "{%") || strings.Contains(t, "{#") {
-			s := &scope{vars: map[string]any{}, env: v.env, lookup: v.get}
-			out, err := renderParsed(t, s)
+			out, err := jinja.RenderScoped(t, v.env, v.get)
 			if err != nil {
 				// Fail-closed: raw {{...}} text written into rendered
 				// config files is worse than undefined — record and
 				// return Undefined (falsy, default()-able).
 				v.errs = append(v.errs,
 					"var "+v.cur+": eval failed: "+err.Error())
-				return Undefined{v.cur}
+				return jinja.NewUndefined(v.cur)
 			}
 			return out
 		}
@@ -105,7 +137,7 @@ func (v *Vars) resolve(x any) any {
 		}
 		return m
 	case *List:
-		out := &List{make([]any, len(t.V))}
+		out := &List{V: make([]any, len(t.V))}
 		for i, x := range t.V {
 			out.V[i] = v.resolve(x)
 		}
@@ -120,37 +152,24 @@ func (v *Vars) resolve(x any) any {
 	return x
 }
 
-// renderParsed renders a template string in a pre-built scope.
-func renderParsed(text string, s *scope) (string, error) {
-	nodes, err := parseTemplate(text)
-	if err != nil {
-		return "", err
-	}
-	var b strings.Builder
-	if err := renderNodes(nodes, s, &b); err != nil {
-		return "", err
-	}
-	return b.String(), nil
-}
-
 // Accessors.
 func (v *Vars) Get(name string) any { return v.get(name) }
 
-func (v *Vars) Str(name string) string { return stringify(v.get(name)) }
+func (v *Vars) Str(name string) string { return jinja.Stringify(v.get(name)) }
 
-func (v *Vars) Bool(name string) bool { return truthy(v.get(name)) }
+func (v *Vars) Bool(name string) bool { return jinja.Truthy(v.get(name)) }
 
 func (v *Vars) Int(name string) int64 {
-	i, _ := toInt(v.get(name))
+	i, _ := jinja.ToInt(v.get(name))
 	return i
 }
 
-func (v *Vars) List(name string) []any { return toIter(v.get(name)) }
+func (v *Vars) List(name string) []any { return jinja.ToIter(v.get(name)) }
 
 func (v *Vars) StrList(name string) []string {
 	var out []string
 	for _, it := range v.List(name) {
-		out = append(out, stringify(it))
+		out = append(out, jinja.Stringify(it))
 	}
 	return out
 }
@@ -337,19 +356,19 @@ func mapGet(m any, key string) any {
 			return v
 		}
 	}
-	return Undefined{key}
+	return jinja.NewUndefined(key)
 }
 
-func mapStr(m any, key string) string { return stringify(mapGet(m, key)) }
+func mapStr(m any, key string) string { return jinja.Stringify(mapGet(m, key)) }
 
-func mapBool(m any, key string) bool { return truthy(mapGet(m, key)) }
+func mapBool(m any, key string) bool { return jinja.Truthy(mapGet(m, key)) }
 
 func mapInt(m any, key string) int64 {
-	i, _ := toInt(mapGet(m, key))
+	i, _ := jinja.ToInt(mapGet(m, key))
 	return i
 }
 
-func mapList(m any, key string) []any { return toIter(mapGet(m, key)) }
+func mapList(m any, key string) []any { return jinja.ToIter(mapGet(m, key)) }
 
 func nodeNameOf(v any) string { return mapStr(v, "name") }
 
@@ -414,11 +433,11 @@ func (t *Topology) derive() {
 
 	// overlay selector
 	overlay := "nebula"
-	if od := v.get("interdc_overlay_default"); !isNilOrUndef(od) {
-		overlay = stringify(od)
+	if od := v.get("interdc_overlay_default"); !jinja.IsNilOrUndef(od) {
+		overlay = jinja.Stringify(od)
 	}
-	if ov := mapGet(node, "overlay"); !isNilOrUndef(ov) {
-		overlay = stringify(ov)
+	if ov := mapGet(node, "overlay"); !jinja.IsNilOrUndef(ov) {
+		overlay = jinja.Stringify(ov)
 	}
 	t.Overlay = overlay
 
@@ -426,13 +445,13 @@ func (t *Topology) derive() {
 		return
 	}
 
-	base := stringify(v.get("interdc_marker_base"))
+	base := jinja.Stringify(v.get("interdc_marker_base"))
 	if base == "" || base == "None" {
 		base = "172.29.0"
 	}
 	markerOf := func(nv *OMap) string {
-		if mo := mapGet(nv, "marker_octet"); !isNilOrUndef(mo) {
-			return base + "." + stringify(mo)
+		if mo := mapGet(nv, "marker_octet"); !jinja.IsNilOrUndef(mo) {
+			return base + "." + jinja.Stringify(mo)
 		}
 		return base + "." + lastOctet(mapStr(nv, "ip"))
 	}
@@ -441,7 +460,7 @@ func (t *Topology) derive() {
 	t.Markers = map[string]string{}
 	t.MarkersLegacy = map[string]string{}
 	t.RelayMap = map[string][]RelayEntry{}
-	legacyBase := stringify(v.get("interdc_marker_base_legacy"))
+	legacyBase := jinja.Stringify(v.get("interdc_marker_base_legacy"))
 	for _, k := range t.Nodes.Keys() {
 		nv, _ := t.Nodes.Get(k)
 		om, _ := nv.(*OMap)
@@ -453,8 +472,8 @@ func (t *Topology) derive() {
 			t.Markers[name] = markerOf(om)
 			if legacyBase != "" {
 				mo := lastOctet(ip)
-				if m := mapGet(om, "marker_octet"); !isNilOrUndef(m) {
-					mo = stringify(m)
+				if m := mapGet(om, "marker_octet"); !jinja.IsNilOrUndef(m) {
+					mo = jinja.Stringify(m)
 				}
 				t.MarkersLegacy[name] = legacyBase + "." + mo
 			}
@@ -462,36 +481,36 @@ func (t *Topology) derive() {
 		var relays []RelayEntry
 		defSites := mapGet(om, "relay_sites")
 		defMode := "always"
-		if dm := mapGet(om, "relay_mode"); !isNilOrUndef(dm) {
-			defMode = stringify(dm)
+		if dm := mapGet(om, "relay_mode"); !jinja.IsNilOrUndef(dm) {
+			defMode = jinja.Stringify(dm)
 		}
 		for _, r := range mapList(om, "relay") {
 			e := RelayEntry{Mode: defMode}
 			if rm, ok := r.(*OMap); ok {
 				e.IP = mapStr(rm, "ip")
-				if s := mapGet(rm, "sites"); !isNilOrUndef(s) {
-					for _, x := range toIter(s) {
-						e.Sites = append(e.Sites, stringify(x))
+				if s := mapGet(rm, "sites"); !jinja.IsNilOrUndef(s) {
+					for _, x := range jinja.ToIter(s) {
+						e.Sites = append(e.Sites, jinja.Stringify(x))
 					}
-				} else if !isNilOrUndef(defSites) {
-					for _, x := range toIter(defSites) {
-						e.Sites = append(e.Sites, stringify(x))
+				} else if !jinja.IsNilOrUndef(defSites) {
+					for _, x := range jinja.ToIter(defSites) {
+						e.Sites = append(e.Sites, jinja.Stringify(x))
 					}
 				}
-				if m := mapGet(rm, "mode"); !isNilOrUndef(m) {
-					e.Mode = stringify(m)
+				if m := mapGet(rm, "mode"); !jinja.IsNilOrUndef(m) {
+					e.Mode = jinja.Stringify(m)
 				}
-				if w := mapGet(rm, "weight"); !isNilOrUndef(w) {
-					e.Weight, _ = toInt(w)
+				if w := mapGet(rm, "weight"); !jinja.IsNilOrUndef(w) {
+					e.Weight, _ = jinja.ToInt(w)
 				}
-				if p := mapGet(rm, "probe"); !isNilOrUndef(p) {
-					e.Probe = stringify(p)
+				if p := mapGet(rm, "probe"); !jinja.IsNilOrUndef(p) {
+					e.Probe = jinja.Stringify(p)
 				}
 			} else {
-				e.IP = stringify(r)
-				if !isNilOrUndef(defSites) {
-					for _, x := range toIter(defSites) {
-						e.Sites = append(e.Sites, stringify(x))
+				e.IP = jinja.Stringify(r)
+				if !jinja.IsNilOrUndef(defSites) {
+					for _, x := range jinja.ToIter(defSites) {
+						e.Sites = append(e.Sites, jinja.Stringify(x))
 					}
 				}
 			}
@@ -771,7 +790,7 @@ func (t *Topology) derive() {
 			if rm, ok := r.(*OMap); ok {
 				rip = mapStr(rm, "ip")
 			} else {
-				rip = stringify(r)
+				rip = jinja.Stringify(r)
 			}
 			if !seenAddr[rip] {
 				seenAddr[rip] = true
