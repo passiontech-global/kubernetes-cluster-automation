@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -199,7 +200,7 @@ func (c *stallCheck) Run(ctx context.Context, e *cycleEnv) {
 	}
 	if reason == "" {
 		c.h.stallFails = 0
-		c.h.state.Exit("kubelet-runtime-stall", nil)
+		c.h.state.Exit(hoststate.LatchKubeletRuntimeStall, nil)
 		c.h.cycles.WithLabelValues(checkStall, "ok").Inc()
 		return
 	}
@@ -210,18 +211,18 @@ func (c *stallCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkStall, "ok").Inc()
 		return
 	}
-	overloaded := c.h.state.Exists("node-overloaded")
+	overloaded := c.h.state.Exists(hoststate.LatchNodeOverloaded)
 	if strings.HasPrefix(reason, "phantom-pods") || strings.HasPrefix(reason, "kubelet-10250-down") {
 		if !overloaded {
-			c.h.state.Enter("kubelet-runtime-stall", reason)
-		} else if !c.h.state.Exists("kubelet-runtime-stall") {
+			c.h.state.Enter(hoststate.LatchKubeletRuntimeStall, reason)
+		} else if !c.h.state.Exists(hoststate.LatchKubeletRuntimeStall) {
 			// Wedge under CPU starvation is a symptom, not a dead
 			// node — latching would kick NHC→SNR and dump 100% of
 			// load onto the survivors (amplifier). Log-only.
 			c.h.state.AppendLog(fmt.Sprintf("runtime-stall-suppressed-overloaded - %s", reason))
 		}
 	} else {
-		c.h.state.Exit("kubelet-runtime-stall", nil)
+		c.h.state.Exit(hoststate.LatchKubeletRuntimeStall, nil)
 	}
 	switch {
 	case overloaded:
@@ -279,7 +280,7 @@ func (c *watchWedgeCheck) Run(ctx context.Context, e *cycleEnv) {
 		// Inconclusive — keep counters/latch exactly like the shell
 		// (a flapping API must not clear wedge evidence). Only log
 		// when there is something worth keeping.
-		if c.h.state.Exists("kubelet-watch-wedge") || c.fails > 0 {
+		if c.h.state.Exists(hoststate.LatchKubeletWatchWedge) || c.fails > 0 {
 			c.h.state.AppendLog("suspect: kubelet-watch-wedge pods query fail — inconclusive, keeping state")
 		}
 		c.h.cycles.WithLabelValues(checkWatch, "abort").Inc()
@@ -321,7 +322,7 @@ func (c *watchWedgeCheck) Run(ctx context.Context, e *cycleEnv) {
 	}
 	if missing == 0 {
 		c.fails = 0
-		c.h.state.Exit("kubelet-watch-wedge", nil)
+		c.h.state.Exit(hoststate.LatchKubeletWatchWedge, nil)
 		c.h.cycles.WithLabelValues(checkWatch, "ok").Inc()
 		return
 	}
@@ -333,14 +334,14 @@ func (c *watchWedgeCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkWatch, "ok").Inc()
 		return
 	}
-	c.h.state.Enter("kubelet-watch-wedge", fmt.Sprintf("unseen-pods=%d", missing))
+	c.h.state.Enter(hoststate.LatchKubeletWatchWedge, fmt.Sprintf("unseen-pods=%d", missing))
 	// Upstream gate: EVERY apiserver backend stale → the unseen pods
 	// are stale-LIST fallout, not a kubelet wedge (sig14 latches the
 	// state-apiserver-backend-stale-<ip> files).
 	if len(c.h.cfg.APIBackends) > 0 {
 		nstale := 0
 		for _, be := range c.h.cfg.APIBackends {
-			if c.h.state.Exists("apiserver-backend-stale-" + dashedHost(be)) {
+			if c.h.state.Exists(hoststate.LatchAPIServerBackendStalePrefix + dashedHost(be)) {
 				nstale++
 			}
 		}
@@ -353,7 +354,7 @@ func (c *watchWedgeCheck) Run(ctx context.Context, e *cycleEnv) {
 		}
 	}
 	switch {
-	case c.h.state.Exists("node-overloaded"):
+	case c.h.state.Exists(hoststate.LatchNodeOverloaded):
 		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-watch-wedge unseen=%d - node overloaded, skip restart k0sworker", missing))
 	case !c.h.k0sWorkerSettled(ctx):
@@ -451,7 +452,7 @@ func (h *Hygiene) kubeletFeedTick(ctx context.Context) {
 				"kubelet-feeder: probe OK again after %d fail", h.kubeletWdFails))
 		}
 		h.kubeletWdFails = 0
-		h.state.Exit("kubelet-healthz-down", nil)
+		h.state.Exit(hoststate.LatchKubeletHealthzDown, nil)
 		return
 	}
 	// PartOf=k0sworker.service parity: the shell feeder unit stood
@@ -476,7 +477,7 @@ func (h *Hygiene) kubeletFeedTick(ctx context.Context) {
 				h.state.AppendLog("kubelet-feeder: k0sworker not active — fails reset (PartOf parity)")
 			}
 			h.kubeletWdFails = 0
-			h.state.Exit("kubelet-healthz-down", nil)
+			h.state.Exit(hoststate.LatchKubeletHealthzDown, nil)
 			return
 		}
 	}
@@ -516,7 +517,7 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 			h.state.AppendLog(fmt.Sprintf(
 				"kubelet-remediate: SKIP(G0-reprobe) :10248 answered 'ok' on re-probe %d — false alarm (steal blip), self-correcting", i))
 			h.kubeletWdFails = 0
-			h.state.Exit("kubelet-healthz-down", nil)
+			h.state.Exit(hoststate.LatchKubeletHealthzDown, nil)
 			return
 		}
 		if i < 2 {
@@ -550,7 +551,7 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 	// G3 overload — a kubelet wedge under CPU starvation is a
 	// symptom, not a dead kubelet; restarting dumps its load onto the
 	// surviving nodes (amplifier).
-	if h.state.Exists("node-overloaded") {
+	if h.state.Exists(hoststate.LatchNodeOverloaded) {
 		h.state.AppendLog("kubelet-remediate: SKIP(G3-overload) state-node-overloaded latched")
 		return
 	}
@@ -569,7 +570,7 @@ func (h *Hygiene) runKubeletRemediate(ctx context.Context) {
 	// window and double-restart. Exhausted → escalate to the NHC→SNR
 	// reboot path via the latch instead of piling on.
 	if !h.state.RateTrySpend("last-restart", h.cfg.MinRestartInterval) {
-		h.state.Enter("kubelet-healthz-down", "restart-budget-exhausted")
+		h.state.Enter(hoststate.LatchKubeletHealthzDown, "restart-budget-exhausted")
 		h.state.AppendLog("kubelet-remediate: SKIP(G5-ratelimit) k0sworker restart <30m ago — " +
 			"state-kubelet-healthz-down latched (NHC→SNR escalation)")
 		return
@@ -748,7 +749,7 @@ func (c *syncloopCheck) Run(ctx context.Context, e *cycleEnv) {
 	c.unauth = false
 	if alive {
 		c.fails = 0
-		c.h.state.Exit("kubelet-syncloop-down", nil)
+		c.h.state.Exit(hoststate.LatchKubeletSyncloopDown, nil)
 		c.h.cycles.WithLabelValues(checkSyncloop, "ok").Inc()
 		return
 	}
@@ -764,11 +765,11 @@ func (c *syncloopCheck) Run(ctx context.Context, e *cycleEnv) {
 	// see — confirmed consecutive fails now self-heal through the
 	// shared k0sworker restart gates (overload / settle /
 	// last-restart budget), checkKubeletStall parity.
-	overloaded := c.h.state.Exists("node-overloaded")
+	overloaded := c.h.state.Exists(hoststate.LatchNodeOverloaded)
 	if !overloaded {
-		c.h.state.Enter("kubelet-syncloop-down",
+		c.h.state.Enter(hoststate.LatchKubeletSyncloopDown,
 			fmt.Sprintf("pleg-frozen last_err=%v", lastErr))
-	} else if !c.h.state.Exists("kubelet-syncloop-down") {
+	} else if !c.h.state.Exists(hoststate.LatchKubeletSyncloopDown) {
 		// A stall under CPU starvation is a symptom — latching
 		// would escalate to NHC→SNR and dump 100% of the load
 		// onto the survivors (amplifier). Log-only.
@@ -830,7 +831,7 @@ func (c *ctrsockCheck) Run(ctx context.Context, e *cycleEnv) {
 	err := c.h.cfg.Seams.probeUnixSock(ctx, c.h.cfg.Ctr.Socket, unixSockProbeTimeout)
 	if err == nil {
 		c.fails = 0
-		c.h.state.Exit("containerd-sock-down", nil)
+		c.h.state.Exit(hoststate.LatchContainerdSockDown, nil)
 		c.h.cycles.WithLabelValues(checkCtrSock, "ok").Inc()
 		return
 	}
@@ -846,11 +847,11 @@ func (c *ctrsockCheck) Run(ctx context.Context, e *cycleEnv) {
 	// lifecycle op — confirmed consecutive fails self-heal through
 	// the shared k0sworker restart gates, checkKubeletSyncloop
 	// parity.
-	overloaded := c.h.state.Exists("node-overloaded")
+	overloaded := c.h.state.Exists(hoststate.LatchNodeOverloaded)
 	if !overloaded {
-		c.h.state.Enter("containerd-sock-down",
+		c.h.state.Enter(hoststate.LatchContainerdSockDown,
 			fmt.Sprintf("probe_err=%v", err))
-	} else if !c.h.state.Exists("containerd-sock-down") {
+	} else if !c.h.state.Exists(hoststate.LatchContainerdSockDown) {
 		c.h.state.AppendLog(fmt.Sprintf(
 			"containerd-sock-down suppressed-overloaded - probe_err=%v", err))
 	}

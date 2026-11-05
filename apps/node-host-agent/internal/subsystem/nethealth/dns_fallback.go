@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
@@ -172,7 +173,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 			_ = os.Remove(f)
 		}
 		n.dnsfails = map[string]int{}
-		n.stateExit("dns-fallback")
+		n.stateExit(hoststate.LatchDNSFallback)
 		n.cycles.WithLabelValues(checkDNSFB, "ok").Inc()
 		return
 	}
@@ -292,7 +293,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 			// until expiry unless flushed now.
 			n.flushStaleUDPConntrack(ctx, checkDNSFB)
 		}
-		n.state.Enter("dns-fallback", "")
+		n.state.Enter(hoststate.LatchDNSFallback, "")
 	} else {
 		if n.renderHostsBlock("") {
 			n.state.AppendLog("ACTION: /etc/hosts dns-fallback block removed (DNS OK)")
@@ -300,7 +301,7 @@ func (n *NetHealth) checkDNSFallback(ctx context.Context) {
 			// restored resolver may sit in stale udp/53 entries.
 			n.flushStaleUDPConntrack(ctx, checkDNSFB)
 		}
-		n.stateExit("dns-fallback")
+		n.stateExit(hoststate.LatchDNSFallback)
 	}
 	n.cycles.WithLabelValues(checkDNSFB, "ok").Inc()
 }

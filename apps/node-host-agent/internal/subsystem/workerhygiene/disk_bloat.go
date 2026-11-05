@@ -12,6 +12,8 @@ import (
 	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // bloatHit is one over-threshold directory found by the walk.
@@ -207,7 +209,7 @@ func (c *diskBloatCheck) Run(ctx context.Context, e *cycleEnv) {
 		return
 	}
 	if used <= c.h.cfg.Disk.BloatWatermark {
-		c.h.state.Exit("disk-bloat", nil)
+		c.h.state.Exit(hoststate.LatchDiskBloat, nil)
 		c.h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
 		return
 	}
@@ -220,11 +222,11 @@ func (c *diskBloatCheck) Run(ctx context.Context, e *cycleEnv) {
 	c.lastScan = c.h.cfg.Seams.nowFn()
 	hits, podTotals, podByUID := c.scanBloat(e.pods)
 	if len(hits) == 0 {
-		c.h.state.Exit("disk-bloat", nil)
+		c.h.state.Exit(hoststate.LatchDiskBloat, nil)
 		c.h.cycles.WithLabelValues(checkDiskBloat, "ok").Inc()
 		return
 	}
-	c.h.state.Enter("disk-bloat", fmt.Sprintf("targets=%d", len(hits)))
+	c.h.state.Enter(hoststate.LatchDiskBloat, fmt.Sprintf("targets=%d", len(hits)))
 	for _, hit := range hits {
 		// NPD contract: "ACTION disk-bloat: target=... bytes=...
 		// used_pct=..." feeds DiskBloatRunaway (events.go).

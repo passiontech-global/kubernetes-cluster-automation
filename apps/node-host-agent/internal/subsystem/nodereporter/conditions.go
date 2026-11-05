@@ -20,6 +20,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // conditionDef is one permanent NodeCondition — 1:1 with a
@@ -49,7 +51,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "NodeLoadNormal",
 		defaultMessage: "node not overloaded (load15 <= 4xCPU)",
 		problemReason:  "NodeOverloadedDetected",
-		stateKey:       "node-overloaded",
+		stateKey:       hoststate.LatchNodeOverloaded,
 	},
 	{
 		typ:            "WatchdogStale",
@@ -63,32 +65,32 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "CiliumAgentUp",
 		defaultMessage: "cilium-agent healthz OK",
 		problemReason:  "CiliumAgentDownDetected",
-		stateKey:       "cilium-agent-down",
+		stateKey:       hoststate.LatchCiliumAgentDown,
 	},
 	{
 		typ:            "CiliumInitStuck",
 		defaultReason:  "CiliumEndpointsReady",
 		defaultMessage: "no cilium endpoint stuck in init (informer healthy)",
 		problemReason:  "CiliumInitStuckDetected",
-		stateKey:       "cilium-init-stuck",
+		stateKey:       hoststate.LatchCiliumInitStuck,
 	},
 	{
 		typ:            "KubeletRuntimeStall",
 		defaultReason:  "KubeletRuntimeOk",
 		defaultMessage: "no phantom-pods wedge (ctr alive, tasks > 0)",
 		problemReason:  "KubeletRuntimeStallDetected",
-		stateKey:       "kubelet-runtime-stall",
+		stateKey:       hoststate.LatchKubeletRuntimeStall,
 		// BUG-H4: the PLEG/syncloop freeze and the hung containerd
 		// socket are runtime stalls too — every latch must light
 		// the condition. W10-KR6 adds the kubelet watch-stream wedge
 		// and the containerd meta.db corruption latch (restart can't
 		// recover a corrupt store — same remediation class).
 		altStateKeys: []string{
-			"kubelet-healthz-down",
-			"kubelet-syncloop-down",
-			"containerd-sock-down",
-			"kubelet-watch-wedge",
-			"containerd-corrupt",
+			hoststate.LatchKubeletHealthzDown,
+			hoststate.LatchKubeletSyncloopDown,
+			hoststate.LatchContainerdSockDown,
+			hoststate.LatchKubeletWatchWedge,
+			hoststate.LatchContainerdCorrupt,
 		},
 	},
 	{
@@ -96,28 +98,28 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "DnsDirectOk",
 		defaultMessage: "DNS via resolv.conf healthy, no /etc/hosts pin",
 		problemReason:  "DnsFallbackEngaged",
-		stateKey:       "dns-fallback",
+		stateKey:       hoststate.LatchDNSFallback,
 	},
 	{
 		typ:            "DnsResolvStale",
 		defaultReason:  "DnsResolvFresh",
 		defaultMessage: "DNS pods (nld/coredns) resolv.conf matches host",
 		problemReason:  "DnsResolvStaleDetected",
-		stateKey:       "dns-resolv-stale",
+		stateKey:       hoststate.LatchDNSResolvStale,
 	},
 	{
 		typ:            "PodTeardownWedged",
 		defaultReason:  "PodTeardownOk",
 		defaultMessage: "no long-Terminating pod with leftover task",
 		problemReason:  "PodTeardownWedgedDetected",
-		stateKey:       "pod-teardown-wedged",
+		stateKey:       hoststate.LatchPodTeardownWedged,
 	},
 	{
 		typ:            "KubeletWatchWedge",
 		defaultReason:  "KubeletWatchOk",
 		defaultMessage: "kubelet receives pod assignment normally (no unseen pod)",
 		problemReason:  "KubeletWatchWedgeDetected",
-		stateKey:       "kubelet-watch-wedge",
+		stateKey:       hoststate.LatchKubeletWatchWedge,
 	},
 	{
 		// Agent-added (not in the NPD JSON): the journalwatch
@@ -128,7 +130,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "JournaldReadable",
 		defaultMessage: "journald journal reads return entries",
 		problemReason:  "JournaldUnreadableDetected",
-		stateKey:       "journal-unreadable",
+		stateKey:       hoststate.LatchJournalUnreadable,
 	},
 	{
 		// Agent-added (W5.3): hostmetrics' statfs probes found a
@@ -142,8 +144,8 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "FilesystemReadWrite",
 		defaultMessage: "all probed filesystems are read-write",
 		problemReason:  "FilesystemReadOnlyDetected",
-		stateKey:       "filesystem-readonly",
-		altStateKeys:   []string{"fs-readonly"},
+		stateKey:       hoststate.LatchFilesystemReadonly,
+		altStateKeys:   []string{hoststate.LatchFSReadonly},
 	},
 	{
 		// Agent-added (W7-H1): workerhygiene's D-state storm
@@ -154,7 +156,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "KernelTasksRunOk",
 		defaultMessage: "no D-state task storm (uninterruptible sleep below threshold)",
 		problemReason:  "KernelHungTasksDetected",
-		stateKey:       "d-state-storm",
+		stateKey:       hoststate.LatchDStateStorm,
 	},
 	// --- Wave-8 latch→condition surface ---
 	// Agent-added conditions for the latches the hygiene subsystems
@@ -166,91 +168,91 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "NebulaMeshHealthy",
 		defaultMessage: "all nebula peers handshake normally",
 		problemReason:  "NebulaIsolatedDetected",
-		stateKey:       "nebula-isolated",
+		stateKey:       hoststate.LatchNebulaIsolated,
 	},
 	{
 		typ:            "NebulaDegraded",
 		defaultReason:  "NebulaDataplaneOk",
 		defaultMessage: "nebula dataplane healthy (no relay/latency degradation)",
 		problemReason:  "NebulaDegradedDetected",
-		stateKey:       "nebula-degraded",
+		stateKey:       hoststate.LatchNebulaDegraded,
 	},
 	{
 		typ:            "CiliumEnvoyDown",
 		defaultReason:  "CiliumEnvoyReady",
 		defaultMessage: "cilium-envoy admin /ready OK",
 		problemReason:  "CiliumEnvoyDownDetected",
-		stateKey:       "cilium-envoy-down",
+		stateKey:       hoststate.LatchCiliumEnvoyDown,
 	},
 	{
 		typ:            "CiliumIPAMExhausted",
 		defaultReason:  "CiliumIPAMOk",
 		defaultMessage: "cilium IPAM pool has headroom (no address leak)",
 		problemReason:  "CiliumIPAMExhaustedDetected",
-		stateKey:       "cilium-ipam-exhausted",
+		stateKey:       hoststate.LatchCiliumIPAMExhausted,
 	},
 	{
 		typ:            "CiliumBPFMapPressure",
 		defaultReason:  "CiliumBPFMapsOk",
 		defaultMessage: "critical cilium BPF maps below 90% capacity",
 		problemReason:  "CiliumBPFMapPressureDetected",
-		stateKey:       "cilium-bpf-map-pressure",
+		stateKey:       hoststate.LatchCiliumBPFMapPressure,
 	},
 	{
 		typ:            "SpegelMirrorDegraded",
 		defaultReason:  "SpegelMirrorReady",
 		defaultMessage: "spegel P2P mirror pod Ready",
 		problemReason:  "SpegelMirrorDegradedDetected",
-		stateKey:       "spegel-mirror-degraded",
+		stateKey:       hoststate.LatchSpegelMirrorDegraded,
 	},
 	{
 		typ:            "CalicoVethLeak",
 		defaultReason:  "CalicoVethCountOk",
 		defaultMessage: "cali* veth count matches pod count (no CNI DEL leak)",
 		problemReason:  "CalicoVethLeakDetected",
-		stateKey:       "calico-veth-leak",
+		stateKey:       hoststate.LatchCalicoVethLeak,
 	},
 	{
 		typ:            "CalicoFelixDown",
 		defaultReason:  "CalicoFelixReady",
 		defaultMessage: "calico felix :9099 readiness OK",
 		problemReason:  "CalicoFelixDownDetected",
-		stateKey:       "calico-felix-down",
+		stateKey:       hoststate.LatchCalicoFelixDown,
 	},
 	{
 		typ:            "Fail2banDown",
 		defaultReason:  "Fail2banActive",
 		defaultMessage: "fail2ban service installed and active",
 		problemReason:  "Fail2banDownDetected",
-		stateKey:       "fail2ban-down",
+		stateKey:       hoststate.LatchFail2banDown,
 	},
 	{
 		typ:            "ConntrackPressure",
 		defaultReason:  "ConntrackNormal",
 		defaultMessage: "nf_conntrack table below pressure threshold",
 		problemReason:  "ConntrackPressureDetected",
-		stateKey:       "conntrack-pressure",
+		stateKey:       hoststate.LatchConntrackPressure,
 	},
 	{
 		typ:            "KernelKeysPressure",
 		defaultReason:  "KernelKeysNormal",
 		defaultMessage: "kernel keyring quota below pressure threshold",
 		problemReason:  "KernelKeysPressureDetected",
-		stateKey:       "kernel-keys-pressure",
+		stateKey:       hoststate.LatchKernelKeysPressure,
 	},
 	{
 		typ:            "ControlPlaneCertReloadStale",
 		defaultReason:  "ControlPlaneCertReloadFresh",
 		defaultMessage: "control-plane cert reload markers fresh",
 		problemReason:  "ControlPlaneCertReloadStaleDetected",
-		stateKey:       "cp-cert-reload-stale",
+		stateKey:       hoststate.LatchCPCertReloadStale,
 	},
 	{
 		typ:            "MemoryPSIThrashing",
 		defaultReason:  "MemoryPSINormal",
 		defaultMessage: "memory PSI full avg60 <= 25% or free memory >= 8%",
 		problemReason:  "MemoryPSIThrashingDetected",
-		stateKey:       "psi-memory-thrash",
+		stateKey:       hoststate.LatchPSIMemoryThrash,
 	},
 	// --- Wave-9 latch→condition surface ---
 	// Agent-added conditions for the latches Wave-9 adds (or the
@@ -263,7 +265,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "ClockSynchronized",
 		defaultMessage: "kernel clock disciplined (adjtimex synced, esterror <= 500ms)",
 		problemReason:  "ClockUnsynchronizedDetected",
-		stateKey:       "clock-unsync",
+		stateKey:       hoststate.LatchClockUnsync,
 	},
 	{
 		// workerhygiene's W9-KR3 slab-leak guard — SUnreclaim above
@@ -274,7 +276,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "KernelSlabNormal",
 		defaultMessage: "unreclaimable kernel slab below pressure threshold",
 		problemReason:  "KernelSlabLeakDetected",
-		stateKey:       "kernel-slab-leak",
+		stateKey:       hoststate.LatchKernelSlabLeak,
 	},
 	{
 		// nethealth's W9-NM1 DF PMTU probe — small-packet overlay
@@ -284,7 +286,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "NebulaPMTUOk",
 		defaultMessage: "nebula overlay passes DF probes at probe size",
 		problemReason:  "NebulaPMTUBlackholeDetected",
-		stateKey:       "nebula-pmtu-blackhole",
+		stateKey:       hoststate.LatchNebulaPMTUBlackhole,
 	},
 	// --- Wave-10 latch→condition surface ---
 	{
@@ -296,7 +298,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "KernelResourcesNormal",
 		defaultMessage: "kernel threads/pids and fd table below exhaustion threshold",
 		problemReason:  "KernelResourceExhaustionDetected",
-		stateKey:       "pid-fd-pressure",
+		stateKey:       hoststate.LatchPIDFDPressure,
 	},
 	{
 		// nethealth's W10-KR5 clock-skew guard — chronyc/adjtimex
@@ -307,7 +309,7 @@ var conditionDefs = []conditionDef{
 		defaultReason:  "ClockSkewOk",
 		defaultMessage: "clock offset within 2.0s of NTP source",
 		problemReason:  "ClockSkewDetected",
-		stateKey:       "clock-skew",
+		stateKey:       hoststate.LatchClockSkew,
 	},
 }
 

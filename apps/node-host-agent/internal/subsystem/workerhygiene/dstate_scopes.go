@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // procStatStatePPID parses /proc/<pid>/stat for state + ppid — the
@@ -144,9 +146,9 @@ func (c *zombieStormCheck) Run(_ context.Context, e *cycleEnv) {
 		}
 	}
 	if storm {
-		c.h.state.Enter("zombie-storm", "")
+		c.h.state.Enter(hoststate.LatchZombieStorm, "")
 	} else {
-		c.h.state.Exit("zombie-storm", nil)
+		c.h.state.Exit(hoststate.LatchZombieStorm, nil)
 	}
 	c.h.cycles.WithLabelValues(checkZombieStorm, "ok").Inc()
 }
@@ -234,7 +236,7 @@ func (c *dstateCheck) Run(_ context.Context, e *cycleEnv) {
 	}
 	if total < c.h.cfg.Pressure.DStateStormThreshold && runtime < dStateRuntimeMin {
 		c.fails = 0
-		c.h.state.Exit("d-state-storm", nil)
+		c.h.state.Exit(hoststate.LatchDStateStorm, nil)
 		c.h.cycles.WithLabelValues(checkDState, "ok").Inc()
 		return
 	}
@@ -246,7 +248,7 @@ func (c *dstateCheck) Run(_ context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkDState, "ok").Inc()
 		return
 	}
-	if !c.h.state.Exists("d-state-storm") {
+	if !c.h.state.Exists(hoststate.LatchDStateStorm) {
 		// NPD contract: nodereporter maps this line to the
 		// KernelHungTasks Event + problem_counter — logged once per
 		// latch entry (the !stateExists gate, checkCiliumMTU parity).
@@ -254,7 +256,7 @@ func (c *dstateCheck) Run(_ context.Context, e *cycleEnv) {
 			"ACTION d-state-storm: count=%d runtime=%d wchan=%s",
 			total, runtime, strings.Join(wchans, ",")))
 	}
-	c.h.state.Enter("d-state-storm",
+	c.h.state.Enter(hoststate.LatchDStateStorm,
 		fmt.Sprintf("count=%d runtime=%d", total, runtime))
 	c.h.cycles.WithLabelValues(checkDState, "ok").Inc()
 }

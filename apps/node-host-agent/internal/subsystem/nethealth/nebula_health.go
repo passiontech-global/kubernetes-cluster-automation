@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // checkNebulaDirectTCP enforces the pref-1499 Direct-Underlay TCP
@@ -128,7 +130,7 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 		// Nebula disabled/left mesh → drop this module's states
 		// (stale files feed phantom gauges). Egress state is module
 		// 12's own business.
-		n.rmFiles("state-nebula-")
+		n.rmFiles(hoststate.LatchFilePrefix + "nebula-")
 		n.nebulaFails, n.nebulaDpFail, n.nebulaDeg = 0, 0, 0
 		n.pmtuFails = 0
 		n.cycles.WithLabelValues(checkNebula, "gated").Inc()
@@ -206,12 +208,12 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 			}
 		}
 		if len(slowpath) > 0 {
-			n.state.SuspectLog("nebula-slowpath", fmt.Sprintf(
+			n.state.SuspectLog(hoststate.LatchNebulaSlowpath, fmt.Sprintf(
 				"suspect: nebula-dataplane-slowpath (reroute via remote site) %s",
 				strings.Join(slowpath, " ")), suspectLogCadence)
-			n.state.Enter("nebula-slowpath", strings.Join(slowpath, " "))
+			n.state.Enter(hoststate.LatchNebulaSlowpath, strings.Join(slowpath, " "))
 		} else {
-			n.stateExit("nebula-slowpath")
+			n.stateExit(hoststate.LatchNebulaSlowpath)
 		}
 		if len(wd.OverlaySiteMarkers) > 0 {
 			var siteedge []string
@@ -226,12 +228,12 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 				}
 			}
 			if len(siteedge) > 0 {
-				n.state.SuspectLog("nebula-siteedge", fmt.Sprintf(
+				n.state.SuspectLog(hoststate.LatchNebulaSiteedge, fmt.Sprintf(
 					"suspect: nebula-siteedge-degraded (site-mesh edge lost) %s",
 					strings.Join(siteedge, " ")), suspectLogCadence)
-				n.state.Enter("nebula-siteedge", strings.Join(siteedge, " "))
+				n.state.Enter(hoststate.LatchNebulaSiteedge, strings.Join(siteedge, " "))
 			} else {
-				n.stateExit("nebula-siteedge")
+				n.stateExit(hoststate.LatchNebulaSiteedge)
 			}
 		}
 		switch {
@@ -240,8 +242,8 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 				dpAlive, dpTotal, mkAlive, mkTotal)
 			dpFail = true
 			n.nebulaDeg = 0
-			n.stateExit("nebula-degraded")
-			if !n.state.Exists("nebula-isolated") {
+			n.stateExit(hoststate.LatchNebulaDegraded)
+			if !n.state.Exists(hoststate.LatchNebulaIsolated) {
 				// B3: on the isolation edge the conntrack entries
 				// learned on the dead path keep the tunnel blackholed
 				// — drop each affected peer's udp/<nebula-port>
@@ -254,25 +256,25 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 				// stale flows have long expired by then).
 				n.flushPeerNebulaConntrack(ctx, checkNebula, nebulaPeerUnderlayIPs(wd)...)
 			}
-			n.state.Enter("nebula-isolated", "dataplane dead")
+			n.state.Enter(hoststate.LatchNebulaIsolated, "dataplane dead")
 		case dpTotal-dpAlive >= 2 || mkTotal-mkAlive >= 2:
 			n.nebulaDeg++
 			need := wd.NebulaDegradedConsec
 			if need <= 0 {
 				need = 2
 			}
-			n.state.SuspectLog("nebula-degraded", fmt.Sprintf(
+			n.state.SuspectLog(hoststate.LatchNebulaDegraded, fmt.Sprintf(
 				"suspect: nebula-dataplane-degraded pub=%d/%d marker=%d/%d (run %d/%d)",
 				dpAlive, dpTotal, mkAlive, mkTotal, n.nebulaDeg, need),
 				suspectLogCadence)
 			if n.nebulaDeg >= need {
-				n.state.Enter("nebula-degraded", fmt.Sprintf(
+				n.state.Enter(hoststate.LatchNebulaDegraded, fmt.Sprintf(
 					"pub=%d/%d marker=%d/%d", dpAlive, dpTotal, mkAlive, mkTotal))
 			}
 		default:
 			n.nebulaDeg = 0
-			n.stateExit("nebula-degraded")
-			n.stateExit("nebula-isolated")
+			n.stateExit(hoststate.LatchNebulaDegraded)
+			n.stateExit(hoststate.LatchNebulaIsolated)
 		}
 		// W9-NM1: small-packet pings can pass while a DF probe at
 		// near-MTU size blackholes — the double-encap path MTU
@@ -286,11 +288,11 @@ func (n *NetHealth) checkNebulaHealth(ctx context.Context) {
 		// the other overlay — clear leftover dataplane states.
 		n.nebulaDeg = 0
 		n.pmtuFails = 0
-		n.stateExit("nebula-degraded")
-		n.stateExit("nebula-slowpath")
-		n.stateExit("nebula-siteedge")
-		n.stateExit("nebula-isolated")
-		n.stateExit("nebula-pmtu-blackhole")
+		n.stateExit(hoststate.LatchNebulaDegraded)
+		n.stateExit(hoststate.LatchNebulaSlowpath)
+		n.stateExit(hoststate.LatchNebulaSiteedge)
+		n.stateExit(hoststate.LatchNebulaIsolated)
+		n.stateExit(hoststate.LatchNebulaPMTUBlackhole)
 	}
 
 	if reason == "" {
@@ -346,25 +348,25 @@ func (n *NetHealth) checkNebulaPMTU(ctx context.Context,
 		// degraded verdicts own the diagnosis; a PMTU streak
 		// cannot be measured without a reachable target.
 		n.pmtuFails = 0
-		n.stateExit("nebula-pmtu-blackhole")
+		n.stateExit(hoststate.LatchNebulaPMTUBlackhole)
 		return
 	}
 	out, err := n.cfg.runHostCmd(ctx, []string{
 		"ping", "-c", "1", "-W", "2", "-M", "do", "-s", "1200", target})
 	if err != nil {
 		n.pmtuFails++
-		n.state.SuspectLog("nebula-pmtu-blackhole", fmt.Sprintf(
+		n.state.SuspectLog(hoststate.LatchNebulaPMTUBlackhole, fmt.Sprintf(
 			"suspect: nebula-pmtu-blackhole df_probe_failed target=%s size=1200 (check %d/%d): %v (%s)",
 			target, n.pmtuFails, n.cfg.ConsecNeeded, err,
 			trimRunErr(out)), suspectLogCadence)
 		if n.pmtuFails >= n.cfg.ConsecNeeded {
-			n.state.Enter("nebula-pmtu-blackhole",
+			n.state.Enter(hoststate.LatchNebulaPMTUBlackhole,
 				fmt.Sprintf("target=%s df_size=1200", target))
 		}
 		return
 	}
 	n.pmtuFails = 0
-	n.stateExit("nebula-pmtu-blackhole")
+	n.stateExit(hoststate.LatchNebulaPMTUBlackhole)
 }
 
 // minRTT parses the smallest "time=<ms>" from ping output — the

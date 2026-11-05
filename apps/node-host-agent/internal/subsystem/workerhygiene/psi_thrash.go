@@ -11,6 +11,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // psiMemoryFullAvg60 parses <ProcRoot>/pressure/memory — the
@@ -103,7 +105,7 @@ func (h *Hygiene) readMeminfo() memInfo {
 // the latch is held.
 func (h *Hygiene) guardKernelSlabLeak(m memInfo) bool {
 	ratio := float64(m.slabUnrecKB) / float64(m.totalKB)
-	latched := h.state.Exists("kernel-slab-leak")
+	latched := h.state.Exists(hoststate.LatchKernelSlabLeak)
 	switch {
 	case ratio > slabLeakEnterRatio:
 		if !latched {
@@ -116,7 +118,7 @@ func (h *Hygiene) guardKernelSlabLeak(m memInfo) bool {
 		latched = true
 	case ratio <= slabLeakClearRatio:
 		if latched {
-			h.state.Exit("kernel-slab-leak", nil)
+			h.state.Exit(hoststate.LatchKernelSlabLeak, nil)
 		}
 		latched = false
 	}
@@ -125,7 +127,7 @@ func (h *Hygiene) guardKernelSlabLeak(m memInfo) bool {
 	}
 	// stateEnter refreshes the latch mtime every cycle it is held —
 	// the janitor's 24h reap must not retire a live condition.
-	h.state.Enter("kernel-slab-leak",
+	h.state.Enter(hoststate.LatchKernelSlabLeak,
 		fmt.Sprintf("sunreclaim_ratio=%.3f", ratio))
 	if h.state.RateTrySpend("last-slab-drop-caches", slabDropCachesInterval) {
 		h.dropKernelCaches()
@@ -352,7 +354,7 @@ func (c *psiThrashCheck) Run(ctx context.Context, e *cycleEnv) {
 	thrash := avg60 > c.h.cfg.Pressure.PSIFullAvg60 && free < c.h.cfg.Pressure.MemFreeMinRatio
 	if !thrash {
 		c.fails = 0
-		c.h.state.Exit("psi-memory-thrash", nil)
+		c.h.state.Exit(hoststate.LatchPSIMemoryThrash, nil)
 		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
@@ -364,7 +366,7 @@ func (c *psiThrashCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkPSIThrash, "ok").Inc()
 		return
 	}
-	if !c.h.state.Exists("psi-memory-thrash") {
+	if !c.h.state.Exists(hoststate.LatchPSIMemoryThrash) {
 		// NPD contract: nodereporter maps this line to the
 		// NodeMemoryPSIThrashing Event + problem_counter — logged
 		// once per latch entry (checkCiliumMTU parity).
@@ -372,7 +374,7 @@ func (c *psiThrashCheck) Run(ctx context.Context, e *cycleEnv) {
 			"ACTION psi-memory-thrash: psi_full_avg60=%.1f mem_free=%.3f fails=%d",
 			avg60, free, c.fails))
 	}
-	c.h.state.Enter("psi-memory-thrash",
+	c.h.state.Enter(hoststate.LatchPSIMemoryThrash,
 		fmt.Sprintf("psi_full_avg60=%.1f mem_free=%.3f", avg60, free))
 	if !e.apiOK {
 		c.h.state.AppendLog("suspect: psi-memory-thrash but API unreachable — skip pod evict")

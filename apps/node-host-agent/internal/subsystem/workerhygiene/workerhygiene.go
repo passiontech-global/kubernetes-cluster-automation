@@ -314,7 +314,7 @@ const (
 // accounting sets: journald installed (journal storage exists) but
 // every read produces nothing — the 05/06 signature greps and the
 // nodereporter journal monitors are blind until it clears.
-const stateJournalUnreadable = "journal-unreadable"
+const stateJournalUnreadable = hoststate.LatchJournalUnreadable
 
 // Regexes — anchored where the shell learned to anchor (the konn pod
 // name and the DNS pod names MUST be anchored: unanchored ~= filters

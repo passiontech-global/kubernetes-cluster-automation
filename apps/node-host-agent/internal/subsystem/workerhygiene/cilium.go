@@ -21,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-node-automation/apps/node-host-agent/internal/platform/hostutil"
 )
 
@@ -134,7 +135,7 @@ func (c *ciliumCheck) Run(ctx context.Context, e *cycleEnv) {
 		// No cilium-agent container → this node runs no cilium
 		// (calico cluster, hub): clear any false-positive state.
 		c.fails = 0
-		c.h.state.Exit("cilium-agent-down", nil)
+		c.h.state.Exit(hoststate.LatchCiliumAgentDown, nil)
 		c.h.cycles.WithLabelValues(checkCilium, "ok").Inc()
 		return
 	}
@@ -142,7 +143,7 @@ func (c *ciliumCheck) Run(ctx context.Context, e *cycleEnv) {
 		probeAttempts, ciliumProbeTime, c.h.cfg.ProbeGap)
 	if err == nil {
 		c.fails = 0
-		c.h.state.Exit("cilium-agent-down", nil)
+		c.h.state.Exit(hoststate.LatchCiliumAgentDown, nil)
 		// W8-NM3: a healthy healthz doesn't prove the datapath —
 		// conntrack/SNAT/LB BPF maps can sit at capacity while the
 		// agent still answers 200. Evaluate the map fill ratios on
@@ -151,7 +152,7 @@ func (c *ciliumCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCilium, "ok").Inc()
 		return
 	}
-	c.h.state.Enter("cilium-agent-down", "")
+	c.h.state.Enter(hoststate.LatchCiliumAgentDown, "")
 	c.fails++
 	switch {
 	case !e.apiOK:
@@ -159,7 +160,7 @@ func (c *ciliumCheck) Run(ctx context.Context, e *cycleEnv) {
 			"suspect: cilium-agent-down healthz fail %dx but API unreachable — skip kill (agent still cannot sync even after restart)",
 			c.fails))
 	case c.fails >= c.h.cfg.ConsecNeeded &&
-		!c.h.state.Exists("node-overloaded") &&
+		!c.h.state.Exists(hoststate.LatchNodeOverloaded) &&
 		c.h.state.RateTrySpend("last-cilium-restart", c.h.cfg.MinRestartInterval):
 		// Budget spent atomically BEFORE acting (rate_spend
 		// parity): a missed kill still consumed it — the feeder
@@ -224,7 +225,7 @@ func (c *ciliumInitCheck) Run(ctx context.Context, e *cycleEnv) {
 	initEps := strings.Count(string(body), "reserved:init")
 	if initEps == 0 {
 		c.h.ciliumInitFails = 0
-		c.h.state.Exit("cilium-init-stuck", nil)
+		c.h.state.Exit(hoststate.LatchCiliumInitStuck, nil)
 		c.h.cycles.WithLabelValues(checkCiliumInit, "ok").Inc()
 		return
 	}
@@ -236,13 +237,13 @@ func (c *ciliumInitCheck) Run(ctx context.Context, e *cycleEnv) {
 		return
 	}
 	// Wedge confirmed — latch before any gate like the shell.
-	c.h.state.Enter("cilium-init-stuck", fmt.Sprintf("init_eps=%d", initEps))
+	c.h.state.Enter(hoststate.LatchCiliumInitStuck, fmt.Sprintf("init_eps=%d", initEps))
 	switch {
 	case !e.apiOK:
 		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but API unreachable — skip kill (agent still cannot resync even after restart)",
 			initEps, c.h.ciliumInitFails))
-	case c.h.state.Exists("node-overloaded"):
+	case c.h.state.Exists(hoststate.LatchNodeOverloaded):
 		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but node overloaded — skip kill",
 			initEps, c.h.ciliumInitFails))
@@ -376,12 +377,12 @@ func (c *ciliumCheck) checkBPFMaps(ctx context.Context) {
 		}
 	}
 	if len(over) == 0 {
-		c.h.state.Exit("cilium-bpf-map-pressure", nil)
+		c.h.state.Exit(hoststate.LatchCiliumBPFMapPressure, nil)
 		c.h.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
 		return
 	}
 	sort.Strings(over)
-	c.h.state.Enter("cilium-bpf-map-pressure", strings.Join(over, " "))
+	c.h.state.Enter(hoststate.LatchCiliumBPFMapPressure, strings.Join(over, " "))
 	c.h.cycles.WithLabelValues(checkCiliumBPF, "ok").Inc()
 }
 
@@ -585,13 +586,13 @@ func (c *ciliumIPAMCheck) Run(ctx context.Context, e *cycleEnv) {
 	exhausted := leaked > 30 || (available >= 0 && available <= 2)
 	if !exhausted {
 		c.h.ciliumIPAMFails = 0
-		c.h.state.Exit("cilium-ipam-exhausted", nil)
+		c.h.state.Exit(hoststate.LatchCiliumIPAMExhausted, nil)
 		c.h.cycles.WithLabelValues(checkCiliumIPAM, "ok").Inc()
 		return
 	}
 	c.h.ciliumIPAMFails++
 	if c.h.ciliumIPAMFails >= c.h.cfg.ConsecNeeded {
-		c.h.state.Enter("cilium-ipam-exhausted", fmt.Sprintf(
+		c.h.state.Enter(hoststate.LatchCiliumIPAMExhausted, fmt.Sprintf(
 			"used=%d in-use=%d leaked=%d available=%d", used, inUse, leaked, available))
 	} else {
 		c.h.state.AppendLog(fmt.Sprintf(
@@ -689,7 +690,7 @@ func (c *ciliumEnvoyCheck) Run(ctx context.Context, e *cycleEnv) {
 		// No cilium-envoy container — older cilium or no L7 proxy:
 		// clear any stale latch like checkCilium does.
 		c.fails = 0
-		c.h.state.Exit("cilium-envoy-down", nil)
+		c.h.state.Exit(hoststate.LatchCiliumEnvoyDown, nil)
 		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
@@ -725,10 +726,10 @@ func (c *ciliumEnvoyCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.xdsFails++
 	} else {
 		c.xdsFails = 0
-		c.h.state.Exit("cilium-envoy-xds-reject", nil)
+		c.h.state.Exit(hoststate.LatchCiliumEnvoyXDSReject, nil)
 	}
 	if c.xdsFails >= c.h.cfg.ConsecNeeded {
-		c.h.state.Enter("cilium-envoy-xds-reject",
+		c.h.state.Enter(hoststate.LatchCiliumEnvoyXDSReject,
 			fmt.Sprintf("update_rejected=%d fails=%d",
 				c.xdsLast, c.xdsFails))
 		c.killCiliumEnvoy(tasks,
@@ -739,7 +740,7 @@ func (c *ciliumEnvoyCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cfg.Cilium.EnvoyReadyURL, "", ciliumProbeTime)
 	if err == nil && code == http.StatusOK {
 		c.fails = 0
-		c.h.state.Exit("cilium-envoy-down", nil)
+		c.h.state.Exit(hoststate.LatchCiliumEnvoyDown, nil)
 		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
@@ -751,7 +752,7 @@ func (c *ciliumEnvoyCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCiliumEnvoy, "ok").Inc()
 		return
 	}
-	c.h.state.Enter("cilium-envoy-down",
+	c.h.state.Enter(hoststate.LatchCiliumEnvoyDown,
 		fmt.Sprintf("ready_probe_fails=%d", c.fails))
 	c.killCiliumEnvoy(tasks,
 		fmt.Sprintf("unready %d consecutive cycles", c.fails))
@@ -822,7 +823,7 @@ func (c *ciliumMTUCheck) Run(_ context.Context, e *cycleEnv) {
 	if !nebOK {
 		// No overlay to compare against — a drift latch from
 		// before must not linger.
-		c.h.state.Exit("cilium-mtu-drift", nil)
+		c.h.state.Exit(hoststate.LatchCiliumMTUDrift, nil)
 		c.h.cycles.WithLabelValues(checkCiliumMTU, "ok").Inc()
 		return
 	}
@@ -835,15 +836,15 @@ func (c *ciliumMTUCheck) Run(_ context.Context, e *cycleEnv) {
 			wg, neb, wgEncapOverheadBytes)
 	}
 	if driftWhy != "" {
-		if !c.h.state.Exists("cilium-mtu-drift") {
-			c.h.state.Enter("cilium-mtu-drift", driftWhy)
+		if !c.h.state.Exists(hoststate.LatchCiliumMTUDrift) {
+			c.h.state.Enter(hoststate.LatchCiliumMTUDrift, driftWhy)
 			// NPD contract: nodereporter maps this line to the
 			// CiliumMTUExceedsOverlay Event + problem_counter.
 			c.h.state.AppendLog(fmt.Sprintf(
 				"ACTION cilium-mtu-drift: %s", driftWhy))
 		}
 	} else {
-		c.h.state.Exit("cilium-mtu-drift", nil)
+		c.h.state.Exit(hoststate.LatchCiliumMTUDrift, nil)
 	}
 	c.h.cycles.WithLabelValues(checkCiliumMTU, "ok").Inc()
 }
@@ -998,7 +999,7 @@ func (c *ciliumWGCheck) Run(ctx context.Context, e *cycleEnv) {
 		// No WireGuard datapath on this node (calico, tunnel mode,
 		// hub) — nothing to heal; drop stale evidence.
 		c.h.ciliumWGFails = 0
-		c.h.state.Exit("cilium-wg-peer-wipe", nil)
+		c.h.state.Exit(hoststate.LatchCiliumWGPeerWipe, nil)
 		c.h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
 		return
 	}
@@ -1046,7 +1047,7 @@ func (c *ciliumWGCheck) Run(ctx context.Context, e *cycleEnv) {
 	}
 	if actual >= expected {
 		c.h.ciliumWGFails = 0
-		c.h.state.Exit("cilium-wg-peer-wipe", nil)
+		c.h.state.Exit(hoststate.LatchCiliumWGPeerWipe, nil)
 		c.h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
 		return
 	}
@@ -1058,10 +1059,10 @@ func (c *ciliumWGCheck) Run(ctx context.Context, e *cycleEnv) {
 		c.h.cycles.WithLabelValues(checkCiliumWG, "ok").Inc()
 		return
 	}
-	c.h.state.Enter("cilium-wg-peer-wipe",
+	c.h.state.Enter(hoststate.LatchCiliumWGPeerWipe,
 		fmt.Sprintf("allowed_ips=%d expected=%d", actual, expected))
 	switch {
-	case c.h.state.Exists("node-overloaded"):
+	case c.h.state.Exists(hoststate.LatchNodeOverloaded):
 		c.h.state.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers allowed_ips=%d expected=%d %dx but node overloaded — skip kill",
 			actual, expected, c.h.ciliumWGFails))
