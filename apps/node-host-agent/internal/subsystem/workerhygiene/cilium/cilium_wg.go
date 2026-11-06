@@ -139,7 +139,7 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "ok").Inc()
 		return
 	}
-	tasks, reachable := ciliumAgentTasks(c.d)
+	tasks, reachable := ciliumAgentTasks(c.d, e)
 	if !reachable {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "abort").Inc()
 		return
@@ -219,7 +219,7 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// This check runs after CiliumEnvoyCheck in the dispatch —
 			// bounce envoy inline for the xDS resync (the shared flag
 			// would only be seen next cycle).
-			restartEnvoyAfterAgentKill(c.d, wdeps.CheckCiliumWG,
+			restartEnvoyAfterAgentKill(c.d, e, wdeps.CheckCiliumWG,
 				"cilium-agent restarted for wireguard peer drift")
 		} else {
 			c.d.State.AppendLog(fmt.Sprintf(

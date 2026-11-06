@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -199,8 +200,11 @@ func TestTaskMapNotBuiltWithoutTriggers(t *testing.T) {
 
 	e.H.Cycle(context.Background())
 
-	if e.H.TaskMapBuilds != 0 {
-		t.Fatalf("task map builds=%d want 0 (never built)", e.H.TaskMapBuilds)
+	// The cilium family pulls the shared snapshot every cycle —
+	// builds==1 proves the once-per-cycle ceiling (the old code
+	// re-scanned the task roots per check).
+	if e.H.TaskMapBuilds != 1 {
+		t.Fatalf("task map builds=%d want 1 (one shared build for the cilium checks)", e.H.TaskMapBuilds)
 	}
 }
 
@@ -217,8 +221,10 @@ func TestTaskMapNotBuiltWhenHostResolvEmpty(t *testing.T) {
 
 	e.H.Cycle(context.Background())
 
-	if e.H.TaskMapBuilds != 0 {
-		t.Fatalf("task map builds=%d want 0 (empty hostNS gates the build)", e.H.TaskMapBuilds)
+	// Still exactly one build — the dns check's pause-pid lookup
+	// shares the cilium family's snapshot.
+	if e.H.TaskMapBuilds != 1 {
+		t.Fatalf("task map builds=%d want 1 (shared once-per-cycle build)", e.H.TaskMapBuilds)
 	}
 }
 
@@ -227,9 +233,12 @@ func TestTaskMapNotBuiltWhenHostResolvEmpty(t *testing.T) {
 func TestStateEnterAtomicTmpLeavesNoResidue(t *testing.T) {
 	e := fixture(t)
 	// A stale tmp file from a crashed earlier write shares the
-	// ".tmp-" prefix — the next stateEnter overwrites+renames it,
-	// leaving exactly the latch. The old "state-<n>.tmp" shape would
-	// have surfaced as a phantom hostmetrics watchdog_state series.
+	// ".tmp-" prefix. Staging names are now unique per writer
+	// (.tmp-<base>-<rand>), so a crashed predecessor's file can
+	// never be reclaimed by name reuse — it stays as benign crash
+	// residue the janitor owns, while the NEW write must leave no
+	// tmp of its own. The old "state-<n>.tmp" shape would have
+	// surfaced as a phantom hostmetrics watchdog_state series.
 	wdepstest.WriteFile(t, filepath.Join(e.StateDir, ".tmp-state-x"), "stale\n")
 
 	e.H.State.Enter("x", "")
@@ -242,9 +251,11 @@ func TestStateEnterAtomicTmpLeavesNoResidue(t *testing.T) {
 	for _, en := range entries {
 		names = append(names, en.Name())
 	}
-	if len(names) != 1 || names[0] != "state-x" {
-		t.Fatalf("state dir after stateEnter=%v want [state-x] "+
-			"(tmp residue or wrong latch name)", names)
+	slices.Sort(names)
+	want := []string{".tmp-state-x", "state-x"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("state dir after stateEnter=%v want %v "+
+			"(stale crash residue kept, no new tmp leaked)", names, want)
 	}
 }
 

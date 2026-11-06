@@ -71,7 +71,7 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumEnvoy, "gated").Inc()
 		return
 	}
-	tasks, reachable := ciliumNamedTasks(c.d, "cilium-envoy")
+	tasks, reachable := ciliumNamedTasks(c.d, e, "cilium-envoy")
 	if !reachable {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumEnvoy, "abort").Inc()
 		return

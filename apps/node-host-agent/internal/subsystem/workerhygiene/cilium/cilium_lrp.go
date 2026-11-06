@@ -83,7 +83,7 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// persists while the agent is down, and a dead/wedged agent can
 	// break the :53 datapath itself — killing the nld pod then would
 	// mask the real failure (wdeps.CheckCilium owns the agent-down verdict).
-	agentTasks, ctrOK := ciliumAgentTasks(c.d)
+	agentTasks, ctrOK := ciliumAgentTasks(c.d, e)
 	if !ctrOK {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "abort").Inc()
 		return
@@ -106,7 +106,7 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// a kube-dns entry with apiserver-Ready endpoints but zero
 	// programmed backends explains every :53 failure — deleting the
 	// nld pod then punishes the wrong component.
-	if c.serviceDesync(ctx, agentTasks) {
+	if c.serviceDesync(ctx, e, agentTasks) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "ok").Inc()
 		return
 	}
@@ -198,7 +198,7 @@ var desyncServices = []struct{ ns, name string }{
 // map explains any :53 failure, so the pod delete would punish the
 // wrong component.
 func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
-	agentTasks []wdeps.CtrTask) bool {
+	e *wdeps.CycleEnv, agentTasks []wdeps.CtrTask) bool {
 	backends, err := c.d.Cfg.Seams.Cilium.CiliumServiceBackendsFn(ctx)
 	if err != nil {
 		// Inconclusive — the agent API hiccuped; the healthz check
@@ -242,7 +242,7 @@ func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
 		// This check runs after CiliumEnvoyCheck in the dispatch —
 		// the shared flag won't be seen until next cycle, so bounce
 		// envoy inline for the xDS resync.
-		restartEnvoyAfterAgentKill(c.d, wdeps.CheckCiliumLRP,
+		restartEnvoyAfterAgentKill(c.d, e, wdeps.CheckCiliumLRP,
 			"cilium-agent restarted for BPF service-map desync")
 	} else {
 		c.d.State.AppendLog(fmt.Sprintf(

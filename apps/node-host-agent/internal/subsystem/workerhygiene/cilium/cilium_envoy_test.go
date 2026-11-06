@@ -5,30 +5,21 @@ package cilium_test
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
-	"strconv"
 	"syscall"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
 // --- B1: cilium-envoy ---
 
 // mkCiliumContainer registers a cilium container task dir named
 // like the container (cilium-agent / cilium-envoy) with a live pid.
+// The config.json carries the pod-uid annotation like a real CRI
+// task — the shared task map only indexes uid-annotated dirs.
 func mkCiliumContainer(t *testing.T, e *env, name string, pid int) {
 	t.Helper()
-	d := filepath.Join(e.CtrDir, "id-"+name)
-	if err := os.MkdirAll(d, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cfg := `{"labels":{"io.kubernetes.container.name":"` + name + `"}}`
-	if err := os.WriteFile(filepath.Join(d, "config.json"), []byte(cfg), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(d, "init.pid"), []byte(strconv.Itoa(pid)), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	e.MkTask(t, wdepstest.UIDF, name, pid)
 	e.Live[pid] = true
 }
 

@@ -140,6 +140,16 @@ func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
 	}
 }
 
+// staleLatched reports whether b's stale latch file exists — a
+// stat-only probe the healthy path uses to know whether the ok
+// streak still has a latch to recover from (vs the tmp+rename+fsync
+// a counter-file rewrite costs every cycle it keeps counting).
+func (p *Prober) staleLatched(dir string, b backend) bool {
+	_, err := os.Stat(dir + "/" + hoststate.LatchFilePrefix +
+		hoststate.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr))
+	return err == nil
+}
+
 // latchStale creates state-apiserver-backend-stale-<ip> — state_enter
 // semantics: create only if absent, content = current epoch.
 func (p *Prober) latchStale(dir string, b backend) {
@@ -295,7 +305,13 @@ func (p *Prober) saveState(dir, name string, st *backendState) {
 	p.writeStateCounter(dir+"/apibe-fail-"+key, int64(st.fail))
 	p.writeStateCounter(dir+"/apibe-ok-"+key, int64(st.ok))
 	prev := dir + "/apibe-prevcache-" + key
-	if st.hasPrev {
+	// The baseline only earns a restart witness while a verdict is
+	// in flight — it exists to resume a frozen/gap/fail streak or a
+	// drain recovery. A fully-healthy backend's rv_cache advances
+	// every cycle, so persisting it was a tmp+rename+fsync every
+	// 30s for nothing (the "healthy run leaves no litter" rule).
+	if st.hasPrev && (st.qfail > 0 || st.frozen > 0 || st.fail > 0 ||
+		st.ok > 0 || st.drained) {
 		p.writeStateFile(prev, strconv.FormatInt(st.prevCache, 10))
 	} else {
 		p.removeStateFile(prev)

@@ -270,27 +270,32 @@ func ephemeralPortWidth(path string) float64 {
 // counts entries whose `st` column (field 3, hex TCP state) equals
 // state. ok=false when NO table read at all — a single readable
 // family still counts (an IPv6-less host legitimately lacks
-// tcp6).
+// tcp6). Streamed line-by-line: os.ReadFile + strings.Split over
+// the whole socket table allocated ~15-25MiB of garbage per
+// scrape on busy nodes.
 func tcpStateCount(state byte, paths ...string) (float64, bool) {
 	want := string([]byte{
 		"0123456789ABCDEF"[state>>4], "0123456789ABCDEF"[state&0x0f]})
 	var n float64
 	var ok bool
 	for _, p := range paths {
-		data, err := os.ReadFile(p)
+		f, err := os.Open(p)
 		if err != nil {
 			continue
 		}
 		ok = true
-		for i, line := range strings.Split(string(data), "\n") {
-			if i == 0 {
+		sc := bufio.NewScanner(f)
+		first := true
+		for sc.Scan() {
+			if first {
+				first = false
 				continue // column header
 			}
-			f := strings.Fields(line)
-			if len(f) > 3 && f[3] == want {
+			if fields := strings.Fields(sc.Text()); len(fields) > 3 && fields[3] == want {
 				n++
 			}
 		}
+		_ = f.Close()
 	}
 	return n, ok
 }

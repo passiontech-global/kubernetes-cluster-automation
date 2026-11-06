@@ -418,26 +418,37 @@ func (c *cyc) nebulaRouting() {
 		}
 	}
 
+	// fwmark + policy-routing converge — ONE generated script run
+	// through a single host exec (the nebnat replay below uses the
+	// same technique). The old code forked `nsenter sh -c` per rule
+	// per loop: ~4 nsenter runs per mesh target plus one per
+	// direct-TCP port, every 5-minute cycle. Every interpolated
+	// value already passed the charset/shape gates above, and no
+	// line's output is parsed back, so sequential lines inside one
+	// sh -c are semantically identical to the per-command forks.
+	var rs strings.Builder
 	// fwmark for transport
 	for _, p := range []string{"dport", "sport"} {
 		for _, chain := range []string{"OUTPUT", "PREROUTING"} {
-			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
+			fmt.Fprintf(&rs,
 				"iptables -t mangle -C %s -p udp --%s %s -j MARK --set-mark 0x1000 2>/dev/null || "+
-					"iptables -t mangle -A %s -p udp --%s %s -j MARK --set-mark 0x1000",
-				chain, p, port(c), chain, p, port(c)))
+					"iptables -t mangle -A %s -p udp --%s %s -j MARK --set-mark 0x1000\n",
+				chain, p, port(c), chain, p, port(c))
 		}
 	}
-	_, _ = r.run(ctx, "sh", "-c", `ip rule list | grep -q "fwmark 0x1000" || ip rule add pref 1400 fwmark 0x1000 lookup main`)
+	rs.WriteString(`ip rule list | grep -q "fwmark 0x1000" || ip rule add pref 1400 fwmark 0x1000 lookup main` + "\n")
 
 	// Populate overlay tables ALWAYS (warm standby even when
 	// overlay=tinc). pub table src = public ip; marker table src =
-	// NODE_IP only when it is a marker-base IP, else flush.
-	_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
-		`ip link show dev %s >/dev/null 2>&1 || exit 0; `+
+	// NODE_IP only when it is a marker-base IP, else flush. The
+	// missing-dev early-out becomes a skipped block, not a script
+	// exit — the rule converge after it must still run.
+	fmt.Fprintf(&rs,
+		`if ip link show dev %s >/dev/null 2>&1; then `+
 			`ip route replace default dev %s src %s table %s; `+
 			`case "%s" in %s.*) ip route replace default dev %s src %s table %s ;; `+
-			`*) ip route flush table %s 2>/dev/null || true ;; esac`,
-		dev, dev, pubIP, pub, nodeIPV, mb, dev, nodeIPV, mark, mark))
+			`*) ip route flush table %s 2>/dev/null || true ;; esac; fi`+"\n",
+		dev, dev, pubIP, pub, nodeIPV, mb, dev, nodeIPV, mark, mark)
 
 	if t.Overlay == "nebula" {
 		// converge ip rules: prune stale lookups for mesh dsts, ensure
@@ -445,53 +456,56 @@ func (c *cyc) nebulaRouting() {
 		targets := append(append([]string{}, t.Targets...), t.EgressRelays...)
 		targets = append(targets, mb+".0/24")
 		for _, d := range targets {
-			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
-				`for t in $(ip rule list pref 1500 | sed -n "s|.*to %s .*lookup \([0-9]*\).*|\1|p"); do [ "$t" = %s ] || ip rule del pref 1500 to %s lookup "$t" 2>/dev/null; done`,
-				d, pub, d))
+			fmt.Fprintf(&rs,
+				`for t in $(ip rule list pref 1500 | sed -n "s|.*to %s .*lookup \([0-9]*\).*|\1|p"); do [ "$t" = %s ] || ip rule del pref 1500 to %s lookup "$t" 2>/dev/null; done`+"\n",
+				d, pub, d)
 		}
 		for _, d := range append(append([]string{}, t.Targets...), mb+".0/24") {
-			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
-				`ip rule list | grep -q "to %s lookup %s" || ip rule add pref 1500 to %s lookup %s`, d, pub, d, pub))
+			fmt.Fprintf(&rs,
+				`ip rule list | grep -q "to %s lookup %s" || ip rule add pref 1500 to %s lookup %s`+"\n",
+				d, pub, d, pub)
 		}
 		for _, d := range t.EgressRelays {
-			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
-				`[ "$(cat /var/lib/node-watchdog/egress-state-%s 2>/dev/null)" = relay ] && { ip rule list | grep -q "to %s lookup %s" || ip rule add pref 1500 to %s lookup %s; }; true`,
-				d, d, pub, d, pub))
+			fmt.Fprintf(&rs,
+				`[ "$(cat /var/lib/node-watchdog/egress-state-%s 2>/dev/null)" = relay ] && { ip rule list | grep -q "to %s lookup %s" || ip rule add pref 1500 to %s lookup %s; }; true`+"\n",
+				d, d, pub, d, pub)
 		}
-		_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
-			`for t in $(ip rule list pref 1490 | sed -n "s|.*to %s\.0/24 .*lookup \([0-9]*\).*|\1|p"); do [ "$t" = %s ] || ip rule del pref 1490 to %s.0/24 lookup "$t" 2>/dev/null; done`,
-			mb, mark, mb))
+		fmt.Fprintf(&rs,
+			`for t in $(ip rule list pref 1490 | sed -n "s|.*to %s\.0/24 .*lookup \([0-9]*\).*|\1|p"); do [ "$t" = %s ] || ip rule del pref 1490 to %s.0/24 lookup "$t" 2>/dev/null; done`+"\n",
+			mb, mark, mb)
 		if strings.HasPrefix(nodeIPV, mb+".") {
-			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
-				`ip rule list | grep -q "to %s.0/24 lookup %s" || ip rule add pref 1490 to %s.0/24 lookup %s`,
-				mb, mark, mb, mark))
+			fmt.Fprintf(&rs,
+				`ip rule list | grep -q "to %s.0/24 lookup %s" || ip rule add pref 1490 to %s.0/24 lookup %s`+"\n",
+				mb, mark, mb, mark)
 		} else {
-			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
-				`ip rule del pref 1490 to %s.0/24 lookup %s 2>/dev/null || true`, mb, mark))
+			fmt.Fprintf(&rs,
+				`ip rule del pref 1490 to %s.0/24 lookup %s 2>/dev/null || true`+"\n",
+				mb, mark)
 		}
 		// pref-1499 Direct-Underlay TCP bypass: management/CP TCP
 		// dports must never be sucked into the tunnel — rule them
 		// into the main table (nethealth re-adds lost ones).
 		for _, p := range c.nebulaDirectTCPPorts() {
-			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
-				`ip rule list pref 1499 | grep -q "ipproto tcp dport %s " || ip rule add pref 1499 ipproto tcp dport %s lookup main`,
-				p, p))
+			fmt.Fprintf(&rs,
+				`ip rule list pref 1499 | grep -q "ipproto tcp dport %s " || ip rule add pref 1499 ipproto tcp dport %s lookup main`+"\n",
+				p, p)
 		}
 		// flush foreign dev tables (stale nebula-era tables).
-		_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
-			`ip -o route show table all dev %s 2>/dev/null | sed -n "s|.* table \([0-9]*\) .*|\1|p" | sort -u | while read -r t; do [ "$t" = "%s" ] || [ "$t" = "%s" ] || ip route flush table "$t" 2>/dev/null; done`,
-			dev, pub, mark))
+		fmt.Fprintf(&rs,
+			`ip -o route show table all dev %s 2>/dev/null | sed -n "s|.* table \([0-9]*\) .*|\1|p" | sort -u | while read -r t; do [ "$t" = "%s" ] || [ "$t" = "%s" ] || ip route flush table "$t" 2>/dev/null; done`+"\n",
+			dev, pub, mark)
 	} else {
 		// overlay=tinc: pref-1499 bypass rules go too.
 		for _, p := range c.nebulaDirectTCPPorts() {
-			_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
-				`ip rule del pref 1499 ipproto tcp dport %s lookup main 2>/dev/null || true`, p))
+			fmt.Fprintf(&rs,
+				`ip rule del pref 1499 ipproto tcp dport %s lookup main 2>/dev/null || true`+"\n", p)
 		}
 		// overlay=tinc rollback: drop nebula-owned rules.
-		_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(
-			`ip rule list pref 1500 | sed -n "s/.*to \([0-9./]*\).*/\1/p" | while read -r d; do ip rule del pref 1500 to "$d" lookup %s 2>/dev/null; done; ip rule del pref 1490 to %s.0/24 lookup %s 2>/dev/null; true`,
-			pub, mb, mark))
+		fmt.Fprintf(&rs,
+			`ip rule list pref 1500 | sed -n "s/.*to \([0-9./]*\).*/\1/p" | while read -r d; do ip rule del pref 1500 to "$d" lookup %s 2>/dev/null; done; ip rule del pref 1490 to %s.0/24 lookup %s 2>/dev/null; true`+"\n",
+			pub, mb, mark)
 	}
+	_, _ = r.run(ctx, "sh", "-c", rs.String()+"\ntrue")
 	// nebnat nft — replayed via a generated script (idempotent guard
 	// lines identical in effect to the ansible shell task). Marker-dst
 	// SNAT goes to the MARKER (peers accept marker srcs via cert

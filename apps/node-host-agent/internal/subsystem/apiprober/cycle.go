@@ -253,8 +253,23 @@ func (p *Prober) Cycle(ctx context.Context) {
 				"backend", b.Name, "rvCache", rvCache, "rvNow", rvNow,
 				"frozen", st.frozen, "frozenCycles", p.eff.frozen)
 		default:
-			st.ok++
-			if wdir != "" && st.ok >= p.eff.recoverC {
+			// st.ok is a RECOVERY counter — it only runs while a
+			// verdict still has something to prove: a backend we
+			// drained (or the admin disabled — maint is reconciled
+			// the same way) earns re-enable after RecoverCycles
+			// consecutive fresh probes, and a backend still
+			// carrying the stale latch (FENCE kept it enabled, or
+			// dry-run never drained it) earns the state_exit the
+			// same way. A healthy backend with nothing to recover
+			// holds ok=0 — saveState's zero-means-absent rule then
+			// leaves no apibe-ok file to rewrite every cycle.
+			latched := wdir != "" && p.staleLatched(wdir, b)
+			if st.drained || b.maint() || latched {
+				st.ok++
+			} else {
+				st.ok = 0
+			}
+			if latched && st.ok >= p.eff.recoverC {
 				// state_exit parity: the shell needed RECOVER_CYCLES
 				// consecutive fully-fresh runs before clearing the
 				// latch — one lucky probe must not unblock

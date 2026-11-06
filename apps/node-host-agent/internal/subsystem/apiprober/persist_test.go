@@ -32,23 +32,24 @@ func TestPersistStreaksResumeAcrossRestart(t *testing.T) {
 	p.cfg.WatchdogStateDir = dir
 
 	// One failing cycle: hub1 qfail=1 — one short of DEAD — and
-	// hub2 ok=1 with its frozen baseline.
+	// hub2 fully healthy (ok holds 0: nothing to recover, no
+	// apibe-ok/prevcache litter files).
 	bad.setFail(true)
 	good.set(50, 50)
 	p.Cycle(context.Background())
-	if p.states["hub1"].qfail != 1 || p.states["hub2"].ok != 1 {
-		t.Fatalf("seed state qfail=%d ok=%d want 1/1",
+	if p.states["hub1"].qfail != 1 || p.states["hub2"].ok != 0 {
+		t.Fatalf("seed state qfail=%d ok=%d want 1/0",
 			p.states["hub1"].qfail, p.states["hub2"].ok)
 	}
-	// The witness files landed at cycle end.
+	// The witness files landed at cycle end — for hub1 only; a
+	// healthy backend with no in-flight verdict writes nothing.
 	if got := fileContent(t, beFile(dir, "apibe-qfail-", "hub1")); got != "1\n" {
 		t.Fatalf("apibe-qfail-hub1=%q want %q", got, "1\n")
 	}
-	if got := fileContent(t, beFile(dir, "apibe-ok-", "hub2")); got != "1\n" {
-		t.Fatalf("apibe-ok-hub2=%q want %q", got, "1\n")
-	}
-	if got := fileContent(t, beFile(dir, "apibe-prevcache-", "hub2")); got != "50\n" {
-		t.Fatalf("apibe-prevcache-hub2=%q want %q", got, "50\n")
+	for _, f := range []string{"apibe-ok-hub2", "apibe-prevcache-hub2"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); !os.IsNotExist(err) {
+			t.Fatalf("%s exists for a healthy unencumbered backend", f)
+		}
 	}
 
 	// "Restart": a fresh Prober on the same dir — the qfail streak
@@ -223,19 +224,17 @@ func TestPersistZeroCountersLeaveNoFiles(t *testing.T) {
 	p.Cycle(context.Background())
 
 	// Zero-value counters must not exist as files — absent IS 0.
+	// A healthy backend with nothing to recover leaves NO files
+	// at all: ok holds 0 (no recovery verdict in flight) and the
+	// prevcache baseline is only persisted while a verdict is
+	// in flight.
 	for _, f := range []string{
 		"apibe-qfail-hub1", "apibe-frozen-hub1", "apibe-fail-hub1",
-		"apibe-drained-hub1",
+		"apibe-drained-hub1", "apibe-ok-hub1", "apibe-prevcache-hub1",
 	} {
 		if _, err := os.Stat(filepath.Join(dir, f)); !os.IsNotExist(err) {
 			t.Fatalf("%s exists for a zero value", f)
 		}
-	}
-	if got := fileContent(t, beFile(dir, "apibe-ok-", "hub1")); got != "1\n" {
-		t.Fatalf("apibe-ok-hub1=%q want %q", got, "1\n")
-	}
-	if got := fileContent(t, beFile(dir, "apibe-prevcache-", "hub1")); got != "100\n" {
-		t.Fatalf("apibe-prevcache-hub1=%q want %q", got, "100\n")
 	}
 
 	// A failing cycle zeroes ok and raises qfail — the files must
@@ -291,8 +290,11 @@ func TestPersistDepartedBackendFilesPruned(t *testing.T) {
 			t.Fatalf("departed backend file survived prune: %s", e.Name())
 		}
 	}
-	if _, err := os.Stat(beFile(dir, "apibe-prevcache-", "hub2")); err != nil {
-		t.Fatal("live backend's state file pruned")
+	// hub2 is healthy — under the in-flight-only persistence rule it
+	// leaves no name-keyed files; its always-fresh gap file is the
+	// surviving contract.
+	if _, err := os.Stat(gapFilePath(dir, good.addr())); err != nil {
+		t.Fatal("live backend's gap file pruned")
 	}
 }
 

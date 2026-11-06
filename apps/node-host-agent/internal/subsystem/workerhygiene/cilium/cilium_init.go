@@ -34,7 +34,7 @@ func (c *CiliumInitCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "gated").Inc()
 		return
 	}
-	tasks, reachable := ciliumAgentTasks(c.d)
+	tasks, reachable := ciliumAgentTasks(c.d, e)
 	if !reachable {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "abort").Inc()
 		return

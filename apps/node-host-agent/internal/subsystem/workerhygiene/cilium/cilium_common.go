@@ -6,10 +6,6 @@ package cilium
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -23,44 +19,42 @@ const (
 	ciliumProbeTime = 5 * time.Second // task spec: 3x timeout 5s
 )
 
+// taskSnapshot returns the cycle's shared containerd task map —
+// e.TasksOnce when the orchestrator wired it (built at most once
+// per workerhygiene cycle, shared with the teardown/dns checks),
+// or a direct BuildTaskMap for bare CycleEnvs (unit tests calling
+// Run without a full Cycle). Either way the task roots' config.json
+// + init.pid sweep happens once — the old per-check rescan cost
+// every one of the ~5 cilium checks a full directory walk.
+func taskSnapshot(d *wdeps.Deps, e *wdeps.CycleEnv) (map[string][]wdeps.CtrTask, bool) {
+	if e != nil && e.TasksOnce != nil {
+		return e.TasksOnce()
+	}
+	return d.BuildTaskMap()
+}
+
 // ciliumNamedTasks finds containerd tasks of one cilium container
 // (cilium-agent / cilium-envoy) by container-name annotation — the
-// Go port of `ctr containers ls 'labels."io.kubernetes.container.name"=="<name>"'`.
-// reachable=false means the task root itself is unreadable (ctr
-// unreachable parity: inconclusive, keep counters/latches).
-func ciliumNamedTasks(d *wdeps.Deps, name string) (tasks []wdeps.CtrTask, reachable bool) {
-	if _, err := os.ReadDir(d.Cfg.CtrTaskRoot); err != nil {
+// Go port of `ctr containers ls 'labels."io.kubernetes.container.name"=="<name>"'`,
+// filtered out of the shared task snapshot. reachable=false means a
+// task root could not be listed (the map's `complete` flag — ctr
+// unreachable parity: inconclusive, keep counters/latches). Note the
+// map only carries tasks WITH a pod-uid annotation — real CRI
+// containers always have one; it also fails closed on a sandbox-root
+// read error where the old scan silently skipped it.
+func ciliumNamedTasks(d *wdeps.Deps, e *wdeps.CycleEnv, name string) (tasks []wdeps.CtrTask, reachable bool) {
+	m, complete := taskSnapshot(d, e)
+	if !complete {
 		d.State.AppendLog(fmt.Sprintf(
-			"suspect: ctr task root %s unreadable: %v — cilium checks inconclusive",
-			d.Cfg.CtrTaskRoot, err))
+			"suspect: ctr task root %s unreadable — cilium checks inconclusive",
+			d.Cfg.CtrTaskRoot))
 		return nil, false
 	}
-	for _, root := range []string{d.Cfg.CtrTaskRoot, d.Cfg.SandboxCtlRoot} {
-		entries, err := os.ReadDir(root)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
+	for _, list := range m {
+		for _, t := range list {
+			if t.Name == name {
+				tasks = append(tasks, t)
 			}
-			dir := filepath.Join(root, e.Name())
-			cfgData, err := os.ReadFile(filepath.Join(dir, "config.json"))
-			if err != nil {
-				continue
-			}
-			nm := wdeps.ContainerNameRe.FindSubmatch(cfgData)
-			if nm == nil || string(nm[1]) != name {
-				continue
-			}
-			t := wdeps.CtrTask{}
-			if pidData, err := os.ReadFile(filepath.Join(dir, "init.pid")); err == nil {
-				if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil {
-					t.PID = pid
-					t.Live = d.PidLive(pid)
-				}
-			}
-			tasks = append(tasks, t)
 		}
 	}
 	return tasks, true
@@ -68,8 +62,8 @@ func ciliumNamedTasks(d *wdeps.Deps, name string) (tasks []wdeps.CtrTask, reacha
 
 // ciliumAgentTasks is the cilium-agent specialization kept for the
 // 32/35 call sites.
-func ciliumAgentTasks(d *wdeps.Deps) (tasks []wdeps.CtrTask, reachable bool) {
-	return ciliumNamedTasks(d, "cilium-agent")
+func ciliumAgentTasks(d *wdeps.Deps, e *wdeps.CycleEnv) (tasks []wdeps.CtrTask, reachable bool) {
+	return ciliumNamedTasks(d, e, "cilium-agent")
 }
 
 // killNamedTasks SIGKILLs every live init pid of the named
@@ -109,8 +103,8 @@ func killCiliumAgent(d *wdeps.Deps, tasks []wdeps.CtrTask) bool {
 // socket across the agent restart until its own probe fails. The
 // dedicated last-cilium-envoy-restart budget bounds it identically
 // to CiliumEnvoyCheck.killCiliumEnvoy.
-func restartEnvoyAfterAgentKill(d *wdeps.Deps, check, why string) {
-	tasks, reachable := ciliumNamedTasks(d, "cilium-envoy")
+func restartEnvoyAfterAgentKill(d *wdeps.Deps, e *wdeps.CycleEnv, check, why string) {
+	tasks, reachable := ciliumNamedTasks(d, e, "cilium-envoy")
 	if !reachable || len(tasks) == 0 {
 		return // no L7 proxy deployed — nothing to bounce
 	}
