@@ -9,12 +9,9 @@ package helmreleaseunlocker
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"strings"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -64,37 +61,34 @@ var artifactFailMsgs = []string{
 // fluxSourceRef is a resolved source object coordinates tuple.
 type fluxSourceRef struct{ kind, namespace, name string }
 
-// healArtifactSources scans every HelmRelease (already listed by the
-// caller) and every Kustomization for the stale-artifact signature,
-// resolves each consumer's Flux source, and stamps
+// healArtifactSources scans every HelmRelease (listed by the caller)
+// and every Kustomization (also listed by the caller — shared with
+// the immutable-Job healer so the sweep pages it once, nil on
+// pre-v1 flux) for the stale-artifact signature, resolves each
+// consumer's Flux source, and stamps
 // reconcile.fluxcd.io/requestedAt on it — source-controller refetches
 // the artifact, which is what actually unstucks the consumer. The
 // passiontech.dev/last-source-nudge stamp on the source caps this at once
 // per source per 30m across ALL consumers pointing at it.
 func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
-	hrs *unstructured.UnstructuredList) error {
+	hrs, kustomizations *unstructured.UnstructuredList) {
 	log := logf.FromContext(ctx)
-	kustomizations, err := u.listAllPages(ctx, u.dyn.Resource(fluxKustomizationGVR))
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			kustomizations = nil // pre-v1 flux — the HR half still runs
-		} else {
-			return fmt.Errorf("list kustomizations: %w", err)
-		}
-	}
 	nudged := 0
 	now := u.now.Now()
+	// One Get+patch per source per sweep — several consumers (or a
+	// consumer's two refs) can point at the same source object.
+	seen := map[fluxSourceRef]bool{}
 	for i := range hrs.Items {
 		hr := &hrs.Items[i]
 		if !fluxArtifactStale(hr, now) {
 			continue
 		}
 		if ref, ok := hrSourceRef(hr); ok &&
-			u.nudgeSource(ctx, ref, consumerID("HelmRelease", hr)) {
+			u.nudgeSource(ctx, ref, consumerID("HelmRelease", hr), seen) {
 			nudged++
 		}
 		if hcRef, ok := hrStatusHelmChartRef(hr); ok &&
-			u.nudgeSource(ctx, hcRef, consumerID("HelmRelease", hr)) {
+			u.nudgeSource(ctx, hcRef, consumerID("HelmRelease", hr), seen) {
 			nudged++
 		}
 	}
@@ -105,13 +99,12 @@ func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 				continue
 			}
 			if ref, ok := ksSourceRef(k); ok &&
-				u.nudgeSource(ctx, ref, consumerID("Kustomization", k)) {
+				u.nudgeSource(ctx, ref, consumerID("Kustomization", k), seen) {
 				nudged++
 			}
 		}
 	}
 	log.Info("flux artifact-source sweep done", "sourcesNudged", nudged)
-	return nil
 }
 
 // fluxArtifactStale is the stale-artifact signature: a non-suspended
@@ -208,8 +201,11 @@ func consumerID(kind string, o *unstructured.Unstructured) string {
 // nudgeSource stamps reconcile.fluxcd.io/requestedAt + the
 // passiontech.dev/last-source-nudge cooldown onto a Flux source object.
 // Failures are per-source: IncError + false, never an aborted sweep.
+// seen dedupes within the sweep: the first consumer to name a source
+// claims its one Get+patch — a shared source is never fetched twice
+// (and a failed Get is not retried for every other consumer).
 func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
-	ref fluxSourceRef, consumer string) bool {
+	ref fluxSourceRef, consumer string, seen map[fluxSourceRef]bool) bool {
 	log := logf.FromContext(ctx)
 	key := ref.namespace + "/" + ref.name
 	gvr, ok := fluxSourceGVRs[ref.kind]
@@ -218,6 +214,10 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 			"kind", ref.kind, "consumer", consumer)
 		return false
 	}
+	if seen[ref] {
+		return false // already handled for another consumer this sweep
+	}
+	seen[ref] = true
 	src, err := u.dyn.Resource(gvr).Namespace(ref.namespace).
 		Get(ctx, ref.name, metav1.GetOptions{})
 	gone, err := kube.ConfirmAbsent(err)
@@ -240,11 +240,9 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 		return false
 	}
 	stamp := now.UTC().Format(time.RFC3339)
-	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]string{
-			fluxReconcileAnno: stamp,
-			fluxLastNudgeAnno: stamp,
-		}},
+	patch, err := kube.MergePatchAnnos(map[string]any{
+		fluxReconcileAnno: stamp,
+		fluxLastNudgeAnno: stamp,
 	})
 	if err != nil {
 		return false

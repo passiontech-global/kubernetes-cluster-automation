@@ -9,7 +9,6 @@ package helmreleaseunlocker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -53,7 +52,7 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 		// The cooldown reads the wider of the in-RAM ledger and the
 		// persisted passiontech.dev/last-helm-unlock stamp — an operator
 		// restart empties the ledger but must not refund the 24h.
-		last, ok := u.unlocked.Entries()[key]
+		last, ok := u.unlocked.Last(key)
 		if t, hasAnno := helmLastUnlock(hr); hasAnno && t.After(last) {
 			last, ok = t, true
 		}
@@ -169,11 +168,9 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	// same patch persists passiontech.dev/last-helm-unlock so the 24h
 	// cooldown survives an operator restart.
 	now := u.now.Now().UTC().Format(time.RFC3339)
-	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]string{
-			fluxReconcileAnno:  now,
-			helmLastUnlockAnno: now,
-		}},
+	patch, err := kube.MergePatchAnnos(map[string]any{
+		fluxReconcileAnno:  now,
+		helmLastUnlockAnno: now,
 	})
 	if err != nil {
 		return false, err
