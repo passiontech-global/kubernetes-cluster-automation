@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/dynamic/fake"
 	kfake "k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -511,6 +512,61 @@ func TestHelmStallUnwedgeListFallback(t *testing.T) {
 	}
 	if got := rsReplicas(t, cs, "onepassword", "connect-old"); got != 1 {
 		t.Fatalf("fallback resolution did not scale the old ReplicaSet: %d, want 1", got)
+	}
+}
+
+// W8-GO2 attempt budget: a REFUSAL consumes one of the
+// stallMaxAttemptsPerRevision tries just like an action does —
+// otherwise a permanently refused signature would re-run the full
+// workload-layer analysis every sweep and never reach the cap. At
+// the cap the HR is not analyzed at all (zero Deployment reads).
+func TestHelmStallUnwedgeRefusalConsumesAttempt(t *testing.T) {
+	hr, objs := stallFixture()
+	// Refusal shape: the surge pod is pending on a resource
+	// shortage, not anti-affinity — never scaled for that.
+	for i, o := range objs {
+		if p, ok := o.(*corev1.Pod); ok && p.Name == "connect-new-1" {
+			p.Status.Conditions[0].Message =
+				"0/2 nodes are available: 2 Insufficient cpu."
+			objs[i] = p
+		}
+	}
+	dyn := newDynFake(hr)
+	cs := kfake.NewSimpleClientset(objs...)
+	u := newStallUnlocker(cs, dyn, time.Hour, "ops/connect")
+
+	// Refusal #1 burns attempt 1.
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	att := u.stallAttempts["ops/connect"]
+	if att == nil || att.count != 1 {
+		t.Fatalf("refusal did not consume an attempt: %+v", att)
+	}
+
+	// Refusal #2 — past the 6h attempt gap — hits the per-revision cap.
+	att.last = time.Now().Add(-stallAttemptCooldown - time.Minute)
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if att.count != stallMaxAttemptsPerRevision {
+		t.Fatalf("second refusal: count = %d, want %d",
+			att.count, stallMaxAttemptsPerRevision)
+	}
+
+	// At the cap the HR must not be analyzed at all — a Deployment
+	// Get would mean unwedge() ran.
+	depReads := 0
+	cs.PrependReactor("get", "deployments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			depReads++
+			return false, nil, nil
+		})
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if depReads != 0 {
+		t.Fatalf("capped HR still analyzed: %d deployment reads, want 0", depReads)
 	}
 }
 

@@ -8,16 +8,14 @@ package helmreleaseunlocker
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"regexp"
 	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -39,21 +37,20 @@ const (
 // error `Job.batch "<name>" is invalid: ... field is immutable`.
 var immutableJobRe = regexp.MustCompile(`Job\.batch "([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)" is invalid`)
 
-// healImmutableJobs scans Kustomizations for Ready=False >=15m whose
+// healImmutableJobs scans Kustomizations (listed by the caller —
+// shared with the artifact-source healer so the sweep pages it
+// once, nil on pre-v1 flux) for Ready=False >=15m whose
 // message is the immutable-Job apply error: a Job manifest changed an
 // immutable field (spec.template), so apply fails forever until the
 // OLD Job object disappears — and a Job that already ran to Complete
 // or Failed is pure residue. Deleting it unblocks the apply. The
 // 30m cooldown rides the in-RAM ledger + the persisted
 // passiontech.dev/last-immutable-job-heal stamp on the Kustomization.
-func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
+func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context,
+	kustomizations *unstructured.UnstructuredList) {
 	log := logf.FromContext(ctx)
-	kustomizations, err := u.listAllPages(ctx, u.dyn.Resource(fluxKustomizationGVR))
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil // pre-v1 flux — nothing to scan
-		}
-		return fmt.Errorf("list kustomizations: %w", err)
+	if kustomizations == nil {
+		return // pre-v1 flux or a failed list — nothing to scan
 	}
 	now := u.now.Now()
 	for i := range kustomizations.Items {
@@ -125,10 +122,8 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 		}
 		// Persist the stamp — the durable half of the 30m cooldown.
 		u.immutableJobHealed.Stamp(key, now)
-		payload, err := json.Marshal(map[string]any{
-			"metadata": map[string]any{"annotations": map[string]string{
-				immutableJobHealAnno: now.UTC().Format(time.RFC3339),
-			}},
+		payload, err := kube.MergePatchAnnos(map[string]any{
+			immutableJobHealAnno: now.UTC().Format(time.RFC3339),
 		})
 		if err != nil {
 			continue
@@ -139,5 +134,4 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 			log.Error(err, "immutable-job heal stamp failed", "kustomization", key)
 		}
 	}
-	return nil
 }
