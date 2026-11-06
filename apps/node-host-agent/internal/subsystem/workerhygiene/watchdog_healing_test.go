@@ -27,6 +27,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/guards"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
 // --- BUG-H1: the Cycle-owned watchdog heartbeat ---
@@ -37,11 +38,11 @@ import (
 // once, last-run is rewritten every cycle.
 func TestCycleWritesWatchdogHeartbeat(t *testing.T) {
 	e := fixture(t)
-	e.h.Cycle(context.Background())
+	e.H.Cycle(context.Background())
 
 	read := func(name string) int64 {
 		t.Helper()
-		data, err := os.ReadFile(filepath.Join(e.state, name))
+		data, err := os.ReadFile(filepath.Join(e.StateDir, name))
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
@@ -52,18 +53,18 @@ func TestCycleWritesWatchdogHeartbeat(t *testing.T) {
 		return v
 	}
 	installEpoch := read("installed")
-	if installEpoch != e.now.Unix() {
-		t.Fatalf("installed = %d, want %d", installEpoch, e.now.Unix())
+	if installEpoch != e.Now.Unix() {
+		t.Fatalf("installed = %d, want %d", installEpoch, e.Now.Unix())
 	}
-	if got := read("last-run"); got != e.now.Unix() {
-		t.Fatalf("last-run = %d, want %d", got, e.now.Unix())
+	if got := read("last-run"); got != e.Now.Unix() {
+		t.Fatalf("last-run = %d, want %d", got, e.Now.Unix())
 	}
 
 	// Next cycle refreshes last-run; installed keeps its baseline.
-	e.now = e.now.Add(2 * time.Minute)
-	e.h.Cycle(context.Background())
-	if got := read("last-run"); got != e.now.Unix() {
-		t.Fatalf("last-run not refreshed: %d, want %d", got, e.now.Unix())
+	e.Now = e.Now.Add(2 * time.Minute)
+	e.H.Cycle(context.Background())
+	if got := read("last-run"); got != e.Now.Unix() {
+		t.Fatalf("last-run not refreshed: %d, want %d", got, e.Now.Unix())
 	}
 	if got := read("installed"); got != installEpoch {
 		t.Fatalf("installed rewritten: %d, want baseline %d", got, installEpoch)
@@ -75,9 +76,9 @@ func TestCycleWritesWatchdogHeartbeat(t *testing.T) {
 // last-run only gets the periodic refresh.
 func TestHeartbeatPreexistingFilesKept(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.state, "installed"), "1000\n")
-	e.h.Cycle(context.Background())
-	data, err := os.ReadFile(filepath.Join(e.state, "installed"))
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "installed"), "1000\n")
+	e.H.Cycle(context.Background())
+	data, err := os.ReadFile(filepath.Join(e.StateDir, "installed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,20 +94,20 @@ func TestHeartbeatPreexistingFilesKept(t *testing.T) {
 // 24h and a multi-day live latch must not be reaped mid-episode.
 func TestStateEnterRefreshesLatchMtime(t *testing.T) {
 	e := fixture(t)
-	p := filepath.Join(e.state, "state-d-state-storm")
-	writeFile(t, p, "100\n")
-	old := e.now.Add(-48 * time.Hour)
+	p := filepath.Join(e.StateDir, "state-d-state-storm")
+	wdepstest.WriteFile(t, p, "100\n")
+	old := e.Now.Add(-48 * time.Hour)
 	if err := os.Chtimes(p, old, old); err != nil {
 		t.Fatal(err)
 	}
-	e.h.State.Enter("d-state-storm", "count=9")
+	e.H.State.Enter("d-state-storm", "count=9")
 	fi, err := os.Stat(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.ModTime().Before(e.now.Add(-time.Minute)) {
+	if fi.ModTime().Before(e.Now.Add(-time.Minute)) {
 		t.Fatalf("latch mtime %v not refreshed to now (%v)",
-			fi.ModTime(), e.now)
+			fi.ModTime(), e.Now)
 	}
 	// Content untouched — the entry epoch records when the
 	// condition started, not the last refresh.
@@ -118,7 +119,7 @@ func TestStateEnterRefreshesLatchMtime(t *testing.T) {
 		t.Fatalf("latch content = %q, want the original epoch", string(data))
 	}
 	// Still no second STATE-ENTER line (idempotent).
-	if n := strings.Count(logLines(t, e), "STATE-ENTER: d-state-storm"); n != 0 {
+	if n := strings.Count(e.LogLines(t), "STATE-ENTER: d-state-storm"); n != 0 {
 		t.Fatalf("STATE-ENTER logged for an existing latch (%d lines)", n)
 	}
 }
@@ -130,7 +131,7 @@ func TestStateEnterRefreshesLatchMtime(t *testing.T) {
 // wedge case. Only 2xx answers pass.
 func TestProbeHTTPDefaultNon2xxIsError(t *testing.T) {
 	e := fixture(t)
-	h, err := New(wdeps.Config{Client: e.cs}, nil)
+	h, err := New(wdeps.Config{Client: e.CS}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,21 +157,21 @@ func TestProbeHTTPDefaultNon2xxIsError(t *testing.T) {
 // restarts k0sworker — the A4 signal is no longer latch-only.
 func TestSyncloopDownRestartsK0sWorker(t *testing.T) {
 	e := fixture(t)
-	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 500
-	e.h.Cycle(context.Background())
-	if e.sdRan("restart k0sworker.service") {
+	e.Status["https://127.0.0.1:10250/healthz/syncloop"] = 500
+	e.H.Cycle(context.Background())
+	if e.SDRan("restart k0sworker.service") {
 		t.Fatal("k0sworker restarted on the first suspect cycle")
 	}
-	e.h.Cycle(context.Background())
-	if !e.h.State.Exists("kubelet-syncloop-down") {
+	e.H.Cycle(context.Background())
+	if !e.H.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("no latch after ConsecNeeded failed probes")
 	}
-	if !e.sdRan("restart k0sworker.service") {
+	if !e.SDRan("restart k0sworker.service") {
 		t.Fatal("BUG-H4: no k0sworker restart at ConsecNeeded")
 	}
 	// The shared budget file is stamped — the next latch entry
 	// inside 30m skips the restart.
-	if _, err := os.Stat(filepath.Join(e.state, "last-restart")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.StateDir, "last-restart")); err != nil {
 		t.Fatal("last-restart budget not spent")
 	}
 }
@@ -181,19 +182,19 @@ func TestSyncloopDownRestartsK0sWorker(t *testing.T) {
 // dump 100% of the load onto survivors (amplifier).
 func TestSyncloopDownOverloadedSkipsRestart(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.state, "state-node-overloaded"),
-		strconv.FormatInt(e.now.Unix(), 10))
-	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 500
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "state-node-overloaded"),
+		strconv.FormatInt(e.Now.Unix(), 10))
+	e.Status["https://127.0.0.1:10250/healthz/syncloop"] = 500
 	for i := 0; i < 2; i++ {
-		e.h.Cycle(context.Background())
+		e.H.Cycle(context.Background())
 	}
-	if e.sdRan("restart k0sworker.service") {
+	if e.SDRan("restart k0sworker.service") {
 		t.Fatal("restart under node-overloaded")
 	}
-	if e.h.State.Exists("kubelet-syncloop-down") {
+	if e.H.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("latch not suppressed under node-overloaded")
 	}
-	if got := logLines(t, e); !strings.Contains(got, "suppressed-overloaded") {
+	if got := e.LogLines(t); !strings.Contains(got, "suppressed-overloaded") {
 		t.Fatalf("expected a suppressed-overloaded line, got:\n%s", got)
 	}
 }
@@ -202,19 +203,19 @@ func TestSyncloopDownOverloadedSkipsRestart(t *testing.T) {
 // blocks the restart — the latch still fires.
 func TestSyncloopDownRestartCooldown(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.state, "last-restart"),
-		strconv.FormatInt(e.now.Unix(), 10))
-	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 500
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "last-restart"),
+		strconv.FormatInt(e.Now.Unix(), 10))
+	e.Status["https://127.0.0.1:10250/healthz/syncloop"] = 500
 	for i := 0; i < 2; i++ {
-		e.h.Cycle(context.Background())
+		e.H.Cycle(context.Background())
 	}
-	if !e.h.State.Exists("kubelet-syncloop-down") {
+	if !e.H.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("no latch after ConsecNeeded failed probes")
 	}
-	if e.sdRan("restart k0sworker.service") {
+	if e.SDRan("restart k0sworker.service") {
 		t.Fatal("restart inside the 30m cooldown")
 	}
-	if got := logLines(t, e); !strings.Contains(got, "restart cooldown") {
+	if got := e.LogLines(t); !strings.Contains(got, "restart cooldown") {
 		t.Fatalf("expected a cooldown line, got:\n%s", got)
 	}
 }
@@ -224,16 +225,16 @@ func TestSyncloopDownRestartCooldown(t *testing.T) {
 // the socket probe's BUG-H4 remedy.
 func TestContainerdSockDownRestartsK0sWorker(t *testing.T) {
 	e := fixture(t)
-	e.sockErrs[e.h.Cfg.Ctr.Socket] = errors.New("connection refused")
-	e.h.Cycle(context.Background())
-	if e.sdRan("restart k0sworker.service") {
+	e.SockErrs[e.H.Cfg.Ctr.Socket] = errors.New("connection refused")
+	e.H.Cycle(context.Background())
+	if e.SDRan("restart k0sworker.service") {
 		t.Fatal("k0sworker restarted on the first suspect cycle")
 	}
-	e.h.Cycle(context.Background())
-	if !e.h.State.Exists("containerd-sock-down") {
+	e.H.Cycle(context.Background())
+	if !e.H.State.Exists("containerd-sock-down") {
 		t.Fatal("no latch after ConsecNeeded socket failures")
 	}
-	if !e.sdRan("restart k0sworker.service") {
+	if !e.SDRan("restart k0sworker.service") {
 		t.Fatal("BUG-H4: no k0sworker restart at ConsecNeeded")
 	}
 }
@@ -246,10 +247,10 @@ func TestContainerdSockDownRestartsK0sWorker(t *testing.T) {
 // eviction victim.
 func TestCheckDiskBloatPodLogEvicts(t *testing.T) {
 	e := fixture(t)
-	e.diskUsed = 0.95
-	logDir := filepath.Join(e.state, "podlogs")
-	e.h.Cfg.Disk.PodLogsDir = logDir
-	e.h.Cfg.Disk.BloatPodThresholdBytes = 64
+	e.DiskUsed = 0.95
+	logDir := filepath.Join(e.StateDir, "podlogs")
+	e.H.Cfg.Disk.PodLogsDir = logDir
+	e.H.Cfg.Disk.BloatPodThresholdBytes = 64
 	victim := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "logger", Namespace: "app", UID: types.UID("uid-1")},
@@ -259,23 +260,23 @@ func TestCheckDiskBloatPodLogEvicts(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(logDir, "app_logger_uid-1"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, filepath.Join(logDir, "app_logger_uid-1", "0.log"),
+	wdepstest.WriteFile(t, filepath.Join(logDir, "app_logger_uid-1", "0.log"),
 		strings.Repeat("l", 200))
-	if err := os.MkdirAll(filepath.Join(e.kubepods, "uid-1"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(e.KubepodsDir, "uid-1"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	e.h.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
+	e.H.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*victim}, APIOK: true, WorkerActive: true})
 
-	if len(deleteActions(e.cs)) != 1 {
+	if len(wdepstest.DeleteActions(e.CS)) != 1 {
 		t.Fatalf("deletes = %v, want the log-bloating pod",
-			deleteActions(e.cs))
+			wdepstest.DeleteActions(e.CS))
 	}
-	if !e.h.State.Exists("disk-bloat") {
+	if !e.H.State.Exists("disk-bloat") {
 		t.Fatal("disk-bloat latch not set")
 	}
-	if got := logLines(t, e); !strings.Contains(got, "logs") {
+	if got := e.LogLines(t); !strings.Contains(got, "logs") {
 		t.Fatalf("log line must name the pod-logs contributor, got:\n%s", got)
 	}
 }
@@ -286,33 +287,33 @@ func TestCheckDiskBloatPodLogEvicts(t *testing.T) {
 // the pod behind it is the eviction victim.
 func TestCheckDiskBloatSnapshotEvicts(t *testing.T) {
 	e := fixture(t)
-	e.diskUsed = 0.95
-	e.h.Cfg.Disk.BloatPodThresholdBytes = 64
+	e.DiskUsed = 0.95
+	e.H.Cfg.Disk.BloatPodThresholdBytes = 64
 	victim := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "layerhog", Namespace: "app", UID: types.UID(uidA)},
+			Name: "layerhog", Namespace: "app", UID: types.UID(wdepstest.UIDA)},
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	snap := filepath.Join(e.h.Cfg.Disk.K0sDataDir, "containerd",
+	snap := filepath.Join(e.H.Cfg.Disk.K0sDataDir, "containerd",
 		"io.containerd.snapshotter.v1.overlayfs", "snapshots", "snapctr1", "fs")
 	if err := os.MkdirAll(snap, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, filepath.Join(snap, "blob"), strings.Repeat("x", 200))
+	wdepstest.WriteFile(t, filepath.Join(snap, "blob"), strings.Repeat("x", 200))
 	// Task dir config.json carries the pod uid annotation.
-	if err := os.MkdirAll(filepath.Join(e.ctr, "snapctr1"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(e.CtrDir, "snapctr1"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, filepath.Join(e.ctr, "snapctr1", "config.json"),
-		`{"annotations": {"io.kubernetes.pod.uid": "`+uidA+`"}}`)
+	wdepstest.WriteFile(t, filepath.Join(e.CtrDir, "snapctr1", "config.json"),
+		`{"annotations": {"io.kubernetes.pod.uid": "`+wdepstest.UIDA+`"}}`)
 
-	e.h.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
+	e.H.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*victim}, APIOK: true, WorkerActive: true})
 
-	if len(deleteActions(e.cs)) != 1 {
+	if len(wdepstest.DeleteActions(e.CS)) != 1 {
 		t.Fatalf("deletes = %v, want the snapshot-owning pod",
-			deleteActions(e.cs))
+			wdepstest.DeleteActions(e.CS))
 	}
 }
 
@@ -335,37 +336,37 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 	e := fixture(t)
 	pod := calicoPod("calico-node-abc12", "uid-cal")
 	// cali* ifaces so the calico gate opens; felix probe fails.
-	writeFile(t, filepath.Join(e.sysnet, "cali00", "carrier"), "1\n")
-	e.status[e.h.Cfg.Calico.FelixReadyURL] = 500
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cali00", "carrier"), "1\n")
+	e.Status[e.H.Cfg.Calico.FelixReadyURL] = 500
 	pods := []corev1.Pod{*pod}
 
 	for i := 0; i < guards.CalicoFelixRestartFails; i++ {
-		e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+		e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
 			Pods: pods, APIOK: true, WorkerActive: true})
 	}
-	if !e.h.State.Exists("calico-felix-down") {
+	if !e.H.State.Exists("calico-felix-down") {
 		t.Fatal("no calico-felix-down latch")
 	}
-	del := deleteActions(e.cs)
+	del := wdepstest.DeleteActions(e.CS)
 	if len(del) != 1 {
 		t.Fatalf("deletes = %v, want the calico-node pod", del)
 	}
-	if _, err := os.Stat(filepath.Join(e.state, "last-calico-restart")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.StateDir, "last-calico-restart")); err != nil {
 		t.Fatal("last-calico-restart budget not spent")
 	}
 	// Same-pod second attempt inside 30m is cooldown-blocked —
 	// the fake clientset was drained by the delete above, so
 	// assert on the budget log instead: a new pod still failing
 	// gets a cooldown line, not another delete.
-	if _, err := e.cs.CoreV1().Pods("kube-system").Create(
+	if _, err := e.CS.CoreV1().Pods("kube-system").Create(
 		context.Background(), calicoPod("calico-node-def34", "uid-cal2"),
 		metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	pods[0] = *calicoPod("calico-node-def34", "uid-cal2")
-	e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, WorkerActive: true})
-	if got := logLines(t, e); !strings.Contains(got, "pod restart in cooldown") {
+	if got := e.LogLines(t); !strings.Contains(got, "pod restart in cooldown") {
 		t.Fatalf("expected a cooldown line, got:\n%s", got)
 	}
 }
@@ -376,18 +377,18 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 // bounce the datapath pod.
 func TestCheckCalicoFelixLatchBeforeRestart(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.sysnet, "cali00", "carrier"), "1\n")
-	e.status[e.h.Cfg.Calico.FelixReadyURL] = 500
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cali00", "carrier"), "1\n")
+	e.Status[e.H.Cfg.Calico.FelixReadyURL] = 500
 	pods := []corev1.Pod{*calicoPod("calico-node-abc12", "uid-cal")}
 
 	for i := 0; i < 2; i++ {
-		e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+		e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
 			Pods: pods, APIOK: true, WorkerActive: true})
 	}
-	if !e.h.State.Exists("calico-felix-down") {
+	if !e.H.State.Exists("calico-felix-down") {
 		t.Fatal("no latch after ConsecNeeded")
 	}
-	if n := len(deleteActions(e.cs)); n != 0 {
+	if n := len(wdepstest.DeleteActions(e.CS)); n != 0 {
 		t.Fatalf("pod deleted at %dx fails — too early (want >= %d)",
 			2, guards.CalicoFelixRestartFails)
 	}
@@ -398,45 +399,45 @@ func TestCheckCalicoFelixLatchBeforeRestart(t *testing.T) {
 // confirm window is reaped via `ip link delete`.
 func TestCheckCalicoVethGCDeletesOrphan(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.sysnet, "cali99", "carrier"), "0\n")
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cali99", "carrier"), "0\n")
 	// Leak still detected → latch persists: threshold+1 cali*
 	// ifaces over the (empty) pod count, all but cali99 live.
-	for i := 0; i < e.h.Cfg.Calico.OrphanVethThreshold+1; i++ {
-		writeFile(t, filepath.Join(e.sysnet,
+	for i := 0; i < e.H.Cfg.Calico.OrphanVethThreshold+1; i++ {
+		wdepstest.WriteFile(t, filepath.Join(e.SysNet,
 			fmt.Sprintf("cali%02d", i+1), "carrier"), "1\n")
 	}
 	pods := []corev1.Pod{}
-	e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, WorkerActive: true})
-	if e.h.State.Exists("calico-veth-leak") {
+	if e.H.State.Exists("calico-veth-leak") {
 		t.Fatal("leak latch before ConsecNeeded")
 	}
-	e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, WorkerActive: true})
-	if !e.h.State.Exists("calico-veth-leak") {
+	if !e.H.State.Exists("calico-veth-leak") {
 		t.Fatal("leak latch not set")
 	}
-	if e.sdRan("ip link delete cali99") {
+	if e.SDRan("ip link delete cali99") {
 		t.Fatal("orphan deleted on first sight — needs the down-age confirm")
 	}
-	if _, err := os.Stat(filepath.Join(e.state, "veth-seen-cali99")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.StateDir, "veth-seen-cali99")); err != nil {
 		t.Fatal("no veth-seen marker stamped for the down orphan")
 	}
 	// 16m later the marker ages out → the delete runs.
-	e.now = e.now.Add(16 * time.Minute)
-	e.sdReply["ip link delete"] = ""
-	e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+	e.Now = e.Now.Add(16 * time.Minute)
+	e.SDReply["ip link delete"] = ""
+	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, WorkerActive: true})
-	if !e.sdRan("ip link delete cali99") {
+	if !e.SDRan("ip link delete cali99") {
 		t.Fatal("orphan veth not deleted after the down-age window")
 	}
-	if e.sdRan("ip link delete calilive") {
+	if e.SDRan("ip link delete calilive") {
 		t.Fatal("a LIVE veth was deleted")
 	}
-	if _, err := os.Stat(filepath.Join(e.state, "veth-seen-cali99")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(e.StateDir, "veth-seen-cali99")); !os.IsNotExist(err) {
 		t.Fatal("veth-seen marker not cleaned after the delete")
 	}
-	if got := logLines(t, e); !strings.Contains(got, "deleted orphan veth cali99") {
+	if got := e.LogLines(t); !strings.Contains(got, "deleted orphan veth cali99") {
 		t.Fatalf("expected the delete ACTION line, got:\n%s", got)
 	}
 }
@@ -446,14 +447,14 @@ func TestCheckCalicoVethGCDeletesOrphan(t *testing.T) {
 // episode are left alone.
 func TestCheckCalicoVethGCNeedsLeakLatch(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.sysnet, "cali99", "carrier"), "0\n")
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cali99", "carrier"), "0\n")
 	// Few ifaces → no leak → latch never enters → no GC.
-	e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
-	if _, err := os.Stat(filepath.Join(e.state, "veth-seen-cali99")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(e.StateDir, "veth-seen-cali99")); !os.IsNotExist(err) {
 		t.Fatal("veth-seen marker stamped without the leak latch")
 	}
-	if e.sdRan("ip link delete cali99") {
+	if e.SDRan("ip link delete cali99") {
 		t.Fatal("orphan deleted without the leak latch")
 	}
 }
@@ -465,25 +466,25 @@ func TestCheckCalicoVethGCNeedsLeakLatch(t *testing.T) {
 // ratio clears it.
 func TestCheckCiliumBPFMapPressureLatches(t *testing.T) {
 	e := fixture(t)
-	e.h.cilium.CheckBPFMaps(context.Background())
-	if e.h.State.Exists("cilium-bpf-map-pressure") {
+	e.H.cilium.CheckBPFMaps(context.Background())
+	if e.H.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("latch on an empty /v1/map body")
 	}
-	e.unixBody = []byte(`{"maps":[
+	e.UnixBody = []byte(`{"maps":[
 		{"name":"cilium_ct4_global","used":950,"max":1000},
 		{"name":"cilium_lb4_services_v2","used":100,"max":1000}
 	]}`)
-	e.h.cilium.CheckBPFMaps(context.Background())
-	if !e.h.State.Exists("cilium-bpf-map-pressure") {
+	e.H.cilium.CheckBPFMaps(context.Background())
+	if !e.H.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("no latch with cilium_ct4_global at 95%")
 	}
 	// Path-shaped entries (the real /v1/map wire) resolve by
 	// basename.
-	e.unixBody = []byte(`{"maps":[
+	e.UnixBody = []byte(`{"maps":[
 		{"path":"/sys/fs/bpf/cilium/cilium_ct4_global","size":1000,"cache":[]}
 	]}`)
-	e.h.cilium.CheckBPFMaps(context.Background())
-	if e.h.State.Exists("cilium-bpf-map-pressure") {
+	e.H.cilium.CheckBPFMaps(context.Background())
+	if e.H.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("empty cache at 1000 capacity must clear the latch")
 	}
 }
@@ -520,10 +521,10 @@ func TestParseCiliumBPFMapsShapes(t *testing.T) {
 // MemAvailable/MemTotal in kB.
 func writeThrashFiles(t *testing.T, e *env, avg60 float64, availKB, totalKB int) {
 	t.Helper()
-	writeFile(t, filepath.Join(e.proc, "pressure", "memory"), fmt.Sprintf(
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "pressure", "memory"), fmt.Sprintf(
 		"some avg10=1.00 avg60=%.2f avg300=1.00 total=1\nfull avg10=1.00 avg60=%.2f avg300=1.00 total=1\n",
 		avg60, avg60))
-	writeFile(t, filepath.Join(e.proc, "meminfo"), fmt.Sprintf(
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "meminfo"), fmt.Sprintf(
 		"MemTotal: %d kB\nMemFree: %d kB\nMemAvailable: %d kB\n",
 		totalKB, availKB, availKB))
 }
@@ -533,67 +534,67 @@ func writeThrashFiles(t *testing.T, e *env, avg60 float64, availKB, totalKB int)
 // NPD ACTION line and evicts the highest-RSS non-system pod.
 func TestCheckPSIThrashLatchesAndEvicts(t *testing.T) {
 	e := fixture(t)
-	writeThrashFiles(t, e, 30.0, 50000, 1000000)
+	wdepstest.WriteThrashFiles(t, e.Fixture, 30.0, 50000, 1000000)
 	hog := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "memhog", Namespace: "app", UID: types.UID(uidA)},
+			Name: "memhog", Namespace: "app", UID: types.UID(wdepstest.UIDA)},
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 	small := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "tiny", Namespace: "app", UID: types.UID(uidB)},
+			Name: "tiny", Namespace: "app", UID: types.UID(wdepstest.UIDB)},
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 	pods := []corev1.Pod{*hog, *small}
 	// Two pids: 5001 belongs to memhog (big VmRSS), 5002 to tiny.
-	for pid, uid := range map[int]string{5001: uidA, 5002: uidB} {
-		d := filepath.Join(e.proc, strconv.Itoa(pid))
+	for pid, uid := range map[int]string{5001: wdepstest.UIDA, 5002: wdepstest.UIDB} {
+		d := filepath.Join(e.ProcDir, strconv.Itoa(pid))
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		underscored := strings.ReplaceAll(uid, "-", "_")
-		writeFile(t, filepath.Join(d, "cgroup"),
+		wdepstest.WriteFile(t, filepath.Join(d, "cgroup"),
 			"0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+underscored+".slice\n")
 		rss := 100
 		if pid == 5001 {
 			rss = 900000
 		}
-		writeFile(t, filepath.Join(d, "status"),
+		wdepstest.WriteFile(t, filepath.Join(d, "status"),
 			fmt.Sprintf("Name:\tc\nVmRSS:\t%d kB\n", rss))
 	}
-	pids := pidsOf(5001, 5002)
+	pids := wdepstest.PidsOf(5001, 5002)
 
-	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, PidsOnce: pids,
 		WorkerActive: true})
-	if e.h.State.Exists("psi-memory-thrash") {
+	if e.H.State.Exists("psi-memory-thrash") {
 		t.Fatal("latched on the first thrash cycle")
 	}
-	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, PidsOnce: pids,
 		WorkerActive: true})
-	if !e.h.State.Exists("psi-memory-thrash") {
+	if !e.H.State.Exists("psi-memory-thrash") {
 		t.Fatal("no latch after ConsecNeeded thrash cycles")
 	}
-	if got := logLines(t, e); !strings.Contains(got, "ACTION psi-memory-thrash:") {
+	if got := e.LogLines(t); !strings.Contains(got, "ACTION psi-memory-thrash:") {
 		t.Fatalf("the NodeMemoryPSIThrashing Event line missing:\n%s", got)
 	}
-	evs := evictActions(e.cs)
+	evs := wdepstest.EvictActions(e.CS)
 	if len(evs) != 1 || evs[0] != "memhog" {
 		t.Fatalf("evictions = %v, want the highest-RSS pod memhog", evs)
 	}
-	if _, err := os.Stat(filepath.Join(e.state, "last-psi-evict")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.StateDir, "last-psi-evict")); err != nil {
 		t.Fatal("last-psi-evict budget not spent")
 	}
 
 	// Recovery clears the latch.
-	writeThrashFiles(t, e, 5.0, 500000, 1000000)
-	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.WriteThrashFiles(t, e.Fixture, 5.0, 500000, 1000000)
+	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, PidsOnce: pids,
 		WorkerActive: true})
-	if e.h.State.Exists("psi-memory-thrash") {
+	if e.H.State.Exists("psi-memory-thrash") {
 		t.Fatal("latch not cleared after the thrash subsides")
 	}
 }
@@ -604,21 +605,21 @@ func TestCheckPSIThrashLatchesAndEvicts(t *testing.T) {
 func TestCheckPSIThrashNeedsBothSignals(t *testing.T) {
 	e := fixture(t)
 	// Stall high, memory fine.
-	writeThrashFiles(t, e, 40.0, 500000, 1000000)
+	wdepstest.WriteThrashFiles(t, e.Fixture, 40.0, 500000, 1000000)
 	for i := 0; i < 3; i++ {
-		e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
-			APIOK: true, PidsOnce: pidsOf(), WorkerActive: true})
+		e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+			APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
 	}
-	if e.h.State.Exists("psi-memory-thrash") {
+	if e.H.State.Exists("psi-memory-thrash") {
 		t.Fatal("latched on PSI alone — free memory is fine")
 	}
 	// Memory low, no stall.
-	writeThrashFiles(t, e, 3.0, 50000, 1000000)
+	wdepstest.WriteThrashFiles(t, e.Fixture, 3.0, 50000, 1000000)
 	for i := 0; i < 3; i++ {
-		e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
-			APIOK: true, PidsOnce: pidsOf(), WorkerActive: true})
+		e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+			APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
 	}
-	if e.h.State.Exists("psi-memory-thrash") {
+	if e.H.State.Exists("psi-memory-thrash") {
 		t.Fatal("latched on low memory alone — no PSI stall")
 	}
 }
@@ -627,27 +628,27 @@ func TestCheckPSIThrashNeedsBothSignals(t *testing.T) {
 // picks kube-system/node-ops pods even when they hold the most RSS.
 func TestCheckPSIThrashSystemPodsSafe(t *testing.T) {
 	e := fixture(t)
-	writeThrashFiles(t, e, 30.0, 50000, 1000000)
+	wdepstest.WriteThrashFiles(t, e.Fixture, 30.0, 50000, 1000000)
 	syspod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "kube-proxy-x1", Namespace: "kube-system", UID: types.UID(uidA)},
+			Name: "kube-proxy-x1", Namespace: "kube-system", UID: types.UID(wdepstest.UIDA)},
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 	work := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "workload", Namespace: "app", UID: types.UID(uidB)},
+			Name: "workload", Namespace: "app", UID: types.UID(wdepstest.UIDB)},
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 	pods := []corev1.Pod{*syspod, *work}
-	for pid, uid := range map[int]string{5001: uidA, 5002: uidB} {
-		d := filepath.Join(e.proc, strconv.Itoa(pid))
+	for pid, uid := range map[int]string{5001: wdepstest.UIDA, 5002: wdepstest.UIDB} {
+		d := filepath.Join(e.ProcDir, strconv.Itoa(pid))
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		underscored := strings.ReplaceAll(uid, "-", "_")
-		writeFile(t, filepath.Join(d, "cgroup"),
+		wdepstest.WriteFile(t, filepath.Join(d, "cgroup"),
 			"0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+underscored+".slice\n")
 		rss := 900000 // the SYSTEM pod holds the most RSS
 		if pid == 5002 {
@@ -656,15 +657,15 @@ func TestCheckPSIThrashSystemPodsSafe(t *testing.T) {
 			// victim.
 			rss = 600000
 		}
-		writeFile(t, filepath.Join(d, "status"),
+		wdepstest.WriteFile(t, filepath.Join(d, "status"),
 			fmt.Sprintf("Name:\tc\nVmRSS:\t%d kB\n", rss))
 	}
 	for i := 0; i < 2; i++ {
-		e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
-			Pods: pods, APIOK: true, PidsOnce: pidsOf(5001, 5002),
+		e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+			Pods: pods, APIOK: true, PidsOnce: wdepstest.PidsOf(5001, 5002),
 			WorkerActive: true})
 	}
-	evs := evictActions(e.cs)
+	evs := wdepstest.EvictActions(e.CS)
 	if len(evs) != 1 || evs[0] != "workload" {
 		t.Fatalf("evictions = %v, want workload (system pods protected)", evs)
 	}

@@ -1,6 +1,6 @@
 // cilium_ipam_test.go — check 38 cilium-bpf-ipam leak/exhaustion
 // latch + cilium.ParseCiliumIPAM shape coverage.
-package workerhygiene
+package cilium_test
 
 import (
 	"context"
@@ -18,6 +18,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
 // --- check: cilium-bpf-ipam (38) ---
@@ -43,33 +44,33 @@ func runningPod(name, ns, uid string, hostNetwork bool) *corev1.Pod {
 func TestCiliumIPAMLeakedLatch(t *testing.T) {
 	e := fixture(t)
 	// 40 cilium-allocated IPs but only 5 in-use pods → 35 leaked.
-	e.unixBody = []byte(`{"ipam":{"ipv4":{"used":40,"available":100}}}`)
-	latch := filepath.Join(e.state, "state-cilium-ipam-exhausted")
+	e.UnixBody = []byte(`{"ipam":{"ipv4":{"used":40,"available":100}}}`)
+	latch := filepath.Join(e.StateDir, "state-cilium-ipam-exhausted")
 	for i := 0; i < 5; i++ {
 		p := runningPod(fmt.Sprintf("app-%d", i), "default",
 			fmt.Sprintf("uid-%d", i), false)
-		if _, err := e.cs.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		if _, err := e.CS.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	e.h.Cycle(context.Background())
+	e.H.Cycle(context.Background())
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("latch on first suspect cycle")
 	}
-	if !strings.Contains(logLines(t, e), "leaked=35") {
-		t.Fatalf("missing suspect log:\n%s", logLines(t, e))
+	if !strings.Contains(e.LogLines(t), "leaked=35") {
+		t.Fatalf("missing suspect log:\n%s", e.LogLines(t))
 	}
-	e.h.Cycle(context.Background())
+	e.H.Cycle(context.Background())
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatalf("latch missing after %d consecutive cycles: %v", 2, err)
 	}
-	if !strings.Contains(logLines(t, e), "STATE-ENTER: cilium-ipam-exhausted") {
-		t.Fatalf("missing STATE-ENTER log:\n%s", logLines(t, e))
+	if !strings.Contains(e.LogLines(t), "STATE-ENTER: cilium-ipam-exhausted") {
+		t.Fatalf("missing STATE-ENTER log:\n%s", e.LogLines(t))
 	}
-	if got := testutil.ToFloat64(e.h.CiliumAllocated); got != 40 {
+	if got := testutil.ToFloat64(e.H.CiliumAllocated); got != 40 {
 		t.Fatalf("allocated gauge=%v want 40", got)
 	}
-	if got := testutil.ToFloat64(e.h.CiliumLeaked); got != 35 {
+	if got := testutil.ToFloat64(e.H.CiliumLeaked); got != 35 {
 		t.Fatalf("leaked gauge=%v want 35", got)
 	}
 }
@@ -78,48 +79,48 @@ func TestCiliumIPAMAvailableLowLatches(t *testing.T) {
 	e := fixture(t)
 	// Leak-free but the pool is nearly exhausted: available <=2 alone
 	// arms the latch after ConsecNeeded.
-	e.unixBody = []byte(`{"ipam":{"ipv4":{"used":5,"available":2}}}`)
+	e.UnixBody = []byte(`{"ipam":{"ipv4":{"used":5,"available":2}}}`)
 	for i := 0; i < 5; i++ {
 		p := runningPod(fmt.Sprintf("app-%d", i), "default",
 			fmt.Sprintf("uid-%d", i), false)
-		if _, err := e.cs.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		if _, err := e.CS.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	latch := filepath.Join(e.state, "state-cilium-ipam-exhausted")
-	e.h.Cycle(context.Background())
+	latch := filepath.Join(e.StateDir, "state-cilium-ipam-exhausted")
+	e.H.Cycle(context.Background())
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("latch on first suspect cycle")
 	}
-	e.h.Cycle(context.Background())
+	e.H.Cycle(context.Background())
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatalf("latch missing on available<=2: %v", err)
 	}
-	if got := testutil.ToFloat64(e.h.CiliumLeaked); got != 0 {
+	if got := testutil.ToFloat64(e.H.CiliumLeaked); got != 0 {
 		t.Fatalf("leaked gauge=%v want 0", got)
 	}
 }
 
 func TestCiliumIPAMHealthyClearsLatch(t *testing.T) {
 	e := fixture(t)
-	e.unixBody = []byte(`{"ipam":{"ipv4":{"used":40,"available":100}}}`)
-	latch := filepath.Join(e.state, "state-cilium-ipam-exhausted")
-	e.h.Cycle(context.Background())
-	e.h.Cycle(context.Background())
+	e.UnixBody = []byte(`{"ipam":{"ipv4":{"used":40,"available":100}}}`)
+	latch := filepath.Join(e.StateDir, "state-cilium-ipam-exhausted")
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatalf("setup latch missing: %v", err)
 	}
 	// IPs reclaimed — leaked drops under the threshold.
-	e.unixBody = []byte(`{"ipam":{"ipv4":{"used":10,"available":130}}}`)
-	e.h.Cycle(context.Background())
+	e.UnixBody = []byte(`{"ipam":{"ipv4":{"used":10,"available":130}}}`)
+	e.H.Cycle(context.Background())
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("latch kept after IPAM recovered")
 	}
-	if e.h.CiliumIPAMFails != 0 {
-		t.Fatalf("counter=%d want 0 after recovery", e.h.CiliumIPAMFails)
+	if wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM).Fails != 0 {
+		t.Fatalf("counter=%d want 0 after recovery", wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM).Fails)
 	}
-	if !strings.Contains(logLines(t, e), "STATE-EXIT: cilium-ipam-exhausted") {
-		t.Fatalf("missing STATE-EXIT log:\n%s", logLines(t, e))
+	if !strings.Contains(e.LogLines(t), "STATE-EXIT: cilium-ipam-exhausted") {
+		t.Fatalf("missing STATE-EXIT log:\n%s", e.LogLines(t))
 	}
 }
 
@@ -128,49 +129,49 @@ func TestCiliumIPAMHostNetworkExcludedFromInUse(t *testing.T) {
 	// used=32, one normal Running pod, one hostNetwork pod — if
 	// hostNetwork were counted in-use would be 2 → leaked 30 (no
 	// latch); correct exclusion gives leaked=31 >30 → latch.
-	e.unixBody = []byte(`{"ipam":{"ipv4":{"used":32,"available":100}}}`)
+	e.UnixBody = []byte(`{"ipam":{"ipv4":{"used":32,"available":100}}}`)
 	for _, p := range []*corev1.Pod{
-		runningPod("app", "default", uidA, false),
-		runningPod("node-local-dns-x", "kube-system", uidB, true),
+		runningPod("app", "default", wdepstest.UIDA, false),
+		runningPod("node-local-dns-x", "kube-system", wdepstest.UIDB, true),
 	} {
-		if _, err := e.cs.CoreV1().Pods(p.Namespace).Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		if _, err := e.CS.CoreV1().Pods(p.Namespace).Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	latch := filepath.Join(e.state, "state-cilium-ipam-exhausted")
-	e.h.Cycle(context.Background())
-	e.h.Cycle(context.Background())
+	latch := filepath.Join(e.StateDir, "state-cilium-ipam-exhausted")
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatalf("latch missing — hostNetwork pod wrongly counted in-use: %v", err)
 	}
-	if got := testutil.ToFloat64(e.h.CiliumLeaked); got != 31 {
+	if got := testutil.ToFloat64(e.H.CiliumLeaked); got != 31 {
 		t.Fatalf("leaked gauge=%v want 31 (hostNetwork excluded)", got)
 	}
 }
 
 func TestCiliumIPAMInconclusiveKeepsCounter(t *testing.T) {
 	e := fixture(t)
-	e.unixBody = []byte(`{"ipam":{"ipv4":{"used":40,"available":100}}}`)
-	e.h.Cycle(context.Background())
-	if e.h.CiliumIPAMFails != 1 {
-		t.Fatalf("counter=%d want 1", e.h.CiliumIPAMFails)
+	e.UnixBody = []byte(`{"ipam":{"ipv4":{"used":40,"available":100}}}`)
+	e.H.Cycle(context.Background())
+	if wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM).Fails != 1 {
+		t.Fatalf("counter=%d want 1", wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM).Fails)
 	}
 	// Socket fails → inconclusive: counter kept, not reset (same
 	// hysteresis rule as checkCiliumInitStuck).
-	e.unixErr = errors.New("socket dead")
-	e.h.Cycle(context.Background())
-	if e.h.CiliumIPAMFails != 1 {
-		t.Fatalf("counter=%d want 1 (inconclusive keeps)", e.h.CiliumIPAMFails)
+	e.UnixErr = errors.New("socket dead")
+	e.H.Cycle(context.Background())
+	if wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM).Fails != 1 {
+		t.Fatalf("counter=%d want 1 (inconclusive keeps)", wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM).Fails)
 	}
-	if got := e.h.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "abort"); testutil.ToFloat64(got) != 1 {
+	if got := e.H.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "abort"); testutil.ToFloat64(got) != 1 {
 		t.Fatalf("abort=%v want 1", testutil.ToFloat64(got))
 	}
 	// Garbage body → same inconclusive path.
-	e.unixErr = nil
-	e.unixBody = []byte(`{"cilium":{"state":"Ok"}}`)
-	e.h.Cycle(context.Background())
-	if e.h.CiliumIPAMFails != 1 {
-		t.Fatalf("counter=%d want 1 (unparseable keeps)", e.h.CiliumIPAMFails)
+	e.UnixErr = nil
+	e.UnixBody = []byte(`{"cilium":{"state":"Ok"}}`)
+	e.H.Cycle(context.Background())
+	if wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM).Fails != 1 {
+		t.Fatalf("counter=%d want 1 (unparseable keeps)", wdepstest.Check[*cilium.CiliumIPAMCheck](e.H, wdeps.CheckCiliumIPAM).Fails)
 	}
 }
 
@@ -200,14 +201,14 @@ func TestCiliumIPAMUpstreamArrayShape(t *testing.T) {
 	}
 	// Two pool entries with empty owner → available=2.
 	b.WriteString(`,"10.0.0.250":"","10.0.0.251":""}}}`)
-	e.unixBody = []byte(b.String())
-	latch := filepath.Join(e.state, "state-cilium-ipam-exhausted")
-	e.h.Cycle(context.Background())
-	e.h.Cycle(context.Background())
+	e.UnixBody = []byte(b.String())
+	latch := filepath.Join(e.StateDir, "state-cilium-ipam-exhausted")
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatalf("latch missing (leaked=40>30 AND available=2): %v", err)
 	}
-	if got := testutil.ToFloat64(e.h.CiliumAllocated); got != 40 {
+	if got := testutil.ToFloat64(e.H.CiliumAllocated); got != 40 {
 		t.Fatalf("allocated gauge=%v want 40 (array length)", got)
 	}
 }

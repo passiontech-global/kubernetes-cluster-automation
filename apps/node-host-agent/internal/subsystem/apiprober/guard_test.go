@@ -5,10 +5,11 @@ package apiprober
 
 import (
 	"context"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // --- /etc/api-backend-guard.conf (LoadGuardConf) ---

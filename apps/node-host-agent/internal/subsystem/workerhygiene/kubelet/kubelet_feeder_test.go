@@ -1,7 +1,7 @@
 // kubelet_feeder_test.go — T15 systemd-watchdog kubelet feeder:
 // 15s healthz ticks, Gate-0 re-probe, G1-G5 remediate gates,
 // activation flips, and the API backend port defaulting.
-package workerhygiene
+package kubelet_test
 
 import (
 	"context"
@@ -16,6 +16,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/kubelet"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
 // TestWithDefaultAPIPort covers the backend port defaulting — the
@@ -40,7 +41,7 @@ func TestWithDefaultAPIPort(t *testing.T) {
 // feedTicks runs n feeder ticks synchronously (the 15s loop body).
 func feedTicks(e *env, n int) {
 	for i := 0; i < n; i++ {
-		kubelet.KubeletFeedTick(context.Background(), e.h.Deps)
+		e.H.Feeder().Tick(context.Background())
 	}
 }
 
@@ -49,76 +50,76 @@ func TestKubeletFeederFailThenRestart(t *testing.T) {
 	// Happy path: :10248 dead, all gates pass (uptime absent →
 	// fail-open, k0sworker settled, no overload latch, API fallback
 	// livez unconfigured → probe map default nil = alive).
-	e.sdReply["restart k0sworker.service"] = ""
-	e.sdReply["reset-failed k0sworker.service"] = ""
+	e.SDReply["restart k0sworker.service"] = ""
+	e.SDReply["reset-failed k0sworker.service"] = ""
 
 	feedTicks(e, wdeps.DefaultKubeletWdMaxFail-1)
-	if e.h.KubeletWdFails != wdeps.DefaultKubeletWdMaxFail-1 {
-		t.Fatalf("fails=%d want %d", e.h.KubeletWdFails, wdeps.DefaultKubeletWdMaxFail-1)
+	if e.H.Feeder().WdFails != wdeps.DefaultKubeletWdMaxFail-1 {
+		t.Fatalf("fails=%d want %d", e.H.Feeder().WdFails, wdeps.DefaultKubeletWdMaxFail-1)
 	}
-	if e.sdRan("restart k0sworker") {
+	if e.SDRan("restart k0sworker") {
 		t.Fatal("restart before MaxFail consecutive fails")
 	}
 	feedTicks(e, 1) // 4th fail → gates → act
-	if e.h.KubeletWdFails != 0 {
-		t.Fatalf("fails=%d want 0 (re-armed after remediate)", e.h.KubeletWdFails)
+	if e.H.Feeder().WdFails != 0 {
+		t.Fatalf("fails=%d want 0 (re-armed after remediate)", e.H.Feeder().WdFails)
 	}
-	if !e.sdRan("reset-failed k0sworker.service") {
-		t.Fatalf("reset-failed not issued, cmds=%v", e.sdcmds)
+	if !e.SDRan("reset-failed k0sworker.service") {
+		t.Fatalf("reset-failed not issued, cmds=%v", e.SDCmds)
 	}
-	if !e.sdRan("restart k0sworker.service") {
-		t.Fatalf("k0sworker restart not issued, cmds=%v", e.sdcmds)
+	if !e.SDRan("restart k0sworker.service") {
+		t.Fatalf("k0sworker restart not issued, cmds=%v", e.SDCmds)
 	}
-	if _, err := os.Stat(filepath.Join(e.state, "last-restart")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.StateDir, "last-restart")); err != nil {
 		t.Fatal("last-restart budget not spent")
 	}
-	if !strings.Contains(logLines(t, e),
+	if !strings.Contains(e.LogLines(t),
 		"ACTION: restarting k0sworker (reason=systemd-watchdog-kubelet-healthz-60s") {
-		t.Fatalf("missing NPD ACTION contract line:\n%s", logLines(t, e))
+		t.Fatalf("missing NPD ACTION contract line:\n%s", e.LogLines(t))
 	}
 }
 
 func TestKubeletFeederProbeOKResetsFailsAndClearsLatch(t *testing.T) {
 	e := fixture(t)
-	latch := filepath.Join(e.state, "state-kubelet-healthz-down")
-	writeFile(t, latch, "1\n")
+	latch := filepath.Join(e.StateDir, "state-kubelet-healthz-down")
+	wdepstest.WriteFile(t, latch, "1\n")
 	feedTicks(e, 2)
-	if e.h.KubeletWdFails != 2 {
-		t.Fatalf("fails=%d want 2", e.h.KubeletWdFails)
+	if e.H.Feeder().WdFails != 2 {
+		t.Fatalf("fails=%d want 2", e.H.Feeder().WdFails)
 	}
-	e.bodyOK[e.h.Cfg.Kubelet.WdProbeURL] = true
-	kubelet.KubeletFeedTick(context.Background(), e.h.Deps)
-	if e.h.KubeletWdFails != 0 {
-		t.Fatalf("fails=%d want 0 after probe OK", e.h.KubeletWdFails)
+	e.BodyOK[e.H.Cfg.Kubelet.WdProbeURL] = true
+	e.H.Feeder().Tick(context.Background())
+	if e.H.Feeder().WdFails != 0 {
+		t.Fatalf("fails=%d want 0 after probe OK", e.H.Feeder().WdFails)
 	}
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("healthz-down latch kept after probe OK")
 	}
-	if !strings.Contains(logLines(t, e), "STATE-EXIT: kubelet-healthz-down") {
-		t.Fatalf("missing STATE-EXIT log:\n%s", logLines(t, e))
+	if !strings.Contains(e.LogLines(t), "STATE-EXIT: kubelet-healthz-down") {
+		t.Fatalf("missing STATE-EXIT log:\n%s", e.LogLines(t))
 	}
 }
 
 func TestKubeletFeederGateUptime(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.proc, "uptime"), "600.5 0\n") // <1200s
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "uptime"), "600.5 0\n") // <1200s
 	// Gate-0 re-probe runs before every gate: 4 failed ticks + 2
 	// failed re-probes before G1 is even evaluated.
 	var probes int
-	e.h.Cfg.Seams.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
+	e.H.Cfg.Seams.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
 		probes++
 		return false
 	}
 	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
-	if e.sdRan("restart k0sworker") {
+	if e.SDRan("restart k0sworker") {
 		t.Fatal("restart under uptime gate")
 	}
 	if probes != wdeps.DefaultKubeletWdMaxFail+2 {
 		t.Fatalf("probe calls=%d want %d (4 ticks + 2 re-probes)",
 			probes, wdeps.DefaultKubeletWdMaxFail+2)
 	}
-	if !strings.Contains(logLines(t, e), "SKIP(G1-uptime)") {
-		t.Fatalf("missing G1 log:\n%s", logLines(t, e))
+	if !strings.Contains(e.LogLines(t), "SKIP(G1-uptime)") {
+		t.Fatalf("missing G1 log:\n%s", e.LogLines(t))
 	}
 }
 
@@ -126,25 +127,25 @@ func TestKubeletFeederGateSettle(t *testing.T) {
 	e := fixture(t)
 	// k0sworker restarted a minute ago — kubelet may still be initing
 	// (uptimeµs - 60s → age 60s < 180s settle window).
-	e.sdReply["ActiveEnterTimestampMonotonic --value k0sworker.service"] = "7140500000\n"
+	e.SDReply["ActiveEnterTimestampMonotonic --value k0sworker.service"] = "7140500000\n"
 	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
-	if e.sdRan("restart k0sworker") {
+	if e.SDRan("restart k0sworker") {
 		t.Fatal("restart inside the 180s settle window")
 	}
-	if !strings.Contains(logLines(t, e), "SKIP(G2-settle)") {
-		t.Fatalf("missing G2 log:\n%s", logLines(t, e))
+	if !strings.Contains(e.LogLines(t), "SKIP(G2-settle)") {
+		t.Fatalf("missing G2 log:\n%s", e.LogLines(t))
 	}
 }
 
 func TestKubeletFeederGateOverload(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.state, "state-node-overloaded"), "1\n")
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "state-node-overloaded"), "1\n")
 	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
-	if e.sdRan("restart k0sworker") {
+	if e.SDRan("restart k0sworker") {
 		t.Fatal("restart under node-overloaded")
 	}
-	if !strings.Contains(logLines(t, e), "SKIP(G3-overload)") {
-		t.Fatalf("missing G3 log:\n%s", logLines(t, e))
+	if !strings.Contains(e.LogLines(t), "SKIP(G3-overload)") {
+		t.Fatalf("missing G3 log:\n%s", e.LogLines(t))
 	}
 }
 
@@ -152,13 +153,13 @@ func TestKubeletFeederGateAPIServer(t *testing.T) {
 	e := fixture(t)
 	// No backends configured → fallback api-local-lb livez is probed;
 	// dead → node isolated → no restart.
-	e.probes[e.h.Cfg.Kubelet.APIFallbackURL] = errors.New("refused")
+	e.Probes[e.H.Cfg.Kubelet.APIFallbackURL] = errors.New("refused")
 	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
-	if e.sdRan("restart k0sworker") {
+	if e.SDRan("restart k0sworker") {
 		t.Fatal("restart while API unreachable")
 	}
-	if !strings.Contains(logLines(t, e), "SKIP(G4-apiserver)") {
-		t.Fatalf("missing G4 log:\n%s", logLines(t, e))
+	if !strings.Contains(e.LogLines(t), "SKIP(G4-apiserver)") {
+		t.Fatalf("missing G4 log:\n%s", e.LogLines(t))
 	}
 }
 
@@ -169,15 +170,15 @@ func TestKubeletFeederGateAPIServer(t *testing.T) {
 // used to demand 2xx and read a degraded endpoint as "unreachable").
 func TestKubeletFeederGateAPIServerNon200StillLive(t *testing.T) {
 	e := fixture(t)
-	e.status[e.h.Cfg.Kubelet.APIFallbackURL] = 503
-	e.sdReply["restart k0sworker.service"] = ""
-	e.sdReply["reset-failed k0sworker.service"] = ""
+	e.Status[e.H.Cfg.Kubelet.APIFallbackURL] = 503
+	e.SDReply["restart k0sworker.service"] = ""
+	e.SDReply["reset-failed k0sworker.service"] = ""
 	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
-	if strings.Contains(logLines(t, e), "SKIP(G4-apiserver)") {
+	if strings.Contains(e.LogLines(t), "SKIP(G4-apiserver)") {
 		t.Fatalf("G4 skipped on a 503 answer — listener is alive:\n%s",
-			logLines(t, e))
+			e.LogLines(t))
 	}
-	if !e.sdRan("restart k0sworker.service") {
+	if !e.SDRan("restart k0sworker.service") {
 		t.Fatal("remediation blocked although /livez answered 503")
 	}
 }
@@ -187,19 +188,19 @@ func TestKubeletFeederGateAPIServerConfiguredBackends(t *testing.T) {
 	// Configured API_BACKENDS are probed (ports preserved); the
 	// fallback URL must NOT be consulted — kill it and keep one
 	// backend alive.
-	e.h.Cfg.Watchdog = &watchdogconf.Config{
+	e.H.Cfg.Watchdog = &watchdogconf.Config{
 		Disabled: map[string]bool{},
 		APIBackends: []watchdogconf.APIBackend{
 			{Name: "ctrl1", Addr: "10.0.0.9:6443"},
 			{Name: "ctrl2", Addr: "10.0.0.10:6443"},
 		},
 	}
-	e.probes["https://10.0.0.9:6443/livez"] = errors.New("refused")
+	e.Probes["https://10.0.0.9:6443/livez"] = errors.New("refused")
 	// 10.0.0.10 unconfigured → probe map default nil = alive.
-	e.probes[e.h.Cfg.Kubelet.APIFallbackURL] = errors.New("refused")
-	e.sdReply["restart k0sworker.service"] = ""
+	e.Probes[e.H.Cfg.Kubelet.APIFallbackURL] = errors.New("refused")
+	e.SDReply["restart k0sworker.service"] = ""
 	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
-	if !e.sdRan("restart k0sworker.service") {
+	if !e.SDRan("restart k0sworker.service") {
 		t.Fatal("restart blocked although a configured backend is live")
 	}
 }
@@ -207,25 +208,25 @@ func TestKubeletFeederGateAPIServerConfiguredBackends(t *testing.T) {
 func TestKubeletFeederGateRateLimitLatches(t *testing.T) {
 	e := fixture(t)
 	// Budget spent moments ago → G5 skips and escalates via the latch.
-	writeFile(t, filepath.Join(e.state, "last-restart"),
-		fmt.Sprintf("%d\n", e.now.Unix()))
-	latch := filepath.Join(e.state, "state-kubelet-healthz-down")
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "last-restart"),
+		fmt.Sprintf("%d\n", e.Now.Unix()))
+	latch := filepath.Join(e.StateDir, "state-kubelet-healthz-down")
 	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
-	if e.sdRan("restart k0sworker") {
+	if e.SDRan("restart k0sworker") {
 		t.Fatal("restart inside 30m cooldown")
 	}
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatalf("kubelet-healthz-down latch missing (NHC escalation): %v", err)
 	}
-	if !strings.Contains(logLines(t, e), "SKIP(G5-ratelimit)") {
-		t.Fatalf("missing G5 log:\n%s", logLines(t, e))
+	if !strings.Contains(e.LogLines(t), "SKIP(G5-ratelimit)") {
+		t.Fatalf("missing G5 log:\n%s", e.LogLines(t))
 	}
-	if strings.Contains(logLines(t, e), "ACTION: restarting k0sworker") {
+	if strings.Contains(e.LogLines(t), "ACTION: restarting k0sworker") {
 		t.Fatal("ACTION logged inside cooldown")
 	}
 	// A recovered kubelet clears the escalation latch again.
-	e.bodyOK[e.h.Cfg.Kubelet.WdProbeURL] = true
-	kubelet.KubeletFeedTick(context.Background(), e.h.Deps)
+	e.BodyOK[e.H.Cfg.Kubelet.WdProbeURL] = true
+	e.H.Feeder().Tick(context.Background())
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("latch kept after kubelet recovered")
 	}
@@ -237,14 +238,14 @@ func TestKubeletFeederStandsDownWhenWorkerInactive(t *testing.T) {
 	// must not accumulate probe fails toward a restart — and a stale
 	// healthz-down latch must clear too, else NHC→SNR reboots a
 	// deliberately-stopped node.
-	latch := filepath.Join(e.state, "state-kubelet-healthz-down")
-	writeFile(t, latch, "1\n")
-	e.sdReply["systemctl is-active k0sworker.service"] = "inactive\n"
+	latch := filepath.Join(e.StateDir, "state-kubelet-healthz-down")
+	wdepstest.WriteFile(t, latch, "1\n")
+	e.SDReply["systemctl is-active k0sworker.service"] = "inactive\n"
 	feedTicks(e, wdeps.DefaultKubeletWdMaxFail+1)
-	if e.h.KubeletWdFails != 0 {
-		t.Fatalf("fails=%d want 0 while k0sworker inactive", e.h.KubeletWdFails)
+	if e.H.Feeder().WdFails != 0 {
+		t.Fatalf("fails=%d want 0 while k0sworker inactive", e.H.Feeder().WdFails)
 	}
-	if e.sdRan("restart k0sworker") {
+	if e.SDRan("restart k0sworker") {
 		t.Fatal("restart while k0sworker intentionally down")
 	}
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
@@ -254,32 +255,32 @@ func TestKubeletFeederStandsDownWhenWorkerInactive(t *testing.T) {
 
 func TestKubeletFeederActivation(t *testing.T) {
 	e := fixture(t)
-	if !kubelet.KubeletFeederActive(e.h.Deps) {
+	if !e.H.Feeder().Active() {
 		t.Fatal("feeder inactive on a default worker node (unit file present)")
 	}
 	// Off the worker list and no unit file → inactive.
-	if err := os.Remove(e.unit); err != nil {
+	if err := os.Remove(e.UnitFile); err != nil {
 		t.Fatal(err)
 	}
-	if kubelet.KubeletFeederActive(e.h.Deps) {
+	if e.H.Feeder().Active() {
 		t.Fatal("feeder active without unit file and without host listing")
 	}
 	// Listed in systemd_watchdog_hosts → active regardless of the
 	// unit file (the shell install gate).
-	e.h.Cfg.Kubelet.WatchdogHosts = []string{"node-x", "node-a"}
-	if !kubelet.KubeletFeederActive(e.h.Deps) {
+	e.H.Cfg.Kubelet.WatchdogHosts = []string{"node-x", "node-a"}
+	if !e.H.Feeder().Active() {
 		t.Fatal("feeder inactive although node is listed")
 	}
 	// WD_SIG_KUBELET_WATCHDOG=off kills it even when listed.
-	e.h.Cfg.Watchdog = &watchdogconf.Config{
+	e.H.Cfg.Watchdog = &watchdogconf.Config{
 		Disabled: map[string]bool{"kubelet-watchdog": true},
 	}
-	if kubelet.KubeletFeederActive(e.h.Deps) {
+	if e.H.Feeder().Active() {
 		t.Fatal("feeder active with WD_SIG kill switch off")
 	}
-	e.h.Cfg.Watchdog = nil
-	e.h.Cfg.Kubelet.WatchdogHosts = nil
-	if kubelet.KubeletFeederActive(e.h.Deps) {
+	e.H.Cfg.Watchdog = nil
+	e.H.Cfg.Kubelet.WatchdogHosts = nil
+	if e.H.Feeder().Active() {
 		t.Fatal("feeder active without unit file and unlisted")
 	}
 }
@@ -288,7 +289,7 @@ func TestKubeletFeederLoopStopsOnCancel(t *testing.T) {
 	e := fixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { kubelet.RunKubeletFeeder(ctx, e.h.Deps); close(done) }()
+	go func() { e.H.Feeder().Run(ctx); close(done) }()
 	cancel()
 	select {
 	case <-done:
@@ -305,25 +306,25 @@ func TestKubeletRemediateReprobeSelfCorrects(t *testing.T) {
 	// re-probes :10248 twice ~3s apart before any gate. One "ok" —
 	// the streak was a CPU-steal probe timeout — self-corrects: no
 	// gates, no restart, fail streak and latch dropped.
-	latch := filepath.Join(e.state, "state-kubelet-healthz-down")
-	writeFile(t, latch, "1\n") // leftover from an earlier episode
+	latch := filepath.Join(e.StateDir, "state-kubelet-healthz-down")
+	wdepstest.WriteFile(t, latch, "1\n") // leftover from an earlier episode
 	var probes int
-	e.h.Cfg.Seams.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
+	e.H.Cfg.Seams.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
 		probes++
 		return probes > wdeps.DefaultKubeletWdMaxFail // ticks 1..4 fail, re-probe 1 OK
 	}
 	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
-	if e.sdRan("restart k0sworker") {
+	if e.SDRan("restart k0sworker") {
 		t.Fatal("restart despite re-probe self-correct (steal blip kills kubelets)")
 	}
-	if e.h.KubeletWdFails != 0 {
-		t.Fatalf("fails=%d want 0 after re-probe ok", e.h.KubeletWdFails)
+	if e.H.Feeder().WdFails != 0 {
+		t.Fatalf("fails=%d want 0 after re-probe ok", e.H.Feeder().WdFails)
 	}
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("healthz-down latch kept after re-probe ok")
 	}
-	if !strings.Contains(logLines(t, e), "SKIP(G0-reprobe)") {
-		t.Fatalf("missing G0 log:\n%s", logLines(t, e))
+	if !strings.Contains(e.LogLines(t), "SKIP(G0-reprobe)") {
+		t.Fatalf("missing G0 log:\n%s", e.LogLines(t))
 	}
 	// One "ok" exits early — exactly one re-probe call, not two.
 	if probes != wdeps.DefaultKubeletWdMaxFail+1 {
@@ -335,12 +336,12 @@ func TestKubeletRemediateReprobeSecondProbeOK(t *testing.T) {
 	e := fixture(t)
 	// First re-probe fails, second answers — still self-corrects.
 	var probes int
-	e.h.Cfg.Seams.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
+	e.H.Cfg.Seams.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
 		probes++
 		return probes > wdeps.DefaultKubeletWdMaxFail+1
 	}
 	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
-	if e.sdRan("restart k0sworker") {
+	if e.SDRan("restart k0sworker") {
 		t.Fatal("restart although the second re-probe answered")
 	}
 	if probes != wdeps.DefaultKubeletWdMaxFail+2 {
@@ -352,34 +353,34 @@ func TestKubeletFeederReactivationResetsFails(t *testing.T) {
 	e := fixture(t)
 	// No "start" log while the feeder never activates — the goroutine
 	// runs fleet-wide but logs only on an actual activation flip.
-	if strings.Contains(logLines(t, e), "kubelet-feeder: start") {
+	if strings.Contains(e.LogLines(t), "kubelet-feeder: start") {
 		t.Fatal("start log before any tick")
 	}
 	// Two failed ticks while active, then deactivation.
 	feedTicks(e, 2)
-	if e.h.KubeletWdFails != 2 {
-		t.Fatalf("setup fails=%d want 2", e.h.KubeletWdFails)
+	if e.H.Feeder().WdFails != 2 {
+		t.Fatalf("setup fails=%d want 2", e.H.Feeder().WdFails)
 	}
-	if err := os.Remove(e.unit); err != nil {
+	if err := os.Remove(e.UnitFile); err != nil {
 		t.Fatal(err)
 	}
-	kubelet.KubeletFeedTick(context.Background(), e.h.Deps) // inactive tick — fails persist
-	if e.h.KubeletWdFails != 2 {
-		t.Fatalf("fails=%d want 2 kept while inactive", e.h.KubeletWdFails)
+	e.H.Feeder().Tick(context.Background()) // inactive tick — fails persist
+	if e.H.Feeder().WdFails != 2 {
+		t.Fatalf("fails=%d want 2 kept while inactive", e.H.Feeder().WdFails)
 	}
 	// Re-activation (unit file reappears) must drop the stale streak
 	// before it can reach MaxFail — and logs exactly one "start" per
 	// activation (the first active tick + this flip).
-	e.bodyOK[e.h.Cfg.Kubelet.WdProbeURL] = true
-	writeFile(t, e.unit, "[Service]\nExecStart=/usr/bin/k0s worker --node-ip=10.1.2.3\n")
-	kubelet.KubeletFeedTick(context.Background(), e.h.Deps)
-	if e.h.KubeletWdFails != 0 {
-		t.Fatalf("fails=%d want 0 on re-activation", e.h.KubeletWdFails)
+	e.BodyOK[e.H.Cfg.Kubelet.WdProbeURL] = true
+	wdepstest.WriteFile(t, e.UnitFile, "[Service]\nExecStart=/usr/bin/k0s worker --node-ip=10.1.2.3\n")
+	e.H.Feeder().Tick(context.Background())
+	if e.H.Feeder().WdFails != 0 {
+		t.Fatalf("fails=%d want 0 on re-activation", e.H.Feeder().WdFails)
 	}
-	if got := strings.Count(logLines(t, e), "kubelet-feeder: start"); got != 2 {
+	if got := strings.Count(e.LogLines(t), "kubelet-feeder: start"); got != 2 {
 		t.Fatalf("start logs=%d want 2 (one per activation)", got)
 	}
-	if !strings.Contains(logLines(t, e), "dropping 2 stale fails") {
-		t.Fatalf("missing stale-fails log:\n%s", logLines(t, e))
+	if !strings.Contains(e.LogLines(t), "dropping 2 stale fails") {
+		t.Fatalf("missing stale-fails log:\n%s", e.LogLines(t))
 	}
 }

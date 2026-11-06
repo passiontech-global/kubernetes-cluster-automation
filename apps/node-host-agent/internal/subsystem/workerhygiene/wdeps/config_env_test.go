@@ -1,4 +1,4 @@
-package workerhygiene
+package wdeps_test
 
 import (
 	"os"

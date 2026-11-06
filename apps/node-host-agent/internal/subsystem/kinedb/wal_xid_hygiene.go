@@ -204,8 +204,8 @@ func (k *KineDB) hygienePreparedXacts(ctx context.Context, pg, user, pass string
 	h.preparedSeen = true // a successful empty read = no orphans
 	for _, gid := range parseGIDs(out) {
 		h.preparedXacts++
-		if _, rerr := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
-			"ROLLBACK PREPARED %s", sqlQuote(gid))); rerr != nil {
+		if _, rerr := k.psqlQuery(ctx, pg, user, pass,
+			"ROLLBACK PREPARED "+sqlQuote(gid)); rerr != nil {
 			note(fmt.Sprintf("rollback-prepared-%s-fail: %v", gid, rerr))
 			continue
 		}

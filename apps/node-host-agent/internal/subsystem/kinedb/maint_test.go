@@ -3,9 +3,10 @@ package kinedb
 import (
 	"context"
 	"errors"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestDeadTuplePct(t *testing.T) {

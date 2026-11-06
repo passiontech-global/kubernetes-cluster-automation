@@ -4,12 +4,13 @@ package hostmetrics
 
 import (
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // mkFdLink creates a fake /proc/<pid>/fd/<fd> symlink with the

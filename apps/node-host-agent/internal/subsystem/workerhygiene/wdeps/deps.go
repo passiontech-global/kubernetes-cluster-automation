@@ -64,7 +64,7 @@ type Series struct {
 // `d *Deps` and read config/proc/state/metrics through it, never
 // touching the orchestrator. Hygiene embeds *Deps so the same
 // fields also resolve as h.<Field> — the test contract
-// (e.h.StallFails, e.h.CiliumAgentKilled, h.Cfg.Seams re-stubs,
+// (e.h.CiliumAgentKilled, h.<check>.Fails, h.Cfg.Seams re-stubs,
 // h.<series field> reads) keeps compiling.
 //
 // Three ownership classes live here:
@@ -73,10 +73,11 @@ type Series struct {
 //     prometheus vecs: built/registered in New, consumed by checks,
 //     re-stubbed by tests through Cfg.Seams.
 //   - Cross-check shared state — fields more than one check (or a
-//     check plus Cycle orchestration) genuinely shares: the named
-//     streak counters tests poke, KubeletFeederWasActive,
+//     check plus Cycle orchestration) genuinely shares:
 //     TaskMapBuilds, CiliumAgentKilled (cilium family → envoy), and
-//     the OrphanHostPath gauges.
+//     the OrphanHostPath gauges. Per-component streak counters do
+//     NOT live here — each Check (and the kubelet Feeder) owns its
+//     own Fails/WdFails field.
 //   - Textfile series surface — the embedded Series struct: the
 //     node_agent_* values with exactly one writer family (the
 //     runtime-resource guards) and one reader (the Cycle-end
@@ -108,27 +109,10 @@ type Deps struct {
 	// d.<Field> and tests keep reading h.<Field>.
 	Series
 
-	// In-memory consecutive counters — the shell kept these as
-	// consecutive-* files; in-agent state survives between cycles and
-	// an agent restart just re-arms the count (bounded by Interval).
-	// Most streaks live on their Check structs now; the four below
-	// stay shared because pre-Check tests poke them by name
-	// (e.h.StallFails et al. — more than five call sites each, so
-	// keeping the field beats churning the test contract).
-	StallFails      int // kubelet-stall streak (StallCheck)
-	CiliumInitFails int // cilium-init-stuck streak (CiliumInitCheck)
-	CiliumIPAMFails int // cilium-ipam streak (CiliumIPAMCheck)
-	CiliumWGFails   int // cilium_wg0 peer-deficit streak (CiliumWGCheck)
-	// KubeletWdFails is the T15 feeder's consecutive-fail counter —
-	// in-memory like the others (the shell counted within one feeder
-	// process anyway; an agent restart re-arms bounded by the 15s tick).
-	KubeletWdFails int
-	// KubeletFeederWasActive tracks the last tick's activation state
-	// so a false→true flip (node re-added to systemd_watchdog_hosts,
-	// unit file reinstalled, WD_SIG lifted) drops a stale partial
-	// fail-streak instead of counting it toward a restart.
-	KubeletFeederWasActive bool
-	TaskMapBuilds          int // BuildTaskMap invocation count (tests)
+	// TaskMapBuilds counts BuildTaskMap invocations — cross-check by
+	// construction (tasksOnce shares one build per Cycle between the
+	// teardown, stall and dns checks) and a test surface.
+	TaskMapBuilds int
 
 	// CiliumAgentKilled is shared between the cilium check family
 	// and the envoy check: KillCiliumAgent sets it (the agent kill

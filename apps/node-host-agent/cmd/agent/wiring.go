@@ -115,6 +115,20 @@ func subsOf[S agent.Subsystem](s S, err error) ([]agent.Subsystem, error) {
 	return []agent.Subsystem{s}, nil
 }
 
+// std is the shared Build-closure body for the plain descriptors:
+// the EnvDeps → ConfigFromEnv → New → subsOf pipeline each one
+// repeats. deps is the package EnvDeps already spliced with its
+// shared inputs (w.Deps, the lazily-built kube client, a resolved
+// hostname, …); cfgFn/newFn are the package's ConfigFromEnv/New
+// pair. The bespoke descriptors (concourse-cache, hostmetrics,
+// hubsync) keep their own Build bodies.
+func std[D any, C any, S agent.Subsystem](w *wiring, deps D,
+	cfgFn func(D) C,
+	newFn func(C, prometheus.Registerer) (S, error),
+) ([]agent.Subsystem, error) {
+	return subsOf(newFn(cfgFn(deps), w.reg))
+}
+
 // onOff adapts a bool default (the standalone-flipped defKube) to the
 // tri-state flag model.
 func onOff(b bool) envx.Mode {
@@ -136,8 +150,8 @@ func (w *wiring) descriptors() []Descriptor {
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
-				return subsOf(sweeper.New(sweeper.ConfigFromEnv(
-					sweeper.EnvDeps{Client: cs}), w.reg))
+				return std(w, sweeper.EnvDeps{Client: cs},
+					sweeper.ConfigFromEnv, sweeper.New)
 			},
 		},
 		// concourse-cache: native shared-cache pruner.
@@ -182,9 +196,8 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_APIPROBER",
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
-				return subsOf(apiprober.New(apiprober.ConfigFromEnv(apiprober.EnvDeps{
-					Deps: w.Deps,
-				}), w.reg))
+				return std(w, apiprober.EnvDeps{Deps: w.Deps},
+					apiprober.ConfigFromEnv, apiprober.New)
 			},
 		},
 		// hostmetrics: scrape-time collector + latch-ticker
@@ -239,11 +252,8 @@ func (w *wiring) descriptors() []Descriptor {
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true, NodeName: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
-				return subsOf(workerhygiene.New(workerhygiene.ConfigFromEnv(
-					workerhygiene.EnvDeps{
-						Deps:   w.Deps,
-						Client: cs,
-					}), w.reg))
+				return std(w, workerhygiene.EnvDeps{Deps: w.Deps, Client: cs},
+					workerhygiene.ConfigFromEnv, workerhygiene.New)
 			},
 		},
 		// nethealth: DNS/overlay/nebula/fail2ban watchdog modules.
@@ -253,9 +263,8 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_NETHEALTH",
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
-				return subsOf(nethealth.New(nethealth.ConfigFromEnv(nethealth.EnvDeps{
-					Deps: w.Deps,
-				}), w.reg))
+				return std(w, nethealth.EnvDeps{Deps: w.Deps},
+					nethealth.ConfigFromEnv, nethealth.New)
 			},
 		},
 		// janitor: watchdog-state latch reaper + retired-unit sweep.
@@ -269,10 +278,8 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_JANITOR",
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
-				return subsOf(janitor.New(janitor.ConfigFromEnv(
-					janitor.EnvDeps{
-						Deps: w.Deps,
-					}), w.reg))
+				return std(w, janitor.EnvDeps{Deps: w.Deps},
+					janitor.ConfigFromEnv, janitor.New)
 			},
 		},
 		// nodereporter: state latches → NodeConditions/Events.
@@ -284,11 +291,8 @@ func (w *wiring) descriptors() []Descriptor {
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true, NodeName: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
-				return subsOf(nodereporter.New(nodereporter.ConfigFromEnv(
-					nodereporter.EnvDeps{
-						Deps:   w.Deps,
-						Client: cs,
-					}), w.reg))
+				return std(w, nodereporter.EnvDeps{Deps: w.Deps, Client: cs},
+					nodereporter.ConfigFromEnv, nodereporter.New)
 			},
 		},
 		// controllerhygiene: control-plane guards.
@@ -302,10 +306,8 @@ func (w *wiring) descriptors() []Descriptor {
 				return controllerhygiene.ShouldRun(w.HostRoot)
 			},
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
-				return subsOf(controllerhygiene.New(controllerhygiene.ConfigFromEnv(
-					controllerhygiene.EnvDeps{
-						Deps: w.Deps,
-					}), w.reg))
+				return std(w, controllerhygiene.EnvDeps{Deps: w.Deps},
+					controllerhygiene.ConfigFromEnv, controllerhygiene.New)
 			},
 		},
 		// hostconfig: declarative host converger.
@@ -322,10 +324,8 @@ func (w *wiring) descriptors() []Descriptor {
 			},
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
 				hostname, _ := os.Hostname()
-				return subsOf(hostconfig.New(hostconfig.ConfigFromEnv(hostconfig.EnvDeps{
-					Deps:     w.Deps,
-					Hostname: hostname,
-				}), w.reg))
+				return std(w, hostconfig.EnvDeps{Deps: w.Deps, Hostname: hostname},
+					hostconfig.ConfigFromEnv, hostconfig.New)
 			},
 		},
 		// hubsync: SSH converge of standalone targets.
@@ -365,9 +365,8 @@ func (w *wiring) descriptors() []Descriptor {
 				return kinedb.Detect(w.HostRoot, w.VarsDir)
 			},
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
-				return subsOf(kinedb.New(kinedb.ConfigFromEnv(kinedb.EnvDeps{
-					Deps: w.Deps,
-				}), w.reg))
+				return std(w, kinedb.EnvDeps{Deps: w.Deps},
+					kinedb.ConfigFromEnv, kinedb.New)
 			},
 		},
 	}

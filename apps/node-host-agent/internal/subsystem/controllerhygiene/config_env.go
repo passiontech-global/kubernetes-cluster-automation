@@ -15,9 +15,9 @@ import (
 // through to (may be nil, treated as an empty conf), its per-cycle
 // reloader (Config.WatchdogSrc), the shared watchdog state dir/log
 // file, the systemd client, the shared journal-unreadable detector
-// inputs, and the hostPath join — all via field promotion. HostRoot
+// inputs, and the HostPath join — all via field promotion. HostRoot
 // itself is NOT consumed: every host-fs path in the config is
-// hostPath()-derived, and the ShouldRun(hostRoot) enable-gate stays
+// PathJoin()-derived, and the ShouldRun(hostRoot) enable-gate stays
 // in the caller.
 type EnvDeps struct {
 	hostctx.Deps
@@ -33,14 +33,11 @@ type EnvDeps struct {
 // EtcdGuard.MinRun, the W8 CPFreeze/PKIDrift knobs, …) stay zero —
 // New's applyDefaults fills them exactly as before.
 //
-// hostPath — NOT the package defaults — supplies the host-fs paths:
-// defaultKubeconfig & friends hardcode the "/host" prefix and would
-// be wrong on a standalone host (hostRoot "/").
+// d.PathJoin (the nil-safe HostPath join) — NOT the package
+// defaults — supplies the host-fs paths: defaultKubeconfig &
+// friends hardcode the "/host" prefix and would be wrong on a
+// standalone host (hostRoot "/").
 func ConfigFromEnv(d EnvDeps) Config {
-	hostPath := d.HostPath
-	if hostPath == nil {
-		hostPath = func(p string) string { return p }
-	}
 	// wd is the watchdogconf middle layer of the env → conf →
 	// package-default chains; a nil Watchdog dep is an empty conf.
 	var wd watchdogconf.Config
@@ -51,22 +48,22 @@ func ConfigFromEnv(d EnvDeps) Config {
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogLogFile:  d.WatchdogLogFile,
 		WatchdogSrc:      d.WatchdogSrc,
-		// No env knob — hostPath-derived like the Admin* paths.
-		K0sControllerUnitFile: hostPath("/etc/systemd/system/k0scontroller.service"),
+		// No env knob — PathJoin-derived like the Admin* paths.
+		K0sControllerUnitFile: d.PathJoin("/etc/systemd/system/k0scontroller.service"),
 		OOMLoop: OOMLoopConfig{
-			// No env knob — hostPath-derived.
-			CGroupEventsFile: hostPath("/sys/fs/cgroup/system.slice/" +
+			// No env knob — PathJoin-derived.
+			CGroupEventsFile: d.PathJoin("/sys/fs/cgroup/system.slice/" +
 				"k0scontroller.service/memory.events"),
 		},
-		// Admin* + Feeder paths are hostPath()-derived — NOT the
+		// Admin* + Feeder paths are PathJoin()-derived — NOT the
 		// package defaults, which hardcode the "/host" prefix.
-		AdminKubeconfig: hostPath("/var/lib/k0s/pki/admin.conf"),
-		AdminCert:       hostPath("/var/lib/k0s/pki/admin.crt"),
-		AdminKey:        hostPath("/var/lib/k0s/pki/admin.key"),
-		AdminCA:         hostPath("/var/lib/k0s/pki/ca.crt"),
+		AdminKubeconfig: d.PathJoin("/var/lib/k0s/pki/admin.conf"),
+		AdminCert:       d.PathJoin("/var/lib/k0s/pki/admin.crt"),
+		AdminKey:        d.PathJoin("/var/lib/k0s/pki/admin.key"),
+		AdminCA:         d.PathJoin("/var/lib/k0s/pki/ca.crt"),
 		Feeder: FeederConfig{
-			StateDir:          hostPath("/var/lib/k0s-systemd-watchdog"),
-			RemediatePeerFile: hostPath("/etc/default/k0scontroller-watchdog"),
+			StateDir:          d.PathJoin("/var/lib/k0s-systemd-watchdog"),
+			RemediatePeerFile: d.PathJoin("/etc/default/k0scontroller-watchdog"),
 		},
 		JournalDirs:             d.JournalDirs,
 		JournalUnreadableNeeded: d.JournalUnreadableNeeded,
@@ -122,9 +119,9 @@ func ConfigFromEnv(d EnvDeps) Config {
 		{Name: "NOTIFY_SOCKET", Resolve: func(k string) {
 			cfg.Feeder.NotifySocket = os.Getenv(k)
 		}},
-		// hostPath default — NOT defaultK0sDir, which hardcodes "/host".
+		// PathJoin default — NOT defaultK0sDir, which hardcodes "/host".
 		envx.StringKnob("NODE_HOST_AGENT_K0S_DIR", &cfg.K0sDir,
-			hostPath("/var/lib/k0s")),
+			d.PathJoin("/var/lib/k0s")),
 		envx.StringKnob("NODE_HOST_AGENT_ETCD_ENDPOINT", &cfg.EtcdGuard.Endpoint, defaultEtcdEndpoint),
 		envx.Int64Knob("NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT", &cfg.EtcdGuard.DBSizeLimit, 0),
 	})

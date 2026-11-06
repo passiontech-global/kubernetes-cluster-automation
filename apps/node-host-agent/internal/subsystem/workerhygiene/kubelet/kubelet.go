@@ -163,9 +163,13 @@ func restartK0sWorker(d *wdeps.Deps, ctx context.Context) error {
 // spam, phantom pods (pod dirs but zero task records), or a dead
 // :10250 listener. 2 consecutive cycles → latch kubelet-runtime-stall
 // + restart k0sworker through the shared last-restart budget, gated
-// on overload / API reachability / settle. The streak stays on
-// deps (stallFails) — pre-Check tests poke it directly.
-type StallCheck struct{ d *wdeps.Deps }
+// on overload / API reachability / settle. Fails is the consecutive
+// suspect-cycle streak (ex-Deps.StallFails) — tests poke it
+// directly through the named Hygiene field.
+type StallCheck struct {
+	d     *wdeps.Deps
+	Fails int
+}
 
 // Name returns the check label / WD_SIG key.
 func (c *StallCheck) Name() string { return wdeps.CheckStall }
@@ -199,15 +203,15 @@ func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	if reason == "" {
-		c.d.StallFails = 0
+		c.Fails = 0
 		c.d.State.Exit(hoststate.LatchKubeletRuntimeStall, nil)
 		c.d.Cycles.WithLabelValues(wdeps.CheckStall, "ok").Inc()
 		return
 	}
-	c.d.StallFails++
-	if c.d.StallFails < c.d.Cfg.ConsecNeeded {
+	c.Fails++
+	if c.Fails < c.d.Cfg.ConsecNeeded {
 		c.d.State.AppendLog(fmt.Sprintf("suspect: %s (check %d/%d)",
-			reason, c.d.StallFails, c.d.Cfg.ConsecNeeded))
+			reason, c.Fails, c.d.Cfg.ConsecNeeded))
 		c.d.Cycles.WithLabelValues(wdeps.CheckStall, "ok").Inc()
 		return
 	}
@@ -237,8 +241,8 @@ func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// Budget already spent atomically by the rateTrySpend case —
 		// the feeder goroutine competes for the same file.
 		c.d.State.AppendLog(fmt.Sprintf("ACTION: restarting k0sworker - %s (persisted %dx)",
-			reason, c.d.StallFails))
-		c.d.StallFails = 0
+			reason, c.Fails))
+		c.Fails = 0
 		if err := restartK0sWorker(c.d, ctx); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
 		} else {

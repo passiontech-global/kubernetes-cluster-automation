@@ -25,6 +25,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/guards"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
 // --- W9-KR3: kernel slab-leak guard ---
@@ -34,7 +35,7 @@ import (
 // consume.
 func writeMeminfoSlab(t *testing.T, e *env, availKB, totalKB, slabKB int) {
 	t.Helper()
-	writeFile(t, filepath.Join(e.proc, "meminfo"), fmt.Sprintf(
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "meminfo"), fmt.Sprintf(
 		"MemTotal: %d kB\nMemFree: %d kB\nMemAvailable: %d kB\nSUnreclaim: %d kB\n",
 		totalKB, availKB, availKB, slabKB))
 }
@@ -44,7 +45,7 @@ func writeMeminfoSlab(t *testing.T, e *env, availKB, totalKB, slabKB int) {
 func writeThrashFilesSlab(t *testing.T, e *env, avg60 float64,
 	availKB, totalKB, slabKB int) {
 	t.Helper()
-	writeThrashFiles(t, e, avg60, availKB, totalKB)
+	wdepstest.WriteThrashFiles(t, e.Fixture, avg60, availKB, totalKB)
 	writeMeminfoSlab(t, e, availKB, totalKB, slabKB)
 }
 
@@ -52,14 +53,14 @@ func writeThrashFilesSlab(t *testing.T, e *env, avg60 float64,
 // pod uid and whose VmRSS is rssKB — the PSI victim-ranking inputs.
 func procRSSProc(t *testing.T, e *env, pid int, uid string, rssKB int) {
 	t.Helper()
-	d := filepath.Join(e.proc, strconv.Itoa(pid))
+	d := filepath.Join(e.ProcDir, strconv.Itoa(pid))
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	underscored := strings.ReplaceAll(uid, "-", "_")
-	writeFile(t, filepath.Join(d, "cgroup"),
+	wdepstest.WriteFile(t, filepath.Join(d, "cgroup"),
 		"0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+underscored+".slice\n")
-	writeFile(t, filepath.Join(d, "status"),
+	wdepstest.WriteFile(t, filepath.Join(d, "status"),
 		fmt.Sprintf("Name:\tc\nVmRSS:\t%d kB\n", rssKB))
 }
 
@@ -93,12 +94,12 @@ func TestKernelSlabLeakLatchesDropsCachesAndBudgets(t *testing.T) {
 	// 40% unreclaimable slab — above the 0.35 enter ratio. PSI is
 	// absent (psiOK=false) but the guard must still evaluate.
 	writeMeminfoSlab(t, e, 500000, 1000000, 400000)
-	dropCaches := filepath.Join(e.proc, "sys", "vm", "drop_caches")
-	writeFile(t, dropCaches, "")
+	dropCaches := filepath.Join(e.ProcDir, "sys", "vm", "drop_caches")
+	wdepstest.WriteFile(t, dropCaches, "")
 
-	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
-		APIOK: true, PidsOnce: pidsOf(), WorkerActive: true})
-	if !e.h.State.Exists("kernel-slab-leak") {
+	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if !e.H.State.Exists("kernel-slab-leak") {
 		t.Fatal("no kernel-slab-leak latch at 40% SUnreclaim")
 	}
 	data, err := os.ReadFile(dropCaches)
@@ -108,41 +109,41 @@ func TestKernelSlabLeakLatchesDropsCachesAndBudgets(t *testing.T) {
 	if strings.TrimSpace(string(data)) != "2" {
 		t.Fatalf("drop_caches = %q, want \"2\"", string(data))
 	}
-	logs := logLines(t, e)
+	logs := e.LogLines(t)
 	if !strings.Contains(logs, "ACTION kernel-slab-leak: sunreclaim_ratio=") {
 		t.Fatalf("missing latch-entry ACTION line:\n%s", logs)
 	}
 	if n := strings.Count(logs, "wrote 2 to sys/vm/drop_caches"); n != 1 {
 		t.Fatalf("drop_caches writes = %d, want 1", n)
 	}
-	if _, err := os.Stat(filepath.Join(e.state, "last-slab-drop-caches")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.StateDir, "last-slab-drop-caches")); err != nil {
 		t.Fatal("last-slab-drop-caches budget not spent")
 	}
 
 	// Same-hour re-entry: the budget blocks a second write.
-	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
-		APIOK: true, PidsOnce: pidsOf(), WorkerActive: true})
-	if n := strings.Count(logLines(t, e), "wrote 2 to sys/vm/drop_caches"); n != 1 {
+	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if n := strings.Count(e.LogLines(t), "wrote 2 to sys/vm/drop_caches"); n != 1 {
 		t.Fatalf("drop_caches writes inside the hour = %d, want 1", n)
 	}
 	// The latch mtime is refreshed while held (janitor-safe).
-	if !e.h.State.Exists("kernel-slab-leak") {
+	if !e.H.State.Exists("kernel-slab-leak") {
 		t.Fatal("latch dropped while still leaking")
 	}
 
 	// Past the 1h budget the write resumes.
-	e.now = e.now.Add(61 * time.Minute)
-	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
-		APIOK: true, PidsOnce: pidsOf(), WorkerActive: true})
-	if n := strings.Count(logLines(t, e), "wrote 2 to sys/vm/drop_caches"); n != 2 {
+	e.Now = e.Now.Add(61 * time.Minute)
+	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if n := strings.Count(e.LogLines(t), "wrote 2 to sys/vm/drop_caches"); n != 2 {
 		t.Fatalf("drop_caches writes past the budget = %d, want 2", n)
 	}
 
 	// Below the 0.25 clear ratio the latch exits.
 	writeMeminfoSlab(t, e, 500000, 1000000, 200000)
-	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
-		APIOK: true, PidsOnce: pidsOf(), WorkerActive: true})
-	if e.h.State.Exists("kernel-slab-leak") {
+	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if e.H.State.Exists("kernel-slab-leak") {
 		t.Fatal("kernel-slab-leak latch not cleared at 20% SUnreclaim")
 	}
 }
@@ -152,29 +153,29 @@ func TestKernelSlabLeakLatchesDropsCachesAndBudgets(t *testing.T) {
 // hovering near a threshold.
 func TestKernelSlabLeakHysteresis(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.proc, "sys", "vm", "drop_caches"), "")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "sys", "vm", "drop_caches"), "")
 
 	// 0.30 is inside the band but was never entered → no latch.
 	writeMeminfoSlab(t, e, 500000, 1000000, 300000)
-	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
-		APIOK: true, PidsOnce: pidsOf(), WorkerActive: true})
-	if e.h.State.Exists("kernel-slab-leak") {
+	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if e.H.State.Exists("kernel-slab-leak") {
 		t.Fatal("latch entered at 0.30 without crossing 0.35")
 	}
 
 	// Cross 0.35 → latch.
 	writeMeminfoSlab(t, e, 500000, 1000000, 400000)
-	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
-		APIOK: true, PidsOnce: pidsOf(), WorkerActive: true})
-	if !e.h.State.Exists("kernel-slab-leak") {
+	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if !e.H.State.Exists("kernel-slab-leak") {
 		t.Fatal("no latch at 0.40")
 	}
 
 	// Back into the band → still latched.
 	writeMeminfoSlab(t, e, 500000, 1000000, 300000)
-	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
-		APIOK: true, PidsOnce: pidsOf(), WorkerActive: true})
-	if !e.h.State.Exists("kernel-slab-leak") {
+	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if !e.H.State.Exists("kernel-slab-leak") {
 		t.Fatal("latch cleared inside the hysteresis band")
 	}
 }
@@ -186,36 +187,36 @@ func TestKernelSlabLeakHysteresis(t *testing.T) {
 func TestPSIThrashEvictSuppressedBySlabLeak(t *testing.T) {
 	e := fixture(t)
 	writeThrashFilesSlab(t, e, 30.0, 50000, 1000000, 400000)
-	hog := psiPod("memhog", "app", uidA)
+	hog := psiPod("memhog", "app", wdepstest.UIDA)
 	pods := []corev1.Pod{*hog}
-	procRSSProc(t, e, 5001, uidA, 900000)
-	pids := pidsOf(5001)
+	procRSSProc(t, e, 5001, wdepstest.UIDA, 900000)
+	pids := wdepstest.PidsOf(5001)
 
 	for i := 0; i < 2; i++ {
-		e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
 			Pods: pods, APIOK: true, PidsOnce: pids,
 			WorkerActive: true})
 	}
-	if !e.h.State.Exists("psi-memory-thrash") {
+	if !e.H.State.Exists("psi-memory-thrash") {
 		t.Fatal("no psi-memory-thrash latch")
 	}
-	if !e.h.State.Exists("kernel-slab-leak") {
+	if !e.H.State.Exists("kernel-slab-leak") {
 		t.Fatal("no kernel-slab-leak latch")
 	}
-	if n := len(evictActions(e.cs)); n != 0 {
-		t.Fatalf("evictions while slab-leaking = %v, want none", evictActions(e.cs))
+	if n := len(wdepstest.EvictActions(e.CS)); n != 0 {
+		t.Fatalf("evictions while slab-leaking = %v, want none", wdepstest.EvictActions(e.CS))
 	}
-	if got := logLines(t, e); !strings.Contains(got,
+	if got := e.LogLines(t); !strings.Contains(got,
 		"pod evict suppressed - kernel-slab-leak latched") {
 		t.Fatalf("missing suppression line:\n%s", got)
 	}
 
 	// Slab recovers → the evictor resumes on the next thrash cycle.
 	writeThrashFilesSlab(t, e, 30.0, 50000, 1000000, 100000)
-	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, PidsOnce: pids,
 		WorkerActive: true})
-	evs := evictActions(e.cs)
+	evs := wdepstest.EvictActions(e.CS)
 	if len(evs) != 1 || evs[0] != "memhog" {
 		t.Fatalf("evictions after slab recovery = %v, want memhog", evs)
 	}
@@ -233,8 +234,8 @@ func thrashEnv(t *testing.T, e *env) {
 // eviction path fire.
 func drivePSI(t *testing.T, e *env, pods []corev1.Pod, pids func() []int) {
 	t.Helper()
-	for i := 0; i < e.h.Cfg.ConsecNeeded; i++ {
-		e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+	for i := 0; i < e.H.Cfg.ConsecNeeded; i++ {
+		e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
 			Pods: pods, APIOK: true, PidsOnce: pids,
 			WorkerActive: true})
 	}
@@ -246,22 +247,22 @@ func drivePSI(t *testing.T, e *env, pods []corev1.Pod, pids func() []int) {
 func TestPSIEvictorRSSFloor(t *testing.T) {
 	e := fixture(t)
 	thrashEnv(t, e)
-	pods := []corev1.Pod{*psiPod("small", "app", uidA)}
-	procRSSProc(t, e, 5001, uidA, 500000) // ~488 MiB < 512 MiB floor
-	drivePSI(t, e, pods, pidsOf(5001))
-	if !e.h.State.Exists("psi-memory-thrash") {
+	pods := []corev1.Pod{*psiPod("small", "app", wdepstest.UIDA)}
+	procRSSProc(t, e, 5001, wdepstest.UIDA, 500000) // ~488 MiB < 512 MiB floor
+	drivePSI(t, e, pods, wdepstest.PidsOf(5001))
+	if !e.H.State.Exists("psi-memory-thrash") {
 		t.Fatal("no psi-memory-thrash latch")
 	}
-	if n := len(evictActions(e.cs)); n != 0 {
-		t.Fatalf("evictions below the RSS floor = %v", evictActions(e.cs))
+	if n := len(wdepstest.EvictActions(e.CS)); n != 0 {
+		t.Fatalf("evictions below the RSS floor = %v", wdepstest.EvictActions(e.CS))
 	}
 	// Exactly at the floor still counts.
 	e2 := fixture(t)
 	thrashEnv(t, e2)
-	pods2 := []corev1.Pod{*psiPod("edge", "app", uidA)}
-	procRSSProc(t, e2, 5001, uidA, guards.MinEvictRSSBytes/1024+1)
-	drivePSI(t, e2, pods2, pidsOf(5001))
-	if evs := evictActions(e2.cs); len(evs) != 1 || evs[0] != "edge" {
+	pods2 := []corev1.Pod{*psiPod("edge", "app", wdepstest.UIDA)}
+	procRSSProc(t, e2, 5001, wdepstest.UIDA, guards.MinEvictRSSBytes/1024+1)
+	drivePSI(t, e2, pods2, wdepstest.PidsOf(5001))
+	if evs := wdepstest.EvictActions(e2.CS); len(evs) != 1 || evs[0] != "edge" {
 		t.Fatalf("evictions at the RSS floor = %v, want edge", evs)
 	}
 }
@@ -272,15 +273,15 @@ func TestPSIEvictorExcludedNamespaces(t *testing.T) {
 	e := fixture(t)
 	thrashEnv(t, e)
 	pods := []corev1.Pod{
-		*psiPod("csi-provisioner", "openebs", uidA),
-		*psiPod("gotk-controller", "flux-system", uidB),
-		*psiPod("workload", "app", uidC),
+		*psiPod("csi-provisioner", "openebs", wdepstest.UIDA),
+		*psiPod("gotk-controller", "flux-system", wdepstest.UIDB),
+		*psiPod("workload", "app", wdepstest.UIDC),
 	}
-	procRSSProc(t, e, 5001, uidA, 900000)
-	procRSSProc(t, e, 5002, uidB, 800000)
-	procRSSProc(t, e, 5003, uidC, 600000)
-	drivePSI(t, e, pods, pidsOf(5001, 5002, 5003))
-	evs := evictActions(e.cs)
+	procRSSProc(t, e, 5001, wdepstest.UIDA, 900000)
+	procRSSProc(t, e, 5002, wdepstest.UIDB, 800000)
+	procRSSProc(t, e, 5003, wdepstest.UIDC, 600000)
+	drivePSI(t, e, pods, wdepstest.PidsOf(5001, 5002, 5003))
+	evs := wdepstest.EvictActions(e.CS)
 	if len(evs) != 1 || evs[0] != "workload" {
 		t.Fatalf("evictions = %v, want only workload", evs)
 	}
@@ -293,17 +294,17 @@ func TestPSIEvictorOnlyProtectedPods(t *testing.T) {
 	e := fixture(t)
 	thrashEnv(t, e)
 	pods := []corev1.Pod{
-		*psiPod("openebs-csi", "openebs", uidA),
-		*psiPod("cert-manager", "cert-manager", uidB),
+		*psiPod("openebs-csi", "openebs", wdepstest.UIDA),
+		*psiPod("cert-manager", "cert-manager", wdepstest.UIDB),
 	}
-	procRSSProc(t, e, 5001, uidA, 900000)
-	procRSSProc(t, e, 5002, uidB, 800000)
-	drivePSI(t, e, pods, pidsOf(5001, 5002))
-	if !e.h.State.Exists("psi-memory-thrash") {
+	procRSSProc(t, e, 5001, wdepstest.UIDA, 900000)
+	procRSSProc(t, e, 5002, wdepstest.UIDB, 800000)
+	drivePSI(t, e, pods, wdepstest.PidsOf(5001, 5002))
+	if !e.H.State.Exists("psi-memory-thrash") {
 		t.Fatal("no psi-memory-thrash latch")
 	}
-	if n := len(evictActions(e.cs)); n != 0 {
-		t.Fatalf("evictions with only protected pods = %v", evictActions(e.cs))
+	if n := len(wdepstest.EvictActions(e.CS)); n != 0 {
+		t.Fatalf("evictions with only protected pods = %v", wdepstest.EvictActions(e.CS))
 	}
 }
 
@@ -312,13 +313,13 @@ func TestPSIEvictorOnlyProtectedPods(t *testing.T) {
 func TestPSIEvictorCriticalPriorityClass(t *testing.T) {
 	e := fixture(t)
 	thrashEnv(t, e)
-	crit := psiPod("apiserver-sidecar", "app", uidA)
+	crit := psiPod("apiserver-sidecar", "app", wdepstest.UIDA)
 	crit.Spec.PriorityClassName = "system-cluster-critical"
 	pods := []corev1.Pod{*crit}
-	procRSSProc(t, e, 5001, uidA, 900000)
-	drivePSI(t, e, pods, pidsOf(5001))
-	if n := len(evictActions(e.cs)); n != 0 {
-		t.Fatalf("evictions of a critical-priority pod = %v", evictActions(e.cs))
+	procRSSProc(t, e, 5001, wdepstest.UIDA, 900000)
+	drivePSI(t, e, pods, wdepstest.PidsOf(5001))
+	if n := len(wdepstest.EvictActions(e.CS)); n != 0 {
+		t.Fatalf("evictions of a critical-priority pod = %v", wdepstest.EvictActions(e.CS))
 	}
 }
 
@@ -327,11 +328,11 @@ func TestPSIEvictorCriticalPriorityClass(t *testing.T) {
 func TestPSIEvictorTerminating(t *testing.T) {
 	e := fixture(t)
 	thrashEnv(t, e)
-	pods := []corev1.Pod{*terminatingPod(e, "dying", "app", uidA, time.Minute)}
-	procRSSProc(t, e, 5001, uidA, 900000)
-	drivePSI(t, e, pods, pidsOf(5001))
-	if n := len(evictActions(e.cs)); n != 0 {
-		t.Fatalf("evictions of a terminating pod = %v", evictActions(e.cs))
+	pods := []corev1.Pod{*e.TerminatingPod("dying", "app", wdepstest.UIDA, time.Minute)}
+	procRSSProc(t, e, 5001, wdepstest.UIDA, 900000)
+	drivePSI(t, e, pods, wdepstest.PidsOf(5001))
+	if n := len(wdepstest.EvictActions(e.CS)); n != 0 {
+		t.Fatalf("evictions of a terminating pod = %v", wdepstest.EvictActions(e.CS))
 	}
 }
 
@@ -341,15 +342,15 @@ func TestPSIEvictorTerminating(t *testing.T) {
 func TestPSIEvictorQoSTiering(t *testing.T) {
 	e := fixture(t)
 	thrashEnv(t, e)
-	guaranteed := psiPod("guaranteed", "app", uidA)
+	guaranteed := psiPod("guaranteed", "app", wdepstest.UIDA)
 	guaranteed.Status.QOSClass = corev1.PodQOSGuaranteed
-	burstable := psiPod("burstable", "app", uidB)
+	burstable := psiPod("burstable", "app", wdepstest.UIDB)
 	burstable.Status.QOSClass = corev1.PodQOSBurstable
 	pods := []corev1.Pod{*guaranteed, *burstable}
-	procRSSProc(t, e, 5001, uidA, 900000) // Guaranteed holds more
-	procRSSProc(t, e, 5002, uidB, 600000)
-	drivePSI(t, e, pods, pidsOf(5001, 5002))
-	evs := evictActions(e.cs)
+	procRSSProc(t, e, 5001, wdepstest.UIDA, 900000) // Guaranteed holds more
+	procRSSProc(t, e, 5002, wdepstest.UIDB, 600000)
+	drivePSI(t, e, pods, wdepstest.PidsOf(5001, 5002))
+	evs := wdepstest.EvictActions(e.CS)
 	if len(evs) != 1 || evs[0] != "burstable" {
 		t.Fatalf("evictions = %v, want the Burstable pod (QoS tiering)", evs)
 	}
@@ -361,12 +362,12 @@ func TestPSIEvictorQoSTiering(t *testing.T) {
 func TestPSIEvictorGuaranteedFallback(t *testing.T) {
 	e := fixture(t)
 	thrashEnv(t, e)
-	guaranteed := psiPod("guaranteed", "app", uidA)
+	guaranteed := psiPod("guaranteed", "app", wdepstest.UIDA)
 	guaranteed.Status.QOSClass = corev1.PodQOSGuaranteed
 	pods := []corev1.Pod{*guaranteed}
-	procRSSProc(t, e, 5001, uidA, 900000)
-	drivePSI(t, e, pods, pidsOf(5001))
-	if evs := evictActions(e.cs); len(evs) != 1 || evs[0] != "guaranteed" {
+	procRSSProc(t, e, 5001, wdepstest.UIDA, 900000)
+	drivePSI(t, e, pods, wdepstest.PidsOf(5001))
+	if evs := wdepstest.EvictActions(e.CS); len(evs) != 1 || evs[0] != "guaranteed" {
 		t.Fatalf("evictions = %v, want the Guaranteed fallback victim", evs)
 	}
 }
@@ -378,16 +379,16 @@ func TestPSIEvictorGuaranteedFallback(t *testing.T) {
 func TestPSIEvictorStatefulSetDBQuorum(t *testing.T) {
 	e := fixture(t)
 	thrashEnv(t, e)
-	db := statefulOwner(psiPod("scylla-0", "scylla", uidA), "scylla")
+	db := statefulOwner(psiPod("scylla-0", "scylla", wdepstest.UIDA), "scylla")
 	db.Labels = map[string]string{"app.kubernetes.io/name": "scylla"}
-	plain := statefulOwner(psiPod("cache-0", "app", uidB), "cache")
-	burstable := psiPod("workload", "app", uidC)
+	plain := statefulOwner(psiPod("cache-0", "app", wdepstest.UIDB), "cache")
+	burstable := psiPod("workload", "app", wdepstest.UIDC)
 	pods := []corev1.Pod{*db, *plain, *burstable}
-	procRSSProc(t, e, 5001, uidA, 950000) // DB pod holds the most
-	procRSSProc(t, e, 5002, uidB, 800000) // StatefulSet non-DB
-	procRSSProc(t, e, 5003, uidC, 600000)
-	drivePSI(t, e, pods, pidsOf(5001, 5002, 5003))
-	evs := evictActions(e.cs)
+	procRSSProc(t, e, 5001, wdepstest.UIDA, 950000) // DB pod holds the most
+	procRSSProc(t, e, 5002, wdepstest.UIDB, 800000) // StatefulSet non-DB
+	procRSSProc(t, e, 5003, wdepstest.UIDC, 600000)
+	drivePSI(t, e, pods, wdepstest.PidsOf(5001, 5002, 5003))
+	evs := wdepstest.EvictActions(e.CS)
 	if len(evs) != 1 || evs[0] != "workload" {
 		t.Fatalf("evictions = %v, want workload (db-quorum + sts protected)", evs)
 	}
@@ -396,14 +397,14 @@ func TestPSIEvictorStatefulSetDBQuorum(t *testing.T) {
 	// the fallback victim — the DB pod still never competes.
 	e2 := fixture(t)
 	thrashEnv(t, e2)
-	db2 := statefulOwner(psiPod("scylla-0", "scylla", uidA), "scylla")
+	db2 := statefulOwner(psiPod("scylla-0", "scylla", wdepstest.UIDA), "scylla")
 	db2.Labels = map[string]string{"app.kubernetes.io/name": "scylla"}
-	plain2 := statefulOwner(psiPod("cache-0", "app", uidB), "cache")
+	plain2 := statefulOwner(psiPod("cache-0", "app", wdepstest.UIDB), "cache")
 	pods2 := []corev1.Pod{*db2, *plain2}
-	procRSSProc(t, e2, 5001, uidA, 950000)
-	procRSSProc(t, e2, 5002, uidB, 800000)
-	drivePSI(t, e2, pods2, pidsOf(5001, 5002))
-	if evs := evictActions(e2.cs); len(evs) != 1 || evs[0] != "cache-0" {
+	procRSSProc(t, e2, 5001, wdepstest.UIDA, 950000)
+	procRSSProc(t, e2, 5002, wdepstest.UIDB, 800000)
+	drivePSI(t, e2, pods2, wdepstest.PidsOf(5001, 5002))
+	if evs := wdepstest.EvictActions(e2.CS); len(evs) != 1 || evs[0] != "cache-0" {
 		t.Fatalf("fallback evictions = %v, want cache-0 (db pod excluded)", evs)
 	}
 }
@@ -415,14 +416,14 @@ func TestPSIEvictorStatefulSetDBQuorum(t *testing.T) {
 func TestPSIEvictorDBLabelWithoutStatefulSet(t *testing.T) {
 	e := fixture(t)
 	thrashEnv(t, e)
-	labeled := psiPod("pg-0", "app", uidA)
+	labeled := psiPod("pg-0", "app", wdepstest.UIDA)
 	// carriesDBQuorumLabel WOULD match this — the missing piece is
 	// the StatefulSet owner.
 	labeled.Labels = map[string]string{"app": "postgresql"}
 	pods := []corev1.Pod{*labeled}
-	procRSSProc(t, e, 5001, uidA, 900000)
-	drivePSI(t, e, pods, pidsOf(5001))
-	if evs := evictActions(e.cs); len(evs) != 1 || evs[0] != "pg-0" {
+	procRSSProc(t, e, 5001, wdepstest.UIDA, 900000)
+	drivePSI(t, e, pods, wdepstest.PidsOf(5001))
+	if evs := wdepstest.EvictActions(e.CS); len(evs) != 1 || evs[0] != "pg-0" {
 		t.Fatalf("evictions = %v, want pg-0 (label alone does not exempt)", evs)
 	}
 }
@@ -433,19 +434,19 @@ func TestPSIEvictorDBLabelWithoutStatefulSet(t *testing.T) {
 func TestPSIEvictorEvictionAPIError(t *testing.T) {
 	e := fixture(t)
 	thrashEnv(t, e)
-	e.cs.PrependReactor("create", "pods",
+	e.CS.PrependReactor("create", "pods",
 		func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("pods \"memhog\" is forbidden by pdb")
 		})
-	pods := []corev1.Pod{*psiPod("memhog", "app", uidA)}
-	procRSSProc(t, e, 5001, uidA, 900000)
-	drivePSI(t, e, pods, pidsOf(5001))
-	if got := logLines(t, e); !strings.Contains(got,
+	pods := []corev1.Pod{*psiPod("memhog", "app", wdepstest.UIDA)}
+	procRSSProc(t, e, 5001, wdepstest.UIDA, 900000)
+	drivePSI(t, e, pods, wdepstest.PidsOf(5001))
+	if got := e.LogLines(t); !strings.Contains(got,
 		"evict app/memhog failed") {
 		t.Fatalf("missing eviction-failure suspect line:\n%s", got)
 	}
 	if got := testutil.ToFloat64(
-		e.h.Actions.WithLabelValues(wdeps.CheckPSIThrash, "pod_evict")); got != 0 {
+		e.H.Actions.WithLabelValues(wdeps.CheckPSIThrash, "pod_evict")); got != 0 {
 		t.Fatalf("pod_evict actions = %v, want 0 on API error", got)
 	}
 }
@@ -457,11 +458,11 @@ func TestPSIEvictorEvictionAPIError(t *testing.T) {
 // live-process inode test).
 func netnsFixture(t *testing.T, e *env) string {
 	t.Helper()
-	dir := filepath.Join(e.proc, "netns")
+	dir := filepath.Join(e.ProcDir, "netns")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	e.h.Cfg.Net.NetnsDir = dir
+	e.H.Cfg.Net.NetnsDir = dir
 	return dir
 }
 
@@ -472,17 +473,17 @@ func TestOrphanCNINetnsConfirmedThenReaped(t *testing.T) {
 	e := fixture(t)
 	dir := netnsFixture(t, e)
 	orphan := filepath.Join(dir, "cni-deadbeef")
-	writeFile(t, orphan, "")
+	wdepstest.WriteFile(t, orphan, "")
 	// A non-cni file must never be touched.
-	writeFile(t, filepath.Join(dir, "keepme"), "")
-	e.sdReply["umount"] = ""
+	wdepstest.WriteFile(t, filepath.Join(dir, "keepme"), "")
+	e.SDReply["umount"] = ""
 
-	e.h.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
-		PidsOnce: pidsOf(), WorkerActive: true})
-	if _, err := os.Stat(filepath.Join(e.state, "cni-netns-seen-cni-deadbeef")); err != nil {
+	e.H.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if _, err := os.Stat(filepath.Join(e.StateDir, "cni-netns-seen-cni-deadbeef")); err != nil {
 		t.Fatal("no confirmation marker on first sight")
 	}
-	if e.sdRan("umount") {
+	if e.SDRan("umount") {
 		t.Fatal("umount ran before the confirmation window")
 	}
 	if _, err := os.Stat(orphan); err != nil {
@@ -490,30 +491,30 @@ func TestOrphanCNINetnsConfirmedThenReaped(t *testing.T) {
 	}
 
 	// Inside the window: still no reap.
-	e.now = e.now.Add(15 * time.Minute)
-	e.h.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
-		PidsOnce: pidsOf(), WorkerActive: true})
-	if e.sdRan("umount") {
+	e.Now = e.Now.Add(15 * time.Minute)
+	e.H.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if e.SDRan("umount") {
 		t.Fatal("umount inside the 30m window")
 	}
 
 	// Past the window: lazy umount + file removal + marker cleanup.
-	e.now = e.now.Add(16 * time.Minute)
-	e.h.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
-		PidsOnce: pidsOf(), WorkerActive: true})
-	if !e.sdRan("umount -l /run/netns/cni-deadbeef") {
-		t.Fatalf("no lazy umount of the orphan; sdcmds=%v", e.sdcmds)
+	e.Now = e.Now.Add(16 * time.Minute)
+	e.H.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if !e.SDRan("umount -l /run/netns/cni-deadbeef") {
+		t.Fatalf("no lazy umount of the orphan; sdcmds=%v", e.SDCmds)
 	}
 	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
 		t.Fatal("orphan netns file not removed")
 	}
-	if _, err := os.Stat(filepath.Join(e.state, "cni-netns-seen-cni-deadbeef")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(e.StateDir, "cni-netns-seen-cni-deadbeef")); !os.IsNotExist(err) {
 		t.Fatal("confirmation marker not cleaned after reap")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "keepme")); err != nil {
 		t.Fatal("non-cni file was touched")
 	}
-	logs := logLines(t, e)
+	logs := e.LogLines(t)
 	if !strings.Contains(logs, "reaped orphan netns cni-deadbeef") {
 		t.Fatalf("missing reap ACTION line:\n%s", logs)
 	}
@@ -527,27 +528,27 @@ func TestOrphanCNINetnsLiveProcessProtected(t *testing.T) {
 	e := fixture(t)
 	dir := netnsFixture(t, e)
 	live := filepath.Join(dir, "cni-live0000")
-	writeFile(t, live, "")
+	wdepstest.WriteFile(t, live, "")
 	// proc/7001/ns/net hardlinks the same inode — the namespace is
 	// still in use.
-	nsdir := filepath.Join(e.proc, "7001", "ns")
+	nsdir := filepath.Join(e.ProcDir, "7001", "ns")
 	if err := os.MkdirAll(nsdir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Link(live, filepath.Join(nsdir, "net")); err != nil {
 		t.Fatalf("hardlink netns: %v", err)
 	}
-	e.sdReply["umount"] = ""
+	e.SDReply["umount"] = ""
 
 	for i := 0; i < 3; i++ {
-		e.h.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
-			PidsOnce: pidsOf(7001), WorkerActive: true})
-		e.now = e.now.Add(20 * time.Minute)
+		e.H.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
+			PidsOnce: wdepstest.PidsOf(7001), WorkerActive: true})
+		e.Now = e.Now.Add(20 * time.Minute)
 	}
-	if e.sdRan("umount") {
+	if e.SDRan("umount") {
 		t.Fatal("umount ran on a live-referenced netns")
 	}
-	if _, err := os.Stat(filepath.Join(e.state, "cni-netns-seen-cni-live0000")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(e.StateDir, "cni-netns-seen-cni-live0000")); !os.IsNotExist(err) {
 		t.Fatal("marker armed for a live-referenced netns")
 	}
 	if _, err := os.Stat(live); err != nil {
@@ -562,29 +563,29 @@ func TestOrphanCNINetnsUmountFailureKeepsMarker(t *testing.T) {
 	e := fixture(t)
 	dir := netnsFixture(t, e)
 	orphan := filepath.Join(dir, "cni-retryme")
-	writeFile(t, orphan, "")
+	wdepstest.WriteFile(t, orphan, "")
 	// No sdReply["umount"] → the fake returns ENOENT.
 
-	e.h.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
-		PidsOnce: pidsOf(), WorkerActive: true})
-	e.now = e.now.Add(31 * time.Minute)
-	e.h.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
-		PidsOnce: pidsOf(), WorkerActive: true})
-	if _, err := os.Stat(filepath.Join(e.state, "cni-netns-seen-cni-retryme")); err != nil {
+	e.H.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	e.Now = e.Now.Add(31 * time.Minute)
+	e.H.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if _, err := os.Stat(filepath.Join(e.StateDir, "cni-netns-seen-cni-retryme")); err != nil {
 		t.Fatal("marker dropped on umount failure")
 	}
 	if _, err := os.Stat(orphan); err != nil {
 		t.Fatal("file removed on umount failure")
 	}
-	if got := logLines(t, e); !strings.Contains(got, "umount /run/netns/cni-retryme failed") {
+	if got := e.LogLines(t); !strings.Contains(got, "umount /run/netns/cni-retryme failed") {
 		t.Fatalf("missing umount-failure suspect line:\n%s", got)
 	}
 
 	// The retry succeeds once systemd answers.
-	e.sdReply["umount"] = ""
-	e.now = e.now.Add(31 * time.Minute)
-	e.h.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
-		PidsOnce: pidsOf(), WorkerActive: true})
+	e.SDReply["umount"] = ""
+	e.Now = e.Now.Add(31 * time.Minute)
+	e.H.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
 	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
 		t.Fatal("orphan not reaped on retry")
 	}
@@ -595,10 +596,10 @@ func TestOrphanCNINetnsUmountFailureKeepsMarker(t *testing.T) {
 func TestOrphanCNINetnsMissingDirAndMarkers(t *testing.T) {
 	e := fixture(t)
 	// NetnsDir defaults to /host/run/netns — nonexistent here.
-	writeFile(t, filepath.Join(e.state, "cni-netns-seen-ghost"), "1\n")
-	e.h.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
-		PidsOnce: pidsOf(), WorkerActive: true})
-	if _, err := os.Stat(filepath.Join(e.state, "cni-netns-seen-ghost")); !os.IsNotExist(err) {
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "cni-netns-seen-ghost"), "1\n")
+	e.H.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if _, err := os.Stat(filepath.Join(e.StateDir, "cni-netns-seen-ghost")); !os.IsNotExist(err) {
 		t.Fatal("stale marker not pruned when the netns file is gone")
 	}
 }
@@ -611,29 +612,29 @@ func TestOrphanCNINetnsReappearedResetsWindow(t *testing.T) {
 	e := fixture(t)
 	dir := netnsFixture(t, e)
 	p := filepath.Join(dir, "cni-recycle")
-	writeFile(t, p, "")
-	e.sdReply["umount"] = ""
+	wdepstest.WriteFile(t, p, "")
+	e.SDReply["umount"] = ""
 
-	e.h.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
-		PidsOnce: pidsOf(), WorkerActive: true})
+	e.H.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
 	// File vanishes; marker pruned on the next scan.
 	if err := os.Remove(p); err != nil {
 		t.Fatal(err)
 	}
-	e.h.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
-		PidsOnce: pidsOf(), WorkerActive: true})
-	if _, err := os.Stat(filepath.Join(e.state, "cni-netns-seen-cni-recycle")); !os.IsNotExist(err) {
+	e.H.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if _, err := os.Stat(filepath.Join(e.StateDir, "cni-netns-seen-cni-recycle")); !os.IsNotExist(err) {
 		t.Fatal("stale marker survived the file's disappearance")
 	}
 	// A NEW file with the same name starts a fresh window.
-	writeFile(t, p, "")
-	e.now = e.now.Add(31 * time.Minute)
-	e.h.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
-		PidsOnce: pidsOf(), WorkerActive: true})
-	if e.sdRan("umount") {
+	wdepstest.WriteFile(t, p, "")
+	e.Now = e.Now.Add(31 * time.Minute)
+	e.H.cniNetns.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
+	if e.SDRan("umount") {
 		t.Fatal("reaped a reappeared netns without a fresh confirmation")
 	}
-	if _, err := os.Stat(filepath.Join(e.state, "cni-netns-seen-cni-recycle")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.StateDir, "cni-netns-seen-cni-recycle")); err != nil {
 		t.Fatal("fresh marker not armed for the reappeared file")
 	}
 }
@@ -645,31 +646,31 @@ func TestOrphanCNINetnsReappearedResetsWindow(t *testing.T) {
 // budget — in addition to the stale-ingest sweep.
 func TestCtrIngestGCContentPruneAboveWatermark(t *testing.T) {
 	e := fixture(t)
-	e.diskUsed = 0.80
+	e.DiskUsed = 0.80
 	prunes := 0
-	e.h.Cfg.Seams.CtrPruneContent = func(context.Context) error {
+	e.H.Cfg.Seams.CtrPruneContent = func(context.Context) error {
 		prunes++
 		return nil
 	}
 
-	e.h.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	e.H.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if prunes != 1 {
 		t.Fatalf("content prunes = %d, want 1 above the watermark", prunes)
 	}
-	if got := logLines(t, e); !strings.Contains(got, "content prune ran") {
+	if got := e.LogLines(t); !strings.Contains(got, "content prune ran") {
 		t.Fatalf("missing prune ACTION line:\n%s", got)
 	}
 
 	// Inside the 6h budget a second high-watermark cycle does NOT
 	// re-prune — the walk is too heavy to run every cycle.
-	e.h.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	e.H.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if prunes != 1 {
 		t.Fatalf("content prunes inside the budget = %d, want 1", prunes)
 	}
 
 	// Past the budget it fires again.
-	e.now = e.now.Add(7 * time.Hour)
-	e.h.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	e.Now = e.Now.Add(7 * time.Hour)
+	e.H.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if prunes != 2 {
 		t.Fatalf("content prunes past the budget = %d, want 2", prunes)
 	}
@@ -679,13 +680,13 @@ func TestCtrIngestGCContentPruneAboveWatermark(t *testing.T) {
 // periodic ingest rescan still runs but the store prune never does.
 func TestCtrIngestGCNoPruneBelowWatermark(t *testing.T) {
 	e := fixture(t)
-	e.diskUsed = 0.50
+	e.DiskUsed = 0.50
 	prunes := 0
-	e.h.Cfg.Seams.CtrPruneContent = func(context.Context) error {
+	e.H.Cfg.Seams.CtrPruneContent = func(context.Context) error {
 		prunes++
 		return nil
 	}
-	e.h.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	e.H.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if prunes != 0 {
 		t.Fatalf("content prunes below the watermark = %d, want 0", prunes)
 	}
@@ -696,25 +697,25 @@ func TestCtrIngestGCNoPruneBelowWatermark(t *testing.T) {
 // spent (rate_spend parity) so a wedged ctr does not spin.
 func TestCtrIngestGCPruneFailureSuspect(t *testing.T) {
 	e := fixture(t)
-	e.diskUsed = 0.80
-	e.h.Cfg.Seams.CtrPruneContent = func(context.Context) error {
+	e.DiskUsed = 0.80
+	e.H.Cfg.Seams.CtrPruneContent = func(context.Context) error {
 		return errors.New("ctr content prune: exit status 1")
 	}
-	e.h.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
-	if got := logLines(t, e); !strings.Contains(got, "content prune failed") {
+	e.H.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	if got := e.LogLines(t); !strings.Contains(got, "content prune failed") {
 		t.Fatalf("missing prune-failure suspect line:\n%s", got)
 	}
 	if got := testutil.ToFloat64(
-		e.h.Actions.WithLabelValues(wdeps.CheckIngestGC, "content_gc")); got != 0 {
+		e.H.Actions.WithLabelValues(wdeps.CheckIngestGC, "content_gc")); got != 0 {
 		t.Fatalf("content_gc actions = %v, want 0 on prune failure", got)
 	}
 	// Budget spent → an immediate retry does not re-run the prune.
 	calls := 0
-	e.h.Cfg.Seams.CtrPruneContent = func(context.Context) error {
+	e.H.Cfg.Seams.CtrPruneContent = func(context.Context) error {
 		calls++
 		return nil
 	}
-	e.h.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	e.H.ingestGC.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if calls != 0 {
 		t.Fatalf("prune retried inside the budget (%d calls)", calls)
 	}
@@ -727,14 +728,14 @@ func TestCtrIngestGCPruneFailureSuspect(t *testing.T) {
 // alone can blackhole under double encapsulation.
 func TestCiliumMTUWG0DriftLatches(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
-	writeFile(t, filepath.Join(e.sysnet, "cilium_wg0", "mtu"), "1250\n")
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "neb1", "mtu"), "1300\n")
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cilium_wg0", "mtu"), "1250\n")
 	// cilium_net absent AND no runtime config → wg0 is the only vote.
-	e.h.ciliumMTU.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
-	if !e.h.State.Exists("cilium-mtu-drift") {
+	e.H.ciliumMTU.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	if !e.H.State.Exists("cilium-mtu-drift") {
 		t.Fatal("no cilium-mtu-drift latch for wg0=1250 > 1300-60")
 	}
-	if got := logLines(t, e); !strings.Contains(got,
+	if got := e.LogLines(t); !strings.Contains(got,
 		"ACTION cilium-mtu-drift: cilium_wg0=1250 nebula=1300") {
 		t.Fatalf("missing wg0 drift ACTION line:\n%s", got)
 	}
@@ -744,15 +745,15 @@ func TestCiliumMTUWG0DriftLatches(t *testing.T) {
 // drift); wg0 == neb−59 exceeds it.
 func TestCiliumMTUWG0Boundary(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
-	writeFile(t, filepath.Join(e.sysnet, "cilium_wg0", "mtu"), "1240\n")
-	e.h.ciliumMTU.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
-	if e.h.State.Exists("cilium-mtu-drift") {
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "neb1", "mtu"), "1300\n")
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cilium_wg0", "mtu"), "1240\n")
+	e.H.ciliumMTU.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	if e.H.State.Exists("cilium-mtu-drift") {
 		t.Fatal("drift latched at exactly neb-60")
 	}
-	writeFile(t, filepath.Join(e.sysnet, "cilium_wg0", "mtu"), "1241\n")
-	e.h.ciliumMTU.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
-	if !e.h.State.Exists("cilium-mtu-drift") {
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cilium_wg0", "mtu"), "1241\n")
+	e.H.ciliumMTU.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	if !e.H.State.Exists("cilium-mtu-drift") {
 		t.Fatal("no drift at neb-59")
 	}
 }
@@ -761,9 +762,9 @@ func TestCiliumMTUWG0Boundary(t *testing.T) {
 // datapath iface resolvable there is nothing to compare — no latch.
 func TestCiliumMTUAbsentDatapathsNoVote(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
-	e.h.ciliumMTU.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
-	if e.h.State.Exists("cilium-mtu-drift") {
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "neb1", "mtu"), "1300\n")
+	e.H.ciliumMTU.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	if e.H.State.Exists("cilium-mtu-drift") {
 		t.Fatal("drift latched with no datapath MTU resolved")
 	}
 }
@@ -772,11 +773,11 @@ func TestCiliumMTUAbsentDatapathsNoVote(t *testing.T) {
 // cilium_net verdict is reported first (the primary datapath).
 func TestCiliumMTUCiliumNetStillWins(t *testing.T) {
 	e := fixture(t)
-	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
-	writeFile(t, filepath.Join(e.sysnet, "cilium_net", "mtu"), "1400\n")
-	writeFile(t, filepath.Join(e.sysnet, "cilium_wg0", "mtu"), "1290\n")
-	e.h.ciliumMTU.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
-	if got := logLines(t, e); !strings.Contains(got,
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "neb1", "mtu"), "1300\n")
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cilium_net", "mtu"), "1400\n")
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cilium_wg0", "mtu"), "1290\n")
+	e.H.ciliumMTU.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	if got := e.LogLines(t); !strings.Contains(got,
 		"ACTION cilium-mtu-drift: cilium_net=1400 nebula=1300") {
 		t.Fatalf("cilium_net drift line missing (wg0 also drifts):\n%s", got)
 	}

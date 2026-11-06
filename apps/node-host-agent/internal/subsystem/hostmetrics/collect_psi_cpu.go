@@ -111,13 +111,14 @@ var descPSI = prometheus.NewDesc(
 	"PSI cpu some avg60 — share of time runnable tasks stalled (runner's overload signal).",
 	nil, nil)
 
-// collectPSI emits the avg60 gauge only when PSI parsed.
-func (c *Collector) collectPSI(ch chan<- prometheus.Metric, avg60 float64, ok bool) {
-	if !ok {
+// collectPSI emits the avg60 gauge only when PSI parsed — the same
+// value scrapeCtx carries from the latch hysteresis read above.
+func (c *Collector) collectPSI(ch chan<- prometheus.Metric, sc scrapeCtx) {
+	if !sc.psiOK {
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(descPSI,
-		prometheus.GaugeValue, avg60)
+		prometheus.GaugeValue, sc.avg60)
 }
 
 // --- cpu-delivered probe (lib.sh measure_cpu_delivered) ---

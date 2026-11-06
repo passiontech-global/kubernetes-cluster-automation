@@ -1,7 +1,7 @@
 // kubelet_syncloop_test.go — A4 syncloop probe (PLEG freeze
 // detection, auth-inconclusive handling) and the containerd
 // unix-socket liveness check.
-package workerhygiene
+package kubelet_test
 
 import (
 	"context"
@@ -13,23 +13,24 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
 // --- Wave-2 tests: A4 syncloop + containerd-sock ---
 
 func TestSyncloopDownLatchesOnPLEGFreeze(t *testing.T) {
 	e := fixture(t)
-	e.sdReply["is-active k0sworker.service"] = "active"
-	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 500
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.Status["https://127.0.0.1:10250/healthz/syncloop"] = 500
 	for i := 0; i < 2; i++ {
-		e.h.Cycle(context.Background())
+		e.H.Cycle(context.Background())
 	}
-	if !e.h.State.Exists("kubelet-syncloop-down") {
+	if !e.H.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("state-kubelet-syncloop-down should latch after 2 failed syncloop probes")
 	}
-	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 200
-	e.h.Cycle(context.Background())
-	if e.h.State.Exists("kubelet-syncloop-down") {
+	e.Status["https://127.0.0.1:10250/healthz/syncloop"] = 200
+	e.H.Cycle(context.Background())
+	if e.H.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("recovery should clear the syncloop latch")
 	}
 }
@@ -39,17 +40,17 @@ func TestSyncloopDownLatchesOnPLEGFreeze(t *testing.T) {
 // "last_err=<nil>".
 func TestSyncloopNon200LogsStatusCode(t *testing.T) {
 	e := fixture(t)
-	e.sdReply["is-active k0sworker.service"] = "active"
-	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 500
-	e.h.Cycle(context.Background()) // streak 1 → suspect line
-	if got := logLines(t, e); !strings.Contains(got, "status 500") {
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.Status["https://127.0.0.1:10250/healthz/syncloop"] = 500
+	e.H.Cycle(context.Background()) // streak 1 → suspect line
+	if got := e.LogLines(t); !strings.Contains(got, "status 500") {
 		t.Fatalf("suspect line must carry the HTTP code, got:\n%s", got)
 	}
-	e.h.Cycle(context.Background()) // streak 2 → latch
-	if !e.h.State.Exists("kubelet-syncloop-down") {
+	e.H.Cycle(context.Background()) // streak 2 → latch
+	if !e.H.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("latch expected after ConsecNeeded failed probes")
 	}
-	if got := logLines(t, e); strings.Contains(got, "last_err=<nil>") {
+	if got := e.LogLines(t); strings.Contains(got, "last_err=<nil>") {
 		t.Fatalf("latch extra must record the code, got:\n%s", got)
 	}
 }
@@ -61,12 +62,12 @@ func TestSyncloopFailClosedWhenActiveCheckErrors(t *testing.T) {
 	// so worker checks must gate off (fail closed). The syncloop
 	// probe is ALSO failing — if the gate didn't hold, two cycles
 	// would latch kubelet-syncloop-down.
-	delete(e.sdReply, "systemctl is-active k0sworker.service")
-	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 500
+	delete(e.SDReply, "systemctl is-active k0sworker.service")
+	e.Status["https://127.0.0.1:10250/healthz/syncloop"] = 500
 	for i := 0; i < 2; i++ {
-		e.h.Cycle(context.Background())
+		e.H.Cycle(context.Background())
 	}
-	if e.h.State.Exists("kubelet-syncloop-down") {
+	if e.H.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("no latch may be written while the unit state is unknown")
 	}
 }
@@ -77,15 +78,15 @@ func TestSyncloopFailClosedWhenActiveCheckErrors(t *testing.T) {
 // logged once per unauth streak, not every cycle.
 func TestSyncloopUnauthorizedIsInconclusive(t *testing.T) {
 	e := fixture(t)
-	e.sdReply["is-active k0sworker.service"] = "active"
-	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 401
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.Status["https://127.0.0.1:10250/healthz/syncloop"] = 401
 	for i := 0; i < 3; i++ {
-		e.h.Cycle(context.Background())
+		e.H.Cycle(context.Background())
 	}
-	if e.h.State.Exists("kubelet-syncloop-down") {
+	if e.H.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("401 must not latch kubelet-syncloop-down")
 	}
-	got := logLines(t, e)
+	got := e.LogLines(t)
 	if !strings.Contains(got, "probe unauthorized") {
 		t.Fatalf("expected an unauthorized/inconclusive log line, got:\n%s", got)
 	}
@@ -94,11 +95,11 @@ func TestSyncloopUnauthorizedIsInconclusive(t *testing.T) {
 	}
 	// A real verdict ends the streak — a later unauth stretch logs
 	// again.
-	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 200
-	e.h.Cycle(context.Background())
-	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 401
-	e.h.Cycle(context.Background())
-	if n := strings.Count(logLines(t, e), "probe unauthorized"); n != 2 {
+	e.Status["https://127.0.0.1:10250/healthz/syncloop"] = 200
+	e.H.Cycle(context.Background())
+	e.Status["https://127.0.0.1:10250/healthz/syncloop"] = 401
+	e.H.Cycle(context.Background())
+	if n := strings.Count(e.LogLines(t), "probe unauthorized"); n != 2 {
 		t.Fatalf("unauth after a healthy verdict must re-log, got %d lines", n)
 	}
 }
@@ -107,29 +108,29 @@ func TestSyncloopUnauthorizedIsInconclusive(t *testing.T) {
 // /healthz — the SA token from KubeletTokenPath must ride the probe.
 func TestSyncloopProbeSendsBearerToken(t *testing.T) {
 	e := fixture(t)
-	e.sdReply["is-active k0sworker.service"] = "active"
-	tok := filepath.Join(e.state, "sa-token")
-	writeFile(t, tok, "tok-abc-123\n")
-	e.h.Cfg.Kubelet.TokenPath = tok
-	e.h.Cycle(context.Background())
-	if got := e.bearer["https://127.0.0.1:10250/healthz/syncloop"]; got != "tok-abc-123" {
+	e.SDReply["is-active k0sworker.service"] = "active"
+	tok := filepath.Join(e.StateDir, "sa-token")
+	wdepstest.WriteFile(t, tok, "tok-abc-123\n")
+	e.H.Cfg.Kubelet.TokenPath = tok
+	e.H.Cycle(context.Background())
+	if got := e.Bearer["https://127.0.0.1:10250/healthz/syncloop"]; got != "tok-abc-123" {
 		t.Fatalf("syncloop probe bearer = %q, want the SA token", got)
 	}
 }
 
 func TestContainerdSockDownLatches(t *testing.T) {
 	e := fixture(t)
-	e.sdReply["is-active k0sworker.service"] = "active"
-	e.sockErrs[e.h.Cfg.Ctr.Socket] = errors.New("connection refused")
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.SockErrs[e.H.Cfg.Ctr.Socket] = errors.New("connection refused")
 	for i := 0; i < 2; i++ {
-		e.h.Cycle(context.Background())
+		e.H.Cycle(context.Background())
 	}
-	if !e.h.State.Exists("containerd-sock-down") {
+	if !e.H.State.Exists("containerd-sock-down") {
 		t.Fatal("state-containerd-sock-down should latch after 2 socket failures")
 	}
-	e.sockErrs[e.h.Cfg.Ctr.Socket] = nil
-	e.h.Cycle(context.Background())
-	if e.h.State.Exists("containerd-sock-down") {
+	e.SockErrs[e.H.Cfg.Ctr.Socket] = nil
+	e.H.Cycle(context.Background())
+	if e.H.State.Exists("containerd-sock-down") {
 		t.Fatal("recovery should clear the containerd-sock latch")
 	}
 }
@@ -196,31 +197,31 @@ kubelet_pleg_discard_events 12
 // and clear on recovery.
 func TestPLEGUnhealthyLatchesAfterConsecNeeded(t *testing.T) {
 	e := fixture(t)
-	e.sdReply["is-active k0sworker.service"] = "active"
-	e.metricsBody = plegMetricsSlow
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.MetricsBody = plegMetricsSlow
 	for i := 0; i < 2; i++ {
-		e.h.Cycle(context.Background())
+		e.H.Cycle(context.Background())
 	}
-	if !e.h.State.Exists("kubelet-pleg-unhealthy") {
+	if !e.H.State.Exists("kubelet-pleg-unhealthy") {
 		t.Fatal("state-kubelet-pleg-unhealthy should latch after 2 over-threshold scrapes")
 	}
-	if e.h.KubeletPLEGLastSeenAgeSec != 45 {
-		t.Fatalf("last-seen gauge=%v want 45", e.h.KubeletPLEGLastSeenAgeSec)
+	if e.H.KubeletPLEGLastSeenAgeSec != 45 {
+		t.Fatalf("last-seen gauge=%v want 45", e.H.KubeletPLEGLastSeenAgeSec)
 	}
-	if e.h.KubeletPLEGDiscardEvents != 12 {
-		t.Fatalf("discard counter=%v want 12", e.h.KubeletPLEGDiscardEvents)
+	if e.H.KubeletPLEGDiscardEvents != 12 {
+		t.Fatalf("discard counter=%v want 12", e.H.KubeletPLEGDiscardEvents)
 	}
 	// Syncloop itself is still healthy — its latch stays clear.
-	if e.h.State.Exists("kubelet-syncloop-down") {
+	if e.H.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("PLEG metric degrade must not trip the syncloop latch")
 	}
-	e.metricsBody = plegMetricsHealthy
-	e.h.Cycle(context.Background())
-	if e.h.State.Exists("kubelet-pleg-unhealthy") {
+	e.MetricsBody = plegMetricsHealthy
+	e.H.Cycle(context.Background())
+	if e.H.State.Exists("kubelet-pleg-unhealthy") {
 		t.Fatal("recovery should clear the pleg latch")
 	}
-	if e.h.KubeletPLEGDiscardEvents != 7 {
-		t.Fatalf("discard counter=%v want 7 (passthrough)", e.h.KubeletPLEGDiscardEvents)
+	if e.H.KubeletPLEGDiscardEvents != 7 {
+		t.Fatalf("discard counter=%v want 7 (passthrough)", e.H.KubeletPLEGDiscardEvents)
 	}
 }
 
@@ -229,25 +230,25 @@ func TestPLEGUnhealthyLatchesAfterConsecNeeded(t *testing.T) {
 // rule as the other failed-probe paths.
 func TestPLEGScrapeErrorIsInconclusive(t *testing.T) {
 	e := fixture(t)
-	e.sdReply["is-active k0sworker.service"] = "active"
-	e.metricsBody = plegMetricsSlow
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.MetricsBody = plegMetricsSlow
 	for i := 0; i < 2; i++ {
-		e.h.Cycle(context.Background())
+		e.H.Cycle(context.Background())
 	}
-	if !e.h.State.Exists("kubelet-pleg-unhealthy") {
+	if !e.H.State.Exists("kubelet-pleg-unhealthy") {
 		t.Fatal("precondition: latch should be set")
 	}
-	e.metricsErr = errors.New("connection refused")
-	e.metricsBody = ""
-	e.h.Cycle(context.Background())
-	if !e.h.State.Exists("kubelet-pleg-unhealthy") {
+	e.MetricsErr = errors.New("connection refused")
+	e.MetricsBody = ""
+	e.H.Cycle(context.Background())
+	if !e.H.State.Exists("kubelet-pleg-unhealthy") {
 		t.Fatal("scrape error must keep the latch (inconclusive)")
 	}
 	// A body without PLEG series is inconclusive too.
-	e.metricsErr = nil
-	e.metricsBody = "kubelet_running_pods 5\n"
-	e.h.Cycle(context.Background())
-	if !e.h.State.Exists("kubelet-pleg-unhealthy") {
+	e.MetricsErr = nil
+	e.MetricsBody = "kubelet_running_pods 5\n"
+	e.H.Cycle(context.Background())
+	if !e.H.State.Exists("kubelet-pleg-unhealthy") {
 		t.Fatal("missing PLEG family must keep the latch")
 	}
 }

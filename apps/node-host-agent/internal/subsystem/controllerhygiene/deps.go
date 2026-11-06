@@ -3,14 +3,13 @@
 // (seams re-stubbed by tests post-New), the procfs view, the mTLS
 // apiserver client + its credential fingerprint, the hoststate
 // store, the journal-blindness tracker, the remediate rate mutex,
-// the watchdogconf refresh bookkeeping, the cross-cycle
-// kcmQuietSince stamp, and the prometheus vecs/gauges.
+// the watchdogconf refresh bookkeeping, and the prometheus
+// vecs/gauges.
 package controllerhygiene
 
 import (
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -56,10 +55,6 @@ type deps struct {
 	// were last refreshed from — BUG-H9's "only move fields that still
 	// carry the previous conf value" rule needs the previous parse.
 	wdApplied *watchdogconf.Config
-	// kcmQuietSince is the first cycle the KCM read leader+idle —
-	// leader-without-workers only counts as frozen after
-	// CPFreezeQuietFor (W8-CP3).
-	kcmQuietSince time.Time
 
 	cycles    *prometheus.CounterVec // check, result
 	actions   *prometheus.CounterVec // check, action

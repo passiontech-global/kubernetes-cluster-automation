@@ -408,21 +408,33 @@ func (h *Hygiene) feederActive() bool {
 func (h *Hygiene) Run(ctx context.Context) {
 	if h.feederActive() {
 		h.feederOnce.Do(func() {
-			go func() {
-				// agent.go's panic recovery only wraps sub.Run —
-				// a panic in this spawned goroutine would take the
-				// whole daemon down. Recover and die loudly
-				// instead: WATCHDOG=1 stops, so the unit's own
-				// watchdog fires (the shell exit-1 → OnFailure
-				// equivalence).
-				defer func() {
-					if r := recover(); r != nil {
-						h.state.AppendLogWarn(fmt.Sprintf(
-							"feeder: PANIC %v — feeder dead, WATCHDOG=1 stops (agent kept alive)", r))
-					}
-				}()
-				h.runFeeder(ctx)
-			}()
+			// Spawn's stop is DELIBERATELY never called: the
+			// feeder runs on the supervisor ctx and must outlive
+			// a single Run — tying its lifetime to Run would let
+			// a crash-looping Cycle starve WATCHDOG=1 through the
+			// supervisor's restart backoff (5s doubling to 5m in
+			// agent.go) until the unit's own watchdog fires.
+			// The feeder dies only when ITSELF panics — the shell
+			// exit-1 → OnFailure equivalence — or the supervisor
+			// ctx is cancelled.
+			cycle.Spawn(ctx, "controllerhygiene watchdog feeder",
+				func(fctx context.Context) {
+					// Keep the panic in the watchdog tail —
+					// every other feeder line lands there —
+					// then re-panic so Spawn's recover logs it
+					// to the agent stream and swallows (its
+					// recover is the daemon-safety net: agent.go
+					// only wraps Run itself, not goroutines Run
+					// spawned).
+					defer func() {
+						if r := recover(); r != nil {
+							h.state.AppendLogWarn(fmt.Sprintf(
+								"feeder: PANIC %v — feeder dead, WATCHDOG=1 stops (agent kept alive)", r))
+							panic(r)
+						}
+					}()
+					h.runFeeder(fctx)
+				})
 		})
 	}
 	cycle.Every("controllerhygiene", h.cfg.Interval, h.runCycle).Run(ctx)

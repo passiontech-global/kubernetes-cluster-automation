@@ -1,7 +1,8 @@
 // kmsg.go — W10-KR1 checkKernelDmesg: the /dev/kmsg + dmesg
-// kernel-log classifiers (filesystem/block errors, nf_conntrack
-// table-full drops, host-level OOM kills) → stateDir evidence
-// markers. workerhygiene consumes the OOM markers for the
+// kernel-log drain plumbing (session/cursor, marker writes, the
+// sysctl bump) → stateDir evidence markers. The classifier half —
+// the detector regexes and the line→detector dispatch — lives in
+// kmsg_rules.go. workerhygiene consumes the OOM markers for the
 // SystemOOMVictim node event; this file owns the latches + counters.
 // The Wave-10 contract overview lives in kernel_failure_latches.go.
 package hostmetrics
@@ -12,7 +13,6 @@ import (
 	"hash/fnv"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,35 +55,9 @@ var kmsgDevicePaths = func(hostRoot string) []string {
 	return kmsg.DevicePaths("/dev/kmsg", hostRoot)
 }
 
-// --- kernel-message detectors (W10-KR1) ---
-
-var (
-	// Filesystem/block error signatures — the plan's literal set.
-	fsErrorRe = regexp.MustCompile(
-		`blk_update_request: I/O error|Buffer I/O error on dev|` +
-			`EXT4-fs error|XFS \([^)]*\): Metadata I/O error|XFS_ERROR`)
-	// nf_conntrack table-full — packets are being DROPPED.
-	conntrackFullRe = regexp.MustCompile(`nf_conntrack: table full`)
-	// "Out of memory: Killed process <pid> (<comm>) ..." — global
-	// OOM — and "Memory cgroup out of memory: Killed process ..."
-	// — the memcg variant the kernel prints for cgroup OOMs, which
-	// is the COMMON case under kubepods pressure.
-	oomKillRe = regexp.MustCompile(
-		`(?i)(?:memory cgroup )?out of memory: killed process \d+ \(([^)]+)\)`)
-	// The constraint line printed just before the kill line —
-	// carries oom_memcg/task_memcg, the cgroup verdict's evidence.
-	oomConstraintRe = regexp.MustCompile(`oom-kill:constraint=`)
-	oomMemcgRe      = regexp.MustCompile(`(?:oom_memcg|task_memcg)=([^\s,]+)`)
-	oomTaskRe       = regexp.MustCompile(`(?:^|,)task=([^\s,]+)`)
-)
-
-// oomKillCtx is the pending constraint-line state — the kernel prints
-// "oom-kill:constraint=..." immediately before "Out of memory:
-// Killed process ..."; the pair classifies one kill event.
-type oomKillCtx struct {
-	memcg string // first memcg path seen (oom_memcg preferred)
-	comm  string // task= comm when present
-}
+// The kernel-message detector regexes, the oomKillCtx pairing
+// context and classifyKernelLine itself live in kmsg_rules.go —
+// this file keeps the plumbing they dispatch into.
 
 // kernelScanState is the per-Collector scanner state — the kmsg
 // tail session plus the cross-line OOM pairing. NetHealth-style
@@ -376,43 +350,6 @@ func (l *Latches) readKmsgAvail(sess *kmsgSession) (
 	return recs, res, maxSeq, maxUsec, nil
 }
 
-// classifyKernelLine feeds one kernel message into the detectors.
-// Order matters: the oom-kill constraint line is captured as pending
-// context for the kill line that follows it.
-func (l *Latches) classifyKernelLine(msg string, st *kernelScanState) {
-	switch {
-	case oomConstraintRe.MatchString(msg):
-		st.oomPending = parseOOMConstraint(msg)
-	case oomKillRe.MatchString(msg):
-		l.noteHostOOMKill(msg, st)
-	case fsErrorRe.MatchString(msg):
-		l.noteKernelFsError(msg)
-	case conntrackFullRe.MatchString(msg):
-		l.noteConntrackFull()
-	}
-}
-
-// parseOOMConstraint extracts the memcg + task fields from an
-// "oom-kill:constraint=..." line.
-func parseOOMConstraint(msg string) *oomKillCtx {
-	ctx := &oomKillCtx{}
-	if m := oomMemcgRe.FindStringSubmatch(msg); m != nil {
-		ctx.memcg = m[1]
-	}
-	if m := oomTaskRe.FindStringSubmatch(msg); m != nil {
-		ctx.comm = m[1]
-	}
-	return ctx
-}
-
-// isHostOOMComm reports whether comm names a host-level daemon —
-// the plan's containerd/k0s/kubelet set. comm is TASK_COMM_LEN
-// truncated (15 chars), so prefix/substring matching is required.
-func isHostOOMComm(comm string) bool {
-	return comm == "kubelet" || strings.HasPrefix(comm, "k0s") ||
-		strings.Contains(comm, "containerd")
-}
-
 // noteHostOOMKill classifies one "Out of memory: Killed process"
 // record: host-level when the victim's memcg sits OUTSIDE the
 // kubepods hierarchy, or the victim comm is a host daemon
@@ -446,13 +383,6 @@ func (l *Latches) noteHostOOMKill(msg string, st *kernelScanState) {
 	}
 	logger().Warn("hostmetrics: host-level OOM kill observed",
 		"comm", comm, "memcg", ctxMemcg(ctx))
-}
-
-func ctxMemcg(ctx *oomKillCtx) string {
-	if ctx == nil {
-		return ""
-	}
-	return ctx.memcg
 }
 
 // noteKernelFsError records the latest kernel filesystem/block error —

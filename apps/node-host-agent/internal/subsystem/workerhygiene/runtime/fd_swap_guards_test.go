@@ -1,7 +1,7 @@
 // fd_swap_guards_test.go — coverage for the unlinked-open-files
 // guard (deleted-but-open fd sweep + shipper SIGHUP) and the
 // cgroup-swap-leak guard (kubepods memory.swap.max cap).
-package workerhygiene
+package runtime_test
 
 import (
 	"context"
@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/runtime"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
 
 // mkDeletedFD links <proc>/<pid>/fd/<fd> to a " (deleted)" target —
@@ -21,7 +23,7 @@ import (
 // magic link; the DeletedFDStatFn seam supplies dev/ino/size.
 func (e *env) mkDeletedFD(t *testing.T, pid, fd int, target string) {
 	t.Helper()
-	dir := filepath.Join(e.proc, strconv.Itoa(pid), "fd")
+	dir := filepath.Join(e.ProcDir, strconv.Itoa(pid), "fd")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -40,8 +42,8 @@ type deletedStat struct {
 }
 
 func (e *env) stubDeletedFDStats(stats map[string]deletedStat) {
-	e.h.Cfg.Seams.DeletedFDStatFn = func(path string) (uint64, uint64, int64, bool) {
-		key := strings.TrimPrefix(path, e.proc+"/")
+	e.H.Cfg.Seams.DeletedFDStatFn = func(path string) (uint64, uint64, int64, bool) {
+		key := strings.TrimPrefix(path, e.ProcDir+"/")
 		parts := strings.Split(key, "/")
 		if len(parts) != 3 {
 			return 0, 0, 0, false
@@ -60,18 +62,18 @@ func mib(n int64) int64 { return n << 20 }
 
 func TestUnlinkedOpenFilesSweepAndSighup(t *testing.T) {
 	e := fixture(t)
-	h := e.h
+	h := e.H
 	ctx := context.Background()
-	e.diskUsed = 0.90 // above the 80% watermark
+	e.DiskUsed = 0.90 // above the 80% watermark
 
 	// fluent-bit holds a 300MiB deleted log, vector a 300MiB one
 	// (shipper-held total 600MiB >= 512MiB → SIGHUP both), an
 	// unrelated proc holds a third file — counted, not signalled.
 	for _, pid := range []int{4242, 4243, 4244} {
-		e.mkStatProc(t, pid, "app", "S", "")
+		e.MkStatProc(t, pid, "app", "S", "")
 	}
-	writeFile(t, filepath.Join(e.proc, "4242", "comm"), "fluent-bit\n")
-	writeFile(t, filepath.Join(e.proc, "4243", "comm"), "vector\n")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "4242", "comm"), "fluent-bit\n")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "4243", "comm"), "vector\n")
 	e.mkDeletedFD(t, 4242, 3, "/var/log/app.log")
 	e.mkDeletedFD(t, 4243, 5, "/var/log/big.log")
 	e.mkDeletedFD(t, 4244, 7, "/tmp/scratch.bin")
@@ -86,7 +88,7 @@ func TestUnlinkedOpenFilesSweepAndSighup(t *testing.T) {
 	})
 	env := &wdeps.CycleEnv{WorkerActive: true}
 
-	h.unlinkedFDs.Run(ctx, env)
+	wdepstest.Check[*runtime.UnlinkedOpenFilesCheck](h, wdeps.CheckUnlinkedOpenFiles).Run(ctx, env)
 
 	if h.UnlinkedOpenFileCount != 3 {
 		t.Fatalf("count=%d want 3 (shared inode deduped)",
@@ -95,44 +97,44 @@ func TestUnlinkedOpenFilesSweepAndSighup(t *testing.T) {
 	if h.UnlinkedOpenFileBytes != mib(900) {
 		t.Fatalf("bytes=%d want %d", h.UnlinkedOpenFileBytes, mib(900))
 	}
-	var sigs []killRecord
-	for _, k := range e.kills {
-		if k.sig == syscall.SIGHUP {
+	var sigs []wdepstest.KillRecord
+	for _, k := range e.Kills {
+		if k.Sig == syscall.SIGHUP {
 			sigs = append(sigs, k)
 		}
 	}
 	if len(sigs) != 2 {
-		t.Fatalf("SIGHUPs=%v want 2 (fluent-bit + vector)", e.kills)
+		t.Fatalf("SIGHUPs=%v want 2 (fluent-bit + vector)", e.Kills)
 	}
-	got := map[int]bool{sigs[0].pid: true, sigs[1].pid: true}
+	got := map[int]bool{sigs[0].PID: true, sigs[1].PID: true}
 	if !got[4242] || !got[4243] || got[4244] {
 		t.Fatalf("SIGHUP pids=%v want {4242,4243}", got)
 	}
 	// The 15m scan stamp + the 30m budget both suppress a repeat:
 	// advancing past the scan interval must still not re-signal.
-	e.now = e.now.Add(16 * time.Minute)
-	h.unlinkedFDs.Run(ctx, env)
+	e.Now = e.Now.Add(16 * time.Minute)
+	wdepstest.Check[*runtime.UnlinkedOpenFilesCheck](h, wdeps.CheckUnlinkedOpenFiles).Run(ctx, env)
 	n := 0
-	for _, k := range e.kills {
-		if k.sig == syscall.SIGHUP {
+	for _, k := range e.Kills {
+		if k.Sig == syscall.SIGHUP {
 			n++
 		}
 	}
 	if n != 2 {
-		t.Fatalf("SIGHUP repeated inside the 30m budget: kills=%v", e.kills)
+		t.Fatalf("SIGHUP repeated inside the 30m budget: kills=%v", e.Kills)
 	}
 	// Shipper-held total below the 512MiB floor → no signal (past
 	// the 30m budget too — this is the floor, not the cooldown).
-	e.kills = nil
-	e.now = e.now.Add(31 * time.Minute)
+	e.Kills = nil
+	e.Now = e.Now.Add(31 * time.Minute)
 	for _, fd := range []string{"5", "9"} {
-		if err := os.Remove(filepath.Join(e.proc, "4243", "fd", fd)); err != nil {
+		if err := os.Remove(filepath.Join(e.ProcDir, "4243", "fd", fd)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	h.unlinkedFDs.Run(ctx, env)
-	for _, k := range e.kills {
-		if k.sig == syscall.SIGHUP {
+	wdepstest.Check[*runtime.UnlinkedOpenFilesCheck](h, wdeps.CheckUnlinkedOpenFiles).Run(ctx, env)
+	for _, k := range e.Kills {
+		if k.Sig == syscall.SIGHUP {
 			t.Fatal("SIGHUP fired below the shipper-held floor")
 		}
 	}
@@ -140,12 +142,12 @@ func TestUnlinkedOpenFilesSweepAndSighup(t *testing.T) {
 
 func TestUnlinkedOpenFilesBelowWatermarkSkips(t *testing.T) {
 	e := fixture(t)
-	h := e.h
-	e.diskUsed = 0.50              // below the 80% watermark
+	h := e.H
+	e.DiskUsed = 0.50              // below the 80% watermark
 	h.UnlinkedOpenFileBytes = 1234 // stale values must zero out
 	h.UnlinkedOpenFileCount = 7
 	e.mkDeletedFD(t, 4242, 3, "/var/log/app.log")
-	h.unlinkedFDs.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	wdepstest.Check[*runtime.UnlinkedOpenFilesCheck](h, wdeps.CheckUnlinkedOpenFiles).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if h.UnlinkedOpenFileBytes != 0 || h.UnlinkedOpenFileCount != 0 {
 		t.Fatalf("stale series kept below watermark: bytes=%d count=%d",
 			h.UnlinkedOpenFileBytes, h.UnlinkedOpenFileCount)
@@ -154,14 +156,14 @@ func TestUnlinkedOpenFilesBelowWatermarkSkips(t *testing.T) {
 
 func TestUnlinkedOpenFilesSizeFloor(t *testing.T) {
 	e := fixture(t)
-	h := e.h
-	e.diskUsed = 0.90
-	e.mkStatProc(t, 4242, "app", "S", "")
+	h := e.H
+	e.DiskUsed = 0.90
+	e.MkStatProc(t, 4242, "app", "S", "")
 	e.mkDeletedFD(t, 4242, 3, "/var/log/tiny.log")
 	e.stubDeletedFDStats(map[string]deletedStat{
 		"4242:3": {dev: 100, ino: 11, size: mib(32)}, // below the 64MiB floor
 	})
-	h.unlinkedFDs.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	wdepstest.Check[*runtime.UnlinkedOpenFilesCheck](h, wdeps.CheckUnlinkedOpenFiles).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if h.UnlinkedOpenFileCount != 0 || h.UnlinkedOpenFileBytes != 0 {
 		t.Fatalf("sub-floor file counted: bytes=%d count=%d",
 			h.UnlinkedOpenFileBytes, h.UnlinkedOpenFileCount)
@@ -172,19 +174,19 @@ func TestUnlinkedOpenFilesSizeFloor(t *testing.T) {
 
 func TestCgroupSwapLeakCapsSlices(t *testing.T) {
 	e := fixture(t)
-	h := e.h
+	h := e.H
 	ctx := context.Background()
 	cg := t.TempDir()
 	h.Cfg.Runtime.CgroupRoot = cg
 	kp := filepath.Join(cg, "kubepods.slice")
-	writeFile(t, filepath.Join(kp, "memory.swap.current"), "134217728\n") // 128MiB
-	writeFile(t, filepath.Join(kp, "memory.swap.max"), "max\n")
+	wdepstest.WriteFile(t, filepath.Join(kp, "memory.swap.current"), "134217728\n") // 128MiB
+	wdepstest.WriteFile(t, filepath.Join(kp, "memory.swap.max"), "max\n")
 	for _, q := range []string{"kubepods-burstable.slice", "kubepods-besteffort.slice"} {
-		writeFile(t, filepath.Join(kp, q, "memory.swap.max"), "max\n")
+		wdepstest.WriteFile(t, filepath.Join(kp, q, "memory.swap.max"), "max\n")
 	}
 	env := &wdeps.CycleEnv{WorkerActive: true}
 
-	h.cgroupSwap.Run(ctx, env)
+	wdepstest.Check[*runtime.CgroupSwapCheck](h, wdeps.CheckCgroupSwap).Run(ctx, env)
 
 	if h.KubepodsSwapUsedBytes != 128<<20 {
 		t.Fatalf("swapUsed=%d want 128MiB", h.KubepodsSwapUsedBytes)
@@ -200,8 +202,8 @@ func TestCgroupSwapLeakCapsSlices(t *testing.T) {
 	}
 	// Idempotent: the cap already stands — a second high cycle must
 	// not rewrite or re-log the ACTION.
-	h.cgroupSwap.Run(ctx, env)
-	if n := strings.Count(logLines(t, e),
+	wdepstest.Check[*runtime.CgroupSwapCheck](h, wdeps.CheckCgroupSwap).Run(ctx, env)
+	if n := strings.Count(e.LogLines(t),
 		"ACTION: cgroup-swap-leak capped pod swap"); n != 1 {
 		t.Fatalf("cap ACTION logged %d times want 1", n)
 	}
@@ -209,16 +211,16 @@ func TestCgroupSwapLeakCapsSlices(t *testing.T) {
 
 func TestCgroupSwapLeakBelowFloorAndDormant(t *testing.T) {
 	e := fixture(t)
-	h := e.h
+	h := e.H
 	ctx := context.Background()
 	cg := t.TempDir()
 	h.Cfg.Runtime.CgroupRoot = cg
 	kp := filepath.Join(cg, "kubepods.slice")
-	writeFile(t, filepath.Join(kp, "memory.swap.current"), "1024\n") // 1KiB
-	writeFile(t, filepath.Join(kp, "memory.swap.max"), "max\n")
+	wdepstest.WriteFile(t, filepath.Join(kp, "memory.swap.current"), "1024\n") // 1KiB
+	wdepstest.WriteFile(t, filepath.Join(kp, "memory.swap.max"), "max\n")
 	env := &wdeps.CycleEnv{WorkerActive: true}
 
-	h.cgroupSwap.Run(ctx, env)
+	wdepstest.Check[*runtime.CgroupSwapCheck](h, wdeps.CheckCgroupSwap).Run(ctx, env)
 	if got := nhReadFile(t, filepath.Join(kp, "memory.swap.max")); got != "max\n" {
 		t.Fatalf("swap.max rewritten below the floor: %q", got)
 	}
@@ -228,9 +230,9 @@ func TestCgroupSwapLeakBelowFloorAndDormant(t *testing.T) {
 
 	// No memory.swap.current at all → cgroup v1/unmounted → abort.
 	h2 := fixture(t)
-	h2.h.Cfg.Runtime.CgroupRoot = t.TempDir()
-	h2.h.cgroupSwap.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
-	if h2.h.KubepodsSwapUsedBytes != 0 {
+	h2.H.Cfg.Runtime.CgroupRoot = t.TempDir()
+	wdepstest.Check[*runtime.CgroupSwapCheck](h2.H, wdeps.CheckCgroupSwap).Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	if h2.H.KubepodsSwapUsedBytes != 0 {
 		t.Fatal("gauge written on a dormant (no swap.current) cycle")
 	}
 }
