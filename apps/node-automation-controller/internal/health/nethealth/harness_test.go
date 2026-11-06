@@ -26,5 +26,9 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober 
 		NewLinkerdProtocolDetectionStallCheck,
 		NewCiliumBPFMapPressureCheck,
 		NewCiliumNodeIPAMExhaustionCheck,
+		NewCiliumMissingEndpointsCheck,
+		NewLinkerdH2StreamGuardCheck,
+		NewCloudflaredTunnelHealthCheck,
+		NewLiqoTunnelHealthCheck,
 	)
 }

@@ -89,8 +89,11 @@ func init() {
 // (aged by lastTransitionTime, 5m floor). Each stuck app gets a
 // argocd.argoproj.io/refresh=hard patch on a 30m cooldown; >=2
 // simultaneous ComparisonErrors additionally restart the oldest
-// argocd-repo-server pod — the shared stale-cache signature. An
-// absent Application CRD is a clean pass (ArgoCD not installed).
+// argocd-repo-server pod — the shared stale-cache signature. A
+// Progressing app whose every non-Healthy managed workload is
+// intentionally downscaled (replicas:0 + downscaler/* annotations)
+// is excused — sleep is not stuck evidence. An absent Application
+// CRD is a clean pass (ArgoCD not installed).
 func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	if p.Dyn == nil {
@@ -117,7 +120,11 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 
 		health, _ := kube.NestedString(app.Object,
 			"status", "health", "status")
-		if health == "Progressing" {
+		// A Progressing roll-up whose only non-Healthy managed
+		// workloads are ones the go-kube-downscaler parked at
+		// replicas:0 is sleep, not stuck evidence — the downscaler
+		// wakes them on schedule.
+		if health == "Progressing" && !p.argocdAppOnlyDownscaled(ctx, app) {
 			sig := "prog/" + ns + "/" + name
 			seenKeep[sig] = true
 			first, _ := p.seen.Observe(sig, now)
@@ -192,6 +199,64 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 	}
 	sort.Strings(stuck)
 	return probefw.Result{Why: "argocd applications stuck: " + strings.Join(stuck, ", ")}
+}
+
+// argocdAppOnlyDownscaled reports whether every non-Healthy entry
+// in the Application's status.resources resolves to a live
+// Deployment/StatefulSet the go-kube-downscaler intentionally
+// parked at replicas:0 (kube.IsIntentionallyDownscaled). Fails
+// closed on any other non-Healthy resource, an unreadable workload
+// or NO non-Healthy resources at all — the Progressing signature
+// then stands and the first-seen window decides as before.
+func (p *argoCDAppStuckCheck) argocdAppOnlyDownscaled(ctx context.Context,
+	app *unstructured.Unstructured) bool {
+	res, found := kube.NestedSlice(app.Object, "status", "resources")
+	if !found {
+		return false
+	}
+	unhealthy := 0
+	for _, r := range res {
+		m, ok := r.(map[string]any)
+		if !ok {
+			return false
+		}
+		hs, _ := kube.NestedString(m, "health", "status")
+		if hs == "" || hs == "Healthy" {
+			continue
+		}
+		unhealthy++
+		kind, _ := kube.NestedString(m, "kind")
+		name, _ := kube.NestedString(m, "name")
+		rns, _ := kube.NestedString(m, "namespace")
+		if rns == "" {
+			rns = app.GetNamespace() // app-namespace resource
+		}
+		if !p.argocdWorkloadDownscaled(ctx, kind, rns, name) {
+			return false
+		}
+	}
+	return unhealthy > 0
+}
+
+// argocdWorkloadDownscaled resolves one Application resource-tree
+// entry to its live workload and asks the shared verdict — anything
+// that is not a Deployment/StatefulSet pinned at replicas:0 with
+// downscaler/* annotations counts as real stuck evidence.
+func (p *argoCDAppStuckCheck) argocdWorkloadDownscaled(ctx context.Context,
+	kind, ns, name string) bool {
+	switch kind {
+	case "Deployment":
+		d, err := p.CS.AppsV1().Deployments(ns).
+			Get(ctx, name, metav1.GetOptions{})
+		return err == nil &&
+			kube.IsIntentionallyDownscaled(d.Annotations, d.Spec.Replicas)
+	case "StatefulSet":
+		s, err := p.CS.AppsV1().StatefulSets(ns).
+			Get(ctx, name, metav1.GetOptions{})
+		return err == nil &&
+			kube.IsIntentionallyDownscaled(s.Annotations, s.Spec.Replicas)
+	}
+	return false
 }
 
 // refreshArgoCDApp patches argocd.argoproj.io/refresh=hard on a

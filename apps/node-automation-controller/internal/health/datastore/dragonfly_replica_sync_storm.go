@@ -18,6 +18,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -130,6 +131,17 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 		}
 	}
 
+	// A Dragonfly CR the go-kube-downscaler parked at
+	// spec.replicas:0 is asleep on purpose — stale link-down series
+	// for its removed member pods are intent, never storm evidence.
+	// A list failure fails open: the signatures keep their normal
+	// posture.
+	downscaled, err := downscaledClusterCRs(ctx, p.Dyn, kube.GVRDragonfly)
+	if err != nil {
+		log.Info("WARN: list dragonflies failed — downscaler awareness off",
+			"error", err)
+	}
+
 	// Pod census for master-role + ownership checks.
 	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
 		List(ctx, metav1.ListOptions{})
@@ -149,6 +161,9 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 		name := s.Label("pod", "pod_name")
 		if ns == "" || name == "" {
 			continue
+		}
+		if downscaledMemberPod(ns, name, downscaled) {
+			continue // parked cluster — not storm evidence
 		}
 		key := ns + "/" + name
 		sig := "link/" + key

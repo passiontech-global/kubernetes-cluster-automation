@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -74,6 +75,91 @@ func TestArgoCDAppStuckProgressingRefreshPatch(t *testing.T) {
 	ann := got.GetAnnotations()
 	if ann["argocd.argoproj.io/refresh"] != "hard" {
 		t.Fatalf("refresh annotation = %q, want hard", ann["argocd.argoproj.io/refresh"])
+	}
+}
+
+// A Progressing app whose only non-Healthy managed resource is a
+// Deployment the go-kube-downscaler parked at replicas:0 is sleep,
+// not stuck — no flag past the window and no refresh patch.
+func TestArgoCDAppStuckSkipsDownscaledWorkload(t *testing.T) {
+	app := argoCDApplication("argocd", "night-app", "Progressing")
+	app.Object["status"].(map[string]any)["resources"] = []any{
+		map[string]any{
+			"kind":      "Deployment",
+			"namespace": "web",
+			"name":      "frontend",
+			"health":    map[string]any{"status": "Suspended"},
+		},
+	}
+	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
+		argocdAppGVR:          "ApplicationList",
+		kube.AutopilotPlanGVR: "PlanList",
+	}, app)
+	zero := int32(0)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "web", Name: "frontend",
+			Annotations: map[string]string{"downscaler/downtime": "22:00-06:00"},
+		},
+		Spec: appsv1.DeploymentSpec{Replicas: &zero},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	p := testProberDyn(cs, dyn)
+	base := time.Now()
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("downscaled-only app must pass: %+v", res)
+	}
+	base = base.Add(50 * time.Minute)
+	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("downscaled-only app must still pass past the window: %+v", res)
+	}
+	got, err := dyn.Resource(argocdAppGVR).Namespace("argocd").
+		Get(ctx, "night-app", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetAnnotations()["argocd.argoproj.io/refresh"] != "" {
+		t.Fatal("downscaled app got a refresh patch")
+	}
+}
+
+// The same Progressing roll-up IS real evidence when the zero-
+// replica workload carries no downscaler/* annotation — a replicas:0
+// nobody claims is a genuine stall.
+func TestArgoCDAppStuckZeroReplicaNoAnnotationStillFlags(t *testing.T) {
+	app := argoCDApplication("argocd", "stalled-app", "Progressing")
+	app.Object["status"].(map[string]any)["resources"] = []any{
+		map[string]any{
+			"kind":      "Deployment",
+			"namespace": "web",
+			"name":      "frontend",
+			"health":    map[string]any{"status": "Suspended"},
+		},
+	}
+	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
+		argocdAppGVR:          "ApplicationList",
+		kube.AutopilotPlanGVR: "PlanList",
+	}, app)
+	zero := int32(0)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "web", Name: "frontend"},
+		Spec:       appsv1.DeploymentSpec{Replicas: &zero},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	p := testProberDyn(cs, dyn)
+	base := time.Now()
+	p.Now = func() time.Time { return base }
+
+	probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	base = base.Add(50 * time.Minute)
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("unexplained replicas:0 must still flag: %+v", res)
+	}
+	if !strings.Contains(res.Why, "stalled-app") {
+		t.Fatalf("why missing app: %q", res.Why)
 	}
 }
 

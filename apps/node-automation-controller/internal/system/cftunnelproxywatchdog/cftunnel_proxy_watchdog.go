@@ -431,8 +431,12 @@ func podUnreadyFor(p *corev1.Pod, now time.Time) (time.Duration, bool) {
 
 // cloudflaredLogsWedged matches the observed cloudflared failure
 // signatures: fatal startup/config errors, and a sustained
-// "connection with edge" error loop (>=3 error lines in the tail —
-// a single blip during an edge rollout is normal).
+// edge/QUIC transport error loop (>=3 error lines in the tail —
+// a single blip during an edge rollout is normal). The QUIC
+// patterns cover the UDP-blackhole wedge where the connector still
+// reports Ready but every dial to the edge times out: "failed to
+// dial to edge with quic", "timeout: no recent network activity"
+// and the "quic: " error prefix.
 func cloudflaredLogsWedged(logs string) bool {
 	edgeErrs := 0
 	for _, line := range strings.Split(logs, "\n") {
@@ -448,6 +452,12 @@ func cloudflaredLogsWedged(logs string) bool {
 				strings.Contains(l, "timeout") ||
 				strings.Contains(l, "reset") ||
 				strings.Contains(l, "closed")) {
+			edgeErrs++
+			continue
+		}
+		if strings.Contains(l, "failed to dial to edge with quic") ||
+			strings.Contains(l, "timeout: no recent network activity") ||
+			strings.Contains(l, "quic: ") {
 			edgeErrs++
 		}
 	}

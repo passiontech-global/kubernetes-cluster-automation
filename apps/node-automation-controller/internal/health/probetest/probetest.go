@@ -133,6 +133,20 @@ func OpDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 		// W7-C5 — OLM reads.
 		kube.GVROLMClusterServiceVersion: "ClusterServiceVersionList",
 		kube.GVROLMSubscription:          "SubscriptionList",
+		// api-object-sprawl-report-gc — trivy + policy reports.
+		kube.GVRVulnerabilityReport: "VulnerabilityReportList",
+		kube.GVRConfigAuditReport:   "ConfigAuditReportList",
+		kube.GVRExposedSecretReport: "ExposedSecretReportList",
+		kube.GVREphemeralReport:     "EphemeralReportList",
+		kube.GVRPolicyReport:        "PolicyReportList",
+		// cilium-missing-endpoint — the CEP census.
+		kube.GVRCiliumEndpoint: "CiliumEndpointList",
+		// liqo-tunnel-health — the peering CR family.
+		kube.GVRLiqoConnection:    "ConnectionList",
+		kube.GVRLiqoGatewayClient: "GatewayClientList",
+		kube.GVRLiqoGatewayServer: "GatewayServerList",
+		// postgres-wal-archive-guard — the CNPG cluster scan.
+		kube.GVRCNPGCluster: "ClusterList",
 		// Maintenance mutex read.
 		kube.AutopilotPlanGVR: "PlanList",
 	}, objs...)

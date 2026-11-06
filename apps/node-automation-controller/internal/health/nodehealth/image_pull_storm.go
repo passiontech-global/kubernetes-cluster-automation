@@ -25,14 +25,19 @@ import (
 type imagePullStormCheck struct {
 	*probefw.Deps
 
+	// seen tracks each container's first sweep inside a pull-failure
+	// waiting state — the >=10m persistence window; pruned when the
+	// container leaves the state so a resolved pull re-arms.
+	seen state.FirstSeenLedger
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1 (zero value usable; the serial sweep needs no lock).
 	emitted state.GaugeLedger[string]
 }
 
-// newImagePullStormCheck builds the W10-GI5 check — its only state
-// is the emitted-gauge ledger.
+// newImagePullStormCheck builds the W10-GI5 check — its state is
+// the first-seen persistence ledger and the emitted-gauge ledger
+// (both zero-value usable).
 func NewImagePullStormCheck(d *probefw.Deps) probefw.Check {
 	return &imagePullStormCheck{Deps: d}
 }
@@ -80,9 +85,11 @@ func init() {
 }
 
 // checkImagePullStorm scans all non-Succeeded pods for containers
-// waiting in an image-pull failure >10m. One affected namespace is
-// a workload problem (workload_image_pull_backoff); >=2 namespaces
-// or a registry-outage message marker is a cluster pull outage
+// waiting in an image-pull failure persisting >10m (first-seen
+// ledger — the waiting state carries no timestamp of its own). One
+// affected namespace is a workload problem
+// (workload_image_pull_backoff); >=2 namespaces or a
+// registry-outage message marker is a cluster pull outage
 // (cluster_registry_pull_outage → ClusterImagePullStorm alert).
 func (p *imagePullStormCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
@@ -98,24 +105,29 @@ func (p *imagePullStormCheck) Run(ctx context.Context) probefw.Result {
 	var offenders []offender
 	namespaces := map[string]bool{}
 	outage := false
+	live := map[string]bool{} // container keys still storming this sweep
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.Status.Phase == corev1.PodSucceeded ||
 			pod.DeletionTimestamp != nil {
 			continue
 		}
-		checkState := func(state corev1.ContainerState) {
-			w := state.Waiting
+		checkState := func(cs corev1.ContainerStatus) {
+			w := cs.State.Waiting
 			if w == nil || !pullWaitingReasons[w.Reason] {
 				return
 			}
 			// ContainerStateWaiting carries no timestamp in the
 			// Kubernetes API (the plan's waiting.startedAt does not
-			// exist) — pod creation time is the sanctioned age
-			// source, same convention as probePodRestarts: a pod
-			// still waiting on its image >10m after creation is a
-			// prolonged pull failure, not a slow first pull.
-			if now.Sub(pod.CreationTimestamp.Time) < imagePullMinAge {
+			// exist) — the first-seen ledger is the age source: the
+			// container must hold the pull-failure state across
+			// imagePullMinAge of observed sweeps before it counts.
+			// Pod creation time cannot stand in — an hours-old pod
+			// that only just started storming would flag instantly.
+			key := "imgpull/" + pod.Namespace + "/" + pod.Name + "/" + cs.Name
+			live[key] = true
+			first, _ := p.seen.Observe(key, now)
+			if now.Sub(first) < imagePullMinAge {
 				return
 			}
 			offenders = append(offenders, offender{
@@ -132,15 +144,18 @@ func (p *imagePullStormCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 		for _, s := range pod.Status.InitContainerStatuses {
-			checkState(s.State)
+			checkState(s)
 		}
 		for _, s := range pod.Status.ContainerStatuses {
-			checkState(s.State)
+			checkState(s)
 		}
 		for _, s := range pod.Status.EphemeralContainerStatuses {
-			checkState(s.State)
+			checkState(s)
 		}
 	}
+	// Resolved/removed containers re-arm — a later storm restarts
+	// the window instead of inheriting the stale stamp.
+	p.seen.Prune(func(k string) bool { return live[k] })
 
 	current := map[string][]string{}
 	for _, o := range offenders {

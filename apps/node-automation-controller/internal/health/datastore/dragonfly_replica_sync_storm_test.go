@@ -50,6 +50,42 @@ func TestDragonflySyncStormRestartsReplicaNotMaster(t *testing.T) {
 	}
 }
 
+// A Dragonfly CR parked at spec.replicas:0 by the
+// go-kube-downscaler — a sustained link-down series for its member
+// pod is never storm evidence and the pod is never restarted.
+func TestDragonflySyncStormSkipsDownscaledCluster(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "master_link_status") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "dragonfly", "pod": "dragonfly-0"},
+				Value:  0,
+			}}
+		}
+		return nil
+	})
+	cr := probetest.UnstructuredObj("dragonflydb.io/v1alpha1", "Dragonfly",
+		"dragonfly", "dragonfly", 1, 0)
+	cr.SetAnnotations(map[string]string{"downscaler/uptime": "08:00-20:00"})
+	cr.Object["spec"] = map[string]any{"replicas": int64(0)}
+	replica := dragonflyMemberPod("dragonfly", "dragonfly-0", "replica")
+	cs := fake.NewSimpleClientset(replica)
+	p := testProberDyn(cs, probetest.OpDyn(cr))
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	base := time.Now()
+	p.Now = func() time.Time { return base }
+
+	probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx)
+	base = base.Add(6 * time.Minute)
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx)
+	if !res.Pass {
+		t.Fatalf("downscaled dragonfly cluster must pass: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("dragonfly").Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
+		t.Fatalf("downscaled member must not be restarted: %v", err)
+	}
+}
+
 func TestDragonflyLinkDownAloneDoesNotRestart(t *testing.T) {
 	// Storm query returns empty -> sustained link-down FAILs but no
 	// restart.

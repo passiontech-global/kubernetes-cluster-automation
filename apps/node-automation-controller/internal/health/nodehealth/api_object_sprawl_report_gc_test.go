@@ -1,0 +1,150 @@
+// api_object_sprawl_report_gc_test.go — coverage for the
+// api-object-sprawl-report-gc check: dead-owner report GC, census
+// gauges and the superseded helm-secret cap.
+package nodehealth
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+)
+
+// sprawlReport builds an unstructured report CR owned by ownerRef,
+// created `age` ago. kind must pluralize to the GVR's resource — the
+// fake dynamic client stores by guessed resource (same convention as
+// every module test seeding unstructured CRs).
+func sprawlReport(gvr schema.GroupVersionResource, kind, ns, name string,
+	age time.Duration, owner *metav1.OwnerReference) *unstructured.Unstructured {
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": ns, "name": name},
+	}}
+	obj.SetGroupVersionKind(gvr.GroupVersion().WithKind(kind))
+	obj.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-age)))
+	obj.SetUID(types.UID("uid-" + ns + "-" + name))
+	if owner != nil {
+		obj.SetOwnerReferences([]metav1.OwnerReference{*owner})
+	}
+	return obj
+}
+
+func sprawlOwner(kind, name string) *metav1.OwnerReference {
+	return &metav1.OwnerReference{
+		Kind: kind, Name: name, Controller: ptr.To(true)}
+}
+
+func liveReplicaSet(ns, name string) *appsv1.ReplicaSet {
+	return &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Namespace: ns, Name: name}}
+}
+
+func helmSecret(ns, release string, version int, status string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      fmt.Sprintf("sh.helm.release.v1.%s.v%d", release, version),
+			Labels: map[string]string{
+				"owner": "helm", "name": release,
+				"version": fmt.Sprint(version), "status": status},
+			UID: types.UID(fmt.Sprintf("uid-%s-%s-%d", ns, release, version)),
+		},
+		Type: corev1.SecretType(sprawlHelmSecretType),
+	}
+}
+
+func TestSprawlGCDeletesDeadOwnerReports(t *testing.T) {
+	// Orphaned: owned by a ReplicaSet that is gone.
+	orphan := sprawlReport(kube.GVRVulnerabilityReport, "VulnerabilityReport",
+		"apps", "vr-orphan", 3*time.Hour, sprawlOwner("ReplicaSet", "gone-rs"))
+	// Live owner: the ReplicaSet exists.
+	liveOwner := sprawlReport(kube.GVRVulnerabilityReport, "VulnerabilityReport",
+		"apps", "vr-live", 3*time.Hour, sprawlOwner("ReplicaSet", "live-rs"))
+	// Too young: owner gone but under the orphan window.
+	young := sprawlReport(kube.GVRVulnerabilityReport, "VulnerabilityReport",
+		"apps", "vr-young", 30*time.Minute, sprawlOwner("ReplicaSet", "gone-rs"))
+	rs := liveReplicaSet("apps", "live-rs")
+	cs := fake.NewSimpleClientset(rs)
+	p := testProberDyn(cs, probetest.OpDyn(orphan, liveOwner, young))
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("live orphans must fail: %+v", res)
+	}
+	if !strings.Contains(res.Why, "vulnerabilityreports") {
+		t.Fatalf("why missing report kind: %q", res.Why)
+	}
+	if _, err := p.Dyn.Resource(kube.GVRVulnerabilityReport).Namespace("apps").
+		Get(ctx, "vr-orphan", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("dead-owner report should be deleted, err=%v", err)
+	}
+	for _, name := range []string{"vr-live", "vr-young"} {
+		if _, err := p.Dyn.Resource(kube.GVRVulnerabilityReport).Namespace("apps").
+			Get(ctx, name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("report %s must survive: %v", name, err)
+		}
+	}
+	if _, ok := testutil.GaugeSeriesValue(t, "node_automation_api_object_count",
+		map[string]string{"resource": "vulnerabilityreports", "namespace": "apps"}); !ok {
+		t.Fatal("census gauge missing for vulnerabilityreports")
+	}
+	if v, ok := testutil.GaugeSeriesValue(t, "node_automation_ephemeral_reports_orphaned",
+		map[string]string{"kind": "vulnerabilityreport"}); !ok || v != 1 {
+		t.Fatalf("orphan gauge = %v,%v want 1,true (only the dead-owner report)", v, ok)
+	}
+}
+
+func TestSprawlGCPrunesSupersededHelmSecrets(t *testing.T) {
+	var objs []runtime.Object
+	for v := 1; v <= 13; v++ {
+		objs = append(objs, helmSecret("apps", "myrelease", v, "superseded"))
+	}
+	// The newest revision is deployed — never a prune candidate.
+	objs = append(objs, helmSecret("apps", "myrelease", 14, "deployed"))
+	cs := fake.NewSimpleClientset(objs...)
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("superseded excess must fail: %+v", res)
+	}
+	remaining := 0
+	list, err := cs.CoreV1().Secrets("apps").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list secrets: %v", err)
+	}
+	for _, s := range list.Items {
+		if s.Labels["status"] == "superseded" {
+			remaining++
+		}
+	}
+	if remaining != sprawlMaxSuperseded {
+		t.Fatalf("superseded secrets = %d want %d", remaining, sprawlMaxSuperseded)
+	}
+	if _, err := cs.CoreV1().Secrets("apps").Get(ctx,
+		"sh.helm.release.v1.myrelease.v14", metav1.GetOptions{}); err != nil {
+		t.Fatalf("deployed revision must survive: %v", err)
+	}
+	// The OLDEST superseded die first — v1..v3 are the excess.
+	if _, err := cs.CoreV1().Secrets("apps").Get(ctx,
+		"sh.helm.release.v1.myrelease.v1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("oldest superseded secret should be pruned, err=%v", err)
+	}
+	if v, ok := testutil.GaugeSeriesValue(t, "node_automation_helm_release_secrets_excess",
+		map[string]string{"namespace": "apps", "release": "myrelease"}); !ok || v != 3 {
+		t.Fatalf("excess gauge = %v,%v want 3,true", v, ok)
+	}
+}

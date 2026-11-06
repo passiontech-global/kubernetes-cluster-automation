@@ -147,11 +147,14 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// errors, plus five W10 checks that also census pods:
 	// linkerd-protocol-detection-stall, cilium-node-ipam-exhaustion
 	// (pod-count fallback), rabbitmq-quorum-health,
-	// coredns-upstream (readiness fallback), image-pull-storm ->
-	// eleven total. (linkerd-endpoint-sync skips its pod census
+	// coredns-upstream (readiness fallback), image-pull-storm, plus
+	// five more pod-census checks added since: cilium-missing-endpoint,
+	// linkerd-h2-stream-guard, cloudflared-tunnel-health,
+	// postgres-wal-archive-guard, scylla-compaction-schema-guard ->
+	// sixteen total. (linkerd-endpoint-sync skips its pod census
 	// entirely when no namespace carries linkerd.io/inject=enabled.)
-	if got := errCount() - before; got != 11 {
-		t.Fatalf("run errors delta = %v, want 11", got)
+	if got := errCount() - before; got != 16 {
+		t.Fatalf("run errors delta = %v, want 16", got)
 	}
 }
 

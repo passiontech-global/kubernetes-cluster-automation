@@ -229,6 +229,31 @@ func TestDeadlockHealCooldown(t *testing.T) {
 	}
 }
 
+// A StatefulSet the go-kube-downscaler parked at spec.replicas:0 —
+// 0 ready endpoints on its master Service is sleep, never a
+// masterless signature. (ReadyReplicas=1 proves the downscaler
+// guard did the work — the ReadyReplicas gate alone would mask it.)
+func TestMasterlessSkipsDownscaledSTS(t *testing.T) {
+	base := time.Now()
+	zero := int32(0)
+	sts := shSTS("db", "dragonfly", 1,
+		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
+	sts.Spec.Replicas = &zero
+	sts.Annotations = map[string]string{"downscaler/downtime-replicas": "0"}
+	svc := shMasterSvc("db", "dragonfly-master",
+		map[string]string{"app": "dragonfly", "role": "master"})
+	cs := fake.NewSimpleClientset(sts, svc)
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
+		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
+	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealAt = base.Add(-4 * time.Minute)
+
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("downscaled statefulset must pass: %+v", res)
+	}
+}
+
 // Deliberate maintenance (a cordoned node) defers the pod kill.
 func TestDeadlockMaintenanceDefers(t *testing.T) {
 	base := time.Now()

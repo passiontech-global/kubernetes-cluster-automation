@@ -48,9 +48,11 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "acme.cert-manager.io", Version: "v1", Kind: "Order"},
 	{Group: "acme.cert-manager.io", Version: "v1", Kind: "Challenge"},
 
-	// cilium (ciliumidentityauditor).
+	// cilium (ciliumidentityauditor, clusterhealthprobes' endpoint/
+	// node scans).
 	{Group: "cilium.io", Version: "v2", Kind: "CiliumIdentity"},
 	{Group: "cilium.io", Version: "v2", Kind: "CiliumEndpoint"},
+	{Group: "cilium.io", Version: "v2", Kind: "CiliumNode"},
 	{Group: "cilium.io", Version: "v2alpha1", Kind: "CiliumEndpointSlice"},
 
 	// external-secrets — v1 and v1beta1 are BOTH served and both
@@ -92,10 +94,26 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "operators.coreos.com", Version: "v1alpha1", Kind: "ClusterServiceVersion"},
 	{Group: "operators.coreos.com", Version: "v1alpha1", Kind: "Subscription"},
 
-	// percona operator clusters (clusterhealthprobes).
+	// percona operator clusters (clusterhealthprobes) + the postgres
+	// WAL guard's CNPG scan.
 	{Group: "pxc.percona.com", Version: "v1", Kind: "PerconaXtraDBCluster"},
 	{Group: "pgv2.percona.com", Version: "v2", Kind: "PerconaPGCluster"},
 	{Group: "psmdb.percona.com", Version: "v1", Kind: "PerconaServerMongoDB"},
+	{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Cluster"},
+
+	// trivy-operator reports + policy-reporter (clusterhealthprobes'
+	// api-object-sprawl-report-gc census/GC).
+	{Group: "aquasecurity.github.io", Version: "v1alpha1", Kind: "VulnerabilityReport"},
+	{Group: "aquasecurity.github.io", Version: "v1alpha1", Kind: "ConfigAuditReport"},
+	{Group: "aquasecurity.github.io", Version: "v1alpha1", Kind: "ExposedSecretReport"},
+	{Group: "aquasecurity.github.io", Version: "v1alpha1", Kind: "EphemeralReport"},
+	{Group: "wgpolicyk8s.io", Version: "v1alpha2", Kind: "PolicyReport"},
+
+	// liqo multi-cluster networking (clusterhealthprobes'
+	// liqo-tunnel-health peer scan).
+	{Group: "networking.liqo.io", Version: "v1beta1", Kind: "Connection"},
+	{Group: "networking.liqo.io", Version: "v1beta1", Kind: "GatewayClient"},
+	{Group: "networking.liqo.io", Version: "v1beta1", Kind: "GatewayServer"},
 
 	// medik8s self-node-remediation family (deadnodesweeper,
 	// clusterhealthprobes' nodehealthchecks scan).
