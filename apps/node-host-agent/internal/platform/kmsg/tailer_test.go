@@ -200,10 +200,11 @@ func TestTailerReadError(t *testing.T) {
 	}
 }
 
-// TestTailerCarrySurvivesFailedRead: a failed Read must not consume
-// the carry — it rejoins on the next handle (nodereporter kept its
-// pending buffer across closeKmsg).
-func TestTailerCarrySurvivesFailedRead(t *testing.T) {
+// TestTailerCloseDropsCarry: a failed Read must not consume the
+// carry — but Close DOES drop it, since the reopened handle resumes
+// at a different ring position and splicing the stale partial onto
+// the next first record would corrupt a line.
+func TestTailerCloseDropsCarry(t *testing.T) {
 	dir, dev := tailerFixture(t, "6,1,5,-;partial")
 	paths := []string{dev}
 	tail := NewTailer(TailerOptions{
@@ -214,14 +215,22 @@ func TestTailerCarrySurvivesFailedRead(t *testing.T) {
 	if _, _, err := tail.Read(); err != nil {
 		t.Fatal(err)
 	}
-	// Next handle is the erroring directory: the carry must not be
-	// consumed by the failed read.
-	paths = []string{dir}
+	if string(tail.pending) != "6,1,5,-;partial" {
+		t.Fatalf("carry before close: %q", tail.pending)
+	}
+	// Close drops the carry with the handle — the next read must not
+	// splice the stale partial onto whatever the new handle yields.
 	tail.Close()
+	if tail.pending != nil {
+		t.Fatalf("pending survived Close: %q", tail.pending)
+	}
+	// Next handle is the erroring directory: the failed read leaves
+	// the (empty) carry alone.
+	paths = []string{dir}
 	if _, _, err := tail.Read(); err == nil {
 		t.Fatal("expected read error")
 	}
-	if string(tail.pending) != "6,1,5,-;partial" {
-		t.Fatalf("pending lost on failed read: %q", tail.pending)
+	if tail.pending != nil {
+		t.Fatalf("pending appeared on failed read: %q", tail.pending)
 	}
 }

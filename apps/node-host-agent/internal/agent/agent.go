@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -134,15 +135,37 @@ func (a *Agent) probeMux() *http.ServeMux {
 	return mux
 }
 
+const (
+	// shutdownGrace bounds each http.Server.Shutdown drain on ctx
+	// cancel — the handlers already run under the per-server
+	// timeouts, so a longer drain only delays pod termination.
+	shutdownGrace = 5 * time.Second
+	// subsystemShutdownTimeout bounds the supervise-goroutine wait
+	// before Run returns — a subsystem wedged mid-check must not
+	// pin the agent's own shutdown forever.
+	subsystemShutdownTimeout = 10 * time.Second
+)
+
 // Run starts the configured subsystems, binds both listeners, marks
 // the agent ready, then blocks until ctx is cancelled or a server
-// fails. Shutdown is graceful. The per-subsystem supervision loop
+// fails. Shutdown is graceful: the HTTP servers drain under a
+// bounded timeout and Run waits — bounded — for the supervise
+// goroutines to exit so per-subsystem cleanup (deferred state
+// flushes like apiprober's flushStates) actually completes instead
+// of being abandoned mid-flight. The per-subsystem supervision loop
 // (panic recovery, restart backoff, subUp/restarts metrics) lives in
 // supervisor.go.
 func (a *Agent) Run(ctx context.Context) error {
 	a.started.Store(time.Now().UnixNano())
 
-	a.supervise(ctx)
+	// sctx scopes the supervise goroutines to Run: on the
+	// listener-error path (parent ctx still live) Run cancels them
+	// itself before waiting — otherwise the loops would outlive a
+	// Run that already reported failure.
+	sctx, stop := context.WithCancel(ctx)
+	defer stop()
+	var wg sync.WaitGroup
+	a.supervise(sctx, &wg)
 
 	metricsLn, err := net.Listen("tcp", a.cfg.MetricsAddr)
 	if err != nil {
@@ -163,6 +186,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	done := make(chan struct{})
 	defer close(done)
 	var servers []*http.Server
+	var srvWG sync.WaitGroup
 	serve := func(name string, ln net.Listener, h http.Handler) {
 		// The metrics handler collects at scrape time and can block
 		// on a hung filesystem — bound every phase so one wedged
@@ -175,7 +199,11 @@ func (a *Agent) Run(ctx context.Context) error {
 			IdleTimeout:       60 * time.Second,
 		}
 		servers = append(servers, srv)
-		go gracefulShutdown(ctx, done, name, srv.Shutdown)
+		srvWG.Add(1)
+		go func() {
+			defer srvWG.Done()
+			gracefulShutdown(ctx, done, name, srv.Shutdown)
+		}()
 		go func() {
 			logger().Info("listening", "server", name, "addr", ln.Addr().String())
 			if err := srv.Serve(ln); err != http.ErrServerClosed {
@@ -188,6 +216,12 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		// The parked gracefulShutdown goroutines are draining the
+		// servers under shutdownGrace — wait for that drain to
+		// actually finish, then for every supervise goroutine to
+		// unwind (bounded — a wedged subsystem can't pin Run).
+		srvWG.Wait()
+		waitSubsystems(&wg)
 		return nil
 	case err := <-errCh:
 		// A listener died while ctx is live — drop the sibling server
@@ -199,7 +233,30 @@ func (a *Agent) Run(ctx context.Context) error {
 					"error", cerr)
 			}
 		}
+		// Cancel the supervise goroutines and give their cleanup a
+		// bounded moment — the parent ctx is still live here.
+		stop()
+		waitSubsystems(&wg)
 		return err
+	}
+}
+
+// waitSubsystems blocks until every supervise goroutine has exited,
+// bounded by subsystemShutdownTimeout — a subsystem ignoring ctx
+// (wedged mid-check) logs a warning and is abandoned rather than
+// pinning the whole agent's shutdown.
+func waitSubsystems(wg *sync.WaitGroup) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(subsystemShutdownTimeout):
+		logger().Warn("subsystem shutdown timed out — abandoning "+
+			"supervise goroutines",
+			"timeout", subsystemShutdownTimeout)
 	}
 }
 
@@ -223,7 +280,12 @@ func gracefulShutdown(ctx context.Context, done <-chan struct{},
 		// path — nothing left to drain.
 		return
 	}
-	if err := shutdown(context.Background()); err != nil &&
+	// Bounded drain: the parent's ctx is already dead, so the
+	// shutdown gets its own deadline — a handler ignoring conn
+	// close would otherwise hold Run's srvWG wait open.
+	sctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	if err := shutdown(sctx); err != nil &&
 		!errors.Is(err, http.ErrServerClosed) {
 		logger().Error("server shutdown failed — connections dropped",
 			"server", name, "error", err)

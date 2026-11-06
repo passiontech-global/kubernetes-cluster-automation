@@ -157,10 +157,11 @@ func (t *Tailer) Read() (lines [][]byte, res ReadResult, err error) {
 // Close drops the open handle so the next Read re-opens the device
 // — the consumers' answer to a mid-stream read error. The backlog
 // gates reset with the handle (a reopen replays the retained ring
-// through the lookback filter instead of emitting it live), while
-// the partial-line carry survives: a record split across the handle
-// loss still rejoins at the next drain — nodereporter's closeKmsg
-// never touched its pending buffer.
+// through the lookback filter instead of emitting it live), and the
+// partial-line carry is dropped WITH it: the reopened handle resumes
+// at a different ring position (the kernel rewinds or auto-advances
+// on reopen), so splicing the stale carry onto the next first record
+// would corrupt a line.
 func (t *Tailer) Close() {
 	if t.f != nil {
 		_ = t.f.Close()
@@ -168,4 +169,5 @@ func (t *Tailer) Close() {
 	}
 	t.reads = 0
 	t.caught = false
+	t.pending = nil
 }

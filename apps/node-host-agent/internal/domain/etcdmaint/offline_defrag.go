@@ -173,6 +173,16 @@ func startTempEtcdExec(ctx context.Context, bin string,
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
+	// A cancelled ctx must NOT SIGKILL etcd mid-defrag — a hard kill
+	// on live bbolt data files risks corruption and leaves the
+	// data-dir lock unreleased. Send SIGTERM (the script's
+	// `kill "$STANDALONE"` parity: etcd flushes and drops the lock
+	// cleanly), and only escalate to SIGKILL if the killGracePeriod
+	// WaitDelay elapses.
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = killGracePeriod
 	cmd.Stdout = f
 	cmd.Stderr = f
 	if err := cmd.Start(); err != nil {

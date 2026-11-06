@@ -82,9 +82,36 @@ func (s *Syncer) Cycle(ctx context.Context) {
 		}
 	}
 
+	// The local binary hash is computed ONCE per cycle — the old
+	// per-target sha256File ran 10x ~15MiB disk reads per cycle on a
+	// 10-target inventory (pagecache.Drop after it re-faulted the
+	// same pages anyway). A hash failure aborts the whole cycle:
+	// every target's binary compare needs it, same blast radius as
+	// the parse error above.
+	localSum, err := sha256File(s.cfg.LocalBinary)
+	if err != nil {
+		s.cfg.Log.Error("hubsync: local binary hash failed — cycle aborted",
+			"path", s.cfg.LocalBinary, "error", err)
+		s.cycles.WithLabelValues("all", "error").Inc()
+		for _, name := range s.lastTargets {
+			s.targetUp.WithLabelValues(name).Set(0)
+		}
+		return
+	}
+
 	var converged, skipped, failed int
-	for _, t := range targets {
+	for i, t := range targets {
 		if ctx.Err() != nil {
+			return
+		}
+		// Re-check the hold before EVERY target — a multi-minute
+		// WAN converge can easily outlive the 60s LeaseDuration if
+		// the renewer stalls, and continuing would have two holders
+		// SSH-converging the same fleet (split-brain).
+		if !s.leaseHeld() {
+			s.cfg.Log.Warn("hubsync: lease lost or lapsed mid-cycle — "+
+				"aborting converge", "done", i, "remaining",
+				len(targets)-i)
 			return
 		}
 		if t.APILB && !guardOK {
@@ -95,7 +122,7 @@ func (s *Syncer) Cycle(ctx context.Context) {
 			skipped++
 			continue
 		}
-		if err := s.syncTarget(ctx, t, token, ca); err != nil {
+		if err := s.syncTarget(ctx, t, token, ca, localSum); err != nil {
 			s.cfg.Log.Error("hubsync: target converge failed",
 				"target", t.Name, "ip", t.IP, "error", err)
 			s.cycles.WithLabelValues(t.Name, "error").Inc()
@@ -176,8 +203,10 @@ func (s *Syncer) guardCreds(ctx context.Context) (token, ca []byte, err error) {
 
 // syncTarget converges one host over SSH: binary, vars (+ nebula
 // certs on interdc nodes), api-lb credentials, then the systemd unit
-// and its enable/restart action.
-func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte) error {
+// and its enable/restart action. localSum is the caller's hash of
+// LocalBinary — computed once per Cycle rather than per target; ""
+// re-hashes here (tests, one-off callers).
+func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, localSum string) error {
 	cfg := s.cfg
 	tctx, cancel := context.WithTimeout(ctx, cfg.TargetTimeout)
 	defer cancel()
@@ -224,9 +253,11 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte) err
 	if err != nil {
 		return err
 	}
-	localSum, err := sha256File(cfg.LocalBinary)
-	if err != nil {
-		return err
+	if localSum == "" {
+		localSum, err = sha256File(cfg.LocalBinary)
+		if err != nil {
+			return err
+		}
 	}
 	binaryUpdated := false
 	if remoteSum != localSum {

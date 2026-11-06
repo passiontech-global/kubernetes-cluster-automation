@@ -22,6 +22,16 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
+// holdLease marks the lease held through the deadline — direct
+// s.Cycle callers need it: Cycle re-checks leaseHeld() before every
+// target, and a bare Syncer holds nothing.
+func holdLease(s *Syncer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.held = true
+	s.leaseExpiresAt = s.cfg.NowFn().Add(time.Hour)
+}
+
 // testConfig returns a Config pointed at the fixture dirs plus a
 // scratch local binary, an existing SSH key path (ensureKey gate),
 // fake dialer and fake clientset carrying the guard secret.
@@ -74,7 +84,7 @@ func TestSyncTargetFreshHost(t *testing.T) {
 	tg := Target{Name: "hub-controller-01", IP: "10.0.0.25",
 		SSHUser: "root", InterDC: true, Hub: true}
 
-	if err := s.syncTarget(context.Background(), tg, nil, nil); err != nil {
+	if err := s.syncTarget(context.Background(), tg, nil, nil, ""); err != nil {
 		t.Fatalf("syncTarget: %v", err)
 	}
 	c := dialer.conn(tg)
@@ -123,7 +133,7 @@ func TestSyncTargetNonInterDC(t *testing.T) {
 		t.Fatal(err)
 	}
 	tg := Target{Name: "db-vm", IP: "10.0.0.15", SSHUser: "root", KineDB: true}
-	if err := s.syncTarget(context.Background(), tg, nil, nil); err != nil {
+	if err := s.syncTarget(context.Background(), tg, nil, nil, ""); err != nil {
 		t.Fatalf("syncTarget: %v", err)
 	}
 	ops := strings.Join(dialer.conn(tg).opsLog(), "\n")
@@ -150,7 +160,7 @@ func TestSyncTargetBinaryUpToDate(t *testing.T) {
 		[]byte(systemdUnit(tg, s.cfg.RemoteBinary, s.cfg.RemoteVarsDir, s.cfg.RemoteCertsDir)))
 	dialer.conns[tg.IP] = c
 
-	if err := s.syncTarget(context.Background(), tg, nil, nil); err != nil {
+	if err := s.syncTarget(context.Background(), tg, nil, nil, ""); err != nil {
 		t.Fatalf("syncTarget: %v", err)
 	}
 	ops := strings.Join(c.opsLog(), "\n")
@@ -180,7 +190,7 @@ func TestSyncTargetBinaryUpdatedRestarts(t *testing.T) {
 	c.seedFile("/usr/local/bin/node-host-agent", []byte("old-binary"))
 	dialer.conns[tg.IP] = c
 
-	if err := s.syncTarget(context.Background(), tg, nil, nil); err != nil {
+	if err := s.syncTarget(context.Background(), tg, nil, nil, ""); err != nil {
 		t.Fatalf("syncTarget: %v", err)
 	}
 	ops := c.opsLog()
@@ -203,7 +213,7 @@ func TestSyncTargetAPILBCreds(t *testing.T) {
 	}
 	tg := Target{Name: "api-lb-vm", IP: "10.0.0.14", SSHUser: "root", APILB: true}
 	if err := s.syncTarget(context.Background(), tg,
-		[]byte("guard-token-value"), []byte("guard-ca-pem")); err != nil {
+		[]byte("guard-token-value"), []byte("guard-ca-pem"), ""); err != nil {
 		t.Fatalf("syncTarget: %v", err)
 	}
 	c := dialer.conn(tg)
@@ -225,7 +235,7 @@ func TestSyncTargetAPILBCreds(t *testing.T) {
 	// Non-APILB target never touches the guard dir.
 	plain := Target{Name: "db-vm", IP: "10.0.0.15", SSHUser: "root"}
 	if err := s.syncTarget(context.Background(), plain,
-		[]byte("t"), []byte("c")); err != nil {
+		[]byte("t"), []byte("c"), ""); err != nil {
 		t.Fatalf("syncTarget plain: %v", err)
 	}
 	ops := strings.Join(dialer.conn(plain).opsLog(), "\n")
@@ -243,6 +253,7 @@ func TestCycleEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	holdLease(s)
 	s.Cycle(context.Background())
 
 	if got := len(dialer.dials()); got != 5 {
@@ -278,6 +289,7 @@ func TestCycleTargetErrorIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	holdLease(s)
 	s.Cycle(context.Background())
 	cycles := gatherVec(t, reg, "node_host_agent_hubsync_cycles_total")
 	if cycles[labelKey("target", "db-vm", "result", "error")] != 1 {
@@ -522,7 +534,7 @@ func TestSyncTargetNonRootSudo(t *testing.T) {
 	}
 	tg := Target{Name: "lanit-hub-01", IP: "10.1.0.7",
 		SSHUser: "ubuntu", InterDC: true}
-	if err := s.syncTarget(context.Background(), tg, nil, nil); err != nil {
+	if err := s.syncTarget(context.Background(), tg, nil, nil, ""); err != nil {
 		t.Fatalf("syncTarget: %v", err)
 	}
 	c := dialer.conn(tg)
@@ -542,7 +554,7 @@ func TestSyncTargetNonRootSudo(t *testing.T) {
 
 	// Root target keeps raw commands.
 	root := Target{Name: "db-vm", IP: "10.0.0.15", SSHUser: "root"}
-	if err := s.syncTarget(context.Background(), root, nil, nil); err != nil {
+	if err := s.syncTarget(context.Background(), root, nil, nil, ""); err != nil {
 		t.Fatalf("syncTarget root: %v", err)
 	}
 	for _, op := range dialer.conn(root).opsLog() {
@@ -572,7 +584,7 @@ func TestSyncTargetSudoUnavailable(t *testing.T) {
 	}
 	dialer.conns[tg.IP] = c
 
-	err = s.syncTarget(context.Background(), tg, nil, nil)
+	err = s.syncTarget(context.Background(), tg, nil, nil, "")
 	if err == nil {
 		t.Fatal("syncTarget succeeded without passwordless sudo")
 	}
@@ -601,6 +613,7 @@ func TestCycleSecretFailureScopesAPILB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	holdLease(s)
 	s.Cycle(context.Background())
 
 	cycles := gatherVec(t, reg, "node_host_agent_hubsync_cycles_total")
@@ -633,6 +646,7 @@ func TestCycleTargetUpGauge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	holdLease(s)
 	s.Cycle(context.Background())
 
 	up := gatherVec(t, reg, "node_host_agent_hubsync_target_up")
@@ -654,6 +668,7 @@ func TestCycleTargetUpGauge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	holdLease(s2)
 	s2.Cycle(context.Background())
 	up2 := gatherVec(t, reg2, "node_host_agent_hubsync_target_up")
 	if up2[labelKey("target", "api-lb-vm")] != 0 {
@@ -689,6 +704,7 @@ func TestCycleParseErrorClearsTargetUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	holdLease(s)
 	s.Cycle(context.Background())
 	up := gatherVec(t, reg, "node_host_agent_hubsync_target_up")
 	for _, name := range []string{"hub-controller-01", "lanit-hub-01",
@@ -704,6 +720,7 @@ func TestCycleParseErrorClearsTargetUp(t *testing.T) {
 	if err := os.Remove(path.Join(vars, "interdc_nodes.yaml")); err != nil {
 		t.Fatal(err)
 	}
+	holdLease(s)
 	s.Cycle(context.Background())
 	if got := len(dialer.dials()); got != 5 {
 		t.Fatalf("dialed during parse-error cycle: %d dials", got-5)
@@ -750,7 +767,7 @@ func TestNebulaCertsFilter(t *testing.T) {
 	}
 	tg := Target{Name: "hub-controller-01", IP: "10.0.0.25",
 		SSHUser: "root", InterDC: true}
-	if err := s.syncTarget(context.Background(), tg, nil, nil); err != nil {
+	if err := s.syncTarget(context.Background(), tg, nil, nil, ""); err != nil {
 		t.Fatalf("syncTarget: %v", err)
 	}
 	c := dialer.conn(tg)
@@ -871,6 +888,7 @@ func TestCycleUnresolvedTargetMarkedDown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	holdLease(s)
 	s.Cycle(context.Background())
 
 	up := gatherVec(t, reg, "node_host_agent_hubsync_target_up")
@@ -888,6 +906,7 @@ func TestCycleUnresolvedTargetMarkedDown(t *testing.T) {
 	}
 
 	// Second cycle — still unresolved → series kept (prune skip).
+	holdLease(s)
 	s.Cycle(context.Background())
 	up = gatherVec(t, reg, "node_host_agent_hubsync_target_up")
 	if _, ok := up[labelKey("target", "ghost-vm")]; !ok {
@@ -900,6 +919,7 @@ func TestCycleUnresolvedTargetMarkedDown(t *testing.T) {
 		0o644); err != nil {
 		t.Fatal(err)
 	}
+	holdLease(s)
 	s.Cycle(context.Background())
 	up = gatherVec(t, reg, "node_host_agent_hubsync_target_up")
 	if _, ok := up[labelKey("target", "ghost-vm")]; ok {

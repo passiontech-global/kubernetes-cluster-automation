@@ -7,6 +7,7 @@ package agent
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -14,10 +15,16 @@ import (
 // subsystem and returns immediately. Run calls it before binding
 // the listeners so subsystem startup never blocks serving — and a
 // subsystem that exits instantly still gets its restart backoff
-// regardless of server health.
-func (a *Agent) supervise(ctx context.Context) {
+// regardless of server health. Each goroutine is counted in wg so
+// Run can wait for subsystem teardown (deferred state flushes) on
+// shutdown instead of abandoning the loops mid-flight.
+func (a *Agent) supervise(ctx context.Context, wg *sync.WaitGroup) {
 	for _, sub := range a.cfg.Subsystems {
-		go a.superviseSubsystem(ctx, sub)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a.superviseSubsystem(ctx, sub)
+		}()
 	}
 }
 

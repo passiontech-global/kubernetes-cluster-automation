@@ -253,6 +253,13 @@ type Syncer struct {
 	held            bool // lease currently held
 	syncedWhileHeld bool // a cycle already ran since the lease was acquired
 	keyReady        bool // converge SSH key observed at least once (latched)
+	// leaseExpiresAt is the wall-clock moment our claim lapses —
+	// renew stamps it from the fresh RenewTime + the advertised
+	// LeaseDurationSeconds. A bare `held` flag goes stale when the
+	// renew path breaks (hung apiserver conn, crashed renewer):
+	// the real Lease then lapses, a second pod takes over, and this
+	// pod keeps converging — split-brain. leaseHeld() requires BOTH.
+	leaseExpiresAt time.Time
 	// cycleCh signals "lease freshly held — converge now" from the
 	// renew loop to the cycle driver (buffered 1, drop-when-full).
 	cycleCh chan struct{}
@@ -417,11 +424,17 @@ func (s *Syncer) leaseLoop(ctx context.Context) {
 	}
 }
 
-// leaseHeld reports the current hold state (mutexed).
+// leaseHeld reports whether we still own the converge singleton —
+// the flag must be set AND the claim must not have lapsed. The
+// expiry half is what actually prevents split-brain: `held` is only
+// refreshed by renewLease, so a stalled renewer (dead apiserver conn
+// before the op timeouts, a panicked loop) leaves it true forever —
+// while the real Lease lapses and a second pod takes over. Cycle
+// re-checks this before EVERY target, not just at cycle start.
 func (s *Syncer) leaseHeld() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.held
+	return s.held && s.cfg.NowFn().Before(s.leaseExpiresAt)
 }
 
 // freshHold reports whether the lease is held but no cycle ran yet

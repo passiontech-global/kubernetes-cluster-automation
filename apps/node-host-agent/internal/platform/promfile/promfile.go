@@ -121,6 +121,14 @@ func Write(dir, name string, content []byte) error {
 		return err
 	}
 	defer func() { _ = os.Remove(tmp.Name()) }()
+	// CreateTemp stages 0600 — the file lands as <name>.prom via the
+	// rename below, and node_exporter's textfile collector runs as
+	// its own user: a 0600 prom file is unreadable to it, so the
+	// staged file must carry the final mode before sync+rename.
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(content); err != nil {
 		_ = tmp.Close()
 		return err

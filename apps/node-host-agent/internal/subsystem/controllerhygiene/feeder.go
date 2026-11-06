@@ -52,8 +52,16 @@ import (
 // runFeeder is the feeder's forever loop — it only returns when ctx
 // is cancelled. One tracked k0scontroller instance at a time.
 func (h *Hygiene) runFeeder(ctx context.Context) {
-	cfg := h.cfg
-	unit := cfg.RestartUnit
+	// Snapshot ONLY the feeder sub-config + restart unit — never the
+	// whole cfg: Cycle's refreshWatchdogConf rewrites the
+	// watchdog-conf-derived groups (Hub/Sig13/KineTTL/KinePool/
+	// OOMLoop) on the same struct, and a whole-Config copy would
+	// race that refresh (workerhygiene's feederWatchdogConf parity:
+	// the feeder goroutine must not touch mutable cfg fields).
+	// Feeder.* and RestartUnit are not conf-derived — immutable
+	// after New.
+	fcfg := h.cfg.Feeder
+	unit := h.cfg.RestartUnit
 	// The gauge must not pin at 1 once the loop exits (ctx cancel
 	// or a recovered panic in the wrapper) — it would advertise
 	// "still feeding" while WATCHDOG=1 has stopped.
@@ -64,7 +72,7 @@ func (h *Hygiene) runFeeder(ctx context.Context) {
 		return // ctx cancelled while waiting
 	}
 	h.state.AppendLog(fmt.Sprintf("feeder: start %s.MainPID=%s interval=%ds url=%s",
-		unit, mainPID, int(cfg.Feeder.Interval.Seconds()), cfg.Feeder.ProbeURL))
+		unit, mainPID, int(fcfg.Interval.Seconds()), fcfg.ProbeURL))
 
 	fails := 0
 	everOK := false
@@ -82,7 +90,7 @@ func (h *Hygiene) runFeeder(ctx context.Context) {
 			everOK = false
 		}
 
-		alive := h.cfg.probeFn(ctx, cfg.Feeder.ProbeURL)
+		alive := h.cfg.probeFn(ctx, fcfg.ProbeURL)
 		doFeed := false
 		if alive {
 			everOK = true
@@ -90,9 +98,9 @@ func (h *Hygiene) runFeeder(ctx context.Context) {
 			doFeed = true
 		} else {
 			fails++
-			limit := cfg.Feeder.MaxFail
+			limit := fcfg.MaxFail
 			if !everOK {
-				limit = cfg.Feeder.GraceFails
+				limit = fcfg.GraceFails
 			}
 			h.state.AppendLog(fmt.Sprintf("feeder: probe fail %d/%d", fails, limit))
 			if fails >= limit {
@@ -137,7 +145,7 @@ func (h *Hygiene) runFeeder(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(cfg.Feeder.Interval):
+		case <-time.After(fcfg.Interval):
 		}
 	}
 }
@@ -173,15 +181,18 @@ func (h *Hygiene) unitProp(ctx context.Context, unit, prop string) string {
 // apiserver is dead (the feeder may have self-wedged/missed a
 // notify) — every gate is a chance to stop before the restart.
 func (h *Hygiene) runRemediate(ctx context.Context) {
-	cfg := h.cfg
-	unit := cfg.RestartUnit
+	// Same narrow-snapshot rule as runFeeder: a whole-Config copy
+	// would race Cycle's refreshWatchdogConf writes; Feeder.* and
+	// RestartUnit are immutable after New.
+	fcfg := h.cfg.Feeder
+	unit := h.cfg.RestartUnit
 	h.actions.WithLabelValues(checkFeeder, "remediate").Inc()
 	h.state.AppendLog("remediate: OnFailure trigger — running ordered gates before restart of " + unit)
 
 	// G1: re-probe twice 3s apart — one answer = apiserver alive =
 	// false alarm (self-correcting).
 	for i := 1; i <= 2; i++ {
-		if h.cfg.probeFn(ctx, cfg.Feeder.ProbeURL) {
+		if h.cfg.probeFn(ctx, fcfg.ProbeURL) {
 			h.state.AppendLog(fmt.Sprintf(
 				"G1 PASS: apiserver answered on probe %d — false alarm, no restart", i))
 			return
@@ -217,10 +228,10 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 		return
 	}
 	ageS := int64(h.cfg.nowFn().Sub(entered).Seconds())
-	if ageS < int64(cfg.Feeder.RemediateFreshGrace.Seconds()) {
+	if ageS < int64(fcfg.RemediateFreshGrace.Seconds()) {
 		h.state.AppendLog(fmt.Sprintf(
 			"G3 PASS: %s started %ds ago (< %ds grace) — apiserver may still be initialising, stop",
-			unit, ageS, int(cfg.Feeder.RemediateFreshGrace.Seconds())))
+			unit, ageS, int(fcfg.RemediateFreshGrace.Seconds())))
 		return
 	}
 	h.state.AppendLog(fmt.Sprintf("G3: %s running %ds — not a fresh start", unit, ageS))
@@ -250,13 +261,13 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 	// the Store's Dir (WatchdogStateDir), and last-restart lives
 	// under FeederStateDir instead.
 	h.rateMu.Lock()
-	lastPath := filepath.Join(cfg.Feeder.StateDir, fileFeederLastRst)
+	lastPath := filepath.Join(fcfg.StateDir, fileFeederLastRst)
 	delta := h.cfg.nowFn().Unix() - h.state.Epoch(lastPath)
-	if delta < int64(cfg.Feeder.RemediateMinRestart.Seconds()) {
+	if delta < int64(fcfg.RemediateMinRestart.Seconds()) {
 		h.rateMu.Unlock()
 		h.state.AppendLog(fmt.Sprintf(
 			"G5 PASS: last restart %ds ago (< %ds) — rate-limit, stop",
-			delta, int(cfg.Feeder.RemediateMinRestart.Seconds())))
+			delta, int(fcfg.RemediateMinRestart.Seconds())))
 		return
 	}
 	h.state.AppendLog(fmt.Sprintf("G5: previous restart %ds ago — allowed", delta))
@@ -270,10 +281,10 @@ func (h *Hygiene) runRemediate(ctx context.Context) {
 	// a killed/hung restartFn with an unwritten budget would allow a
 	// second restart inside the 1800s window. FeederStateDir may not
 	// exist yet (mkdir -p parity) — create it so the mark lands.
-	if err := os.MkdirAll(cfg.Feeder.StateDir, 0o755); err != nil {
+	if err := os.MkdirAll(fcfg.StateDir, 0o755); err != nil {
 		h.rateMu.Unlock()
 		h.state.AppendLogWarn(fmt.Sprintf("G6: mkdir %s failed: %v — restart skipped (budget file must exist)",
-			cfg.Feeder.StateDir, err))
+			fcfg.StateDir, err))
 		return
 	}
 	h.state.AppendLog("G6: all gates passed — systemctl restart " + unit)
