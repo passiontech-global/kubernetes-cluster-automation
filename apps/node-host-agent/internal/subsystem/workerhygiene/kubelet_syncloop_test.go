@@ -22,12 +22,12 @@ func TestSyncloopDownLatchesOnPLEGFreeze(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.state.Exists("kubelet-syncloop-down") {
+	if !e.h.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("state-kubelet-syncloop-down should latch after 2 failed syncloop probes")
 	}
 	e.status["https://127.0.0.1:10250/healthz/syncloop"] = 200
 	e.h.Cycle(context.Background())
-	if e.h.state.Exists("kubelet-syncloop-down") {
+	if e.h.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("recovery should clear the syncloop latch")
 	}
 }
@@ -44,7 +44,7 @@ func TestSyncloopNon200LogsStatusCode(t *testing.T) {
 		t.Fatalf("suspect line must carry the HTTP code, got:\n%s", got)
 	}
 	e.h.Cycle(context.Background()) // streak 2 → latch
-	if !e.h.state.Exists("kubelet-syncloop-down") {
+	if !e.h.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("latch expected after ConsecNeeded failed probes")
 	}
 	if got := logLines(t, e); strings.Contains(got, "last_err=<nil>") {
@@ -64,7 +64,7 @@ func TestSyncloopFailClosedWhenActiveCheckErrors(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if e.h.state.Exists("kubelet-syncloop-down") {
+	if e.h.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("no latch may be written while the unit state is unknown")
 	}
 }
@@ -80,7 +80,7 @@ func TestSyncloopUnauthorizedIsInconclusive(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if e.h.state.Exists("kubelet-syncloop-down") {
+	if e.h.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("401 must not latch kubelet-syncloop-down")
 	}
 	got := logLines(t, e)
@@ -108,7 +108,7 @@ func TestSyncloopProbeSendsBearerToken(t *testing.T) {
 	e.sdReply["is-active k0sworker.service"] = "active"
 	tok := filepath.Join(e.state, "sa-token")
 	writeFile(t, tok, "tok-abc-123\n")
-	e.h.cfg.Kubelet.TokenPath = tok
+	e.h.Cfg.Kubelet.TokenPath = tok
 	e.h.Cycle(context.Background())
 	if got := e.bearer["https://127.0.0.1:10250/healthz/syncloop"]; got != "tok-abc-123" {
 		t.Fatalf("syncloop probe bearer = %q, want the SA token", got)
@@ -118,16 +118,16 @@ func TestSyncloopProbeSendsBearerToken(t *testing.T) {
 func TestContainerdSockDownLatches(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.sockErrs[e.h.cfg.Ctr.Socket] = errors.New("connection refused")
+	e.sockErrs[e.h.Cfg.Ctr.Socket] = errors.New("connection refused")
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.state.Exists("containerd-sock-down") {
+	if !e.h.State.Exists("containerd-sock-down") {
 		t.Fatal("state-containerd-sock-down should latch after 2 socket failures")
 	}
-	e.sockErrs[e.h.cfg.Ctr.Socket] = nil
+	e.sockErrs[e.h.Cfg.Ctr.Socket] = nil
 	e.h.Cycle(context.Background())
-	if e.h.state.Exists("containerd-sock-down") {
+	if e.h.State.Exists("containerd-sock-down") {
 		t.Fatal("recovery should clear the containerd-sock latch")
 	}
 }
@@ -140,7 +140,7 @@ func TestContainerdSockDownLatches(t *testing.T) {
 // pins).
 func TestContainerdSocketDefaultPinsK0sPath(t *testing.T) {
 	c := Config{}
-	c.applyDefaults()
+	c.ApplyDefaults()
 	if c.Ctr.Socket != "/host/run/k0s/containerd.sock" {
 		t.Fatalf("default ContainerdSocket=%q, want /host/run/k0s/containerd.sock",
 			c.Ctr.Socket)
@@ -161,8 +161,8 @@ func TestProbeUnixSockDefaultReturnsNilOnConnect(t *testing.T) {
 	}
 	defer func() { _ = ln.Close() }()
 	c := Config{}
-	c.applyDefaults()
-	if err := c.Seams.probeUnixSock(context.Background(), sock, time.Second); err != nil {
+	c.ApplyDefaults()
+	if err := c.Seams.ProbeUnixSock(context.Background(), sock, time.Second); err != nil {
 		t.Fatalf("successful unix dial want nil, got %v", err)
 	}
 }

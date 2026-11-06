@@ -30,7 +30,7 @@ func mkZombieProc(t *testing.T, e *env, pid, ppid int) {
 func TestZombieStormLatchesAndLogsAction(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.cfg.Pressure.ZombieStormThreshold = 3 // fake proc trees are small
+	e.h.Cfg.Pressure.ZombieStormThreshold = 3 // fake proc trees are small
 	uid := "11111111_2222_3333_4444_555555555555"
 	parent := filepath.Join(e.proc, "777")
 	if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -46,10 +46,10 @@ func TestZombieStormLatchesAndLogsAction(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.state.Exists("zombie-storm") {
+	if !e.h.State.Exists("zombie-storm") {
 		t.Fatal("state-zombie-storm should latch after 2 storm cycles")
 	}
-	data, err := os.ReadFile(e.h.cfg.WatchdogLogFile)
+	data, err := os.ReadFile(e.h.Cfg.WatchdogLogFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func mkParentProc(t *testing.T, e *env, pid int, starttime string) {
 func TestZombieStormActionLoggedOncePerEpisode(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.cfg.Pressure.ZombieStormThreshold = 3
+	e.h.Cfg.Pressure.ZombieStormThreshold = 3
 	mkParentProc(t, e, 777, "111111")
 	for pid := 800; pid < 805; pid++ {
 		mkZombieProc(t, e, pid, 777)
@@ -85,7 +85,7 @@ func TestZombieStormActionLoggedOncePerEpisode(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.state.Exists("zombie-storm") {
+	if !e.h.State.Exists("zombie-storm") {
 		t.Fatal("storm latch should hold while the storm persists")
 	}
 	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 1 {
@@ -99,14 +99,14 @@ func TestZombieStormActionLoggedOncePerEpisode(t *testing.T) {
 func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.cfg.Pressure.ZombieStormThreshold = 3
+	e.h.Cfg.Pressure.ZombieStormThreshold = 3
 	mkParentProc(t, e, 777, "111111")
 	for pid := 800; pid < 805; pid++ {
 		mkZombieProc(t, e, pid, 777)
 	}
 	e.h.Cycle(context.Background()) // streak 1
 	e.h.Cycle(context.Background()) // streak 2 → ACTION + latch
-	if !e.h.state.Exists("zombie-storm") {
+	if !e.h.State.Exists("zombie-storm") {
 		t.Fatal("latch expected after 2 storm cycles")
 	}
 	// pid 777 is RECYCLED — same ppid, different starttime. The
@@ -114,7 +114,7 @@ func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 	// restarts at streak 1, the latch drops, no second ACTION yet.
 	mkParentProc(t, e, 777, "222222")
 	e.h.Cycle(context.Background())
-	if e.h.state.Exists("zombie-storm") {
+	if e.h.State.Exists("zombie-storm") {
 		t.Fatal("recycled ppid must not inherit the dead parent's streak")
 	}
 	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 1 {
@@ -123,7 +123,7 @@ func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 	// The new generation earns its own streak — latch + ACTION
 	// again on its own entry.
 	e.h.Cycle(context.Background())
-	if !e.h.state.Exists("zombie-storm") {
+	if !e.h.State.Exists("zombie-storm") {
 		t.Fatal("recycled parent's own streak should re-latch")
 	}
 	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 2 {
@@ -139,14 +139,14 @@ func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 func TestZombieStormLatchDropsBelowThreshold(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.cfg.Pressure.ZombieStormThreshold = 3
+	e.h.Cfg.Pressure.ZombieStormThreshold = 3
 	mkParentProc(t, e, 777, "111111")
 	for pid := 800; pid < 805; pid++ {
 		mkZombieProc(t, e, pid, 777)
 	}
 	e.h.Cycle(context.Background())
 	e.h.Cycle(context.Background())
-	if !e.h.state.Exists("zombie-storm") {
+	if !e.h.State.Exists("zombie-storm") {
 		t.Fatal("latch expected after 2 storm cycles")
 	}
 	// Storm drains to 2 zombies (≤ threshold but >0) — the parent
@@ -157,7 +157,7 @@ func TestZombieStormLatchDropsBelowThreshold(t *testing.T) {
 		}
 	}
 	e.h.Cycle(context.Background())
-	if e.h.state.Exists("zombie-storm") {
+	if e.h.State.Exists("zombie-storm") {
 		t.Fatal("latch held an extra cycle after storm dropped below threshold")
 	}
 }

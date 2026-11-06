@@ -11,6 +11,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // --- W10-KR3: containerd meta.db corruption latch ---
@@ -20,7 +22,7 @@ func TestContainerdMetaJournalLatch(t *testing.T) {
 	h := e.h
 	ctx := context.Background()
 	var journal string
-	h.cfg.Ctr.MetaJournalFn = func(context.Context) (string, error) {
+	h.Cfg.Ctr.MetaJournalFn = func(context.Context) (string, error) {
 		return journal, nil
 	}
 	pids := func() []int { return nil }
@@ -74,9 +76,9 @@ func TestHostOOMVictimEvent(t *testing.T) {
 	}
 	// Marker pair → one Warning event on the Node.
 	now := time.Now().Unix()
-	writeFile(t, h.cfg.Host.OOMVictimFile,
+	writeFile(t, h.Cfg.Host.OOMVictimFile,
 		strconv.FormatInt(now, 10)+" containerd-shim\n")
-	writeFile(t, h.cfg.Host.OOMCountFile, "3\n")
+	writeFile(t, h.Cfg.Host.OOMCountFile, "3\n")
 	h.checkHostOOMVictims(ctx)
 	h.checkHostOOMVictims(ctx) // dedup — same count, no second event
 	evs, err = e.cs.EventsV1().Events("default").List(ctx,
@@ -94,7 +96,7 @@ func TestHostOOMVictimEvent(t *testing.T) {
 			ev.Reason, ev.Type, ev.Regarding.Name)
 	}
 	// Count advances → second event.
-	writeFile(t, h.cfg.Host.OOMCountFile, "4\n")
+	writeFile(t, h.Cfg.Host.OOMCountFile, "4\n")
 	h.checkHostOOMVictims(ctx)
 	evs, _ = e.cs.EventsV1().Events("default").List(ctx,
 		metav1.ListOptions{})
@@ -110,8 +112,8 @@ func TestOrphanHostPathVolumes(t *testing.T) {
 	h := e.h
 	ctx := context.Background()
 	root := t.TempDir()
-	h.cfg.Disk.OrphanHostPathDirs = []string{filepath.Join(root, "prov")}
-	prov := h.cfg.Disk.OrphanHostPathDirs[0]
+	h.Cfg.Disk.OrphanHostPathDirs = []string{filepath.Join(root, "prov")}
+	prov := h.Cfg.Disk.OrphanHostPathDirs[0]
 	if err := os.MkdirAll(filepath.Join(prov, "pvc-orphan1"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -123,8 +125,8 @@ func TestOrphanHostPathVolumes(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(prov, "pvc-orphan1")); !os.IsNotExist(err) {
 		t.Fatal("empty orphan dir not removed under disk pressure")
 	}
-	if h.orphanHostPathDirs != 1 {
-		t.Fatalf("orphanHostPathDirs=%d want 1", h.orphanHostPathDirs)
+	if h.OrphanHostPathDirs != 1 {
+		t.Fatalf("orphanHostPathDirs=%d want 1", h.OrphanHostPathDirs)
 	}
 	// Dir holding data is reported but NEVER removed.
 	dataDir := filepath.Join(prov, "pvc-data")
@@ -160,11 +162,11 @@ func TestNodeAgentPromTextfileWrite(t *testing.T) {
 	e := fixture(t)
 	h := e.h
 	dir := t.TempDir()
-	promTextfileDirOverride = dir
-	defer func() { promTextfileDirOverride = "" }()
-	h.orphanHostPathBytes = 4096
-	h.orphanHostPathDirs = 2
-	h.writeNodeAgentPromTextfile()
+	wdeps.PromTextfileDirOverride = dir
+	defer func() { wdeps.PromTextfileDirOverride = "" }()
+	h.OrphanHostPathBytes = 4096
+	h.OrphanHostPathDirs = 2
+	h.WriteNodeAgentPromTextfile()
 	b, err := os.ReadFile(filepath.Join(dir, "node-agent-hygiene.prom"))
 	if err != nil {
 		t.Fatalf("prom file missing: %v", err)

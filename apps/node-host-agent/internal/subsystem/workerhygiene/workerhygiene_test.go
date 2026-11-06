@@ -207,7 +207,7 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 	}
 	// Test seams: signals never touch real processes, probes are
 	// canned, the journal snapshot is a string.
-	h.cfg.Seams.killFn = func(pid int, sig syscall.Signal) error {
+	h.Cfg.Seams.KillFn = func(pid int, sig syscall.Signal) error {
 		if sig == 0 {
 			if e.live[pid] {
 				return nil
@@ -217,28 +217,28 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		e.kills = append(e.kills, killRecord{pid, sig})
 		return nil
 	}
-	h.cfg.Seams.nowFn = func() time.Time { return e.now }
-	h.cfg.ProbeGap = 0             // tests run real-time — no 2s sleep between probes
-	h.cfg.Kubelet.WdReprobeGap = 0 // same: no 3s sleep between Gate-0 re-probes
-	h.cfg.Seams.probeHTTP = func(_ context.Context, url string, _ time.Duration) error {
+	h.Cfg.Seams.NowFn = func() time.Time { return e.now }
+	h.Cfg.ProbeGap = 0             // tests run real-time — no 2s sleep between probes
+	h.Cfg.Kubelet.WdReprobeGap = 0 // same: no 3s sleep between Gate-0 re-probes
+	h.Cfg.Seams.ProbeHTTP = func(_ context.Context, url string, _ time.Duration) error {
 		return e.probes[url]
 	}
 	// Feeder seam: bodyOK[url] answers "does :10248 return body 'ok'".
 	// Unset entry → false (unhealthy) — gate tests want fails anyway.
-	h.cfg.Seams.probeBodyOK = func(_ context.Context, url string, _ time.Duration) bool {
+	h.Cfg.Seams.ProbeBodyOK = func(_ context.Context, url string, _ time.Duration) bool {
 		return e.bodyOK[url]
 	}
-	h.cfg.Seams.unixGet = func(_ context.Context, _, _ string) ([]byte, error) {
+	h.Cfg.Seams.UnixGet = func(_ context.Context, _, _ string) ([]byte, error) {
 		return e.unixBody, e.unixErr
 	}
-	h.cfg.Seams.journalFn = func(_ context.Context) (string, error) {
+	h.Cfg.Seams.JournalFn = func(_ context.Context) (string, error) {
 		return e.journal, e.journalErr
 	}
 	// Wave-2 seams: status-code probes default 200 (healthy) unless
 	// probes[url] errors or status[url] overrides; the unix socket
 	// probe answers from sockErrs (nil = connects); statfs reports
 	// e.diskUsed of 100 blocks.
-	h.cfg.Seams.probeHTTPStatus = func(_ context.Context, url, bearer string, _ time.Duration) (int, error) {
+	h.Cfg.Seams.ProbeHTTPStatus = func(_ context.Context, url, bearer string, _ time.Duration) (int, error) {
 		e.bearer[url] = bearer
 		if err := e.probes[url]; err != nil {
 			return 0, err
@@ -248,15 +248,15 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		}
 		return 200, nil
 	}
-	h.cfg.Seams.probeUnixSock = func(_ context.Context, socket string, _ time.Duration) error {
+	h.Cfg.Seams.ProbeUnixSock = func(_ context.Context, socket string, _ time.Duration) error {
 		return e.sockErrs[socket]
 	}
-	h.cfg.Seams.statfsFn = func(_ string, st *unix.Statfs_t) error {
+	h.Cfg.Seams.StatfsFn = func(_ string, st *unix.Statfs_t) error {
 		st.Blocks = 100
 		st.Bavail = uint64(100 - int(e.diskUsed*100))
 		return nil
 	}
-	h.cfg.Seams.ctrRmIngest = func(_ context.Context, ref string) error {
+	h.Cfg.Seams.CtrRmIngest = func(_ context.Context, ref string) error {
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		e.sdcmds = append(e.sdcmds, []string{"ctr", "ingest", "rm", ref})
@@ -355,7 +355,7 @@ func evictActions(cs *fake.Clientset) []string {
 
 func logLines(t *testing.T, e *env) string {
 	t.Helper()
-	data, err := os.ReadFile(e.h.cfg.WatchdogLogFile)
+	data, err := os.ReadFile(e.h.Cfg.WatchdogLogFile)
 	if err != nil {
 		return ""
 	}
@@ -399,8 +399,8 @@ func dnsPod(e *env, name, uid string) *corev1.Pod {
 
 func TestStateEnterExitTransitionLogsOnce(t *testing.T) {
 	e := fixture(t)
-	e.h.state.Enter("test-state", "extra=1")
-	e.h.state.Enter("test-state", "extra=1") // idempotent — one log line
+	e.h.State.Enter("test-state", "extra=1")
+	e.h.State.Enter("test-state", "extra=1") // idempotent — one log line
 	if got := strings.Count(logLines(t, e), "STATE-ENTER: test-state"); got != 1 {
 		t.Fatalf("STATE-ENTER lines=%d want 1", got)
 	}
@@ -411,8 +411,8 @@ func TestStateEnterExitTransitionLogsOnce(t *testing.T) {
 	if _, err := fmt.Sscanf(strings.TrimSpace(string(content)), "%d", new(int64)); err != nil {
 		t.Fatalf("state file content=%q want epoch", content)
 	}
-	e.h.state.Exit("test-state", nil)
-	e.h.state.Exit("test-state", nil)
+	e.h.State.Exit("test-state", nil)
+	e.h.State.Exit("test-state", nil)
 	if got := strings.Count(logLines(t, e), "STATE-EXIT: test-state"); got != 1 {
 		t.Fatalf("STATE-EXIT lines=%d want 1", got)
 	}
@@ -421,27 +421,27 @@ func TestStateEnterExitTransitionLogsOnce(t *testing.T) {
 func TestRateOKSpend(t *testing.T) {
 	e := fixture(t)
 	name := "last-test"
-	if !e.h.state.RateOK(name, 30*time.Minute) {
+	if !e.h.State.RateOK(name, 30*time.Minute) {
 		t.Fatal("rateOK on absent file want true")
 	}
-	e.h.state.RateSpend(name)
-	if e.h.state.RateOK(name, 30*time.Minute) {
+	e.h.State.RateSpend(name)
+	if e.h.State.RateOK(name, 30*time.Minute) {
 		t.Fatal("rateOK right after spend want false")
 	}
 	e.now = e.now.Add(31 * time.Minute)
-	if !e.h.state.RateOK(name, 30*time.Minute) {
+	if !e.h.State.RateOK(name, 30*time.Minute) {
 		t.Fatal("rateOK after interval want true")
 	}
 	// Garbage content → 0 → ok (shell parity).
 	writeFile(t, filepath.Join(e.state, name), "garbage\n")
-	if !e.h.state.RateOK(name, 30*time.Minute) {
+	if !e.h.State.RateOK(name, 30*time.Minute) {
 		t.Fatal("rateOK on garbage file want true")
 	}
 }
 
 func TestRunStopsOnCancel(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.Interval = time.Hour // only the immediate cycle runs
+	e.h.Cfg.Interval = time.Hour // only the immediate cycle runs
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { e.h.Run(ctx); close(done) }()
@@ -490,9 +490,9 @@ func TestTaskMapBuiltOnceSharedAcrossChecks(t *testing.T) {
 
 	e.h.Cycle(context.Background())
 
-	if e.h.taskMapBuilds != 1 {
+	if e.h.TaskMapBuilds != 1 {
 		t.Fatalf("task map builds=%d want 1 (built once, "+
-			"shared between teardown and dns checks)", e.h.taskMapBuilds)
+			"shared between teardown and dns checks)", e.h.TaskMapBuilds)
 	}
 	if n := len(deleteActions(e.cs)); n != 0 {
 		t.Fatalf("deletes=%d want 0 (terminating pod too young)", n)
@@ -519,8 +519,8 @@ func TestTaskMapNotBuiltWithoutTriggers(t *testing.T) {
 
 	e.h.Cycle(context.Background())
 
-	if e.h.taskMapBuilds != 0 {
-		t.Fatalf("task map builds=%d want 0 (never built)", e.h.taskMapBuilds)
+	if e.h.TaskMapBuilds != 0 {
+		t.Fatalf("task map builds=%d want 0 (never built)", e.h.TaskMapBuilds)
 	}
 }
 
@@ -537,8 +537,8 @@ func TestTaskMapNotBuiltWhenHostResolvEmpty(t *testing.T) {
 
 	e.h.Cycle(context.Background())
 
-	if e.h.taskMapBuilds != 0 {
-		t.Fatalf("task map builds=%d want 0 (empty hostNS gates the build)", e.h.taskMapBuilds)
+	if e.h.TaskMapBuilds != 0 {
+		t.Fatalf("task map builds=%d want 0 (empty hostNS gates the build)", e.h.TaskMapBuilds)
 	}
 }
 
@@ -552,7 +552,7 @@ func TestStateEnterAtomicTmpLeavesNoResidue(t *testing.T) {
 	// have surfaced as a phantom hostmetrics watchdog_state series.
 	writeFile(t, filepath.Join(e.state, ".tmp-state-x"), "stale\n")
 
-	e.h.state.Enter("x", "")
+	e.h.State.Enter("x", "")
 
 	entries, err := os.ReadDir(e.state)
 	if err != nil {
@@ -591,7 +591,7 @@ func TestWorkerInactiveGatesAllChecks(t *testing.T) {
 		t.Fatal("checks ran while k0sworker intentionally down")
 	}
 	for _, chk := range []string{checkStall, checkTeardown, checkKonn, checkDNS} {
-		if got := e.h.cycles.WithLabelValues(chk, "gated"); testutil.ToFloat64(got) != 1 {
+		if got := e.h.Cycles.WithLabelValues(chk, "gated"); testutil.ToFloat64(got) != 1 {
 			t.Fatalf("%s gated=%v want 1", chk, testutil.ToFloat64(got))
 		}
 	}
@@ -599,11 +599,11 @@ func TestWorkerInactiveGatesAllChecks(t *testing.T) {
 
 func TestSignalDisabledSkipsCheck(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.Watchdog = &watchdogconf.Config{Disabled: map[string]bool{"cilium": true}}
+	e.h.Cfg.Watchdog = &watchdogconf.Config{Disabled: map[string]bool{"cilium": true}}
 	e.mkTask(t, uidA, "cilium-agent", 0)
 	e.probes[defaultCiliumHealthzURL] = errors.New("refused")
 	e.h.Cycle(context.Background())
-	if got := e.h.cycles.WithLabelValues(checkCilium, "disabled"); testutil.ToFloat64(got) != 1 {
+	if got := e.h.Cycles.WithLabelValues(checkCilium, "disabled"); testutil.ToFloat64(got) != 1 {
 		t.Fatalf("cilium disabled=%v want 1", testutil.ToFloat64(got))
 	}
 }
@@ -620,7 +620,7 @@ func TestRateTrySpendAtomic(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if e.h.state.RateTrySpend("last-restart", e.h.cfg.MinRestartInterval) {
+			if e.h.State.RateTrySpend("last-restart", e.h.Cfg.MinRestartInterval) {
 				wins.Add(1)
 			}
 		}()

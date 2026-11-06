@@ -258,7 +258,7 @@ func TestCtrTasksForeignNsSameSocketOrphanKilled(t *testing.T) {
 // capped pass forced over-cap dirs to re-confirm for 5m forever.
 func TestCtrTasksOverCapKeepsMarker(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.Ctr.MaxTaskClean = 2
+	e.h.Cfg.Ctr.MaxTaskClean = 2
 	// 4 confirmed-wedged dirs (dead init: no init.pid at all), each
 	// with a marker already past the 5m confirm window.
 	for i := 0; i < 4; i++ {
@@ -317,7 +317,7 @@ func waitingPod(name, ns, uid, image, imageID, reason, msg string) *corev1.Pod {
 func TestCtrImageHealerRemovesCorruptedImage(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -347,7 +347,7 @@ func TestCtrImageHealerRemovesCorruptedImage(t *testing.T) {
 func TestCtrImageHealerReasonAndMessageFilter(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -389,7 +389,7 @@ func TestCtrImageHealerReasonAndMessageFilter(t *testing.T) {
 func TestCtrImageHealerAllSignatures(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -421,7 +421,7 @@ func TestCtrImageHealerAllSignatures(t *testing.T) {
 func TestCtrImageHealerDedupesAndRateLimits(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -456,7 +456,7 @@ func TestCtrImageHealerDedupesAndRateLimits(t *testing.T) {
 
 func TestCtrImageHealerRmErrorKeepsGoing(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
 		if img == "docker.io/library/bad:1" {
 			return errors.New("ctr exploded")
 		}
@@ -505,7 +505,7 @@ func TestCtrImageHealerDefaultSeamUsesSystemdExec(t *testing.T) {
 func TestCtrImageHealerAPIFailNoAction(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -516,7 +516,7 @@ func TestCtrImageHealerAPIFailNoAction(t *testing.T) {
 	if len(removed) != 0 {
 		t.Fatal("image rm fired on an inconclusive (API-failed) cycle")
 	}
-	if got := e.h.cycles.WithLabelValues(checkCtrImages, "abort"); testutil.ToFloat64(got) != 1 {
+	if got := e.h.Cycles.WithLabelValues(checkCtrImages, "abort"); testutil.ToFloat64(got) != 1 {
 		t.Fatalf("abort=%v want 1", testutil.ToFloat64(got))
 	}
 }
@@ -563,7 +563,7 @@ func TestNormalizeCRIImageName(t *testing.T) {
 func TestCtrImageHealerNormalizesDockerHubShortName(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -585,7 +585,7 @@ func TestCtrImageHealerNormalizesDockerHubShortName(t *testing.T) {
 func TestCtrImageHealerDigestRefDedupes(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -606,7 +606,7 @@ func TestCtrImageHealerDigestRefDedupes(t *testing.T) {
 func TestCtrImageHealerTagPlusDigestStripsTag(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -628,7 +628,7 @@ func TestCtrImageHealerTagPlusDigestStripsTag(t *testing.T) {
 func TestCtrImageHealerPrivateRegistryUntouched(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.h.cfg.Seams.ctrRmImage = func(_ context.Context, img string) error {
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -669,7 +669,7 @@ func TestCtrIngestGCCleansStaleDirs(t *testing.T) {
 	if !e.sdRan("ctr ingest rm deadbeefref") {
 		t.Fatal("ctr ingest rm should run for the stale ref")
 	}
-	got, err := counterValue(e.h.ctrIngestsCleaned)
+	got, err := counterValue(e.h.CtrIngestsCleaned)
 	if err != nil || got != 1 {
 		t.Fatalf("ctr_ingests_cleaned_total=%v err=%v want 1", got, err)
 	}
@@ -735,7 +735,7 @@ func TestCtrIngestGCFailedScanRetriesNextCycle(t *testing.T) {
 func TestCtrIngestGCBavailOverBlocksSaturates(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.cfg.Seams.statfsFn = func(_ string, st *unix.Statfs_t) error {
+	e.h.Cfg.Seams.StatfsFn = func(_ string, st *unix.Statfs_t) error {
 		st.Blocks, st.Bavail = 100, 120 // free > total
 		return nil
 	}

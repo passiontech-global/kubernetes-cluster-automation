@@ -63,10 +63,10 @@ func TestCiliumIPAMLeakedLatch(t *testing.T) {
 	if !strings.Contains(logLines(t, e), "STATE-ENTER: cilium-ipam-exhausted") {
 		t.Fatalf("missing STATE-ENTER log:\n%s", logLines(t, e))
 	}
-	if got := testutil.ToFloat64(e.h.ciliumAllocated); got != 40 {
+	if got := testutil.ToFloat64(e.h.CiliumAllocated); got != 40 {
 		t.Fatalf("allocated gauge=%v want 40", got)
 	}
-	if got := testutil.ToFloat64(e.h.ciliumLeaked); got != 35 {
+	if got := testutil.ToFloat64(e.h.CiliumLeaked); got != 35 {
 		t.Fatalf("leaked gauge=%v want 35", got)
 	}
 }
@@ -92,7 +92,7 @@ func TestCiliumIPAMAvailableLowLatches(t *testing.T) {
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatalf("latch missing on available<=2: %v", err)
 	}
-	if got := testutil.ToFloat64(e.h.ciliumLeaked); got != 0 {
+	if got := testutil.ToFloat64(e.h.CiliumLeaked); got != 0 {
 		t.Fatalf("leaked gauge=%v want 0", got)
 	}
 }
@@ -112,8 +112,8 @@ func TestCiliumIPAMHealthyClearsLatch(t *testing.T) {
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("latch kept after IPAM recovered")
 	}
-	if e.h.ciliumIPAMFails != 0 {
-		t.Fatalf("counter=%d want 0 after recovery", e.h.ciliumIPAMFails)
+	if e.h.CiliumIPAMFails != 0 {
+		t.Fatalf("counter=%d want 0 after recovery", e.h.CiliumIPAMFails)
 	}
 	if !strings.Contains(logLines(t, e), "STATE-EXIT: cilium-ipam-exhausted") {
 		t.Fatalf("missing STATE-EXIT log:\n%s", logLines(t, e))
@@ -140,7 +140,7 @@ func TestCiliumIPAMHostNetworkExcludedFromInUse(t *testing.T) {
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatalf("latch missing — hostNetwork pod wrongly counted in-use: %v", err)
 	}
-	if got := testutil.ToFloat64(e.h.ciliumLeaked); got != 31 {
+	if got := testutil.ToFloat64(e.h.CiliumLeaked); got != 31 {
 		t.Fatalf("leaked gauge=%v want 31 (hostNetwork excluded)", got)
 	}
 }
@@ -149,25 +149,25 @@ func TestCiliumIPAMInconclusiveKeepsCounter(t *testing.T) {
 	e := fixture(t)
 	e.unixBody = []byte(`{"ipam":{"ipv4":{"used":40,"available":100}}}`)
 	e.h.Cycle(context.Background())
-	if e.h.ciliumIPAMFails != 1 {
-		t.Fatalf("counter=%d want 1", e.h.ciliumIPAMFails)
+	if e.h.CiliumIPAMFails != 1 {
+		t.Fatalf("counter=%d want 1", e.h.CiliumIPAMFails)
 	}
 	// Socket fails → inconclusive: counter kept, not reset (same
 	// hysteresis rule as checkCiliumInitStuck).
 	e.unixErr = errors.New("socket dead")
 	e.h.Cycle(context.Background())
-	if e.h.ciliumIPAMFails != 1 {
-		t.Fatalf("counter=%d want 1 (inconclusive keeps)", e.h.ciliumIPAMFails)
+	if e.h.CiliumIPAMFails != 1 {
+		t.Fatalf("counter=%d want 1 (inconclusive keeps)", e.h.CiliumIPAMFails)
 	}
-	if got := e.h.cycles.WithLabelValues(checkCiliumIPAM, "abort"); testutil.ToFloat64(got) != 1 {
+	if got := e.h.Cycles.WithLabelValues(checkCiliumIPAM, "abort"); testutil.ToFloat64(got) != 1 {
 		t.Fatalf("abort=%v want 1", testutil.ToFloat64(got))
 	}
 	// Garbage body → same inconclusive path.
 	e.unixErr = nil
 	e.unixBody = []byte(`{"cilium":{"state":"Ok"}}`)
 	e.h.Cycle(context.Background())
-	if e.h.ciliumIPAMFails != 1 {
-		t.Fatalf("counter=%d want 1 (unparseable keeps)", e.h.ciliumIPAMFails)
+	if e.h.CiliumIPAMFails != 1 {
+		t.Fatalf("counter=%d want 1 (unparseable keeps)", e.h.CiliumIPAMFails)
 	}
 }
 
@@ -204,7 +204,7 @@ func TestCiliumIPAMUpstreamArrayShape(t *testing.T) {
 	if _, err := os.Stat(latch); err != nil {
 		t.Fatalf("latch missing (leaked=40>30 AND available=2): %v", err)
 	}
-	if got := testutil.ToFloat64(e.h.ciliumAllocated); got != 40 {
+	if got := testutil.ToFloat64(e.h.CiliumAllocated); got != 40 {
 		t.Fatalf("allocated gauge=%v want 40 (array length)", got)
 	}
 }

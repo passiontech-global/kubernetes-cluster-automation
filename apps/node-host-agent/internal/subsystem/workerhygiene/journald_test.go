@@ -105,13 +105,13 @@ func TestJournalUnreadableLatchesAfterConsecFails(t *testing.T) {
 	// journalOnce snapshot + the A5 probe) — one cycle is a streak
 	// below Needed, three must have latched.
 	e.h.Cycle(context.Background())
-	if e.h.state.Exists(stateJournalUnreadable) {
+	if e.h.State.Exists(stateJournalUnreadable) {
 		t.Fatal("latched before the streak reached Needed")
 	}
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.state.Exists(stateJournalUnreadable) {
+	if !e.h.State.Exists(stateJournalUnreadable) {
 		t.Fatal("state-journal-unreadable not latched after persistent read failures")
 	}
 	if n := strings.Count(logLines(t, e), "suspect: journal-unreadable"); n != 1 {
@@ -133,13 +133,13 @@ func TestJournalUnreadableClearsOnRecovery(t *testing.T) {
 	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.state.Exists(stateJournalUnreadable) {
+	if !e.h.State.Exists(stateJournalUnreadable) {
 		t.Fatal("precondition: latch should be held")
 	}
 	e.journalErr = nil
 	e.journal = "Oct 01 node k0sworker: healthy line\n"
 	e.h.Cycle(context.Background())
-	if e.h.state.Exists(stateJournalUnreadable) {
+	if e.h.State.Exists(stateJournalUnreadable) {
 		t.Fatal("latch not cleared on first healthy read")
 	}
 	if n := strings.Count(logLines(t, e), "STATE-EXIT: journal-unreadable"); n != 1 {
@@ -152,12 +152,12 @@ func TestJournalUnreadableNoFireWithoutJournalDir(t *testing.T) {
 	e.sdReply["is-active k0sworker.service"] = "active"
 	// No journal storage at all — journald legitimately absent is a
 	// config, not a failure: reads failing forever must never latch.
-	e.h.journalReads.Dirs = []string{filepath.Join(t.TempDir(), "missing")}
+	e.h.JournalReads.Dirs = []string{filepath.Join(t.TempDir(), "missing")}
 	e.journalErr = errors.New("signal: killed")
 	for i := 0; i < defaultJournalUnreadableNeeded+2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if e.h.state.Exists(stateJournalUnreadable) {
+	if e.h.State.Exists(stateJournalUnreadable) {
 		t.Fatal("latched without any journal storage — must not fire")
 	}
 	if n := strings.Count(logLines(t, e), "suspect: journal-unreadable"); n != 0 {
@@ -173,7 +173,7 @@ func TestJournalUnreadableEmptyWindowSilentJournaldFires(t *testing.T) {
 	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.state.Exists(stateJournalUnreadable) {
+	if !e.h.State.Exists(stateJournalUnreadable) {
 		t.Fatal("journald-wide silence should latch journal-unreadable")
 	}
 }
@@ -187,7 +187,7 @@ func TestJournalUnreadableQuietUnitNoFire(t *testing.T) {
 	for i := 0; i < defaultJournalUnreadableNeeded+2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if e.h.state.Exists(stateJournalUnreadable) {
+	if e.h.State.Exists(stateJournalUnreadable) {
 		t.Fatal("quiet unit on healthy journald must not latch")
 	}
 }
@@ -199,7 +199,7 @@ func TestJournalUnreadableFilesGoneMarkerFires(t *testing.T) {
 	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.state.Exists(stateJournalUnreadable) {
+	if !e.h.State.Exists(stateJournalUnreadable) {
 		t.Fatal("'No journal files' reads should latch journal-unreadable")
 	}
 }

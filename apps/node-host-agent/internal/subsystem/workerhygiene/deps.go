@@ -1,119 +1,119 @@
-// deps.go — the check-facing dependency surface. Deps is everything
-// a Check reaches through its embedded pointer: the live config
-// (seams re-stubbed by tests post-New), the procfs view, the
-// hoststate store, the journal-blindness tracker, the prometheus
-// vecs, and the small set of mutable state that is genuinely shared
-// BETWEEN checks (or poked by name from pre-Check tests).
+// deps.go — the parent-side seam after the per-domain split. The
+// check-facing dependency surface itself moved to wdeps (the
+// shared package every domain check imports: Config+Seams, Deps,
+// CycleEnv, Check, the CtrTask machinery and the shared helpers).
+// What lives here are ALIASES so the external API
+// (workerhygiene.Config/EnvDeps/ConfigFromEnv/New) and the
+// package-internal test contract keep working verbatim: tests in
+// this package still name Config, Seams, cycleEnv, Check,
+// the check-name constants and the parser/helper funcs by
+// their pre-split spellings — each alias points at the ONE
+// definition in the owning package, so nothing can drift.
 package workerhygiene
 
 import (
-	"github.com/prometheus/client_golang/prometheus"
-
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/ctr"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/guards"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/kubelet"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
-// deps is the shared state every Check consumes — the refactor's
-// answer to the old `h *Hygiene` back-ref. Check structs hold a
-// `d *deps` and read config/proc/state/metrics through it, never
-// touching the orchestrator. Hygiene embeds *deps so the same
-// fields also resolve as h.<field> — the pre-Check test contract
-// (e.h.stallFails, e.h.ciliumAgentKilled, h.cfg.Seams re-stubs)
-// keeps compiling unchanged.
-//
-// Remaining seam for a per-domain package split: this struct IS
-// the boundary. A kubelet/cilium/ctr/disk sub-package would take a
-// *deps (or a per-domain projection of it) in its constructor; what
-// blocks the move today is only the cross-check shared state kept
-// here — ciliumAgentKilled (cilium family → envoy), the named
-// streak counters tests poke (stallFails, ciliumInitFails,
-// ciliumIPAMFails, ciliumWGFails, kubeletWdFails,
-// kubeletFeederWasActive, taskMapBuilds), the orphanHostPath gauges
-// the Cycle textfile writer reads, journalReads, and the metric
-// vecs — plus the named-check-field test contract on Hygiene.
-// Splitting means either exporting these or moving the tests; the
-// check code itself is already package-clean.
-type deps struct {
-	cfg Config
-	// proc is the /proc view bound to cfg.ProcRoot — the shared
-	// platform/procfs helpers (pid listing, cmdline/environ/stat
-	// reads, liveness) the checks all go through.
-	proc procfs.FS
+// Type aliases — the pre-split spellings of the types that moved
+// (or whose canonical definition moved) into wdeps.
+type (
+	Config         = wdeps.Config
+	EnvDeps        = wdeps.EnvDeps
+	KubeletConfig  = wdeps.KubeletConfig
+	TeardownConfig = wdeps.TeardownConfig
+	CtrConfig      = wdeps.CtrConfig
+	CiliumConfig   = wdeps.CiliumConfig
+	DiskConfig     = wdeps.DiskConfig
+	NetConfig      = wdeps.NetConfig
+	PressureConfig = wdeps.PressureConfig
+	CalicoConfig   = wdeps.CalicoConfig
+	JournalConfig  = wdeps.JournalConfig
+	HostConfig     = wdeps.HostConfig
+	RuntimeConfig  = wdeps.RuntimeConfig
+	Seams          = wdeps.Seams
+	cycleEnv       = wdeps.CycleEnv
+	Check          = wdeps.Check
+)
 
-	// state is the shared hoststate.Store for the watchdog state-dir
-	// contract (state-* latches, last-* rate budgets, installed/
-	// last-run heartbeat, watchdog log appends). Its clock is a
-	// closure over the LIVE cfg.Seams.nowFn so post-construction test
-	// stubs still apply; its RateTrySpend mutex serialises the
-	// feeder-vs-Cycle check+spend pairs the old rateMu guarded
-	// (TOCTOU double-restart on the shared last-* budgets).
-	state *hoststate.Store
+// ConfigFromEnv resolves every NODE_HOST_AGENT_* knob workerhygiene
+// reads — implementation lives in wdeps (it owns the Config
+// defaults); the name stays here because the subsystem convention
+// puts it next to New.
+func ConfigFromEnv(d EnvDeps) Config { return wdeps.ConfigFromEnv(d) }
 
-	// In-memory consecutive counters — the shell kept these as
-	// consecutive-* files; in-agent state survives between cycles and
-	// an agent restart just re-arms the count (bounded by Interval).
-	// Most streaks live on their Check structs now; the four below
-	// stay shared because pre-Check tests poke them by name
-	// (e.h.stallFails et al. — more than five call sites each, so
-	// keeping the field beats churning the test contract).
-	stallFails      int // kubelet-stall streak (stallCheck)
-	ciliumInitFails int // cilium-init-stuck streak (ciliumInitCheck)
-	ciliumIPAMFails int // cilium-ipam streak (ciliumIPAMCheck)
-	ciliumWGFails   int // cilium_wg0 peer-deficit streak (ciliumWGCheck)
-	// kubeletWdFails is the T15 feeder's consecutive-fail counter —
-	// in-memory like the others (the shell counted within one feeder
-	// process anyway; an agent restart re-arms bounded by the 15s tick).
-	kubeletWdFails int
-	// kubeletFeederWasActive tracks the last tick's activation state
-	// so a false→true flip (node re-added to systemd_watchdog_hosts,
-	// unit file reinstalled, WD_SIG lifted) drops a stale partial
-	// fail-streak instead of counting it toward a restart.
-	kubeletFeederWasActive bool
-	taskMapBuilds          int // buildTaskMap invocation count (tests)
+// Const aliases — the defaults and latch/check names tests assert
+// against. The canonical values are exported from their owning
+// packages (wdeps for config defaults and check names, kubelet/
+// guards for check-side thresholds, hoststate for the latch itself).
+const (
+	minUptimeSeconds               = wdeps.MinUptimeSeconds
+	defaultInterval                = wdeps.DefaultInterval
+	defaultKubeletHealthzURL       = wdeps.DefaultKubeletHealthzURL
+	defaultKubeletWdMaxFail        = wdeps.DefaultKubeletWdMaxFail
+	defaultJournalUnreadableNeeded = wdeps.DefaultJournalUnreadableNeeded
+	defaultCiliumHealthzURL        = wdeps.DefaultCiliumHealthzURL
+	defaultKubeletTokenPath        = wdeps.DefaultKubeletTokenPath
+	defaultCalicoFelixReadyURL     = wdeps.DefaultCalicoFelixReadyURL
+	poddirThreshold                = kubelet.PoddirThreshold
+	minEvictRSSBytes               = guards.MinEvictRSSBytes
+	calicoFelixRestartFails        = guards.CalicoFelixRestartFails
+	stateJournalUnreadable         = hoststate.LatchJournalUnreadable
 
-	// journalReads is the journal-unreadable accounting — every
-	// journal read (k0sworker snapshot + A5 probes) is classified
-	// into it; the tracker fires the state-journal-unreadable latch
-	// on persistent blindness while journal storage exists.
-	journalReads journalwatch.Tracker
-	// ciliumAgentKilled is shared between the cilium check family
-	// and the envoy check: killCiliumAgent sets it (the agent kill
-	// can come from the cilium, cilium-init or wg-peers check —
-	// whichever wins the shared last-cilium-restart budget first),
-	// and the envoy check restarts cilium-envoy the same cycle so
-	// its xDS listener can't hold a stale socket across the agent
-	// restart. Cycle resets it before the checks run.
-	ciliumAgentKilled bool
+	checkTeardown         = wdeps.CheckTeardown
+	checkKonn             = wdeps.CheckKonn
+	checkDNS              = wdeps.CheckDNS
+	checkStall            = wdeps.CheckStall
+	checkWatch            = wdeps.CheckWatch
+	checkCtrTasks         = wdeps.CheckCtrTasks
+	checkCilium           = wdeps.CheckCilium
+	checkCiliumInit       = wdeps.CheckCiliumInit
+	checkCtrImages        = wdeps.CheckCtrImages
+	checkCiliumIPAM       = wdeps.CheckCiliumIPAM
+	checkKubeletWd        = wdeps.CheckKubeletWd
+	checkSyncloop         = wdeps.CheckSyncloop
+	checkCtrSock          = wdeps.CheckCtrSock
+	checkIngestGC         = wdeps.CheckIngestGC
+	checkZombieStorm      = wdeps.CheckZombieStorm
+	checkJournald         = wdeps.CheckJournald
+	checkCiliumEnvoy      = wdeps.CheckCiliumEnvoy
+	checkCiliumMTU        = wdeps.CheckCiliumMTU
+	checkCiliumWG         = wdeps.CheckCiliumWG
+	checkDiskBloat        = wdeps.CheckDiskBloat
+	checkDState           = wdeps.CheckDState
+	checkSysScopes        = wdeps.CheckSysScopes
+	checkCiliumLRP        = wdeps.CheckCiliumLRP
+	checkSpegel           = wdeps.CheckSpegel
+	checkCalico           = wdeps.CheckCalico
+	checkCiliumBPF        = wdeps.CheckCiliumBPF
+	checkPSIThrash        = wdeps.CheckPSIThrash
+	checkCNINetns         = wdeps.CheckCNINetns
+	checkCtrMeta          = wdeps.CheckCtrMeta
+	checkHostOOM          = wdeps.CheckHostOOM
+	checkOrphanHP         = wdeps.CheckOrphanHP
+	checkCgroupDying      = wdeps.CheckCgroupDying
+	checkSystemdSessions  = wdeps.CheckSystemdSessions
+	checkOverlayFSStale   = wdeps.CheckOverlayFSStale
+	checkIOPressure       = wdeps.CheckIOPressure
+	checkConntrackLiberal = wdeps.CheckConntrackLiberal
+	checkClockJump        = wdeps.CheckClockJump
+)
 
-	// Wave-10 ST2 gauge values — shared between orphanHPCheck
-	// (writes them each cycle) and writeNodeAgentPromTextfile
-	// (reads them at end of Cycle); tests poke them too.
-	orphanHostPathBytes int64
-	orphanHostPathDirs  int
-
-	// Runtime-resource guard series — the six checks in
-	// runtime_resource_guards.go refresh the gauges every cycle
-	// and accumulate the counters; writeNodeAgentPromTextfile
-	// emits the node_agent_* series at end of Cycle.
-	cgroupDyingDescendants int64   // max nr_dying_descendants seen
-	cgroupReclaimRuns      int64   // drop_caches+memory.reclaim runs
-	systemdSessionsTotal   int64   // logind session files seen
-	systemdSessionsStale   int64   // closing/abandoned sessions >2h
-	systemdDbusLatencySec  float64 // timed systemctl is-system-running
-	systemdSessionsReaped  int64   // loginctl terminate-session count
-	overlayfsStaleMounts   int64   // stale-overlay pod detections
-	diskIOUtilRatio        float64 // max whole-disk io_ticks util
-	diskWriteAwaitMs       float64 // per-write await across whole disks
-	ioPSIFullAvg60         float64 // /proc/pressure/io full avg60
-	ioPSIFullAvg300        float64 // /proc/pressure/io full avg300
-	ioThrottledProcs       int64   // pids reniced+ioniced to idle
-	conntrackLiberalFixes  int64   // nf_conntrack_tcp_be_liberal writes
-
-	cycles          *prometheus.CounterVec // check, result
-	actions         *prometheus.CounterVec // check, action
-	ciliumAllocated prometheus.Gauge       // cilium IPAM allocated IPs (38)
-	ciliumLeaked    prometheus.Gauge       // allocated − in-use (38)
-	// ctrIngestsCleaned counts ingest dirs removed by the A3 GC.
-	ctrIngestsCleaned prometheus.Counter
-}
+// Func aliases — parsers/helpers tests call by their old names;
+// the implementations live in their owning packages.
+var (
+	parseWGAllowedIPs       = wdeps.ParseWGAllowedIPs
+	kubeletWatchdogHosts    = wdeps.KubeletWatchdogHosts
+	withDefaultAPIPort      = kubelet.WithDefaultAPIPort
+	parseEnvoyXDSRejected   = cilium.ParseEnvoyXDSRejected
+	parseCiliumIPAM         = cilium.ParseCiliumIPAM
+	parseCiliumBPFMaps      = cilium.ParseCiliumBPFMaps
+	parseCiliumEncryptPeers = cilium.ParseCiliumEncryptPeers
+	normalizeCRIImageName   = ctr.NormalizeCRIImageName
+	dstateRuntimeComm       = guards.DstateRuntimeComm
+)
