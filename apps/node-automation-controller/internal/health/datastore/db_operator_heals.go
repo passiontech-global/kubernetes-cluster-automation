@@ -16,6 +16,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -96,8 +97,8 @@ func dbOperatorFor(sts *appsv1.StatefulSet) string {
 func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.Logger,
 	sig masterSvc, operator string, now time.Time) {
 	const dbOperatorHealCooldown = 30 * time.Minute
-	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
-		&p.Heals, operator, dbOperatorHealCooldown, now)
+	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+		p.CS, p.Dyn, &p.Heals, operator, dbOperatorHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
@@ -105,7 +106,11 @@ func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.L
 	if !proceed {
 		return
 	}
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	// Cluster-wide but paged — the operator pod's namespace is not
+	// fixed across installs, so no selector can narrow the read.
+	pods, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.Pods(p.CS, metav1.NamespaceAll))
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: list pods failed — db operator heal deferred", "error", err)
@@ -117,7 +122,7 @@ func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.L
 	// Percona operators answer to two Deployment spellings (W10-FIX4)
 	// — every alias prefix is tried so a short-name match still finds
 	// the long-named pods.
-	target := heal.OldestRunningPod(pods.Items, dbOperatorPodPrefixes(operator)...)
+	target := heal.OldestRunningPod(pods, dbOperatorPodPrefixes(operator)...)
 	if target == nil {
 		log.Info("no running pod found for db operator — heal deferred",
 			"operator", operator)

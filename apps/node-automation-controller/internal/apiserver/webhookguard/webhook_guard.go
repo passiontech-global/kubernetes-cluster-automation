@@ -119,6 +119,11 @@ type webhookGuard struct {
 	// TLS handshake against a Ready endpoint IP on the webhook port.
 	// Injectable for tests; nil falls back to tcpTLSEndpointProber.
 	endpointProber func(ctx context.Context, ip string, port int32) bool
+	// verdict memoizes the maintenance-mutex evaluation the W7-C1
+	// gates (pod bounce + unmeshed remediation) share within a run —
+	// one evaluation per VerdictTTL instead of three API reads per
+	// consumer.
+	verdict kube.Verdict
 
 	// The three sweeps share cs/dyn/now/endpointProber through
 	// snap.g and hand each other nothing else; embedding keeps the
@@ -493,5 +498,5 @@ func tcpTLSEndpointProber(ctx context.Context, ip string, port int32) bool {
 // statically-cordoned node would then have held the mutex forever;
 // the shared implementation fails closed on a missing dyn instead.
 func (g *webhookGuard) maintenanceActive(ctx context.Context) (bool, string, error) {
-	return kube.MaintenanceActive(ctx, g.cs, g.dyn)
+	return g.verdict.Active(ctx, g.cs, g.dyn, g.now.Now())
 }
