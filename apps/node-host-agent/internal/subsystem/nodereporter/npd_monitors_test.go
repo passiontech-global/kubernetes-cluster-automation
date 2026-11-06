@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -189,6 +190,15 @@ func TestKernelRulePatterns(t *testing.T) {
 		{"XFS (dm-2): metadata I/O error in \"xlog_recover_iodone\" at daddr 0x121500 len 32 error 28", "FilesystemIOError", true},
 		{"XFS (dm-2): Mounting V5 Filesystem", "FilesystemIOError", false},
 		{"blk_update_request: I/O error, dev vda, sector 42 op 0x0:(READ)", "FilesystemIOError", false},
+		// kernel-softlockup-monitor pair — the watchdog soft-lockup
+		// and RCU-stall signatures.
+		{"watchdog: BUG: soft lockup - CPU#2 stuck for 23s! [kworker/2:1:123]", "KernelSoftLockup", true},
+		{"watchdog: BUG: soft lockup - CPU#0 stuck for 11s!", "KernelSoftLockup", true},
+		{"watchdog: BUG: hard lockup detected on CPU#1", "KernelSoftLockup", false},
+		{"INFO: rcu_sched detected stall on CPUs/tasks:", "KernelRCUStall", true},
+		{"INFO: rcu_preempt self-detected stall on CPU { 3 }", "KernelRCUStall", true},
+		{"INFO: rcu_bh detected stall on CPU 0 (t=12345 jiffies)", "KernelRCUStall", true},
+		{"INFO: rcu_sched kthread starved for 100 jiffies", "KernelRCUStall", false},
 	}
 	for _, c := range cases {
 		for _, rule := range kernelTempRules {
@@ -206,6 +216,14 @@ func TestKernelRulePatterns(t *testing.T) {
 	}
 	if kernelDeadlockRe.MatchString("INFO: task kworker started") {
 		t.Error("KernelDeadlock pattern matched noise")
+	}
+	// The soft-lockup/RCU-stall signatures are the same deadlock
+	// class — both must latch the permanent condition too.
+	if !kernelDeadlockRe.MatchString("watchdog: BUG: soft lockup - CPU#2 stuck for 23s!") {
+		t.Error("KernelDeadlock pattern did not match soft-lockup line")
+	}
+	if !kernelDeadlockRe.MatchString("INFO: rcu_preempt self-detected stall on CPU { 0 }") {
+		t.Error("KernelDeadlock pattern did not match RCU-stall line")
 	}
 }
 
@@ -449,6 +467,68 @@ func TestKernelDeadlockPermanent(t *testing.T) {
 	e.cycle()
 	if c := e.cond(t, "KernelDeadlock"); c.Status != corev1.ConditionTrue {
 		t.Fatalf("KernelDeadlock cleared: %s (permanent must latch)", c.Status)
+	}
+}
+
+// TestKernelSoftLockupMonitor: a soft-lockup / RCU-stall kmsg line
+// bumps its temporary-rule counter and emits its Event, latches the
+// permanent KernelDeadlock (same deadlock class as the hung-task
+// signature), and Enters its KernelHungTasks evidence latch — the
+// watchdog condition eval picks it up through altStateKeys (the
+// node-facing patch lands the following cycle, since syncConditions
+// runs before syncKernelMonitor inside Cycle).
+func TestKernelSoftLockupMonitor(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		line   string
+		reason string
+		latch  string
+	}{
+		{"softlockup",
+			"watchdog: BUG: soft lockup - CPU#2 stuck for 23s! [kworker/2:1:123]",
+			"KernelSoftLockup", "kernel-softlockup"},
+		{"rcu-stall",
+			"INFO: rcu_preempt self-detected stall on CPU { 3 }",
+			"KernelRCUStall", "kernel-rcu-stall"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			e.appendKmsg(t, "4,1,3599000000,-;"+tc.line)
+			e.cycle()
+
+			if got := e.counter(tc.reason); got != 1 {
+				t.Fatalf("%s = %v, want 1", tc.reason, got)
+			}
+			if n := len(eventsByReason(t, e, tc.reason)); n != 1 {
+				t.Fatalf("%s events = %d, want 1", tc.reason, n)
+			}
+			// Same deadlock class → the permanent latch + counter.
+			if got := e.counter("KernelDeadlock"); got != 1 {
+				t.Fatalf("KernelDeadlock counter = %v, want 1", got)
+			}
+			if !e.r.kernelDeadlock {
+				t.Fatalf("%s did not latch KernelDeadlock", tc.reason)
+			}
+			// The evidence latch lands in the watchdog state dir;
+			// KernelHungTasks' altStateKeys see it on eval.
+			if _, err := os.Stat(filepath.Join(e.dir, "state-"+tc.latch)); err != nil {
+				t.Fatalf("evidence latch state-%s missing: %v", tc.latch, err)
+			}
+			got := condEvalFor(t, e.r, "KernelHungTasks")
+			if got.status != corev1.ConditionTrue ||
+				got.reason != "KernelHungTasksDetected" {
+				t.Fatalf("KernelHungTasks=%v/%s want True/KernelHungTasksDetected",
+					got.status, got.reason)
+			}
+			// Next cycle ships it to the node status.
+			e.cycle()
+			if c := e.cond(t, "KernelHungTasks"); c.Status != corev1.ConditionTrue {
+				t.Fatalf("node KernelHungTasks = %s, want True", c.Status)
+			}
+			if c := e.cond(t, "KernelDeadlock"); c.Status != corev1.ConditionTrue {
+				t.Fatalf("node KernelDeadlock = %s, want True", c.Status)
+			}
+		})
 	}
 }
 

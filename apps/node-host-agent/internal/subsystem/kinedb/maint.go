@@ -38,7 +38,11 @@ func deadTuplePct(dead, live int64) int64 {
 type maintResult struct {
 	okReindex   bool
 	okRepack    bool   // skip counts as ok — a ran-and-failed repack (or a failed assessment) flips it
+	okFreeze    bool   // same for the XID freeze vacuum
 	repackState string // skipped|done|fail|no-binary|assess-fail
+	freezeState string // ""|skipped|done|fail — "" until the XID read lands
+	xidAge      int64
+	xidSeen     bool // MAX(age(datfrozenxid)) was actually read this run
 	heapBytes   int64
 	indexBytes  int64
 	deadPct     int64
@@ -49,7 +53,7 @@ type maintResult struct {
 // maintCycle runs one maintenance round and emits metrics +
 // textfile. Returns the result for tests.
 func (k *KineDB) maintCycle(ctx context.Context) *maintResult {
-	res := &maintResult{okRepack: true, repackState: "skipped"}
+	res := &maintResult{okRepack: true, okFreeze: true, repackState: "skipped"}
 	note := func(s string) { res.notes = append(res.notes, s) }
 
 	user, pass, credOK := k.creds()
@@ -63,9 +67,12 @@ func (k *KineDB) maintCycle(ctx context.Context) *maintResult {
 		k.maintRun(ctx, pg, user, pass, res, note)
 	}
 	k.emitMaint(res)
-	sum := fmt.Sprintf("reindex=%v repack=%s heap=%dB idx=%dB dead=%d%%",
-		res.okReindex, res.repackState, res.heapBytes, res.indexBytes, res.deadPct)
-	if res.okReindex && res.okRepack {
+	sum := fmt.Sprintf("reindex=%v repack=%s freeze=%s heap=%dB idx=%dB "+
+		"dead=%d%% xid=%s",
+		res.okReindex, res.repackState, reasonOrDash(res.freezeState),
+		res.heapBytes, res.indexBytes, res.deadPct,
+		intOrNA(res.xidSeen, res.xidAge))
+	if res.okReindex && res.okRepack && res.okFreeze {
 		logger().Info("kine-db-maint OK: " + sum)
 		k.m.cycles.WithLabelValues("maint", "ok").Inc()
 	} else {
@@ -86,7 +93,12 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 		note(fmt.Sprintf("reindex-fail: %v", err))
 	}
 
-	// (b) sizes + dead-tuple estimate from pg_stat_user_tables.
+	// (b) XID wraparound — VACUUM (FREEZE, ANALYZE) when
+	// MAX(age(datfrozenxid)) crosses 150M. Runs before the repack
+	// gate so a failing stats read cannot skip it.
+	k.xidFreezeCheck(ctx, pg, user, pass, res, note)
+
+	// (c) sizes + dead-tuple estimate from pg_stat_user_tables.
 	// Indexes via pg_indexes_size like the bash — total−heap would
 	// count TOAST as index bytes.
 	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
@@ -115,7 +127,7 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 		return
 	}
 
-	// (c) pg_repack ONLY when the heap is genuinely bloated —
+	// (d) pg_repack ONLY when the heap is genuinely bloated —
 	// autovacuum keeps it roughly compact, so this fires rarely.
 	if res.deadPct <= k.cfg.RepackDeadPct ||
 		res.heapBytes <= k.cfg.RepackMinHeapBytes {
@@ -192,6 +204,19 @@ func (k *KineDB) emitMaint(res *maintResult) {
 		`check="repack"`, repack)
 	k.m.maintOK.WithLabelValues("reindex").Set(reindex)
 	k.m.maintOK.WithLabelValues("repack").Set(repack)
+	// vacuum_freeze only appears once the XID read landed — same
+	// seen-gating as relation_bytes: an unmeasured cycle must not
+	// fabricate a passing check.
+	if res.xidSeen {
+		freeze := 1.0
+		if res.freezeState == "fail" {
+			freeze = 0
+		}
+		p.GaugeLabels("kine_db_maint_ok",
+			"Maintenance job result on the kine DB (1 = ok/skip, 0 = fail)",
+			`check="vacuum_freeze"`, freeze)
+		k.m.maintOK.WithLabelValues("vacuum_freeze").Set(freeze)
+	}
 	ts := float64(k.cfg.nowFn().Unix())
 	p.Gauge("kine_db_maint_last_run_timestamp_seconds",
 		"Last maintenance run", ts)

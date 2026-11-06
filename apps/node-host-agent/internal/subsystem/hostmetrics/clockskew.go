@@ -29,8 +29,9 @@ const (
 
 // Marker/state file names inside WatchdogStateDir.
 const (
-	clockSkewCountFile  = "clock-skew-count"
-	clockStepBudgetFile = "last-clock-makestep"
+	clockSkewCountFile     = "clock-skew-count"
+	clockStepBudgetFile    = "last-clock-makestep"
+	clockSteppedMarkerFile = "clock-stepped-at"
 )
 
 // --- W10-KR5: clock skew ---
@@ -106,6 +107,14 @@ func (l *Latches) checkClockSkew() {
 			logger().Warn("hostmetrics: ACTION chronyc makestep — "+
 				"clock offset beyond step threshold",
 				"offset", off, "synced", synced)
+			// clock-jump-session-healer marker: a stepped clock
+			// breaks cached ServiceAccount tokens and TLS sessions
+			// (konnectivity 401/x509 bursts right after a jump) —
+			// the healer pairs fresh auth failures with this stamp.
+			// Written on SUCCESS only: a failed makestep stepped
+			// nothing and must not arm the correlation window.
+			l.c.state.WriteEpochFile(
+				l.statePath(clockSteppedMarkerFile), l.c.cfg.nowFn().Unix())
 		}
 	}
 	countPath := l.statePath(clockSkewCountFile)

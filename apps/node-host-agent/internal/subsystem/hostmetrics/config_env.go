@@ -11,8 +11,13 @@ import (
 // hostPath join that prefixes host-fs paths with the host root
 // ("/host" in the DaemonSet, identity standalone).
 type EnvDeps struct {
-	NodeName            string
-	WatchdogStateDir    string
+	NodeName         string
+	WatchdogStateDir string
+	// WatchdogLogFile is the shared appended watchdog log — the
+	// file the latch ticker's STATE-ENTER lines must reach for
+	// nodereporter's Event rules. Empty falls back to the shared
+	// default (w.watchdogLogFile is not yet passed to hostmetrics).
+	WatchdogLogFile     string
 	Standalone          bool
 	OverlayEgressRelays []string // watchdogconf OVERLAY_EGRESS_RELAYS
 	NebulaNet           string   // watchdogconf NEBULA_NET — cert path default
@@ -40,6 +45,8 @@ func ConfigFromEnv(d EnvDeps) Config {
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
+		envx.StringKnob("NODE_HOST_AGENT_WATCHDOG_LOG_FILE", &cfg.WatchdogLogFile,
+			d.WatchdogLogFile),
 		envx.StringKnob("NODE_HOST_AGENT_KEY_USERS_FILE", &cfg.KeyUsersFile,
 			defaultKeyUsersFile),
 		envx.DurationKnob("NODE_HOST_AGENT_LATCH_INTERVAL", &cfg.LatchInterval,

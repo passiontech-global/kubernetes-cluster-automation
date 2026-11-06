@@ -187,6 +187,11 @@ type probeResult struct {
 	// then inconclusive (a fabricated clean window must neither
 	// pass nor fail the probe).
 	logScanned bool
+
+	// hyg is the kine-pg-hygiene + WAL archive guard read
+	// (wal_xid_hygiene.go) — nil when the block did not run this
+	// round (no containers/creds), so emission skips its series.
+	hyg *hygieneResult
 }
 
 // runProbeChecks executes every probe check once and fills
@@ -232,6 +237,10 @@ func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
 			// query >10m holds locks the compact guard needs.
 			k.reapStuckSessions(ctx, pg, user, pass, note)
 			k.probeAppChecks(ctx, pg, pgb, user, pass, res, note)
+			// kine-pg-hygiene + WAL archive guard: cheap pg_stat
+			// census each round (idle-in-tx, dead tuples, XID age,
+			// pg_wal/archiver/slots) plus the gated remediations.
+			k.pgHygiene(ctx, pg, user, pass, res, note)
 			// W8-CP2: pgbouncer saturation/auth wedge — deep
 			// client queue, or e2e auth failing while the raw
 			// backend still logs in, means the pooler itself is
@@ -451,6 +460,63 @@ func (k *KineDB) emitProbe(res *probeResult) {
 		k.m.compactRevision.Set(float64(res.compact))
 		k.m.retained.Set(float64(res.head - res.compact))
 	}
+	if h := res.hyg; h != nil {
+		// Every series gates on its own *Seen flag — a failed
+		// stats query leaves the gauge absent (stale) instead of
+		// overwriting a real value with a fabricated zero.
+		if h.idleSeen {
+			p.Gauge("kine_db_idle_in_tx_sessions",
+				"Sessions idle in transaction >3min on the postgres/kine databases — autovacuum blockers",
+				float64(h.idleInTx))
+			p.Gauge("node_agent_kine_pg_idle_in_tx_sessions",
+				"Alias of kine_db_idle_in_tx_sessions under the node_agent_* alert contract",
+				float64(h.idleInTx))
+			k.m.idleInTx.Set(float64(h.idleInTx))
+			k.m.idleInTxAlias.Set(float64(h.idleInTx))
+		}
+		if h.deadSeen {
+			p.Gauge("node_agent_kine_pg_dead_tuple_ratio",
+				"n_dead_tup/GREATEST(n_live_tup,1) of the kine table — >0.5 means autovacuum lost the race",
+				h.deadRatio)
+			k.m.deadTupleRatio.Set(h.deadRatio)
+		}
+		if h.xidSeen {
+			p.Gauge("kine_db_xid_age_transactions",
+				"MAX(age(datfrozenxid)) across databases — wraparound distance",
+				float64(h.xidAge))
+			k.m.xidAge.Set(float64(h.xidAge))
+		}
+		if h.walSeen {
+			p.Gauge("kine_db_wal_bytes",
+				"Total bytes in pg_wal (pg_ls_waldir)",
+				float64(h.walBytes))
+			k.m.walBytes.Set(float64(h.walBytes))
+		}
+		if h.walDiskSeen {
+			p.Gauge("kine_db_wal_disk_ratio",
+				"pg_wal bytes / data filesystem capacity — runaway retention fills the disk to PANIC",
+				h.walDiskRatio)
+			k.m.walDiskRatio.Set(h.walDiskRatio)
+		}
+		if h.archiveSeen {
+			p.Gauge("kine_db_wal_archive_stale",
+				"1 when pg_stat_archiver has been failing continuously for >30m",
+				float64(h.archiveStale))
+			k.m.walArchStale.Set(float64(h.archiveStale))
+		}
+		if h.slotSeen {
+			p.Gauge("kine_db_inactive_slot_retained_bytes",
+				"WAL bytes pinned by inactive replication slots",
+				float64(h.slotRetained))
+			k.m.inactiveSlot.Set(float64(h.slotRetained))
+		}
+	}
+	// The reaper counter is cumulative state — emitted every round
+	// (unlike the seen-gated gauges above, a skipped reap does not
+	// make the lifetime total any less true).
+	p.Gauge("node_agent_kine_pg_idle_in_tx_terminated_total",
+		"Stuck kine sessions terminated by the session reaper",
+		float64(k.m.idleTermTotal))
 	ts := float64(k.cfg.nowFn().Unix())
 	p.Gauge("kine_db_probe_last_run_timestamp_seconds",
 		"Last probe run", ts)

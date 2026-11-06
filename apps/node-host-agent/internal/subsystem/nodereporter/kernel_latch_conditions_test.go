@@ -83,3 +83,78 @@ func TestKernelLatchConditions(t *testing.T) {
 		t.Fatal("ClockSkewDetected stuck True after latch removal")
 	}
 }
+
+// TestHygieneLatchConditions covers the remaining registered
+// latches — each maps 1:1 to its permanent NodeCondition:
+// kubeconfig-cert-expiring (controllerhygiene cert-expiry),
+// cpu-steal-pressure (hostmetrics steal guard), cgroup-dying-leak
+// and systemd-session-bloat (workerhygiene hygiene checks).
+func TestHygieneLatchConditions(t *testing.T) {
+	e := fixture(t)
+	r := e.r
+	state := func(key string) {
+		if err := os.WriteFile(filepath.Join(e.dir, "state-"+key),
+			[]byte("1700000000\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	latches := map[string][2]string{
+		"kubeconfig-cert-expiring": {"KubeconfigCertExpiring", "KubeconfigCertExpiringDetected"},
+		"cpu-steal-pressure":       {"CPUStealPressure", "CPUStealPressureDetected"},
+		"cgroup-dying-leak":        {"CgroupDyingLeak", "CgroupDyingLeakDetected"},
+		"systemd-session-bloat":    {"SystemdSessionBloat", "SystemdSessionBloatDetected"},
+	}
+	// Baseline: every condition False with its default reason.
+	for _, want := range latches {
+		got := condEvalFor(t, r, want[0])
+		if got.status != corev1.ConditionFalse {
+			t.Fatalf("%s baseline status=%v want False", want[0], got.status)
+		}
+	}
+	for latch, want := range latches {
+		state(latch)
+		got := condEvalFor(t, r, want[0])
+		if got.status != corev1.ConditionTrue || got.reason != want[1] {
+			t.Fatalf("latch %s: %s=%v/%s want True/%s",
+				latch, want[0], got.status, got.reason, want[1])
+		}
+		if wantMsg := "watchdog state " + latch + " active since 1700000000"; got.message != wantMsg {
+			t.Fatalf("latch %s: message=%q want %q", latch, got.message, wantMsg)
+		}
+		_ = os.Remove(filepath.Join(e.dir, "state-"+latch))
+	}
+	// All latches cleared → every condition back to False.
+	for _, want := range latches {
+		if got := condEvalFor(t, r, want[0]); got.status != corev1.ConditionFalse {
+			t.Fatalf("%s stuck True after latch removal", want[0])
+		}
+	}
+}
+
+// TestKernelHungTasksEvidenceLatches covers the
+// kernel-softlockup-monitor wiring: the kernel monitor's
+// soft-lockup/RCU-stall evidence latches (state-kernel-softlockup /
+// state-kernel-rcu-stall, written by processKernelLine) raise
+// KernelHungTasks through altStateKeys — the same hang class as the
+// d-state-storm primary latch.
+func TestKernelHungTasksEvidenceLatches(t *testing.T) {
+	for _, latch := range []string{"kernel-softlockup", "kernel-rcu-stall"} {
+		t.Run(latch, func(t *testing.T) {
+			e := fixture(t)
+			if err := os.WriteFile(filepath.Join(e.dir, "state-"+latch),
+				[]byte("1700000007\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got := condEvalFor(t, e.r, "KernelHungTasks")
+			if got.status != corev1.ConditionTrue ||
+				got.reason != "KernelHungTasksDetected" {
+				t.Fatalf("KernelHungTasks=%v/%s want True/KernelHungTasksDetected",
+					got.status, got.reason)
+			}
+			wantMsg := "watchdog state " + latch + " active since 1700000007"
+			if got.message != wantMsg {
+				t.Fatalf("message=%q want %q", got.message, wantMsg)
+			}
+		})
+	}
+}

@@ -92,6 +92,24 @@ type deps struct {
 	orphanHostPathBytes int64
 	orphanHostPathDirs  int
 
+	// Runtime-resource guard series — the six checks in
+	// runtime_resource_guards.go refresh the gauges every cycle
+	// and accumulate the counters; writeNodeAgentPromTextfile
+	// emits the node_agent_* series at end of Cycle.
+	cgroupDyingDescendants int64   // max nr_dying_descendants seen
+	cgroupReclaimRuns      int64   // drop_caches+memory.reclaim runs
+	systemdSessionsTotal   int64   // logind session files seen
+	systemdSessionsStale   int64   // closing/abandoned sessions >2h
+	systemdDbusLatencySec  float64 // timed systemctl is-system-running
+	systemdSessionsReaped  int64   // loginctl terminate-session count
+	overlayfsStaleMounts   int64   // stale-overlay pod detections
+	diskIOUtilRatio        float64 // max whole-disk io_ticks util
+	diskWriteAwaitMs       float64 // per-write await across whole disks
+	ioPSIFullAvg60         float64 // /proc/pressure/io full avg60
+	ioPSIFullAvg300        float64 // /proc/pressure/io full avg300
+	ioThrottledProcs       int64   // pids reniced+ioniced to idle
+	conntrackLiberalFixes  int64   // nf_conntrack_tcp_be_liberal writes
+
 	cycles          *prometheus.CounterVec // check, result
 	actions         *prometheus.CounterVec // check, action
 	ciliumAllocated prometheus.Gauge       // cilium IPAM allocated IPs (38)

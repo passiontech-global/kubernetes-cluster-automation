@@ -169,6 +169,13 @@ const (
 	checkCtrMeta     = "containerd-meta"    // W10-KR3 meta.db corruption + orphan shims
 	checkHostOOM     = "host-oom"           // W10-KR1 SystemOOMVictim event + metric
 	checkOrphanHP    = "orphan-hostpath"    // W10-ST2 orphaned pvc-* hostPath dirs
+	// Runtime-resource guards (runtime_resource_guards.go).
+	checkCgroupDying      = "cgroup-dying-reclaim"        // nr_dying_descendants reclaim
+	checkSystemdSessions  = "systemd-session-hygiene"     // logind session janitor
+	checkOverlayFSStale   = "overlayfs-stale-mount"       // ESTALE/lowerdir image healer
+	checkIOPressure       = "io-pressure-throttler"       // diskstats + PSI io throttler
+	checkConntrackLiberal = "conntrack-tcp-liberal-guard" // neb1 be_liberal fixer
+	checkClockJump        = "clock-jump-session-healer"   // konn pod recreate after step
 )
 
 // Regexes shared by the ctrTask machinery and the snapshot→pod
@@ -226,6 +233,15 @@ type Hygiene struct {
 	ctrMeta     *ctrMetaCheck
 	hostOOM     *hostOOMCheck
 	orphanHP    *orphanHPCheck
+
+	// Runtime-resource guards — the checks live in
+	// runtime_resource_guards.go.
+	cgroupDying      *cgroupDyingCheck
+	systemdSessions  *systemdSessionCheck
+	overlayFSStale   *overlayFSStaleCheck
+	ioPressure       *ioPressureCheck
+	conntrackLiberal *conntrackLiberalCheck
+	clockJump        *clockJumpCheck
 }
 
 // New returns a Hygiene and registers its metrics on reg.

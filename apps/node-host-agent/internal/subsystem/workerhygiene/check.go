@@ -74,6 +74,12 @@ func (h *Hygiene) initChecks() {
 	h.ctrMeta = &ctrMetaCheck{d: h.deps}
 	h.hostOOM = &hostOOMCheck{d: h.deps}
 	h.orphanHP = &orphanHPCheck{d: h.deps}
+	h.cgroupDying = &cgroupDyingCheck{d: h.deps}
+	h.systemdSessions = &systemdSessionCheck{d: h.deps}
+	h.overlayFSStale = &overlayFSStaleCheck{d: h.deps}
+	h.ioPressure = &ioPressureCheck{d: h.deps, throttled: map[int]string{}}
+	h.conntrackLiberal = &conntrackLiberalCheck{d: h.deps}
+	h.clockJump = &clockJumpCheck{d: h.deps}
 	h.checks = []Check{
 		h.stall,       // checkStall
 		h.watch,       // checkWatch
@@ -104,5 +110,15 @@ func (h *Hygiene) initChecks() {
 		h.ctrMeta,     // checkCtrMeta
 		h.hostOOM,     // checkHostOOM
 		h.orphanHP,    // checkOrphanHP
+		// Runtime-resource guards run last: they consume only
+		// their own host-side evidence (cgroup.stat, sessions dir,
+		// diskstats, sysctls, the pod LIST) so nothing downstream
+		// depends on their output this cycle.
+		h.cgroupDying,      // checkCgroupDying
+		h.systemdSessions,  // checkSystemdSessions
+		h.overlayFSStale,   // checkOverlayFSStale
+		h.ioPressure,       // checkIOPressure
+		h.conntrackLiberal, // checkConntrackLiberal
+		h.clockJump,        // checkClockJump
 	}
 }

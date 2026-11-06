@@ -157,6 +157,12 @@ var conditionDefs = []conditionDef{
 		defaultMessage: "no D-state task storm (uninterruptible sleep below threshold)",
 		problemReason:  "KernelHungTasksDetected",
 		stateKey:       hoststate.LatchDStateStorm,
+		// kernel-softlockup-monitor (npd_monitors.go): a kmsg
+		// soft-lockup/RCU-stall signature is the same hang class —
+		// the kernel monitor Enters one evidence latch per
+		// signature so a CPU wedged inside the kernel raises
+		// KernelHungTasks even when no D-state storm is counted.
+		altStateKeys: []string{kernelSoftLockupLatch, kernelRCUStallLatch},
 	},
 	// --- Wave-8 latch→condition surface ---
 	// Agent-added conditions for the latches the hygiene subsystems
@@ -310,6 +316,57 @@ var conditionDefs = []conditionDef{
 		defaultMessage: "clock offset within 2.0s of NTP source",
 		problemReason:  "ClockSkewDetected",
 		stateKey:       hoststate.LatchClockSkew,
+	},
+	// --- latch→condition surface: kernel/host deep-failure + hygiene ---
+	// The remaining registered latches each map 1:1 to a permanent
+	// NodeCondition — kubeconfig-cert-expiring from
+	// controllerhygiene's cert-expiry probe, cpu-steal-pressure from
+	// hostmetrics' hypervisor steal guard, cgroup-dying-leak and
+	// systemd-session-bloat from workerhygiene's reclaim/session
+	// hygiene checks.
+	{
+		// controllerhygiene's kubeconfig cert-expiry guard — an
+		// embedded client cert in one of the node-daemons'
+		// kubeconfigs approaching notAfter. Renewal belongs to the
+		// certs pipeline, not the agent — the condition is the
+		// signal channel.
+		typ:            "KubeconfigCertExpiring",
+		defaultReason:  "KubeconfigCertValid",
+		defaultMessage: "kubeconfig client certificates valid beyond the expiry horizon",
+		problemReason:  "KubeconfigCertExpiringDetected",
+		stateKey:       hoststate.LatchKubeconfigCertExpiring,
+	},
+	{
+		// hostmetrics' cpu-steal guard — hypervisor steal time above
+		// the pressure threshold for consecutive scrapes: a noisy
+		// neighbour or overcommitted host starves every pod on the
+		// node (token caches and leases start timing out first).
+		typ:            "CPUStealPressure",
+		defaultReason:  "CPUStealNormal",
+		defaultMessage: "hypervisor CPU steal below pressure threshold",
+		problemReason:  "CPUStealPressureDetected",
+		stateKey:       hoststate.LatchCPUStealPressure,
+	},
+	{
+		// workerhygiene's cgroup-dying-reclaim — cgroup v2
+		// nr_dying_descendants above threshold: deleted containers
+		// pin page cache and slow every cgroup-tree walk (the
+		// PLEG-not-healthy class).
+		typ:            "CgroupDyingLeak",
+		defaultReason:  "CgroupDyingNormal",
+		defaultMessage: "cgroup dying descendants below pressure threshold",
+		problemReason:  "CgroupDyingLeakDetected",
+		stateKey:       hoststate.LatchCgroupDyingLeak,
+	},
+	{
+		// workerhygiene's systemd-session-hygiene — abandoned logind
+		// session scopes accumulating (or D-Bus latency climbing)
+		// degrades every systemctl call on the node.
+		typ:            "SystemdSessionBloat",
+		defaultReason:  "SystemdSessionsNormal",
+		defaultMessage: "logind session count and D-Bus latency healthy",
+		problemReason:  "SystemdSessionBloatDetected",
+		stateKey:       hoststate.LatchSystemdSessionBloat,
 	},
 }
 

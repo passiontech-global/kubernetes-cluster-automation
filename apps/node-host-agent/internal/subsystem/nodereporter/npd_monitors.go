@@ -25,7 +25,11 @@
 //     backlog); the journald fallback is already cursor-bounded.
 //     KernelDeadlock is a PERMANENT condition: once latched it stays
 //     True for the agent lifetime (NPD parity — permanent conditions
-//     never clear).
+//     never clear). The kernel-softlockup-monitor additions extend
+//     the deadlock class to the watchdog soft-lockup and RCU-stall
+//     signatures — each is also a temporary rule (counter + Event)
+//     and Enters an evidence latch KernelHungTasks' altStateKeys
+//     probe (conditions.go).
 //   - readonly-monitor: upstream also watched kmsg ("Remounting
 //     filesystem read-only"); this port checks the actual mount
 //     table instead — /proc/1/mounts (hostPID -> the HOST mount
@@ -55,6 +59,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 )
@@ -68,8 +73,21 @@ var kubeletJournalRules = []logRule{
 	{"KubeletObjectNotRegistered", regexp.MustCompile(`not registered|no relationship found between node`)},
 }
 
+// kernelSoftLockupRe / kernelRCUStallRe are the
+// kernel-softlockup-monitor signatures — a CPU spinning inside a
+// kernel critical section (watchdog soft lockup) or an RCU grace
+// period that never completes. Both feed a temporary rule
+// (counter + Event), the permanent KernelDeadlock latch (the
+// signatures are compiled into kernelDeadlockRe too) and the
+// KernelHungTasks evidence latches below.
+var (
+	kernelSoftLockupRe = regexp.MustCompile(`watchdog: BUG: soft lockup - CPU#\d+ stuck for \d+s!`)
+	kernelRCUStallRe   = regexp.MustCompile(`INFO: rcu_(?:sched|preempt|bh) (?:self-)?detected stall on CPU`)
+)
+
 // kernel-monitor.json temporary rules (the upstream set, trimmed to
-// the reasons kept by this deployment's alert rules).
+// the reasons kept by this deployment's alert rules), plus the
+// kernel-softlockup-monitor pair at the tail.
 var kernelTempRules = []logRule{
 	{"OOMKilling", regexp.MustCompile(`Killed process \d+ .* out of memory|Out of memory: Killed process`)},
 	{"TaskHung", regexp.MustCompile(`task [\S ]+:\w+ blocked for more than \w+ seconds`)},
@@ -78,11 +96,42 @@ var kernelTempRules = []logRule{
 	{"Ext4Warning", regexp.MustCompile(`EXT4-fs warning`)},
 	{"ConntrackTableFull", regexp.MustCompile(`nf_conntrack.*table full`)},
 	{"FilesystemIOError", regexp.MustCompile(`Buffer I/O error on dev|XFS.*[Mm]etadata I/O error`)},
+	{"KernelSoftLockup", kernelSoftLockupRe},
+	{"KernelRCUStall", kernelRCUStallRe},
 }
 
 // kernelDeadlockRe is the permanent KernelDeadlock rule — the
-// hung-task watcher's "INFO: task ... blocked" output.
-var kernelDeadlockRe = regexp.MustCompile(`INFO: task .* blocked for more than`)
+// hung-task watcher's "INFO: task ... blocked" output plus the
+// soft-lockup/RCU-stall signatures: all three are the same deadlock
+// class (a CPU wedged in kernel or a stalled RCU grace period blocks
+// every task queued behind it).
+var kernelDeadlockRe = regexp.MustCompile(`INFO: task .* blocked for more than` +
+	`|watchdog: BUG: soft lockup - CPU#\d+ stuck for \d+s!` +
+	`|INFO: rcu_(?:sched|preempt|bh) (?:self-)?detected stall on CPU`)
+
+// kernelSoftLockupLatch / kernelRCUStallLatch are the KernelHungTasks
+// evidence latches the kernel monitor Enters on a soft-lockup /
+// RCU-stall signature — the same hang class as the workerhygiene
+// D-state storm, surfaced through KernelHungTasks' altStateKeys in
+// conditions.go. The reporter owns the latch names (no hygiene check
+// produces kmsg lines) and never Exits them: a lockup/stall is
+// permanent-class evidence, so only the janitor's max-age reaper
+// clears a latch whose signature stopped recurring.
+const (
+	kernelSoftLockupLatch = hoststate.LatchKernelSoftLockup
+	kernelRCUStallLatch   = hoststate.LatchKernelRCUStall
+)
+
+// kernelHungLatchRules map a kernel-hang signature regex to the
+// evidence latch it Enters — evaluated in processKernelLine after
+// the temporary rules, same table shape as the rule sets above.
+var kernelHungLatchRules = []struct {
+	re    *regexp.Regexp
+	latch string
+}{
+	{kernelSoftLockupRe, kernelSoftLockupLatch},
+	{kernelRCUStallRe, kernelRCUStallLatch},
+}
 
 // maxKmsgReadBytes bounds one kmsg drain per cycle — a printk flood
 // is sliced across cycles instead of slurping the whole ring.
@@ -374,7 +423,11 @@ func (r *Reporter) syncKernelMonitor(ctx context.Context) error {
 }
 
 // processKernelLine applies the temporary kernel rules plus the
-// permanent KernelDeadlock latch to one kernel message.
+// permanent KernelDeadlock latch to one kernel message. The
+// soft-lockup/RCU-stall signatures additionally Enter their
+// KernelHungTasks evidence latches — r.state carries an empty
+// LogFile, so the STATE-ENTER never circles back into the filelog
+// rules this same reporter tails.
 func (r *Reporter) processKernelLine(ctx context.Context, msg string) {
 	r.matchEventRules(ctx, kernelTempRules, msg)
 	if kernelDeadlockRe.MatchString(msg) {
@@ -388,6 +441,11 @@ func (r *Reporter) processKernelLine(ctx context.Context, msg string) {
 				logger().Error("nodereporter: event emit failed",
 					"reason", kernelDeadlockProblemReason, "error", err)
 			}
+		}
+	}
+	for _, hr := range kernelHungLatchRules {
+		if hr.re.MatchString(msg) {
+			r.state.Enter(hr.latch, msg)
 		}
 	}
 }
