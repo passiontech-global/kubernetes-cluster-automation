@@ -35,6 +35,7 @@ import (
 // any held series via DeleteLabelValues.
 func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 	tlsData map[string][]byte, replicated []replicatedSecretRef) {
+	a.seenReplication.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
 	for _, d := range replicated {

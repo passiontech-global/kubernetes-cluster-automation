@@ -37,6 +37,8 @@ import (
 // ---------------------------------------------------------------------------
 
 func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
+	a.seenWebhookExpiry.Begin() // drop any aborted sweep's leftover emissions
+	a.seenWebhooks.Begin()      // drop any aborted sweep's leftover emissions
 	mutating, err := a.cs.AdmissionregistrationV1().
 		MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
 	if err != nil {

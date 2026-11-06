@@ -148,13 +148,26 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 			want[ip] = true
 		}
 	} else {
-		// Headless: the A record IS the endpoint set.
-		for _, ep := range best.Endpoints {
-			if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
-				continue
-			}
-			for _, a := range ep.Addresses {
-				want[a] = true
+		// Headless: the A record IS the endpoint set — and that set
+		// spans EVERY slice the Service owns, not just the freshest:
+		// a Ready IP in a second slice is a valid DNS answer the
+		// single-slice want set would wrongly judge stale.
+		eps, err := w.cs.DiscoveryV1().EndpointSlices(ns).List(ctx,
+			metav1.ListOptions{
+				LabelSelector: discoveryv1.LabelServiceName + "=" + svcName})
+		if err != nil {
+			log.Info("dns: cannot list sibling endpointslices — inconclusive",
+				"service", ns+"/"+svcName, "error", err)
+			return "", nil
+		}
+		for _, es := range eps.Items {
+			for _, ep := range es.Endpoints {
+				if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
+					continue
+				}
+				for _, a := range ep.Addresses {
+					want[a] = true
+				}
 			}
 		}
 	}

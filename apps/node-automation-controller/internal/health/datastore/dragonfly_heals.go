@@ -100,8 +100,11 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 			log.Error(err, "dragonfly operator delete failed", "pod", key)
 			continue
 		}
-		if now.After(p.drOpHealAt) {
-			p.drOpHealAt = now
+		if now.After(p.drOpHealAt[stsKey]) {
+			if p.drOpHealAt == nil {
+				p.drOpHealAt = map[string]time.Time{}
+			}
+			p.drOpHealAt[stsKey] = now
 		}
 		deleted = true
 		log.Info("DELETE: dragonfly operator pod — masterless service, forcing re-election",
@@ -136,7 +139,7 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 // patch failure). ok=false means no heal has landed yet: the
 // dual-replica heal must not skip ahead of step 1.
 func (p *statefulMasterlessCheck) dragonflyOperatorHealedAt(sig masterSvc) (time.Time, bool) {
-	latest := p.drOpHealAt
+	latest := p.drOpHealAt[sig.sts.Namespace+"/"+sig.sts.Name]
 	if t, ok := kube.AnnoTime(sig.sts, dragonflyHealAnno); ok && t.After(latest) {
 		latest = t
 	}

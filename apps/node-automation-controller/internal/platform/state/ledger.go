@@ -40,6 +40,20 @@ type GaugeLedger[K comparable] struct {
 	current map[K][]string // tuples emitted so far THIS sweep
 }
 
+// Begin resets the pending "current" set — call it once at the top
+// of every sweep that emits on this ledger. Without it, a sweep
+// that emitted some tuples then returned early on an API error
+// (before Prune) leaves those tuples sitting in current: the NEXT
+// sweep's emissions merge with the leftovers and Prune rolls them
+// into emitted, pinning stale label values that were never
+// re-verified — under a persistent API failure that is forever.
+// Resetting at sweep start makes each sweep's emission set reflect
+// only what THIS sweep actually measured (emitted stays at the last
+// committed set meanwhile — carry-forward hygiene is unchanged).
+func (l *GaugeLedger[K]) Begin() {
+	l.current = nil
+}
+
 // Emit records that the gauge series for key exists after this sweep
 // — call it wherever the module does vec.WithLabelValues(lv...).Set
 // (a series Set to 0 still exists and still counts as emitted; only

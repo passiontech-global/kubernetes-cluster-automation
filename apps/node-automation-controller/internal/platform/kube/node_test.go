@@ -209,7 +209,7 @@ func TestPatchNodeTaintsNilWritesEmptyArray(t *testing.T) {
 	tainted := node("n1", corev1.ConditionTrue, nil,
 		corev1.Taint{Key: "a", Effect: corev1.TaintEffectNoSchedule})
 	cs := fake.NewSimpleClientset(tainted)
-	if err := patchNodeTaints(ctx, cs, "n1", nil); err != nil {
+	if err := patchNodeTaints(ctx, cs, getNode(t, cs, "n1"), nil); err != nil {
 		t.Fatalf("patchNodeTaints(nil): %v", err)
 	}
 	got := getNode(t, cs, "n1").Spec.Taints
@@ -227,7 +227,7 @@ func TestPatchNodeTaintsPatchError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
-	if err := patchNodeTaints(ctx, cs, "n1",
+	if err := patchNodeTaints(ctx, cs, getNode(t, cs, "n1"),
 		[]corev1.Taint{{Key: "a", Effect: corev1.TaintEffectNoSchedule}}); err == nil {
 		t.Fatal("expected error when the node patch fails")
 	}

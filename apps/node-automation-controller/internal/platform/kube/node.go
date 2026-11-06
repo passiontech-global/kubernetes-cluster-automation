@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 )
 
 // ---------------------------------------------------------------------------
@@ -128,47 +129,59 @@ func dropTaintsByKey(taints []corev1.Taint, key string) []corev1.Taint {
 // — the merge semantics create the key when absent (a never-tainted
 // node has no "taints" field, so a JSONPatch "replace" would be
 // rejected) and arrays are replaced wholesale, which is exactly what
-// callers pass (the full desired taint list).
-func patchNodeTaints(ctx context.Context, cs kubernetes.Interface, name string, taints []corev1.Taint) error {
+// callers pass (the full desired taint list). The patch pins
+// metadata.resourceVersion: the whole-array replace makes a
+// concurrent taint writer (kubelet, another controller) a conflict
+// the caller retries instead of silently reverting.
+func patchNodeTaints(ctx context.Context, cs kubernetes.Interface, node *corev1.Node, taints []corev1.Taint) error {
 	if taints == nil {
 		taints = []corev1.Taint{} // merge patch [] clears, nil would marshal "taints":null
 	}
 	payload, err := json.Marshal(map[string]any{
-		"spec": map[string]any{"taints": taints},
+		"metadata": map[string]any{"resourceVersion": node.ResourceVersion},
+		"spec":     map[string]any{"taints": taints},
 	})
 	if err != nil {
 		return err
 	}
-	_, err = cs.CoreV1().Nodes().Patch(ctx, name, types.MergePatchType, payload, metav1.PatchOptions{})
+	_, err = cs.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, payload, metav1.PatchOptions{})
 	return err
 }
 
 // TaintNode adds key=value:effect unless the key is already present.
 // The node is re-fetched inside (kubectl taint's get-modify-patch
-// pattern) so a taint added after the caller's snapshot is not lost.
+// pattern) and the whole get-modify-patch retries on conflict — a
+// taint another writer added between our Get and Patch is merged
+// around on the retry instead of being dropped by the stale
+// whole-array replace.
 func TaintNode(ctx context.Context, cs kubernetes.Interface, name, key, value string, effect corev1.TaintEffect) error {
-	node, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-	if HasTaint(node.Spec.Taints, key) {
-		return nil
-	}
-	taints := append(append([]corev1.Taint{}, node.Spec.Taints...),
-		corev1.Taint{Key: key, Value: value, Effect: effect})
-	return patchNodeTaints(ctx, cs, name, taints)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		node, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if HasTaint(node.Spec.Taints, key) {
+			return nil
+		}
+		taints := append(append([]corev1.Taint{}, node.Spec.Taints...),
+			corev1.Taint{Key: key, Value: value, Effect: effect})
+		return patchNodeTaints(ctx, cs, node, taints)
+	})
 }
 
-// UntaintNode removes every taint with the given key (all effects).
+// UntaintNode removes every taint with the given key (all effects),
+// under the same get-modify-patch conflict retry as TaintNode.
 func UntaintNode(ctx context.Context, cs kubernetes.Interface, name, key string) error {
-	node, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-	if !HasTaint(node.Spec.Taints, key) {
-		return nil
-	}
-	return patchNodeTaints(ctx, cs, name, dropTaintsByKey(node.Spec.Taints, key))
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		node, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if !HasTaint(node.Spec.Taints, key) {
+			return nil
+		}
+		return patchNodeTaints(ctx, cs, node, dropTaintsByKey(node.Spec.Taints, key))
+	})
 }
 
 // PatchNodeLabels merges labels onto a node (kubectl label --overwrite).

@@ -77,7 +77,8 @@ type drainBlockedKey struct {
 }
 
 type pdbDeadlockWatchdog struct {
-	cs kubernetes.Interface
+	cs         kubernetes.Interface
+	nodeReader kube.CachedNodeReader
 	// firstSeen records when each "<ns>/<name>/<reason>" precondition
 	// STARTED holding — "continuously >= N" means now-firstSeen >= N
 	// with no gap. Any cycle where the precondition drops deletes the
@@ -106,15 +107,17 @@ type pdbDeadlockWatchdog struct {
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
 		w := &pdbDeadlockWatchdog{
-			cs:    d.CS,
-			now:   shared.SystemClock,
-			queue: d.Name,
+			cs:         d.CS,
+			nodeReader: d.Mgr.GetClient(),
+			now:        shared.SystemClock,
+			queue:      d.Name,
 		}
 		return shared.AddPeriodic(d.Mgr, w.queue, 5*time.Minute, w.run)
 	})
 }
 
 func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
+	w.blockedEmitted.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
 	// Node list first — "at least one cordoned node" is a cluster-wide
@@ -125,7 +128,7 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	// cordon-active window is deliberate state, not a drain in
 	// flight, and must not pin cordoned_node_blocked forever.
 	now := w.now.Now()
-	nodes, err := kube.ListNodes(ctx, w.cs)
+	nodes, err := kube.ListNodesCached(ctx, w.nodeReader, w.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}

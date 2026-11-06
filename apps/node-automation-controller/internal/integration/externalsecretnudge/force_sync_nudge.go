@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -48,6 +49,10 @@ import (
 // bounce via maybeHealConnect.
 func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady bool) error {
 	log := logf.FromContext(ctx)
+	// Fresh per-pass secret-read memoizer — the audit + skeleton
+	// reaper share it, and it must not outlive the pass (a Secret
+	// written between passes must be re-read).
+	n.secretReads = map[string]secretRead{}
 	list, esGVR, err := n.listES(ctx)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -207,6 +212,7 @@ func esNudgeStamp(es *unstructured.Unstructured) (time.Time, bool) {
 // its series deleted instead of pinning stale.
 func (n *externalSecretNudge) auditEmptySecretKeys(ctx context.Context,
 	list *unstructured.UnstructuredList) {
+	n.emptyKeyEmitted.Begin() // drop any aborted sweep's leftover emissions
 	if n.cs == nil {
 		return // no typed client wired — cannot read target Secrets
 	}
@@ -222,7 +228,7 @@ func (n *externalSecretNudge) auditEmptySecretKeys(ctx context.Context,
 		}
 		ns, name := es.GetNamespace(), es.GetName()
 		target := esTargetSecretName(es)
-		secret, err := n.cs.CoreV1().Secrets(ns).Get(ctx, target, metav1.GetOptions{})
+		secret, err := n.readTargetSecret(ctx, ns, target)
 		switch {
 		case apierrors.IsNotFound(err):
 			continue // no Secret yet — nothing to audit, not an error
@@ -251,6 +257,27 @@ func (n *externalSecretNudge) auditEmptySecretKeys(ctx context.Context,
 		}
 	}
 	n.emptyKeyEmitted.Prune(metrics.ExternalSecretEmptyKey.DeleteLabelValues)
+}
+
+// readTargetSecret fetches one ES target Secret, memoized per pass on
+// n.secretReads — the audit reads every Ready ES's target and the
+// skeleton reaper re-reads the same Secret for each stuck ES, so the
+// shared cache turns 2N Gets into N. Errors memoize too: a NotFound
+// or transient failure replays identically rather than re-hitting
+// the apiserver for every ES sharing the target.
+func (n *externalSecretNudge) readTargetSecret(ctx context.Context,
+	ns, name string) (*corev1.Secret, error) {
+
+	key := ns + "/" + name
+	if r, ok := n.secretReads[key]; ok {
+		return r.secret, r.err
+	}
+	secret, err := n.cs.CoreV1().Secrets(ns).Get(ctx, name, metav1.GetOptions{})
+	if n.secretReads == nil {
+		n.secretReads = map[string]secretRead{} // direct call — lazy init
+	}
+	n.secretReads[key] = secretRead{secret, err}
+	return secret, err
 }
 
 // flagEmptyKey emits one empty-key series through the ledger — Set
@@ -311,7 +338,7 @@ func (n *externalSecretNudge) deleteEmptySkeletonSecret(ctx context.Context,
 	log := logf.FromContext(ctx)
 	ns, name := es.GetNamespace(), es.GetName()
 	target := esTargetSecretName(es)
-	secret, err := n.cs.CoreV1().Secrets(ns).Get(ctx, target, metav1.GetOptions{})
+	secret, err := n.readTargetSecret(ctx, ns, target)
 	switch {
 	case apierrors.IsNotFound(err):
 		return // no skeleton at all — the common path

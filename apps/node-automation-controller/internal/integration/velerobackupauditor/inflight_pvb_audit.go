@@ -40,6 +40,8 @@ import (
 // scheduled backup is not blocked behind it.
 func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 	backups *unstructured.UnstructuredList) error {
+	a.seenStuckBackup.Begin() // drop any aborted sweep's leftover emissions
+	a.seenWedgedPVB.Begin()   // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 	now := a.now.Now()
 
@@ -96,16 +98,38 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 		if phase != "InProgress" || cleaned >= veleroPVBCleanupMaxPerRun {
 			continue
 		}
-		if a.pvbHealed.CooledDown(ns+"/"+name, veleroPVBCleanupCooldown, now) {
+		// The cleanup cooldown is keyed on the NODE, not the PVB:
+		// the destructive half is the node-agent pod bounce, and
+		// several wedged PVBs can share one agent — per-PVB keys
+		// would bounce the same pod once per wedged backup.
+		coolKey := "node-agent/" + pvbNode(pvb)
+		if a.pvbHealed.CooledDown(coolKey, veleroPVBCleanupCooldown, now) {
 			continue
 		}
 		if a.cleanWedgedPVB(ctx, pvb, since, now) {
-			a.pvbHealed.Stamp(ns+"/"+name, now)
+			a.pvbHealed.Stamp(coolKey, now)
 			cleaned++
 		}
 	}
 	a.seenWedgedPVB.Prune(metrics.VeleroPodVolumeBackupWedged.DeleteLabelValues)
+	// Cooldown hygiene once per cycle: a stamp past the window can
+	// never cool again, so expired entries are dead weight in an
+	// otherwise append-only ledger.
+	a.pvbHealed.Prune(func(_ string, last time.Time) bool {
+		return now.Sub(last) < veleroPVBCleanupCooldown
+	})
 	return nil
+}
+
+// pvbNode resolves the node the PVB's Kopia transfer runs on —
+// spec.node (the snapshot's node) first, status.node as the
+// older-velero fallback so pre-upgrade PVBs still resolve.
+func pvbNode(pvb *unstructured.Unstructured) string {
+	node, ok := kube.NestedString(pvb.Object, "spec", "node")
+	if !ok || node == "" {
+		node, _ = kube.NestedString(pvb.Object, "status", "node")
+	}
+	return node
 }
 
 // inFlightSince is the wedge-age clock for an in-flight velero
@@ -144,9 +168,11 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 	// The whole delete phase (PVB object + node-agent pod bounce)
 	// defers while deliberate maintenance is in flight — a cordon or
 	// k0s upgrade already removes agent pods, and an unverifiable
-	// mutex fails closed with the error surfaced on the queue.
+	// mutex fails closed with the error surfaced on the queue. The
+	// cooldown key is the node-agent's node — the same key the
+	// caller stamped under.
 	proceed, unverifiable := heal.AllowedV(ctx, log, &a.verdict, a.cs, a.dyn,
-		&a.pvbHealed, ns+"/"+name, veleroPVBCleanupCooldown, now)
+		&a.pvbHealed, "node-agent/"+pvbNode(pvb), veleroPVBCleanupCooldown, now)
 	switch {
 	case unverifiable:
 		metrics.IncError(a.queue)
@@ -195,12 +221,7 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 func (a *veleroBackupAuditor) pvbAgentPod(ctx context.Context,
 	pvb *unstructured.Unstructured) (*corev1.Pod, error) {
 	ns := pvb.GetNamespace()
-	node, ok := kube.NestedString(pvb.Object, "spec", "node")
-	if !ok || node == "" {
-		// Older velero wrote the node under status — accept it as a
-		// fallback so pre-upgrade PVBs still resolve.
-		node, _ = kube.NestedString(pvb.Object, "status", "node")
-	}
+	node := pvbNode(pvb)
 	if node == "" {
 		return nil, nil
 	}
@@ -211,16 +232,18 @@ func (a *veleroBackupAuditor) pvbAgentPod(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	// Prefer an actual node-agent pod; the DaemonSet names them
-	// "node-agent-*". Fall back to the first pod on the node —
-	// velero's namespace is otherwise quiet.
+	// Only an actual node-agent pod counts — the DaemonSet names
+	// them "node-agent-*". The spec.nodeName check runs in code too
+	// (fake clientsets ignore field selectors), and there is NO
+	// fallback to "any pod on the node": velero's namespace also
+	// hosts the velero server Deployment, and the old pods[0]
+	// fallback could hand that server pod to cleanWedgedPVB's
+	// bounce — deleting it would abort every backup in flight.
 	for i := range pods {
-		if strings.Contains(pods[i].Name, "node-agent") {
+		if strings.Contains(pods[i].Name, "node-agent") &&
+			pods[i].Spec.NodeName == node {
 			return &pods[i], nil
 		}
-	}
-	if len(pods) > 0 {
-		return &pods[0], nil
 	}
 	return nil, nil
 }

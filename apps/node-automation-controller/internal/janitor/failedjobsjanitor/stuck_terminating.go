@@ -64,6 +64,7 @@ const (
 // there is no containing namespace, and repeating the object name
 // would only make the two labels redundant.
 func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
+	j.stuckEmitted.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 	now := j.now.Now()
 

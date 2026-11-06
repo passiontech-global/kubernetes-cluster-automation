@@ -170,9 +170,20 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 			"kind", kind, "config", p.name)
 		var err error
 		if p.mutating {
-			_, err = g.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().Patch(ctx, p.name, types.StrategicMergePatchType, p.payload, metav1.PatchOptions{})
+			var patched *admissionv1.MutatingWebhookConfiguration
+			patched, err = g.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().Patch(ctx, p.name, types.StrategicMergePatchType, p.payload, metav1.PatchOptions{})
+			if err == nil {
+				// Keep the shared snapshot current — the circuit
+				// breaker and the unmeshed audit run later on the
+				// same snap and must see the dropped entries gone.
+				snap.SetMWC(patched)
+			}
 		} else {
-			_, err = g.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().Patch(ctx, p.name, types.StrategicMergePatchType, p.payload, metav1.PatchOptions{})
+			var patched *admissionv1.ValidatingWebhookConfiguration
+			patched, err = g.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().Patch(ctx, p.name, types.StrategicMergePatchType, p.payload, metav1.PatchOptions{})
+			if err == nil {
+				snap.SetVWC(patched)
+			}
 		}
 		if err != nil {
 			log.Error(err, "webhook config patch failed",

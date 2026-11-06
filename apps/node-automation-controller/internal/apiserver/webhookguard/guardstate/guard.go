@@ -131,6 +131,37 @@ func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 	return s
 }
 
+// SetMWC writes a just-patched MutatingWebhookConfiguration back
+// into the snapshot — every duty that patches a config (orphan
+// entry drops, circuit-breaker failurePolicy flips) must keep the
+// shared view current or the later duties (the unmeshed
+// injector-health read, the next circuitPatch evaluation) act on
+// stale webhook entries. A name absent from the list is ignored.
+func (s *Snapshot) SetMWC(cfg *admissionv1.MutatingWebhookConfiguration) {
+	if s.MWC == nil || cfg == nil {
+		return
+	}
+	for i := range s.MWC.Items {
+		if s.MWC.Items[i].Name == cfg.Name {
+			s.MWC.Items[i] = *cfg
+			return
+		}
+	}
+}
+
+// SetVWC is the ValidatingWebhookConfiguration twin of SetMWC.
+func (s *Snapshot) SetVWC(cfg *admissionv1.ValidatingWebhookConfiguration) {
+	if s.VWC == nil || cfg == nil {
+		return
+	}
+	for i := range s.VWC.Items {
+		if s.VWC.Items[i].Name == cfg.Name {
+			s.VWC.Items[i] = *cfg
+			return
+		}
+	}
+}
+
 // ReadyCounts returns the EndpointSlice ready census, listing it at
 // most once per run — the circuit breaker and the injector-health
 // check both draw from the same result, including the same error.

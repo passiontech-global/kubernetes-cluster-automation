@@ -578,7 +578,7 @@ func TestDeadNodeSweeperRemediationCRDMissing(t *testing.T) {
 				}, "")
 		})
 	s := deadNodeSweeperFor(fake.NewSimpleClientset(), dyn, nil)
-	fenced, err := s.hasRemediationCR(ctx, "w1")
+	fenced, err := s.hasRemediationCR(ctx, "w1", &remediationCache{}, nil)
 	if err != nil || fenced {
 		t.Fatalf("missing CRD must read as no-evidence, got fenced=%v err=%v", fenced, err)
 	}
