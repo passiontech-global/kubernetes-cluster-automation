@@ -1,19 +1,18 @@
 package kinedb
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
-// cmd/agent used to splice into Config directly: the hostPath join
-// that prefixes host-fs paths with the host root ("/host" in the
-// DaemonSet, identity standalone) and the shared node-exporter
-// textfile dir.
+// cmd/agent used to splice into Config directly. It embeds the shared
+// hostctx.Deps watchdog/host-context bundle; this subsystem consumes
+// the hostPath join (prefixes host-fs paths with the host root —
+// "/host" in the DaemonSet, identity standalone) and the shared
+// node-exporter textfile dir via field promotion.
 type EnvDeps struct {
-	// HostPath joins a host-absolute path under the host-fs root.
-	// Nil → identity (host paths used verbatim).
-	HostPath    func(string) string
-	TextfileDir string
+	hostctx.Deps
 }
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob kinedb reads

@@ -104,6 +104,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -267,28 +268,35 @@ func buildAgentConfig(p agentParams) (agent.Config, wireReport) {
 		return cs, nil
 	}
 
+	// The shared watchdog/host context every subsystem EnvDeps embeds
+	// — resolved once above, spliced verbatim into each Build closure
+	// as EnvDeps{Deps: w.Deps, ...}.
+	hc := hostctx.Deps{
+		Watchdog:                wdCfg,
+		WatchdogSrc:             wdReloader,
+		WatchdogStateDir:        watchdogStateDir,
+		WatchdogLogFile:         watchdogLogFile,
+		HostPath:                hostPath,
+		HostRoot:                hostRoot,
+		Systemd:                 sdClient,
+		JournalDirs:             journalDirs,
+		JournalUnreadableNeeded: journalUnreadableNeeded,
+		VarsDir:                 varsDir,
+		TextfileDir:             textfileDir,
+		NodeName:                hnode,
+	}
+
 	w := &wiring{
 		reg:        reg,
 		csOnce:     csOnce,
-		wdCfg:      wdCfg,
-		wdReloader: wdReloader,
-		sdClient:   sdClient,
-		hostRoot:   hostRoot,
-		hostPath:   hostPath,
+		Deps:       hc,
 		standalone: standalone,
 		defKube:    defKube,
 
 		resolved: map[string]bool{},
 		built:    map[string]bool{},
 
-		watchdogStateDir:        watchdogStateDir,
-		watchdogLogFile:         watchdogLogFile,
-		hnode:                   hnode,
-		journalDirs:             journalDirs,
-		journalUnreadableNeeded: journalUnreadableNeeded,
-		varsDir:                 varsDir,
-		textfileDir:             textfileDir,
-		podName:                 p.podName,
+		podName: p.podName,
 	}
 
 	// One Descriptor per subsystem, in the same order the sequential

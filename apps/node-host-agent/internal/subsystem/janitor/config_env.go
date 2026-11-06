@@ -1,23 +1,19 @@
 package janitor
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the
-// values cmd/agent used to splice into the config directly: the
-// systemd client and the shared watchdog state dir/log file. It is a
-// deliberate copy of the four fields the wire call passes (the
-// janitor must not depend on workerhygiene's EnvDeps type).
+// values cmd/agent used to splice into the config directly. It
+// embeds the shared hostctx.Deps watchdog/host-context bundle; this
+// subsystem consumes the systemd client and the shared watchdog
+// state dir/log file via field promotion (the promoted HostPath is
+// currently unused — the janitor's own defaults are already
+// host-absolute).
 type EnvDeps struct {
-	Systemd          *systemd.Client
-	WatchdogStateDir string
-	WatchdogLogFile  string
-	// HostPath joins a host-absolute path under the host-fs root.
-	// Accepted for parity with the other subsystem EnvDeps; currently
-	// unused — the janitor's own defaults are already host-absolute.
-	HostPath func(string) string
+	hostctx.Deps
 }
 
 // ConfigFromEnv resolves the NODE_HOST_AGENT_* knobs the

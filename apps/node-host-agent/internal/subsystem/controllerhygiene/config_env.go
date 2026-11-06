@@ -3,45 +3,24 @@ package controllerhygiene
 import (
 	"os"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
-// cmd/agent used to splice into Config directly: the parsed
+// cmd/agent used to splice into Config directly. It embeds the shared
+// hostctx.Deps watchdog/host-context bundle: the parsed
 // node-watchdog.conf the env → conf → package-default chains fall
-// through to (w.wdCfg — may be nil, treated as an empty conf), its
-// per-cycle reloader (Config.WatchdogSrc), the shared watchdog state
-// dir/log file, the shared journal-unreadable detector inputs, and
-// the hostPath join that prefixes host-fs paths with the host root
-// ("/host" in the DaemonSet, identity standalone). HostRoot itself is
-// NOT a dep: every host-fs path in the config is hostPath()-derived,
-// and the ShouldRun(hostRoot) enable-gate stays in the caller.
+// through to (may be nil, treated as an empty conf), its per-cycle
+// reloader (Config.WatchdogSrc), the shared watchdog state dir/log
+// file, the systemd client, the shared journal-unreadable detector
+// inputs, and the hostPath join — all via field promotion. HostRoot
+// itself is NOT consumed: every host-fs path in the config is
+// hostPath()-derived, and the ShouldRun(hostRoot) enable-gate stays
+// in the caller.
 type EnvDeps struct {
-	// Watchdog is the parsed /etc/node-watchdog.conf — the middle
-	// layer of every envOr/envIntOr/envDurOr chain. Nil → empty conf
-	// (all conf values zero → package defaults apply).
-	Watchdog *watchdogconf.Config
-	// WatchdogSrc is the per-cycle conf reloader (Config.WatchdogSrc).
-	WatchdogSrc *watchdogconf.Reloader
-	// WatchdogStateDir / WatchdogLogFile are the shared
-	// node-watchdog state dir + log file buildAgentConfig resolves
-	// once for the whole pod.
-	WatchdogStateDir string
-	WatchdogLogFile  string
-	// Systemd is the shared host-systemd client (Config.Systemd) —
-	// may be nil: the seam defaults degrade to "no systemd client
-	// wired" and every dependent check no-ops/log-degrades.
-	Systemd *systemd.Client
-	// JournalDirs / JournalUnreadableNeeded are the shared journald
-	// blindness-detector inputs buildAgentConfig resolves once for
-	// workerhygiene + controllerhygiene.
-	JournalDirs             []string
-	JournalUnreadableNeeded int
-	// HostPath joins a host-absolute path under the host-fs root.
-	// Nil → identity (host paths used verbatim).
-	HostPath func(string) string
+	hostctx.Deps
 }
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob controllerhygiene

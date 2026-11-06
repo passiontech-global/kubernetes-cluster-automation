@@ -1,29 +1,26 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
-// cmd/agent used to splice into Config directly: node identity, the
-// shared watchdog state dir, the standalone flag, the watchdogconf-
-// derived egress relays + nebula net name (path defaults), and the
-// hostPath join that prefixes host-fs paths with the host root
-// ("/host" in the DaemonSet, identity standalone).
+// cmd/agent used to splice into Config directly. It embeds the shared
+// hostctx.Deps watchdog/host-context bundle (node identity, the
+// shared watchdog state dir/log file and the hostPath join promote
+// out of it — the promoted WatchdogLogFile is the shared appended
+// watchdog log the latch ticker's STATE-ENTER lines must reach for
+// nodereporter's Event rules); the named fields below are the
+// hostmetrics-only inputs: the standalone flag and the
+// watchdogconf-derived egress relays + nebula net name (path
+// defaults — extracted off Watchdog by the caller because the knobs
+// read differently here).
 type EnvDeps struct {
-	NodeName         string
-	WatchdogStateDir string
-	// WatchdogLogFile is the shared appended watchdog log — the
-	// file the latch ticker's STATE-ENTER lines must reach for
-	// nodereporter's Event rules. Empty falls back to the shared
-	// default (w.watchdogLogFile is not yet passed to hostmetrics).
-	WatchdogLogFile     string
+	hostctx.Deps
 	Standalone          bool
 	OverlayEgressRelays []string // watchdogconf OVERLAY_EGRESS_RELAYS
 	NebulaNet           string   // watchdogconf NEBULA_NET — cert path default
-	// HostPath joins a host-absolute path under the host-fs root.
-	// Nil → identity (host paths used verbatim).
-	HostPath func(string) string
 }
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob the collector

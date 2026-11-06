@@ -1,27 +1,19 @@
 package nethealth
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
-// cmd/agent used to splice into Config directly: the shared watchdog
-// state dir/log, the host root (nsenter decision + Config field), the
-// parsed watchdog conf + its per-cycle reloader, the systemd client,
-// and the hostPath join that prefixes host-fs paths with the host
-// root ("/host" in the DaemonSet, identity standalone).
+// cmd/agent used to splice into Config directly. It embeds the shared
+// hostctx.Deps watchdog/host-context bundle — this subsystem consumes
+// the shared watchdog state dir/log, the host root (nsenter decision
+// + Config field), the parsed watchdog conf + its per-cycle reloader,
+// the systemd client, and the hostPath join — all via field
+// promotion.
 type EnvDeps struct {
-	WatchdogStateDir string
-	WatchdogLogFile  string
-	HostRoot         string
-	Watchdog         *watchdogconf.Config
-	WatchdogSrc      *watchdogconf.Reloader
-	Systemd          *systemd.Client
-	// HostPath joins a host-absolute path under the host-fs root.
-	// Nil → identity (host paths used verbatim).
-	HostPath func(string) string
+	hostctx.Deps
 }
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob nethealth reads

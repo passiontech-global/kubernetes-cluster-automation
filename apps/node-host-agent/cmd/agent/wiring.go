@@ -15,8 +15,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/concoursecache"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene"
@@ -34,9 +33,11 @@ import (
 
 // wiring carries the shared inputs buildAgentConfig computes once —
 // the registry the subsystems register on, the lazy shared kube
-// clientset, the watchdog conf + its per-cycle reloader, the systemd
-// client, and every resolved host path/dir/env-derived knob — so each
-// descriptor's Build closure reads them instead of re-deriving.
+// clientset, and the hostctx.Deps watchdog/host-context bundle (the
+// watchdog conf + its per-cycle reloader, the systemd client, and
+// every resolved host path/dir/env-derived knob) — so each
+// descriptor's Build closure reads them instead of re-deriving and
+// splices w.Deps straight into the subsystem EnvDeps.
 type wiring struct {
 	reg        *prometheus.Registry
 	subsystems []agent.Subsystem
@@ -51,25 +52,17 @@ type wiring struct {
 	resolved map[string]bool
 	built    map[string]bool
 
-	csOnce     func() (kubernetes.Interface, error)
-	wdCfg      *watchdogconf.Config
-	wdReloader *watchdogconf.Reloader
-	sdClient   *systemd.Client
+	csOnce func() (kubernetes.Interface, error)
 
-	hostRoot string
-	hostPath func(string) string
+	// Deps is the shared watchdog/host context — embedded so the
+	// Build closures read w.Watchdog, w.HostPath(...), w.VarsDir
+	// etc. directly and splice w.Deps into every EnvDeps.
+	hostctx.Deps
 
 	standalone bool
 	defKube    bool
 
-	watchdogStateDir        string
-	watchdogLogFile         string
-	hnode                   string
-	journalDirs             []string
-	journalUnreadableNeeded int
-	varsDir                 string
-	textfileDir             string
-	podName                 string
+	podName string
 }
 
 // Needs marks which shared inputs a descriptor's Build consumes —
@@ -179,9 +172,7 @@ func (w *wiring) descriptors() []Descriptor {
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
 				return apiprober.New(apiprober.ConfigFromEnv(apiprober.EnvDeps{
-					Watchdog:         w.wdCfg,
-					WatchdogSrc:      w.wdReloader,
-					WatchdogStateDir: w.watchdogStateDir,
+					Deps: w.Deps,
 				}), w.reg)
 			},
 		},
@@ -198,13 +189,10 @@ func (w *wiring) descriptors() []Descriptor {
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
 				hm := hostmetrics.New(hostmetrics.ConfigFromEnv(hostmetrics.EnvDeps{
-					NodeName:            w.hnode,
-					WatchdogStateDir:    w.watchdogStateDir,
-					WatchdogLogFile:     w.watchdogLogFile,
+					Deps:                w.Deps,
 					Standalone:          w.standalone,
-					OverlayEgressRelays: w.wdCfg.OverlayEgressRelays,
-					NebulaNet:           w.wdCfg.NebulaNet,
-					HostPath:            w.hostPath,
+					OverlayEgressRelays: w.Watchdog.OverlayEgressRelays,
+					NebulaNet:           w.Watchdog.NebulaNet,
 				}))
 				w.reg.MustRegister(hm)
 				return hm.Latches(), nil
@@ -223,9 +211,9 @@ func (w *wiring) descriptors() []Descriptor {
 					envx.Duration("NODE_HOST_AGENT_TEXTFILE_INTERVAL",
 						30*time.Second),
 					func(ctx context.Context) {
-						if err := hm.WriteTextfile(w.textfileDir); err != nil {
+						if err := hm.WriteTextfile(w.TextfileDir); err != nil {
 							logger().Error("hostmetrics textfile write failed",
-								"dir", w.textfileDir, "error", err)
+								"dir", w.TextfileDir, "error", err)
 						}
 					}))
 			},
@@ -244,17 +232,8 @@ func (w *wiring) descriptors() []Descriptor {
 			Build: func(w *wiring, cs kubernetes.Interface) (agent.Subsystem, error) {
 				return workerhygiene.New(workerhygiene.ConfigFromEnv(
 					workerhygiene.EnvDeps{
-						Client:                  cs,
-						NodeName:                w.hnode,
-						Systemd:                 w.sdClient,
-						Watchdog:                w.wdCfg,
-						WatchdogSrc:             w.wdReloader,
-						WatchdogStateDir:        w.watchdogStateDir,
-						WatchdogLogFile:         w.watchdogLogFile,
-						VarsDir:                 w.varsDir,
-						JournalDirs:             w.journalDirs,
-						JournalUnreadableNeeded: w.journalUnreadableNeeded,
-						HostPath:                w.hostPath,
+						Deps:   w.Deps,
+						Client: cs,
 					}), w.reg)
 			},
 		},
@@ -266,13 +245,7 @@ func (w *wiring) descriptors() []Descriptor {
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
 				return nethealth.New(nethealth.ConfigFromEnv(nethealth.EnvDeps{
-					WatchdogStateDir: w.watchdogStateDir,
-					WatchdogLogFile:  w.watchdogLogFile,
-					HostRoot:         w.hostRoot,
-					Watchdog:         w.wdCfg,
-					WatchdogSrc:      w.wdReloader,
-					Systemd:          w.sdClient,
-					HostPath:         w.hostPath,
+					Deps: w.Deps,
 				}), w.reg)
 			},
 		},
@@ -289,10 +262,7 @@ func (w *wiring) descriptors() []Descriptor {
 			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
 				return janitor.New(janitor.ConfigFromEnv(
 					janitor.EnvDeps{
-						Systemd:          w.sdClient,
-						WatchdogStateDir: w.watchdogStateDir,
-						WatchdogLogFile:  w.watchdogLogFile,
-						HostPath:         w.hostPath,
+						Deps: w.Deps,
 					}), w.reg)
 			},
 		},
@@ -307,10 +277,8 @@ func (w *wiring) descriptors() []Descriptor {
 			Build: func(w *wiring, cs kubernetes.Interface) (agent.Subsystem, error) {
 				return nodereporter.New(nodereporter.ConfigFromEnv(
 					nodereporter.EnvDeps{
-						Client:           cs,
-						NodeName:         w.hnode,
-						WatchdogStateDir: w.watchdogStateDir,
-						WatchdogLogFile:  w.watchdogLogFile,
+						Deps:   w.Deps,
+						Client: cs,
 					}), w.reg)
 			},
 		},
@@ -322,19 +290,12 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE",
 			Default: envx.ModeAuto,
 			Auto: func(w *wiring) bool {
-				return controllerhygiene.ShouldRun(w.hostRoot)
+				return controllerhygiene.ShouldRun(w.HostRoot)
 			},
 			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
 				return controllerhygiene.New(controllerhygiene.ConfigFromEnv(
 					controllerhygiene.EnvDeps{
-						Watchdog:                w.wdCfg,
-						WatchdogSrc:             w.wdReloader,
-						Systemd:                 w.sdClient,
-						WatchdogStateDir:        w.watchdogStateDir,
-						WatchdogLogFile:         w.watchdogLogFile,
-						JournalDirs:             w.journalDirs,
-						JournalUnreadableNeeded: w.journalUnreadableNeeded,
-						HostPath:                w.hostPath,
+						Deps: w.Deps,
 					}), w.reg)
 			},
 		},
@@ -347,16 +308,14 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_HOSTCONFIG",
 			Default: envx.ModeAuto,
 			Auto: func(w *wiring) bool {
-				_, err := os.Stat(w.varsDir + "/defaults.yaml")
+				_, err := os.Stat(w.VarsDir + "/defaults.yaml")
 				return err == nil
 			},
 			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
 				hostname, _ := os.Hostname()
 				return hostconfig.New(hostconfig.ConfigFromEnv(hostconfig.EnvDeps{
-					NodeName: w.hnode,
+					Deps:     w.Deps,
 					Hostname: hostname,
-					HostRoot: w.hostRoot,
-					VarsDir:  w.varsDir,
 				}), w.reg)
 			},
 		},
@@ -373,9 +332,9 @@ func (w *wiring) descriptors() []Descriptor {
 			Needs: Needs{Kube: true, PodName: true, PodModeOnly: true},
 			Build: func(w *wiring, cs kubernetes.Interface) (agent.Subsystem, error) {
 				hsCfg := hubsync.ConfigFromEnv(hubsync.EnvDeps{
+					Deps:        w.Deps,
 					Client:      cs,
 					Identity:    w.podName,
-					VarsDir:     w.varsDir,
 					LocalBinary: resolveLocalBinary(),
 				})
 				if !hubsync.Enabled(hsCfg.SSHKeyPath) {
@@ -394,12 +353,11 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_KINEDB",
 			Default: envx.ModeAuto,
 			Auto: func(w *wiring) bool {
-				return kinedb.Detect(w.hostRoot, w.varsDir)
+				return kinedb.Detect(w.HostRoot, w.VarsDir)
 			},
 			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
 				return kinedb.New(kinedb.ConfigFromEnv(kinedb.EnvDeps{
-					HostPath:    w.hostPath,
-					TextfileDir: w.textfileDir,
+					Deps: w.Deps,
 				}), w.reg)
 			},
 		},
@@ -430,7 +388,7 @@ func (w *wiring) resolveAndBuild(d Descriptor) {
 	if d.Needs.PodModeOnly && w.standalone {
 		return
 	}
-	if d.Needs.NodeName && w.hnode == "" {
+	if d.Needs.NodeName && w.NodeName == "" {
 		logger().Error(d.Name + " disabled: node name empty " +
 			"(NODE_HOST_AGENT_NODE_NAME/NODE_NAME unset)")
 		return

@@ -1,19 +1,19 @@
 package apiprober
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
-// cmd/agent used to splice into Config directly: the startup
-// node-watchdog.conf parse (its APIBackends are the StaticBackends
-// fallback when api-backend-guard.conf carries none), the per-cycle
-// conf reloader, and the shared watchdog state dir.
+// cmd/agent used to splice into Config directly. It embeds the shared
+// hostctx.Deps watchdog/host-context bundle (this subsystem consumes
+// Watchdog — its APIBackends are the StaticBackends fallback when
+// api-backend-guard.conf carries none — WatchdogSrc and
+// WatchdogStateDir via field promotion).
 type EnvDeps struct {
-	Watchdog         *watchdogconf.Config
-	WatchdogSrc      *watchdogconf.Reloader
-	WatchdogStateDir string
+	hostctx.Deps
 }
 
 // proberInputs is the resolved env → guard.conf → compiled-default

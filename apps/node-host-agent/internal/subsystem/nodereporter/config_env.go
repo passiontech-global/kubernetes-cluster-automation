@@ -3,19 +3,19 @@ package nodereporter
 import (
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
-// cmd/agent used to splice into Config directly: the shared lazily-
-// built kube clientset (its csOnce), this node's name (hnode —
-// NODE_HOST_AGENT_NODE_NAME/NODE_NAME resolved in main), and the
-// shared watchdog state dir + log file.
+// cmd/agent used to splice into Config directly. It embeds the shared
+// hostctx.Deps watchdog/host-context bundle (this node's name and the
+// shared watchdog state dir + log file promote out of it); Client is
+// the subsystem-unique shared lazily-built kube clientset (its
+// csOnce).
 type EnvDeps struct {
-	Client           kubernetes.Interface
-	NodeName         string
-	WatchdogStateDir string
-	WatchdogLogFile  string
+	hostctx.Deps
+	Client kubernetes.Interface
 }
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob nodereporter
