@@ -13,6 +13,7 @@ import (
 	"net"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
@@ -20,6 +21,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
@@ -114,6 +116,15 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 	// flap) yields an empty probeSet — the census still counts, the
 	// breaker just sees no probe data (unresponsive stays false).
 	probeSet := webhookBackendServices(snap)
+	// The EndpointSlice a webhook backend fronts can carry several
+	// ports (HTTPS webhook + HTTP metrics), so Ports[0] is not a
+	// safe probe target — resolve each probe service's preferred
+	// port set ONCE (one Service Get per backend, before the paged
+	// slice walk) for collectProbeCandidates to pick against.
+	probePrefs := make(map[string]slicePortPref, len(probeSet))
+	for key, svcPorts := range probeSet {
+		probePrefs[key] = resolveSlicePortPref(ctx, g.CS, key, svcPorts)
+	}
 	err := kube.ListEach(ctx,
 		metav1.ListOptions{Limit: ListPageSize},
 		kube.EndpointSlices(g.CS, metav1.NamespaceAll),
@@ -124,7 +135,7 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 					continue // no owning Service — cannot map to a webhook backend
 				}
 				key := s.Namespace + "/" + svc
-				probeSvc := probeSet[key]
+				_, probeSvc := probeSet[key]
 				for _, ep := range s.Endpoints {
 					if ep.Conditions.Ready == nil || *ep.Conditions.Ready {
 						ready.Raw[key]++
@@ -142,7 +153,7 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 						// probing them would just re-measure the
 						// partition.
 						if probeSvc && effective {
-							collectProbeCandidates(&ready, key, &s, &ep)
+							collectProbeCandidates(&ready, key, &s, &ep, probePrefs[key])
 						}
 					}
 				}
@@ -174,17 +185,30 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 	return ready, nil
 }
 
-// webhookBackendServices returns the set of "namespace/name" Service
-// keys referenced by any sub-webhook's clientConfig.service across
-// both webhook-config kinds PLUS every CRD spec.conversion webhook's
-// service — the only services the W9-CP1 probe dials. Nil config
+// webhookBackendServices maps each "namespace/name" Service key
+// referenced by any sub-webhook's clientConfig.service across both
+// webhook-config kinds PLUS every CRD spec.conversion webhook's
+// service to the declared SERVICE ports the referencing webhooks
+// carry (clientConfig.service.port, nil → the apiserver default
+// 443) — the only services the W9-CP1 probe dials, and the input the
+// slice-port preference resolves through spec.ports. Nil config
 // lists and a failed CRD list (API flap) contribute nothing.
-func webhookBackendServices(snap *Snapshot) map[string]bool {
-	out := map[string]bool{}
-	add := func(svc *admissionv1.ServiceReference) {
-		if svc != nil && svc.Namespace != "" && svc.Name != "" {
-			out[svc.Namespace+"/"+svc.Name] = true
+func webhookBackendServices(snap *Snapshot) map[string][]int32 {
+	out := map[string][]int32{}
+	addPort := func(key string, port int32) {
+		if !slices.Contains(out[key], port) {
+			out[key] = append(out[key], port)
 		}
+	}
+	add := func(svc *admissionv1.ServiceReference) {
+		if svc == nil || svc.Namespace == "" || svc.Name == "" {
+			return
+		}
+		port := int32(probeDefaultPort)
+		if svc.Port != nil {
+			port = *svc.Port
+		}
+		addPort(svc.Namespace+"/"+svc.Name, port)
 	}
 	if snap.MWC != nil {
 		for i := range snap.MWC.Items {
@@ -205,10 +229,92 @@ func webhookBackendServices(snap *Snapshot) map[string]bool {
 	// the tls_probe_failed reason + the stage-1 bounce.
 	for i := range snap.CRDs {
 		if key, _, _, ok := CRDConversionServiceKey(&snap.CRDs[i]); ok {
-			out[key] = true
+			port := int32(probeDefaultPort)
+			if p, found := kube.NestedInt64(snap.CRDs[i].Object,
+				"spec", "conversion", "webhook", "clientConfig",
+				"service", "port"); found {
+				port = int32(p)
+			}
+			addPort(key, port)
 		}
 	}
 	return out
+}
+
+// slicePortPref is one webhook-backend Service's acceptable
+// EndpointSlice port set: names that mark the webhook's HTTPS
+// listener plus resolved targetPort numbers — the preference
+// pickSlicePort applies instead of a bare Ports[0] grab.
+type slicePortPref struct {
+	names   map[string]bool
+	numbers map[int32]bool
+}
+
+// webhookPortNames are the EndpointSlice port names that mark a
+// webhook's TLS listener — a slice can front an HTTP metrics port
+// too, and probing THAT reads a hung webhook as healthy.
+var webhookPortNames = map[string]bool{"https": true, "webhook": true, "tls": true}
+
+// resolveSlicePortPref builds the acceptable-port set for one probe
+// service: the conventional webhook port names, plus — resolved
+// through the Service's spec.ports — the port name and targetPort
+// the declared ServiceReference port maps to (a ServiceReference
+// port is the SERVICE port; the slice carries TARGET ports, so the
+// Service object is the only honest translation). An unresolvable
+// Service degrades to name matching alone.
+func resolveSlicePortPref(ctx context.Context, cs kubernetes.Interface,
+	key string, svcPorts []int32) slicePortPref {
+	pref := slicePortPref{names: map[string]bool{}, numbers: map[int32]bool{}}
+	for n := range webhookPortNames {
+		pref.names[n] = true
+	}
+	ns, name, ok := strings.Cut(key, "/")
+	if !ok {
+		return pref
+	}
+	svc, err := cs.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return pref // cannot resolve — the named-port preference still applies
+	}
+	for _, sp := range svc.Spec.Ports {
+		if !slices.Contains(svcPorts, sp.Port) {
+			continue // not a port a webhook declared
+		}
+		if sp.Name != "" {
+			pref.names[strings.ToLower(sp.Name)] = true
+		}
+		if sp.TargetPort.IntVal != 0 {
+			pref.numbers[sp.TargetPort.IntVal] = true
+		}
+		if sp.TargetPort.StrVal != "" {
+			pref.names[strings.ToLower(sp.TargetPort.StrVal)] = true
+		}
+	}
+	return pref
+}
+
+// pickSlicePort chooses the EndpointSlice port the TLS probe dials:
+// a port whose name marks the webhook listener (https/webhook/tls or
+// the name the Service gave the declared port) or whose number
+// equals a resolved targetPort wins; the first declared port is the
+// fallback (matching the old Ports[0] pick), then 443.
+func pickSlicePort(s *discoveryv1.EndpointSlice, pref slicePortPref) int32 {
+	port := int32(probeDefaultPort)
+	for i, p := range s.Ports {
+		if p.Port == nil {
+			continue
+		}
+		if i == 0 {
+			port = *p.Port // the bare first-port fallback
+		}
+		if p.Name != nil && pref.names[strings.ToLower(*p.Name)] {
+			return *p.Port
+		}
+		if pref.numbers[*p.Port] {
+			return *p.Port
+		}
+	}
+	return port
 }
 
 // collectProbeCandidates records one effective-ready endpoint's
@@ -216,7 +322,8 @@ func webhookBackendServices(snap *Snapshot) map[string]bool {
 // Pod ref (up to probeMaxPodRefs) for service key — the probe
 // and bounce inputs of the W9-CP1 brownout path.
 func collectProbeCandidates(ready *EndpointCensus,
-	key string, s *discoveryv1.EndpointSlice, ep *discoveryv1.Endpoint) {
+	key string, s *discoveryv1.EndpointSlice, ep *discoveryv1.Endpoint,
+	pref slicePortPref) {
 	if len(ready.ProbeIPs[key]) < probeMaxPerSvc && len(ep.Addresses) > 0 {
 		for _, addr := range ep.Addresses {
 			if !slices.Contains(ready.ProbeIPs[key], addr) {
@@ -226,17 +333,11 @@ func collectProbeCandidates(ready *EndpointCensus,
 		}
 	}
 	if _, ok := ready.ProbePort[key]; !ok {
-		// The webhook port: the slice's first declared port, default
-		// 443 — admission webhooks are HTTPS-only, and a slice with
-		// no ports still targets the Service's own port mapping.
-		port := int32(probeDefaultPort)
-		for _, p := range s.Ports {
-			if p.Port != nil {
-				port = *p.Port
-				break
-			}
-		}
-		ready.ProbePort[key] = port
+		// The webhook port: the slice's HTTPS port by name or by the
+		// resolved Service mapping — a bare first-port pick can land
+		// on an HTTP metrics port and read a healthy webhook as a
+		// brownout (or a wedged one as serving).
+		ready.ProbePort[key] = pickSlicePort(s, pref)
 	}
 	if ep.TargetRef != nil && ep.TargetRef.Kind == "Pod" && ep.TargetRef.Name != "" {
 		ns := ep.TargetRef.Namespace

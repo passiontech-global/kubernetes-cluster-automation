@@ -29,6 +29,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
+	a.seenSecrets.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
 	// W7-C6 — the sweep collects two extra payloads on the same

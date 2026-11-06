@@ -261,7 +261,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 			if t.strip {
 				// The W4 wedged-detach gate — fails closed inside
 				// (a pod-list failure keeps the finalizers).
-				return c.stuckTerminatingNodeDead(ctx, t.va, nodeByName, livePods), nil
+				return c.stuckTerminatingNodeDead(ctx, t.va, nodeByName, livePods, now), nil
 			}
 			if node, ok := nodeByName[t.va.Spec.NodeName]; !ok {
 				// missing_node: the node object is gone — the VA can
@@ -335,13 +335,30 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 // closed (the mount may still be real).
 func (c *volumeAttachmentCleaner) stuckTerminatingNodeDead(ctx context.Context,
 	va *storagev1.VolumeAttachment, nodeByName map[string]*corev1.Node,
-	livePods map[string]podProbe) bool {
+	livePods map[string]podProbe, now time.Time) bool {
 	log := logf.FromContext(ctx)
 	node, ok := nodeByName[va.Spec.NodeName]
 	if !ok {
 		return true // node object gone — nothing left to detach from
 	}
 	if !kube.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
+		return false
+	}
+	if kube.NodeReady(node) {
+		// Fenced but alive — the taint is stale and the attacher is
+		// live to drain its own finalizer; stripping it here could
+		// detach a mounted volume (same guard nodeFencedDead runs).
+		return false
+	}
+	notReadyFor, ok := c.nodeNotReadySince.Seen(node.Name, now)
+	if !ok || notReadyFor < vaOutOfServiceDownFor {
+		// The node has not been not-Ready long enough — the node
+		// controller's own force-detach may still be in flight; we
+		// only take over a wedged cleanup, never a working one.
+		log.Info("KEEP: fenced node inside not-Ready window — finalizers stay",
+			"node", node.Name,
+			"notReadyFor", notReadyFor.Truncate(time.Minute),
+			"required", vaOutOfServiceDownFor)
 		return false
 	}
 	live, err := c.livePodCount(ctx, livePods, node.Name)

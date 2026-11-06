@@ -38,6 +38,7 @@ const (
 // proxy handshake (no mTLS) while existing connections still work —
 // the classic "mesh died silently" failure.
 func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
+	a.seenTrustBundles.Begin() // drop any aborted sweep's leftover emissions
 	// The trust-roots ConfigMap is optional — clusters without
 	// linkerd (or a differently-named install) simply skip.
 	cm, err := a.cs.CoreV1().ConfigMaps(linkerdNS).

@@ -159,6 +159,7 @@ type Breaker struct {
 // it always evaluates post-prune state; a patch failure on one config
 // is logged and the sweep continues with the rest.
 func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
+	b.brokenEmitted.Begin() // drop any aborted sweep's leftover emissions
 	g := snap.G
 	log := logf.FromContext(ctx)
 	now := g.Now.Now()
@@ -187,13 +188,18 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		if payload == nil {
 			continue
 		}
-		if _, err := g.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().
-			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		patched, err := g.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().
+			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
+		if err != nil {
 			log.Error(err, "circuit breaker patch failed",
 				"kind", guardstate.KindMutating, "config", cfg.Name)
 			failed = append(failed, cfg.Name)
 			continue
 		}
+		// Write the landed object back into the shared snapshot —
+		// the unmeshed audit's injector-health read must see the
+		// new failurePolicy/annotation state, not the stale list.
+		snap.SetMWC(patched)
 		circuitMetrics(&b.brokenEmitted, guardstate.KindMutating, cfg.Name, trips, recovered)
 	}
 	for i := range vwcs.Items {
@@ -204,13 +210,15 @@ func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		if payload == nil {
 			continue
 		}
-		if _, err := g.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().
-			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		patched, err := g.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().
+			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
+		if err != nil {
 			log.Error(err, "circuit breaker patch failed",
 				"kind", guardstate.KindValidating, "config", cfg.Name)
 			failed = append(failed, cfg.Name)
 			continue
 		}
+		snap.SetVWC(patched)
 		circuitMetrics(&b.brokenEmitted, guardstate.KindValidating, cfg.Name, trips, recovered)
 	}
 
@@ -490,6 +498,7 @@ func svcRefString(ref *admissionv1.ServiceReference) string {
 // "clean".
 func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 	snap *guardstate.Snapshot) error {
+	b.crdUnhealthyEmitted.Begin() // drop any aborted sweep's leftover emissions
 	g := snap.G
 	log := logf.FromContext(ctx)
 	now := g.Now.Now()

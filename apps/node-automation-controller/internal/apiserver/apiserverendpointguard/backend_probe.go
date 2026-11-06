@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/rest"
@@ -26,6 +27,13 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
+
+// endpointGuardProbeBudget is the per-backend probe budget under
+// parallel probing — the probe issues up to three sequential
+// requests (live_rv, cache_rv, jwks) each bounded by the shared
+// client's endpointGuardProbeTO, so one hung backend can never
+// outlive the runCtx it used to share with healthy siblings.
+const endpointGuardProbeBudget = 3 * endpointGuardProbeTO
 
 // apiProbeResult is one backend probe outcome: the quorum (etcd) list
 // RV, the watch-cache list RV, the sorted JWKS kid set, or the
@@ -227,16 +235,42 @@ func (g *apiServerEndpointGuard) evaluateBackends(ctx context.Context,
 	allIPs, activeIPs []string, quarantinedIPs map[string]bool) (map[string]backendOutcome, []string) {
 	log := logf.FromContext(ctx)
 	results := make(map[string]backendOutcome, len(allIPs))
-	for _, ip := range allIPs {
+
+	// Probe every backend in parallel, each against its OWN budget:
+	// sequential probing let one slow/dead backend eat the whole 25s
+	// runCtx, starving the healthy backends queued behind it — their
+	// starved requests then read as transport failures and inflated
+	// THEIR errStreaks toward a false wedge verdict. The streak fold
+	// below stays sequential and deterministic in allIPs order.
+	probed := make([]apiProbeResult, len(allIPs))
+	var wg sync.WaitGroup
+	for i, ip := range allIPs {
+		wg.Add(1)
+		go func(i int, ip string) {
+			defer wg.Done()
+			probeCtx, cancel := context.WithTimeout(ctx, endpointGuardProbeBudget)
+			defer cancel()
+			probed[i] = g.probeFn(probeCtx, ip)
+		}(i, ip)
+	}
+	wg.Wait()
+
+	for i, ip := range allIPs {
 		st := g.backends[ip]
 		if st == nil {
 			st = &backendProbeState{}
 			g.backends[ip] = st
 		}
-		res := g.probeFn(ctx, ip)
+		res := probed[i]
 
 		var o backendOutcome
-		if res.err != nil {
+		if res.err != nil && ctx.Err() != nil {
+			// The run's own budget expired mid-probe — a starved or
+			// cancelled request is not evidence the backend is
+			// wedged: no errStreak bump, streaks untouched, verdict
+			// deferred to the next cycle.
+			log.Info("backend probe cut short by the run budget — verdict deferred", "ip", ip)
+		} else if res.err != nil {
 			// Timeout / non-2xx: wedge signal only after
 			// endpointGuardErrCycles consecutive failures — a single
 			// WAN/TLS blip must not pull a healthy backend. Streaks

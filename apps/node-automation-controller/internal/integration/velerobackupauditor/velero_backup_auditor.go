@@ -205,6 +205,9 @@ func Setup(d shared.Deps) error {
 }
 
 func (a *veleroBackupAuditor) run(ctx context.Context) error {
+	a.seenBSL.Begin()    // drop any aborted sweep's leftover emissions
+	a.seenBad.Begin()    // drop any aborted sweep's leftover emissions
+	a.seenPaused.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
 	// W9-ST3 — the Everest DB-backup audit is independent of Velero:

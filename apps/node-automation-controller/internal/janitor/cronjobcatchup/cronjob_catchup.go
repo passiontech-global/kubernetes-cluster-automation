@@ -111,6 +111,7 @@ func Setup(d shared.Deps) error {
 }
 
 func (c *cronJobCatchup) run(ctx context.Context) error {
+	c.missedEmitted.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 	now := c.now.Now()
 
@@ -142,7 +143,13 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 				if missedOver100(sched, anchor, now) {
 					c.missedEmitted.Set(metrics.CronJobTooManyMissedStarts, 1,
 						cj.Namespace+"/"+cj.Name, cj.Namespace, cj.Name)
-					c.unfreezeDeadline(ctx, log, cj, now)
+					if c.unfreezeDeadline(ctx, log, cj, now) {
+						// The deadline repair hands the CronJob back
+						// to the controller, which creates its own
+						// recovery Job — spawning our catch-up in
+						// the same cycle would double-fire it.
+						continue
+					}
 				}
 			}
 		}
@@ -281,8 +288,10 @@ func missedOver100(sched cron.Schedule, anchor, now time.Time) bool {
 // skipped forever. Merge patch: the annotation adds a single key and
 // the spec field cannot clobber a concurrent writer's spec edits
 // (merge preserves every key not named). A patch failure is
-// metered+logged but absorbed — the next sweep retries.
-func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, cj *batchv1.CronJob, now time.Time) {
+// metered+logged but absorbed — the next sweep retries. Reports
+// whether the patch landed so the caller can skip its own catch-up
+// spawn this cycle (KCM creates the recovery Job itself).
+func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, cj *batchv1.CronJob, now time.Time) bool {
 	// MergePatchAnnos builds the annotations half; the spec field is
 	// grafted onto the same doc so the provenance stamp and the
 	// deadline land in ONE merge patch (merge preserves every key
@@ -303,18 +312,19 @@ func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, 
 		metrics.IncError(c.queue)
 		log.Error(err, "marshal deadline patch",
 			"cronjob", cj.Namespace+"/"+cj.Name)
-		return
+		return false
 	}
 	if _, err := c.cs.BatchV1().CronJobs(cj.Namespace).Patch(ctx, cj.Name,
 		types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
 		metrics.IncError(c.queue)
 		log.Error(err, "startingDeadlineSeconds patch failed",
 			"cronjob", cj.Namespace+"/"+cj.Name)
-		return
+		return false
 	}
 	log.Info("PATCH: startingDeadlineSeconds=3600 — CronJob crossed the >100 missed-start cap",
 		"cronjob", cj.Namespace+"/"+cj.Name,
 		"schedule", cj.Spec.Schedule)
+	return true
 }
 
 // deduped reports whether a catch-up for cj is already covered:

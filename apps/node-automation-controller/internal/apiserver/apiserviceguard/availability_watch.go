@@ -43,6 +43,7 @@ type availabilityWatch struct {
 // is delivered via snap.err and aborts only this duty (the orphan
 // pass already ran its own verdict).
 func (w *availabilityWatch) sweepAvailability(ctx context.Context, snap *apiServiceSnapshot) error {
+	w.emitted.Begin() // drop any aborted sweep's leftover emissions
 	g := snap.g
 	log := logf.FromContext(ctx)
 	if snap.err != nil {

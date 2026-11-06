@@ -41,6 +41,7 @@ import (
 // without the Everest CRDs 404/NoMatch on the list — a quiet no-op,
 // same contract as the Velero half of this module.
 func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
+	a.seenEverest.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
 	clusters, err := a.veleroList(ctx, everestDBClusterGVR)

@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -128,6 +129,19 @@ type externalSecretNudge struct {
 	// populated (or an ES that vanished) gets its series deleted so
 	// /metrics never leaks a stale "empty" series.
 	emptyKeyEmitted state.GaugeLedger[esEmptyKey]
+	// secretReads memoizes one nudge pass's target-Secret Gets by
+	// "ns/name" — the empty-key audit reads every Ready ES's target
+	// and the skeleton reaper re-reads the same Secret for a stuck
+	// ES, so identical ns/name lookups collapse to one Get each.
+	secretReads map[string]secretRead
+}
+
+// secretRead is one memoized Secrets().Get result — errors included
+// (a NotFound is as cacheable as a hit: the verdict is identical for
+// the rest of the pass).
+type secretRead struct {
+	secret *corev1.Secret
+	err    error
 }
 
 // Setup registers the 10-minute sweep — or nothing when the cluster

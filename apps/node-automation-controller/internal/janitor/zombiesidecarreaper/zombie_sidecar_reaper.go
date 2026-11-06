@@ -203,7 +203,19 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		// path: deleting a still-Running pod of an unfinished Job
 		// recreates it and re-runs the Job (BUG-C1).
 		Confirm: func(ctx context.Context, t zombieTarget) (bool, error) {
-			return r.jobAllowsReap(ctx, t.pod, t.attempted), nil
+			if r.jobAllowsReap(ctx, t.pod, t.attempted) {
+				return true, nil
+			}
+			// The Job gate vetoed the delete — release the poked
+			// ledger entry too, or the pod is stuck forever: a key
+			// still in `poked` skips the shutdown path every cycle
+			// and re-lands here unconfirmed (the delete step was the
+			// only poked release — the catch-22). Dropping it makes
+			// the next cycle retry the graceful /shutdown; `tried`
+			// still holds, so the backoffLimit==0 exemption keeps
+			// working through the same gate.
+			delete(r.poked, t.key)
+			return false, nil
 		},
 		LogTarget: func(log logr.Logger, t zombieTarget) {
 			log.Info("DELETE: zombie sidecar pod",

@@ -137,6 +137,35 @@ func TestGaugeLedgerSetWritesVecAndLedger(t *testing.T) {
 	}
 }
 
+// Begin clears the pending current set at sweep start: emissions
+// from a sweep that died before its Prune must not merge into the
+// next sweep and roll into emitted as never-re-verified tuples.
+func TestGaugeLedgerBeginDropsAbortedSweep(t *testing.T) {
+	var led GaugeLedger[ledgerKey]
+	// Sweep 1 committed "a" — emitted baseline.
+	led.Begin()
+	led.Emit(ledgerKey{"ns", "a"}, "ns", "a")
+	led.Prune(recordingDelete(&[][]string{}))
+
+	// Sweep 2 emitted "stale" then died before Prune — "a" stays
+	// committed (carry-forward), but "stale" sits un-pruned in
+	// current.
+	led.Emit(ledgerKey{"ns", "a"}, "ns", "a")
+	led.Emit(ledgerKey{"ns", "stale"}, "ns", "stale")
+
+	// Sweep 3 starts with Begin: "stale" must not ride in.
+	led.Begin()
+	led.Emit(ledgerKey{"ns", "b"}, "ns", "b")
+	var deleted [][]string
+	led.Prune(recordingDelete(&deleted))
+	if fmt.Sprint(deleted) != "[[ns a]]" {
+		t.Fatalf("deleted = %v, want [[ns a]] (stale tuple must not persist)", deleted)
+	}
+	if _, ok := led.Last()[ledgerKey{"ns", "stale"}]; ok {
+		t.Fatal("aborted sweep's tuple leaked into emitted")
+	}
+}
+
 func TestGaugeLedgerEmitClonesLabelValues(t *testing.T) {
 	var led GaugeLedger[string]
 	lv := []string{"ns", "a"}

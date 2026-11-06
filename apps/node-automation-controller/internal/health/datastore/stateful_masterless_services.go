@@ -53,15 +53,19 @@ type statefulMasterlessCheck struct {
 	//   - drPodHealed: "ns/sts" → last ordinal-0 pod delete — the
 	//     in-RAM half of the 30m dual-replica-deadlock cooldown
 	//     (W7-C3; the STS annotation is the durable half).
-	//   - drOpHealAt: the newest drHealed stamp — the in-RAM half
-	//     of "when did step 1 last land" for the W7-C3 settle gate
-	//     (a CooldownSet suppresses repeats but cannot report the
-	//     latest stamp back, so the moment is carried alongside).
+	//   - drOpHealAt: "ns/sts" -> newest drHealed stamp for THAT
+	//     StatefulSet — the in-RAM half of "when did step 1 last
+	//     land" for the W7-C3 settle gate (a CooldownSet suppresses
+	//     repeats but cannot report the latest stamp back, so the
+	//     moment is carried alongside). Keyed per-STS: a single
+	//     shared stamp let a second Dragonfly STS ride on an
+	//     unrelated STS's operator bounce and skip its settle
+	//     window entirely.
 	stsZeroSince   state.FirstSeenLedger
 	stsZeroEmitted state.GaugeLedger[string]
 	drHealed       state.CooldownSet
 	drPodHealed    state.CooldownSet
-	drOpHealAt     time.Time
+	drOpHealAt     map[string]time.Time
 	// W12-SC2 watchdog state:
 	//   - multiMasterStreak: "ns/svc/sts" → consecutive sweeps the
 	//     master-role Service showed >1 Ready endpoints — a
@@ -283,50 +287,45 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list statefulsets: %w", err)}
 	}
-	svcList, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.Services(p.CS, metav1.NamespaceAll))
+	svcList, err := p.AllServices(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list services: %w", err)}
 	}
 	// Ready-endpoint census per ns/service — same source as the
-	// webhook guard (paged, service-name label binding, nil ready
-	// counts as ready). A list error skips the whole check: "0
-	// ready" is indistinguishable from "no data". W12-SC2 keeps the
-	// endpoint detail (zone/node/targetRef) so the split-brain and
-	// site-skew signatures can place each endpoint.
+	// webhook guard (service-name label binding, nil ready counts
+	// as ready). A list error skips the whole check: "0 ready" is
+	// indistinguishable from "no data". W12-SC2 keeps the endpoint
+	// detail (zone/node/targetRef) so the split-brain and
+	// site-skew signatures can place each endpoint. The census
+	// rides the per-sweep snapshot — this check was the last one
+	// paying its own cluster-wide list.
 	ready := map[string][]readyEndpoint{}
-	err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.EndpointSlices(p.CS, metav1.NamespaceAll),
-		func(items []discoveryv1.EndpointSlice) error {
-			for _, s := range items {
-				svc := s.Labels[discoveryv1.LabelServiceName]
-				if svc == "" {
-					continue
-				}
-				key := s.Namespace + "/" + svc
-				for _, ep := range s.Endpoints {
-					if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
-						continue
-					}
-					e := readyEndpoint{}
-					if ep.Zone != nil {
-						e.zone = *ep.Zone
-					}
-					if ep.NodeName != nil {
-						e.node = *ep.NodeName
-					}
-					if ref := ep.TargetRef; ref != nil && ref.Kind == "Pod" {
-						e.podKey = ref.Namespace + "/" + ref.Name
-					}
-					ready[key] = append(ready[key], e)
-				}
-			}
-			return nil
-		})
+	esSlices, err := p.AllEndpointSlices(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list endpointslices: %w", err)}
+	}
+	for _, s := range esSlices {
+		svc := s.Labels[discoveryv1.LabelServiceName]
+		if svc == "" {
+			continue
+		}
+		key := s.Namespace + "/" + svc
+		for _, ep := range s.Endpoints {
+			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+				continue
+			}
+			e := readyEndpoint{}
+			if ep.Zone != nil {
+				e.zone = *ep.Zone
+			}
+			if ep.NodeName != nil {
+				e.node = *ep.NodeName
+			}
+			if ref := ep.TargetRef; ref != nil && ref.Kind == "Pod" {
+				e.podKey = ref.Namespace + "/" + ref.Name
+			}
+			ready[key] = append(ready[key], e)
+		}
 	}
 
 	// W12-SC2 reads: node topology zones (the skew gate + the
@@ -338,10 +337,8 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	zoneWorkers := map[string]bool{} // zones with >=1 Ready schedulable worker
 	podNode := map[string]string{}   // "ns/name" -> nodeName
 	var podItems []corev1.Pod
-	nodes, nerr := kube.ListNodes(ctx, p.CS)
-	pods, perr := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.Pods(p.CS, metav1.NamespaceAll))
+	nodes, nerr := p.AllNodes(ctx)
+	pods, perr := p.AllPods(ctx)
 	skewEval := nerr == nil && perr == nil
 	if !skewEval {
 		// Tolerated: the skew signatures go dark this sweep, the

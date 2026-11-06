@@ -102,6 +102,7 @@ type Auditor struct {
 // exported unconditionally; deletion additionally requires the
 // injector webhook provably healthy and the remediation flag on.
 func (a *Auditor) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
+	a.unmeshedEmitted.Begin() // drop any aborted sweep's leftover emissions
 	a.auditCriticalNSExclusions(snap)
 	g := snap.G
 	log := logf.FromContext(ctx)
@@ -370,7 +371,12 @@ func (a *Auditor) linkerdInjectorHealthy(snap *guardstate.Snapshot) (bool, error
 				continue
 			}
 			svc := w.ClientConfig.Service.Namespace + "/" + w.ClientConfig.Service.Name
-			if ready.Effective[svc] > 0 {
+			// W9-CP1 brownout guard: an effective-ready endpoint set
+			// that was probed AND failed every TCP+TLS handshake is
+			// hung, not healthy — evicting unmeshed pods now would
+			// only recreate them unmeshed again. A service that was
+			// never probed gets the benefit of the doubt.
+			if ready.Effective[svc] > 0 && (!ready.Probed[svc] || ready.Responsive[svc]) {
 				return true, nil
 			}
 		}
@@ -387,6 +393,7 @@ func (a *Auditor) linkerdInjectorHealthy(snap *guardstate.Snapshot) (bool, error
 // when the sub-webhook's namespaceSelector matches any of the critical
 // self-healing namespaces (kube-system, node-ops, medik8s).
 func (a *Auditor) auditCriticalNSExclusions(snap *guardstate.Snapshot) {
+	a.criticalNSExclusionEmitted.Begin() // drop any aborted sweep's leftover emissions
 	if snap.NSErr != nil || snap.MWCErr != nil || snap.VWCErr != nil ||
 		snap.MWC == nil || snap.VWC == nil {
 		return

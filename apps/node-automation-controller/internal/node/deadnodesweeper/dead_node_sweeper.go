@@ -49,6 +49,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -120,11 +121,13 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 		return fmt.Errorf("list nodes: %w", err)
 	}
 	nodeByName := make(map[string]*corev1.Node, len(nodes))
+	nodeNames := make(map[string]bool, len(nodes))
 	hasNotReady := false
 	untainted := 0
 	for i := range nodes {
 		n := &nodes[i]
 		nodeByName[n.Name] = n
+		nodeNames[n.Name] = true
 		if !kube.NodeReady(n) {
 			hasNotReady = true
 		}
@@ -210,6 +213,10 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	}
 	sort.Strings(names)
 
+	// The two medik8s remediation CRD lists are fetched once per
+	// sweep — lazily on the first death check — and shared by every
+	// suspect node (previously one List pair PER node).
+	remCache := &remediationCache{}
 	tainted := 0
 	for _, nodeName := range names {
 		count := stuck[nodeName]
@@ -238,7 +245,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 			continue
 		}
 
-		dead, err := s.confirmedDead(ctx, n)
+		dead, err := s.confirmedDead(ctx, n, remCache, nodeNames)
 		if err != nil {
 			log.Error(err, "death check failed — node skipped (fail closed)",
 				"node", nodeName, "stuckPods", count)
@@ -274,11 +281,12 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 
 // confirmedDead is the safety gate — true only with independent
 // fencing evidence (medik8s CR, or Ready=Unknown>30m + dead probe).
-func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node) (bool, error) {
+func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node,
+	rem *remediationCache, nodeNames map[string]bool) (bool, error) {
 	log := logf.FromContext(ctx)
 
 	// Path (a): a fencer CR exists for the node.
-	fenced, err := s.hasRemediationCR(ctx, n.Name)
+	fenced, err := s.hasRemediationCR(ctx, n.Name, rem, nodeNames)
 	if err != nil {
 		return false, err
 	}
@@ -321,19 +329,32 @@ func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node) (bo
 // fencing target (W12 P0-7).
 const remediationNodeNameAnno = "remediation.medik8s.io/node-name"
 
-// hasRemediationCR reports whether any medik8s remediation object
-// targets the node: CR name == node name (the 1:1 shape both CRDs
-// historically use), the remediation.medik8s.io/node-name
-// annotation, or a "<nodeName>-" name prefix (the template-suffixed
-// shape NHC v0.6+ emits). A missing CRD is "no evidence", not an
-// error — other list failures are real.
-func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string) (bool, error) {
+// remediationCache memoizes the once-per-sweep remediation CR
+// listing — the same API read serves every suspect node in the
+// cycle, so N suspects cost two List calls total, not 2N. A list
+// failure is cached too: the verdict stays consistent across the
+// sweep instead of re-hammering a flapping API per node.
+type remediationCache struct {
+	fetched bool
+	items   []unstructured.Unstructured
+	err     error
+}
+
+// remediationItems returns both CRDs' objects, listing at most once
+// per cache instance. A missing CRD is "no evidence" for that GVR —
+// other list failures are real and sticky for the sweep.
+func (s *deadNodeSweeper) remediationItems(ctx context.Context,
+	rem *remediationCache) ([]unstructured.Unstructured, error) {
 	// A missing dynamic client is a wiring bug, not "no fencing
 	// evidence" — unverifiable fails closed like every other check
 	// (same contract as descheduler-storm-gate's dyn guard).
 	if s.dyn == nil {
-		return false, errors.New("no dynamic client — remediation CR check unverifiable")
+		return nil, errors.New("no dynamic client — remediation CR check unverifiable")
 	}
+	if rem.fetched {
+		return rem.items, rem.err
+	}
+	rem.fetched = true
 	for _, gvr := range []schema.GroupVersionResource{
 		selfNodeRemediationGVR, fenceAgentsRemediationGVR,
 	} {
@@ -344,17 +365,66 @@ func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string)
 			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 				continue // CRD not installed on this cluster
 			}
-			return false, fmt.Errorf("list %s: %w", gvr.Resource, err)
+			rem.err = fmt.Errorf("list %s: %w", gvr.Resource, err)
+			return nil, rem.err
 		}
-		for i := range items {
-			if items[i].GetName() == nodeName ||
-				items[i].GetAnnotations()[remediationNodeNameAnno] == nodeName ||
-				strings.HasPrefix(items[i].GetName(), nodeName+"-") {
+		rem.items = append(rem.items, items...)
+	}
+	return rem.items, nil
+}
+
+// hasRemediationCR reports whether any medik8s remediation object
+// targets the node: the remediation.medik8s.io/node-name annotation
+// (AUTHORITATIVE when present — a CR stamped for another node is
+// never evidence here), CR name == node name (the 1:1 shape both
+// CRDs historically use), or a "<nodeName>-" name prefix (the
+// template-suffixed shape NHC v0.6+ emits). The prefix fallback is
+// guarded by the known node set: a CR like "worker-1-gpu" or
+// "worker-1-gpu-<tpl>" belongs to the node worker-1-gpu, and a bare
+// HasPrefix match would otherwise let it fence worker-1.
+func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string,
+	rem *remediationCache, nodeNames map[string]bool) (bool, error) {
+	items, err := s.remediationItems(ctx, rem)
+	if err != nil {
+		return false, err
+	}
+	for i := range items {
+		crName := items[i].GetName()
+		if anno := items[i].GetAnnotations()[remediationNodeNameAnno]; anno != "" {
+			// The annotation is the fencing target — when it is
+			// present it decides alone: no name or prefix match can
+			// override it (a "worker-1-gpu-<tpl>" CR annotated for
+			// worker-1-gpu must not fence worker-1).
+			if anno == nodeName {
 				return true, nil
 			}
+			continue
+		}
+		if crName == nodeName {
+			return true, nil
+		}
+		if strings.HasPrefix(crName, nodeName+"-") &&
+			!ownedByLongerNode(crName, nodeName, nodeNames) {
+			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// ownedByLongerNode reports whether crName is actually named after a
+// DIFFERENT known node with a longer name — the "worker-1-gpu" vs
+// "worker-1" prefix-collision guard: a bare HasPrefix match would
+// let a CR that belongs to worker-1-gpu fence worker-1.
+func ownedByLongerNode(crName, nodeName string, nodeNames map[string]bool) bool {
+	for other := range nodeNames {
+		if len(other) <= len(nodeName) {
+			continue // only a strictly-longer name can steal the prefix
+		}
+		if crName == other || strings.HasPrefix(crName, other+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 // probe is a single kube.KubeletHealthz attempt — a body starting
