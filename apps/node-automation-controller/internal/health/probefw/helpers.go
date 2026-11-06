@@ -85,8 +85,8 @@ func (d *Deps) DeletePodHeal(ctx context.Context, log logr.Logger,
 	cooldown time.Duration, now time.Time) {
 
 	key := "selfheal/" + checkName + "/" + targetKey
-	proceed, unverifiable := heal.Allowed(ctx, log, d.CS, d.Dyn,
-		&d.Heals, key, cooldown, now)
+	proceed, unverifiable := heal.AllowedV(ctx, log, &d.verdict,
+		d.CS, d.Dyn, &d.Heals, key, cooldown, now)
 	if unverifiable {
 		metrics.IncError(d.Name)
 		return

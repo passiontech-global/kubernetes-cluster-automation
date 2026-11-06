@@ -79,6 +79,12 @@ type Deps struct {
 	// (the former deps.meshHealed map).
 	Heals state.CooldownSet
 
+	// verdict memoizes the maintenance-mutex evaluation every
+	// DeletePodHeal preamble shares — one evaluation per
+	// kube.VerdictTTL across all checks using this Deps instead of
+	// three API reads per target.
+	verdict kube.Verdict
+
 	// Prom is the shared Prometheus instant-query client the
 	// metrics-backed checks run through PromQuery; Timeout bounds
 	// each query below the check's own deadline.
