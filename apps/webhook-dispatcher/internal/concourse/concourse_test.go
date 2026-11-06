@@ -212,6 +212,99 @@ func TestResourcesStaleFallback(t *testing.T) {
 	}
 }
 
+func TestResourcesFailedRefreshBacksOff(t *testing.T) {
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", IndexTTL: time.Hour}
+
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Expire the cache artificially — the last fetch attempt is as
+	// old as the cache itself (it IS the fetch that populated it) —
+	// then break the ATC: the first call re-fetches, fails, and
+	// serves the stale index.
+	c.fetchedAt = time.Now().Add(-2 * c.ttl())
+	c.lastAttemptAt = c.fetchedAt
+	stub.fail("/api/v1/teams/main/pipelines", 500)
+	index, err := c.Resources(context.Background())
+	if err != nil || len(index) != 4 {
+		t.Fatalf("stale fallback index=%v err=%v want 4, nil", index, err)
+	}
+	hits := stub.hitCount("/api/v1/teams/main/pipelines")
+
+	// Repeat calls inside the TTL window must NOT re-hit the ATC —
+	// without the attempt backoff each one would block on a doomed
+	// fetch, serializing webhook traffic behind a dead ATC.
+	for i := 0; i < 3; i++ {
+		index, err := c.Resources(context.Background())
+		if err != nil || len(index) != 4 {
+			t.Fatalf("call %d: stale index=%v err=%v want 4, nil", i, index, err)
+		}
+	}
+	if got := stub.hitCount("/api/v1/teams/main/pipelines"); got != hits {
+		t.Fatalf("pipeline-list hits=%d want %d (failed fetch must back off)", got, hits)
+	}
+}
+
+func TestFetchIndexRetainsResourcesForFailedPipeline(t *testing.T) {
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", IndexTTL: time.Nanosecond}
+
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond) // expire the TTL
+
+	// p2's resource listing breaks while the pipeline still exists —
+	// the refreshed index must carry p2's last-known resources over
+	// instead of silently unregistering them (the fetch succeeds as
+	// a whole, so a partial result would overwrite the cache).
+	stub.fail("/api/v1/teams/main/pipelines/p2/resources", 500)
+	index, err := c.Resources(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(index) != 4 {
+		t.Fatalf("index=%v want 4 resources (p2 retained)", index)
+	}
+	found := false
+	for _, r := range index {
+		if r.Pipeline == "p2" && r.Name == "repo-https" && r.Repo == "org/repo" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("index=%v missing p2's retained resource", index)
+	}
+}
+
+func TestFetchIndexDropsPipelineGoneFromList(t *testing.T) {
+	stub := newATCStub(t, stubRoutes())
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", IndexTTL: time.Nanosecond}
+
+	if _, err := c.Resources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond) // expire the TTL
+
+	// p2 disappears from the pipeline list entirely — its stale
+	// resources must NOT be retained (only a failed listing keeps
+	// them; a truly deleted pipeline drops out).
+	stub.setRoute("/api/v1/teams/main/pipelines", `[{"name":"p1"}]`)
+	index, err := c.Resources(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range index {
+		if r.Pipeline == "p2" {
+			t.Fatalf("index=%v still carries deleted pipeline p2", index)
+		}
+	}
+	if len(index) != 3 {
+		t.Fatalf("index=%v want 3 resources", index)
+	}
+}
+
 func TestRefreshBypassesTTL(t *testing.T) {
 	stub := newATCStub(t, stubRoutes())
 	c := &Client{BaseURL: stub.srv.URL, Team: "main", IndexTTL: time.Hour}

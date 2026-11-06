@@ -102,9 +102,10 @@ func main() {
 		IndexTTL:     time.Minute,
 	}
 
+	wh := handler.New(os.Getenv("GITHUB_WEBHOOK_SECRET"), client)
+
 	mux := http.NewServeMux()
-	mux.Handle("POST /webhook",
-		handler.New(os.Getenv("GITHUB_WEBHOOK_SECRET"), client))
+	mux.Handle("POST /webhook", wh)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -124,7 +125,13 @@ func main() {
 		WriteTimeout: 45 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
+	// shutdownDone closes when BOTH the HTTP drain and the fan-out
+	// wait have finished — main must block on it after ListenAndServe
+	// returns or it would exit while detached check POSTs are still
+	// in flight.
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		logger().Info("shutdown signal received — draining connections")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -133,6 +140,12 @@ func main() {
 			logger().Warn("graceful shutdown failed — connections dropped",
 				"error", err)
 		}
+		// srv.Shutdown only drains listeners and request handlers —
+		// the detached fan-out goroutines outlive the requests that
+		// spawned them. Wait for the last check POST to land (each is
+		// bounded by the per-target fan-out timeout) before exiting.
+		logger().Info("connections drained — waiting for in-flight fan-outs")
+		wh.Wait()
 	}()
 
 	logger().Info("starting webhook-dispatcher",
@@ -143,4 +156,5 @@ func main() {
 		logger().Error("server exited", "error", err)
 		os.Exit(1)
 	}
+	<-shutdownDone
 }
