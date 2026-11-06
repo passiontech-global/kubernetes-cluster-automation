@@ -1,5 +1,5 @@
 // heal.go — the three helpers implementing the sequence doc.go
-// describes, split at the points call sites differ: Allowed runs
+// describes, split at the points call sites differ: AllowedV runs
 // the preamble (cooldown + mutex), OldestRunningPod is the shared
 // "bounce the operator" target pick, and DeletePod is the delete +
 // stamp actuation. Modules that pick a different target (a leader
@@ -20,7 +20,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
-// Allowed runs the shared preamble every pod-kill heal repeats
+// AllowedV runs the shared preamble every pod-kill heal repeats
 // before picking its target: per-key cooldown on the heals ledger,
 // then the maintenance mutex (kube.MaintenanceActive — fail closed:
 // unverifiable counts as held). Returns proceed=true when the caller
@@ -34,22 +34,16 @@ import (
 // The defer reason is logged here with the heal's key; callers log
 // only their own ACTION/defer wording.
 //
+// v is the shared maintenance verdict: loops that run the preamble
+// once per target pass the module's Verdict field so the whole sweep
+// pays a single mutex evaluation instead of three API reads per pod.
+// A nil v means "no memoization" — the mutex evaluates fresh every
+// call (the one-shot-heal shape).
+//
 // A nil heals pointer skips the cooldown check entirely — heals
 // that persist their stamp on the object itself (the passiontech.dev/last-*
-// annotations read via kube.AnnoTime) pass nil and keep only the
-// mutex gate.
-func Allowed(ctx context.Context, log logr.Logger,
-	cs kubernetes.Interface, dyn dynamic.Interface,
-	heals *state.CooldownSet, key string, cooldown time.Duration,
-	now time.Time) (proceed bool, unverifiable bool) {
-	return AllowedV(ctx, log, &kube.Verdict{}, cs, dyn,
-		heals, key, cooldown, now)
-}
-
-// AllowedV is Allowed with a shared maintenance verdict — loops that
-// run the preamble once per target pass the module's Verdict field
-// so the whole sweep pays a single mutex evaluation instead of three
-// API reads per pod.
+// annotations read via kube.AnnoTime, see persisted.go) pass nil and
+// keep only the mutex gate.
 func AllowedV(ctx context.Context, log logr.Logger, v *kube.Verdict,
 	cs kubernetes.Interface, dyn dynamic.Interface,
 	heals *state.CooldownSet, key string, cooldown time.Duration,
@@ -58,6 +52,11 @@ func AllowedV(ctx context.Context, log logr.Logger, v *kube.Verdict,
 	if heals != nil && heals.CooledDown(key, cooldown, now) {
 		log.Info("skip heal: inside cooldown", "target", key)
 		return false, false
+	}
+	if v == nil {
+		// No memoization — a throwaway zero Verdict evaluates fresh
+		// (an unstamped verdict is always expired).
+		v = &kube.Verdict{}
 	}
 	held, why, err := v.Active(ctx, cs, dyn, now)
 	if err != nil {
@@ -84,7 +83,7 @@ func AllowedV(ctx context.Context, log logr.Logger, v *kube.Verdict,
 // Returns (deleted, err): any API failure is (false, err) — the
 // caller IncErrors its own queue and logs err in its own wording
 // (each module phrases the failure with its own target context).
-// A nil heals pointer skips the stamp, mirroring Allowed's
+// A nil heals pointer skips the stamp, mirroring AllowedV's
 // nil-ledger contract.
 func DeletePod(ctx context.Context, cs kubernetes.Interface,
 	heals *state.CooldownSet, key string, pod *corev1.Pod,

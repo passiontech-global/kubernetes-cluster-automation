@@ -186,9 +186,10 @@ func Namespaces(cs kubernetes.Interface) PageFunc[corev1.Namespace] {
 		func(l *corev1.NamespaceList) []corev1.Namespace { return l.Items })
 }
 
-// Nodes lists cluster-scoped Nodes — the backing PageFunc for
-// ListNodes in node.go.
-func Nodes(cs kubernetes.Interface) PageFunc[corev1.Node] {
+// nodes lists cluster-scoped Nodes — the backing PageFunc for
+// ListNodes in node.go (kept private: node reads must funnel
+// through ListNodes, the single place node listing happens).
+func nodes(cs kubernetes.Interface) PageFunc[corev1.Node] {
 	return typedPage(
 		func(ctx context.Context, o metav1.ListOptions) (*corev1.NodeList, error) {
 			return cs.CoreV1().Nodes().List(ctx, o)

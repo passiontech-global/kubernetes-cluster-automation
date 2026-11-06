@@ -76,7 +76,7 @@ func TestIsControlPlaneMasterLabel(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// PatchNodeTaints / TaintNode / UntaintNode edge cases.
+// patchNodeTaints / TaintNode / UntaintNode edge cases.
 // ---------------------------------------------------------------------------
 
 func TestPatchNodeTaintsNilWritesEmptyArray(t *testing.T) {
@@ -85,8 +85,8 @@ func TestPatchNodeTaintsNilWritesEmptyArray(t *testing.T) {
 	tainted := node("n1", corev1.ConditionTrue, nil,
 		corev1.Taint{Key: "a", Effect: corev1.TaintEffectNoSchedule})
 	cs := fake.NewSimpleClientset(tainted)
-	if err := PatchNodeTaints(ctx, cs, "n1", nil); err != nil {
-		t.Fatalf("PatchNodeTaints(nil): %v", err)
+	if err := patchNodeTaints(ctx, cs, "n1", nil); err != nil {
+		t.Fatalf("patchNodeTaints(nil): %v", err)
 	}
 	got := getNode(t, cs, "n1").Spec.Taints
 	if got == nil {
@@ -103,7 +103,7 @@ func TestPatchNodeTaintsPatchError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
-	if err := PatchNodeTaints(ctx, cs, "n1",
+	if err := patchNodeTaints(ctx, cs, "n1",
 		[]corev1.Taint{{Key: "a", Effect: corev1.TaintEffectNoSchedule}}); err == nil {
 		t.Fatal("expected error when the node patch fails")
 	}
@@ -219,13 +219,13 @@ func TestTaintHelpers(t *testing.T) {
 	}
 }
 
-func TestDropTaintsByKey(t *testing.T) {
+func TestDropTaintsByKeyInPlace(t *testing.T) {
 	in := []corev1.Taint{
 		{Key: "a", Effect: corev1.TaintEffectNoSchedule},
 		{Key: "a", Effect: corev1.TaintEffectNoExecute},
 		{Key: "b", Effect: corev1.TaintEffectNoSchedule},
 	}
-	out := DropTaintsByKey(in, "a")
+	out := dropTaintsByKey(in, "a")
 	if len(out) != 1 || out[0].Key != "b" {
 		t.Fatalf("expected only taint b, got %+v", out)
 	}

@@ -47,7 +47,7 @@ func maintenancePlan(name, state string) *unstructured.Unstructured {
 // maintenanceKured builds the kured DaemonSet carrying `annos`.
 func maintenanceKured(annos map[string]string) *appsv1.DaemonSet {
 	return &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
-		Namespace: KuredDaemonSetNS, Name: KuredDaemonSetName,
+		Namespace: kuredDaemonSetNS, Name: kuredDaemonSetName,
 		Annotations: annos}}
 }
 
@@ -68,11 +68,11 @@ func maintenanceCordoned(name string, ago time.Duration) *corev1.Node {
 
 // Signal (a): only an ACTIVE cordon is evidence — a node cordoned
 // past the 45m window is deliberate static state and yields none.
-func TestNodeCordonEvidence(t *testing.T) {
+func TestNodeCordonEvidenceFreshOnly(t *testing.T) {
 	fresh := maintenanceCordoned("w1", 10*time.Minute)
 	stale := maintenanceCordoned("w2", 2*time.Hour)
 	cs := fake.NewSimpleClientset(fresh, stale)
-	ev, err := NodeCordonEvidence(ctx, cs)
+	ev, err := nodeCordonEvidence(ctx, cs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestNodeCordonEvidenceListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	if _, err := NodeCordonEvidence(ctx, cs); err == nil {
+	if _, err := nodeCordonEvidence(ctx, cs); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
 }
@@ -181,24 +181,19 @@ func TestMaintenanceActiveNilDynFailsClosed(t *testing.T) {
 	}
 }
 
-// MaintenanceEvidence reports EVERY active signal at once — the
-// storm-gate-style verdict shape — where MaintenanceActive reports
-// only the first.
-func TestMaintenanceEvidenceCollectsAllSignals(t *testing.T) {
+// A held signal's evidence is the verdict's `why` — the first
+// active signal in canonical order answers (the cordon beats a
+// held kured lock and a live Plan here).
+func TestMaintenanceActiveWhyIsFirstSignalEvidence(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		maintenanceCordoned("w1", time.Minute),
 		maintenanceKured(map[string]string{KuredLockAnno: "w2"}))
 	dyn := maintenanceDynFake(maintenancePlan("up", "InProgress"))
-	ev, err := MaintenanceEvidence(ctx, cs, dyn)
+	held, why, err := MaintenanceActive(ctx, cs, dyn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{
-		"node w1 actively cordoned",
-		"kured lock held by w2",
-		"autopilot plan up state=InProgress",
-	}
-	if !slices.Equal(ev, want) {
-		t.Fatalf("evidence = %v, want %v", ev, want)
+	if !held || why != "node w1 actively cordoned" {
+		t.Fatalf("held=%v why=%q, want the cordon evidence", held, why)
 	}
 }

@@ -50,7 +50,7 @@ type linkerdEndpointSyncCheck struct {
 	linkerdDesyncHealed  state.CooldownSet
 	// verdict memoizes the maintenance-mutex evaluation the
 	// per-service heal preambles share — one evaluation per
-	// VerdictTTL instead of three API reads per desynced service.
+	// Verdict TTL instead of three API reads per desynced service.
 	verdict kube.Verdict
 }
 

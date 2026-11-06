@@ -40,7 +40,7 @@ type ciliumNodeIPAMExhaustionCheck struct {
 	// lock).
 	emitted state.GaugeLedger[string]
 	// verdict memoizes the maintenance-mutex evaluation the
-	// per-node reap preambles share — one evaluation per VerdictTTL
+	// per-node reap preambles share — one evaluation per Verdict TTL
 	// instead of three API reads per exhausted node.
 	verdict kube.Verdict
 }

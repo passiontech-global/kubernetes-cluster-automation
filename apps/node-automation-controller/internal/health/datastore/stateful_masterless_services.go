@@ -62,7 +62,7 @@ type statefulMasterlessCheck struct {
 	drOpHealAt     time.Time
 	// verdict memoizes the maintenance-mutex evaluation the
 	// per-target heal preambles share — one evaluation per
-	// VerdictTTL instead of three API reads per masterless service.
+	// Verdict TTL instead of three API reads per masterless service.
 	verdict kube.Verdict
 }
 

@@ -1,9 +1,12 @@
 // helpers.go — shared helpers for the self-healing probe checks:
 //
-//   - DeletePodHeal: the shared pod-delete heal shape — per-target
-//     cooldown on the Deps Heals ledger, maintenance mutex (fail
-//     closed), UID-preconditioned delete. Thin wrapper over the
-//     platform heal package this file was the reference for.
+//   - DeletePodHeal / SelfHealKey: the shared pod-delete heal shape —
+//     per-target cooldown on the Deps Heals ledger, maintenance mutex
+//     (fail closed), UID-preconditioned delete — and the
+//     "selfheal/<check>/<target>" ledger key it stamps. Thin wrapper
+//     over the platform heal package this file was the reference for.
+//   - RequireDyn: the "no dynamic client" preamble every CR-scanning
+//     check opens with.
 //   - PodUnreadySince / PodFromList: pod readiness helpers.
 //   - PromEndpoint / PromQuery: the Prometheus instant-query seam
 //     every metrics-backed check shares, backed by internal/promq.
@@ -20,6 +23,8 @@ package probefw
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -72,6 +77,39 @@ func (d *Deps) PromQuery(ctx context.Context, query string) ([]promq.Sample, err
 	return c.InstantQuery(ctx, endpoint, query)
 }
 
+// SelfHealKey composes the shared heal-ledger key —
+// "selfheal/<check>/<target>" — DeletePodHeal stamps on
+// Deps.Heals. Four domain checks hand-compose the same format for
+// their non-pod-delete heals (keda rescue, wedged-namespace
+// finalizer sweep, cilium IPAM reap, linkerd template re-roll) so
+// the keyspace stays unified: a heal under any spelling honors the
+// same cooldown stamp.
+func SelfHealKey(check, target string) string {
+	return "selfheal/" + check + "/" + target
+}
+
+// RequireDyn implements the shared "no dynamic client" preamble —
+// the CR-scanning checks treat a missing dynamic client as a wiring
+// bug (Infra), never "no signal". Returns nil when Dyn is set, else
+// the Infra result the sites build; what is the check's free-form
+// description and the error stays byte-identical to the hand-rolled
+// strings ("no dynamic client — <what> unverifiable"; what="" yields
+// the bare "no dynamic client").
+//
+//	if r := d.RequireDyn("scylla health check"); r != nil {
+//		return *r
+//	}
+func (d *Deps) RequireDyn(what string) *Result {
+	if d.Dyn != nil {
+		return nil
+	}
+	if what == "" {
+		return &Result{Infra: errors.New("no dynamic client")}
+	}
+	return &Result{Infra: fmt.Errorf(
+		"no dynamic client — %s unverifiable", what)}
+}
+
 // DeletePodHeal is the pod-delete heal shape the self-healing checks
 // share — this body was the reference internal/platform/heal was
 // extracted from, so it now delegates: heal.Allowed runs the
@@ -84,7 +122,7 @@ func (d *Deps) DeletePodHeal(ctx context.Context, log logr.Logger,
 	checkName, targetKey string, pod *corev1.Pod,
 	cooldown time.Duration, now time.Time) {
 
-	key := "selfheal/" + checkName + "/" + targetKey
+	key := SelfHealKey(checkName, targetKey)
 	proceed, unverifiable := heal.AllowedV(ctx, log, &d.verdict,
 		d.CS, d.Dyn, &d.Heals, key, cooldown, now)
 	if unverifiable {

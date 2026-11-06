@@ -106,6 +106,10 @@ type externalSecretNudge struct {
 	// the heal still needs 15m of fresh down/storm observations
 	// first.
 	connectHeals state.CooldownSet
+	// verdict memoizes the maintenance-mutex evaluation for the
+	// sweep's heal preambles — one evaluation per Verdict TTL
+	// instead of three API reads per target.
+	verdict kube.Verdict
 }
 
 // Setup registers the 10-minute sweep. With the module gate off

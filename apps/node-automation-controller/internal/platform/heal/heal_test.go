@@ -60,7 +60,7 @@ func pod(ns, name string, uid types.UID, phase corev1.PodPhase,
 	}
 }
 
-// Allowed's cooldown check runs BEFORE the mutex: a cooled-down key
+// AllowedV's cooldown check runs BEFORE the mutex: a cooled-down key
 // defers (false, false) even when every maintenance read would fail
 // — proven here by a clientset whose lists all error.
 func TestAllowedCooledDownShortCircuits(t *testing.T) {
@@ -73,10 +73,10 @@ func TestAllowedCooledDownShortCircuits(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	proceed, unverifiable := Allowed(ctx, logr.Discard(), cs, nil,
+	proceed, unverifiable := AllowedV(ctx, logr.Discard(), nil, cs, nil,
 		&heals, "k", 5*time.Minute, now)
 	if proceed || unverifiable {
-		t.Fatalf("cooled-down Allowed = (%v,%v), want (false,false)",
+		t.Fatalf("cooled-down AllowedV = (%v,%v), want (false,false)",
 			proceed, unverifiable)
 	}
 }
@@ -85,10 +85,10 @@ func TestAllowedCooledDownShortCircuits(t *testing.T) {
 // operation, no IncError owed by the caller.
 func TestAllowedMaintenanceHeld(t *testing.T) {
 	cs := fake.NewSimpleClientset(cordonedNow("w1"))
-	proceed, unverifiable := Allowed(ctx, logr.Discard(), cs, nil,
+	proceed, unverifiable := AllowedV(ctx, logr.Discard(), nil, cs, nil,
 		&state.CooldownSet{}, "k", time.Minute, time.Now())
 	if proceed || unverifiable {
-		t.Fatalf("held Allowed = (%v,%v), want (false,false)",
+		t.Fatalf("held AllowedV = (%v,%v), want (false,false)",
 			proceed, unverifiable)
 	}
 }
@@ -97,10 +97,10 @@ func TestAllowedMaintenanceHeld(t *testing.T) {
 // fails closed AND flags it — the caller IncErrors on this path.
 func TestAllowedUnverifiableFailsClosed(t *testing.T) {
 	cs := fake.NewSimpleClientset()
-	proceed, unverifiable := Allowed(ctx, logr.Discard(), cs, nil,
+	proceed, unverifiable := AllowedV(ctx, logr.Discard(), nil, cs, nil,
 		&state.CooldownSet{}, "k", time.Minute, time.Now())
 	if proceed || !unverifiable {
-		t.Fatalf("unverifiable Allowed = (%v,%v), want (false,true)",
+		t.Fatalf("unverifiable AllowedV = (%v,%v), want (false,true)",
 			proceed, unverifiable)
 	}
 }
@@ -108,10 +108,10 @@ func TestAllowedUnverifiableFailsClosed(t *testing.T) {
 // Clear maintenance + no cooldown = proceed.
 func TestAllowedProceeds(t *testing.T) {
 	cs := fake.NewSimpleClientset()
-	proceed, unverifiable := Allowed(ctx, logr.Discard(), cs,
+	proceed, unverifiable := AllowedV(ctx, logr.Discard(), nil, cs,
 		planAwareDyn(), &state.CooldownSet{}, "k", time.Minute, time.Now())
 	if !proceed || unverifiable {
-		t.Fatalf("clear Allowed = (%v,%v), want (true,false)",
+		t.Fatalf("clear AllowedV = (%v,%v), want (true,false)",
 			proceed, unverifiable)
 	}
 }
@@ -120,10 +120,35 @@ func TestAllowedProceeds(t *testing.T) {
 // cooled proceeds when the mutex is clear.
 func TestAllowedNilHealsSkipsCooldown(t *testing.T) {
 	cs := fake.NewSimpleClientset()
-	proceed, _ := Allowed(ctx, logr.Discard(), cs, planAwareDyn(),
+	proceed, _ := AllowedV(ctx, logr.Discard(), nil, cs, planAwareDyn(),
 		nil, "k", time.Hour, time.Now())
 	if !proceed {
 		t.Fatal("nil heals blocked the heal")
+	}
+}
+
+// A shared Verdict memoizes the mutex across preamble calls: two
+// AllowedV calls against a cordoned-then-cleared view still see the
+// FIRST evaluation — one node list total, not one per call.
+func TestAllowedVSharedVerdictMemoizes(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	var lists int
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			lists++
+			return false, nil, nil // tracker serves the (empty) list
+		})
+	var v kube.Verdict
+	now := time.Now()
+	for i := 0; i < 2; i++ {
+		proceed, unverifiable := AllowedV(ctx, logr.Discard(), &v, cs,
+			planAwareDyn(), &state.CooldownSet{}, "k", time.Minute, now)
+		if !proceed || unverifiable {
+			t.Fatalf("call %d = (%v,%v), want (true,false)", i, proceed, unverifiable)
+		}
+	}
+	if lists != 1 {
+		t.Fatalf("node lists = %d, want 1 (memoized verdict)", lists)
 	}
 }
 

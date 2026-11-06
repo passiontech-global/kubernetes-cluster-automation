@@ -45,22 +45,6 @@ func AnnoTime(obj metav1.Object, key string) (time.Time, bool) {
 	return ParseAnnoTime(obj.GetAnnotations()[key])
 }
 
-// StampAnno sets obj's annotation key to t in RFC3339 — new stamps
-// are always RFC3339; the unix-seconds branch of ParseAnnoTime is
-// read-compat only and must never be written again. A nil
-// annotations map is created (the same create-on-write the
-// hand-rolled stampers each carried). The value lands in the map
-// BEFORE SetAnnotations: unstructured objects deep-copy on set, so
-// mutating the map afterwards would silently drop the stamp.
-func StampAnno(obj metav1.Object, key string, t time.Time) {
-	annos := obj.GetAnnotations()
-	if annos == nil {
-		annos = map[string]string{}
-	}
-	annos[key] = t.Format(time.RFC3339)
-	obj.SetAnnotations(annos)
-}
-
 // MergePatchAnnos builds a MergePatchType patch doc setting (or, for
 // a nil value, deleting) the given metadata.annotations keys —
 // collapses the json.Marshal({"metadata":{"annotations":{...}}})

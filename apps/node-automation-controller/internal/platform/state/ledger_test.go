@@ -3,6 +3,9 @@ package state
 import (
 	"fmt"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 type ledgerKey struct{ ns, name string }
@@ -102,6 +105,35 @@ func TestGaugeLedgerReconcile(t *testing.T) {
 	}
 	if fmt.Sprint(deleted) != "[[B]]" {
 		t.Fatalf("deleted = %v, want [[B]]", deleted)
+	}
+}
+
+// Set is the WithLabelValues(...).Set + Emit pair in one call: the
+// gauge carries the value AND the ledger records the tuple, so the
+// prune sees it as still-live next sweep.
+func TestGaugeLedgerSetWritesVecAndLedger(t *testing.T) {
+	vec := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "test_gauge_ledger_set", Help: "test"}, []string{"ns", "name"})
+	var led GaugeLedger[ledgerKey]
+	led.Set(vec, 1, ledgerKey{"ns", "a"}, "ns", "a")
+
+	m := &dto.Metric{}
+	if err := vec.WithLabelValues("ns", "a").Write(m); err != nil {
+		t.Fatal(err)
+	}
+	if m.GetGauge().GetValue() != 1 {
+		t.Fatalf("gauge value = %v, want 1", m.GetGauge().GetValue())
+	}
+	// The tuple counts as emitted: roll the sweep, emit only a
+	// different key next sweep, and the prune must delete "ns/a" —
+	// proving Set fed the ledger the same label values it Set the
+	// vec with.
+	led.Prune(recordingDelete(&[][]string{}))
+	led.Emit(ledgerKey{"ns", "b"}, "ns", "b")
+	var deleted [][]string
+	led.Prune(recordingDelete(&deleted))
+	if fmt.Sprint(deleted) != "[[ns a]]" {
+		t.Fatalf("deleted = %v, want [[ns a]]", deleted)
 	}
 }
 

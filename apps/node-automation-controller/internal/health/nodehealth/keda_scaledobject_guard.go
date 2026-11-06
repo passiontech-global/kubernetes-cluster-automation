@@ -46,7 +46,7 @@ type kedaScaledObjectGuardCheck struct {
 	emitted state.GaugeLedger[string]
 	// verdict memoizes the maintenance-mutex evaluation the
 	// per-target rescue preambles share — one evaluation per
-	// VerdictTTL instead of three API reads per wedged ScaledObject.
+	// Verdict TTL instead of three API reads per wedged ScaledObject.
 	verdict kube.Verdict
 }
 

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -89,7 +91,6 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 		ageHours               int
 	}
 	var targets []target
-	capped := false
 	for i := range pods {
 		pod := &pods[i]
 		if pod.Status.Phase != corev1.PodFailed {
@@ -109,10 +110,6 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 		if age <= evictedPodMaxAge {
 			continue // fresh eviction — keep it inspectable
 		}
-		if len(targets) >= evictedPodCap {
-			capped = true
-			break
-		}
 		targets = append(targets, target{
 			ns:       pod.Namespace,
 			name:     pod.Name,
@@ -125,23 +122,27 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 	// Release the pod slice before issuing Delete calls.
 	pods = nil
 
-	deleted, failed := 0, 0
-	for _, t := range targets {
-		log.Info("DELETE: evicted pod past retention",
-			"pod", t.ns+"/"+t.name, "node", t.node,
-			"reason", t.reason, "ageHours", t.ageHours)
-		// UID precondition: the listed object is what we vetted — a
-		// same-named pod recreated in between is not ours to reap.
-		if err := j.cs.CoreV1().Pods(t.ns).Delete(ctx, t.name,
-			kube.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground)); err != nil {
+	deleted, failed, capped := reap.Sweep(ctx, log, targets, reap.Options[target]{
+		// The cap bounds delete attempts (failed deletes churn the
+		// apiserver the same way) — leftover targets drain next run.
+		Cap: evictedPodCap,
+		LogTarget: func(log logr.Logger, t target) {
+			log.Info("DELETE: evicted pod past retention",
+				"pod", t.ns+"/"+t.name, "node", t.node,
+				"reason", t.reason, "ageHours", t.ageHours)
+		},
+		Delete: func(ctx context.Context, t target) error {
+			// UID precondition: the listed object is what we vetted —
+			// a same-named pod recreated in between is not ours to reap.
+			return j.cs.CoreV1().Pods(t.ns).Delete(ctx, t.name,
+				kube.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground))
+		},
+		OnError: func(log logr.Logger, t target, err error) {
 			metrics.IncError(j.queue)
 			log.Error(err, "pod delete failed",
 				"pod", t.ns+"/"+t.name, "node", t.node, "reason", t.reason)
-			failed++
-			continue
-		}
-		deleted++
-	}
+		},
+	})
 	if capped {
 		log.Info("SKIP rest: cap reached", "cap", evictedPodCap)
 	}
