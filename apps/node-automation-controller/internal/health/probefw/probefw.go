@@ -81,7 +81,7 @@ type Deps struct {
 
 	// verdict memoizes the maintenance-mutex evaluation every
 	// DeletePodHeal preamble shares — one evaluation per
-	// kube.VerdictTTL across all checks using this Deps instead of
+	// Verdict TTL across all checks using this Deps instead of
 	// three API reads per target.
 	verdict kube.Verdict
 
@@ -102,6 +102,7 @@ type Config struct {
 	Pods        PodsConfig
 	Quota       QuotaConfig
 	KCM         KCMConfig
+	Cilium      CiliumConfig
 }
 
 // TimeoutsConfig bounds remote calls at two levels: Check is the
@@ -145,4 +146,14 @@ type QuotaConfig struct {
 type KCMConfig struct {
 	LeaseMaxAge  time.Duration // HEALTH_KCM_LEASE_MAX_AGE
 	FreezeMinAge time.Duration // HEALTH_KCM_FREEZE_MIN_AGE
+}
+
+// CiliumConfig — the cilium nethealth knobs: the BPF map fill-ratio
+// ceiling for cilium-bpf-map-pressure and the node pod-IP free-ratio
+// floor for cilium-node-ipam-exhaustion. The env names carry no
+// HEALTH_ prefix — they predate the port and the ops contract keeps
+// them byte-stable.
+type CiliumConfig struct {
+	BPFMapPressureThreshold float64 // CILIUM_BPF_MAP_PRESSURE_THRESHOLD
+	NodeIPAMMinFreeRatio    float64 // CILIUM_NODE_IPAM_MIN_FREE_RATIO
 }

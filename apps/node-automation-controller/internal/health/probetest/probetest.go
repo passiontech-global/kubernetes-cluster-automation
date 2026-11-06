@@ -79,6 +79,14 @@ func NewDeps(cs kubernetes.Interface, dyn dynamic.Interface) *probefw.Deps {
 	return d
 }
 
+// FreezeNow pins the Deps clock to base — the shared shape for the
+// "p.Now = func() time.Time { return base }" every persistence-window
+// test hand-rolls. Advance by calling again with a new base (the
+// clock is the same plain func var production wires to time.Now).
+func FreezeNow(d *probefw.Deps, base time.Time) {
+	d.Now = func() time.Time { return base }
+}
+
 // OpDyn registers every GVR the sweep checks scan — the fake dynamic
 // client PANICS on an unregistered GVR List, so every watched
 // operator resource (W5.8 original five + the ten W7-C2 additions)

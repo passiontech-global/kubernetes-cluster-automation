@@ -59,14 +59,14 @@ func HasTaint(taints []corev1.Taint, key string) bool {
 // has this cordon been live".
 const UnschedulableTaintKey = "node.kubernetes.io/unschedulable"
 
-// NodeCordonActiveMaxAge is how old a cordon may be before it reads as
+// nodeCordonActiveMaxAge is how old a cordon may be before it reads as
 // deliberate static state rather than a drain in flight.
-const NodeCordonActiveMaxAge = 45 * time.Minute
+const nodeCordonActiveMaxAge = 45 * time.Minute
 
 // NodeActivelyCordoned reports whether the node is cordoned AND the
 // cordon looks like a drain in flight — spec.unschedulable plus the
 // node.kubernetes.io/unschedulable taint younger than
-// NodeCordonActiveMaxAge (or timestamp-less: unverifiable fails
+// nodeCordonActiveMaxAge (or timestamp-less: unverifiable fails
 // closed). A statically-cordoned node — unschedulable held past the
 // window — does NOT count: long-cordoned nodes are an operator
 // decision (decommissioned capacity, quarantined hardware), not a
@@ -83,20 +83,20 @@ func NodeActivelyCordoned(n *corev1.Node, now time.Time) bool {
 		if t.TimeAdded == nil {
 			return true // cordon timestamp unverifiable — fail closed
 		}
-		return now.Sub(t.TimeAdded.Time) < NodeCordonActiveMaxAge
+		return now.Sub(t.TimeAdded.Time) < nodeCordonActiveMaxAge
 	}
 	// unschedulable without the companion taint — the age cannot be
 	// verified, so it counts (fail closed, same as a nil TimeAdded).
 	return true
 }
 
-// DropTaintsByKey returns taints with every entry matching key
+// dropTaintsByKey returns taints with every entry matching key
 // removed. It filters IN PLACE — the result aliases and shortens the
 // caller's backing array, so the input must not be shared or
 // informer-cache-owned. Callers must pass a slice they own (today
 // every call site hands over .spec.taints of a fresh Get, which the
 // apiserver decodes per call).
-func DropTaintsByKey(taints []corev1.Taint, key string) []corev1.Taint {
+func dropTaintsByKey(taints []corev1.Taint, key string) []corev1.Taint {
 	out := taints[:0]
 	changed := false
 	for _, t := range taints {
@@ -115,12 +115,12 @@ func DropTaintsByKey(taints []corev1.Taint, key string) []corev1.Taint {
 	return out
 }
 
-// PatchNodeTaints replaces .spec.taints on a node via JSON Merge Patch
+// patchNodeTaints replaces .spec.taints on a node via JSON Merge Patch
 // — the merge semantics create the key when absent (a never-tainted
 // node has no "taints" field, so a JSONPatch "replace" would be
 // rejected) and arrays are replaced wholesale, which is exactly what
 // callers pass (the full desired taint list).
-func PatchNodeTaints(ctx context.Context, cs kubernetes.Interface, name string, taints []corev1.Taint) error {
+func patchNodeTaints(ctx context.Context, cs kubernetes.Interface, name string, taints []corev1.Taint) error {
 	if taints == nil {
 		taints = []corev1.Taint{} // merge patch [] clears, nil would marshal "taints":null
 	}
@@ -147,7 +147,7 @@ func TaintNode(ctx context.Context, cs kubernetes.Interface, name, key, value st
 	}
 	taints := append(append([]corev1.Taint{}, node.Spec.Taints...),
 		corev1.Taint{Key: key, Value: value, Effect: effect})
-	return PatchNodeTaints(ctx, cs, name, taints)
+	return patchNodeTaints(ctx, cs, name, taints)
 }
 
 // UntaintNode removes every taint with the given key (all effects).
@@ -159,7 +159,7 @@ func UntaintNode(ctx context.Context, cs kubernetes.Interface, name, key string)
 	if !HasTaint(node.Spec.Taints, key) {
 		return nil
 	}
-	return PatchNodeTaints(ctx, cs, name, DropTaintsByKey(node.Spec.Taints, key))
+	return patchNodeTaints(ctx, cs, name, dropTaintsByKey(node.Spec.Taints, key))
 }
 
 // PatchNodeLabels merges labels onto a node (kubectl label --overwrite).
@@ -178,7 +178,7 @@ func PatchNodeLabels(ctx context.Context, cs kubernetes.Interface, name string, 
 // get/list/watch on nodes). Paged like every cluster-wide list —
 // Node objects are the fattest typed payload any module pulls.
 func ListNodes(ctx context.Context, cs kubernetes.Interface) ([]corev1.Node, error) {
-	return ListAll(ctx, metav1.ListOptions{Limit: 500}, Nodes(cs))
+	return ListAll(ctx, metav1.ListOptions{Limit: 500}, nodes(cs))
 }
 
 // CountNotReadyNodes returns how many nodes are not Ready=True —

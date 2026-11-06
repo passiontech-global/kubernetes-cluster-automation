@@ -60,7 +60,7 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 		return
 	}
 	// The cooldown check stays a manual CooledDown (not inside
-	// heal.Allowed) so the DEFER log keeps its trigger context —
+	// heal.AllowedV) so the DEFER log keeps its trigger context —
 	// storeDown/stormLong and the last-heal age the shared preamble
 	// cannot know.
 	if n.connectHeals.CooledDown(esConnectPodPrefix, esConnectHealCooldown, now) {
@@ -75,7 +75,7 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	// module, via the shared preamble — cordon/drain/kured or an
 	// in-flight upgrade defers the bounce, and "cannot verify"
 	// (unverifiable) skips it AND IncErrors the queue.
-	proceed, unverifiable := heal.Allowed(ctx, log, n.cs, n.dyn,
+	proceed, unverifiable := heal.AllowedV(ctx, log, &n.verdict, n.cs, n.dyn,
 		&n.connectHeals, esConnectPodPrefix, esConnectHealCooldown, now)
 	switch {
 	case unverifiable:

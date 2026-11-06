@@ -44,7 +44,7 @@ type operatorWorkqueueCheck struct {
 	opHealed    state.CooldownSet
 	// verdict memoizes the maintenance-mutex evaluation the
 	// per-operator heal preambles share — one evaluation per
-	// VerdictTTL instead of three API reads per stuck operator.
+	// Verdict TTL instead of three API reads per stuck operator.
 	verdict kube.Verdict
 
 	// gwClassCtlr caches GatewayClass name → spec.controllerName for

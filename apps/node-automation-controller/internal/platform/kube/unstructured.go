@@ -72,6 +72,32 @@ func NestedSlice(obj map[string]any, fields ...string) ([]any, bool) {
 	return v, found && err == nil
 }
 
+// NestedMap reads a map[string]any field at path fields — (nil,
+// false) on absence or wrong type. The returned map is a COPY
+// (unstructured.NestedMap deep-copies): mutating it does not touch
+// the object.
+func NestedMap(obj map[string]any, fields ...string) (map[string]any, bool) {
+	v, found, err := unstructured.NestedMap(obj, fields...)
+	return v, found && err == nil
+}
+
+// NestedStringMap reads a map[string]string field at path fields —
+// (nil, false) on absence or a non-string value (unstructured is
+// strict: one non-string leaf fails the whole read). The returned
+// map is a copy, same as NestedMap.
+func NestedStringMap(obj map[string]any, fields ...string) (map[string]string, bool) {
+	v, found, err := unstructured.NestedStringMap(obj, fields...)
+	return v, found && err == nil
+}
+
+// NestedStringSlice reads a []string field at path fields — (nil,
+// false) on absence or a non-string element (same strictness as
+// NestedStringMap). The returned slice is a copy.
+func NestedStringSlice(obj map[string]any, fields ...string) ([]string, bool) {
+	v, found, err := unstructured.NestedStringSlice(obj, fields...)
+	return v, found && err == nil
+}
+
 // Condition is one decoded entry of a conditions-style status list —
 // the near-universal {type,status,reason,message,lastTransitionTime}
 // shape cert-manager, Flux, OLM, Gateway-API and most operators

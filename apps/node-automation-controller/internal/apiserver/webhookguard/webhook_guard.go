@@ -121,7 +121,7 @@ type webhookGuard struct {
 	endpointProber func(ctx context.Context, ip string, port int32) bool
 	// verdict memoizes the maintenance-mutex evaluation the W7-C1
 	// gates (pod bounce + unmeshed remediation) share within a run —
-	// one evaluation per VerdictTTL instead of three API reads per
+	// one evaluation per Verdict TTL instead of three API reads per
 	// consumer.
 	verdict kube.Verdict
 

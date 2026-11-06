@@ -24,7 +24,11 @@
 // list errors for exactly this reason).
 package state
 
-import "slices"
+import (
+	"slices"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 // GaugeLedger tracks which label-value tuples of one
 // gauge were emitted during the previous sweep versus the current
@@ -47,6 +51,19 @@ func (l *GaugeLedger[K]) Emit(key K, labelValues ...string) {
 		l.current = map[K][]string{}
 	}
 	l.current[key] = slices.Clone(labelValues)
+}
+
+// Set folds the common `vec.WithLabelValues(lvs...).Set(v)` +
+// `l.Emit(key, lvs...)` pair into one call — the shape every
+// emit-site repeats when a live condition produces both the gauge
+// value and the ledger entry. labelValues must be the exact tuple
+// DeleteLabelValues needs at Prune time (same contract as Emit);
+// the prometheus import is acceptable here even though state is a
+// leaf — the leaf rule bans internal/ imports, not the client lib.
+func (l *GaugeLedger[K]) Set(vec *prometheus.GaugeVec, value float64,
+	key K, labelValues ...string) {
+	vec.WithLabelValues(labelValues...).Set(value)
+	l.Emit(key, labelValues...)
 }
 
 // Prune deletes — through delete, typically a *prometheus.GaugeVec's

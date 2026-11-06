@@ -6,14 +6,12 @@
 // Remediation that could disturb a drain/upgrade in flight defers
 // while ANY signal holds.
 //
-// Two consumption shapes share the same per-signal helpers:
-//   - MaintenanceActive — the (held, why, error) verdict most
-//     modules want: the first active signal's evidence, evaluated
-//     in order with the historical short-circuit (a held signal
-//     means the later API calls never run).
-//   - MaintenanceEvidence and the *Evidence helpers — every active
-//     signal's evidence string, for callers that LOG all of them
-//     (the storm-gate's maintenance=[...] verdict list).
+// The consumption shape is MaintenanceActive — the (held, why,
+// error) verdict every deferring module wants: the first active
+// signal's evidence, evaluated in order with the historical
+// short-circuit (a held signal means the later API calls never
+// run). The per-signal *Evidence helpers stay package-private:
+// they exist to be composed here, not called directly.
 package kube
 
 import (
@@ -31,9 +29,9 @@ import (
 )
 
 const (
-	// KuredDaemonSetNS/Name is where the kured reboot lock lives.
-	KuredDaemonSetNS   = "kube-system"
-	KuredDaemonSetName = "kured"
+	// kuredDaemonSetNS/Name is where the kured reboot lock lives.
+	kuredDaemonSetNS   = "kube-system"
+	kuredDaemonSetName = "kured"
 	// KuredLockAnno is the reboot-coordination annotation kured holds
 	// while a node drains for its reboot window.
 	KuredLockAnno = "weave.works/kured-node-lock"
@@ -43,7 +41,7 @@ const (
 // package, same exported identifier, unchanged value (its original
 // doc comment moved with it).
 
-// NodeCordonEvidence returns the evidence strings for mutex signal
+// nodeCordonEvidence returns the evidence strings for mutex signal
 // (a) — "node <name> actively cordoned" for every node inside the
 // active-cordon window: spec.unschedulable with the unschedulable
 // taint younger than 45m. A statically-cordoned node (>45m, no kured
@@ -51,7 +49,7 @@ const (
 // it would freeze every deferring remediation forever (W8). A node
 // LIST failure is an error — "cannot verify" must never read as
 // "clear".
-func NodeCordonEvidence(ctx context.Context, cs kubernetes.Interface) ([]string, error) {
+func nodeCordonEvidence(ctx context.Context, cs kubernetes.Interface) ([]string, error) {
 	// A node cordoned for longer than the active window with no
 	// other maintenance signal is a static cordon, not a drain.
 	now := time.Now()
@@ -75,14 +73,14 @@ func NodeCordonEvidence(ctx context.Context, cs kubernetes.Interface) ([]string,
 // evidence — kured is not installed on every cluster; a real API
 // failure is an error.
 func KuredLockEvidence(ctx context.Context, cs kubernetes.Interface) ([]string, error) {
-	ds, err := cs.AppsV1().DaemonSets(KuredDaemonSetNS).
-		Get(ctx, KuredDaemonSetName, metav1.GetOptions{})
+	ds, err := cs.AppsV1().DaemonSets(kuredDaemonSetNS).
+		Get(ctx, kuredDaemonSetName, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
 		// kured not installed on this cluster — no signal.
 	case err != nil:
 		return nil, fmt.Errorf("get daemonset %s/%s (maintenance mutex): %w",
-			KuredDaemonSetNS, KuredDaemonSetName, err)
+			kuredDaemonSetNS, kuredDaemonSetName, err)
 	default:
 		if v := ds.Annotations[KuredLockAnno]; v != "" {
 			return []string{"kured lock held by " + v}, nil
@@ -123,30 +121,6 @@ func AutopilotPlanEvidence(ctx context.Context, dyn dynamic.Interface) ([]string
 	return nil, nil
 }
 
-// MaintenanceEvidence returns the evidence strings of EVERY active
-// signal — the concatenation of NodeCordonEvidence,
-// KuredLockEvidence and AutopilotPlanEvidence, in the canonical
-// signal order. An empty slice means "no maintenance in flight".
-// Unlike MaintenanceActive it does not short-circuit: callers that
-// log a verdict (descheduler-storm-gate's maintenance=[...]) want
-// the whole picture, so a held earlier signal does not suppress the
-// later API reads — and their failures still surface as errors.
-func MaintenanceEvidence(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface) ([]string, error) {
-	var ev []string
-	for _, signal := range []func(context.Context) ([]string, error){
-		func(ctx context.Context) ([]string, error) { return NodeCordonEvidence(ctx, cs) },
-		func(ctx context.Context) ([]string, error) { return KuredLockEvidence(ctx, cs) },
-		func(ctx context.Context) ([]string, error) { return AutopilotPlanEvidence(ctx, dyn) },
-	} {
-		e, err := signal(ctx)
-		if err != nil {
-			return nil, err
-		}
-		ev = append(ev, e...)
-	}
-	return ev, nil
-}
-
 // MaintenanceActive reports whether deliberate cluster maintenance is
 // in flight — destructive remediation (pod deletes, leader kills)
 // defers while any signal holds:
@@ -166,14 +140,13 @@ func MaintenanceEvidence(ctx context.Context, cs kubernetes.Interface, dyn dynam
 // A nil dynamic client makes the Plan check unverifiable and is
 // reported as an error, never silently skipped.
 //
-// Built on the per-signal helpers but deliberately NOT on
-// MaintenanceEvidence: the historical contract is the SHORT-CIRCUIT —
-// the first held signal answers the verdict without paying for (or
-// failing on) the later API reads. Signals evaluate in the canonical
+// The historical contract is the SHORT-CIRCUIT — the first held
+// signal answers the verdict without paying for (or failing on)
+// the later API reads. Signals evaluate in the canonical
 // a → b → c order and `why` is the first signal's first evidence.
 func MaintenanceActive(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface) (bool, string, error) {
 	for _, signal := range []func(context.Context) ([]string, error){
-		func(ctx context.Context) ([]string, error) { return NodeCordonEvidence(ctx, cs) },
+		func(ctx context.Context) ([]string, error) { return nodeCordonEvidence(ctx, cs) },
 		func(ctx context.Context) ([]string, error) { return KuredLockEvidence(ctx, cs) },
 		func(ctx context.Context) ([]string, error) { return AutopilotPlanEvidence(ctx, dyn) },
 	} {
@@ -188,14 +161,14 @@ func MaintenanceActive(ctx context.Context, cs kubernetes.Interface, dyn dynamic
 	return false, "", nil
 }
 
-// VerdictTTL is how long a Verdict reuses one MaintenanceActive
+// verdictTTL is how long a Verdict reuses one MaintenanceActive
 // evaluation — sized to cover a sweep's per-target heal preambles
 // without letting a drain that starts mid-incident go unseen past
 // the next cycle.
-const VerdictTTL = time.Minute
+const verdictTTL = time.Minute
 
-// Verdict memoizes one MaintenanceActive evaluation for VerdictTTL —
-// heal loops that run the mutex once per target would otherwise pay
+// Verdict memoizes one MaintenanceActive evaluation for the verdict
+// TTL — heal loops that run the mutex once per target would otherwise pay
 // three API reads (node list, kured DS get, autopilot plan list) per
 // pod. Zero value is ready (expired — evaluates on first call); an
 // error verdict is sticky for the window too, matching the
@@ -208,10 +181,10 @@ type Verdict struct {
 }
 
 // Active returns the maintenance verdict, evaluating
-// MaintenanceActive only when the memo is older than VerdictTTL.
+// MaintenanceActive only when the memo is older than the verdict TTL.
 func (v *Verdict) Active(ctx context.Context, cs kubernetes.Interface,
 	dyn dynamic.Interface, now time.Time) (bool, string, error) {
-	if now.Sub(v.at) < VerdictTTL {
+	if now.Sub(v.at) < verdictTTL {
 		return v.held, v.why, v.err
 	}
 	v.held, v.why, v.err = MaintenanceActive(ctx, cs, dyn)

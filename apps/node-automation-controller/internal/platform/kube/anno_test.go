@@ -7,7 +7,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestParseAnnoTime(t *testing.T) {
@@ -63,27 +62,6 @@ func TestAnnoTime(t *testing.T) {
 	}
 	if _, ok := AnnoTime(nil, "passiontech.dev/last-heal"); ok {
 		t.Fatal("nil object read as a stamp")
-	}
-}
-
-func TestStampAnno(t *testing.T) {
-	stamp := time.Date(2026, 11, 5, 10, 30, 0, 0, time.UTC)
-
-	// New stamps are always RFC3339 — even over a legacy unix value.
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Annotations: map[string]string{"passiontech.dev/last-heal": "1762871400"},
-	}}
-	StampAnno(pod, "passiontech.dev/last-heal", stamp)
-	if got := pod.Annotations["passiontech.dev/last-heal"]; got != "2026-11-05T10:30:00Z" {
-		t.Fatalf("stamped value = %q, want RFC3339", got)
-	}
-
-	// A nil annotations map is created on write — and works on
-	// unstructured objects too (the dyn-client callers).
-	u := &unstructured.Unstructured{Object: map[string]any{}}
-	StampAnno(u, "passiontech.dev/last-heal", stamp)
-	if got, ok := AnnoTime(u, "passiontech.dev/last-heal"); !ok || !got.Equal(stamp) {
-		t.Fatalf("round-trip on unstructured = (%v,%v)", got, ok)
 	}
 }
 

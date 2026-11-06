@@ -40,7 +40,7 @@ type linkerdProtocolDetectionStallCheck struct {
 	// stale 1 (zero value usable; the serial sweep needs no lock).
 	emitted state.GaugeLedger[string]
 	// verdict memoizes the maintenance-mutex evaluation the
-	// per-pod heal preambles share — one evaluation per VerdictTTL
+	// per-pod heal preambles share — one evaluation per Verdict TTL
 	// instead of three API reads per violating pod.
 	verdict kube.Verdict
 }
