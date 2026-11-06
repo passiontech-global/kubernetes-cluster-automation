@@ -91,6 +91,7 @@ jobs:
             bumped=$(git-cliff --bumped-version \
               --config "apps/$APP/cliff.toml" \
               --include-path "apps/$APP/**" \
+              --include-path "libs/hostkit/**" \
               "$last_tag..HEAD")
             rel_version="v$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' <<<"$bumped" | head -1)"
             # No new conventional commits since last tag -> git-cliff
@@ -98,6 +99,12 @@ jobs:
             # release tag never collides.
             if [ "$rel_version" = "$last_ver" ]; then
               IFS=. read -r major minor patch <<<"${last_ver#v}"
+              # A prerelease last tag ("v0.1.0-rc.1") leaves a suffix
+              # on the last component ("0-rc.1") — strip it (and the
+              # build-metadata '+' form) or the arithmetic crashes.
+              major="${major%%[-+]*}"
+              minor="${minor%%[-+]*}"
+              patch="${patch%%[-+]*}"
               rel_version="v$major.$minor.$((patch + 1))"
             fi
           fi
@@ -106,6 +113,7 @@ jobs:
           git-cliff --unreleased --tag "$rel_tag" \
             --config "apps/$APP/cliff.toml" \
             --include-path "apps/$APP/**" \
+            --include-path "libs/hostkit/**" \
             "$last_tag..HEAD" > changelog.md
           grep -q '[^[:space:]]' changelog.md || echo "No user-facing changes." > changelog.md
           {
@@ -147,7 +155,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ env.REL_VERSION }}
-          TAGS: ${{ env.REL_VERSION }},latest
+          # Prereleases get the version tag only — they must not move
+          # the floating :latest pointer onto a non-stable build.
+          TAGS: "${{ env.REL_VERSION }}${{ inputs.prerelease == true && '' || ',latest' }}"
           KO_DOCKER_REPO: ${{ env.IMAGE }}
         run: |
           set -euo pipefail
