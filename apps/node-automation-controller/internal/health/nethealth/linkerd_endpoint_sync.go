@@ -48,6 +48,10 @@ type linkerdEndpointSyncCheck struct {
 	linkerdDesyncSince   state.FirstSeenLedger
 	linkerdDesyncEmitted map[string]bool
 	linkerdDesyncHealed  state.CooldownSet
+	// verdict memoizes the maintenance-mutex evaluation the
+	// per-service heal preambles share — one evaluation per
+	// VerdictTTL instead of three API reads per desynced service.
+	verdict kube.Verdict
 }
 
 // newLinkerdEndpointSyncCheck builds the W9-NM2 check with fresh
@@ -408,8 +412,8 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 	log logr.Logger, svcKey string, now time.Time, stale []linkerdSliceRef) {
 
-	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
-		&p.linkerdDesyncHealed, svcKey, linkerdDestHealCooldown, now)
+	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+		p.CS, p.Dyn, &p.linkerdDesyncHealed, svcKey, linkerdDestHealCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

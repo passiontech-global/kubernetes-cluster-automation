@@ -24,7 +24,15 @@ import (
 
 // meshControlPlaneCheck is the W8 mesh control-plane watchdog —
 // cilium-operator / linkerd control-plane pod heals.
-type meshControlPlaneCheck struct{ *probefw.Deps }
+type meshControlPlaneCheck struct {
+	*probefw.Deps
+
+	// verdict is the shared maintenance-mutex memo — healComponentPod
+	// and healNamedPod both gate a bounce on it, so one evaluation
+	// covers every pod the sweep touches instead of two per bounce
+	// (serial sweep — unguarded).
+	verdict kube.Verdict
+}
 
 // newMeshControlPlaneCheck builds the W8-NM2/NM3 watchdog —
 // stateless itself; heal cooldowns ride the shared Deps.Heals
@@ -152,8 +160,8 @@ func linkerdPodWedged(pod *corev1.Pod, now time.Time) bool {
 // heal in this sweep.
 func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.Logger,
 	component, ns, prefix string, cooldown time.Duration, now time.Time) {
-	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
-		&p.Heals, component, cooldown, now)
+	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+		p.CS, p.Dyn, &p.Heals, component, cooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
@@ -187,11 +195,13 @@ func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.L
 // mutex is re-checked here (not just in healComponentPod) because
 // checkMeshControlPlane calls this directly for the wedged linkerd
 // pods — every pod-delete heal defers while a drain/upgrade is in
-// flight, and "cannot verify" fails closed.
+// flight, and "cannot verify" fails closed. The check shares
+// p.verdict, so the re-check costs no extra API reads when it runs
+// back-to-back with healComponentPod's own gate.
 func (p *meshControlPlaneCheck) healNamedPod(ctx context.Context, log logr.Logger,
 	component, key string, pod *corev1.Pod, cooldown time.Duration, now time.Time) {
-	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
-		&p.Heals, component, cooldown, now)
+	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+		p.CS, p.Dyn, &p.Heals, component, cooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

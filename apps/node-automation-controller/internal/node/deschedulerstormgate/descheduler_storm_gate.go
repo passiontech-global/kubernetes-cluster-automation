@@ -248,11 +248,17 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 			"verdict", verdict, "from", curStr, "to", want,
 			"notReady", notReady, "bad", bad, "tainted", tainted,
 			"cordoned", cordoned, "maintenance", maintenance)
-		// Merge-patch spec.replicas only — a full-object Update on a
-		// cached Get races any concurrent spec edit (HPA, gitops)
-		// and would clobber it or fail on resourceVersion.
+		// One merge patch carries spec.replicas AND the decision
+		// annotation — two back-to-back merge patches on the same
+		// Deployment would pay two API writes for one logical act.
+		// Merge-patch only (never a full-object Update): a cached
+		// Get races any concurrent spec edit (HPA, gitops) and
+		// would clobber it or fail on resourceVersion.
 		patch, err := json.Marshal(map[string]any{
 			"spec": map[string]any{"replicas": want},
+			"metadata": map[string]any{"annotations": map[string]string{
+				stormGateDecisionAnno: decision,
+			}},
 		})
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("marshal replicas patch: %w", err)
@@ -263,9 +269,6 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 			return ctrl.Result{}, fmt.Errorf(
 				"scale deployment kube-system/descheduler to %d replicas: %w",
 				want, err)
-		}
-		if err := annotateStormDecision(ctx, r.cs, decision); err != nil {
-			return ctrl.Result{}, err
 		}
 	case deploy.Annotations[stormGateDecisionAnno] == "":
 		// Replicas already right but no decision recorded yet —
@@ -325,14 +328,12 @@ func taintKeys(n *corev1.Node) []string {
 }
 
 // annotateStormDecision merge-patches the decision annotation onto the
-// descheduler Deployment (kubectl annotate --overwrite equivalent).
+// descheduler Deployment (kubectl annotate --overwrite equivalent) —
+// used on the steady-replicas path only; the scale path folds the
+// same annotation into its replicas patch above.
 func annotateStormDecision(ctx context.Context, cs kubernetes.Interface, value string) error {
-	payload, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{
-			"annotations": map[string]string{
-				stormGateDecisionAnno: value,
-			},
-		},
+	payload, err := kube.MergePatchAnnos(map[string]any{
+		stormGateDecisionAnno: value,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal %s patch: %w", stormGateDecisionAnno, err)

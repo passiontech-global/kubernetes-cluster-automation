@@ -9,7 +9,6 @@ package datastore
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"time"
 
@@ -30,27 +29,31 @@ import (
 // that triggered it (survives operator restarts).
 func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log logr.Logger,
 	sig masterSvc, now time.Time) {
+	// The cheap persisted-stamp cooldown runs BEFORE the mutex —
+	// same ordering healDragonflyReplicaDeadlock carries: a stamp
+	// inside the window skips the three-signal API reads entirely.
+	if t, ok := kube.AnnoTime(sig.sts, dragonflyHealAnno); ok &&
+		now.Sub(t) < dragonflyHealCooldown {
+		log.Info("skip heal: persisted stamp inside cooldown",
+			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name,
+			"ago", now.Sub(t).Truncate(time.Minute))
+		return
+	}
 	// Maintenance mutex — never kill an operator mid-drain/upgrade;
 	// "cannot verify" fails closed like healOperatorLeader (W5.8).
-	// heal.Allowed gets a nil ledger here: this heal's cooldown is the
+	// heal.AllowedV gets a nil ledger here: this heal's cooldown is the
 	// wider of the persisted STS stamp and the per-pod drHealed
 	// entries, not a single CooldownSet key, so only its mutex gate
-	// applies.
+	// applies — shared via the check's verdict so the whole sweep
+	// pays one evaluation.
 	stsKey := sig.sts.Namespace + "/" + sig.sts.Name
-	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
-		nil, stsKey, 0, now)
+	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+		p.CS, p.Dyn, nil, stsKey, 0, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
 	}
 	if !proceed {
-		return
-	}
-	if t, ok := kube.AnnoTime(sig.sts, dragonflyHealAnno); ok &&
-		now.Sub(t) < dragonflyHealCooldown {
-		log.Info("skip heal: persisted stamp inside cooldown",
-			"statefulset", stsKey,
-			"ago", now.Sub(t).Truncate(time.Minute))
 		return
 	}
 	pods, err := p.CS.CoreV1().Pods(probefw.DragonflyOperatorNS).
@@ -90,10 +93,8 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	}
 	// Persist the stamp on the STS — the durable half of the
 	// cooldown. A patch failure leaves the in-RAM half holding.
-	payload, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]any{
-			dragonflyHealAnno: now.UTC().Format(time.RFC3339),
-		}},
+	payload, err := kube.MergePatchAnnos(map[string]any{
+		dragonflyHealAnno: now.UTC().Format(time.RFC3339),
 	})
 	if err != nil {
 		metrics.IncError(p.Name)
@@ -207,10 +208,10 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 
 	// Gate 3 — the 30m cooldown (wider of in-RAM + persisted), then
 	// the maintenance mutex. The cooldown halves stay bespoke — no
-	// single CooldownSet key carries them — so heal.Allowed runs
-	// with a nil ledger as the mutex-only gate: never kill a
-	// stateful pod mid-drain/upgrade; "cannot verify" fails closed
-	// like every other caller.
+	// single CooldownSet key carries them — so heal.AllowedV runs
+	// with a nil ledger as the mutex-only gate (shared verdict):
+	// never kill a stateful pod mid-drain/upgrade; "cannot verify"
+	// fails closed like every other caller.
 	if p.drPodHealed.CooledDown(stsKey, dragonflyPodHealCooldown, now) {
 		log.Info("skip heal: dragonfly pod inside cooldown",
 			"statefulset", stsKey)
@@ -223,8 +224,8 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 			"ago", now.Sub(t).Truncate(time.Minute))
 		return
 	}
-	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
-		nil, stsKey, 0, now)
+	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+		p.CS, p.Dyn, nil, stsKey, 0, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
@@ -253,10 +254,8 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 
 	// Persist the stamp on the STS — the durable half of the
 	// cooldown. A patch failure leaves the in-RAM half holding.
-	payload, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]any{
-			dragonflyPodHealAnno: now.UTC().Format(time.RFC3339),
-		}},
+	payload, err := kube.MergePatchAnnos(map[string]any{
+		dragonflyPodHealAnno: now.UTC().Format(time.RFC3339),
 	})
 	if err != nil {
 		metrics.IncError(p.Name)

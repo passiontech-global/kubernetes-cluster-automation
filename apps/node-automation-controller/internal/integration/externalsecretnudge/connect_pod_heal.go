@@ -64,9 +64,10 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	// storeDown/stormLong and the last-heal age the shared preamble
 	// cannot know.
 	if n.connectHeals.CooledDown(esConnectPodPrefix, esConnectHealCooldown, now) {
+		lastHeal, _ := n.connectHeals.Last(esConnectPodPrefix)
 		log.Info("DEFER: connect pod heal inside cooldown",
 			"storeDown", storeDown, "stormLong", stormLong,
-			"lastHeal", now.Sub(n.connectHeals.Entries()[esConnectPodPrefix]).Truncate(time.Minute))
+			"lastHeal", now.Sub(lastHeal).Truncate(time.Minute))
 		return
 	}
 

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -41,6 +42,10 @@ type operatorWorkqueueCheck struct {
 	opFirstSeen state.FirstSeenLedger
 	opFrozen    map[string]bool
 	opHealed    state.CooldownSet
+	// verdict memoizes the maintenance-mutex evaluation the
+	// per-operator heal preambles share — one evaluation per
+	// VerdictTTL instead of three API reads per stuck operator.
+	verdict kube.Verdict
 
 	// gwClassCtlr caches GatewayClass name → spec.controllerName for
 	// ~a minute so the gateway-API ownership filter doesn't LIST the
