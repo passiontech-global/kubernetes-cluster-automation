@@ -1,6 +1,7 @@
 package deschedulerstormgate
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -316,10 +317,19 @@ func TestStormGateScalesViaMergePatch(t *testing.T) {
 	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	// First patch is the replicas write (the decision annotation
-	// patch follows it).
-	if len(patches) == 0 || string(patches[0]) != `{"spec":{"replicas":0}}` {
-		t.Fatalf("scale patch = %s, want spec.replicas merge patch", patches)
+	// The scale write is ONE merge patch carrying spec.replicas plus
+	// the decision annotation (the two used to be back-to-back
+	// patches on the same Deployment).
+	var doc map[string]any
+	if len(patches) != 1 || json.Unmarshal(patches[0], &doc) != nil {
+		t.Fatalf("scale patches = %s, want one merged patch", patches)
+	}
+	if got := doc["spec"].(map[string]any)["replicas"]; got != float64(0) {
+		t.Fatalf("merged patch replicas = %v, want 0", got)
+	}
+	annos := doc["metadata"].(map[string]any)["annotations"].(map[string]any)
+	if _, ok := annos[stormGateDecisionAnno]; !ok {
+		t.Fatalf("merged patch missing %s: %s", stormGateDecisionAnno, patches[0])
 	}
 	if got := getDeschedulerReplicas(t, cs); got != 0 {
 		t.Fatalf("merge patch did not scale to 0, replicas=%d", got)

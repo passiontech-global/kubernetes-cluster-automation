@@ -9,7 +9,6 @@ package watchdogs
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -64,11 +63,12 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	}
 	// Maintenance mutex — "cannot verify" fails closed like every
 	// other caller: an unverifiable drain state defers the heal.
-	// heal.Allowed runs with a nil ledger — the cooldown above is
+	// heal.AllowedV runs with a nil ledger — the cooldown above is
 	// the wider of in-RAM + persisted stamp, not a single key, so
-	// only its mutex gate applies.
-	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
-		nil, op.name, 0, now)
+	// only its mutex gate applies — shared via the check's verdict
+	// so a sweep of stuck operators pays one evaluation.
+	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+		p.CS, p.Dyn, nil, op.name, 0, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
@@ -121,10 +121,8 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	if lease == nil {
 		return
 	}
-	payload, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]any{
-			operatorHealAnno: now.UTC().Format(time.RFC3339),
-		}},
+	payload, err := kube.MergePatchAnnos(map[string]any{
+		operatorHealAnno: now.UTC().Format(time.RFC3339),
 	})
 	if err != nil {
 		metrics.IncError(p.Name)
