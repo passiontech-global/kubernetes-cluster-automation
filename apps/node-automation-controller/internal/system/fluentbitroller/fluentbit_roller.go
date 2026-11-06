@@ -67,14 +67,13 @@ var onlyPipelineSecret = predicate.NewPredicateFuncs(func(o client.Object) bool 
 // is opt-in, resolved by setupModules into Deps.Disabled) skip
 // registration entirely.
 func Setup(d shared.Deps) error {
-	if d.Disabled {
-		return nil
-	}
-	r := &fluentBitRoller{cs: d.CS, queue: d.Name, now: shared.SystemClock}
-	return ctrl.NewControllerManagedBy(d.Mgr).
-		Named(d.Name).
-		For(&corev1.Secret{}, builder.WithPredicates(onlyPipelineSecret)).
-		Complete(shared.CountReconcile(d.Name, r.Reconcile))
+	return shared.SetupNoConfig(d, func() error {
+		r := &fluentBitRoller{cs: d.CS, queue: d.Name, now: shared.SystemClock}
+		return ctrl.NewControllerManagedBy(d.Mgr).
+			Named(d.Name).
+			For(&corev1.Secret{}, builder.WithPredicates(onlyPipelineSecret)).
+			Complete(shared.CountReconcile(d.Name, r.Reconcile))
+	})
 }
 
 func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {

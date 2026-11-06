@@ -1,0 +1,154 @@
+// guard.go — the shared dep bundle and the per-run Snapshot every
+// webhookguard duty draws from: Guard carries the clients, queue
+// name, clock, probe seam and maintenance-mutex verdict the sweeps
+// reach through snap.G, and Snapshot is the once-per-run cluster
+// census (namespaces, both webhook-config lists, CRDs, node health)
+// plus the lazily-computed ready-endpoint census.
+package guardstate
+
+import (
+	"context"
+	"errors"
+	"sync"
+
+	admissionv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+)
+
+// EndpointProber is the W9-CP1 brownout probe seam — a TCP connect +
+// TLS handshake against a Ready endpoint IP on the webhook port.
+// Injectable for tests; a nil Guard.EndpointProber falls back to
+// tcpTLSEndpointProber.
+type EndpointProber func(ctx context.Context, ip string, port int32) bool
+
+// Guard bundles the deps every webhookguard duty shares — the direct
+// clientset, the dynamic client (autopilot-Plan signal of the
+// maintenance mutex, W7-C1), the ops queue name every IncError label
+// is stamped from, the clock seam, the brownout probe seam, and the
+// verdict memoizing the maintenance-mutex evaluation the pod-kill
+// paths share within a run. The facade embeds it so the sweep state
+// and the deps live on one object across runs.
+type Guard struct {
+	CS    kubernetes.Interface
+	Dyn   dynamic.Interface
+	Queue string
+	// Now is the clock seam for the dead-backend streak — tests pin
+	// a scripted now to reach past the dead threshold. A nil Clock
+	// reads as system time (shared.Clock.Now is nil-safe).
+	Now shared.Clock
+	// EndpointProber is the W9-CP1 brownout probe — injectable for
+	// tests; nil falls back to tcpTLSEndpointProber.
+	EndpointProber EndpointProber
+	// Verdict memoizes the maintenance-mutex evaluation the W7-C1
+	// gates (pod bounce + unmeshed remediation) share within a run —
+	// one evaluation per Verdict TTL instead of three API reads per
+	// consumer.
+	Verdict kube.Verdict
+}
+
+// Snapshot carries the cluster state one run shares across its
+// sub-sweeps: the namespace census and both webhook-config lists are
+// identical inputs for the orphan sweep, the circuit breaker and the
+// unmeshed-pod audit, so they are listed ONCE per run instead of once
+// per consumer.
+type Snapshot struct {
+	G   *Guard
+	Ctx context.Context
+
+	NS     *corev1.NamespaceList
+	NSErr  error
+	MWC    *admissionv1.MutatingWebhookConfigurationList
+	MWCErr error
+	VWC    *admissionv1.ValidatingWebhookConfigurationList
+	VWCErr error
+
+	// CRDs feeds the conversion-webhook duties — the orphan sweep's
+	// missing-backend warn and the unhealthy-backend gauge + pod
+	// bounce. A list failure degrades those duties only: the
+	// admission sweeps never see the error.
+	CRDs   []unstructured.Unstructured
+	CRDErr error
+
+	// UnhealthyNodes is the W5.5 node census: nodes whose Ready
+	// endpoints cannot actually serve webhook traffic (NotReady,
+	// partitioned, kubelet-unresponsive, unreachable/out-of-service
+	// taints, or an explicit NetworkPartitioned condition). The
+	// endpoint census discounts endpoints hosted on them.
+	UnhealthyNodes map[string]bool
+	NodesErr       error
+
+	// readyOnce/ready/readyErr lazily cache the EndpointSlice ready
+	// census — the circuit breaker and the injector-health check
+	// share it, and a run whose breaker is disabled and has no
+	// unmeshed candidates never pays for the list at all.
+	readyOnce sync.Once
+	ready     EndpointCensus
+	readyErr  error
+}
+
+// TakeSnapshot lists the shared inputs once — see Snapshot. A list
+// failure is recorded on the snapshot, not returned — every duty
+// still decides for itself whether the missing piece aborts it
+// (fail-closed source) or merely skips a check.
+func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
+	s := &Snapshot{G: g, Ctx: ctx}
+	s.NS, s.NSErr = g.CS.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	s.MWC, s.MWCErr = g.CS.AdmissionregistrationV1().
+		MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
+	s.VWC, s.VWCErr = g.CS.AdmissionregistrationV1().
+		ValidatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
+	// W5.5 — the node census feeds the effective-ready math: a
+	// "Ready" webhook pod on a partitioned node cannot be called by
+	// the apiserver, so it must not count toward backend health.
+	s.UnhealthyNodes = map[string]bool{}
+	nodes, err := kube.ListNodes(ctx, g.CS)
+	s.NodesErr = err
+	if err == nil {
+		for i := range nodes {
+			if nodeUnhealthyForEndpoints(&nodes[i]) {
+				s.UnhealthyNodes[nodes[i].Name] = true
+			}
+		}
+	}
+	// Conversion-webhook CRDs — listed once here because the orphan
+	// sweep and the backend-health sweep both read them. A missing
+	// dynamic client or a list error is recorded, not fatal: the
+	// admission duties above already have their inputs.
+	if g.Dyn == nil {
+		s.CRDErr = errors.New("no dynamic client — CRD list skipped")
+	} else {
+		s.CRDs, s.CRDErr = kube.ListAll(ctx,
+			metav1.ListOptions{Limit: ListPageSize},
+			kube.DynamicPage(g.Dyn.Resource(CustomResourceDefinitionGVR)))
+	}
+	return s
+}
+
+// ReadyCounts returns the EndpointSlice ready census, listing it at
+// most once per run — the circuit breaker and the injector-health
+// check both draw from the same result, including the same error.
+func (s *Snapshot) ReadyCounts() (EndpointCensus, error) {
+	s.readyOnce.Do(func() {
+		s.ready, s.readyErr = s.G.readyEndpointCounts(s.Ctx, s)
+	})
+	return s.ready, s.readyErr
+}
+
+// MaintenanceActive runs the cluster maintenance mutex (W7-C1) — the
+// shared three-signal check (node cordon + kured lock + autopilot
+// Plan), exactly like every other deferring module, memoized through
+// the Guard's Verdict. An earlier version carried a nil-dyn degraded
+// copy that checked spec.unschedulable instead of
+// kube.NodeActivelyCordoned — a statically-cordoned node would then
+// have held the mutex forever; the shared implementation fails
+// closed on a missing dyn instead.
+func (g *Guard) MaintenanceActive(ctx context.Context) (bool, string, error) {
+	return g.Verdict.Active(ctx, g.CS, g.Dyn, g.Now.Now())
+}

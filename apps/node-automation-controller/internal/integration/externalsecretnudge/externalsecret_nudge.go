@@ -135,17 +135,16 @@ type externalSecretNudge struct {
 // gate (opt-in: only "true" registers), resolved by setupModules into
 // Deps.Disabled — clusters without ESO never run the sweep at all.
 func Setup(d shared.Deps) error {
-	if d.Disabled {
-		return nil
-	}
-	n := &externalSecretNudge{
-		cs:         d.CS,
-		dyn:        d.Dyn,
-		queue:      d.Name,
-		now:        shared.SystemClock,
-		storeReady: map[string]bool{},
-	}
-	return shared.AddPeriodic(d.Mgr, n.queue, esNudgeInterval, n.run)
+	return shared.SetupNoConfig(d, func() error {
+		n := &externalSecretNudge{
+			cs:         d.CS,
+			dyn:        d.Dyn,
+			queue:      d.Name,
+			now:        shared.SystemClock,
+			storeReady: map[string]bool{},
+		}
+		return shared.AddPeriodic(d.Mgr, n.queue, esNudgeInterval, n.run)
+	})
 }
 
 func (n *externalSecretNudge) run(ctx context.Context) error {

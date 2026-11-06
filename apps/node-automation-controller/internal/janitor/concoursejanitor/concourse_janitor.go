@@ -211,31 +211,30 @@ type concourseWorkdirJanitor struct {
 // volumeattachment-cleaner.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	if d.Disabled {
-		return nil
-	}
-	j := &concourseWorkdirJanitor{
-		cs:    cs,
-		queue: d.Name,
-		stats: &kubeletStatsReader{cs: cs},
-		atc:   newATCClient(cjATCBase, &http.Client{Timeout: cjATCTimeout}),
-		dyn:   dyn,
-		now:   shared.SystemClock,
+	return shared.SetupNoConfig(d, func() error {
+		j := &concourseWorkdirJanitor{
+			cs:    cs,
+			queue: d.Name,
+			stats: &kubeletStatsReader{cs: cs},
+			atc:   newATCClient(cjATCBase, &http.Client{Timeout: cjATCTimeout}),
+			dyn:   dyn,
+			now:   shared.SystemClock,
 
-		cfg: cjConfig{
-			runTimeout:     cjRunTimeout,
-			reqTimeout:     cjReqTimeout,
-			drainTimeout:   cjDrainTimeout,
-			landFailWait:   cjLandFailWait,
-			pruneStateWait: cjPruneStateTimeout,
-			deleteTimeout:  cjDeleteTimeout,
-			uidPollTimeout: cjUIDPollTimeout,
-			readyTimeout:   cjReadyTimeout,
-			fastPoll:       cjFastPoll,
-			slowPoll:       cjSlowPoll,
-		},
-	}
-	return shared.AddPeriodic(mgr, j.queue, 30*time.Minute, j.run)
+			cfg: cjConfig{
+				runTimeout:     cjRunTimeout,
+				reqTimeout:     cjReqTimeout,
+				drainTimeout:   cjDrainTimeout,
+				landFailWait:   cjLandFailWait,
+				pruneStateWait: cjPruneStateTimeout,
+				deleteTimeout:  cjDeleteTimeout,
+				uidPollTimeout: cjUIDPollTimeout,
+				readyTimeout:   cjReadyTimeout,
+				fastPoll:       cjFastPoll,
+				slowPoll:       cjSlowPoll,
+			},
+		}
+		return shared.AddPeriodic(mgr, j.queue, 30*time.Minute, j.run)
+	})
 }
 
 func (j *concourseWorkdirJanitor) run(ctx context.Context) error {

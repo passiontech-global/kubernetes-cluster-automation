@@ -115,11 +115,10 @@ type apiServiceGuard struct {
 // the apiserver.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	if d.Disabled {
-		return nil
-	}
-	g := &apiServiceGuard{cs: cs, dyn: dyn, queue: d.Name, now: shared.SystemClock}
-	return shared.AddPeriodic(mgr, g.queue, apiServiceGuardInterval, g.run)
+	return shared.SetupNoConfig(d, func() error {
+		g := &apiServiceGuard{cs: cs, dyn: dyn, queue: d.Name, now: shared.SystemClock}
+		return shared.AddPeriodic(mgr, g.queue, apiServiceGuardInterval, g.run)
+	})
 }
 
 // apiServiceSnapshot carries the cluster state one run shares across

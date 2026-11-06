@@ -60,87 +60,40 @@
 // replica of an already-degraded workload. An apiserver 429 (PDB
 // refusing the disruption) is a deferral, not an error: the pod is
 // kept and the next candidate is tried.
+//
+// The package is split into leaf subpackages — guardstate (shared
+// deps + run snapshot + endpoint census), orphansweep, circuitbreaker
+// and unmeshed — each owning one duty; this facade keeps only the
+// registry-facing Setup and the errors.Join sweep orchestration.
 package webhookguard
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
-	"fmt"
-	"net"
-	"slices"
-	"strconv"
-	"sync"
 	"time"
 
-	admissionv1 "k8s.io/api/admissionregistration/v1"
-	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/circuitbreaker"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/orphansweep"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/unmeshed"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
-const (
-	// kind label values for the WebhookCircuit* metrics — the short
-	// forms matching webhookPatch.mutating.
-	webhookKindMutating   = "mutating"
-	webhookKindValidating = "validating"
-)
-
-// customResourceDefinitionGVR is where the conversion-webhook checks
-// read CRDs — the typed clientset has no apiextensions surface, so
-// the objects reach through dyn like every other CRD this controller
-// consumes.
-var customResourceDefinitionGVR = schema.GroupVersionResource{
-	Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
-
 // webhookGuard is the facade behind the single
-// "admission-webhook-guard" periodic: it owns the shared clients, the
-// clock and probe seams, and the per-run sweepSnapshot, and embeds the
-// three independent sweeps — orphanSweep, circuitBreaker and
-// unmeshedPodAuditor — each of which owns only its own state. run()
-// invokes them in a fixed order through the promoted methods, so the
-// externally visible contract (queue name, interval, metric series)
-// is unchanged by the split.
+// "admission-webhook-guard" periodic: it embeds the shared
+// guardstate.Guard dep bundle (clients, queue name, clock, probe
+// seam, maintenance verdict) and holds the two stateful duties —
+// circuitbreaker.Breaker and unmeshed.Auditor (orphansweep is
+// stateless, so it needs no struct). run() takes the shared
+// snapshot once and invokes the duties in a fixed order, so the
+// externally visible contract (queue name, interval, metric series,
+// errors.Join error accounting) is unchanged by the split.
 type webhookGuard struct {
-	cs kubernetes.Interface
-	// queue is the module's ops name — stamped from Deps.Name (the
-	// registry row) so the periodic's name, the registration log and
-	// every IncError label come from one place.
-	queue string
-	// dyn feeds the autopilot-Plan signal of the maintenance mutex
-	// (W7-C1) — wired through Setup like every other dynamic-client
-	// module. A nil dyn makes the Plan check unverifiable, which the
-	// mutex reports as an error: unverifiable fails closed, never a
-	// silently-narrowed check.
-	dyn dynamic.Interface
-	// now is the clock seam for the dead-backend streak — tests pin
-	// a scripted now to reach past webhookDeadThreshold. nil → time.Now.
-	now shared.Clock
-	// endpointProber is the W9-CP1 brownout probe — a TCP connect +
-	// TLS handshake against a Ready endpoint IP on the webhook port.
-	// Injectable for tests; nil falls back to tcpTLSEndpointProber.
-	endpointProber func(ctx context.Context, ip string, port int32) bool
-	// verdict memoizes the maintenance-mutex evaluation the W7-C1
-	// gates (pod bounce + unmeshed remediation) share within a run —
-	// one evaluation per Verdict TTL instead of three API reads per
-	// consumer.
-	verdict kube.Verdict
-
-	// The three sweeps share cs/dyn/now/endpointProber through
-	// snap.g and hand each other nothing else; embedding keeps the
-	// guard's method set — and every in-package test fixture — stable
-	// across the split.
-	orphanSweep
-	circuitBreaker
-	unmeshedPodAuditor
+	guardstate.Guard
+	breaker circuitbreaker.Breaker
+	auditor unmeshed.Auditor
 }
 
 // Setup registers the 5-minute sweep (was crontab */5). dyn feeds
@@ -148,196 +101,15 @@ type webhookGuard struct {
 // the unmeshed-pod healer (W7-C1).
 func Setup(d shared.Deps) error {
 	logf.Log.WithName(d.Name).Info("registered",
-		"interval", 5*time.Minute, "circuitBreaker", circuitBreakerEnabled(),
-		"unmeshedRemediation", unmeshedRemediationEnabled())
-	// The bookkeeping ledgers (brokenEmitted, unmeshedEmitted,
-	// deadSince, bounceAt) are shared.* zero-value types — nothing to
-	// initialize here.
-	g := &webhookGuard{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
-	return shared.AddPeriodic(d.Mgr, g.queue, 5*time.Minute, g.run)
-}
-
-// listPageSize bounds every cluster-wide namespaced List below —
-// an unbounded all-namespaces EndpointSlice/pod/Service list is a
-// heap spike every sweep, so they page through the apiserver's
-// continue token instead. The snapshot's cluster-scoped lists
-// (Namespaces, Mutating/ValidatingWebhookConfigurations) stay
-// unpaged: they are tiny by definition.
-const listPageSize = kube.DefaultListPageSize
-
-// sweepSnapshot carries the cluster state one run shares across its
-// sub-sweeps: the namespace census and both webhook-config lists are
-// identical inputs for the orphan sweep, the circuit breaker and the
-// unmeshed-pod audit, so they are listed ONCE per run instead of once
-// per consumer. A list failure is recorded on the snapshot, not
-// returned — every duty still decides for itself whether the missing
-// piece aborts it (fail-closed source) or merely skips a check.
-type sweepSnapshot struct {
-	g   *webhookGuard
-	ctx context.Context
-
-	ns     *corev1.NamespaceList
-	nsErr  error
-	mwc    *admissionv1.MutatingWebhookConfigurationList
-	mwcErr error
-	vwc    *admissionv1.ValidatingWebhookConfigurationList
-	vwcErr error
-
-	// crds feeds the conversion-webhook duties — the orphan sweep's
-	// missing-backend warn and the unhealthy-backend gauge + pod
-	// bounce. A list failure degrades those duties only: the
-	// admission sweeps never see the error.
-	crds   []unstructured.Unstructured
-	crdErr error
-
-	// unhealthyNodes is the W5.5 node census: nodes whose Ready
-	// endpoints cannot actually serve webhook traffic (NotReady,
-	// partitioned, kubelet-unresponsive, unreachable/out-of-service
-	// taints, or an explicit NetworkPartitioned condition). The
-	// endpoint census discounts endpoints hosted on them.
-	unhealthyNodes map[string]bool
-	nodesErr       error
-
-	// readyOnce/ready/readyErr lazily cache the EndpointSlice ready
-	// census — the circuit breaker and the injector-health check
-	// share it, and a run whose breaker is disabled and has no
-	// unmeshed candidates never pays for the list at all.
-	readyOnce sync.Once
-	ready     endpointCensus
-	readyErr  error
-}
-
-// takeSnapshot lists the shared inputs once — see sweepSnapshot.
-func (g *webhookGuard) takeSnapshot(ctx context.Context) *sweepSnapshot {
-	s := &sweepSnapshot{g: g, ctx: ctx}
-	s.ns, s.nsErr = g.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-	s.mwc, s.mwcErr = g.cs.AdmissionregistrationV1().
-		MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
-	s.vwc, s.vwcErr = g.cs.AdmissionregistrationV1().
-		ValidatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
-	// W5.5 — the node census feeds the effective-ready math: a
-	// "Ready" webhook pod on a partitioned node cannot be called by
-	// the apiserver, so it must not count toward backend health.
-	s.unhealthyNodes = map[string]bool{}
-	nodes, err := kube.ListNodes(ctx, g.cs)
-	s.nodesErr = err
-	if err == nil {
-		for i := range nodes {
-			if nodeUnhealthyForEndpoints(&nodes[i]) {
-				s.unhealthyNodes[nodes[i].Name] = true
-			}
-		}
-	}
-	// Conversion-webhook CRDs — listed once here because the orphan
-	// sweep and the backend-health sweep both read them. A missing
-	// dynamic client or a list error is recorded, not fatal: the
-	// admission duties above already have their inputs.
-	if g.dyn == nil {
-		s.crdErr = errors.New("no dynamic client — CRD list skipped")
-	} else {
-		s.crds, s.crdErr = kube.ListAll(ctx,
-			metav1.ListOptions{Limit: listPageSize},
-			kube.DynamicPage(g.dyn.Resource(customResourceDefinitionGVR)))
-	}
-	return s
-}
-
-// crdConversionServiceKey extracts the "namespace/name" Service key a
-// CRD's spec.conversion webhook targets — ok=false when the CRD does
-// not convert via webhook (strategy missing or something else) or the
-// clientConfig is URL-targeted / malformed. The sweep treats those
-// like the breaker's URL entries: unmeasurable, never flagged.
-func crdConversionServiceKey(crd *unstructured.Unstructured) (key, ns, name string, ok bool) {
-	strategy, _ := kube.NestedString(crd.Object, "spec", "conversion", "strategy")
-	if strategy != "Webhook" {
-		return "", "", "", false
-	}
-	ns, _ = kube.NestedString(crd.Object,
-		"spec", "conversion", "webhook", "clientConfig", "service", "namespace")
-	name, _ = kube.NestedString(crd.Object,
-		"spec", "conversion", "webhook", "clientConfig", "service", "name")
-	if ns == "" || name == "" {
-		return "", "", "", false
-	}
-	return ns + "/" + name, ns, name, true
-}
-
-// webhookUnhealthyNodeTaints are the taint keys marking a node whose
-// pod network is presumed dead for admission purposes — the passiontech.dev
-// pair this operator asserts itself plus the kubelet/node-controller
-// lifecycle taints.
-var webhookUnhealthyNodeTaints = []string{
-	kube.TaintNetworkPartitioned,
-	kube.TaintKubeletUnresponsive,
-	"node.kubernetes.io/unreachable",
-	"node.kubernetes.io/not-ready",
-	"node.kubernetes.io/out-of-service",
-}
-
-// nodeUnhealthyForEndpoints reports whether Ready pods on this node
-// should be DISCOUNTED from a webhook backend census: the node is
-// NotReady, carries a partition/unresponsive/lifecycle taint, or
-// reports an explicit NetworkPartitioned condition — in all three
-// cases the apiserver's webhook call to that pod times out, so the
-// endpoint is Ready in name only.
-func nodeUnhealthyForEndpoints(n *corev1.Node) bool {
-	if !kube.NodeReady(n) {
-		return true
-	}
-	for _, k := range webhookUnhealthyNodeTaints {
-		if kube.HasTaint(n.Spec.Taints, k) {
-			return true
-		}
-	}
-	for _, c := range n.Status.Conditions {
-		if c.Type == "NetworkPartitioned" && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
-}
-
-// endpointCensus is the W5.5 dual ready-endpoint count: raw counts
-// every Ready endpoint; effective excludes the Ready endpoints whose
-// pod sits on an unhealthy node (partitioned/unresponsive — reachable
-// in the API sense but dead for webhook traffic).
-//
-// W9-CP1 adds the brownout fields, populated ONLY for services a
-// webhook config's clientConfig.service references (the probeSet in
-// readyEndpointCounts — probing every Service cluster-wide would be
-// a dial storm):
-//   - probeIPs/probePort: up to webhookProbeMaxPerSvc Ready endpoint
-//     IPs on healthy nodes plus the port the handshake targets.
-//   - backingPods: Ready endpoint pod refs for the stage-1 bounce.
-//   - probed/responsive: per-service handshake outcome — probed marks
-//     a service whose endpoints were actually dialed this run;
-//     responsive is true when ANY probed IP completed TCP+TLS. A
-//     probed service with responsive=false is "unresponsive": its
-//     pods are hung, which the breaker treats as effective=0.
-type endpointCensus struct {
-	raw       map[string]int
-	effective map[string]int
-	probeIPs  map[string][]string
-	probePort map[string]int32
-	// podRef identifies one Ready endpoint's backing Pod — the
-	// bounce candidates for an unresponsive service.
-	backingPods map[string][]podRef
-	probed      map[string]bool
-	responsive  map[string]bool
-}
-
-// podRef is a namespace/name pair for a Pod discovered through an
-// EndpointSlice targetRef.
-type podRef struct{ namespace, name string }
-
-// readyCounts returns the EndpointSlice ready census, listing it at
-// most once per run — the circuit breaker and the injector-health
-// check both draw from the same result, including the same error.
-func (s *sweepSnapshot) readyCounts() (endpointCensus, error) {
-	s.readyOnce.Do(func() {
-		s.ready, s.readyErr = s.g.readyEndpointCounts(s.ctx, s)
-	})
-	return s.ready, s.readyErr
+		"interval", 5*time.Minute, "circuitBreaker", circuitbreaker.Enabled(),
+		"unmeshedRemediation", unmeshed.RemediationEnabled())
+	// The bookkeeping ledgers inside the duty structs (deadSince,
+	// brokenEmitted, bounceAt, crdUnhealthyEmitted, unmeshedEmitted,
+	// criticalNSExclusionEmitted) are shared.* zero-value types —
+	// nothing to initialize here.
+	g := &webhookGuard{Guard: guardstate.Guard{
+		CS: d.CS, Dyn: d.Dyn, Queue: d.Name, Now: shared.SystemClock}}
+	return shared.AddPeriodic(d.Mgr, g.Queue, 5*time.Minute, g.run)
 }
 
 func (g *webhookGuard) run(ctx context.Context) error {
@@ -346,214 +118,17 @@ func (g *webhookGuard) run(ctx context.Context) error {
 	// duties — a failure in one must never skip the others, so all
 	// run and their errors join (nils → nil). All four read the same
 	// cluster state, so the shared snapshot is listed once up front
-	// instead of once per consumer.
-	snap := g.takeSnapshot(ctx)
-	orphanErr := g.sweepOrphans(ctx, snap)
+	// instead of once per consumer. The two ops levers
+	// (WEBHOOK_CIRCUIT_BREAKER_ENABLED, UNMESHED_POD_REMEDIATION_ENABLED)
+	// are read fresh on every sweep — the sanctioned hot-reload
+	// exception to the resolve-at-Setup env rule.
+	snap := g.TakeSnapshot(ctx)
+	orphanErr := orphansweep.Sweep(ctx, snap)
 	var breakerErr error
-	if circuitBreakerEnabled() {
-		breakerErr = g.sweepCircuitBreaker(ctx, snap)
+	if circuitbreaker.Enabled() {
+		breakerErr = g.breaker.Sweep(ctx, snap)
 	}
-	conversionErr := g.sweepCRDConversionBackends(ctx, snap)
-	unmeshedErr := g.sweepUnmeshedPods(ctx, snap)
+	conversionErr := g.breaker.SweepCRDConversionBackends(ctx, snap)
+	unmeshedErr := g.auditor.Sweep(ctx, snap)
 	return errors.Join(orphanErr, breakerErr, conversionErr, unmeshedErr)
-}
-
-// readyEndpointCounts builds the ns/service → Ready-endpoint census
-// from the cluster-wide EndpointSlice list (paged — see listPageSize),
-// in TWO counts (W5.5): raw counts every Ready endpoint; effective
-// drops the endpoints whose NodeName is flagged unhealthy by the
-// node census — a "Ready" pod on a partitioned node still fails every
-// apiserver webhook call. The kubernetes.io/service-name label binds
-// each slice to its Service; a nil conditions.ready counts as ready
-// (the field defaults to true server-side). No degraded mode: without
-// a complete census "0 ready" is indistinguishable from "no data", so
-// a list error — endpoints OR nodes — skips the whole breaker rather
-// than trip healthy webhooks.
-func (g *webhookGuard) readyEndpointCounts(ctx context.Context, snap *sweepSnapshot) (endpointCensus, error) {
-	if snap.nodesErr != nil {
-		return endpointCensus{}, fmt.Errorf("list nodes — circuit breaker skipped: %w", snap.nodesErr)
-	}
-	ready := endpointCensus{
-		raw:         map[string]int{},
-		effective:   map[string]int{},
-		probeIPs:    map[string][]string{},
-		probePort:   map[string]int32{},
-		backingPods: map[string][]podRef{},
-		probed:      map[string]bool{},
-		responsive:  map[string]bool{},
-	}
-	// W9-CP1 — only Services a webhook config actually calls get
-	// probed: the brownout check exists to keep admission webhooks
-	// honest, and dialing every Service in the cluster would be a
-	// handshake storm for zero signal. A missing config list (API
-	// flap) yields an empty probeSet — the census still counts, the
-	// breaker just sees no probe data (unresponsive stays false).
-	probeSet := webhookBackendServices(snap)
-	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: listPageSize},
-		kube.EndpointSlices(g.cs, metav1.NamespaceAll),
-		func(items []discoveryv1.EndpointSlice) error {
-			for _, s := range items {
-				svc := s.Labels[discoveryv1.LabelServiceName]
-				if svc == "" {
-					continue // no owning Service — cannot map to a webhook backend
-				}
-				key := s.Namespace + "/" + svc
-				probeSvc := probeSet[key]
-				for _, ep := range s.Endpoints {
-					if ep.Conditions.Ready == nil || *ep.Conditions.Ready {
-						ready.raw[key]++
-						// A nil NodeName (off-cluster target, not yet
-						// bound) cannot be attributed to a bad node —
-						// benefit of the doubt, count it effective.
-						effective := ep.NodeName == nil || !snap.unhealthyNodes[*ep.NodeName]
-						if effective {
-							ready.effective[key]++
-						}
-						// W9-CP1 — collect probe candidates and backing
-						// pod refs ONLY for effective-ready endpoints on
-						// webhook backends: endpoints stranded on
-						// unhealthy nodes are already discounted, and
-						// probing them would just re-measure the
-						// partition.
-						if probeSvc && effective {
-							g.collectProbeCandidates(&ready, key, &s, &ep)
-						}
-					}
-				}
-			}
-			return nil
-		})
-	if err != nil {
-		return endpointCensus{}, fmt.Errorf("list endpointslices — circuit breaker skipped: %w", err)
-	}
-	// W9-CP1 — TCP+TLS brownout probe, up to webhookProbeMaxPerSvc
-	// Ready endpoint IPs per webhook backend. responsive is an
-	// ANY-success verdict: one answering endpoint means the Service
-	// is not brownout-hung even if siblings are.
-	prober := g.endpointProber
-	if prober == nil {
-		prober = tcpTLSEndpointProber
-	}
-	for key, ips := range ready.probeIPs {
-		ready.probed[key] = true
-		ok := false
-		for _, ip := range ips {
-			if prober(ctx, ip, ready.probePort[key]) {
-				ok = true
-				break
-			}
-		}
-		ready.responsive[key] = ok
-	}
-	return ready, nil
-}
-
-// webhookBackendServices returns the set of "namespace/name" Service
-// keys referenced by any sub-webhook's clientConfig.service across
-// both webhook-config kinds PLUS every CRD spec.conversion webhook's
-// service — the only services the W9-CP1 probe dials. Nil config
-// lists and a failed CRD list (API flap) contribute nothing.
-func webhookBackendServices(snap *sweepSnapshot) map[string]bool {
-	out := map[string]bool{}
-	add := func(svc *admissionv1.ServiceReference) {
-		if svc != nil && svc.Namespace != "" && svc.Name != "" {
-			out[svc.Namespace+"/"+svc.Name] = true
-		}
-	}
-	if snap.mwc != nil {
-		for i := range snap.mwc.Items {
-			for _, h := range mutHookViews(snap.mwc.Items[i].Webhooks) {
-				add(h.svc)
-			}
-		}
-	}
-	if snap.vwc != nil {
-		for i := range snap.vwc.Items {
-			for _, h := range valHookViews(snap.vwc.Items[i].Webhooks) {
-				add(h.svc)
-			}
-		}
-	}
-	// CRD conversion backends join the probe set — a hung conversion
-	// pod is the same brownout signature, and its probe verdict feeds
-	// the tls_probe_failed reason + the stage-1 bounce.
-	for i := range snap.crds {
-		if key, _, _, ok := crdConversionServiceKey(&snap.crds[i]); ok {
-			out[key] = true
-		}
-	}
-	return out
-}
-
-// collectProbeCandidates records one effective-ready endpoint's
-// address (up to webhookProbeMaxPerSvc distinct IPs) and its backing
-// Pod ref (up to webhookProbeMaxPodRefs) for service key — the probe
-// and bounce inputs of the W9-CP1 brownout path.
-func (g *webhookGuard) collectProbeCandidates(ready *endpointCensus,
-	key string, s *discoveryv1.EndpointSlice, ep *discoveryv1.Endpoint) {
-	if len(ready.probeIPs[key]) < webhookProbeMaxPerSvc && len(ep.Addresses) > 0 {
-		for _, addr := range ep.Addresses {
-			if !slices.Contains(ready.probeIPs[key], addr) {
-				ready.probeIPs[key] = append(ready.probeIPs[key], addr)
-				break
-			}
-		}
-	}
-	if _, ok := ready.probePort[key]; !ok {
-		// The webhook port: the slice's first declared port, default
-		// 443 — admission webhooks are HTTPS-only, and a slice with
-		// no ports still targets the Service's own port mapping.
-		port := int32(webhookProbeDefaultPort)
-		for _, p := range s.Ports {
-			if p.Port != nil {
-				port = *p.Port
-				break
-			}
-		}
-		ready.probePort[key] = port
-	}
-	if ep.TargetRef != nil && ep.TargetRef.Kind == "Pod" && ep.TargetRef.Name != "" {
-		ns := ep.TargetRef.Namespace
-		if ns == "" {
-			ns = s.Namespace // endpointSlice-local pods carry no namespace on the ref
-		}
-		ref := podRef{namespace: ns, name: ep.TargetRef.Name}
-		if len(ready.backingPods[key]) < webhookProbeMaxPodRefs &&
-			!slices.Contains(ready.backingPods[key], ref) {
-			ready.backingPods[key] = append(ready.backingPods[key], ref)
-		}
-	}
-}
-
-// tcpTLSEndpointProber is the production endpointProber: a 2s
-// TCP-connect + TLS handshake against ip:port. InsecureSkipVerify —
-// the probe answers "is the webhook port serving TLS at all", not
-// "is the certificate valid": a brownout pod fails the handshake
-// entirely, while a healthy one completes it regardless of SANs the
-// probe cannot vouch for.
-func tcpTLSEndpointProber(ctx context.Context, ip string, port int32) bool {
-	if err := ctx.Err(); err != nil {
-		return false
-	}
-	d := &net.Dialer{Timeout: 2 * time.Second}
-	conn, err := tls.DialWithDialer(d, "tcp",
-		net.JoinHostPort(ip, strconv.Itoa(int(port))),
-		&tls.Config{InsecureSkipVerify: true}) // liveness probe only
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
-}
-
-// maintenanceActive runs the cluster maintenance mutex (W7-C1) —
-// the shared three-signal check (node cordon + kured lock +
-// autopilot Plan), exactly like every other deferring module. An
-// earlier version carried a nil-dyn degraded copy that checked
-// spec.unschedulable instead of kube.NodeActivelyCordoned — a
-// statically-cordoned node would then have held the mutex forever;
-// the shared implementation fails closed on a missing dyn instead.
-func (g *webhookGuard) maintenanceActive(ctx context.Context) (bool, string, error) {
-	return g.verdict.Active(ctx, g.cs, g.dyn, g.now.Now())
 }

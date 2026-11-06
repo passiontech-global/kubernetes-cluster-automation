@@ -2,9 +2,9 @@
 // circuit breaker: a webhook backend whose Ready endpoints ALL fail
 // the TCP+TLS handshake has hung pods, not partitioned ones, so the
 // sweep deletes the oldest Ready backing pod for its controller to
-// recreate fresh — one bounce per service per webhookBounceCooldown,
+// recreate fresh — one bounce per service per BounceCooldown,
 // gated by the shared maintenance mutex (fail closed).
-package webhookguard
+package circuitbreaker
 
 import (
 	"context"
@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -26,14 +27,14 @@ import (
 // failing TCP+TLS), delete the oldest Ready backing pod — its owner
 // controller (Deployment/ReplicaSet) recreates it fresh, which is
 // the rolling bounce a hung webhook process needs. One bounce per
-// service per webhookBounceCooldown; the whole pass is gated by the
+// service per BounceCooldown; the whole pass is gated by the
 // shared maintenance mutex and fails closed like every other pod
 // kill in this module.
-func (b *circuitBreaker) bounceHungWebhookPods(ctx context.Context,
-	snap *sweepSnapshot, ready endpointCensus) {
-	g := snap.g
+func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
+	snap *guardstate.Snapshot, ready guardstate.EndpointCensus) {
+	g := snap.G
 	log := logf.FromContext(ctx)
-	now := g.now.Now()
+	now := g.Now.Now()
 	// Distinct unresponsive webhook backend services, deduped across
 	// configs and kinds — several webhooks routinely share one
 	// Service, and one hung pod set is one bounce.
@@ -47,25 +48,25 @@ func (b *circuitBreaker) bounceHungWebhookPods(ctx context.Context,
 		if seen[key] {
 			return
 		}
-		if ready.effective[key] <= 0 || !ready.probed[key] || ready.responsive[key] {
+		if ready.Effective[key] <= 0 || !ready.Probed[key] || ready.Responsive[key] {
 			return // not brownout-hung — healthy, partitioned or unprobed
 		}
-		if b.bounceAt.CooledDown(key, webhookBounceCooldown, now) {
-			return // inside the 15m per-service cooldown
+		if b.bounceAt.CooledDown(key, BounceCooldown, now) {
+			return // inside the per-service cooldown
 		}
 		seen[key] = true
 		keys = append(keys, key)
 	}
-	if snap.mwc != nil {
-		for i := range snap.mwc.Items {
-			for _, h := range mutHookViews(snap.mwc.Items[i].Webhooks) {
+	if snap.MWC != nil {
+		for i := range snap.MWC.Items {
+			for _, h := range mutHookViews(snap.MWC.Items[i].Webhooks) {
 				add(h.svc)
 			}
 		}
 	}
-	if snap.vwc != nil {
-		for i := range snap.vwc.Items {
-			for _, h := range valHookViews(snap.vwc.Items[i].Webhooks) {
+	if snap.VWC != nil {
+		for i := range snap.VWC.Items {
+			for _, h := range valHookViews(snap.VWC.Items[i].Webhooks) {
 				add(h.svc)
 			}
 		}
@@ -77,9 +78,9 @@ func (b *circuitBreaker) bounceHungWebhookPods(ctx context.Context,
 	// The maintenance mutex gates the bounce (W7-C1 posture): a
 	// cordon/drain/kured reboot or in-flight k0s upgrade defers the
 	// pod kill, and "cannot verify" fails closed.
-	held, why, err := g.maintenanceActive(ctx)
+	held, why, err := g.MaintenanceActive(ctx)
 	if err != nil {
-		metrics.IncError(g.queue)
+		metrics.IncError(g.Queue)
 		log.Info("WARN: maintenance check unverifiable — "+
 			"DEFER: webhook pod bounce skipped (fail closed)",
 			"error", err, "services", keys)
@@ -91,7 +92,7 @@ func (b *circuitBreaker) bounceHungWebhookPods(ctx context.Context,
 		return
 	}
 	for _, key := range keys {
-		b.bounceOldestPod(ctx, snap, key, ready.backingPods[key], now)
+		b.bounceOldestPod(ctx, snap, key, ready.BackingPods[key], now)
 	}
 }
 
@@ -101,18 +102,18 @@ func (b *circuitBreaker) bounceHungWebhookPods(ctx context.Context,
 // bounce keeps the rollout gentle. The delete carries the pod's UID
 // as a precondition so a same-named replacement admitted between the
 // census and the delete is never killed by mistake.
-func (b *circuitBreaker) bounceOldestPod(ctx context.Context, snap *sweepSnapshot, svcKey string,
-	refs []podRef, now time.Time) {
-	g := snap.g
+func (b *Breaker) bounceOldestPod(ctx context.Context, snap *guardstate.Snapshot, svcKey string,
+	refs []guardstate.PodRef, now time.Time) {
+	g := snap.G
 	log := logf.FromContext(ctx)
 	var oldest *corev1.Pod
 	for _, r := range refs {
-		p, getErr := g.cs.CoreV1().Pods(r.namespace).Get(ctx, r.name, metav1.GetOptions{})
+		p, getErr := g.CS.CoreV1().Pods(r.Namespace).Get(ctx, r.Name, metav1.GetOptions{})
 		gone, err := kube.ConfirmAbsent(getErr)
 		if err != nil {
-			metrics.IncError(g.queue)
+			metrics.IncError(g.Queue)
 			log.Error(err, "webhook backing pod get failed",
-				"pod", r.namespace+"/"+r.name, "service", svcKey)
+				"pod", r.Namespace+"/"+r.Name, "service", svcKey)
 			continue
 		}
 		if gone {
@@ -137,9 +138,9 @@ func (b *circuitBreaker) bounceOldestPod(ctx context.Context, snap *sweepSnapsho
 		"age", now.Sub(oldest.CreationTimestamp.Time).Truncate(time.Second))
 	// heal.DeletePod stamps bounceAt on a DELIVERED bounce only — a
 	// failed delete leaves the pod hung and the next sweep retries.
-	if _, err := heal.DeletePod(ctx, g.cs, &b.bounceAt, svcKey,
+	if _, err := heal.DeletePod(ctx, g.CS, &b.bounceAt, svcKey,
 		oldest, now); err != nil {
-		metrics.IncError(g.queue)
+		metrics.IncError(g.Queue)
 		log.Error(err, "webhook pod bounce delete failed",
 			"pod", oldest.Namespace+"/"+oldest.Name, "service", svcKey)
 		return

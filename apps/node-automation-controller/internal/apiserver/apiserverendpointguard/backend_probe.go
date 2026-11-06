@@ -10,6 +10,7 @@ package apiserverendpointguard
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -315,7 +316,7 @@ func (g *apiServerEndpointGuard) evaluateBackends(ctx context.Context,
 		flagged := st.kidSkewStreak >= endpointGuardKidSkewCycles
 		metrics.ObserveAPIBackendJWKSSkew(ip, flagged)
 		if flagged {
-			log.Error(fmt.Errorf("JWKS kid set skew"), "backend serves a different ServiceAccount signer kid set than the control-plane majority — random 401s through the LB pool (sa.pub/sa.key rotation skew)",
+			log.Error(errors.New("JWKS kid set skew"), "backend serves a different ServiceAccount signer kid set than the control-plane majority — random 401s through the LB pool (sa.pub/sa.key rotation skew)",
 				"ip", ip, "cycles", st.kidSkewStreak)
 		}
 	}

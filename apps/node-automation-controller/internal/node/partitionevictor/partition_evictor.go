@@ -1,4 +1,4 @@
-// Port of hooks/60-partition-pod-evictor.sh.
+// partition_evictor.go — port of hooks/60-partition-pod-evictor.sh.
 //
 // Evicts non-HA infra pods off network-partitioned nodes: a node can stay
 // Ready (kubelet posts status over a healthy path) while its pod IPs are

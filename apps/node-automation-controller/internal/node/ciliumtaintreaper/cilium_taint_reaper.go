@@ -88,29 +88,28 @@ func Setup(d shared.Deps) error {
 	// is opt-in, resolved by setupModules into Deps.Disabled: no
 	// controller, no informer, no RequeueAfter loop. The manager
 	// cache's cilium-pod ByObject entry exists only for this module.
-	if d.Disabled {
-		return nil
-	}
-	r := &ciliumTaintReaper{cs: cs}
-	return ctrl.NewControllerManagedBy(mgr).
-		Named(d.Name).
-		// Watches with a single fixed workqueue key, not For(): the
-		// reconcile ignores req.Name and always sweeps the whole
-		// cluster, so per-node keys only produced N duplicate queued
-		// requests + N independent RequeueAfter timers per informer
-		// sync. One key collapses both to a single sweep (see
-		// shared.SweepRequests). Predicate semantics are unchanged.
-		Watches(&corev1.Node{},
-			handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
-			builder.WithPredicates(ciliumTaintChanges)).
-		// Also react when a node's cilium pod flips Ready/not-Ready.
-		// The pod informer is already scoped to kube-system +
-		// k8s-app=cilium (manager cache options) and only exists
-		// because this module registered, so no extra predicate is
-		// needed. Same fixed sweep key — the reconcile never read
-		// the pod's node name anyway.
-		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(ciliumPodSweepRequests)).
-		Complete(shared.CountReconcile(d.Name, r.Reconcile))
+	return shared.SetupNoConfig(d, func() error {
+		r := &ciliumTaintReaper{cs: cs}
+		return ctrl.NewControllerManagedBy(mgr).
+			Named(d.Name).
+			// Watches with a single fixed workqueue key, not For(): the
+			// reconcile ignores req.Name and always sweeps the whole
+			// cluster, so per-node keys only produced N duplicate queued
+			// requests + N independent RequeueAfter timers per informer
+			// sync. One key collapses both to a single sweep (see
+			// shared.SweepRequests). Predicate semantics are unchanged.
+			Watches(&corev1.Node{},
+				handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
+				builder.WithPredicates(ciliumTaintChanges)).
+			// Also react when a node's cilium pod flips Ready/not-Ready.
+			// The pod informer is already scoped to kube-system +
+			// k8s-app=cilium (manager cache options) and only exists
+			// because this module registered, so no extra predicate is
+			// needed. Same fixed sweep key — the reconcile never read
+			// the pod's node name anyway.
+			Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(ciliumPodSweepRequests)).
+			Complete(shared.CountReconcile(d.Name, r.Reconcile))
+	})
 }
 
 func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {

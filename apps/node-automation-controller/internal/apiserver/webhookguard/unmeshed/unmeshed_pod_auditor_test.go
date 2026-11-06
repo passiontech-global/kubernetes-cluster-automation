@@ -1,4 +1,8 @@
-package webhookguard
+// unmeshed_pod_auditor_test.go — coverage for the unmeshed-pod
+// auditor duty: the injection opt-in matrix, the emitted gauge's
+// ledger hygiene, the bounded eviction remediation and its
+// fail-closed gates (injector health, maintenance mutex).
+package unmeshed
 
 import (
 	"errors"
@@ -21,6 +25,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -95,9 +100,9 @@ func upPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 	return err == nil
 }
 
-func upGuard(cs *fake.Clientset) *webhookGuard {
-	return &webhookGuard{cs: cs, dyn: wgDyn(), now: time.Now,
-		unmeshedPodAuditor: unmeshedPodAuditor{}}
+func upGuard(cs *fake.Clientset) (*Auditor, *guardstate.Guard) {
+	return &Auditor{},
+		&guardstate.Guard{CS: cs, Dyn: wgDyn(), Now: time.Now}
 }
 
 // ---------------------------------------------------------------------------
@@ -117,9 +122,9 @@ func TestUnmeshedAuditFlagsUnmeshedPod(t *testing.T) {
 		upNamespace("plain", ""),
 		upPod("meshed", "web-abc"),
 		upPod("plain", "other-abc"))
-	g := upGuard(cs)
+	a, g := upGuard(cs)
 
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if got := ptestutil.ToFloat64(
@@ -156,12 +161,12 @@ func TestUnmeshedAuditSkips(t *testing.T) {
 		upNamespace("kube-system", ""),
 		upNamespace("meshed", "enabled"),
 		hostNet, jobPod, optedOut, meshed, initMeshed)
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if len(g.unmeshedEmitted.Last()) != 0 {
-		t.Fatalf("skippable pods flagged: %v", g.unmeshedEmitted.Last())
+	if len(a.unmeshedEmitted.Last()) != 0 {
+		t.Fatalf("skippable pods flagged: %v", a.unmeshedEmitted.Last())
 	}
 }
 
@@ -183,15 +188,15 @@ func TestUnmeshedAuditPodDirectiveOverridesNamespace(t *testing.T) {
 		upNamespace("meshed", "enabled"),
 		upNamespace("plain", ""),
 		podEnabled, nsEnabledPodDisabled)
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if got := ptestutil.ToFloat64(
 		metrics.UnmeshedPods.WithLabelValues("plain", "pod-enabled")); got != 1 {
 		t.Fatalf("pod-level enabled not flagged: %v", got)
 	}
-	if _, ok := g.unmeshedEmitted.Last()["meshed/ns-enabled-pod-disabled"]; ok {
+	if _, ok := a.unmeshedEmitted.Last()["meshed/ns-enabled-pod-disabled"]; ok {
 		t.Fatal("pod-level disabled flagged inside an enabled ns")
 	}
 }
@@ -204,12 +209,12 @@ func TestUnmeshedAuditSkipsNonRunning(t *testing.T) {
 		upNamespace("kube-system", ""),
 		upNamespace("meshed", "enabled"),
 		pending)
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if len(g.unmeshedEmitted.Last()) != 0 {
-		t.Fatalf("pending pod flagged: %v", g.unmeshedEmitted.Last())
+	if len(a.unmeshedEmitted.Last()) != 0 {
+		t.Fatalf("pending pod flagged: %v", a.unmeshedEmitted.Last())
 	}
 }
 
@@ -232,8 +237,8 @@ func TestUnmeshedRemediationDeletesUpToTwo(t *testing.T) {
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"), upPod("meshed", "web-b"), upPod("meshed", "web-c"))
 	emulateEviction(cs)
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	deleted := 0
@@ -251,7 +256,7 @@ func TestUnmeshedRemediationDeletesUpToTwo(t *testing.T) {
 	}
 }
 
-// A circuit-broken injector (recorded in webhookCircuitAnno) means
+// A circuit-broken injector (recorded in guardstate.CircuitBrokenAnno) means
 // pods recreate unmeshed again — remediation must stay off on the
 // annotation ALONE, even with failurePolicy still Fail and endpoints
 // up. Isolated from the Ignore-policy guard so each half is proven
@@ -259,15 +264,15 @@ func TestUnmeshedRemediationDeletesUpToTwo(t *testing.T) {
 func TestUnmeshedRemediationSkipsCircuitBrokenInjector(t *testing.T) {
 	broken := upInjectorCfg() // failurePolicy stays Fail
 	broken.Annotations = map[string]string{
-		webhookCircuitAnno: "linkerd-proxy-injector.linkerd.io"}
+		guardstate.CircuitBrokenAnno: "linkerd-proxy-injector.linkerd.io"}
 	cs := fake.NewSimpleClientset(
 		upNamespace("kube-system", ""),
 		upNamespace("meshed", "enabled"),
 		upNamespace("linkerd", ""),
 		broken, upReadySlice(),
 		upPod("meshed", "web-a"))
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if !upPodExists(t, cs, "meshed", "web-a") {
@@ -288,8 +293,8 @@ func TestUnmeshedRemediationSkipsIgnorePolicyInjector(t *testing.T) {
 		upNamespace("linkerd", ""),
 		failOpen, upReadySlice(),
 		upPod("meshed", "web-a"))
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if !upPodExists(t, cs, "meshed", "web-a") {
@@ -306,8 +311,8 @@ func TestUnmeshedRemediationSkipsDeadEndpoints(t *testing.T) {
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), // no EndpointSlice at all
 		upPod("meshed", "web-a"))
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if !upPodExists(t, cs, "meshed", "web-a") {
@@ -326,8 +331,8 @@ func TestUnmeshedInjectorHealthRequiresExactName(t *testing.T) {
 		upNamespace("linkerd", ""),
 		lookalike, upReadySlice(),
 		upPod("meshed", "web-a"))
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if !upPodExists(t, cs, "meshed", "web-a") {
@@ -345,8 +350,8 @@ func TestUnmeshedRemediationDisabledByEnv(t *testing.T) {
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"))
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if !upPodExists(t, cs, "meshed", "web-a") {
@@ -373,8 +378,8 @@ func TestUnmeshedRemediationRequiresOwnerAndAge(t *testing.T) {
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		fresh, orphan, bareOwner)
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	for _, n := range []string{"fresh", "orphan", "bare-owner"} {
@@ -382,8 +387,8 @@ func TestUnmeshedRemediationRequiresOwnerAndAge(t *testing.T) {
 			t.Fatalf("pod %s deleted — age/owner gate failed", n)
 		}
 	}
-	if len(g.unmeshedEmitted.Last()) != 3 {
-		t.Fatalf("fresh/orphan/bare-owner pods not flagged: %v", g.unmeshedEmitted.Last())
+	if len(a.unmeshedEmitted.Last()) != 3 {
+		t.Fatalf("fresh/orphan/bare-owner pods not flagged: %v", a.unmeshedEmitted.Last())
 	}
 }
 
@@ -406,8 +411,8 @@ func TestUnmeshedRemediationSkipsTerminatingAndMirror(t *testing.T) {
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		terminating, mirror)
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	for _, n := range []string{"terminating", "mirror"} {
@@ -415,8 +420,8 @@ func TestUnmeshedRemediationSkipsTerminatingAndMirror(t *testing.T) {
 			t.Fatalf("pod %s deleted — terminating/mirror skip failed", n)
 		}
 	}
-	if len(g.unmeshedEmitted.Last()) != 2 {
-		t.Fatalf("terminating/mirror pods not flagged: %v", g.unmeshedEmitted.Last())
+	if len(a.unmeshedEmitted.Last()) != 2 {
+		t.Fatalf("terminating/mirror pods not flagged: %v", a.unmeshedEmitted.Last())
 	}
 }
 
@@ -444,14 +449,14 @@ func TestUnmeshedAuditPaginatesPodList(t *testing.T) {
 			}
 			return false, nil, nil // passthrough — page 2 from the tracker
 		})
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 2 {
 		t.Fatalf("pod list calls = %d, want 2 (continue followed)", calls)
 	}
-	if _, ok := g.unmeshedEmitted.Last()["meshed/web-a"]; !ok {
+	if _, ok := a.unmeshedEmitted.Last()["meshed/web-a"]; !ok {
 		t.Fatal("pod on the continued page was not audited")
 	}
 }
@@ -482,8 +487,8 @@ func TestUnmeshedRemediationDeleteUIDPrecondition(t *testing.T) {
 				corev1.SchemeGroupVersion.WithResource("pods"),
 				ca.GetNamespace(), ev.Name)
 		})
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if gotUID == nil {
@@ -516,8 +521,8 @@ func TestUnmeshedRemediationCapsDeleteAttempts(t *testing.T) {
 			evictions++
 			return true, nil, errors.New("apiserver wedged")
 		})
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if evictions != unmeshedDeleteAttempts {
@@ -567,8 +572,8 @@ func TestUnmeshedRemediationPDBRefusalDefers(t *testing.T) {
 				corev1.SchemeGroupVersion.WithResource("pods"),
 				ca.GetNamespace(), ev.Name)
 		})
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if !refused {
@@ -620,8 +625,8 @@ func TestUnmeshedRemediationMaintenanceDefers(t *testing.T) {
 			}
 			return true, nil, errors.New("must not evict")
 		})
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if evictions != 0 {
@@ -657,8 +662,8 @@ func TestUnmeshedRemediationStaticCordonDoesNotDefer(t *testing.T) {
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"))
 	emulateEviction(cs)
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if upPodExists(t, cs, "meshed", "web-a") {
@@ -681,8 +686,8 @@ func TestUnmeshedRemediationKuredLockDefers(t *testing.T) {
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"))
-	g := upGuard(cs)
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if !upPodExists(t, cs, "meshed", "web-a") {
@@ -704,9 +709,9 @@ func TestUnmeshedRemediationAutopilotPlanDefers(t *testing.T) {
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"))
-	g := &webhookGuard{cs: cs, dyn: dyn, now: time.Now,
-		unmeshedPodAuditor: unmeshedPodAuditor{}}
-	if err := g.sweepUnmeshedPods(ctx, g.takeSnapshot(ctx)); err != nil {
+	a := &Auditor{}
+	g := &guardstate.Guard{CS: cs, Dyn: dyn, Now: time.Now}
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	if !upPodExists(t, cs, "meshed", "web-a") {

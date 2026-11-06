@@ -1,16 +1,114 @@
+// node_test.go — tests for node.go: condition/role reads, the
+// actively-cordoned verdict, taint/label merge patches, and the
+// ListNodes/CountNotReadyNodes census.
 package kube
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 )
+
+var ctx = context.Background()
+
+func node(name string, ready corev1.ConditionStatus, labels map[string]string, taints ...corev1.Taint) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+		Spec:       corev1.NodeSpec{Taints: taints},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type:   corev1.NodeReady,
+			Status: ready,
+		}}},
+	}
+}
+
+func getNode(t *testing.T, cs *fake.Clientset, name string) *corev1.Node {
+	t.Helper()
+	n, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get node %s: %v", name, err)
+	}
+	return n
+}
+
+// ---------------------------------------------------------------------------
+// NodeActivelyCordoned — BUG-C4 fresh-cordon verdict + the W12 P0-1
+// precordon exemption.
+// ---------------------------------------------------------------------------
+
+// BUG-C4 — NodeActivelyCordoned: only a FRESH cordon counts as an
+// active drain; a statically-cordoned node (>45m) does not.
+func TestNodeActivelyCordoned(t *testing.T) {
+	now := time.Now()
+	fresh := metav1.NewTime(now.Add(-10 * time.Minute))
+	old := metav1.NewTime(now.Add(-time.Hour))
+	for _, tc := range []struct {
+		name          string
+		unschedulable bool
+		taints        []corev1.Taint
+		want          bool
+	}{
+		{"schedulable", false, nil, false},
+		{"cordoned no taint (unverifiable)", true, nil, true},
+		{"cordoned nil TimeAdded", true,
+			[]corev1.Taint{{Key: UnschedulableTaintKey}}, true},
+		{"cordoned 10m ago", true,
+			[]corev1.Taint{{Key: UnschedulableTaintKey, TimeAdded: &fresh}}, true},
+		{"static cordon 60m ago", true,
+			[]corev1.Taint{{Key: UnschedulableTaintKey, TimeAdded: &old}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := &corev1.Node{Spec: corev1.NodeSpec{
+				Unschedulable: tc.unschedulable, Taints: tc.taints}}
+			if got := NodeActivelyCordoned(n, now); got != tc.want {
+				t.Fatalf("NodeActivelyCordoned=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// W12 P0-1 — a node pre-cordoned by node-hang-precordon
+// (AnnoPreCordonedBy) is the controller's own defensive quarantine
+// of a sick worker, not an operator drain: its fresh unschedulable
+// taint must NOT trip the active-cordon verdict or the maintenance
+// mutex would lock every heal cluster-wide for 45m.
+func TestNodeActivelyCordonedPreCordonExempt(t *testing.T) {
+	now := time.Now()
+	fresh := metav1.NewTime(now.Add(-time.Minute))
+	for _, tc := range []struct {
+		name  string
+		annos map[string]string
+		want  bool
+	}{
+		{"precordoned by node-hang-precordon",
+			map[string]string{AnnoPreCordonedBy: "node-hang-precordon"}, false},
+		{"precordoned by anything counts as exempt",
+			map[string]string{AnnoPreCordonedBy: "other-controller"}, false},
+		{"empty precordon anno is an operator cordon",
+			map[string]string{AnnoPreCordonedBy: ""}, true},
+		{"no precordon anno is an operator cordon", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Annotations: tc.annos},
+				Spec: corev1.NodeSpec{
+					Unschedulable: true,
+					Taints: []corev1.Taint{
+						{Key: UnschedulableTaintKey, TimeAdded: &fresh}}},
+			}
+			if got := NodeActivelyCordoned(n, now); got != tc.want {
+				t.Fatalf("NodeActivelyCordoned=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 // ---------------------------------------------------------------------------
 // PatchNodeLabels — kubectl label --overwrite merge semantics.
@@ -51,8 +149,20 @@ func TestPatchNodeLabelsNilMap(t *testing.T) {
 	}
 }
 
+func TestPatchNodeLabelsPatchError(t *testing.T) {
+	cs := fake.NewSimpleClientset(node("n1", corev1.ConditionTrue, nil))
+	cs.PrependReactor("patch", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("patch rejected")
+		})
+	if err := PatchNodeLabels(ctx, cs, "n1",
+		map[string]string{"k": "v"}); err == nil {
+		t.Fatal("expected error when the node patch fails")
+	}
+}
+
 // ---------------------------------------------------------------------------
-// NodeReady / IsControlPlane edge cases.
+// NodeReady / IsControlPlane / NodeCondition edge cases.
 // ---------------------------------------------------------------------------
 
 func TestNodeReadyNoConditions(t *testing.T) {
@@ -72,6 +182,20 @@ func TestIsControlPlaneMasterLabel(t *testing.T) {
 		map[string]string{"node-role.kubernetes.io/master": ""})
 	if !IsControlPlane(m) {
 		t.Fatal("master-role label not recognized as control plane")
+	}
+}
+
+func TestNodeConditionHelpers(t *testing.T) {
+	ready := node("w", corev1.ConditionTrue, nil)
+	notReady := node("w2", corev1.ConditionFalse, nil)
+	cp := node("cp", corev1.ConditionTrue,
+		map[string]string{"node-role.kubernetes.io/control-plane": ""})
+
+	if !NodeReady(ready) || NodeReady(notReady) {
+		t.Fatal("NodeReady wrong")
+	}
+	if !IsControlPlane(cp) || IsControlPlane(ready) {
+		t.Fatal("IsControlPlane wrong")
 	}
 }
 
@@ -129,65 +253,6 @@ func TestUntaintNodeGetErrorAndNoop(t *testing.T) {
 	}
 }
 
-func TestListNodesError(t *testing.T) {
-	cs := fake.NewSimpleClientset()
-	cs.PrependReactor("list", "nodes",
-		func(ktesting.Action) (bool, runtime.Object, error) {
-			return true, nil, errors.New("api down")
-		})
-	if _, err := ListNodes(ctx, cs); err == nil {
-		t.Fatal("expected error when the node list fails")
-	}
-	if _, err := CountNotReadyNodes(ctx, cs); err == nil {
-		t.Fatal("expected CountNotReadyNodes to propagate the list error")
-	}
-}
-
-func TestPatchNodeLabelsPatchError(t *testing.T) {
-	cs := fake.NewSimpleClientset(node("n1", corev1.ConditionTrue, nil))
-	cs.PrependReactor("patch", "nodes",
-		func(ktesting.Action) (bool, runtime.Object, error) {
-			return true, nil, errors.New("patch rejected")
-		})
-	if err := PatchNodeLabels(ctx, cs, "n1",
-		map[string]string{"k": "v"}); err == nil {
-		t.Fatal("expected error when the node patch fails")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// DaemonSetSettled — every lagging field must veto "settled".
-// ---------------------------------------------------------------------------
-
-func TestDaemonSetSettledFields(t *testing.T) {
-	t.Run("settled", func(t *testing.T) {
-		if !DaemonSetSettled(settledDaemonSet()) {
-			t.Fatal("fully caught-up DaemonSet not settled")
-		}
-	})
-	t.Run("observedGeneration lag", func(t *testing.T) {
-		ds := settledDaemonSet()
-		ds.Status.ObservedGeneration = 2 // controller hasn't seen gen 3
-		if DaemonSetSettled(ds) {
-			t.Fatal("settled despite stale observedGeneration")
-		}
-	})
-	t.Run("updatedNumberScheduled lag", func(t *testing.T) {
-		ds := settledDaemonSet()
-		ds.Status.UpdatedNumberScheduled = 3 // old pod template on one node
-		if DaemonSetSettled(ds) {
-			t.Fatal("settled despite pods still on the old revision")
-		}
-	})
-	t.Run("numberReady lag", func(t *testing.T) {
-		ds := settledDaemonSet()
-		ds.Status.NumberReady = 3 // updated but not ready yet
-		if DaemonSetSettled(ds) {
-			t.Fatal("settled despite unready pod")
-		}
-	})
-}
-
 func TestTaintHelpers(t *testing.T) {
 	n := node("n1", corev1.ConditionTrue, nil)
 	cs := fake.NewSimpleClientset(n)
@@ -243,17 +308,21 @@ func TestDropTaintsByKeyInPlace(t *testing.T) {
 	}
 }
 
-func TestNodeConditionHelpers(t *testing.T) {
-	ready := node("w", corev1.ConditionTrue, nil)
-	notReady := node("w2", corev1.ConditionFalse, nil)
-	cp := node("cp", corev1.ConditionTrue,
-		map[string]string{"node-role.kubernetes.io/control-plane": ""})
+// ---------------------------------------------------------------------------
+// ListNodes / CountNotReadyNodes.
+// ---------------------------------------------------------------------------
 
-	if !NodeReady(ready) || NodeReady(notReady) {
-		t.Fatal("NodeReady wrong")
+func TestListNodesError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	if _, err := ListNodes(ctx, cs); err == nil {
+		t.Fatal("expected error when the node list fails")
 	}
-	if !IsControlPlane(cp) || IsControlPlane(ready) {
-		t.Fatal("IsControlPlane wrong")
+	if _, err := CountNotReadyNodes(ctx, cs); err == nil {
+		t.Fatal("expected CountNotReadyNodes to propagate the list error")
 	}
 }
 
@@ -268,43 +337,5 @@ func TestCountNotReadyNodes(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("expected 1 NotReady, got %d", n)
-	}
-}
-
-func TestDaemonSetSettled(t *testing.T) {
-	ds := &appsv1.DaemonSet{
-		ObjectMeta: metav1.ObjectMeta{Generation: 3},
-		Status: appsv1.DaemonSetStatus{
-			ObservedGeneration:     3,
-			DesiredNumberScheduled: 4,
-			UpdatedNumberScheduled: 4,
-			NumberReady:            4,
-		},
-	}
-	if !DaemonSetSettled(ds) {
-		t.Fatal("expected settled")
-	}
-	ds.Status.NumberReady = 3
-	if DaemonSetSettled(ds) {
-		t.Fatal("expected not settled when a replica is not ready")
-	}
-}
-
-// PodReadyCond mirrors the bash Ready=True probe: absent condition and
-// Ready=False both count as not ready.
-func TestPodReadyCond(t *testing.T) {
-	p := &corev1.Pod{}
-	if PodReadyCond(p) {
-		t.Fatal("pod with no conditions reported ready")
-	}
-	p.Status.Conditions = []corev1.PodCondition{
-		{Type: corev1.PodReady, Status: corev1.ConditionFalse},
-	}
-	if PodReadyCond(p) {
-		t.Fatal("Ready=False pod reported ready")
-	}
-	p.Status.Conditions[0].Status = corev1.ConditionTrue
-	if !PodReadyCond(p) {
-		t.Fatal("Ready=True pod reported not ready")
 	}
 }

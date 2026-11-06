@@ -104,15 +104,14 @@ type pdbDeadlockWatchdog struct {
 // contract as cilium-taint-reaper: no runnable, no periodic
 // cluster-wide LIST against the apiserver.
 func Setup(d shared.Deps) error {
-	if d.Disabled {
-		return nil
-	}
-	w := &pdbDeadlockWatchdog{
-		cs:    d.CS,
-		now:   shared.SystemClock,
-		queue: d.Name,
-	}
-	return shared.AddPeriodic(d.Mgr, w.queue, 5*time.Minute, w.run)
+	return shared.SetupNoConfig(d, func() error {
+		w := &pdbDeadlockWatchdog{
+			cs:    d.CS,
+			now:   shared.SystemClock,
+			queue: d.Name,
+		}
+		return shared.AddPeriodic(d.Mgr, w.queue, 5*time.Minute, w.run)
+	})
 }
 
 func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {

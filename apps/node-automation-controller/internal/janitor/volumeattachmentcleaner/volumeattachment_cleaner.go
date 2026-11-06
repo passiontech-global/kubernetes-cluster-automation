@@ -122,15 +122,14 @@ type volumeAttachmentCleaner struct {
 // entirely, matching the certmanager-reaper / cilium-taint-reaper
 // contract.
 func Setup(d shared.Deps) error {
-	if d.Disabled {
-		return nil
-	}
-	c := &volumeAttachmentCleaner{
-		cs:    d.CS,
-		queue: d.Name,
-		now:   shared.SystemClock,
-	}
-	return shared.AddPeriodic(d.Mgr, c.queue, vaCleanerInterval, c.run)
+	return shared.SetupNoConfig(d, func() error {
+		c := &volumeAttachmentCleaner{
+			cs:    d.CS,
+			queue: d.Name,
+			now:   shared.SystemClock,
+		}
+		return shared.AddPeriodic(d.Mgr, c.queue, vaCleanerInterval, c.run)
+	})
 }
 
 func (c *volumeAttachmentCleaner) run(ctx context.Context) error {

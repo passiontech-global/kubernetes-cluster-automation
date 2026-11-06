@@ -4,7 +4,7 @@
 // landed, so a failed patch retries next sweep without
 // double-counting, and the sweep-end ledger prune drops whatever was
 // not re-seen instead of pinning circuit_broken=1 forever.
-package webhookguard
+package circuitbreaker
 
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"

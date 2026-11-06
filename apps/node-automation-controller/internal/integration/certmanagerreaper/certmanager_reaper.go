@@ -113,12 +113,11 @@ type crListResult struct {
 // registration entirely.
 func Setup(d shared.Deps) error {
 	mgr, dyn := d.Mgr, d.Dyn
-	if d.Disabled {
-		return nil
-	}
-	r := &certManagerReaper{dyn: dyn, queue: d.Name,
-		resets: map[string]*certReset{}}
-	return shared.AddPeriodic(mgr, r.queue, 15*time.Minute, r.run)
+	return shared.SetupNoConfig(d, func() error {
+		r := &certManagerReaper{dyn: dyn, queue: d.Name,
+			resets: map[string]*certReset{}}
+		return shared.AddPeriodic(mgr, r.queue, 15*time.Minute, r.run)
+	})
 }
 
 func (r *certManagerReaper) run(ctx context.Context) error {

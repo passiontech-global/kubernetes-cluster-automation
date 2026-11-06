@@ -112,12 +112,6 @@ func init() {
 		natsJetstreamUnhealthyGauge)
 }
 
-// isNATSPod reports whether the pod carries the canonical NATS helm
-// label the discovery step matches on.
-func isNATSPod(pod *corev1.Pod) bool {
-	return pod.Labels["app.kubernetes.io/name"] == natsAppLabelValue
-}
-
 // natsSTSKey resolves the StatefulSet name owning a NATS member pod
 // — the per-cluster quorum-census grouping (two NATS clusters in one
 // namespace must never pool Ready members). Controller owner ref

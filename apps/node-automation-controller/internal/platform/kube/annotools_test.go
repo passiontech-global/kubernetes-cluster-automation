@@ -1,3 +1,6 @@
+// annotools_test.go — tests for annotools.go: ParseAnnoTime's
+// RFC3339-then-unix fallback, AnnoTime's absent-reads-as-no-stamp
+// contract, and MergePatchAnnos' null-value delete encoding.
 package kube
 
 import (

@@ -22,6 +22,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/circuitbreaker"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -49,19 +51,19 @@ func cwPodSlice(ns, svc string, pods ...string) *discoveryv1.EndpointSlice {
 // prober — the brownout seam the tls_probe_failed verdict needs.
 func cwGuard(cs *fake.Clientset, now *time.Time, responsive bool,
 	dynObjs ...runtime.Object) *webhookGuard {
-	return &webhookGuard{cs: cs, dyn: wgDyn(dynObjs...),
-		now:            func() time.Time { return *now },
-		circuitBreaker: circuitBreaker{},
-		endpointProber: func(context.Context, string, int32) bool {
+	return &webhookGuard{Guard: guardstate.Guard{
+		CS: cs, Dyn: wgDyn(dynObjs...),
+		Now: func() time.Time { return *now },
+		EndpointProber: func(context.Context, string, int32) bool {
 			return responsive
-		}}
+		}}}
 }
 
 // cwUnhealthy reads the unhealthy gauge for one (crd, service,
 // reason) tuple.
 func cwUnhealthy(crd, svc, reason string) float64 {
 	return ptestutil.ToFloat64(
-		crdConversionWebhookUnhealthy.WithLabelValues(crd, svc, reason))
+		circuitbreaker.CRDConversionWebhookUnhealthy.WithLabelValues(crd, svc, reason))
 }
 
 // cwCleanup drops every unhealthy series a test may have emitted for
@@ -70,8 +72,8 @@ func cwCleanup(t *testing.T, crd, svc string) {
 	t.Helper()
 	t.Cleanup(func() {
 		for _, reason := range []string{
-			crdReasonMissingService, crdReasonZeroEndpoints, crdReasonTLSProbeFailed} {
-			crdConversionWebhookUnhealthy.DeleteLabelValues(crd, svc, reason)
+			circuitbreaker.CRDReasonMissingService, circuitbreaker.CRDReasonZeroEndpoints, circuitbreaker.CRDReasonTLSProbeFailed} {
+			circuitbreaker.CRDConversionWebhookUnhealthy.DeleteLabelValues(crd, svc, reason)
 		}
 	})
 }
@@ -126,8 +128,8 @@ func TestCRDConversionUnhealthyZeroEndpoints(t *testing.T) {
 		t.Fatalf("zero_endpoints gauge = %v, want 1", got)
 	}
 	for _, reason := range []string{
-		crdReasonMissingService, crdReasonZeroEndpoints, crdReasonTLSProbeFailed} {
-		if crdConversionWebhookUnhealthy.DeleteLabelValues(
+		circuitbreaker.CRDReasonMissingService, circuitbreaker.CRDReasonZeroEndpoints, circuitbreaker.CRDReasonTLSProbeFailed} {
+		if circuitbreaker.CRDConversionWebhookUnhealthy.DeleteLabelValues(
 			"healthy.example.com", "conv/live-svc", reason) {
 			t.Fatalf("healthy backend produced a %s series", reason)
 		}
@@ -172,7 +174,7 @@ func TestCRDConversionUnhealthyTLSProbeFailedBounces(t *testing.T) {
 	}
 
 	// Past the cooldown the next wedged pod bounces.
-	now = now.Add(webhookBounceCooldown + time.Minute)
+	now = now.Add(circuitbreaker.BounceCooldown + time.Minute)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +272,7 @@ func TestCRDConversionUnhealthySeriesPrunedOnRecovery(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if crdConversionWebhookUnhealthy.DeleteLabelValues(
+	if circuitbreaker.CRDConversionWebhookUnhealthy.DeleteLabelValues(
 		"widgets.example.com", "conv/conv-svc", "missing_service") {
 		t.Fatal("recovered backend must prune the unhealthy series, not park it")
 	}
@@ -296,12 +298,12 @@ func TestCRDConversionHealthyBackendQuiet(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range [][3]string{
-		{"widgets.example.com", "conv/conv-svc", crdReasonMissingService},
-		{"widgets.example.com", "conv/conv-svc", crdReasonZeroEndpoints},
-		{"widgets.example.com", "conv/conv-svc", crdReasonTLSProbeFailed},
-		{"no-conv.example.com", "conv/none-svc", crdReasonMissingService},
+		{"widgets.example.com", "conv/conv-svc", circuitbreaker.CRDReasonMissingService},
+		{"widgets.example.com", "conv/conv-svc", circuitbreaker.CRDReasonZeroEndpoints},
+		{"widgets.example.com", "conv/conv-svc", circuitbreaker.CRDReasonTLSProbeFailed},
+		{"no-conv.example.com", "conv/none-svc", circuitbreaker.CRDReasonMissingService},
 	} {
-		if crdConversionWebhookUnhealthy.DeleteLabelValues(tc[0], tc[1], tc[2]) {
+		if circuitbreaker.CRDConversionWebhookUnhealthy.DeleteLabelValues(tc[0], tc[1], tc[2]) {
 			t.Fatalf("unexpected %s series for %s", tc[2], tc[0])
 		}
 	}
@@ -317,7 +319,7 @@ func TestCRDConversionListErrorCarriesSeries(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	dyn := wgDyn(wgCRDConversion("widgets.example.com", "conv", "conv-svc"))
 	g := cwGuard(cs, &now, true)
-	g.dyn = dyn
+	g.Dyn = dyn
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)

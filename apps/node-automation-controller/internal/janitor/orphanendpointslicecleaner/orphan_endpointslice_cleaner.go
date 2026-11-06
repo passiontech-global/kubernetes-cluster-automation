@@ -91,12 +91,11 @@ type orphanEndpointSliceCleaner struct {
 // resolved by setupModules into Deps.Disabled) skip registration
 // entirely — same contract as volumeattachment-cleaner.
 func Setup(d shared.Deps) error {
-	if d.Disabled {
-		return nil
-	}
-	c := &orphanEndpointSliceCleaner{cs: d.CS, dyn: d.Dyn, queue: d.Name,
-		now: shared.SystemClock}
-	return shared.AddPeriodic(d.Mgr, c.queue, orphanEndpointSliceInterval, c.run)
+	return shared.SetupNoConfig(d, func() error {
+		c := &orphanEndpointSliceCleaner{cs: d.CS, dyn: d.Dyn, queue: d.Name,
+			now: shared.SystemClock}
+		return shared.AddPeriodic(d.Mgr, c.queue, orphanEndpointSliceInterval, c.run)
+	})
 }
 
 func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {

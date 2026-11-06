@@ -107,13 +107,12 @@ type zombieSidecarReaper struct {
 // setupModules into Deps.Disabled) skip registration entirely — same
 // contract as volumeattachment-cleaner.
 func Setup(d shared.Deps) error {
-	if d.Disabled {
-		return nil
-	}
-	r := &zombieSidecarReaper{cs: d.CS, dyn: d.Dyn, queue: d.Name,
-		now: shared.SystemClock, shutdownFn: zombieSidecarShutdown,
-		poked: map[string]bool{}, tried: map[string]bool{}}
-	return shared.AddPeriodic(d.Mgr, r.queue, zombieSidecarReaperInterval, r.run)
+	return shared.SetupNoConfig(d, func() error {
+		r := &zombieSidecarReaper{cs: d.CS, dyn: d.Dyn, queue: d.Name,
+			now: shared.SystemClock, shutdownFn: zombieSidecarShutdown,
+			poked: map[string]bool{}, tried: map[string]bool{}}
+		return shared.AddPeriodic(d.Mgr, r.queue, zombieSidecarReaperInterval, r.run)
+	})
 }
 
 func (r *zombieSidecarReaper) run(ctx context.Context) error {

@@ -1,3 +1,6 @@
+// deps.go — the Deps bundle every module's Setup receives: the
+// manager, the direct clientset, the dynamic client, the logger and
+// the Disabled gate flag.
 package shared
 
 import (
