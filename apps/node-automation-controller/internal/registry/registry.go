@@ -38,7 +38,6 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node/nodelabeler"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node/partitionevictor"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node/pdbdeadlockwatchdog"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/cftunnelproxywatchdog"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/corednspatcher"
@@ -47,6 +46,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/konnectivitypatcher"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/metricsserverpatcher"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/statefulsetroller"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // Modules is the single registration point for every node-ops

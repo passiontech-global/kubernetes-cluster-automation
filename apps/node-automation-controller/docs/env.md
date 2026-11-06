@@ -6,7 +6,7 @@ hand-maintained and **verified against source** by the envdoc coverage test
 `cmd/manager/main.go`, and every `envx.Getenv*` / `envx.Gate` call under
 `internal/` — update this file when adding a knob.
 
-Parsing rules (`internal/platform/envx/env.go`):
+Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 
 - **Registration gates** live in the `GateEnv` column of the module registry
   (`internal/registry/registry.go`). `DefaultOn=false` = opt-in: enabled only when

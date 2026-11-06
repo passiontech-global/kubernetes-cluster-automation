@@ -26,8 +26,9 @@
 // This package keeps only the module contract layer: Module, Deps,
 // SetupWithConfig, Periodic/AddPeriodic + the sweep fan-in, and the
 // Clock seam. The reusable leaf machinery it used to also hold now
-// lives under internal/platform/: envx (env parsing + Gate), state
+// lives under internal/platform/: state
 // (the Gauge/Cooldown/FirstSeen/Streak/Seen ledgers), kube (list
 // pagination, node/pod/patch helpers, the GVR registry, replicas,
-// the maintenance mutex).
+// the maintenance mutex) — the env getters moved further out to
+// libs/hostkit/envx (see envx.go for the warn-pipeline rebinding).
 package shared
