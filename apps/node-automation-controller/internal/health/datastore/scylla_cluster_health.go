@@ -22,9 +22,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/prometheus/client_golang/prometheus"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // scyllaHealthCheck is the W9-ST1 scylla cluster health watchdog.
@@ -68,6 +69,22 @@ const (
 // scyllaClusterGVR is the ScyllaCluster CR the W9-ST1 auditor reads —
 // the same GVR the W5.8 scylla-operator watchdog scans.
 var scyllaClusterGVR = kube.GVRScyllaCluster
+
+var (
+	// W9-ST1 — the ScyllaDB unhealthy signal: 1 while the
+	// ScyllaCluster/member shows a sustained unhealthy signature.
+	// reason is degraded_condition | member_service_desync |
+	// gossip_or_raft_stall.
+	scyllaClusterUnhealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_scylla_unhealthy",
+		Help: "1 while the ScyllaCluster/member shows a sustained unhealthy signature.",
+	}, []string{"namespace", "cluster", "reason"})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		scyllaClusterUnhealthyGauge)
+}
 
 // ---------------------------------------------------------------------------
 // W9-ST1 — scylla-cluster-health
@@ -330,10 +347,10 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 	for k, f := range emitted {
-		p.scyllaEmitted.Set(metrics.ScyllaClusterUnhealthy, 1,
+		p.scyllaEmitted.Set(scyllaClusterUnhealthyGauge, 1,
 			k, f.ns, f.cluster, f.reason)
 	}
-	p.scyllaEmitted.Prune(metrics.ScyllaClusterUnhealthy.DeleteLabelValues)
+	p.scyllaEmitted.Prune(scyllaClusterUnhealthyGauge.DeleteLabelValues)
 
 	if len(emitted) == 0 {
 		return probefw.Result{Pass: true}

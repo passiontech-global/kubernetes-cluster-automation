@@ -31,11 +31,8 @@ func stormGateDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 // autopilotPlan builds a Plan CR in `state` — "" renders no status at
 // all (a brand-new Plan before the controller writes one).
 func autopilotPlan(name, state string) *unstructured.Unstructured {
-	u := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "autopilot.k0sproject.io/v1beta2",
-		"kind":       "Plan",
-		"metadata":   map[string]any{"name": name},
-	}}
+	u := testutil.Unstructured(
+		kube.AutopilotPlanGVR.GroupVersion().WithKind("Plan"), "", name, nil)
 	if state != "" {
 		u.Object["status"] = map[string]any{"state": state}
 	}

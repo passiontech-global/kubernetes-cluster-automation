@@ -52,14 +52,8 @@ func unknownNode(name string, age time.Duration) *corev1.Node {
 
 // remediationObj builds a medik8s remediation CR (unstructured).
 func remediationObj(gvr schema.GroupVersionResource, kind, ns, name string) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": gvr.GroupVersion().String(),
-		"kind":       kind,
-		"metadata": map[string]any{
-			"namespace": ns,
-			"name":      name, // remediation CRs are named after the node
-		},
-	}}
+	// remediation CRs are named after the node.
+	return testutil.Unstructured(gvr.GroupVersion().WithKind(kind), ns, name, nil)
 }
 
 func selfNodeRemediation(ns, name string) *unstructured.Unstructured {
@@ -71,15 +65,9 @@ func fenceAgentsRemediation(ns, name string) *unstructured.Unstructured {
 }
 
 // deadNodeDynFake returns a dynamic fake that knows the list kinds for
-// both medik8s GVRs.
+// both medik8s GVRs (and every other CRD the sweep may touch).
 func deadNodeDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{
-			selfNodeRemediationGVR:    "SelfNodeRemediationList",
-			fenceAgentsRemediationGVR: "FenceAgentsRemediationList",
-		},
-		objs...)
+	return testutil.NewDynamicClient(objs...)
 }
 
 // healthyProbe is the default stub — kubelet answers /healthz "ok",

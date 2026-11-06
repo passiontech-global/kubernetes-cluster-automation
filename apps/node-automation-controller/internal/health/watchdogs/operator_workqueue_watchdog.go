@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/prometheus/client_golang/prometheus"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // operatorWorkqueueCheck is the W5.8 lease-holding zombie detector
@@ -78,6 +79,21 @@ const (
 	operatorLeaseMaxAge = 2 * time.Minute
 )
 
+var (
+	// W5.8 — the stuck-operator signal: 1 while the operator renews
+	// its Lease but its CRs stay unreconciled past the stuck
+	// threshold. operator/reason identify the stall.
+	operatorWorkqueueFrozenGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_operator_workqueue_frozen",
+		Help: "1 while the operator renews its Lease but its CRs stay unreconciled past the stuck threshold.",
+	}, []string{"operator", "reason"})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		operatorWorkqueueFrozenGauge)
+}
+
 // checkOperatorWorkqueues detects a lease-holding zombie operator:
 // the leader still renews its coordination.k8s.io Lease while its
 // target CRs sit unreconciled — the C6 gray-failure shape, but for
@@ -92,7 +108,7 @@ const (
 //	   healOperatorLeader resolves the holderIdentity to the leader
 //	   pod and deletes it (1h cooldown, persisted on the Lease),
 //	   forcing re-election onto a fresh replica.
-//	b) ALERTING — OperatorWorkqueueFrozen{operator,reason}=1 stays
+//	b) ALERTING — operatorWorkqueueFrozenGauge{operator,reason}=1 stays
 //	   set while the CRs remain unreconciled, so a PrometheusRule
 //	   fires if healing did not unstick the queue.
 func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
@@ -213,7 +229,7 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 			return !strings.HasPrefix(k, op.name+"/") || live[k]
 		})
 		for r := range reasonsFrozen {
-			p.opFrozen.Set(metrics.OperatorWorkqueueFrozen, 1,
+			p.opFrozen.Set(operatorWorkqueueFrozenGauge, 1,
 				op.name+"/"+r, op.name, r)
 			frozen[op.name+"/"+r] = r
 		}
@@ -301,7 +317,7 @@ func (p *operatorWorkqueueCheck) operatorPodRunning(ctx context.Context, op oper
 // "operator/reason" series that stopped being emitted flips to 0
 // rather than disappearing — the resolved edge stays visible.
 func opFrozenFlipZero(labelValues ...string) bool {
-	metrics.OperatorWorkqueueFrozen.WithLabelValues(labelValues...).Set(0)
+	operatorWorkqueueFrozenGauge.WithLabelValues(labelValues...).Set(0)
 	return true
 }
 

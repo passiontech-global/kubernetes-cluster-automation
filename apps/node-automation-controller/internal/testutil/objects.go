@@ -10,7 +10,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -65,14 +64,6 @@ func GaugeSeriesValue(t *testing.T, family string, want map[string]string) (floa
 		}
 	}
 	return 0, false
-}
-
-// NewFakeDyn builds a dynamic fake client with explicit GVR->ListKind
-// mappings (required for List on unregistered CRDs).
-func NewFakeDyn(kinds map[schema.GroupVersionResource]string,
-	objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(), kinds, objs...)
 }
 
 // Namespace builds a bare *corev1.Namespace fixture.

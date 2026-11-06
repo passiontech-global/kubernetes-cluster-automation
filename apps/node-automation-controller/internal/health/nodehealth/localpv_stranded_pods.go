@@ -18,10 +18,12 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // localPVStrandedCheck is the W7-C4 local-PV dead-node diagnostic,
@@ -103,6 +105,47 @@ const (
 	strandedReasonNotReady     = "not_ready"
 	strandedReasonCordoned     = "cordoned"
 )
+
+var (
+	// W7-C4 — the stranded-pod signal: 1 while the Pod pends on a
+	// local PV node-affinity-pinned to an unavailable node. reason is
+	// missing_node | out_of_service | not_ready | cordoned.
+	localPVStrandedPodsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_localpv_stranded_pods",
+		Help: "1 while the Pod pends on a local PV node-affinity-pinned to an unavailable node.",
+	}, []string{"namespace", "pod", "pvc", "node", "reason"})
+
+	// W7-C4 — ephemeral localpv PVC+pod pairs reaped after their
+	// bound node was confirmed gone (missing or out-of-service).
+	// Counts delivered heals only.
+	localPVEphemeralHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "node_automation_localpv_ephemeral_heals_total",
+		Help: "Ephemeral localpv PVC+pod pairs reaped after their bound node was confirmed gone.",
+	}, []string{"namespace", "pvc", "node"})
+
+	// W7-C4 — the stalled-provisioning signal: 1 while the PVC
+	// pends on a local provisioner despite Ready schedulable
+	// workers existing.
+	pvcProvisioningStalledGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_pvc_provisioning_stalled",
+		Help: "1 while the PVC pends on a local provisioner despite Ready schedulable workers existing.",
+	}, []string{"namespace", "pvc", "storageclass"})
+
+	// W7-C4 — local provisioner pods deleted to unstick Pending
+	// claims, by provisioner. Counts delivered heals only.
+	pvcProvisionerHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "node_automation_pvc_provisioner_heals_total",
+		Help: "Local provisioner pods deleted to unstick Pending claims, by provisioner.",
+	}, []string{"provisioner"})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		localPVStrandedPodsGauge,
+		localPVEphemeralHealsTotal,
+		pvcProvisioningStalledGauge,
+		pvcProvisionerHealsTotal)
+}
 
 // strandedHeal is one pod+PVC pair eligible for the ephemeral-volume
 // rescue — carried out of the pod scan so the maintenance mutex is
@@ -279,7 +322,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 									pvc.Name + "/" + node + "/" + reason
 								emitted[key] = []string{
 									pod.Namespace, pod.Name, pvc.Name, node, reason}
-								metrics.LocalPVStrandedPods.WithLabelValues(
+								localPVStrandedPodsGauge.WithLabelValues(
 									emitted[key]...).Set(1)
 								// Confirmed-gone nodes only: NotReady/
 								// cordoned can come back — a missing or
@@ -304,7 +347,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 						key := pod.Namespace + "/" + pvc.Name + "/" + openebsHostpathSC
 						stalled[key] = []string{
 							pod.Namespace, pvc.Name, openebsHostpathSC}
-						metrics.PVCProvisioningStalled.WithLabelValues(
+						pvcProvisioningStalledGauge.WithLabelValues(
 							stalled[key]...).Set(1)
 					}
 				}
@@ -319,9 +362,9 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	// DeleteLabelValues hygiene as stsZeroEmitted; the ledgers hold
 	// the label tuples so no key gets re-split.
 	p.localPVEmitted.Reconcile(emitted,
-		metrics.LocalPVStrandedPods.DeleteLabelValues)
+		localPVStrandedPodsGauge.DeleteLabelValues)
 	p.pvcStalledEmitted.Reconcile(stalled,
-		metrics.PVCProvisioningStalled.DeleteLabelValues)
+		pvcProvisioningStalledGauge.DeleteLabelValues)
 
 	// AllowedV folds the per-target cooldown plus the maintenance
 	// mutex (memoized on p.verdict — one evaluation per sweep) —
@@ -381,7 +424,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		p.localPVHealed.Stamp(pvcKey, now)
-		metrics.LocalPVEphemeralHealsTotal.
+		localPVEphemeralHealsTotal.
 			WithLabelValues(h.pvc.Namespace, h.pvc.Name, h.node).Inc()
 		log.Info("DELETE: ephemeral localpv pvc+pod stranded on a confirmed-dead node — StatefulSet rebinds on a live node",
 			"pvc", pvcKey, "pod", h.pod.Namespace+"/"+h.pod.Name,
@@ -454,6 +497,6 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	if !deleted {
 		return
 	}
-	metrics.PVCProvisionerHealsTotal.
+	pvcProvisionerHealsTotal.
 		WithLabelValues(openebsProvisionerName).Inc()
 }

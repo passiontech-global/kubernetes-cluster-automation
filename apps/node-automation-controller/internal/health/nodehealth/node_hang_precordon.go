@@ -20,6 +20,8 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/prometheus/client_golang/prometheus"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // nodeHangCheck is the node-hang pre-cordon watchdog.
@@ -65,6 +67,28 @@ const (
 var nodeHangConds = []corev1.NodeConditionType{
 	"KernelHungTasks", "FilesystemReadOnly", "KubeletRuntimeStall",
 	"KubeletWatchWedge", "PodTeardownWedged", "InodePressure",
+}
+
+var (
+	// W8-ST2 — worker nodes patched spec.unschedulable after a
+	// sustained hang condition (delivered cordons only).
+	nodeHangCordonsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "node_automation_node_hang_cordons_total",
+		Help: "Worker nodes patched spec.unschedulable after a sustained hang condition.",
+	}, []string{"node"})
+
+	// W8-ST2 — worker nodes patched schedulable after the
+	// pre-cordon hang latch cleared (delivered uncordons only).
+	nodeHangUncordonsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "node_automation_node_hang_uncordons_total",
+		Help: "Worker nodes patched schedulable after the pre-cordon hang latch cleared.",
+	}, []string{"node"})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		nodeHangCordonsTotal,
+		nodeHangUncordonsTotal)
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +208,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		cordoned--
-		metrics.NodeHangUncordonsTotal.WithLabelValues(name).Inc()
+		nodeHangUncordonsTotal.WithLabelValues(name).Inc()
 		log.Info("UNCORDON: node hang condition cleared",
 			"node", name)
 	}
@@ -254,7 +278,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		cordoned++
-		metrics.NodeHangCordonsTotal.WithLabelValues(name).Inc()
+		nodeHangCordonsTotal.WithLabelValues(name).Inc()
 		log.Info("CORDON: node carrying a sustained hang latch — unschedulable before NHC/SNR reboots it",
 			"node", name, "condition", entry)
 	}

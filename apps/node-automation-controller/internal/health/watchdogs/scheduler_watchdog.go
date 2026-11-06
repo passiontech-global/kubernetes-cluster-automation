@@ -16,8 +16,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/prometheus/client_golang/prometheus"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // schedulerWatchdogCheck is the W8-CP3 scheduler-watchdog — a stopped
@@ -36,6 +37,22 @@ const (
 	CheckNameSchedulerWatchdog = "scheduler-watchdog"
 	schedulerPendingMinAge     = 5 * time.Minute
 )
+
+var (
+	// W8-CP3 — the scheduler-freeze signal: 1 while unscheduled
+	// Pending pods accumulate past the fuse despite Ready uncordoned
+	// workers. A plain gauge — the freeze is cluster-wide, not
+	// per-object.
+	schedulerFrozenGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_automation_scheduler_frozen",
+		Help: "1 while unscheduled Pending pods accumulate past 5m despite Ready uncordoned workers.",
+	})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		schedulerFrozenGauge)
+}
 
 // ---------------------------------------------------------------------------
 // W8-CP3 — scheduler-watchdog
@@ -62,7 +79,7 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 	if !schedulable {
-		metrics.SchedulerFrozen.Set(0)
+		schedulerFrozenGauge.Set(0)
 		return probefw.Result{Pass: true} // nowhere to schedule — ambiguous
 	}
 
@@ -91,11 +108,11 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 	if len(stuck) == 0 {
-		metrics.SchedulerFrozen.Set(0)
+		schedulerFrozenGauge.Set(0)
 		return probefw.Result{Pass: true}
 	}
 	sort.Strings(stuck)
-	metrics.SchedulerFrozen.Set(1)
+	schedulerFrozenGauge.Set(1)
 	return probefw.Result{Why: fmt.Sprintf(
 		"%d pods pending >=%s unscheduled with no PodScheduled condition despite Ready workers: %s",
 		len(stuck), schedulerPendingMinAge, strings.Join(stuck, ", "))}

@@ -17,7 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -168,9 +167,9 @@ func TestCheckOperatorWorkqueuesStaleLeaseQuiet(t *testing.T) {
 // the 20m window the gauge goes to 1 AND the leader pod is deleted —
 // holderIdentity's "<pod>_<uuid>" prefix resolves it.
 func TestCheckOperatorWorkqueuesStuckThenHeals(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
 	})
 	base := time.Now()
 	leader := &corev1.Pod{
@@ -238,9 +237,9 @@ func TestCheckOperatorWorkqueuesStuckThenHeals(t *testing.T) {
 // Inside the 1h heal cooldown a replacement leader is left alone —
 // the wider of the in-RAM ledger and the persisted stamp governs.
 func TestCheckOperatorWorkqueuesHealCooldown(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
 	})
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
@@ -299,9 +298,9 @@ func TestCheckOperatorWorkqueuesHealCooldown(t *testing.T) {
 // cooldown — the persisted Lease annotation carries it across
 // operator restarts.
 func TestCheckOperatorWorkqueuesPersistedCooldown(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
 	})
 	base := time.Now()
 	lease := shLease("scylla-operator", "scylla-operator-lock",
@@ -337,9 +336,9 @@ func TestCheckOperatorWorkqueuesPersistedCooldown(t *testing.T) {
 // The frozen gauge still fires: detection and remediation are
 // independent.
 func TestCheckOperatorWorkqueuesMaintenanceDefers(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("scylla-operator", kcmReasonStaleGen)
 	})
 	base := time.Now()
 	cordoned := testutil.Node("n1", corev1.ConditionTrue, nil)
@@ -375,7 +374,7 @@ func TestCheckOperatorWorkqueuesMaintenanceDefers(t *testing.T) {
 // A suspended HelmRelease is parked, not stuck — the flux path must
 // not freeze on deliberately-suspended objects.
 func TestCheckOperatorWorkqueuesSuspendedFluxIgnored(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("helm-controller", kcmReasonStaleGen)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("helm-controller", kcmReasonStaleGen)
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("flux-system", "helm-controller-leader-election",
@@ -400,9 +399,9 @@ func TestCheckOperatorWorkqueuesSuspendedFluxIgnored(t *testing.T) {
 // When the leader can't be resolved by holderIdentity, the operator's
 // pod label selector inside the Lease's namespace picks the pod.
 func TestCheckOperatorWorkqueuesSelectorFallback(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("dragonfly-operator", kcmReasonStaleGen)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("dragonfly-operator", kcmReasonStaleGen)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("dragonfly-operator", kcmReasonStaleGen)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("dragonfly-operator", kcmReasonStaleGen)
 	})
 	base := time.Now()
 	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
@@ -540,10 +539,10 @@ func TestOperatorLeaseCandidateFallback(t *testing.T) {
 // A W10-CP3 target end-to-end: node-healthcheck-operator's renewing
 // lease plus a never-reconciled NodeHealthCheck freezes the gauge.
 func TestCheckOperatorWorkqueuesMedik8sTarget(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues(
+	operatorWorkqueueFrozenGauge.DeleteLabelValues(
 		"node-healthcheck-operator", opReasonNoStatus)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues(
+		operatorWorkqueueFrozenGauge.DeleteLabelValues(
 			"node-healthcheck-operator", opReasonNoStatus)
 	})
 	base := time.Now()

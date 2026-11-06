@@ -20,8 +20,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
-
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -70,9 +68,9 @@ func shStatefulZeroGauge(t *testing.T, ns, svc, sts string) (float64, bool) {
 // first, gauge at 3m — and because the STS is Dragonfly-owned the
 // operator leader gets bounced at 5m to force re-election.
 func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
-	metrics.StatefulServiceZeroEndpoints.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
+	statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
 	t.Cleanup(func() {
-		metrics.StatefulServiceZeroEndpoints.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
+		statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
 	})
 	base := time.Now()
 	sts := shSTS("db", "dragonfly", 3,
@@ -126,9 +124,9 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 // A masterless non-Dragonfly service fires the gauge but never
 // touches any operator pod.
 func TestCheckStatefulMasterlessNonDragonflyNoHeal(t *testing.T) {
-	metrics.StatefulServiceZeroEndpoints.DeleteLabelValues("cache", "redis-master", "redis")
+	statefulServiceZeroEndpointsGauge.DeleteLabelValues("cache", "redis-master", "redis")
 	t.Cleanup(func() {
-		metrics.StatefulServiceZeroEndpoints.DeleteLabelValues("cache", "redis-master", "redis")
+		statefulServiceZeroEndpointsGauge.DeleteLabelValues("cache", "redis-master", "redis")
 	})
 	base := time.Now()
 	sts := shSTS("cache", "redis", 2, map[string]string{"app": "redis"})
@@ -161,7 +159,7 @@ func TestCheckStatefulMasterlessNonDragonflyNoHeal(t *testing.T) {
 // Recovery: once the Service has a Ready endpoint again the tuple
 // leaves the ledger and its gauge series is deleted, not parked at 1.
 func TestCheckStatefulMasterlessRecovers(t *testing.T) {
-	metrics.StatefulServiceZeroEndpoints.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
+	statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
 	base := time.Now()
 	sts := shSTS("db", "dragonfly", 3,
 		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
@@ -201,7 +199,7 @@ func TestCheckStatefulMasterlessRecovers(t *testing.T) {
 		Seen("db/dragonfly-master/dragonfly", at); ok {
 		t.Fatal("recovered tuple must leave the first-seen ledger")
 	}
-	if metrics.StatefulServiceZeroEndpoints.DeleteLabelValues("db", "dragonfly-master", "dragonfly") {
+	if statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly") {
 		t.Fatal("zero-endpoints series must be pruned on recovery")
 	}
 }
@@ -312,7 +310,7 @@ func TestCheckRabbitMQSuspendedHeals(t *testing.T) {
 		return m.GetCounter().GetValue()
 	}()
 	t.Cleanup(func() {
-		metrics.RabbitMQSuspendedHealsTotal.DeleteLabelValues("mq", "rabbitmq-0")
+		rabbitMQSuspendedHealsTotal.DeleteLabelValues("mq", "rabbitmq-0")
 	})
 
 	// First sighting — tracked, quiet, pod kept.

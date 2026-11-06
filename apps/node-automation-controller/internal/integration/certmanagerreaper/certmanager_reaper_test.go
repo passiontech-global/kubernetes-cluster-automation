@@ -14,17 +14,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	clienttesting "k8s.io/client-go/testing"
 )
-
-var cmrListKinds = map[schema.GroupVersionResource]string{
-	certificateGVR:        "CertificateList",
-	certificateRequestGVR: "CertificateRequestList",
-	orderGVR:              "OrderList",
-	challengeGVR:          "ChallengeList",
-}
 
 // ---------------------------------------------------------------------------
 // certmanager-reaper builders
@@ -35,12 +27,8 @@ var cmrListKinds = map[schema.GroupVersionResource]string{
 // RFC3339 status.renewalTime ("" = absent) — where cert-manager
 // actually publishes the next renewal.
 func cmrCert(ns, name, readyStatus, renewalTime string) *unstructured.Unstructured {
-	o := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "cert-manager.io/v1",
-		"kind":       "Certificate",
-	}}
-	o.SetNamespace(ns)
-	o.SetName(name)
+	o := testutil.Unstructured(
+		certificateGVR.GroupVersion().WithKind("Certificate"), ns, name, nil)
 	if readyStatus != "" {
 		_ = unstructured.SetNestedSlice(o.Object, []interface{}{
 			map[string]interface{}{"type": "Ready", "status": readyStatus},
@@ -53,12 +41,8 @@ func cmrCert(ns, name, readyStatus, renewalTime string) *unstructured.Unstructur
 }
 
 func cmrOrder(ns, name, state string, age time.Duration) *unstructured.Unstructured {
-	o := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "acme.cert-manager.io/v1",
-		"kind":       "Order",
-	}}
-	o.SetNamespace(ns)
-	o.SetName(name)
+	o := testutil.Unstructured(
+		orderGVR.GroupVersion().WithKind("Order"), ns, name, nil)
 	o.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-age)))
 	if state != "" {
 		_ = unstructured.SetNestedField(o.Object, state, "status", "state")
@@ -84,12 +68,8 @@ func cmrOrderOwned(ns, name, state string, age time.Duration, crName string) *un
 // Ready-True: a stuck Ready=False/old CR is built inline by the W8
 // stuck-CR tests instead.
 func cmrCertRequest(ns, name, certName string) *unstructured.Unstructured {
-	o := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "cert-manager.io/v1",
-		"kind":       "CertificateRequest",
-	}}
-	o.SetNamespace(ns)
-	o.SetName(name)
+	o := testutil.Unstructured(
+		certificateRequestGVR.GroupVersion().WithKind("CertificateRequest"), ns, name, nil)
 	o.SetCreationTimestamp(metav1.NewTime(time.Now()))
 	o.SetOwnerReferences([]metav1.OwnerReference{{
 		APIVersion: "cert-manager.io/v1",
@@ -115,12 +95,8 @@ func cmrCertRequestStuck(ns, name, certName string, age time.Duration) *unstruct
 // status.lastTransitionTime, orderOwner sets the ownerReference name.
 func cmrChallenge(ns, name string, presented, processing bool,
 	transitionAgo time.Duration, orderOwner string) *unstructured.Unstructured {
-	o := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "acme.cert-manager.io/v1",
-		"kind":       "Challenge",
-	}}
-	o.SetNamespace(ns)
-	o.SetName(name)
+	o := testutil.Unstructured(
+		challengeGVR.GroupVersion().WithKind("Challenge"), ns, name, nil)
 	o.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-transitionAgo)))
 	_ = unstructured.SetNestedField(o.Object, presented, "status", "presented")
 	_ = unstructured.SetNestedField(o.Object, processing, "status", "processing")
@@ -171,7 +147,7 @@ func TestCertManagerReaperSetupDisabled(t *testing.T) {
 }
 
 func TestCertManagerReaperDeletesStuckOrder(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
+	dyn := testutil.NewDynamicClient(stuckFixture("app", "tls-a", "order-a")...)
 	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
@@ -188,9 +164,8 @@ func TestCertManagerReaperDeletesStuckOrder(t *testing.T) {
 
 // Renewal-time candidacy: Ready=True but renewalTime inside 7d.
 func TestCertManagerReaperRenewalWindowCandidate(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds,
-		cmrCert("app", "tls-b", "True",
-			time.Now().Add(48*time.Hour).UTC().Format(time.RFC3339)),
+	dyn := testutil.NewDynamicClient(cmrCert("app", "tls-b", "True",
+		time.Now().Add(48*time.Hour).UTC().Format(time.RFC3339)),
 		cmrCertRequest("app", "order-b-cr", "tls-b"),
 		cmrOrderOwned("app", "order-b", "pending", 45*time.Minute, "order-b-cr"),
 		cmrChallenge("app", "order-b-ch", true, true, time.Hour, "order-b"))
@@ -206,9 +181,8 @@ func TestCertManagerReaperRenewalWindowCandidate(t *testing.T) {
 
 // Healthy cert, renewal far out: not a candidate, order never touched.
 func TestCertManagerReaperKeepsHealthyCert(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds,
-		cmrCert("app", "tls-ok", "True",
-			time.Now().Add(30*24*time.Hour).UTC().Format(time.RFC3339)),
+	dyn := testutil.NewDynamicClient(cmrCert("app", "tls-ok", "True",
+		time.Now().Add(30*24*time.Hour).UTC().Format(time.RFC3339)),
 		cmrCertRequest("app", "order-ok-cr", "tls-ok"),
 		cmrOrderOwned("app", "order-ok", "pending", 45*time.Minute, "order-ok-cr"),
 		cmrChallenge("app", "order-ok-ch", true, true, time.Hour, "order-ok"))
@@ -225,8 +199,7 @@ func TestCertManagerReaperKeepsHealthyCert(t *testing.T) {
 // Order must be BOTH pending and >30m old — and owned by this cert's
 // CertificateRequest before the gates even apply.
 func TestCertManagerReaperOrderGates(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds,
-		cmrCert("app", "tls-a", "False", ""),
+	dyn := testutil.NewDynamicClient(cmrCert("app", "tls-a", "False", ""),
 		cmrCertRequest("app", "cr-a", "tls-a"),
 		cmrOrderOwned("app", "young", "pending", 10*time.Minute, "cr-a"), // fresh
 		cmrOrderOwned("app", "valid", "valid", 45*time.Minute, "cr-a"),   // not pending
@@ -245,8 +218,7 @@ func TestCertManagerReaperOrderGates(t *testing.T) {
 
 // A pending>30m order with no wedged challenge is still progressing.
 func TestCertManagerReaperKeepsOrderWhenChallengeProgressing(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds,
-		cmrCert("app", "tls-a", "False", ""),
+	dyn := testutil.NewDynamicClient(cmrCert("app", "tls-a", "False", ""),
 		cmrCertRequest("app", "order-a-cr", "tls-a"),
 		cmrOrderOwned("app", "order-a", "pending", 45*time.Minute, "order-a-cr"),
 		// presented but not processing — still moving.
@@ -265,8 +237,7 @@ func TestCertManagerReaperKeepsOrderWhenChallengeProgressing(t *testing.T) {
 // deleting this order — the cross-check is per-order linkage, not
 // "any wedged challenge in the namespace".
 func TestCertManagerReaperIgnoresForeignChallenge(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds,
-		cmrCert("app", "tls-a", "False", ""),
+	dyn := testutil.NewDynamicClient(cmrCert("app", "tls-a", "False", ""),
 		cmrCertRequest("app", "order-a-cr", "tls-a"),
 		cmrOrderOwned("app", "order-a", "pending", 45*time.Minute, "order-a-cr"),
 		cmrChallenge("app", "ch-b", true, true, time.Hour, "other-order"))
@@ -283,7 +254,7 @@ func TestCertManagerReaperIgnoresForeignChallenge(t *testing.T) {
 // Max 1 reset per cert per hour: a second stuck order inside the hour
 // is kept; after the gap it is reset again (total 2).
 func TestCertManagerReaperHourlyRateLimit(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-1")...)
+	dyn := testutil.NewDynamicClient(stuckFixture("app", "tls-a", "order-1")...)
 	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
@@ -323,7 +294,7 @@ func TestCertManagerReaperHourlyRateLimit(t *testing.T) {
 // After 3 total resets the reaper refuses: order kept, IncError fires
 // exactly once even across repeated runs.
 func TestCertManagerReaperResetBudgetExhausted(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
+	dyn := testutil.NewDynamicClient(stuckFixture("app", "tls-a", "order-a")...)
 	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{
 			"app/tls-a": {total: certReaperMaxReset, last: time.Now().Add(-2 * time.Hour)},
@@ -352,9 +323,8 @@ func TestCertManagerReaperResetBudgetExhausted(t *testing.T) {
 // next Order wedges (the old cert is still valid) — wiping the budget
 // there would bypass the hourly gap and the 3-reset cap every sweep.
 func TestCertManagerReaperRenewalKeepsResetBudget(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds,
-		cmrCert("app", "tls-renew", "True",
-			time.Now().Add(48*time.Hour).UTC().Format(time.RFC3339)),
+	dyn := testutil.NewDynamicClient(cmrCert("app", "tls-renew", "True",
+		time.Now().Add(48*time.Hour).UTC().Format(time.RFC3339)),
 		cmrCertRequest("app", "order-r-cr", "tls-renew"),
 		cmrOrderOwned("app", "order-r", "pending", 45*time.Minute, "order-r-cr"),
 		cmrChallenge("app", "order-r-ch", true, true, time.Hour, "order-r"))
@@ -380,9 +350,8 @@ func TestCertManagerReaperRenewalKeepsResetBudget(t *testing.T) {
 // A cert recovered to Ready=True with no pending candidacy gets a
 // clean slate, and a budget for a deleted Certificate is dropped.
 func TestCertManagerReaperPrunesResetBudgets(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds,
-		cmrCert("app", "tls-ok", "True",
-			time.Now().Add(30*24*time.Hour).UTC().Format(time.RFC3339)),
+	dyn := testutil.NewDynamicClient(cmrCert("app", "tls-ok", "True",
+		time.Now().Add(30*24*time.Hour).UTC().Format(time.RFC3339)),
 		// A second cert still Ready=False keeps its budget.
 		cmrCert("app", "pending", "False", ""))
 	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
@@ -408,7 +377,7 @@ func TestCertManagerReaperPrunesResetBudgets(t *testing.T) {
 // Per-item failure logs + continues: a failing orders List in ns "bad"
 // must not prevent the healthy ns "good" cert from being processed.
 func TestCertManagerReaperContinuesOnItemError(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds, append(
+	dyn := testutil.NewDynamicClient(append(
 		stuckFixture("good", "tls-good", "order-good"),
 		cmrCert("bad", "tls-bad", "False", ""))...)
 	dyn.PrependReactor("list", "orders",
@@ -434,7 +403,7 @@ func TestCertManagerReaperContinuesOnItemError(t *testing.T) {
 
 // Top-level certificate list failure is a real error.
 func TestCertManagerReaperListError(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds)
+	dyn := testutil.NewDynamicClient()
 	dyn.PrependReactor("list", "certificates",
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
@@ -449,7 +418,7 @@ func TestCertManagerReaperListError(t *testing.T) {
 // A challenge list failure is a per-item IncError + keep: the order
 // must NOT be deleted on an unreadable cross-check.
 func TestCertManagerReaperChallengeListError(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
+	dyn := testutil.NewDynamicClient(stuckFixture("app", "tls-a", "order-a")...)
 	dyn.PrependReactor("list", "challenges",
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("challenges unreachable")
@@ -471,7 +440,7 @@ func TestCertManagerReaperChallengeListError(t *testing.T) {
 // A failed order delete IncErrors but does NOT consume reset budget —
 // the next run retries the same order.
 func TestCertManagerReaperOrderDeleteError(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
+	dyn := testutil.NewDynamicClient(stuckFixture("app", "tls-a", "order-a")...)
 	var failOnce atomic.Bool
 	failOnce.Store(true)
 	dyn.PrependReactor("delete", "orders",
@@ -565,8 +534,7 @@ func TestChallengeLinkedToOrder(t *testing.T) {
 // cert's CR — or carrying no ownerRef at all — is never reaped on
 // this cert's candidacy (and never charges its budget).
 func TestCertManagerReaperIgnoresForeignOrder(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds,
-		cmrCert("app", "tls-a", "False", ""),
+	dyn := testutil.NewDynamicClient(cmrCert("app", "tls-a", "False", ""),
 		cmrCert("app", "tls-x", "True",
 			time.Now().Add(48*time.Hour).UTC().Format(time.RFC3339)),
 		cmrCertRequest("app", "cr-a", "tls-a"),
@@ -596,7 +564,7 @@ func TestCertManagerReaperIgnoresForeignOrder(t *testing.T) {
 // A CertificateRequest list failure makes attribution indeterminate —
 // per-item IncError + keep, same posture as the order/challenge lists.
 func TestCertManagerReaperCRListError(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
+	dyn := testutil.NewDynamicClient(stuckFixture("app", "tls-a", "order-a")...)
 	dyn.PrependReactor("list", "certificaterequests",
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("cr list boom")
@@ -650,7 +618,7 @@ func cmrCertAnnotation(t *testing.T, dyn *dynamicfake.FakeDynamicClient, ns, nam
 // Every consumed reset is persisted on the Certificate
 // ("<total>,<lastRFC3339>") so a restart cannot refund the budget.
 func TestCertManagerReaperPersistsResetAnnotation(t *testing.T) {
-	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
+	dyn := testutil.NewDynamicClient(stuckFixture("app", "tls-a", "order-a")...)
 	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
@@ -671,8 +639,7 @@ func TestCertManagerReaperHydratesBudgetFromAnnotation(t *testing.T) {
 		acmeResetsAnno: fmt.Sprintf("%d,%s", certReaperMaxReset,
 			time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339)),
 	})
-	dyn := testutil.NewFakeDyn(cmrListKinds,
-		cert,
+	dyn := testutil.NewDynamicClient(cert,
 		cmrCertRequest("app", "order-a-cr", "tls-a"),
 		cmrOrderOwned("app", "order-a", "pending", 45*time.Minute, "order-a-cr"),
 		cmrChallenge("app", "ch-a", true, true, time.Hour, "order-a"))
@@ -695,7 +662,7 @@ func TestCertManagerReaperClearsPersistedBudgetOnHeal(t *testing.T) {
 	cert := cmrCert("app", "tls-ok", "True",
 		time.Now().Add(30*24*time.Hour).UTC().Format(time.RFC3339))
 	cert.SetAnnotations(map[string]string{acmeResetsAnno: "2,2026-01-01T00:00:00Z"})
-	dyn := testutil.NewFakeDyn(cmrListKinds, cert)
+	dyn := testutil.NewDynamicClient(cert)
 	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
@@ -755,7 +722,7 @@ func TestCertManagerReaperStuckCertificateRequest(t *testing.T) {
 		cmrCert("app", "tls-stuck", "False", ""),
 		cmrCertRequestStuck("app", "cr-stuck", "tls-stuck", time.Hour),
 	}
-	dyn := testutil.NewFakeDyn(cmrListKinds, objs...)
+	dyn := testutil.NewDynamicClient(objs...)
 	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {

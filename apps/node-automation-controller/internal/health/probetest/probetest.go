@@ -22,7 +22,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
@@ -31,7 +30,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -87,77 +85,12 @@ func FreezeNow(d *probefw.Deps, base time.Time) {
 	d.Now = func() time.Time { return base }
 }
 
-// OpDyn registers every GVR the sweep checks scan — the fake dynamic
-// client PANICS on an unregistered GVR List, so every watched
-// operator resource (W5.8 original five + the ten W7-C2 additions)
-// plus the OLM/autopilot reads must be mapped.
+// OpDyn returns the shared CRD-aware dynamic fake — every GVR the
+// sweep checks scan is already in testutil's dynCRDGVKs table (the
+// fake PANICS on an unregistered GVR List, so the watched-operator
+// roster, OLM/autopilot reads and report CRs all live there).
 func OpDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		kube.GVRGateway:   "GatewayList",
-		kube.GVRHTTPRoute: "HTTPRouteList",
-		kube.GVRGRPCRoute: "GRPCRouteList",
-		// The owns filter LISTs classes once per stuck gateway-api
-		// object — unregistered GVR panics the fake.
-		kube.GVRGatewayClass:  "GatewayClassList",
-		kube.GVRScyllaCluster: "ScyllaClusterList",
-		kube.GVRDragonfly:     "DragonflyList",
-		kube.GVRHelmReleaseV2: "HelmReleaseList",
-		// The flux retry check falls back to the previous storage
-		// version when v2 is unserved — register it too so that
-		// probe order cannot panic the fake.
-		kube.GVRHelmReleaseV2Beta2: "HelmReleaseList",
-		kube.GVRFluxKustomization:  "KustomizationList",
-		// W7-C2 — the ten additional watched operators' CRDs.
-		kube.GVRFluxGitRepository:  "GitRepositoryList",
-		kube.GVRFluxHelmRepository: "HelmRepositoryList",
-		kube.GVRFluxHelmChart:      "HelmChartList",
-		kube.GVRFluxOCIRepository:  "OCIRepositoryList",
-		kube.GVRFluxBucket:         "BucketList",
-		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "alerts"}:    "AlertList",
-		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "providers"}: "ProviderList",
-		{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Resource: "receivers"}: "ReceiverList",
-		kube.GVRCertificate:           "CertificateList",
-		kube.GVRExternalSecretV1:      "ExternalSecretList",
-		kube.GVRExternalSecretV1Beta1: "ExternalSecretList",
-		kube.GVRRabbitMQCluster:       "RabbitmqClusterList",
-		kube.GVRKedaScaledObject:      "ScaledObjectList",
-		kube.GVRArgoCD:                "ArgoCDList",
-		// argocd-app-stuck Lists Applications unconditionally every
-		// sweep — same unregistered-GVR panic exposure as the
-		// watchdog table.
-		kube.GVRArgoCDApplication:      "ApplicationList",
-		kube.GVRKargoStage:             "StageList",
-		kube.GVRKargoWarehouse:         "WarehouseList",
-		kube.GVREverestDatabaseCluster: "DatabaseClusterList",
-		kube.GVRShipwrightBuild:        "BuildList",
-		// W10-CP3 — the nine additional watched operators' CRDs.
-		kube.GVRNodeHealthCheck:         "NodeHealthCheckList",
-		kube.GVRSelfNodeRemediation:     "SelfNodeRemediationList",
-		kube.GVRPerconaXtraDBCluster:    "PerconaXtraDBClusterList",
-		kube.GVRPerconaPGCluster:        "PerconaPGClusterList",
-		kube.GVRPerconaServerMongoDB:    "PerconaServerMongoDBList",
-		kube.GVRTektonPipelineRun:       "PipelineRunList",
-		kube.GVRShipwrightOperatorBuild: "ShipwrightBuildList",
-		// W7-C5 — OLM reads.
-		kube.GVROLMClusterServiceVersion: "ClusterServiceVersionList",
-		kube.GVROLMSubscription:          "SubscriptionList",
-		// api-object-sprawl-report-gc — trivy + policy reports.
-		kube.GVRVulnerabilityReport: "VulnerabilityReportList",
-		kube.GVRConfigAuditReport:   "ConfigAuditReportList",
-		kube.GVRExposedSecretReport: "ExposedSecretReportList",
-		kube.GVREphemeralReport:     "EphemeralReportList",
-		kube.GVRPolicyReport:        "PolicyReportList",
-		// cilium-missing-endpoint — the CEP census.
-		kube.GVRCiliumEndpoint: "CiliumEndpointList",
-		// liqo-tunnel-health — the peering CR family.
-		kube.GVRLiqoConnection:    "ConnectionList",
-		kube.GVRLiqoGatewayClient: "GatewayClientList",
-		kube.GVRLiqoGatewayServer: "GatewayServerList",
-		// postgres-wal-archive-guard — the CNPG cluster scan.
-		kube.GVRCNPGCluster: "ClusterList",
-		// Maintenance mutex read.
-		kube.AutopilotPlanGVR: "PlanList",
-	}, objs...)
+	return testutil.NewDynamicClient(objs...)
 }
 
 // UnstructuredObj builds a CR object carrying a generation and an

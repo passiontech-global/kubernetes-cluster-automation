@@ -26,6 +26,8 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/prometheus/client_golang/prometheus"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // linkerdEndpointSyncCheck is the W9-NM2 linkerd endpoint-sync
@@ -79,6 +81,23 @@ const (
 	// recreates them with corrected contents.
 	linkerdSliceManagedByESC = "endpointslice-controller.k8s.io"
 )
+
+var (
+	// W9-NM2 — the endpoint-desync signal: 1 while the headless
+	// Service's EndpointSlice misses a Ready pod IP or holds a
+	// deleted pod's address. Past the persistence window the check
+	// also rolling-bounces the oldest linkerd-destination pod (1h
+	// per-service cooldown) to force a resync.
+	linkerdEndpointDesyncGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_linkerd_endpoint_desync",
+		Help: "1 while the headless Service's EndpointSlice misses a Ready pod IP or holds a deleted pod's address.",
+	}, []string{"namespace", "service"})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		linkerdEndpointDesyncGauge)
+}
 
 // ---------------------------------------------------------------------------
 // W9-NM2 — linkerd-endpoint-sync
@@ -347,10 +366,10 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		emitted[k] = lv
-		metrics.LinkerdEndpointDesync.WithLabelValues(lv...).Set(1)
+		linkerdEndpointDesyncGauge.WithLabelValues(lv...).Set(1)
 	}
 	p.linkerdDesyncEmitted.Reconcile(emitted,
-		metrics.LinkerdEndpointDesync.DeleteLabelValues)
+		linkerdEndpointDesyncGauge.DeleteLabelValues)
 
 	// Past the window: bounce the oldest linkerd-destination pod so
 	// its endpoint table rebuilds from the current EndpointSlices.

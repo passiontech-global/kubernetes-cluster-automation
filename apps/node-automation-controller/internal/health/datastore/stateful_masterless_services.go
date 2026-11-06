@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // statefulMasterlessCheck is the W6.2 masterless service guard plus
@@ -41,7 +42,7 @@ type statefulMasterlessCheck struct {
 	//   - stsZeroSince: "ns/svc/sts" → first sweep the master-role
 	//     Service showed 0 Ready endpoints.
 	//   - stsZeroEmitted: the emitted-gauge ledger for
-	//     StatefulServiceZeroEndpoints — a tuple not re-seen gets
+	//     statefulServiceZeroEndpointsGauge — a tuple not re-seen gets
 	//     DeleteLabelValues, not a stale 1 (same hygiene as the
 	//     webhook guard's brokenEmitted).
 	//   - drHealed: operator pod "ns/name" → last delete — the
@@ -113,6 +114,20 @@ const (
 	// the STS — the restart-proof half of the cooldown.
 	dragonflyPodHealAnno = kube.AnnoLastDragonflyPodHeal
 )
+
+var (
+	// W6.2 — the masterless-service signal: 1 while the master-role
+	// Service of a ready StatefulSet reports 0 Ready endpoints.
+	statefulServiceZeroEndpointsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_stateful_service_zero_endpoints",
+		Help: "1 while the master-role Service of a ready StatefulSet reports 0 Ready endpoints.",
+	}, []string{"namespace", "service", "statefulset"})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		statefulServiceZeroEndpointsGauge)
+}
 
 // ---------------------------------------------------------------------------
 // stateful-masterless-services (W6.2) — masterless service guard +
@@ -297,7 +312,7 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		emitted[key] = true
-		p.stsZeroEmitted.Set(metrics.StatefulServiceZeroEndpoints, 1,
+		p.stsZeroEmitted.Set(statefulServiceZeroEndpointsGauge, 1,
 			key, c.ns, c.svc, c.sts.Name)
 		// The heal window reads the same streak — Seen never
 		// re-stamps, so the already-observed key reports its age.
@@ -307,7 +322,7 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	p.stsZeroSince.Prune(func(k string) bool { return seen[k] })
-	p.stsZeroEmitted.Prune(metrics.StatefulServiceZeroEndpoints.DeleteLabelValues)
+	p.stsZeroEmitted.Prune(statefulServiceZeroEndpointsGauge.DeleteLabelValues)
 
 	// Dragonfly auto-heal — a masterless dragonfly past the heal
 	// window bounces the operator leader to force re-election (step

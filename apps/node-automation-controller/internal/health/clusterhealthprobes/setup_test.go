@@ -23,7 +23,7 @@ func TestSetupPeriodicModules(t *testing.T) {
 			func(m *testutil.StubManager) error {
 				return Setup(shared.Deps{
 					Name: "cluster-health-probes",
-					Mgr:  m, CS: cs, Dyn: testutil.NewFakeDyn(nil)})
+					Mgr:  m, CS: cs, Dyn: testutil.NewDynamicClient()})
 			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -48,7 +48,7 @@ func TestSetupFeatureFlagVariants(t *testing.T) {
 	m := testutil.NewStubManager()
 	if err := Setup(shared.Deps{
 		Name: "cluster-health-probes",
-		Mgr:  m, CS: fake.NewSimpleClientset(), Dyn: testutil.NewFakeDyn(nil),
+		Mgr:  m, CS: fake.NewSimpleClientset(), Dyn: testutil.NewDynamicClient(),
 		Disabled: true}); err != nil {
 		t.Fatalf("disabled setup must return nil, got %v", err)
 	}

@@ -24,19 +24,9 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
-var ciliumAuditListKinds = map[schema.GroupVersionResource]string{
-	ciliumIdentityGVR:      "CiliumIdentityList",
-	ciliumEndpointGVR:      "CiliumEndpointList",
-	ciliumEndpointSliceGVR: "CiliumEndpointSliceList",
-}
-
 func ciliumIdentity(name string) *unstructured.Unstructured {
-	o := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "cilium.io/v2",
-		"kind":       "CiliumIdentity",
-	}}
-	o.SetName(name)
-	return o
+	return testutil.Unstructured(
+		ciliumIdentityGVR.GroupVersion().WithKind("CiliumIdentity"), "", name, nil)
 }
 
 // ciliumIdentityAged is ciliumIdentity with a controlled
@@ -48,12 +38,8 @@ func ciliumIdentityAged(name string, created time.Time) *unstructured.Unstructur
 }
 
 func ciliumEndpoint(ns, name string, id int64) *unstructured.Unstructured {
-	o := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "cilium.io/v2",
-		"kind":       "CiliumEndpoint",
-	}}
-	o.SetNamespace(ns)
-	o.SetName(name)
+	o := testutil.Unstructured(
+		ciliumEndpointGVR.GroupVersion().WithKind("CiliumEndpoint"), ns, name, nil)
 	_ = unstructured.SetNestedField(o.Object, id, "status", "identity", "id")
 	return o
 }
@@ -69,12 +55,8 @@ func ciliumEndpointSlice(ns, name string, ids ...int64) *unstructured.Unstructur
 			"identity": map[string]any{"id": id},
 		})
 	}
-	o := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "cilium.io/v2alpha1",
-		"kind":       "CiliumEndpointSlice",
-	}}
-	o.SetNamespace(ns)
-	o.SetName(name)
+	o := testutil.Unstructured(
+		ciliumEndpointSliceGVR.GroupVersion().WithKind("CiliumEndpointSlice"), ns, name, nil)
 	_ = unstructured.SetNestedSlice(o.Object, eps, "spec", "endpoints")
 	return o
 }
@@ -101,8 +83,7 @@ func TestCiliumIdentityAuditorSetupDisabled(t *testing.T) {
 // the rest are orphans — below the threshold they log only (no error).
 // The fixture leaves gcEnabled=false, so nothing is ever deleted.
 func TestCiliumIdentityAuditorDetectsOrphansBelowThreshold(t *testing.T) {
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentity("1000"), ciliumIdentity("2000"), ciliumIdentity("3000"),
+	dyn := testutil.NewDynamicClient(ciliumIdentity("1000"), ciliumIdentity("2000"), ciliumIdentity("3000"),
 		ciliumEndpoint("app", "cep-1", 1000))
 	cs := fake.NewSimpleClientset(identityPod("app", "p-1", "2000"))
 	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor", cs: cs, dyn: dyn}
@@ -124,8 +105,7 @@ func TestCiliumIdentityAuditorDetectsOrphansBelowThreshold(t *testing.T) {
 
 // Clean cluster: every identity referenced -> no orphans.
 func TestCiliumIdentityAuditorCleanCluster(t *testing.T) {
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentity("1001"), ciliumIdentity("1002"),
+	dyn := testutil.NewDynamicClient(ciliumIdentity("1001"), ciliumIdentity("1002"),
 		ciliumEndpoint("a", "cep-1", 1001),
 		ciliumEndpoint("b", "cep-2", 1002))
 	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor", cs: fake.NewSimpleClientset(), dyn: dyn}
@@ -141,7 +121,7 @@ func TestCiliumIdentityAuditorOrphanThreshold(t *testing.T) {
 	for i := 0; i < ciliumOrphanMax+1; i++ {
 		objs = append(objs, ciliumIdentity(strconv.Itoa(5000+i)))
 	}
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds, objs...)
+	dyn := testutil.NewDynamicClient(objs...)
 	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor", cs: fake.NewSimpleClientset(), dyn: dyn}
 	before := testutil.QueueErrorCount(t, "cilium-identity-auditor")
 	if err := a.run(ctx); err != nil {
@@ -161,7 +141,7 @@ func TestCiliumIdentityAuditorOrphanThreshold(t *testing.T) {
 }
 
 func TestCiliumIdentityAuditorAPIError(t *testing.T) {
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds)
+	dyn := testutil.NewDynamicClient()
 	dyn.PrependReactor("list", "ciliumidentities",
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
@@ -179,7 +159,7 @@ func TestCiliumIdentityAuditorAPIError(t *testing.T) {
 // The endpoint list feeds the "used" set — its failure aborts rather
 // than flag every identity as orphaned on empty data.
 func TestCiliumIdentityAuditorEndpointListError(t *testing.T) {
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds, ciliumIdentity("100"))
+	dyn := testutil.NewDynamicClient(ciliumIdentity("100"))
 	dyn.PrependReactor("list", "ciliumendpoints",
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
@@ -192,8 +172,7 @@ func TestCiliumIdentityAuditorEndpointListError(t *testing.T) {
 
 // The pod annotation feed is also mandatory — same abort-on-empty rule.
 func TestCiliumIdentityAuditorPodListError(t *testing.T) {
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentity("100"), ciliumEndpoint("app", "cep-1", 100))
+	dyn := testutil.NewDynamicClient(ciliumIdentity("100"), ciliumEndpoint("app", "cep-1", 100))
 	cs := fake.NewSimpleClientset()
 	cs.PrependReactor("list", "pods",
 		func(clienttesting.Action) (bool, runtime.Object, error) {
@@ -209,10 +188,8 @@ func TestCiliumIdentityAuditorPodListError(t *testing.T) {
 // hand-built fixtures — anything else yields "".
 func TestEndpointIdentityID(t *testing.T) {
 	withID := func(v any) *unstructured.Unstructured {
-		o := &unstructured.Unstructured{Object: map[string]interface{}{
-			"apiVersion": "cilium.io/v2",
-			"kind":       "CiliumEndpoint",
-		}}
+		o := testutil.Unstructured(
+			ciliumEndpointGVR.GroupVersion().WithKind("CiliumEndpoint"), "", "", nil)
 		if v != nil {
 			_ = unstructured.SetNestedField(o.Object, v, "status", "identity", "id")
 		}
@@ -282,9 +259,8 @@ func identityExists(t *testing.T, dyn dynamic.Interface, name string) bool {
 // a too-young orphan are kept.
 func TestCiliumIdentityAuditorGCDeletesEligibleOrphan(t *testing.T) {
 	now := time.Now()
-	old := now.Add(-time.Hour) // past ciliumOrphanMinAge
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentityAged("5001", old),                     // eligible orphan
+	old := now.Add(-time.Hour)                                        // past ciliumOrphanMinAge
+	dyn := testutil.NewDynamicClient(ciliumIdentityAged("5001", old), // eligible orphan
 		ciliumIdentityAged("5002", old),                     // used — kept
 		ciliumIdentityAged("5003", now.Add(-5*time.Minute)), // orphan but too young
 		ciliumEndpoint("app", "cep-1", 5002))
@@ -315,8 +291,7 @@ func TestCiliumIdentityAuditorGCDeletesEligibleOrphan(t *testing.T) {
 // the SECOND sweep past the grace period collects it.
 func TestCiliumIdentityAuditorGCGracePeriod(t *testing.T) {
 	now := time.Now()
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentityAged("7001", now.Add(-time.Hour)))
+	dyn := testutil.NewDynamicClient(ciliumIdentityAged("7001", now.Add(-time.Hour)))
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
 
@@ -345,8 +320,7 @@ func TestCiliumIdentityAuditorGCGracePeriod(t *testing.T) {
 // still hold identities the API cannot see.
 func TestCiliumIdentityAuditorGCAbortsOnNotReadyNode(t *testing.T) {
 	now := time.Now()
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentityAged("8001", now.Add(-time.Hour)))
+	dyn := testutil.NewDynamicClient(ciliumIdentityAged("8001", now.Add(-time.Hour)))
 	cs := fake.NewSimpleClientset(readyNode("n1"), notReadyNode("n2"))
 	a := newGCAuditor(cs, dyn, now)
 	a.orphanFirstSeen.Observe("8001", now.Add(-time.Hour))
@@ -363,8 +337,7 @@ func TestCiliumIdentityAuditorGCAbortsOnNotReadyNode(t *testing.T) {
 // "all Ready" check must not vacuously pass on an empty list.
 func TestCiliumIdentityAuditorGCAbortsOnZeroNodes(t *testing.T) {
 	now := time.Now()
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentityAged("8002", now.Add(-time.Hour)))
+	dyn := testutil.NewDynamicClient(ciliumIdentityAged("8002", now.Add(-time.Hour)))
 	a := newGCAuditor(fake.NewSimpleClientset(), dyn, now)
 	a.orphanFirstSeen.Observe("8002", now.Add(-time.Hour))
 
@@ -380,8 +353,7 @@ func TestCiliumIdentityAuditorGCAbortsOnZeroNodes(t *testing.T) {
 // orphan on a healthy cluster is never deleted.
 func TestCiliumIdentityAuditorGCDisabledNeverDeletes(t *testing.T) {
 	now := time.Now()
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentityAged("9001", now.Add(-time.Hour)))
+	dyn := testutil.NewDynamicClient(ciliumIdentityAged("9001", now.Add(-time.Hour)))
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
 	a.gcEnabled = false
@@ -409,7 +381,7 @@ func TestCiliumIdentityAuditorGCMaxDeleteCap(t *testing.T) {
 		name := strconv.Itoa(20000 + i)
 		objs = append(objs, ciliumIdentityAged(name, old))
 	}
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds, objs...)
+	dyn := testutil.NewDynamicClient(objs...)
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
 	for i := 0; i < ciliumGCMaxDelete+10; i++ {
@@ -440,7 +412,7 @@ func TestCiliumIdentityAuditorGCDeleteUIDPrecondition(t *testing.T) {
 	now := time.Now()
 	orphan := ciliumIdentityAged("5001", now.Add(-time.Hour))
 	orphan.SetUID("uid-5001")
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds, orphan)
+	dyn := testutil.NewDynamicClient(orphan)
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
 	a.orphanFirstSeen.Observe("5001", now.Add(-time.Hour))
@@ -470,8 +442,7 @@ func TestCiliumIdentityAuditorGCDeleteUIDPrecondition(t *testing.T) {
 // IncError'd, and the run still succeeds.
 func TestCiliumIdentityAuditorGCConflictSkipsDelete(t *testing.T) {
 	now := time.Now()
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentityAged("5002", now.Add(-time.Hour)))
+	dyn := testutil.NewDynamicClient(ciliumIdentityAged("5002", now.Add(-time.Hour)))
 	dyn.PrependReactor("delete", "ciliumidentities",
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewConflict(
@@ -501,8 +472,7 @@ func TestCiliumIdentityAuditorGCConflictSkipsDelete(t *testing.T) {
 func TestCiliumIdentityAuditorGCPrunesOrphanLedger(t *testing.T) {
 	now := time.Now()
 	old := now.Add(-time.Hour)
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentityAged("6001", old)) // orphan — tracked
+	dyn := testutil.NewDynamicClient(ciliumIdentityAged("6001", old)) // orphan — tracked
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
 	// Seed stale entries: one for an identity that will reappear
@@ -539,8 +509,7 @@ func TestCiliumIdentityAuditorSkipsReservedIdentities(t *testing.T) {
 	old := now.Add(-time.Hour)
 	labeled := ciliumIdentityAged("30000", old)
 	labeled.SetLabels(map[string]string{"reserved:host": ""})
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentityAged("1", old),    // reserved range — host
+	dyn := testutil.NewDynamicClient(ciliumIdentityAged("1", old), // reserved range — host
 		ciliumIdentityAged("255", old),  // top of the reserved range
 		labeled,                         // reserved: label — exempt too
 		ciliumIdentityAged("4000", old)) // ordinary orphan — collectible
@@ -573,8 +542,7 @@ func TestCiliumIdentityAuditorSkipsReservedIdentities(t *testing.T) {
 func TestCiliumIdentityAuditorCESCountsAsUsed(t *testing.T) {
 	now := time.Now()
 	old := now.Add(-time.Hour)
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentityAged("4001", old),
+	dyn := testutil.NewDynamicClient(ciliumIdentityAged("4001", old),
 		ciliumEndpointSlice("app", "ces-1", 4001))
 	cs := fake.NewSimpleClientset(readyNode("n1"))
 	a := newGCAuditor(cs, dyn, now)
@@ -596,8 +564,7 @@ func TestCiliumIdentityAuditorCESCountsAsUsed(t *testing.T) {
 func TestCiliumIdentityAuditorCESListErrorFailsClosed(t *testing.T) {
 	now := time.Now()
 	old := now.Add(-time.Hour)
-	dyn := testutil.NewFakeDyn(ciliumAuditListKinds,
-		ciliumIdentityAged("4002", old))
+	dyn := testutil.NewDynamicClient(ciliumIdentityAged("4002", old))
 	dyn.PrependReactor("list", "ciliumendpointslices",
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("ces list boom")

@@ -15,21 +15,20 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // cepObj builds a CiliumEndpoint CR for pod ns/name with the given
 // identity id (0 leaves identity.id absent).
 func cepObj(ns, name string, identityID int64) *unstructured.Unstructured {
-	obj := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "cilium.io/v2",
-		"kind":       "CiliumEndpoint",
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-		"status": map[string]any{
+	obj := testutil.Unstructured(
+		kube.GVRCiliumEndpoint.GroupVersion().WithKind("CiliumEndpoint"), ns, name,
+		map[string]any{"status": map[string]any{
 			"networking": map[string]any{
 				"addressing": []any{map[string]any{"ipv4": "10.0.0.9"}},
 			},
-		},
-	}}
+		}})
 	if identityID > 0 {
 		_ = unstructured.SetNestedField(obj.Object, identityID,
 			"status", "identity", "id")

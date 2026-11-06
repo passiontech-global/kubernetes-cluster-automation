@@ -13,10 +13,12 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // olmHealthCheck is the W7-C5 OLM CSV / webhook cert / subscription
@@ -89,6 +91,30 @@ var (
 	olmCSVGVR = kube.GVROLMClusterServiceVersion
 	olmSubGVR = kube.GVROLMSubscription
 )
+
+var (
+	// W7-C5 — the OLM-unhealthy signal: 1 while the CSV/Subscription
+	// reports an unhealthy phase/condition past the audit threshold.
+	// kind is ClusterServiceVersion | Subscription.
+	olmUnhealthyResourcesGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_olm_unhealthy_resources",
+		Help: "1 while the OLM resource reports an unhealthy phase/condition past the audit threshold.",
+	}, []string{"kind", "namespace", "name", "reason"})
+
+	// W7-C5 — olm-operator pods deleted to unstick wedged CSV/cert-
+	// rotation reconciliation, by detected reason. Counts delivered
+	// heals only.
+	olmOperatorHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "node_automation_olm_operator_heals_total",
+		Help: "olm-operator pods deleted to unstick wedged CSV/cert-rotation reconciliation, by detected reason.",
+	}, []string{"reason"})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		olmUnhealthyResourcesGauge,
+		olmOperatorHealsTotal)
+}
 
 // checkOLMHealth audits the OLM control plane's two user-visible
 // surfaces — ClusterServiceVersions and Subscriptions. Unlike
@@ -184,7 +210,7 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		emitted[k] = true
-		p.olmEmitted.Set(metrics.OLMUnhealthyResources, 1, k, lv...)
+		p.olmEmitted.Set(olmUnhealthyResourcesGauge, 1, k, lv...)
 		// The heal is CSV-scoped: a subscription failure is the
 		// catalog's problem, not olm-operator's queue. Seen reads
 		// the same streak — never re-stamps.
@@ -194,7 +220,7 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 	}
-	p.olmEmitted.Prune(metrics.OLMUnhealthyResources.DeleteLabelValues)
+	p.olmEmitted.Prune(olmUnhealthyResourcesGauge.DeleteLabelValues)
 
 	if len(healReasons) > 0 {
 		reasons := make([]string, 0, len(healReasons))
@@ -266,6 +292,6 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 		return
 	}
 	for _, r := range reasons {
-		metrics.OLMOperatorHealsTotal.WithLabelValues(r).Inc()
+		olmOperatorHealsTotal.WithLabelValues(r).Inc()
 	}
 }

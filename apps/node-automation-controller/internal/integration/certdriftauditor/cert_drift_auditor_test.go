@@ -18,7 +18,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -32,20 +31,12 @@ import (
 // Builders
 // ---------------------------------------------------------------------------
 
-var cdaListKinds = map[schema.GroupVersionResource]string{
-	certificateGVR: "CertificateList",
-}
-
 // cdaCertificate builds an unstructured cert-manager Certificate; an
 // empty secretName leaves spec.secretName absent (name-convention
 // fallback path).
 func cdaCertificate(ns, name, secretName string) *unstructured.Unstructured {
-	o := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "cert-manager.io/v1",
-		"kind":       "Certificate",
-	}}
-	o.SetNamespace(ns)
-	o.SetName(name)
+	o := testutil.Unstructured(
+		certificateGVR.GroupVersion().WithKind("Certificate"), ns, name, nil)
 	if secretName != "" {
 		_ = unstructured.SetNestedField(o.Object, secretName, "spec", "secretName")
 	}
@@ -160,7 +151,7 @@ func TestCertDriftAuditorWebhookInjectSecret(t *testing.T) {
 			mutHook("hook-ok.example.com", caBundleA),
 			mutHook("hook-stale.example.com", caBundleB),
 		))
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -181,8 +172,7 @@ func TestCertDriftAuditorWebhookInjectFromCertificate(t *testing.T) {
 		validatingCfg("vwc", map[string]string{
 			injectCAFromAnno: "cert-ns/my-cert",
 		}, valHook("hook.example.com", caBundleB)))
-	dyn := testutil.NewFakeDyn(cdaListKinds,
-		cdaCertificate("cert-ns", "my-cert", "real-secret"))
+	dyn := testutil.NewDynamicClient(cdaCertificate("cert-ns", "my-cert", "real-secret"))
 	a := newCertDriftAuditor(cs, dyn, time.Now())
 
 	if err := a.run(ctx); err != nil {
@@ -201,7 +191,7 @@ func TestCertDriftAuditorInjectFromSecretNameFallback(t *testing.T) {
 		validatingCfg("vwc", map[string]string{
 			injectCAFromAnno: "cert-ns/my-cert",
 		}, valHook("hook.example.com", caBundleA)))
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -217,7 +207,7 @@ func TestCertDriftAuditorInjectFromSecretNameFallback(t *testing.T) {
 func TestCertDriftAuditorUnannotatedConfigSkipped(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		mutatingCfg("plain-mwc", nil, mutHook("hook.example.com", caBundleA)))
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +226,7 @@ func TestCertDriftAuditorUnresolvedSourceKeepsSeries(t *testing.T) {
 		mutatingCfg("mwc", map[string]string{
 			injectCAFromSecretAnno: "cert-ns/ca-secret",
 		}, mutHook("hook.example.com", caBundleB)))
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -273,8 +263,7 @@ func TestCertDriftAuditorCertGetErrorCarriesSeries(t *testing.T) {
 		mutatingCfg("mwc", map[string]string{
 			injectCAFromAnno: "cert-ns/my-cert",
 		}, mutHook("hook.example.com", caBundleB)))
-	dyn := testutil.NewFakeDyn(cdaListKinds,
-		cdaCertificate("cert-ns", "my-cert", "real-secret"))
+	dyn := testutil.NewDynamicClient(cdaCertificate("cert-ns", "my-cert", "real-secret"))
 	a := newCertDriftAuditor(cs, dyn, time.Now())
 
 	if err := a.run(ctx); err != nil {
@@ -305,7 +294,7 @@ func TestCertDriftAuditorPrunesDroppedAnnotation(t *testing.T) {
 	}, mutHook("hook.example.com", caBundleB))
 	cs := fake.NewSimpleClientset(
 		caSecret("cert-ns", "ca-secret", "ca.crt", caBundleA), cfg)
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +329,7 @@ func TestCertDriftAuditorWebhookListError(t *testing.T) {
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), fixedNow)
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
 
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when the webhook config list fails")
@@ -367,7 +356,7 @@ func TestCertDriftAuditorTLSExpiry(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "opaque"},
 			Type:       corev1.SecretTypeOpaque,
 		})
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), fixedNow)
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -396,7 +385,7 @@ func TestCertDriftAuditorTLSUnparseableSkipped(t *testing.T) {
 			Data:       map[string][]byte{"tls.crt": []byte("not-a-pem")},
 		},
 		tlsSecret(t, "app", "tls-ok", fixedNow.Add(5*24*time.Hour)))
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), fixedNow)
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -416,7 +405,7 @@ func TestCertDriftAuditorTLSPrunesDeletedSecret(t *testing.T) {
 	fixedNow := time.Now().Truncate(time.Second) // x509 serializes cert times at second precision
 	s := tlsSecret(t, "app", "tls-temp", fixedNow.Add(10*24*time.Hour))
 	cs := fake.NewSimpleClientset(s)
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), fixedNow)
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -445,7 +434,7 @@ func TestCertDriftAuditorTLSListError(t *testing.T) {
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
 
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when the tls secret list fails")
@@ -515,7 +504,7 @@ func TestCertDriftAuditorWebhookBundleExpiry(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		mutatingCfg("unannotated-mwc", nil, mutHook("hook-a.example.com", oldest)),
 		validatingCfg("unannotated-vwc", nil, valHook("hook-b.example.com", bundle)))
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), fixedNow)
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -542,7 +531,7 @@ func TestCertDriftAuditorWebhookEmptyBundleFailClosed(t *testing.T) {
 			mutHookSvc("ignore.example.com", nil, &ignore),
 			mutHook("url.example.com", nil), // url clientConfig — no service
 		))
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -589,7 +578,7 @@ func TestCertDriftAuditorTrustBundles(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "s"},
 			Data:       map[string][]byte{"ca.crt": makeCertPEM(t, fixedNow.Add(9*24*time.Hour))},
 		})
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), fixedNow)
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -642,7 +631,7 @@ func TestReplicatedDriftLatchesAfterTwoScans(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		replicatedSecret("sec", "tls-src", "", "CRT-v2"),
 		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-v1"))
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -668,7 +657,7 @@ func TestReplicatedDriftClearsOnResync(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		replicatedSecret("sec", "tls-src", "", "CRT-v1"),
 		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-old"))
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -709,7 +698,7 @@ func TestReplicatedDriftOpaqueSourceFallback(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(src,
 		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-v1"))
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -726,7 +715,7 @@ func TestReplicatedDriftOpaqueSourceFallback(t *testing.T) {
 func TestReplicatedDriftMissingSourceQuiet(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-v1"))
-	a := newCertDriftAuditor(cs, testutil.NewFakeDyn(cdaListKinds), time.Now())
+	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}

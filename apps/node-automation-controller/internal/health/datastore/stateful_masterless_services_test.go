@@ -16,7 +16,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -90,10 +89,10 @@ func dragonflyRolePod(ns, name, role string, ready bool) *corev1.Pod {
 // 4m ago, both pods Ready with role=replica → ordinal-0 deleted,
 // counter bumped, stamp persisted on the STS.
 func TestDeadlockDeletesLowestOrdinal(t *testing.T) {
-	metrics.DragonflyMasterlessPodHealsTotal.DeleteLabelValues("db", "dragonfly")
+	dragonflyMasterlessPodHealsTotal.DeleteLabelValues("db", "dragonfly")
 	t.Cleanup(func() {
-		metrics.DragonflyMasterlessPodHealsTotal.DeleteLabelValues("db", "dragonfly")
-		metrics.StatefulServiceZeroEndpoints.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
+		dragonflyMasterlessPodHealsTotal.DeleteLabelValues("db", "dragonfly")
+		statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
 	})
 	base := time.Now()
 	sts := shSTS("db", "dragonfly", 2,

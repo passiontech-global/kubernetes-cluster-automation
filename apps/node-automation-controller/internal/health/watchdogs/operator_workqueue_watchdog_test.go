@@ -14,8 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
-
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -96,9 +94,9 @@ func TestOperatorStuckPredicateShapes(t *testing.T) {
 // Lease while a GitRepository sits unreconciled past the window →
 // frozen gauge + leader pod deleted.
 func TestCheckOperatorWorkqueuesSourceControllerHeals(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("source-controller", kcmReasonStaleGen)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("source-controller", kcmReasonStaleGen)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("source-controller", kcmReasonStaleGen)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("source-controller", kcmReasonStaleGen)
 	})
 	base := time.Now()
 	leader := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
@@ -132,9 +130,9 @@ func TestCheckOperatorWorkqueuesSourceControllerHeals(t *testing.T) {
 // A cert-manager Certificate never reconciled (no status.conditions)
 // freezes under the no_status_conditions reason.
 func TestCheckOperatorWorkqueuesCertManagerNoConditions(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cert-manager", opReasonNoConditions)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("cert-manager", opReasonNoConditions)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cert-manager", opReasonNoConditions)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("cert-manager", opReasonNoConditions)
 	})
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
@@ -161,9 +159,9 @@ func TestCheckOperatorWorkqueuesCertManagerNoConditions(t *testing.T) {
 // this exercises the operator.shipwright.io GVR row end-to-end so the
 // shOpDyn registration cannot silently drift from production again.
 func TestCheckOperatorWorkqueuesShipwrightOperatorNoConditions(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("shipwright-operator", opReasonNoConditions)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("shipwright-operator", opReasonNoConditions)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("shipwright-operator", opReasonNoConditions)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("shipwright-operator", opReasonNoConditions)
 	})
 	base := time.Now()
 	cs := fake.NewSimpleClientset(

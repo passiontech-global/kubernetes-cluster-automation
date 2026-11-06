@@ -30,11 +30,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -102,23 +100,13 @@ func putGateway(t *testing.T, dyn dynamic.Interface, o *unstructured.Unstructure
 	}
 }
 
-// gatewayDynKinds are the list-kind registrations the ownership
-// tests need: the four gateway.networking.k8s.io/v1 GVRs (including
-// gatewayclasses, which shOpDyn deliberately omits) plus the autopilot
-// Plan the maintenance mutex reads if a heal ever fires.
-func gatewayDynKinds() map[schema.GroupVersionResource]string {
-	return map[schema.GroupVersionResource]string{
-		kube.GVRGatewayClass:  "GatewayClassList",
-		kube.GVRGateway:       "GatewayList",
-		kube.GVRHTTPRoute:     "HTTPRouteList",
-		kube.GVRGRPCRoute:     "GRPCRouteList",
-		kube.AutopilotPlanGVR: "PlanList",
-	}
-}
-
+// newGatewayClassAwareProber builds a prober whose dyn fake knows the
+// four gateway.networking.k8s.io/v1 GVRs (including gatewayclasses)
+// plus the autopilot Plan the maintenance mutex reads if a heal ever
+// fires — all covered by testutil.NewDynamicClient's table.
 func newGatewayClassAwareProber(objs ...runtime.Object) *probetest.Prober {
 	return testProberDyn(fake.NewSimpleClientset(),
-		testutil.NewFakeDyn(gatewayDynKinds(), objs...))
+		testutil.NewDynamicClient(objs...))
 }
 
 // ---------------------------------------------------------------------------
@@ -515,7 +503,7 @@ func TestGatewayClassControllerCache(t *testing.T) {
 	base := time.Now()
 	p := newGatewayClassAwareProber(
 		gwClassFixture("cilium", ciliumGatewayController))
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 
 	ctlr, ok := probetest.MustCheck[*operatorWorkqueueCheck](t, p).gatewayClassController(ctx, "cilium")
 	if !ok || ctlr != ciliumGatewayController {
@@ -547,9 +535,9 @@ func TestGatewayClassControllerCache(t *testing.T) {
 // no gauge, and — most importantly — a heal would never bounce
 // cilium's leader over someone else's queue.
 func TestCheckOperatorWorkqueuesForeignGatewaySkipped(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
 	})
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
@@ -558,12 +546,11 @@ func TestCheckOperatorWorkqueuesForeignGatewaySkipped(t *testing.T) {
 	// Route is stuck (no status.parents) but provably foreign-owned.
 	route := routeFixture("apps", "r-foreign", 1,
 		[]any{map[string]any{"name": "gw-foreign"}})
-	dyn := testutil.NewFakeDyn(gatewayDynKinds(),
-		route,
+	dyn := testutil.NewDynamicClient(route,
 		gwClassFixture("cilium", ciliumGatewayController),
 		gwClassFixture("cloudflare-tunnel", foreignGatewayController))
 	p := testProberDyn(cs, dyn)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 	putGateway(t, p.Dyn, gwFixture("apps", "gw-foreign", "cloudflare-tunnel", 1))
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
@@ -578,9 +565,9 @@ func TestCheckOperatorWorkqueuesForeignGatewaySkipped(t *testing.T) {
 // IS tracked — first-seen lands under the
 // "cilium-operator/httproutes/<ns>/<name>" signature key.
 func TestCheckOperatorWorkqueuesCiliumGatewayTracked(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
 	})
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
@@ -588,12 +575,11 @@ func TestCheckOperatorWorkqueuesCiliumGatewayTracked(t *testing.T) {
 			"cilium-operator-aa_uid", 2*time.Second, base))
 	route := routeFixture("apps", "r-cilium", 1,
 		[]any{map[string]any{"name": "gw-cilium"}})
-	dyn := testutil.NewFakeDyn(gatewayDynKinds(),
-		route,
+	dyn := testutil.NewDynamicClient(route,
 		gwClassFixture("cilium", ciliumGatewayController),
 		gwClassFixture("cloudflare-tunnel", foreignGatewayController))
 	p := testProberDyn(cs, dyn)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 	putGateway(t, p.Dyn, gwFixture("apps", "gw-cilium", "cilium", 1))
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
@@ -616,20 +602,19 @@ func TestCheckOperatorWorkqueuesCiliumGatewayTracked(t *testing.T) {
 // enter the stuck set: proven foreign ownership applies to the class
 // kind exactly as it does to Gateways and routes.
 func TestCheckOperatorWorkqueuesGatewayClassOwnership(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
 	})
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("kube-system", "cilium-operator-resource-lock",
 			"cilium-operator-aa_uid", 2*time.Second, base))
-	dyn := testutil.NewFakeDyn(gatewayDynKinds(),
-		// Never accepted (no status.conditions) — stuck by signature.
+	dyn := testutil.NewDynamicClient( // Never accepted (no status.conditions) — stuck by signature.
 		gwClassFixtureBare("cilium", ciliumGatewayController, 1),
 		gwClassFixtureBare("cloudflare-tunnel", foreignGatewayController, 1))
 	p := testProberDyn(cs, dyn)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
@@ -651,9 +636,9 @@ func TestCheckOperatorWorkqueuesGatewayClassOwnership(t *testing.T) {
 // check and lifts the stale_gateway_status gauge — the real signal
 // the signature exists for.
 func TestCheckOperatorWorkqueuesGatewayClassStaleFreezes(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
 	})
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
@@ -663,9 +648,9 @@ func TestCheckOperatorWorkqueuesGatewayClassStaleFreezes(t *testing.T) {
 	_ = unstructured.SetNestedSlice(stale.Object, []any{map[string]any{
 		"type": "Accepted", "status": "True", "observedGeneration": int64(4)}},
 		"status", "conditions")
-	dyn := testutil.NewFakeDyn(gatewayDynKinds(), stale)
+	dyn := testutil.NewDynamicClient(stale)
 	p := testProberDyn(cs, dyn)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("cilium-operator/gatewayclasses//cilium", base.Add(-time.Hour))
 
@@ -680,18 +665,17 @@ func TestCheckOperatorWorkqueuesGatewayClassStaleFreezes(t *testing.T) {
 // The healthy mirror: a class Accepted at its current generation is
 // not even tracked — no first-seen, no gauge.
 func TestCheckOperatorWorkqueuesGatewayClassHealthyQuiet(t *testing.T) {
-	metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
 	t.Cleanup(func() {
-		metrics.OperatorWorkqueueFrozen.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("cilium-operator", opReasonStaleGWStatus)
 	})
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		shLease("kube-system", "cilium-operator-resource-lock",
 			"cilium-operator-aa_uid", 2*time.Second, base))
-	dyn := testutil.NewFakeDyn(gatewayDynKinds(),
-		gwClassFixture("cilium", ciliumGatewayController))
+	dyn := testutil.NewDynamicClient(gwClassFixture("cilium", ciliumGatewayController))
 	p := testProberDyn(cs, dyn)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("healthy accepted class must keep the check quiet: %+v", res)

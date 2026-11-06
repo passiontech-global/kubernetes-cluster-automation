@@ -5,6 +5,7 @@ package datastore
 
 import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	"testing"
 	"time"
 
@@ -13,10 +14,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
-
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -26,11 +26,8 @@ import (
 // olmUnstructured builds an OLM object with the fields the check
 // reads, supplied by the caller as nested status fields.
 func olmUnstructured(apiVersion, kind, ns, name string, status map[string]any) *unstructured.Unstructured {
-	obj := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": apiVersion,
-		"kind":       kind,
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-	}}
+	obj := testutil.Unstructured(
+		schema.FromAPIVersionAndKind(apiVersion, kind), ns, name, nil)
 	for k, v := range status {
 		_ = unstructured.SetNestedField(obj.Object, v, "status", k)
 	}
@@ -59,12 +56,12 @@ func TestCheckOLMHealthAbsentCRDsQuiet(t *testing.T) {
 // A CSV stuck off Succeeded past 15m fires the gauge; past 20m the
 // olm-operator leader gets bounced to force re-reconciliation.
 func TestCheckOLMHealthStuckCSVHeals(t *testing.T) {
-	metrics.OLMUnhealthyResources.DeleteLabelValues(
+	olmUnhealthyResourcesGauge.DeleteLabelValues(
 		olmKindCSV, "operators", "rabbitmq.v1.2.3", olmReasonCSVStuck)
 	t.Cleanup(func() {
-		metrics.OLMUnhealthyResources.DeleteLabelValues(
+		olmUnhealthyResourcesGauge.DeleteLabelValues(
 			olmKindCSV, "operators", "rabbitmq.v1.2.3", olmReasonCSVStuck)
-		metrics.OLMOperatorHealsTotal.DeleteLabelValues(olmReasonCSVStuck)
+		olmOperatorHealsTotal.DeleteLabelValues(olmReasonCSVStuck)
 	})
 	base := time.Now()
 	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
@@ -114,7 +111,7 @@ func TestCheckOLMHealthStuckCSVHeals(t *testing.T) {
 // CSV-scoped path.
 func TestCheckOLMHealthUnhealthySubscription(t *testing.T) {
 	t.Cleanup(func() {
-		metrics.OLMUnhealthyResources.DeleteLabelValues(
+		olmUnhealthyResourcesGauge.DeleteLabelValues(
 			olmKindSubscription, "operators", "keda", olmReasonCatalogUnhealthy)
 	})
 	base := time.Now()
@@ -145,9 +142,9 @@ func TestCheckOLMHealthUnhealthySubscription(t *testing.T) {
 // webhook certs OLM owes the operand never landed.
 func TestCheckOLMHealthCertRotationOverdue(t *testing.T) {
 	t.Cleanup(func() {
-		metrics.OLMUnhealthyResources.DeleteLabelValues(
+		olmUnhealthyResourcesGauge.DeleteLabelValues(
 			olmKindCSV, "operators", "nhc.v1", olmReasonCertOverdue)
-		metrics.OLMOperatorHealsTotal.DeleteLabelValues(olmReasonCertOverdue)
+		olmOperatorHealsTotal.DeleteLabelValues(olmReasonCertOverdue)
 	})
 	base := time.Now()
 	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{

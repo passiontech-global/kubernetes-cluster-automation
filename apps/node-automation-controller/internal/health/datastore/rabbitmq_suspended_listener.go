@@ -12,9 +12,11 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // rabbitMQSuspendedCheck is the W6.4 suspended-listener healer.
@@ -51,6 +53,22 @@ const (
 	rabbitSuspendedMinAge      = 10 * time.Minute
 	rabbitHealCooldown         = 30 * time.Minute
 )
+
+var (
+	// W6.4 — RabbitMQ pods deleted while running with a suspended
+	// listener (started but never Ready). Counts delivered heals
+	// only — the counter increments after a quorum-safe delete
+	// landed.
+	rabbitMQSuspendedHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "node_automation_rabbitmq_suspended_heals_total",
+		Help: "RabbitMQ pods deleted while running with a suspended listener (started but never Ready).",
+	}, []string{"namespace", "pod"})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		rabbitMQSuspendedHealsTotal)
+}
 
 // ---------------------------------------------------------------------------
 // rabbitmq-suspended-listener (W6.4) — suspended listener healer.
@@ -130,7 +148,7 @@ func (p *rabbitMQSuspendedCheck) rabbitQuorumSafe(ctx context.Context, pod *core
 // partitioned from its own cluster while holding a peer slot. Stuck
 // >=10m AND all other replicas Ready (quorum survives) → delete the
 // pod so the StatefulSet controller brings up a clean replica; the
-// RabbitMQSuspendedHealsTotal counter records each heal.
+// rabbitMQSuspendedHealsTotal counter records each heal.
 func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
@@ -191,7 +209,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(err, "suspended rabbitmq pod delete failed", "pod", key)
 			continue
 		}
-		metrics.RabbitMQSuspendedHealsTotal.
+		rabbitMQSuspendedHealsTotal.
 			WithLabelValues(pod.Namespace, pod.Name).Inc()
 		log.Info("DELETE: suspended-listener rabbitmq pod — quorum verified",
 			"pod", key)

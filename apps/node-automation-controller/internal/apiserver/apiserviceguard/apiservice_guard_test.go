@@ -10,14 +10,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -28,11 +26,8 @@ import (
 // asgObj builds an APIService unstructured — svcNs/svcName "" renders
 // no spec.service at all (the local, non-Service-backed shape).
 func asgObj(name, svcNs, svcName string) *unstructured.Unstructured {
-	u := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "apiregistration.k8s.io/v1",
-		"kind":       "APIService",
-		"metadata":   map[string]any{"name": name},
-	}}
+	u := testutil.Unstructured(
+		apiServiceGVR.GroupVersion().WithKind("APIService"), "", name, nil)
 	if svcNs != "" && svcName != "" {
 		u.Object["spec"] = map[string]any{
 			"service": map[string]any{"namespace": svcNs, "name": svcName},
@@ -58,13 +53,7 @@ func asgUnavailable(u *unstructured.Unstructured, age time.Duration) {
 // Plans through the same dyn client, and the fake panics on a List
 // whose list kind is not registered.
 func asgDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{
-			apiServiceGVR:         "APIServiceList",
-			kube.AutopilotPlanGVR: "PlanList",
-		},
-		objs...)
+	return testutil.NewDynamicClient(objs...)
 }
 
 func asgExists(t *testing.T, dyn *dynamicfake.FakeDynamicClient, name string) bool {

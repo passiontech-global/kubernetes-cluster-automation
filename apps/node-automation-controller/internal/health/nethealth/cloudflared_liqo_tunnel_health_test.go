@@ -19,6 +19,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -87,22 +88,21 @@ func TestCloudflaredHealthyHAConnectionsPass(t *testing.T) {
 // liqoConnection builds a networking.liqo.io Connection whose
 // Connected condition transitioned to the given status `age` ago.
 func liqoConnection(ns, name, status string, age time.Duration) *unstructured.Unstructured {
-	obj := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "networking.liqo.io/v1beta1",
-		"kind":       "Connection",
-		"metadata": map[string]any{
-			"namespace": ns, "name": name,
-			"labels": map[string]any{
-				"networking.liqo.io/remote-cluster-id": "peer-b"},
-		},
-		"status": map[string]any{
-			"conditions": []any{map[string]any{
-				"type":   "Connected",
-				"status": status,
-				"lastTransitionTime": time.Now().
-					Add(-age).UTC().Format(time.RFC3339)}},
-		},
-	}}
+	obj := testutil.Unstructured(
+		kube.GVRLiqoConnection.GroupVersion().WithKind("Connection"), ns, name,
+		map[string]any{
+			"metadata": map[string]any{
+				"namespace": ns, "name": name,
+				"labels": map[string]any{
+					"networking.liqo.io/remote-cluster-id": "peer-b"},
+			},
+			"status": map[string]any{
+				"conditions": []any{map[string]any{
+					"type":   "Connected",
+					"status": status,
+					"lastTransitionTime": time.Now().
+						Add(-age).UTC().Format(time.RFC3339)}},
+			}})
 	return obj
 }
 
