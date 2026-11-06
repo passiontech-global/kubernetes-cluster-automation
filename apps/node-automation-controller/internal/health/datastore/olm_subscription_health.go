@@ -3,22 +3,23 @@ package datastore
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // olmHealthCheck is the W7-C5 OLM CSV / webhook cert / subscription
@@ -198,7 +199,7 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	emitted := map[string]bool{}     // keys past the gauge window
+	var rep probefw.SweepReport
 	healReasons := map[string]bool{} // reasons past the heal window (CSV only)
 	p.olmFirstSeen.Prune(func(k string) bool {
 		_, ok := live[k]
@@ -209,8 +210,7 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 			olmUnhealthyMinAge, log) {
 			continue
 		}
-		emitted[k] = true
-		p.olmEmitted.Set(olmUnhealthyResourcesGauge, 1, k, lv...)
+		rep.Emit(olmUnhealthyResourcesGauge, k, lv, k)
 		// The heal is CSV-scoped: a subscription failure is the
 		// catalog's problem, not olm-operator's queue. Seen reads
 		// the same streak — never re-stamps.
@@ -220,7 +220,7 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 	}
-	p.olmEmitted.Prune(olmUnhealthyResourcesGauge.DeleteLabelValues)
+	rep.Close(&p.olmEmitted, olmUnhealthyResourcesGauge.DeleteLabelValues)
 
 	if len(healReasons) > 0 {
 		reasons := make([]string, 0, len(healReasons))
@@ -231,17 +231,8 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 		p.healOLMOperator(ctx, log, reasons, now)
 	}
 
-	if len(emitted) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	keys := make([]string, 0, len(emitted))
-	for k := range emitted {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return probefw.Result{Why: fmt.Sprintf(
-		"olm resources unhealthy >=%s: %s",
-		olmUnhealthyMinAge, strings.Join(keys, ", "))}
+	return rep.Verdict(fmt.Sprintf(
+		"olm resources unhealthy >=%s: ", olmUnhealthyMinAge), ", ")
 }
 
 // healOLMOperator deletes the olm-operator pod(s) — a wedged

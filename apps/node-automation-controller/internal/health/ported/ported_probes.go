@@ -3,7 +3,6 @@ package ported
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"io"
 	"net/http"
 	"strings"
@@ -11,6 +10,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 )
 
 // Check names — the exact HealthCheck metadata.name values the

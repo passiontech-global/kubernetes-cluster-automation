@@ -1,8 +1,9 @@
 package shared
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // envx warnings belong in the controller-runtime log stream, not on

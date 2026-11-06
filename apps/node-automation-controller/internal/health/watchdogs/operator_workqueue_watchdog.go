@@ -3,13 +3,10 @@ package watchdogs
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/prometheus/client_golang/prometheus"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -20,6 +17,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // operatorWorkqueueCheck is the W5.8 lease-holding zombie detector
@@ -120,17 +121,14 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 	}
 	now := p.Now()
 
-	frozen := map[string]string{} // "operator/reason" → reason, for the why line
-	var firstErr error
+	var rep probefw.SweepReport
 	for _, op := range operatorTargets {
 		lease, lerr := p.operatorLease(ctx, op)
 		switch {
 		case lerr != nil:
-			if firstErr == nil {
-				firstErr = lerr
-			}
+			rep.InfraErr(lerr)
 			// Never evaluated — carry the held tuples forward.
-			p.carryFrozen(op.name)
+			p.carryFrozen(&rep, op.name)
 			continue
 		case lease == nil && op.leaseOptional:
 			// No candidate Lease by design (replicas:1 or
@@ -142,12 +140,10 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 			alive, aerr := p.operatorPodRunning(ctx, op)
 			switch {
 			case aerr != nil:
-				if firstErr == nil {
-					firstErr = fmt.Errorf("list pods %s selector %q (%s): %w",
-						targetPodNS(op), op.podSelector, op.name, aerr)
-				}
+				rep.InfraErr(fmt.Errorf("list pods %s selector %q (%s): %w",
+					targetPodNS(op), op.podSelector, op.name, aerr))
 				// Never evaluated — carry the held tuples forward.
-				p.carryFrozen(op.name)
+				p.carryFrozen(&rep, op.name)
 				continue
 			case !alive:
 				p.resetOperator(op.name)
@@ -185,10 +181,8 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 					list = lists[res.gvr]
 				case err != nil:
 					evalFailed = true
-					if firstErr == nil {
-						firstErr = fmt.Errorf("list %s (%s): %w",
-							res.gvr.Resource, op.name, err)
-					}
+					rep.InfraErr(fmt.Errorf("list %s (%s): %w",
+						res.gvr.Resource, op.name, err))
 					lists[res.gvr] = &unstructured.UnstructuredList{}
 					list = lists[res.gvr]
 				default:
@@ -221,7 +215,7 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 			// clear held series — carry this operator's held tuples
 			// forward so the sweep-end prune keeps them (they were
 			// never re-evaluated, not proven resolved).
-			p.carryFrozen(op.name)
+			p.carryFrozen(&rep, op.name)
 			continue
 		}
 
@@ -229,9 +223,8 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 			return !strings.HasPrefix(k, op.name+"/") || live[k]
 		})
 		for r := range reasonsFrozen {
-			p.opFrozen.Set(operatorWorkqueueFrozenGauge, 1,
-				op.name+"/"+r, op.name, r)
-			frozen[op.name+"/"+r] = r
+			rep.Emit(operatorWorkqueueFrozenGauge, op.name+"/"+r,
+				[]string{op.name, r}, op.name+"/"+r)
 		}
 
 		if len(reasonsFrozen) > 0 {
@@ -249,21 +242,8 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 	// to 0 — this covers both resolved signatures and the
 	// resetOperator paths (absent/stale Lease, dead pod), while
 	// evalFailed operators carried theirs forward above.
-	p.opFrozen.Prune(opFrozenFlipZero)
-
-	if len(frozen) == 0 {
-		if firstErr != nil {
-			return probefw.Result{Infra: firstErr}
-		}
-		return probefw.Result{Pass: true}
-	}
-	keys := make([]string, 0, len(frozen))
-	for k := range frozen {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return probefw.Result{Infra: firstErr, Why: "operator lease renews but target CRs unreconciled: " +
-		strings.Join(keys, ", ")}
+	return rep.Result(&p.opFrozen, opFrozenFlipZero,
+		"operator lease renews but target CRs unreconciled: ", ", ")
 }
 
 // operatorLease fetches the operator's leader-election Lease,
@@ -321,15 +301,15 @@ func opFrozenFlipZero(labelValues ...string) bool {
 	return true
 }
 
-// carryFrozen re-Emits one operator's held frozen tuples so the
-// sweep-end prune keeps them — the skip paths where the operator's
-// signatures were never evaluated (lease read error, pod list
-// error, incomplete CR scan) must not read as "resolved" and flap
-// the series to 0.
-func (p *operatorWorkqueueCheck) carryFrozen(name string) {
+// carryFrozen re-registers one operator's held frozen tuples on the
+// sweep report so the sweep-end prune keeps them — the skip paths
+// where the operator's signatures were never evaluated (lease read
+// error, pod list error, incomplete CR scan) must not read as
+// "resolved" and flap the series to 0.
+func (p *operatorWorkqueueCheck) carryFrozen(rep *probefw.SweepReport, name string) {
 	for k, lv := range p.opFrozen.Last() {
 		if strings.HasPrefix(k, name+"/") {
-			p.opFrozen.Emit(k, lv...)
+			rep.Carry(k, lv)
 		}
 	}
 }

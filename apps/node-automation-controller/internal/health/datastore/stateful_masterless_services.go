@@ -9,16 +9,12 @@ package datastore
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -31,6 +27,10 @@ import (
 	"k8s.io/client-go/dynamic"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // statefulMasterlessCheck is the W6.2 masterless service guard plus
@@ -298,9 +298,9 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	seen := map[string]bool{}    // tuples observed at 0 ready this sweep
-	emitted := map[string]bool{} // tuples past the gauge window
-	var due []masterlessDue      // past the heal window
+	seen := map[string]bool{}   // tuples observed at 0 ready this sweep
+	var rep probefw.SweepReport // tuples past the gauge window
+	var due []masterlessDue     // past the heal window
 	for _, c := range candidates {
 		key := c.ns + "/" + c.svc + "/" + c.sts.Name
 		if ready[c.ns+"/"+c.svc] > 0 {
@@ -311,9 +311,8 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 			masterlessZeroMinAge, log) {
 			continue
 		}
-		emitted[key] = true
-		p.stsZeroEmitted.Set(statefulServiceZeroEndpointsGauge, 1,
-			key, c.ns, c.svc, c.sts.Name)
+		rep.Emit(statefulServiceZeroEndpointsGauge, key,
+			[]string{c.ns, c.svc, c.sts.Name}, key)
 		// The heal window reads the same streak — Seen never
 		// re-stamps, so the already-observed key reports its age.
 		if age, _ := p.stsZeroSince.Seen(key, now); age >= masterlessHealMinAge {
@@ -322,7 +321,7 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	p.stsZeroSince.Prune(func(k string) bool { return seen[k] })
-	p.stsZeroEmitted.Prune(statefulServiceZeroEndpointsGauge.DeleteLabelValues)
+	rep.Close(&p.stsZeroEmitted, statefulServiceZeroEndpointsGauge.DeleteLabelValues)
 
 	// Dragonfly auto-heal — a masterless dragonfly past the heal
 	// window bounces the operator leader to force re-election (step
@@ -351,17 +350,9 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	if len(emitted) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	keys := make([]string, 0, len(emitted))
-	for k := range emitted {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return probefw.Result{Why: fmt.Sprintf(
-		"master-role services at 0 ready endpoints >=%s: %s",
-		masterlessZeroMinAge, strings.Join(keys, ", "))}
+	return rep.Verdict(fmt.Sprintf(
+		"master-role services at 0 ready endpoints >=%s: ",
+		masterlessZeroMinAge), ", ")
 }
 
 // podMasterRole reports whether the pod carries a master/primary/

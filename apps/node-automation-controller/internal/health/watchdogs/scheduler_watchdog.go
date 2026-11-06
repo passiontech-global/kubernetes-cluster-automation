@@ -8,17 +8,15 @@ package watchdogs
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"sort"
-	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/prometheus/client_golang/prometheus"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // schedulerWatchdogCheck is the W8-CP3 scheduler-watchdog — a stopped
@@ -89,7 +87,7 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list pending pods: %w", err)}
 	}
 	now := p.Now()
-	var stuck []string
+	var rep probefw.SweepReport
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.Spec.NodeName != "" ||
@@ -104,16 +102,15 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 		if !scheduled {
-			stuck = append(stuck, pod.Namespace+"/"+pod.Name)
+			rep.Find(pod.Namespace + "/" + pod.Name)
 		}
 	}
-	if len(stuck) == 0 {
+	if len(rep.Findings()) == 0 {
 		schedulerFrozenGauge.Set(0)
 		return probefw.Result{Pass: true}
 	}
-	sort.Strings(stuck)
 	schedulerFrozenGauge.Set(1)
-	return probefw.Result{Why: fmt.Sprintf(
-		"%d pods pending >=%s unscheduled with no PodScheduled condition despite Ready workers: %s",
-		len(stuck), schedulerPendingMinAge, strings.Join(stuck, ", "))}
+	return rep.Verdict(fmt.Sprintf(
+		"%d pods pending >=%s unscheduled with no PodScheduled condition despite Ready workers: ",
+		len(rep.Findings()), schedulerPendingMinAge), ", ")
 }

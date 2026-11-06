@@ -8,8 +8,6 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -133,7 +131,7 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
 
-	current := map[string][]string{}
+	var rep probefw.SweepReport
 	streakKeep := map[string]bool{}
 	missingByNode := map[string]int{}
 	var confirmed []*corev1.Pod
@@ -155,14 +153,13 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		if p.streak.Hit(sig) < ciliumCEPMinStreak {
 			continue // inside the persistence window
 		}
-		lv := []string{pod.Namespace, pod.Name, pod.Spec.NodeName}
-		current[key] = lv
-		ciliumMissingCEPPodsGauge.WithLabelValues(lv...).Set(1)
+		rep.Flag(ciliumMissingCEPPodsGauge, key,
+			[]string{pod.Namespace, pod.Name, pod.Spec.NodeName})
 		missingByNode[pod.Spec.NodeName]++
 		confirmed = append(confirmed, pod)
 	}
 	p.streak.Prune(func(k string) bool { return streakKeep[k] })
-	p.emitted.Reconcile(current, ciliumMissingCEPPodsGauge.DeleteLabelValues)
+	rep.Close(&p.emitted, ciliumMissingCEPPodsGauge.DeleteLabelValues)
 
 	// Heal — a node-level miss pattern means the agent lost its
 	// endpoint informer; per-pod deletes there would churn workloads
@@ -185,17 +182,12 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		p.DeletePodHeal(ctx, log, CheckNameCiliumMissingEndpoints,
 			pod.Namespace+"/"+pod.Name, pod, ciliumCEPHealCool, now)
 	}
-	if len(confirmed) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	keys := make([]string, 0, len(confirmed))
 	for _, pod := range confirmed {
-		keys = append(keys, pod.Namespace+"/"+pod.Name+"@"+pod.Spec.NodeName)
+		rep.Find(pod.Namespace + "/" + pod.Name + "@" + pod.Spec.NodeName)
 	}
-	sort.Strings(keys)
-	return probefw.Result{Why: fmt.Sprintf(
-		"pods missing a programmed CiliumEndpoint across %d sweeps: %s",
-		ciliumCEPMinStreak, strings.Join(keys, ", "))}
+	return rep.Verdict(fmt.Sprintf(
+		"pods missing a programmed CiliumEndpoint across %d sweeps: ",
+		ciliumCEPMinStreak), ", ")
 }
 
 // ciliumAgentPodOnNode finds the Running cilium agent pod scheduled

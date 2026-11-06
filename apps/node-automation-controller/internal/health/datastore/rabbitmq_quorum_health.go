@@ -7,7 +7,6 @@ package datastore
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +18,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -217,7 +217,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
 
-	var out []string
+	var rep probefw.SweepReport
 	for key, reasons := range findings {
 		rs := make([]string, 0, len(reasons))
 		for r := range reasons {
@@ -228,16 +228,11 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		ns := parts[0]
 		if pod, ok := rabbitByName[key]; ok {
 			joined := strings.Join(rs, "+")
-			p.emitted.Set(rabbitMQQuorumUnhealthyGauge, 1,
-				key+"/"+joined, ns, pod.Name, joined)
+			rep.Flag(rabbitMQQuorumUnhealthyGauge, key+"/"+joined,
+				[]string{ns, pod.Name, joined})
 		}
-		out = append(out, key+"("+strings.Join(rs, "+")+")")
+		rep.Find(key + "(" + strings.Join(rs, "+") + ")")
 	}
-	sort.Strings(out)
-	p.emitted.Prune(rabbitMQQuorumUnhealthyGauge.DeleteLabelValues)
-	if len(out) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	return probefw.Result{Why: "rabbitmq quorum/partition signals: " +
-		strings.Join(out, ", ")}
+	return rep.Result(&p.emitted, rabbitMQQuorumUnhealthyGauge.DeleteLabelValues,
+		"rabbitmq quorum/partition signals: ", ", ")
 }

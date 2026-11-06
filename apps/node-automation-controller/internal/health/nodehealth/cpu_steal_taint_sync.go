@@ -7,8 +7,6 @@ package nodehealth
 import (
 	"context"
 	"fmt"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -117,8 +115,7 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	clearKeep := map[string]bool{}
-	current := map[string][]string{}
-	var pressuredNames []string
+	var rep probefw.SweepReport
 	for i := range nodes {
 		n := &nodes[i]
 		if kube.IsControlPlane(n) {
@@ -129,8 +126,7 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 			// Pressure still on — the clear clock re-arms.
 			clearKeep[n.Name] = false
 			if age, ok := pressured[n.Name]; ok {
-				pressuredNames = append(pressuredNames,
-					fmt.Sprintf("%s(%s)", n.Name, age.Truncate(time.Minute)))
+				rep.Find(fmt.Sprintf("%s(%s)", n.Name, age.Truncate(time.Minute)))
 				if !tainted && p.stealHealthyWorkers(nodes, n.Name) >= cpuStealMinHealthy {
 					if err := kube.TaintNode(ctx, p.CS, n.Name,
 						kube.TaintCPUSteal, cpuStealTaintValue,
@@ -164,20 +160,13 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 		if tainted {
-			lv := []string{n.Name}
-			current[n.Name] = lv
-			cpuStealTaintedGauge.WithLabelValues(lv...).Set(1)
+			rep.Flag(cpuStealTaintedGauge, n.Name, []string{n.Name})
 		}
 	}
 	p.clear.Prune(func(k string) bool { return clearKeep[k] })
-	p.emitted.Reconcile(current, cpuStealTaintedGauge.DeleteLabelValues)
-	if len(pressuredNames) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	sort.Strings(pressuredNames)
-	return probefw.Result{Why: fmt.Sprintf(
-		"workers under sustained CPUStealPressure >=%s: %s",
-		cpuStealCondMinAge, strings.Join(pressuredNames, ", "))}
+	return rep.Result(&p.emitted, cpuStealTaintedGauge.DeleteLabelValues,
+		fmt.Sprintf("workers under sustained CPUStealPressure >=%s: ",
+			cpuStealCondMinAge), ", ")
 }
 
 // stealHealthyWorkers counts the Ready, schedulable, unpressured,

@@ -8,12 +8,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------

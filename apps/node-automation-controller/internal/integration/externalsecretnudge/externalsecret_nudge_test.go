@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,12 +16,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
 	kfake "k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
-	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
-	ktesting "k8s.io/client-go/testing"
 )
 
 // ---------------------------------------------------------------------------

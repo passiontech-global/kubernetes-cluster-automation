@@ -3,20 +3,19 @@ package datastore
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"sort"
-	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // rabbitMQSuspendedCheck is the W6.4 suspended-listener healer.
@@ -160,6 +159,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	live := map[string]bool{} // "ns/pod/uid" suspended signatures this sweep
+	var rep probefw.SweepReport
 	var due []corev1.Pod
 	for i := range pods.Items {
 		pod := &pods.Items[i]
@@ -170,6 +170,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 		live[key] = true
 		if probefw.Persisted(&p.rbSuspendedSince, key, now,
 			rabbitSuspendedMinAge, log) {
+			rep.Find(pod.Namespace + "/" + pod.Name)
 			due = append(due, *pod)
 		}
 	}
@@ -215,15 +216,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 			"pod", key)
 	}
 
-	if len(due) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	names := make([]string, 0, len(due))
-	for i := range due {
-		names = append(names, due[i].Namespace+"/"+due[i].Name)
-	}
-	sort.Strings(names)
-	return probefw.Result{Why: fmt.Sprintf(
-		"rabbitmq pods running suspended >=%s: %s",
-		rabbitSuspendedMinAge, strings.Join(names, ", "))}
+	return rep.Verdict(fmt.Sprintf(
+		"rabbitmq pods running suspended >=%s: ",
+		rabbitSuspendedMinAge), ", ")
 }

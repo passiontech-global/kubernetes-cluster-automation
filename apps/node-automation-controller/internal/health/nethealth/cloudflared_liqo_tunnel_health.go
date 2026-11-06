@@ -11,7 +11,6 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -177,7 +176,7 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 	// absorb the traffic" proof.
 	readyByOwner := probefw.ReadyByOwner(pods.Items)
 
-	current := map[string][]string{}
+	var rep probefw.SweepReport
 	streakKeep := map[string]bool{}
 	var degraded []*corev1.Pod
 	for i := range pods.Items {
@@ -209,13 +208,12 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 		if p.streak.Hit(sig) < cfTunnelMinStreak {
 			continue
 		}
-		lv := []string{pod.Namespace, pod.Name}
-		current[key] = lv
-		cloudflaredTunnelDegradedGauge.WithLabelValues(lv...).Set(1)
+		rep.Emit(cloudflaredTunnelDegradedGauge, key,
+			[]string{pod.Namespace, pod.Name}, key)
 		degraded = append(degraded, pod)
 	}
 	p.streak.Prune(func(k string) bool { return streakKeep[k] })
-	p.emitted.Reconcile(current, cloudflaredTunnelDegradedGauge.DeleteLabelValues)
+	rep.Close(&p.emitted, cloudflaredTunnelDegradedGauge.DeleteLabelValues)
 
 	for _, pod := range degraded {
 		key := pod.Namespace + "/" + pod.Name
@@ -235,16 +233,8 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 		p.DeletePodHeal(ctx, log, CheckNameCloudflaredTunnelHealth,
 			key, pod, cfTunnelHealCool, now)
 	}
-	if len(degraded) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	keys := make([]string, 0, len(degraded))
-	for _, pod := range degraded {
-		keys = append(keys, pod.Namespace+"/"+pod.Name)
-	}
-	sort.Strings(keys)
-	return probefw.Result{Why: "cloudflared pods with a dead tunnel across " +
-		strconv.Itoa(cfTunnelMinStreak) + " sweeps: " + strings.Join(keys, ", ")}
+	return rep.Verdict("cloudflared pods with a dead tunnel across "+
+		strconv.Itoa(cfTunnelMinStreak)+" sweeps: ", ", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -418,28 +408,20 @@ func (p *liqoTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	current := map[string][]string{}
-	var peers []string
+	var rep probefw.SweepReport
 	for _, f := range found {
-		lv := []string{f.peer, f.reason}
-		current[f.peer+"/"+f.reason] = lv
-		liqoPeerUnhealthyGauge.WithLabelValues(lv...).Set(1)
-		peers = append(peers, f.peer+"("+f.reason+")")
+		rep.Emit(liqoPeerUnhealthyGauge, f.peer+"/"+f.reason,
+			[]string{f.peer, f.reason}, f.peer+"("+f.reason+")")
 	}
-	p.emitted.Reconcile(current, liqoPeerUnhealthyGauge.DeleteLabelValues)
+	rep.Close(&p.emitted, liqoPeerUnhealthyGauge.DeleteLabelValues)
 
 	if len(found) > 0 {
 		if err := p.bounceLiqoGateways(ctx, log, found, now); err != nil {
 			return probefw.Result{Infra: err}
 		}
 	}
-	if len(peers) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	sort.Strings(peers)
-	return probefw.Result{Why: fmt.Sprintf(
-		"liqo peers disconnected >=%s: %s",
-		liqoPeerDisconnectMinAge, strings.Join(peers, ", "))}
+	return rep.Verdict(fmt.Sprintf(
+		"liqo peers disconnected >=%s: ", liqoPeerDisconnectMinAge), ", ")
 }
 
 // liqoTunnelCRs is the networking.liqo.io family the peer scan

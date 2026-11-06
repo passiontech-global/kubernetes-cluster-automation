@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -103,9 +102,8 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list scaledobjects: %w", err)}
 	}
 
-	current := map[string][]string{}
+	var rep probefw.SweepReport
 	seenKeep := map[string]bool{}
-	var unhealthy []string
 	for i := range sos.Items {
 		so := &sos.Items[i]
 		var reasons []string
@@ -126,22 +124,15 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		for _, reason := range reasons {
-			lv := []string{so.GetNamespace(), so.GetName(), reason}
-			current[key+"/"+reason] = lv
-			kedaScaledObjectUnhealthyGauge.WithLabelValues(lv...).Set(1)
+			rep.Flag(kedaScaledObjectUnhealthyGauge, key+"/"+reason,
+				[]string{so.GetNamespace(), so.GetName(), reason})
 		}
-		unhealthy = append(unhealthy, key+"("+strings.Join(reasons, ",")+")")
+		rep.Find(key + "(" + strings.Join(reasons, ",") + ")")
 		p.rescueZeroTarget(ctx, log, so, now)
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
-	p.emitted.Reconcile(current, kedaScaledObjectUnhealthyGauge.DeleteLabelValues)
-	if len(unhealthy) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	sort.Strings(unhealthy)
-	return probefw.Result{Why: fmt.Sprintf(
-		"scaledobjects unhealthy >=%s: %s",
-		kedaUnhealthyMinAge, strings.Join(unhealthy, ", "))}
+	return rep.Result(&p.emitted, kedaScaledObjectUnhealthyGauge.DeleteLabelValues,
+		fmt.Sprintf("scaledobjects unhealthy >=%s: ", kedaUnhealthyMinAge), ", ")
 }
 
 // rescueZeroTarget lifts a wedged-at-zero scale target back to

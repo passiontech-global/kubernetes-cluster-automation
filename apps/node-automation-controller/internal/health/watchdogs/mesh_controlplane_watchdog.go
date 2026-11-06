@@ -7,7 +7,6 @@ package watchdogs
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -77,7 +77,7 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	var findings []string
+	var rep probefw.SweepReport
 
 	// (a) CiliumIPAMExhausted latch.
 	nodes, err := kube.ListNodes(ctx, p.CS)
@@ -95,7 +95,7 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 	}
 	if len(ipamNodes) > 0 {
 		sort.Strings(ipamNodes)
-		findings = append(findings, "cilium_ipam_exhausted:"+strings.Join(ipamNodes, ","))
+		rep.Find("cilium_ipam_exhausted:" + strings.Join(ipamNodes, ","))
 		p.healComponentPod(ctx, log, "cilium-operator",
 			ciliumOperatorNS, ciliumOperatorPrefix, ciliumOpHealCooldown, now)
 	}
@@ -113,7 +113,7 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 				if !probefw.LinkerdPodMatchesComponent(pod, component) || !linkerdPodWedged(pod, now) {
 					continue
 				}
-				findings = append(findings, component+":wedged")
+				rep.Find(component + ":wedged")
 				p.healNamedPod(ctx, log, component, pod.Namespace+"/"+pod.Name,
 					pod, linkerdHealCooldown, now)
 				break
@@ -121,10 +121,7 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	if len(findings) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	return probefw.Result{Why: "mesh control-plane wedge: " + strings.Join(findings, ", ")}
+	return rep.Verdict("mesh control-plane wedge: ", ", ")
 }
 
 // linkerdPodWedged reports the wedged-watch / crashloop signature:

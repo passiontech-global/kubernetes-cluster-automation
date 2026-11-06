@@ -9,15 +9,13 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"sort"
 	"strconv"
-	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -75,27 +73,18 @@ func (p *ciliumBPFMapPressureCheck) Run(ctx context.Context) probefw.Result {
 			"error", err)
 		return probefw.Result{Pass: true}
 	}
-	current := map[string][]string{}
-	var findings []string
+	var rep probefw.SweepReport
 	for _, s := range series {
 		node := s.Label("node", "kubernetes_node", "instance")
 		mapName := s.Metric["map_name"]
 		if node == "" || mapName == "" {
 			continue
 		}
-		lv := []string{node, mapName}
-		current[node+"/"+mapName] = lv
-		ciliumBPFMapPressureGauge.WithLabelValues(lv...).Set(s.Value)
-		findings = append(findings,
-			fmt.Sprintf("%s/%s=%.2f", node, mapName, s.Value))
+		rep.Set(ciliumBPFMapPressureGauge, s.Value, node+"/"+mapName,
+			[]string{node, mapName})
+		rep.Find(fmt.Sprintf("%s/%s=%.2f", node, mapName, s.Value))
 	}
-	sort.Strings(findings)
-	p.emitted.Reconcile(current, ciliumBPFMapPressureGauge.DeleteLabelValues)
-	if len(findings) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	return probefw.Result{Why: fmt.Sprintf(
-		"cilium_bpf_map_pressure>%s: %s",
-		strconv.FormatFloat(threshold, 'f', -1, 64),
-		strings.Join(findings, ", "))}
+	return rep.Result(&p.emitted, ciliumBPFMapPressureGauge.DeleteLabelValues,
+		fmt.Sprintf("cilium_bpf_map_pressure>%s: ",
+			strconv.FormatFloat(threshold, 'f', -1, 64)), ", ")
 }

@@ -3,7 +3,6 @@
 package watchdogs
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +12,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 )
 
 // ---------------------------------------------------------------------------

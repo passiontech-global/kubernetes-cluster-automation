@@ -3,11 +3,12 @@
 package watchdogs
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"testing"
 	"time"
 
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 )
 
 // W8-CP3 — a pod Pending >5m with no PodScheduled condition while

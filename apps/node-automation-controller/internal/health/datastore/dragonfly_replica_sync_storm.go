@@ -7,8 +7,6 @@ package datastore
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"sort"
 	"strings"
 	"time"
 
@@ -19,6 +17,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -155,7 +154,7 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	}
 
 	seenKeep := map[string]bool{}
-	var desynced []string
+	var rep probefw.SweepReport
 	for _, s := range linkSeries {
 		ns := s.Label("namespace")
 		name := s.Label("pod", "pod_name")
@@ -172,8 +171,7 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 			logr.Discard()) {
 			continue // link down must persist the window
 		}
-		p.emitted.Set(dragonflyReplicaSyncStormGauge, 1, key, ns, name)
-		desynced = append(desynced, key)
+		rep.Emit(dragonflyReplicaSyncStormGauge, key, []string{ns, name}, key)
 
 		pod := podByKey[key]
 		if pod == nil || pod.DeletionTimestamp != nil {
@@ -197,16 +195,11 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 			key, pod, dragonflySyncHealCool, now)
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
-	sort.Strings(desynced)
-	p.emitted.Prune(dragonflyReplicaSyncStormGauge.DeleteLabelValues)
-	if len(desynced) == 0 {
-		return probefw.Result{Pass: true}
-	}
 	stormNote := "storm=confirmed"
 	if !stormActive {
 		stormNote = "storm=unconfirmed"
 	}
-	return probefw.Result{Why: fmt.Sprintf(
-		"dragonfly/valkey replicas with master-link down >%s (%s): %s",
-		dragonflyLinkMinAge, stormNote, strings.Join(desynced, ", "))}
+	return rep.Result(&p.emitted, dragonflyReplicaSyncStormGauge.DeleteLabelValues,
+		fmt.Sprintf("dragonfly/valkey replicas with master-link down >%s (%s): ",
+			dragonflyLinkMinAge, stormNote), ", ")
 }

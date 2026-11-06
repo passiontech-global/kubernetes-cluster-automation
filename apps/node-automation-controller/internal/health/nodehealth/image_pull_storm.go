@@ -7,18 +7,18 @@ package nodehealth
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/go-logr/logr"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -160,13 +160,12 @@ func (p *imagePullStormCheck) Run(ctx context.Context) probefw.Result {
 	// the window instead of inheriting the stale stamp.
 	p.seen.Prune(func(k string) bool { return live[k] })
 
-	current := map[string][]string{}
+	var rep probefw.SweepReport
 	for _, o := range offenders {
-		lv := []string{o.ns, o.name}
-		current[o.ns+"/"+o.name] = lv
-		imagePullBackoffPodsGauge.WithLabelValues(lv...).Set(1)
+		rep.Flag(imagePullBackoffPodsGauge, o.ns+"/"+o.name,
+			[]string{o.ns, o.name})
 	}
-	p.emitted.Reconcile(current, imagePullBackoffPodsGauge.DeleteLabelValues)
+	rep.Close(&p.emitted, imagePullBackoffPodsGauge.DeleteLabelValues)
 	if len(namespaces) >= 2 {
 		outage = true
 	}
