@@ -43,8 +43,8 @@ func TestKubeletStall10250DownRestarts(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.state, "last-restart")); err != nil {
 		t.Fatal("last-restart budget not spent")
 	}
-	if e.h.stallFails != 0 {
-		t.Fatalf("stallFails=%d want 0 after action", e.h.stallFails)
+	if e.h.StallFails != 0 {
+		t.Fatalf("stallFails=%d want 0 after action", e.h.StallFails)
 	}
 	if !strings.Contains(logLines(t, e), "ACTION: restarting k0sworker - kubelet-10250-down") {
 		t.Fatalf("missing ACTION log:\n%s", logLines(t, e))
@@ -71,9 +71,9 @@ func TestKubeletStall10250AuthResponseIsUp(t *testing.T) {
 			if e.sdRan("restart k0sworker.service") {
 				t.Fatalf("restart on %d auth response", code)
 			}
-			if e.h.stallFails != 0 {
+			if e.h.StallFails != 0 {
 				t.Fatalf("stallFails=%d want 0 — %d counts as alive",
-					e.h.stallFails, code)
+					e.h.StallFails, code)
 			}
 		})
 	}
@@ -86,12 +86,12 @@ func TestKubeletStall10250AuthResponseIsUp(t *testing.T) {
 func TestKubeletStall10250AuthClearsStaleEvidence(t *testing.T) {
 	e := fixture(t)
 	latch := filepath.Join(e.state, "state-kubelet-runtime-stall")
-	e.h.state.Enter("kubelet-runtime-stall", "test")
-	e.h.stallFails = 1
+	e.h.State.Enter("kubelet-runtime-stall", "test")
+	e.h.StallFails = 1
 	e.status[defaultKubeletHealthzURL] = 401
 	e.h.Cycle(context.Background())
-	if e.h.stallFails != 0 {
-		t.Fatalf("stallFails=%d want 0 after 401 answer", e.h.stallFails)
+	if e.h.StallFails != 0 {
+		t.Fatalf("stallFails=%d want 0 after 401 answer", e.h.StallFails)
 	}
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("runtime-stall latch kept after the listener answered 401")
@@ -106,7 +106,7 @@ func TestKubeletStall10250ProbeSendsBearerToken(t *testing.T) {
 	e := fixture(t)
 	tok := filepath.Join(e.state, "sa-token")
 	writeFile(t, tok, "tok-abc-123\n")
-	e.h.cfg.Kubelet.TokenPath = tok
+	e.h.Cfg.Kubelet.TokenPath = tok
 	e.h.Cycle(context.Background())
 	if got := e.bearer[defaultKubeletHealthzURL]; got != "tok-abc-123" {
 		t.Fatalf("10250 probe bearer = %q, want the SA token", got)
@@ -273,7 +273,7 @@ func TestKubeletWatchWedgeYoungAndDirsSkipped(t *testing.T) {
 
 func TestKubeletWatchWedgeUpstreamGate(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.APIBackends = []string{"10.0.0.1:6443", "10.0.0.2:6443"}
+	e.h.Cfg.APIBackends = []string{"10.0.0.1:6443", "10.0.0.2:6443"}
 	p := assignedPod(e, "unseen", uidA, 20*time.Minute)
 	if _, err := e.cs.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -286,7 +286,7 @@ func TestKubeletWatchWedgeUpstreamGate(t *testing.T) {
 	}
 	// Only ONE backend stale → not an upstream wedge → restart.
 	writeFile(t, filepath.Join(e.state, "state-apiserver-backend-stale-10-0-0-1"), "1\n")
-	e.h.watch.fails = 2
+	e.h.watch.Fails = 2
 	e.h.Cycle(context.Background())
 	if !e.sdRan("restart k0sworker.service") {
 		t.Fatal("restart blocked by partial staleness")
@@ -294,7 +294,7 @@ func TestKubeletWatchWedgeUpstreamGate(t *testing.T) {
 	// ALL backends stale → upstream gate blocks the restart.
 	e.sdcmds = nil
 	writeFile(t, filepath.Join(e.state, "state-apiserver-backend-stale-10-0-0-2"), "1\n")
-	e.h.watch.fails = 2
+	e.h.watch.Fails = 2
 	e.h.Cycle(context.Background())
 	if e.sdRan("restart k0sworker.service") {
 		t.Fatal("restart fired despite all backends stale")

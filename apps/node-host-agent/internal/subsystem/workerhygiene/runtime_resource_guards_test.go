@@ -29,7 +29,7 @@ func TestCgroupDyingReclaim(t *testing.T) {
 	e := fixture(t)
 	h := e.h
 	cg := t.TempDir()
-	h.cfg.Runtime.CgroupRoot = cg
+	h.Cfg.Runtime.CgroupRoot = cg
 	writeFile(t, filepath.Join(cg, "cgroup.stat"),
 		"nr_descendants 10\nnr_dying_descendants 7000\nnr_delegate 0\n")
 	writeFile(t, filepath.Join(cg, "kubepods.slice", "cgroup.stat"),
@@ -37,13 +37,13 @@ func TestCgroupDyingReclaim(t *testing.T) {
 	// On a real host /proc/sys/vm always exists — the check writes
 	// the sysctl, it does not mkdir it.
 	writeFile(t, filepath.Join(e.proc, "sys", "vm", "drop_caches"), "0\n")
-	env := &cycleEnv{workerActive: true}
+	env := &cycleEnv{WorkerActive: true}
 	latch := filepath.Join(e.state, "state-cgroup-dying-leak")
 
 	runActive(h.cgroupDying, env)
-	if h.cgroupDyingDescendants != 7000 {
+	if h.CgroupDyingDescendants != 7000 {
 		t.Fatalf("descendants=%d want 7000 (max of the two files)",
-			h.cgroupDyingDescendants)
+			h.CgroupDyingDescendants)
 	}
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("latch set before ConsecNeeded")
@@ -63,13 +63,13 @@ func TestCgroupDyingReclaim(t *testing.T) {
 			t.Fatalf("%s=%q want \"256M\\n\"", p, got)
 		}
 	}
-	if h.cgroupReclaimRuns != 1 {
-		t.Fatalf("reclaimRuns=%d want 1", h.cgroupReclaimRuns)
+	if h.CgroupReclaimRuns != 1 {
+		t.Fatalf("reclaimRuns=%d want 1", h.CgroupReclaimRuns)
 	}
 	// Cooldown: a third high cycle must not reclaim again.
 	runActive(h.cgroupDying, env)
-	if h.cgroupReclaimRuns != 1 {
-		t.Fatalf("reclaimRuns=%d want 1 (30m cooldown held)", h.cgroupReclaimRuns)
+	if h.CgroupReclaimRuns != 1 {
+		t.Fatalf("reclaimRuns=%d want 1 (30m cooldown held)", h.CgroupReclaimRuns)
 	}
 }
 
@@ -77,14 +77,14 @@ func TestCgroupDyingBelowThresholdNoLatch(t *testing.T) {
 	e := fixture(t)
 	h := e.h
 	cg := t.TempDir()
-	h.cfg.Runtime.CgroupRoot = cg
+	h.Cfg.Runtime.CgroupRoot = cg
 	writeFile(t, filepath.Join(cg, "cgroup.stat"), "nr_dying_descendants 10\n")
-	runActive(h.cgroupDying, &cycleEnv{workerActive: true})
-	runActive(h.cgroupDying, &cycleEnv{workerActive: true})
+	runActive(h.cgroupDying, &cycleEnv{WorkerActive: true})
+	runActive(h.cgroupDying, &cycleEnv{WorkerActive: true})
 	if _, err := os.Stat(filepath.Join(e.state, "state-cgroup-dying-leak")); !os.IsNotExist(err) {
 		t.Fatal("latch set below threshold")
 	}
-	if h.cgroupReclaimRuns != 0 {
+	if h.CgroupReclaimRuns != 0 {
 		t.Fatal("reclaim ran below threshold")
 	}
 }
@@ -96,7 +96,7 @@ func TestSystemdSessionReaper(t *testing.T) {
 	h := e.h
 	ctx := context.Background()
 	dir := t.TempDir()
-	h.cfg.Runtime.SessionsDir = dir
+	h.Cfg.Runtime.SessionsDir = dir
 	old := e.now.Add(-3 * time.Hour)
 	for i := 1; i <= 25; i++ {
 		p := filepath.Join(dir, strconv.Itoa(i))
@@ -111,14 +111,14 @@ func TestSystemdSessionReaper(t *testing.T) {
 	e.sdReply["loginctl terminate-session"] = ""
 	e.sdReply["systemctl reset-failed"] = ""
 
-	h.systemdSessions.Run(ctx, &cycleEnv{workerActive: true})
+	h.systemdSessions.Run(ctx, &cycleEnv{WorkerActive: true})
 
-	if h.systemdSessionsTotal != 26 {
+	if h.SystemdSessionsTotal != 26 {
 		t.Fatalf("sessionsTotal=%d want 26 (.ref excluded)",
-			h.systemdSessionsTotal)
+			h.SystemdSessionsTotal)
 	}
-	if h.systemdSessionsStale != 25 {
-		t.Fatalf("sessionsStale=%d want 25", h.systemdSessionsStale)
+	if h.SystemdSessionsStale != 25 {
+		t.Fatalf("sessionsStale=%d want 25", h.SystemdSessionsStale)
 	}
 	if _, err := os.Stat(filepath.Join(e.state, "state-systemd-session-bloat")); err != nil {
 		t.Fatal("session-bloat latch missing")
@@ -126,8 +126,8 @@ func TestSystemdSessionReaper(t *testing.T) {
 	if !e.sdRan("loginctl terminate-session") {
 		t.Fatal("no terminate-session ran")
 	}
-	if h.systemdSessionsReaped != 20 {
-		t.Fatalf("reaped=%d want 20 (per-cycle cap)", h.systemdSessionsReaped)
+	if h.SystemdSessionsReaped != 20 {
+		t.Fatalf("reaped=%d want 20 (per-cycle cap)", h.SystemdSessionsReaped)
 	}
 	if !e.sdRan("systemctl reset-failed") {
 		t.Fatal("reset-failed did not run")
@@ -138,7 +138,7 @@ func TestSystemdSessionDbusLatencyLatch(t *testing.T) {
 	e := fixture(t)
 	h := e.h
 	ctx := context.Background()
-	h.cfg.Runtime.SessionsDir = t.TempDir() // no stale sessions at all
+	h.Cfg.Runtime.SessionsDir = t.TempDir() // no stale sessions at all
 	e.sdReply["systemctl is-system-running"] = "running\n"
 	// The D-Bus round trip eats 4s — above the 3s bar.
 	e.sdHook = func(joined string) {
@@ -148,10 +148,10 @@ func TestSystemdSessionDbusLatencyLatch(t *testing.T) {
 	}
 	e.sdReply["systemctl reset-failed"] = ""
 
-	h.systemdSessions.Run(ctx, &cycleEnv{workerActive: true})
+	h.systemdSessions.Run(ctx, &cycleEnv{WorkerActive: true})
 
-	if h.systemdDbusLatencySec < 3.5 {
-		t.Fatalf("dbus latency=%.2f want ~4s", h.systemdDbusLatencySec)
+	if h.SystemdDbusLatencySec < 3.5 {
+		t.Fatalf("dbus latency=%.2f want ~4s", h.SystemdDbusLatencySec)
 	}
 	if _, err := os.Stat(filepath.Join(e.state, "state-systemd-session-bloat")); err != nil {
 		t.Fatal("session-bloat latch missing on slow D-Bus")
@@ -185,9 +185,9 @@ func TestOverlayFSStaleMount(t *testing.T) {
 	ctx := context.Background()
 	p := staleOverlayPod(e, "stale-app", uidA)
 	env := &cycleEnv{
-		pods:         []corev1.Pod{*p},
-		apiOK:        true,
-		workerActive: true,
+		Pods:         []corev1.Pod{*p},
+		APIOK:        true,
+		WorkerActive: true,
 	}
 	h.overlayFSStale.Run(ctx, env)
 	if e.sdRan("images rm") {
@@ -197,7 +197,7 @@ func TestOverlayFSStaleMount(t *testing.T) {
 	if !e.sdRan("images rm --sync docker.io/library/nginx:1.25") {
 		t.Fatalf("expected normalized image rm, sdcmds=%v", e.sdcmds)
 	}
-	if h.overlayfsStaleMounts < 1 {
+	if h.OverlayFSStaleMounts < 1 {
 		t.Fatal("stale-mount counter not incremented")
 	}
 }
@@ -209,16 +209,16 @@ func TestOverlayFSStaleMountSkipsUnmatched(t *testing.T) {
 	p := staleOverlayPod(e, "plain-crash", uidB)
 	p.Status.ContainerStatuses[0].State.Waiting.Message = "back-off restarting failed container"
 	env := &cycleEnv{
-		pods:         []corev1.Pod{*p},
-		apiOK:        true,
-		workerActive: true,
+		Pods:         []corev1.Pod{*p},
+		APIOK:        true,
+		WorkerActive: true,
 	}
 	h.overlayFSStale.Run(ctx, env)
 	h.overlayFSStale.Run(ctx, env)
 	if e.sdRan("images rm") {
 		t.Fatal("image rm on a non-overlay Waiting message")
 	}
-	if h.overlayfsStaleMounts != 0 {
+	if h.OverlayFSStaleMounts != 0 {
 		t.Fatal("counter incremented on unmatched pod")
 	}
 }
@@ -239,15 +239,15 @@ func TestIOPressureThrottler(t *testing.T) {
 			"   8       1 sda1 500 100 4000 250 50 50 3000 2000 0 1000 3000\n")
 	writeFile(t, filepath.Join(e.proc, "4242", "comm"), "kopia\n")
 	var reniced, ioniced []int
-	h.cfg.Seams.reniceFn = func(pid int) error { reniced = append(reniced, pid); return nil }
-	h.cfg.Seams.ioniceIdleFn = func(pid int) error { ioniced = append(ioniced, pid); return nil }
+	h.Cfg.Seams.ReniceFn = func(pid int) error { reniced = append(reniced, pid); return nil }
+	h.Cfg.Seams.IoniceIdleFn = func(pid int) error { ioniced = append(ioniced, pid); return nil }
 	env := &cycleEnv{
-		workerActive: true,
-		pidsOnce:     func() []int { return []int{4242} },
+		WorkerActive: true,
+		PidsOnce:     func() []int { return []int{4242} },
 	}
 
 	h.ioPressure.Run(ctx, env) // baseline cycle — seeds diskstats
-	if h.ioThrottledProcs != 0 {
+	if h.IOThrottledProcs != 0 {
 		t.Fatal("throttled on the baseline cycle")
 	}
 	e.now = e.now.Add(time.Minute)
@@ -259,14 +259,14 @@ func TestIOPressureThrottler(t *testing.T) {
 			"   8       1 sda1 500 100 4000 250 60 50 3000 4000 0 2000 3000\n")
 	h.ioPressure.Run(ctx, env)
 
-	if h.diskWriteAwaitMs != 300 {
-		t.Fatalf("writeAwait=%v want 300ms", h.diskWriteAwaitMs)
+	if h.DiskWriteAwaitMs != 300 {
+		t.Fatalf("writeAwait=%v want 300ms", h.DiskWriteAwaitMs)
 	}
-	if h.diskIOUtilRatio != 0.5 {
-		t.Fatalf("ioUtil=%v want 0.5", h.diskIOUtilRatio)
+	if h.DiskIOUtilRatio != 0.5 {
+		t.Fatalf("ioUtil=%v want 0.5", h.DiskIOUtilRatio)
 	}
-	if h.ioPSIFullAvg60 != 30 || h.ioPSIFullAvg300 != 26 {
-		t.Fatalf("psi avgs=%v/%v want 30/26", h.ioPSIFullAvg60, h.ioPSIFullAvg300)
+	if h.IOPSIFullAvg60 != 30 || h.IOPSIFullAvg300 != 26 {
+		t.Fatalf("psi avgs=%v/%v want 30/26", h.IOPSIFullAvg60, h.IOPSIFullAvg300)
 	}
 	if len(reniced) != 1 || reniced[0] != 4242 {
 		t.Fatalf("reniced=%v want [4242]", reniced)
@@ -274,16 +274,16 @@ func TestIOPressureThrottler(t *testing.T) {
 	if len(ioniced) != 1 || ioniced[0] != 4242 {
 		t.Fatalf("ioniced=%v want [4242]", ioniced)
 	}
-	if h.ioThrottledProcs != 1 {
-		t.Fatalf("throttled=%d want 1", h.ioThrottledProcs)
+	if h.IOThrottledProcs != 1 {
+		t.Fatalf("throttled=%d want 1", h.IOThrottledProcs)
 	}
 	// The same pid must not be re-throttled while pressure persists.
 	h.ioPressure.Run(ctx, env)
 	if len(reniced) != 1 {
 		t.Fatalf("pid re-throttled: reniced=%v", reniced)
 	}
-	if h.ioThrottledProcs != 1 {
-		t.Fatalf("throttled=%d want 1 (dedupe)", h.ioThrottledProcs)
+	if h.IOThrottledProcs != 1 {
+		t.Fatalf("throttled=%d want 1 (dedupe)", h.IOThrottledProcs)
 	}
 }
 
@@ -298,17 +298,17 @@ func TestConntrackLiberalGuard(t *testing.T) {
 		"nf_conntrack_tcp_be_liberal")
 	writeFile(t, sysctl, "0\n")
 
-	h.conntrackLiberal.Run(ctx, &cycleEnv{workerActive: true})
+	h.conntrackLiberal.Run(ctx, &cycleEnv{WorkerActive: true})
 	if got := nhReadFile(t, sysctl); got != "1\n" {
 		t.Fatalf("be_liberal=%q want \"1\\n\"", got)
 	}
-	if h.conntrackLiberalFixes != 1 {
-		t.Fatalf("fixes=%d want 1", h.conntrackLiberalFixes)
+	if h.ConntrackLiberalFixes != 1 {
+		t.Fatalf("fixes=%d want 1", h.ConntrackLiberalFixes)
 	}
 	// Idempotent: already 1 → no second fix.
-	h.conntrackLiberal.Run(ctx, &cycleEnv{workerActive: true})
-	if h.conntrackLiberalFixes != 1 {
-		t.Fatalf("fixes=%d want 1 (idempotent)", h.conntrackLiberalFixes)
+	h.conntrackLiberal.Run(ctx, &cycleEnv{WorkerActive: true})
+	if h.ConntrackLiberalFixes != 1 {
+		t.Fatalf("fixes=%d want 1 (idempotent)", h.ConntrackLiberalFixes)
 	}
 }
 
@@ -320,11 +320,11 @@ func TestConntrackLiberalGuardNeedsNeb1(t *testing.T) {
 	sysctl := filepath.Join(e.proc, "sys", "net", "netfilter",
 		"nf_conntrack_tcp_be_liberal")
 	writeFile(t, sysctl, "0\n")
-	h.conntrackLiberal.Run(ctx, &cycleEnv{workerActive: true})
+	h.conntrackLiberal.Run(ctx, &cycleEnv{WorkerActive: true})
 	if got := nhReadFile(t, sysctl); got != "0\n" {
 		t.Fatalf("be_liberal=%q want \"0\\n\" without neb1", got)
 	}
-	if h.conntrackLiberalFixes != 0 {
+	if h.ConntrackLiberalFixes != 0 {
 		t.Fatal("fix written without neb1")
 	}
 }
@@ -351,7 +351,7 @@ func TestClockJumpSessionHealer(t *testing.T) {
 		t.Fatal(err)
 	}
 	logs := t.TempDir()
-	h.cfg.Disk.PodLogsDir = logs
+	h.Cfg.Disk.PodLogsDir = logs
 	writeFile(t, filepath.Join(logs,
 		"kube-system_konnectivity-agent-abc12_"+uidC,
 		"konnectivity-agent", "0.log"),
@@ -359,9 +359,9 @@ func TestClockJumpSessionHealer(t *testing.T) {
 	writeFile(t, filepath.Join(e.state, "clock-stepped-at"),
 		fmt.Sprintf("%d\n", e.now.Unix()))
 	env := &cycleEnv{
-		pods:         []corev1.Pod{*konn},
-		apiOK:        true,
-		workerActive: true,
+		Pods:         []corev1.Pod{*konn},
+		APIOK:        true,
+		WorkerActive: true,
 	}
 	h.clockJump.Run(ctx, env)
 	if n := len(deleteActions(e.cs)); n != 1 {
@@ -384,7 +384,7 @@ func TestClockJumpSessionHealerNeedsFreshMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	logs := t.TempDir()
-	h.cfg.Disk.PodLogsDir = logs
+	h.Cfg.Disk.PodLogsDir = logs
 	writeFile(t, filepath.Join(logs,
 		"kube-system_konnectivity-agent-abc12_"+uidC,
 		"konnectivity-agent", "0.log"),
@@ -393,7 +393,7 @@ func TestClockJumpSessionHealerNeedsFreshMarker(t *testing.T) {
 	writeFile(t, filepath.Join(e.state, "clock-stepped-at"),
 		fmt.Sprintf("%d\n", e.now.Add(-2*time.Hour).Unix()))
 	h.clockJump.Run(ctx, &cycleEnv{
-		pods: []corev1.Pod{*konn}, apiOK: true, workerActive: true})
+		Pods: []corev1.Pod{*konn}, APIOK: true, WorkerActive: true})
 	if n := len(deleteActions(e.cs)); n != 0 {
 		t.Fatalf("deletes=%d want 0 on a stale marker", n)
 	}
@@ -405,30 +405,30 @@ func TestOrphanHostPathEarlyReturnSkipsPVList(t *testing.T) {
 	e := fixture(t)
 	h := e.h
 	ctx := context.Background()
-	h.cfg.Disk.OrphanHostPathDirs = []string{t.TempDir()} // no pvc-* dirs
+	h.Cfg.Disk.OrphanHostPathDirs = []string{t.TempDir()} // no pvc-* dirs
 	// Pretend a previous cycle left counts behind — the early
 	// return must still zero them.
-	h.orphanHostPathDirs = 7
-	h.orphanHostPathBytes = 999
+	h.OrphanHostPathDirs = 7
+	h.OrphanHostPathBytes = 999
 
-	h.orphanHP.Run(ctx, &cycleEnv{workerActive: true})
+	h.orphanHP.Run(ctx, &cycleEnv{WorkerActive: true})
 
 	for _, a := range e.cs.Actions() {
 		if a.GetResource().Resource == "persistentvolumes" {
 			t.Fatalf("PV list ran with zero candidates: %v", a)
 		}
 	}
-	if h.orphanHostPathDirs != 0 || h.orphanHostPathBytes != 0 {
+	if h.OrphanHostPathDirs != 0 || h.OrphanHostPathBytes != 0 {
 		t.Fatalf("stale gauges kept: dirs=%d bytes=%d",
-			h.orphanHostPathDirs, h.orphanHostPathBytes)
+			h.OrphanHostPathDirs, h.OrphanHostPathBytes)
 	}
 	// Sanity: with a real pvc-* dir the PV list must still run.
 	prov := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(prov, "pvc-x"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	h.cfg.Disk.OrphanHostPathDirs = []string{prov}
-	h.orphanHP.Run(ctx, &cycleEnv{workerActive: true})
+	h.Cfg.Disk.OrphanHostPathDirs = []string{prov}
+	h.orphanHP.Run(ctx, &cycleEnv{WorkerActive: true})
 	sawPVList := false
 	for _, a := range e.cs.Actions() {
 		if a.GetVerb() == "list" &&

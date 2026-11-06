@@ -20,10 +20,10 @@ func TestCiliumMTUDriftLatchesAndLogs(t *testing.T) {
 	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
 	writeFile(t, filepath.Join(e.sysnet, "cilium_net", "mtu"), "1500\n")
 	e.h.Cycle(context.Background())
-	if !e.h.state.Exists("cilium-mtu-drift") {
+	if !e.h.State.Exists("cilium-mtu-drift") {
 		t.Fatal("state-cilium-mtu-drift should latch when cilium_mtu > neb1")
 	}
-	data, err := os.ReadFile(e.h.cfg.WatchdogLogFile)
+	data, err := os.ReadFile(e.h.Cfg.WatchdogLogFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func TestCiliumMTUDriftLatchesAndLogs(t *testing.T) {
 	// Drift fixed → latch clears.
 	writeFile(t, filepath.Join(e.sysnet, "cilium_net", "mtu"), "1300\n")
 	e.h.Cycle(context.Background())
-	if e.h.state.Exists("cilium-mtu-drift") {
+	if e.h.State.Exists("cilium-mtu-drift") {
 		t.Fatal("latch should clear once MTUs align")
 	}
 }
@@ -44,7 +44,7 @@ func TestCiliumMTURuntimeConfigFallback(t *testing.T) {
 	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
 	writeFile(t, e.ciliumRt, `{"mtu":1500,"other":1}`)
 	e.h.Cycle(context.Background())
-	if !e.h.state.Exists("cilium-mtu-drift") {
+	if !e.h.State.Exists("cilium-mtu-drift") {
 		t.Fatal("runtime-config MTU 1500 > neb1 1300 should latch drift")
 	}
 }

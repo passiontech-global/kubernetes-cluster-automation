@@ -94,7 +94,7 @@ func TestKernelSlabLeakLatchesDropsCachesAndBudgets(t *testing.T) {
 	writeFile(t, dropCaches, "")
 
 	e.h.checkPSIThrash(context.Background(), nil, true, pidsOf(), true)
-	if !e.h.state.Exists("kernel-slab-leak") {
+	if !e.h.State.Exists("kernel-slab-leak") {
 		t.Fatal("no kernel-slab-leak latch at 40% SUnreclaim")
 	}
 	data, err := os.ReadFile(dropCaches)
@@ -121,7 +121,7 @@ func TestKernelSlabLeakLatchesDropsCachesAndBudgets(t *testing.T) {
 		t.Fatalf("drop_caches writes inside the hour = %d, want 1", n)
 	}
 	// The latch mtime is refreshed while held (janitor-safe).
-	if !e.h.state.Exists("kernel-slab-leak") {
+	if !e.h.State.Exists("kernel-slab-leak") {
 		t.Fatal("latch dropped while still leaking")
 	}
 
@@ -135,7 +135,7 @@ func TestKernelSlabLeakLatchesDropsCachesAndBudgets(t *testing.T) {
 	// Below the 0.25 clear ratio the latch exits.
 	writeMeminfoSlab(t, e, 500000, 1000000, 200000)
 	e.h.checkPSIThrash(context.Background(), nil, true, pidsOf(), true)
-	if e.h.state.Exists("kernel-slab-leak") {
+	if e.h.State.Exists("kernel-slab-leak") {
 		t.Fatal("kernel-slab-leak latch not cleared at 20% SUnreclaim")
 	}
 }
@@ -150,21 +150,21 @@ func TestKernelSlabLeakHysteresis(t *testing.T) {
 	// 0.30 is inside the band but was never entered → no latch.
 	writeMeminfoSlab(t, e, 500000, 1000000, 300000)
 	e.h.checkPSIThrash(context.Background(), nil, true, pidsOf(), true)
-	if e.h.state.Exists("kernel-slab-leak") {
+	if e.h.State.Exists("kernel-slab-leak") {
 		t.Fatal("latch entered at 0.30 without crossing 0.35")
 	}
 
 	// Cross 0.35 → latch.
 	writeMeminfoSlab(t, e, 500000, 1000000, 400000)
 	e.h.checkPSIThrash(context.Background(), nil, true, pidsOf(), true)
-	if !e.h.state.Exists("kernel-slab-leak") {
+	if !e.h.State.Exists("kernel-slab-leak") {
 		t.Fatal("no latch at 0.40")
 	}
 
 	// Back into the band → still latched.
 	writeMeminfoSlab(t, e, 500000, 1000000, 300000)
 	e.h.checkPSIThrash(context.Background(), nil, true, pidsOf(), true)
-	if !e.h.state.Exists("kernel-slab-leak") {
+	if !e.h.State.Exists("kernel-slab-leak") {
 		t.Fatal("latch cleared inside the hysteresis band")
 	}
 }
@@ -184,10 +184,10 @@ func TestPSIThrashEvictSuppressedBySlabLeak(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.checkPSIThrash(context.Background(), pods, true, pids, true)
 	}
-	if !e.h.state.Exists("psi-memory-thrash") {
+	if !e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("no psi-memory-thrash latch")
 	}
-	if !e.h.state.Exists("kernel-slab-leak") {
+	if !e.h.State.Exists("kernel-slab-leak") {
 		t.Fatal("no kernel-slab-leak latch")
 	}
 	if n := len(evictActions(e.cs)); n != 0 {
@@ -219,7 +219,7 @@ func thrashEnv(t *testing.T, e *env) {
 // eviction path fire.
 func drivePSI(t *testing.T, e *env, pods []corev1.Pod, pids func() []int) {
 	t.Helper()
-	for i := 0; i < e.h.cfg.ConsecNeeded; i++ {
+	for i := 0; i < e.h.Cfg.ConsecNeeded; i++ {
 		e.h.checkPSIThrash(context.Background(), pods, true, pids, true)
 	}
 }
@@ -233,7 +233,7 @@ func TestPSIEvictorRSSFloor(t *testing.T) {
 	pods := []corev1.Pod{*psiPod("small", "app", uidA)}
 	procRSSProc(t, e, 5001, uidA, 500000) // ~488 MiB < 512 MiB floor
 	drivePSI(t, e, pods, pidsOf(5001))
-	if !e.h.state.Exists("psi-memory-thrash") {
+	if !e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("no psi-memory-thrash latch")
 	}
 	if n := len(evictActions(e.cs)); n != 0 {
@@ -283,7 +283,7 @@ func TestPSIEvictorOnlyProtectedPods(t *testing.T) {
 	procRSSProc(t, e, 5001, uidA, 900000)
 	procRSSProc(t, e, 5002, uidB, 800000)
 	drivePSI(t, e, pods, pidsOf(5001, 5002))
-	if !e.h.state.Exists("psi-memory-thrash") {
+	if !e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("no psi-memory-thrash latch")
 	}
 	if n := len(evictActions(e.cs)); n != 0 {
@@ -429,7 +429,7 @@ func TestPSIEvictorEvictionAPIError(t *testing.T) {
 		t.Fatalf("missing eviction-failure suspect line:\n%s", got)
 	}
 	if got := testutil.ToFloat64(
-		e.h.actions.WithLabelValues(checkPSIThrash, "pod_evict")); got != 0 {
+		e.h.Actions.WithLabelValues(checkPSIThrash, "pod_evict")); got != 0 {
 		t.Fatalf("pod_evict actions = %v, want 0 on API error", got)
 	}
 }
@@ -445,7 +445,7 @@ func netnsFixture(t *testing.T, e *env) string {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	e.h.cfg.Net.NetnsDir = dir
+	e.h.Cfg.Net.NetnsDir = dir
 	return dir
 }
 
@@ -620,7 +620,7 @@ func TestCtrIngestGCContentPruneAboveWatermark(t *testing.T) {
 	e := fixture(t)
 	e.diskUsed = 0.80
 	prunes := 0
-	e.h.cfg.Seams.ctrPruneContent = func(context.Context) error {
+	e.h.Cfg.Seams.CtrPruneContent = func(context.Context) error {
 		prunes++
 		return nil
 	}
@@ -654,7 +654,7 @@ func TestCtrIngestGCNoPruneBelowWatermark(t *testing.T) {
 	e := fixture(t)
 	e.diskUsed = 0.50
 	prunes := 0
-	e.h.cfg.Seams.ctrPruneContent = func(context.Context) error {
+	e.h.Cfg.Seams.CtrPruneContent = func(context.Context) error {
 		prunes++
 		return nil
 	}
@@ -670,7 +670,7 @@ func TestCtrIngestGCNoPruneBelowWatermark(t *testing.T) {
 func TestCtrIngestGCPruneFailureSuspect(t *testing.T) {
 	e := fixture(t)
 	e.diskUsed = 0.80
-	e.h.cfg.Seams.ctrPruneContent = func(context.Context) error {
+	e.h.Cfg.Seams.CtrPruneContent = func(context.Context) error {
 		return errors.New("ctr content prune: exit status 1")
 	}
 	e.h.checkCtrIngestGC(context.Background(), true)
@@ -678,12 +678,12 @@ func TestCtrIngestGCPruneFailureSuspect(t *testing.T) {
 		t.Fatalf("missing prune-failure suspect line:\n%s", got)
 	}
 	if got := testutil.ToFloat64(
-		e.h.actions.WithLabelValues(checkIngestGC, "content_gc")); got != 0 {
+		e.h.Actions.WithLabelValues(checkIngestGC, "content_gc")); got != 0 {
 		t.Fatalf("content_gc actions = %v, want 0 on prune failure", got)
 	}
 	// Budget spent → an immediate retry does not re-run the prune.
 	calls := 0
-	e.h.cfg.Seams.ctrPruneContent = func(context.Context) error {
+	e.h.Cfg.Seams.CtrPruneContent = func(context.Context) error {
 		calls++
 		return nil
 	}
@@ -704,7 +704,7 @@ func TestCiliumMTUWG0DriftLatches(t *testing.T) {
 	writeFile(t, filepath.Join(e.sysnet, "cilium_wg0", "mtu"), "1250\n")
 	// cilium_net absent AND no runtime config → wg0 is the only vote.
 	e.h.checkCiliumMTU(true)
-	if !e.h.state.Exists("cilium-mtu-drift") {
+	if !e.h.State.Exists("cilium-mtu-drift") {
 		t.Fatal("no cilium-mtu-drift latch for wg0=1250 > 1300-60")
 	}
 	if got := logLines(t, e); !strings.Contains(got,
@@ -720,12 +720,12 @@ func TestCiliumMTUWG0Boundary(t *testing.T) {
 	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
 	writeFile(t, filepath.Join(e.sysnet, "cilium_wg0", "mtu"), "1240\n")
 	e.h.checkCiliumMTU(true)
-	if e.h.state.Exists("cilium-mtu-drift") {
+	if e.h.State.Exists("cilium-mtu-drift") {
 		t.Fatal("drift latched at exactly neb-60")
 	}
 	writeFile(t, filepath.Join(e.sysnet, "cilium_wg0", "mtu"), "1241\n")
 	e.h.checkCiliumMTU(true)
-	if !e.h.state.Exists("cilium-mtu-drift") {
+	if !e.h.State.Exists("cilium-mtu-drift") {
 		t.Fatal("no drift at neb-59")
 	}
 }
@@ -736,7 +736,7 @@ func TestCiliumMTUAbsentDatapathsNoVote(t *testing.T) {
 	e := fixture(t)
 	writeFile(t, filepath.Join(e.sysnet, "neb1", "mtu"), "1300\n")
 	e.h.checkCiliumMTU(true)
-	if e.h.state.Exists("cilium-mtu-drift") {
+	if e.h.State.Exists("cilium-mtu-drift") {
 		t.Fatal("drift latched with no datapath MTU resolved")
 	}
 }

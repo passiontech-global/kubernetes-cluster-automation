@@ -95,7 +95,7 @@ func TestStateEnterRefreshesLatchMtime(t *testing.T) {
 	if err := os.Chtimes(p, old, old); err != nil {
 		t.Fatal(err)
 	}
-	e.h.state.Enter("d-state-storm", "count=9")
+	e.h.State.Enter("d-state-storm", "count=9")
 	fi, err := os.Stat(p)
 	if err != nil {
 		t.Fatal(err)
@@ -137,10 +137,10 @@ func TestProbeHTTPDefaultNon2xxIsError(t *testing.T) {
 		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
 	defer srv503.Close()
 
-	if err := h.cfg.Seams.probeHTTP(context.Background(), srv200.URL, time.Second); err != nil {
+	if err := h.Cfg.Seams.ProbeHTTP(context.Background(), srv200.URL, time.Second); err != nil {
 		t.Fatalf("200 probe = %v, want nil", err)
 	}
-	if err := h.cfg.Seams.probeHTTP(context.Background(), srv503.URL, time.Second); err == nil {
+	if err := h.Cfg.Seams.ProbeHTTP(context.Background(), srv503.URL, time.Second); err == nil {
 		t.Fatal("503 probe must error — a wedged /healthz is down")
 	}
 }
@@ -158,7 +158,7 @@ func TestSyncloopDownRestartsK0sWorker(t *testing.T) {
 		t.Fatal("k0sworker restarted on the first suspect cycle")
 	}
 	e.h.Cycle(context.Background())
-	if !e.h.state.Exists("kubelet-syncloop-down") {
+	if !e.h.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("no latch after ConsecNeeded failed probes")
 	}
 	if !e.sdRan("restart k0sworker.service") {
@@ -186,7 +186,7 @@ func TestSyncloopDownOverloadedSkipsRestart(t *testing.T) {
 	if e.sdRan("restart k0sworker.service") {
 		t.Fatal("restart under node-overloaded")
 	}
-	if e.h.state.Exists("kubelet-syncloop-down") {
+	if e.h.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("latch not suppressed under node-overloaded")
 	}
 	if got := logLines(t, e); !strings.Contains(got, "suppressed-overloaded") {
@@ -204,7 +204,7 @@ func TestSyncloopDownRestartCooldown(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.state.Exists("kubelet-syncloop-down") {
+	if !e.h.State.Exists("kubelet-syncloop-down") {
 		t.Fatal("no latch after ConsecNeeded failed probes")
 	}
 	if e.sdRan("restart k0sworker.service") {
@@ -220,13 +220,13 @@ func TestSyncloopDownRestartCooldown(t *testing.T) {
 // the socket probe's BUG-H4 remedy.
 func TestContainerdSockDownRestartsK0sWorker(t *testing.T) {
 	e := fixture(t)
-	e.sockErrs[e.h.cfg.Ctr.Socket] = errors.New("connection refused")
+	e.sockErrs[e.h.Cfg.Ctr.Socket] = errors.New("connection refused")
 	e.h.Cycle(context.Background())
 	if e.sdRan("restart k0sworker.service") {
 		t.Fatal("k0sworker restarted on the first suspect cycle")
 	}
 	e.h.Cycle(context.Background())
-	if !e.h.state.Exists("containerd-sock-down") {
+	if !e.h.State.Exists("containerd-sock-down") {
 		t.Fatal("no latch after ConsecNeeded socket failures")
 	}
 	if !e.sdRan("restart k0sworker.service") {
@@ -244,8 +244,8 @@ func TestCheckDiskBloatPodLogEvicts(t *testing.T) {
 	e := fixture(t)
 	e.diskUsed = 0.95
 	logDir := filepath.Join(e.state, "podlogs")
-	e.h.cfg.Disk.PodLogsDir = logDir
-	e.h.cfg.Disk.BloatPodThresholdBytes = 64
+	e.h.Cfg.Disk.PodLogsDir = logDir
+	e.h.Cfg.Disk.BloatPodThresholdBytes = 64
 	victim := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "logger", Namespace: "app", UID: types.UID("uid-1")},
@@ -267,7 +267,7 @@ func TestCheckDiskBloatPodLogEvicts(t *testing.T) {
 		t.Fatalf("deletes = %v, want the log-bloating pod",
 			deleteActions(e.cs))
 	}
-	if !e.h.state.Exists("disk-bloat") {
+	if !e.h.State.Exists("disk-bloat") {
 		t.Fatal("disk-bloat latch not set")
 	}
 	if got := logLines(t, e); !strings.Contains(got, "logs") {
@@ -282,14 +282,14 @@ func TestCheckDiskBloatPodLogEvicts(t *testing.T) {
 func TestCheckDiskBloatSnapshotEvicts(t *testing.T) {
 	e := fixture(t)
 	e.diskUsed = 0.95
-	e.h.cfg.Disk.BloatPodThresholdBytes = 64
+	e.h.Cfg.Disk.BloatPodThresholdBytes = 64
 	victim := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "layerhog", Namespace: "app", UID: types.UID(uidA)},
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	snap := filepath.Join(e.h.cfg.Disk.K0sDataDir, "containerd",
+	snap := filepath.Join(e.h.Cfg.Disk.K0sDataDir, "containerd",
 		"io.containerd.snapshotter.v1.overlayfs", "snapshots", "snapctr1", "fs")
 	if err := os.MkdirAll(snap, 0o755); err != nil {
 		t.Fatal(err)
@@ -330,13 +330,13 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 	pod := calicoPod("calico-node-abc12", "uid-cal")
 	// cali* ifaces so the calico gate opens; felix probe fails.
 	writeFile(t, filepath.Join(e.sysnet, "cali00", "carrier"), "1\n")
-	e.status[e.h.cfg.Calico.FelixReadyURL] = 500
+	e.status[e.h.Cfg.Calico.FelixReadyURL] = 500
 	pods := []corev1.Pod{*pod}
 
 	for i := 0; i < calicoFelixRestartFails; i++ {
 		e.h.checkCalicoHygiene(context.Background(), pods, true, true)
 	}
-	if !e.h.state.Exists("calico-felix-down") {
+	if !e.h.State.Exists("calico-felix-down") {
 		t.Fatal("no calico-felix-down latch")
 	}
 	del := deleteActions(e.cs)
@@ -369,13 +369,13 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 func TestCheckCalicoFelixLatchBeforeRestart(t *testing.T) {
 	e := fixture(t)
 	writeFile(t, filepath.Join(e.sysnet, "cali00", "carrier"), "1\n")
-	e.status[e.h.cfg.Calico.FelixReadyURL] = 500
+	e.status[e.h.Cfg.Calico.FelixReadyURL] = 500
 	pods := []corev1.Pod{*calicoPod("calico-node-abc12", "uid-cal")}
 
 	for i := 0; i < 2; i++ {
 		e.h.checkCalicoHygiene(context.Background(), pods, true, true)
 	}
-	if !e.h.state.Exists("calico-felix-down") {
+	if !e.h.State.Exists("calico-felix-down") {
 		t.Fatal("no latch after ConsecNeeded")
 	}
 	if n := len(deleteActions(e.cs)); n != 0 {
@@ -392,17 +392,17 @@ func TestCheckCalicoVethGCDeletesOrphan(t *testing.T) {
 	writeFile(t, filepath.Join(e.sysnet, "cali99", "carrier"), "0\n")
 	// Leak still detected → latch persists: threshold+1 cali*
 	// ifaces over the (empty) pod count, all but cali99 live.
-	for i := 0; i < e.h.cfg.Calico.OrphanVethThreshold+1; i++ {
+	for i := 0; i < e.h.Cfg.Calico.OrphanVethThreshold+1; i++ {
 		writeFile(t, filepath.Join(e.sysnet,
 			fmt.Sprintf("cali%02d", i+1), "carrier"), "1\n")
 	}
 	pods := []corev1.Pod{}
 	e.h.checkCalicoHygiene(context.Background(), pods, true, true)
-	if e.h.state.Exists("calico-veth-leak") {
+	if e.h.State.Exists("calico-veth-leak") {
 		t.Fatal("leak latch before ConsecNeeded")
 	}
 	e.h.checkCalicoHygiene(context.Background(), pods, true, true)
-	if !e.h.state.Exists("calico-veth-leak") {
+	if !e.h.State.Exists("calico-veth-leak") {
 		t.Fatal("leak latch not set")
 	}
 	if e.sdRan("ip link delete cali99") {
@@ -453,7 +453,7 @@ func TestCheckCalicoVethGCNeedsLeakLatch(t *testing.T) {
 func TestCheckCiliumBPFMapPressureLatches(t *testing.T) {
 	e := fixture(t)
 	e.h.checkCiliumBPFMaps(context.Background())
-	if e.h.state.Exists("cilium-bpf-map-pressure") {
+	if e.h.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("latch on an empty /v1/map body")
 	}
 	e.unixBody = []byte(`{"maps":[
@@ -461,7 +461,7 @@ func TestCheckCiliumBPFMapPressureLatches(t *testing.T) {
 		{"name":"cilium_lb4_services_v2","used":100,"max":1000}
 	]}`)
 	e.h.checkCiliumBPFMaps(context.Background())
-	if !e.h.state.Exists("cilium-bpf-map-pressure") {
+	if !e.h.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("no latch with cilium_ct4_global at 95%")
 	}
 	// Path-shaped entries (the real /v1/map wire) resolve by
@@ -470,7 +470,7 @@ func TestCheckCiliumBPFMapPressureLatches(t *testing.T) {
 		{"path":"/sys/fs/bpf/cilium/cilium_ct4_global","size":1000,"cache":[]}
 	]}`)
 	e.h.checkCiliumBPFMaps(context.Background())
-	if e.h.state.Exists("cilium-bpf-map-pressure") {
+	if e.h.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("empty cache at 1000 capacity must clear the latch")
 	}
 }
@@ -553,11 +553,11 @@ func TestCheckPSIThrashLatchesAndEvicts(t *testing.T) {
 	pids := pidsOf(5001, 5002)
 
 	e.h.checkPSIThrash(context.Background(), pods, true, pids, true)
-	if e.h.state.Exists("psi-memory-thrash") {
+	if e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("latched on the first thrash cycle")
 	}
 	e.h.checkPSIThrash(context.Background(), pods, true, pids, true)
-	if !e.h.state.Exists("psi-memory-thrash") {
+	if !e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("no latch after ConsecNeeded thrash cycles")
 	}
 	if got := logLines(t, e); !strings.Contains(got, "ACTION psi-memory-thrash:") {
@@ -574,7 +574,7 @@ func TestCheckPSIThrashLatchesAndEvicts(t *testing.T) {
 	// Recovery clears the latch.
 	writeThrashFiles(t, e, 5.0, 500000, 1000000)
 	e.h.checkPSIThrash(context.Background(), pods, true, pids, true)
-	if e.h.state.Exists("psi-memory-thrash") {
+	if e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("latch not cleared after the thrash subsides")
 	}
 }
@@ -589,7 +589,7 @@ func TestCheckPSIThrashNeedsBothSignals(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		e.h.checkPSIThrash(context.Background(), nil, true, pidsOf(), true)
 	}
-	if e.h.state.Exists("psi-memory-thrash") {
+	if e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("latched on PSI alone — free memory is fine")
 	}
 	// Memory low, no stall.
@@ -597,7 +597,7 @@ func TestCheckPSIThrashNeedsBothSignals(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		e.h.checkPSIThrash(context.Background(), nil, true, pidsOf(), true)
 	}
-	if e.h.state.Exists("psi-memory-thrash") {
+	if e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("latched on low memory alone — no PSI stall")
 	}
 }

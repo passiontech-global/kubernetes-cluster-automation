@@ -39,8 +39,8 @@ func TestCiliumInitStuckTransientNoKill(t *testing.T) {
 	if len(e.kills) != 0 {
 		t.Fatal("transient init endpoint killed the agent")
 	}
-	if e.h.ciliumInitFails != 0 {
-		t.Fatalf("counter=%d want 0 after recovery", e.h.ciliumInitFails)
+	if e.h.CiliumInitFails != 0 {
+		t.Fatalf("counter=%d want 0 after recovery", e.h.CiliumInitFails)
 	}
 }
 
@@ -49,13 +49,13 @@ func TestCiliumInitStuckInconclusiveKeepsCounter(t *testing.T) {
 	e.mkCiliumTask(t, 9402)
 	e.unixBody = []byte(`reserved:init`)
 	e.h.Cycle(context.Background())
-	if e.h.ciliumInitFails != 1 {
-		t.Fatalf("counter=%d want 1", e.h.ciliumInitFails)
+	if e.h.CiliumInitFails != 1 {
+		t.Fatalf("counter=%d want 1", e.h.CiliumInitFails)
 	}
 	// Endpoint list fails → inconclusive: counter kept, not reset.
 	e.unixErr = errors.New("socket dead")
 	e.h.Cycle(context.Background())
-	if e.h.ciliumInitFails != 1 {
-		t.Fatalf("counter=%d want 1 (inconclusive keeps)", e.h.ciliumInitFails)
+	if e.h.CiliumInitFails != 1 {
+		t.Fatalf("counter=%d want 1 (inconclusive keeps)", e.h.CiliumInitFails)
 	}
 }

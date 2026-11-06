@@ -40,7 +40,7 @@ func TestCiliumEnvoyUnreadyKillAfterConsec(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.state.Exists("cilium-envoy-down") {
+	if !e.h.State.Exists("cilium-envoy-down") {
 		t.Fatal("state-cilium-envoy-down should latch after 2 unready cycles")
 	}
 	found := false

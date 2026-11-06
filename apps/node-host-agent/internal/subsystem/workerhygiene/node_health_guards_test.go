@@ -57,11 +57,11 @@ func TestCheckDStateStormLatch(t *testing.T) {
 		_ = i
 	}
 	e.h.checkDStateTasks(pidsOf(pids...), true)
-	if e.h.state.Exists("d-state-storm") {
+	if e.h.State.Exists("d-state-storm") {
 		t.Fatal("latch fired before ConsecNeeded cycles")
 	}
 	e.h.checkDStateTasks(pidsOf(pids...), true)
-	if !e.h.state.Exists("d-state-storm") {
+	if !e.h.State.Exists("d-state-storm") {
 		t.Fatal("state-d-state-storm not latched after ConsecNeeded cycles")
 	}
 	log := logLines(t, e)
@@ -73,7 +73,7 @@ func TestCheckDStateStormLatch(t *testing.T) {
 		e.mkStatProc(t, pid, "postgres", "S", "")
 	}
 	e.h.checkDStateTasks(pidsOf(pids...), true)
-	if e.h.state.Exists("d-state-storm") {
+	if e.h.State.Exists("d-state-storm") {
 		t.Fatal("latch not cleared after D procs recovered")
 	}
 }
@@ -87,7 +87,7 @@ func TestCheckDStateRuntimeMinTrigger(t *testing.T) {
 	e.mkStatProc(t, 7102, "jbd2/vda1-8", "D", "wait_transaction_locked")
 	e.h.checkDStateTasks(pidsOf(pids...), true)
 	e.h.checkDStateTasks(pidsOf(pids...), true)
-	if !e.h.state.Exists("d-state-storm") {
+	if !e.h.State.Exists("d-state-storm") {
 		t.Fatal("runtime-critical D-state storm not latched")
 	}
 	if !strings.Contains(logLines(t, e), "ACTION d-state-storm: count=2 runtime=2") {
@@ -160,7 +160,7 @@ func TestCheckCiliumEnvoyXDSReject(t *testing.T) {
 		"cluster_manager.cds.update_rejected: 9\n",
 	}
 	call := 0
-	e.h.cfg.Seams.httpGetBody = func(context.Context, string, time.Duration) ([]byte, error) {
+	e.h.Cfg.Seams.HTTPGetBody = func(context.Context, string, time.Duration) ([]byte, error) {
 		defer func() { call++ }()
 		if call < len(stats) {
 			return []byte(stats[call]), nil
@@ -169,11 +169,11 @@ func TestCheckCiliumEnvoyXDSReject(t *testing.T) {
 	}
 	e.h.checkCiliumEnvoy(context.Background(), true) // baseline read — no delta
 	e.h.checkCiliumEnvoy(context.Background(), true) // delta +1 → streak 1
-	if e.h.state.Exists("cilium-envoy-xds-reject") {
+	if e.h.State.Exists("cilium-envoy-xds-reject") {
 		t.Fatal("xds latch fired before ConsecNeeded deltas")
 	}
 	e.h.checkCiliumEnvoy(context.Background(), true) // delta +1 → streak 2
-	if !e.h.state.Exists("cilium-envoy-xds-reject") {
+	if !e.h.State.Exists("cilium-envoy-xds-reject") {
 		t.Fatal("state-cilium-envoy-xds-reject not latched")
 	}
 	found := false
@@ -205,7 +205,7 @@ func TestCheckCiliumLRPDNS(t *testing.T) {
 	e.mkTask(t, uidB, "cilium-agent", 4343)
 	pod, _ := e.cs.CoreV1().Pods("kube-system").Get(
 		context.Background(), "node-local-dns-a1b2c", metav1.GetOptions{})
-	e.h.cfg.Seams.dnsProbe = func(string, string, time.Duration) bool { return false }
+	e.h.Cfg.Seams.DNSProbe = func(string, string, time.Duration) bool { return false }
 	e.h.checkCiliumLRPDNS(context.Background(), []corev1.Pod{*pod}, true, true)
 	e.h.checkCiliumLRPDNS(context.Background(), []corev1.Pod{*pod}, true, true)
 	if _, err := e.cs.CoreV1().Pods("kube-system").Get(
@@ -220,13 +220,13 @@ func TestCheckCiliumLRPDNS(t *testing.T) {
 func TestCheckCiliumLRPDNSGates(t *testing.T) {
 	e := fixture(t)
 	// No cilium_host → dormant (calico node) — the probe must not run.
-	e.h.cfg.Seams.dnsProbe = func(string, string, time.Duration) bool {
+	e.h.Cfg.Seams.DNSProbe = func(string, string, time.Duration) bool {
 		t.Fatal("dnsProbe ran without cilium datapath")
 		return false
 	}
 	e.h.checkCiliumLRPDNS(context.Background(), nil, true, true)
-	if e.h.ciliumLRP.fails != 0 {
-		t.Fatalf("nldFails = %d, want 0 on non-cilium node", e.h.ciliumLRP.fails)
+	if e.h.ciliumLRP.Fails != 0 {
+		t.Fatalf("nldFails = %d, want 0 on non-cilium node", e.h.ciliumLRP.Fails)
 	}
 
 	// cilium_host present but no cilium-agent task → gated (agent
@@ -235,8 +235,8 @@ func TestCheckCiliumLRPDNSGates(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.h.checkCiliumLRPDNS(context.Background(), nil, true, true)
-	if e.h.ciliumLRP.fails != 0 {
-		t.Fatalf("nldFails = %d, want 0 with cilium-agent absent", e.h.ciliumLRP.fails)
+	if e.h.ciliumLRP.Fails != 0 {
+		t.Fatalf("nldFails = %d, want 0 with cilium-agent absent", e.h.ciliumLRP.Fails)
 	}
 }
 
@@ -256,11 +256,11 @@ func TestCheckSpegelMirror(t *testing.T) {
 	pod, _ := e.cs.CoreV1().Pods("spegel").Get(
 		context.Background(), "spegel-x9y8z", metav1.GetOptions{})
 	e.h.checkSpegelMirror(context.Background(), []corev1.Pod{*pod}, true, true)
-	if e.h.state.Exists("spegel-mirror-degraded") {
+	if e.h.State.Exists("spegel-mirror-degraded") {
 		t.Fatal("spegel latch fired before ConsecNeeded cycles")
 	}
 	e.h.checkSpegelMirror(context.Background(), []corev1.Pod{*pod}, true, true)
-	if !e.h.state.Exists("spegel-mirror-degraded") {
+	if !e.h.State.Exists("spegel-mirror-degraded") {
 		t.Fatal("state-spegel-mirror-degraded not latched")
 	}
 	if _, err := e.cs.CoreV1().Pods("spegel").Get(
@@ -282,7 +282,7 @@ func TestCheckSpegelMirrorTooYoung(t *testing.T) {
 	}
 	e.h.checkSpegelMirror(context.Background(), []corev1.Pod{*pod}, true, true)
 	e.h.checkSpegelMirror(context.Background(), []corev1.Pod{*pod}, true, true)
-	if e.h.spegel.fails != 0 || e.h.state.Exists("spegel-mirror-degraded") {
+	if e.h.spegel.Fails != 0 || e.h.State.Exists("spegel-mirror-degraded") {
 		t.Fatal("3m-old spegel pod counted toward the streak — startup grace violated")
 	}
 }
@@ -298,11 +298,11 @@ func TestCheckCalicoHygieneVethLeak(t *testing.T) {
 		}
 	}
 	e.h.checkCalicoHygiene(context.Background(), nil, true, true)
-	if e.h.state.Exists("calico-veth-leak") {
+	if e.h.State.Exists("calico-veth-leak") {
 		t.Fatal("veth-leak latch fired before ConsecNeeded cycles")
 	}
 	e.h.checkCalicoHygiene(context.Background(), nil, true, true)
-	if !e.h.state.Exists("calico-veth-leak") {
+	if !e.h.State.Exists("calico-veth-leak") {
 		t.Fatal("state-calico-veth-leak not latched (55 cali vs 0 pods)")
 	}
 }
@@ -324,7 +324,7 @@ func TestCheckCalicoHygieneFelixDown(t *testing.T) {
 	}}
 	e.h.checkCalicoHygiene(context.Background(), pods, true, true)
 	e.h.checkCalicoHygiene(context.Background(), pods, true, true)
-	if !e.h.state.Exists("calico-felix-down") {
+	if !e.h.State.Exists("calico-felix-down") {
 		t.Fatal("state-calico-felix-down not latched on failing readiness")
 	}
 }
@@ -339,10 +339,10 @@ func TestCheckCalicoHygieneCiliumGate(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(e.sysnet, "cali00"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	e.h.calico.vethFails = 1
+	e.h.calico.VethFails = 1
 	writeFile(t, filepath.Join(e.state, "state-calico-veth-leak"), "1\n")
 	e.h.checkCalicoHygiene(context.Background(), nil, true, true)
-	if e.h.calico.vethFails != 0 || e.h.state.Exists("calico-veth-leak") {
+	if e.h.calico.VethFails != 0 || e.h.State.Exists("calico-veth-leak") {
 		t.Fatal("calico checks ran/cleared nothing on a cilium node")
 	}
 }

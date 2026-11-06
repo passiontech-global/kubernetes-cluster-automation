@@ -115,7 +115,7 @@ func TestForceDeleteSkipsProtectedPods(t *testing.T) {
 
 func TestForceDeleteCap(t *testing.T) {
 	e := fixture(t)
-	e.h.cfg.Teardown.MaxForceDelete = 2
+	e.h.Cfg.Teardown.MaxForceDelete = 2
 	for i, uid := range []string{uidA, uidB, uidC} {
 		p := terminatingPod(e, fmt.Sprintf("stuck-%d", i), "default", uid, 20*time.Minute)
 		if _, err := e.cs.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
@@ -303,8 +303,8 @@ func TestKonnectivityMismatchRestartAndRateLimit(t *testing.T) {
 	if !strings.Contains(logLines(t, e), "recreating konnectivity-agent sandbox") {
 		t.Fatalf("missing restart log:\n%s", logLines(t, e))
 	}
-	if e.h.konn.fails != 0 {
-		t.Fatalf("counter=%d want 0 after action", e.h.konn.fails)
+	if e.h.konn.Fails != 0 {
+		t.Fatalf("counter=%d want 0 after action", e.h.konn.Fails)
 	}
 
 	// Cycle 3+4: mismatch persists (process still stale) — the
