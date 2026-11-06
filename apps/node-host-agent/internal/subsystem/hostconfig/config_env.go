@@ -1,19 +1,19 @@
 package hostconfig
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
-// cmd/agent used to splice into Config directly: node identity
-// (hnode — NODE_HOST_AGENT_NODE_NAME resolved in main — plus the
-// os.Hostname() fallback), the host root, and the shared vars dir
-// (also a watcher dir).
+// cmd/agent used to splice into Config directly. It embeds the shared
+// hostctx.Deps watchdog/host-context bundle (node identity, the host
+// root and the shared vars dir — also a watcher dir — promote out of
+// it); Hostname is the hostconfig-only input (the os.Hostname()
+// fallback identity).
 type EnvDeps struct {
-	NodeName string
+	hostctx.Deps
 	Hostname string
-	HostRoot string
-	VarsDir  string
 }
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob hostconfig

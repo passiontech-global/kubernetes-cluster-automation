@@ -19,23 +19,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"io/fs"
-	"net/netip"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/converge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
@@ -59,39 +53,18 @@ const (
 	defaultHTTPTimeout = 120 * time.Second
 )
 
-// Runner executes a command inside the HOST namespaces.
-type Runner interface {
-	// Run returns combined stdout ("" on error).
-	Run(ctx context.Context, name string, args ...string) (string, error)
-}
-
-// NsenterRunner enters PID 1 mount/uts/ipc/net/pid namespaces —
-// the same access community.docker.nsenter gave the ansible pod.
-// The flag set is hostexec.NSAll spelled out in argv: it is NOT
-// routed through hostexec.Runner because that would stack its own
-// Config.Timeout on top of the deadline runBudget already applied
-// to ctx — only the exec plumbing (capped output, WaitDelay) is
-// shared, via hostexec.RunCombined.
-type NsenterRunner struct{}
-
-func (NsenterRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	argv := append([]string{"nsenter", "-t", "1",
-		"-m", "-u", "-i", "-n", "-p", "--", name}, args...)
-	out, err := hostexec.RunCombined(ctx, argv...)
-	return strings.TrimRight(out, "\n"), err
-}
-
-// DirectRunner runs commands unwrapped — the standalone systemd
-// deployment (HostRoot "/") is already inside the host namespaces.
-// Same hostexec.RunCombined container-side exec as NsenterRunner,
-// minus the wrap.
-type DirectRunner struct{}
-
-func (DirectRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	out, err := hostexec.RunCombined(ctx,
-		append([]string{name}, args...)...)
-	return strings.TrimRight(out, "\n"), err
-}
+// The exec contract lives in platform/converge (it owns the systemd
+// verbs + deploys that run over it); aliased here so the Config
+// surface — and ops/hostconverge's RunnerFactory — keeps the
+// hostconfig.* spelling.
+type (
+	// Runner executes a command inside the HOST namespaces.
+	Runner = converge.Runner
+	// NsenterRunner enters PID 1's namespaces (agent-pod default).
+	NsenterRunner = converge.NsenterRunner
+	// DirectRunner runs unwrapped (standalone on-host deployment).
+	DirectRunner = converge.DirectRunner
+)
 
 // Watcher detects input changes (injectable for tests).
 type Watcher interface {
@@ -384,10 +357,21 @@ func (r *Reconciler) hp(p string) string {
 	return filepath.Join(r.cfg.HostRoot, p)
 }
 
-// run is a runner shorthand — failures are logged at Debug (the
-// caller decides which failures deserve a Warn) and never fatal.
-// Every command gets a CmdTimeout deadline: the converge ctx is
-// long-lived, so a hung host binary must time out here.
+// host is the managed-file seam the generic verbs run through —
+// built per call because tests re-stub cfg.Runner/cfg.CmdTimeout
+// after New().
+func (r *Reconciler) host() converge.Host { return converge.Host{Root: r.cfg.HostRoot} }
+
+// sysd is the systemctl verb seam, same lazy-build reasoning as host.
+func (r *Reconciler) sysd() converge.Systemd {
+	return converge.Systemd{Runner: r.cfg.Runner, Budget: r.cfg.CmdTimeout}
+}
+
+// run is a runner shorthand — failures are logged at Debug inside
+// converge.RunBudget (the caller decides which deserve a Warn) and
+// never fatal. Every command gets a CmdTimeout deadline: the
+// converge ctx is long-lived, so a hung host binary must time out
+// here.
 func (r *Reconciler) run(ctx context.Context, name string, args ...string) (string, error) {
 	return r.runBudget(ctx, r.cfg.CmdTimeout, name, args...)
 }
@@ -402,131 +386,40 @@ func (r *Reconciler) runLong(ctx context.Context, name string, args ...string) (
 }
 
 func (r *Reconciler) runBudget(ctx context.Context, budget time.Duration, name string, args ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
-	out, err := r.cfg.Runner.Run(cctx, name, args...)
-	if err != nil {
-		logger().Debug("hostconfig: host command failed",
-			"cmd", name+" "+strings.Join(args, " "), "out", out, "error", err)
-	}
-	return out, err
+	return converge.RunBudget(ctx, r.cfg.Runner, budget, name, args...)
 }
 
 // writeManaged writes content to HostRoot+path atomically when it
 // differs (sha256). Returns changed. Preserves the existing file's
-// mode; default mode when creating.
+// mode; default mode when creating. The mechanism lives in
+// converge.Host — this wrapper owns hostconfig's writes metric and
+// cycle-error attribution.
 func (r *Reconciler) writeManaged(path string, content []byte, mode os.FileMode) (bool, error) {
-	dst := r.hp(path)
-	// Streamed hash + pagecache drop: dst can be a staged binary in
-	// the tens of MB (self-stage) — os.ReadFile would pull it into
-	// the pod's charged page cache every cycle.
-	if oldHex, err := pagecache.Sha256File(dst); err == nil {
-		nsum := sha256.Sum256(content)
-		if oldHex == hex.EncodeToString(nsum[:]) {
-			return false, nil
-		}
-		if st, err := os.Stat(dst); err == nil {
-			mode = st.Mode().Perm()
-		}
-	} else if !os.IsNotExist(err) {
-		logger().Warn("hostconfig: read managed file failed", "path", path, "error", err)
-		r.noteErr(err)
-		return false, err
-	}
-	fail := func(err error) (bool, error) {
-		logger().Warn("hostconfig: write managed file failed", "path", path, "error", err)
-		r.noteErr(err)
-		return false, err
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return fail(err)
-	}
-	tmp := dst + ".hostconfig.tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	changed, err := r.host().WriteManaged(path, content, mode)
 	if err != nil {
-		return fail(err)
+		r.noteErr(err)
+		return false, err
 	}
-	// A short write is a failed write — n < len(content) means a
-	// truncated file would be promoted by the rename below.
-	if n, err := f.Write(content); err != nil || n < len(content) {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		if err == nil {
-			err = io.ErrShortWrite
-		}
-		return fail(err)
+	if changed {
+		r.writes.WithLabelValues(path).Inc()
 	}
-	// fsync BEFORE rename — the content must be durable at the final
-	// name, so a crash after rename can never expose a zeroed file.
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return fail(err)
-	}
-	// Evict the just-written pages — a staged binary's cache charge
-	// outlives the write otherwise (see pagecache doc). After Sync
-	// the pages are clean, so DONTNEED drops them outright.
-	pagecache.Drop(f)
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return fail(err)
-	}
-	if err := os.Chmod(tmp, mode); err != nil {
-		_ = os.Remove(tmp)
-		return fail(err)
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return fail(err)
-	}
-	// Parent-dir fsync: the rename is only durable once the new
-	// directory entry is flushed.
-	if d, err := os.Open(filepath.Dir(dst)); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
-	r.writes.WithLabelValues(path).Inc()
-	logger().Info("hostconfig: wrote managed file", "path", path)
-	return true, nil
+	return changed, nil
 }
 
 func (r *Reconciler) removeManaged(path string) (bool, error) {
-	dst := r.hp(path)
-	fi, err := os.Lstat(dst)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			logger().Warn("hostconfig: remove stat failed — treating as absent",
-				"path", path, "error", err)
-		}
-		return false, nil
-	}
-	if fi.IsDir() {
-		logger().Warn("hostconfig: remove refused — path is a dir", "path", path)
-		err := fmt.Errorf("removeManaged: %s is a dir", path)
-		r.noteErr(err)
-		return false, err
-	}
-	if err := os.Remove(dst); err != nil {
-		logger().Warn("hostconfig: remove file failed", "path", path, "error", err)
-		r.noteErr(err)
-		return false, err
-	}
-	logger().Info("hostconfig: removed file", "path", path)
-	return true, nil
+	changed, err := r.host().RemoveManaged(path)
+	r.noteErr(err)
+	return changed, err
 }
 
 func (r *Reconciler) ensureDir(path string, mode os.FileMode) error {
-	if err := os.MkdirAll(r.hp(path), mode); err != nil {
-		logger().Warn("hostconfig: ensure dir failed", "path", path, "error", err)
-		r.noteErr(err)
-		return err
-	}
-	return nil
+	err := r.host().EnsureDir(path, mode)
+	r.noteErr(err)
+	return err
 }
 
 func (r *Reconciler) fileExists(path string) bool {
-	_, err := os.Stat(r.hp(path))
-	return err == nil
+	return r.host().FileExists(path)
 }
 
 // watchdogStateDir is the shared latch dir every subsystem writes
@@ -559,26 +452,30 @@ func (r *Reconciler) render(name string, ctx map[string]any) ([]byte, error) {
 }
 
 // --- systemd helpers via runner ---
+//
+// The verbs themselves live in converge.Systemd; these wrappers keep
+// the actions metric, the Warn, and noteErr attribution on the
+// hostconfig side.
 
 func (r *Reconciler) daemonReload(ctx context.Context) {
 	r.actions.WithLabelValues("daemon-reload").Inc()
-	if _, err := r.run(ctx, "systemctl", "daemon-reload"); err != nil {
+	if err := r.sysd().DaemonReload(ctx); err != nil {
 		logger().Warn("hostconfig: daemon-reload failed", "error", err)
 		r.noteErr(err)
 	}
 }
 
 func (r *Reconciler) isActive(ctx context.Context, unit string) bool {
-	out, err := r.run(ctx, "systemctl", "is-active", unit)
-	return err == nil && strings.TrimSpace(out) == "active"
+	return r.sysd().IsActive(ctx, unit)
 }
 
 func (r *Reconciler) serviceState(ctx context.Context, unit string) string {
-	out, _ := r.run(ctx, "systemctl", "show", unit, "-p", "ActiveState", "--value")
-	return strings.TrimSpace(out)
+	return r.sysd().ServiceState(ctx, unit)
 }
 
-// ensureService ports systemd_service enabled+state.
+// ensureService ports systemd_service enabled+state. Routed through
+// the per-verb wrappers (not converge.Systemd.EnsureService) so each
+// failed verb keeps its own actions metric + noteErr.
 func (r *Reconciler) ensureService(ctx context.Context, unit string, enable, start bool) {
 	if enable {
 		r.enableService(ctx, unit)
@@ -592,7 +489,7 @@ func (r *Reconciler) ensureService(ctx context.Context, unit string, enable, sta
 
 func (r *Reconciler) enableService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("enable:" + unit).Inc()
-	if _, err := r.run(ctx, "systemctl", "enable", unit); err != nil {
+	if err := r.sysd().EnableService(ctx, unit); err != nil {
 		logger().Warn("hostconfig: enable failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
@@ -600,7 +497,7 @@ func (r *Reconciler) enableService(ctx context.Context, unit string) {
 
 func (r *Reconciler) startService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("start:" + unit).Inc()
-	if _, err := r.run(ctx, "systemctl", "start", unit); err != nil {
+	if err := r.sysd().StartService(ctx, unit); err != nil {
 		logger().Warn("hostconfig: start failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
@@ -608,7 +505,7 @@ func (r *Reconciler) startService(ctx context.Context, unit string) {
 
 func (r *Reconciler) stopService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("stop:" + unit).Inc()
-	if _, err := r.run(ctx, "systemctl", "stop", unit); err != nil {
+	if err := r.sysd().StopService(ctx, unit); err != nil {
 		logger().Warn("hostconfig: stop failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
@@ -616,7 +513,7 @@ func (r *Reconciler) stopService(ctx context.Context, unit string) {
 
 func (r *Reconciler) restartService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("restart:" + unit).Inc()
-	if _, err := r.run(ctx, "systemctl", "restart", unit); err != nil {
+	if err := r.sysd().RestartService(ctx, unit); err != nil {
 		logger().Warn("hostconfig: restart failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
@@ -624,7 +521,7 @@ func (r *Reconciler) restartService(ctx context.Context, unit string) {
 
 func (r *Reconciler) reloadService(ctx context.Context, unit string) {
 	r.actions.WithLabelValues("reload:" + unit).Inc()
-	if _, err := r.run(ctx, "systemctl", "reload", unit); err != nil {
+	if err := r.sysd().ReloadService(ctx, unit); err != nil {
 		logger().Warn("hostconfig: reload failed", "unit", unit, "error", err)
 		r.noteErr(err)
 	}
@@ -633,25 +530,15 @@ func (r *Reconciler) reloadService(ctx context.Context, unit string) {
 // --- sh -c interpolation gates ---
 //
 // Several groups build `sh -c`/`bash -c` command strings with
-// vars-derived values (nebula tables/dev, mesh IPs, ports). Many of
-// those values land inside sed/grep patterns where shell-quoting
-// would corrupt the match — so the gate is a strict charset/shape
-// check applied BEFORE any command is built, not quoting at the
-// interpolation site. A value outside the charset counts a cycle
-// error and refuses the shell work.
-
-// shTokenRe is the safe-charset gate for values interpolated into
-// host shell commands: IPs, CIDRs, netdev/table names and paths all
-// fit; space, quote, $, `, ; & | < > never do.
-var shTokenRe = regexp.MustCompile(`^[A-Za-z0-9_.,:/@%+=-]+$`)
+// vars-derived values (nebula tables/dev, mesh IPs, ports). The
+// charset/shape predicates live in platform/converge — these
+// wrappers add the cycle-error attribution: a refused value counts a
+// cycle error AND refuses the shell work.
 
 // shToken reports whether a vars-derived value may be interpolated
-// into a host shell command. Empty stays allowed (callers keep their
-// existing empty-value semantics — an empty value cannot inject) —
-// but see the *Req variants: at slots where the value is REQUIRED an
-// empty pass still emits a malformed command.
+// into a host shell command.
 func (c *cyc) shToken(what, s string) bool {
-	if s == "" || shTokenRe.MatchString(s) {
+	if converge.SHToken(s) {
 		return true
 	}
 	c.err("hostconfig: unsafe value refused for shell interpolation",
@@ -659,18 +546,9 @@ func (c *cyc) shToken(what, s string) bool {
 	return false
 }
 
-// shIPCIDR is shToken for IP/prefix values — netip parse enforces
-// real IP/CIDR shape on top of the charset (a malformed value would
-// only produce a failing ip/nft invocation, but a vars bug should
-// surface as a cycle error, not a silent shell failure).
+// shIPCIDR is shToken for IP/prefix values.
 func (c *cyc) shIPCIDR(what, s string) bool {
-	if s == "" {
-		return true
-	}
-	if _, err := netip.ParseAddr(s); err == nil {
-		return true
-	}
-	if _, err := netip.ParsePrefix(s); err == nil {
+	if converge.SHIPCIDR(s) {
 		return true
 	}
 	c.err("hostconfig: invalid IP/CIDR refused for shell interpolation",
@@ -682,10 +560,7 @@ func (c *cyc) shIPCIDR(what, s string) bool {
 // e.g. "172.29.0") — rules use it as <base>.0/24, so <base>.0 must
 // be a valid IPv4 addr (a 3-octet base, NOT a full IP).
 func (c *cyc) shMarkerBase(what, s string) bool {
-	if s == "" {
-		return true
-	}
-	if _, err := netip.ParseAddr(s + ".0"); err == nil {
+	if converge.SHMarkerBase(s) {
 		return true
 	}
 	c.err("hostconfig: invalid marker base refused for shell interpolation",
@@ -694,12 +569,9 @@ func (c *cyc) shMarkerBase(what, s string) bool {
 }
 
 // shPort is shToken for TCP/UDP ports destined for --dport or
-// /dev/tcp interpolation: digits only, 1-65535.
+// /dev/tcp interpolation.
 func (c *cyc) shPort(what, s string) bool {
-	if s == "" {
-		return true
-	}
-	if n, err := strconv.Atoi(s); err == nil && n >= 1 && n <= 65535 {
+	if converge.SHPort(s) {
 		return true
 	}
 	c.err("hostconfig: invalid port refused for shell interpolation",
