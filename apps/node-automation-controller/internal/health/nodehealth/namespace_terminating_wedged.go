@@ -26,6 +26,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -80,14 +81,16 @@ func init() {
 func (p *namespaceTerminatingWedgedCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	nss, err := p.CS.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	nss, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.Namespaces(p.CS))
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list namespaces: %w", err)}
 	}
 	current := map[string][]string{}
 	var wedged []string
-	for i := range nss.Items {
-		ns := &nss.Items[i]
+	for i := range nss {
+		ns := &nss[i]
 		if ns.DeletionTimestamp == nil ||
 			now.Sub(ns.DeletionTimestamp.Time) < nsTerminatingMinAge {
 			continue

@@ -55,7 +55,7 @@ func TestCheckFluxHelmReleaseRetriesPatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, anno := range []string{fluxHRRequestedAtAnno, fluxHRForceAtAnno} {
+	for _, anno := range []string{kube.AnnoFluxRequestedAt, kube.AnnoFluxForceAt} {
 		v, found, _ := unstructured.NestedString(
 			got.Object, "metadata", "annotations", anno)
 		if !found || v == "" {
@@ -98,7 +98,7 @@ func TestCheckFluxHelmReleaseRetriesDepNotReady(t *testing.T) {
 	got, _ := p.Dyn.Resource(hrRetryGVR).Namespace("apps").
 		Get(ctx, "hr", metav1.GetOptions{})
 	if _, found, _ := unstructured.NestedString(
-		got.Object, "metadata", "annotations", fluxHRRequestedAtAnno); found {
+		got.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt); found {
 		t.Fatal("patch applied despite unready dependsOn")
 	}
 }
@@ -118,7 +118,7 @@ func TestCheckFluxHelmReleaseRetriesCooldown(t *testing.T) {
 	first, _ := p.Dyn.Resource(hrRetryGVR).Namespace("apps").
 		Get(ctx, "hr", metav1.GetOptions{})
 	firstToken, _, _ := unstructured.NestedString(
-		first.Object, "metadata", "annotations", fluxHRRequestedAtAnno)
+		first.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt)
 
 	// 10m later — still inside the 30m cooldown.
 	p.Now = func() time.Time { return base.Add(10 * time.Minute) }
@@ -128,7 +128,7 @@ func TestCheckFluxHelmReleaseRetriesCooldown(t *testing.T) {
 	got, _ := p.Dyn.Resource(hrRetryGVR).Namespace("apps").
 		Get(ctx, "hr", metav1.GetOptions{})
 	token, _, _ := unstructured.NestedString(
-		got.Object, "metadata", "annotations", fluxHRRequestedAtAnno)
+		got.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt)
 	if token != firstToken {
 		t.Fatal("re-patched inside the 30m cooldown")
 	}

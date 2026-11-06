@@ -2,15 +2,15 @@
 // ExternalSecret Ready=False for longer than esStuckAge gets the
 // force-sync + passiontech.dev/last-es-nudge annotations merge-patched on,
 // forcing an immediate ESO reconcile that skips the remaining
-// backoff. Rate-limited to one stamp per esNudgeCooldown by BOTH the
-// in-memory ledger and the persisted stamps esNudgeStamp reads back.
+// backoff. Rate-limited to one stamp per esNudgeCooldown by the
+// persisted stamps esNudgeStamp reads back — durable across restarts,
+// so no in-RAM ledger is needed.
 // Also carries the W9-GO1 storm census: a mass-failure storm
 // suppresses every stamp and feeds the connect auto-heal.
 package externalsecretnudge
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -92,9 +92,6 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 		return nil
 	}
 
-	// The nudged ledger needs no prune pass: stamps past the
-	// cooldown read uncooled anyway, and entries for vanished ESs
-	// are dead weight that ages out on its own.
 	nudgedNow := 0
 	for i := range list.Items {
 		es := &list.Items[i]
@@ -118,25 +115,19 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 		if !recovered && !n.esStoreReady(es) {
 			continue
 		}
-		// Persisted cooldown — survives restarts where n.nudged
-		// cannot: a force-sync / last-es-nudge stamp younger than the
-		// cooldown means the poke is already in flight.
+		// Persisted cooldown — survives restarts: a force-sync /
+		// last-es-nudge stamp younger than the cooldown means the
+		// poke is already in flight.
 		if last, ok := esNudgeStamp(es); ok && now.Sub(last) < esNudgeCooldown {
 			log.Info("skip: persisted nudge stamp inside cooldown",
 				"es", key, "ago", now.Sub(last).Truncate(time.Minute))
 			continue
 		}
-		if n.nudged.CooledDown(key, esNudgeCooldown, now) {
-			log.Info("skip: already nudged inside cooldown", "es", key)
-			continue
-		}
-		patch, err := json.Marshal(map[string]any{
-			"metadata": map[string]any{"annotations": map[string]string{
-				esForceSyncAnno: strconv.FormatInt(now.Unix(), 10),
-				// Same moment in RFC3339 — the persisted cooldown
-				// marker operators can read (and esNudgeStamp accepts).
-				esLastNudgeAnno: now.UTC().Format(time.RFC3339),
-			}},
+		patch, err := kube.MergePatchAnnos(map[string]any{
+			esForceSyncAnno: strconv.FormatInt(now.Unix(), 10),
+			// Same moment in RFC3339 — the persisted cooldown
+			// marker operators can read (and esNudgeStamp accepts).
+			esLastNudgeAnno: now.UTC().Format(time.RFC3339),
 		})
 		if err != nil {
 			return err
@@ -150,7 +141,6 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 			log.Error(err, "force-sync patch failed", "es", key)
 			continue // per-ES failures must not starve the rest
 		}
-		n.nudged.Stamp(key, now)
 		nudgedNow++
 		log.Info("ACTION: force-sync ExternalSecret", "es", key,
 			"stuckFor", now.Sub(since).Truncate(time.Minute),
