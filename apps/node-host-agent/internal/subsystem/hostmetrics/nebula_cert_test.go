@@ -4,10 +4,11 @@ package hostmetrics
 
 import (
 	"encoding/pem"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // --- nebula cert expiry ---

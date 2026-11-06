@@ -2,8 +2,8 @@
 // ratios → state-pid-fd-pressure (KernelResourceExhaustion) + the
 // node_agent_*_utilization_ratio textfile gauges (the W10 metric
 // channel — same convention the controllerhygiene textfile channel
-// uses — adding a prometheus desc means a row in hostmetrics.go's
-// descTable, and the textfile channel needs no registry change).
+// uses — adding a prometheus desc means a row in domains.go's
+// domainTable, and the textfile channel needs no registry change).
 // The Wave-10 contract overview lives in kernel_failure_latches.go.
 package hostmetrics
 

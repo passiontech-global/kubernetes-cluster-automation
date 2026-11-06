@@ -150,10 +150,13 @@ func ParseCiliumIPAM(body []byte) (used, available int, ok bool) {
 // datapath this module exists to catch early). A small constant leak
 // (~2: router + health reserved IPs) is normal, so the latch needs
 // leaked >30 or available <=2 for ConsecNeeded consecutive cycles.
-// The gauges update on every successful probe regardless. The
-// streak stays on deps (ciliumIPAMFails) — pre-Check tests poke
-// it directly.
-type CiliumIPAMCheck struct{ d *wdeps.Deps }
+// The gauges update on every successful probe regardless. Fails is
+// the consecutive exhausted-pool streak (ex-Deps.CiliumIPAMFails) —
+// tests poke it via the named Hygiene field.
+type CiliumIPAMCheck struct {
+	d     *wdeps.Deps
+	Fails int
+}
 
 // Name returns the check label / WD_SIG key.
 func (c *CiliumIPAMCheck) Name() string { return wdeps.CheckCiliumIPAM }
@@ -207,19 +210,19 @@ func (c *CiliumIPAMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.CiliumLeaked.Set(float64(leaked))
 	exhausted := leaked > 30 || (available >= 0 && available <= 2)
 	if !exhausted {
-		c.d.CiliumIPAMFails = 0
+		c.Fails = 0
 		c.d.State.Exit(hoststate.LatchCiliumIPAMExhausted, nil)
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "ok").Inc()
 		return
 	}
-	c.d.CiliumIPAMFails++
-	if c.d.CiliumIPAMFails >= c.d.Cfg.ConsecNeeded {
+	c.Fails++
+	if c.Fails >= c.d.Cfg.ConsecNeeded {
 		c.d.State.Enter(hoststate.LatchCiliumIPAMExhausted, fmt.Sprintf(
 			"used=%d in-use=%d leaked=%d available=%d", used, inUse, leaked, available))
 	} else {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-ipam-exhausted used=%d in-use=%d leaked=%d available=%d (check %d/%d)",
-			used, inUse, leaked, available, c.d.CiliumIPAMFails, c.d.Cfg.ConsecNeeded))
+			used, inUse, leaked, available, c.Fails, c.d.Cfg.ConsecNeeded))
 	}
 	c.d.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "ok").Inc()
 }

@@ -39,10 +39,9 @@ type EnvDeps struct {
 // defaults, …) stay zero — New's applyDefaults fills them exactly as
 // before.
 func ConfigFromEnv(d EnvDeps) Config {
-	hostPath := d.HostPath
-	if hostPath == nil {
-		hostPath = func(p string) string { return p }
-	}
+	// hostctx.Deps.PathJoin is the nil-safe hostPath join — no
+	// identity fallback needed here.
+	hostPath := d.PathJoin
 	cfg := Config{
 		NodeName:         d.NodeName,
 		WatchdogStateDir: d.WatchdogStateDir,

@@ -68,3 +68,15 @@ type Deps struct {
 	// and the NodeCondition target.
 	NodeName string
 }
+
+// PathJoin is the nil-safe form of the HostPath join: nil HostPath →
+// identity (the nil-dep contract Deps documents — tests and
+// partially-built bundles join host paths verbatim), non-nil →
+// HostPath(p). Consumers call it straight off the promoted field
+// instead of re-declaring the nil fallback inline.
+func (d Deps) PathJoin(p string) string {
+	if d.HostPath == nil {
+		return p
+	}
+	return d.HostPath(p)
+}

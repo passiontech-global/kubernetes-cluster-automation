@@ -3,11 +3,12 @@
 package hostmetrics
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func k0sDrift(t *testing.T, c *Collector, reason, key string) (float64, bool) {

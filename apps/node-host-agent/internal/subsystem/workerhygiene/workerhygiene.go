@@ -46,7 +46,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -72,7 +71,8 @@ import (
 // view, state store, journal tracker, metric vecs, cross-check
 // shared state) lives on the embedded *wdeps.Deps — see
 // wdeps/deps.go. The embed keeps the test contract compiling:
-// h.Cfg, h.StallFails, h.CiliumAgentKilled etc. promote through it.
+// h.Cfg, h.CiliumAgentKilled, h.<series field> etc. promote
+// through it.
 type Hygiene struct {
 	*wdeps.Deps
 
@@ -121,6 +121,12 @@ type Hygiene struct {
 	clockJump        *runtime.ClockJumpCheck
 	unlinkedFDs      *runtime.UnlinkedOpenFilesCheck
 	cgroupSwap       *runtime.CgroupSwapCheck
+
+	// feeder is the T15 kubelet watchdog feeder — not a Check (it
+	// runs on its own faster ticker Spawned from Run, outside the
+	// dispatch list) but owned here for the same reason the checks
+	// are named fields: tests reach its streak through it.
+	feeder *kubelet.Feeder
 }
 
 // The subsystem-convention export surface cmd/agent wires against:
@@ -192,54 +198,54 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		}
 	}
 	h.initChecks()
+	h.feeder = kubelet.NewFeeder(d)
 	return h, nil
 }
 
 // Name identifies the subsystem for logging.
 func (h *Hygiene) Name() string { return "workerhygiene" }
 
+// Check returns the registered check with the given wdeps.Check*
+// name, or nil. The named fields are the in-package path to check
+// state; this is the exported one — the domain test packages
+// (package X_test beside the check) reach their check's
+// streak/latch bookkeeping through it.
+func (h *Hygiene) Check(name string) wdeps.Check {
+	for _, c := range h.checks {
+		if c.Name() == name {
+			return c
+		}
+	}
+	return nil
+}
+
+// Feeder returns the T15 kubelet watchdog feeder — the exported
+// path to its state for the domain test packages.
+func (h *Hygiene) Feeder() *kubelet.Feeder { return h.feeder }
+
 // Run checks immediately, then every Interval until ctx is cancelled.
 // The T15 kubelet watchdog feeder runs on its own faster ticker in
 // parallel — the controllerhygiene runFeeder pattern (shell had a
 // dedicated systemd unit looping every ~15s).
 func (h *Hygiene) Run(ctx context.Context) {
-	// The tick self-gates on KubeletFeederActive() each round, so a
+	// The tick self-gates on Feeder.Active() each round, so a
 	// node dropped from systemd_watchdog_hosts (unit file pruned) or
 	// a WD_SIG_KUBELET_WATCHDOG=off conf rewrite idles without an
-	// agent restart. The wait makes Run's return coincide with the
-	// feeder's exit — a restarted Run must never stack a second
-	// feeder, and callers may tear down cfg paths on return.
-	// The feeder gets its OWN cancel: a bare `defer wg.Wait()` also
-	// runs during panic unwinding, but the feeder only exits on
-	// ctx.Done() — nothing cancels ctx on a Cycle panic, so Run
-	// parked forever and the agent's recover never fired (the
-	// subsystem died silently). Cancelling first bounds the wait on
-	// EVERY exit path — panic included — so the panic reaches the
-	// agent recover and a restarted Run finds the old feeder gone.
-	fctx, stop := context.WithCancel(ctx)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer func() {
-			// A feeder panic must not take the daemon down — the
-			// agent's recover only wraps Run itself, not
-			// goroutines Run spawned.
-			if r := recover(); r != nil {
-				logger().Error("workerhygiene: kubelet watchdog feeder "+
-					"panicked — feeder dead until Run restart",
-					"panic", r)
-			}
-		}()
-		kubelet.RunKubeletFeeder(fctx, h.Deps)
-	}()
-	// Feeder setup precedes the FIRST Cycle too — a first-Cycle
-	// panic must tear down a running feeder, not stack a second
-	// one behind it on the agent's restart.
-	defer func() {
-		stop()
-		wg.Wait()
-	}()
+	// agent restart. cycle.Spawn owns the feeder lifecycle: the
+	// feeder runs on a ctx derived from ctx, a feeder panic is
+	// recovered + logged inside the goroutine (the agent's recover
+	// only wraps Run itself — a feeder defect must not take the
+	// daemon down), and stop() cancels the child ctx THEN waits.
+	// Deferring stop makes Run's return coincide with the feeder's
+	// exit on EVERY exit path — panic unwinding included (the
+	// "cancel before wait" argument lives on cycle.Spawn), so a
+	// restarted Run never stacks a second feeder and callers may
+	// tear down cfg paths on return. Spawn starts the goroutine
+	// before returning, so even a first-Cycle panic unwinds past a
+	// registered stop that tears the running feeder down.
+	stop := cycle.Spawn(ctx, "workerhygiene kubelet watchdog feeder",
+		func(fctx context.Context) { h.feeder.Run(fctx) })
+	defer stop()
 	cycle.Every("workerhygiene", h.Cfg.Interval, h.Cycle).Run(ctx)
 }
 

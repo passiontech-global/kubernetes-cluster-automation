@@ -36,15 +36,42 @@ const (
 
 // --- Check: ctr-tasks (31-ctr-tasks.sh) ---
 
-// runKubeletFeeder is the T15 feeder's forever loop — returns only
-// when ctx is cancelled. The tick self-gates per round; the "start"
-// line is logged on each activation transition inside the tick, not
-// here — the goroutine also runs on nodes where the feeder never
-// activates.
-func RunKubeletFeeder(ctx context.Context, d *wdeps.Deps) {
-	cycle.Every("kubelet-feeder", d.Cfg.Kubelet.WdInterval,
-		func(cctx context.Context) { kubeletFeedTick(d, cctx) }).Run(ctx)
+// Feeder is the T15 kubelet watchdog feeder's state — the
+// consecutive-fail streak and the last-tick activation flag that
+// used to ride on Deps (KubeletWdFails/KubeletFeederWasActive) so
+// the free-function tick could reach them. Hygiene owns one; tests
+// drive Tick directly.
+type Feeder struct {
+	d *wdeps.Deps
+	// WdFails is the consecutive :10248-fail counter — in-memory
+	// like the shell's within-one-process count (an agent restart
+	// re-arms, bounded by the tick interval). Exported for the
+	// test contract (was Deps.KubeletWdFails).
+	WdFails int
+	// WasActive tracks the last tick's activation state so a
+	// false→true flip (node re-added to systemd_watchdog_hosts,
+	// unit file reinstalled, WD_SIG lifted) drops a stale partial
+	// fail-streak instead of counting it toward a restart (was
+	// Deps.KubeletFeederWasActive).
+	WasActive bool
 }
+
+// NewFeeder returns the T15 feeder bound to d.
+func NewFeeder(d *wdeps.Deps) *Feeder { return &Feeder{d: d} }
+
+// Run is the T15 feeder's forever loop — returns only when ctx is
+// cancelled. The tick self-gates per round; the "start" line is
+// logged on each activation transition inside the tick, not here —
+// the goroutine also runs on nodes where the feeder never
+// activates.
+func (f *Feeder) Run(ctx context.Context) {
+	cycle.Every("kubelet-feeder", f.d.Cfg.Kubelet.WdInterval,
+		func(cctx context.Context) { f.Tick(cctx) }).Run(ctx)
+}
+
+// Active reports whether the feeder should probe this node — see
+// kubeletFeederActive for the gate contract.
+func (f *Feeder) Active() bool { return kubeletFeederActive(f.d) }
 
 // kubeletFeederActive reports whether the feeder should probe this
 // node — the shell install gate: the unit ran only on hosts listed in
@@ -102,12 +129,13 @@ func feederWatchdogConf(d *wdeps.Deps) *watchdogconf.Config {
 //                                      NHC→SNR escalates to reboot
 //   G6 spend budget + reset-failed + systemctl restart k0sworker
 
-// kubeletFeedTick is one feeder round: probe :10248, count fails, run
-// the remediate gates at MaxFail — k0s-kubelet-watchdog.sh's loop
-// body minus the sd_notify feed (no watchdog unit exists in-agent).
-func kubeletFeedTick(d *wdeps.Deps, ctx context.Context) {
+// Tick is one feeder round: probe :10248, count fails, run the
+// remediate gates at MaxFail — k0s-kubelet-watchdog.sh's loop body
+// minus the sd_notify feed (no watchdog unit exists in-agent).
+func (f *Feeder) Tick(ctx context.Context) {
+	d := f.d
 	active := kubeletFeederActive(d)
-	if active && !d.KubeletFeederWasActive {
+	if active && !f.WasActive {
 		// false→true activation (first active tick, node re-added to
 		// systemd_watchdog_hosts, unit file reinstalled, WD_SIG
 		// lifted) — a partial fail-streak from before the gap is
@@ -116,22 +144,22 @@ func kubeletFeedTick(d *wdeps.Deps, ctx context.Context) {
 			"kubelet-feeder: start interval=%ds maxfail=%d url=%s",
 			int(d.Cfg.Kubelet.WdInterval.Seconds()), d.Cfg.Kubelet.WdMaxFail,
 			d.Cfg.Kubelet.WdProbeURL))
-		if d.KubeletWdFails > 0 {
+		if f.WdFails > 0 {
 			d.State.AppendLog(fmt.Sprintf(
-				"kubelet-feeder: re-activated — dropping %d stale fails", d.KubeletWdFails))
+				"kubelet-feeder: re-activated — dropping %d stale fails", f.WdFails))
 		}
-		d.KubeletWdFails = 0
+		f.WdFails = 0
 	}
-	d.KubeletFeederWasActive = active
+	f.WasActive = active
 	if !active {
 		return
 	}
 	if d.Cfg.Seams.ProbeBodyOK(ctx, d.Cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
-		if d.KubeletWdFails > 0 {
+		if f.WdFails > 0 {
 			d.State.AppendLog(fmt.Sprintf(
-				"kubelet-feeder: probe OK again after %d fail", d.KubeletWdFails))
+				"kubelet-feeder: probe OK again after %d fail", f.WdFails))
 		}
-		d.KubeletWdFails = 0
+		f.WdFails = 0
 		d.State.Exit(hoststate.LatchKubeletHealthzDown, nil)
 		return
 	}
@@ -153,36 +181,37 @@ func kubeletFeedTick(d *wdeps.Deps, ctx context.Context) {
 			return
 		}
 		if !active {
-			if d.KubeletWdFails > 0 {
+			if f.WdFails > 0 {
 				d.State.AppendLog("kubelet-feeder: k0sworker not active — fails reset (PartOf parity)")
 			}
-			d.KubeletWdFails = 0
+			f.WdFails = 0
 			d.State.Exit(hoststate.LatchKubeletHealthzDown, nil)
 			return
 		}
 	}
-	d.KubeletWdFails++
+	f.WdFails++
 	d.State.AppendLog(fmt.Sprintf("kubelet-feeder: probe fail %d/%d",
-		d.KubeletWdFails, d.Cfg.Kubelet.WdMaxFail))
-	if d.KubeletWdFails < d.Cfg.Kubelet.WdMaxFail {
+		f.WdFails, d.Cfg.Kubelet.WdMaxFail))
+	if f.WdFails < d.Cfg.Kubelet.WdMaxFail {
 		return
 	}
 	d.State.AppendLog(fmt.Sprintf(
 		"kubelet-feeder: %d consecutive fails (~%ds) — running remediation gates",
-		d.KubeletWdFails,
+		f.WdFails,
 		int(d.Cfg.Kubelet.WdInterval.Seconds())*d.Cfg.Kubelet.WdMaxFail))
-	runKubeletRemediate(d, ctx)
+	f.remediate(ctx)
 	// Re-arm like the shell's exit-1 → unit fail → OnFailure →
 	// Restart=always round: the remediate pass ENDS this fails run
 	// whatever the gates decided.
-	d.KubeletWdFails = 0
+	f.WdFails = 0
 }
 
-// runKubeletRemediate is the ordered-gate port of
+// remediate is the ordered-gate port of
 // k0sworker-remediate.sh — a probe failure does NOT prove the kubelet
 // is dead (the probe may just be timing out under steal); every gate
 // is a chance to stop before the shared last-restart budget is spent.
-func runKubeletRemediate(d *wdeps.Deps, ctx context.Context) {
+func (f *Feeder) remediate(ctx context.Context) {
+	d := f.d
 	d.Actions.WithLabelValues(wdeps.CheckKubeletWd, "remediate").Inc()
 	d.State.AppendLog("kubelet-remediate: healthz :10248 down ~60s — running ordered gates before k0sworker restart")
 
@@ -196,7 +225,7 @@ func runKubeletRemediate(d *wdeps.Deps, ctx context.Context) {
 		if d.Cfg.Seams.ProbeBodyOK(ctx, d.Cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
 			d.State.AppendLog(fmt.Sprintf(
 				"kubelet-remediate: SKIP(G0-reprobe) :10248 answered 'ok' on re-probe %d — false alarm (steal blip), self-correcting", i))
-			d.KubeletWdFails = 0
+			f.WdFails = 0
 			d.State.Exit(hoststate.LatchKubeletHealthzDown, nil)
 			return
 		}

@@ -131,13 +131,14 @@ func (c *Collector) updateCertLatch(days int64, ok bool) {
 
 // collectNebulaCert emits the cert days-left gauge — only when the
 // cert parses (absent/garbage cert → absent series, distinguishing
-// "no cert" from "0 days").
-func (c *Collector) collectNebulaCert(ch chan<- prometheus.Metric, daysLeft int64, ok bool) {
-	if !ok {
+// "no cert" from "0 days"). The parse result arrives via scrapeCtx
+// — Collect already ran nebulaCertDaysLeft for the latch updaters.
+func (c *Collector) collectNebulaCert(ch chan<- prometheus.Metric, sc scrapeCtx) {
+	if !sc.certOK {
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(descNebCertDays,
-		prometheus.GaugeValue, float64(daysLeft))
+		prometheus.GaugeValue, float64(sc.certDays))
 }
 
 // nebulaCertDaysLeft returns days until notAfter, and ok=false when

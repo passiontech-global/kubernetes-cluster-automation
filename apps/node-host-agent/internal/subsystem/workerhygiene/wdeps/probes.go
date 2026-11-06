@@ -35,7 +35,7 @@ func deletedFDStat(path string) (dev, ino uint64, size int64, ok bool) {
 	if !ok {
 		return 0, 0, 0, false
 	}
-	return uint64(st.Dev), st.Ino, st.Size, true
+	return st.Dev, st.Ino, st.Size, true
 }
 
 // tcpDNSQuery is the DNSProbeTCP default — the same minimal A-record

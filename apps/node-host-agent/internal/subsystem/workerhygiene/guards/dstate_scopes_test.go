@@ -1,10 +1,11 @@
 // dstate_scopes_test.go — A2 zombie-storm latch + per-episode
 // ACTION log + PID-reuse streak resets.
-package workerhygiene
+package guards_test
 
 import (
 	"context"
 	"fmt"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,7 +18,7 @@ import (
 // mkZombieProc writes a Z-state stat for pid whose parent is ppid.
 func mkZombieProc(t *testing.T, e *env, pid, ppid int) {
 	t.Helper()
-	d := filepath.Join(e.proc, strconv.Itoa(pid))
+	d := filepath.Join(e.ProcDir, strconv.Itoa(pid))
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -29,10 +30,10 @@ func mkZombieProc(t *testing.T, e *env, pid, ppid int) {
 
 func TestZombieStormLatchesAndLogsAction(t *testing.T) {
 	e := fixture(t)
-	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.Cfg.Pressure.ZombieStormThreshold = 3 // fake proc trees are small
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.H.Cfg.Pressure.ZombieStormThreshold = 3 // fake proc trees are small
 	uid := "11111111_2222_3333_4444_555555555555"
-	parent := filepath.Join(e.proc, "777")
+	parent := filepath.Join(e.ProcDir, "777")
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -44,12 +45,12 @@ func TestZombieStormLatchesAndLogsAction(t *testing.T) {
 		mkZombieProc(t, e, pid, 777)
 	}
 	for i := 0; i < 2; i++ {
-		e.h.Cycle(context.Background())
+		e.H.Cycle(context.Background())
 	}
-	if !e.h.State.Exists("zombie-storm") {
+	if !e.H.State.Exists("zombie-storm") {
 		t.Fatal("state-zombie-storm should latch after 2 storm cycles")
 	}
-	data, err := os.ReadFile(e.h.Cfg.WatchdogLogFile)
+	data, err := os.ReadFile(e.H.Cfg.WatchdogLogFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +67,7 @@ func mkParentProc(t *testing.T, e *env, pid int, starttime string) {
 	t.Helper()
 	// Fields after ')' start at field 3: f[0]=state … f[19]=
 	// starttime (field 22) — 20 fields total.
-	writeFile(t, filepath.Join(e.proc, strconv.Itoa(pid), "stat"),
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, strconv.Itoa(pid), "stat"),
 		fmt.Sprintf("%d (parent) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 %s",
 			pid, starttime))
 }
@@ -76,19 +77,19 @@ func mkParentProc(t *testing.T, e *env, pid int, starttime string) {
 // every repeat becomes a fresh K8s Event via nodereporter.
 func TestZombieStormActionLoggedOncePerEpisode(t *testing.T) {
 	e := fixture(t)
-	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.Cfg.Pressure.ZombieStormThreshold = 3
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.H.Cfg.Pressure.ZombieStormThreshold = 3
 	mkParentProc(t, e, 777, "111111")
 	for pid := 800; pid < 805; pid++ {
 		mkZombieProc(t, e, pid, 777)
 	}
 	for i := 0; i < 4; i++ {
-		e.h.Cycle(context.Background())
+		e.H.Cycle(context.Background())
 	}
-	if !e.h.State.Exists("zombie-storm") {
+	if !e.H.State.Exists("zombie-storm") {
 		t.Fatal("storm latch should hold while the storm persists")
 	}
-	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 1 {
+	if n := strings.Count(e.LogLines(t), "ACTION zombie-storm:"); n != 1 {
 		t.Fatalf("ACTION zombie-storm logged %d times over 4 storm cycles, want 1", n)
 	}
 }
@@ -98,35 +99,35 @@ func TestZombieStormActionLoggedOncePerEpisode(t *testing.T) {
 // the dead parent's count and holding a dead latch open.
 func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 	e := fixture(t)
-	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.Cfg.Pressure.ZombieStormThreshold = 3
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.H.Cfg.Pressure.ZombieStormThreshold = 3
 	mkParentProc(t, e, 777, "111111")
 	for pid := 800; pid < 805; pid++ {
 		mkZombieProc(t, e, pid, 777)
 	}
-	e.h.Cycle(context.Background()) // streak 1
-	e.h.Cycle(context.Background()) // streak 2 → ACTION + latch
-	if !e.h.State.Exists("zombie-storm") {
+	e.H.Cycle(context.Background()) // streak 1
+	e.H.Cycle(context.Background()) // streak 2 → ACTION + latch
+	if !e.H.State.Exists("zombie-storm") {
 		t.Fatal("latch expected after 2 storm cycles")
 	}
 	// pid 777 is RECYCLED — same ppid, different starttime. The
 	// dead parent's streak must not carry: the new generation
 	// restarts at streak 1, the latch drops, no second ACTION yet.
 	mkParentProc(t, e, 777, "222222")
-	e.h.Cycle(context.Background())
-	if e.h.State.Exists("zombie-storm") {
+	e.H.Cycle(context.Background())
+	if e.H.State.Exists("zombie-storm") {
 		t.Fatal("recycled ppid must not inherit the dead parent's streak")
 	}
-	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 1 {
+	if n := strings.Count(e.LogLines(t), "ACTION zombie-storm:"); n != 1 {
 		t.Fatalf("ACTION zombie-storm count=%d want 1", n)
 	}
 	// The new generation earns its own streak — latch + ACTION
 	// again on its own entry.
-	e.h.Cycle(context.Background())
-	if !e.h.State.Exists("zombie-storm") {
+	e.H.Cycle(context.Background())
+	if !e.H.State.Exists("zombie-storm") {
 		t.Fatal("recycled parent's own streak should re-latch")
 	}
-	if n := strings.Count(logLines(t, e), "ACTION zombie-storm:"); n != 2 {
+	if n := strings.Count(e.LogLines(t), "ACTION zombie-storm:"); n != 2 {
 		t.Fatalf("recycled parent logs its own ACTION on streak entry; count=%d want 2", n)
 	}
 }
@@ -138,26 +139,26 @@ func TestZombieStormPIDReuseResetsStreak(t *testing.T) {
 // storm dropped under the threshold.
 func TestZombieStormLatchDropsBelowThreshold(t *testing.T) {
 	e := fixture(t)
-	e.sdReply["is-active k0sworker.service"] = "active"
-	e.h.Cfg.Pressure.ZombieStormThreshold = 3
+	e.SDReply["is-active k0sworker.service"] = "active"
+	e.H.Cfg.Pressure.ZombieStormThreshold = 3
 	mkParentProc(t, e, 777, "111111")
 	for pid := 800; pid < 805; pid++ {
 		mkZombieProc(t, e, pid, 777)
 	}
-	e.h.Cycle(context.Background())
-	e.h.Cycle(context.Background())
-	if !e.h.State.Exists("zombie-storm") {
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
+	if !e.H.State.Exists("zombie-storm") {
 		t.Fatal("latch expected after 2 storm cycles")
 	}
 	// Storm drains to 2 zombies (≤ threshold but >0) — the parent
 	// still has zombie children, but the latch must drop NOW.
 	for pid := 800; pid < 803; pid++ {
-		if err := os.RemoveAll(filepath.Join(e.proc, strconv.Itoa(pid))); err != nil {
+		if err := os.RemoveAll(filepath.Join(e.ProcDir, strconv.Itoa(pid))); err != nil {
 			t.Fatal(err)
 		}
 	}
-	e.h.Cycle(context.Background())
-	if e.h.State.Exists("zombie-storm") {
+	e.H.Cycle(context.Background())
+	if e.H.State.Exists("zombie-storm") {
 		t.Fatal("latch held an extra cycle after storm dropped below threshold")
 	}
 }

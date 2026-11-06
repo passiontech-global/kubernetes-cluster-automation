@@ -4,11 +4,12 @@ package hostmetrics
 
 import (
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestWatchdogStates(t *testing.T) {

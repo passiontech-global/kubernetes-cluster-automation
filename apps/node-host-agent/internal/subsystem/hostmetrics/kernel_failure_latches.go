@@ -35,7 +35,7 @@ import (
 //     (KernelResourceExhaustion) + the node_agent_*_utilization_ratio
 //     textfile gauges (the W10 metric channel — same convention the
 //     controllerhygiene textfile channel uses; a new prometheus desc
-//     would mean a descTable row in hostmetrics.go, the textfile
+//     would mean a domainTable row in domains.go, the textfile
 //     channel needs no registry change).
 //   - W10-KR5 checkClockSkew (clockskew.go): chronyc tracking
 //     (adjtimex offset fallback) → state-clock-skew

@@ -43,6 +43,10 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
   ops/etcdmaint+eventpurge).
 - `internal/testutil` — shared fakes/fixture builders for the
   internal test suites.
+- `internal/subsystem/workerhygiene/wdepstest` — exported fixture
+  builder (`Fixture` + `wdepstest.Check[T]` accessor) so the domain
+  packages' external `package X_test` files can drive a full
+  `*workerhygiene.Hygiene` without importing the parent package.
 
 ## Layering (enforced by depguard in the root .golangci.yml)
 

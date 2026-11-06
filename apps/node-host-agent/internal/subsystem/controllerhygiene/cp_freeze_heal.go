@@ -273,8 +273,9 @@ func (c *cpFreezeCheck) peerHealthy(ctx context.Context) bool {
 }
 
 // cpFreezeCheck is the W8-CP3/W10-FIX1 freeze auto-heal as a
-// Check — its only in-memory state is the kcmQuietSince stamp kept
-// on deps; everything else is the consecutive-cp-freeze / kcm-queue
+// Check — its only in-memory state is the kcmQuietSince stamp +
+// the APF reject baseline, both kept on the check itself;
+// everything else is the consecutive-cp-freeze / kcm-queue
 // snapshot bookkeeping. It also owns the ungated-cycle dispatch
 // slot the W10-CP2 kine-storage and W10-CP5 kubeconfig-cert checks
 // ride (initChecks wires them in).
@@ -282,6 +283,12 @@ type cpFreezeCheck struct {
 	d           *deps
 	kineStorage *kineStorageCheck
 	kubeCert    *kubeCertCheck
+
+	// kcmQuietSince is the first cycle the KCM read
+	// leader+stalled-queue — leader-without-progress only counts as
+	// frozen after CPFreezeQuietFor (W8-CP3/W10-FIX1). In-memory:
+	// an agent restart just re-arms the quiet window.
+	kcmQuietSince time.Time
 
 	// apfMetricsFn is the apiserver /metrics scrape seam behind
 	// probeAPF — nil → the mTLS GET over deps.ensureClient (the
@@ -354,17 +361,17 @@ func (c *cpFreezeCheck) Run(ctx context.Context) {
 			}
 		}
 		if stalled {
-			if c.d.kcmQuietSince.IsZero() {
-				c.d.kcmQuietSince = c.d.cfg.nowFn()
+			if c.kcmQuietSince.IsZero() {
+				c.kcmQuietSince = c.d.cfg.nowFn()
 				c.d.state.Incr(fileCtrKCMQuiet)
 			}
-			if c.d.cfg.nowFn().Sub(c.d.kcmQuietSince) >= c.d.cfg.CPFreeze.QuietFor {
+			if c.d.cfg.nowFn().Sub(c.kcmQuietSince) >= c.d.cfg.CPFreeze.QuietFor {
 				frozen = true
 				reason = fmt.Sprintf("kcm workqueue stalled >%s",
 					c.d.cfg.CPFreeze.QuietFor)
 			}
 		} else {
-			c.d.kcmQuietSince = time.Time{}
+			c.kcmQuietSince = time.Time{}
 			c.d.state.ResetCounter(fileCtrKCMQuiet)
 		}
 	}
@@ -402,7 +409,7 @@ func (c *cpFreezeCheck) Run(ctx context.Context) {
 		c.d.state.RateSpend(fileRateCPRestart)
 		c.d.state.ResetCounter(fileCtrCPFreeze)
 		c.d.state.ResetCounter(fileCtrKCMQuiet)
-		c.d.kcmQuietSince = time.Time{}
+		c.kcmQuietSince = time.Time{}
 		if err := c.d.cfg.restartFn(ctx, c.d.cfg.RestartUnit); err != nil {
 			c.d.state.AppendLogWarn(fmt.Sprintf(
 				"suspect: restart %s failed: %v", c.d.cfg.RestartUnit, err))
@@ -629,9 +636,9 @@ func (c *cpFreezeCheck) probeAPF(ctx context.Context) {
 			"flow_schema=%s priority_level=%s +%.0f rejects (inqueue %.0f)",
 			o.key.flowSchema, o.key.priorityLevel, o.delta, o.inqueue))
 	}
-	c.d.state.SuspectLog(logKeyAPFStarve, fmt.Sprintf(
-		"suspect: apiserver APF queue starvation — flow-schema queues rejecting requests: %s",
-		strings.Join(parts, "; ")), c.d.cfg.SuspectLogCadence)
+	c.d.state.SuspectLog(logKeyAPFStarve,
+		"suspect: apiserver APF queue starvation — flow-schema queues rejecting requests: "+
+			strings.Join(parts, "; "), c.d.cfg.SuspectLogCadence)
 }
 
 // emitAPFMetrics renders node-agent-apiserver-apf.prom — the

@@ -6,8 +6,9 @@ import (
 	"math"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // --- H1: clock sync (adjtimex) ---

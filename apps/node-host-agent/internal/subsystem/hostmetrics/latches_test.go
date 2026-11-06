@@ -1,10 +1,11 @@
 package hostmetrics
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestKernelKeysUsedRatio(t *testing.T) {

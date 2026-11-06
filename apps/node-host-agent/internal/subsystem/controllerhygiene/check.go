@@ -27,6 +27,18 @@ type Check interface {
 	Run(ctx context.Context)
 }
 
+// bind is initChecks's single declaration point for one check: it
+// stores the instance in its named field slot (tests and the
+// old-shape forwarders still reach them by name) AND appends the
+// dispatch entry to the group's list — slot, name and table row
+// used to be maintained in two parallel lists that could drift.
+// Bind-call order inside a group IS the dispatch order; the group
+// boundary is where the target entries slice switches.
+func bind[C Check](slot *C, c C, entries *[]checks.Entry, name string) {
+	*slot = c
+	*entries = append(*entries, checks.Entry{Name: name, Run: c.Run})
+}
+
 // initChecks builds the ordered dispatch table Cycle drives — the
 // workerhygiene initChecks pattern. Order + grouping are
 // load-bearing: the 60s-timer guards (kine pool, OOM loop) had no
@@ -35,54 +47,46 @@ type Check interface {
 // no WD_SIG kill switch (the shell timers had none) — Dispatch gets
 // a nil sigOn and every entry runs.
 func (h *Hygiene) initChecks() {
-	h.kinePool = &kinePoolCheck{d: h.deps}
-	h.oomLoop = &oomLoopCheck{d: h.deps}
-	h.etcd = &etcdGuardCheck{d: h.deps}
+	// Group 1 — ungated. etcdguard sits with the 60s-timer
+	// guards: an embedded etcd that hit quota during boot needs
+	// the guard BEFORE the 20min wedge grace, and hosts without
+	// etcdctl no-op. W8-CP3/CP4 are ungated like the guards too —
+	// a frozen KCM/scheduler or a stale PKI reload must not wait
+	// out the module-22 boot grace; both probes are read-only
+	// until their own consecutive-cycle + rate budgets pass.
+	var ungated []checks.Entry
+	bind(&h.kinePool, &kinePoolCheck{d: h.deps}, &ungated, checkKinePool)
+	bind(&h.oomLoop, &oomLoopCheck{d: h.deps}, &ungated, checkOOMLoop)
+	bind(&h.etcd, &etcdGuardCheck{d: h.deps}, &ungated, checkEtcd)
 	// The W10-CP2/W10-CP5 ride-alongs share the cp-freeze dispatch
 	// slot — cpFreezeCheck.Run invokes them before its own probe so
 	// they keep the pre-uptime-gate position they had as inlined
-	// calls (same pre-Check order).
+	// calls (same pre-Check order). They stay named fields (the
+	// forwarders reach them) but get no table row of their own —
+	// built first, then handed to cpFreeze explicitly.
 	h.kineStorage = &kineStorageCheck{d: h.deps}
 	h.kubeCert = &kubeCertCheck{d: h.deps}
-	h.cpFreeze = &cpFreezeCheck{
+	bind(&h.cpFreeze, &cpFreezeCheck{
 		d:           h.deps,
 		kineStorage: h.kineStorage,
 		kubeCert:    h.kubeCert,
-	}
-	h.pkiDrift = &pkiDriftCheck{d: h.deps}
-	h.hub = &apiserverHubCheck{d: h.deps}
-	h.kineTTL = &kineTTLCheck{d: h.deps}
+	}, &ungated, checkCPFreeze)
+	bind(&h.pkiDrift, &pkiDriftCheck{d: h.deps}, &ungated, checkPKIDrift)
+
+	// Group 2 — WD_REQUIRES: uptime unit:k0scontroller — the
+	// 20min post-boot grace before the destructive wedge/TTL
+	// checks. The skip counts ONCE under checkHub — the label
+	// the gated cycle always reported.
+	var gated []checks.Entry
+	bind(&h.hub, &apiserverHubCheck{d: h.deps}, &gated, checkHub)
+	bind(&h.kineTTL, &kineTTLCheck{d: h.deps}, &gated, checkKineTTL)
+
 	h.groups = []checks.Group{
+		{Entries: ungated},
 		{
-			Entries: []checks.Entry{
-				{Name: checkKinePool, Run: h.kinePool.Run},
-				{Name: checkOOMLoop, Run: h.oomLoop.Run},
-				// etcdguard is in the ungated group like
-				// kine-pool/oomloop — an embedded etcd that hit
-				// quota during boot needs the guard BEFORE the
-				// 20min wedge grace, and hosts without etcdctl
-				// no-op.
-				{Name: checkEtcd, Run: h.etcd.Run},
-				// W8-CP3/CP4 are ungated like the 60s-timer
-				// guards: a frozen KCM/scheduler or a stale PKI
-				// reload must not wait out the module-22 boot
-				// grace — both probes are read-only until their
-				// own consecutive-cycle + rate budgets pass.
-				{Name: checkCPFreeze, Run: h.cpFreeze.Run},
-				{Name: checkPKIDrift, Run: h.pkiDrift.Run},
-			},
-		},
-		{
-			// WD_REQUIRES: uptime unit:k0scontroller — 20min
-			// grace after boot before the destructive wedge/TTL
-			// checks. The skip counts ONCE under checkHub —
-			// the label the gated cycle always reported.
 			GateOK:    h.uptimeOK,
 			GateLabel: checkHub,
-			Entries: []checks.Entry{
-				{Name: checkHub, Run: h.hub.Run},
-				{Name: checkKineTTL, Run: h.kineTTL.Run},
-			},
+			Entries:   gated,
 		},
 	}
 }

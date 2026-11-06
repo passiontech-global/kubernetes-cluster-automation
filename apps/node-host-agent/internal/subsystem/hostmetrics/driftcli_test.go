@@ -1,10 +1,11 @@
 package hostmetrics
 
 import (
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // findingKeys returns the keys of every finding with the given

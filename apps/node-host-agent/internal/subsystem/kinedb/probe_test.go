@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"net"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestPGStartupMessage(t *testing.T) {

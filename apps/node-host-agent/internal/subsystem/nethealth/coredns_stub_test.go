@@ -4,8 +4,9 @@ package nethealth
 
 import (
 	"context"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // --- coredns-stub (21) ---

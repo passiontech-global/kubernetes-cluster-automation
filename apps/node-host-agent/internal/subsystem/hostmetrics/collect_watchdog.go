@@ -128,11 +128,12 @@ var (
 		[]string{"signal"}, nil)
 )
 
-// collectWatchdog scans state-* latch files. certDays/certOK fold the
-// agent-computed nebula cert expiry into the latch bookkeeping: the
-// shell module 13 used to own the state-nebula-cert-expiring file —
-// now the series is driven by cert parsing whenever the cert reads.
-func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, certDays int64, certOK bool) {
+// collectWatchdog scans state-* latch files. sc.certDays/sc.certOK
+// fold the agent-computed nebula cert expiry into the latch
+// bookkeeping: the shell module 13 used to own the
+// state-nebula-cert-expiring file — now the series is driven by
+// cert parsing whenever the cert reads.
+func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, sc scrapeCtx) {
 	present := map[string]bool{}
 	entries, err := os.ReadDir(c.cfg.WatchdogStateDir)
 	switch {
@@ -173,10 +174,10 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, certDays int64,
 		}
 		return
 	}
-	if certOK && certDays < nebulaCertWarnDays {
+	if sc.certOK && sc.certDays < nebulaCertWarnDays {
 		present[hoststate.LatchNebulaCertExpiring] = true
 	}
-	for _, name := range c.seen.update(present, certOK, c.cfg.nowFn()) {
+	for _, name := range c.seen.update(present, sc.certOK, c.cfg.nowFn()) {
 		v := 0.0
 		if present[name] {
 			v = 1

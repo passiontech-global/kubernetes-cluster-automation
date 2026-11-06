@@ -3,11 +3,12 @@ package kinedb
 import (
 	"context"
 	"errors"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestGuardTrigger(t *testing.T) {

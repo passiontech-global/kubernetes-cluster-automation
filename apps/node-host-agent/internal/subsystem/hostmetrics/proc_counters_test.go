@@ -6,8 +6,9 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // counterValue mirrors metricValue for Counter-typed series.

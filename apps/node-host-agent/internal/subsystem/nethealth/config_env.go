@@ -21,10 +21,6 @@ type EnvDeps struct {
 // package, not in cmd/agent. The enable gate
 // (NODE_HOST_AGENT_ENABLE_NETHEALTH) stays in the caller.
 func ConfigFromEnv(d EnvDeps) Config {
-	hostPath := d.HostPath
-	if hostPath == nil {
-		hostPath = func(p string) string { return p }
-	}
 	cfg := Config{
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogLogFile:  d.WatchdogLogFile,
@@ -40,9 +36,9 @@ func ConfigFromEnv(d EnvDeps) Config {
 		// which hardcode the "/host" prefix and would be wrong on a
 		// standalone host (hostRoot "/").
 		envx.StringKnob("NODE_HOST_AGENT_HOST_RESOLV_CONF", &cfg.HostResolvConf,
-			hostPath("/etc/resolv.conf")),
+			d.PathJoin("/etc/resolv.conf")),
 		envx.StringKnob("NODE_HOST_AGENT_HOSTS_FILE", &cfg.HostsFile,
-			hostPath("/etc/hosts")),
+			d.PathJoin("/etc/hosts")),
 		envx.StringKnob("NODE_HOST_AGENT_PROC_NET_UDP", &cfg.ProcNetUDP, defaultProcNetUDP),
 		envx.StringKnob("NODE_HOST_AGENT_PROC_NET_UDP6", &cfg.ProcNetUDP6, defaultProcNetUDP6),
 		envx.StringKnob("NODE_HOST_AGENT_UPTIME_FILE", &cfg.UptimeFile, defaultUptimeFile),

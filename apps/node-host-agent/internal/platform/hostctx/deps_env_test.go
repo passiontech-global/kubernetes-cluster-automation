@@ -89,6 +89,20 @@ func TestDepsFromEnvDefaults(t *testing.T) {
 	}
 }
 
+// TestDepsPathJoin pins the nil-safe accessor the consumers call
+// instead of re-declaring the fallback: nil HostPath → identity join
+// (the documented nil-dep contract), non-nil → the join applied.
+func TestDepsPathJoin(t *testing.T) {
+	var d Deps
+	if got := d.PathJoin("/etc/hosts"); got != "/etc/hosts" {
+		t.Fatalf("nil HostPath: PathJoin=%q want identity", got)
+	}
+	d.HostPath = func(p string) string { return "/host" + p }
+	if got := d.PathJoin("/etc/hosts"); got != "/host/etc/hosts" {
+		t.Fatalf("PathJoin=%q want /host/etc/hosts", got)
+	}
+}
+
 // TestDepsFromEnvStandalonePaths: root "/" makes hostPath the
 // identity — the same knobs land unprefixed on standalone hosts.
 func TestDepsFromEnvStandalonePaths(t *testing.T) {

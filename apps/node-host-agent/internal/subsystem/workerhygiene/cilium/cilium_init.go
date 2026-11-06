@@ -17,10 +17,13 @@ import (
 // black-holed datapath). The shell ran `cilium-dbg endpoint list` via
 // ctr exec; the agent reads the same data from the cilium agent unix
 // socket (/v1/endpoint) — reserved:init counting is identical.
-// Inconclusive (socket/exec fail) → keep counters, never reset. The
-// streak stays on deps (ciliumInitFails) — pre-Check tests poke
-// it directly.
-type CiliumInitCheck struct{ d *wdeps.Deps }
+// Inconclusive (socket/exec fail) → keep counters, never reset.
+// Fails is the consecutive stuck-endpoints streak (ex-Deps.
+// CiliumInitFails) — tests poke it via the named Hygiene field.
+type CiliumInitCheck struct {
+	d     *wdeps.Deps
+	Fails int
+}
 
 // Name returns the check label / WD_SIG key.
 func (c *CiliumInitCheck) Name() string { return wdeps.CheckCiliumInit }
@@ -52,15 +55,15 @@ func (c *CiliumInitCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	initEps := strings.Count(string(body), "reserved:init")
 	if initEps == 0 {
-		c.d.CiliumInitFails = 0
+		c.Fails = 0
 		c.d.State.Exit(hoststate.LatchCiliumInitStuck, nil)
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "ok").Inc()
 		return
 	}
-	c.d.CiliumInitFails++
-	if c.d.CiliumInitFails < c.d.Cfg.ConsecNeeded {
+	c.Fails++
+	if c.Fails < c.d.Cfg.ConsecNeeded {
 		c.d.State.AppendLog(fmt.Sprintf("suspect: cilium-init-stuck init_eps=%d (check %d/%d)",
-			initEps, c.d.CiliumInitFails, c.d.Cfg.ConsecNeeded))
+			initEps, c.Fails, c.d.Cfg.ConsecNeeded))
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "ok").Inc()
 		return
 	}
@@ -70,28 +73,28 @@ func (c *CiliumInitCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	case !e.APIOK:
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but API unreachable — skip kill (agent still cannot resync even after restart)",
-			initEps, c.d.CiliumInitFails))
+			initEps, c.Fails))
 	case c.d.State.Exists(hoststate.LatchNodeOverloaded):
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but node overloaded — skip kill",
-			initEps, c.d.CiliumInitFails))
+			initEps, c.Fails))
 	case !c.d.State.RateTrySpend("last-cilium-restart", c.d.Cfg.MinRestartInterval):
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but restart cooldown — skip kill",
-			initEps, c.d.CiliumInitFails))
+			initEps, c.Fails))
 	default:
 		// Budget already spent atomically by the rateTrySpend case —
 		// the feeder goroutine competes for the same file.
 		if killCiliumAgent(c.d, tasks) {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"ACTION: killed cilium-agent container - init_eps=%d %dx (kubelet will restart -> informer resync)",
-				initEps, c.d.CiliumInitFails))
-			c.d.CiliumInitFails = 0
+				initEps, c.Fails))
+			c.Fails = 0
 			c.d.Actions.WithLabelValues(wdeps.CheckCiliumInit, "sigkill").Inc()
 		} else {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: cilium-init-stuck init_eps=%d %dx, no running task to kill (kubelet retries itself)",
-				initEps, c.d.CiliumInitFails))
+				initEps, c.Fails))
 		}
 	}
 	c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "ok").Inc()

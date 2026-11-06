@@ -57,10 +57,11 @@ type EnvParams struct {
 // conf exactly like the shell modules did without a sourced
 // node-watchdog.conf.
 func DepsFromEnv(p EnvParams) Deps {
-	hostPath := p.HostPath
-	if hostPath == nil {
-		hostPath = func(s string) string { return s }
-	}
+	// PathJoin is the nil-safe accessor over the passed joiner —
+	// bound once so Deps.HostPath below stores the resolved
+	// (never-nil) func and the env-derived defaults prefix through
+	// it.
+	hostPath := Deps{HostPath: p.HostPath}.PathJoin
 
 	// The shared host-side inputs: the node-watchdog.conf parser
 	// feeds API_BACKENDS / OVERLAY_* / DNS_FALLBACK_MAP into
