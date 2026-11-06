@@ -6,6 +6,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,8 +14,11 @@ import (
 	coordv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -348,6 +352,106 @@ func TestRunLeaseGatesSync(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("no converge after foreign lease expired")
+}
+
+// panicWatcher panics on the Changed() call numbers in panicOn —
+// each panic unwinds Run while the supervisor ctx stays live
+// (agent.go's recover + re-invoke parity), letting the test walk one
+// Syncer through several Run entries on a single ctx.
+type panicWatcher struct {
+	calls   atomic.Int32
+	panicOn map[int32]bool
+}
+
+func (w *panicWatcher) Changed() bool {
+	if w.panicOn[w.calls.Add(1)] {
+		panic("watcher panic")
+	}
+	return false
+}
+
+// TestRunLeaseLoopSingleFlight: panic-restarts of Run must not stack
+// a second lease heartbeater — agent.go re-invokes Run on the SAME
+// ctx, and without leaseOnce every entry added another renewer
+// double-writing the same Lease (hostconfig TestRunStartsWatcherOnce
+// / controllerhygiene feederOnce parity). The SpawnFn seam counts
+// spawns; an "update leases" reactor proves the single renewer kept
+// heartbeating while NO Run was executing — Spawn's stop is never
+// called so the 60s Lease survives the supervisor's restart backoff.
+func TestRunLeaseLoopSingleFlight(t *testing.T) {
+	var spawns, updates atomic.Int32
+	cs := testutil.FakeKube()
+	cs.PrependReactor("update", "leases",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			updates.Add(1)
+			return false, nil, nil // fall through to the default tracker
+		})
+	cfg := testConfig(t, cs, newFakeDialer(), []byte("bin"))
+	cfg.RenewInterval = 5 * time.Millisecond
+	cfg.SyncInterval = time.Hour
+	cfg.WatchInterval = 5 * time.Millisecond // tick Run can die on
+	// Call 1 = entry #1's baseline seed, call 3 = entry #2's first
+	// watch tick (call 2 is its seed) — entry #3 runs clean.
+	cfg.Watcher = &panicWatcher{panicOn: map[int32]bool{1: true, 3: true}}
+	cfg.SpawnFn = func(ctx context.Context, name string,
+		fn func(context.Context)) func() {
+		spawns.Add(1)
+		return cycle.Spawn(ctx, name, fn)
+	}
+	s, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Supervisor parity: agent.go recovers the panic and re-invokes
+	// Run on the same ctx; done closes when Run exits.
+	runEntry := func() (done chan struct{}) {
+		done = make(chan struct{})
+		go func() {
+			defer close(done)
+			defer func() { _ = recover() }()
+			s.Run(ctx)
+		}()
+		return done
+	}
+
+	// Entry #1 dies on the baseline seed — before the spawn is even
+	// reached (the spawn must not have happened "early" anywhere).
+	<-runEntry()
+	if got := spawns.Load(); got != 0 {
+		t.Fatalf("entry #1 spawned %d heartbeaters before panicking, want 0", got)
+	}
+
+	// Entry #2 seeds clean, spawns the renewer, then unwinds on its
+	// first watch tick.
+	<-runEntry()
+	if got := spawns.Load(); got != 1 {
+		t.Fatalf("entry #2 spawned %d heartbeaters, want 1", got)
+	}
+
+	// The backoff window: NO Run is executing, yet the renewer bound
+	// to ctx keeps heartbeating — the lease-continuity half of the
+	// fix (a defer-stop() would lapse the Lease right here).
+	pre := updates.Load()
+	deadline := time.Now().Add(2 * time.Second)
+	for updates.Load() == pre {
+		if time.Now().After(deadline) {
+			t.Fatal("renewer died with Run — the Lease would lapse mid-backoff")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Entry #3 — the restart proper: Run blocks in its select again
+	// but the once must suppress a second renewer.
+	done := runEntry()
+	time.Sleep(50 * time.Millisecond)
+	if got := spawns.Load(); got != 1 {
+		t.Fatalf("three Run entries spawned %d heartbeaters, want 1", got)
+	}
+	cancel()
+	<-done
 }
 
 // --- helpers ---
