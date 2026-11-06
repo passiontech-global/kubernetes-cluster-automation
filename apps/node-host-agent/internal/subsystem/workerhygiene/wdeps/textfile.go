@@ -171,6 +171,21 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 	counter("node_agent_conntrack_liberal_fixes_total",
 		"nf_conntrack_tcp_be_liberal 0→1 fixes written on neb1 nodes.",
 		d.Series.ConntrackLiberalFixes)
+	b.Gauge("node_agent_unlinked_open_file_bytes",
+		"Bytes held by deleted-but-open regular files under /proc/*/fd (deduped by dev,ino).",
+		float64(d.Series.UnlinkedOpenFileBytes))
+	b.Gauge("node_agent_unlinked_open_files_count",
+		"Deleted-but-open regular files >=64MiB held under /proc/*/fd.",
+		float64(d.Series.UnlinkedOpenFileCount))
+	b.Gauge("node_agent_kubepods_swap_used_bytes",
+		"memory.swap.current of kubepods.slice — pod swap-out in progress.",
+		float64(d.Series.KubepodsSwapUsedBytes))
+	b.Gauge("node_agent_kubelet_pleg_last_seen_age_seconds",
+		"kubelet_pleg_last_seen_seconds — seconds since PLEG last saw a container state change.",
+		d.Series.KubeletPLEGLastSeenAgeSec)
+	counter("node_agent_kubelet_pleg_discard_events_total",
+		"kubelet_pleg_discard_events counter passthrough — PLEG events dropped under backlog.",
+		d.Series.KubeletPLEGDiscardEvents)
 	if err := promfile.Write(dir, "node-agent-hygiene.prom",
 		[]byte(b.String())); err != nil {
 		fail(err)

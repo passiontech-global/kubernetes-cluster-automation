@@ -22,7 +22,8 @@ import (
 // prints one "  OK   <name>" / "  FAIL <name>" line per check in the
 // bash script's format, then the ALL OK / CO CHECK FAIL verdict.
 // Returns the process exit code: 0 when every check succeeded, else 1.
-// No metrics or textfiles are emitted — this is the interactive run.
+// Note: pgHygiene writes the kine-db-xact.prom textfile on every run
+// (shared with the periodic path — no separate CLI-only emit path).
 func RunCheckCLI(ctx context.Context, cfg Config, out io.Writer) int {
 	k, err := New(cfg, nil)
 	if err != nil {

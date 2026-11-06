@@ -168,3 +168,86 @@ func TestProbeUnixSockDefaultReturnsNilOnConnect(t *testing.T) {
 		t.Fatalf("successful unix dial want nil, got %v", err)
 	}
 }
+
+// --- PLEG metrics early warning (kubelet /metrics) ---
+
+const plegMetricsHealthy = `# HELP kubelet_pleg_relist_duration_seconds x
+kubelet_pleg_relist_duration_seconds{quantile="0.5"} 0.2
+kubelet_pleg_relist_duration_seconds{quantile="0.9"} 0.5
+kubelet_pleg_relist_duration_seconds{quantile="0.99"} 1.0
+kubelet_pleg_relist_duration_seconds_sum 40
+kubelet_pleg_relist_duration_seconds_count 200
+kubelet_pleg_last_seen_seconds 2
+kubelet_pleg_discard_events 7
+`
+
+const plegMetricsSlow = `kubelet_pleg_relist_duration_seconds{quantile="0.5"} 1.0
+kubelet_pleg_relist_duration_seconds{quantile="0.9"} 6.5
+kubelet_pleg_relist_duration_seconds{quantile="0.99"} 8.0
+kubelet_pleg_relist_duration_seconds_sum 120
+kubelet_pleg_relist_duration_seconds_count 200
+kubelet_pleg_last_seen_seconds 45
+kubelet_pleg_discard_events 12
+`
+
+// TestPLEGUnhealthyLatchesAfterConsecNeeded: a degraded relist /
+// last-seen scrape must latch state-kubelet-pleg-unhealthy after
+// ConsecNeeded cycles while /healthz/syncloop still answers 200 —
+// and clear on recovery.
+func TestPLEGUnhealthyLatchesAfterConsecNeeded(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.metricsBody = plegMetricsSlow
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.h.State.Exists("kubelet-pleg-unhealthy") {
+		t.Fatal("state-kubelet-pleg-unhealthy should latch after 2 over-threshold scrapes")
+	}
+	if e.h.KubeletPLEGLastSeenAgeSec != 45 {
+		t.Fatalf("last-seen gauge=%v want 45", e.h.KubeletPLEGLastSeenAgeSec)
+	}
+	if e.h.KubeletPLEGDiscardEvents != 12 {
+		t.Fatalf("discard counter=%v want 12", e.h.KubeletPLEGDiscardEvents)
+	}
+	// Syncloop itself is still healthy — its latch stays clear.
+	if e.h.State.Exists("kubelet-syncloop-down") {
+		t.Fatal("PLEG metric degrade must not trip the syncloop latch")
+	}
+	e.metricsBody = plegMetricsHealthy
+	e.h.Cycle(context.Background())
+	if e.h.State.Exists("kubelet-pleg-unhealthy") {
+		t.Fatal("recovery should clear the pleg latch")
+	}
+	if e.h.KubeletPLEGDiscardEvents != 7 {
+		t.Fatalf("discard counter=%v want 7 (passthrough)", e.h.KubeletPLEGDiscardEvents)
+	}
+}
+
+// TestPLEGScrapeErrorIsInconclusive: a failed /metrics GET must
+// neither count a fail nor clear a held latch — same keep-state
+// rule as the other failed-probe paths.
+func TestPLEGScrapeErrorIsInconclusive(t *testing.T) {
+	e := fixture(t)
+	e.sdReply["is-active k0sworker.service"] = "active"
+	e.metricsBody = plegMetricsSlow
+	for i := 0; i < 2; i++ {
+		e.h.Cycle(context.Background())
+	}
+	if !e.h.State.Exists("kubelet-pleg-unhealthy") {
+		t.Fatal("precondition: latch should be set")
+	}
+	e.metricsErr = errors.New("connection refused")
+	e.metricsBody = ""
+	e.h.Cycle(context.Background())
+	if !e.h.State.Exists("kubelet-pleg-unhealthy") {
+		t.Fatal("scrape error must keep the latch (inconclusive)")
+	}
+	// A body without PLEG series is inconclusive too.
+	e.metricsErr = nil
+	e.metricsBody = "kubelet_running_pods 5\n"
+	e.h.Cycle(context.Background())
+	if !e.h.State.Exists("kubelet-pleg-unhealthy") {
+		t.Fatal("missing PLEG family must keep the latch")
+	}
+}

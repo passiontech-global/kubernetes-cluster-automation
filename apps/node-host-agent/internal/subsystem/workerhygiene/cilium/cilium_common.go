@@ -99,3 +99,28 @@ func killCiliumAgent(d *wdeps.Deps, tasks []wdeps.CtrTask) bool {
 	}
 	return false
 }
+
+// restartEnvoyAfterAgentKill covers the envoy side of an agent
+// restart when the killing check runs AFTER CiliumEnvoyCheck in the
+// dispatch order (cilium-wg, cilium-lrp): the shared
+// CiliumAgentKilled flag is consumed only by the envoy check, which
+// already ran this cycle — without this the envoy keeps a stale xDS
+// socket across the agent restart until its own probe fails. The
+// dedicated last-cilium-envoy-restart budget bounds it identically
+// to CiliumEnvoyCheck.killCiliumEnvoy.
+func restartEnvoyAfterAgentKill(d *wdeps.Deps, check, why string) {
+	tasks, reachable := ciliumNamedTasks(d, "cilium-envoy")
+	if !reachable || len(tasks) == 0 {
+		return // no L7 proxy deployed — nothing to bounce
+	}
+	if !d.State.RateTrySpend("last-cilium-envoy-restart", d.Cfg.MinRestartInterval) {
+		d.State.AppendLog(fmt.Sprintf(
+			"suspect: cilium-envoy kill skipped (%s) — restart cooldown (<30m)", why))
+		return
+	}
+	if killNamedTasks(d, tasks, "cilium-envoy") {
+		d.State.AppendLog(fmt.Sprintf(
+			"ACTION: killed cilium-envoy container - %s (kubelet will restart -> xDS resync)", why))
+		d.Actions.WithLabelValues(check, "sigkill").Inc()
+	}
+}

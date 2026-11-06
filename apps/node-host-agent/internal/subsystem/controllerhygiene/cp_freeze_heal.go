@@ -13,18 +13,32 @@
 //
 // Also hosts the ungated-cycle dispatch slot: the W10-CP2
 // kine-storage and W10-CP5 kubeconfig-cert checks ride this
-// entry point (see checkCPFreeze).
+// entry point (see checkCPFreeze), and so does the apiserver
+// APF (API Priority & Fairness) queue-starvation probe — a
+// read-only scrape of the local apiserver's /metrics that
+// mirrors apiserver_flowcontrol_rejected_requests_total and
+// apiserver_flowcontrol_current_inqueue_requests per
+// (flow_schema, priority_level) into the node-exporter
+// textfile channel and names the client group whose queue is
+// rejecting when the counters grow (see probeAPF).
 package controllerhygiene
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // checkCPFreeze is the prometheus `check` label + log context for
@@ -268,6 +282,18 @@ type cpFreezeCheck struct {
 	d           *deps
 	kineStorage *kineStorageCheck
 	kubeCert    *kubeCertCheck
+
+	// apfMetricsFn is the apiserver /metrics scrape seam behind
+	// probeAPF — nil → the mTLS GET over deps.ensureClient (the
+	// secure :6443 /metrics needs client credentials, so the
+	// insecure kcmMetricsFn probe client cannot serve it).
+	apfMetricsFn func(ctx context.Context) (string, error)
+	// apfPrevRejected is the last scrape's
+	// apiserver_flowcontrol_rejected_requests_total per
+	// (flow_schema, priority_level) — the reject-delta baseline.
+	// In-memory like kcmQuietSince: a restart simply re-baselines
+	// on the first scrape (inconclusive, never fires).
+	apfPrevRejected map[apfSeriesKey]float64
 }
 
 // Name returns the check label / log context.
@@ -285,6 +311,10 @@ func (c *cpFreezeCheck) Run(ctx context.Context) {
 	// position, every cycle.
 	c.kineStorage.Run(ctx)
 	c.kubeCert.Run(ctx)
+	// The APF queue-starvation probe rides the same ungated slot —
+	// read-only scrape + metric mirror, it must run every cycle
+	// including the early-return suspect paths below.
+	c.probeAPF(ctx)
 
 	kcmOK := c.d.cfg.cpHealthFn(ctx, c.d.cfg.CPFreeze.KCMHealthURL)
 	schedOK := c.d.cfg.cpHealthFn(ctx, c.d.cfg.CPFreeze.SchedHealthURL)
@@ -385,4 +415,254 @@ func (c *cpFreezeCheck) Run(ctx context.Context) {
 		c.d.actions.WithLabelValues(checkCPFreeze, "dryrun_restart").Inc()
 	}
 	c.d.cycles.WithLabelValues(checkCPFreeze, "ok").Inc()
+}
+
+// ---------------------------------------------------------------------------
+// APF queue-starvation probe
+// ---------------------------------------------------------------------------
+//
+// The kube-apiserver's API Priority & Fairness layer sheds requests
+// with 429s when a flow schema's queues overflow — the mirror image
+// of the KCM workqueue stall above: instead of the controller's own
+// workqueue stalling, one client GROUP's queue saturates and its
+// requests are rejected while the rest of the apiserver stays
+// healthy. apiserver_flowcontrol_rejected_requests_total and
+// apiserver_flowcontrol_current_inqueue_requests carry
+// flow_schema + priority_level labels — the labels that name the
+// congesting client group — so the probe mirrors both into
+// node-agent-apiserver-apf.prom (node-exporter textfile channel:
+// the subsystem registry is owned by controllerhygiene.go's New(),
+// outside this file — see textfile_prom.go) and suspect-logs the
+// offending pairs whenever the reject counters grow between
+// consecutive scrapes.
+
+const (
+	// apfRejectedMetric mirrors the apiserver's cumulative reject
+	// counter per flow_schema+priority_level — increase() over it
+	// names the client group being 429'd.
+	apfRejectedMetric = "node_host_agent_apiserver_apf_rejected_total"
+	// apfInqueueMetric mirrors the live queue depth per
+	// flow_schema+priority_level — the leading edge before rejects.
+	apfInqueueMetric = "node_host_agent_apiserver_apf_inqueue_requests"
+	apfPromFile      = "node-agent-apiserver-apf.prom"
+	// logKeyAPFStarve keys the suspectLog dedupe budget for the
+	// reject-growth lines — no dedicated latch, same role as
+	// logKeyDeadFallbk.
+	logKeyAPFStarve = "apf-starvation"
+	// apfOffenderSample caps the flow-schema list in one suspect
+	// line — the rest still land in the textfile series.
+	apfOffenderSample = 5
+)
+
+// apfSeriesKey identifies one APF series — the
+// (flow_schema, priority_level) label pair shared by the rejected
+// and inqueue families.
+type apfSeriesKey struct {
+	flowSchema    string
+	priorityLevel string
+}
+
+// apfOffender is one (flow_schema, priority_level) pair whose reject
+// counter grew since the previous scrape.
+type apfOffender struct {
+	key     apfSeriesKey
+	delta   float64
+	inqueue float64
+}
+
+var (
+	// apfSeriesRe matches the two apiserver_flowcontrol families the
+	// probe needs — same scrape-line grammar as kcmWorkqueueRe.
+	apfSeriesRe = regexp.MustCompile(
+		`(?m)^apiserver_flowcontrol_(rejected_requests_total|current_inqueue_requests)` +
+			`(\{[^}]*\})?\s+([0-9.eE+-]+)`)
+	apfFlowSchemaRe = regexp.MustCompile(`flow_schema="([^"]*)"`)
+	apfPriorityRe   = regexp.MustCompile(`priority_level="([^"]*)"`)
+)
+
+// apfLabel extracts one label value from a `{...}` label set — ""
+// when absent, which still groups consistently.
+func apfLabel(labels string, re *regexp.Regexp) string {
+	if m := re.FindStringSubmatch(labels); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// parseAPFMetrics extracts the rejected_requests_total counters and
+// current_inqueue_requests gauges, keyed by (flow_schema,
+// priority_level). Missing APF families (a scraped endpoint that
+// never served flowcontrol) yield empty maps — inconclusive, not a
+// failure.
+func parseAPFMetrics(body string) (rejected, inqueue map[apfSeriesKey]float64) {
+	rejected = map[apfSeriesKey]float64{}
+	inqueue = map[apfSeriesKey]float64{}
+	for _, m := range apfSeriesRe.FindAllStringSubmatch(body, -1) {
+		v, err := strconv.ParseFloat(m[3], 64)
+		if err != nil {
+			continue
+		}
+		k := apfSeriesKey{
+			flowSchema:    apfLabel(m[2], apfFlowSchemaRe),
+			priorityLevel: apfLabel(m[2], apfPriorityRe),
+		}
+		switch m[1] {
+		case "rejected_requests_total":
+			rejected[k] += v
+		case "current_inqueue_requests":
+			inqueue[k] += v
+		}
+	}
+	return rejected, inqueue
+}
+
+// apfKeysSorted returns the map keys in a stable order — the
+// textfile content stays byte-stable between scrapes.
+func apfKeysSorted(m map[apfSeriesKey]float64) []apfSeriesKey {
+	keys := make([]apfSeriesKey, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].flowSchema != keys[j].flowSchema {
+			return keys[i].flowSchema < keys[j].flowSchema
+		}
+		return keys[i].priorityLevel < keys[j].priorityLevel
+	})
+	return keys
+}
+
+// apfMetrics fetches the local apiserver /metrics body. The default
+// path reuses the mTLS client the rv probe already builds from the
+// admin credentials (the secure :6443 /metrics endpoint requires
+// client auth — the insecure healthz/metrics probe client would get
+// a 401). ensureClient()==nil is "not a controller / no creds" —
+// inconclusive, same posture as the hub check.
+func (c *cpFreezeCheck) apfMetrics(ctx context.Context) (string, error) {
+	if c.apfMetricsFn != nil {
+		return c.apfMetricsFn(ctx)
+	}
+	client := c.d.ensureClient()
+	if client == nil {
+		return "", errors.New("no apiserver client credentials")
+	}
+	qctx, cancel := context.WithTimeout(ctx, c.d.cfg.QueryTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(qctx, http.MethodGet,
+		"https://"+c.d.cfg.Hub.SelfEndpoint+"/metrics", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		return "", fmt.Errorf("apiserver /metrics status %d", resp.StatusCode)
+	}
+	// The apiserver /metrics body is a few MiB on a healthy cluster —
+	// 16MiB bounds it like the journal capture cap.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+// probeAPF scrapes the local apiserver /metrics, mirrors the APF
+// rejected/inqueue series into the textfile, and suspect-logs the
+// (flow_schema, priority_level) pairs whose reject counter grew —
+// the observable signature of APF queue overflow (requests denied
+// with 429). A scrape failure degrades to headers-only emission so
+// the series goes absent rather than pinning a stale counter.
+func (c *cpFreezeCheck) probeAPF(ctx context.Context) {
+	body, err := c.apfMetrics(ctx)
+	if err != nil {
+		c.emitAPFMetrics(nil, nil)
+		logger().Debug("controllerhygiene: apf metrics scrape failed",
+			"error", err)
+		return
+	}
+	rejected, inqueue := parseAPFMetrics(body)
+	c.emitAPFMetrics(rejected, inqueue)
+
+	// Reject deltas vs the previous scrape — the APF counters are
+	// cumulative, so a growth window is what proves CURRENT
+	// congestion (same consecutive-scrape posture as
+	// kcmQueueStalled). No baseline → inconclusive.
+	var offenders []apfOffender
+	if c.apfPrevRejected != nil {
+		reset := false
+		for k, cur := range rejected {
+			prev, ok := c.apfPrevRejected[k]
+			if !ok {
+				continue
+			}
+			d := cur - prev
+			switch {
+			case d > 0:
+				offenders = append(offenders, apfOffender{
+					key: k, delta: d, inqueue: inqueue[k]})
+			case d < 0:
+				reset = true // counter reset — apiserver restarted
+			}
+		}
+		if reset {
+			logger().Debug("controllerhygiene: apf reject counters went backwards — apiserver restarted, re-baselining")
+		}
+	}
+	c.apfPrevRejected = rejected
+	if len(offenders) == 0 {
+		return
+	}
+	sort.Slice(offenders, func(i, j int) bool {
+		return offenders[i].delta > offenders[j].delta
+	})
+	if len(offenders) > apfOffenderSample {
+		offenders = offenders[:apfOffenderSample]
+	}
+	parts := make([]string, 0, len(offenders))
+	for _, o := range offenders {
+		parts = append(parts, fmt.Sprintf(
+			"flow_schema=%s priority_level=%s +%.0f rejects (inqueue %.0f)",
+			o.key.flowSchema, o.key.priorityLevel, o.delta, o.inqueue))
+	}
+	c.d.state.SuspectLog(logKeyAPFStarve, fmt.Sprintf(
+		"suspect: apiserver APF queue starvation — flow-schema queues rejecting requests: %s",
+		strings.Join(parts, "; ")), c.d.cfg.SuspectLogCadence)
+}
+
+// emitAPFMetrics renders node-agent-apiserver-apf.prom — the
+// rejected family as a mirrored counter (TYPE counter: the apiserver
+// series is cumulative), the inqueue family as a gauge. nil maps
+// emit headers only so a blind scrape drops the series instead of
+// leaving a stale reading live.
+func (c *cpFreezeCheck) emitAPFMetrics(rejected, inqueue map[apfSeriesKey]float64) {
+	var p promfile.Builder
+	p.HeaderType(apfRejectedMetric,
+		"apiserver_flowcontrol_rejected_requests_total mirrored from the "+
+			"local apiserver — APF queue-overflow rejects by flow_schema "+
+			"and priority_level.", "counter")
+	for _, k := range apfKeysSorted(rejected) {
+		p.Line(fmt.Sprintf("%s{flow_schema=\"%s\",priority_level=\"%s\"} %s",
+			apfRejectedMetric,
+			promfile.EscapeLabelValue(k.flowSchema),
+			promfile.EscapeLabelValue(k.priorityLevel),
+			strconv.FormatFloat(rejected[k], 'f', -1, 64)))
+	}
+	inqueueHelp := "apiserver_flowcontrol_current_inqueue_requests " +
+		"mirrored from the local apiserver — APF queue depth by " +
+		"flow_schema and priority_level."
+	if len(inqueue) == 0 {
+		p.Header(apfInqueueMetric, inqueueHelp)
+	}
+	for _, k := range apfKeysSorted(inqueue) {
+		p.GaugeLabels(apfInqueueMetric, inqueueHelp, fmt.Sprintf(
+			"flow_schema=\"%s\",priority_level=\"%s\"",
+			promfile.EscapeLabelValue(k.flowSchema),
+			promfile.EscapeLabelValue(k.priorityLevel)), inqueue[k])
+	}
+	c.d.writeTextfileProm(apfPromFile, p.String())
 }

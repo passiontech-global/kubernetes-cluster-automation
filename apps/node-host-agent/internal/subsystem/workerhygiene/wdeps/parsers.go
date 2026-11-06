@@ -44,3 +44,40 @@ func ParseCiliumHealthNodes(body []byte) (int, bool) {
 	}
 	return len(resp.Cluster.Nodes), true
 }
+
+// ParseCiliumServiceBackends reduces the agent's GET /v1/service
+// payload (the `cilium-dbg service list -o json` source) to
+// "<namespace>/<name>" → backend count. k8s-derived services carry
+// their identity in spec.name/spec.namespace (older builds nest it
+// under spec.flags); entries without a name (l7lb/synthetic) are
+// skipped. Backend counts SUM across a service's per-transport
+// entries (kube-dns lists a UDP and a TCP frontend — the desync
+// verdict only cares whether ANY backend is programmed).
+func ParseCiliumServiceBackends(body []byte) (map[string]int, error) {
+	var list []struct {
+		Spec struct {
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+			Flags     struct {
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+			} `json:"flags"`
+			BackendAddresses []json.RawMessage `json:"backend-addresses"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, err
+	}
+	out := map[string]int{}
+	for _, svc := range list {
+		ns, name := svc.Spec.Namespace, svc.Spec.Name
+		if name == "" {
+			ns, name = svc.Spec.Flags.Namespace, svc.Spec.Flags.Name
+		}
+		if name == "" {
+			continue
+		}
+		out[ns+"/"+name] += len(svc.Spec.BackendAddresses)
+	}
+	return out, nil
+}

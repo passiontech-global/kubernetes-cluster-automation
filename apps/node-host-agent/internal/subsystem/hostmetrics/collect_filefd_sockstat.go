@@ -16,6 +16,12 @@ const (
 	// H6 fd/socket sources.
 	defaultFileNRFile   = "/proc/sys/fs/file-nr"
 	defaultSockstatFile = "/proc/1/net/sockstat"
+	// Tcp-level grey-failure sources — the kernel TCP/IP stack
+	// counters node_exporter's netstat collector exposes. Read via
+	// /proc/1/net (host netns through the init pid — same path
+	// sockstat uses, and hostPID makes it the host view anyway).
+	defaultNetstatFile = "/proc/1/net/netstat"
+	defaultSNMPFile    = "/proc/1/net/snmp"
 )
 
 // --- H6: FD + socket pressure (file-nr, sockstat) ---
@@ -54,6 +60,34 @@ var (
 	descSockTCPCW = prometheus.NewDesc(
 		"node_host_agent_sockstat_tcp_close_wait",
 		"sockstat TCP close_wait — sockets stuck half-closed waiting for local close().",
+		[]string{"node"}, nil)
+	// Kernel TCP/IP stack counters (netstat TcpExt + snmp Ip/Udp) —
+	// listen-queue overflows/drops present as accept flakes,
+	// syn-retrans and timeouts as connect flakes, reassembly fails
+	// as fragment loss, RcvbufErrors as UDP buffer exhaustion.
+	descNetstatListenOverflows = prometheus.NewDesc(
+		"node_host_agent_netstat_tcp_listen_overflows_total",
+		"TcpExt ListenOverflows — SYNs dropped because the accept queue was full.",
+		[]string{"node"}, nil)
+	descNetstatListenDrops = prometheus.NewDesc(
+		"node_host_agent_netstat_tcp_listen_drops_total",
+		"TcpExt ListenDrops — connections dropped from a full listen backlog.",
+		[]string{"node"}, nil)
+	descNetstatSynRetrans = prometheus.NewDesc(
+		"node_host_agent_netstat_tcp_syn_retrans_total",
+		"TcpExt TCPSynRetrans — retransmitted SYNs.",
+		[]string{"node"}, nil)
+	descNetstatTCPTimeouts = prometheus.NewDesc(
+		"node_host_agent_netstat_tcp_timeouts_total",
+		"TcpExt TCPTimeouts — connections that timed out in any state.",
+		[]string{"node"}, nil)
+	descSNMPReasmFails = prometheus.NewDesc(
+		"node_host_agent_snmp_ip_reasm_fails_total",
+		"Ip ReasmFails — IP fragment reassembly failures.",
+		[]string{"node"}, nil)
+	descSNMPRcvbufErrors = prometheus.NewDesc(
+		"node_host_agent_snmp_udp_rcvbuf_errors_total",
+		"Udp RcvbufErrors — UDP datagrams dropped on a full receive buffer.",
 		[]string{"node"}, nil)
 )
 
@@ -160,5 +194,74 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 	if tcpCWOK {
 		ch <- prometheus.MustNewConstMetric(descSockTCPCW,
 			prometheus.GaugeValue, tcpCW, c.cfg.NodeName)
+	}
+}
+
+// --- netstat/snmp kernel TCP/IP counters ---
+
+// parseNetstatPairs parses the two-line <Section>: key... /
+// <Section>: val... pairs of /proc/1/net/{netstat,snmp} into
+// per-section key→value maps (e.g. TcpExt: ListenOverflows 12 ...).
+// A values line with a different field count than its header is
+// skipped — never emit junk.
+func parseNetstatPairs(data string) map[string]map[string]float64 {
+	out := map[string]map[string]float64{}
+	var pending string
+	var pendingKeys []string
+	for _, line := range strings.Split(data, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		sect := strings.TrimSuffix(f[0], ":")
+		if pending == sect && len(f) == len(pendingKeys)+1 {
+			kv := make(map[string]float64, len(pendingKeys))
+			good := true
+			for i, k := range pendingKeys {
+				v, err := strconv.ParseFloat(f[i+1], 64)
+				if err != nil {
+					good = false
+					break
+				}
+				kv[k] = v
+			}
+			if good {
+				out[sect] = kv
+			}
+			pending = ""
+			continue
+		}
+		pending, pendingKeys = sect, f[1:]
+	}
+	return out
+}
+
+// collectNetstatSNMP emits the six kernel TCP/IP counters from
+// /proc/1/net/netstat (TcpExt) and /proc/1/net/snmp (Ip/Udp) — each
+// only when its key parses, same per-source rule as sockstat.
+func (c *Collector) collectNetstatSNMP(ch chan<- prometheus.Metric) {
+	if data, err := os.ReadFile(c.cfg.NetstatFile); err == nil {
+		kv := parseNetstatPairs(string(data))["TcpExt"]
+		emit := func(d *prometheus.Desc, key string) {
+			if v, ok := kv[key]; ok {
+				ch <- prometheus.MustNewConstMetric(d,
+					prometheus.CounterValue, v, c.cfg.NodeName)
+			}
+		}
+		emit(descNetstatListenOverflows, "ListenOverflows")
+		emit(descNetstatListenDrops, "ListenDrops")
+		emit(descNetstatSynRetrans, "TCPSynRetrans")
+		emit(descNetstatTCPTimeouts, "TCPTimeouts")
+	}
+	if data, err := os.ReadFile(c.cfg.SNMPFile); err == nil {
+		kv := parseNetstatPairs(string(data))
+		if v, ok := kv["Ip"]["ReasmFails"]; ok {
+			ch <- prometheus.MustNewConstMetric(descSNMPReasmFails,
+				prometheus.CounterValue, v, c.cfg.NodeName)
+		}
+		if v, ok := kv["Udp"]["RcvbufErrors"]; ok {
+			ch <- prometheus.MustNewConstMetric(descSNMPRcvbufErrors,
+				prometheus.CounterValue, v, c.cfg.NodeName)
+		}
 	}
 }

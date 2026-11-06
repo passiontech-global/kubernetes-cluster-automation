@@ -2,6 +2,12 @@ package controllerhygiene
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -249,5 +255,222 @@ func TestCPFreezeHealthyIdleNeverRestarts(t *testing.T) {
 	}
 	if e.hasState("cp-component-frozen") {
 		t.Fatal("cp-component-frozen latched on healthy idle cluster")
+	}
+}
+
+// --- APF queue-starvation probe ---
+
+// watchdogLogOrEmpty is watchdogLog tolerant of a never-written
+// log — "the probe must not log" assertions need it (watchdogLog
+// itself t.Fatal's on a missing file).
+func watchdogLogOrEmpty(e *env) string {
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(e.state), "watchdog.log"))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func countLogLinesOrEmpty(e *env, needle string) int {
+	n := 0
+	for _, l := range strings.Split(watchdogLogOrEmpty(e), "\n") {
+		if strings.Contains(l, needle) {
+			n++
+		}
+	}
+	return n
+}
+
+// apfBody renders a fixture apiserver /metrics payload: the
+// flowcontrol series carry flow_schema+priority_level labels —
+// other families must not match the parser.
+func apfBody(rejected, inqueue map[string]float64) string {
+	var b strings.Builder
+	b.WriteString("# HELP apiserver_flowcontrol_rejected_requests_total x\n" +
+		"# TYPE apiserver_flowcontrol_rejected_requests_total counter\n")
+	for _, kv := range strings.Split(rejectedList(rejected), "\n") {
+		if kv != "" {
+			b.WriteString(kv + "\n")
+		}
+	}
+	for _, kv := range strings.Split(inqueueList(inqueue), "\n") {
+		if kv != "" {
+			b.WriteString(kv + "\n")
+		}
+	}
+	b.WriteString("go_goroutines 800\n") // noise — must be ignored
+	return b.String()
+}
+
+// rejectedList / inqueueList expand a "fs/pl=value" fixture table
+// into scrape lines — deterministic order keeps tests readable.
+func rejectedList(m map[string]float64) string {
+	var keys []string
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []string
+	for _, k := range keys {
+		fs, pl, _ := strings.Cut(k, "/")
+		out = append(out, "apiserver_flowcontrol_rejected_requests_total"+
+			"{flow_schema=\""+fs+"\",priority_level=\""+pl+"\"} "+
+			strconv.FormatFloat(m[k], 'f', -1, 64))
+	}
+	return strings.Join(out, "\n")
+}
+
+func inqueueList(m map[string]float64) string {
+	var keys []string
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []string
+	for _, k := range keys {
+		fs, pl, _ := strings.Cut(k, "/")
+		out = append(out, "apiserver_flowcontrol_current_inqueue_requests"+
+			"{flow_schema=\""+fs+"\",priority_level=\""+pl+"\"} "+
+			strconv.FormatFloat(m[k], 'f', -1, 64))
+	}
+	return strings.Join(out, "\n")
+}
+
+func TestParseAPFMetrics(t *testing.T) {
+	body := apfBody(
+		map[string]float64{
+			"exempt/exempt":                  3,
+			"system:serviceaccounts/wl-high": 40,
+			"system:nodes/global-default":    7,
+			"probe--f1e2d3c4/metrics":        2,
+		},
+		map[string]float64{
+			"system:serviceaccounts/wl-high": 12,
+			"exempt/exempt":                  0,
+		})
+	rejected, inqueue := parseAPFMetrics(body)
+	got := rejected[apfSeriesKey{"system:serviceaccounts", "wl-high"}]
+	if got != 40 {
+		t.Fatalf("rejected=%v want 40", got)
+	}
+	if rejected[apfSeriesKey{"system:nodes", "global-default"}] != 7 {
+		t.Fatalf("global-default rejects missing: %v", rejected)
+	}
+	if inqueue[apfSeriesKey{"system:serviceaccounts", "wl-high"}] != 12 {
+		t.Fatalf("inqueue=%v want 12", inqueue)
+	}
+	// No APF families → empty maps, not an error.
+	r2, i2 := parseAPFMetrics("go_goroutines 5\n")
+	if len(r2) != 0 || len(i2) != 0 {
+		t.Fatalf("non-APF body must parse empty: %v %v", r2, i2)
+	}
+}
+
+// The probe emits the mirrored series into the textfile every cycle
+// and suspect-logs only when the reject counters actually grew
+// between consecutive scrapes.
+func TestAPFProbeEmitsAndLogsRejectGrowth(t *testing.T) {
+	e := fixture(t)
+	root := t.TempDir()
+	oldTD := textfileDirOverride
+	textfileDirOverride = filepath.Join(root, "textfile")
+	defer func() { textfileDirOverride = oldTD }()
+
+	body1 := apfBody(
+		map[string]float64{"system:serviceaccounts/wl-high": 40},
+		map[string]float64{"system:serviceaccounts/wl-high": 12})
+	body2 := apfBody(
+		map[string]float64{"system:serviceaccounts/wl-high": 57},
+		map[string]float64{"system:serviceaccounts/wl-high": 30})
+	e.h.cpFreeze.apfMetricsFn = func(context.Context) (string, error) {
+		return body1, nil
+	}
+	e.h.cpFreeze.probeAPF(context.Background()) // scrape 1 — baseline only
+	prom, err := os.ReadFile(filepath.Join(
+		textfileDirOverride, apfPromFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"# TYPE node_host_agent_apiserver_apf_rejected_total counter",
+		`node_host_agent_apiserver_apf_rejected_total{flow_schema="system:serviceaccounts",priority_level="wl-high"} 40`,
+		`node_host_agent_apiserver_apf_inqueue_requests{flow_schema="system:serviceaccounts",priority_level="wl-high"} 12`,
+	} {
+		if !strings.Contains(string(prom), want) {
+			t.Fatalf("textfile missing %q:\n%s", want, prom)
+		}
+	}
+	if countLogLinesOrEmpty(e, "APF queue starvation") != 0 {
+		t.Fatal("starvation logged on the baseline scrape")
+	}
+
+	e.h.cpFreeze.apfMetricsFn = func(context.Context) (string, error) {
+		return body2, nil
+	}
+	e.h.cpFreeze.probeAPF(context.Background()) // scrape 2 — +17 rejects
+	if countLogLinesOrEmpty(e, "APF queue starvation") == 0 {
+		t.Fatal("no starvation line on reject growth")
+	}
+	log := watchdogLog(t, e)
+	if !strings.Contains(log, "flow_schema=system:serviceaccounts") ||
+		!strings.Contains(log, "priority_level=wl-high") {
+		t.Fatalf("offending flow_schema/priority_level not named:\n%s", log)
+	}
+	if !strings.Contains(log, "+17 rejects") {
+		t.Fatalf("reject delta not logged:\n%s", log)
+	}
+	prom, _ = os.ReadFile(filepath.Join(textfileDirOverride, apfPromFile))
+	if !strings.Contains(string(prom), "} 57") {
+		t.Fatalf("textfile not refreshed:\n%s", prom)
+	}
+}
+
+// A scrape failure emits headers only — the series must go absent
+// rather than keep a stale counter live.
+func TestAPFProbeScrapeFailureDropsSeries(t *testing.T) {
+	e := fixture(t)
+	root := t.TempDir()
+	oldTD := textfileDirOverride
+	textfileDirOverride = filepath.Join(root, "textfile")
+	defer func() { textfileDirOverride = oldTD }()
+
+	e.h.cpFreeze.apfMetricsFn = func(context.Context) (string, error) {
+		return "", errors.New("connection refused")
+	}
+	e.h.cpFreeze.probeAPF(context.Background()) // must not panic
+	prom, err := os.ReadFile(filepath.Join(
+		textfileDirOverride, apfPromFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(prom), "# TYPE "+apfRejectedMetric) {
+		t.Fatalf("headers missing on scrape failure:\n%s", prom)
+	}
+	for _, line := range strings.Split(string(prom), "\n") {
+		if strings.HasPrefix(line, apfRejectedMetric+"{") {
+			t.Fatalf("stale sample emitted on scrape failure:\n%s", prom)
+		}
+	}
+}
+
+// Counter resets (apiserver restart) re-baseline without firing —
+// the same inconclusive posture as a stale KCM snapshot.
+func TestAPFProbeCounterResetInconclusive(t *testing.T) {
+	e := fixture(t)
+	root := t.TempDir()
+	oldTD := textfileDirOverride
+	textfileDirOverride = filepath.Join(root, "textfile")
+	defer func() { textfileDirOverride = oldTD }()
+
+	e.h.cpFreeze.apfMetricsFn = func(context.Context) (string, error) {
+		return apfBody(map[string]float64{"a/b": 100}, nil), nil
+	}
+	e.h.cpFreeze.probeAPF(context.Background())
+	e.h.cpFreeze.apfMetricsFn = func(context.Context) (string, error) {
+		return apfBody(map[string]float64{"a/b": 3}, nil), nil // reset
+	}
+	e.h.cpFreeze.probeAPF(context.Background())
+	if countLogLinesOrEmpty(e, "APF queue starvation") != 0 {
+		t.Fatal("starvation logged across a counter reset")
 	}
 }

@@ -58,6 +58,11 @@ type Config struct {
 	// pressure gauges.
 	FileNRFile   string
 	SockstatFile string
+	// NetstatFile is /proc/1/net/netstat (TcpExt counters) and
+	// SNMPFile /proc/1/net/snmp (Ip/Udp counters) — the kernel
+	// TCP/IP stack grey-failure series.
+	NetstatFile string
+	SNMPFile    string
 	// FilesystemTargets are the mounts statfs'd per scrape for the
 	// inode gauges (H3) and the hung-mount probe (H7).
 	FilesystemTargets []string
@@ -200,6 +205,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.SockstatFile == "" {
 		c.SockstatFile = defaultSockstatFile
+	}
+	if c.NetstatFile == "" {
+		c.NetstatFile = defaultNetstatFile
+	}
+	if c.SNMPFile == "" {
+		c.SNMPFile = defaultSNMPFile
 	}
 	if len(c.FilesystemTargets) == 0 {
 		c.FilesystemTargets = defaultFilesystemTargets

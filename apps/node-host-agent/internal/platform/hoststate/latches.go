@@ -54,6 +54,7 @@ const (
 	LatchContainerdCorrupt      = "containerd-corrupt"       // W10-KR3
 	LatchCgroupDyingLeak        = "cgroup-dying-leak"        // cgroup-dying-reclaim
 	LatchSystemdSessionBloat    = "systemd-session-bloat"    // systemd-session-hygiene
+	LatchKubeletPLEGUnhealthy   = "kubelet-pleg-unhealthy"   // kubelet-syncloop PLEG metrics
 	// LatchJournalUnreadable is the blindness latch the shared
 	// journalwatch tracker sets — produced by BOTH hygienes'
 	// journal-read accounting (workerhygiene journald.go,
@@ -180,6 +181,7 @@ var LatchDefs = []LatchDef{
 	{Name: LatchContainerdCorrupt, Owner: "workerhygiene"},
 	{Name: LatchCgroupDyingLeak, Owner: "workerhygiene"},
 	{Name: LatchSystemdSessionBloat, Owner: "workerhygiene"},
+	{Name: LatchKubeletPLEGUnhealthy, Owner: "workerhygiene"},
 	{Name: LatchJournalUnreadable, Owner: "workerhygiene+controllerhygiene"},
 	{Name: LatchCiliumIPAMPrefix, Owner: "workerhygiene", Prefix: true},
 

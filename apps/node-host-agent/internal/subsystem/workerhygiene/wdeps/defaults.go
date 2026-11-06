@@ -19,6 +19,9 @@ const (
 	defaultKubeletWatchMinAge = 15 * time.Minute // shell KUBELET_WATCH_MIN_AGE_S=900
 	probeGap                  = 2 * time.Second
 	defaultKubeletSyncloopURL = "https://127.0.0.1:10250/healthz/syncloop"
+	// defaultKubeletMetricsURL is the PLEG series source — same
+	// :10250 listener + bearer as the syncloop probe.
+	defaultKubeletMetricsURL = "https://127.0.0.1:10250/metrics"
 	// DefaultKubeletTokenPath is the SA bearer-token file attached
 	// to kubelet's secure-port probes.
 	DefaultKubeletTokenPath    = "/var/run/secrets/kubernetes.io/serviceaccount/token"

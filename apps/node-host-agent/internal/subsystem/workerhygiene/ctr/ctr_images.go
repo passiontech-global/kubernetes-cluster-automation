@@ -20,19 +20,37 @@ import (
 var (
 	// Corrupted containerd layer/content-store signatures inside a
 	// pod's Waiting message (37) — a missing blob/snapshot never
-	// heals by retrying the pull; the image record must go.
+	// heals by retrying the pull; the image record must go. The
+	// last four are corrupted-on-disk-layer signatures: an ext4
+	// "structure needs cleaning" mount failure, a shim task dying
+	// on EIO, a truncated .so ("file too short"), and the
+	// exec-format class (0-byte truncated binary after hard-reset —
+	// heals on repull; a wrong-arch image does NOT, which is why
+	// exec-format refs get the once-per-image healed map).
 	corruptImageRe = regexp.MustCompile(
 		`content digest sha256:[0-9a-f]+: not found|` +
 			`failed to extract layer|` +
-			`parent snapshot .* does not exist`)
+			`parent snapshot .* does not exist|` +
+			`failed to mount .* structure needs cleaning|` +
+			`failed to create shim task: .* input/output error|` +
+			`error while loading shared libraries: .* file too short|` +
+			`exec format error`)
+
+	// execFormatRe is the once-per-image subset — a wrong-arch
+	// image can never heal by re-pulling, so each ref is deleted
+	// at most once (see CtrImagesCheck.execFormatHealed).
+	execFormatRe = regexp.MustCompile(`exec format error`)
 )
 
 // corruptImageWaitingReason mirrors the shell reason list — pull
-// failures (ErrImagePull/ImagePullBackOff) and create failures
-// (CreateContainerError) both surface corrupted-layer messages.
+// failures (ErrImagePull/ImagePullBackOff), create failures
+// (CreateContainerError) and run/start failures
+// (RunContainerError/StartError — the on-disk corrupt-layer and
+// exec-format signatures surface there, not at pull).
 func corruptImageWaitingReason(r string) bool {
 	switch r {
-	case "CreateContainerError", "ErrImagePull", "ImagePullBackOff":
+	case "CreateContainerError", "ErrImagePull", "ImagePullBackOff",
+		"RunContainerError", "StartError":
 		return true
 	}
 	return false
@@ -100,7 +118,18 @@ func NormalizeCRIImageName(spec string) string {
 // Normalization is preferred over `ctr images ls` reconciliation —
 // one exec per ref keeps the seam shape; a normalized name that still
 // isn't in the store just makes ctr warn and exit 0 (accepted).
-type CtrImagesCheck struct{ d *wdeps.Deps }
+//
+// execFormatHealed is the once-per-image ledger for the exec-format
+// class: a 0-byte truncated binary (hard-reset mid-write) heals on
+// the repull the rm triggers, but a genuinely wrong-arch image
+// repulls the SAME un-runnable ref — deleting it every 15m would
+// loop forever. Each normalized ref is deleted at most once for an
+// exec-format signature; other signatures stay unlimited (bounded
+// by the shared budget only).
+type CtrImagesCheck struct {
+	d                *wdeps.Deps
+	execFormatHealed map[string]bool
+}
 
 // Name returns the check label / WD_SIG key.
 func (c *CtrImagesCheck) Name() string { return wdeps.CheckCtrImages }
@@ -120,6 +149,10 @@ func (c *CtrImagesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// Dedupe refs across pods and statuses — several containers
 	// pinned to one corrupted image need a single rm, not one each.
 	seen := map[string]bool{}
+	execFmtRefs := map[string]bool{}
+	if c.execFormatHealed == nil {
+		c.execFormatHealed = map[string]bool{}
+	}
 	for i := range e.Pods {
 		p := &e.Pods[i]
 		statuses := slices.Concat(p.Status.InitContainerStatuses,
@@ -130,11 +163,25 @@ func (c *CtrImagesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				!corruptImageRe.MatchString(w.Message) {
 				continue
 			}
-			if cs.Image != "" {
-				seen[NormalizeCRIImageName(cs.Image)] = true
-			}
-			if cs.ImageID != "" {
-				seen[NormalizeCRIImageName(cs.ImageID)] = true
+			// Exec-format refs heal once — the ledger marks the ref
+			// only when the rm is actually attempted below (marking
+			// at selection would burn the single shot when the rm
+			// budget is in cooldown; a failed rm still counts since a
+			// persistent rm failure on a wrong-arch image must not
+			// loop either).
+			execFmt := execFormatRe.MatchString(w.Message)
+			for _, spec := range []string{cs.Image, cs.ImageID} {
+				if spec == "" {
+					continue
+				}
+				ref := NormalizeCRIImageName(spec)
+				if execFmt {
+					if c.execFormatHealed[ref] {
+						continue
+					}
+					execFmtRefs[ref] = true
+				}
+				seen[ref] = true
 			}
 		}
 	}
@@ -157,6 +204,12 @@ func (c *CtrImagesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// Budget spent atomically BEFORE acting (lib.sh rate_spend
 	// parity): a failed rm still consumed the budget.
 	for _, img := range images {
+		if execFmtRefs[img] {
+			// Burn the ref's single exec-format heal only now that
+			// the rm will actually run — a cooldown skip above must
+			// not consume it.
+			c.execFormatHealed[img] = true
+		}
 		if err := c.d.Cfg.Seams.CtrRmImage(ctx, img); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: ctr image rm %s failed: %v", img, err))

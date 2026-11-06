@@ -143,3 +143,87 @@ func TestSockstatMissingAndMalformedSections(t *testing.T) {
 		}
 	}
 }
+
+// --- netstat/snmp kernel TCP/IP counters ---
+
+const netstatFixture = `TcpExt: SyncookiesSent ListenOverflows ListenDrops TCPSynRetrans TCPTimeouts
+TcpExt: 0 123 45 67 89
+IpExt: InMcastPkts OutMcastPkts
+IpExt: 1 2
+`
+
+const snmpFixture = `Ip: Forwarding DefaultTTL InReceives ReasmFails
+Ip: 1 64 9999 13
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors
+Udp: 100 0 2 100 5 0
+`
+
+func TestNetstatSNMPMetrics(t *testing.T) {
+	cfg, _ := fixture(t)
+	testutil.WriteFile(t, cfg.NetstatFile, netstatFixture)
+	testutil.WriteFile(t, cfg.SNMPFile, snmpFixture)
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	checks := map[string]float64{
+		"node_host_agent_netstat_tcp_listen_overflows_total": 123,
+		"node_host_agent_netstat_tcp_listen_drops_total":     45,
+		"node_host_agent_netstat_tcp_syn_retrans_total":      67,
+		"node_host_agent_netstat_tcp_timeouts_total":         89,
+		"node_host_agent_snmp_ip_reasm_fails_total":          13,
+		"node_host_agent_snmp_udp_rcvbuf_errors_total":       5,
+	}
+	for name, want := range checks {
+		if v, ok := metricValue(t, c, name, node); !ok || v != want {
+			t.Fatalf("%s=%v ok=%v want %v", name, v, ok, want)
+		}
+	}
+}
+
+func TestNetstatSNMPAbsentWithoutFiles(t *testing.T) {
+	cfg, _ := fixture(t)
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	for _, name := range []string{
+		"node_host_agent_netstat_tcp_listen_overflows_total",
+		"node_host_agent_netstat_tcp_listen_drops_total",
+		"node_host_agent_netstat_tcp_syn_retrans_total",
+		"node_host_agent_netstat_tcp_timeouts_total",
+		"node_host_agent_snmp_ip_reasm_fails_total",
+		"node_host_agent_snmp_udp_rcvbuf_errors_total",
+	} {
+		if _, ok := metricValue(t, c, name, node); ok {
+			t.Fatalf("%s emitted without the source file", name)
+		}
+	}
+}
+
+func TestNetstatSNMPMissingAndMalformedSections(t *testing.T) {
+	cfg, _ := fixture(t)
+	// A values line that doesn't line up with its header is
+	// skipped; a section carrying only SOME keys emits just those.
+	testutil.WriteFile(t, cfg.NetstatFile,
+		"TcpExt: ListenOverflows ListenDrops\nTcpExt: 7 8\n"+
+			"TcpExt: TCPSynRetrans extra\nTcpExt: notanumber x\n")
+	testutil.WriteFile(t, cfg.SNMPFile,
+		"Udp: InDatagrams RcvbufErrors\nUdp: 9 nope\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	if v, ok := metricValue(t, c,
+		"node_host_agent_netstat_tcp_listen_overflows_total",
+		node); !ok || v != 7 {
+		t.Fatalf("overflows=%v ok=%v want 7", v, ok)
+	}
+	if v, ok := metricValue(t, c,
+		"node_host_agent_netstat_tcp_listen_drops_total",
+		node); !ok || v != 8 {
+		t.Fatalf("drops=%v ok=%v want 8", v, ok)
+	}
+	if _, ok := metricValue(t, c,
+		"node_host_agent_netstat_tcp_syn_retrans_total", node); ok {
+		t.Fatal("syn_retrans emitted for a malformed values line")
+	}
+	if _, ok := metricValue(t, c,
+		"node_host_agent_snmp_udp_rcvbuf_errors_total", node); ok {
+		t.Fatal("rcvbuf_errors emitted for a malformed values line")
+	}
+}

@@ -36,35 +36,40 @@ import (
 // just entries in env.live plus a stat file under env.proc, systemd
 // is a fake argv recorder, and HTTP/unix/journal probes are canned.
 type env struct {
-	h          *Hygiene
-	cs         *fake.Clientset
-	state      string
-	proc       string
-	ctr        string
-	sb         string
-	resv       string
-	unit       string
-	kubepods   string
-	live       map[int]bool
-	kills      []killRecord
-	now        time.Time
-	mu         sync.Mutex // guards sdcmds (feeder goroutine + Cycle both record)
-	sdcmds     [][]string
-	sdReply    map[string]string
-	probes     map[string]error  // url → error (nil = healthy)
-	status     map[string]int    // url → canned HTTP status for probeHTTPStatus
-	bearer     map[string]string // url → bearer token the probe carried
-	sockErrs   map[string]error  // unix socket path → dial error
-	diskUsed   float64           // /var/lib/k0s fill ratio for statfsFn
-	ingest     string            // CtrIngestDir
-	sysnet     string            // SysClassNet
-	ciliumRt   string            // CiliumRuntimeConfig
-	bodyOK     map[string]bool   // :10248 healthz body=="ok" canned answers
-	unixBody   []byte
-	unixErr    error
-	journal    string
-	journalErr error
-	jdir       string
+	h           *Hygiene
+	cs          *fake.Clientset
+	state       string
+	proc        string
+	ctr         string
+	sb          string
+	resv        string
+	unit        string
+	kubepods    string
+	live        map[int]bool
+	kills       []killRecord
+	now         time.Time
+	mu          sync.Mutex // guards sdcmds (feeder goroutine + Cycle both record)
+	sdcmds      [][]string
+	sdReply     map[string]string
+	probes      map[string]error  // url → error (nil = healthy)
+	status      map[string]int    // url → canned HTTP status for probeHTTPStatus
+	bearer      map[string]string // url → bearer token the probe carried
+	sockErrs    map[string]error  // unix socket path → dial error
+	diskUsed    float64           // /var/lib/k0s fill ratio for statfsFn
+	ingest      string            // CtrIngestDir
+	sysnet      string            // SysClassNet
+	ciliumRt    string            // CiliumRuntimeConfig
+	bodyOK      map[string]bool   // :10248 healthz body=="ok" canned answers
+	unixBody    []byte
+	unixErr     error
+	journal     string
+	journalErr  error
+	jdir        string
+	dnsTCP      bool           // cilium-lrp :53 TCP probe canned answer
+	svcBackends map[string]int // cilium-lrp BPF service-map backends
+	svcErr      error          // cilium-lrp service-map probe error
+	metricsBody string         // kubelet /metrics canned body (PLEG)
+	metricsErr  error          // kubelet /metrics canned error
 	// sdHook, when set, runs inside sdRun before the reply lookup —
 	// tests advance the fake clock here to simulate a slow host
 	// call (e.g. a D-Bus round trip taking seconds).
@@ -250,6 +255,17 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 	}
 	h.Cfg.Seams.ProbeUnixSock = func(_ context.Context, socket string, _ time.Duration) error {
 		return e.sockErrs[socket]
+	}
+	// Newer probe seams — canned defaults keep tests hermetic (the
+	// production defaults would dial/exec on the test host).
+	h.Cfg.Seams.DNSProbeTCP = func(string, string, time.Duration) bool {
+		return e.dnsTCP
+	}
+	h.Cfg.Seams.CiliumServiceBackendsFn = func(context.Context) (map[string]int, error) {
+		return e.svcBackends, e.svcErr
+	}
+	h.Cfg.Seams.KubeletMetricsFn = func(_ context.Context, _, _ string, _ time.Duration) (string, error) {
+		return e.metricsBody, e.metricsErr
 	}
 	h.Cfg.Seams.StatfsFn = func(_ string, st *unix.Statfs_t) error {
 		st.Blocks = 100

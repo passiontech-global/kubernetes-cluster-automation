@@ -48,6 +48,15 @@ type Series struct {
 	IOPSIFullAvg300        float64 // /proc/pressure/io full avg300
 	IOThrottledProcs       int64   // pids reniced+ioniced to idle
 	ConntrackLiberalFixes  int64   // nf_conntrack_tcp_be_liberal writes
+	UnlinkedOpenFileBytes  int64   // deleted-but-open regular-file bytes held
+	UnlinkedOpenFileCount  int64   // deleted-but-open regular files (deduped)
+	KubepodsSwapUsedBytes  int64   // kubepods.slice memory.swap.current
+	// KubeletPLEGLastSeenAgeSec is the kubelet_pleg_last_seen_seconds
+	// gauge passthrough — seconds since PLEG last observed a container
+	// state change; KubeletPLEGDiscardEvents is the cumulative
+	// kubelet_pleg_discard_events counter.
+	KubeletPLEGLastSeenAgeSec float64
+	KubeletPLEGDiscardEvents  int64
 }
 
 // Deps is the shared state every Check consumes — the split's

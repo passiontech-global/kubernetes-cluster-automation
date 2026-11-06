@@ -27,6 +27,24 @@
 //     classic way a postgres data disk fills to PANIC; past the
 //     10GiB critical threshold the orphan slot is dropped (5GiB only
 //     notes a warning).
+//  5. MultiXact age — MAX(age(datminmxid)) feeds
+//     kine_db_multixact_age_transactions: the row-lock-share
+//     wraparound horizon, the lesser-known twin of the datfrozenxid
+//     wraparound item 3 watches.
+//  6. Orphaned prepared transactions — pg_prepared_xacts rows on the
+//     postgres/kine databases older than 15min. A prepared xact
+//     whose coordinator vanished holds its xmin open forever —
+//     pinning the xmin horizon exactly like an idle-in-transaction
+//     session but invisible to pg_stat_activity — so the probe both
+//     gauges them (kine_db_orphan_prepared_xacts) and rolls them
+//     back automatically (ROLLBACK PREPARED), counting releases in
+//     kine_db_orphan_prepared_xacts_rolled_back_total.
+//
+// Items 5–6 export through their own textfile (kine-db-xact.prom)
+// rather than emitProbe's kine-db.prom — the prometheus collector
+// list lives in kinedb.go/probe.go outside this file, so the
+// node-exporter textfile channel is the export path (the
+// controllerhygiene textfile_prom convention).
 package kinedb
 
 import (
@@ -35,7 +53,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 const (
@@ -99,7 +120,32 @@ type hygieneResult struct {
 	slotRetained int64
 	slotSeen     bool
 	slotsDropped int64
+	// Items 5–6 (multiXact horizon + orphan prepared xacts).
+	mxidAge        int64
+	mxidSeen       bool
+	preparedXacts  int64
+	preparedSeen   bool
+	preparedRolled int64 // rolled back THIS round
 }
+
+// preparedXactRolledBackTotal is the lifetime count behind
+// kine_db_orphan_prepared_xacts_rolled_back_total — in-process
+// cumulative like metrics.idleTermTotal (a prometheus Counter
+// resets on restart anyway; the textfile emits the running total
+// every round the block runs).
+var preparedXactRolledBackTotal atomic.Int64
+
+// preparedXactOrphanAge — a prepared transaction still listed in
+// pg_prepared_xacts past this age counts as orphaned: its
+// coordinator had every chance to COMMIT/ABORT PREPARED, so what
+// remains pins the xmin horizon with nobody left to finish it.
+const preparedXactOrphanAge = "15 minutes"
+
+// xactPromFile is the textfile items 5–6 export through — kept
+// separate from emitProbe's kine-db.prom because that render is
+// owned by probe.go (a second writer would just be overwritten each
+// round, and duplicate series across textfiles fail the scrape).
+const xactPromFile = "kine-db-xact.prom"
 
 // pgHygiene runs the whole hygiene block once — called from
 // runProbeChecks only after containers+creds pass, so every query
@@ -112,6 +158,107 @@ func (k *KineDB) pgHygiene(ctx context.Context, pg, user, pass string,
 	k.hygieneDeadTuple(ctx, pg, user, pass, h, note)
 	k.hygieneXID(ctx, pg, user, pass, h, note)
 	k.hygieneWAL(ctx, pg, user, pass, h, note)
+	k.hygieneMultiXact(ctx, pg, user, pass, h, note)
+	k.hygienePreparedXacts(ctx, pg, user, pass, h, note)
+	k.emitXactTextfile(h)
+}
+
+// hygieneMultiXact — item 5: MAX(age(datminmxid)) across databases.
+// MultiXact IDs are consumed by row-level SHARE locks (foreign keys
+// checking referenced rows); exhaustion forces the same emergency
+// freeze cycle as XID wraparound, so the gauge rides the same
+// 2-minute freshness as kine_db_xid_age_transactions.
+func (k *KineDB) hygieneMultiXact(ctx context.Context, pg, user, pass string,
+	h *hygieneResult, note func(string)) {
+	out, err := k.psqlQuery(ctx, pg, user, pass,
+		"SELECT COALESCE(MAX(age(datminmxid)),0) FROM pg_database")
+	if err != nil {
+		note(fmt.Sprintf("mxid-age-fail: %v", err))
+		return
+	}
+	v, perr := strconv.ParseInt(firstLine(out), 10, 64)
+	if perr != nil {
+		note(fmt.Sprintf("mxid-age-unparsed: %v", perr))
+		return
+	}
+	h.mxidAge, h.mxidSeen = v, true
+}
+
+// hygienePreparedXacts — item 6: prepared transactions orphaned past
+// preparedXactOrphanAge on the postgres/kine databases, rolled back
+// in place. ROLLBACK PREPARED is the safe release: the coordinator
+// is gone by definition (an alive one commits/aborts itself long
+// before 15min), and ABORT is the conservative half of the outcome
+// — no data commit happens, only the xmin pin releases. A failed
+// rollback is noted and retried next round, never fatal.
+func (k *KineDB) hygienePreparedXacts(ctx context.Context, pg, user, pass string,
+	h *hygieneResult, note func(string)) {
+	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+		"SELECT gid FROM pg_prepared_xacts "+
+			"WHERE database IN ('postgres','kine') "+
+			"AND prepared < now() - interval '%s'", preparedXactOrphanAge))
+	if err != nil {
+		note(fmt.Sprintf("prepared-xacts-fail: %v", err))
+		return
+	}
+	h.preparedSeen = true // a successful empty read = no orphans
+	for _, gid := range parseGIDs(out) {
+		h.preparedXacts++
+		if _, rerr := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+			"ROLLBACK PREPARED %s", sqlQuote(gid))); rerr != nil {
+			note(fmt.Sprintf("rollback-prepared-%s-fail: %v", gid, rerr))
+			continue
+		}
+		h.preparedRolled++
+		preparedXactRolledBackTotal.Add(1)
+		logger().Warn("kinedb: rolled back orphaned prepared transaction",
+			"gid", gid)
+	}
+}
+
+// parseGIDs splits the gid list of the prepared-xacts query — one
+// identifier per -tA line; empty/blank lines are skipped.
+func parseGIDs(out string) []string {
+	var gids []string
+	for _, l := range strings.Split(out, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		gids = append(gids, l)
+	}
+	return gids
+}
+
+// emitXactTextfile renders kine-db-xact.prom for items 5–6 — header
+// always, sample only behind its *Seen flag (a failed read goes
+// absent rather than fabricating a zero), and the lifetime rollback
+// counter every round like idleTermTotal.
+func (k *KineDB) emitXactTextfile(h *hygieneResult) {
+	var p promfile.Builder
+	mxidHelp := "MAX(age(datminmxid)) across databases — distance " +
+		"to MultiXact wraparound pressure."
+	if h.mxidSeen {
+		p.Gauge("kine_db_multixact_age_transactions", mxidHelp,
+			float64(h.mxidAge))
+	} else {
+		p.Header("kine_db_multixact_age_transactions", mxidHelp)
+	}
+	preparedHelp := "Prepared transactions older than " +
+		preparedXactOrphanAge + " on the postgres/kine databases — " +
+		"orphaned xacts pinning the xmin horizon."
+	if h.preparedSeen {
+		p.Gauge("kine_db_orphan_prepared_xacts", preparedHelp,
+			float64(h.preparedXacts))
+	} else {
+		p.Header("kine_db_orphan_prepared_xacts", preparedHelp)
+	}
+	p.HeaderType("kine_db_orphan_prepared_xacts_rolled_back_total",
+		"Orphaned prepared transactions rolled back by the agent "+
+			"(ROLLBACK PREPARED) to release the xmin horizon.", "counter")
+	p.Line(fmt.Sprintf("kine_db_orphan_prepared_xacts_rolled_back_total %d",
+		preparedXactRolledBackTotal.Load()))
+	k.emitTextfile(xactPromFile, &p)
 }
 
 // hygieneIdleInTx — item 1: sessions idle-in-transaction >3min on

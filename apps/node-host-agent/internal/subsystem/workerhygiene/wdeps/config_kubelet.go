@@ -41,6 +41,11 @@ type KubeletConfig struct {
 	// unreadable → the probe runs unauthenticated and 401/403
 	// answers mark the check inconclusive, not down.
 	TokenPath string
+	// MetricsURL is the kubelet :10250 /metrics endpoint the
+	// syncloop check scrapes for the PLEG relist/last-seen series —
+	// same bearer auth as the syncloop probe. No env row (the URL
+	// is a wiring constant like APIFallbackURL).
+	MetricsURL string
 }
 
 func (k *KubeletConfig) applyDefaults() {
@@ -70,6 +75,9 @@ func (k *KubeletConfig) applyDefaults() {
 	}
 	if k.SyncloopURL == "" {
 		k.SyncloopURL = defaultKubeletSyncloopURL
+	}
+	if k.MetricsURL == "" {
+		k.MetricsURL = defaultKubeletMetricsURL
 	}
 	if k.TokenPath == "" {
 		k.TokenPath = DefaultKubeletTokenPath
