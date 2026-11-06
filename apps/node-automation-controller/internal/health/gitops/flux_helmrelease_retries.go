@@ -2,7 +2,6 @@ package gitops
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
@@ -58,13 +57,10 @@ const (
 	// fluxHRHealCooldown bounds reconcile-annotation patches to one
 	// per HelmRelease per 30m.
 	fluxHRHealCooldown = 30 * time.Minute
-	// fluxHRRequestedAtAnno / fluxHRForceAtAnno are the flux
-	// reconcile-request annotations stamped with the SAME timestamp
-	// token — requestedAt asks for a reconcile, forceAt skips the
-	// artifact-cache freshness check (same pair the flux
-	// CLI `reconcile --with-source` writes).
-	fluxHRRequestedAtAnno = "reconcile.fluxcd.io/requestedAt"
-	fluxHRForceAtAnno     = "reconcile.fluxcd.io/forceAt"
+	// The stamped pair is kube.AnnoFluxRequestedAt /
+	// kube.AnnoFluxForceAt — requestedAt asks for a reconcile,
+	// forceAt skips the artifact-cache freshness check (same pair
+	// the flux CLI `reconcile --with-source` writes).
 )
 
 // helmReleaseRetryGVRs are the HelmRelease API versions the check
@@ -230,21 +226,14 @@ func (p *fluxHRRetriesCheck) maybePatchHRRetry(ctx context.Context, log logr.Log
 	// The requestedAt annotation is the durable half: a stamp younger
 	// than the cooldown — whether we wrote it or `flux reconcile`
 	// did — means a reconcile is already queued.
-	if v, found := kube.NestedString(
-		hr.Object, "metadata", "annotations", fluxHRRequestedAtAnno); found {
-		if t, err := time.Parse(time.RFC3339, v); err == nil &&
-			now.Sub(t) < fluxHRHealCooldown {
-			return
-		}
+	if t, ok := kube.AnnoTime(hr, kube.AnnoFluxRequestedAt); ok &&
+		now.Sub(t) < fluxHRHealCooldown {
+		return
 	}
-	token := now.UTC().Format(time.RFC3339Nano)
-	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{
-			"annotations": map[string]string{
-				fluxHRRequestedAtAnno: token,
-				fluxHRForceAtAnno:     token,
-			},
-		},
+	token := now.UTC().Format(time.RFC3339)
+	patch, err := kube.MergePatchAnnos(map[string]any{
+		kube.AnnoFluxRequestedAt: token,
+		kube.AnnoFluxForceAt:     token,
 	})
 	if err != nil {
 		metrics.IncError(p.Name)

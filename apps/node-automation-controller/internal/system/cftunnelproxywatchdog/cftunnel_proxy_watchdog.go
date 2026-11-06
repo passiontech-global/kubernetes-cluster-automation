@@ -181,9 +181,14 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 		return 0, fmt.Errorf("list proxy endpointslices in %s: %w", w.namespace, err)
 	}
 	// kubectl annotate --overwrite: merge patch sets/replaces the key.
-	patch := []byte(fmt.Sprintf(
-		`{"metadata":{"annotations":{%q:"%d"}}}`,
-		cfTunnelResyncAnno, w.now.Now().Unix()))
+	// The stamp stays unix — the VALUE churn is the resync signal
+	// (each sweep must differ or the EndpointSlice emits no event).
+	patch, err := kube.MergePatchAnnos(map[string]any{
+		cfTunnelResyncAnno: fmt.Sprintf("%d", w.now.Now().Unix()),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("marshal resync patch: %w", err)
+	}
 	for i := range epsList.Items {
 		if _, err := w.cs.DiscoveryV1().EndpointSlices(w.namespace).Patch(ctx,
 			epsList.Items[i].Name, types.MergePatchType,

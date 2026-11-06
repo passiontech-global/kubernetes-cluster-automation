@@ -285,14 +285,22 @@ func missedOver100(sched cron.Schedule, anchor, now time.Time) bool {
 // (merge preserves every key not named). A patch failure is
 // metered+logged but absorbed — the next sweep retries.
 func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, cj *batchv1.CronJob, now time.Time) {
-	payload, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]any{
-			deadlinePatchedAnno: now.UTC().Format(time.RFC3339),
-		}},
-		"spec": map[string]any{
-			"startingDeadlineSeconds": deadlinePatchSeconds,
-		},
+	// MergePatchAnnos builds the annotations half; the spec field is
+	// grafted onto the same doc so the provenance stamp and the
+	// deadline land in ONE merge patch (merge preserves every key
+	// not named, so a concurrent spec writer is not clobbered).
+	payload, err := kube.MergePatchAnnos(map[string]any{
+		deadlinePatchedAnno: now.UTC().Format(time.RFC3339),
 	})
+	if err == nil {
+		var doc map[string]any
+		if err = json.Unmarshal(payload, &doc); err == nil {
+			doc["spec"] = map[string]any{
+				"startingDeadlineSeconds": deadlinePatchSeconds,
+			}
+			payload, err = json.Marshal(doc)
+		}
+	}
 	if err != nil {
 		metrics.IncError(c.queue)
 		log.Error(err, "marshal deadline patch",
