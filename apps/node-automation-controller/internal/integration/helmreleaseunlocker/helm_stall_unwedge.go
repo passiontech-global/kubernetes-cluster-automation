@@ -109,8 +109,8 @@ const (
 	// one-off install/upgrade even with no drift. Both are only
 	// honored when reconcile.fluxcd.io/requestedAt carries the SAME
 	// token value, so all three are stamped in one patch.
-	fluxResetAnno = "reconcile.fluxcd.io/resetAt"
-	fluxForceAnno = "reconcile.fluxcd.io/forceAt"
+	fluxResetAnno = kube.AnnoFluxResetAt
+	fluxForceAnno = kube.AnnoFluxForceAt
 	// W8-GO2 — the stall-unwedge retry cycle: max 2 attempts per
 	// lastAttemptedRevision, each at least 6h apart.
 	stallMaxAttemptsPerRevision = 2
@@ -218,10 +218,13 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 			continue // inside the 6h attempt gap — let the last unwedge land
 		}
 		acted, refuse, err := u.unwedge(ctx, gvr, hr)
-		if acted || err == nil && refuse == "" {
-			// Only a completed cycle (acted, or a clean no-op that
-			// needed nothing) and refusals count as attempts —
-			// API errors must not burn the 2-try budget.
+		if err == nil {
+			// Every non-error outcome burns one of the
+			// stallMaxAttemptsPerRevision tries: acted, a clean
+			// no-op AND refusals — an uncounted refusal would
+			// re-run the full workload-layer analysis every
+			// sweep forever and never reach the cap. API errors
+			// are the only outcome that spares the budget.
 			att.count++
 			att.last = now
 		}
@@ -322,13 +325,11 @@ func (u *helmReleaseUnlocker) unwedge(ctx context.Context,
 	// reset token a stalled HR would consume the freed scheduling
 	// window and stay parked.
 	token := u.now.Now().UTC().Format(time.RFC3339)
-	patch, err = json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]string{
-			fluxReconcileAnno:        token,
-			fluxResetAnno:            token,
-			fluxForceAnno:            token,
-			helmLastStallUnwedgeAnno: token,
-		}},
+	patch, err = kube.MergePatchAnnos(map[string]any{
+		fluxReconcileAnno:        token,
+		fluxResetAnno:            token,
+		fluxForceAnno:            token,
+		helmLastStallUnwedgeAnno: token,
 	})
 	if err != nil {
 		return false, "", err

@@ -1036,6 +1036,50 @@ func TestFluxSourceHealerKustomization(t *testing.T) {
 	}
 }
 
+// C1 sweep economy: N stale consumers sharing one GitRepository cost
+// exactly ONE Get + one patch (the per-sweep dedupe claims the source
+// for the first consumer), and the Kustomization list is paged once
+// for BOTH K-scanning healers.
+func TestFluxSourceHealerDedupesSharedSource(t *testing.T) {
+	ks := func(name string) *unstructured.Unstructured {
+		k := ksObj("apps", name, "failed to fetch artifact", time.Hour)
+		k.Object["spec"] = map[string]any{
+			"sourceRef": map[string]any{"kind": "GitRepository", "name": "flux-system"},
+		}
+		return k
+	}
+	src := fluxSourceObj("GitRepository", "source.toolkit.fluxcd.io/v1",
+		"apps", "flux-system")
+	dyn := newDynFake(ks("root"), ks("apps"), src)
+	var gets, patches, ksLists int
+	dyn.PrependReactor("get", "gitrepositories",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			gets++
+			return false, nil, nil
+		})
+	dyn.PrependReactor("patch", "gitrepositories",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			patches++
+			return false, nil, nil
+		})
+	dyn.PrependReactor("list", "kustomizations",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			ksLists++
+			return false, nil, nil
+		})
+	u := newUnlocker(kfake.NewSimpleClientset(), dyn, 0, "")
+
+	if err := u.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if gets != 1 || patches != 1 {
+		t.Fatalf("shared source: %d Gets + %d patches, want 1 each", gets, patches)
+	}
+	if ksLists != 1 {
+		t.Fatalf("kustomizations listed %d times in one sweep, want 1", ksLists)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // W9-CP2 — superseded helm release secret pruner
 // ---------------------------------------------------------------------------
