@@ -1,6 +1,6 @@
 // quarantine_mutation.go — the quarantine bookkeeping + write path
 // of apiserver-endpoint-guard: reading/writing the
-// node.ops/quarantined-endpoints annotation (the persisted half of
+// passiontech.dev/quarantined-endpoints annotation (the persisted half of
 // the quarantine set, mirrored in memory by g.memQuarantine) and the
 // pure Endpoints/EndpointSlice mutation helpers run() applies to the
 // SSOT object's deep copy before Update.
@@ -107,7 +107,7 @@ func routableEndpointIPs(ep *unstructured.Unstructured) map[string]bool {
 	return set
 }
 
-// parseQuarantineAnnotation reads node.ops/quarantined-endpoints off
+// parseQuarantineAnnotation reads passiontech.dev/quarantined-endpoints off
 // whichever object is the SSOT this cluster (Endpoints <1.33,
 // EndpointSlice >=1.33).
 func parseQuarantineAnnotation(obj metav1.Object) map[string]bool {

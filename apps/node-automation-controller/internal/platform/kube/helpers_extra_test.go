@@ -192,11 +192,11 @@ func TestTaintHelpers(t *testing.T) {
 	n := node("n1", corev1.ConditionTrue, nil)
 	cs := fake.NewSimpleClientset(n)
 
-	if err := TaintNode(ctx, cs, "n1", "node.ops/test", "true", corev1.TaintEffectNoSchedule); err != nil {
+	if err := TaintNode(ctx, cs, "n1", "passiontech.dev/test", "true", corev1.TaintEffectNoSchedule); err != nil {
 		t.Fatalf("TaintNode: %v", err)
 	}
 	got := getNode(t, cs, "n1")
-	if !HasTaint(got.Spec.Taints, "node.ops/test") {
+	if !HasTaint(got.Spec.Taints, "passiontech.dev/test") {
 		t.Fatal("taint not applied")
 	}
 	if len(got.Spec.Taints) != 1 {
@@ -204,17 +204,17 @@ func TestTaintHelpers(t *testing.T) {
 	}
 
 	// Idempotent: same key is not duplicated.
-	if err := TaintNode(ctx, cs, "n1", "node.ops/test", "true", corev1.TaintEffectNoSchedule); err != nil {
+	if err := TaintNode(ctx, cs, "n1", "passiontech.dev/test", "true", corev1.TaintEffectNoSchedule); err != nil {
 		t.Fatalf("TaintNode idempotent: %v", err)
 	}
 	if l := len(getNode(t, cs, "n1").Spec.Taints); l != 1 {
 		t.Fatalf("expected still 1 taint, got %d", l)
 	}
 
-	if err := UntaintNode(ctx, cs, "n1", "node.ops/test"); err != nil {
+	if err := UntaintNode(ctx, cs, "n1", "passiontech.dev/test"); err != nil {
 		t.Fatalf("UntaintNode: %v", err)
 	}
-	if HasTaint(getNode(t, cs, "n1").Spec.Taints, "node.ops/test") {
+	if HasTaint(getNode(t, cs, "n1").Spec.Taints, "passiontech.dev/test") {
 		t.Fatal("taint not removed")
 	}
 }

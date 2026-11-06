@@ -878,7 +878,7 @@ func TestJobFailedCondition(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 2.1 — node.ops/last-helm-unlock persistence & C1 — flux source healer
+// 2.1 — passiontech.dev/last-helm-unlock persistence & C1 — flux source healer
 // ---------------------------------------------------------------------------
 
 func fluxSourceObj(kind, apiVersion, ns, name string) *unstructured.Unstructured {
@@ -913,7 +913,7 @@ func ksObj(ns, name string, staleMsg string, failingFor time.Duration) *unstruct
 	return k
 }
 
-// The persisted node.ops/last-helm-unlock stamp IS the cooldown: with
+// The persisted passiontech.dev/last-helm-unlock stamp IS the cooldown: with
 // an empty in-RAM ledger (post-restart) an HR still inside 24h is
 // alerted, not re-unlocked.
 func TestHelmReleaseUnlockerPersistedCooldown(t *testing.T) {
@@ -941,7 +941,7 @@ func TestHelmReleaseUnlockerPersistedCooldown(t *testing.T) {
 }
 
 // A successful unlock stamps BOTH reconcile.fluxcd.io/requestedAt and
-// node.ops/last-helm-unlock on the HR.
+// passiontech.dev/last-helm-unlock on the HR.
 func TestHelmReleaseUnlockerStampsLastUnlockAnnotation(t *testing.T) {
 	dyn, secrets := stuckHRFixture()
 	cs := kfake.NewSimpleClientset(secrets...)
@@ -951,7 +951,7 @@ func TestHelmReleaseUnlockerStampsLastUnlockAnnotation(t *testing.T) {
 	}
 	got := hrAnnotation(t, dyn, helmReleaseGVRs[0], "apps", "myapp", helmLastUnlockAnno)
 	if got == "" {
-		t.Fatal("node.ops/last-helm-unlock not persisted on unlock")
+		t.Fatal("passiontech.dev/last-helm-unlock not persisted on unlock")
 	}
 	if _, err := time.Parse(time.RFC3339, got); err != nil {
 		t.Fatalf("last-helm-unlock %q is not RFC3339: %v", got, err)

@@ -3,7 +3,7 @@
 // HELM_STALL_UNWEDGE_ENABLED). Sibling to the pending-secret unlock
 // in helmrelease_unlocker.go: same HR list, same 30m first-seen
 // window, same helm-controller-health gate, same 24h cooldown shape
-// (own ledger + node.ops/last-helm-stall-unwedge stamp so the two
+// (own ledger + passiontech.dev/last-helm-stall-unwedge stamp so the two
 // remediations never refund each other).
 //
 // The wedge (observed 2026-11-04, HelmRelease 1password/connect on
@@ -101,7 +101,7 @@ import (
 const (
 	// helmLastStallUnwedgeAnno persists the last unwedge moment on
 	// the HR — the durable half of the 24h stall-unwedge cooldown,
-	// deliberately a different key than node.ops/last-helm-unlock.
+	// deliberately a different key than passiontech.dev/last-helm-unlock.
 	helmLastStallUnwedgeAnno = kube.AnnoLastHelmStallUnwedge
 	// fluxResetAnno zeroes helm-controller's failure counters — the
 	// documented escape from Stalled=True/RetriesExceeded
@@ -163,7 +163,7 @@ func hrCondition(o *unstructured.Unstructured, condType string) (status, reason,
 	return c.Status, c.Reason, c.Message
 }
 
-// helmLastStallUnwedge reads the persisted node.ops/last-helm-stall-
+// helmLastStallUnwedge reads the persisted passiontech.dev/last-helm-stall-
 // unwedge stamp — the restart-proof half of the unwedge cooldown.
 func helmLastStallUnwedge(hr *unstructured.Unstructured) (time.Time, bool) {
 	return kube.AnnoTime(hr, helmLastStallUnwedgeAnno)

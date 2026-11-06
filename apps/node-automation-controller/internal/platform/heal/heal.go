@@ -35,7 +35,7 @@ import (
 // only their own ACTION/defer wording.
 //
 // A nil heals pointer skips the cooldown check entirely — heals
-// that persist their stamp on the object itself (the node.ops/last-*
+// that persist their stamp on the object itself (the passiontech.dev/last-*
 // annotations read via kube.AnnoTime) pass nil and keep only the
 // mutex gate.
 func Allowed(ctx context.Context, log logr.Logger,

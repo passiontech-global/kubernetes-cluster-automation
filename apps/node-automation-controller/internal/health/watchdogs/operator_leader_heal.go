@@ -2,7 +2,7 @@
 // operator-workqueue-watchdog check (W5.8): once an operator's CRs
 // stay unreconciled past the stuck window, healOperatorLeader deletes
 // the leader pod to force re-election (1h cooldown, wider of the
-// in-RAM ledger and the persisted node.ops/last-operator-heal Lease
+// in-RAM ledger and the persisted passiontech.dev/last-operator-heal Lease
 // stamp; maintenance-mutex gated), and leaderPods resolves the holder
 // from the Lease's holderIdentity with the pod-selector fallback.
 package watchdogs
@@ -29,7 +29,7 @@ import (
 const (
 	// operatorHealCooldown bounds leader-pod deletes to one per
 	// operator per hour — the wider of the in-RAM ledger and the
-	// persisted node.ops/last-operator-heal stamp on the Lease
+	// persisted passiontech.dev/last-operator-heal stamp on the Lease
 	// (same wider-of-both shape as the helmrelease-unlocker).
 	operatorHealCooldown = time.Hour
 	// operatorHealAnno persists the last heal moment on the

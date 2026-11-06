@@ -51,7 +51,7 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 	for _, key := range due {
 		hr := stuck[key]
 		// The cooldown reads the wider of the in-RAM ledger and the
-		// persisted node.ops/last-helm-unlock stamp — an operator
+		// persisted passiontech.dev/last-helm-unlock stamp — an operator
 		// restart empties the ledger but must not refund the 24h.
 		last, ok := u.unlocked.Entries()[key]
 		if t, hasAnno := helmLastUnlock(hr); hasAnno && t.After(last) {
@@ -166,7 +166,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 
 	// reconcile.fluxcd.io/requestedAt is flux's "reconcile now" hint —
 	// only the value changing matters; RFC3339 is the convention. The
-	// same patch persists node.ops/last-helm-unlock so the 24h
+	// same patch persists passiontech.dev/last-helm-unlock so the 24h
 	// cooldown survives an operator restart.
 	now := u.now.Now().UTC().Format(time.RFC3339)
 	patch, err := json.Marshal(map[string]any{
@@ -200,7 +200,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	return true, nil
 }
 
-// helmLastUnlock reads the persisted node.ops/last-helm-unlock stamp
+// helmLastUnlock reads the persisted passiontech.dev/last-helm-unlock stamp
 // — the durable half of the 24h cooldown, surviving operator restarts
 // where the in-memory ledger cannot.
 func helmLastUnlock(hr *unstructured.Unstructured) (time.Time, bool) {

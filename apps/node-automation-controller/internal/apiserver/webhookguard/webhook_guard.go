@@ -22,7 +22,7 @@
 // is a cluster-wide deadlock — every admission it matches fails closed,
 // including the creates that would bring the backend back. The breaker
 // flips such entries to Ignore and records their names in the
-// node.ops/circuit-broken-webhooks annotation on the config; when the
+// passiontech.dev/circuit-broken-webhooks annotation on the config; when the
 // Service reports >= 1 Ready endpoint again the declared Fail policy
 // is restored and the annotation shrinks (removed when empty).
 // W5.5 — the endpoint census is node-aware: Ready endpoints on
@@ -211,7 +211,7 @@ func (g *webhookGuard) takeSnapshot(ctx context.Context) *sweepSnapshot {
 }
 
 // webhookUnhealthyNodeTaints are the taint keys marking a node whose
-// pod network is presumed dead for admission purposes — the node.ops
+// pod network is presumed dead for admission purposes — the passiontech.dev
 // pair this operator asserts itself plus the kubelet/node-controller
 // lifecycle taints.
 var webhookUnhealthyNodeTaints = []string{

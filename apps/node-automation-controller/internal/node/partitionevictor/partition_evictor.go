@@ -12,11 +12,11 @@
 //   - untaint recovered nodes first;
 //   - abort when >= half (or all) nodes are flagged — that's a mesh-wide
 //     partition where eviction only makes churn;
-//   - taint flagged nodes node.ops/network-partitioned=true:NoSchedule so
+//   - taint flagged nodes passiontech.dev/network-partitioned=true:NoSchedule so
 //     evicted pods don't get rescheduled onto the same broken node;
 //   - delete pods in the configured namespaces (PARTITION_EVICT_NAMESPACES,
 //     default flux-system) plus any pod carrying the
-//     node.ops/evict-on-partition=true opt-in annotation — in ANY
+//     passiontech.dev/evict-on-partition=true opt-in annotation — in ANY
 //     namespace — off flagged nodes, capped at 8/run.
 //
 // Three pod classes are never evicted no matter the namespace or the
@@ -143,7 +143,7 @@ func partitionEvictNamespaces() map[string]struct{} {
 
 // partitionEvictable reports whether pod p is a candidate for
 // partition eviction. Membership is by the configured namespace set
-// OR the node.ops/evict-on-partition=true opt-in annotation, but
+// OR the passiontech.dev/evict-on-partition=true opt-in annotation, but
 // three classes are always skipped no matter where they live:
 //   - terminal pods (Succeeded/Failed): dead weight, nothing to move;
 //   - DaemonSet pods: the daemon re-creates them in place — and DS

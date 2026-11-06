@@ -10,13 +10,13 @@
 // --from=cronjob/<cj>`.
 //
 // Opt-in ONLY: a CronJob must carry
-// node-ops.passiontech.dev/catchup: "true" — most jobs are not
+// passiontech.dev/catchup: "true" — most jobs are not
 // idempotent across a multi-day backlog (report generators, backup
 // pruners), so silence means leave it alone.
 //
 // Dedupe (belt & suspenders, any one vetoes):
 //   - a Job in the namespace labeled
-//     node-ops.passiontech.dev/missed-catchup=<cj> younger than 24h
+//     passiontech.dev/missed-catchup=<cj> younger than 24h
 //   - any Active Job still owned by the CronJob
 //   - an in-memory 1-catchup-per-cronjob-per-day cap (survives the
 //     catch-up Job being deleted)

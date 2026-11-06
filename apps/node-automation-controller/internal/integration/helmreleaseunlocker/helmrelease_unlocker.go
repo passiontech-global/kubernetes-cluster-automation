@@ -34,7 +34,7 @@
 // consumer problem — the fix is stamping
 // reconcile.fluxcd.io/requestedAt on the SOURCE object (HelmChart,
 // GitRepository, HelmRepository, OCIRepository), which refetches the
-// artifact. node.ops/last-source-nudge on the source caps this at
+// artifact. passiontech.dev/last-source-nudge on the source caps this at
 // once per source per 30m across all consumers.
 //
 // Stalled-rollout surge unwedge (opt-in via
@@ -55,10 +55,10 @@
 //
 // Guards:
 //   - max one unlock per HR per 24h (in-memory ledger AND the
-//     persisted node.ops/last-helm-unlock annotation — a restart
+//     persisted passiontech.dev/last-helm-unlock annotation — a restart
 //     wipes the ledger but must not refund the cooldown); the stall
 //     unwedge carries the same 24h cap under its own
-//     node.ops/last-helm-stall-unwedge annotation so the two
+//     passiontech.dev/last-helm-stall-unwedge annotation so the two
 //     cooldowns never refund each other;
 //   - skip+warn while a helm-controller pod (flux-system,
 //     app.kubernetes.io/name=helm-controller) is CrashLoopBackOff —
@@ -139,7 +139,7 @@ type helmReleaseUnlocker struct {
 	// stallFirstSeen / unwedged / stallAlerted mirror the ledgers
 	// above for the stalled-rollout signature: first-seen tracking
 	// for the 30m window, the 24h remediation cooldown (also
-	// persisted via node.ops/last-helm-stall-unwedge), and the
+	// persisted via passiontech.dev/last-helm-stall-unwedge), and the
 	// once-per-cooldown alert dedup shared by "re-stalled after
 	// unwedge" and "signature matched but a guard refused".
 	// CooldownSets are zero-value ready and deliberately unbounded:
@@ -155,7 +155,7 @@ type helmReleaseUnlocker struct {
 	stallAttempts map[string]*stallAttempt
 	// immutableJobHealed: Kustomization ns/name → last failed-immutable-
 	// Job delete (W8-GO1) — the 30m in-RAM half of the cooldown; the
-	// durable half is node.ops/last-immutable-job-heal on the
+	// durable half is passiontech.dev/last-immutable-job-heal on the
 	// Kustomization itself.
 	immutableJobHealed state.CooldownSet
 }

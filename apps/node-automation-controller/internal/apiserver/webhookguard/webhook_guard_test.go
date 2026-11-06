@@ -1196,9 +1196,9 @@ func TestNodeUnhealthyForEndpoints(t *testing.T) {
 		{"not ready", notReady, true},
 		{"ready clean", wgReadyNode("n-ok"), false},
 		{"network-partitioned taint", wgReadyNode("n1",
-			corev1.Taint{Key: "node.ops/network-partitioned", Effect: corev1.TaintEffectNoSchedule}), true},
+			corev1.Taint{Key: "passiontech.dev/network-partitioned", Effect: corev1.TaintEffectNoSchedule}), true},
 		{"kubelet-unresponsive taint", wgReadyNode("n2",
-			corev1.Taint{Key: "node.ops/kubelet-unresponsive", Effect: corev1.TaintEffectNoSchedule}), true},
+			corev1.Taint{Key: "passiontech.dev/kubelet-unresponsive", Effect: corev1.TaintEffectNoSchedule}), true},
 		{"unreachable taint", wgReadyNode("n3",
 			corev1.Taint{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoSchedule}), true},
 		{"not-ready taint", wgReadyNode("n4",
@@ -1260,7 +1260,7 @@ func TestWebhookCircuitBreakerPartitionedBackendTripsFast(t *testing.T) {
 		wgService("backend", "dead-svc"),
 		wgSliceOnNode("backend", "dead-svc", "node-part"),
 		wgReadyNode("node-part",
-			corev1.Taint{Key: "node.ops/network-partitioned", Effect: corev1.TaintEffectNoSchedule}),
+			corev1.Taint{Key: "passiontech.dev/network-partitioned", Effect: corev1.TaintEffectNoSchedule}),
 		mwc)
 	now := time.Unix(1_700_000_000, 0)
 	g := wgBreakerGuard(cs, &now)
@@ -1324,7 +1324,7 @@ func TestWebhookCircuitBreakerHealthyNodeBackendNeverTrips(t *testing.T) {
 		healthySlice, badSlice,
 		wgReadyNode("node-ok"),
 		wgReadyNode("node-part",
-			corev1.Taint{Key: "node.ops/network-partitioned", Effect: corev1.TaintEffectNoSchedule}),
+			corev1.Taint{Key: "passiontech.dev/network-partitioned", Effect: corev1.TaintEffectNoSchedule}),
 		mwc)
 	patches := wgPatchCounter(cs)
 	now := time.Unix(1_700_000_000, 0)

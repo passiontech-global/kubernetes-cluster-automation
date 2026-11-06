@@ -12,7 +12,7 @@
 // Every 30s the module reads the backend set from
 // default/Endpoints/kubernetes (subsets[].addresses + notReadyAddresses)
 // plus the IPs it quarantined earlier (annotation
-// node.ops/quarantined-endpoints), then probes EACH backend directly at
+// passiontech.dev/quarantined-endpoints), then probes EACH backend directly at
 // https://<ip>:6443 with the pod's ServiceAccount credentials:
 //
 //	live_rv  = list RV of GET /api/v1/namespaces/default/services?limit=1

@@ -38,11 +38,11 @@ func TestCPUStealTaintsPressuredWorkerWithHeadroom(t *testing.T) {
 	if res.Pass {
 		t.Fatalf("sustained steal pressure must fail: %+v", res)
 	}
-	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, cpuStealTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
 		t.Fatal("pressured worker not tainted")
 	}
 	for _, n := range []string{"w2", "w3"} {
-		if kube.HasTaint(testutil.GetNode(t, cs, n).Spec.Taints, cpuStealTaintKey) {
+		if kube.HasTaint(testutil.GetNode(t, cs, n).Spec.Taints, kube.TaintCPUSteal) {
 			t.Fatalf("healthy worker %s must not be tainted", n)
 		}
 	}
@@ -59,7 +59,7 @@ func TestCPUStealSkipsTaintWithoutHeadroom(t *testing.T) {
 	}
 	// Zero healthy others — tainting anything would strand scheduling.
 	for _, n := range []string{"w1", "w2"} {
-		if kube.HasTaint(testutil.GetNode(t, cs, n).Spec.Taints, cpuStealTaintKey) {
+		if kube.HasTaint(testutil.GetNode(t, cs, n).Spec.Taints, kube.TaintCPUSteal) {
 			t.Fatalf("worker %s tainted with no healthy headroom", n)
 		}
 	}
@@ -77,7 +77,7 @@ func TestCPUStealUntaintsAfterClearWindow(t *testing.T) {
 	if res := chk.Run(ctx); res.Pass {
 		t.Fatalf("sustained steal pressure must fail: %+v", res)
 	}
-	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, cpuStealTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
 		t.Fatal("pressured worker not tainted")
 	}
 	// Pressure clears — the 10m clear window must elapse before the
@@ -94,14 +94,14 @@ func TestCPUStealUntaintsAfterClearWindow(t *testing.T) {
 	if res := chk.Run(ctx); !res.Pass {
 		t.Fatalf("cleared pressure should pass: %+v", res)
 	}
-	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, cpuStealTaintKey) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
 		t.Fatal("taint lifted inside the clear window")
 	}
 	base = base.Add(11 * time.Minute)
 	if res := chk.Run(ctx); !res.Pass {
 		t.Fatalf("cleared pressure should pass: %+v", res)
 	}
-	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, cpuStealTaintKey) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
 		t.Fatal("taint survived the clear window")
 	}
 }

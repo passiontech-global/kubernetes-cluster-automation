@@ -116,7 +116,7 @@ func nodeHangLatchActive(n *corev1.Node) bool {
 // nodes carrying a sustained hang latch (any nodeHangConds entry
 // >=2m, ClockUnsynchronized >=10m) — NHC/SNR will
 // reboot the node, but pods keep scheduling onto it until then. The
-// cordon is stamped node.ops/precordoned-by=node-hang-precordon and
+// cordon is stamped passiontech.dev/precordoned-by=node-hang-precordon and
 // the same sweep AUTO-UNCORDONS a stamped node once every latch has
 // cleared — transient recovery, or a post-SNR reboot that came back
 // healthy but kept spec.unschedulable. A stale stamp on a schedulable

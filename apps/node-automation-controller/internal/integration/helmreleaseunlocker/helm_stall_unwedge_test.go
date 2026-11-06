@@ -377,7 +377,7 @@ func TestHelmStallUnwedgePreferredOnlySkipped(t *testing.T) {
 }
 
 // The 24h cooldown — in-RAM ledger AND the persisted
-// node.ops/last-helm-stall-unwedge stamp — suppresses a second
+// passiontech.dev/last-helm-stall-unwedge stamp — suppresses a second
 // unwedge and alerts once per window; a re-stall inside the window
 // means the previous unwedge did not fix it.
 func TestHelmStallUnwedgeCooldownHonored(t *testing.T) {

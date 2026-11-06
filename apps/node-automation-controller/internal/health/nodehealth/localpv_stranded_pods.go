@@ -153,7 +153,7 @@ func strandedNodeReason(nodes map[string]*corev1.Node, name string) string {
 // ephemeralLocalPV reports whether the workload's local volume is
 // disposable: concourse-worker workdirs (rebuilt by the init
 // container on the new node) or anything explicitly annotated
-// node.ops/ephemeral-localpv on the pod or the PVC.
+// passiontech.dev/ephemeral-localpv on the pod or the PVC.
 func ephemeralLocalPV(pod *corev1.Pod, pvc *corev1.PersistentVolumeClaim) bool {
 	if pod.Namespace == concourseWorkerNS &&
 		strings.HasPrefix(pod.Name, concourseWorkerPodPrefix) {
@@ -172,7 +172,7 @@ func ephemeralLocalPV(pod *corev1.Pod, pvc *corev1.PersistentVolumeClaim) bool {
 //	   the pod to a new node, so the pod pends forever. Every such
 //	   pod emits localpv_stranded_pods=1 — and for workloads whose
 //	   volume is disposable (concourse-worker, or pod/PVC annotated
-//	   node.ops/ephemeral-localpv) stranded on a confirmed-gone
+//	   passiontech.dev/ephemeral-localpv) stranded on a confirmed-gone
 //	   node (missing or out-of-service) the heal deletes PVC+pod so
 //	   the StatefulSet rebinds on a live node while the Released PV
 //	   gets swept by the node-host-agent. Database volumes are

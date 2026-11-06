@@ -3,7 +3,7 @@
 // >=15m on a `field is immutable` Job apply error gets the
 // completed/failed Job reaped so kustomize-controller can recreate
 // it. The 30m cooldown rides the in-RAM ledger plus the persisted
-// node.ops/last-immutable-job-heal stamp on the Kustomization.
+// passiontech.dev/last-immutable-job-heal stamp on the Kustomization.
 package helmreleaseunlocker
 
 import (
@@ -45,7 +45,7 @@ var immutableJobRe = regexp.MustCompile(`Job\.batch "([a-z0-9](?:[a-z0-9.-]*[a-z
 // OLD Job object disappears — and a Job that already ran to Complete
 // or Failed is pure residue. Deleting it unblocks the apply. The
 // 30m cooldown rides the in-RAM ledger + the persisted
-// node.ops/last-immutable-job-heal stamp on the Kustomization.
+// passiontech.dev/last-immutable-job-heal stamp on the Kustomization.
 func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	kustomizations, err := u.listAllPages(ctx, u.dyn.Resource(fluxKustomizationGVR))

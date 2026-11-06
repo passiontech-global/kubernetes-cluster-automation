@@ -93,7 +93,7 @@ func TestSetupStormGatePredicate(t *testing.T) {
 	}
 
 	taintChanged := testutil.Node("n1", corev1.ConditionTrue, nil,
-		corev1.Taint{Key: "node.ops/kubelet-unresponsive", Effect: corev1.TaintEffectNoSchedule})
+		corev1.Taint{Key: "passiontech.dev/kubelet-unresponsive", Effect: corev1.TaintEffectNoSchedule})
 	if !p.Update(testutil.UpdateEvent(old, taintChanged)) {
 		t.Fatal("taint change did not fire")
 	}

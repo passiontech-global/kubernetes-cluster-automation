@@ -81,11 +81,11 @@ func TestStormGateScalesDownOnStormCondition(t *testing.T) {
 }
 
 func TestStormGateScalesDownOnStormTaint(t *testing.T) {
-	// A stormTaints key (node.ops/kubelet-unresponsive — set by the
+	// A stormTaints key (passiontech.dev/kubelet-unresponsive — set by the
 	// reaper) on an otherwise healthy node also forces the verdict.
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil, corev1.Taint{
-			Key:    "node.ops/kubelet-unresponsive",
+			Key:    "passiontech.dev/kubelet-unresponsive",
 			Effect: corev1.TaintEffectNoSchedule,
 		}),
 		deschedulerDeploy(1, nil))

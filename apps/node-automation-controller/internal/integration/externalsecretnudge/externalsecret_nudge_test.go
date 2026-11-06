@@ -569,7 +569,7 @@ func TestExternalSecretNudgeStateBasedWithoutEdge(t *testing.T) {
 		t.Fatal("stuck ES on a Ready=True store not nudged without an edge")
 	}
 	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esLastNudgeAnno); got == "" {
-		t.Fatal("node.ops/last-es-nudge not persisted alongside force-sync")
+		t.Fatal("passiontech.dev/last-es-nudge not persisted alongside force-sync")
 	}
 	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-via-datafrom", esForceSyncAnno); got == "" {
 		t.Fatal("ES whose only store ref is a dataFrom CSS override not nudged")

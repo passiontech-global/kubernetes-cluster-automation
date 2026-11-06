@@ -106,7 +106,7 @@ var LocalPVStrandedPods = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 
 // LocalPVEphemeralHealsTotal counts dead PVC+pod pairs reaped for
 // workloads whose local volume is disposable — concourse-worker or
-// anything annotated node.ops/ephemeral-localpv — once the bound
+// anything annotated passiontech.dev/ephemeral-localpv — once the bound
 // node is confirmed gone (missing or out-of-service). Deleting the
 // PVC lets the StatefulSet rebind the pod onto a live node; the
 // Released PV is swept by the node-host-agent (W7-C4).
