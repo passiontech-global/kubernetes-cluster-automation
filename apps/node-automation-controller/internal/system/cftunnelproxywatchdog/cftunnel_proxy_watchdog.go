@@ -31,6 +31,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -184,7 +185,7 @@ func (w *cfTunnelProxyWatchdog) resyncUnreadyProxies(ctx context.Context) (int, 
 	// The stamp stays unix — the VALUE churn is the resync signal
 	// (each sweep must differ or the EndpointSlice emits no event).
 	patch, err := kube.MergePatchAnnos(map[string]any{
-		cfTunnelResyncAnno: fmt.Sprintf("%d", w.now.Now().Unix()),
+		cfTunnelResyncAnno: strconv.FormatInt(w.now.Now().Unix(), 10),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("marshal resync patch: %w", err)
