@@ -75,3 +75,39 @@ func TestNodeActivelyCordoned(t *testing.T) {
 		})
 	}
 }
+
+// W12 P0-1 — a node pre-cordoned by node-hang-precordon
+// (AnnoPreCordonedBy) is the controller's own defensive quarantine
+// of a sick worker, not an operator drain: its fresh unschedulable
+// taint must NOT trip the active-cordon verdict or the maintenance
+// mutex would lock every heal cluster-wide for 45m.
+func TestNodeActivelyCordonedPreCordonExempt(t *testing.T) {
+	now := time.Now()
+	fresh := metav1.NewTime(now.Add(-time.Minute))
+	for _, tc := range []struct {
+		name  string
+		annos map[string]string
+		want  bool
+	}{
+		{"precordoned by node-hang-precordon",
+			map[string]string{AnnoPreCordonedBy: "node-hang-precordon"}, false},
+		{"precordoned by anything counts as exempt",
+			map[string]string{AnnoPreCordonedBy: "other-controller"}, false},
+		{"empty precordon anno is an operator cordon",
+			map[string]string{AnnoPreCordonedBy: ""}, true},
+		{"no precordon anno is an operator cordon", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Annotations: tc.annos},
+				Spec: corev1.NodeSpec{
+					Unschedulable: true,
+					Taints: []corev1.Taint{
+						{Key: UnschedulableTaintKey, TimeAdded: &fresh}}},
+			}
+			if got := NodeActivelyCordoned(n, now); got != tc.want {
+				t.Fatalf("NodeActivelyCordoned=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}

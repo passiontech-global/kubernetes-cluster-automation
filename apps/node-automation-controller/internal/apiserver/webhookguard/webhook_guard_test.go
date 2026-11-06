@@ -1538,3 +1538,105 @@ func TestWebhookCircuitBreakerResponsiveSkipsBounce(t *testing.T) {
 		t.Fatalf("responsive backend must never trip, got %q", got)
 	}
 }
+
+// W12-CP-B: fail-closed webhooks whose namespaceSelector still matches
+// kube-system/node-ops/medik8s emit node_automation_webhook_missing_critical_ns_exclusion=1;
+// webhooks with NotIn exclusion, opt-in matchLabels, or failurePolicy=Ignore do not,
+// and updating the selector prunes the stale gauge series.
+func TestWebhookGuardCriticalNSExclusionAudit(t *testing.T) {
+	excludedSel := &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{{
+			Key:      "kubernetes.io/metadata.name",
+			Operator: metav1.LabelSelectorOpNotIn,
+			Values:   []string{"kube-system", "node-ops", "medik8s"},
+		}},
+	}
+	optInSel := &metav1.LabelSelector{
+		MatchLabels: map[string]string{"linkerd.io/inject": "enabled"},
+	}
+	partialSel := &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{{
+			Key:      "kubernetes.io/metadata.name",
+			Operator: metav1.LabelSelectorOpNotIn,
+			Values:   []string{"kube-system"}, // missing node-ops and medik8s
+		}},
+	}
+	vwc := &admissionv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "w12-cpb-vwc"},
+		Webhooks: []admissionv1.ValidatingWebhook{
+			{
+				Name:              "missing-nil.example.com",
+				FailurePolicy:     wgFP(admissionv1.Fail),
+				NamespaceSelector: nil, // matches all
+				ClientConfig:      admissionv1.WebhookClientConfig{Service: wgSvcRef("alive", "svc")},
+			},
+			{
+				Name:              "missing-partial.example.com",
+				FailurePolicy:     wgFP(admissionv1.Fail),
+				NamespaceSelector: partialSel,
+				ClientConfig:      admissionv1.WebhookClientConfig{Service: wgSvcRef("alive", "svc")},
+			},
+			{
+				Name:              "excluded-notin.example.com",
+				FailurePolicy:     wgFP(admissionv1.Fail),
+				NamespaceSelector: excludedSel,
+				ClientConfig:      admissionv1.WebhookClientConfig{Service: wgSvcRef("alive", "svc")},
+			},
+			{
+				Name:              "excluded-optin.example.com",
+				FailurePolicy:     wgFP(admissionv1.Fail),
+				NamespaceSelector: optInSel,
+				ClientConfig:      admissionv1.WebhookClientConfig{Service: wgSvcRef("alive", "svc")},
+			},
+			{
+				Name:              "ignore-policy.example.com",
+				FailurePolicy:     wgFP(admissionv1.Ignore),
+				NamespaceSelector: nil,
+				ClientConfig:      admissionv1.WebhookClientConfig{Service: wgSvcRef("alive", "svc")},
+			},
+		},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("node-ops"),
+		wgNamespace("medik8s"), wgNamespace("alive"),
+		wgService("alive", "svc"), vwc)
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	t.Cleanup(func() {
+		for _, wh := range vwc.Webhooks {
+			metrics.WebhookMissingCriticalNSExclusion.DeleteLabelValues(
+				webhookKindValidating, "w12-cpb-vwc", wh.Name)
+		}
+	})
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, wh := range []string{"missing-nil.example.com", "missing-partial.example.com"} {
+		if got := ptestutil.ToFloat64(metrics.WebhookMissingCriticalNSExclusion.WithLabelValues(
+			webhookKindValidating, "w12-cpb-vwc", wh)); got != 1 {
+			t.Fatalf("expected missing_critical_ns_exclusion=1 for %s, got %v", wh, got)
+		}
+	}
+	for _, wh := range []string{"excluded-notin.example.com", "excluded-optin.example.com", "ignore-policy.example.com"} {
+		if got := ptestutil.ToFloat64(metrics.WebhookMissingCriticalNSExclusion.WithLabelValues(
+			webhookKindValidating, "w12-cpb-vwc", wh)); got != 0 {
+			t.Fatalf("expected missing_critical_ns_exclusion=0 for %s, got %v", wh, got)
+		}
+	}
+
+	// Fix missing-nil and missing-partial -> series pruned on next sweep.
+	vwc.Webhooks[0].NamespaceSelector = excludedSel
+	vwc.Webhooks[1].NamespaceSelector = excludedSel
+	if _, err := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().
+		Update(ctx, vwc, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, wh := range []string{"missing-nil.example.com", "missing-partial.example.com"} {
+		if got := ptestutil.ToFloat64(metrics.WebhookMissingCriticalNSExclusion.WithLabelValues(
+			webhookKindValidating, "w12-cpb-vwc", wh)); got != 0 {
+			t.Fatalf("expected pruned series=0 for %s after fix, got %v", wh, got)
+		}
+	}
+}

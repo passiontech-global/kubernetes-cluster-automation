@@ -165,6 +165,25 @@ func TestMaintenanceActiveShortCircuitsOnCordon(t *testing.T) {
 	}
 }
 
+// W12 P0-1 — a node cordoned BY node-hang-precordon (the defensive
+// quarantine, stamped AnnoPreCordonedBy) is not maintenance: its
+// fresh unschedulable taint must not hold the mutex, or every
+// heal.AllowedV-gated remediation freezes for 45m exactly while the
+// cluster is sick.
+func TestMaintenanceActiveIgnoresPreCordoned(t *testing.T) {
+	n := maintenanceCordoned("w1", time.Minute)
+	n.Annotations = map[string]string{
+		AnnoPreCordonedBy: "node-hang-precordon"}
+	cs := fake.NewSimpleClientset(n)
+	held, why, err := MaintenanceActive(ctx, cs, maintenanceDynFake())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held {
+		t.Fatalf("pre-cordoned node held the mutex: %q", why)
+	}
+}
+
 // A nil dyn still fails closed when reached — the mutex never reads
 // "cannot verify" as "clear".
 func TestMaintenanceActiveNilDynFailsClosed(t *testing.T) {

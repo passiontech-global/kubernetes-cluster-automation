@@ -249,6 +249,65 @@ func TestDeadNodeSweeperFenceAgentsCR(t *testing.T) {
 	}
 }
 
+// W12 P0-7 — medik8s NHC v0.6+ names remediation CRs
+// "<nodeName>-<templateName>" under escalatingRemediations /
+// multi-template setups, and may carry the target in
+// remediation.medik8s.io/node-name. Both shapes are fencing
+// evidence — a name-equality-only match misses the fencing proof.
+func TestDeadNodeSweeperRemediationCRNameVariants(t *testing.T) {
+	t.Run("template-suffixed CR name", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			testutil.Node("w1", corev1.ConditionFalse, nil),
+			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+		dyn := deadNodeDynFake(
+			selfNodeRemediation("medik8s", "w1-snr-template"))
+		s := deadNodeSweeperFor(cs, dyn, nil)
+
+		if err := s.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+			t.Fatal("template-suffixed SelfNodeRemediation not accepted as fencing evidence")
+		}
+	})
+
+	t.Run("node-name annotation on an unrelated name", func(t *testing.T) {
+		cr := selfNodeRemediation("medik8s", "snr-7f9b2d")
+		cr.SetAnnotations(map[string]string{
+			"remediation.medik8s.io/node-name": "w1"})
+		cs := fake.NewSimpleClientset(
+			testutil.Node("w1", corev1.ConditionFalse, nil),
+			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+		dyn := deadNodeDynFake(cr)
+		s := deadNodeSweeperFor(cs, dyn, nil)
+
+		if err := s.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+			t.Fatal("node-name annotation not accepted as fencing evidence")
+		}
+	})
+
+	t.Run("annotation naming a different node is not evidence", func(t *testing.T) {
+		cr := selfNodeRemediation("medik8s", "snr-7f9b2d")
+		cr.SetAnnotations(map[string]string{
+			"remediation.medik8s.io/node-name": "w2"})
+		cs := fake.NewSimpleClientset(
+			testutil.Node("w1", corev1.ConditionFalse, nil),
+			stuckTerminatingPod("db", "pg-0", "w1", 20*time.Minute))
+		dyn := deadNodeDynFake(cr)
+		s := deadNodeSweeperFor(cs, dyn, nil)
+
+		if err := s.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, outOfServiceTaintKey) {
+			t.Fatal("node tainted by an annotation naming a different node")
+		}
+	})
+}
+
 func TestDeadNodeSweeperUntaintsRecoveredNode(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("w1", corev1.ConditionTrue, nil, outOfServiceTaint))

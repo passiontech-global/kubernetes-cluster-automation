@@ -456,6 +456,220 @@ func TestCoreDNSPatcherMissingDeployment(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// W12-NM4b — Corefile negative-cache (denial 9984 5) reconcile
+// ---------------------------------------------------------------------------
+
+// corefileConfigMap builds the kube-system/coredns ConfigMap fixture —
+// the k0s-managed object the denial-cap guard reconciles.
+func corefileConfigMap(corefile string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "coredns"},
+		Data:       map[string]string{"Corefile": corefile},
+	}
+}
+
+// k0sCorefile is the stock k0s Corefile: a BARE `cache 30` — the
+// NXDOMAIN-poisoning incident class (negative cache holds the full
+// SOA TTL and kills Jobs that outrace the endpoint controller).
+const k0sCorefile = `.:53 {
+    errors
+    health {
+        lameduck 5s
+    }
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+        pods insecure
+        fallthrough in-addr.arpa ip6.arpa
+        ttl 30
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf
+    cache 30
+    loop
+    reload
+    loadbalance
+}
+`
+
+// patchedCorefile is the denial-capped stock Corefile.
+const patchedCorefile = `.:53 {
+    errors
+    health {
+        lameduck 5s
+    }
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+        pods insecure
+        fallthrough in-addr.arpa ip6.arpa
+        ttl 30
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf
+    cache 30 {
+        success 9984 30
+        denial 9984 5
+    }
+    loop
+    reload
+    loadbalance
+}
+`
+
+func getCorefile(t *testing.T, cs *fake.Clientset) string {
+	t.Helper()
+	cm, err := cs.CoreV1().ConfigMaps("kube-system").
+		Get(context.Background(), "coredns", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get coredns configmap: %v", err)
+	}
+	return cm.Data["Corefile"]
+}
+
+// A bare `cache 30` gets expanded to the success+denial block —
+// NXDOMAIN negative caching capped at 5s on the k0s-managed CoreDNS.
+func TestCoreDNSPatcherCorefileDenialCap(t *testing.T) {
+	cs := fake.NewSimpleClientset(corednsDeploy("DoNotSchedule", 2),
+		corefileConfigMap(k0sCorefile))
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getCorefile(t, cs)
+	if !strings.Contains(got, "denial 9984 5") || !strings.Contains(got, "success 9984 30") {
+		t.Fatalf("corefile not denial-capped:\n%s", got)
+	}
+	if !strings.Contains(got, "cache 30 {") {
+		t.Fatalf("cache directive not braced:\n%s", got)
+	}
+	// Idempotent: a second reconcile must not touch the ConfigMap.
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if getCorefile(t, cs) != got {
+		t.Fatal("denial-capped corefile was rewritten again — not idempotent")
+	}
+}
+
+// A Corefile whose cache block already carries denial/success is
+// left byte-identical — no patch action fires on configmaps.
+func TestCoreDNSPatcherCorefileAlreadyCapped(t *testing.T) {
+	cs := fake.NewSimpleClientset(corednsDeploy("DoNotSchedule", 2),
+		corefileConfigMap(patchedCorefile))
+	var patched bool
+	cs.PrependReactor("patch", "configmaps",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			patched = true
+			return true, nil, nil
+		})
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if patched {
+		t.Fatal("patched an already denial-capped Corefile")
+	}
+	if getCorefile(t, cs) != patchedCorefile {
+		t.Fatal("capped corefile mutated")
+	}
+}
+
+// A braced cache block WITHOUT denial gains just the denial line —
+// existing subkeys (success/negative zones) are preserved, not
+// replaced by the fixed block.
+func TestCoreDNSPatcherCorefileBracedNoDenial(t *testing.T) {
+	corefile := strings.Replace(k0sCorefile, "    cache 30\n",
+		"    cache 30 {\n        success 9984 30\n    }\n", 1)
+	cs := fake.NewSimpleClientset(corednsDeploy("DoNotSchedule", 2),
+		corefileConfigMap(corefile))
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getCorefile(t, cs)
+	if !strings.Contains(got, "denial 9984 5") {
+		t.Fatalf("braced cache block did not gain denial:\n%s", got)
+	}
+	if !strings.Contains(got, "success 9984 30") {
+		t.Fatalf("existing success directive lost:\n%s", got)
+	}
+	if strings.Count(got, "cache 30 {") != 1 {
+		t.Fatalf("cache block duplicated:\n%s", got)
+	}
+}
+
+// The zone-qualified bare form `cache 30 cluster.local` keeps its
+// zone args through the expansion.
+func TestCoreDNSPatcherCorefileZoneCache(t *testing.T) {
+	got, changed := corefileDenialCap("x {\n    cache 30 cluster.local\n}\n")
+	if !changed {
+		t.Fatal("bare zone-qualified cache not rewritten")
+	}
+	if !strings.Contains(got, "cache 30 cluster.local {") ||
+		!strings.Contains(got, "denial 9984 5") {
+		t.Fatalf("zone args lost in expansion:\n%s", got)
+	}
+}
+
+// Pure-parser edge cases: comments, inline single-line blocks, and
+// several cache directives in one Corefile.
+func TestCorefileDenialCapParser(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		in      string
+		changed bool
+		want    string // substring that must appear, "" = just !changed
+	}{
+		{"empty", "", false, ""},
+		{"no cache", ".:53 {\n    forward . /etc/resolv.conf\n}\n", false, ""},
+		{"comment is not a cache", ".:53 {\n    # cache 30\n    forward . x\n}\n", false, ""},
+		{"denial commented counts as missing",
+			".:53 {\n    cache 30 {\n        # denial 9984 5\n    }\n}\n", true, "denial 9984 5"},
+		{"inline block with denial untouched",
+			".:53 {\n    cache 30 { denial 9984 5 }\n}\n", false, ""},
+		{"inline block without denial injected",
+			".:53 {\n    cache 30 { success 9984 30 }\n}\n", true, "denial 9984 5"},
+		{"two cache directives",
+			".:53 {\n    cache 30\n}\ncluster.local:53 {\n    cache 60 {\n        denial 9984 5\n    }\n}\n",
+			true, "cache 30 {\n        success 9984 30\n        denial 9984 5\n    }"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed := corefileDenialCap(tc.in)
+			if changed != tc.changed {
+				t.Fatalf("changed=%v, want %v (out:\n%s)", changed, tc.changed, got)
+			}
+			if tc.changed && !strings.Contains(got, tc.want) {
+				t.Fatalf("rewritten corefile missing %q:\n%s", tc.want, got)
+			}
+			if !tc.changed && got != tc.in {
+				t.Fatal("unchanged corefile mutated")
+			}
+			// Every rewrite must itself be stable — second pass no-ops.
+			again, againChanged := corefileDenialCap(got)
+			if againChanged || again != got {
+				t.Fatalf("rewrite not idempotent: pass 2 changed=%v\n%s", againChanged, again)
+			}
+		})
+	}
+}
+
+// A missing ConfigMap is tolerated (k0s owns it), and a get failure
+// surfaces so the reconcile retries instead of leaving the cap off.
+func TestCoreDNSPatcherCorefileAbsentAndGetError(t *testing.T) {
+	cs := fake.NewSimpleClientset(corednsDeploy("DoNotSchedule", 2))
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		t.Fatalf("missing configmap must be tolerated: %v", err)
+	}
+	cs.PrependReactor("get", "configmaps",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+		t.Fatal("expected error when the configmap get fails")
+	}
+}
+
 func TestCoreDNSPatcherGetError(t *testing.T) {
 	cs := fake.NewSimpleClientset(corednsDeployBare())
 	cs.PrependReactor("get", "deployments",

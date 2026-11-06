@@ -47,9 +47,14 @@ type localPVStrandedCheck struct {
 	//     Verdict TTL instead of three API reads per heal.
 	localPVEmitted    state.GaugeLedger[string]
 	pvcStalledEmitted state.GaugeLedger[string]
-	localPVHealed     state.CooldownSet
-	pvcProvHealed     state.CooldownSet
-	verdict           kube.Verdict
+	// strandedStatefulEmitted is the W12-SC2 ledger for the
+	// stranded-stateful-pod tuples — a pod whose node comes back
+	// (or whose claim rebinds) loses its series via
+	// DeleteLabelValues, same hygiene as localPVEmitted.
+	strandedStatefulEmitted state.GaugeLedger[string]
+	localPVHealed           state.CooldownSet
+	pvcProvHealed           state.CooldownSet
+	verdict                 kube.Verdict
 }
 
 // newLocalPVStrandedCheck builds the W7-C4 check — every ledger is
@@ -123,6 +128,16 @@ var (
 		Help: "Ephemeral localpv PVC+pod pairs reaped after their bound node was confirmed gone.",
 	}, []string{"namespace", "pvc", "node"})
 
+	// W12-SC2 — the stranded-stateful signal: 1 while a
+	// NON-ephemeral LocalPV pod pends on a volume pinned to a
+	// confirmed-dead node (missing or out-of-service). The generic
+	// stranded gauge carries the pvc+reason detail; this one names
+	// the dead node so the alert can route straight to the site.
+	localPVStrandedStatefulPodGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_localpv_stranded_stateful_pod",
+		Help: "1 while a non-ephemeral LocalPV pod pends on a volume nodeAffinity-pinned to a dead (missing/out-of-service) node — data recovery needed, never auto-healed.",
+	}, []string{"namespace", "pod", "dead_node"})
+
 	// W7-C4 — the stalled-provisioning signal: 1 while the PVC
 	// pends on a local provisioner despite Ready schedulable
 	// workers existing.
@@ -142,6 +157,7 @@ var (
 func init() {
 	ctrlmetrics.Registry.MustRegister(
 		localPVStrandedPodsGauge,
+		localPVStrandedStatefulPodGauge,
 		localPVEphemeralHealsTotal,
 		pvcProvisioningStalledGauge,
 		pvcProvisionerHealsTotal)
@@ -278,9 +294,10 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list persistentvolumeclaims: %w", err)}
 	}
 
-	// stranded/stalled accumulate each live gauge key's label values —
-	// the reports feed the ledgers so no key gets SplitN'd apart.
-	var stranded, stalledRep probefw.SweepReport
+	// stranded/stalled/statefulRep accumulate each live gauge key's
+	// label values — the reports feed the ledgers so no key gets
+	// SplitN'd apart.
+	var stranded, stalledRep, statefulRep probefw.SweepReport
 	var heals []strandedHeal
 
 	podOpts := metav1.ListOptions{
@@ -322,6 +339,20 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 								stranded.Emit(localPVStrandedPodsGauge, key,
 									[]string{pod.Namespace, pod.Name, pvc.Name,
 										node, reason}, key)
+								// W12-SC2 — a NON-ephemeral workload
+								// stranded on a confirmed-dead node is
+								// the data-loss class the ephemeral heal
+								// deliberately never touches; the
+								// dedicated gauge names the dead node so
+								// the alert routes to the site.
+								if (reason == strandedReasonMissingNode ||
+									reason == strandedReasonOutOfService) &&
+									!ephemeralLocalPV(pod, pvc) {
+									skey := pod.Namespace + "/" + pod.Name + "/" + node
+									statefulRep.Flag(localPVStrandedStatefulPodGauge,
+										skey, []string{pod.Namespace, pod.Name, node})
+									stranded.Find("stateful:" + skey + "(" + reason + ")")
+								}
 								// Confirmed-gone nodes only: NotReady/
 								// cordoned can come back — a missing or
 								// fenced (out-of-service) node cannot.
@@ -362,6 +393,8 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 		localPVStrandedPodsGauge.DeleteLabelValues)
 	stalledRep.Close(&p.pvcStalledEmitted,
 		pvcProvisioningStalledGauge.DeleteLabelValues)
+	statefulRep.Close(&p.strandedStatefulEmitted,
+		localPVStrandedStatefulPodGauge.DeleteLabelValues)
 
 	// AllowedV folds the per-target cooldown plus the maintenance
 	// mutex (memoized on p.verdict — one evaluation per sweep) —

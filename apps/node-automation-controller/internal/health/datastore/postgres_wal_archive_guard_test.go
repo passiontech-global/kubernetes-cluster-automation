@@ -84,3 +84,90 @@ func TestPostgresHealthyClusterPasses(t *testing.T) {
 		t.Fatalf("clean cluster must pass: %+v", res)
 	}
 }
+
+// W12-ST2 — an inactive replication slot retaining past 5GiB of WAL
+// fires the dedicated bloat gauge carrying the slot name and the
+// retained byte count, alongside the existing inactive_slot reason
+// on the unhealthy gauge.
+func TestPostgresInactiveSlotWALBloat(t *testing.T) {
+	postgresInactiveSlotWALGauge.DeleteLabelValues("db", "pg-main", "replica1")
+	postgresWALUnhealthyGauge.DeleteLabelValues("db", "pg-main", "inactive_slot")
+	t.Cleanup(func() {
+		postgresInactiveSlotWALGauge.DeleteLabelValues("db", "pg-main", "replica1")
+		postgresWALUnhealthyGauge.DeleteLabelValues("db", "pg-main", "inactive_slot")
+	})
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "pg_replication_slots_retained_bytes") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "db",
+					"postgres_cluster": "pg-main", "slot_name": "replica1"},
+				Value: float64(8 << 30), // 8GiB retained
+			}}
+		}
+		return nil
+	})
+	pod := pgPod("db", "pg-main-1", "pg-main")
+	cs := fake.NewSimpleClientset(pod)
+	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		"INFO archive-push ok\n", nil))
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("inactive slot retaining >5GiB must fail")
+	}
+	if !strings.Contains(res.Why, "replica1") {
+		t.Fatalf("why missing the slot name: %q", res.Why)
+	}
+	m := probetest.FindMetric(t, "node_automation_postgres_inactive_slot_wal_bloat",
+		map[string]string{"namespace": "db", "cluster": "pg-main",
+			"slot": "replica1"})
+	if m == nil || m.GetGauge().GetValue() != float64(8<<30) {
+		t.Fatalf("slot bloat gauge = %v, want 8GiB", m)
+	}
+	// The shared unhealthy gauge keeps its inactive_slot reason.
+	if v, ok := testutil.GaugeSeriesValue(t, "node_automation_postgres_wal_archive_unhealthy",
+		map[string]string{"namespace": "db", "cluster": "pg-main",
+			"reason": "inactive_slot"}); !ok || v != 1 {
+		t.Fatalf("unhealthy inactive_slot = %v,%v want 1,true", v, ok)
+	}
+}
+
+// The postgres_exporter spelling — an active==0 series `and`-joined
+// to a >5GiB lsn diff — flags 1 on the bloat gauge (that family
+// returns value-0 samples, no byte count to carry).
+func TestPostgresInactiveSlotActiveFlagSpelling(t *testing.T) {
+	postgresInactiveSlotWALGauge.DeleteLabelValues("db", "pg-main", "stale-slot")
+	postgresWALUnhealthyGauge.DeleteLabelValues("db", "pg-main", "inactive_slot")
+	t.Cleanup(func() {
+		postgresInactiveSlotWALGauge.DeleteLabelValues("db", "pg-main", "stale-slot")
+		postgresWALUnhealthyGauge.DeleteLabelValues("db", "pg-main", "inactive_slot")
+	})
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "pg_replication_slots_active") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "db",
+					"pod": "pg-main", "slot_name": "stale-slot"},
+				Value: 0, // `and` returns the left-side samples
+			}}
+		}
+		return nil
+	})
+	cs := fake.NewSimpleClientset()
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	res := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("active-flag spelling of slot bloat must fail")
+	}
+	m := probetest.FindMetric(t, "node_automation_postgres_inactive_slot_wal_bloat",
+		map[string]string{"namespace": "db", "cluster": "pg-main",
+			"slot": "stale-slot"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("slot bloat gauge = %v, want 1", m)
+	}
+}

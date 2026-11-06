@@ -12,7 +12,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -151,11 +153,241 @@ func TestRabbitMQQuorumHealthyPasses(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// W12 P0-2 — the quorum-breaking delete fixes.
+// ---------------------------------------------------------------------------
+
+// Sub-bug (a): the Ready census is per RabbitmqCluster, not per
+// namespace — rmq-a's unready member must NOT be healed on the
+// strength of rmq-b's Ready pods sharing the namespace.
+func TestRabbitMQQuorumPerClusterCensus(t *testing.T) {
+	bad := rabbitMQClusterPod("mq", "rmq-a", "rmq-a-server-0", false)
+	bad.Status.Conditions[0].LastTransitionTime = metav1.NewTime(
+		time.Now().Add(-15 * time.Minute))
+	a1 := rabbitMQClusterPod("mq", "rmq-a", "rmq-a-server-1", true)
+	// rmq-a's third member is unready but only 5m — inside the
+	// persistence window so it flags nothing; it still keeps rmq-a
+	// at a single Ready member.
+	a2 := rabbitMQClusterPod("mq", "rmq-a", "rmq-a-server-2", false)
+	a2.Status.Conditions[0].LastTransitionTime = metav1.NewTime(
+		time.Now().Add(-5 * time.Minute))
+	b0 := rabbitMQClusterPod("mq", "rmq-b", "rmq-b-server-0", true)
+	b1 := rabbitMQClusterPod("mq", "rmq-b", "rmq-b-server-1", true)
+	b2 := rabbitMQClusterPod("mq", "rmq-b", "rmq-b-server-2", true)
+	cs := fake.NewSimpleClientset(bad, a1, a2, b0, b1, b2)
+	p := testProber(cs)
+
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("stuck-unready member must still FAIL the check")
+	}
+	if _, err := cs.CoreV1().Pods("mq").Get(ctx, "rmq-a-server-0",
+		metav1.GetOptions{}); err != nil {
+		t.Fatal("rmq-a has only 1 other Ready member — the delete must " +
+			"not borrow rmq-b's census (per-cluster grouping)")
+	}
+}
+
+// Sub-bug (a) fallback: member pods missing the
+// app.kubernetes.io/name label group by controller owner UID — a
+// different StatefulSet's Ready members must not lend quorum, and a
+// same-owner unready member DOES heal with 2 Ready siblings.
+func TestRabbitMQQuorumOwnerFallbackCensus(t *testing.T) {
+	t.Run("other owner's members do not count", func(t *testing.T) {
+		bad := rabbitMQOwnedPod("mq", "x-server-0", false, "sts-a")
+		bad.Status.Conditions[0].LastTransitionTime = metav1.NewTime(
+			time.Now().Add(-15 * time.Minute))
+		a1 := rabbitMQOwnedPod("mq", "x-server-1", true, "sts-a")
+		b0 := rabbitMQOwnedPod("mq", "y-server-0", true, "sts-b")
+		b1 := rabbitMQOwnedPod("mq", "y-server-1", true, "sts-b")
+		b2 := rabbitMQOwnedPod("mq", "y-server-2", true, "sts-b")
+		cs := fake.NewSimpleClientset(bad, a1, b0, b1, b2)
+		p := testProber(cs)
+
+		if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx); res.Pass {
+			t.Fatal("stuck-unready member must still FAIL the check")
+		}
+		if _, err := cs.CoreV1().Pods("mq").Get(ctx, "x-server-0",
+			metav1.GetOptions{}); err != nil {
+			t.Fatal("owner fallback pooled another controller's Ready members")
+		}
+	})
+
+	t.Run("same owner with 2 ready siblings heals", func(t *testing.T) {
+		bad := rabbitMQOwnedPod("mq", "x-server-0", false, "sts-a")
+		bad.Status.Conditions[0].LastTransitionTime = metav1.NewTime(
+			time.Now().Add(-15 * time.Minute))
+		a1 := rabbitMQOwnedPod("mq", "x-server-1", true, "sts-a")
+		a2 := rabbitMQOwnedPod("mq", "x-server-2", true, "sts-a")
+		cs := fake.NewSimpleClientset(bad, a1, a2)
+		p := testProber(cs)
+
+		if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx); res.Pass {
+			t.Fatal("stuck-unready member must FAIL the check")
+		}
+		if _, err := cs.CoreV1().Pods("mq").Get(ctx, "x-server-0",
+			metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("owner-grouped pod with quorum intact should be deleted, err=%v", err)
+		}
+	})
+}
+
+// Sub-bug (b): a Ready-but-alarmed member must not count toward its
+// own sibling census — a 3-node cluster already at 2/3 Ready drops
+// to 1/3 (Raft quorum loss) if the alarmed pod is deleted.
+func TestRabbitMQQuorumReadyAlarmDoesNotSelfCount(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "memory_used_watermark") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
+				Value:  1,
+			}}
+		}
+		return nil
+	})
+	base := time.Now()
+	flagged := rabbitMQMemberPod("mq", "rabbitmq-server-0", true)
+	flagged.Annotations = map[string]string{
+		kube.AnnoFirstSeenRabbitQuorum: `{"prom/mq/rabbitmq-server-0":"` +
+			base.Add(-15*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	r1 := rabbitMQMemberPod("mq", "rabbitmq-server-1", true)
+	// Third member down but only 5m — inside the persistence
+	// window, flags nothing, keeps the cluster at 2/3 Ready.
+	down := rabbitMQMemberPod("mq", "rabbitmq-server-2", false)
+	down.Status.Conditions[0].LastTransitionTime = metav1.NewTime(
+		base.Add(-5 * time.Minute))
+	cs := fake.NewSimpleClientset(flagged, r1, down)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	p.Now = func() time.Time { return base }
+
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("persisted alarm must FAIL the check")
+	}
+	if _, err := cs.CoreV1().Pods("mq").Get(ctx, "rabbitmq-server-0",
+		metav1.GetOptions{}); err != nil {
+		t.Fatal("alarmed pod deleted — 2/3 Ready drops to 1/3 (Raft " +
+			"quorum loss); the target must not count toward its own census")
+	}
+}
+
+// Sub-bug (c): disk_watermark_alarm NEVER deletes the pod — a
+// delete cannot free the PVC and the restart replays the
+// quorum-queue WAL onto a still-full disk. The check still FAILs
+// and emits the alarm gauge.
+func TestRabbitMQQuorumDiskWatermarkNeverHeals(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "free_disk_space_watermark") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
+				Value:  1,
+			}}
+		}
+		return nil
+	})
+	base := time.Now()
+	flagged := rabbitMQMemberPod("mq", "rabbitmq-server-0", true)
+	flagged.Annotations = map[string]string{
+		kube.AnnoFirstSeenRabbitQuorum: `{"prom/mq/rabbitmq-server-0":"` +
+			base.Add(-15*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	r1 := rabbitMQMemberPod("mq", "rabbitmq-server-1", true)
+	r2 := rabbitMQMemberPod("mq", "rabbitmq-server-2", true)
+	cs := fake.NewSimpleClientset(flagged, r1, r2)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	p.Now = func() time.Time { return base }
+
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("disk_watermark_alarm must FAIL the check")
+	}
+	if !strings.Contains(res.Why, "disk_watermark_alarm") {
+		t.Fatalf("why missing the alarm reason: %q", res.Why)
+	}
+	if _, err := cs.CoreV1().Pods("mq").Get(ctx, "rabbitmq-server-0",
+		metav1.GetOptions{}); err != nil {
+		t.Fatal("disk_watermark_alarm must never delete — the pod " +
+			"cannot free its own PVC")
+	}
+	m := probetest.FindMetric(t, "node_automation_rabbitmq_quorum_unhealthy",
+		map[string]string{
+			"namespace": "mq", "pod": "rabbitmq-server-0",
+			"reason": "disk_watermark_alarm"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("disk_watermark_alarm gauge must still emit")
+	}
+}
+
+// Sub-bug (c) boundary: a disk_watermark_alarm stacked WITH a
+// healable reason does heal — the guard excludes the disk-only
+// shape, not every finding set that mentions the disk.
+func TestRabbitMQQuorumDiskPlusHealableHeals(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "free_disk_space_watermark") ||
+			strings.Contains(query, "memory_used_watermark") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
+				Value:  1,
+			}}
+		}
+		return nil
+	})
+	base := time.Now()
+	flagged := rabbitMQMemberPod("mq", "rabbitmq-server-0", true)
+	flagged.Annotations = map[string]string{
+		kube.AnnoFirstSeenRabbitQuorum: `{"prom/mq/rabbitmq-server-0":"` +
+			base.Add(-15*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	r1 := rabbitMQMemberPod("mq", "rabbitmq-server-1", true)
+	r2 := rabbitMQMemberPod("mq", "rabbitmq-server-2", true)
+	cs := fake.NewSimpleClientset(flagged, r1, r2)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("stacked alarms must FAIL the check")
+	}
+	if _, err := cs.CoreV1().Pods("mq").Get(ctx, "rabbitmq-server-0",
+		metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("disk+memory alarm with quorum intact should heal, err=%v", err)
+	}
+}
+
+// rabbitMQMemberPod builds a member pod of the "rabbitmq"
+// RabbitmqCluster.
 func rabbitMQMemberPod(ns, name string, ready bool) *corev1.Pod {
+	return rabbitMQClusterPod(ns, "rabbitmq", name, ready)
+}
+
+// rabbitMQClusterPod builds a member pod of the named
+// RabbitmqCluster — the operator stamps app.kubernetes.io/name with
+// the owning CR's name next to the part-of/component labels
+// isRabbitMQPod matches on; the per-cluster census keys on it
+// (W12 P0-2a).
+func rabbitMQClusterPod(ns, cluster, name string, ready bool) *corev1.Pod {
 	pod := probetest.PodWithPhase(ns, name, corev1.PodRunning, ready, time.Hour)
 	pod.Labels = map[string]string{
+		"app.kubernetes.io/name":      cluster,
 		"app.kubernetes.io/part-of":   "rabbitmq",
 		"app.kubernetes.io/component": "rabbitmq",
 	}
+	return pod
+}
+
+// rabbitMQOwnedPod builds a member pod WITHOUT the
+// app.kubernetes.io/name label — the census falls back to
+// controller-owner grouping by StatefulSet UID (W12 P0-2a).
+func rabbitMQOwnedPod(ns, name string, ready bool, ownerUID string) *corev1.Pod {
+	pod := probetest.PodWithPhase(ns, name, corev1.PodRunning, ready, time.Hour)
+	pod.Labels = map[string]string{
+		"app.kubernetes.io/component": "rabbitmq",
+	}
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "StatefulSet", Name: name + "-sts",
+		UID: types.UID(ownerUID), Controller: ptr.To(true)}}
 	return pod
 }

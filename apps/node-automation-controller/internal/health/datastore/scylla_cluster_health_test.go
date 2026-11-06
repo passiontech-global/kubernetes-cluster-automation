@@ -135,6 +135,41 @@ func TestCheckScyllaHealthGossipStall(t *testing.T) {
 	}
 }
 
+// W12-ST3 — a troubled member whose log tail carries the tombstone-
+// avalanche signature reports under tombstone_overload_stall after
+// the same persistence window.
+func TestCheckScyllaHealthTombstoneStall(t *testing.T) {
+	t.Cleanup(func() {
+		scyllaClusterUnhealthyGauge.DeleteLabelValues("bino-scylla",
+			"bino-scylla", scyllaReasonTombstoneStall)
+	})
+	base := time.Now()
+	pod := scyllaMemberPod("bino-scylla", "bino-scylla-bino-dc-rack-1-0",
+		"bino-scylla", "10.244.1.5", false)
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
+	cs.PrependReactor("get", "pods",
+		testutil.ProbeLogReactor(
+			"WARN storage_proxy - Read 3 live cells and 91204 tombstones for query\n", nil))
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+	if res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("first-seen tombstone stall must pass: %+v", res)
+	}
+	p.Now = func() time.Time {
+		return base.Add(scyllaSignatureMinAge + time.Minute)
+	}
+	res := probetest.MustCheck[*scyllaHealthCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("persisted tombstone stall did not fail")
+	}
+	m := probetest.FindMetric(t, "node_automation_scylla_unhealthy", map[string]string{
+		"namespace": "bino-scylla", "cluster": "bino-scylla",
+		"reason": scyllaReasonTombstoneStall})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("scylla_unhealthy tombstone=%v, want 1", m)
+	}
+}
+
 // Clean logs on a troubled pod are not a stall — the signature must
 // match, not just the pod shape.
 func TestCheckScyllaHealthCleanLogsPass(t *testing.T) {

@@ -8,8 +8,10 @@
 //     manual jobs and jobs that failed before the limit existed linger
 //     forever, wasting storage and cluttering `kubectl get jobs`
 //     (nonprod 2026-09-22).
-//   - buildrun_reap.go    — W9-GO2: Shipwright BuildRun TTL sweep,
-//     same 24h retention horizon.
+//   - buildrun_reap.go    — W9-GO2 + W12-GO2: the completed-run TTL
+//     sweep (Shipwright BuildRuns plus Tekton PipelineRuns/TaskRuns,
+//     same 24h retention horizon) and the orphaned run-workspace PVC
+//     reaper.
 //   - stuck_terminating.go — C3b: detect-only auditor for Namespaces,
 //     PVCs and VolumeAttachments wedged in Terminating past 2h, plus
 //     the W4 pvc-protection unstick.
@@ -41,8 +43,10 @@ type stuckTerminatingKey struct {
 
 type failedJobsJanitor struct {
 	cs kubernetes.Interface
-	// dyn reads/writes CRDs (Shipwright BuildRuns, W9-GO2) — nil
-	// disables the BuildRun sweep only; every typed sweep is
+	// dyn reads/writes CRDs (Shipwright BuildRuns and Tekton
+	// PipelineRuns/TaskRuns — W9-GO2/W12-GO2) — nil disables the
+	// completed-run sweep only and keeps CRD-owned workspace PVCs
+	// (their owner cannot be verified); every typed sweep is
 	// unaffected. main.go always wires the manager's dynamic client.
 	dyn dynamic.Interface
 	// queue is the module's ops name — stamped from Deps.Name (the
@@ -59,8 +63,9 @@ type failedJobsJanitor struct {
 }
 
 // Setup registers the hourly sweep (was crontab 17 * * * *). d.Dyn
-// carries the dynamic client the W9-GO2 BuildRun TTL sweep needs —
-// pass nil only in tests that never exercise it.
+// carries the dynamic client the W9-GO2/W12-GO2 completed-run TTL
+// sweep and the CRD half of the workspace-PVC reaper need — pass nil
+// only in tests that never exercise them.
 func Setup(d shared.Deps) error {
 	j := &failedJobsJanitor{
 		cs:    d.CS,
@@ -79,7 +84,11 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 		return err
 	}
 	// C3b audit rides the same hourly tick — detect-only, it shares
-	// neither the job list nor the delete cap. W9-GO2's BuildRun TTL
-	// sweep joins it: both are cluster-wide retention hygiene.
-	return errors.Join(j.sweepBuildRuns(ctx), j.auditStuckTerminating(ctx))
+	// neither the job list nor the delete cap. The W9-GO2/W12-GO2
+	// retention sweeps join it: completed runs first so a just-reaped
+	// run's workspace PVC reads "owner gone" in the same pass — all
+	// three are cluster-wide retention hygiene.
+	return errors.Join(j.sweepCompletedRuns(ctx),
+		j.sweepOrphanWorkspacePVCs(ctx),
+		j.auditStuckTerminating(ctx))
 }

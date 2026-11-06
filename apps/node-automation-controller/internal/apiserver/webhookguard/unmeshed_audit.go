@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -75,11 +77,21 @@ func unmeshedRemediationEnabled() bool {
 // in-package test fixture built on it) is unchanged by the split.
 // Shared deps (cs/dyn/now) are reached through snap.g; only the
 // emitted-series ledger lives here.
+// criticalSelfHealingNamespaces are the three namespaces that run CNI,
+// DNS, and the node self-healing stack itself — a fail-closed admission
+// webhook that matches any of them can deadlock recovery when its own
+// backend dies (W12-CP-B, mirroring check-webhook-guard.sh at runtime).
+var criticalSelfHealingNamespaces = []string{"kube-system", "node-ops", "medik8s"}
+
 type unmeshedPodAuditor struct {
 	// unmeshedEmitted is the same ledger for UnmeshedPods
 	// ("namespace/pod") — deleted pods and pods that gained the
 	// sidecar get their series pruned each sweep.
 	unmeshedEmitted state.GaugeLedger[string]
+	// criticalNSExclusionEmitted tracks live WebhookMissingCriticalNSExclusion
+	// series ("kind/name/webhook") so fixed or removed webhooks have their
+	// series pruned.
+	criticalNSExclusionEmitted state.GaugeLedger[string]
 }
 
 // sweepUnmeshedPods audits Running Pods that opted into linkerd
@@ -89,6 +101,7 @@ type unmeshedPodAuditor struct {
 // exported unconditionally; deletion additionally requires the
 // injector webhook provably healthy and the remediation flag on.
 func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepSnapshot) error {
+	a.auditCriticalNSExclusions(snap)
 	g := snap.g
 	log := logf.FromContext(ctx)
 
@@ -365,4 +378,73 @@ func (a *unmeshedPodAuditor) linkerdInjectorHealthy(snap *sweepSnapshot) (bool, 
 		logf.FromContext(snap.ctx).Info("injector health: no linkerd-proxy-injector webhook found")
 	}
 	return false, nil
+}
+
+// auditCriticalNSExclusions (W12-CP-B) audits live Mutating/Validating
+// admission sub-webhooks with failurePolicy=Fail (or nil, which defaults
+// to Fail) and emits node_automation_webhook_missing_critical_ns_exclusion=1
+// when the sub-webhook's namespaceSelector matches any of the critical
+// self-healing namespaces (kube-system, node-ops, medik8s).
+func (a *unmeshedPodAuditor) auditCriticalNSExclusions(snap *sweepSnapshot) {
+	if snap.nsErr != nil || snap.mwcErr != nil || snap.vwcErr != nil ||
+		snap.mwc == nil || snap.vwc == nil {
+		return
+	}
+	critLabels := make(map[string]labels.Set, len(criticalSelfHealingNamespaces))
+	for _, ns := range criticalSelfHealingNamespaces {
+		critLabels[ns] = labels.Set{"kubernetes.io/metadata.name": ns}
+	}
+	if snap.ns != nil {
+		for i := range snap.ns.Items {
+			ns := &snap.ns.Items[i]
+			if _, ok := critLabels[ns.Name]; !ok {
+				continue
+			}
+			merged := make(labels.Set, len(ns.Labels)+1)
+			maps.Copy(merged, ns.Labels)
+			merged["kubernetes.io/metadata.name"] = ns.Name
+			critLabels[ns.Name] = merged
+		}
+	}
+	matchesCriticalNS := func(ls *metav1.LabelSelector) bool {
+		if ls == nil {
+			return true // nil selector matches all namespaces
+		}
+		sel, err := metav1.LabelSelectorAsSelector(ls)
+		if err != nil {
+			return true
+		}
+		for _, ns := range criticalSelfHealingNamespaces {
+			if sel.Matches(critLabels[ns]) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for i := range snap.mwc.Items {
+		cfg := &snap.mwc.Items[i]
+		for j := range cfg.Webhooks {
+			w := &cfg.Webhooks[j]
+			if !failClosed(w.FailurePolicy) || !matchesCriticalNS(w.NamespaceSelector) {
+				continue
+			}
+			a.criticalNSExclusionEmitted.Set(metrics.WebhookMissingCriticalNSExclusion, 1,
+				webhookKindMutating+"/"+cfg.Name+"/"+w.Name,
+				webhookKindMutating, cfg.Name, w.Name)
+		}
+	}
+	for i := range snap.vwc.Items {
+		cfg := &snap.vwc.Items[i]
+		for j := range cfg.Webhooks {
+			w := &cfg.Webhooks[j]
+			if !failClosed(w.FailurePolicy) || !matchesCriticalNS(w.NamespaceSelector) {
+				continue
+			}
+			a.criticalNSExclusionEmitted.Set(metrics.WebhookMissingCriticalNSExclusion, 1,
+				webhookKindValidating+"/"+cfg.Name+"/"+w.Name,
+				webhookKindValidating, cfg.Name, w.Name)
+		}
+	}
+	a.criticalNSExclusionEmitted.Prune(metrics.WebhookMissingCriticalNSExclusion.DeleteLabelValues)
 }

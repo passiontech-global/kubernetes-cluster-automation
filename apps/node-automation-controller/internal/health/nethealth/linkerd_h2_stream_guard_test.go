@@ -1,9 +1,11 @@
 // linkerd_h2_stream_guard_test.go — coverage for the
 // linkerd-h2-stream-guard check: storm-signature delete with a
-// Ready sibling, and the no-sibling skip.
+// Ready sibling, the no-sibling skip, the W12-NM3 outbound balancer
+// lockout and proxy OOM detection.
 package nethealth
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -97,6 +99,10 @@ func TestLinkerdIdentityStallMarkers(t *testing.T) {
 		"linkerd-proxy ERR identity: certificate_expired for default.web",
 		"linkerd-proxy ERR tonic: InvalidCertificate(Expired)",
 		"linkerd-proxy ERR Failed to certify identity: status: Unauthenticated",
+		// W12-NM3 — issued-at skew (NotValidYet) and trust-root skew
+		// (UnknownIssuer) stall the identity the same way.
+		"linkerd-proxy ERR tonic: InvalidCertificate(NotValidYet)",
+		"linkerd-proxy ERR identity: UnknownIssuer for default.web",
 	} {
 		t.Run(line, func(t *testing.T) {
 			owner := types.UID("rs-id")
@@ -198,5 +204,187 @@ func TestLinkerdIdentityStallGaugeClears(t *testing.T) {
 	if m := probetest.FindMetric(t, "node_automation_linkerd_proxy_identity_stalled",
 		map[string]string{"namespace": "apps", "pod": "web-1"}); m != nil {
 		t.Fatal("identity-stalled gauge not cleared after pod eviction")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W12-NM3 — linkerd-proxy OOMKilled detection
+// ---------------------------------------------------------------------------
+
+// oomKilledPod builds a meshed pod whose linkerd-proxy container last
+// terminated on OOMKilled.
+func oomKilledPod(ns, name string, owner types.UID) *corev1.Pod {
+	pod := meshedPod(ns, name, true, owner)
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: linkerdProxyContainer,
+		LastTerminationState: corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				Reason:   "OOMKilled",
+				ExitCode: 137,
+			},
+		},
+	}}
+	return pod
+}
+
+// A linkerd-proxy that OOM'd reports on
+// node_automation_linkerd_proxy_oomkilled — detection only, the pod
+// already restarted its proxy and must NOT be deleted.
+func TestLinkerdProxyOOMKilledFlagged(t *testing.T) {
+	pod := oomKilledPod("apps", "web-1", types.UID("rs-1"))
+	cs := fake.NewSimpleClientset(pod)
+	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		"linkerd-proxy INFO connection established\n", nil))
+	p := testProber(cs)
+	res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("OOMKilled linkerd-proxy must fail: %+v", res)
+	}
+	m := probetest.FindMetric(t, "node_automation_linkerd_proxy_oomkilled",
+		map[string]string{"namespace": "apps", "pod": "web-1"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("oomkilled gauge = %v, want 1", m)
+	}
+	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-1", metav1.GetOptions{}); err != nil {
+		t.Fatalf("OOMKilled pod must NOT be deleted (proxy already restarted): %v", err)
+	}
+	t.Cleanup(func() {
+		linkerdProxyOOMKilledGauge.DeleteLabelValues("apps", "web-1")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// W12-NM3 — outbound balancer lockout
+// ---------------------------------------------------------------------------
+
+// linkerdTargetService parses the service identity back out of a
+// target_addr label on both supported shapes and refuses
+// non-service targets.
+func TestLinkerdTargetService(t *testing.T) {
+	for _, tc := range []struct {
+		addr         string
+		wantNS, want string
+		ok           bool
+	}{
+		{"db-svc.backend.svc.cluster.local:5432", "backend", "db-svc", true},
+		{"db-svc.backend.svc.cluster.local", "backend", "db-svc", true},
+		{"db-svc.backend.svc:5432", "backend", "db-svc", true},
+		{"10.244.0.9:8080", "", "", false},
+		{"example.com:443", "", "", false},
+	} {
+		ns, name, ok := linkerdTargetService(tc.addr)
+		if ok != tc.ok || ns != tc.wantNS || name != tc.want {
+			t.Fatalf("linkerdTargetService(%q) = (%q,%q,%v), want (%q,%q,%v)",
+				tc.addr, ns, name, ok, tc.wantNS, tc.want, tc.ok)
+		}
+	}
+}
+
+// A wedged outbound balancer (total > 0, ready == 0) whose target
+// Service still has Ready endpoints is the lockout: past the 10m
+// window the gauge fires and the client pod is bounced — a Ready
+// sibling absorbs the traffic.
+func TestLinkerdBalancerWedgedHeals(t *testing.T) {
+	base := time.Now()
+	owner := types.UID("rs-shared")
+	bad := meshedPod("apps", "web-1", true, owner)
+	// The unmeshed sibling proves "someone can absorb the traffic"
+	// without being re-flagged by the shared log reactor.
+	good := probetest.PodWithPhase("apps", "web-2", corev1.PodRunning, true, time.Hour)
+	good.OwnerReferences = bad.OwnerReferences
+	cs := fake.NewSimpleClientset(
+		bad, good,
+		// The destination Service still has a Ready endpoint — the
+		// wedge is client-side, not a real outage.
+		probetest.EndpointSliceForService("backend", "db-svc", "10.244.0.9"))
+	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		"linkerd-proxy INFO connection established\n", nil))
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, `state="ready"`) {
+			return nil // no ready endpoints on the wedged target
+		}
+		return []probetest.PromTestSample{{
+			Labels: map[string]string{
+				"namespace":   "apps",
+				"pod":         "web-1",
+				"target_addr": "db-svc.backend.svc.cluster.local:5432",
+			},
+			Value: 3,
+		}}
+	})
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	chk := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p)
+	probetest.FreezeNow(p.Deps, base)
+	if res := chk.Run(ctx); !res.Pass {
+		t.Fatalf("first-seen wedge must pass (inside window): %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-1", metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod deleted inside the persistence window: %v", err)
+	}
+	probetest.FreezeNow(p.Deps, base.Add(linkerdBalancerWedgeMinAge+time.Minute))
+	res := chk.Run(ctx)
+	if res.Pass {
+		t.Fatal("persisted balancer wedge must fail")
+	}
+	m := probetest.FindMetric(t, "node_automation_linkerd_outbound_balancer_wedged",
+		map[string]string{"namespace": "apps", "pod": "web-1"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("balancer-wedged gauge = %v, want 1", m)
+	}
+	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("wedged client pod should be bounced, err=%v", err)
+	}
+	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-2", metav1.GetOptions{}); err != nil {
+		t.Fatalf("Ready sibling must survive: %v", err)
+	}
+	t.Cleanup(func() {
+		linkerdOutboundBalancerWedgedGauge.DeleteLabelValues("apps", "web-1")
+	})
+}
+
+// A "wedged" tuple whose target Service genuinely has zero ready
+// endpoints cluster-wide is a real outage the proxy reports
+// honestly — never flagged, never bounced.
+func TestLinkerdBalancerRealOutageSkipped(t *testing.T) {
+	base := time.Now()
+	owner := types.UID("rs-shared")
+	bad := meshedPod("apps", "web-1", true, owner)
+	cs := fake.NewSimpleClientset(bad) // NO ready endpoints for db-svc at all
+	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		"linkerd-proxy INFO connection established\n", nil))
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, `state="ready"`) {
+			return nil
+		}
+		return []probetest.PromTestSample{{
+			Labels: map[string]string{
+				"namespace":   "apps",
+				"pod":         "web-1",
+				"target_addr": "db-svc.backend.svc.cluster.local:5432",
+			},
+			Value: 3,
+		}}
+	})
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	chk := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p)
+	probetest.FreezeNow(p.Deps, base)
+	if res := chk.Run(ctx); !res.Pass {
+		t.Fatalf("real outage must pass: %+v", res)
+	}
+	probetest.FreezeNow(p.Deps, base.Add(linkerdBalancerWedgeMinAge+time.Minute))
+	if res := chk.Run(ctx); !res.Pass {
+		t.Fatalf("real outage still must pass past the window: %+v", res)
+	}
+	if m := probetest.FindMetric(t, "node_automation_linkerd_outbound_balancer_wedged",
+		map[string]string{"namespace": "apps", "pod": "web-1"}); m != nil {
+		t.Fatal("balancer-wedged gauge emitted for a genuine outage")
+	}
+	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-1", metav1.GetOptions{}); err != nil {
+		t.Fatalf("outage-reporting pod must not be bounced: %v", err)
 	}
 }

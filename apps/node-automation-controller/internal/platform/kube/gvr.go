@@ -181,6 +181,12 @@ var (
 		Group: "kargo.akuity.io", Version: "v1alpha1", Resource: "stages"}
 	GVRKargoWarehouse = schema.GroupVersionResource{
 		Group: "kargo.akuity.io", Version: "v1alpha1", Resource: "warehouses"}
+	GVRKargoPromotion = schema.GroupVersionResource{
+		Group: "kargo.akuity.io", Version: "v1alpha1", Resource: "promotions"}
+	// GVRArgoAnalysisRun is the argoproj.io/v1alpha1 AnalysisRun the
+	// kargo-promotion-health zombie guard scans (Rollouts analysis).
+	GVRArgoAnalysisRun = schema.GroupVersionResource{
+		Group: "argoproj.io", Version: "v1alpha1", Resource: "analysisruns"}
 
 	// ---------------------------------------------------------------
 	// Shipwright (failed-jobs-janitor BuildRuns; cluster-health-probes
@@ -198,6 +204,8 @@ var (
 	// ---------------------------------------------------------------
 	GVRTektonPipelineRun = schema.GroupVersionResource{
 		Group: "tekton.dev", Version: "v1", Resource: "pipelineruns"}
+	GVRTektonTaskRun = schema.GroupVersionResource{
+		Group: "tekton.dev", Version: "v1", Resource: "taskruns"}
 	GVRKedaScaledObject = schema.GroupVersionResource{
 		Group: "keda.sh", Version: "v1alpha1", Resource: "scaledobjects"}
 	GVROLMClusterServiceVersion = schema.GroupVersionResource{

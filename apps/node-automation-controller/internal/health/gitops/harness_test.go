@@ -20,5 +20,6 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober 
 	return probetest.NewProber(cs, dyn,
 		NewArgoCDAppStuckCheck,
 		NewFluxHRRetriesCheck,
+		NewKargoPromotionHealthCheck,
 	)
 }

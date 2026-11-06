@@ -39,11 +39,14 @@ const (
 	nodeHangCondMinAge       = 2 * time.Minute
 	nodeHangMaxCordonedRatio = 0.35
 
-	// W9-CP3 — clock-skew pre-cordon: ClockUnsynchronized gets a
+	// W9-CP3 — clock-skew pre-cordon: the clock conditions get a
 	// longer fuse than the hang latches — the NTP daemon needs
 	// restart time to resync before the node counts as hanging.
-	nodeClockSkewCond      corev1.NodeConditionType = "ClockUnsynchronized"
-	nodeClockSkewCordonAge                          = 10 * time.Minute
+	// ClockSkewDetected (W12-1.4) is the host-agent's >2s-offset
+	// latch (chrony still reports a source, so ClockUnsynchronized
+	// never trips) — skewed mTLS/Raft leases harm every pod that
+	// lands on the node, same blast radius.
+	nodeClockSkewCordonAge = 10 * time.Minute
 
 	// nodeHangPreCordonAnno stamps every cordon this check applies so
 	// the auto-uncordon path only ever lifts cordons IT created — a
@@ -63,17 +66,28 @@ const (
 // InodePressure is kubelet-native — nodefs/imagefs inode
 // exhaustion, no agent latch involved; the Cilium*/CalicoFelixDown
 // latches are the CNI death signals a pre-reboot node carries;
-// NebulaIsolated is the overlay partition latch). There is
+// NebulaIsolated is the overlay partition latch;
+// KubeletPLEGUnhealthy — W12-1.4 — is the PLEG relist stall that
+// precedes the kubelet dying outright). There is
 // no corev1 constant for any of them — string literals are the
-// convention here (same as nodeClockSkewCond below).
-// ClockUnsynchronized is deliberately NOT here: it carries its own
-// longer fuse (nodeClockSkewCordonAge) and is checked separately.
+// convention here (same as nodeClockSkewConds below).
+// The clock conditions are deliberately NOT here: they carry their
+// own longer fuse (nodeClockSkewCordonAge) and are checked
+// separately.
 var nodeHangConds = []corev1.NodeConditionType{
 	"KernelHungTasks", "FilesystemReadOnly", "KubeletRuntimeStall",
 	"KubeletWatchWedge", "PodTeardownWedged", "InodePressure",
 	"MemoryPSIThrashing", "KernelSlabLeak", "KernelResourceExhaustion",
 	"CgroupDyingLeak", "CiliumAgentDown", "CiliumInitStuck",
 	"CiliumEnvoyDown", "CalicoFelixDown", "NebulaIsolated",
+	"KubeletPLEGUnhealthy", "DiskSlowIO",
+}
+
+// nodeClockSkewConds are the clock-health latches on the longer
+// fuse — ClockUnsynchronized (no sync source) and
+// ClockSkewDetected (synchronized but >2s offset, W12-1.4).
+var nodeClockSkewConds = []corev1.NodeConditionType{
+	"ClockUnsynchronized", "ClockSkewDetected",
 }
 
 var (
@@ -104,9 +118,9 @@ func init() {
 
 // nodeHangLatch reports the first hang latch past its cordon fuse on
 // the node — "" when none qualifies. Every nodeHangConds entry fuses
-// at nodeHangCondMinAge; ClockUnsynchronized (W9-CP3) gets
-// nodeClockSkewCordonAge so an NTP daemon restart has time to resync
-// before the node counts as hanging.
+// at nodeHangCondMinAge; the nodeClockSkewConds latches (W9-CP3)
+// get nodeClockSkewCordonAge so an NTP daemon restart has time to
+// resync before the node counts as hanging.
 func nodeHangLatch(n *corev1.Node, now time.Time) string {
 	for _, t := range nodeHangConds {
 		c := kube.NodeCondition(n, t)
@@ -116,11 +130,13 @@ func nodeHangLatch(n *corev1.Node, now time.Time) string {
 			return string(t)
 		}
 	}
-	if c := kube.NodeCondition(n, nodeClockSkewCond); c != nil &&
-		c.Status == corev1.ConditionTrue &&
-		!c.LastTransitionTime.IsZero() &&
-		now.Sub(c.LastTransitionTime.Time) >= nodeClockSkewCordonAge {
-		return string(nodeClockSkewCond)
+	for _, t := range nodeClockSkewConds {
+		if c := kube.NodeCondition(n, t); c != nil &&
+			c.Status == corev1.ConditionTrue &&
+			!c.LastTransitionTime.IsZero() &&
+			now.Sub(c.LastTransitionTime.Time) >= nodeClockSkewCordonAge {
+			return string(t)
+		}
 	}
 	return ""
 }
@@ -136,16 +152,18 @@ func nodeHangLatchActive(n *corev1.Node) bool {
 			return true
 		}
 	}
-	if c := kube.NodeCondition(n, nodeClockSkewCond); c != nil &&
-		c.Status == corev1.ConditionTrue {
-		return true
+	for _, t := range nodeClockSkewConds {
+		if c := kube.NodeCondition(n, t); c != nil &&
+			c.Status == corev1.ConditionTrue {
+			return true
+		}
 	}
 	return false
 }
 
 // checkNodeHangPreCordon patches spec.unschedulable=true onto worker
 // nodes carrying a sustained hang latch (any nodeHangConds entry
-// >=2m, ClockUnsynchronized >=10m) — NHC/SNR will
+// >=2m, a nodeClockSkewConds latch >=10m) — NHC/SNR will
 // reboot the node, but pods keep scheduling onto it until then. The
 // cordon is stamped passiontech.dev/precordoned-by=node-hang-precordon and
 // the same sweep AUTO-UNCORDONS a stamped node once every latch has

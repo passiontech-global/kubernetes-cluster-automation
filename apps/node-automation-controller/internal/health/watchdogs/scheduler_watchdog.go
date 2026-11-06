@@ -3,6 +3,15 @@
 // PodScheduled condition while Ready uncordoned workers exist) and
 // reports node_automation_scheduler_frozen. Detect-only — restarting
 // the scheduler is the platform's job.
+//
+// W12-SC1 adds the second scheduler fault signature: a
+// PriorityClass preemption cascade (a high-priority pod preempts
+// victims that preempt their own victims — the Monzo/Zalando domino
+// eviction shape) reads as a burst of reason=Preempted events;
+// >15 inside 5m raises node_automation_scheduler_preemption_storm
+// and fails the check so the storm is paged, while
+// descheduler-storm-gate reads the same signal to keep the
+// descheduler from amplifying the cascade.
 package watchdogs
 
 import (
@@ -13,6 +22,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
@@ -34,6 +44,13 @@ const (
 	// W8-CP3 — scheduler-watchdog knobs.
 	CheckNameSchedulerWatchdog = "scheduler-watchdog"
 	schedulerPendingMinAge     = 5 * time.Minute
+
+	// W12-SC1 — preemption-cascade knobs: an ordinary scheduler
+	// emits a handful of Preempted events during placement churn;
+	// more than the ceiling inside the window is a domino cascade —
+	// each preempted victim requeues and preempts its own victims.
+	schedulerPreemptionWindow = 5 * time.Minute
+	schedulerPreemptionMax    = 15
 )
 
 var (
@@ -45,11 +62,20 @@ var (
 		Name: "node_automation_scheduler_frozen",
 		Help: "1 while unscheduled Pending pods accumulate past 5m despite Ready uncordoned workers.",
 	})
+
+	// W12-SC1 — the preemption-cascade signal: 1 while
+	// reason=Preempted events outpace the ceiling — the same plain
+	// cluster-wide shape as the freeze gauge.
+	schedulerPreemptionStormGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_automation_scheduler_preemption_storm",
+		Help: "1 while reason=Preempted events exceed 15 in 5m — a PriorityClass preemption cascade.",
+	})
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
-		schedulerFrozenGauge)
+		schedulerFrozenGauge,
+		schedulerPreemptionStormGauge)
 }
 
 // ---------------------------------------------------------------------------
@@ -63,7 +89,39 @@ func init() {
 // workers exist to place them on. Detect-only — restarting the
 // scheduler is the platform's job; this check makes the freeze
 // visible on node_automation_scheduler_frozen.
+//
+// The W12-SC1 preemption-cascade signal folds into the same sweep:
+// a burst of reason=Preempted events (>15 in 5m) is a PriorityClass
+// domino eviction storm, reported on
+// node_automation_scheduler_preemption_storm — the freeze signal is
+// about a DEAD scheduler, the storm signal about a scheduler that is
+// too busy evicting to place anything. An events-list failure is
+// tolerated (WARN + InfraErr) — the freeze half still judges on its
+// own evidence, and an inconclusive storm signal must not read as
+// "no storm".
 func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
+	log := logf.FromContext(ctx)
+	now := p.Now()
+	var rep probefw.SweepReport
+
+	// W12-SC1 — PriorityClass preemption cascade. The count ignores
+	// reason alone (kube.CountRecentEvents re-checks it) so a
+	// supported-field-selector variant can never over-report.
+	preempted, err := kube.CountRecentEvents(ctx, p.CS,
+		kube.PreemptedEventReason, schedulerPreemptionWindow, now)
+	if err != nil {
+		log.Info("WARN: preempted events list failed — preemption-storm signal inconclusive",
+			"error", err)
+		rep.InfraErr(fmt.Errorf("list preempted events: %w", err))
+	} else if preempted > schedulerPreemptionMax {
+		schedulerPreemptionStormGauge.Set(1)
+		rep.Find(fmt.Sprintf(
+			"preemption storm: %d Preempted events in %s (>%d)",
+			preempted, schedulerPreemptionWindow, schedulerPreemptionMax))
+	} else {
+		schedulerPreemptionStormGauge.Set(0)
+	}
+
 	nodes, err := kube.ListNodes(ctx, p.CS)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
@@ -78,7 +136,9 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 	}
 	if !schedulable {
 		schedulerFrozenGauge.Set(0)
-		return probefw.Result{Pass: true} // nowhere to schedule — ambiguous
+		// nowhere to schedule — the freeze signal is ambiguous, but
+		// the preemption-storm finding above still reports.
+		return rep.Verdict("scheduler fault signatures: ", ", ")
 	}
 
 	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).List(ctx,
@@ -86,8 +146,7 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pending pods: %w", err)}
 	}
-	now := p.Now()
-	var rep probefw.SweepReport
+	pending := 0
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.Spec.NodeName != "" ||
@@ -102,15 +161,16 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 		if !scheduled {
+			pending++
 			rep.Find(pod.Namespace + "/" + pod.Name)
 		}
 	}
-	if len(rep.Findings()) == 0 {
+	if pending == 0 {
 		schedulerFrozenGauge.Set(0)
-		return probefw.Result{Pass: true}
+	} else {
+		schedulerFrozenGauge.Set(1)
 	}
-	schedulerFrozenGauge.Set(1)
 	return rep.Verdict(fmt.Sprintf(
-		"%d pods pending >=%s unscheduled with no PodScheduled condition despite Ready workers: ",
-		len(rep.Findings()), schedulerPendingMinAge), ", ")
+		"scheduler fault signatures (%d pods pending >=%s unscheduled with no PodScheduled condition despite Ready workers): ",
+		pending, schedulerPendingMinAge), ", ")
 }

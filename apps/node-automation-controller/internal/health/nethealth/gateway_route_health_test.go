@@ -52,6 +52,33 @@ func routeCond(condType, status string) map[string]any {
 	return map[string]any{"type": condType, "status": status}
 }
 
+// routeCondReason is one status condition entry carrying a reason —
+// ResolvedRefs/RefNotPermitted is the W12-NM4b signature.
+func routeCondReason(condType, status, reason string) map[string]any {
+	return map[string]any{"type": condType, "status": status, "reason": reason}
+}
+
+// referenceGrantFixture builds a ReferenceGrant in ns permitting
+// `fromKind` routes from fromNS to reach kind/name targets — empty
+// toName means any object of the kind.
+func referenceGrantFixture(ns, name, fromKind, fromNS, toKind, toName string) *unstructured.Unstructured {
+	to := map[string]any{"group": "", "kind": toKind}
+	if toName != "" {
+		to["name"] = toName
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "gateway.networking.k8s.io/v1beta1",
+		"kind":       "ReferenceGrant",
+		"metadata":   map[string]any{"namespace": ns, "name": name},
+		"spec": map[string]any{
+			"from": []any{map[string]any{
+				"group": "gateway.networking.k8s.io",
+				"kind":  fromKind, "namespace": fromNS}},
+			"to": []any{to},
+		},
+	}}
+}
+
 // setRouteBackends stamps one spec.rules entry carrying the given
 // backendRefs (name/namespace/port/kind/group fields).
 func setRouteBackends(u *unstructured.Unstructured, refs ...map[string]any) {
@@ -152,6 +179,146 @@ func TestGatewayRouteHealthResolvedRefsFalse(t *testing.T) {
 			"name": "grpc-route", "reason": "resolved_refs_false"})
 	if m == nil || m.GetGauge().GetValue() != 1 {
 		t.Fatalf("unhealthy gauge = %v, want 1", m)
+	}
+}
+
+// A cross-namespace backendRef with NO permitting ReferenceGrant in
+// the backend's namespace flags ref_not_permitted — the controller
+// drops the ref silently, so the static grant cross-check is the
+// only way to see it before ResolvedRefs catches up (W12-NM4b).
+func TestGatewayRouteHealthCrossNSRefNotPermitted(t *testing.T) {
+	t.Run("no grant", func(t *testing.T) {
+		route := routeFixture("HTTPRoute", "apps", "xns-route")
+		setRouteBackends(route, map[string]any{
+			"name": "web-svc", "namespace": "backend", "port": int64(80)})
+		setRouteParents(route, routeCond("Accepted", "True"),
+			routeCond("ResolvedRefs", "True"))
+		cs := fake.NewSimpleClientset(
+			clusterIPService("backend", "web-svc", map[string]string{"app": "x"}))
+		// A grant in an unrelated namespace keeps the GVR served on
+		// the fake while proving it does not permit this ref.
+		dyn := probetest.OpDyn(route,
+			referenceGrantFixture("other", "g1", "HTTPRoute", "apps", "Service", ""))
+		p := testProberDyn(cs, dyn)
+		res := driveRouteCheck(t, p, time.Now())
+		if res.Pass {
+			t.Fatal("unpermitted cross-ns backendRef did not fail")
+		}
+		m := probetest.FindMetric(t, "node_automation_gateway_route_unhealthy",
+			map[string]string{"kind": "HTTPRoute", "namespace": "apps",
+				"name": "xns-route", "reason": "ref_not_permitted"})
+		if m == nil || m.GetGauge().GetValue() != 1 {
+			t.Fatalf("ref_not_permitted gauge = %v, want 1", m)
+		}
+	})
+
+	t.Run("grant permits", func(t *testing.T) {
+		route := routeFixture("HTTPRoute", "apps", "xns-ok-route")
+		setRouteBackends(route, map[string]any{
+			"name": "web-svc", "namespace": "backend", "port": int64(80)})
+		setRouteParents(route, routeCond("Accepted", "True"),
+			routeCond("ResolvedRefs", "True"))
+		cs := fake.NewSimpleClientset(
+			clusterIPService("backend", "web-svc", map[string]string{"app": "x"}),
+			probetest.EndpointSliceForService("backend", "web-svc", "10.244.0.5"))
+		dyn := probetest.OpDyn(route,
+			referenceGrantFixture("backend", "g1", "HTTPRoute", "apps", "Service", "web-svc"))
+		p := testProberDyn(cs, dyn)
+		res := driveRouteCheck(t, p, time.Now())
+		if !res.Pass {
+			t.Fatalf("permitted cross-ns backendRef must pass: %s", res.Why)
+		}
+	})
+
+	t.Run("wrong grant shape does not permit", func(t *testing.T) {
+		route := routeFixture("HTTPRoute", "apps", "xns-wrong-route")
+		setRouteBackends(route, map[string]any{
+			"name": "web-svc", "namespace": "backend", "port": int64(80)})
+		setRouteParents(route, routeCond("Accepted", "True"))
+		cs := fake.NewSimpleClientset(
+			clusterIPService("backend", "web-svc", map[string]string{"app": "x"}))
+		// Grant names a different Service — not this ref's backend.
+		dyn := probetest.OpDyn(route,
+			referenceGrantFixture("backend", "g1", "HTTPRoute", "apps", "Service", "other-svc"))
+		p := testProberDyn(cs, dyn)
+		res := driveRouteCheck(t, p, time.Now())
+		if res.Pass {
+			t.Fatal("grant naming another service must not permit this ref")
+		}
+	})
+}
+
+// ResolvedRefs=False with reason RefNotPermitted lands the precise
+// ref_not_permitted reason (not generic resolved_refs_false).
+func TestGatewayRouteHealthRefNotPermittedReason(t *testing.T) {
+	route := routeFixture("GRPCRoute", "apps", "rnp-route")
+	setRouteParents(route,
+		routeCond("Accepted", "True"),
+		routeCondReason("ResolvedRefs", "False", "RefNotPermitted"))
+	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(route))
+	res := driveRouteCheck(t, p, time.Now())
+	if res.Pass {
+		t.Fatal("RefNotPermitted route did not fail")
+	}
+	if m := probetest.FindMetric(t, "node_automation_gateway_route_unhealthy",
+		map[string]string{"kind": "GRPCRoute", "namespace": "apps",
+			"name": "rnp-route", "reason": "ref_not_permitted"}); m == nil {
+		t.Fatal("ref_not_permitted gauge missing")
+	}
+	if m := probetest.FindMetric(t, "node_automation_gateway_route_unhealthy",
+		map[string]string{"kind": "GRPCRoute", "namespace": "apps",
+			"name": "rnp-route", "reason": "resolved_refs_false"}); m != nil {
+		t.Fatal("RefNotPermitted also flagged generic resolved_refs_false")
+	}
+}
+
+// The dedicated 5m zero-endpoints gauge fires BEFORE the 10m
+// unhealthy signature — same blackhole, earlier edge (W12-NM4b).
+func TestGatewayRouteHealthZeroEndpointsGaugeAt5m(t *testing.T) {
+	base := time.Now()
+	route := routeFixture("HTTPRoute", "apps", "zero5m-route")
+	setRouteBackends(route, map[string]any{"name": "web-svc", "port": int64(80)})
+	setRouteParents(route, routeCond("Accepted", "True"))
+	cs := fake.NewSimpleClientset(
+		clusterIPService("apps", "web-svc", map[string]string{"app": "x"}))
+	p := testProberDyn(cs, probetest.OpDyn(route))
+	chk := probetest.MustCheck[*gatewayRouteHealthCheck](t, p)
+
+	probetest.FreezeNow(p.Deps, base)
+	if r := chk.Run(ctx); !r.Pass {
+		t.Fatalf("fresh zero-endpoints must not flag: %+v", r)
+	}
+	// Inside the 10m unhealthy window but PAST the 5m zero window —
+	// the dedicated gauge is live while the check still passes.
+	probetest.FreezeNow(p.Deps, base.Add(gatewayRouteZeroEndpointsMinAge+time.Minute))
+	r := chk.Run(ctx)
+	if !r.Pass {
+		t.Fatalf("zero gauge must not fail the check before 10m: %+v", r)
+	}
+	m := probetest.FindMetric(t, "node_automation_gateway_route_zero_endpoints",
+		map[string]string{"kind": "HTTPRoute", "namespace": "apps",
+			"name": "zero5m-route", "service_namespace": "apps", "service": "web-svc"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("zero-endpoints gauge = %v, want 1 at 5m", m)
+	}
+	// Past 10m the unhealthy reason lands too.
+	probetest.FreezeNow(p.Deps, base.Add(gatewayRouteUnhealthyMinAge+time.Minute))
+	if r := chk.Run(ctx); r.Pass {
+		t.Fatal("persisted zero-endpoints did not fail at 10m")
+	}
+	// Endpoints appear — both gauges must drain on the next sweep.
+	cs2 := probetest.EndpointSliceForService("apps", "web-svc", "10.244.0.7")
+	if _, err := cs.DiscoveryV1().EndpointSlices("apps").Create(ctx, cs2, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	probetest.FreezeNow(p.Deps, base.Add(2*gatewayRouteUnhealthyMinAge+time.Minute))
+	if r := chk.Run(ctx); !r.Pass {
+		t.Fatalf("healed backend must pass: %+v", r)
+	}
+	if m := probetest.FindMetric(t, "node_automation_gateway_route_zero_endpoints",
+		map[string]string{"kind": "HTTPRoute", "namespace": "apps",
+			"name": "zero5m-route", "service_namespace": "apps", "service": "web-svc"}); m != nil {
+		t.Fatal("zero-endpoints gauge not cleared after endpoints returned")
 	}
 }
 

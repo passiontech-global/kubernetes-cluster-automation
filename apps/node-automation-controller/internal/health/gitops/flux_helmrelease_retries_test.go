@@ -55,7 +55,10 @@ func TestCheckFluxHelmReleaseRetriesPatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, anno := range []string{kube.AnnoFluxRequestedAt, kube.AnnoFluxForceAt} {
+	for _, anno := range []string{
+		kube.AnnoFluxRequestedAt, kube.AnnoFluxForceAt,
+		kube.AnnoFluxResetAt, // W12 P0-3 — required to clear RetriesExceeded
+	} {
 		v, found, _ := unstructured.NestedString(
 			got.Object, "metadata", "annotations", anno)
 		if !found || v == "" {

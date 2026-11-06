@@ -25,6 +25,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
 // postgresWALArchiveGuardCheck is the WAL-archive stall watchdog.
@@ -34,7 +35,10 @@ type postgresWALArchiveGuardCheck struct {
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1 (zero value usable; the serial sweep needs no lock).
-	emitted state.GaugeLedger[string]
+	// emittedSlot is the same ledger for the W12-ST2 slot-bloat
+	// gauge — a slot that drains or goes active loses its series.
+	emitted     state.GaugeLedger[string]
+	emittedSlot state.GaugeLedger[string]
 }
 
 // NewPostgresWALArchiveGuardCheck builds the WAL guard — its only
@@ -84,11 +88,20 @@ var (
 		Name: "node_automation_postgres_wal_archive_unhealthy",
 		Help: "1 while the Postgres cluster shows a WAL/archive runaway signature (archive condition, archiver failure, retained slot WAL, volume pressure, disk-full crash evidence).",
 	}, []string{"namespace", "cluster", "reason"})
+
+	// W12-ST2 — inactive replication slots retaining WAL, carried
+	// with the slot name and the retained size the
+	// wal_archive_unhealthy{reason=inactive_slot} flag cannot show.
+	postgresInactiveSlotWALGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_postgres_inactive_slot_wal_bloat",
+		Help: "Retained WAL bytes behind an inactive replication slot (pg_replication_slots_active==0) past the 5GiB floor — the bloat that precedes the pg_wal disk-full crash.",
+	}, []string{"namespace", "cluster", "slot"})
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
-		postgresWALUnhealthyGauge)
+		postgresWALUnhealthyGauge,
+		postgresInactiveSlotWALGauge)
 }
 
 // pgWALConditionUnhealthy reports whether a cluster CR condition is
@@ -191,6 +204,7 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 	type finding struct {
 		ns, cluster, reason string
 	}
+	var rep probefw.SweepReport
 	findings := map[string]finding{}
 	emit := func(ns, cluster, reason string) {
 		if cluster == "" {
@@ -264,6 +278,7 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 				s.Label("cluster", "postgres_cluster", "pod"), "archiver_failing")
 		}
 	}
+	var slotRep probefw.SweepReport
 	if series, qerr := p.PromQuery(ctx, fmt.Sprintf(
 		`(pg_replication_slots_retained_bytes{active="false"} > %d) or `+
 			`(cnpg_pg_replication_slots_retained_bytes{active="false"} > %d)`,
@@ -274,6 +289,26 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 		for _, s := range series {
 			emit(s.Label("namespace"),
 				s.Label("cluster", "postgres_cluster", "pod"), "inactive_slot")
+			p.emitSlotBloat(&slotRep, &rep, s)
+		}
+	}
+	// W12-ST2 — the postgres_exporter spelling of the same
+	// signature: the active flag and the retained-bytes diff live on
+	// separate series joined by the slot labels. `and` returns the
+	// active==0 samples themselves (value 0) — the bloat gauge
+	// flags 1 since this exporter family can't give a byte count.
+	if series, qerr := p.PromQuery(ctx, fmt.Sprintf(
+		`(pg_replication_slots_active == 0) and on(namespace, pod, slot_name) `+
+			`(pg_replication_slots_pg_wal_lsn_diff > %d or `+
+			`pg_replication_slots_confirmed_flush_lsn_wal_lsn_diff > %d)`,
+		pgWALSlotRetainMax, pgWALSlotRetainMax)); qerr != nil {
+		log.Info("WARN: active-flag slot query failed — slot-bloat evidence incomplete",
+			"error", qerr)
+	} else {
+		for _, s := range series {
+			emit(s.Label("namespace"),
+				s.Label("cluster", "postgres_cluster", "pod"), "inactive_slot")
+			p.emitSlotBloat(&slotRep, &rep, s)
 		}
 	}
 	// Volume pressure: the data volume a postgres pod mounts above
@@ -294,11 +329,40 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	var rep probefw.SweepReport
 	for k, f := range findings {
 		rep.Emit(postgresWALUnhealthyGauge, k,
 			[]string{f.ns, f.cluster, f.reason}, k)
 	}
+	slotRep.Close(&p.emittedSlot, postgresInactiveSlotWALGauge.DeleteLabelValues)
 	return rep.Result(&p.emitted, postgresWALUnhealthyGauge.DeleteLabelValues,
 		"postgres wal/archive unhealthy: ", ", ")
+}
+
+// emitSlotBloat flags one inactive-slot sample on the W12-ST2
+// slot-bloat gauge and records the finding on the shared report.
+// The value is the retained byte count where the exporter reports
+// one (retained_bytes / lsn-diff families); the `and`-joined
+// active-flag spelling returns value-0 samples, which flag 1 — a
+// boolean "this slot is bloated" when no byte count exists.
+func (p *postgresWALArchiveGuardCheck) emitSlotBloat(
+	slotRep, rep *probefw.SweepReport, s promq.Sample) {
+
+	ns := s.Label("namespace")
+	cluster := s.Label("cluster", "postgres_cluster", "pod")
+	if cluster == "" {
+		cluster = "-"
+	}
+	slot := s.Label("slot_name", "slot")
+	if slot == "" {
+		slot = "-"
+	}
+	val := s.Value
+	if val <= 0 {
+		val = 1
+	}
+	key := ns + "/" + cluster + "/" + slot
+	slotRep.Set(postgresInactiveSlotWALGauge, val, key,
+		[]string{ns, cluster, slot})
+	rep.Find(fmt.Sprintf("%s/%s slot %s inactive retaining %.1fGiB WAL",
+		ns, cluster, slot, s.Value/float64(1<<30)))
 }

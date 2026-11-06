@@ -572,3 +572,96 @@ func driveEndpointDesync(t *testing.T, p *probetest.Prober, base time.Time) prob
 	p.Now = func() time.Time { return base.Add(linkerdEndpointDesyncMinAge + time.Minute) }
 	return probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
 }
+
+// ---------------------------------------------------------------------------
+// W12-NM1b — Cilium socket-LB vs Linkerd compatibility audit
+// ---------------------------------------------------------------------------
+
+// ciliumConfig builds the kube-system/cilium-config ConfigMap the
+// socket-LB audit reads.
+func ciliumConfig(data map[string]string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "kube-system", Name: "cilium-config"}, Data: data}
+}
+
+// linkerdNamespace is the control-plane namespace whose mere
+// presence means the mesh is installed.
+func linkerdNamespace() *corev1.Namespace {
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: probefw.LinkerdNS}}
+}
+
+// bpf-lb-sock on Linkerd with NEITHER compatibility knob fails the
+// check and raises the conflict gauge.
+func TestLinkerdSockLBConflictFlagged(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		linkerdNamespace(),
+		ciliumConfig(map[string]string{"bpf-lb-sock": "true"}),
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("socket-LB conflict must fail: %+v", res)
+	}
+	m := probetest.FindMetric(t, "node_automation_cilium_linkerd_socklb_conflict",
+		map[string]string{})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("socklb conflict gauge = %v, want 1", m)
+	}
+	t.Cleanup(func() { ciliumLinkerdSockLBConflictGauge.Set(0) })
+}
+
+// Either compatibility knob — cni-exclusive=false or
+// bpf-lb-sock-hostns-only=true — makes the shape safe; socket-LB
+// off entirely is safe too; no cilium-config means no Cilium.
+func TestLinkerdSockLBSafeShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data map[string]string
+	}{
+		{"cni-exclusive=false", map[string]string{
+			"bpf-lb-sock": "true", "cni-exclusive": "false"}},
+		{"hostns-only", map[string]string{
+			"bpf-lb-sock": "true", "bpf-lb-sock-hostns-only": "true"}},
+		{"socklb disabled", map[string]string{"bpf-lb-sock": "false"}},
+		{"no socklb key", map[string]string{"debug": "false"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset(
+				linkerdNamespace(),
+				ciliumConfig(tc.data),
+				probetest.ReadyWorkerNode("w1", "", 0, false))
+			p := testProberDyn(cs, probetest.OpDyn())
+			res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx)
+			if !res.Pass {
+				t.Fatalf("%s must pass: %+v", tc.name, res)
+			}
+			m := probetest.FindMetric(t,
+				"node_automation_cilium_linkerd_socklb_conflict",
+				map[string]string{})
+			if m == nil || m.GetGauge().GetValue() != 0 {
+				t.Fatalf("socklb conflict gauge = %v, want 0", m)
+			}
+		})
+	}
+}
+
+// No Cilium ConfigMap (no Cilium) and no linkerd namespace (no mesh)
+// both read as no-conflict — the conflict needs both sides present.
+func TestLinkerdSockLBNoCiliumNoMesh(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		linkerdNamespace(),
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("no cilium-config must pass: %+v", res)
+	}
+
+	cs = fake.NewSimpleClientset(
+		ciliumConfig(map[string]string{"bpf-lb-sock": "true"}),
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p = testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); !res.Pass {
+		t.Fatalf("no linkerd namespace must pass: %+v", res)
+	}
+}

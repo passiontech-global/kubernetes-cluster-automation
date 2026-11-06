@@ -71,9 +71,18 @@ const nodeCordonActiveMaxAge = 45 * time.Minute
 // window — does NOT count: long-cordoned nodes are an operator
 // decision (decommissioned capacity, quarantined hardware), not a
 // drain, and treating them as "maintenance in flight" freezes every
-// remediation that defers to it forever.
+// remediation that defers to it forever. Neither does a node
+// carrying AnnoPreCordonedBy: the node-hang precordon is the
+// controller's OWN defensive cordon of a degraded worker, and its
+// fresh unschedulable taint would otherwise read as a 45m operator
+// drain and lock every heal.AllowedV-gated remediation cluster-wide
+// exactly while the cluster is sick (W12 P0-1 — self-inflicted
+// maintenance lockout).
 func NodeActivelyCordoned(n *corev1.Node, now time.Time) bool {
 	if !n.Spec.Unschedulable {
+		return false
+	}
+	if n.Annotations[AnnoPreCordonedBy] != "" {
 		return false
 	}
 	for _, t := range n.Spec.Taints {

@@ -239,6 +239,66 @@ func TestLocalPVStrandedTooYoungForHeal(t *testing.T) {
 	}
 }
 
+// W12-SC2 — a NON-ephemeral workload stranded on a confirmed-dead
+// node fires the dedicated stateful gauge naming the dead node;
+// ephemeral pods stay on the generic gauge only.
+func TestLocalPVStrandedStatefulPodGauge(t *testing.T) {
+	localPVStrandedStatefulPodGauge.DeleteLabelValues("db", "pg-0", "dead-node")
+	t.Cleanup(func() {
+		localPVStrandedStatefulPodGauge.DeleteLabelValues("db", "pg-0", "dead-node")
+		localPVStrandedPodsGauge.DeleteLabelValues(
+			"db", "pg-0", "data-pg-0", "dead-node", strandedReasonMissingNode)
+	})
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		pendingPodForPVC("db", "pg-0", "data-pg-0", 30*time.Minute, base),
+		testPVC("db", "data-pg-0", "pv-1", "", corev1.ClaimBound),
+		nodePinnedPV("pv-1", "dead-node"))
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("stranded stateful pod must FAIL")
+	}
+	m := probetest.FindMetric(t, "node_automation_localpv_stranded_stateful_pod",
+		map[string]string{"namespace": "db", "pod": "pg-0", "dead_node": "dead-node"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatal("stranded_stateful_pod gauge missing/0, want 1")
+	}
+	// The data volume is never touched — pod and PVC survive.
+	if _, err := cs.CoreV1().PersistentVolumeClaims("db").
+		Get(ctx, "data-pg-0", metav1.GetOptions{}); err != nil {
+		t.Fatal("stateful PVC must never be deleted")
+	}
+	if _, err := cs.CoreV1().Pods("db").
+		Get(ctx, "pg-0", metav1.GetOptions{}); err != nil {
+		t.Fatal("stateful pod must never be deleted")
+	}
+}
+
+// An EPHEMERAL workload on a dead node does NOT fire the stateful
+// gauge — its class is covered by the heal, not the alert.
+func TestLocalPVStrandedEphemeralNoStatefulGauge(t *testing.T) {
+	t.Cleanup(func() {
+		localPVStrandedPodsGauge.DeleteLabelValues(
+			"concourse", "concourse-worker-0", "pvc-w", "dead-node", strandedReasonMissingNode)
+	})
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		pendingPodForPVC("concourse", "concourse-worker-0", "pvc-w", 30*time.Minute, base),
+		testPVC("concourse", "pvc-w", "pv-1", "", corev1.ClaimBound),
+		nodePinnedPV("pv-1", "dead-node"))
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	_ = probetest.MustCheck[*localPVStrandedCheck](t, p).Run(ctx)
+	if m := probetest.FindMetric(t, "node_automation_localpv_stranded_stateful_pod",
+		map[string]string{"namespace": "concourse", "pod": "concourse-worker-0",
+			"dead_node": "dead-node"}); m != nil {
+		t.Fatal("ephemeral pod must not fire the stateful gauge")
+	}
+}
+
 // Deliberate maintenance gates the ephemeral heal.
 func TestLocalPVStrandedMaintenanceDefers(t *testing.T) {
 	base := time.Now()

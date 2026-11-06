@@ -173,6 +173,53 @@ func TestLeaseGuardExpiredLeaseMaintenanceGate(t *testing.T) {
 	}
 }
 
+// W12-SC2 — a jump of 4 transitions inside 10m is thrashing: the
+// dedicated gauge fires and the check fails, but below the flap
+// threshold (5/15m) no unhealthy flapping series appears.
+func TestLeaseGuardThrashing(t *testing.T) {
+	controllerLeaseThrashingGauge.DeleteLabelValues("kube-system", "thrash-op")
+	t.Cleanup(func() {
+		controllerLeaseThrashingGauge.DeleteLabelValues("kube-system", "thrash-op")
+	})
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		cpLease("kube-system", "thrash-op", "a_1", time.Minute, 0, base))
+	p, ch := leaseGuardProber(cs)
+	probetest.FreezeNow(p.Deps, base)
+
+	if res := ch.Run(ctx); !res.Pass {
+		t.Fatalf("first transitions sighting must pass: %+v", res)
+	}
+
+	l, err := cs.CoordinationV1().Leases("kube-system").
+		Get(ctx, "thrash-op", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	*l.Spec.LeaseTransitions = 4
+	if _, err := cs.CoordinationV1().Leases("kube-system").
+		Update(ctx, l, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	probetest.FreezeNow(p.Deps, base.Add(8*time.Minute))
+
+	res := ch.Run(ctx)
+	if res.Pass {
+		t.Fatal("4 transitions inside 10m did not fail the check")
+	}
+	m := probetest.FindMetric(t, "node_automation_controller_lease_thrashing",
+		map[string]string{"namespace": "kube-system", "lease": "thrash-op"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("thrashing gauge = %v, want 1", m)
+	}
+	// Below the flap threshold — no flapping series.
+	if m := probetest.FindMetric(t, "node_automation_controller_lease_unhealthy",
+		map[string]string{"namespace": "kube-system",
+			"lease": "thrash-op", "reason": "flapping"}); m != nil {
+		t.Fatal("4/10m must not emit the flapping reason")
+	}
+}
+
 // A lease renewing normally (fresh renewTime) with running pods is
 // healthy — no finding, no delete.
 func TestLeaseGuardFreshLeaseNoAction(t *testing.T) {
