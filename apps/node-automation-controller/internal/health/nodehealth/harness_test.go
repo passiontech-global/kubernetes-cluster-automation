@@ -25,5 +25,8 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober 
 		NewImagePullStormCheck,
 		NewLocalPVStrandedCheck,
 		NewNamespaceTerminatingWedgedCheck,
+		NewAPIObjectSprawlReportGCCheck,
+		NewCPUStealTaintSyncCheck,
+		NewKedaScaledObjectGuardCheck,
 	)
 }

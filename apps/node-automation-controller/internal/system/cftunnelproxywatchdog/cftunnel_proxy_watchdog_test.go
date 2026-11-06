@@ -410,6 +410,20 @@ func TestCloudflaredLogsWedged(t *testing.T) {
 			"INF connection with edge established\n" +
 				"INF connection with edge registered\n" +
 				"INF connection with edge ready\n", false},
+		{"quic dial loop",
+			"ERR failed to dial to edge with quic\n" +
+				"ERR failed to dial to edge with quic\n" +
+				"ERR failed to dial to edge with quic\n", true},
+		{"quic dial single blip",
+			"ERR failed to dial to edge with quic\nINF retrying\n", false},
+		{"quic no recent network activity loop",
+			"ERR timeout: no recent network activity\n" +
+				"ERR timeout: no recent network activity\n" +
+				"ERR timeout: no recent network activity\n", true},
+		{"quic prefix loop",
+			"ERR quic: connection closed before handshake\n" +
+				"ERR quic: connection closed before handshake\n" +
+				"ERR quic: connection closed before handshake\n", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := cloudflaredLogsWedged(tc.logs); got != tc.want {

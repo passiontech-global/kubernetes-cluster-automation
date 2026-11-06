@@ -28,5 +28,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober 
 		NewPerconaQuorumCheck,
 		NewStatefulMasterlessCheck,
 		NewOlmHealthCheck,
+		NewPostgresWALArchiveGuardCheck,
+		NewScyllaCompactionSchemaGuardCheck,
 	)
 }

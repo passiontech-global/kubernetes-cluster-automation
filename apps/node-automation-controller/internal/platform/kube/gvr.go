@@ -217,4 +217,41 @@ var (
 		Group: "gateway.networking.k8s.io", Version: "v1", Resource: "httproutes"}
 	GVRGRPCRoute = schema.GroupVersionResource{
 		Group: "gateway.networking.k8s.io", Version: "v1", Resource: "grpcroutes"}
+
+	// ---------------------------------------------------------------
+	// Trivy operator report CRDs + Policy Reporter (api-object-sprawl-
+	// report-gc). The aquasecurity reports and PolicyReports pile up
+	// per ReplicaSet/Pod churn — the GC deletes ones whose owner is
+	// gone.
+	// ---------------------------------------------------------------
+	GVRVulnerabilityReport = schema.GroupVersionResource{
+		Group: "aquasecurity.github.io", Version: "v1alpha1", Resource: "vulnerabilityreports"}
+	GVRConfigAuditReport = schema.GroupVersionResource{
+		Group: "aquasecurity.github.io", Version: "v1alpha1", Resource: "configauditreports"}
+	GVRExposedSecretReport = schema.GroupVersionResource{
+		Group: "aquasecurity.github.io", Version: "v1alpha1", Resource: "exposedsecretreports"}
+	GVREphemeralReport = schema.GroupVersionResource{
+		Group: "aquasecurity.github.io", Version: "v1alpha1", Resource: "ephemeralreports"}
+	GVRPolicyReport = schema.GroupVersionResource{
+		Group: "wgpolicyk8s.io", Version: "v1alpha2", Resource: "policyreports"}
+
+	// ---------------------------------------------------------------
+	// Liqo multi-cluster networking (liqo-tunnel-health) + CiliumNode
+	// (cilium-missing-endpoint node census).
+	// ---------------------------------------------------------------
+	GVRLiqoConnection = schema.GroupVersionResource{
+		Group: "networking.liqo.io", Version: "v1beta1", Resource: "connections"}
+	GVRLiqoGatewayClient = schema.GroupVersionResource{
+		Group: "networking.liqo.io", Version: "v1beta1", Resource: "gatewayclients"}
+	GVRLiqoGatewayServer = schema.GroupVersionResource{
+		Group: "networking.liqo.io", Version: "v1beta1", Resource: "gatewayservers"}
+	GVRCiliumNode = schema.GroupVersionResource{
+		Group: "cilium.io", Version: "v2", Resource: "ciliumnodes"}
+
+	// ---------------------------------------------------------------
+	// CloudNativePG (postgres-wal-archive-guard — complements the
+	// Percona/Everest GVRs above).
+	// ---------------------------------------------------------------
+	GVRCNPGCluster = schema.GroupVersionResource{
+		Group: "postgresql.cnpg.io", Version: "v1", Resource: "clusters"}
 )

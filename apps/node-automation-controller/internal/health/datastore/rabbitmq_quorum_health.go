@@ -88,12 +88,23 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
+	// A RabbitmqCluster the go-kube-downscaler parked at
+	// spec.replicas:0 is asleep on purpose — its members' absence
+	// and any lingering alarm series are intent, not a quorum
+	// failure. A list failure fails open (empty set): the pod
+	// signatures keep their normal posture.
+	downscaled, err := downscaledClusterCRs(ctx, p.Dyn, kube.GVRRabbitMQCluster)
+	if err != nil {
+		log.Info("WARN: list rabbitmqclusters failed — downscaler awareness off",
+			"error", err)
+	}
 	rabbitByName := map[string]*corev1.Pod{}
 	rabbitByPodName := map[string]*corev1.Pod{}
 	rabbitByNS := map[string][]*corev1.Pod{}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if !isRabbitMQPod(pod) {
+		if !isRabbitMQPod(pod) ||
+			downscaledMemberPod(pod.Namespace, pod.Name, downscaled) {
 			continue
 		}
 		rabbitByName[pod.Namespace+"/"+pod.Name] = pod
@@ -124,6 +135,10 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 				if pod := rabbitByPodName[podName]; pod != nil {
 					ns = pod.Namespace
 				}
+			}
+			if podName != "" &&
+				downscaledMemberPod(ns, podName, downscaled) {
+				continue // parked cluster — stale series, not quorum evidence
 			}
 			key := ns + "/" + podName
 			if podName == "" {
