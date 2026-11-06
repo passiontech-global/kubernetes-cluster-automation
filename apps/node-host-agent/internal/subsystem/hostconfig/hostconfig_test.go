@@ -70,8 +70,8 @@ func TestAtomicWriteIdempotent(t *testing.T) {
 	if sha256.Sum256(b) != sha256.Sum256([]byte("world")) {
 		t.Fatal("bad hash")
 	}
-	// tmp file must not linger
-	if _, err := os.Stat(filepath.Join(r.cfg.HostRoot, "etc/test.conf.hostconfig.tmp")); !os.IsNotExist(err) {
+	// tmp file must not linger (converge.Host's staging suffix)
+	if _, err := os.Stat(filepath.Join(r.cfg.HostRoot, "etc/test.conf.converge.tmp")); !os.IsNotExist(err) {
 		t.Fatal("tmp file lingered")
 	}
 }

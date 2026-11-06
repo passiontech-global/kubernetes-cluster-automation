@@ -1,24 +1,19 @@
 // cycle.go — Cycle orchestration (Cycle/CycleWithErrors), the per-cycle
-// cyc context, and the helpers shared across converge groups.
+// cyc context, and the helpers shared across converge groups. The
+// generic mechanisms live in platform/converge — the helpers here are
+// thin delegates keeping the group_*.go call sites (and their tests)
+// on their original names.
 package hostconfig
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
-	"crypto/sha256"
 	"embed"
-	"encoding/hex"
+	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"path/filepath"
-	"regexp"
-	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/converge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
@@ -185,89 +180,66 @@ func fileExistsNoRoot(p string) bool {
 	return err == nil
 }
 
+// hostOps adapts the Reconciler to converge.Ops — the seam
+// converge.Deploy/NftUnit drive. Every method routes through the
+// metric + noteErr-carrying wrappers so a deploy's writes, removes,
+// checks, and systemctl calls attribute exactly like the
+// pre-extraction code.
+type hostOps struct{ r *Reconciler }
+
+func (o hostOps) Join(p string) string { return o.r.hp(p) }
+
+func (o hostOps) WriteManaged(p string, b []byte, m os.FileMode) (bool, error) {
+	return o.r.writeManaged(p, b, m)
+}
+
+func (o hostOps) RemoveManaged(p string) (bool, error) { return o.r.removeManaged(p) }
+
+func (o hostOps) Run(ctx context.Context, name string, args ...string) (string, error) {
+	return o.r.run(ctx, name, args...)
+}
+
+func (o hostOps) DaemonReload(ctx context.Context)            { o.r.daemonReload(ctx) }
+func (o hostOps) EnableService(ctx context.Context, u string) { o.r.enableService(ctx, u) }
+func (o hostOps) StartService(ctx context.Context, u string)  { o.r.startService(ctx, u) }
+func (o hostOps) RestartService(ctx context.Context, u string) {
+	o.r.restartService(ctx, u)
+}
+
+func (r *Reconciler) ops() converge.Ops { return hostOps{r} }
+
 // checkedDeploy is the candidate-staging validate-then-promote half
-// of applyNftUnit, shared by the haproxy/nft deploys in groupAPILB:
-// content is written to path+".candidate", the check command runs
-// against the CANDIDATE (its name appended to check argv), and only a
-// passing candidate is promoted to path via writeManaged — a bad
-// render therefore never sits at the live path where the unit loads
-// it on next start. The candidate is swept on every outcome.
-//
-// An unchanged file skips staging entirely (it was validated the
-// cycle it was promoted) but still sweeps a stale candidate a crashed
-// converge left behind.
+// of applyNftUnit, shared by the haproxy/nft deploys in groupAPILB —
+// the mechanism is converge.Deploy; this wrapper preserves the old
+// (changed, ok) contract and the errMsg-attributed check failure.
 //
 // Returns (changed, ok): ok=false means the stage write or check
-// failed — already counted (writeManaged's noteErr or the counted
-// c.err here carrying errMsg) and the caller must abort the deploy.
+// failed — already counted (writeManaged's noteErr via
+// ErrManagedWrite, or the counted c.err here carrying errMsg) and
+// the caller must abort the deploy.
 func (c *cyc) checkedDeploy(path string, content []byte, mode os.FileMode, errMsg string, check ...string) (changed, ok bool) {
-	r, ctx := c.r, c.ctx
-	changed = true
-	if old, err := os.ReadFile(r.hp(path)); err == nil &&
-		sha256.Sum256(old) == sha256.Sum256(content) {
-		changed = false
-	}
-	if !changed {
-		// Cheap sweep, ENOENT ignored — a candidate orphaned between
-		// stage and promote must not linger next to the live file.
-		if err := os.Remove(r.hp(path + ".candidate")); err != nil && !os.IsNotExist(err) {
-			logger().Warn("hostconfig: stale candidate sweep failed",
-				"path", path+".candidate", "error", err)
+	changed, err := converge.Deploy(c.ctx, c.r.ops(), path, content, mode, check...)
+	if err != nil {
+		// A managed-write failure was already attributed inside
+		// writeManaged's noteErr — counting it again here would
+		// double the cycle's error total.
+		if !errors.Is(err, converge.ErrManagedWrite) {
+			c.err(errMsg, "path", path, "error", err)
 		}
-		return false, true
-	}
-	cand := path + ".candidate"
-	if _, err := r.writeManaged(cand, content, mode); err != nil {
-		return false, false // writeManaged counted the failure via noteErr
-	}
-	if out, err := r.run(ctx, check[0], append(check[1:], cand)...); err != nil {
-		c.err(errMsg,
-			"path", path, "candidate", cand,
-			"check", strings.Join(check, " "), "out", out, "error", err)
-		_, _ = r.removeManaged(cand)
 		return false, false
 	}
-	changed, _ = r.writeManaged(path, content, mode)
-	_, _ = r.removeManaged(cand)
 	return changed, true
 }
 
 // applyNftUnit deploys an nft ruleset + its oneshot boot unit, applies
-// via restart when the file changed (T4/T11 pattern).
+// via restart when the file changed (T4/T11 pattern). converge.NftUnit
+// owns the stage→validate→promote→unit choreography; failures that
+// were not already attributed inside a managed write count here.
 func (c *cyc) applyNftUnit(name, path string, content []byte, desc string) {
-	r, ctx := c.r, c.ctx
-	// `nft -c` runs on the CANDIDATE — writeManaged must only ever
-	// land a validated ruleset at the deploy path, or a broken render
-	// would persist where the oneshot unit loads it at boot.
-	ch, ok := c.checkedDeploy(path, content, 0o644,
-		"nft ruleset failed nft -c — deploy path keeps the last good file",
-		"nft", "-c", "-f")
-	if !ok {
-		return
-	}
-	unitPath := "/etc/systemd/system/" + name + ".service"
-	uch, _ := r.writeManaged(unitPath, []byte(fmt.Sprintf(`[Unit]
-Description=%s
-After=network-pre.target
-Wants=network-pre.target
-Before=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/sbin/nft -f %s
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-`, desc, path)), 0o644)
-	if ch || uch {
-		r.daemonReload(ctx)
-	}
-	r.enableService(ctx, name+".service")
-	if ch {
-		r.restartService(ctx, name+".service")
-	} else {
-		r.startService(ctx, name+".service")
+	if err := converge.NftUnit(c.ctx, c.r.ops(), name, path, content, desc); err != nil &&
+		!errors.Is(err, converge.ErrManagedWrite) {
+		c.err("hostconfig: nft ruleset failed nft -c — deploy path keeps the last good file",
+			"unit", name, "path", path, "error", err)
 	}
 }
 
@@ -391,14 +363,7 @@ func topologyPlain(v any) any {
 
 // sha256FileOK verifies a staged/downloaded archive against its pin.
 func sha256FileOK(path, wantHex string) bool {
-	if wantHex == "" {
-		return true
-	}
-	sum, err := pagecache.Sha256File(path)
-	if err != nil {
-		return false
-	}
-	return strings.EqualFold(sum, wantHex)
+	return converge.Sha256FileOK(path, wantHex)
 }
 
 func (c *cyc) markerBase() string {
@@ -418,59 +383,15 @@ func nodeIPStr(m *topology.OMap, key string) string {
 	return s
 }
 
-func defStr(v, d string) string {
-	if v == "" || v == "None" {
-		return d
-	}
-	return v
-}
+func defStr(v, d string) string { return converge.DefStr(v, d) }
 
-func containsSS(l []string, s string) bool {
-	for _, x := range l {
-		if x == s {
-			return true
-		}
-	}
-	return false
-}
+func containsSS(l []string, s string) bool { return converge.ContainsSS(l, s) }
 
 // lineInFile is ansible lineinfile parity: replace the LAST line
 // matching re with line; when absent insert after the last line
 // matching insAfter (or append at EOF).
 func lineInFile(s, re, line, insAfter string) string {
-	rex := regexp.MustCompile(re)
-	if loc := findLastMatch(rex, s); loc != nil {
-		nl := strings.IndexByte(s[loc[0]:], '\n')
-		end := len(s)
-		if nl >= 0 {
-			end = loc[0] + nl + 1
-		}
-		if !strings.HasSuffix(line, "\n") {
-			line += "\n"
-		}
-		return s[:loc[0]] + line + s[end:]
-	}
-	if insAfter != "" {
-		ia := regexp.MustCompile(insAfter)
-		if loc := findLastMatch(ia, s); loc != nil {
-			nl := strings.IndexByte(s[loc[0]:], '\n')
-			end := loc[0] + nl + 1
-			if nl < 0 {
-				end = len(s)
-				return s[:end] + "\n" + line + "\n"
-			}
-			return s[:end] + line + "\n" + s[end:]
-		}
-	}
-	return s + line + "\n"
-}
-
-func findLastMatch(re *regexp.Regexp, s string) []int {
-	var last []int
-	for _, loc := range re.FindAllStringIndex(s, -1) {
-		last = loc
-	}
-	return last
+	return converge.LineInFile(s, re, line, insAfter)
 }
 
 // ---------- download helpers ----------
@@ -478,117 +399,17 @@ func findLastMatch(re *regexp.Regexp, s string) []int {
 // download fetches url to dst under the Config.HTTPTimeout client
 // deadline (nebula/coredns/etcdctl tarballs, haproxy + kine deb/bin).
 func (r *Reconciler) download(ctx context.Context, url, dst, wantSHA256 string) error {
-	return downloadFile(ctx, url, dst, wantSHA256, r.cfg.HTTPTimeout)
+	return converge.DownloadFile(ctx, url, dst, wantSHA256, r.cfg.HTTPTimeout)
 }
 
-// downloadFile streams url to dst atomically: tmp file + sha256
-// verify + fsync + rename, partial tmp swept on every failure path.
+// downloadFile streams url to dst atomically under an explicit client
+// deadline (nexpDownload floors the timeout above HTTPTimeout).
 func downloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time.Duration) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := (&http.Client{Timeout: timeout}).Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	tmp := dst + ".dl"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	h := sha256.New()
-	_, err = io.Copy(io.MultiWriter(f, h), resp.Body)
-	if err == nil {
-		// fsync before rename — the staged artifact must be durable;
-		// Close's error counts too (NFS/delayed-write failures only
-		// surface there). Drop the just-written pages after Sync —
-		// archives are staged for untarInstall/sha256FileOK, not for
-		// serving, and their cache would pin the pod's cgroup charge.
-		if err = f.Sync(); err == nil {
-			pagecache.Drop(f)
-		}
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if wantSHA256 != "" && !strings.EqualFold(wantSHA256, hex.EncodeToString(h.Sum(nil))) {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("download %s: sha256 mismatch", url)
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return converge.DownloadFile(ctx, url, dst, wantSHA256, timeout)
 }
 
 // untarInstall extracts member name from a .tar.gz and atomically
 // installs to dst.
 func untarInstall(tgz, member, dst string, mode os.FileMode) error {
-	f, err := os.Open(tgz)
-	if err != nil {
-		return err
-	}
-	// Drop the archive's read-behind pages on the way out — the tgz
-	// is only scanned once per install.
-	defer func() { pagecache.Drop(f); _ = f.Close() }()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = gz.Close() }()
-	tr := tar.NewReader(gz)
-	for {
-		hd, err := tr.Next()
-		if err != nil {
-			return fmt.Errorf("%s not found in %s", member, tgz)
-		}
-		if filepath.Base(hd.Name) == member {
-			tmp := dst + ".tmp"
-			out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-			if err != nil {
-				return err
-			}
-			_, err = io.Copy(out, tr)
-			if err == nil {
-				// fsync before rename (writeManaged parity) — a
-				// crash after rename must never expose a zeroed
-				// binary at the install path. Then drop the staged
-				// pages: a freshly installed binary's cache charge
-				// belongs to whoever execs it, not to this pod's
-				// working set.
-				if err = out.Sync(); err == nil {
-					pagecache.Drop(out)
-				}
-			}
-			// Close's error counts too — delayed-write failures only
-			// surface there.
-			if cerr := out.Close(); err == nil {
-				err = cerr
-			}
-			if err != nil {
-				// sweep the partial tmp — a truncated member must not
-				// linger next to the live binary.
-				_ = os.Remove(tmp)
-				return err
-			}
-			if err := os.Rename(tmp, dst); err != nil {
-				_ = os.Remove(tmp)
-				return err
-			}
-			return nil
-		}
-	}
+	return converge.UntarInstall(tgz, member, dst, mode)
 }
