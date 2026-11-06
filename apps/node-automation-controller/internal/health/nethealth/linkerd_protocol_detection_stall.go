@@ -39,6 +39,10 @@ type linkerdProtocolDetectionStallCheck struct {
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1 (zero value usable; the serial sweep needs no lock).
 	emitted state.GaugeLedger[string]
+	// verdict memoizes the maintenance-mutex evaluation the
+	// per-pod heal preambles share — one evaluation per VerdictTTL
+	// instead of three API reads per violating pod.
+	verdict kube.Verdict
 }
 
 // newLinkerdProtocolDetectionStallCheck builds the W10-NM3 check —
@@ -219,8 +223,8 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 	log logr.Logger, pod *corev1.Pod, missing []int, now time.Time) {
 
 	ck := "selfheal/" + CheckNameLinkerdOpaqueStall + "/" + pod.Namespace + "/" + pod.Name
-	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
-		&p.Heals, ck, linkerdOpaqueHealCool, now)
+	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+		p.CS, p.Dyn, &p.Heals, ck, linkerdOpaqueHealCool, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return
@@ -436,12 +440,8 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdPodAnno(ctx context.Con
 	if !changed {
 		return
 	}
-	payload, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{
-			"annotations": map[string]string{
-				linkerdOpaquePortsAnno: portSetString(set),
-			},
-		},
+	payload, err := kube.MergePatchAnnos(map[string]any{
+		linkerdOpaquePortsAnno: portSetString(set),
 	})
 	if err != nil {
 		return

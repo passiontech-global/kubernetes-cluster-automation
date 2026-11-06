@@ -60,6 +60,10 @@ type statefulMasterlessCheck struct {
 	drHealed       state.CooldownSet
 	drPodHealed    state.CooldownSet
 	drOpHealAt     time.Time
+	// verdict memoizes the maintenance-mutex evaluation the
+	// per-target heal preambles share — one evaluation per
+	// VerdictTTL instead of three API reads per masterless service.
+	verdict kube.Verdict
 }
 
 // newStatefulMasterlessCheck builds the W6.2 check — the ledgers
@@ -217,13 +221,15 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 		p.stsZeroEmitted = map[string]bool{}
 	}
 
-	stsList, err := p.CS.AppsV1().StatefulSets(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	stsList, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: probefw.HealthListPageSize},
+		kube.StatefulSets(p.CS, metav1.NamespaceAll))
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list statefulsets: %w", err)}
 	}
-	svcList, err := p.CS.CoreV1().Services(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	svcList, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: probefw.HealthListPageSize},
+		kube.Services(p.CS, metav1.NamespaceAll))
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list services: %w", err)}
 	}
@@ -257,8 +263,8 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	// Candidates: a ready STS paired with a master-role Service
 	// routing to its pods.
 	var candidates []masterSvc
-	for i := range stsList.Items {
-		sts := &stsList.Items[i]
+	for i := range stsList {
+		sts := &stsList[i]
 		// A StatefulSet the go-kube-downscaler parked at
 		// spec.replicas:0 (downscaler/* annotations present) is
 		// asleep on purpose — its master Service reading 0 ready
@@ -269,8 +275,8 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 		if sts.Status.ReadyReplicas == 0 {
 			continue
 		}
-		for j := range svcList.Items {
-			svc := &svcList.Items[j]
+		for j := range svcList {
+			svc := &svcList[j]
 			if svc.Namespace != sts.Namespace ||
 				svc.Spec.ClusterIP == "" ||
 				svc.Spec.ClusterIP == corev1.ClusterIPNone {

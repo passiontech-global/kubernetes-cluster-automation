@@ -39,6 +39,10 @@ type ciliumNodeIPAMExhaustionCheck struct {
 	// stale value (zero value usable; the serial sweep needs no
 	// lock).
 	emitted state.GaugeLedger[string]
+	// verdict memoizes the maintenance-mutex evaluation the
+	// per-node reap preambles share — one evaluation per VerdictTTL
+	// instead of three API reads per exhausted node.
+	verdict kube.Verdict
 }
 
 // newCiliumNodeIPAMExhaustionCheck builds the W10-NM6 check — its
@@ -228,8 +232,8 @@ func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Conte
 	log logr.Logger, node string, now time.Time) {
 
 	ck := "selfheal/" + CheckNameCiliumNodeIPAM + "/reap/" + node
-	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
-		&p.Heals, ck, ciliumIPAMNodeCool, now)
+	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+		p.CS, p.Dyn, &p.Heals, ck, ciliumIPAMNodeCool, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
 		return

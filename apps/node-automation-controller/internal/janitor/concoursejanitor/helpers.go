@@ -6,13 +6,14 @@ package concoursejanitor
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // atcCredentials reads the break-glass local user from the
@@ -45,10 +46,8 @@ func (j *concourseWorkdirJanitor) atcCredentials(ctx context.Context) (string, s
 func (j *concourseWorkdirJanitor) annotateBaseline(ctx context.Context, pod string, nodefsGiB int64) error {
 	cctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
 	defer cancel()
-	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]string{
-			cjBaselineAnno: strconv.FormatInt(nodefsGiB, 10),
-		}},
+	patch, err := kube.MergePatchAnnos(map[string]any{
+		cjBaselineAnno: strconv.FormatInt(nodefsGiB, 10),
 	})
 	if err != nil {
 		return err
