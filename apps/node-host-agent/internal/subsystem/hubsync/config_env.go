@@ -3,20 +3,22 @@ package hubsync
 import (
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // EnvDeps carries the non-env inputs ConfigFromEnv needs — the values
-// cmd/agent used to splice into Config directly: the shared lazily-
-// built kube clientset (its csOnce — serves the Lease and the
-// api-backend-guard token Secret), the lease-holder identity
-// (POD_NAME), the shared vars dir, and the already-resolved local
-// binary path (resolveLocalBinary stays in cmd/agent — it stats
-// os.Executable).
+// cmd/agent used to splice into Config directly. It embeds the shared
+// hostctx.Deps watchdog/host-context bundle (only the shared vars dir
+// promotes out of it); the named fields are the hubsync-only inputs:
+// the shared lazily-built kube clientset (its csOnce — serves the
+// Lease and the api-backend-guard token Secret), the lease-holder
+// identity (POD_NAME), and the already-resolved local binary path
+// (resolveLocalBinary stays in cmd/agent — it stats os.Executable).
 type EnvDeps struct {
+	hostctx.Deps
 	Client      kubernetes.Interface
 	Identity    string
-	VarsDir     string
 	LocalBinary string
 }
 
