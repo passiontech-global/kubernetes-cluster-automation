@@ -77,7 +77,7 @@ knobs (always-on, no gates).
 | `CERT_DRIFT_AUDITOR_ENABLED` | cert-drift-auditor | on unless `"false"` | Registration gate — audits cert/secret drift. |
 | `VELERO_BACKUP_AUDITOR_ENABLED` | velero-backup-auditor | on unless `"false"` | Registration gate — audits Velero backup health. |
 | `HELM_STALL_UNWEDGE_ENABLED` | helmrelease-unlocker | off unless `"true"` | Sub-feature gate — gates ONLY the stalled-rollout unwedge pass; pending-secret unlock and artifact-source healing always run. |
-| `EXTERNALSECRET_NUDGE_ENABLED` | externalsecret-nudge | off unless `"true"` | Sub-feature gate — off = the 10m sweep logs "skip" and returns (keeps the queue uniform across clusters without ESO). |
+| `EXTERNALSECRET_NUDGE_ENABLED` | externalsecret-nudge | off unless `"true"` | Registration gate — nudges stuck ExternalSecrets; off = module registers nothing (for clusters without ESO). |
 
 `helmrelease-unlocker` itself has no registration gate (always-on).
 

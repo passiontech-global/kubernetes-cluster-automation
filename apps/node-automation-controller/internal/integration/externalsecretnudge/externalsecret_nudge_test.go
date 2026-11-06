@@ -28,36 +28,27 @@ import (
 // ---------------------------------------------------------------------------
 
 func cssObj(name, ready string) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "external-secrets.io/v1",
-		"kind":       "ClusterSecretStore",
-		"metadata":   map[string]any{"name": name},
-		"status": map[string]any{
+	return testutil.Unstructured(
+		kube.GVRClusterSecretStoreV1.GroupVersion().WithKind("ClusterSecretStore"),
+		"", name, map[string]any{"status": map[string]any{
 			"conditions": []any{map[string]any{
 				"type":               "Ready",
 				"status":             ready,
 				"lastTransitionTime": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
 			}},
-		},
-	}}
+		}})
 }
 
 func esObj(ns, name, ready string, failingFor time.Duration) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "external-secrets.io/v1",
-		"kind":       "ExternalSecret",
-		"metadata": map[string]any{
-			"namespace": ns,
-			"name":      name,
-		},
-		"status": map[string]any{
+	return testutil.Unstructured(
+		kube.GVRExternalSecretV1.GroupVersion().WithKind("ExternalSecret"),
+		ns, name, map[string]any{"status": map[string]any{
 			"conditions": []any{map[string]any{
 				"type":               "Ready",
 				"status":             ready,
 				"lastTransitionTime": time.Now().Add(-failingFor).UTC().Format(time.RFC3339),
 			}},
-		},
-	}}
+		}})
 }
 
 // esStoreRef points the ES's spec.secretStoreRef at a store — the
@@ -395,11 +386,9 @@ func TestExternalSecretNudgeNudgedCooldown(t *testing.T) {
 // The unstructured Ready-condition helpers must tolerate absent and
 // malformed shapes (real objects in the wild are inconsistent).
 func TestReadyConditionHelpersEdgeCases(t *testing.T) {
-	bare := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "external-secrets.io/v1",
-		"kind":       "ExternalSecret",
-		"metadata":   map[string]any{"name": "bare"},
-	}}
+	bare := testutil.Unstructured(
+		kube.GVRExternalSecretV1.GroupVersion().WithKind("ExternalSecret"),
+		"", "bare", nil)
 	if c, ok := kube.ConditionOf(bare.Object, "Ready"); ok || c.Status != "" || c.Message != "" {
 		t.Fatalf("ConditionOf on condition-less object = %v,%q,%q", ok, c.Status, c.Message)
 	}
@@ -603,18 +592,7 @@ func TestExternalSecretNudgePersistedCooldown(t *testing.T) {
 // autopilot Plan GVR kube.MaintenanceActive lists — without the
 // latter the maintenance mutex panics inside the fake.
 func esNudgeDynFake(objs ...runtime.Object) *fake.FakeDynamicClient {
-	kinds := map[schema.GroupVersionResource]string{}
-	for _, gvr := range clusterSecretStoreGVRs {
-		kinds[gvr] = "ClusterSecretStoreList"
-	}
-	for _, gvr := range secretStoreGVRs {
-		kinds[gvr] = "SecretStoreList"
-	}
-	for _, gvr := range externalSecretGVRs {
-		kinds[gvr] = "ExternalSecretList"
-	}
-	kinds[kube.AutopilotPlanGVR] = "PlanList"
-	return testutil.NewFakeDyn(kinds, objs...)
+	return testutil.NewDynamicClient(objs...)
 }
 
 // A mass ExternalSecret failure (>=5 failing AND >=half the fleet)

@@ -15,6 +15,8 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // kedaObj builds a ScaledObject CR targeting `target` with the given
@@ -22,17 +24,12 @@ import (
 func kedaObj(ns, name, target string, minReplicas int64,
 	ready, active string) *unstructured.Unstructured {
 
-	obj := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "keda.sh/v1alpha1",
-		"kind":       "ScaledObject",
-		"metadata": map[string]any{
-			"namespace": ns, "name": name,
-		},
-		"spec": map[string]any{
+	obj := testutil.Unstructured(
+		kube.GVRKedaScaledObject.GroupVersion().WithKind("ScaledObject"), ns, name,
+		map[string]any{"spec": map[string]any{
 			"scaleTargetRef":  map[string]any{"name": target},
 			"minReplicaCount": minReplicas,
-		},
-	}}
+		}})
 	var conds []any
 	if ready != "" {
 		conds = append(conds, map[string]any{

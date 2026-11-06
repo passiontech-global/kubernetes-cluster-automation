@@ -28,27 +28,13 @@ import (
 // ---------------------------------------------------------------------------
 
 func newDynFake(objs ...runtime.Object) *fake.FakeDynamicClient {
-	return testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		helmReleaseGVRs[0]:               "HelmReleaseList",
-		helmReleaseGVRs[1]:               "HelmReleaseList",
-		fluxKustomizationGVR:             "KustomizationList",
-		fluxSourceGVRs["HelmChart"]:      "HelmChartList",
-		fluxSourceGVRs["GitRepository"]:  "GitRepositoryList",
-		fluxSourceGVRs["HelmRepository"]: "HelmRepositoryList",
-		fluxSourceGVRs["OCIRepository"]:  "OCIRepositoryList",
-		fluxSourceGVRs["Bucket"]:         "BucketList",
-	}, objs...)
+	return testutil.NewDynamicClient(objs...)
 }
 
 func hrObj(ns, name, version string) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "helm.toolkit.fluxcd.io/" + version,
-		"kind":       "HelmRelease",
-		"metadata": map[string]any{
-			"namespace": ns,
-			"name":      name,
-		},
-	}}
+	return testutil.Unstructured(
+		schema.FromAPIVersionAndKind("helm.toolkit.fluxcd.io/"+version, "HelmRelease"),
+		ns, name, nil)
 }
 
 func hrReady(u *unstructured.Unstructured, status, msg string) {
@@ -882,11 +868,8 @@ func TestJobFailedCondition(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func fluxSourceObj(kind, apiVersion, ns, name string) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": apiVersion,
-		"kind":       kind,
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-	}}
+	return testutil.Unstructured(
+		schema.FromAPIVersionAndKind(apiVersion, kind), ns, name, nil)
 }
 
 func hrChartRef(hr *unstructured.Unstructured, kind, ns, name string) {
@@ -903,11 +886,8 @@ func hrChartRef(hr *unstructured.Unstructured, kind, ns, name string) {
 }
 
 func ksObj(ns, name string, staleMsg string, failingFor time.Duration) *unstructured.Unstructured {
-	k := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "kustomize.toolkit.fluxcd.io/v1",
-		"kind":       "Kustomization",
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-	}}
+	k := testutil.Unstructured(
+		fluxKustomizationGVR.GroupVersion().WithKind("Kustomization"), ns, name, nil)
 	hrReady(k, "False", staleMsg)
 	k.Object["status"].(map[string]any)["conditions"].([]any)[0].(map[string]any)["lastTransitionTime"] = time.Now().Add(-failingFor).UTC().Format(time.RFC3339)
 	return k

@@ -55,7 +55,7 @@ const (
 // ---------------------------------------------------------------------------
 
 // opStuckResource binds a watched CRD GVR to its stall signature: the
-// reason label reported on OperatorWorkqueueFrozen and the predicate
+// reason label reported on operatorWorkqueueFrozenGauge and the predicate
 // deciding whether one object counts as unreconciled. owns optionally
 // filters stuck objects down to those this operator is actually
 // responsible for — required on resource types shared by several

@@ -463,18 +463,13 @@ func fjjBuildRun(ns, name, succeeded string, completedAgo time.Duration) *unstru
 			"status": succeeded,
 		}}
 	}
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "shipwright.io/v1beta1",
-		"kind":       "BuildRun",
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-		"status":     status,
-	}}
+	return testutil.Unstructured(
+		buildRunGVR.GroupVersion().WithKind("BuildRun"), ns, name,
+		map[string]any{"status": status})
 }
 
 func fjjDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		buildRunGVR: "BuildRunList",
-	}, objs...)
+	return testutil.NewDynamicClient(objs...)
 }
 
 func fjjBuildRunExists(t *testing.T, dyn *dynamicfake.FakeDynamicClient, ns, name string) bool {

@@ -19,7 +19,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -28,10 +27,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestArgoCDAppStuckSkipsWhenCRDAbsent(t *testing.T) {
-	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		argocdAppGVR:          "ApplicationList",
-		kube.AutopilotPlanGVR: "PlanList",
-	})
+	dyn := testutil.NewDynamicClient()
 	dyn.PrependReactor("list", "applications",
 		func(action ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewNotFound(
@@ -46,20 +42,17 @@ func TestArgoCDAppStuckSkipsWhenCRDAbsent(t *testing.T) {
 
 func TestArgoCDAppStuckProgressingRefreshPatch(t *testing.T) {
 	app := argoCDApplication("argocd", "my-app", "Progressing")
-	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		argocdAppGVR:          "ApplicationList",
-		kube.AutopilotPlanGVR: "PlanList",
-	}, app)
+	dyn := testutil.NewDynamicClient(app)
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, dyn)
 	base := time.Now()
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 
 	// First sighting stamps the first-seen ledger — still inside 45m.
 	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("young Progressing app must pass: %+v", res)
 	}
-	base = base.Add(50 * time.Minute)
+	probetest.FreezeNow(p.Deps, base.Add(50*time.Minute))
 	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatalf("Progressing >45m must fail: %+v", res)
@@ -91,10 +84,7 @@ func TestArgoCDAppStuckSkipsDownscaledWorkload(t *testing.T) {
 			"health":    map[string]any{"status": "Suspended"},
 		},
 	}
-	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		argocdAppGVR:          "ApplicationList",
-		kube.AutopilotPlanGVR: "PlanList",
-	}, app)
+	dyn := testutil.NewDynamicClient(app)
 	zero := int32(0)
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -106,12 +96,12 @@ func TestArgoCDAppStuckSkipsDownscaledWorkload(t *testing.T) {
 	cs := fake.NewSimpleClientset(dep)
 	p := testProberDyn(cs, dyn)
 	base := time.Now()
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 
 	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("downscaled-only app must pass: %+v", res)
 	}
-	base = base.Add(50 * time.Minute)
+	probetest.FreezeNow(p.Deps, base.Add(50*time.Minute))
 	if res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("downscaled-only app must still pass past the window: %+v", res)
 	}
@@ -138,10 +128,7 @@ func TestArgoCDAppStuckZeroReplicaNoAnnotationStillFlags(t *testing.T) {
 			"health":    map[string]any{"status": "Suspended"},
 		},
 	}
-	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		argocdAppGVR:          "ApplicationList",
-		kube.AutopilotPlanGVR: "PlanList",
-	}, app)
+	dyn := testutil.NewDynamicClient(app)
 	zero := int32(0)
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "web", Name: "frontend"},
@@ -150,10 +137,10 @@ func TestArgoCDAppStuckZeroReplicaNoAnnotationStillFlags(t *testing.T) {
 	cs := fake.NewSimpleClientset(dep)
 	p := testProberDyn(cs, dyn)
 	base := time.Now()
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 
 	probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
-	base = base.Add(50 * time.Minute)
+	probetest.FreezeNow(p.Deps, base.Add(50*time.Minute))
 	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatalf("unexplained replicas:0 must still flag: %+v", res)
@@ -174,10 +161,7 @@ func TestArgoCDComparisonErrorsRestartOldestRepoServer(t *testing.T) {
 	}
 	appA := argoCDApplication("argocd", "app-a", "", cond())
 	appB := argoCDApplication("argocd", "app-b", "", cond())
-	dyn := testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		argocdAppGVR:          "ApplicationList",
-		kube.AutopilotPlanGVR: "PlanList",
-	}, appA, appB)
+	dyn := testutil.NewDynamicClient(appA, appB)
 
 	older := probetest.PodWithPhase("argocd", "argocd-repo-server-0", corev1.PodRunning, true, 2*time.Hour)
 	older.Labels = map[string]string{"app.kubernetes.io/name": "argocd-repo-server"}

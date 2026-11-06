@@ -14,24 +14,22 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // cnpgCluster builds a CNPG Cluster CR carrying a
 // ContinuousArchiving=False condition transitioned `age` ago.
 func cnpgCluster(ns, name string, age time.Duration) *unstructured.Unstructured {
-	obj := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "postgresql.cnpg.io/v1",
-		"kind":       "Cluster",
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-		"status": map[string]any{
+	obj := testutil.Unstructured(
+		kube.GVRCNPGCluster.GroupVersion().WithKind("Cluster"), ns, name,
+		map[string]any{"status": map[string]any{
 			"conditions": []any{map[string]any{
 				"type":   "ContinuousArchiving",
 				"status": "False",
 				"lastTransitionTime": time.Now().
 					Add(-age).UTC().Format(time.RFC3339)}},
-		},
-	}}
+		}})
 	obj.SetUID(types.UID("uid-" + ns + "-" + name))
 	return obj
 }

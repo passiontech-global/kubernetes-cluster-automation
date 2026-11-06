@@ -18,11 +18,13 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/prometheus/client_golang/prometheus"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 const (
@@ -36,6 +38,21 @@ const (
 	// the cooldown.
 	operatorHealAnno = kube.AnnoLastOperatorHeal
 )
+
+var (
+	// W5.8 — stuck-operator leader pods deleted to force
+	// re-election, by detected stall reason. Counts delivered heals
+	// only (the counter increments after a delete landed).
+	operatorWorkqueueHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "node_automation_operator_workqueue_heals_total",
+		Help: "Stuck operator leader pods deleted to force re-election, by detected stall reason.",
+	}, []string{"operator", "reason"})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		operatorWorkqueueHealsTotal)
+}
 
 // healOperatorLeader deletes the stuck operator's leader pod to force
 // re-election — the same unsticking nudge a manual
@@ -112,7 +129,7 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 		return
 	}
 	for _, r := range reasons {
-		metrics.OperatorWorkqueueHealsTotal.WithLabelValues(op.name, r).Inc()
+		operatorWorkqueueHealsTotal.WithLabelValues(op.name, r).Inc()
 	}
 	// The pod delete already landed — stamp the in-RAM half
 	// unconditionally so a failed anno patch cannot un-suppress a

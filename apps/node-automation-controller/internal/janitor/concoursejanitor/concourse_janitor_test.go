@@ -128,12 +128,9 @@ func cjPlanDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 
 // cjAutopilotPlan builds a Plan CR in `state`.
 func cjAutopilotPlan(name, state string) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "autopilot.k0sproject.io/v1beta2",
-		"kind":       "Plan",
-		"metadata":   map[string]any{"name": name},
-		"status":     map[string]any{"state": state},
-	}}
+	return testutil.Unstructured(
+		kube.AutopilotPlanGVR.GroupVersion().WithKind("Plan"), "", name,
+		map[string]any{"status": map[string]any{"state": state}})
 }
 
 // cjReplaceOnDelete makes the fake apiserver behave like the

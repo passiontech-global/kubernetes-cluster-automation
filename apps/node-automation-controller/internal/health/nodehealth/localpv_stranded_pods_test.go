@@ -14,7 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -79,11 +78,11 @@ func pendingPodForPVC(ns, name, pvcName string, age time.Duration, at time.Time)
 // A concourse-worker stranded on a MISSING node past 10m: gauge
 // fires AND the disposable PVC+pod are reaped so the STS rebinds.
 func TestLocalPVStrandedConcourseHeals(t *testing.T) {
-	metrics.LocalPVEphemeralHealsTotal.DeleteLabelValues("concourse", "concourse-work-dir-concourse-worker-0", "dead-node")
+	localPVEphemeralHealsTotal.DeleteLabelValues("concourse", "concourse-work-dir-concourse-worker-0", "dead-node")
 	t.Cleanup(func() {
-		metrics.LocalPVStrandedPods.DeleteLabelValues(
+		localPVStrandedPodsGauge.DeleteLabelValues(
 			"concourse", "concourse-worker-0", "concourse-work-dir-concourse-worker-0", "dead-node", strandedReasonMissingNode)
-		metrics.LocalPVEphemeralHealsTotal.DeleteLabelValues("concourse", "concourse-work-dir-concourse-worker-0", "dead-node")
+		localPVEphemeralHealsTotal.DeleteLabelValues("concourse", "concourse-work-dir-concourse-worker-0", "dead-node")
 	})
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
@@ -126,7 +125,7 @@ func TestLocalPVStrandedConcourseHeals(t *testing.T) {
 // gauge but never the delete — its volume is the data.
 func TestLocalPVStrandedDatabaseNoHeal(t *testing.T) {
 	t.Cleanup(func() {
-		metrics.LocalPVStrandedPods.DeleteLabelValues(
+		localPVStrandedPodsGauge.DeleteLabelValues(
 			"scylla", "scylla-0", "data-scylla-0", "dead-node", strandedReasonMissingNode)
 	})
 	base := time.Now()
@@ -154,9 +153,9 @@ func TestLocalPVStrandedDatabaseNoHeal(t *testing.T) {
 // even outside the concourse namespace.
 func TestLocalPVStrandedAnnotatedEphemeralHeals(t *testing.T) {
 	t.Cleanup(func() {
-		metrics.LocalPVStrandedPods.DeleteLabelValues(
+		localPVStrandedPodsGauge.DeleteLabelValues(
 			"apps", "cache-0", "data-cache-0", "node-f", strandedReasonOutOfService)
-		metrics.LocalPVEphemeralHealsTotal.DeleteLabelValues("apps", "data-cache-0", "node-f")
+		localPVEphemeralHealsTotal.DeleteLabelValues("apps", "data-cache-0", "node-f")
 	})
 	base := time.Now()
 	fenced := testutil.Node("node-f", corev1.ConditionFalse, nil,
@@ -202,7 +201,7 @@ func TestLocalPVStrandedSoftStatesAlertOnly(t *testing.T) {
 				nodePinnedPV("pv-1", "n1"))
 			p := testProberDyn(cs, probetest.OpDyn())
 			p.Now = func() time.Time { return base }
-			defer metrics.LocalPVStrandedPods.DeleteLabelValues(
+			defer localPVStrandedPodsGauge.DeleteLabelValues(
 				"concourse", "concourse-worker-0", "pvc-w", "n1", tc.reason)
 
 			if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(ctx); res.Pass {
@@ -220,7 +219,7 @@ func TestLocalPVStrandedSoftStatesAlertOnly(t *testing.T) {
 // gauge fires but the heal waits.
 func TestLocalPVStrandedTooYoungForHeal(t *testing.T) {
 	t.Cleanup(func() {
-		metrics.LocalPVStrandedPods.DeleteLabelValues(
+		localPVStrandedPodsGauge.DeleteLabelValues(
 			"concourse", "concourse-worker-0", "pvc-w", "dead-node", strandedReasonMissingNode)
 	})
 	base := time.Now()
@@ -263,8 +262,8 @@ func TestLocalPVStrandedMaintenanceDefers(t *testing.T) {
 // exists → stalled gauge + provisioner pod bounce.
 func TestPVCStalledProvisionerHeals(t *testing.T) {
 	t.Cleanup(func() {
-		metrics.PVCProvisioningStalled.DeleteLabelValues("apps", "data-x", "openebs-hostpath")
-		metrics.PVCProvisionerHealsTotal.DeleteLabelValues("openebs-localpv-provisioner")
+		pvcProvisioningStalledGauge.DeleteLabelValues("apps", "data-x", "openebs-hostpath")
+		pvcProvisionerHealsTotal.DeleteLabelValues("openebs-localpv-provisioner")
 	})
 	base := time.Now()
 	worker := testutil.Node("w1", corev1.ConditionTrue, nil)

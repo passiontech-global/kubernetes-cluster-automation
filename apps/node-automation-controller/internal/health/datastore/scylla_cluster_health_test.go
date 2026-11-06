@@ -222,16 +222,13 @@ func scyllaMemberService(ns, name, podName string) *corev1.Service {
 // scyllaClusterCR builds a ScyllaCluster CR carrying one status condition
 // whose lastTransitionTime is `age` old.
 func scyllaClusterCR(ns, name, condType, condStatus string, age time.Duration) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "scylla.scylladb.com/v1",
-		"kind":       "ScyllaCluster",
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-		"status": map[string]any{
+	return testutil.Unstructured(
+		scyllaClusterGVR.GroupVersion().WithKind("ScyllaCluster"), ns, name,
+		map[string]any{"status": map[string]any{
 			"conditions": []any{map[string]any{
 				"type":               condType,
 				"status":             condStatus,
 				"lastTransitionTime": time.Now().Add(-age).UTC().Format(time.RFC3339),
 			}},
-		},
-	}}
+		}})
 }

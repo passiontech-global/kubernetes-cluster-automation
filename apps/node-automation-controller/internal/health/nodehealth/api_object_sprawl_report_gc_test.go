@@ -32,10 +32,8 @@ import (
 func sprawlReport(gvr schema.GroupVersionResource, kind, ns, name string,
 	age time.Duration, owner *metav1.OwnerReference) *unstructured.Unstructured {
 
-	obj := &unstructured.Unstructured{Object: map[string]any{
-		"metadata": map[string]any{"namespace": ns, "name": name},
-	}}
-	obj.SetGroupVersionKind(gvr.GroupVersion().WithKind(kind))
+	obj := testutil.Unstructured(
+		gvr.GroupVersion().WithKind(kind), ns, name, nil)
 	obj.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-age)))
 	obj.SetUID(types.UID("uid-" + ns + "-" + name))
 	if owner != nil {

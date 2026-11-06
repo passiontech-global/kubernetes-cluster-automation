@@ -694,11 +694,8 @@ func TestUnmeshedRemediationKuredLockDefers(t *testing.T) {
 // Plan (state neither Schedulable nor Completed) defers remediation
 // even when no node is cordoned.
 func TestUnmeshedRemediationAutopilotPlanDefers(t *testing.T) {
-	plan := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "autopilot.k0sproject.io/v1beta2",
-		"kind":       "Plan",
-		"metadata":   map[string]any{"name": "upgrade-1"},
-	}}
+	plan := testutil.Unstructured(
+		kube.AutopilotPlanGVR.GroupVersion().WithKind("Plan"), "", "upgrade-1", nil)
 	_ = unstructured.SetNestedField(plan.Object, "Running", "status", "state")
 	dyn := testutil.NewDynamicClient(plan)
 	cs := fake.NewSimpleClientset(

@@ -128,10 +128,13 @@ func TestDynListKinds(t *testing.T) {
 	kinds := DynListKinds()
 	for gvr, want := range map[schema.GroupVersionResource]string{
 		{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gatewayclasses"}: "GatewayClassList",
-		{Group: "dragonflydb.io", Version: "v1alpha1", Resource: "dragonflies"}:         "DragonflyList",
-		{Group: "cert-manager.io", Version: "v1", Resource: "certificaterequests"}:      "CertificateRequestList",
-		{Group: "autopilot.k0sproject.io", Version: "v1beta2", Resource: "plans"}:       "PlanList",
-		{Group: "cilium.io", Version: "v2alpha1", Resource: "ciliumendpointslices"}:     "CiliumEndpointSliceList",
+		// "gateways" is NOT the guessed plural (UnsafeGuessKindToResource
+		// yields "gatewaies") — it comes from dynListKindOverrides.
+		{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gateways"}:   "GatewayList",
+		{Group: "dragonflydb.io", Version: "v1alpha1", Resource: "dragonflies"}:     "DragonflyList",
+		{Group: "cert-manager.io", Version: "v1", Resource: "certificaterequests"}:  "CertificateRequestList",
+		{Group: "autopilot.k0sproject.io", Version: "v1beta2", Resource: "plans"}:   "PlanList",
+		{Group: "cilium.io", Version: "v2alpha1", Resource: "ciliumendpointslices"}: "CiliumEndpointSliceList",
 	} {
 		if got := kinds[gvr]; got != want {
 			t.Fatalf("DynListKinds[%v] = %q, want %q", gvr, got, want)

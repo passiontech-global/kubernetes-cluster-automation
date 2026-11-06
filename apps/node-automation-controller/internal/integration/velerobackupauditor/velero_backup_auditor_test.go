@@ -28,12 +28,9 @@ import (
 // ledger, not the object's age). A deterministic UID keeps the
 // pause-ledger key non-empty; tests override it for recreate cases.
 func veleroSchedule(ns, name string, paused bool, age time.Duration) *unstructured.Unstructured {
-	o := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "velero.io/v1",
-		"kind":       "Schedule",
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-		"spec":       map[string]any{"paused": paused},
-	}}
+	o := testutil.Unstructured(
+		veleroScheduleGVR.GroupVersion().WithKind("Schedule"), ns, name,
+		map[string]any{"spec": map[string]any{"paused": paused}})
 	o.SetUID(types.UID(ns + "/" + name))
 	o.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-age)))
 	return o
@@ -45,11 +42,9 @@ func veleroSchedule(ns, name string, paused bool, age time.Duration) *unstructur
 // totalBytes; the old fixture field never existed upstream).
 func veleroBackup(ns, name, schedule, phase string, age time.Duration,
 	items, total, errs, warns int64) *unstructured.Unstructured {
-	o := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "velero.io/v1",
-		"kind":       "Backup",
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-		"status": map[string]any{
+	o := testutil.Unstructured(
+		veleroBackupGVR.GroupVersion().WithKind("Backup"), ns, name,
+		map[string]any{"status": map[string]any{
 			"phase":    phase,
 			"errors":   errs,
 			"warnings": warns,
@@ -57,8 +52,7 @@ func veleroBackup(ns, name, schedule, phase string, age time.Duration,
 				"itemsBackedUp": items,
 				"totalItems":    total,
 			},
-		},
-	}}
+		}})
 	if schedule != "" {
 		o.SetLabels(map[string]string{veleroScheduleLabel: schedule})
 	}
@@ -380,19 +374,18 @@ func TestVeleroBackupAuditorClearsResolvedSeries(t *testing.T) {
 // on their own reason series; BSLs not phase=Available raise the
 // unavailable gauge.
 func TestVeleroBackupAuditorFailedAndBSL(t *testing.T) {
-	sched := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "velero.io/v1", "kind": "Schedule",
-		"metadata": map[string]any{"namespace": "velero", "name": "daily"}}}
-	failed := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "velero.io/v1", "kind": "Backup",
-		"metadata": map[string]any{
-			"namespace": "velero", "name": "daily-x",
-			"labels": map[string]any{"velero.io/schedule-name": "daily"}},
-		"status": map[string]any{"phase": "PartiallyFailed"}}}
-	bsl := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "velero.io/v1", "kind": "BackupStorageLocation",
-		"metadata": map[string]any{"namespace": "velero", "name": "main"},
-		"status":   map[string]any{"phase": "Unavailable"}}}
+	sched := testutil.Unstructured(
+		veleroScheduleGVR.GroupVersion().WithKind("Schedule"), "velero", "daily", nil)
+	failed := testutil.Unstructured(
+		veleroBackupGVR.GroupVersion().WithKind("Backup"), "velero", "daily-x",
+		map[string]any{
+			"metadata": map[string]any{
+				"namespace": "velero", "name": "daily-x",
+				"labels": map[string]any{"velero.io/schedule-name": "daily"}},
+			"status": map[string]any{"phase": "PartiallyFailed"}})
+	bsl := testutil.Unstructured(
+		veleroBSLGVR.GroupVersion().WithKind("BackupStorageLocation"), "velero", "main",
+		map[string]any{"status": map[string]any{"phase": "Unavailable"}})
 	dyn := newDynFake(sched, failed, bsl)
 	a := &veleroBackupAuditor{dyn: dyn, now: time.Now}
 	if err := a.run(ctx); err != nil {
@@ -415,15 +408,12 @@ func TestVeleroBackupAuditorFailedAndBSL(t *testing.T) {
 // everestDBCluster builds a DatabaseCluster — backupEnabled toggles
 // spec.backup.enabled, paused spec.paused.
 func everestDBCluster(ns, name string, backupEnabled, paused bool) *unstructured.Unstructured {
-	o := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "everest.percona.com/v1alpha1",
-		"kind":       "DatabaseCluster",
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-		"spec": map[string]any{
+	o := testutil.Unstructured(
+		everestDBClusterGVR.GroupVersion().WithKind("DatabaseCluster"), ns, name,
+		map[string]any{"spec": map[string]any{
 			"backup": map[string]any{"enabled": backupEnabled},
 			"paused": paused,
-		},
-	}}
+		}})
 	return o
 }
 
@@ -436,13 +426,12 @@ func everestBackup(ns, name, dc, state string, age time.Duration,
 	if completion != "" {
 		status["completionTime"] = completion
 	}
-	o := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "everest.percona.com/v1alpha1",
-		"kind":       "DatabaseClusterBackup",
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-		"spec":       map[string]any{"dbClusterName": dc},
-		"status":     status,
-	}}
+	o := testutil.Unstructured(
+		everestDBBackupGVR.GroupVersion().WithKind("DatabaseClusterBackup"), ns, name,
+		map[string]any{
+			"spec":   map[string]any{"dbClusterName": dc},
+			"status": status,
+		})
 	o.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-age)))
 	return o
 }
@@ -605,19 +594,18 @@ func TestVeleroAuditorEverestMissingBackups(t *testing.T) {
 func veleroPVB(ns, name, phase string, age time.Duration,
 	pod, node string) *unstructured.Unstructured {
 	start := time.Now().Add(-age).UTC().Format(time.RFC3339)
-	o := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "velero.io/v1",
-		"kind":       "PodVolumeBackup",
-		"metadata":   map[string]any{"namespace": ns, "name": name},
-		"spec": map[string]any{
-			"pod":  map[string]any{"name": pod},
-			"node": node,
-		},
-		"status": map[string]any{
-			"phase":          phase,
-			"startTimestamp": start,
-		},
-	}}
+	o := testutil.Unstructured(
+		veleroPVBGVR.GroupVersion().WithKind("PodVolumeBackup"), ns, name,
+		map[string]any{
+			"spec": map[string]any{
+				"pod":  map[string]any{"name": pod},
+				"node": node,
+			},
+			"status": map[string]any{
+				"phase":          phase,
+				"startTimestamp": start,
+			},
+		})
 	o.SetUID(types.UID(ns + "/" + name))
 	o.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-age)))
 	return o

@@ -21,7 +21,6 @@ func TestGatherFindsCounters(t *testing.T) {
 	VolumeAttachmentsCleanedTotal.WithLabelValues("r").Inc()
 	WebhookCABundleMismatch.WithLabelValues("k", "n", "w").Set(1)
 	TLSSecretDaysToExpiry.WithLabelValues("ns", "s").Set(1)
-	KCMWorkqueueFrozen.WithLabelValues("r").Set(1)
 	APIServiceUnavailable.WithLabelValues("n", "ns", "s").Set(1)
 	WebhookCABundleDaysToExpiry.WithLabelValues("k", "n", "w").Set(1)
 	TrustBundleDaysToExpiry.WithLabelValues("ns", "n").Set(1)
@@ -54,7 +53,6 @@ func TestGatherFindsCounters(t *testing.T) {
 		"node_automation_volumeattachments_cleaned_total",
 		"node_automation_webhook_ca_bundle_mismatch",
 		"node_automation_tls_secret_days_to_expiry",
-		"node_automation_kcm_workqueue_frozen",
 		"node_automation_apiservice_unavailable",
 		"node_automation_webhook_ca_bundle_days_to_expiry",
 		"node_automation_trust_bundle_days_to_expiry",

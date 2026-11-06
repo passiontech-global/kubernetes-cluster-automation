@@ -301,6 +301,23 @@ linters:
               desc: "internal/testutil stays generic; it must not import a domain module"
             - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
               desc: "internal/testutil stays generic; it must not import a domain module"
+        # Raw env reads in module code bypass the envx.* helper layer:
+        # every knob must resolve through libs/hostkit/envx so the
+        # envdoc source scan sees it and docs/env.md stays complete.
+        # depguard is package-granular (it cannot deny os.Getenv
+        # alone), so `os` is denied wholesale — internal/node/
+        # nodelabeler is excluded as the one sanctioned os consumer
+        # (its config-file ReadFile), and the envdoc test flags raw
+        # env reads even there. _test.go files are lint-exempt anyway;
+        # the explicit negation keeps the intent legible.
+        nac-no-raw-env:
+          files:
+            - "**/node-automation-controller/internal/**"
+            - "!**/node-automation-controller/internal/**/*_test.go"
+            - "!**/node-automation-controller/internal/node/nodelabeler/**"
+          deny:
+            - pkg: "os"
+              desc: "read env vars through libs/hostkit/envx.* (envdoc test enforces docs/env.md coverage); nodelabeler keeps the one sanctioned os.ReadFile"
 
     staticcheck:
       # -QF*: quick-fix style suggestions (De Morgan's law, tagged

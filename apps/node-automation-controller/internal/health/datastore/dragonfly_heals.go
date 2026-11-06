@@ -17,9 +17,26 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/prometheus/client_golang/prometheus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
+
+var (
+	// W7-C3 — dragonfly STS ordinal-0 pods deleted to force master
+	// re-election after a dual-replica deadlock. Counts delivered
+	// heals only.
+	dragonflyMasterlessPodHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "node_automation_dragonfly_masterless_pod_heals_total",
+		Help: "Dragonfly STS ordinal-0 pods deleted to force master re-election after a dual-replica deadlock.",
+	}, []string{"namespace", "statefulset"})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		dragonflyMasterlessPodHealsTotal)
+}
 
 // healDragonflyOperator deletes the dragonfly-operator controller
 // pod(s) — the same re-election nudge the operator watchdog applies,
@@ -241,7 +258,7 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 			"pod", target.Namespace+"/"+target.Name)
 		return
 	}
-	metrics.DragonflyMasterlessPodHealsTotal.
+	dragonflyMasterlessPodHealsTotal.
 		WithLabelValues(sig.sts.Namespace, sig.sts.Name).Inc()
 	log.Info("DELETE: dragonfly dual-replica deadlock — lowest-ordinal pod deleted to force master re-election",
 		"pod", target.Namespace+"/"+target.Name,

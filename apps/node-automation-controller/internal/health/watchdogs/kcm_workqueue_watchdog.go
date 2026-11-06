@@ -7,12 +7,13 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // kcmWorkqueueCheck is the C6 kube-controller-manager workqueue
@@ -51,6 +52,21 @@ const (
 	kcmReasonDesiredZero  = "daemonset_desired_zero"
 	kcmReasonStaleGen     = "stale_observed_generation"
 )
+
+var (
+	// C6 — the KCM workqueue-freeze signal: 1 while KCM renews its
+	// Lease but objects stop being reconciled. reason identifies the
+	// stall signature.
+	kcmWorkqueueFrozenGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_kcm_workqueue_frozen",
+		Help: "1 while KCM renews its Lease but stops reconciling objects.",
+	}, []string{"reason"})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		kcmWorkqueueFrozenGauge)
+}
 
 // ---------------------------------------------------------------------------
 // kcm-workqueue-watchdog (C6)
@@ -175,7 +191,7 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 		return ok
 	})
 	for reason := range frozen {
-		p.kcmFrozenReasons.Set(metrics.KCMWorkqueueFrozen, 1,
+		p.kcmFrozenReasons.Set(kcmWorkqueueFrozenGauge, 1,
 			reason, reason)
 	}
 	// A reason held last sweep but not re-frozen flips back to 0 —
@@ -200,7 +216,7 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 // that stopped being emitted flips to 0 rather than disappearing —
 // the resolved edge is part of this check's gauge contract.
 func kcmFrozenFlipZero(labelValues ...string) bool {
-	metrics.KCMWorkqueueFrozen.WithLabelValues(labelValues...).Set(0)
+	kcmWorkqueueFrozenGauge.WithLabelValues(labelValues...).Set(0)
 	return true
 }
 

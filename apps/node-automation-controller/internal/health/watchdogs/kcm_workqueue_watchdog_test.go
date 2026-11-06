@@ -13,8 +13,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
-
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -94,7 +92,7 @@ func kcmFrozenGauge(t *testing.T, reason string) (float64, bool) {
 func resetKCMFrozenSeries(t *testing.T, reasons ...string) {
 	t.Helper()
 	for _, r := range reasons {
-		metrics.KCMWorkqueueFrozen.DeleteLabelValues(r)
+		kcmWorkqueueFrozenGauge.DeleteLabelValues(r)
 	}
 }
 
@@ -236,7 +234,7 @@ func TestCheckKCMWorkqueueQuietOnStaleLease(t *testing.T) {
 	led := &probetest.MustCheck[*kcmWorkqueueCheck](t, p).kcmFrozenReasons
 	led.Emit("daemonset_desired_zero", "daemonset_desired_zero")
 	led.Prune(func(...string) bool { return true })
-	metrics.KCMWorkqueueFrozen.WithLabelValues("daemonset_desired_zero").Set(1)
+	kcmWorkqueueFrozenGauge.WithLabelValues("daemonset_desired_zero").Set(1)
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("stale KCM lease must stay quiet: %+v", res)
 	}

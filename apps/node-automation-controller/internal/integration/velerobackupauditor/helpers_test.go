@@ -4,10 +4,8 @@ import (
 	"context"
 
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -21,13 +19,5 @@ var ctx = context.Background()
 // so every type the audit touches must be mapped even when a test
 // seeds none).
 func newDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return testutil.NewFakeDyn(map[schema.GroupVersionResource]string{
-		veleroScheduleGVR:     "ScheduleList",
-		veleroBackupGVR:       "BackupList",
-		veleroBSLGVR:          "BackupStorageLocationList",
-		veleroPVBGVR:          "PodVolumeBackupList",
-		everestDBClusterGVR:   "DatabaseClusterList",
-		everestDBBackupGVR:    "DatabaseClusterBackupList",
-		kube.AutopilotPlanGVR: "PlanList",
-	}, objs...)
+	return testutil.NewDynamicClient(objs...)
 }

@@ -11,33 +11,26 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
 )
 
 // maintenanceDynFake returns a dynamic fake that knows the PlanList
-// kind — shared cannot reach testutil.NewDynamicClient (testutil
-// imports shared), so the list-kind map is spelled out here like the
-// module test files do.
+// kind (and every other CRD the modules list) via the shared
+// platform/testhelp table — the leaf-level home for the fake
+// testutil cannot host (testutil imports internal/shared).
 func maintenanceDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{
-			AutopilotPlanGVR: "PlanList",
-		},
-		objs...)
+	return testhelp.NewDynamicClient(objs...)
 }
 
 // maintenancePlan builds a Plan CR in `state` — "" renders no status
 // at all (a brand-new Plan before the controller writes one).
 func maintenancePlan(name, state string) *unstructured.Unstructured {
-	u := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "autopilot.k0sproject.io/v1beta2",
-		"kind":       "Plan",
-		"metadata":   map[string]any{"name": name},
-	}}
+	u := testhelp.Unstructured(
+		AutopilotPlanGVR.GroupVersion().WithKind("Plan"), "", name, nil)
 	if state != "" {
 		u.Object["status"] = map[string]any{"state": state}
 	}

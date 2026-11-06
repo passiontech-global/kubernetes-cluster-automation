@@ -10,10 +10,10 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
 )
 
 // scriptPage returns a PageFunc that serves the given pages in order,
@@ -166,14 +166,10 @@ func TestVolumeAttachmentsPageFunc(t *testing.T) {
 func TestDynamicPage(t *testing.T) {
 	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "foos"}
 	mk := func(name string) *unstructured.Unstructured {
-		return &unstructured.Unstructured{Object: map[string]any{
-			"apiVersion": "example.com/v1",
-			"kind":       "Foo",
-			"metadata":   map[string]any{"name": name, "namespace": "ns"},
-		}}
+		return testhelp.Unstructured(
+			gvr.GroupVersion().WithKind("Foo"), "ns", name, nil)
 	}
-	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(),
+	dyn := testhelp.NewFakeDyn(
 		map[schema.GroupVersionResource]string{gvr: "FooList"},
 		mk("f1"), mk("f2"))
 

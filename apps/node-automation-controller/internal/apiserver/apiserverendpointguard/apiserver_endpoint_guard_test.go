@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/version"
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/dynamic"
@@ -50,14 +51,10 @@ func kubeEndpoints(active, notReady, quarantined []string) *unstructured.Unstruc
 		}
 		sub["notReadyAddresses"] = nr
 	}
-	ep := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "v1",
-		"kind":       "Endpoints",
-		"metadata": map[string]any{
-			"namespace": endpointGuardNS, "name": endpointGuardName,
-		},
-		"subsets": []any{sub},
-	}}
+	ep := testutil.Unstructured(
+		schema.GroupVersionKind{Version: "v1", Kind: "Endpoints"},
+		endpointGuardNS, endpointGuardName,
+		map[string]any{"subsets": []any{sub}})
 	annos := map[string]string{}
 	if len(quarantined) > 0 {
 		annos[endpointGuardAnno] = strings.Join(quarantined, ",")

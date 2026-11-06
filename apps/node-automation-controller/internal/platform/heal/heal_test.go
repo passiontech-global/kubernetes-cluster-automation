@@ -11,7 +11,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
@@ -19,20 +18,15 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
 )
 
 var ctx = context.Background()
 
-// planAwareDyn is a dynamic fake that knows the PlanList kind —
-// the platform layer cannot reach internal/testutil's helper, so
-// the list-kind map is spelled out like kube's own tests do.
+// planAwareDyn is a dynamic fake that knows the PlanList kind (and
+// every other CRD the sweep lists) via the platform/testhelp table.
 func planAwareDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{
-			kube.AutopilotPlanGVR: "PlanList",
-		},
-		objs...)
+	return testhelp.NewDynamicClient(objs...)
 }
 
 // cordonedNow builds a node inside the active-cordon window —
