@@ -144,7 +144,7 @@ func (k *KineDB) hygieneDeadTuple(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
 	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
 		"SELECT n_dead_tup, n_live_tup FROM pg_stat_user_tables "+
-			"WHERE relname='%s'", k.cfg.Table))
+			"WHERE relname=%s", sqlQuote(k.cfg.Table)))
 	if err != nil {
 		note(fmt.Sprintf("dead-tuple-fail: %v", err))
 		return
@@ -188,7 +188,7 @@ func (k *KineDB) deadTupleVacuum(ctx context.Context, pg, user, pass string,
 		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS kh_locked;\n",
 		k.cfg.AdvisoryLockID)
 	b.WriteString("\\gset\n\\if :kh_locked\n")
-	fmt.Fprintf(&b, "VACUUM (ANALYZE) %s;\n", k.cfg.Table)
+	fmt.Fprintf(&b, "VACUUM (ANALYZE) %s;\n", sqlIdent(k.cfg.Table))
 	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", k.cfg.AdvisoryLockID)
 	b.WriteString("\\else\n\\echo '" + lockBusyMarker + "'\n\\endif\n")
 	sout, err := k.psqlScript(ctx, pg, user, pass, b.String())
@@ -346,6 +346,15 @@ func sqlQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
+// sqlIdent wraps s as a double-quoted SQL identifier — cfg.Table is
+// validated as a plain identifier by applyDefaults, but it lands in
+// DDL positions (VACUUM/REINDEX/FROM/UPDATE) where sqlQuote's string
+// literal would be wrong; quoting keeps the interpolation safe even
+// if a name ever bypasses the config check.
+func sqlIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
 // xidFreezeCheck is the maint-cycle half of item 3: the probe owns
 // the kine_db_xid_age_transactions series (2-minute freshness); the
 // freeze remediation runs here where the daily cadence already
@@ -374,7 +383,7 @@ func (k *KineDB) xidFreezeCheck(ctx context.Context, pg, user, pass string,
 	logger().Warn("kinedb: XID age past freeze threshold — VACUUM (FREEZE, ANALYZE)",
 		"xid_age", age, "threshold", xidFreezeAge)
 	if _, verr := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
-		"-qc", "VACUUM (FREEZE, ANALYZE) "+k.cfg.Table), ""); verr != nil {
+		"-qc", "VACUUM (FREEZE, ANALYZE) "+sqlIdent(k.cfg.Table)), ""); verr != nil {
 		res.okFreeze = false
 		res.freezeState = "fail"
 		note(fmt.Sprintf("freeze-vacuum-fail: %v", verr))

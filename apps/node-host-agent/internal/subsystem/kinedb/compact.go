@@ -101,7 +101,7 @@ func (k *KineDB) guardTrigger(head, compactRev, rows, retained, freeze int64, pr
 // out of stdout, so the `deleted=N` lines sumDeleted parses must be
 // real query output.
 func (k *KineDB) buildCompactScript(cur, target int64) string {
-	t := k.cfg.Table
+	t := sqlIdent(k.cfg.Table)
 	var b strings.Builder
 	fmt.Fprintf(&b,
 		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS kcg_locked;\n",
@@ -216,7 +216,7 @@ func (k *KineDB) guardRun(ctx context.Context, pg, user, pass string,
 		"SELECT COALESCE((SELECT MAX(id) FROM %s),0), "+
 			"COALESCE((SELECT MAX(prev_revision) FROM %s WHERE name='%s'),0), "+
 			"COUNT(*) FROM %[1]s",
-		k.cfg.Table, k.cfg.Table, compactRevKey))
+		sqlIdent(k.cfg.Table), sqlIdent(k.cfg.Table), compactRevKey))
 	if err != nil {
 		res.ok = false
 		note(fmt.Sprintf("stats query fail: %v", err))
@@ -274,7 +274,7 @@ func (k *KineDB) guardRun(ctx context.Context, pg, user, pass string,
 		if aout, aerr := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
 			"SELECT COALESCE((SELECT MAX(prev_revision) FROM %s WHERE name='%s'),0), "+
 				"COUNT(*) FROM %[1]s",
-			k.cfg.Table, compactRevKey)); aerr == nil {
+			sqlIdent(k.cfg.Table), compactRevKey)); aerr == nil {
 			if after, rows, perr := parsePair(aout); perr == nil {
 				res.revAfter, res.revSeen = after, true
 				res.rows = rows

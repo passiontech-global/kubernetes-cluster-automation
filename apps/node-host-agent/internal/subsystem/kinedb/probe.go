@@ -365,10 +365,10 @@ func (k *KineDB) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	// 10-min guard, which owns the kine_db_rows series. A query
 	// failure only zeroes this check, never the probe.
 	out, err = k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
-		"SELECT COALESCE((SELECT MAX(id) FROM %s),0), "+
-			"COALESCE((SELECT MAX(prev_revision) FROM %s WHERE name='%s'),0), "+
-			"COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relname='%[1]s'),0)",
-		k.cfg.Table, k.cfg.Table, compactRevKey))
+		"SELECT COALESCE((SELECT MAX(id) FROM %[1]s),0), "+
+			"COALESCE((SELECT MAX(prev_revision) FROM %[1]s WHERE name='%s'),0), "+
+			"COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relname=%s),0)",
+		sqlIdent(k.cfg.Table), compactRevKey, sqlQuote(k.cfg.Table)))
 	if err == nil {
 		head, crev, live, perr := parseTriple(out)
 		if perr == nil {

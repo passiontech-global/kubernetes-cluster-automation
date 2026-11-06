@@ -69,12 +69,10 @@ package nethealth
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,6 +80,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/routewatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -113,128 +112,11 @@ const (
 	routeGuardRespawnBackoff = 30 * time.Second
 )
 
-// Netns magic-link paths for the host-netns bind selection.
-// routeInitNetns is a var so tests can point pid 1's entry at a
-// fixture path; routeSelfNetns is always the real own-netns link —
-// it is also the setns restore target inside bindInNetns.
-var routeInitNetns = "/proc/1/ns/net"
-
-const routeSelfNetns = "/proc/self/ns/net"
-
-// --- netlink socket (host netns) ---
-
-// bindRouteSocket creates the subscribed NETLINK_ROUTE socket — the
-// bash `ip monitor rule route` without the forked process.
-func bindRouteSocket() (int, error) {
-	fd, err := unix.Socket(unix.AF_NETLINK,
-		unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
-	if err != nil {
-		return -1, err
-	}
-	// A route-delete burst (interface flap, Cilium churn) can
-	// overflow the default netlink receive buffer (~200K) — the
-	// kernel then silently drops exactly the DEL events this guard
-	// exists to catch. 4MiB is the usual monitor sizing; a failure
-	// (rmem_max cap) only logs — a smaller buffer still beats no
-	// guard.
-	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET,
-		unix.SO_RCVBUF, 4<<20); err != nil {
-		logger().Warn("route-guard: SO_RCVBUF 4MiB failed — keeping "+
-			"default buffer (delete bursts may lose events)",
-			"error", err)
-	}
-	if err := unix.Bind(fd, &unix.SockaddrNetlink{
-		Family: unix.AF_NETLINK,
-		Groups: unix.RTMGRP_IPV4_ROUTE | unix.RTMGRP_IPV4_RULE,
-	}); err != nil {
-		_ = unix.Close(fd)
-		return -1, err
-	}
-	return fd, nil
-}
-
-// sameNetns reports whether two /proc/<pid>/ns/net magic links name
-// the same network namespace — the hostNetwork check (the pod's own
-// netns IS the host's when the inode matches pid 1's).
-func sameNetns(a, b string) bool {
-	ai, aerr := os.Stat(a)
-	bi, berr := os.Stat(b)
-	return aerr == nil && berr == nil && os.SameFile(ai, bi)
-}
-
-// openRouteNetlink returns the bound socket in the HOST network
-// namespace. Selection order matches the DaemonSet's actual mounts:
-//
-//   - hostNetwork: /proc/self/ns/net == /proc/1/ns/net → bind
-//     directly, no setns at all (the common case on workers).
-//   - hostPID: /proc/1/ns/net is host init's netns → setns into it
-//     for the socket creation — reachable WITHOUT any /host/proc
-//     mount (the DS mounts individual hostPaths only, so this is the
-//     path that keeps the guard alive containerized).
-//   - <hostRoot>/proc/1/ns/net: last fallback for a pod with neither
-//     flag but a mounted host /proc.
-func openRouteNetlink(hostRoot string) (int, error) {
-	if sameNetns(routeSelfNetns, routeInitNetns) {
-		return bindRouteSocket()
-	}
-	fd, err := bindInNetns(routeInitNetns)
-	if err == nil {
-		return fd, nil
-	}
-	if hostRoot != "" && hostRoot != "/" {
-		if ffd, ferr := bindInNetns(
-			filepath.Join(hostRoot, "proc/1/ns/net")); ferr == nil {
-			return ffd, nil
-		} else {
-			err = fmt.Errorf("%w (host-root fallback: %v)", err, ferr)
-		}
-	}
-	return -1, err
-}
-
-// bindInNetns binds the route socket inside the netns at nsPath —
-// the same namespace the runHostCmd seam reaches with `nsenter -t 1
-// -n`. setns(2) is per-thread: the calling thread is locked,
-// switched, and switched back; the socket keeps the creating netns.
-//
-// If the restore fails the thread must NOT go back to the runtime —
-// a goroutine scheduled on it would silently execute in the host
-// netns. The bound fd is closed and the goroutine exits via
-// runtime.Goexit while the thread stays locked, which makes the
-// runtime destroy the thread instead of reusing it (the safe setns
-// pattern). The goroutine's defers still run (the ns fds close).
-func bindInNetns(nsPath string) (int, error) {
-	self, err := unix.Open(routeSelfNetns, unix.O_RDONLY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return -1, fmt.Errorf("self netns: %w", err)
-	}
-	defer func() { _ = unix.Close(self) }()
-	host, err := unix.Open(nsPath, unix.O_RDONLY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return -1, fmt.Errorf("host netns %s: %w", nsPath, err)
-	}
-	defer func() { _ = unix.Close(host) }()
-	runtime.LockOSThread()
-	if err := unix.Setns(host, unix.CLONE_NEWNET); err != nil {
-		runtime.UnlockOSThread()
-		return -1, fmt.Errorf("setns %s: %w", nsPath, err)
-	}
-	fd, serr := bindRouteSocket()
-	if rerr := unix.Setns(self, unix.CLONE_NEWNET); rerr != nil {
-		if fd >= 0 {
-			_ = unix.Close(fd)
-		}
-		logger().Error("route-guard: setns restore failed — parking "+
-			"thread in the host netns and exiting the guard goroutine",
-			"error", rerr)
-		runtime.Goexit()
-		panic("unreachable")
-	}
-	runtime.UnlockOSThread()
-	return fd, serr
-}
-
 // --- delete-event decode ---
+//
+// The netlink socket + netns bind mechanics and the generic
+// nlmsg/rtattr decode live in platform/routewatch; below is the
+// nebula policy they filter against.
 
 // The numeric identity of the nebula dataplane — constants mirrored
 // from nebula-up.sh (hostconfig templates/nebula-up.sh.j2):
@@ -252,10 +134,6 @@ const (
 	routeGuardPrefFwmark = 1400
 	routeGuardPrefMarker = 1490
 	routeGuardPrefPub    = 1500
-	// fibRuleHdrLen is sizeof(struct fib_rule_hdr) — the fixed
-	// header a DELRULE payload carries before its rtattr list
-	// (x/sys exports no constant for it).
-	fibRuleHdrLen = 12
 )
 
 // routeEventFilter is the nebula dataplane identity the delete scan
@@ -319,40 +197,21 @@ func nebulaIfindex(dir, dev string) uint32 {
 
 // scanDeleteEvents reports whether buf carries at least one nlmsg a
 // restore must answer — the only events the bash guard reacted to
-// (`*Deleted*` lines naming the nebula state). Netlink headers are
-// host byte order — binary.NativeEndian matches the kernel layout
-// without unsafe. Fail-open: a torn header or tail can't be proven
-// NOT to be a nebula delete, so it counts.
+// (`*Deleted*` lines naming the nebula state). routewatch owns the
+// datagram walk and its fail-open contract (a torn header or tail
+// can't be proven NOT to be a nebula delete, so it counts); the
+// DELROUTE/DELRULE decode below is the nebula policy.
 func (f *routeEventFilter) scanDeleteEvents(buf []byte) bool {
-	for len(buf) > 0 {
-		if len(buf) < unix.NLMSG_HDRLEN {
-			return true
-		}
-		ln := int(binary.NativeEndian.Uint32(buf[0:4]))
-		typ := binary.NativeEndian.Uint16(buf[4:6])
-		if ln < unix.NLMSG_HDRLEN || ln > len(buf) {
-			return true
-		}
-		switch typ {
-		case unix.RTM_DELROUTE:
-			if f.delRouteRelevant(buf[unix.NLMSG_HDRLEN:ln]) {
-				return true
+	return routewatch.ScanMessages(buf,
+		func(typ uint16, payload []byte) bool {
+			switch typ {
+			case unix.RTM_DELROUTE:
+				return f.delRouteRelevant(payload)
+			case unix.RTM_DELRULE:
+				return f.delRuleRelevant(payload)
 			}
-		case unix.RTM_DELRULE:
-			if f.delRuleRelevant(buf[unix.NLMSG_HDRLEN:ln]) {
-				return true
-			}
-		}
-		// The next message sits at the aligned offset — but the
-		// kernel may not pad the LAST message to alignment, so the
-		// offset can land exactly at or past the buffer end.
-		if next := nlmsgAlign(ln); next < len(buf) {
-			buf = buf[next:]
-		} else {
 			return false
-		}
-	}
-	return false
+		})
 }
 
 // delRouteRelevant decodes an RTM_DELROUTE payload (struct rtmsg +
@@ -368,7 +227,7 @@ func (f *routeEventFilter) delRouteRelevant(payload []byte) bool {
 	if payload[0] != unix.AF_INET {
 		return false // non-IPv4 — never nebula's (no v6 tables/rules)
 	}
-	attrs, clean := routeAttrs(payload[unix.SizeofRtMsg:],
+	attrs, clean := routewatch.Attrs(payload[unix.SizeofRtMsg:],
 		unix.RTA_TABLE, unix.RTA_OIF)
 	if !clean {
 		return true // torn attribute list — can't prove it isn't ours
@@ -387,13 +246,13 @@ func (f *routeEventFilter) delRouteRelevant(payload []byte) bool {
 // a payload without it, or with a torn attribute list, is
 // undecodable → relevant.
 func (f *routeEventFilter) delRuleRelevant(payload []byte) bool {
-	if len(payload) < fibRuleHdrLen {
+	if len(payload) < routewatch.FibRuleHdrLen {
 		return true
 	}
 	if payload[0] != unix.AF_INET {
 		return false
 	}
-	attrs, clean := routeAttrs(payload[fibRuleHdrLen:],
+	attrs, clean := routewatch.Attrs(payload[routewatch.FibRuleHdrLen:],
 		unix.FRA_PRIORITY)
 	if !clean {
 		return true
@@ -403,47 +262,6 @@ func (f *routeEventFilter) delRuleRelevant(payload []byte) bool {
 		return true
 	}
 	return f.prefs[prio]
-}
-
-// routeAttrs walks a rtattr list and extracts the wanted u32-valued
-// attributes. clean=false means the walk hit a torn attribute
-// (rta_len shorter than the header or running past the buffer end)
-// — the wanted values may sit in the unread tail, so callers treat
-// !clean as undecodable. A last attribute whose ALIGNMENT padding
-// overruns the buffer is a clean end: the kernel need not pad the
-// final attribute of a message.
-func routeAttrs(buf []byte, wants ...uint16) (map[uint16]uint32, bool) {
-	found := map[uint16]uint32{}
-	want := map[uint16]bool{}
-	for _, w := range wants {
-		want[w] = true
-	}
-	for len(buf) >= unix.SizeofRtAttr {
-		ln := int(binary.NativeEndian.Uint16(buf[0:2]))
-		typ := binary.NativeEndian.Uint16(buf[2:4])
-		if ln < unix.SizeofRtAttr || ln > len(buf) {
-			return found, false
-		}
-		if want[typ] && ln >= unix.SizeofRtAttr+4 {
-			found[typ] = binary.NativeEndian.Uint32(buf[4:8])
-		}
-		if next := rtaAlign(ln); next < len(buf) {
-			buf = buf[next:]
-		} else {
-			return found, next == len(buf) || ln == len(buf)
-		}
-	}
-	// A <4B residue can't hold an attribute (min rta_len is the
-	// header) — treat it as undecodable rather than silently exact.
-	return found, len(buf) == 0
-}
-
-func nlmsgAlign(ln int) int {
-	return (ln + int(unix.NLMSG_ALIGNTO) - 1) &^ (int(unix.NLMSG_ALIGNTO) - 1)
-}
-
-func rtaAlign(ln int) int {
-	return (ln + int(unix.RTA_ALIGNTO) - 1) &^ (int(unix.RTA_ALIGNTO) - 1)
 }
 
 // --- the guard loop ---
@@ -531,7 +349,7 @@ func (n *NetHealth) routeGuard(ctx context.Context) {
 	open := n.cfg.openRouteSocket
 	if open == nil {
 		hostRoot := n.cfg.HostRoot
-		open = func() (int, error) { return openRouteNetlink(hostRoot) }
+		open = func() (int, error) { return routewatch.Bind(hostRoot) }
 	}
 	debounce := n.cfg.routeDebounce
 	if debounce <= 0 {

@@ -40,6 +40,8 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE", "9")
 	t.Setenv("NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD", "7")
 	t.Setenv("NODE_HOST_AGENT_CALICO_ORPHAN_VETH_THRESHOLD", "77")
+	t.Setenv("NODE_HOST_AGENT_CGROUP_ROOT", "/custom/cgroup")
+	t.Setenv("NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR", "/custom/sessions")
 
 	d := testEnvDeps(t)
 	cfg := ConfigFromEnv(d)
@@ -93,6 +95,12 @@ func TestConfigFromEnv(t *testing.T) {
 	if cfg.Calico.OrphanVethThreshold != 77 {
 		t.Fatalf("CalicoOrphanVethThreshold=%d", cfg.Calico.OrphanVethThreshold)
 	}
+	if cfg.Runtime.CgroupRoot != "/custom/cgroup" {
+		t.Fatalf("Runtime.CgroupRoot=%q", cfg.Runtime.CgroupRoot)
+	}
+	if cfg.Runtime.SessionsDir != "/custom/sessions" {
+		t.Fatalf("Runtime.SessionsDir=%q", cfg.Runtime.SessionsDir)
+	}
 	// APIBackends derives from the watchdog conf, not env.
 	if !reflect.DeepEqual(cfg.APIBackends, []string{"10.0.0.1"}) {
 		t.Fatalf("APIBackends=%v", cfg.APIBackends)
@@ -112,6 +120,14 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	if cfg.Cilium.Socket != "/host/run/cilium/cilium.sock" {
 		t.Fatalf("CiliumSocket=%q", cfg.Cilium.Socket)
 	}
+	// W10 runtime-resource guards — same hostPath-joined default
+	// contract as the mount paths above.
+	if cfg.Runtime.CgroupRoot != "/host/sys/fs/cgroup" {
+		t.Fatalf("Runtime.CgroupRoot=%q", cfg.Runtime.CgroupRoot)
+	}
+	if cfg.Runtime.SessionsDir != "/host/run/systemd/sessions" {
+		t.Fatalf("Runtime.SessionsDir=%q", cfg.Runtime.SessionsDir)
+	}
 	// Vars dir has no vars files → advisory host list is nil.
 	if cfg.Kubelet.WatchdogHosts != nil {
 		t.Fatalf("KubeletWatchdogHosts=%v want nil", cfg.Kubelet.WatchdogHosts)
@@ -124,6 +140,10 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	// nil HostPath → identity join.
 	if cfg.CtrTaskRoot != "/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io" {
 		t.Fatalf("identity CtrTaskRoot=%q", cfg.CtrTaskRoot)
+	}
+	if cfg.Runtime.CgroupRoot != "/sys/fs/cgroup" ||
+		cfg.Runtime.SessionsDir != "/run/systemd/sessions" {
+		t.Fatalf("identity Runtime paths: %+v", cfg.Runtime)
 	}
 }
 

@@ -1,6 +1,7 @@
 package kube
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -83,5 +84,26 @@ func TestStampAnno(t *testing.T) {
 	StampAnno(u, "passiontech.dev/last-heal", stamp)
 	if got, ok := AnnoTime(u, "passiontech.dev/last-heal"); !ok || !got.Equal(stamp) {
 		t.Fatalf("round-trip on unstructured = (%v,%v)", got, ok)
+	}
+}
+
+func TestMergePatchAnnos(t *testing.T) {
+	patch, err := MergePatchAnnos(map[string]any{
+		"passiontech.dev/last-es-nudge": "2026-11-06T00:00:00Z",
+		"passiontech.dev/stale-marker":  nil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := map[string]any{}
+	if err := json.Unmarshal(patch, &doc); err != nil {
+		t.Fatal(err)
+	}
+	annos := doc["metadata"].(map[string]any)["annotations"].(map[string]any)
+	if annos["passiontech.dev/last-es-nudge"] != "2026-11-06T00:00:00Z" {
+		t.Fatalf("stamp missing: %v", annos)
+	}
+	if v, present := annos["passiontech.dev/stale-marker"]; !present || v != nil {
+		t.Fatalf("nil value must serialize as JSON null for merge-patch delete: %v", annos)
 	}
 }

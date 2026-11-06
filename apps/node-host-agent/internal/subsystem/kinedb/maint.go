@@ -87,7 +87,7 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 
 	// (a) REINDEX CONCURRENTLY — always, cheap on a small table.
 	if _, err := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
-		"-qc", "REINDEX TABLE CONCURRENTLY "+k.cfg.Table), ""); err == nil {
+		"-qc", "REINDEX TABLE CONCURRENTLY "+sqlIdent(k.cfg.Table)), ""); err == nil {
 		res.okReindex = true
 	} else {
 		note(fmt.Sprintf("reindex-fail: %v", err))
@@ -102,10 +102,10 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 	// Indexes via pg_indexes_size like the bash — total−heap would
 	// count TOAST as index bytes.
 	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
-		"SELECT pg_relation_size('%s'), pg_indexes_size('%[1]s'), "+
-			"COALESCE((SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname='%[1]s'),0), "+
-			"COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relname='%[1]s'),0)",
-		k.cfg.Table))
+		"SELECT pg_relation_size(%[1]s), pg_indexes_size(%[1]s), "+
+			"COALESCE((SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname=%[1]s),0), "+
+			"COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relname=%[1]s),0)",
+		sqlQuote(k.cfg.Table)))
 	if err == nil {
 		heap, idx, dead, live, perr := parseQuad(out)
 		if perr == nil {
@@ -145,7 +145,7 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 			"free", free, "heap", res.heapBytes, "wal", wal)
 		res.repackState = "skipped-headroom"
 		if _, err := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
-			"-qc", "VACUUM (ANALYZE) "+k.cfg.Table), ""); err != nil {
+			"-qc", "VACUUM (ANALYZE) "+sqlIdent(k.cfg.Table)), ""); err != nil {
 			note(fmt.Sprintf("fallback-vacuum-fail: %v", err))
 		}
 		return

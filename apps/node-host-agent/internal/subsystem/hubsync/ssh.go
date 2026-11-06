@@ -2,6 +2,7 @@ package hubsync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -68,7 +69,7 @@ func remoteSHA256(ctx context.Context, c Conn, remotePath string) (string, error
 	out, err := c.Run(ctx, "sha256sum "+shq(remotePath))
 	if err != nil {
 		var ee ExitError
-		if isExitErr(err, &ee) && ee.ExitStatus() == 1 {
+		if errors.As(err, &ee) && ee.ExitStatus() == 1 {
 			return "", nil
 		}
 		return "", err
@@ -78,22 +79,6 @@ func remoteSHA256(ctx context.Context, c Conn, remotePath string) (string, error
 		return "", nil
 	}
 	return fields[0], nil
-}
-
-// isExitErr reports whether err is (or wraps) an ExitError.
-func isExitErr(err error, ee *ExitError) bool {
-	for err != nil {
-		if e, ok := err.(ExitError); ok {
-			*ee = e
-			return true
-		}
-		if u, ok := err.(interface{ Unwrap() error }); ok {
-			err = u.Unwrap()
-			continue
-		}
-		break
-	}
-	return false
 }
 
 // putAtomic streams r into <path>'s staging file, chmods it and

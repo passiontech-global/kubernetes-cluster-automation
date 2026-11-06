@@ -16,6 +16,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/routewatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -53,7 +54,7 @@ func rtmsgBytes(family, table byte, attrs ...[]byte) []byte {
 // fibRuleBytes builds a struct fib_rule_hdr payload: same 12-byte
 // fixed size, family at [0], then rtattrs.
 func fibRuleBytes(family byte, attrs ...[]byte) []byte {
-	b := make([]byte, fibRuleHdrLen)
+	b := make([]byte, routewatch.FibRuleHdrLen)
 	b[0] = family
 	for _, a := range attrs {
 		b = append(b, a...)
@@ -265,73 +266,6 @@ func TestNebulaRouteFilterDefaults(t *testing.T) {
 	}
 	if f.nebIf != 0 {
 		t.Fatalf("nebIf=%d want 0 (no devices in fixture sysfs)", f.nebIf)
-	}
-}
-
-// --- host-netns bind selection ---
-
-func TestSameNetnsSelfIsSelf(t *testing.T) {
-	if !sameNetns(routeSelfNetns, routeSelfNetns) {
-		t.Fatal("/proc/self/ns/net does not SameFile itself")
-	}
-}
-
-// hostNetwork deployment (the DaemonSet case): pod netns IS the host
-// netns → direct bind, hostRoot never consulted. Skips when the test
-// env runs pid 1 in a different netns (unusual containers).
-func TestOpenRouteNetlinkDirectBindWhenHostNet(t *testing.T) {
-	if !sameNetns(routeSelfNetns, routeInitNetns) {
-		t.Skip("test env: pid 1 lives in a different netns")
-	}
-	// A bogus hostRoot proves the mounted-/proc path isn't touched —
-	// on the DS <hostRoot>/proc doesn't exist at all.
-	fd, err := openRouteNetlink(filepath.Join(t.TempDir(), "no-such-root"))
-	if err != nil {
-		t.Fatalf("direct bind failed: %v", err)
-	}
-	if fd < 0 {
-		t.Fatalf("fd=%d", fd)
-	}
-	defer func() { _ = unix.Close(fd) }()
-	sa, err := unix.Getsockname(fd)
-	if err != nil {
-		t.Fatalf("Getsockname: %v", err)
-	}
-	if _, ok := sa.(*unix.SockaddrNetlink); !ok {
-		t.Fatalf("bound fd is not netlink: %T", sa)
-	}
-}
-
-// hostPID deployment without hostNetwork: setns into /proc/1/ns/net;
-// a mounted host /proc under hostRoot is only the last fallback.
-// A regular file stands in for the ns magic link — setns() on it
-// fails deterministically (EINVAL, no privilege needed).
-func TestOpenRouteNetlinkSetnsAndHostRootFallback(t *testing.T) {
-	old := routeInitNetns
-	defer func() { routeInitNetns = old }()
-	init := filepath.Join(t.TempDir(), "net")
-	testutil.WriteFile(t, init, "")
-	routeInitNetns = init
-
-	// No mounted host /proc → the setns error propagates.
-	if fd, err := openRouteNetlink("/"); err == nil ||
-		!strings.Contains(err.Error(), "setns") {
-		if fd >= 0 {
-			_ = unix.Close(fd)
-		}
-		t.Fatalf("want setns failure, got fd=%d err=%v", fd, err)
-	}
-
-	// Mounted host /proc under hostRoot → attempted as last resort.
-	root := t.TempDir()
-	fake := filepath.Join(root, "proc/1/ns/net")
-	testutil.WriteFile(t, fake, "")
-	fd, err := openRouteNetlink(root)
-	if fd >= 0 {
-		_ = unix.Close(fd)
-	}
-	if err == nil || !strings.Contains(err.Error(), fake) {
-		t.Fatalf("host-root fallback not attempted: %v", err)
 	}
 }
 

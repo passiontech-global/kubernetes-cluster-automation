@@ -119,7 +119,7 @@ func TestDeadTupleVacuumFiresAndCoolsDown(t *testing.T) {
 	script := fr.LastStdin()
 	for _, want := range []string{
 		"pg_try_advisory_lock(20260921)",
-		"VACUUM (ANALYZE) kine;",
+		`VACUUM (ANALYZE) "kine";`,
 		"pg_advisory_unlock(20260921)",
 		lockBusyMarker,
 	} {
@@ -237,7 +237,7 @@ func TestMaintCycleXIDFreezeFires(t *testing.T) {
 	if !res.xidSeen || res.freezeState != "done" || !res.okFreeze {
 		t.Fatalf("res=%+v", res)
 	}
-	if !strings.Contains(fr.Joined(), "VACUUM (FREEZE, ANALYZE) kine") {
+	if !strings.Contains(fr.Joined(), `VACUUM (FREEZE, ANALYZE) "kine"`) {
 		t.Fatalf("freeze vacuum did not run:\n%s", fr.Joined())
 	}
 	content := readText(t, dir, "kine-db-maint.prom")

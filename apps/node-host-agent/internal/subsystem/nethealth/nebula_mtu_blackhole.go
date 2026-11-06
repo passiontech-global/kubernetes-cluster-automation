@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
@@ -278,20 +279,17 @@ func (n *NetHealth) writeMTUBHMetric(st *mtuProbeState) {
 			"dir", dir, "error", err)
 		return
 	}
-	content := "# HELP node_agent_nebula_mtu_blackhole " +
-		"Nebula overlay MTU blackhole latched — small pings pass, " +
-		"1252-byte DF probes fail (state-nebula-mtu-blackhole).\n" +
-		"# TYPE node_agent_nebula_mtu_blackhole gauge\n" +
-		"node_agent_nebula_mtu_blackhole " + v + "\n"
-	name := "node-agent-nebula-mtu.prom"
-	tmp := filepath.Join(dir, "."+name+".tmp")
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+	var b promfile.Builder
+	b.Header("node_agent_nebula_mtu_blackhole",
+		"Nebula overlay MTU blackhole latched — small pings pass, "+
+			"1252-byte DF probes fail (state-nebula-mtu-blackhole).")
+	b.Line("node_agent_nebula_mtu_blackhole " + v)
+	// promfile.Write stages through a hidden CreateTemp file, fsyncs
+	// and renames — the textfile collector must never see a partial
+	// .prom (and the staging name can't match its "*.prom" glob).
+	if err := promfile.Write(dir, "node-agent-nebula-mtu.prom",
+		[]byte(b.String())); err != nil {
 		logger().Debug("mtu metric: write failed",
-			"path", tmp, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, name)); err != nil {
-		logger().Debug("mtu metric: install failed",
 			"dir", dir, "error", err)
 	}
 }

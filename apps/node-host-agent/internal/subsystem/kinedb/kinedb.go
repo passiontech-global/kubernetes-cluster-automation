@@ -128,9 +128,10 @@ var (
 	rePGBName   = regexp.MustCompile(`(?i)pgbouncer|pgb`)
 	rePGBLogErr = regexp.MustCompile(`server_login_retry|password authentication failed|pooler error`)
 	reDeleted   = regexp.MustCompile(`deleted=([0-9]+)`)
-	// Table is Sprintf'd into SQL identifiers and quoted literals
-	// all over the probe/guard/maint queries — only a plain SQL
-	// identifier is safe to interpolate.
+	// Table is Sprintf'd into SQL all over the probe/guard/maint
+	// queries — interpolation sites go through sqlIdent (identifier
+	// positions) or sqlQuote (literal positions), and only a plain
+	// SQL identifier is accepted anyway (belt and suspenders).
 	reTableIdent = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 	repackGlob   = `ls /usr/pgsql-*/bin/pg_repack /usr/lib/postgresql/*/bin/pg_repack 2>/dev/null | head -1`
 	pgbAdminDB   = "pgbouncer" // SHOW POOLS lives on the admin console db

@@ -47,8 +47,8 @@ const (
 // kubelet's own kubeconfig at the K0sDir root. controller-manager.conf
 // is scanned alongside ccm.conf — k0s has shipped both names for the
 // KCM identity; missing files are skipped.
-func (h *Hygiene) kubeconfigCertPaths() []string {
-	k0s := h.cfg.K0sDir
+func (c *kubeCertCheck) kubeconfigCertPaths() []string {
+	k0s := c.d.cfg.K0sDir
 	return []string{
 		filepath.Join(k0s, "pki", "admin.conf"),
 		filepath.Join(k0s, "pki", "ccm.conf"),
@@ -58,19 +58,29 @@ func (h *Hygiene) kubeconfigCertPaths() []string {
 	}
 }
 
-// checkKubeconfigCertExpiry parses client-certificate-data (and
-// file-referenced client certs) out of the k0s kubeconfigs and
-// exports node_agent_kubeconfig_cert_min_days_remaining — the
-// minimum NotAfter horizon across every embedded client cert.
-// Inside kubeconfigCertMinDays it latches
-// state-kubeconfig-cert-expiring (surfaces via
-// node_host_agent_watchdog_state) and suspect-logs; absent or
-// unparseable files are skipped silently.
-func (h *Hygiene) checkKubeconfigCertExpiry(_ context.Context) {
-	now := h.cfg.nowFn()
+// kubeCertCheck is the W10-CP5 embedded kubeconfig client-cert
+// expiry check as a Check — stateless (the warn window needs no
+// streak bookkeeping). Like kineStorageCheck it rides cpFreezeCheck's
+// ungated slot rather than holding its own dispatch-table entry.
+type kubeCertCheck struct {
+	d *deps
+}
+
+// Name returns the check label / log context.
+func (c *kubeCertCheck) Name() string { return checkKubeCert }
+
+// Run parses client-certificate-data (and file-referenced client
+// certs) out of the k0s kubeconfigs and exports
+// node_agent_kubeconfig_cert_min_days_remaining — the minimum
+// NotAfter horizon across every embedded client cert. Inside
+// kubeconfigCertMinDays it latches state-kubeconfig-cert-expiring
+// (surfaces via node_host_agent_watchdog_state) and suspect-logs;
+// absent or unparseable files are skipped silently.
+func (c *kubeCertCheck) Run(_ context.Context) {
+	now := c.d.cfg.nowFn()
 	minDays := math.Inf(1)
 	seen := 0
-	for _, path := range h.kubeconfigCertPaths() {
+	for _, path := range c.kubeconfigCertPaths() {
 		certs, err := kubeconfigClientCerts(path)
 		if err != nil {
 			continue
@@ -88,28 +98,28 @@ func (h *Hygiene) checkKubeconfigCertExpiry(_ context.Context) {
 			"Minimum days until the soonest-expiring embedded client "+
 				"certificate across the k0s kubeconfigs (admin/ccm/"+
 				"scheduler/kubelet).")
-		h.stateExit(stateKubeCertExpiring) // no certs → nothing to expire
-		h.cycles.WithLabelValues(checkKubeCert, "no_certs").Inc()
+		c.d.stateExit(stateKubeCertExpiring) // no certs → nothing to expire
+		c.d.cycles.WithLabelValues(checkKubeCert, "no_certs").Inc()
 	} else {
 		p.Gauge(certDaysMetric,
 			"Minimum days until the soonest-expiring embedded client "+
 				"certificate across the k0s kubeconfigs (admin/ccm/"+
 				"scheduler/kubelet).",
 			minDays)
-		h.cycles.WithLabelValues(checkKubeCert, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkKubeCert, "ok").Inc()
 		if minDays < kubeconfigCertMinDays {
-			h.state.Enter(stateKubeCertExpiring, fmt.Sprintf(
+			c.d.state.Enter(stateKubeCertExpiring, fmt.Sprintf(
 				"client cert expires in %.1fd", minDays))
-			h.state.SuspectLog(stateKubeCertExpiring, fmt.Sprintf(
+			c.d.state.SuspectLog(stateKubeCertExpiring, fmt.Sprintf(
 				"kubeconfig-cert-expiring: embedded client cert "+
 					"NotAfter in %.1f days (<%d)",
 				minDays, int(kubeconfigCertMinDays)),
-				h.cfg.SuspectLogCadence)
+				c.d.cfg.SuspectLogCadence)
 		} else {
-			h.stateExit(stateKubeCertExpiring)
+			c.d.stateExit(stateKubeCertExpiring)
 		}
 	}
-	h.writeTextfileProm("node-agent-kubeconfig-cert.prom", p.String())
+	c.d.writeTextfileProm("node-agent-kubeconfig-cert.prom", p.String())
 }
 
 // kubeconfigClientCerts extracts every embedded client certificate
@@ -152,4 +162,10 @@ func kubeconfigClientCerts(path string) ([]*x509.Certificate, error) {
 		}
 	}
 	return certs, nil
+}
+
+// checkKubeconfigCertExpiry forwards to the migrated Check — tests
+// written before the interface still call the old method shape.
+func (h *Hygiene) checkKubeconfigCertExpiry(ctx context.Context) {
+	h.kubeCert.Run(ctx)
 }

@@ -84,10 +84,10 @@ func TestBuildCompactScript(t *testing.T) {
 	for _, want := range []string{
 		"pg_try_advisory_lock(20260921)",
 		"\\gset", "\\if :kcg_locked",
-		"UPDATE kine SET prev_revision = 150100 WHERE name = 'compact_rev_key'",
+		`UPDATE "kine" SET prev_revision = 150100 WHERE name = 'compact_rev_key'`,
 		"kp.prev_revision != 0",
 		"kd.deleted != 0",
-		"VACUUM (ANALYZE) kine;",
+		`VACUUM (ANALYZE) "kine";`,
 		"pg_advisory_unlock(20260921)",
 		lockBusyMarker,
 	} {
