@@ -3,6 +3,20 @@
 // which used them to parse its NODE_HOST_AGENT_* knobs — so subsystem
 // packages can own their env contracts. Each func reads os.Getenv
 // itself; unset/empty semantics mirror the original helpers exactly.
+//
+// Two contracts live here, kept distinct because they are different
+// user-facing agreements:
+//
+//   - the lenient family (String, Bool, Int, Int64, Duration, List,
+//     … and the *Knob table constructors) — node-host-agent's
+//     shell-knob convention: unrecognised input quietly falls back to
+//     the default;
+//   - the strict family (the Getenv* getters and Gate, marked below)
+//     — node-automation-controller's ConfigMap-flag convention,
+//     ported verbatim from its retired internal/platform/envx: an
+//     unparseable or out-of-range value warns (through Warnf) and
+//     falls back to the default, durations require Go format and a
+//     >=1s floor, and Gate accepts only exact "true"/"false".
 package envx
 
 import (
@@ -153,12 +167,12 @@ func Duration(key string, def time.Duration) time.Duration {
 	} else {
 		// Neither shape parsed — a typo'd knob silently pinned to the
 		// default is impossible to spot from the outside.
-		logger().Warn("unparseable env duration ignored — using default",
+		Warnf("unparseable env duration ignored — using default",
 			"env", key, "value", v, "default", def)
 		return def
 	}
 	if d <= 0 {
-		logger().Warn("non-positive env duration ignored — using default",
+		Warnf("non-positive env duration ignored — using default",
 			"env", key, "value", v, "default", def)
 		return def
 	}
@@ -189,13 +203,147 @@ func IntList(key string) []int {
 	for _, p := range List(key) {
 		n, err := strconv.Atoi(p)
 		if err != nil {
-			logger().Warn("non-numeric env list entry ignored",
+			Warnf("non-numeric env list entry ignored",
 				"env", key, "value", p)
 			continue
 		}
 		out = append(out, n)
 	}
 	return out
+}
+
+// Warnf is the sink for the "invalid env value — using default"
+// diagnostics emitted by the getters (Duration, IntList, and the
+// strict Getenv* family below). It defaults to the package slog
+// logger; an app on a different logging pipeline rebinds it once at
+// startup, before env knobs resolve — node-automation-controller
+// points it at controller-runtime's logr (logf.Log.WithName("env").Info)
+// so the warnings land in the same zap stream the retired
+// internal/platform/envx used. It is a plain func var: rebind before
+// the first getter call, not while env resolution may be running.
+var Warnf = func(msg string, kv ...any) {
+	logger().Warn(msg, kv...)
+}
+
+// --------------------------------------------------------------------
+// Strict family — node-automation-controller's ConfigMap-flag contract.
+//
+// The Getenv* getters and Gate below were ported verbatim from
+// apps/node-automation-controller/internal/platform/envx and keep its
+// semantics exactly, because they are the env contract of the
+// controller's operator-facing flag ConfigMaps (the ported
+// shell-operator CronJobs/kuberhealthy checks):
+//
+//   - an unparseable or out-of-range value warns via Warnf and falls
+//     back to the default rather than being silently accepted — a
+//     typo'd knob pinned to its default must be visible from outside;
+//   - warn records keep that app's kv names ("key"/"value"/"default"/
+//     "min", not this package's "env" convention) so its log pipeline
+//     sees the same record shape it always emitted;
+//   - durations accept ONLY Go duration format with a >=1s floor —
+//     every duration knob is a sweep interval where <=0 would panic
+//     time.NewTicker and a sub-second value would hot-loop the sweep
+//     (Duration above additionally accepts a bare integer as seconds
+//     for shell-knob parity; GetenvDuration does not);
+//   - Gate is exact-match: defaultOn=true enables unless the value is
+//     exactly "false" (explicit opt-out); defaultOn=false enables only
+//     when the value is exactly "true" (opt-in). Bool's lenient
+//     1/true/yes/on vocabulary does not apply.
+// --------------------------------------------------------------------
+
+// Getenv reads a string env knob, returning def when unset or empty —
+// identical semantics to String; the Getenv name is kept so the strict
+// family reads as one contract.
+func Getenv(key, def string) string {
+	return String(key, def)
+}
+
+// GetenvInt reads an integer env knob. An unparseable value warns and
+// falls back to def; the parsed value is kept verbatim — <=0 is a
+// legitimate setting for the replica-pin knobs (minReplicas<=0
+// disables the pin).
+func GetenvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+		Warnf("unparseable integer env value, using default",
+			"key", key, "value", v, "default", def)
+	}
+	return def
+}
+
+// GetenvDuration reads a duration env knob. Unparseable values warn
+// and fall back to def; so do parsed values < 1s — every duration
+// knob is a sweep interval, where <=0 is never meaningful and would
+// panic time.NewTicker downstream in shared.Periodic, and a
+// sub-second interval would hot-loop the sweep.
+func GetenvDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= time.Second {
+			return d
+		}
+		Warnf("invalid duration env value, using default",
+			"key", key, "value", v, "default", def)
+	}
+	return def
+}
+
+// GetenvFloat reads a float env knob with the same warn-and-fallback
+// contract as GetenvInt.
+func GetenvFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+		Warnf("unparseable float env value, using default",
+			"key", key, "value", v, "default", def)
+	}
+	return def
+}
+
+// GetenvIntMin is GetenvInt with a lower bound: parsed values < min
+// warn and fall back to def (e.g. a negative restart-limit knob would
+// flag every object). min applies to the PARSED value only — def is
+// returned verbatim whether or not it satisfies the bound, so callers
+// may express "disabled" defaults outside the valid-input range.
+func GetenvIntMin(key string, def, min int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= min {
+			return n
+		}
+		Warnf("invalid integer env value, using default",
+			"key", key, "value", v, "default", def, "min", min)
+	}
+	return def
+}
+
+// GetenvFloatPositive is GetenvFloat restricted to strictly positive
+// values: unparseable input and f <= 0 warn and fall back to def.
+// Values > 1 are kept — several threshold knobs document ">1 disables
+// the check" as the operator escape hatch.
+func GetenvFloatPositive(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			return f
+		}
+		Warnf("invalid float env value, using default",
+			"key", key, "value", v, "default", def)
+	}
+	return def
+}
+
+// Gate resolves a feature-gate env var. defaultOn=false is the
+// opt-in convention (enabled only when the value is exactly "true" —
+// the destructive/opt-in gates); defaultOn=true is the always-on
+// convention the ported CronJobs/kuberhealthy checks kept (enabled
+// unless the value is exactly "false" — an explicit opt-out via the
+// base-flags ConfigMap).
+func Gate(key string, defaultOn bool) bool {
+	if defaultOn {
+		return os.Getenv(key) != "false"
+	}
+	return os.Getenv(key) == "true"
 }
 
 // Knob is one row of a package's declarative env surface: Name is the

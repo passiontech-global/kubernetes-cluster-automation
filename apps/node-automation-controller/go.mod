@@ -4,6 +4,7 @@ go 1.27.3
 
 require (
 	github.com/go-logr/logr v1.4.4
+	github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit v0.0.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/robfig/cron/v3 v3.0.1
@@ -73,3 +74,5 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.2 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+replace github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit => ../../libs/hostkit

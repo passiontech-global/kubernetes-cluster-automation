@@ -36,8 +36,9 @@
 // module wires anything at all) live in the shared.Module registry —
 // see internal/registry; registry.SetupModules evaluates them and
 // stamps Deps.Disabled. Modules still resolve their own knobs and
-// sub-feature gates from env inside Setup — see
-// internal/platform/envx for the parsing helpers.
+// sub-feature gates from env inside Setup — see libs/hostkit/envx
+// for the parsing helpers (the Getenv*/Gate strict family; its
+// warnings are routed into the logr pipeline by internal/shared).
 package main
 
 import (

@@ -3,7 +3,7 @@
 // controller reads — the REGISTRATION gates in the internal/registry
 // module table (the GateEnv column) plus the run-behavior knobs and
 // sub-feature gates each module resolves through the envx.Getenv* /
-// envx.Gate helpers in internal/platform/envx/env.go. The catalog is
+// envx.Gate helpers in libs/hostkit/envx. The catalog is
 // maintained by hand, so it drifts the moment a knob lands in code
 // without a matching table row; TestEnvDocCoversSource walks the module
 // source, collects every env-var name the code can read, and fails with a
@@ -35,9 +35,11 @@ import (
 const moduleRoot = "../.."
 
 // envHelpers is the complete set of env-reading helpers exported by
-// internal/platform/envx/env.go. A call `envx.Xxx("NAME", ...)` — or an
-// unqualified `Xxx("NAME", ...)` inside package envx itself — reads the
-// env var named by its first argument. Keep this set in sync with env.go:
+// libs/hostkit/envx (the strict Getenv* family + Gate — the lenient
+// helpers there have different names and are not this app's contract).
+// A call `envx.Xxx("NAME", ...)` — or an unqualified `Xxx("NAME", ...)`
+// inside an in-tree envx package — reads the env var named by its first
+// argument. Keep this set in sync with the strict family in envx.go:
 // adding a new helper there without listing it here silently drops its
 // call sites from coverage.
 var envHelpers = map[string]bool{
@@ -74,10 +76,12 @@ var knownGaps = map[string]string{}
 //     cmd/manager/*.go and internal/**/*.go — both string literals and
 //     package-level string consts used as the key (partition-evictor keys
 //     its call off `const partitionNSsEnv`);
-//   - unqualified Getenv/Gate-family calls inside internal/platform/envx itself
-//     (there are none today, but a future helper calling another helper
-//     would land here). env.go's own DEFINITIONS take a `key` parameter,
-//     not a literal, so they collect nothing.
+//   - unqualified Getenv/Gate-family calls inside an in-tree envx
+//     package (dormant today — the helpers moved out to libs/hostkit,
+//     which this module-local scan never reaches, but a future
+//     internal/platform/envx-style package would land here). Helper
+//     DEFINITIONS take a `key` parameter, not a literal, so they
+//     collect nothing.
 //
 // *_test.go files are skipped (test-only env seams like GO_HELPER_PROCESS
 // are not operator surface) and internal/envdoc itself is never scanned —
@@ -155,6 +159,9 @@ func collectEnvNames(t *testing.T) (map[string]string, []string) {
 	t.Helper()
 
 	envdocDir := filepath.Join(moduleRoot, "internal", "envdoc")
+	// envx moved out to libs/hostkit — outside this module's scan
+	// tree — so envxDir matches nothing today; the inEnvx branch stays
+	// so a future in-tree envx package is covered.
 	envxDir := filepath.Join(moduleRoot, "internal", "platform", "envx")
 	registryDir := filepath.Join(moduleRoot, "internal", "registry")
 
