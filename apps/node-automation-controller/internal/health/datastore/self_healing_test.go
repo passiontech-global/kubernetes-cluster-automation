@@ -21,6 +21,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -119,6 +120,41 @@ func TestCheckStatefulMasterlessZeroEndpoints(t *testing.T) {
 	if _, err := cs.CoreV1().Pods(probefw.DragonflyOperatorNS).
 		Get(ctx, opPod.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("dragonfly operator pod must be deleted past 5m, err=%v", err)
+	}
+}
+
+// Restart resume: an STS still carrying the persisted first-seen
+// stamp past the 5m heal window bounces the dragonfly operator on
+// the FIRST post-restart sweep — the in-RAM ledger is empty but the
+// annotation proves the zero-endpoint streak held.
+func TestCheckStatefulMasterlessRestartResume(t *testing.T) {
+	statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
+	t.Cleanup(func() {
+		statefulServiceZeroEndpointsGauge.DeleteLabelValues("db", "dragonfly-master", "dragonfly")
+	})
+	base := time.Now()
+	sts := shSTS("db", "dragonfly", 3,
+		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
+	sts.Annotations = map[string]string{
+		kube.AnnoFirstSeenStatefulMasterless: `{"db/dragonfly-master/dragonfly":"` +
+			base.Add(-6*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	svc := shMasterSvc("db", "dragonfly-master",
+		map[string]string{"app": "dragonfly", "role": "master"})
+	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: probefw.DragonflyOperatorNS,
+		Name:      dragonflyOperatorPodPrefix + "-6f8bc-xy",
+		UID:       types.UID("dr-op-1"),
+	}}
+	cs := fake.NewSimpleClientset(sts, svc, opPod)
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("persisted masterless window must FAIL on the first sweep")
+	}
+	if _, err := cs.CoreV1().Pods(probefw.DragonflyOperatorNS).
+		Get(ctx, opPod.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("resumed window past 5m must bounce the operator, err=%v", err)
 	}
 }
 
@@ -340,6 +376,43 @@ func TestCheckRabbitMQSuspendedHeals(t *testing.T) {
 	}
 	if got != before+1 {
 		t.Fatalf("heals total = %v, want %v", got, before+1)
+	}
+}
+
+// Restart resume: a suspended pod still carrying the persisted
+// first-seen stamp past the 10m window heals on the FIRST
+// post-restart sweep — the in-RAM ledger is empty but the annotation
+// proves the suspended-listener wedge held.
+func TestCheckRabbitMQSuspendedRestartResume(t *testing.T) {
+	base := time.Now()
+	replicas := int32(3)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "mq", Name: "rabbitmq"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app.kubernetes.io/component": "rabbitmq"}},
+		},
+	}
+	stuck := shRabbitPod("mq", "rabbitmq-0", "u0", true, false)
+	stuck.Annotations = map[string]string{
+		kube.AnnoFirstSeenRabbitSuspended: `{"mq/rabbitmq-0/u0":"` +
+			base.Add(-11*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	peer1 := shRabbitPod("mq", "rabbitmq-1", "u1", true, true)
+	peer2 := shRabbitPod("mq", "rabbitmq-2", "u2", true, true)
+	cs := fake.NewSimpleClientset(sts, stuck, peer1, peer2)
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+	t.Cleanup(func() {
+		rabbitMQSuspendedHealsTotal.DeleteLabelValues("mq", "rabbitmq-0")
+	})
+
+	if res := probetest.MustCheck[*rabbitMQSuspendedCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("persisted suspended window past 10m must FAIL on the first sweep")
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "rabbitmq-0", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("resumed window must heal on the first sweep, err=%v", err)
 	}
 }
 

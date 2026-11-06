@@ -8,6 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -163,13 +164,35 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 	var due []corev1.Pod
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		key := pod.Namespace + "/" + pod.Name + "/" + string(pod.UID)
+		// The suspended-listener window gates a pod delete, so it
+		// runs the persisted (annotation-backed) variant — the stamp
+		// on the pod survives an operator restart that would
+		// otherwise re-arm the full 10m mid-wedge. A pod that reads
+		// healthy clears the stamp so a recurrence re-arms the full
+		// window; a clear failure is tolerated (Warn only) — the
+		// ledger Forget already landed, the durable half retries
+		// next sweep.
+		patch := func(ctx context.Context, data []byte) error {
+			_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(ctx,
+				pod.Name, types.MergePatchType, data,
+				metav1.PatchOptions{})
+			return err
+		}
 		if !rabbitSuspended(pod) {
+			if err := heal.ClearPersistedFirstSeen(ctx, log,
+				&p.rbSuspendedSince, pod,
+				kube.AnnoFirstSeenRabbitSuspended, key,
+				patch); err != nil {
+				log.Info("WARN: suspended-listener first-seen clear failed",
+					"pod", pod.Namespace+"/"+pod.Name, "error", err)
+			}
 			continue
 		}
-		key := pod.Namespace + "/" + pod.Name + "/" + string(pod.UID)
 		live[key] = true
-		if probefw.Persisted(&p.rbSuspendedSince, key, now,
-			rabbitSuspendedMinAge, log) {
+		if heal.FirstSeenPersisted(ctx, log, &p.rbSuspendedSince, pod,
+			kube.AnnoFirstSeenRabbitSuspended, key,
+			rabbitSuspendedMinAge, now, patch) {
 			rep.Find(pod.Namespace + "/" + pod.Name)
 			due = append(due, *pod)
 		}

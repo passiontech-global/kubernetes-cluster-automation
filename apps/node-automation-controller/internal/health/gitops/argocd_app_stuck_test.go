@@ -19,6 +19,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -147,6 +148,40 @@ func TestArgoCDAppStuckZeroReplicaNoAnnotationStillFlags(t *testing.T) {
 	}
 	if !strings.Contains(res.Why, "stalled-app") {
 		t.Fatalf("why missing app: %q", res.Why)
+	}
+}
+
+// Restart-resume: an Application carrying a persisted first-seen
+// stamp older than the Progressing window trips it on the FIRST
+// sweep and draws the refresh patch — the in-RAM ledger is empty
+// (operator restarted) but the annotation proves the stall held.
+func TestArgoCDAppStuckPersistedFirstSeenResume(t *testing.T) {
+	base := time.Now()
+	app := argoCDApplication("argocd", "resume-app", "Progressing")
+	app.SetAnnotations(map[string]string{
+		kube.AnnoFirstSeenArgoCDAppStuck: `{"prog/argocd/resume-app":"` +
+			base.Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`,
+	})
+	dyn := testutil.NewDynamicClient(app)
+	cs := fake.NewSimpleClientset()
+	p := testProberDyn(cs, dyn)
+	probetest.FreezeNow(p.Deps, base)
+	argoCDAppStuckGauge.DeleteLabelValues("argocd", "resume-app", "progressing>45m0s")
+	t.Cleanup(func() {
+		argoCDAppStuckGauge.DeleteLabelValues("argocd", "resume-app", "progressing>45m0s")
+	})
+
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("persisted Progressing must fail on the first post-restart sweep: %+v", res)
+	}
+	got, err := dyn.Resource(argocdAppGVR).Namespace("argocd").
+		Get(ctx, "resume-app", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetAnnotations()["argocd.argoproj.io/refresh"] != "hard" {
+		t.Fatal("resumed window did not fire the refresh patch")
 	}
 }
 

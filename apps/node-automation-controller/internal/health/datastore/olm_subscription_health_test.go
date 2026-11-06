@@ -17,6 +17,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -104,6 +105,38 @@ func TestCheckOLMHealthStuckCSVHeals(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("olm").
 		Get(ctx, "olm-operator-77dc", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("olm-operator must be deleted past 20m, err=%v", err)
+	}
+}
+
+// Restart resume: a CSV still carrying the persisted first-seen
+// stamp past the heal window bounces the olm-operator on the FIRST
+// post-restart sweep — the in-RAM ledger is empty but the per-reason
+// stamp map proves the stuck-CSV signature held.
+func TestCheckOLMHealthRestartResumeHeals(t *testing.T) {
+	t.Cleanup(func() {
+		olmUnhealthyResourcesGauge.DeleteLabelValues(
+			olmKindCSV, "operators", "rabbitmq.v1.2.3", olmReasonCSVStuck)
+		olmOperatorHealsTotal.DeleteLabelValues(olmReasonCSVStuck)
+	})
+	base := time.Now()
+	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "olm", Name: "olm-operator-77dc", UID: "o1"}}
+	cs := fake.NewSimpleClientset(opPod)
+	csv := olmUnstructured("operators.coreos.com/v1alpha1", "ClusterServiceVersion",
+		"operators", "rabbitmq.v1.2.3", map[string]any{"phase": "Installing"})
+	csv.SetAnnotations(map[string]string{
+		kube.AnnoFirstSeenOLMUnhealthy: `{"ClusterServiceVersion/operators/rabbitmq.v1.2.3/` +
+			olmReasonCSVStuck + `":"` +
+			base.Add(-21*time.Minute).UTC().Format(time.RFC3339) + `"}`})
+	p := testProberDyn(cs, probetest.OpDyn(csv))
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*olmHealthCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("persisted CSV window past the heal window must FAIL on the first sweep")
+	}
+	if _, err := cs.CoreV1().Pods("olm").
+		Get(ctx, "olm-operator-77dc", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("resumed window must bounce the operator, err=%v", err)
 	}
 }
 

@@ -105,6 +105,32 @@ func TestKedaGuardSkipsDownscalerManagedZero(t *testing.T) {
 	}
 }
 
+// The persisted twin of the unhealthy window: the ScaledObject
+// carries a first-seen stamp already past kedaUnhealthyMinAge — the
+// first post-restart sweep (empty ledger) must flag AND rescue, not
+// sit the proven signature out a fresh 15m.
+func TestKedaGuardRestartResume(t *testing.T) {
+	so := kedaObj("apps", "worker-scaler", "worker", 1, "False", "")
+	so.SetAnnotations(map[string]string{
+		kube.AnnoFirstSeenKedaScaledObject: `{"apps/worker-scaler":"` +
+			time.Now().Add(-(kedaUnhealthyMinAge + time.Minute)).
+				UTC().Format(time.RFC3339) + `"}`})
+	dep := zeroDeploy("apps", "worker", nil)
+	cs := fake.NewSimpleClientset(dep)
+	p := testProberDyn(cs, probetest.OpDyn(so))
+	res := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatalf("persisted window did not resume on the first post-restart sweep: %+v", res)
+	}
+	got, err := cs.AppsV1().Deployments("apps").Get(ctx, "worker", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 1 {
+		t.Fatalf("wedged target replicas = %v want 1", got.Spec.Replicas)
+	}
+}
+
 func TestKedaGuardPassesOnHealthyObjects(t *testing.T) {
 	so := kedaObj("apps", "worker-scaler", "worker", 1, "True", "True")
 	cs := fake.NewSimpleClientset()

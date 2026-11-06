@@ -246,3 +246,30 @@ func TestLeaseGuardKSMWedgeBounce(t *testing.T) {
 		t.Fatalf("lease_unhealthy ksm series = %v, want 1", m)
 	}
 }
+
+// The persisted twin of TestLeaseGuardKSMWedgeBounce: an operator
+// restart wiped the in-RAM ledger, but the pod carries a first-seen
+// stamp already past ksmWedgeMinAge — the first post-restart sweep
+// resumes the window and the bounce fires without a fresh 10m wait.
+func TestLeaseGuardKSMWedgeRestartResume(t *testing.T) {
+	pod := probetest.ReadyPodWithIP("monitoring",
+		"kube-state-metrics-6cc5c9d9b4-x2", "10.0.0.8",
+		map[string]string{"app.kubernetes.io/name": "kube-state-metrics"})
+	pod.Annotations = map[string]string{
+		kube.AnnoFirstSeenKSMWedge: `{"monitoring/kube-state-metrics-6cc5c9d9b4-x2":"` +
+			time.Now().Add(-(ksmWedgeMinAge + time.Minute)).
+				UTC().Format(time.RFC3339) + `"}`}
+	cs := fake.NewSimpleClientset(pod)
+	_, ch := leaseGuardProber(cs)
+	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
+		return leaseReasonKSMUnauthorized, nil
+	}
+
+	if res := ch.Run(ctx); res.Pass {
+		t.Fatal("persisted wedge window did not resume on the first post-restart sweep")
+	}
+	if _, err := cs.CoreV1().Pods("monitoring").
+		Get(ctx, "kube-state-metrics-6cc5c9d9b4-x2", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("wedged ksm pod was not bounced on the resumed window: %v", err)
+	}
+}

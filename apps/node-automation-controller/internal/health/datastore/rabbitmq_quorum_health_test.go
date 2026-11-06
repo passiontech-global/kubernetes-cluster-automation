@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 func TestRabbitMQQuorumAlarmFails(t *testing.T) {
@@ -43,6 +44,43 @@ func TestRabbitMQQuorumAlarmFails(t *testing.T) {
 	if !strings.Contains(res.Why, "rabbitmq-server-0") ||
 		!strings.Contains(res.Why, "fd_limit_alarm") {
 		t.Fatalf("why missing diagnostics: %q", res.Why)
+	}
+}
+
+// Restart resume: a member pod still carrying the persisted
+// first-seen stamp for its alarm signal heals on the FIRST
+// post-restart sweep — the in-RAM ledger is empty but the
+// annotation proves the signal held past the 10m window.
+func TestRabbitMQQuorumPromResumeHeals(t *testing.T) {
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "file_descriptor_limit") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
+				Value:  1,
+			}}
+		}
+		return nil
+	})
+	base := time.Now()
+	flagged := rabbitMQMemberPod("mq", "rabbitmq-server-0", true)
+	flagged.Annotations = map[string]string{
+		kube.AnnoFirstSeenRabbitQuorum: `{"prom/mq/rabbitmq-server-0":"` +
+			base.Add(-15*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	r1 := rabbitMQMemberPod("mq", "rabbitmq-server-1", true)
+	r2 := rabbitMQMemberPod("mq", "rabbitmq-server-2", true)
+	cs := fake.NewSimpleClientset(flagged, r1, r2)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	p.Now = func() time.Time { return base }
+
+	res := probetest.MustCheck[*rabbitMQQuorumHealthCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("persisted quorum window past 10m must FAIL on the first sweep")
+	}
+	if _, err := cs.CoreV1().Pods("mq").
+		Get(ctx, "rabbitmq-server-0", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("resumed window must heal on the first sweep, err=%v", err)
 	}
 }
 

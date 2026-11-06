@@ -10,14 +10,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -167,13 +168,35 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 		key := ns + "/" + name
 		sig := "link/" + key
 		seenKeep[sig] = true
-		if !probefw.Persisted(&p.seen, sig, now, dragonflyLinkMinAge,
-			logr.Discard()) {
+		pod := podByKey[key]
+		// The link-storm window gates a pod restart, so it runs the
+		// persisted (annotation-backed) variant whenever a pod exists
+		// to carry the stamp — the annotation survives an operator
+		// restart that would otherwise re-arm the full 5m mid-storm.
+		// A series whose pod is already gone from the census has no
+		// annotation carrier (FirstSeenPersisted needs a real object):
+		// keep the pure in-RAM window — the heal cannot target a
+		// missing pod anyway.
+		persisted := false
+		if pod != nil {
+			persisted = heal.FirstSeenPersisted(ctx, log, &p.seen, pod,
+				kube.AnnoFirstSeenDragonflyLinkStorm, sig,
+				dragonflyLinkMinAge, now,
+				func(ctx context.Context, data []byte) error {
+					_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(
+						ctx, pod.Name, types.MergePatchType, data,
+						metav1.PatchOptions{})
+					return err
+				})
+		} else {
+			persisted = probefw.Persisted(&p.seen, sig, now,
+				dragonflyLinkMinAge, log)
+		}
+		if !persisted {
 			continue // link down must persist the window
 		}
 		rep.Emit(dragonflyReplicaSyncStormGauge, key, []string{ns, name}, key)
 
-		pod := podByKey[key]
 		if pod == nil || pod.DeletionTimestamp != nil {
 			continue
 		}
@@ -193,6 +216,28 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 		}
 		p.DeletePodHeal(ctx, log, CheckNameDragonflySyncStorm,
 			key, pod, dragonflySyncHealCool, now)
+	}
+	// A pod whose link signature went quiet drops its persisted stamp
+	// so the next drop re-arms the full window — a stale stamp would
+	// fast-trip the restart. Terminating pods are skipped (the stamp
+	// dies with them); a clear failure is a tolerated sub-failure —
+	// the ledger Forget already landed, the annotation retry is
+	// Warn-only.
+	for key, pod := range podByKey {
+		if seenKeep["link/"+key] || pod.DeletionTimestamp != nil {
+			continue
+		}
+		if err := heal.ClearPersistedFirstSeen(ctx, log, &p.seen, pod,
+			kube.AnnoFirstSeenDragonflyLinkStorm, "link/"+key,
+			func(ctx context.Context, data []byte) error {
+				_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(ctx,
+					pod.Name, types.MergePatchType, data,
+					metav1.PatchOptions{})
+				return err
+			}); err != nil {
+			log.Info("WARN: dragonfly link-storm first-seen clear failed",
+				"pod", key, "error", err)
+		}
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
 	stormNote := "storm=confirmed"

@@ -19,9 +19,11 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -92,6 +94,17 @@ func (p *controllerLeaseGuardCheck) checkKSMWedged(ctx context.Context,
 			continue
 		}
 		key := pod.Namespace + "/" + pod.Name
+		// stampPatch delivers this pod's first-seen merge patch —
+		// the durable half of the wedge window below: the window
+		// gates a pod bounce, so the stamp lives on the pod itself
+		// (and dies with it) for a restarted operator to resume
+		// rather than re-arming a signature that already held.
+		stampPatch := func(ctx context.Context, data []byte) error {
+			_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(ctx,
+				pod.Name, types.MergePatchType, data,
+				metav1.PatchOptions{})
+			return err
+		}
 		reason, err := p.ksmWedgeReason(ctx, pod)
 		if err != nil {
 			// Inconclusive, not clean — a broken log/metrics read
@@ -108,11 +121,24 @@ func (p *controllerLeaseGuardCheck) checkKSMWedged(ctx context.Context,
 			continue
 		}
 		if reason == "" {
+			// Resolved — the pod evaluated healthy, so the stamp
+			// must leave BOTH clocks (a lingering annotation would
+			// fast-trip the next wedge's window). A failed clear is
+			// Warn'd inside and tolerated: the ledger Forget already
+			// landed, only the durable half can linger a sweep.
+			_ = heal.ClearPersistedFirstSeen(ctx, log, &p.wedgeSeen,
+				pod, kube.AnnoFirstSeenKSMWedge, key, stampPatch)
 			continue
 		}
 		wedgeLive[key] = true
-		if !probefw.Persisted(&p.wedgeSeen, key, now,
-			ksmWedgeMinAge, log) {
+		// The window gates the pod-delete remediation below — the
+		// annotation-backed variant, so an operator restart resumes
+		// the count instead of sitting a proven wedge out a second
+		// full window (the inconclusive path above deliberately
+		// does NOT clear: it keeps tracking + carried series).
+		if !heal.FirstSeenPersisted(ctx, log, &p.wedgeSeen, pod,
+			kube.AnnoFirstSeenKSMWedge, key, ksmWedgeMinAge, now,
+			stampPatch) {
 			continue
 		}
 		p.emitUnhealthy(rep, pod.Namespace, pod.Name, reason)

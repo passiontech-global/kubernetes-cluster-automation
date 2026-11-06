@@ -24,11 +24,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -303,18 +305,48 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	var due []masterlessDue     // past the heal window
 	for _, c := range candidates {
 		key := c.ns + "/" + c.svc + "/" + c.sts.Name
+		sts := c.sts
+		patch := func(ctx context.Context, data []byte) error {
+			_, err := p.CS.AppsV1().StatefulSets(sts.Namespace).Patch(ctx,
+				sts.Name, types.MergePatchType, data,
+				metav1.PatchOptions{})
+			return err
+		}
 		if ready[c.ns+"/"+c.svc] > 0 {
-			continue // master reachable — drop any streak
+			// Master reachable — the signature resolved on a live
+			// object: drop the persisted stamp so a recurrence
+			// re-arms the full window (a stale stamp would
+			// fast-trip the heal). Tolerated sub-failure — the
+			// ledger Forget already landed, the annotation retry
+			// is Warn-only.
+			if err := heal.ClearPersistedFirstSeen(ctx, log,
+				&p.stsZeroSince, sts,
+				kube.AnnoFirstSeenStatefulMasterless, key,
+				patch); err != nil {
+				log.Info("WARN: masterless first-seen clear failed",
+					"statefulset", sts.Namespace+"/"+sts.Name,
+					"error", err)
+			}
+			continue
 		}
 		seen[key] = true
-		if !probefw.Persisted(&p.stsZeroSince, key, now,
-			masterlessZeroMinAge, log) {
+		// The zero-endpoint streak gates the dragonfly/db-operator
+		// bounce and the W7-C3 ordinal-0 pod delete, so it runs the
+		// persisted (annotation-backed) variant — the stamp on the
+		// STS survives an operator restart that would otherwise
+		// re-arm the gauge and heal windows mid-wedge.
+		if !heal.FirstSeenPersisted(ctx, log, &p.stsZeroSince, sts,
+			kube.AnnoFirstSeenStatefulMasterless, key,
+			masterlessZeroMinAge, now, patch) {
 			continue
 		}
 		rep.Emit(statefulServiceZeroEndpointsGauge, key,
 			[]string{c.ns, c.svc, c.sts.Name}, key)
 		// The heal window reads the same streak — Seen never
-		// re-stamps, so the already-observed key reports its age.
+		// re-stamps, and reports the WIDER window once
+		// FirstSeenPersisted Seeds a resumed persisted stamp back
+		// into the ledger (a streak that crossed a restart keeps
+		// its full age).
 		if age, _ := p.stsZeroSince.Seen(key, now); age >= masterlessHealMinAge {
 			due = append(due, masterlessDue{svc: c, since: now.Add(-age)})
 		}

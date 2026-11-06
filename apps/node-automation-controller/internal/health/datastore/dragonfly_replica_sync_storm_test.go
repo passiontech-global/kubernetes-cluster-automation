@@ -16,7 +16,40 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
+
+// Restart resume: a replica still carrying the persisted first-seen
+// stamp past the 5m window restarts on the FIRST post-restart sweep —
+// the in-RAM ledger is empty but the annotation proves the link-down
+// held; the master is still never restarted.
+func TestDragonflySyncStormResumeRestarts(t *testing.T) {
+	srv := dragonflyPromServer(t)
+	base := time.Now()
+	replica := dragonflyMemberPod("dragonfly", "dragonfly-replica-1", "replica")
+	replica.Annotations = map[string]string{
+		kube.AnnoFirstSeenDragonflyLinkStorm: `{"link/dragonfly/dragonfly-replica-1":"` +
+			base.Add(-6*time.Minute).UTC().Format(time.RFC3339) + `"}`}
+	master := dragonflyMemberPod("dragonfly", "dragonfly-master-0", "master")
+	cs := fake.NewSimpleClientset(replica, master)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	p.Now = func() time.Time { return base }
+
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(ctx)
+	if res.Pass {
+		t.Fatal("persisted link-storm window must FAIL on the first sweep")
+	}
+	if _, err := cs.CoreV1().Pods("dragonfly").
+		Get(ctx, "dragonfly-replica-1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("resumed window must restart the replica, err=%v", err)
+	}
+	if _, err := cs.CoreV1().Pods("dragonfly").
+		Get(ctx, "dragonfly-master-0", metav1.GetOptions{}); err != nil {
+		t.Fatal("master must never be restarted")
+	}
+}
 
 func TestDragonflySyncStormRestartsReplicaNotMaster(t *testing.T) {
 	srv := dragonflyPromServer(t)

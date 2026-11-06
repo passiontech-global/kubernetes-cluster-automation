@@ -7,6 +7,7 @@ package gitops
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -36,8 +38,13 @@ type argoCDAppStuckCheck struct {
 
 	// seen tracks each stuck signature's first-seen sweep — the
 	// persistence clock for health/condition shapes that carry no
-	// timestamp of their own; pruned when the signature resolves so
-	// a later stall re-arms the window.
+	// timestamp of their own. The windows gate remediation (the
+	// refresh patch AND the repo-server restart), so the ledger
+	// runs the persisted variant: stamps ride the Application as a
+	// per-key annotation map (kube.AnnoFirstSeenArgoCDAppStuck — one
+	// map holds the "prog/" and every "cond/" key of an app) and a
+	// restart resumes them; a resolved signature's key is cleared
+	// so a later stall re-arms the window.
 	seen state.FirstSeenLedger
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
@@ -115,17 +122,39 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		ns, name := app.GetNamespace(), app.GetName()
 		var reasons []string
 
+		// patchApp is the durable-write half every persisted
+		// first-seen call on this Application shares — several
+		// signatures stamp/clear keys in the same per-object
+		// annotation map per sweep, and the LISTED copy is stale
+		// the moment the first write lands: mirroring each patch
+		// into app keeps later reads current, or a second write
+		// would drop a sibling key the earlier one just set (an
+		// intra-sweep lost update the serial sweep otherwise
+		// cannot see).
+		patchApp := func(ctx context.Context, data []byte) error {
+			if _, err := p.Dyn.Resource(argocdAppGVR).
+				Namespace(ns).Patch(ctx, name, types.MergePatchType,
+				data, metav1.PatchOptions{}); err != nil {
+				return err
+			}
+			mergeAnnoPatchLocally(app, data)
+			return nil
+		}
+
 		health, _ := kube.NestedString(app.Object,
 			"status", "health", "status")
 		// A Progressing roll-up whose only non-Healthy managed
 		// workloads are ones the go-kube-downscaler parked at
 		// replicas:0 is sleep, not stuck evidence — the downscaler
-		// wakes them on schedule.
+		// wakes them on schedule. The window gates the refresh
+		// patch, so the first-seen rides the Application as a
+		// durable annotation (wider of ledger vs annotation).
 		if health == "Progressing" && !p.argocdAppOnlyDownscaled(ctx, app) {
 			sig := "prog/" + ns + "/" + name
 			seenKeep[sig] = true
-			if probefw.Persisted(&p.seen, sig, now,
-				argocdAppProgressingMinAge, logr.Discard()) {
+			if heal.FirstSeenPersisted(ctx, log, &p.seen, app,
+				kube.AnnoFirstSeenArgoCDAppStuck, sig,
+				argocdAppProgressingMinAge, now, patchApp) {
 				reasons = append(reasons,
 					fmt.Sprintf("progressing>%s", argocdAppProgressingMinAge))
 			}
@@ -145,12 +174,13 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 			sig := "cond/" + ns + "/" + name + "/" + typ
 			seenKeep[sig] = true
 			// lastTransitionTime is the condition's own clock;
-			// absent/malformed falls back to the first-seen ledger —
-			// inside the persistence window the signature doesn't
-			// count yet (quiet site: no first-seen log).
+			// absent/malformed falls back to the persisted
+			// first-seen window — inside it the signature doesn't
+			// count yet.
 			if c.LastTransitionTime.IsZero() {
-				if !probefw.Persisted(&p.seen, sig, now,
-					argocdConditionMinAge, logr.Discard()) {
+				if !heal.FirstSeenPersisted(ctx, log, &p.seen, app,
+					kube.AnnoFirstSeenArgoCDAppStuck, sig,
+					argocdConditionMinAge, now, patchApp) {
 					continue
 				}
 			} else if now.Sub(c.LastTransitionTime) < argocdConditionMinAge {
@@ -161,6 +191,28 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 				hasComparisonError = true
 			} else {
 				reasonSet["invalid_spec_error"] = true
+			}
+		}
+		// Resolution clears — every first-seen key persisted on
+		// this Application whose signature did NOT evaluate live
+		// this sweep is resolved: health left Progressing (or the
+		// downscaler excuse now applies), or a condition type
+		// dropped out of status.conditions entirely (absent = the
+		// only "resolved" a status-less ApplicationCondition can
+		// show). Clearing drops the key from BOTH clocks so a
+		// recurrence re-arms the full window — a stale stamp would
+		// fast-trip it (premature remediation). Tolerated
+		// sub-failure: Warn + continue, retry next sweep.
+		for sig := range argoPersistedFirstSeen(app) {
+			if seenKeep[sig] {
+				continue
+			}
+			if err := heal.ClearPersistedFirstSeen(ctx, log,
+				&p.seen, app, kube.AnnoFirstSeenArgoCDAppStuck,
+				sig, patchApp); err != nil {
+				log.Info("WARN: persisted first-seen clear failed — "+
+					"a stale stamp could fast-trip the next stall",
+					"application", ns+"/"+name, "key", sig, "error", err)
 			}
 		}
 		for r := range reasonSet {
@@ -276,6 +328,58 @@ func (p *argoCDAppStuckCheck) refreshArgoCDApp(ctx context.Context,
 	p.Heals.Stamp(ck, now)
 	log.Info("PATCH: argocd application refresh=hard",
 		"application", app.GetNamespace()+"/"+app.GetName())
+}
+
+// argoPersistedFirstSeen returns the first-seen keys persisted on
+// this Application — the annotation map is per-object, so every
+// entry is one of this app's signatures. Absent/unparseable reads
+// as empty (same "unparseable = absent" posture as
+// kube.ParseAnnoTime); the in-RAM half needs no enumeration —
+// p.seen.Prune drops non-live keys at sweep end.
+func argoPersistedFirstSeen(app *unstructured.Unstructured) map[string]bool {
+	sigs := map[string]bool{}
+	raw := app.GetAnnotations()[kube.AnnoFirstSeenArgoCDAppStuck]
+	if raw == "" {
+		return sigs
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return sigs
+	}
+	for k := range m {
+		sigs[k] = true
+	}
+	return sigs
+}
+
+// mergeAnnoPatchLocally applies a landed
+// {"metadata":{"annotations":{k:v|null}}} merge patch to the LISTED
+// copy of obj — the serial sweep sees no apiserver echo, so without
+// the mirror a second annotation write this sweep would compute its
+// patch from the pre-write state (an app's "prog/" and "cond/" keys
+// share one annotation map, so a stale read can resurrect a
+// cleared key or drop a just-stamped one).
+func mergeAnnoPatchLocally(obj metav1.Object, data []byte) {
+	var doc struct {
+		Metadata struct {
+			Annotations map[string]*string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return
+	}
+	annos := obj.GetAnnotations()
+	if annos == nil {
+		annos = map[string]string{}
+	}
+	for k, v := range doc.Metadata.Annotations {
+		if v == nil {
+			delete(annos, k)
+			continue
+		}
+		annos[k] = *v
+	}
+	obj.SetAnnotations(annos)
 }
 
 // restartArgoCDRepoServer deletes the OLDEST argocd-repo-server

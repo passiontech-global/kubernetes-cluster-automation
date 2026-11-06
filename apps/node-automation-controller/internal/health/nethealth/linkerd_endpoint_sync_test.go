@@ -16,6 +16,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -166,6 +167,49 @@ func TestCheckLinkerdEndpointSyncResyncClears(t *testing.T) {
 	if m := probetest.FindMetric(t, "node_automation_linkerd_endpoint_desync",
 		map[string]string{"namespace": "app", "service": "headless-svc"}); m != nil {
 		t.Fatal("desync gauge not cleared after resync")
+	}
+}
+
+// Restart-resume: a Service carrying a persisted first-seen stamp
+// older than the desync window trips it on the FIRST sweep — the
+// in-RAM ledger is empty (operator restarted) but the annotation
+// proves the desync held continuously.
+func TestCheckLinkerdEndpointSyncPersistedFirstSeenResume(t *testing.T) {
+	base := time.Now()
+	svc := probetest.HeadlessService("app", "resume-svc",
+		map[string]string{"app": "x"})
+	svc.Annotations = map[string]string{
+		kube.AnnoFirstSeenLinkerdEndpointSync: `{"app/resume-svc":"` +
+			base.Add(-20*time.Minute).UTC().Format(time.RFC3339) + `"}`,
+	}
+	dest := linkerdDestinationPod(probefw.LinkerdDestinationName+"-old-111", 2*time.Hour)
+	cs := fake.NewSimpleClientset(
+		linkerdInjectedNamespace("app"),
+		svc,
+		probetest.ReadyPodWithIP("app", "pod-0", "10.244.0.5",
+			map[string]string{"app": "x"}),
+		// EndpointSlice holds a stale IP — the Ready pod IP is missing.
+		probetest.EndpointSliceForService("app", "resume-svc", "10.244.0.9"),
+		dest,
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+	linkerdEndpointDesyncGauge.DeleteLabelValues("app", "resume-svc")
+	t.Cleanup(func() {
+		linkerdEndpointDesyncGauge.DeleteLabelValues("app", "resume-svc")
+	})
+
+	if res := probetest.MustCheck[*linkerdEndpointSyncCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("persisted desync must fail on the first post-restart sweep")
+	}
+	m := probetest.FindMetric(t, "node_automation_linkerd_endpoint_desync",
+		map[string]string{"namespace": "app", "service": "resume-svc"})
+	if m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("desync gauge = %v, want 1", m)
+	}
+	if _, err := cs.CoreV1().Pods(probefw.LinkerdNS).
+		Get(ctx, dest.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("linkerd-destination pod not bounced on the resumed window")
 	}
 }
 
