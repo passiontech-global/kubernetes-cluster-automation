@@ -36,7 +36,10 @@ type kedaScaledObjectGuardCheck struct {
 
 	// seen tracks each unhealthy ScaledObject's first-seen sweep —
 	// the 15m persistence window; pruned on recovery so a later
-	// failure re-arms instead of instantly re-firing.
+	// failure re-arms instead of instantly re-firing. The window
+	// gates the zero-target rescue (a workload scale mutation), so
+	// it runs the annotation-backed variant — stamped on the
+	// ScaledObject under kube.AnnoFirstSeenKedaScaledObject.
 	seen state.FirstSeenLedger
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
@@ -106,6 +109,19 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 	seenKeep := map[string]bool{}
 	for i := range sos.Items {
 		so := &sos.Items[i]
+		key := so.GetNamespace() + "/" + so.GetName()
+		// annoPatch delivers this ScaledObject's first-seen merge
+		// patch — the durable half of the window below: the window
+		// gates the zero-target rescue (a workload scale mutation),
+		// so the stamp lives on the ScaledObject for a restarted
+		// operator to resume rather than re-arming a signature that
+		// already held.
+		annoPatch := func(ctx context.Context, data []byte) error {
+			_, err := p.Dyn.Resource(kube.GVRKedaScaledObject).
+				Namespace(so.GetNamespace()).Patch(ctx, so.GetName(),
+				types.MergePatchType, data, metav1.PatchOptions{})
+			return err
+		}
 		var reasons []string
 		if c, ok := kube.ConditionOf(so.Object, "Ready"); ok && c.Status == "False" {
 			reasons = append(reasons, "ready_false")
@@ -114,13 +130,23 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 			reasons = append(reasons, "active_unknown")
 		}
 		if len(reasons) == 0 {
+			// Resolved — the ScaledObject evaluated healthy, so the
+			// stamp must leave BOTH clocks (a lingering annotation
+			// would fast-trip the next failure's window). No-op when
+			// never stamped; a failed clear is Warn'd inside and
+			// tolerated — the ledger Forget already landed.
+			_ = heal.ClearPersistedFirstSeen(ctx, logr.Discard(), &p.seen,
+				so, kube.AnnoFirstSeenKedaScaledObject, key, annoPatch)
 			continue
 		}
-		key := so.GetNamespace() + "/" + so.GetName()
 		seenKeep[key] = true
-		// Quiet site: first-seen tracking needs no log line.
-		if !probefw.Persisted(&p.seen, key, now, kedaUnhealthyMinAge,
-			logr.Discard()) {
+		// Quiet site: first-seen tracking needs no log line. The
+		// annotation-backed variant — the stamp on the ScaledObject
+		// lets a restarted operator honor a window it never saw
+		// in RAM.
+		if !heal.FirstSeenPersisted(ctx, logr.Discard(), &p.seen, so,
+			kube.AnnoFirstSeenKedaScaledObject, key,
+			kedaUnhealthyMinAge, now, annoPatch) {
 			continue
 		}
 		for _, reason := range reasons {

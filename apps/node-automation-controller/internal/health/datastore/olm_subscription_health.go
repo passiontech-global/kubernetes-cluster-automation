@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,6 +13,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -147,10 +151,19 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	// live signatures keyed "kind/ns/name/reason" — the value is the
 	// exact gauge label tuple so emission never re-splits the key.
+	// objByKey maps each live key to the object carrying its
+	// first-seen stamp; audited records every object evaluated this
+	// sweep (to its GVR) so stamps whose signature resolved get
+	// cleared below — the CSV and Subscription lists are disjoint,
+	// so one object is never audited under two GVRs.
 	live := map[string][]string{}
-	addLive := func(kind, ns, name, reason string) {
-		live[kind+"/"+ns+"/"+name+"/"+reason] =
-			[]string{kind, ns, name, reason}
+	objByKey := map[string]*unstructured.Unstructured{}
+	audited := map[*unstructured.Unstructured]schema.GroupVersionResource{}
+	addLive := func(kind, ns, name, reason string,
+		obj *unstructured.Unstructured) {
+		k := kind + "/" + ns + "/" + name + "/" + reason
+		live[k] = []string{kind, ns, name, reason}
+		objByKey[k] = obj
 	}
 	csvs, err := p.Dyn.Resource(olmCSVGVR).List(ctx, metav1.ListOptions{})
 	switch {
@@ -161,16 +174,17 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 	default:
 		for i := range csvs.Items {
 			csv := &csvs.Items[i]
+			audited[csv] = olmCSVGVR
 			phase, _ := kube.NestedString(csv.Object, "status", "phase")
 			if phase != "Succeeded" {
 				addLive(olmKindCSV, csv.GetNamespace(), csv.GetName(),
-					olmReasonCSVStuck)
+					olmReasonCSVStuck, csv)
 			}
 			if ts, found := kube.NestedString(
 				csv.Object, "status", "certsRotateAt"); found && ts != "" {
 				if t, err := time.Parse(time.RFC3339, ts); err == nil && now.After(t) {
 					addLive(olmKindCSV, csv.GetNamespace(), csv.GetName(),
-						olmReasonCertOverdue)
+						olmReasonCertOverdue, csv)
 				}
 			}
 		}
@@ -183,6 +197,7 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 	default:
 		for i := range subs.Items {
 			sub := &subs.Items[i]
+			audited[sub] = olmSubGVR
 			for _, c := range kube.Conditions(sub.Object, "status", "conditions") {
 				if c.Status != "True" {
 					continue
@@ -190,10 +205,10 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 				switch c.Type {
 				case "CatalogSourcesUnhealthy":
 					addLive(olmKindSubscription, sub.GetNamespace(),
-						sub.GetName(), olmReasonCatalogUnhealthy)
+						sub.GetName(), olmReasonCatalogUnhealthy, sub)
 				case "ResolutionFailed":
 					addLive(olmKindSubscription, sub.GetNamespace(),
-						sub.GetName(), olmReasonResolutionFailed)
+						sub.GetName(), olmReasonResolutionFailed, sub)
 				}
 			}
 		}
@@ -206,17 +221,72 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 		return ok
 	})
 	for k, lv := range live {
-		if !probefw.Persisted(&p.olmFirstSeen, k, now,
-			olmUnhealthyMinAge, log) {
+		obj := objByKey[k]
+		gvr := olmCSVGVR
+		if lv[0] == olmKindSubscription {
+			gvr = olmSubGVR
+		}
+		ns, name := lv[1], lv[2]
+		// The unhealthy window gates the olm-operator pod delete (and
+		// the gauge), so it runs the persisted (annotation-backed)
+		// variant — the per-reason stamp map on the CR survives an
+		// operator restart that would otherwise re-arm the full
+		// 15m/20m windows. The patch closure also applies the merge
+		// to the listed object: several live keys can share one
+		// object's map and each stamp re-reads it — an un-synced
+		// second stamp would clobber the first until the next List.
+		if !heal.FirstSeenPersisted(ctx, log, &p.olmFirstSeen, obj,
+			kube.AnnoFirstSeenOLMUnhealthy, k, olmUnhealthyMinAge, now,
+			func(ctx context.Context, data []byte) error {
+				applyAnnoMerge(obj, data)
+				_, err := p.Dyn.Resource(gvr).Namespace(ns).Patch(ctx,
+					name, types.MergePatchType, data,
+					metav1.PatchOptions{})
+				return err
+			}) {
 			continue
 		}
 		rep.Emit(olmUnhealthyResourcesGauge, k, lv, k)
 		// The heal is CSV-scoped: a subscription failure is the
 		// catalog's problem, not olm-operator's queue. Seen reads
-		// the same streak — never re-stamps.
+		// the same streak — never re-stamps — and reports the WIDER
+		// window once FirstSeenPersisted Seeds a resumed persisted
+		// stamp back into the ledger.
 		if lv[0] == olmKindCSV {
 			if age, _ := p.olmFirstSeen.Seen(k, now); age >= olmHealMinAge {
 				healReasons[lv[3]] = true
+			}
+		}
+	}
+	// Resolved-signature clear: an audited object drops every anno'd
+	// key that left this sweep's live set so a recurrence re-arms
+	// the full window — a stale stamp would fast-trip the gauge and
+	// the heal. Tolerated sub-failure: the ledger Forget already
+	// landed, the annotation retry is Warn-only.
+	for obj, gvr := range audited {
+		stamped := map[string]string{}
+		if raw := obj.GetAnnotations()[kube.AnnoFirstSeenOLMUnhealthy]; raw != "" {
+			if err := json.Unmarshal([]byte(raw), &stamped); err != nil {
+				continue // unparseable = absent — same posture as the helper
+			}
+		}
+		for k := range stamped {
+			if _, ok := live[k]; ok {
+				continue
+			}
+			if err := heal.ClearPersistedFirstSeen(ctx, log,
+				&p.olmFirstSeen, obj, kube.AnnoFirstSeenOLMUnhealthy, k,
+				func(ctx context.Context, data []byte) error {
+					applyAnnoMerge(obj, data)
+					_, err := p.Dyn.Resource(gvr).
+						Namespace(obj.GetNamespace()).
+						Patch(ctx, obj.GetName(), types.MergePatchType,
+							data, metav1.PatchOptions{})
+					return err
+				}); err != nil {
+				log.Info("WARN: olm first-seen clear failed — "+
+					"a stale stamp could fast-trip a recurrence",
+					"key", k, "error", err)
 			}
 		}
 	}
@@ -285,4 +355,35 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	for _, r := range reasons {
 		olmOperatorHealsTotal.WithLabelValues(r).Inc()
 	}
+}
+
+// applyAnnoMerge applies a {"metadata":{"annotations":{k:v|null}}}
+// merge patch to the already-listed object so a second stamp — or a
+// clear — in the SAME sweep sees the first write: several OLM
+// reason-keys share one object's first-seen map and every stamp
+// re-reads that map, so an un-synced second write would clobber the
+// first (or a clear would wipe a just-stamped sibling) until the
+// next List re-fetches. Malformed payloads are ignored — the input
+// is always kube.MergePatchAnnos output.
+func applyAnnoMerge(obj metav1.Object, data []byte) {
+	var doc struct {
+		Metadata struct {
+			Annotations map[string]*string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return
+	}
+	annos := obj.GetAnnotations()
+	if annos == nil {
+		annos = map[string]string{}
+	}
+	for k, v := range doc.Metadata.Annotations {
+		if v == nil {
+			delete(annos, k)
+			continue
+		}
+		annos[k] = *v
+	}
+	obj.SetAnnotations(annos)
 }

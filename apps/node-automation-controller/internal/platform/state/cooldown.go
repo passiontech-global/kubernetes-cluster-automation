@@ -109,6 +109,23 @@ func (l *FirstSeenLedger) Observe(key string, now time.Time) (first time.Time, s
 	return now, false
 }
 
+// Seed records first as key's first-seen when key is untracked OR
+// first predates the current stamp — the persisted-annotation
+// restore path: a stamp recovered off the target object must win
+// the ledger's first sighting so the window keeps counting from the
+// original observation instead of re-arming at the post-restart
+// sweep. Seeds only ever move the stamp EARLIER (the wider window
+// wins, matching the wider-of-two-clocks persisted-cooldown
+// contract); a later seed never rejuvenates the window.
+func (l *FirstSeenLedger) Seed(key string, first time.Time) {
+	if l.seen == nil {
+		l.seen = map[string]time.Time{}
+	}
+	if t, ok := l.seen[key]; !ok || first.Before(t) {
+		l.seen[key] = first
+	}
+}
+
 // Seen reports how long key has been tracked — (age, true) for a
 // tracked key, (0, false) otherwise. Unlike Observe it never stamps,
 // so it suits read-only checks that must not create ledger entries.

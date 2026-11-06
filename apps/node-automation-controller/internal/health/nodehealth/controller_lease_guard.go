@@ -64,7 +64,10 @@ type controllerLeaseGuardCheck struct {
 	// first-seen sweep — the persistence window a reflector/401
 	// wedge must outlast before the pod counts as wedged; pruned on
 	// recovery so a later wedge re-arms instead of instantly
-	// re-firing.
+	// re-firing. The window gates a pod bounce, so it runs the
+	// annotation-backed variant (heal.FirstSeenPersisted, stamped
+	// on the pod under kube.AnnoFirstSeenKSMWedge) — a restart
+	// resumes the count instead of re-arming it.
 	wedgeSeen state.FirstSeenLedger
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a

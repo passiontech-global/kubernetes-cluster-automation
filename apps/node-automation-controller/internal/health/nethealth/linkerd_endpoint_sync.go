@@ -36,9 +36,13 @@ type linkerdEndpointSyncCheck struct {
 
 	// W9-NM2 watchdog state (serial sweep — unguarded):
 	//   - linkerdDesyncSince: "ns/svc" → first sweep the Service's
-	//     EndpointSlice diverged from its Ready pod IPs;
-	//     pruned when the divergence resolves so a later desync
-	//     re-arms the window.
+	//     EndpointSlice diverged from its Ready pod IPs. The window
+	//     gates the stale-slice delete + destination-pod bounce,
+	//     so it runs the persisted variant: the first-seen rides
+	//     the Service as an annotation
+	//     (kube.AnnoFirstSeenLinkerdEndpointSync) and a restart
+	//     resumes it; cleared when the sets converge so a later
+	//     desync re-arms the window.
 	//   - linkerdDesyncEmitted: gauge tuples held at 1 — a tuple not
 	//     re-seen gets DeleteLabelValues, not a stale 1.
 	//   - linkerdDesyncHealed: "ns/svc" → last linkerd-destination
@@ -244,10 +248,11 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	// desynced maps each "ns/name" diverged this sweep to its gauge
-	// label values — the ledger stores the tuple so no key ever
-	// gets SplitN'd back apart.
-	desynced := map[string][]string{}
+	// desynced maps each "ns/name" diverged this sweep to its
+	// Service object — the persisted first-seen variant stamps the
+	// window onto the Service itself, so the emit loop needs the
+	// object, not just the gauge label tuple.
+	desynced := map[string]*corev1.Service{}
 	// staleSlices: "ns/svc" → the provably-stale managed EndpointSlices
 	// to delete if the service's desync survives the window (W10-FIX7).
 	staleSlices := map[string][]linkerdSliceRef{}
@@ -360,7 +365,18 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 			}
 			key := svc.Namespace + "/" + svc.Name
 			if linkerdEndpointSetsDiverge(readyIPs, liveIPs, esReady[key]) {
-				desynced[key] = []string{svc.Namespace, svc.Name}
+				desynced[key] = svc
+			} else if err := heal.ClearPersistedFirstSeen(ctx, log,
+				&p.linkerdDesyncSince, svc,
+				kube.AnnoFirstSeenLinkerdEndpointSync, key,
+				p.linkerdSvcPatch(svc)); err != nil {
+				// CONVERGED services clear any persisted stamp so a
+				// later desync re-arms the full window. Tolerated
+				// sub-failure — Warn + continue, never fail the
+				// sweep; the stamp retries next sweep.
+				log.Info("WARN: persisted first-seen clear failed — "+
+					"a stale stamp could fast-trip the next desync",
+					"service", key, "error", err)
 			}
 			if stale := staleLinkerdSlices(
 				managedSlices[key], readyAgedIPs, liveIPs); len(stale) > 0 {
@@ -371,12 +387,20 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 
 	var rep probefw.SweepReport
 	p.linkerdDesyncSince.Prune(func(k string) bool { _, ok := desynced[k]; return ok })
-	for k, lv := range desynced {
-		if !probefw.Persisted(&p.linkerdDesyncSince, k, now,
-			linkerdEndpointDesyncMinAge, log) {
+	for k, svc := range desynced {
+		// The window gates the stale-EndpointSlice delete plus the
+		// linkerd-destination bounce — an operator restart must not
+		// re-arm it, so the first-seen rides the Service as a
+		// durable annotation (wider of ledger vs annotation).
+		if !heal.FirstSeenPersisted(ctx, log,
+			&p.linkerdDesyncSince, svc,
+			kube.AnnoFirstSeenLinkerdEndpointSync, k,
+			linkerdEndpointDesyncMinAge, now,
+			p.linkerdSvcPatch(svc)) {
 			continue
 		}
-		rep.Emit(linkerdEndpointDesyncGauge, k, lv, k)
+		rep.Emit(linkerdEndpointDesyncGauge, k,
+			[]string{svc.Namespace, svc.Name}, k)
 	}
 	rep.Close(&p.linkerdDesyncEmitted,
 		linkerdEndpointDesyncGauge.DeleteLabelValues)
@@ -392,6 +416,21 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	return rep.Verdict(fmt.Sprintf(
 		"meshed services with EndpointSlice desync >=%s: ",
 		linkerdEndpointDesyncMinAge), ", ")
+}
+
+// linkerdSvcPatch closes over the Service the persisted first-seen
+// stamp rides — the durable half of the desync window lives on the
+// Service itself, delivered as a merge patch through the typed
+// clientset.
+func (p *linkerdEndpointSyncCheck) linkerdSvcPatch(
+	svc *corev1.Service) func(context.Context, []byte) error {
+
+	return func(ctx context.Context, data []byte) error {
+		_, err := p.CS.CoreV1().Services(svc.Namespace).
+			Patch(ctx, svc.Name, types.MergePatchType, data,
+				metav1.PatchOptions{})
+		return err
+	}
 }
 
 // healLinkerdDestination repairs a desynced Service on two

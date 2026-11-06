@@ -105,3 +105,33 @@ func TestCPUStealUntaintsAfterClearWindow(t *testing.T) {
 		t.Fatal("taint survived the clear window")
 	}
 }
+
+// The persisted twin of the clear window: the operator restarted
+// mid-window (empty ledger), but the Node carries the first-seen
+// stamp proving the pressure cleared >10m ago — the first
+// post-restart sweep must honor it, untaint, and drop the stamp so
+// the next taint cycle re-arms a full window.
+func TestCPUStealUntaintRestartResume(t *testing.T) {
+	w1 := stealNode("w1", corev1.ConditionFalse, 20*time.Minute)
+	w1.Spec.Taints = append(w1.Spec.Taints, corev1.Taint{
+		Key:    kube.TaintCPUSteal,
+		Value:  cpuStealTaintValue,
+		Effect: corev1.TaintEffectPreferNoSchedule,
+	})
+	w1.Annotations = map[string]string{
+		kube.AnnoFirstSeenCPUStealClear: `{"w1":"` +
+			time.Now().Add(-(cpuStealClearMinAge + time.Minute)).
+				UTC().Format(time.RFC3339) + `"}`}
+	cs := fake.NewSimpleClientset(w1)
+	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, testProber(cs)).Run(ctx)
+	if !res.Pass {
+		t.Fatalf("cleared pressure should pass: %+v", res)
+	}
+	got := testutil.GetNode(t, cs, "w1")
+	if kube.HasTaint(got.Spec.Taints, kube.TaintCPUSteal) {
+		t.Fatal("persisted clear window did not resume — taint survived the first sweep")
+	}
+	if _, ok := got.Annotations[kube.AnnoFirstSeenCPUStealClear]; ok {
+		t.Fatal("resolved clear stamp lingered on the node")
+	}
+}

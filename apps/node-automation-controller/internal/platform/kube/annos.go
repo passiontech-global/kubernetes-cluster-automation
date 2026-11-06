@@ -90,6 +90,28 @@ const (
 	// hold and the last verdict — internal-owned.
 	AnnoStormGateHold     = "passiontech.dev/storm-gate-hold"
 	AnnoStormGateDecision = "passiontech.dev/storm-gate-decision"
+
+	// AnnoFirstSeen* are the persisted first-seen window stamps —
+	// the durable half of "signature must hold >= N before the
+	// remediation fires" tracking (heal.FirstSeenPersisted). Each is
+	// a JSON object {"<ledger-key>": "<rfc3339>", ...} stamped on the
+	// object the signature is evaluated against, one anno per check
+	// so concurrent modules never share a map (a lost update on a
+	// shared key would corrupt a sibling check's window). The stamp
+	// dies with the object — a bounced pod or deleted CR needs no
+	// sweep-side cleanup; live-but-resolved objects are cleared by
+	// heal.ClearPersistedFirstSeen on the healthy path.
+	AnnoFirstSeenKSMWedge            = "passiontech.dev/first-seen-ksm-wedge"
+	AnnoFirstSeenCPUStealClear       = "passiontech.dev/first-seen-cpu-steal-clear"
+	AnnoFirstSeenKedaScaledObject    = "passiontech.dev/first-seen-keda-scaledobject"
+	AnnoFirstSeenRabbitQuorum        = "passiontech.dev/first-seen-rabbitmq-quorum"
+	AnnoFirstSeenRabbitSuspended     = "passiontech.dev/first-seen-rabbitmq-suspended"
+	AnnoFirstSeenDragonflyLinkStorm  = "passiontech.dev/first-seen-dragonfly-linkstorm"
+	AnnoFirstSeenOLMUnhealthy        = "passiontech.dev/first-seen-olm-unhealthy"
+	AnnoFirstSeenStatefulMasterless  = "passiontech.dev/first-seen-stateful-masterless"
+	AnnoFirstSeenOperatorWorkqueue   = "passiontech.dev/first-seen-operator-workqueue"
+	AnnoFirstSeenLinkerdEndpointSync = "passiontech.dev/first-seen-linkerd-endpoint-sync"
+	AnnoFirstSeenArgoCDAppStuck      = "passiontech.dev/first-seen-argocd-app-stuck"
 	// AnnoRolledConfigHash is the EXTERNAL contract: fluentbit-roller
 	// stamps it on the fluent-bit Secret so other tooling sees which
 	// fluent.io/config-hash was last rolled out. Value must never

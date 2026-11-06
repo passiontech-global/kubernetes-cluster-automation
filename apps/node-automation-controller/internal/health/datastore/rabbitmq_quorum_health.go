@@ -11,14 +11,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -206,13 +207,46 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 		sig := "prom/" + key
 		seenKeep[sig] = true
-		if !probefw.Persisted(&p.seen, sig, now, rabbitUnreadyMinAge,
-			logr.Discard()) {
+		// The alarm/partition window gates a pod delete, so it runs
+		// the persisted (annotation-backed) variant — the stamp on
+		// the pod survives an operator restart that would otherwise
+		// re-arm the full 10m while the signature still held.
+		if !heal.FirstSeenPersisted(ctx, log, &p.seen, pod,
+			kube.AnnoFirstSeenRabbitQuorum, sig, rabbitUnreadyMinAge,
+			now, func(ctx context.Context, data []byte) error {
+				_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(ctx,
+					pod.Name, types.MergePatchType, data,
+					metav1.PatchOptions{})
+				return err
+			}) {
 			continue
 		}
 		if readyByNS[pod.Namespace] >= 2 {
 			p.DeletePodHeal(ctx, log, CheckNameRabbitMQQuorum,
 				key, pod, rabbitQuorumHealCool, now)
+		}
+	}
+	// A member pod whose signal went quiet drops its persisted stamp
+	// so a recurrence re-arms the full window — a stale stamp would
+	// fast-trip the heal. Terminating pods are skipped (the stamp
+	// dies with them); a clear failure is a tolerated sub-failure —
+	// the ledger Forget already landed, the annotation retry is
+	// Warn-only. The stuck_unready path's window is pod-carried
+	// (PodUnreadySince) and needs no clear.
+	for key, pod := range rabbitByName {
+		if findings[key] != nil || pod.DeletionTimestamp != nil {
+			continue
+		}
+		if err := heal.ClearPersistedFirstSeen(ctx, log, &p.seen, pod,
+			kube.AnnoFirstSeenRabbitQuorum, "prom/"+key,
+			func(ctx context.Context, data []byte) error {
+				_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(ctx,
+					pod.Name, types.MergePatchType, data,
+					metav1.PatchOptions{})
+				return err
+			}); err != nil {
+			log.Info("WARN: rabbitmq quorum first-seen clear failed",
+				"pod", key, "error", err)
 		}
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })

@@ -96,3 +96,32 @@ func TestCooldownSetEntries(t *testing.T) {
 		t.Fatal("Entries delete removed a ledger entry")
 	}
 }
+
+// Seed only ever moves a first-seen stamp EARLIER: it restores a
+// persisted window into an empty ledger and wins against a fresher
+// in-RAM stamp, but a later seed must never rejuvenate the window.
+func TestFirstSeenLedgerSeed(t *testing.T) {
+	now := time.Now()
+	older := now.Add(-time.Hour)
+	later := now.Add(-time.Minute)
+
+	var l FirstSeenLedger
+	l.Seed("k", older)
+	if got, _ := l.Observe("k", now); !got.Equal(older) {
+		t.Fatalf("Seed then Observe = %v, want %v", got, older)
+	}
+
+	// A fresher seed does not overwrite an older stamp.
+	l.Seed("k", later)
+	if got, _ := l.Observe("k", now); !got.Equal(older) {
+		t.Fatalf("Seed(later) overwrote the older stamp: %v", got)
+	}
+
+	// An older seed DOES overwrite a fresher stamp — the restore
+	// path after Observe already stamped now this sweep.
+	l.Seed("k2", now)
+	l.Seed("k2", older)
+	if got, _ := l.Observe("k2", now); !got.Equal(older) {
+		t.Fatalf("Seed(older) did not move the stamp back: %v", got)
+	}
+}

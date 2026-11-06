@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -149,6 +150,36 @@ func TestCheckOperatorWorkqueuesCertManagerNoConditions(t *testing.T) {
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("never-reconciled Certificate must FAIL")
+	}
+	if v, _ := shOpFrozenGauge(t, "cert-manager", opReasonNoConditions); v != 1 {
+		t.Fatalf("frozen gauge = %v, want 1", v)
+	}
+}
+
+// Restart-resume: a Certificate carrying a persisted first-seen
+// stamp older than stuckMinAge trips the window on the FIRST sweep —
+// the in-RAM ledger is empty (operator restarted) but the annotation
+// proves the signature held continuously.
+func TestCheckOperatorWorkqueuesPersistedFirstSeenResume(t *testing.T) {
+	operatorWorkqueueFrozenGauge.DeleteLabelValues("cert-manager", opReasonNoConditions)
+	t.Cleanup(func() {
+		operatorWorkqueueFrozenGauge.DeleteLabelValues("cert-manager", opReasonNoConditions)
+	})
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		shLease("kube-system", "cert-manager-controller",
+			"cert-manager-abc_uid", 2*time.Second, base))
+	stuck := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate",
+		"apps", "tls", 1, 0)
+	stuck.SetAnnotations(map[string]string{
+		kube.AnnoFirstSeenOperatorWorkqueue: `{"cert-manager/certificates/apps/tls":"` +
+			base.Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`,
+	})
+	p := testProberDyn(cs, probetest.OpDyn(stuck))
+	p.Now = func() time.Time { return base }
+
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(ctx); res.Pass {
+		t.Fatal("persisted first-seen must trip on the first post-restart sweep")
 	}
 	if v, _ := shOpFrozenGauge(t, "cert-manager", opReasonNoConditions); v != 1 {
 		t.Fatalf("frozen gauge = %v, want 1", v)
