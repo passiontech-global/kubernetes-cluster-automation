@@ -27,31 +27,31 @@ func TestContainerdMetaJournalLatch(t *testing.T) {
 	}
 	pids := func() []int { return nil }
 	// Clean journal clears/keeps clear.
-	h.checkContainerdHealth(ctx, pids, true)
+	h.ctrMeta.Run(ctx, &wdeps.CycleEnv{PidsOnce: pids, WorkerActive: true})
 	if _, err := os.Stat(filepath.Join(e.state,
 		"state-containerd-corrupt")); !os.IsNotExist(err) {
 		t.Fatal("latch set on clean journal")
 	}
 	journal = "containerd[123]: failed to loadmeta \"/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db\": timeout"
-	h.checkContainerdHealth(ctx, pids, true)
+	h.ctrMeta.Run(ctx, &wdeps.CycleEnv{PidsOnce: pids, WorkerActive: true})
 	if _, err := os.Stat(filepath.Join(e.state,
 		"state-containerd-corrupt")); !os.IsNotExist(err) {
 		t.Fatal("latch set before ConsecNeeded")
 	}
-	h.checkContainerdHealth(ctx, pids, true)
+	h.ctrMeta.Run(ctx, &wdeps.CycleEnv{PidsOnce: pids, WorkerActive: true})
 	if _, err := os.Stat(filepath.Join(e.state,
 		"state-containerd-corrupt")); err != nil {
 		t.Fatal("containerd-corrupt latch missing after 2 evidence cycles")
 	}
 	// Clean cycle releases.
 	journal = "containerd[123]: healthy heartbeat"
-	h.checkContainerdHealth(ctx, pids, true)
+	h.ctrMeta.Run(ctx, &wdeps.CycleEnv{PidsOnce: pids, WorkerActive: true})
 	if _, err := os.Stat(filepath.Join(e.state,
 		"state-containerd-corrupt")); !os.IsNotExist(err) {
 		t.Fatal("latch not cleared on clean journal")
 	}
 	// Worker gate off → no evaluation.
-	h.checkContainerdHealth(ctx, pids, false)
+	h.ctrMeta.Run(ctx, &wdeps.CycleEnv{PidsOnce: pids, WorkerActive: false})
 	if _, err := os.Stat(filepath.Join(e.state,
 		"state-containerd-corrupt")); !os.IsNotExist(err) {
 		t.Fatal("latch touched while worker inactive")
@@ -65,7 +65,7 @@ func TestHostOOMVictimEvent(t *testing.T) {
 	h := e.h
 	ctx := context.Background()
 	// No markers → no event.
-	h.checkHostOOMVictims(ctx)
+	h.hostOOM.Run(ctx, &wdeps.CycleEnv{})
 	evs, err := e.cs.EventsV1().Events("default").List(ctx,
 		metav1.ListOptions{})
 	if err != nil {
@@ -79,8 +79,8 @@ func TestHostOOMVictimEvent(t *testing.T) {
 	writeFile(t, h.Cfg.Host.OOMVictimFile,
 		strconv.FormatInt(now, 10)+" containerd-shim\n")
 	writeFile(t, h.Cfg.Host.OOMCountFile, "3\n")
-	h.checkHostOOMVictims(ctx)
-	h.checkHostOOMVictims(ctx) // dedup — same count, no second event
+	h.hostOOM.Run(ctx, &wdeps.CycleEnv{})
+	h.hostOOM.Run(ctx, &wdeps.CycleEnv{}) // dedup — same count, no second event
 	evs, err = e.cs.EventsV1().Events("default").List(ctx,
 		metav1.ListOptions{})
 	if err != nil {
@@ -97,7 +97,7 @@ func TestHostOOMVictimEvent(t *testing.T) {
 	}
 	// Count advances → second event.
 	writeFile(t, h.Cfg.Host.OOMCountFile, "4\n")
-	h.checkHostOOMVictims(ctx)
+	h.hostOOM.Run(ctx, &wdeps.CycleEnv{})
 	evs, _ = e.cs.EventsV1().Events("default").List(ctx,
 		metav1.ListOptions{})
 	if len(evs.Items) != 2 {
@@ -121,7 +121,7 @@ func TestOrphanHostPathVolumes(t *testing.T) {
 	old := time.Now().Add(-48 * time.Hour)
 	_ = os.Chtimes(filepath.Join(prov, "pvc-orphan1"), old, old)
 	e.diskUsed = 0.90
-	h.checkOrphanedHostPathVolumes(ctx, true)
+	h.orphanHP.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
 	if _, err := os.Stat(filepath.Join(prov, "pvc-orphan1")); !os.IsNotExist(err) {
 		t.Fatal("empty orphan dir not removed under disk pressure")
 	}
@@ -135,7 +135,7 @@ func TestOrphanHostPathVolumes(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(dataDir, "important.bin"), "x")
 	_ = os.Chtimes(dataDir, old, old)
-	h.checkOrphanedHostPathVolumes(ctx, true)
+	h.orphanHP.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
 	if _, err := os.Stat(filepath.Join(dataDir, "important.bin")); err != nil {
 		t.Fatal("data-bearing orphan dir was removed")
 	}
@@ -152,7 +152,7 @@ func TestOrphanHostPathVolumes(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = os.Chtimes(liveDir, old, old)
-	h.checkOrphanedHostPathVolumes(ctx, true)
+	h.orphanHP.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
 	if _, err := os.Stat(liveDir); err != nil {
 		t.Fatal("PV-backed dir treated as orphan")
 	}

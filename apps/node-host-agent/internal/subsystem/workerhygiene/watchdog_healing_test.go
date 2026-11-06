@@ -265,7 +265,8 @@ func TestCheckDiskBloatPodLogEvicts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.h.checkDiskBloat(context.Background(), []corev1.Pod{*victim}, true, true)
+	e.h.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
+		Pods: []corev1.Pod{*victim}, APIOK: true, WorkerActive: true})
 
 	if len(deleteActions(e.cs)) != 1 {
 		t.Fatalf("deletes = %v, want the log-bloating pod",
@@ -306,7 +307,8 @@ func TestCheckDiskBloatSnapshotEvicts(t *testing.T) {
 	writeFile(t, filepath.Join(e.ctr, "snapctr1", "config.json"),
 		`{"annotations": {"io.kubernetes.pod.uid": "`+uidA+`"}}`)
 
-	e.h.checkDiskBloat(context.Background(), []corev1.Pod{*victim}, true, true)
+	e.h.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
+		Pods: []corev1.Pod{*victim}, APIOK: true, WorkerActive: true})
 
 	if len(deleteActions(e.cs)) != 1 {
 		t.Fatalf("deletes = %v, want the snapshot-owning pod",
@@ -338,7 +340,8 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 	pods := []corev1.Pod{*pod}
 
 	for i := 0; i < guards.CalicoFelixRestartFails; i++ {
-		e.h.checkCalicoHygiene(context.Background(), pods, true, true)
+		e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+			Pods: pods, APIOK: true, WorkerActive: true})
 	}
 	if !e.h.State.Exists("calico-felix-down") {
 		t.Fatal("no calico-felix-down latch")
@@ -360,7 +363,8 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 		t.Fatal(err)
 	}
 	pods[0] = *calicoPod("calico-node-def34", "uid-cal2")
-	e.h.checkCalicoHygiene(context.Background(), pods, true, true)
+	e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+		Pods: pods, APIOK: true, WorkerActive: true})
 	if got := logLines(t, e); !strings.Contains(got, "pod restart in cooldown") {
 		t.Fatalf("expected a cooldown line, got:\n%s", got)
 	}
@@ -377,7 +381,8 @@ func TestCheckCalicoFelixLatchBeforeRestart(t *testing.T) {
 	pods := []corev1.Pod{*calicoPod("calico-node-abc12", "uid-cal")}
 
 	for i := 0; i < 2; i++ {
-		e.h.checkCalicoHygiene(context.Background(), pods, true, true)
+		e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+			Pods: pods, APIOK: true, WorkerActive: true})
 	}
 	if !e.h.State.Exists("calico-felix-down") {
 		t.Fatal("no latch after ConsecNeeded")
@@ -401,11 +406,13 @@ func TestCheckCalicoVethGCDeletesOrphan(t *testing.T) {
 			fmt.Sprintf("cali%02d", i+1), "carrier"), "1\n")
 	}
 	pods := []corev1.Pod{}
-	e.h.checkCalicoHygiene(context.Background(), pods, true, true)
+	e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+		Pods: pods, APIOK: true, WorkerActive: true})
 	if e.h.State.Exists("calico-veth-leak") {
 		t.Fatal("leak latch before ConsecNeeded")
 	}
-	e.h.checkCalicoHygiene(context.Background(), pods, true, true)
+	e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+		Pods: pods, APIOK: true, WorkerActive: true})
 	if !e.h.State.Exists("calico-veth-leak") {
 		t.Fatal("leak latch not set")
 	}
@@ -418,7 +425,8 @@ func TestCheckCalicoVethGCDeletesOrphan(t *testing.T) {
 	// 16m later the marker ages out → the delete runs.
 	e.now = e.now.Add(16 * time.Minute)
 	e.sdReply["ip link delete"] = ""
-	e.h.checkCalicoHygiene(context.Background(), pods, true, true)
+	e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+		Pods: pods, APIOK: true, WorkerActive: true})
 	if !e.sdRan("ip link delete cali99") {
 		t.Fatal("orphan veth not deleted after the down-age window")
 	}
@@ -440,7 +448,8 @@ func TestCheckCalicoVethGCNeedsLeakLatch(t *testing.T) {
 	e := fixture(t)
 	writeFile(t, filepath.Join(e.sysnet, "cali99", "carrier"), "0\n")
 	// Few ifaces → no leak → latch never enters → no GC.
-	e.h.checkCalicoHygiene(context.Background(), nil, true, true)
+	e.h.calico.Run(context.Background(), &wdeps.CycleEnv{
+		APIOK: true, WorkerActive: true})
 	if _, err := os.Stat(filepath.Join(e.state, "veth-seen-cali99")); !os.IsNotExist(err) {
 		t.Fatal("veth-seen marker stamped without the leak latch")
 	}
@@ -456,7 +465,7 @@ func TestCheckCalicoVethGCNeedsLeakLatch(t *testing.T) {
 // ratio clears it.
 func TestCheckCiliumBPFMapPressureLatches(t *testing.T) {
 	e := fixture(t)
-	e.h.checkCiliumBPFMaps(context.Background())
+	e.h.cilium.CheckBPFMaps(context.Background())
 	if e.h.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("latch on an empty /v1/map body")
 	}
@@ -464,7 +473,7 @@ func TestCheckCiliumBPFMapPressureLatches(t *testing.T) {
 		{"name":"cilium_ct4_global","used":950,"max":1000},
 		{"name":"cilium_lb4_services_v2","used":100,"max":1000}
 	]}`)
-	e.h.checkCiliumBPFMaps(context.Background())
+	e.h.cilium.CheckBPFMaps(context.Background())
 	if !e.h.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("no latch with cilium_ct4_global at 95%")
 	}
@@ -473,7 +482,7 @@ func TestCheckCiliumBPFMapPressureLatches(t *testing.T) {
 	e.unixBody = []byte(`{"maps":[
 		{"path":"/sys/fs/bpf/cilium/cilium_ct4_global","size":1000,"cache":[]}
 	]}`)
-	e.h.checkCiliumBPFMaps(context.Background())
+	e.h.cilium.CheckBPFMaps(context.Background())
 	if e.h.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("empty cache at 1000 capacity must clear the latch")
 	}
@@ -556,11 +565,15 @@ func TestCheckPSIThrashLatchesAndEvicts(t *testing.T) {
 	}
 	pids := pidsOf(5001, 5002)
 
-	e.h.checkPSIThrash(context.Background(), pods, true, pids, true)
+	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		Pods: pods, APIOK: true, PidsOnce: pids,
+		WorkerActive: true})
 	if e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("latched on the first thrash cycle")
 	}
-	e.h.checkPSIThrash(context.Background(), pods, true, pids, true)
+	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		Pods: pods, APIOK: true, PidsOnce: pids,
+		WorkerActive: true})
 	if !e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("no latch after ConsecNeeded thrash cycles")
 	}
@@ -577,7 +590,9 @@ func TestCheckPSIThrashLatchesAndEvicts(t *testing.T) {
 
 	// Recovery clears the latch.
 	writeThrashFiles(t, e, 5.0, 500000, 1000000)
-	e.h.checkPSIThrash(context.Background(), pods, true, pids, true)
+	e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		Pods: pods, APIOK: true, PidsOnce: pids,
+		WorkerActive: true})
 	if e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("latch not cleared after the thrash subsides")
 	}
@@ -591,7 +606,8 @@ func TestCheckPSIThrashNeedsBothSignals(t *testing.T) {
 	// Stall high, memory fine.
 	writeThrashFiles(t, e, 40.0, 500000, 1000000)
 	for i := 0; i < 3; i++ {
-		e.h.checkPSIThrash(context.Background(), nil, true, pidsOf(), true)
+		e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+			APIOK: true, PidsOnce: pidsOf(), WorkerActive: true})
 	}
 	if e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("latched on PSI alone — free memory is fine")
@@ -599,7 +615,8 @@ func TestCheckPSIThrashNeedsBothSignals(t *testing.T) {
 	// Memory low, no stall.
 	writeThrashFiles(t, e, 3.0, 50000, 1000000)
 	for i := 0; i < 3; i++ {
-		e.h.checkPSIThrash(context.Background(), nil, true, pidsOf(), true)
+		e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+			APIOK: true, PidsOnce: pidsOf(), WorkerActive: true})
 	}
 	if e.h.State.Exists("psi-memory-thrash") {
 		t.Fatal("latched on low memory alone — no PSI stall")
@@ -643,7 +660,9 @@ func TestCheckPSIThrashSystemPodsSafe(t *testing.T) {
 			fmt.Sprintf("Name:\tc\nVmRSS:\t%d kB\n", rss))
 	}
 	for i := 0; i < 2; i++ {
-		e.h.checkPSIThrash(context.Background(), pods, true, pidsOf(5001, 5002), true)
+		e.h.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+			Pods: pods, APIOK: true, PidsOnce: pidsOf(5001, 5002),
+			WorkerActive: true})
 	}
 	evs := evictActions(e.cs)
 	if len(evs) != 1 || evs[0] != "workload" {

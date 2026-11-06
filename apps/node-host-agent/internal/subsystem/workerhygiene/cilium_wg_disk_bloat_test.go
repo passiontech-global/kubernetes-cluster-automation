@@ -102,7 +102,8 @@ func TestCheckCiliumWGPeersGates(t *testing.T) {
 	e.h.Cfg.Seams.WGAllowedIPsFn = func(context.Context) (int, error) {
 		return 0, errors.New("must not be called")
 	}
-	e.h.checkCiliumWGPeers(context.Background(), true, true)
+	e.h.ciliumWG.Run(context.Background(), &wdeps.CycleEnv{
+		APIOK: true, WorkerActive: true})
 	if e.h.CiliumWGFails != 0 {
 		t.Fatalf("no-iface: ciliumWGFails = %d, want 0", e.h.CiliumWGFails)
 	}
@@ -111,7 +112,8 @@ func TestCheckCiliumWGPeersGates(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.h.CiliumWGFails = 1
-	e.h.checkCiliumWGPeers(context.Background(), false, true)
+	e.h.ciliumWG.Run(context.Background(), &wdeps.CycleEnv{
+		WorkerActive: true})
 	if e.h.CiliumWGFails != 1 {
 		t.Fatalf("api-down: ciliumWGFails = %d, want kept 1", e.h.CiliumWGFails)
 	}
@@ -121,7 +123,8 @@ func TestCheckCiliumWGPeersGates(t *testing.T) {
 	e.live[4242] = true
 	writeFile(t, filepath.Join(e.proc, "4242", "stat"), "1 (agent) S 0 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1000\n")
 	e.mkTask(t, "aabbccdd-1111-2222-3333-444455556666", "cilium-agent", 4242)
-	e.h.checkCiliumWGPeers(context.Background(), true, true)
+	e.h.ciliumWG.Run(context.Background(), &wdeps.CycleEnv{
+		APIOK: true, WorkerActive: true})
 	if e.h.CiliumWGFails != 0 {
 		t.Fatalf("healthy: ciliumWGFails = %d, want 0", e.h.CiliumWGFails)
 	}
@@ -158,7 +161,8 @@ func TestCheckDiskBloatEvicts(t *testing.T) {
 			Name: "hog", Namespace: "app", UID: types.UID("uid-1"),
 		},
 	}
-	e.h.checkDiskBloat(context.Background(), []corev1.Pod{pod}, true, true)
+	e.h.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
+		Pods: []corev1.Pod{pod}, APIOK: true, WorkerActive: true})
 	if !e.h.State.Exists("disk-bloat") {
 		t.Fatal("state-disk-bloat not latched")
 	}
@@ -187,7 +191,8 @@ func TestCheckDiskBloatSystemPodSafe(t *testing.T) {
 	pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: "sys-hog", Namespace: "kube-system", UID: types.UID("uid-sys"),
 	}}
-	e.h.checkDiskBloat(context.Background(), []corev1.Pod{pod}, true, true)
+	e.h.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
+		Pods: []corev1.Pod{pod}, APIOK: true, WorkerActive: true})
 	if !e.h.State.Exists("disk-bloat") {
 		t.Fatal("state-disk-bloat not latched")
 	}

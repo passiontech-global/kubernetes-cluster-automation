@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -180,148 +179,6 @@ type Config struct {
 	tlsCertFn func(ctx context.Context, addr string) (*x509.Certificate, error)
 }
 
-// PKIDriftPair is one W8-CP4 check row: the on-disk cert file, the
-// TLS listener that must already serve it, and the systemd unit a
-// detected drift restarts.
-type PKIDriftPair struct {
-	CertFile string
-	Addr     string
-	Unit     string
-}
-
-// HubConfig carries the apiserver-hub identity/probe knobs — the
-// NODE_HOST_AGENT_API_SELF / API_PEER / KINE_DB_PROBE env →
-// watchdogconf → (empty) chain. SelfAPI deliberately has NO default:
-// it is the first-hub ordering identity — solo/dead-fallback restarts
-// gate on it being non-empty, and inventing 127.0.0.1 here would make
-// every unconfigured controller believe it is the first hub.
-type HubConfig struct {
-	// SelfEndpoint is the apiserver probed for rv_cache/rv_now —
-	// always the local listener (SELF_EP=127.0.0.1:6443).
-	SelfEndpoint string
-	// SelfAPI is API_SELF: this hub's apiserver "ip:port" used only
-	// for deterministic first-hub ordering vs PeerAPI.
-	SelfAPI string
-	// PeerAPI is API_PEER: the other hub's apiserver "ip:port"; empty
-	// = single-hub cluster (self always first).
-	PeerAPI string
-	// KineDBProbe is KINE_DB_PROBE "host:port" — pg-wire probe used
-	// by the dead-fallback; empty disables it (veto preserved).
-	KineDBProbe string
-}
-
-// Sig13Config is the sig13 apiserver watch-cache wedge guard — also
-// the shared SIG13_AUTOFIX mode cp_freeze_heal and pki_cert_drift
-// restart under. Fields resolve env → watchdogconf → package default.
-type Sig13Config struct {
-	Mode         string        // SIG13_AUTOFIX for k0scontroller restarts
-	StaleMinErrs int           // journal errs/6min → apiserver-cache-stale
-	GapMin       int64         // rv_now - rv_cache wedge threshold
-	GapCycles    int           // consecutive gap-over-threshold → wedge
-	FrozenCycles int           // consecutive identical rv_cache → wedge
-	SoloCycles   int           // wedge cycles before first-hub may act alone
-	MinRestart   time.Duration // SIG13_MIN_RESTART_S restart budget
-}
-
-// KineTTLConfig is the kine TTL dead/rewedge-loop kill guard
-// (KINE_TTL_AUTOFIX for kine process kills).
-type KineTTLConfig struct {
-	Mode          string
-	MinRestart    time.Duration // fast-kill budget (KINE_TTL_MIN_RESTART_S)
-	CtlRestart    time.Duration // rewedge-loop probe-kill cadence (KINE_TTL_CTL_RESTART_S)
-	RewedgeCycles int           // distinct wedged pids → kine-ttl-loop
-	MinProcAge    time.Duration // pid must outlive seed window
-}
-
-// KinePoolConfig is the kine -> DB connection-spiral kill guard
-// (KINE_POOL_AUTOFIX for pool-spiral kills).
-type KinePoolConfig struct {
-	Mode           string
-	MaxConns       int           // conns-to-DB spiral threshold
-	Cycles         int           // consecutive over-threshold → kill
-	MinRestart     time.Duration // kill budget (KINE_POOL_MIN_RESTART_S)
-	DBPortFallback int           // DB port when --endpoint has none
-}
-
-// OOMLoopConfig is the cgroup v2 OOM-loop detector + oom_score_adj
-// shield (K0S_OOMLOOP_AUTOFIX).
-type OOMLoopConfig struct {
-	Mode               string
-	MinKills           int           // kills in window → loop
-	Window             time.Duration // sliding window
-	CGroupEventsFile   string        // cgroup v2 memory.events
-	APIServerShieldAdj int           // kube-apiserver protection
-	KineShieldAdj      int           // kine sacrifice ranking
-}
-
-// FeederConfig is the systemd watchdog feeder — sd_notify WATCHDOG=1
-// gated on apiserver liveness — plus the remediate ordered gates.
-// Active only when Enabled AND (NotifySocket non-empty or a notifyFn
-// seam is injected) — in a pod without NOTIFY_SOCKET the feeder is
-// inert.
-type FeederConfig struct {
-	Enabled      bool
-	NotifySocket string        // sd_notify datagram address (env NOTIFY_SOCKET)
-	Interval     time.Duration // probe/feed cadence
-	MaxFail      int           // consecutive fails → remediate
-	GraceFails   int           // fail budget before first success
-	ProbeURL     string        // readyz-ish endpoint; any HTTP code = alive
-	ProbeTO      time.Duration
-	// StateDir holds the remediate rate-limit file (shell
-	// STATE_DIR=/var/lib/k0s-systemd-watchdog).
-	StateDir            string
-	RemediateMinRestart time.Duration // G5 budget
-	RemediateFreshGrace time.Duration // G3 fresh-start grace
-	RemediatePeerFile   string        // PEER_APISERVER= override file
-}
-
-// EtcdGuardConfig is the embedded-etcd quota self-defence (k0s
-// embedded-etcd controllers only — kine hosts no-op on the missing
-// <K0sDir>/bin/etcdctl + pki/etcd/ca.crt). Trigger = NOSPACE alarm or
-// dbSize >= DBSizeLimit → eventpurge + ONLINE-ONLY etcd rescue under the
-// last-etcd-guard budget (the offline defrag stops k0scontroller and
-// stays a manual action).
-type EtcdGuardConfig struct {
-	Endpoint    string // "" → https://127.0.0.1:2379
-	DBSizeLimit int64  // dbSize trigger bytes; <=0 → 1.5 GiB
-	// MinRun is the eventpurge+rescue rate budget; <=0 → 1h.
-	MinRun time.Duration
-}
-
-// CPFreezeConfig is the W8-CP3 KCM/scheduler freeze auto-heal. No env
-// wiring — package defaults unless set programmatically.
-type CPFreezeConfig struct {
-	// KCMHealthURL/SchedHealthURL are the healthz endpoints of the
-	// kube-controller-manager and kube-scheduler hosted inside
-	// k0scontroller; KCMMetricsURL feeds the leader-without-workers
-	// signal. Empty → the loopback defaults.
-	KCMHealthURL   string
-	SchedHealthURL string
-	KCMMetricsURL  string
-	Cycles         int           // consecutive healthz fails → act (default 3)
-	QuietFor       time.Duration // KCM leader+idle grace (default 10m)
-	MinRestart     time.Duration // last-cp-restart budget (default 2h)
-}
-
-// PKIDriftConfig is the W8-CP4 on-disk-vs-served PKI cert drift check.
-// No env wiring — package defaults unless set programmatically.
-type PKIDriftConfig struct {
-	// Pairs pairs an on-disk cert with the socket that must present
-	// it and the unit restarted on drift; nil → the four defaults
-	// (apiserver.crt→:6443, konnectivity-server.crt→:8132,
-	// etcd/server.crt→:2379 — all k0scontroller.service —
-	// and /etc/kine/pki/server.crt→:2379 → kine.service). Paths may
-	// use the $K0SDIR placeholder, resolved against Config.K0sDir.
-	Pairs []PKIDriftPair
-	// Cycles is the consecutive-newer-cycle gate (default 2);
-	// RestartInterval the last-cp-cert-restart budget (default 1h).
-	Cycles          int
-	RestartInterval time.Duration
-	// KinePKIDir prefixes the default kine cert path ("" →
-	// "/host/etc/kine/pki").
-	KinePKIDir string
-}
-
 func (c *Config) applyDefaults() {
 	if c.Interval <= 0 {
 		c.Interval = defaultInterval
@@ -347,13 +204,7 @@ func (c *Config) applyDefaults() {
 	if c.RestartUnit == "" {
 		c.RestartUnit = defaultRestartUnit
 	}
-	if c.Hub.SelfEndpoint == "" {
-		c.Hub.SelfEndpoint = defaultSelfEndpoint
-	}
-	// SelfAPI deliberately has NO loopback default: it is the
-	// first-hub ordering identity — solo/dead-fallback restarts gate
-	// on it being non-empty, and inventing 127.0.0.1 here would make
-	// every unconfigured controller believe it is the first hub.
+	c.applyHubDefaults()
 	if c.AdminKubeconfig == "" {
 		c.AdminKubeconfig = defaultKubeconfig
 	}
@@ -372,108 +223,11 @@ func (c *Config) applyDefaults() {
 	if c.QueryTimeout <= 0 {
 		c.QueryTimeout = defaultQueryTimeout
 	}
-	if c.Sig13.Mode == "" {
-		c.Sig13.Mode = ModeOff
-	}
-	if c.Sig13.StaleMinErrs <= 0 {
-		c.Sig13.StaleMinErrs = defaultStaleMinErrs
-	}
-	if c.Sig13.GapMin <= 0 {
-		c.Sig13.GapMin = defaultGapMin
-	}
-	if c.Sig13.GapCycles <= 0 {
-		c.Sig13.GapCycles = defaultGapCycles
-	}
-	if c.Sig13.FrozenCycles <= 0 {
-		c.Sig13.FrozenCycles = defaultFrozenCycles
-	}
-	if c.Sig13.SoloCycles <= 0 {
-		c.Sig13.SoloCycles = defaultSoloCycles
-	}
-	if c.Sig13.MinRestart <= 0 {
-		c.Sig13.MinRestart = defaultMinRestart
-	}
-	if c.KineTTL.Mode == "" {
-		c.KineTTL.Mode = ModeOff
-	}
-	if c.KineTTL.MinRestart <= 0 {
-		c.KineTTL.MinRestart = defaultTTLMinRestart
-	}
-	if c.KineTTL.CtlRestart <= 0 {
-		c.KineTTL.CtlRestart = defaultTTLCtlRestart
-	}
-	if c.KineTTL.RewedgeCycles <= 0 {
-		c.KineTTL.RewedgeCycles = defaultTTLRewedgeCycles
-	}
-	if c.KineTTL.MinProcAge <= 0 {
-		c.KineTTL.MinProcAge = defaultTTLMinProcAge
-	}
-	if c.KinePool.Mode == "" {
-		c.KinePool.Mode = ModeOff
-	}
-	if c.KinePool.MaxConns <= 0 {
-		c.KinePool.MaxConns = defaultPoolMaxConns
-	}
-	if c.KinePool.Cycles <= 0 {
-		c.KinePool.Cycles = defaultPoolCycles
-	}
-	if c.KinePool.MinRestart <= 0 {
-		c.KinePool.MinRestart = defaultPoolMinRestart
-	}
-	if c.KinePool.DBPortFallback <= 0 {
-		c.KinePool.DBPortFallback = defaultDBPortFallback
-	}
-	if c.OOMLoop.Mode == "" {
-		c.OOMLoop.Mode = ModeOff
-	}
-	if c.OOMLoop.MinKills <= 0 {
-		c.OOMLoop.MinKills = defaultOOMMinKills
-	}
-	if c.OOMLoop.Window <= 0 {
-		c.OOMLoop.Window = defaultOOMWindow
-	}
-	if c.OOMLoop.CGroupEventsFile == "" {
-		c.OOMLoop.CGroupEventsFile = defaultCGroupEvents
-	}
-	// Shield adjs are non-zero in both directions; an explicit 0
-	// would mean "shield to neutral" which is never what the loop
-	// wants — treat unset as unset.
-	if c.OOMLoop.APIServerShieldAdj == 0 {
-		c.OOMLoop.APIServerShieldAdj = defaultAPIServerAdj
-	}
-	if c.OOMLoop.KineShieldAdj == 0 {
-		c.OOMLoop.KineShieldAdj = defaultKineAdj
-	}
-	if c.Feeder.Interval <= 0 {
-		c.Feeder.Interval = defaultFeedInterval
-	}
-	if c.Feeder.MaxFail <= 0 {
-		c.Feeder.MaxFail = defaultFeedMaxFail
-	}
-	if c.Feeder.GraceFails <= 0 {
-		c.Feeder.GraceFails = defaultFeedGraceFails
-	}
-	if c.Feeder.ProbeURL == "" {
-		c.Feeder.ProbeURL = defaultFeedProbeURL
-	}
-	if c.Feeder.ProbeTO <= 0 {
-		c.Feeder.ProbeTO = defaultFeedProbeTO
-	}
-	if c.Feeder.StateDir == "" {
-		c.Feeder.StateDir = defaultFeederStateDir
-	}
-	if c.Feeder.RemediateMinRestart <= 0 {
-		c.Feeder.RemediateMinRestart = defaultRemediateMinRst
-	}
-	if c.Feeder.RemediateFreshGrace <= 0 {
-		c.Feeder.RemediateFreshGrace = defaultRemediateGrace
-	}
-	if c.Feeder.RemediatePeerFile == "" {
-		c.Feeder.RemediatePeerFile = defaultPeerFile
-	}
-	if c.Feeder.NotifySocket == "" {
-		c.Feeder.NotifySocket = os.Getenv("NOTIFY_SOCKET")
-	}
+	c.applySig13Defaults()
+	c.applyKineTTLDefaults()
+	c.applyKinePoolDefaults()
+	c.applyOOMLoopDefaults()
+	c.applyFeederDefaults()
 	if c.nowFn == nil {
 		c.nowFn = time.Now
 	}
@@ -565,15 +319,7 @@ func (c *Config) applyDefaults() {
 	if c.K0sDir == "" {
 		c.K0sDir = defaultK0sDir
 	}
-	if c.EtcdGuard.Endpoint == "" {
-		c.EtcdGuard.Endpoint = defaultEtcdEndpoint
-	}
-	if c.EtcdGuard.DBSizeLimit <= 0 {
-		c.EtcdGuard.DBSizeLimit = defaultEtcdDBSizeLimit
-	}
-	if c.EtcdGuard.MinRun <= 0 {
-		c.EtcdGuard.MinRun = defaultEtcdGuardMinRun
-	}
+	c.applyEtcdGuardDefaults()
 	if c.SuspectLogCadence <= 0 {
 		c.SuspectLogCadence = defaultSuspectLogCadence
 	}
@@ -618,51 +364,8 @@ func (c *Config) applyDefaults() {
 	if c.etcdRescueFn == nil {
 		c.etcdRescueFn = etcdmaint.Run
 	}
-	if c.CPFreeze.KCMHealthURL == "" {
-		c.CPFreeze.KCMHealthURL = "https://127.0.0.1:10257/healthz"
-	}
-	if c.CPFreeze.SchedHealthURL == "" {
-		c.CPFreeze.SchedHealthURL = "https://127.0.0.1:10259/healthz"
-	}
-	if c.CPFreeze.KCMMetricsURL == "" {
-		c.CPFreeze.KCMMetricsURL = "https://127.0.0.1:10257/metrics"
-	}
-	if c.CPFreeze.Cycles <= 0 {
-		c.CPFreeze.Cycles = defaultCPFreezeCycles
-	}
-	if c.CPFreeze.QuietFor <= 0 {
-		c.CPFreeze.QuietFor = defaultCPFreezeQuietFor
-	}
-	if c.CPFreeze.MinRestart <= 0 {
-		c.CPFreeze.MinRestart = defaultCPFreezeMinRestart
-	}
-	if c.PKIDrift.KinePKIDir == "" {
-		c.PKIDrift.KinePKIDir = "/host/etc/kine/pki"
-	}
-	if c.PKIDrift.Pairs == nil {
-		k0s := c.K0sDir
-		c.PKIDrift.Pairs = []PKIDriftPair{
-			{filepath.Join(k0s, "pki", "apiserver.crt"),
-				"127.0.0.1:6443", "k0scontroller.service"},
-			{filepath.Join(k0s, "pki", "konnectivity-server.crt"),
-				"127.0.0.1:8132", "k0scontroller.service"},
-			{filepath.Join(k0s, "pki", "etcd", "server.crt"),
-				"127.0.0.1:2379", "k0scontroller.service"},
-			{filepath.Join(c.PKIDrift.KinePKIDir, "server.crt"),
-				"127.0.0.1:2379", "kine.service"},
-		}
-	} else {
-		for i := range c.PKIDrift.Pairs {
-			c.PKIDrift.Pairs[i].CertFile = strings.ReplaceAll(
-				c.PKIDrift.Pairs[i].CertFile, "$K0SDIR", c.K0sDir)
-		}
-	}
-	if c.PKIDrift.Cycles <= 0 {
-		c.PKIDrift.Cycles = defaultPKIDriftCycles
-	}
-	if c.PKIDrift.RestartInterval <= 0 {
-		c.PKIDrift.RestartInterval = defaultPKIRestartInterval
-	}
+	c.applyCPFreezeDefaults()
+	c.applyPKIDriftDefaults()
 	if c.ssKillFn == nil {
 		c.ssKillFn = func(ctx context.Context) error {
 			// `ss -K sport = :6443` is a HOST command — it drops the
