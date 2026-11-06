@@ -67,6 +67,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/apiserverendpointguard"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 var version = "dev"
@@ -244,6 +245,15 @@ func main() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	cfg := ctrl.GetConfigOrDie()
+	// client-go defaults (QPS 5 / Burst 10) are sized for one
+	// controller — ~32 modules share this rest.Config, so every
+	// sweep and reconcile queue fought for the same 10-token
+	// bucket and throttled client-side. 50/100 matches the
+	// aggregate rate the fleet actually issues; both are
+	// env-overridable for clusters whose apiserver wants a lower
+	// ceiling.
+	cfg.QPS = float32(envx.GetenvInt("NODE_AUTOMATION_KUBE_CLIENT_QPS", 50))
+	cfg.Burst = envx.GetenvInt("NODE_AUTOMATION_KUBE_CLIENT_BURST", 100)
 
 	mgr, err := ctrl.NewManager(cfg,
 		buildMgrOptions(scheme, metricsAddr, probeAddr, leaderElect,

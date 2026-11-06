@@ -346,14 +346,13 @@ func (p *operatorWorkqueueCheck) operatorLease(ctx context.Context, op operatorT
 // is Running — a live pod whose CRs sit unreconciled is the same
 // zombie signature a renewing-lease zombie leader presents.
 func (p *operatorWorkqueueCheck) operatorPodRunning(ctx context.Context, op operatorTarget) (bool, error) {
-	pods, err := p.CS.CoreV1().Pods(targetPodNS(op)).List(ctx,
-		metav1.ListOptions{LabelSelector: op.podSelector})
+	pods, err := p.PodsMatching(ctx, targetPodNS(op), op.podSelector)
 	if err != nil {
 		return false, err
 	}
-	for i := range pods.Items {
-		if pods.Items[i].Status.Phase == corev1.PodRunning &&
-			pods.Items[i].DeletionTimestamp == nil {
+	for i := range pods {
+		if pods[i].Status.Phase == corev1.PodRunning &&
+			pods[i].DeletionTimestamp == nil {
 			return true, nil
 		}
 	}

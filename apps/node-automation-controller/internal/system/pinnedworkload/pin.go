@@ -39,10 +39,20 @@ func (p ReplicaPin) Enabled() bool { return p.MinReplicas > 0 }
 // A node list error surfaces so the count is never computed from a
 // partial picture.
 func (p ReplicaPin) Want(ctx context.Context, cs kubernetes.Interface) (int32, error) {
+	return p.WantFrom(ctx, nil, cs)
+}
+
+// WantFrom is Want with an optional informer-backed node read: a
+// non-nil r takes the census from the manager's Node cache (the
+// Deployment patchers already watch Nodes when the pin is on —
+// the LIST was redundant work on top of the informer); nil keeps
+// the direct clientset read.
+func (p ReplicaPin) WantFrom(ctx context.Context, r kube.CachedNodeReader,
+	cs kubernetes.Interface) (int32, error) {
 	if !p.Enabled() {
 		return 0, nil
 	}
-	nodes, err := kube.ListNodes(ctx, cs)
+	nodes, err := kube.ListNodesCached(ctx, r, cs)
 	if err != nil {
 		return 0, err
 	}

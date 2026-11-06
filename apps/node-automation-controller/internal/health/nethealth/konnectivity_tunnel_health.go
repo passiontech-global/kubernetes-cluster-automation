@@ -22,7 +22,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -115,7 +114,7 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 	// zero Ready CP has bigger problems than tunnel health, and 0
 	// would make the "sibling holds the full count" proof vacuous:
 	// skip rather than flag the whole DaemonSet.
-	nodes, err := kube.ListNodes(ctx, p.CS)
+	nodes, err := p.AllNodes(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
@@ -167,7 +166,7 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 	if !deficit {
 		return probefw.Result{Pass: true}
 	}
-	pods, err := p.CS.CoreV1().Pods(konnAgentNS).List(ctx, metav1.ListOptions{})
+	pods, err := p.PodsIn(ctx, konnAgentNS)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list %s pods: %w", konnAgentNS, err)}
 	}
@@ -175,8 +174,8 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 	halfOpen := map[string]bool{} // live-key set for the seen prune
 	var targets []*corev1.Pod
 	healthyPeer := false
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := pods[i]
 		if !isKonnectivityAgentPod(pod) || pod.DeletionTimestamp != nil ||
 			pod.Status.Phase != corev1.PodRunning {
 			continue

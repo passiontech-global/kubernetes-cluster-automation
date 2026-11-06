@@ -43,6 +43,11 @@ const ciliumNotReadyTaint = "node.cilium.io/agent-not-ready"
 
 type ciliumTaintReaper struct {
 	cs kubernetes.Interface
+	// nodeReader is the informer-backed node read — the sweep's
+	// whole-cluster census rides the Node watch this reconciler
+	// already registers; UntaintNode still re-Gets on the direct
+	// clientset before acting.
+	nodeReader kube.CachedNodeReader
 }
 
 // The watch wiring below installs these package-level units
@@ -89,7 +94,7 @@ func Setup(d shared.Deps) error {
 	// controller, no informer, no RequeueAfter loop. The manager
 	// cache's cilium-pod ByObject entry exists only for this module.
 	return shared.SetupNoConfig(d, func() error {
-		r := &ciliumTaintReaper{cs: cs}
+		r := &ciliumTaintReaper{cs: cs, nodeReader: mgr.GetClient()}
 		return ctrl.NewControllerManagedBy(mgr).
 			Named(d.Name).
 			// Watches with a single fixed workqueue key, not For(): the
@@ -118,7 +123,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 
 	// Sweep every node like bash — a node/pod event is only the
 	// trigger, the verdict always covers the whole cluster.
-	nodes, err := kube.ListNodes(ctx, r.cs)
+	nodes, err := kube.ListNodesCached(ctx, r.nodeReader, r.cs)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}

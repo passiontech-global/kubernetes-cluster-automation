@@ -415,8 +415,7 @@ func (p *argoCDAppStuckCheck) restartArgoCDRepoServer(ctx context.Context,
 func (p *argoCDAppStuckCheck) oldestRepoServerPod(ctx context.Context,
 	log logr.Logger, selector string) *corev1.Pod {
 
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{LabelSelector: selector})
+	pods, err := p.PodsMatching(ctx, metav1.NamespaceAll, selector)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: list pods failed — repo-server restart deferred",
@@ -424,8 +423,8 @@ func (p *argoCDAppStuckCheck) oldestRepoServerPod(ctx context.Context,
 		return nil
 	}
 	var oldest *corev1.Pod
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := pods[i]
 		if pod.DeletionTimestamp != nil {
 			continue
 		}

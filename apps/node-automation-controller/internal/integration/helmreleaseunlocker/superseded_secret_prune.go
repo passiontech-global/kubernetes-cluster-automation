@@ -43,11 +43,19 @@ const (
 // the newest rollback point even when it is itself superseded.
 func (u *helmReleaseUnlocker) pruneSupersededSecrets(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	// Cluster-wide, server-side filtered to helm release secrets —
-	// owner=helm is the same label unlock() selects on. Paged like
-	// every cluster-wide list in this module.
+	// Cluster-wide, server-side filtered to SUPERSEDED helm release
+	// secrets — owner=helm is the same label unlock() selects on, and
+	// every superseded revision also carries status=superseded (helm
+	// v3's standard pair, same labels the test fixtures build), so
+	// deployed/pending/failed revisions never cross the wire. The
+	// per-release `highest` computation then runs over superseded
+	// revisions only: the delete set is unchanged — the "never touch
+	// the newest rollback point" guard still skips the top
+	// superseded revision, and a live deployed revision was never a
+	// candidate anyway. Paged like every cluster-wide list here.
 	secrets, err := kube.ListAll(ctx, metav1.ListOptions{
-		LabelSelector: "owner=helm", Limit: kube.DefaultListPageSize},
+		LabelSelector: "owner=helm,status=superseded",
+		Limit:         kube.DefaultListPageSize},
 		kube.Secrets(u.cs, metav1.NamespaceAll))
 	if err != nil {
 		// Hygiene sweep — a list failure must not fail the run

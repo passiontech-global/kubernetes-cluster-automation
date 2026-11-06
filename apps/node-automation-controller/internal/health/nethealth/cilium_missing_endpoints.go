@@ -125,8 +125,7 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		cep := &ceps.Items[i]
 		cepByKey[cep.GetNamespace()+"/"+cep.GetName()] = cep
 	}
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
@@ -135,8 +134,8 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 	streakKeep := map[string]bool{}
 	missingByNode := map[string]int{}
 	var confirmed []*corev1.Pod
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		if pod.DeletionTimestamp != nil || pod.Spec.HostNetwork ||
 			pod.Spec.NodeName == "" ||
 			pod.Status.Phase != corev1.PodRunning ||
@@ -169,7 +168,7 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		if n < ciliumCEPNodeMinPods {
 			continue
 		}
-		if agent := ciliumAgentPodOnNode(pods.Items, node); agent != nil {
+		if agent := ciliumAgentPodOnNode(pods, node); agent != nil {
 			p.DeletePodHeal(ctx, log, CheckNameCiliumMissingEndpoints,
 				"agent/"+node, agent, ciliumCEPHealCool, now)
 			agentHealed[node] = true

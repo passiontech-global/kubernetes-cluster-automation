@@ -454,37 +454,28 @@ func (p *gatewayRouteHealthCheck) loadEndpointCensus(ctx context.Context,
 	if c.esLoaded {
 		return nil
 	}
-	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.EndpointSlices(p.CS, metav1.NamespaceAll),
-		func(items []discoveryv1.EndpointSlice) error {
-			for _, s := range items {
-				svc := s.Labels[discoveryv1.LabelServiceName]
-				if svc == "" {
-					continue
-				}
-				set := c.esReady[s.Namespace+"/"+svc]
-				if set == nil {
-					set = map[string]bool{}
-					c.esReady[s.Namespace+"/"+svc] = set
-				}
-				for _, ep := range s.Endpoints {
-					if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
-						continue
-					}
-					for _, a := range ep.Addresses {
-						set[a] = true
-					}
-				}
-			}
-			return nil
-		})
+	slices, err := p.AllEndpointSlices(ctx)
 	if err != nil {
-		// A mid-walk failure leaves a partial census — do NOT mark it
-		// loaded or later backendRefs would judge 0-endpoints against
-		// incomplete data (false backend_zero_endpoints + wrongly
-		// pruned persistence/series).
 		return err
+	}
+	for _, s := range slices {
+		svc := s.Labels[discoveryv1.LabelServiceName]
+		if svc == "" {
+			continue
+		}
+		set := c.esReady[s.Namespace+"/"+svc]
+		if set == nil {
+			set = map[string]bool{}
+			c.esReady[s.Namespace+"/"+svc] = set
+		}
+		for _, ep := range s.Endpoints {
+			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+				continue
+			}
+			for _, a := range ep.Addresses {
+				set[a] = true
+			}
+		}
 	}
 	c.esLoaded = true
 	return nil

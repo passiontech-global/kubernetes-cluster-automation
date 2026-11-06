@@ -58,6 +58,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/pinnedworkload"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -72,6 +73,7 @@ var (
 
 type corednsPatcher struct {
 	cs              kubernetes.Interface
+	nodeReader      kube.CachedNodeReader
 	zoneWhen        string
 	minDomains      int
 	minReplicas     int
@@ -129,7 +131,7 @@ func Setup(d shared.Deps) error {
 			MinReplicas:     cfg.minReplicas,
 			NodesPerReplica: cfg.nodesPerReplica,
 		}.WatchNodes(b, "coredns-patcher-sweep")
-		r := &corednsPatcher{cs: d.CS, zoneWhen: cfg.zoneWhen,
+		r := &corednsPatcher{cs: d.CS, nodeReader: d.Mgr.GetClient(), zoneWhen: cfg.zoneWhen,
 			minDomains: cfg.zoneMinDomains, minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica}
 		// CountReconcile owns the returned-error accounting — one
 		// IncError per non-nil Reconcile return; the reconcile body
@@ -169,10 +171,11 @@ func configFromEnv() corednsPatcherConfig {
 // fresh enough for a drift k0s only re-applies on stack changes).
 func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	res, err := pinnedworkload.DeploymentSpec{
-		CS:        r.cs,
-		Namespace: "kube-system",
-		Name:      "coredns",
-		Container: "coredns",
+		CS:         r.cs,
+		NodeReader: r.nodeReader,
+		Namespace:  "kube-system",
+		Name:       "coredns",
+		Container:  "coredns",
 		Replicas: pinnedworkload.ReplicaPin{
 			MinReplicas:     r.minReplicas,
 			NodesPerReplica: r.nodesPerReplica,

@@ -326,8 +326,7 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	if !proceed {
 		return
 	}
-	pods, err := p.CS.CoreV1().Pods(olmOperatorNS).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.PodsIn(ctx, olmOperatorNS)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: list olm-operator pods failed — heal deferred",
@@ -335,8 +334,8 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 		return
 	}
 	deleted := false
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := pods[i]
 		if !strings.HasPrefix(pod.Name, olmOperatorPodPrefix) {
 			continue
 		}
@@ -347,6 +346,7 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 				"pod", pod.Namespace+"/"+pod.Name)
 			continue
 		}
+		p.InvalidateSweep(ctx) // pod gone — drop the census
 		deleted = true
 		log.Info("DELETE: wedged olm-operator — stuck CSV/cert-rotation queues need a resync",
 			"pod", pod.Namespace+"/"+pod.Name,

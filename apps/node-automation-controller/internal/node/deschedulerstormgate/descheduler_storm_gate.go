@@ -121,6 +121,10 @@ var stormTaints = []string{
 
 type deschedulerStormGate struct {
 	cs kubernetes.Interface
+	// nodeReader is the informer-backed node read — the storm
+	// verdict's census rides the Node watch this reconciler
+	// already registers instead of an apiserver LIST per run.
+	nodeReader kube.CachedNodeReader
 	// dyn reads the autopilot Plan CR for maintenance-mutex
 	// signal (c) — no typed client exists for it.
 	dyn dynamic.Interface
@@ -161,7 +165,7 @@ var stormSignalChanges = predicate.Funcs{
 }
 
 func Setup(d shared.Deps) error {
-	r := &deschedulerStormGate{cs: d.CS, dyn: d.Dyn, now: shared.SystemClock}
+	r := &deschedulerStormGate{cs: d.CS, nodeReader: d.Mgr.GetClient(), dyn: d.Dyn, now: shared.SystemClock}
 	return ctrl.NewControllerManagedBy(d.Mgr).
 		Named(d.Name).
 		// Watches with a single fixed workqueue key, not For(): the
@@ -180,7 +184,7 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	log := logf.FromContext(ctx)
 	res := ctrl.Result{RequeueAfter: 5 * time.Minute}
 
-	nodes, err := kube.ListNodes(ctx, r.cs)
+	nodes, err := kube.ListNodesCached(ctx, r.nodeReader, r.cs)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}

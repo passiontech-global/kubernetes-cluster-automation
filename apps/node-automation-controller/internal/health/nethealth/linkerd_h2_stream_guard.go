@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -80,6 +81,10 @@ const (
 	linkerdH2LogTimeout = 8 * time.Second
 	linkerdH2TailLines  = int64(200)
 	linkerdH2LogMaxByte = int64(256 * 1024)
+	// linkerdH2LogWorkers bounds the parallel proxy-log tails —
+	// the kubelet log path is the sweep's slowest read, so the
+	// scan runs on a small pool instead of serially.
+	linkerdH2LogWorkers = 8
 
 	// W12-NM3 — a balancer with no ready endpoint must hold that
 	// shape this long before it counts as failure-accrual lockout
@@ -205,19 +210,25 @@ func (p *linkerdH2StreamGuardCheck) linkerdH2LogSignals(ctx context.Context,
 func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
 
 	// Ready siblings per controller UID — the heal's "someone can
 	// absorb the traffic" proof.
-	readyByOwner := probefw.ReadyByOwner(pods.Items)
+	readyByOwner := probefw.ReadyByOwner(pods)
 
 	var rep, identityRep, oomRep, balancerRep probefw.SweepReport
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+
+	// Phase 1 — candidate collection plus the cheap OOM report.
+	// The Prometheus prefilter narrows the per-pod log tails to
+	// suspect pods only; nil is "inconclusive" and the legacy
+	// full-mesh scan runs.
+	suspect := p.linkerdSuspectPods(ctx, log)
+	var cands []*corev1.Pod
+	for i := range pods {
+		pod := &pods[i]
 		if pod.DeletionTimestamp != nil ||
 			pod.Status.Phase != corev1.PodRunning ||
 			now.Sub(pod.CreationTimestamp.Time) < linkerdH2PodMinAge ||
@@ -235,14 +246,46 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 			oomRep.Flag(linkerdProxyOOMKilledGauge, key, lv)
 			rep.Find(key + "(linkerd-proxy OOMKilled)")
 		}
-		storm, identity, err := p.linkerdH2LogSignals(ctx, pod)
-		if err != nil {
+		if suspect != nil && !suspect[key] {
+			continue
+		}
+		cands = append(cands, pod)
+	}
+
+	// Phase 2 — parallel log tails bounded at linkerdH2LogWorkers:
+	// each fetch is a kubelet round-trip (the sweep's slowest
+	// read), and a serial tail over every meshed pod could eat the
+	// whole per-check budget on a large cluster.
+	sigs := make([]logSignals, len(cands))
+	sem := make(chan struct{}, linkerdH2LogWorkers)
+	var wg sync.WaitGroup
+	for i := range cands {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			storm, identity, lerr := p.linkerdH2LogSignals(ctx, cands[i])
+			sigs[i] = logSignals{storm: storm, identity: identity, err: lerr}
+		}(i)
+	}
+	wg.Wait()
+
+	// Phase 3 — the serial verdict + heal pass over the fetched
+	// signatures (gauge ledgers, the heal mutex and the cooldown
+	// set are all single-writer by design).
+	for i := range cands {
+		pod := cands[i]
+		key := pod.Namespace + "/" + pod.Name
+		lv := []string{pod.Namespace, pod.Name}
+		if err := sigs[i].err; err != nil {
 			// Inconclusive, not clean — a broken pod-log path must
 			// not silently read as "no signature".
 			log.Info("WARN: linkerd-proxy log fetch failed — log signatures inconclusive",
 				"pod", pod.Namespace+"/"+pod.Name, "error", err)
 			continue
 		}
+		storm, identity := sigs[i].storm, sigs[i].identity
 		if !storm && !identity {
 			continue
 		}
@@ -296,13 +339,66 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 
 	// W12-NM3 — outbound balancer lockout: the client-side proxies
 	// whose failure-accrual kept a target dead after it recovered.
-	p.scanOutboundBalancers(ctx, log, now, pods.Items, readyByOwner,
+	p.scanOutboundBalancers(ctx, log, now, pods, readyByOwner,
 		&rep, &balancerRep)
 	balancerRep.Close(&p.balancerEmitted,
 		linkerdOutboundBalancerWedgedGauge.DeleteLabelValues)
 
 	return rep.Verdict(
 		"meshed pods with a linkerd-proxy failure signature (h2 stream storm / identity cert stall / OOM kill / outbound balancer wedge): ", ", ")
+}
+
+// logSignals is one pod's proxy-log verdict collected by the phase-2
+// worker pool — same triple linkerdH2LogSignals returns, packaged
+// for the indexed results slice.
+type logSignals struct {
+	storm, identity bool
+	err             error
+}
+
+// linkerdSuspectPods pre-filters the log scan through Prometheus:
+// pods whose linkerd-proxy restarted recently or is closing
+// connections on errors are the only ones worth a log tail — the
+// healthy majority never costs a kubelet round-trip. nil means
+// "no conclusive verdict" (no endpoint, every query failed, or the
+// metrics pipeline simply has nothing) and the caller falls back
+// to the legacy full scan — a prefilter must never hide a wedge
+// behind a monitoring gap.
+func (p *linkerdH2StreamGuardCheck) linkerdSuspectPods(
+	ctx context.Context, log logr.Logger) map[string]bool {
+
+	if _, err := p.PromEndpoint(); err != nil {
+		return nil
+	}
+	queries := []string{
+		`sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total{container="linkerd-proxy"}[30m])) > 0`,
+		`sum by (namespace, pod) (increase(tcp_close_total{error!=""}[30m])) > 0`,
+	}
+	suspect := map[string]bool{}
+	conclusive := false
+	for _, q := range queries {
+		series, err := p.PromQuery(ctx, q)
+		if err != nil {
+			continue
+		}
+		for _, s := range series {
+			if s.Value <= 0 {
+				continue
+			}
+			ns, pod := s.Label("namespace"), s.Label("pod", "pod_name")
+			if ns == "" || pod == "" {
+				continue
+			}
+			conclusive = true
+			suspect[ns+"/"+pod] = true
+		}
+	}
+	if !conclusive {
+		return nil
+	}
+	log.Info("linkerd-h2-stream-guard: prometheus prefilter narrowed the log scan",
+		"suspects", len(suspect))
+	return suspect
 }
 
 // ---------------------------------------------------------------------------
@@ -358,28 +454,23 @@ func (p *linkerdH2StreamGuardCheck) readyEndpointsByService(
 	ctx context.Context) (map[string]int, error) {
 
 	ready := map[string]int{}
-	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.EndpointSlices(p.CS, metav1.NamespaceAll),
-		func(items []discoveryv1.EndpointSlice) error {
-			for _, s := range items {
-				svc := s.Labels[discoveryv1.LabelServiceName]
-				if svc == "" {
-					continue
-				}
-				for _, ep := range s.Endpoints {
-					if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
-						continue
-					}
-					if len(ep.Addresses) > 0 {
-						ready[s.Namespace+"/"+svc]++
-					}
-				}
-			}
-			return nil
-		})
+	slices, err := p.AllEndpointSlices(ctx)
 	if err != nil {
 		return nil, err
+	}
+	for _, s := range slices {
+		svc := s.Labels[discoveryv1.LabelServiceName]
+		if svc == "" {
+			continue
+		}
+		for _, ep := range s.Endpoints {
+			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+				continue
+			}
+			if len(ep.Addresses) > 0 {
+				ready[s.Namespace+"/"+svc]++
+			}
+		}
 	}
 	return ready, nil
 }

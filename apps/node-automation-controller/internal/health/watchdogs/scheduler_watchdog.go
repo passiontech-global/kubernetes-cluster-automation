@@ -21,7 +21,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -122,7 +121,7 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 		schedulerPreemptionStormGauge.Set(0)
 	}
 
-	nodes, err := kube.ListNodes(ctx, p.CS)
+	nodes, err := p.AllNodes(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
@@ -141,15 +140,15 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 		return rep.Verdict("scheduler fault signatures: ", ", ")
 	}
 
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).List(ctx,
-		metav1.ListOptions{FieldSelector: "status.phase=Pending"})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pending pods: %w", err)}
 	}
 	pending := 0
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if pod.Spec.NodeName != "" ||
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Status.Phase != corev1.PodPending ||
+			pod.Spec.NodeName != "" ||
 			now.Sub(pod.CreationTimestamp.Time) < schedulerPendingMinAge {
 			continue
 		}

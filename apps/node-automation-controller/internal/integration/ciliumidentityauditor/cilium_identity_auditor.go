@@ -138,8 +138,9 @@ var (
 )
 
 type ciliumIdentityAuditor struct {
-	cs  kubernetes.Interface
-	dyn dynamic.Interface
+	cs         kubernetes.Interface
+	nodeReader kube.CachedNodeReader
+	dyn        dynamic.Interface
 	// gcEnabled arms the v2 delete path (CILIUM_IDENTITY_GC_ENABLED
 	// != "false"); false keeps the module detect-only (v1 behavior).
 	gcEnabled bool
@@ -165,11 +166,12 @@ type ciliumIdentityAuditor struct {
 func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, gcEnabledFromEnv, func(gcEnabled bool) error {
 		a := &ciliumIdentityAuditor{
-			cs:        d.CS,
-			dyn:       d.Dyn,
-			gcEnabled: gcEnabled,
-			now:       shared.SystemClock,
-			queue:     d.Name,
+			cs:         d.CS,
+			nodeReader: d.Mgr.GetClient(),
+			dyn:        d.Dyn,
+			gcEnabled:  gcEnabled,
+			now:        shared.SystemClock,
+			queue:      d.Name,
 		}
 		logf.Log.WithName(a.queue).Info("registered", "gcEnabled", a.gcEnabled)
 		return shared.AddPeriodic(d.Mgr, a.queue, 15*time.Minute, a.run)
@@ -383,7 +385,7 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 	// nodes at all means the cluster is too broken to judge, so an
 	// empty list aborts too rather than vacuously passing "all
 	// Ready".
-	nodes, err := kube.ListNodes(ctx, a.cs)
+	nodes, err := kube.ListNodesCached(ctx, a.nodeReader, a.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err) // propagates to run()'s return — wrapper IncErrors
 	}
