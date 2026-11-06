@@ -16,12 +16,18 @@ import (
 type Config struct {
 	NodeName         string
 	WatchdogStateDir string
-	SysClassNet      string
-	NebulaIface      string
-	RouteFile        string
-	K0sConfigFile    string
-	K0sUnitFile      string
-	NebulaCertFile   string
+	// WatchdogLogFile is the shared appended watchdog log — the
+	// latch ticker's STATE-ENTER lines must land in the FILE
+	// nodereporter tails for its Event rules (Store.AppendLog's
+	// slog mirror alone never reaches it). Same path
+	// workerhygiene/nethealth/controllerhygiene write.
+	WatchdogLogFile string
+	SysClassNet     string
+	NebulaIface     string
+	RouteFile       string
+	K0sConfigFile   string
+	K0sUnitFile     string
+	NebulaCertFile  string
 	// PSIFile is /proc/pressure/cpu — drives the overload gauge +
 	// state-node-overloaded latch.
 	PSIFile string
@@ -137,6 +143,9 @@ type Config struct {
 func (c *Config) applyDefaults() {
 	if c.WatchdogStateDir == "" {
 		c.WatchdogStateDir = defaultWatchdogStateDir
+	}
+	if c.WatchdogLogFile == "" {
+		c.WatchdogLogFile = defaultWatchdogLogFile
 	}
 	if c.SysClassNet == "" {
 		c.SysClassNet = defaultSysClassNet

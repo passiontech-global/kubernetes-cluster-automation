@@ -120,8 +120,13 @@ import (
 // latch files).
 const (
 	defaultWatchdogStateDir = "/host/var/lib/node-watchdog"
-	defaultSysClassNet      = "/sys/class/net"
-	defaultNebulaIface      = "neb1"
+	// defaultWatchdogLogFile is the shared appended watchdog log —
+	// the same path workerhygiene/nethealth/controllerhygiene
+	// write and nodereporter's events.go tails. The latch ticker
+	// needs the file half of AppendLog for its STATE-ENTER lines.
+	defaultWatchdogLogFile = "/host/var/log/node-watchdog.log"
+	defaultSysClassNet     = "/sys/class/net"
+	defaultNebulaIface     = "neb1"
 	// defaultProcRoot is the host /proc — plain /proc under
 	// hostPID:true (the pod's /proc is the host's); the inotify
 	// fdinfo and zombie scans walk it.
@@ -142,10 +147,13 @@ type Collector struct {
 	cfg Config
 
 	// state is the shared watchdog-state contract handle (hoststate):
-	// the last-* rate budgets and the kmsg counter files go through it
-	// so the on-disk format stays the lib.sh parity every subsystem
-	// shares. Now is a closure over c.cfg.nowFn — tests re-stub the
-	// clock after New() and the store must observe the new one.
+	// the last-* rate budgets, the kmsg counter files and the
+	// STATE-ENTER log lines go through it so the on-disk format stays
+	// the lib.sh parity every subsystem shares. LogFile is the shared
+	// watchdog log — nodereporter tails it, so a latch-entry line
+	// only counts if it lands there. Now is a closure over
+	// c.cfg.nowFn — tests re-stub the clock after New() and the
+	// store must observe the new one.
 	state *hoststate.Store
 
 	// Hoisted out of the scrape path in New(): drift regexes are
@@ -181,6 +189,15 @@ type Collector struct {
 	cpuOK      bool
 	cpuSink    uint64 // busy-loop sink, mu-guarded
 
+	// cpu-steal delta bookkeeping (mu): the steal ratio is a jiffie
+	// DELTA between consecutive latch ticks, so the previous
+	// /proc/stat sums live here. The consecutive-tick streaks live
+	// in state-dir counter files instead — a restart reseeding the
+	// baseline costs one tick, losing the streak would cost three.
+	stealPrevSteal uint64
+	stealPrevTotal uint64
+	stealPrevOK    bool
+
 	// fsInflight (mu) holds the start time of each mount's in-kernel
 	// statfs probe — a hung syscall can't be cancelled, so a scrape
 	// that finds an in-flight probe reports stalled only once the
@@ -215,7 +232,7 @@ func New(cfg Config) *Collector {
 	cfg.applyDefaults()
 	c := &Collector{cfg: cfg, seenStates: map[string]time.Time{},
 		fsInflight: map[string]time.Time{}, fsStalledLogged: map[string]bool{}}
-	c.state = hoststate.New(cfg.WatchdogStateDir, "",
+	c.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
 		func() time.Time { return c.cfg.nowFn() }, logger)
 	c.removedFlagRe = make(map[string]*regexp.Regexp, len(cfg.RemovedFlags))
 	for _, flag := range cfg.RemovedFlags {

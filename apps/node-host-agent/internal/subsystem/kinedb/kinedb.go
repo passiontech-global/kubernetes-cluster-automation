@@ -327,9 +327,24 @@ type metrics struct {
 	guardLastRun     prometheus.Gauge
 	guardRevAfter    prometheus.Gauge
 
-	maintOK       *prometheus.GaugeVec // check=reindex|repack
+	maintOK       *prometheus.GaugeVec // check=reindex|repack|vacuum_freeze
 	maintRelBytes *prometheus.GaugeVec // kind=heap|indexes
 	maintLastRun  prometheus.Gauge
+
+	// kine-pg-hygiene + WAL archive guard series (wal_xid_hygiene.go).
+	// idleTermTotal mirrors the idleTxTerm counter so the probe
+	// textfile can render the cumulative value (prometheus counters
+	// cannot be read back).
+	idleInTx       prometheus.Gauge
+	idleInTxAlias  prometheus.Gauge
+	idleTxTerm     prometheus.Counter
+	idleTermTotal  int64
+	deadTupleRatio prometheus.Gauge
+	xidAge         prometheus.Gauge
+	walBytes       prometheus.Gauge
+	walDiskRatio   prometheus.Gauge
+	walArchStale   prometheus.Gauge
+	inactiveSlot   prometheus.Gauge
 
 	cycles *prometheus.CounterVec // loop, result
 }
@@ -408,6 +423,42 @@ func newMetrics() *metrics {
 			Name: "kine_db_maint_last_run_timestamp_seconds",
 			Help: "Last maintenance run.",
 		}),
+		idleInTx: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_idle_in_tx_sessions",
+			Help: "Sessions idle in transaction >3min on the postgres/kine databases — autovacuum blockers.",
+		}),
+		idleInTxAlias: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "node_agent_kine_pg_idle_in_tx_sessions",
+			Help: "Alias of kine_db_idle_in_tx_sessions under the node_agent_* alert contract.",
+		}),
+		idleTxTerm: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "node_agent_kine_pg_idle_in_tx_terminated_total",
+			Help: "Stuck kine sessions terminated by the session reaper.",
+		}),
+		deadTupleRatio: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "node_agent_kine_pg_dead_tuple_ratio",
+			Help: "n_dead_tup / GREATEST(n_live_tup,1) of the kine table — >0.5 means autovacuum lost the race.",
+		}),
+		xidAge: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_xid_age_transactions",
+			Help: "MAX(age(datfrozenxid)) across databases — distance to XID wraparound pressure.",
+		}),
+		walBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_wal_bytes",
+			Help: "Total bytes in pg_wal (pg_ls_waldir).",
+		}),
+		walDiskRatio: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_wal_disk_ratio",
+			Help: "pg_wal bytes / data filesystem capacity — runaway retention fills the disk to PANIC.",
+		}),
+		walArchStale: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_wal_archive_stale",
+			Help: "1 when pg_stat_archiver has been failing continuously for >30m.",
+		}),
+		inactiveSlot: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_inactive_slot_retained_bytes",
+			Help: "WAL bytes pinned by inactive replication slots.",
+		}),
 		cycles: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "node_host_agent_kinedb_cycles_total",
 			Help: "kinedb loop cycles by loop and result.",
@@ -422,6 +473,9 @@ func (m *metrics) collectors() []prometheus.Collector {
 		m.guardOK, m.guardFreeze, m.guardFired, m.guardLastDeleted,
 		m.guardLastCompact, m.guardLastRun, m.guardRevAfter,
 		m.maintOK, m.maintRelBytes, m.maintLastRun,
+		m.idleInTx, m.idleInTxAlias, m.idleTxTerm, m.deadTupleRatio,
+		m.xidAge, m.walBytes, m.walDiskRatio, m.walArchStale,
+		m.inactiveSlot,
 		m.cycles,
 	}
 }

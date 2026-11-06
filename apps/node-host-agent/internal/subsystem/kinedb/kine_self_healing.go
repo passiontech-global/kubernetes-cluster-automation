@@ -40,22 +40,28 @@ const (
 )
 
 // reapStuckSessions terminates stuck kine sessions — W8-CP2 item 1.
-// Best-effort: a failed query only notes, never fails the probe.
+// The kine TABLE lives inside the database named 'postgres' (the
+// psqlArgs -d postgres contract), so datname='kine' alone matched
+// nothing: the IN list covers both the real backend database and
+// stacks that did create a dedicated kine database. Best-effort: a
+// failed query only notes, never fails the probe.
 func (k *KineDB) reapStuckSessions(ctx context.Context, pg, user, pass string,
 	note func(string)) {
-	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := k.psqlQuery(ctx, pg, user, pass,
 		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "+
-			"WHERE datname = '%s' AND ((state = 'idle in transaction' "+
+			"WHERE datname IN ('postgres', 'kine') AND ((state = 'idle in transaction' "+
 			"AND state_change < now() - interval '5 minutes') OR "+
 			"(state = 'active' AND query_start < now() - interval '10 minutes' "+
-			"AND query NOT ILIKE '%%VACUUM%%' AND query NOT ILIKE '%%REINDEX%%' "+
-			"AND query NOT ILIKE '%%pg_repack%%'))", "kine"))
+			"AND query NOT ILIKE '%VACUUM%' AND query NOT ILIKE '%REINDEX%' "+
+			"AND query NOT ILIKE '%pg_repack%'))")
 	if err != nil {
 		note(fmt.Sprintf("reap-sessions-fail: %v", err))
 		return
 	}
 	// -tA returns one 't' per terminated backend.
 	if n := strings.Count(out, "t\n") + boolToInt(strings.TrimSpace(out) == "t"); n > 0 {
+		k.m.idleTxTerm.Add(float64(n))
+		k.m.idleTermTotal += int64(n) // textfile mirror of the counter
 		note(fmt.Sprintf("reaped %d stuck kine session(s)", n))
 		logger().Warn("kinedb: terminated stuck kine sessions", "count", n)
 	}

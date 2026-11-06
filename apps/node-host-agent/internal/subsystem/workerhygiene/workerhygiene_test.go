@@ -64,6 +64,10 @@ type env struct {
 	journal    string
 	journalErr error
 	jdir       string
+	// sdHook, when set, runs inside sdRun before the reply lookup —
+	// tests advance the fake clock here to simulate a slow host
+	// call (e.g. a D-Bus round trip taking seconds).
+	sdHook func(joined string)
 }
 
 type killRecord struct {
@@ -78,6 +82,9 @@ func (e *env) sdRun(_ context.Context, argv []string) (string, error) {
 	e.sdcmds = append(e.sdcmds, argv)
 	e.mu.Unlock()
 	joined := strings.Join(argv, " ")
+	if e.sdHook != nil {
+		e.sdHook(joined)
+	}
 	for k, v := range e.sdReply {
 		if strings.Contains(joined, k) {
 			return v, nil

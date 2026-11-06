@@ -192,6 +192,11 @@ func TestAllConditionDefaults(t *testing.T) {
 		// Wave-10 latch→condition surface.
 		"KernelResourceExhaustion": {"KernelResourcesNormal", "kernel threads/pids and fd table below exhaustion threshold"},
 		"ClockSkewDetected":        {"ClockSkewOk", "clock offset within 2.0s of NTP source"},
+		// kernel/host deep-failure + hygiene latch→condition surface.
+		"KubeconfigCertExpiring": {"KubeconfigCertValid", "kubeconfig client certificates valid beyond the expiry horizon"},
+		"CPUStealPressure":       {"CPUStealNormal", "hypervisor CPU steal below pressure threshold"},
+		"CgroupDyingLeak":        {"CgroupDyingNormal", "cgroup dying descendants below pressure threshold"},
+		"SystemdSessionBloat":    {"SystemdSessionsNormal", "logind session count and D-Bus latency healthy"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

@@ -52,6 +52,8 @@ const (
 	LatchPSIMemoryThrash        = "psi-memory-thrash"        // W2
 	LatchKernelSlabLeak         = "kernel-slab-leak"         // W9-KR3
 	LatchContainerdCorrupt      = "containerd-corrupt"       // W10-KR3
+	LatchCgroupDyingLeak        = "cgroup-dying-leak"        // cgroup-dying-reclaim
+	LatchSystemdSessionBloat    = "systemd-session-bloat"    // systemd-session-hygiene
 	// LatchJournalUnreadable is the blindness latch the shared
 	// journalwatch tracker sets — produced by BOTH hygienes'
 	// journal-read accounting (workerhygiene journald.go,
@@ -87,6 +89,13 @@ const (
 	LatchCPCertReloadStale      = "cp-cert-reload-stale"     // W8-CP4
 	LatchKubeconfigCertExpiring = "kubeconfig-cert-expiring" // W10
 
+	// nodereporter — the kernel monitor's permanent-class evidence
+	// latches, Entered on a soft-lockup / RCU-stall kmsg signature
+	// and never Exited by the reporter (the janitor's max-age
+	// reaper clears them once the signature stops recurring).
+	LatchKernelSoftLockup = "kernel-softlockup"
+	LatchKernelRCUStall   = "kernel-rcu-stall"
+
 	// hostmetrics — the latch ticker's file-contract latches.
 	LatchNodeOverloaded     = "node-overloaded"      // PSI hysteresis
 	LatchFilesystemReadonly = "filesystem-readonly"  // W5.3 statfs ST_RDONLY
@@ -95,6 +104,7 @@ const (
 	LatchFSReadonly         = "fs-readonly"          // W10-ST1/KR1
 	LatchPIDFDPressure      = "pid-fd-pressure"      // W10-KR2
 	LatchClockSkew          = "clock-skew"           // W10-KR5
+	LatchCPUStealPressure   = "cpu-steal-pressure"   // cpu-steal-guard
 
 	// apiprober — the per-backend stale family; the suffix is the
 	// backend IP with dots dashed (shell ${beh//./-}), minted per
@@ -168,6 +178,8 @@ var LatchDefs = []LatchDef{
 	{Name: LatchPSIMemoryThrash, Owner: "workerhygiene"},
 	{Name: LatchKernelSlabLeak, Owner: "workerhygiene"},
 	{Name: LatchContainerdCorrupt, Owner: "workerhygiene"},
+	{Name: LatchCgroupDyingLeak, Owner: "workerhygiene"},
+	{Name: LatchSystemdSessionBloat, Owner: "workerhygiene"},
 	{Name: LatchJournalUnreadable, Owner: "workerhygiene+controllerhygiene"},
 	{Name: LatchCiliumIPAMPrefix, Owner: "workerhygiene", Prefix: true},
 
@@ -195,6 +207,10 @@ var LatchDefs = []LatchDef{
 	{Name: LatchCPCertReloadStale, Owner: "controllerhygiene"},
 	{Name: LatchKubeconfigCertExpiring, Owner: "controllerhygiene"},
 
+	// nodereporter
+	{Name: LatchKernelSoftLockup, Owner: "nodereporter"},
+	{Name: LatchKernelRCUStall, Owner: "nodereporter"},
+
 	// hostmetrics
 	{Name: LatchNodeOverloaded, Owner: "hostmetrics"},
 	{Name: LatchFilesystemReadonly, Owner: "hostmetrics"},
@@ -203,6 +219,7 @@ var LatchDefs = []LatchDef{
 	{Name: LatchFSReadonly, Owner: "hostmetrics"},
 	{Name: LatchPIDFDPressure, Owner: "hostmetrics"},
 	{Name: LatchClockSkew, Owner: "hostmetrics"},
+	{Name: LatchCPUStealPressure, Owner: "hostmetrics"},
 
 	// apiprober
 	{Name: LatchAPIServerBackendStalePrefix, Owner: "apiprober", Prefix: true},

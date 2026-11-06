@@ -8,12 +8,15 @@ package hostmetrics
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // ===========================================================================
@@ -41,6 +44,16 @@ import (
 //     ext4/xfs/btrfs mounts under the PVC provisioner roots parsed
 //     out of /proc/<pid>/mounts → state-fs-readonly
 //     (FilesystemReadOnly) ahead of statfs.
+//   - cpu-steal-guard + kernel-entropy-check
+//     (collect_steal_entropy.go): /proc/stat steal-column delta →
+//     state-cpu-steal-pressure (CPUStealPressure) + the
+//     node_agent_cpu_steal_ratio / node_agent_kernel_entropy_avail_bits
+//     textfile gauges.
+//
+// Every new latch ensureStateLatch installs also lands a
+// "STATE-ENTER: <name> (<evidence>)" line in the shared watchdog
+// log via the Store — nodereporter's events.go tails that file and
+// maps the line onto a Kubernetes Event.
 // ===========================================================================
 
 // --- shared kernel-failure helpers ---
@@ -89,6 +102,16 @@ func (l *Latches) ensureStateLatch(path, name, evidence string) {
 	}
 	logger().Warn("hostmetrics: "+name+" latch set — "+evidence,
 		"path", path)
+	// A NEW latch also lands a STATE-ENTER line in the shared
+	// watchdog log — nodereporter's events.go tails that file and
+	// maps "STATE-ENTER: <name>" onto a Kubernetes Event. The name
+	// argument here is the display form ("state-<latch>"); the log
+	// line carries the bare latch suffix the event regexes anchor
+	// on. The line goes through the Store's AppendLog — NOT a bare
+	// logger() call — because the file half is the contract, not
+	// the slog mirror.
+	l.c.state.AppendLog(fmt.Sprintf("STATE-ENTER: %s (%s)",
+		strings.TrimPrefix(name, hoststate.LatchFilePrefix), evidence))
 }
 
 // --- small shared helpers (uniquely named per file rules) ---

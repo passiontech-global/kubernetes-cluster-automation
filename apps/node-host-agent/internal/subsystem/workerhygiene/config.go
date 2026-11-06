@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
@@ -83,6 +84,7 @@ type Config struct {
 	Calico   CalicoConfig   // calico-hygiene felix + orphan-veth knobs
 	Journal  JournalConfig  // journald blindness-detector inputs
 	Host     HostConfig     // hostmetrics markers + node events (KR1/ST2)
+	Runtime  RuntimeConfig  // cgroup/session/io-pressure guard paths
 
 	// Seams are the unexported test seams — every check reads them
 	// through h.cfg.Seams so tests re-stub a live Hygiene after New.
@@ -239,6 +241,17 @@ type HostConfig struct {
 	EventNamespace string
 }
 
+// RuntimeConfig groups the runtime-resource guard paths — the
+// cgroup-v2 unified hierarchy root (dying-descendant guard +
+// memory.reclaim writes) and the logind session dir the session
+// janitor scans. Everything else the guards touch lives under
+// already-shared roots (ProcRoot for diskstats/PSI/sysctls,
+// WatchdogStateDir for markers, SysClassNet for the neb1 gate).
+type RuntimeConfig struct {
+	CgroupRoot  string // cgroup v2 root ("/host/sys/fs/cgroup" in-pod)
+	SessionsDir string // /run/systemd/sessions on the host
+}
+
 // Seams groups the unexported test-seam funcs. Every one has a
 // production default filled by applyDefaults; tests re-stub them on
 // the live Hygiene (h.cfg.Seams.<name>) after New.
@@ -318,6 +331,19 @@ type Seams struct {
 	// the deadline — the node-local-dns :53 datapath probe
 	// (W7-H3). Seam.
 	dnsProbe func(addr, name string, timeout time.Duration) bool
+	// reniceFn drops one pid to the lowest CPU scheduling priority
+	// (renice +19) — the io-pressure throttler's CPU half. Default
+	// syscall.Setpriority; tests record instead of renicing.
+	reniceFn func(pid int) error
+	// ioniceIdleFn puts one pid in the idle I/O scheduling class
+	// (ionice -c 3) — the io-pressure throttler's I/O half. Default
+	// the ioprio_set syscall (ionice_other.go reports unsupported
+	// off-Linux). Seam.
+	ioniceIdleFn func(pid int) error
+	// podLogFn returns a tail of one pod's current log — the
+	// clock-jump healer's konnectivity evidence read. Default the
+	// kube-client GetLogs call; tests stub with canned output.
+	podLogFn func(ctx context.Context, ns, name string, tailLines int64) (string, error)
 }
 
 // applyDefaults fills every unset knob — the per-group methods below
@@ -334,6 +360,7 @@ func (c *Config) applyDefaults() {
 	c.Calico.applyDefaults()
 	c.Journal.applyDefaults()
 	c.Host.applyDefaults(c.WatchdogStateDir)
+	c.Runtime.applyDefaults()
 	c.Seams.applyDefaults(c)
 }
 
@@ -580,6 +607,15 @@ func (hc *HostConfig) applyDefaults(stateDir string) {
 	}
 }
 
+func (r *RuntimeConfig) applyDefaults() {
+	if r.CgroupRoot == "" {
+		r.CgroupRoot = defaultCgroupRoot
+	}
+	if r.SessionsDir == "" {
+		r.SessionsDir = defaultSystemdSessionsDir
+	}
+}
+
 // applyDefaults fills the production implementations of every test
 // seam. cfg carries the already-defaulted knob groups — the systemd
 // exec defaults capture c.Systemd, and the cilium encrypt-peers
@@ -696,6 +732,25 @@ func (s *Seams) applyDefaults(c *Config) {
 				return 0, err
 			}
 			return parseWGAllowedIPs(out), nil
+		}
+	}
+	if s.reniceFn == nil {
+		s.reniceFn = func(pid int) error {
+			return syscall.Setpriority(syscall.PRIO_PROCESS, pid, 19)
+		}
+	}
+	if s.ioniceIdleFn == nil {
+		s.ioniceIdleFn = ioniceIdle // build-tag split: linux ioprio_set
+	}
+	if s.podLogFn == nil {
+		s.podLogFn = func(ctx context.Context, ns, name string, tail int64) (string, error) {
+			if c.Client == nil {
+				return "", errors.New("no kube client wired")
+			}
+			res := c.Client.CoreV1().Pods(ns).GetLogs(name,
+				&corev1.PodLogOptions{TailLines: &tail}).Do(ctx)
+			b, err := res.Raw()
+			return string(b), err
 		}
 	}
 	if s.ciliumEncryptPeersFn == nil {

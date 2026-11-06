@@ -110,6 +110,20 @@ var logRules = []logRule{
 	// already covered by the ClockUnsynchronized rule above).
 	{"KernelSlabLeak", regexp.MustCompile(`STATE-ENTER: kernel-slab-leak`)},
 	{"NebulaPMTUBlackhole", regexp.MustCompile(`STATE-ENTER: nebula-pmtu-blackhole`)},
+	// --- latch→event surface: kernel/host deep-failure + hygiene ---
+	// One Event per STATE-ENTER for the remaining registered latches.
+	// containerd-corrupt and fs-readonly feed shared conditions via
+	// altStateKeys in conditions.go (KubeletRuntimeStall and
+	// FilesystemReadOnly respectively); the rest own their condition
+	// type 1:1.
+	{"ContainerdCorrupt", regexp.MustCompile(`STATE-ENTER: containerd-corrupt`)},
+	{"FilesystemReadOnly", regexp.MustCompile(`STATE-ENTER: fs-readonly`)},
+	{"KernelResourceExhaustion", regexp.MustCompile(`STATE-ENTER: pid-fd-pressure`)},
+	{"ClockSkewDetected", regexp.MustCompile(`STATE-ENTER: clock-skew`)},
+	{"KubeconfigCertExpiring", regexp.MustCompile(`STATE-ENTER: kubeconfig-cert-expiring`)},
+	{"CPUStealPressure", regexp.MustCompile(`STATE-ENTER: cpu-steal-pressure`)},
+	{"CgroupDyingLeak", regexp.MustCompile(`STATE-ENTER: cgroup-dying-leak`)},
+	{"SystemdSessionBloat", regexp.MustCompile(`STATE-ENTER: systemd-session-bloat`)},
 }
 
 // maxEventNote caps the Event note — the apiserver validates the

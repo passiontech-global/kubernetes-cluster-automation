@@ -359,6 +359,15 @@ func TestSelfHealActionReasons(t *testing.T) {
 		// Wave-9 latch→event surface.
 		{"STATE-ENTER: kernel-slab-leak sunreclaim_ratio=0.412", "KernelSlabLeak"},
 		{"STATE-ENTER: nebula-pmtu-blackhole target=10.8.0.1 df_size=1200", "NebulaPMTUBlackhole"},
+		// kernel/host deep-failure + hygiene latch→event surface.
+		{"STATE-ENTER: containerd-corrupt meta.db open failed: corrupt", "ContainerdCorrupt"},
+		{"STATE-ENTER: fs-readonly mount=/var/lib/k0s fstype=ext4", "FilesystemReadOnly"},
+		{"STATE-ENTER: pid-fd-pressure pid_ratio=0.95 fd_ratio=0.91", "KernelResourceExhaustion"},
+		{"STATE-ENTER: clock-skew offset=+2.31s source=chronyc", "ClockSkewDetected"},
+		{"STATE-ENTER: kubeconfig-cert-expiring kubeconfig-cert-expiring: embedded client cert expires in 9d", "KubeconfigCertExpiring"},
+		{"STATE-ENTER: cpu-steal-pressure steal_ratio=0.41 fails=3", "CPUStealPressure"},
+		{"STATE-ENTER: cgroup-dying-leak nr_dying_descendants=6200", "CgroupDyingLeak"},
+		{"STATE-ENTER: systemd-session-bloat abandoned=24 dbus_latency=3.2s", "SystemdSessionBloat"},
 	}
 	for _, l := range lines {
 		e.appendLog(t, l.msg)

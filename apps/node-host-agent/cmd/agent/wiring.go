@@ -200,6 +200,7 @@ func (w *wiring) descriptors() []Descriptor {
 				hm := hostmetrics.New(hostmetrics.ConfigFromEnv(hostmetrics.EnvDeps{
 					NodeName:            w.hnode,
 					WatchdogStateDir:    w.watchdogStateDir,
+					WatchdogLogFile:     w.watchdogLogFile,
 					Standalone:          w.standalone,
 					OverlayEgressRelays: w.wdCfg.OverlayEgressRelays,
 					NebulaNet:           w.wdCfg.NebulaNet,

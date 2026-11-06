@@ -347,6 +347,18 @@ func (c *orphanHPCheck) Run(ctx context.Context, e *cycleEnv) {
 				path: filepath.Join(root, e.Name()), name: e.Name()})
 		}
 	}
+	if len(cands) == 0 || c.d.cfg.Client == nil {
+		// Nothing to verify — a cluster-scope PV LIST on every
+		// worker every cycle for zero candidates is wasted
+		// apiserver traffic (and a nil client, defensive only —
+		// New rejects it — would nil-pointer panic). Zero the
+		// gauges too so a dir set deleted since the last real
+		// scan can't leave stale counts behind.
+		c.d.orphanHostPathDirs = 0
+		c.d.orphanHostPathBytes = 0
+		c.d.cycles.WithLabelValues(checkOrphanHP, "ok").Inc()
+		return
+	}
 	pvNames := map[string]bool{}
 	apiOK := true
 	if pvs, err := c.d.cfg.Client.CoreV1().PersistentVolumes().
@@ -519,6 +531,47 @@ func (d *deps) writeNodeAgentPromTextfile() {
 	gauge("node_agent_orphan_hostpath_dirs",
 		"Orphaned pvc-* hostPath dirs whose PV is gone from the apiserver.",
 		float64(d.orphanHostPathDirs))
+	// Runtime-resource guard series — the checks refresh these
+	// fields each cycle (counters accumulate in-agent).
+	gauge("node_agent_cgroup_dying_descendants",
+		"nr_dying_descendants on the cgroup-v2 root / kubepods.slice (max of the two).",
+		float64(d.cgroupDyingDescendants))
+	counter("node_agent_cgroup_reclaim_runs_total",
+		"drop_caches + memory.reclaim reclaim runs for the cgroup-dying-leak guard.",
+		d.cgroupReclaimRuns)
+	gauge("node_agent_systemd_sessions_total",
+		"logind session state files under /run/systemd/sessions.",
+		float64(d.systemdSessionsTotal))
+	gauge("node_agent_systemd_abandoned_sessions",
+		"logind sessions in STATE=closing/abandoned older than 2h.",
+		float64(d.systemdSessionsStale))
+	gauge("node_agent_systemd_dbus_latency_seconds",
+		"Wall time of `systemctl is-system-running` — the D-Bus round trip.",
+		d.systemdDbusLatencySec)
+	counter("node_agent_systemd_sessions_reaped_total",
+		"loginctl terminate-session calls issued by the session janitor.",
+		d.systemdSessionsReaped)
+	counter("node_agent_overlayfs_stale_mounts_total",
+		"Stale-overlay (ESTALE/missing lowerdir) pod detections on this node.",
+		d.overlayfsStaleMounts)
+	gauge("node_agent_disk_io_util_ratio",
+		"Whole-disk io_ticks utilization, max across devices, per cycle delta.",
+		d.diskIOUtilRatio)
+	gauge("node_agent_disk_write_await_ms",
+		"Average write await in ms across whole disks, per cycle delta.",
+		d.diskWriteAwaitMs)
+	gauge("node_agent_io_psi_full_avg60",
+		"/proc/pressure/io full avg60 (percent of wall time all tasks stalled on IO).",
+		d.ioPSIFullAvg60)
+	gauge("node_agent_io_psi_full_avg300",
+		"/proc/pressure/io full avg300 (percent of wall time all tasks stalled on IO).",
+		d.ioPSIFullAvg300)
+	counter("node_agent_io_throttled_procs_total",
+		"Background IO-heavy processes deprioritized (renice +19 + ionice idle).",
+		d.ioThrottledProcs)
+	counter("node_agent_conntrack_liberal_fixes_total",
+		"nf_conntrack_tcp_be_liberal 0→1 fixes written on neb1 nodes.",
+		d.conntrackLiberalFixes)
 	name := "node-agent-hygiene.prom"
 	tmp := filepath.Join(dir, "."+name+".tmp")
 	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {

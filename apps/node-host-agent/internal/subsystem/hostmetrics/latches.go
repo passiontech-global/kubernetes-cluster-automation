@@ -95,6 +95,11 @@ func (l *Latches) refreshLatches() {
 	// W10-KR2: pid/thread/fd utilization → state-pid-fd-pressure
 	// plus the node_agent_*_utilization_ratio textfile gauges.
 	l.updatePidFDPressure()
+	// cpu-steal-guard + kernel-entropy-check: /proc/stat steal
+	// delta → state-cpu-steal-pressure plus the
+	// node_agent_cpu_steal_ratio / node_agent_kernel_entropy_avail_bits
+	// textfile gauges.
+	l.updateStealEntropy()
 	// W10-KR5: chronyc/adjtimex clock-skew probe → state-clock-skew
 	// + rate-limited chronyc makestep.
 	l.checkClockSkew()
@@ -113,6 +118,13 @@ func (l *Latches) refreshLatches() {
 		hoststate.LatchFSReadonly,
 		hoststate.LatchPIDFDPressure,
 		hoststate.LatchClockSkew,
+		// Held latches minted elsewhere share the same reap
+		// exposure: kubeconfig-cert-expiring is controllerhygiene's
+		// signal and cpu-steal-pressure is the steal-guard's — a
+		// touch here costs one stat per tick and keeps an active
+		// episode from being reaped as stale.
+		hoststate.LatchKubeconfigCertExpiring,
+		hoststate.LatchCPUStealPressure,
 	} {
 		p := c.state.Path(name)
 		if _, err := os.Stat(p); err == nil {
