@@ -2,10 +2,13 @@ package ciliumidentityauditor
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -18,6 +21,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -578,5 +582,107 @@ func TestCiliumIdentityAuditorCESListErrorFailsClosed(t *testing.T) {
 	}
 	if !identityExists(t, dyn, "4002") {
 		t.Fatal("identity deleted on an indeterminate usage read")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Active-identity occupancy gauge + high-cardinality analysis
+// ---------------------------------------------------------------------------
+
+// ciliumIdentityLabeled is ciliumIdentity plus a
+// .spec.security-labels map — the label set the cardinality
+// profiler reads.
+func ciliumIdentityLabeled(name string, labels map[string]string) *unstructured.Unstructured {
+	o := ciliumIdentity(name)
+	_ = unstructured.SetNestedStringMap(
+		o.Object, labels, "spec", "security-labels")
+	return o
+}
+
+// The gauge mirrors the total listed identity count — below the
+// warn threshold no cardinality profiling runs.
+func TestCiliumIdentityAuditorActiveIdentitiesGauge(t *testing.T) {
+	dyn := testutil.NewDynamicClient(
+		ciliumIdentity("1000"), ciliumIdentity("2000"),
+		ciliumEndpoint("app", "cep-1", 1000),
+		ciliumEndpoint("app", "cep-2", 2000))
+	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor",
+		cs: fake.NewSimpleClientset(), dyn: dyn}
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := promtestutil.ToFloat64(ciliumActiveIdentities); got != 2 {
+		t.Fatalf("active identities gauge = %v, want 2", got)
+	}
+}
+
+// topSecurityLabelKeys ranks keys by DISTINCT-VALUE count, capped
+// at n, deterministic on ties (key-asc).
+func TestTopSecurityLabelKeys(t *testing.T) {
+	var ids []unstructured.Unstructured
+	for i := 0; i < 10; i++ {
+		ids = append(ids, *ciliumIdentityLabeled(strconv.Itoa(40000+i),
+			map[string]string{
+				// every identity carries a UNIQUE pod name — the
+				// high-cardinality culprit.
+				"k8s:io.cilium.pod.name":          fmt.Sprintf("pod-%d", i),
+				"k8s:app":                         fmt.Sprintf("app-%d", i%3),
+				"k8s:io.kubernetes.pod.namespace": "app",
+			}))
+	}
+	got := topSecurityLabelKeys(ids, 3)
+	want := []string{
+		"k8s:io.cilium.pod.name(10)",
+		"k8s:app(3)",
+		"k8s:io.kubernetes.pod.namespace(1)",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("top keys = %v, want %v", got, want)
+	}
+	// n larger than the key count just returns what exists.
+	if got := topSecurityLabelKeys(ids, 10); len(got) != 3 {
+		t.Fatalf("n>keys returned %v", got)
+	}
+	// Identities with no security-labels profile to nothing.
+	if got := topSecurityLabelKeys(
+		[]unstructured.Unstructured{*ciliumIdentity("50000")}, 3); len(got) != 0 {
+		t.Fatalf("unlabeled identity produced keys: %v", got)
+	}
+}
+
+// Above ciliumActiveIdentityWarn the sweep profiles security-label
+// cardinality and names the inflating key in the log — the gauge
+// still reads the full count.
+func TestCiliumIdentityAuditorHighCardinalityWarn(t *testing.T) {
+	objs := make([]runtime.Object, 0, ciliumActiveIdentityWarn+1)
+	for i := 0; i < ciliumActiveIdentityWarn+1; i++ {
+		name := strconv.Itoa(30000 + i)
+		objs = append(objs, ciliumIdentityLabeled(name,
+			map[string]string{
+				"k8s:io.cilium.pod.name":          "pod-" + name,
+				"k8s:io.kubernetes.pod.namespace": "app",
+			}))
+	}
+	dyn := testutil.NewDynamicClient(objs...)
+	a := &ciliumIdentityAuditor{queue: "cilium-identity-auditor",
+		cs: fake.NewSimpleClientset(), dyn: dyn}
+
+	var logs []string
+	l := funcr.New(func(_, args string) {
+		logs = append(logs, args)
+	}, funcr.Options{})
+	lctx := logf.IntoContext(ctx, l)
+	if err := a.run(lctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := promtestutil.ToFloat64(ciliumActiveIdentities); got != ciliumActiveIdentityWarn+1 {
+		t.Fatalf("active identities gauge = %v, want %d", got, ciliumActiveIdentityWarn+1)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "above warn threshold") {
+		t.Fatalf("no cardinality warning logged:\n%s", joined)
+	}
+	if !strings.Contains(joined, "k8s:io.cilium.pod.name") {
+		t.Fatalf("top cardinality key not named:\n%s", joined)
 	}
 }

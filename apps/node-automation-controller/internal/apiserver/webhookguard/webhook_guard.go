@@ -77,6 +77,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -91,6 +93,13 @@ const (
 	webhookKindMutating   = "mutating"
 	webhookKindValidating = "validating"
 )
+
+// customResourceDefinitionGVR is where the conversion-webhook checks
+// read CRDs — the typed clientset has no apiextensions surface, so
+// the objects reach through dyn like every other CRD this controller
+// consumes.
+var customResourceDefinitionGVR = schema.GroupVersionResource{
+	Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
 
 // webhookGuard is the facade behind the single
 // "admission-webhook-guard" periodic: it owns the shared clients, the
@@ -174,6 +183,13 @@ type sweepSnapshot struct {
 	vwc    *admissionv1.ValidatingWebhookConfigurationList
 	vwcErr error
 
+	// crds feeds the conversion-webhook duties — the orphan sweep's
+	// missing-backend warn and the unhealthy-backend gauge + pod
+	// bounce. A list failure degrades those duties only: the
+	// admission sweeps never see the error.
+	crds   []unstructured.Unstructured
+	crdErr error
+
 	// unhealthyNodes is the W5.5 node census: nodes whose Ready
 	// endpoints cannot actually serve webhook traffic (NotReady,
 	// partitioned, kubelet-unresponsive, unreachable/out-of-service
@@ -212,7 +228,38 @@ func (g *webhookGuard) takeSnapshot(ctx context.Context) *sweepSnapshot {
 			}
 		}
 	}
+	// Conversion-webhook CRDs — listed once here because the orphan
+	// sweep and the backend-health sweep both read them. A missing
+	// dynamic client or a list error is recorded, not fatal: the
+	// admission duties above already have their inputs.
+	if g.dyn == nil {
+		s.crdErr = errors.New("no dynamic client — CRD list skipped")
+	} else {
+		s.crds, s.crdErr = kube.ListAll(ctx,
+			metav1.ListOptions{Limit: listPageSize},
+			kube.DynamicPage(g.dyn.Resource(customResourceDefinitionGVR)))
+	}
 	return s
+}
+
+// crdConversionServiceKey extracts the "namespace/name" Service key a
+// CRD's spec.conversion webhook targets — ok=false when the CRD does
+// not convert via webhook (strategy missing or something else) or the
+// clientConfig is URL-targeted / malformed. The sweep treats those
+// like the breaker's URL entries: unmeasurable, never flagged.
+func crdConversionServiceKey(crd *unstructured.Unstructured) (key, ns, name string, ok bool) {
+	strategy, _ := kube.NestedString(crd.Object, "spec", "conversion", "strategy")
+	if strategy != "Webhook" {
+		return "", "", "", false
+	}
+	ns, _ = kube.NestedString(crd.Object,
+		"spec", "conversion", "webhook", "clientConfig", "service", "namespace")
+	name, _ = kube.NestedString(crd.Object,
+		"spec", "conversion", "webhook", "clientConfig", "service", "name")
+	if ns == "" || name == "" {
+		return "", "", "", false
+	}
+	return ns + "/" + name, ns, name, true
 }
 
 // webhookUnhealthyNodeTaints are the taint keys marking a node whose
@@ -294,20 +341,21 @@ func (s *sweepSnapshot) readyCounts() (endpointCensus, error) {
 }
 
 func (g *webhookGuard) run(ctx context.Context) error {
-	// The orphan sweep, the circuit breaker and the unmeshed-pod
-	// auditor are independent duties — a failure in one must never
-	// skip the others, so all run and their errors join
-	// (nil+nil+nil → nil). All three read the same cluster state, so
-	// the shared snapshot is listed once up front instead of once per
-	// consumer.
+	// The orphan sweep, the circuit breaker, the CRD conversion-
+	// backend check and the unmeshed-pod auditor are independent
+	// duties — a failure in one must never skip the others, so all
+	// run and their errors join (nils → nil). All four read the same
+	// cluster state, so the shared snapshot is listed once up front
+	// instead of once per consumer.
 	snap := g.takeSnapshot(ctx)
 	orphanErr := g.sweepOrphans(ctx, snap)
 	var breakerErr error
 	if circuitBreakerEnabled() {
 		breakerErr = g.sweepCircuitBreaker(ctx, snap)
 	}
+	conversionErr := g.sweepCRDConversionBackends(ctx, snap)
 	unmeshedErr := g.sweepUnmeshedPods(ctx, snap)
-	return errors.Join(orphanErr, breakerErr, unmeshedErr)
+	return errors.Join(orphanErr, breakerErr, conversionErr, unmeshedErr)
 }
 
 // readyEndpointCounts builds the ns/service → Ready-endpoint census
@@ -403,8 +451,9 @@ func (g *webhookGuard) readyEndpointCounts(ctx context.Context, snap *sweepSnaps
 
 // webhookBackendServices returns the set of "namespace/name" Service
 // keys referenced by any sub-webhook's clientConfig.service across
-// both webhook-config kinds — the only services the W9-CP1 probe
-// dials. Nil config lists (API flap) contribute nothing.
+// both webhook-config kinds PLUS every CRD spec.conversion webhook's
+// service — the only services the W9-CP1 probe dials. Nil config
+// lists and a failed CRD list (API flap) contribute nothing.
 func webhookBackendServices(snap *sweepSnapshot) map[string]bool {
 	out := map[string]bool{}
 	add := func(svc *admissionv1.ServiceReference) {
@@ -424,6 +473,14 @@ func webhookBackendServices(snap *sweepSnapshot) map[string]bool {
 			for _, h := range valHookViews(snap.vwc.Items[i].Webhooks) {
 				add(h.svc)
 			}
+		}
+	}
+	// CRD conversion backends join the probe set — a hung conversion
+	// pod is the same brownout signature, and its probe verdict feeds
+	// the tls_probe_failed reason + the stage-1 bounce.
+	for i := range snap.crds {
+		if key, _, _, ok := crdConversionServiceKey(&snap.crds[i]); ok {
+			out[key] = true
 		}
 	}
 	return out

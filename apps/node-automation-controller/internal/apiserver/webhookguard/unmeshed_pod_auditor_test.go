@@ -96,7 +96,7 @@ func upPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 }
 
 func upGuard(cs *fake.Clientset) *webhookGuard {
-	return &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient(), now: time.Now,
+	return &webhookGuard{cs: cs, dyn: wgDyn(), now: time.Now,
 		unmeshedPodAuditor: unmeshedPodAuditor{}}
 }
 
@@ -697,7 +697,7 @@ func TestUnmeshedRemediationAutopilotPlanDefers(t *testing.T) {
 	plan := testutil.Unstructured(
 		kube.AutopilotPlanGVR.GroupVersion().WithKind("Plan"), "", "upgrade-1", nil)
 	_ = unstructured.SetNestedField(plan.Object, "Running", "status", "state")
-	dyn := testutil.NewDynamicClient(plan)
+	dyn := wgDyn(plan)
 	cs := fake.NewSimpleClientset(
 		upNamespace("kube-system", ""),
 		upNamespace("meshed", "enabled"),

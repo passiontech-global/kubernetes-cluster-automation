@@ -76,10 +76,14 @@ const (
 // stormConds mirrors STORM_CONDS (see package comment for sources).
 // NebulaIsolated/NebulaDegraded/NebulaPMTUBlackhole are the
 // node-host-agent overlay conditions; KernelHungTasks,
-// KernelSlabLeak, ClockUnsynchronized, CalicoFelixDown and
-// CiliumIPAMExhausted are the node-problem-detector/CNI latches that
-// make rebalancing actively harmful — same posture as the existing
-// network-problem conditions.
+// KernelSlabLeak, KernelResourceExhaustion, CgroupDyingLeak,
+// MemoryPSIThrashing, ClockUnsynchronized, JournaldWedged,
+// SystemdSessionLeak, ConntrackExhausted, InodePressure,
+// KubeletPLEGUnhealthy, ControlPlaneFrozen, CalicoFelixDown,
+// CiliumIPAMExhausted and the remaining Cilium* latches are the
+// node-problem-detector/kubelet/CNI latches that make rebalancing
+// actively harmful — same posture as the existing network-problem
+// conditions.
 var stormConds = []corev1.NodeConditionType{
 	"KubeletRuntimeStall", "KubeletWatchWedge", "PodTeardownWedged",
 	"WatchdogStale", "HostNetworkProblems", "ClusterNetworkProblems",
@@ -88,6 +92,12 @@ var stormConds = []corev1.NodeConditionType{
 	"NebulaIsolated", "NebulaDegraded", "NebulaPMTUBlackhole",
 	"KernelHungTasks", "KernelSlabLeak", "ClockUnsynchronized",
 	"CalicoFelixDown", "CiliumIPAMExhausted",
+	"InodePressure", "MemoryPSIThrashing", "CgroupDyingLeak",
+	"KernelResourceExhaustion", "KubeletPLEGUnhealthy",
+	"SystemdSessionLeak", "CiliumAgentDown", "CiliumInitStuck",
+	"CiliumEnvoyDown", "CiliumWGStale", "CiliumLRPDegraded",
+	"CiliumMTUDrift", "ConntrackExhausted", "JournaldWedged",
+	"ControlPlaneFrozen",
 }
 
 // stormTaints mirrors STORM_TAINTS.

@@ -132,6 +132,32 @@ func (o *orphanSweep) sweepOrphans(ctx context.Context, snap *sweepSnapshot) err
 		collect(false, cfg.Name, removed)
 	}
 
+	// CRD conversion webhooks get the same warn-only treatment: a
+	// backend Service deleted under a live namespace — or its whole
+	// namespace pruned — leaves the apiserver erroring every CR read
+	// for that API group. Unlike an admission webhook ENTRY there is
+	// no entry to drop (the CRD object IS the config, and deleting a
+	// CRD is catastrophic), so this sweep only warns; the
+	// backend-health sweep emits the
+	// node_automation_crd_conversion_webhook_unhealthy gauge.
+	if snap.crdErr == nil {
+		for i := range snap.crds {
+			crd := &snap.crds[i]
+			svcKey, ns, _, ok := crdConversionServiceKey(crd)
+			if !ok {
+				continue
+			}
+			switch {
+			case !namespaces[ns]:
+				log.Info("ORPHAN: CRD conversion webhook backend namespace gone — warn only, the CRD itself is never touched",
+					"crd", crd.GetName(), "service", svcKey)
+			case haveSvc && !services[svcKey]:
+				log.Info("WARN: CRD conversion webhook backend Service missing — warn only",
+					"crd", crd.GetName(), "service", svcKey)
+			}
+		}
+	}
+
 	if len(patches) == 0 {
 		log.Info("sweep done: no orphan admission webhooks")
 		return nil

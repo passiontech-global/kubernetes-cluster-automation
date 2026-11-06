@@ -364,6 +364,116 @@ func TestLinkerdEndpointSyncKeepsNonManagedSlice(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Widened Service census — the audit covers every selector-bearing
+// Service in an injected namespace, not just headless ones.
+// ---------------------------------------------------------------------------
+
+// A non-headless ClusterIP Service in an injected namespace is audited
+// the same way: a Ready pod IP missing from the EndpointSlice desyncs
+// it and fails the check past the persistence window.
+func TestLinkerdEndpointSyncAuditsClusterIPService(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		linkerdInjectedNamespace("app"),
+		clusterIPService("app", "web-svc", map[string]string{"app": "x"}),
+		probetest.ReadyPodWithIP("app", "pod-0", "10.244.0.5",
+			map[string]string{"app": "x"}),
+		probetest.EndpointSliceForService("app", "web-svc", "10.244.0.9"), // stale IP
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := driveEndpointDesync(t, p, base); res.Pass {
+		t.Fatal("desynced ClusterIP service did not fail the check")
+	}
+	if m := probetest.FindMetric(t, "node_automation_linkerd_endpoint_desync",
+		map[string]string{"namespace": "app", "service": "web-svc"}); m == nil {
+		t.Fatal("desync gauge missing for ClusterIP service")
+	}
+}
+
+// Excluded service shapes — a desync on any of these must never
+// flag, even after the persistence window would have elapsed.
+func TestLinkerdEndpointSyncSkipsExcludedServices(t *testing.T) {
+	externalName := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "ext-svc"},
+		Spec: corev1.ServiceSpec{
+			Type:         corev1.ServiceTypeExternalName,
+			ExternalName: "example.com",
+			Selector:     map[string]string{"app": "x"},
+		},
+	}
+	publishNotReady := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "pnr-svc"},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:                "10.96.0.20",
+			Selector:                 map[string]string{"app": "x"},
+			PublishNotReadyAddresses: true,
+		},
+	}
+	selectorless := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "no-sel-svc"},
+		Spec:       corev1.ServiceSpec{ClusterIP: "10.96.0.30"},
+	}
+	for _, tc := range []struct {
+		name string
+		svc  *corev1.Service
+	}{
+		{"ExternalName", externalName},
+		{"PublishNotReadyAddresses", publishNotReady},
+		{"no selector", selectorless},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := time.Now()
+			cs := fake.NewSimpleClientset(
+				linkerdInjectedNamespace("app"),
+				tc.svc,
+				// A Ready pod the selector WOULD have matched + an
+				// empty managed slice — desync material if audited.
+				probetest.ReadyPodWithIP("app", "pod-0", "10.244.0.5",
+					map[string]string{"app": "x"}),
+				probetest.ReadyWorkerNode("w1", "", 0, false))
+			p := testProberDyn(cs, probetest.OpDyn())
+			if res := driveEndpointDesync(t, p, base); !res.Pass {
+				t.Fatalf("%s service must never be audited: %+v", tc.name, res)
+			}
+			if m := probetest.FindMetric(t, "node_automation_linkerd_endpoint_desync",
+				map[string]string{"namespace": "app", "service": tc.svc.Name}); m != nil {
+				t.Fatalf("desync gauge emitted for excluded %s service", tc.name)
+			}
+		})
+	}
+}
+
+// A selector Service OUTSIDE an injected namespace is still skipped —
+// the widened census keeps the namespace gate.
+func TestLinkerdEndpointSyncSkipsClusterIPOutsideMesh(t *testing.T) {
+	plain := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "plain"}}
+	cs := fake.NewSimpleClientset(
+		plain,
+		clusterIPService("plain", "web-svc", map[string]string{"app": "x"}),
+		probetest.ReadyPodWithIP("plain", "pod-0", "10.244.0.5",
+			map[string]string{"app": "x"}),
+		probetest.ReadyWorkerNode("w1", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := driveEndpointDesync(t, p, time.Now()); !res.Pass {
+		t.Fatalf("uninjected ClusterIP service must pass: %+v", res)
+	}
+}
+
+// clusterIPService builds a routable (non-headless) ClusterIP Service
+// with a pod selector — the shape the widened census now audits
+// alongside headless Services.
+func clusterIPService(ns, name string, selector map[string]string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.96.0.10",
+			Selector:  selector,
+			Ports:     []corev1.ServicePort{{Port: 80}},
+		},
+	}
+}
+
 // linkerdInjectedNamespace builds a namespace opted into linkerd injection.
 func linkerdInjectedNamespace(name string) *corev1.Namespace {
 	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{

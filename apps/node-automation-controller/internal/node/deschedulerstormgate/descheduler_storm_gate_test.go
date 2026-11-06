@@ -489,13 +489,11 @@ func TestStormGateMaintenanceCheckError(t *testing.T) {
 	}
 }
 
-// W9-CP3 — the node-host-agent overlay/kernel latches added to
-// stormConds gate the descheduler exactly like the existing storm
-// conditions.
+// Every latch in stormConds gates the descheduler exactly like the
+// original storm conditions — the node-host-agent overlay, kernel,
+// kubelet and CNI latches included.
 func TestStormGateScalesDownOnLatchConditions(t *testing.T) {
-	for _, cond := range []corev1.NodeConditionType{
-		"NebulaPMTUBlackhole", "KernelSlabLeak", "ClockUnsynchronized",
-	} {
+	for _, cond := range stormConds {
 		cs := fake.NewSimpleClientset(
 			withStormCond(testutil.Node("n1", corev1.ConditionTrue, nil), cond),
 			deschedulerDeploy(1, nil))

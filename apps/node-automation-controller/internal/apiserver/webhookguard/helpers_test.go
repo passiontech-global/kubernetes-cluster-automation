@@ -5,12 +5,43 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 var ctx = context.Background()
+
+// wgDyn builds the dynamic fake the guard's tests share — the stock
+// testutil.NewDynamicClient covers every CRD in the shared table but
+// NOT CustomResourceDefinition itself (the snapshot lists CRDs for
+// the conversion-webhook checks), so the list kind is merged in
+// here. Without it the fake panics on a List whose <Kind>List is
+// unregistered.
+func wgDyn(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	kinds := testutil.DynListKinds()
+	kinds[customResourceDefinitionGVR] = "CustomResourceDefinitionList"
+	return testutil.NewFakeDyn(kinds, objs...)
+}
+
+// wgCRDConversion builds a CustomResourceDefinition whose
+// spec.conversion is a Webhook strategy targeting Service
+// ns/name — the conversion-backend fixture.
+func wgCRDConversion(crdName, svcNS, svcName string) *unstructured.Unstructured {
+	crd := testutil.Unstructured(
+		customResourceDefinitionGVR.GroupVersion().WithKind("CustomResourceDefinition"),
+		"", crdName, nil)
+	_ = unstructured.SetNestedField(crd.Object, "Webhook",
+		"spec", "conversion", "strategy")
+	_ = unstructured.SetNestedMap(crd.Object,
+		map[string]any{"namespace": svcNS, "name": svcName},
+		"spec", "conversion", "webhook", "clientConfig", "service")
+	return crd
+}
 
 // emulateEviction teaches the fake clientset the apiserver's
 // pods/eviction contract: the fake tracker records a pods/eviction

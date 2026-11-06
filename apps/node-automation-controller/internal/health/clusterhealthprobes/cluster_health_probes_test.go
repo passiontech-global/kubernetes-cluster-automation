@@ -150,11 +150,12 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// coredns-upstream (readiness fallback), image-pull-storm, plus
 	// five more pod-census checks added since: cilium-missing-endpoint,
 	// linkerd-h2-stream-guard, cloudflared-tunnel-health,
-	// postgres-wal-archive-guard, scylla-compaction-schema-guard ->
-	// sixteen total. (linkerd-endpoint-sync skips its pod census
-	// entirely when no namespace carries linkerd.io/inject=enabled.)
-	if got := errCount() - before; got != 16 {
-		t.Fatalf("run errors delta = %v, want 16", got)
+	// postgres-wal-archive-guard, scylla-compaction-schema-guard,
+	// controller-lease-guard (KSM wedge scan) -> seventeen total.
+	// (linkerd-endpoint-sync skips its pod census entirely when no
+	// namespace carries linkerd.io/inject=enabled.)
+	if got := errCount() - before; got != 17 {
+		t.Fatalf("run errors delta = %v, want 17", got)
 	}
 }
 

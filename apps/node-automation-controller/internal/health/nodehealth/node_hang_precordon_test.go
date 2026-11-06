@@ -190,16 +190,13 @@ func TestCheckNodeHangClockSkewCordon(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// W10-KR6 — nodeHangConds expansion
+// nodeHangConds coverage
 // ---------------------------------------------------------------------------
 
-// Every Wave-10 latch in nodeHangConds cordons a worker once True for
+// Every latch in nodeHangConds cordons a worker once True for
 // >= nodeHangCondMinAge — same fuse as the original two.
 func TestNodeHangPreCordonNewLatches(t *testing.T) {
-	for i, cond := range []corev1.NodeConditionType{
-		"KubeletRuntimeStall", "KubeletWatchWedge",
-		"PodTeardownWedged", "InodePressure",
-	} {
+	for i, cond := range nodeHangConds {
 		name := "w-" + string(rune('a'+i))
 		cs := fake.NewSimpleClientset(
 			probetest.ReadyWorkerNode(name, cond, 5*time.Minute, false),
