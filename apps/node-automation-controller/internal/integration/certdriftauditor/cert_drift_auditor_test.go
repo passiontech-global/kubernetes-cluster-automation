@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"math/big"
@@ -151,7 +152,7 @@ func TestCertDriftAuditorWebhookInjectSecret(t *testing.T) {
 			mutHook("hook-ok.example.com", caBundleA),
 			mutHook("hook-stale.example.com", caBundleB),
 		))
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
+	a := newCertDriftAuditor(cs, cdaDyn(), time.Now())
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -172,7 +173,7 @@ func TestCertDriftAuditorWebhookInjectFromCertificate(t *testing.T) {
 		validatingCfg("vwc", map[string]string{
 			injectCAFromAnno: "cert-ns/my-cert",
 		}, valHook("hook.example.com", caBundleB)))
-	dyn := testutil.NewDynamicClient(cdaCertificate("cert-ns", "my-cert", "real-secret"))
+	dyn := cdaDyn(cdaCertificate("cert-ns", "my-cert", "real-secret"))
 	a := newCertDriftAuditor(cs, dyn, time.Now())
 
 	if err := a.run(ctx); err != nil {
@@ -191,7 +192,7 @@ func TestCertDriftAuditorInjectFromSecretNameFallback(t *testing.T) {
 		validatingCfg("vwc", map[string]string{
 			injectCAFromAnno: "cert-ns/my-cert",
 		}, valHook("hook.example.com", caBundleA)))
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
+	a := newCertDriftAuditor(cs, cdaDyn(), time.Now())
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -207,7 +208,7 @@ func TestCertDriftAuditorInjectFromSecretNameFallback(t *testing.T) {
 func TestCertDriftAuditorUnannotatedConfigSkipped(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		mutatingCfg("plain-mwc", nil, mutHook("hook.example.com", caBundleA)))
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
+	a := newCertDriftAuditor(cs, cdaDyn(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +227,7 @@ func TestCertDriftAuditorUnresolvedSourceKeepsSeries(t *testing.T) {
 		mutatingCfg("mwc", map[string]string{
 			injectCAFromSecretAnno: "cert-ns/ca-secret",
 		}, mutHook("hook.example.com", caBundleB)))
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
+	a := newCertDriftAuditor(cs, cdaDyn(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +264,7 @@ func TestCertDriftAuditorCertGetErrorCarriesSeries(t *testing.T) {
 		mutatingCfg("mwc", map[string]string{
 			injectCAFromAnno: "cert-ns/my-cert",
 		}, mutHook("hook.example.com", caBundleB)))
-	dyn := testutil.NewDynamicClient(cdaCertificate("cert-ns", "my-cert", "real-secret"))
+	dyn := cdaDyn(cdaCertificate("cert-ns", "my-cert", "real-secret"))
 	a := newCertDriftAuditor(cs, dyn, time.Now())
 
 	if err := a.run(ctx); err != nil {
@@ -294,7 +295,7 @@ func TestCertDriftAuditorPrunesDroppedAnnotation(t *testing.T) {
 	}, mutHook("hook.example.com", caBundleB))
 	cs := fake.NewSimpleClientset(
 		caSecret("cert-ns", "ca-secret", "ca.crt", caBundleA), cfg)
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
+	a := newCertDriftAuditor(cs, cdaDyn(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +330,7 @@ func TestCertDriftAuditorWebhookListError(t *testing.T) {
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
+	a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
 
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when the webhook config list fails")
@@ -356,7 +357,7 @@ func TestCertDriftAuditorTLSExpiry(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "opaque"},
 			Type:       corev1.SecretTypeOpaque,
 		})
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
+	a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -385,7 +386,7 @@ func TestCertDriftAuditorTLSUnparseableSkipped(t *testing.T) {
 			Data:       map[string][]byte{"tls.crt": []byte("not-a-pem")},
 		},
 		tlsSecret(t, "app", "tls-ok", fixedNow.Add(5*24*time.Hour)))
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
+	a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -405,7 +406,7 @@ func TestCertDriftAuditorTLSPrunesDeletedSecret(t *testing.T) {
 	fixedNow := time.Now().Truncate(time.Second) // x509 serializes cert times at second precision
 	s := tlsSecret(t, "app", "tls-temp", fixedNow.Add(10*24*time.Hour))
 	cs := fake.NewSimpleClientset(s)
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
+	a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -434,7 +435,7 @@ func TestCertDriftAuditorTLSListError(t *testing.T) {
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
+	a := newCertDriftAuditor(cs, cdaDyn(), time.Now())
 
 	if err := a.run(ctx); err == nil {
 		t.Fatal("expected error when the tls secret list fails")
@@ -504,7 +505,7 @@ func TestCertDriftAuditorWebhookBundleExpiry(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		mutatingCfg("unannotated-mwc", nil, mutHook("hook-a.example.com", oldest)),
 		validatingCfg("unannotated-vwc", nil, valHook("hook-b.example.com", bundle)))
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
+	a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -531,7 +532,7 @@ func TestCertDriftAuditorWebhookEmptyBundleFailClosed(t *testing.T) {
 			mutHookSvc("ignore.example.com", nil, &ignore),
 			mutHook("url.example.com", nil), // url clientConfig — no service
 		))
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
+	a := newCertDriftAuditor(cs, cdaDyn(), time.Now())
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -578,7 +579,7 @@ func TestCertDriftAuditorTrustBundles(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "s"},
 			Data:       map[string][]byte{"ca.crt": makeCertPEM(t, fixedNow.Add(9*24*time.Hour))},
 		})
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), fixedNow)
+	a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -631,7 +632,7 @@ func TestReplicatedDriftLatchesAfterTwoScans(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		replicatedSecret("sec", "tls-src", "", "CRT-v2"),
 		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-v1"))
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
+	a := newCertDriftAuditor(cs, cdaDyn(), time.Now())
 
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
@@ -657,7 +658,7 @@ func TestReplicatedDriftClearsOnResync(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		replicatedSecret("sec", "tls-src", "", "CRT-v1"),
 		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-old"))
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
+	a := newCertDriftAuditor(cs, cdaDyn(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +699,7 @@ func TestReplicatedDriftOpaqueSourceFallback(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(src,
 		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-v1"))
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
+	a := newCertDriftAuditor(cs, cdaDyn(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -715,11 +716,204 @@ func TestReplicatedDriftOpaqueSourceFallback(t *testing.T) {
 func TestReplicatedDriftMissingSourceQuiet(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		replicatedSecret("apps", "tls-copy", "sec/tls-src", "CRT-v1"))
-	a := newCertDriftAuditor(cs, testutil.NewDynamicClient(), time.Now())
+	a := newCertDriftAuditor(cs, cdaDyn(), time.Now())
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if len(a.replicationMismatch) != 0 {
 		t.Fatalf("missing source counted as drift: %v", a.replicationMismatch)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CRD conversion webhook caBundles
+// ---------------------------------------------------------------------------
+
+// cdaCRD builds a CustomResourceDefinition whose spec.conversion is a
+// Webhook strategy — the caBundle is base64-encoded exactly the way
+// the apiserver serializes []byte. svcNS/svcName=="" yields a URL
+// backend; annos==nil leaves the object unannotated.
+func cdaCRD(name string, annos map[string]string, caBundle []byte,
+	svcNS, svcName string) *unstructured.Unstructured {
+	crd := testutil.Unstructured(
+		customResourceDefinitionGVR.GroupVersion().WithKind("CustomResourceDefinition"),
+		"", name, nil)
+	crd.SetAnnotations(annos)
+	_ = unstructured.SetNestedField(crd.Object, "Webhook",
+		"spec", "conversion", "strategy")
+	cc := map[string]any{}
+	if svcNS != "" {
+		cc["service"] = map[string]any{"namespace": svcNS, "name": svcName}
+	} else {
+		cc["url"] = "https://convert.example.com/convert"
+	}
+	if len(caBundle) > 0 {
+		cc["caBundle"] = base64.StdEncoding.EncodeToString(caBundle)
+	}
+	_ = unstructured.SetNestedMap(crd.Object, cc,
+		"spec", "conversion", "webhook", "clientConfig")
+	return crd
+}
+
+// A CRD conversion webhook whose caBundle drifted from the
+// inject-ca-from Secret gauges mismatch=1 — the series lands under
+// kind=CustomResourceDefinition with the fixed "conversion" webhook
+// label.
+func TestCertDriftAuditorCRDConversionDrift(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		caSecret("cert-ns", "ca-secret", "ca.crt", caBundleA))
+	dyn := cdaDyn(cdaCRD("widgets.example.com",
+		map[string]string{injectCAFromSecretAnno: "cert-ns/ca-secret"},
+		caBundleB, "conv-ns", "conv-svc"))
+	a := newCertDriftAuditor(cs, dyn, time.Now())
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := caMismatch("CustomResourceDefinition", "widgets.example.com", "conversion"); got != 1 {
+		t.Fatalf("drifted CRD conversion bundle mismatch=%v, want 1", got)
+	}
+}
+
+// A conversion bundle matching the injection source gauges 0 — drift
+// is a byte comparison, not a presence check.
+func TestCertDriftAuditorCRDConversionMatch(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		caSecret("cert-ns", "ca-secret", "ca.crt", caBundleA))
+	dyn := cdaDyn(cdaCRD("widgets.example.com",
+		map[string]string{injectCAFromSecretAnno: "cert-ns/ca-secret"},
+		caBundleA, "conv-ns", "conv-svc"))
+	a := newCertDriftAuditor(cs, dyn, time.Now())
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := caMismatch("CustomResourceDefinition", "widgets.example.com", "conversion"); got != 0 {
+		t.Fatalf("matching conversion bundle mismatch=%v, want 0", got)
+	}
+}
+
+// inject-ca-from resolves through a Certificate object on CRDs too —
+// cainjector's wiring is identical for the conversion surface.
+func TestCertDriftAuditorCRDConversionInjectFromCertificate(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		caSecret("cert-ns", "real-secret", "ca.crt", caBundleA))
+	dyn := cdaDyn(
+		cdaCertificate("cert-ns", "my-cert", "real-secret"),
+		cdaCRD("widgets.example.com",
+			map[string]string{injectCAFromAnno: "cert-ns/my-cert"},
+			caBundleB, "conv-ns", "conv-svc"))
+	a := newCertDriftAuditor(cs, dyn, time.Now())
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := caMismatch("CustomResourceDefinition", "widgets.example.com", "conversion"); got != 1 {
+		t.Fatalf("mismatch=%v, want 1 (caBundleB != source caBundleA)", got)
+	}
+}
+
+// Every conversion bundle feeds the expiry gauge — the CRD needs no
+// annotation for that check, and a URL backend counts the same.
+func TestCertDriftAuditorCRDConversionBundleExpiry(t *testing.T) {
+	fixedNow := time.Now().Truncate(time.Second)
+	svcBundle := makeCertPEM(t, fixedNow.Add(11*24*time.Hour))
+	urlBundle := makeCertPEM(t, fixedNow.Add(40*24*time.Hour))
+	cs := fake.NewSimpleClientset()
+	dyn := cdaDyn(
+		cdaCRD("widgets.example.com", nil, svcBundle, "conv-ns", "conv-svc"),
+		cdaCRD("remote.example.com", nil, urlBundle, "", ""))
+	a := newCertDriftAuditor(cs, dyn, fixedNow)
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := caExpiryGauge("CustomResourceDefinition", "widgets.example.com", "conversion"); got != 11 {
+		t.Fatalf("service-backed crd days=%v, want 11", got)
+	}
+	if got := caExpiryGauge("CustomResourceDefinition", "remote.example.com", "conversion"); got != 40 {
+		t.Fatalf("url-backed crd days=%v, want 40", got)
+	}
+}
+
+// An EMPTY caBundle on a service-targeted conversion webhook is the
+// outage signature — conversion has no failurePolicy to soften the
+// call, so the check fires unconditionally. A non-Webhook CRD and a
+// URL-targeted conversion stay silent.
+func TestCertDriftAuditorCRDConversionEmptyBundle(t *testing.T) {
+	plain := testutil.Unstructured(
+		customResourceDefinitionGVR.GroupVersion().WithKind("CustomResourceDefinition"),
+		"", "no-conversion.example.com", nil)
+	cs := fake.NewSimpleClientset()
+	dyn := cdaDyn(
+		cdaCRD("widgets.example.com", nil, nil, "conv-ns", "conv-svc"),
+		cdaCRD("remote.example.com", nil, nil, "", ""), // url backend — legitimately bundle-less
+		plain)
+	a := newCertDriftAuditor(cs, dyn, time.Now())
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := caMismatch("CustomResourceDefinition", "widgets.example.com", "conversion"); got != 1 {
+		t.Fatalf("empty conversion bundle mismatch=%v, want 1", got)
+	}
+	for _, name := range []string{"remote.example.com", "no-conversion.example.com"} {
+		if metrics.WebhookCABundleMismatch.DeleteLabelValues(
+			"CustomResourceDefinition", name, "conversion") {
+			t.Fatalf("CRD %s produced a mismatch series — only service-targeted conversions flag", name)
+		}
+	}
+}
+
+// A CRD deleted between sweeps gets its series pruned — /metrics must
+// not keep reporting drift for a dead object.
+func TestCertDriftAuditorCRDConversionPrunesDeletedCRD(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		caSecret("cert-ns", "ca-secret", "ca.crt", caBundleA))
+	dyn := cdaDyn(cdaCRD("widgets.example.com",
+		map[string]string{injectCAFromSecretAnno: "cert-ns/ca-secret"},
+		caBundleB, "conv-ns", "conv-svc"))
+	a := newCertDriftAuditor(cs, dyn, time.Now())
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := caMismatch("CustomResourceDefinition", "widgets.example.com", "conversion"); got != 1 {
+		t.Fatalf("precondition: mismatch=%v, want 1", got)
+	}
+	if err := dyn.Resource(customResourceDefinitionGVR).
+		Delete(ctx, "widgets.example.com", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete crd: %v", err)
+	}
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.WebhookCABundleMismatch.DeleteLabelValues(
+		"CustomResourceDefinition", "widgets.example.com", "conversion") {
+		t.Fatal("drift series kept after the CRD was deleted")
+	}
+}
+
+// A CRD list failure propagates as the run's error — and the
+// admission-config audits still landed their series first (the TLS
+// sweep stays independent too).
+func TestCertDriftAuditorCRDListError(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		mutatingCfg("mwc", map[string]string{
+			injectCAFromSecretAnno: "cert-ns/ca-secret",
+		}, mutHook("hook.example.com", caBundleB)),
+		caSecret("cert-ns", "ca-secret", "ca.crt", caBundleA))
+	dyn := cdaDyn()
+	dyn.PrependReactor("list", "customresourcedefinitions",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+	a := newCertDriftAuditor(cs, dyn, time.Now())
+
+	if err := a.run(ctx); err == nil {
+		t.Fatal("expected error when the CRD list fails")
+	}
+	if got := caMismatch("MutatingWebhookConfiguration", "mwc", "hook.example.com"); got != 1 {
+		t.Fatalf("webhook audit skipped after CRD failure — mismatch=%v, want 1", got)
 	}
 }

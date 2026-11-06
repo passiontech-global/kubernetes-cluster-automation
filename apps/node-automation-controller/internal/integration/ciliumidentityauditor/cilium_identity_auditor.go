@@ -43,6 +43,15 @@
 // burst hammering the apiserver. Each delete bumps
 // metrics.CiliumIdentitiesCollectedTotal; orphans above
 // ciliumOrphanMax still IncError on the legacy alert path.
+//
+// The sweep also exports node_automation_cilium_active_identities —
+// the total identity-table occupancy from the same list the orphan
+// audit already makes. Past ciliumActiveIdentityWarn the count alone
+// does not say WHY the table is full, so the sweep profiles
+// .spec.security-labels across the identities and logs the top-3
+// label keys by distinct-value cardinality: each unique label SET
+// mints an identity, so the high-cardinality key is the workload
+// attribute inflating the eBPF identity table.
 package ciliumidentityauditor
 
 import (
@@ -54,6 +63,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -62,6 +72,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -93,7 +104,29 @@ const (
 	// range (1–255: host, world, health, ingress, ...) — upstream GC
 	// exempts it, so orphan accounting must too.
 	ciliumReservedIDMax = 255
+	// ciliumActiveIdentityWarn — total CiliumIdentity objects past
+	// which the table-occupancy count alone is not enough signal:
+	// the sweep then profiles security-label cardinality and names
+	// the keys inflating the table (65k range exhaustion risk).
+	ciliumActiveIdentityWarn = 10000
 )
+
+var (
+	// ciliumActiveIdentities is the total CiliumIdentity count from
+	// the last successful list — the eBPF identity-table occupancy.
+	// Colocated single-check series: the integration-domain shared
+	// vectors live in internal/metrics, but a gauge only this
+	// module consumes stays with the check file (probefw parity).
+	ciliumActiveIdentities = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_automation_cilium_active_identities",
+		Help: "Total CiliumIdentity objects in the cluster — eBPF identity table occupancy.",
+	})
+)
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(
+		ciliumActiveIdentities)
+}
 
 var (
 	ciliumIdentityGVR = kube.GVRCiliumIdentity
@@ -160,6 +193,22 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		kube.DynamicPage(a.dyn.Resource(ciliumIdentityGVR)))
 	if err != nil {
 		return fmt.Errorf("list ciliumidentities: %w", err) // wrapper IncErrors — a returned error must not count itself
+	}
+	// Table occupancy gauge — the last-successful-list reading
+	// stays when a list fails (a failed sweep returns before this
+	// point, so the series mirrors real observed state, never a
+	// fabricated zero). Past the warn threshold the count alone is
+	// insufficient signal — profile security-label cardinality and
+	// name the keys minting identities (each distinct label SET is
+	// one identity; the top keys are the workload attributes
+	// inflating the table).
+	totalIDs := len(ids)
+	ciliumActiveIdentities.Set(float64(totalIDs))
+	if totalIDs > ciliumActiveIdentityWarn {
+		log.Info("CiliumIdentity count above warn threshold — top "+
+			"security-label keys by distinct values",
+			"total", totalIDs, "threshold", ciliumActiveIdentityWarn,
+			"topLabelKeys", topSecurityLabelKeys(ids, 3))
 	}
 	// Keep only name → (creationTimestamp, UID): the audit never
 	// reads identity bodies beyond the age gate and the delete
@@ -463,4 +512,49 @@ func reservedIdentity(id *unstructured.Unstructured) bool {
 		}
 	}
 	return false
+}
+
+// topSecurityLabelKeys profiles .spec.security-labels across the
+// identity list and returns the n keys carrying the most distinct
+// values, rendered "key(count)" for one structured log field.
+// Cilium mints one identity per distinct security-label SET, so an
+// identity-table blow-up is always a high-cardinality key — a
+// per-pod label, a churning version tag — and the cardinality of
+// its VALUES is what names it (a key seen on every identity with
+// one fixed value mints nothing). Sort is count-desc then key-asc
+// so the report is deterministic.
+func topSecurityLabelKeys(ids []unstructured.Unstructured, n int) []string {
+	values := map[string]map[string]struct{}{}
+	for i := range ids {
+		sec, _ := kube.NestedStringMap(
+			ids[i].Object, "spec", "security-labels")
+		for k, v := range sec {
+			if values[k] == nil {
+				values[k] = map[string]struct{}{}
+			}
+			values[k][v] = struct{}{}
+		}
+	}
+	type kv struct {
+		key string
+		n   int
+	}
+	keys := make([]kv, 0, len(values))
+	for k, set := range values {
+		keys = append(keys, kv{k, len(set)})
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].n != keys[j].n {
+			return keys[i].n > keys[j].n
+		}
+		return keys[i].key < keys[j].key
+	})
+	if len(keys) > n {
+		keys = keys[:n]
+	}
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, fmt.Sprintf("%s(%d)", k.key, k.n))
+	}
+	return out
 }

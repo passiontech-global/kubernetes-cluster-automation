@@ -1,7 +1,7 @@
 // linkerd_endpoint_sync.go — the linkerd-endpoint-sync check
-// (W9-NM2/W10-FIX7): audits headless Services in linkerd-injected
-// namespaces for EndpointSlice desync, deletes provably-stale
-// controller-owned slices, and bounces the oldest
+// (W9-NM2/W10-FIX7): audits every selector-bearing Service in
+// linkerd-injected namespaces for EndpointSlice desync, deletes
+// provably-stale controller-owned slices, and bounces the oldest
 // linkerd-destination pod past the persistence window.
 package nethealth
 
@@ -31,14 +31,14 @@ import (
 )
 
 // linkerdEndpointSyncCheck is the W9-NM2 linkerd endpoint-sync
-// watchdog — a headless Service whose EndpointSlice diverges from
+// watchdog — a meshed Service whose EndpointSlice diverges from
 // its Ready pod IPs, healed by bouncing linkerd-destination.
 type linkerdEndpointSyncCheck struct {
 	*probefw.Deps
 
 	// W9-NM2 watchdog state (serial sweep — unguarded):
-	//   - linkerdDesyncSince: "ns/svc" → first sweep the headless
-	//     Service's EndpointSlice diverged from its Ready pod IPs;
+	//   - linkerdDesyncSince: "ns/svc" → first sweep the Service's
+	//     EndpointSlice diverged from its Ready pod IPs;
 	//     pruned when the divergence resolves so a later desync
 	//     re-arms the window.
 	//   - linkerdDesyncEmitted: gauge tuples held at 1 — a tuple not
@@ -83,14 +83,14 @@ const (
 )
 
 var (
-	// W9-NM2 — the endpoint-desync signal: 1 while the headless
-	// Service's EndpointSlice misses a Ready pod IP or holds a
-	// deleted pod's address. Past the persistence window the check
-	// also rolling-bounces the oldest linkerd-destination pod (1h
+	// W9-NM2 — the endpoint-desync signal: 1 while the Service's
+	// EndpointSlice misses a Ready pod IP or holds a deleted pod's
+	// address. Past the persistence window the check also
+	// rolling-bounces the oldest linkerd-destination pod (1h
 	// per-service cooldown) to force a resync.
 	linkerdEndpointDesyncGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_linkerd_endpoint_desync",
-		Help: "1 while the headless Service's EndpointSlice misses a Ready pod IP or holds a deleted pod's address.",
+		Help: "1 while the Service's EndpointSlice misses a Ready pod IP or holds a deleted pod's address.",
 	}, []string{"namespace", "service"})
 )
 
@@ -103,7 +103,7 @@ func init() {
 // W9-NM2 — linkerd-endpoint-sync
 // ---------------------------------------------------------------------------
 
-// linkerdEndpointSetsDiverge reports whether a headless Service's
+// linkerdEndpointSetsDiverge reports whether a Service's
 // EndpointSlice view diverged from its pods: a Ready pod IP missing
 // from the Ready endpoint addresses (linkerd-destination never learns
 // the endpoint exists), or a Ready endpoint address no live selected
@@ -125,7 +125,7 @@ func linkerdEndpointSetsDiverge(readyIPs, liveIPs, esReady map[string]bool) bool
 }
 
 // linkerdSliceRef is one endpointslice-controller-owned EndpointSlice
-// of an audited headless Service — a delete candidate when it
+// of an audited Service — a delete candidate when it
 // provably holds stale endpoint data (W10-FIX7). addrs is the set of
 // Ready endpoint addresses (nil Ready counts as ready, same
 // convention as the aggregate census).
@@ -152,7 +152,7 @@ func podReadySince(pod *corev1.Pod) (since time.Time, ok bool) {
 }
 
 // staleLinkerdSlices picks the controller-owned EndpointSlices of a
-// desynced headless Service that provably hold stale endpoint data
+// desynced Service that provably hold stale endpoint data
 // (W10-FIX7):
 //
 //   - a slice retaining a Ready address no live selected pod owns
@@ -193,13 +193,29 @@ func staleLinkerdSlices(slices []linkerdSliceRef,
 	return stale
 }
 
-// checkLinkerdEndpointSync audits headless Services (spec.clusterIP
-// "None" with a non-empty selector) in namespaces opted into linkerd
-// injection: linkerd-destination builds its endpoint table from
-// EndpointSlices, so a slice that misses a Ready pod IP — or keeps a
-// deleted pod's address — silently blackholes or misroutes traffic
-// for exactly the workloads headless services exist for (per-pod DNS,
-// StatefulSet members). A divergence must persist
+// linkerdAuditedService reports whether a Service is in the
+// endpoint-sync census: in a linkerd-injected namespace, carrying a
+// pod selector (selectorless Services are manually managed — their
+// endpoints are user-owned), not ExternalName (a DNS alias has no
+// EndpointSlices of its own), and not publishNotReadyAddresses —
+// that flag intentionally pins not-ready addresses into the slices,
+// so ghost/missing-IP detection cannot tell intent from desync.
+// Headless AND ordinary ClusterIP/NodePort/LoadBalancer Services all
+// qualify: linkerd-destination builds its endpoint table from
+// EndpointSlices for each of them.
+func linkerdAuditedService(injected map[string]bool, svc *corev1.Service) bool {
+	return injected[svc.Namespace] &&
+		len(svc.Spec.Selector) > 0 &&
+		svc.Spec.Type != corev1.ServiceTypeExternalName &&
+		!svc.Spec.PublishNotReadyAddresses
+}
+
+// checkLinkerdEndpointSync audits every selector-bearing Service in
+// namespaces opted into linkerd injection: linkerd-destination builds
+// its endpoint table from EndpointSlices, so a slice that misses a
+// Ready pod IP — or keeps a deleted pod's address — silently
+// blackholes or misroutes traffic for the selected workload. A
+// divergence must persist
 // linkerdEndpointDesyncMinAge before the gauge fires; past the window
 // the oldest linkerd-destination pod is bounced (1h per-service
 // cooldown, maintenance-gated, UID-preconditioned) to force a full
@@ -248,15 +264,14 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		if err != nil {
 			return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 		}
-		// Audited services — headless + selector + injected ns, the
-		// same filter the per-service loop applies. Only their
-		// controller-owned slices are delete candidates (W10-FIX7).
+		// Audited services — selector + injected ns (+ the
+		// ExternalName/publishNotReady exclusions), the same filter
+		// the per-service loop applies. Only their controller-owned
+		// slices are delete candidates (W10-FIX7).
 		audited := map[string]bool{}
 		for i := range svcList.Items {
 			svc := &svcList.Items[i]
-			if injected[svc.Namespace] &&
-				svc.Spec.ClusterIP == corev1.ClusterIPNone &&
-				len(svc.Spec.Selector) > 0 {
+			if linkerdAuditedService(injected, svc) {
 				audited[svc.Namespace+"/"+svc.Name] = true
 			}
 		}
@@ -320,9 +335,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		}
 		for i := range svcList.Items {
 			svc := &svcList.Items[i]
-			if !injected[svc.Namespace] ||
-				svc.Spec.ClusterIP != corev1.ClusterIPNone ||
-				len(svc.Spec.Selector) == 0 {
+			if !linkerdAuditedService(injected, svc) {
 				continue
 			}
 			sel := labels.SelectorFromSet(svc.Spec.Selector)
@@ -388,11 +401,11 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	}
 	sort.Strings(keys)
 	return probefw.Result{Why: fmt.Sprintf(
-		"headless services with EndpointSlice desync >=%s: %s",
+		"meshed services with EndpointSlice desync >=%s: %s",
 		linkerdEndpointDesyncMinAge, strings.Join(keys, ", "))}
 }
 
-// healLinkerdDestination repairs a desynced headless Service on two
+// healLinkerdDestination repairs a desynced Service on two
 // fronts (W10-FIX7):
 //
 //  1. DELETE the provably-stale endpointslice-controller-owned
@@ -449,6 +462,12 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		metrics.IncError(p.Name)
 		log.Info("WARN: list linkerd pods failed — heal deferred",
 			"error", err)
+		if healed {
+			// Slice deletes already landed — stamp them now or an
+			// unstamped sweep re-deletes the slices the
+			// endpointslice-controller just rebuilt.
+			p.linkerdDesyncHealed.Stamp(svcKey, now)
+		}
 		return
 	}
 	// The pod pick stays bespoke — the component matcher is not a

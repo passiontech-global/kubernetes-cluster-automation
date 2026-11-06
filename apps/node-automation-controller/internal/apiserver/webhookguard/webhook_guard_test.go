@@ -22,7 +22,6 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -126,7 +125,7 @@ func TestWebhookGuardRemovesValidatingOrphan(t *testing.T) {
 		wgNamespace("kube-system"), wgNamespace("alive"),
 		wgService("alive", "svc"),
 		vwc)
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +148,7 @@ func TestWebhookGuardMixedOrphansPreserveOrder(t *testing.T) {
 		wgNamespace("kube-system"), wgNamespace("alive"), wgNamespace("alive2"),
 		wgService("alive", "svc"), wgService("alive2", "svc2"),
 		mwc)
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +166,7 @@ func TestWebhookGuardEmptiesFullyOrphanConfig(t *testing.T) {
 		},
 	}
 	cs := fake.NewSimpleClientset(wgNamespace("kube-system"), vwc)
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +200,7 @@ func TestWebhookGuardKeepsNonServiceEntries(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(wgNamespace("kube-system"), mwc)
 	patches := wgPatchCounter(cs)
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +225,7 @@ func TestWebhookGuardMissingServiceWarnOnly(t *testing.T) {
 		wgNamespace("kube-system"), wgNamespace("alive"), // no Service objects at all
 		mwc)
 	patches := wgPatchCounter(cs)
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +254,7 @@ func TestWebhookGuardNoOrphansNoPatch(t *testing.T) {
 		wgService("alive", "svc"),
 		mwc, vwc)
 	patches := wgPatchCounter(cs)
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +285,7 @@ func TestWebhookGuardOrphansAcrossBothKinds(t *testing.T) {
 		wgNamespace("kube-system"), wgNamespace("alive"),
 		wgService("alive", "svc"),
 		mwc, vwc)
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +302,7 @@ func TestWebhookGuardNamespaceListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	if err := g.run(ctx); err == nil {
 		t.Fatal("expected error when the namespace list fails")
 	}
@@ -325,7 +324,7 @@ func TestWebhookGuardServiceListErrorStillRemovesOrphans(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("services unreachable")
 		})
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	if err := g.run(ctx); err != nil {
 		t.Fatalf("service list failure must degrade, not abort: %v", err)
 	}
@@ -347,7 +346,7 @@ func TestWebhookGuardWebhookConfigListErrors(t *testing.T) {
 				func(ktesting.Action) (bool, runtime.Object, error) {
 					return true, nil, errors.New("api down")
 				})
-			g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+			g := &webhookGuard{cs: cs, dyn: wgDyn()}
 			if err := g.run(ctx); err == nil {
 				t.Fatalf("expected error when %s list fails", tc.resource)
 			}
@@ -383,7 +382,7 @@ func TestWebhookGuardOrphanPatchIsStrategicDelete(t *testing.T) {
 			}
 			return false, nil, nil // passthrough
 		})
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +415,7 @@ func TestWebhookGuardListsClusterStateOncePerRun(t *testing.T) {
 			counts[a.GetResource().Resource]++
 			return false, nil, nil // passthrough to the tracker
 		})
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +449,7 @@ func TestWebhookGuardPatchFailureReturnsError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	err := g.run(ctx)
 	if err == nil {
 		t.Fatal("expected error when the webhook patch fails")
@@ -470,7 +469,7 @@ func TestWebhookGuardPatchFailureReturnsError(t *testing.T) {
 // W9-CP1 brownout probe never fires in tests that predate it — those
 // fixtures have no TLS server to dial anyway.
 func wgBreakerGuard(cs *fake.Clientset, now *time.Time) *webhookGuard {
-	return &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient(),
+	return &webhookGuard{cs: cs, dyn: wgDyn(),
 		now:            func() time.Time { return *now },
 		circuitBreaker: circuitBreaker{},
 		endpointProber: func(context.Context, string, int32) bool {
@@ -817,7 +816,7 @@ func TestWebhookCircuitBreakerDisabledByEnv(t *testing.T) {
 		wgEndpointSlice("backend", "dead-svc", 0, 1),
 		mwc)
 	patches := wgPatchCounter(cs)
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	for i := 0; i < 3; i++ {
 		if err := g.run(ctx); err != nil {
 			t.Fatal(err)
@@ -995,7 +994,7 @@ func TestWebhookCircuitBreakerDropsStaleAnnotationNames(t *testing.T) {
 		wgService("backend", "dead-svc"),
 		wgEndpointSlice("backend", "dead-svc", 0, 1),
 		mwc)
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{cs: cs, dyn: wgDyn()}
 	t.Cleanup(func() {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(
 			webhookKindMutating, "cb-stale", "still-dead.example.com")
@@ -1222,14 +1221,14 @@ func TestNodeUnhealthyForEndpoints(t *testing.T) {
 // empty backend keeps the full dead threshold. Field overrides win
 // over the package defaults.
 func TestTripThresholdSelection(t *testing.T) {
-	g := &webhookGuard{dyn: testutil.NewDynamicClient()}
+	g := &webhookGuard{dyn: wgDyn()}
 	if got := g.tripThreshold(0); got != webhookDeadThreshold {
 		t.Fatalf("raw=0 threshold = %s, want %s", got, webhookDeadThreshold)
 	}
 	if got := g.tripThreshold(3); got != webhookPartitionedThreshold {
 		t.Fatalf("raw>0 threshold = %s, want %s", got, webhookPartitionedThreshold)
 	}
-	g = &webhookGuard{dyn: testutil.NewDynamicClient(),
+	g = &webhookGuard{dyn: wgDyn(),
 		circuitBreaker: circuitBreaker{
 			zeroThreshold:          7 * time.Minute,
 			partitionZeroThreshold: 42 * time.Second}}
@@ -1444,7 +1443,7 @@ func TestWebhookCircuitBreakerUnresponsiveTripsAndBounces(t *testing.T) {
 		mwc)
 	now := time.Unix(1_700_000_000, 0)
 	// endpointProber=false — every handshake fails: the pods are hung.
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient(),
+	g := &webhookGuard{cs: cs, dyn: wgDyn(),
 		now:            func() time.Time { return now },
 		circuitBreaker: circuitBreaker{},
 		endpointProber: func(context.Context, string, int32) bool {
@@ -1520,7 +1519,7 @@ func TestWebhookCircuitBreakerResponsiveSkipsBounce(t *testing.T) {
 		wgPod("backend", "ok-pod", 48*time.Hour),
 		mwc)
 	now := time.Unix(1_700_000_000, 0)
-	g := &webhookGuard{cs: cs, dyn: testutil.NewDynamicClient(),
+	g := &webhookGuard{cs: cs, dyn: wgDyn(),
 		now:            func() time.Time { return now },
 		circuitBreaker: circuitBreaker{},
 		endpointProber: func(context.Context, string, int32) bool {

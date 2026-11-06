@@ -1,5 +1,5 @@
 // cluster_health_probes.go — the sweep module root: Setup, the
-// prober and the checkDefs registry. The 36 checks it drives live in
+// prober and the checkDefs registry. The 38 checks it drives live in
 // per-domain subpackages under internal/health on top of the shared
 // probefw framework:
 //
@@ -161,6 +161,8 @@ var checkDefs = []struct {
 	{datastore.CheckNamePostgresWALArchiveGuard, datastore.NewPostgresWALArchiveGuardCheck},
 	{datastore.CheckNameScyllaCompactionSchemaGuard, datastore.NewScyllaCompactionSchemaGuardCheck},
 	{nodehealth.CheckNameKedaScaledObjectGuard, nodehealth.NewKedaScaledObjectGuardCheck},
+	{nethealth.CheckNameGatewayRouteHealth, nethealth.NewGatewayRouteHealthCheck},
+	{nodehealth.CheckNameControllerLeaseGuard, nodehealth.NewControllerLeaseGuardCheck},
 }
 
 // clusterHealthProber is the thin sweep runner: the shared deps, the

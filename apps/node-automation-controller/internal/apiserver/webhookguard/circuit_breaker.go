@@ -20,12 +20,16 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -57,6 +61,50 @@ const (
 	webhookProbeMaxPodRefs  = 32 // backing-pod candidates kept per service
 	webhookProbeDefaultPort = 443
 )
+
+// ---------------------------------------------------------------------------
+// CRD conversion-webhook backend health — the same dead-backend
+// failure modes the breaker covers for admission webhooks, but with
+// no failurePolicy knob at all: a dead conversion backend errors
+// every CR read for the whole API group.
+// ---------------------------------------------------------------------------
+
+// crdReason* are the reason label values of
+// crdConversionWebhookUnhealthy — the three measurable dead-backend
+// signatures.
+const (
+	// crdReasonMissingService: the conversion clientConfig points at
+	// a Service that does not exist.
+	crdReasonMissingService = "missing_service"
+	// crdReasonZeroEndpoints: the Service exists but the endpoint
+	// census reports 0 effective-Ready endpoints (endpoints on
+	// partitioned nodes count as dead, same as the breaker's math).
+	crdReasonZeroEndpoints = "zero_endpoints"
+	// crdReasonTLSProbeFailed: Ready endpoints exist but EVERY probed
+	// IP failed the TCP+TLS handshake — wedged pods, which the sweep
+	// bounces.
+	crdReasonTLSProbeFailed = "tls_probe_failed"
+)
+
+// crdConversionWebhookUnhealthy marks (1) each CustomResourceDefinition
+// whose spec.conversion webhook backend is measurably broken — a
+// single-check series, so it lives here (colocated var + init)
+// instead of internal/metrics. reason carries the verdict
+// (missing_service|zero_endpoints|tls_probe_failed); the series
+// disappears once the backend is healthy again.
+var crdConversionWebhookUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_crd_conversion_webhook_unhealthy",
+	Help: "1 while the CRD's spec.conversion webhook backend is unhealthy (missing_service|zero_endpoints|tls_probe_failed).",
+}, []string{"crd", "service", "reason"})
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(crdConversionWebhookUnhealthy)
+}
+
+// crdConversionKey is the exact label tuple of the
+// crdConversionWebhookUnhealthy gauge — the GaugeLedger key, same
+// contract as webhookMetricKey in cert-drift-auditor.
+type crdConversionKey struct{ crd, service, reason string }
 
 // ---------------------------------------------------------------------------
 // C1 — admission webhook self-deadlock circuit breaker.
@@ -97,7 +145,15 @@ type circuitBreaker struct {
 	partitionZeroThreshold time.Duration
 	// bounceAt: webhook backend service key ("ns/name") → last pod
 	// bounce — the in-memory half of the 15m per-service cooldown.
+	// Admission and conversion backends share the ledger on purpose:
+	// one hung Service is one bounce per cooldown regardless of
+	// which duty noticed it.
 	bounceAt state.CooldownSet
+	// crdUnhealthyEmitted is the same GaugeLedger hygiene for
+	// crdConversionWebhookUnhealthy — tuples re-asserted each sweep,
+	// stale ones (CRD gone, backend healthy, reason changed) pruned
+	// via DeleteLabelValues.
+	crdUnhealthyEmitted state.GaugeLedger[crdConversionKey]
 }
 
 // sweepCircuitBreaker trips fail-closed sub-webhooks whose backend
@@ -420,4 +476,135 @@ func svcRefString(ref *admissionv1.ServiceReference) string {
 		return "<none>"
 	}
 	return ref.Namespace + "/" + ref.Name
+}
+
+// sweepCRDConversionBackends health-checks every CRD whose
+// spec.conversion.strategy is Webhook and whose clientConfig targets
+// an in-cluster Service — the fourth independent duty behind
+// webhookGuard.run. The failure modes are the breaker's three
+// dead-backend signatures, but a dead CONVERSION backend is worse
+// than a dead admission one: there is no failurePolicy to trip, so
+// every CR read for the whole API group errors while it lasts. The
+// sweep therefore only exports
+// node_automation_crd_conversion_webhook_unhealthy per CRD — never
+// touches the CRD object — and bounces the oldest wedged backend pod
+// so the controller recreates it serving (the same stage-1 heal as
+// the admission path: webhookBounceCooldown, the shared maintenance
+// mutex via heal.AllowedV, UID-preconditioned delete).
+//
+// Series hygiene: a complete sweep emits the current tuple per
+// unhealthy CRD and prunes whatever was not re-seen — a stale
+// reason tuple (missing_service → zero_endpoints when the Service
+// comes back empty) or a recovered backend must not pin the alert.
+// An unverifiable sweep carries the last verdict forward — a
+// transient CRD list failure or a blind census is "can't tell", not
+// "clean".
+func (b *circuitBreaker) sweepCRDConversionBackends(ctx context.Context,
+	snap *sweepSnapshot) error {
+	g := snap.g
+	log := logf.FromContext(ctx)
+	now := g.now.Now()
+
+	carryForward := func() {
+		for k, lv := range b.crdUnhealthyEmitted.Last() {
+			b.crdUnhealthyEmitted.Emit(k, lv...)
+		}
+		b.crdUnhealthyEmitted.Prune(crdConversionWebhookUnhealthy.DeleteLabelValues)
+	}
+
+	if snap.crdErr != nil {
+		// API flap — "can't read the surface" fails closed: carry
+		// the series forward and surface the error.
+		carryForward()
+		return fmt.Errorf("list customresourcedefinitions — conversion webhook health skipped: %w", snap.crdErr)
+	}
+	ready, err := snap.readyCounts()
+	if err != nil {
+		// The breaker reports the same census failure as ITS error —
+		// re-reporting it here would double-count. Defer quietly and
+		// keep the last verdict alive — UNLESS the breaker is
+		// levered off this cycle, in which case nobody else reports
+		// it and the failure would be invisible.
+		carryForward()
+		if !circuitBreakerEnabled() {
+			return fmt.Errorf("endpoint/node census — conversion webhook health skipped: %w", err)
+		}
+		return nil
+	}
+
+	var hung []string
+	bounceSeen := map[string]bool{}
+	for i := range snap.crds {
+		crd := &snap.crds[i]
+		svcKey, svcNS, svcName, ok := crdConversionServiceKey(crd)
+		if !ok {
+			continue // no webhook conversion or a URL backend — unmeasurable
+		}
+		reason := ""
+		_, err := g.cs.CoreV1().Services(svcNS).
+			Get(ctx, svcName, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			reason = crdReasonMissingService
+			log.Info("UNHEALTHY: CRD conversion webhook backend Service missing",
+				"crd", crd.GetName(), "service", svcKey)
+		case err != nil:
+			// Can't verify — carry this CRD's last verdict forward
+			// rather than flap; absorbed sub-failure, sweep
+			// continues.
+			metrics.IncError(g.queue)
+			log.Error(err, "conversion webhook backend Service get failed",
+				"crd", crd.GetName(), "service", svcKey)
+			for k, lv := range b.crdUnhealthyEmitted.Last() {
+				if k.crd == crd.GetName() {
+					b.crdUnhealthyEmitted.Emit(k, lv...)
+				}
+			}
+			continue
+		case ready.effective[svcKey] == 0:
+			reason = crdReasonZeroEndpoints
+			log.Info("UNHEALTHY: CRD conversion webhook backend has 0 effective-ready endpoints",
+				"crd", crd.GetName(), "service", svcKey)
+		case ready.probed[svcKey] && !ready.responsive[svcKey]:
+			reason = crdReasonTLSProbeFailed
+			log.Info("UNHEALTHY: CRD conversion webhook backend fails TCP+TLS probe on every endpoint — pods wedged",
+				"crd", crd.GetName(), "service", svcKey)
+			if !bounceSeen[svcKey] {
+				bounceSeen[svcKey] = true
+				hung = append(hung, svcKey)
+			}
+		}
+		if reason == "" {
+			continue
+		}
+		k := crdConversionKey{crd: crd.GetName(), service: svcKey, reason: reason}
+		b.crdUnhealthyEmitted.Set(crdConversionWebhookUnhealthy, 1,
+			k, k.crd, k.service, k.reason)
+	}
+	b.crdUnhealthyEmitted.Prune(crdConversionWebhookUnhealthy.DeleteLabelValues)
+
+	if !circuitBreakerEnabled() {
+		// The shared ops lever silences pod kills module-wide —
+		// the gauge above stays live (detect-only, like the
+		// unmeshed audit).
+		return nil
+	}
+	for _, svcKey := range hung {
+		// heal.AllowedV folds the 15m per-service cooldown AND the
+		// maintenance mutex into one fail-closed preamble; &g.verdict
+		// memoizes the mutex across services (and shares it with the
+		// admission bounce + unmeshed paths) instead of paying three
+		// API reads per service.
+		proceed, unverifiable := heal.AllowedV(ctx, log, &g.verdict,
+			g.cs, g.dyn, &b.bounceAt, svcKey, webhookBounceCooldown, now)
+		if unverifiable {
+			metrics.IncError(g.queue)
+			continue
+		}
+		if !proceed {
+			continue
+		}
+		b.bounceOldestPod(ctx, snap, svcKey, ready.backingPods[svcKey], now)
+	}
+	return nil
 }

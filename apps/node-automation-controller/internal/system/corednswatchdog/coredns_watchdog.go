@@ -13,9 +13,10 @@
 //  2. active freshness query: pick a Service <10m old with a ready
 //     EndpointSlice (its delta certainly crossed a healthy watch) and
 //     resolve <svc>.<ns>.svc.cluster.local directly against each pod's
-//     podIP. Two consecutive failed runs (streak) = stale. If NO pod
-//     answers at all the layer aborts without bumping streaks — the
-//     probe path itself is broken, not the fleet.
+//     podIP over both UDP :53 and TCP :53 — one wedged listener is
+//     the same stale signature. Two consecutive failed runs (streak)
+//     = stale. If NO pod answers at all the layer aborts without
+//     bumping streaks — the probe path itself is broken, not the fleet.
 //  3. metrics :9153: coredns_panics_total > 0 = plugin panic.
 //
 // Recovery deletes only the stale pods by name; falls back to a full
@@ -76,14 +77,18 @@ type coreDNSWatchdog struct {
 	now shared.Clock
 	// Probe seams: the real implementations are the logHit/dnsProbe/
 	// panics methods below — fields so tests can stub log-stream,
-	// UDP:53 and :9153 access that the fake clientset cannot reach.
+	// UDP+TCP:53 and :9153 access that the fake clientset cannot reach.
 	logHitFn func(ctx context.Context, pod string) string
 	// dnsFn resolves fqdn through one coredns pod and returns the
 	// A-record IPs it answered — the W8-NM5 fallback verifies them
 	// against the live EndpointSlice/ClusterIP instead of accepting
 	// any answer as "fresh". nil → dnsProbe.
-	dnsFn    func(ctx context.Context, podIP, fqdn string) ([]string, error)
-	panicsFn func(ctx context.Context, podIP string) (float64, bool)
+	dnsFn func(ctx context.Context, podIP, fqdn string) ([]string, error)
+	// dnsExchangeFn is the per-transport seam dnsProbe loops over
+	// (udp, tcp) — a listener wedged on one protocol is the same
+	// stale signature. nil → dnsExchange (real net.Resolver dial).
+	dnsExchangeFn func(ctx context.Context, network, podIP, fqdn string) ([]string, error)
+	panicsFn      func(ctx context.Context, podIP string) (float64, bool)
 }
 
 func Setup(d shared.Deps) error {

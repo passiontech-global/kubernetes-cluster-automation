@@ -5,19 +5,26 @@
 // cainjector inject annotation additionally get their entries'
 // caBundle diffed against the resolved injection-source Secret
 // (inject-ca-from Certificate → spec.secretName, or
-// inject-ca-from-secret directly). Detect-only — the config objects
-// are Flux/cainjector-owned.
+// inject-ca-from-secret directly). The same three checks then run on
+// every CustomResourceDefinition whose spec.conversion.strategy is
+// Webhook: cainjector injects into conversion clientConfigs through
+// the identical annotations, and a drifted or empty bundle there
+// fails EVERY CR read for the whole API group — conversion calls
+// have no failurePolicy=Ignore escape hatch. Detect-only — the
+// config objects are Flux/cainjector-owned.
 package certdriftauditor
 
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"strings"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -49,6 +56,33 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 		v := &validating.Items[i]
 		a.auditOneWebhookConfig(ctx, "ValidatingWebhookConfiguration",
 			v.Name, v.Annotations, validatingEntries(v.Webhooks))
+	}
+
+	// CRD conversion webhooks share the caBundle surface — the
+	// cainjector annotations and the empty/drifted-bundle failure
+	// modes are identical, but the object reaches through dyn (the
+	// typed clientset has no apiextensions surface) and the bundle
+	// arrives base64-encoded like every []byte JSON field. The list
+	// runs AFTER the admission-config audits so their emissions land
+	// first, and its failure skips the prune below: "can't read the
+	// surface" must not delete live drift series.
+	if a.dyn == nil {
+		return fmt.Errorf("list customresourcedefinitions: no dynamic client")
+	}
+	crds, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.DynamicPage(a.dyn.Resource(customResourceDefinitionGVR)))
+	if err != nil {
+		return fmt.Errorf("list customresourcedefinitions: %w", err)
+	}
+	for i := range crds {
+		crd := &crds[i]
+		entry, ok := crdConversionEntry(crd)
+		if !ok {
+			continue
+		}
+		a.auditOneWebhookConfig(ctx, "CustomResourceDefinition",
+			crd.GetName(), crd.GetAnnotations(), []webhookEntry{entry})
 	}
 
 	// Prune series for entries no longer covered — a webhook entry
@@ -254,4 +288,42 @@ func validatingEntries(ws []admissionv1.ValidatingWebhook) []webhookEntry {
 			service: w.ClientConfig.Service, fail: webhookFails(w.FailurePolicy)})
 	}
 	return out
+}
+
+// crdConversionEntry projects one CRD's spec.conversion webhook into
+// the audit's uniform entry shape — ok=false for non-Webhook
+// strategies, which have no caBundle surface at all. The "webhook"
+// label reads "conversion": a CRD carries exactly one conversion
+// clientConfig and it has no name of its own. fail is hard-wired —
+// unlike admission webhooks, conversion calls have NO failurePolicy
+// knob: an unverifiable backend errors the whole CR read for every
+// client, so a service-targeted entry with an empty bundle IS the
+// outage signature. The bundle decodes from base64 — []byte fields
+// serialize that way through the apiserver's JSON.
+func crdConversionEntry(crd *unstructured.Unstructured) (webhookEntry, bool) {
+	strategy, _ := kube.NestedString(crd.Object, "spec", "conversion", "strategy")
+	if strategy != "Webhook" {
+		return webhookEntry{}, false
+	}
+	e := webhookEntry{name: "conversion", fail: true}
+	if b64, ok := kube.NestedString(crd.Object,
+		"spec", "conversion", "webhook", "clientConfig", "caBundle"); ok && b64 != "" {
+		raw, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			// An undecodable bundle is as broken as an empty one —
+			// leave caBundle nil so the fail-closed check flags it.
+			logf.Log.Info("skip: CRD conversion caBundle is not valid base64",
+				"crd", crd.GetName())
+		} else {
+			e.caBundle = raw
+		}
+	}
+	ns, _ := kube.NestedString(crd.Object,
+		"spec", "conversion", "webhook", "clientConfig", "service", "namespace")
+	name, _ := kube.NestedString(crd.Object,
+		"spec", "conversion", "webhook", "clientConfig", "service", "name")
+	if ns != "" && name != "" {
+		e.service = &admissionv1.ServiceReference{Namespace: ns, Name: name}
+	}
+	return e, true
 }

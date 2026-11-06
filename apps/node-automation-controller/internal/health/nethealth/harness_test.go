@@ -31,6 +31,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober 
 		NewLinkerdH2StreamGuardCheck,
 		NewCloudflaredTunnelHealthCheck,
 		NewLiqoTunnelHealthCheck,
+		NewGatewayRouteHealthCheck,
 	)
 	// The production sweep resolves the CILIUM_* knobs into
 	// Cfg.Cilium once at Setup (probefw.CiliumConfigFromEnv —

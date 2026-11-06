@@ -56,10 +56,14 @@ const (
 // nodeHangConds are the NPD/node-agent latches that precede a node
 // reboot — patching unschedulable early keeps new pods off the dying
 // node. All are custom NodeConditionTypes written by the node stack
-// (FilesystemReadOnly/KernelHungTasks by hostmetrics+workerhygiene,
+// (FilesystemReadOnly/KernelHungTasks/KernelSlabLeak/
+// KernelResourceExhaustion/CgroupDyingLeak by hostmetrics+workerhygiene,
 // KubeletRuntimeStall/KubeletWatchWedge/PodTeardownWedged by
-// nodereporter; InodePressure is kubelet-native — nodefs/imagefs
-// inode exhaustion, no agent latch involved). There is
+// nodereporter, MemoryPSIThrashing by the PSI monitor;
+// InodePressure is kubelet-native — nodefs/imagefs inode
+// exhaustion, no agent latch involved; the Cilium*/CalicoFelixDown
+// latches are the CNI death signals a pre-reboot node carries;
+// NebulaIsolated is the overlay partition latch). There is
 // no corev1 constant for any of them — string literals are the
 // convention here (same as nodeClockSkewCond below).
 // ClockUnsynchronized is deliberately NOT here: it carries its own
@@ -67,6 +71,9 @@ const (
 var nodeHangConds = []corev1.NodeConditionType{
 	"KernelHungTasks", "FilesystemReadOnly", "KubeletRuntimeStall",
 	"KubeletWatchWedge", "PodTeardownWedged", "InodePressure",
+	"MemoryPSIThrashing", "KernelSlabLeak", "KernelResourceExhaustion",
+	"CgroupDyingLeak", "CiliumAgentDown", "CiliumInitStuck",
+	"CiliumEnvoyDown", "CalicoFelixDown", "NebulaIsolated",
 }
 
 var (
