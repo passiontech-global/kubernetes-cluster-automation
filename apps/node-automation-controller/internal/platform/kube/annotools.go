@@ -1,13 +1,16 @@
-// anno.go — annotation timestamp helpers. The passiontech.dev/last-*
-// stamps (last-es-nudge, last-helm-unlock, last-source-nudge,
-// last-immutable-job-heal, last-helm-stall-unwedge, ...) are the
-// DURABLE half of their modules' cooldowns — they survive operator
-// restarts where the in-RAM CooldownSet cannot. ~6 sites hand-roll
-// the same read: try RFC3339 (what every current writer stamps),
-// fall back to unix seconds (the legacy force-sync stamp format
-// still live on older objects), treat absent/empty/unparseable as
-// "no stamp" — a garbage value cannot prove a recent action, and
-// stamping over it is exactly how a wedged object gets unstuck.
+// annotools.go — annotation read/write helpers: the timestamp stamps
+// (ParseAnnoTime/AnnoTime) and the merge-patch builder
+// (MergePatchAnnos) every stamp site shares. They serve the
+// passiontech.dev/last-* stamps (last-es-nudge, last-helm-unlock,
+// last-source-nudge, last-immutable-job-heal, last-helm-stall-
+// unwedge, ...) — the DURABLE half of their modules' cooldowns;
+// they survive operator restarts where the in-RAM CooldownSet
+// cannot. ~6 sites hand-roll the same read: try RFC3339 (what
+// every current writer stamps), fall back to unix seconds (the
+// legacy force-sync stamp format still live on older objects),
+// treat absent/empty/unparseable as "no stamp" — a garbage value
+// cannot prove a recent action, and stamping over it is exactly
+// how a wedged object gets unstuck.
 package kube
 
 import (

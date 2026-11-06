@@ -1,3 +1,6 @@
+// envx.go — rebinds libs/hostkit/envx.Warnf into the
+// controller-runtime log stream so env-knob parse warnings keep
+// their zap JSON shape in the manager's records.
 package shared
 
 import (

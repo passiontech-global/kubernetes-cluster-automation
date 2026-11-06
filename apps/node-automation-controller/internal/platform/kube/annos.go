@@ -21,7 +21,7 @@ package kube
 // ---------------------------------------------------------------------------
 // passiontech.dev/* — internal-owned annotations (the operator's own
 // stamps). The last-* family are durable cooldown stamps read via
-// AnnoTime; see anno.go for the two accepted timestamp formats.
+// AnnoTime; see annotools.go for the two accepted timestamp formats.
 // ---------------------------------------------------------------------------
 const (
 	// AnnoLastHelmUnlock is helmrelease-unlocker's durable

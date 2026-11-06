@@ -1,3 +1,6 @@
+// olm_subscription_health.go — the W7-C5 olm-subscription-health
+// check: the OLM CSV / webhook-cert / subscription guard plus the
+// olm-operator auto-heal.
 package datastore
 
 import (

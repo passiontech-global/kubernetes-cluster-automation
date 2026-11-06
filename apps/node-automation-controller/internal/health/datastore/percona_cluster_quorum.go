@@ -1,3 +1,6 @@
+// percona_cluster_quorum.go — the W10-ST5 percona-cluster-quorum
+// watchdog (stuck-initializing Percona clusters) plus the W12-ST2
+// degraded-quorum / Patroni-lock gauge.
 package datastore
 
 import (
@@ -402,6 +405,8 @@ func (p *perconaQuorumCheck) patroniLeaderVacant(ctx context.Context,
 
 // corev1EndpointsVacant reports whether an Endpoints object routes
 // nothing — every subset empty or all addresses not-ready.
+//
+//nolint:staticcheck // SA1019: the object under test IS a corev1.Endpoints — Patroni's endpoints-DCS mode writes that kind directly; EndpointSlice cannot express it.
 func corev1EndpointsVacant(ep *corev1.Endpoints) bool {
 	for _, sub := range ep.Subsets {
 		if len(sub.Addresses) > 0 {

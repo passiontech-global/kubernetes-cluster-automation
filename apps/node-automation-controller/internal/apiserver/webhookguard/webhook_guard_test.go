@@ -1,3 +1,9 @@
+// webhook_guard_test.go — whole-sweep coverage for the C1
+// admission-webhook circuit breaker driven through the facade's
+// run(): dead-backend streaks, failurePolicy Fail↔Ignore trips and
+// restores, the circuit-broken annotation record, node-health
+// endpoint discounting, the W9-CP1 brownout probe and pod bounce,
+// and the missing-critical-namespace warning series.
 package webhookguard
 
 import (
@@ -21,6 +27,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/circuitbreaker"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
@@ -125,7 +133,7 @@ func TestWebhookGuardRemovesValidatingOrphan(t *testing.T) {
 		wgNamespace("kube-system"), wgNamespace("alive"),
 		wgService("alive", "svc"),
 		vwc)
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +156,7 @@ func TestWebhookGuardMixedOrphansPreserveOrder(t *testing.T) {
 		wgNamespace("kube-system"), wgNamespace("alive"), wgNamespace("alive2"),
 		wgService("alive", "svc"), wgService("alive2", "svc2"),
 		mwc)
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +174,7 @@ func TestWebhookGuardEmptiesFullyOrphanConfig(t *testing.T) {
 		},
 	}
 	cs := fake.NewSimpleClientset(wgNamespace("kube-system"), vwc)
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +208,7 @@ func TestWebhookGuardKeepsNonServiceEntries(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(wgNamespace("kube-system"), mwc)
 	patches := wgPatchCounter(cs)
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +233,7 @@ func TestWebhookGuardMissingServiceWarnOnly(t *testing.T) {
 		wgNamespace("kube-system"), wgNamespace("alive"), // no Service objects at all
 		mwc)
 	patches := wgPatchCounter(cs)
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +262,7 @@ func TestWebhookGuardNoOrphansNoPatch(t *testing.T) {
 		wgService("alive", "svc"),
 		mwc, vwc)
 	patches := wgPatchCounter(cs)
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +293,7 @@ func TestWebhookGuardOrphansAcrossBothKinds(t *testing.T) {
 		wgNamespace("kube-system"), wgNamespace("alive"),
 		wgService("alive", "svc"),
 		mwc, vwc)
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +310,7 @@ func TestWebhookGuardNamespaceListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	if err := g.run(ctx); err == nil {
 		t.Fatal("expected error when the namespace list fails")
 	}
@@ -324,7 +332,7 @@ func TestWebhookGuardServiceListErrorStillRemovesOrphans(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("services unreachable")
 		})
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	if err := g.run(ctx); err != nil {
 		t.Fatalf("service list failure must degrade, not abort: %v", err)
 	}
@@ -346,7 +354,7 @@ func TestWebhookGuardWebhookConfigListErrors(t *testing.T) {
 				func(ktesting.Action) (bool, runtime.Object, error) {
 					return true, nil, errors.New("api down")
 				})
-			g := &webhookGuard{cs: cs, dyn: wgDyn()}
+			g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 			if err := g.run(ctx); err == nil {
 				t.Fatalf("expected error when %s list fails", tc.resource)
 			}
@@ -382,7 +390,7 @@ func TestWebhookGuardOrphanPatchIsStrategicDelete(t *testing.T) {
 			}
 			return false, nil, nil // passthrough
 		})
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +423,7 @@ func TestWebhookGuardListsClusterStateOncePerRun(t *testing.T) {
 			counts[a.GetResource().Resource]++
 			return false, nil, nil // passthrough to the tracker
 		})
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +457,7 @@ func TestWebhookGuardPatchFailureReturnsError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	err := g.run(ctx)
 	if err == nil {
 		t.Fatal("expected error when the webhook patch fails")
@@ -464,17 +472,17 @@ func TestWebhookGuardPatchFailureReturnsError(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // wgBreakerGuard builds a guard with a scripted clock — advance *now
-// between runs to walk the deadSince streak past webhookDeadThreshold.
+// between runs to walk the deadSince streak past circuitbreaker.DeadThreshold.
 // The endpointProber stub answers "responsive" for every IP so the
 // W9-CP1 brownout probe never fires in tests that predate it — those
 // fixtures have no TLS server to dial anyway.
 func wgBreakerGuard(cs *fake.Clientset, now *time.Time) *webhookGuard {
-	return &webhookGuard{cs: cs, dyn: wgDyn(),
-		now:            func() time.Time { return *now },
-		circuitBreaker: circuitBreaker{},
-		endpointProber: func(context.Context, string, int32) bool {
+	return &webhookGuard{Guard: guardstate.Guard{
+		CS: cs, Dyn: wgDyn(),
+		Now: func() time.Time { return *now },
+		EndpointProber: func(context.Context, string, int32) bool {
 			return true
-		}}
+		}}}
 }
 
 func wgFP(v admissionv1.FailurePolicyType) *admissionv1.FailurePolicyType {
@@ -568,7 +576,7 @@ func wgMutatingAnno(t *testing.T, cs *fake.Clientset, cfg string) (string, bool)
 	if err != nil {
 		t.Fatalf("get mutatingwebhookconfiguration %s: %v", cfg, err)
 	}
-	v, ok := got.Annotations[webhookCircuitAnno]
+	v, ok := got.Annotations[guardstate.CircuitBrokenAnno]
 	return v, ok
 }
 
@@ -579,7 +587,7 @@ func wgValidatingAnno(t *testing.T, cs *fake.Clientset, cfg string) (string, boo
 	if err != nil {
 		t.Fatalf("get validatingwebhookconfiguration %s: %v", cfg, err)
 	}
-	v, ok := got.Annotations[webhookCircuitAnno]
+	v, ok := got.Annotations[guardstate.CircuitBrokenAnno]
 	return v, ok
 }
 
@@ -605,7 +613,7 @@ func wgTripCount(t *testing.T, kind, cfg string) float64 {
 
 // A fail-closed sub-webhook whose Service reports 0 Ready endpoints
 // does NOT trip on first sight nor inside the threshold — only a
-// continuous >= webhookDeadThreshold streak flips it to Ignore and
+// continuous >= circuitbreaker.DeadThreshold streak flips it to Ignore and
 // records the name in the annotation.
 func TestWebhookCircuitBreakerTripsAfterThreshold(t *testing.T) {
 	mwc := &admissionv1.MutatingWebhookConfiguration{
@@ -628,9 +636,9 @@ func TestWebhookCircuitBreakerTripsAfterThreshold(t *testing.T) {
 	patches := wgPatchCounter(cs)
 	t.Cleanup(func() {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(
-			webhookKindMutating, "cb-mwc", "dead.example.com")
+			guardstate.KindMutating, "cb-mwc", "dead.example.com")
 	})
-	tripsBefore := wgTripCount(t, webhookKindMutating, "cb-mwc")
+	tripsBefore := wgTripCount(t, guardstate.KindMutating, "cb-mwc")
 
 	// First sighting — recorded, not tripped.
 	if err := g.run(ctx); err != nil {
@@ -647,7 +655,7 @@ func TestWebhookCircuitBreakerTripsAfterThreshold(t *testing.T) {
 	}
 	if got := wgMutatingFP(t, cs, "cb-mwc", "dead.example.com"); got != admissionv1.Fail {
 		t.Fatalf("4m streak < %s must not trip, failurePolicy=%q",
-			webhookDeadThreshold, got)
+			circuitbreaker.DeadThreshold, got)
 	}
 	if got := atomic.LoadInt32(patches); got != 0 {
 		t.Fatalf("breaker must not patch before the threshold, got %d patch(es)", got)
@@ -665,10 +673,10 @@ func TestWebhookCircuitBreakerTripsAfterThreshold(t *testing.T) {
 	if !ok || anno != "dead.example.com" {
 		t.Fatalf("annotation = %q (present=%v), want %q", anno, ok, "dead.example.com")
 	}
-	if got := wgBrokenGauge(t, webhookKindMutating, "cb-mwc", "dead.example.com"); got != 1 {
+	if got := wgBrokenGauge(t, guardstate.KindMutating, "cb-mwc", "dead.example.com"); got != 1 {
 		t.Fatalf("WebhookCircuitBroken = %v, want 1", got)
 	}
-	if got := wgTripCount(t, webhookKindMutating, "cb-mwc"); got != tripsBefore+1 {
+	if got := wgTripCount(t, guardstate.KindMutating, "cb-mwc"); got != tripsBefore+1 {
 		t.Fatalf("trips = %v, want %v", got, tripsBefore+1)
 	}
 }
@@ -709,7 +717,7 @@ func TestWebhookCircuitBreakerPatchContents(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(webhookDeadThreshold + time.Minute)
+	now = now.Add(circuitbreaker.DeadThreshold + time.Minute)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -720,7 +728,7 @@ func TestWebhookCircuitBreakerPatchContents(t *testing.T) {
 		t.Fatalf("patch type = %s, want StrategicMergePatchType", patchType)
 	}
 	annos, _ := doc["metadata"].(map[string]any)["annotations"].(map[string]any)
-	if got := annos[webhookCircuitAnno]; got != "dead.example.com" {
+	if got := annos[guardstate.CircuitBrokenAnno]; got != "dead.example.com" {
 		t.Fatalf("patch annotation = %v, want %q", got, "dead.example.com")
 	}
 	whs, _ := doc["webhooks"].([]any)
@@ -761,14 +769,14 @@ func TestWebhookCircuitBreakerRecoversAndClears(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(webhookDeadThreshold + time.Minute)
+	now = now.Add(circuitbreaker.DeadThreshold + time.Minute)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if got := wgValidatingFP(t, cs, "cb-vwc", "dead.example.com"); got != admissionv1.Ignore {
 		t.Fatalf("precondition: expected tripped webhook, failurePolicy=%q", got)
 	}
-	tripsAfterTrip := wgTripCount(t, webhookKindValidating, "cb-vwc")
+	tripsAfterTrip := wgTripCount(t, guardstate.KindValidating, "cb-vwc")
 
 	// Backend comes back — one Ready endpoint.
 	if _, err := cs.DiscoveryV1().EndpointSlices("backend").Update(ctx,
@@ -788,10 +796,10 @@ func TestWebhookCircuitBreakerRecoversAndClears(t *testing.T) {
 	// The probe runs before any WithLabelValues read — the gauge call
 	// itself would recreate the series at 0 and mask the deletion.
 	if metrics.WebhookCircuitBroken.DeleteLabelValues(
-		webhookKindValidating, "cb-vwc", "dead.example.com") {
+		guardstate.KindValidating, "cb-vwc", "dead.example.com") {
 		t.Fatal("recovery must delete the WebhookCircuitBroken series, not park it at 0")
 	}
-	if got := wgTripCount(t, webhookKindValidating, "cb-vwc"); got != tripsAfterTrip {
+	if got := wgTripCount(t, guardstate.KindValidating, "cb-vwc"); got != tripsAfterTrip {
 		t.Fatalf("recovery must not count as a trip: %v != %v", got, tripsAfterTrip)
 	}
 }
@@ -816,7 +824,7 @@ func TestWebhookCircuitBreakerDisabledByEnv(t *testing.T) {
 		wgEndpointSlice("backend", "dead-svc", 0, 1),
 		mwc)
 	patches := wgPatchCounter(cs)
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	for i := 0; i < 3; i++ {
 		if err := g.run(ctx); err != nil {
 			t.Fatal(err)
@@ -863,7 +871,7 @@ func TestWebhookCircuitBreakerReadyBackendNeverTrips(t *testing.T) {
 			if err := g.run(ctx); err != nil {
 				t.Fatal(err)
 			}
-			now = now.Add(2 * webhookDeadThreshold)
+			now = now.Add(2 * circuitbreaker.DeadThreshold)
 			if err := g.run(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -901,7 +909,7 @@ func TestWebhookCircuitBreakerIgnorePolicyNeverTrips(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(2 * webhookDeadThreshold)
+	now = now.Add(2 * circuitbreaker.DeadThreshold)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -947,14 +955,14 @@ func TestWebhookCircuitBreakerPatchFailureDoesNotAbort(t *testing.T) {
 		})
 	t.Cleanup(func() {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(
-			webhookKindMutating, "cb-m-ok", "dead-m.example.com")
+			guardstate.KindMutating, "cb-m-ok", "dead-m.example.com")
 	})
 	now := time.Unix(1_700_000_000, 0)
 	g := wgBreakerGuard(cs, &now)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(webhookDeadThreshold + time.Minute)
+	now = now.Add(circuitbreaker.DeadThreshold + time.Minute)
 	err := g.run(ctx)
 	if err == nil {
 		t.Fatal("expected the aggregated circuit breaker patch failure")
@@ -978,7 +986,7 @@ func TestWebhookCircuitBreakerDropsStaleAnnotationNames(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "cb-stale",
 			Annotations: map[string]string{
-				webhookCircuitAnno: "gone.example.com,still-dead.example.com",
+				guardstate.CircuitBrokenAnno: "gone.example.com,still-dead.example.com",
 			},
 		},
 		Webhooks: []admissionv1.MutatingWebhook{{
@@ -994,10 +1002,10 @@ func TestWebhookCircuitBreakerDropsStaleAnnotationNames(t *testing.T) {
 		wgService("backend", "dead-svc"),
 		wgEndpointSlice("backend", "dead-svc", 0, 1),
 		mwc)
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	t.Cleanup(func() {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(
-			webhookKindMutating, "cb-stale", "still-dead.example.com")
+			guardstate.KindMutating, "cb-stale", "still-dead.example.com")
 	})
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
@@ -1034,17 +1042,17 @@ func TestWebhookCircuitBreakerPrunesSeriesForDeletedConfig(t *testing.T) {
 	g := wgBreakerGuard(cs, &now)
 	t.Cleanup(func() {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(
-			webhookKindMutating, "cb-deleted", "dead.example.com")
+			guardstate.KindMutating, "cb-deleted", "dead.example.com")
 	})
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(webhookDeadThreshold + time.Minute)
+	now = now.Add(circuitbreaker.DeadThreshold + time.Minute)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := wgBrokenGauge(t, webhookKindMutating, "cb-deleted", "dead.example.com"); got != 1 {
+	if got := wgBrokenGauge(t, guardstate.KindMutating, "cb-deleted", "dead.example.com"); got != 1 {
 		t.Fatalf("precondition: WebhookCircuitBroken = %v, want 1", got)
 	}
 
@@ -1059,7 +1067,7 @@ func TestWebhookCircuitBreakerPrunesSeriesForDeletedConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if metrics.WebhookCircuitBroken.DeleteLabelValues(
-		webhookKindMutating, "cb-deleted", "dead.example.com") {
+		guardstate.KindMutating, "cb-deleted", "dead.example.com") {
 		t.Fatal("WebhookCircuitBroken series for a deleted config must be pruned")
 	}
 }
@@ -1092,17 +1100,17 @@ func TestWebhookCircuitBreakerPrunesSeriesForRecreatedConfig(t *testing.T) {
 	g := wgBreakerGuard(cs, &now)
 	t.Cleanup(func() {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(
-			webhookKindMutating, "cb-recreated", "dead.example.com")
+			guardstate.KindMutating, "cb-recreated", "dead.example.com")
 	})
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(webhookDeadThreshold + time.Minute)
+	now = now.Add(circuitbreaker.DeadThreshold + time.Minute)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := wgBrokenGauge(t, webhookKindMutating, "cb-recreated", "dead.example.com"); got != 1 {
+	if got := wgBrokenGauge(t, guardstate.KindMutating, "cb-recreated", "dead.example.com"); got != 1 {
 		t.Fatalf("precondition: WebhookCircuitBroken = %v, want 1", got)
 	}
 
@@ -1137,7 +1145,7 @@ func TestWebhookCircuitBreakerPrunesSeriesForRecreatedConfig(t *testing.T) {
 	}
 
 	if metrics.WebhookCircuitBroken.DeleteLabelValues(
-		webhookKindMutating, "cb-recreated", "dead.example.com") {
+		guardstate.KindMutating, "cb-recreated", "dead.example.com") {
 		t.Fatal("WebhookCircuitBroken series for a recreated (un-annotated) config must be pruned")
 	}
 	if got := wgMutatingFP(t, cs, "cb-recreated", "dead.example.com"); got != admissionv1.Fail {
@@ -1177,69 +1185,6 @@ func wgSliceOnNode(ns, svc, nodeName string) *discoveryv1.EndpointSlice {
 	return es
 }
 
-// nodeUnhealthyForEndpoints flags every node whose pod network is
-// presumed dead for admission: NotReady, any partition/unresponsive/
-// lifecycle taint, or an explicit NetworkPartitioned condition.
-func TestNodeUnhealthyForEndpoints(t *testing.T) {
-	notReady := wgReadyNode("n-notready")
-	notReady.Status.Conditions[0].Status = corev1.ConditionFalse
-	partCond := wgReadyNode("n-partcond")
-	partCond.Status.Conditions = append(partCond.Status.Conditions,
-		corev1.NodeCondition{Type: "NetworkPartitioned", Status: corev1.ConditionTrue})
-
-	for _, tc := range []struct {
-		name string
-		node *corev1.Node
-		want bool
-	}{
-		{"not ready", notReady, true},
-		{"ready clean", wgReadyNode("n-ok"), false},
-		{"network-partitioned taint", wgReadyNode("n1",
-			corev1.Taint{Key: "passiontech.dev/network-partitioned", Effect: corev1.TaintEffectNoSchedule}), true},
-		{"kubelet-unresponsive taint", wgReadyNode("n2",
-			corev1.Taint{Key: "passiontech.dev/kubelet-unresponsive", Effect: corev1.TaintEffectNoSchedule}), true},
-		{"unreachable taint", wgReadyNode("n3",
-			corev1.Taint{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoSchedule}), true},
-		{"not-ready taint", wgReadyNode("n4",
-			corev1.Taint{Key: "node.kubernetes.io/not-ready", Effect: corev1.TaintEffectNoSchedule}), true},
-		{"out-of-service taint", wgReadyNode("n5",
-			corev1.Taint{Key: "node.kubernetes.io/out-of-service", Effect: corev1.TaintEffectNoSchedule}), true},
-		{"NetworkPartitioned condition", partCond, true},
-		{"unrelated taint", wgReadyNode("n6",
-			corev1.Taint{Key: "node.cilium.io/agent-not-ready", Effect: corev1.TaintEffectNoSchedule}), false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := nodeUnhealthyForEndpoints(tc.node); got != tc.want {
-				t.Fatalf("nodeUnhealthyForEndpoints = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-// tripThreshold picks the faster partition window only when raw
-// Ready endpoints remain (all of them stranded on bad nodes); a truly
-// empty backend keeps the full dead threshold. Field overrides win
-// over the package defaults.
-func TestTripThresholdSelection(t *testing.T) {
-	g := &webhookGuard{dyn: wgDyn()}
-	if got := g.tripThreshold(0); got != webhookDeadThreshold {
-		t.Fatalf("raw=0 threshold = %s, want %s", got, webhookDeadThreshold)
-	}
-	if got := g.tripThreshold(3); got != webhookPartitionedThreshold {
-		t.Fatalf("raw>0 threshold = %s, want %s", got, webhookPartitionedThreshold)
-	}
-	g = &webhookGuard{dyn: wgDyn(),
-		circuitBreaker: circuitBreaker{
-			zeroThreshold:          7 * time.Minute,
-			partitionZeroThreshold: 42 * time.Second}}
-	if got := g.tripThreshold(0); got != 7*time.Minute {
-		t.Fatalf("zeroThreshold override ignored: %s", got)
-	}
-	if got := g.tripThreshold(1); got != 42*time.Second {
-		t.Fatalf("partitionZeroThreshold override ignored: %s", got)
-	}
-}
-
 // The W5.5 signature: every Ready endpoint of the backend Service sits
 // on a partitioned node — raw > 0, effective == 0 — so the breaker
 // trips on the 90s partition threshold instead of waiting 5m.
@@ -1266,7 +1211,7 @@ func TestWebhookCircuitBreakerPartitionedBackendTripsFast(t *testing.T) {
 	patches := wgPatchCounter(cs)
 	t.Cleanup(func() {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(
-			webhookKindMutating, "cb-part", "dead.example.com")
+			guardstate.KindMutating, "cb-part", "dead.example.com")
 	})
 
 	// First sighting — tracked, not tripped.
@@ -1280,7 +1225,7 @@ func TestWebhookCircuitBreakerPartitionedBackendTripsFast(t *testing.T) {
 	}
 	if got := wgMutatingFP(t, cs, "cb-part", "dead.example.com"); got != admissionv1.Fail {
 		t.Fatalf("60s streak < %s partition threshold must not trip, failurePolicy=%q",
-			webhookPartitionedThreshold, got)
+			circuitbreaker.PartitionedThreshold, got)
 	}
 	// 100s in — past the partition window, still far under 5m.
 	now = now.Add(40 * time.Second)
@@ -1331,7 +1276,7 @@ func TestWebhookCircuitBreakerHealthyNodeBackendNeverTrips(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(2 * webhookDeadThreshold)
+	now = now.Add(2 * circuitbreaker.DeadThreshold)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1372,7 +1317,7 @@ func TestWebhookCircuitBreakerNodeListErrorSkips(t *testing.T) {
 	if err := g.run(ctx); err == nil {
 		t.Fatal("expected an error when the node census fails")
 	}
-	now = now.Add(2 * webhookDeadThreshold)
+	now = now.Add(2 * circuitbreaker.DeadThreshold)
 	_ = g.run(ctx)
 	if got := wgMutatingFP(t, cs, "cb-nodeerr", "dead.example.com"); got != admissionv1.Fail {
 		t.Fatalf("blind node census must not trip, failurePolicy=%q", got)
@@ -1443,15 +1388,15 @@ func TestWebhookCircuitBreakerUnresponsiveTripsAndBounces(t *testing.T) {
 		mwc)
 	now := time.Unix(1_700_000_000, 0)
 	// endpointProber=false — every handshake fails: the pods are hung.
-	g := &webhookGuard{cs: cs, dyn: wgDyn(),
-		now:            func() time.Time { return now },
-		circuitBreaker: circuitBreaker{},
-		endpointProber: func(context.Context, string, int32) bool {
+	g := &webhookGuard{Guard: guardstate.Guard{
+		CS: cs, Dyn: wgDyn(),
+		Now: func() time.Time { return now },
+		EndpointProber: func(context.Context, string, int32) bool {
 			return false
-		}}
+		}}}
 	t.Cleanup(func() {
 		metrics.WebhookCircuitBroken.DeleteLabelValues(
-			webhookKindMutating, "brownout", "hung.example.com")
+			guardstate.KindMutating, "brownout", "hung.example.com")
 	})
 
 	if err := g.run(ctx); err != nil {
@@ -1473,7 +1418,7 @@ func TestWebhookCircuitBreakerUnresponsiveTripsAndBounces(t *testing.T) {
 	}
 
 	// Past the threshold the breaker trips to Ignore.
-	now = now.Add(webhookPartitionedThreshold + time.Second)
+	now = now.Add(circuitbreaker.PartitionedThreshold + time.Second)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1488,7 +1433,7 @@ func TestWebhookCircuitBreakerUnresponsiveTripsAndBounces(t *testing.T) {
 
 	// The pod came back healthy — the next probe answers and the
 	// declared Fail policy is restored.
-	g.endpointProber = func(context.Context, string, int32) bool { return true }
+	g.EndpointProber = func(context.Context, string, int32) bool { return true }
 	now = now.Add(time.Minute)
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
@@ -1519,12 +1464,12 @@ func TestWebhookCircuitBreakerResponsiveSkipsBounce(t *testing.T) {
 		wgPod("backend", "ok-pod", 48*time.Hour),
 		mwc)
 	now := time.Unix(1_700_000_000, 0)
-	g := &webhookGuard{cs: cs, dyn: wgDyn(),
-		now:            func() time.Time { return now },
-		circuitBreaker: circuitBreaker{},
-		endpointProber: func(context.Context, string, int32) bool {
+	g := &webhookGuard{Guard: guardstate.Guard{
+		CS: cs, Dyn: wgDyn(),
+		Now: func() time.Time { return now },
+		EndpointProber: func(context.Context, string, int32) bool {
 			return true // at least one endpoint answers
-		}}
+		}}}
 	for i := 0; i < 3; i++ {
 		if err := g.run(ctx); err != nil {
 			t.Fatal(err)
@@ -1600,11 +1545,11 @@ func TestWebhookGuardCriticalNSExclusionAudit(t *testing.T) {
 		wgNamespace("kube-system"), wgNamespace("node-ops"),
 		wgNamespace("medik8s"), wgNamespace("alive"),
 		wgService("alive", "svc"), vwc)
-	g := &webhookGuard{cs: cs, dyn: wgDyn()}
+	g := &webhookGuard{Guard: guardstate.Guard{CS: cs, Dyn: wgDyn()}}
 	t.Cleanup(func() {
 		for _, wh := range vwc.Webhooks {
 			metrics.WebhookMissingCriticalNSExclusion.DeleteLabelValues(
-				webhookKindValidating, "w12-cpb-vwc", wh.Name)
+				guardstate.KindValidating, "w12-cpb-vwc", wh.Name)
 		}
 	})
 	if err := g.run(ctx); err != nil {
@@ -1612,13 +1557,13 @@ func TestWebhookGuardCriticalNSExclusionAudit(t *testing.T) {
 	}
 	for _, wh := range []string{"missing-nil.example.com", "missing-partial.example.com"} {
 		if got := ptestutil.ToFloat64(metrics.WebhookMissingCriticalNSExclusion.WithLabelValues(
-			webhookKindValidating, "w12-cpb-vwc", wh)); got != 1 {
+			guardstate.KindValidating, "w12-cpb-vwc", wh)); got != 1 {
 			t.Fatalf("expected missing_critical_ns_exclusion=1 for %s, got %v", wh, got)
 		}
 	}
 	for _, wh := range []string{"excluded-notin.example.com", "excluded-optin.example.com", "ignore-policy.example.com"} {
 		if got := ptestutil.ToFloat64(metrics.WebhookMissingCriticalNSExclusion.WithLabelValues(
-			webhookKindValidating, "w12-cpb-vwc", wh)); got != 0 {
+			guardstate.KindValidating, "w12-cpb-vwc", wh)); got != 0 {
 			t.Fatalf("expected missing_critical_ns_exclusion=0 for %s, got %v", wh, got)
 		}
 	}
@@ -1635,7 +1580,7 @@ func TestWebhookGuardCriticalNSExclusionAudit(t *testing.T) {
 	}
 	for _, wh := range []string{"missing-nil.example.com", "missing-partial.example.com"} {
 		if got := ptestutil.ToFloat64(metrics.WebhookMissingCriticalNSExclusion.WithLabelValues(
-			webhookKindValidating, "w12-cpb-vwc", wh)); got != 0 {
+			guardstate.KindValidating, "w12-cpb-vwc", wh)); got != 0 {
 			t.Fatalf("expected pruned series=0 for %s after fix, got %v", wh, got)
 		}
 	}

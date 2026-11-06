@@ -115,11 +115,10 @@ type statefulSetOnDeleteRoller struct {
 // resolved by setupModules into Deps.Disabled) skip registration
 // entirely — same contract as cert-drift-auditor.
 func Setup(d shared.Deps) error {
-	if d.Disabled {
-		return nil
-	}
-	r := &statefulSetOnDeleteRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
-	return shared.AddPeriodic(d.Mgr, r.queue, stsOnDeleteRollerInterval, r.run)
+	return shared.SetupNoConfig(d, func() error {
+		r := &statefulSetOnDeleteRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
+		return shared.AddPeriodic(d.Mgr, r.queue, stsOnDeleteRollerInterval, r.run)
+	})
 }
 
 func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {

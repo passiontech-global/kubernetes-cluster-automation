@@ -193,16 +193,15 @@ type veleroBackupAuditor struct {
 // cert-drift-auditor.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	if d.Disabled {
-		return nil
-	}
-	a := &veleroBackupAuditor{
-		cs:    cs,
-		dyn:   dyn,
-		now:   shared.SystemClock,
-		queue: d.Name,
-	}
-	return shared.AddPeriodic(mgr, a.queue, veleroAuditInterval, a.run)
+	return shared.SetupNoConfig(d, func() error {
+		a := &veleroBackupAuditor{
+			cs:    cs,
+			dyn:   dyn,
+			now:   shared.SystemClock,
+			queue: d.Name,
+		}
+		return shared.AddPeriodic(mgr, a.queue, veleroAuditInterval, a.run)
+	})
 }
 
 func (a *veleroBackupAuditor) run(ctx context.Context) error {

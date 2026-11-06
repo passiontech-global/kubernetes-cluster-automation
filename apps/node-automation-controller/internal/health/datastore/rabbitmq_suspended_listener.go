@@ -1,3 +1,6 @@
+// rabbitmq_suspended_listener.go — the W6.4
+// rabbitmq-suspended-listener healer: deletes a Running-but-never-
+// Ready rabbit pod once the quorum-safe check passes.
 package datastore
 
 import (

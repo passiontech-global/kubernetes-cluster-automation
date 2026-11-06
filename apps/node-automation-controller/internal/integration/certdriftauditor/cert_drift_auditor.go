@@ -191,18 +191,17 @@ type certDriftAuditor struct {
 // certmanager-reaper.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	if d.Disabled {
-		return nil
-	}
-	a := &certDriftAuditor{
-		cs:                  cs,
-		dyn:                 dyn,
-		queue:               d.Name,
-		now:                 shared.SystemClock,
-		replicationMismatch: map[replicationMetricKey]int{},
-		resyncNudged:        map[replicationMetricKey]time.Time{},
-	}
-	return shared.AddPeriodic(mgr, a.queue, 15*time.Minute, a.run)
+	return shared.SetupNoConfig(d, func() error {
+		a := &certDriftAuditor{
+			cs:                  cs,
+			dyn:                 dyn,
+			queue:               d.Name,
+			now:                 shared.SystemClock,
+			replicationMismatch: map[replicationMetricKey]int{},
+			resyncNudged:        map[replicationMetricKey]time.Time{},
+		}
+		return shared.AddPeriodic(mgr, a.queue, 15*time.Minute, a.run)
+	})
 }
 
 func (a *certDriftAuditor) run(ctx context.Context) error {

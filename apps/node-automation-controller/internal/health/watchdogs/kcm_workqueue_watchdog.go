@@ -1,3 +1,6 @@
+// kcm_workqueue_watchdog.go — the C6 kube-controller-manager
+// workqueue watchdog: a frozen KCM whose leader Lease still renews
+// while its object controllers stop reconciling.
 package watchdogs
 
 import (

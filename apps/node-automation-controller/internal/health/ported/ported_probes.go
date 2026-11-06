@@ -1,3 +1,7 @@
+// ported_probes.go — the five in-process ports of the kuberhealthy
+// passive HealthChecks (dns-status-internal, http-content-check,
+// pod-restarts, pod-status-check, resource-quota-check): stateless
+// probes over probefw.Deps plus their check-name consts.
 package ported
 
 import (

@@ -1,3 +1,7 @@
+// metrics.go — metric-registry assertions for tests:
+// ReconcileErrorCount reads a module's reconcile-error counter off
+// the controller-runtime registry — end-to-end proof an error path
+// calls IncError.
 package testutil
 
 import (

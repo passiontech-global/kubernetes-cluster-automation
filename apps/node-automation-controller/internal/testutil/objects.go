@@ -1,3 +1,7 @@
+// objects.go — the shared k8s fixtures and fake-clientset seams:
+// Node/Namespace builders, GetNode, GaugeSeriesValue,
+// CaptureDeployPatch/ForbidDeployPatch, and the pod spec.nodeName
+// field-selector emulator the fake clientset lacks.
 package testutil
 
 import (

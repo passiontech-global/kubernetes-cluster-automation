@@ -1,13 +1,14 @@
-// unmeshed_audit.go — the unmeshed-pod auditor, the third of the
-// three independent duties behind webhookGuard.run: it exports
-// node_automation_unmeshed_pods{namespace,pod} for every Running pod
-// that opted into linkerd injection but carries no linkerd-proxy
-// sidecar (the signature of a pod admitted while the C1 breaker held
-// the injector open), and — once the injector is provably healthy
-// again — evicts a bounded number of them so their owner controller
-// recreates them meshed. Its state (the emitted-series ledger) lives
-// on unmeshedPodAuditor; shared deps are reached through snap.g.
-package webhookguard
+// unmeshed_audit.go — the unmeshed-pod auditor, one of the four
+// independent duties behind the admission-webhook-guard run: it
+// exports node_automation_unmeshed_pods{namespace,pod} for every
+// Running pod that opted into linkerd injection but carries no
+// linkerd-proxy sidecar (the signature of a pod admitted while the
+// C1 breaker held the injector open), and — once the injector is
+// provably healthy again — evicts a bounded number of them so their
+// owner controller recreates them meshed. Its state (the
+// emitted-series ledgers) lives on Auditor; shared deps are reached
+// through snap.G.
+package unmeshed
 
 import (
 	"context"
@@ -25,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
@@ -63,28 +65,27 @@ const (
 // 2.2 — unmeshed-pod-auditor + post-circuit-breaker pod healer.
 // ---------------------------------------------------------------------------
 
-// unmeshedRemediationEnabled reads the kill-switch EVERY run — the
+// RemediationEnabled reads the kill-switch EVERY run — the
 // sanctioned exception to the resolve-at-Setup rule: remediation is an
 // ops lever that must stay flippable mid-incident, so an env flip
 // takes effect on the next sweep without an operator restart (the
-// same deliberate hot reload circuitBreakerEnabled carries).
-func unmeshedRemediationEnabled() bool {
+// same deliberate hot reload the circuit-breaker lever carries).
+func RemediationEnabled() bool {
 	return envx.Gate("UNMESHED_POD_REMEDIATION_ENABLED", true)
 }
 
-// unmeshedPodAuditor owns the unmeshed-pod sweep's per-sweep state —
-// embedded in webhookGuard so the facade's method set (and every
-// in-package test fixture built on it) is unchanged by the split.
-// Shared deps (cs/dyn/now) are reached through snap.g; only the
-// emitted-series ledger lives here.
 // criticalSelfHealingNamespaces are the three namespaces that run CNI,
 // DNS, and the node self-healing stack itself — a fail-closed admission
 // webhook that matches any of them can deadlock recovery when its own
 // backend dies (W12-CP-B, mirroring check-webhook-guard.sh at runtime).
 var criticalSelfHealingNamespaces = []string{"kube-system", "node-ops", "medik8s"}
 
-type unmeshedPodAuditor struct {
-	// unmeshedEmitted is the same ledger for UnmeshedPods
+// Auditor owns the unmeshed-pod sweep's per-sweep state — the facade
+// holds one across runs so the emitted-series ledgers persist. Shared
+// deps (CS/Dyn/Now) are reached through snap.G; only the
+// emitted-series ledgers live here.
+type Auditor struct {
+	// unmeshedEmitted is the ledger for UnmeshedPods
 	// ("namespace/pod") — deleted pods and pods that gained the
 	// sidecar get their series pruned each sweep.
 	unmeshedEmitted state.GaugeLedger[string]
@@ -94,48 +95,48 @@ type unmeshedPodAuditor struct {
 	criticalNSExclusionEmitted state.GaugeLedger[string]
 }
 
-// sweepUnmeshedPods audits Running Pods that opted into linkerd
+// Sweep audits Running Pods that opted into linkerd
 // injection (namespace OR pod linkerd.io/inject=enabled) but carry no
 // linkerd-proxy container or initContainer — the signature of a pod
 // admitted while the C1 breaker held the injector open. The gauge is
 // exported unconditionally; deletion additionally requires the
 // injector webhook provably healthy and the remediation flag on.
-func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepSnapshot) error {
+func (a *Auditor) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	a.auditCriticalNSExclusions(snap)
-	g := snap.g
+	g := snap.G
 	log := logf.FromContext(ctx)
 
 	// The namespace census carries the ns-level inject=enabled
 	// opt-in. An empty list is an API flap — a pod whose namespace
 	// cannot be checked must never be classified, so abort the
 	// audit before anything is emitted or deleted.
-	if snap.nsErr != nil {
-		return fmt.Errorf("list namespaces — unmeshed audit skipped: %w", snap.nsErr)
+	if snap.NSErr != nil {
+		return fmt.Errorf("list namespaces — unmeshed audit skipped: %w", snap.NSErr)
 	}
-	if len(snap.ns.Items) == 0 {
+	if len(snap.NS.Items) == 0 {
 		return errors.New("empty namespace list (API flap) — unmeshed audit skipped")
 	}
-	nsInject := make(map[string]string, len(snap.ns.Items))
-	for _, ns := range snap.ns.Items {
+	nsInject := make(map[string]string, len(snap.NS.Items))
+	for _, ns := range snap.NS.Items {
 		nsInject[ns.Name] = injectDirective(ns.Labels, ns.Annotations)
 	}
 
 	// Server-side phase filter (the informer cache is list/watch-
-	// locked to kube-system cilium pods, so this goes through cs like
+	// locked to kube-system cilium pods, so this goes through CS like
 	// every other module); the in-code phase check stays because
 	// fake clientsets ignore field selectors. The list is PAGED —
 	// all Running pods cluster-wide is an unbounded read, and each
 	// page is processed then dropped instead of pinning the whole
 	// list for the sweep.
-	now := g.now.Now()
+	now := g.Now.Now()
 	unmeshed := 0 // UnmeshedPods tuples re-asserted this sweep
 	var candidates []corev1.Pod
 	listOpts := metav1.ListOptions{
 		FieldSelector: "status.phase=Running",
-		Limit:         listPageSize,
+		Limit:         guardstate.ListPageSize,
 	}
 	err := kube.ListEach(ctx, listOpts,
-		kube.Pods(g.cs, metav1.NamespaceAll),
+		kube.Pods(g.CS, metav1.NamespaceAll),
 		func(items []corev1.Pod) error {
 			for i := range items {
 				p := &items[i]
@@ -177,13 +178,13 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 	}
 
 	// Prune series for pods that vanished or gained the sidecar —
-	// same DeleteLabelValues hygiene as brokenEmitted.
+	// same DeleteLabelValues hygiene as the circuit breaker's ledger.
 	a.unmeshedEmitted.Prune(metrics.UnmeshedPods.DeleteLabelValues)
 
 	if len(candidates) == 0 {
 		return nil
 	}
-	if !unmeshedRemediationEnabled() {
+	if !RemediationEnabled() {
 		log.Info("unmeshed remediation disabled (UNMESHED_POD_REMEDIATION_ENABLED=false)",
 			"candidates", len(candidates))
 		return nil
@@ -196,7 +197,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 	// that would only be recreated unmeshed again.
 	healthy, err := a.linkerdInjectorHealthy(snap)
 	if err != nil {
-		metrics.IncError(g.queue)
+		metrics.IncError(g.Queue)
 		log.Info("WARN: injector health unverifiable — remediation skipped (fail closed)",
 			"error", err, "candidates", len(candidates))
 		return nil
@@ -210,10 +211,10 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 	// W7-C1 — the maintenance mutex gates the evictions: killing
 	// pods mid-drain/upgrade is exactly what the mutex exists to
 	// prevent, and "cannot verify" fails closed like every other
-	// caller of kube.MaintenanceActive.
-	held, why, err := g.maintenanceActive(ctx)
+	// caller of the shared check.
+	held, why, err := g.MaintenanceActive(ctx)
 	if err != nil {
-		metrics.IncError(g.queue)
+		metrics.IncError(g.Queue)
 		log.Info("WARN: maintenance check unverifiable — "+
 			"DEFER: unmeshed remediation skipped (fail closed)",
 			"error", err, "candidates", len(candidates))
@@ -256,7 +257,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 			},
 			DeleteOptions: &deleteOpts,
 		}
-		if err := g.cs.CoreV1().Pods(p.Namespace).EvictV1(ctx, eviction); err != nil {
+		if err := g.CS.CoreV1().Pods(p.Namespace).EvictV1(ctx, eviction); err != nil {
 			if apierrors.IsTooManyRequests(err) {
 				// HTTP 429 — a PDB with disruptionsAllowed==0
 				// refused the eviction. That is a deferral, not a
@@ -268,7 +269,7 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 				continue
 			}
 			log.Error(err, "unmeshed pod eviction failed", "pod", p.Namespace+"/"+p.Name)
-			metrics.IncError(g.queue)
+			metrics.IncError(g.Queue)
 			continue
 		}
 		metrics.UnmeshedPodsRecreatedTotal.WithLabelValues(p.Namespace).Inc()
@@ -343,39 +344,39 @@ func injectDirective(labels, annotations map[string]string) string {
 // real error — the caller treats "cannot verify" as "not healthy".
 // Runs only when unmeshed candidates exist, so its census +
 // config-list inputs are drawn from the shared run snapshot (the
-// census is computed lazily on first use — see sweepSnapshot).
-func (a *unmeshedPodAuditor) linkerdInjectorHealthy(snap *sweepSnapshot) (bool, error) {
-	ready, err := snap.readyCounts()
+// census is computed lazily on first use — see guardstate.Snapshot).
+func (a *Auditor) linkerdInjectorHealthy(snap *guardstate.Snapshot) (bool, error) {
+	ready, err := snap.ReadyCounts()
 	if err != nil {
 		return false, err
 	}
-	if snap.mwcErr != nil {
-		return false, fmt.Errorf("list mutatingwebhookconfigurations — injector health unknown: %w", snap.mwcErr)
+	if snap.MWCErr != nil {
+		return false, fmt.Errorf("list mutatingwebhookconfigurations — injector health unknown: %w", snap.MWCErr)
 	}
-	mwcs := snap.mwc
+	mwcs := snap.MWC
 	found := false
 	for i := range mwcs.Items {
 		cfg := &mwcs.Items[i]
-		broken := parseCircuitAnnotation(cfg.Annotations[webhookCircuitAnno])
+		broken := guardstate.ParseCircuitAnnotation(cfg.Annotations[guardstate.CircuitBrokenAnno])
 		for _, w := range cfg.Webhooks {
 			if w.Name != linkerdInjectorWebhook {
 				continue // exact match — a lookalike name is not the injector
 			}
 			found = true
-			if broken[w.Name] || !failClosed(w.FailurePolicy) {
+			if broken[w.Name] || !guardstate.FailClosed(w.FailurePolicy) {
 				continue // circuit-broken (or manually set to Ignore)
 			}
 			if w.ClientConfig.Service == nil {
 				continue
 			}
 			svc := w.ClientConfig.Service.Namespace + "/" + w.ClientConfig.Service.Name
-			if ready.effective[svc] > 0 {
+			if ready.Effective[svc] > 0 {
 				return true, nil
 			}
 		}
 	}
 	if !found {
-		logf.FromContext(snap.ctx).Info("injector health: no linkerd-proxy-injector webhook found")
+		logf.FromContext(snap.Ctx).Info("injector health: no linkerd-proxy-injector webhook found")
 	}
 	return false, nil
 }
@@ -385,18 +386,18 @@ func (a *unmeshedPodAuditor) linkerdInjectorHealthy(snap *sweepSnapshot) (bool, 
 // to Fail) and emits node_automation_webhook_missing_critical_ns_exclusion=1
 // when the sub-webhook's namespaceSelector matches any of the critical
 // self-healing namespaces (kube-system, node-ops, medik8s).
-func (a *unmeshedPodAuditor) auditCriticalNSExclusions(snap *sweepSnapshot) {
-	if snap.nsErr != nil || snap.mwcErr != nil || snap.vwcErr != nil ||
-		snap.mwc == nil || snap.vwc == nil {
+func (a *Auditor) auditCriticalNSExclusions(snap *guardstate.Snapshot) {
+	if snap.NSErr != nil || snap.MWCErr != nil || snap.VWCErr != nil ||
+		snap.MWC == nil || snap.VWC == nil {
 		return
 	}
 	critLabels := make(map[string]labels.Set, len(criticalSelfHealingNamespaces))
 	for _, ns := range criticalSelfHealingNamespaces {
 		critLabels[ns] = labels.Set{"kubernetes.io/metadata.name": ns}
 	}
-	if snap.ns != nil {
-		for i := range snap.ns.Items {
-			ns := &snap.ns.Items[i]
+	if snap.NS != nil {
+		for i := range snap.NS.Items {
+			ns := &snap.NS.Items[i]
 			if _, ok := critLabels[ns.Name]; !ok {
 				continue
 			}
@@ -422,28 +423,28 @@ func (a *unmeshedPodAuditor) auditCriticalNSExclusions(snap *sweepSnapshot) {
 		return false
 	}
 
-	for i := range snap.mwc.Items {
-		cfg := &snap.mwc.Items[i]
+	for i := range snap.MWC.Items {
+		cfg := &snap.MWC.Items[i]
 		for j := range cfg.Webhooks {
 			w := &cfg.Webhooks[j]
-			if !failClosed(w.FailurePolicy) || !matchesCriticalNS(w.NamespaceSelector) {
+			if !guardstate.FailClosed(w.FailurePolicy) || !matchesCriticalNS(w.NamespaceSelector) {
 				continue
 			}
 			a.criticalNSExclusionEmitted.Set(metrics.WebhookMissingCriticalNSExclusion, 1,
-				webhookKindMutating+"/"+cfg.Name+"/"+w.Name,
-				webhookKindMutating, cfg.Name, w.Name)
+				guardstate.KindMutating+"/"+cfg.Name+"/"+w.Name,
+				guardstate.KindMutating, cfg.Name, w.Name)
 		}
 	}
-	for i := range snap.vwc.Items {
-		cfg := &snap.vwc.Items[i]
+	for i := range snap.VWC.Items {
+		cfg := &snap.VWC.Items[i]
 		for j := range cfg.Webhooks {
 			w := &cfg.Webhooks[j]
-			if !failClosed(w.FailurePolicy) || !matchesCriticalNS(w.NamespaceSelector) {
+			if !guardstate.FailClosed(w.FailurePolicy) || !matchesCriticalNS(w.NamespaceSelector) {
 				continue
 			}
 			a.criticalNSExclusionEmitted.Set(metrics.WebhookMissingCriticalNSExclusion, 1,
-				webhookKindValidating+"/"+cfg.Name+"/"+w.Name,
-				webhookKindValidating, cfg.Name, w.Name)
+				guardstate.KindValidating+"/"+cfg.Name+"/"+w.Name,
+				guardstate.KindValidating, cfg.Name, w.Name)
 		}
 	}
 	a.criticalNSExclusionEmitted.Prune(metrics.WebhookMissingCriticalNSExclusion.DeleteLabelValues)

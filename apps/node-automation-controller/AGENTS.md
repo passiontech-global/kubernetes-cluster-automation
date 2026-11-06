@@ -17,13 +17,16 @@ byte-stable with the shell-operator alerts).
   row + injected clients), `Periodic`/`AddPeriodic` (crontab
   replacement, panics recovered into run errors),
   `CountReconcile`/`ReconcileFunc` (reconciler error accounting),
-  `SetupWithConfig` (parse-knobs-before-gate ordering), `Clock`.
+  `SetupWithConfig`/`SetupNoConfig` (parse-knobs-before-gate
+  ordering — every gated Setup goes through one of them, never a
+  hand-rolled `if d.Disabled`), `Clock` (alias of
+  `libs/hostkit/timex.Clock`).
 - `internal/registry` — the single `[]shared.Module` registration
   table + `-modules` allowlist resolution + the boot wiring loop.
   Adding a module = one import + one row here.
-- `internal/platform/*` — leaf libraries: `envx` (env knobs/gates),
-  `kube` (paged lists, node/pod/patch helpers, the GVR registry,
-  annotation keys + timestamp stamps, maintenance mutex),
+- `internal/platform/*` — leaf libraries: `kube` (paged lists,
+  node/pod/patch helpers, the GVR registry, annotation keys +
+  timestamp stamps, maintenance mutex),
   `state` (Cooldown/FirstSeen/Seen/Streak/Gauge ledgers),
   `heal` (cooldown → maintenance-mutex → UID-delete → stamp;
   `PersistedCooledDown`/`StampPersisted` for the wider-of
@@ -40,6 +43,10 @@ byte-stable with the shell-operator alerts).
   the 32 modules, one package per module grouped by domain. Health
   checks live under `health/<sub>/` on top of `health/probefw` with
   the `clusterhealthprobes.checkDefs` roster as sweep order.
+  `apiserver/webhookguard` is the one module with subpackages —
+  `circuitbreaker`, `guardstate`, `orphansweep`, `unmeshed` are leaf
+  duties the facade's single `Setup`/sweep orchestrates (one
+  registry row, `errors.Join` of the four duty errors).
 - `internal/testutil` — shared fakes (StubManager, `PeriodicContract`
   setup assertions) plus re-export shims over `platform/testhelp`
   (probe clientset, CRD-aware dynamic fake, `Unstructured`). Domain
@@ -94,14 +101,17 @@ byte-stable with the shell-operator alerts).
 - Env: registration gates live ONLY in the registry's `GateEnv`
   column (arrive as `Deps.Disabled`); run knobs are read inside
   `Setup` via `envx.*` — modules with knobs use
-  `shared.SetupWithConfig` so parse warnings fire even when gated
-  off. Reading env inside a run/sweep is a bug — the ONE sanctioned
+  `shared.SetupWithConfig`, modules without use
+  `shared.SetupNoConfig`, so parse warnings fire even when gated
+  off and no module hand-rolls `if d.Disabled`. Reading env inside
+  a run/sweep is a bug — the ONE sanctioned
   exception is webhookguard's `WEBHOOK_CIRCUIT_BREAKER_ENABLED` /
   `UNMESHED_POD_REMEDIATION_ENABLED`, deliberately hot-reloaded per
   sweep as an ops lever. `os.Getenv`/`os.LookupEnv` is depguard-denied
   under `internal/` (envdoc also scans for it). `docs/env.md` must
   document every knob (envdoc test enforces).
-- Test seams: `now shared.Clock` (zero value = system time),
+- Test seams: `now shared.Clock` (alias of `libs/hostkit/timex.Clock`;
+  zero value = system time),
   `probeFn`/`dnsFn`/`httpClient` fields for paths the fake clientset
   cannot serve; ledgers are zero-value-ready so literal-constructed
   fixtures work.

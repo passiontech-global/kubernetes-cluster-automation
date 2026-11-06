@@ -1,14 +1,16 @@
 // circuit_breaker.go — the C1 admission-webhook self-deadlock
-// circuit breaker plus the W9-CP1 brownout probe/pod-bounce: the
-// second of the three independent duties behind webhookGuard.run.
-// The sweep trips fail-closed sub-webhooks whose backend Service has
-// reported 0 effective Ready endpoints past the dead threshold to
-// failurePolicy=Ignore, restores them on recovery, and bounces the
-// oldest Ready backing pod of a TCP+TLS-unresponsive backend. Its
-// state (dead-backend streaks, the broken-series ledger, bounce
-// cooldowns, test-seam thresholds) lives on circuitBreaker; shared
-// deps are reached through snap.g.
-package webhookguard
+// circuit breaker plus the W9-CP1 brownout probe/pod-bounce and the
+// CRD conversion-webhook backend health check: the sweep trips
+// fail-closed sub-webhooks whose backend Service has reported 0
+// effective Ready endpoints past the dead threshold to
+// failurePolicy=Ignore, restores them on recovery, bounces the
+// oldest Ready backing pod of a TCP+TLS-unresponsive backend, and
+// exports node_automation_crd_conversion_webhook_unhealthy for CRDs
+// whose conversion webhook backend is measurably broken. Its state
+// (dead-backend streaks, the broken-series ledger, bounce cooldowns,
+// test-seam thresholds) lives on Breaker; shared deps are reached
+// through snap.G.
+package circuitbreaker
 
 import (
 	"context"
@@ -28,6 +30,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -36,30 +39,24 @@ import (
 )
 
 const (
-	// webhookDeadThreshold is how long a fail-closed sub-webhook's
+	// DeadThreshold is how long a fail-closed sub-webhook's
 	// backend Service must report 0 Ready endpoints before the breaker
 	// trips it to Ignore.
-	webhookDeadThreshold = 5 * time.Minute
-	// webhookPartitionedThreshold is the faster trip window used when
+	DeadThreshold = 5 * time.Minute
+	// PartitionedThreshold is the faster trip window used when
 	// the Service still reports Ready endpoints but EVERY one sits on
 	// a partitioned/unresponsive node (W5.5): those pods cannot serve
 	// the apiserver's webhook calls, so the deadlock is real now — 90s
 	// of that condition is already an outage, no need to wait out the
 	// full dead-backend window.
-	webhookPartitionedThreshold = 90 * time.Second
+	PartitionedThreshold = 90 * time.Second
 
-	// W9-CP1 — Admission Webhook gray-failure TCP/TLS brownout
-	// probe: a webhook backend whose EndpointSlice still reports
-	// Ready endpoints on healthy nodes but whose pods all fail the
-	// TCP+TLS handshake is hung, not partitioned. The breaker treats
-	// it as effective=0 (90s partition threshold), and stage 1 bounces
-	// the oldest Ready backing pod — one bounce per service per
-	// webhookBounceCooldown so a wedged pod cannot be restarted every
-	// sweep.
-	webhookBounceCooldown   = 15 * time.Minute
-	webhookProbeMaxPerSvc   = 2  // endpoint IPs dialed per service
-	webhookProbeMaxPodRefs  = 32 // backing-pod candidates kept per service
-	webhookProbeDefaultPort = 443
+	// W9-CP1 — one pod bounce per service per BounceCooldown so a
+	// wedged pod cannot be restarted every sweep; admission and
+	// conversion backends share the ledger on purpose: one hung
+	// Service is one bounce per cooldown regardless of which duty
+	// noticed it.
+	BounceCooldown = 15 * time.Minute
 )
 
 // ---------------------------------------------------------------------------
@@ -69,62 +66,61 @@ const (
 // every CR read for the whole API group.
 // ---------------------------------------------------------------------------
 
-// crdReason* are the reason label values of
-// crdConversionWebhookUnhealthy — the three measurable dead-backend
+// CRDReason* are the reason label values of
+// CRDConversionWebhookUnhealthy — the three measurable dead-backend
 // signatures.
 const (
-	// crdReasonMissingService: the conversion clientConfig points at
+	// CRDReasonMissingService: the conversion clientConfig points at
 	// a Service that does not exist.
-	crdReasonMissingService = "missing_service"
-	// crdReasonZeroEndpoints: the Service exists but the endpoint
+	CRDReasonMissingService = "missing_service"
+	// CRDReasonZeroEndpoints: the Service exists but the endpoint
 	// census reports 0 effective-Ready endpoints (endpoints on
 	// partitioned nodes count as dead, same as the breaker's math).
-	crdReasonZeroEndpoints = "zero_endpoints"
-	// crdReasonTLSProbeFailed: Ready endpoints exist but EVERY probed
+	CRDReasonZeroEndpoints = "zero_endpoints"
+	// CRDReasonTLSProbeFailed: Ready endpoints exist but EVERY probed
 	// IP failed the TCP+TLS handshake — wedged pods, which the sweep
 	// bounces.
-	crdReasonTLSProbeFailed = "tls_probe_failed"
+	CRDReasonTLSProbeFailed = "tls_probe_failed"
 )
 
-// crdConversionWebhookUnhealthy marks (1) each CustomResourceDefinition
+// CRDConversionWebhookUnhealthy marks (1) each CustomResourceDefinition
 // whose spec.conversion webhook backend is measurably broken — a
 // single-check series, so it lives here (colocated var + init)
 // instead of internal/metrics. reason carries the verdict
 // (missing_service|zero_endpoints|tls_probe_failed); the series
 // disappears once the backend is healthy again.
-var crdConversionWebhookUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+var CRDConversionWebhookUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_crd_conversion_webhook_unhealthy",
 	Help: "1 while the CRD's spec.conversion webhook backend is unhealthy (missing_service|zero_endpoints|tls_probe_failed).",
 }, []string{"crd", "service", "reason"})
 
 func init() {
-	ctrlmetrics.Registry.MustRegister(crdConversionWebhookUnhealthy)
+	ctrlmetrics.Registry.MustRegister(CRDConversionWebhookUnhealthy)
 }
 
 // crdConversionKey is the exact label tuple of the
-// crdConversionWebhookUnhealthy gauge — the GaugeLedger key, same
-// contract as webhookMetricKey in cert-drift-auditor.
+// CRDConversionWebhookUnhealthy gauge — the GaugeLedger key, same
+// contract as the WebhookCircuitBroken ledger.
 type crdConversionKey struct{ crd, service, reason string }
 
 // ---------------------------------------------------------------------------
 // C1 — admission webhook self-deadlock circuit breaker.
 // ---------------------------------------------------------------------------
 
-// circuitBreakerEnabled reads the kill-switch EVERY run — the
+// Enabled reads the kill-switch EVERY run — the
 // sanctioned exception to the resolve-at-Setup rule: the breaker is
 // an ops lever that must stay flippable mid-incident, so an env flip
 // takes effect on the next sweep without an operator restart (the
-// same deliberate hot reload unmeshedRemediationEnabled carries).
-func circuitBreakerEnabled() bool {
+// same deliberate hot reload the unmeshed remediation lever carries).
+func Enabled() bool {
 	return envx.Gate("WEBHOOK_CIRCUIT_BREAKER_ENABLED", true)
 }
 
-// circuitBreaker owns the C1 sweep's per-sweep state — embedded in
-// webhookGuard so the facade's method set (and every in-package test
-// fixture built on it) is unchanged by the split. Shared deps
-// (cs/dyn/now/endpointProber) are reached through snap.g; only the
-// breaker-specific ledgers and cooldowns live here.
-type circuitBreaker struct {
+// Breaker owns the circuit-breaker sweep's per-sweep state — the
+// facade holds one across runs so the ledgers and cooldowns persist.
+// Shared deps (CS/Dyn/Now/EndpointProber/Verdict) are reached through
+// snap.G; only the breaker-specific ledgers and cooldowns live here.
+type Breaker struct {
 	// deadSince is the first-seen ledger of each
 	// kind/config/sub-webhook sighted fail-closed against a Service
 	// with 0 Ready endpoints. A sighting that disappears (endpoints
@@ -140,44 +136,44 @@ type circuitBreaker struct {
 	brokenEmitted state.GaugeLedger[string]
 	// zeroThreshold / partitionZeroThreshold override the two trip
 	// windows — tests shrink them; a zero value falls back to
-	// webhookDeadThreshold / webhookPartitionedThreshold.
+	// DeadThreshold / PartitionedThreshold.
 	zeroThreshold          time.Duration
 	partitionZeroThreshold time.Duration
 	// bounceAt: webhook backend service key ("ns/name") → last pod
-	// bounce — the in-memory half of the 15m per-service cooldown.
-	// Admission and conversion backends share the ledger on purpose:
-	// one hung Service is one bounce per cooldown regardless of
-	// which duty noticed it.
+	// bounce — the in-memory half of the BounceCooldown per-service
+	// cooldown. Admission and conversion backends share the ledger on
+	// purpose: one hung Service is one bounce per cooldown regardless
+	// of which duty noticed it.
 	bounceAt state.CooldownSet
 	// crdUnhealthyEmitted is the same GaugeLedger hygiene for
-	// crdConversionWebhookUnhealthy — tuples re-asserted each sweep,
+	// CRDConversionWebhookUnhealthy — tuples re-asserted each sweep,
 	// stale ones (CRD gone, backend healthy, reason changed) pruned
 	// via DeleteLabelValues.
 	crdUnhealthyEmitted state.GaugeLedger[crdConversionKey]
 }
 
-// sweepCircuitBreaker trips fail-closed sub-webhooks whose backend
+// Sweep trips fail-closed sub-webhooks whose backend
 // Service has reported 0 Ready endpoints continuously for
-// webhookDeadThreshold, and restores previously tripped entries once
+// DeadThreshold, and restores previously tripped entries once
 // the Service has endpoints again. It runs after the orphan sweep so
 // it always evaluates post-prune state; a patch failure on one config
 // is logged and the sweep continues with the rest.
-func (b *circuitBreaker) sweepCircuitBreaker(ctx context.Context, snap *sweepSnapshot) error {
-	g := snap.g
+func (b *Breaker) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
+	g := snap.G
 	log := logf.FromContext(ctx)
-	now := g.now.Now()
+	now := g.Now.Now()
 
-	ready, err := snap.readyCounts()
+	ready, err := snap.ReadyCounts()
 	if err != nil {
 		return err
 	}
-	if snap.mwcErr != nil {
-		return fmt.Errorf("list mutatingwebhookconfigurations — circuit breaker skipped: %w", snap.mwcErr)
+	if snap.MWCErr != nil {
+		return fmt.Errorf("list mutatingwebhookconfigurations — circuit breaker skipped: %w", snap.MWCErr)
 	}
-	if snap.vwcErr != nil {
-		return fmt.Errorf("list validatingwebhookconfigurations — circuit breaker skipped: %w", snap.vwcErr)
+	if snap.VWCErr != nil {
+		return fmt.Errorf("list validatingwebhookconfigurations — circuit breaker skipped: %w", snap.VWCErr)
 	}
-	mwcs, vwcs := snap.mwc, snap.vwc
+	mwcs, vwcs := snap.MWC, snap.VWC
 
 	// seen marks the deadSince keys still under evaluation — streaks
 	// for entries gone since the last sweep are pruned below.
@@ -185,37 +181,37 @@ func (b *circuitBreaker) sweepCircuitBreaker(ctx context.Context, snap *sweepSna
 	var failed []string
 	for i := range mwcs.Items {
 		cfg := &mwcs.Items[i]
-		payload, trips, recovered := b.circuitPatch(log, g.queue, webhookKindMutating,
-			cfg.Name, cfg.Annotations[webhookCircuitAnno],
+		payload, trips, recovered := b.circuitPatch(log, g.Queue, guardstate.KindMutating,
+			cfg.Name, cfg.Annotations[guardstate.CircuitBrokenAnno],
 			mutHookViews(cfg.Webhooks), ready, now, seen, &b.brokenEmitted)
 		if payload == nil {
 			continue
 		}
-		if _, err := g.cs.AdmissionregistrationV1().MutatingWebhookConfigurations().
+		if _, err := g.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().
 			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{}); err != nil {
 			log.Error(err, "circuit breaker patch failed",
-				"kind", webhookKindMutating, "config", cfg.Name)
+				"kind", guardstate.KindMutating, "config", cfg.Name)
 			failed = append(failed, cfg.Name)
 			continue
 		}
-		circuitMetrics(&b.brokenEmitted, webhookKindMutating, cfg.Name, trips, recovered)
+		circuitMetrics(&b.brokenEmitted, guardstate.KindMutating, cfg.Name, trips, recovered)
 	}
 	for i := range vwcs.Items {
 		cfg := &vwcs.Items[i]
-		payload, trips, recovered := b.circuitPatch(log, g.queue, webhookKindValidating,
-			cfg.Name, cfg.Annotations[webhookCircuitAnno],
+		payload, trips, recovered := b.circuitPatch(log, g.Queue, guardstate.KindValidating,
+			cfg.Name, cfg.Annotations[guardstate.CircuitBrokenAnno],
 			valHookViews(cfg.Webhooks), ready, now, seen, &b.brokenEmitted)
 		if payload == nil {
 			continue
 		}
-		if _, err := g.cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().
+		if _, err := g.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().
 			Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{}); err != nil {
 			log.Error(err, "circuit breaker patch failed",
-				"kind", webhookKindValidating, "config", cfg.Name)
+				"kind", guardstate.KindValidating, "config", cfg.Name)
 			failed = append(failed, cfg.Name)
 			continue
 		}
-		circuitMetrics(&b.brokenEmitted, webhookKindValidating, cfg.Name, trips, recovered)
+		circuitMetrics(&b.brokenEmitted, guardstate.KindValidating, cfg.Name, trips, recovered)
 	}
 
 	// W9-CP1 stage 1 — rolling pod bounce: a webhook backend whose
@@ -278,17 +274,17 @@ func valHookViews(ws []admissionv1.ValidatingWebhook) []hookView {
 // deadlock is already real — the shorter partition threshold applies;
 // a genuinely empty backend keeps the full dead threshold. The fields
 // are test seams; zero values fall back to the package defaults.
-func (b *circuitBreaker) tripThreshold(rawReady int) time.Duration {
+func (b *Breaker) tripThreshold(rawReady int) time.Duration {
 	if rawReady > 0 {
 		if b.partitionZeroThreshold > 0 {
 			return b.partitionZeroThreshold
 		}
-		return webhookPartitionedThreshold
+		return PartitionedThreshold
 	}
 	if b.zeroThreshold > 0 {
 		return b.zeroThreshold
 	}
-	return webhookDeadThreshold
+	return DeadThreshold
 }
 
 // circuitPatch evaluates one config's sub-webhooks against the ready
@@ -306,11 +302,11 @@ func (b *circuitBreaker) tripThreshold(rawReady int) time.Duration {
 // not re-seen. Returns nil payload when nothing changed;
 // trips/recovered are the names whose metric updates the caller must
 // apply only after the patch lands.
-func (b *circuitBreaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal string,
-	hooks []hookView, ready endpointCensus, now time.Time,
+func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal string,
+	hooks []hookView, ready guardstate.EndpointCensus, now time.Time,
 	seen map[string]bool, emitted *state.GaugeLedger[string]) ([]byte, []string, []string) {
 
-	broken := parseCircuitAnnotation(annoVal)
+	broken := guardstate.ParseCircuitAnnotation(annoVal)
 	// present holds every live sub-webhook name — the staleness check
 	// below compares the annotation against it (a freshly tripped name
 	// is present even though it was not in the annotation yet).
@@ -333,8 +329,8 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, queue, kind, cfgName, ann
 		isBroken := broken[h.name]
 		// svcEffective < 0 marks "not Service-backed" — URL webhooks
 		// and malformed refs are unmeasurable, the breaker never
-		// trips them. effective excludes Ready endpoints sitting on
-		// partitioned/unresponsive nodes (W5.5); raw keeps them for
+		// trips them. Effective excludes Ready endpoints sitting on
+		// partitioned/unresponsive nodes (W5.5); Raw keeps them for
 		// the threshold pick.
 		svcEffective, svcRaw := -1, -1
 		svc := ""
@@ -348,10 +344,10 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, queue, kind, cfgName, ann
 		unresponsive := false
 		if h.svc != nil && h.svc.Namespace != "" && h.svc.Name != "" {
 			svc = h.svc.Namespace + "/" + h.svc.Name
-			svcEffective = ready.effective[svc]
-			svcRaw = ready.raw[svc]
+			svcEffective = ready.Effective[svc]
+			svcRaw = ready.Raw[svc]
 			unresponsive = svcEffective > 0 &&
-				ready.probed[svc] && !ready.responsive[svc]
+				ready.Probed[svc] && !ready.Responsive[svc]
 		}
 		switch {
 		case isBroken && svcEffective != 0 && !unresponsive:
@@ -378,7 +374,7 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, queue, kind, cfgName, ann
 				changed = true
 			}
 			emitted.Set(metrics.WebhookCircuitBroken, 1, key, kind, cfgName, h.name)
-		case (svcEffective == 0 || unresponsive) && failClosed(h.fp):
+		case (svcEffective == 0 || unresponsive) && guardstate.FailClosed(h.fp):
 			seen[key] = true
 			first, tracked := b.deadSince.Observe(key, now)
 			if !tracked {
@@ -436,9 +432,9 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, queue, kind, cfgName, ann
 		return nil, nil, nil
 	}
 
-	anno := map[string]any{webhookCircuitAnno: nil} // merge-patch null deletes the key
+	anno := map[string]any{guardstate.CircuitBrokenAnno: nil} // merge-patch null deletes the key
 	if len(broken) > 0 {
-		anno[webhookCircuitAnno] = strings.Join(slices.Sorted(maps.Keys(broken)), ",")
+		anno[guardstate.CircuitBrokenAnno] = strings.Join(slices.Sorted(maps.Keys(broken)), ",")
 	}
 	// MergePatchAnnos builds the annotations half; the webhooks
 	// merge entries are grafted onto the same doc so the policy
@@ -463,13 +459,6 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, queue, kind, cfgName, ann
 	return payload, trips, recovered
 }
 
-// failClosed reports whether the entry currently fails closed. A nil
-// failurePolicy defaults to Fail server-side; anything not explicitly
-// Ignore is treated as fail-closed.
-func failClosed(fp *admissionv1.FailurePolicyType) bool {
-	return fp == nil || *fp != admissionv1.Ignore
-}
-
 // svcRefString renders a webhook's Service reference for log lines.
 func svcRefString(ref *admissionv1.ServiceReference) string {
 	if ref == nil || ref.Namespace == "" || ref.Name == "" {
@@ -478,10 +467,10 @@ func svcRefString(ref *admissionv1.ServiceReference) string {
 	return ref.Namespace + "/" + ref.Name
 }
 
-// sweepCRDConversionBackends health-checks every CRD whose
+// SweepCRDConversionBackends health-checks every CRD whose
 // spec.conversion.strategy is Webhook and whose clientConfig targets
-// an in-cluster Service — the fourth independent duty behind
-// webhookGuard.run. The failure modes are the breaker's three
+// an in-cluster Service — one of the four independent duties behind
+// the admission-webhook-guard sweep. The failure modes are the breaker's three
 // dead-backend signatures, but a dead CONVERSION backend is worse
 // than a dead admission one: there is no failurePolicy to trip, so
 // every CR read for the whole API group errors while it lasts. The
@@ -489,7 +478,7 @@ func svcRefString(ref *admissionv1.ServiceReference) string {
 // node_automation_crd_conversion_webhook_unhealthy per CRD — never
 // touches the CRD object — and bounces the oldest wedged backend pod
 // so the controller recreates it serving (the same stage-1 heal as
-// the admission path: webhookBounceCooldown, the shared maintenance
+// the admission path: BounceCooldown, the shared maintenance
 // mutex via heal.AllowedV, UID-preconditioned delete).
 //
 // Series hygiene: a complete sweep emits the current tuple per
@@ -499,26 +488,26 @@ func svcRefString(ref *admissionv1.ServiceReference) string {
 // An unverifiable sweep carries the last verdict forward — a
 // transient CRD list failure or a blind census is "can't tell", not
 // "clean".
-func (b *circuitBreaker) sweepCRDConversionBackends(ctx context.Context,
-	snap *sweepSnapshot) error {
-	g := snap.g
+func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
+	snap *guardstate.Snapshot) error {
+	g := snap.G
 	log := logf.FromContext(ctx)
-	now := g.now.Now()
+	now := g.Now.Now()
 
 	carryForward := func() {
 		for k, lv := range b.crdUnhealthyEmitted.Last() {
 			b.crdUnhealthyEmitted.Emit(k, lv...)
 		}
-		b.crdUnhealthyEmitted.Prune(crdConversionWebhookUnhealthy.DeleteLabelValues)
+		b.crdUnhealthyEmitted.Prune(CRDConversionWebhookUnhealthy.DeleteLabelValues)
 	}
 
-	if snap.crdErr != nil {
+	if snap.CRDErr != nil {
 		// API flap — "can't read the surface" fails closed: carry
 		// the series forward and surface the error.
 		carryForward()
-		return fmt.Errorf("list customresourcedefinitions — conversion webhook health skipped: %w", snap.crdErr)
+		return fmt.Errorf("list customresourcedefinitions — conversion webhook health skipped: %w", snap.CRDErr)
 	}
-	ready, err := snap.readyCounts()
+	ready, err := snap.ReadyCounts()
 	if err != nil {
 		// The breaker reports the same census failure as ITS error —
 		// re-reporting it here would double-count. Defer quietly and
@@ -526,7 +515,7 @@ func (b *circuitBreaker) sweepCRDConversionBackends(ctx context.Context,
 		// levered off this cycle, in which case nobody else reports
 		// it and the failure would be invisible.
 		carryForward()
-		if !circuitBreakerEnabled() {
+		if !Enabled() {
 			return fmt.Errorf("endpoint/node census — conversion webhook health skipped: %w", err)
 		}
 		return nil
@@ -534,25 +523,25 @@ func (b *circuitBreaker) sweepCRDConversionBackends(ctx context.Context,
 
 	var hung []string
 	bounceSeen := map[string]bool{}
-	for i := range snap.crds {
-		crd := &snap.crds[i]
-		svcKey, svcNS, svcName, ok := crdConversionServiceKey(crd)
+	for i := range snap.CRDs {
+		crd := &snap.CRDs[i]
+		svcKey, svcNS, svcName, ok := guardstate.CRDConversionServiceKey(crd)
 		if !ok {
 			continue // no webhook conversion or a URL backend — unmeasurable
 		}
 		reason := ""
-		_, err := g.cs.CoreV1().Services(svcNS).
+		_, err := g.CS.CoreV1().Services(svcNS).
 			Get(ctx, svcName, metav1.GetOptions{})
 		switch {
 		case apierrors.IsNotFound(err):
-			reason = crdReasonMissingService
+			reason = CRDReasonMissingService
 			log.Info("UNHEALTHY: CRD conversion webhook backend Service missing",
 				"crd", crd.GetName(), "service", svcKey)
 		case err != nil:
 			// Can't verify — carry this CRD's last verdict forward
 			// rather than flap; absorbed sub-failure, sweep
 			// continues.
-			metrics.IncError(g.queue)
+			metrics.IncError(g.Queue)
 			log.Error(err, "conversion webhook backend Service get failed",
 				"crd", crd.GetName(), "service", svcKey)
 			for k, lv := range b.crdUnhealthyEmitted.Last() {
@@ -561,12 +550,12 @@ func (b *circuitBreaker) sweepCRDConversionBackends(ctx context.Context,
 				}
 			}
 			continue
-		case ready.effective[svcKey] == 0:
-			reason = crdReasonZeroEndpoints
+		case ready.Effective[svcKey] == 0:
+			reason = CRDReasonZeroEndpoints
 			log.Info("UNHEALTHY: CRD conversion webhook backend has 0 effective-ready endpoints",
 				"crd", crd.GetName(), "service", svcKey)
-		case ready.probed[svcKey] && !ready.responsive[svcKey]:
-			reason = crdReasonTLSProbeFailed
+		case ready.Probed[svcKey] && !ready.Responsive[svcKey]:
+			reason = CRDReasonTLSProbeFailed
 			log.Info("UNHEALTHY: CRD conversion webhook backend fails TCP+TLS probe on every endpoint — pods wedged",
 				"crd", crd.GetName(), "service", svcKey)
 			if !bounceSeen[svcKey] {
@@ -578,33 +567,33 @@ func (b *circuitBreaker) sweepCRDConversionBackends(ctx context.Context,
 			continue
 		}
 		k := crdConversionKey{crd: crd.GetName(), service: svcKey, reason: reason}
-		b.crdUnhealthyEmitted.Set(crdConversionWebhookUnhealthy, 1,
+		b.crdUnhealthyEmitted.Set(CRDConversionWebhookUnhealthy, 1,
 			k, k.crd, k.service, k.reason)
 	}
-	b.crdUnhealthyEmitted.Prune(crdConversionWebhookUnhealthy.DeleteLabelValues)
+	b.crdUnhealthyEmitted.Prune(CRDConversionWebhookUnhealthy.DeleteLabelValues)
 
-	if !circuitBreakerEnabled() {
+	if !Enabled() {
 		// The shared ops lever silences pod kills module-wide —
 		// the gauge above stays live (detect-only, like the
 		// unmeshed audit).
 		return nil
 	}
 	for _, svcKey := range hung {
-		// heal.AllowedV folds the 15m per-service cooldown AND the
-		// maintenance mutex into one fail-closed preamble; &g.verdict
+		// heal.AllowedV folds the BounceCooldown per-service cooldown AND the
+		// maintenance mutex into one fail-closed preamble; &g.Verdict
 		// memoizes the mutex across services (and shares it with the
 		// admission bounce + unmeshed paths) instead of paying three
 		// API reads per service.
-		proceed, unverifiable := heal.AllowedV(ctx, log, &g.verdict,
-			g.cs, g.dyn, &b.bounceAt, svcKey, webhookBounceCooldown, now)
+		proceed, unverifiable := heal.AllowedV(ctx, log, &g.Verdict,
+			g.CS, g.Dyn, &b.bounceAt, svcKey, BounceCooldown, now)
 		if unverifiable {
-			metrics.IncError(g.queue)
+			metrics.IncError(g.Queue)
 			continue
 		}
 		if !proceed {
 			continue
 		}
-		b.bounceOldestPod(ctx, snap, svcKey, ready.backingPods[svcKey], now)
+		b.bounceOldestPod(ctx, snap, svcKey, ready.BackingPods[svcKey], now)
 	}
 	return nil
 }

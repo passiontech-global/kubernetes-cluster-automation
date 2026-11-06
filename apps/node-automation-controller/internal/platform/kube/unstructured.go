@@ -1,5 +1,5 @@
 // unstructured.go — generic field accessors for objects read through
-// the dynamic client, complementing the Ready* helpers in helpers.go.
+// the dynamic client, complementing the Ready* helpers in node.go.
 // The modules reach into CRD status/spec constantly
 // (unstructured.NestedString/NestedBool/NestedInt64/NestedFloat64/
 // NestedSlice — 100+ call sites); these wrappers keep the same
