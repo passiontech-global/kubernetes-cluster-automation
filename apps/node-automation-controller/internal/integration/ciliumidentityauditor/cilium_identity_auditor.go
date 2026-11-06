@@ -53,6 +53,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,6 +65,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -349,40 +351,49 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 		}
 	}
 
-	deleted := 0
-	for _, name := range eligible {
-		if deleted >= ciliumGCMaxDelete {
-			log.Info("GC capped — remaining orphans drain next sweep",
-				"cap", ciliumGCMaxDelete, "remaining", len(eligible)-deleted)
-			break
-		}
-		orphanedFor, _ := a.orphanFirstSeen.Seen(name, now)
-		log.Info("ACTION: GC orphaned CiliumIdentity",
-			"identity", name,
-			"orphanedFor", orphanedFor.Truncate(time.Minute))
-		// UID precondition closes the list→delete TOCTOU: a same-named
-		// identity recreated between the List above and this Delete is
-		// not the orphan this sweep vetted — the apiserver rejects the
-		// delete with a Conflict, skipped like the NotFound race below.
-		uid := idUIDs[name]
-		if err := a.dyn.Resource(ciliumIdentityGVR).
-			Delete(ctx, name, kube.UIDDeleteOptions(uid, "")); err != nil {
-			switch {
-			case apierrors.IsNotFound(err):
-				log.Info("SKIP: identity already gone — raced with cilium's own GC",
-					"identity", name)
-				continue
-			case apierrors.IsConflict(err):
-				log.Info("SKIP: identity recreated since the list — UID precondition fired",
-					"identity", name)
-				continue
-			}
-			metrics.IncError(a.queue)
-			log.Error(err, "identity delete failed", "identity", name)
-			continue // per-identity failure must not starve the rest
-		}
-		metrics.CiliumIdentitiesCollectedTotal.Inc()
-		deleted++
+	// The cap bounds delete ATTEMPTS (failed deletes churn the
+	// apiserver the same way) — leftover identities drain next sweep.
+	deleted, failed, capped := reap.Sweep(ctx, log, eligible,
+		reap.Options[string]{
+			Cap: ciliumGCMaxDelete,
+			LogTarget: func(log logr.Logger, name string) {
+				orphanedFor, _ := a.orphanFirstSeen.Seen(name, now)
+				log.Info("ACTION: GC orphaned CiliumIdentity",
+					"identity", name,
+					"orphanedFor", orphanedFor.Truncate(time.Minute))
+			},
+			Delete: func(ctx context.Context, name string) error {
+				// UID precondition closes the list→delete TOCTOU: a
+				// same-named identity recreated between the List above
+				// and this Delete is not the orphan this sweep vetted
+				// — the apiserver rejects it with a Conflict, reported
+				// through OnError like the NotFound race below.
+				uid := idUIDs[name]
+				if err := a.dyn.Resource(ciliumIdentityGVR).
+					Delete(ctx, name, kube.UIDDeleteOptions(uid, "")); err != nil {
+					return err
+				}
+				metrics.CiliumIdentitiesCollectedTotal.Inc()
+				return nil
+			},
+			OnError: func(log logr.Logger, name string, err error) {
+				switch {
+				case apierrors.IsNotFound(err):
+					log.Info("SKIP: identity already gone — raced with cilium's own GC",
+						"identity", name)
+				case apierrors.IsConflict(err):
+					log.Info("SKIP: identity recreated since the list — UID precondition fired",
+						"identity", name)
+				default:
+					metrics.IncError(a.queue)
+					log.Error(err, "identity delete failed", "identity", name)
+				}
+			},
+		})
+	if capped {
+		log.Info("GC capped — remaining orphans drain next sweep",
+			"cap", ciliumGCMaxDelete,
+			"remaining", len(eligible)-deleted-failed)
 	}
 	log.Info("GC done", "eligible", len(eligible), "deleted", deleted)
 	return nil
@@ -444,7 +455,7 @@ func reservedIdentity(id *unstructured.Unstructured) bool {
 			return true
 		}
 	}
-	secLabels, _, _ := unstructured.NestedStringMap(
+	secLabels, _ := kube.NestedStringMap(
 		id.Object, "spec", "security-labels")
 	for k := range secLabels {
 		if strings.HasPrefix(k, "reserved:") {

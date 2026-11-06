@@ -38,15 +38,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -134,7 +137,15 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 
 	now := c.now.Now()
 	absentNow := map[string]bool{}
-	deleted := 0
+
+	// target carries a streak-qualified slice into the sweep: key is
+	// the "ns/name/uid" ledger key so the re-confirm and the
+	// post-delete bookkeeping find the same streak entry again.
+	type target struct {
+		ns, name, svcName, key string
+		uid                    types.UID
+	}
+	var targets []target
 	for i := range slices {
 		s := &slices[i]
 		if s.DeletionTimestamp != nil {
@@ -164,45 +175,60 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 		if now.Sub(s.CreationTimestamp.Time) < orphanEndpointSliceMinAge {
 			continue // too fresh — the Service may still be landing
 		}
-		// Streak + age gates passed — re-confirm against the live
-		// apiserver before deleting (a List can lag a Get).
-		_, getErr := c.cs.CoreV1().Services(s.Namespace).
-			Get(ctx, svcName, metav1.GetOptions{})
-		gone, confirmErr := kube.ConfirmAbsent(getErr)
-		switch {
-		case gone:
-		case confirmErr != nil:
-			log.Info("WARN: service confirm failed — slice kept (fail closed)",
-				"endpointslice", s.Namespace+"/"+s.Name,
-				"service", svcName, "error", confirmErr)
-			metrics.IncError(c.queue)
-			continue
-		default:
-			// Service actually exists — the snapshot was stale.
-			// Clear the streak so the slice re-arms from zero.
-			c.absentStreak.Reset(key)
-			absentNow[key] = false
-			continue
-		}
-		log.Info("DELETE: orphan EndpointSlice (Service gone)",
-			"endpointslice", s.Namespace+"/"+s.Name, "service", svcName)
-		// UID precondition closes the TOCTOU window between the
-		// IsNotFound re-confirm and the delete — a same-named slice
-		// recreated in between is not the object we vetted.
-		uid := s.UID
-		if err := c.cs.DiscoveryV1().EndpointSlices(s.Namespace).
-			Delete(ctx, s.Name, kube.UIDDeleteOptions(uid, "")); err != nil {
-			log.Error(err, "orphan endpointslice delete failed",
-				"endpointslice", s.Namespace+"/"+s.Name)
-			metrics.IncError(c.queue)
-			continue
-		}
-		c.absentStreak.Reset(key)
-		delete(absentNow, key)
-		metrics.OrphanEndpointSlicesCleanedTotal.WithLabelValues(s.Namespace).Inc()
-		deleted++
+		targets = append(targets, target{
+			ns: s.Namespace, name: s.Name,
+			svcName: svcName, key: key, uid: s.UID,
+		})
 	}
 	slices = nil
+
+	deleted, _, _ := reap.Sweep(ctx, log, targets, reap.Options[target]{
+		// Streak + age gates passed — re-confirm against the live
+		// apiserver before deleting (a List can lag a Get).
+		Confirm: func(ctx context.Context, t target) (bool, error) {
+			_, getErr := c.cs.CoreV1().Services(t.ns).
+				Get(ctx, t.svcName, metav1.GetOptions{})
+			gone, confirmErr := kube.ConfirmAbsent(getErr)
+			switch {
+			case gone:
+				return true, nil
+			case confirmErr != nil:
+				log.Info("WARN: service confirm failed — slice kept (fail closed)",
+					"endpointslice", t.ns+"/"+t.name,
+					"service", t.svcName, "error", confirmErr)
+				metrics.IncError(c.queue)
+				return false, nil
+			default:
+				// Service actually exists — the snapshot was stale.
+				// Clear the streak so the slice re-arms from zero.
+				c.absentStreak.Reset(t.key)
+				absentNow[t.key] = false
+				return false, nil
+			}
+		},
+		LogTarget: func(log logr.Logger, t target) {
+			log.Info("DELETE: orphan EndpointSlice (Service gone)",
+				"endpointslice", t.ns+"/"+t.name, "service", t.svcName)
+		},
+		Delete: func(ctx context.Context, t target) error {
+			// UID precondition closes the TOCTOU window between the
+			// IsNotFound re-confirm and the delete — a same-named slice
+			// recreated in between is not the object we vetted.
+			if err := c.cs.DiscoveryV1().EndpointSlices(t.ns).
+				Delete(ctx, t.name, kube.UIDDeleteOptions(t.uid, "")); err != nil {
+				return err
+			}
+			c.absentStreak.Reset(t.key)
+			delete(absentNow, t.key)
+			metrics.OrphanEndpointSlicesCleanedTotal.WithLabelValues(t.ns).Inc()
+			return nil
+		},
+		OnError: func(log logr.Logger, t target, err error) {
+			log.Error(err, "orphan endpointslice delete failed",
+				"endpointslice", t.ns+"/"+t.name)
+			metrics.IncError(c.queue)
+		},
+	})
 
 	// Prune streaks for slices that vanished or whose Service came
 	// back — "consecutive" means any cycle with the Service present

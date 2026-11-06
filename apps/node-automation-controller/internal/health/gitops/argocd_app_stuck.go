@@ -7,7 +7,6 @@ package gitops
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
@@ -96,9 +95,8 @@ func init() {
 // CRD is a clean pass (ArgoCD not installed).
 func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
-	if p.Dyn == nil {
-		return probefw.Result{Infra: errors.New(
-			"no dynamic client — argocd app check unverifiable")}
+	if r := p.RequireDyn("argocd app check"); r != nil {
+		return *r
 	}
 	now := p.Now()
 	apps, err := p.Dyn.Resource(argocdAppGVR).List(ctx, metav1.ListOptions{})
@@ -109,7 +107,6 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list applications: %w", err)}
 	}
 
-	current := map[string][]string{}
 	seenKeep := map[string]bool{}
 	var stuck []string
 	comparisonErrors := 0
@@ -127,8 +124,8 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		if health == "Progressing" && !p.argocdAppOnlyDownscaled(ctx, app) {
 			sig := "prog/" + ns + "/" + name
 			seenKeep[sig] = true
-			first, _ := p.seen.Observe(sig, now)
-			if now.Sub(first) >= argocdAppProgressingMinAge {
+			if probefw.Persisted(&p.seen, sig, now,
+				argocdAppProgressingMinAge, logr.Discard()) {
 				reasons = append(reasons,
 					fmt.Sprintf("progressing>%s", argocdAppProgressingMinAge))
 			}
@@ -148,18 +145,15 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 			sig := "cond/" + ns + "/" + name + "/" + typ
 			seenKeep[sig] = true
 			// lastTransitionTime is the condition's own clock;
-			// absent/malformed falls back to first-seen.
-			age := time.Duration(0)
-			known := false
-			if !c.LastTransitionTime.IsZero() {
-				age = now.Sub(c.LastTransitionTime)
-				known = true
-			}
-			if !known {
-				first, _ := p.seen.Observe(sig, now)
-				age = now.Sub(first)
-			}
-			if age < argocdConditionMinAge {
+			// absent/malformed falls back to the first-seen ledger —
+			// inside the persistence window the signature doesn't
+			// count yet (quiet site: no first-seen log).
+			if c.LastTransitionTime.IsZero() {
+				if !probefw.Persisted(&p.seen, sig, now,
+					argocdConditionMinAge, logr.Discard()) {
+					continue
+				}
+			} else if now.Sub(c.LastTransitionTime) < argocdConditionMinAge {
 				continue
 			}
 			if isCmp {
@@ -180,14 +174,13 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		}
 		sort.Strings(reasons)
 		reason := strings.Join(reasons, "+")
-		lv := []string{ns, name, reason}
-		current[ns+"/"+name+"/"+reason] = lv
-		argoCDAppStuckGauge.WithLabelValues(lv...).Set(1)
+		p.emitted.Set(argoCDAppStuckGauge, 1,
+			ns+"/"+name+"/"+reason, ns, name, reason)
 		stuck = append(stuck, fmt.Sprintf("%s/%s(%s)", ns, name, reason))
 		p.refreshArgoCDApp(ctx, log, app, now)
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
-	p.emitted.Reconcile(current, argoCDAppStuckGauge.DeleteLabelValues)
+	p.emitted.Prune(argoCDAppStuckGauge.DeleteLabelValues)
 
 	// >=2 simultaneous ComparisonErrors = shared stale repo-server
 	// cache — restart the oldest repo-server pod to flush it.
@@ -264,8 +257,8 @@ func (p *argoCDAppStuckCheck) argocdWorkloadDownscaled(ctx context.Context,
 func (p *argoCDAppStuckCheck) refreshArgoCDApp(ctx context.Context,
 	log logr.Logger, app *unstructured.Unstructured, now time.Time) {
 
-	ck := "selfheal/" + CheckNameArgoCDAppStuck + "/refresh/" +
-		app.GetNamespace() + "/" + app.GetName()
+	ck := probefw.SelfHealKey(CheckNameArgoCDAppStuck,
+		"refresh/"+app.GetNamespace()+"/"+app.GetName())
 	if p.Heals.CooledDown(ck, argocdRefreshCooldown, now) {
 		return
 	}

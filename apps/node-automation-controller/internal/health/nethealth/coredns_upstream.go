@@ -20,7 +20,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -183,17 +182,19 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 
 // hasHealthySibling reports whether another dns pod in the same
 // namespace is Running+Ready and NOT itself flagged — the "isolated
-// failure" precondition for the pod-delete heal.
+// failure" precondition for the pod-delete heal. PodRunningReady
+// already discounts deleting pods (a terminating sibling cannot
+// absorb traffic).
 func hasHealthySibling(pod *corev1.Pod, siblings []*corev1.Pod,
 	flagged map[string]string) bool {
 	for _, s := range siblings {
-		if s.Name == pod.Name || s.DeletionTimestamp != nil {
+		if s.Name == pod.Name {
 			continue
 		}
 		if _, bad := flagged[s.Namespace+"/"+s.Name]; bad {
 			continue
 		}
-		if s.Status.Phase == corev1.PodRunning && kube.PodReadyCond(s) {
+		if probefw.PodRunningReady(s) {
 			return true
 		}
 	}

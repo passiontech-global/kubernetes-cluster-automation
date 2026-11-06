@@ -1,7 +1,8 @@
-// zombie_reap.go — the forceful exit: the Job-completion gate that
-// must pass before a still-Running pod may be deleted
-// (jobAllowsReap, backed by allZeroExit) and the pod delete itself
-// (reap). Deleting a pod whose Job has not counted its exit-0
+// zombie_reap.go — the forceful-exit gate: the Job-completion check
+// that must pass before a still-Running pod may be deleted
+// (jobAllowsReap, backed by allZeroExit) — wired as the Confirm step
+// of the reap.Sweep delete loop in zombie_sidecar_reaper.go.
+// Deleting a pod whose Job has not counted its exit-0
 // completion makes the job-controller recreate it and re-run the
 // Job (BUG-C1); the backoffLimit==0 exemption (W10-FIX3) exists
 // because such a Job can spawn no replacement.
@@ -98,23 +99,4 @@ func (r *zombieSidecarReaper) jobAllowsReap(ctx context.Context, p *corev1.Pod, 
 			"succeeded", job.Status.Succeeded)
 		return false
 	}
-}
-
-// reap deletes the zombie pod and counts the reap — the Job
-// controller reconciles completions once the live pod is gone.
-func (r *zombieSidecarReaper) reap(ctx context.Context, p *corev1.Pod, why string) error {
-	log := logf.FromContext(ctx)
-	log.Info("DELETE: zombie sidecar pod", "pod", p.Namespace+"/"+p.Name, "reason", why)
-	// UID precondition: the listed object is the zombie we vetted —
-	// a same-named replacement must start its own graceful cycle,
-	// not inherit this delete.
-	uid := p.UID
-	if err := r.cs.CoreV1().Pods(p.Namespace).
-		Delete(ctx, p.Name, kube.UIDDeleteOptions(uid, "")); err != nil {
-		log.Error(err, "zombie pod delete failed", "pod", p.Namespace+"/"+p.Name)
-		metrics.IncError(r.queue)
-		return err
-	}
-	metrics.ZombieSidecarPodsReapedTotal.WithLabelValues(p.Namespace).Inc()
-	return nil
 }

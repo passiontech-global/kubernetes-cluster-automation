@@ -8,7 +8,6 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 	"time"
@@ -16,7 +15,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -49,8 +47,9 @@ const (
 	// linkerd-h2-stream-guard knobs.
 	linkerdH2PodMinAge  = 5 * time.Minute
 	linkerdH2HealCool   = 30 * time.Minute
+	linkerdH2LogTimeout = 8 * time.Second
 	linkerdH2TailLines  = int64(200)
-	linkerdH2LogMaxByte = 256 * 1024
+	linkerdH2LogMaxByte = int64(256 * 1024)
 )
 
 // linkerdH2StormMarkers are the proxy-log signatures of an HTTP/2
@@ -78,36 +77,23 @@ func init() {
 
 // linkerdH2LogStorm fetches the linkerd-proxy container's log tail
 // and reports whether any line carries a storm signature. Bounded to
-// 8s / linkerdH2LogMaxByte — the same posture as the scylla gossip
-// probe; a fetch failure is inconclusive, not healthy.
+// linkerdH2LogTimeout / linkerdH2LogMaxByte — the same posture as
+// the scylla gossip probe; a fetch failure is inconclusive, not
+// healthy.
 func (p *linkerdH2StreamGuardCheck) linkerdH2LogStorm(ctx context.Context,
 	pod *corev1.Pod) (bool, error) {
 
-	lctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	defer cancel()
-	tail := linkerdH2TailLines
-	stream, err := p.CS.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name,
-		&corev1.PodLogOptions{
-			Container: linkerdProxyContainer,
-			TailLines: &tail,
-		}).Stream(lctx)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = stream.Close() }()
-	data, err := io.ReadAll(io.LimitReader(stream, linkerdH2LogMaxByte))
-	if err != nil {
-		return false, err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		l := strings.ToLower(line)
-		for _, marker := range linkerdH2StormMarkers {
-			if strings.Contains(l, marker) {
-				return true, nil
+	return probefw.PodLogTail(ctx, p.CS, pod, linkerdProxyContainer,
+		linkerdH2TailLines, linkerdH2LogMaxByte, linkerdH2LogTimeout,
+		func(line string) bool {
+			l := strings.ToLower(line)
+			for _, marker := range linkerdH2StormMarkers {
+				if strings.Contains(l, marker) {
+					return true
+				}
 			}
-		}
-	}
-	return false, nil
+			return false
+		})
 }
 
 // checkLinkerdH2StreamGuard scans Running meshed pods older than 5m
@@ -127,18 +113,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 
 	// Ready siblings per controller UID — the heal's "someone can
 	// absorb the traffic" proof.
-	readyByOwner := map[types.UID]int{}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if pod.DeletionTimestamp != nil ||
-			pod.Status.Phase != corev1.PodRunning ||
-			!kube.PodReadyCond(pod) {
-			continue
-		}
-		if ref := metav1.GetControllerOf(pod); ref != nil {
-			readyByOwner[ref.UID]++
-		}
-	}
+	readyByOwner := probefw.ReadyByOwner(pods.Items)
 
 	current := map[string][]string{}
 	var findings []string
@@ -175,13 +150,9 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 		// The storming pod itself counts toward its owner's Ready
 		// total when it is Ready — a h2 wedge does not break the
-		// HTTP/1.1 probe. Subtract self so the guard requires a
-		// GENUINELY separate sibling.
-		siblings := readyByOwner[ref.UID]
-		if kube.PodReadyCond(pod) {
-			siblings--
-		}
-		if siblings < 1 {
+		// HTTP/1.1 probe. ReadySiblings subtracts self so the guard
+		// requires a GENUINELY separate sibling.
+		if probefw.ReadySiblings(readyByOwner, pod) < 1 {
 			log.Info("skip heal: no Ready sibling replica — delete would blackhole the workload",
 				"pod", key)
 			continue

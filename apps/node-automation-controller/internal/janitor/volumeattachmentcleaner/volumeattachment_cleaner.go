@@ -50,9 +50,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -63,6 +63,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -181,11 +182,6 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list volumeattachments: %w", err)
 	}
-	// Deterministic order — the per-cycle cap must always pick the
-	// same victims, not whichever ordering the apiserver returned.
-	sort.Slice(vas, func(i, j int) bool {
-		return vas[i].Name < vas[j].Name
-	})
 
 	// orphanNow tracks which VAs still look missing-node orphaned
 	// this cycle — a VA whose node reappeared, or that was deleted,
@@ -225,8 +221,17 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 		}
 	}
 
-	deleted, failed := 0, 0
-	capped := false
+	// vaTarget is one listed VA carried into the sweep — strip tags
+	// the W4 finalizer-strip action, reason the metric label of the
+	// plain delete (decided inside Confirm, so a capped-out VA costs
+	// no gate evaluation at all). Items are pointers so Confirm's
+	// reason reaches LogTarget/Delete.
+	type vaTarget struct {
+		va     *storagev1.VolumeAttachment
+		strip  bool
+		reason string
+	}
+	var targets []*vaTarget
 	for i := range vas {
 		va := &vas[i]
 		if va.DeletionTimestamp != nil {
@@ -236,66 +241,77 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 			// finalizers are stripped to free the volume. Inside
 			// the grace window it stays the stuck-terminating
 			// audit's surface (C3b), untouched here.
-			if now.Sub(va.DeletionTimestamp.Time) < vaStuckTerminatingAge {
-				continue
+			if now.Sub(va.DeletionTimestamp.Time) >= vaStuckTerminatingAge {
+				targets = append(targets, &vaTarget{va: va, strip: true})
 			}
-			if !c.stuckTerminatingNodeDead(ctx, va, nodeByName, livePods) {
-				continue
-			}
-			if deleted+failed >= vaDeleteCap {
-				capped = true
-				break
-			}
-			if err := c.stripFinalizers(ctx, va); err != nil {
-				failed++
-				continue
-			}
-			deleted++
 			continue
 		}
+		targets = append(targets, &vaTarget{va: va})
+	}
+	vas = nil
 
-		reason := ""
-		if node, ok := nodeByName[va.Spec.NodeName]; !ok {
-			// missing_node: the node object is gone — the VA can
-			// only be garbage. Still requires the VA to be old
-			// enough AND a sighting in a PRIOR cycle (seenPrior),
-			// so a one-off node List gap never detaches anything.
-			if seenPrior[va.Name] &&
-				now.Sub(va.CreationTimestamp.Time) >= vaMissingNodeMinAge {
-				reason = "missing_node"
+	deleted, failed, capped := reap.Sweep(ctx, log, targets, reap.Options[*vaTarget]{
+		// The cap bounds delete ATTEMPTS — a wrong verdict must
+		// never detach more than a handful of volumes at once, and
+		// a rejected write churns the apiserver the same way.
+		Cap: vaDeleteCap,
+		// Deterministic victims — the cap must always pick the same
+		// names, not whichever ordering the apiserver returned.
+		Less: func(a, b *vaTarget) bool { return a.va.Name < b.va.Name },
+		Confirm: func(ctx context.Context, t *vaTarget) (bool, error) {
+			if t.strip {
+				// The W4 wedged-detach gate — fails closed inside
+				// (a pod-list failure keeps the finalizers).
+				return c.stuckTerminatingNodeDead(ctx, t.va, nodeByName, livePods), nil
 			}
-		} else if c.nodeFencedDead(ctx, node, livePods, now) {
-			reason = "out_of_service_node"
-		}
-		if reason == "" {
-			continue
-		}
-		if deleted >= vaDeleteCap {
-			capped = true
-			break
-		}
-
-		log.Info("DELETE volumeattachment",
-			"va", va.Name, "reason", reason, "node", va.Spec.NodeName,
-			"pv", ptr.Deref(va.Spec.Source.PersistentVolumeName, "?"))
-		// UID precondition: VA names are deterministic csi-hash
-		// names — a volume re-attachment between list and delete
-		// recreates the SAME name, so only the object we vetted may
-		// be removed.
-		uid := va.UID
-		if err := c.cs.StorageV1().VolumeAttachments().Delete(ctx, va.Name,
-			kube.UIDDeleteOptions(uid, "")); err != nil {
+			if node, ok := nodeByName[t.va.Spec.NodeName]; !ok {
+				// missing_node: the node object is gone — the VA can
+				// only be garbage. Still requires the VA to be old
+				// enough AND a sighting in a PRIOR cycle (seenPrior),
+				// so a one-off node List gap never detaches anything.
+				if seenPrior[t.va.Name] &&
+					now.Sub(t.va.CreationTimestamp.Time) >= vaMissingNodeMinAge {
+					t.reason = "missing_node"
+				}
+			} else if c.nodeFencedDead(ctx, node, livePods, now) {
+				t.reason = "out_of_service_node"
+			}
+			return t.reason != "", nil
+		},
+		LogTarget: func(log logr.Logger, t *vaTarget) {
+			if t.strip {
+				return // stripFinalizers emits its own PATCH-FINALIZERS line
+			}
+			log.Info("DELETE volumeattachment",
+				"va", t.va.Name, "reason", t.reason, "node", t.va.Spec.NodeName,
+				"pv", ptr.Deref(t.va.Spec.Source.PersistentVolumeName, "?"))
+		},
+		Delete: func(ctx context.Context, t *vaTarget) error {
+			if t.strip {
+				return c.stripFinalizers(ctx, t.va)
+			}
+			// UID precondition: VA names are deterministic csi-hash
+			// names — a volume re-attachment between list and delete
+			// recreates the SAME name, so only the object we vetted may
+			// be removed.
+			if err := c.cs.StorageV1().VolumeAttachments().Delete(ctx, t.va.Name,
+				kube.UIDDeleteOptions(t.va.UID, "")); err != nil {
+				return err
+			}
+			metrics.VolumeAttachmentsCleanedTotal.WithLabelValues(t.reason).Inc()
+			c.orphanFirstSeen.Forget(t.va.Name)
+			return nil
+		},
+		OnError: func(log logr.Logger, t *vaTarget, err error) {
+			if t.strip {
+				return // stripFinalizers already metered + logged the failure
+			}
 			metrics.IncError(c.queue)
 			log.Error(err, "volumeattachment delete failed",
-				"va", va.Name, "node", va.Spec.NodeName,
-				"pv", ptr.Deref(va.Spec.Source.PersistentVolumeName, "?"))
-			failed++
-			continue
-		}
-		metrics.VolumeAttachmentsCleanedTotal.WithLabelValues(reason).Inc()
-		c.orphanFirstSeen.Forget(va.Name)
-		deleted++
-	}
+				"va", t.va.Name, "node", t.va.Spec.NodeName,
+				"pv", ptr.Deref(t.va.Spec.Source.PersistentVolumeName, "?"))
+		},
+	})
 	// Re-arm the grace window for every VA that stopped looking
 	// orphaned (node reappeared, or the VA vanished between cycles).
 	c.orphanFirstSeen.Prune(func(name string) bool {

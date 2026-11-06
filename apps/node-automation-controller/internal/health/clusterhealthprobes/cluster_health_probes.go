@@ -79,7 +79,9 @@ import (
 // It fills the sweep-level Timeouts itself and delegates each
 // domain's knobs to the package that consumes them — the ported
 // kuberhealthy checks to ported.ConfigFromEnv, the
-// kcm-workqueue-watchdog knobs to watchdogs.KCMConfigFromEnv.
+// kcm-workqueue-watchdog knobs to watchdogs.KCMConfigFromEnv, the
+// cilium nethealth knobs to probefw.CiliumConfigFromEnv (without it
+// the cilium checks read zero-value thresholds).
 func healthProbeConfigFromEnv() probefw.Config {
 	cfg := probefw.Config{
 		Timeouts: probefw.TimeoutsConfig{
@@ -101,6 +103,7 @@ func healthProbeConfigFromEnv() probefw.Config {
 	}
 	ported.ConfigFromEnv(&cfg)
 	watchdogs.KCMConfigFromEnv(&cfg)
+	probefw.CiliumConfigFromEnv(&cfg)
 	return cfg
 }
 

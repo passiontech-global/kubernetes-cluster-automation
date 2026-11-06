@@ -8,7 +8,6 @@ package nodehealth
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -91,9 +90,8 @@ func init() {
 func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 	// The ScaledObject scan needs dyn — a missing client is a wiring
 	// bug, not "no signal" (same posture as the scylla check).
-	if p.Dyn == nil {
-		return probefw.Result{Infra: errors.New(
-			"no dynamic client — keda scaledobject guard unverifiable")}
+	if r := p.RequireDyn("keda scaledobject guard"); r != nil {
+		return *r
 	}
 	log := logf.FromContext(ctx)
 	now := p.Now()
@@ -122,8 +120,9 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 		key := so.GetNamespace() + "/" + so.GetName()
 		seenKeep[key] = true
-		first, _ := p.seen.Observe(key, now)
-		if now.Sub(first) < kedaUnhealthyMinAge {
+		// Quiet site: first-seen tracking needs no log line.
+		if !probefw.Persisted(&p.seen, key, now, kedaUnhealthyMinAge,
+			logr.Discard()) {
 			continue
 		}
 		for _, reason := range reasons {
@@ -190,7 +189,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		return // downscaler-managed zero — the workload is asleep on purpose
 	}
 
-	ck := "selfheal/" + CheckNameKedaScaledObjectGuard + "/" + ns + "/" + target
+	ck := probefw.SelfHealKey(CheckNameKedaScaledObjectGuard, ns+"/"+target)
 	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
 		p.CS, p.Dyn, &p.Heals, ck, kedaRescueCooldown, now)
 	if unverifiable {

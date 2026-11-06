@@ -58,11 +58,7 @@ var (
 )
 
 type corednsPatcher struct {
-	cs kubernetes.Interface
-	// queue is the module's ops name — stamped from Deps.Name (the
-	// registry row) so the controller name, the setup log lines and
-	// every IncError label come from one place.
-	queue           string
+	cs              kubernetes.Interface
 	zoneWhen        string
 	minDomains      int
 	minReplicas     int
@@ -120,8 +116,12 @@ func Setup(d shared.Deps) error {
 			MinReplicas:     cfg.minReplicas,
 			NodesPerReplica: cfg.nodesPerReplica,
 		}.WatchNodes(b, "coredns-patcher-sweep")
-		return b.Complete(&corednsPatcher{cs: d.CS, queue: d.Name, zoneWhen: cfg.zoneWhen,
-			minDomains: cfg.zoneMinDomains, minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica})
+		r := &corednsPatcher{cs: d.CS, zoneWhen: cfg.zoneWhen,
+			minDomains: cfg.zoneMinDomains, minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica}
+		// CountReconcile owns the returned-error accounting — one
+		// IncError per non-nil Reconcile return; the reconcile body
+		// never IncErrors an error it returns.
+		return b.Complete(shared.CountReconcile(d.Name, r.Reconcile))
 	})
 }
 
@@ -154,7 +154,6 @@ func configFromEnv() corednsPatcherConfig {
 func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	return pinnedworkload.DeploymentSpec{
 		CS:        r.cs,
-		Queue:     r.queue,
 		Namespace: "kube-system",
 		Name:      "coredns",
 		Container: "coredns",

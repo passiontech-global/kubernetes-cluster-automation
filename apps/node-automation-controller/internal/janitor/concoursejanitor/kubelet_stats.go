@@ -44,7 +44,7 @@ func (j *concourseWorkdirJanitor) readStats(ctx context.Context, pod *corev1.Pod
 	if s.node == "" {
 		return s
 	}
-	cctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
+	cctx, cancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
 	defer cancel()
 	used, capBytes, imgUsed, err := j.stats.Summary(cctx, s.node)
 	if err != nil {

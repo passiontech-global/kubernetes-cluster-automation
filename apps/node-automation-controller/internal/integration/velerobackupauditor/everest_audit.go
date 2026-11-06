@@ -110,8 +110,7 @@ func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
 		}
 		for _, reason := range reasons {
 			k := everestKey{ns, name, reason}
-			a.seenEverest.Emit(k, ns, name, reason)
-			metrics.DBBackupUnhealthy.WithLabelValues(ns, name, reason).Set(1)
+			a.seenEverest.Set(metrics.DBBackupUnhealthy, 1, k, ns, name, reason)
 			log.Info("everest databasecluster backup unhealthy",
 				"cluster", ns+"/"+name, "reason", reason,
 				"backups", len(clusterBackups))

@@ -67,8 +67,8 @@ import (
 // on an explicit "false". An empty GateEnv means always-on. Gates
 // that only alter run behavior while the module still registers —
 // CSR_APPROVER_ENABLED approve mode, HELM_STALL_UNWEDGE_ENABLED,
-// EXTERNALSECRET_NUDGE_ENABLED, CILIUM_IDENTITY_GC_ENABLED,
-// WEBHOOK_CIRCUIT_BREAKER_ENABLED, UNMESHED_POD_REMEDIATION_ENABLED —
+// CILIUM_IDENTITY_GC_ENABLED, WEBHOOK_CIRCUIT_BREAKER_ENABLED,
+// UNMESHED_POD_REMEDIATION_ENABLED —
 // are NOT listed: the module keeps reading those itself.
 //
 // The slice (not a map) makes registration order deterministic — the
@@ -138,7 +138,7 @@ var Modules = []shared.Module{
 	// Third-party controller unstuckers (dynamic client /
 	// CRD types).
 	{Name: "helmrelease-unlocker", Group: groupIntegration, Setup: helmreleaseunlocker.Setup},
-	{Name: "externalsecret-nudge", Group: groupIntegration, Setup: externalsecretnudge.Setup},
+	{Name: "externalsecret-nudge", Group: groupIntegration, GateEnv: "EXTERNALSECRET_NUDGE_ENABLED", Setup: externalsecretnudge.Setup},
 	{Name: "certmanager-reaper", Group: groupIntegration, GateEnv: "CERTMANAGER_REAPER_ENABLED", Setup: certmanagerreaper.Setup},
 	{Name: "cilium-identity-auditor", Group: groupIntegration, GateEnv: "CILIUM_IDENTITY_AUDITOR_ENABLED", Setup: ciliumidentityauditor.Setup},
 	{Name: "cert-drift-auditor", Group: groupIntegration, GateEnv: "CERT_DRIFT_AUDITOR_ENABLED", DefaultOn: true, Setup: certdriftauditor.Setup},

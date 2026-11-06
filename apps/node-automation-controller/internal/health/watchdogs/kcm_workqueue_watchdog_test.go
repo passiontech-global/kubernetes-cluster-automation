@@ -109,7 +109,7 @@ func TestCheckKCMWorkqueueFreezeAfterMinAge(t *testing.T) {
 		kcmDesiredZeroDS(),
 	)
 	p := testProber(cs)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 
 	// First sighting stamps first-seen — quiet.
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
@@ -126,7 +126,7 @@ func TestCheckKCMWorkqueueFreezeAfterMinAge(t *testing.T) {
 	// Inside the window — still quiet.
 	at := base.Add(9 * time.Minute)
 	renewKCMLease(t, cs, at)
-	p.Now = func() time.Time { return at }
+	probetest.FreezeNow(p.Deps, at)
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("signature at 9m must still pass: %+v", res)
 	}
@@ -137,7 +137,7 @@ func TestCheckKCMWorkqueueFreezeAfterMinAge(t *testing.T) {
 	// Past the persistence window the freeze fires.
 	at = base.Add(10 * time.Minute)
 	renewKCMLease(t, cs, at)
-	p.Now = func() time.Time { return at }
+	probetest.FreezeNow(p.Deps, at)
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("signature persisted >=10m must FAIL")
 	}
@@ -179,7 +179,7 @@ func TestCheckKCMWorkqueueStaleObservedGeneration(t *testing.T) {
 		dep, settled,
 	)
 	p := testProber(cs)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("first-seen signature must pass: %+v", res)
@@ -194,7 +194,7 @@ func TestCheckKCMWorkqueueStaleObservedGeneration(t *testing.T) {
 
 	at := base.Add(11 * time.Minute)
 	renewKCMLease(t, cs, at)
-	p.Now = func() time.Time { return at }
+	probetest.FreezeNow(p.Deps, at)
 	res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx)
 	if res.Pass {
 		t.Fatal("stale observedGeneration >=10m must FAIL")
@@ -218,7 +218,7 @@ func TestCheckKCMWorkqueueQuietOnStaleLease(t *testing.T) {
 		kcmDesiredZeroDS(),
 	)
 	p := testProber(cs)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("stale KCM lease must stay quiet: %+v", res)
@@ -231,7 +231,11 @@ func TestCheckKCMWorkqueueQuietOnStaleLease(t *testing.T) {
 	}
 
 	// A previously-frozen gauge also clears when the holder dies.
-	probetest.MustCheck[*kcmWorkqueueCheck](t, p).kcmFrozenReasons["daemonset_desired_zero"] = true
+	// Seed the emitted ledger: Emit + a no-op Prune rolls the tuple
+	// into "held last sweep" so the reset path sees it as held.
+	led := &probetest.MustCheck[*kcmWorkqueueCheck](t, p).kcmFrozenReasons
+	led.Emit("daemonset_desired_zero", "daemonset_desired_zero")
+	led.Prune(func(...string) bool { return true })
 	metrics.KCMWorkqueueFrozen.WithLabelValues("daemonset_desired_zero").Set(1)
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("stale KCM lease must stay quiet: %+v", res)
@@ -242,7 +246,7 @@ func TestCheckKCMWorkqueueQuietOnStaleLease(t *testing.T) {
 
 	// No Lease object at all — same quiet path.
 	p = testProber(fake.NewSimpleClientset(kcmReadyNode(), kcmDesiredZeroDS()))
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("missing KCM lease must stay quiet: %+v", res)
 	}
@@ -256,7 +260,7 @@ func TestCheckKCMWorkqueueQuietOnNoReadyNodes(t *testing.T) {
 	// Zero nodes at all.
 	cs := fake.NewSimpleClientset(kcmLease(2*time.Second, base), kcmDesiredZeroDS())
 	p := testProber(cs)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("no nodes must stay quiet: %+v", res)
 	}
@@ -271,7 +275,7 @@ func TestCheckKCMWorkqueueQuietOnNoReadyNodes(t *testing.T) {
 	}
 	cs = fake.NewSimpleClientset(notReady, kcmLease(2*time.Second, base), kcmDesiredZeroDS())
 	p = testProber(cs)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("all nodes NotReady must stay quiet: %+v", res)
 	}
@@ -294,7 +298,7 @@ func TestCheckKCMWorkqueueRecoveryClearsGauge(t *testing.T) {
 		kcmDesiredZeroDS(),
 	)
 	p := testProber(cs)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 
 	// Drive past the window into frozen.
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
@@ -302,7 +306,7 @@ func TestCheckKCMWorkqueueRecoveryClearsGauge(t *testing.T) {
 	}
 	at := base.Add(11 * time.Minute)
 	renewKCMLease(t, cs, at)
-	p.Now = func() time.Time { return at }
+	probetest.FreezeNow(p.Deps, at)
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); res.Pass {
 		t.Fatal("expected frozen FAIL")
 	}
@@ -313,7 +317,7 @@ func TestCheckKCMWorkqueueRecoveryClearsGauge(t *testing.T) {
 	// KCM catches up: desired recomputed to match the scheduled pods.
 	at = base.Add(12 * time.Minute)
 	renewKCMLease(t, cs, at)
-	p.Now = func() time.Time { return at }
+	probetest.FreezeNow(p.Deps, at)
 	ds, err := cs.AppsV1().DaemonSets(metav1.NamespaceSystem).
 		Get(ctx, "cilium", metav1.GetOptions{})
 	if err != nil {
@@ -365,14 +369,14 @@ func TestCheckKCMWorkqueueIgnoresEmptyDaemonSet(t *testing.T) {
 		empty,
 	)
 	p := testProber(cs)
-	p.Now = func() time.Time { return base }
+	probetest.FreezeNow(p.Deps, base)
 
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("empty DaemonSet must pass: %+v", res)
 	}
 	at := base.Add(30 * time.Minute)
 	renewKCMLease(t, cs, at)
-	p.Now = func() time.Time { return at }
+	probetest.FreezeNow(p.Deps, at)
 	if res := probetest.MustCheck[*kcmWorkqueueCheck](t, p).Run(ctx); !res.Pass {
 		t.Fatalf("empty DaemonSet must never freeze: %+v", res)
 	}

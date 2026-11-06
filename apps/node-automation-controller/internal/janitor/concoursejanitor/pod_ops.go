@@ -24,13 +24,13 @@ import (
 // ---------------------------------------------------------------------------
 
 func (j *concourseWorkdirJanitor) getPod(ctx context.Context, name string) (*corev1.Pod, error) {
-	cctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
+	cctx, cancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
 	defer cancel()
 	return j.cs.CoreV1().Pods(cjNamespace).Get(cctx, name, metav1.GetOptions{})
 }
 
 func (j *concourseWorkdirJanitor) workerReplicas(ctx context.Context) (int32, error) {
-	cctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
+	cctx, cancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
 	defer cancel()
 	sts, err := j.cs.AppsV1().StatefulSets(cjNamespace).Get(cctx, cjStatefulSet, metav1.GetOptions{})
 	if err != nil {
@@ -47,7 +47,7 @@ func (j *concourseWorkdirJanitor) workerReplicas(ctx context.Context) (int32, er
 // "Gone" is uid-scoped: a same-named replacement created before our
 // first poll still confirms the old object's deletion.
 func (j *concourseWorkdirJanitor) deletePod(ctx context.Context, name string, oldUID types.UID) error {
-	dctx, cancel := context.WithTimeout(ctx, j.deleteTimeout)
+	dctx, cancel := context.WithTimeout(ctx, j.cfg.deleteTimeout)
 	defer cancel()
 	// UID precondition: oldUID was re-fetched right before this call
 	// — if the object already churned to a new UID, the delete must
@@ -56,7 +56,7 @@ func (j *concourseWorkdirJanitor) deletePod(ctx context.Context, name string, ol
 		kube.UIDDeleteOptions(oldUID, "")); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete pod %s: %w", name, err)
 	}
-	err := wait.PollUntilContextCancel(dctx, j.fastPoll, true,
+	err := wait.PollUntilContextCancel(dctx, j.cfg.fastPoll, true,
 		func(ctx context.Context) (bool, error) {
 			p, err := j.cs.CoreV1().Pods(cjNamespace).Get(ctx, name, metav1.GetOptions{})
 			if apierrors.IsNotFound(err) {
@@ -69,7 +69,7 @@ func (j *concourseWorkdirJanitor) deletePod(ctx context.Context, name string, ol
 			return p.UID != oldUID, nil // old object deleted (or still terminating)
 		})
 	if err != nil {
-		return fmt.Errorf("pod %s still present after %s: %w", name, j.deleteTimeout, err)
+		return fmt.Errorf("pod %s still present after %s: %w", name, j.cfg.deleteTimeout, err)
 	}
 	return nil
 }
@@ -79,9 +79,9 @@ func (j *concourseWorkdirJanitor) deletePod(ctx context.Context, name string, ol
 // would pin onto the old pod. No replacement inside uidPollTimeout is
 // a run error (bash `exit 1`: "new pod not created").
 func (j *concourseWorkdirJanitor) waitNewPod(ctx context.Context, name string, oldUID types.UID) error {
-	dctx, cancel := context.WithTimeout(ctx, j.uidPollTimeout)
+	dctx, cancel := context.WithTimeout(ctx, j.cfg.uidPollTimeout)
 	defer cancel()
-	err := wait.PollUntilContextCancel(dctx, j.fastPoll, true,
+	err := wait.PollUntilContextCancel(dctx, j.cfg.fastPoll, true,
 		func(ctx context.Context) (bool, error) {
 			p, err := j.cs.CoreV1().Pods(cjNamespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
@@ -91,7 +91,7 @@ func (j *concourseWorkdirJanitor) waitNewPod(ctx context.Context, name string, o
 			return p.UID != oldUID, nil
 		})
 	if err != nil {
-		return fmt.Errorf("pod %s: new pod not created within %s: %w", name, j.uidPollTimeout, err)
+		return fmt.Errorf("pod %s: new pod not created within %s: %w", name, j.cfg.uidPollTimeout, err)
 	}
 	return nil
 }
@@ -99,9 +99,9 @@ func (j *concourseWorkdirJanitor) waitNewPod(ctx context.Context, name string, o
 // waitReady blocks until the pod's Ready condition is True — init-rm
 // of a huge work-dir is why the window is so generous.
 func (j *concourseWorkdirJanitor) waitReady(ctx context.Context, name string) error {
-	dctx, cancel := context.WithTimeout(ctx, j.readyTimeout)
+	dctx, cancel := context.WithTimeout(ctx, j.cfg.readyTimeout)
 	defer cancel()
-	err := wait.PollUntilContextCancel(dctx, j.slowPoll, true,
+	err := wait.PollUntilContextCancel(dctx, j.cfg.slowPoll, true,
 		func(ctx context.Context) (bool, error) {
 			p, err := j.cs.CoreV1().Pods(cjNamespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
@@ -111,7 +111,7 @@ func (j *concourseWorkdirJanitor) waitReady(ctx context.Context, name string) er
 			return kube.PodReadyCond(p), nil
 		})
 	if err != nil {
-		return fmt.Errorf("pod %s not Ready after %s: %w", name, j.readyTimeout, err)
+		return fmt.Errorf("pod %s not Ready after %s: %w", name, j.cfg.readyTimeout, err)
 	}
 	return nil
 }

@@ -9,9 +9,7 @@ package datastore
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 	"time"
@@ -135,7 +133,9 @@ func pgWALLogReason(line string) string {
 
 // pgWALLogHit fetches the postgres container's log tail and returns
 // the first matching WAL signature — bounded like the scylla gossip
-// probe; a fetch failure is inconclusive, not healthy.
+// probe; a fetch failure is inconclusive, not healthy. The matched
+// reason rides out through the match closure (PodLogTail reports
+// only hit/miss).
 func (p *postgresWALArchiveGuardCheck) pgWALLogHit(ctx context.Context,
 	pod *corev1.Pod) (string, error) {
 
@@ -147,25 +147,20 @@ func (p *postgresWALArchiveGuardCheck) pgWALLogHit(ctx context.Context,
 	} else {
 		return "", nil // no unambiguous postgres container — skip
 	}
-	lctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	defer cancel()
-	tail := pgWALTailLines
-	stream, err := p.CS.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name,
-		&corev1.PodLogOptions{Container: container, TailLines: &tail}).Stream(lctx)
-	if err != nil {
+	var reason string
+	hit, err := probefw.PodLogTail(ctx, p.CS, pod, container,
+		pgWALTailLines, pgWALLogMaxByte, 8*time.Second,
+		func(line string) bool {
+			if r := pgWALLogReason(line); r != "" {
+				reason = r
+				return true
+			}
+			return false
+		})
+	if err != nil || !hit {
 		return "", err
 	}
-	defer func() { _ = stream.Close() }()
-	data, err := io.ReadAll(io.LimitReader(stream, pgWALLogMaxByte))
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if reason := pgWALLogReason(line); reason != "" {
-			return reason, nil
-		}
-	}
-	return "", nil
+	return reason, nil
 }
 
 // postgresClusterOf returns the operator cluster a postgres pod
@@ -188,9 +183,8 @@ func postgresClusterOf(pod *corev1.Pod) string {
 // operator decision; the check's job is making the stall visible
 // before the volume actually fills.
 func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
-	if p.Dyn == nil {
-		return probefw.Result{Infra: errors.New(
-			"no dynamic client — postgres wal archive guard unverifiable")}
+	if r := p.RequireDyn("postgres wal archive guard"); r != nil {
+		return *r
 	}
 	log := logf.FromContext(ctx)
 	now := p.Now()
@@ -301,13 +295,11 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	current := map[string][]string{}
 	for k, f := range findings {
-		lv := []string{f.ns, f.cluster, f.reason}
-		current[k] = lv
-		postgresWALUnhealthyGauge.WithLabelValues(lv...).Set(1)
+		p.emitted.Set(postgresWALUnhealthyGauge, 1,
+			k, f.ns, f.cluster, f.reason)
 	}
-	p.emitted.Reconcile(current, postgresWALUnhealthyGauge.DeleteLabelValues)
+	p.emitted.Prune(postgresWALUnhealthyGauge.DeleteLabelValues)
 	if len(findings) == 0 {
 		return probefw.Result{Pass: true}
 	}

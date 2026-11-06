@@ -33,7 +33,6 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -80,13 +79,12 @@ var (
 )
 
 type externalSecretNudge struct {
-	cs  kubernetes.Interface // reserved for future typed reads
+	cs  kubernetes.Interface // connect-pod heal target lists + deletes
 	dyn dynamic.Interface
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
-	queue   string
-	enabled bool // EXTERNALSECRET_NUDGE_ENABLED — clusters without ESO skip
+	queue string
 	// now is the clock seam — tests pin it so the stuck/cooldown
 	// windows are deterministic. nil → time.Now.
 	now shared.Clock
@@ -112,16 +110,18 @@ type externalSecretNudge struct {
 	verdict kube.Verdict
 }
 
-// Setup registers the 10-minute sweep. With the module gate off
-// (EXTERNALSECRET_NUDGE_ENABLED != "true") the tick only logs and
-// returns nil — keeps the signature/queue uniform across clusters
-// with and without ESO.
+// Setup registers the 10-minute sweep — or nothing when the cluster
+// opts out. EXTERNALSECRET_NUDGE_ENABLED is the module's REGISTRATION
+// gate (opt-in: only "true" registers), resolved by setupModules into
+// Deps.Disabled — clusters without ESO never run the sweep at all.
 func Setup(d shared.Deps) error {
+	if d.Disabled {
+		return nil
+	}
 	n := &externalSecretNudge{
 		cs:         d.CS,
 		dyn:        d.Dyn,
 		queue:      d.Name,
-		enabled:    envx.Gate("EXTERNALSECRET_NUDGE_ENABLED", false),
 		now:        shared.SystemClock,
 		storeReady: map[string]bool{},
 	}
@@ -130,10 +130,6 @@ func Setup(d shared.Deps) error {
 
 func (n *externalSecretNudge) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	if !n.enabled {
-		log.Info("skip: externalsecret-nudge disabled")
-		return nil
-	}
 
 	stores, err := n.listFirst(ctx, clusterSecretStoreGVRs)
 	if err != nil {

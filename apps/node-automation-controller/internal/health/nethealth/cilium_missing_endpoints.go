@@ -7,7 +7,6 @@ package nethealth
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -111,9 +110,8 @@ func ciliumCEPUnprogrammed(cep *unstructured.Unstructured) bool {
 func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 	// The CEP census needs dyn — a missing client is a wiring bug,
 	// not "no signal" (same posture as the scylla check).
-	if p.Dyn == nil {
-		return probefw.Result{Infra: errors.New(
-			"no dynamic client — cilium endpoint check unverifiable")}
+	if r := p.RequireDyn("cilium endpoint check"); r != nil {
+		return *r
 	}
 	log := logf.FromContext(ctx)
 	now := p.Now()

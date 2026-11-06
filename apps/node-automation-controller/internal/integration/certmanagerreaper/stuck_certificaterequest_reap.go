@@ -10,12 +10,12 @@ package certmanagerreaper
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -23,6 +23,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 )
 
 // listCRs returns the CertificateRequests of one namespace, caching
@@ -113,14 +114,27 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 			"lastResetAgo", now.Sub(st.last).Truncate(time.Minute))
 		return false
 	}
-	log.Info("RESET: deleting stuck CertificateRequest — cert-manager re-issues on next sync",
-		"cert", key, "certificaterequest", stuck.GetName())
-	uid := stuck.GetUID()
-	if err := r.dyn.Resource(certificateRequestGVR).Namespace(ns).
-		Delete(ctx, stuck.GetName(), kube.UIDDeleteOptions(uid, "")); err != nil {
-		metrics.IncError(r.queue)
-		log.Error(err, "certificaterequest delete failed",
-			"cert", key, "certificaterequest", stuck.GetName())
+	// The stuck CR carries its UID from the list that vetted it —
+	// the delete is preconditioned on that UID so a same-named CR
+	// recreated since the list is not reaped.
+	deleted, _, _ := reap.Sweep(ctx, log, []*unstructured.Unstructured{stuck},
+		reap.Options[*unstructured.Unstructured]{
+			LogTarget: func(log logr.Logger, cr *unstructured.Unstructured) {
+				log.Info("RESET: deleting stuck CertificateRequest — "+
+					"cert-manager re-issues on next sync",
+					"cert", key, "certificaterequest", cr.GetName())
+			},
+			Delete: func(ctx context.Context, cr *unstructured.Unstructured) error {
+				return r.dyn.Resource(certificateRequestGVR).Namespace(ns).
+					Delete(ctx, cr.GetName(), kube.UIDDeleteOptions(cr.GetUID(), ""))
+			},
+			OnError: func(log logr.Logger, cr *unstructured.Unstructured, err error) {
+				metrics.IncError(r.queue)
+				log.Error(err, "certificaterequest delete failed",
+					"cert", key, "certificaterequest", cr.GetName())
+			},
+		})
+	if deleted == 0 {
 		return false
 	}
 	st.total++
@@ -166,10 +180,8 @@ func (r *certManagerReaper) patchResetsAnnotation(ctx context.Context,
 	if st != nil {
 		value = fmt.Sprintf("%d,%s", st.total, st.last.UTC().Format(time.RFC3339))
 	}
-	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]any{
-			acmeResetsAnno: value,
-		}},
+	patch, err := kube.MergePatchAnnos(map[string]any{
+		acmeResetsAnno: value,
 	})
 	if err != nil {
 		return err

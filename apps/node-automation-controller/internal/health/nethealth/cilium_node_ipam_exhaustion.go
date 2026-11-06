@@ -26,7 +26,6 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // ciliumNodeIPAMExhaustionCheck is the cilium node IPAM exhaustion
@@ -56,9 +55,8 @@ const (
 	CheckNameCiliumNodeIPAM = "cilium-node-ipam-exhaustion"
 
 	// W10-NM6 — cilium-node-ipam-exhaustion knobs.
-	ciliumIPAMMinFreeRatio = 0.15
-	ciliumIPAMNodeCool     = 30 * time.Minute
-	ciliumIPAMMaxReaps     = 50
+	ciliumIPAMNodeCool = 30 * time.Minute
+	ciliumIPAMMaxReaps = 50
 )
 
 var (
@@ -111,10 +109,10 @@ func podCIDRCapacity(podCIDR string) (int, bool) {
 func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	// GetenvFloatPositive keeps >1 (the documented "disable this
-	// check" escape) and rejects <=0 — the same contract the retired
-	// healthEnvFloat had.
-	minFree := envx.GetenvFloatPositive("CILIUM_NODE_IPAM_MIN_FREE_RATIO", ciliumIPAMMinFreeRatio)
+	// The CILIUM_NODE_IPAM_MIN_FREE_RATIO knob resolves once at
+	// sweep Setup (probefw.CiliumConfigFromEnv — >1 keeps working as
+	// the documented "disable this check" escape).
+	minFree := p.Cfg.Cilium.NodeIPAMMinFreeRatio
 
 	// Prometheus operator IPAM census — cilium_operator_ipam_{used,
 	// available}_ips{target_node} (cilium >=1.15; the old
@@ -231,7 +229,7 @@ func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result 
 func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Context,
 	log logr.Logger, node string, now time.Time) {
 
-	ck := "selfheal/" + CheckNameCiliumNodeIPAM + "/reap/" + node
+	ck := probefw.SelfHealKey(CheckNameCiliumNodeIPAM, "reap/"+node)
 	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
 		p.CS, p.Dyn, &p.Heals, ck, ciliumIPAMNodeCool, now)
 	if unverifiable {

@@ -20,12 +20,12 @@ var ciliumStaleTaint = corev1.Taint{
 	Effect: corev1.TaintEffectNoSchedule,
 }
 
-// reaperClientset returns an enabled reaper backed by a fake clientset
-// with apiserver-faithful field-selector behavior.
+// reaperClientset returns a reaper backed by a fake clientset. The
+// disabled path is not exercised here: gate-off means Setup registers
+// nothing at all (covered by TestSetupDisabled).
 func reaperClientset(objs ...runtime.Object) (*fake.Clientset, *ciliumTaintReaper) {
 	cs := fake.NewSimpleClientset(objs...)
-	testutil.EmulatePodNodeNameSelector(cs)
-	return cs, &ciliumTaintReaper{cs: cs, enabled: true}
+	return cs, &ciliumTaintReaper{cs: cs}
 }
 
 func TestCiliumTaintReaperNoPodKeepsTaint(t *testing.T) {
@@ -184,7 +184,7 @@ func TestCiliumTaintReaperPodListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	r := &ciliumTaintReaper{cs: cs, enabled: true}
+	r := &ciliumTaintReaper{cs: cs}
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the cilium pod list fails")
 	}
@@ -229,7 +229,7 @@ func TestCiliumTaintReaperNodeListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	r := &ciliumTaintReaper{cs: cs, enabled: true}
+	r := &ciliumTaintReaper{cs: cs}
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
@@ -241,12 +241,11 @@ func TestCiliumTaintReaperUntaintError(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
 		ciliumPod("n1", corev1.PodRunning, true))
-	testutil.EmulatePodNodeNameSelector(cs)
 	cs.PrependReactor("patch", "nodes",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
-	r := &ciliumTaintReaper{cs: cs, enabled: true}
+	r := &ciliumTaintReaper{cs: cs}
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the untaint patch fails")
 	}

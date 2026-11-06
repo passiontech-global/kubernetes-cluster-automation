@@ -61,9 +61,11 @@ const (
 // 2.2 — unmeshed-pod-auditor + post-circuit-breaker pod healer.
 // ---------------------------------------------------------------------------
 
-// unmeshedRemediationEnabled reads the kill-switch every run — an env
-// flip takes effect on the next sweep without a code change (same
-// pattern as circuitBreakerEnabled).
+// unmeshedRemediationEnabled reads the kill-switch EVERY run — the
+// sanctioned exception to the resolve-at-Setup rule: remediation is an
+// ops lever that must stay flippable mid-incident, so an env flip
+// takes effect on the next sweep without an operator restart (the
+// same deliberate hot reload circuitBreakerEnabled carries).
 func unmeshedRemediationEnabled() bool {
 	return envx.Gate("UNMESHED_POD_REMEDIATION_ENABLED", true)
 }
@@ -133,9 +135,9 @@ func (a *unmeshedPodAuditor) sweepUnmeshedPods(ctx context.Context, snap *sweepS
 				if podHasSidecar(p) {
 					continue
 				}
-				a.unmeshedEmitted.Emit(p.Namespace+"/"+p.Name, p.Namespace, p.Name)
+				a.unmeshedEmitted.Set(metrics.UnmeshedPods, 1,
+					p.Namespace+"/"+p.Name, p.Namespace, p.Name)
 				unmeshed++
-				metrics.UnmeshedPods.WithLabelValues(p.Namespace, p.Name).Set(1)
 				log.Info("UNMESHED: pod running without linkerd-proxy sidecar",
 					"pod", p.Namespace+"/"+p.Name)
 				// Deletion requires a CONTROLLER owner (a bare

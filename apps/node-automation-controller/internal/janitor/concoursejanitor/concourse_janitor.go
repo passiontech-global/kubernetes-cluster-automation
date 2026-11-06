@@ -170,21 +170,10 @@ type atcIface interface {
 	pruneWorker(ctx context.Context, name string) error
 }
 
-type concourseWorkdirJanitor struct {
-	cs kubernetes.Interface
-	// queue is the module's ops name — stamped from Deps.Name (the
-	// registry row) so the periodic's name and every IncError label
-	// come from one place.
-	queue   string
-	stats   nodeStatsReader
-	atc     atcIface
-	enabled bool
-	// dyn reads the autopilot Plan CR for maintenance-mutex
-	// signal (c) — no typed client exists for it.
-	dyn dynamic.Interface
-
-	// Timeouts/polls are fields (initialised from the consts) only so
-	// tests can shrink them; production values match the bash ones.
+// cjConfig groups the timeout/poll knobs the wipe cycle waits on —
+// populated from the cj* consts in Setup (production values match the
+// bash ones); tests shrink them.
+type cjConfig struct {
 	runTimeout     time.Duration
 	reqTimeout     time.Duration
 	drainTimeout   time.Duration
@@ -195,6 +184,23 @@ type concourseWorkdirJanitor struct {
 	readyTimeout   time.Duration
 	fastPoll       time.Duration
 	slowPoll       time.Duration
+}
+
+type concourseWorkdirJanitor struct {
+	cs kubernetes.Interface
+	// queue is the module's ops name — stamped from Deps.Name (the
+	// registry row) so the periodic's name and every IncError label
+	// come from one place.
+	queue string
+	stats nodeStatsReader
+	atc   atcIface
+	// dyn reads the autopilot Plan CR for maintenance-mutex
+	// signal (c) — no typed client exists for it.
+	dyn dynamic.Interface
+	// now is the clock seam — tests pin it so the mid-init-rm guard
+	// is deterministic. nil → time.Now.
+	now shared.Clock
+	cfg cjConfig
 }
 
 // Setup registers the 30-minute sweep (was the
@@ -212,32 +218,27 @@ func Setup(d shared.Deps) error {
 		queue: d.Name,
 		stats: &kubeletStatsReader{cs: cs},
 		atc:   newATCClient(cjATCBase, &http.Client{Timeout: cjATCTimeout}),
-		// Reaching this line means the registration gate was on, so
-		// the field is unconditionally true — run()'s enabled check
-		// now only guards literally-constructed janitors in tests.
-		enabled: true,
-		dyn:     dyn,
+		dyn:   dyn,
+		now:   shared.SystemClock,
 
-		runTimeout:     cjRunTimeout,
-		reqTimeout:     cjReqTimeout,
-		drainTimeout:   cjDrainTimeout,
-		landFailWait:   cjLandFailWait,
-		pruneStateWait: cjPruneStateTimeout,
-		deleteTimeout:  cjDeleteTimeout,
-		uidPollTimeout: cjUIDPollTimeout,
-		readyTimeout:   cjReadyTimeout,
-		fastPoll:       cjFastPoll,
-		slowPoll:       cjSlowPoll,
+		cfg: cjConfig{
+			runTimeout:     cjRunTimeout,
+			reqTimeout:     cjReqTimeout,
+			drainTimeout:   cjDrainTimeout,
+			landFailWait:   cjLandFailWait,
+			pruneStateWait: cjPruneStateTimeout,
+			deleteTimeout:  cjDeleteTimeout,
+			uidPollTimeout: cjUIDPollTimeout,
+			readyTimeout:   cjReadyTimeout,
+			fastPoll:       cjFastPoll,
+			slowPoll:       cjSlowPoll,
+		},
 	}
 	return shared.AddPeriodic(mgr, j.queue, 30*time.Minute, j.run)
 }
 
 func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	if !j.enabled {
-		log.Info("skip: concourse-workdir-janitor disabled")
-		return nil
-	}
 
 	// 2.7 maintenance mutex — defer the whole wipe cycle while any
 	// deliberate maintenance is in flight (cordon/drain, kured
@@ -252,7 +253,7 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	// in-package copy wrapped each call separately; an aggregate
 	// bound is strictly tighter and avoids growing a
 	// per-call-timeout variant of the shared API).
-	mctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
+	mctx, cancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
 	held, why, err := kube.MaintenanceActive(mctx, j.cs, j.dyn)
 	cancel()
 	if err != nil {
@@ -265,7 +266,7 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 	}
 
 	// Whole-run bound — replaces the CronJob's activeDeadlineSeconds.
-	ctx, cancel = context.WithTimeout(ctx, j.runTimeout)
+	ctx, cancel = context.WithTimeout(ctx, j.cfg.runTimeout)
 	defer cancel()
 
 	// ATC login is fail-open: on any failure land/drain/prune are
@@ -360,11 +361,11 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 	// serving builds anyway. Once the window passes the guard lifts so
 	// a wedged-not-Ready pod can still be replaced (bash had no such
 	// guard; an interrupted CronJob could thrash the same pod).
-	if !kube.PodReadyCond(pod) && time.Since(pod.CreationTimestamp.Time) < j.readyTimeout {
+	if !kube.PodReadyCond(pod) && j.now.Now().Sub(pod.CreationTimestamp.Time) < j.cfg.readyTimeout {
 		log.Info("SKIP: not Ready after creation — mid init-rm",
 			"pod", podName,
-			"createdAgo", time.Since(pod.CreationTimestamp.Time).Truncate(time.Minute),
-			"readyTimeout", j.readyTimeout)
+			"createdAgo", j.now.Now().Sub(pod.CreationTimestamp.Time).Truncate(time.Minute),
+			"readyTimeout", j.cfg.readyTimeout)
 		return false, nil
 	}
 
@@ -434,14 +435,14 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 // the expected steady state, not a drain in progress.
 func (j *concourseWorkdirJanitor) drain(ctx context.Context, podName string, log logr.Logger) {
 	log.Info("=== land-worker ===", "pod", podName)
-	bound := j.drainTimeout
+	bound := j.cfg.drainTimeout
 	if err := j.atc.landWorker(ctx, podName); err != nil {
 		log.Info("WARN: land-worker failed", "pod", podName, "error", err)
-		bound = j.landFailWait
+		bound = j.cfg.landFailWait
 	}
 	dctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
-	err := wait.PollUntilContextCancel(dctx, j.slowPoll, true,
+	err := wait.PollUntilContextCancel(dctx, j.cfg.slowPoll, true,
 		func(ctx context.Context) (bool, error) {
 			// "" only means drained when the ATC call SUCCEEDED — an
 			// errored poll keeps waiting (up to the bound), so a
@@ -466,13 +467,13 @@ func (j *concourseWorkdirJanitor) drain(ctx context.Context, podName string, log
 // (bounded by pruneStateWait) until it settles instead of deciding
 // on a single laggy read.
 func (j *concourseWorkdirJanitor) maybePruneWorker(ctx context.Context, podName string, log logr.Logger) {
-	pctx, cancel := context.WithTimeout(ctx, j.pruneStateWait)
+	pctx, cancel := context.WithTimeout(ctx, j.cfg.pruneStateWait)
 	defer cancel()
 	var st string
 	var lastErr error
 	// The first check is immediate; a timeout just means the last
 	// read stands — the decision below uses it either way.
-	_ = wait.PollUntilContextCancel(pctx, j.fastPoll, true,
+	_ = wait.PollUntilContextCancel(pctx, j.cfg.fastPoll, true,
 		func(ctx context.Context) (bool, error) {
 			s, err := j.atc.workerState(ctx, podName)
 			if err != nil {

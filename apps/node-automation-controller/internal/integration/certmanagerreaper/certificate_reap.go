@@ -11,12 +11,14 @@ import (
 	"context"
 	"time"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 )
 
 // certReady reports whether the Certificate's Ready condition is True.
@@ -141,19 +143,37 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		log.Error(err, "challenge list failed", "cert", key)
 		return false
 	}
-	if !stuckChallengeForOrder(stuck, chals.Items, now) {
-		log.Info("KEEP: pending order but no wedged challenge — "+
-			"issuance still progressing", "cert", key, "order", stuck.GetName())
-		return false
-	}
 
-	log.Info("RESET: deleting stuck pending Order — cert-manager recreates fresh",
-		"cert", key, "order", stuck.GetName())
-	stuckUID := stuck.GetUID()
-	if err := r.dyn.Resource(orderGVR).Namespace(ns).
-		Delete(ctx, stuck.GetName(), kube.UIDDeleteOptions(stuckUID, "")); err != nil {
-		metrics.IncError(r.queue)
-		log.Error(err, "order delete failed", "cert", key, "order", stuck.GetName())
+	// The wedged-challenge cross-check rides the sweep's Confirm
+	// phase — the live re-vet right before the delete. A pending
+	// Order with no wedged Challenge is kept (issuance still
+	// progressing); the delete itself is UID-preconditioned on the
+	// object the list vetted.
+	deleted, _, _ := reap.Sweep(ctx, log, []*unstructured.Unstructured{stuck},
+		reap.Options[*unstructured.Unstructured]{
+			Confirm: func(ctx context.Context, o *unstructured.Unstructured) (bool, error) {
+				if !stuckChallengeForOrder(o, chals.Items, now) {
+					log.Info("KEEP: pending order but no wedged challenge — "+
+						"issuance still progressing", "cert", key, "order", o.GetName())
+					return false, nil
+				}
+				return true, nil
+			},
+			LogTarget: func(log logr.Logger, o *unstructured.Unstructured) {
+				log.Info("RESET: deleting stuck pending Order — "+
+					"cert-manager recreates fresh",
+					"cert", key, "order", o.GetName())
+			},
+			Delete: func(ctx context.Context, o *unstructured.Unstructured) error {
+				return r.dyn.Resource(orderGVR).Namespace(ns).
+					Delete(ctx, o.GetName(), kube.UIDDeleteOptions(o.GetUID(), ""))
+			},
+			OnError: func(log logr.Logger, o *unstructured.Unstructured, err error) {
+				metrics.IncError(r.queue)
+				log.Error(err, "order delete failed", "cert", key, "order", o.GetName())
+			},
+		})
+	if deleted == 0 {
 		return false
 	}
 	st.total++

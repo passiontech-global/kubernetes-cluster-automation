@@ -7,11 +7,8 @@ package datastore
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"io"
-	"maps"
 	"regexp"
 	"sort"
 	"strings"
@@ -40,20 +37,17 @@ type scyllaHealthCheck struct {
 	//     scyllaSignatureMinAge before the gauge fires (the
 	//     degraded_condition reason carries its own clock — the CR
 	//     condition's lastTransitionTime). Pruned on resolve.
-	//   - scyllaEmitted: "ns/cluster/reason" gauge tuples held at 1 —
-	//     same DeleteLabelValues hygiene as the other emitted sets.
+	//   - scyllaEmitted: the emitted-gauge ledger for the
+	//     "ns/cluster/reason" tuples held at 1 — same
+	//     DeleteLabelValues hygiene as the other emitted sets.
 	scyllaFirstSeen state.FirstSeenLedger
-	scyllaEmitted   map[string]bool
+	scyllaEmitted   state.GaugeLedger[string]
 }
 
-// newScyllaHealthCheck builds the W9-ST1 check — the first-seen
-// ledger arms lazily; only the emitted-series map needs the
-// explicit initialization that used to live in the monolithic
-// newClusterHealthProber literal.
+// newScyllaHealthCheck builds the W9-ST1 check — both ledgers arm
+// lazily on first use (the GaugeLedger zero value is ready).
 func NewScyllaHealthCheck(d *probefw.Deps) probefw.Check {
-	return &scyllaHealthCheck{Deps: d,
-		scyllaEmitted: map[string]bool{},
-	}
+	return &scyllaHealthCheck{Deps: d}
 }
 
 const (
@@ -142,33 +136,19 @@ func scyllaPodTroubled(pod *corev1.Pod) bool {
 // pod's "scylla" container and reports whether any line matches a
 // gossip/raft stall signature. Bounded to 8s / scyllaGossipLogMaxBytes
 // (same posture as the coredns watchdog's log probe); a stream/read
-// failure is inconclusive — returned as an error so the caller logs
-// it rather than reading "no match" as "healthy".
+// failure is inconclusive — PodLogTail returns it as an error so the
+// caller logs it rather than reading "no match" as "healthy".
 func (p *scyllaHealthCheck) scyllaGossipLogHit(ctx context.Context, pod *corev1.Pod) (bool, error) {
-	lctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	defer cancel()
-	tail := scyllaGossipTailLines
-	stream, err := p.CS.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name,
-		&corev1.PodLogOptions{
-			Container: scyllaContainerName,
-			TailLines: &tail,
-		}).Stream(lctx)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = stream.Close() }()
-	data, err := io.ReadAll(io.LimitReader(stream, scyllaGossipLogMaxBytes))
-	if err != nil {
-		return false, err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		for _, re := range scyllaGossipPatterns {
-			if re.MatchString(line) {
-				return true, nil
+	return probefw.PodLogTail(ctx, p.CS, pod, scyllaContainerName,
+		scyllaGossipTailLines, scyllaGossipLogMaxBytes, 8*time.Second,
+		func(line string) bool {
+			for _, re := range scyllaGossipPatterns {
+				if re.MatchString(line) {
+					return true
+				}
 			}
-		}
-	}
-	return false, nil
+			return false
+		})
 }
 
 // checkScyllaHealth audits the ScyllaDB operand stack on the three
@@ -194,14 +174,10 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	// The CR scan needs dyn — a missing client is a wiring bug, not
 	// "no signal" (same posture as the OLM check).
-	if p.Dyn == nil {
-		return probefw.Result{Infra: errors.New(
-			"no dynamic client — scylla health check unverifiable")}
+	if r := p.RequireDyn("scylla health check"); r != nil {
+		return *r
 	}
 	now := p.Now()
-	if p.scyllaEmitted == nil {
-		p.scyllaEmitted = map[string]bool{}
-	}
 
 	// pending: signatures still inside their persistence window,
 	// keyed for first-seen tracking. emittedKeys collect the gauge
@@ -348,37 +324,16 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 		return ok
 	})
 	for k, f := range pending {
-		first, tracked := p.scyllaFirstSeen.Observe(k, now)
-		if !tracked {
-			log.Info("scylla unhealthy signature — tracking first-seen",
-				"signature", k)
-			continue
+		if probefw.Persisted(&p.scyllaFirstSeen, k, now,
+			scyllaSignatureMinAge, log) {
+			emitted[f.ns+"/"+f.cluster+"/"+f.reason] = f
 		}
-		if now.Sub(first) < scyllaSignatureMinAge {
-			continue
-		}
-		emitted[f.ns+"/"+f.cluster+"/"+f.reason] = f
 	}
-	for k := range p.scyllaEmitted {
-		if _, ok := emitted[k]; ok {
-			continue
-		}
-		if parts := strings.SplitN(k, "/", 3); len(parts) == 3 {
-			metrics.ScyllaClusterUnhealthy.DeleteLabelValues(
-				parts[0], parts[1], parts[2])
-		}
-		delete(p.scyllaEmitted, k)
+	for k, f := range emitted {
+		p.scyllaEmitted.Set(metrics.ScyllaClusterUnhealthy, 1,
+			k, f.ns, f.cluster, f.reason)
 	}
-	emittedKeys := make(map[string]bool, len(emitted))
-	for k := range emitted {
-		emittedKeys[k] = true
-	}
-	maps.Copy(p.scyllaEmitted, emittedKeys)
-
-	for _, f := range emitted {
-		metrics.ScyllaClusterUnhealthy.
-			WithLabelValues(f.ns, f.cluster, f.reason).Set(1)
-	}
+	p.scyllaEmitted.Prune(metrics.ScyllaClusterUnhealthy.DeleteLabelValues)
 
 	if len(emitted) == 0 {
 		return probefw.Result{Pass: true}

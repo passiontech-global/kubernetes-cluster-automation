@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -146,8 +147,10 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 		} else {
 			clearKeep[n.Name] = true
 			if tainted {
-				first, _ := p.clear.Observe(n.Name, now)
-				if now.Sub(first) >= cpuStealClearMinAge {
+				// Quiet site: the clear window logs only on the
+				// untaint itself, not on every observed sweep.
+				if probefw.Persisted(&p.clear, n.Name, now,
+					cpuStealClearMinAge, logr.Discard()) {
 					if err := kube.UntaintNode(ctx, p.CS, n.Name, kube.TaintCPUSteal); err != nil {
 						metrics.IncError(p.Name)
 						log.Error(err, "cpu-steal untaint failed", "node", n.Name)

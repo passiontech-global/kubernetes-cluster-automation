@@ -165,18 +165,19 @@ func cjReplaceOnDelete(cs *fake.Clientset, events *[]string, ready bool) {
 func cjTestJanitor(cs *fake.Clientset, st nodeStatsReader, atc atcIface) *concourseWorkdirJanitor {
 	return &concourseWorkdirJanitor{queue: "concourse-workdir-janitor",
 		cs: cs, stats: st, atc: atc,
-		enabled:        true,
-		dyn:            cjPlanDynFake(),
-		runTimeout:     10 * time.Second,
-		reqTimeout:     10 * time.Second,
-		drainTimeout:   50 * time.Millisecond,
-		landFailWait:   10 * time.Millisecond,
-		pruneStateWait: 10 * time.Millisecond,
-		deleteTimeout:  100 * time.Millisecond,
-		uidPollTimeout: 100 * time.Millisecond,
-		readyTimeout:   100 * time.Millisecond,
-		fastPoll:       time.Millisecond,
-		slowPoll:       time.Millisecond,
+		dyn: cjPlanDynFake(),
+		cfg: cjConfig{
+			runTimeout:     10 * time.Second,
+			reqTimeout:     10 * time.Second,
+			drainTimeout:   50 * time.Millisecond,
+			landFailWait:   10 * time.Millisecond,
+			pruneStateWait: 10 * time.Millisecond,
+			deleteTimeout:  100 * time.Millisecond,
+			uidPollTimeout: 100 * time.Millisecond,
+			readyTimeout:   100 * time.Millisecond,
+			fastPoll:       time.Millisecond,
+			slowPoll:       time.Millisecond,
+		},
 	}
 }
 
@@ -192,14 +193,6 @@ func cjPod(t *testing.T, cs *fake.Clientset, name string) *corev1.Pod {
 // ---------------------------------------------------------------------------
 // Module tests
 // ---------------------------------------------------------------------------
-
-// Disabled: the tick logs and returns without touching anything.
-func TestConcourseJanitorDisabled(t *testing.T) {
-	j := &concourseWorkdirJanitor{queue: "concourse-workdir-janitor", enabled: false}
-	if err := j.run(ctx); err != nil {
-		t.Fatal(err)
-	}
-}
 
 // 2.7 maintenance mutex — any positive signal defers the whole wipe
 // cycle before ATC login: no land, no stats, no delete. Signals
@@ -617,8 +610,8 @@ func TestConcourseJanitorLandFailShortensDrain(t *testing.T) {
 	j := cjTestJanitor(cs, st, atc)
 	// If the failed-land path used drainTimeout the run would stall
 	// for this full window; landFailWait must bound it instead.
-	j.drainTimeout = 5 * time.Second
-	j.landFailWait = 20 * time.Millisecond
+	j.cfg.drainTimeout = 5 * time.Second
+	j.cfg.landFailWait = 20 * time.Millisecond
 	start := time.Now()
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
@@ -667,7 +660,7 @@ func TestConcourseJanitorPruneWaitsForStateSettle(t *testing.T) {
 			return "landed", nil
 		}}
 	j := cjTestJanitor(cs, st, atc)
-	j.pruneStateWait = 50 * time.Millisecond
+	j.cfg.pruneStateWait = 50 * time.Millisecond
 	if err := j.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -732,7 +725,7 @@ func TestConcourseJanitorATCCredentials(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Namespace: cjNamespace, Name: cjSecretName},
 				Data:       tc.data,
 			})
-			j := &concourseWorkdirJanitor{queue: "concourse-workdir-janitor", cs: cs, reqTimeout: 10 * time.Second}
+			j := &concourseWorkdirJanitor{queue: "concourse-workdir-janitor", cs: cs, cfg: cjConfig{reqTimeout: 10 * time.Second}}
 			u, p, err := j.atcCredentials(ctx)
 			if tc.wantErr {
 				if err == nil {
@@ -747,7 +740,7 @@ func TestConcourseJanitorATCCredentials(t *testing.T) {
 	}
 	// Missing secret object entirely → error → flyOK=false.
 	cs := fake.NewSimpleClientset()
-	j := &concourseWorkdirJanitor{queue: "concourse-workdir-janitor", cs: cs, reqTimeout: 10 * time.Second}
+	j := &concourseWorkdirJanitor{queue: "concourse-workdir-janitor", cs: cs, cfg: cjConfig{reqTimeout: 10 * time.Second}}
 	if _, _, err := j.atcCredentials(ctx); err == nil {
 		t.Fatal("expected error for missing secret")
 	}

@@ -40,10 +40,6 @@ var (
 
 type konnectivityPatcher struct {
 	cs kubernetes.Interface
-	// queue is the module's ops name — stamped from Deps.Name (the
-	// registry row) so the controller name and every IncError label
-	// come from one place.
-	queue string
 }
 
 // onlyKonnectivityDaemonSet is the exact predicate the For() watch
@@ -55,10 +51,14 @@ var onlyKonnectivityDaemonSet = pinnedworkload.OnlyNamespacedName("kube-system",
 // DaemonSet (the informer is already field-scoped to it via the
 // manager cache; the predicate is a cheap belt on top).
 func Setup(d shared.Deps) error {
+	r := &konnectivityPatcher{cs: d.CS}
+	// CountReconcile owns the returned-error accounting — one
+	// IncError per non-nil Reconcile return; the reconcile body
+	// never IncErrors an error it returns.
 	return ctrl.NewControllerManagedBy(d.Mgr).
 		Named(d.Name).
 		For(&appsv1.DaemonSet{}, builder.WithPredicates(onlyKonnectivityDaemonSet)).
-		Complete(&konnectivityPatcher{cs: d.CS, queue: d.Name})
+		Complete(shared.CountReconcile(d.Name, r.Reconcile))
 }
 
 // Reconcile delegates to the shared pinned-DaemonSet skeleton — this
@@ -67,7 +67,6 @@ func Setup(d shared.Deps) error {
 func (r *konnectivityPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	return pinnedworkload.DaemonSetSpec{
 		CS:         r.cs,
-		Queue:      r.queue,
 		Namespace:  "kube-system",
 		Name:       "konnectivity-agent",
 		Container:  "konnectivity-agent",

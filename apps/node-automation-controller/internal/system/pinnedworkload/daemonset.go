@@ -4,7 +4,9 @@
 // strategic-merge Patch → 15m requeue. Same shape as DeploymentSpec
 // minus the replica pin, plus the Settled gate a DaemonSet needs —
 // patching mid-rollout would stack a second rolling restart (the
-// double flap the bash hook avoided).
+// double flap the bash hook avoided). Returned errors are counted
+// once by the shared.CountReconcile wrapper at the module's
+// builder.Complete — never IncError here (that would double-count).
 package pinnedworkload
 
 import (
@@ -19,7 +21,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -28,9 +29,6 @@ type DaemonSetSpec struct {
 	// CS is the direct (uncached) clientset — module reads go through
 	// it, not the manager cache.
 	CS kubernetes.Interface
-	// Queue is the module's ops name — every metrics.IncError label
-	// comes from it.
-	Queue string
 	// Namespace/Name locate the pinned DaemonSet — they also fill the
 	// "daemonset" log key and every wrapped error string.
 	Namespace string
@@ -61,8 +59,9 @@ type DaemonSetSpec struct {
 // Reconcile is the pinned-DaemonSet reconcile loop: get → skip on
 // NotFound → patch only on drift, and only once the rollout has
 // settled. NotFound, no-drift and the skip paths return nil on the
-// 15m requeue; every other failure IncErrors Queue once and returns
-// the error for workqueue backoff.
+// 15m requeue; every other failure returns the error for workqueue
+// backoff — the shared.CountReconcile wrapper at the module's
+// builder.Complete IncErrors it exactly once.
 func (s DaemonSetSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	res := ctrl.Result{RequeueAfter: RequeueInterval}
@@ -76,7 +75,6 @@ func (s DaemonSetSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 		return res, nil
 	}
 	if err != nil {
-		metrics.IncError(s.Queue)
 		return ctrl.Result{}, fmt.Errorf("get daemonset %s: %w", ref, err)
 	}
 
@@ -111,7 +109,6 @@ func (s DaemonSetSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	if _, err := s.CS.AppsV1().DaemonSets(s.Namespace).Patch(ctx,
 		s.Name, types.StrategicMergePatchType,
 		s.Patch, metav1.PatchOptions{}); err != nil {
-		metrics.IncError(s.Queue)
 		return ctrl.Result{}, fmt.Errorf("patch daemonset %s: %w", ref, err)
 	}
 	return res, nil

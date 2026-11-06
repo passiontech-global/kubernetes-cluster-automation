@@ -1,32 +1,38 @@
-// apiservice-guard — 2.3, the aggregated APIService watchdog +
-// fail-closed orphan reaper (apiregistration.k8s.io/v1).
+// apiservice_guard.go — apiservice-guard, the aggregated APIService
+// watchdog + fail-closed orphan reaper (apiregistration.k8s.io/v1).
 //
 // An aggregated APIService whose spec.service.namespace no longer
 // exists is worse than dead weight: the orphaned object keeps
 // wedging the namespace-terminating controller and the garbage
 // collector (the apiservice still advertises a live Service backend
 // that can never resolve — the same fail-closed shape as the
-// admission webhook orphans this package already reaps, incident
+// admission webhook orphans webhookguard already reaps, incident
 // 2026-10-20).
 //
-// Two independent duties per 5m sweep:
+// Three independent duties per 5m sweep, one file each behind the
+// apiServiceGuard facade (same split shape as webhookguard):
 //
-//	(a) Fail-closed orphan cleanup. The Namespace list is the ONLY
-//	    source of "deleted" truth and is snapshotted first — an
-//	    error or an EMPTY list aborts the deletion pass before
-//	    anything is touched (an API flap must never read as
-//	    "namespace deleted"). Only APIServices with spec.service
-//	    set are candidates; when the referenced namespace is
-//	    absent from the snapshot the guard re-confirms with a
-//	    direct Namespaces().Get — only an IsNotFound verdict
+//	(a) orphan_sweep.go — fail-closed orphan cleanup. The Namespace
+//	    list is the ONLY source of "deleted" truth and is
+//	    snapshotted first — an error or an EMPTY list aborts the
+//	    deletion pass before anything is touched (an API flap must
+//	    never read as "namespace deleted"). Only APIServices with
+//	    spec.service set are candidates; when the referenced
+//	    namespace is absent from the snapshot the guard re-confirms
+//	    with a direct Namespaces().Get — only an IsNotFound verdict
 //	    deletes the object.
-//	(b) Availability watchdog. An APIService holding
-//	    Available=False for longer than apiServiceUnavailMinAge
-//	    (measured from the condition's lastTransitionTime) exports
+//	(b) availability_watch.go — the availability watchdog. An
+//	    APIService holding Available=False for longer than
+//	    apiServiceUnavailMinAge (measured from the condition's
+//	    lastTransitionTime) exports
 //	    node_automation_apiservice_unavailable{name,
 //	    service_namespace, service_name}=1. A seen-set prunes
 //	    series whose APIService recovered or vanished — a stale
 //	    label tuple must not pin the alert forever.
+//	(c) unblock_heal.go — the W10-CP1 dead-APIService unblocker:
+//	    a protected-namespace APIService wedging a Terminating
+//	    namespace gets its backing pods restarted (maintenance-
+//	    gated, UID-preconditioned, capped).
 //
 // apiregistration.k8s.io has no in-tree typed client, so all
 // APIService access goes through the dynamic client; the typed
@@ -37,41 +43,23 @@ package apiserviceguard
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
-	apiServiceGuardInterval  = 5 * time.Minute
-	apiServiceUnavailMinAge  = 10 * time.Minute
+	apiServiceGuardInterval = 5 * time.Minute
+
 	apiServiceAvailableCond  = "Available"
 	apiServiceConditionFalse = "False"
-
-	// W10-CP1 — dead-APIService unblocker. An aggregated APIService
-	// in a protected namespace that stays Available=False wedges
-	// every namespace termination whose GC still references its API
-	// group. The unblock pass is the ONLY path allowed to restart
-	// those backends, and only when the wedge is proven: unavailable
-	// >=15m AND a namespace stuck Terminating >=15m whose
-	// conditions/events name the group.
-	apiServiceUnblockMinAge   = 15 * time.Minute
-	apiServiceUnblockPodCap   = 10
-	apiServiceUnblockCooldown = 15 * time.Minute
 
 	// apiServiceListPageSize bounds each List page — continue-token
 	// pagination keeps a large APIService/event set from arriving as
@@ -79,24 +67,24 @@ const (
 	apiServiceListPageSize = kube.DefaultListPageSize
 )
 
-// apiServiceProtectedNamespaces is the plan's skipNamespaces set —
-// APIServices backed in these namespaces are core-ish infra the
-// guard otherwise never touches. Membership here does NOT skip the
-// availability metric; it scopes which backends the unblock healer
-// may restart.
-var apiServiceProtectedNamespaces = map[string]bool{
-	"kube-system": true,
-	"linkerd":     true,
-	"linkerd-viz": true,
-	"monitoring":  true,
-}
-
 // apiServiceGVR is the apiregistration.k8s.io/v1 APIService resource —
 // cluster-scoped, no typed client in client-go.
 var apiServiceGVR = kube.GVRAPIService
 
+// apiServiceGuard is the facade behind the single "apiservice-guard"
+// periodic: it owns the shared clients, the clock seam and the
+// maintenance-mutex verdict, and embeds the three independent duties
+// — orphanSweep, availabilityWatch and unblockHealer — each of which
+// owns only its own state. run() invokes them in a fixed order
+// through the promoted methods, so the externally visible contract
+// (queue name, interval, metric series) is unchanged by the split.
 type apiServiceGuard struct {
-	cs  kubernetes.Interface
+	cs kubernetes.Interface
+	// dyn lists the APIServices every duty consumes AND feeds the
+	// autopilot-Plan signal of the maintenance mutex the unblock
+	// healer gates on. A nil dyn makes the Plan check unverifiable,
+	// which the mutex reports as an error: unverifiable fails
+	// closed, never a silently-narrowed check.
 	dyn dynamic.Interface
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
@@ -105,15 +93,19 @@ type apiServiceGuard struct {
 	// now is the clock seam — tests pin it so the >10m
 	// unavailable window is deterministic. nil → time.Now.
 	now shared.Clock
-	// emitted is the ledger of APIServiceUnavailable label tuples
-	// ("name/service_namespace/service_name") held at =1 — a tuple
-	// not re-seen this sweep gets its series deleted via
-	// DeleteLabelValues (same seen-set hygiene as brokenEmitted).
-	emitted state.GaugeLedger[string]
-	// unblocked is "<apiservice name>" -> last unblock-heal time —
-	// bounds restart churn on a backend that wedges again right
-	// after its pods are recreated.
-	unblocked state.CooldownSet
+	// verdict memoizes the maintenance-mutex evaluation the unblock
+	// healer's per-target heal preambles share within a run — one
+	// evaluation per Verdict TTL instead of three API reads per
+	// candidate.
+	verdict kube.Verdict
+
+	// The three duties share cs/dyn/now through snap.g and hand
+	// each other nothing else; embedding keeps the guard's method
+	// set — and every in-package test fixture — stable across the
+	// split.
+	orphanSweep
+	availabilityWatch
+	unblockHealer
 }
 
 // Setup registers the 5-minute sweep. Disabled
@@ -130,140 +122,45 @@ func Setup(d shared.Deps) error {
 	return shared.AddPeriodic(mgr, g.queue, apiServiceGuardInterval, g.run)
 }
 
+// apiServiceSnapshot carries the cluster state one run shares across
+// its duties: all three read the same APIService set, so it is
+// listed ONCE per run instead of once per consumer. A list failure
+// is recorded on the snapshot, not returned — every duty still
+// decides for itself whether the missing piece aborts it
+// (fail-closed source) or merely skips a check.
+type apiServiceSnapshot struct {
+	g    *apiServiceGuard
+	svcs *unstructured.UnstructuredList
+	err  error
+}
+
+// takeSnapshot lists the shared APIService set once — see
+// apiServiceSnapshot.
+func (g *apiServiceGuard) takeSnapshot(ctx context.Context) *apiServiceSnapshot {
+	items, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: apiServiceListPageSize},
+		kube.DynamicPage(g.dyn.Resource(apiServiceGVR)))
+	return &apiServiceSnapshot{
+		g:    g,
+		svcs: &unstructured.UnstructuredList{Items: items},
+		err:  err,
+	}
+}
+
 func (g *apiServiceGuard) run(ctx context.Context) error {
 	// No lazy arming: a nil Clock reads as system time and the
 	// GaugeLedger/CooldownSet bookkeeping zero values are ready to
 	// use, so unit tests can construct the guard literally without
 	// the Setup path.
-	// The orphan sweep and the availability watchdog are
-	// independent duties — a failure in one must never blind the
-	// other, so both run and their errors join (nil+nil → nil). Both
-	// read the same APIService set, so it is listed ONCE per run and
-	// shared; a list failure is handed to each duty separately
-	// (either may still act on the parts it does not need).
-	svcItems, svcsErr := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: apiServiceListPageSize},
-		kube.DynamicPage(g.dyn.Resource(apiServiceGVR)))
-	svcs := &unstructured.UnstructuredList{Items: svcItems}
-	orphanErr := g.sweepOrphans(ctx, svcs, svcsErr)
-	watchErr := g.sweepAvailability(ctx, svcs, svcsErr)
-	unblockErr := g.sweepUnblock(ctx, svcs, svcsErr)
+	// The orphan sweep, the availability watchdog and the unblock
+	// healer are independent duties — a failure in one must never
+	// blind the others, so all run and their errors join
+	// (nil+nil+nil → nil).
+	snap := g.takeSnapshot(ctx)
+	orphanErr := g.sweepOrphans(ctx, snap)
+	watchErr := g.sweepAvailability(ctx, snap)
+	unblockErr := g.sweepUnblock(ctx, snap)
 	return errors.Join(orphanErr, watchErr, unblockErr)
-}
-
-// ---------------------------------------------------------------------------
-// (a) Fail-closed orphan cleanup.
-// ---------------------------------------------------------------------------
-
-// sweepOrphans consumes the shared per-run APIService snapshot — a
-// list error is delivered via svcsErr (recorded by run, not returned
-// there) so this pass can still abort itself while the watchdog
-// reports its own verdict on the same failure.
-func (g *apiServiceGuard) sweepOrphans(ctx context.Context, svcs *unstructured.UnstructuredList, svcsErr error) error {
-	log := logf.FromContext(ctx)
-
-	// Namespace snapshot — the ONLY source of "deleted" truth. An
-	// error aborts the whole pass; an EMPTY list means the
-	// apiserver/RBAC lied (every APIService would look orphaned), so
-	// the pass skips itself without failing the run — the
-	// availability watchdog still evaluates.
-	nss, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: apiServiceListPageSize},
-		kube.Namespaces(g.cs))
-	if err != nil {
-		return fmt.Errorf("list namespaces (API flap) — abort orphan pass: %w", err)
-	}
-	if len(nss) == 0 {
-		log.Info("WARN: empty namespace list (API flap) — orphan pass skipped")
-		return nil
-	}
-	namespaces := make(map[string]bool, len(nss))
-	for _, ns := range nss {
-		namespaces[ns.Name] = true
-	}
-	if svcsErr != nil {
-		return fmt.Errorf("list apiservices — abort orphan pass: %w", svcsErr)
-	}
-
-	deleted := 0
-	for i := range svcs.Items {
-		svc := &svcs.Items[i]
-		svcNs, svcName, ok := apiServiceBackend(svc)
-		if !ok {
-			continue // no Service backend — nothing to orphan-check
-		}
-		if namespaces[svcNs] {
-			continue
-		}
-		// The snapshot says the namespace is gone — but a List can be
-		// stale where a Get is fresh, so the delete only fires after
-		// the apiserver itself confirms NotFound (fail closed).
-		_, getErr := g.cs.CoreV1().Namespaces().Get(ctx, svcNs, metav1.GetOptions{})
-		gone, err := kube.ConfirmAbsent(getErr)
-		if err != nil {
-			log.Info("WARN: namespace confirm failed — APIService kept (fail closed)",
-				"apiservice", svc.GetName(), "namespace", svcNs, "error", err)
-			metrics.IncError(g.queue)
-			continue
-		}
-		if !gone {
-			// Namespace actually exists — the snapshot was stale.
-			continue
-		}
-		log.Info("DELETE: orphan APIService (backend namespace gone)",
-			"apiservice", svc.GetName(), "service", svcNs+"/"+svcName)
-		// UID precondition closes the TOCTOU window between the
-		// IsNotFound re-confirm and the delete — a same-named
-		// APIService recreated in between is not ours to reap.
-		uid := svc.GetUID()
-		if err := g.dyn.Resource(apiServiceGVR).
-			Delete(ctx, svc.GetName(), kube.UIDDeleteOptions(uid, "")); err != nil {
-			log.Error(err, "orphan apiservice delete failed",
-				"apiservice", svc.GetName())
-			metrics.IncError(g.queue)
-			continue
-		}
-		deleted++
-	}
-	log.Info("orphan pass done", "deleted", deleted, "apiservices", len(svcs.Items))
-	return nil
-}
-
-// ---------------------------------------------------------------------------
-// (b) Availability watchdog.
-// ---------------------------------------------------------------------------
-
-// sweepAvailability consumes the same per-run snapshot — a list error
-// is delivered via svcsErr and aborts only this duty (the orphan pass
-// above already ran its own verdict).
-func (g *apiServiceGuard) sweepAvailability(ctx context.Context, svcs *unstructured.UnstructuredList, svcsErr error) error {
-	log := logf.FromContext(ctx)
-	if svcsErr != nil {
-		return fmt.Errorf("list apiservices — watchdog skipped: %w", svcsErr)
-	}
-
-	now := g.now.Now()
-	for i := range svcs.Items {
-		svc := &svcs.Items[i]
-		unavailSince, ok := apiServiceUnavailableSince(svc)
-		if !ok || now.Sub(unavailSince) < apiServiceUnavailMinAge {
-			continue
-		}
-		svcNs, svcName, _ := apiServiceBackend(svc)
-		g.emitted.Emit(svc.GetName()+"/"+svcNs+"/"+svcName,
-			svc.GetName(), svcNs, svcName)
-		metrics.APIServiceUnavailable.
-			WithLabelValues(svc.GetName(), svcNs, svcName).Set(1)
-		log.Info("APIService unavailable past threshold",
-			"apiservice", svc.GetName(), "service", svcNs+"/"+svcName,
-			"since", unavailSince.Format(time.RFC3339))
-	}
-
-	// Prune series whose APIService recovered or vanished — a label
-	// tuple that stops being re-asserted must not pin
-	// apiservice_unavailable=1 forever.
-	g.emitted.Prune(metrics.APIServiceUnavailable.DeleteLabelValues)
-	return nil
 }
 
 // apiServiceBackend returns the APIService's spec.service
@@ -281,165 +178,14 @@ func apiServiceBackend(u *unstructured.Unstructured) (namespace, name string, ok
 // apiServiceUnavailableSince returns the Available=False condition's
 // lastTransitionTime — ok=false when the condition is absent, not
 // False, or the timestamp is unparseable (an APIService with no
-// provable failure age is never flagged).
+// provable failure age is never flagged). Shared by the availability
+// watchdog (10m window) and the unblock healer (15m window).
 func apiServiceUnavailableSince(u *unstructured.Unstructured) (time.Time, bool) {
 	c, ok := kube.ConditionOf(u.Object, apiServiceAvailableCond)
 	if !ok || c.Status != apiServiceConditionFalse || c.LastTransitionTime.IsZero() {
 		return time.Time{}, false
 	}
 	return c.LastTransitionTime, true
-}
-
-// ---------------------------------------------------------------------------
-// (c) W10-CP1 — dead-APIService unblocker.
-// ---------------------------------------------------------------------------
-
-// sweepUnblock consumes the same per-run snapshot. It heals ONLY the
-// protected-namespace backends (the plan's skipNamespaces set) and
-// ONLY when the wedge is proven end-to-end:
-//
-//	spec.service.namespace in apiServiceProtectedNamespaces
-//	AND Available=False for >= apiServiceUnblockMinAge (15m)
-//	AND >=1 Namespace stuck Terminating >=15m whose conditions or
-//	    events reference the APIService's API group.
-//
-// The heal is a backing-pod restart: the aggregated-apiserver pods
-// behind spec.service are deleted (UID-preconditioned, capped) so
-// their controllers recreate them — the least destructive action
-// that clears a wedged aggregation without touching the
-// operator-owned APIService object itself.
-func (g *apiServiceGuard) sweepUnblock(ctx context.Context, svcs *unstructured.UnstructuredList, svcsErr error) error {
-	log := logf.FromContext(ctx)
-	if svcsErr != nil {
-		return fmt.Errorf("list apiservices — unblock pass skipped: %w", svcsErr)
-	}
-	now := g.now.Now()
-
-	// Candidate pass — cheap unstructured reads only; the namespace
-	// scan below is skipped entirely when nothing qualifies.
-	type candidate struct {
-		svc   *unstructured.Unstructured
-		group string
-	}
-	var cands []candidate
-	for i := range svcs.Items {
-		svc := &svcs.Items[i]
-		unavailSince, ok := apiServiceUnavailableSince(svc)
-		if !ok || now.Sub(unavailSince) < apiServiceUnblockMinAge {
-			continue
-		}
-		svcNs, _, _ := apiServiceBackend(svc)
-		if !apiServiceProtectedNamespaces[svcNs] {
-			continue
-		}
-		group := apiServiceGroup(svc.GetName())
-		if group == "" {
-			continue // "v1." core registration — never unblocked
-		}
-		cands = append(cands, candidate{svc: svc, group: group})
-	}
-	if len(cands) == 0 {
-		return nil
-	}
-
-	// Wedge evidence: namespaces stuck Terminating >=15m, each with
-	// a lowercased corpus of its conditions + events for group
-	// matching.
-	stuck, err := g.stuckTerminatingNamespaces(ctx, now)
-	if err != nil {
-		return err
-	}
-	if len(stuck) == 0 {
-		return nil
-	}
-
-	healed := 0
-	for _, c := range cands {
-		if g.unblocked.CooledDown(c.svc.GetName(), apiServiceUnblockCooldown, now) {
-			continue
-		}
-		var refs []string
-		for ns, corpus := range stuck {
-			if strings.Contains(corpus, c.group) {
-				refs = append(refs, ns)
-			}
-		}
-		if len(refs) == 0 {
-			continue
-		}
-		svcNs, svcName, _ := apiServiceBackend(c.svc)
-		deleted, err := g.restartBackingPods(ctx, svcNs, svcName)
-		if err != nil {
-			log.Error(err, "unblock heal failed",
-				"apiservice", c.svc.GetName(), "service", svcNs+"/"+svcName)
-			metrics.IncError(g.queue)
-			continue
-		}
-		g.unblocked.Stamp(c.svc.GetName(), now)
-		healed++
-		if deleted > 0 {
-			metrics.APIServiceUnblockHealsTotal.
-				WithLabelValues(svcNs, "backing_pods_deleted").Inc()
-		}
-		log.Info("ACTION: unblocked dead APIService wedging namespace termination",
-			"apiservice", c.svc.GetName(), "group", c.group,
-			"service", svcNs+"/"+svcName,
-			"terminatingNamespaces", refs, "podsDeleted", deleted)
-	}
-	return nil
-}
-
-// stuckTerminatingNamespaces returns "<ns name>" -> lowercased
-// reference corpus (conditions + events) for every namespace that
-// has been in phase Terminating for >= apiServiceUnblockMinAge. A
-// namespace without a deletionTimestamp cannot prove its age — it
-// is skipped (fail closed).
-func (g *apiServiceGuard) stuckTerminatingNamespaces(ctx context.Context, now time.Time) (map[string]string, error) {
-	log := logf.FromContext(ctx)
-	nss, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: apiServiceListPageSize},
-		kube.Namespaces(g.cs))
-	if err != nil {
-		return nil, fmt.Errorf("list namespaces (unblock pass): %w", err)
-	}
-	out := map[string]string{}
-	for i := range nss {
-		ns := &nss[i]
-		if ns.Status.Phase != corev1.NamespaceTerminating ||
-			ns.DeletionTimestamp == nil ||
-			now.Sub(ns.DeletionTimestamp.Time) < apiServiceUnblockMinAge {
-			continue
-		}
-		var corpus strings.Builder
-		for _, c := range ns.Status.Conditions {
-			corpus.WriteString(strings.ToLower(string(c.Type)))
-			corpus.WriteByte(' ')
-			corpus.WriteString(strings.ToLower(c.Reason))
-			corpus.WriteByte(' ')
-			corpus.WriteString(strings.ToLower(c.Message))
-			corpus.WriteByte('\n')
-		}
-		evs, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: apiServiceListPageSize},
-			kube.Events(g.cs, ns.Name))
-		if err != nil {
-			// Conditions-only corpus still carries
-			// NamespaceContentRemaining/DiscoveryFailed detail —
-			// a partial corpus beats skipping the namespace.
-			log.Info("WARN: events list failed — conditions-only corpus",
-				"namespace", ns.Name, "error", err)
-		} else {
-			for j := range evs {
-				e := &evs[j]
-				corpus.WriteString(strings.ToLower(e.Reason))
-				corpus.WriteByte(' ')
-				corpus.WriteString(strings.ToLower(e.Message))
-				corpus.WriteByte('\n')
-			}
-		}
-		out[ns.Name] = corpus.String()
-	}
-	return out, nil
 }
 
 // apiServiceGroup extracts the API group from an APIService name —
@@ -451,57 +197,4 @@ func apiServiceGroup(name string) string {
 		return ""
 	}
 	return name[idx+1:]
-}
-
-// restartBackingPods deletes the running pods selected by the
-// APIService's backing Service so their controllers recreate them —
-// the aggregated-apiserver restart that clears a wedged aggregation.
-// Capped per call; NotFound service/pod races are quiet no-ops.
-func (g *apiServiceGuard) restartBackingPods(ctx context.Context, svcNs, svcName string) (int, error) {
-	log := logf.FromContext(ctx)
-	svc, err := g.cs.CoreV1().Services(svcNs).Get(ctx, svcName, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		// The backend Service itself is gone — pod restart is
-		// impossible; the operator that owns it must recreate it.
-		log.Info("unblock heal skipped — backing service gone",
-			"service", svcNs+"/"+svcName)
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("get backing service %s/%s: %w", svcNs, svcName, err)
-	}
-	if len(svc.Spec.Selector) == 0 {
-		log.Info("unblock heal skipped — backing service has no selector",
-			"service", svcNs+"/"+svcName)
-		return 0, nil
-	}
-	pods, err := kube.ListAll(ctx, metav1.ListOptions{
-		LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
-		Limit:         apiServiceListPageSize,
-	}, kube.Pods(g.cs, svcNs))
-	if err != nil {
-		return 0, fmt.Errorf("list backing pods %s: %w", svcNs, err)
-	}
-	deleted := 0
-	for i := range pods {
-		if deleted >= apiServiceUnblockPodCap {
-			break
-		}
-		p := &pods[i]
-		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		uid := p.UID
-		if err := g.cs.CoreV1().Pods(svcNs).Delete(ctx, p.Name,
-			kube.UIDDeleteOptions(uid, "")); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			log.Error(err, "backing pod delete failed",
-				"pod", svcNs+"/"+p.Name)
-			continue
-		}
-		deleted++
-	}
-	return deleted, nil
 }

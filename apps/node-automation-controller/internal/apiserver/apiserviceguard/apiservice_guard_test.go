@@ -17,6 +17,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -52,11 +53,16 @@ func asgUnavailable(u *unstructured.Unstructured, age time.Duration) {
 	}
 }
 
+// asgDynFake registers APIServiceList (the module's own list) AND
+// PlanList — the unblock healer's maintenance mutex lists autopilot
+// Plans through the same dyn client, and the fake panics on a List
+// whose list kind is not registered.
 func asgDynFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{
-			apiServiceGVR: "APIServiceList",
+			apiServiceGVR:         "APIServiceList",
+			kube.AutopilotPlanGVR: "PlanList",
 		},
 		objs...)
 }

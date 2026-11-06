@@ -222,7 +222,7 @@ func (p *linkerdProtocolDetectionStallCheck) Run(ctx context.Context) probefw.Re
 func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.Context,
 	log logr.Logger, pod *corev1.Pod, missing []int, now time.Time) {
 
-	ck := "selfheal/" + CheckNameLinkerdOpaqueStall + "/" + pod.Namespace + "/" + pod.Name
+	ck := probefw.SelfHealKey(CheckNameLinkerdOpaqueStall, pod.Namespace+"/"+pod.Name)
 	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
 		p.CS, p.Dyn, &p.Heals, ck, linkerdOpaqueHealCool, now)
 	if unverifiable {

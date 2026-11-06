@@ -19,8 +19,8 @@ import (
 // drops it for good.
 func circuitMetrics(emitted *state.GaugeLedger[string], kind, cfgName string, trips, recovered []string) {
 	for _, n := range trips {
-		metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, n).Set(1)
-		emitted.Emit(kind+"/"+cfgName+"/"+n, kind, cfgName, n)
+		emitted.Set(metrics.WebhookCircuitBroken, 1,
+			kind+"/"+cfgName+"/"+n, kind, cfgName, n)
 		metrics.WebhookCircuitBreakerTripsTotal.WithLabelValues(kind, cfgName).Inc()
 	}
 	for _, n := range recovered {

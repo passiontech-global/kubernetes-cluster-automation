@@ -32,11 +32,13 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	// The cheap persisted-stamp cooldown runs BEFORE the mutex —
 	// same ordering healDragonflyReplicaDeadlock carries: a stamp
 	// inside the window skips the three-signal API reads entirely.
-	if t, ok := kube.AnnoTime(sig.sts, dragonflyHealAnno); ok &&
-		now.Sub(t) < dragonflyHealCooldown {
+	// Nil ledger — this heal's per-pod drHealed keys are checked
+	// inside the delete loop, not here, so the annotation half is
+	// all the preamble reads.
+	if heal.PersistedCooledDown(nil, sig.sts, dragonflyHealAnno, "",
+		dragonflyHealCooldown, now) {
 		log.Info("skip heal: persisted stamp inside cooldown",
-			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name,
-			"ago", now.Sub(t).Truncate(time.Minute))
+			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name)
 		return
 	}
 	// Maintenance mutex — never kill an operator mid-drain/upgrade;
@@ -92,17 +94,17 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 		return
 	}
 	// Persist the stamp on the STS — the durable half of the
-	// cooldown. A patch failure leaves the in-RAM half holding.
-	payload, err := kube.MergePatchAnnos(map[string]any{
-		dragonflyHealAnno: now.UTC().Format(time.RFC3339),
-	})
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Error(err, "marshal dragonfly heal stamp", "statefulset", sig.sts.Name)
-		return
-	}
-	if _, err := p.CS.AppsV1().StatefulSets(sig.sts.Namespace).Patch(ctx,
-		sig.sts.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+	// cooldown. A patch failure leaves the in-RAM half (the per-pod
+	// drHealed stamps inside DeletePod) holding; nil ledger because
+	// there is no per-STS ledger key for this heal.
+	if err := heal.StampPersisted(ctx,
+		func(ctx context.Context, data []byte) error {
+			_, err := p.CS.AppsV1().StatefulSets(sig.sts.Namespace).
+				Patch(ctx, sig.sts.Name, types.MergePatchType, data,
+					metav1.PatchOptions{})
+			return err
+		},
+		dragonflyHealAnno, nil, "", now); err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "persist dragonfly heal stamp failed",
 			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name)
@@ -206,22 +208,15 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 		return
 	}
 
-	// Gate 3 — the 30m cooldown (wider of in-RAM + persisted), then
-	// the maintenance mutex. The cooldown halves stay bespoke — no
-	// single CooldownSet key carries them — so heal.AllowedV runs
-	// with a nil ledger as the mutex-only gate (shared verdict):
+	// Gate 3 — the 30m cooldown (wider of in-RAM + persisted via
+	// PersistedCooledDown), then the maintenance mutex: heal.AllowedV
+	// runs with a nil ledger as the mutex-only gate (shared verdict):
 	// never kill a stateful pod mid-drain/upgrade; "cannot verify"
 	// fails closed like every other caller.
-	if p.drPodHealed.CooledDown(stsKey, dragonflyPodHealCooldown, now) {
+	if heal.PersistedCooledDown(&p.drPodHealed, sig.sts,
+		dragonflyPodHealAnno, stsKey, dragonflyPodHealCooldown, now) {
 		log.Info("skip heal: dragonfly pod inside cooldown",
 			"statefulset", stsKey)
-		return
-	}
-	if t, ok := kube.AnnoTime(sig.sts, dragonflyPodHealAnno); ok &&
-		now.Sub(t) < dragonflyPodHealCooldown {
-		log.Info("skip heal: persisted stamp inside cooldown",
-			"statefulset", stsKey,
-			"ago", now.Sub(t).Truncate(time.Minute))
 		return
 	}
 	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
@@ -253,17 +248,18 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 		"statefulset", stsKey, "service", sig.ns+"/"+sig.svc)
 
 	// Persist the stamp on the STS — the durable half of the
-	// cooldown. A patch failure leaves the in-RAM half holding.
-	payload, err := kube.MergePatchAnnos(map[string]any{
-		dragonflyPodHealAnno: now.UTC().Format(time.RFC3339),
-	})
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Error(err, "marshal dragonfly pod heal stamp", "statefulset", stsKey)
-		return
-	}
-	if _, err := p.CS.AppsV1().StatefulSets(sig.sts.Namespace).Patch(ctx,
-		sig.sts.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+	// cooldown. A patch failure leaves the in-RAM half holding:
+	// drPodHealed was already stamped by the delivered DeletePod, so
+	// the stamp lands nil-ledger here (delivered-only belongs to the
+	// delete, not the annotation write).
+	if err := heal.StampPersisted(ctx,
+		func(ctx context.Context, data []byte) error {
+			_, err := p.CS.AppsV1().StatefulSets(sig.sts.Namespace).
+				Patch(ctx, sig.sts.Name, types.MergePatchType, data,
+					metav1.PatchOptions{})
+			return err
+		},
+		dragonflyPodHealAnno, nil, "", now); err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "persist dragonfly pod heal stamp failed",
 			"statefulset", stsKey)

@@ -26,6 +26,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -61,8 +62,11 @@ const (
 // C1 — admission webhook self-deadlock circuit breaker.
 // ---------------------------------------------------------------------------
 
-// circuitBreakerEnabled reads the kill-switch every run — an env flip
-// takes effect on the next sweep without a code change.
+// circuitBreakerEnabled reads the kill-switch EVERY run — the
+// sanctioned exception to the resolve-at-Setup rule: the breaker is
+// an ops lever that must stay flippable mid-incident, so an env flip
+// takes effect on the next sweep without an operator restart (the
+// same deliberate hot reload unmeshedRemediationEnabled carries).
 func circuitBreakerEnabled() bool {
 	return envx.Gate("WEBHOOK_CIRCUIT_BREAKER_ENABLED", true)
 }
@@ -317,8 +321,7 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, queue, kind, cfgName, ann
 				flip(h, admissionv1.Ignore)
 				changed = true
 			}
-			metrics.WebhookCircuitBroken.WithLabelValues(kind, cfgName, h.name).Set(1)
-			emitted.Emit(key, kind, cfgName, h.name)
+			emitted.Set(metrics.WebhookCircuitBroken, 1, key, kind, cfgName, h.name)
 		case (svcEffective == 0 || unresponsive) && failClosed(h.fp):
 			seen[key] = true
 			first, tracked := b.deadSince.Observe(key, now)
@@ -381,13 +384,19 @@ func (b *circuitBreaker) circuitPatch(log logr.Logger, queue, kind, cfgName, ann
 	if len(broken) > 0 {
 		anno[webhookCircuitAnno] = strings.Join(slices.Sorted(maps.Keys(broken)), ",")
 	}
-	doc := map[string]any{
-		"metadata": map[string]any{"annotations": anno},
+	// MergePatchAnnos builds the annotations half; the webhooks
+	// merge entries are grafted onto the same doc so the policy
+	// flips and the trip record land in ONE strategic-merge patch
+	// (the webhooks list is patchMergeKey=name — a concurrent
+	// writer's sibling entries survive).
+	payload, err := kube.MergePatchAnnos(anno)
+	if err == nil && len(hookMerges) > 0 {
+		var doc map[string]any
+		if err = json.Unmarshal(payload, &doc); err == nil {
+			doc["webhooks"] = hookMerges
+			payload, err = json.Marshal(doc)
+		}
 	}
-	if len(hookMerges) > 0 {
-		doc["webhooks"] = hookMerges
-	}
-	payload, err := json.Marshal(doc)
 	if err != nil {
 		// Absorbed sub-failure: the sweep logs and continues —
 		// metered so the dropped work is still counted.

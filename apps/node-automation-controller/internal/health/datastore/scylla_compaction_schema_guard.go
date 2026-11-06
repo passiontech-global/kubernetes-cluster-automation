@@ -9,8 +9,6 @@ package datastore
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -76,76 +74,28 @@ func init() {
 		scyllaSchemaSplitGauge)
 }
 
-// scyllaMetricsValues parses a prometheus text exposition body and
-// returns every sample value of the named metric — the line can
-// carry a label set (`name{...} v`) or not (`name v`); comments and
-// every other metric name are ignored.
-func scyllaMetricsValues(body, name string) []float64 {
-	var out []float64
-	for _, line := range strings.Split(body, "\n") {
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		rest, ok := strings.CutPrefix(line, name)
-		if !ok {
-			continue
-		}
-		var raw string
-		switch {
-		case strings.HasPrefix(rest, "{"):
-			idx := strings.LastIndex(rest, "}")
-			if idx < 0 {
-				continue
-			}
-			raw = strings.TrimSpace(rest[idx+1:])
-		case strings.HasPrefix(rest, " "):
-			raw = strings.TrimSpace(rest)
-		default:
-			continue
-		}
-		raw, _, _ = strings.Cut(raw, " ")
-		if v, err := strconv.ParseFloat(raw, 64); err == nil {
-			out = append(out, v)
-		}
-	}
-	return out
-}
-
 // scyllaPodMetrics fetches the pod's :9180/metrics and returns the
 // compaction backlog (max sample) plus the set of coordinator schema
 // versions it reports. ok=false on fetch/parse failure —
-// inconclusive, not healthy.
+// inconclusive, not healthy (a dead endpoint and a sick pod are
+// indistinguishable from here).
 func (p *scyllaCompactionSchemaGuardCheck) scyllaPodMetrics(ctx context.Context,
 	pod *corev1.Pod) (backlog float64, versions map[float64]bool, ok bool) {
 
-	if pod.Status.PodIP == "" || p.HTTPClient == nil {
-		return 0, nil, false
-	}
-	lctx, cancel := context.WithTimeout(ctx, scyllaMetricsTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(lctx, http.MethodGet,
-		fmt.Sprintf("http://%s:%d/metrics", pod.Status.PodIP, scyllaMetricsPort), nil)
+	body, err := probefw.FetchPodMetrics(ctx, p.HTTPClient,
+		pod.Status.PodIP, scyllaMetricsPort, scyllaMetricsTimeout, 4<<20)
 	if err != nil {
-		return 0, nil, false
-	}
-	resp, err := p.HTTPClient.Do(req)
-	if err != nil {
-		return 0, nil, false
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil || resp.StatusCode != http.StatusOK {
 		return 0, nil, false
 	}
 	text := string(body)
-	for _, v := range scyllaMetricsValues(text,
+	for _, v := range probefw.ParseMetricValues(text,
 		"scylla_compaction_manager_pending_compactions") {
 		if v > backlog {
 			backlog = v
 		}
 	}
 	versions = map[float64]bool{}
-	for _, v := range scyllaMetricsValues(text,
+	for _, v := range probefw.ParseMetricValues(text,
 		"scylla_storage_proxy_coordinator_schema_version") {
 		versions[v] = true
 	}
@@ -167,8 +117,6 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
 
-	backlogCurrent := map[string][]string{}
-	splitCurrent := map[string][]string{}
 	// cluster -> namespace -> distinct schema versions across members.
 	clusterVersions := map[string]map[string]map[float64]bool{}
 	var backlogFindings []string
@@ -189,9 +137,8 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 			continue
 		}
 		if backlog > scyllaCompactionBacklogMax {
-			lv := []string{pod.Namespace, pod.Name}
-			backlogCurrent[pod.Namespace+"/"+pod.Name] = lv
-			scyllaCompactionBacklogGauge.WithLabelValues(lv...).Set(backlog)
+			p.emittedBacklog.Set(scyllaCompactionBacklogGauge, backlog,
+				pod.Namespace+"/"+pod.Name, pod.Namespace, pod.Name)
 			backlogFindings = append(backlogFindings, fmt.Sprintf(
 				"%s/%s=%.0f", pod.Namespace, pod.Name, backlog))
 		}
@@ -216,9 +163,7 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 			continue
 		}
 		ns, cluster, _ := strings.Cut(ck, "/")
-		lv := []string{ns, cluster}
-		splitCurrent[ck] = lv
-		scyllaSchemaSplitGauge.WithLabelValues(lv...).Set(1)
+		p.emittedSplit.Set(scyllaSchemaSplitGauge, 1, ck, ns, cluster)
 		var vs []string
 		for v := range distinct {
 			vs = append(vs, strconv.FormatFloat(v, 'f', -1, 64))
@@ -228,8 +173,8 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 			fmt.Sprintf("%s versions=[%s]", ck, strings.Join(vs, ",")))
 	}
 
-	p.emittedBacklog.Reconcile(backlogCurrent, scyllaCompactionBacklogGauge.DeleteLabelValues)
-	p.emittedSplit.Reconcile(splitCurrent, scyllaSchemaSplitGauge.DeleteLabelValues)
+	p.emittedBacklog.Prune(scyllaCompactionBacklogGauge.DeleteLabelValues)
+	p.emittedSplit.Prune(scyllaSchemaSplitGauge.DeleteLabelValues)
 	if len(backlogFindings) == 0 && len(splitFindings) == 0 {
 		return probefw.Result{Pass: true}
 	}

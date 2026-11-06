@@ -33,7 +33,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -80,7 +79,6 @@ type certReset struct {
 }
 
 type certManagerReaper struct {
-	cs  kubernetes.Interface // reserved for future typed reads
 	dyn dynamic.Interface
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
@@ -114,11 +112,11 @@ type crListResult struct {
 // opt-in and resolved by setupModules into Deps.Disabled) skip
 // registration entirely.
 func Setup(d shared.Deps) error {
-	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
+	mgr, dyn := d.Mgr, d.Dyn
 	if d.Disabled {
 		return nil
 	}
-	r := &certManagerReaper{cs: cs, dyn: dyn, queue: d.Name,
+	r := &certManagerReaper{dyn: dyn, queue: d.Name,
 		resets: map[string]*certReset{}}
 	return shared.AddPeriodic(mgr, r.queue, 15*time.Minute, r.run)
 }

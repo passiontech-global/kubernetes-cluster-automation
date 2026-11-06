@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -153,7 +154,6 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 		podByKey[pods.Items[i].Namespace+"/"+pods.Items[i].Name] = &pods.Items[i]
 	}
 
-	current := map[string][]string{}
 	seenKeep := map[string]bool{}
 	var desynced []string
 	for _, s := range linkSeries {
@@ -168,13 +168,11 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 		key := ns + "/" + name
 		sig := "link/" + key
 		seenKeep[sig] = true
-		first, _ := p.seen.Observe(sig, now)
-		if now.Sub(first) < dragonflyLinkMinAge {
+		if !probefw.Persisted(&p.seen, sig, now, dragonflyLinkMinAge,
+			logr.Discard()) {
 			continue // link down must persist the window
 		}
-		lv := []string{ns, name}
-		current[key] = lv
-		dragonflyReplicaSyncStormGauge.WithLabelValues(lv...).Set(1)
+		p.emitted.Set(dragonflyReplicaSyncStormGauge, 1, key, ns, name)
 		desynced = append(desynced, key)
 
 		pod := podByKey[key]
@@ -200,7 +198,7 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
 	sort.Strings(desynced)
-	p.emitted.Reconcile(current, dragonflyReplicaSyncStormGauge.DeleteLabelValues)
+	p.emitted.Prune(dragonflyReplicaSyncStormGauge.DeleteLabelValues)
 	if len(desynced) == 0 {
 		return probefw.Result{Pass: true}
 	}

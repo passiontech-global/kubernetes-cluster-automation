@@ -2,12 +2,12 @@ package datastore
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -60,9 +60,8 @@ var perconaClusterGVRs = kube.PerconaClusterGVRs
 // paused (W10-ST5). Suggested run() registration name:
 // "percona-cluster-quorum".
 func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
-	if p.Dyn == nil {
-		return probefw.Result{Infra: errors.New(
-			"no dynamic client — percona quorum check unverifiable")}
+	if r := p.RequireDyn("percona quorum check"); r != nil {
+		return *r
 	}
 	now := p.Now()
 
@@ -104,7 +103,8 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 				// bootstrapping — flagging it here would bypass
 				// the perconaInitMinAge grace and flap new
 				// clusters (W10-ST5 review).
-				if p.perconaInitAge(key, now) >= perconaInitMinAge {
+				if probefw.Persisted(&p.perconaInitSeen, key, now,
+					perconaInitMinAge, logr.Discard()) {
 					offenders = append(offenders, fmt.Sprintf(
 						"%s/%s initializing>%s", o.GetNamespace(),
 						o.GetName(), perconaInitMinAge))
@@ -165,13 +165,6 @@ func perconaStateLabel(state, statusField string) string {
 		return state
 	}
 	return statusField
-}
-
-// perconaInitAge records (or returns the age of) the first sweep this
-// cluster was seen initializing — the 30m stuck-initializing clock.
-func (p *perconaQuorumCheck) perconaInitAge(key string, now time.Time) time.Duration {
-	since, _ := p.perconaInitSeen.Observe(key, now)
-	return now.Sub(since)
 }
 
 // clearPerconaInit drops a cluster's initializing timer — resolved,

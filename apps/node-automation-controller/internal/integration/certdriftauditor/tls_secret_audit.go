@@ -75,12 +75,11 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 					continue
 				}
 				key := secretMetricKey{s.Namespace, s.Name}
-				a.seenSecrets.Emit(key, s.Namespace, s.Name)
 				// Days, not seconds — the alert budget this feeds ("fires
 				// <30d, pages <7d") thinks in days; negatives mean expired.
 				days := cert.NotAfter.Sub(a.now.Now()).Hours() / 24
-				metrics.TLSSecretDaysToExpiry.
-					WithLabelValues(s.Namespace, s.Name).Set(days)
+				a.seenSecrets.Set(metrics.TLSSecretDaysToExpiry, days,
+					key, s.Namespace, s.Name)
 			}
 			return nil
 		})

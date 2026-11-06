@@ -35,9 +35,8 @@ func (a *veleroBackupAuditor) flagMissingBackups(ctx context.Context,
 	if age <= veleroMissingBackupMaxAge {
 		return
 	}
-	a.seenBad.Emit(backupKey{ns, schedule, "missing"}, ns, schedule, "missing")
-	metrics.VeleroBackupEmptyOrErrored.
-		WithLabelValues(ns, schedule, "missing").Set(1)
+	a.seenBad.Set(metrics.VeleroBackupEmptyOrErrored, 1,
+		backupKey{ns, schedule, "missing"}, ns, schedule, "missing")
 	log.Info("velero schedule older than 36h has zero backups — silently unprotected",
 		"schedule", ns+"/"+schedule, "age", age.Truncate(time.Hour))
 }
@@ -69,9 +68,8 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 			flag = a.now.Now().Sub(since) > veleroStuckMaxAge
 		}
 		if flag {
-			a.seenBad.Emit(backupKey{ns, schedule, reason}, ns, schedule, reason)
-			metrics.VeleroBackupEmptyOrErrored.
-				WithLabelValues(ns, schedule, reason).Set(1)
+			a.seenBad.Set(metrics.VeleroBackupEmptyOrErrored, 1,
+				backupKey{ns, schedule, reason}, ns, schedule, reason)
 			log.Info("velero backup in a bad phase",
 				"backup", b.GetNamespace()+"/"+b.GetName(),
 				"schedule", ns+"/"+schedule, "phase", phase)
@@ -91,24 +89,21 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 	total, totalFound := kube.NestedInt64(
 		b.Object, "status", "progress", "totalItems")
 	if (itemsFound && items == 0) || (totalFound && total == 0) {
-		a.seenBad.Emit(backupKey{ns, schedule, "zero_items"}, ns, schedule, "zero_items")
-		metrics.VeleroBackupEmptyOrErrored.
-			WithLabelValues(ns, schedule, "zero_items").Set(1)
+		a.seenBad.Set(metrics.VeleroBackupEmptyOrErrored, 1,
+			backupKey{ns, schedule, "zero_items"}, ns, schedule, "zero_items")
 		log.Info("velero backup completed with zero items",
 			"backup", b.GetNamespace()+"/"+b.GetName(), "schedule", ns+"/"+schedule)
 	}
 	if errs, _ := kube.NestedInt64(b.Object, "status", "errors"); errs > 0 {
-		a.seenBad.Emit(backupKey{ns, schedule, "errors"}, ns, schedule, "errors")
-		metrics.VeleroBackupEmptyOrErrored.
-			WithLabelValues(ns, schedule, "errors").Set(1)
+		a.seenBad.Set(metrics.VeleroBackupEmptyOrErrored, 1,
+			backupKey{ns, schedule, "errors"}, ns, schedule, "errors")
 		log.Info("velero backup completed with item errors",
 			"backup", b.GetNamespace()+"/"+b.GetName(), "schedule", ns+"/"+schedule,
 			"errors", errs)
 	}
 	if warns, _ := kube.NestedInt64(b.Object, "status", "warnings"); warns > 0 {
-		a.seenBad.Emit(backupKey{ns, schedule, "warnings"}, ns, schedule, "warnings")
-		metrics.VeleroBackupEmptyOrErrored.
-			WithLabelValues(ns, schedule, "warnings").Set(1)
+		a.seenBad.Set(metrics.VeleroBackupEmptyOrErrored, 1,
+			backupKey{ns, schedule, "warnings"}, ns, schedule, "warnings")
 		log.Info("velero backup completed with item warnings",
 			"backup", b.GetNamespace()+"/"+b.GetName(), "schedule", ns+"/"+schedule,
 			"warnings", warns)

@@ -1,10 +1,14 @@
+// localpv_stranded_pods.go — the localpv-stranded-pods check
+// (W7-C4): Pending pods whose bound local PV is nodeAffinity-pinned
+// to a dead node get the stranded gauge (and, for disposable
+// volumes, a PVC+pod rescue); Pending openebs-hostpath claims with
+// Ready workers bounce the localpv provisioner.
 package nodehealth
 
 import (
 	"context"
 	"fmt"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -36,21 +40,22 @@ type localPVStrandedCheck struct {
 	//     can carry the stamp).
 	//   - pvcProvHealed: provisioner → last provisioner pod delete —
 	//     the 1h cooldown.
-	localPVEmitted    map[string]bool
-	pvcStalledEmitted map[string]bool
+	//   - verdict memoizes the maintenance-mutex evaluation the
+	//     per-target heal preambles share — one evaluation per
+	//     Verdict TTL instead of three API reads per heal.
+	localPVEmitted    state.GaugeLedger[string]
+	pvcStalledEmitted state.GaugeLedger[string]
 	localPVHealed     state.CooldownSet
 	pvcProvHealed     state.CooldownSet
+	verdict           kube.Verdict
 }
 
-// newLocalPVStrandedCheck builds the W7-C4 check with fresh
-// tracking maps — the state-map initialization that used to live in
-// the monolithic newClusterHealthProber literal. The cooldown
-// ledgers are zero-value ready; only the gauge-tuple sets arm here.
+// newLocalPVStrandedCheck builds the W7-C4 check — every ledger is
+// zero-value ready, so the constructor carries no initialization
+// (the state-map literals retired with the monolithic
+// newClusterHealthProber).
 func NewLocalPVStrandedCheck(d *probefw.Deps) probefw.Check {
-	return &localPVStrandedCheck{Deps: d,
-		localPVEmitted:    map[string]bool{},
-		pvcStalledEmitted: map[string]bool{},
-	}
+	return &localPVStrandedCheck{Deps: d}
 }
 
 // ---------------------------------------------------------------------------
@@ -185,12 +190,6 @@ func ephemeralLocalPV(pod *corev1.Pod, pvc *corev1.PersistentVolumeClaim) bool {
 func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	if p.localPVEmitted == nil {
-		p.localPVEmitted = map[string]bool{}
-	}
-	if p.pvcStalledEmitted == nil {
-		p.pvcStalledEmitted = map[string]bool{}
-	}
 
 	nodes, err := kube.ListNodes(ctx, p.CS)
 	if err != nil {
@@ -236,8 +235,10 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list persistentvolumeclaims: %w", err)}
 	}
 
-	emitted := map[string]bool{} // "ns/pod/pvc/node/reason" this sweep
-	stalled := map[string]bool{} // "ns/pvc/storageclass" this sweep
+	// emitted/stalled map each live gauge key to its label values —
+	// the ledgers store the tuples so no key gets SplitN'd apart.
+	emitted := map[string][]string{} // "ns/pod/pvc/node/reason" this sweep
+	stalled := map[string][]string{} // "ns/pvc/storageclass" this sweep
 	var heals []strandedHeal
 
 	podOpts := metav1.ListOptions{
@@ -276,9 +277,10 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 								}
 								key := pod.Namespace + "/" + pod.Name + "/" +
 									pvc.Name + "/" + node + "/" + reason
-								emitted[key] = true
+								emitted[key] = []string{
+									pod.Namespace, pod.Name, pvc.Name, node, reason}
 								metrics.LocalPVStrandedPods.WithLabelValues(
-									pod.Namespace, pod.Name, pvc.Name, node, reason).Set(1)
+									emitted[key]...).Set(1)
 								// Confirmed-gone nodes only: NotReady/
 								// cordoned can come back — a missing or
 								// fenced (out-of-service) node cannot.
@@ -300,9 +302,10 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 						*pvc.Spec.StorageClassName == openebsHostpathSC &&
 						age >= pvcStalledMinAge {
 						key := pod.Namespace + "/" + pvc.Name + "/" + openebsHostpathSC
-						stalled[key] = true
+						stalled[key] = []string{
+							pod.Namespace, pvc.Name, openebsHostpathSC}
 						metrics.PVCProvisioningStalled.WithLabelValues(
-							pod.Namespace, pvc.Name, openebsHostpathSC).Set(1)
+							stalled[key]...).Set(1)
 					}
 				}
 			}
@@ -313,56 +316,28 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	// Prune the gauges' series for tuples not re-seen — same
-	// DeleteLabelValues hygiene as stsZeroEmitted.
-	for k := range p.localPVEmitted {
-		if emitted[k] {
-			continue
-		}
-		if parts := strings.SplitN(k, "/", 5); len(parts) == 5 {
-			metrics.LocalPVStrandedPods.DeleteLabelValues(
-				parts[0], parts[1], parts[2], parts[3], parts[4])
-		}
-		delete(p.localPVEmitted, k)
-	}
-	maps.Copy(p.localPVEmitted, emitted)
-	for k := range p.pvcStalledEmitted {
-		if stalled[k] {
-			continue
-		}
-		if parts := strings.SplitN(k, "/", 3); len(parts) == 3 {
-			metrics.PVCProvisioningStalled.DeleteLabelValues(
-				parts[0], parts[1], parts[2])
-		}
-		delete(p.pvcStalledEmitted, k)
-	}
-	maps.Copy(p.pvcStalledEmitted, stalled)
+	// DeleteLabelValues hygiene as stsZeroEmitted; the ledgers hold
+	// the label tuples so no key gets re-split.
+	p.localPVEmitted.Reconcile(emitted,
+		metrics.LocalPVStrandedPods.DeleteLabelValues)
+	p.pvcStalledEmitted.Reconcile(stalled,
+		metrics.PVCProvisioningStalled.DeleteLabelValues)
 
-	// The maintenance mutex is evaluated once per sweep and only
-	// when there is something to delete — pod/PVC kills during a
-	// drain are exactly what it exists to prevent; "cannot verify"
-	// fails closed.
-	var maintHeld bool
-	var maintWhy string
-	var maintErr error
-	if len(heals) > 0 || len(stalled) > 0 {
-		maintHeld, maintWhy, maintErr = kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-		if maintErr != nil {
-			metrics.IncError(p.Name)
-			log.Info("WARN: maintenance check unverifiable — localpv heals deferred (fail closed)",
-				"error", maintErr)
-		}
-	}
+	// AllowedV folds the per-target cooldown plus the maintenance
+	// mutex (memoized on p.verdict — one evaluation per sweep) —
+	// pod/PVC kills during a drain are exactly what it exists to
+	// prevent; "cannot verify" fails closed.
 	for i := range heals {
 		h := &heals[i]
 		pvcKey := h.pvc.Namespace + "/" + h.pvc.Name
-		if maintErr != nil || maintHeld {
-			log.Info("maintenance gate — stranded ephemeral pvc kept",
-				"pvc", pvcKey, "why", maintWhy)
+		proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+			p.CS, p.Dyn, &p.localPVHealed, pvcKey,
+			localPVEphemeralHealCooldown, now)
+		if unverifiable {
+			metrics.IncError(p.Name)
 			continue
 		}
-		if p.localPVHealed.CooledDown(pvcKey, localPVEphemeralHealCooldown, now) {
-			log.Info("skip heal: ephemeral localpv inside cooldown",
-				"pvc", pvcKey)
+		if !proceed {
 			continue
 		}
 		// PVC first, then the pod — the claim release flips the PV
@@ -412,7 +387,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 			"pvc", pvcKey, "pod", h.pod.Namespace+"/"+h.pod.Name,
 			"node", h.node, "reason", h.reason)
 	}
-	if len(stalled) > 0 && maintErr == nil && !maintHeld {
+	if len(stalled) > 0 {
 		p.healLocalPVProvisioner(ctx, log, now)
 	}
 
@@ -436,12 +411,19 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 // Pending hostpath claims while Ready workers exist mean the
 // provisioner missed a watch event; a restart makes it re-list and
 // provision. 1h cooldown (in-RAM — the pod itself is the heal
-// target, nothing else can carry the stamp).
+// target, nothing else can carry the stamp), maintenance-gated via
+// the shared AllowedV preamble.
 func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	log logr.Logger, now time.Time) {
 
-	if p.pvcProvHealed.CooledDown(openebsProvisionerName, pvcProvisionerHealCooldown, now) {
-		log.Info("skip heal: localpv provisioner inside cooldown")
+	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+		p.CS, p.Dyn, &p.pvcProvHealed, openebsProvisionerName,
+		pvcProvisionerHealCooldown, now)
+	if unverifiable {
+		metrics.IncError(p.Name)
+		return
+	}
+	if !proceed {
 		return
 	}
 	pods, err := p.CS.CoreV1().Pods(openebsProvisionerNS).

@@ -151,7 +151,7 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 	if p.Dyn == nil {
 		return
 	}
-	ck := "selfheal/" + CheckNameNamespaceWedged + "/finalsweep/" + nsName
+	ck := probefw.SelfHealKey(CheckNameNamespaceWedged, "finalsweep/"+nsName)
 	if p.Heals.CooledDown(ck, nsFinalizerSweepCooldown, now) {
 		return
 	}
@@ -265,57 +265,31 @@ func (p *namespaceTerminatingWedgedCheck) maybeStripFinalizers(ctx context.Conte
 // ownerGone reports whether the object's controller ownerRef
 // points at a workload that no longer exists — the "dead operator"
 // proof required before stripping. Unknown kinds and lookup errors
-// fail closed (owner presumed alive).
+// fail closed (owner presumed alive): OwnerGone's `resolved` bit
+// tells "exists" apart from "unresolvable" so the
+// ReplicaSet→Deployment chain can still run.
 func (p *namespaceTerminatingWedgedCheck) ownerGone(ctx context.Context,
 	obj *unstructured.Unstructured) bool {
 
 	ref := metav1.GetControllerOf(obj)
-	if ref == nil {
+	gone, resolved := probefw.OwnerGone(ctx, p.CS, obj.GetNamespace(), ref,
+		"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "CronJob")
+	// A nil ref resolves (gone=false): "no owner" is not a dead
+	// owner — and the RS chain needs ref non-nil below.
+	if gone || !resolved || ref == nil || ref.Kind != "ReplicaSet" {
+		return gone
+	}
+	// Owner ReplicaSet exists — except a ReplicaSet whose own
+	// Deployment is gone: the RS is GC-pending garbage, so its
+	// finalizers are just as dead.
+	ns := obj.GetNamespace()
+	rs, err := p.CS.AppsV1().ReplicaSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+	if err != nil {
 		return false
 	}
-	ns := obj.GetNamespace()
-	get := func(kind, name string) error {
-		switch kind {
-		case "Deployment":
-			_, err := p.CS.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
-			return err
-		case "StatefulSet":
-			_, err := p.CS.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
-			return err
-		case "DaemonSet":
-			_, err := p.CS.AppsV1().DaemonSets(ns).Get(ctx, name, metav1.GetOptions{})
-			return err
-		case "ReplicaSet":
-			_, err := p.CS.AppsV1().ReplicaSets(ns).Get(ctx, name, metav1.GetOptions{})
-			return err
-		case "Job":
-			_, err := p.CS.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
-			return err
-		case "CronJob":
-			_, err := p.CS.BatchV1().CronJobs(ns).Get(ctx, name, metav1.GetOptions{})
-			return err
-		}
-		return fmt.Errorf("unresolvable owner kind %q", kind)
-	}
-	err := get(ref.Kind, ref.Name)
-	if apierrors.IsNotFound(err) {
-		return true
-	}
-	if err != nil {
-		return false // lookup failed or unknown kind — fail closed
-	}
-	// Owner object exists — except a ReplicaSet whose own Deployment
-	// is gone: the RS is GC-pending garbage, so its finalizers are
-	// just as dead.
-	if ref.Kind == "ReplicaSet" {
-		rs, err := p.CS.AppsV1().ReplicaSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-		if err != nil {
-			return false
-		}
-		if dref := metav1.GetControllerOf(rs); dref != nil && dref.Kind == "Deployment" {
-			_, err := p.CS.AppsV1().Deployments(ns).Get(ctx, dref.Name, metav1.GetOptions{})
-			return apierrors.IsNotFound(err)
-		}
+	if dref := metav1.GetControllerOf(rs); dref != nil && dref.Kind == "Deployment" {
+		gone, _ := probefw.OwnerGone(ctx, p.CS, ns, dref, "Deployment")
+		return gone
 	}
 	return false
 }

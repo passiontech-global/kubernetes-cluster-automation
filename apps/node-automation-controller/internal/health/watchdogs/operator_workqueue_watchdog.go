@@ -2,7 +2,6 @@ package watchdogs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
@@ -34,13 +33,13 @@ type operatorWorkqueueCheck struct {
 	//     that saw the stuck signature; it must persist the
 	//     operator's stuckMinAge before the gauge fires. Pruned when
 	//     the object reconciles — a later stall re-arms the window.
-	//   - opFrozen: "operator/reason" currently held at 1, so a
-	//     resolved signature flips the series back to 0.
+	//   - opFrozen: the emitted-gauge ledger for "operator/reason"
+	//     series held at 1 — a tuple not re-emitted flips back to 0.
 	//   - opHealed: operator → last leader-pod delete — the in-RAM
 	//     half of the 1h heal cooldown (the Lease annotation is the
 	//     durable half).
 	opFirstSeen state.FirstSeenLedger
-	opFrozen    map[string]bool
+	opFrozen    state.GaugeLedger[string]
 	opHealed    state.CooldownSet
 	// verdict memoizes the maintenance-mutex evaluation the
 	// per-operator heal preambles share — one evaluation per
@@ -55,14 +54,10 @@ type operatorWorkqueueCheck struct {
 }
 
 // newOperatorWorkqueueCheck builds the W5.8 watchdog — the ledgers
-// arm lazily on first use; only the frozen-reasons map needs the
-// explicit initialization that used to live in the monolithic
-// newClusterHealthProber literal (gwClassCtlr stays lazily
-// populated on first resolve).
+// arm lazily on first use (gwClassCtlr stays lazily populated on
+// first resolve).
 func NewOperatorWorkqueueCheck(d *probefw.Deps) probefw.Check {
-	return &operatorWorkqueueCheck{Deps: d,
-		opFrozen: map[string]bool{},
-	}
+	return &operatorWorkqueueCheck{Deps: d}
 }
 
 // W5.8 — operator-workqueue-watchdog knobs. The signature-side
@@ -104,14 +99,10 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	// The CR scans and the maintenance mutex both need dyn — a
 	// missing client is a wiring bug, not "no signal".
-	if p.Dyn == nil {
-		return probefw.Result{Infra: errors.New(
-			"no dynamic client — operator workqueue check unverifiable")}
+	if r := p.RequireDyn("operator workqueue check"); r != nil {
+		return *r
 	}
 	now := p.Now()
-	if p.opFrozen == nil {
-		p.opFrozen = map[string]bool{}
-	}
 
 	frozen := map[string]string{} // "operator/reason" → reason, for the why line
 	var firstErr error
@@ -122,6 +113,8 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 			if firstErr == nil {
 				firstErr = lerr
 			}
+			// Never evaluated — carry the held tuples forward.
+			p.carryFrozen(op.name)
 			continue
 		case lease == nil && op.leaseOptional:
 			// No candidate Lease by design (replicas:1 or
@@ -137,6 +130,8 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 					firstErr = fmt.Errorf("list pods %s selector %q (%s): %w",
 						targetPodNS(op), op.podSelector, op.name, aerr)
 				}
+				// Never evaluated — carry the held tuples forward.
+				p.carryFrozen(op.name)
 				continue
 			case !alive:
 				p.resetOperator(op.name)
@@ -199,41 +194,27 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 				key := op.name + "/" + res.gvr.Resource + "/" +
 					o.GetNamespace() + "/" + o.GetName()
 				live[key] = true
-				first, tracked := p.opFirstSeen.Observe(key, now)
-				if !tracked {
-					log.Info("operator stuck signature — tracking first-seen",
-						"operator", op.name, "resource", res.gvr.Resource,
-						"object", o.GetNamespace()+"/"+o.GetName())
-					continue
-				}
-				if now.Sub(first) >= op.stuckMinAge {
+				if probefw.Persisted(&p.opFirstSeen, key, now,
+					op.stuckMinAge, log) {
 					reasonsFrozen[res.reason] = true
 				}
 			}
 		}
 		if evalFailed {
 			// An incomplete scan must not prune first-seen nor
-			// clear held series — leave this operator's state as-is.
+			// clear held series — carry this operator's held tuples
+			// forward so the sweep-end prune keeps them (they were
+			// never re-evaluated, not proven resolved).
+			p.carryFrozen(op.name)
 			continue
 		}
 
 		p.opFirstSeen.Prune(func(k string) bool {
 			return !strings.HasPrefix(k, op.name+"/") || live[k]
 		})
-		for k := range p.opFrozen {
-			if !strings.HasPrefix(k, op.name+"/") {
-				continue
-			}
-			if reasonsFrozen[strings.TrimPrefix(k, op.name+"/")] {
-				continue
-			}
-			metrics.OperatorWorkqueueFrozen.WithLabelValues(
-				op.name, strings.TrimPrefix(k, op.name+"/")).Set(0)
-			delete(p.opFrozen, k)
-		}
 		for r := range reasonsFrozen {
-			metrics.OperatorWorkqueueFrozen.WithLabelValues(op.name, r).Set(1)
-			p.opFrozen[op.name+"/"+r] = true
+			p.opFrozen.Set(metrics.OperatorWorkqueueFrozen, 1,
+				op.name+"/"+r, op.name, r)
 			frozen[op.name+"/"+r] = r
 		}
 
@@ -246,6 +227,13 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 			p.healOperatorLeader(ctx, log, op, lease, reasons, now)
 		}
 	}
+
+	// Sweep-end gauge hygiene: every "operator/reason" tuple held at
+	// 1 last sweep that no operator re-emitted this sweep flips back
+	// to 0 — this covers both resolved signatures and the
+	// resetOperator paths (absent/stale Lease, dead pod), while
+	// evalFailed operators carried theirs forward above.
+	p.opFrozen.Prune(opFrozenFlipZero)
 
 	if len(frozen) == 0 {
 		if firstErr != nil {
@@ -309,20 +297,34 @@ func (p *operatorWorkqueueCheck) operatorPodRunning(ctx context.Context, op oper
 	return false, nil
 }
 
-// resetOperator clears one operator's tracking and flips its held
-// frozen series back to 0 — called when the frozen-but-leader
-// diagnosis cannot apply (absent/stale Lease) so a signature that
-// flaps around a precondition edge re-arms from scratch.
+// opFrozenFlipZero is the emitted-ledger's prune action: an
+// "operator/reason" series that stopped being emitted flips to 0
+// rather than disappearing — the resolved edge stays visible.
+func opFrozenFlipZero(labelValues ...string) bool {
+	metrics.OperatorWorkqueueFrozen.WithLabelValues(labelValues...).Set(0)
+	return true
+}
+
+// carryFrozen re-Emits one operator's held frozen tuples so the
+// sweep-end prune keeps them — the skip paths where the operator's
+// signatures were never evaluated (lease read error, pod list
+// error, incomplete CR scan) must not read as "resolved" and flap
+// the series to 0.
+func (p *operatorWorkqueueCheck) carryFrozen(name string) {
+	for k, lv := range p.opFrozen.Last() {
+		if strings.HasPrefix(k, name+"/") {
+			p.opFrozen.Emit(k, lv...)
+		}
+	}
+}
+
+// resetOperator clears one operator's first-seen tracking — called
+// when the frozen-but-leader diagnosis cannot apply (absent/stale
+// Lease, dead pod) so a signature that flaps around a precondition
+// edge re-arms from scratch. The operator's held frozen series flip
+// at the sweep-end opFrozen prune — nothing re-emitted them.
 func (p *operatorWorkqueueCheck) resetOperator(name string) {
 	p.opFirstSeen.Prune(func(k string) bool {
 		return !strings.HasPrefix(k, name+"/")
 	})
-	for k := range p.opFrozen {
-		if !strings.HasPrefix(k, name+"/") {
-			continue
-		}
-		metrics.OperatorWorkqueueFrozen.WithLabelValues(
-			name, strings.TrimPrefix(k, name+"/")).Set(0)
-		delete(p.opFrozen, k)
-	}
 }

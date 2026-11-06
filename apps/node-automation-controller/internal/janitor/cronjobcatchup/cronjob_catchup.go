@@ -140,10 +140,8 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 					anchor = cj.Status.LastScheduleTime.Time
 				}
 				if missedOver100(sched, anchor, now) {
-					c.missedEmitted.Emit(cj.Namespace+"/"+cj.Name,
-						cj.Namespace, cj.Name)
-					metrics.CronJobTooManyMissedStarts.
-						WithLabelValues(cj.Namespace, cj.Name).Set(1)
+					c.missedEmitted.Set(metrics.CronJobTooManyMissedStarts, 1,
+						cj.Namespace+"/"+cj.Name, cj.Namespace, cj.Name)
 					c.unfreezeDeadline(ctx, log, cj, now)
 				}
 			}

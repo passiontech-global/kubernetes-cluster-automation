@@ -10,6 +10,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 )
 
@@ -20,7 +21,7 @@ func testProber(cs *fake.Clientset) *probetest.Prober {
 }
 
 func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober {
-	return probetest.NewProber(cs, dyn,
+	p := probetest.NewProber(cs, dyn,
 		NewCoreDNSUpstreamCheck,
 		NewLinkerdEndpointSyncCheck,
 		NewLinkerdProtocolDetectionStallCheck,
@@ -31,4 +32,13 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober 
 		NewCloudflaredTunnelHealthCheck,
 		NewLiqoTunnelHealthCheck,
 	)
+	// The production sweep resolves the CILIUM_* knobs into
+	// Cfg.Cilium once at Setup (probefw.CiliumConfigFromEnv —
+	// clusterhealthprobes wiring); NewDeps leaves it zero, so the
+	// harness stamps the documented defaults the env parse yields.
+	p.Cfg.Cilium = probefw.CiliumConfig{
+		BPFMapPressureThreshold: probefw.CiliumBPFMapPressureDefault,
+		NodeIPAMMinFreeRatio:    probefw.CiliumNodeIPAMMinFreeDefault,
+	}
+	return p
 }

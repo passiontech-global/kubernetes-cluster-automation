@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -156,9 +157,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	readyByNS := map[string]int{}
 	for ns, members := range rabbitByNS {
 		for _, pod := range members {
-			if pod.DeletionTimestamp == nil &&
-				pod.Status.Phase == corev1.PodRunning &&
-				kube.PodReadyCond(pod) {
+			if probefw.PodRunningReady(pod) {
 				readyByNS[ns]++
 			}
 		}
@@ -207,8 +206,8 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		}
 		sig := "prom/" + key
 		seenKeep[sig] = true
-		first, _ := p.seen.Observe(sig, now)
-		if now.Sub(first) < rabbitUnreadyMinAge {
+		if !probefw.Persisted(&p.seen, sig, now, rabbitUnreadyMinAge,
+			logr.Discard()) {
 			continue
 		}
 		if readyByNS[pod.Namespace] >= 2 {
@@ -218,7 +217,6 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
 
-	current := map[string][]string{}
 	var out []string
 	for key, reasons := range findings {
 		rs := make([]string, 0, len(reasons))
@@ -229,14 +227,14 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		parts := strings.SplitN(key, "/", 2)
 		ns := parts[0]
 		if pod, ok := rabbitByName[key]; ok {
-			lv := []string{ns, pod.Name, strings.Join(rs, "+")}
-			current[key+"/"+strings.Join(rs, "+")] = lv
-			rabbitMQQuorumUnhealthyGauge.WithLabelValues(lv...).Set(1)
+			joined := strings.Join(rs, "+")
+			p.emitted.Set(rabbitMQQuorumUnhealthyGauge, 1,
+				key+"/"+joined, ns, pod.Name, joined)
 		}
 		out = append(out, key+"("+strings.Join(rs, "+")+")")
 	}
 	sort.Strings(out)
-	p.emitted.Reconcile(current, rabbitMQQuorumUnhealthyGauge.DeleteLabelValues)
+	p.emitted.Prune(rabbitMQQuorumUnhealthyGauge.DeleteLabelValues)
 	if len(out) == 0 {
 		return probefw.Result{Pass: true}
 	}
