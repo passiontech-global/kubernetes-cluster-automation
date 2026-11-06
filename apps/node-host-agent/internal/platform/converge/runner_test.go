@@ -1,0 +1,81 @@
+// runner_test.go — RunBudget's deadline plumbing over a stub Runner
+// (the production Nsenter/Direct runners are thin exec wrappers; the
+// verbs are what carry behavior worth pinning).
+package converge
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"testing"
+	"time"
+)
+
+// stubRunner records argv and the ctx deadline RunBudget applied,
+// and replies with the canned out/err. Shared with systemd_test.go.
+type stubRunner struct {
+	out         string
+	err         error
+	cmds        [][]string
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (s *stubRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	s.cmds = append(s.cmds, append([]string{name}, args...))
+	s.deadline, s.hasDeadline = ctx.Deadline()
+	return s.out, s.err
+}
+
+func TestRunBudgetPassesThrough(t *testing.T) {
+	r := &stubRunner{out: "the-out", err: nil}
+	out, err := RunBudget(context.Background(), r, time.Second, "nft", "list", "ruleset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "the-out" {
+		t.Fatalf("out = %q", out)
+	}
+	if !slices.Equal(r.cmds[0], []string{"nft", "list", "ruleset"}) {
+		t.Fatalf("argv = %v", r.cmds[0])
+	}
+}
+
+func TestRunBudgetAppliesDeadline(t *testing.T) {
+	r := &stubRunner{}
+	before := time.Now()
+	if _, err := RunBudget(context.Background(), r, time.Minute, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if !r.hasDeadline {
+		t.Fatal("a positive budget must attach a ctx deadline")
+	}
+	// The deadline lands ~budget out — assert it brackets sanely.
+	if r.deadline.Before(before.Add(50*time.Second)) || r.deadline.After(before.Add(2*time.Minute)) {
+		t.Fatalf("deadline = %v, want ~now+1m", r.deadline)
+	}
+}
+
+func TestRunBudgetNonPositiveLeavesCtxAlone(t *testing.T) {
+	for _, budget := range []time.Duration{0, -time.Second} {
+		r := &stubRunner{}
+		if _, err := RunBudget(context.Background(), r, budget, "true"); err != nil {
+			t.Fatal(err)
+		}
+		if r.hasDeadline {
+			t.Fatalf("budget %v must not attach a deadline", budget)
+		}
+	}
+}
+
+func TestRunBudgetPropagatesError(t *testing.T) {
+	want := errors.New("exec blew up")
+	r := &stubRunner{out: "partial", err: want}
+	out, err := RunBudget(context.Background(), r, time.Second, "false")
+	if !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
+	}
+	if out != "partial" {
+		t.Fatalf("out = %q — output must return alongside the error", out)
+	}
+}

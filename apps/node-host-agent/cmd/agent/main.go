@@ -9,79 +9,28 @@
 //   - Node identity via the downward API: NODE_NAME, POD_NAME,
 //     POD_NAMESPACE.
 //
-// Subsystems (all paths/intervals env-configurable):
-//   - sweeper:    openebs orphan-dir cleanup. Enabled via
-//     NODE_HOST_AGENT_ENABLE_SWEEPER (default true).
-//   - concourse-cache: native Go pruner for
-//     /var/openebs/local/pvc-*/shared-cache (replaces the CronJob +
-//     pods/exec janitor). NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE
-//     (default true), cadence NODE_HOST_AGENT_CONCOURSE_CACHE_INTERVAL
-//     (default 15m).
-//   - apiprober:  apiserver watch-cache wedge guard for the api-local-lb
-//     HAProxy sidecar. NODE_HOST_AGENT_ENABLE_APIPROBER:
-//     true|false|auto (default auto).
-//   - hostmetrics: scrape-time collector for watchdog state latches,
-//     PSI/cpu-delivered, fail2ban, nebula + k0s config drift.
-//     Enabled via NODE_HOST_AGENT_ENABLE_HOSTMETRICS (default true).
-//   - workerhygiene: worker-only watchdog checks (pod-teardown,
-//     konnectivity drift, kubelet stall/watch-wedge, ctr tasks,
-//     cilium health/init-stuck). NODE_HOST_AGENT_ENABLE_HYGIENE
-//     (default true); needs a kube client and a non-empty node name.
-//   - nethealth: DNS fallback, coredns-stub, overlay egress relays,
-//     nebula health, fail2ban (former watchdog modules 12/13/20/21/50).
-//     NODE_HOST_AGENT_ENABLE_NETHEALTH (default true).
-//   - janitor:  self-healing sweeps of the shared watchdog state dir
-//     (reaps stale state-* latches no enabled check can produce, plus
-//     known latches past 24h) and of retired shell-stack residue
-//     (reset-failed/stop on not-found ghost units, kills orphaned
-//     `ip monitor` watchers). No kube client — runs on every node
-//     class. NODE_HOST_AGENT_ENABLE_JANITOR (default true).
-//   - nodereporter: syncs watchdog state-* latches to NodeConditions,
-//     K8s Events and problem_gauge/problem_counter (replaces the NPD
-//     watchdog monitors). NODE_HOST_AGENT_ENABLE_REPORTER (default
-//     true); needs a kube client and a node name.
-//   - controllerhygiene: control-plane guards (apiserver wedge,
-//     kine TTL/pool, oom-loop shield, systemd watchdog feeder).
-//     NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE: true|false|auto
-//     (default auto = enabled iff k0scontroller.service exists).
-//   - hostconfig: declarative host converger (sysctl, systemd
-//     drop-ins, nebula, coredns stub, api-local-lb, fail2ban, sshd)
-//     replacing the node-config-agent ansible DaemonSet.
-//     NODE_HOST_AGENT_ENABLE_HOSTCONFIG: true|false|auto (default
-//     auto = enabled iff the vars dir holds defaults.yaml).
-//   - hubsync:  SSH converge of the standalone targets (interdc
-//     hubs, infra/api-lb VMs) — the hub-converge CronJob port.
-//     Pod-mode only; polls for the converge key at
-//     NODE_HOST_AGENT_CONVERGE_SSH_KEY (default
-//     /etc/node-converge-ssh/id_ed25519) — the secret mounts
-//     optional:true and may land after pod start.
-//   - kinedb:   kine DB VM probe/compact-guard/maintenance loops
-//     (postgres+pgbouncer). NODE_HOST_AGENT_ENABLE_KINEDB:
-//     true|false|auto (default auto = kinedb.Detect: the postgres
-//     .env exists or a kine_db extra-host entry matches).
+// Subsystems are env-gated via NODE_HOST_AGENT_ENABLE_* — the
+// registry and startup order live in cmd/agent/wiring.go
+// (descriptors()); the full env surface is generated into ENV.md
+// (`moon run node-host-agent:envdoc`).
 //
 // --standalone (NODE_HOST_AGENT_STANDALONE=1) is the on-host systemd
 // mode the hubsync-converged targets run: hostRoot is forced to "/",
 // the kube-client/pod-context subsystems (sweeper, concourse-cache,
 // workerhygiene, nodereporter, hubsync) default OFF, the host-local
 // ones (hostconfig, hostmetrics + the node-exporter textfile writer,
-// nethealth, apiprober, controllerhygiene, kinedb) stay on — the env
-// vars still override every default. --node-name supplies the node
-// identity (NODE_HOST_AGENT_NODE_NAME/NODE_NAME envs win when set).
-// /etc/api-backend-guard.conf feeds the apiprober fallback layer
-// below the env vars on api-lb VMs.
+// nethealth, apiprober, janitor, controllerhygiene, kinedb) stay on —
+// the env vars still override every default. --node-name supplies the
+// node identity (NODE_HOST_AGENT_NODE_NAME/NODE_NAME envs win when
+// set). /etc/api-backend-guard.conf feeds the apiprober fallback
+// layer below the env vars on api-lb VMs.
 //
-// Subcommands (dispatched before flag parsing; an argv[0] basename
-// of "runc" also selects the wrapper, since /concourse-runc/runc is
-// a copy of this binary):
-//   - concourse-worker-init     — worker init-rm (btrfs cleanup,
-//     shared-cache wipe/scaffold, runc wrapper install).
-//   - concourse-runc-wrapper    — runc shim injecting the
-//     /shared-cache bind mount, then execs runc.real.
-//   - converge-once --vars-dir=DIR [--node-name=N] — one hostconfig
-//     converge on the host, then exit.
-//   - nebula-sign --vars-dir=DIR --ca-dir=DIR [--node=N] — sign
-//     interdc host certs with the local CA (sign.yaml port).
+// Multi-call binary: subcommands (converge-once, nebula-sign,
+// purge-events, the check-*/rescue ops, the concourse init/runc
+// shim) are dispatched before flag.Parse — the dispatch table, and
+// therefore the usage text, lives in cli.go. An argv[0] basename of
+// "runc" selects the runc wrapper, since /concourse-runc/runc is a
+// copy of this binary.
 //
 // NODE_HOST_AGENT_HOST_ROOT (default "/host") prefixes every host
 // path; set it to "/" when running as a standalone systemd binary on

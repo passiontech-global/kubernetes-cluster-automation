@@ -40,7 +40,7 @@ func TestWithDefaultAPIPort(t *testing.T) {
 // feedTicks runs n feeder ticks synchronously (the 15s loop body).
 func feedTicks(e *env, n int) {
 	for i := 0; i < n; i++ {
-		e.h.kubeletFeedTick(context.Background())
+		kubelet.KubeletFeedTick(context.Background(), e.h.Deps)
 	}
 }
 
@@ -87,7 +87,7 @@ func TestKubeletFeederProbeOKResetsFailsAndClearsLatch(t *testing.T) {
 		t.Fatalf("fails=%d want 2", e.h.KubeletWdFails)
 	}
 	e.bodyOK[e.h.Cfg.Kubelet.WdProbeURL] = true
-	e.h.kubeletFeedTick(context.Background())
+	kubelet.KubeletFeedTick(context.Background(), e.h.Deps)
 	if e.h.KubeletWdFails != 0 {
 		t.Fatalf("fails=%d want 0 after probe OK", e.h.KubeletWdFails)
 	}
@@ -225,7 +225,7 @@ func TestKubeletFeederGateRateLimitLatches(t *testing.T) {
 	}
 	// A recovered kubelet clears the escalation latch again.
 	e.bodyOK[e.h.Cfg.Kubelet.WdProbeURL] = true
-	e.h.kubeletFeedTick(context.Background())
+	kubelet.KubeletFeedTick(context.Background(), e.h.Deps)
 	if _, err := os.Stat(latch); !os.IsNotExist(err) {
 		t.Fatal("latch kept after kubelet recovered")
 	}
@@ -254,32 +254,32 @@ func TestKubeletFeederStandsDownWhenWorkerInactive(t *testing.T) {
 
 func TestKubeletFeederActivation(t *testing.T) {
 	e := fixture(t)
-	if !e.h.kubeletFeederActive() {
+	if !kubelet.KubeletFeederActive(e.h.Deps) {
 		t.Fatal("feeder inactive on a default worker node (unit file present)")
 	}
 	// Off the worker list and no unit file → inactive.
 	if err := os.Remove(e.unit); err != nil {
 		t.Fatal(err)
 	}
-	if e.h.kubeletFeederActive() {
+	if kubelet.KubeletFeederActive(e.h.Deps) {
 		t.Fatal("feeder active without unit file and without host listing")
 	}
 	// Listed in systemd_watchdog_hosts → active regardless of the
 	// unit file (the shell install gate).
 	e.h.Cfg.Kubelet.WatchdogHosts = []string{"node-x", "node-a"}
-	if !e.h.kubeletFeederActive() {
+	if !kubelet.KubeletFeederActive(e.h.Deps) {
 		t.Fatal("feeder inactive although node is listed")
 	}
 	// WD_SIG_KUBELET_WATCHDOG=off kills it even when listed.
 	e.h.Cfg.Watchdog = &watchdogconf.Config{
 		Disabled: map[string]bool{"kubelet-watchdog": true},
 	}
-	if e.h.kubeletFeederActive() {
+	if kubelet.KubeletFeederActive(e.h.Deps) {
 		t.Fatal("feeder active with WD_SIG kill switch off")
 	}
 	e.h.Cfg.Watchdog = nil
 	e.h.Cfg.Kubelet.WatchdogHosts = nil
-	if e.h.kubeletFeederActive() {
+	if kubelet.KubeletFeederActive(e.h.Deps) {
 		t.Fatal("feeder active without unit file and unlisted")
 	}
 }
@@ -288,12 +288,12 @@ func TestKubeletFeederLoopStopsOnCancel(t *testing.T) {
 	e := fixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { e.h.runKubeletFeeder(ctx); close(done) }()
+	go func() { kubelet.RunKubeletFeeder(ctx, e.h.Deps); close(done) }()
 	cancel()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("runKubeletFeeder did not return after cancel")
+		t.Fatal("RunKubeletFeeder did not return after cancel")
 	}
 }
 
@@ -363,7 +363,7 @@ func TestKubeletFeederReactivationResetsFails(t *testing.T) {
 	if err := os.Remove(e.unit); err != nil {
 		t.Fatal(err)
 	}
-	e.h.kubeletFeedTick(context.Background()) // inactive tick — fails persist
+	kubelet.KubeletFeedTick(context.Background(), e.h.Deps) // inactive tick — fails persist
 	if e.h.KubeletWdFails != 2 {
 		t.Fatalf("fails=%d want 2 kept while inactive", e.h.KubeletWdFails)
 	}
@@ -372,7 +372,7 @@ func TestKubeletFeederReactivationResetsFails(t *testing.T) {
 	// activation (the first active tick + this flip).
 	e.bodyOK[e.h.Cfg.Kubelet.WdProbeURL] = true
 	writeFile(t, e.unit, "[Service]\nExecStart=/usr/bin/k0s worker --node-ip=10.1.2.3\n")
-	e.h.kubeletFeedTick(context.Background())
+	kubelet.KubeletFeedTick(context.Background(), e.h.Deps)
 	if e.h.KubeletWdFails != 0 {
 		t.Fatalf("fails=%d want 0 on re-activation", e.h.KubeletWdFails)
 	}
