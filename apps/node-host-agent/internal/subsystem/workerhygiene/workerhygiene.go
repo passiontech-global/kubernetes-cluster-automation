@@ -16,8 +16,9 @@
 //   - guards/  — dstate_scopes.go (A2 zombie, W7-H1 D-state, W7-H2
 //     scopes), psi_thrash.go (W2), journald.go (A5),
 //     spegel_calico_netns.go (W7-H4/H7, W9 netns)
-//   - runtime/ — runtime_<name>.go (the six W10 guards, one file
-//     each — see runtime_common.go for the family overview),
+//   - runtime/ — runtime_<name>.go (the eight runtime-resource
+//     guards, one file each — see runtime_common.go for the family
+//     overview),
 //     disk_bloat.go (W6.3), deep_failure_checks.go (W10-KR1/ST2)
 //   - wdeps/   — the shared dependency surface (Config/Seams, Deps,
 //     CycleEnv, Check, the CtrTask machinery, the journal tracker,
@@ -118,6 +119,8 @@ type Hygiene struct {
 	ioPressure       *runtime.IOPressureCheck
 	conntrackLiberal *runtime.ConntrackLiberalCheck
 	clockJump        *runtime.ClockJumpCheck
+	unlinkedFDs      *runtime.UnlinkedOpenFilesCheck
+	cgroupSwap       *runtime.CgroupSwapCheck
 }
 
 // The subsystem-convention export surface cmd/agent wires against:
@@ -162,7 +165,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	d.Actions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_workerhygiene_actions_total",
 		Help: "Worker-hygiene remediation actions by check and action " +
-			"(force_delete|pod_delete|sigkill|pause_kill|restart|rm_dir|shim_kill|image_rm|remediate).",
+			"(force_delete|pod_delete|sigkill|pause_kill|restart|rm_dir|shim_kill|image_rm|remediate|sighup|swap_cap|agent_kill).",
 	}, []string{"check", "action"})
 	d.CiliumAllocated = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_workerhygiene_cilium_allocated_ips",

@@ -1,4 +1,4 @@
-// checks.go — the runtime-domain check constructors: the six W10
+// checks.go — the runtime-domain check constructors: the eight
 // runtime-resource guards (runtime_<name>.go — one file per guard,
 // see runtime_common.go for the family overview), the W6.3
 // disk-bloat detector (disk_bloat.go) and the W10 KR1/ST2
@@ -38,6 +38,16 @@ func NewConntrackLiberal(d *wdeps.Deps) *ConntrackLiberalCheck {
 // NewClockJump returns the konn-pod clock-jump session healer.
 func NewClockJump(d *wdeps.Deps) *ClockJumpCheck {
 	return &ClockJumpCheck{d: d}
+}
+
+// NewUnlinkedOpenFiles returns the deleted-but-open fd space guard.
+func NewUnlinkedOpenFiles(d *wdeps.Deps) *UnlinkedOpenFilesCheck {
+	return &UnlinkedOpenFilesCheck{d: d}
+}
+
+// NewCgroupSwap returns the kubepods swap-leak cap guard.
+func NewCgroupSwap(d *wdeps.Deps) *CgroupSwapCheck {
+	return &CgroupSwapCheck{d: d}
 }
 
 // NewDiskBloat returns the W6.3 disk-bloat runaway detector.

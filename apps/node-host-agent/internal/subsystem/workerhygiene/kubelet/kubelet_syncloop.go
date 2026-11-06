@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,13 @@ import (
 // convention as the other seams.
 const (
 	unixSockProbeTimeout = 5 * time.Second
+	// plegRelistHighSec is the kubelet_pleg_relist_duration_seconds
+	// threshold — avg or any quantile above it means the PLEG
+	// relist itself is degrading.
+	plegRelistHighSec = 5.0
+	// plegLastSeenHighSec is the kubelet_pleg_last_seen_seconds lag
+	// above which PLEG has stopped observing state changes at all.
+	plegLastSeenHighSec = 30.0
 )
 
 // --- Check: kubelet syncloop / containerd socket (A4) ---
@@ -34,11 +42,19 @@ const (
 
 // SyncloopCheck is the A4 PLEG probe as a Check; it owns the
 // consecutive-fail streak and the unauth-logged flag (ex-Hygiene
-// .syncloopFails/.syncloopUnauth).
+// .syncloopFails/.syncloopUnauth), plus the PLEG-metrics early
+// warning streak (plegFails/prevDiscard): the /metrics relist and
+// last-seen series degrade a full cycle before /healthz/syncloop
+// ever answers 500, so the metrics half latches
+// state-kubelet-pleg-unhealthy for nodereporter's
+// KubeletPLEGUnhealthy condition while the sync loop still replies.
 type SyncloopCheck struct {
-	d      *wdeps.Deps
-	fails  int
-	unauth bool // last probe was 401/403 — log the streak once
+	d           *wdeps.Deps
+	fails       int
+	unauth      bool  // last probe was 401/403 — log the streak once
+	plegFails   int   // consecutive over-threshold PLEG metric cycles
+	prevDiscard int64 // last kubelet_pleg_discard_events read
+	discardSeen bool  // prevDiscard holds a real baseline
 }
 
 // Name returns the check label / WD_SIG key.
@@ -50,6 +66,10 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckSyncloop, "gated").Inc()
 		return
 	}
+	// The /metrics PLEG series degrade before /healthz/syncloop ever
+	// answers 500 — run the early-warning scrape every cycle,
+	// independent of the syncloop verdict below.
+	c.probePLEG(ctx)
 	var lastErr error
 	alive := false
 	unauth := false
@@ -151,6 +171,132 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	c.d.Cycles.WithLabelValues(wdeps.CheckSyncloop, "ok").Inc()
+}
+
+// --- PLEG relist-latency early warning (kubelet /metrics) ---
+// kubelet_pleg_relist_duration_seconds (summary: quantiles + sum +
+// count), kubelet_pleg_last_seen_seconds (gauge) and
+// kubelet_pleg_discard_events (counter) tell the PLEG-health story a
+// full cycle before /healthz/syncloop dies: relist avg/quantile >5s
+// or last-seen lag >30s means the relist loop is starving. The
+// scrape goes through the KubeletMetricsFn seam — same :10250
+// listener and SA bearer as the healthz probe. A scrape error or a
+// body without PLEG series is inconclusive (streak and latch kept —
+// never count, never clear on missing evidence). ConsecNeeded
+// consecutive over-threshold cycles enter
+// state-kubelet-pleg-unhealthy so nodereporter flips
+// KubeletPLEGUnhealthy early; a healthy scrape clears both.
+
+// plegSample is one parsed scrape of the PLEG series.
+type plegSample struct {
+	relistAvg   float64 // relist_duration_seconds_sum / _count
+	relistQuant float64 // worst quantile sample
+	lastSeen    float64 // pleg_last_seen_seconds
+	discard     int64   // pleg_discard_events counter
+	hasRelist   bool
+	hasLastSeen bool
+	hasDiscard  bool
+}
+
+// parsePLEGMetrics picks the PLEG series out of a kubelet /metrics
+// text exposition. Sample lines are "<name>{labels} value" or
+// "<name> value"; HELP/TYPE comments are skipped. The summary emits
+// quantile samples plus _sum/_count — avg is computed from the pair
+// and the worst quantile is kept; a histogram variant (only
+// _bucket/_sum/_count lines) still yields the avg.
+func parsePLEGMetrics(body string) plegSample {
+	var s plegSample
+	var sum, cnt float64
+	for _, line := range strings.Split(body, "\n") {
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		name := f[0]
+		if i := strings.IndexByte(name, '{'); i >= 0 {
+			name = name[:i]
+		}
+		v, err := strconv.ParseFloat(f[len(f)-1], 64)
+		if err != nil {
+			continue
+		}
+		switch name {
+		case "kubelet_pleg_relist_duration_seconds":
+			// Summary quantile rows — worst wins; non-quantile
+			// label rows don't exist upstream but guard anyway.
+			if strings.Contains(f[0], "quantile=") {
+				s.hasRelist = true
+				if v > s.relistQuant {
+					s.relistQuant = v
+				}
+			}
+		case "kubelet_pleg_relist_duration_seconds_sum":
+			sum, s.hasRelist = v, true
+		case "kubelet_pleg_relist_duration_seconds_count":
+			cnt, s.hasRelist = v, true
+		case "kubelet_pleg_last_seen_seconds":
+			s.lastSeen, s.hasLastSeen = v, true
+		case "kubelet_pleg_discard_events":
+			s.discard, s.hasDiscard = int64(v), true
+		}
+	}
+	if cnt > 0 {
+		s.relistAvg = sum / cnt
+	}
+	return s
+}
+
+// probePLEG scrapes kubelet /metrics once and updates the PLEG
+// streak + latch plus the exported gauges. Called at the head of
+// every Run so the early-warning verdict is independent of the
+// syncloop probe's outcome.
+func (c *SyncloopCheck) probePLEG(ctx context.Context) {
+	body, err := c.d.Cfg.Seams.KubeletMetricsFn(ctx,
+		c.d.Cfg.Kubelet.MetricsURL, kubeletBearer(c.d), wdeps.ProbeTimeout)
+	if err != nil {
+		// Unreachable/unauthorized /metrics says nothing about
+		// PLEG — inconclusive like the other failed-probe paths.
+		return
+	}
+	s := parsePLEGMetrics(body)
+	if !s.hasRelist && !s.hasLastSeen {
+		// The endpoint answered but the PLEG family isn't there —
+		// inconclusive (metrics stripped/downgraded), keep state.
+		return
+	}
+	if s.hasLastSeen {
+		c.d.KubeletPLEGLastSeenAgeSec = s.lastSeen
+	}
+	discardDelta := int64(0)
+	if s.hasDiscard {
+		c.d.KubeletPLEGDiscardEvents = s.discard
+		if c.discardSeen && s.discard >= c.prevDiscard {
+			discardDelta = s.discard - c.prevDiscard
+		}
+		c.prevDiscard, c.discardSeen = s.discard, true
+	}
+	over := (s.hasRelist && (s.relistAvg > plegRelistHighSec ||
+		s.relistQuant > plegRelistHighSec)) ||
+		(s.hasLastSeen && s.lastSeen > plegLastSeenHighSec)
+	if !over {
+		c.plegFails = 0
+		c.d.State.Exit(hoststate.LatchKubeletPLEGUnhealthy, nil)
+		return
+	}
+	c.plegFails++
+	if c.plegFails < c.d.Cfg.ConsecNeeded {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: kubelet-pleg-unhealthy relist_avg=%.2f relist_q=%.2f last_seen=%.1f discards=+%d (check %d/%d)",
+			s.relistAvg, s.relistQuant, s.lastSeen, discardDelta,
+			c.plegFails, c.d.Cfg.ConsecNeeded))
+		return
+	}
+	c.d.State.Enter(hoststate.LatchKubeletPLEGUnhealthy, fmt.Sprintf(
+		"relist_avg=%.2f relist_q=%.2f last_seen=%.1f discards=+%d",
+		s.relistAvg, s.relistQuant, s.lastSeen, discardDelta))
 }
 
 // kubeletBearer reads the service-account token kubelet's :10250

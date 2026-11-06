@@ -368,6 +368,19 @@ var conditionDefs = []conditionDef{
 		problemReason:  "SystemdSessionBloatDetected",
 		stateKey:       hoststate.LatchSystemdSessionBloat,
 	},
+	{
+		// workerhygiene's kubelet-syncloop PLEG metrics guard —
+		// relist latency (avg/quantile >5s) or last-seen lag >30s
+		// for ConsecNeeded cycles. Early warning: PLEG is starving
+		// before /healthz/syncloop ever answers 500, so NHC/SNR and
+		// the runbooks see the degrade while the sync loop still
+		// replies.
+		typ:            "KubeletPLEGUnhealthy",
+		defaultReason:  "KubeletPLEGHealthy",
+		defaultMessage: "kubelet PLEG relist latency and last-seen lag healthy",
+		problemReason:  "KubeletPLEGUnhealthyDetected",
+		stateKey:       hoststate.LatchKubeletPLEGUnhealthy,
+	},
 }
 
 // condEval is the evaluated state of one condition this cycle.

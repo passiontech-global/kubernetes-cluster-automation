@@ -14,7 +14,7 @@ func NewCtrTasks(d *wdeps.Deps) *CtrTasksCheck {
 
 // NewCtrImages returns the 37 corrupted-layer image healer.
 func NewCtrImages(d *wdeps.Deps) *CtrImagesCheck {
-	return &CtrImagesCheck{d: d}
+	return &CtrImagesCheck{d: d, execFormatHealed: map[string]bool{}}
 }
 
 // NewIngestGC returns the 39/A3 stale-ingest + content-prune GC.

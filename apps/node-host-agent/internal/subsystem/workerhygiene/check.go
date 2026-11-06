@@ -57,6 +57,8 @@ func (h *Hygiene) initChecks() {
 	h.ioPressure = runtime.NewIOPressure(d)
 	h.conntrackLiberal = runtime.NewConntrackLiberal(d)
 	h.clockJump = runtime.NewClockJump(d)
+	h.unlinkedFDs = runtime.NewUnlinkedOpenFiles(d)
+	h.cgroupSwap = runtime.NewCgroupSwap(d)
 	h.checks = []wdeps.Check{
 		h.stall,       // wdeps.CheckStall
 		h.watch,       // wdeps.CheckWatch
@@ -97,5 +99,7 @@ func (h *Hygiene) initChecks() {
 		h.ioPressure,       // wdeps.CheckIOPressure
 		h.conntrackLiberal, // wdeps.CheckConntrackLiberal
 		h.clockJump,        // wdeps.CheckClockJump
+		h.unlinkedFDs,      // wdeps.CheckUnlinkedOpenFiles
+		h.cgroupSwap,       // wdeps.CheckCgroupSwap
 	}
 }

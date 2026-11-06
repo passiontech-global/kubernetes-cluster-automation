@@ -46,12 +46,14 @@ const (
 	CheckHostOOM     = "host-oom"           // W10-KR1 SystemOOMVictim event + metric
 	CheckOrphanHP    = "orphan-hostpath"    // W10-ST2 orphaned pvc-* hostPath dirs
 	// Runtime-resource guards (runtime package).
-	CheckCgroupDying      = "cgroup-dying-reclaim"        // nr_dying_descendants reclaim
-	CheckSystemdSessions  = "systemd-session-hygiene"     // logind session janitor
-	CheckOverlayFSStale   = "overlayfs-stale-mount"       // ESTALE/lowerdir image healer
-	CheckIOPressure       = "io-pressure-throttler"       // diskstats + PSI io throttler
-	CheckConntrackLiberal = "conntrack-tcp-liberal-guard" // neb1 be_liberal fixer
-	CheckClockJump        = "clock-jump-session-healer"   // konn pod recreate after step
+	CheckCgroupDying       = "cgroup-dying-reclaim"        // nr_dying_descendants reclaim
+	CheckSystemdSessions   = "systemd-session-hygiene"     // logind session janitor
+	CheckOverlayFSStale    = "overlayfs-stale-mount"       // ESTALE/lowerdir image healer
+	CheckIOPressure        = "io-pressure-throttler"       // diskstats + PSI io throttler
+	CheckConntrackLiberal  = "conntrack-tcp-liberal-guard" // neb1 be_liberal fixer
+	CheckClockJump         = "clock-jump-session-healer"   // konn pod recreate after step
+	CheckUnlinkedOpenFiles = "unlinked-open-files"         // deleted-but-open fd space guard
+	CheckCgroupSwap        = "cgroup-swap-leak"            // kubepods memory.swap leak cap
 )
 
 // CycleEnv is the per-cycle shared context Cycle hands to every

@@ -323,6 +323,18 @@ var descTable = []struct {
 		"sockstat TCP close_wait."},
 	{descLocalPVDirBytes, "node_host_agent_localpv_dir_bytes",
 		"Bytes under the OpenEBS LocalPV pvc-* volume dir."},
+	{descNetstatListenOverflows, "node_host_agent_netstat_tcp_listen_overflows_total",
+		"TcpExt ListenOverflows — SYNs dropped on a full accept queue."},
+	{descNetstatListenDrops, "node_host_agent_netstat_tcp_listen_drops_total",
+		"TcpExt ListenDrops — connections dropped from a full listen backlog."},
+	{descNetstatSynRetrans, "node_host_agent_netstat_tcp_syn_retrans_total",
+		"TcpExt TCPSynRetrans — retransmitted SYNs."},
+	{descNetstatTCPTimeouts, "node_host_agent_netstat_tcp_timeouts_total",
+		"TcpExt TCPTimeouts — connections that timed out."},
+	{descSNMPReasmFails, "node_host_agent_snmp_ip_reasm_fails_total",
+		"Ip ReasmFails — IP fragment reassembly failures."},
+	{descSNMPRcvbufErrors, "node_host_agent_snmp_udp_rcvbuf_errors_total",
+		"Udp RcvbufErrors — UDP datagrams dropped on a full receive buffer."},
 }
 
 // descMetaTable maps each desc to its textfile fqName/help — a
@@ -391,6 +403,7 @@ func (c *Collector) collectors(avg60 float64, psiOK bool,
 		{"cgroup-mem-events", c.collectCgroupMemEvents},
 		{"kernel-keys", c.collectKernelKeys},
 		{"localpv", c.collectLocalPVUsage},
+		{"netstat-snmp", c.collectNetstatSNMP},
 	}
 }
 

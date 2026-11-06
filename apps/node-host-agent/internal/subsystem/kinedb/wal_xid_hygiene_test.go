@@ -275,3 +275,124 @@ func TestMaintCycleXIDFreezeFailure(t *testing.T) {
 		t.Fatalf("textfile:\n%s", content)
 	}
 }
+
+// --- item 5: multiXact age ---
+
+func TestProbeHygieneMultiXactEmits(t *testing.T) {
+	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
+		testutil.ExecRule{Substr: "datminmxid", Out: "250000\n"},
+	))
+	res := k.probeCycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if res.hyg.mxidAge != 250000 || !res.hyg.mxidSeen {
+		t.Fatalf("mxid=%+v", res.hyg)
+	}
+	content := readText(t, dir, xactPromFile)
+	if !strings.Contains(content, "kine_db_multixact_age_transactions 250000") {
+		t.Fatalf("textfile:\n%s", content)
+	}
+}
+
+// A failed mxid read gates only its own series — headers-only in
+// the xact textfile, probe still succeeds.
+func TestProbeHygieneMultiXactQueryFailure(t *testing.T) {
+	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
+		testutil.ExecRule{Substr: "datminmxid", Err: errors.New("connection reset")},
+	))
+	res := k.probeCycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if res.hyg.mxidSeen {
+		t.Fatal("failed mxid read must stay unseen")
+	}
+	content := readText(t, dir, xactPromFile)
+	if !strings.Contains(content, "# TYPE kine_db_multixact_age_transactions") {
+		t.Fatalf("header missing:\n%s", content)
+	}
+	for _, l := range strings.Split(content, "\n") {
+		if strings.HasPrefix(l, "kine_db_multixact_age_transactions ") {
+			t.Fatalf("fabricated a sample on query failure:\n%s", content)
+		}
+	}
+}
+
+// --- item 6: orphaned prepared transactions ---
+
+// Orphans listed by pg_prepared_xacts are rolled back in place and
+// counted — gid reaches SQL as a safely-quoted literal.
+func TestOrphanPreparedXactsRolledBack(t *testing.T) {
+	k, fr, dir := fixture(t, hygieneRules)
+	fr.On("pg_prepared_xacts", "gid-orphan-1\ngid'quo\n")
+	fr.On("ROLLBACK PREPARED", "ROLLBACK PREPARED\n")
+	before := preparedXactRolledBackTotal.Load()
+	res := k.probeCycle(context.Background())
+	h := res.hyg
+	if !h.preparedSeen || h.preparedXacts != 2 || h.preparedRolled != 2 {
+		t.Fatalf("prepared=%+v notes=%v", h, res.notes)
+	}
+	j := fr.Joined()
+	if !strings.Contains(j, "ROLLBACK PREPARED 'gid-orphan-1'") {
+		t.Fatalf("orphan gid not rolled back:\n%s", j)
+	}
+	// A quote inside the gid doubles per SQL literal rules — it
+	// must not break the statement.
+	if !strings.Contains(j, "ROLLBACK PREPARED 'gid''quo'") {
+		t.Fatalf("gid quoting wrong:\n%s", j)
+	}
+	if got := preparedXactRolledBackTotal.Load() - before; got != 2 {
+		t.Fatalf("rolled-back total delta=%d want 2", got)
+	}
+	content := readText(t, dir, xactPromFile)
+	for _, want := range []string{
+		"kine_db_orphan_prepared_xacts 2",
+		"kine_db_orphan_prepared_xacts_rolled_back_total ",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("textfile missing %q:\n%s", want, content)
+		}
+	}
+}
+
+// A failed rollback is absorbed (note + retry next round) — the
+// sibling orphans still roll back and the probe still succeeds.
+func TestOrphanPreparedXactsPartialFailure(t *testing.T) {
+	k, fr, _ := fixture(t, hygieneRules)
+	fr.On("pg_prepared_xacts", "gid-bad\ngid-good\n")
+	fr.On("ROLLBACK PREPARED 'gid-good'", "ROLLBACK PREPARED\n")
+	fr.FailOn("ROLLBACK PREPARED 'gid-bad'", errors.New("already aborted"))
+	res := k.probeCycle(context.Background())
+	h := res.hyg
+	if !h.preparedSeen || h.preparedXacts != 2 || h.preparedRolled != 1 {
+		t.Fatalf("prepared=%+v notes=%v", h, res.notes)
+	}
+	found := false
+	for _, n := range res.notes {
+		if strings.Contains(n, "rollback-prepared-gid-bad-fail") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("failed rollback not noted: %v", res.notes)
+	}
+}
+
+// An empty prepared-xacts read emits a real zero gauge and never
+// runs a rollback.
+func TestNoOrphanPreparedXacts(t *testing.T) {
+	k, fr, dir := fixture(t, hygieneRules) // pg_prepared_xacts unmatched → ""
+	res := k.probeCycle(context.Background())
+	h := res.hyg
+	if !h.preparedSeen || h.preparedXacts != 0 || h.preparedRolled != 0 {
+		t.Fatalf("prepared=%+v", h)
+	}
+	if strings.Contains(fr.Joined(), "ROLLBACK PREPARED") {
+		t.Fatalf("rollback ran with no orphans:\n%s", fr.Joined())
+	}
+	content := readText(t, dir, xactPromFile)
+	if !strings.Contains(content, "kine_db_orphan_prepared_xacts 0") {
+		t.Fatalf("textfile:\n%s", content)
+	}
+}

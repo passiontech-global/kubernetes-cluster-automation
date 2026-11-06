@@ -212,6 +212,11 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				actual, expected))
 			c.d.CiliumWGFails = 0
 			c.d.Actions.WithLabelValues(wdeps.CheckCiliumWG, "sigkill").Inc()
+			// This check runs after CiliumEnvoyCheck in the dispatch —
+			// bounce envoy inline for the xDS resync (the shared flag
+			// would only be seen next cycle).
+			restartEnvoyAfterAgentKill(c.d, wdeps.CheckCiliumWG,
+				"cilium-agent restarted for wireguard peer drift")
 		} else {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: cilium-wg-peers allowed_ips=%d expected=%d, no running task to kill",

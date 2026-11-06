@@ -188,6 +188,30 @@ type Seams struct {
 	// clock-jump healer's konnectivity evidence read. Default the
 	// kube-client GetLogs call; tests stub with canned output.
 	PodLogFn func(ctx context.Context, ns, name string, tailLines int64) (string, error)
+	// DeletedFDStatFn stats a /proc/<pid>/fd link whose readlink
+	// target ends in " (deleted)" — the kernel resolves the magic
+	// link to the still-open inode, so the fd's dev/ino/size are
+	// readable even though the path is gone (the
+	// unlinked-open-files guard's evidence source and (dev,ino)
+	// dedup key). ok=false when the fd vanished mid-walk or isn't
+	// a regular file. Seam.
+	DeletedFDStatFn func(path string) (dev, ino uint64, size int64, ok bool)
+	// DNSProbeTCP sends one TCP DNS query — the :53 datapath
+	// probe's TCP half (a wedged TCP listener still serves UDP,
+	// and truncated/large answers ride TCP). Seam.
+	DNSProbeTCP func(addr, name string, timeout time.Duration) bool
+	// KubeletMetricsFn GETs the kubelet :10250 /metrics body with
+	// the SA bearer — the syncloop check's PLEG relist/last-seen
+	// series source. Insecure TLS + Authorization header: kubelet
+	// cert SANs never cover the loopback and anonymous /metrics is
+	// denied. Seam.
+	KubeletMetricsFn func(ctx context.Context, url, bearer string, timeout time.Duration) (string, error)
+	// CiliumServiceBackendsFn returns the local BPF service map's
+	// backend counts keyed "<namespace>/<name>" — the cilium-lrp
+	// desync evidence source. Default: GET /v1/service off the
+	// agent socket via UnixGet (`cilium-dbg service list -o json`
+	// equivalent — same API the CLI scrapes). Seam.
+	CiliumServiceBackendsFn func(ctx context.Context) (map[string]int, error)
 }
 
 // applyDefaults fills every unset knob — the per-group methods below
@@ -396,6 +420,27 @@ func (s *Seams) applyDefaults(c *Config) {
 	}
 	if s.IoniceIdleFn == nil {
 		s.IoniceIdleFn = ioniceIdle // build-tag split: linux ioprio_set
+	}
+	if s.DeletedFDStatFn == nil {
+		s.DeletedFDStatFn = deletedFDStat
+	}
+	if s.DNSProbeTCP == nil {
+		s.DNSProbeTCP = tcpDNSQuery
+	}
+	if s.KubeletMetricsFn == nil {
+		s.KubeletMetricsFn = kubeletMetricsGet
+	}
+	if s.CiliumServiceBackendsFn == nil {
+		s.CiliumServiceBackendsFn = func(ctx context.Context) (map[string]int, error) {
+			// The agent API /v1/service is the `cilium-dbg service
+			// list -o json` equivalent — the CLI scrapes the same
+			// endpoint over the same socket; no container exec.
+			body, err := s.UnixGet(ctx, c.Cilium.Socket, "/v1/service")
+			if err != nil {
+				return nil, err
+			}
+			return ParseCiliumServiceBackends(body)
+		}
 	}
 	if s.PodLogFn == nil {
 		s.PodLogFn = func(ctx context.Context, ns, name string, tail int64) (string, error) {

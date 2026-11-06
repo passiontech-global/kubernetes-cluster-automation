@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -648,6 +649,112 @@ func TestCtrImageHealerPrivateRegistryUntouched(t *testing.T) {
 	}
 	if !slices.Equal(removed, want) {
 		t.Fatalf("removed=%v want %v", removed, want)
+	}
+}
+
+// Corrupted-on-disk-layer signatures at run/start time — the
+// waiting reasons kubelet reports for a container that started and
+// then died on the corrupt layer (RunContainerError/StartError).
+func TestCtrImageHealerCorruptLayerSignatures(t *testing.T) {
+	e := fixture(t)
+	var removed []string
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+		removed = append(removed, img)
+		return nil
+	}
+	for i, tc := range []struct {
+		reason, msg string
+	}{
+		{"RunContainerError", "failed to mount /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/9/fs: structure needs cleaning"},
+		{"StartError", "failed to create shim task: OCI runtime create failed: input/output error"},
+		{"RunContainerError", "error while loading shared libraries: libc.so.6: file too short"},
+	} {
+		p := waitingPod("stuck-"+strconv.Itoa(i), "default", uidA[:8]+strconv.Itoa(i),
+			"registry.local/app:v"+strconv.Itoa(i), "",
+			tc.reason, tc.msg)
+		if _, err := e.cs.CoreV1().Pods("default").Create(
+			context.Background(), p, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.h.Cycle(context.Background())
+	if len(removed) != 3 {
+		t.Fatalf("removed=%v want 3 (all on-disk-corrupt signatures)", removed)
+	}
+}
+
+// The exec-format class is once-per-image: a 0-byte truncated
+// binary heals on repull, but a wrong-arch image repulls the same
+// un-runnable ref — the ref may be deleted at most ONCE, even after
+// the 15m rm budget ages out. Other signatures stay unlimited.
+func TestCtrImageHealerExecFormatOncePerImage(t *testing.T) {
+	e := fixture(t)
+	var removed []string
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+		removed = append(removed, img)
+		return nil
+	}
+	p := waitingPod("wrongarch", "default", uidA, "app:v1",
+		"registry.local/app@sha256:beef",
+		"StartError", "exec /bin/app: exec format error")
+	if _, err := e.cs.CoreV1().Pods("default").Create(
+		context.Background(), p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	if len(removed) != 2 {
+		t.Fatalf("removed=%v want 2 (tag + digest refs once)", removed)
+	}
+	// Budget ages out but the refs are healed — a persistent
+	// wrong-arch image must never loop-delete.
+	e.now = e.now.Add(16 * time.Minute)
+	e.h.Cycle(context.Background())
+	if len(removed) != 2 {
+		t.Fatalf("removed=%v want 2 (exec-format refs deleted at most once)", removed)
+	}
+	e.now = e.now.Add(16 * time.Minute)
+	e.h.Cycle(context.Background())
+	if len(removed) != 2 {
+		t.Fatalf("removed=%v want 2 (still healed)", removed)
+	}
+}
+
+// A DIFFERENT image with an exec-format failure still gets its own
+// single heal — the ledger is per-ref.
+func TestCtrImageHealerExecFormatPerRef(t *testing.T) {
+	e := fixture(t)
+	var removed []string
+	e.h.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+		removed = append(removed, img)
+		return nil
+	}
+	for i, img := range []string{"bad-a:1", "bad-b:2"} {
+		p := waitingPod("w"+strconv.Itoa(i), "default",
+			uidA[:8]+strconv.Itoa(i), img, "",
+			"StartError", "exec format error")
+		if _, err := e.cs.CoreV1().Pods("default").Create(
+			context.Background(), p, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.h.Cycle(context.Background())
+	if len(removed) != 2 {
+		t.Fatalf("removed=%v want 2 (each ref healed once)", removed)
+	}
+	// A pod reporting exec-format AND a different corrupt signature
+	// on the same cycle keeps the once-guard on the exec refs while
+	// the other signature still re-deletes after cooldown.
+	e.now = e.now.Add(16 * time.Minute)
+	p := waitingPod("mixed", "default", uidC, "dirty:3", "",
+		"CreateContainerError", "failed to extract layer sha256:zz")
+	if _, err := e.cs.CoreV1().Pods("default").Create(
+		context.Background(), p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	e.h.Cycle(context.Background())
+	want := []string{"bad-a:1", "bad-b:2", "docker.io/library/dirty:3"}
+	if len(removed) != 3 {
+		t.Fatalf("removed=%v want %v (only the new non-exec ref re-deleted)", removed, want)
 	}
 }
 

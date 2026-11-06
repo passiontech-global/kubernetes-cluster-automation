@@ -2,6 +2,7 @@ package workerhygiene
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -241,6 +242,149 @@ func TestCheckCiliumLRPDNSGates(t *testing.T) {
 	e.h.checkCiliumLRPDNS(context.Background(), nil, true, true)
 	if e.h.ciliumLRP.Fails != 0 {
 		t.Fatalf("nldFails = %d, want 0 with cilium-agent absent", e.h.ciliumLRP.Fails)
+	}
+}
+
+// TCP-failing-only :53 datapath is still a wedge — UDP alone must
+// not mark the listener healthy.
+func TestCheckCiliumLRPDNSTCPHalfWedge(t *testing.T) {
+	e := fixture(t, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-local-dns-b2c3d", Namespace: "kube-system",
+			UID: types.UID(uidA), CreationTimestamp: metav1.Now(),
+		},
+		Spec: corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+	})
+	if err := os.MkdirAll(filepath.Join(e.sysnet, "cilium_host"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.mkProc(t, 4343, "S", "", "")
+	e.mkTask(t, uidB, "cilium-agent", 4343)
+	pod, _ := e.cs.CoreV1().Pods("kube-system").Get(
+		context.Background(), "node-local-dns-b2c3d", metav1.GetOptions{})
+	// UDP answers, TCP silent — a one-sided wedge still counts.
+	e.h.Cfg.Seams.DNSProbe = func(string, string, time.Duration) bool { return true }
+	e.dnsTCP = false
+	e.svcErr = errors.New("map unreadable") // desync probe inconclusive
+	e.h.checkCiliumLRPDNS(context.Background(), []corev1.Pod{*pod}, true, true)
+	e.h.checkCiliumLRPDNS(context.Background(), []corev1.Pod{*pod}, true, true)
+	if _, err := e.cs.CoreV1().Pods("kube-system").Get(
+		context.Background(), "node-local-dns-b2c3d", metav1.GetOptions{}); err == nil {
+		t.Fatal("nld pod not deleted on TCP-only :53 wedge")
+	}
+}
+
+// --- local BPF service-map desync ---
+
+// TestCheckCiliumLRPServiceDesync: apiserver-side kube-dns has Ready
+// endpoints but the local BPF map has 0 backends → restart
+// cilium-agent through last-cilium-restart after ConsecNeeded
+// cycles; the nld pod delete is suppressed meanwhile.
+func TestCheckCiliumLRPServiceDesync(t *testing.T) {
+	e := fixture(t, &corev1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{Name: "kube-dns", Namespace: "kube-system"},
+		Subsets: []corev1.EndpointSubset{{
+			Addresses: []corev1.EndpointAddress{{IP: "10.244.1.7"}},
+		}},
+	})
+	if err := os.MkdirAll(filepath.Join(e.sysnet, "cilium_host"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.mkProc(t, 4343, "S", "", "")
+	e.mkTask(t, uidB, "cilium-agent", 4343)
+	e.svcBackends = map[string]int{
+		"kube-system/kube-dns": 0, // desynced — ready endpoints, no backends
+		"default/kubernetes":   1,
+	}
+	e.h.checkCiliumLRPDNS(context.Background(), nil, true, true)
+	killed := false
+	for _, k := range e.kills {
+		if k.pid == 4343 && k.sig == syscall.SIGKILL {
+			killed = true
+		}
+	}
+	if killed {
+		t.Fatal("agent killed before ConsecNeeded desync cycles")
+	}
+	e.h.checkCiliumLRPDNS(context.Background(), nil, true, true)
+	killed = false
+	for _, k := range e.kills {
+		if k.pid == 4343 && k.sig == syscall.SIGKILL {
+			killed = true
+		}
+	}
+	if !killed {
+		t.Fatal("cilium-agent not killed on confirmed BPF service-map desync")
+	}
+	if _, err := os.Stat(filepath.Join(e.state, "last-cilium-restart")); err != nil {
+		t.Fatal("last-cilium-restart budget not spent")
+	}
+}
+
+// TestCheckCiliumLRPDesyncSuppressesPodDelete: while the map is
+// desynced the :53 datapath verdict is explained by the agent —
+// the nld pod must not be deleted for it.
+func TestCheckCiliumLRPDesyncSuppressesPodDelete(t *testing.T) {
+	e := fixture(t, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-local-dns-c4d5e", Namespace: "kube-system",
+			UID: types.UID(uidA), CreationTimestamp: metav1.Now(),
+		},
+		Spec: corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+	}, &corev1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{Name: "kube-dns", Namespace: "kube-system"},
+		Subsets: []corev1.EndpointSubset{{
+			Addresses: []corev1.EndpointAddress{{IP: "10.244.1.7"}},
+		}},
+	})
+	if err := os.MkdirAll(filepath.Join(e.sysnet, "cilium_host"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.mkProc(t, 4343, "S", "", "")
+	e.mkTask(t, uidB, "cilium-agent", 4343)
+	e.svcBackends = map[string]int{"kube-system/kube-dns": 0, "default/kubernetes": 1}
+	// :53 is dead on both transports — the desync explains it.
+	e.h.Cfg.Seams.DNSProbe = func(string, string, time.Duration) bool { return false }
+	e.dnsTCP = false
+	for i := 0; i < 3; i++ {
+		e.h.checkCiliumLRPDNS(context.Background(), nil, true, true)
+	}
+	if _, err := e.cs.CoreV1().Pods("kube-system").Get(
+		context.Background(), "node-local-dns-c4d5e", metav1.GetOptions{}); err != nil {
+		t.Fatal("nld pod deleted while the desync explained the :53 failures")
+	}
+}
+
+func TestParseCiliumServiceBackends(t *testing.T) {
+	body := []byte(`[
+		{"spec":{"id":1,"name":"kube-dns","namespace":"kube-system",
+			"frontend-address":{"ip":"10.96.0.10","port":53},
+			"backend-addresses":[{"ip":"10.244.1.7"},{"ip":"10.244.2.3"}]}},
+		{"spec":{"id":2,"name":"kube-dns","namespace":"kube-system",
+			"frontend-address":{"ip":"10.96.0.10","port":53},
+			"backend-addresses":[{"ip":"10.244.1.7"}]}},
+		{"spec":{"id":3,"flags":{"name":"kubernetes","namespace":"default"},
+			"backend-addresses":[]}},
+		{"spec":{"id":4,"frontend-address":{"ip":"0.0.0.0","port":0},
+			"backend-addresses":[{"ip":"x"}]}}
+	]`)
+	got, err := wdeps.ParseCiliumServiceBackends(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["kube-system/kube-dns"] != 3 {
+		t.Fatalf("kube-dns backends=%d want 3 (sum across transports)",
+			got["kube-system/kube-dns"])
+	}
+	if got["default/kubernetes"] != 0 {
+		t.Fatalf("kubernetes backends=%d want 0", got["default/kubernetes"])
+	}
+	if _, ok := got["/"]; ok {
+		t.Fatal("nameless entry mapped")
 	}
 }
 

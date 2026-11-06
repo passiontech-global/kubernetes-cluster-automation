@@ -197,6 +197,7 @@ func TestAllConditionDefaults(t *testing.T) {
 		"CPUStealPressure":       {"CPUStealNormal", "hypervisor CPU steal below pressure threshold"},
 		"CgroupDyingLeak":        {"CgroupDyingNormal", "cgroup dying descendants below pressure threshold"},
 		"SystemdSessionBloat":    {"SystemdSessionsNormal", "logind session count and D-Bus latency healthy"},
+		"KubeletPLEGUnhealthy":   {"KubeletPLEGHealthy", "kubelet PLEG relist latency and last-seen lag healthy"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

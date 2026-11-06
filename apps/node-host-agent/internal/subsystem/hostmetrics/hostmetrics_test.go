@@ -54,6 +54,8 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		ConntrackMaxFile:   filepath.Join(root, "nf_conntrack_max"),
 		FileNRFile:         filepath.Join(root, "file-nr"),
 		SockstatFile:       filepath.Join(root, "sockstat"),
+		NetstatFile:        filepath.Join(root, "netstat"),
+		SNMPFile:           filepath.Join(root, "snmp"),
 		FilesystemTargets:  []string{"/fake/etc", "/fake/k0s"},
 		// Wave-2 sources under root — never the real /proc or /sys:
 		// an fdinfo/zombie sweep of the live host would leak real
@@ -117,7 +119,10 @@ func metricValue(t *testing.T, c *Collector, name string,
 			if !matchLabels(m, labels) {
 				continue
 			}
-			return m.GetGauge().GetValue(), true
+			if g := m.GetGauge(); g != nil {
+				return g.GetValue(), true
+			}
+			return m.GetCounter().GetValue(), true
 		}
 	}
 	return 0, false
@@ -205,8 +210,9 @@ func TestDescribe(t *testing.T) {
 	// cgroup memory high/oom_kill).
 	// + 2 W8 descs (kernel-keys ratio, sockstat tcp close_wait).
 	// + 1 W9 desc (localpv dir bytes).
-	if got := len(ch); got != 51 {
-		t.Fatalf("Describe emitted %d descs want 51", got)
+	// + 6 netstat/snmp kernel TCP/IP counter descs.
+	if got := len(ch); got != 57 {
+		t.Fatalf("Describe emitted %d descs want 57", got)
 	}
 }
 
