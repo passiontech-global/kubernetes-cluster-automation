@@ -374,41 +374,39 @@ func TestExternalSecretNudgeReadySinceFallback(t *testing.T) {
 	}
 }
 
-// The nudged cooldown suppresses a still-stuck ES inside the 1h
-// window and lets an expired stamp re-nudge. CooldownSet has no
-// enumeration — stamps for vanished ESs are dead weight that ages
-// out of the window on its own.
+// The persisted stamp IS the cooldown: a still-stuck ES whose
+// force-sync is inside the 1h window is suppressed, while an
+// expired stamp re-nudges — the same guarantee the dropped in-RAM
+// ledger provided, durable across restarts.
 func TestExternalSecretNudgeNudgedCooldown(t *testing.T) {
+	now := time.Now()
 	live := esObj("apps", "es-live", "False", 30*time.Minute)
+	live.SetAnnotations(map[string]string{
+		esForceSyncAnno: strconv.FormatInt(now.Add(-10*time.Minute).Unix(), 10),
+	})
 	expired := esObj("apps", "es-expired", "False", 2*time.Hour)
+	expired.SetAnnotations(map[string]string{
+		esLastNudgeAnno: now.Add(-esNudgeCooldown - time.Minute).UTC().Format(time.RFC3339),
+	})
 	healed := esObj("apps", "es-healed", "True", 3*time.Hour)
 	dyn := newDynFake(live, expired, healed)
 	n := newNudge(dyn, true)
-	now := time.Now()
-	fresh := now.Add(-10 * time.Minute)
-	stale := now.Add(-esNudgeCooldown - time.Minute)
-	n.nudged.Stamp("apps/es-live", fresh)    // live + inside cooldown → suppress
-	n.nudged.Stamp("apps/es-expired", stale) // live + past cooldown → re-nudge
-	n.nudged.Stamp("apps/es-healed", stale)  // healed → nothing re-adds
-	n.nudged.Stamp("apps/es-gone", fresh)    // vanished → dead weight
+	freshStamp := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-live", esForceSyncAnno)
 
 	if err := n.nudge(ctx, true, true); err != nil { // edge path — all stuck ESs eligible
 		t.Fatal(err)
 	}
-	if !n.nudged.CooledDown("apps/es-live", esNudgeCooldown, now) {
-		t.Fatal("live ES inside the cooldown lost its nudge suppression")
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-live", esForceSyncAnno); got != freshStamp {
+		t.Fatal("ES re-nudged inside the persisted cooldown")
 	}
-	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-live", esForceSyncAnno); got != "" {
-		t.Fatal("ES re-nudged inside the in-RAM cooldown")
-	}
-	if !n.nudged.CooledDown("apps/es-expired", esNudgeCooldown, now) {
-		t.Fatal("re-nudged ES did not re-stamp the cooldown")
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-live", esLastNudgeAnno); got != "" {
+		t.Fatal("suppressed ES got a fresh last-es-nudge stamp")
 	}
 	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-expired", esForceSyncAnno); got == "" {
 		t.Fatal("ES past the cooldown was not re-nudged")
 	}
-	if n.nudged.CooledDown("apps/es-healed", esNudgeCooldown, now) {
-		t.Fatal("stale stamp on a healed ES still reads cooled")
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-healed", esForceSyncAnno); got != "" {
+		t.Fatal("healed ES got a nudge stamp")
 	}
 }
 
@@ -491,10 +489,10 @@ func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 	if err := n.nudge(ctx, true, true); err != nil {
 		t.Fatalf("per-ES patch failure must not fail the nudge: %v", err)
 	}
-	if n.nudged.CooledDown("apps/es-bad", esNudgeCooldown, time.Now()) {
-		t.Fatal("failed nudge recorded as delivered")
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-bad", esForceSyncAnno); got != "" {
+		t.Fatal("failed nudge stamped force-sync")
 	}
-	if !n.nudged.CooledDown("apps/es-good", esNudgeCooldown, time.Now()) {
+	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-good", esForceSyncAnno); got == "" {
 		t.Fatal("healthy patch skipped after a sibling's failure")
 	}
 	if got := testutil.QueueErrorCount(t, "externalsecret-nudge") - before; got != 1 {

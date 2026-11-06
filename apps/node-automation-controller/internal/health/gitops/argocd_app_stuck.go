@@ -269,8 +269,14 @@ func (p *argoCDAppStuckCheck) refreshArgoCDApp(ctx context.Context,
 	if p.Heals.CooledDown(ck, argocdRefreshCooldown, now) {
 		return
 	}
-	payload := []byte(fmt.Sprintf(
-		`{"metadata":{"annotations":{"%s":"hard"}}}`, argocdRefreshAnno))
+	payload, err := kube.MergePatchAnnos(map[string]any{
+		argocdRefreshAnno: "hard",
+	})
+	if err != nil {
+		log.Error(err, "marshal argocd refresh patch failed",
+			"application", app.GetNamespace()+"/"+app.GetName())
+		return
+	}
 	if _, err := p.Dyn.Resource(argocdAppGVR).
 		Namespace(app.GetNamespace()).Patch(ctx, app.GetName(),
 		types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
@@ -285,19 +291,44 @@ func (p *argoCDAppStuckCheck) refreshArgoCDApp(ctx context.Context,
 
 // restartArgoCDRepoServer deletes the OLDEST argocd-repo-server
 // pod — repo-server caches repo state; >=2 ComparisonErrors at once
-// is the stale-cache signature and one restart flushes it. Matched
-// by the argocd-operator label scheme (app.kubernetes.io/name or
-// component) with a name-prefix fallback.
+// is the stale-cache signature and one restart flushes it. The
+// primary list filters server-side on the operator's canonical
+// app.kubernetes.io/name label; a repo-server pod missing the label
+// can never reach that list, so an empty result re-lists
+// unfiltered and matches the argocd-repo-server- name prefix (the
+// helm-vs-operator label drift fallback).
 func (p *argoCDAppStuckCheck) restartArgoCDRepoServer(ctx context.Context,
 	log logr.Logger, now time.Time) {
 
+	oldest := p.oldestRepoServerPod(ctx, log,
+		"app.kubernetes.io/name=argocd-repo-server")
+	if oldest == nil {
+		oldest = p.oldestRepoServerPod(ctx, log, "")
+	}
+	if oldest == nil {
+		log.Info("argocd repo-server restart requested but no repo-server pod found")
+		return
+	}
+	p.DeletePodHeal(ctx, log, CheckNameArgoCDAppStuck,
+		"repo-server/"+oldest.Namespace+"/"+oldest.Name,
+		oldest, argocdRepoServerCool, now)
+}
+
+// oldestRepoServerPod returns the oldest non-terminating
+// argocd-repo-server pod cluster-wide. selector=="" is the
+// label-less fallback pass that matches on the name prefix plus the
+// component label (an install shape where the canonical
+// app.kubernetes.io/name label is absent entirely).
+func (p *argoCDAppStuckCheck) oldestRepoServerPod(ctx context.Context,
+	log logr.Logger, selector string) *corev1.Pod {
+
 	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+		List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: list pods failed — repo-server restart deferred",
 			"error", err)
-		return
+		return nil
 	}
 	var oldest *corev1.Pod
 	for i := range pods.Items {
@@ -305,7 +336,8 @@ func (p *argoCDAppStuckCheck) restartArgoCDRepoServer(ctx context.Context,
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
-		if pod.Labels["app.kubernetes.io/name"] != "argocd-repo-server" &&
+		if selector == "" &&
+			pod.Labels["app.kubernetes.io/name"] != "argocd-repo-server" &&
 			pod.Labels["app.kubernetes.io/component"] != "repo-server" &&
 			!strings.HasPrefix(pod.Name, "argocd-repo-server-") {
 			continue
@@ -315,11 +347,5 @@ func (p *argoCDAppStuckCheck) restartArgoCDRepoServer(ctx context.Context,
 			oldest = pod
 		}
 	}
-	if oldest == nil {
-		log.Info("argocd repo-server restart requested but no repo-server pod found")
-		return
-	}
-	p.DeletePodHeal(ctx, log, CheckNameArgoCDAppStuck,
-		"repo-server/"+oldest.Namespace+"/"+oldest.Name,
-		oldest, argocdRepoServerCool, now)
+	return oldest
 }
