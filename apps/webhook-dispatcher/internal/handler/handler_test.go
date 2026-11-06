@@ -632,3 +632,74 @@ func TestMetricsRecorded(t *testing.T) {
 		t.Fatalf("ok fanout=%v want %v", got, okBefore+2)
 	}
 }
+
+func TestMetricEventLabel(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"push", "push"},
+		{"pull_request", "pull_request"},
+		{"release", "release"},
+		{"create", "create"},
+		{"", "none"},
+		{"ping", "other"},
+		{"check_run", "other"},
+		{"PUSH", "other"}, // case is part of the event identity
+		{"push\x00forged", "other"},
+	} {
+		if got := metricEventLabel(tc.in); got != tc.want {
+			t.Fatalf("metricEventLabel(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestEventHeaderCannotCreateMetricSeries(t *testing.T) {
+	// An unauthenticated probe carrying an arbitrary X-GitHub-Event
+	// must land on the bounded "other" label — before normalization,
+	// every random value grew a new deliveriesTotal series
+	// (metrics-cardinality DoS).
+	otherBefore := testutil.ToFloat64(
+		deliveriesTotal.WithLabelValues("other", "unauthorized"))
+	noneBefore := testutil.ToFloat64(
+		deliveriesTotal.WithLabelValues("none", "unauthorized"))
+	forged := "forged-event-" + t.Name()
+
+	h := New(testSecret, &fakeBackend{})
+	for _, event := range []string{forged, ""} {
+		req := signedRequest(t, event, pushBody)
+		req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	if got := testutil.ToFloat64(
+		deliveriesTotal.WithLabelValues("other", "unauthorized")); got != otherBefore+1 {
+		t.Fatalf("other/unauthorized=%v want %v", got, otherBefore+1)
+	}
+	if got := testutil.ToFloat64(
+		deliveriesTotal.WithLabelValues("none", "unauthorized")); got != noneBefore+1 {
+		t.Fatalf("none/unauthorized=%v want %v", got, noneBefore+1)
+	}
+	// The forged value must never have become a label — a counter
+	// under it exists only if normalization failed.
+	if got := testutil.ToFloat64(
+		deliveriesTotal.WithLabelValues(forged, "unauthorized")); got != 0 {
+		t.Fatalf("forged event label series=%v want 0", got)
+	}
+}
+
+func TestWaitDrainsInFlightFanout(t *testing.T) {
+	// Wait must block until every detached check goroutine finishes —
+	// the shutdown path in main depends on it.
+	b := &throttledBackend{delay: 20 * time.Millisecond, resources: []concourse.Resource{
+		{Pipeline: "p1", Name: "a", Type: "git", Repo: "org/repo"},
+		{Pipeline: "p1", Name: "b", Type: "git", Repo: "org/repo"},
+	}}
+	h := New(testSecret, b)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
+	}
+	h.Wait() // exported drain path — same as main's shutdown
+	if got := b.calls(); got != 2 {
+		t.Fatalf("check calls=%d want 2 after Wait", got)
+	}
+}

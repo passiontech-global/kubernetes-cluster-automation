@@ -80,8 +80,9 @@ type summary struct {
 type Handler struct {
 	secret  string
 	backend Backend
-	// wg tracks in-flight background fan-outs so tests (and a future
-	// graceful-drain hook) can wait for the last check to land.
+	// wg tracks in-flight background fan-outs so tests and the
+	// graceful-shutdown path (Wait) can wait for the last check to
+	// land.
 	wg sync.WaitGroup
 }
 
@@ -91,10 +92,22 @@ func New(secret string, b Backend) *Handler {
 	return &Handler{secret: secret, backend: b}
 }
 
+// Wait blocks until every in-flight background fan-out has finished —
+// the graceful-shutdown path calls it once the HTTP server has drained
+// so the last check POSTs land before the process exits (the fan-outs
+// run on detached contexts and otherwise outlive the listener).
+func (h *Handler) Wait() {
+	h.wg.Wait()
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	delivery := r.Header.Get("X-GitHub-Delivery")
 	event := r.Header.Get("X-GitHub-Event")
 	sig := r.Header.Get("X-Hub-Signature-256")
+	// The event header is unauthenticated until the HMAC check passes
+	// — normalize it onto the fixed metric label set so a flood of
+	// random values can't grow deliveriesTotal's series without bound.
+	eventMetric := metricEventLabel(event)
 
 	logger().Info("webhook delivery received",
 		"remote_addr", r.RemoteAddr, "path", r.URL.Path,
@@ -105,7 +118,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// buffer allocation. The HMAC check below still runs on the full
 	// body for well-formed headers.
 	if !verify.HasValidSignatureFormat(h.secret, sig) {
-		deliveriesTotal.WithLabelValues(event, "unauthorized").Inc()
+		deliveriesTotal.WithLabelValues(eventMetric, "unauthorized").Inc()
 		logger().Warn("webhook rejected: malformed signature",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event,
@@ -116,7 +129,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
-		deliveriesTotal.WithLabelValues(event, "payload_too_large").Inc()
+		deliveriesTotal.WithLabelValues(eventMetric, "payload_too_large").Inc()
 		logger().Warn("webhook rejected: body read failed",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event, "error", err,
@@ -125,7 +138,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !verify.Signature(h.secret, body, sig) {
-		deliveriesTotal.WithLabelValues(event, "unauthorized").Inc()
+		deliveriesTotal.WithLabelValues(eventMetric, "unauthorized").Inc()
 		logger().Warn("webhook rejected: signature mismatch",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event,
@@ -136,7 +149,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	wantType, ok := resourceTypeForEvent[event]
 	if !ok {
-		deliveriesTotal.WithLabelValues(event, "ignored").Inc()
+		deliveriesTotal.WithLabelValues(eventMetric, "ignored").Inc()
 		logger().Info("webhook delivery ignored: unhandled event",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event)
@@ -146,7 +159,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var p payload
 	if err := json.Unmarshal(body, &p); err != nil {
-		deliveriesTotal.WithLabelValues(event, "bad_request").Inc()
+		deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
 		logger().Warn("webhook rejected: malformed JSON payload",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event, "error", err,
@@ -155,7 +168,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if p.Repository.FullName == "" {
-		deliveriesTotal.WithLabelValues(event, "bad_request").Inc()
+		deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
 		logger().Warn("webhook rejected: missing repository.full_name",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event,
@@ -171,7 +184,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case event == "release" && p.Action != "published" && p.Action != "released":
 		fallthrough
 	case event == "create" && p.RefType != "tag":
-		deliveriesTotal.WithLabelValues(event, "ignored").Inc()
+		deliveriesTotal.WithLabelValues(eventMetric, "ignored").Inc()
 		logger().Info("webhook delivery ignored: no-op for resource checks",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event,
@@ -206,7 +219,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// With no index (and no stale copy) nothing can be checked —
 		// a 502 lets GitHub redeliver once the ATC is back instead of
 		// silently dropping the delivery.
-		deliveriesTotal.WithLabelValues(event, "index_unavailable").Inc()
+		deliveriesTotal.WithLabelValues(eventMetric, "index_unavailable").Inc()
 		logger().Error("resource index unavailable",
 			"remote_addr", r.RemoteAddr,
 			"delivery", delivery, "event", event, "error", err,
@@ -235,7 +248,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// back immediately and GitHub's ~10s webhook timeout can't fire
 	// (a single resource failure never fails the delivery anyway —
 	// redelivery would re-trigger every resource, not just the one).
-	deliveriesTotal.WithLabelValues(event, "dispatched").Inc()
+	deliveriesTotal.WithLabelValues(eventMetric, "dispatched").Inc()
 	if len(matched) > 0 {
 		h.wg.Add(1)
 		go func() {
