@@ -82,12 +82,19 @@ func (c *Collector) collectNebula(ch chan<- prometheus.Metric) {
 // nodereporter and prom filelog consumers read files, not metric
 // series: state-nebula-cert-expiring is created (state_enter, epoch
 // content, only while absent) when days < nebulaCertWarnDays and
-// removed on recovery, and nebula-cert-days-left is rewritten on
-// every parsed scrape (shell wrote it every run). An absent or
-// unparseable cert CLEARS both files — the shell left the latch
-// behind on `[ -s "$cert" ]` failure, but a permanent phantom latch
-// breaks both the file consumers and the emit-0 alert contract (a
-// gone cert cannot be "expiring").
+// removed on recovery, and nebula-cert-days-left tracks the last
+// parsed day count. An absent or unparseable cert CLEARS both files
+// — the shell left the latch behind on `[ -s "$cert" ]` failure,
+// but a permanent phantom latch breaks both the file consumers and
+// the emit-0 alert contract (a gone cert cannot be "expiring").
+//
+// Write discipline: this updater runs on BOTH the scrape path
+// (Collect) and the 30s latch ticker (refreshLatches), so every
+// write is gated on an actual change — the days file is
+// read-compared before the tmp+rename (its content changes once a
+// day, not once per scrape), and the latch moves only on a real
+// enter/exit transition. A steady-state scrape therefore writes
+// nothing to disk.
 func (c *Collector) updateCertLatch(days int64, ok bool) {
 	dir := c.cfg.WatchdogStateDir
 	latch := c.state.Path(hoststate.LatchNebulaCertExpiring)
@@ -97,16 +104,18 @@ func (c *Collector) updateCertLatch(days int64, ok bool) {
 		return
 	}
 	daysPath := filepath.Join(dir, "nebula-cert-days-left")
-	tmp := filepath.Join(dir, ".tmp-"+filepath.Base(daysPath))
-	if err := os.WriteFile(tmp,
-		[]byte(strconv.FormatInt(days, 10)+"\n"), 0o644); err == nil {
-		_ = os.Rename(tmp, daysPath)
+	daysContent := strconv.FormatInt(days, 10) + "\n"
+	if cur, err := os.ReadFile(daysPath); err != nil || string(cur) != daysContent {
+		tmp := filepath.Join(dir, ".tmp-"+filepath.Base(daysPath))
+		if err := os.WriteFile(tmp, []byte(daysContent), 0o644); err == nil {
+			_ = os.Rename(tmp, daysPath)
+		}
 	}
 	_, statErr := os.Stat(latch)
 	switch {
 	case days < nebulaCertWarnDays && statErr != nil:
 		content := strconv.FormatInt(c.cfg.nowFn().Unix(), 10) + "\n"
-		tmp = filepath.Join(dir, ".tmp-"+filepath.Base(latch))
+		tmp := filepath.Join(dir, ".tmp-"+filepath.Base(latch))
 		if werr := os.WriteFile(tmp, []byte(content), 0o644); werr != nil {
 			logger().Warn("hostmetrics: nebula-cert-expiring latch write failed",
 				"path", latch, "error", werr)

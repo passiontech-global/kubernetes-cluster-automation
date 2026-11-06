@@ -275,8 +275,21 @@ var legacyWatchdogScripts = []string{
 // still rendered and consumed by the Go subsystems.
 func (c *cyc) pruneLegacyWatchdog() {
 	r, ctx := c.r, c.ctx
+	// Gate the systemctl fan-out on unit files actually present:
+	// `systemctl disable` on a long-deleted unit is still a full
+	// host exec (nsenter + D-Bus) per name — ~23 forks of pure
+	// waste every cycle once the sweep has done its job. The stat
+	// pass costs only filesystem reads, and the survivors share
+	// ONE disable call (systemctl accepts a unit list).
+	var live []string
 	for _, u := range legacyWatchdogUnits {
-		_, _ = r.run(ctx, "systemctl", "disable", "--now", u)
+		if r.fileExists("/etc/systemd/system/" + u) {
+			live = append(live, u)
+		}
+	}
+	if len(live) > 0 {
+		_, _ = r.run(ctx, "systemctl",
+			append([]string{"disable", "--now"}, live...)...)
 	}
 	removed := false
 	for _, u := range legacyWatchdogUnits {

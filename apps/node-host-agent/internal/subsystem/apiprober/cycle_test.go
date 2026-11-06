@@ -1134,8 +1134,8 @@ func TestTokenRotationSelfHeals(t *testing.T) {
 	if st.probeErr != "" {
 		t.Fatal("probeErr latch not cleared after credential healed")
 	}
-	if st.ok != 1 || st.qfail != 0 {
-		t.Fatalf("healed backend state ok=%d qfail=%d want 1/0", st.ok, st.qfail)
+	if st.ok != 0 || st.qfail != 0 {
+		t.Fatalf("healed backend state ok=%d qfail=%d want 0/0 — ok only counts while a recovery verdict is in flight", st.ok, st.qfail)
 	}
 	if got := promtest.ToFloat64(p.enabled.WithLabelValues("hub1")); got != 1 {
 		t.Fatalf("enabled=%v want 1 after credential rotation", got)

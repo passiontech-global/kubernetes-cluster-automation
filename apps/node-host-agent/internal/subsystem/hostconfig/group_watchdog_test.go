@@ -38,16 +38,17 @@ func TestPruneLegacyWatchdogStack(t *testing.T) {
 	c := loadCyc(t, r, vars, "node-b")
 	c.groupWatchdog()
 
-	// units stopped+disabled
-	for _, want := range []string{
-		"systemctl disable --now node-watchdog.timer",
-		"systemctl disable --now k0s-apiserver-wedge-probe.timer",
-		"systemctl disable --now kine-db-probe.timer",
-		"systemctl disable --now api-backend-guard.service",
-		"systemctl disable --now nebula-route-guard.service",
-	} {
-		if len(sr.callsMatching(want)) == 0 {
-			t.Fatalf("missing call %q", want)
+	// units stopped+disabled — ONE batched `systemctl disable
+	// --now` covering every seeded unit file (the per-unit fork
+	// fan-out is gone; the file sweep still removes them all).
+	disableCalls := sr.callsMatching("systemctl disable --now")
+	if len(disableCalls) != 1 {
+		t.Fatalf("systemctl disable calls=%d want 1: %v",
+			len(disableCalls), disableCalls)
+	}
+	for _, u := range legacyWatchdogUnits {
+		if !strings.Contains(disableCalls[0], u) {
+			t.Fatalf("batched disable missing unit %q: %q", u, disableCalls[0])
 		}
 	}
 	// every unit file / drop-in / script / lib dir gone

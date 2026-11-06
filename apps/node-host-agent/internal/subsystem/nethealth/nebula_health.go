@@ -45,16 +45,19 @@ func (n *NetHealth) checkNebulaDirectTCP(ctx context.Context) {
 		n.cycles.WithLabelValues(checkNebTCP, "gated").Inc()
 		return
 	}
+	// The pref-1499 rule table is one kernel object — listing it
+	// per port ran the identical `ip rule list` (nsenter fork)
+	// once per configured port every cycle.
+	out, err := n.ip(ctx, "rule", "list", "pref", "1499")
+	if err != nil {
+		n.cycles.WithLabelValues(checkNebTCP, "open_error").Inc()
+		return
+	}
 	for _, port := range n.cfg.NebulaDirectTCPPorts {
 		if port <= 0 || port > 65535 {
 			continue
 		}
 		p := strconv.Itoa(port)
-		out, err := n.ip(ctx, "rule", "list", "pref", "1499")
-		if err != nil {
-			n.cycles.WithLabelValues(checkNebTCP, "open_error").Inc()
-			return
-		}
 		if strings.Contains(out, "dport "+p+" ") ||
 			strings.Contains(out, "dport "+p+"\n") ||
 			strings.HasSuffix(strings.TrimSpace(out), "dport "+p) {
@@ -71,6 +74,10 @@ func (n *NetHealth) checkNebulaDirectTCP(ctx context.Context) {
 		n.actions.WithLabelValues(checkNebTCP, "rule_add").Inc()
 		n.state.AppendLog(fmt.Sprintf(
 			"ACTION: re-added pref-1499 direct-underlay tcp dport %s rule", p))
+		// Fold the new rule into the snapshot — a duplicated port
+		// entry in the list must not attempt a second add (the old
+		// per-iteration re-list saw it for free).
+		out += "dport " + p + " "
 	}
 	n.cycles.WithLabelValues(checkNebTCP, "ok").Inc()
 }

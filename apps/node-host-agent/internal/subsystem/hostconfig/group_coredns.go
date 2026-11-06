@@ -116,7 +116,7 @@ func (c *cyc) groupCoreDNS() {
 	if ch, _ := r.writeManaged("/etc/coredns/Corefile", []byte(corefile), 0o644); ch {
 		cfgChanged = true
 	}
-	_, _ = r.writeManaged("/etc/systemd/system/coredns.service", []byte(fmt.Sprintf(`# Managed by %s
+	uch, _ := r.writeManaged("/etc/systemd/system/coredns.service", []byte(fmt.Sprintf(`# Managed by %s
 [Unit]
 Description=%s
 After=network-online.target %s
@@ -134,7 +134,11 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 `, map[bool]string{true: "hub_converge.yaml", false: "node-config-agent (T9)"}[isHub],
 		desc, afterUnit)), 0o644)
-	r.daemonReload(ctx)
+	// daemon-reload only pays its nsenter+D-Bus fork when the unit
+	// content actually changed — an unchanged unit needs no reload.
+	if uch {
+		r.daemonReload(ctx)
+	}
 	r.ensureService(ctx, "coredns.service", true, true)
 	if cfgChanged {
 		r.restartService(ctx, "coredns.service")
