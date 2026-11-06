@@ -4,6 +4,7 @@ package hostmetrics
 
 import (
 	"math"
+	"path/filepath"
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
@@ -142,6 +143,95 @@ func TestSockstatMissingAndMalformedSections(t *testing.T) {
 		if _, ok := metricValue(t, c, name, node); ok {
 			t.Fatalf("%s emitted for malformed TCP lines", name)
 		}
+	}
+}
+
+// --- W12-KR3: ephemeral port saturation + CLOSE_WAIT count ---
+
+func TestEphemeralPortSaturationRatio(t *testing.T) {
+	cfg, _ := fixture(t)
+	testutil.WriteFile(t, cfg.SockstatFile,
+		"sockets: used 500\nTCP: inuse 100 orphan 0 tw 50 alloc 200 mem 10\n")
+	dir := t.TempDir()
+	cfg.LocalPortRangeFile = filepath.Join(dir, "ip_local_port_range")
+	testutil.WriteFile(t, cfg.LocalPortRangeFile, "10240 65535\n")
+	c := New(cfg)
+	// width = 65535-10240+1 = 55296; (100+50)/55296.
+	want := 150.0 / 55296.0
+	if v, ok := metricValue(t, c,
+		"node_sockstat_ephemeral_port_saturation_ratio",
+		map[string]string{"node": "node-a"}); !ok || math.Abs(v-want) > 1e-9 {
+		t.Fatalf("saturation=%v ok=%v want %v", v, ok, want)
+	}
+}
+
+func TestEphemeralPortSaturationDefaultWidth(t *testing.T) {
+	cfg, _ := fixture(t)
+	testutil.WriteFile(t, cfg.SockstatFile,
+		"TCP: inuse 14116 orphan 0 tw 14116 alloc 30000 mem 5\n")
+	// Unreadable sysctl → the kernel's stock 28232-wide range.
+	cfg.LocalPortRangeFile = filepath.Join(t.TempDir(), "missing")
+	c := New(cfg)
+	if v, ok := metricValue(t, c,
+		"node_sockstat_ephemeral_port_saturation_ratio",
+		map[string]string{"node": "node-a"}); !ok || math.Abs(v-1.0) > 1e-9 {
+		t.Fatalf("saturation=%v ok=%v want 1.0 (28232/28232)", v, ok)
+	}
+}
+
+func TestEphemeralPortSaturationNeedsBothLegs(t *testing.T) {
+	cfg, _ := fixture(t)
+	// sockstat with inuse but no tw → partial read stays absent.
+	testutil.WriteFile(t, cfg.SockstatFile,
+		"TCP: inuse 25 orphan 0 alloc 100 mem 5\n")
+	cfg.LocalPortRangeFile = filepath.Join(t.TempDir(), "missing")
+	c := New(cfg)
+	if _, ok := metricValue(t, c,
+		"node_sockstat_ephemeral_port_saturation_ratio",
+		map[string]string{"node": "node-a"}); ok {
+		t.Fatal("saturation emitted without the tw leg")
+	}
+}
+
+func TestTCPCloseWaitSockets(t *testing.T) {
+	cfg, _ := fixture(t)
+	dir := t.TempDir()
+	cfg.ProcNetTCP = filepath.Join(dir, "tcp")
+	cfg.ProcNetTCP6 = filepath.Join(dir, "tcp6")
+	testutil.WriteFile(t, cfg.ProcNetTCP,
+		"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when\n"+
+			"   0: 0100007F:0050 0100007F:1F90 01 00000000:00000000\n"+
+			"   1: 0100007F:0051 0100007F:1F91 08 00000000:00000000\n"+ // CLOSE_WAIT
+			"   2: 0100007F:0052 0100007F:1F92 06 00000000:00000000\n"+ // TIME_WAIT
+			"   3: 0100007F:0053 0100007F:1F93 08 00000000:00000000\n") // CLOSE_WAIT
+	testutil.WriteFile(t, cfg.ProcNetTCP6,
+		"  sl  local_address                         rem_address                        st\n"+
+			"   0: 0000000000000000000000000100007F:0050 0000000000000000000000000100007F:1F90 08\n")
+	c := New(cfg)
+	if v, ok := metricValue(t, c, "node_tcp_close_wait_sockets",
+		map[string]string{"node": "node-a"}); !ok || v != 3 {
+		t.Fatalf("close_wait=%v ok=%v want 3 (2 v4 + 1 v6)", v, ok)
+	}
+}
+
+func TestTCPCloseWaitAbsentWithoutTables(t *testing.T) {
+	cfg, _ := fixture(t)
+	dir := t.TempDir() // neither tcp nor tcp6 exists
+	cfg.ProcNetTCP = filepath.Join(dir, "tcp")
+	cfg.ProcNetTCP6 = filepath.Join(dir, "tcp6")
+	c := New(cfg)
+	if _, ok := metricValue(t, c, "node_tcp_close_wait_sockets",
+		map[string]string{"node": "node-a"}); ok {
+		t.Fatal("close_wait emitted with no socket tables at all")
+	}
+	// A single readable family still counts — an IPv6-less host
+	// legitimately lacks tcp6.
+	testutil.WriteFile(t, cfg.ProcNetTCP,
+		"  sl  local_address rem_address   st\n"+
+			"   0: 0100007F:0050 0100007F:1F90 01\n")
+	if v, ok := metricValue(t, c, "node_tcp_close_wait_sockets",
+		map[string]string{"node": "node-a"}); !ok || v != 0 {
+		t.Fatalf("close_wait=%v ok=%v want explicit 0", v, ok)
 	}
 }
 

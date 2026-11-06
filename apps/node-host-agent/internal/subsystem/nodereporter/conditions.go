@@ -381,6 +381,23 @@ var conditionDefs = []conditionDef{
 		problemReason:  "KubeletPLEGUnhealthyDetected",
 		stateKey:       hoststate.LatchKubeletPLEGUnhealthy,
 	},
+	// --- Wave-12 latch→condition surface ---
+	{
+		// workerhygiene's W12-KR4 disk-slow-io gray-failure guard —
+		// a whole disk whose write await stays >200ms while io PSI
+		// full avg60 sits >= 25% for >=5 consecutive cycles: the
+		// backing device/SAN is degrading but nothing has
+		// D-stormed or remounted ro yet. Consumed cluster-side by
+		// node-hang-precordon and descheduler-storm-gate to keep
+		// new stateful pods off the node — deliberately NOT in any
+		// SNR reboot path (a shared-storage slowdown must not
+		// mass-reboot the fleet).
+		typ:            "DiskSlowIO",
+		defaultReason:  "DiskIONormal",
+		defaultMessage: "disk write await and io PSI within normal bounds",
+		problemReason:  "DiskSlowIODetected",
+		stateKey:       hoststate.LatchDiskSlowIO,
+	},
 }
 
 // condEval is the evaluated state of one condition this cycle.

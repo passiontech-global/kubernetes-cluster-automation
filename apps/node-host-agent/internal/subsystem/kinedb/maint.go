@@ -7,7 +7,12 @@
 // shrinks the heap — so this job runs:
 //
 //	reindex  REINDEX TABLE CONCURRENTLY kine — always (cheap on a
-//	         small table, SHARE UPDATE EXCLUSIVE lock)
+//	         small table, SHARE UPDATE EXCLUSIVE lock). W12-CP2:
+//	         preceded by the invalid-index reaper — an interrupted
+//	         REINDEX CONCURRENTLY / pg_repack leaves *_ccnew / *_ccold
+//	         shells with indisvalid=false; they cost every INSERT,
+//	         serve no query, and trip the next reindex, so they are
+//	         dropped first (DROP INDEX CONCURRENTLY).
 //	repack   pg_repack --no-superuser-check --no-order -t public.kine
 //	         — ONLY when the heap is genuinely bloated
 //	         (dead_tuple_percent > 40 AND heap > 200MB, measured via
@@ -47,7 +52,10 @@ type maintResult struct {
 	indexBytes  int64
 	deadPct     int64
 	statsOK     bool // sizes/dead-tuple stats were actually read this run
-	notes       []string
+	// W12-CP2 invalid-index reaper tallies.
+	invalidDropped int
+	invalidKept    int // non-ccnew/ccold invalids left for an operator
+	notes          []string
 }
 
 // maintCycle runs one maintenance round and emits metrics +
@@ -84,6 +92,14 @@ func (k *KineDB) maintCycle(ctx context.Context) *maintResult {
 
 func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 	res *maintResult, note func(string)) {
+
+	// (a0) W12-CP2 invalid-index reaper — BEFORE the reindex: an
+	// interrupted REINDEX CONCURRENTLY or pg_repack leaves *_ccnew /
+	// *_ccold shells with indisvalid=false, and those shells make
+	// the next reindex error out ("cannot reindex invalid index")
+	// while still taxing every INSERT. Best-effort: a failed
+	// listing or drop only notes, never fails the maint run.
+	k.reapInvalidIndexes(ctx, pg, user, pass, res, note)
 
 	// (a) REINDEX CONCURRENTLY — always, cheap on a small table.
 	if _, err := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
@@ -183,6 +199,57 @@ func (k *KineDB) maintRun(ctx context.Context, pg, user, pass string,
 		res.okRepack = false
 		res.repackState = "fail"
 		note(fmt.Sprintf("repack-fail: %v", err))
+	}
+}
+
+// reapInvalidIndexes — W12-CP2: drop the invalid index shells an
+// interrupted REINDEX CONCURRENTLY / pg_repack leaves on the kine
+// table. Only the *_ccnew / *_ccold names PostgreSQL itself mints
+// are auto-dropped — any other invalid index is noted and kept for
+// an operator (dropping a live application's index would be data
+// loss of a different kind). DROP INDEX CONCURRENTLY cannot run in
+// a transaction, so each drop is its own -qc statement under the
+// long budget (CONCURRENTLY waits on concurrent snapshots).
+func (k *KineDB) reapInvalidIndexes(ctx context.Context, pg, user, pass string,
+	res *maintResult, note func(string)) {
+	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+		"SELECT indexrelid::regclass::text FROM pg_index "+
+			"WHERE NOT indisvalid AND indrelid = %s::regclass",
+		sqlQuote(k.cfg.Table)))
+	if err != nil {
+		note(fmt.Sprintf("invalid-index-list-fail: %v", err))
+		return
+	}
+	for _, idx := range parseGIDs(out) {
+		// regclass::text may be schema-qualified (public.foo) or
+		// double-quoted — the suffix + identifier checks apply to
+		// the bare index name.
+		base := idx
+		if i := strings.LastIndexByte(base, '.'); i >= 0 {
+			base = base[i+1:]
+		}
+		base = strings.Trim(base, `"`)
+		switch {
+		case !reTableIdent.MatchString(base):
+			note(fmt.Sprintf("invalid-index %q skipped (unsafe name)", idx))
+		case !strings.HasSuffix(base, "_ccnew") &&
+			!strings.HasSuffix(base, "_ccold"):
+			note(fmt.Sprintf("invalid-index %s kept (not a _ccnew/_ccold orphan)", base))
+			res.invalidKept++
+			logger().Warn("kinedb: invalid index on kine table kept (not a reindex orphan)",
+				"index", base)
+		default:
+			if _, derr := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
+				"-qc", "DROP INDEX CONCURRENTLY IF EXISTS "+
+					sqlIdent(base)), ""); derr != nil {
+				note(fmt.Sprintf("drop-index-%s-fail: %v", base, derr))
+				continue
+			}
+			res.invalidDropped++
+			note(fmt.Sprintf("dropped invalid index %s", base))
+			logger().Warn("kinedb: dropped orphaned invalid index",
+				"index", base)
+		}
 	}
 }
 

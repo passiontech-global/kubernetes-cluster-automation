@@ -58,6 +58,13 @@ type Config struct {
 	// pressure gauges.
 	FileNRFile   string
 	SockstatFile string
+	// LocalPortRangeFile is /proc/sys/net/ipv4/ip_local_port_range
+	// — the ephemeral source-port pool width the W12-KR3 sockstat
+	// saturation ratio divides by; ProcNetTCP/ProcNetTCP6 are the
+	// /proc/1/net/tcp{,6} tables the CLOSE_WAIT count scans.
+	LocalPortRangeFile string
+	ProcNetTCP         string
+	ProcNetTCP6        string
 	// NetstatFile is /proc/1/net/netstat (TcpExt counters) and
 	// SNMPFile /proc/1/net/snmp (Ip/Udp counters) — the kernel
 	// TCP/IP stack grey-failure series.
@@ -205,6 +212,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.SockstatFile == "" {
 		c.SockstatFile = defaultSockstatFile
+	}
+	if c.LocalPortRangeFile == "" {
+		c.LocalPortRangeFile = defaultLocalPortRangeFile
+	}
+	if c.ProcNetTCP == "" {
+		c.ProcNetTCP = defaultProcNetTCP
+	}
+	if c.ProcNetTCP6 == "" {
+		c.ProcNetTCP6 = defaultProcNetTCP6
 	}
 	if c.NetstatFile == "" {
 		c.NetstatFile = defaultNetstatFile

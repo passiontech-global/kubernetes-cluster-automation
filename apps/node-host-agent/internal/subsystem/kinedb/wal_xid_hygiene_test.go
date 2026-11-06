@@ -396,3 +396,118 @@ func TestNoOrphanPreparedXacts(t *testing.T) {
 		t.Fatalf("textfile:\n%s", content)
 	}
 }
+
+// --- item 7: W12-CP2 invalid-index census + seq-scan guard ---
+
+func TestProbeInvalidIndexCensusEmits(t *testing.T) {
+	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
+		testutil.ExecRule{Substr: "indisvalid", Out: "2\n"}))
+	res := k.probeCycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if res.hyg.invalidIdx != 2 || !res.hyg.invalidSeen {
+		t.Fatalf("invalid=%+v", res.hyg)
+	}
+	content := readText(t, dir, "kine-db.prom")
+	if !strings.Contains(content, "kine_db_invalid_indexes 2") {
+		t.Fatalf("textfile:\n%s", content)
+	}
+}
+
+// seq_tup_read deltas: first read only baselines; +600K trips the
+// 500K gate → ANALYZE under the 30m last-kine-analyze budget; a
+// further spike inside the budget is eaten by the cooldown.
+func TestProbeSeqScanEmitsAndAnalyzeFires(t *testing.T) {
+	k, fr, dir := fixture(t, hygieneRules)
+	fr.On("seq_tup_read", "120|100000\n")
+	res := k.probeCycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if res.hyg.seqScans != 120 || res.hyg.seqTupRead != 100000 || !res.hyg.seqSeen {
+		t.Fatalf("seq=%+v", res.hyg)
+	}
+	if res.hyg.analyzeFired {
+		t.Fatal("ANALYZE fired on the baseline read")
+	}
+	content := readText(t, dir, "kine-db.prom")
+	for _, want := range []string{
+		"kine_db_seq_scans_total 120",
+		"kine_db_seq_tuples_read_total 100000",
+		"# TYPE kine_db_seq_scans_total counter",
+		"# TYPE kine_db_seq_tuples_read_total counter",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("textfile missing %q:\n%s", want, content)
+		}
+	}
+
+	// Second probe: +600K tuples read via seq scan → the planner
+	// regressed; ANALYZE runs immediately, budgeted.
+	fr.On("seq_tup_read", "180|700000\n")
+	res = k.probeCycle(context.Background())
+	if !res.hyg.analyzeFired {
+		t.Fatalf("ANALYZE did not fire on a 600K delta: %v", res.notes)
+	}
+	if !strings.Contains(fr.Joined(), `ANALYZE "kine"`) {
+		t.Fatalf("ANALYZE missing from command log:\n%s", fr.Joined())
+	}
+	if _, err := os.Stat(filepath.Join(k.cfg.GuardStateDir, kineAnalyzeFile)); err != nil {
+		t.Fatalf("analyze budget file missing: %v", err)
+	}
+
+	// Third probe still spikes but inside the 30m budget → cooldown.
+	fr.ClearLog()
+	fr.On("seq_tup_read", "200|1400000\n")
+	res = k.probeCycle(context.Background())
+	if res.hyg.analyzeFired {
+		t.Fatal("ANALYZE re-fired inside the 30m budget")
+	}
+	if strings.Contains(fr.Joined(), `ANALYZE "kine"`) {
+		t.Fatalf("ANALYZE ran inside the cooldown:\n%s", fr.Joined())
+	}
+}
+
+// A delta at or under 500K is normal kine churn — no ANALYZE.
+func TestProbeSeqScanBelowDeltaNoAnalyze(t *testing.T) {
+	k, fr, _ := fixture(t, hygieneRules)
+	fr.On("seq_tup_read", "50|400000\n")
+	res := k.probeCycle(context.Background())
+	if res.hyg.analyzeFired {
+		t.Fatal("ANALYZE fired on the baseline read")
+	}
+	fr.On("seq_tup_read", "55|890000\n") // +490K — under the trip line
+	res = k.probeCycle(context.Background())
+	if res.hyg.analyzeFired {
+		t.Fatalf("ANALYZE fired under the delta gate: %v", res.notes)
+	}
+	if strings.Contains(fr.Joined(), `ANALYZE "kine"`) {
+		t.Fatalf("ANALYZE ran below the delta gate:\n%s", fr.Joined())
+	}
+}
+
+// Failed item-7 reads gate only their own series — the probe still
+// succeeds and no fabricated counters land in the textfile.
+func TestProbeSeqScanDegradesOnQueryFailure(t *testing.T) {
+	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
+		testutil.ExecRule{Substr: "seq_tup_read", Err: errors.New("connection reset")},
+		testutil.ExecRule{Substr: "indisvalid", Err: errors.New("connection reset")}))
+	res := k.probeCycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if res.hyg.seqSeen || res.hyg.invalidSeen {
+		t.Fatalf("failed reads must stay unseen: %+v", res.hyg)
+	}
+	content := readText(t, dir, "kine-db.prom")
+	for _, absent := range []string{
+		"kine_db_invalid_indexes",
+		"kine_db_seq_scans_total",
+		"kine_db_seq_tuples_read_total",
+	} {
+		if strings.Contains(content, absent) {
+			t.Fatalf("fabricated %s on query failure:\n%s", absent, content)
+		}
+	}
+}

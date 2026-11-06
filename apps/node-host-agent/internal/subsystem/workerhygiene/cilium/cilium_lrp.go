@@ -19,6 +19,11 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
+// endpointSliceServiceLabel is the kubernetes.io/service-name
+// label key endpointslices carry for their owning Service — the
+// discovery.k8s.io lookup key for serviceReadyEndpoints.
+const endpointSliceServiceLabel = "kubernetes.io/service-name"
+
 const (
 // The LRP datapath probe targets the kube-dns ClusterIP — the
 // CiliumLocalRedirectPolicy's serviceMatcher redirects
@@ -202,14 +207,9 @@ func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
 	}
 	var desynced []string
 	for _, sv := range desyncServices {
-		ep, err := c.d.Cfg.Client.CoreV1().Endpoints(sv.ns).Get(ctx,
-			sv.name, metav1.GetOptions{})
-		if err != nil {
+		ready, ok := c.serviceReadyEndpoints(ctx, sv.ns, sv.name)
+		if !ok {
 			continue // apiserver verdict unreadable — keep, don't count
-		}
-		ready := 0
-		for _, sub := range ep.Subsets {
-			ready += len(sub.Addresses)
 		}
 		if ready > 0 && backends[sv.ns+"/"+sv.name] == 0 {
 			desynced = append(desynced, sv.ns+"/"+sv.name)
@@ -250,4 +250,46 @@ func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
 			strings.Join(desynced, " ")))
 	}
 	return true
+}
+
+// serviceReadyEndpoints counts a Service's Ready backends through
+// discovery.k8s.io/v1 EndpointSlices — the source cilium-agent
+// actually programs the BPF service map from (v1/Endpoints is
+// deprecated on k8s ≥1.33 and can lag or be absent entirely when a
+// Service is slice-native; comparing BPF state to the stale object
+// false-positives the desync). ok=false means the apiserver verdict
+// is unreadable — the caller keeps the streak evidence without
+// counting it (the old "skip on Get error" semantics).
+//
+// Fallback: only when the slice LIST itself errors or returns zero
+// items does the check read the legacy corev1.Endpoints object — a
+// Service whose slices exist but carry only not-ready endpoints
+// legitimately reports 0; that's a real verdict, not a missing one.
+func (c *CiliumLRPCheck) serviceReadyEndpoints(ctx context.Context,
+	ns, name string) (ready int, ok bool) {
+	slices, err := c.d.Cfg.Client.DiscoveryV1().EndpointSlices(ns).
+		List(ctx, metav1.ListOptions{
+			LabelSelector: endpointSliceServiceLabel + "=" + name,
+		})
+	if err == nil && len(slices.Items) > 0 {
+		for i := range slices.Items {
+			for _, ep := range slices.Items[i].Endpoints {
+				// nil Ready defaults true — only an explicit
+				// ready=false endpoint is excluded.
+				if ep.Conditions.Ready == nil || *ep.Conditions.Ready {
+					ready++
+				}
+			}
+		}
+		return ready, true
+	}
+	ep, err := c.d.Cfg.Client.CoreV1().Endpoints(ns).Get(ctx, name,
+		metav1.GetOptions{})
+	if err != nil {
+		return 0, false
+	}
+	for _, sub := range ep.Subsets {
+		ready += len(sub.Addresses)
+	}
+	return ready, true
 }

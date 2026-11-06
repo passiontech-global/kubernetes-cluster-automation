@@ -53,6 +53,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -345,11 +346,28 @@ type metrics struct {
 	walArchStale   prometheus.Gauge
 	inactiveSlot   prometheus.Gauge
 
+	// W12-CP1 pgbouncer starvation series (plan-mandated names —
+	// sibling of clientsWaiting, not a rename).
+	pgbClientWaiting prometheus.Gauge // kine_pgbouncer_client_waiting_connections
+	pgbMaxWait       prometheus.Gauge // kine_pgbouncer_maxwait_seconds
+
+	// W12-CP2 invalid-index census + seq-scan regression series.
+	// seqScans/seqTupRead report counter type (the _total
+	// contract) via CounterFuncs over the last probe read — a
+	// skipped probe round keeps serving the real last value
+	// instead of fabricating a zero, mirroring the seen-gated
+	// textfile emission.
+	invalidIndexes prometheus.Gauge
+	seqScans       prometheus.Collector // CounterFunc → kine_db_seq_scans_total
+	seqTupRead     prometheus.Collector // CounterFunc → kine_db_seq_tuples_read_total
+	seqScansVal    atomic.Int64
+	seqTupReadVal  atomic.Int64
+
 	cycles *prometheus.CounterVec // loop, result
 }
 
 func newMetrics() *metrics {
-	return &metrics{
+	m := &metrics{
 		probeOK: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "kine_db_probe_ok",
 			Help: "App-layer probe result on the kine DB VM (1 = ok, 0 = fail).",
@@ -458,11 +476,35 @@ func newMetrics() *metrics {
 			Name: "kine_db_inactive_slot_retained_bytes",
 			Help: "WAL bytes pinned by inactive replication slots.",
 		}),
+		pgbClientWaiting: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_pgbouncer_client_waiting_connections",
+			Help: "cl_waiting of the postgres pool — clients queued for a server conn (starvation leading edge).",
+		}),
+		pgbMaxWait: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_pgbouncer_maxwait_seconds",
+			Help: "maxwait of the postgres pool — age of the oldest queued client; >10s while the backend idles means stalled server conns.",
+		}),
+		invalidIndexes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_invalid_indexes",
+			Help: "Indexes with indisvalid=false in pg_index — dead shells an interrupted REINDEX CONCURRENTLY leaves behind.",
+		}),
 		cycles: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "node_host_agent_kinedb_cycles_total",
 			Help: "kinedb loop cycles by loop and result.",
 		}, []string{"loop", "result"}),
 	}
+	// CounterFuncs close over m — the seq_* _total series must
+	// report counter type while serving the last real pg_stat
+	// read between probe rounds.
+	m.seqScans = prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "kine_db_seq_scans_total",
+		Help: "seq_scan of the kine table (pg_stat_user_tables) — sequential scans against the kine heap.",
+	}, func() float64 { return float64(m.seqScansVal.Load()) })
+	m.seqTupRead = prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "kine_db_seq_tuples_read_total",
+		Help: "seq_tup_read of the kine table (pg_stat_user_tables) — tuples read via seq scans; a spike means planner regression.",
+	}, func() float64 { return float64(m.seqTupReadVal.Load()) })
+	return m
 }
 
 func (m *metrics) collectors() []prometheus.Collector {
@@ -475,6 +517,8 @@ func (m *metrics) collectors() []prometheus.Collector {
 		m.idleInTx, m.idleInTxAlias, m.idleTxTerm, m.deadTupleRatio,
 		m.xidAge, m.walBytes, m.walDiskRatio, m.walArchStale,
 		m.inactiveSlot,
+		m.pgbClientWaiting, m.pgbMaxWait, m.invalidIndexes,
+		m.seqScans, m.seqTupRead,
 		m.cycles,
 	}
 }

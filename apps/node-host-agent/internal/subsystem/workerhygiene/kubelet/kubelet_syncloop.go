@@ -187,15 +187,19 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // state-kubelet-pleg-unhealthy so nodereporter flips
 // KubeletPLEGUnhealthy early; a healthy scrape clears both.
 
-// plegSample is one parsed scrape of the PLEG series.
+// plegSample is one parsed scrape of the PLEG series plus the
+// W12-KR4 storage-operation error counter the same :10250
+// exposition carries.
 type plegSample struct {
-	relistAvg   float64 // relist_duration_seconds_sum / _count
-	relistQuant float64 // worst quantile sample
-	lastSeen    float64 // pleg_last_seen_seconds
-	discard     int64   // pleg_discard_events counter
-	hasRelist   bool
-	hasLastSeen bool
-	hasDiscard  bool
+	relistAvg      float64 // relist_duration_seconds_sum / _count
+	relistQuant    float64 // worst quantile sample
+	lastSeen       float64 // pleg_last_seen_seconds
+	discard        int64   // pleg_discard_events counter
+	storageErrs    float64 // storage_operation_errors_total summed over labels
+	hasRelist      bool
+	hasLastSeen    bool
+	hasDiscard     bool
+	hasStorageErrs bool
 }
 
 // parsePLEGMetrics picks the PLEG series out of a kubelet /metrics
@@ -241,6 +245,13 @@ func parsePLEGMetrics(body string) plegSample {
 			s.lastSeen, s.hasLastSeen = v, true
 		case "kubelet_pleg_discard_events":
 			s.discard, s.hasDiscard = int64(v), true
+		case "storage_operation_errors_total":
+			// W12-KR4: mount/attach/device-operation failures
+			// kubelet reports per volume_plugin+operation —
+			// every labelled sample sums into the one node-level
+			// counter (node_kubelet_storage_operation_errors_total).
+			s.storageErrs += v
+			s.hasStorageErrs = true
 		}
 	}
 	if cnt > 0 {
@@ -262,6 +273,12 @@ func (c *SyncloopCheck) probePLEG(ctx context.Context) {
 		return
 	}
 	s := parsePLEGMetrics(body)
+	// W12-KR4: the storage error counter exports even when the
+	// PLEG family is absent — the series is independent of PLEG
+	// health.
+	if s.hasStorageErrs {
+		c.d.KubeletStorageOperationErrors = int64(s.storageErrs)
+	}
 	if !s.hasRelist && !s.hasLastSeen {
 		// The endpoint answered but the PLEG family isn't there —
 		// inconclusive (metrics stripped/downgraded), keep state.

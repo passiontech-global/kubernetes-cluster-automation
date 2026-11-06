@@ -81,6 +81,21 @@ var (
 		"node_host_agent_conntrack_drops_total",
 		"Sum of the drop column across all CPU rows of /proc/net/stat/nf_conntrack.",
 		[]string{"node"}, nil)
+	// W12-KR3: the same counters under the node_exporter
+	// nf_conntrack collector names — dashboards/alerts written for
+	// node_exporter's conntrack module then port over without
+	// translation. drop folds in early_drop: both count packets the
+	// table refused (early_drop is the LRU eviction that still
+	// loses the flow). CounterValue like the host_agent twins —
+	// cumulative kernel counters.
+	descCtStatInsertFail = prometheus.NewDesc(
+		"node_nf_conntrack_stat_insert_failed_total",
+		"Sum of the insert_failed column across all CPU rows of /proc/net/stat/nf_conntrack.",
+		[]string{"node"}, nil)
+	descCtStatDrop = prometheus.NewDesc(
+		"node_nf_conntrack_stat_drop_total",
+		"Sum of the drop + early_drop columns across all CPU rows of /proc/net/stat/nf_conntrack.",
+		[]string{"node"}, nil)
 )
 
 // collectConntrack emits entries/limit each only when its own file
@@ -108,14 +123,27 @@ func (c *Collector) collectConntrack(ch chan<- prometheus.Metric) {
 	// table fills; drop counts the packets conntrack refused. Both
 	// are cumulative kernel counters → CounterValue.
 	if st, ok := conntrackStatCounters(c.cfg.ConntrackStatFile,
-		"insert_failed", "drop"); ok {
+		"insert_failed", "drop", "early_drop"); ok {
 		if v, found := st["insert_failed"]; found {
 			ch <- prometheus.MustNewConstMetric(descCtInsertFail,
 				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+			ch <- prometheus.MustNewConstMetric(descCtStatInsertFail,
+				prometheus.CounterValue, float64(v), c.cfg.NodeName)
 		}
+		// The legacy drops series stays strictly drop-column — a
+		// kernel exposing only early_drop must not fabricate a 0
+		// here; the node_exporter-named twin folds both columns.
 		if v, found := st["drop"]; found {
 			ch <- prometheus.MustNewConstMetric(descCtDrops,
 				prometheus.CounterValue, float64(v), c.cfg.NodeName)
+		}
+		drops, dropOK := st["drop"]
+		if v, found := st["early_drop"]; found {
+			drops, dropOK = drops+v, true
+		}
+		if dropOK {
+			ch <- prometheus.MustNewConstMetric(descCtStatDrop,
+				prometheus.CounterValue, float64(drops), c.cfg.NodeName)
 		}
 	}
 }

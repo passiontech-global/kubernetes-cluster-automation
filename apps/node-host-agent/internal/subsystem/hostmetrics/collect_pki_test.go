@@ -5,14 +5,18 @@ package hostmetrics
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -117,5 +121,76 @@ func TestPKICertDaysLeftExpiredFloors(t *testing.T) {
 			"path": filepath.Join(pkiDir, "expired.crt")})
 	if !ok || got != -2 {
 		t.Fatalf("days_left=%v ok=%v want -2 (floor, not truncation)", got, ok)
+	}
+}
+
+// --- W12-CP4a: sa.pub ServiceAccount signer-key fingerprint ---
+
+// saPubHashOf returns the expected {sha256} label value for a file
+// content — mirrors sha256FileHex so the label assertion is exact.
+func saPubHashOf(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// metricFamilyAbsent gathers the collector once and reports whether
+// the named family produced no series at all.
+func metricFamilyAbsent(t *testing.T, c *Collector, name string) bool {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(c)
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == name && len(mf.Metric) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func TestSAPubFingerprintEmitsOnController(t *testing.T) {
+	cfg, _ := fixture(t)
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+	saPub := filepath.Join(cfg.HostRoot, "var/lib/k0s/pki/sa.pub")
+	testutil.WriteFile(t, saPub, "PUBKEY-BYTES-1")
+	c := New(cfg)
+	got, ok := metricValue(t, c, "node_k0s_sa_pub_fingerprint_hash",
+		map[string]string{"node": "node-a",
+			"sha256": saPubHashOf("PUBKEY-BYTES-1")})
+	if !ok || got != 1 {
+		t.Fatalf("fingerprint=%v ok=%v want 1", got, ok)
+	}
+	// A drifted file must change the fingerprint label — the whole
+	// point of the series (cross-CP count_by(sha256)).
+	testutil.WriteFile(t, saPub, "PUBKEY-BYTES-2")
+	if _, ok := metricValue(t, c, "node_k0s_sa_pub_fingerprint_hash",
+		map[string]string{"node": "node-a",
+			"sha256": saPubHashOf("PUBKEY-BYTES-2")}); !ok {
+		t.Fatal("drifted sa.pub fingerprint not exported")
+	}
+}
+
+func TestSAPubFingerprintAbsentOnWorker(t *testing.T) {
+	cfg, _ := fixture(t)
+	// No k0scontroller unit file → worker → no series even though
+	// the file exists on disk.
+	testutil.WriteFile(t,
+		filepath.Join(cfg.HostRoot, "var/lib/k0s/pki/sa.pub"), "PUBKEY-BYTES")
+	c := New(cfg)
+	if !metricFamilyAbsent(t, c, "node_k0s_sa_pub_fingerprint_hash") {
+		t.Fatal("fingerprint emitted on a non-controller node")
+	}
+}
+
+func TestSAPubFingerprintAbsentWhenFileMissing(t *testing.T) {
+	cfg, _ := fixture(t)
+	testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+	// Controller, but sa.pub is absent → no series, never a fake hash.
+	c := New(cfg)
+	if !metricFamilyAbsent(t, c, "node_k0s_sa_pub_fingerprint_hash") {
+		t.Fatal("fingerprint emitted for a missing sa.pub")
 	}
 }

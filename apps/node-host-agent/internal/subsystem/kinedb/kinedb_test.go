@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -201,5 +202,180 @@ func TestDiscoverContainer(t *testing.T) {
 	pgb := k.pgbContainerName(context.Background())
 	if pgb != "kine-pgbouncer" {
 		t.Fatalf("pgb=%q want kine-pgbouncer", pgb)
+	}
+}
+
+// --- W12-CP1: PgBouncer server-pool starvation & WAIT queue ---
+
+// starvePoolsOut is the W12-CP1 starvation shape: maxwait=12s (>10s)
+// on a pool still holding 10 server conns while the queue is short
+// — clients wait while the backend is not actually busy.
+const starvePoolsOut = `database|user|cl_active|cl_waiting|sv_active|sv_idle|sv_used|sv_tested|sv_login|maxwait|maxwait_us|pool_mode
+postgres|postgres|4|0|3|7|0|0|0|12|0|transaction
+pgbouncer|pgbouncer|1|0|0|0|0|0|0|0|0|transaction
+`
+
+// starveNoActivePoolsOut is the other starvation shape: clients
+// queued (cl_waiting=5, still under WaitMax) while NO server conn
+// is actually running a query (sv_active=0).
+const starveNoActivePoolsOut = `database|user|cl_active|cl_waiting|sv_active|sv_idle|sv_used|sv_tested|sv_login|maxwait|maxwait_us|pool_mode
+postgres|postgres|4|5|0|7|0|0|0|2|0|transaction
+pgbouncer|pgbouncer|1|0|0|0|0|0|0|0|0|transaction
+`
+
+func TestParseShowPoolsMaxWait(t *testing.T) {
+	out := "database|user|cl_active|cl_waiting|sv_active|sv_idle|sv_used|sv_tested|sv_login|maxwait|maxwait_us|pool_mode\n" +
+		"postgres|postgres|4|2|3|7|0|0|0|42|12345|transaction\n"
+	st, ok := parseShowPools(out, "postgres")
+	if !ok || st.maxWaitSec != 42 {
+		t.Fatalf("maxWaitSec=%d ok=%v want 42", st.maxWaitSec, ok)
+	}
+	// A multi-row pool takes the worst maxwait across rows (same
+	// aggregation rule as cl_waiting).
+	multi := "database|user|maxwait|sv_active\n" +
+		"postgres|postgres|4|1\npostgres|kine|9|1\npgbouncer|pgbouncer|99|0\n"
+	st, ok = parseShowPools(multi, "postgres")
+	if !ok || st.maxWaitSec != 9 {
+		t.Fatalf("maxWaitSec=%d ok=%v want 9", st.maxWaitSec, ok)
+	}
+}
+
+// starveFixture returns a KineDB whose SHOW POOLS reports the given
+// pool output and whose pg_stat_activity claims zero active queries
+// — the "conns held but nobody running" half-open shape.
+func starveFixture(t *testing.T, poolsOut string) (*KineDB, *testutil.FakeExec, string) {
+	k, fr, dir := fixture(t, probeOKRules)
+	fr.On("SHOW POOLS", poolsOut)
+	fr.On("pid <> pg_backend_pid", "0\n")
+	fr.On("RECONNECT", "RECONNECT\n")
+	return k, fr, dir
+}
+
+// Two consecutive starved probes → RECONNECT on the admin console
+// (no client-socket drop); a third inside the 15m budget is eaten
+// by the shared last-pgb-restart cooldown.
+func TestPGBStarveReconnectAfterTwoProbes(t *testing.T) {
+	k, fr, dir := starveFixture(t, starvePoolsOut)
+
+	res := k.probeCycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if res.pool.maxWaitSec != 12 {
+		t.Fatalf("maxWaitSec=%d want 12", res.pool.maxWaitSec)
+	}
+	if fr.Ran("RECONNECT") || fr.Ran("restart kine-pgbouncer") {
+		t.Fatalf("remediation fired on the FIRST starved probe:\n%s", fr.Joined())
+	}
+	// The new series land in the probe textfile.
+	content := readText(t, dir, "kine-db.prom")
+	for _, want := range []string{
+		"kine_pgbouncer_client_waiting_connections 0",
+		"kine_pgbouncer_maxwait_seconds 12",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("textfile missing %q:\n%s", want, content)
+		}
+	}
+
+	res = k.probeCycle(context.Background())
+	j := fr.Joined()
+	if !strings.Contains(j, "-d pgbouncer -Aqc RECONNECT") {
+		t.Fatalf("RECONNECT did not fire on the second starved probe:\n%s", j)
+	}
+	if strings.Contains(j, "restart kine-pgbouncer") {
+		t.Fatalf("restart ran where RECONNECT should have sufficed:\n%s", j)
+	}
+	if v, err := readIntFile(filepath.Join(
+		k.cfg.GuardStateDir, pgbStarveFile)); err != nil || v != 2 {
+		t.Fatalf("starve streak=%d err=%v want 2", v, err)
+	}
+
+	// Third probe still starved but inside the 15m budget →
+	// cooldown, nothing runs.
+	fr.ClearLog()
+	res = k.probeCycle(context.Background())
+	j = fr.Joined()
+	if strings.Contains(j, "RECONNECT") ||
+		strings.Contains(j, "restart kine-pgbouncer") {
+		t.Fatalf("remediation re-fired inside the 15m budget:\n%s", j)
+	}
+	found := false
+	for _, n := range res.notes {
+		if strings.Contains(n, "cooldown") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no cooldown note on the third probe: %v", res.notes)
+	}
+}
+
+// cl_waiting>0 with sv_active==0 is the other starvation shape —
+// the queue exists but no server conn actually runs.
+func TestPGBStarveOnQueueWithNoActiveConns(t *testing.T) {
+	k, fr, _ := starveFixture(t, starveNoActivePoolsOut)
+	k.probeCycle(context.Background())
+	k.probeCycle(context.Background())
+	if !strings.Contains(fr.Joined(), "-d pgbouncer -Aqc RECONNECT") {
+		t.Fatalf("RECONNECT did not fire for cl_waiting+sv_active=0:\n%s",
+			fr.Joined())
+	}
+}
+
+// backend_env==0 vetoes the starve count: a broken backend can
+// legitimately starve the queue and RECONNECT cannot help it.
+func TestPGBStarveNotCountedWhenBackendBroken(t *testing.T) {
+	k, fr, _ := starveFixture(t, starvePoolsOut)
+	// The backend-env check is the ONLY query ending in
+	// `-tAc select 1` over the loopback psql path — fail it alone
+	// (e2e through the pooler keeps succeeding).
+	fr.FailOn("-h 127.0.0.1 -U postgres -d postgres -tAc select 1",
+		errors.New("password authentication failed"))
+	for i := 0; i < 3; i++ {
+		k.probeCycle(context.Background())
+	}
+	j := fr.Joined()
+	if strings.Contains(j, "RECONNECT") ||
+		strings.Contains(j, "restart kine-pgbouncer") {
+		t.Fatalf("remediation fired with backend_env=0:\n%s", j)
+	}
+	if v, _ := readIntFile(filepath.Join(
+		k.cfg.GuardStateDir, pgbStarveFile)); v != 0 {
+		t.Fatalf("starve streak=%d want 0 with backend_env=0", v)
+	}
+}
+
+// A backend that IS busy (active queries >= held server conns) is
+// real saturation evidence, not stalled conns — no starvation.
+func TestPGBStarveNotCountedWhenBackendBusy(t *testing.T) {
+	k, fr, _ := starveFixture(t, starvePoolsOut)
+	fr.On("pid <> pg_backend_pid", "10\n") // 10 active == 10 held conns
+	k.probeCycle(context.Background())
+	k.probeCycle(context.Background())
+	j := fr.Joined()
+	if strings.Contains(j, "RECONNECT") ||
+		strings.Contains(j, "restart kine-pgbouncer") {
+		t.Fatalf("remediation fired on a genuinely busy backend:\n%s", j)
+	}
+	if v, _ := readIntFile(filepath.Join(
+		k.cfg.GuardStateDir, pgbStarveFile)); v != 0 {
+		t.Fatalf("starve streak=%d want 0 on a busy backend", v)
+	}
+}
+
+// A failed RECONNECT (admin console itself wedged) falls back to
+// the container restart inside the same budget spend.
+func TestPGBStarveReconnectFallsBackToRestart(t *testing.T) {
+	k, fr, _ := starveFixture(t, starvePoolsOut)
+	fr.FailOn("RECONNECT", errors.New("console unreachable"))
+	k.probeCycle(context.Background())
+	k.probeCycle(context.Background())
+	j := fr.Joined()
+	if !strings.Contains(j, "RECONNECT") {
+		t.Fatalf("RECONNECT not attempted:\n%s", j)
+	}
+	if !strings.Contains(j, "restart kine-pgbouncer") {
+		t.Fatalf("restart fallback missing after RECONNECT failure:\n%s", j)
 	}
 }

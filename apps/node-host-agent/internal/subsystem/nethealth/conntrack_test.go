@@ -236,3 +236,83 @@ func TestPeerConntrackFlushBestEffort(t *testing.T) {
 		t.Fatalf("missing flush-skip log:\n%s", logLines(t, e))
 	}
 }
+
+// --- W12-KR3: insert_failed/drop spike → whole-UDP flush ---
+
+// ranExactCmd reports whether the fake executed argv joined EXACTLY
+// as cmd — "conntrack -D -p udp" must not match the longer
+// "--dport 53" / peer flushes it prefixes.
+func ranExactCmd(e *env, cmd string) bool {
+	for _, c := range e.host.Cmds() {
+		if strings.Join(c, " ") == cmd {
+			return true
+		}
+	}
+	return false
+}
+
+// conntrackStatBody renders a /proc/net/stat/nf_conntrack fixture
+// with the given hex values in the insert_failed / drop /
+// early_drop columns.
+func conntrackStatBody(insertFailed, drop, earlyDrop string) string {
+	return "  entries  searched found insert insert_failed drop early_drop\n" +
+		"00000ed4  00000000 00000000 00000000 " +
+		insertFailed + " " + drop + " " + earlyDrop + "\n"
+}
+
+func TestConntrackDropSpikeFlushesUDP(t *testing.T) {
+	e := fixture(t, nil)
+	e.n.cfg.ConntrackStatFile = filepath.Join(t.TempDir(), "nf_conntrack")
+	testutil.WriteFile(t, e.n.cfg.ConntrackStatFile,
+		conntrackStatBody("00000064", "0000000a", "00000000"))
+	e.n.Cycle(context.Background()) // baseline read — never flushes
+	if ranExactCmd(e, "conntrack -D -p udp") {
+		t.Fatal("UDP flush fired on the baseline read")
+	}
+	// +0x46 = 70 new refuses across the summed columns → spike.
+	testutil.WriteFile(t, e.n.cfg.ConntrackStatFile,
+		conntrackStatBody("000000aa", "00000014", "00000000"))
+	e.n.Cycle(context.Background())
+	if !ranExactCmd(e, "conntrack -D -p udp") {
+		t.Fatalf("UDP flush did not fire on a +70 spike, cmds=%v", e.host.Cmds())
+	}
+	e.host.ClearLog()
+	// Same counters again — a 0-delta cycle must not re-flush.
+	e.n.Cycle(context.Background())
+	if ranExactCmd(e, "conntrack -D -p udp") {
+		t.Fatal("UDP flush refired without a counter delta")
+	}
+}
+
+func TestConntrackDropUnderThresholdNoFlush(t *testing.T) {
+	e := fixture(t, nil)
+	e.n.cfg.ConntrackStatFile = filepath.Join(t.TempDir(), "nf_conntrack")
+	testutil.WriteFile(t, e.n.cfg.ConntrackStatFile,
+		conntrackStatBody("0000000a", "00000000", "00000000"))
+	e.n.Cycle(context.Background())
+	// +0x32 = 50 — the threshold is strictly "> 50", so exactly 50
+	// must not flush.
+	testutil.WriteFile(t, e.n.cfg.ConntrackStatFile,
+		conntrackStatBody("0000003c", "00000000", "00000000"))
+	e.n.Cycle(context.Background())
+	if ranExactCmd(e, "conntrack -D -p udp") {
+		t.Fatal("UDP flush fired at exactly the 50 threshold")
+	}
+}
+
+func TestConntrackDropSpikeMissingFileIdles(t *testing.T) {
+	e := fixture(t, nil)
+	// Module absent → no stat file: the detector idles, the
+	// baseline resets so a re-appearing file can't false-spike.
+	e.n.cfg.ConntrackStatFile = filepath.Join(t.TempDir(), "missing")
+	e.n.Cycle(context.Background())
+	if ranExactCmd(e, "conntrack -D -p udp") {
+		t.Fatal("UDP flush fired without a stat file")
+	}
+	testutil.WriteFile(t, e.n.cfg.ConntrackStatFile,
+		conntrackStatBody("00000100", "00000100", "00000100"))
+	e.n.Cycle(context.Background()) // re-seeds the baseline only
+	if ranExactCmd(e, "conntrack -D -p udp") {
+		t.Fatal("UDP flush fired on a re-appearing baseline read")
+	}
+}

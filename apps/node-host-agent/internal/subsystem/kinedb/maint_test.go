@@ -214,3 +214,67 @@ func TestMaintCycleAssessFailGatesGauges(t *testing.T) {
 		t.Fatalf("repack failure not emitted:\n%s", content)
 	}
 }
+
+// W12-CP2: the invalid-index reaper drops *_ccnew/*_ccold shells
+// BEFORE the reindex and leaves other invalid indexes for an
+// operator.
+func TestMaintReapsInvalidIndexes(t *testing.T) {
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		// regclass::text may be schema-qualified — the bare-name
+		// suffix check must still fire.
+		{Substr: "indisvalid", Out: "public.kine_name_prev_revision_uindex_ccnew\nkine_id_idx_ccold\nkine_other_idx\n"},
+		{Substr: "DROP INDEX CONCURRENTLY", Out: "DROP INDEX\n"},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
+		{Substr: "datfrozenxid", Out: "1000000\n"},
+	})
+	res := k.maintCycle(context.Background())
+	if res.invalidDropped != 2 || res.invalidKept != 1 {
+		t.Fatalf("res=%+v", res)
+	}
+	j := fr.Joined()
+	for _, want := range []string{
+		`DROP INDEX CONCURRENTLY IF EXISTS "kine_name_prev_revision_uindex_ccnew"`,
+		`DROP INDEX CONCURRENTLY IF EXISTS "kine_id_idx_ccold"`,
+	} {
+		if !strings.Contains(j, want) {
+			t.Fatalf("missing %q:\n%s", want, j)
+		}
+	}
+	if strings.Contains(j, `DROP INDEX CONCURRENTLY IF EXISTS "kine_other_idx"`) {
+		t.Fatalf("non-ccnew/ccold index was dropped:\n%s", j)
+	}
+	// Ordering: every drop precedes the REINDEX TABLE run.
+	dropIdx, reindexIdx := -1, -1
+	for i, c := range fr.Cmds() {
+		s := strings.Join(c, " ")
+		if strings.Contains(s, "DROP INDEX CONCURRENTLY") && dropIdx < 0 {
+			dropIdx = i
+		}
+		if strings.Contains(s, "REINDEX TABLE CONCURRENTLY") && reindexIdx < 0 {
+			reindexIdx = i
+		}
+	}
+	if dropIdx < 0 || reindexIdx < 0 || dropIdx > reindexIdx {
+		t.Fatalf("reaper ordering wrong (drop=%d reindex=%d)", dropIdx, reindexIdx)
+	}
+}
+
+// A failed invalid-index listing is noted and skipped — the reindex
+// still runs (best-effort reaper).
+func TestMaintReaperSkipsOnListFailure(t *testing.T) {
+	k, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "indisvalid", Err: errors.New("connection reset")},
+		{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
+	})
+	res := k.maintCycle(context.Background())
+	if !res.okReindex || res.invalidDropped != 0 {
+		t.Fatalf("res=%+v", res)
+	}
+	if strings.Contains(fr.Joined(), "DROP INDEX CONCURRENTLY") {
+		t.Fatalf("drop ran despite the failed listing:\n%s", fr.Joined())
+	}
+}

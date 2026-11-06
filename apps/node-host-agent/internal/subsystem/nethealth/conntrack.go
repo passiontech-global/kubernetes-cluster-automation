@@ -3,6 +3,7 @@ package nethealth
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -17,6 +18,12 @@ const (
 	// counter must not flap the state file every cycle.
 	conntrackEnterRatio = 0.90
 	conntrackExitRatio  = 0.80
+	// conntrackDropSpike is the per-cycle delta of
+	// insert_failed+drop+early_drop that counts as a conntrack
+	// refuse spike (W12-KR3): a table refusing NEW flow insertions
+	// at this rate pins NATed UDP tuples (the A+AAAA DNS race
+	// class) — the remedy is evicting stale UDP entries.
+	conntrackDropSpike = 50
 )
 
 // --- Check: conntrack-guard (H2) ---
@@ -60,7 +67,98 @@ func (n *NetHealth) checkConntrack(ctx context.Context) {
 		n.state.Enter(hoststate.LatchConntrackPressure,
 			fmt.Sprintf("used=%.0f max=%.0f ratio=%.2f", used, max, ratio))
 	}
+	n.checkConntrackDropSpike(ctx)
 	n.cycles.WithLabelValues(checkCT, "ok").Inc()
+}
+
+// --- W12-KR3: conntrack insert_failed/drop spike → stale-UDP flush ---
+
+// conntrackStatSum parses /proc/net/stat/nf_conntrack — a header of
+// column names then one HEX row per CPU — and returns the sum of the
+// named columns across all CPUs. ok=false when the file is
+// unreadable or carries none of the wanted columns (module absent →
+// detector idles; hostmetrics' conntrackStatCounters twin).
+func conntrackStatSum(path string, keys ...string) (uint64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) < 2 {
+		return 0, false
+	}
+	header := strings.Fields(lines[0])
+	idx := map[string]int{}
+	for _, k := range keys {
+		for i, name := range header {
+			if name == k {
+				idx[k] = i
+			}
+		}
+	}
+	if len(idx) == 0 {
+		return 0, false
+	}
+	var sum uint64
+	for _, line := range lines[1:] {
+		f := strings.Fields(line)
+		if len(f) != len(header) {
+			continue // malformed CPU row — skip, never count junk
+		}
+		for _, i := range idx {
+			if v, err := strconv.ParseUint(f[i], 16, 64); err == nil {
+				sum += v
+			}
+		}
+	}
+	return sum, true
+}
+
+// checkConntrackDropSpike — W12-KR3: the fill-ratio gauge above only
+// sees a nearly-FULL table; insert_failed/drop climb while the table
+// still has headroom when stale UDP tuples collide with new
+// insertions (the A+AAAA source-port race) or the table evicts live
+// flows under churn (early_drop). A per-cycle delta over
+// conntrackDropSpike flushes the whole UDP conntrack set — the same
+// best-effort contract as the :53 flush (a missing binary or denied
+// delete logs and moves on, the cycle verdict is unaffected). The
+// first read only seeds the baseline so an agent restart can't
+// mistake the cumulative counters for a fresh spike.
+func (n *NetHealth) checkConntrackDropSpike(ctx context.Context) {
+	sum, ok := conntrackStatSum(n.cfg.ConntrackStatFile,
+		"insert_failed", "drop", "early_drop")
+	if !ok {
+		n.ctStatSeen = false
+		return
+	}
+	prev, seen := n.ctStatPrev, n.ctStatSeen
+	n.ctStatPrev, n.ctStatSeen = sum, true
+	if !seen || sum <= prev || sum-prev <= conntrackDropSpike {
+		return
+	}
+	n.state.AppendLog(fmt.Sprintf(
+		"ACTION: conntrack insert_failed+drop spiked +%d in one cycle (> %d) — flushing stale UDP conntrack entries",
+		sum-prev, conntrackDropSpike))
+	n.flushStaleUDPConntrackAll(ctx, checkCT)
+}
+
+// flushStaleUDPConntrackAll drops EVERY udp conntrack entry — the
+// coarse remedy for an insert_failed/drop spike, where the wedged
+// tuples aren't limited to DNS (:53). Deleting the set forces the
+// kernel to re-track live UDP flows on their next packet and drops
+// the stale NAT tuples the inserts were colliding with. Same
+// best-effort contract as flushStaleUDPConntrack: runMountCmd seam,
+// a missing conntrack binary logs and moves on.
+func (n *NetHealth) flushStaleUDPConntrackAll(ctx context.Context, check string) {
+	out, err := n.cfg.runMountCmd(ctx,
+		[]string{"conntrack", "-D", "-p", "udp"})
+	if err != nil {
+		n.state.AppendLog(fmt.Sprintf("conntrack udp flush skipped: %v (%s)",
+			err, trimRunErr(out)))
+		return
+	}
+	n.actions.WithLabelValues(check, "flush_udp").Inc()
+	n.state.AppendLog("ACTION: flushed all stale udp conntrack entries")
 }
 
 // flushPeerNebulaConntrack drops stale udp/<nebula-port> conntrack

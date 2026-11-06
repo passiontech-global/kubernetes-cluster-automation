@@ -186,6 +186,15 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 	counter("node_agent_kubelet_pleg_discard_events_total",
 		"kubelet_pleg_discard_events counter passthrough — PLEG events dropped under backlog.",
 		d.Series.KubeletPLEGDiscardEvents)
+	counter("node_agent_pod_cgroup_memory_throttled",
+		"Pod cgroups with memory.pressure full avg60 >40% and rising memory.events high while node PSI is quiet — memory.high throttle without OOM (W12-KR1).",
+		d.Series.PodCgroupMemoryThrottled)
+	b.Gauge("node_cgroup_pids_utilization_max_ratio",
+		"Max pids.current/pids.max ratio across kubepods pod cgroups — near 1 means fork() denials are next.",
+		d.Series.PodCgroupPIDsMaxUtilRatio)
+	counter("node_kubelet_storage_operation_errors_total",
+		"storage_operation_errors_total summed over volume_plugin/operation labels from the kubelet :10250/metrics scrape (W12-KR4).",
+		d.Series.KubeletStorageOperationErrors)
 	if err := promfile.Write(dir, "node-agent-hygiene.prom",
 		[]byte(b.String())); err != nil {
 		fail(err)

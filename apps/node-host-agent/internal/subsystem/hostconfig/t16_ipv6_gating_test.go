@@ -57,3 +57,20 @@ func TestT16PairsIPv6Gated(t *testing.T) {
 		t.Fatal("ipv4 gc_thresh3 missing from t16Pairs")
 	}
 }
+
+// W12-KR3: the sysctl drop-in must widen the ephemeral source-port
+// range and allow TIME_WAIT reuse — the pair that prevents
+// EADDRNOTAVAIL on gateway/proxy churn bursts.
+func TestT16PairsEphemeralPortHygiene(t *testing.T) {
+	c := &cyc{r: &Reconciler{}}
+	pairs := map[string]string{}
+	for _, kv := range c.t16Pairs() {
+		pairs[kv[0]] = kv[1]
+	}
+	if got := pairs["net.ipv4.ip_local_port_range"]; got != "10240 65535" {
+		t.Fatalf("ip_local_port_range = %q want \"10240 65535\"", got)
+	}
+	if got := pairs["net.ipv4.tcp_tw_reuse"]; got != "1" {
+		t.Fatalf("tcp_tw_reuse = %q want \"1\"", got)
+	}
+}

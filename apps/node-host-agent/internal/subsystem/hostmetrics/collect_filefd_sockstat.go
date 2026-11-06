@@ -22,6 +22,17 @@ const (
 	// sockstat uses, and hostPID makes it the host view anyway).
 	defaultNetstatFile = "/proc/1/net/netstat"
 	defaultSNMPFile    = "/proc/1/net/snmp"
+	// W12-KR3 sources: the ephemeral source-port range the
+	// sockstat saturation ratio divides by, and the per-socket
+	// tables the CLOSE_WAIT count scans (host netns via /proc/1).
+	defaultLocalPortRangeFile = "/proc/sys/net/ipv4/ip_local_port_range"
+	defaultProcNetTCP         = "/proc/1/net/tcp"
+	defaultProcNetTCP6        = "/proc/1/net/tcp6"
+	// defaultEphemeralPortWidth is the kernel's stock
+	// ip_local_port_range span (32768-60999) — the fallback when
+	// the sysctl itself can't be read (hostconfig widens it to
+	// 10240-65535 = 55296).
+	defaultEphemeralPortWidth = 28232
 )
 
 // --- H6: FD + socket pressure (file-nr, sockstat) ---
@@ -60,6 +71,22 @@ var (
 	descSockTCPCW = prometheus.NewDesc(
 		"node_host_agent_sockstat_tcp_close_wait",
 		"sockstat TCP close_wait — sockets stuck half-closed waiting for local close().",
+		[]string{"node"}, nil)
+	// W12-KR3: ephemeral source-port saturation — (inuse + tw) over
+	// the ip_local_port_range width. Past ~0.8 every new connect()
+	// risks EADDRNOTAVAIL, which applications report as generic
+	// "network is down" (the Cloudflare/Haplon/Envoy incident shape).
+	descEphemeralPortSat = prometheus.NewDesc(
+		"node_sockstat_ephemeral_port_saturation_ratio",
+		"sockstat TCP inuse+tw divided by the ip_local_port_range width — ephemeral source-port pool saturation.",
+		[]string{"node"}, nil)
+	// W12-KR3: the per-socket CLOSE_WAIT count. sockstat doesn't
+	// break the state out on every kernel, so /proc/1/net/tcp{,6}
+	// is scanned directly — a growing count is a userspace
+	// connection leak (linkerd-proxy/cilium-envoy class).
+	descTCPCloseWaitSocks = prometheus.NewDesc(
+		"node_tcp_close_wait_sockets",
+		"Sockets in TCP_CLOSE_WAIT (state 08) across /proc/1/net/tcp and /proc/1/net/tcp6.",
 		[]string{"node"}, nil)
 	// Kernel TCP/IP stack counters (netstat TcpExt + snmp Ip/Udp) —
 	// listen-queue overflows/drops present as accept flakes,
@@ -124,6 +151,16 @@ func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
 // emits only when its key parsed — a node missing a section keeps
 // that series absent rather than 0.
 func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
+	// W12-KR3: the CLOSE_WAIT count comes from the per-socket
+	// tables, NOT sockstat — it must emit even when the sockstat
+	// file itself is absent, so it runs before the early return.
+	// ok=false only when NO family table read (a node with neither
+	// file is inconclusive, not empty).
+	if cw, ok := tcpStateCount(0x08,
+		c.cfg.ProcNetTCP, c.cfg.ProcNetTCP6); ok {
+		ch <- prometheus.MustNewConstMetric(descTCPCloseWaitSocks,
+			prometheus.GaugeValue, cw, c.cfg.NodeName)
+	}
 	f, err := os.Open(c.cfg.SockstatFile)
 	if err != nil {
 		return
@@ -195,6 +232,67 @@ func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(descSockTCPCW,
 			prometheus.GaugeValue, tcpCW, c.cfg.NodeName)
 	}
+	// W12-KR3: ephemeral source-port saturation. The ratio needs
+	// both sockstat legs (inuse + tw) — a partial read stays absent
+	// rather than emit a falsely-low value. An unreadable sysctl
+	// falls back to the kernel's stock 28232-wide range so the
+	// series still reflects the compiled-in limit.
+	if tcpInuseOK && tcpTWOK {
+		width := ephemeralPortWidth(c.cfg.LocalPortRangeFile)
+		ch <- prometheus.MustNewConstMetric(descEphemeralPortSat,
+			prometheus.GaugeValue, (tcpInuse+tcpTW)/width, c.cfg.NodeName)
+	}
+}
+
+// ephemeralPortWidth returns the ip_local_port_range span — the
+// count of ports the kernel picks source ports from. The sysctl
+// file carries "<low> <high>"; an unreadable/malformed file or an
+// inverted range yields the stock 28232-wide default (the kernel
+// compiled value — the range can never be narrower in practice).
+func ephemeralPortWidth(path string) float64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return defaultEphemeralPortWidth
+	}
+	f := strings.Fields(string(data))
+	if len(f) < 2 {
+		return defaultEphemeralPortWidth
+	}
+	lo, errL := strconv.ParseUint(f[0], 10, 32)
+	hi, errH := strconv.ParseUint(f[1], 10, 32)
+	if errL != nil || errH != nil || hi <= lo {
+		return defaultEphemeralPortWidth
+	}
+	return float64(hi - lo + 1)
+}
+
+// tcpStateCount scans the /proc/net/tcp{,6} socket tables and
+// counts entries whose `st` column (field 3, hex TCP state) equals
+// state. ok=false when NO table read at all — a single readable
+// family still counts (an IPv6-less host legitimately lacks
+// tcp6).
+func tcpStateCount(state byte, paths ...string) (float64, bool) {
+	want := string([]byte{
+		"0123456789ABCDEF"[state>>4], "0123456789ABCDEF"[state&0x0f]})
+	var n float64
+	var ok bool
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		ok = true
+		for i, line := range strings.Split(string(data), "\n") {
+			if i == 0 {
+				continue // column header
+			}
+			f := strings.Fields(line)
+			if len(f) > 3 && f[3] == want {
+				n++
+			}
+		}
+	}
+	return n, ok
 }
 
 // --- netstat/snmp kernel TCP/IP counters ---
