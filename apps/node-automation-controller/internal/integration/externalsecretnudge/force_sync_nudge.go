@@ -92,9 +92,9 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 		return nil
 	}
 
-	// The nudged ledger needs no prune pass: CooldownSet has no
-	// enumeration (stamps past the cooldown read uncooled anyway,
-	// and entries for vanished ESs are dead weight that ages out).
+	// The nudged ledger needs no prune pass: stamps past the
+	// cooldown read uncooled anyway, and entries for vanished ESs
+	// are dead weight that ages out on its own.
 	nudgedNow := 0
 	for i := range list.Items {
 		es := &list.Items[i]
@@ -161,31 +161,25 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 }
 
 // esNudgeStamp returns the newest persisted nudge marker on the ES —
-// force-sync (unix) or node.ops/last-es-nudge (RFC3339 or unix),
-// whichever parses latest. Unparseable values count as absent: a
-// garbage stamp cannot prove a recent nudge, and stamping over it is
-// exactly how the ES gets unstuck.
+// force-sync or node.ops/last-es-nudge, whichever parses latest. Both
+// keys go through kube.ParseAnnoTime: absent/empty/unparseable values
+// count as absent (a garbage stamp cannot prove a recent nudge, and
+// stamping over it is exactly how the ES gets unstuck), and each
+// accepts RFC3339 OR unix seconds — force-sync is written unix and
+// last-es-nudge RFC3339 today, but older objects still carry the
+// legacy unix stamp under last-es-nudge.
 func esNudgeStamp(es *unstructured.Unstructured) (time.Time, bool) {
 	var latest time.Time
 	found := false
-	if v := es.GetAnnotations()[esForceSyncAnno]; v != "" {
-		if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
-			latest = time.Unix(ts, 0)
-			found = true
-		}
+	if t, ok := kube.ParseAnnoTime(
+		es.GetAnnotations()[esForceSyncAnno]); ok {
+		latest, found = t, true
 	}
-	if v := es.GetAnnotations()[esLastNudgeAnno]; v != "" {
-		var t time.Time
-		if parsed, err := time.Parse(time.RFC3339, v); err == nil {
-			t = parsed
-		} else if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
-			t = time.Unix(ts, 0)
-		}
-		if !t.IsZero() {
-			found = true
-			if t.After(latest) {
-				latest = t
-			}
+	if t, ok := kube.ParseAnnoTime(
+		es.GetAnnotations()[esLastNudgeAnno]); ok {
+		found = true
+		if t.After(latest) {
+			latest = t
 		}
 	}
 	return latest, found

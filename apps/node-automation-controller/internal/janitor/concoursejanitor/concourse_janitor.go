@@ -105,7 +105,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -127,7 +126,7 @@ const (
 	cjATCBase      = "http://concourse-web.concourse:8080"
 	cjSecretName   = "concourse-web"
 	cjSecretKey    = "local-users"
-	cjBaselineAnno = "concourse.passiontech.dev/baseline-nodefs-gib"
+	cjBaselineAnno = kube.AnnoConcourseBaselineNodeFSGiB
 
 	cjMaxWorkdirGiB = 100 // work-dir cap — the disk limit Concourse lacks
 	cjMinNodefsPct  = 60  // nodefs above this forces a wipe too
@@ -180,7 +179,6 @@ type concourseWorkdirJanitor struct {
 	stats   nodeStatsReader
 	atc     atcIface
 	enabled bool
-	mu      sync.Mutex
 	// dyn reads the autopilot Plan CR for maintenance-mutex
 	// signal (c) — no typed client exists for it.
 	dyn dynamic.Interface
@@ -240,8 +238,6 @@ func (j *concourseWorkdirJanitor) run(ctx context.Context) error {
 		log.Info("skip: concourse-workdir-janitor disabled")
 		return nil
 	}
-	j.mu.Lock()
-	defer j.mu.Unlock()
 
 	// 2.7 maintenance mutex — defer the whole wipe cycle while any
 	// deliberate maintenance is in flight (cordon/drain, kured

@@ -102,7 +102,7 @@ const (
 	// helmLastStallUnwedgeAnno persists the last unwedge moment on
 	// the HR — the durable half of the 24h stall-unwedge cooldown,
 	// deliberately a different key than node.ops/last-helm-unlock.
-	helmLastStallUnwedgeAnno = "node.ops/last-helm-stall-unwedge"
+	helmLastStallUnwedgeAnno = kube.AnnoLastHelmStallUnwedge
 	// fluxResetAnno zeroes helm-controller's failure counters — the
 	// documented escape from Stalled=True/RetriesExceeded
 	// (helm-controller#823, >= v0.37.0). fluxForceAnno requests a
@@ -166,15 +166,7 @@ func hrCondition(o *unstructured.Unstructured, condType string) (status, reason,
 // helmLastStallUnwedge reads the persisted node.ops/last-helm-stall-
 // unwedge stamp — the restart-proof half of the unwedge cooldown.
 func helmLastStallUnwedge(hr *unstructured.Unstructured) (time.Time, bool) {
-	v := hr.GetAnnotations()[helmLastStallUnwedgeAnno]
-	if v == "" {
-		return time.Time{}, false
-	}
-	t, err := time.Parse(time.RFC3339, v)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
+	return kube.AnnoTime(hr, helmLastStallUnwedgeAnno)
 }
 
 // unwedgeDue runs the stall-unwedge pass over the due HRs — cooldown

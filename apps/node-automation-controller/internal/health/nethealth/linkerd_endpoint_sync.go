@@ -24,6 +24,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -407,31 +408,20 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 	log logr.Logger, svcKey string, now time.Time, stale []linkerdSliceRef) {
 
-	if p.linkerdDesyncHealed.CooledDown(svcKey, linkerdDestHealCooldown, now) {
-		log.Info("skip heal: linkerd-destination inside cooldown",
-			"service", svcKey)
-		return
-	}
-	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-	if err != nil {
+	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
+		&p.linkerdDesyncHealed, svcKey, linkerdDestHealCooldown, now)
+	if unverifiable {
 		metrics.IncError(p.Name)
-		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
-			"service", svcKey, "error", err)
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — heal deferred",
-			"service", svcKey, "why", why)
+	if !proceed {
 		return
 	}
 
 	healed := false
 	for _, sl := range stale {
-		uid := sl.uid
 		err := p.CS.DiscoveryV1().EndpointSlices(sl.ns).Delete(ctx, sl.name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			})
+			kube.UIDDeleteOptions(sl.uid, ""))
 		switch {
 		case err == nil:
 			healed = true
@@ -454,6 +444,10 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 			"error", err)
 		return
 	}
+	// The pod pick stays bespoke — the component matcher is not a
+	// plain name-prefix list (exact name + Deployment prefix +
+	// control-plane-component label, any phase), which
+	// heal.OldestRunningPod's Running-only prefix scan cannot express.
 	var target *corev1.Pod
 	for i := range pods.Items {
 		pod := &pods.Items[i]
@@ -467,11 +461,9 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		}
 	}
 	if target != nil {
-		uid := target.UID
-		if err := p.CS.CoreV1().Pods(target.Namespace).Delete(ctx, target.Name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
+		// The stamp is NOT the ledger's here — svcKey stamps once at
+		// the end when ANY heal action (slice or pod delete) landed.
+		if _, err := heal.DeletePod(ctx, p.CS, nil, "", target, now); err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "linkerd-destination delete failed",
 				"pod", target.Namespace+"/"+target.Name)

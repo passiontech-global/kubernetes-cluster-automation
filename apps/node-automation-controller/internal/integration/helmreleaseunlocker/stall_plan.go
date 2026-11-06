@@ -63,7 +63,7 @@ func (u *helmReleaseUnlocker) deadlockPlan(ctx context.Context,
 		return nil, "", fmt.Errorf("list replicasets in %s: %w", dep.Namespace, err)
 	}
 	pods, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: helmListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Pods(u.cs, dep.Namespace))
 	if err != nil {
 		return nil, "", fmt.Errorf("list pods in %s: %w", dep.Namespace, err)
@@ -207,7 +207,7 @@ func (u *helmReleaseUnlocker) deadlockPlan(ctx context.Context,
 func (u *helmReleaseUnlocker) pdbBlocksScaleDown(ctx context.Context,
 	ns string, podLabels map[string]string, remove int) (string, error) {
 	pdbs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: helmListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.PodDisruptionBudgets(u.cs, ns))
 	if err != nil {
 		return "", fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w", ns, err)

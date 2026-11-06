@@ -40,10 +40,10 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	var replicated []replicatedSecretRef
 	// Server-side type filter + continue-token pagination: the
 	// all-namespaces secret read is the biggest this module makes —
-	// page it at certDriftListPage so no single response dominates.
+	// page it at kube.DefaultListPageSize so no single response dominates.
 	err := kube.ListEach(ctx, metav1.ListOptions{
 		FieldSelector: "type=kubernetes.io/tls",
-		Limit:         certDriftListPage,
+		Limit:         kube.DefaultListPageSize,
 	}, kube.Secrets(a.cs, metav1.NamespaceAll),
 		func(items []corev1.Secret) error {
 			for i := range items {

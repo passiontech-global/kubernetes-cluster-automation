@@ -30,7 +30,7 @@ const (
 	// helmLastUnlockAnno persists the last unlock moment on the HR —
 	// the 24h cooldown survives operator restarts where the unlocked
 	// ledger cannot.
-	helmLastUnlockAnno = "node.ops/last-helm-unlock"
+	helmLastUnlockAnno = kube.AnnoLastHelmUnlock
 )
 
 // hrStuckInProgress reports whether the HR's Ready condition is False
@@ -53,12 +53,12 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 		// The cooldown reads the wider of the in-RAM ledger and the
 		// persisted node.ops/last-helm-unlock stamp — an operator
 		// restart empties the ledger but must not refund the 24h.
-		last, ok := u.unlocked[key]
+		last, ok := u.unlocked.Entries()[key]
 		if t, hasAnno := helmLastUnlock(hr); hasAnno && t.After(last) {
 			last, ok = t, true
 		}
 		if ok && now.Sub(last) < helmUnlockCooldown {
-			u.unlocked[key] = last // fold the persisted stamp into the ledger
+			u.unlocked.Stamp(key, last) // fold the persisted stamp into the ledger
 			// Still/again stuck inside the cooldown: the previous
 			// unlock did NOT resolve it — page instead of churning
 			// secrets every tick. The alert itself fires once per
@@ -86,7 +86,7 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 			// "still stuck after unlock" errors for a refusal.
 			continue
 		}
-		u.unlocked[key] = now
+		u.unlocked.Stamp(key, now)
 		unlocked++
 	}
 	return unlocked
@@ -204,13 +204,5 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 // — the durable half of the 24h cooldown, surviving operator restarts
 // where the in-memory ledger cannot.
 func helmLastUnlock(hr *unstructured.Unstructured) (time.Time, bool) {
-	v := hr.GetAnnotations()[helmLastUnlockAnno]
-	if v == "" {
-		return time.Time{}, false
-	}
-	t, err := time.Parse(time.RFC3339, v)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
+	return kube.AnnoTime(hr, helmLastUnlockAnno)
 }

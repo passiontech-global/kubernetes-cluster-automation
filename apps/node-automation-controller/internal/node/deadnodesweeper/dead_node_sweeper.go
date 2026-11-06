@@ -168,7 +168,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	stuck := map[string]int{}
 	err = kube.ListEach(ctx, metav1.ListOptions{
 		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
-		Limit:         500,
+		Limit:         kube.DefaultListPageSize,
 	}, kube.Pods(s.cs, metav1.NamespaceAll),
 		func(items []corev1.Pod) error {
 			for i := range items {
@@ -319,7 +319,8 @@ func (s *deadNodeSweeper) hasRemediationCR(ctx context.Context, nodeName string)
 	for _, gvr := range []schema.GroupVersionResource{
 		selfNodeRemediationGVR, fenceAgentsRemediationGVR,
 	} {
-		items, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+		items, err := kube.ListAll(ctx,
+			metav1.ListOptions{Limit: kube.DefaultListPageSize},
 			kube.DynamicPage(s.dyn.Resource(gvr).Namespace(metav1.NamespaceAll)))
 		if err != nil {
 			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
@@ -355,7 +356,8 @@ func (s *deadNodeSweeper) logVolumeAttachments(ctx context.Context, nodeName str
 	// Paged like the pod list above — VolumeAttachments are
 	// cluster-scoped and unbounded, and this read is signal-only.
 	var names []string
-	err := kube.ListEach(ctx, metav1.ListOptions{Limit: 500},
+	err := kube.ListEach(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.VolumeAttachments(s.cs),
 		func(items []storagev1.VolumeAttachment) error {
 			for i := range items {

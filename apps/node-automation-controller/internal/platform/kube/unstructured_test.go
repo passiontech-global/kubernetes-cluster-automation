@@ -64,6 +64,40 @@ func TestNestedScalars(t *testing.T) {
 	}
 }
 
+func TestNestedNumber(t *testing.T) {
+	obj := map[string]any{
+		"spec": map[string]any{
+			"fromAPI":     int64(7),      // unstructured decoding
+			"fromJSON":    float64(8),    // encoding/json round-trip
+			"fromLiteral": int(9),        // hand-built fixture
+			"fractional":  float64(3.75), // truncates toward zero
+			"name":        "widget",
+		},
+	}
+	for _, tc := range []struct {
+		name   string
+		fields []string
+		want   int64
+		ok     bool
+	}{
+		{"int64", []string{"spec", "fromAPI"}, 7, true},
+		{"float64", []string{"spec", "fromJSON"}, 8, true},
+		{"int", []string{"spec", "fromLiteral"}, 9, true},
+		{"float64 truncates", []string{"spec", "fractional"}, 3, true},
+		{"missing", []string{"spec", "absent"}, 0, false},
+		{"wrong type", []string{"spec", "name"}, 0, false},
+		{"through scalar", []string{"spec", "name", "deep"}, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := NestedNumber(obj, tc.fields...)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("NestedNumber = (%d,%v), want (%d,%v)",
+					got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
 func TestNestedNilObject(t *testing.T) {
 	if _, ok := NestedString(nil, "status", "phase"); ok {
 		t.Fatal("nil object reported a value")
@@ -89,6 +123,9 @@ func TestConditionsDecode(t *testing.T) {
 				map[string]any{
 					"type":   "Available",
 					"status": "True",
+					// float64 observedGeneration — the JSON/fixture
+					// shape — decodes through NestedNumber, not absent.
+					"observedGeneration": float64(2),
 					// no reason/message/timestamp — partial entries decode
 				},
 			},
@@ -112,6 +149,10 @@ func TestConditionsDecode(t *testing.T) {
 	}
 	if conds[1].Reason != "" || !conds[1].LastTransitionTime.IsZero() {
 		t.Fatalf("partial cond = %+v", conds[1])
+	}
+	if conds[1].ObservedGeneration != 2 {
+		t.Fatalf("float64 ObservedGeneration = %d, want 2",
+			conds[1].ObservedGeneration)
 	}
 }
 

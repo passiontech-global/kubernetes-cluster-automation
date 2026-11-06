@@ -97,7 +97,7 @@ func Setup(d shared.Deps) error {
 		Watches(&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
 			builder.WithPredicates(nodeLabelChanges)).
-		Complete(r)
+		Complete(shared.CountReconcile(d.Name, r.Reconcile))
 }
 
 func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -107,7 +107,6 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 	// (a) worker role on every non-control-plane node lacking it.
 	nodes, err := kube.ListNodes(ctx, r.cs)
 	if err != nil {
-		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
 	// The listed snapshot doubles as the labels.txt lookup index —

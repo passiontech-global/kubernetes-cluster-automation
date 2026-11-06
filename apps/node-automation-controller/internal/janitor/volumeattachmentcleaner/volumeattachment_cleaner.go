@@ -51,7 +51,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -83,10 +82,6 @@ const (
 	// vaDeleteCap bounds detach calls per cycle — a wrong verdict
 	// must never detach more than a handful of volumes at once.
 	vaDeleteCap = 10
-	// vaListPageSize bounds each cluster-wide VA/pod List page —
-	// continue-token pagination keeps a large fleet from arriving
-	// as one giant response body.
-	vaListPageSize = 500
 	// vaOutOfServiceTaint is the Kubernetes-native "node is fenced"
 	// signal — the same key dead-node-sweeper sets.
 	vaOutOfServiceTaint = "node.kubernetes.io/out-of-service"
@@ -107,7 +102,6 @@ type volumeAttachmentCleaner struct {
 	// now is the clock seam — tests pin and advance it freely.
 	now shared.Clock
 
-	mu sync.Mutex
 	// orphanFirstSeen: va name → first cycle the VA pointed at a
 	// node that does not exist. Two consecutive sightings are
 	// required to delete — an operator restart re-arms the window,
@@ -140,8 +134,6 @@ func Setup(d shared.Deps) error {
 
 func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	now := c.now.Now()
 
 	// Gate 1: the node list is the single source of truth for
@@ -184,7 +176,7 @@ func (c *volumeAttachmentCleaner) run(ctx context.Context) error {
 	nodes = nil
 
 	vas, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: vaListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.VolumeAttachments(c.cs))
 	if err != nil {
 		return fmt.Errorf("list volumeattachments: %w", err)
@@ -461,7 +453,7 @@ func (c *volumeAttachmentCleaner) livePodCount(ctx context.Context,
 	}
 	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		FieldSelector: "spec.nodeName=" + node,
-		Limit:         vaListPageSize,
+		Limit:         kube.DefaultListPageSize,
 	}, kube.Pods(c.cs, metav1.NamespaceAll))
 	if err != nil {
 		err = fmt.Errorf("list pods on %s: %w", node, err)

@@ -44,6 +44,27 @@ func NestedFloat64(obj map[string]any, fields ...string) (float64, bool) {
 	return v, found && err == nil
 }
 
+// NestedNumber reads a numeric field accepting int64, float64 and
+// int — unstructured decoding yields int64, but hand-built fixtures
+// (and encoding/json) produce float64/int. NestedInt64 would read
+// those as absent. Returns the value as int64 (float64 truncated)
+// + ok.
+func NestedNumber(obj map[string]any, fields ...string) (int64, bool) {
+	v, found, err := unstructured.NestedFieldNoCopy(obj, fields...)
+	if !found || err != nil {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case float64:
+		return int64(n), true
+	}
+	return 0, false
+}
+
 // NestedSlice reads a []any field at path fields — (nil, false) on
 // absence, wrong type, or a non-list value.
 func NestedSlice(obj map[string]any, fields ...string) ([]any, bool) {
@@ -98,7 +119,12 @@ func Conditions(obj map[string]any, fields ...string) []Condition {
 				cond.LastTransitionTime = t
 			}
 		}
-		cond.ObservedGeneration, _ = NestedInt64(m, "observedGeneration")
+		// observedGeneration decodes through NestedNumber, not
+		// NestedInt64: apiserver-decoded objects carry int64, but
+		// hand-built test fixtures (and anything round-tripped
+		// through encoding/json) carry float64 — those must not
+		// read as "never reconciled".
+		cond.ObservedGeneration, _ = NestedNumber(m, "observedGeneration")
 		out = append(out, cond)
 	}
 	return out

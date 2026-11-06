@@ -108,7 +108,7 @@ const (
 	// endpointGuardAnno records the comma-separated IPs the guard pulled
 	// out of default/kubernetes — the wedge evidence survives pod
 	// restarts and is human-readable in `kubectl describe ep kubernetes`.
-	endpointGuardAnno = "node.ops/quarantined-endpoints"
+	endpointGuardAnno = kube.AnnoQuarantinedEndpoints
 
 	endpointGuardInterval           = 30 * time.Second
 	endpointGuardQuarantineInterval = 10 * time.Second

@@ -28,7 +28,6 @@ import (
 	"fmt"
 	"maps"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -48,9 +47,9 @@ import (
 const (
 	// catchupAnno is the opt-in annotation — a backlog replay is only
 	// safe for jobs whose side effects are idempotent.
-	catchupAnno = "node-ops.passiontech.dev/catchup"
+	catchupAnno = kube.AnnoCatchup
 	// catchupLabel marks Jobs this module created (dedupe).
-	catchupLabel = "node-ops.passiontech.dev/missed-catchup"
+	catchupLabel = kube.LabelMissedCatchup
 	// catchupDedupeAge is how long a previously-created catch-up Job
 	// blocks a new one.
 	catchupDedupeAge = 24 * time.Hour
@@ -78,12 +77,7 @@ const (
 	// deadlinePatchedAnno records when/that this module repaired the
 	// CronJob — operator-visible provenance on an object GitOps did
 	// not write the deadline into.
-	deadlinePatchedAnno = "node.ops/starting-deadline-patched"
-
-	// catchupListPageSize bounds each List page — the CronJob census
-	// is cluster-wide and the per-namespace Job dedupe list is
-	// unbounded on busy CI namespaces.
-	catchupListPageSize = 500
+	deadlinePatchedAnno = kube.AnnoStartingDeadlinePatched
 )
 
 type cronJobCatchup struct {
@@ -100,7 +94,6 @@ type cronJobCatchup struct {
 	// CronJobs that vanished. An apiserver-restart-clean map only
 	// ever re-arms early, and the Job label dedupe still guards the
 	// 24h window across restarts.
-	mu          sync.Mutex
 	lastCatchup map[string]string
 	// missedEmitted is the CronJobTooManyMissedStarts ledger
 	// ("ns/name") of series currently held at =1 — a CronJob that
@@ -122,7 +115,7 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 	now := c.now.Now()
 
 	cronjobs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: catchupListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.CronJobs(c.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list cronjobs: %w", err) // periodic wrapper IncErrors c.queue
@@ -185,13 +178,11 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 		cj := &cronjobs[i]
 		present[cj.Namespace+"/"+cj.Name] = struct{}{}
 	}
-	c.mu.Lock()
 	for key := range c.lastCatchup {
 		if _, ok := present[key]; !ok {
 			delete(c.lastCatchup, key)
 		}
 	}
-	c.mu.Unlock()
 	// Prune TooManyMissedStarts series whose tuple was not re-seen —
 	// a patched (deadline now set), suspended or deleted CronJob
 	// must not pin the gauge at 1 forever.
@@ -326,7 +317,7 @@ func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, 
 // replaying on top of it double-fires the workload).
 func (c *cronJobCatchup) deduped(ctx context.Context, log logr.Logger, cj *batchv1.CronJob) bool {
 	jobs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: catchupListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Jobs(c.cs, cj.Namespace))
 	if err != nil {
 		// List failure = empty dedupe list, still create — a missed
@@ -358,8 +349,6 @@ func (c *cronJobCatchup) deduped(ctx context.Context, log logr.Logger, cj *batch
 
 // capped enforces the in-memory 1-catchup-per-cronjob-per-day limit.
 func (c *cronJobCatchup) capped(key string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.lastCatchup == nil {
 		c.lastCatchup = map[string]string{}
 	}
@@ -415,9 +404,7 @@ func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1
 			"cronjob", cj.Namespace+"/"+cj.Name, "job", job.Name)
 		return false
 	}
-	c.mu.Lock()
 	c.lastCatchup[key] = now.UTC().Format("2006-01-02")
-	c.mu.Unlock()
 	log.Info("CATCHUP job", "job", job.Name,
 		"cronjob", cj.Namespace+"/"+cj.Name,
 		"lastSchedule", cj.Status.LastScheduleTime)

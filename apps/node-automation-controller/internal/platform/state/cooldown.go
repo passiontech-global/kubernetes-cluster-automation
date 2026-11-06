@@ -12,10 +12,10 @@
 //
 // Like GaugeLedger the zero value is ready to use (lazy arm on first
 // write) and neither type locks — sweeps are single-goroutine or the
-// caller already serializes under its own mutex (clusterhealthprobes'
-// deps.mu). The maps are deliberately unbounded: keys live only as
-// long as the condition they track, and Prune/Forget is the caller's
-// hygiene hook for resolved ones.
+// caller already serializes under its own per-module mutex. The maps
+// are deliberately unbounded: keys live only as long as the
+// condition they track, and Prune/Forget is the caller's hygiene
+// hook for resolved ones.
 package state
 
 import "time"
@@ -48,6 +48,36 @@ func (c *CooldownSet) Stamp(key string, now time.Time) {
 // failure on the same key is not suppressed by the old stamp.
 func (c *CooldownSet) Forget(key string) {
 	delete(c.last, key)
+}
+
+// Prune deletes every tracked key for which keep returns false and
+// returns how many were dropped — the same ledger-hygiene contract
+// as FirstSeenLedger.Prune: call only after a complete sweep (a
+// partial keep set would wipe live cooldowns). keep receives the
+// key AND its last-action stamp so age-based retention ("drop
+// stamps older than the longest cooldown") needs no second lookup.
+func (c *CooldownSet) Prune(keep func(key string, last time.Time) bool) int {
+	pruned := 0
+	for k, last := range c.last {
+		if !keep(k, last) {
+			delete(c.last, k)
+			pruned++
+		}
+	}
+	return pruned
+}
+
+// Entries returns a COPY of the key→last-stamp map — callers that
+// must inspect ages without stamping (prune-by-age, "when did this
+// last fire" diagnostics) read it instead of reaching into internals.
+// Mutating the returned map does not affect the ledger; write
+// through Stamp/Forget.
+func (c *CooldownSet) Entries() map[string]time.Time {
+	out := make(map[string]time.Time, len(c.last))
+	for k, last := range c.last {
+		out[k] = last
+	}
+	return out
 }
 
 // FirstSeenLedger tracks when each key was first observed — the

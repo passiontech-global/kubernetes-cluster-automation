@@ -32,7 +32,7 @@ const (
 	// per-Kustomization (in-RAM + persisted annotation).
 	immutableJobMinAge   = 15 * time.Minute
 	immutableJobCooldown = 30 * time.Minute
-	immutableJobHealAnno = "node.ops/last-immutable-job-heal"
+	immutableJobHealAnno = kube.AnnoLastImmutableJobHeal
 )
 
 // immutableJobRe extracts the Job name out of the kustomize apply
@@ -79,8 +79,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context) error {
 		key := k.GetNamespace() + "/" + k.GetName()
 		// Cooldown: wider of the in-RAM ledger and the persisted stamp.
 		cooled := u.immutableJobHealed.CooledDown(key, immutableJobCooldown, now)
-		if t, err := time.Parse(time.RFC3339,
-			k.GetAnnotations()[immutableJobHealAnno]); err == nil &&
+		if t, ok := kube.AnnoTime(k, immutableJobHealAnno); ok &&
 			now.Sub(t) < immutableJobCooldown {
 			// Fold the persisted stamp into the ledger.
 			u.immutableJobHealed.Stamp(key, t)

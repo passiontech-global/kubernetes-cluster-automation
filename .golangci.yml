@@ -78,6 +78,229 @@ linters:
           deny:
             - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps"
               desc: "libs/hostkit is a shared stdlib-only leaf module; it must not import any app module"
+        # node-automation-controller layering (see
+        # apps/node-automation-controller/AGENTS.md). Same
+        # absolute-path `files` empirics as above; scoping again comes
+        # from the deny `pkg` prefixes carrying the app module path.
+        # The invariants:
+        #   - internal/platform/** is the leaf layer (envx, kube,
+        #     state, heal): it must never import anything above it —
+        #     not metrics/shared/promq, not the registry, not a
+        #     domain module.
+        #   - internal/metrics and internal/promq are leaf packages
+        #     too: the god-metrics package and the Prometheus client
+        #     must never reach upward either.
+        #   - internal/shared is the module-contract layer (Deps,
+        #     Module, Periodic, SetupWithConfig, CountReconcile): it
+        #     may use metrics/platform but never a domain module or
+        #     the registry.
+        #   - the six domain trees (apiserver, health, integration,
+        #     janitor, node, system) are self-contained modules — no
+        #     cross-domain imports, and never the registry that wires
+        #     them.
+        #   - internal/testutil stays generic: fakes must not pull a
+        #     domain module in.
+        # Deliberately allowed: intra-domain imports (health/datastore
+        # → health/probefw, system/corednspatcher →
+        # system/pinnedworkload), testutil use in _test.go (excluded
+        # from lint anyway), and cmd/manager importing anything.
+        nac-platform-is-leaf:
+          files:
+            - "**/internal/platform/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+              desc: "internal/platform is the leaf layer; metrics must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+              desc: "internal/platform is the leaf layer; the module contract must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
+              desc: "internal/platform is the leaf layer; promq must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
+              desc: "internal/platform is the leaf layer; the registry must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+              desc: "internal/platform is the leaf layer; test fakes must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
+              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
+              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
+              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
+              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
+              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
+              desc: "internal/platform is the leaf layer; domain modules must not be imported from it (push shared logic down into platform)"
+        nac-metrics-promq-leaf:
+          files:
+            - "**/node-automation-controller/internal/metrics/**"
+            - "**/node-automation-controller/internal/promq/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform"
+              desc: "metrics/promq are leaf packages; platform must not be imported from them"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+              desc: "metrics/promq are leaf packages; the module contract must not be imported from them"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
+              desc: "metrics/promq are leaf packages; the registry must not be imported from them"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
+              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
+              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
+              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
+              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
+              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
+              desc: "metrics/promq are leaf packages; domain modules must not be imported from them"
+        nac-shared-no-domain:
+          files:
+            - "**/node-automation-controller/internal/shared/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
+              desc: "internal/shared is the module contract layer; the registry must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+              desc: "internal/shared is the module contract layer; test fakes must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
+              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
+              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
+              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
+              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
+              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
+              desc: "internal/shared is the module contract layer; domain modules must not be imported from it"
+        nac-domain-isolation:
+          files:
+            - "**/node-automation-controller/internal/apiserver/**"
+            - "**/node-automation-controller/internal/health/**"
+            - "**/node-automation-controller/internal/integration/**"
+            - "**/node-automation-controller/internal/janitor/**"
+            - "**/node-automation-controller/internal/node/**"
+            - "**/node-automation-controller/internal/system/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
+              desc: "domain modules are wired by the registry; they must never import it back"
+        # testutil in domain non-test files: denied everywhere EXCEPT
+        # health/probetest — that package IS shared test scaffolding
+        # (non-_test so sibling test files can import it).
+        nac-domain-no-testutil:
+          files:
+            - "**/node-automation-controller/internal/apiserver/**"
+            - "**/node-automation-controller/internal/health/**"
+            - "!**/node-automation-controller/internal/health/probetest/**"
+            - "**/node-automation-controller/internal/integration/**"
+            - "**/node-automation-controller/internal/janitor/**"
+            - "**/node-automation-controller/internal/node/**"
+            - "**/node-automation-controller/internal/system/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+              desc: "test fakes belong in _test.go imports, not module code"
+        nac-domain-no-cross:
+          files:
+            - "**/node-automation-controller/internal/apiserver/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+        nac-domain-no-cross-health:
+          files:
+            - "**/node-automation-controller/internal/health/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+        nac-domain-no-cross-integration:
+          files:
+            - "**/node-automation-controller/internal/integration/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+        nac-domain-no-cross-janitor:
+          files:
+            - "**/node-automation-controller/internal/janitor/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+        nac-domain-no-cross-node:
+          files:
+            - "**/node-automation-controller/internal/node/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+        nac-domain-no-cross-system:
+          files:
+            - "**/node-automation-controller/internal/system/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
+              desc: "domain modules are self-contained; shared logic belongs in platform/shared"
+        nac-testutil-no-domain:
+          files:
+            - "**/node-automation-controller/internal/testutil/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
+              desc: "internal/testutil stays generic; it must not import the registry"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver"
+              desc: "internal/testutil stays generic; it must not import a domain module"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health"
+              desc: "internal/testutil stays generic; it must not import a domain module"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/integration"
+              desc: "internal/testutil stays generic; it must not import a domain module"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/janitor"
+              desc: "internal/testutil stays generic; it must not import a domain module"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node"
+              desc: "internal/testutil stays generic; it must not import a domain module"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system"
+              desc: "internal/testutil stays generic; it must not import a domain module"
 
     staticcheck:
       # -QF*: quick-fix style suggestions (De Morgan's law, tagged

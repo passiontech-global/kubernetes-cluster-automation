@@ -160,6 +160,54 @@ func TestPeriodicErrorIncrementsErrorMetric(t *testing.T) {
 	}
 }
 
+// A panicking Fn must not escape Start: controller-runtime does not
+// recover Runnable panics, so an unrecovered panic would crash the
+// whole 32-module binary. runOnce converts it into a run error —
+// IncError counts it exactly like a returned error and the ticker
+// keeps going (the second invocation is the happens-after witness,
+// same as the plain-error test above).
+func TestPeriodicPanicIsCountedAndLoopContinues(t *testing.T) {
+	var calls atomic.Int32
+	second := make(chan struct{})
+	p := &Periodic{
+		Name:     "test-periodic-panic",
+		Interval: 10 * time.Millisecond,
+		Fn: func(context.Context) error {
+			if calls.Add(1) == 1 {
+				panic("boom")
+			}
+			select {
+			case <-second:
+			default:
+				close(second)
+			}
+			return nil
+		},
+		Log: logr.Discard(),
+	}
+
+	before := reconcileErrorCount(t, "test-periodic-panic")
+
+	pctx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- p.Start(pctx) }()
+
+	select {
+	case <-second:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("loop did not survive a panicking fn")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("periodic start: %v", err)
+	}
+
+	if got := reconcileErrorCount(t, "test-periodic-panic"); got != before+1 {
+		t.Fatalf("error counter = %v, want %v", got, before+1)
+	}
+}
+
 // A non-positive Interval used to panic in rand.N / time.NewTicker —
 // Start must now return it as a plain error instead (the manager
 // turns a runnable error into a clean exit, not a crash loop).

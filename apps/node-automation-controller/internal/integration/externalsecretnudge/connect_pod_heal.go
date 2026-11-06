@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -58,26 +59,28 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	if !storeDown && !stormLong {
 		return
 	}
-	if now.Sub(n.connectHealAt) < esConnectHealCooldown {
+	// The cooldown check stays a manual CooledDown (not inside
+	// heal.Allowed) so the DEFER log keeps its trigger context —
+	// storeDown/stormLong and the last-heal age the shared preamble
+	// cannot know.
+	if n.connectHeals.CooledDown(esConnectPodPrefix, esConnectHealCooldown, now) {
 		log.Info("DEFER: connect pod heal inside cooldown",
 			"storeDown", storeDown, "stormLong", stormLong,
-			"lastHeal", now.Sub(n.connectHealAt).Truncate(time.Minute))
+			"lastHeal", now.Sub(n.connectHeals.Entries()[esConnectPodPrefix]).Truncate(time.Minute))
 		return
 	}
 
 	// Same fail-closed maintenance gate as every pod kill in this
-	// module — cordon/drain/kured or an in-flight upgrade defers the
-	// bounce, and "cannot verify" skips it.
-	held, why, err := kube.MaintenanceActive(ctx, n.cs, n.dyn)
-	if err != nil {
+	// module, via the shared preamble — cordon/drain/kured or an
+	// in-flight upgrade defers the bounce, and "cannot verify"
+	// (unverifiable) skips it AND IncErrors the queue.
+	proceed, unverifiable := heal.Allowed(ctx, log, n.cs, n.dyn,
+		&n.connectHeals, esConnectPodPrefix, esConnectHealCooldown, now)
+	switch {
+	case unverifiable:
 		metrics.IncError(n.queue)
-		log.Info("WARN: maintenance check unverifiable — "+
-			"DEFER: connect pod heal skipped (fail closed)", "error", err)
 		return
-	}
-	if held {
-		log.Info("DEFER: maintenance active — connect pod heal skipped",
-			"why", why)
+	case !proceed:
 		return
 	}
 
@@ -89,17 +92,16 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	log.Info("ACTION: deleting oldest running onepassword-connect pod — "+
 		"sustained store outage/storm", "pod", pod.Namespace+"/"+pod.Name,
 		"storeDown", storeDown, "stormLong", stormLong)
-	uid := pod.UID
-	if err := n.cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-		kube.UIDDeleteOptions(uid, "")); err != nil {
+	// DeletePod UID-preconditions the delete and stamps the cooldown
+	// on a DELIVERED delete only — a failed delete leaves the pod
+	// stuck and the next sweep retries.
+	if _, err := heal.DeletePod(ctx, n.cs, &n.connectHeals,
+		esConnectPodPrefix, pod, now); err != nil {
 		metrics.IncError(n.queue)
 		log.Error(err, "connect pod delete failed",
 			"pod", pod.Namespace+"/"+pod.Name)
 		return
 	}
-	// Cooldown stamps on a DELIVERED delete only — a failed delete
-	// leaves the pod stuck and the next sweep retries.
-	n.connectHealAt = now
 }
 
 // oldestConnectPod returns the oldest Running pod named
@@ -112,7 +114,7 @@ func (n *externalSecretNudge) oldestConnectPod(ctx context.Context) *corev1.Pod 
 	var oldest *corev1.Pod
 	for _, ns := range esConnectNamespaces {
 		pods, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: esListPageSize},
+			metav1.ListOptions{Limit: kube.DefaultListPageSize},
 			kube.Pods(n.cs, ns))
 		if err != nil {
 			if !apierrors.IsNotFound(err) {

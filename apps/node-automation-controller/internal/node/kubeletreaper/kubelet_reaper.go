@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	kubeletReaperTaint    = "node.ops/kubelet-unresponsive"
+	kubeletReaperTaint    = kube.TaintKubeletUnresponsive
 	kubeletReaperProbes   = 4                // all probes fail -> really down
 	kubeletReaperProbeGap = 10 * time.Second // between probes
 	// per-probe apiserver timeout (8s) lives in kube.KubeletHealthz

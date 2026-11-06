@@ -35,7 +35,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -43,11 +42,7 @@ import (
 const ciliumNotReadyTaint = "node.cilium.io/agent-not-ready"
 
 type ciliumTaintReaper struct {
-	cs kubernetes.Interface
-	// queue is the module's ops name — stamped from Deps.Name (the
-	// registry row) so the controller name and every IncError label
-	// come from one place.
-	queue   string
+	cs      kubernetes.Interface
 	enabled bool
 }
 
@@ -97,6 +92,7 @@ func Setup(d shared.Deps) error {
 	if d.Disabled {
 		return nil
 	}
+	r := &ciliumTaintReaper{cs: cs, enabled: true}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(d.Name).
 		// Watches with a single fixed workqueue key, not For(): the
@@ -119,7 +115,7 @@ func Setup(d shared.Deps) error {
 		// unconditionally true here — the field and its Reconcile
 		// check now only matter for literally-constructed reapers
 		// in tests.
-		Complete(&ciliumTaintReaper{cs: cs, queue: d.Name, enabled: true})
+		Complete(shared.CountReconcile(d.Name, r.Reconcile))
 }
 
 func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -134,7 +130,6 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 	// trigger, the verdict always covers the whole cluster.
 	nodes, err := kube.ListNodes(ctx, r.cs)
 	if err != nil {
-		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
 
@@ -149,7 +144,6 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 			FieldSelector: "spec.nodeName=" + node.Name,
 		})
 		if err != nil {
-			metrics.IncError(r.queue)
 			return ctrl.Result{}, fmt.Errorf("list cilium pods on node %s: %w", node.Name, err)
 		}
 		if len(pods.Items) == 0 {
@@ -173,7 +167,6 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 			log.Info("REAP: agent healthy but stale taint -> removing",
 				"node", node.Name, "pod", healthy.Name)
 			if err := kube.UntaintNode(ctx, r.cs, node.Name, ciliumNotReadyTaint); err != nil {
-				metrics.IncError(r.queue)
 				return ctrl.Result{}, fmt.Errorf("remove taint %s on node %s: %w",
 					ciliumNotReadyTaint, node.Name, err)
 			}

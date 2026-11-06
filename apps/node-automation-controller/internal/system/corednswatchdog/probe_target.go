@@ -38,7 +38,8 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) (string, map[string]boo
 	// Page the cluster-wide Service list — an unbounded List forces
 	// etcd to serialize every Service into one response; 500-per-page
 	// keeps each request cheap at fleet scale.
-	svcItems, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+	svcItems, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Services(w.cs, metav1.NamespaceAll))
 	if err != nil {
 		log.Info("dns: cannot list services — layer 2 inconclusive", "error", err)
@@ -99,7 +100,8 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 	log := logf.FromContext(ctx)
 	var best *discoveryv1.EndpointSlice
 	var bestRV int64
-	err := kube.ListEach(ctx, metav1.ListOptions{Limit: 500},
+	err := kube.ListEach(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.EndpointSlices(w.cs, metav1.NamespaceAll),
 		func(items []discoveryv1.EndpointSlice) error {
 			for i := range items {

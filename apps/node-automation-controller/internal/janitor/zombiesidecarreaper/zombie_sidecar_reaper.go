@@ -49,7 +49,6 @@ package zombiesidecarreaper
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -64,10 +63,6 @@ import (
 
 const (
 	zombieSidecarReaperInterval = 5 * time.Minute
-	// zombieSidecarListPageSize bounds each Running-pod List page —
-	// continue-token pagination keeps a busy cluster's pod fleet
-	// from arriving as one giant response body.
-	zombieSidecarListPageSize = 500
 )
 
 type zombieSidecarReaper struct {
@@ -93,7 +88,6 @@ type zombieSidecarReaper struct {
 	// for when the direct dial is blocked (pod-ingress netpol) or
 	// the pod has no IP. nil → (*zombieSidecarReaper).proxyShutdown.
 	proxyFn func(ctx context.Context, pod *corev1.Pod, sidecar string) error
-	mu      sync.Mutex
 	// poked records "ns/name/uid" of pods already sent /shutdown:
 	// one graceful cycle, then delete. UID is part of the key so a
 	// same-named replacement pod never inherits the ledger entry.
@@ -121,8 +115,6 @@ func Setup(d shared.Deps) error {
 
 func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	// Lazily arm the zero-value struct — unit tests construct the
 	// reaper literally without the Setup path.
 	if r.shutdownFn == nil {
@@ -140,7 +132,7 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	// are ignored there).
 	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		FieldSelector: "status.phase=Running",
-		Limit:         zombieSidecarListPageSize,
+		Limit:         kube.DefaultListPageSize,
 	}, kube.Pods(r.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list pods: %w", err)

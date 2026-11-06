@@ -24,6 +24,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -227,19 +228,13 @@ func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Conte
 	log logr.Logger, node string, now time.Time) {
 
 	ck := "selfheal/" + CheckNameCiliumNodeIPAM + "/reap/" + node
-	if p.Heals.CooledDown(ck, ciliumIPAMNodeCool, now) {
-		return
-	}
-	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-	if err != nil {
+	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
+		&p.Heals, ck, ciliumIPAMNodeCool, now)
+	if unverifiable {
 		metrics.IncError(p.Name)
-		log.Info("WARN: maintenance check unverifiable — ipam reap deferred (fail closed)",
-			"node", node, "error", err)
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — ipam reap deferred",
-			"node", node, "why", why)
+	if !proceed {
 		return
 	}
 	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
@@ -263,11 +258,10 @@ func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Conte
 				pod.Status.Phase != corev1.PodFailed) {
 			continue
 		}
-		uid := pod.UID
-		if err := p.CS.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
+		// One stamp per node per sweep — the ledger is stamped by
+		// hand below only when at least one reap landed, so the
+		// delete runs with a nil heals ledger.
+		if _, err := heal.DeletePod(ctx, p.CS, nil, "", pod, now); err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "ipam terminal-pod reap failed",
 				"pod", pod.Namespace+"/"+pod.Name)

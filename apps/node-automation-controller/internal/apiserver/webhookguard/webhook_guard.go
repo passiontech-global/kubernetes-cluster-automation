@@ -149,7 +149,7 @@ func Setup(d shared.Deps) error {
 // continue token instead. The snapshot's cluster-scoped lists
 // (Namespaces, Mutating/ValidatingWebhookConfigurations) stay
 // unpaged: they are tiny by definition.
-const listPageSize = 500
+const listPageSize = kube.DefaultListPageSize
 
 // sweepSnapshot carries the cluster state one run shares across its
 // sub-sweeps: the namespace census and both webhook-config lists are
@@ -215,8 +215,8 @@ func (g *webhookGuard) takeSnapshot(ctx context.Context) *sweepSnapshot {
 // pair this operator asserts itself plus the kubelet/node-controller
 // lifecycle taints.
 var webhookUnhealthyNodeTaints = []string{
-	"node.ops/network-partitioned",
-	"node.ops/kubelet-unresponsive",
+	kube.TaintNetworkPartitioned,
+	kube.TaintKubeletUnresponsive,
 	"node.kubernetes.io/unreachable",
 	"node.kubernetes.io/not-ready",
 	"node.kubernetes.io/out-of-service",

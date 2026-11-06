@@ -191,7 +191,7 @@ func (a *veleroBackupAuditor) pvbAgentPod(ctx context.Context,
 	}
 	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		FieldSelector: "spec.nodeName=" + node,
-		Limit:         veleroListPageSize,
+		Limit:         kube.DefaultListPageSize,
 	}, kube.Pods(a.cs, ns))
 	if err != nil {
 		return nil, err

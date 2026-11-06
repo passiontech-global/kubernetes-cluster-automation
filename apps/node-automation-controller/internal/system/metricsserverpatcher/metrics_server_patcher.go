@@ -44,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/pinnedworkload"
 )
@@ -261,7 +262,7 @@ var metricsServerWantTolerations = []corev1.Toleration{
 	{Key: "node.kubernetes.io/memory-pressure", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
 	{Key: "node.kubernetes.io/pid-pressure", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
 	{Key: "node.kubernetes.io/network-unavailable", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
-	{Key: "weave.works/kured-node-reboot", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectPreferNoSchedule},
+	{Key: kube.TaintKuredNodeReboot, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectPreferNoSchedule},
 	{Key: "CriticalAddonsOnly", Operator: corev1.TolerationOpExists},
 }
 

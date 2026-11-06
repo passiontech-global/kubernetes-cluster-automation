@@ -84,12 +84,34 @@ func (p *Periodic) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
-			if err := p.Fn(runCtx); err != nil {
+			if err := p.runOnce(runCtx); err != nil {
 				metrics.IncError(p.Name)
 				log.Error(err, "periodic run failed")
 			}
 		}
 	}
+}
+
+// runOnce invokes Fn once, converting a panic into a plain run error
+// so the tick loop treats it exactly like a returned error. The
+// choice is deliberate — panic → run error + continue, never
+// propagate: controller-runtime does not recover Runnable panics, so
+// an unrecovered panic in one module's Fn would take down the whole
+// 32-module operator process — a single module's bug crash-looping
+// the entire fleet. Folding the panic into the error path keeps the
+// ticker alive while the failure still surfaces where ops looks for
+// it: IncError bumps shell_operator_hook_run_errors_total{queue} and
+// the "periodic run failed" line logs the recovered value under the
+// module's named logger. No stack is captured — the named logger +
+// queue counter already attribute the failure to the module, which
+// is all the run-level contract needs.
+func (p *Periodic) runOnce(ctx context.Context) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("panic in periodic run: %v", recovered)
+		}
+	}()
+	return p.Fn(ctx)
 }
 
 // AddPeriodic registers fn to run every interval (equivalent to the

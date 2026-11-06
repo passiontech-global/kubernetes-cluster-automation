@@ -26,6 +26,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -186,21 +187,13 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	}
 
 	ck := "selfheal/" + CheckNameKedaScaledObjectGuard + "/" + ns + "/" + target
-	if p.Heals.CooledDown(ck, kedaRescueCooldown, now) {
-		log.Info("skip heal: inside cooldown", "check", CheckNameKedaScaledObjectGuard,
-			"target", kind+" "+ns+"/"+target)
-		return
-	}
-	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-	if err != nil {
+	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
+		&p.Heals, ck, kedaRescueCooldown, now)
+	if unverifiable {
 		metrics.IncError(p.Name)
-		log.Info("WARN: maintenance check unverifiable — rescue deferred (fail closed)",
-			"target", kind+" "+ns+"/"+target, "error", err)
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — keda rescue deferred",
-			"target", kind+" "+ns+"/"+target, "why", why)
+	if !proceed {
 		return
 	}
 	payload, err := json.Marshal(map[string]any{

@@ -71,7 +71,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"sync"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -98,10 +97,6 @@ const (
 	helmControllerNS   = "flux-system"
 	helmControllerSel  = "app.kubernetes.io/name=helm-controller"
 	fluxReconcileAnno  = "reconcile.fluxcd.io/requestedAt"
-	// helmListPageSize caps each List response — cluster-wide HR /
-	// Kustomization reads page through continue tokens instead of one
-	// unbounded fetch.
-	helmListPageSize = 500
 )
 
 // helmReleaseGVRs tried in order — v2 on current flux, v2beta2 on
@@ -116,7 +111,6 @@ type helmReleaseUnlocker struct {
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
 	queue string
-	mu    sync.Mutex
 	// now is the clock seam — tests pin it so the first-seen
 	// windows and the 24h cooldowns are deterministic. nil →
 	// time.Now.
@@ -128,12 +122,9 @@ type helmReleaseUnlocker struct {
 	// unlocked: ns/name → last successful unlock — enforces the
 	// 1-unlock/24h cap and detects "stuck again after unlock".
 	// Pruned each sweep once past the cooldown or when the HR
-	// vanished. Kept as a raw map (not state.CooldownSet): the
-	// cooldown merge reads the raw stamp to fold in the persisted
-	// node.ops/last-helm-unlock annotation and to compute the
-	// "unlockedAgo" alert field, and the prune needs the stamp for
-	// the expiry check — CooldownSet exposes neither.
-	unlocked map[string]time.Time
+	// vanished (Entries() feeds the cooldown merge's raw-stamp read
+	// and Prune's `last` arg the expiry check).
+	unlocked state.CooldownSet
 	// alerted: ns/name → the "still stuck after unlock" page already
 	// fired for the CURRENT cooldown window — without it a stuck HR
 	// re-bumps the error metric every 10-minute sweep for up to
@@ -186,7 +177,6 @@ func Setup(d shared.Deps) error {
 		dyn:           d.Dyn,
 		queue:         d.Name,
 		now:           shared.SystemClock,
-		unlocked:      map[string]time.Time{},
 		stallEnabled:  envx.Gate("HELM_STALL_UNWEDGE_ENABLED", false),
 		stallAttempts: map[string]*stallAttempt{},
 	}
@@ -195,8 +185,6 @@ func Setup(d shared.Deps) error {
 
 func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	u.mu.Lock()
-	defer u.mu.Unlock()
 	// Lazy-init for literal-constructed structs (tests) — Setup
 	// always initializes, but a fixture must not panic on a nil map.
 	// The FirstSeenLedger, SeenSet and CooldownSet fields are
@@ -242,15 +230,17 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 		_, ok := stalled[key]
 		return ok
 	})
-	// Same prune for the unlock ledger: entries past the 24h cooldown
-	// are dead weight and entries for HRs that vanished would pile up
-	// forever — the map is otherwise append-only per unlocked HR.
-	for key, last := range u.unlocked {
-		if !present[key] || now.Sub(last) >= helmUnlockCooldown {
-			delete(u.unlocked, key)
+	// Same prune for the unlock ledger — not because CooldownSet
+	// needs it (a stale stamp reads uncooled on its own) but to keep
+	// the alerted dedup paired: a vanished or aged-out entry must
+	// release its alert key so a NEW cooldown window alerts afresh.
+	u.unlocked.Prune(func(key string, last time.Time) bool {
+		keep := present[key] && now.Sub(last) < helmUnlockCooldown
+		if !keep {
 			u.alerted.Forget(key)
 		}
-	}
+		return keep
+	})
 	// The unwedge ledger + its alert dedup need no prune pass:
 	// CooldownSet stamps past the window read uncooled and entries
 	// for vanished HRs are dead weight (no enumeration).
@@ -320,7 +310,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 
 // listHelmReleases returns the HR list and the GVR that answered — v2
 // first, v2beta2 when the v2 CRDs are absent. Pages at
-// helmListPageSize: HRs are unbounded cluster-wide and each item
+// kube.DefaultListPageSize: HRs are unbounded cluster-wide and each item
 // embeds values/crds hooks — a single shot List of a large fleet is
 // a heap spike.
 func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructured.UnstructuredList, schema.GroupVersionResource, error) {
@@ -341,7 +331,7 @@ func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructur
 // it so no single response hauls the whole resource across the wire.
 func (u *helmReleaseUnlocker) listAllPages(ctx context.Context,
 	ri dynamic.ResourceInterface) (*unstructured.UnstructuredList, error) {
-	items, err := kube.ListAll(ctx, metav1.ListOptions{Limit: helmListPageSize},
+	items, err := kube.ListAll(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.DynamicPage(ri))
 	if err != nil {
 		return nil, err
@@ -381,7 +371,7 @@ func (u *helmReleaseUnlocker) helmControllerDown(ctx context.Context) (bool, err
 func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string) {
 	log := logf.FromContext(ctx)
 	jobs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: helmListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Jobs(u.cs, ns))
 	if err != nil {
 		log.Error(err, "helm-hook job list failed — hook cleanup skipped", "ns", ns)

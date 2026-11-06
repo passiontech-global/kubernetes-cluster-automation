@@ -2,7 +2,7 @@
 // Deps.Disabled → register" contract every module's Setup
 // implements by hand today:
 //
-//	cfg := knobs{interval: GetenvDuration(...), limit: GetenvIntMin(...)}
+//	cfg := knobs{interval: envx.GetenvDuration(...), limit: envx.GetenvIntMin(...)}
 //	if d.Disabled {
 //		return nil // gate off — register nothing, but the parses above already warned
 //	}

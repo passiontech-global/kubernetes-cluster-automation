@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -23,8 +24,9 @@ import (
 
 // HealthListPageSize bounds the cluster-wide EndpointSlice list the
 // masterless check pages through — same pagination posture as the
-// webhook guard's census.
-const HealthListPageSize = 500
+// webhook guard's census. Kept as an exported alias of the shared
+// page bound so the domain checks' spelling stays stable.
+const HealthListPageSize = kube.DefaultListPageSize
 
 // Result is one check's verdict. Pass=false + Infra=nil is an
 // observed health failure (the metric's FAIL=1); Infra!=nil is a
