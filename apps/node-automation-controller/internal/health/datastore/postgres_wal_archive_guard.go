@@ -10,7 +10,6 @@ package datastore
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -295,19 +294,11 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
+	var rep probefw.SweepReport
 	for k, f := range findings {
-		p.emitted.Set(postgresWALUnhealthyGauge, 1,
-			k, f.ns, f.cluster, f.reason)
+		rep.Emit(postgresWALUnhealthyGauge, k,
+			[]string{f.ns, f.cluster, f.reason}, k)
 	}
-	p.emitted.Prune(postgresWALUnhealthyGauge.DeleteLabelValues)
-	if len(findings) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	keys := make([]string, 0, len(findings))
-	for k := range findings {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return probefw.Result{Why: "postgres wal/archive unhealthy: " +
-		strings.Join(keys, ", ")}
+	return rep.Result(&p.emitted, postgresWALUnhealthyGauge.DeleteLabelValues,
+		"postgres wal/archive unhealthy: ", ", ")
 }

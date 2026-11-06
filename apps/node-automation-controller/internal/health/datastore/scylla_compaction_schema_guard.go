@@ -119,7 +119,7 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 
 	// cluster -> namespace -> distinct schema versions across members.
 	clusterVersions := map[string]map[string]map[float64]bool{}
-	var backlogFindings []string
+	var backlogRep probefw.SweepReport
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		cluster := pod.Labels[scyllaClusterLabel]
@@ -137,9 +137,10 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 			continue
 		}
 		if backlog > scyllaCompactionBacklogMax {
-			p.emittedBacklog.Set(scyllaCompactionBacklogGauge, backlog,
-				pod.Namespace+"/"+pod.Name, pod.Namespace, pod.Name)
-			backlogFindings = append(backlogFindings, fmt.Sprintf(
+			backlogRep.Set(scyllaCompactionBacklogGauge, backlog,
+				pod.Namespace+"/"+pod.Name,
+				[]string{pod.Namespace, pod.Name})
+			backlogRep.Find(fmt.Sprintf(
 				"%s/%s=%.0f", pod.Namespace, pod.Name, backlog))
 		}
 		ck := pod.Namespace + "/" + cluster
@@ -151,7 +152,7 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 		set[pod.Name] = versions
 	}
 
-	var splitFindings []string
+	var splitRep probefw.SweepReport
 	for ck, members := range clusterVersions {
 		distinct := map[float64]bool{}
 		for _, versions := range members {
@@ -163,30 +164,27 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 			continue
 		}
 		ns, cluster, _ := strings.Cut(ck, "/")
-		p.emittedSplit.Set(scyllaSchemaSplitGauge, 1, ck, ns, cluster)
+		splitRep.Set(scyllaSchemaSplitGauge, 1, ck, []string{ns, cluster})
 		var vs []string
 		for v := range distinct {
 			vs = append(vs, strconv.FormatFloat(v, 'f', -1, 64))
 		}
 		sort.Strings(vs)
-		splitFindings = append(splitFindings,
-			fmt.Sprintf("%s versions=[%s]", ck, strings.Join(vs, ",")))
+		splitRep.Find(fmt.Sprintf("%s versions=[%s]", ck, strings.Join(vs, ",")))
 	}
 
-	p.emittedBacklog.Prune(scyllaCompactionBacklogGauge.DeleteLabelValues)
-	p.emittedSplit.Prune(scyllaSchemaSplitGauge.DeleteLabelValues)
-	if len(backlogFindings) == 0 && len(splitFindings) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	sort.Strings(backlogFindings)
-	sort.Strings(splitFindings)
+	backlogRep.Close(&p.emittedBacklog, scyllaCompactionBacklogGauge.DeleteLabelValues)
+	splitRep.Close(&p.emittedSplit, scyllaSchemaSplitGauge.DeleteLabelValues)
 	var parts []string
-	if len(backlogFindings) > 0 {
+	if findings := backlogRep.Sorted(); len(findings) > 0 {
 		parts = append(parts, fmt.Sprintf("compaction backlog >%d: %s",
-			scyllaCompactionBacklogMax, strings.Join(backlogFindings, ", ")))
+			scyllaCompactionBacklogMax, strings.Join(findings, ", ")))
 	}
-	if len(splitFindings) > 0 {
-		parts = append(parts, "schema splits: "+strings.Join(splitFindings, ", "))
+	if findings := splitRep.Sorted(); len(findings) > 0 {
+		parts = append(parts, "schema splits: "+strings.Join(findings, ", "))
+	}
+	if len(parts) == 0 {
+		return probefw.Result{Pass: true}
 	}
 	return probefw.Result{Why: strings.Join(parts, " | ")}
 }

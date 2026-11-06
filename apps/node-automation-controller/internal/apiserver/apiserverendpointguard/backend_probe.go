@@ -12,11 +12,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 
+	"github.com/go-logr/logr"
 	"k8s.io/client-go/rest"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
 // apiProbeResult is one backend probe outcome: the quorum (etcd) list
@@ -147,4 +153,178 @@ func fetchListRV(ctx context.Context, client *http.Client, ip, path string) (int
 		return 0, err
 	}
 	return strconv.ParseInt(body.Metadata.ResourceVersion, 10, 64)
+}
+
+// ---------------------------------------------------------------------------
+// Per-cycle verdicts — fold each backend's probe result into the
+// streaks above, then turn the streaks into this cycle's
+// quarantine/recover decisions (run() persists them).
+// ---------------------------------------------------------------------------
+
+// backendOutcome is one backend's verdict this cycle: wedged marks a
+// quarantine candidate, healthy lets it vouch as a peer for the
+// last-healthy guard in decideQuarantine.
+type backendOutcome struct {
+	wedged  bool
+	healthy bool
+}
+
+// evaluateBackends probes every backend (active + quarantined) and
+// folds the outcome into the per-backend streaks, prunes state +
+// metric series for IPs that left the controller set, then expires
+// quarantined IPs whose backend is never coming back. Returns the
+// per-IP verdicts and the expired IPs; quarantinedIPs shrinks in
+// place for the expiries.
+func (g *apiServerEndpointGuard) evaluateBackends(ctx context.Context,
+	allIPs, activeIPs []string, quarantinedIPs map[string]bool) (map[string]backendOutcome, []string) {
+	log := logf.FromContext(ctx)
+	results := make(map[string]backendOutcome, len(allIPs))
+	for _, ip := range allIPs {
+		st := g.backends[ip]
+		if st == nil {
+			st = &backendProbeState{}
+			g.backends[ip] = st
+		}
+		res := g.probeFn(ctx, ip)
+
+		var o backendOutcome
+		if res.err != nil {
+			// Timeout / non-2xx: wedge signal only after
+			// endpointGuardErrCycles consecutive failures — a single
+			// WAN/TLS blip must not pull a healthy backend. Streaks
+			// reset so a flap doesn't resume mid-count on recovery.
+			st.errStreak++
+			o.wedged = st.errStreak >= endpointGuardErrCycles
+			st.gapStreak, st.frozenStreak, st.okStreak = 0, 0, 0
+			st.haveLast = false
+			log.Error(res.err, "backend probe failed — wedge signal", "ip", ip)
+			metrics.ObserveAPIBackend(ip, -1, quarantinedIPs[ip])
+		} else {
+			st.errStreak = 0
+			gap := res.liveRV - res.cacheRV
+			if gap >= endpointGuardRVGap {
+				st.gapStreak++
+			} else {
+				st.gapStreak = 0
+			}
+			if st.haveLast && res.cacheRV == st.lastCacheRV && res.liveRV > st.lastLiveRV {
+				st.frozenStreak++
+			} else if res.cacheRV < res.liveRV {
+				// W8-CP1: the cache still trails the quorum RV — a
+				// quiet cycle (cache advanced a little, or nothing
+				// changed) must KEEP the frozen streak instead of
+				// re-arming it, or a slowly-lagging cache never
+				// reaches the wedge threshold.
+			} else {
+				st.frozenStreak = 0
+			}
+			st.lastLiveRV, st.lastCacheRV, st.haveLast = res.liveRV, res.cacheRV, true
+			o.wedged = st.gapStreak >= endpointGuardGapCycles ||
+				st.frozenStreak >= endpointGuardFrozenCyc
+			o.healthy = gap < endpointGuardRVGap && st.frozenStreak < endpointGuardFrozenCyc
+			if o.healthy {
+				st.okStreak++
+			} else {
+				st.okStreak = 0
+			}
+			metrics.ObserveAPIBackend(ip, float64(gap), quarantinedIPs[ip])
+		}
+		results[ip] = o
+	}
+
+	// Prune state + metric series for IPs that left the controller set.
+	for ip := range g.backends {
+		if !slices.Contains(allIPs, ip) {
+			delete(g.backends, ip)
+			metrics.ForgetAPIBackend(ip)
+		}
+	}
+
+	// ---- Quarantine expiry ------------------------------------------
+	// A permanently decommissioned backend never recovers AND the
+	// endpoints reconciler stops re-adding it: absent from the current
+	// address sets while probe-erring continuously for
+	// endpointGuardExpireCyc cycles means it is never coming back, so
+	// it drops out of the quarantine set (annotation rewrite below +
+	// memQuarantine) instead of pinning a dead IP — and the 10s
+	// re-apply cadence — forever. This is decided BEFORE the
+	// min-backends gate: the expiry only shrinks the annotation, a
+	// write that can never empty the endpoint set, so it stays legal
+	// where address edits are banned — and its bookkeeping can never
+	// deadlock behind the early return.
+	var toExpire []string
+	for _, ip := range slices.Sorted(maps.Keys(quarantinedIPs)) {
+		if slices.Contains(activeIPs, ip) {
+			continue // the reconciler re-added it — still a live backend
+		}
+		if st := g.backends[ip]; st != nil && st.errStreak >= endpointGuardExpireCyc {
+			toExpire = append(toExpire, ip)
+		}
+	}
+	for _, ip := range toExpire {
+		delete(quarantinedIPs, ip)
+		delete(g.backends, ip)
+		metrics.ForgetAPIBackend(ip)
+		log.Info("EXPIRE-QUARANTINE: backend absent from endpoints and unreachable — dropping quarantine",
+			"ip", ip, "errCycles", endpointGuardExpireCyc)
+	}
+	if len(toExpire) > 0 {
+		g.memQuarantine = maps.Clone(quarantinedIPs)
+		g.quarantineActive = len(quarantinedIPs) > 0
+	}
+	return results, toExpire
+}
+
+// decideQuarantine turns the per-backend verdicts into this cycle's
+// removal/re-add lists. It runs only after run()'s min-backends gate:
+// the SKIP/recovering logs below exist to explain edit decisions, so
+// on probe-only clusters they must stay silent.
+func (g *apiServerEndpointGuard) decideQuarantine(log logr.Logger,
+	results map[string]backendOutcome, activeIPs []string,
+	routableIPs, quarantinedIPs map[string]bool) (toRemove, toAdd []string, healthyActive int) {
+	// ---- Decide removals -------------------------------------------------
+	// A wedged active IP may be quarantined only while at least one
+	// OTHER ROUTABLE IP is healthy this cycle — processed in sorted
+	// order so a multi-wedge cycle can never remove the last healthy
+	// backend. "Routable" excludes notReadyAddresses / Ready=false
+	// slice endpoints: kube-proxy never routes to them, so a notReady
+	// backend that happens to probe fine must not vouch for pulling
+	// the last Ready endpoint — that would flap kubernetes.default to
+	// zero routable addresses (notReady suspects are still probed and
+	// quarantined above; only the healthy-peer accounting changes).
+	for ip := range routableIPs {
+		if results[ip].healthy {
+			healthyActive++
+		}
+	}
+	for _, ip := range activeIPs { // activeIPs is sorted
+		if !results[ip].wedged {
+			continue
+		}
+		if healthyActive < 1 {
+			log.Info("SKIP-QUARANTINE: no healthy backend would remain — fail closed",
+				"ip", ip)
+			continue
+		}
+		toRemove = append(toRemove, ip)
+	}
+	if len(toRemove) > 0 && g.client != nil {
+		// W8-CP1: quarantining the IP only protects NEW dials —
+		// pooled keep-alive connections to the wedged backend stay
+		// pinned until they break. Drop them so the very next probe
+		// (and anything sharing this transport) re-dials onto a
+		// healthy backend.
+		g.client.CloseIdleConnections()
+	}
+
+	// ---- Decide re-adds --------------------------------------------------
+	for _, ip := range slices.Sorted(maps.Keys(quarantinedIPs)) {
+		if g.backends[ip].okStreak >= endpointGuardRecoverCyc {
+			toAdd = append(toAdd, ip)
+		} else {
+			log.Info("quarantined backend still recovering",
+				"ip", ip, "okStreak", g.backends[ip].okStreak, "need", endpointGuardRecoverCyc)
+		}
+	}
+	return toRemove, toAdd, healthyActive
 }

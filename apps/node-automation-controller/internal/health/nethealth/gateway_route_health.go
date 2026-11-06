@@ -13,8 +13,6 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -236,7 +234,7 @@ func (p *gatewayRouteHealthCheck) serviceBackendUnresolved(ctx context.Context,
 			log.Info("WARN: gateway route backend service get failed — verdict inconclusive",
 				"service", key, "error", err)
 		default:
-			svc, ok = got, true
+			svc = got
 			c.services[key] = svc
 		}
 	}
@@ -406,25 +404,17 @@ func (p *gatewayRouteHealthCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	p.since.Prune(func(k string) bool { _, ok := live[k]; return ok })
-	current := map[string][]string{}
-	var findings []string
+	var rep probefw.SweepReport
 	for k, lv := range live {
 		if !probefw.Persisted(&p.since, k, now,
 			gatewayRouteUnhealthyMinAge, log) {
 			continue
 		}
-		current[k] = lv
-		gatewayRouteUnhealthyGauge.WithLabelValues(lv...).Set(1)
-		findings = append(findings, k)
+		rep.Emit(gatewayRouteUnhealthyGauge, k, lv, k)
 	}
-	p.emitted.Reconcile(current, gatewayRouteUnhealthyGauge.DeleteLabelValues)
-	if len(findings) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	sort.Strings(findings)
-	return probefw.Result{Why: fmt.Sprintf(
-		"gateway routes unhealthy >=%s: %s",
-		gatewayRouteUnhealthyMinAge, strings.Join(findings, ", "))}
+	return rep.Result(&p.emitted, gatewayRouteUnhealthyGauge.DeleteLabelValues,
+		fmt.Sprintf("gateway routes unhealthy >=%s: ",
+			gatewayRouteUnhealthyMinAge), ", ")
 }
 
 // scanRoute evaluates one route and adds every live signature to

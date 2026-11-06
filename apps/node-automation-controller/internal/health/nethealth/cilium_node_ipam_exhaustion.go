@@ -9,9 +9,7 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"net"
-	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +20,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -168,8 +167,7 @@ func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result 
 		podCount[pod.Spec.NodeName]++
 	}
 
-	current := map[string][]string{}
-	var exhausted []string
+	var rep probefw.SweepReport
 	for i := range nodes {
 		node := &nodes[i]
 		capacity, ok := podCIDRCapacity(node.Spec.PodCIDR)
@@ -201,24 +199,16 @@ func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result 
 				}
 			}
 		}
-		lv := []string{node.Name}
-		current[node.Name] = lv
-		ciliumIPAMFreeRatioGauge.WithLabelValues(lv...).Set(ratio)
+		rep.Set(ciliumIPAMFreeRatioGauge, ratio, node.Name, []string{node.Name})
 		if ratio >= minFree {
 			continue
 		}
-		exhausted = append(exhausted, fmt.Sprintf(
+		rep.Find(fmt.Sprintf(
 			"%s(free=%.0f/%d=%.0f%%)", node.Name, free, capacity, ratio*100))
 		p.reapTerminalPodsOnNode(ctx, log, node.Name, now)
 	}
-	sort.Strings(exhausted)
-	p.emitted.Reconcile(current, ciliumIPAMFreeRatioGauge.DeleteLabelValues)
-	if len(exhausted) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	return probefw.Result{Why: fmt.Sprintf(
-		"nodes below %.0f%% free pod IPs: %s",
-		minFree*100, strings.Join(exhausted, ", "))}
+	return rep.Result(&p.emitted, ciliumIPAMFreeRatioGauge.DeleteLabelValues,
+		fmt.Sprintf("nodes below %.0f%% free pod IPs: ", minFree*100), ", ")
 }
 
 // reapTerminalPodsOnNode deletes Succeeded/Failed pods on an

@@ -11,7 +11,6 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -161,9 +160,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 	// absorb the traffic" proof.
 	readyByOwner := probefw.ReadyByOwner(pods.Items)
 
-	current := map[string][]string{}
-	identityCurrent := map[string][]string{}
-	var findings []string
+	var rep, identityRep probefw.SweepReport
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.DeletionTimestamp != nil ||
@@ -187,9 +184,8 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		ref := metav1.GetControllerOf(pod)
 		if storm {
 			lv := []string{pod.Namespace, pod.Name}
-			current[key] = lv
-			linkerdH2StreamStalledGauge.WithLabelValues(lv...).Set(1)
-			findings = append(findings, key)
+			rep.Flag(linkerdH2StreamStalledGauge, key, lv)
+			rep.Find(key)
 			if ref == nil {
 				log.Info("skip heal: unowned pod — no sibling can absorb traffic",
 					"pod", key)
@@ -208,10 +204,9 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		}
 		if identity {
 			lv := []string{pod.Namespace, pod.Name}
-			identityCurrent[key] = lv
-			linkerdProxyIdentityStalledGauge.WithLabelValues(lv...).Set(1)
+			identityRep.Flag(linkerdProxyIdentityStalledGauge, key, lv)
 			if !storm {
-				findings = append(findings, key)
+				rep.Find(key)
 			}
 			// The safe-evict gate needs TWO Ready pods under the
 			// same controller: the stalled pod may still report
@@ -232,12 +227,8 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 	}
-	sort.Strings(findings)
-	p.emitted.Reconcile(current, linkerdH2StreamStalledGauge.DeleteLabelValues)
-	p.identityEmitted.Reconcile(identityCurrent, linkerdProxyIdentityStalledGauge.DeleteLabelValues)
-	if len(findings) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	return probefw.Result{Why: "meshed pods with a linkerd-proxy failure signature (h2 stream storm / identity cert stall): " +
-		strings.Join(findings, ", ")}
+	rep.Close(&p.emitted, linkerdH2StreamStalledGauge.DeleteLabelValues)
+	identityRep.Close(&p.identityEmitted, linkerdProxyIdentityStalledGauge.DeleteLabelValues)
+	return rep.Verdict(
+		"meshed pods with a linkerd-proxy failure signature (h2 stream storm / identity cert stall): ", ", ")
 }

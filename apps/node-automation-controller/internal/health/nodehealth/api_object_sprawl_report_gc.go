@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -144,9 +143,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	objectCurrent := map[string][]string{}
-	orphanCurrent := map[string][]string{}
-	var findings []string
+	var objects, orphans, helmRep probefw.SweepReport
 	orphanBudget := sprawlMaxOrphanDeletes
 	for _, rk := range sprawlReportKinds {
 		items, err := p.Dyn.Resource(rk.gvr).List(ctx, metav1.ListOptions{})
@@ -178,33 +175,24 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 		for ns, count := range perNS {
-			lv := []string{rk.resource, ns}
-			objectCurrent[rk.resource+"/"+ns] = lv
-			apiObjectCountGauge.WithLabelValues(lv...).Set(float64(count))
+			objects.Set(apiObjectCountGauge, float64(count),
+				rk.resource+"/"+ns, []string{rk.resource, ns})
 		}
-		lv := []string{rk.kind}
-		orphanCurrent[rk.kind] = lv
-		ephemeralReportsOrphanedGauge.WithLabelValues(lv...).Set(float64(orphaned))
+		orphans.Set(ephemeralReportsOrphanedGauge, float64(orphaned),
+			rk.kind, []string{rk.kind})
 		if orphaned > 0 {
-			findings = append(findings,
-				fmt.Sprintf("%d orphaned %s", orphaned, rk.resource))
+			objects.Find(fmt.Sprintf("%d orphaned %s", orphaned, rk.resource))
 		}
 	}
 
-	helmFindings, helmCurrent, err := p.pruneHelmSecrets(ctx, log, objectCurrent)
-	if err != nil {
+	if err := p.pruneHelmSecrets(ctx, log, &objects, &helmRep); err != nil {
 		return probefw.Result{Infra: err}
 	}
-	findings = append(findings, helmFindings...)
 
-	p.emittedObjects.Reconcile(objectCurrent, apiObjectCountGauge.DeleteLabelValues)
-	p.emittedOrphans.Reconcile(orphanCurrent, ephemeralReportsOrphanedGauge.DeleteLabelValues)
-	p.emittedHelm.Reconcile(helmCurrent, helmSecretsExcessGauge.DeleteLabelValues)
-	if len(findings) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	sort.Strings(findings)
-	return probefw.Result{Why: "api object sprawl: " + strings.Join(findings, ", ")}
+	objects.Close(&p.emittedObjects, apiObjectCountGauge.DeleteLabelValues)
+	orphans.Close(&p.emittedOrphans, ephemeralReportsOrphanedGauge.DeleteLabelValues)
+	helmRep.Close(&p.emittedHelm, helmSecretsExcessGauge.DeleteLabelValues)
+	return objects.Verdict("api object sprawl: ", ", ")
 }
 
 // reportOwnerGone reports whether the report's controller owner is a
@@ -267,16 +255,16 @@ func (p *apiObjectSprawlReportGCCheck) deleteOrphanReport(ctx context.Context,
 // `version` label are prune candidates, the oldest beyond the cap are
 // deleted with a UID precondition, and the highest-version secret of
 // the release is NEVER touched (it stays the newest rollback point
-// even when itself superseded). Returns the findings for the check's
-// why string and the helm-excess gauge tuples for the ledger.
+// even when itself superseded). Findings for the check's why string
+// and the helm-excess gauge tuples are recorded on the reports.
 func (p *apiObjectSprawlReportGCCheck) pruneHelmSecrets(ctx context.Context,
-	log logr.Logger, objectCurrent map[string][]string) ([]string, map[string][]string, error) {
+	log logr.Logger, objects, helmRep *probefw.SweepReport) error {
 
 	secrets, err := kube.ListAll(ctx, metav1.ListOptions{
 		LabelSelector: "owner=helm", Limit: probefw.HealthListPageSize},
 		kube.Secrets(p.CS, metav1.NamespaceAll))
 	if err != nil {
-		return nil, nil, fmt.Errorf("list helm release secrets: %w", err)
+		return fmt.Errorf("list helm release secrets: %w", err)
 	}
 	type relKey struct{ ns, release string }
 	byRelease := map[relKey][]*corev1.Secret{}
@@ -295,17 +283,15 @@ func (p *apiObjectSprawlReportGCCheck) pruneHelmSecrets(ctx context.Context,
 		byRelease[k] = append(byRelease[k], s)
 	}
 	for ns, count := range perNS {
-		lv := []string{sprawlHelmSecretsResource, ns}
-		objectCurrent[sprawlHelmSecretsResource+"/"+ns] = lv
-		apiObjectCountGauge.WithLabelValues(lv...).Set(float64(count))
+		objects.Set(apiObjectCountGauge, float64(count),
+			sprawlHelmSecretsResource+"/"+ns,
+			[]string{sprawlHelmSecretsResource, ns})
 	}
 
 	type supersededSecret struct {
 		s *corev1.Secret
 		v int
 	}
-	var findings []string
-	helmCurrent := map[string][]string{}
 	for k, relSecrets := range byRelease {
 		highest := -1
 		var superseded []supersededSecret
@@ -325,10 +311,9 @@ func (p *apiObjectSprawlReportGCCheck) pruneHelmSecrets(ctx context.Context,
 		if excess <= 0 {
 			continue
 		}
-		lv := []string{k.ns, k.release}
-		helmCurrent[k.ns+"/"+k.release] = lv
-		helmSecretsExcessGauge.WithLabelValues(lv...).Set(float64(excess))
-		findings = append(findings, fmt.Sprintf(
+		helmRep.Set(helmSecretsExcessGauge, float64(excess),
+			k.ns+"/"+k.release, []string{k.ns, k.release})
+		objects.Find(fmt.Sprintf(
 			"release %s/%s holds %d superseded secrets (cap %d)",
 			k.ns, k.release, len(superseded), sprawlMaxSuperseded))
 		sort.Slice(superseded, func(i, j int) bool {
@@ -356,5 +341,5 @@ func (p *apiObjectSprawlReportGCCheck) pruneHelmSecrets(ctx context.Context,
 			toDelete--
 		}
 	}
-	return findings, helmCurrent, nil
+	return nil
 }

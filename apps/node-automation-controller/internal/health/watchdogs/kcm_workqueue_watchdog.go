@@ -3,17 +3,16 @@ package watchdogs
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"sort"
-	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // kcmWorkqueueCheck is the C6 kube-controller-manager workqueue
@@ -190,26 +189,17 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 		_, ok := sigs[sig]
 		return ok
 	})
+	var rep probefw.SweepReport
 	for reason := range frozen {
-		p.kcmFrozenReasons.Set(kcmWorkqueueFrozenGauge, 1,
-			reason, reason)
+		rep.Emit(kcmWorkqueueFrozenGauge, reason, []string{reason}, reason)
 	}
 	// A reason held last sweep but not re-frozen flips back to 0 —
 	// the series stays present so the "back to 0" edge is visible,
 	// it just stops pinning at 1.
-	p.kcmFrozenReasons.Prune(kcmFrozenFlipZero)
-
-	if len(frozen) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	reasons := make([]string, 0, len(frozen))
-	for r := range frozen {
-		reasons = append(reasons, r)
-	}
-	sort.Strings(reasons)
-	return probefw.Result{Why: fmt.Sprintf(
-		"KCM lease renews but kube-system objects unreconciled >=%s: %s",
-		p.Cfg.KCM.FreezeMinAge, strings.Join(reasons, ", "))}
+	return rep.Result(&p.kcmFrozenReasons, kcmFrozenFlipZero,
+		fmt.Sprintf(
+			"KCM lease renews but kube-system objects unreconciled >=%s: ",
+			p.Cfg.KCM.FreezeMinAge), ", ")
 }
 
 // kcmFrozenFlipZero is the ledger's prune action: a reason series

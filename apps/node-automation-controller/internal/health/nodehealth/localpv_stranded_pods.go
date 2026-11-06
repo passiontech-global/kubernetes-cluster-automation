@@ -8,22 +8,22 @@ package nodehealth
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 // localPVStrandedCheck is the W7-C4 local-PV dead-node diagnostic,
@@ -278,10 +278,9 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list persistentvolumeclaims: %w", err)}
 	}
 
-	// emitted/stalled map each live gauge key to its label values —
-	// the ledgers store the tuples so no key gets SplitN'd apart.
-	emitted := map[string][]string{} // "ns/pod/pvc/node/reason" this sweep
-	stalled := map[string][]string{} // "ns/pvc/storageclass" this sweep
+	// stranded/stalled accumulate each live gauge key's label values —
+	// the reports feed the ledgers so no key gets SplitN'd apart.
+	var stranded, stalledRep probefw.SweepReport
 	var heals []strandedHeal
 
 	podOpts := metav1.ListOptions{
@@ -320,10 +319,9 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 								}
 								key := pod.Namespace + "/" + pod.Name + "/" +
 									pvc.Name + "/" + node + "/" + reason
-								emitted[key] = []string{
-									pod.Namespace, pod.Name, pvc.Name, node, reason}
-								localPVStrandedPodsGauge.WithLabelValues(
-									emitted[key]...).Set(1)
+								stranded.Emit(localPVStrandedPodsGauge, key,
+									[]string{pod.Namespace, pod.Name, pvc.Name,
+										node, reason}, key)
 								// Confirmed-gone nodes only: NotReady/
 								// cordoned can come back — a missing or
 								// fenced (out-of-service) node cannot.
@@ -345,10 +343,9 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 						*pvc.Spec.StorageClassName == openebsHostpathSC &&
 						age >= pvcStalledMinAge {
 						key := pod.Namespace + "/" + pvc.Name + "/" + openebsHostpathSC
-						stalled[key] = []string{
-							pod.Namespace, pvc.Name, openebsHostpathSC}
-						pvcProvisioningStalledGauge.WithLabelValues(
-							stalled[key]...).Set(1)
+						stalledRep.Flag(pvcProvisioningStalledGauge, key,
+							[]string{pod.Namespace, pvc.Name, openebsHostpathSC})
+						stranded.Find("stalled:" + key)
 					}
 				}
 			}
@@ -361,9 +358,9 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	// Prune the gauges' series for tuples not re-seen — same
 	// DeleteLabelValues hygiene as stsZeroEmitted; the ledgers hold
 	// the label tuples so no key gets re-split.
-	p.localPVEmitted.Reconcile(emitted,
+	stranded.Close(&p.localPVEmitted,
 		localPVStrandedPodsGauge.DeleteLabelValues)
-	p.pvcStalledEmitted.Reconcile(stalled,
+	stalledRep.Close(&p.pvcStalledEmitted,
 		pvcProvisioningStalledGauge.DeleteLabelValues)
 
 	// AllowedV folds the per-target cooldown plus the maintenance
@@ -430,23 +427,11 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 			"pvc", pvcKey, "pod", h.pod.Namespace+"/"+h.pod.Name,
 			"node", h.node, "reason", h.reason)
 	}
-	if len(stalled) > 0 {
+	if stalledRep.Flagged() > 0 {
 		p.healLocalPVProvisioner(ctx, log, now)
 	}
 
-	if len(emitted) == 0 && len(stalled) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	keys := make([]string, 0, len(emitted)+len(stalled))
-	for k := range emitted {
-		keys = append(keys, k)
-	}
-	for k := range stalled {
-		keys = append(keys, "stalled:"+k)
-	}
-	sort.Strings(keys)
-	return probefw.Result{Why: "localpv-stranded/stalled volumes: " +
-		strings.Join(keys, ", ")}
+	return stranded.Verdict("localpv-stranded/stalled volumes: ", ", ")
 }
 
 // healLocalPVProvisioner deletes the openebs-localpv-provisioner

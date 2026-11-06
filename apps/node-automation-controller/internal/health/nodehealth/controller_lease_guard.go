@@ -16,7 +16,8 @@
 // its kube_state_metrics_*_total error counters) shows a continuous
 // reflector watch/list failure or a stuck 401 Unauthorized / expired
 // SA token — the pod stays Ready while every kube_* metric it
-// serves silently goes stale.
+// serves silently goes stale. Its detector and healer live in
+// ksm_wedge.go.
 //
 // The heal for (b) and (c) is the shared pod bounce — a
 // UID-preconditioned delete through probefw.DeletePodHeal, gated by
@@ -28,7 +29,6 @@ package nodehealth
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -38,7 +38,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -115,19 +114,9 @@ const (
 	// leaseDuration plus renew headroom to prove the heal worked.
 	leasePodHealCooldown = 30 * time.Minute
 
-	// A KSM reflector/401 signature must persist 10m before the pod
-	// counts as wedged — a single retry burst is self-healing.
-	ksmWedgeMinAge     = 10 * time.Minute
-	ksmPodHealCooldown = 30 * time.Minute
-	ksmLogTailLines    = int64(200)
-	ksmLogMaxBytes     = int64(256 * 1024)
-	ksmLogTimeout      = 8 * time.Second
-
 	// node_automation_controller_lease_unhealthy reason labels.
 	leaseReasonFlapping           = "flapping"
 	leaseReasonExpiredRunningPods = "expired_with_running_pods"
-	leaseReasonKSMUnauthorized    = "ksm_unauthorized"
-	leaseReasonKSMReflectorErrors = "ksm_reflector_errors"
 )
 
 // leaseGuardNamespaces are the control-plane namespaces whose
@@ -136,24 +125,6 @@ const (
 var leaseGuardNamespaces = []string{
 	"kube-system", "flux-system", "node-ops", "operators",
 	"linkerd", "argocd", "cert-manager", "external-secrets",
-}
-
-// ksmWedgeSignatures map a lower-cased log marker to the reason it
-// reports — ordered most-specific first so a reflector line whose
-// cause is a 401 still classifies as the auth wedge. "the server has
-// asked for the client to provide credentials" is client-go's
-// canonical expired-SA-token 401.
-var ksmWedgeSignatures = []struct {
-	marker string
-	reason string
-}{
-	{"unauthorized", leaseReasonKSMUnauthorized},
-	{"401", leaseReasonKSMUnauthorized},
-	{"provide credentials", leaseReasonKSMUnauthorized},
-	{"token expired", leaseReasonKSMUnauthorized},
-	{"failed to list", leaseReasonKSMReflectorErrors},
-	{"failed to watch", leaseReasonKSMReflectorErrors},
-	{"unable to sync caches", leaseReasonKSMReflectorErrors},
 }
 
 var (
@@ -180,9 +151,7 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	current := map[string][]string{}
-	var findings []string
-	var firstErr error
+	var rep probefw.SweepReport
 
 	// podsCache memoizes the per-namespace pod list the
 	// expired-lease heuristic needs — fetched lazily, only for
@@ -214,10 +183,8 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 		leases, err := p.CS.CoordinationV1().Leases(ns).
 			List(ctx, metav1.ListOptions{})
 		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("list leases in %s: %w", ns, err)
-			}
-			p.carryNamespace(current, liveLeases, ns)
+			rep.InfraErr(fmt.Errorf("list leases in %s: %w", ns, err))
+			p.carryNamespace(&rep, liveLeases, ns)
 			continue
 		}
 		for i := range leases.Items {
@@ -225,18 +192,16 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 			key := ns + "/" + lease.Name
 			liveLeases[key] = true
 			if p.leaseFlapping(key, lease, now) {
-				p.emitUnhealthy(current, ns, lease.Name, leaseReasonFlapping)
-				findings = append(findings, key+"("+leaseReasonFlapping+")")
+				p.emitUnhealthy(&rep, ns, lease.Name, leaseReasonFlapping)
+				rep.Find(key + "(" + leaseReasonFlapping + ")")
 			}
 			if !leaseStaleWindow(lease, now) {
 				continue
 			}
 			pods, err := podsInNS(ns)
 			if err != nil {
-				if firstErr == nil {
-					firstErr = fmt.Errorf("list pods in %s: %w", ns, err)
-				}
-				p.carryNamespace(current, liveLeases, ns)
+				rep.InfraErr(fmt.Errorf("list pods in %s: %w", ns, err))
+				p.carryNamespace(&rep, liveLeases, ns)
 				continue
 			}
 			targets := controllerRunningPods(lease, pods)
@@ -246,33 +211,18 @@ func (p *controllerLeaseGuardCheck) Run(ctx context.Context) probefw.Result {
 				// elector (pod-status checks own that class).
 				continue
 			}
-			p.emitUnhealthy(current, ns, lease.Name,
+			p.emitUnhealthy(&rep, ns, lease.Name,
 				leaseReasonExpiredRunningPods)
-			findings = append(findings,
-				key+"("+leaseReasonExpiredRunningPods+")")
+			rep.Find(key + "(" + leaseReasonExpiredRunningPods + ")")
 			p.healStaleLeaseController(ctx, log, lease, targets, now)
 		}
 	}
 	p.pruneTransitions(liveLeases)
 
-	ksmFindings, err := p.checkKSMWedged(ctx, log, now, current)
-	findings = append(findings, ksmFindings...)
-	if err != nil && firstErr == nil {
-		firstErr = err
-	}
+	rep.InfraErr(p.checkKSMWedged(ctx, log, now, &rep))
 
-	p.emitted.Reconcile(current, controllerLeaseUnhealthyGauge.DeleteLabelValues)
-	if len(findings) == 0 {
-		if firstErr != nil {
-			return probefw.Result{Infra: firstErr}
-		}
-		return probefw.Result{Pass: true}
-	}
-	sort.Strings(findings)
-	return probefw.Result{
-		Infra: firstErr,
-		Why:   "controller leases unhealthy: " + strings.Join(findings, ", "),
-	}
+	return rep.Result(&p.emitted, controllerLeaseUnhealthyGauge.DeleteLabelValues,
+		"controller leases unhealthy: ", ", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -414,174 +364,17 @@ func (p *controllerLeaseGuardCheck) healStaleLeaseController(
 }
 
 // ---------------------------------------------------------------------------
-// kube-state-metrics wedge healer
-// ---------------------------------------------------------------------------
-
-// checkKSMWedged scans Running kube-state-metrics pods for the
-// reflector/token wedge and returns this sweep's finding strings. A
-// signature that persists past ksmWedgeMinAge reports the pod on the
-// gauge AND bounces it — the restart re-mounts a fresh SA token and
-// re-opens the watch streams a wedged client cannot recover.
-func (p *controllerLeaseGuardCheck) checkKSMWedged(ctx context.Context,
-	log logr.Logger, now time.Time,
-	current map[string][]string) ([]string, error) {
-
-	pods, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Pods(p.CS, metav1.NamespaceAll))
-	if err != nil {
-		// Never evaluated — carry the held ksm tuples forward so the
-		// sweep-end reconcile keeps their series (the scan failed;
-		// nothing was proven resolved).
-		for k, lv := range p.emitted.Last() {
-			if len(lv) == 3 && strings.HasPrefix(lv[2], "ksm_") {
-				current[k] = lv
-			}
-		}
-		return nil, fmt.Errorf("list pods (kube-state-metrics wedge scan): %w", err)
-	}
-	var findings []string
-	wedgeLive := map[string]bool{}
-	for i := range pods {
-		pod := &pods[i]
-		if !isKSMPod(pod) || pod.DeletionTimestamp != nil ||
-			pod.Status.Phase != corev1.PodRunning {
-			continue
-		}
-		key := pod.Namespace + "/" + pod.Name
-		reason, err := p.ksmWedgeReason(ctx, pod)
-		if err != nil {
-			// Inconclusive, not clean — a broken log/metrics read
-			// must not read as "no wedge": keep the first-seen
-			// tracking and any held series for this pod.
-			log.Info("WARN: ksm wedge signature inconclusive",
-				"pod", key, "error", err)
-			wedgeLive[key] = true
-			for k, lv := range p.emitted.Last() {
-				if strings.HasPrefix(k, key+"/") {
-					current[k] = lv
-				}
-			}
-			continue
-		}
-		if reason == "" {
-			continue
-		}
-		wedgeLive[key] = true
-		if !probefw.Persisted(&p.wedgeSeen, key, now,
-			ksmWedgeMinAge, log) {
-			continue
-		}
-		p.emitUnhealthy(current, pod.Namespace, pod.Name, reason)
-		findings = append(findings, key+"("+reason+")")
-		p.DeletePodHeal(ctx, log, CheckNameControllerLeaseGuard,
-			"ksm/"+key, pod, ksmPodHealCooldown, now)
-	}
-	p.wedgeSeen.Prune(func(k string) bool { return wedgeLive[k] })
-	return findings, nil
-}
-
-// isKSMPod matches kube-state-metrics pods by the
-// app.kubernetes.io/name label the kube-prometheus-stack chart
-// ships, falling back to the deployment name prefix for installs
-// without the label.
-func isKSMPod(pod *corev1.Pod) bool {
-	return pod.Labels["app.kubernetes.io/name"] == "kube-state-metrics" ||
-		strings.HasPrefix(pod.Name, "kube-state-metrics-")
-}
-
-// ksmWedgeReason resolves this sweep's wedge signature for one
-// kube-state-metrics pod. The log tail is the primary signal — the
-// injected seam in tests, the bounded GetLogs tail in production;
-// when the tail reads clean, the Prometheus counter increase is the
-// "or metrics" half of the detection (a spamming reflector can
-// rotate the 401 storm out of the last tail lines between sweeps).
-// "" is clean; an error means inconclusive.
-func (p *controllerLeaseGuardCheck) ksmWedgeReason(ctx context.Context,
-	pod *corev1.Pod) (string, error) {
-
-	probe := p.ksmLogProbe
-	if probe == nil {
-		probe = func(ctx context.Context, pod *corev1.Pod) (string, error) {
-			return ksmLogTailWedge(ctx, p.CS, pod)
-		}
-	}
-	reason, err := probe(ctx, pod)
-	if err != nil {
-		return "", fmt.Errorf("log tail: %w", err)
-	}
-	if reason != "" {
-		return reason, nil
-	}
-	errs, err := p.ksmReflectorErrorIncrease(ctx, pod)
-	if err != nil {
-		return "", fmt.Errorf("prometheus: %w", err)
-	}
-	if errs > 0 {
-		return leaseReasonKSMReflectorErrors, nil
-	}
-	return "", nil
-}
-
-// ksmLogTailWedge is the production log-tail probe: the pod's last
-// ksmLogTailLines lines (bounded by ksmLogMaxBytes / ksmLogTimeout)
-// scanned for the wedge signatures — the reason of the first hit,
-// "" when clean. A fetch failure is inconclusive, not healthy.
-func ksmLogTailWedge(ctx context.Context, cs kubernetes.Interface,
-	pod *corev1.Pod) (string, error) {
-
-	reason := ""
-	hit, err := probefw.PodLogTail(ctx, cs, pod, "",
-		ksmLogTailLines, ksmLogMaxBytes, ksmLogTimeout,
-		func(line string) bool {
-			l := strings.ToLower(line)
-			for _, sig := range ksmWedgeSignatures {
-				if strings.Contains(l, sig.marker) {
-					reason = sig.reason
-					return true
-				}
-			}
-			return false
-		})
-	if err != nil || !hit {
-		return "", err
-	}
-	return reason, nil
-}
-
-// ksmReflectorErrorIncrease is the metrics half of the wedge OR: KSM
-// exports per-resource list/watch counters labelled result="error" —
-// a wedged stream shows a continuous increase. A missing series is
-// clean; a query failure is inconclusive.
-func (p *controllerLeaseGuardCheck) ksmReflectorErrorIncrease(
-	ctx context.Context, pod *corev1.Pod) (float64, error) {
-
-	samples, err := p.PromQuery(ctx, fmt.Sprintf(
-		`sum(increase(kube_state_metrics_list_total{result="error",pod="%s"}[10m])) + sum(increase(kube_state_metrics_watch_total{result="error",pod="%s"}[10m]))`,
-		pod.Name, pod.Name))
-	if err != nil {
-		return 0, err
-	}
-	total := 0.0
-	for _, s := range samples {
-		total += s.Value
-	}
-	return total, nil
-}
-
-// ---------------------------------------------------------------------------
 // Gauge + carry-forward helpers
 // ---------------------------------------------------------------------------
 
 // emitUnhealthy records one unhealthy tuple on the gauge and in this
-// sweep's current set — Reconcile at the end prunes every tuple the
-// sweep did not re-assert.
+// sweep's report — Close at the end prunes every tuple the sweep did
+// not re-assert.
 func (p *controllerLeaseGuardCheck) emitUnhealthy(
-	current map[string][]string, ns, name, reason string) {
+	rep *probefw.SweepReport, ns, name, reason string) {
 
-	lv := []string{ns, name, reason}
-	current[ns+"/"+name+"/"+reason] = lv
-	controllerLeaseUnhealthyGauge.WithLabelValues(lv...).Set(1)
+	rep.Flag(controllerLeaseUnhealthyGauge, ns+"/"+name+"/"+reason,
+		[]string{ns, name, reason})
 }
 
 // carryNamespace re-registers the held gauge tuples and flap history
@@ -589,11 +382,11 @@ func (p *controllerLeaseGuardCheck) emitUnhealthy(
 // "not evaluated" must not read as "resolved", or one API flap would
 // prune live series and re-arm every persistence window.
 func (p *controllerLeaseGuardCheck) carryNamespace(
-	current map[string][]string, liveLeases map[string]bool, ns string) {
+	rep *probefw.SweepReport, liveLeases map[string]bool, ns string) {
 
 	for k, lv := range p.emitted.Last() {
 		if strings.HasPrefix(k, ns+"/") {
-			current[k] = lv
+			rep.Carry(k, lv)
 		}
 	}
 	for k := range p.transitions {

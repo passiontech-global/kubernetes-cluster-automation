@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -67,7 +68,7 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 	// first, and its failure skips the prune below: "can't read the
 	// surface" must not delete live drift series.
 	if a.dyn == nil {
-		return fmt.Errorf("list customresourcedefinitions: no dynamic client")
+		return errors.New("list customresourcedefinitions: no dynamic client")
 	}
 	crds, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},

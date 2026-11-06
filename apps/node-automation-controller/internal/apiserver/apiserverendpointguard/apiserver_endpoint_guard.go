@@ -83,7 +83,6 @@ import (
 	"maps"
 	"net/http"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -93,7 +92,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -224,55 +222,6 @@ func Setup(d shared.Deps) error {
 	}
 	return mgr.Add(g)
 }
-
-// NewWarningHandler returns the WarningHandler that drops
-// only the apiserver's "v1 Endpoints is deprecated" header — exported
-// so main can attach it to the shared rest.Config before the first
-// clientset is built. The guard then recognizes its own filter on the
-// manager config and reuses that clientset instead of paying for a
-// second http.Transport and TLS connection pool.
-func NewWarningHandler() rest.WarningHandler {
-	return endpointGuardWarnings{delegate: rest.WarningLogger{}}
-}
-
-// endpointsWarningClient returns a dynamic client whose WarningHandler
-// drops only the apiserver's Endpoints deprecation header — the
-// guard's Endpoints reads/writes are intentional. When cfg already
-// carries the guard's filter (main wires it onto the shared config
-// before building dyn), the incoming client is reused: cloning cfg
-// into a second client would duplicate the http.Transport and its
-// connection pool for zero behavioral gain.
-func endpointsWarningClient(cfg *rest.Config, dyn dynamic.Interface) (dynamic.Interface, error) {
-	if dyn != nil {
-		if _, ok := cfg.WarningHandler.(endpointGuardWarnings); ok {
-			return dyn, nil
-		}
-	}
-	cfg = rest.CopyConfig(cfg)
-	cfg.WarningHandler = NewWarningHandler()
-	return dynamic.NewForConfig(cfg)
-}
-
-// endpointGuardWarnings suppresses exactly one warning: "v1 Endpoints
-// is deprecated" (the deprecated object is written by design wherever
-// the kubernetes slice is a mirror projection). Everything else still
-// reaches the default WarningLogger.
-type endpointGuardWarnings struct {
-	delegate rest.WarningHandlerWithContext
-}
-
-func (w endpointGuardWarnings) HandleWarningHeader(code int, agent, message string) {
-	w.HandleWarningHeaderWithContext(context.Background(), code, agent, message)
-}
-
-func (w endpointGuardWarnings) HandleWarningHeaderWithContext(ctx context.Context, code int, agent, message string) {
-	if code == 299 && strings.Contains(message, "v1 Endpoints is deprecated") {
-		return
-	}
-	w.delegate.HandleWarningHeaderWithContext(ctx, code, agent, message)
-}
-
-var _ rest.WarningHandlerWithContext = endpointGuardWarnings{}
 
 // Start implements manager.Runnable — leader-gated like every other
 // periodic module (plain Runnables default NeedLeaderElection()=true).
@@ -406,106 +355,7 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 		return nil
 	}
 
-	// Probe every backend (active + quarantined) and fold the outcome
-	// into the per-backend streaks.
-	type outcome struct {
-		wedged  bool
-		healthy bool
-	}
-	results := make(map[string]outcome, len(allIPs))
-	for _, ip := range allIPs {
-		st := g.backends[ip]
-		if st == nil {
-			st = &backendProbeState{}
-			g.backends[ip] = st
-		}
-		res := g.probeFn(ctx, ip)
-
-		var o outcome
-		if res.err != nil {
-			// Timeout / non-2xx: wedge signal only after
-			// endpointGuardErrCycles consecutive failures — a single
-			// WAN/TLS blip must not pull a healthy backend. Streaks
-			// reset so a flap doesn't resume mid-count on recovery.
-			st.errStreak++
-			o.wedged = st.errStreak >= endpointGuardErrCycles
-			st.gapStreak, st.frozenStreak, st.okStreak = 0, 0, 0
-			st.haveLast = false
-			log.Error(res.err, "backend probe failed — wedge signal", "ip", ip)
-			metrics.ObserveAPIBackend(ip, -1, quarantinedIPs[ip])
-		} else {
-			st.errStreak = 0
-			gap := res.liveRV - res.cacheRV
-			if gap >= endpointGuardRVGap {
-				st.gapStreak++
-			} else {
-				st.gapStreak = 0
-			}
-			if st.haveLast && res.cacheRV == st.lastCacheRV && res.liveRV > st.lastLiveRV {
-				st.frozenStreak++
-			} else if res.cacheRV < res.liveRV {
-				// W8-CP1: the cache still trails the quorum RV — a
-				// quiet cycle (cache advanced a little, or nothing
-				// changed) must KEEP the frozen streak instead of
-				// re-arming it, or a slowly-lagging cache never
-				// reaches the wedge threshold.
-			} else {
-				st.frozenStreak = 0
-			}
-			st.lastLiveRV, st.lastCacheRV, st.haveLast = res.liveRV, res.cacheRV, true
-			o.wedged = st.gapStreak >= endpointGuardGapCycles ||
-				st.frozenStreak >= endpointGuardFrozenCyc
-			o.healthy = gap < endpointGuardRVGap && st.frozenStreak < endpointGuardFrozenCyc
-			if o.healthy {
-				st.okStreak++
-			} else {
-				st.okStreak = 0
-			}
-			metrics.ObserveAPIBackend(ip, float64(gap), quarantinedIPs[ip])
-		}
-		results[ip] = o
-	}
-
-	// Prune state + metric series for IPs that left the controller set.
-	for ip := range g.backends {
-		if !slices.Contains(allIPs, ip) {
-			delete(g.backends, ip)
-			metrics.ForgetAPIBackend(ip)
-		}
-	}
-
-	// ---- Quarantine expiry ------------------------------------------
-	// A permanently decommissioned backend never recovers AND the
-	// endpoints reconciler stops re-adding it: absent from the current
-	// address sets while probe-erring continuously for
-	// endpointGuardExpireCyc cycles means it is never coming back, so
-	// it drops out of the quarantine set (annotation rewrite below +
-	// memQuarantine) instead of pinning a dead IP — and the 10s
-	// re-apply cadence — forever. This is decided BEFORE the
-	// min-backends gate: the expiry only shrinks the annotation, a
-	// write that can never empty the endpoint set, so it stays legal
-	// where address edits are banned — and its bookkeeping can never
-	// deadlock behind the early return.
-	var toExpire []string
-	for _, ip := range slices.Sorted(maps.Keys(quarantinedIPs)) {
-		if slices.Contains(activeIPs, ip) {
-			continue // the reconciler re-added it — still a live backend
-		}
-		if st := g.backends[ip]; st != nil && st.errStreak >= endpointGuardExpireCyc {
-			toExpire = append(toExpire, ip)
-		}
-	}
-	for _, ip := range toExpire {
-		delete(quarantinedIPs, ip)
-		delete(g.backends, ip)
-		metrics.ForgetAPIBackend(ip)
-		log.Info("EXPIRE-QUARANTINE: backend absent from endpoints and unreachable — dropping quarantine",
-			"ip", ip, "errCycles", endpointGuardExpireCyc)
-	}
-	if len(toExpire) > 0 {
-		g.memQuarantine = maps.Clone(quarantinedIPs)
-		g.quarantineActive = len(quarantinedIPs) > 0
-	}
+	results, toExpire := g.evaluateBackends(ctx, allIPs, activeIPs, quarantinedIPs)
 
 	// Fewer than 2 controller IPs total (single-controller clusters):
 	// the probe streaks/metrics above still ran, but edits here can
@@ -517,53 +367,8 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 		return nil
 	}
 
-	// ---- Decide removals -------------------------------------------------
-	// A wedged active IP may be quarantined only while at least one
-	// OTHER ROUTABLE IP is healthy this cycle — processed in sorted
-	// order so a multi-wedge cycle can never remove the last healthy
-	// backend. "Routable" excludes notReadyAddresses / Ready=false
-	// slice endpoints: kube-proxy never routes to them, so a notReady
-	// backend that happens to probe fine must not vouch for pulling
-	// the last Ready endpoint — that would flap kubernetes.default to
-	// zero routable addresses (notReady suspects are still probed and
-	// quarantined above; only the healthy-peer accounting changes).
-	var toRemove []string
-	healthyActive := 0
-	for ip := range routableIPs {
-		if results[ip].healthy {
-			healthyActive++
-		}
-	}
-	for _, ip := range activeIPs { // activeIPs is sorted
-		if !results[ip].wedged {
-			continue
-		}
-		if healthyActive < 1 {
-			log.Info("SKIP-QUARANTINE: no healthy backend would remain — fail closed",
-				"ip", ip)
-			continue
-		}
-		toRemove = append(toRemove, ip)
-	}
-	if len(toRemove) > 0 && g.client != nil {
-		// W8-CP1: quarantining the IP only protects NEW dials —
-		// pooled keep-alive connections to the wedged backend stay
-		// pinned until they break. Drop them so the very next probe
-		// (and anything sharing this transport) re-dials onto a
-		// healthy backend.
-		g.client.CloseIdleConnections()
-	}
-
-	// ---- Decide re-adds --------------------------------------------------
-	var toAdd []string
-	for _, ip := range slices.Sorted(maps.Keys(quarantinedIPs)) {
-		if g.backends[ip].okStreak >= endpointGuardRecoverCyc {
-			toAdd = append(toAdd, ip)
-		} else {
-			log.Info("quarantined backend still recovering",
-				"ip", ip, "okStreak", g.backends[ip].okStreak, "need", endpointGuardRecoverCyc)
-		}
-	}
+	toRemove, toAdd, healthyActive := g.decideQuarantine(log, results,
+		activeIPs, routableIPs, quarantinedIPs)
 
 	if len(toRemove) == 0 && len(toAdd) == 0 && len(toExpire) == 0 {
 		log.Info("sweep done", "backends", len(allIPs), "healthyActive", healthyActive,

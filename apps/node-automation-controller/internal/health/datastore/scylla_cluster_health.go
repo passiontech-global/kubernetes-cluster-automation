@@ -8,12 +8,10 @@ package datastore
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"regexp"
-	"sort"
-	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -21,11 +19,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
-	"github.com/prometheus/client_golang/prometheus"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // scyllaHealthCheck is the W9-ST1 scylla cluster health watchdog.
@@ -346,20 +344,11 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 			emitted[f.ns+"/"+f.cluster+"/"+f.reason] = f
 		}
 	}
+	var rep probefw.SweepReport
 	for k, f := range emitted {
-		p.scyllaEmitted.Set(scyllaClusterUnhealthyGauge, 1,
-			k, f.ns, f.cluster, f.reason)
+		rep.Emit(scyllaClusterUnhealthyGauge, k,
+			[]string{f.ns, f.cluster, f.reason}, k)
 	}
-	p.scyllaEmitted.Prune(scyllaClusterUnhealthyGauge.DeleteLabelValues)
-
-	if len(emitted) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	keys := make([]string, 0, len(emitted))
-	for k := range emitted {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return probefw.Result{Why: "scylla unhealthy signatures: " +
-		strings.Join(keys, ", ")}
+	return rep.Result(&p.scyllaEmitted, scyllaClusterUnhealthyGauge.DeleteLabelValues,
+		"scylla unhealthy signatures: ", ", ")
 }

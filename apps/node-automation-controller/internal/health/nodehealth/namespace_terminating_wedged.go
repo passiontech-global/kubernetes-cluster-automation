@@ -9,8 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"sort"
 	"strings"
 	"time"
 
@@ -25,6 +23,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
@@ -87,27 +86,19 @@ func (p *namespaceTerminatingWedgedCheck) Run(ctx context.Context) probefw.Resul
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list namespaces: %w", err)}
 	}
-	current := map[string][]string{}
-	var wedged []string
+	var rep probefw.SweepReport
 	for i := range nss {
 		ns := &nss[i]
 		if ns.DeletionTimestamp == nil ||
 			now.Sub(ns.DeletionTimestamp.Time) < nsTerminatingMinAge {
 			continue
 		}
-		lv := []string{ns.Name}
-		current[ns.Name] = lv
-		namespaceTerminatingWedgedGauge.WithLabelValues(lv...).Set(1)
-		wedged = append(wedged, nsStuckDiagnostic(ns, now))
+		rep.Emit(namespaceTerminatingWedgedGauge, ns.Name,
+			[]string{ns.Name}, nsStuckDiagnostic(ns, now))
 		p.nsFinalizerSweep(ctx, log, ns.Name, now)
 	}
-	sort.Strings(wedged)
-	p.emitted.Reconcile(current, namespaceTerminatingWedgedGauge.DeleteLabelValues)
-	if len(wedged) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	return probefw.Result{Why: "namespaces wedged Terminating >" +
-		nsTerminatingMinAge.String() + ": " + strings.Join(wedged, " | ")}
+	return rep.Result(&p.emitted, namespaceTerminatingWedgedGauge.DeleteLabelValues,
+		"namespaces wedged Terminating >"+nsTerminatingMinAge.String()+": ", " | ")
 }
 
 // nsStuckDiagnostic renders one wedged namespace's blocking state

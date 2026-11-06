@@ -8,7 +8,6 @@ package gitops
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
 	"time"
@@ -24,6 +23,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
@@ -108,7 +108,7 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	seenKeep := map[string]bool{}
-	var stuck []string
+	var rep probefw.SweepReport
 	comparisonErrors := 0
 	for i := range apps.Items {
 		app := &apps.Items[i]
@@ -174,24 +174,20 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		}
 		sort.Strings(reasons)
 		reason := strings.Join(reasons, "+")
-		p.emitted.Set(argoCDAppStuckGauge, 1,
-			ns+"/"+name+"/"+reason, ns, name, reason)
-		stuck = append(stuck, fmt.Sprintf("%s/%s(%s)", ns, name, reason))
+		rep.Emit(argoCDAppStuckGauge, ns+"/"+name+"/"+reason,
+			[]string{ns, name, reason},
+			fmt.Sprintf("%s/%s(%s)", ns, name, reason))
 		p.refreshArgoCDApp(ctx, log, app, now)
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
-	p.emitted.Prune(argoCDAppStuckGauge.DeleteLabelValues)
+	rep.Close(&p.emitted, argoCDAppStuckGauge.DeleteLabelValues)
 
 	// >=2 simultaneous ComparisonErrors = shared stale repo-server
 	// cache — restart the oldest repo-server pod to flush it.
 	if comparisonErrors >= 2 {
 		p.restartArgoCDRepoServer(ctx, log, now)
 	}
-	if len(stuck) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	sort.Strings(stuck)
-	return probefw.Result{Why: "argocd applications stuck: " + strings.Join(stuck, ", ")}
+	return rep.Verdict("argocd applications stuck: ", ", ")
 }
 
 // argocdAppOnlyDownscaled reports whether every non-Healthy entry

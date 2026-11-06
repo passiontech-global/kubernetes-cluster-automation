@@ -10,7 +10,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,6 +23,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -183,8 +183,7 @@ func (p *linkerdProtocolDetectionStallCheck) Run(ctx context.Context) probefw.Re
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
-	current := map[string][]string{}
-	var findings []string
+	var rep probefw.SweepReport
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
@@ -198,21 +197,16 @@ func (p *linkerdProtocolDetectionStallCheck) Run(ctx context.Context) probefw.Re
 			continue
 		}
 		for _, port := range missing {
-			lv := []string{pod.Namespace, pod.Name, strconv.Itoa(port)}
-			current[pod.Namespace+"/"+pod.Name+"/"+strconv.Itoa(port)] = lv
-			linkerdOpaquePortMissingGauge.WithLabelValues(lv...).Set(1)
+			rep.Flag(linkerdOpaquePortMissingGauge,
+				pod.Namespace+"/"+pod.Name+"/"+strconv.Itoa(port),
+				[]string{pod.Namespace, pod.Name, strconv.Itoa(port)})
 		}
-		findings = append(findings, fmt.Sprintf("%s/%s ports=%s",
+		rep.Find(fmt.Sprintf("%s/%s ports=%s",
 			pod.Namespace, pod.Name, joinPorts(missing)))
 		p.healLinkerdOpaquePorts(ctx, log, pod, missing, now)
 	}
-	sort.Strings(findings)
-	p.emitted.Reconcile(current, linkerdOpaquePortMissingGauge.DeleteLabelValues)
-	if len(findings) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	return probefw.Result{Why: "meshed pods exposing unannotated binary ports: " +
-		strings.Join(findings, ", ")}
+	return rep.Result(&p.emitted, linkerdOpaquePortMissingGauge.DeleteLabelValues,
+		"meshed pods exposing unannotated binary ports: ", ", ")
 }
 
 // healLinkerdOpaquePorts applies the opaque-ports heal for one

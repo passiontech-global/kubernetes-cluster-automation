@@ -8,8 +8,6 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"sort"
 	"strings"
 	"time"
 
@@ -20,6 +18,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -149,15 +148,13 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	current := map[string][]string{}
+	var rep probefw.SweepReport
 	for key := range flagged {
 		parts := strings.SplitN(key, "/", 2)
 		ns, name := parts[0], parts[1]
 		pod := dnsByName[name]
 		if pod != nil && pod.Namespace == ns {
-			lv := []string{ns, name}
-			current[key] = lv
-			coreDNSUpstreamFailingGauge.WithLabelValues(lv...).Set(1)
+			rep.Flag(coreDNSUpstreamFailingGauge, key, []string{ns, name})
 		}
 		// Isolated-failure heal: a healthy Ready sibling in the same
 		// namespace means this is per-pod wedge, not a fleet outage.
@@ -166,18 +163,11 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 				ns+"/"+name, pod, coreDNSUpstreamHealCool, now)
 		}
 	}
-	p.emitted.Reconcile(current, coreDNSUpstreamFailingGauge.DeleteLabelValues)
-
-	if len(flagged) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	keys := make([]string, 0, len(flagged))
 	for k, d := range flagged {
-		keys = append(keys, k+"("+d+")")
+		rep.Find(k + "(" + d + ")")
 	}
-	sort.Strings(keys)
-	return probefw.Result{Why: "coredns/node-local-dns upstream failures: " +
-		strings.Join(keys, ", ")}
+	return rep.Result(&p.emitted, coreDNSUpstreamFailingGauge.DeleteLabelValues,
+		"coredns/node-local-dns upstream failures: ", ", ")
 }
 
 // hasHealthySibling reports whether another dns pod in the same
@@ -235,8 +225,7 @@ func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 		}
 	}
 
-	current := map[string][]string{}
-	var findings []string
+	var rep probefw.SweepReport
 	for key, detail := range flagged {
 		parts := strings.SplitN(key, "/", 2)
 		ns, name := parts[0], parts[1]
@@ -245,19 +234,13 @@ func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 			continue
 		}
 		lv := []string{ns, name}
-		current[key] = lv
-		coreDNSUpstreamFailingGauge.WithLabelValues(lv...).Set(1)
+		rep.Flag(coreDNSUpstreamFailingGauge, key, lv)
 		if hasHealthySibling(pod, dnsByNS[ns], flagged) {
 			p.DeletePodHeal(ctx, log, CheckNameCoreDNSUpstream,
 				ns+"/"+name, pod, coreDNSUpstreamHealCool, now)
 		}
-		findings = append(findings, key+"("+detail+")")
+		rep.Find(key + "(" + detail + ")")
 	}
-	sort.Strings(findings)
-	p.emitted.Reconcile(current, coreDNSUpstreamFailingGauge.DeleteLabelValues)
-	if len(findings) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	return probefw.Result{Why: "coredns/node-local-dns unready pods (prometheus fallback): " +
-		strings.Join(findings, ", ")}
+	return rep.Result(&p.emitted, coreDNSUpstreamFailingGauge.DeleteLabelValues,
+		"coredns/node-local-dns unready pods (prometheus fallback): ", ", ")
 }

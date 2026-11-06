@@ -8,12 +8,10 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -21,13 +19,13 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
-	"github.com/prometheus/client_golang/prometheus"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // linkerdEndpointSyncCheck is the W9-NM2 linkerd endpoint-sync
@@ -371,38 +369,29 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	emitted := map[string][]string{} // "ns/name" → lvs past the persistence window
+	var rep probefw.SweepReport
 	p.linkerdDesyncSince.Prune(func(k string) bool { _, ok := desynced[k]; return ok })
 	for k, lv := range desynced {
 		if !probefw.Persisted(&p.linkerdDesyncSince, k, now,
 			linkerdEndpointDesyncMinAge, log) {
 			continue
 		}
-		emitted[k] = lv
-		linkerdEndpointDesyncGauge.WithLabelValues(lv...).Set(1)
+		rep.Emit(linkerdEndpointDesyncGauge, k, lv, k)
 	}
-	p.linkerdDesyncEmitted.Reconcile(emitted,
+	rep.Close(&p.linkerdDesyncEmitted,
 		linkerdEndpointDesyncGauge.DeleteLabelValues)
 
 	// Past the window: bounce the oldest linkerd-destination pod so
 	// its endpoint table rebuilds from the current EndpointSlices.
 	// The 1h cooldown is per desynced SERVICE — two services stuck on
 	// the same root cause share one bounce.
-	for k := range emitted {
+	for _, k := range rep.Findings() {
 		p.healLinkerdDestination(ctx, log, k, now, staleSlices[k])
 	}
 
-	if len(emitted) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	keys := make([]string, 0, len(emitted))
-	for k := range emitted {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return probefw.Result{Why: fmt.Sprintf(
-		"meshed services with EndpointSlice desync >=%s: %s",
-		linkerdEndpointDesyncMinAge, strings.Join(keys, ", "))}
+	return rep.Verdict(fmt.Sprintf(
+		"meshed services with EndpointSlice desync >=%s: ",
+		linkerdEndpointDesyncMinAge), ", ")
 }
 
 // healLinkerdDestination repairs a desynced Service on two

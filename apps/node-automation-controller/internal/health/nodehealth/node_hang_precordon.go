@@ -8,20 +8,20 @@ package nodehealth
 import (
 	"context"
 	"fmt"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
-	"github.com/prometheus/client_golang/prometheus"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // nodeHangCheck is the node-hang pre-cordon watchdog.
@@ -163,7 +163,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
 	workers, cordoned := 0, 0
-	var hang []string
+	var rep probefw.SweepReport
 	var uncordon, staleStamp []string
 	for i := range nodes {
 		n := &nodes[i]
@@ -185,7 +185,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 		if latch := nodeHangLatch(n, now); latch != "" {
-			hang = append(hang, n.Name+":"+latch)
+			rep.Find(n.Name + ":" + latch)
 		}
 	}
 
@@ -242,11 +242,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 			"node", name)
 	}
 
-	if len(hang) == 0 {
-		return probefw.Result{Pass: true}
-	}
-	sort.Strings(hang)
-	for _, entry := range hang {
+	for _, entry := range rep.Sorted() {
 		name, _, _ := strings.Cut(entry, ":")
 		var target *corev1.Node
 		for i := range nodes {
@@ -289,5 +285,5 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 		log.Info("CORDON: node carrying a sustained hang latch — unschedulable before NHC/SNR reboots it",
 			"node", name, "condition", entry)
 	}
-	return probefw.Result{Why: "nodes hanging with a pre-reboot latch: " + strings.Join(hang, ", ")}
+	return rep.Verdict("nodes hanging with a pre-reboot latch: ", ", ")
 }

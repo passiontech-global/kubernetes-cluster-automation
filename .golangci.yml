@@ -346,3 +346,15 @@ issues:
 formatters:
   enable:
     - gofmt
+    - gci
+
+  settings:
+    gci:
+      # Import block convention repo-wide: stdlib | third-party |
+      # project-internal (this module + libs/hostkit, which all carry
+      # the github.com/passiontech-global/kubernetes-cluster-automation
+      # prefix).
+      sections:
+        - standard
+        - default
+        - prefix(github.com/passiontech-global/kubernetes-cluster-automation)
