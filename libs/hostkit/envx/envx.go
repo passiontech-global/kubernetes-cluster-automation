@@ -20,6 +20,7 @@
 package envx
 
 import (
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -144,6 +145,13 @@ func DurOr(key string, confSeconds int, def time.Duration) time.Duration {
 		return Duration(key, def)
 	}
 	if confSeconds > 0 {
+		// Same overflow guard as Duration: a conf value past the
+		// int64-second ceiling would wrap to a bogus interval.
+		if int64(confSeconds) > math.MaxInt64/int64(time.Second) {
+			Warnf("conf duration overflows int64 — using default",
+				"env", key, "conf_seconds", confSeconds, "default", def)
+			return def
+		}
 		return time.Duration(confSeconds) * time.Second
 	}
 	return def
@@ -163,6 +171,15 @@ func Duration(key string, def time.Duration) time.Duration {
 	if parsed, err := time.ParseDuration(v); err == nil {
 		d = parsed
 	} else if n, err := strconv.Atoi(v); err == nil {
+		// The bare-integer seconds path must not wrap: values past
+		// MaxInt64/1e9 seconds overflow int64 nanoseconds and can land
+		// on a bogus positive interval the <=0 check below would miss.
+		if int64(n) > math.MaxInt64/int64(time.Second) ||
+			int64(n) < math.MinInt64/int64(time.Second) {
+			Warnf("env duration overflows int64 — using default",
+				"env", key, "value", v, "default", def)
+			return def
+		}
 		d = time.Duration(n) * time.Second
 	} else {
 		// Neither shape parsed — a typo'd knob silently pinned to the
@@ -290,10 +307,14 @@ func GetenvDuration(key string, def time.Duration) time.Duration {
 }
 
 // GetenvFloat reads a float env knob with the same warn-and-fallback
-// contract as GetenvInt.
+// contract as GetenvInt. ParseFloat also accepts "NaN"/"Inf"/"+Inf"/
+// "-Inf" — non-finite values silently corrupt threshold comparisons
+// downstream (NaN != everything, +Inf > everything), so they take the
+// same warn-and-default path as unparseable input.
 func GetenvFloat(key string, def float64) float64 {
 	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
+		if f, err := strconv.ParseFloat(v, 64); err == nil &&
+			!math.IsNaN(f) && !math.IsInf(f, 0) {
 			return f
 		}
 		Warnf("unparseable float env value, using default",
