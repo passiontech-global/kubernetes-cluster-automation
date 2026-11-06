@@ -17,16 +17,15 @@ type EnvDeps struct {
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob kinedb reads
 // and returns a Config ready for New — the env contract lives in the
-// package, not in cmd/agent. Enabled is always true here: the caller
-// only builds the config after the enable gate
-// (NODE_HOST_AGENT_ENABLE_KINEDB=true|auto + Detect) passed.
+// package, not in cmd/agent. The caller only builds the config after
+// the enable gate (NODE_HOST_AGENT_ENABLE_KINEDB=true|auto + Detect)
+// passed.
 func ConfigFromEnv(d EnvDeps) Config {
 	hostPath := d.HostPath
 	if hostPath == nil {
 		hostPath = func(p string) string { return p }
 	}
 	cfg := Config{
-		Enabled:     true,
 		TextfileDir: d.TextfileDir,
 	}
 	// The env surface, one row per knob in declaration order.

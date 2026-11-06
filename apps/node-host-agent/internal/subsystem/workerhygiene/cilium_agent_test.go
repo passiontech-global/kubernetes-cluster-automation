@@ -9,12 +9,14 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 func TestCiliumDownKillsAgent(t *testing.T) {
 	e := fixture(t)
 	e.mkCiliumTask(t, 9300)
-	e.probes[defaultCiliumHealthzURL] = errors.New("refused")
+	e.probes[wdeps.DefaultCiliumHealthzURL] = errors.New("refused")
 	latch := filepath.Join(e.state, "state-cilium-agent-down")
 
 	e.h.Cycle(context.Background())

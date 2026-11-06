@@ -1,0 +1,14 @@
+$schema: 'https://moonrepo.dev/schemas/tasks.json'
+
+# Tasks inherited by every project tagged `docker` (the three apps ship a
+# Dockerfile; hostkit does not). hadolint is pinned in mise.toml — part of
+# the `moon ci` PR gate.
+inheritedBy:
+  tag: 'docker'
+
+tasks:
+  lint-dockerfile:
+    command: 'hadolint Dockerfile'
+    toolchains: 'system'
+    inputs:
+      - 'Dockerfile'

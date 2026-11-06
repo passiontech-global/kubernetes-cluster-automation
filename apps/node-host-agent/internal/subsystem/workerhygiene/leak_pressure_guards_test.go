@@ -22,6 +22,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/guards"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // --- W9-KR3: kernel slab-leak guard ---
@@ -243,7 +246,7 @@ func TestPSIEvictorRSSFloor(t *testing.T) {
 	e2 := fixture(t)
 	thrashEnv(t, e2)
 	pods2 := []corev1.Pod{*psiPod("edge", "app", uidA)}
-	procRSSProc(t, e2, 5001, uidA, minEvictRSSBytes/1024+1)
+	procRSSProc(t, e2, 5001, uidA, guards.MinEvictRSSBytes/1024+1)
 	drivePSI(t, e2, pods2, pidsOf(5001))
 	if evs := evictActions(e2.cs); len(evs) != 1 || evs[0] != "edge" {
 		t.Fatalf("evictions at the RSS floor = %v, want edge", evs)
@@ -429,7 +432,7 @@ func TestPSIEvictorEvictionAPIError(t *testing.T) {
 		t.Fatalf("missing eviction-failure suspect line:\n%s", got)
 	}
 	if got := testutil.ToFloat64(
-		e.h.Actions.WithLabelValues(checkPSIThrash, "pod_evict")); got != 0 {
+		e.h.Actions.WithLabelValues(wdeps.CheckPSIThrash, "pod_evict")); got != 0 {
 		t.Fatalf("pod_evict actions = %v, want 0 on API error", got)
 	}
 }
@@ -678,7 +681,7 @@ func TestCtrIngestGCPruneFailureSuspect(t *testing.T) {
 		t.Fatalf("missing prune-failure suspect line:\n%s", got)
 	}
 	if got := testutil.ToFloat64(
-		e.h.Actions.WithLabelValues(checkIngestGC, "content_gc")); got != 0 {
+		e.h.Actions.WithLabelValues(wdeps.CheckIngestGC, "content_gc")); got != 0 {
 		t.Fatalf("content_gc actions = %v, want 0 on prune failure", got)
 	}
 	// Budget spent → an immediate retry does not re-run the prune.

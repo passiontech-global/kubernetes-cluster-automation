@@ -35,7 +35,6 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) (stri
 func newTestReconciler(t *testing.T, varsDir string) *Reconciler {
 	t.Helper()
 	r, err := New(Config{
-		Enabled:            true,
 		NodeName:           "node-b",
 		HostRoot:           t.TempDir(),
 		VarsDir:            varsDir,

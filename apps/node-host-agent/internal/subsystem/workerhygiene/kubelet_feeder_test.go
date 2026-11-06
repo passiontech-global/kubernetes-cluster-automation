@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/kubelet"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // TestWithDefaultAPIPort covers the backend port defaulting — the
@@ -27,8 +29,8 @@ func TestWithDefaultAPIPort(t *testing.T) {
 		"[::1]:6443":   "[::1]:6443",
 		"[::1]:":       "[::1]:6443",
 	} {
-		if got := withDefaultAPIPort(in); got != want {
-			t.Fatalf("withDefaultAPIPort(%q)=%q want %q", in, got, want)
+		if got := kubelet.WithDefaultAPIPort(in); got != want {
+			t.Fatalf("kubelet.WithDefaultAPIPort(%q)=%q want %q", in, got, want)
 		}
 	}
 }
@@ -50,9 +52,9 @@ func TestKubeletFeederFailThenRestart(t *testing.T) {
 	e.sdReply["restart k0sworker.service"] = ""
 	e.sdReply["reset-failed k0sworker.service"] = ""
 
-	feedTicks(e, defaultKubeletWdMaxFail-1)
-	if e.h.KubeletWdFails != defaultKubeletWdMaxFail-1 {
-		t.Fatalf("fails=%d want %d", e.h.KubeletWdFails, defaultKubeletWdMaxFail-1)
+	feedTicks(e, wdeps.DefaultKubeletWdMaxFail-1)
+	if e.h.KubeletWdFails != wdeps.DefaultKubeletWdMaxFail-1 {
+		t.Fatalf("fails=%d want %d", e.h.KubeletWdFails, wdeps.DefaultKubeletWdMaxFail-1)
 	}
 	if e.sdRan("restart k0sworker") {
 		t.Fatal("restart before MaxFail consecutive fails")
@@ -107,13 +109,13 @@ func TestKubeletFeederGateUptime(t *testing.T) {
 		probes++
 		return false
 	}
-	feedTicks(e, defaultKubeletWdMaxFail)
+	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
 	if e.sdRan("restart k0sworker") {
 		t.Fatal("restart under uptime gate")
 	}
-	if probes != defaultKubeletWdMaxFail+2 {
+	if probes != wdeps.DefaultKubeletWdMaxFail+2 {
 		t.Fatalf("probe calls=%d want %d (4 ticks + 2 re-probes)",
-			probes, defaultKubeletWdMaxFail+2)
+			probes, wdeps.DefaultKubeletWdMaxFail+2)
 	}
 	if !strings.Contains(logLines(t, e), "SKIP(G1-uptime)") {
 		t.Fatalf("missing G1 log:\n%s", logLines(t, e))
@@ -125,7 +127,7 @@ func TestKubeletFeederGateSettle(t *testing.T) {
 	// k0sworker restarted a minute ago — kubelet may still be initing
 	// (uptimeµs - 60s → age 60s < 180s settle window).
 	e.sdReply["ActiveEnterTimestampMonotonic --value k0sworker.service"] = "7140500000\n"
-	feedTicks(e, defaultKubeletWdMaxFail)
+	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
 	if e.sdRan("restart k0sworker") {
 		t.Fatal("restart inside the 180s settle window")
 	}
@@ -137,7 +139,7 @@ func TestKubeletFeederGateSettle(t *testing.T) {
 func TestKubeletFeederGateOverload(t *testing.T) {
 	e := fixture(t)
 	writeFile(t, filepath.Join(e.state, "state-node-overloaded"), "1\n")
-	feedTicks(e, defaultKubeletWdMaxFail)
+	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
 	if e.sdRan("restart k0sworker") {
 		t.Fatal("restart under node-overloaded")
 	}
@@ -151,7 +153,7 @@ func TestKubeletFeederGateAPIServer(t *testing.T) {
 	// No backends configured → fallback api-local-lb livez is probed;
 	// dead → node isolated → no restart.
 	e.probes[e.h.Cfg.Kubelet.APIFallbackURL] = errors.New("refused")
-	feedTicks(e, defaultKubeletWdMaxFail)
+	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
 	if e.sdRan("restart k0sworker") {
 		t.Fatal("restart while API unreachable")
 	}
@@ -170,7 +172,7 @@ func TestKubeletFeederGateAPIServerNon200StillLive(t *testing.T) {
 	e.status[e.h.Cfg.Kubelet.APIFallbackURL] = 503
 	e.sdReply["restart k0sworker.service"] = ""
 	e.sdReply["reset-failed k0sworker.service"] = ""
-	feedTicks(e, defaultKubeletWdMaxFail)
+	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
 	if strings.Contains(logLines(t, e), "SKIP(G4-apiserver)") {
 		t.Fatalf("G4 skipped on a 503 answer — listener is alive:\n%s",
 			logLines(t, e))
@@ -196,7 +198,7 @@ func TestKubeletFeederGateAPIServerConfiguredBackends(t *testing.T) {
 	// 10.0.0.10 unconfigured → probe map default nil = alive.
 	e.probes[e.h.Cfg.Kubelet.APIFallbackURL] = errors.New("refused")
 	e.sdReply["restart k0sworker.service"] = ""
-	feedTicks(e, defaultKubeletWdMaxFail)
+	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
 	if !e.sdRan("restart k0sworker.service") {
 		t.Fatal("restart blocked although a configured backend is live")
 	}
@@ -208,7 +210,7 @@ func TestKubeletFeederGateRateLimitLatches(t *testing.T) {
 	writeFile(t, filepath.Join(e.state, "last-restart"),
 		fmt.Sprintf("%d\n", e.now.Unix()))
 	latch := filepath.Join(e.state, "state-kubelet-healthz-down")
-	feedTicks(e, defaultKubeletWdMaxFail)
+	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
 	if e.sdRan("restart k0sworker") {
 		t.Fatal("restart inside 30m cooldown")
 	}
@@ -238,7 +240,7 @@ func TestKubeletFeederStandsDownWhenWorkerInactive(t *testing.T) {
 	latch := filepath.Join(e.state, "state-kubelet-healthz-down")
 	writeFile(t, latch, "1\n")
 	e.sdReply["systemctl is-active k0sworker.service"] = "inactive\n"
-	feedTicks(e, defaultKubeletWdMaxFail+1)
+	feedTicks(e, wdeps.DefaultKubeletWdMaxFail+1)
 	if e.h.KubeletWdFails != 0 {
 		t.Fatalf("fails=%d want 0 while k0sworker inactive", e.h.KubeletWdFails)
 	}
@@ -308,9 +310,9 @@ func TestKubeletRemediateReprobeSelfCorrects(t *testing.T) {
 	var probes int
 	e.h.Cfg.Seams.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
 		probes++
-		return probes > defaultKubeletWdMaxFail // ticks 1..4 fail, re-probe 1 OK
+		return probes > wdeps.DefaultKubeletWdMaxFail // ticks 1..4 fail, re-probe 1 OK
 	}
-	feedTicks(e, defaultKubeletWdMaxFail)
+	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
 	if e.sdRan("restart k0sworker") {
 		t.Fatal("restart despite re-probe self-correct (steal blip kills kubelets)")
 	}
@@ -324,8 +326,8 @@ func TestKubeletRemediateReprobeSelfCorrects(t *testing.T) {
 		t.Fatalf("missing G0 log:\n%s", logLines(t, e))
 	}
 	// One "ok" exits early — exactly one re-probe call, not two.
-	if probes != defaultKubeletWdMaxFail+1 {
-		t.Fatalf("probes=%d want %d (4 ticks + 1 re-probe)", probes, defaultKubeletWdMaxFail+1)
+	if probes != wdeps.DefaultKubeletWdMaxFail+1 {
+		t.Fatalf("probes=%d want %d (4 ticks + 1 re-probe)", probes, wdeps.DefaultKubeletWdMaxFail+1)
 	}
 }
 
@@ -335,14 +337,14 @@ func TestKubeletRemediateReprobeSecondProbeOK(t *testing.T) {
 	var probes int
 	e.h.Cfg.Seams.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
 		probes++
-		return probes > defaultKubeletWdMaxFail+1
+		return probes > wdeps.DefaultKubeletWdMaxFail+1
 	}
-	feedTicks(e, defaultKubeletWdMaxFail)
+	feedTicks(e, wdeps.DefaultKubeletWdMaxFail)
 	if e.sdRan("restart k0sworker") {
 		t.Fatal("restart although the second re-probe answered")
 	}
-	if probes != defaultKubeletWdMaxFail+2 {
-		t.Fatalf("probes=%d want %d (4 ticks + 2 re-probes)", probes, defaultKubeletWdMaxFail+2)
+	if probes != wdeps.DefaultKubeletWdMaxFail+2 {
+		t.Fatalf("probes=%d want %d (4 ticks + 2 re-probes)", probes, wdeps.DefaultKubeletWdMaxFail+2)
 	}
 }
 

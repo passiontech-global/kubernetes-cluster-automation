@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // --- A5: journald integrity ---
@@ -105,13 +108,13 @@ func TestJournalUnreadableLatchesAfterConsecFails(t *testing.T) {
 	// journalOnce snapshot + the A5 probe) — one cycle is a streak
 	// below Needed, three must have latched.
 	e.h.Cycle(context.Background())
-	if e.h.State.Exists(stateJournalUnreadable) {
+	if e.h.State.Exists(hoststate.LatchJournalUnreadable) {
 		t.Fatal("latched before the streak reached Needed")
 	}
 	for i := 0; i < 2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.State.Exists(stateJournalUnreadable) {
+	if !e.h.State.Exists(hoststate.LatchJournalUnreadable) {
 		t.Fatal("state-journal-unreadable not latched after persistent read failures")
 	}
 	if n := strings.Count(logLines(t, e), "suspect: journal-unreadable"); n != 1 {
@@ -130,16 +133,16 @@ func TestJournalUnreadableClearsOnRecovery(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
 	e.journalErr = errors.New("signal: killed")
-	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
+	for i := 0; i < wdeps.DefaultJournalUnreadableNeeded; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.State.Exists(stateJournalUnreadable) {
+	if !e.h.State.Exists(hoststate.LatchJournalUnreadable) {
 		t.Fatal("precondition: latch should be held")
 	}
 	e.journalErr = nil
 	e.journal = "Oct 01 node k0sworker: healthy line\n"
 	e.h.Cycle(context.Background())
-	if e.h.State.Exists(stateJournalUnreadable) {
+	if e.h.State.Exists(hoststate.LatchJournalUnreadable) {
 		t.Fatal("latch not cleared on first healthy read")
 	}
 	if n := strings.Count(logLines(t, e), "STATE-EXIT: journal-unreadable"); n != 1 {
@@ -154,10 +157,10 @@ func TestJournalUnreadableNoFireWithoutJournalDir(t *testing.T) {
 	// config, not a failure: reads failing forever must never latch.
 	e.h.JournalReads.Dirs = []string{filepath.Join(t.TempDir(), "missing")}
 	e.journalErr = errors.New("signal: killed")
-	for i := 0; i < defaultJournalUnreadableNeeded+2; i++ {
+	for i := 0; i < wdeps.DefaultJournalUnreadableNeeded+2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if e.h.State.Exists(stateJournalUnreadable) {
+	if e.h.State.Exists(hoststate.LatchJournalUnreadable) {
 		t.Fatal("latched without any journal storage — must not fire")
 	}
 	if n := strings.Count(logLines(t, e), "suspect: journal-unreadable"); n != 0 {
@@ -170,10 +173,10 @@ func TestJournalUnreadableEmptyWindowSilentJournaldFires(t *testing.T) {
 	e.sdReply["is-active k0sworker.service"] = "active"
 	e.journal = ""                    // empty 10m k0sworker window
 	e.sdReply["journalctl -n 1"] = "" // …and journald-wide silence
-	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
+	for i := 0; i < wdeps.DefaultJournalUnreadableNeeded; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.State.Exists(stateJournalUnreadable) {
+	if !e.h.State.Exists(hoststate.LatchJournalUnreadable) {
 		t.Fatal("journald-wide silence should latch journal-unreadable")
 	}
 }
@@ -184,10 +187,10 @@ func TestJournalUnreadableQuietUnitNoFire(t *testing.T) {
 	e.journal = "" // quiet k0sworker window…
 	e.sdReply["journalctl -n 1"] =
 		"Oct 01 node systemd[1]: Started Daily Cleanup.\n" // …but journald answers
-	for i := 0; i < defaultJournalUnreadableNeeded+2; i++ {
+	for i := 0; i < wdeps.DefaultJournalUnreadableNeeded+2; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if e.h.State.Exists(stateJournalUnreadable) {
+	if e.h.State.Exists(hoststate.LatchJournalUnreadable) {
 		t.Fatal("quiet unit on healthy journald must not latch")
 	}
 }
@@ -196,10 +199,10 @@ func TestJournalUnreadableFilesGoneMarkerFires(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["is-active k0sworker.service"] = "active"
 	e.journal = "No journal files were found.\n"
-	for i := 0; i < defaultJournalUnreadableNeeded; i++ {
+	for i := 0; i < wdeps.DefaultJournalUnreadableNeeded; i++ {
 		e.h.Cycle(context.Background())
 	}
-	if !e.h.State.Exists(stateJournalUnreadable) {
+	if !e.h.State.Exists(hoststate.LatchJournalUnreadable) {
 		t.Fatal("'No journal files' reads should latch journal-unreadable")
 	}
 }

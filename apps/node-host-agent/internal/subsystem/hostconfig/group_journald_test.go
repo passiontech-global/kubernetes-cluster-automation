@@ -18,7 +18,7 @@ func standaloneJournaldEnv(t *testing.T, res map[string]string, errs map[string]
 	t.Helper()
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: res, errs: errs}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Standalone: true, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)

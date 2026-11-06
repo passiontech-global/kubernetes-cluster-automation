@@ -101,7 +101,8 @@ const (
 	// check silently seeing "0 hits").
 	DefaultJournalUnreadableNeeded = 5
 
-	// runtime domain (was runtime_resource_guards.go).
+	// runtime domain (was runtime_resource_guards.go — now the
+	// runtime_<name>.go family).
 	// defaultCgroupRoot is the host cgroup-v2 unified hierarchy as a
 	// host-absolute path — ConfigFromEnv resolves it through
 	// hostPath ("/host"-prefixed in the DaemonSet, verbatim on a

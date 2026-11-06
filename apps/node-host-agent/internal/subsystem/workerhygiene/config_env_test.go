@@ -9,12 +9,13 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
-func testEnvDeps(t *testing.T) EnvDeps {
+func testEnvDeps(t *testing.T) wdeps.EnvDeps {
 	t.Helper()
-	return EnvDeps{
+	return wdeps.EnvDeps{
 		Client:                  testutil.FakeKube(),
 		NodeName:                "node-a",
 		Systemd:                 systemd.New(systemd.Config{HostRoot: "/"}),
@@ -44,11 +45,8 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR", "/custom/sessions")
 
 	d := testEnvDeps(t)
-	cfg := ConfigFromEnv(d)
+	cfg := wdeps.ConfigFromEnv(d)
 
-	if !cfg.Enabled {
-		t.Fatal("Enabled should be true — the enable gate stays in the caller")
-	}
 	if cfg.Client != d.Client {
 		t.Fatal("Client not passed through")
 	}
@@ -70,7 +68,7 @@ func TestConfigFromEnv(t *testing.T) {
 		t.Fatalf("ProcRoot=%q", cfg.ProcRoot)
 	}
 	// hostPath-joined defaults — the "/host" prefix must come from
-	// EnvDeps.HostPath, not the package's "/host"-hardcoded defaults.
+	// wdeps.EnvDeps.HostPath, not the package's "/host"-hardcoded defaults.
 	if cfg.CtrTaskRoot != "/host/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io" {
 		t.Fatalf("CtrTaskRoot=%q", cfg.CtrTaskRoot)
 	}
@@ -110,11 +108,11 @@ func TestConfigFromEnv(t *testing.T) {
 func TestConfigFromEnvDefaults(t *testing.T) {
 	// No env set: package defaults + hostPath join + wdCfg fallback.
 	d := testEnvDeps(t)
-	cfg := ConfigFromEnv(d)
-	if cfg.Interval != defaultInterval {
-		t.Fatalf("Interval=%v want %v", cfg.Interval, defaultInterval)
+	cfg := wdeps.ConfigFromEnv(d)
+	if cfg.Interval != wdeps.DefaultInterval {
+		t.Fatalf("Interval=%v want %v", cfg.Interval, wdeps.DefaultInterval)
 	}
-	if cfg.Kubelet.TokenPath != defaultKubeletTokenPath {
+	if cfg.Kubelet.TokenPath != wdeps.DefaultKubeletTokenPath {
 		t.Fatalf("KubeletTokenPath=%q", cfg.Kubelet.TokenPath)
 	}
 	if cfg.Cilium.Socket != "/host/run/cilium/cilium.sock" {
@@ -133,7 +131,7 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 		t.Fatalf("KubeletWatchdogHosts=%v want nil", cfg.Kubelet.WatchdogHosts)
 	}
 	// nil Watchdog → no APIBackends, no panic.
-	cfg = ConfigFromEnv(EnvDeps{Client: d.Client, NodeName: "n"})
+	cfg = wdeps.ConfigFromEnv(wdeps.EnvDeps{Client: d.Client, NodeName: "n"})
 	if cfg.APIBackends != nil {
 		t.Fatalf("APIBackends=%v want nil", cfg.APIBackends)
 	}
@@ -147,12 +145,12 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	}
 }
 
-// --- kubeletWatchdogHosts (ported from cmd/agent's main_test) ---
+// --- wdeps.KubeletWatchdogHosts (ported from cmd/agent's main_test) ---
 
 func TestKubeletWatchdogHosts(t *testing.T) {
 	t.Run("env list wins", func(t *testing.T) {
 		t.Setenv("NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS", "a , b")
-		got := kubeletWatchdogHosts(t.TempDir(), "n")
+		got := wdeps.KubeletWatchdogHosts(t.TempDir(), "n")
 		if len(got) != 2 || got[0] != "a" || got[1] != "b" {
 			t.Fatalf("env hosts=%v", got)
 		}
@@ -168,14 +166,14 @@ func TestKubeletWatchdogHosts(t *testing.T) {
 			[]byte("systemd_watchdog_hosts:\n  - node-x\n  - node-y\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		got := kubeletWatchdogHosts(dir, "node-a")
+		got := wdeps.KubeletWatchdogHosts(dir, "node-a")
 		if len(got) != 2 || got[0] != "node-x" || got[1] != "node-y" {
 			t.Fatalf("vars hosts=%v", got)
 		}
 	})
 
 	t.Run("missing vars dir is nil not error", func(t *testing.T) {
-		if got := kubeletWatchdogHosts(t.TempDir(), "n"); got != nil {
+		if got := wdeps.KubeletWatchdogHosts(t.TempDir(), "n"); got != nil {
 			t.Fatalf("hosts=%v want nil", got)
 		}
 	})

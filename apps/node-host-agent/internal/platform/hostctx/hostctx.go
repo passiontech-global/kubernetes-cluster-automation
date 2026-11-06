@@ -1,10 +1,10 @@
 // hostctx.go — the shared "watchdog/host context" bundle: the
-// host-side inputs cmd/agent's buildAgentConfig resolves ONCE
-// (the hostPath join over the host-fs root, the parsed
+// host-side inputs resolved ONCE per process by DepsFromEnv
+// (deps_env.go — the hostPath join over the host-fs root, the parsed
 // node-watchdog.conf plus its per-cycle reloader, the shared
 // systemd client, the journald blindness-detector inputs, and the
 // shared state/log/vars/textfile dirs + resolved node name) and
-// then splices into every subsystem's EnvDeps. Each EnvDeps embeds
+// then spliced into every subsystem's EnvDeps. Each EnvDeps embeds
 // Deps anonymously so ConfigFromEnv keeps reading d.Watchdog,
 // d.HostPath(...) etc. via field promotion; subsystem-unique inputs
 // (kube client, hostname, standalone flag, …) stay named fields on
@@ -17,7 +17,7 @@ import (
 )
 
 // Deps is the shared watchdog/host context — one value per process,
-// built in cmd/agent and spliced verbatim into every subsystem
+// built by DepsFromEnv and spliced verbatim into every subsystem
 // EnvDeps that needs any of it. Fields a subsystem does not consume
 // stay zero-valued in its view of the bundle; nil Watchdog/Systemd/
 // HostPath degrade exactly like the nil-dep contracts the

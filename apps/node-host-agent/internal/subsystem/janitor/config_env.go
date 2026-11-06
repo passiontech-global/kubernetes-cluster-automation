@@ -19,13 +19,11 @@ type EnvDeps struct {
 // ConfigFromEnv resolves the NODE_HOST_AGENT_* knobs the
 // watchdog-state janitor reads and returns a Config ready for
 // New — the env contract lives in the package, not in
-// cmd/agent. Enabled is always true here: the wire func set it
-// unconditionally and the enable gate
+// cmd/agent. The enable gate
 // (NODE_HOST_AGENT_ENABLE_JANITOR) stays in the caller. Consumes only
 // EnvDeps.WatchdogStateDir, .WatchdogLogFile and .Systemd.
 func ConfigFromEnv(d EnvDeps) Config {
 	cfg := Config{
-		Enabled:          true,
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogLogFile:  d.WatchdogLogFile,
 		Systemd:          d.Systemd,

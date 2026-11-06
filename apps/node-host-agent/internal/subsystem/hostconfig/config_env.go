@@ -24,8 +24,8 @@ type EnvDeps struct {
 // DirectRunner; anything else nsenters into PID 1 like the retired
 // ansible pod did) and the DirWatcher construction (vars dir +
 // nebula certs mount — vars/cert changes converge on the next poll
-// instead of waiting out the full interval). Enabled is always true
-// here: the caller only builds the config after the enable gate
+// instead of waiting out the full interval). The caller only builds
+// the config after the enable gate
 // (NODE_HOST_AGENT_ENABLE_HOSTCONFIG=true|auto + the vars-dir
 // defaults.yaml probe) passed.
 func ConfigFromEnv(d EnvDeps) Config {
@@ -34,7 +34,6 @@ func ConfigFromEnv(d EnvDeps) Config {
 		runner = DirectRunner{}
 	}
 	cfg := Config{
-		Enabled:  true,
 		NodeName: d.NodeName,
 		Hostname: d.Hostname,
 		HostRoot: d.HostRoot,

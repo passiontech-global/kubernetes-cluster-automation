@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -132,28 +133,77 @@ var (
 		nil, nil)
 )
 
+// cpuDeliveredProbe is the busy-loop probe's bookkeeping — one
+// slice of what used to be the Collector's shared mu-guarded
+// fields. The probe itself runs in a goroutine: a scrape re-arms it
+// and serves the last result — a scrape must never block up to ~6s
+// on steal measurement. The mutex is private; the probe shares no
+// state with the other domains.
+type cpuDeliveredProbe struct {
+	mu      sync.Mutex
+	running bool
+	last    time.Time
+	ratio   float64
+	wall    float64
+	ok      bool
+	sink    uint64 // busy-loop sink, mu-guarded
+}
+
+// rearm reports whether a fresh probe should start: false while one
+// is in flight or while interval hasn't elapsed since the last
+// completion. A true return marks the probe running — the caller
+// MUST call complete when the measurement finishes.
+func (p *cpuDeliveredProbe) rearm(now time.Time,
+	interval time.Duration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.running || now.Sub(p.last) < interval {
+		return false
+	}
+	p.running = true
+	return true
+}
+
+// complete parks a finished probe's result — a failed measurement
+// (ok=false) leaves the last good result served.
+func (p *cpuDeliveredProbe) complete(now time.Time, ratio, wall float64,
+	ok bool) {
+	p.mu.Lock()
+	p.running = false
+	p.last = now
+	if ok {
+		p.ratio, p.wall, p.ok = ratio, wall, true
+	}
+	p.mu.Unlock()
+}
+
+// setSink records the busy-loop's checksum sink — kept mu-guarded
+// so the compiler can't prove the loop dead.
+func (p *cpuDeliveredProbe) setSink(sink uint64) {
+	p.mu.Lock()
+	p.sink = sink
+	p.mu.Unlock()
+}
+
+// result returns the last completed measurement — ok=false before
+// the first one finishes.
+func (p *cpuDeliveredProbe) result() (ratio, wall float64, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ratio, p.wall, p.ok
+}
+
 // maybeMeasureCPU re-arms the busy-loop probe every
 // CPUDeliveredInterval. The probe itself runs in a goroutine so a
 // scrape never blocks on wall-clock steal; the gauges serve the last
 // completed measurement.
 func (c *Collector) maybeMeasureCPU() {
-	c.mu.Lock()
-	if c.cpuRunning ||
-		c.cfg.nowFn().Sub(c.cpuLast) < c.cfg.CPUDeliveredInterval {
-		c.mu.Unlock()
+	if !c.cpu.rearm(c.cfg.nowFn(), c.cfg.CPUDeliveredInterval) {
 		return
 	}
-	c.cpuRunning = true
-	c.mu.Unlock()
 	go func() {
 		ratio, wall, ok := c.measureCPU()
-		c.mu.Lock()
-		c.cpuRunning = false
-		c.cpuLast = c.cfg.nowFn()
-		if ok {
-			c.cpuRatio, c.cpuWall, c.cpuOK = ratio, wall, true
-		}
-		c.mu.Unlock()
+		c.cpu.complete(c.cfg.nowFn(), ratio, wall, ok)
 		if !ok {
 			logger().Warn("hostmetrics: cpu-delivered probe did not " +
 				"complete — serving previous result",
@@ -197,9 +247,7 @@ func (c *Collector) measureCPU() (ratio, wall float64, ok bool) {
 			}
 		}
 	}
-	c.mu.Lock()
-	c.cpuSink = sink
-	c.mu.Unlock()
+	c.cpu.setSink(sink)
 	wall = time.Since(wall0).Seconds()
 	if wall <= 0 {
 		return 0, 0, false
@@ -215,9 +263,7 @@ func (c *Collector) measureCPU() (ratio, wall float64, ok bool) {
 // the first measurement (shell: no cpu-delivered file → no metric,
 // never a fake 0).
 func (c *Collector) collectCPUDelivered(ch chan<- prometheus.Metric) {
-	c.mu.Lock()
-	ok, ratio, wall := c.cpuOK, c.cpuRatio, c.cpuWall
-	c.mu.Unlock()
+	ratio, wall, ok := c.cpu.result()
 	if !ok {
 		return
 	}

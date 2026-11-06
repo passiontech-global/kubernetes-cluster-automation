@@ -8,6 +8,8 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/yaml"
@@ -55,21 +57,39 @@ func kcmExtraArgKeys(parsed map[string]any) []string {
 	return keys
 }
 
-// k0sConfig returns the raw bytes and parsed form of k0s.yaml,
-// re-reading only when the file's mtime+size changed since the last
-// scrape. ok=false means the file was unreadable or unparseable at
-// read time — the caller keeps the old drift=1 "unreadable" finding.
-func (c *Collector) k0sConfig() (data []byte, parsed map[string]any, ok bool) {
-	fi, err := os.Stat(c.cfg.K0sConfigFile)
+// k0sDriftCache is the k0s.yaml read/parse cache — one slice of
+// what used to be the Collector's shared mu-guarded fields. The
+// file changes on k0s upgrades (rare), not per scrape — a
+// stat+mtime+size check gates the re-read/re-parse. A failed stat
+// serves no stale data. The mutex is private — the drift domain
+// shares no state with the other domains.
+type k0sDriftCache struct {
+	mu     sync.Mutex
+	loaded bool
+	mtime  time.Time
+	size   int64
+	data   []byte
+	parsed map[string]any
+	ok     bool
+}
+
+// get returns the raw bytes and parsed form of the k0s.yaml at
+// path, re-reading only when the file's mtime+size changed since
+// the last call. ok=false means the file was unreadable or
+// unparseable at read time — the caller keeps the old drift=1
+// "unreadable" finding.
+func (s *k0sDriftCache) get(path string) (data []byte,
+	parsed map[string]any, ok bool) {
+	fi, err := os.Stat(path)
 	if err != nil {
 		return nil, nil, false // gone/un-statable → never serve cache
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.k0sLoaded && fi.ModTime().Equal(c.k0sMtime) && fi.Size() == c.k0sSize {
-		return c.k0sData, c.k0sParsed, c.k0sOK
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loaded && fi.ModTime().Equal(s.mtime) && fi.Size() == s.size {
+		return s.data, s.parsed, s.ok
 	}
-	data, err = os.ReadFile(c.cfg.K0sConfigFile)
+	data, err = os.ReadFile(path)
 	var p map[string]any
 	var uerr error
 	if err == nil {
@@ -85,15 +105,15 @@ func (c *Collector) k0sConfig() (data []byte, parsed map[string]any, ok bool) {
 		// not once per scrape.
 		logger().Debug("hostmetrics: k0s config unreadable/unparseable — "+
 			"drift reports {unreadable,k0s.yaml}",
-			"path", c.cfg.K0sConfigFile,
+			"path", path,
 			"error", cause)
 	}
-	c.k0sLoaded = true
-	c.k0sMtime = fi.ModTime()
-	c.k0sSize = fi.Size()
-	c.k0sData = data
-	c.k0sParsed = p
-	c.k0sOK = ok
+	s.loaded = true
+	s.mtime = fi.ModTime()
+	s.size = fi.Size()
+	s.data = data
+	s.parsed = p
+	s.ok = ok
 	return data, p, ok
 }
 
@@ -158,7 +178,7 @@ func (c *Collector) collectK0sDrift(ch chan<- prometheus.Metric) {
 	if _, err := os.Stat(c.cfg.K0sUnitFile); err != nil {
 		return // not a k0s controller → no series
 	}
-	data, parsed, ok := c.k0sConfig()
+	data, parsed, ok := c.k0s.get(c.cfg.K0sConfigFile)
 	findings := scanK0sDrift(data, parsed, ok, c.removedFlagRe,
 		c.expectedKCM, c.cfg.ExpectedKCMArgs)
 	if len(findings) == 0 {

@@ -85,12 +85,12 @@ type oomKillCtx struct {
 	comm  string // task= comm when present
 }
 
-// kernelScanState is the per-Collector scanner state — the kmsg fd
-// session plus the cross-line OOM pairing. NetHealth-style keyed
-// state because the Latches wrapper is recreated per call — the
-// Collector underneath is the stable identity.
+// kernelScanState is the per-Collector scanner state — the kmsg
+// tail session plus the cross-line OOM pairing. NetHealth-style
+// keyed state because the Latches wrapper is recreated per call —
+// the Collector underneath is the stable identity.
 type kernelScanState struct {
-	sess       *kmsgSession // nil until /dev/kmsg opens
+	sess       *kmsgSession // nil until the session is (re)built
 	oomPending *oomKillCtx  // constraint line awaiting its kill line
 }
 
@@ -105,15 +105,15 @@ func (l *Latches) kernelScan() *kernelScanState {
 	return actual.(*kernelScanState)
 }
 
-// kmsgSession is the open /dev/kmsg handle + ring position. The fd
-// stays open across ticks: each drain reads only NEW records (the
-// kernel advances the read offset), so the kmsg-cursor file only
-// matters across agent restarts.
+// kmsgSession is the consumer half of the /dev/kmsg tail: the
+// kmsg.Tailer underneath owns the fd, the partial-line carry and
+// the backlog gates — only seq (resume-cursor dedup) is consumer
+// state. The fd stays open across ticks: each drain reads only NEW
+// records (the kernel advances the read offset), so the kmsg-cursor
+// file only matters across agent restarts.
 type kmsgSession struct {
-	f       *os.File
-	pending []byte // partial-line carry between reads
-	primed  bool   // first-open backlog disposition decided
-	seq     uint64 // highest record seq consumed (resume dedup)
+	tail *kmsg.Tailer
+	seq  uint64 // highest record seq consumed (resume dedup)
 }
 
 // kmsgRecord is one parsed kmsg record — seq/usec for cursor resume,
@@ -245,37 +245,52 @@ func parseKmsgRecord(line string) (kmsgRecord, bool) {
 // inconclusive — no markers, no latch movement.
 func (l *Latches) checkKernelDmesg() {
 	st := l.kernelScan()
-	if st.sess != nil || l.openKMSSession(st) {
-		if l.drainKmsg(st) {
-			return
-		}
-		// Read/open failure — drop the session; the dmesg fallback
-		// covers this tick and kmsg is retried next tick.
-		l.closeKMSSession(st)
+	if st.sess == nil {
+		st.sess = l.newKmsgSession()
 	}
+	if l.drainKmsg(st) {
+		return
+	}
+	// Read/open failure — drop the session; the dmesg fallback
+	// covers this tick and kmsg is retried next tick.
+	l.closeKMSSession(st)
 	l.drainDmesg(st)
 }
 
-// openKMSSession tries the kmsgDevicePaths candidates and parks the
-// first openable fd on the state.
-func (l *Latches) openKMSSession(st *kernelScanState) bool {
-	if f := kmsg.Open(kmsgDevicePaths(l.c.cfg.HostRoot)...); f != nil {
-		st.sess = &kmsgSession{f: f}
-		return true
-	}
-	return false
+// newKmsgSession builds the tail session — the Tailer opens the
+// device lazily on its first Read, so a missing /dev/kmsg surfaces
+// as kmsg.ErrNoDevice inside drainKmsg on the same tick a failed
+// open used to.
+func (l *Latches) newKmsgSession() *kmsgSession {
+	return &kmsgSession{tail: kmsg.NewTailer(kmsg.TailerOptions{
+		// Re-evaluated per (re)open — kmsgDevicePaths is the test
+		// seam that points the session at a fixture file.
+		Paths: func() []string {
+			return kmsgDevicePaths(l.c.cfg.HostRoot)
+		},
+		// The pending carry counts against the tick's drain budget —
+		// the cap bounds pending+fresh bytes, not just the fd reads.
+		DrainCap:             kmsgDrainCap,
+		DrainIncludesPending: true,
+		PendingCap:           kmsgMaxPending,
+		// One record can't sanely exceed the cap — drop the carry.
+		PendingTrimTail: false,
+		// Bytes delivered before a hard error still classify.
+		KeepPartialOnError: true,
+	})}
 }
 
 func (l *Latches) closeKMSSession(st *kernelScanState) {
 	if st.sess != nil {
-		_ = st.sess.f.Close()
+		st.sess.tail.Close()
 		st.sess = nil
 	}
 }
 
 // drainKmsg reads every record the kernel currently offers (bounded
-// by kmsgDrainCap), classifies the new ones and advances the cursor.
-// Returns false when the fd itself fails — the caller falls back.
+// by the tailer's kmsgDrainCap), classifies the new ones and
+// advances the cursor. Returns false when the device itself fails —
+// the caller falls back.
 func (l *Latches) drainKmsg(st *kernelScanState) bool {
 	sess := st.sess
 	cur := l.readKmsgCursor()
@@ -294,23 +309,21 @@ func (l *Latches) drainKmsg(st *kernelScanState) bool {
 		sess.seq = cur.seq
 	}
 
-	recs, maxSeq, maxUsec, err := l.readKmsgAvail(sess)
+	recs, res, maxSeq, maxUsec, err := l.readKmsgAvail(sess)
 	if err != nil {
 		return false
 	}
-	if !sess.primed && !resume {
+	if res.First && !resume {
 		// First-ever open (or post-reboot): the ring holds the whole
 		// retained backlog — history, not news. Discard it and park
 		// the position at the tail so only NEW records classify.
 		// (A valid resume cursor skips by seq instead — those old
 		// records were already processed pre-restart.)
 		sess.seq = maxSeq
-		sess.primed = true
 		l.writeKmsgCursor(&kmsgCursor{
 			mode: "kmsg", bootID: bootID, seq: sess.seq, usec: maxUsec})
 		return true
 	}
-	sess.primed = true
 	for _, r := range recs {
 		if resume && (!r.parsed || r.seq <= minSeq) {
 			continue
@@ -330,29 +343,21 @@ func (l *Latches) drainKmsg(st *kernelScanState) bool {
 	return true
 }
 
-// readKmsgAvail drains the fd until EAGAIN/EOF/cap, carrying a
-// partial trailing line in sess.pending. Returns the parsed records
-// plus the highest seq/usec seen (0 when nothing parsed).
+// readKmsgAvail drains the fd until EAGAIN/EOF/cap through the
+// session's Tailer (it owns the pending carry) and returns the
+// parsed records, the read's place in the handle lifecycle (the
+// First gate is the backlog-disposition check), and the highest
+// seq/usec seen (0 when nothing parsed).
 func (l *Latches) readKmsgAvail(sess *kmsgSession) (
-	[]kmsgRecord, uint64, int64, error) {
-	// The pending carry counts against this tick's drain budget —
-	// the cap bounds pending+fresh bytes, not just the fd reads.
-	pending := sess.pending
-	sess.pending = nil
-	fresh, _, err := kmsg.Drain(sess.f, kmsgDrainCap-len(pending))
+	[]kmsgRecord, kmsg.ReadResult, uint64, int64, error) {
+	raw, res, err := sess.tail.Read()
 	if err != nil {
-		if len(fresh) == 0 {
-			// Hard error with nothing delivered — the carry is
-			// already consumed; the caller drops the session.
-			return nil, 0, 0, err
-		}
-		// Delivered bytes + a sticky error — keep them.
+		return nil, res, 0, 0, err
 	}
 	var recs []kmsgRecord
 	var maxSeq uint64
 	var maxUsec int64
-	lines, rest := kmsg.SplitLines(pending, fresh)
-	for _, lb := range lines {
+	for _, lb := range raw {
 		line := string(lb)
 		if r, ok := parseKmsgRecord(line); ok {
 			recs = append(recs, r)
@@ -368,13 +373,7 @@ func (l *Latches) readKmsgAvail(sess *kmsgSession) (
 			recs = append(recs, kmsgRecord{msg: line})
 		}
 	}
-	if len(rest) > kmsgMaxPending {
-		// A single record can't exceed this sanely — drop the
-		// carry rather than grow without bound.
-		rest = nil
-	}
-	sess.pending = rest
-	return recs, maxSeq, maxUsec, nil
+	return recs, res, maxSeq, maxUsec, nil
 }
 
 // classifyKernelLine feeds one kernel message into the detectors.

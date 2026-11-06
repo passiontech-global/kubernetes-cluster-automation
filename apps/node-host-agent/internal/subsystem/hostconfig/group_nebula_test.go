@@ -19,7 +19,7 @@ func TestHairpinPruneOnlyOnLighthouse(t *testing.T) {
 	sr := &scriptedRunner{res: map[string]string{
 		"ip -o route get 10.0.2.20 mark 0x1000": "10.0.2.20 via 10.0.1.30 dev eth0 src 10.0.1.10 mark 0x1000",
 	}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -38,7 +38,7 @@ func TestHairpinPruneOnlyOnLighthouse(t *testing.T) {
 
 	// non-lighthouse node: no hairpin probing at all
 	sr2 := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r2, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r2, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr2}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +127,7 @@ func TestNebulaEmptyVersionPinSkips(t *testing.T) {
 		"/usr/local/bin/nebula -version": "nebula version 9.9.9",
 	}, errs: map[string]bool{}}
 	dl := t.TempDir()
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -150,7 +150,7 @@ func TestNebulaEmptyVersionPinSkips(t *testing.T) {
 func TestNebulaRoutingRefusesBadVar(t *testing.T) {
 	vars := writeVarsDir(t, `interdc_marker_base: "172.29.0;rm -rf /"`)
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -185,7 +185,7 @@ node-b:
 		t.Fatal(err)
 	}
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +208,7 @@ node-b:
 func TestNebulaDisableRunsUnconditionalCleanup(t *testing.T) {
 	vars := writeVarsDir(t, "interdc_nebula_enabled: false\ninterdc_marker_base: \"172.29.0;rm -rf /\"\n")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)

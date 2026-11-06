@@ -57,7 +57,6 @@ func jfixture(t *testing.T) *jenv {
 	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: e.sd.Run,
 		ProcUptimeFile: filepath.Join(e.proc, "uptime")})
 	j, err := New(Config{
-		Enabled:          true,
 		Interval:         time.Hour,
 		WatchdogStateDir: e.state,
 		WatchdogLogFile:  e.logFile,
@@ -326,7 +325,6 @@ func TestUnitsSweepNoGhosts(t *testing.T) {
 func TestUnitsSweepGatedWithoutSystemd(t *testing.T) {
 	e := jfixture(t)
 	j, err := New(Config{
-		Enabled:          true,
 		WatchdogStateDir: e.state,
 		WatchdogLogFile:  e.logFile,
 		ProcRoot:         e.proc,
@@ -423,22 +421,6 @@ func TestIgnoresNonMonitorIPCommands(t *testing.T) {
 
 	if len(e.kills) != 0 {
 		t.Fatalf("kills=%v want none (no monitor processes)", e.kills)
-	}
-}
-
-func TestRunDisabledIdles(t *testing.T) {
-	j, err := New(Config{Enabled: false}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { j.Run(ctx); close(done) }()
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("disabled janitor Run did not return on ctx cancel")
 	}
 }
 

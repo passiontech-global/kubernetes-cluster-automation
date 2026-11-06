@@ -3,6 +3,8 @@ $schema: 'https://moonrepo.dev/schemas/project.json'
 language: 'go'
 layer: 'application'
 stack: 'backend'
+tags:
+  - 'docker'
 
 # hostkit change -> this project's tasks are affected (moon ci).
 dependsOn:
@@ -26,6 +28,24 @@ tasks:
       - 'go.mod'
     outputs:
       - 'bin/node-host-agent'
+
+  # Regenerate ENV.md — the full NODE_HOST_AGENT_* inventory derived
+  # from the Go sources (envx knobs grouped by package + the
+  # ENABLE_* gates out of cmd/agent/wiring.go). Deterministic:
+  # re-running after an env-surface change refreshes the doc in place.
+  envdoc:
+    script: 'sh scripts/gen-envdoc.sh'
+    toolchains: 'system'
+    inputs:
+      - 'cmd/**/*.go'
+      - 'internal/**/*.go'
+      - 'scripts/gen-envdoc.sh'
+    outputs:
+      - 'ENV.md'
+    options:
+      # runs a checked-in shell script — must go through the shell.
+      shell: true
+      cache: false
 
   image:
     # Plain docker build of ./Dockerfile — NOT `ko build`: the shipped

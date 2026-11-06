@@ -4,10 +4,13 @@
 // buffer the way the ported shell watchdog modules did: candidate
 // device paths under a host root, an O_NONBLOCK read handle, a
 // byte-bounded drain, a partial-line carry across drains, and the
-// "pri,seq,usec,flags;msg" record parse. The package is a leaf —
-// consumer policy (cursor bookkeeping, lookback replay filters,
-// dmesg/journalctl fallbacks, the per-consumer byte caps and pending
-// overflow rules) stays in the callers.
+// "pri,seq,usec,flags;msg" record parse. Tailer (tailer.go) owns the
+// full tail lifecycle — lazy open/reopen, capped drain, carry and
+// the first-scan backlog gates — over these primitives, with the
+// per-consumer caps and overflow rules passed in as options. The
+// package is a leaf — consumer policy (cursor bookkeeping, the
+// lookback replay filter itself, classification, latch/event
+// emission, dmesg/journalctl fallbacks) stays in the callers.
 package kmsg
 
 import (

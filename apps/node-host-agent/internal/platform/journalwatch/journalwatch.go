@@ -18,6 +18,11 @@
 // at all (no /var/log/journal, no /run/log/journal). There journald
 // is legitimately absent — every read failing is configuration, not
 // a fault.
+//
+// json.go holds the package's second piece: the `journalctl -o
+// json` line decode + since-cursor fetch shared by the NPD
+// journald-plugin ports (nodereporter's kubelet-stale monitor and
+// `journalctl -k` kernel fallback).
 package journalwatch
 
 import (

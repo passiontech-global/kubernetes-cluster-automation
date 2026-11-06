@@ -32,7 +32,6 @@ import (
 // (ConfigFromEnv fills them); shared paths/transport, the watchdog
 // conf reloader and the private test seams stay flat.
 type Config struct {
-	Enabled  bool          // false → Run idles until ctx done
 	Interval time.Duration // guard cycle cadence (60s)
 	// CycleTimeout is the per-Cycle deadline Run applies around each
 	// Cycle: every spawned command and HTTP probe is ctx-aware, so

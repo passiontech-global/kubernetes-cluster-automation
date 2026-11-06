@@ -197,7 +197,6 @@ type Config struct {
 	// (image pulls), journalctl --vacuum. Plain systemctl/queries
 	// stay on CmdTimeout.
 	CmdTimeoutLong time.Duration
-	Enabled        bool
 	Runner         Runner
 	Watcher        Watcher
 	NowFn          func() time.Time
@@ -324,10 +323,6 @@ func (r *Reconciler) Name() string { return "hostconfig" }
 
 // Run converges immediately, then on Interval or vars/cert changes.
 func (r *Reconciler) Run(ctx context.Context) {
-	if !r.cfg.Enabled {
-		<-ctx.Done()
-		return
-	}
 	if r.cfg.Watcher != nil {
 		r.watchOnce.Do(func() { go r.cfg.Watcher.Poll(ctx) })
 	}

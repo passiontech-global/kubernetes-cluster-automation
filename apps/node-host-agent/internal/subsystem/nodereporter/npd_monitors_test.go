@@ -12,6 +12,9 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 )
 
 // ---------------------------------------------------------------------------
@@ -24,20 +27,22 @@ func journalJSON(tsUS int64, msg string) string {
 }
 
 // TestParseJournalJSON: MESSAGE arrives as a JSON string or a byte
-// array (non-UTF8 payloads); malformed lines are skipped.
+// array (non-UTF8 payloads); malformed lines are skipped. The decode
+// lives in platform/journalwatch — this keeps the nodereporter-side
+// contract pinned.
 func TestParseJournalJSON(t *testing.T) {
 	data := journalJSON(1700000000000000, `err="node \"n1\" not found"`) + "\n" +
 		"not-json-garbage\n" +
 		`{"__REALTIME_TIMESTAMP":"1700000001000000","MESSAGE":[104,101,108,108,111]}` + "\n"
-	got := parseJournalJSON(data)
+	got := journalwatch.ParseJSON(data)
 	if len(got) != 2 {
 		t.Fatalf("got %d entries, want 2: %+v", len(got), got)
 	}
-	if got[0].tsUS != 1700000000000000 || !strings.Contains(got[0].msg, `not found`) {
+	if got[0].TSUS != 1700000000000000 || !strings.Contains(got[0].Msg, `not found`) {
 		t.Fatalf("entry 0 = %+v", got[0])
 	}
-	if got[1].msg != "hello" {
-		t.Fatalf("byte-array MESSAGE decoded to %q", got[1].msg)
+	if got[1].Msg != "hello" {
+		t.Fatalf("byte-array MESSAGE decoded to %q", got[1].Msg)
 	}
 }
 
@@ -374,19 +379,20 @@ func TestKmsgLookbackArmedUntilCaughtUp(t *testing.T) {
 	}
 }
 
-// TestReadKmsgAvailCaughtUpFlag: the drain reports caughtUp when the
-// source ran dry (EOF/EAGAIN); the byte-capped case is covered by
-// TestKmsgLookbackArmedUntilCaughtUp above.
-func TestReadKmsgAvailCaughtUpFlag(t *testing.T) {
+// TestKmsgTailCaughtUpFlag: the tailer's drain reports CaughtUp when
+// the source ran dry (EOF/EAGAIN); the byte-capped case is covered
+// by TestKmsgLookbackArmedUntilCaughtUp above.
+func TestKmsgTailCaughtUpFlag(t *testing.T) {
 	e := fixture(t)
-	f, err := os.Open(e.kmsg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = f.Close() }()
+	tail := kmsg.NewTailer(kmsg.TailerOptions{
+		Paths:    func() []string { return []string{e.kmsg} },
+		DrainCap: maxKmsgReadBytes,
+	})
+	defer tail.Close()
 	// Fixture kmsg is empty → EOF on first read → caught up.
-	if _, caughtUp, err := readKmsgAvail(f); err != nil || !caughtUp {
-		t.Fatalf("empty kmsg: caughtUp=%v err=%v, want true,nil", caughtUp, err)
+	_, res, err := tail.Read()
+	if err != nil || !res.CaughtUp {
+		t.Fatalf("empty kmsg: CaughtUp=%v err=%v, want true,nil", res.CaughtUp, err)
 	}
 }
 

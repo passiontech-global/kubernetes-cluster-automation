@@ -32,4 +32,4 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run affected tasks
-        run: moon ci :format :vet :lint :test :build
+        run: moon ci :format :vet :lint :lint-dockerfile :test :build

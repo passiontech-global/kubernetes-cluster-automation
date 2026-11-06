@@ -31,9 +31,6 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 		},
 	})
 
-	if !cfg.Enabled {
-		t.Fatal("Enabled = false, want true (wire func set it unconditionally)")
-	}
 	if cfg.WatchdogStateDir != "/wd/state" || cfg.WatchdogLogFile != "/wd/watchdog.log" ||
 		cfg.HostRoot != "/host" || cfg.Watchdog != wd || cfg.WatchdogSrc != wdSrc ||
 		cfg.Systemd != sd {

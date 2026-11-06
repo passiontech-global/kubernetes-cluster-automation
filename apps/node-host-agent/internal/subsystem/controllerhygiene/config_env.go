@@ -25,8 +25,7 @@ type EnvDeps struct {
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob controllerhygiene
 // reads and returns a Config ready for New — the env contract lives in
-// the package, not in cmd/agent. Enabled is always true here: the wire
-// func set it unconditionally and the enable gate
+// the package, not in cmd/agent. The enable gate
 // (NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE "auto"/ShouldRun) plus the
 // New error path stay in the caller. Fields wiring never set
 // (Hub.SelfEndpoint, KineTTL.MinProcAge, KinePool.DBPortFallback,
@@ -49,7 +48,6 @@ func ConfigFromEnv(d EnvDeps) Config {
 		wd = *d.Watchdog
 	}
 	cfg := Config{
-		Enabled:          true,
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogLogFile:  d.WatchdogLogFile,
 		WatchdogSrc:      d.WatchdogSrc,

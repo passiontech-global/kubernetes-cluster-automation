@@ -13,7 +13,7 @@ import (
 func TestPruneLegacyWatchdogStack(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: sr}, nil)
 	if err != nil {

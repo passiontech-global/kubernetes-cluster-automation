@@ -1,9 +1,14 @@
+// config.go — the shared workerhygiene Config: the top-level knob
+// struct, the subsystem wiring defaults + env rows, and the Seams
+// test-seam funcs. The per-domain sub-configs (Kubelet/Teardown/
+// Ctr/Cilium/Disk/Net/Pressure/Calico/Journal/Host/Runtime) live in
+// config_<domain>.go beside their own defaults and env rows;
+// ApplyDefaults below orchestrates them in a fixed order.
 package wdeps
 
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -14,6 +19,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // Subsystem wiring defaults — the /host mount convention mirrors the
@@ -41,7 +47,6 @@ const (
 type Config struct {
 	NodeName          string        // this node (spec.nodeName)
 	Interval          time.Duration // check cadence
-	Enabled           bool          // false → Run idles until ctx done
 	WatchdogStateDir  string        // state-*/last-*/consecutive-* files
 	WatchdogLogFile   string        // appended watchdog log (NPD filelog)
 	ProcRoot          string        // host /proc
@@ -89,171 +94,6 @@ type Config struct {
 	// Seams are the unexported test seams — every check reads them
 	// through h.cfg.Seams so tests re-stub a live Hygiene after New.
 	Seams Seams
-}
-
-// KubeletConfig groups the kubelet-side knobs: the 05/06 stall and
-// watch-wedge pod dirs/probes, the A4 syncloop probe auth, and the
-// T15 watchdog-feeder cadence/gates.
-type KubeletConfig struct {
-	PodsDir     string        // host kubelet pod dirs (05/06)
-	HealthzURL  string        // kubelet :10250 probe (05)
-	WatchMinAge time.Duration // pod age without pod dir → watch wedge (06)
-	// WatchdogHosts is the cluster var systemd_watchdog_hosts —
-	// the T15 opt-in host list the shell feeder unit gated on (wired
-	// by main from the vars dir / env). The feeder activates when this
-	// node is listed here OR by default on any worker node
-	// (K0sWorkerUnitFile present) — in the agent port the T15 pilot
-	// graduated fleet-wide, so an empty list never disables it.
-	WatchdogHosts []string
-	WdInterval    time.Duration // feeder probe cadence (15s)
-	WdMaxFail     int           // consecutive fails → remediate gates (4 = ~60s)
-	WdProbeURL    string        // kubelet :10248 healthz — body must be "ok"
-	// WdReprobeGap is the sleep between the remediate Gate-0
-	// re-probes — the shell's "probe twice 3s apart" self-correct
-	// window before any gate runs.
-	WdReprobeGap time.Duration
-	// APIFallbackURL is the G4 last-resort /livez target when no
-	// API backends are configured (worker-local api-local-lb :7443).
-	APIFallbackURL string
-	SyncloopURL    string // kubelet :10250 /healthz/syncloop (PLEG)
-	// TokenPath is the bearer-token file attached to kubelet's
-	// secure-port probes — kubelet denies anonymous /healthz access,
-	// so the syncloop probe authenticates with the pod SA token
-	// (requires get on nonResourceURL /healthz/syncloop). Empty or
-	// unreadable → the probe runs unauthenticated and 401/403
-	// answers mark the check inconclusive, not down.
-	TokenPath string
-}
-
-// TeardownConfig groups the pod-teardown knobs (36-pod-teardown.sh).
-type TeardownConfig struct {
-	StuckDeleteAge time.Duration // Terminating age → force-delete candidate
-	StuckWedgeAge  time.Duration // Terminating age + task dir → wedge latch
-	MaxForceDelete int           // force-delete cap per cycle
-}
-
-// CtrConfig groups the containerd knobs: the A4 socket hang probe,
-// the 31-ctr-tasks per-cycle cleanup caps, the A3 ingest GC, the W9
-// content prune budget and the KR3 meta.db journal probe.
-type CtrConfig struct {
-	Socket             string        // containerd grpc unix socket under /host/run
-	IngestDir          string        // containerd content ingest dir (39)
-	IngestMaxAge       time.Duration // ingest dir mtime older than → stale (3h)
-	IngestScanInterval time.Duration // periodic rescan even under disk WM (6h)
-	MaxTaskClean       int           // wedged ctr task dir cap per cycle (31)
-	MaxShimKill        int           // orphan shim kill cap per cycle (31)
-	// MetaJournalFn is the KR3 journal probe — `journalctl
-	// -u k0sworker -u containerd --since "3 minutes ago"`. nil →
-	// Systemd.ExecCombined default; a nil Systemd leaves the journal
-	// half of the check inconclusive (the orphan-shim half still runs).
-	MetaJournalFn func(ctx context.Context) (string, error)
-}
-
-// CiliumConfig groups the cilium knobs: the 32 agent healthz/socket,
-// the 35/38 unix-socket consumers, the B1 envoy probes, the B4/W5.6
-// MTU + WireGuard iface knobs and the W8-NM3 BPF map latch ratio.
-type CiliumConfig struct {
-	HealthzURL      string  // cilium-agent :9879 probe (32)
-	Socket          string  // cilium agent unix socket (35)
-	EnvoyReadyURL   string  // cilium-envoy admin :9964/ready
-	EnvoyAdminURL   string  // envoy :9901 /stats?filter=update_rejected
-	Iface           string  // cilium host iface (cilium_net)
-	WG0Iface        string  // cilium WG tunnel iface (cilium_wg0)
-	RuntimeConfig   string  // agent-runtime-config.json MTU fallback
-	BPFMapHighRatio float64 // critical-map fill ratio → latch (0.90)
-}
-
-// DiskConfig groups the disk knobs: the /var/lib/k0s watermarks that
-// trigger the ingest GC, the W6.3 disk-bloat runaway detector, the
-// /var/log/pods walk (BUG-H8) and the W10-ST2 orphan-hostPath roots.
-type DiskConfig struct {
-	K0sDataDir    string  // /var/lib/k0s — disk-high ingest-GC trigger
-	HighWatermark float64 // /var/lib/k0s used ratio triggering GC
-	// W6.3 disk-bloat runaway detector: above BloatWatermark
-	// the bounded emptyDir/snapshot walk runs (gated by
-	// BloatScanInterval — the walk costs IO on the disk that is
-	// already full); above BloatCriticalWatermark a
-	// non-system pod holding more than BloatPodThresholdBytes
-	// may be evicted through the API (last-disk-bloat-evict budget).
-	BloatWatermark         float64
-	BloatCriticalWatermark float64
-	BloatPodThresholdBytes int64
-	BloatScanInterval      time.Duration
-	PodLogsDir             string // /var/log/pods walk root (BUG-H8)
-	// OrphanHostPathDirs are the host-side local-provisioner roots
-	// ST2 scans for pvc-* dirs whose PV is gone.
-	OrphanHostPathDirs []string
-}
-
-// NetConfig groups the network knobs: the dns-resolv drift baseline,
-// the /sys/class/net + overlay-iface MTU reads (B4), the W9 orphan
-// cni-* netns reaper root and the W7-H3 node-local-dns datapath probe.
-type NetConfig struct {
-	HostResolvConf    string // host resolv.conf (dns drift baseline)
-	SysClassNet       string // /sys/class/net — MTU reads (B4)
-	NebulaIface       string // overlay iface MTU baseline (neb1 = 1300)
-	NetnsDir          string // host /run/netns — orphan cni-* netns files
-	LocalDNSProbeAddr string // node-local-dns :53 probe target (169.254.20.10:53)
-	LocalDNSProbeName string // query name the DNS probe resolves
-}
-
-// PressureConfig groups the leak/pressure guard knobs: the W7-H1
-// D-state storm + A2 zombie storm thresholds and the W2 PSI
-// memory-thrash guard — latch when /proc/pressure/memory `full
-// avg60` exceeds PSIFullAvg60 (percent) AND MemAvailable/MemTotal
-// drops under MemFreeMinRatio for ConsecNeeded cycles.
-type PressureConfig struct {
-	DStateStormThreshold int     // total D-state procs → storm latch (5)
-	ZombieStormThreshold int     // defunct children of one parent → storm
-	PSIFullAvg60         float64 // PSI memory full avg60 percent (25)
-	MemFreeMinRatio      float64 // free-mem ratio floor (0.08)
-}
-
-// CalicoConfig groups the W7-H7 calico-hygiene knobs — the felix
-// readiness probe and the orphan cali* veth leak headroom.
-type CalicoConfig struct {
-	FelixReadyURL       string // calico-node felix :9099/readiness probe
-	OrphanVethThreshold int    // cali* ifaces above the pod count → leak (50)
-}
-
-// JournalConfig groups the journald blindness-detector inputs shared
-// with controllerhygiene via EnvDeps.
-type JournalConfig struct {
-	// Dirs are the host journal storage roots — the
-	// journal-unreadable latch may only fire while at least one
-	// exists (a host with no journald at all fails every read by
-	// configuration, not by fault).
-	Dirs []string
-	// UnreadableNeeded is the consecutive-failed-read budget
-	// before state-journal-unreadable latches; <=0 → 5.
-	UnreadableNeeded int
-}
-
-// HostConfig groups the W10 KR1/ST2 host-side markers: the
-// hostmetrics kmsg scanner's files this check consumes (defaults
-// derive from WatchdogStateDir so both subsystems agree on the file
-// contract without wiring) and the SystemOOMVictim event sink.
-type HostConfig struct {
-	OOMVictimFile      string // "<epoch> <comm>" latest host-level victim
-	OOMCountFile       string // cumulative host-level OOM kills
-	ConntrackDropsFile string // cumulative nf_conntrack table-full records
-	// EventNamespace receives the SystemOOMVictim node event.
-	EventNamespace string
-}
-
-// RuntimeConfig groups the runtime-resource guard paths — the
-// cgroup-v2 unified hierarchy root (dying-descendant guard +
-// memory.reclaim writes) and the logind session dir the session
-// janitor scans. Everything else the guards touch lives under
-// already-shared roots (ProcRoot for diskstats/PSI/sysctls,
-// WatchdogStateDir for markers, SysClassNet for the neb1 gate).
-type RuntimeConfig struct {
-	// Both paths default through ConfigFromEnv: hostPath-joined
-	// defaults behind NODE_HOST_AGENT_CGROUP_ROOT /
-	// NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR; a direct-New caller
-	// gets the unprefixed host paths from applyDefaults.
-	CgroupRoot  string // cgroup v2 root ("/host/sys/fs/cgroup" in-pod)
-	SessionsDir string // /run/systemd/sessions on the host
 }
 
 // Seams groups the unexported test-seam funcs. Every one has a
@@ -403,223 +243,31 @@ func (c *Config) applyWiringDefaults() {
 	}
 }
 
-func (k *KubeletConfig) applyDefaults() {
-	if k.PodsDir == "" {
-		k.PodsDir = defaultKubeletPodsDir
-	}
-	if k.HealthzURL == "" {
-		k.HealthzURL = DefaultKubeletHealthzURL
-	}
-	if k.WatchMinAge <= 0 {
-		k.WatchMinAge = defaultKubeletWatchMinAge
-	}
-	if k.WdInterval <= 0 {
-		k.WdInterval = defaultKubeletWdInterval
-	}
-	if k.WdMaxFail <= 0 {
-		k.WdMaxFail = DefaultKubeletWdMaxFail
-	}
-	if k.WdProbeURL == "" {
-		k.WdProbeURL = defaultKubeletWdProbeURL
-	}
-	if k.WdReprobeGap <= 0 {
-		k.WdReprobeGap = defaultKubeletWdReprobeGap
-	}
-	if k.APIFallbackURL == "" {
-		k.APIFallbackURL = defaultAPIFallbackURL
-	}
-	if k.SyncloopURL == "" {
-		k.SyncloopURL = defaultKubeletSyncloopURL
-	}
-	if k.TokenPath == "" {
-		k.TokenPath = DefaultKubeletTokenPath
+// wiringEnvKnobs returns the shared host-path env rows — the
+// hostPath-joined defaults (NOT the package defaults, which hardcode
+// the "/host" DaemonSet prefix and would be wrong on a standalone
+// host). These held the head of the pre-split knob table; the
+// domain rows follow in ConfigFromEnv's assembly order.
+func (c *Config) wiringEnvKnobs(hostPath func(string) string) []envx.Knob {
+	return []envx.Knob{
+		envx.DurationKnob("NODE_HOST_AGENT_HYGIENE_INTERVAL", &c.Interval, DefaultInterval),
+		envx.StringKnob("NODE_HOST_AGENT_PROC_ROOT", &c.ProcRoot, defaultProcRoot),
+		envx.StringKnob("NODE_HOST_AGENT_CTR_TASK_ROOT", &c.CtrTaskRoot,
+			hostPath("/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io")),
+		envx.StringKnob("NODE_HOST_AGENT_SANDBOX_CTL_ROOT", &c.SandboxCtlRoot,
+			hostPath("/run/k0s/containerd/io.containerd.sandbox.controller.v1.shim")),
+		envx.StringKnob("NODE_HOST_AGENT_K0S_WORKER_UNIT", &c.K0sWorkerUnitFile,
+			hostPath("/etc/systemd/system/k0sworker.service")),
 	}
 }
 
-func (t *TeardownConfig) applyDefaults() {
-	if t.StuckDeleteAge <= 0 {
-		t.StuckDeleteAge = defaultStuckDeleteAge
-	}
-	if t.StuckWedgeAge <= 0 {
-		t.StuckWedgeAge = defaultStuckWedgeAge
-	}
-	if t.MaxForceDelete <= 0 {
-		t.MaxForceDelete = defaultMaxForceDelete
-	}
-}
-
-func (g *CtrConfig) applyDefaults() {
-	if g.Socket == "" {
-		g.Socket = defaultContainerdSocket
-	}
-	if g.IngestDir == "" {
-		g.IngestDir = defaultCtrIngestDir
-	}
-	if g.IngestMaxAge <= 0 {
-		g.IngestMaxAge = ctrIngestMaxAge
-	}
-	if g.IngestScanInterval <= 0 {
-		g.IngestScanInterval = ctrIngestScanInterval
-	}
-	if g.MaxTaskClean <= 0 {
-		g.MaxTaskClean = defaultMaxCtrTaskClean
-	}
-	if g.MaxShimKill <= 0 {
-		g.MaxShimKill = defaultMaxShimKill
-	}
-}
-
-func (cl *CiliumConfig) applyDefaults() {
-	if cl.HealthzURL == "" {
-		cl.HealthzURL = DefaultCiliumHealthzURL
-	}
-	if cl.Socket == "" {
-		cl.Socket = defaultCiliumSocket
-	}
-	if cl.EnvoyReadyURL == "" {
-		cl.EnvoyReadyURL = defaultCiliumEnvoyReadyURL
-	}
-	if cl.EnvoyAdminURL == "" {
-		cl.EnvoyAdminURL = defaultCiliumEnvoyAdminURL
-	}
-	if cl.Iface == "" {
-		cl.Iface = defaultCiliumIface
-	}
-	if cl.WG0Iface == "" {
-		cl.WG0Iface = defaultCiliumWG0Iface
-	}
-	if cl.RuntimeConfig == "" {
-		cl.RuntimeConfig = defaultCiliumRuntimeConfig
-	}
-	if cl.BPFMapHighRatio <= 0 {
-		cl.BPFMapHighRatio = defaultBPFMapHighRatio
-	}
-}
-
-func (d *DiskConfig) applyDefaults() {
-	if d.K0sDataDir == "" {
-		d.K0sDataDir = defaultK0sDataDir
-	}
-	if d.HighWatermark <= 0 {
-		d.HighWatermark = k0sDiskHighWatermark
-	}
-	if d.BloatWatermark <= 0 {
-		d.BloatWatermark = k0sDiskBloatWatermark
-	}
-	if d.BloatCriticalWatermark <= 0 {
-		d.BloatCriticalWatermark = k0sDiskBloatCriticalWatermark
-	}
-	if d.BloatPodThresholdBytes <= 0 {
-		d.BloatPodThresholdBytes = diskBloatPodThresholdBytes
-	}
-	if d.BloatScanInterval <= 0 {
-		d.BloatScanInterval = diskBloatScanInterval
-	}
-	if d.PodLogsDir == "" {
-		d.PodLogsDir = defaultPodLogsDir
-	}
-	if len(d.OrphanHostPathDirs) == 0 {
-		// Paths are used RAW (no HostRoot prefix): the DaemonSet
-		// mounts host /var/openebs/local at the SAME container path
-		// (sweeper contract). /opt/local-path-provisioner has no
-		// container mount — ReadDir just misses there — but is the
-		// real host path in standalone mode. Extra provisioner
-		// roots need a matching DS hostPath mount to be scanned.
-		d.OrphanHostPathDirs = []string{
-			"/var/openebs/local",
-			"/opt/local-path-provisioner",
-		}
-	}
-}
-
-func (n *NetConfig) applyDefaults() {
-	if n.HostResolvConf == "" {
-		n.HostResolvConf = defaultHostResolvConf
-	}
-	if n.SysClassNet == "" {
-		n.SysClassNet = defaultSysClassNet
-	}
-	if n.NebulaIface == "" {
-		n.NebulaIface = defaultNebulaIface
-	}
-	if n.NetnsDir == "" {
-		n.NetnsDir = defaultNetnsDir
-	}
-	if n.LocalDNSProbeAddr == "" {
-		n.LocalDNSProbeAddr = defaultLocalDNSProbeAddr
-	}
-	if n.LocalDNSProbeName == "" {
-		n.LocalDNSProbeName = defaultLocalDNSProbeName
-	}
-}
-
-func (p *PressureConfig) applyDefaults() {
-	if p.DStateStormThreshold <= 0 {
-		p.DStateStormThreshold = defaultDStateStormThreshold
-	}
-	if p.ZombieStormThreshold <= 0 {
-		p.ZombieStormThreshold = zombieStormThreshold
-	}
-	if p.PSIFullAvg60 <= 0 {
-		p.PSIFullAvg60 = defaultPSIFullAvg60
-	}
-	if p.MemFreeMinRatio <= 0 {
-		p.MemFreeMinRatio = defaultMemFreeMinRatio
-	}
-}
-
-func (cl *CalicoConfig) applyDefaults() {
-	if cl.FelixReadyURL == "" {
-		cl.FelixReadyURL = DefaultCalicoFelixReadyURL
-	}
-	if cl.OrphanVethThreshold <= 0 {
-		cl.OrphanVethThreshold = defaultCalicoOrphanVethThresh
-	}
-}
-
-func (j *JournalConfig) applyDefaults() {
-	if len(j.Dirs) == 0 {
-		// /host mount convention like the other defaults; standalone
-		// wiring passes the unprefixed host paths.
-		j.Dirs = []string{
-			"/host/var/log/journal", "/host/run/log/journal"}
-	}
-	if j.UnreadableNeeded <= 0 {
-		j.UnreadableNeeded = DefaultJournalUnreadableNeeded
-	}
-}
-
-// applyDefaults fills the Wave-10 (KR1/KR3/ST2) defaults —
-// WatchdogStateDir is already resolved by applyWiringDefaults, so
-// the marker-file paths derive from the same dir hostmetrics writes
-// into.
-func (hc *HostConfig) applyDefaults(stateDir string) {
-	if hc.OOMVictimFile == "" {
-		hc.OOMVictimFile = filepath.Join(stateDir,
-			"kmsg-host-oom-victim")
-	}
-	if hc.OOMCountFile == "" {
-		hc.OOMCountFile = filepath.Join(stateDir,
-			"kmsg-host-oom-count")
-	}
-	if hc.ConntrackDropsFile == "" {
-		hc.ConntrackDropsFile = filepath.Join(stateDir,
-			"kmsg-conntrack-drops")
-	}
-	if hc.EventNamespace == "" {
-		hc.EventNamespace = "default"
-	}
-}
-
-// applyDefaults fills the unprefixed host paths for direct-New
-// callers — ConfigFromEnv already resolved both knobs through
-// hostPath, so a non-empty field is never touched.
-func (r *RuntimeConfig) applyDefaults() {
-	if r.CgroupRoot == "" {
-		r.CgroupRoot = defaultCgroupRoot
-	}
-	if r.SessionsDir == "" {
-		r.SessionsDir = defaultSystemdSessionsDir
+// budgetEnvKnobs returns the shared consecutive-suspect / rate-limit
+// budget rows — they sat between the calico and runtime rows in the
+// pre-split table; ConfigFromEnv keeps that position.
+func (c *Config) budgetEnvKnobs() []envx.Knob {
+	return []envx.Knob{
+		envx.IntKnob("NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED", &c.ConsecNeeded, defaultConsecNeeded),
+		envx.DurationKnob("NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL", &c.MinRestartInterval, defaultMinRestartInterval),
 	}
 }
 

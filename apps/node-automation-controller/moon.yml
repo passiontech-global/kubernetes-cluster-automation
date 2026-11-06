@@ -3,6 +3,8 @@ $schema: 'https://moonrepo.dev/schemas/project.json'
 language: 'go'
 layer: 'application'
 stack: 'backend'
+tags:
+  - 'docker'
 
 project:
   title: 'node-automation-controller'

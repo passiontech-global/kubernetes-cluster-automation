@@ -1,5 +1,5 @@
 // cilium_ipam_test.go — check 38 cilium-bpf-ipam leak/exhaustion
-// latch + parseCiliumIPAM shape coverage.
+// latch + cilium.ParseCiliumIPAM shape coverage.
 package workerhygiene
 
 import (
@@ -15,6 +15,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // --- check: cilium-bpf-ipam (38) ---
@@ -159,7 +162,7 @@ func TestCiliumIPAMInconclusiveKeepsCounter(t *testing.T) {
 	if e.h.CiliumIPAMFails != 1 {
 		t.Fatalf("counter=%d want 1 (inconclusive keeps)", e.h.CiliumIPAMFails)
 	}
-	if got := e.h.Cycles.WithLabelValues(checkCiliumIPAM, "abort"); testutil.ToFloat64(got) != 1 {
+	if got := e.h.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "abort"); testutil.ToFloat64(got) != 1 {
 		t.Fatalf("abort=%v want 1", testutil.ToFloat64(got))
 	}
 	// Garbage body → same inconclusive path.
@@ -229,9 +232,9 @@ func TestParseCiliumIPAMShapes(t *testing.T) {
 		{"empty ipv4", `{"ipam":{"status":"Ok"}}`, 0, -1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			used, avail, ok := parseCiliumIPAM([]byte(tc.body))
+			used, avail, ok := cilium.ParseCiliumIPAM([]byte(tc.body))
 			if ok != tc.wantOK || used != tc.wantUsed || avail != tc.wantAvail {
-				t.Fatalf("parseCiliumIPAM(%s)=(%d,%d,%v) want (%d,%d,%v)",
+				t.Fatalf("cilium.ParseCiliumIPAM(%s)=(%d,%d,%v) want (%d,%d,%v)",
 					tc.body, used, avail, ok, tc.wantUsed, tc.wantAvail, tc.wantOK)
 			}
 		})

@@ -116,7 +116,6 @@ var defaultNebulaDirectTCPPorts = []int{22, 6443, 8132, 9443, 39901}
 // empty config (every check idles on defaults like the shell did on
 // nodes without a conf file).
 type Config struct {
-	Enabled            bool          // false → Run idles until ctx done
 	Interval           time.Duration // check cadence
 	WatchdogStateDir   string        // state-*/egress-*/dnsfb-* files
 	WatchdogLogFile    string        // appended watchdog log (NPD filelog)
@@ -403,11 +402,6 @@ func (n *NetHealth) Name() string { return "nethealth" }
 
 // Run checks immediately, then every Interval until ctx is cancelled.
 func (n *NetHealth) Run(ctx context.Context) {
-	if !n.cfg.Enabled {
-		logger().Info("nethealth disabled — idling until shutdown")
-		cycle.Idle(ctx)
-		return
-	}
 	// Route guard: netlink-driven restore of the nebula policy
 	// routing (replaces nebula-route-guard.service). Single-flight
 	// via spawnRouteGuard — overlapping Runs can't double-bind the

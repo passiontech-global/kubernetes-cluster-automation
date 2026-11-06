@@ -11,9 +11,6 @@ func TestConfigFromEnv(t *testing.T) {
 		HostPath:    func(p string) string { return "/host" + p },
 		TextfileDir: "/textfile",
 	})
-	if !cfg.Enabled {
-		t.Fatal("Enabled should be true — the Detect() gate stays in the caller")
-	}
 	if cfg.EnvFile != "/custom/postgres.env" {
 		t.Fatalf("EnvFile=%q", cfg.EnvFile)
 	}

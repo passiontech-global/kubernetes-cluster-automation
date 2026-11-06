@@ -148,8 +148,6 @@ type runner func(ctx context.Context, argv []string, stdin string) (string, erro
 
 // Config carries the kinedb knobs — all test-injectable.
 type Config struct {
-	Enabled bool // false → Run idles until ctx done
-
 	ProbeInterval time.Duration // probe loop cadence (2min)
 	GuardInterval time.Duration // compact guard cadence (10min)
 	MaintInterval time.Duration // maintenance cadence (24h)

@@ -105,7 +105,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
@@ -162,76 +161,28 @@ type Collector struct {
 	removedFlagRe map[string]*regexp.Regexp
 	expectedKCM   map[string]bool
 
-	mu sync.Mutex
-	// seenStates tracks the emit-0 bookkeeping per dynamic latch:
-	// zero time = the latch is active on disk (or the cert-owned
-	// series is live); non-zero = the scrape that first saw it
-	// cleared — the entry emits 0 until seenStateTTL then drops.
-	seenStates map[string]time.Time
-
-	// k0s.yaml cache, guarded by mu: the file changes on k0s upgrades
-	// (rare), not per-scrape — a stat+mtime+size check gates the
-	// re-read/re-parse. A failed stat serves no stale data.
-	k0sLoaded bool
-	k0sMtime  time.Time
-	k0sSize   int64
-	k0sData   []byte
-	k0sParsed map[string]any
-	k0sOK     bool
-
-	// cpu-delivered probe bookkeeping (mu): the busy-loop runs in a
-	// goroutine — a scrape triggers it and serves the last result;
-	// a scrape must never block up to ~6s on steal measurement.
-	cpuRunning bool
-	cpuLast    time.Time
-	cpuRatio   float64
-	cpuWall    float64
-	cpuOK      bool
-	cpuSink    uint64 // busy-loop sink, mu-guarded
-
-	// cpu-steal delta bookkeeping (mu): the steal ratio is a jiffie
-	// DELTA between consecutive latch ticks, so the previous
-	// /proc/stat sums live here. The consecutive-tick streaks live
-	// in state-dir counter files instead — a restart reseeding the
-	// baseline costs one tick, losing the streak would cost three.
-	stealPrevSteal uint64
-	stealPrevTotal uint64
-	stealPrevOK    bool
-
-	// fsInflight (mu) holds the start time of each mount's in-kernel
-	// statfs probe — a hung syscall can't be cancelled, so a scrape
-	// that finds an in-flight probe reports stalled only once the
-	// deadline has elapsed, WITHOUT spawning another (bounds stuck
-	// goroutines at one per mount).
-	fsInflight map[string]time.Time
-	// fsStalledLogged (mu) edge-triggers the hung-mount Warn: the
-	// stall logs once per mount per episode instead of once per
-	// scrape for the whole outage.
-	fsStalledLogged map[string]bool
-
-	// inotify sweep cache (mu): the /proc/*/fdinfo walk is done at
-	// most once per InotifyScanInterval — the scrape serves the
-	// cached result.
-	inoAt          time.Time
-	inoInstances   uint64
-	inoWatches     uint64
-	inoTop         []inotifyConsumer
-	inoWarnedInst  bool // edge-triggered >80% Warn per episode
-	inoWarnedWatch bool
-
-	// localpv walk cache (mu): the per-PVC du walk is cached for
-	// LocalPVScanInterval — walking every volume dir per scrape is
-	// too heavy on a node with hundreds of LocalPVs.
-	lpvAt    time.Time
-	lpvBytes map[string]int64
+	// Per-domain scrape/probe state — each type is defined next to
+	// the collect_*.go file that consumes it and carries its own
+	// mutex (the domains are independent, so the old single mu
+	// split into one lock per domain). Field docs live on the
+	// domain types.
+	seen  latchSeenBook     // collect_watchdog.go — emit-0 bookkeeping
+	k0s   k0sDriftCache     // collect_k0sdrift.go — mtime+size config cache
+	cpu   cpuDeliveredProbe // collect_psi_cpu.go — busy-loop probe
+	steal stealDelta        // collect_steal_entropy.go — jiffie baseline
+	fs    fsProbeState      // collect_fs.go — hung-mount probes
+	ino   inotifyCache      // collect_inotify.go — fdinfo sweep cache
+	lpv   localpvCache      // collect_localpv.go — du walk cache
 }
 
 // New returns the Collector. Register it on the agent's registry,
 // and wire its Latches() half in as the latch-ticker subsystem.
 func New(cfg Config) *Collector {
 	cfg.applyDefaults()
-	c := &Collector{cfg: cfg, seenStates: map[string]time.Time{},
-		fsInflight: map[string]time.Time{}, fsStalledLogged: map[string]bool{}}
+	c := &Collector{cfg: cfg}
+	c.seen.m = map[string]time.Time{}
+	c.fs.inflight = map[string]time.Time{}
+	c.fs.stalledLogged = map[string]bool{}
 	c.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
 		func() time.Time { return c.cfg.nowFn() }, logger)
 	c.removedFlagRe = make(map[string]*regexp.Regexp, len(cfg.RemovedFlags))

@@ -37,7 +37,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync/atomic"
 	"time"
 
@@ -46,6 +45,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
@@ -198,14 +198,14 @@ type Reporter struct {
 	evSeq       atomic.Uint64            // event-name uniqueness suffix
 	emittedEvts map[string]*emittedEvent // dedup key → created/aggregated Event
 
-	// NPD-monitor port state (npd_monitors.go). Journal cursors are
-	// µs wall timestamps — 0 bounds the first fetch to LogLookback.
-	kubeletJournalUS int64    // kubelet-stale monitor cursor
-	kernelJournalUS  int64    // journalctl -k fallback cursor
-	kmsgJournalMode  bool     // permanent fallback once kmsg can't be opened
-	kmsgSrc          *os.File // lazily-opened O_NONBLOCK kmsg handle
-	kmsgPending      []byte   // carried partial kmsg record
-	kmsgScanned      bool     // first drain done → lookback replay disarmed
+	// NPD-monitor port state (npd_kernel.go/npd_journal.go). Journal
+	// cursors are µs wall timestamps — 0 bounds the first fetch to
+	// LogLookback.
+	kubeletJournalUS int64        // kubelet-stale monitor cursor
+	kernelJournalUS  int64        // journalctl -k fallback cursor
+	kmsgJournalMode  bool         // permanent fallback once kmsg can't be opened
+	kmsgTail         *kmsg.Tailer // the /dev/kmsg tail — handle, carry, backlog gates
+	kmsgScanned      bool         // mirrors the tail's caught-up flag (kernelLines)
 
 	// heartbeatInit marks the one-time installed/last-run
 	// initialization — periodic refreshes are the hygiene
@@ -236,6 +236,18 @@ func New(cfg Config, reg prometheus.Registerer) (*Reporter, error) {
 	r := &Reporter{cfg: cfg, emittedEvts: map[string]*emittedEvent{}}
 	r.state = hoststate.New(cfg.WatchdogStateDir, "",
 		func() time.Time { return r.cfg.nowFn() }, logger)
+	// The kernel monitor's /dev/kmsg tail (npd_kernel.go). Paths are
+	// re-evaluated per (re)open so cfg/test re-points stay live.
+	r.kmsgTail = kmsg.NewTailer(kmsg.TailerOptions{
+		Paths: func() []string {
+			return kmsg.DevicePaths(r.cfg.KmsgFile, r.cfg.HostRoot)
+		},
+		DrainCap:   maxKmsgReadBytes,
+		PendingCap: maxLogPendingBytes,
+		// A never-terminated record keeps its tail — same carry
+		// policy as the watchdog filelog tail.
+		PendingTrimTail: true,
+	})
 
 	r.problemGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "problem_gauge",
@@ -269,7 +281,7 @@ func (r *Reporter) Name() string { return "nodereporter" }
 // The lazily-opened kmsg handle is the one file the Reporter holds —
 // it is released when the subsystem stops.
 func (r *Reporter) Run(ctx context.Context) {
-	defer r.closeKmsg()
+	defer r.kmsgTail.Close()
 	cycle.Every("nodereporter", r.cfg.Interval, r.Cycle).Run(ctx)
 }
 

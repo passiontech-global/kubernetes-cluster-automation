@@ -18,9 +18,6 @@ func TestConfigFromEnv(t *testing.T) {
 		WatchdogLogFile:  "/lf",
 	}
 	cfg := ConfigFromEnv(d)
-	if !cfg.Enabled {
-		t.Fatal("Enabled should be true — the enable gate stays in the caller")
-	}
 	if cfg.Interval != 2*time.Minute {
 		t.Fatalf("Interval=%v", cfg.Interval)
 	}

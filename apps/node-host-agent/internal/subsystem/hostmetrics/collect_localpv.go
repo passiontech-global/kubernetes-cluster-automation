@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -23,6 +24,33 @@ const (
 
 // --- W9: OpenEBS LocalPV per-PVC dir bytes ---
 
+// localpvCache is the per-PVC du-walk domain — one slice of what
+// used to be the Collector's shared mu-guarded fields: the walk
+// result cached for LocalPVScanInterval (walking every volume dir
+// per scrape is too heavy on a node with hundreds of LocalPVs). The
+// mutex is private.
+type localpvCache struct {
+	mu    sync.Mutex
+	at    time.Time
+	bytes map[string]int64
+}
+
+// snapshot returns the cached per-PVC bytes and whether they're
+// still fresh — non-nil and younger than interval.
+func (s *localpvCache) snapshot(now time.Time,
+	interval time.Duration) (map[string]int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bytes, s.bytes != nil && now.Sub(s.at) < interval
+}
+
+// store replaces the cache with a fresh walk result stamped at now.
+func (s *localpvCache) store(now time.Time, bytes map[string]int64) {
+	s.mu.Lock()
+	s.at, s.bytes = now, bytes
+	s.mu.Unlock()
+}
+
 var descLocalPVDirBytes = prometheus.NewDesc(
 	"node_host_agent_localpv_dir_bytes",
 	"Bytes under the OpenEBS LocalPV pvc-* volume dir (bounded walk; emitted per pvc-* dir present).",
@@ -36,18 +64,11 @@ var descLocalPVDirBytes = prometheus.NewDesc(
 // local-path volumes here" must stay distinguishable from "zero
 // bytes").
 func (c *Collector) collectLocalPVUsage(ch chan<- prometheus.Metric) {
-	c.mu.Lock()
-	fresh := c.lpvBytes != nil &&
-		c.cfg.nowFn().Sub(c.lpvAt) < c.cfg.LocalPVScanInterval
-	cached := c.lpvBytes
-	c.mu.Unlock()
+	cached, fresh := c.lpv.snapshot(c.cfg.nowFn(), c.cfg.LocalPVScanInterval)
 	bytes := cached
 	if !fresh {
 		if walked := c.walkLocalPVDirs(); walked != nil {
-			c.mu.Lock()
-			c.lpvBytes = walked
-			c.lpvAt = c.cfg.nowFn()
-			c.mu.Unlock()
+			c.lpv.store(c.cfg.nowFn(), walked)
 			bytes = walked
 		}
 		// A failed walk (root unreadable) keeps serving the last

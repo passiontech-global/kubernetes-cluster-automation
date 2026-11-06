@@ -48,7 +48,7 @@ func (s *swapRunner) Run(ctx context.Context, name string, args ...string) (stri
 func newSwapHost(t *testing.T, vars, node string, sr *scriptedRunner) *Reconciler {
 	t.Helper()
 	hr := t.TempDir()
-	r, err := New(Config{Enabled: true, NodeName: node, HostRoot: hr,
+	r, err := New(Config{NodeName: node, HostRoot: hr,
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: &swapRunner{scriptedRunner: sr, hostRoot: hr}}, nil)
 	if err != nil {

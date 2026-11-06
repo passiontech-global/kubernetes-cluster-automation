@@ -115,7 +115,6 @@ func fixture(t *testing.T) *env {
 	testutil.WriteFile(t, filepath.Join(e.proc, "uptime"), "86400.00 12345.00\n")
 
 	h, err := New(Config{
-		Enabled:               true,
 		Interval:              time.Hour,
 		WatchdogStateDir:      e.state,
 		WatchdogLogFile:       filepath.Join(root, "watchdog.log"),
@@ -304,21 +303,6 @@ func TestUptimeGate(t *testing.T) {
 }
 
 // --- misc ---
-
-func TestRunDisabledIdles(t *testing.T) {
-	e := fixture(t)
-	e.h.cfg.Enabled = false
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { e.h.Run(ctx); close(done) }()
-	time.Sleep(20 * time.Millisecond)
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("disabled Run did not exit on cancel")
-	}
-}
 
 func TestSelfAPIStaysEmptyWhenUnset(t *testing.T) {
 	h, err := New(Config{}, nil)

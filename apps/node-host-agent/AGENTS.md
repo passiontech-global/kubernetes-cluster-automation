@@ -84,15 +84,17 @@ on standalone targets (hubsync picks 8091 because lixo-fabric owns
 ```sh
 cd apps/node-host-agent
 go build ./... && test -z "$(gofmt -l .)" && go vet ./... && \
-  go test -race ./... && golangci-lint run ./...
+  go test -race ./... && golangci-lint run ./... && hadolint Dockerfile
 ```
 
-Moon equivalents (test/vet/format/lint come from .moon/tasks/all.yml;
-test is exactly `go test -race ./...`):
+Moon equivalents (test/vet/format/lint come from .moon/tasks/all.yml —
+test is exactly `go test -race ./...`; lint-dockerfile comes from
+.moon/tasks/tag-docker.yml):
 
 ```sh
 moon run node-host-agent:test node-host-agent:vet \
-  node-host-agent:format node-host-agent:lint
+  node-host-agent:format node-host-agent:lint \
+  node-host-agent:lint-dockerfile
 ```
 
 ## Commits
