@@ -26,7 +26,7 @@ import (
 // pod(s) — the same re-election nudge the operator watchdog applies,
 // keyed on its own 30m cooldown so the leader is never churned. The
 // cooldown is the wider of the in-RAM ledger and the
-// node.ops/last-dragonfly-operator-heal stamp persisted on the STS
+// passiontech.dev/last-dragonfly-operator-heal stamp persisted on the STS
 // that triggered it (survives operator restarts).
 func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log logr.Logger,
 	sig masterSvc, now time.Time) {
@@ -110,7 +110,7 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 
 // dragonflyOperatorHealedAt returns the most recent moment a
 // dragonfly-operator leader pod was deleted by step 1 — the wider
-// of the persisted node.ops/last-dragonfly-operator-heal stamp on
+// of the persisted passiontech.dev/last-dragonfly-operator-heal stamp on
 // this STS and the in-RAM drOpHealAt stamp (which survives an STS
 // patch failure). ok=false means no heal has landed yet: the
 // dual-replica heal must not skip ahead of step 1.

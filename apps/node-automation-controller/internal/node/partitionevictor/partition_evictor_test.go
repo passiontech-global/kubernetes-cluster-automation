@@ -529,7 +529,7 @@ func nsSetHas(set map[string]struct{}, ns string) bool {
 	return ok
 }
 
-// A pod carrying node.ops/evict-on-partition=true in an UNLISTED
+// A pod carrying passiontech.dev/evict-on-partition=true in an UNLISTED
 // namespace is evicted off the flagged node; an identical unannotated
 // pod in the same namespace is left alone.
 func TestPartitionEvictorAnnotatedPodInUnlistedNamespace(t *testing.T) {

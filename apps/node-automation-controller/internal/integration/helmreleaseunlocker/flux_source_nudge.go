@@ -69,7 +69,7 @@ type fluxSourceRef struct{ kind, namespace, name string }
 // resolves each consumer's Flux source, and stamps
 // reconcile.fluxcd.io/requestedAt on it — source-controller refetches
 // the artifact, which is what actually unstucks the consumer. The
-// node.ops/last-source-nudge stamp on the source caps this at once
+// passiontech.dev/last-source-nudge stamp on the source caps this at once
 // per source per 30m across ALL consumers pointing at it.
 func (u *helmReleaseUnlocker) healArtifactSources(ctx context.Context,
 	hrs *unstructured.UnstructuredList) error {
@@ -206,7 +206,7 @@ func consumerID(kind string, o *unstructured.Unstructured) string {
 }
 
 // nudgeSource stamps reconcile.fluxcd.io/requestedAt + the
-// node.ops/last-source-nudge cooldown onto a Flux source object.
+// passiontech.dev/last-source-nudge cooldown onto a Flux source object.
 // Failures are per-source: IncError + false, never an aborted sweep.
 func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 	ref fluxSourceRef, consumer string) bool {

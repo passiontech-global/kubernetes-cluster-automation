@@ -43,7 +43,7 @@ func TestPartitionEvictor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, "node.ops/network-partitioned") {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, "passiontech.dev/network-partitioned") {
 		t.Fatal("partitioned node not tainted")
 	}
 	_, err := cs.CoreV1().Pods("flux-system").Get(ctx, "src-ctrl", metav1.GetOptions{})
@@ -60,7 +60,7 @@ func TestPartitionEvictor(t *testing.T) {
 	if err := e.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, "node.ops/network-partitioned") {
+	if kube.HasTaint(testutil.GetNode(t, cs, "p1").Spec.Taints, "passiontech.dev/network-partitioned") {
 		t.Fatal("taint not removed after recovery")
 	}
 }
@@ -83,7 +83,7 @@ func TestPartitionEvictorAbortsOnMajorityPartition(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"a", "b"} {
-		if kube.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, "node.ops/network-partitioned") {
+		if kube.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, "passiontech.dev/network-partitioned") {
 			t.Fatalf("node %s tainted during a majority partition — guard failed", name)
 		}
 	}

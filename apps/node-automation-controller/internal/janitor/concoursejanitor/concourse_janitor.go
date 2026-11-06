@@ -32,7 +32,7 @@
 // imageFs + other pods), while `du -sk /concourse-work-dir` directly
 // costs >90s over millions of overlay files. For an accurate,
 // zero-I/O (<50ms) Concourse-only reading the janitor stamps the
-// annotation `concourse.passiontech.dev/baseline-nodefs-gib` on the
+// annotation `passiontech.dev/baseline-nodefs-gib` on the
 // worker pod right after init-rm wiped the work-dir
 // (workdir = nodefs_used - baseline). When the annotation is missing
 // the baseline is estimated as imageFs_used + 32GiB (OS/k0s/other

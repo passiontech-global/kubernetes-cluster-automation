@@ -45,7 +45,7 @@ Parsing rules (`internal/platform/envx/env.go`):
 | `PDB_WATCHDOG_ENABLED` | pdb-deadlock-watchdog | on unless `"false"` | Registration gate — detects PDBs deadlocking drains/evictions. |
 | `CSR_APPROVER_ENABLED` | csr-watcher | off unless `"true"` | Sub-feature gate — approve mode. Off = detect/report pending CSRs only (module always registers). |
 | `NODE_LABELER_CONFIG_PATH` | node-labeler | `/etc/node-labeler/labels.txt` | Path to the labels.txt file the reconciler applies to nodes. |
-| `PARTITION_EVICT_NAMESPACES` | partition-pod-evictor | `flux-system` | Comma-separated namespace allow-list for partition eviction; unset/empty falls back to `flux-system`. Pods in any ns can opt in via `node.ops/evict-on-partition`. |
+| `PARTITION_EVICT_NAMESPACES` | partition-pod-evictor | `flux-system` | Comma-separated namespace allow-list for partition eviction; unset/empty falls back to `flux-system`. Pods in any ns can opt in via `passiontech.dev/evict-on-partition`. |
 
 ## apiserver guards
 

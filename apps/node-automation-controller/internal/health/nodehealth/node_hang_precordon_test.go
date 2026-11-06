@@ -222,7 +222,7 @@ func TestNodeHangPreCordonNewLatches(t *testing.T) {
 }
 
 // precordonedWorkerNode builds a worker node carrying our pre-cordon stamp —
-// unschedulable with node.ops/precordoned-by=node-hang-precordon and
+// unschedulable with passiontech.dev/precordoned-by=node-hang-precordon and
 // no active latch (the auto-uncordon shape).
 func precordonedWorkerNode(name string, unschedulable bool) *corev1.Node {
 	n := probetest.ReadyWorkerNode(name, "", 0, unschedulable)

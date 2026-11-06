@@ -20,7 +20,7 @@
 // changed value forces an immediate reconcile that skips the
 // remaining backoff. Rate-limited to one nudge per ES per hour by
 // BOTH the in-memory ledger and the persisted stamp itself — an ES
-// whose force-sync (or node.ops/last-es-nudge) is younger than an
+// whose force-sync (or passiontech.dev/last-es-nudge) is younger than an
 // hour is already poked, so a flapping store cannot stampede the API
 // even across controller restarts.
 package externalsecretnudge
@@ -47,7 +47,7 @@ const (
 	esForceSyncAnno = "force-sync"     // literal key — ESO watches it
 	// esLastNudgeAnno is the human-readable half of the persisted
 	// cooldown — force-sync is a bare unix stamp ESO consumes,
-	// node.ops/last-es-nudge is the same moment for operators.
+	// passiontech.dev/last-es-nudge is the same moment for operators.
 	esLastNudgeAnno = kube.AnnoLastESNudge
 	// W9-GO1 — storm guard + 1Password Connect auto-heal thresholds.
 	// A storm is >=5 failing ExternalSecrets making up >=half the

@@ -11,7 +11,7 @@
 // for weeks this way.
 //
 // Opt-in only: the module only touches StatefulSets annotated
-// node.ops/auto-roll-ondelete="true" — an unannotated OnDelete set is
+// passiontech.dev/auto-roll-ondelete="true" — an unannotated OnDelete set is
 // a deliberate manual-roll policy, not a forgotten one.
 //
 // Per 10m sweep, for each opted-in StatefulSet:
@@ -328,7 +328,7 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	return nil
 }
 
-// stsAutoRollOptedIn reports the opt-in: node.ops/auto-roll-ondelete
+// stsAutoRollOptedIn reports the opt-in: passiontech.dev/auto-roll-ondelete
 // on the StatefulSet itself OR on its pod template — operators like
 // dragonfly-operator propagate CR spec.annotations into the pod
 // template only, so the STS object never carries the annotation even

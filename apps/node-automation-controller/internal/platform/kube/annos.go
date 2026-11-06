@@ -1,8 +1,6 @@
 // annos.go — the central registry of annotation/label/taint KEYS the
-// controller reads or stamps. Every key below was gathered verbatim
-// from the modules; NONE are migrated here — this file is the single
-// place the values are spelled out, and call sites adopt the consts
-// in a follow-up wave.
+// controller reads or stamps. This file is the single place the
+// values are spelled out; call sites adopt the consts.
 //
 // Two ownership classes matter:
 //
@@ -10,11 +8,10 @@
 //     by tooling outside this controller — the fluent-bit config
 //     hash annotations, the kured reboot keys. Their VALUES MUST
 //     NEVER CHANGE: renaming one silently breaks the integration.
-//   - Internal-owned keys — the whole node.ops/* family plus the
-//     *.passiontech.dev domains — answer only to this codebase.
-//     Renames are still persistence-visible (a renamed stamp reads
-//     as "never stamped" until re-written), but nothing off-cluster
-//     depends on them.
+//   - Internal-owned keys — the whole passiontech.dev/* family —
+//     answer only to this codebase. Renames are still
+//     persistence-visible (a renamed stamp reads as "never stamped"
+//     until re-written), but nothing off-cluster depends on them.
 //
 // Naming: AnnoXxx for annotations, LabelXxx for labels, TaintXxx for
 // taint keys — the same domain literal is used as a taint key by the
@@ -22,93 +19,72 @@
 package kube
 
 // ---------------------------------------------------------------------------
-// node.ops/* — internal-owned annotations (the operator's own stamps).
-// The last-* family are durable cooldown stamps read via AnnoTime;
-// see anno.go for the two accepted timestamp formats.
+// passiontech.dev/* — internal-owned annotations (the operator's own
+// stamps). The last-* family are durable cooldown stamps read via
+// AnnoTime; see anno.go for the two accepted timestamp formats.
 // ---------------------------------------------------------------------------
 const (
 	// AnnoLastHelmUnlock is helmrelease-unlocker's durable
 	// pending-secret unlock stamp on the HelmRelease.
-	AnnoLastHelmUnlock = "node.ops/last-helm-unlock"
+	AnnoLastHelmUnlock = "passiontech.dev/last-helm-unlock"
 	// AnnoLastHelmStallUnwedge is helmrelease-unlocker's stall-unwedge
 	// stamp (suspended-too-long unwedge cooldown).
-	AnnoLastHelmStallUnwedge = "node.ops/last-helm-stall-unwedge"
+	AnnoLastHelmStallUnwedge = "passiontech.dev/last-helm-stall-unwedge"
 	// AnnoLastImmutableJobHeal is helmrelease-unlocker's
 	// immutable-Job recreate stamp.
-	AnnoLastImmutableJobHeal = "node.ops/last-immutable-job-heal"
+	AnnoLastImmutableJobHeal = "passiontech.dev/last-immutable-job-heal"
 	// AnnoLastSourceNudge is helmrelease-unlocker's flux source
 	// reconcile-nudge stamp.
-	AnnoLastSourceNudge = "node.ops/last-source-nudge"
+	AnnoLastSourceNudge = "passiontech.dev/last-source-nudge"
 	// AnnoLastESNudge is externalsecret-nudge's per-ES nudge stamp —
 	// persisted alongside the legacy unix force-sync annotation.
-	AnnoLastESNudge = "node.ops/last-es-nudge"
+	AnnoLastESNudge = "passiontech.dev/last-es-nudge"
 	// AnnoLastOperatorHeal is the watchdogs' operator-leader-heal
 	// stamp on the healed operator.
-	AnnoLastOperatorHeal = "node.ops/last-operator-heal"
+	AnnoLastOperatorHeal = "passiontech.dev/last-operator-heal"
 	// AnnoLastDragonflyOperatorHeal / AnnoLastDragonflyPodHeal are
 	// the datastore stateful-masterless check's two dragonfly heal
 	// stamps (operator bounce vs direct pod bounce).
-	AnnoLastDragonflyOperatorHeal = "node.ops/last-dragonfly-operator-heal"
-	AnnoLastDragonflyPodHeal      = "node.ops/last-dragonfly-pod-heal"
+	AnnoLastDragonflyOperatorHeal = "passiontech.dev/last-dragonfly-operator-heal"
+	AnnoLastDragonflyPodHeal      = "passiontech.dev/last-dragonfly-pod-heal"
 	// AnnoACMEOrderResets is cert-manager-reaper's count of ACME
 	// order resets stamped on the order.
-	AnnoACMEOrderResets = "node.ops/acme-order-resets"
+	AnnoACMEOrderResets = "passiontech.dev/acme-order-resets"
 	// AnnoStartingDeadlinePatched is cronjob-catchup's marker that a
 	// CronJob's startingDeadlineSeconds was already patched once.
-	AnnoStartingDeadlinePatched = "node.ops/starting-deadline-patched"
+	AnnoStartingDeadlinePatched = "passiontech.dev/starting-deadline-patched"
 	// AnnoEphemeralLocalPV marks a nodehealth-stranded pod as localPV
 	// ephemeral — safe to reap with its node.
-	AnnoEphemeralLocalPV = "node.ops/ephemeral-localpv"
+	AnnoEphemeralLocalPV = "passiontech.dev/ephemeral-localpv"
 	// AnnoPreCordonedBy records which controller pre-cordoned a
 	// hanging node (nodehealth node-hang path).
-	AnnoPreCordonedBy = "node.ops/precordoned-by"
+	AnnoPreCordonedBy = "passiontech.dev/precordoned-by"
 	// AnnoAutoRollOnDelete opts a StatefulSet into
 	// statefulset-roller's roll-on-delete.
-	AnnoAutoRollOnDelete = "node.ops/auto-roll-ondelete"
+	AnnoAutoRollOnDelete = "passiontech.dev/auto-roll-ondelete"
 	// AnnoEvictOnPartition opts a pod/namespace into
 	// partition-evictor's partitioned-node eviction.
-	AnnoEvictOnPartition = "node.ops/evict-on-partition"
+	AnnoEvictOnPartition = "passiontech.dev/evict-on-partition"
 	// AnnoQuarantinedEndpoints is apiserver-endpoint-guard's record
 	// of endpoints it removed from the apiserver Service.
-	AnnoQuarantinedEndpoints = "node.ops/quarantined-endpoints"
+	AnnoQuarantinedEndpoints = "passiontech.dev/quarantined-endpoints"
 	// AnnoCircuitBrokenWebhooks is webhook-guard's open-circuit
 	// record — the webhooks currently being skipped.
-	AnnoCircuitBrokenWebhooks = "node.ops/circuit-broken-webhooks"
-)
-
-// ---------------------------------------------------------------------------
-// node.ops/* — internal-owned TAINT keys (node markers, not
-// annotations; the storm-gate and webhook-guard both read these off
-// Node objects).
-// ---------------------------------------------------------------------------
-const (
-	// TaintKubeletUnresponsive is kubelet-reaper's mark on a node
-	// whose kubelet stopped reporting.
-	TaintKubeletUnresponsive = "node.ops/kubelet-unresponsive"
-	// TaintNetworkPartitioned is partition-evictor's mark on a
-	// network-partitioned node.
-	TaintNetworkPartitioned = "node.ops/network-partitioned"
-)
-
-// ---------------------------------------------------------------------------
-// node-ops.passiontech.dev/* — the legacy internal domain (predates
-// the node.ops short form); still internal-owned.
-// ---------------------------------------------------------------------------
-const (
+	AnnoCircuitBrokenWebhooks = "passiontech.dev/circuit-broken-webhooks"
 	// AnnoLastCoreDNSRestart is coredns-watchdog's restart stamp.
-	AnnoLastCoreDNSRestart = "node-ops.passiontech.dev/last-coredns-restart"
+	AnnoLastCoreDNSRestart = "passiontech.dev/last-coredns-restart"
 	// AnnoCatchup is cronjob-catchup's annotation marker on a CronJob
 	// it already caught up.
-	AnnoCatchup = "node-ops.passiontech.dev/catchup"
+	AnnoCatchup = "passiontech.dev/catchup"
 	// LabelMissedCatchup is cronjob-catchup's LABEL marking a Job it
 	// spawned for a missed CronJob schedule.
-	LabelMissedCatchup = "node-ops.passiontech.dev/missed-catchup"
-)
-
-// ---------------------------------------------------------------------------
-// passiontech.dev/* — mixed ownership.
-// ---------------------------------------------------------------------------
-const (
+	LabelMissedCatchup = "passiontech.dev/missed-catchup"
+	// AnnoConcourseBaselineNodeFSGiB is concourse-janitor's recorded
+	// baseline node filesystem size on the node.
+	AnnoConcourseBaselineNodeFSGiB = "passiontech.dev/baseline-nodefs-gib"
+	// AnnoWatchdogForceResync is cftunnel-proxy-watchdog's annotation
+	// an operator sets to force a tunnel proxy resync.
+	AnnoWatchdogForceResync = "passiontech.dev/force-resync"
 	// AnnoStormGateHold / AnnoStormGateDecision are
 	// descheduler-storm-gate's node annotations recording an active
 	// hold and the last verdict — internal-owned.
@@ -122,15 +98,21 @@ const (
 )
 
 // ---------------------------------------------------------------------------
-// *.passiontech.dev domain-specific — internal-owned.
+// passiontech.dev/* — internal-owned TAINT keys (node markers, not
+// annotations; the storm-gate and webhook-guard both read these off
+// Node objects).
 // ---------------------------------------------------------------------------
 const (
-	// AnnoConcourseBaselineNodeFSGiB is concourse-janitor's recorded
-	// baseline node filesystem size on the node.
-	AnnoConcourseBaselineNodeFSGiB = "concourse.passiontech.dev/baseline-nodefs-gib"
-	// AnnoWatchdogForceResync is cftunnel-proxy-watchdog's annotation
-	// an operator sets to force a tunnel proxy resync.
-	AnnoWatchdogForceResync = "watchdog.passiontech.dev/force-resync"
+	// TaintKubeletUnresponsive is kubelet-reaper's mark on a node
+	// whose kubelet stopped reporting.
+	TaintKubeletUnresponsive = "passiontech.dev/kubelet-unresponsive"
+	// TaintNetworkPartitioned is partition-evictor's mark on a
+	// network-partitioned node.
+	TaintNetworkPartitioned = "passiontech.dev/network-partitioned"
+	// TaintCPUSteal is cpu-steal-taint-sync's mark on a worker under
+	// sustained hypervisor steal pressure — PreferNoSchedule, drains
+	// new placements only.
+	TaintCPUSteal = "passiontech.dev/cpu-steal"
 )
 
 // ---------------------------------------------------------------------------

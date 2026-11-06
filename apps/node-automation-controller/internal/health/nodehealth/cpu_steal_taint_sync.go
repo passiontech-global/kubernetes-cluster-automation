@@ -56,10 +56,10 @@ const (
 	// constant exists, same convention as the hang-latch literals.
 	cpuStealCond corev1.NodeConditionType = "CPUStealPressure"
 
-	// The taint this check owns — PreferNoSchedule drains new
-	// placements without evicting the pods already running on the
-	// throttled worker (eviction is NHC's call, not a taint's).
-	cpuStealTaintKey   = "passiontech.io/cpu-steal"
+	// cpuStealTaintValue pairs with kube.TaintCPUSteal — the taint is
+	// PreferNoSchedule so it drains new placements without evicting
+	// the pods already running on the throttled worker (eviction is
+	// NHC's call, not a taint's).
 	cpuStealTaintValue = "high"
 )
 
@@ -67,7 +67,7 @@ var (
 	// Worker nodes carrying the cpu-steal taint.
 	cpuStealTaintedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_node_cpu_steal_tainted",
-		Help: "1 while the worker carries the passiontech.io/cpu-steal PreferNoSchedule taint.",
+		Help: "1 while the worker carries the passiontech.dev/cpu-steal PreferNoSchedule taint.",
 	}, []string{"node"})
 )
 
@@ -76,7 +76,7 @@ func init() {
 		cpuStealTaintedGauge)
 }
 
-// checkCPUStealTaintSync syncs the passiontech.io/cpu-steal taint
+// checkCPUStealTaintSync syncs the passiontech.dev/cpu-steal taint
 // with the CPUStealPressure latch: a worker pressured for >=5m gets
 // tainted PreferNoSchedule so fresh pods land elsewhere — but ONLY
 // while >=2 other Ready, unpressured, untainted workers remain to
@@ -123,7 +123,7 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 		if kube.IsControlPlane(n) {
 			continue
 		}
-		tainted := kube.HasTaint(n.Spec.Taints, cpuStealTaintKey)
+		tainted := kube.HasTaint(n.Spec.Taints, kube.TaintCPUSteal)
 		if condTrue[n.Name] {
 			// Pressure still on — the clear clock re-arms.
 			clearKeep[n.Name] = false
@@ -132,7 +132,7 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 					fmt.Sprintf("%s(%s)", n.Name, age.Truncate(time.Minute)))
 				if !tainted && p.stealHealthyWorkers(nodes, n.Name) >= cpuStealMinHealthy {
 					if err := kube.TaintNode(ctx, p.CS, n.Name,
-						cpuStealTaintKey, cpuStealTaintValue,
+						kube.TaintCPUSteal, cpuStealTaintValue,
 						corev1.TaintEffectPreferNoSchedule); err != nil {
 						metrics.IncError(p.Name)
 						log.Error(err, "cpu-steal taint failed", "node", n.Name)
@@ -148,7 +148,7 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 			if tainted {
 				first, _ := p.clear.Observe(n.Name, now)
 				if now.Sub(first) >= cpuStealClearMinAge {
-					if err := kube.UntaintNode(ctx, p.CS, n.Name, cpuStealTaintKey); err != nil {
+					if err := kube.UntaintNode(ctx, p.CS, n.Name, kube.TaintCPUSteal); err != nil {
 						metrics.IncError(p.Name)
 						log.Error(err, "cpu-steal untaint failed", "node", n.Name)
 					} else {
@@ -186,7 +186,7 @@ func (p *cpuStealTaintSyncCheck) stealHealthyWorkers(nodes []corev1.Node, exclud
 		w := &nodes[i]
 		if w.Name == exclude || kube.IsControlPlane(w) ||
 			!kube.NodeReady(w) || w.Spec.Unschedulable ||
-			kube.HasTaint(w.Spec.Taints, cpuStealTaintKey) {
+			kube.HasTaint(w.Spec.Taints, kube.TaintCPUSteal) {
 			continue
 		}
 		if c := kube.NodeCondition(w, cpuStealCond); c != nil &&

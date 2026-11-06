@@ -18,7 +18,7 @@
 // would burn the ACME rate limit). Per-item failures log + continue.
 //
 // Budget persistence: the counter lives in memory AND in the
-// node.ops/acme-order-resets annotation ("<total>,<lastRFC3339>") on
+// passiontech.dev/acme-order-resets annotation ("<total>,<lastRFC3339>") on
 // the Certificate itself — a controller restart cannot refund resets
 // and hammer the ACME rate limit. A cert that heals (Ready=True and
 // no longer a reap candidate) gets both halves wiped so its next
@@ -68,7 +68,7 @@ var (
 )
 
 // certReset is the per-certificate reset budget tracked in memory.
-// The node.ops/acme-order-resets annotation on the Certificate is the
+// The passiontech.dev/acme-order-resets annotation on the Certificate is the
 // durable half — hydrated into this map on first sight after a
 // restart, written back on every reset, and wiped together with the
 // map entry when the cert reports Ready=True and is no longer a reap
@@ -93,7 +93,7 @@ type certManagerReaper struct {
 	now shared.Clock
 	// crReaped: cert key → last stuck-CertificateRequest delete —
 	// the 6h in-RAM half of the W8 CR-reap cooldown (the durable
-	// half shares node.ops/acme-order-resets). CooldownSet is
+	// half shares passiontech.dev/acme-order-resets). CooldownSet is
 	// zero-value ready — no arm needed.
 	crReaped state.CooldownSet
 	// crCache: per-run CertificateRequest list cache keyed by

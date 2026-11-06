@@ -134,7 +134,7 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 }
 
 // certResetFromAnnotation hydrates the reset budget from the
-// node.ops/acme-order-resets annotation ("<total>,<lastRFC3339>") on
+// passiontech.dev/acme-order-resets annotation ("<total>,<lastRFC3339>") on
 // the Certificate. Malformed values hydrate to a zero budget — the
 // reaper then re-earns its stamps one reset at a time, never the
 // other way around.
@@ -157,7 +157,7 @@ func certResetFromAnnotation(cert *unstructured.Unstructured) *certReset {
 	return st
 }
 
-// patchResetsAnnotation merge-patches node.ops/acme-order-resets on
+// patchResetsAnnotation merge-patches passiontech.dev/acme-order-resets on
 // the Certificate: "<total>,<lastRFC3339>" while st is non-nil, null
 // (annotation removed) when the cert healed and the budget resets.
 func (r *certManagerReaper) patchResetsAnnotation(ctx context.Context,

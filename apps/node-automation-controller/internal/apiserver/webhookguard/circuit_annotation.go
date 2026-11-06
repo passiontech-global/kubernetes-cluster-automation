@@ -1,4 +1,4 @@
-// circuit_annotation.go — the node.ops/circuit-broken-webhooks
+// circuit_annotation.go — the passiontech.dev/circuit-broken-webhooks
 // annotation: the C1 circuit breaker's persistent trip record, kept on
 // the webhook config object itself so it survives pod restarts and
 // stays human-readable in kubectl describe. The value is a plain

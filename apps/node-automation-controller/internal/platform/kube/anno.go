@@ -1,4 +1,4 @@
-// anno.go — annotation timestamp helpers. The node.ops/last-*
+// anno.go — annotation timestamp helpers. The passiontech.dev/last-*
 // stamps (last-es-nudge, last-helm-unlock, last-source-nudge,
 // last-immutable-job-heal, last-helm-stall-unwedge, ...) are the
 // DURABLE half of their modules' cooldowns — they survive operator

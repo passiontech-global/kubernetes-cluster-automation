@@ -1,6 +1,6 @@
 // force_sync_nudge.go — the nudge pass of externalsecret-nudge: every
 // ExternalSecret Ready=False for longer than esStuckAge gets the
-// force-sync + node.ops/last-es-nudge annotations merge-patched on,
+// force-sync + passiontech.dev/last-es-nudge annotations merge-patched on,
 // forcing an immediate ESO reconcile that skips the remaining
 // backoff. Rate-limited to one stamp per esNudgeCooldown by BOTH the
 // in-memory ledger and the persisted stamps esNudgeStamp reads back.
@@ -161,7 +161,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 }
 
 // esNudgeStamp returns the newest persisted nudge marker on the ES —
-// force-sync or node.ops/last-es-nudge, whichever parses latest. Both
+// force-sync or passiontech.dev/last-es-nudge, whichever parses latest. Both
 // keys go through kube.ParseAnnoTime: absent/empty/unparseable values
 // count as absent (a garbage stamp cannot prove a recent nudge, and
 // stamping over it is exactly how the ES gets unstuck), and each

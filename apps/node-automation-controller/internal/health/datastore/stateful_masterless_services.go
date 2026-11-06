@@ -107,7 +107,7 @@ const (
 	dragonflyOperatorSettleMin = 3 * time.Minute
 	// dragonflyPodHealCooldown bounds ordinal-0 pod deletes to one
 	// per STS — wider of the in-RAM ledger and the persisted
-	// node.ops/last-dragonfly-pod-heal stamp (same wider-of-both
+	// passiontech.dev/last-dragonfly-pod-heal stamp (same wider-of-both
 	// shape as the operator heal above).
 	dragonflyPodHealCooldown = 30 * time.Minute
 	// dragonflyPodHealAnno persists the last ordinal-0 pod delete on
