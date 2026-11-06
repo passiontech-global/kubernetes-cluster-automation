@@ -80,6 +80,14 @@ func (c *CooldownSet) Entries() map[string]time.Time {
 	return out
 }
 
+// Last returns key's last-action stamp without copying the ledger —
+// the single-key read for "when did this one fire" diagnostics;
+// Entries() is for bulk inspection only (it copies the whole map).
+func (c *CooldownSet) Last(key string) (time.Time, bool) {
+	t, ok := c.last[key]
+	return t, ok
+}
+
 // FirstSeenLedger tracks when each key was first observed — the
 // persistence window behind "condition held for >Nm" signatures.
 type FirstSeenLedger struct {
