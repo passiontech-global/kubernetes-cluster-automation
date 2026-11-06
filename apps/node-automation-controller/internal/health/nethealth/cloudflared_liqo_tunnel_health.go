@@ -10,10 +10,7 @@ package nethealth
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,7 +24,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -66,13 +62,14 @@ const (
 	CheckNameCloudflaredTunnelHealth = "cloudflared-tunnel-health"
 
 	// cloudflared-tunnel-health knobs.
-	cfTunnelPodMinAge   = 5 * time.Minute
-	cfTunnelMinStreak   = 2
-	cfTunnelHealCool    = 30 * time.Minute
-	cfTunnelMetricsPort = 2000
-	cfTunnelHTTPTimeout = 8 * time.Second
-	cfTunnelTailLines   = int64(200)
-	cfTunnelLogMaxByte  = 256 * 1024
+	cfTunnelPodMinAge      = 5 * time.Minute
+	cfTunnelMinStreak      = 2
+	cfTunnelHealCool       = 30 * time.Minute
+	cfTunnelMetricsPort    = 2000
+	cfTunnelHTTPTimeout    = 8 * time.Second
+	cfTunnelTailLines      = int64(200)
+	cfTunnelLogMaxByte     = int64(256 * 1024)
+	cfTunnelMetricsMaxByte = int64(1 << 20)
 )
 
 // cfTunnelQUICMarkers are the log signatures of a cloudflared
@@ -116,36 +113,21 @@ func isCloudflaredPod(pod *corev1.Pod) bool {
 // the maximum cloudflared_tunnel_ha_connections value — 0 means the
 // connector holds no edge connections (a dead tunnel behind a live
 // Ready gate). ok=false when the endpoint is unreachable or the
-// metric is absent — inconclusive, not healthy.
+// metric is absent — inconclusive, not healthy (FetchPodMetrics
+// folds every failure shape — no client, no IP, transport error,
+// non-200 — into the same inconclusive err).
 func (p *cloudflaredTunnelHealthCheck) cfTunnelHAConnections(ctx context.Context,
 	pod *corev1.Pod) (float64, bool) {
 
-	if pod.Status.PodIP == "" || p.HTTPClient == nil {
-		return 0, false
-	}
-	lctx, cancel := context.WithTimeout(ctx, cfTunnelHTTPTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(lctx, http.MethodGet,
-		fmt.Sprintf("http://%s:%d/metrics", pod.Status.PodIP, cfTunnelMetricsPort), nil)
+	body, err := probefw.FetchPodMetrics(ctx, p.HTTPClient, pod.Status.PodIP,
+		cfTunnelMetricsPort, cfTunnelHTTPTimeout, cfTunnelMetricsMaxByte)
 	if err != nil {
-		return 0, false
-	}
-	resp, err := p.HTTPClient.Do(req)
-	if err != nil {
-		return 0, false
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil || resp.StatusCode != http.StatusOK {
 		return 0, false
 	}
 	found := false
 	maxV := 0.0
-	for _, line := range strings.Split(string(body), "\n") {
-		v, ok := scrapeMetricValue(line, "cloudflared_tunnel_ha_connections")
-		if !ok {
-			continue
-		}
+	for _, v := range probefw.ParseMetricValues(
+		string(body), "cloudflared_tunnel_ha_connections") {
 		found = true
 		if v > maxV {
 			maxV = v
@@ -154,67 +136,25 @@ func (p *cloudflaredTunnelHealthCheck) cfTunnelHAConnections(ctx context.Context
 	return maxV, found
 }
 
-// scrapeMetricValue parses one prometheus text-format line —
-// `name{labels} value` or `name value` — returning the sample value.
-// A comment/blank line or a different metric name reads absent.
-func scrapeMetricValue(line, name string) (float64, bool) {
-	if line == "" || strings.HasPrefix(line, "#") {
-		return 0, false
-	}
-	rest, ok := strings.CutPrefix(line, name)
-	if !ok {
-		return 0, false
-	}
-	var raw string
-	switch {
-	case strings.HasPrefix(rest, "{"):
-		idx := strings.LastIndex(rest, "}")
-		if idx < 0 {
-			return 0, false
-		}
-		raw = strings.TrimSpace(rest[idx+1:])
-	case strings.HasPrefix(rest, " "):
-		raw = strings.TrimSpace(rest)
-	default:
-		return 0, false
-	}
-	// A second field (exemplar/timestamp) is rare on these gauges —
-	// take the first token only.
-	raw, _, _ = strings.Cut(raw, " ")
-	v, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
-		return 0, false
-	}
-	return v, true
-}
-
 // cfTunnelLogQUICStorm fetches the pod's log tail and reports
-// whether a QUIC edge-dial failure signature is present.
+// whether a QUIC edge-dial failure signature is present. The
+// default-container rule applies (no container name — cloudflared
+// pods carry a single workload container); a fetch/read failure is
+// inconclusive, not healthy.
 func (p *cloudflaredTunnelHealthCheck) cfTunnelLogQUICStorm(ctx context.Context,
 	pod *corev1.Pod) (bool, error) {
 
-	lctx, cancel := context.WithTimeout(ctx, cfTunnelHTTPTimeout)
-	defer cancel()
-	tail := cfTunnelTailLines
-	stream, err := p.CS.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name,
-		&corev1.PodLogOptions{TailLines: &tail}).Stream(lctx)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = stream.Close() }()
-	data, err := io.ReadAll(io.LimitReader(stream, cfTunnelLogMaxByte))
-	if err != nil {
-		return false, err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		l := strings.ToLower(line)
-		for _, marker := range cfTunnelQUICMarkers {
-			if strings.Contains(l, marker) {
-				return true, nil
+	return probefw.PodLogTail(ctx, p.CS, pod, "",
+		cfTunnelTailLines, cfTunnelLogMaxByte, cfTunnelHTTPTimeout,
+		func(line string) bool {
+			l := strings.ToLower(line)
+			for _, marker := range cfTunnelQUICMarkers {
+				if strings.Contains(l, marker) {
+					return true
+				}
 			}
-		}
-	}
-	return false, nil
+			return false
+		})
 }
 
 // checkCloudflaredTunnelHealth scans Running cloudflared pods older
@@ -233,18 +173,9 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
-	readyByOwner := map[types.UID]int{}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if pod.DeletionTimestamp != nil ||
-			pod.Status.Phase != corev1.PodRunning ||
-			!kube.PodReadyCond(pod) {
-			continue
-		}
-		if ref := metav1.GetControllerOf(pod); ref != nil {
-			readyByOwner[ref.UID]++
-		}
-	}
+	// Ready siblings per controller UID — the heal's "someone can
+	// absorb the traffic" proof.
+	readyByOwner := probefw.ReadyByOwner(pods.Items)
 
 	current := map[string][]string{}
 	streakKeep := map[string]bool{}
@@ -293,11 +224,10 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 			log.Info("skip heal: unowned cloudflared pod", "pod", key)
 			continue
 		}
-		siblings := readyByOwner[ref.UID]
-		if kube.PodReadyCond(pod) {
-			siblings-- // the degraded pod can still report Ready — discount it
-		}
-		if siblings < 1 {
+		// The degraded pod can still report Ready (the gray-failure
+		// shape) — ReadySiblings discounts it so the guard requires
+		// a GENUINELY separate sibling.
+		if probefw.ReadySiblings(readyByOwner, pod) < 1 {
 			log.Info("skip heal: no healthy cloudflared sibling — edge outage vs wedge unverifiable",
 				"pod", key)
 			continue
@@ -428,9 +358,8 @@ type liqoPeerFinding struct {
 func (p *liqoTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 	// The CR scan needs dyn — a missing client is a wiring bug, not
 	// "no signal" (same posture as the scylla check).
-	if p.Dyn == nil {
-		return probefw.Result{Infra: errors.New(
-			"no dynamic client — liqo tunnel check unverifiable")}
+	if r := p.RequireDyn("liqo tunnel check"); r != nil {
+		return *r
 	}
 	log := logf.FromContext(ctx)
 	now := p.Now()

@@ -18,6 +18,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -126,8 +127,10 @@ func (p *imagePullStormCheck) Run(ctx context.Context) probefw.Result {
 			// that only just started storming would flag instantly.
 			key := "imgpull/" + pod.Namespace + "/" + pod.Name + "/" + cs.Name
 			live[key] = true
-			first, _ := p.seen.Observe(key, now)
-			if now.Sub(first) < imagePullMinAge {
+			// Quiet site: the first-seen window needs no "tracking"
+			// log line — Discard keeps the shared helper silent.
+			if !probefw.Persisted(&p.seen, key, now, imagePullMinAge,
+				logr.Discard()) {
 				return
 			}
 			offenders = append(offenders, offender{

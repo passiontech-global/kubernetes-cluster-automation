@@ -22,6 +22,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -52,17 +53,23 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 		// The cooldown reads the wider of the in-RAM ledger and the
 		// persisted passiontech.dev/last-helm-unlock stamp — an operator
 		// restart empties the ledger but must not refund the 24h.
-		last, ok := u.unlocked.Last(key)
-		if t, hasAnno := helmLastUnlock(hr); hasAnno && t.After(last) {
-			last, ok = t, true
+		// The persisted stamp is folded INTO the ledger before the
+		// verdict because the fold is load-bearing: unlocked.Prune
+		// releases the alerted dedup only when the ledger entry ages
+		// out, so an anno-only stamp must live in the ledger too.
+		if t, hasAnno := helmLastUnlock(hr); hasAnno {
+			if last, _ := u.unlocked.Last(key); t.After(last) {
+				u.unlocked.Stamp(key, t)
+			}
 		}
-		if ok && now.Sub(last) < helmUnlockCooldown {
-			u.unlocked.Stamp(key, last) // fold the persisted stamp into the ledger
+		if heal.PersistedCooledDown(&u.unlocked, hr, helmLastUnlockAnno,
+			key, helmUnlockCooldown, now) {
 			// Still/again stuck inside the cooldown: the previous
 			// unlock did NOT resolve it — page instead of churning
 			// secrets every tick. The alert itself fires once per
 			// cooldown window (alerted ledger), not per sweep.
 			if u.alerted.Add(key) {
+				last, _ := u.unlocked.Last(key)
 				metrics.IncError(u.queue)
 				log.Info("ALERT: HR still stuck after unlock — not retrying inside cooldown",
 					"hr", key, "unlockedAgo", now.Sub(last).Truncate(time.Minute))

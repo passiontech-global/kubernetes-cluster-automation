@@ -64,7 +64,10 @@ type csrWatcher struct {
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
-	queue    string
+	queue string
+	// now is the wall-clock seam so tests can age a CSR past
+	// csrMinAge without sleeping. nil reads as system time.
+	now      shared.Clock
 	warned   state.SeenSet // detect mode: warn-logged once per CSR
 	reported state.SeenSet // approve mode: IncError fired once per CSR
 }
@@ -72,13 +75,35 @@ type csrWatcher struct {
 // Setup registers the 10m sweep — always runs (detect mode
 // still reports pending CSRs); `approve` only controls the action.
 func Setup(d shared.Deps) error {
-	approve := envx.Gate("CSR_APPROVER_ENABLED", false)
-	w := &csrWatcher{cs: d.CS, approve: approve, queue: d.Name}
-	return shared.AddPeriodic(d.Mgr, w.queue, 10*time.Minute, w.run)
+	return shared.SetupWithConfig(d, configFromEnv, func(cfg watcherConfig) error {
+		w := &csrWatcher{
+			cs:      d.CS,
+			approve: cfg.approve,
+			queue:   d.Name,
+			now:     shared.SystemClock,
+		}
+		return shared.AddPeriodic(d.Mgr, w.queue, 10*time.Minute, w.run)
+	})
+}
+
+// watcherConfig is the module's env-resolved knob set — carried
+// through SetupWithConfig's parse step.
+type watcherConfig struct {
+	approve bool
+}
+
+// configFromEnv resolves CSR_APPROVER_ENABLED — a SUB-gate, not a
+// registration gate: the sweep registers either way, the flag only
+// flips detect -> approve. SetupWithConfig runs the parse before
+// the Deps.Disabled check (moot today — csr-watcher has no
+// GateEnv — but uniform with the gated modules).
+func configFromEnv() watcherConfig {
+	return watcherConfig{approve: envx.Gate("CSR_APPROVER_ENABLED", false)}
 }
 
 func (w *csrWatcher) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
+	now := w.now.Now()
 
 	// Paged list — CSRs accumulate forever on clusters where nothing
 	// auto-approves them, so bound each apiserver response instead of
@@ -98,7 +123,7 @@ func (w *csrWatcher) run(ctx context.Context) error {
 		if csrDecided(csr) {
 			continue
 		}
-		if time.Since(csr.CreationTimestamp.Time) <= csrMinAge {
+		if now.Sub(csr.CreationTimestamp.Time) <= csrMinAge {
 			continue
 		}
 		pending++
@@ -122,15 +147,15 @@ func (w *csrWatcher) run(ctx context.Context) error {
 		// LastUpdateTime AND LastTransitionTime, and consumers that
 		// key on transition time (kubectl certificate, cert-manager's
 		// approver parity checks) read it as unset otherwise.
-		now := metav1.Now()
+		stamp := metav1.NewTime(now)
 		csr.Status.Conditions = append(csr.Status.Conditions,
 			certificatesv1.CertificateSigningRequestCondition{
 				Type:               certificatesv1.CertificateApproved,
 				Status:             corev1.ConditionTrue,
 				Reason:             "NodeOpsAutoApprove",
 				Message:            "validated by node-automation-controller",
-				LastUpdateTime:     now,
-				LastTransitionTime: now,
+				LastUpdateTime:     stamp,
+				LastTransitionTime: stamp,
 			})
 		if _, err := w.cs.CertificatesV1().CertificateSigningRequests().
 			UpdateApproval(ctx, csr.Name, csr, metav1.UpdateOptions{}); err != nil {

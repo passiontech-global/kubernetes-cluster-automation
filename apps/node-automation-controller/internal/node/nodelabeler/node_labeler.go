@@ -82,22 +82,37 @@ var nodeLabelChanges = predicate.Funcs{
 // Setup wires the node-labeler reconciler. configPath is the
 // labels.txt file (default /etc/node-labeler/labels.txt).
 func Setup(d shared.Deps) error {
-	configPath := envx.Getenv("NODE_LABELER_CONFIG_PATH",
-		"/etc/node-labeler/labels.txt")
-	logf.Log.WithName(d.Name).Info("registered", "configPath", configPath)
-	r := &nodeLabeler{cs: d.CS, queue: d.Name, configPath: configPath}
-	return ctrl.NewControllerManagedBy(d.Mgr).
-		Named(d.Name).
-		// Watches with a single fixed workqueue key, not For(): the
-		// reconcile ignores req.Name and always sweeps the whole
-		// cluster, so per-node keys only produced N duplicate queued
-		// requests + N independent RequeueAfter timers per informer
-		// sync. One key collapses both to a single sweep (see
-		// shared.SweepRequests). Predicate semantics are unchanged.
-		Watches(&corev1.Node{},
-			handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
-			builder.WithPredicates(nodeLabelChanges)).
-		Complete(shared.CountReconcile(d.Name, r.Reconcile))
+	return shared.SetupWithConfig(d, configFromEnv, func(cfg labelerConfig) error {
+		logf.Log.WithName(d.Name).Info("registered", "configPath", cfg.configPath)
+		r := &nodeLabeler{cs: d.CS, queue: d.Name, configPath: cfg.configPath}
+		return ctrl.NewControllerManagedBy(d.Mgr).
+			Named(d.Name).
+			// Watches with a single fixed workqueue key, not For(): the
+			// reconcile ignores req.Name and always sweeps the whole
+			// cluster, so per-node keys only produced N duplicate queued
+			// requests + N independent RequeueAfter timers per informer
+			// sync. One key collapses both to a single sweep (see
+			// shared.SweepRequests). Predicate semantics are unchanged.
+			Watches(&corev1.Node{},
+				handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
+				builder.WithPredicates(nodeLabelChanges)).
+			Complete(shared.CountReconcile(d.Name, r.Reconcile))
+	})
+}
+
+// labelerConfig is the module's env-resolved knob set — carried
+// through SetupWithConfig's parse step.
+type labelerConfig struct {
+	configPath string
+}
+
+// configFromEnv resolves NODE_LABELER_CONFIG_PATH. SetupWithConfig
+// runs it before the Deps.Disabled check — moot today (node-labeler
+// has no GateEnv) but it keeps the parse->gate->register shape
+// uniform with the gated modules.
+func configFromEnv() labelerConfig {
+	return labelerConfig{configPath: envx.Getenv("NODE_LABELER_CONFIG_PATH",
+		"/etc/node-labeler/labels.txt")}
 }
 
 func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {

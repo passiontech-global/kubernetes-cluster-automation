@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -46,7 +45,7 @@ type linkerdEndpointSyncCheck struct {
 	//     bounce — the 1h per-service cooldown (in-RAM: the pod is
 	//     the heal target, nothing else can carry the stamp).
 	linkerdDesyncSince   state.FirstSeenLedger
-	linkerdDesyncEmitted map[string]bool
+	linkerdDesyncEmitted state.GaugeLedger[string]
 	linkerdDesyncHealed  state.CooldownSet
 	// verdict memoizes the maintenance-mutex evaluation the
 	// per-service heal preambles share — one evaluation per
@@ -54,14 +53,12 @@ type linkerdEndpointSyncCheck struct {
 	verdict kube.Verdict
 }
 
-// newLinkerdEndpointSyncCheck builds the W9-NM2 check with fresh
-// tracking maps — the state-map initialization that used to live in
-// the monolithic newClusterHealthProber literal. The time-keyed
-// ledgers are zero-value ready; only the gauge-tuple set arms here.
+// newLinkerdEndpointSyncCheck builds the W9-NM2 check — every
+// ledger is zero-value ready, so the constructor carries no
+// initialization (the state-map literals retired with the monolithic
+// newClusterHealthProber).
 func NewLinkerdEndpointSyncCheck(d *probefw.Deps) probefw.Check {
-	return &linkerdEndpointSyncCheck{Deps: d,
-		linkerdDesyncEmitted: map[string]bool{},
-	}
+	return &linkerdEndpointSyncCheck{Deps: d}
 }
 
 const (
@@ -200,9 +197,6 @@ func staleLinkerdSlices(slices []linkerdSliceRef,
 func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	if p.linkerdDesyncEmitted == nil {
-		p.linkerdDesyncEmitted = map[string]bool{}
-	}
 
 	// Namespaces opted into injection — the only places a desynced
 	// EndpointSlice actually strands mesh traffic.
@@ -217,7 +211,10 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	desynced := map[string]bool{} // "ns/name" diverged this sweep
+	// desynced maps each "ns/name" diverged this sweep to its gauge
+	// label values — the ledger stores the tuple so no key ever
+	// gets SplitN'd back apart.
+	desynced := map[string][]string{}
 	// staleSlices: "ns/svc" → the provably-stale managed EndpointSlices
 	// to delete if the service's desync survives the window (W10-FIX7).
 	staleSlices := map[string][]linkerdSliceRef{}
@@ -333,7 +330,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 			}
 			key := svc.Namespace + "/" + svc.Name
 			if linkerdEndpointSetsDiverge(readyIPs, liveIPs, esReady[key]) {
-				desynced[key] = true
+				desynced[key] = []string{svc.Namespace, svc.Name}
 			}
 			if stale := staleLinkerdSlices(
 				managedSlices[key], readyAgedIPs, liveIPs); len(stale) > 0 {
@@ -342,31 +339,18 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 
-	emitted := map[string]bool{} // "ns/name" past the persistence window
-	p.linkerdDesyncSince.Prune(func(k string) bool { return desynced[k] })
-	for k := range desynced {
-		first, seen := p.linkerdDesyncSince.Observe(k, now)
-		if !seen {
-			log.Info("linkerd endpoint desync — tracking first-seen", "service", k)
+	emitted := map[string][]string{} // "ns/name" → lvs past the persistence window
+	p.linkerdDesyncSince.Prune(func(k string) bool { _, ok := desynced[k]; return ok })
+	for k, lv := range desynced {
+		if !probefw.Persisted(&p.linkerdDesyncSince, k, now,
+			linkerdEndpointDesyncMinAge, log) {
 			continue
 		}
-		if now.Sub(first) < linkerdEndpointDesyncMinAge {
-			continue
-		}
-		emitted[k] = true
-		parts := strings.SplitN(k, "/", 2)
-		metrics.LinkerdEndpointDesync.WithLabelValues(parts[0], parts[1]).Set(1)
+		emitted[k] = lv
+		metrics.LinkerdEndpointDesync.WithLabelValues(lv...).Set(1)
 	}
-	for k := range p.linkerdDesyncEmitted {
-		if emitted[k] {
-			continue
-		}
-		if parts := strings.SplitN(k, "/", 2); len(parts) == 2 {
-			metrics.LinkerdEndpointDesync.DeleteLabelValues(parts[0], parts[1])
-		}
-		delete(p.linkerdDesyncEmitted, k)
-	}
-	maps.Copy(p.linkerdDesyncEmitted, emitted)
+	p.linkerdDesyncEmitted.Reconcile(emitted,
+		metrics.LinkerdEndpointDesync.DeleteLabelValues)
 
 	// Past the window: bounce the oldest linkerd-destination pod so
 	// its endpoint table rebuilds from the current EndpointSlices.

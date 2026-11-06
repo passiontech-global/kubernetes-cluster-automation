@@ -69,10 +69,12 @@ package helmreleaseunlocker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
 
+	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -85,6 +87,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -170,18 +173,31 @@ type stallAttempt struct {
 
 // Setup registers the 10-minute sweep. HELM_STALL_UNWEDGE_ENABLED
 // gates ONLY the stalled-rollout unwedge pass (the pod-affecting
-// signature); the pending-secret unlock and the artifact-source
-// healer run unconditionally like before.
+// signature) — a run-behavior sub-gate parsed through SetupWithConfig,
+// NOT a registration gate; the pending-secret unlock and the
+// artifact-source healer run unconditionally like before.
 func Setup(d shared.Deps) error {
-	u := &helmReleaseUnlocker{
-		cs:            d.CS,
-		dyn:           d.Dyn,
-		queue:         d.Name,
-		now:           shared.SystemClock,
-		stallEnabled:  envx.Gate("HELM_STALL_UNWEDGE_ENABLED", false),
-		stallAttempts: map[string]*stallAttempt{},
-	}
-	return shared.AddPeriodic(d.Mgr, u.queue, helmUnlockInterval, u.run)
+	return shared.SetupWithConfig(d, stallEnabledFromEnv,
+		func(stallEnabled bool) error {
+			u := &helmReleaseUnlocker{
+				cs:            d.CS,
+				dyn:           d.Dyn,
+				queue:         d.Name,
+				now:           shared.SystemClock,
+				stallEnabled:  stallEnabled,
+				stallAttempts: map[string]*stallAttempt{},
+			}
+			return shared.AddPeriodic(d.Mgr, u.queue, helmUnlockInterval, u.run)
+		})
+}
+
+// stallEnabledFromEnv resolves the stalled-rollout unwedge sub-gate.
+// SetupWithConfig runs it before the Deps.Disabled check so an
+// unparseable HELM_STALL_UNWEDGE_ENABLED warns even on a gated-off
+// cluster (the module carries no GateEnv row — always registered —
+// but the parse-before-gate ordering contract stays uniform).
+func stallEnabledFromEnv() bool {
+	return envx.Gate("HELM_STALL_UNWEDGE_ENABLED", false)
 }
 
 func (u *helmReleaseUnlocker) run(ctx context.Context) error {
@@ -261,16 +277,18 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	}
 	sort.Strings(stallDue)
 
-	var firstErr error
+	// The superseded-secret prune, the helm-controller health gate
+	// and the Kustomization list are independent duties — a failure
+	// in one must never blind the others, so all run and their
+	// errors join (nil+nil+nil → nil).
 	// W9-CP2 — Kine bloat guard: cap superseded helm release secrets
 	// per release. Independent of every signature below — it runs on
 	// every sweep, healthy cluster or not, and BEFORE the per-HR
 	// unlock pass so its cluster-wide list never masks the
 	// release-scoped secret lists the unlock path performs.
-	if err := u.pruneSupersededSecrets(ctx); err != nil && firstErr == nil {
-		firstErr = err
-	}
+	pruneErr := u.pruneSupersededSecrets(ctx)
 	unlocked, unwedged := 0, 0
+	var ctlErr error
 	if len(due) > 0 || len(stallDue) > 0 {
 		// helm-controller crashlooping → neither signature can
 		// converge (someone must finish the rollback after the
@@ -282,7 +300,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 		case err != nil:
 			// Report, but don't blind the C1 source healer below —
 			// it reads different resources than the pod list.
-			firstErr = err
+			ctlErr = err
 		case down:
 			log.Info("SKIP: helm-controller pod CrashLoopBackOff — unlock/unwedge would not converge",
 				"due", due, "stallDue", stallDue)
@@ -298,8 +316,9 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	// HR half still runs, the immutable-Job healer has nothing to
 	// scan; a real error is reported once for both consumers.
 	kustomizations, err := u.listAllPages(ctx, u.dyn.Resource(fluxKustomizationGVR))
-	if err != nil && !apierrors.IsNotFound(err) && firstErr == nil {
-		firstErr = fmt.Errorf("list kustomizations: %w", err)
+	var ksErr error
+	if err != nil && !apierrors.IsNotFound(err) {
+		ksErr = fmt.Errorf("list kustomizations: %w", err)
 	}
 	// C1 — stale-artifact source healing is independent of the
 	// in-progress unlock path: it scans the same HR list plus
@@ -311,7 +330,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	u.healImmutableJobs(ctx, kustomizations)
 	log.Info("sweep done", "stuck", len(stuck), "due", len(due), "unlocked", unlocked,
 		"stalled", len(stalled), "stallDue", len(stallDue), "unwedged", unwedged)
-	return firstErr
+	return errors.Join(pruneErr, ctlErr, ksErr)
 }
 
 // listHelmReleases returns the HR list and the GVR that answered — v2
@@ -371,9 +390,10 @@ func (u *helmReleaseUnlocker) helmControllerDown(ctx context.Context) (bool, err
 
 // cleanFailedHookJobs deletes batchv1 Jobs in ns that carry the
 // helm.sh/hook annotation and report JobFailed=True, with background
-// propagation so their pods go with them. Each deletion bumps
-// metrics.HelmHookJobsCleanedTotal{namespace}. Errors are logged and
-// skipped — hook cleanup never fails the caller.
+// propagation so their pods go with them. Only FAILED hook Jobs are
+// targets — a Running one is a live workload, never reaped. Each
+// deletion bumps metrics.HelmHookJobsCleanedTotal{namespace}. Errors
+// are logged and skipped — hook cleanup never fails the caller.
 func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string) {
 	log := logf.FromContext(ctx)
 	jobs, err := kube.ListAll(ctx,
@@ -383,6 +403,7 @@ func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string
 		log.Error(err, "helm-hook job list failed — hook cleanup skipped", "ns", ns)
 		return
 	}
+	var targets []*batchv1.Job
 	for i := range jobs {
 		j := &jobs[i]
 		if _, ok := j.Annotations["helm.sh/hook"]; !ok {
@@ -391,15 +412,28 @@ func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns string
 		if !jobFailed(j) {
 			continue // still running or succeeded — leave it
 		}
-		log.Info("ACTION: delete failed helm-hook Job",
-			"ns", ns, "job", j.Name)
-		if err := u.cs.BatchV1().Jobs(ns).Delete(ctx, j.Name,
-			kube.UIDDeleteOptions(j.UID, metav1.DeletePropagationBackground)); err != nil {
-			log.Error(err, "helm-hook job delete failed", "ns", ns, "job", j.Name)
-			continue
-		}
-		metrics.HelmHookJobsCleanedTotal.WithLabelValues(ns).Inc()
+		targets = append(targets, j)
 	}
+	reap.Sweep(ctx, log, targets, reap.Options[*batchv1.Job]{
+		LogTarget: func(log logr.Logger, j *batchv1.Job) {
+			log.Info("ACTION: delete failed helm-hook Job",
+				"ns", ns, "job", j.Name)
+		},
+		Delete: func(ctx context.Context, j *batchv1.Job) error {
+			if err := u.cs.BatchV1().Jobs(ns).Delete(ctx, j.Name,
+				kube.UIDDeleteOptions(j.UID, metav1.DeletePropagationBackground)); err != nil {
+				return err
+			}
+			metrics.HelmHookJobsCleanedTotal.WithLabelValues(ns).Inc()
+			return nil
+		},
+		// Delete failures are logged and skipped, never IncError'd —
+		// the sweep is best-effort residue cleanup riding a heal,
+		// and the periodic wrapper already counts the run error.
+		OnError: func(log logr.Logger, j *batchv1.Job, err error) {
+			log.Error(err, "helm-hook job delete failed", "ns", ns, "job", j.Name)
+		},
+	})
 }
 
 // jobFailed reports whether the Job carries a JobFailed=True condition.

@@ -1,7 +1,7 @@
 // stale_recover.go — the heal action of coredns-stale-watchdog:
-// cooldown/storm-gate/rollout gates, then either a Deployment
-// rollout-restart (whole fleet stale) or surgical deletes of only the
-// stale pods, plus stamping the cooldown annotation.
+// cooldown/storm-gate/maintenance-mutex/rollout gates, then either a
+// Deployment rollout-restart (whole fleet stale) or surgical deletes
+// of only the stale pods, plus stamping the cooldown annotation.
 package corednswatchdog
 
 import (
@@ -15,14 +15,18 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// recover applies cooldown/storm-gate/rollout gates, then either
-// rollout-restarts the Deployment (whole fleet stale) or deletes only
-// the stale pods, and stamps the cooldown annotation. Hard API
+// recover applies cooldown/storm-gate/maintenance-mutex/rollout
+// gates, then either rollout-restarts the Deployment (whole fleet
+// stale) or deletes only the stale pods, and stamps the cooldown
+// annotation. podUID maps pod name → the UID the sweep's pod list
+// saw — the deletes carry it as a UID precondition. Hard API
 // failures are returned so the wrapper counts them.
-func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods int) error {
+func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
+	podUID map[string]types.UID, nPods int) error {
 	log := logf.FromContext(ctx)
 	deploy, err := w.cs.AppsV1().Deployments(corednsNS).Get(ctx, "coredns", metav1.GetOptions{})
 	if err != nil {
@@ -50,6 +54,21 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 		metrics.IncError(w.queue)
 		log.Info("SKIP recovery: nodes NotReady — cluster storm",
 			"pods", suspects, "notReady", notReady)
+		return nil
+	}
+	// Maintenance mutex — a SECOND, different storm signal alongside
+	// the NotReady gate above: cordon/kured/autopilot mean a drain
+	// or k0s upgrade is in flight and pod deletes must not race it.
+	// heal.AllowedV runs with a nil heals ledger — the cooldown
+	// above is annotation-persisted on the Deployment, not a
+	// CooldownSet — and shares w.verdict so the run pays one
+	// evaluation. Held AND unverifiable both defer + count like the
+	// other gates' skips (the defer log with the why/error comes
+	// from AllowedV).
+	proceed, unverifiable := heal.AllowedV(ctx, log, &w.verdict,
+		w.cs, w.dyn, nil, "coredns", 0, w.now.Now())
+	if unverifiable || !proceed {
+		metrics.IncError(w.queue)
 		return nil
 	}
 	// Fleet not fully ready = a rollout is already recreating pods.
@@ -96,10 +115,16 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 		}
 	} else {
 		// Delete only the stale pods — healthy replicas keep serving.
+		// The UID precondition closes the TOCTOU between the sweep's
+		// pod list and the delete: a same-named pod recreated since
+		// is a fresh replica, not ours to kill. Every suspect name
+		// has a podUID entry (same list); an absent entry yields an
+		// empty-UID precondition that can never match a live pod —
+		// fail closed, delete nothing.
 		log.Info("ACTION: delete stale pods", "pods", suspects)
 		for _, name := range suspects {
 			if err := w.cs.CoreV1().Pods(corednsNS).Delete(ctx, name,
-				metav1.DeleteOptions{}); err != nil {
+				kube.UIDDeleteOptions(podUID[name], "")); err != nil {
 				return fmt.Errorf("delete stale pod %s/%s: %w", corednsNS, name, err)
 			}
 		}

@@ -19,7 +19,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // ciliumBPFMapPressureCheck is the cilium BPF map pressure watchdog.
@@ -41,9 +40,6 @@ func NewCiliumBPFMapPressureCheck(d *probefw.Deps) probefw.Check {
 
 const (
 	CheckNameCiliumBPFMapPressure = "cilium-bpf-map-pressure"
-
-	// W10-NM1 — cilium-bpf-map-pressure knobs.
-	ciliumBPFDefaultThreshold = 0.85
 )
 
 var (
@@ -67,10 +63,10 @@ func init() {
 // false FAIL.
 func (p *ciliumBPFMapPressureCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
-	// GetenvFloatPositive keeps >1 (the documented "disable this
-	// check" escape) and rejects <=0 — the same contract the retired
-	// healthEnvFloat had.
-	threshold := envx.GetenvFloatPositive("CILIUM_BPF_MAP_PRESSURE_THRESHOLD", ciliumBPFDefaultThreshold)
+	// The CILIUM_BPF_MAP_PRESSURE_THRESHOLD knob resolves once at
+	// sweep Setup (probefw.CiliumConfigFromEnv — >1 keeps working as
+	// the documented "disable this check" escape).
+	threshold := p.Cfg.Cilium.BPFMapPressureThreshold
 	query := `max by (node, map_name) (cilium_bpf_map_pressure) > ` +
 		strconv.FormatFloat(threshold, 'f', -1, 64)
 	series, err := p.PromQuery(ctx, query)

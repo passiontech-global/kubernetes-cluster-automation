@@ -51,13 +51,16 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -140,7 +143,19 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 
 	now := r.now.Now()
 	seen := map[string]bool{} // qualifying keys this cycle
-	deleted := 0
+
+	// zombieTarget is a pod that reached the delete step this cycle —
+	// either poked last cycle and still stuck, or freshly attempted
+	// with both shutdown paths failing. attempted records whether a
+	// shutdown call already ran (the W10-FIX3 backoffLimit==0
+	// exemption needs it); reason feeds the DELETE log line.
+	type zombieTarget struct {
+		pod       *corev1.Pod
+		key       string
+		reason    string
+		attempted bool
+	}
+	var targets []zombieTarget
 	for i := range pods {
 		p := &pods[i]
 		sidecar := r.zombiePod(p, now)
@@ -152,19 +167,11 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		if r.poked[key] {
 			// Already sent the admin quit call last cycle and the
 			// pod STILL qualifies — the sidecar ignored the
-			// graceful path, so the pod itself goes away. The
-			// Job-completion gate still applies: deleting a
-			// still-Running pod of an unfinished Job recreates it
-			// and re-runs the Job. poked implies a shutdown attempt
-			// already ran — the backoffLimit==0 exemption applies.
-			if !r.jobAllowsReap(ctx, p, true) {
-				continue
-			}
-			delete(r.poked, key)
-			if err := r.reap(ctx, p, "still stuck after sidecar shutdown"); err != nil {
-				continue
-			}
-			deleted++
+			// graceful path, so the pod itself goes away. poked
+			// implies a shutdown attempt already ran — the
+			// backoffLimit==0 exemption applies.
+			targets = append(targets, zombieTarget{pod: p, key: key,
+				reason: "still stuck after sidecar shutdown", attempted: true})
 			continue
 		}
 		// Graceful path: direct pod-IP admin call, then the apiserver
@@ -178,16 +185,11 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 			// Both shutdown paths failed — graceful is impossible,
 			// so delete now rather than burn a cycle. BUG-C1: with
 			// every app container at exit 0 the Job must already be
-			// Complete first — deleting a still-Running pod whose
-			// Job has not counted it makes the job-controller
-			// recreate the pod and re-run the Job.
-			if !r.jobAllowsReap(ctx, p, attemptedBefore) {
-				continue
-			}
-			if derr := r.reap(ctx, p, fmt.Sprintf("sidecar shutdown failed: %v", err)); derr != nil {
-				continue
-			}
-			deleted++
+			// Complete first — the jobAllowsReap gate in the sweep
+			// decides.
+			targets = append(targets, zombieTarget{pod: p, key: key,
+				reason:    fmt.Sprintf("sidecar shutdown failed: %v", err),
+				attempted: attemptedBefore})
 			continue
 		}
 		r.poked[key] = true
@@ -196,6 +198,39 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 			"sidecar", sidecar)
 	}
 	pods = nil
+
+	deleted, _, _ := reap.Sweep(ctx, log, targets, reap.Options[zombieTarget]{
+		// The Job-completion gate still applies on every delete
+		// path: deleting a still-Running pod of an unfinished Job
+		// recreates it and re-runs the Job (BUG-C1).
+		Confirm: func(ctx context.Context, t zombieTarget) (bool, error) {
+			return r.jobAllowsReap(ctx, t.pod, t.attempted), nil
+		},
+		LogTarget: func(log logr.Logger, t zombieTarget) {
+			log.Info("DELETE: zombie sidecar pod",
+				"pod", t.pod.Namespace+"/"+t.pod.Name, "reason", t.reason)
+		},
+		Delete: func(ctx context.Context, t zombieTarget) error {
+			// The graceful ledger entry is spent whether the delete
+			// lands or not — a failed delete re-arms the shutdown
+			// path next cycle (tried still holds the key).
+			delete(r.poked, t.key)
+			// UID precondition: the listed object is the zombie we
+			// vetted — a same-named replacement must start its own
+			// graceful cycle, not inherit this delete.
+			if err := r.cs.CoreV1().Pods(t.pod.Namespace).
+				Delete(ctx, t.pod.Name, kube.UIDDeleteOptions(t.pod.UID, "")); err != nil {
+				return err
+			}
+			metrics.ZombieSidecarPodsReapedTotal.WithLabelValues(t.pod.Namespace).Inc()
+			return nil
+		},
+		OnError: func(log logr.Logger, t zombieTarget, err error) {
+			metrics.IncError(r.queue)
+			log.Error(err, "zombie pod delete failed",
+				"pod", t.pod.Namespace+"/"+t.pod.Name)
+		},
+	})
 
 	// Prune ledger entries for pods that vanished or stopped
 	// qualifying — a pod that honored /shutdown leaves phase

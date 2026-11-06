@@ -244,7 +244,7 @@ func TestParseModulesFlag(t *testing.T) {
 // the registry — except the gate-skippers, which SetupModules hands
 // Deps.Disabled and which then skip mgr.Add entirely. Modules whose
 // flag only gates the tick body (csr-watcher approve mode,
-// helmrelease-unlocker stall-unwedge, externalsecret-nudge,
+// helmrelease-unlocker stall-unwedge,
 // webhookguard, and the no-gate always-on modules) still register.
 func TestSetupModules(t *testing.T) {
 	t.Run("all gates enabled", func(t *testing.T) {
@@ -275,9 +275,9 @@ func TestSetupModules(t *testing.T) {
 		if err := SetupModules(testDeps(m), Modules); err != nil {
 			t.Fatalf("SetupModules: %v", err)
 		}
-		// 32 modules minus the 17 gate-skippers = 15 runnables.
-		if len(m.Added) != 15 {
-			t.Fatalf("registered %d runnables, want 15", len(m.Added))
+		// 32 modules minus the 18 gate-skippers = 14 runnables.
+		if len(m.Added) != 14 {
+			t.Fatalf("registered %d runnables, want 14", len(m.Added))
 		}
 	})
 

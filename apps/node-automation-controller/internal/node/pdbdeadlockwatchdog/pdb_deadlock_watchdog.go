@@ -40,7 +40,6 @@ package pdbdeadlockwatchdog
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -70,14 +69,27 @@ const (
 	pdbProlongedMinAge  = 30 * time.Minute
 )
 
+// drainBlockedKey is the blockedEmitted ledger's dedup key — one
+// node_automation_pdb_drain_blocked series per
+// (namespace, pdb, reason) tuple.
+type drainBlockedKey struct {
+	ns, name, reason string
+}
+
 type pdbDeadlockWatchdog struct {
 	cs kubernetes.Interface
 	// firstSeen records when each "<ns>/<name>/<reason>" precondition
 	// STARTED holding — "continuously >= N" means now-firstSeen >= N
 	// with no gap. Any cycle where the precondition drops deletes the
 	// entry, restarting the window; any cycle where the PDB vanishes
-	// prunes all of its entries (and their gauge series).
+	// prunes all of its entries.
 	firstSeen state.FirstSeenLedger
+	// blockedEmitted tracks which (ns, pdb, reason) tuples had their
+	// node_automation_pdb_drain_blocked series Set last sweep — a
+	// reason that resolves gets its series deleted outright
+	// (DeleteLabelValues, same hygiene as ForgetAPIBackend) instead
+	// of pinning at its last value forever.
+	blockedEmitted state.GaugeLedger[drainBlockedKey]
 	// now is the wall-clock seam so tests can age sightings without
 	// sleeping 30 minutes.
 	now shared.Clock
@@ -175,8 +187,9 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 			if now.Sub(first) < r.minAge {
 				continue
 			}
-			metrics.PDBDrainBlocked.
-				WithLabelValues(p.Namespace, p.Name, r.name).Set(1)
+			w.blockedEmitted.Set(metrics.PDBDrainBlocked, 1,
+				drainBlockedKey{ns: p.Namespace, name: p.Name, reason: r.name},
+				p.Namespace, p.Name, r.name)
 			reported = true
 			log.Info("PDB blocking drains",
 				"pdb", p.Namespace+"/"+p.Name, "reason", r.name,
@@ -191,26 +204,21 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	}
 	pdbs = nil
 
-	// Prune first-seen entries — and their gauge series — for reasons
-	// that stopped holding or PDBs that vanished. "Continuously"
-	// resets on any gap, and a stale label set must not outlive its
-	// object (same DeleteLabelValues hygiene as ForgetAPIBackend: the
-	// series disappears rather than lingering at 0 forever).
+	// Prune first-seen entries for reasons that stopped holding or
+	// PDBs that vanished — "continuously" resets on any gap.
 	w.firstSeen.Prune(func(key string) bool {
-		if _, ok := seen[key]; ok {
-			return true
-		}
-		// Keys are built as ns/name/reason; ns+name are DNS-1123
-		// identifiers so "/" is unambiguous. Deleting a series that
-		// was never set is a harmless no-op.
-		if parts := strings.SplitN(key, "/", 3); len(parts) == 3 {
-			metrics.PDBDrainBlocked.
-				DeleteLabelValues(parts[0], parts[1], parts[2])
-		}
-		return false
+		_, ok := seen[key]
+		return ok
 	})
-	// Post-prune the ledger holds exactly the keys still tracked —
-	// the same set `seen` collected this cycle.
+	// Series hygiene is the ledger's job: every tuple emitted last
+	// sweep that was not re-asserted this sweep is deleted outright —
+	// a stale label set must not outlive its object (same
+	// DeleteLabelValues hygiene as ForgetAPIBackend). Prune runs
+	// only after a complete, verified sweep: the early returns above
+	// keep a partial/failed list from pruning live series.
+	w.blockedEmitted.Prune(metrics.PDBDrainBlocked.DeleteLabelValues)
+	// Post-prune the first-seen ledger holds exactly the keys still
+	// tracked — the same set `seen` collected this cycle.
 	log.Info("sweep done", "flagged", flagged, "tracked", len(seen))
 	return nil
 }

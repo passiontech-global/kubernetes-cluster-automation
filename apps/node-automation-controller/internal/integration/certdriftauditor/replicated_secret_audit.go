@@ -85,8 +85,8 @@ func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
 		if a.replicationMismatch[k] < replicationDriftScans {
 			continue // first mismatch — the replicator may be mid-sync
 		}
-		metrics.ReplicatedSecretDrift.
-			WithLabelValues(k.namespace, k.name, k.source).Set(1)
+		a.seenReplication.Set(metrics.ReplicatedSecretDrift, 1,
+			k, k.namespace, k.name, k.source)
 		log.Info("replicated tls secret drifted from source across scans",
 			"secret", d.namespace+"/"+d.name, "source", d.source,
 			"consecutiveScans", a.replicationMismatch[k])

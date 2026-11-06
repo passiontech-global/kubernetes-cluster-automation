@@ -162,9 +162,21 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 	// the cordon pass re-evaluates the 35% ratio.
 	sort.Strings(uncordon)
 	for _, name := range uncordon {
-		payload := []byte(fmt.Sprintf(
-			`{"spec":{"unschedulable":false},"metadata":{"annotations":{"%s":null}}}`,
-			nodeHangPreCordonAnno))
+		payload, err := kube.MergePatchAnnos(map[string]any{
+			nodeHangPreCordonAnno: nil, // merge-patch delete — lift our stamp
+		})
+		if err == nil {
+			// The spec half rides ahead of the annotations doc so
+			// the cordon lift and the stamp delete land in ONE merge
+			// patch — bytes identical to the hand-marshalled shape.
+			payload = append([]byte(`{"spec":{"unschedulable":false},`),
+				payload[1:]...)
+		}
+		if err != nil {
+			metrics.IncError(p.Name)
+			log.Error(err, "hang precordon uncordon patch marshal failed", "node", name)
+			continue
+		}
 		if _, err := p.CS.CoreV1().Nodes().Patch(ctx, name,
 			types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
 			metrics.IncError(p.Name)
@@ -181,9 +193,14 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 	// inherit the auto-uncordon.
 	sort.Strings(staleStamp)
 	for _, name := range staleStamp {
-		payload := []byte(fmt.Sprintf(
-			`{"metadata":{"annotations":{"%s":null}}}`,
-			nodeHangPreCordonAnno))
+		payload, err := kube.MergePatchAnnos(map[string]any{
+			nodeHangPreCordonAnno: nil,
+		})
+		if err != nil {
+			metrics.IncError(p.Name)
+			log.Error(err, "hang precordon stale-stamp patch marshal failed", "node", name)
+			continue
+		}
 		if _, err := p.CS.CoreV1().Nodes().Patch(ctx, name,
 			types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
 			metrics.IncError(p.Name)
@@ -215,9 +232,21 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 				"cordoned", cordoned, "workers", workers)
 			continue
 		}
-		payload := []byte(fmt.Sprintf(
-			`{"spec":{"unschedulable":true},"metadata":{"annotations":{"%s":"%s"}}}`,
-			nodeHangPreCordonAnno, nodeHangPreCordonValue))
+		payload, err := kube.MergePatchAnnos(map[string]any{
+			nodeHangPreCordonAnno: nodeHangPreCordonValue,
+		})
+		if err == nil {
+			// Same one-patch shape as the uncordon half — the spec
+			// write ahead of the annotations doc keeps the ported
+			// byte order.
+			payload = append([]byte(`{"spec":{"unschedulable":true},`),
+				payload[1:]...)
+		}
+		if err != nil {
+			metrics.IncError(p.Name)
+			log.Error(err, "hang precordon patch marshal failed", "node", name)
+			continue
+		}
 		if _, err := p.CS.CoreV1().Nodes().Patch(ctx, name,
 			types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
 			metrics.IncError(p.Name)

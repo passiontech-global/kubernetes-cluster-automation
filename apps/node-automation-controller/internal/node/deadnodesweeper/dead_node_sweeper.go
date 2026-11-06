@@ -95,6 +95,10 @@ type deadNodeSweeper struct {
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
 	queue string
+	// now is the wall-clock seam so tests can pin the stuck-pod and
+	// Unknown-window verdicts. nil reads as system time — the
+	// standard unarmed-seam convention.
+	now shared.Clock
 	// Probe seam — same trick as kubeletReaper: the node/proxy REST
 	// path cannot be served by the fake clientset, so tests stub the
 	// healthz outcome per node.
@@ -103,7 +107,7 @@ type deadNodeSweeper struct {
 
 // Setup registers the 5-minute sweep.
 func Setup(d shared.Deps) error {
-	s := &deadNodeSweeper{cs: d.CS, dyn: d.Dyn, queue: d.Name}
+	s := &deadNodeSweeper{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
 	s.probeFn = s.probe
 	return shared.AddPeriodic(d.Mgr, s.queue, 5*time.Minute, s.run)
 }
@@ -165,6 +169,10 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// page is tallied and dropped, so peak client heap is one page,
 	// not every pod in the cluster (which is the same footprint the
 	// unbounded List had).
+	// One "now" pins the whole sweep — a stuck verdict measured
+	// against a drifting wall clock inside a thousands-pod page loop
+	// could straddle the threshold mid-pass.
+	now := s.now.Now()
 	stuck := map[string]int{}
 	err = kube.ListEach(ctx, metav1.ListOptions{
 		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
@@ -180,7 +188,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 				if p.DeletionTimestamp == nil || p.Spec.NodeName == "" {
 					continue
 				}
-				if time.Since(p.DeletionTimestamp.Time) <= deadNodeStuckPodAge {
+				if now.Sub(p.DeletionTimestamp.Time) <= deadNodeStuckPodAge {
 					continue // still inside a legitimate graceful shutdown
 				}
 				stuck[p.Spec.NodeName]++
@@ -287,7 +295,7 @@ func (s *deadNodeSweeper) confirmedDead(ctx context.Context, n *corev1.Node) (bo
 		return false, nil // NotReady/False alone is not a death certificate
 	}
 	if c.LastTransitionTime.IsZero() ||
-		time.Since(c.LastTransitionTime.Time) <= deadNodeUnknownAge {
+		s.now.Now().Sub(c.LastTransitionTime.Time) <= deadNodeUnknownAge {
 		return false, nil
 	}
 	ok, err := s.probeFn(ctx, n.Name)

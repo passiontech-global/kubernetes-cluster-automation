@@ -100,23 +100,67 @@ type partitionEvictor struct {
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
 	queue string
+	// now is the wall-clock seam so tests can age a partition
+	// condition past partitionMinAge without sleeping. nil reads as
+	// system time — the standard unarmed-seam convention.
+	now shared.Clock
+	// namespaces is the PARTITION_EVICT_NAMESPACES allow-list,
+	// resolved once in Setup — env is fixed at process start, so the
+	// sweep must not re-parse it per cycle. A nil field (a
+	// literally-constructed test fixture) resolves lazily inside
+	// run, the same unarmed-seam convention as Clock.
+	namespaces map[string]struct{}
 }
 
 // Setup registers the 5-minute sweep (was crontab */5).
 func Setup(d shared.Deps) error {
-	e := &partitionEvictor{cs: d.CS, queue: d.Name}
-	return shared.AddPeriodic(d.Mgr, e.queue, 5*time.Minute, e.run)
+	return shared.SetupWithConfig(d, configFromEnv, func(cfg evictorConfig) error {
+		e := &partitionEvictor{
+			cs:         d.CS,
+			queue:      d.Name,
+			now:        shared.SystemClock,
+			namespaces: cfg.namespaces,
+		}
+		return shared.AddPeriodic(d.Mgr, e.queue, 5*time.Minute, e.run)
+	})
+}
+
+// evictorConfig is the module's env-resolved knob set — carried
+// through SetupWithConfig's parse step.
+type evictorConfig struct {
+	namespaces map[string]struct{}
+}
+
+// configFromEnv resolves the namespace allow-list ONCE at boot —
+// the previous per-sweep parse implied env could change at runtime,
+// which it cannot. SetupWithConfig runs it before the Deps.Disabled
+// gate; partition-pod-evictor has no GateEnv today so the ordering
+// is moot but keeps the parse->gate->register shape uniform with
+// the gated modules.
+func configFromEnv() evictorConfig {
+	return evictorConfig{namespaces: partitionEvictNamespaces()}
+}
+
+// evictNamespaces returns the allow-list Setup stamped, resolving
+// it lazily for fixtures that built the evictor literally — a nil
+// field must not silently evict nothing.
+func (e *partitionEvictor) evictNamespaces() map[string]struct{} {
+	if e.namespaces == nil {
+		return partitionEvictNamespaces()
+	}
+	return e.namespaces
 }
 
 // nodePartitioned reports whether any NWPD network condition has been
-// True for longer than partitionMinAge. A missing/empty timestamp
-// (bash's `[ -n "$ts" ]` guard) does NOT flag the node.
-func nodePartitioned(n *corev1.Node) bool {
+// True for longer than partitionMinAge measured against `now`. A
+// missing/empty timestamp (bash's `[ -n "$ts" ]` guard) does NOT flag
+// the node.
+func nodePartitioned(n *corev1.Node, now time.Time) bool {
 	for _, t := range partitionCondTypes {
 		c := kube.NodeCondition(n, t)
 		if c != nil && c.Status == corev1.ConditionTrue &&
 			!c.LastTransitionTime.IsZero() &&
-			time.Since(c.LastTransitionTime.Time) > partitionMinAge {
+			now.Sub(c.LastTransitionTime.Time) > partitionMinAge {
 			return true
 		}
 	}
@@ -227,6 +271,7 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 	byName := make(map[string]*corev1.Node, len(nodes))
 	flagged := map[string]bool{}
 	total := 0
+	now := e.now.Now()
 	for i := range nodes {
 		byName[nodes[i].Name] = &nodes[i]
 		if kube.IsControlPlane(&nodes[i]) {
@@ -238,7 +283,7 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 			continue
 		}
 		total++
-		if nodePartitioned(&nodes[i]) {
+		if nodePartitioned(&nodes[i], now) {
 			flagged[nodes[i].Name] = true
 		}
 	}
@@ -278,12 +323,12 @@ func (e *partitionEvictor) run(ctx context.Context) error {
 		return nil
 	}
 
-	// Resolve the eviction set once per run: the env allow-list plus
-	// the annotation opt-in (checked per pod inside the loop). One
-	// node-scoped cluster-wide list per flagged node beats
-	// 1+len(namespaces) namespaced lists — RBAC already grants
+	// Resolve the eviction set once per run: the Setup-parsed env
+	// allow-list plus the annotation opt-in (checked per pod inside
+	// the loop). One node-scoped cluster-wide list per flagged node
+	// beats 1+len(namespaces) namespaced lists — RBAC already grants
 	// cluster-wide pod list (dead-node-sweeper reads the same way).
-	namespaces := partitionEvictNamespaces()
+	namespaces := e.evictNamespaces()
 
 	// Taint EVERY flagged node before any eviction — the cap below
 	// bounds pod churn, not fencing. Breaking out of a combined loop

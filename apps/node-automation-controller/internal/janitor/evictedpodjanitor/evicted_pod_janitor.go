@@ -61,11 +61,14 @@ type evictedPodJanitor struct {
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
 	queue string
+	// now is the clock seam — tests pin it so the 1h keep window is
+	// deterministic. nil → time.Now.
+	now shared.Clock
 }
 
 // Setup registers the 10-minute sweep.
 func Setup(d shared.Deps) error {
-	j := &evictedPodJanitor{cs: d.CS, queue: d.Name}
+	j := &evictedPodJanitor{cs: d.CS, queue: d.Name, now: shared.SystemClock}
 	return shared.AddPeriodic(d.Mgr, j.queue, 10*time.Minute, j.run)
 }
 
@@ -106,7 +109,7 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 		// the pod object was created — a pod can live for weeks
 		// before eviction, and CreationTimestamp-based aging would
 		// reap a minutes-old eviction the operator has not seen.
-		age := time.Since(evictionTime(pod))
+		age := j.now.Now().Sub(evictionTime(pod))
 		if age <= evictedPodMaxAge {
 			continue // fresh eviction — keep it inspectable
 		}

@@ -52,6 +52,10 @@ type kubeletReaper struct {
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
 	queue string
+	// now is the wall-clock seam so tests can pin the heartbeat-age
+	// verdict. nil reads as system time — the standard unarmed-seam
+	// convention.
+	now shared.Clock
 	// Probe seam: r.probe goes through the apiserver REST client,
 	// which the fake clientset cannot serve — a field so tests can
 	// stub the healthz outcome per node.
@@ -59,7 +63,7 @@ type kubeletReaper struct {
 }
 
 func Setup(d shared.Deps) error {
-	r := &kubeletReaper{cs: d.CS, queue: d.Name}
+	r := &kubeletReaper{cs: d.CS, queue: d.Name, now: shared.SystemClock}
 	r.probeFn = r.probe
 	return shared.AddPeriodic(d.Mgr, r.queue, 2*time.Minute, r.run)
 }
@@ -237,7 +241,7 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	age := -1 // sentinel: no usable timestamp -> stale
 	if c := kube.NodeCondition(node, corev1.NodeReady); c != nil &&
 		!c.LastHeartbeatTime.IsZero() {
-		age = int(time.Since(c.LastHeartbeatTime.Time) / time.Second)
+		age = int(r.now.Now().Sub(c.LastHeartbeatTime.Time) / time.Second)
 		if age < 0 {
 			// A heartbeat 1-2s in the future computes -1 and would
 			// collide with the sentinel — clamp so skew reads as

@@ -2,7 +2,6 @@ package gitops
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"strings"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -89,9 +89,8 @@ var fluxHRFailureReasons = map[string]bool{
 // remediation is best-effort, detection is the contract.
 func (p *fluxHRRetriesCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
-	if p.Dyn == nil {
-		return probefw.Result{Infra: errors.New(
-			"no dynamic client — helmrelease retry check unverifiable")}
+	if r := p.RequireDyn("helmrelease retry check"); r != nil {
+		return *r
 	}
 	now := p.Now()
 
@@ -214,20 +213,16 @@ func fluxHRReadyStrings(obj *unstructured.Unstructured) (status, reason, message
 }
 
 // maybePatchHRRetry stamps the reconcile annotations on a stuck
-// HelmRelease unless the 30m cooldown (in-RAM ledger OR the
-// requestedAt stamp a previous patch — ours or an operator's —
-// already left) is still warm.
+// HelmRelease unless the 30m cooldown is still warm — the wider of
+// the in-RAM ledger and the requestedAt stamp a previous patch (ours
+// or `flux reconcile`'s) already left. The write side stays
+// hand-rolled: StampPersisted emits a single-annotation patch and
+// this heal needs requestedAt AND forceAt stamped together.
 func (p *fluxHRRetriesCheck) maybePatchHRRetry(ctx context.Context, log logr.Logger,
 	gvr schema.GroupVersionResource, hr *unstructured.Unstructured,
 	key string, now time.Time) {
-	if p.hrRetryHealed.CooledDown(key, fluxHRHealCooldown, now) {
-		return
-	}
-	// The requestedAt annotation is the durable half: a stamp younger
-	// than the cooldown — whether we wrote it or `flux reconcile`
-	// did — means a reconcile is already queued.
-	if t, ok := kube.AnnoTime(hr, kube.AnnoFluxRequestedAt); ok &&
-		now.Sub(t) < fluxHRHealCooldown {
+	if heal.PersistedCooledDown(&p.hrRetryHealed, hr,
+		kube.AnnoFluxRequestedAt, key, fluxHRHealCooldown, now) {
 		return
 	}
 	token := now.UTC().Format(time.RFC3339)

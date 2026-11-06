@@ -26,21 +26,17 @@ type kcmWorkqueueCheck struct {
 	//     first sweep that observed it; a signature must persist
 	//     kcmFreezeMinAge before the gauge fires. Pruned when the
 	//     signature resolves — a later stall re-arms the window.
-	//   - kcmFrozenReasons: reason labels currently held at 1, so a
-	//     resolved signature flips its series back to 0 instead of
-	//     leaking a stale 1 forever.
+	//   - kcmFrozenReasons: the emitted-gauge ledger for the held
+	//     reason series — a tuple not re-emitted flips back to 0
+	//     instead of leaking a stale 1 forever.
 	kcmFirstSeen     state.FirstSeenLedger
-	kcmFrozenReasons map[string]bool
+	kcmFrozenReasons state.GaugeLedger[string]
 }
 
-// newKcmWorkqueueCheck builds the C6 watchdog — the first-seen
-// ledger arms lazily; only the frozen-reasons map needs the
-// explicit initialization that used to live in the monolithic
-// newClusterHealthProber literal.
+// newKcmWorkqueueCheck builds the C6 watchdog — both ledgers arm
+// lazily on first use (the GaugeLedger zero value is ready).
 func NewKcmWorkqueueCheck(d *probefw.Deps) probefw.Check {
-	return &kcmWorkqueueCheck{Deps: d,
-		kcmFrozenReasons: map[string]bool{},
-	}
+	return &kcmWorkqueueCheck{Deps: d}
 }
 
 // C6 watchdog knobs — the KCM leader Lease name and the
@@ -169,13 +165,8 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 
 	frozen := map[string]bool{}
 	for sig, reason := range sigs {
-		first, tracked := p.kcmFirstSeen.Observe(sig, now)
-		if !tracked {
-			log.Info("KCM freeze signature — tracking first-seen",
-				"signature", sig)
-			continue
-		}
-		if now.Sub(first) >= p.Cfg.KCM.FreezeMinAge {
+		if probefw.Persisted(&p.kcmFirstSeen, sig, now,
+			p.Cfg.KCM.FreezeMinAge, log) {
 			frozen[reason] = true
 		}
 	}
@@ -183,16 +174,14 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 		_, ok := sigs[sig]
 		return ok
 	})
-	for reason := range p.kcmFrozenReasons {
-		if !frozen[reason] {
-			metrics.KCMWorkqueueFrozen.WithLabelValues(reason).Set(0)
-			delete(p.kcmFrozenReasons, reason)
-		}
-	}
 	for reason := range frozen {
-		metrics.KCMWorkqueueFrozen.WithLabelValues(reason).Set(1)
-		p.kcmFrozenReasons[reason] = true
+		p.kcmFrozenReasons.Set(metrics.KCMWorkqueueFrozen, 1,
+			reason, reason)
 	}
+	// A reason held last sweep but not re-frozen flips back to 0 —
+	// the series stays present so the "back to 0" edge is visible,
+	// it just stops pinning at 1.
+	p.kcmFrozenReasons.Prune(kcmFrozenFlipZero)
 
 	if len(frozen) == 0 {
 		return probefw.Result{Pass: true}
@@ -207,14 +196,21 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 		p.Cfg.KCM.FreezeMinAge, strings.Join(reasons, ", "))}
 }
 
+// kcmFrozenFlipZero is the ledger's prune action: a reason series
+// that stopped being emitted flips to 0 rather than disappearing —
+// the resolved edge is part of this check's gauge contract.
+func kcmFrozenFlipZero(labelValues ...string) bool {
+	metrics.KCMWorkqueueFrozen.WithLabelValues(labelValues...).Set(0)
+	return true
+}
+
 // resetKCMWorkqueue clears freeze tracking and drops any held gauge —
 // called when the frozen-but-leader diagnosis cannot apply (no Ready
 // nodes, absent/stale KCM Lease) so a signature that flaps around a
 // precondition edge re-arms its persistence window from scratch.
+// Runs only on early-return paths, before this sweep's Emits, so the
+// prune sees a pure "held last sweep" tuple set.
 func (p *kcmWorkqueueCheck) resetKCMWorkqueue() {
 	p.kcmFirstSeen = state.FirstSeenLedger{}
-	for reason := range p.kcmFrozenReasons {
-		metrics.KCMWorkqueueFrozen.WithLabelValues(reason).Set(0)
-		delete(p.kcmFrozenReasons, reason)
-	}
+	p.kcmFrozenReasons.Prune(kcmFrozenFlipZero)
 }

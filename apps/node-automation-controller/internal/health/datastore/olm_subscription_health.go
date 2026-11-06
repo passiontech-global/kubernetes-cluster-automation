@@ -2,10 +2,8 @@ package datastore
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -31,13 +29,14 @@ type olmHealthCheck struct {
 	//     unhealthy signature showed; it must persist
 	//     olmUnhealthyMinAge before the gauge fires (>= olmHealMinAge
 	//     for the CSV-triggered operator heal). Pruned on resolve.
-	//   - olmEmitted: same keys held at gauge=1 — a tuple not
-	//     re-seen gets DeleteLabelValues, not a stale 1.
+	//   - olmEmitted: the emitted-gauge ledger for the same keys
+	//     held at gauge=1 — a tuple not re-seen gets
+	//     DeleteLabelValues, not a stale 1.
 	//   - olmHealed: reason → last olm-operator pod delete — the 1h
 	//     cooldown (in-RAM: deleting the operator pod is the heal,
 	//     nothing else can carry the stamp).
 	olmFirstSeen state.FirstSeenLedger
-	olmEmitted   map[string]bool
+	olmEmitted   state.GaugeLedger[string]
 	olmHealed    state.CooldownSet
 	// verdict memoizes the maintenance-mutex evaluation the heal
 	// preamble reads — the shared-Verdict shape every per-target
@@ -46,13 +45,9 @@ type olmHealthCheck struct {
 }
 
 // newOlmHealthCheck builds the W7-C5 check — the ledgers arm
-// lazily on first use; only the emitted-series map needs the
-// explicit initialization that used to live in the monolithic
-// newClusterHealthProber literal.
+// lazily on first use (the GaugeLedger zero value is ready).
 func NewOlmHealthCheck(d *probefw.Deps) probefw.Check {
-	return &olmHealthCheck{Deps: d,
-		olmEmitted: map[string]bool{},
-	}
+	return &olmHealthCheck{Deps: d}
 }
 
 // ---------------------------------------------------------------------------
@@ -118,17 +113,18 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	// The CR scans and the maintenance mutex both need dyn — a
 	// missing client is a wiring bug, not "no signal".
-	if p.Dyn == nil {
-		return probefw.Result{Infra: errors.New(
-			"no dynamic client — olm health check unverifiable")}
+	if r := p.RequireDyn("olm health check"); r != nil {
+		return *r
 	}
 	now := p.Now()
-	if p.olmEmitted == nil {
-		p.olmEmitted = map[string]bool{}
-	}
 
-	// live signatures keyed "kind/ns/name/reason".
-	live := map[string]bool{}
+	// live signatures keyed "kind/ns/name/reason" — the value is the
+	// exact gauge label tuple so emission never re-splits the key.
+	live := map[string][]string{}
+	addLive := func(kind, ns, name, reason string) {
+		live[kind+"/"+ns+"/"+name+"/"+reason] =
+			[]string{kind, ns, name, reason}
+	}
 	csvs, err := p.Dyn.Resource(olmCSVGVR).List(ctx, metav1.ListOptions{})
 	switch {
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
@@ -138,15 +134,16 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 	default:
 		for i := range csvs.Items {
 			csv := &csvs.Items[i]
-			obj := olmKindCSV + "/" + csv.GetNamespace() + "/" + csv.GetName()
 			phase, _ := kube.NestedString(csv.Object, "status", "phase")
 			if phase != "Succeeded" {
-				live[obj+"/"+olmReasonCSVStuck] = true
+				addLive(olmKindCSV, csv.GetNamespace(), csv.GetName(),
+					olmReasonCSVStuck)
 			}
 			if ts, found := kube.NestedString(
 				csv.Object, "status", "certsRotateAt"); found && ts != "" {
 				if t, err := time.Parse(time.RFC3339, ts); err == nil && now.After(t) {
-					live[obj+"/"+olmReasonCertOverdue] = true
+					addLive(olmKindCSV, csv.GetNamespace(), csv.GetName(),
+						olmReasonCertOverdue)
 				}
 			}
 		}
@@ -159,17 +156,17 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 	default:
 		for i := range subs.Items {
 			sub := &subs.Items[i]
-			obj := olmKindSubscription + "/" +
-				sub.GetNamespace() + "/" + sub.GetName()
 			for _, c := range kube.Conditions(sub.Object, "status", "conditions") {
 				if c.Status != "True" {
 					continue
 				}
 				switch c.Type {
 				case "CatalogSourcesUnhealthy":
-					live[obj+"/"+olmReasonCatalogUnhealthy] = true
+					addLive(olmKindSubscription, sub.GetNamespace(),
+						sub.GetName(), olmReasonCatalogUnhealthy)
 				case "ResolutionFailed":
-					live[obj+"/"+olmReasonResolutionFailed] = true
+					addLive(olmKindSubscription, sub.GetNamespace(),
+						sub.GetName(), olmReasonResolutionFailed)
 				}
 			}
 		}
@@ -177,38 +174,27 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	emitted := map[string]bool{}     // keys past the gauge window
 	healReasons := map[string]bool{} // reasons past the heal window (CSV only)
-	p.olmFirstSeen.Prune(func(k string) bool { return live[k] })
-	for k := range live {
-		first, tracked := p.olmFirstSeen.Observe(k, now)
-		if !tracked {
-			log.Info("olm unhealthy signature — tracking first-seen",
-				"signature", k)
-			continue
-		}
-		if now.Sub(first) < olmUnhealthyMinAge {
+	p.olmFirstSeen.Prune(func(k string) bool {
+		_, ok := live[k]
+		return ok
+	})
+	for k, lv := range live {
+		if !probefw.Persisted(&p.olmFirstSeen, k, now,
+			olmUnhealthyMinAge, log) {
 			continue
 		}
 		emitted[k] = true
-		parts := strings.SplitN(k, "/", 4)
-		metrics.OLMUnhealthyResources.
-			WithLabelValues(parts[0], parts[1], parts[2], parts[3]).Set(1)
+		p.olmEmitted.Set(metrics.OLMUnhealthyResources, 1, k, lv...)
 		// The heal is CSV-scoped: a subscription failure is the
-		// catalog's problem, not olm-operator's queue.
-		if parts[0] == olmKindCSV && now.Sub(first) >= olmHealMinAge {
-			healReasons[parts[3]] = true
+		// catalog's problem, not olm-operator's queue. Seen reads
+		// the same streak — never re-stamps.
+		if lv[0] == olmKindCSV {
+			if age, _ := p.olmFirstSeen.Seen(k, now); age >= olmHealMinAge {
+				healReasons[lv[3]] = true
+			}
 		}
 	}
-	for k := range p.olmEmitted {
-		if emitted[k] {
-			continue
-		}
-		if parts := strings.SplitN(k, "/", 4); len(parts) == 4 {
-			metrics.OLMUnhealthyResources.DeleteLabelValues(
-				parts[0], parts[1], parts[2], parts[3])
-		}
-		delete(p.olmEmitted, k)
-	}
-	maps.Copy(p.olmEmitted, emitted)
+	p.olmEmitted.Prune(metrics.OLMUnhealthyResources.DeleteLabelValues)
 
 	if len(healReasons) > 0 {
 		reasons := make([]string, 0, len(healReasons))

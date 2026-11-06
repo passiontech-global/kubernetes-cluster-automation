@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
-	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -41,7 +40,7 @@ type statefulMasterlessCheck struct {
 	// W6.2 watchdog state (serial sweep — unguarded):
 	//   - stsZeroSince: "ns/svc/sts" → first sweep the master-role
 	//     Service showed 0 Ready endpoints.
-	//   - stsZeroEmitted: series ledger for
+	//   - stsZeroEmitted: the emitted-gauge ledger for
 	//     StatefulServiceZeroEndpoints — a tuple not re-seen gets
 	//     DeleteLabelValues, not a stale 1 (same hygiene as the
 	//     webhook guard's brokenEmitted).
@@ -56,7 +55,7 @@ type statefulMasterlessCheck struct {
 	//     (a CooldownSet suppresses repeats but cannot report the
 	//     latest stamp back, so the moment is carried alongside).
 	stsZeroSince   state.FirstSeenLedger
-	stsZeroEmitted map[string]bool
+	stsZeroEmitted state.GaugeLedger[string]
 	drHealed       state.CooldownSet
 	drPodHealed    state.CooldownSet
 	drOpHealAt     time.Time
@@ -67,13 +66,9 @@ type statefulMasterlessCheck struct {
 }
 
 // newStatefulMasterlessCheck builds the W6.2 check — the ledgers
-// arm lazily on first use; only the emitted-series map needs the
-// explicit initialization that used to live in the monolithic
-// newClusterHealthProber literal.
+// arm lazily on first use (the GaugeLedger zero value is ready).
 func NewStatefulMasterlessCheck(d *probefw.Deps) probefw.Check {
-	return &statefulMasterlessCheck{Deps: d,
-		stsZeroEmitted: map[string]bool{},
-	}
+	return &statefulMasterlessCheck{Deps: d}
 }
 
 // W6.2 — stateful-masterless-services knobs.
@@ -217,9 +212,6 @@ func dragonflyOwned(sts *appsv1.StatefulSet) bool {
 func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	if p.stsZeroEmitted == nil {
-		p.stsZeroEmitted = map[string]bool{}
-	}
 
 	stsList, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: probefw.HealthListPageSize},
@@ -300,35 +292,22 @@ func (p *statefulMasterlessCheck) Run(ctx context.Context) probefw.Result {
 			continue // master reachable — drop any streak
 		}
 		seen[key] = true
-		first, tracked := p.stsZeroSince.Observe(key, now)
-		if !tracked {
-			log.Info("master-role service at 0 ready endpoints — tracking first-seen",
-				"service", c.ns+"/"+c.svc, "statefulset", c.sts.Name)
-			continue
-		}
-		if now.Sub(first) < masterlessZeroMinAge {
+		if !probefw.Persisted(&p.stsZeroSince, key, now,
+			masterlessZeroMinAge, log) {
 			continue
 		}
 		emitted[key] = true
-		metrics.StatefulServiceZeroEndpoints.
-			WithLabelValues(c.ns, c.svc, c.sts.Name).Set(1)
-		if now.Sub(first) >= masterlessHealMinAge {
-			due = append(due, masterlessDue{svc: c, since: first})
+		p.stsZeroEmitted.Set(metrics.StatefulServiceZeroEndpoints, 1,
+			key, c.ns, c.svc, c.sts.Name)
+		// The heal window reads the same streak — Seen never
+		// re-stamps, so the already-observed key reports its age.
+		if age, _ := p.stsZeroSince.Seen(key, now); age >= masterlessHealMinAge {
+			due = append(due, masterlessDue{svc: c, since: now.Add(-age)})
 		}
 	}
 
 	p.stsZeroSince.Prune(func(k string) bool { return seen[k] })
-	for k := range p.stsZeroEmitted {
-		if emitted[k] {
-			continue
-		}
-		if parts := strings.SplitN(k, "/", 3); len(parts) == 3 {
-			metrics.StatefulServiceZeroEndpoints.
-				DeleteLabelValues(parts[0], parts[1], parts[2])
-		}
-		delete(p.stsZeroEmitted, k)
-	}
-	maps.Copy(p.stsZeroEmitted, emitted)
+	p.stsZeroEmitted.Prune(metrics.StatefulServiceZeroEndpoints.DeleteLabelValues)
 
 	// Dragonfly auto-heal — a masterless dragonfly past the heal
 	// window bounces the operator leader to force re-election (step

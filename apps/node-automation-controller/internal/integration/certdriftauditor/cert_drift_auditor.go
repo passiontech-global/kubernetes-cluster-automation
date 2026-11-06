@@ -55,13 +55,13 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"strings"
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
@@ -198,35 +198,21 @@ func Setup(d shared.Deps) error {
 }
 
 func (a *certDriftAuditor) run(ctx context.Context) error {
-	log := logf.FromContext(ctx)
 	// Lazily arm the zero-value struct — unit tests construct the
 	// auditor literally without the Setup path.
 	if a.replicationMismatch == nil {
 		a.replicationMismatch = map[replicationMetricKey]int{}
 	}
 
-	// The audits are independent: a broken webhook list must not
-	// blind the TLS-expiry gauge (and vice versa). The first error
-	// propagates — the periodic wrapper owns run-level IncError, so
-	// this run() must not count the error it returns (double-count).
-	var firstErr error
-	if err := a.auditWebhookCABundles(ctx); err != nil {
-		log.Error(err, "webhook ca-bundle audit failed")
-		firstErr = err
-	}
-	if err := a.auditTLSSecrets(ctx); err != nil {
-		log.Error(err, "tls secret expiry audit failed")
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
-	if err := a.auditTrustBundles(ctx); err != nil {
-		log.Error(err, "linkerd trust-bundle audit failed")
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
+	// The audits are independent duties: a broken webhook list must
+	// not blind the TLS-expiry gauge (and vice versa), so all three
+	// run and their errors join (nil+nil+nil → nil). The periodic
+	// wrapper owns run-level IncError, so this run() must not count
+	// the error it returns (double-count).
+	webhookErr := a.auditWebhookCABundles(ctx)
+	tlsErr := a.auditTLSSecrets(ctx)
+	trustErr := a.auditTrustBundles(ctx)
+	return errors.Join(webhookErr, tlsErr, trustErr)
 }
 
 // ---------------------------------------------------------------------------

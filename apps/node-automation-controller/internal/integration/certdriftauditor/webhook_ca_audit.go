@@ -84,18 +84,16 @@ func (a *certDriftAuditor) auditOneWebhookConfig(ctx context.Context,
 			// mismatch=1. url-targeted entries legitimately carry
 			// no bundle (public CA), so they skip.
 			if e.service != nil && e.fail {
-				a.seenWebhooks.Emit(k, k.kind, k.name, k.webhook)
-				metrics.WebhookCABundleMismatch.
-					WithLabelValues(k.kind, k.name, k.webhook).Set(1)
+				a.seenWebhooks.Set(metrics.WebhookCABundleMismatch, 1,
+					k, k.kind, k.name, k.webhook)
 				log.Info("webhook entry has empty caBundle with failurePolicy=Fail — admission calls will fail",
 					"kind", kind, "config", cfgName, "webhook", e.name)
 			}
 			continue
 		}
 		if days, ok := earliestCertExpiryDays(e.caBundle, a.now.Now()); ok {
-			a.seenWebhookExpiry.Emit(k, k.kind, k.name, k.webhook)
-			metrics.WebhookCABundleDaysToExpiry.
-				WithLabelValues(k.kind, k.name, k.webhook).Set(days)
+			a.seenWebhookExpiry.Set(metrics.WebhookCABundleDaysToExpiry, days,
+				k, k.kind, k.name, k.webhook)
 		} else {
 			log.Info("skip: caBundle carries no parseable X.509 PEM",
 				"kind", kind, "config", cfgName, "webhook", e.name)
@@ -127,14 +125,14 @@ func (a *certDriftAuditor) auditOneWebhookConfig(ctx context.Context,
 	}
 	for _, e := range entries {
 		k := webhookMetricKey{kind, cfgName, e.name}
-		a.seenWebhooks.Emit(k, k.kind, k.name, k.webhook)
 		v := 0.0
 		if !bytes.Equal(e.caBundle, ca) {
 			v = 1
 			log.Info("webhook caBundle drifted from cainjector source",
 				"kind", kind, "config", cfgName, "webhook", e.name)
 		}
-		metrics.WebhookCABundleMismatch.WithLabelValues(k.kind, k.name, k.webhook).Set(v)
+		a.seenWebhooks.Set(metrics.WebhookCABundleMismatch, v,
+			k, k.kind, k.name, k.webhook)
 	}
 }
 

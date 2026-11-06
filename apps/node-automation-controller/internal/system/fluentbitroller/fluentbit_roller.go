@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -142,18 +143,34 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 		return res, nil
 	}
 
-	// kubectl rollout restart equivalent.
-	restartPatch := []byte(fmt.Sprintf(
-		`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":%q}}}}}`,
-		r.now.Now().UTC().Format(time.RFC3339)))
+	// kubectl rollout restart equivalent. The stamp must land on the
+	// POD TEMPLATE — kube.MergePatchAnnos only covers top-level
+	// metadata.annotations, so the nested doc is marshalled by hand
+	// (same shape stale_recover.go builds for its restart stamp).
+	restartPatch, err := json.Marshal(map[string]any{
+		"spec": map[string]any{
+			"template": map[string]any{
+				"metadata": map[string]any{
+					"annotations": map[string]any{
+						"kubectl.kubernetes.io/restartedAt": r.now.Now().UTC().Format(time.RFC3339),
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("render restart patch: %w", err)
+	}
 	if _, err := r.cs.AppsV1().DaemonSets("fluent-system").Patch(ctx, "fluent-bit",
 		types.StrategicMergePatchType, restartPatch, metav1.PatchOptions{}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("rollout-restart patch daemonset fluent-system/fluent-bit: %w", err)
 	}
 	// State written only AFTER the restart succeeded (bash ordering):
 	// writing first would silently swallow the drift if restart failed.
-	statePatch := []byte(fmt.Sprintf(
-		`{"metadata":{"annotations":{%q:%q}}}`, kube.AnnoRolledConfigHash, hash))
+	statePatch, err := kube.MergePatchAnnos(map[string]any{kube.AnnoRolledConfigHash: hash})
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("render rolled-config-hash patch: %w", err)
+	}
 	if _, err := r.cs.CoreV1().Secrets("fluent-system").Patch(ctx, "passiontech-pipeline",
 		types.MergePatchType, statePatch, metav1.PatchOptions{}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("stamp rolled-config-hash on secret fluent-system/passiontech-pipeline: %w", err)

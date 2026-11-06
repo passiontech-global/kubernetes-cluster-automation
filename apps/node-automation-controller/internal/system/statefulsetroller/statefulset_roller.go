@@ -55,11 +55,13 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -86,6 +88,9 @@ const (
 
 type statefulSetOnDeleteRoller struct {
 	cs kubernetes.Interface
+	// dyn feeds the maintenance mutex's autopilot-Plan signal —
+	// live-pod evictions defer while a k0s upgrade is in flight.
+	dyn dynamic.Interface
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
@@ -93,6 +98,10 @@ type statefulSetOnDeleteRoller struct {
 	// now is the clock seam — tests pin it so the 30m drift and
 	// 5m stability windows are deterministic. nil → time.Now.
 	now shared.Clock
+	// verdict memoizes the maintenance-mutex evaluation so a sweep
+	// of several due StatefulSets pays one set of API reads instead
+	// of three per target.
+	verdict kube.Verdict
 	// driftSince records when each "ns/name" StatefulSet's
 	// updateRevision != currentRevision drift was FIRST observed —
 	// any cycle where the revisions agree, the set leaves, or the
@@ -109,7 +118,7 @@ func Setup(d shared.Deps) error {
 	if d.Disabled {
 		return nil
 	}
-	r := &statefulSetOnDeleteRoller{cs: d.CS, queue: d.Name, now: shared.SystemClock}
+	r := &statefulSetOnDeleteRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock}
 	return shared.AddPeriodic(d.Mgr, r.queue, stsOnDeleteRollerInterval, r.run)
 }
 
@@ -305,6 +314,26 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 		}
 	}
 
+	// Maintenance mutex — the cluster-wide cordon/kured/autopilot
+	// signal gate 1 does not cover (a static-cordon-tolerant Ready
+	// check vs. the fail-closed maintenance signals): a drain or k0s
+	// upgrade in flight must not race a live-pod eviction.
+	// heal.AllowedV runs with a nil heals ledger — this module's
+	// pacing is the 30m drift window, not a CooldownSet — and shares
+	// r.verdict so the sweep pays one mutex evaluation.
+	proceed, unverifiable := heal.AllowedV(ctx, log, &r.verdict,
+		r.cs, r.dyn, nil, sts.Namespace+"/"+sts.Name, 0, now)
+	if unverifiable {
+		// The check itself failed — a defer, not a returned run
+		// error, so count it here (same shape as every other
+		// unverifiable-mutex skip: fail closed, never evict blind).
+		metrics.IncError(r.queue)
+		return nil
+	}
+	if !proceed {
+		return nil
+	}
+
 	log.Info("EVICT: roll OnDelete StatefulSet — highest stale ordinal",
 		"statefulset", sts.Namespace+"/"+sts.Name,
 		"pod", candidate.Name,
@@ -314,10 +343,14 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	// the apiserver enforces the PDB budget and consumes a disruption
 	// slot atomically — the gate-2 pre-check above stays as a
 	// fast-path skip, and a refused eviction just errors this STS's
-	// roll (retried next sweep, no pod lost).
+	// roll (retried next sweep, no pod lost). The UID precondition
+	// closes the TOCTOU between the owned-pods snapshot and the
+	// evict — a same-named pod recreated in between is a fresh
+	// member already on its own schedule, not ours to roll.
 	ev := &policyv1.Eviction{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: candidate.Name, Namespace: sts.Namespace},
+		DeleteOptions: ptr.To(kube.UIDDeleteOptions(candidate.UID, "")),
 	}
 	if err := r.cs.PolicyV1().Evictions(sts.Namespace).
 		Evict(ctx, ev); err != nil {

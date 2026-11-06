@@ -48,23 +48,24 @@ const (
 func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log logr.Logger,
 	op operatorTarget, lease *coordinationv1.Lease, reasons []string, now time.Time) {
 
-	if p.opHealed.CooledDown(op.name, operatorHealCooldown, now) {
-		log.Info("skip heal: operator inside cooldown", "operator", op.name)
-		return
-	}
+	// The 1h cooldown is the wider of the in-RAM ledger and the
+	// persisted Lease stamp — the ledger covers a heal whose anno
+	// patch never landed, the annotation survives an operator
+	// restart. A nil lease (leaseOptional operators healing through
+	// the pod fallback) collapses the check to the ledger half.
+	var leaseObj metav1.Object
 	if lease != nil {
-		if t, ok := kube.AnnoTime(lease, operatorHealAnno); ok &&
-			now.Sub(t) < operatorHealCooldown {
-			log.Info("skip heal: persisted stamp inside cooldown",
-				"operator", op.name,
-				"ago", now.Sub(t).Truncate(time.Minute))
-			return
-		}
+		leaseObj = lease
+	}
+	if heal.PersistedCooledDown(&p.opHealed, leaseObj, operatorHealAnno,
+		op.name, operatorHealCooldown, now) {
+		log.Info("skip heal: inside cooldown", "operator", op.name)
+		return
 	}
 	// Maintenance mutex — "cannot verify" fails closed like every
 	// other caller: an unverifiable drain state defers the heal.
 	// heal.AllowedV runs with a nil ledger — the cooldown above is
-	// the wider of in-RAM + persisted stamp, not a single key, so
+	// the wider-of-both PersistedCooledDown, not a single key, so
 	// only its mutex gate applies — shared via the check's verdict
 	// so a sweep of stuck operators pays one evaluation.
 	proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
@@ -113,6 +114,10 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	for _, r := range reasons {
 		metrics.OperatorWorkqueueHealsTotal.WithLabelValues(op.name, r).Inc()
 	}
+	// The pod delete already landed — stamp the in-RAM half
+	// unconditionally so a failed anno patch cannot un-suppress a
+	// delivered heal (StampPersisted's delivered-only contract is
+	// for the annotation stamp, not the heal itself).
 	p.opHealed.Stamp(op.name, now)
 	// Persist the stamp on the Lease — the durable half of the
 	// cooldown. A nil lease (leaseOptional operators healing through
@@ -121,16 +126,14 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	if lease == nil {
 		return
 	}
-	payload, err := kube.MergePatchAnnos(map[string]any{
-		operatorHealAnno: now.UTC().Format(time.RFC3339),
-	})
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Error(err, "marshal heal stamp", "operator", op.name)
-		return
-	}
-	if _, err := p.CS.CoordinationV1().Leases(lease.Namespace).Patch(ctx, lease.Name,
-		types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+	if err := heal.StampPersisted(ctx,
+		func(ctx context.Context, data []byte) error {
+			_, err := p.CS.CoordinationV1().Leases(lease.Namespace).
+				Patch(ctx, lease.Name, types.MergePatchType, data,
+					metav1.PatchOptions{})
+			return err
+		},
+		operatorHealAnno, nil, "", now); err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "persist heal stamp failed", "operator", op.name)
 	}

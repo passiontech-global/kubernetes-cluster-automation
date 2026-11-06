@@ -95,6 +95,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -163,12 +164,6 @@ func hrCondition(o *unstructured.Unstructured, condType string) (status, reason,
 	return c.Status, c.Reason, c.Message
 }
 
-// helmLastStallUnwedge reads the persisted passiontech.dev/last-helm-stall-
-// unwedge stamp — the restart-proof half of the unwedge cooldown.
-func helmLastStallUnwedge(hr *unstructured.Unstructured) (time.Time, bool) {
-	return kube.AnnoTime(hr, helmLastStallUnwedgeAnno)
-}
-
 // unwedgeDue runs the stall-unwedge pass over the due HRs — cooldown
 // check, deadlock analysis, scale-down, retry stamp — and returns how
 // many HRs were actually unwedged.
@@ -181,16 +176,11 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		hr := stalled[key]
 		// Wider of in-RAM ledger and persisted stamp — same cooldown
 		// contract as the unlock path (restart must not refund 24h).
-		cooled := u.unwedged.CooledDown(key, helmUnlockCooldown, now)
-		if t, hasAnno := helmLastStallUnwedge(hr); hasAnno &&
-			now.Sub(t) < helmUnlockCooldown {
-			// Fold the persisted stamp into the ledger (the anno is
-			// stamped at unwedge time, never older than the in-RAM
-			// stamp from the same action).
-			u.unwedged.Stamp(key, t)
-			cooled = true
-		}
-		if cooled {
+		// No ledger fold needed here: unlike the unlock ledger the
+		// unwedged set is never pruned (stamps self-expire), so an
+		// anno-only cooldown needs no in-RAM mirror.
+		if heal.PersistedCooledDown(&u.unwedged, hr, helmLastStallUnwedgeAnno,
+			key, helmUnlockCooldown, now) {
 			u.alertStallOnce(ctx, key, now,
 				fmt.Sprintf("HR re-stalled inside the %s unwedge cooldown — previous unwedge did not fix it",
 					helmUnlockCooldown))

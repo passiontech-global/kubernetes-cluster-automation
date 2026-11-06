@@ -7,7 +7,6 @@ package nodehealth
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -139,9 +138,8 @@ func init() {
 func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	// The report census needs dyn — a missing client is a wiring
 	// bug, not "no signal" (same posture as the scylla check).
-	if p.Dyn == nil {
-		return probefw.Result{Infra: errors.New(
-			"no dynamic client — api object sprawl gc unverifiable")}
+	if r := p.RequireDyn("api object sprawl gc"); r != nil {
+		return *r
 	}
 	log := logf.FromContext(ctx)
 	now := p.Now()
@@ -218,21 +216,12 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 func (p *apiObjectSprawlReportGCCheck) reportOwnerGone(ctx context.Context,
 	obj *unstructured.Unstructured) bool {
 
-	ref := metav1.GetControllerOf(obj)
-	if ref == nil {
-		return false
-	}
-	ns := obj.GetNamespace()
-	var err error
-	switch ref.Kind {
-	case "Pod":
-		_, err = p.CS.CoreV1().Pods(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-	case "ReplicaSet":
-		_, err = p.CS.AppsV1().ReplicaSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-	default:
-		return false
-	}
-	return apierrors.IsNotFound(err)
+	// Only the Pod/ReplicaSet kinds are whitelisted — any other
+	// shape (unresolvable, lookup error, no owner, object still
+	// alive) fails closed as "not evidence of orphanhood".
+	gone, _ := probefw.OwnerGone(ctx, p.CS, obj.GetNamespace(),
+		metav1.GetControllerOf(obj), "Pod", "ReplicaSet")
+	return gone
 }
 
 // deleteOrphanReport removes one orphaned report with a UID

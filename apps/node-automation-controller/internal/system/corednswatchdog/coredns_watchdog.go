@@ -31,6 +31,8 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -50,12 +52,20 @@ const (
 )
 
 type coreDNSWatchdog struct {
-	cs   kubernetes.Interface
+	cs kubernetes.Interface
+	// dyn feeds the maintenance mutex's autopilot-Plan signal —
+	// stale-pod deletes/rollout restarts defer while a drain or k0s
+	// upgrade is in flight.
+	dyn  dynamic.Interface
 	http *http.Client
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
 	queue string
+	// verdict memoizes the maintenance-mutex evaluation inside
+	// recover() so back-to-back recovery runs pay one evaluation
+	// per TTL window.
+	verdict kube.Verdict
 	// streak replaces the bash /tmp/coredns-streak-* files: pod ->
 	// consecutive layer-2 failures. Resets on operator restart,
 	// biasing conservative like the old tmpfs files did.
@@ -79,6 +89,7 @@ type coreDNSWatchdog struct {
 func Setup(d shared.Deps) error {
 	w := &coreDNSWatchdog{
 		cs:    d.CS,
+		dyn:   d.Dyn,
 		http:  &http.Client{Timeout: 5 * time.Second},
 		queue: d.Name,
 		now:   shared.SystemClock,
@@ -101,11 +112,17 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 		return nil
 	}
 	podIP := map[string]string{}
+	// podUID captures each pod's UID off the same list snapshot —
+	// recover() deletes with a UID precondition so a same-named pod
+	// recreated mid-sweep is never killed.
+	podUID := map[string]types.UID{}
 	for _, p := range podList.Items {
 		podIP[p.Name] = p.Status.PodIP
+		podUID[p.Name] = p.UID
 	}
-	// Only name->IP feeds the layers below — release the full PodList
-	// before the log streams, EndpointSlice lists and DNS probes run.
+	// Only name->IP and name->UID feed the layers below — release
+	// the full PodList before the log streams, EndpointSlice lists
+	// and DNS probes run.
 	podList = nil
 	// Prune streaks of pods that vanished (recreates change names).
 	w.streak.Prune(func(name string) bool {
@@ -196,5 +213,5 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	sort.Strings(suspects)
 	log.Info("STALE coredns replicas — dead watch or panic",
 		"stale", len(suspects), "total", len(podIP), "pods", suspects)
-	return w.recover(ctx, suspects, len(podIP))
+	return w.recover(ctx, suspects, podUID, len(podIP))
 }

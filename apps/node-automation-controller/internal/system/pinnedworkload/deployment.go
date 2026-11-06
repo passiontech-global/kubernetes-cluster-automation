@@ -2,9 +2,11 @@
 // the pinned-Deployment patchers (coredns, metrics-server):
 // Get → NotFound skip → proportional wantReplicas → Drifted →
 // missing-container guard → PatchBody → strategic-merge Patch →
-// 15m requeue. The module supplies the ops surface — queue name,
-// drift check, patch body, the drift-free log line; this file owns
-// the flow and the fixed error/metric shape every error path shares.
+// 15m requeue. The module supplies the ops surface — drift check,
+// patch body, the drift-free log line; this file owns the flow and
+// the fixed error shape every error path shares. Returned errors are
+// counted once by the shared.CountReconcile wrapper at each module's
+// builder.Complete — never IncError here (that would double-count).
 package pinnedworkload
 
 import (
@@ -20,7 +22,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -36,9 +37,6 @@ type DeploymentSpec struct {
 	// CS is the direct (uncached) clientset — module reads go through
 	// it, not the manager cache.
 	CS kubernetes.Interface
-	// Queue is the module's ops name — every metrics.IncError label
-	// comes from it.
-	Queue string
 	// Namespace/Name locate the pinned Deployment (kube-system/<addon>
 	// today) — they also fill the "deployment" log key and every
 	// wrapped error string ("get deployment <ns>/<name>: ...").
@@ -68,8 +66,9 @@ type DeploymentSpec struct {
 // Reconcile is the pinned-Deployment reconcile loop both Deployment
 // patchers run: get → skip on NotFound → compute wantReplicas →
 // patch only on drift. NotFound, no-drift and the skip paths return
-// nil on the 15m requeue; every other failure IncErrors Queue once
-// and returns the error for workqueue backoff.
+// nil on the 15m requeue; every other failure returns the error for
+// workqueue backoff — the shared.CountReconcile wrapper at the
+// module's builder.Complete IncErrors it exactly once.
 func (s DeploymentSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	res := ctrl.Result{RequeueAfter: RequeueInterval}
@@ -83,7 +82,6 @@ func (s DeploymentSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 		return res, nil
 	}
 	if err != nil {
-		metrics.IncError(s.Queue)
 		return ctrl.Result{}, fmt.Errorf("get deployment %s: %w", ref, err)
 	}
 
@@ -92,7 +90,6 @@ func (s DeploymentSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	// touches .spec.replicas then).
 	wantReplicas, err := s.Replicas.Want(ctx, s.CS)
 	if err != nil {
-		metrics.IncError(s.Queue)
 		return ctrl.Result{}, fmt.Errorf("list nodes for proportional replica count: %w", err)
 	}
 
@@ -114,7 +111,6 @@ func (s DeploymentSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	}
 	patch, err := s.PatchBody(wantReplicas)
 	if err != nil {
-		metrics.IncError(s.Queue)
 		return ctrl.Result{}, fmt.Errorf("render patch body for deployment %s: %w", ref, err)
 	}
 	log.Info("PATCH: "+s.Name+" drifted — restoring pinned spec",
@@ -122,7 +118,6 @@ func (s DeploymentSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	if _, err := s.CS.AppsV1().Deployments(s.Namespace).Patch(ctx,
 		s.Name, types.StrategicMergePatchType,
 		patch, metav1.PatchOptions{}); err != nil {
-		metrics.IncError(s.Queue)
 		return ctrl.Result{}, fmt.Errorf("patch deployment %s: %w", ref, err)
 	}
 	return res, nil

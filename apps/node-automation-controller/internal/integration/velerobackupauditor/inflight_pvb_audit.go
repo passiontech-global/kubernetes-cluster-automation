@@ -20,6 +20,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -55,8 +56,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 				continue
 			}
 			k := pausedKey{b.GetNamespace(), b.GetName()}
-			a.seenStuckBackup.Emit(k, k.namespace, k.schedule)
-			metrics.VeleroBackupStuck.WithLabelValues(k.namespace, k.schedule).Set(1)
+			a.seenStuckBackup.Set(metrics.VeleroBackupStuck, 1, k, k.namespace, k.schedule)
 			log.Info("velero backup wedged in-flight >6h",
 				"backup", k.namespace+"/"+k.schedule, "phase", phase)
 		}
@@ -87,8 +87,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 		}
 		ns, name := pvb.GetNamespace(), pvb.GetName()
 		k := pausedKey{ns, name}
-		a.seenWedgedPVB.Emit(k, ns, name)
-		metrics.VeleroPodVolumeBackupWedged.WithLabelValues(ns, name).Set(1)
+		a.seenWedgedPVB.Set(metrics.VeleroPodVolumeBackupWedged, 1, k, ns, name)
 		log.Info("velero podvolumebackup wedged in-flight >6h",
 			"pvb", ns+"/"+name, "phase", phase)
 
@@ -100,7 +99,7 @@ func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
 		if a.pvbHealed.CooledDown(ns+"/"+name, veleroPVBCleanupCooldown, now) {
 			continue
 		}
-		if a.cleanWedgedPVB(ctx, pvb, since) {
+		if a.cleanWedgedPVB(ctx, pvb, since, now) {
 			a.pvbHealed.Stamp(ns+"/"+name, now)
 			cleaned++
 		}
@@ -124,9 +123,12 @@ func inFlightSince(u *unstructured.Unstructured) time.Time {
 
 // cleanWedgedPVB decides whether the PVB's node-agent provably lost
 // its Kopia thread and, if so, deletes the PVB and bounces the agent
-// pod. Returns true when the cleanup ran (cooldown-worthy).
+// pod. The delete phase is destructive on TWO counts — a CR object
+// and a LIVE pod — so it gates on heal.AllowedV (cooldown +
+// maintenance mutex, fail closed on unverifiable) before any write.
+// Returns true when the cleanup ran (cooldown-worthy).
 func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
-	pvb *unstructured.Unstructured, pvbStart time.Time) bool {
+	pvb *unstructured.Unstructured, pvbStart, now time.Time) bool {
 	log := logf.FromContext(ctx)
 	agent, err := a.pvbAgentPod(ctx, pvb)
 	if err != nil {
@@ -139,6 +141,19 @@ func (a *veleroBackupAuditor) cleanWedgedPVB(ctx context.Context,
 		return false // agent still owns the thread — not provably wedged
 	}
 	ns, name := pvb.GetNamespace(), pvb.GetName()
+	// The whole delete phase (PVB object + node-agent pod bounce)
+	// defers while deliberate maintenance is in flight — a cordon or
+	// k0s upgrade already removes agent pods, and an unverifiable
+	// mutex fails closed with the error surfaced on the queue.
+	proceed, unverifiable := heal.AllowedV(ctx, log, &a.verdict, a.cs, a.dyn,
+		&a.pvbHealed, ns+"/"+name, veleroPVBCleanupCooldown, now)
+	switch {
+	case unverifiable:
+		metrics.IncError(a.queue)
+		return false
+	case !proceed:
+		return false
+	}
 	uid := pvb.GetUID()
 	if err := a.dyn.Resource(veleroPVBGVR).Namespace(ns).Delete(ctx, name,
 		kube.UIDDeleteOptions(uid, "")); err != nil && !apierrors.IsNotFound(err) {

@@ -28,6 +28,10 @@ type rabbitMQSuspendedCheck struct {
 	//   - rbHealed: "ns/pod" → last delete — the 30m heal cooldown.
 	rbSuspendedSince state.FirstSeenLedger
 	rbHealed         state.CooldownSet
+	// verdict memoizes the maintenance-mutex evaluation the
+	// per-pod heal preambles share — one evaluation per Verdict TTL
+	// instead of three API reads per suspended pod.
+	verdict kube.Verdict
 }
 
 // newRabbitMQSuspendedCheck builds the W6.4 check — both ledgers
@@ -104,7 +108,10 @@ func (p *rabbitMQSuspendedCheck) rabbitQuorumSafe(ctx context.Context, pod *core
 	// mid-churn set where fewer than spec.replicas pods even exist
 	// cannot prove the delete leaves quorum intact. Require the full
 	// pod count AND replicas-1 READY peers (the suspended pod itself
-	// holds the remaining vote).
+	// holds the remaining vote). ReadySiblings counts Running+Ready
+	// non-deleting pods sharing the pod's StatefulSet owner —
+	// strictly stronger than a bare Ready-condition read (a
+	// terminating-but-Ready peer cannot absorb traffic either).
 	if sts.Spec.Replicas == nil {
 		return false, nil
 	}
@@ -112,17 +119,7 @@ func (p *rabbitMQSuspendedCheck) rabbitQuorumSafe(ctx context.Context, pod *core
 	if len(peers.Items) < want {
 		return false, nil
 	}
-	readyPeers := 0
-	for i := range peers.Items {
-		peer := &peers.Items[i]
-		if peer.UID == pod.UID {
-			continue
-		}
-		if kube.PodReadyCond(peer) {
-			readyPeers++
-		}
-	}
-	if readyPeers < want-1 {
+	if probefw.ReadySiblings(probefw.ReadyByOwner(peers.Items), pod) < want-1 {
 		return false, nil
 	}
 	return true, nil
@@ -153,43 +150,28 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 		}
 		key := pod.Namespace + "/" + pod.Name + "/" + string(pod.UID)
 		live[key] = true
-		first, tracked := p.rbSuspendedSince.Observe(key, now)
-		if !tracked {
-			log.Info("rabbitmq suspended-listener signature — tracking first-seen",
-				"pod", pod.Namespace+"/"+pod.Name)
-			continue
-		}
-		if now.Sub(first) >= rabbitSuspendedMinAge {
+		if probefw.Persisted(&p.rbSuspendedSince, key, now,
+			rabbitSuspendedMinAge, log) {
 			due = append(due, *pod)
 		}
 	}
 	p.rbSuspendedSince.Prune(func(k string) bool { return live[k] })
 
-	// Maintenance mutex — evaluated once per sweep and only when
-	// there is something to delete: pod kills during a drain/upgrade
-	// are exactly what the mutex exists to prevent; "cannot verify"
-	// fails closed.
-	var maintHeld bool
-	var maintWhy string
-	var maintErr error
-	if len(due) > 0 {
-		maintHeld, maintWhy, maintErr = kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-		if maintErr != nil {
-			metrics.IncError(p.Name)
-			log.Info("WARN: maintenance check unverifiable — heals deferred (fail closed)",
-				"error", maintErr)
-		}
-	}
+	// Per-pod heal preamble — cooldown + maintenance mutex run by
+	// heal.AllowedV like every pod-delete heal in this sweep. The
+	// check's verdict memoizes the mutex evaluation, so the loop
+	// still pays a single set of API reads when several pods are
+	// due; "cannot verify" fails closed.
 	for i := range due {
 		pod := &due[i]
 		key := pod.Namespace + "/" + pod.Name
-		if maintErr != nil || maintHeld {
-			log.Info("maintenance gate — suspended rabbitmq pod kept",
-				"pod", key, "why", maintWhy)
+		proceed, unverifiable := heal.AllowedV(ctx, log, &p.verdict,
+			p.CS, p.Dyn, &p.rbHealed, key, rabbitHealCooldown, now)
+		if unverifiable {
+			metrics.IncError(p.Name)
 			continue
 		}
-		if p.rbHealed.CooledDown(key, rabbitHealCooldown, now) {
-			log.Info("skip heal: rabbitmq pod inside cooldown", "pod", key)
+		if !proceed {
 			continue
 		}
 		safe, err := p.rabbitQuorumSafe(ctx, pod)

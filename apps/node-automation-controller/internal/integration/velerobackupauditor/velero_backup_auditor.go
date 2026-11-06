@@ -180,6 +180,11 @@ type veleroBackupAuditor struct {
 	// the per-object cooldown that stops a still-broken node-agent
 	// from being delete-looped every sweep.
 	pvbHealed state.CooldownSet
+	// verdict memoizes the maintenance-mutex evaluation for the
+	// sweep's PVB-cleanup preambles — the deletes below are
+	// destructive (a PVB object AND a live node-agent pod), so they
+	// gate on heal.AllowedV and share one verdict per sweep.
+	verdict kube.Verdict
 }
 
 // Setup registers the 15m sweep — or nothing when
@@ -247,14 +252,13 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 			pausedNow[lk] = true
 			first, _ := a.firstSeenPaused.Observe(lk, a.now.Now())
 			k := pausedKey{ns, name}
-			a.seenPaused.Emit(k, ns, name)
 			v := 0.0
 			if pausedFor := a.now.Now().Sub(first); pausedFor > veleroPausedMinAge {
 				v = 1
 				log.Info("velero schedule paused >24h — backups silently stopped",
 					"schedule", ns+"/"+name, "pausedFor", pausedFor.Truncate(time.Hour))
 			}
-			metrics.VeleroSchedulePaused.WithLabelValues(ns, name).Set(v)
+			a.seenPaused.Set(metrics.VeleroSchedulePaused, v, k, ns, name)
 		}
 
 		// Check 2 — the latest schedule-owned Backup empty/errored.
@@ -302,8 +306,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 				continue
 			}
 			k := pausedKey{ns, name}
-			a.seenBSL.Emit(k, ns, name)
-			metrics.VeleroBSLUnavailable.WithLabelValues(ns, name).Set(1)
+			a.seenBSL.Set(metrics.VeleroBSLUnavailable, 1, k, ns, name)
 			log.Info("velero BSL unavailable — backups/restore at risk",
 				"bsl", ns+"/"+name, "phase", phase)
 		}

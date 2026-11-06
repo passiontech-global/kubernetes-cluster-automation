@@ -92,6 +92,6 @@ func (a *certDriftAuditor) emitTrustBundle(ctx context.Context, ns, name string,
 			"object", ns+"/"+name)
 		return
 	}
-	a.seenTrustBundles.Emit(secretMetricKey{ns, name}, ns, name)
-	metrics.TrustBundleDaysToExpiry.WithLabelValues(ns, name).Set(days)
+	a.seenTrustBundles.Set(metrics.TrustBundleDaysToExpiry, days,
+		secretMetricKey{ns, name}, ns, name)
 }

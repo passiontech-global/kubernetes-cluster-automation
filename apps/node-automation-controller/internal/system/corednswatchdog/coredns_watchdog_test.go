@@ -75,7 +75,11 @@ func cdnsProbeService(name, ns string, age time.Duration, ready *bool) (*corev1.
 // to the "all clean" result — each test overrides the layer it exercises.
 func newCDNSWatchdog(cs *fake.Clientset) *coreDNSWatchdog {
 	return &coreDNSWatchdog{
-		cs:       cs,
+		cs: cs,
+		// NewDynamicClient (not StubDyn): recover()'s maintenance
+		// mutex autopilot-Plan signal must be verifiable or every
+		// recovery defers fail-closed.
+		dyn:      testutil.NewDynamicClient(),
 		logHitFn: func(context.Context, string) string { return "" },
 		dnsFn:    func(context.Context, string, string) ([]string, error) { return []string{"10.1.2.3"}, nil },
 		panicsFn: func(context.Context, string) (float64, bool) { return 0, true },
@@ -331,7 +335,7 @@ func TestCoreDNSRecover(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
 			cdnsDeployment(2, 2, cooldown))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, 2); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, 2); err != nil {
 			t.Fatal(err)
 		}
 		for _, p := range []string{"cdns-a", "cdns-b"} {
@@ -350,7 +354,7 @@ func TestCoreDNSRecover(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"),
 			cdnsDeployment(1, 1, nil))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, 1); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err != nil {
 			t.Fatal(err)
 		}
 		if !cdnsPodExists(t, cs, "cdns-a") {
@@ -370,7 +374,7 @@ func TestCoreDNSRecover(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"),
 			cdnsDeployment(2, 1, nil)) // 2 desired, only 1 ready
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, 1); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err != nil {
 			t.Fatal(err)
 		}
 		if !cdnsPodExists(t, cs, "cdns-a") {
@@ -383,7 +387,7 @@ func TestCoreDNSRecover(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
 			cdnsDeployment(2, 2, nil))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, 2); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, 2); err != nil {
 			t.Fatal(err)
 		}
 		d := getCDNSDeployment(t, cs)
@@ -406,7 +410,7 @@ func TestCoreDNSRecover(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
 			cdnsDeployment(2, 2, nil))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, 2); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
 			t.Fatal(err)
 		}
 		if cdnsPodExists(t, cs, "cdns-a") {
@@ -426,7 +430,7 @@ func TestCoreDNSRecover(t *testing.T) {
 
 	t.Run("missing deployment is a hard error", func(t *testing.T) {
 		w := newCDNSWatchdog(fake.NewSimpleClientset())
-		if err := w.recover(ctx, []string{"cdns-a"}, 1); err == nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err == nil {
 			t.Fatal("expected error when deploy/coredns is absent")
 		}
 	})
@@ -494,7 +498,7 @@ func TestCoreDNSRecoverErrorPaths(t *testing.T) {
 				return true, nil, errors.New("api down")
 			})
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, 1); err == nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err == nil {
 			t.Fatal("expected error when the node list fails")
 		}
 	})
@@ -508,7 +512,7 @@ func TestCoreDNSRecoverErrorPaths(t *testing.T) {
 				return true, nil, errors.New("patch rejected")
 			})
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, 1); err == nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err == nil {
 			t.Fatal("expected error when the restart patch fails")
 		}
 	})
@@ -522,7 +526,7 @@ func TestCoreDNSRecoverErrorPaths(t *testing.T) {
 				return true, nil, errors.New("delete rejected")
 			})
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, 2); err == nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err == nil {
 			t.Fatal("expected error when the pod delete fails")
 		}
 	})

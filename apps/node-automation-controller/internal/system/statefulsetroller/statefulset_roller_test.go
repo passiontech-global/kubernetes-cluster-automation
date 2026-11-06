@@ -104,6 +104,10 @@ func srPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
 
 func srRoller(cs *fake.Clientset, now time.Time) *statefulSetOnDeleteRoller {
 	return &statefulSetOnDeleteRoller{cs: cs,
+		// NewDynamicClient (not StubDyn): the maintenance mutex's
+		// autopilot-Plan signal must be verifiable or every roll
+		// defers fail-closed.
+		dyn: natestutil.NewDynamicClient(),
 		now: func() time.Time { return now }}
 }
 

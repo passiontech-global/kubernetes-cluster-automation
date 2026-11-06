@@ -21,7 +21,7 @@ import (
 // "user:password", split on the FIRST colon (the password itself may
 // contain colons).
 func (j *concourseWorkdirJanitor) atcCredentials(ctx context.Context) (string, string, error) {
-	cctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
+	cctx, cancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
 	defer cancel()
 	sec, err := j.cs.CoreV1().Secrets(cjNamespace).Get(cctx, cjSecretName, metav1.GetOptions{})
 	if err != nil {
@@ -44,7 +44,7 @@ func (j *concourseWorkdirJanitor) atcCredentials(ctx context.Context) (string, s
 // the pod (kubectl annotate --overwrite). The annotation is what the
 // next run subtracts from nodefs to get the work-dir usage.
 func (j *concourseWorkdirJanitor) annotateBaseline(ctx context.Context, pod string, nodefsGiB int64) error {
-	cctx, cancel := context.WithTimeout(ctx, j.reqTimeout)
+	cctx, cancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
 	defer cancel()
 	patch, err := kube.MergePatchAnnos(map[string]any{
 		cjBaselineAnno: strconv.FormatInt(nodefsGiB, 10),

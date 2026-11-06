@@ -111,11 +111,10 @@ func esAnnotation(t *testing.T, dyn *fake.FakeDynamicClient, gvr schema.GroupVer
 	return u.GetAnnotations()[anno]
 }
 
-func newNudge(dyn *fake.FakeDynamicClient, enabled bool) *externalSecretNudge {
+func newNudge(dyn *fake.FakeDynamicClient) *externalSecretNudge {
 	return &externalSecretNudge{queue: "externalsecret-nudge",
 		cs:         kfake.NewSimpleClientset(),
 		dyn:        dyn,
-		enabled:    enabled,
 		storeReady: map[string]bool{},
 	}
 }
@@ -153,7 +152,7 @@ func TestExternalSecretNudgeRecoveryTransition(t *testing.T) {
 	young := esObj("apps", "es-fresh", "False", 5*time.Minute)
 	healthy := esObj("apps", "es-ok", "True", 2*time.Hour)
 	dyn := newDynFake(cssObj("css1", "False"), old, young, healthy)
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 
 	// Tick 1: seeds storeReady (store currently False) — no nudges.
 	if err := n.run(ctx); err != nil {
@@ -194,7 +193,7 @@ func TestExternalSecretNudgeRecoveryTransition(t *testing.T) {
 func TestExternalSecretNudgeRateLimit(t *testing.T) {
 	dyn := newDynFake(cssObj("css1", "False"),
 		esObj("apps", "es-stuck", "False", time.Hour))
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 
 	if err := n.run(ctx); err != nil { // seed: False
 		t.Fatal(err)
@@ -227,7 +226,7 @@ func TestExternalSecretNudgeRateLimit(t *testing.T) {
 func TestExternalSecretNudgeNoTransitionOnFirstSight(t *testing.T) {
 	dyn := newDynFake(cssObj("css1", "True"),
 		esObj("apps", "es-stuck", "False", time.Hour))
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
@@ -237,26 +236,9 @@ func TestExternalSecretNudgeNoTransitionOnFirstSight(t *testing.T) {
 	}
 }
 
-// enabled=false → log + nil, nothing is listed or patched.
-func TestExternalSecretNudgeDisabled(t *testing.T) {
-	dyn := newDynFake(cssObj("css1", "False"),
-		esObj("apps", "es-stuck", "False", time.Hour))
-	n := newNudge(dyn, false)
-
-	if err := n.run(ctx); err != nil {
-		t.Fatal(err)
-	}
-	setStoreReady(t, dyn, "css1", "True")
-	if err := n.run(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-stuck", esForceSyncAnno); got != "" {
-		t.Fatal("disabled module stamped force-sync")
-	}
-	if len(n.storeReady) != 0 {
-		t.Fatal("disabled module tracked store state")
-	}
-}
+// The disabled-module case is covered by the registration contract in
+// setup_test.go — EXTERNALSECRET_NUDGE_ENABLED is a registration gate,
+// so there is no run-time disabled path left to test.
 
 // A ClusterSecretStore list failure is a real error — probing on a
 // partial store view could misread "vanished" as a transition.
@@ -266,16 +248,16 @@ func TestExternalSecretNudgeStoreListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 	if err := n.run(ctx); err == nil {
 		t.Fatal("expected error when the store list fails")
 	}
 }
 
-// Cluster has the flag enabled but the ESO CRDs are not installed
-// yet (opt-in before the rollout) -> List 404 "could not find the
-// requested resource" — must skip quietly, must not count as a
-// periodic run error.
+// Cluster is registered (the gate is opt-in at registration) but the
+// ESO CRDs are not installed yet — opted in before the rollout -> List
+// 404 "could not find the requested resource" — must skip quietly,
+// must not count as a periodic run error.
 func TestExternalSecretNudgeCRDsAbsent(t *testing.T) {
 	dyn := newDynFake(cssObj("css1", "False"))
 	dyn.PrependReactor("list", "clustersecretstores",
@@ -283,7 +265,7 @@ func TestExternalSecretNudgeCRDsAbsent(t *testing.T) {
 			return true, nil, apierrors.NewNotFound(
 				clusterSecretStoreGVRs[0].GroupResource(), "")
 		})
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 	if err := n.run(ctx); err != nil {
 		t.Fatalf("absent ESO CRDs must skip cleanly, got %v", err)
 	}
@@ -294,7 +276,7 @@ func TestExternalSecretNudgeCRDsAbsent(t *testing.T) {
 func TestExternalSecretNudgePrunedStoreReseeds(t *testing.T) {
 	dyn := newDynFake(cssObj("css1", "False"),
 		esObj("apps", "es-stuck", "False", time.Hour))
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 
 	if err := n.run(ctx); err != nil { // seed: False
 		t.Fatal(err)
@@ -332,7 +314,7 @@ func TestExternalSecretNudgePrunedStoreReseeds(t *testing.T) {
 func TestExternalSecretNudgeESListError(t *testing.T) {
 	dyn := newDynFake(cssObj("css1", "False"),
 		esObj("apps", "es-stuck", "False", time.Hour))
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 	if err := n.run(ctx); err != nil { // seed
 		t.Fatal(err)
 	}
@@ -360,7 +342,7 @@ func TestExternalSecretNudgeReadySinceFallback(t *testing.T) {
 	}
 	es.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-time.Hour)))
 	dyn := newDynFake(cssObj("css1", "False"), es)
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 
 	if err := n.run(ctx); err != nil { // seed: False
 		t.Fatal(err)
@@ -390,7 +372,7 @@ func TestExternalSecretNudgeNudgedCooldown(t *testing.T) {
 	})
 	healed := esObj("apps", "es-healed", "True", 3*time.Hour)
 	dyn := newDynFake(live, expired, healed)
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 	freshStamp := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-live", esForceSyncAnno)
 
 	if err := n.nudge(ctx, true, true); err != nil { // edge path — all stuck ESs eligible
@@ -484,7 +466,7 @@ func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 			}
 			return false, nil, nil
 		})
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 	before := testutil.QueueErrorCount(t, "externalsecret-nudge")
 	if err := n.nudge(ctx, true, true); err != nil {
 		t.Fatalf("per-ES patch failure must not fail the nudge: %v", err)
@@ -558,7 +540,7 @@ func TestExternalSecretNudgeStateBasedWithoutEdge(t *testing.T) {
 		stuck, other, namespaced, defaulted, broken,
 		viaDataFrom, mixedBroken, mixedNamespaced, viaData, mixedDataBroken,
 	}, healthyObjs...)...)
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 
 	if err := n.run(ctx); err != nil { // seeds both stores, no edge
 		t.Fatal(err)
@@ -600,7 +582,7 @@ func TestExternalSecretNudgePersistedCooldown(t *testing.T) {
 		esLastNudgeAnno: time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339),
 	})
 	dyn := newDynFake(cssObj("css1", "True"), recent, stale)
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 
 	if err := n.run(ctx); err != nil {
 		t.Fatal(err)
@@ -652,7 +634,7 @@ func TestExternalSecretNudgeStormGuardSuppresses(t *testing.T) {
 	objs = append(objs, ok)
 
 	dyn := esNudgeDynFake(objs...)
-	n := newNudge(dyn, true)
+	n := newNudge(dyn)
 	if err := n.run(ctx); err != nil { // seed store state
 		t.Fatal(err)
 	}
@@ -671,7 +653,7 @@ func TestExternalSecretNudgeStormGuardSuppresses(t *testing.T) {
 	// A non-storm population resets the gauge.
 	healthy := esNudgeDynFake(cssObj("store", "True"),
 		esObj("apps", "es-fine", "True", time.Hour))
-	n2 := newNudge(healthy, true)
+	n2 := newNudge(healthy)
 	if err := n2.run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -705,7 +687,6 @@ func TestExternalSecretNudgeConnectHeal(t *testing.T) {
 	n := &externalSecretNudge{queue: "externalsecret-nudge",
 		cs:         cs,
 		dyn:        dyn,
-		enabled:    true,
 		storeReady: map[string]bool{},
 	}
 	// The store has been observed down since 20m ago — past the
@@ -749,7 +730,6 @@ func TestExternalSecretNudgeConnectHealTransient(t *testing.T) {
 	n := &externalSecretNudge{queue: "externalsecret-nudge",
 		cs:         cs,
 		dyn:        dyn,
-		enabled:    true,
 		storeReady: map[string]bool{},
 	}
 	if err := n.run(ctx); err != nil { // first sight — clock starts now

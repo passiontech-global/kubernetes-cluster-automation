@@ -20,6 +20,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -75,14 +76,8 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context,
 		}
 		key := k.GetNamespace() + "/" + k.GetName()
 		// Cooldown: wider of the in-RAM ledger and the persisted stamp.
-		cooled := u.immutableJobHealed.CooledDown(key, immutableJobCooldown, now)
-		if t, ok := kube.AnnoTime(k, immutableJobHealAnno); ok &&
-			now.Sub(t) < immutableJobCooldown {
-			// Fold the persisted stamp into the ledger.
-			u.immutableJobHealed.Stamp(key, t)
-			cooled = true
-		}
-		if cooled {
+		if heal.PersistedCooledDown(&u.immutableJobHealed, k,
+			immutableJobHealAnno, key, immutableJobCooldown, now) {
 			continue
 		}
 		// The Job lives where the manifests apply — spec.targetNamespace
@@ -120,8 +115,11 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context,
 			log.Error(err, "immutable job delete failed", "job", jobNS+"/"+job.Name)
 			continue
 		}
-		// Persist the stamp — the durable half of the 30m cooldown.
+		// The in-RAM stamp lands WITH the heal — the Job is already
+		// deleted, so a failed annotation write below must not refund
+		// the cooldown (the annotation is only the restart-proof half).
 		u.immutableJobHealed.Stamp(key, now)
+		// Persist the stamp — the durable half of the 30m cooldown.
 		payload, err := kube.MergePatchAnnos(map[string]any{
 			immutableJobHealAnno: now.UTC().Format(time.RFC3339),
 		})

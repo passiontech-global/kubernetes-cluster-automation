@@ -42,8 +42,7 @@ import (
 const ciliumNotReadyTaint = "node.cilium.io/agent-not-ready"
 
 type ciliumTaintReaper struct {
-	cs      kubernetes.Interface
-	enabled bool
+	cs kubernetes.Interface
 }
 
 // The watch wiring below installs these package-level units
@@ -92,7 +91,7 @@ func Setup(d shared.Deps) error {
 	if d.Disabled {
 		return nil
 	}
-	r := &ciliumTaintReaper{cs: cs, enabled: true}
+	r := &ciliumTaintReaper{cs: cs}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(d.Name).
 		// Watches with a single fixed workqueue key, not For(): the
@@ -111,20 +110,12 @@ func Setup(d shared.Deps) error {
 		// needed. Same fixed sweep key — the reconcile never read
 		// the pod's node name anyway.
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(ciliumPodSweepRequests)).
-		// Registration implies the gate was on, so enabled is
-		// unconditionally true here — the field and its Reconcile
-		// check now only matter for literally-constructed reapers
-		// in tests.
 		Complete(shared.CountReconcile(d.Name, r.Reconcile))
 }
 
 func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	res := ctrl.Result{RequeueAfter: 10 * time.Minute}
-	if !r.enabled {
-		log.Info("skip: CILIUM_TAINT_REAPER_ENABLED != true")
-		return res, nil
-	}
 
 	// Sweep every node like bash — a node/pod event is only the
 	// trigger, the verdict always covers the whole cluster.
@@ -133,33 +124,56 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
 
-	reaped := 0
+	// Collect the tainted nodes first: with none, the cilium pod
+	// list is never issued — the steady state pays only the node
+	// list, the same cost the old per-node lookups had.
+	var tainted []*corev1.Node
 	for i := range nodes {
-		node := &nodes[i]
-		if !kube.HasTaint(node.Spec.Taints, ciliumNotReadyTaint) {
-			continue
+		if kube.HasTaint(nodes[i].Spec.Taints, ciliumNotReadyTaint) {
+			tainted = append(tainted, &nodes[i])
 		}
-		pods, err := r.cs.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{
-			LabelSelector: "k8s-app=cilium",
-			FieldSelector: "spec.nodeName=" + node.Name,
-		})
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("list cilium pods on node %s: %w", node.Name, err)
-		}
-		if len(pods.Items) == 0 {
+	}
+	if len(tainted) == 0 {
+		log.Info("sweep done", "reaped", 0, "nodes", len(nodes))
+		return res, nil
+	}
+
+	// ONE label-selected cluster list indexed by node — the old
+	// sweep issued a kube-system List per tainted node (an N+1 on
+	// the apiserver); indexing spec.nodeName in-code reproduces the
+	// per-node field-selector scoping exactly (a pod pinned to a
+	// different node lands under ITS key, an unscheduled one under
+	// ""). Reads stay on the direct clientset: the Pod informer
+	// exists for event triggers, not this verdict.
+	pods, err := r.cs.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{
+		LabelSelector: "k8s-app=cilium",
+	})
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("list cilium pods: %w", err)
+	}
+	podsByNode := make(map[string][]*corev1.Pod)
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		podsByNode[p.Spec.NodeName] = append(podsByNode[p.Spec.NodeName], p)
+	}
+
+	reaped := 0
+	for _, node := range tainted {
+		onNode := podsByNode[node.Name]
+		if len(onNode) == 0 {
 			log.Info("SKIP: taint present but no cilium pod on node",
 				"node", node.Name)
 			continue
 		}
 		// The verdict must read EVERY cilium pod on the node — during
 		// a rollout the old (terminating/unready) and new agents can
-		// coexist, and reading only Items[0] makes the outcome depend
-		// on apiserver list order. ANY healthy agent means the taint
-		// is stale; reap only then.
+		// coexist, and reading only the first pod makes the outcome
+		// depend on apiserver list order. ANY healthy agent means the
+		// taint is stale; reap only then.
 		var healthy *corev1.Pod
-		for i := range pods.Items {
-			if ciliumPodHealthy(&pods.Items[i]) {
-				healthy = &pods.Items[i]
+		for _, p := range onNode {
+			if ciliumPodHealthy(p) {
+				healthy = p
 				break
 			}
 		}
@@ -172,9 +186,9 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 			}
 			reaped++
 		} else {
-			pod := &pods.Items[0] // first pod, for diagnostics only
+			pod := onNode[0] // first pod, for diagnostics only
 			log.Info("KEEP: no healthy agent -> taint is doing its job",
-				"node", node.Name, "pods", len(pods.Items),
+				"node", node.Name, "pods", len(onNode),
 				"pod", pod.Name,
 				"phase", pod.Status.Phase,
 				"terminating", pod.DeletionTimestamp != nil,

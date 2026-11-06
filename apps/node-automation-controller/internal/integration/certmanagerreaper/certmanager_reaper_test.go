@@ -16,7 +16,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
-	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 )
 
@@ -173,7 +172,7 @@ func TestCertManagerReaperSetupDisabled(t *testing.T) {
 
 func TestCertManagerReaperDeletesStuckOrder(t *testing.T) {
 	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -195,7 +194,7 @@ func TestCertManagerReaperRenewalWindowCandidate(t *testing.T) {
 		cmrCertRequest("app", "order-b-cr", "tls-b"),
 		cmrOrderOwned("app", "order-b", "pending", 45*time.Minute, "order-b-cr"),
 		cmrChallenge("app", "order-b-ch", true, true, time.Hour, "order-b"))
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -213,7 +212,7 @@ func TestCertManagerReaperKeepsHealthyCert(t *testing.T) {
 		cmrCertRequest("app", "order-ok-cr", "tls-ok"),
 		cmrOrderOwned("app", "order-ok", "pending", 45*time.Minute, "order-ok-cr"),
 		cmrChallenge("app", "order-ok-ch", true, true, time.Hour, "order-ok"))
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -232,7 +231,7 @@ func TestCertManagerReaperOrderGates(t *testing.T) {
 		cmrOrderOwned("app", "young", "pending", 10*time.Minute, "cr-a"), // fresh
 		cmrOrderOwned("app", "valid", "valid", 45*time.Minute, "cr-a"),   // not pending
 		cmrChallenge("app", "ch", true, true, time.Hour, "young"))
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -252,7 +251,7 @@ func TestCertManagerReaperKeepsOrderWhenChallengeProgressing(t *testing.T) {
 		cmrOrderOwned("app", "order-a", "pending", 45*time.Minute, "order-a-cr"),
 		// presented but not processing — still moving.
 		cmrChallenge("app", "ch-a", true, false, time.Hour, "order-a"))
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -271,7 +270,7 @@ func TestCertManagerReaperIgnoresForeignChallenge(t *testing.T) {
 		cmrCertRequest("app", "order-a-cr", "tls-a"),
 		cmrOrderOwned("app", "order-a", "pending", 45*time.Minute, "order-a-cr"),
 		cmrChallenge("app", "ch-b", true, true, time.Hour, "other-order"))
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -285,7 +284,7 @@ func TestCertManagerReaperIgnoresForeignChallenge(t *testing.T) {
 // is kept; after the gap it is reset again (total 2).
 func TestCertManagerReaperHourlyRateLimit(t *testing.T) {
 	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-1")...)
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -325,7 +324,7 @@ func TestCertManagerReaperHourlyRateLimit(t *testing.T) {
 // exactly once even across repeated runs.
 func TestCertManagerReaperResetBudgetExhausted(t *testing.T) {
 	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{
 			"app/tls-a": {total: certReaperMaxReset, last: time.Now().Add(-2 * time.Hour)},
 		}}
@@ -359,7 +358,7 @@ func TestCertManagerReaperRenewalKeepsResetBudget(t *testing.T) {
 		cmrCertRequest("app", "order-r-cr", "tls-renew"),
 		cmrOrderOwned("app", "order-r", "pending", 45*time.Minute, "order-r-cr"),
 		cmrChallenge("app", "order-r-ch", true, true, time.Hour, "order-r"))
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{
 			"app/tls-renew": {total: certReaperMaxReset, gaveUp: true},
 		}}
@@ -386,7 +385,7 @@ func TestCertManagerReaperPrunesResetBudgets(t *testing.T) {
 			time.Now().Add(30*24*time.Hour).UTC().Format(time.RFC3339)),
 		// A second cert still Ready=False keeps its budget.
 		cmrCert("app", "pending", "False", ""))
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{
 			"app/tls-ok":  {total: certReaperMaxReset, gaveUp: true},
 			"gone/tls-x":  {total: 1},
@@ -419,7 +418,7 @@ func TestCertManagerReaperContinuesOnItemError(t *testing.T) {
 			}
 			return false, nil, nil
 		})
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	before := testutil.QueueErrorCount(t, "certmanager-reaper")
 	if err := r.run(ctx); err != nil {
@@ -440,7 +439,7 @@ func TestCertManagerReaperListError(t *testing.T) {
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err == nil {
 		t.Fatal("expected error when certificate list fails")
@@ -455,7 +454,7 @@ func TestCertManagerReaperChallengeListError(t *testing.T) {
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("challenges unreachable")
 		})
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	before := testutil.QueueErrorCount(t, "certmanager-reaper")
 	if err := r.run(ctx); err != nil {
@@ -482,7 +481,7 @@ func TestCertManagerReaperOrderDeleteError(t *testing.T) {
 			}
 			return false, nil, nil
 		})
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	before := testutil.QueueErrorCount(t, "certmanager-reaper")
 	if err := r.run(ctx); err != nil {
@@ -579,7 +578,7 @@ func TestCertManagerReaperIgnoresForeignOrder(t *testing.T) {
 		cmrOrderOwned("app", "order-x", "pending", 45*time.Minute, "cr-x"),
 		// An ownerless pending order — unattributable, kept.
 		cmrOrder("app", "order-free", "pending", 45*time.Minute))
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -602,7 +601,7 @@ func TestCertManagerReaperCRListError(t *testing.T) {
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("cr list boom")
 		})
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	before := testutil.QueueErrorCount(t, "certmanager-reaper")
 	if err := r.run(ctx); err != nil {
@@ -652,7 +651,7 @@ func cmrCertAnnotation(t *testing.T, dyn *dynamicfake.FakeDynamicClient, ns, nam
 // ("<total>,<lastRFC3339>") so a restart cannot refund the budget.
 func TestCertManagerReaperPersistsResetAnnotation(t *testing.T) {
 	dyn := testutil.NewFakeDyn(cmrListKinds, stuckFixture("app", "tls-a", "order-a")...)
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -677,7 +676,7 @@ func TestCertManagerReaperHydratesBudgetFromAnnotation(t *testing.T) {
 		cmrCertRequest("app", "order-a-cr", "tls-a"),
 		cmrOrderOwned("app", "order-a", "pending", 45*time.Minute, "order-a-cr"),
 		cmrChallenge("app", "ch-a", true, true, time.Hour, "order-a"))
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -697,7 +696,7 @@ func TestCertManagerReaperClearsPersistedBudgetOnHeal(t *testing.T) {
 		time.Now().Add(30*24*time.Hour).UTC().Format(time.RFC3339))
 	cert.SetAnnotations(map[string]string{acmeResetsAnno: "2,2026-01-01T00:00:00Z"})
 	dyn := testutil.NewFakeDyn(cmrListKinds, cert)
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
@@ -757,7 +756,7 @@ func TestCertManagerReaperStuckCertificateRequest(t *testing.T) {
 		cmrCertRequestStuck("app", "cr-stuck", "tls-stuck", time.Hour),
 	}
 	dyn := testutil.NewFakeDyn(cmrListKinds, objs...)
-	r := &certManagerReaper{cs: fake.NewSimpleClientset(), dyn: dyn, queue: "certmanager-reaper",
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper",
 		resets: map[string]*certReset{}}
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)

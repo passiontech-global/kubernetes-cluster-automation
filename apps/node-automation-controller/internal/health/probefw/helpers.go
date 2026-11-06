@@ -112,7 +112,7 @@ func (d *Deps) RequireDyn(what string) *Result {
 
 // DeletePodHeal is the pod-delete heal shape the self-healing checks
 // share — this body was the reference internal/platform/heal was
-// extracted from, so it now delegates: heal.Allowed runs the
+// extracted from, so it now delegates: heal.AllowedV runs the
 // per-target cooldown on the shared heals ledger plus the
 // maintenance mutex (fail closed on unverifiable), heal.DeletePod
 // does the UID-preconditioned delete and stamps the ledger only on

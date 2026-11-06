@@ -19,6 +19,8 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -32,7 +34,7 @@ import (
 // endpointSubsets decodes subsets[] into maps — absent/garbage-shaped
 // entries are skipped rather than panicking on a hand-edited object.
 func endpointSubsets(ep *unstructured.Unstructured) []map[string]any {
-	subs, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
+	subs, _ := kube.NestedSlice(ep.Object, "subsets")
 	out := make([]map[string]any, 0, len(subs))
 	for _, s := range subs {
 		if m, ok := s.(map[string]any); ok {
@@ -45,7 +47,7 @@ func endpointSubsets(ep *unstructured.Unstructured) []map[string]any {
 // nestedMaps decodes a map-typed list field (addresses,
 // notReadyAddresses, ports) into maps — same skip-garbage contract.
 func nestedMaps(m map[string]any, field string) []map[string]any {
-	l, _, _ := unstructured.NestedSlice(m, field)
+	l, _ := kube.NestedSlice(m, field)
 	out := make([]map[string]any, 0, len(l))
 	for _, e := range l {
 		if em, ok := e.(map[string]any); ok {
@@ -153,7 +155,7 @@ func unionIPs(a []string, b map[string]bool) []string {
 // NotReadyAddresses; a subset left with zero addresses is dropped so
 // the object never serializes an empty-addresses subset.
 func removeEndpointIP(ep *unstructured.Unstructured, ip string) {
-	subs, found, _ := unstructured.NestedSlice(ep.Object, "subsets")
+	subs, found := kube.NestedSlice(ep.Object, "subsets")
 	if !found {
 		return
 	}
@@ -180,7 +182,7 @@ func removeEndpointIP(ep *unstructured.Unstructured, ip string) {
 // dropAddrField filters ip out of m[field] in place and returns the
 // kept entries — an absent field is already empty.
 func dropAddrField(m map[string]any, field, ip string) []any {
-	addrs, found, _ := unstructured.NestedSlice(m, field)
+	addrs, found := kube.NestedSlice(m, field)
 	if !found {
 		return nil
 	}
@@ -199,7 +201,7 @@ func dropAddrField(m map[string]any, field, ip string) []any {
 // API port — falls back to the first subset, then to a fresh subset so
 // a cluster whose object was emptied can still be re-seeded).
 func addEndpointIP(ep *unstructured.Unstructured, ip string) {
-	subs, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
+	subs, _ := kube.NestedSlice(ep.Object, "subsets")
 	for _, sub := range subs {
 		if m, ok := sub.(map[string]any); ok {
 			for _, a := range nestedMaps(m, "addresses") {
@@ -233,7 +235,7 @@ func addEndpointIP(ep *unstructured.Unstructured, ip string) {
 			},
 		}}
 	} else if m, ok := subs[idx].(map[string]any); ok {
-		addrs, _, _ := unstructured.NestedSlice(m, "addresses")
+		addrs, _ := kube.NestedSlice(m, "addresses")
 		addrs = append(addrs, map[string]any{"ip": ip})
 		_ = unstructured.SetNestedSlice(m, addrs, "addresses")
 		subs[idx] = m
