@@ -13,7 +13,7 @@ import (
 func TestGroupPullsUnitsAndKubeletCfg(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: sr}, nil)
 	if err != nil {
@@ -79,7 +79,7 @@ func TestGroupPullsUnitsAndKubeletCfg(t *testing.T) {
 func TestGroupPullsQuotedExtraArgs(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: sr}, nil)
 	if err != nil {
@@ -113,7 +113,7 @@ func TestGroupPullsQuotedExtraArgs(t *testing.T) {
 func TestGroupPullsRefusesUnsafeQPS(t *testing.T) {
 	vars := writeVarsDir(t, "kubelet_registry_qps: \"2;rm -rf /\"\n")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +137,7 @@ func TestGroupPullsRefusesUnsafeQPS(t *testing.T) {
 func TestGroupPullsUnterminatedExtraArgsQuote(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)

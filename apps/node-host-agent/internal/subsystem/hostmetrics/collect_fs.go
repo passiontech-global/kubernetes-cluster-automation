@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -38,6 +39,60 @@ type fsResult struct {
 	err error
 }
 
+// fsProbeState is the hung-mount probe domain — one slice of what
+// used to be the Collector's shared mu-guarded fields. inflight
+// holds the start time of each mount's in-kernel statfs probe — a
+// hung syscall can't be cancelled, so a scrape that finds an
+// in-flight probe reports stalled only once the deadline has
+// elapsed, WITHOUT spawning another (bounds stuck goroutines at one
+// per mount). stalledLogged edge-triggers the hung-mount Warn: the
+// stall logs once per mount per episode instead of once per scrape
+// for the whole outage. The mutex is private — the fs domain
+// shares no state with the other collect domains.
+type fsProbeState struct {
+	mu            sync.Mutex
+	inflight      map[string]time.Time
+	stalledLogged map[string]bool
+}
+
+// probeStart registers a fresh in-flight probe for mount stamped at
+// now and reports true — or, when a probe is already in flight,
+// returns its start and false so the caller serves the running
+// probe's deadline verdict instead of piling up a second statfs
+// goroutine.
+func (s *fsProbeState) probeStart(mount string, now time.Time) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if start, inflight := s.inflight[mount]; inflight {
+		return start, false
+	}
+	s.inflight[mount] = now
+	return now, true
+}
+
+// probeDone clears mount's in-flight stamp — the statfs goroutine's
+// completion path (a timed-out scrape still lets it finish).
+func (s *fsProbeState) probeDone(mount string) {
+	s.mu.Lock()
+	delete(s.inflight, mount)
+	s.mu.Unlock()
+}
+
+// noteStall edge-updates the stall-log bookkeeping — set while
+// stalled, cleared on recovery — and returns the previous flag so
+// the caller logs only on transitions.
+func (s *fsProbeState) noteStall(mount string, stalled bool) (wasLogged bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	wasLogged = s.stalledLogged[mount]
+	if stalled {
+		s.stalledLogged[mount] = true
+	} else {
+		delete(s.stalledLogged, mount)
+	}
+	return wasLogged
+}
+
 // probeFS statfs's one mount under the fsProbeTimeout deadline. A
 // hung mount blocks the syscall in uninterruptible sleep — it can't
 // be cancelled — so the call runs on a goroutine and the scrape
@@ -50,22 +105,17 @@ type fsResult struct {
 // must not manufacture a hung-mount alert. ok=true only when statfs
 // completed without error.
 func (c *Collector) probeFS(mount string) (st unix.Statfs_t, stalled, ok bool) {
-	c.mu.Lock()
-	if start, inflight := c.fsInflight[mount]; inflight {
-		c.mu.Unlock()
+	start, fresh := c.fs.probeStart(mount, c.cfg.nowFn())
+	if !fresh {
 		return unix.Statfs_t{},
 			c.cfg.nowFn().Sub(start) >= c.cfg.fsProbeTimeout, false
 	}
-	c.fsInflight[mount] = c.cfg.nowFn()
-	c.mu.Unlock()
 
 	res := make(chan fsResult, 1)
 	go func() {
 		var r fsResult
 		r.err = c.cfg.statfsFn(mount, &r.st)
-		c.mu.Lock()
-		delete(c.fsInflight, mount)
-		c.mu.Unlock()
+		c.fs.probeDone(mount)
 		res <- r // buffered — never blocks after a timed-out scrape
 	}()
 
@@ -126,14 +176,7 @@ func (c *Collector) collectFilesystem(ch chan<- prometheus.Metric) {
 		// episode (a hung mount stays stalled for the whole outage),
 		// and recovery logs once — per-scrape repeats would drown
 		// the log without adding information.
-		c.mu.Lock()
-		wasLogged := c.fsStalledLogged[mount]
-		if stalled {
-			c.fsStalledLogged[mount] = true
-		} else {
-			delete(c.fsStalledLogged, mount)
-		}
-		c.mu.Unlock()
+		wasLogged := c.fs.noteStall(mount, stalled)
 		switch {
 		case stalled && !wasLogged:
 			logger().Warn("hostmetrics: statfs probe exceeded deadline — "+

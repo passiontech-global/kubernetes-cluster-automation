@@ -14,6 +14,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/guards"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // mkStatProc writes a /proc entry with a custom comm + state and an
@@ -42,8 +46,8 @@ func TestDStateRuntimeComm(t *testing.T) {
 		"kubelet": true, "btrfs-worker": true, "jbd2/vda1-8": true,
 		"postgres": false, "nginx": false, "bash": false, "pause": false,
 	} {
-		if got := dstateRuntimeComm(comm); got != want {
-			t.Errorf("dstateRuntimeComm(%q) = %v, want %v", comm, got, want)
+		if got := guards.DstateRuntimeComm(comm); got != want {
+			t.Errorf("guards.DstateRuntimeComm(%q) = %v, want %v", comm, got, want)
 		}
 	}
 }
@@ -142,10 +146,10 @@ func TestParseEnvoyXDSRejected(t *testing.T) {
 			"http.ingress.rds.route_config.update_rejected: 2\n" +
 			"cluster_manager.cds.update_success: 9\n" +
 			"server.watchdog_miss: 4\n")
-	if got := parseEnvoyXDSRejected(body); got != 6 {
-		t.Fatalf("parseEnvoyXDSRejected = %d, want 6", got)
+	if got := cilium.ParseEnvoyXDSRejected(body); got != 6 {
+		t.Fatalf("cilium.ParseEnvoyXDSRejected = %d, want 6", got)
 	}
-	if got := parseEnvoyXDSRejected([]byte("cds.update_rejected: notanumber\n")); got != 0 {
+	if got := cilium.ParseEnvoyXDSRejected([]byte("cds.update_rejected: notanumber\n")); got != 0 {
 		t.Fatalf("malformed value counted: %d", got)
 	}
 }
@@ -315,7 +319,7 @@ func TestCheckCalicoHygieneFelixDown(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	e.probes[defaultCalicoFelixReadyURL] = os.ErrNotExist
+	e.probes[wdeps.DefaultCalicoFelixReadyURL] = os.ErrNotExist
 	pods := []corev1.Pod{{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "calico-node-q9w8e", Namespace: "kube-system",

@@ -106,7 +106,6 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -198,54 +197,10 @@ func buildAgentConfig(p agentParams) (agent.Config, wireReport) {
 		return hostRoot + p
 	}
 
-	// Shared host-side inputs: the node-watchdog.conf parser feeds
-	// API_BACKENDS / OVERLAY_* / DNS_FALLBACK_MAP into apiprober,
-	// workerhygiene, nethealth and hostmetrics; the systemd client
-	// drives every host unit action (nsenter-wrapped in a container,
-	// direct on the host).
-	wdConfPath := envx.String("NODE_HOST_AGENT_WATCHDOG_CONF",
-		hostPath("/etc/node-watchdog.conf"))
-	wdCfg, err := watchdogconf.Load(wdConfPath)
-	if err != nil {
-		logger().Error("watchdog conf parse failed — running on defaults",
-			"path", wdConfPath, "error", err)
-		wdCfg, _ = watchdogconf.Parse(nil)
-	}
-	// One shared reloader: hostconfig rewrites the conf every
-	// converge, so conf-consuming subsystems re-read it per cycle
-	// instead of pinning the startup parse (the runner re-sourced it
-	// every run — API_BACKENDS / OVERLAY_* / WD_SIG_* changes land
-	// next cycle).
-	wdReloader := watchdogconf.NewReloader(wdConfPath, wdCfg)
+	// The systemd client drives every host unit action
+	// (nsenter-wrapped in a container, direct on the host) — built
+	// here because HostRoot, not env, is its input.
 	sdClient := systemd.New(systemd.Config{HostRoot: hostRoot})
-
-	watchdogStateDir := envx.String("NODE_HOST_AGENT_WATCHDOG_STATE_DIR",
-		hostPath("/var/lib/node-watchdog"))
-	watchdogLogFile := envx.String("NODE_HOST_AGENT_WATCHDOG_LOG",
-		hostPath("/var/log/node-watchdog.log"))
-	hnode := envx.String("NODE_HOST_AGENT_NODE_NAME", p.nodeName)
-
-	// Shared journald inputs for the journal-unreadable blindness
-	// detector (workerhygiene + controllerhygiene): the storage dirs
-	// are the "journald is installed" witness — a host with no
-	// journald fails every read by config and must never latch.
-	// hostPath() makes them unprefixed in standalone mode.
-	journalDirs := envx.List("NODE_HOST_AGENT_JOURNAL_DIRS")
-	if journalDirs == nil {
-		journalDirs = []string{
-			hostPath("/var/log/journal"), hostPath("/run/log/journal")}
-	}
-	journalUnreadableNeeded := envx.Int(
-		"NODE_HOST_AGENT_JOURNAL_UNREADABLE_NEEDED", 5)
-
-	// Shared vars/textfile dirs — hoisted out of the hostconfig
-	// block: workerhygiene (systemd_watchdog_hosts), kinedb
-	// (Detect), hubsync (VarsDir) and hostconfig itself all read the
-	// same vars dir, and the textfile dir feeds both the standalone
-	// prom writer and kinedb's prom files.
-	varsDir := envx.String("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", "/config/vars")
-	textfileDir := envx.String("NODE_HOST_AGENT_TEXTFILE_DIR",
-		hostPath("/var/lib/node-exporter/textfile"))
 
 	// One clientset for the whole process: each NewForConfig builds
 	// its own http.Transport + TLS pool, so sweeper, workerhygiene
@@ -269,22 +224,19 @@ func buildAgentConfig(p agentParams) (agent.Config, wireReport) {
 	}
 
 	// The shared watchdog/host context every subsystem EnvDeps embeds
-	// — resolved once above, spliced verbatim into each Build closure
-	// as EnvDeps{Deps: w.Deps, ...}.
-	hc := hostctx.Deps{
-		Watchdog:                wdCfg,
-		WatchdogSrc:             wdReloader,
-		WatchdogStateDir:        watchdogStateDir,
-		WatchdogLogFile:         watchdogLogFile,
-		HostPath:                hostPath,
-		HostRoot:                hostRoot,
-		Systemd:                 sdClient,
-		JournalDirs:             journalDirs,
-		JournalUnreadableNeeded: journalUnreadableNeeded,
-		VarsDir:                 varsDir,
-		TextfileDir:             textfileDir,
-		NodeName:                hnode,
-	}
+	// — the NODE_HOST_AGENT_* knobs (watchdog conf + reloader, state
+	// dir, log file, journal dirs, vars/textfile dirs) resolve inside
+	// hostctx.DepsFromEnv, symmetric with each subsystem's own
+	// ConfigFromEnv; only the non-env inputs (hostPath/hostRoot from
+	// the standalone flip, the resolved node name, the systemd
+	// client) are passed in. Spliced verbatim into each Build
+	// closure as EnvDeps{Deps: w.Deps, ...}.
+	hc := hostctx.DepsFromEnv(hostctx.EnvParams{
+		HostPath: hostPath,
+		HostRoot: hostRoot,
+		NodeName: p.nodeName,
+		Systemd:  sdClient,
+	})
 
 	w := &wiring{
 		reg:        reg,

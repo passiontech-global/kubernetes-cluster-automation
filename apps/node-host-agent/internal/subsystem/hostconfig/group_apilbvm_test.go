@@ -23,7 +23,7 @@ func TestAPILBVMConverge(t *testing.T) {
 	sr := &scriptedRunner{res: map[string]string{
 		"docker inspect haproxy": inspectJSON,
 	}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "lb-vm-1", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "lb-vm-1", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestAPILBVMConverge(t *testing.T) {
 func TestAPILBVMSkipsUnlisted(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)

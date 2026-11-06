@@ -95,7 +95,6 @@ const (
 
 // Config carries the janitor knobs — all test-injectable.
 type Config struct {
-	Enabled          bool          // false → Run idles until ctx done
 	Interval         time.Duration // sweep cadence
 	WatchdogStateDir string        // the shared node-watchdog state dir
 	WatchdogLogFile  string        // appended watchdog log (NPD filelog)
@@ -186,12 +185,6 @@ func (j *Janitor) Name() string { return "janitor" }
 
 // Run sweeps immediately, then every Interval until ctx is cancelled.
 func (j *Janitor) Run(ctx context.Context) {
-	if !j.cfg.Enabled {
-		// Constructed but disabled — idle instead of returning: the
-		// agent restarts a returned Run in a hot loop.
-		cycle.Idle(ctx)
-		return
-	}
 	cycle.Every("janitor", j.cfg.Interval, j.Sweep).Run(ctx)
 }
 

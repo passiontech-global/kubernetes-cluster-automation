@@ -81,7 +81,7 @@ func TestSeenStatesTTLExpiry(t *testing.T) {
 	if _, ok := metricValue(t, c, "node_host_agent_watchdog_state", labels); ok {
 		t.Fatal("series kept after seenStateTTL elapsed")
 	}
-	if _, ok := c.seenStates["tmp-latch"]; ok {
+	if _, ok := c.seen.m["tmp-latch"]; ok {
 		t.Fatal("expired cleared state kept in seenStates")
 	}
 }
@@ -97,23 +97,23 @@ func TestSeenStatesCapEvictsOldestCleared(t *testing.T) {
 	c := New(cfg)
 	// Pre-seed over-cap cleared entries, oldest first.
 	for i := 0; i < maxSeenStates+10; i++ {
-		c.seenStates[fmt.Sprintf("old-%03d", i)] = now.Add(-time.Duration(i+1) * time.Second)
+		c.seen.m[fmt.Sprintf("old-%03d", i)] = now.Add(-time.Duration(i+1) * time.Second)
 	}
 	labels := map[string]string{"node": "node-a", "state": "real"}
 	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state", labels); !ok || v != 1 {
 		t.Fatalf("latched state=%v ok=%v want 1", v, ok)
 	}
-	if got := len(c.seenStates); got > maxSeenStates {
+	if got := len(c.seen.m); got > maxSeenStates {
 		t.Fatalf("seenStates = %d, want <= %d", got, maxSeenStates)
 	}
-	if ts, ok := c.seenStates["real"]; !ok || !ts.IsZero() {
+	if ts, ok := c.seen.m["real"]; !ok || !ts.IsZero() {
 		t.Fatal("active latch missing or got a cleared timestamp")
 	}
 	// The oldest-cleared entries must have been evicted.
-	if _, ok := c.seenStates[fmt.Sprintf("old-%03d", maxSeenStates+9)]; ok {
+	if _, ok := c.seen.m[fmt.Sprintf("old-%03d", maxSeenStates+9)]; ok {
 		t.Fatal("oldest cleared entry was not evicted")
 	}
-	if _, ok := c.seenStates["old-000"]; !ok {
+	if _, ok := c.seen.m["old-000"]; !ok {
 		t.Fatal("freshest cleared entry was evicted")
 	}
 }

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // --- Wave-2 tests: A4 syncloop + containerd-sock ---
@@ -139,7 +141,7 @@ func TestContainerdSockDownLatches(t *testing.T) {
 // containerd-sock-down on every agent start (the A4 bug this
 // pins).
 func TestContainerdSocketDefaultPinsK0sPath(t *testing.T) {
-	c := Config{}
+	c := wdeps.Config{}
 	c.ApplyDefaults()
 	if c.Ctr.Socket != "/host/run/k0s/containerd.sock" {
 		t.Fatalf("default ContainerdSocket=%q, want /host/run/k0s/containerd.sock",
@@ -160,7 +162,7 @@ func TestProbeUnixSockDefaultReturnsNilOnConnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
-	c := Config{}
+	c := wdeps.Config{}
 	c.ApplyDefaults()
 	if err := c.Seams.ProbeUnixSock(context.Background(), sock, time.Second); err != nil {
 		t.Fatalf("successful unix dial want nil, got %v", err)

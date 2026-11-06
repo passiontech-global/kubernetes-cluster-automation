@@ -19,7 +19,7 @@ import (
 func TestHubMetricsFWRenders(t *testing.T) {
 	vars := writeVarsDir(t, "hub_metrics_extra_ports: [2380, 2381]\n")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +69,7 @@ interdc_nexp_deb_file: "nexp.deb"
 	sr := &scriptedRunner{res: map[string]string{
 		"dpkg-query -W -f=${Status} ${Version} prometheus-node-exporter": "install ok installed 1.7.0-1ubuntu0.3",
 	}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -106,7 +106,7 @@ interdc_nexp_deb_sha256: "%x"
 		},
 		errs: map[string]bool{},
 	}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +137,7 @@ interdc_nexp_deb_sha256: "%x"
 	// apt-get install /tmp/<basename> (deb_file defaults to the URL
 	// basename, ansible `| basename` parity).
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ interdc_nexp_deb_url: "%s/nexp.deb"
 interdc_nexp_deb_sha256: "%s"
 `, srv.URL, strings.Repeat("0", 64)))
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +179,7 @@ interdc_nexp_deb_sha256: "%s"
 func TestHubMetricsNexpNoPinsNoOp(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +194,7 @@ func TestHubMetricsNexpNoPinsNoOp(t *testing.T) {
 func TestHubMetricsFWSkipsContainer(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -222,7 +222,7 @@ func TestHubMetricsScriptRefusesBadIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)

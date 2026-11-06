@@ -1,3 +1,7 @@
+// env.go — the NODE_HOST_AGENT_* env contract: EnvDeps (the non-env
+// inputs) and ConfigFromEnv, which assembles the per-domain knob
+// rows from config_<domain>.go in the pre-split table's order and
+// applies them through envx.
 package wdeps
 
 import (
@@ -28,8 +32,7 @@ type EnvDeps struct {
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob workerhygiene
 // reads and returns a Config ready for New — the env contract lives
-// in the package, not in cmd/agent. Enabled is always true here: the
-// wire func set it unconditionally and the enable gate
+// in the package, not in cmd/agent. The enable gate
 // (NODE_HOST_AGENT_ENABLE_HYGIENE) plus the node-name-empty and
 // kube-client-build checks stay in the caller. Fields wiring never
 // set (KubeletHealthzURL, the T15 feeder knobs, the wave-2/7/8/9/10
@@ -42,7 +45,6 @@ func ConfigFromEnv(d EnvDeps) Config {
 	}
 	cfg := Config{
 		NodeName:         d.NodeName,
-		Enabled:          true,
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogLogFile:  d.WatchdogLogFile,
 		Journal: JournalConfig{
@@ -54,66 +56,24 @@ func ConfigFromEnv(d EnvDeps) Config {
 		WatchdogSrc: d.WatchdogSrc,
 		Client:      d.Client,
 	}
-	// The env surface, one row per knob in declaration order.
-	envx.Apply([]envx.Knob{
-		envx.DurationKnob("NODE_HOST_AGENT_HYGIENE_INTERVAL", &cfg.Interval, DefaultInterval),
-		envx.StringKnob("NODE_HOST_AGENT_PROC_ROOT", &cfg.ProcRoot, defaultProcRoot),
-		// hostPath defaults — NOT the package defaults
-		// (defaultCtrTaskRoot & friends hardcode the "/host"
-		// prefix and would be wrong on a standalone host).
-		envx.StringKnob("NODE_HOST_AGENT_CTR_TASK_ROOT", &cfg.CtrTaskRoot,
-			hostPath("/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io")),
-		envx.StringKnob("NODE_HOST_AGENT_SANDBOX_CTL_ROOT", &cfg.SandboxCtlRoot,
-			hostPath("/run/k0s/containerd/io.containerd.sandbox.controller.v1.shim")),
-		envx.StringKnob("NODE_HOST_AGENT_K0S_WORKER_UNIT", &cfg.K0sWorkerUnitFile,
-			hostPath("/etc/systemd/system/k0sworker.service")),
-		envx.StringKnob("NODE_HOST_AGENT_HOST_RESOLV_CONF", &cfg.Net.HostResolvConf,
-			hostPath("/etc/resolv.conf")),
-		// W7 knobs — empty env → in-package defaults.
-		envx.StringKnob("NODE_HOST_AGENT_LOCALDNS_PROBE_ADDR", &cfg.Net.LocalDNSProbeAddr, ""),
-		envx.StringKnob("NODE_HOST_AGENT_LOCALDNS_PROBE_NAME", &cfg.Net.LocalDNSProbeName, ""),
-		envx.StringKnob("NODE_HOST_AGENT_KUBELET_PODS_DIR", &cfg.Kubelet.PodsDir,
-			hostPath("/var/lib/k0s/kubelet/pods")),
-		// A4 probes: kubelet :10250 denies anonymous healthz, so
-		// the syncloop probe authenticates with the pod SA token.
-		envx.StringKnob("NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL", &cfg.Kubelet.SyncloopURL, ""),
-		envx.OrKnob("NODE_HOST_AGENT_KUBELET_TOKEN_FILE", &cfg.Kubelet.TokenPath,
-			DefaultKubeletTokenPath),
-		// T15 opt-in host list: env override →
-		// systemd_watchdog_hosts out of the vars dir
-		// (cluster.yaml) — resolved by KubeletWatchdogHosts below.
-		// Absent vars dir is not an error — the feeder self-gates on
-		// k0sworker.service anyway.
-		{Name: "NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS", Resolve: func(string) {
-			cfg.Kubelet.WatchdogHosts = KubeletWatchdogHosts(d.VarsDir, d.NodeName)
-		}},
-		envx.StringKnob("NODE_HOST_AGENT_CILIUM_SOCKET", &cfg.Cilium.Socket,
-			hostPath("/run/cilium/cilium.sock")),
-		// W7 knob — empty env → in-package default.
-		envx.StringKnob("NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL", &cfg.Cilium.EnvoyAdminURL, ""),
-		// A4 probe: k0s puts the containerd socket at
-		// /run/k0s/containerd.sock (not inside the state dir).
-		envx.StringKnob("NODE_HOST_AGENT_CONTAINERD_SOCKET", &cfg.Ctr.Socket,
-			hostPath("/run/k0s/containerd.sock")),
-		envx.DurationKnob("NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE", &cfg.Teardown.StuckDeleteAge, defaultStuckDeleteAge),
-		envx.DurationKnob("NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE", &cfg.Teardown.StuckWedgeAge, defaultStuckWedgeAge),
-		envx.IntKnob("NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE", &cfg.Teardown.MaxForceDelete, defaultMaxForceDelete),
-		// W7 knob — empty env → in-package default.
-		envx.IntKnob("NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD", &cfg.Pressure.DStateStormThreshold, defaultDStateStormThreshold),
-		// W7 knobs — empty env → in-package defaults.
-		envx.StringKnob("NODE_HOST_AGENT_CALICO_FELIX_READY_URL", &cfg.Calico.FelixReadyURL, ""),
-		envx.IntKnob("NODE_HOST_AGENT_CALICO_ORPHAN_VETH_THRESHOLD", &cfg.Calico.OrphanVethThreshold, defaultCalicoOrphanVethThresh),
-		envx.IntKnob("NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED", &cfg.ConsecNeeded, defaultConsecNeeded),
-		envx.DurationKnob("NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL", &cfg.MinRestartInterval, defaultMinRestartInterval),
-		// W10 runtime-resource guards — hostPath defaults like the
-		// block above (the package defaults are unprefixed
-		// host-absolute paths; the "/host" prefix is the
-		// DaemonSet's, not the constant's).
-		envx.StringKnob("NODE_HOST_AGENT_CGROUP_ROOT", &cfg.Runtime.CgroupRoot,
-			hostPath("/sys/fs/cgroup")),
-		envx.StringKnob("NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR", &cfg.Runtime.SessionsDir,
-			hostPath("/run/systemd/sessions")),
-	})
+	// The env surface, one row per knob — the rows live beside
+	// their domain's type in config_<domain>.go; the assembly
+	// order below is the pre-split table's exact order (shared
+	// wiring, net, kubelet, cilium, ctr, teardown, pressure,
+	// calico, shared budgets, runtime). Every row writes a
+	// distinct field, so order is documentation, not semantics.
+	var knobs []envx.Knob
+	knobs = append(knobs, cfg.wiringEnvKnobs(hostPath)...)
+	knobs = append(knobs, cfg.Net.envKnobs(hostPath)...)
+	knobs = append(knobs, cfg.Kubelet.envKnobs(hostPath, d)...)
+	knobs = append(knobs, cfg.Cilium.envKnobs(hostPath)...)
+	knobs = append(knobs, cfg.Ctr.envKnobs(hostPath)...)
+	knobs = append(knobs, cfg.Teardown.envKnobs()...)
+	knobs = append(knobs, cfg.Pressure.envKnobs()...)
+	knobs = append(knobs, cfg.Calico.envKnobs()...)
+	knobs = append(knobs, cfg.budgetEnvKnobs()...)
+	knobs = append(knobs, cfg.Runtime.envKnobs(hostPath)...)
+	envx.Apply(knobs)
 	if d.Watchdog != nil {
 		// API_BACKENDS → the watch-wedge check's upstream-stale gate
 		// (module 06); kept current per-cycle by WatchdogSrc.

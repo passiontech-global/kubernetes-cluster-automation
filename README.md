@@ -28,7 +28,7 @@ apps/
   ci.yml                         PR gate — moon ci on affected projects
   release-app.yml                reusable release pipeline
   release-<app>.yml              per-app release triggers
-mise.toml                      tool pins: go, git-cliff, ko, moon
+mise.toml                      tool pins: go, git-cliff, ko, golangci-lint, hadolint, moon
 ```
 
 Each app is an independent Go module with its own dependencies, image
@@ -37,18 +37,20 @@ build (`ko`), and release cadence.
 ## Development
 
 ```sh
-mise install                 # go + git-cliff + ko + moon (all pinned)
+mise install                 # all tools pinned in mise.toml
 
 moon query projects          # list workspace projects
 moon run :format :vet :test  # shared tasks across all projects
+moon run :lint-dockerfile    # hadolint — apps tagged `docker` only
 moon run node-host-agent:build
 moon run node-automation-controller:image   # ko build (needs KO_DOCKER_REPO)
 ```
 
 Common tasks (`test`, `vet`, `format`) are defined once in
-`.moon/tasks/all.yml` and inherited by every project; `build`/`image`
-live in each app's `moon.yml`. All binaries come from mise — moon tasks
-run on the `system` toolchain.
+`.moon/tasks/all.yml` and inherited by every project;
+`.moon/tasks/tag-docker.yml` adds `lint-dockerfile` (hadolint) to the
+apps tagged `docker`; `build`/`image` live in each app's `moon.yml`. All
+binaries come from mise — moon tasks run on the `system` toolchain.
 
 A committed `go.work` covers all three modules, so `go` and gopls work
 from the repo root. CI sets `GOWORK=off`, keeping release builds on

@@ -64,7 +64,7 @@ etcdctl_tgz_file: "etcd-v3.7.3-linux-amd64.tar.gz"
 func TestEtcdctlSkipsNonController(t *testing.T) {
 	vars := writeVarsDir(t, etcdctlPins("deadbeef"))
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestEtcdctlSkipsNonController(t *testing.T) {
 func TestEtcdctlSkipsKineHost(t *testing.T) {
 	vars := writeVarsDir(t, etcdctlPins("deadbeef"))
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -103,7 +103,7 @@ func TestEtcdctlVersionMatchSkipsDownload(t *testing.T) {
 	sr := &scriptedRunner{
 		res: map[string]string{"/var/lib/k0s/bin/etcdctl version": "etcdctl version: 3.7.3"},
 	}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -121,7 +121,7 @@ func TestEtcdctlMissingPinsFailsClosed(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
 	dl := t.TempDir()
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +143,7 @@ func TestEtcdctlInstallsFromStagedTgz(t *testing.T) {
 	vars := writeVarsDir(t, etcdctlPins(sum))
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
 	dl := t.TempDir()
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +169,7 @@ func TestEtcdctlStagedShaMismatchRefuses(t *testing.T) {
 	vars := writeVarsDir(t, etcdctlPins("00000000"))
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
 	dl := t.TempDir()
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +190,7 @@ func TestEtcdctlStagedShaMismatchRefuses(t *testing.T) {
 func TestKineServiceOffByDefault(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -225,7 +225,7 @@ kine_bin_sha256: "%x"
 kine_endpoint: "postgres://postgres:pw@db.test.internal:6432/postgres?sslmode=disable"
 `, srv.URL, sum))
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -289,7 +289,7 @@ func TestKineServiceSkipsWithoutBinaryPins(t *testing.T) {
 kine_endpoint: "postgres://x"
 `)
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -315,7 +315,7 @@ kine_bin_sha256: "deadbeef"
 kine_endpoint: ""
 `)
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -340,7 +340,7 @@ kine_bin_sha256: "%x"
 kine_endpoint: "postgres://x"
 `, sum))
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)

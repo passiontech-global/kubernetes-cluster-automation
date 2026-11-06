@@ -1,5 +1,5 @@
 // runtime_resource_guards_test.go — coverage for the six
-// runtime-resource guards in runtime_resource_guards.go and the
+// runtime-resource guards (runtime/runtime_<name>.go) and the
 // orphan-hostpath early return.
 package workerhygiene
 
@@ -16,10 +16,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // runActive invokes one check the way Cycle does on an active worker.
-func runActive(c Check, e *cycleEnv) {
+func runActive(c wdeps.Check, e *wdeps.CycleEnv) {
 	c.Run(context.Background(), e)
 }
 
@@ -37,7 +39,7 @@ func TestCgroupDyingReclaim(t *testing.T) {
 	// On a real host /proc/sys/vm always exists — the check writes
 	// the sysctl, it does not mkdir it.
 	writeFile(t, filepath.Join(e.proc, "sys", "vm", "drop_caches"), "0\n")
-	env := &cycleEnv{WorkerActive: true}
+	env := &wdeps.CycleEnv{WorkerActive: true}
 	latch := filepath.Join(e.state, "state-cgroup-dying-leak")
 
 	runActive(h.cgroupDying, env)
@@ -79,8 +81,8 @@ func TestCgroupDyingBelowThresholdNoLatch(t *testing.T) {
 	cg := t.TempDir()
 	h.Cfg.Runtime.CgroupRoot = cg
 	writeFile(t, filepath.Join(cg, "cgroup.stat"), "nr_dying_descendants 10\n")
-	runActive(h.cgroupDying, &cycleEnv{WorkerActive: true})
-	runActive(h.cgroupDying, &cycleEnv{WorkerActive: true})
+	runActive(h.cgroupDying, &wdeps.CycleEnv{WorkerActive: true})
+	runActive(h.cgroupDying, &wdeps.CycleEnv{WorkerActive: true})
 	if _, err := os.Stat(filepath.Join(e.state, "state-cgroup-dying-leak")); !os.IsNotExist(err) {
 		t.Fatal("latch set below threshold")
 	}
@@ -111,7 +113,7 @@ func TestSystemdSessionReaper(t *testing.T) {
 	e.sdReply["loginctl terminate-session"] = ""
 	e.sdReply["systemctl reset-failed"] = ""
 
-	h.systemdSessions.Run(ctx, &cycleEnv{WorkerActive: true})
+	h.systemdSessions.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
 
 	if h.SystemdSessionsTotal != 26 {
 		t.Fatalf("sessionsTotal=%d want 26 (.ref excluded)",
@@ -148,7 +150,7 @@ func TestSystemdSessionDbusLatencyLatch(t *testing.T) {
 	}
 	e.sdReply["systemctl reset-failed"] = ""
 
-	h.systemdSessions.Run(ctx, &cycleEnv{WorkerActive: true})
+	h.systemdSessions.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
 
 	if h.SystemdDbusLatencySec < 3.5 {
 		t.Fatalf("dbus latency=%.2f want ~4s", h.SystemdDbusLatencySec)
@@ -184,7 +186,7 @@ func TestOverlayFSStaleMount(t *testing.T) {
 	h := e.h
 	ctx := context.Background()
 	p := staleOverlayPod(e, "stale-app", uidA)
-	env := &cycleEnv{
+	env := &wdeps.CycleEnv{
 		Pods:         []corev1.Pod{*p},
 		APIOK:        true,
 		WorkerActive: true,
@@ -208,7 +210,7 @@ func TestOverlayFSStaleMountSkipsUnmatched(t *testing.T) {
 	ctx := context.Background()
 	p := staleOverlayPod(e, "plain-crash", uidB)
 	p.Status.ContainerStatuses[0].State.Waiting.Message = "back-off restarting failed container"
-	env := &cycleEnv{
+	env := &wdeps.CycleEnv{
 		Pods:         []corev1.Pod{*p},
 		APIOK:        true,
 		WorkerActive: true,
@@ -241,7 +243,7 @@ func TestIOPressureThrottler(t *testing.T) {
 	var reniced, ioniced []int
 	h.Cfg.Seams.ReniceFn = func(pid int) error { reniced = append(reniced, pid); return nil }
 	h.Cfg.Seams.IoniceIdleFn = func(pid int) error { ioniced = append(ioniced, pid); return nil }
-	env := &cycleEnv{
+	env := &wdeps.CycleEnv{
 		WorkerActive: true,
 		PidsOnce:     func() []int { return []int{4242} },
 	}
@@ -298,7 +300,7 @@ func TestConntrackLiberalGuard(t *testing.T) {
 		"nf_conntrack_tcp_be_liberal")
 	writeFile(t, sysctl, "0\n")
 
-	h.conntrackLiberal.Run(ctx, &cycleEnv{WorkerActive: true})
+	h.conntrackLiberal.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
 	if got := nhReadFile(t, sysctl); got != "1\n" {
 		t.Fatalf("be_liberal=%q want \"1\\n\"", got)
 	}
@@ -306,7 +308,7 @@ func TestConntrackLiberalGuard(t *testing.T) {
 		t.Fatalf("fixes=%d want 1", h.ConntrackLiberalFixes)
 	}
 	// Idempotent: already 1 → no second fix.
-	h.conntrackLiberal.Run(ctx, &cycleEnv{WorkerActive: true})
+	h.conntrackLiberal.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
 	if h.ConntrackLiberalFixes != 1 {
 		t.Fatalf("fixes=%d want 1 (idempotent)", h.ConntrackLiberalFixes)
 	}
@@ -320,7 +322,7 @@ func TestConntrackLiberalGuardNeedsNeb1(t *testing.T) {
 	sysctl := filepath.Join(e.proc, "sys", "net", "netfilter",
 		"nf_conntrack_tcp_be_liberal")
 	writeFile(t, sysctl, "0\n")
-	h.conntrackLiberal.Run(ctx, &cycleEnv{WorkerActive: true})
+	h.conntrackLiberal.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
 	if got := nhReadFile(t, sysctl); got != "0\n" {
 		t.Fatalf("be_liberal=%q want \"0\\n\" without neb1", got)
 	}
@@ -358,7 +360,7 @@ func TestClockJumpSessionHealer(t *testing.T) {
 		"E0101 dial tcp: konnectivity-server: x509: certificate has expired or is not yet valid\n")
 	writeFile(t, filepath.Join(e.state, "clock-stepped-at"),
 		fmt.Sprintf("%d\n", e.now.Unix()))
-	env := &cycleEnv{
+	env := &wdeps.CycleEnv{
 		Pods:         []corev1.Pod{*konn},
 		APIOK:        true,
 		WorkerActive: true,
@@ -392,7 +394,7 @@ func TestClockJumpSessionHealerNeedsFreshMarker(t *testing.T) {
 	// Marker from 2h ago — outside the 10m attribution window.
 	writeFile(t, filepath.Join(e.state, "clock-stepped-at"),
 		fmt.Sprintf("%d\n", e.now.Add(-2*time.Hour).Unix()))
-	h.clockJump.Run(ctx, &cycleEnv{
+	h.clockJump.Run(ctx, &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*konn}, APIOK: true, WorkerActive: true})
 	if n := len(deleteActions(e.cs)); n != 0 {
 		t.Fatalf("deletes=%d want 0 on a stale marker", n)
@@ -411,7 +413,7 @@ func TestOrphanHostPathEarlyReturnSkipsPVList(t *testing.T) {
 	h.OrphanHostPathDirs = 7
 	h.OrphanHostPathBytes = 999
 
-	h.orphanHP.Run(ctx, &cycleEnv{WorkerActive: true})
+	h.orphanHP.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
 
 	for _, a := range e.cs.Actions() {
 		if a.GetResource().Resource == "persistentvolumes" {
@@ -428,7 +430,7 @@ func TestOrphanHostPathEarlyReturnSkipsPVList(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.Cfg.Disk.OrphanHostPathDirs = []string{prov}
-	h.orphanHP.Run(ctx, &cycleEnv{WorkerActive: true})
+	h.orphanHP.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
 	sawPVList := false
 	for _, a := range e.cs.Actions() {
 		if a.GetVerb() == "list" &&

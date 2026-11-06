@@ -12,8 +12,8 @@ WORKDIR /src
 COPY libs/hostkit/ libs/hostkit/
 COPY apps/webhook-dispatcher/ apps/webhook-dispatcher/
 WORKDIR /src/apps/webhook-dispatcher
-RUN go mod download
-RUN CGO_ENABLED=0 go build -trimpath \
+RUN go mod download && \
+    CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/webhook-dispatcher ./cmd/dispatcher
 

@@ -131,7 +131,7 @@ func TestForceDeleteCap(t *testing.T) {
 // TestTeardownAbortOnUnreadableTaskRoot is the fail-closed guard:
 // with the ctr task root unlistable the map cannot prove "zero live
 // tasks", so a Terminating pod must NOT be force-deleted — the cycle
-// is inconclusive (checkCtrTasks unreadable-root parity).
+// is inconclusive (wdeps.CheckCtrTasks unreadable-root parity).
 func TestTeardownAbortOnUnreadableTaskRoot(t *testing.T) {
 	e := fixture(t)
 	p := terminatingPod(e, "stuck-pod", "default", uidA, 20*time.Minute)

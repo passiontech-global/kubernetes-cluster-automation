@@ -27,6 +27,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	nhatestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -155,9 +156,8 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 	e.sdReply["systemctl is-active k0sworker.service"] = "active\n"
 	e.sdReply["ActiveEnterTimestampMonotonic --value k0sworker.service"] =
 		fmt.Sprintf("%d\n", 7200500000-int64(time.Hour/time.Microsecond))
-	h, err := New(Config{
+	h, err := New(wdeps.Config{
 		NodeName:           "node-a",
-		Enabled:            true,
 		Interval:           time.Hour,
 		WatchdogStateDir:   e.state,
 		WatchdogLogFile:    filepath.Join(root, "watchdog.log"),
@@ -169,36 +169,36 @@ func fixture(t *testing.T, objs ...runtime.Object) *env {
 		Systemd:            sd,
 		ConsecNeeded:       2,
 		MinRestartInterval: 30 * time.Minute,
-		Net: NetConfig{
+		Net: wdeps.NetConfig{
 			HostResolvConf: e.resv,
 			SysClassNet:    e.sysnet,
 		},
-		Kubelet: KubeletConfig{
+		Kubelet: wdeps.KubeletConfig{
 			PodsDir:     e.kubepods,
 			WatchMinAge: 15 * time.Minute,
 		},
-		Teardown: TeardownConfig{
+		Teardown: wdeps.TeardownConfig{
 			StuckDeleteAge: 15 * time.Minute,
 			StuckWedgeAge:  30 * time.Minute,
 			MaxForceDelete: 5,
 		},
 		// Wave-2 knobs: paths under the fixture root, never the real
 		// /sys or /var/lib/k0s.
-		Ctr: CtrConfig{
+		Ctr: wdeps.CtrConfig{
 			IngestDir:    e.ingest,
 			MaxTaskClean: 5,
 			MaxShimKill:  10,
 		},
-		Cilium: CiliumConfig{
+		Cilium: wdeps.CiliumConfig{
 			RuntimeConfig: e.ciliumRt,
 		},
-		Disk: DiskConfig{
+		Disk: wdeps.DiskConfig{
 			K0sDataDir: filepath.Join(root, "k0sdata"),
 		},
-		Pressure: PressureConfig{
+		Pressure: wdeps.PressureConfig{
 			ZombieStormThreshold: 500,
 		},
-		Journal: JournalConfig{
+		Journal: wdeps.JournalConfig{
 			Dirs: []string{e.jdir},
 		},
 	}, prometheus.NewRegistry())
@@ -463,7 +463,7 @@ func TestName(t *testing.T) {
 // TestNewRequiresClient: a nil Clientset would nil-pointer panic on
 // the first Cycle LIST — New must reject it (never-panic contract).
 func TestNewRequiresClient(t *testing.T) {
-	if _, err := New(Config{}, nil); err == nil {
+	if _, err := New(wdeps.Config{}, nil); err == nil {
 		t.Fatal("New accepted a nil Client")
 	}
 }
@@ -585,12 +585,12 @@ func (e *env) mkCiliumTask(t *testing.T, pid int) {
 func TestWorkerInactiveGatesAllChecks(t *testing.T) {
 	e := fixture(t)
 	e.sdReply["systemctl is-active k0sworker.service"] = "inactive\n"
-	e.probes[defaultKubeletHealthzURL] = errors.New("refused")
+	e.probes[wdeps.DefaultKubeletHealthzURL] = errors.New("refused")
 	e.h.Cycle(context.Background())
 	if e.sdRan("restart k0sworker.service") {
 		t.Fatal("checks ran while k0sworker intentionally down")
 	}
-	for _, chk := range []string{checkStall, checkTeardown, checkKonn, checkDNS} {
+	for _, chk := range []string{wdeps.CheckStall, wdeps.CheckTeardown, wdeps.CheckKonn, wdeps.CheckDNS} {
 		if got := e.h.Cycles.WithLabelValues(chk, "gated"); testutil.ToFloat64(got) != 1 {
 			t.Fatalf("%s gated=%v want 1", chk, testutil.ToFloat64(got))
 		}
@@ -601,9 +601,9 @@ func TestSignalDisabledSkipsCheck(t *testing.T) {
 	e := fixture(t)
 	e.h.Cfg.Watchdog = &watchdogconf.Config{Disabled: map[string]bool{"cilium": true}}
 	e.mkTask(t, uidA, "cilium-agent", 0)
-	e.probes[defaultCiliumHealthzURL] = errors.New("refused")
+	e.probes[wdeps.DefaultCiliumHealthzURL] = errors.New("refused")
 	e.h.Cycle(context.Background())
-	if got := e.h.Cycles.WithLabelValues(checkCilium, "disabled"); testutil.ToFloat64(got) != 1 {
+	if got := e.h.Cycles.WithLabelValues(wdeps.CheckCilium, "disabled"); testutil.ToFloat64(got) != 1 {
 		t.Fatalf("cilium disabled=%v want 1", testutil.ToFloat64(got))
 	}
 }

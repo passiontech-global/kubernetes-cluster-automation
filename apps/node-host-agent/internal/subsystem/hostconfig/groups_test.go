@@ -176,7 +176,7 @@ func cleanCycleFixture(t *testing.T) (*Reconciler, *scriptedRunner) {
 		},
 		errs: map[string]bool{},
 	}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		DownloadDir: t.TempDir(), Runner: sr,
 		NowFn: func() time.Time { return time.Unix(1_700_000_000, 0) }}, nil)
@@ -198,7 +198,7 @@ func TestCycleWithErrorsCleanCycleStampsLastOK(t *testing.T) {
 
 func TestCycleWithErrorsTopologyLoadFailure(t *testing.T) {
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: t.TempDir(), // missing interdc_nodes.yaml/cluster.yaml
 		Runner:  sr}, nil)
 	if err != nil {
@@ -240,7 +240,7 @@ func TestCycleWithErrorsCountsGroupErrors(t *testing.T) {
 func TestGroupRecordsOkErrorPanic(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -281,7 +281,7 @@ func TestGroupWriteFailureCountedViaHelper(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
 	hr := t.TempDir()
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: hr,
+	r, err := New(Config{NodeName: "node-b", HostRoot: hr,
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -307,7 +307,7 @@ func journaldEnv(t *testing.T, res map[string]string, errs map[string]bool) (*cy
 	t.Helper()
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: res, errs: errs}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -323,7 +323,7 @@ func TestApplyNftUnitRejectsBeforePromote(t *testing.T) {
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{
 		"nft -c -f": true,
 	}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -353,7 +353,7 @@ func TestApplyNftUnitRejectsBeforePromote(t *testing.T) {
 func TestApplyNftUnitPromotesValidCandidate(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -427,7 +427,7 @@ func TestSlowOpsUseLongBudget(t *testing.T) {
 		"journalctl -n 5": "File corruption detected at /var/log/journal/x/system.journal:0 (of 20971520 bytes, 0%)",
 		"sshd -T":         "passwordauthentication no",
 	}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: bp}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -462,7 +462,7 @@ func TestSlowOpsUseLongBudget(t *testing.T) {
 func TestApplyNftUnitSweepsStaleCandidate(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)

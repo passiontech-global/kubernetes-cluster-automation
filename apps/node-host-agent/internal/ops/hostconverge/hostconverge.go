@@ -58,7 +58,6 @@ func converge(ctx context.Context, varsDir, nodeName, certsDir string) int {
 		nn = hostname
 	}
 	hc, err := hostconfig.New(hostconfig.Config{
-		Enabled:        true,
 		NodeName:       nn,
 		Hostname:       hostname,
 		HostRoot:       HostRoot,

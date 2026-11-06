@@ -21,10 +21,6 @@ import (
 // Run starts the three loops (probe, compact guard, maintenance) and
 // blocks until ctx is cancelled.
 func (k *KineDB) Run(ctx context.Context) {
-	if !k.cfg.Enabled {
-		<-ctx.Done()
-		return
-	}
 	var wg sync.WaitGroup
 	for _, l := range []struct {
 		name  string

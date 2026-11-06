@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,6 +26,91 @@ const (
 	// longest-cleared entries are evicted first when it overflows.
 	maxSeenStates = 256
 )
+
+// latchSeenBook is the emit-0 bookkeeping behind the watchdog_state
+// family — one slice of what used to be the Collector's shared
+// mu-guarded fields. A map entry's value is zero while the latch is
+// active on disk (or the cert-owned series is live); a non-zero
+// stamp is the scrape that first saw it cleared — the entry emits 0
+// until seenStateTTL then drops. The mutex is private.
+type latchSeenBook struct {
+	mu sync.Mutex
+	m  map[string]time.Time
+}
+
+// prev snapshots the last-known active flags (zero stamp = active)
+// for the degraded path — an unreadable state dir serves the
+// previous values unchanged so no false cleared-0s are emitted.
+func (b *latchSeenBook) prev() map[string]bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	prev := make(map[string]bool, len(b.m))
+	for s, clearedAt := range b.m {
+		prev[s] = clearedAt.IsZero()
+	}
+	return prev
+}
+
+// update folds this scrape's present set into the bookkeeping —
+// first-cleared stamps, TTL drops, the cert-owned series (certOK
+// counts nebula-cert-expiring as active) and the maxSeenStates
+// eviction — then returns every state name that emits this scrape.
+// The caller maps present[name] onto 1/0.
+func (b *latchSeenBook) update(present map[string]bool, certOK bool,
+	now time.Time) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Cleared-state bookkeeping: an entry absent from this scrape's
+	// latches is stamped with now on the first cleared scrape and
+	// dropped once it has emitted 0 for seenStateTTL. The cert-owned
+	// series counts as active while the cert parses — the signal
+	// must emit an explicit 0 from then on (alert contract), even
+	// if the cert later disappears.
+	for s, clearedAt := range b.m {
+		if present[s] || (certOK && s == hoststate.LatchNebulaCertExpiring) {
+			continue
+		}
+		if clearedAt.IsZero() {
+			b.m[s] = now
+		} else if now.Sub(clearedAt) >= seenStateTTL {
+			delete(b.m, s)
+		}
+	}
+	for name := range present {
+		b.m[name] = time.Time{}
+	}
+	if certOK {
+		b.m[hoststate.LatchNebulaCertExpiring] = time.Time{}
+	}
+	// Hard bound: a latch storm must not grow the map without
+	// limit — evict the longest-cleared entries first (active
+	// entries, zero time, are never evicted). Single pass: collect
+	// the cleared entries, sort oldest-first, delete the overflow —
+	// if the map is still over-cap afterwards it is all-active and
+	// stays so.
+	if len(b.m) > maxSeenStates {
+		type clearedState struct {
+			state string
+			at    time.Time
+		}
+		var evictable []clearedState
+		for s, at := range b.m {
+			if !at.IsZero() {
+				evictable = append(evictable, clearedState{s, at})
+			}
+		}
+		slices.SortFunc(evictable, func(a, b clearedState) int { return a.at.Compare(b.at) })
+		over := min(len(b.m)-maxSeenStates, len(evictable))
+		for _, e := range evictable[:over] {
+			delete(b.m, e.state)
+		}
+	}
+	seen := make([]string, 0, len(b.m))
+	for name := range b.m {
+		seen = append(seen, name)
+	}
+	return seen
+}
 
 var (
 	descWatchdog = prometheus.NewDesc(
@@ -75,13 +161,7 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, certDays int64,
 		logger().Debug("hostmetrics: watchdog state dir unreadable — "+
 			"serving previous watchdog_state values",
 			"dir", c.cfg.WatchdogStateDir, "error", err)
-		c.mu.Lock()
-		prev := make(map[string]bool, len(c.seenStates))
-		for s, clearedAt := range c.seenStates {
-			prev[s] = clearedAt.IsZero()
-		}
-		c.mu.Unlock()
-		for name, active := range prev {
+		for name, active := range c.seen.prev() {
 			v := 0.0
 			if active {
 				v = 1
@@ -96,58 +176,7 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, certDays int64,
 	if certOK && certDays < nebulaCertWarnDays {
 		present[hoststate.LatchNebulaCertExpiring] = true
 	}
-	c.mu.Lock()
-	now := c.cfg.nowFn()
-	// Cleared-state bookkeeping: an entry absent from this scrape's
-	// latches is stamped with now on the first cleared scrape and
-	// dropped once it has emitted 0 for seenStateTTL. The cert-owned
-	// series counts as active while the cert parses — the signal
-	// must emit an explicit 0 from then on (alert contract), even if
-	// the cert later disappears.
-	for s, clearedAt := range c.seenStates {
-		if present[s] || (certOK && s == hoststate.LatchNebulaCertExpiring) {
-			continue
-		}
-		if clearedAt.IsZero() {
-			c.seenStates[s] = now
-		} else if now.Sub(clearedAt) >= seenStateTTL {
-			delete(c.seenStates, s)
-		}
-	}
-	for name := range present {
-		c.seenStates[name] = time.Time{}
-	}
-	if certOK {
-		c.seenStates[hoststate.LatchNebulaCertExpiring] = time.Time{}
-	}
-	// Hard bound: a latch storm must not grow the map without limit —
-	// evict the longest-cleared entries first (active entries, zero
-	// time, are never evicted). Single pass: collect the cleared
-	// entries, sort oldest-first, delete the overflow — if the map is
-	// still over-cap afterwards it is all-active and stays so.
-	if len(c.seenStates) > maxSeenStates {
-		type clearedState struct {
-			state string
-			at    time.Time
-		}
-		var evictable []clearedState
-		for s, at := range c.seenStates {
-			if !at.IsZero() {
-				evictable = append(evictable, clearedState{s, at})
-			}
-		}
-		slices.SortFunc(evictable, func(a, b clearedState) int { return a.at.Compare(b.at) })
-		over := min(len(c.seenStates)-maxSeenStates, len(evictable))
-		for _, e := range evictable[:over] {
-			delete(c.seenStates, e.state)
-		}
-	}
-	seen := make([]string, 0, len(c.seenStates))
-	for name := range c.seenStates {
-		seen = append(seen, name)
-	}
-	c.mu.Unlock()
-	for _, name := range seen {
+	for _, name := range c.seen.update(present, certOK, c.cfg.nowFn()) {
 		v := 0.0
 		if present[name] {
 			v = 1

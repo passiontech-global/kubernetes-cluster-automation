@@ -8,19 +8,21 @@
 //     kubelet_syncloop.go (A4 PLEG + containerd-sock probes)
 //   - pods/    — pod_teardown.go (36 teardown, 30 konnectivity,
 //     33 dns-resolv)
-//   - ctr/     — ctr_tasks.go (31 tasks, 37 image healer, 39 ingest
-//     GC) + ctr_meta.go (W10-KR3 meta.db corruption)
+//   - ctr/     — ctr_tasks.go (31 tasks), ctr_images.go (37 image
+//     healer), ctr_ingest_gc.go (39 ingest GC), ctr_shims.go (shared
+//     shim scope) + ctr_meta.go (W10-KR3 meta.db corruption)
 //   - cilium/  — cilium_*.go (32 agent, 35 init-stuck, 38 IPAM, B1
 //     envoy, B4 MTU, W5.6 WG peers, W7-H3 LRP DNS)
 //   - guards/  — dstate_scopes.go (A2 zombie, W7-H1 D-state, W7-H2
 //     scopes), psi_thrash.go (W2), journald.go (A5),
 //     spegel_calico_netns.go (W7-H4/H7, W9 netns)
-//   - runtime/ — runtime_resource_guards.go (the six W10 guards),
+//   - runtime/ — runtime_<name>.go (the six W10 guards, one file
+//     each — see runtime_common.go for the family overview),
 //     disk_bloat.go (W6.3), deep_failure_checks.go (W10-KR1/ST2)
 //   - wdeps/   — the shared dependency surface (Config/Seams, Deps,
 //     CycleEnv, Check, the CtrTask machinery, the journal tracker,
-//     the node_agent_* textfile writer) — the seam deps.go
-//     documented as the blocker for this split.
+//     the node_agent_* textfile writer). The Config domain groups
+//     are split into wdeps/config_<domain>.go.
 //
 // Differences from the shell versions (documented, behaviour-equivalent):
 //   - `k0s ctr tasks ls` / `tasks kill` is replaced by scanning the
@@ -118,6 +120,22 @@ type Hygiene struct {
 	clockJump        *runtime.ClockJumpCheck
 }
 
+// The subsystem-convention export surface cmd/agent wires against:
+// Config and EnvDeps alias the canonical wdeps types so
+// workerhygiene.Config IS wdeps.Config (no drift possible), and
+// ConfigFromEnv forwards to the env resolution that lives in wdeps
+// beside the defaults it fills. The name stays here because the
+// subsystem convention puts it next to New.
+type (
+	Config  = wdeps.Config
+	EnvDeps = wdeps.EnvDeps
+)
+
+// ConfigFromEnv resolves every NODE_HOST_AGENT_* knob workerhygiene
+// reads — implementation lives in wdeps (it owns the Config
+// defaults).
+func ConfigFromEnv(d EnvDeps) Config { return wdeps.ConfigFromEnv(d) }
+
 // New returns a Hygiene and registers its metrics on reg.
 func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	if cfg.Client == nil {
@@ -182,12 +200,6 @@ func (h *Hygiene) Name() string { return "workerhygiene" }
 // parallel — the controllerhygiene runFeeder pattern (shell had a
 // dedicated systemd unit looping every ~15s).
 func (h *Hygiene) Run(ctx context.Context) {
-	if !h.Cfg.Enabled {
-		// Constructed but disabled — idle instead of returning: the
-		// agent restarts a returned Run in a hot loop.
-		cycle.Idle(ctx)
-		return
-	}
 	// The tick self-gates on KubeletFeederActive() each round, so a
 	// node dropped from systemd_watchdog_hosts (unit file pruned) or
 	// a WD_SIG_KUBELET_WATCHDOG=off conf rewrite idles without an
@@ -242,7 +254,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// required uptime >= 1200s): a freshly rebooted node gets grace
 	// before any destructive check runs — Terminating ages surviving
 	// a reboot must not trigger action inside the first minutes.
-	if up, err := h.Proc.UptimeSeconds(); err == nil && up < minUptimeSeconds {
+	if up, err := h.Proc.UptimeSeconds(); err == nil && up < wdeps.MinUptimeSeconds {
 		h.Cycles.WithLabelValues("all", "uptime_gate").Inc()
 		return
 	}

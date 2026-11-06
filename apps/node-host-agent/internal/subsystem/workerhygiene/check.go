@@ -58,44 +58,44 @@ func (h *Hygiene) initChecks() {
 	h.conntrackLiberal = runtime.NewConntrackLiberal(d)
 	h.clockJump = runtime.NewClockJump(d)
 	h.checks = []wdeps.Check{
-		h.stall,       // checkStall
-		h.watch,       // checkWatch
-		h.teardown,    // checkTeardown
-		h.konn,        // checkKonn
-		h.dns,         // checkDNS
-		h.syncloop,    // checkSyncloop
-		h.ctrsock,     // checkCtrSock
-		h.ctrTasks,    // checkCtrTasks
-		h.ingestGC,    // checkIngestGC
-		h.cilium,      // checkCilium
-		h.ciliumInit,  // checkCiliumInit
-		h.ctrImages,   // checkCtrImages
-		h.ciliumIPAM,  // checkCiliumIPAM
-		h.ciliumEnvoy, // checkCiliumEnvoy
-		h.ciliumMTU,   // checkCiliumMTU
-		h.ciliumWG,    // checkCiliumWG
-		h.diskBloat,   // checkDiskBloat
-		h.zombies,     // checkZombieStorm
-		h.journald,    // checkJournald
-		h.dstate,      // checkDState
-		h.scopes,      // checkSysScopes
-		h.ciliumLRP,   // checkCiliumLRP
-		h.spegel,      // checkSpegel
-		h.calico,      // checkCalico
-		h.cniNetns,    // checkCNINetns
-		h.psiThrash,   // checkPSIThrash
-		h.ctrMeta,     // checkCtrMeta
-		h.hostOOM,     // checkHostOOM
-		h.orphanHP,    // checkOrphanHP
+		h.stall,       // wdeps.CheckStall
+		h.watch,       // wdeps.CheckWatch
+		h.teardown,    // wdeps.CheckTeardown
+		h.konn,        // wdeps.CheckKonn
+		h.dns,         // wdeps.CheckDNS
+		h.syncloop,    // wdeps.CheckSyncloop
+		h.ctrsock,     // wdeps.CheckCtrSock
+		h.ctrTasks,    // wdeps.CheckCtrTasks
+		h.ingestGC,    // wdeps.CheckIngestGC
+		h.cilium,      // wdeps.CheckCilium
+		h.ciliumInit,  // wdeps.CheckCiliumInit
+		h.ctrImages,   // wdeps.CheckCtrImages
+		h.ciliumIPAM,  // wdeps.CheckCiliumIPAM
+		h.ciliumEnvoy, // wdeps.CheckCiliumEnvoy
+		h.ciliumMTU,   // wdeps.CheckCiliumMTU
+		h.ciliumWG,    // wdeps.CheckCiliumWG
+		h.diskBloat,   // wdeps.CheckDiskBloat
+		h.zombies,     // wdeps.CheckZombieStorm
+		h.journald,    // wdeps.CheckJournald
+		h.dstate,      // wdeps.CheckDState
+		h.scopes,      // wdeps.CheckSysScopes
+		h.ciliumLRP,   // wdeps.CheckCiliumLRP
+		h.spegel,      // wdeps.CheckSpegel
+		h.calico,      // wdeps.CheckCalico
+		h.cniNetns,    // wdeps.CheckCNINetns
+		h.psiThrash,   // wdeps.CheckPSIThrash
+		h.ctrMeta,     // wdeps.CheckCtrMeta
+		h.hostOOM,     // wdeps.CheckHostOOM
+		h.orphanHP,    // wdeps.CheckOrphanHP
 		// Runtime-resource guards run last: they consume only
 		// their own host-side evidence (cgroup.stat, sessions dir,
 		// diskstats, sysctls, the pod LIST) so nothing downstream
 		// depends on their output this cycle.
-		h.cgroupDying,      // checkCgroupDying
-		h.systemdSessions,  // checkSystemdSessions
-		h.overlayFSStale,   // checkOverlayFSStale
-		h.ioPressure,       // checkIOPressure
-		h.conntrackLiberal, // checkConntrackLiberal
-		h.clockJump,        // checkClockJump
+		h.cgroupDying,      // wdeps.CheckCgroupDying
+		h.systemdSessions,  // wdeps.CheckSystemdSessions
+		h.overlayFSStale,   // wdeps.CheckOverlayFSStale
+		h.ioPressure,       // wdeps.CheckIOPressure
+		h.conntrackLiberal, // wdeps.CheckConntrackLiberal
+		h.clockJump,        // wdeps.CheckClockJump
 	}
 }

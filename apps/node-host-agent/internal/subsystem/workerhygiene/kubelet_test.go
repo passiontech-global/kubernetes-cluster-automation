@@ -17,13 +17,16 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/kubelet"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // --- check 4: kubelet-stall (05) ---
 
 func TestKubeletStall10250DownRestarts(t *testing.T) {
 	e := fixture(t)
-	e.probes[defaultKubeletHealthzURL] = errors.New("connection refused")
+	e.probes[wdeps.DefaultKubeletHealthzURL] = errors.New("connection refused")
 	latch := filepath.Join(e.state, "state-kubelet-runtime-stall")
 
 	e.h.Cycle(context.Background())
@@ -60,7 +63,7 @@ func TestKubeletStall10250AuthResponseIsUp(t *testing.T) {
 	for _, code := range []int{401, 403} {
 		t.Run(fmt.Sprintf("code-%d", code), func(t *testing.T) {
 			e := fixture(t)
-			e.status[defaultKubeletHealthzURL] = code
+			e.status[wdeps.DefaultKubeletHealthzURL] = code
 			latch := filepath.Join(e.state, "state-kubelet-runtime-stall")
 			for i := 0; i < 3; i++ {
 				e.h.Cycle(context.Background())
@@ -88,7 +91,7 @@ func TestKubeletStall10250AuthClearsStaleEvidence(t *testing.T) {
 	latch := filepath.Join(e.state, "state-kubelet-runtime-stall")
 	e.h.State.Enter("kubelet-runtime-stall", "test")
 	e.h.StallFails = 1
-	e.status[defaultKubeletHealthzURL] = 401
+	e.status[wdeps.DefaultKubeletHealthzURL] = 401
 	e.h.Cycle(context.Background())
 	if e.h.StallFails != 0 {
 		t.Fatalf("stallFails=%d want 0 after 401 answer", e.h.StallFails)
@@ -108,14 +111,14 @@ func TestKubeletStall10250ProbeSendsBearerToken(t *testing.T) {
 	writeFile(t, tok, "tok-abc-123\n")
 	e.h.Cfg.Kubelet.TokenPath = tok
 	e.h.Cycle(context.Background())
-	if got := e.bearer[defaultKubeletHealthzURL]; got != "tok-abc-123" {
+	if got := e.bearer[wdeps.DefaultKubeletHealthzURL]; got != "tok-abc-123" {
 		t.Fatalf("10250 probe bearer = %q, want the SA token", got)
 	}
 }
 
 func TestKubeletStallPhantomPods(t *testing.T) {
 	e := fixture(t)
-	for i := 0; i < poddirThreshold; i++ {
+	for i := 0; i < kubelet.PoddirThreshold; i++ {
 		if err := os.MkdirAll(filepath.Join(e.kubepods, fmt.Sprintf("pod%d", i)), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -136,7 +139,7 @@ func TestKubeletStallPhantomPods(t *testing.T) {
 
 func TestKubeletStallLiveTasksNoRestart(t *testing.T) {
 	e := fixture(t)
-	for i := 0; i < poddirThreshold; i++ {
+	for i := 0; i < kubelet.PoddirThreshold; i++ {
 		if err := os.MkdirAll(filepath.Join(e.kubepods, fmt.Sprintf("pod%d", i)), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -156,7 +159,7 @@ func TestKubeletStallLiveTasksNoRestart(t *testing.T) {
 
 func TestKubeletStallOverloadedSuppresses(t *testing.T) {
 	e := fixture(t)
-	e.probes[defaultKubeletHealthzURL] = errors.New("refused")
+	e.probes[wdeps.DefaultKubeletHealthzURL] = errors.New("refused")
 	writeFile(t, filepath.Join(e.state, "state-node-overloaded"), "1\n")
 	e.h.Cycle(context.Background())
 	e.h.Cycle(context.Background())
@@ -173,7 +176,7 @@ func TestKubeletStallOverloadedSuppresses(t *testing.T) {
 
 func TestKubeletStallCooldownAndSettle(t *testing.T) {
 	e := fixture(t)
-	e.probes[defaultKubeletHealthzURL] = errors.New("refused")
+	e.probes[wdeps.DefaultKubeletHealthzURL] = errors.New("refused")
 	// Freshly spent budget → cooldown blocks the restart.
 	writeFile(t, filepath.Join(e.state, "last-restart"),
 		fmt.Sprintf("%d\n", e.now.Unix()))
@@ -369,7 +372,7 @@ func TestKubeletWatchWedgePodsDirIsFileInconclusive(t *testing.T) {
 
 func TestKubeletStallStoppedTaskRecordsNotPhantom(t *testing.T) {
 	e := fixture(t)
-	for i := 0; i < poddirThreshold; i++ {
+	for i := 0; i < kubelet.PoddirThreshold; i++ {
 		if err := os.MkdirAll(filepath.Join(e.kubepods, fmt.Sprintf("pod%d", i)), 0o755); err != nil {
 			t.Fatal(err)
 		}

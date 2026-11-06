@@ -93,15 +93,26 @@ type Descriptor struct {
 	// Auto resolves a ModeAuto flag to enabled/disabled (nil → off).
 	Auto  func(w *wiring) bool
 	Needs Needs
-	// Build constructs the subsystem; cs is the shared lazily-built
-	// clientset and is non-nil only when Needs.Kube is set. A
-	// non-nil error logs "<name> setup failed"; returning (nil, nil)
-	// means the failure was already logged — append nothing.
-	Build func(w *wiring, cs kubernetes.Interface) (agent.Subsystem, error)
-	// Extra runs after a successful Build+append — for the one
-	// subsystem that spawns a sibling (hostmetrics's standalone
-	// textfile writer).
-	Extra func(w *wiring, sub agent.Subsystem)
+	// Build constructs the subsystem(s) this descriptor contributes,
+	// in append order; cs is the shared lazily-built clientset and
+	// is non-nil only when Needs.Kube is set. Most descriptors
+	// return exactly one subsystem — hostmetrics may return two
+	// (the latch ticker plus the standalone textfile writer). A
+	// non-nil error logs "<name> setup failed"; an empty slice with
+	// a nil error means the failure was already logged — append
+	// nothing.
+	Build func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error)
+}
+
+// subsOf adapts a single-subsystem constructor result to the
+// []agent.Subsystem Build shape — the generic lets each Build
+// closure pass its New(...) call straight through instead of
+// unwrapping the concrete (T, error) pair.
+func subsOf[S agent.Subsystem](s S, err error) ([]agent.Subsystem, error) {
+	if err != nil {
+		return nil, err
+	}
+	return []agent.Subsystem{s}, nil
 }
 
 // onOff adapts a bool default (the standalone-flipped defKube) to the
@@ -124,9 +135,9 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_SWEEPER",
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true},
-			Build: func(w *wiring, cs kubernetes.Interface) (agent.Subsystem, error) {
-				return sweeper.New(sweeper.ConfigFromEnv(
-					sweeper.EnvDeps{Client: cs}), w.reg)
+			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
+				return subsOf(sweeper.New(sweeper.ConfigFromEnv(
+					sweeper.EnvDeps{Client: cs}), w.reg))
 			},
 		},
 		// concourse-cache: native shared-cache pruner.
@@ -138,20 +149,20 @@ func (w *wiring) descriptors() []Descriptor {
 			Name:    "concourse-cache",
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE",
 			Default: onOff(w.defKube),
-			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
+			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
 				knobs := concoursecache.ConfigFromEnv()
 				pr, err := concoursecache.New(knobs.Config, w.reg)
 				if err != nil {
 					logger().Error("concourse-cache pruner setup failed", "error", err)
 					return nil, nil
 				}
-				return cycle.Every(
+				return []agent.Subsystem{cycle.Every(
 					"concourse-cache", knobs.Interval,
 					func(ctx context.Context) {
 						if err := pr.Sweep(ctx, knobs.CacheRoot); err != nil {
 							logger().Error("concourse cache sweep failed", "error", err)
 						}
-					}), nil
+					})}, nil
 			},
 		},
 		// apiprober: apiserver watch-cache wedge guard.
@@ -170,10 +181,10 @@ func (w *wiring) descriptors() []Descriptor {
 			Name:    "apiprober",
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_APIPROBER",
 			Default: envx.ModeOn,
-			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
-				return apiprober.New(apiprober.ConfigFromEnv(apiprober.EnvDeps{
+			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
+				return subsOf(apiprober.New(apiprober.ConfigFromEnv(apiprober.EnvDeps{
 					Deps: w.Deps,
-				}), w.reg)
+				}), w.reg))
 			},
 		},
 		// hostmetrics: scrape-time collector + latch-ticker
@@ -187,7 +198,7 @@ func (w *wiring) descriptors() []Descriptor {
 			Name:    "hostmetrics",
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_HOSTMETRICS",
 			Default: envx.ModeOn,
-			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
+			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
 				hm := hostmetrics.New(hostmetrics.ConfigFromEnv(hostmetrics.EnvDeps{
 					Deps:                w.Deps,
 					Standalone:          w.standalone,
@@ -195,27 +206,25 @@ func (w *wiring) descriptors() []Descriptor {
 					NebulaNet:           w.Watchdog.NebulaNet,
 				}))
 				w.reg.MustRegister(hm)
-				return hm.Latches(), nil
-			},
-			// Standalone hosts have no Prometheus scrape — the
-			// legacy prom_emit contract is kept by rendering the
-			// same series into the node-exporter textfile dir on a
-			// ticker.
-			Extra: func(w *wiring, sub agent.Subsystem) {
-				if !w.standalone {
-					return
+				subs := []agent.Subsystem{hm.Latches()}
+				// Standalone hosts have no Prometheus scrape — the
+				// legacy prom_emit contract is kept by rendering the
+				// same series into the node-exporter textfile dir on
+				// a ticker (appended after the latch ticker, same as
+				// the old Extra hook).
+				if w.standalone {
+					subs = append(subs, cycle.Every(
+						"hostmetrics-textfile",
+						envx.Duration("NODE_HOST_AGENT_TEXTFILE_INTERVAL",
+							30*time.Second),
+						func(ctx context.Context) {
+							if err := hm.WriteTextfile(w.TextfileDir); err != nil {
+								logger().Error("hostmetrics textfile write failed",
+									"dir", w.TextfileDir, "error", err)
+							}
+						}))
 				}
-				hm := sub.(*hostmetrics.Latches).Collector()
-				w.subsystems = append(w.subsystems, cycle.Every(
-					"hostmetrics-textfile",
-					envx.Duration("NODE_HOST_AGENT_TEXTFILE_INTERVAL",
-						30*time.Second),
-					func(ctx context.Context) {
-						if err := hm.WriteTextfile(w.TextfileDir); err != nil {
-							logger().Error("hostmetrics textfile write failed",
-								"dir", w.TextfileDir, "error", err)
-						}
-					}))
+				return subs, nil
 			},
 		},
 		// workerhygiene: worker-only watchdog checks.
@@ -229,12 +238,12 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_HYGIENE",
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true, NodeName: true},
-			Build: func(w *wiring, cs kubernetes.Interface) (agent.Subsystem, error) {
-				return workerhygiene.New(workerhygiene.ConfigFromEnv(
+			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
+				return subsOf(workerhygiene.New(workerhygiene.ConfigFromEnv(
 					workerhygiene.EnvDeps{
 						Deps:   w.Deps,
 						Client: cs,
-					}), w.reg)
+					}), w.reg))
 			},
 		},
 		// nethealth: DNS/overlay/nebula/fail2ban watchdog modules.
@@ -243,10 +252,10 @@ func (w *wiring) descriptors() []Descriptor {
 			Name:    "nethealth",
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_NETHEALTH",
 			Default: envx.ModeOn,
-			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
-				return nethealth.New(nethealth.ConfigFromEnv(nethealth.EnvDeps{
+			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
+				return subsOf(nethealth.New(nethealth.ConfigFromEnv(nethealth.EnvDeps{
 					Deps: w.Deps,
-				}), w.reg)
+				}), w.reg))
 			},
 		},
 		// janitor: watchdog-state latch reaper + retired-unit sweep.
@@ -259,11 +268,11 @@ func (w *wiring) descriptors() []Descriptor {
 			Name:    "janitor",
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_JANITOR",
 			Default: envx.ModeOn,
-			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
-				return janitor.New(janitor.ConfigFromEnv(
+			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
+				return subsOf(janitor.New(janitor.ConfigFromEnv(
 					janitor.EnvDeps{
 						Deps: w.Deps,
-					}), w.reg)
+					}), w.reg))
 			},
 		},
 		// nodereporter: state latches → NodeConditions/Events.
@@ -274,12 +283,12 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: "NODE_HOST_AGENT_ENABLE_REPORTER",
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true, NodeName: true},
-			Build: func(w *wiring, cs kubernetes.Interface) (agent.Subsystem, error) {
-				return nodereporter.New(nodereporter.ConfigFromEnv(
+			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
+				return subsOf(nodereporter.New(nodereporter.ConfigFromEnv(
 					nodereporter.EnvDeps{
 						Deps:   w.Deps,
 						Client: cs,
-					}), w.reg)
+					}), w.reg))
 			},
 		},
 		// controllerhygiene: control-plane guards.
@@ -292,11 +301,11 @@ func (w *wiring) descriptors() []Descriptor {
 			Auto: func(w *wiring) bool {
 				return controllerhygiene.ShouldRun(w.HostRoot)
 			},
-			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
-				return controllerhygiene.New(controllerhygiene.ConfigFromEnv(
+			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
+				return subsOf(controllerhygiene.New(controllerhygiene.ConfigFromEnv(
 					controllerhygiene.EnvDeps{
 						Deps: w.Deps,
-					}), w.reg)
+					}), w.reg))
 			},
 		},
 		// hostconfig: declarative host converger.
@@ -311,12 +320,12 @@ func (w *wiring) descriptors() []Descriptor {
 				_, err := os.Stat(w.VarsDir + "/defaults.yaml")
 				return err == nil
 			},
-			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
+			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
 				hostname, _ := os.Hostname()
-				return hostconfig.New(hostconfig.ConfigFromEnv(hostconfig.EnvDeps{
+				return subsOf(hostconfig.New(hostconfig.ConfigFromEnv(hostconfig.EnvDeps{
 					Deps:     w.Deps,
 					Hostname: hostname,
-				}), w.reg)
+				}), w.reg))
 			},
 		},
 		// hubsync: SSH converge of standalone targets.
@@ -330,7 +339,7 @@ func (w *wiring) descriptors() []Descriptor {
 		{
 			Name:  "hubsync",
 			Needs: Needs{Kube: true, PodName: true, PodModeOnly: true},
-			Build: func(w *wiring, cs kubernetes.Interface) (agent.Subsystem, error) {
+			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
 				hsCfg := hubsync.ConfigFromEnv(hubsync.EnvDeps{
 					Deps:        w.Deps,
 					Client:      cs,
@@ -341,7 +350,7 @@ func (w *wiring) descriptors() []Descriptor {
 					logger().Info("hubsync: converge key not mounted yet — polling until it appears",
 						"path", hsCfg.SSHKeyPath)
 				}
-				return hubsync.New(hsCfg, w.reg)
+				return subsOf(hubsync.New(hsCfg, w.reg))
 			},
 		},
 		// kinedb: kine DB VM probe/compact-guard/maintenance.
@@ -355,10 +364,10 @@ func (w *wiring) descriptors() []Descriptor {
 			Auto: func(w *wiring) bool {
 				return kinedb.Detect(w.HostRoot, w.VarsDir)
 			},
-			Build: func(w *wiring, _ kubernetes.Interface) (agent.Subsystem, error) {
-				return kinedb.New(kinedb.ConfigFromEnv(kinedb.EnvDeps{
+			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
+				return subsOf(kinedb.New(kinedb.ConfigFromEnv(kinedb.EnvDeps{
 					Deps: w.Deps,
-				}), w.reg)
+				}), w.reg))
 			},
 		},
 	}
@@ -406,17 +415,14 @@ func (w *wiring) resolveAndBuild(d Descriptor) {
 			return
 		}
 	}
-	sub, err := d.Build(w, cs)
+	subs, err := d.Build(w, cs)
 	if err != nil {
 		logger().Error(d.Name+" setup failed", "error", err)
 		return
 	}
-	if sub == nil {
+	if len(subs) == 0 {
 		return // Build already logged its own failure
 	}
-	w.subsystems = append(w.subsystems, sub)
+	w.subsystems = append(w.subsystems, subs...)
 	w.built[d.Name] = true
-	if d.Extra != nil {
-		d.Extra(w, sub)
-	}
 }

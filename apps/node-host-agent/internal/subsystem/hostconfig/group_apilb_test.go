@@ -25,7 +25,7 @@ api_lb_backends:
 		// probe for api_far fails -> name NOT in api_lb_probe_reachable
 		"/dev/tcp/10.0.2.99/6443": true,
 	}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		Runner: sr}, nil)
 	if err != nil {
@@ -81,7 +81,7 @@ func lbRunner() *scriptedRunner {
 
 func newLBHost(t *testing.T, vars string, sr *scriptedRunner) *Reconciler {
 	t.Helper()
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
 		DownloadDir: t.TempDir(), Runner: sr}, nil)
 	if err != nil {
@@ -320,7 +320,7 @@ func TestProbeReachableRejectsBadAddr(t *testing.T) {
 	sr := &scriptedRunner{res: map[string]string{
 		"/dev/tcp/10.0.1.10/6443": "",
 	}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -426,7 +426,7 @@ func TestProbeReachableIPv6SplitHostPort(t *testing.T) {
 	sr := &scriptedRunner{res: map[string]string{
 		"/dev/tcp/::1/6443": "",
 	}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)

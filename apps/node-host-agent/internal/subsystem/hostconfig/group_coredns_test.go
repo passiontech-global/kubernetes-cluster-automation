@@ -22,7 +22,7 @@ func TestCoreDNSWorkerStub(t *testing.T) {
 		},
 		errs: map[string]bool{},
 	}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ func TestCoreDNSSkipsResolvConfWhenDigFails(t *testing.T) {
 		res:  map[string]string{"/usr/local/bin/coredns -version": "CoreDNS-1.14.7"},
 		errs: map[string]bool{"dig @127.0.0.1": true},
 	}
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +98,7 @@ func TestCoreDNSHubZoneFile(t *testing.T) {
 		},
 		errs: map[string]bool{},
 	}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DownloadDir: t.TempDir()}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +163,7 @@ node-z:
 		t.Fatal(err)
 	}
 	sr := &scriptedRunner{res: map[string]string{}, errs: map[string]bool{}}
-	r, err := New(Config{Enabled: true, NodeName: "node-a", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -193,7 +193,7 @@ func TestCoreDNSEmptyVersionPinSkips(t *testing.T) {
 		"/usr/local/bin/coredns -version": "CoreDNS-9.9.9",
 	}, errs: map[string]bool{}}
 	dl := t.TempDir()
-	r, err := New(Config{Enabled: true, NodeName: "node-b", HostRoot: t.TempDir(),
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
 	if err != nil {
 		t.Fatal(err)

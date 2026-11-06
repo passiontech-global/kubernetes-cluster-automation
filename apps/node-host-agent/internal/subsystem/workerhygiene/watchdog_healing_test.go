@@ -23,6 +23,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/guards"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // --- BUG-H1: the Cycle-owned watchdog heartbeat ---
@@ -126,7 +130,7 @@ func TestStateEnterRefreshesLatchMtime(t *testing.T) {
 // wedge case. Only 2xx answers pass.
 func TestProbeHTTPDefaultNon2xxIsError(t *testing.T) {
 	e := fixture(t)
-	h, err := New(Config{Client: e.cs}, nil)
+	h, err := New(wdeps.Config{Client: e.cs}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +327,7 @@ func calicoPod(name, uid string) *corev1.Pod {
 }
 
 // TestCheckCalicoFelixRestartDeletesPod: felix readiness dark for
-// calicoFelixRestartFails consecutive cycles deletes the calico-node
+// guards.CalicoFelixRestartFails consecutive cycles deletes the calico-node
 // pod (DaemonSet rebuilds it) under the last-calico-restart budget.
 func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 	e := fixture(t)
@@ -333,7 +337,7 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 	e.status[e.h.Cfg.Calico.FelixReadyURL] = 500
 	pods := []corev1.Pod{*pod}
 
-	for i := 0; i < calicoFelixRestartFails; i++ {
+	for i := 0; i < guards.CalicoFelixRestartFails; i++ {
 		e.h.checkCalicoHygiene(context.Background(), pods, true, true)
 	}
 	if !e.h.State.Exists("calico-felix-down") {
@@ -364,7 +368,7 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 
 // TestCheckCalicoFelixLatchBeforeRestart: the latch enters at
 // ConsecNeeded (2) but the pod delete waits for
-// calicoFelixRestartFails (3) — one flaky readiness probe must not
+// guards.CalicoFelixRestartFails (3) — one flaky readiness probe must not
 // bounce the datapath pod.
 func TestCheckCalicoFelixLatchBeforeRestart(t *testing.T) {
 	e := fixture(t)
@@ -380,7 +384,7 @@ func TestCheckCalicoFelixLatchBeforeRestart(t *testing.T) {
 	}
 	if n := len(deleteActions(e.cs)); n != 0 {
 		t.Fatalf("pod deleted at %dx fails — too early (want >= %d)",
-			2, calicoFelixRestartFails)
+			2, guards.CalicoFelixRestartFails)
 	}
 }
 
@@ -478,7 +482,7 @@ func TestCheckCiliumBPFMapPressureLatches(t *testing.T) {
 // TestParseCiliumBPFMapsShapes covers the tolerant wire parser —
 // name/path, used/entries/cache, size/max/capacity.
 func TestParseCiliumBPFMapsShapes(t *testing.T) {
-	m := parseCiliumBPFMaps([]byte(`{
+	m := cilium.ParseCiliumBPFMaps([]byte(`{
 		"maps": [
 			{"name": "cilium_ct4_global", "size": 262144, "used": 250000},
 			{"path": "/sys/fs/bpf/tc/globals/cilium_snat_v4_external",

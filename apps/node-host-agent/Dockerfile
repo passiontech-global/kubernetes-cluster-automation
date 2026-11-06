@@ -16,8 +16,8 @@ WORKDIR /src
 COPY libs/hostkit/ libs/hostkit/
 COPY apps/node-host-agent/ apps/node-host-agent/
 WORKDIR /src/apps/node-host-agent
-RUN go mod download
-RUN CGO_ENABLED=0 go build -trimpath \
+RUN go mod download && \
+    CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/node-host-agent ./cmd/agent
 
@@ -33,6 +33,10 @@ RUN CGO_ENABLED=0 go build -trimpath \
 # are exec'd via `nsenter -m` → they resolve in the HOST mount ns and
 # intentionally do NOT ship here.
 FROM alpine:3.24
+# apk repos prune old package builds, so pinning exact versions against
+# the floating alpine:3.24 tag would break the build whenever upstream
+# bumps a package.
+# hadolint ignore=DL3018
 RUN apk add --no-cache util-linux iproute2 iputils bash
 COPY --from=build /out/node-host-agent /node-host-agent
 USER 65532:65532

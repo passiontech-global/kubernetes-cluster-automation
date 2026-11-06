@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
@@ -37,6 +38,56 @@ type inotifyConsumer struct {
 	name      string
 	instances uint64
 	watches   uint64
+}
+
+// inotifyCache is the fdinfo-sweep domain — one slice of what used
+// to be the Collector's shared mu-guarded fields: the cached
+// /proc/*/fdinfo walk result (refreshed at most once per
+// InotifyScanInterval — a full walk per scrape is too heavy) plus
+// the edge-triggered >80% top-3-holder Warn flags. The mutex is
+// private — the sweep shares no state with the other domains.
+type inotifyCache struct {
+	mu          sync.Mutex
+	at          time.Time
+	instances   uint64
+	watches     uint64
+	top         []inotifyConsumer
+	warnedInst  bool // edge-triggered >80% Warn per episode
+	warnedWatch bool
+}
+
+// get returns the cached sweep while it is younger than interval.
+func (s *inotifyCache) get(now time.Time, interval time.Duration) (
+	inst, watch uint64, top []inotifyConsumer, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now.Sub(s.at) >= interval {
+		return 0, 0, nil, false
+	}
+	return s.instances, s.watches, s.top, true
+}
+
+// put stores a fresh sweep result stamped at now.
+func (s *inotifyCache) put(now time.Time, inst, watch uint64,
+	top []inotifyConsumer) {
+	s.mu.Lock()
+	s.at, s.instances, s.watches, s.top = now, inst, watch, top
+	s.mu.Unlock()
+}
+
+// noteWarned edge-updates the per-kind warn flag (over replaces the
+// stored edge) and returns the previous value — the caller logs
+// only on the false→true transition.
+func (s *inotifyCache) noteWarned(kind string, over bool) (was bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	warned := &s.warnedWatch
+	if kind == "instances" {
+		warned = &s.warnedInst
+	}
+	was = *warned
+	*warned = over
+	return was
 }
 
 // --- A1: inotify instances/watches pressure ---
@@ -119,41 +170,25 @@ func (c *Collector) sweepInotify() (inst, watch uint64, top []inotifyConsumer) {
 // inotifySnapshot returns the cached sweep, re-walking the procfs
 // at most once per InotifyScanInterval.
 func (c *Collector) inotifySnapshot() (uint64, uint64, []inotifyConsumer) {
-	c.mu.Lock()
-	if c.cfg.nowFn().Sub(c.inoAt) < c.cfg.InotifyScanInterval {
-		inst, watch, top := c.inoInstances, c.inoWatches, c.inoTop
-		c.mu.Unlock()
+	if inst, watch, top, ok := c.ino.get(c.cfg.nowFn(),
+		c.cfg.InotifyScanInterval); ok {
 		return inst, watch, top
 	}
-	c.mu.Unlock()
 
 	// The /proc/*/fdinfo sweep can take seconds on a busy node —
-	// run it WITHOUT mu so concurrent scrapes aren't blocked for
-	// the whole walk (mu also guards every other collector
-	// section's bookkeeping). Two scrapes may then sweep in
+	// run it WITHOUT the cache lock so concurrent scrapes aren't
+	// blocked for the whole walk. Two scrapes may then sweep in
 	// parallel; the later store wins, harmless for a cache.
 	inst, watch, top := c.sweepInotify()
-	c.mu.Lock()
-	c.inoInstances, c.inoWatches, c.inoTop = inst, watch, top
-	c.inoAt = c.cfg.nowFn()
-	c.mu.Unlock()
+	c.ino.put(c.cfg.nowFn(), inst, watch, top)
 	return inst, watch, top
 }
 
 // warnInotifyTop edge-logs the top-3 holder report once per
-// over-threshold episode (the fsStalledLogged pattern).
+// over-threshold episode (the fs probe's noteStall pattern).
 func (c *Collector) warnInotifyTop(kind string, over bool,
 	top []inotifyConsumer) {
-	c.mu.Lock()
-	var warned *bool
-	if kind == "instances" {
-		warned = &c.inoWarnedInst
-	} else {
-		warned = &c.inoWarnedWatch
-	}
-	was := *warned
-	*warned = over
-	c.mu.Unlock()
+	was := c.ino.noteWarned(kind, over)
 	if !over || was {
 		return
 	}

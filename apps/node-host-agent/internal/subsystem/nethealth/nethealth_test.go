@@ -88,7 +88,6 @@ func fixture(t *testing.T, wd *watchdogconf.Config) *env {
 	}
 	sd := systemd.New(systemd.Config{HostRoot: "/", RunCmd: e.sd.Run})
 	n, err := New(Config{
-		Enabled:            true,
 		Interval:           time.Hour,
 		WatchdogStateDir:   e.state,
 		WatchdogLogFile:    filepath.Join(root, "watchdog.log"),

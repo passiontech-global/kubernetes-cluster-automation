@@ -24,6 +24,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/ctr"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // --- check 6: ctr-tasks (31) ---
@@ -516,7 +519,7 @@ func TestCtrImageHealerAPIFailNoAction(t *testing.T) {
 	if len(removed) != 0 {
 		t.Fatal("image rm fired on an inconclusive (API-failed) cycle")
 	}
-	if got := e.h.Cycles.WithLabelValues(checkCtrImages, "abort"); testutil.ToFloat64(got) != 1 {
+	if got := e.h.Cycles.WithLabelValues(wdeps.CheckCtrImages, "abort"); testutil.ToFloat64(got) != 1 {
 		t.Fatalf("abort=%v want 1", testutil.ToFloat64(got))
 	}
 }
@@ -551,8 +554,8 @@ func TestNormalizeCRIImageName(t *testing.T) {
 		{"docker.io/library/nginx@sha256:abc", "docker.io/library/nginx@sha256:abc"},
 	}
 	for _, c := range cases {
-		if got := normalizeCRIImageName(c.in); got != c.want {
-			t.Errorf("normalizeCRIImageName(%q)=%q want %q", c.in, got, c.want)
+		if got := ctr.NormalizeCRIImageName(c.in); got != c.want {
+			t.Errorf("ctr.NormalizeCRIImageName(%q)=%q want %q", c.in, got, c.want)
 		}
 	}
 }

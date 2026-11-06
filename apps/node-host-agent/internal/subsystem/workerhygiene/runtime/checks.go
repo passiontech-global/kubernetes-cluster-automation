@@ -1,5 +1,6 @@
 // checks.go — the runtime-domain check constructors: the six W10
-// runtime-resource guards (runtime_resource_guards.go), the W6.3
+// runtime-resource guards (runtime_<name>.go — one file per guard,
+// see runtime_common.go for the family overview), the W6.3
 // disk-bloat detector (disk_bloat.go) and the W10 KR1/ST2
 // deep-failure guards (deep_failure_checks.go). The parent
 // workerhygiene package wires them into its ordered dispatch list.

@@ -18,8 +18,7 @@ type EnvDeps struct {
 
 // ConfigFromEnv resolves every NODE_HOST_AGENT_* knob nethealth reads
 // and returns a Config ready for New — the env contract lives in the
-// package, not in cmd/agent. Enabled is always true here: the wire
-// func set it unconditionally and the enable gate
+// package, not in cmd/agent. The enable gate
 // (NODE_HOST_AGENT_ENABLE_NETHEALTH) stays in the caller.
 func ConfigFromEnv(d EnvDeps) Config {
 	hostPath := d.HostPath
@@ -27,7 +26,6 @@ func ConfigFromEnv(d EnvDeps) Config {
 		hostPath = func(p string) string { return p }
 	}
 	cfg := Config{
-		Enabled:          true,
 		WatchdogStateDir: d.WatchdogStateDir,
 		WatchdogLogFile:  d.WatchdogLogFile,
 		HostRoot:         d.HostRoot,

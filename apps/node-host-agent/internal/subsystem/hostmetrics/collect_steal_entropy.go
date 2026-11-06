@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
@@ -110,28 +111,46 @@ func procStatCPUSums(path string) (steal, total uint64, ok bool) {
 	return steal, total, seen
 }
 
-// cpuStealDelta returns the steal/total jiffie delta since the
-// previous tick. The first call only seeds the baseline — a ratio
-// needs two samples — and counter regression (jiffies wrap, proc
-// remount) reseeds instead of emitting a garbage ratio.
+// stealDelta is the cpu-steal jiffie-delta baseline — one slice of
+// what used to be the Collector's shared mu-guarded fields: the
+// steal ratio is a DELTA between consecutive latch ticks, so the
+// previous /proc/stat sums live here. The consecutive-tick streaks
+// live in state-dir counter files instead — a restart reseeding the
+// baseline costs one tick, losing the streak would cost three. The
+// mutex is private.
+type stealDelta struct {
+	mu        sync.Mutex
+	prevSteal uint64
+	prevTotal uint64
+	prevOK    bool
+}
+
+// delta returns the steal/total jiffie delta since the previous
+// call. The first call only seeds the baseline — a ratio needs two
+// samples — and counter regression (jiffies wrap, proc remount)
+// reseeds instead of emitting a garbage ratio.
+func (d *stealDelta) delta(steal, total uint64) (float64, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.prevOK || steal < d.prevSteal || total <= d.prevTotal {
+		d.prevSteal, d.prevTotal, d.prevOK = steal, total, true
+		return 0, false
+	}
+	ds, dt := steal-d.prevSteal, total-d.prevTotal
+	d.prevSteal, d.prevTotal = steal, total
+	return float64(ds) / float64(dt), true
+}
+
+// cpuStealDelta reads the /proc/stat sums and folds them into the
+// jiffie-delta baseline — see stealDelta.delta for the seeding and
+// regression rules.
 func (l *Latches) cpuStealDelta() (float64, bool) {
 	steal, total, ok := procStatCPUSums(
 		filepath.Join(l.c.cfg.ProcRoot, "stat"))
 	if !ok {
 		return 0, false
 	}
-	c := l.c
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.stealPrevOK || steal < c.stealPrevSteal ||
-		total <= c.stealPrevTotal {
-		c.stealPrevSteal, c.stealPrevTotal, c.stealPrevOK =
-			steal, total, true
-		return 0, false
-	}
-	ds, dt := steal-c.stealPrevSteal, total-c.stealPrevTotal
-	c.stealPrevSteal, c.stealPrevTotal = steal, total
-	return float64(ds) / float64(dt), true
+	return l.c.steal.delta(steal, total)
 }
 
 // kernelEntropyAvail reads the kernel entropy pool fill — bits,

@@ -16,9 +16,6 @@ func TestConfigFromEnv(t *testing.T) {
 		HostRoot: "/host",
 		VarsDir:  "/vars",
 	})
-	if !cfg.Enabled {
-		t.Fatal("Enabled should be true — the gate stays in the caller")
-	}
 	if cfg.NodeName != "node-1" || cfg.Hostname != "host-1" {
 		t.Fatalf("identity: %+v", cfg)
 	}

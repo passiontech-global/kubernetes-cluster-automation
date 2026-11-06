@@ -406,12 +406,6 @@ func (h *Hygiene) feederActive() bool {
 // Run starts the feeder goroutine (when active), checks immediately,
 // then cycles every Interval until ctx is cancelled.
 func (h *Hygiene) Run(ctx context.Context) {
-	if !h.cfg.Enabled {
-		// Constructed but disabled — idle instead of returning: the
-		// agent restarts a returned Run in a hot loop.
-		cycle.Idle(ctx)
-		return
-	}
 	if h.feederActive() {
 		h.feederOnce.Do(func() {
 			go func() {

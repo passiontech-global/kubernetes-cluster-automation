@@ -26,7 +26,6 @@ func fixture(t *testing.T, rules []testutil.ExecRule) (*KineDB, *testutil.FakeEx
 	}
 	fr := testutil.NewFakeExec(rules...)
 	k, err := New(Config{
-		Enabled:       true,
 		EnvFile:       envFile,
 		TextfileDir:   filepath.Join(dir, "textfile"),
 		GuardStateDir: filepath.Join(dir, "guard"),
@@ -202,22 +201,5 @@ func TestDiscoverContainer(t *testing.T) {
 	pgb := k.pgbContainerName(context.Background())
 	if pgb != "kine-pgbouncer" {
 		t.Fatalf("pgb=%q want kine-pgbouncer", pgb)
-	}
-}
-
-func TestDisabledRunIdles(t *testing.T) {
-	k, err := New(Config{Enabled: false}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { k.Run(ctx); close(done) }()
-	time.Sleep(20 * time.Millisecond)
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("disabled Run did not exit on cancel")
 	}
 }

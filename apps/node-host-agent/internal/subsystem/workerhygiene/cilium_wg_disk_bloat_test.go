@@ -12,6 +12,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
 // --- W5.6 pure parsers ---
@@ -20,15 +23,15 @@ func TestParseWGAllowedIPs(t *testing.T) {
 	out := "peer1key=\t10.0.0.1/32\n" +
 		"peer2key=\t(none)\n" +
 		"peer3key=\t10.0.0.3/32,fd00::3/128\n"
-	if got := parseWGAllowedIPs(out); got != 2 {
-		t.Fatalf("parseWGAllowedIPs = %d, want 2", got)
+	if got := wdeps.ParseWGAllowedIPs(out); got != 2 {
+		t.Fatalf("wdeps.ParseWGAllowedIPs = %d, want 2", got)
 	}
-	if got := parseWGAllowedIPs(""); got != 0 {
-		t.Fatalf("empty: parseWGAllowedIPs = %d, want 0", got)
+	if got := wdeps.ParseWGAllowedIPs(""); got != 0 {
+		t.Fatalf("empty: wdeps.ParseWGAllowedIPs = %d, want 0", got)
 	}
 	allWiped := "peer1key=\t(none)\npeer2key=\t(none)\n"
-	if got := parseWGAllowedIPs(allWiped); got != 0 {
-		t.Fatalf("all-wiped: parseWGAllowedIPs = %d, want 0", got)
+	if got := wdeps.ParseWGAllowedIPs(allWiped); got != 0 {
+		t.Fatalf("all-wiped: wdeps.ParseWGAllowedIPs = %d, want 0", got)
 	}
 }
 
@@ -48,9 +51,9 @@ func TestParseCiliumEncryptPeers(t *testing.T) {
 		{"garbage", "not json no numbers", 0, false},
 	}
 	for _, tc := range cases {
-		got, ok := parseCiliumEncryptPeers(tc.out)
+		got, ok := cilium.ParseCiliumEncryptPeers(tc.out)
 		if got != tc.want || ok != tc.ok {
-			t.Errorf("%s: parseCiliumEncryptPeers = (%d,%v), want (%d,%v)",
+			t.Errorf("%s: cilium.ParseCiliumEncryptPeers = (%d,%v), want (%d,%v)",
 				tc.name, got, ok, tc.want, tc.ok)
 		}
 	}
