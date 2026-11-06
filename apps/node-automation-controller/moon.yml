@@ -6,6 +6,10 @@ stack: 'backend'
 tags:
   - 'docker'
 
+# hostkit change -> this project's tasks are affected (moon ci).
+dependsOn:
+  - 'hostkit'
+
 project:
   title: 'node-automation-controller'
   description: 'controller-runtime operator replacing the shell-operator Deployment + bash hooks for node lifecycle automation.'

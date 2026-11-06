@@ -1,8 +1,0 @@
-.git/
-bin/
-dist/
-notes.md
-changelog.md
-.github/
-*.test
-coverage.out
