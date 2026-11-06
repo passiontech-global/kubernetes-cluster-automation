@@ -1,6 +1,7 @@
 package janitor
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -30,9 +31,9 @@ func ConfigFromEnv(d EnvDeps) Config {
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
-		envx.DurationKnob("NODE_HOST_AGENT_JANITOR_INTERVAL", &cfg.Interval, defaultInterval),
-		envx.StringKnob("NODE_HOST_AGENT_PROC_ROOT", &cfg.ProcRoot, defaultProcRoot),
-		envx.DurationKnob("NODE_HOST_AGENT_JANITOR_LATCH_MAX_AGE", &cfg.LatchMaxAge, latchMaxAge),
+		envx.DurationKnob(envnames.EnvJanitorInterval, &cfg.Interval, defaultInterval),
+		envx.StringKnob(envnames.EnvProcRoot, &cfg.ProcRoot, defaultProcRoot),
+		envx.DurationKnob(envnames.EnvJanitorLatchMaxAge, &cfg.LatchMaxAge, latchMaxAge),
 	})
 	return cfg
 }

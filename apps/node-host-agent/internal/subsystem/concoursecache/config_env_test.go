@@ -4,11 +4,13 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 )
 
 func TestConfigFromEnv(t *testing.T) {
-	t.Setenv("NODE_HOST_AGENT_SWEEP_BASE_DIR", "/data/openebs")
-	t.Setenv("NODE_HOST_AGENT_CONCOURSE_CACHE_INTERVAL", "45m")
+	t.Setenv(envnames.EnvSweepBaseDir, "/data/openebs")
+	t.Setenv(envnames.EnvConcourseCacheInterval, "45m")
 
 	k := ConfigFromEnv()
 	if k.CacheRoot != "/data/openebs" {

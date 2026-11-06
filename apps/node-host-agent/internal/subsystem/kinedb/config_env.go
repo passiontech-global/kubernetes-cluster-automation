@@ -1,6 +1,7 @@
 package kinedb
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -28,13 +29,13 @@ func ConfigFromEnv(d EnvDeps) Config {
 	envx.Apply([]envx.Knob{
 		// PathJoin(defaultEnvFile) keeps the Detect() probe path and
 		// the configured EnvFile on the same file.
-		envx.StringKnob("NODE_HOST_AGENT_KINEDB_ENV_FILE", &cfg.EnvFile,
+		envx.StringKnob(envnames.EnvKinedbEnvFile, &cfg.EnvFile,
 			d.PathJoin(defaultEnvFile)),
-		envx.StringKnob("NODE_HOST_AGENT_KINEDB_GUARD_STATE_DIR", &cfg.GuardStateDir,
+		envx.StringKnob(envnames.EnvKinedbGuardStateDir, &cfg.GuardStateDir,
 			d.PathJoin(defaultGuardStateDir)),
 		// W8-CP2: in-container postgres data dir for the repack
 		// headroom gate; empty → package default.
-		envx.StringKnob("NODE_HOST_AGENT_KINEDB_PG_DATA_DIR", &cfg.PGDataDir, ""),
+		envx.StringKnob(envnames.EnvKinedbPgDataDir, &cfg.PGDataDir, ""),
 	})
 	return cfg
 }

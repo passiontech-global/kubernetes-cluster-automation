@@ -176,8 +176,9 @@ type Collector struct {
 	lpv   localpvCache      // collect_localpv.go — du walk cache
 }
 
-// New returns the Collector. Register it on the agent's registry,
-// and wire its Latches() half in as the latch-ticker subsystem.
+// New returns the Collector. Call Register to add it to the agent's
+// registry, and wire its Latches() half in as the latch-ticker
+// subsystem.
 func New(cfg Config) *Collector {
 	cfg.applyDefaults()
 	c := &Collector{cfg: cfg}
@@ -201,6 +202,21 @@ func New(cfg Config) *Collector {
 		c.expectedKCM[k] = true
 	}
 	return c
+}
+
+// Register adds the collector to reg — the error-returning form of
+// the registration every other subsystem performs inside
+// New(cfg, reg) (workerhygiene parity). hostmetrics keeps a
+// registry-free New(cfg) because its test suite builds bare
+// collectors directly; production wiring (cmd/agent's hostmetrics
+// descriptor) goes through this step so a registration failure
+// surfaces as a Build error — "hostmetrics setup failed" — instead
+// of a MustRegister panic taking the process down.
+func (c *Collector) Register(reg prometheus.Registerer) error {
+	if reg == nil {
+		return nil
+	}
+	return reg.Register(c)
 }
 
 // The scrape-domain registry — domainTable, descMetaTable and

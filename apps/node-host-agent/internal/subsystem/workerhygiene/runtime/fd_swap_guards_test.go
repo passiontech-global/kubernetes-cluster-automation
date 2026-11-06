@@ -42,7 +42,7 @@ type deletedStat struct {
 }
 
 func (e *env) stubDeletedFDStats(stats map[string]deletedStat) {
-	e.H.Cfg.Seams.DeletedFDStatFn = func(path string) (uint64, uint64, int64, bool) {
+	e.H.Cfg.Seams.Host.DeletedFDStatFn = func(path string) (uint64, uint64, int64, bool) {
 		key := strings.TrimPrefix(path, e.ProcDir+"/")
 		parts := strings.Split(key, "/")
 		if len(parts) != 3 {

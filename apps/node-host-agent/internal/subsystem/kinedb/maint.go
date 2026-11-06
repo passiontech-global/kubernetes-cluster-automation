@@ -246,7 +246,7 @@ func (k *KineDB) reapInvalidIndexes(ctx context.Context, pg, user, pass string,
 				continue
 			}
 			res.invalidDropped++
-			note(fmt.Sprintf("dropped invalid index %s", base))
+			note("dropped invalid index " + base)
 			logger().Warn("kinedb: dropped orphaned invalid index",
 				"index", base)
 		}

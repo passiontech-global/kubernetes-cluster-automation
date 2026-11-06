@@ -77,7 +77,7 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// and bound SA tokens rotate.
 	bearer := kubeletBearer(c.d)
 	for i := 0; i < wdeps.ProbeAttempts; i++ {
-		code, err := c.d.Cfg.Seams.ProbeHTTPStatus(ctx,
+		code, err := c.d.Cfg.Seams.Probe.ProbeHTTPStatus(ctx,
 			c.d.Cfg.Kubelet.SyncloopURL, bearer, wdeps.ProbeTimeout)
 		if err == nil {
 			switch {
@@ -265,7 +265,7 @@ func parsePLEGMetrics(body string) plegSample {
 // every Run so the early-warning verdict is independent of the
 // syncloop probe's outcome.
 func (c *SyncloopCheck) probePLEG(ctx context.Context) {
-	body, err := c.d.Cfg.Seams.KubeletMetricsFn(ctx,
+	body, err := c.d.Cfg.Seams.Probe.KubeletMetricsFn(ctx,
 		c.d.Cfg.Kubelet.MetricsURL, kubeletBearer(c.d), wdeps.ProbeTimeout)
 	if err != nil {
 		// Unreachable/unauthorized /metrics says nothing about
@@ -344,7 +344,7 @@ func (c *CtrsockCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCtrSock, "gated").Inc()
 		return
 	}
-	err := c.d.Cfg.Seams.ProbeUnixSock(ctx, c.d.Cfg.Ctr.Socket, unixSockProbeTimeout)
+	err := c.d.Cfg.Seams.Probe.ProbeUnixSock(ctx, c.d.Cfg.CtrSocket, unixSockProbeTimeout)
 	if err == nil {
 		c.fails = 0
 		c.d.State.Exit(hoststate.LatchContainerdSockDown, nil)
@@ -355,7 +355,7 @@ func (c *CtrsockCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.fails < c.d.Cfg.ConsecNeeded {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: containerd-sock-down %s probe fail: %v (check %d/%d)",
-			c.d.Cfg.Ctr.Socket, err, c.fails, c.d.Cfg.ConsecNeeded))
+			c.d.Cfg.CtrSocket, err, c.fails, c.d.Cfg.ConsecNeeded))
 		c.d.Cycles.WithLabelValues(wdeps.CheckCtrSock, "ok").Inc()
 		return
 	}
@@ -384,7 +384,7 @@ func (c *CtrsockCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// case — the feeder goroutine competes for the same file.
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION: restarting k0sworker - containerd-sock-down %s (persisted %dx)",
-			c.d.Cfg.Ctr.Socket, c.fails))
+			c.d.Cfg.CtrSocket, c.fails))
 		c.fails = 0
 		if err := restartK0sWorker(c.d, ctx); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))

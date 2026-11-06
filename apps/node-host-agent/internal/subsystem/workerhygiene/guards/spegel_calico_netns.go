@@ -75,7 +75,7 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			!spegelPodRe.MatchString(p.Name) ||
 			p.DeletionTimestamp != nil ||
 			p.Status.Phase != corev1.PodRunning ||
-			c.d.Cfg.Seams.NowFn().Sub(p.CreationTimestamp.Time) < spegelMinPodAge {
+			c.d.Cfg.Seams.Host.NowFn().Sub(p.CreationTimestamp.Time) < spegelMinPodAge {
 			continue
 		}
 		sp = p
@@ -142,7 +142,7 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // calicoIfaceCount counts cali* interfaces under SysClassNet; -1
 // when the sysfs root is unreadable (inconclusive).
 func calicoIfaceCount(d *wdeps.Deps) int {
-	entries, err := os.ReadDir(d.Cfg.Net.SysClassNet)
+	entries, err := os.ReadDir(d.Cfg.SysClassNet)
 	if err != nil {
 		return -1
 	}
@@ -173,7 +173,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCalico, "gated").Inc()
 		return
 	}
-	if _, err := os.Stat(filepath.Join(c.d.Cfg.Net.SysClassNet, "cilium_host")); err == nil {
+	if _, err := os.Stat(filepath.Join(c.d.Cfg.SysClassNet, "cilium_host")); err == nil {
 		// Cilium node — every calico verdict belongs to the cilium
 		// guard family; drop stale evidence like checkCiliumWGPeers.
 		c.VethFails = 0
@@ -248,7 +248,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.felixFails = 0
 		c.d.State.Exit(hoststate.LatchCalicoFelixDown, nil)
 	default:
-		code, err := c.d.Cfg.Seams.ProbeHTTPStatus(ctx,
+		code, err := c.d.Cfg.Seams.Probe.ProbeHTTPStatus(ctx,
 			c.d.Cfg.Calico.FelixReadyURL, "", calicoProbeTimeout)
 		if err == nil && code == http.StatusOK {
 			c.felixFails = 0
@@ -305,7 +305,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // iface mid-creation reads carrier 0 briefly). Markers for ifaces
 // that vanished or came back up are pruned.
 func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
-	entries, err := os.ReadDir(d.Cfg.Net.SysClassNet)
+	entries, err := os.ReadDir(d.Cfg.SysClassNet)
 	if err != nil {
 		return
 	}
@@ -315,7 +315,7 @@ func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
 			continue
 		}
 		marker := filepath.Join(d.Cfg.WatchdogStateDir, "veth-seen-"+name)
-		carrier, err := os.ReadFile(filepath.Join(d.Cfg.Net.SysClassNet, name, "carrier"))
+		carrier, err := os.ReadFile(filepath.Join(d.Cfg.SysClassNet, name, "carrier"))
 		if err != nil {
 			continue // racing an iface add/remove — neither up nor down
 		}
@@ -359,7 +359,7 @@ func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
 		filepath.Join(d.Cfg.WatchdogStateDir, "veth-seen-*")); err == nil {
 		for _, m := range ms {
 			name := strings.TrimPrefix(filepath.Base(m), "veth-seen-")
-			if _, err := os.Stat(filepath.Join(d.Cfg.Net.SysClassNet, name)); err != nil {
+			if _, err := os.Stat(filepath.Join(d.Cfg.SysClassNet, name)); err != nil {
 				_ = os.Remove(m)
 			}
 		}
@@ -522,7 +522,7 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// raced the CNI ADD is not an orphan no matter what the
 		// inode check says.
 		if fi, err := os.Stat(path); err != nil ||
-			c.d.Cfg.Seams.NowFn().Sub(fi.ModTime()) < cniNetnsMinAge {
+			c.d.Cfg.Seams.Host.NowFn().Sub(fi.ModTime()) < cniNetnsMinAge {
 			continue
 		}
 		// W12-KR2: the containerd task map is the stronger liveness

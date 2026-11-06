@@ -72,7 +72,7 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "gated").Inc()
 		return
 	}
-	if _, err := os.Stat(filepath.Join(c.d.Cfg.Net.SysClassNet, "cilium_host")); err != nil {
+	if _, err := os.Stat(filepath.Join(c.d.Cfg.SysClassNet, "cilium_host")); err != nil {
 		// No cilium datapath — the LRP wedge can't exist here.
 		c.Fails = 0
 		c.svcFails = 0
@@ -131,9 +131,9 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// query UDP first but truncated/large answers and TCP clients
 	// (zone transfers, some resolvers) ride TCP; a one-sided wedge
 	// still blackholes real queries.
-	udpOK := c.d.Cfg.Seams.DNSProbe(c.d.Cfg.Net.LocalDNSProbeAddr,
+	udpOK := c.d.Cfg.Seams.Probe.DNSProbe(c.d.Cfg.Net.LocalDNSProbeAddr,
 		c.d.Cfg.Net.LocalDNSProbeName, ciliumProbeTime)
-	tcpOK := c.d.Cfg.Seams.DNSProbeTCP(c.d.Cfg.Net.LocalDNSProbeAddr,
+	tcpOK := c.d.Cfg.Seams.Probe.DNSProbeTCP(c.d.Cfg.Net.LocalDNSProbeAddr,
 		c.d.Cfg.Net.LocalDNSProbeName, ciliumProbeTime)
 	if udpOK && tcpOK {
 		c.Fails = 0
@@ -199,7 +199,7 @@ var desyncServices = []struct{ ns, name string }{
 // wrong component.
 func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
 	agentTasks []wdeps.CtrTask) bool {
-	backends, err := c.d.Cfg.Seams.CiliumServiceBackendsFn(ctx)
+	backends, err := c.d.Cfg.Seams.Cilium.CiliumServiceBackendsFn(ctx)
 	if err != nil {
 		// Inconclusive — the agent API hiccuped; the healthz check
 		// owns the agent verdict.

@@ -9,7 +9,7 @@
 // reclaims nothing (or --force-offline) -> alarm disarm -> write
 // canary.
 //
-// The rescue itself lives in internal/ops/etcdmaint (Run): this file is
+// The rescue itself lives in internal/domain/etcdmaint (Run): this file is
 // only the flag layer so the controllerhygiene etcd guard can share
 // the domain logic without importing a CLI package.
 package etcdrescue
@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/etcdmaint"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/etcdmaint"
 )
 
 // Cmd is the `rescue-etcd` subcommand entrypoint.

@@ -78,12 +78,12 @@ func (c *DiskBloatCheck) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 	}
 	threshold := c.d.Cfg.Disk.BloatPodThresholdBytes
 	// (1) emptyDir volumes: pods/<uid>/volumes/kubernetes.io~empty-dir/<vol>.
-	for _, uidDir := range readDirNames(c.d.Cfg.Kubelet.PodsDir) {
+	for _, uidDir := range readDirNames(c.d.Cfg.PodsDir) {
 		uid := filepath.Base(uidDir)
 		for _, vol := range readDirNames(filepath.Join(
 			uidDir, "volumes", "kubernetes.io~empty-dir")) {
 			var vst unix.Statfs_t
-			if err := c.d.Cfg.Seams.StatfsFn(vol, &vst); err == nil &&
+			if err := c.d.Cfg.Seams.Host.StatfsFn(vol, &vst); err == nil &&
 				vst.Type == int64(unix.TMPFS_MAGIC) {
 				continue // medium=Memory emptyDir — can't fill the disk
 			}
@@ -106,7 +106,7 @@ func (c *DiskBloatCheck) scanBloat(pods []corev1.Pod) (hits []bloatHit,
 	// snapshot key, so a live task dir maps the snapshot back to
 	// its pod's uid for the eviction decision; unresolvable
 	// snapshots stay hits-only.
-	snapRoot := filepath.Join(c.d.Cfg.Disk.K0sDataDir, "containerd",
+	snapRoot := filepath.Join(c.d.Cfg.K0sDataDir, "containerd",
 		"io.containerd.snapshotter.v1.overlayfs", "snapshots")
 	for _, snap := range readDirNames(snapRoot) {
 		id := filepath.Base(snap)
@@ -183,7 +183,7 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	var st unix.Statfs_t
 	used := -1.0
-	if err := c.d.Cfg.Seams.StatfsFn(c.d.Cfg.Disk.K0sDataDir, &st); err == nil &&
+	if err := c.d.Cfg.Seams.Host.StatfsFn(c.d.Cfg.K0sDataDir, &st); err == nil &&
 		st.Blocks > 0 && st.Bavail <= st.Blocks {
 		used = float64(st.Blocks-st.Bavail) / float64(st.Blocks)
 	}
@@ -200,11 +200,11 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	// The walk is IO on the disk that is full — at most once per
 	// DiskBloatScanInterval; an existing latch persists meanwhile.
-	if c.d.Cfg.Seams.NowFn().Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
+	if c.d.Cfg.Seams.Host.NowFn().Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
 		c.d.Cycles.WithLabelValues(wdeps.CheckDiskBloat, "ok").Inc()
 		return
 	}
-	c.lastScan = c.d.Cfg.Seams.NowFn()
+	c.lastScan = c.d.Cfg.Seams.Host.NowFn()
 	hits, podTotals, podByUID := c.scanBloat(e.Pods)
 	if len(hits) == 0 {
 		c.d.State.Exit(hoststate.LatchDiskBloat, nil)

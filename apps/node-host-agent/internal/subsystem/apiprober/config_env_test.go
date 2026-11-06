@@ -6,13 +6,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
 
 // The env → guard.conf → compiled-default chain must keep its exact
 // precedence: env wins, then the conf key, then the package default.
 func TestResolveProberInputsChain(t *testing.T) {
-	t.Setenv("NODE_HOST_AGENT_API_GUARD_CONF", filepath.Join(t.TempDir(), "absent.conf"))
+	t.Setenv(envnames.EnvAPIGuardConf, filepath.Join(t.TempDir(), "absent.conf"))
 
 	wd := &watchdogconf.Config{APIBackends: []watchdogconf.APIBackend{
 		{Name: "ctl1", Addr: "10.0.0.1:6443"},
@@ -43,12 +44,12 @@ func TestResolveProberInputsChain(t *testing.T) {
 	}
 
 	// Env overrides the conf layer.
-	t.Setenv("NODE_HOST_AGENT_APIPROBER_SOCKET", "/env/sock")
-	t.Setenv("NODE_HOST_AGENT_APIPROBER_BACKEND", "env_back")
-	t.Setenv("NODE_HOST_AGENT_APIPROBER_MODE", ModeDryRun)
-	t.Setenv("NODE_HOST_AGENT_APIPROBER_COMPANION_BACKENDS", "a,b")
-	t.Setenv("NODE_HOST_AGENT_APIPROBER_TOKEN_FILE", "/env/token")
-	t.Setenv("NODE_HOST_AGENT_APIPROBER_CA_FILE", "/env/ca")
+	t.Setenv(envnames.EnvApiproberSocket, "/env/sock")
+	t.Setenv(envnames.EnvApiproberBackend, "env_back")
+	t.Setenv(envnames.EnvApiproberMode, ModeDryRun)
+	t.Setenv(envnames.EnvApiproberCompanionBackends, "a,b")
+	t.Setenv(envnames.EnvApiproberTokenFile, "/env/token")
+	t.Setenv(envnames.EnvApiproberCaFile, "/env/ca")
 	pi = resolveProberInputs(wd, g)
 	if pi.socket != "/env/sock" || pi.backend != "env_back" ||
 		pi.mode != ModeDryRun || pi.tokenFile != "/env/token" ||
@@ -67,11 +68,11 @@ func TestConfigFromEnv(t *testing.T) {
 		0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("NODE_HOST_AGENT_API_GUARD_CONF", confPath)
-	t.Setenv("NODE_HOST_AGENT_APIPROBER_INTERVAL", "45s")
-	t.Setenv("NODE_HOST_AGENT_APIPROBER_GAP_MIN", "42")
-	t.Setenv("NODE_HOST_AGENT_APIPROBER_LIVE_PATH", "/live")
-	t.Setenv("NODE_HOST_AGENT_APIPROBER_INSECURE_TLS", "false")
+	t.Setenv(envnames.EnvAPIGuardConf, confPath)
+	t.Setenv(envnames.EnvApiproberInterval, "45s")
+	t.Setenv(envnames.EnvApiproberGapMin, "42")
+	t.Setenv(envnames.EnvApiproberLivePath, "/live")
+	t.Setenv(envnames.EnvApiproberInsecureTLS, "false")
 
 	cfg := ConfigFromEnv(EnvDeps{
 		Watchdog:         &watchdogconf.Config{},

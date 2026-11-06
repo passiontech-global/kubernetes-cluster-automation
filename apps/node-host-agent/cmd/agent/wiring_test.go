@@ -14,6 +14,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -40,8 +41,8 @@ func enableBothKubeConsumers(t *testing.T) {
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
 	t.Setenv("KUBECONFIG", "")
 	disableAllSubsystems(t)
-	t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "true")
-	t.Setenv("NODE_HOST_AGENT_ENABLE_HYGIENE", "true")
+	t.Setenv(envnames.EnvEnableSweeper, "true")
+	t.Setenv(envnames.EnvEnableHygiene, "true")
 }
 
 // TestCsOnceSharesOneClientset: sweeper and workerhygiene both consume
@@ -52,7 +53,7 @@ func TestCsOnceSharesOneClientset(t *testing.T) {
 	})
 	enableBothKubeConsumers(t)
 
-	cfg, _ := buildAgentConfig(testAgentParams("node-a", "p", false))
+	cfg, _ := testBuildAgentConfig("node-a", "p", false)
 
 	if *calls != 1 {
 		t.Fatalf("kubeClient calls=%d want 1 (shared clientset)", *calls)
@@ -77,7 +78,7 @@ func TestCsOnceErrorRetried(t *testing.T) {
 	})
 	enableBothKubeConsumers(t)
 
-	cfg, _ := buildAgentConfig(testAgentParams("node-a", "p", false))
+	cfg, _ := testBuildAgentConfig("node-a", "p", false)
 
 	// sweeper + workerhygiene + hubsync each re-attempt once.
 	if *calls != 3 {
@@ -101,20 +102,20 @@ func TestStandaloneDefaultFlips(t *testing.T) {
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
 	t.Setenv("KUBECONFIG", "")
-	t.Setenv("NODE_HOST_AGENT_NODE_NAME", "node-a")
-	t.Setenv("NODE_HOST_AGENT_WATCHDOG_CONF",
+	t.Setenv(envnames.EnvNodeName, "node-a")
+	t.Setenv(envnames.EnvWatchdogConf,
 		filepath.Join(t.TempDir(), "absent.conf"))
-	t.Setenv("NODE_HOST_AGENT_API_GUARD_CONF",
+	t.Setenv(envnames.EnvAPIGuardConf,
 		filepath.Join(t.TempDir(), "absent-guard.conf"))
-	t.Setenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", t.TempDir())
-	t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY",
+	t.Setenv(envnames.EnvHostconfigVarsDir, t.TempDir())
+	t.Setenv(envnames.EnvConvergeSSHKey,
 		filepath.Join(t.TempDir(), "absent-key"))
-	t.Setenv("NODE_HOST_AGENT_ENABLE_KINEDB", "false")
-	t.Setenv("NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE", "false")
-	t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTCONFIG", "false")
+	t.Setenv(envnames.EnvEnableKinedb, "false")
+	t.Setenv(envnames.EnvEnableControllerhygiene, "false")
+	t.Setenv(envnames.EnvEnableHostconfig, "false")
 
 	t.Run("standalone flips kube-dependent defaults off", func(t *testing.T) {
-		cfg, _ := buildAgentConfig(testAgentParams("node-a", "p", true))
+		cfg, _ := testBuildAgentConfig("node-a", "p", true)
 		names := subsystemNames(cfg)
 		want := map[string]bool{
 			"apiprober": true, "hostmetrics": true,
@@ -133,7 +134,7 @@ func TestStandaloneDefaultFlips(t *testing.T) {
 	})
 
 	t.Run("pod mode keeps kube-dependent defaults on", func(t *testing.T) {
-		cfg, _ := buildAgentConfig(testAgentParams("node-a", "p", false))
+		cfg, _ := testBuildAgentConfig("node-a", "p", false)
 		got := map[string]bool{}
 		for _, n := range subsystemNames(cfg) {
 			got[n] = true
@@ -151,8 +152,8 @@ func TestStandaloneDefaultFlips(t *testing.T) {
 	})
 
 	t.Run("env override still wins in standalone", func(t *testing.T) {
-		t.Setenv("NODE_HOST_AGENT_ENABLE_HYGIENE", "true")
-		cfg, _ := buildAgentConfig(testAgentParams("node-a", "p", true))
+		t.Setenv(envnames.EnvEnableHygiene, "true")
+		cfg, _ := testBuildAgentConfig("node-a", "p", true)
 		got := map[string]bool{}
 		for _, n := range subsystemNames(cfg) {
 			got[n] = true
@@ -164,8 +165,8 @@ func TestStandaloneDefaultFlips(t *testing.T) {
 	})
 
 	t.Run("NODE_HOST_AGENT_STANDALONE env selects standalone", func(t *testing.T) {
-		t.Setenv("NODE_HOST_AGENT_STANDALONE", "1")
-		cfg, _ := buildAgentConfig(testAgentParams("node-a", "p", false))
+		t.Setenv(envnames.EnvStandalone, "1")
+		cfg, _ := testBuildAgentConfig("node-a", "p", false)
 		got := map[string]bool{}
 		for _, n := range subsystemNames(cfg) {
 			got[n] = true
@@ -202,16 +203,16 @@ func writeEd25519Key(t *testing.T) string {
 func TestKineDBGating(t *testing.T) {
 	disableAllSubsystems(t)
 	sandboxed := t.TempDir()
-	t.Setenv("NODE_HOST_AGENT_WATCHDOG_CONF", filepath.Join(sandboxed, "no.conf"))
-	t.Setenv("NODE_HOST_AGENT_API_GUARD_CONF", filepath.Join(sandboxed, "no.conf"))
-	t.Setenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", sandboxed)
-	t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", filepath.Join(sandboxed, "no-key"))
+	t.Setenv(envnames.EnvWatchdogConf, filepath.Join(sandboxed, "no.conf"))
+	t.Setenv(envnames.EnvAPIGuardConf, filepath.Join(sandboxed, "no.conf"))
+	t.Setenv(envnames.EnvHostconfigVarsDir, sandboxed)
+	t.Setenv(envnames.EnvConvergeSSHKey, filepath.Join(sandboxed, "no-key"))
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
 	t.Setenv("KUBECONFIG", "")
 
 	t.Run("auto + no detect → off", func(t *testing.T) {
-		cfg, _ := buildAgentConfig(testAgentParams("n", "p", false))
+		cfg, _ := testBuildAgentConfig("n", "p", false)
 		for _, n := range subsystemNames(cfg) {
 			if n == "kinedb" {
 				t.Fatal("kinedb enabled without Detect match")
@@ -219,8 +220,8 @@ func TestKineDBGating(t *testing.T) {
 		}
 	})
 	t.Run("true forces on", func(t *testing.T) {
-		t.Setenv("NODE_HOST_AGENT_ENABLE_KINEDB", "true")
-		cfg, _ := buildAgentConfig(testAgentParams("n", "p", false))
+		t.Setenv(envnames.EnvEnableKinedb, "true")
+		cfg, _ := testBuildAgentConfig("n", "p", false)
 		got := subsystemNames(cfg)
 		if len(got) != 1 || got[0] != "kinedb" {
 			t.Fatalf("subsystems=%v want [kinedb]", got)
@@ -231,10 +232,10 @@ func TestKineDBGating(t *testing.T) {
 func TestHubsyncGating(t *testing.T) {
 	disableAllSubsystems(t)
 	sandboxed := t.TempDir()
-	t.Setenv("NODE_HOST_AGENT_WATCHDOG_CONF", filepath.Join(sandboxed, "no.conf"))
-	t.Setenv("NODE_HOST_AGENT_API_GUARD_CONF", filepath.Join(sandboxed, "no.conf"))
-	t.Setenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", sandboxed)
-	t.Setenv("NODE_HOST_AGENT_ENABLE_KINEDB", "false")
+	t.Setenv(envnames.EnvWatchdogConf, filepath.Join(sandboxed, "no.conf"))
+	t.Setenv(envnames.EnvAPIGuardConf, filepath.Join(sandboxed, "no.conf"))
+	t.Setenv(envnames.EnvHostconfigVarsDir, sandboxed)
+	t.Setenv(envnames.EnvEnableKinedb, "false")
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
 	t.Setenv("KUBECONFIG", "")
@@ -243,9 +244,9 @@ func TestHubsyncGating(t *testing.T) {
 		stubKubeClient(t, func() (kubernetes.Interface, error) {
 			return testutil.FakeKube(), nil
 		})
-		t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY",
+		t.Setenv(envnames.EnvConvergeSSHKey,
 			filepath.Join(sandboxed, "absent"))
-		cfg, _ := buildAgentConfig(testAgentParams("n", "pod-a", false))
+		cfg, _ := testBuildAgentConfig("n", "pod-a", false)
 		// The absent key is NOT a permanent gate — the secret mounts
 		// optional:true and may land after pod start; the Syncer
 		// re-checks on every trigger (skip-cycle-and-poll).
@@ -259,8 +260,8 @@ func TestHubsyncGating(t *testing.T) {
 		stubKubeClient(t, func() (kubernetes.Interface, error) {
 			return testutil.FakeKube(), nil
 		})
-		t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", writeEd25519Key(t))
-		cfg, _ := buildAgentConfig(testAgentParams("n", "pod-a", false))
+		t.Setenv(envnames.EnvConvergeSSHKey, writeEd25519Key(t))
+		cfg, _ := testBuildAgentConfig("n", "pod-a", false)
 		got := subsystemNames(cfg)
 		if len(got) != 1 || got[0] != "hubsync" {
 			t.Fatalf("subsystems=%v want [hubsync]", got)
@@ -271,8 +272,8 @@ func TestHubsyncGating(t *testing.T) {
 		stubKubeClient(t, func() (kubernetes.Interface, error) {
 			return nil, errors.New("no config")
 		})
-		t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", writeEd25519Key(t))
-		cfg, _ := buildAgentConfig(testAgentParams("n", "pod-a", false))
+		t.Setenv(envnames.EnvConvergeSSHKey, writeEd25519Key(t))
+		cfg, _ := testBuildAgentConfig("n", "pod-a", false)
 		for _, n := range subsystemNames(cfg) {
 			if n == "hubsync" {
 				t.Fatal("hubsync enabled despite client error")
@@ -284,8 +285,8 @@ func TestHubsyncGating(t *testing.T) {
 		stubKubeClient(t, func() (kubernetes.Interface, error) {
 			return testutil.FakeKube(), nil
 		})
-		t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", writeEd25519Key(t))
-		cfg, _ := buildAgentConfig(testAgentParams("n", "pod-a", true))
+		t.Setenv(envnames.EnvConvergeSSHKey, writeEd25519Key(t))
+		cfg, _ := testBuildAgentConfig("n", "pod-a", true)
 		for _, n := range subsystemNames(cfg) {
 			if n == "hubsync" {
 				t.Fatal("hubsync ran in standalone mode")

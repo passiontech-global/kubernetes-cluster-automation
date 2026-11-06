@@ -3,12 +3,14 @@ package hostconfig
 import (
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 )
 
 func TestConfigFromEnv(t *testing.T) {
-	t.Setenv("NODE_HOST_AGENT_NEBULA_CERTS_DIR", "/certs")
-	t.Setenv("NODE_HOST_AGENT_WATCHDOG_SCRIPTS_DIR", "/wd-scripts")
-	t.Setenv("NODE_HOST_AGENT_HOSTCONFIG_INTERVAL", "5m")
+	t.Setenv(envnames.EnvNebulaCertsDir, "/certs")
+	t.Setenv(envnames.EnvWatchdogScriptsDir, "/wd-scripts")
+	t.Setenv(envnames.EnvHostconfigInterval, "5m")
 
 	cfg := ConfigFromEnv(EnvDeps{
 		NodeName: "node-1",

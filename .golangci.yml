@@ -35,43 +35,82 @@ linters:
       # `run ./internal/...` — so the globs use a leading `**/` to
       # cover every form. App scoping comes from the deny `pkg`
       # prefixes, which carry the node-host-agent module path (the
-      # other apps have no internal/platform|internal/agent layout
-      # anyway). The three real invariants (see
+      # other apps have no internal/platform|internal/domain|
+      # internal/agent layout anyway). The invariants (see
       # apps/node-host-agent/AGENTS.md):
+      #   - internal/envnames/** is a leaf: the NODE_HOST_AGENT_*
+      #     contract is const declarations only — it must never
+      #     import another package in the module.
       #   - internal/platform/** is the leaf layer (hoststate,
       #     systemd, ...; envx/logx moved out to libs/hostkit): it
-      #     must never import the runtime or domain layers above it.
+      #     must never import the layers above it.
+      #   - internal/domain/** holds the importable domain libs
+      #     shared by subsystems and ops (etcdmaint, eventpurge):
+      #     it may use platform/hostkit but must not import
+      #     subsystem, ops, agent, or cmd.
       #   - internal/agent/** is the runtime (metrics/probe servers +
       #     subsystem supervisor): it must not import the domain
       #     layers either — subsystems get wired in cmd/agent.
+      #   - internal/subsystem/** must not import internal/ops/**:
+      #     ops are one-shot Cmd wrappers; logic shared with a
+      #     subsystem lives in internal/domain or the subsystem
+      #     itself. The reverse direction stays allowed — ops
+      #     wrappers may import domain libs and subsystems (e.g.
+      #     ops/kinecheckdb wraps subsystem/kinedb).
       #   - libs/hostkit is the shared stdlib-only leaf module: it
       #     must never import back into an app module.
-      # Deliberately NOT denied: internal/subsystem <-> internal/ops
-      # cross-imports are the documented two-way convention (domain
-      # logic usable by both a periodic subsystem and a one-shot op
-      # lives in the lower layer, e.g. ops/kinecheckdb wraps
-      # subsystem/kinedb), and cmd/agent may import anything.
+      # Deliberately NOT denied: ops -> domain and ops -> subsystem
+      # imports (the one-directional half of the old subsystem<->ops
+      # convention), and cmd/agent may import anything.
       # deny `pkg` is a string prefix — `.../internal/subsystem`
       # covers every .../internal/subsystem/* package too.
       rules:
+        nha-envnames-is-leaf:
+          files:
+            - "**/internal/envnames/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent"
+              desc: "internal/envnames is the env-name contract leaf; it must not import any other package in the module"
         nha-platform-is-leaf:
           files:
             - "**/internal/platform/**"
           deny:
             - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem"
               desc: "internal/platform is the leaf layer; subsystem must not be imported from it (push shared logic down into platform)"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain"
+              desc: "internal/platform is the leaf layer; domain must not be imported from it (push shared logic down into platform)"
             - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
               desc: "internal/platform is the leaf layer; the agent runtime must not be imported from it"
             - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops"
               desc: "internal/platform is the leaf layer; ops must not be imported from it (push shared logic down into platform)"
+        nha-domain-no-upward:
+          files:
+            - "**/internal/domain/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem"
+              desc: "internal/domain is below subsystem; shared logic belongs here, not the reverse (domain must not import subsystem)"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops"
+              desc: "internal/domain is below ops; domain libs must not import the Cmd wrappers that consume them"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
+              desc: "internal/domain is a library layer; the agent runtime must not be imported from it"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/cmd"
+              desc: "internal/domain is a library layer; cmd entrypoints must not be imported from it"
         nha-agent-no-domain:
           files:
             - "**/internal/agent/**"
           deny:
             - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem"
               desc: "internal/agent is the runtime layer; subsystems are wired in cmd/agent, not imported here"
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain"
+              desc: "internal/agent is the runtime layer; domain libs are wired in cmd/agent, not imported here"
             - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops"
               desc: "internal/agent is the runtime layer; ops are wired in cmd/agent, not imported here"
+        nha-subsystem-no-ops:
+          files:
+            - "**/internal/subsystem/**"
+          deny:
+            - pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops"
+              desc: "subsystem must not import ops cmd wrappers; shared domain logic lives in internal/domain or the owning subsystem"
         hostkit-is-leaf:
           files:
             - "**/libs/hostkit/**"

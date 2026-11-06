@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
@@ -33,18 +34,18 @@ func testParams(root, node string) EnvParams {
 // two standard locations, and the non-env params pass through.
 func TestDepsFromEnvDefaults(t *testing.T) {
 	for _, k := range []string{
-		"NODE_HOST_AGENT_WATCHDOG_CONF",
-		"NODE_HOST_AGENT_WATCHDOG_STATE_DIR",
-		"NODE_HOST_AGENT_WATCHDOG_LOG",
-		"NODE_HOST_AGENT_JOURNAL_DIRS",
-		"NODE_HOST_AGENT_JOURNAL_UNREADABLE_NEEDED",
-		"NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR",
-		"NODE_HOST_AGENT_TEXTFILE_DIR",
-		"NODE_HOST_AGENT_NODE_NAME",
+		envnames.EnvWatchdogConf,
+		envnames.EnvWatchdogStateDir,
+		envnames.EnvWatchdogLog,
+		envnames.EnvJournalDirs,
+		envnames.EnvJournalUnreadableNeeded,
+		envnames.EnvHostconfigVarsDir,
+		envnames.EnvTextfileDir,
+		envnames.EnvNodeName,
 	} {
 		t.Setenv(k, "") // envx treats empty as unset — hermetic defaults
 	}
-	t.Setenv("NODE_HOST_AGENT_WATCHDOG_CONF",
+	t.Setenv(envnames.EnvWatchdogConf,
 		filepath.Join(t.TempDir(), "absent.conf"))
 
 	d := DepsFromEnv(testParams("/host", "node-a"))
@@ -107,18 +108,18 @@ func TestDepsPathJoin(t *testing.T) {
 // identity — the same knobs land unprefixed on standalone hosts.
 func TestDepsFromEnvStandalonePaths(t *testing.T) {
 	for _, k := range []string{
-		"NODE_HOST_AGENT_WATCHDOG_CONF",
-		"NODE_HOST_AGENT_WATCHDOG_STATE_DIR",
-		"NODE_HOST_AGENT_WATCHDOG_LOG",
-		"NODE_HOST_AGENT_JOURNAL_DIRS",
-		"NODE_HOST_AGENT_JOURNAL_UNREADABLE_NEEDED",
-		"NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR",
-		"NODE_HOST_AGENT_TEXTFILE_DIR",
-		"NODE_HOST_AGENT_NODE_NAME",
+		envnames.EnvWatchdogConf,
+		envnames.EnvWatchdogStateDir,
+		envnames.EnvWatchdogLog,
+		envnames.EnvJournalDirs,
+		envnames.EnvJournalUnreadableNeeded,
+		envnames.EnvHostconfigVarsDir,
+		envnames.EnvTextfileDir,
+		envnames.EnvNodeName,
 	} {
 		t.Setenv(k, "")
 	}
-	t.Setenv("NODE_HOST_AGENT_WATCHDOG_CONF",
+	t.Setenv(envnames.EnvWatchdogConf,
 		filepath.Join(t.TempDir(), "absent.conf"))
 
 	d := DepsFromEnv(testParams("/", "n"))
@@ -135,14 +136,14 @@ func TestDepsFromEnvStandalonePaths(t *testing.T) {
 // (env > flag precedence kept from the old main.go resolution).
 func TestDepsFromEnvOverrides(t *testing.T) {
 	conf := filepath.Join(t.TempDir(), "wd.conf")
-	t.Setenv("NODE_HOST_AGENT_WATCHDOG_CONF", conf)
-	t.Setenv("NODE_HOST_AGENT_WATCHDOG_STATE_DIR", "/x/state")
-	t.Setenv("NODE_HOST_AGENT_WATCHDOG_LOG", "/x/wd.log")
-	t.Setenv("NODE_HOST_AGENT_JOURNAL_DIRS", "/j1, /j2")
-	t.Setenv("NODE_HOST_AGENT_JOURNAL_UNREADABLE_NEEDED", "9")
-	t.Setenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", "/x/vars")
-	t.Setenv("NODE_HOST_AGENT_TEXTFILE_DIR", "/x/textfile")
-	t.Setenv("NODE_HOST_AGENT_NODE_NAME", "env-node")
+	t.Setenv(envnames.EnvWatchdogConf, conf)
+	t.Setenv(envnames.EnvWatchdogStateDir, "/x/state")
+	t.Setenv(envnames.EnvWatchdogLog, "/x/wd.log")
+	t.Setenv(envnames.EnvJournalDirs, "/j1, /j2")
+	t.Setenv(envnames.EnvJournalUnreadableNeeded, "9")
+	t.Setenv(envnames.EnvHostconfigVarsDir, "/x/vars")
+	t.Setenv(envnames.EnvTextfileDir, "/x/textfile")
+	t.Setenv(envnames.EnvNodeName, "env-node")
 
 	d := DepsFromEnv(testParams("/host", "flag-node"))
 

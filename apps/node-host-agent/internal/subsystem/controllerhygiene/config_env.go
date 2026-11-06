@@ -3,6 +3,7 @@ package controllerhygiene
 import (
 	"os"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -71,59 +72,59 @@ func ConfigFromEnv(d EnvDeps) Config {
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
-		envx.DurationKnob("NODE_HOST_AGENT_CONTROLLER_INTERVAL", &cfg.Interval, defaultInterval),
-		envx.StringKnob("NODE_HOST_AGENT_PROC_ROOT", &cfg.ProcRoot, defaultProcRoot),
+		envx.DurationKnob(envnames.EnvControllerInterval, &cfg.Interval, defaultInterval),
+		envx.StringKnob(envnames.EnvProcRoot, &cfg.ProcRoot, defaultProcRoot),
 		// env → wdCfg → package defaults; SelfAPI stays EMPTY when
 		// neither is set (the solo/dead-fallback fences gate on
 		// non-empty — a made-up identity would crown every
 		// unconfigured controller first-hub).
-		envx.OrKnob("NODE_HOST_AGENT_API_SELF", &cfg.Hub.SelfAPI, wd.APISelf),
-		envx.OrKnob("NODE_HOST_AGENT_API_PEER", &cfg.Hub.PeerAPI, wd.APIPeer),
-		envx.OrKnob("NODE_HOST_AGENT_KINE_DB_PROBE", &cfg.Hub.KineDBProbe, wd.KineDBProbe),
-		envx.OrKnob("NODE_HOST_AGENT_SIG13_AUTOFIX", &cfg.Sig13.Mode, wd.Sig13Autofix),
-		envx.IntOrKnob("NODE_HOST_AGENT_STALE_MIN_ERRS", &cfg.Sig13.StaleMinErrs,
+		envx.OrKnob(envnames.EnvAPISelf, &cfg.Hub.SelfAPI, wd.APISelf),
+		envx.OrKnob(envnames.EnvAPIPeer, &cfg.Hub.PeerAPI, wd.APIPeer),
+		envx.OrKnob(envnames.EnvKineDBProbe, &cfg.Hub.KineDBProbe, wd.KineDBProbe),
+		envx.OrKnob(envnames.EnvSig13Autofix, &cfg.Sig13.Mode, wd.Sig13Autofix),
+		envx.IntOrKnob(envnames.EnvStaleMinErrs, &cfg.Sig13.StaleMinErrs,
 			wd.Sig13StaleMinErrs, defaultStaleMinErrs),
-		envx.Int64OrKnob("NODE_HOST_AGENT_GAP_MIN", &cfg.Sig13.GapMin,
+		envx.Int64OrKnob(envnames.EnvGapMin, &cfg.Sig13.GapMin,
 			wd.Sig13GapMin, defaultGapMin),
-		envx.IntOrKnob("NODE_HOST_AGENT_GAP_CYCLES", &cfg.Sig13.GapCycles,
+		envx.IntOrKnob(envnames.EnvGapCycles, &cfg.Sig13.GapCycles,
 			wd.Sig13GapCycles, defaultGapCycles),
-		envx.IntOrKnob("NODE_HOST_AGENT_FROZEN_CYCLES", &cfg.Sig13.FrozenCycles,
+		envx.IntOrKnob(envnames.EnvFrozenCycles, &cfg.Sig13.FrozenCycles,
 			wd.Sig13FrozenCycles, defaultFrozenCycles),
-		envx.IntOrKnob("NODE_HOST_AGENT_SOLO_CYCLES", &cfg.Sig13.SoloCycles,
+		envx.IntOrKnob(envnames.EnvSoloCycles, &cfg.Sig13.SoloCycles,
 			wd.Sig13SoloCycles, defaultSoloCycles),
-		envx.DurOrKnob("NODE_HOST_AGENT_SIG13_MIN_RESTART_S", &cfg.Sig13.MinRestart,
+		envx.DurOrKnob(envnames.EnvSig13MinRestartS, &cfg.Sig13.MinRestart,
 			wd.Sig13MinRestartS, defaultMinRestart),
-		envx.OrKnob("NODE_HOST_AGENT_KINE_TTL_AUTOFIX", &cfg.KineTTL.Mode, wd.KineTTLAutofix),
-		envx.DurOrKnob("NODE_HOST_AGENT_KINE_TTL_MIN_RESTART_S", &cfg.KineTTL.MinRestart,
+		envx.OrKnob(envnames.EnvKineTTLAutofix, &cfg.KineTTL.Mode, wd.KineTTLAutofix),
+		envx.DurOrKnob(envnames.EnvKineTTLMinRestartS, &cfg.KineTTL.MinRestart,
 			wd.KineTTLMinRestartS, defaultTTLMinRestart),
-		envx.DurOrKnob("NODE_HOST_AGENT_KINE_TTL_CTL_RESTART_S", &cfg.KineTTL.CtlRestart,
+		envx.DurOrKnob(envnames.EnvKineTTLCtlRestartS, &cfg.KineTTL.CtlRestart,
 			wd.KineTTLCtlRestartS, defaultTTLCtlRestart),
-		envx.IntOrKnob("NODE_HOST_AGENT_KINE_TTL_REWEDGE_CYCLES", &cfg.KineTTL.RewedgeCycles,
+		envx.IntOrKnob(envnames.EnvKineTTLRewedgeCycles, &cfg.KineTTL.RewedgeCycles,
 			wd.KineTTLRewedgeCycle, defaultTTLRewedgeCycles),
-		envx.OrKnob("NODE_HOST_AGENT_KINE_POOL_AUTOFIX", &cfg.KinePool.Mode, wd.KinePoolAutofix),
-		envx.IntOrKnob("NODE_HOST_AGENT_KINE_POOL_MAX_CONNS", &cfg.KinePool.MaxConns,
+		envx.OrKnob(envnames.EnvKinePoolAutofix, &cfg.KinePool.Mode, wd.KinePoolAutofix),
+		envx.IntOrKnob(envnames.EnvKinePoolMaxConns, &cfg.KinePool.MaxConns,
 			wd.KinePoolMaxConns, defaultPoolMaxConns),
-		envx.IntOrKnob("NODE_HOST_AGENT_KINE_POOL_CYCLES", &cfg.KinePool.Cycles,
+		envx.IntOrKnob(envnames.EnvKinePoolCycles, &cfg.KinePool.Cycles,
 			wd.KinePoolCycles, defaultPoolCycles),
-		envx.DurOrKnob("NODE_HOST_AGENT_KINE_POOL_MIN_RESTART_S", &cfg.KinePool.MinRestart,
+		envx.DurOrKnob(envnames.EnvKinePoolMinRestartS, &cfg.KinePool.MinRestart,
 			wd.KinePoolMinRestartS, defaultPoolMinRestart),
-		envx.OrKnob("NODE_HOST_AGENT_OOMLOOP_AUTOFIX", &cfg.OOMLoop.Mode, wd.OOMLoopAutofix),
-		envx.IntOrKnob("NODE_HOST_AGENT_OOMLOOP_MIN_KILLS", &cfg.OOMLoop.MinKills,
+		envx.OrKnob(envnames.EnvOomloopAutofix, &cfg.OOMLoop.Mode, wd.OOMLoopAutofix),
+		envx.IntOrKnob(envnames.EnvOomloopMinKills, &cfg.OOMLoop.MinKills,
 			wd.OOMLoopMinKills, defaultOOMMinKills),
-		envx.DurOrKnob("NODE_HOST_AGENT_OOMLOOP_WINDOW_S", &cfg.OOMLoop.Window,
+		envx.DurOrKnob(envnames.EnvOomloopWindowS, &cfg.OOMLoop.Window,
 			wd.OOMLoopWindowS, defaultOOMWindow),
-		envx.BoolKnob("NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS", &cfg.InsecureTLS, true),
-		envx.BoolKnob("NODE_HOST_AGENT_ENABLE_FEEDER", &cfg.Feeder.Enabled, true),
+		envx.BoolKnob(envnames.EnvControllerInsecureTLS, &cfg.InsecureTLS, true),
+		envx.BoolKnob(envnames.EnvEnableFeeder, &cfg.Feeder.Enabled, true),
 		// NOTIFY_SOCKET is a systemd contract, not a
 		// NODE_HOST_AGENT_* knob — read it directly.
 		{Name: "NOTIFY_SOCKET", Resolve: func(k string) {
 			cfg.Feeder.NotifySocket = os.Getenv(k)
 		}},
 		// PathJoin default — NOT defaultK0sDir, which hardcodes "/host".
-		envx.StringKnob("NODE_HOST_AGENT_K0S_DIR", &cfg.K0sDir,
+		envx.StringKnob(envnames.EnvK0sDir, &cfg.K0sDir,
 			d.PathJoin("/var/lib/k0s")),
-		envx.StringKnob("NODE_HOST_AGENT_ETCD_ENDPOINT", &cfg.EtcdGuard.Endpoint, defaultEtcdEndpoint),
-		envx.Int64Knob("NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT", &cfg.EtcdGuard.DBSizeLimit, 0),
+		envx.StringKnob(envnames.EnvEtcdEndpoint, &cfg.EtcdGuard.Endpoint, defaultEtcdEndpoint),
+		envx.Int64Knob(envnames.EnvEtcdDBSizeLimit, &cfg.EtcdGuard.DBSizeLimit, 0),
 	})
 	return cfg
 }

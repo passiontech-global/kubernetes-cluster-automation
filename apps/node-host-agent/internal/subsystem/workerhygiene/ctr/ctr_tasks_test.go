@@ -322,7 +322,7 @@ func waitingPod(name, ns, uid, image, imageID, reason, msg string) *corev1.Pod {
 func TestCtrImageHealerRemovesCorruptedImage(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -352,7 +352,7 @@ func TestCtrImageHealerRemovesCorruptedImage(t *testing.T) {
 func TestCtrImageHealerReasonAndMessageFilter(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -394,7 +394,7 @@ func TestCtrImageHealerReasonAndMessageFilter(t *testing.T) {
 func TestCtrImageHealerAllSignatures(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -426,7 +426,7 @@ func TestCtrImageHealerAllSignatures(t *testing.T) {
 func TestCtrImageHealerDedupesAndRateLimits(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -461,7 +461,7 @@ func TestCtrImageHealerDedupesAndRateLimits(t *testing.T) {
 
 func TestCtrImageHealerRmErrorKeepsGoing(t *testing.T) {
 	e := fixture(t)
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		if img == "docker.io/library/bad:1" {
 			return errors.New("ctr exploded")
 		}
@@ -510,7 +510,7 @@ func TestCtrImageHealerDefaultSeamUsesSystemdExec(t *testing.T) {
 func TestCtrImageHealerAPIFailNoAction(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -568,7 +568,7 @@ func TestNormalizeCRIImageName(t *testing.T) {
 func TestCtrImageHealerNormalizesDockerHubShortName(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -590,7 +590,7 @@ func TestCtrImageHealerNormalizesDockerHubShortName(t *testing.T) {
 func TestCtrImageHealerDigestRefDedupes(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -611,7 +611,7 @@ func TestCtrImageHealerDigestRefDedupes(t *testing.T) {
 func TestCtrImageHealerTagPlusDigestStripsTag(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -633,7 +633,7 @@ func TestCtrImageHealerTagPlusDigestStripsTag(t *testing.T) {
 func TestCtrImageHealerPrivateRegistryUntouched(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -659,7 +659,7 @@ func TestCtrImageHealerPrivateRegistryUntouched(t *testing.T) {
 func TestCtrImageHealerCorruptLayerSignatures(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -691,7 +691,7 @@ func TestCtrImageHealerCorruptLayerSignatures(t *testing.T) {
 func TestCtrImageHealerExecFormatOncePerImage(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -725,7 +725,7 @@ func TestCtrImageHealerExecFormatOncePerImage(t *testing.T) {
 func TestCtrImageHealerExecFormatPerRef(t *testing.T) {
 	e := fixture(t)
 	var removed []string
-	e.H.Cfg.Seams.CtrRmImage = func(_ context.Context, img string) error {
+	e.H.Cfg.Seams.Ctr.CtrRmImage = func(_ context.Context, img string) error {
 		removed = append(removed, img)
 		return nil
 	}
@@ -846,7 +846,7 @@ func TestCtrIngestGCFailedScanRetriesNextCycle(t *testing.T) {
 func TestCtrIngestGCBavailOverBlocksSaturates(t *testing.T) {
 	e := fixture(t)
 	e.SDReply["is-active k0sworker.service"] = "active"
-	e.H.Cfg.Seams.StatfsFn = func(_ string, st *unix.Statfs_t) error {
+	e.H.Cfg.Seams.Host.StatfsFn = func(_ string, st *unix.Statfs_t) error {
 		st.Blocks, st.Bavail = 100, 120 // free > total
 		return nil
 	}

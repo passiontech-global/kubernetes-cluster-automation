@@ -64,6 +64,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // Defaults mirror the shell modules + DaemonSet host mounts.
@@ -149,7 +150,7 @@ type Config struct {
 	NebulaDirectTCPPorts []int
 
 	// Seams — nil gets production defaults.
-	nowFn func() time.Time
+	nowFn timex.Clock
 	// runHostCmd executes a host binary (ip, ping): hostexec NSNet —
 	// nsenter -t 1 -n -- <argv> when HostRoot != "/", plain exec on
 	// the host itself. Netns only — the binaries are shipped in the
@@ -246,7 +247,7 @@ func (c *Config) applyDefaults() {
 		c.NebulaDirectTCPPorts = defaultNebulaDirectTCPPorts
 	}
 	if c.nowFn == nil {
-		c.nowFn = time.Now
+		c.nowFn = timex.SystemClock
 	}
 	// Both host-exec defaults share one platform/hostexec Runner —
 	// the single nsenter seam: NSNet for binaries shipped in the

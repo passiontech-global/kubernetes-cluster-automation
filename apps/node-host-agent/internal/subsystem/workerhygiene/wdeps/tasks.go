@@ -49,7 +49,7 @@ func (d *Deps) ProbeHTTPSeries(ctx context.Context, url string,
 	attempts int, timeout, gap time.Duration) error {
 	var last error
 	for i := 0; i < attempts; i++ {
-		last = d.Cfg.Seams.ProbeHTTP(ctx, url, timeout)
+		last = d.Cfg.Seams.Probe.ProbeHTTP(ctx, url, timeout)
 		if last == nil {
 			return nil
 		}
@@ -65,17 +65,17 @@ func (d *Deps) ProbeHTTPSeries(ctx context.Context, url string,
 }
 
 // PidLive is procfs.FS.Live bound to this subsystem's KillFn seam —
-// d.Cfg.Seams.KillFn is read at call time because tests re-stub it
+// d.Cfg.Seams.Host.KillFn is read at call time because tests re-stub it
 // after New returns.
 func (d *Deps) PidLive(pid int) bool {
-	return d.Proc.Live(pid, d.Cfg.Seams.KillFn)
+	return d.Proc.Live(pid, d.Cfg.Seams.Host.KillFn)
 }
 
 // ProcAge is procfs.FS.Age bound to the NowFn seam (tests re-stub
-// h.Cfg.Seams.NowFn after New — the Deps field promotes through the
+// h.Cfg.Seams.Host.NowFn after New — the Deps field promotes through the
 // Hygiene embed).
 func (d *Deps) ProcAge(pid int) time.Duration {
-	return d.Proc.Age(pid, d.Cfg.Seams.NowFn())
+	return d.Proc.Age(pid, d.Cfg.Seams.Host.NowFn())
 }
 
 // PidsWithCmdline returns pids whose joined cmdline contains sub —

@@ -3,6 +3,7 @@ package nodereporter
 import (
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -34,8 +35,8 @@ func ConfigFromEnv(d EnvDeps) Config {
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
-		envx.DurationKnob("NODE_HOST_AGENT_REPORTER_INTERVAL", &cfg.Interval, defaultInterval),
-		envx.StringKnob("NODE_HOST_AGENT_EVENT_NAMESPACE", &cfg.EventNamespace, defaultEventNamespace),
+		envx.DurationKnob(envnames.EnvReporterInterval, &cfg.Interval, defaultInterval),
+		envx.StringKnob(envnames.EnvEventNamespace, &cfg.EventNamespace, defaultEventNamespace),
 	})
 	return cfg
 }

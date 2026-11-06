@@ -6,6 +6,7 @@ package wdeps
 import (
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -32,8 +33,8 @@ func (t *TeardownConfig) applyDefaults() {
 // thresholds and the per-cycle force-delete cap.
 func (t *TeardownConfig) envKnobs() []envx.Knob {
 	return []envx.Knob{
-		envx.DurationKnob("NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE", &t.StuckDeleteAge, defaultStuckDeleteAge),
-		envx.DurationKnob("NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE", &t.StuckWedgeAge, defaultStuckWedgeAge),
-		envx.IntKnob("NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE", &t.MaxForceDelete, defaultMaxForceDelete),
+		envx.DurationKnob(envnames.EnvHygieneStuckDeleteAge, &t.StuckDeleteAge, defaultStuckDeleteAge),
+		envx.DurationKnob(envnames.EnvHygieneStuckWedgeAge, &t.StuckWedgeAge, defaultStuckWedgeAge),
+		envx.IntKnob(envnames.EnvHygieneMaxForceDelete, &t.MaxForceDelete, defaultMaxForceDelete),
 	}
 }

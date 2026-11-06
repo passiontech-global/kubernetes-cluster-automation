@@ -194,7 +194,7 @@ func ParseCiliumBPFMaps(body []byte) map[string][2]int64 {
 // is inconclusive (the cilium checks' keep-state rule) — the latch
 // is neither entered nor cleared on missing evidence.
 func (c *CiliumCheck) CheckBPFMaps(ctx context.Context) {
-	body, err := c.d.Cfg.Seams.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/map")
+	body, err := c.d.Cfg.Seams.Cilium.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/map")
 	if err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-bpf-maps map query on %s failed: %v — inconclusive, keeping state",

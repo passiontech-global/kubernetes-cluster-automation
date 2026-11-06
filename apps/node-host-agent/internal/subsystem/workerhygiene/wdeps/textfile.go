@@ -63,7 +63,7 @@ func (d *Deps) WalkBytes(root string) (total int64, truncated bool) {
 // the ST2 removal watermark — statfs through the injectable seam.
 func (d *Deps) DiskUsageAboveWatermark(dir string) bool {
 	var st unix.Statfs_t
-	if err := d.Cfg.Seams.StatfsFn(dir, &st); err != nil || st.Blocks == 0 {
+	if err := d.Cfg.Seams.Host.StatfsFn(dir, &st); err != nil || st.Blocks == 0 {
 		return false // can't measure → don't remove (fail closed)
 	}
 	used := 1.0 - float64(st.Bavail)/float64(st.Blocks)
@@ -82,7 +82,7 @@ func (d *Deps) PromTextfileDir() string {
 	if PromTextfileDirOverride != "" {
 		return PromTextfileDirOverride
 	}
-	return filepath.Join(filepath.Dir(d.Cfg.Disk.K0sDataDir),
+	return filepath.Join(filepath.Dir(d.Cfg.K0sDataDir),
 		"node-exporter", "textfile")
 }
 

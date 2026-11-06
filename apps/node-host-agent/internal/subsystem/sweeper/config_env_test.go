@@ -4,16 +4,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestConfigFromEnv(t *testing.T) {
-	t.Setenv("NODE_HOST_AGENT_SWEEP_BASE_DIR", "/data/openebs")
-	t.Setenv("NODE_HOST_AGENT_SWEEP_MIN_AGE", "2h")
-	t.Setenv("NODE_HOST_AGENT_SWEEP_MAX_DELETE", "7")
-	t.Setenv("NODE_HOST_AGENT_SWEEP_INTERVAL", "30m")
-	t.Setenv("NODE_HOST_AGENT_MOUNTS_FILE", "/host/proc/mounts")
-	t.Setenv("NODE_HOST_AGENT_REQUEST_TIMEOUT", "5s")
+	t.Setenv(envnames.EnvSweepBaseDir, "/data/openebs")
+	t.Setenv(envnames.EnvSweepMinAge, "2h")
+	t.Setenv(envnames.EnvSweepMaxDelete, "7")
+	t.Setenv(envnames.EnvSweepInterval, "30m")
+	t.Setenv(envnames.EnvMountsFile, "/host/proc/mounts")
+	t.Setenv(envnames.EnvRequestTimeout, "5s")
 
 	cs := testutil.FakeKube()
 	cfg := ConfigFromEnv(EnvDeps{Client: cs})

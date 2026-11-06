@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 )
 
@@ -33,13 +34,13 @@ func Cmd(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("converge-once", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	varsDir := fs.String("vars-dir",
-		getenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", "/etc/node-host-agent/vars"),
+		getenv(envnames.EnvHostconfigVarsDir, "/etc/node-host-agent/vars"),
 		"vars dir holding defaults.yaml/cluster.yaml/interdc_nodes.yaml")
 	nodeName := fs.String("node-name",
-		getenv("NODE_HOST_AGENT_NODE_NAME", getenv("NODE_NAME", "")),
+		getenv(envnames.EnvNodeName, getenv("NODE_NAME", "")),
 		"registry node name (default: OS hostname)")
 	certsDir := fs.String("nebula-certs-dir",
-		getenv("NODE_HOST_AGENT_NEBULA_CERTS_DIR", "/etc/node-host-agent/nebula-certs"),
+		getenv(envnames.EnvNebulaCertsDir, "/etc/node-host-agent/nebula-certs"),
 		"nebula cert dir (hubsync pushes to /etc/node-host-agent/nebula-certs)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

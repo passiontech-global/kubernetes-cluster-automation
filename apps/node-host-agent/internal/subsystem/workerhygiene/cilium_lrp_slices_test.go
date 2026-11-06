@@ -18,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
@@ -71,12 +72,12 @@ func agentKilled(e *env, pid int) bool {
 func TestCheckCiliumLRPDesyncViaEndpointSlices(t *testing.T) {
 	e := fixture(t, kubeDNSSlice(ptr.To(true)))
 	lrpSliceFixture(t, e)
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
 	if agentKilled(e, 4343) {
 		t.Fatal("agent killed before ConsecNeeded desync cycles")
 	}
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
 	if !agentKilled(e, 4343) {
 		t.Fatal("agent not killed on slice-confirmed desync")
@@ -98,7 +99,7 @@ func TestCheckCiliumLRPSliceNotReadyNoDesync(t *testing.T) {
 		})
 	lrpSliceFixture(t, e)
 	for i := 0; i < 3; i++ {
-		e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+		wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 			APIOK: true, WorkerActive: true})
 	}
 	if agentKilled(e, 4343) {
@@ -111,9 +112,9 @@ func TestCheckCiliumLRPSliceNotReadyNoDesync(t *testing.T) {
 func TestCheckCiliumLRPSliceNilReadyCounts(t *testing.T) {
 	e := fixture(t, kubeDNSSlice(nil))
 	lrpSliceFixture(t, e)
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
 	if !agentKilled(e, 4343) {
 		t.Fatal("nil-Ready endpoint not counted as ready")
@@ -131,9 +132,9 @@ func TestCheckCiliumLRPDesyncEndpointsFallback(t *testing.T) {
 		}},
 	})
 	lrpSliceFixture(t, e)
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
 	if !agentKilled(e, 4343) {
 		t.Fatal("endpoints fallback not honoured — no desync kill")

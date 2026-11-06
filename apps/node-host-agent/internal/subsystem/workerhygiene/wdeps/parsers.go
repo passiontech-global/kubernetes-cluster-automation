@@ -1,5 +1,5 @@
 // parsers.go — the response parsers the Seams production defaults
-// need: Seams.ApplyDefaults wires the WG allowed-ips counter and
+// need: Seams.applyDefaults wires the WG allowed-ips counter and
 // the cilium encrypt-peers fallback, and both parse command/API
 // output. They live here (not in cilium/) because wdeps cannot
 // import a domain package that itself imports wdeps.

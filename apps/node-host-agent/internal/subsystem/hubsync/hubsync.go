@@ -58,6 +58,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 const (
@@ -141,7 +142,7 @@ type Config struct {
 	SpawnFn func(ctx context.Context, name string, fn func(context.Context)) (stop func())
 
 	// NowFn supplies wall time — seam for tests.
-	NowFn func() time.Time
+	NowFn timex.Clock
 	// Log overrides the default slog logger — seam for tests.
 	Log *slog.Logger
 }
@@ -208,7 +209,7 @@ func (c *Config) applyDefaults() {
 		c.TargetTimeout = defaultTargetTimeout
 	}
 	if c.NowFn == nil {
-		c.NowFn = time.Now
+		c.NowFn = timex.SystemClock
 	}
 	if c.Log == nil {
 		c.Log = logger()

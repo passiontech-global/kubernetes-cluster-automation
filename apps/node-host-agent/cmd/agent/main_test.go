@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 )
 
 // TestKubeClientOutOfCluster exercises the KUBECONFIG fallback. The
@@ -125,16 +126,16 @@ func TestMainRunShutsDownOnSIGTERM(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"GO_HELPER_PROCESS_RUN=1",
 		// Hermetic: no kube client attempts, no host-path probes.
-		"NODE_HOST_AGENT_ENABLE_SWEEPER=false",
-		"NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE=false",
-		"NODE_HOST_AGENT_ENABLE_APIPROBER=false",
-		"NODE_HOST_AGENT_ENABLE_HOSTMETRICS=false",
-		"NODE_HOST_AGENT_ENABLE_HYGIENE=false",
-		"NODE_HOST_AGENT_ENABLE_NETHEALTH=false",
-		"NODE_HOST_AGENT_ENABLE_REPORTER=false",
-		"NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE=false",
-		"NODE_HOST_AGENT_ENABLE_HOSTCONFIG=false",
-		"NODE_HOST_AGENT_ENABLE_JANITOR=false",
+		envnames.EnvEnableSweeper+"=false",
+		envnames.EnvEnableConcourseCache+"=false",
+		envnames.EnvEnableApiprober+"=false",
+		envnames.EnvEnableHostmetrics+"=false",
+		envnames.EnvEnableHygiene+"=false",
+		envnames.EnvEnableNethealth+"=false",
+		envnames.EnvEnableReporter+"=false",
+		envnames.EnvEnableControllerhygiene+"=false",
+		envnames.EnvEnableHostconfig+"=false",
+		envnames.EnvEnableJanitor+"=false",
 		"KUBERNETES_SERVICE_HOST=",
 		"KUBERNETES_SERVICE_PORT=",
 		"KUBECONFIG=",
@@ -200,16 +201,16 @@ func TestMainRunListenerError(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=^TestMainRunListenerError$")
 	cmd.Env = append(os.Environ(),
 		"GO_HELPER_PROCESS_BADADDR=1",
-		"NODE_HOST_AGENT_ENABLE_SWEEPER=false",
-		"NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE=false",
-		"NODE_HOST_AGENT_ENABLE_APIPROBER=false",
-		"NODE_HOST_AGENT_ENABLE_HOSTMETRICS=false",
-		"NODE_HOST_AGENT_ENABLE_HYGIENE=false",
-		"NODE_HOST_AGENT_ENABLE_NETHEALTH=false",
-		"NODE_HOST_AGENT_ENABLE_REPORTER=false",
-		"NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE=false",
-		"NODE_HOST_AGENT_ENABLE_HOSTCONFIG=false",
-		"NODE_HOST_AGENT_ENABLE_JANITOR=false",
+		envnames.EnvEnableSweeper+"=false",
+		envnames.EnvEnableConcourseCache+"=false",
+		envnames.EnvEnableApiprober+"=false",
+		envnames.EnvEnableHostmetrics+"=false",
+		envnames.EnvEnableHygiene+"=false",
+		envnames.EnvEnableNethealth+"=false",
+		envnames.EnvEnableReporter+"=false",
+		envnames.EnvEnableControllerhygiene+"=false",
+		envnames.EnvEnableHostconfig+"=false",
+		envnames.EnvEnableJanitor+"=false",
 		"KUBERNETES_SERVICE_HOST=",
 		"KUBERNETES_SERVICE_PORT=",
 		"KUBECONFIG=",
@@ -232,34 +233,36 @@ func TestMainRunListenerError(t *testing.T) {
 func disableAllSubsystems(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
-		"NODE_HOST_AGENT_ENABLE_SWEEPER",
-		"NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE",
-		"NODE_HOST_AGENT_ENABLE_APIPROBER",
-		"NODE_HOST_AGENT_ENABLE_HOSTMETRICS",
-		"NODE_HOST_AGENT_ENABLE_HYGIENE",
-		"NODE_HOST_AGENT_ENABLE_NETHEALTH",
-		"NODE_HOST_AGENT_ENABLE_REPORTER",
-		"NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE",
-		"NODE_HOST_AGENT_ENABLE_HOSTCONFIG",
-		"NODE_HOST_AGENT_ENABLE_JANITOR",
+		envnames.EnvEnableSweeper,
+		envnames.EnvEnableConcourseCache,
+		envnames.EnvEnableApiprober,
+		envnames.EnvEnableHostmetrics,
+		envnames.EnvEnableHygiene,
+		envnames.EnvEnableNethealth,
+		envnames.EnvEnableReporter,
+		envnames.EnvEnableControllerhygiene,
+		envnames.EnvEnableHostconfig,
+		envnames.EnvEnableJanitor,
 	} {
 		t.Setenv(k, "false")
 	}
 }
 
-// testAgentParams builds the params most subtests share — ephemeral
-// addrs, version "v", namespace "ns" — with node/pod/standalone
-// varying per subtest.
-func testAgentParams(nodeName, podName string, standalone bool) agentParams {
-	return agentParams{
-		nodeName:       nodeName,
-		podName:        podName,
-		namespace:      "ns",
-		version:        "v",
-		metricsAddr:    "127.0.0.1:0",
-		probeAddr:      "127.0.0.1:0",
-		standaloneFlag: standalone,
-	}
+// testBuildAgentConfig runs buildAgentConfig with the inputs most
+// subtests share — ephemeral addrs, version "v", namespace "ns" —
+// with node/pod/standalone varying per subtest. standaloneFlag
+// stays a separate parameter: it is a CLI switch, not an
+// agent.Config field.
+func testBuildAgentConfig(nodeName, podName string,
+	standalone bool) (agent.Config, wireReport) {
+	return buildAgentConfig(agent.Config{
+		NodeName:    nodeName,
+		PodName:     podName,
+		Namespace:   "ns",
+		Version:     "v",
+		MetricsAddr: "127.0.0.1:0",
+		ProbeAddr:   "127.0.0.1:0",
+	}, standalone)
 }
 
 func subsystemNames(cfg agent.Config) []string {

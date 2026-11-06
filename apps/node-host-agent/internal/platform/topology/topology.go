@@ -17,14 +17,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // Config carries paths + node identity.
 type Config struct {
 	VarsDir  string // dir containing the four vars files (+ nebula certs)
 	NodeName string // registry key = OS hostname = k8s node name
-	NowFn    func() time.Time
+	NowFn    timex.Clock
 }
 
 // ---- derived topology ----

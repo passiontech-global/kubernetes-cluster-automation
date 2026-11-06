@@ -1,6 +1,7 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -42,37 +43,37 @@ func ConfigFromEnv(d EnvDeps) Config {
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
-		envx.StringKnob("NODE_HOST_AGENT_WATCHDOG_LOG_FILE", &cfg.WatchdogLogFile,
+		envx.StringKnob(envnames.EnvWatchdogLogFile, &cfg.WatchdogLogFile,
 			d.WatchdogLogFile),
-		envx.StringKnob("NODE_HOST_AGENT_KEY_USERS_FILE", &cfg.KeyUsersFile,
+		envx.StringKnob(envnames.EnvKeyUsersFile, &cfg.KeyUsersFile,
 			defaultKeyUsersFile),
-		envx.DurationKnob("NODE_HOST_AGENT_LATCH_INTERVAL", &cfg.LatchInterval,
+		envx.DurationKnob(envnames.EnvLatchInterval, &cfg.LatchInterval,
 			defaultLatchInterval),
-		envx.StringKnob("NODE_HOST_AGENT_SYS_CLASS_NET", &cfg.SysClassNet, defaultSysClassNet),
-		envx.StringKnob("NODE_HOST_AGENT_NEBULA_IFACE", &cfg.NebulaIface, defaultNebulaIface),
-		envx.StringKnob("NODE_HOST_AGENT_HOST_ROUTE_FILE", &cfg.RouteFile, defaultRouteFile),
-		envx.StringKnob("NODE_HOST_AGENT_K0S_CONFIG", &cfg.K0sConfigFile,
+		envx.StringKnob(envnames.EnvSysClassNet, &cfg.SysClassNet, defaultSysClassNet),
+		envx.StringKnob(envnames.EnvNebulaIface, &cfg.NebulaIface, defaultNebulaIface),
+		envx.StringKnob(envnames.EnvHostRouteFile, &cfg.RouteFile, defaultRouteFile),
+		envx.StringKnob(envnames.EnvK0sConfig, &cfg.K0sConfigFile,
 			defaultK0sConfigFile),
-		envx.StringKnob("NODE_HOST_AGENT_K0S_UNIT", &cfg.K0sUnitFile,
+		envx.StringKnob(envnames.EnvK0sUnit, &cfg.K0sUnitFile,
 			hostPath(defaultK0sUnitFile)),
-		envx.StringKnob("NODE_HOST_AGENT_NEBULA_CERT", &cfg.NebulaCertFile,
+		envx.StringKnob(envnames.EnvNebulaCert, &cfg.NebulaCertFile,
 			hostPath("/etc/nebula/"+d.NebulaNet+"/host.crt")),
 		// empty env → nil → applyDefaults' expected key set.
-		envx.ListKnob("NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS", &cfg.ExpectedKCMArgs),
-		envx.StringKnob("NODE_HOST_AGENT_PSI_FILE", &cfg.PSIFile, defaultPSIFile),
-		envx.DurationKnob("NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL",
+		envx.ListKnob(envnames.EnvK0sExpectedKcmArgs, &cfg.ExpectedKCMArgs),
+		envx.StringKnob(envnames.EnvPsiFile, &cfg.PSIFile, defaultPSIFile),
+		envx.DurationKnob(envnames.EnvCPUDeliveredInterval,
 			&cfg.CPUDeliveredInterval, defaultCPUDeliveredIn),
 		// W7-H5/H6 telemetry files.
-		envx.StringKnob("NODE_HOST_AGENT_CONNTRACK_STAT_FILE", &cfg.ConntrackStatFile,
+		envx.StringKnob(envnames.EnvConntrackStatFile, &cfg.ConntrackStatFile,
 			defaultConntrackStatFile),
-		envx.StringKnob("NODE_HOST_AGENT_ARP_TABLE_FILE", &cfg.ARPTableFile,
+		envx.StringKnob(envnames.EnvArpTableFile, &cfg.ARPTableFile,
 			defaultARPTableFile),
-		envx.ListKnob("NODE_HOST_AGENT_CGROUP_MEM_UNITS", &cfg.CgroupMemUnits),
+		envx.ListKnob(envnames.EnvCgroupMemUnits, &cfg.CgroupMemUnits),
 		// envList → default-closure: a set env wins verbatim (even an
 		// empty-looking parse is nil → defaults); unset falls back to
 		// the hostPath-joined mount set — NOT defaultFilesystemTargets,
 		// which assumes the "/host" prefix literally.
-		{Name: "NODE_HOST_AGENT_FILESYSTEM_TARGETS", Resolve: func(k string) {
+		{Name: envnames.EnvFilesystemTargets, Resolve: func(k string) {
 			if l := envx.List(k); l != nil {
 				cfg.FilesystemTargets = l
 			} else {

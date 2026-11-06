@@ -174,7 +174,7 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckIOPressure, "abort").Inc()
 		return
 	}
-	now := c.d.Cfg.Seams.NowFn()
+	now := c.d.Cfg.Seams.Host.NowFn()
 	cur := parseDiskstats(data)
 	util, await, maxAwait := 0.0, 0.0, 0.0
 	if c.lastDisk != nil {
@@ -292,12 +292,12 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		// idle (the process only gets the disk when nothing else
 		// wants it). Either failing is logged, never fatal — a pid
 		// can exit mid-sweep.
-		if err := c.d.Cfg.Seams.ReniceFn(pid); err != nil {
+		if err := c.d.Cfg.Seams.Host.ReniceFn(pid); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: io-pressure-throttler renice +19 pid=%d (%s) failed: %v",
 				pid, comm, err))
 		}
-		if err := c.d.Cfg.Seams.IoniceIdleFn(pid); err != nil {
+		if err := c.d.Cfg.Seams.Host.IoniceIdleFn(pid); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: io-pressure-throttler ionice -c3 pid=%d (%s) failed: %v",
 				pid, comm, err))

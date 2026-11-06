@@ -124,7 +124,7 @@ func (c *OverlayFSStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// Budget spent atomically BEFORE acting (lib.sh rate_spend
 	// parity): a failed rm still consumed it.
 	for _, img := range images {
-		if err := c.d.Cfg.Seams.CtrRmImage(ctx, img); err != nil {
+		if err := c.d.Cfg.Seams.Ctr.CtrRmImage(ctx, img); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: overlayfs-stale-mount image rm %s failed: %v", img, err))
 			continue

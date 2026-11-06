@@ -12,8 +12,10 @@ import "time"
 
 const (
 	// kubelet domain (was kubelet.go / kubelet_feeder.go /
-	// kubelet_syncloop.go).
-	defaultKubeletPodsDir = "/host/var/lib/k0s/kubelet/pods"
+	// kubelet_syncloop.go). The shared wiring defaults consumed by
+	// applyWiringDefaults (pods dir, ctr socket, resolv.conf,
+	// k0s data dir, nebula iface) live in config.go instead —
+	// defaultSysClassNet set the precedent.
 	// DefaultKubeletHealthzURL is the kubelet :10250 probe (05).
 	DefaultKubeletHealthzURL  = "https://127.0.0.1:10250/healthz"
 	defaultKubeletWatchMinAge = 15 * time.Minute // shell KUBELET_WATCH_MIN_AGE_S=900
@@ -31,14 +33,12 @@ const (
 	defaultKubeletWdReprobeGap = 3 * time.Second // remediate Gate-0: two probes ~3s apart
 	// G4 fallback when no API backends are configured — the
 	// worker-local api-local-lb listener (k0s haproxy).
-	defaultAPIFallbackURL   = "https://localhost:7443/livez"
-	defaultContainerdSocket = "/host/run/k0s/containerd.sock"
+	defaultAPIFallbackURL = "https://localhost:7443/livez"
 
 	// pods domain (was pod_teardown.go).
 	defaultStuckDeleteAge = 15 * time.Minute // shell STUCK_DELETE_S=900
 	defaultStuckWedgeAge  = 30 * time.Minute // shell STUCK_WEDGE_S=1800
 	defaultMaxForceDelete = 5                // bounds per-cycle churn (shell used 3; 5 keeps parity headroom)
-	defaultHostResolvConf = "/host/etc/resolv.conf"
 
 	// ctr domain (was ctr_tasks.go).
 	defaultCtrTaskRoot     = "/host/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io"
@@ -63,7 +63,6 @@ const (
 	defaultCiliumWG0Iface      = "cilium_wg0"
 	defaultCiliumRuntimeConfig = "/host/run/cilium/state/agent-runtime-config.json"
 	defaultBPFMapHighRatio     = 0.90
-	defaultNebulaIface         = "neb1"
 	// The LRP datapath probe targets the kube-dns ClusterIP — the
 	// CiliumLocalRedirectPolicy's serviceMatcher redirects
 	// 10.96.0.10:53 to the local cache pod, so this exercises the
@@ -75,7 +74,6 @@ const (
 	defaultLocalDNSProbeName = "kubernetes.default.svc.cluster.local"
 
 	// disk domain (was disk_bloat.go).
-	defaultK0sDataDir             = "/host/var/lib/k0s"
 	k0sDiskHighWatermark          = 0.75
 	k0sDiskBloatWatermark         = 0.85
 	k0sDiskBloatCriticalWatermark = 0.92

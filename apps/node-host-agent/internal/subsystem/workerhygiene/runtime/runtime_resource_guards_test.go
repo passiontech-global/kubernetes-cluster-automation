@@ -243,8 +243,8 @@ func TestIOPressureThrottler(t *testing.T) {
 			"   8       1 sda1 500 100 4000 250 50 50 3000 2000 0 1000 3000\n")
 	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "4242", "comm"), "kopia\n")
 	var reniced, ioniced []int
-	h.Cfg.Seams.ReniceFn = func(pid int) error { reniced = append(reniced, pid); return nil }
-	h.Cfg.Seams.IoniceIdleFn = func(pid int) error { ioniced = append(ioniced, pid); return nil }
+	h.Cfg.Seams.Host.ReniceFn = func(pid int) error { reniced = append(reniced, pid); return nil }
+	h.Cfg.Seams.Host.IoniceIdleFn = func(pid int) error { ioniced = append(ioniced, pid); return nil }
 	env := &wdeps.CycleEnv{
 		WorkerActive: true,
 		PidsOnce:     func() []int { return []int{4242} },

@@ -6,6 +6,8 @@ package main
 import (
 	"os"
 	"strings"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 )
 
 // osExecutable is os.Executable as a var — tests stub it to exercise
@@ -21,7 +23,7 @@ var osExecutable = os.Executable
 // cycle on that literal path), and a still-nonexistent resolved path
 // falls back to the DS's fixed /node-host-agent.
 func resolveLocalBinary() string {
-	if v := os.Getenv("NODE_HOST_AGENT_HUBSYNC_LOCAL_BINARY"); v != "" {
+	if v := os.Getenv(envnames.EnvHubsyncLocalBinary); v != "" {
 		return v
 	}
 	const fallback = "/node-host-agent"

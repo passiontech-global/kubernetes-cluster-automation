@@ -59,6 +59,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 const (
@@ -112,7 +113,7 @@ type Config struct {
 	// monitors).
 	killFn func(pid int, sig syscall.Signal) error
 	// nowFn supplies the current time — seam for tests.
-	nowFn func() time.Time
+	nowFn timex.Clock
 }
 
 func (c *Config) applyDefaults() {
@@ -137,7 +138,7 @@ func (c *Config) applyDefaults() {
 		}
 	}
 	if c.nowFn == nil {
-		c.nowFn = time.Now
+		c.nowFn = timex.SystemClock
 	}
 }
 

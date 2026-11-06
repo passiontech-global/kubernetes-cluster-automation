@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -72,7 +73,7 @@ func TestBuildAgentConfigSubsystems(t *testing.T) {
 
 	t.Run("all disabled", func(t *testing.T) {
 		disableAllSubsystems(t)
-		cfg, report := buildAgentConfig(testAgentParams("n", "p", false))
+		cfg, report := testBuildAgentConfig("n", "p", false)
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%d want 0", len(cfg.Subsystems))
 		}
@@ -90,8 +91,8 @@ func TestBuildAgentConfigSubsystems(t *testing.T) {
 	t.Run("sweeper omitted without kubeconfig is not fatal", func(t *testing.T) {
 		disableAllSubsystems(t)
 		t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "absent"))
-		t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "true")
-		cfg, _ := buildAgentConfig(testAgentParams("n", "p", false))
+		t.Setenv(envnames.EnvEnableSweeper, "true")
+		cfg, _ := testBuildAgentConfig("n", "p", false)
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%d want 0 (sweeper skipped, not fatal)", len(cfg.Subsystems))
 		}
@@ -122,8 +123,8 @@ users:
 			t.Fatal(err)
 		}
 		t.Setenv("KUBECONFIG", kubeconfig)
-		t.Setenv("NODE_HOST_AGENT_ENABLE_SWEEPER", "true")
-		cfg, _ := buildAgentConfig(testAgentParams("n", "p", false))
+		t.Setenv(envnames.EnvEnableSweeper, "true")
+		cfg, _ := testBuildAgentConfig("n", "p", false)
 		// hubsync joins: with a working client it is always wired in
 		// pod mode (it polls for the converge key itself).
 		if names := subsystemNames(cfg); len(names) != 2 ||
@@ -136,8 +137,8 @@ users:
 		disableAllSubsystems(t)
 		// "auto" is the production default — the prober enables
 		// itself without a socket gate.
-		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto")
-		cfg, report := buildAgentConfig(testAgentParams("n", "p", false))
+		t.Setenv(envnames.EnvEnableApiprober, "auto")
+		cfg, report := testBuildAgentConfig("n", "p", false)
 		if slices.Contains(report.Off, "apiprober") {
 			t.Fatalf("apiprober resolved off want on (auto default): %+v", report)
 		}
@@ -152,8 +153,8 @@ users:
 		// (BUG-H5) runs as a subsystem driving the latch ticker —
 		// latches can't ride scrape-time Collect() when Prometheus
 		// goes dark.
-		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTMETRICS", "true")
-		cfg, _ := buildAgentConfig(testAgentParams("n", "p", false))
+		t.Setenv(envnames.EnvEnableHostmetrics, "true")
+		cfg, _ := testBuildAgentConfig("n", "p", false)
 		if len(cfg.Subsystems) != 1 || cfg.Subsystems[0].Name() != "hostmetrics" {
 			t.Fatalf("subsystems=%v want [hostmetrics]", subsystemNames(cfg))
 		}
@@ -164,9 +165,9 @@ users:
 
 	t.Run("apiprober invalid mode is not fatal", func(t *testing.T) {
 		disableAllSubsystems(t)
-		t.Setenv("NODE_HOST_AGENT_ENABLE_APIPROBER", "auto")
-		t.Setenv("NODE_HOST_AGENT_APIPROBER_MODE", "bogus")
-		cfg, report := buildAgentConfig(testAgentParams("n", "p", false))
+		t.Setenv(envnames.EnvEnableApiprober, "auto")
+		t.Setenv(envnames.EnvApiproberMode, "bogus")
+		cfg, report := testBuildAgentConfig("n", "p", false)
 		// Resolved ON (auto) but Build failed — that is exactly the
 		// skipped bucket the startup log reports.
 		if !slices.Contains(report.Skipped, "apiprober") {
@@ -181,8 +182,8 @@ users:
 		disableAllSubsystems(t)
 		// CONCOURSE_CACHE default true; pure host-fs, no kube client
 		// required.
-		t.Setenv("NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE", "true")
-		cfg, _ := buildAgentConfig(testAgentParams("n", "p", false))
+		t.Setenv(envnames.EnvEnableConcourseCache, "true")
+		cfg, _ := testBuildAgentConfig("n", "p", false)
 		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "concourse-cache" {
 			t.Fatalf("subsystems=%v want [concourse-cache]", names)
 		}
@@ -191,8 +192,8 @@ users:
 	t.Run("nethealth default enabled without kube client", func(t *testing.T) {
 		disableAllSubsystems(t)
 		// NETHEALTH default true; no kube client required.
-		t.Setenv("NODE_HOST_AGENT_ENABLE_NETHEALTH", "true")
-		cfg, _ := buildAgentConfig(testAgentParams("n", "p", false))
+		t.Setenv(envnames.EnvEnableNethealth, "true")
+		cfg, _ := testBuildAgentConfig("n", "p", false)
 		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "nethealth" {
 			t.Fatalf("subsystems=%v want [nethealth]", names)
 		}
@@ -202,8 +203,8 @@ users:
 		disableAllSubsystems(t)
 		// "auto" is the production default; no k0scontroller.service
 		// under the test host root → stays off.
-		t.Setenv("NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE", "auto")
-		cfg, _ := buildAgentConfig(testAgentParams("n", "p", false))
+		t.Setenv(envnames.EnvEnableControllerhygiene, "auto")
+		cfg, _ := testBuildAgentConfig("n", "p", false)
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%v want [] (no k0scontroller unit)", subsystemNames(cfg))
 		}
@@ -213,8 +214,8 @@ users:
 		disableAllSubsystems(t)
 		// "auto" is the production default; the default vars dir
 		// carries no defaults.yaml in the test environment → off.
-		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTCONFIG", "auto")
-		cfg, _ := buildAgentConfig(testAgentParams("n", "p", false))
+		t.Setenv(envnames.EnvEnableHostconfig, "auto")
+		cfg, _ := testBuildAgentConfig("n", "p", false)
 		if len(cfg.Subsystems) != 0 {
 			t.Fatalf("subsystems=%v want [] (no vars dir)", subsystemNames(cfg))
 		}
@@ -227,9 +228,9 @@ users:
 			[]byte("{}\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		t.Setenv("NODE_HOST_AGENT_ENABLE_HOSTCONFIG", "auto")
-		t.Setenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", varsDir)
-		cfg, _ := buildAgentConfig(testAgentParams("n", "p", false))
+		t.Setenv(envnames.EnvEnableHostconfig, "auto")
+		t.Setenv(envnames.EnvHostconfigVarsDir, varsDir)
+		cfg, _ := testBuildAgentConfig("n", "p", false)
 		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "hostconfig" {
 			t.Fatalf("subsystems=%v want [hostconfig]", names)
 		}

@@ -4,13 +4,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
 func TestConfigFromEnv(t *testing.T) {
-	t.Setenv("NODE_HOST_AGENT_JANITOR_INTERVAL", "2m")
-	t.Setenv("NODE_HOST_AGENT_JANITOR_LATCH_MAX_AGE", "48h")
-	t.Setenv("NODE_HOST_AGENT_PROC_ROOT", "/host/proc")
+	t.Setenv(envnames.EnvJanitorInterval, "2m")
+	t.Setenv(envnames.EnvJanitorLatchMaxAge, "48h")
+	t.Setenv(envnames.EnvProcRoot, "/host/proc")
 
 	d := EnvDeps{
 		Systemd:          systemd.New(systemd.Config{HostRoot: "/"}),

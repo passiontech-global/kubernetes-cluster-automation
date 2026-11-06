@@ -59,17 +59,17 @@ type Fixture struct {
 	ProcDir     string // ProcRoot — fake /proc
 	CtrDir      string // CtrTaskRoot — containerd task dirs
 	SbDir       string // SandboxCtlRoot
-	ResolvConf  string // Net.HostResolvConf
+	ResolvConf  string // HostResolvConf
 	UnitFile    string // K0sWorkerUnitFile — the worker gate
-	KubepodsDir string // Kubelet.PodsDir
+	KubepodsDir string // PodsDir
 	IngestDir   string // Ctr.IngestDir
-	SysNet      string // Net.SysClassNet
+	SysNet      string // SysClassNet
 	CiliumRt    string // Cilium.RuntimeConfig
 	JDir        string // Journal.Dirs[0]
 
 	Live   map[int]bool // pids KillFn(0) reports alive
 	Kills  []KillRecord
-	Now    time.Time  // Cfg.Seams.NowFn reads this — advance to age budgets
+	Now    time.Time  // Cfg.Seams.Host.NowFn reads this — advance to age budgets
 	SDCmds [][]string // systemd fake argv log
 	// SDHook, when set, runs inside sdRun before the reply lookup —
 	// tests advance the fake clock here to simulate a slow host call
@@ -185,24 +185,25 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 	f.SDReply["ActiveEnterTimestampMonotonic --value k0sworker.service"] =
 		fmt.Sprintf("%d\n", 7200500000-int64(time.Hour/time.Microsecond))
 	f.Cfg = wdeps.Config{
-		NodeName:           "node-a",
-		Interval:           time.Hour,
-		WatchdogStateDir:   f.StateDir,
-		WatchdogLogFile:    filepath.Join(root, "watchdog.log"),
-		ProcRoot:           f.ProcDir,
-		CtrTaskRoot:        f.CtrDir,
-		SandboxCtlRoot:     f.SbDir,
-		K0sWorkerUnitFile:  f.UnitFile,
+		NodeName:          "node-a",
+		Interval:          time.Hour,
+		WatchdogStateDir:  f.StateDir,
+		WatchdogLogFile:   filepath.Join(root, "watchdog.log"),
+		ProcRoot:          f.ProcDir,
+		CtrTaskRoot:       f.CtrDir,
+		SandboxCtlRoot:    f.SbDir,
+		K0sWorkerUnitFile: f.UnitFile,
+		// Promoted wiring paths get the same tempdir treatment —
+		// CtrSocket/NebulaIface keep their package defaults.
+		K0sDataDir:         filepath.Join(root, "k0sdata"),
+		PodsDir:            f.KubepodsDir,
+		SysClassNet:        f.SysNet,
+		HostResolvConf:     f.ResolvConf,
 		Client:             f.CS,
 		Systemd:            sd,
 		ConsecNeeded:       2,
 		MinRestartInterval: 30 * time.Minute,
-		Net: wdeps.NetConfig{
-			HostResolvConf: f.ResolvConf,
-			SysClassNet:    f.SysNet,
-		},
 		Kubelet: wdeps.KubeletConfig{
-			PodsDir:     f.KubepodsDir,
 			WatchMinAge: 15 * time.Minute,
 		},
 		Teardown: wdeps.TeardownConfig{
@@ -220,9 +221,6 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 		Cilium: wdeps.CiliumConfig{
 			RuntimeConfig: f.CiliumRt,
 		},
-		Disk: wdeps.DiskConfig{
-			K0sDataDir: filepath.Join(root, "k0sdata"),
-		},
 		Pressure: wdeps.PressureConfig{
 			ZombieStormThreshold: 500,
 		},
@@ -238,7 +236,7 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 // string. Call it after workerhygiene.New — the seams live on
 // d.Cfg, which the checks read through the same *Deps.
 func (f *Fixture) Bind(d *wdeps.Deps) {
-	d.Cfg.Seams.KillFn = func(pid int, sig syscall.Signal) error {
+	d.Cfg.Seams.Host.KillFn = func(pid int, sig syscall.Signal) error {
 		if sig == 0 {
 			if f.Live[pid] {
 				return nil
@@ -248,28 +246,28 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 		f.Kills = append(f.Kills, KillRecord{pid, sig})
 		return nil
 	}
-	d.Cfg.Seams.NowFn = func() time.Time { return f.Now }
+	d.Cfg.Seams.Host.NowFn = func() time.Time { return f.Now }
 	d.Cfg.ProbeGap = 0             // tests run real-time — no 2s sleep between probes
 	d.Cfg.Kubelet.WdReprobeGap = 0 // same: no 3s sleep between Gate-0 re-probes
-	d.Cfg.Seams.ProbeHTTP = func(_ context.Context, url string, _ time.Duration) error {
+	d.Cfg.Seams.Probe.ProbeHTTP = func(_ context.Context, url string, _ time.Duration) error {
 		return f.Probes[url]
 	}
 	// Feeder seam: BodyOK[url] answers "does :10248 return body 'ok'".
 	// Unset entry → false (unhealthy) — gate tests want fails anyway.
-	d.Cfg.Seams.ProbeBodyOK = func(_ context.Context, url string, _ time.Duration) bool {
+	d.Cfg.Seams.Probe.ProbeBodyOK = func(_ context.Context, url string, _ time.Duration) bool {
 		return f.BodyOK[url]
 	}
-	d.Cfg.Seams.UnixGet = func(_ context.Context, _, _ string) ([]byte, error) {
+	d.Cfg.Seams.Cilium.UnixGet = func(_ context.Context, _, _ string) ([]byte, error) {
 		return f.UnixBody, f.UnixErr
 	}
-	d.Cfg.Seams.JournalFn = func(_ context.Context) (string, error) {
+	d.Cfg.Seams.Host.JournalFn = func(_ context.Context) (string, error) {
 		return f.Journal, f.JournalErr
 	}
 	// Wave-2 seams: status-code probes default 200 (healthy) unless
 	// Probes[url] errors or Status[url] overrides; the unix socket
 	// probe answers from SockErrs (nil = connects); statfs reports
 	// f.DiskUsed of 100 blocks.
-	d.Cfg.Seams.ProbeHTTPStatus = func(_ context.Context, url, bearer string, _ time.Duration) (int, error) {
+	d.Cfg.Seams.Probe.ProbeHTTPStatus = func(_ context.Context, url, bearer string, _ time.Duration) (int, error) {
 		f.Bearer[url] = bearer
 		if err := f.Probes[url]; err != nil {
 			return 0, err
@@ -279,26 +277,26 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 		}
 		return 200, nil
 	}
-	d.Cfg.Seams.ProbeUnixSock = func(_ context.Context, socket string, _ time.Duration) error {
+	d.Cfg.Seams.Probe.ProbeUnixSock = func(_ context.Context, socket string, _ time.Duration) error {
 		return f.SockErrs[socket]
 	}
 	// Newer probe seams — canned defaults keep tests hermetic (the
 	// production defaults would dial/exec on the test host).
-	d.Cfg.Seams.DNSProbeTCP = func(string, string, time.Duration) bool {
+	d.Cfg.Seams.Probe.DNSProbeTCP = func(string, string, time.Duration) bool {
 		return f.DNSTCP
 	}
-	d.Cfg.Seams.CiliumServiceBackendsFn = func(context.Context) (map[string]int, error) {
+	d.Cfg.Seams.Cilium.CiliumServiceBackendsFn = func(context.Context) (map[string]int, error) {
 		return f.SvcBackends, f.SvcErr
 	}
-	d.Cfg.Seams.KubeletMetricsFn = func(_ context.Context, _, _ string, _ time.Duration) (string, error) {
+	d.Cfg.Seams.Probe.KubeletMetricsFn = func(_ context.Context, _, _ string, _ time.Duration) (string, error) {
 		return f.MetricsBody, f.MetricsErr
 	}
-	d.Cfg.Seams.StatfsFn = func(_ string, st *unix.Statfs_t) error {
+	d.Cfg.Seams.Host.StatfsFn = func(_ string, st *unix.Statfs_t) error {
 		st.Blocks = 100
 		st.Bavail = uint64(100 - int(f.DiskUsed*100))
 		return nil
 	}
-	d.Cfg.Seams.CtrRmIngest = func(_ context.Context, ref string) error {
+	d.Cfg.Seams.Ctr.CtrRmIngest = func(_ context.Context, ref string) error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.SDCmds = append(f.SDCmds, []string{"ctr", "ingest", "rm", ref})

@@ -1,6 +1,7 @@
 package hostconfig
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -42,11 +43,11 @@ func ConfigFromEnv(d EnvDeps) Config {
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
-		envx.StringKnob("NODE_HOST_AGENT_NEBULA_CERTS_DIR", &cfg.NebulaCertsDir,
+		envx.StringKnob(envnames.EnvNebulaCertsDir, &cfg.NebulaCertsDir,
 			defaultNebulaCertsDir),
-		envx.StringKnob("NODE_HOST_AGENT_WATCHDOG_SCRIPTS_DIR", &cfg.WatchdogScriptsDir,
+		envx.StringKnob(envnames.EnvWatchdogScriptsDir, &cfg.WatchdogScriptsDir,
 			defaultWatchdogDir),
-		envx.DurationKnob("NODE_HOST_AGENT_HOSTCONFIG_INTERVAL", &cfg.Interval,
+		envx.DurationKnob(envnames.EnvHostconfigInterval, &cfg.Interval,
 			defaultInterval),
 	})
 	// vars dir + nebula certs mount — vars/cert changes converge on

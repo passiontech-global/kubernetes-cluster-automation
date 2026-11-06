@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/runtime"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
@@ -71,8 +72,8 @@ func TestCheckCiliumWGPeers(t *testing.T) {
 	e.Live[4242] = true
 	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "4242", "stat"), "1 (agent) S 0 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1000\n")
 	e.MkTask(t, "aabbccdd-1111-2222-3333-444455556666", "cilium-agent", 4242)
-	e.H.Cfg.Seams.WGAllowedIPsFn = func(context.Context) (int, error) { return 0, nil }
-	e.H.Cfg.Seams.CiliumEncryptPeersFn = func(context.Context) (int, error) { return 3, nil }
+	e.H.Cfg.Seams.Cilium.WGAllowedIPsFn = func(context.Context) (int, error) { return 0, nil }
+	e.H.Cfg.Seams.Cilium.CiliumEncryptPeersFn = func(context.Context) (int, error) { return 3, nil }
 	e.H.Cycle(context.Background())
 	if len(e.Kills) != 0 {
 		t.Fatalf("first cycle: kills = %v, want none (streak 1/2)", e.Kills)
@@ -100,34 +101,34 @@ func TestCheckCiliumWGPeers(t *testing.T) {
 func TestCheckCiliumWGPeersGates(t *testing.T) {
 	e := fixture(t)
 	// No cilium_wg0 in sysfs → the check is a silent no-op.
-	e.H.Cfg.Seams.WGAllowedIPsFn = func(context.Context) (int, error) {
+	e.H.Cfg.Seams.Cilium.WGAllowedIPsFn = func(context.Context) (int, error) {
 		return 0, errors.New("must not be called")
 	}
-	e.H.ciliumWG.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
-	if e.H.ciliumWG.Fails != 0 {
-		t.Fatalf("no-iface: ciliumWGFails = %d, want 0", e.H.ciliumWG.Fails)
+	if wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Fails != 0 {
+		t.Fatalf("no-iface: ciliumWGFails = %d, want 0", wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Fails)
 	}
 	// apiOK=false → abort, counters kept.
 	if err := os.MkdirAll(filepath.Join(e.SysNet, "cilium_wg0"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	e.H.ciliumWG.Fails = 1
-	e.H.ciliumWG.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Fails = 1
+	wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Run(context.Background(), &wdeps.CycleEnv{
 		WorkerActive: true})
-	if e.H.ciliumWG.Fails != 1 {
-		t.Fatalf("api-down: ciliumWGFails = %d, want kept 1", e.H.ciliumWG.Fails)
+	if wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Fails != 1 {
+		t.Fatalf("api-down: ciliumWGFails = %d, want kept 1", wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Fails)
 	}
 	// Healthy peers → streak resets, latch clears.
-	e.H.Cfg.Seams.WGAllowedIPsFn = func(context.Context) (int, error) { return 5, nil }
-	e.H.Cfg.Seams.CiliumEncryptPeersFn = func(context.Context) (int, error) { return 5, nil }
+	e.H.Cfg.Seams.Cilium.WGAllowedIPsFn = func(context.Context) (int, error) { return 5, nil }
+	e.H.Cfg.Seams.Cilium.CiliumEncryptPeersFn = func(context.Context) (int, error) { return 5, nil }
 	e.Live[4242] = true
 	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "4242", "stat"), "1 (agent) S 0 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1000\n")
 	e.MkTask(t, "aabbccdd-1111-2222-3333-444455556666", "cilium-agent", 4242)
-	e.H.ciliumWG.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
-	if e.H.ciliumWG.Fails != 0 {
-		t.Fatalf("healthy: ciliumWGFails = %d, want 0", e.H.ciliumWG.Fails)
+	if wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Fails != 0 {
+		t.Fatalf("healthy: ciliumWGFails = %d, want 0", wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Fails)
 	}
 }
 
@@ -162,7 +163,7 @@ func TestCheckDiskBloatEvicts(t *testing.T) {
 			Name: "hog", Namespace: "app", UID: types.UID("uid-1"),
 		},
 	}
-	e.H.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*runtime.DiskBloatCheck](e.H, wdeps.CheckDiskBloat).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{pod}, APIOK: true, WorkerActive: true})
 	if !e.H.State.Exists("disk-bloat") {
 		t.Fatal("state-disk-bloat not latched")
@@ -192,7 +193,7 @@ func TestCheckDiskBloatSystemPodSafe(t *testing.T) {
 	pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: "sys-hog", Namespace: "kube-system", UID: types.UID("uid-sys"),
 	}}
-	e.H.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*runtime.DiskBloatCheck](e.H, wdeps.CheckDiskBloat).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{pod}, APIOK: true, WorkerActive: true})
 	if !e.H.State.Exists("disk-bloat") {
 		t.Fatal("state-disk-bloat not latched")

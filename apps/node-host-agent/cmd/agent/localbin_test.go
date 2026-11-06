@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 )
 
 // --- resolveLocalBinary ---
@@ -16,7 +18,7 @@ func TestResolveLocalBinary(t *testing.T) {
 	t.Cleanup(func() { osExecutable = orig })
 
 	t.Run("env override wins", func(t *testing.T) {
-		t.Setenv("NODE_HOST_AGENT_HUBSYNC_LOCAL_BINARY", "/custom/bin")
+		t.Setenv(envnames.EnvHubsyncLocalBinary, "/custom/bin")
 		if got := resolveLocalBinary(); got != "/custom/bin" {
 			t.Fatalf("env override=%q want /custom/bin", got)
 		}

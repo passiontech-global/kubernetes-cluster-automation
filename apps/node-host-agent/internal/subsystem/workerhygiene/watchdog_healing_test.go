@@ -26,6 +26,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/guards"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/runtime"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
@@ -142,10 +143,10 @@ func TestProbeHTTPDefaultNon2xxIsError(t *testing.T) {
 		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
 	defer srv503.Close()
 
-	if err := h.Cfg.Seams.ProbeHTTP(context.Background(), srv200.URL, time.Second); err != nil {
+	if err := h.Cfg.Seams.Probe.ProbeHTTP(context.Background(), srv200.URL, time.Second); err != nil {
 		t.Fatalf("200 probe = %v, want nil", err)
 	}
-	if err := h.Cfg.Seams.ProbeHTTP(context.Background(), srv503.URL, time.Second); err == nil {
+	if err := h.Cfg.Seams.Probe.ProbeHTTP(context.Background(), srv503.URL, time.Second); err == nil {
 		t.Fatal("503 probe must error — a wedged /healthz is down")
 	}
 }
@@ -225,7 +226,7 @@ func TestSyncloopDownRestartCooldown(t *testing.T) {
 // the socket probe's BUG-H4 remedy.
 func TestContainerdSockDownRestartsK0sWorker(t *testing.T) {
 	e := fixture(t)
-	e.SockErrs[e.H.Cfg.Ctr.Socket] = errors.New("connection refused")
+	e.SockErrs[e.H.Cfg.CtrSocket] = errors.New("connection refused")
 	e.H.Cycle(context.Background())
 	if e.SDRan("restart k0sworker.service") {
 		t.Fatal("k0sworker restarted on the first suspect cycle")
@@ -266,7 +267,7 @@ func TestCheckDiskBloatPodLogEvicts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.H.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*runtime.DiskBloatCheck](e.H, wdeps.CheckDiskBloat).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*victim}, APIOK: true, WorkerActive: true})
 
 	if len(wdepstest.DeleteActions(e.CS)) != 1 {
@@ -295,7 +296,7 @@ func TestCheckDiskBloatSnapshotEvicts(t *testing.T) {
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	snap := filepath.Join(e.H.Cfg.Disk.K0sDataDir, "containerd",
+	snap := filepath.Join(e.H.Cfg.K0sDataDir, "containerd",
 		"io.containerd.snapshotter.v1.overlayfs", "snapshots", "snapctr1", "fs")
 	if err := os.MkdirAll(snap, 0o755); err != nil {
 		t.Fatal(err)
@@ -308,7 +309,7 @@ func TestCheckDiskBloatSnapshotEvicts(t *testing.T) {
 	wdepstest.WriteFile(t, filepath.Join(e.CtrDir, "snapctr1", "config.json"),
 		`{"annotations": {"io.kubernetes.pod.uid": "`+wdepstest.UIDA+`"}}`)
 
-	e.H.diskBloat.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*runtime.DiskBloatCheck](e.H, wdeps.CheckDiskBloat).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*victim}, APIOK: true, WorkerActive: true})
 
 	if len(wdepstest.DeleteActions(e.CS)) != 1 {
@@ -341,7 +342,7 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 	pods := []corev1.Pod{*pod}
 
 	for i := 0; i < guards.CalicoFelixRestartFails; i++ {
-		e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+		wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 			Pods: pods, APIOK: true, WorkerActive: true})
 	}
 	if !e.H.State.Exists("calico-felix-down") {
@@ -364,7 +365,7 @@ func TestCheckCalicoFelixRestartDeletesPod(t *testing.T) {
 		t.Fatal(err)
 	}
 	pods[0] = *calicoPod("calico-node-def34", "uid-cal2")
-	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, WorkerActive: true})
 	if got := e.LogLines(t); !strings.Contains(got, "pod restart in cooldown") {
 		t.Fatalf("expected a cooldown line, got:\n%s", got)
@@ -382,7 +383,7 @@ func TestCheckCalicoFelixLatchBeforeRestart(t *testing.T) {
 	pods := []corev1.Pod{*calicoPod("calico-node-abc12", "uid-cal")}
 
 	for i := 0; i < 2; i++ {
-		e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+		wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 			Pods: pods, APIOK: true, WorkerActive: true})
 	}
 	if !e.H.State.Exists("calico-felix-down") {
@@ -407,12 +408,12 @@ func TestCheckCalicoVethGCDeletesOrphan(t *testing.T) {
 			fmt.Sprintf("cali%02d", i+1), "carrier"), "1\n")
 	}
 	pods := []corev1.Pod{}
-	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, WorkerActive: true})
 	if e.H.State.Exists("calico-veth-leak") {
 		t.Fatal("leak latch before ConsecNeeded")
 	}
-	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, WorkerActive: true})
 	if !e.H.State.Exists("calico-veth-leak") {
 		t.Fatal("leak latch not set")
@@ -426,7 +427,7 @@ func TestCheckCalicoVethGCDeletesOrphan(t *testing.T) {
 	// 16m later the marker ages out → the delete runs.
 	e.Now = e.Now.Add(16 * time.Minute)
 	e.SDReply["ip link delete"] = ""
-	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, WorkerActive: true})
 	if !e.SDRan("ip link delete cali99") {
 		t.Fatal("orphan veth not deleted after the down-age window")
@@ -449,7 +450,7 @@ func TestCheckCalicoVethGCNeedsLeakLatch(t *testing.T) {
 	e := fixture(t)
 	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cali99", "carrier"), "0\n")
 	// Few ifaces → no leak → latch never enters → no GC.
-	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
 	if _, err := os.Stat(filepath.Join(e.StateDir, "veth-seen-cali99")); !os.IsNotExist(err) {
 		t.Fatal("veth-seen marker stamped without the leak latch")
@@ -466,7 +467,7 @@ func TestCheckCalicoVethGCNeedsLeakLatch(t *testing.T) {
 // ratio clears it.
 func TestCheckCiliumBPFMapPressureLatches(t *testing.T) {
 	e := fixture(t)
-	e.H.cilium.CheckBPFMaps(context.Background())
+	wdepstest.Check[*cilium.CiliumCheck](e.H, wdeps.CheckCilium).CheckBPFMaps(context.Background())
 	if e.H.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("latch on an empty /v1/map body")
 	}
@@ -474,7 +475,7 @@ func TestCheckCiliumBPFMapPressureLatches(t *testing.T) {
 		{"name":"cilium_ct4_global","used":950,"max":1000},
 		{"name":"cilium_lb4_services_v2","used":100,"max":1000}
 	]}`)
-	e.H.cilium.CheckBPFMaps(context.Background())
+	wdepstest.Check[*cilium.CiliumCheck](e.H, wdeps.CheckCilium).CheckBPFMaps(context.Background())
 	if !e.H.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("no latch with cilium_ct4_global at 95%")
 	}
@@ -483,7 +484,7 @@ func TestCheckCiliumBPFMapPressureLatches(t *testing.T) {
 	e.UnixBody = []byte(`{"maps":[
 		{"path":"/sys/fs/bpf/cilium/cilium_ct4_global","size":1000,"cache":[]}
 	]}`)
-	e.H.cilium.CheckBPFMaps(context.Background())
+	wdepstest.Check[*cilium.CiliumCheck](e.H, wdeps.CheckCilium).CheckBPFMaps(context.Background())
 	if e.H.State.Exists("cilium-bpf-map-pressure") {
 		t.Fatal("empty cache at 1000 capacity must clear the latch")
 	}
@@ -566,13 +567,13 @@ func TestCheckPSIThrashLatchesAndEvicts(t *testing.T) {
 	}
 	pids := wdepstest.PidsOf(5001, 5002)
 
-	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.PSIThrashCheck](e.H, wdeps.CheckPSIThrash).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, PidsOnce: pids,
 		WorkerActive: true})
 	if e.H.State.Exists("psi-memory-thrash") {
 		t.Fatal("latched on the first thrash cycle")
 	}
-	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.PSIThrashCheck](e.H, wdeps.CheckPSIThrash).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, PidsOnce: pids,
 		WorkerActive: true})
 	if !e.H.State.Exists("psi-memory-thrash") {
@@ -591,7 +592,7 @@ func TestCheckPSIThrashLatchesAndEvicts(t *testing.T) {
 
 	// Recovery clears the latch.
 	wdepstest.WriteThrashFiles(t, e.Fixture, 5.0, 500000, 1000000)
-	e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.PSIThrashCheck](e.H, wdeps.CheckPSIThrash).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, PidsOnce: pids,
 		WorkerActive: true})
 	if e.H.State.Exists("psi-memory-thrash") {
@@ -607,7 +608,7 @@ func TestCheckPSIThrashNeedsBothSignals(t *testing.T) {
 	// Stall high, memory fine.
 	wdepstest.WriteThrashFiles(t, e.Fixture, 40.0, 500000, 1000000)
 	for i := 0; i < 3; i++ {
-		e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		wdepstest.Check[*guards.PSIThrashCheck](e.H, wdeps.CheckPSIThrash).Run(context.Background(), &wdeps.CycleEnv{
 			APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
 	}
 	if e.H.State.Exists("psi-memory-thrash") {
@@ -616,7 +617,7 @@ func TestCheckPSIThrashNeedsBothSignals(t *testing.T) {
 	// Memory low, no stall.
 	wdepstest.WriteThrashFiles(t, e.Fixture, 3.0, 50000, 1000000)
 	for i := 0; i < 3; i++ {
-		e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		wdepstest.Check[*guards.PSIThrashCheck](e.H, wdeps.CheckPSIThrash).Run(context.Background(), &wdeps.CycleEnv{
 			APIOK: true, PidsOnce: wdepstest.PidsOf(), WorkerActive: true})
 	}
 	if e.H.State.Exists("psi-memory-thrash") {
@@ -661,7 +662,7 @@ func TestCheckPSIThrashSystemPodsSafe(t *testing.T) {
 			fmt.Sprintf("Name:\tc\nVmRSS:\t%d kB\n", rss))
 	}
 	for i := 0; i < 2; i++ {
-		e.H.psiThrash.Run(context.Background(), &wdeps.CycleEnv{
+		wdepstest.Check[*guards.PSIThrashCheck](e.H, wdeps.CheckPSIThrash).Run(context.Background(), &wdeps.CycleEnv{
 			Pods: pods, APIOK: true, PidsOnce: wdepstest.PidsOf(5001, 5002),
 			WorkerActive: true})
 	}

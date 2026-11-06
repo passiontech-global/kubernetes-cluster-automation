@@ -6,6 +6,7 @@
 package wdeps
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -42,9 +43,9 @@ func (r *RuntimeConfig) applyDefaults() {
 // DaemonSet's, not the constant's).
 func (r *RuntimeConfig) envKnobs(hostPath func(string) string) []envx.Knob {
 	return []envx.Knob{
-		envx.StringKnob("NODE_HOST_AGENT_CGROUP_ROOT", &r.CgroupRoot,
+		envx.StringKnob(envnames.EnvCgroupRoot, &r.CgroupRoot,
 			hostPath("/sys/fs/cgroup")),
-		envx.StringKnob("NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR", &r.SessionsDir,
+		envx.StringKnob(envnames.EnvSystemdSessionsDir, &r.SessionsDir,
 			hostPath("/run/systemd/sessions")),
 	}
 }

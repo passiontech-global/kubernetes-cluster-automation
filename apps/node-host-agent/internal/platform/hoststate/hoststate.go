@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // SuspectBudgetPrefix prefixes the suspect-log dedupe budgets:
@@ -58,8 +59,8 @@ type Store struct {
 	// config field (`func() time.Time { return cfg.nowFn() }`), not
 	// the func value captured at New() — tests re-stub cfg.nowFn
 	// after construction and the store must observe the new clock.
-	// nil → time.Now.
-	Now func() time.Time
+	// nil → system time.
+	Now timex.Clock
 	// Log resolves the slog logger per call — pass the package
 	// `logger` func itself so the "logger"=<pkg> attr and any
 	// post-construction slog.SetDefault are honored exactly like the
@@ -76,11 +77,11 @@ type Store struct {
 }
 
 // New returns a Store for dir/logFile. now and log may be nil.
-func New(dir, logFile string, now func() time.Time,
+func New(dir, logFile string, now timex.Clock,
 	log func() *slog.Logger) *Store {
 
 	if now == nil {
-		now = time.Now
+		now = timex.SystemClock
 	}
 	return &Store{Dir: dir, LogFile: logFile, Now: now, Log: log}
 }

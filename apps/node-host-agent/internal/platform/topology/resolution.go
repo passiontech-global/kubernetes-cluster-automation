@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/jinja"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // Vars is a lazily-resolved view over the merged vars maps.
@@ -133,7 +134,7 @@ func (v *Vars) StrList(name string) []string {
 // and lookup('pipe', 'date +%s') returns the unix epoch (nowFn
 // injectable for tests; nil → time.Now). No other pipe command is
 // honoured.
-func NewEnv(varsDir string, nowFn func() time.Time) *Env {
+func NewEnv(varsDir string, nowFn timex.Clock) *Env {
 	return &Env{
 		FileLookup: func(p string) (string, error) {
 			b, err := os.ReadFile(filepath.Join(varsDir, filepath.Base(p)))

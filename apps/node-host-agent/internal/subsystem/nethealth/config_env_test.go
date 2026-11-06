@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -67,15 +68,15 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 // TestConfigFromEnvOverrides sets every knob and verifies env wins,
 // including the comma-list parser's skip-non-numeric behaviour.
 func TestConfigFromEnvOverrides(t *testing.T) {
-	t.Setenv("NODE_HOST_AGENT_NETHEALTH_INTERVAL", "90s")
-	t.Setenv("NODE_HOST_AGENT_HOST_RESOLV_CONF", "/etc/resolv.conf")
-	t.Setenv("NODE_HOST_AGENT_HOSTS_FILE", "/etc/hosts")
-	t.Setenv("NODE_HOST_AGENT_PROC_NET_UDP", "/p/udp")
-	t.Setenv("NODE_HOST_AGENT_PROC_NET_UDP6", "/p/udp6")
-	t.Setenv("NODE_HOST_AGENT_UPTIME_FILE", "/p/uptime")
-	t.Setenv("NODE_HOST_AGENT_NETHEALTH_CONSEC_NEEDED", "5")
-	t.Setenv("NODE_HOST_AGENT_NETHEALTH_MIN_RESTART", "10m")
-	t.Setenv("NODE_HOST_AGENT_NEBULA_DIRECT_TCP_PORTS", "22, 6443 ,bogus,9443")
+	t.Setenv(envnames.EnvNethealthInterval, "90s")
+	t.Setenv(envnames.EnvHostResolvConf, "/etc/resolv.conf")
+	t.Setenv(envnames.EnvHostsFile, "/etc/hosts")
+	t.Setenv(envnames.EnvProcNetUDP, "/p/udp")
+	t.Setenv(envnames.EnvProcNetUDP6, "/p/udp6")
+	t.Setenv(envnames.EnvUptimeFile, "/p/uptime")
+	t.Setenv(envnames.EnvNethealthConsecNeeded, "5")
+	t.Setenv(envnames.EnvNethealthMinRestart, "10m")
+	t.Setenv(envnames.EnvNebulaDirectTCPPorts, "22, 6443 ,bogus,9443")
 
 	cfg := ConfigFromEnv(EnvDeps{HostRoot: "/"})
 

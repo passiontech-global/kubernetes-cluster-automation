@@ -81,7 +81,7 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	}
 	var st unix.Statfs_t
 	used := -1.0
-	if err := c.d.Cfg.Seams.StatfsFn(c.d.Cfg.Disk.K0sDataDir, &st); err == nil &&
+	if err := c.d.Cfg.Seams.Host.StatfsFn(c.d.Cfg.K0sDataDir, &st); err == nil &&
 		st.Blocks > 0 && st.Bavail <= st.Blocks {
 		used = float64(st.Blocks-st.Bavail) / float64(st.Blocks)
 	}
@@ -100,11 +100,11 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	// The fd walk is IO on the disk that is already full — at most
 	// once per BloatScanInterval while over the watermark; the last
 	// exported series values persist meanwhile.
-	if c.d.Cfg.Seams.NowFn().Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
+	if c.d.Cfg.Seams.Host.NowFn().Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
 		c.d.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "ok").Inc()
 		return
 	}
-	c.lastScan = c.d.Cfg.Seams.NowFn()
+	c.lastScan = c.d.Cfg.Seams.Host.NowFn()
 	total, count, holderBytes, holderPids := c.sweep(e)
 	c.d.UnlinkedOpenFileBytes = total
 	c.d.UnlinkedOpenFileCount = int64(count)
@@ -134,7 +134,7 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	// a failed signal still consumed it).
 	sort.Ints(holderPids) // deterministic signal order, same convention as dnsStale sort
 	for _, pid := range holderPids {
-		if err := c.d.Cfg.Seams.KillFn(pid, syscall.SIGHUP); err != nil {
+		if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGHUP); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: unlinked-open-files SIGHUP pid=%d failed: %v", pid, err))
 			continue
@@ -184,7 +184,7 @@ func (c *UnlinkedOpenFilesCheck) sweep(e *wdeps.CycleEnv) (total int64,
 				strings.HasPrefix(target, "/run/shm/") {
 				continue
 			}
-			dev, ino, size, ok := c.d.Cfg.Seams.DeletedFDStatFn(link)
+			dev, ino, size, ok := c.d.Cfg.Seams.Host.DeletedFDStatFn(link)
 			if !ok || size < unlinkedFDsMinBytes {
 				continue
 			}

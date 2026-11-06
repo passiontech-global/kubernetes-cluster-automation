@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 )
 
@@ -55,7 +56,7 @@ func Cmd(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("nebula-sign", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	varsDir := fs.String("vars-dir",
-		getenv("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR", "/etc/node-host-agent/vars"),
+		getenv(envnames.EnvHostconfigVarsDir, "/etc/node-host-agent/vars"),
 		"vars dir holding cluster.yaml/interdc_nodes.yaml; nebula-<name>.crt lands here")
 	caDir := fs.String("ca-dir", "",
 		"directory holding ca.crt + ca.key (required — backup/nebula-ca)")
@@ -63,7 +64,7 @@ func Cmd(ctx context.Context, args []string) int {
 		"sign only this registry node (interdc_nodes.yaml key)")
 	duration := fs.String("duration", "8760h", "cert validity (1y; CA renews at 10y)")
 	sshKey := fs.String("ssh-key",
-		getenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", "~/.ssh/id_ed25519"),
+		getenv(envnames.EnvConvergeSSHKey, "~/.ssh/id_ed25519"),
 		"SSH private key for the host.pub fetch fallback")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
