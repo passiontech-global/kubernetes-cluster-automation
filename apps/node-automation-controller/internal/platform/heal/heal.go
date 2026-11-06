@@ -42,12 +42,24 @@ func Allowed(ctx context.Context, log logr.Logger,
 	cs kubernetes.Interface, dyn dynamic.Interface,
 	heals *state.CooldownSet, key string, cooldown time.Duration,
 	now time.Time) (proceed bool, unverifiable bool) {
+	return AllowedV(ctx, log, &kube.Verdict{}, cs, dyn,
+		heals, key, cooldown, now)
+}
+
+// AllowedV is Allowed with a shared maintenance verdict — loops that
+// run the preamble once per target pass the module's Verdict field
+// so the whole sweep pays a single mutex evaluation instead of three
+// API reads per pod.
+func AllowedV(ctx context.Context, log logr.Logger, v *kube.Verdict,
+	cs kubernetes.Interface, dyn dynamic.Interface,
+	heals *state.CooldownSet, key string, cooldown time.Duration,
+	now time.Time) (proceed bool, unverifiable bool) {
 
 	if heals != nil && heals.CooledDown(key, cooldown, now) {
 		log.Info("skip heal: inside cooldown", "target", key)
 		return false, false
 	}
-	held, why, err := kube.MaintenanceActive(ctx, cs, dyn)
+	held, why, err := v.Active(ctx, cs, dyn, now)
 	if err != nil {
 		log.Info("WARN: maintenance check unverifiable — "+
 			"heal deferred (fail closed)", "target", key, "error", err)
