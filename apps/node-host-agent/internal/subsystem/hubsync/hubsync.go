@@ -56,6 +56,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 )
 
@@ -133,6 +134,11 @@ type Config struct {
 	// Dialer overrides the real SSH dialer — the test seam
 	// (fake exec/write recording conns).
 	Dialer Dialer
+
+	// SpawnFn overrides the supervised-goroutine spawner the lease
+	// heartbeater starts through — default cycle.Spawn. Test seam
+	// counting spawn calls across Run re-entries.
+	SpawnFn func(ctx context.Context, name string, fn func(context.Context)) (stop func())
 
 	// NowFn supplies wall time — seam for tests.
 	NowFn func() time.Time
@@ -212,6 +218,9 @@ func (c *Config) applyDefaults() {
 			Dirs: []string{c.VarsDir, c.NebulaCertsDir},
 		}
 	}
+	if c.SpawnFn == nil {
+		c.SpawnFn = cycle.Spawn
+	}
 }
 
 // Enabled reports whether the converge SSH private key is mounted at
@@ -246,6 +255,15 @@ type Syncer struct {
 	// cycleCh signals "lease freshly held — converge now" from the
 	// renew loop to the cycle driver (buffered 1, drop-when-full).
 	cycleCh chan struct{}
+
+	// leaseOnce keeps the lease heartbeater single-flight: the
+	// agent supervisor re-invokes Run on the SAME ctx after a Cycle
+	// panic, and a bare `go s.leaseLoop(ctx)` stacked another
+	// renewer per restart — two loops racing the same Lease update
+	// (the resourceVersion-conflict loser reads it as lease loss →
+	// spurious "lost lease" + an extra converge). feederOnce parity
+	// in controllerhygiene.
+	leaseOnce sync.Once
 
 	// lastTargets caches the target names of the last successful
 	// loadTargets — a parse failure must drive every known
@@ -330,7 +348,16 @@ func (s *Syncer) Run(ctx context.Context) {
 	// slow SSH/SCP converge (up to ~3min/target over WAN) starved it
 	// past the 60s LeaseDurationSeconds, letting a second pod claim
 	// the lease mid-cycle (two holders converging the same targets).
-	go s.leaseLoop(ctx)
+	s.leaseOnce.Do(func() {
+		// Spawn's stop is DELIBERATELY never called: the supervisor
+		// passes the same live ctx on every restart, so the renewer
+		// already outlived Run — the once just stops re-entries
+		// stacking duplicates. Tying its lifetime to Run would let a
+		// crash-looping Cycle lapse the 60s Lease through the
+		// restart backoff (5s doubling to 5m in agent.go) and hand
+		// the converge singleton to a second pod mid-flap.
+		s.cfg.SpawnFn(ctx, "hubsync lease renewer", s.leaseLoop)
+	})
 	syncT := time.NewTicker(s.cfg.SyncInterval)
 	watch := time.NewTicker(s.cfg.WatchInterval)
 	defer syncT.Stop()
