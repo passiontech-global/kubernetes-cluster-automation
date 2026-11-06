@@ -75,6 +75,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -96,7 +97,7 @@ const (
 	helmSecretType     = "helm.sh/release.v1"
 	helmControllerNS   = "flux-system"
 	helmControllerSel  = "app.kubernetes.io/name=helm-controller"
-	fluxReconcileAnno  = "reconcile.fluxcd.io/requestedAt"
+	fluxReconcileAnno  = kube.AnnoFluxRequestedAt
 )
 
 // helmReleaseGVRs tried in order — v2 on current flux, v2beta2 on
@@ -122,8 +123,8 @@ type helmReleaseUnlocker struct {
 	// unlocked: ns/name → last successful unlock — enforces the
 	// 1-unlock/24h cap and detects "stuck again after unlock".
 	// Pruned each sweep once past the cooldown or when the HR
-	// vanished (Entries() feeds the cooldown merge's raw-stamp read
-	// and Prune's `last` arg the expiry check).
+	// vanished (Last() feeds the per-HR raw-stamp read and Prune's
+	// `last` arg the expiry check).
 	unlocked state.CooldownSet
 	// alerted: ns/name → the "still stuck after unlock" page already
 	// fired for the CURRENT cooldown window — without it a stuck HR
@@ -291,18 +292,23 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 		}
 	}
 
+	// The Kustomization list feeds both K-scanning healers below —
+	// page it once per sweep instead of once per healer. NotFound
+	// (pre-v1 flux CRDs) yields a nil list — the artifact healer's
+	// HR half still runs, the immutable-Job healer has nothing to
+	// scan; a real error is reported once for both consumers.
+	kustomizations, err := u.listAllPages(ctx, u.dyn.Resource(fluxKustomizationGVR))
+	if err != nil && !apierrors.IsNotFound(err) && firstErr == nil {
+		firstErr = fmt.Errorf("list kustomizations: %w", err)
+	}
 	// C1 — stale-artifact source healing is independent of the
 	// in-progress unlock path: it scans the same HR list plus
 	// Kustomizations and must run on every sweep.
-	if err := u.healArtifactSources(ctx, list); err != nil && firstErr == nil {
-		firstErr = err
-	}
+	u.healArtifactSources(ctx, list, kustomizations)
 	// W8-GO1 — immutable-Job apply errors on Kustomizations: the
 	// completed/failed Job blocking the apply is reaped so
 	// kustomize-controller can recreate it.
-	if err := u.healImmutableJobs(ctx); err != nil && firstErr == nil {
-		firstErr = err
-	}
+	u.healImmutableJobs(ctx, kustomizations)
 	log.Info("sweep done", "stuck", len(stuck), "due", len(due), "unlocked", unlocked,
 		"stalled", len(stalled), "stallDue", len(stallDue), "unwedged", unwedged)
 	return firstErr
