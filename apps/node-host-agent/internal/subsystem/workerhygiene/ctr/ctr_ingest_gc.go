@@ -45,12 +45,12 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// free-side field is Bavail, not Bfree: kubelet/containerd run
 	// unprivileged against the root-reserved block margin, so
 	// unprivileged-free is the signal that trips ENOSPC first.
-	if err := c.d.Cfg.Seams.StatfsFn(c.d.Cfg.Disk.K0sDataDir, &st); err == nil &&
+	if err := c.d.Cfg.Seams.Host.StatfsFn(c.d.Cfg.K0sDataDir, &st); err == nil &&
 		st.Blocks > 0 && st.Bavail <= st.Blocks {
 		used := float64(st.Blocks-st.Bavail) / float64(st.Blocks)
 		diskHigh = used > c.d.Cfg.Disk.HighWatermark
 	}
-	due := c.d.Cfg.Seams.NowFn().Sub(c.lastScan) >= c.d.Cfg.Ctr.IngestScanInterval
+	due := c.d.Cfg.Seams.Host.NowFn().Sub(c.lastScan) >= c.d.Cfg.Ctr.IngestScanInterval
 	if !diskHigh && !due {
 		c.d.Cycles.WithLabelValues(wdeps.CheckIngestGC, "ok").Inc()
 		return
@@ -67,7 +67,7 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if os.IsNotExist(err) {
 			// Absent dir = nothing to scan — stamp like a clean
 			// walk so the 6h cadence still applies.
-			c.lastScan = c.d.Cfg.Seams.NowFn()
+			c.lastScan = c.d.Cfg.Seams.Host.NowFn()
 			c.d.Cycles.WithLabelValues(wdeps.CheckIngestGC, "ok").Inc()
 			return
 		}
@@ -80,8 +80,8 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckIngestGC, "abort").Inc()
 		return
 	}
-	c.lastScan = c.d.Cfg.Seams.NowFn()
-	now := c.d.Cfg.Seams.NowFn()
+	c.lastScan = c.d.Cfg.Seams.Host.NowFn()
+	now := c.d.Cfg.Seams.Host.NowFn()
 	n := 0
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -102,7 +102,7 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		ref := e.Name()
 		d := filepath.Join(c.d.Cfg.Ctr.IngestDir, ref)
-		if rerr := c.d.Cfg.Seams.CtrRmIngest(ctx, ref); rerr != nil {
+		if rerr := c.d.Cfg.Seams.Ctr.CtrRmIngest(ctx, ref); rerr != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: ctr content ingest rm %s failed: %v — removing dir directly", ref, rerr))
 		}
@@ -136,7 +136,7 @@ func maybePruneContentStore(d *wdeps.Deps, ctx context.Context) {
 	if !d.State.RateTrySpend("last-content-gc", contentPruneInterval) {
 		return
 	}
-	if err := d.Cfg.Seams.CtrPruneContent(ctx); err != nil {
+	if err := d.Cfg.Seams.Ctr.CtrPruneContent(ctx); err != nil {
 		d.State.AppendLog(fmt.Sprintf(
 			"suspect: ctr-ingest-gc content prune failed: %v", err))
 		return

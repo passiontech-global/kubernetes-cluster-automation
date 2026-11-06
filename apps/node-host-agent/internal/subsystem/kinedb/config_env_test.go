@@ -1,11 +1,15 @@
 package kinedb
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
+)
 
 func TestConfigFromEnv(t *testing.T) {
-	t.Setenv("NODE_HOST_AGENT_KINEDB_ENV_FILE", "/custom/postgres.env")
-	t.Setenv("NODE_HOST_AGENT_KINEDB_GUARD_STATE_DIR", "/custom/guard")
-	t.Setenv("NODE_HOST_AGENT_KINEDB_PG_DATA_DIR", "/pgdata")
+	t.Setenv(envnames.EnvKinedbEnvFile, "/custom/postgres.env")
+	t.Setenv(envnames.EnvKinedbGuardStateDir, "/custom/guard")
+	t.Setenv(envnames.EnvKinedbPgDataDir, "/pgdata")
 
 	cfg := ConfigFromEnv(EnvDeps{
 		HostPath:    func(p string) string { return "/host" + p },

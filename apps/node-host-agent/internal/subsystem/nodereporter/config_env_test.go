@@ -4,12 +4,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestConfigFromEnv(t *testing.T) {
-	t.Setenv("NODE_HOST_AGENT_REPORTER_INTERVAL", "45s")
-	t.Setenv("NODE_HOST_AGENT_EVENT_NAMESPACE", "node-ops")
+	t.Setenv(envnames.EnvReporterInterval, "45s")
+	t.Setenv(envnames.EnvEventNamespace, "node-ops")
 
 	cs := testutil.FakeKube()
 	cfg := ConfigFromEnv(EnvDeps{

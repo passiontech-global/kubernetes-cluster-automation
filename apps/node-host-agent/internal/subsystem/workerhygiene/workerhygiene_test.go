@@ -34,9 +34,8 @@ import (
 // wdepstest can't build the Hygiene itself (importing workerhygiene
 // would cycle back into this test package). Every consuming test
 // package declares this same thin wrapper. In-package tests reach
-// check state through the unexported named fields (e.H.stall et
-// al.); the domain packages' external test files use
-// Hygiene.Check/wdepstest.Check instead.
+// check state through Hygiene.Check/wdepstest.Check like the
+// domain packages' external test files do.
 type env struct {
 	*wdepstest.Fixture
 	H *Hygiene

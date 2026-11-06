@@ -131,7 +131,7 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "abort").Inc()
 		return
 	}
-	if _, err := os.Stat(filepath.Join(c.d.Cfg.Net.SysClassNet, "cilium_wg0")); err != nil {
+	if _, err := os.Stat(filepath.Join(c.d.Cfg.SysClassNet, "cilium_wg0")); err != nil {
 		// No WireGuard datapath on this node (calico, tunnel mode,
 		// hub) — nothing to heal; drop stale evidence.
 		c.Fails = 0
@@ -158,14 +158,14 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "ok").Inc()
 		return
 	}
-	actual, err := c.d.Cfg.Seams.WGAllowedIPsFn(ctx)
+	actual, err := c.d.Cfg.Seams.Cilium.WGAllowedIPsFn(ctx)
 	if err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers wg allowed-ips probe failed: %v — inconclusive, keeping state", err))
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "abort").Inc()
 		return
 	}
-	expected, err := c.d.Cfg.Seams.CiliumEncryptPeersFn(ctx)
+	expected, err := c.d.Cfg.Seams.Cilium.CiliumEncryptPeersFn(ctx)
 	if err != nil || expected <= 0 {
 		// encrypt status unreadable or carries no count — fall back
 		// to ReadyNodes-1 (every OTHER Ready node is a peer).

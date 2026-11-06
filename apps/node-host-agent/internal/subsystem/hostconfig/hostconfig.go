@@ -31,6 +31,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/converge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 const (
@@ -199,7 +200,7 @@ type Config struct {
 	CmdTimeoutLong time.Duration
 	Runner         Runner
 	Watcher        Watcher
-	NowFn          func() time.Time
+	NowFn          timex.Clock
 	HTTPTimeout    time.Duration
 	// DownloadDir caches fetched archives (nebula/coredns/haproxy deb).
 	DownloadDir string
@@ -230,7 +231,7 @@ func (c *Config) applyDefaults() {
 		c.Runner = NsenterRunner{}
 	}
 	if c.NowFn == nil {
-		c.NowFn = time.Now
+		c.NowFn = timex.SystemClock
 	}
 	if c.HTTPTimeout <= 0 {
 		c.HTTPTimeout = defaultHTTPTimeout

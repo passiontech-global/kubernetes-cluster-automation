@@ -1,19 +1,20 @@
 // config_kubelet.go — the kubelet-domain knobs: KubeletConfig, its
-// defaults and its NODE_HOST_AGENT_* env rows (pod dirs, secure-port
-// probes, the T15 watchdog-feeder cadence/gates and host list).
+// defaults and its NODE_HOST_AGENT_* env rows (secure-port probes,
+// the T15 watchdog-feeder cadence/gates and host list). The pods dir
+// promoted to the top-level Config (kubelet + runtime both read it).
 package wdeps
 
 import (
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // KubeletConfig groups the kubelet-side knobs: the 05/06 stall and
-// watch-wedge pod dirs/probes, the A4 syncloop probe auth, and the
-// T15 watchdog-feeder cadence/gates.
+// watch-wedge probes, the A4 syncloop probe auth, and the T15
+// watchdog-feeder cadence/gates.
 type KubeletConfig struct {
-	PodsDir     string        // host kubelet pod dirs (05/06)
 	HealthzURL  string        // kubelet :10250 probe (05)
 	WatchMinAge time.Duration // pod age without pod dir → watch wedge (06)
 	// WatchdogHosts is the cluster var systemd_watchdog_hosts —
@@ -49,9 +50,6 @@ type KubeletConfig struct {
 }
 
 func (k *KubeletConfig) applyDefaults() {
-	if k.PodsDir == "" {
-		k.PodsDir = defaultKubeletPodsDir
-	}
 	if k.HealthzURL == "" {
 		k.HealthzURL = DefaultKubeletHealthzURL
 	}
@@ -85,25 +83,22 @@ func (k *KubeletConfig) applyDefaults() {
 }
 
 // envKnobs returns the kubelet domain's NODE_HOST_AGENT_* env rows —
-// the pod dir + secure-port probe paths (hostPath defaults like the
-// wiring rows) and the T15 watchdog-hosts resolution, which needs the
-// EnvDeps vars dir / node name for the cluster.yaml fallback.
-func (k *KubeletConfig) envKnobs(hostPath func(string) string,
-	d EnvDeps) []envx.Knob {
+// the secure-port probe auth and the T15 watchdog-hosts resolution,
+// which needs the EnvDeps vars dir / node name for the cluster.yaml
+// fallback.
+func (k *KubeletConfig) envKnobs(d EnvDeps) []envx.Knob {
 	return []envx.Knob{
-		envx.StringKnob("NODE_HOST_AGENT_KUBELET_PODS_DIR", &k.PodsDir,
-			hostPath("/var/lib/k0s/kubelet/pods")),
 		// A4 probes: kubelet :10250 denies anonymous healthz, so
 		// the syncloop probe authenticates with the pod SA token.
-		envx.StringKnob("NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL", &k.SyncloopURL, ""),
-		envx.OrKnob("NODE_HOST_AGENT_KUBELET_TOKEN_FILE", &k.TokenPath,
+		envx.StringKnob(envnames.EnvKubeletSyncloopURL, &k.SyncloopURL, ""),
+		envx.OrKnob(envnames.EnvKubeletTokenFile, &k.TokenPath,
 			DefaultKubeletTokenPath),
 		// T15 opt-in host list: env override →
 		// systemd_watchdog_hosts out of the vars dir
 		// (cluster.yaml) — resolved by KubeletWatchdogHosts (env.go).
 		// Absent vars dir is not an error — the feeder self-gates on
 		// k0sworker.service anyway.
-		{Name: "NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS", Resolve: func(string) {
+		{Name: envnames.EnvKubeletWatchdogHosts, Resolve: func(string) {
 			k.WatchdogHosts = KubeletWatchdogHosts(d.VarsDir, d.NodeName)
 		}},
 	}

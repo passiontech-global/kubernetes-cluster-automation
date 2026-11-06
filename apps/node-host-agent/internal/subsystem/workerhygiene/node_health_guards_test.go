@@ -44,12 +44,12 @@ func TestCheckDStateStormLatch(t *testing.T) {
 		e.MkStatProc(t, pid, "postgres", "D", "blk_mq_get_tag")
 		_ = i
 	}
-	e.H.dstate.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.DstateCheck](e.H, wdeps.CheckDState).Run(context.Background(), &wdeps.CycleEnv{
 		PidsOnce: wdepstest.PidsOf(pids...), WorkerActive: true})
 	if e.H.State.Exists("d-state-storm") {
 		t.Fatal("latch fired before ConsecNeeded cycles")
 	}
-	e.H.dstate.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.DstateCheck](e.H, wdeps.CheckDState).Run(context.Background(), &wdeps.CycleEnv{
 		PidsOnce: wdepstest.PidsOf(pids...), WorkerActive: true})
 	if !e.H.State.Exists("d-state-storm") {
 		t.Fatal("state-d-state-storm not latched after ConsecNeeded cycles")
@@ -62,7 +62,7 @@ func TestCheckDStateStormLatch(t *testing.T) {
 	for _, pid := range pids {
 		e.MkStatProc(t, pid, "postgres", "S", "")
 	}
-	e.H.dstate.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.DstateCheck](e.H, wdeps.CheckDState).Run(context.Background(), &wdeps.CycleEnv{
 		PidsOnce: wdepstest.PidsOf(pids...), WorkerActive: true})
 	if e.H.State.Exists("d-state-storm") {
 		t.Fatal("latch not cleared after D procs recovered")
@@ -76,9 +76,9 @@ func TestCheckDStateRuntimeMinTrigger(t *testing.T) {
 	pids := []int{7101, 7102}
 	e.MkStatProc(t, 7101, "runc", "D", "umount_tree")
 	e.MkStatProc(t, 7102, "jbd2/vda1-8", "D", "wait_transaction_locked")
-	e.H.dstate.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.DstateCheck](e.H, wdeps.CheckDState).Run(context.Background(), &wdeps.CycleEnv{
 		PidsOnce: wdepstest.PidsOf(pids...), WorkerActive: true})
-	e.H.dstate.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.DstateCheck](e.H, wdeps.CheckDState).Run(context.Background(), &wdeps.CycleEnv{
 		PidsOnce: wdepstest.PidsOf(pids...), WorkerActive: true})
 	if !e.H.State.Exists("d-state-storm") {
 		t.Fatal("runtime-critical D-state storm not latched")
@@ -96,7 +96,7 @@ func TestCheckSystemdScopesResetFailed(t *testing.T) {
 		"cri-containerd-aa11.scope loaded failed failed abandoned\n" +
 			"cri-containerd-bb22.scope loaded failed failed abandoned\n"
 	e.SDReply["reset-failed cri-containerd-*.scope"] = ""
-	e.H.scopes.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if !e.SDRan("reset-failed cri-containerd-*.scope") {
 		t.Fatal("systemctl reset-failed not invoked for failed scopes")
 	}
@@ -105,13 +105,13 @@ func TestCheckSystemdScopesResetFailed(t *testing.T) {
 	}
 	// Inside the 30m scan interval — no further exec.
 	before := len(e.SDCmds)
-	e.H.scopes.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if len(e.SDCmds) != before {
 		t.Fatal("scan re-ran inside SystemdScopeScanInterval")
 	}
 	// Past the interval the sweep runs again.
 	e.Now = e.Now.Add(31 * time.Minute)
-	e.H.scopes.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if len(e.SDCmds) != before+2 { // list + reset again
 		t.Fatalf("scan did not re-run past interval: sdcmds=%d want %d", len(e.SDCmds), before+2)
 	}
@@ -120,7 +120,7 @@ func TestCheckSystemdScopesResetFailed(t *testing.T) {
 func TestCheckSystemdScopesClean(t *testing.T) {
 	e := fixture(t)
 	e.SDReply["list-units --type=scope --state=failed"] = ""
-	e.H.scopes.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	wdepstest.Check[*guards.ScopesCheck](e.H, wdeps.CheckSysScopes).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
 	if e.SDRan("reset-failed cri-containerd-") {
 		t.Fatal("reset-failed ran with zero failed scopes")
 	}
@@ -153,19 +153,19 @@ func TestCheckCiliumEnvoyXDSReject(t *testing.T) {
 		"cluster_manager.cds.update_rejected: 9\n",
 	}
 	call := 0
-	e.H.Cfg.Seams.HTTPGetBody = func(context.Context, string, time.Duration) ([]byte, error) {
+	e.H.Cfg.Seams.Probe.HTTPGetBody = func(context.Context, string, time.Duration) ([]byte, error) {
 		defer func() { call++ }()
 		if call < len(stats) {
 			return []byte(stats[call]), nil
 		}
 		return []byte(stats[len(stats)-1]), nil
 	}
-	e.H.ciliumEnvoy.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true}) // baseline read — no delta
-	e.H.ciliumEnvoy.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true}) // delta +1 → streak 1
+	wdepstest.Check[*cilium.CiliumEnvoyCheck](e.H, wdeps.CheckCiliumEnvoy).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true}) // baseline read — no delta
+	wdepstest.Check[*cilium.CiliumEnvoyCheck](e.H, wdeps.CheckCiliumEnvoy).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true}) // delta +1 → streak 1
 	if e.H.State.Exists("cilium-envoy-xds-reject") {
 		t.Fatal("xds latch fired before ConsecNeeded deltas")
 	}
-	e.H.ciliumEnvoy.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true}) // delta +1 → streak 2
+	wdepstest.Check[*cilium.CiliumEnvoyCheck](e.H, wdeps.CheckCiliumEnvoy).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true}) // delta +1 → streak 2
 	if !e.H.State.Exists("cilium-envoy-xds-reject") {
 		t.Fatal("state-cilium-envoy-xds-reject not latched")
 	}
@@ -198,10 +198,10 @@ func TestCheckCiliumLRPDNS(t *testing.T) {
 	e.MkTask(t, wdepstest.UIDB, "cilium-agent", 4343)
 	pod, _ := e.CS.CoreV1().Pods("kube-system").Get(
 		context.Background(), "node-local-dns-a1b2c", metav1.GetOptions{})
-	e.H.Cfg.Seams.DNSProbe = func(string, string, time.Duration) bool { return false }
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool { return false }
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true})
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true})
 	if _, err := e.CS.CoreV1().Pods("kube-system").Get(
 		context.Background(), "node-local-dns-a1b2c", metav1.GetOptions{}); err == nil {
@@ -215,14 +215,14 @@ func TestCheckCiliumLRPDNS(t *testing.T) {
 func TestCheckCiliumLRPDNSGates(t *testing.T) {
 	e := fixture(t)
 	// No cilium_host → dormant (calico node) — the probe must not run.
-	e.H.Cfg.Seams.DNSProbe = func(string, string, time.Duration) bool {
+	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool {
 		t.Fatal("dnsProbe ran without cilium datapath")
 		return false
 	}
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
-	if e.H.ciliumLRP.Fails != 0 {
-		t.Fatalf("nldFails = %d, want 0 on non-cilium node", e.H.ciliumLRP.Fails)
+	if wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Fails != 0 {
+		t.Fatalf("nldFails = %d, want 0 on non-cilium node", wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Fails)
 	}
 
 	// cilium_host present but no cilium-agent task → gated (agent
@@ -230,10 +230,10 @@ func TestCheckCiliumLRPDNSGates(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(e.SysNet, "cilium_host"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
-	if e.H.ciliumLRP.Fails != 0 {
-		t.Fatalf("nldFails = %d, want 0 with cilium-agent absent", e.H.ciliumLRP.Fails)
+	if wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Fails != 0 {
+		t.Fatalf("nldFails = %d, want 0 with cilium-agent absent", wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Fails)
 	}
 }
 
@@ -257,12 +257,12 @@ func TestCheckCiliumLRPDNSTCPHalfWedge(t *testing.T) {
 	pod, _ := e.CS.CoreV1().Pods("kube-system").Get(
 		context.Background(), "node-local-dns-b2c3d", metav1.GetOptions{})
 	// UDP answers, TCP silent — a one-sided wedge still counts.
-	e.H.Cfg.Seams.DNSProbe = func(string, string, time.Duration) bool { return true }
+	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool { return true }
 	e.DNSTCP = false
 	e.SvcErr = errors.New("map unreadable") // desync probe inconclusive
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true})
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true})
 	if _, err := e.CS.CoreV1().Pods("kube-system").Get(
 		context.Background(), "node-local-dns-b2c3d", metav1.GetOptions{}); err == nil {
@@ -292,7 +292,7 @@ func TestCheckCiliumLRPServiceDesync(t *testing.T) {
 		"kube-system/kube-dns": 0, // desynced — ready endpoints, no backends
 		"default/kubernetes":   1,
 	}
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
 	killed := false
 	for _, k := range e.Kills {
@@ -303,7 +303,7 @@ func TestCheckCiliumLRPServiceDesync(t *testing.T) {
 	if killed {
 		t.Fatal("agent killed before ConsecNeeded desync cycles")
 	}
-	e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
 	killed = false
 	for _, k := range e.Kills {
@@ -344,10 +344,10 @@ func TestCheckCiliumLRPDesyncSuppressesPodDelete(t *testing.T) {
 	e.MkTask(t, wdepstest.UIDB, "cilium-agent", 4343)
 	e.SvcBackends = map[string]int{"kube-system/kube-dns": 0, "default/kubernetes": 1}
 	// :53 is dead on both transports — the desync explains it.
-	e.H.Cfg.Seams.DNSProbe = func(string, string, time.Duration) bool { return false }
+	e.H.Cfg.Seams.Probe.DNSProbe = func(string, string, time.Duration) bool { return false }
 	e.DNSTCP = false
 	for i := 0; i < 3; i++ {
-		e.H.ciliumLRP.Run(context.Background(), &wdeps.CycleEnv{
+		wdepstest.Check[*cilium.CiliumLRPCheck](e.H, wdeps.CheckCiliumLRP).Run(context.Background(), &wdeps.CycleEnv{
 			APIOK: true, WorkerActive: true})
 	}
 	if _, err := e.CS.CoreV1().Pods("kube-system").Get(
@@ -400,12 +400,12 @@ func TestCheckSpegelMirror(t *testing.T) {
 	})
 	pod, _ := e.CS.CoreV1().Pods("spegel").Get(
 		context.Background(), "spegel-x9y8z", metav1.GetOptions{})
-	e.H.spegel.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.SpegelCheck](e.H, wdeps.CheckSpegel).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true})
 	if e.H.State.Exists("spegel-mirror-degraded") {
 		t.Fatal("spegel latch fired before ConsecNeeded cycles")
 	}
-	e.H.spegel.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.SpegelCheck](e.H, wdeps.CheckSpegel).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true})
 	if !e.H.State.Exists("spegel-mirror-degraded") {
 		t.Fatal("state-spegel-mirror-degraded not latched")
@@ -427,11 +427,11 @@ func TestCheckSpegelMirrorTooYoung(t *testing.T) {
 			Conditions: []corev1.PodCondition{
 				{Type: corev1.PodReady, Status: corev1.ConditionFalse}}},
 	}
-	e.H.spegel.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.SpegelCheck](e.H, wdeps.CheckSpegel).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true})
-	e.H.spegel.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.SpegelCheck](e.H, wdeps.CheckSpegel).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true})
-	if e.H.spegel.Fails != 0 || e.H.State.Exists("spegel-mirror-degraded") {
+	if wdepstest.Check[*guards.SpegelCheck](e.H, wdeps.CheckSpegel).Fails != 0 || e.H.State.Exists("spegel-mirror-degraded") {
 		t.Fatal("3m-old spegel pod counted toward the streak — startup grace violated")
 	}
 }
@@ -446,12 +446,12 @@ func TestCheckCalicoHygieneVethLeak(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
 	if e.H.State.Exists("calico-veth-leak") {
 		t.Fatal("veth-leak latch fired before ConsecNeeded cycles")
 	}
-	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
 	if !e.H.State.Exists("calico-veth-leak") {
 		t.Fatal("state-calico-veth-leak not latched (55 cali vs 0 pods)")
@@ -473,9 +473,9 @@ func TestCheckCalicoHygieneFelixDown(t *testing.T) {
 			UID: types.UID(wdepstest.UIDC), CreationTimestamp: metav1.Now()},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}}
-	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, WorkerActive: true})
-	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 		Pods: pods, APIOK: true, WorkerActive: true})
 	if !e.H.State.Exists("calico-felix-down") {
 		t.Fatal("state-calico-felix-down not latched on failing readiness")
@@ -492,11 +492,11 @@ func TestCheckCalicoHygieneCiliumGate(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(e.SysNet, "cali00"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	e.H.calico.VethFails = 1
+	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).VethFails = 1
 	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "state-calico-veth-leak"), "1\n")
-	e.H.calico.Run(context.Background(), &wdeps.CycleEnv{
+	wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).Run(context.Background(), &wdeps.CycleEnv{
 		APIOK: true, WorkerActive: true})
-	if e.H.calico.VethFails != 0 || e.H.State.Exists("calico-veth-leak") {
+	if wdepstest.Check[*guards.CalicoCheck](e.H, wdeps.CheckCalico).VethFails != 0 || e.H.State.Exists("calico-veth-leak") {
 		t.Fatal("calico checks ran/cleared nothing on a cilium node")
 	}
 }

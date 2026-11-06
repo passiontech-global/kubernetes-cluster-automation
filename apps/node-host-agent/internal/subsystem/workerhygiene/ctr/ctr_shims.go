@@ -78,7 +78,7 @@ func normalizeCtrAddr(a string) string {
 // root dir, not inside it).
 func ctrShimSockets(d *wdeps.Deps) map[string]bool {
 	out := map[string]bool{}
-	if s := normalizeCtrAddr(hostSidePath(d.Cfg.Ctr.Socket)); s != "" {
+	if s := normalizeCtrAddr(hostSidePath(d.Cfg.CtrSocket)); s != "" {
 		out[s] = true
 	}
 	derived := filepath.Join(

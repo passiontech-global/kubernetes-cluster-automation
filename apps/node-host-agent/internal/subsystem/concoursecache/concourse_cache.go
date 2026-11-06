@@ -39,6 +39,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // pvcNameRe is the last-deletion-belt name check — exactly
@@ -122,7 +124,7 @@ type Config struct {
 	// for tests; nil → syscall.Statfs.
 	statfsFn func(path string, st *syscall.Statfs_t) error
 	// nowFn supplies the current time — seam for tests; nil → time.Now.
-	nowFn func() time.Time
+	nowFn timex.Clock
 }
 
 func (c *Config) applyDefaults() {
@@ -185,7 +187,7 @@ func (c *Config) applyDefaults() {
 		c.statfsFn = syscall.Statfs
 	}
 	if c.nowFn == nil {
-		c.nowFn = time.Now
+		c.nowFn = timex.SystemClock
 	}
 }
 

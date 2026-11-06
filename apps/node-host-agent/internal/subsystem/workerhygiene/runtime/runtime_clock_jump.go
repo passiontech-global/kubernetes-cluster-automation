@@ -92,8 +92,8 @@ func konnPodLog(d *wdeps.Deps, ctx context.Context, p *corev1.Pod) string {
 			}
 		}
 	}
-	if d.Cfg.Seams.PodLogFn != nil {
-		if out, err := d.Cfg.Seams.PodLogFn(ctx, p.Namespace, p.Name,
+	if d.Cfg.Seams.Probe.PodLogFn != nil {
+		if out, err := d.Cfg.Seams.Probe.PodLogFn(ctx, p.Namespace, p.Name,
 			konnLogTailLines); err == nil {
 			return out
 		}
@@ -128,7 +128,7 @@ func (c *ClockJumpCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	stepped, ok := clockSteppedAt(c.d)
-	if !ok || c.d.Cfg.Seams.NowFn().Sub(stepped) > clockJumpMarkerFresh {
+	if !ok || c.d.Cfg.Seams.Host.NowFn().Sub(stepped) > clockJumpMarkerFresh {
 		// No recent step — the signature this check heals can't be
 		// attributed to a clock jump.
 		c.d.Cycles.WithLabelValues(wdeps.CheckClockJump, "ok").Inc()

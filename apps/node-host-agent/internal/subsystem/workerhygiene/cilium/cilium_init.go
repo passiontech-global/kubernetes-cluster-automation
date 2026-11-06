@@ -43,7 +43,7 @@ func (c *CiliumInitCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumInit, "ok").Inc()
 		return
 	}
-	body, err := c.d.Cfg.Seams.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/endpoint")
+	body, err := c.d.Cfg.Seams.Cilium.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/endpoint")
 	if err != nil {
 		// Endpoint list unreadable — inconclusive: don't count, don't
 		// reset (shell: tasks exec fail → exit 0).

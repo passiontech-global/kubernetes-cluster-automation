@@ -10,7 +10,7 @@
 // empty default is the script's "1970-01-01T00:00:00Z" (delete
 // everything).
 //
-// The purge itself lives in internal/ops/eventpurge (Run): this file is
+// The purge itself lives in internal/domain/eventpurge (Run): this file is
 // only the flag layer so the controllerhygiene etcd guard can share
 // the domain logic without importing a CLI package.
 package evpurge
@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/eventpurge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/eventpurge"
 )
 
 // Cmd is the `purge-events` subcommand entrypoint.

@@ -14,8 +14,8 @@ import (
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/etcdmaint"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/eventpurge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/etcdmaint"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/eventpurge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 

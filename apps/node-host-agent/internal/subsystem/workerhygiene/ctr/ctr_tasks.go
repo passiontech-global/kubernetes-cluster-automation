@@ -135,7 +135,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION: kill orphan shim pid=%d id=%.12s ns=%s - task dir missing",
 			pid, sid, ns))
-		if err := c.d.Cfg.Seams.KillFn(pid, syscall.SIGKILL); err != nil {
+		if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGKILL); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: kill orphan shim pid=%d failed: %v", pid, err))
 		}
@@ -216,7 +216,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				pid > 0 && c.d.PidLive(pid) {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"ACTION: kill -9 init %d of %.12s - log.json missing", pid, id))
-				if err := c.d.Cfg.Seams.KillFn(pid, syscall.SIGKILL); err != nil {
+				if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGKILL); err != nil {
 					c.d.State.AppendLog(fmt.Sprintf(
 						"suspect: kill init %d of %.12s failed: %v", pid, id, err))
 				}
@@ -226,7 +226,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// the task id, then remove the dir — containerd GCs the task
 		// record once the shim is gone.
 		for _, pid := range c.d.PidsWithCmdline(id, pids) {
-			if err := c.d.Cfg.Seams.KillFn(pid, syscall.SIGKILL); err != nil {
+			if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGKILL); err != nil {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: kill leftover pid=%d holding task %.12s failed: %v",
 					pid, id, err))

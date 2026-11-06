@@ -80,7 +80,7 @@ func killNamedTasks(d *wdeps.Deps, tasks []wdeps.CtrTask, name string) bool {
 	killed := false
 	for _, t := range tasks {
 		if t.Live && t.PID > 0 {
-			if err := d.Cfg.Seams.KillFn(t.PID, syscall.SIGKILL); err != nil {
+			if err := d.Cfg.Seams.Host.KillFn(t.PID, syscall.SIGKILL); err != nil {
 				d.State.AppendLog(fmt.Sprintf(
 					"suspect: kill %s pid=%d failed: %v", name, t.PID, err))
 			} else {

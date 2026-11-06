@@ -9,6 +9,7 @@
 package hostctx
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -66,7 +67,7 @@ func DepsFromEnv(p EnvParams) Deps {
 	// The shared host-side inputs: the node-watchdog.conf parser
 	// feeds API_BACKENDS / OVERLAY_* / DNS_FALLBACK_MAP into
 	// apiprober, workerhygiene, nethealth and hostmetrics.
-	wdConfPath := envx.String("NODE_HOST_AGENT_WATCHDOG_CONF",
+	wdConfPath := envx.String(envnames.EnvWatchdogConf,
 		hostPath("/etc/node-watchdog.conf"))
 	wdCfg, err := watchdogconf.Load(wdConfPath)
 	if err != nil {
@@ -86,7 +87,7 @@ func DepsFromEnv(p EnvParams) Deps {
 	// are the "journald is installed" witness — a host with no
 	// journald fails every read by config and must never latch.
 	// hostPath() makes them unprefixed in standalone mode.
-	journalDirs := envx.List("NODE_HOST_AGENT_JOURNAL_DIRS")
+	journalDirs := envx.List(envnames.EnvJournalDirs)
 	if journalDirs == nil {
 		journalDirs = []string{
 			hostPath("/var/log/journal"), hostPath("/run/log/journal")}
@@ -95,25 +96,25 @@ func DepsFromEnv(p EnvParams) Deps {
 	return Deps{
 		Watchdog:    wdCfg,
 		WatchdogSrc: wdReloader,
-		WatchdogStateDir: envx.String("NODE_HOST_AGENT_WATCHDOG_STATE_DIR",
+		WatchdogStateDir: envx.String(envnames.EnvWatchdogStateDir,
 			hostPath("/var/lib/node-watchdog")),
-		WatchdogLogFile: envx.String("NODE_HOST_AGENT_WATCHDOG_LOG",
+		WatchdogLogFile: envx.String(envnames.EnvWatchdogLog,
 			hostPath("/var/log/node-watchdog.log")),
 		HostPath:    hostPath,
 		HostRoot:    p.HostRoot,
 		Systemd:     p.Systemd,
 		JournalDirs: journalDirs,
 		JournalUnreadableNeeded: envx.Int(
-			"NODE_HOST_AGENT_JOURNAL_UNREADABLE_NEEDED", 5),
+			envnames.EnvJournalUnreadableNeeded, 5),
 		// VarsDir/TextfileDir stay shared: workerhygiene
 		// (systemd_watchdog_hosts), kinedb (Detect), hubsync
 		// (VarsDir) and hostconfig itself all read the same vars
 		// dir, and the textfile dir feeds both the standalone prom
 		// writer and kinedb's prom files.
-		VarsDir: envx.String("NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR",
+		VarsDir: envx.String(envnames.EnvHostconfigVarsDir,
 			"/config/vars"),
-		TextfileDir: envx.String("NODE_HOST_AGENT_TEXTFILE_DIR",
+		TextfileDir: envx.String(envnames.EnvTextfileDir,
 			hostPath("/var/lib/node-exporter/textfile")),
-		NodeName: envx.String("NODE_HOST_AGENT_NODE_NAME", p.NodeName),
+		NodeName: envx.String(envnames.EnvNodeName, p.NodeName),
 	}
 }

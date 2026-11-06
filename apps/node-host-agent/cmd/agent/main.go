@@ -53,6 +53,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -78,25 +79,10 @@ var kubeClient = func() (kubernetes.Interface, error) {
 	// not hang each kube API call forever, so the config carries the
 	// same request-timeout knob the sweeper uses for its cycles.
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = envx.Duration("NODE_HOST_AGENT_REQUEST_TIMEOUT",
+		cfg.Timeout = envx.Duration(envnames.EnvRequestTimeout,
 			30*time.Second)
 	}
 	return kubernetes.NewForConfig(cfg)
-}
-
-// agentParams bundles the inputs buildAgentConfig consumes — one
-// field per former positional parameter so the call sites read by
-// name. StandaloneFlag is the --standalone CLI switch; the
-// NODE_HOST_AGENT_STANDALONE env is OR-ed in by buildAgentConfig so
-// either spelling selects standalone mode.
-type agentParams struct {
-	nodeName       string
-	podName        string
-	namespace      string
-	version        string
-	metricsAddr    string
-	probeAddr      string
-	standaloneFlag bool
 }
 
 // wireReport is the wire loop's per-descriptor outcome summary —
@@ -110,13 +96,19 @@ type wireReport struct {
 	Skipped []string
 }
 
-// buildAgentConfig wires the environment into an agent.Config: one
-// shared registry plus the subsystem list in startup order.
+// buildAgentConfig wires the environment into an agent.Config: cfg
+// arrives already carrying the identity/listener fields main resolved
+// from flags+env (NodeName/PodName/Namespace/Version/MetricsAddr/
+// ProbeAddr); the function fills in the shared registry plus the
+// subsystem list in startup order and returns the completed Config.
 // hostmetrics registers on the shared registry directly. The
 // wireReport feeds only the startup log line — it answers the
 // operator's second question (which subsystems did NOT wire up and
-// why) alongside the constructed set.
-func buildAgentConfig(p agentParams) (agent.Config, wireReport) {
+// why) alongside the constructed set. standaloneFlag is the
+// --standalone CLI switch; the NODE_HOST_AGENT_STANDALONE env is
+// OR-ed in so either spelling selects standalone mode — it is NOT a
+// Config field because agent.Config is also the runtime's contract.
+func buildAgentConfig(cfg agent.Config, standaloneFlag bool) (agent.Config, wireReport) {
 
 	// Standalone = on-host systemd mode (API LB VMs, interdc hubs,
 	// the kine DB VM): the enable-set inverts — every subsystem
@@ -125,8 +117,8 @@ func buildAgentConfig(p agentParams) (agent.Config, wireReport) {
 	// of the same envx knobs, never by hard ifs, so the
 	// env contract is intact (NODE_HOST_AGENT_ENABLE_HYGIENE=true
 	// still forces workerhygiene on a standalone host).
-	standalone := p.standaloneFlag ||
-		envx.Bool("NODE_HOST_AGENT_STANDALONE", false)
+	standalone := standaloneFlag ||
+		envx.Bool(envnames.EnvStandalone, false)
 	defKube := !standalone // default for kube/pod-context subsystems
 
 	// Shared registry: subsystems + collectors register on it, the
@@ -135,7 +127,7 @@ func buildAgentConfig(p agentParams) (agent.Config, wireReport) {
 
 	// Host root: "/host" in the DaemonSet (host fs bind-mounted),
 	// "/" for the standalone systemd binary on the host itself.
-	hostRoot := strings.TrimRight(envx.String("NODE_HOST_AGENT_HOST_ROOT", "/host"), "/")
+	hostRoot := strings.TrimRight(envx.String(envnames.EnvHostRoot, "/host"), "/")
 	if hostRoot == "" || standalone {
 		hostRoot = "/"
 	}
@@ -183,7 +175,7 @@ func buildAgentConfig(p agentParams) (agent.Config, wireReport) {
 	hc := hostctx.DepsFromEnv(hostctx.EnvParams{
 		HostPath: hostPath,
 		HostRoot: hostRoot,
-		NodeName: p.nodeName,
+		NodeName: cfg.NodeName,
 		Systemd:  sdClient,
 	})
 
@@ -197,7 +189,7 @@ func buildAgentConfig(p agentParams) (agent.Config, wireReport) {
 		resolved: map[string]bool{},
 		built:    map[string]bool{},
 
-		podName: p.podName,
+		podName: cfg.PodName,
 	}
 
 	// One Descriptor per subsystem, in the same order the sequential
@@ -221,16 +213,9 @@ func buildAgentConfig(p agentParams) (agent.Config, wireReport) {
 		}
 	}
 
-	return agent.Config{
-		NodeName:    p.nodeName,
-		PodName:     p.podName,
-		Namespace:   p.namespace,
-		Version:     p.version,
-		MetricsAddr: p.metricsAddr,
-		ProbeAddr:   p.probeAddr,
-		Registry:    reg,
-		Subsystems:  w.subsystems,
-	}, report
+	cfg.Registry = reg
+	cfg.Subsystems = w.subsystems
+	return cfg, report
 }
 
 func main() {
@@ -268,20 +253,19 @@ func main() {
 
 	// Precedence: NODE_HOST_AGENT_NODE_NAME > NODE_NAME > --node-name.
 	// Standalone units pass --node-name (no downward API on the host).
-	nodeName := envx.String("NODE_HOST_AGENT_NODE_NAME",
+	nodeName := envx.String(envnames.EnvNodeName,
 		envx.String("NODE_NAME", nodeNameFlag))
 	podName := envx.String("POD_NAME", "")
 	namespace := envx.String("POD_NAMESPACE", "")
 
-	cfg, report := buildAgentConfig(agentParams{
-		nodeName:       nodeName,
-		podName:        podName,
-		namespace:      namespace,
-		version:        version,
-		metricsAddr:    metricsAddr,
-		probeAddr:      probeAddr,
-		standaloneFlag: standaloneFlag,
-	})
+	cfg, report := buildAgentConfig(agent.Config{
+		NodeName:    nodeName,
+		PodName:     podName,
+		Namespace:   namespace,
+		Version:     version,
+		MetricsAddr: metricsAddr,
+		ProbeAddr:   probeAddr,
+	}, standaloneFlag)
 	a := agent.New(cfg)
 
 	// The enabled set is an operator's first question when a check

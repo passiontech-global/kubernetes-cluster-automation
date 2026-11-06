@@ -59,7 +59,7 @@ func (c *PodTeardownCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// The task map is only worth building once a Terminating pod
 	// exists — with none, the whole loop below is a no-op.
 	var tasks map[string][]wdeps.CtrTask
-	now := c.d.Cfg.Seams.NowFn()
+	now := c.d.Cfg.Seams.Host.NowFn()
 	wedged := 0
 	ndel := 0
 	for i := range e.Pods {
@@ -275,7 +275,7 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// the stale proxy-agent directly. Least-bad: a container
 			// restart alone can't fix env baked at pod create, but
 			// it still clears a hung agent while humans look.
-			if err := c.d.Cfg.Seams.KillFn(stalePID, syscall.SIGKILL); err != nil {
+			if err := c.d.Cfg.Seams.Host.KillFn(stalePID, syscall.SIGKILL); err != nil {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: kill stale proxy-agent pid=%d failed: %v", stalePID, err))
 			} else {
@@ -375,7 +375,7 @@ func (c *DNSResolvCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckDNS, "abort").Inc()
 		return
 	}
-	hostNS, _ := nameserverSet(c.d.Cfg.Net.HostResolvConf)
+	hostNS, _ := nameserverSet(c.d.Cfg.HostResolvConf)
 
 	var stale []dnsStale
 	if len(hostNS) > 0 { // empty host set → nothing to compare (shell parity)
@@ -443,7 +443,7 @@ func (c *DNSResolvCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"DNS-RESOLV-RESTART: killing pause %d (%s) - dns-resolv-stale, resolv.conf pod stale vs host",
 				s.pid, s.pod))
-			if err := c.d.Cfg.Seams.KillFn(s.pid, syscall.SIGKILL); err != nil {
+			if err := c.d.Cfg.Seams.Host.KillFn(s.pid, syscall.SIGKILL); err != nil {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: kill pause %d (%s) failed: %v", s.pid, s.pod, err))
 			}

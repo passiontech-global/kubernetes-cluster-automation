@@ -4,6 +4,7 @@
 package wdeps
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -28,7 +29,7 @@ func (cl *CalicoConfig) applyDefaults() {
 // orphan-veth threshold.
 func (cl *CalicoConfig) envKnobs() []envx.Knob {
 	return []envx.Knob{
-		envx.StringKnob("NODE_HOST_AGENT_CALICO_FELIX_READY_URL", &cl.FelixReadyURL, ""),
-		envx.IntKnob("NODE_HOST_AGENT_CALICO_ORPHAN_VETH_THRESHOLD", &cl.OrphanVethThreshold, defaultCalicoOrphanVethThresh),
+		envx.StringKnob(envnames.EnvCalicoFelixReadyURL, &cl.FelixReadyURL, ""),
+		envx.IntKnob(envnames.EnvCalicoOrphanVethThreshold, &cl.OrphanVethThreshold, defaultCalicoOrphanVethThresh),
 	}
 }

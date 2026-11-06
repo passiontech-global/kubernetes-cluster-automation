@@ -82,7 +82,7 @@ func dashedHost(addr string) string {
 func kubelet10250Alive(d *wdeps.Deps, ctx context.Context) bool {
 	bearer := kubeletBearer(d)
 	for i := 0; i < wdeps.ProbeAttempts; i++ {
-		if _, err := d.Cfg.Seams.ProbeHTTPStatus(ctx,
+		if _, err := d.Cfg.Seams.Probe.ProbeHTTPStatus(ctx,
 			d.Cfg.Kubelet.HealthzURL, bearer, wdeps.ProbeTimeout); err == nil {
 			return true
 		}
@@ -101,7 +101,7 @@ func kubelet10250Alive(d *wdeps.Deps, ctx context.Context) bool {
 // `find $KUBELET_PODS_DIR -mindepth 1 -maxdepth 1 -type d | wc -l`.
 // ok=false means the dir is unreadable (treated like missing).
 func podDirCount(d *wdeps.Deps) (n int, ok bool) {
-	entries, err := os.ReadDir(d.Cfg.Kubelet.PodsDir)
+	entries, err := os.ReadDir(d.Cfg.PodsDir)
 	if err != nil {
 		return 0, false
 	}
@@ -298,15 +298,15 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// cleanly but every per-pod join then fails ENOTDIR — the same
 	// false wedge via a different syscall. Inconclusive — keep
 	// counters/latch exactly like the !apiOK path.
-	st, err := os.Stat(c.d.Cfg.Kubelet.PodsDir)
+	st, err := os.Stat(c.d.Cfg.PodsDir)
 	if err != nil || !st.IsDir() {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: kubelet pods dir %s unstatable or not a directory (isdir=%v, err=%v) — watch-wedge inconclusive, keeping state",
-			c.d.Cfg.Kubelet.PodsDir, err == nil && st.IsDir(), err))
+			c.d.Cfg.PodsDir, err == nil && st.IsDir(), err))
 		c.d.Cycles.WithLabelValues(wdeps.CheckWatch, "abort").Inc()
 		return
 	}
-	now := c.d.Cfg.Seams.NowFn()
+	now := c.d.Cfg.Seams.Host.NowFn()
 	missing := 0
 	for i := range e.Pods {
 		p := &e.Pods[i]
@@ -319,7 +319,7 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if ct.IsZero() || now.Sub(ct) < c.d.Cfg.Kubelet.WatchMinAge {
 			continue
 		}
-		if st, err := os.Stat(filepath.Join(c.d.Cfg.Kubelet.PodsDir,
+		if st, err := os.Stat(filepath.Join(c.d.Cfg.PodsDir,
 			string(p.UID))); err != nil || !st.IsDir() {
 			missing++
 		}

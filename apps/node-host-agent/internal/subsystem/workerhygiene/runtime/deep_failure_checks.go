@@ -97,7 +97,7 @@ func emitOOMEvent(d *wdeps.Deps, ctx context.Context, comm string,
 	if d.Cfg.Client == nil {
 		return
 	}
-	now := d.Cfg.Seams.NowFn()
+	now := d.Cfg.Seams.Host.NowFn()
 	when := now
 	if epoch > 0 {
 		when = time.Unix(epoch, 0)
@@ -220,7 +220,7 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if err != nil {
 			continue
 		}
-		if c.d.Cfg.Seams.NowFn().Sub(fi.ModTime()) < orphanHostPathMinAge {
+		if c.d.Cfg.Seams.Host.NowFn().Sub(fi.ModTime()) < orphanHostPathMinAge {
 			continue // inside the deletion grace window
 		}
 		if !c.d.DiskUsageAboveWatermark(filepath.Dir(cd.path)) {

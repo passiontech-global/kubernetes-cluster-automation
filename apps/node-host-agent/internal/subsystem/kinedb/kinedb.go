@@ -60,6 +60,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // Defaults mirror the shell scripts + their systemd timers.
@@ -187,7 +188,7 @@ type Config struct {
 	LongCmdTimeout time.Duration // compact/vacuum/reindex/repack budget
 
 	// --- injectable seams (defaults follow) ---
-	nowFn  func() time.Time
+	nowFn  timex.Clock
 	run    runner
 	wireFn func(ctx context.Context, addr string) bool
 }
@@ -279,7 +280,7 @@ func (c *Config) applyDefaults() error {
 		c.LongCmdTimeout = defaultLongCmdTimeout
 	}
 	if c.nowFn == nil {
-		c.nowFn = time.Now
+		c.nowFn = timex.SystemClock
 	}
 	if c.run == nil {
 		c.run = func(ctx context.Context, argv []string, stdin string) (string, error) {

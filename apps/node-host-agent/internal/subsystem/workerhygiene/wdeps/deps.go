@@ -102,7 +102,7 @@ type Deps struct {
 	// State is the shared hoststate.Store for the watchdog state-dir
 	// contract (state-* latches, last-* rate budgets, installed/
 	// last-run heartbeat, watchdog log appends). Its clock is a
-	// closure over the LIVE Cfg.Seams.NowFn so post-construction test
+	// closure over the LIVE Cfg.Seams.Host.NowFn so post-construction test
 	// stubs still apply; its RateTrySpend mutex serialises the
 	// feeder-vs-Cycle check+spend pairs the old rateMu guarded
 	// (TOCTOU double-restart on the shared last-* budgets).

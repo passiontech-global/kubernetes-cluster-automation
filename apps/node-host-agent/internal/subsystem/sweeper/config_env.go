@@ -3,6 +3,7 @@ package sweeper
 import (
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -23,12 +24,12 @@ func ConfigFromEnv(d EnvDeps) Config {
 	cfg := Config{Client: d.Client}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
-		envx.StringKnob("NODE_HOST_AGENT_SWEEP_BASE_DIR", &cfg.BaseDir, defaultBaseDir),
-		envx.DurationKnob("NODE_HOST_AGENT_SWEEP_MIN_AGE", &cfg.MinAge, defaultMinAge),
-		envx.IntKnob("NODE_HOST_AGENT_SWEEP_MAX_DELETE", &cfg.MaxDelete, defaultMaxDelete),
-		envx.DurationKnob("NODE_HOST_AGENT_SWEEP_INTERVAL", &cfg.Interval, defaultInterval),
-		envx.StringKnob("NODE_HOST_AGENT_MOUNTS_FILE", &cfg.MountsFile, defaultMountsFile),
-		envx.DurationKnob("NODE_HOST_AGENT_REQUEST_TIMEOUT", &cfg.RequestTimeout, defaultRequestTimeout),
+		envx.StringKnob(envnames.EnvSweepBaseDir, &cfg.BaseDir, envnames.DefaultSweepBaseDir),
+		envx.DurationKnob(envnames.EnvSweepMinAge, &cfg.MinAge, defaultMinAge),
+		envx.IntKnob(envnames.EnvSweepMaxDelete, &cfg.MaxDelete, defaultMaxDelete),
+		envx.DurationKnob(envnames.EnvSweepInterval, &cfg.Interval, defaultInterval),
+		envx.StringKnob(envnames.EnvMountsFile, &cfg.MountsFile, defaultMountsFile),
+		envx.DurationKnob(envnames.EnvRequestTimeout, &cfg.RequestTimeout, defaultRequestTimeout),
 	})
 	return cfg
 }

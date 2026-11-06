@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // Config carries the host paths — all test-injectable.
@@ -137,7 +139,7 @@ type Config struct {
 	LatchInterval time.Duration
 
 	// nowFn supplies the current time — seam for tests.
-	nowFn func() time.Time
+	nowFn timex.Clock
 	// cpuMeasure replaces the real RUSAGE_THREAD busy-loop for
 	// tests: returns (ratio, wallSeconds, ok).
 	cpuMeasure func() (ratio, wall float64, ok bool)
@@ -193,7 +195,7 @@ func (c *Config) applyDefaults() {
 		c.CPUDeliveredInterval = defaultCPUDeliveredIn
 	}
 	if c.nowFn == nil {
-		c.nowFn = time.Now
+		c.nowFn = timex.SystemClock
 	}
 	if len(c.RemovedFlags) == 0 {
 		c.RemovedFlags = defaultRemovedFlags

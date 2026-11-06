@@ -3,6 +3,7 @@ package hubsync
 import (
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -37,8 +38,8 @@ func ConfigFromEnv(d EnvDeps) Config {
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
-		envx.StringKnob("NODE_HOST_AGENT_NEBULA_CERTS_DIR", &cfg.NebulaCertsDir, defaultNebulaCertsDir),
-		envx.StringKnob("NODE_HOST_AGENT_CONVERGE_SSH_KEY", &cfg.SSHKeyPath, defaultSSHKeyPath),
+		envx.StringKnob(envnames.EnvNebulaCertsDir, &cfg.NebulaCertsDir, defaultNebulaCertsDir),
+		envx.StringKnob(envnames.EnvConvergeSSHKey, &cfg.SSHKeyPath, defaultSSHKeyPath),
 	})
 	return cfg
 }

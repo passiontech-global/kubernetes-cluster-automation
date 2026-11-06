@@ -106,7 +106,7 @@ func TestKubeletFeederGateUptime(t *testing.T) {
 	// Gate-0 re-probe runs before every gate: 4 failed ticks + 2
 	// failed re-probes before G1 is even evaluated.
 	var probes int
-	e.H.Cfg.Seams.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
+	e.H.Cfg.Seams.Probe.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
 		probes++
 		return false
 	}
@@ -309,7 +309,7 @@ func TestKubeletRemediateReprobeSelfCorrects(t *testing.T) {
 	latch := filepath.Join(e.StateDir, "state-kubelet-healthz-down")
 	wdepstest.WriteFile(t, latch, "1\n") // leftover from an earlier episode
 	var probes int
-	e.H.Cfg.Seams.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
+	e.H.Cfg.Seams.Probe.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
 		probes++
 		return probes > wdeps.DefaultKubeletWdMaxFail // ticks 1..4 fail, re-probe 1 OK
 	}
@@ -336,7 +336,7 @@ func TestKubeletRemediateReprobeSecondProbeOK(t *testing.T) {
 	e := fixture(t)
 	// First re-probe fails, second answers — still self-corrects.
 	var probes int
-	e.H.Cfg.Seams.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
+	e.H.Cfg.Seams.Probe.ProbeBodyOK = func(_ context.Context, _ string, _ time.Duration) bool {
 		probes++
 		return probes > wdeps.DefaultKubeletWdMaxFail+1
 	}

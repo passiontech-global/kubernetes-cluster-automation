@@ -4,6 +4,7 @@
 package wdeps
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -53,9 +54,9 @@ func (cl *CiliumConfig) applyDefaults() {
 // → in-package default).
 func (cl *CiliumConfig) envKnobs(hostPath func(string) string) []envx.Knob {
 	return []envx.Knob{
-		envx.StringKnob("NODE_HOST_AGENT_CILIUM_SOCKET", &cl.Socket,
+		envx.StringKnob(envnames.EnvCiliumSocket, &cl.Socket,
 			hostPath("/run/cilium/cilium.sock")),
 		// W7 knob — empty env → in-package default.
-		envx.StringKnob("NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL", &cl.EnvoyAdminURL, ""),
+		envx.StringKnob(envnames.EnvCiliumEnvoyAdminURL, &cl.EnvoyAdminURL, ""),
 	}
 }

@@ -7,6 +7,7 @@ package wdeps
 import (
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/topology"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -58,15 +59,16 @@ func ConfigFromEnv(d EnvDeps) Config {
 	// The env surface, one row per knob — the rows live beside
 	// their domain's type in config_<domain>.go; the assembly
 	// order below is the pre-split table's exact order (shared
-	// wiring, net, kubelet, cilium, ctr, teardown, pressure,
-	// calico, shared budgets, runtime). Every row writes a
-	// distinct field, so order is documentation, not semantics.
+	// wiring, net, kubelet, cilium, teardown, pressure, calico,
+	// shared budgets, runtime). The ctr rows moved into
+	// wiringEnvKnobs when CtrSocket promoted to the top-level
+	// Config. Every row writes a distinct field, so order is
+	// documentation, not semantics.
 	var knobs []envx.Knob
 	knobs = append(knobs, cfg.wiringEnvKnobs(hostPath)...)
-	knobs = append(knobs, cfg.Net.envKnobs(hostPath)...)
-	knobs = append(knobs, cfg.Kubelet.envKnobs(hostPath, d)...)
+	knobs = append(knobs, cfg.Net.envKnobs()...)
+	knobs = append(knobs, cfg.Kubelet.envKnobs(d)...)
 	knobs = append(knobs, cfg.Cilium.envKnobs(hostPath)...)
-	knobs = append(knobs, cfg.Ctr.envKnobs(hostPath)...)
 	knobs = append(knobs, cfg.Teardown.envKnobs()...)
 	knobs = append(knobs, cfg.Pressure.envKnobs()...)
 	knobs = append(knobs, cfg.Calico.envKnobs()...)
@@ -87,7 +89,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 // vars dir yields nil — the feeder self-gates on k0sworker.service,
 // so the list is advisory. Ported verbatim from cmd/agent.
 func KubeletWatchdogHosts(varsDir, nodeName string) []string {
-	if l := envx.List("NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS"); l != nil {
+	if l := envx.List(envnames.EnvKubeletWatchdogHosts); l != nil {
 		return l
 	}
 	t, err := topology.Load(topology.Config{VarsDir: varsDir, NodeName: nodeName})

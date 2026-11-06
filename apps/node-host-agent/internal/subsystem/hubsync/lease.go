@@ -9,6 +9,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	coordclient "k8s.io/client-go/kubernetes/typed/coordination/v1"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // lease is a minimal coordinationv1 Lease acquire/renew loop —
@@ -22,7 +24,7 @@ type lease struct {
 	name     string
 	identity string
 	duration time.Duration
-	now      func() time.Time
+	now      timex.Clock
 }
 
 // renew performs one acquire/renew step and reports whether the

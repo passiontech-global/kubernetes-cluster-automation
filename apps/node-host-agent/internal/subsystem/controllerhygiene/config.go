@@ -18,12 +18,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/etcdmaint"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/eventpurge"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/etcdmaint"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/eventpurge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // Config carries the subsystem knobs — all test-injectable. The
@@ -132,7 +133,7 @@ type Config struct {
 	PKIDrift PKIDriftConfig
 
 	// --- injectable seams (defaults follow) ---
-	nowFn     func() time.Time
+	nowFn     timex.Clock
 	sleepFn   func(d time.Duration)
 	killFn    func(pid int, sig syscall.Signal) error
 	listRVFn  func(ctx context.Context, endpoint string, cached bool) (rv int64, ok bool)
@@ -229,7 +230,7 @@ func (c *Config) applyDefaults() {
 	c.applyOOMLoopDefaults()
 	c.applyFeederDefaults()
 	if c.nowFn == nil {
-		c.nowFn = time.Now
+		c.nowFn = timex.SystemClock
 	}
 	if c.sleepFn == nil {
 		c.sleepFn = time.Sleep

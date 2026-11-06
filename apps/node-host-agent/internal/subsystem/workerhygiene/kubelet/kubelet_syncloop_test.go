@@ -121,14 +121,14 @@ func TestSyncloopProbeSendsBearerToken(t *testing.T) {
 func TestContainerdSockDownLatches(t *testing.T) {
 	e := fixture(t)
 	e.SDReply["is-active k0sworker.service"] = "active"
-	e.SockErrs[e.H.Cfg.Ctr.Socket] = errors.New("connection refused")
+	e.SockErrs[e.H.Cfg.CtrSocket] = errors.New("connection refused")
 	for i := 0; i < 2; i++ {
 		e.H.Cycle(context.Background())
 	}
 	if !e.H.State.Exists("containerd-sock-down") {
 		t.Fatal("state-containerd-sock-down should latch after 2 socket failures")
 	}
-	e.SockErrs[e.H.Cfg.Ctr.Socket] = nil
+	e.SockErrs[e.H.Cfg.CtrSocket] = nil
 	e.H.Cycle(context.Background())
 	if e.H.State.Exists("containerd-sock-down") {
 		t.Fatal("recovery should clear the containerd-sock latch")
@@ -144,9 +144,9 @@ func TestContainerdSockDownLatches(t *testing.T) {
 func TestContainerdSocketDefaultPinsK0sPath(t *testing.T) {
 	c := wdeps.Config{}
 	c.ApplyDefaults()
-	if c.Ctr.Socket != "/host/run/k0s/containerd.sock" {
+	if c.CtrSocket != "/host/run/k0s/containerd.sock" {
 		t.Fatalf("default ContainerdSocket=%q, want /host/run/k0s/containerd.sock",
-			c.Ctr.Socket)
+			c.CtrSocket)
 	}
 	if c.Kubelet.TokenPath != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
 		t.Fatalf("default KubeletTokenPath=%q, want the pod SA token path",
@@ -165,7 +165,7 @@ func TestProbeUnixSockDefaultReturnsNilOnConnect(t *testing.T) {
 	defer func() { _ = ln.Close() }()
 	c := wdeps.Config{}
 	c.ApplyDefaults()
-	if err := c.Seams.ProbeUnixSock(context.Background(), sock, time.Second); err != nil {
+	if err := c.Seams.Probe.ProbeUnixSock(context.Background(), sock, time.Second); err != nil {
 		t.Fatalf("successful unix dial want nil, got %v", err)
 	}
 }

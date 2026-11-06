@@ -30,7 +30,7 @@ func (c *ConntrackLiberalCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	if _, err := os.Stat(filepath.Join(
-		c.d.Cfg.Net.SysClassNet, c.d.Cfg.Net.NebulaIface)); err != nil {
+		c.d.Cfg.SysClassNet, c.d.Cfg.NebulaIface)); err != nil {
 		// No nebula iface — the asymmetric-path problem this guard
 		// exists for can't occur; leave the kernel default alone.
 		c.d.Cycles.WithLabelValues(wdeps.CheckConntrackLiberal, "ok").Inc()

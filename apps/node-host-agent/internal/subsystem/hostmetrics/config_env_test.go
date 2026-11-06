@@ -4,6 +4,8 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 )
 
 // testHostPath mirrors cmd/agent's hostPath closure: identity on "/",
@@ -75,21 +77,21 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 // TestConfigFromEnvOverrides sets every knob and verifies env wins —
 // including the envList parsers' trim/drop-empty behaviour.
 func TestConfigFromEnvOverrides(t *testing.T) {
-	t.Setenv("NODE_HOST_AGENT_KEY_USERS_FILE", "/x/key-users")
-	t.Setenv("NODE_HOST_AGENT_LATCH_INTERVAL", "45s")
-	t.Setenv("NODE_HOST_AGENT_SYS_CLASS_NET", "/sys2")
-	t.Setenv("NODE_HOST_AGENT_NEBULA_IFACE", "neb9")
-	t.Setenv("NODE_HOST_AGENT_HOST_ROUTE_FILE", "/route")
-	t.Setenv("NODE_HOST_AGENT_K0S_CONFIG", "/k0s.yaml")
-	t.Setenv("NODE_HOST_AGENT_K0S_UNIT", "/unit.service")
-	t.Setenv("NODE_HOST_AGENT_NEBULA_CERT", "/cert.crt")
-	t.Setenv("NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS", "a, b ,,c")
-	t.Setenv("NODE_HOST_AGENT_PSI_FILE", "/psi")
-	t.Setenv("NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL", "5m")
-	t.Setenv("NODE_HOST_AGENT_CONNTRACK_STAT_FILE", "/ctstat")
-	t.Setenv("NODE_HOST_AGENT_ARP_TABLE_FILE", "/arp")
-	t.Setenv("NODE_HOST_AGENT_CGROUP_MEM_UNITS", "u1, u2")
-	t.Setenv("NODE_HOST_AGENT_FILESYSTEM_TARGETS", "/f1, /f2")
+	t.Setenv(envnames.EnvKeyUsersFile, "/x/key-users")
+	t.Setenv(envnames.EnvLatchInterval, "45s")
+	t.Setenv(envnames.EnvSysClassNet, "/sys2")
+	t.Setenv(envnames.EnvNebulaIface, "neb9")
+	t.Setenv(envnames.EnvHostRouteFile, "/route")
+	t.Setenv(envnames.EnvK0sConfig, "/k0s.yaml")
+	t.Setenv(envnames.EnvK0sUnit, "/unit.service")
+	t.Setenv(envnames.EnvNebulaCert, "/cert.crt")
+	t.Setenv(envnames.EnvK0sExpectedKcmArgs, "a, b ,,c")
+	t.Setenv(envnames.EnvPsiFile, "/psi")
+	t.Setenv(envnames.EnvCPUDeliveredInterval, "5m")
+	t.Setenv(envnames.EnvConntrackStatFile, "/ctstat")
+	t.Setenv(envnames.EnvArpTableFile, "/arp")
+	t.Setenv(envnames.EnvCgroupMemUnits, "u1, u2")
+	t.Setenv(envnames.EnvFilesystemTargets, "/f1, /f2")
 
 	cfg := ConfigFromEnv(EnvDeps{HostPath: testHostPath("/host")})
 

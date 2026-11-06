@@ -154,7 +154,7 @@ func (f *Feeder) Tick(ctx context.Context) {
 	if !active {
 		return
 	}
-	if d.Cfg.Seams.ProbeBodyOK(ctx, d.Cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
+	if d.Cfg.Seams.Probe.ProbeBodyOK(ctx, d.Cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
 		if f.WdFails > 0 {
 			d.State.AppendLog(fmt.Sprintf(
 				"kubelet-feeder: probe OK again after %d fail", f.WdFails))
@@ -222,7 +222,7 @@ func (f *Feeder) remediate(ctx context.Context) {
 	// (drop the fail streak and any escalation latch), never spend a
 	// restart on a healthy kubelet.
 	for i := 1; i <= 2; i++ {
-		if d.Cfg.Seams.ProbeBodyOK(ctx, d.Cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
+		if d.Cfg.Seams.Probe.ProbeBodyOK(ctx, d.Cfg.Kubelet.WdProbeURL, kubeletWdProbeTimeout) {
 			d.State.AppendLog(fmt.Sprintf(
 				"kubelet-remediate: SKIP(G0-reprobe) :10248 answered 'ok' on re-probe %d — false alarm (steal blip), self-correcting", i))
 			f.WdFails = 0
@@ -334,7 +334,7 @@ func anyAPIBackendLive(d *wdeps.Deps, ctx context.Context) bool {
 		// answered (curl -sk parity; a 2xx-only read made an
 		// auth-refusing or LB-degraded endpoint look "unreachable"
 		// and falsely gated remediation as isolated).
-		if _, err := d.Cfg.Seams.ProbeHTTPStatus(ctx, url, "",
+		if _, err := d.Cfg.Seams.Probe.ProbeHTTPStatus(ctx, url, "",
 			apiLivezProbeTimeout); err == nil {
 			return true
 		}

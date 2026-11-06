@@ -1,6 +1,7 @@
 package nethealth
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -31,22 +32,22 @@ func ConfigFromEnv(d EnvDeps) Config {
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{
-		envx.DurationKnob("NODE_HOST_AGENT_NETHEALTH_INTERVAL", &cfg.Interval, defaultInterval),
+		envx.DurationKnob(envnames.EnvNethealthInterval, &cfg.Interval, defaultInterval),
 		// hostPath defaults — NOT defaultHostResolvConf/defaultHostsFile,
 		// which hardcode the "/host" prefix and would be wrong on a
 		// standalone host (hostRoot "/").
-		envx.StringKnob("NODE_HOST_AGENT_HOST_RESOLV_CONF", &cfg.HostResolvConf,
+		envx.StringKnob(envnames.EnvHostResolvConf, &cfg.HostResolvConf,
 			d.PathJoin("/etc/resolv.conf")),
-		envx.StringKnob("NODE_HOST_AGENT_HOSTS_FILE", &cfg.HostsFile,
+		envx.StringKnob(envnames.EnvHostsFile, &cfg.HostsFile,
 			d.PathJoin("/etc/hosts")),
-		envx.StringKnob("NODE_HOST_AGENT_PROC_NET_UDP", &cfg.ProcNetUDP, defaultProcNetUDP),
-		envx.StringKnob("NODE_HOST_AGENT_PROC_NET_UDP6", &cfg.ProcNetUDP6, defaultProcNetUDP6),
-		envx.StringKnob("NODE_HOST_AGENT_UPTIME_FILE", &cfg.UptimeFile, defaultUptimeFile),
-		envx.IntKnob("NODE_HOST_AGENT_NETHEALTH_CONSEC_NEEDED", &cfg.ConsecNeeded, defaultConsecNeeded),
-		envx.DurationKnob("NODE_HOST_AGENT_NETHEALTH_MIN_RESTART", &cfg.MinRestart, defaultMinRestart),
+		envx.StringKnob(envnames.EnvProcNetUDP, &cfg.ProcNetUDP, defaultProcNetUDP),
+		envx.StringKnob(envnames.EnvProcNetUDP6, &cfg.ProcNetUDP6, defaultProcNetUDP6),
+		envx.StringKnob(envnames.EnvUptimeFile, &cfg.UptimeFile, defaultUptimeFile),
+		envx.IntKnob(envnames.EnvNethealthConsecNeeded, &cfg.ConsecNeeded, defaultConsecNeeded),
+		envx.DurationKnob(envnames.EnvNethealthMinRestart, &cfg.MinRestart, defaultMinRestart),
 		// W8: pref-1499 direct-underlay TCP bypass; empty env → nil →
 		// applyDefaults' package default [22 6443 8132 9443 39901].
-		envx.IntListKnob("NODE_HOST_AGENT_NEBULA_DIRECT_TCP_PORTS", &cfg.NebulaDirectTCPPorts),
+		envx.IntListKnob(envnames.EnvNebulaDirectTCPPorts, &cfg.NebulaDirectTCPPorts),
 	})
 	return cfg
 }

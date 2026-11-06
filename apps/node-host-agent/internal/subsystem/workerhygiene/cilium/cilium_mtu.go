@@ -42,8 +42,8 @@ func (c *CiliumMTUCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumMTU, "gated").Inc()
 		return
 	}
-	neb, nebOK := hostutil.MTUOfIface(c.d.Cfg.Net.SysClassNet, c.d.Cfg.Net.NebulaIface)
-	cil, cilOK := hostutil.MTUOfIface(c.d.Cfg.Net.SysClassNet, c.d.Cfg.Cilium.Iface)
+	neb, nebOK := hostutil.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.NebulaIface)
+	cil, cilOK := hostutil.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.Cilium.Iface)
 	if !cilOK {
 		cil, cilOK = hostutil.RuntimeConfigMTU(c.d.Cfg.Cilium.RuntimeConfig)
 	}
@@ -52,7 +52,7 @@ func (c *CiliumMTUCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	// leave room for the WG header (~60B) under the overlay MTU.
 	// A wg0 MTU above neb−60 means pod packets exceed what the
 	// double-encapsulated path can carry → silent blackhole.
-	wg, wgOK := hostutil.MTUOfIface(c.d.Cfg.Net.SysClassNet, c.d.Cfg.Cilium.WG0Iface)
+	wg, wgOK := hostutil.MTUOfIface(c.d.Cfg.SysClassNet, c.d.Cfg.Cilium.WG0Iface)
 	if !nebOK {
 		// No overlay to compare against — a drift latch from
 		// before must not linger.

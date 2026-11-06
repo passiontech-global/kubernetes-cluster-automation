@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -32,17 +33,17 @@ func testEnvDeps(t *testing.T) wdeps.EnvDeps {
 }
 
 func TestConfigFromEnv(t *testing.T) {
-	t.Setenv("NODE_HOST_AGENT_HYGIENE_INTERVAL", "5m")
-	t.Setenv("NODE_HOST_AGENT_PROC_ROOT", "/host/proc")
-	t.Setenv("NODE_HOST_AGENT_CONTAINERD_SOCKET", "/custom/containerd.sock")
-	t.Setenv("NODE_HOST_AGENT_KUBELET_TOKEN_FILE", "/custom/sa-token")
-	t.Setenv("NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS", "a , b")
-	t.Setenv("NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE", "20m")
-	t.Setenv("NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE", "9")
-	t.Setenv("NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD", "7")
-	t.Setenv("NODE_HOST_AGENT_CALICO_ORPHAN_VETH_THRESHOLD", "77")
-	t.Setenv("NODE_HOST_AGENT_CGROUP_ROOT", "/custom/cgroup")
-	t.Setenv("NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR", "/custom/sessions")
+	t.Setenv(envnames.EnvHygieneInterval, "5m")
+	t.Setenv(envnames.EnvProcRoot, "/host/proc")
+	t.Setenv(envnames.EnvContainerdSocket, "/custom/containerd.sock")
+	t.Setenv(envnames.EnvKubeletTokenFile, "/custom/sa-token")
+	t.Setenv(envnames.EnvKubeletWatchdogHosts, "a , b")
+	t.Setenv(envnames.EnvHygieneStuckDeleteAge, "20m")
+	t.Setenv(envnames.EnvHygieneMaxForceDelete, "9")
+	t.Setenv(envnames.EnvDstateStormThreshold, "7")
+	t.Setenv(envnames.EnvCalicoOrphanVethThreshold, "77")
+	t.Setenv(envnames.EnvCgroupRoot, "/custom/cgroup")
+	t.Setenv(envnames.EnvSystemdSessionsDir, "/custom/sessions")
 
 	d := testEnvDeps(t)
 	cfg := wdeps.ConfigFromEnv(d)
@@ -72,8 +73,8 @@ func TestConfigFromEnv(t *testing.T) {
 	if cfg.CtrTaskRoot != "/host/run/k0s/containerd/io.containerd.runtime.v2.task/k8s.io" {
 		t.Fatalf("CtrTaskRoot=%q", cfg.CtrTaskRoot)
 	}
-	if cfg.Ctr.Socket != "/custom/containerd.sock" {
-		t.Fatalf("ContainerdSocket=%q", cfg.Ctr.Socket)
+	if cfg.CtrSocket != "/custom/containerd.sock" {
+		t.Fatalf("ContainerdSocket=%q", cfg.CtrSocket)
 	}
 	if cfg.Kubelet.TokenPath != "/custom/sa-token" {
 		t.Fatalf("KubeletTokenPath=%q", cfg.Kubelet.TokenPath)
@@ -149,7 +150,7 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 
 func TestKubeletWatchdogHosts(t *testing.T) {
 	t.Run("env list wins", func(t *testing.T) {
-		t.Setenv("NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS", "a , b")
+		t.Setenv(envnames.EnvKubeletWatchdogHosts, "a , b")
 		got := wdeps.KubeletWatchdogHosts(t.TempDir(), "n")
 		if len(got) != 2 || got[0] != "a" || got[1] != "b" {
 			t.Fatalf("env hosts=%v", got)

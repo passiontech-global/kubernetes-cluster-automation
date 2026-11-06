@@ -87,7 +87,7 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// 2.5: subsystem/datapath health off the agent socket is
 	// evidence only — an unreadable socket must not block the envoy
 	// verdict (the admin port is the primary signal).
-	if body, err := c.d.Cfg.Seams.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/healthz"); err == nil {
+	if body, err := c.d.Cfg.Seams.Cilium.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/healthz"); err == nil {
 		if bad := ciliumUnhealthySubsystems(body); len(bad) > 0 {
 			c.d.State.AppendLog(
 				"suspect: cilium subsystem health degraded: " +
@@ -126,7 +126,7 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			fmt.Sprintf("xDS update_rejected deltas %d consecutive cycles",
 				c.xdsFails))
 	}
-	code, err := c.d.Cfg.Seams.ProbeHTTPStatus(ctx,
+	code, err := c.d.Cfg.Seams.Probe.ProbeHTTPStatus(ctx,
 		c.d.Cfg.Cilium.EnvoyReadyURL, "", ciliumProbeTime)
 	if err == nil && code == http.StatusOK {
 		c.fails = 0
@@ -210,7 +210,7 @@ func (c *CiliumEnvoyCheck) evalEnvoyXDS(ctx context.Context) (reject, inconclusi
 	if c.d.Cfg.Cilium.EnvoyAdminURL == "" {
 		return false, true
 	}
-	body, err := c.d.Cfg.Seams.HTTPGetBody(ctx, c.d.Cfg.Cilium.EnvoyAdminURL, ciliumProbeTime)
+	body, err := c.d.Cfg.Seams.Probe.HTTPGetBody(ctx, c.d.Cfg.Cilium.EnvoyAdminURL, ciliumProbeTime)
 	if err != nil {
 		return false, true
 	}

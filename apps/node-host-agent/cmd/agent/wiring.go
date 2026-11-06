@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/apiprober"
@@ -146,7 +148,7 @@ func (w *wiring) descriptors() []Descriptor {
 		// sweeper: openebs orphan pvc-* dir cleanup.
 		{
 			Name:    "sweeper",
-			EnvFlag: "NODE_HOST_AGENT_ENABLE_SWEEPER",
+			EnvFlag: envnames.EnvEnableSweeper,
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
@@ -161,7 +163,7 @@ func (w *wiring) descriptors() []Descriptor {
 		// path.
 		{
 			Name:    "concourse-cache",
-			EnvFlag: "NODE_HOST_AGENT_ENABLE_CONCOURSE_CACHE",
+			EnvFlag: envnames.EnvEnableConcourseCache,
 			Default: onOff(w.defKube),
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
 				knobs := concoursecache.ConfigFromEnv()
@@ -193,7 +195,7 @@ func (w *wiring) descriptors() []Descriptor {
 		// value.
 		{
 			Name:    "apiprober",
-			EnvFlag: "NODE_HOST_AGENT_ENABLE_APIPROBER",
+			EnvFlag: envnames.EnvEnableApiprober,
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
 				return std(w, apiprober.EnvDeps{Deps: w.Deps},
@@ -209,7 +211,7 @@ func (w *wiring) descriptors() []Descriptor {
 		// half runs as the subsystem.
 		{
 			Name:    "hostmetrics",
-			EnvFlag: "NODE_HOST_AGENT_ENABLE_HOSTMETRICS",
+			EnvFlag: envnames.EnvEnableHostmetrics,
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
 				hm := hostmetrics.New(hostmetrics.ConfigFromEnv(hostmetrics.EnvDeps{
@@ -218,7 +220,12 @@ func (w *wiring) descriptors() []Descriptor {
 					OverlayEgressRelays: w.Watchdog.OverlayEgressRelays,
 					NebulaNet:           w.Watchdog.NebulaNet,
 				}))
-				w.reg.MustRegister(hm)
+				// Registration is fallible — a duplicate/conflicting
+				// collector must surface as "hostmetrics setup
+				// failed", not a MustRegister panic.
+				if err := hm.Register(w.reg); err != nil {
+					return nil, fmt.Errorf("register hostmetrics collector: %w", err)
+				}
 				subs := []agent.Subsystem{hm.Latches()}
 				// Standalone hosts have no Prometheus scrape — the
 				// legacy prom_emit contract is kept by rendering the
@@ -228,7 +235,7 @@ func (w *wiring) descriptors() []Descriptor {
 				if w.standalone {
 					subs = append(subs, cycle.Every(
 						"hostmetrics-textfile",
-						envx.Duration("NODE_HOST_AGENT_TEXTFILE_INTERVAL",
+						envx.Duration(envnames.EnvTextfileInterval,
 							30*time.Second),
 						func(ctx context.Context) {
 							if err := hm.WriteTextfile(w.TextfileDir); err != nil {
@@ -248,7 +255,7 @@ func (w *wiring) descriptors() []Descriptor {
 		// API — the explicit override env wins.
 		{
 			Name:    "workerhygiene",
-			EnvFlag: "NODE_HOST_AGENT_ENABLE_HYGIENE",
+			EnvFlag: envnames.EnvEnableHygiene,
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true, NodeName: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
@@ -260,7 +267,7 @@ func (w *wiring) descriptors() []Descriptor {
 		// Runs on workers AND hub nodes; no kube client needed.
 		{
 			Name:    "nethealth",
-			EnvFlag: "NODE_HOST_AGENT_ENABLE_NETHEALTH",
+			EnvFlag: envnames.EnvEnableNethealth,
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
 				return std(w, nethealth.EnvDeps{Deps: w.Deps},
@@ -275,7 +282,7 @@ func (w *wiring) descriptors() []Descriptor {
 		// needed.
 		{
 			Name:    "janitor",
-			EnvFlag: "NODE_HOST_AGENT_ENABLE_JANITOR",
+			EnvFlag: envnames.EnvEnableJanitor,
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
 				return std(w, janitor.EnvDeps{Deps: w.Deps},
@@ -287,7 +294,7 @@ func (w *wiring) descriptors() []Descriptor {
 		// kube client and a node name.
 		{
 			Name:    "nodereporter",
-			EnvFlag: "NODE_HOST_AGENT_ENABLE_REPORTER",
+			EnvFlag: envnames.EnvEnableReporter,
 			Default: onOff(w.defKube),
 			Needs:   Needs{Kube: true, NodeName: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
@@ -300,7 +307,7 @@ func (w *wiring) descriptors() []Descriptor {
 		// workers and bare API LB VMs self-disable.
 		{
 			Name:    "controllerhygiene",
-			EnvFlag: "NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE",
+			EnvFlag: envnames.EnvEnableControllerhygiene,
 			Default: envx.ModeAuto,
 			Auto: func(w *wiring) bool {
 				return controllerhygiene.ShouldRun(w.HostRoot)
@@ -316,7 +323,7 @@ func (w *wiring) descriptors() []Descriptor {
 		// standalone hosts without config self-disable.
 		{
 			Name:    "hostconfig",
-			EnvFlag: "NODE_HOST_AGENT_ENABLE_HOSTCONFIG",
+			EnvFlag: envnames.EnvEnableHostconfig,
 			Default: envx.ModeAuto,
 			Auto: func(w *wiring) bool {
 				_, err := os.Stat(w.VarsDir + "/defaults.yaml")
@@ -359,7 +366,7 @@ func (w *wiring) descriptors() []Descriptor {
 		// host.
 		{
 			Name:    "kinedb",
-			EnvFlag: "NODE_HOST_AGENT_ENABLE_KINEDB",
+			EnvFlag: envnames.EnvEnableKinedb,
 			Default: envx.ModeAuto,
 			Auto: func(w *wiring) bool {
 				return kinedb.Detect(w.HostRoot, w.VarsDir)

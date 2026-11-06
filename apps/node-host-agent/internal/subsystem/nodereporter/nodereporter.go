@@ -47,6 +47,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // Defaults mirror the removed NPD config and the DaemonSet host mounts.
@@ -115,7 +116,7 @@ type Config struct {
 	// systemd package; tests substitute a fake.
 	journalFetch func(ctx context.Context, args ...string) (string, error)
 	// nowFn supplies the current time — seam for tests.
-	nowFn func() time.Time
+	nowFn timex.Clock
 }
 
 func (c *Config) applyDefaults() {
@@ -168,7 +169,7 @@ func (c *Config) applyDefaults() {
 		}
 	}
 	if c.nowFn == nil {
-		c.nowFn = time.Now
+		c.nowFn = timex.SystemClock
 	}
 }
 

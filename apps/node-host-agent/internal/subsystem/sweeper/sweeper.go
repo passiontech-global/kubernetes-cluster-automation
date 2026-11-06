@@ -55,7 +55,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // pvcNameRe is the last-deletion-belt name check — exactly pvc-<uuid>,
@@ -63,9 +65,10 @@ import (
 var pvcNameRe = regexp.MustCompile(
 	`^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
-// Default values mirror the DaemonSet env defaults.
+// Default values mirror the DaemonSet env defaults. The base-dir
+// default is envnames.DefaultSweepBaseDir — shared with
+// concoursecache since both read EnvSweepBaseDir.
 const (
-	defaultBaseDir        = "/var/openebs/local"
 	defaultMinAge         = 60 * time.Minute
 	defaultMaxDelete      = 10
 	defaultInterval       = time.Hour
@@ -104,13 +107,13 @@ type Config struct {
 	// tests; nil → syscall.Statfs.
 	statfsFn func(path string) (uint64, error)
 	// nowFn supplies the current time — seam for tests; nil → time.Now.
-	nowFn func() time.Time
+	nowFn timex.Clock
 }
 
 // applyDefaults fills zero-valued knobs with the production defaults.
 func (c *Config) applyDefaults() {
 	if c.BaseDir == "" {
-		c.BaseDir = defaultBaseDir
+		c.BaseDir = envnames.DefaultSweepBaseDir
 	}
 	// A trailing "/" would defeat the mount-boundary string compare
 	// (mount table entries are canonical paths).
@@ -134,7 +137,7 @@ func (c *Config) applyDefaults() {
 		c.statfsFn = usedBytes
 	}
 	if c.nowFn == nil {
-		c.nowFn = time.Now
+		c.nowFn = timex.SystemClock
 	}
 }
 

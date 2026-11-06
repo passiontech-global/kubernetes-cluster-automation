@@ -3,14 +3,14 @@ package concoursecache
 import (
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
-// defaultBaseDir is the openebs hostdir root — duplicated from
-// sweeper. Both packages read the SAME env var
-// (NODE_HOST_AGENT_SWEEP_BASE_DIR) since the pruner walks the
-// pvc-*/shared-cache children of the root the orphan sweeper cleans.
-const defaultBaseDir = "/var/openebs/local"
+// The openebs hostdir root is envnames.DefaultSweepBaseDir —
+// shared with sweeper (both read EnvSweepBaseDir) since the pruner
+// walks the pvc-*/shared-cache children of the root the orphan
+// sweeper cleans.
 
 // Knobs bundles everything the caller needs to run the
 // shared-cache pruner: the pruner Config plus the two env-resolved
@@ -38,9 +38,9 @@ type Knobs struct {
 func ConfigFromEnv() Knobs {
 	return Knobs{
 		Config: Config{},
-		CacheRoot: envx.String("NODE_HOST_AGENT_SWEEP_BASE_DIR",
-			defaultBaseDir),
-		Interval: envx.Duration("NODE_HOST_AGENT_CONCOURSE_CACHE_INTERVAL",
+		CacheRoot: envx.String(envnames.EnvSweepBaseDir,
+			envnames.DefaultSweepBaseDir),
+		Interval: envx.Duration(envnames.EnvConcourseCacheInterval,
 			DefaultInterval),
 	}
 }

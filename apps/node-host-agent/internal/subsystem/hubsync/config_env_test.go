@@ -3,12 +3,13 @@ package hubsync
 import (
 	"testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 func TestConfigFromEnv(t *testing.T) {
-	t.Setenv("NODE_HOST_AGENT_CONVERGE_SSH_KEY", "/keys/converge")
-	t.Setenv("NODE_HOST_AGENT_NEBULA_CERTS_DIR", "/certs")
+	t.Setenv(envnames.EnvConvergeSSHKey, "/keys/converge")
+	t.Setenv(envnames.EnvNebulaCertsDir, "/certs")
 
 	cs := testutil.FakeKube()
 	cfg := ConfigFromEnv(EnvDeps{

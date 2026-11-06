@@ -136,57 +136,13 @@ func (a *Agent) probeMux() *http.ServeMux {
 
 // Run starts the configured subsystems, binds both listeners, marks
 // the agent ready, then blocks until ctx is cancelled or a server
-// fails. Shutdown is graceful.
+// fails. Shutdown is graceful. The per-subsystem supervision loop
+// (panic recovery, restart backoff, subUp/restarts metrics) lives in
+// supervisor.go.
 func (a *Agent) Run(ctx context.Context) error {
 	a.started.Store(time.Now().UnixNano())
 
-	for _, sub := range a.cfg.Subsystems {
-		go func() {
-			name := sub.Name()
-			logger().Info("subsystem started", "name", name)
-			up := a.subUp.WithLabelValues(name)
-			restarts := a.restarts.WithLabelValues(name)
-			// Restart backoff doubles per early exit (5s → 5m cap) so
-			// a subsystem that returns instantly can't spam a restart
-			// + error log every cycle; a run that outlived the
-			// current backoff counts as healthy and resets it.
-			backoff := 5 * time.Second
-			for {
-				began := time.Now()
-				up.Set(1)
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							logger().Error("subsystem panicked — restarting",
-								"subsystem", name, "panic", r)
-						}
-					}()
-					sub.Run(ctx)
-				}()
-				up.Set(0)
-				if ctx.Err() != nil {
-					return
-				}
-				restarts.Inc()
-				if time.Since(began) >= backoff {
-					backoff = 5 * time.Second
-				}
-				// Run returned while ctx is live (panic recovered, or
-				// a silent early return) — restart after backoff
-				// instead of letting the subsystem die invisibly.
-				logger().Error("subsystem exited unexpectedly — restarting",
-					"subsystem", sub.Name(), "backoff", backoff)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(backoff):
-				}
-				if backoff *= 2; backoff > 5*time.Minute {
-					backoff = 5 * time.Minute
-				}
-			}
-		}()
-	}
+	a.supervise(ctx)
 
 	metricsLn, err := net.Listen("tcp", a.cfg.MetricsAddr)
 	if err != nil {

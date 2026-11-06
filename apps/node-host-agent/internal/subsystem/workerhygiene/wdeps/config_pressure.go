@@ -6,6 +6,7 @@
 package wdeps
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -40,6 +41,6 @@ func (p *PressureConfig) applyDefaults() {
 // storm threshold (empty env → in-package default).
 func (p *PressureConfig) envKnobs() []envx.Knob {
 	return []envx.Knob{
-		envx.IntKnob("NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD", &p.DStateStormThreshold, defaultDStateStormThreshold),
+		envx.IntKnob(envnames.EnvDstateStormThreshold, &p.DStateStormThreshold, defaultDStateStormThreshold),
 	}
 }

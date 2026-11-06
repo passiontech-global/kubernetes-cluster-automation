@@ -173,7 +173,7 @@ func (c *CiliumIPAMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckCiliumIPAM, "abort").Inc()
 		return
 	}
-	body, err := c.d.Cfg.Seams.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/healthz")
+	body, err := c.d.Cfg.Seams.Cilium.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/healthz")
 	if err != nil {
 		// Socket unreadable — inconclusive: keep counters/latch
 		// (same rule as checkCiliumInitStuck).

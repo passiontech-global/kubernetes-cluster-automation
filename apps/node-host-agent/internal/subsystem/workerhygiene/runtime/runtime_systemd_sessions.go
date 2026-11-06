@@ -71,7 +71,7 @@ func (c *SystemdSessionCheck) scanSessions() (total int, stale []string) {
 	if err != nil {
 		return 0, nil
 	}
-	now := c.d.Cfg.Seams.NowFn()
+	now := c.d.Cfg.Seams.Host.NowFn()
 	for _, en := range ents {
 		if en.IsDir() || strings.HasSuffix(en.Name(), ".ref") {
 			continue
@@ -110,7 +110,7 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// and only the round-trip TIME is the signal. The
 		// measurement uses the seam clock, not time.Now: the test
 		// seam keeps latency deterministic.
-		t0 := c.d.Cfg.Seams.NowFn()
+		t0 := c.d.Cfg.Seams.Host.NowFn()
 		if _, err := sd.Exec(ctx, "systemctl", "is-system-running"); err != nil {
 			// A non-zero exit is still a D-Bus round trip (degraded
 			// reports exit 1); only log at debug level via suspect
@@ -118,7 +118,7 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			logger().Debug("workerhygiene: is-system-running probe non-ok",
 				"error", err)
 		}
-		latency = c.d.Cfg.Seams.NowFn().Sub(t0).Seconds()
+		latency = c.d.Cfg.Seams.Host.NowFn().Sub(t0).Seconds()
 		c.d.SystemdDbusLatencySec = latency
 	}
 	triggered := len(stale) >= systemdSessionAbandonedMin ||

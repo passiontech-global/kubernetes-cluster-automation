@@ -57,12 +57,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/ctr"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/guards"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/kubelet"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/pods"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/runtime"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -76,57 +71,32 @@ import (
 type Hygiene struct {
 	*wdeps.Deps
 
-	// checks is the ordered per-Cycle dispatch list — initChecks
-	// fills it; the order preserves the sequence the checks ran
-	// before the table existed. Cycle wraps it into a checks.Group
-	// for platform/checks.Dispatch (the Entry.Run closures bind
-	// the per-cycle env — see Cycle). The checks are also named
-	// fields so tests can reach per-check state and the old
-	// Hygiene-method forwarders resolve without a list walk.
-	checks           []wdeps.Check
-	stall            *kubelet.StallCheck
-	watch            *kubelet.WatchWedgeCheck
-	teardown         *pods.PodTeardownCheck
-	konn             *pods.KonnCheck
-	dns              *pods.DNSResolvCheck
-	syncloop         *kubelet.SyncloopCheck
-	ctrsock          *kubelet.CtrsockCheck
-	ctrTasks         *ctr.CtrTasksCheck
-	ingestGC         *ctr.IngestGCCheck
-	cilium           *cilium.CiliumCheck
-	ciliumInit       *cilium.CiliumInitCheck
-	ctrImages        *ctr.CtrImagesCheck
-	ciliumIPAM       *cilium.CiliumIPAMCheck
-	ciliumEnvoy      *cilium.CiliumEnvoyCheck
-	ciliumMTU        *cilium.CiliumMTUCheck
-	ciliumWG         *cilium.CiliumWGCheck
-	diskBloat        *runtime.DiskBloatCheck
-	journald         *guards.JournaldCheck
-	zombies          *guards.ZombieStormCheck
-	dstate           *guards.DstateCheck
-	scopes           *guards.ScopesCheck
-	ciliumLRP        *cilium.CiliumLRPCheck
-	spegel           *guards.SpegelCheck
-	calico           *guards.CalicoCheck
-	cniNetns         *guards.CNINetnsCheck
-	psiThrash        *guards.PSIThrashCheck
-	ctrMeta          *ctr.CtrMetaCheck
-	hostOOM          *runtime.HostOOMCheck
-	orphanHP         *runtime.OrphanHPCheck
-	cgroupDying      *runtime.CgroupDyingCheck
-	systemdSessions  *runtime.SystemdSessionCheck
-	overlayFSStale   *runtime.OverlayFSStaleCheck
-	ioPressure       *runtime.IOPressureCheck
-	conntrackLiberal *runtime.ConntrackLiberalCheck
-	clockJump        *runtime.ClockJumpCheck
-	unlinkedFDs      *runtime.UnlinkedOpenFilesCheck
-	cgroupSwap       *runtime.CgroupSwapCheck
-	cgroupThrottle   *runtime.CgroupThrottleCheck
+	// envCell is the per-cycle CycleEnv cell the dispatch entries
+	// read through: initChecks builds the checks.Entry table ONCE
+	// (each Run closes over this cell, not a per-cycle env) and
+	// Cycle assigns a fresh CycleEnv into it each round. Dispatch
+	// runs synchronously in the Cycle goroutine and no check
+	// retains the pointer past its Run call, so the swap is
+	// race-free — the controllerhygiene/nethealth static-table
+	// pattern.
+	envCell *wdeps.CycleEnv
+
+	// checks is the ordered check list initChecks fills — Check
+	// walks it for the domain test packages (wdepstest.Check is
+	// the typed path; the old per-check named fields are gone).
+	checks []wdeps.Check
+
+	// groups is the static dispatch table initChecks builds once —
+	// a single UNGATED checks.Group (the unit-file and uptime gates
+	// return early in Cycle and workerActive gates inside each
+	// check, so nothing maps onto Group.GateOK). Entry order IS
+	// checks order — load-bearing.
+	groups []checks.Group
 
 	// feeder is the T15 kubelet watchdog feeder — not a Check (it
 	// runs on its own faster ticker Spawned from Run, outside the
-	// dispatch list) but owned here for the same reason the checks
-	// are named fields: tests reach its streak through it.
+	// dispatch list) but owned here so tests reach its streak
+	// through Feeder().
 	feeder *kubelet.Feeder
 }
 
@@ -156,10 +126,10 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	cfg.ApplyDefaults()
 	d := &wdeps.Deps{Cfg: cfg, Proc: procfs.New(cfg.ProcRoot)}
 	// Now MUST close over the live config field, not the cfg
-	// parameter: tests re-stub h.Cfg.Seams.NowFn after New returns and
+	// parameter: tests re-stub h.Cfg.Seams.Host.NowFn after New returns and
 	// the store has to observe the new clock (hoststate.New doc).
 	d.State = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
-		func() time.Time { return d.Cfg.Seams.NowFn() }, logger)
+		func() time.Time { return d.Cfg.Seams.Host.NowFn() }, logger)
 	d.JournalReads = journalwatch.Tracker{
 		Needed: cfg.Journal.UnreadableNeeded,
 		Dirs:   cfg.Journal.Dirs,
@@ -198,7 +168,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		Help: "Stale containerd content ingest dirs removed by the ingest GC (39).",
 	})
 
-	h := &Hygiene{Deps: d}
+	h := &Hygiene{Deps: d, envCell: &wdeps.CycleEnv{}}
 	if reg != nil {
 		for _, c := range []prometheus.Collector{
 			d.Cycles, d.Actions, d.CiliumAllocated, d.CiliumLeaked,
@@ -218,10 +188,10 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 func (h *Hygiene) Name() string { return "workerhygiene" }
 
 // Check returns the registered check with the given wdeps.Check*
-// name, or nil. The named fields are the in-package path to check
-// state; this is the exported one — the domain test packages
-// (package X_test beside the check) reach their check's
-// streak/latch bookkeeping through it.
+// name, or nil. This is the exported path to check state — the
+// domain test packages (package X_test beside the check) reach
+// their check's streak/latch bookkeeping through it via
+// wdepstest.Check.
 func (h *Hygiene) Check(name string) wdeps.Check {
 	for _, c := range h.checks {
 		if c.Name() == name {
@@ -323,7 +293,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	journalOnce := func() string {
 		if !journalSet {
 			journalSet = true
-			j, err := h.Cfg.Seams.JournalFn(ctx)
+			j, err := h.Cfg.Seams.Host.JournalFn(ctx)
 			switch {
 			case err != nil:
 				h.State.AppendLog(fmt.Sprintf("k0sworker journal snapshot failed: %v", err))
@@ -379,20 +349,22 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	sigOn := func(name string) bool {
 		return h.Cfg.Watchdog == nil || h.Cfg.Watchdog.SignalEnabled(name)
 	}
-	// The checks dispatch through the shared ordered dispatcher —
-	// the entries are rebuilt each cycle because checks.Entry.Run
-	// takes no env: every entry closes over THIS cycle's env (the
+	// The dispatch table is static — initChecks built the
+	// checks.Entry slice once and each Run reads the env through
+	// h.envCell, so Cycle only refreshes the cell's contents: the
 	// pod LIST, the workerActive gate and the lazy once-per-cycle
-	// snapshots). One small slice per Interval. A single UNGATED
-	// group: the unit-file and uptime gates return early above,
-	// and workerActive gates inside each check (per-check
-	// cycles{check,"gated"}) — none map onto Group.GateOK, whose
-	// skip counts "uptime_gate" and would starve the "disabled"
-	// count of a kill-switched check. Entry order IS h.checks
-	// order — load-bearing, same as the hand-rolled loop; a
-	// WD_SIG_<NAME>=off check counts cycles{check,"disabled"}
-	// exactly like the old run gate.
-	env := &wdeps.CycleEnv{
+	// snapshots. Each once-closure still captures THIS cycle's
+	// vars, so a stale env can never leak into the next round, and
+	// Dispatch is synchronous on this goroutine with no check
+	// retaining the env pointer past Run — the swap is race-free.
+	// A single UNGATED group: the unit-file and uptime gates return
+	// early above, and workerActive gates inside each check
+	// (per-check cycles{check,"gated"}) — none map onto
+	// Group.GateOK, whose skip counts "uptime_gate" and would
+	// starve the "disabled" count of a kill-switched check.
+	// WD_SIG_<NAME>=off counts cycles{check,"disabled"} exactly
+	// like the old run gate.
+	*h.envCell = wdeps.CycleEnv{
 		Pods:         pods,
 		APIOK:        apiOK,
 		WorkerActive: workerActive,
@@ -400,14 +372,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		PidsOnce:     pidsOnce,
 		JournalOnce:  journalOnce,
 	}
-	entries := make([]checks.Entry, 0, len(h.checks))
-	for _, c := range h.checks {
-		entries = append(entries, checks.Entry{
-			Name: c.Name(),
-			Run:  func(ctx context.Context) { c.Run(ctx, env) },
-		})
-	}
-	checks.Dispatch(ctx, sigOn, h.Cycles, []checks.Group{{Entries: entries}})
+	checks.Dispatch(ctx, sigOn, h.Cycles, h.groups)
 	// W10 node_agent_* gauges — one textfile per cycle carrying the
 	// OOM/conntrack counters and the orphan-hostpath measurements
 	// the checks above just refreshed.

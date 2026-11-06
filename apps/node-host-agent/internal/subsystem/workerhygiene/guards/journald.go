@@ -57,7 +57,7 @@ func (c *JournaldCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Cycles.WithLabelValues(wdeps.CheckJournald, "gated").Inc()
 		return
 	}
-	out, err := c.d.Cfg.Seams.JournalFn(ctx)
+	out, err := c.d.Cfg.Seams.Host.JournalFn(ctx)
 	// Only OUTPUT evidence counts as corruption: an exec-level error
 	// (nsenter/journalctl timeout, transient host exec failure) means
 	// journald never answered — that is journal-UNREADABLE, not
@@ -77,7 +77,7 @@ func (c *JournaldCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// Any line means journald is fine and the unit is just
 		// silent; an error, an empty reply, or a "corrupt" warning
 		// is journald-level anomaly — only then remediate.
-		unfiltered, uerr = c.d.Cfg.Seams.JournalAnyFn(ctx)
+		unfiltered, uerr = c.d.Cfg.Seams.Host.JournalAnyFn(ctx)
 		if uerr == nil && strings.TrimSpace(unfiltered) != "" &&
 			!strings.Contains(strings.ToLower(unfiltered), "corrupt") {
 			empty = false

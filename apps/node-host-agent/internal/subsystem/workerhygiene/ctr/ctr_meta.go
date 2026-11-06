@@ -135,7 +135,7 @@ func countMetaOrphanShims(d *wdeps.Deps, pids []int) int {
 		if err != nil || !fi.IsDir() {
 			continue // dir gone → wdeps.CheckCtrTasks' orphan-shim path
 		}
-		if d.Cfg.Seams.NowFn().Sub(fi.ModTime()) < ctrMetaOrphanMinAge {
+		if d.Cfg.Seams.Host.NowFn().Sub(fi.ModTime()) < ctrMetaOrphanMinAge {
 			continue
 		}
 		if ctrTaskInitLive(d, dir) {

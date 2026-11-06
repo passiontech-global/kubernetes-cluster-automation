@@ -1,19 +1,19 @@
 // config_disk.go — the disk knobs: DiskConfig and its defaults (the
-// /var/lib/k0s watermarks that trigger the ingest GC, the W6.3
+// /var/lib/k0s watermark that triggers the ingest GC, the W6.3
 // disk-bloat runaway detector, the /var/log/pods walk and the
-// W10-ST2 orphan-hostPath roots). The domain reads no env rows of
-// its own.
+// W10-ST2 orphan-hostPath roots). K0sDataDir itself promoted to the
+// top-level Config (ctr + runtime both read it). The domain reads no
+// env rows of its own.
 package wdeps
 
 import (
 	"time"
 )
 
-// DiskConfig groups the disk knobs: the /var/lib/k0s watermarks that
-// trigger the ingest GC, the W6.3 disk-bloat runaway detector, the
+// DiskConfig groups the disk knobs: the /var/lib/k0s watermark that
+// triggers the ingest GC, the W6.3 disk-bloat runaway detector, the
 // /var/log/pods walk (BUG-H8) and the W10-ST2 orphan-hostPath roots.
 type DiskConfig struct {
-	K0sDataDir    string  // /var/lib/k0s — disk-high ingest-GC trigger
 	HighWatermark float64 // /var/lib/k0s used ratio triggering GC
 	// W6.3 disk-bloat runaway detector: above BloatWatermark
 	// the bounded emptyDir/snapshot walk runs (gated by
@@ -32,9 +32,6 @@ type DiskConfig struct {
 }
 
 func (d *DiskConfig) applyDefaults() {
-	if d.K0sDataDir == "" {
-		d.K0sDataDir = defaultK0sDataDir
-	}
 	if d.HighWatermark <= 0 {
 		d.HighWatermark = k0sDiskHighWatermark
 	}
