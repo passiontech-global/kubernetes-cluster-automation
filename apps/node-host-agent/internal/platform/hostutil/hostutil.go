@@ -31,10 +31,17 @@ var renameFallbackLogged sync.Map
 
 // WriteFileAtomic writes content via a tmp file in the same dir +
 // rename — the atomic-copy contract the watchdog state/prom files
-// rely on (no torn reads mid-write). The tmp name deliberately uses
-// the ".tmp-<base>" convention: a leading dot keeps it out of
+// rely on (no torn reads mid-write). The tmp name uses the
+// ".tmp-<base>-*" convention: the leading dot keeps it out of
 // hostmetrics' state-* scan — a "state-foo.tmp" file would surface as
-// a phantom watchdog_state series that then sits at 0 forever.
+// a phantom watchdog_state series that then sits at 0 forever — and
+// CreateTemp's random suffix gives concurrent writers (workerhygiene
+// / controllerhygiene / nethealth / hostmetrics all stamp the same
+// last-run/latch files) a private staging file instead of clobbering
+// one shared ".tmp-<base>" (truncated or ENOENT-renamed payloads).
+// The fsync before rename closes the crash window where the rename
+// lands but the payload was never flushed — a power loss otherwise
+// leaves a 0-byte or partial state file behind.
 //
 // rename(2) has one blind spot that matters here: the TARGET of a
 // file-level bind mount cannot be renamed over — the kernel returns
@@ -44,15 +51,39 @@ var renameFallbackLogged sync.Map
 // write+fsync on the target: the crash-atomicity is lost but the
 // write actually lands — strictly better than never writing at all.
 func WriteFileAtomic(path, content string) error {
-	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path),
+		".tmp-"+filepath.Base(path)+"-*")
+	if err != nil {
 		return err
 	}
-	err := RenameFile(tmp, path)
+	tmpName := tmp.Name()
+	// From here on every failure path must remove the staging file;
+	// a leaked .tmp-* would sit in the state dir forever.
+	fail := func(err error) error {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	// CreateTemp files are 0600 — the state/prom files this writes
+	// are world-readable contract (node_exporter, other readers).
+	if err := tmp.Chmod(0o644); err != nil {
+		return fail(err)
+	}
+	if _, err := tmp.WriteString(content); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	err = RenameFile(tmpName, path)
 	if err == nil {
 		return nil
 	}
-	defer func() { _ = os.Remove(tmp) }()
+	defer func() { _ = os.Remove(tmpName) }()
 	if !errors.Is(err, unix.EBUSY) && !errors.Is(err, unix.EXDEV) {
 		return err
 	}

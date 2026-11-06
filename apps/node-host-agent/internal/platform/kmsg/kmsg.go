@@ -136,6 +136,15 @@ func SplitLines(pending, data []byte) (lines [][]byte, rest []byte) {
 // handle — rather than being cut at the byte cap; callers use it to
 // decide when backlog replay ends.
 //
+// A ring-buffer overrun surfaces as EPIPE on the NEXT read after
+// the kernel already auto-advanced the reader past the lost records
+// — it is a resume marker, not a handle failure. Treating it as
+// fatal made consumers close+reopen the fd (rewinding to the ring
+// start and re-emitting the backlog) or fall back to `dmesg -T`
+// forks; the right answer is to skip it and keep reading the records
+// the kernel now offers. The skip count is bounded so a pathological
+// all-EPIPE reader cannot spin the drain forever.
+//
 // A hard read error returns what the drain gathered: data is nil
 // when the erroring read delivered nothing, otherwise the bytes read
 // so far accompany the error — partial-output-vs-fatal is the
@@ -144,6 +153,8 @@ func Drain(r io.Reader, maxBytes int) (data []byte, caughtUp bool, err error) {
 	if maxBytes <= 0 {
 		return nil, false, nil
 	}
+	const maxOverruns = 32
+	overruns := 0
 	var out []byte
 	tmp := make([]byte, 32*1024)
 	for len(out) <= maxBytes {
@@ -152,6 +163,15 @@ func Drain(r io.Reader, maxBytes int) (data []byte, caughtUp bool, err error) {
 			out = append(out, tmp[:n]...)
 		}
 		if rerr != nil {
+			if errors.Is(rerr, syscall.EPIPE) {
+				// Ring overrun — kernel auto-advanced to the
+				// newest records; keep draining (records were
+				// lost, but the handle is still good).
+				if overruns++; overruns >= maxOverruns {
+					return out, false, nil
+				}
+				continue
+			}
 			if errors.Is(rerr, syscall.EAGAIN) ||
 				errors.Is(rerr, io.EOF) || errors.Is(rerr, os.ErrClosed) {
 				return out, true, nil

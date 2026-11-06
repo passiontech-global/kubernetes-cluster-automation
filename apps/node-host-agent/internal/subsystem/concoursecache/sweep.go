@@ -161,12 +161,25 @@ func (p *Pruner) enforcePerms(sc string, log *slog.Logger) {
 	targets := []string{sc}
 	if entries, err := os.ReadDir(sc); err == nil {
 		for _, e := range entries {
-			// Lstat filter: skip symlinks — os.Chown/os.Chmod below
-			// dereference them onto host paths outside the cache.
-			if e.Type()&os.ModeSymlink != 0 {
+			p := filepath.Join(sc, e.Name())
+			// Lstat each candidate — os.Chown/os.Chmod below
+			// dereference symlinks onto host paths outside the
+			// cache, and DirEntry.Type() is ZERO on filesystems
+			// reporting DT_UNKNOWN (XFS ftype=0, overlayfs, NFS),
+			// so a Type()-only guard would let a container-planted
+			// `<entry> -> /etc/...` slip through as a privilege
+			// gadget (concourseinit/worker_init.go parity). Only
+			// real directories get the top-level perm invariant —
+			// chmod 0777 on a regular file would be world-
+			// writable AND executable.
+			fi, err := os.Lstat(p)
+			if err != nil {
+				continue // raced away between ReadDir and Lstat
+			}
+			if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 				continue
 			}
-			targets = append(targets, filepath.Join(sc, e.Name()))
+			targets = append(targets, p)
 		}
 	} else {
 		log.Debug("cannot list shared-cache — perms enforced on root only",

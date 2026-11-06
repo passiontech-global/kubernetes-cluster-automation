@@ -27,22 +27,53 @@ type lease struct {
 	now      timex.Clock
 }
 
+// leaseOpTimeout bounds every single Lease API call. Without it a
+// hung apiserver TCP connection (conntrack-blackhole, apiserver
+// wedge) parks renew on the bare supervisor ctx — s.held stays true
+// while the real Lease lapses and a second pod takes over, leaving
+// two holders converging the same targets (split-brain).
+const leaseOpTimeout = 10 * time.Second
+
+// leaseGet/leaseCreate/leaseUpdate run one Lease call under
+// leaseOpTimeout — a cancelled parent ctx still passes through.
+func (l *lease) leaseGet(ctx context.Context) (*coordv1.Lease, error) {
+	octx, cancel := context.WithTimeout(ctx, leaseOpTimeout)
+	defer cancel()
+	return l.leases.Get(octx, l.name, metav1.GetOptions{})
+}
+
+func (l *lease) leaseCreate(ctx context.Context, lease *coordv1.Lease) error {
+	octx, cancel := context.WithTimeout(ctx, leaseOpTimeout)
+	defer cancel()
+	_, err := l.leases.Create(octx, lease, metav1.CreateOptions{})
+	return err
+}
+
+func (l *lease) leaseUpdate(ctx context.Context, lease *coordv1.Lease) error {
+	octx, cancel := context.WithTimeout(ctx, leaseOpTimeout)
+	defer cancel()
+	_, err := l.leases.Update(octx, lease, metav1.UpdateOptions{})
+	return err
+}
+
 // renew performs one acquire/renew step and reports whether the
-// caller holds the lease after it. API errors and Update conflicts
-// are logged by the caller and simply yield "not held" — the next
-// RenewInterval tick retries.
-func (l *lease) renew(ctx context.Context) (bool, error) {
+// caller holds the lease after it, plus the moment the claim lapses
+// (our fresh RenewTime + the advertised duration — the same window a
+// competing pod waits before takeover). API errors and Update
+// conflicts are logged by the caller and simply yield "not held" —
+// the next RenewInterval tick retries.
+func (l *lease) renew(ctx context.Context) (bool, time.Time, error) {
 	now := l.now()
 	durSec := int32(l.duration.Round(time.Second).Seconds())
 	if durSec <= 0 {
 		durSec = 1
 	}
 
-	cur, err := l.leases.Get(ctx, l.name, metav1.GetOptions{})
+	cur, err := l.leaseGet(ctx)
 	switch {
 	case apierrors.IsNotFound(err):
 		mt := metav1.NewMicroTime(now)
-		_, err = l.leases.Create(ctx, &coordv1.Lease{
+		err = l.leaseCreate(ctx, &coordv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{Name: l.name},
 			Spec: coordv1.LeaseSpec{
 				HolderIdentity:       &l.identity,
@@ -50,14 +81,14 @@ func (l *lease) renew(ctx context.Context) (bool, error) {
 				AcquireTime:          &mt,
 				RenewTime:            &mt,
 			},
-		}, metav1.CreateOptions{})
+		})
 		if err != nil {
 			// Another pod won the create race — we're not the holder.
-			return false, err
+			return false, time.Time{}, err
 		}
-		return true, nil
+		return true, mt.Time.Add(time.Duration(durSec) * time.Second), nil
 	case err != nil:
-		return false, err
+		return false, time.Time{}, err
 	}
 
 	holder := ""
@@ -71,6 +102,7 @@ func (l *lease) renew(ctx context.Context) (bool, error) {
 	}
 
 	mt := metav1.NewMicroTime(now)
+	expiresAt := mt.Time.Add(time.Duration(durSec) * time.Second)
 	switch {
 	case holder == l.identity:
 		// Heartbeat — also adopt a changed configured duration,
@@ -80,10 +112,10 @@ func (l *lease) renew(ctx context.Context) (bool, error) {
 			*cur.Spec.LeaseDurationSeconds != durSec {
 			cur.Spec.LeaseDurationSeconds = &durSec
 		}
-		if _, err := l.leases.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
-			return false, fmt.Errorf("renew lease: %w", err)
+		if err := l.leaseUpdate(ctx, cur); err != nil {
+			return false, time.Time{}, fmt.Errorf("renew lease: %w", err)
 		}
-		return true, nil
+		return true, expiresAt, nil
 	case expired || holder == "":
 		// Take over a dead/absent holder — optimistic concurrency on
 		// resourceVersion arbitrates simultaneous takeovers.
@@ -96,19 +128,19 @@ func (l *lease) renew(ctx context.Context) (bool, error) {
 		cur.Spec.AcquireTime = &mt
 		cur.Spec.RenewTime = &mt
 		cur.Spec.LeaseTransitions = &trans
-		if _, err := l.leases.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
-			return false, fmt.Errorf("acquire lease: %w", err)
+		if err := l.leaseUpdate(ctx, cur); err != nil {
+			return false, time.Time{}, fmt.Errorf("acquire lease: %w", err)
 		}
-		return true, nil
+		return true, expiresAt, nil
 	default:
-		return false, nil
+		return false, time.Time{}, nil
 	}
 }
 
-// renewLease wraps lease.renew: keeps s.held state, clears the
-// synced-once latch on loss, logs transient errors.
+// renewLease wraps lease.renew: keeps s.held state + the claim's
+// expiry, clears the synced-once latch on loss, logs transient errors.
 func (s *Syncer) renewLease(ctx context.Context) bool {
-	held, err := s.lease.renew(ctx)
+	held, expiresAt, err := s.lease.renew(ctx)
 	if err != nil {
 		s.cfg.Log.Warn("hubsync: lease renew failed — retrying next tick",
 			"lease", s.cfg.LeaseNamespace+"/"+s.cfg.LeaseName, "error", err)
@@ -125,6 +157,9 @@ func (s *Syncer) renewLease(ctx context.Context) bool {
 	}
 	if !held {
 		s.syncedWhileHeld = false
+		s.leaseExpiresAt = time.Time{}
+	} else {
+		s.leaseExpiresAt = expiresAt
 	}
 	s.held = held
 	return held

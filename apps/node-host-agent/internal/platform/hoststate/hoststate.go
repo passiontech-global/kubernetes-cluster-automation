@@ -68,11 +68,12 @@ type Store struct {
 	// slog.Default().
 	Log func() *slog.Logger
 
-	// mu serializes RateTrySpend across goroutines — the feeder
-	// remediate path and Cycle compete on the shared last-restart
-	// budget ("last-restart" above all): without it a feeder "ok"
-	// and a Cycle check "ok" could both pass in the same window and
-	// double-spend a restart.
+	// mu serializes the read-modify-write ops across goroutines —
+	// RateTrySpend (the feeder remediate path and Cycle compete on
+	// the shared last-restart budget: without it a feeder "ok" and
+	// a Cycle check "ok" could both pass in the same window and
+	// double-spend a restart) and Incr's check-then-write counter
+	// bump (the shared consecutive-journal-unreadable streak).
 	mu sync.Mutex
 }
 
@@ -292,8 +293,14 @@ func (s *Store) Counter(name string) int {
 
 // Incr mirrors lib.sh ctr_inc: read + increment + write + return.
 // Garbage → 1. A failed write returns 0 (the streak is lost, never
-// invented).
+// invented). The read-modify-write runs under the same mutex as
+// RateTrySpend: counters are shared with the feeder goroutine
+// (consecutive-journal-unreadable is incremented by BOTH
+// controllerhygiene's cycle and its feeder-side journal reads), so
+// an unlocked check-then-write can drop a concurrent increment.
 func (s *Store) Incr(name string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	n := s.Counter(name) + 1
 	if !s.WriteEpochFile(filepath.Join(s.Dir, name), int64(n)) {
 		return 0

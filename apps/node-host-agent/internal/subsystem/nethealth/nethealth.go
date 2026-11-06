@@ -489,10 +489,17 @@ func (n *NetHealth) Cycle(ctx context.Context) {
 	// alive (BUG-H1 — Store.StampLastRun no-ops on an empty dir).
 	defer n.state.StampLastRun()
 	if n.cfg.WatchdogSrc != nil {
+		// cfg.Watchdog is owned by the Cycle goroutine alone: only
+		// in-cycle checks read the field, and only when WatchdogSrc
+		// is wired does it move. Off-Cycle goroutines (routeGuard,
+		// mtuProbeLoop) NEVER read it — watchdogConf() routes them
+		// through the mutexed reloader instead (workerhygiene's
+		// feederWatchdogConf parity).
 		n.cfg.Watchdog = n.cfg.WatchdogSrc.Get()
 	}
+	wd := n.cfg.Watchdog
 	sigOn := func(name string) bool {
-		return n.cfg.Watchdog == nil || n.cfg.Watchdog.SignalEnabled(name)
+		return wd == nil || wd.SignalEnabled(name)
 	}
 	checks.Dispatch(ctx, sigOn, n.cycles, n.groups)
 }

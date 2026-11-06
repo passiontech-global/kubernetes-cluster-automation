@@ -75,12 +75,15 @@ func TestWriteFileAtomicFallbackOnBindMountErrno(t *testing.T) {
 			if got := testutil.ReadFile(t, path); got != "new-content" {
 				t.Fatalf("direct-write fallback landed %q", got)
 			}
-			wantTmp := filepath.Join(dir, ".tmp-hosts")
-			if gotOld != wantTmp || gotNew != path {
-				t.Fatalf("rename called with (%q,%q), want (%q,%q)",
-					gotOld, gotNew, wantTmp, path)
+			// The staging name is .tmp-<base>-<rand> (CreateTemp) —
+			// a private name per writer so concurrent stampers never
+			// share a staging file.
+			if !strings.HasPrefix(gotOld, filepath.Join(dir, ".tmp-hosts-")) ||
+				gotNew != path {
+				t.Fatalf("rename called with (%q,%q), want (.tmp-hosts-*,%q)",
+					gotOld, gotNew, path)
 			}
-			if _, err := os.Stat(wantTmp); !os.IsNotExist(err) {
+			if _, err := os.Stat(gotOld); !os.IsNotExist(err) {
 				t.Fatal("tmp file not cleaned up after fallback")
 			}
 		})
