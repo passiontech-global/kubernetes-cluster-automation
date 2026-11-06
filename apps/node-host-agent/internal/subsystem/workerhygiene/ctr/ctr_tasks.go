@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -111,6 +112,24 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 		}
 		if c.d.ProcAge(pid) < 5*time.Minute {
+			continue
+		}
+		// W12-KR2: an orphan shim already wedged in D
+		// (uninterruptible) or Z (zombie whose reaper never ran)
+		// state cannot be SIGKILLed away — the signal pends inside
+		// the kernel or lands on a corpse. Escalate the confirmed
+		// orphan into the pod-teardown-wedged latch so the
+		// node-level NHC→SNR remediation path sees the wedge
+		// (kubelet/containerd teardown is dead by definition).
+		if state, _, ok := c.d.ProcStatStatePPID(pid); ok &&
+			(state == "D" || state == "Z") {
+			c.d.State.Enter(hoststate.LatchPodTeardownWedged, fmt.Sprintf(
+				"unkillable-orphan-shim pid=%d id=%.12s state=%s",
+				pid, sid, state))
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: ctr-tasks orphan shim pid=%d id=%.12s state=%s — SIGKILL cannot clear it, escalated to pod-teardown-wedged",
+				pid, sid, state))
+			c.d.Actions.WithLabelValues(wdeps.CheckCtrTasks, "shim_escalate").Inc()
 			continue
 		}
 		c.d.State.AppendLog(fmt.Sprintf(

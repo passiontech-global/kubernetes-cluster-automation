@@ -77,4 +77,5 @@ func (h *Hygiene) initChecks() {
 	add(h, &h.clockJump, runtime.NewClockJump(d))               // wdeps.CheckClockJump
 	add(h, &h.unlinkedFDs, runtime.NewUnlinkedOpenFiles(d))     // wdeps.CheckUnlinkedOpenFiles
 	add(h, &h.cgroupSwap, runtime.NewCgroupSwap(d))             // wdeps.CheckCgroupSwap
+	add(h, &h.cgroupThrottle, runtime.NewCgroupThrottle(d))     // wdeps.CheckCgroupThrottle
 }

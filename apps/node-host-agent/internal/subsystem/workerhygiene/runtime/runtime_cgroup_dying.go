@@ -36,6 +36,14 @@ const (
 	// "amount to reclaim" values; an undersized pool just returns
 	// fewer pages).
 	cgroupReclaimBytes = "256M\n"
+	// cgroupDyingChildThreshold is the per-slice
+	// nr_dying_descendants count that earns a targeted
+	// memory.reclaim write (W12-KR-C) — a dying-descendant pile
+	// concentrates in a few first-level kubepods.slice children
+	// (one noisy pod slice, a QoS slice), and reclaiming the
+	// offender directly works far better than asking the
+	// aggregate root.
+	cgroupDyingChildThreshold = 100
 )
 
 type CgroupDyingCheck struct {
@@ -147,6 +155,36 @@ func (c *CgroupDyingCheck) reclaim(root string, dying int64) {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: cgroup-dying-leak memory.reclaim write %s failed: %v",
 				rec, err))
+		}
+	}
+	// W12-KR-C: targeted reclaim on the first-level kubepods.slice
+	// children whose own nr_dying_descendants exceeds
+	// cgroupDyingChildThreshold — the dying pile concentrates in a
+	// few pod/QoS slices, and reclaiming the offender's subtree
+	// frees the pinned pages the aggregate write can't reach.
+	kubepods := filepath.Join(root, "kubepods.slice")
+	if entries, err := os.ReadDir(kubepods); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			child := filepath.Join(kubepods, e.Name())
+			childDying, ok := cgroupStatDying(
+				filepath.Join(child, "cgroup.stat"))
+			if !ok || childDying <= cgroupDyingChildThreshold {
+				continue
+			}
+			rec := filepath.Join(child, "memory.reclaim")
+			if err := os.WriteFile(rec, []byte(cgroupReclaimBytes), 0o644); err != nil {
+				c.d.State.AppendLog(fmt.Sprintf(
+					"suspect: cgroup-dying-leak memory.reclaim write %s failed: %v",
+					rec, err))
+				continue
+			}
+			c.d.State.AppendLog(fmt.Sprintf(
+				"ACTION: cgroup-dying-leak targeted memory.reclaim %s - child nr_dying_descendants=%d",
+				e.Name(), childDying))
+			c.d.Actions.WithLabelValues(wdeps.CheckCgroupDying, "reclaim_child").Inc()
 		}
 	}
 	c.d.State.AppendLog(fmt.Sprintf(

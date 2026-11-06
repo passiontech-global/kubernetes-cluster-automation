@@ -7,24 +7,80 @@
 //	PKIDriftCycles consecutive cycles latches
 //	state-cp-cert-reload-stale and restarts the owning unit under
 //	the last-cp-cert-restart budget.
+//
+//	W12-CP4a: the same Run also exports the SHA-256 fingerprint of
+//	the k0s ServiceAccount token signer public key (sa.pub) to the
+//	textfile channel — a signer key drifted between control-plane
+//	nodes means TokenRequest tokens minted on this node randomly
+//	401 on the other apiservers.
 package controllerhygiene
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // checkPKIDrift is the prometheus `check` label + log context for
 // the PKI reload drift check.
 const checkPKIDrift = "cp-cert-drift"
+
+// saPubMetric/saPubPromFile — the W12-CP4a ServiceAccount signer-key
+// fingerprint export: same series the hostmetrics collector exports
+// on pods ({sha256} only here — the textfile is already node-local).
+// saPubHashHelp is the identical sentence hostmetrics carries in
+// its desc: the textfile collector rejects a family whose HELP
+// lines disagree across .prom files, so keep them in lockstep.
+const (
+	saPubMetric   = "node_k0s_sa_pub_fingerprint_hash"
+	saPubPromFile = "node-agent-sa-pub-fp.prom"
+	saPubHashHelp = "SHA-256 fingerprint of the k0s ServiceAccount " +
+		"token signer public key (sa.pub) — a differing hash across " +
+		"control-plane nodes is signer key skew (TokenRequest 401s)."
+)
+
+// sha256FileHex returns the hex SHA-256 of a file's raw bytes —
+// sa.pub is hashed whole (not parsed): a drifted file must change
+// the fingerprint even when the drift is a stray byte, not a
+// different key.
+func sha256FileHex(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// emitSAPubFingerprint — W12-CP4a: write
+// node_k0s_sa_pub_fingerprint_hash{sha256=...} to the textfile
+// channel every cycle. The whole subsystem only runs on
+// k0scontroller hosts (unit-file gate in Cycle/ShouldRun), so no
+// extra control-plane gate is needed. A missing/unreadable sa.pub
+// emits headers-only — the series goes absent, never a fake hash.
+func (c *pkiDriftCheck) emitSAPubFingerprint() {
+	var p promfile.Builder
+	sum, err := sha256FileHex(filepath.Join(c.d.cfg.K0sDir, "pki", "sa.pub"))
+	if err != nil {
+		p.Header(saPubMetric, saPubHashHelp)
+	} else {
+		p.GaugeLabels(saPubMetric, saPubHashHelp,
+			fmt.Sprintf("sha256=%q", sum), 1)
+	}
+	c.d.writeTextfileProm(saPubPromFile, p.String())
+}
 
 // tlsDialCert returns the leaf certificate addr presents — drift is
 // judged on the presented cert, not on chain trust, so the dial is
@@ -59,8 +115,11 @@ func (c *pkiDriftCheck) Name() string { return checkPKIDrift }
 // (later NotAfter, or different serial with a not-older NotAfter)
 // than the socket serves. Drift held for PKIDriftCycles consecutive
 // cycles latches the state and restarts the owning unit under the
-// last-cp-cert-restart budget.
+// last-cp-cert-restart budget. W12-CP4a rides the same cycle: the
+// sa.pub signer-key fingerprint export runs first so it lands even
+// when a pair fails early.
 func (c *pkiDriftCheck) Run(ctx context.Context) {
+	c.emitSAPubFingerprint()
 	anyDrift := false
 	for i, pair := range c.d.cfg.PKIDrift.Pairs {
 		ctr := fileCtrPKIDriftPre + strconv.Itoa(i)

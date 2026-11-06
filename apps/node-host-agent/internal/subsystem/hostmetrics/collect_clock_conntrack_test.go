@@ -4,6 +4,7 @@ package hostmetrics
 
 import (
 	"math"
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -160,6 +161,52 @@ func TestConntrackMalformedSkipped(t *testing.T) {
 	} {
 		if _, ok := metricValue(t, c, name, node); ok {
 			t.Fatalf("%s emitted for malformed data", name)
+		}
+	}
+}
+
+// --- W12-KR3: node_exporter-named nf_conntrack stat series ---
+
+// The per-CPU stat table carries insert_failed + drop + early_drop
+// hex columns; the node_exporter-named twins emit insert_failed
+// verbatim and fold early_drop into drop.
+func TestConntrackStatNodeExporterSeries(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.ConntrackStatFile = filepath.Join(t.TempDir(), "nf_conntrack")
+	testutil.WriteFile(t, cfg.ConntrackStatFile,
+		"  entries  searched found insert insert_failed drop early_drop\n"+
+			"00000ed4  00000000 00000000 00000000 0000000a 00000004 00000002\n"+
+			"00000ed5  00000000 00000000 00000000 00000014 00000002 00000001\n")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	// hex sums: 0xa+0x14 = 30 insert_failed; drop 0x4+0x2 = 6,
+	// early_drop 0x2+0x1 = 3 → drop_total folds to 9.
+	if v, ok := counterValue(t, c,
+		"node_nf_conntrack_stat_insert_failed_total", node); !ok || v != 30 {
+		t.Fatalf("nf insert_failed=%v ok=%v want 30", v, ok)
+	}
+	if v, ok := counterValue(t, c,
+		"node_nf_conntrack_stat_drop_total", node); !ok || v != 9 {
+		t.Fatalf("nf drop=%v ok=%v want 9 (drop 6 + early_drop 3)", v, ok)
+	}
+	// The legacy host_agent series stay strict drop-column (6).
+	if v, ok := counterValue(t, c,
+		"node_host_agent_conntrack_drops_total", node); !ok || v != 6 {
+		t.Fatalf("legacy drops=%v ok=%v want 6 (drop only)", v, ok)
+	}
+}
+
+func TestConntrackStatNodeExporterAbsentWithoutFile(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.ConntrackStatFile = filepath.Join(t.TempDir(), "missing")
+	c := New(cfg)
+	node := map[string]string{"node": "node-a"}
+	for _, name := range []string{
+		"node_nf_conntrack_stat_insert_failed_total",
+		"node_nf_conntrack_stat_drop_total",
+	} {
+		if _, ok := metricValue(t, c, name, node); ok {
+			t.Fatalf("%s emitted without the stat file", name)
 		}
 	}
 }

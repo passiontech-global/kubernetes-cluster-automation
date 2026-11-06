@@ -378,6 +378,12 @@ func (c *cyc) t16Pairs() [][2]string {
 		{"net.core.netdev_max_backlog", "8192"},
 		{"net.ipv4.tcp_max_syn_backlog", "8192"},
 		{"net.ipv4.ip_local_port_range", "10240 65535"},
+		// W12-KR3: reuse TIME_WAIT sockets for new outbound
+		// connections — safe with tcp_timestamps on (default), and
+		// the difference between a healthy node and EADDRNOTAVAIL on
+		// the gateway/proxy churn bursts the port-range width above
+		// is sized for.
+		{"net.ipv4.tcp_tw_reuse", "1"},
 		// W5.1: keep the kernel's ephemeral source-port allocation off
 		// ports host daemons LISTEN on — an ephemeral steal of kubelet
 		// 10248/10250/10256, NPD 20256, NodePort+Spegel 30000-32767,

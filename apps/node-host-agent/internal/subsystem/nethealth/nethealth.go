@@ -91,6 +91,9 @@ const (
 
 	defaultConntrackCountFile = "/proc/sys/net/netfilter/nf_conntrack_count"
 	defaultConntrackMaxFile   = "/proc/sys/net/netfilter/nf_conntrack_max"
+	// W12-KR3: the per-CPU conntrack stat table — insert_failed /
+	// drop / early_drop column sums drive the stale-UDP flush.
+	defaultConntrackStatFile = "/proc/net/stat/nf_conntrack"
 )
 
 // Check names — prometheus `check` label + log context.
@@ -126,8 +129,12 @@ type Config struct {
 	UptimeFile         string        // host /proc/uptime (20/21 gate)
 	ConntrackCountFile string        // nf_conntrack_count (entries used)
 	ConntrackMaxFile   string        // nf_conntrack_max (table size)
-	HostRoot           string        // "/" = already on host (no nsenter)
-	Watchdog           *watchdogconf.Config
+	// ConntrackStatFile is /proc/net/stat/nf_conntrack — the
+	// per-CPU insert_failed/drop counters the W12-KR3 spike
+	// detector reads (module absent → no file → detector idles).
+	ConntrackStatFile string
+	HostRoot          string // "/" = already on host (no nsenter)
+	Watchdog          *watchdogconf.Config
 	// WatchdogSrc, when set, re-reads the conf file every Cycle so
 	// hostconfig rewrites (OVERLAY_*, DNS_FALLBACK_MAP, WD_SIG_*
 	// kill switches) apply live instead of only at agent start.
@@ -218,6 +225,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ConntrackMaxFile == "" {
 		c.ConntrackMaxFile = defaultConntrackMaxFile
+	}
+	if c.ConntrackStatFile == "" {
+		c.ConntrackStatFile = defaultConntrackStatFile
 	}
 	if c.HostRoot == "" {
 		c.HostRoot = defaultHostRoot
@@ -342,6 +352,18 @@ type NetHealth struct {
 	pmtuFails    int            // consecutive DF-probe failures (W9-NM1)
 	clockFails   int            // consecutive unsynced adjtimex reads
 	egressCtr    map[string]int // per relay probe!=committed counter
+	// nebulaSiteedgeRun counts consecutive cycles the siteedge
+	// marker set keeps failing — the siteedge LATCH arms on the
+	// first detection, but the W12-NM2 per-peer conntrack flush
+	// waits for ConsecNeeded confirmed runs like the degraded path.
+	nebulaSiteedgeRun int
+	// ctStatPrev is the last-cycle sum of the nf_conntrack
+	// insert_failed+drop+early_drop columns; ctStatSeen separates
+	// "first read" (baseline only) from a real delta — the spike
+	// detector must not flush on a counter jump across an agent
+	// restart vs an unset baseline.
+	ctStatPrev uint64
+	ctStatSeen bool
 
 	cycles  *prometheus.CounterVec // check, result
 	actions *prometheus.CounterVec // check, action

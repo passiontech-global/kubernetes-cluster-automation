@@ -34,6 +34,11 @@ const (
 	// cniNetnsMinAge is the orphan CNI netns confirmation age
 	// (Wave-9).
 	cniNetnsMinAge = 30 * time.Minute
+	// cniNetnsMaxReapPerCycle bounds the per-cycle umount blast
+	// radius (W12-KR2) — a mass CNI DEL failure can leak dozens of
+	// netns mounts at once; the reaper drains them at a fixed rate
+	// rather than stalling the check budget on one cycle.
+	cniNetnsMaxReapPerCycle = 10
 )
 
 var (
@@ -361,22 +366,30 @@ func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
 	}
 }
 
-// --- Check: orphan CNI netns reaper (W9) ---
+// --- Check: orphan CNI netns reaper (W9, hardened W12-KR2) ---
 // CNI plugins pin each pod sandbox's network namespace by
 // bind-mounting its nsfs file at /run/netns/cni-<id>. A pod teardown
 // that dies mid-DEL (crash, OOM kill, kubelet restart) leaks the
 // mount: the file outlives the namespace, and `ip netns` listings
 // accumulate dead entries that confuse operators and slow CNI
-// scans. The reaper stats every cni-* file — the nsfs inode is the
-// namespace's identity, shared with /proc/<pid>/ns/net for every
-// process still inside it — and only a file whose inode NO live
-// process references is an orphan. Confirmation is the
+// scans — worse, a leaked net_namespace slab keeps Cilium IPAM from
+// reclaiming the pod IP and pins any hostPort it held. The reaper
+// stats every cni-* file — the nsfs inode is the namespace's
+// identity, shared with /proc/<pid>/ns/net for every process still
+// inside it — and only a file whose inode NO live process
+// references is an orphan. Confirmation is the
 // cni-netns-seen-<name> two-pass marker (veth-seen-* parity): first
 // sighting records the epoch, and only a file still unreferenced
 // >= cniNetnsMinAge later is lazily unmounted + removed. The umount
 // runs through the systemd nsenter wrapper so the HOST mount
 // namespace is the one modified; the file removal uses the /host
-// view (NetnsDir).
+// view (NetnsDir). W12-KR2 adds three qualifiers to the reap
+// itself: the file mtime must be older than the confirm window
+// (a just-created mount point the sweep raced is never an
+// orphan), the containerd task map must not show a live task
+// still inside the netns, and reaps cap at
+// cniNetnsMaxReapPerCycle per cycle. The scan runs on every
+// worker — Cilium AND Calico pin netns the same way.
 
 // netnsInode stats a netns file and returns the nsfs inode — the
 // identity /proc/<pid>/ns/net entries share for the same network
@@ -404,6 +417,27 @@ func liveNetnsInodes(d *wdeps.Deps, pids []int) map[uint64]bool {
 		}
 	}
 	return out
+}
+
+// netnsHeldByLiveTask reports whether any containerd task with a
+// live init pid still sits inside the netns inode — the
+// containerd-side half of the W12-KR2 orphan verdict (a live task
+// pins the sandbox netns even when the /proc sweep raced it).
+func netnsHeldByLiveTask(d *wdeps.Deps, tasks map[string][]wdeps.CtrTask,
+	ino uint64) bool {
+
+	for _, ts := range tasks {
+		for _, t := range ts {
+			if !t.Live || t.PID <= 0 {
+				continue
+			}
+			if tino, ok := netnsInode(d.Proc.File(t.PID, "ns", "net")); ok &&
+				tino == ino {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // CNINetnsCheck is the W9 orphan /run/netns/cni-* reaper as a Check.
@@ -449,6 +483,7 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	live := liveNetnsInodes(c.d, e.PidsOnce())
 	seen := map[string]bool{}
+	reaped := 0
 	for _, name := range names {
 		seen[name] = true
 		path := filepath.Join(c.d.Cfg.Net.NetnsDir, name)
@@ -482,7 +517,32 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if !ok2 || live[ino2] {
 			continue
 		}
+		// W12-KR2: the netns file itself must be older than the
+		// confirm window — a just-created mount point whose sweep
+		// raced the CNI ADD is not an orphan no matter what the
+		// inode check says.
+		if fi, err := os.Stat(path); err != nil ||
+			c.d.Cfg.Seams.NowFn().Sub(fi.ModTime()) < cniNetnsMinAge {
+			continue
+		}
+		// W12-KR2: the containerd task map is the stronger liveness
+		// verdict — a live task pins its sandbox netns even when
+		// the pid sweep raced it. An unreadable map makes "no
+		// live task" unverifiable → fail closed, retry next cycle.
+		if e.TasksOnce != nil {
+			tasks, complete := e.TasksOnce()
+			if !complete || netnsHeldByLiveTask(c.d, tasks, ino2) {
+				continue
+			}
+		}
+		if reaped >= cniNetnsMaxReapPerCycle {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: cni-netns-gc reap cap %d reached — remaining orphans drain next cycle",
+				cniNetnsMaxReapPerCycle))
+			break
+		}
 		reapCNINetns(c.d, ctx, name)
+		reaped++
 	}
 	pruneCNINetnsMarkers(c.d, seen)
 	c.d.Cycles.WithLabelValues(wdeps.CheckCNINetns, "ok").Inc()

@@ -1,10 +1,13 @@
 // collect_pki.go — on-disk PKI cert expiry (2.4): days-left per
-// *.crt/*.pem under the k0s/kine PKI dirs. Split out of
-// hostmetrics.go.
+// *.crt/*.pem under the k0s/kine PKI dirs, plus the W12-CP4a
+// ServiceAccount token signer key fingerprint (sa.pub SHA-256) on
+// control-plane nodes. Split out of hostmetrics.go.
 package hostmetrics
 
 import (
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"math"
 	"os"
@@ -33,6 +36,59 @@ var descPKIDays = prometheus.NewDesc(
 	"node_host_agent_pki_cert_days_left",
 	"Days until the earliest notAfter of the on-disk PKI cert at this path (emitted only when a cert parses).",
 	[]string{"node", "path"}, nil)
+
+// defaultSAPubHostPath is the sa.pub path relative to HostRoot —
+// the ServiceAccount token signer public key every control-plane
+// node must share byte-for-byte (W12-CP4a).
+const defaultSAPubHostPath = "var/lib/k0s/pki/sa.pub"
+
+// saPubHashHelp is the HELP text shared with the controllerhygiene
+// textfile writer — the textfile collector rejects a family whose
+// HELP lines disagree across .prom files, so both emitters must
+// carry the identical sentence.
+const saPubHashHelp = "SHA-256 fingerprint of the k0s ServiceAccount " +
+	"token signer public key (sa.pub) — a differing hash across " +
+	"control-plane nodes is signer key skew (TokenRequest 401s)."
+
+var descSAPubHash = prometheus.NewDesc(
+	"node_k0s_sa_pub_fingerprint_hash",
+	saPubHashHelp,
+	[]string{"node", "sha256"}, nil)
+
+// sha256FileHex returns the hex SHA-256 of a file's raw bytes —
+// sa.pub is hashed whole (not parsed): a drifted file must change
+// the fingerprint even when the drift is a stray byte, not a
+// different key.
+func sha256FileHex(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// collectSAPubFingerprint emits node_k0s_sa_pub_fingerprint_hash on
+// control-plane nodes — W12-CP4a: when one CP node's sa.pub diverges
+// (rotation not propagated, or the file never reloaded), tokens the
+// TokenRequest API mints there 401 on the other apiservers (~33/66%
+// of requests behind the CP load balancer). The hash rides a label
+// so `count by (sha256)` across nodes exposes the skew directly.
+// Same emission policy as collectK0sDrift: gated on the
+// k0scontroller unit file, absent (no series) when the file can't
+// be read — never a fabricated value.
+func (c *Collector) collectSAPubFingerprint(ch chan<- prometheus.Metric) {
+	if _, err := os.Stat(c.cfg.K0sUnitFile); err != nil {
+		return // not a k0s controller → no series
+	}
+	sum, err := sha256FileHex(filepath.Join(
+		c.cfg.HostRoot, defaultSAPubHostPath))
+	if err != nil {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(descSAPubHash,
+		prometheus.GaugeValue, 1, c.cfg.NodeName, sum)
+}
 
 // pkiCertFiles expands one PKICertPaths entry: a directory yields
 // its *.crt/*.pem children one level deep, a regular file is taken
@@ -118,4 +174,7 @@ func (c *Collector) collectPKICerts(ch chan<- prometheus.Metric) {
 				prometheus.GaugeValue, days, c.cfg.NodeName, label)
 		}
 	}
+	// W12-CP4a: the sa.pub fingerprint rides the pki domain — same
+	// PKI surface, same control-plane-only emission policy.
+	c.collectSAPubFingerprint(ch)
 }

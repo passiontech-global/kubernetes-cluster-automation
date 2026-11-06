@@ -39,6 +39,17 @@
 //     gauges them (kine_db_orphan_prepared_xacts) and rolls them
 //     back automatically (ROLLBACK PREPARED), counting releases in
 //     kine_db_orphan_prepared_xacts_rolled_back_total.
+//  7. Invalid-index census + seq-scan regression guard (W12-CP2) —
+//     kine_db_invalid_indexes counts pg_index rows with
+//     indisvalid=false (dead *_ccnew/*_ccold shells an interrupted
+//     REINDEX CONCURRENTLY leaves behind — they cost every INSERT
+//     but serve no query; the drop itself is the maint cycle's
+//     reaper). kine_db_seq_scans_total/kine_db_seq_tuples_read_total
+//     track the kine table's seq-scan counters — a seq_tup_read
+//     delta >500K between probes means the planner fell back to a
+//     sequential scan (stale pg_statistic or a poisoned index), so
+//     an ANALYZE runs immediately under the 30m last-kine-analyze
+//     budget instead of waiting for the daily maint window.
 //
 // Items 5–6 export through their own textfile (kine-db-xact.prom)
 // rather than emitProbe's kine-db.prom — the prometheus collector
@@ -51,6 +62,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -91,6 +103,21 @@ const (
 	// last success only counts as CONTINUOUSLY failing once the last
 	// success is this old (seconds).
 	archiveStaleSecs = 1800
+
+	// seqTupReadDeltaMax — W12-CP2: tuples-read-by-seq-scan growth
+	// between probe rounds that marks a planner regression to
+	// sequential scan (the kine table is supposed to answer
+	// LIST/WATCH via kine_name_prev_revision_uindex / kine_id_idx).
+	seqTupReadDeltaMax = 500_000
+	// seqTupReadFile keeps the previous round's seq_tup_read under
+	// GuardStateDir — the delta must survive an agent restart.
+	seqTupReadFile = "last-seq-tup-read"
+	// kineAnalyzeBudget/kineAnalyzeFile — the 30m last-kine-analyze
+	// cooldown on the immediate ANALYZE a seq-scan regression
+	// triggers; same last-* spend-on-attempt contract as
+	// last-dead-tuple-vacuum.
+	kineAnalyzeBudget = 30 * time.Minute
+	kineAnalyzeFile   = "last-kine-analyze"
 )
 
 // inactiveSlot is one pg_replication_slots row with active=false.
@@ -126,6 +153,13 @@ type hygieneResult struct {
 	preparedXacts  int64
 	preparedSeen   bool
 	preparedRolled int64 // rolled back THIS round
+	// Item 7 (W12-CP2 invalid-index census + seq-scan guard).
+	invalidIdx   int64
+	invalidSeen  bool
+	seqScans     int64
+	seqTupRead   int64
+	seqSeen      bool
+	analyzeFired bool // the seq-scan ANALYZE ran this round
 }
 
 // preparedXactRolledBackTotal is the lifetime count behind
@@ -160,6 +194,8 @@ func (k *KineDB) pgHygiene(ctx context.Context, pg, user, pass string,
 	k.hygieneWAL(ctx, pg, user, pass, h, note)
 	k.hygieneMultiXact(ctx, pg, user, pass, h, note)
 	k.hygienePreparedXacts(ctx, pg, user, pass, h, note)
+	k.hygieneInvalidIndexes(ctx, pg, user, pass, h, note)
+	k.hygieneSeqScan(ctx, pg, user, pass, h, note)
 	k.emitXactTextfile(h)
 }
 
@@ -214,6 +250,90 @@ func (k *KineDB) hygienePreparedXacts(ctx context.Context, pg, user, pass string
 		logger().Warn("kinedb: rolled back orphaned prepared transaction",
 			"gid", gid)
 	}
+}
+
+// hygieneInvalidIndexes — item 7a (W12-CP2): indexes with
+// indisvalid=false across pg_index. An invalid index is dead
+// weight — every INSERT still maintains it but the planner never
+// uses it, and the next REINDEX CONCURRENTLY errors or silently
+// leaves it. The probe only counts (kine_db_invalid_indexes feeds
+// the alert); the DROP itself belongs to the maint cycle's
+// invalid-index reaper (maint.go) where the daily serialisation
+// already gates the index churn.
+// COUNT(indexrelid), not COUNT(*): the probe contract bans a bare
+// COUNT(*) in the 2-minute loop — counting a catalog column is
+// semantically identical and keeps the kine-heap seq-scan guard
+// (probe_test.go) airtight.
+func (k *KineDB) hygieneInvalidIndexes(ctx context.Context, pg, user, pass string,
+	h *hygieneResult, note func(string)) {
+	out, err := k.psqlQuery(ctx, pg, user, pass,
+		"SELECT COUNT(indexrelid) FROM pg_index WHERE NOT indisvalid")
+	if err != nil {
+		note(fmt.Sprintf("invalid-indexes-fail: %v", err))
+		return
+	}
+	v, perr := strconv.ParseInt(firstLine(out), 10, 64)
+	if perr != nil {
+		note(fmt.Sprintf("invalid-indexes-unparsed: %v", perr))
+		return
+	}
+	h.invalidIdx, h.invalidSeen = v, true
+}
+
+// hygieneSeqScan — item 7b (W12-CP2): seq_scan / seq_tup_read of the
+// kine table from pg_stat_user_tables. A planner regression to
+// sequential scan (stale statistics after a churn burst, or a
+// poisoned index) shows as a seq_tup_read spike BEFORE the CPU
+// storm makes apiserver LIST/WATCH time out — the Datadog/Rancher
+// k3s failure mode. Past seqTupReadDeltaMax between probes the
+// planner stats get refreshed immediately: ANALYZE under the 30m
+// last-kine-analyze budget (spend-on-attempt, same contract as
+// last-dead-tuple-vacuum).
+func (k *KineDB) hygieneSeqScan(ctx context.Context, pg, user, pass string,
+	h *hygieneResult, note func(string)) {
+	out, err := k.psqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+		"SELECT COALESCE(seq_scan,0), COALESCE(seq_tup_read,0) "+
+			"FROM pg_stat_user_tables WHERE relname=%s", sqlQuote(k.cfg.Table)))
+	if err != nil {
+		note(fmt.Sprintf("seq-scan-fail: %v", err))
+		return
+	}
+	scans, tupRead, perr := parsePair(out)
+	if perr != nil {
+		// An empty result means the stats view has no row for the
+		// table yet — inconclusive, like a parse failure.
+		note(fmt.Sprintf("seq-scan-unparsed: %v", perr))
+		return
+	}
+	h.seqScans, h.seqTupRead, h.seqSeen = scans, tupRead, true
+
+	// Delta vs the previous probe — persisted under GuardStateDir
+	// so the guard survives an agent restart. A pg_stat reset (DB
+	// restart) reads as a negative delta and simply re-baselines.
+	prevPath := filepath.Join(k.cfg.GuardStateDir, seqTupReadFile)
+	prev, _ := readIntFile(prevPath)
+	writeIntFile(prevPath, tupRead)
+	delta := tupRead - prev
+	if delta <= seqTupReadDeltaMax {
+		return
+	}
+	note(fmt.Sprintf("seq-tup-read +%d>%d between probes — planner fell back to seq scan; ANALYZE %s",
+		delta, seqTupReadDeltaMax, k.cfg.Table))
+	// MkdirAll before the spend — Store.WriteEpochFile does not
+	// create the state dir itself (same note as deadTupleVacuum).
+	_ = os.MkdirAll(k.cfg.GuardStateDir, 0o755)
+	if !k.state.RateTrySpend(kineAnalyzeFile, kineAnalyzeBudget) {
+		note("kine-analyze cooldown (<30m)")
+		return
+	}
+	if _, aerr := k.execLong(ctx, k.psqlArgs(pg, user, pass, false,
+		"-qc", "ANALYZE "+sqlIdent(k.cfg.Table)), ""); aerr != nil {
+		note(fmt.Sprintf("kine-analyze-fail: %v", aerr))
+		return
+	}
+	h.analyzeFired = true
+	logger().Warn("kinedb: seq-scan regression — ran ANALYZE",
+		"table", k.cfg.Table, "seq_tup_read_delta", delta)
 }
 
 // parseGIDs splits the gid list of the prepared-xacts query — one

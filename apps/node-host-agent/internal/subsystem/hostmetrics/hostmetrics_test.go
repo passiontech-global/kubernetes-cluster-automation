@@ -212,8 +212,11 @@ func TestDescribe(t *testing.T) {
 	// + 2 W8 descs (kernel-keys ratio, sockstat tcp close_wait).
 	// + 1 W9 desc (localpv dir bytes).
 	// + 6 netstat/snmp kernel TCP/IP counter descs.
-	if got := len(ch); got != 57 {
-		t.Fatalf("Describe emitted %d descs want 57", got)
+	// + 4 W12-KR3 descs (ephemeral port saturation, tcp CLOSE_WAIT
+	// count, node_exporter-named nf_conntrack insert_failed/drop).
+	// + 1 W12-CP4a desc (sa.pub signer-key fingerprint hash).
+	if got := len(ch); got != 62 {
+		t.Fatalf("Describe emitted %d descs want 62", got)
 	}
 }
 

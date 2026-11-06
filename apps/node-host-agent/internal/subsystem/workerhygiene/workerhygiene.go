@@ -121,6 +121,7 @@ type Hygiene struct {
 	clockJump        *runtime.ClockJumpCheck
 	unlinkedFDs      *runtime.UnlinkedOpenFilesCheck
 	cgroupSwap       *runtime.CgroupSwapCheck
+	cgroupThrottle   *runtime.CgroupThrottleCheck
 
 	// feeder is the T15 kubelet watchdog feeder — not a Check (it
 	// runs on its own faster ticker Spawned from Run, outside the

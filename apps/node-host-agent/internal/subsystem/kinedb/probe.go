@@ -11,7 +11,12 @@
 //	                 host port only)
 //	pools            SHOW POOLS: server conns > 0 and cl_waiting
 //	                 <= WaitMax (deep queue = apiserver flap,
-//	                 incident 2026-10-01)
+//	                 incident 2026-10-01); maxwait also feeds the
+//	                 W12-CP1 server-pool starvation detector in
+//	                 checkPGBWedge — a queue older than 10s while
+//	                 the backend runs fewer queries than the pool
+//	                 holds server conns means stalled conns, not
+//	                 a busy backend
 //	backend_env      .env creds log into the backend — catches
 //	                 the initdb-skip credential drift trap
 //	log_errors       pgbouncer log 301s clean of login_retry /
@@ -92,6 +97,11 @@ type poolStats struct {
 	svIdle      int64
 	serverConns int64 // sum of every sv_* column (bash parity)
 	clWaiting   int64
+	// maxWaitSec is the `maxwait` column — the age in seconds of the
+	// oldest client queued for a server conn (W12-CP1 starvation
+	// signal; maxwait_us's fractional part adds nothing the guard
+	// needs).
+	maxWaitSec int64
 }
 
 // isPoolsHeader reports whether a `SHOW POOLS` field row is the
@@ -115,8 +125,8 @@ func isPoolsHeader(f []string) bool {
 // (the shell did the same — sv_* column positions shift between
 // pgbouncer versions). SHOW POOLS emits one row per (database,user)
 // pair, so every row for dbName is aggregated: sv_* columns sum,
-// cl_waiting takes the worst. Returns false when the header or no
-// matching pool row is present.
+// cl_waiting and maxwait take the worst. Returns false when the
+// header or no matching pool row is present.
 func parseShowPools(out, dbName string) (poolStats, bool) {
 	var hdr map[string]int
 	var st poolStats
@@ -155,6 +165,8 @@ func parseShowPools(out, dbName string) (poolStats, bool) {
 					st.svIdle += v
 				case name == "cl_waiting" && v > st.clWaiting:
 					st.clWaiting = v
+				case name == "maxwait" && v > st.maxWaitSec:
+					st.maxWaitSec = v
 				}
 				if strings.HasPrefix(name, "sv_") {
 					st.serverConns += v
@@ -245,7 +257,11 @@ func (k *KineDB) runProbeChecks(ctx context.Context) *probeResult {
 			// client queue, or e2e auth failing while the raw
 			// backend still logs in, means the pooler itself is
 			// the wedge → container restart (15m cooldown).
-			k.checkPGBWedge(ctx, pgb, res, note)
+			// W12-CP1 rides the same check: a starved wait queue
+			// (maxwait>10s / cl_waiting with sv_active==0) while
+			// the backend idles below the pool's conn count →
+			// RECONNECT the stalled server conns first.
+			k.checkPGBWedge(ctx, pg, pgb, user, pass, res, note)
 		}
 	}
 
@@ -440,9 +456,20 @@ func (k *KineDB) emitProbe(res *probeResult) {
 		p.Gauge("kine_db_pgbouncer_clients_waiting",
 			"cl_waiting of the postgres pool — deep queue = client spiral",
 			float64(res.pool.clWaiting))
+		// W12-CP1 alert contract series (plan names — kept separate
+		// from the kine_db_* family above so the old dashboards do
+		// not double-count the same number under two names).
+		p.Gauge("kine_pgbouncer_client_waiting_connections",
+			"cl_waiting of the postgres pool — clients queued for a server conn (starvation leading edge)",
+			float64(res.pool.clWaiting))
+		p.Gauge("kine_pgbouncer_maxwait_seconds",
+			"maxwait of the postgres pool — age of the oldest queued client; >10s while the backend idles means stalled server conns",
+			float64(res.pool.maxWaitSec))
 		k.m.serverConns.WithLabelValues("active").Set(float64(res.pool.svActive))
 		k.m.serverConns.WithLabelValues("idle").Set(float64(res.pool.svIdle))
 		k.m.clientsWaiting.Set(float64(res.pool.clWaiting))
+		k.m.pgbClientWaiting.Set(float64(res.pool.clWaiting))
+		k.m.pgbMaxWait.Set(float64(res.pool.maxWaitSec))
 	}
 	if res.revSeen {
 		p.Gauge("kine_db_head_revision",
@@ -509,6 +536,28 @@ func (k *KineDB) emitProbe(res *probeResult) {
 				"WAL bytes pinned by inactive replication slots",
 				float64(h.slotRetained))
 			k.m.inactiveSlot.Set(float64(h.slotRetained))
+		}
+		// W12-CP2 item 7 — invalid-index census + seq-scan
+		// regression counters. The seq_* series are cumulative
+		// pg_stat counters → TYPE counter, like the rollback total
+		// in the xact textfile.
+		if h.invalidSeen {
+			p.Gauge("kine_db_invalid_indexes",
+				"Indexes with indisvalid=false in pg_index — dead shells an interrupted REINDEX CONCURRENTLY leaves behind",
+				float64(h.invalidIdx))
+			k.m.invalidIndexes.Set(float64(h.invalidIdx))
+		}
+		if h.seqSeen {
+			p.HeaderType("kine_db_seq_scans_total",
+				"seq_scan of the kine table (pg_stat_user_tables) — sequential scans against the kine heap.",
+				"counter")
+			p.Line(fmt.Sprintf("kine_db_seq_scans_total %d", h.seqScans))
+			p.HeaderType("kine_db_seq_tuples_read_total",
+				"seq_tup_read of the kine table (pg_stat_user_tables) — tuples read via seq scans; a spike means planner regression.",
+				"counter")
+			p.Line(fmt.Sprintf("kine_db_seq_tuples_read_total %d", h.seqTupRead))
+			k.m.seqScansVal.Store(h.seqScans)
+			k.m.seqTupReadVal.Store(h.seqTupRead)
 		}
 	}
 	// The reaper counter is cumulative state — emitted every round

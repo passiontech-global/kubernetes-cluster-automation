@@ -50,6 +50,12 @@ func NewCgroupSwap(d *wdeps.Deps) *CgroupSwapCheck {
 	return &CgroupSwapCheck{d: d}
 }
 
+// NewCgroupThrottle returns the W12-KR1 pod memory.high throttle +
+// pids.max guard.
+func NewCgroupThrottle(d *wdeps.Deps) *CgroupThrottleCheck {
+	return &CgroupThrottleCheck{d: d}
+}
+
 // NewDiskBloat returns the W6.3 disk-bloat runaway detector.
 func NewDiskBloat(d *wdeps.Deps) *DiskBloatCheck {
 	return &DiskBloatCheck{d: d}

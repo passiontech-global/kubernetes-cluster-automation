@@ -57,6 +57,16 @@ type Series struct {
 	// kubelet_pleg_discard_events counter.
 	KubeletPLEGLastSeenAgeSec float64
 	KubeletPLEGDiscardEvents  int64
+	// PodCgroupMemoryThrottled counts pod cgroups caught in
+	// memory.high throttle (W12-KR1), PodCgroupPIDsMaxUtilRatio is
+	// the worst pids.current/pids.max across pod cgroups.
+	PodCgroupMemoryThrottled  int64
+	PodCgroupPIDsMaxUtilRatio float64
+	// KubeletStorageOperationErrors is the
+	// storage_operation_errors_total counter passthrough (W12-KR4)
+	// — summed across the volume_plugin/operation labels of the
+	// kubelet :10250/metrics scrape.
+	KubeletStorageOperationErrors int64
 }
 
 // Deps is the shared state every Check consumes — the split's

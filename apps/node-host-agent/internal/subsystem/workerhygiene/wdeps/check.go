@@ -54,6 +54,7 @@ const (
 	CheckClockJump         = "clock-jump-session-healer"   // konn pod recreate after step
 	CheckUnlinkedOpenFiles = "unlinked-open-files"         // deleted-but-open fd space guard
 	CheckCgroupSwap        = "cgroup-swap-leak"            // kubepods memory.swap leak cap
+	CheckCgroupThrottle    = "cgroup-pod-throttle"         // W12-KR1 pod memory.high + pids.max
 )
 
 // CycleEnv is the per-cycle shared context Cycle hands to every

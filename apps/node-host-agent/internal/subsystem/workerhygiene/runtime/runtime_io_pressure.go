@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -31,6 +32,11 @@ const (
 	// diskWriteAwaitHighMs is the per-cycle mean write await above
 	// which latency-critical IO is queued behind bulk writers.
 	diskWriteAwaitHighMs = 200.0
+	// diskSlowIOConsecNeeded is the consecutive-cycle count the
+	// W12-KR4 DiskSlowIO gray-failure verdict must persist before
+	// latching — ~10m at the default 2m interval, so a bursty
+	// backup or fstrim spike can't cordon the node.
+	diskSlowIOConsecNeeded = 5
 )
 
 var (
@@ -55,6 +61,8 @@ var (
 // diskIOStat is one whole-disk row of /proc/diskstats, reduced to
 // the counters the deltas need (all in kernel units: ios, ms).
 type diskIOStat struct {
+	rdIOS   uint64 // field 3  — reads completed
+	rdTicks uint64 // field 6  — ms spent reading
 	wrIOS   uint64 // field 7  — writes completed
 	wrTicks uint64 // field 10 — ms spent writing
 	ioTicks uint64 // field 12 — ms doing IO (utilization source)
@@ -86,6 +94,12 @@ func parseDiskstats(data []byte) map[string]diskIOStat {
 			continue
 		}
 		var s diskIOStat
+		if v, err := strconv.ParseUint(f[3], 10, 64); err == nil {
+			s.rdIOS = v
+		}
+		if v, err := strconv.ParseUint(f[6], 10, 64); err == nil {
+			s.rdTicks = v
+		}
 		if v, err := strconv.ParseUint(f[7], 10, 64); err == nil {
 			s.wrIOS = v
 		}
@@ -135,13 +149,15 @@ func psiIOFullAvgs(d *wdeps.Deps) (avg60, avg300 float64, ok bool) {
 }
 
 // IOPressureCheck is the disk-IO starvation guard as a Check. It
-// keeps the previous diskstats snapshot for the delta math and the
-// pid→comm throttle ledger (pid reuse protection).
+// keeps the previous diskstats snapshot for the delta math, the
+// pid→comm throttle ledger (pid reuse protection) and the W12-KR4
+// consecutive-cycle disk-slow-io streak.
 type IOPressureCheck struct {
-	d         *wdeps.Deps
-	lastDisk  map[string]diskIOStat
-	lastTime  time.Time
-	throttled map[int]string
+	d             *wdeps.Deps
+	lastDisk      map[string]diskIOStat
+	lastTime      time.Time
+	throttled     map[int]string
+	diskSlowFails int
 }
 
 // Name returns the check label / WD_SIG key.
@@ -160,7 +176,7 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	}
 	now := c.d.Cfg.Seams.NowFn()
 	cur := parseDiskstats(data)
-	util, await := 0.0, 0.0
+	util, await, maxAwait := 0.0, 0.0, 0.0
 	if c.lastDisk != nil {
 		dtMs := float64(now.Sub(c.lastTime).Milliseconds())
 		if dtMs > 0 {
@@ -180,6 +196,25 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 				}
 				if s.wrTicks >= prev.wrTicks {
 					dWrMs += s.wrTicks - prev.wrTicks
+					// Per-disk max read/write await for the W12-KR4
+					// DiskSlowIO latch — a single dying device
+					// (bad-sector remap, RAID rebuild, slow SAN)
+					// is the signal; the pooled await above
+					// dilutes it across healthy disks.
+					if dios := s.wrIOS - prev.wrIOS; dios > 0 {
+						if a := float64(s.wrTicks-prev.wrTicks) /
+							float64(dios); a > maxAwait {
+							maxAwait = a
+						}
+					}
+				}
+				if s.rdTicks >= prev.rdTicks && s.rdIOS >= prev.rdIOS {
+					if dios := s.rdIOS - prev.rdIOS; dios > 0 {
+						if a := float64(s.rdTicks-prev.rdTicks) /
+							float64(dios); a > maxAwait {
+							maxAwait = a
+						}
+					}
 				}
 			}
 			if dWr > 0 {
@@ -193,6 +228,32 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	avg60, avg300, psiOK := psiIOFullAvgs(c.d)
 	c.d.IOPSIFullAvg60 = avg60
 	c.d.IOPSIFullAvg300 = avg300
+	// W12-KR4: the DiskSlowIO gray-failure latch — a whole disk
+	// whose write await stays >200ms WHILE io PSI full avg60 sits
+	// >= 25% for >=5 consecutive cycles (~10m) is a dying device
+	// or a slow shared-storage path: ScyllaDB/PostgreSQL/kubelet
+	// stall long before any task hits D-state (KernelHungTasks)
+	// or the fs remounts ro (FilesystemReadOnly). Latch-only by
+	// design: nodereporter maps it to the DiskSlowIO condition
+	// for node-hang-precordon / descheduler-storm-gate so the
+	// scheduler stops placing stateful pods here — it must NEVER
+	// feed a reboot path (a shared SAN slowdown would
+	// mass-reboot the fleet).
+	if maxAwait > diskWriteAwaitHighMs && psiOK && avg60 >= ioPSIFullHigh {
+		c.diskSlowFails++
+		if c.diskSlowFails >= diskSlowIOConsecNeeded {
+			c.d.State.Enter(hoststate.LatchDiskSlowIO, fmt.Sprintf(
+				"max_await=%.1fms psi_avg60=%.1f fails=%d",
+				maxAwait, avg60, c.diskSlowFails))
+		} else {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: disk-slow-io max_await=%.1fms psi_avg60=%.1f (check %d/%d)",
+				maxAwait, avg60, c.diskSlowFails, diskSlowIOConsecNeeded))
+		}
+	} else {
+		c.diskSlowFails = 0
+		c.d.State.Exit(hoststate.LatchDiskSlowIO, nil)
+	}
 	pressure := await > diskWriteAwaitHighMs ||
 		(psiOK && (avg300 > ioPSIFullHigh || avg60 > ioPSIFullHigh))
 	if !pressure {
