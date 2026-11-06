@@ -104,16 +104,15 @@ func (p *httpContentCheck) Run(ctx context.Context) probefw.Result {
 // check red forever — RestartCount is monotonic, so the raw count
 // alone can never recover.
 func (p *podRestartsCheck) Run(ctx context.Context) probefw.Result {
-	pods, err := p.CS.CoreV1().Pods(p.Cfg.Pods.Namespace).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.PodsIn(ctx, p.Cfg.Pods.Namespace)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods in %s: %w",
 			p.Cfg.Pods.Namespace, err)}
 	}
 	now := p.Now()
 	var offenders []string
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := pods[i]
 		for _, statuses := range [][]corev1.ContainerStatus{
 			pod.Status.InitContainerStatuses,
 			pod.Status.ContainerStatuses,
@@ -161,15 +160,14 @@ func restartRecentlyActive(s corev1.ContainerStatus, now time.Time) bool {
 // images pull); any older pod whose Phase is not Running or Succeeded
 // is a FAIL (Failed/Unknown/stuck Pending).
 func (p *podStatusCheck) Run(ctx context.Context) probefw.Result {
-	pods, err := p.CS.CoreV1().Pods(p.Cfg.Pods.Namespace).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.PodsIn(ctx, p.Cfg.Pods.Namespace)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods in %s: %w",
 			p.Cfg.Pods.Namespace, err)}
 	}
 	var bad []string
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := pods[i]
 		if p.Now().Sub(pod.CreationTimestamp.Time) < p.Cfg.Pods.SkipDuration {
 			continue // too young — still allowed to be Pending
 		}

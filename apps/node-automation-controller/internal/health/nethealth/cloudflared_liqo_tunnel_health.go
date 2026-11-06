@@ -167,20 +167,19 @@ func (p *cloudflaredTunnelHealthCheck) cfTunnelLogQUICStorm(ctx context.Context,
 func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
 	// Ready siblings per controller UID — the heal's "someone can
 	// absorb the traffic" proof.
-	readyByOwner := probefw.ReadyByOwner(pods.Items)
+	readyByOwner := probefw.ReadyByOwner(pods)
 
 	var rep probefw.SweepReport
 	streakKeep := map[string]bool{}
 	var degraded []*corev1.Pod
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		if pod.DeletionTimestamp != nil ||
 			pod.Status.Phase != corev1.PodRunning ||
 			now.Sub(pod.CreationTimestamp.Time) < cfTunnelPodMinAge ||
@@ -357,7 +356,7 @@ func (p *liqoTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 	var found []liqoPeerFinding
 
 	// Virtual nodes — Ready False/absent past the window.
-	nodes, err := kube.ListNodes(ctx, p.CS)
+	nodes, err := p.AllNodes(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
@@ -444,15 +443,14 @@ var liqoTunnelCRs = []struct {
 func (p *liqoTunnelHealthCheck) bounceLiqoGateways(ctx context.Context,
 	log logr.Logger, found []liqoPeerFinding, now time.Time) error {
 
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return fmt.Errorf("list pods for liqo gateway bounce: %w", err)
 	}
 	for _, f := range found {
 		var target *corev1.Pod
-		for i := range pods.Items {
-			pod := &pods.Items[i]
+		for i := range pods {
+			pod := &pods[i]
 			if pod.DeletionTimestamp != nil ||
 				pod.Status.Phase != corev1.PodRunning ||
 				!strings.HasPrefix(pod.Name, liqoGatewayPodPrefix) {

@@ -233,14 +233,13 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	// (b) pod logs — crash/stall evidence the CR status cannot see.
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
 	pgPVCs := map[string]bool{} // "ns/pvc" mounted by a postgres pod
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		cluster := postgresClusterOf(pod)
 		if cluster == "" {
 			continue

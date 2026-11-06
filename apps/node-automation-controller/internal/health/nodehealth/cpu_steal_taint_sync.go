@@ -94,7 +94,7 @@ func init() {
 func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	nodes, err := kube.ListNodes(ctx, p.CS)
+	nodes, err := p.AllNodes(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
@@ -161,6 +161,7 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 						metrics.IncError(p.Name)
 						log.Error(err, "cpu-steal taint failed", "node", n.Name)
 					} else {
+						p.InvalidateSweep(ctx) // node taints changed
 						tainted = true
 						log.Info("TAINT: worker under sustained CPUStealPressure — PreferNoSchedule",
 							"node", n.Name, "for", age.Truncate(time.Minute))
@@ -182,6 +183,7 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 						metrics.IncError(p.Name)
 						log.Error(err, "cpu-steal untaint failed", "node", n.Name)
 					} else {
+						p.InvalidateSweep(ctx) // node taints changed
 						tainted = false
 						// The untaint landed — the stamp leaves BOTH
 						// clocks so the next taint cycle re-arms a

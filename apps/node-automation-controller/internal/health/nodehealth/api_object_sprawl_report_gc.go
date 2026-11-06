@@ -41,6 +41,13 @@ type apiObjectSprawlReportGCCheck struct {
 	emittedObjects state.GaugeLedger[string]
 	emittedOrphans state.GaugeLedger[string]
 	emittedHelm    state.GaugeLedger[string]
+
+	// ownerSeen memoizes one sweep's owner-existence probes: a pod
+	// with N containers produces N identical reports per kind, all
+	// pointing at the same Pod/ReplicaSet owner — the N+1 Get storm
+	// the map collapses to one lookup per distinct owner. Reset at
+	// the top of every Run.
+	ownerSeen map[string]bool
 }
 
 // NewAPIObjectSprawlReportGCCheck builds the sprawl-gc check — its
@@ -145,6 +152,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 
 	var objects, orphans, helmRep probefw.SweepReport
 	orphanBudget := sprawlMaxOrphanDeletes
+	p.ownerSeen = map[string]bool{}
 	for _, rk := range sprawlReportKinds {
 		items, err := p.Dyn.Resource(rk.gvr).List(ctx, metav1.ListOptions{})
 		switch {
@@ -207,8 +215,30 @@ func (p *apiObjectSprawlReportGCCheck) reportOwnerGone(ctx context.Context,
 	// Only the Pod/ReplicaSet kinds are whitelisted — any other
 	// shape (unresolvable, lookup error, no owner, object still
 	// alive) fails closed as "not evidence of orphanhood".
-	gone, _ := probefw.OwnerGone(ctx, p.CS, obj.GetNamespace(),
-		metav1.GetControllerOf(obj), "Pod", "ReplicaSet")
+	ref := metav1.GetControllerOf(obj)
+	if ref == nil {
+		return false
+	}
+	if p.ownerSeen == nil {
+		p.ownerSeen = map[string]bool{} // lazy init — Run seeds it
+	}
+	key := ref.Kind + "/" + obj.GetNamespace() + "/" + ref.Name
+	if gone, memo := p.ownerSeen[key]; memo {
+		return gone // same owner already resolved this sweep
+	}
+	var gone bool
+	if ref.Kind == "Pod" {
+		// The sweep's shared pod census resolves Pod owners with
+		// zero API calls; an unverifiable census fails closed the
+		// same way a lookup error did (owner presumed alive).
+		pods, err := p.AllPods(ctx)
+		gone = err == nil &&
+			probefw.PodFromList(pods, obj.GetNamespace(), ref.Name) == nil
+	} else {
+		gone, _ = probefw.OwnerGone(ctx, p.CS, obj.GetNamespace(),
+			ref, "Pod", "ReplicaSet")
+	}
+	p.ownerSeen[key] = gone
 	return gone
 }
 
@@ -260,8 +290,18 @@ func (p *apiObjectSprawlReportGCCheck) deleteOrphanReport(ctx context.Context,
 func (p *apiObjectSprawlReportGCCheck) pruneHelmSecrets(ctx context.Context,
 	log logr.Logger, objects, helmRep *probefw.SweepReport) error {
 
+	// owner=helm,status=superseded server-side: every superseded
+	// revision carries that label pair (helm v3 convention — the same
+	// labels pruneSupersededSecrets and the test fixtures use), so
+	// the live deployed/pending/failed revisions never cross the wire.
+	// The census below therefore counts the superseded population —
+	// the actual bloat the helm_release_secrets series exists to
+	// track. The per-release "highest" guard still protects the
+	// newest superseded revision (the rollback point), and a
+	// non-superseded current revision was never a candidate anyway.
 	secrets, err := kube.ListAll(ctx, metav1.ListOptions{
-		LabelSelector: "owner=helm", Limit: probefw.HealthListPageSize},
+		LabelSelector: "owner=helm,status=superseded",
+		Limit:         probefw.HealthListPageSize},
 		kube.Secrets(p.CS, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list helm release secrets: %w", err)

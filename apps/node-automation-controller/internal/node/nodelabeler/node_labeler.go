@@ -41,6 +41,10 @@ const workerRoleLabel = "node-role.kubernetes.io/worker"
 
 type nodeLabeler struct {
 	cs kubernetes.Interface
+	// nodeReader is the informer-backed node read — the sweep's
+	// whole-cluster census rides the Node watch this reconciler
+	// already registers instead of an apiserver LIST per run.
+	nodeReader kube.CachedNodeReader
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the controller name, the registration log and
 	// every IncError label come from one place.
@@ -84,7 +88,7 @@ var nodeLabelChanges = predicate.Funcs{
 func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, configFromEnv, func(cfg labelerConfig) error {
 		logf.Log.WithName(d.Name).Info("registered", "configPath", cfg.configPath)
-		r := &nodeLabeler{cs: d.CS, queue: d.Name, configPath: cfg.configPath}
+		r := &nodeLabeler{cs: d.CS, nodeReader: d.Mgr.GetClient(), queue: d.Name, configPath: cfg.configPath}
 		return ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
 			// Watches with a single fixed workqueue key, not For(): the
@@ -120,7 +124,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 	res := ctrl.Result{RequeueAfter: 30 * time.Minute}
 
 	// (a) worker role on every non-control-plane node lacking it.
-	nodes, err := kube.ListNodes(ctx, r.cs)
+	nodes, err := kube.ListNodesCached(ctx, r.nodeReader, r.cs)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}

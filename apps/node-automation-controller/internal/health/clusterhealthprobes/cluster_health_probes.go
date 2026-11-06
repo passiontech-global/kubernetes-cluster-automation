@@ -273,6 +273,13 @@ func setupConfigFromEnv() setupConfig {
 
 func (p *clusterHealthProber) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
+	// One fresh cluster-state snapshot per sweep: the ~30 checks
+	// that census pods/nodes/EndpointSlices/Services/Namespaces used
+	// to each issue their own full LIST (~17 pod + ~11 node LISTs
+	// per cycle); the ctx-carried memoizer turns that into one LIST
+	// per resource per run. Checks invalidate it on their own
+	// mutations via Deps.InvalidateSweep.
+	ctx = probefw.WithSweepSnapshot(ctx)
 	for _, c := range p.checks {
 		// Bound one check's share of the serial sweep — a hung
 		// apiserver call used to stretch the whole cycle. The child

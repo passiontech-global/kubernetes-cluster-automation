@@ -174,17 +174,16 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 	// serving the log scan, the prom pod mapping and the quorum
 	// census. A list failure on a populated cluster is Infra — the
 	// census cannot be proven.
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{
-			LabelSelector: "app.kubernetes.io/name=" + natsAppLabelValue})
+	pods, err := p.PodsMatching(ctx, metav1.NamespaceAll,
+		"app.kubernetes.io/name="+natsAppLabelValue)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nats pods: %w", err)}
 	}
 	memberByName := map[string]*corev1.Pod{} // "ns/name"
 	memberByShort := map[string]*corev1.Pod{}
 	readyBySTS := map[string]int{} // "ns/stsName" -> Running+Ready members
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := pods[i]
 		if pod.DeletionTimestamp != nil {
 			continue
 		}

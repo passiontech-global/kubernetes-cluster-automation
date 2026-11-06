@@ -14,7 +14,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -95,8 +94,7 @@ func init() {
 func (p *imagePullStormCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
@@ -107,8 +105,8 @@ func (p *imagePullStormCheck) Run(ctx context.Context) probefw.Result {
 	namespaces := map[string]bool{}
 	outage := false
 	live := map[string]bool{} // container keys still storming this sweep
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		if pod.Status.Phase == corev1.PodSucceeded ||
 			pod.DeletionTimestamp != nil {
 			continue

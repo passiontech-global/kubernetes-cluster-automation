@@ -261,7 +261,7 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 
 	// Namespaces opted into injection — the only places a desynced
 	// EndpointSlice actually strands mesh traffic.
-	nsList, err := p.CS.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	nsList, err := p.AllNamespaces(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list namespaces: %w", err)}
 	}
@@ -270,11 +270,11 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	// Cilium config only conflicts while the mesh itself is
 	// deployed on this cluster.
 	linkerdInstalled := false
-	for i := range nsList.Items {
-		if nsList.Items[i].Labels[linkerdInjectLabel] == "enabled" {
-			injected[nsList.Items[i].Name] = true
+	for i := range nsList {
+		if nsList[i].Labels[linkerdInjectLabel] == "enabled" {
+			injected[nsList[i].Name] = true
 		}
-		if nsList.Items[i].Name == probefw.LinkerdNS {
+		if nsList[i].Name == probefw.LinkerdNS {
 			linkerdInstalled = true
 		}
 	}
@@ -288,13 +288,11 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 	// to delete if the service's desync survives the window (W10-FIX7).
 	staleSlices := map[string][]linkerdSliceRef{}
 	if len(injected) > 0 {
-		svcList, err := p.CS.CoreV1().Services(metav1.NamespaceAll).
-			List(ctx, metav1.ListOptions{})
+		svcList, err := p.AllServices(ctx)
 		if err != nil {
 			return probefw.Result{Infra: fmt.Errorf("list services: %w", err)}
 		}
-		podList, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-			List(ctx, metav1.ListOptions{})
+		podList, err := p.AllPods(ctx)
 		if err != nil {
 			return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 		}
@@ -303,8 +301,8 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		// the per-service loop applies. Only their controller-owned
 		// slices are delete candidates (W10-FIX7).
 		audited := map[string]bool{}
-		for i := range svcList.Items {
-			svc := &svcList.Items[i]
+		for i := range svcList {
+			svc := &svcList[i]
 			if linkerdAuditedService(injected, svc) {
 				audited[svc.Namespace+"/"+svc.Name] = true
 			}
@@ -317,58 +315,53 @@ func (p *linkerdEndpointSyncCheck) Run(ctx context.Context) probefw.Result {
 		// endpointslice-controller-owned EndpointSlices with their
 		// Ready address sets — the W10-FIX7 delete candidates.
 		managedSlices := map[string][]linkerdSliceRef{}
-		err = kube.ListEach(ctx,
-			metav1.ListOptions{Limit: probefw.HealthListPageSize},
-			kube.EndpointSlices(p.CS, metav1.NamespaceAll),
-			func(items []discoveryv1.EndpointSlice) error {
-				for _, s := range items {
-					svc := s.Labels[discoveryv1.LabelServiceName]
-					if svc == "" {
-						continue
-					}
-					key := s.Namespace + "/" + svc
-					managed := audited[key] &&
-						s.Labels[discoveryv1.LabelManagedBy] == linkerdSliceManagedByESC &&
-						s.DeletionTimestamp == nil
-					var sliceAddrs map[string]bool
-					if managed {
-						sliceAddrs = map[string]bool{}
-					}
-					set := esReady[key]
-					if set == nil {
-						set = map[string]bool{}
-						esReady[key] = set
-					}
-					for _, ep := range s.Endpoints {
-						if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
-							continue
-						}
-						for _, a := range ep.Addresses {
-							set[a] = true
-							if managed {
-								sliceAddrs[a] = true
-							}
-						}
-					}
-					if managed {
-						managedSlices[key] = append(managedSlices[key],
-							linkerdSliceRef{ns: s.Namespace, name: s.Name,
-								uid: s.UID, addrs: sliceAddrs})
-					}
-				}
-				return nil
-			})
+		slices, err := p.AllEndpointSlices(ctx)
 		if err != nil {
 			return probefw.Result{Infra: fmt.Errorf("list endpointslices: %w", err)}
 		}
+		for _, s := range slices {
+			svc := s.Labels[discoveryv1.LabelServiceName]
+			if svc == "" {
+				continue
+			}
+			key := s.Namespace + "/" + svc
+			managed := audited[key] &&
+				s.Labels[discoveryv1.LabelManagedBy] == linkerdSliceManagedByESC &&
+				s.DeletionTimestamp == nil
+			var sliceAddrs map[string]bool
+			if managed {
+				sliceAddrs = map[string]bool{}
+			}
+			set := esReady[key]
+			if set == nil {
+				set = map[string]bool{}
+				esReady[key] = set
+			}
+			for _, ep := range s.Endpoints {
+				if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+					continue
+				}
+				for _, a := range ep.Addresses {
+					set[a] = true
+					if managed {
+						sliceAddrs[a] = true
+					}
+				}
+			}
+			if managed {
+				managedSlices[key] = append(managedSlices[key],
+					linkerdSliceRef{ns: s.Namespace, name: s.Name,
+						uid: s.UID, addrs: sliceAddrs})
+			}
+		}
 
 		podsByNS := map[string][]*corev1.Pod{}
-		for i := range podList.Items {
-			pod := &podList.Items[i]
+		for i := range podList {
+			pod := &podList[i]
 			podsByNS[pod.Namespace] = append(podsByNS[pod.Namespace], pod)
 		}
-		for i := range svcList.Items {
-			svc := &svcList.Items[i]
+		for i := range svcList {
+			svc := &svcList[i]
 			if !linkerdAuditedService(injected, svc) {
 				continue
 			}
@@ -520,6 +513,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		switch {
 		case err == nil:
 			healed = true
+			p.InvalidateSweep(ctx) // slice census changed — drop the snapshot
 			log.Info("DELETE: stale EndpointSlice for endpoint desync — endpointslice-controller rebuild forced",
 				"endpointslice", sl.ns+"/"+sl.name, "service", svcKey)
 		case apierrors.IsNotFound(err):
@@ -532,7 +526,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 		}
 	}
 
-	pods, err := p.CS.CoreV1().Pods(probefw.LinkerdNS).List(ctx, metav1.ListOptions{})
+	pods, err := p.PodsIn(ctx, probefw.LinkerdNS)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: list linkerd pods failed — heal deferred",
@@ -550,8 +544,8 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 	// control-plane-component label, any phase), which
 	// heal.OldestRunningPod's Running-only prefix scan cannot express.
 	var target *corev1.Pod
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := pods[i]
 		if pod.DeletionTimestamp != nil ||
 			!probefw.LinkerdPodMatchesComponent(pod, probefw.LinkerdDestinationName) {
 			continue
@@ -570,6 +564,7 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 				"pod", target.Namespace+"/"+target.Name)
 		} else {
 			healed = true
+			p.InvalidateSweep(ctx) // pod gone — drop the census
 			metrics.ControlPlanePodHealsTotal.WithLabelValues(probefw.LinkerdDestinationName).Inc()
 			log.Info("DELETE: linkerd-destination bounce for endpoint desync — forcing endpoint-table resync",
 				"pod", target.Namespace+"/"+target.Name, "service", svcKey)

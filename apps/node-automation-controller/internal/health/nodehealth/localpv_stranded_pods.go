@@ -250,7 +250,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	nodes, err := kube.ListNodes(ctx, p.CS)
+	nodes, err := p.AllNodes(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
@@ -300,90 +300,84 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 	var stranded, stalledRep, statefulRep probefw.SweepReport
 	var heals []strandedHeal
 
-	podOpts := metav1.ListOptions{
-		FieldSelector: "status.phase=Pending",
-		Limit:         probefw.HealthListPageSize,
+	// Pending pods only — the old status.phase=Pending FieldSelector,
+	// evaluated client-side over the shared sweep snapshot.
+	pods, err := p.AllPods(ctx)
+	if err != nil {
+		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
-	err = kube.ListEach(ctx, podOpts,
-		kube.Pods(p.CS, metav1.NamespaceAll),
-		func(items []corev1.Pod) error {
-			for i := range items {
-				pod := &items[i]
-				if pod.Status.Phase != corev1.PodPending {
-					continue // mirrors the FieldSelector for fake clients
-				}
-				age := now.Sub(pod.CreationTimestamp.Time)
-				if age < localPVStrandedMinAge {
-					continue
-				}
-				for _, vol := range pod.Spec.Volumes {
-					claim := vol.PersistentVolumeClaim
-					if claim == nil {
-						continue
-					}
-					pvc := pvcsByKey[pod.Namespace+"/"+claim.ClaimName]
-					if pvc == nil {
-						continue
-					}
-					// Branch A — bound local PV on an unavailable node.
-					if pvc.Status.Phase == corev1.ClaimBound &&
-						pvc.Spec.VolumeName != "" {
-						if pv := pvsByName[pvc.Spec.VolumeName]; pv != nil {
-							for _, node := range localPVNodeNames(pv) {
-								reason := strandedNodeReason(nodesByName, node)
-								if reason == "" {
-									continue
-								}
-								key := pod.Namespace + "/" + pod.Name + "/" +
-									pvc.Name + "/" + node + "/" + reason
-								stranded.Emit(localPVStrandedPodsGauge, key,
-									[]string{pod.Namespace, pod.Name, pvc.Name,
-										node, reason}, key)
-								// W12-SC2 — a NON-ephemeral workload
-								// stranded on a confirmed-dead node is
-								// the data-loss class the ephemeral heal
-								// deliberately never touches; the
-								// dedicated gauge names the dead node so
-								// the alert routes to the site.
-								if (reason == strandedReasonMissingNode ||
-									reason == strandedReasonOutOfService) &&
-									!ephemeralLocalPV(pod, pvc) {
-									skey := pod.Namespace + "/" + pod.Name + "/" + node
-									statefulRep.Flag(localPVStrandedStatefulPodGauge,
-										skey, []string{pod.Namespace, pod.Name, node})
-									stranded.Find("stateful:" + skey + "(" + reason + ")")
-								}
-								// Confirmed-gone nodes only: NotReady/
-								// cordoned can come back — a missing or
-								// fenced (out-of-service) node cannot.
-								if ephemeralLocalPV(pod, pvc) &&
-									(reason == strandedReasonMissingNode ||
-										reason == strandedReasonOutOfService) &&
-									age >= localPVEphemeralHealMinAge {
-									heals = append(heals, strandedHeal{
-										pod: pod, pvc: pvc, node: node, reason: reason})
-								}
-							}
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Status.Phase != corev1.PodPending {
+			continue // mirrors the FieldSelector for fake clients
+		}
+		age := now.Sub(pod.CreationTimestamp.Time)
+		if age < localPVStrandedMinAge {
+			continue
+		}
+		for _, vol := range pod.Spec.Volumes {
+			claim := vol.PersistentVolumeClaim
+			if claim == nil {
+				continue
+			}
+			pvc := pvcsByKey[pod.Namespace+"/"+claim.ClaimName]
+			if pvc == nil {
+				continue
+			}
+			// Branch A — bound local PV on an unavailable node.
+			if pvc.Status.Phase == corev1.ClaimBound &&
+				pvc.Spec.VolumeName != "" {
+				if pv := pvsByName[pvc.Spec.VolumeName]; pv != nil {
+					for _, node := range localPVNodeNames(pv) {
+						reason := strandedNodeReason(nodesByName, node)
+						if reason == "" {
+							continue
 						}
-					}
-					// Branch B — claim still Pending on the hostpath
-					// provisioner while schedulable workers exist.
-					if pvc.Status.Phase == corev1.ClaimPending &&
-						hasSchedulableWorker &&
-						pvc.Spec.StorageClassName != nil &&
-						*pvc.Spec.StorageClassName == openebsHostpathSC &&
-						age >= pvcStalledMinAge {
-						key := pod.Namespace + "/" + pvc.Name + "/" + openebsHostpathSC
-						stalledRep.Flag(pvcProvisioningStalledGauge, key,
-							[]string{pod.Namespace, pvc.Name, openebsHostpathSC})
-						stranded.Find("stalled:" + key)
+						key := pod.Namespace + "/" + pod.Name + "/" +
+							pvc.Name + "/" + node + "/" + reason
+						stranded.Emit(localPVStrandedPodsGauge, key,
+							[]string{pod.Namespace, pod.Name, pvc.Name,
+								node, reason}, key)
+						// W12-SC2 — a NON-ephemeral workload
+						// stranded on a confirmed-dead node is
+						// the data-loss class the ephemeral heal
+						// deliberately never touches; the
+						// dedicated gauge names the dead node so
+						// the alert routes to the site.
+						if (reason == strandedReasonMissingNode ||
+							reason == strandedReasonOutOfService) &&
+							!ephemeralLocalPV(pod, pvc) {
+							skey := pod.Namespace + "/" + pod.Name + "/" + node
+							statefulRep.Flag(localPVStrandedStatefulPodGauge,
+								skey, []string{pod.Namespace, pod.Name, node})
+							stranded.Find("stateful:" + skey + "(" + reason + ")")
+						}
+						// Confirmed-gone nodes only: NotReady/
+						// cordoned can come back — a missing or
+						// fenced (out-of-service) node cannot.
+						if ephemeralLocalPV(pod, pvc) &&
+							(reason == strandedReasonMissingNode ||
+								reason == strandedReasonOutOfService) &&
+							age >= localPVEphemeralHealMinAge {
+							heals = append(heals, strandedHeal{
+								pod: pod, pvc: pvc, node: node, reason: reason})
+						}
 					}
 				}
 			}
-			return nil
-		})
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
+			// Branch B — claim still Pending on the hostpath
+			// provisioner while schedulable workers exist.
+			if pvc.Status.Phase == corev1.ClaimPending &&
+				hasSchedulableWorker &&
+				pvc.Spec.StorageClassName != nil &&
+				*pvc.Spec.StorageClassName == openebsHostpathSC &&
+				age >= pvcStalledMinAge {
+				key := pod.Namespace + "/" + pvc.Name + "/" + openebsHostpathSC
+				stalledRep.Flag(pvcProvisioningStalledGauge, key,
+					[]string{pod.Namespace, pvc.Name, openebsHostpathSC})
+				stranded.Find("stalled:" + key)
+			}
+		}
 	}
 
 	// Prune the gauges' series for tuples not re-seen — same
@@ -453,6 +447,7 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 				"pod", h.pod.Namespace+"/"+h.pod.Name)
 			continue
 		}
+		p.InvalidateSweep(ctx) // pod gone — drop the snapshot census
 		p.localPVHealed.Stamp(pvcKey, now)
 		localPVEphemeralHealsTotal.
 			WithLabelValues(h.pvc.Namespace, h.pvc.Name, h.node).Inc()
@@ -487,8 +482,7 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	if !proceed {
 		return
 	}
-	pods, err := p.CS.CoreV1().Pods(openebsProvisionerNS).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.PodsIn(ctx, openebsProvisionerNS)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: list provisioner pods failed — heal deferred",
@@ -496,8 +490,8 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 		return
 	}
 	deleted := false
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := pods[i]
 		if !strings.HasPrefix(pod.Name, openebsProvisionerPrefix) {
 			continue
 		}
@@ -508,6 +502,7 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 				"pod", pod.Namespace+"/"+pod.Name)
 			continue
 		}
+		p.InvalidateSweep(ctx) // pod gone — drop the snapshot census
 		deleted = true
 		log.Info("DELETE: wedged localpv provisioner — stalled claims need a resync",
 			"pod", pod.Namespace+"/"+pod.Name)

@@ -21,7 +21,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -245,8 +244,7 @@ func scyllaLabelValue(line, key string) (string, bool) {
 // that drops writes on the minority side.
 func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
@@ -256,8 +254,8 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 	var backlogRep, shardRep, overloadRep probefw.SweepReport
 	scrapedLive := map[string]bool{} // "ns/pod" successfully scraped — the baselines' keep set
 	shardLive := map[string]bool{}   // "ns/pod" showing the skew THIS sweep — the imbalance ledger's
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		cluster := pod.Labels[scyllaClusterLabel]
 		if cluster == "" || pod.DeletionTimestamp != nil ||
 			pod.Status.Phase != corev1.PodRunning ||

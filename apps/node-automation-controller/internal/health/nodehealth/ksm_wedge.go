@@ -72,9 +72,7 @@ var ksmWedgeSignatures = []struct {
 func (p *controllerLeaseGuardCheck) checkKSMWedged(ctx context.Context,
 	log logr.Logger, now time.Time, rep *probefw.SweepReport) error {
 
-	pods, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Pods(p.CS, metav1.NamespaceAll))
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		// Never evaluated — carry the held ksm tuples forward so the
 		// sweep-end reconcile keeps their series (the scan failed;

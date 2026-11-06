@@ -15,11 +15,9 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // dbOperatorNames are the operators whose role-assignment wedge this
@@ -109,9 +107,7 @@ func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.L
 	}
 	// Cluster-wide but paged — the operator pod's namespace is not
 	// fixed across installs, so no selector can narrow the read.
-	pods, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Pods(p.CS, metav1.NamespaceAll))
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: list pods failed — db operator heal deferred", "error", err)
@@ -135,6 +131,7 @@ func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.L
 			"pod", target.Namespace+"/"+target.Name, "operator", operator)
 		return
 	}
+	p.InvalidateSweep(ctx) // pod gone — drop the census
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(operator).Inc()
 	log.Info("DELETE: db operator pod — masterless service, forcing re-election",
 		"operator", operator, "pod", target.Namespace+"/"+target.Name,

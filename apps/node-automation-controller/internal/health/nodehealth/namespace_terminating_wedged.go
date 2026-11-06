@@ -25,7 +25,6 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
@@ -80,9 +79,7 @@ func init() {
 func (p *namespaceTerminatingWedgedCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	nss, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Namespaces(p.CS))
+	nss, err := p.AllNamespaces(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list namespaces: %w", err)}
 	}

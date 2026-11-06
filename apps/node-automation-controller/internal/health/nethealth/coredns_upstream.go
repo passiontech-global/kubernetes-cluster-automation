@@ -14,7 +14,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -108,15 +107,14 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 
 	// Pod census — dns pods only, for name→ns resolution, sibling
 	// health and the heal target.
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
 	dnsByName := map[string]*corev1.Pod{}
 	dnsByNS := map[string][]*corev1.Pod{}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		if !isDNSPod(pod) {
 			continue
 		}
@@ -197,14 +195,13 @@ func hasHealthySibling(pod *corev1.Pod, siblings []*corev1.Pod,
 func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 	log logr.Logger, now time.Time) probefw.Result {
 
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
 	dnsByNS := map[string][]*corev1.Pod{}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		if isDNSPod(pod) {
 			dnsByNS[pod.Namespace] = append(dnsByNS[pod.Namespace], pod)
 		}
@@ -229,7 +226,7 @@ func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 	for key, detail := range flagged {
 		parts := strings.SplitN(key, "/", 2)
 		ns, name := parts[0], parts[1]
-		pod := probefw.PodFromList(pods.Items, ns, name)
+		pod := probefw.PodFromList(pods, ns, name)
 		if pod == nil {
 			continue
 		}

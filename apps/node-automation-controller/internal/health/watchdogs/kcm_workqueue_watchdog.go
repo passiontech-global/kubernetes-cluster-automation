@@ -111,7 +111,7 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	nodes, err := kube.ListNodes(ctx, p.CS)
+	nodes, err := p.AllNodes(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}

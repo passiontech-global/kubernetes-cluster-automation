@@ -16,7 +16,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -145,18 +144,17 @@ func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result 
 			"error", err)
 	}
 
-	nodes, err := kube.ListNodes(ctx, p.CS)
+	nodes, err := p.AllNodes(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
 	podCount := map[string]int{}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		if pod.Spec.HostNetwork || pod.Spec.NodeName == "" {
 			continue
 		}
@@ -229,10 +227,7 @@ func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Conte
 	if !proceed {
 		return
 	}
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{
-			FieldSelector: "spec.nodeName=" + node,
-		})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: list node pods failed — ipam reap deferred",
@@ -240,11 +235,14 @@ func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Conte
 		return
 	}
 	reaped := 0
-	for i := range pods.Items {
+	for i := range pods {
 		if reaped >= ciliumIPAMMaxReaps {
 			break
 		}
-		pod := &pods.Items[i]
+		pod := &pods[i]
+		if pod.Spec.NodeName != node {
+			continue // the old spec.nodeName FieldSelector, client-side
+		}
 		if pod.DeletionTimestamp != nil ||
 			(pod.Status.Phase != corev1.PodSucceeded &&
 				pod.Status.Phase != corev1.PodFailed) {
@@ -259,6 +257,7 @@ func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Conte
 				"pod", pod.Namespace+"/"+pod.Name)
 			continue
 		}
+		p.InvalidateSweep(ctx) // pod gone — drop the census
 		reaped++
 	}
 	if reaped > 0 {

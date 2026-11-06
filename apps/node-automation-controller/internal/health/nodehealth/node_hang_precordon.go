@@ -176,7 +176,7 @@ func nodeHangLatchActive(n *corev1.Node) bool {
 func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	nodes, err := kube.ListNodes(ctx, p.CS)
+	nodes, err := p.AllNodes(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
@@ -232,6 +232,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(err, "hang precordon uncordon patch failed", "node", name)
 			continue
 		}
+		p.InvalidateSweep(ctx) // node spec changed — drop the snapshot
 		cordoned--
 		nodeHangUncordonsTotal.WithLabelValues(name).Inc()
 		log.Info("UNCORDON: node hang condition cleared",
@@ -256,6 +257,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(err, "hang precordon stale-stamp patch failed", "node", name)
 			continue
 		}
+		p.InvalidateSweep(ctx) // node annotations changed — drop the snapshot
 		log.Info("CORDON STAMP CLEARED: schedulable node carried a stale pre-cordon annotation",
 			"node", name)
 	}
@@ -298,6 +300,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(err, "hang precordon patch failed", "node", name)
 			continue
 		}
+		p.InvalidateSweep(ctx) // node spec changed — drop the snapshot
 		cordoned++
 		nodeHangCordonsTotal.WithLabelValues(name).Inc()
 		log.Info("CORDON: node carrying a sustained hang latch — unschedulable before NHC/SNR reboots it",

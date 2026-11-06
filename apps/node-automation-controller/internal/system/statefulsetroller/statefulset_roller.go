@@ -87,7 +87,8 @@ const (
 )
 
 type statefulSetOnDeleteRoller struct {
-	cs kubernetes.Interface
+	cs         kubernetes.Interface
+	nodeReader kube.CachedNodeReader
 	// dyn feeds the maintenance mutex's autopilot-Plan signal —
 	// live-pod evictions defer while a k0s upgrade is in flight.
 	dyn dynamic.Interface
@@ -173,7 +174,7 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 
 	// Gate 1 is cluster-wide — evaluate once for every due
 	// StatefulSet (a cluster failing it skips them all anyway).
-	nodes, err := kube.ListNodes(ctx, r.cs)
+	nodes, err := kube.ListNodesCached(ctx, r.nodeReader, r.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes (safety gate): %w", err)
 	}

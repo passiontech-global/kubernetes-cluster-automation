@@ -121,6 +121,7 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 				"pod", pod.Namespace+"/"+pod.Name, "operator", op.name)
 			continue
 		}
+		p.InvalidateSweep(ctx) // drop the pod census the delete just invalidated
 		deleted = true
 		log.Info("DELETE: stuck operator leader pod — forcing re-election",
 			"operator", op.name, "pod", pod.Namespace+"/"+pod.Name,
@@ -194,8 +195,7 @@ func (p *operatorWorkqueueCheck) leaderPods(ctx context.Context, op operatorTarg
 			}
 		}
 	}
-	pods, err := p.CS.CoreV1().Pods(podNS).List(ctx,
-		metav1.ListOptions{LabelSelector: op.podSelector})
+	pods, err := p.PodsMatching(ctx, podNS, op.podSelector)
 	if err != nil {
 		return nil, fmt.Errorf("list operator pods in %s (selector %q): %w",
 			podNS, op.podSelector, err)
@@ -207,12 +207,16 @@ func (p *operatorWorkqueueCheck) leaderPods(ctx context.Context, op operatorTarg
 	// longest-running replica is the likelier wedged holder): if
 	// the survivor was the real holder the signature stays up and
 	// the next post-cooldown sweep deletes it.
-	if len(pods.Items) > 1 {
-		sort.Slice(pods.Items, func(i, j int) bool {
-			return pods.Items[i].CreationTimestamp.
-				Before(&pods.Items[j].CreationTimestamp)
+	if len(pods) > 1 {
+		sort.Slice(pods, func(i, j int) bool {
+			return pods[i].CreationTimestamp.
+				Before(&pods[j].CreationTimestamp)
 		})
-		return pods.Items[:1], nil
+		return []corev1.Pod{*pods[0]}, nil
 	}
-	return pods.Items, nil
+	out := make([]corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		out = append(out, *pod)
+	}
+	return out, nil
 }

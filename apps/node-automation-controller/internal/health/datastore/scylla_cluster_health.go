@@ -268,59 +268,52 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	// Shared reads for (b) and (c) — one pod/service/EndpointSlice
 	// census per sweep.
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
-	svcs, err := p.CS.CoreV1().Services(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	svcs, err := p.AllServices(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list services: %w", err)}
 	}
 	esAddrs := map[string]map[string]bool{} // "ns/svc" -> endpoint addresses
-	err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.EndpointSlices(p.CS, metav1.NamespaceAll),
-		func(items []discoveryv1.EndpointSlice) error {
-			for _, s := range items {
-				svc := s.Labels[discoveryv1.LabelServiceName]
-				if svc == "" {
-					continue
-				}
-				key := s.Namespace + "/" + svc
-				set := esAddrs[key]
-				if set == nil {
-					set = map[string]bool{}
-					esAddrs[key] = set
-				}
-				for _, ep := range s.Endpoints {
-					// Ready-only — a slice holding the pod IP but
-					// marked unready is still a desync for traffic.
-					// nil Ready counts as ready (k8s convention).
-					if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
-						continue
-					}
-					for _, a := range ep.Addresses {
-						set[a] = true
-					}
-				}
-			}
-			return nil
-		})
+	slices, err := p.AllEndpointSlices(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list endpointslices: %w", err)}
 	}
+	for _, s := range slices {
+		svc := s.Labels[discoveryv1.LabelServiceName]
+		if svc == "" {
+			continue
+		}
+		key := s.Namespace + "/" + svc
+		set := esAddrs[key]
+		if set == nil {
+			set = map[string]bool{}
+			esAddrs[key] = set
+		}
+		for _, ep := range s.Endpoints {
+			// Ready-only — a slice holding the pod IP but
+			// marked unready is still a desync for traffic.
+			// nil Ready counts as ready (k8s convention).
+			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+				continue
+			}
+			for _, a := range ep.Addresses {
+				set[a] = true
+			}
+		}
+	}
 
 	podsByKey := map[string]*corev1.Pod{}
-	for i := range pods.Items {
-		podsByKey[pods.Items[i].Namespace+"/"+pods.Items[i].Name] = &pods.Items[i]
+	for i := range pods {
+		podsByKey[pods[i].Namespace+"/"+pods[i].Name] = &pods[i]
 	}
 
 	// (b) member_service_desync — the per-member Service must route
 	// to the live pod's IP.
-	for i := range svcs.Items {
-		svc := &svcs.Items[i]
+	for i := range svcs {
+		svc := &svcs[i]
 		podName := svc.Labels[scyllaPodNameLabel]
 		if podName == "" {
 			continue
@@ -346,8 +339,8 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	// (c) gossip_or_raft_stall / tombstone_overload_stall — troubled
 	// member pods whose scylla log tail carries a stall signature.
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		if pod.Labels[scyllaClusterLabel] == "" || !scyllaPodTroubled(pod) {
 			continue
 		}

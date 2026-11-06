@@ -240,8 +240,7 @@ func missingBinaryPorts(pod *corev1.Pod) []int {
 func (p *linkerdProtocolDetectionStallCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
@@ -250,8 +249,8 @@ func (p *linkerdProtocolDetectionStallCheck) Run(ctx context.Context) probefw.Re
 	// reconciled on the SECOND gauge ledger below (the missing-port
 	// ledger stays bound to its own vec).
 	driftNow := map[string][]string{}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
@@ -307,6 +306,7 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 			"pod", pod.Namespace+"/"+pod.Name)
 		return
 	}
+	p.InvalidateSweep(ctx) // pod gone — drop the census
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNameLinkerdOpaqueStall).Inc()
 	log.Info("DELETE: linkerd protocol-detection stall — template patched, re-rolling pod",
 		"pod", pod.Namespace+"/"+pod.Name, "ports", missing)

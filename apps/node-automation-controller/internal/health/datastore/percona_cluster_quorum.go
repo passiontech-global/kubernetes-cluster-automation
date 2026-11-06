@@ -317,17 +317,14 @@ func (p *perconaQuorumCheck) checkPatroniLeaderLock(ctx context.Context,
 func (p *perconaQuorumCheck) perconaPGRunningPods(ctx context.Context,
 	ns, cluster string) (int, error) {
 
-	pods, err := p.CS.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
-		LabelSelector: "pgv2.percona.com/cluster=" + cluster,
-		Limit:         probefw.HealthListPageSize,
-	})
+	pods, err := p.PodsMatching(ctx, ns, "pgv2.percona.com/cluster="+cluster)
 	if err != nil {
 		return 0, fmt.Errorf("list pg pods in %s: %w", ns, err)
 	}
 	running := 0
-	for i := range pods.Items {
-		if pods.Items[i].Status.Phase == corev1.PodRunning &&
-			pods.Items[i].DeletionTimestamp == nil {
+	for i := range pods {
+		if pods[i].Status.Phase == corev1.PodRunning &&
+			pods[i].DeletionTimestamp == nil {
 			running++
 		}
 	}

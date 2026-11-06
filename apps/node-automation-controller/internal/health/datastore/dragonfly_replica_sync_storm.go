@@ -144,14 +144,13 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	}
 
 	// Pod census for master-role + ownership checks.
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
 	podByKey := map[string]*corev1.Pod{}
-	for i := range pods.Items {
-		podByKey[pods.Items[i].Namespace+"/"+pods.Items[i].Name] = &pods.Items[i]
+	for i := range pods {
+		podByKey[pods[i].Namespace+"/"+pods[i].Name] = &pods[i]
 	}
 
 	seenKeep := map[string]bool{}

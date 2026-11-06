@@ -118,8 +118,7 @@ func (p *rabbitMQSuspendedCheck) rabbitQuorumSafe(ctx context.Context, pod *core
 		return false, fmt.Errorf("statefulset selector %s/%s: %w",
 			pod.Namespace, owner.Name, err)
 	}
-	peers, err := p.CS.CoreV1().Pods(pod.Namespace).List(ctx,
-		metav1.ListOptions{LabelSelector: sel.String()})
+	peers, err := p.PodsMatching(ctx, pod.Namespace, sel.String())
 	if err != nil {
 		return false, fmt.Errorf("list peer pods of %s/%s: %w",
 			pod.Namespace, owner.Name, err)
@@ -137,10 +136,16 @@ func (p *rabbitMQSuspendedCheck) rabbitQuorumSafe(ctx context.Context, pod *core
 		return false, nil
 	}
 	want := int(*sts.Spec.Replicas)
-	if len(peers.Items) < want {
+	if len(peers) < want {
 		return false, nil
 	}
-	if probefw.ReadySiblings(probefw.ReadyByOwner(peers.Items), pod) < want-1 {
+	// ReadyByOwner takes values — the snapshot's pointer view is
+	// read-only anyway, so a cheap deref keeps the shared helper.
+	peerPods := make([]corev1.Pod, 0, len(peers))
+	for _, peer := range peers {
+		peerPods = append(peerPods, *peer)
+	}
+	if probefw.ReadySiblings(probefw.ReadyByOwner(peerPods), pod) < want-1 {
 		return false, nil
 	}
 	return true, nil
@@ -156,8 +161,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).List(ctx,
-		metav1.ListOptions{LabelSelector: rabbitComponentLabel})
+	pods, err := p.PodsMatching(ctx, metav1.NamespaceAll, rabbitComponentLabel)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list rabbitmq pods: %w", err)}
 	}
@@ -165,8 +169,8 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 	live := map[string]bool{} // "ns/pod/uid" suspended signatures this sweep
 	var rep probefw.SweepReport
 	var due []corev1.Pod
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := pods[i]
 		key := pod.Namespace + "/" + pod.Name + "/" + string(pod.UID)
 		// The suspended-listener window gates a pod delete, so it
 		// runs the persisted (annotation-backed) variant — the stamp
@@ -236,6 +240,7 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(err, "suspended rabbitmq pod delete failed", "pod", key)
 			continue
 		}
+		p.InvalidateSweep(ctx) // pod gone — drop the census
 		rabbitMQSuspendedHealsTotal.
 			WithLabelValues(pod.Namespace, pod.Name).Inc()
 		log.Info("DELETE: suspended-listener rabbitmq pod — quorum verified",

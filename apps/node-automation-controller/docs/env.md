@@ -19,6 +19,13 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
   `"true"`/`"false"` semantics as registration gates, but the module still
   registers when they're off.
 
+## Manager / API client
+
+| Env var | Module | Default | Notes |
+|---|---|---|---|
+| `NODE_AUTOMATION_KUBE_CLIENT_QPS` | manager | `50` | client-go QPS on the shared rest.Config every module sweeps/reconciles through (client-go's `5` was far under this fleet's aggregate rate). |
+| `NODE_AUTOMATION_KUBE_CLIENT_BURST` | manager | `100` | client-go burst paired with the QPS knob above. |
+
 ## System patchers / watchdogs
 
 | Env var | Module | Default | Notes |

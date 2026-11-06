@@ -48,7 +48,8 @@ const (
 )
 
 type kubeletReaper struct {
-	cs kubernetes.Interface
+	cs         kubernetes.Interface
+	nodeReader kube.CachedNodeReader
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
@@ -64,14 +65,14 @@ type kubeletReaper struct {
 }
 
 func Setup(d shared.Deps) error {
-	r := &kubeletReaper{cs: d.CS, queue: d.Name, now: shared.SystemClock}
+	r := &kubeletReaper{cs: d.CS, nodeReader: d.Mgr.GetClient(), queue: d.Name, now: shared.SystemClock}
 	r.probeFn = r.probe
 	return shared.AddPeriodic(d.Mgr, r.queue, 2*time.Minute, r.run)
 }
 
 func (r *kubeletReaper) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	nodes, err := kube.ListNodes(ctx, r.cs)
+	nodes, err := kube.ListNodesCached(ctx, r.nodeReader, r.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}

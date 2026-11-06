@@ -37,6 +37,11 @@ type DeploymentSpec struct {
 	// CS is the direct (uncached) clientset — module reads go through
 	// it, not the manager cache.
 	CS kubernetes.Interface
+	// NodeReader is the optional informer-backed node census for the
+	// replica pin (mgr.GetClient() at module Setup); nil falls back
+	// to a direct ListNodes — the zero value keeps tests on the
+	// fake clientset.
+	NodeReader kube.CachedNodeReader
 	// Namespace/Name locate the pinned Deployment (kube-system/<addon>
 	// today) — they also fill the "deployment" log key and every
 	// wrapped error string ("get deployment <ns>/<name>: ...").
@@ -88,7 +93,7 @@ func (s DeploymentSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	// Proportional replica pin — disabled when MinReplicas<=0
 	// (wantReplicas stays 0: neither Drifted nor the patch body
 	// touches .spec.replicas then).
-	wantReplicas, err := s.Replicas.Want(ctx, s.CS)
+	wantReplicas, err := s.Replicas.WantFrom(ctx, s.NodeReader, s.CS)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list nodes for proportional replica count: %w", err)
 	}

@@ -146,8 +146,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).
-		List(ctx, metav1.ListOptions{})
+	pods, err := p.AllPods(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
@@ -165,8 +164,8 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	rabbitByPodName := map[string]*corev1.Pod{}
 	var memberPods []*corev1.Pod
 	var unlabeledPods []corev1.Pod
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		if !isRabbitMQPod(pod) ||
 			downscaledMemberPod(pod.Namespace, pod.Name, downscaled) {
 			continue
