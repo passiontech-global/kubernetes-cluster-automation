@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -34,7 +35,7 @@ const (
 	// operatorHealAnno persists the last heal moment on the
 	// operator's leader-election Lease — the restart-proof half of
 	// the cooldown.
-	operatorHealAnno = "node.ops/last-operator-heal"
+	operatorHealAnno = kube.AnnoLastOperatorHeal
 )
 
 // healOperatorLeader deletes the stuck operator's leader pod to force
@@ -53,28 +54,26 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 		return
 	}
 	if lease != nil {
-		if ts := lease.Annotations[operatorHealAnno]; ts != "" {
-			if t, err := time.Parse(time.RFC3339, ts); err == nil &&
-				now.Sub(t) < operatorHealCooldown {
-				log.Info("skip heal: persisted stamp inside cooldown",
-					"operator", op.name,
-					"ago", now.Sub(t).Truncate(time.Minute))
-				return
-			}
+		if t, ok := kube.AnnoTime(lease, operatorHealAnno); ok &&
+			now.Sub(t) < operatorHealCooldown {
+			log.Info("skip heal: persisted stamp inside cooldown",
+				"operator", op.name,
+				"ago", now.Sub(t).Truncate(time.Minute))
+			return
 		}
 	}
 	// Maintenance mutex — "cannot verify" fails closed like every
 	// other caller: an unverifiable drain state defers the heal.
-	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-	if err != nil {
+	// heal.Allowed runs with a nil ledger — the cooldown above is
+	// the wider of in-RAM + persisted stamp, not a single key, so
+	// only its mutex gate applies.
+	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
+		nil, op.name, 0, now)
+	if unverifiable {
 		metrics.IncError(p.Name)
-		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
-			"operator", op.name, "error", err)
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — heal deferred",
-			"operator", op.name, "why", why)
+	if !proceed {
 		return
 	}
 
@@ -94,13 +93,10 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 	deleted := false
 	for i := range pods {
 		pod := &pods[i]
-		// UID precondition closes the list→delete TOCTOU: a
-		// same-named replacement pod is not ours to reap.
-		uid := pod.UID
-		if err := p.CS.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
+		// The UID precondition inside heal.DeletePod closes the
+		// list→delete TOCTOU: a same-named replacement pod is not
+		// ours to reap.
+		if _, err := heal.DeletePod(ctx, p.CS, nil, "", pod, now); err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "stuck operator leader delete failed",
 				"pod", pod.Namespace+"/"+pod.Name, "operator", op.name)

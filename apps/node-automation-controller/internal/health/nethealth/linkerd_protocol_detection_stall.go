@@ -25,6 +25,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -218,23 +219,13 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 	log logr.Logger, pod *corev1.Pod, missing []int, now time.Time) {
 
 	ck := "selfheal/" + CheckNameLinkerdOpaqueStall + "/" + pod.Namespace + "/" + pod.Name
-	if p.Heals.CooledDown(ck, linkerdOpaqueHealCool, now) {
-		log.Info("skip heal: inside cooldown", "check", CheckNameLinkerdOpaqueStall,
-			"pod", pod.Namespace+"/"+pod.Name)
-		return
-	}
-	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-	if err != nil {
+	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
+		&p.Heals, ck, linkerdOpaqueHealCool, now)
+	if unverifiable {
 		metrics.IncError(p.Name)
-		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
-			"check", CheckNameLinkerdOpaqueStall,
-			"pod", pod.Namespace+"/"+pod.Name, "error", err)
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — heal deferred",
-			"check", CheckNameLinkerdOpaqueStall,
-			"pod", pod.Namespace+"/"+pod.Name, "why", why)
+	if !proceed {
 		return
 	}
 	templateOK := p.patchLinkerdTemplate(ctx, log, pod, missing)
@@ -244,17 +235,12 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 			"pod", pod.Namespace+"/"+pod.Name, "ports", missing)
 		return
 	}
-	uid := pod.UID
-	if err := p.CS.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-		metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid},
-		}); err != nil {
+	if _, err := heal.DeletePod(ctx, p.CS, &p.Heals, ck, pod, now); err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "linkerd opaque-ports pod delete failed",
 			"pod", pod.Namespace+"/"+pod.Name)
 		return
 	}
-	p.Heals.Stamp(ck, now)
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNameLinkerdOpaqueStall).Inc()
 	log.Info("DELETE: linkerd protocol-detection stall — template patched, re-rolling pod",
 		"pod", pod.Namespace+"/"+pod.Name, "ports", missing)

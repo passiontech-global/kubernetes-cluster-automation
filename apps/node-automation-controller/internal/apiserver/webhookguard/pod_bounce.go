@@ -16,6 +16,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -134,15 +135,13 @@ func (b *circuitBreaker) bounceOldestPod(ctx context.Context, snap *sweepSnapsho
 	log.Info("BOUNCE: deleting oldest Ready webhook pod — hung TCP+TLS handshake",
 		"service", svcKey, "pod", oldest.Namespace+"/"+oldest.Name,
 		"age", now.Sub(oldest.CreationTimestamp.Time).Truncate(time.Second))
-	uid := oldest.UID
-	if err := g.cs.CoreV1().Pods(oldest.Namespace).Delete(ctx, oldest.Name,
-		kube.UIDDeleteOptions(uid, "")); err != nil {
+	// heal.DeletePod stamps bounceAt on a DELIVERED bounce only — a
+	// failed delete leaves the pod hung and the next sweep retries.
+	if _, err := heal.DeletePod(ctx, g.cs, &b.bounceAt, svcKey,
+		oldest, now); err != nil {
 		metrics.IncError(g.queue)
 		log.Error(err, "webhook pod bounce delete failed",
 			"pod", oldest.Namespace+"/"+oldest.Name, "service", svcKey)
 		return
 	}
-	// The cooldown stamps on a DELIVERED bounce only — a failed
-	// delete leaves the pod hung and the next sweep retries.
-	b.bounceAt.Stamp(svcKey, now)
 }

@@ -28,13 +28,13 @@ import (
 	"context"
 	"net/http"
 	"sort"
-	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -45,7 +45,7 @@ const (
 	corednsLogSinceS   = 600 // layer-1 log window / layer-2 max service age
 	corednsCooldownS   = 1800
 	corednsStreakMax   = 2 // consecutive flagged runs before action
-	corednsTSAnno      = "node-ops.passiontech.dev/last-coredns-restart"
+	corednsTSAnno      = kube.AnnoLastCoreDNSRestart
 	corednsMaxLogBytes = 256 * 1024
 )
 
@@ -56,7 +56,6 @@ type coreDNSWatchdog struct {
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
 	queue string
-	mu    sync.Mutex
 	// streak replaces the bash /tmp/coredns-streak-* files: pod ->
 	// consecutive layer-2 failures. Resets on operator restart,
 	// biasing conservative like the old tmpfs files did.
@@ -92,8 +91,6 @@ func Setup(d shared.Deps) error {
 
 func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	podList, err := w.cs.CoreV1().Pods(corednsNS).List(ctx,
 		metav1.ListOptions{LabelSelector: corednsPodSelector})

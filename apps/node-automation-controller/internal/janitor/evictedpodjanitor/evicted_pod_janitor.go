@@ -33,10 +33,6 @@ import (
 const (
 	evictedPodMaxAge = time.Hour
 	evictedPodCap    = 10 // bound delete churn per run
-	// evictedPodListPageSize bounds each Failed-pod List page —
-	// continue-token pagination keeps a big failure fleet from
-	// arriving as one giant response body.
-	evictedPodListPageSize = 500
 )
 
 // evictedPodReasons is the set of terminal status.reason values that
@@ -81,7 +77,7 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 	// selectors and the belt costs nothing.
 	pods, err := kube.ListAll(ctx, metav1.ListOptions{
 		FieldSelector: "status.phase=" + string(corev1.PodFailed),
-		Limit:         evictedPodListPageSize,
+		Limit:         kube.DefaultListPageSize,
 	}, kube.Pods(j.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list failed pods: %w", err) // periodic wrapper IncErrors j.queue

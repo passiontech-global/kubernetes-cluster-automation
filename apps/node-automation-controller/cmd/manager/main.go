@@ -37,7 +37,7 @@
 // see internal/registry; registry.SetupModules evaluates them and
 // stamps Deps.Disabled. Modules still resolve their own knobs and
 // sub-feature gates from env inside Setup — see
-// internal/shared/env.go for the parsing helpers.
+// internal/platform/envx for the parsing helpers.
 package main
 
 import (

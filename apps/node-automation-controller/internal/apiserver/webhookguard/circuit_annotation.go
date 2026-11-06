@@ -6,7 +6,11 @@
 // which can never contain a comma, so the split is unambiguous.
 package webhookguard
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+)
 
 // webhookCircuitAnno records, on the webhook config object itself,
 // the comma-separated names of the sub-webhooks the C1 circuit
@@ -14,7 +18,7 @@ import "strings"
 // survives pod restarts and is human-readable in kubectl describe.
 // Comma-separated is unambiguous: webhook names are DNS-1123
 // subdomains, which can never contain a comma.
-const webhookCircuitAnno = "node.ops/circuit-broken-webhooks"
+const webhookCircuitAnno = kube.AnnoCircuitBrokenWebhooks
 
 // parseCircuitAnnotation splits the comma-separated annotation value
 // into a name set. Webhook names are DNS-1123 subdomains — commas can

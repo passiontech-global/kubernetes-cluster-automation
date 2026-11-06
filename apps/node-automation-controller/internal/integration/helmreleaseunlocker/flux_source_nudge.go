@@ -28,7 +28,7 @@ import (
 const (
 	// fluxLastNudgeAnno is the per-source 30m cooldown stamp written
 	// onto the Flux source object by the artifact healer.
-	fluxLastNudgeAnno = "node.ops/last-source-nudge"
+	fluxLastNudgeAnno = kube.AnnoLastSourceNudge
 	// artifactStuckMinAge: a consumer Ready=False on an artifact-
 	// fetch signature this long is a stale source cache, not a
 	// transient fetch retry.
@@ -232,14 +232,12 @@ func (u *helmReleaseUnlocker) nudgeSource(ctx context.Context,
 		return false
 	}
 	now := u.now.Now()
-	if ts := src.GetAnnotations()[fluxLastNudgeAnno]; ts != "" {
-		if t, err := time.Parse(time.RFC3339, ts); err == nil &&
-			now.Sub(t) < sourceNudgeCooldown {
-			log.Info("skip: source nudged inside cooldown",
-				"kind", ref.kind, "source", key,
-				"ago", now.Sub(t).Truncate(time.Minute))
-			return false
-		}
+	if t, ok := kube.AnnoTime(src, fluxLastNudgeAnno); ok &&
+		now.Sub(t) < sourceNudgeCooldown {
+		log.Info("skip: source nudged inside cooldown",
+			"kind", ref.kind, "source", key,
+			"ago", now.Sub(t).Truncate(time.Minute))
+		return false
 	}
 	stamp := now.UTC().Format(time.RFC3339)
 	patch, err := json.Marshal(map[string]any{

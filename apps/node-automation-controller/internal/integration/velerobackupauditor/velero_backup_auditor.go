@@ -87,18 +87,14 @@ var veleroStuckPhases = map[string]string{
 
 const veleroStuckMaxAge = 6 * time.Hour
 
-// veleroListPageSize bounds each List page — Backup/PVB objects are
-// cluster-wide and accumulate unboundedly on busy schedules.
-const veleroListPageSize = 500
-
-// veleroList pages a full dynamic List through veleroListPageSize —
+// veleroList pages a full dynamic List through the shared page bound —
 // same contract as a raw .List but bounded per response (Velero and
 // Everest CRDs are cluster-scoped here, so every audit read is
 // cluster-wide).
 func (a *veleroBackupAuditor) veleroList(ctx context.Context,
 	gvr schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
 	items, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: veleroListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.DynamicPage(a.dyn.Resource(gvr)))
 	if err != nil {
 		return nil, err

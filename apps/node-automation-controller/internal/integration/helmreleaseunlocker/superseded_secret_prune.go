@@ -47,7 +47,7 @@ func (u *helmReleaseUnlocker) pruneSupersededSecrets(ctx context.Context) error 
 	// owner=helm is the same label unlock() selects on. Paged like
 	// every cluster-wide list in this module.
 	secrets, err := kube.ListAll(ctx, metav1.ListOptions{
-		LabelSelector: "owner=helm", Limit: helmListPageSize},
+		LabelSelector: "owner=helm", Limit: kube.DefaultListPageSize},
 		kube.Secrets(u.cs, metav1.NamespaceAll))
 	if err != nil {
 		// Hygiene sweep — a list failure must not fail the run

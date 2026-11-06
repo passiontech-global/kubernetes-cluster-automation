@@ -47,7 +47,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -70,7 +69,7 @@ const (
 	stsOnDeleteRollerInterval = 10 * time.Minute
 	// stsAutoRollAnno is the opt-in switch — only annotated
 	// StatefulSets are ever rolled.
-	stsAutoRollAnno = "node.ops/auto-roll-ondelete"
+	stsAutoRollAnno = kube.AnnoAutoRollOnDelete
 	// stsOnDeleteDriftMin: updateRevision must differ from
 	// currentRevision continuously for this long before the roller
 	// acts — a self-correcting apply or a slow-but-working rollout
@@ -94,7 +93,6 @@ type statefulSetOnDeleteRoller struct {
 	// now is the clock seam — tests pin it so the 30m drift and
 	// 5m stability windows are deterministic. nil → time.Now.
 	now shared.Clock
-	mu  sync.Mutex
 	// driftSince records when each "ns/name" StatefulSet's
 	// updateRevision != currentRevision drift was FIRST observed —
 	// any cycle where the revisions agree, the set leaves, or the
@@ -117,13 +115,12 @@ func Setup(d shared.Deps) error {
 
 func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// Page the cluster-wide list — an unbounded List forces etcd to
 	// serialize every StatefulSet into one response; 500-per-page
 	// keeps each request cheap at fleet scale.
-	stsItems, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+	stsItems, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.StatefulSets(r.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list statefulsets: %w", err)
@@ -281,7 +278,8 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	// allow a disruption — a 0 means the workload is already at its
 	// floor and eviction would refuse the delete anyway. Paged like
 	// the StatefulSet list above.
-	pdbItems, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+	pdbItems, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.PodDisruptionBudgets(r.cs, sts.Namespace))
 	if err != nil {
 		return fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w",

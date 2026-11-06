@@ -25,6 +25,12 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
+// DefaultListPageSize is the shared page bound ~13 modules redeclare
+// as private xListPageSize consts — big enough that any realistic
+// resource count fits in one or two pages, small enough that a page
+// stays a cheap apiserver read. Pass it as metav1.ListOptions.Limit.
+const DefaultListPageSize = 500
+
 // PageFunc fetches ONE page of a paginated List. opts carries the
 // caller's selectors (LabelSelector/FieldSelector/Limit) plus
 // Continue set to the token of the page to fetch — "" requests the

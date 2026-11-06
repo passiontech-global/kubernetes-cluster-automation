@@ -128,7 +128,7 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	nodes = nil
 
 	pdbs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: 500},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.PodDisruptionBudgets(w.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list poddisruptionbudgets: %w", err)

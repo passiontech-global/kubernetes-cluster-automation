@@ -75,9 +75,6 @@ const (
 	// injectCAFromSecretAnno carries "namespace/secretName" — a direct
 	// reference, no Certificate hop.
 	injectCAFromSecretAnno = "cert-manager.io/inject-ca-from-secret"
-	// certDriftListPage caps each cluster-wide List response — the
-	// all-namespaces TLS-secret read is unbounded.
-	certDriftListPage = 500
 	// replicatedFromAnno carries "src-namespace/src-name" — the
 	// kubernetes-replicator annotation marking a replicated copy
 	// (W7-C6).

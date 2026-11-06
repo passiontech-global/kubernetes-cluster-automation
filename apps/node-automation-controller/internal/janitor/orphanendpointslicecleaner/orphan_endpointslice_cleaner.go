@@ -36,7 +36,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -62,11 +61,6 @@ const (
 	// be absent before the slice is reaped — a single bad snapshot
 	// can never delete.
 	orphanEndpointSliceStreak = 2
-	// orphanEndpointSliceListPageSize bounds each cluster-wide
-	// Service/EndpointSlice List page — continue-token pagination
-	// keeps a large endpoint fleet from arriving as one giant
-	// response body.
-	orphanEndpointSliceListPageSize = 500
 )
 
 type orphanEndpointSliceCleaner struct {
@@ -81,7 +75,6 @@ type orphanEndpointSliceCleaner struct {
 	// now is the clock seam — tests pin it so the >15m age gate
 	// is deterministic. nil → time.Now.
 	now shared.Clock
-	mu  sync.Mutex
 	// absentStreak counts consecutive cycles each "ns/name/uid"
 	// slice has been seen without its Service — reaching
 	// orphanEndpointSliceStreak unlocks the re-confirm + delete.
@@ -105,8 +98,6 @@ func Setup(d shared.Deps) error {
 
 func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	// Fail closed: the Service snapshot is the ONLY source of
 	// "deleted" truth. An error or an empty list aborts the run —
@@ -115,7 +106,7 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	svcCount := 0
 	services := map[string]bool{}
 	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: orphanEndpointSliceListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Services(c.cs, metav1.NamespaceAll),
 		func(items []corev1.Service) error {
 			for _, s := range items {
@@ -135,7 +126,7 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	// fake clientsets ignore ListOptions selectors.
 	slices, err := kube.ListAll(ctx, metav1.ListOptions{
 		LabelSelector: discoveryv1.LabelServiceName,
-		Limit:         orphanEndpointSliceListPageSize,
+		Limit:         kube.DefaultListPageSize,
 	}, kube.EndpointSlices(c.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list endpointslices: %w", err)

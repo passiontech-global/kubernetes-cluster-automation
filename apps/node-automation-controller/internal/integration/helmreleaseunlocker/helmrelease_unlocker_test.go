@@ -105,9 +105,8 @@ func hrAnnotation(t *testing.T, dyn *fake.FakeDynamicClient, gvr schema.GroupVer
 
 func newUnlocker(cs *kfake.Clientset, dyn *fake.FakeDynamicClient, stuckFor time.Duration, key string) *helmReleaseUnlocker {
 	u := &helmReleaseUnlocker{queue: "helmrelease-unlocker",
-		cs:       cs,
-		dyn:      dyn,
-		unlocked: map[string]time.Time{},
+		cs:  cs,
+		dyn: dyn,
 	}
 	if key != "" {
 		u.firstSeen.Observe(key, time.Now().Add(-stuckFor))
@@ -192,7 +191,7 @@ func TestHelmReleaseUnlockerCooldownAlert(t *testing.T) {
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v1", "myapp", 1, "deployed"),
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v2", "myapp", 2, "pending-upgrade"))
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
-	u.unlocked["apps/myapp"] = time.Now().Add(-time.Hour) // unlocked 1h ago
+	u.unlocked.Stamp("apps/myapp", time.Now().Add(-time.Hour)) // unlocked 1h ago
 
 	before := testutil.ReconcileErrorCount(t, "helmrelease-unlocker")
 	if err := u.run(ctx); err != nil {
@@ -219,7 +218,7 @@ func TestHelmReleaseUnlockerCooldownExpired(t *testing.T) {
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v1", "myapp", 1, "deployed"),
 		helmRelSecret("apps", "sh.helm.release.v1.myapp.v2", "myapp", 2, "pending-rollback"))
 	u := newUnlocker(cs, dyn, time.Hour, "apps/myapp")
-	u.unlocked["apps/myapp"] = time.Now().Add(-25 * time.Hour)
+	u.unlocked.Stamp("apps/myapp", time.Now().Add(-25*time.Hour))
 
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
@@ -418,7 +417,7 @@ func TestHelmReleaseUnlockerSecretsListError(t *testing.T) {
 	if !secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
 		t.Fatal("pending secret deleted despite the failed list")
 	}
-	if _, ok := u.unlocked["apps/myapp"]; ok {
+	if _, ok := u.unlocked.Entries()["apps/myapp"]; ok {
 		t.Fatal("HR marked unlocked although unlock never ran")
 	}
 }
@@ -465,7 +464,7 @@ func TestHelmReleaseUnlockerPendingDeleteError(t *testing.T) {
 	if got := hrAnnotation(t, dyn, helmReleaseGVRs[0], "apps", "myapp", fluxReconcileAnno); got != "" {
 		t.Fatal("HR annotated although the pending secret still exists")
 	}
-	if _, ok := u.unlocked["apps/myapp"]; ok {
+	if _, ok := u.unlocked.Entries()["apps/myapp"]; ok {
 		t.Fatal("HR marked unlocked although unlock failed")
 	}
 }
@@ -509,7 +508,7 @@ func TestHelmReleaseUnlockerAnnotateError(t *testing.T) {
 	if secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
 		t.Fatal("pending secret kept although its delete succeeded")
 	}
-	if _, ok := u.unlocked["apps/myapp"]; ok {
+	if _, ok := u.unlocked.Entries()["apps/myapp"]; ok {
 		t.Fatal("HR marked unlocked although the annotate failed")
 	}
 }
@@ -684,21 +683,21 @@ func TestHelmReleaseUnlockerPrunesUnlockedLedger(t *testing.T) {
 	hrReady(old, "True", "Reconciliation finished")
 	dyn := newDynFake(live, old)
 	u := newUnlocker(kfake.NewSimpleClientset(), dyn, 0, "")
-	u.unlocked["apps/myapp"] = time.Now() // live HR inside cooldown → keep
-	u.unlocked["apps/gone"] = time.Now()  // HR vanished → prune
+	u.unlocked.Stamp("apps/myapp", time.Now()) // live HR inside cooldown → keep
+	u.unlocked.Stamp("apps/gone", time.Now())  // HR vanished → prune
 	// Live HR past the cooldown → pruned by age, not absence.
-	u.unlocked["apps/oldrel"] = time.Now().Add(-helmUnlockCooldown - time.Minute)
+	u.unlocked.Stamp("apps/oldrel", time.Now().Add(-helmUnlockCooldown-time.Minute))
 
 	if err := u.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := u.unlocked["apps/gone"]; ok {
+	if _, ok := u.unlocked.Entries()["apps/gone"]; ok {
 		t.Fatal("unlocked entry for a deleted HR not pruned")
 	}
-	if _, ok := u.unlocked["apps/oldrel"]; ok {
+	if _, ok := u.unlocked.Entries()["apps/oldrel"]; ok {
 		t.Fatal("live HR's unlocked entry past the cooldown not pruned")
 	}
-	if _, ok := u.unlocked["apps/myapp"]; !ok {
+	if _, ok := u.unlocked.Entries()["apps/myapp"]; !ok {
 		t.Fatal("live HR inside the cooldown lost its unlock-ledger entry")
 	}
 }
@@ -828,7 +827,7 @@ func TestHelmReleaseUnlockerHookJobListErrorKeepsUnlock(t *testing.T) {
 	if secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
 		t.Fatal("pending secret kept although the unlock ran")
 	}
-	if _, ok := u.unlocked["apps/myapp"]; !ok {
+	if _, ok := u.unlocked.Entries()["apps/myapp"]; !ok {
 		t.Fatal("HR not marked unlocked — hook cleanup failure undid the unlock")
 	}
 }

@@ -51,7 +51,7 @@ func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
 	}
 
 	secrets, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: certDriftListPage},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Secrets(a.cs, linkerdNS))
 	if err != nil {
 		return fmt.Errorf("list linkerd secrets: %w", err)

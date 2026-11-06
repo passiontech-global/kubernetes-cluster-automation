@@ -28,7 +28,6 @@ package externalsecretnudge
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
@@ -49,7 +48,7 @@ const (
 	// esLastNudgeAnno is the human-readable half of the persisted
 	// cooldown — force-sync is a bare unix stamp ESO consumes,
 	// node.ops/last-es-nudge is the same moment for operators.
-	esLastNudgeAnno = "node.ops/last-es-nudge"
+	esLastNudgeAnno = kube.AnnoLastESNudge
 	// W9-GO1 — storm guard + 1Password Connect auto-heal thresholds.
 	// A storm is >=5 failing ExternalSecrets making up >=half the
 	// population; either a ClusterSecretStore down or a storm must
@@ -58,10 +57,6 @@ const (
 	esStormMinFailing     = 5
 	esConnectHealMinAge   = 15 * time.Minute
 	esConnectHealCooldown = time.Hour
-
-	// esListPageSize bounds each List page — the ExternalSecret and
-	// store lists are cluster-wide and unbounded.
-	esListPageSize = 500
 )
 
 // esConnectNamespaces are where the 1Password Connect pod can live —
@@ -92,7 +87,6 @@ type externalSecretNudge struct {
 	// come from one place.
 	queue   string
 	enabled bool // EXTERNALSECRET_NUDGE_ENABLED — clusters without ESO skip
-	mu      sync.Mutex
 	// now is the clock seam — tests pin it so the stuck/cooldown
 	// windows are deterministic. nil → time.Now.
 	now shared.Clock
@@ -111,11 +105,12 @@ type externalSecretNudge struct {
 	// stormSince: first sweep of the current ExternalSecret failure
 	// storm — same persistence clock, storm-triggered heal path.
 	stormSince time.Time
-	// connectHealAt: last delivered connect-pod bounce — the 1/hour
-	// cooldown. In-memory only, like nudged: a restart re-arms it,
-	// which is safe because the heal still needs 15m of fresh
-	// down/storm observations first.
-	connectHealAt time.Time
+	// connectHeals: last delivered connect-pod bounce — the 1/hour
+	// cooldown keyed on the heal target (esConnectPodPrefix).
+	// In-memory only, like nudged: a restart re-arms it, which is
+	// safe because the heal still needs 15m of fresh down/storm
+	// observations first.
+	connectHeals state.CooldownSet
 }
 
 // Setup registers the 10-minute sweep. With the module gate off
@@ -140,8 +135,6 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 		log.Info("skip: externalsecret-nudge disabled")
 		return nil
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
 
 	stores, err := n.listFirst(ctx, clusterSecretStoreGVRs)
 	if err != nil {

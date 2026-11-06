@@ -57,7 +57,7 @@ const (
 	// acmeResetsAnno persists the per-cert reset budget on the
 	// Certificate — "<total>,<lastRFC3339>" — so the 3-per-cycle cap
 	// survives controller restarts.
-	acmeResetsAnno = "node.ops/acme-order-resets"
+	acmeResetsAnno = kube.AnnoACMEOrderResets
 )
 
 var (

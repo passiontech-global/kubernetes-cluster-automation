@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	corev1 "k8s.io/api/core/v1"
@@ -75,7 +76,7 @@ const (
 	localPVEphemeralHealCooldown = 30 * time.Minute
 	// localPVEphemeralAnno opts any workload into the disposable-
 	// volume heal — set on the pod or its PVC.
-	localPVEphemeralAnno = "node.ops/ephemeral-localpv"
+	localPVEphemeralAnno = kube.AnnoEphemeralLocalPV
 	// concourseWorkerNS/PodPrefix name the workload whose local
 	// workdir is disposable by design — losing it on a dead node is
 	// the exact rescue the concourse janitor already performs while
@@ -393,11 +394,12 @@ func (p *localPVStrandedCheck) Run(ctx context.Context) probefw.Result {
 			log.Error(pvcErr, "ephemeral localpv pvc delete failed", "pvc", pvcKey)
 			continue
 		}
-		podUID := h.pod.UID
-		if err := p.CS.CoreV1().Pods(h.pod.Namespace).Delete(ctx, h.pod.Name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &podUID},
-			}); err != nil && !apierrors.IsNotFound(err) {
+		// A pod already gone (NotFound) still counts the heal — the
+		// claim release landed and the pod slot is free either way —
+		// so the stamp stays manual rather than riding
+		// heal.DeletePod's delivered-delete stamp.
+		if _, err := heal.DeletePod(ctx, p.CS, nil, "", h.pod, now); err != nil &&
+			!apierrors.IsNotFound(err) {
 			metrics.IncError(p.Name)
 			log.Error(err, "stranded pod delete failed",
 				"pod", h.pod.Namespace+"/"+h.pod.Name)
@@ -456,11 +458,8 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 		if !strings.HasPrefix(pod.Name, openebsProvisionerPrefix) {
 			continue
 		}
-		uid := pod.UID
-		if err := p.CS.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
+		if _, err := heal.DeletePod(ctx, p.CS, &p.pvcProvHealed,
+			openebsProvisionerName, pod, now); err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "localpv provisioner delete failed",
 				"pod", pod.Namespace+"/"+pod.Name)
@@ -473,7 +472,6 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	if !deleted {
 		return
 	}
-	p.pvcProvHealed.Stamp(openebsProvisionerName, now)
 	metrics.PVCProvisionerHealsTotal.
 		WithLabelValues(openebsProvisionerName).Inc()
 }

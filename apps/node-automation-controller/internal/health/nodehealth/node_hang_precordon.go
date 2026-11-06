@@ -47,7 +47,7 @@ const (
 	// the auto-uncordon path only ever lifts cordons IT created — a
 	// kubectl cordon or an NHC fence carries no stamp and is never
 	// touched.
-	nodeHangPreCordonAnno  = "node.ops/precordoned-by"
+	nodeHangPreCordonAnno  = kube.AnnoPreCordonedBy
 	nodeHangPreCordonValue = "node-hang-precordon"
 )
 

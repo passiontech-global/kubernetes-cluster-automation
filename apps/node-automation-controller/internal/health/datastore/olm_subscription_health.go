@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -231,24 +232,18 @@ func (p *olmHealthCheck) Run(ctx context.Context) probefw.Result {
 // operator stops reconciling CSVs and stops rotating the webhook
 // certificates it owns, so a restart forces both queues to re-list.
 // Gates: the 1h in-RAM cooldown (the pod is the heal target —
-// nothing else can carry the stamp) and the maintenance mutex, same
-// shape as every pod-delete heal in this sweep.
+// nothing else can carry the stamp) and the maintenance mutex, run
+// together by heal.Allowed like every pod-delete heal in this sweep.
 func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	log logr.Logger, reasons []string, now time.Time) {
 
-	if p.olmHealed.CooledDown(olmOperatorPodPrefix, olmHealCooldown, now) {
-		log.Info("skip heal: olm-operator inside cooldown")
-		return
-	}
-	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-	if err != nil {
+	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
+		&p.olmHealed, olmOperatorPodPrefix, olmHealCooldown, now)
+	if unverifiable {
 		metrics.IncError(p.Name)
-		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
-			"error", err)
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — heal deferred", "why", why)
+	if !proceed {
 		return
 	}
 	pods, err := p.CS.CoreV1().Pods(olmOperatorNS).
@@ -265,11 +260,8 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 		if !strings.HasPrefix(pod.Name, olmOperatorPodPrefix) {
 			continue
 		}
-		uid := pod.UID
-		if err := p.CS.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
+		if _, err := heal.DeletePod(ctx, p.CS, &p.olmHealed,
+			olmOperatorPodPrefix, pod, now); err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "olm-operator delete failed",
 				"pod", pod.Namespace+"/"+pod.Name)
@@ -283,7 +275,6 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	if !deleted {
 		return
 	}
-	p.olmHealed.Stamp(olmOperatorPodPrefix, now)
 	for _, r := range reasons {
 		metrics.OLMOperatorHealsTotal.WithLabelValues(r).Inc()
 	}

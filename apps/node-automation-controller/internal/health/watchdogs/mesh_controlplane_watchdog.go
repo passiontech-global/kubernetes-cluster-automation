@@ -18,6 +18,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -151,19 +152,13 @@ func linkerdPodWedged(pod *corev1.Pod, now time.Time) bool {
 // heal in this sweep.
 func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.Logger,
 	component, ns, prefix string, cooldown time.Duration, now time.Time) {
-	if p.Heals.CooledDown(component, cooldown, now) {
-		log.Info("skip heal: component inside cooldown", "component", component)
-		return
-	}
-	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-	if err != nil {
+	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
+		&p.Heals, component, cooldown, now)
+	if unverifiable {
 		metrics.IncError(p.Name)
-		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
-			"component", component, "error", err)
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — heal deferred", "component", component, "why", why)
+	if !proceed {
 		return
 	}
 	pods, err := p.CS.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
@@ -195,31 +190,20 @@ func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.L
 // flight, and "cannot verify" fails closed.
 func (p *meshControlPlaneCheck) healNamedPod(ctx context.Context, log logr.Logger,
 	component, key string, pod *corev1.Pod, cooldown time.Duration, now time.Time) {
-	if p.Heals.CooledDown(component, cooldown, now) {
-		log.Info("skip heal: component inside cooldown", "component", component)
-		return
-	}
-	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-	if err != nil {
+	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
+		&p.Heals, component, cooldown, now)
+	if unverifiable {
 		metrics.IncError(p.Name)
-		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
-			"component", component, "error", err)
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — heal deferred", "component", component, "why", why)
+	if !proceed {
 		return
 	}
-	uid := pod.UID
-	if err := p.CS.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-		metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid},
-		}); err != nil {
+	if _, err := heal.DeletePod(ctx, p.CS, &p.Heals, component, pod, now); err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "control-plane pod delete failed", "pod", key)
 		return
 	}
-	p.Heals.Stamp(component, now)
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(component).Inc()
 	log.Info("DELETE: wedged control-plane pod — forcing re-roll",
 		"component", component, "pod", key)

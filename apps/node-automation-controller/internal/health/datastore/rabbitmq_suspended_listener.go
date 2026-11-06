@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	corev1 "k8s.io/api/core/v1"
@@ -203,16 +204,11 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 				"pod", key)
 			continue
 		}
-		uid := pod.UID
-		if err := p.CS.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
+		if _, err := heal.DeletePod(ctx, p.CS, &p.rbHealed, key, pod, now); err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "suspended rabbitmq pod delete failed", "pod", key)
 			continue
 		}
-		p.rbHealed.Stamp(key, now)
 		metrics.RabbitMQSuspendedHealsTotal.
 			WithLabelValues(pod.Namespace, pod.Name).Inc()
 		log.Info("DELETE: suspended-listener rabbitmq pod — quorum verified",

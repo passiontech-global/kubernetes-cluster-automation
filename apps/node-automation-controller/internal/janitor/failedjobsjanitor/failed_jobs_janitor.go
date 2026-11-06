@@ -59,10 +59,6 @@ const (
 	// PVC unprotect, resourcequota reconcile) finishes in seconds to
 	// a couple of minutes.
 	stuckTerminatingMaxAge = 2 * time.Hour
-	// failedJobListPageSize bounds each cluster-wide List page —
-	// continue-token pagination keeps a huge Job/PVC/VA fleet from
-	// arriving as one giant response body.
-	failedJobListPageSize = 500
 	// buildRunTTL is the W9-GO2 retention window for completed
 	// Shipwright BuildRuns — same 24h horizon as failed Jobs.
 	buildRunTTL = 24 * time.Hour
@@ -116,7 +112,7 @@ func (j *failedJobsJanitor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
 	jobs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: failedJobListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Jobs(j.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list jobs: %w", err)
@@ -208,7 +204,7 @@ func (j *failedJobsJanitor) sweepBuildRuns(ctx context.Context) error {
 	}
 	log := logf.FromContext(ctx)
 	brs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: failedJobListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.DynamicPage(j.dyn.Resource(buildRunGVR)))
 	if err != nil {
 		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
@@ -282,19 +278,19 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context) error {
 	// All lists land before any series is emitted — a failed later
 	// list must not leave the gauge half-populated for an hour.
 	nss, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: failedJobListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Namespaces(j.cs))
 	if err != nil {
 		return fmt.Errorf("list namespaces: %w", err)
 	}
 	pvcs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: failedJobListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.PersistentVolumeClaims(j.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list persistentvolumeclaims: %w", err)
 	}
 	vas, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: failedJobListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.VolumeAttachments(j.cs))
 	if err != nil {
 		return fmt.Errorf("list volumeattachments: %w", err)
@@ -381,7 +377,7 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 	if !ok {
 		pr = pvcUseProbe{claims: map[string]bool{}}
 		pods, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: failedJobListPageSize},
+			metav1.ListOptions{Limit: kube.DefaultListPageSize},
 			kube.Pods(j.cs, pvc.Namespace))
 		if err != nil {
 			pr.err = err

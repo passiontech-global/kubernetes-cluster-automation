@@ -3,10 +3,10 @@
 Operator-facing catalog of every env var the controller reads. The table is
 hand-maintained and **verified against source** by the envdoc coverage test
 (`internal/envdoc`), which walks `internal/registry/registry.go`,
-`cmd/manager/main.go`, and every `shared.Getenv*` / `shared.Gate` call under
+`cmd/manager/main.go`, and every `envx.Getenv*` / `envx.Gate` call under
 `internal/` — update this file when adding a knob.
 
-Parsing rules (`internal/shared/env.go`):
+Parsing rules (`internal/platform/envx/env.go`):
 
 - **Registration gates** live in the `GateEnv` column of the module registry
   (`internal/registry/registry.go`). `DefaultOn=false` = opt-in: enabled only when
@@ -15,7 +15,7 @@ Parsing rules (`internal/shared/env.go`):
 - **Run-behavior knobs** are read inside each module's `Setup` (or per sweep).
   Unparseable / out-of-range values warn and fall back to the default.
   Duration knobs below 1s are rejected.
-- **Sub-feature gates** are `shared.Gate` calls inside a module — same
+- **Sub-feature gates** are `envx.Gate` calls inside a module — same
   `"true"`/`"false"` semantics as registration gates, but the module still
   registers when they're off.
 

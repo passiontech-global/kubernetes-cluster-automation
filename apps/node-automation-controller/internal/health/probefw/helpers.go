@@ -2,7 +2,8 @@
 //
 //   - DeletePodHeal: the shared pod-delete heal shape — per-target
 //     cooldown on the Deps Heals ledger, maintenance mutex (fail
-//     closed), UID-preconditioned delete.
+//     closed), UID-preconditioned delete. Thin wrapper over the
+//     platform heal package this file was the reference for.
 //   - PodUnreadySince / PodFromList: pod readiness helpers.
 //   - PromEndpoint / PromQuery: the Prometheus instant-query seam
 //     every metrics-backed check shares, backed by internal/promq.
@@ -24,11 +25,10 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/envx"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
@@ -73,43 +73,33 @@ func (d *Deps) PromQuery(ctx context.Context, query string) ([]promq.Sample, err
 }
 
 // DeletePodHeal is the pod-delete heal shape the self-healing checks
-// share: per-target cooldown on the shared heals ledger, the
-// maintenance mutex (fail closed on unverifiable), a
-// UID-preconditioned delete, and the shared ControlPlanePodHealsTotal
-// counter under the check name.
+// share — this body was the reference internal/platform/heal was
+// extracted from, so it now delegates: heal.Allowed runs the
+// per-target cooldown on the shared heals ledger plus the
+// maintenance mutex (fail closed on unverifiable), heal.DeletePod
+// does the UID-preconditioned delete and stamps the ledger only on
+// delivery, and the shared ControlPlanePodHealsTotal counter stays
+// under the check name here (heal never touches metrics).
 func (d *Deps) DeletePodHeal(ctx context.Context, log logr.Logger,
 	checkName, targetKey string, pod *corev1.Pod,
 	cooldown time.Duration, now time.Time) {
 
 	key := "selfheal/" + checkName + "/" + targetKey
-	if d.Heals.CooledDown(key, cooldown, now) {
-		log.Info("skip heal: inside cooldown", "check", checkName,
-			"target", targetKey)
-		return
-	}
-	held, why, err := kube.MaintenanceActive(ctx, d.CS, d.Dyn)
-	if err != nil {
+	proceed, unverifiable := heal.Allowed(ctx, log, d.CS, d.Dyn,
+		&d.Heals, key, cooldown, now)
+	if unverifiable {
 		metrics.IncError(d.Name)
-		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
-			"check", checkName, "target", targetKey, "error", err)
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — heal deferred",
-			"check", checkName, "target", targetKey, "why", why)
+	if !proceed {
 		return
 	}
-	uid := pod.UID
-	if err := d.CS.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-		metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid},
-		}); err != nil {
+	if _, err := heal.DeletePod(ctx, d.CS, &d.Heals, key, pod, now); err != nil {
 		metrics.IncError(d.Name)
 		log.Error(err, "heal pod delete failed",
 			"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
 		return
 	}
-	d.Heals.Stamp(key, now)
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(checkName).Inc()
 	log.Info("DELETE: pod heal — forcing pod restart",
 		"check", checkName, "pod", pod.Namespace+"/"+pod.Name)

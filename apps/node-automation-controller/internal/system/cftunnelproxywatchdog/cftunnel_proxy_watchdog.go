@@ -53,7 +53,7 @@ const (
 	cfTunnelProxyDeployName   = "cloudflare-tunnel-gateway-controller-proxy"
 	cfTunnelProxyPodSelector  = "app.kubernetes.io/component=proxy,app.kubernetes.io/instance=cloudflare-tunnel-gateway-controller"
 	cfTunnelProxySliceService = "cloudflare-tunnel-gateway-controller-proxy-headless"
-	cfTunnelResyncAnno        = "watchdog.passiontech.dev/force-resync"
+	cfTunnelResyncAnno        = kube.AnnoWatchdogForceResync
 
 	// W10-NM2 — cloudflared wedge healer. The proxy gateway's pods
 	// are cloudflared connectors; the ingress controller release

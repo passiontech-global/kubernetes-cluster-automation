@@ -64,14 +64,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 const (
-	stormGateHoldAnno     = "passiontech.dev/storm-gate-hold"
-	stormGateDecisionAnno = "passiontech.dev/storm-gate-decision"
+	stormGateHoldAnno     = kube.AnnoStormGateHold
+	stormGateDecisionAnno = kube.AnnoStormGateDecision
 )
 
 // stormConds mirrors STORM_CONDS (see package comment for sources).
@@ -93,7 +92,7 @@ var stormConds = []corev1.NodeConditionType{
 
 // stormTaints mirrors STORM_TAINTS.
 var stormTaints = []string{
-	"node.ops/kubelet-unresponsive", "node.ops/network-partitioned",
+	kube.TaintKubeletUnresponsive, kube.TaintNetworkPartitioned,
 }
 
 type deschedulerStormGate struct {
@@ -101,10 +100,6 @@ type deschedulerStormGate struct {
 	// dyn reads the autopilot Plan CR for maintenance-mutex
 	// signal (c) — no typed client exists for it.
 	dyn dynamic.Interface
-	// queue is the module's ops name — stamped from Deps.Name (the
-	// registry row) so the controller name and every IncError label
-	// come from one place.
-	queue string
 	// now is the clock seam — tests pin it so the cordon-window and
 	// decision-stamp reads are deterministic. nil → time.Now.
 	now shared.Clock
@@ -142,6 +137,7 @@ var stormSignalChanges = predicate.Funcs{
 }
 
 func Setup(d shared.Deps) error {
+	r := &deschedulerStormGate{cs: d.CS, dyn: d.Dyn, now: shared.SystemClock}
 	return ctrl.NewControllerManagedBy(d.Mgr).
 		Named(d.Name).
 		// Watches with a single fixed workqueue key, not For(): the
@@ -153,8 +149,7 @@ func Setup(d shared.Deps) error {
 		Watches(&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
 			builder.WithPredicates(stormSignalChanges)).
-		Complete(&deschedulerStormGate{cs: d.CS, dyn: d.Dyn, queue: d.Name,
-			now: shared.SystemClock})
+		Complete(shared.CountReconcile(d.Name, r.Reconcile))
 }
 
 func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -163,7 +158,6 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 
 	nodes, err := kube.ListNodes(ctx, r.cs)
 	if err != nil {
-		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
 	if len(nodes) == 0 {
@@ -172,7 +166,6 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		// below yields a "clear" verdict and scales the descheduler
 		// back up on blind data (same fail-closed posture as the
 		// statefulset-ondelete-roller's nodesSafe check).
-		metrics.IncError(r.queue)
 		return ctrl.Result{}, errors.New("empty node list (API flap) — refusing to compute a verdict")
 	}
 
@@ -213,7 +206,6 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		return res, nil
 	}
 	if err != nil {
-		metrics.IncError(r.queue)
 		return ctrl.Result{}, fmt.Errorf("get deployment kube-system/descheduler: %w", err)
 	}
 
@@ -222,7 +214,6 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 	// descheduler exactly like a storm does.
 	maintenance, err := r.maintenanceEvidence(ctx)
 	if err != nil {
-		metrics.IncError(r.queue)
 		return ctrl.Result{}, err
 	}
 
@@ -269,20 +260,17 @@ func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Reques
 		if _, err := r.cs.AppsV1().Deployments("kube-system").
 			Patch(ctx, "descheduler", types.MergePatchType, patch,
 				metav1.PatchOptions{}); err != nil {
-			metrics.IncError(r.queue)
 			return ctrl.Result{}, fmt.Errorf(
 				"scale deployment kube-system/descheduler to %d replicas: %w",
 				want, err)
 		}
 		if err := annotateStormDecision(ctx, r.cs, decision); err != nil {
-			metrics.IncError(r.queue)
 			return ctrl.Result{}, err
 		}
 	case deploy.Annotations[stormGateDecisionAnno] == "":
 		// Replicas already right but no decision recorded yet —
 		// annotate anyway so the verdict is auditable (bash elif).
 		if err := annotateStormDecision(ctx, r.cs, decision); err != nil {
-			metrics.IncError(r.queue)
 			return ctrl.Result{}, err
 		}
 	default:

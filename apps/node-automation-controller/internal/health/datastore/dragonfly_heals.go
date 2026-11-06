@@ -16,6 +16,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,26 +32,26 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 	sig masterSvc, now time.Time) {
 	// Maintenance mutex — never kill an operator mid-drain/upgrade;
 	// "cannot verify" fails closed like healOperatorLeader (W5.8).
-	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-	if err != nil {
+	// heal.Allowed gets a nil ledger here: this heal's cooldown is the
+	// wider of the persisted STS stamp and the per-pod drHealed
+	// entries, not a single CooldownSet key, so only its mutex gate
+	// applies.
+	stsKey := sig.sts.Namespace + "/" + sig.sts.Name
+	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
+		nil, stsKey, 0, now)
+	if unverifiable {
 		metrics.IncError(p.Name)
-		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
-			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name, "error", err)
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — heal deferred",
-			"statefulset", sig.sts.Namespace+"/"+sig.sts.Name, "why", why)
+	if !proceed {
 		return
 	}
-	if ts := sig.sts.Annotations[dragonflyHealAnno]; ts != "" {
-		if t, err := time.Parse(time.RFC3339, ts); err == nil &&
-			now.Sub(t) < dragonflyHealCooldown {
-			log.Info("skip heal: persisted stamp inside cooldown",
-				"statefulset", sig.sts.Namespace+"/"+sig.sts.Name,
-				"ago", now.Sub(t).Truncate(time.Minute))
-			return
-		}
+	if t, ok := kube.AnnoTime(sig.sts, dragonflyHealAnno); ok &&
+		now.Sub(t) < dragonflyHealCooldown {
+		log.Info("skip heal: persisted stamp inside cooldown",
+			"statefulset", stsKey,
+			"ago", now.Sub(t).Truncate(time.Minute))
+		return
 	}
 	pods, err := p.CS.CoreV1().Pods(probefw.DragonflyOperatorNS).
 		List(ctx, metav1.ListOptions{})
@@ -71,16 +72,11 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 			log.Info("skip heal: dragonfly operator inside cooldown", "pod", key)
 			continue
 		}
-		uid := pod.UID
-		if err := p.CS.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-			metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			}); err != nil {
+		if _, err := heal.DeletePod(ctx, p.CS, &p.drHealed, key, pod, now); err != nil {
 			metrics.IncError(p.Name)
 			log.Error(err, "dragonfly operator delete failed", "pod", key)
 			continue
 		}
-		p.drHealed.Stamp(key, now)
 		if now.After(p.drOpHealAt) {
 			p.drOpHealAt = now
 		}
@@ -120,10 +116,8 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 // dual-replica heal must not skip ahead of step 1.
 func (p *statefulMasterlessCheck) dragonflyOperatorHealedAt(sig masterSvc) (time.Time, bool) {
 	latest := p.drOpHealAt
-	if ts := sig.sts.Annotations[dragonflyHealAnno]; ts != "" {
-		if t, err := time.Parse(time.RFC3339, ts); err == nil && t.After(latest) {
-			latest = t
-		}
+	if t, ok := kube.AnnoTime(sig.sts, dragonflyHealAnno); ok && t.After(latest) {
+		latest = t
 	}
 	return latest, !latest.IsZero()
 }
@@ -212,33 +206,30 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	}
 
 	// Gate 3 — the 30m cooldown (wider of in-RAM + persisted), then
-	// the maintenance mutex.
+	// the maintenance mutex. The cooldown halves stay bespoke — no
+	// single CooldownSet key carries them — so heal.Allowed runs
+	// with a nil ledger as the mutex-only gate: never kill a
+	// stateful pod mid-drain/upgrade; "cannot verify" fails closed
+	// like every other caller.
 	if p.drPodHealed.CooledDown(stsKey, dragonflyPodHealCooldown, now) {
 		log.Info("skip heal: dragonfly pod inside cooldown",
 			"statefulset", stsKey)
 		return
 	}
-	if ts := sig.sts.Annotations[dragonflyPodHealAnno]; ts != "" {
-		if t, err := time.Parse(time.RFC3339, ts); err == nil &&
-			now.Sub(t) < dragonflyPodHealCooldown {
-			log.Info("skip heal: persisted stamp inside cooldown",
-				"statefulset", stsKey,
-				"ago", now.Sub(t).Truncate(time.Minute))
-			return
-		}
-	}
-	// Maintenance mutex — never kill a stateful pod mid-drain/
-	// upgrade; "cannot verify" fails closed like every other caller.
-	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
-			"statefulset", stsKey, "error", err)
+	if t, ok := kube.AnnoTime(sig.sts, dragonflyPodHealAnno); ok &&
+		now.Sub(t) < dragonflyPodHealCooldown {
+		log.Info("skip heal: persisted stamp inside cooldown",
+			"statefulset", stsKey,
+			"ago", now.Sub(t).Truncate(time.Minute))
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — heal deferred",
-			"statefulset", stsKey, "why", why)
+	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
+		nil, stsKey, 0, now)
+	if unverifiable {
+		metrics.IncError(p.Name)
+		return
+	}
+	if !proceed {
 		return
 	}
 
@@ -246,13 +237,9 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	if target == nil {
 		return // no STS-named pod found — nothing safe to delete
 	}
-	// UID precondition closes the list→delete TOCTOU: a same-named
-	// replacement pod is not ours to reap.
-	uid := target.UID
-	if err := p.CS.CoreV1().Pods(target.Namespace).Delete(ctx, target.Name,
-		metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid},
-		}); err != nil {
+	// UID precondition (inside heal.DeletePod) closes the list→delete
+	// TOCTOU: a same-named replacement pod is not ours to reap.
+	if _, err := heal.DeletePod(ctx, p.CS, &p.drPodHealed, stsKey, target, now); err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "dragonfly dual-replica pod delete failed",
 			"pod", target.Namespace+"/"+target.Name)
@@ -260,7 +247,6 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	}
 	metrics.DragonflyMasterlessPodHealsTotal.
 		WithLabelValues(sig.sts.Namespace, sig.sts.Name).Inc()
-	p.drPodHealed.Stamp(stsKey, now)
 	log.Info("DELETE: dragonfly dual-replica deadlock — lowest-ordinal pod deleted to force master re-election",
 		"pod", target.Namespace+"/"+target.Name,
 		"statefulset", stsKey, "service", sig.ns+"/"+sig.svc)

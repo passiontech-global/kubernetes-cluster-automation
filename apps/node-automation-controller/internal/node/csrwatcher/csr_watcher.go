@@ -83,7 +83,8 @@ func (w *csrWatcher) run(ctx context.Context) error {
 	// Paged list — CSRs accumulate forever on clusters where nothing
 	// auto-approves them, so bound each apiserver response instead of
 	// decoding the whole pile in one shot.
-	csrs, err := kube.ListAll(ctx, metav1.ListOptions{Limit: 500},
+	csrs, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.CertificateSigningRequests(w.cs))
 	if err != nil {
 		return fmt.Errorf("list certificatesigningrequests: %w", err)

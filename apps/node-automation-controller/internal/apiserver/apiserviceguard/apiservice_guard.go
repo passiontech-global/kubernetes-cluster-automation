@@ -76,7 +76,7 @@ const (
 	// apiServiceListPageSize bounds each List page — continue-token
 	// pagination keeps a large APIService/event set from arriving as
 	// one giant response body.
-	apiServiceListPageSize = 500
+	apiServiceListPageSize = kube.DefaultListPageSize
 )
 
 // apiServiceProtectedNamespaces is the plan's skipNamespaces set —

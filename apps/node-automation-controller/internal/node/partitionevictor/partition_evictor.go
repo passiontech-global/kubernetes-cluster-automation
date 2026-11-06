@@ -45,7 +45,7 @@ import (
 )
 
 const (
-	partitionTaintKey = "node.ops/network-partitioned"
+	partitionTaintKey = kube.TaintNetworkPartitioned
 	partitionMinAge   = 600 * time.Second // condition True >10m before evicting
 	partitionPodNS    = "flux-system"     // default for partitionNSsEnv
 	partitionEvictCap = 8                 // bound churn per run
@@ -59,7 +59,7 @@ const (
 	// single-replica infra living outside the allow-list (a
 	// cert-manager webhook or a database proxy wedged on a
 	// blackholed node is just as stuck as source-controller was).
-	partitionEvictAnno = "node.ops/evict-on-partition"
+	partitionEvictAnno = kube.AnnoEvictOnPartition
 	// mirrorPodAnno is the kubelet's static-pod marker — the API
 	// object is only a mirror, the kubelet owns (and recreates) the
 	// real pod, so deleting it buys nothing.
@@ -183,7 +183,7 @@ func partitionEvictable(p *corev1.Pod, namespaces map[string]struct{}) bool {
 // evicting pods it cannot prove are movable.
 func (e *partitionEvictor) nodePinnedPVCs(ctx context.Context) (map[string]struct{}, error) {
 	pvcs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: 500},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.PersistentVolumeClaims(e.cs, metav1.NamespaceAll))
 	if err != nil {
 		return nil, fmt.Errorf("list persistentvolumeclaims: %w", err)
@@ -319,7 +319,7 @@ loop:
 	for _, name := range names {
 		pods, err := kube.ListAll(ctx, metav1.ListOptions{
 			FieldSelector: "spec.nodeName=" + name,
-			Limit:         500,
+			Limit:         kube.DefaultListPageSize,
 		}, kube.Pods(e.cs, metav1.NamespaceAll))
 		if err != nil {
 			metrics.IncError(e.queue)

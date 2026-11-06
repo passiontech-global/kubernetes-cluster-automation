@@ -93,7 +93,7 @@ const (
 	dragonflyOperatorPodPrefix = "dragonfly-operator-controller-manager"
 	// dragonflyHealAnno persists the last heal moment on the STS —
 	// the restart-proof half of the cooldown.
-	dragonflyHealAnno = "node.ops/last-dragonfly-operator-heal"
+	dragonflyHealAnno = kube.AnnoLastDragonflyOperatorHeal
 
 	// W7-C3 — dual-replica deadlock: past this zero-endpoint streak
 	// the operator restart (step 1) demonstrably failed to re-elect
@@ -112,7 +112,7 @@ const (
 	dragonflyPodHealCooldown = 30 * time.Minute
 	// dragonflyPodHealAnno persists the last ordinal-0 pod delete on
 	// the STS — the restart-proof half of the cooldown.
-	dragonflyPodHealAnno = "node.ops/last-dragonfly-pod-heal"
+	dragonflyPodHealAnno = kube.AnnoLastDragonflyPodHeal
 )
 
 // ---------------------------------------------------------------------------

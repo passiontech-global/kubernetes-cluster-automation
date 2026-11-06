@@ -15,9 +15,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -97,19 +96,13 @@ func dbOperatorFor(sts *appsv1.StatefulSet) string {
 func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.Logger,
 	sig masterSvc, operator string, now time.Time) {
 	const dbOperatorHealCooldown = 30 * time.Minute
-	if p.Heals.CooledDown(operator, dbOperatorHealCooldown, now) {
-		log.Info("skip heal: db operator inside cooldown", "operator", operator)
-		return
-	}
-	held, why, err := kube.MaintenanceActive(ctx, p.CS, p.Dyn)
-	if err != nil {
+	proceed, unverifiable := heal.Allowed(ctx, log, p.CS, p.Dyn,
+		&p.Heals, operator, dbOperatorHealCooldown, now)
+	if unverifiable {
 		metrics.IncError(p.Name)
-		log.Info("WARN: maintenance check unverifiable — heal deferred (fail closed)",
-			"operator", operator, "error", err)
 		return
 	}
-	if held {
-		log.Info("maintenance in progress — heal deferred", "operator", operator, "why", why)
+	if !proceed {
 		return
 	}
 	pods, err := p.CS.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
@@ -124,44 +117,18 @@ func (p *statefulMasterlessCheck) healDBOperator(ctx context.Context, log logr.L
 	// Percona operators answer to two Deployment spellings (W10-FIX4)
 	// — every alias prefix is tried so a short-name match still finds
 	// the long-named pods.
-	prefixes := dbOperatorPodPrefixes(operator)
-	var target *corev1.Pod
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if pod.Status.Phase != corev1.PodRunning ||
-			pod.DeletionTimestamp != nil {
-			continue
-		}
-		matched := false
-		for _, prefix := range prefixes {
-			if strings.HasPrefix(pod.Name, prefix+"-") {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			continue
-		}
-		if target == nil || pod.CreationTimestamp.Before(&target.CreationTimestamp) {
-			target = pod
-		}
-	}
+	target := heal.OldestRunningPod(pods.Items, dbOperatorPodPrefixes(operator)...)
 	if target == nil {
 		log.Info("no running pod found for db operator — heal deferred",
 			"operator", operator)
 		return
 	}
-	uid := target.UID
-	if err := p.CS.CoreV1().Pods(target.Namespace).Delete(ctx, target.Name,
-		metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid},
-		}); err != nil {
+	if _, err := heal.DeletePod(ctx, p.CS, &p.Heals, operator, target, now); err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "db operator pod delete failed",
 			"pod", target.Namespace+"/"+target.Name, "operator", operator)
 		return
 	}
-	p.Heals.Stamp(operator, now)
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(operator).Inc()
 	log.Info("DELETE: db operator pod — masterless service, forcing re-election",
 		"operator", operator, "pod", target.Namespace+"/"+target.Name,

@@ -191,7 +191,6 @@ func newStallUnlocker(cs *kfake.Clientset, dyn *fake.FakeDynamicClient,
 	u := &helmReleaseUnlocker{queue: "helmrelease-unlocker",
 		cs:           cs,
 		dyn:          dyn,
-		unlocked:     map[string]time.Time{},
 		stallEnabled: true,
 	}
 	if key != "" {

@@ -87,9 +87,6 @@ const (
 	// a burst of cluster-scoped Deletes hammering the apiserver when
 	// a mass-orphan event finally converges.
 	ciliumGCMaxDelete = 50
-	// ciliumListPageSize caps each cluster-wide List response — the
-	// all-namespaces pod read is the biggest this module makes.
-	ciliumListPageSize = 500
 	// ciliumReservedIDMax is the top of Cilium's reserved identity
 	// range (1–255: host, world, health, ingress, ...) — upstream GC
 	// exempts it, so orphan accounting must too.
@@ -157,7 +154,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	now := a.now.Now()
 
 	ids, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: ciliumListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.DynamicPage(a.dyn.Resource(ciliumIdentityGVR)))
 	if err != nil {
 		return fmt.Errorf("list ciliumidentities: %w", err) // wrapper IncErrors — a returned error must not count itself
@@ -183,7 +180,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 
 	used := map[string]struct{}{}
 	eps, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: ciliumListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.DynamicPage(a.dyn.Resource(ciliumEndpointGVR).Namespace(metav1.NamespaceAll)))
 	if err != nil {
 		return fmt.Errorf("list ciliumendpoints: %w", err) // wrapper IncErrors — a returned error must not count itself
@@ -205,7 +202,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	// error aborts the run, so the GC path below is never reached on
 	// partial data).
 	slices, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: ciliumListPageSize},
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.DynamicPage(a.dyn.Resource(ciliumEndpointSliceGVR).
 			Namespace(metav1.NamespaceAll)))
 	switch {
@@ -224,13 +221,13 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 
 	// Server-side phase filter + continue-token pagination: terminal
 	// pods hold no live endpoints, and the all-namespaces pod read is
-	// the biggest this module makes — page it at ciliumListPageSize so
+	// the biggest this module makes — page it at the shared bound so
 	// no single response dominates. The in-code phase check stays —
 	// fake clientsets ignore field selectors and the belt costs
 	// nothing.
 	podOpts := metav1.ListOptions{
 		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
-		Limit:         ciliumListPageSize,
+		Limit:         kube.DefaultListPageSize,
 	}
 	err = kube.ListEach(ctx, podOpts, kube.Pods(a.cs, metav1.NamespaceAll),
 		func(items []corev1.Pod) error {
