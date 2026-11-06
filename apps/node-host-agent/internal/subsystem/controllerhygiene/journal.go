@@ -30,13 +30,13 @@ const journalSinceLayout = "2006-01-02 15:04:05"
 // persistently answers nothing while journal storage exists blinds
 // ALL journal-grep checks, and that blindness must latch+log, not
 // stay a per-cycle warning line.
-func (h *Hygiene) journalText(ctx context.Context, since time.Time) string {
-	out, err := h.cfg.journalFn(ctx, h.cfg.JournalUnit, since)
-	h.noteJournalRead(ctx, out, err)
+func (d *deps) journalText(ctx context.Context, since time.Time) string {
+	out, err := d.cfg.journalFn(ctx, d.cfg.JournalUnit, since)
+	d.noteJournalRead(ctx, out, err)
 	if err != nil {
-		h.state.AppendLogWarn(fmt.Sprintf(
+		d.state.AppendLogWarn(fmt.Sprintf(
 			"controllerhygiene: journal read failed (unit=%s): %v — journal checks see 0 hits",
-			h.cfg.JournalUnit, err))
+			d.cfg.JournalUnit, err))
 		return ""
 	}
 	return out
@@ -49,14 +49,14 @@ func (h *Hygiene) journalText(ctx context.Context, since time.Time) string {
 // answering ANY line (even "-- No entries --") means the empty
 // window was a quiet unit, while an error, a files-gone notice or
 // literally zero bytes is journald-level blindness.
-func (h *Hygiene) classifyJournalRead(ctx context.Context, out string, err error) (bool, string) {
+func (d *deps) classifyJournalRead(ctx context.Context, out string, err error) (bool, string) {
 	switch {
 	case err != nil:
 		return false, fmt.Sprintf("read failed: %v", err)
 	case journalwatch.FilesGone(out):
 		return false, "journalctl reports no journal files"
 	case strings.TrimSpace(out) == "":
-		uout, uerr := h.cfg.journalAnyFn(ctx)
+		uout, uerr := d.cfg.journalAnyFn(ctx)
 		switch {
 		case uerr != nil:
 			return false, fmt.Sprintf("unfiltered probe failed: %v", uerr)
@@ -75,28 +75,28 @@ func (h *Hygiene) classifyJournalRead(ctx context.Context, out string, err error
 // then re-reminds at most once per SuspectLogCadence while the
 // latch stays held); exit → STATE-EXIT. The journalDir gate lives
 // inside the tracker — a host with no journal storage never fires.
-func (h *Hygiene) noteJournalRead(ctx context.Context, out string, err error) {
-	ok, detail := h.classifyJournalRead(ctx, out, err)
-	enter, exit := h.journalReads.NoteRead(ok)
+func (d *deps) noteJournalRead(ctx context.Context, out string, err error) {
+	ok, detail := d.classifyJournalRead(ctx, out, err)
+	enter, exit := d.journalReads.NoteRead(ok)
 	// Re-establish after external removal: janitor's 24h reap or a
 	// manual rm can delete the file while the tracker stays latched,
 	// and `enter` won't fire twice per episode — without this the
 	// latch/metric/condition go dark mid-episode.
-	if enter || (h.journalReads.Latched() &&
-		!h.state.Exists(stateJournalUnreadable)) {
-		h.state.Enter(stateJournalUnreadable, detail)
+	if enter || (d.journalReads.Latched() &&
+		!d.state.Exists(stateJournalUnreadable)) {
+		d.state.Enter(stateJournalUnreadable, detail)
 		if enter {
-			h.cycles.WithLabelValues(checkJournal, "journal_unreadable").Inc()
+			d.cycles.WithLabelValues(checkJournal, "journal_unreadable").Inc()
 		}
 	}
-	if !ok && h.journalReads.Latched() {
-		h.state.SuspectLog(stateJournalUnreadable, fmt.Sprintf(
+	if !ok && d.journalReads.Latched() {
+		d.state.SuspectLog(stateJournalUnreadable, fmt.Sprintf(
 			"suspect: journal-unreadable %s — %d consecutive journal "+
 				"reads produced nothing while journal storage exists; "+
 				"every journal-grep check is blind",
-			detail, h.journalReads.Fails()), h.cfg.SuspectLogCadence)
+			detail, d.journalReads.Fails()), d.cfg.SuspectLogCadence)
 	}
 	if exit {
-		h.stateExit(stateJournalUnreadable)
+		d.stateExit(stateJournalUnreadable)
 	}
 }

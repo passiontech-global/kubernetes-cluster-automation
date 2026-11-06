@@ -123,6 +123,14 @@ func ConfigFromEnv(d EnvDeps) Config {
 		envx.IntKnob("NODE_HOST_AGENT_CALICO_ORPHAN_VETH_THRESHOLD", &cfg.Calico.OrphanVethThreshold, defaultCalicoOrphanVethThresh),
 		envx.IntKnob("NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED", &cfg.ConsecNeeded, defaultConsecNeeded),
 		envx.DurationKnob("NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL", &cfg.MinRestartInterval, defaultMinRestartInterval),
+		// W10 runtime-resource guards — hostPath defaults like the
+		// block above (the package defaults are unprefixed
+		// host-absolute paths; the "/host" prefix is the
+		// DaemonSet's, not the constant's).
+		envx.StringKnob("NODE_HOST_AGENT_CGROUP_ROOT", &cfg.Runtime.CgroupRoot,
+			hostPath("/sys/fs/cgroup")),
+		envx.StringKnob("NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR", &cfg.Runtime.SessionsDir,
+			hostPath("/run/systemd/sessions")),
 	})
 	if d.Watchdog != nil {
 		// API_BACKENDS → the watch-wedge check's upstream-stale gate

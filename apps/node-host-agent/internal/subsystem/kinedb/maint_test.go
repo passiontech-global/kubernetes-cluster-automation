@@ -133,7 +133,7 @@ func TestMaintCycleRepackSkippedOnLowHeadroom(t *testing.T) {
 		t.Fatalf("repackState=%s", res.repackState)
 	}
 	j := fr.Joined()
-	if !strings.Contains(j, "VACUUM (ANALYZE) kine") {
+	if !strings.Contains(j, `VACUUM (ANALYZE) "kine"`) {
 		t.Fatalf("fallback vacuum missing:\n%s", j)
 	}
 	if strings.Contains(j, "--no-superuser-check") {

@@ -55,66 +55,77 @@ const (
 	kineWALBytesMetric = "node_agent_kine_wal_bytes"
 )
 
-// checkKineStorageHealth measures the Kine backing store on this
-// controller and keeps the WAL from growing until it fills the
-// root filesystem. SQLite/Kine hosts get state.db + state.db-wal
-// sizes; non-SQLite backends (embedded etcd, NATS JetStream
-// filestore) get the first existing store dir summed with a bounded
-// walk — both land on node_agent_kine_db_bytes /
-// node_agent_kine_wal_bytes via the node-exporter textfile channel.
-// A WAL over kineWALCheckpointMinBytes triggers `PRAGMA
-// wal_checkpoint(TRUNCATE)` through the host sqlite3 under the
-// last-kine-wal-checkpoint cooldown.
-func (h *Hygiene) checkKineStorageHealth(ctx context.Context) {
-	dbBytes, walBytes, ok := h.kineStoreSizes()
+// kineStorageCheck is the W10-CP2 Kine store health check as a Check
+// — stateless: the checkpoint cadence lives in the
+// last-kine-wal-checkpoint budget. It is not its own dispatch-table
+// entry: it rides cpFreezeCheck's ungated slot (check.go).
+type kineStorageCheck struct {
+	d *deps
+}
+
+// Name returns the check label / log context.
+func (c *kineStorageCheck) Name() string { return checkKineStorage }
+
+// Run measures the Kine backing store on this controller and keeps
+// the WAL from growing until it fills the root filesystem.
+// SQLite/Kine hosts get state.db + state.db-wal sizes; non-SQLite
+// backends (embedded etcd, NATS JetStream filestore) get the first
+// existing store dir summed with a bounded walk — both land on
+// node_agent_kine_db_bytes / node_agent_kine_wal_bytes via the
+// node-exporter textfile channel. A WAL over
+// kineWALCheckpointMinBytes triggers `PRAGMA wal_checkpoint(TRUNCATE)`
+// through the host sqlite3 under the last-kine-wal-checkpoint
+// cooldown.
+func (c *kineStorageCheck) Run(ctx context.Context) {
+	dbBytes, walBytes, ok := c.kineStoreSizes()
 	if !ok {
 		// No store at all — headers-only file so a vanished store
 		// drops the series instead of pinning a stale size.
-		h.emitKineStorageTextfile(0, 0, false)
-		h.cycles.WithLabelValues(checkKineStorage, "absent").Inc()
+		c.emitKineStorageTextfile(0, 0, false)
+		c.d.cycles.WithLabelValues(checkKineStorage, "absent").Inc()
 		return
 	}
-	h.emitKineStorageTextfile(dbBytes, walBytes, true)
+	c.emitKineStorageTextfile(dbBytes, walBytes, true)
 	if walBytes <= kineWALCheckpointMinBytes {
-		h.cycles.WithLabelValues(checkKineStorage, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkKineStorage, "ok").Inc()
 		return
 	}
-	if !h.state.RateOK(fileRateKineCheckpoint,
+	if !c.d.state.RateOK(fileRateKineCheckpoint,
 		kineWALCheckpointCooldown) {
-		h.cycles.WithLabelValues(checkKineStorage, "checkpoint_cooldown").Inc()
+		c.d.cycles.WithLabelValues(checkKineStorage, "checkpoint_cooldown").Inc()
 		return
 	}
-	err := kineCheckpointFn(ctx, h.kineDBPath())
+	err := kineCheckpointFn(ctx, c.kineDBPath())
 	switch {
 	case errors.Is(err, errKineNoSQLite3):
 		// No sqlite3 on the host — skip WITHOUT spending the
 		// cooldown so a later install still gets the checkpoint.
-		h.cycles.WithLabelValues(checkKineStorage, "no_sqlite3").Inc()
+		c.d.cycles.WithLabelValues(checkKineStorage, "no_sqlite3").Inc()
 	case err != nil:
-		h.state.RateSpend(fileRateKineCheckpoint)
-		h.state.AppendLogWarn(fmt.Sprintf(
+		c.d.state.RateSpend(fileRateKineCheckpoint)
+		c.d.state.AppendLogWarn(fmt.Sprintf(
 			"suspect: kine wal=%.0fMiB > %dMiB but wal_checkpoint failed: %v",
 			float64(walBytes)/(1<<20),
 			kineWALCheckpointMinBytes>>20, err))
-		h.cycles.WithLabelValues(checkKineStorage, "checkpoint_fail").Inc()
+		c.d.cycles.WithLabelValues(checkKineStorage, "checkpoint_fail").Inc()
 	default:
-		h.state.RateSpend(fileRateKineCheckpoint)
-		h.state.AppendLog(fmt.Sprintf(
+		c.d.state.RateSpend(fileRateKineCheckpoint)
+		c.d.state.AppendLog(fmt.Sprintf(
 			"ACTION: kine wal_checkpoint(TRUNCATE) — state.db-wal %.0fMiB > %dMiB",
 			float64(walBytes)/(1<<20), kineWALCheckpointMinBytes>>20))
-		h.actions.WithLabelValues(checkKineStorage, "wal_checkpoint").Inc()
-		h.cycles.WithLabelValues(checkKineStorage, "ok").Inc()
+		c.d.actions.WithLabelValues(checkKineStorage, "wal_checkpoint").Inc()
+		c.d.cycles.WithLabelValues(checkKineStorage, "ok").Inc()
 	}
 }
 
 // kineDBPath / kineWALPath — the SQLite/Kine store locations under
 // K0sDir (<K0sDir>/db/state.db and its -wal sidecar).
-func (h *Hygiene) kineDBPath() string {
-	return filepath.Join(h.cfg.K0sDir, "db", "state.db")
+func (c *kineStorageCheck) kineDBPath() string {
+	return filepath.Join(c.d.cfg.K0sDir, "db", "state.db")
 }
 
-func (h *Hygiene) kineWALPath() string {
-	return h.kineDBPath() + "-wal"
+func (c *kineStorageCheck) kineWALPath() string {
+	return c.kineDBPath() + "-wal"
 }
 
 // kineStoreSizes reports the store sizes: state.db + state.db-wal
@@ -122,17 +133,17 @@ func (h *Hygiene) kineWALPath() string {
 // first existing non-SQLite store dir (embedded etcd / NATS
 // JetStream filestore — WAL stays 0 there). ok=false when no store
 // exists at all.
-func (h *Hygiene) kineStoreSizes() (dbBytes, walBytes int64, ok bool) {
-	if fi, err := os.Stat(h.kineDBPath()); err == nil && !fi.IsDir() {
+func (c *kineStorageCheck) kineStoreSizes() (dbBytes, walBytes int64, ok bool) {
+	if fi, err := os.Stat(c.kineDBPath()); err == nil && !fi.IsDir() {
 		dbBytes = fi.Size()
-		if w, werr := os.Stat(h.kineWALPath()); werr == nil && !w.IsDir() {
+		if w, werr := os.Stat(c.kineWALPath()); werr == nil && !w.IsDir() {
 			walBytes = w.Size()
 		}
 		return dbBytes, walBytes, true
 	}
 	for _, dir := range []string{
-		filepath.Join(h.cfg.K0sDir, "etcd"),
-		filepath.Join(h.cfg.K0sDir, "nats"),
+		filepath.Join(c.d.cfg.K0sDir, "etcd"),
+		filepath.Join(c.d.cfg.K0sDir, "nats"),
 	} {
 		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
 			total, _ := dirSizeBounded(dir, kineStoreMaxFiles)
@@ -197,7 +208,7 @@ func sqlite3WALCheckpoint(ctx context.Context, dbPath string) error {
 
 // emitKineStorageTextfile writes the two kine gauges — present=false
 // emits headers only so the series goes absent rather than stale.
-func (h *Hygiene) emitKineStorageTextfile(dbBytes, walBytes int64, present bool) {
+func (c *kineStorageCheck) emitKineStorageTextfile(dbBytes, walBytes int64, present bool) {
 	var p promfile.Builder
 	if present {
 		p.Gauge(kineDBBytesMetric,
@@ -216,5 +227,11 @@ func (h *Hygiene) emitKineStorageTextfile(dbBytes, walBytes int64, present bool)
 			"Size in bytes of the Kine SQLite WAL (state.db-wal); "+
 				"absent on non-SQLite backends.")
 	}
-	h.writeTextfileProm("node-agent-kine-storage.prom", p.String())
+	c.d.writeTextfileProm("node-agent-kine-storage.prom", p.String())
+}
+
+// checkKineStorageHealth forwards to the migrated Check — tests
+// written before the interface still call the old method shape.
+func (h *Hygiene) checkKineStorageHealth(ctx context.Context) {
+	h.kineStorage.Run(ctx)
 }

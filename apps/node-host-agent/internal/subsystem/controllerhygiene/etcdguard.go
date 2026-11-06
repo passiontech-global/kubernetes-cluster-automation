@@ -59,30 +59,40 @@ const (
 	eventStaleAge = time.Hour
 )
 
-// checkEtcdQuota runs one etcdguard cycle.
-func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
-	if _, err := os.Stat(filepath.Join(h.cfg.K0sDir, "bin", "etcdctl")); err != nil {
-		h.cycles.WithLabelValues(checkEtcd, "no_etcdctl").Inc()
+// etcdGuardCheck is the embedded-etcd quota self-defence as a
+// Check — stateless: the eventpurge+rescue cadence lives in the
+// last-etcd-guard budget.
+type etcdGuardCheck struct {
+	d *deps
+}
+
+// Name returns the check label / log context.
+func (c *etcdGuardCheck) Name() string { return checkEtcd }
+
+// Run executes one etcdguard cycle.
+func (c *etcdGuardCheck) Run(ctx context.Context) {
+	if _, err := os.Stat(filepath.Join(c.d.cfg.K0sDir, "bin", "etcdctl")); err != nil {
+		c.d.cycles.WithLabelValues(checkEtcd, "no_etcdctl").Inc()
 		return
 	}
-	if _, err := os.Stat(filepath.Join(h.cfg.K0sDir,
+	if _, err := os.Stat(filepath.Join(c.d.cfg.K0sDir,
 		"pki", "etcd", "ca.crt")); err != nil {
-		h.cycles.WithLabelValues(checkEtcd, "no_etcd_pki").Inc()
+		c.d.cycles.WithLabelValues(checkEtcd, "no_etcd_pki").Inc()
 		return
 	}
 
-	dbSize, dbUse, err := h.etcdStatus(ctx)
+	dbSize, dbUse, err := c.etcdStatus(ctx)
 	if err != nil {
 		// etcd unreachable — nothing measurable; the wedge/feeder
 		// guards own the control-plane-down story.
-		h.state.AppendLogWarn(fmt.Sprintf(
+		c.d.state.AppendLogWarn(fmt.Sprintf(
 			"etcdguard: endpoint status failed (endpoint=%s): %v — quota check skipped",
-			h.cfg.EtcdGuard.Endpoint, err))
-		h.cycles.WithLabelValues(checkEtcd, "status_error").Inc()
+			c.d.cfg.EtcdGuard.Endpoint, err))
+		c.d.cycles.WithLabelValues(checkEtcd, "status_error").Inc()
 		return
 	}
-	h.etcdDBSize.Set(float64(dbSize))
-	h.etcdDBUse.Set(float64(dbUse))
+	c.d.etcdDBSize.Set(float64(dbSize))
+	c.d.etcdDBUse.Set(float64(dbUse))
 
 	// The alarm-list probe only runs while dbSize is below the
 	// trigger: over-limit the action decision is already made, so a
@@ -92,19 +102,19 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	// value, the same "keep last, never force-clear a
 	// possibly-armed alarm" semantics as a probe error.
 	var nospace bool
-	if dbSize < h.cfg.EtcdGuard.DBSizeLimit {
-		ns, aerr := h.etcdNospaceArmed(ctx)
+	if dbSize < c.d.cfg.EtcdGuard.DBSizeLimit {
+		ns, aerr := c.etcdNospaceArmed(ctx)
 		if aerr != nil {
 			// A failed alarm read must not hide a real alarm —
 			// treat the size signal as authoritative this cycle,
 			// surface the error once in the log, and LEAVE the
 			// gauge at its last value.
-			h.state.AppendLogWarn(fmt.Sprintf("etcdguard: alarm list failed: %v", aerr))
+			c.d.state.AppendLogWarn(fmt.Sprintf("etcdguard: alarm list failed: %v", aerr))
 		} else if ns {
 			nospace = true
-			h.etcdNospace.Set(1)
+			c.d.etcdNospace.Set(1)
 		} else {
-			h.etcdNospace.Set(0)
+			c.d.etcdNospace.Set(0)
 		}
 	}
 
@@ -112,29 +122,29 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	switch {
 	case nospace:
 		reason = "nospace-alarm"
-	case dbSize >= h.cfg.EtcdGuard.DBSizeLimit:
-		reason = fmt.Sprintf("dbSize=%d>=%d", dbSize, h.cfg.EtcdGuard.DBSizeLimit)
+	case dbSize >= c.d.cfg.EtcdGuard.DBSizeLimit:
+		reason = fmt.Sprintf("dbSize=%d>=%d", dbSize, c.d.cfg.EtcdGuard.DBSizeLimit)
 	default:
-		h.cycles.WithLabelValues(checkEtcd, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkEtcd, "ok").Inc()
 		return
 	}
 
-	if !h.state.RateOK(fileRateEtcdGuard,
-		h.cfg.EtcdGuard.MinRun) {
-		h.state.SuspectLog(checkEtcd, fmt.Sprintf(
+	if !c.d.state.RateOK(fileRateEtcdGuard,
+		c.d.cfg.EtcdGuard.MinRun) {
+		c.d.state.SuspectLog(checkEtcd, fmt.Sprintf(
 			"etcdguard: %s but in guard cooldown (<%dm), skip",
-			reason, int(h.cfg.EtcdGuard.MinRun.Minutes())),
-			h.cfg.SuspectLogCadence)
-		h.cycles.WithLabelValues(checkEtcd, "cooldown").Inc()
+			reason, int(c.d.cfg.EtcdGuard.MinRun.Minutes())),
+			c.d.cfg.SuspectLogCadence)
+		c.d.cycles.WithLabelValues(checkEtcd, "cooldown").Inc()
 		return
 	}
-	h.state.AppendLog(fmt.Sprintf(
+	c.d.state.AppendLog(fmt.Sprintf(
 		"ACTION: etcdguard %s — evpurge stale events + ONLINE-ONLY "+
 			"etcd rescue (offline defrag forbidden)", reason))
 	// Budget spent before the action — a kill mid-rescue must not
 	// allow a second run inside the window (feeder G6 parity).
-	h.state.RateSpend(fileRateEtcdGuard)
-	out := &guardLogWriter{h: h}
+	c.d.state.RateSpend(fileRateEtcdGuard)
+	out := &guardLogWriter{d: c.d}
 
 	// The whole remediation runs under a bounded ctx: eventpurge is
 	// unbounded pagination + delete work against a possibly
@@ -150,17 +160,17 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	// control-plane outage — purge first so the rescue's compaction
 	// has garbage to drop. Cutoff keeps the apiserver's own 1h event
 	// TTL: only GC debt is deleted, fresh events survive.
-	perr := h.cfg.evpurgeRunFn(gctx, eventpurge.Config{
-		API:      "https://" + h.cfg.Hub.SelfEndpoint,
-		CAFile:   h.cfg.AdminCA,
-		CertFile: h.cfg.AdminCert,
-		KeyFile:  h.cfg.AdminKey,
-	}, h.cfg.nowFn().Add(-eventStaleAge), out)
+	perr := c.d.cfg.evpurgeRunFn(gctx, eventpurge.Config{
+		API:      "https://" + c.d.cfg.Hub.SelfEndpoint,
+		CAFile:   c.d.cfg.AdminCA,
+		CertFile: c.d.cfg.AdminCert,
+		KeyFile:  c.d.cfg.AdminKey,
+	}, c.d.cfg.nowFn().Add(-eventStaleAge), out)
 	out.flush()
 	if perr != nil {
 		// Logged on its own — a purge miss does NOT fail the cycle
 		// when the quota-remediating step still lands below.
-		h.state.AppendLogWarn(fmt.Sprintf("etcdguard: evpurge failed: %v", perr))
+		c.d.state.AppendLogWarn(fmt.Sprintf("etcdguard: evpurge failed: %v", perr))
 	}
 	// remediated tracks the step that actually relieves the quota:
 	// the online rescue (compact+defrag). eventpurge only drops event
@@ -172,9 +182,9 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 	// the whole budget — spawn no further calls that can only fail;
 	// the rescue is idempotent and retries in the next window.
 	if gctx.Err() == nil {
-		rerr := h.cfg.etcdRescueFn(gctx, etcdmaint.Config{
-			K0sDir:   h.cfg.K0sDir,
-			Endpoint: h.cfg.EtcdGuard.Endpoint,
+		rerr := c.d.cfg.etcdRescueFn(gctx, etcdmaint.Config{
+			K0sDir:   c.d.cfg.K0sDir,
+			Endpoint: c.d.cfg.EtcdGuard.Endpoint,
 			// OnlineOnly: this is background auto-maintenance — the
 			// systemctl-stop + standalone-etcd defrag would take the
 			// control plane down and stays a manual rescue-etcd
@@ -188,7 +198,7 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 		}, out)
 		out.flush()
 		if rerr != nil {
-			h.state.AppendLogWarn(fmt.Sprintf("etcdguard: rescue incomplete: %v", rerr))
+			c.d.state.AppendLogWarn(fmt.Sprintf("etcdguard: rescue incomplete: %v", rerr))
 		}
 		remediated = rerr == nil
 	} else {
@@ -197,24 +207,24 @@ func (h *Hygiene) checkEtcdQuota(ctx context.Context) {
 		remediated = false
 	}
 	if errors.Is(gctx.Err(), context.DeadlineExceeded) {
-		h.state.AppendLogWarn(fmt.Sprintf(
+		c.d.state.AppendLogWarn(fmt.Sprintf(
 			"etcdguard: run budget (%s) exhausted — remaining steps "+
 				"deferred to the next %s window",
-			defaultEtcdGuardBudget, h.cfg.EtcdGuard.MinRun))
+			defaultEtcdGuardBudget, c.d.cfg.EtcdGuard.MinRun))
 	}
-	h.actions.WithLabelValues(checkEtcd, "evpurge_rescue").Inc()
+	c.d.actions.WithLabelValues(checkEtcd, "evpurge_rescue").Inc()
 	if remediated {
-		h.cycles.WithLabelValues(checkEtcd, "ok").Inc()
+		c.d.cycles.WithLabelValues(checkEtcd, "ok").Inc()
 	} else {
-		h.cycles.WithLabelValues(checkEtcd, "remediate_error").Inc()
+		c.d.cycles.WithLabelValues(checkEtcd, "remediate_error").Inc()
 	}
 }
 
 // etcdStatus fetches `endpoint status -w json` and returns the db
 // file size + in-use size of element[0] (same JSON shape
 // etcdmaint.parseStatusJSON consumes).
-func (h *Hygiene) etcdStatus(ctx context.Context) (dbSize, dbUse int64, err error) {
-	b, err := h.cfg.etcdctlFn(ctx, "endpoint", "status", "-w", "json")
+func (c *etcdGuardCheck) etcdStatus(ctx context.Context) (dbSize, dbUse int64, err error) {
+	b, err := c.d.cfg.etcdctlFn(ctx, "endpoint", "status", "-w", "json")
 	if err != nil {
 		return 0, 0, err
 	}
@@ -235,8 +245,8 @@ func (h *Hygiene) etcdStatus(ctx context.Context) (dbSize, dbUse int64, err erro
 
 // etcdNospaceArmed reports whether `alarm list` carries a NOSPACE
 // entry — the memberID:xxx alarm:NOSPACE grep the manual flow used.
-func (h *Hygiene) etcdNospaceArmed(ctx context.Context) (bool, error) {
-	b, err := h.cfg.etcdctlFn(ctx, "alarm", "list")
+func (c *etcdGuardCheck) etcdNospaceArmed(ctx context.Context) (bool, error) {
+	b, err := c.d.cfg.etcdctlFn(ctx, "alarm", "list")
 	if err != nil {
 		return false, err
 	}
@@ -248,7 +258,7 @@ func (h *Hygiene) etcdNospaceArmed(ctx context.Context) (bool, error) {
 // appendLog entry (the "<rfc3339> <msg>" filelog contract), prefixed
 // so the sub-command output is attributable in the NPD tail.
 type guardLogWriter struct {
-	h   *Hygiene
+	d   *deps
 	buf strings.Builder
 }
 
@@ -261,7 +271,7 @@ func (w *guardLogWriter) Write(p []byte) (int, error) {
 			return len(p), nil
 		}
 		if line := strings.TrimSpace(s[:i]); line != "" {
-			w.h.state.AppendLog("etcdguard: " + line)
+			w.d.state.AppendLog("etcdguard: " + line)
 		}
 		w.buf.Reset()
 		w.buf.WriteString(s[i+1:])
@@ -272,7 +282,7 @@ func (w *guardLogWriter) Write(p []byte) (int, error) {
 // so a stream ending without '\n' still reaches the log.
 func (w *guardLogWriter) flush() {
 	if line := strings.TrimSpace(w.buf.String()); line != "" {
-		w.h.state.AppendLog("etcdguard: " + line)
+		w.d.state.AppendLog("etcdguard: " + line)
 	}
 	w.buf.Reset()
 }

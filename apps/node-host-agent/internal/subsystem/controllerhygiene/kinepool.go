@@ -34,95 +34,105 @@ import (
 	"syscall"
 )
 
-// checkKinePool runs one pool-guard cycle.
-func (h *Hygiene) checkKinePool(_ context.Context) {
-	kpid := h.proc.FindByComm("kine")
+// kinePoolCheck is the kine->DB connection-spiral backstop as a
+// Check — it keeps no in-memory state: the spiral streak lives in
+// consecutive-kine-pool (the cross-process shell contract).
+type kinePoolCheck struct {
+	d *deps
+}
+
+// Name returns the check label / log context.
+func (c *kinePoolCheck) Name() string { return checkKinePool }
+
+// Run executes one pool-guard cycle.
+func (c *kinePoolCheck) Run(_ context.Context) {
+	kpid := c.d.proc.FindByComm("kine")
 	if kpid == 0 {
 		// No kine process: etcd controller or k0s not initialised —
 		// the probe is a silent no-op (the shell exited the same way).
-		h.cycles.WithLabelValues(checkKinePool, "no_kine").Inc()
+		c.d.cycles.WithLabelValues(checkKinePool, "no_kine").Inc()
 		return
 	}
-	dbPort := h.kineDBPort(kpid)
-	conns := h.kineDBConns(kpid, dbPort)
-	h.kineConns.Set(float64(conns))
+	dbPort := c.kineDBPort(kpid)
+	conns := c.kineDBConns(kpid, dbPort)
+	c.d.kineConns.Set(float64(conns))
 
-	if conns <= h.cfg.KinePool.MaxConns {
-		h.state.ResetCounter(fileCtrPool)
-		h.stateExit(stateKinePoolRunaway)
-		h.cycles.WithLabelValues(checkKinePool, "ok").Inc()
+	if conns <= c.d.cfg.KinePool.MaxConns {
+		c.d.state.ResetCounter(fileCtrPool)
+		c.d.stateExit(stateKinePoolRunaway)
+		c.d.cycles.WithLabelValues(checkKinePool, "ok").Inc()
 		return
 	}
 
-	n := h.state.Incr(fileCtrPool)
-	if n < h.cfg.KinePool.Cycles {
-		h.state.AppendLog(fmt.Sprintf(
+	n := c.d.state.Incr(fileCtrPool)
+	if n < c.d.cfg.KinePool.Cycles {
+		c.d.state.AppendLog(fmt.Sprintf(
 			"suspect: kine conns-to-db=%d > %d — pool spiral? (check %d/%d)",
-			conns, h.cfg.KinePool.MaxConns, n, h.cfg.KinePool.Cycles))
-		h.cycles.WithLabelValues(checkKinePool, "ok").Inc()
+			conns, c.d.cfg.KinePool.MaxConns, n, c.d.cfg.KinePool.Cycles))
+		c.d.cycles.WithLabelValues(checkKinePool, "ok").Inc()
 		return
 	}
 
 	// --- spiral confirmed ---
-	h.state.Enter(stateKinePoolRunaway, fmt.Sprintf(
-		"conns=%d>%d x%d pid=%d", conns, h.cfg.KinePool.MaxConns, n, kpid))
+	c.d.state.Enter(stateKinePoolRunaway, fmt.Sprintf(
+		"conns=%d>%d x%d pid=%d", conns, c.d.cfg.KinePool.MaxConns, n, kpid))
 
-	if !h.state.RateOK(fileRatePoolKill, h.cfg.KinePool.MinRestart) {
-		h.state.SuspectLog(stateKinePoolRunaway, fmt.Sprintf(
+	if !c.d.state.RateOK(fileRatePoolKill, c.d.cfg.KinePool.MinRestart) {
+		c.d.state.SuspectLog(stateKinePoolRunaway, fmt.Sprintf(
 			"kine-pool-runaway conns=%d (%dx) but in kill cooldown (<%dm), skip",
-			conns, n, int(h.cfg.KinePool.MinRestart.Minutes())),
-			h.cfg.SuspectLogCadence)
-		h.cycles.WithLabelValues(checkKinePool, "ok").Inc()
+			conns, n, int(c.d.cfg.KinePool.MinRestart.Minutes())),
+			c.d.cfg.SuspectLogCadence)
+		c.d.cycles.WithLabelValues(checkKinePool, "ok").Inc()
 		return
 	}
 
-	switch h.cfg.KinePool.Mode {
+	switch c.d.cfg.KinePool.Mode {
 	case ModeEnforce:
-		h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"ACTION: kill kine pid=%d — conns-to-db=%d > %d x%d (k0s supervisor respawns with a clean pool)",
-			kpid, conns, h.cfg.KinePool.MaxConns, n))
-		h.state.RateSpend(fileRatePoolKill)
-		h.state.ResetCounter(fileCtrPool)
-		if err := h.cfg.killFn(kpid, syscall.SIGTERM); err != nil {
-			h.state.AppendLogWarn(fmt.Sprintf(
+			kpid, conns, c.d.cfg.KinePool.MaxConns, n))
+		c.d.state.RateSpend(fileRatePoolKill)
+		c.d.state.ResetCounter(fileCtrPool)
+		if err := c.d.cfg.killFn(kpid, syscall.SIGTERM); err != nil {
+			c.d.state.AppendLogWarn(fmt.Sprintf(
 				"suspect: kill kine pid=%d failed: %v", kpid, err))
 		}
-		h.actions.WithLabelValues(checkKinePool, "kill_kine").Inc()
+		c.d.actions.WithLabelValues(checkKinePool, "kill_kine").Inc()
 	case ModeDryRun:
-		h.state.AppendLog(fmt.Sprintf(
+		c.d.state.AppendLog(fmt.Sprintf(
 			"DRY-RUN: would kill kine pid=%d — conns-to-db=%d > %d x%d",
-			kpid, conns, h.cfg.KinePool.MaxConns, n))
-		h.actions.WithLabelValues(checkKinePool, "dryrun_kill").Inc()
+			kpid, conns, c.d.cfg.KinePool.MaxConns, n))
+		c.d.actions.WithLabelValues(checkKinePool, "dryrun_kill").Inc()
 	}
-	h.cycles.WithLabelValues(checkKinePool, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkKinePool, "ok").Inc()
 }
 
 // kineDBPort parses the datastore port out of kine's --endpoint argv:
 // `--endpoint=postgres://...:PORT/db`. Fallback 6432 when absent —
 // the same default the probe's shell header documents.
-func (h *Hygiene) kineDBPort(kpid int) int {
-	for _, arg := range h.proc.Cmdline(kpid) {
+func (c *kinePoolCheck) kineDBPort(kpid int) int {
+	for _, arg := range c.d.proc.Cmdline(kpid) {
 		if m := endpointPortRe.FindStringSubmatch(arg); m != nil {
 			if p, err := strconv.Atoi(m[1]); err == nil {
 				return p
 			}
 		}
 	}
-	return h.cfg.KinePool.DBPortFallback
+	return c.d.cfg.KinePool.DBPortFallback
 }
 
 // kineDBConns counts pid's TCP sockets whose remote port is dbPort —
 // the `ss -Htnp dport = :PORT | grep pid=` set: the pid's own socket
 // inodes (from /proc/<pid>/fd) intersected with the non-LISTEN rows
 // of its /proc/net/tcp(+tcp6) view.
-func (h *Hygiene) kineDBConns(pid, dbPort int) int {
-	inodes := h.socketInodes(pid)
+func (c *kinePoolCheck) kineDBConns(pid, dbPort int) int {
+	inodes := c.socketInodes(pid)
 	if len(inodes) == 0 {
 		return 0
 	}
 	n := 0
 	for _, f := range []string{"net/tcp", "net/tcp6"} {
-		data, err := os.ReadFile(h.proc.File(pid, f))
+		data, err := os.ReadFile(c.d.proc.File(pid, f))
 		if err != nil {
 			continue
 		}
@@ -133,14 +143,14 @@ func (h *Hygiene) kineDBConns(pid, dbPort int) int {
 
 // socketInodes returns the socket inode set of a process — the fd
 // symlinks of the form socket:[<inode>].
-func (h *Hygiene) socketInodes(pid int) map[string]bool {
-	entries, err := os.ReadDir(h.proc.File(pid, "fd"))
+func (c *kinePoolCheck) socketInodes(pid int) map[string]bool {
+	entries, err := os.ReadDir(c.d.proc.File(pid, "fd"))
 	if err != nil {
 		return nil
 	}
 	set := make(map[string]bool, len(entries))
 	for _, e := range entries {
-		link, err := os.Readlink(h.proc.File(pid, "fd", e.Name()))
+		link, err := os.Readlink(c.d.proc.File(pid, "fd", e.Name()))
 		if err != nil {
 			continue
 		}

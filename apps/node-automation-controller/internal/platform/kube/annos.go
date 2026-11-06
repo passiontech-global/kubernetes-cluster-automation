@@ -126,6 +126,15 @@ const (
 	// TaintKuredNodeReboot is the taint kured places on a node it is
 	// rebooting; metrics-server-patcher tolerates it.
 	TaintKuredNodeReboot = "weave.works/kured-node-reboot"
+	// AnnoFluxRequestedAt / AnnoFluxResetAt / AnnoFluxForceAt are
+	// flux's reconcile-control annotations —
+	// helmrelease-unlocker and flux-helmrelease-retries stamp them on
+	// HelmReleases and source objects to nudge a reconcile
+	// (resetAt/forceAt bump the counters flux checks so a retry it
+	// would otherwise dedupe goes through).
+	AnnoFluxRequestedAt = "reconcile.fluxcd.io/requestedAt"
+	AnnoFluxResetAt     = "reconcile.fluxcd.io/resetAt"
+	AnnoFluxForceAt     = "reconcile.fluxcd.io/forceAt"
 )
 
 // The third external key — weave.works/kured-node-lock, the reboot

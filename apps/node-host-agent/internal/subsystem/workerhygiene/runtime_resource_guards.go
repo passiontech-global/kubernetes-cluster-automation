@@ -51,10 +51,13 @@ import (
 )
 
 const (
-	// defaultCgroupRoot is the host cgroup-v2 unified hierarchy —
-	// the DaemonSet mounts host /sys/fs/cgroup at the same path
-	// under the host root like the other host-tree mounts.
-	defaultCgroupRoot = "/host/sys/fs/cgroup"
+	// defaultCgroupRoot is the host cgroup-v2 unified hierarchy as a
+	// host-absolute path — ConfigFromEnv resolves it through
+	// hostPath ("/host"-prefixed in the DaemonSet, verbatim on a
+	// standalone host) behind NODE_HOST_AGENT_CGROUP_ROOT;
+	// applyDefaults uses the constant verbatim so a direct-New
+	// caller gets the standalone path.
+	defaultCgroupRoot = "/sys/fs/cgroup"
 	// cgroupDyingThreshold is the nr_dying_descendants count above
 	// which dying cgroups are considered leaked — the level where
 	// cgroup-file walks and memory accounting visibly degrade
@@ -69,9 +72,13 @@ const (
 	// fewer pages).
 	cgroupReclaimBytes = "256M\n"
 
-	// defaultSystemdSessionsDir is the logind session state dir —
-	// one file per session plus .ref companions (skipped).
-	defaultSystemdSessionsDir = "/host/run/systemd/sessions"
+	// defaultSystemdSessionsDir is the logind session state dir as
+	// a host-absolute path — one file per session plus .ref
+	// companions (skipped). Same hostPath contract as
+	// defaultCgroupRoot: ConfigFromEnv resolves it through hostPath
+	// behind NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR; applyDefaults
+	// uses it verbatim for direct-New callers.
+	defaultSystemdSessionsDir = "/run/systemd/sessions"
 	// systemdSessionStaleAge is the "abandoned" evidence bar — a
 	// closing/abandoned session file untouched this long is stuck,
 	// not tearing down (logind rewrites the file on state change,

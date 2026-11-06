@@ -210,8 +210,8 @@ func kcmQueueStalled(prev, cur *kcmQueueSnapshot) bool {
 
 // loadKCMSnapshot returns the previous scrape's snapshot, or nil
 // when the file is absent/corrupt — inconclusive, never fires.
-func (h *Hygiene) loadKCMSnapshot() *kcmQueueSnapshot {
-	data := h.readState(fileKCMQueueSnap)
+func (c *cpFreezeCheck) loadKCMSnapshot() *kcmQueueSnapshot {
+	data := c.d.readState(fileKCMQueueSnap)
 	if data == "" {
 		return nil
 	}
@@ -225,12 +225,12 @@ func (h *Hygiene) loadKCMSnapshot() *kcmQueueSnapshot {
 // saveKCMSnapshot persists the scrape atomically (tmp+rename — the
 // writeEpochFile contract; a torn JSON just reads as "no baseline"
 // next cycle).
-func (h *Hygiene) saveKCMSnapshot(s *kcmQueueSnapshot) {
+func (c *cpFreezeCheck) saveKCMSnapshot(s *kcmQueueSnapshot) {
 	b, err := json.Marshal(s)
 	if err != nil {
 		return
 	}
-	dir := h.state.Dir
+	dir := c.d.state.Dir
 	tmp := filepath.Join(dir, ".tmp-"+fileKCMQueueSnap)
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		logger().Warn("controllerhygiene: kcm snapshot write failed",
@@ -247,48 +247,63 @@ func (h *Hygiene) saveKCMSnapshot(s *kcmQueueSnapshot) {
 // gate that proves only the controller components froze, not the whole
 // control plane. Falls back to the local apiserver when no peer is
 // configured (single-hub).
-func (h *Hygiene) peerHealthy(ctx context.Context) bool {
-	ep := h.cfg.Hub.PeerAPI
+func (c *cpFreezeCheck) peerHealthy(ctx context.Context) bool {
+	ep := c.d.cfg.Hub.PeerAPI
 	if ep == "" {
-		ep = h.cfg.Hub.SelfEndpoint
+		ep = c.d.cfg.Hub.SelfEndpoint
 	}
 	// ANY HTTP code = the apiserver event loop is alive
 	// (probee.HTTPAnyCode parity — a wedged apiserver is the wedge
 	// guard's problem, not this check's).
-	return h.cfg.probeFn(ctx, "https://"+ep+"/readyz")
+	return c.d.cfg.probeFn(ctx, "https://"+ep+"/readyz")
 }
 
-// checkCPFreeze — W8-CP3. Restart evidence is (a) KCM or scheduler
-// healthz dead for CPFreezeCycles consecutive cycles, or (b) a
-// stalled KCM workqueue (W10-FIX1 kcmQueueStalled) persisting past
+// cpFreezeCheck is the W8-CP3/W10-FIX1 freeze auto-heal as a
+// Check — its only in-memory state is the kcmQuietSince stamp kept
+// on deps; everything else is the consecutive-cp-freeze / kcm-queue
+// snapshot bookkeeping. It also owns the ungated-cycle dispatch
+// slot the W10-CP2 kine-storage and W10-CP5 kubeconfig-cert checks
+// ride (initChecks wires them in).
+type cpFreezeCheck struct {
+	d           *deps
+	kineStorage *kineStorageCheck
+	kubeCert    *kubeCertCheck
+}
+
+// Name returns the check label / log context.
+func (c *cpFreezeCheck) Name() string { return checkCPFreeze }
+
+// Run — W8-CP3. Restart evidence is (a) KCM or scheduler healthz dead
+// for CPFreezeCycles consecutive cycles, or (b) a stalled KCM
+// workqueue (W10-FIX1 kcmQueueStalled) persisting past
 // CPFreezeQuietFor. The restart only fires while the peer apiserver
 // stays healthy and honors Sig13Mode.
-func (h *Hygiene) checkCPFreeze(ctx context.Context) {
+func (c *cpFreezeCheck) Run(ctx context.Context) {
 	// W10-CP2/W10-CP5 ride this ungated cycle slot: Cycle()
-	// dispatch lives in controllerhygiene.go, so those checks
-	// are invoked from the first W8-CP entry point — same
-	// pre-uptime-gate position, every cycle.
-	h.checkKineStorageHealth(ctx)
-	h.checkKubeconfigCertExpiry(ctx)
+	// dispatch lives in check.go, so those checks are invoked
+	// from the first W8-CP entry point — same pre-uptime-gate
+	// position, every cycle.
+	c.kineStorage.Run(ctx)
+	c.kubeCert.Run(ctx)
 
-	kcmOK := h.cfg.cpHealthFn(ctx, h.cfg.CPFreeze.KCMHealthURL)
-	schedOK := h.cfg.cpHealthFn(ctx, h.cfg.CPFreeze.SchedHealthURL)
+	kcmOK := c.d.cfg.cpHealthFn(ctx, c.d.cfg.CPFreeze.KCMHealthURL)
+	schedOK := c.d.cfg.cpHealthFn(ctx, c.d.cfg.CPFreeze.SchedHealthURL)
 
 	frozen := false
 	reason := ""
 	switch {
 	case !kcmOK || !schedOK:
-		n := h.state.Incr(fileCtrCPFreeze)
-		if n >= h.cfg.CPFreeze.Cycles {
+		n := c.d.state.Incr(fileCtrCPFreeze)
+		if n >= c.d.cfg.CPFreeze.Cycles {
 			frozen = true
 			reason = fmt.Sprintf("healthz dead %dx (kcm=%v sched=%v)",
 				n, kcmOK, schedOK)
 		} else {
-			h.cycles.WithLabelValues(checkCPFreeze, "suspect").Inc()
+			c.d.cycles.WithLabelValues(checkCPFreeze, "suspect").Inc()
 			return
 		}
 	default:
-		h.state.ResetCounter(fileCtrCPFreeze)
+		c.d.state.ResetCounter(fileCtrCPFreeze)
 	}
 
 	// Leader-with-a-stalled-workqueue is an OR-condition: even with
@@ -299,75 +314,75 @@ func (h *Hygiene) checkCPFreeze(ctx context.Context) {
 	// already fire; every successful scrape refreshes the snapshot
 	// the next scrape compares against.
 	if !frozen {
-		body, err := h.cfg.kcmMetricsFn(ctx, h.cfg.CPFreeze.KCMMetricsURL)
+		body, err := c.d.cfg.kcmMetricsFn(ctx, c.d.cfg.CPFreeze.KCMMetricsURL)
 		stalled := false
 		if err == nil {
 			if snap, parsed := parseKCMQueueSnapshot(
-				body, h.cfg.nowFn().Unix()); parsed {
-				stalled = kcmQueueStalled(h.loadKCMSnapshot(), snap)
-				h.saveKCMSnapshot(snap)
+				body, c.d.cfg.nowFn().Unix()); parsed {
+				stalled = kcmQueueStalled(c.loadKCMSnapshot(), snap)
+				c.saveKCMSnapshot(snap)
 			}
 		}
 		if stalled {
-			if h.kcmQuietSince.IsZero() {
-				h.kcmQuietSince = h.cfg.nowFn()
-				h.state.Incr(fileCtrKCMQuiet)
+			if c.d.kcmQuietSince.IsZero() {
+				c.d.kcmQuietSince = c.d.cfg.nowFn()
+				c.d.state.Incr(fileCtrKCMQuiet)
 			}
-			if h.cfg.nowFn().Sub(h.kcmQuietSince) >= h.cfg.CPFreeze.QuietFor {
+			if c.d.cfg.nowFn().Sub(c.d.kcmQuietSince) >= c.d.cfg.CPFreeze.QuietFor {
 				frozen = true
 				reason = fmt.Sprintf("kcm workqueue stalled >%s",
-					h.cfg.CPFreeze.QuietFor)
+					c.d.cfg.CPFreeze.QuietFor)
 			}
 		} else {
-			h.kcmQuietSince = time.Time{}
-			h.state.ResetCounter(fileCtrKCMQuiet)
+			c.d.kcmQuietSince = time.Time{}
+			c.d.state.ResetCounter(fileCtrKCMQuiet)
 		}
 	}
 
 	if !frozen {
-		h.stateExit(stateCPComponentFrozen)
-		h.cycles.WithLabelValues(checkCPFreeze, "ok").Inc()
+		c.d.stateExit(stateCPComponentFrozen)
+		c.d.cycles.WithLabelValues(checkCPFreeze, "ok").Inc()
 		return
 	}
-	h.state.Enter(stateCPComponentFrozen, reason)
+	c.d.state.Enter(stateCPComponentFrozen, reason)
 	// Gate: the peer apiserver must still answer — otherwise the
 	// outage is bigger than a frozen component and the wedge guard
 	// owns the restart story.
-	if !h.peerHealthy(ctx) {
-		h.state.SuspectLog(stateCPComponentFrozen, fmt.Sprintf(
+	if !c.peerHealthy(ctx) {
+		c.d.state.SuspectLog(stateCPComponentFrozen, fmt.Sprintf(
 			"suspect: cp-component-frozen %s but peer apiserver unhealthy — wedge guard owns this, skip",
-			reason), h.cfg.SuspectLogCadence)
-		h.cycles.WithLabelValues(checkCPFreeze, "gated").Inc()
+			reason), c.d.cfg.SuspectLogCadence)
+		c.d.cycles.WithLabelValues(checkCPFreeze, "gated").Inc()
 		return
 	}
-	if !h.state.RateOK(fileRateCPRestart,
-		h.cfg.CPFreeze.MinRestart) {
-		h.state.SuspectLog(stateCPComponentFrozen, fmt.Sprintf(
+	if !c.d.state.RateOK(fileRateCPRestart,
+		c.d.cfg.CPFreeze.MinRestart) {
+		c.d.state.SuspectLog(stateCPComponentFrozen, fmt.Sprintf(
 			"suspect: cp-component-frozen %s but in restart cooldown (<%dm), skip",
-			reason, int(h.cfg.CPFreeze.MinRestart.Minutes())),
-			h.cfg.SuspectLogCadence)
-		h.cycles.WithLabelValues(checkCPFreeze, "cooldown").Inc()
+			reason, int(c.d.cfg.CPFreeze.MinRestart.Minutes())),
+			c.d.cfg.SuspectLogCadence)
+		c.d.cycles.WithLabelValues(checkCPFreeze, "cooldown").Inc()
 		return
 	}
-	switch h.cfg.Sig13.Mode {
+	switch c.d.cfg.Sig13.Mode {
 	case ModeEnforce:
-		h.state.AppendLog(
+		c.d.state.AppendLog(
 			"ACTION: restarting k0scontroller - cp-component-frozen " +
 				reason)
-		h.state.RateSpend(fileRateCPRestart)
-		h.state.ResetCounter(fileCtrCPFreeze)
-		h.state.ResetCounter(fileCtrKCMQuiet)
-		h.kcmQuietSince = time.Time{}
-		if err := h.cfg.restartFn(ctx, h.cfg.RestartUnit); err != nil {
-			h.state.AppendLogWarn(fmt.Sprintf(
-				"suspect: restart %s failed: %v", h.cfg.RestartUnit, err))
+		c.d.state.RateSpend(fileRateCPRestart)
+		c.d.state.ResetCounter(fileCtrCPFreeze)
+		c.d.state.ResetCounter(fileCtrKCMQuiet)
+		c.d.kcmQuietSince = time.Time{}
+		if err := c.d.cfg.restartFn(ctx, c.d.cfg.RestartUnit); err != nil {
+			c.d.state.AppendLogWarn(fmt.Sprintf(
+				"suspect: restart %s failed: %v", c.d.cfg.RestartUnit, err))
 		}
-		h.actions.WithLabelValues(checkCPFreeze, "restart_controller").Inc()
+		c.d.actions.WithLabelValues(checkCPFreeze, "restart_controller").Inc()
 	case ModeDryRun:
-		h.state.AppendLog(
+		c.d.state.AppendLog(
 			"DRY-RUN: would restart k0scontroller - cp-component-frozen " +
 				reason)
-		h.actions.WithLabelValues(checkCPFreeze, "dryrun_restart").Inc()
+		c.d.actions.WithLabelValues(checkCPFreeze, "dryrun_restart").Inc()
 	}
-	h.cycles.WithLabelValues(checkCPFreeze, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkCPFreeze, "ok").Inc()
 }

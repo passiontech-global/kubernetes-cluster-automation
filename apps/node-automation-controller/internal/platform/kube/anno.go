@@ -11,6 +11,7 @@
 package kube
 
 import (
+	"encoding/json"
 	"strconv"
 	"time"
 
@@ -58,4 +59,17 @@ func StampAnno(obj metav1.Object, key string, t time.Time) {
 	}
 	annos[key] = t.Format(time.RFC3339)
 	obj.SetAnnotations(annos)
+}
+
+// MergePatchAnnos builds a MergePatchType patch doc setting (or, for
+// a nil value, deleting) the given metadata.annotations keys —
+// collapses the json.Marshal({"metadata":{"annotations":{...}}})
+// boilerplate every stamp site hand-rolled. Stamp values are
+// RFC3339 by contract (the unix branch of ParseAnnoTime is read-
+// compat only); a nil value is the merge-patch delete used when a
+// budget/marker annotation must be cleared on heal.
+func MergePatchAnnos(annos map[string]any) ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"metadata": map[string]any{"annotations": annos},
+	})
 }

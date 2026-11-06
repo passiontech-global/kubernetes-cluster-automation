@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // ===========================================================================
@@ -488,26 +489,21 @@ func (d *deps) promTextfileDir() string {
 // host_oom_kills_total + conntrack_drops_detected_total read the
 // hostmetrics kmsg markers (cumulative — monotonic across restarts),
 // orphan_hostpath_{bytes,dirs} carry this cycle's ST2 measurement.
-// tmp+rename keeps node_exporter from reading a partial file.
+// promfile.Write stages + renames with payload/dir fsyncs — the
+// collector must never read a partial file (the other nine
+// textfile writers take the same path).
 func (d *deps) writeNodeAgentPromTextfile() {
 	dir := d.promTextfileDir()
 	fail := func(err error) {
 		d.state.AppendLog(fmt.Sprintf(
 			"suspect: node-agent prom textfile unwritable (dir=%s): %v", dir, err))
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		fail(err)
-		return
-	}
-	var b strings.Builder
-	gauge := func(name, help string, v float64) {
-		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s gauge\n%s %s\n",
-			name, help, name, name,
-			strconv.FormatFloat(v, 'f', -1, 64))
-	}
+	var b promfile.Builder
+	// Builder has no counter helper — a counter family is its
+	// header plus a bare `name v` sample line.
 	counter := func(name, help string, v int64) {
-		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s counter\n%s %d\n",
-			name, help, name, name, v)
+		b.HeaderType(name, help, "counter")
+		b.Line(fmt.Sprintf("%s %d", name, v))
 	}
 	if v, err := strconv.ParseInt(strings.TrimSpace(
 		readSmallFile(d.cfg.Host.OOMCountFile)), 10, 64); err == nil {
@@ -525,27 +521,27 @@ func (d *deps) writeNodeAgentPromTextfile() {
 		counter("node_agent_conntrack_drops_detected_total",
 			"nf_conntrack table-full records observed by the kernel dmesg scanner.", 0)
 	}
-	gauge("node_agent_orphan_hostpath_bytes",
+	b.Gauge("node_agent_orphan_hostpath_bytes",
 		"Bytes held by orphaned pvc-* hostPath dirs whose PV is gone.",
 		float64(d.orphanHostPathBytes))
-	gauge("node_agent_orphan_hostpath_dirs",
+	b.Gauge("node_agent_orphan_hostpath_dirs",
 		"Orphaned pvc-* hostPath dirs whose PV is gone from the apiserver.",
 		float64(d.orphanHostPathDirs))
 	// Runtime-resource guard series — the checks refresh these
 	// fields each cycle (counters accumulate in-agent).
-	gauge("node_agent_cgroup_dying_descendants",
+	b.Gauge("node_agent_cgroup_dying_descendants",
 		"nr_dying_descendants on the cgroup-v2 root / kubepods.slice (max of the two).",
 		float64(d.cgroupDyingDescendants))
 	counter("node_agent_cgroup_reclaim_runs_total",
 		"drop_caches + memory.reclaim reclaim runs for the cgroup-dying-leak guard.",
 		d.cgroupReclaimRuns)
-	gauge("node_agent_systemd_sessions_total",
+	b.Gauge("node_agent_systemd_sessions_total",
 		"logind session state files under /run/systemd/sessions.",
 		float64(d.systemdSessionsTotal))
-	gauge("node_agent_systemd_abandoned_sessions",
+	b.Gauge("node_agent_systemd_abandoned_sessions",
 		"logind sessions in STATE=closing/abandoned older than 2h.",
 		float64(d.systemdSessionsStale))
-	gauge("node_agent_systemd_dbus_latency_seconds",
+	b.Gauge("node_agent_systemd_dbus_latency_seconds",
 		"Wall time of `systemctl is-system-running` — the D-Bus round trip.",
 		d.systemdDbusLatencySec)
 	counter("node_agent_systemd_sessions_reaped_total",
@@ -554,16 +550,16 @@ func (d *deps) writeNodeAgentPromTextfile() {
 	counter("node_agent_overlayfs_stale_mounts_total",
 		"Stale-overlay (ESTALE/missing lowerdir) pod detections on this node.",
 		d.overlayfsStaleMounts)
-	gauge("node_agent_disk_io_util_ratio",
+	b.Gauge("node_agent_disk_io_util_ratio",
 		"Whole-disk io_ticks utilization, max across devices, per cycle delta.",
 		d.diskIOUtilRatio)
-	gauge("node_agent_disk_write_await_ms",
+	b.Gauge("node_agent_disk_write_await_ms",
 		"Average write await in ms across whole disks, per cycle delta.",
 		d.diskWriteAwaitMs)
-	gauge("node_agent_io_psi_full_avg60",
+	b.Gauge("node_agent_io_psi_full_avg60",
 		"/proc/pressure/io full avg60 (percent of wall time all tasks stalled on IO).",
 		d.ioPSIFullAvg60)
-	gauge("node_agent_io_psi_full_avg300",
+	b.Gauge("node_agent_io_psi_full_avg300",
 		"/proc/pressure/io full avg300 (percent of wall time all tasks stalled on IO).",
 		d.ioPSIFullAvg300)
 	counter("node_agent_io_throttled_procs_total",
@@ -572,13 +568,8 @@ func (d *deps) writeNodeAgentPromTextfile() {
 	counter("node_agent_conntrack_liberal_fixes_total",
 		"nf_conntrack_tcp_be_liberal 0→1 fixes written on neb1 nodes.",
 		d.conntrackLiberalFixes)
-	name := "node-agent-hygiene.prom"
-	tmp := filepath.Join(dir, "."+name+".tmp")
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
-		fail(err)
-		return
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, name)); err != nil {
+	if err := promfile.Write(dir, "node-agent-hygiene.prom",
+		[]byte(b.String())); err != nil {
 		fail(err)
 	}
 }

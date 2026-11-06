@@ -44,75 +44,85 @@ func tlsDialCert(ctx context.Context, addr string) (*x509.Certificate, error) {
 	return state.PeerCertificates[0], nil
 }
 
-// checkPKIReloadDrift — W8-CP4. For each pair: read the on-disk leaf
-// and the socket-presented leaf; drift means the file describes a
-// NEWER cert (later NotAfter, or different serial with a not-older
-// NotAfter) than the socket serves. Drift held for PKIDriftCycles
-// consecutive cycles latches the state and restarts the owning unit
-// under the last-cp-cert-restart budget.
-func (h *Hygiene) checkPKIReloadDrift(ctx context.Context) {
+// pkiDriftCheck is the W8-CP4 PKI reload drift detector as a
+// Check — stateless: per-pair streaks live in the
+// consecutive-cp-cert-stale-<i> counters.
+type pkiDriftCheck struct {
+	d *deps
+}
+
+// Name returns the check label / log context.
+func (c *pkiDriftCheck) Name() string { return checkPKIDrift }
+
+// Run — W8-CP4. For each pair: read the on-disk leaf and the
+// socket-presented leaf; drift means the file describes a NEWER cert
+// (later NotAfter, or different serial with a not-older NotAfter)
+// than the socket serves. Drift held for PKIDriftCycles consecutive
+// cycles latches the state and restarts the owning unit under the
+// last-cp-cert-restart budget.
+func (c *pkiDriftCheck) Run(ctx context.Context) {
 	anyDrift := false
-	for i, pair := range h.cfg.PKIDrift.Pairs {
+	for i, pair := range c.d.cfg.PKIDrift.Pairs {
 		ctr := fileCtrPKIDriftPre + strconv.Itoa(i)
 		disk, err := readLeafCert(pair.CertFile)
 		if err != nil {
 			// Cert absent — not a controller / pair not deployed on
 			// this host. Reset rather than carry a stale count.
-			h.state.ResetCounter(ctr)
+			c.d.state.ResetCounter(ctr)
 			continue
 		}
-		sock, err := h.cfg.tlsCertFn(ctx, pair.Addr)
+		sock, err := c.d.cfg.tlsCertFn(ctx, pair.Addr)
 		if err != nil {
 			// Socket down is someone else's check — the drift
 			// comparison is inconclusive, not evidence.
-			h.state.ResetCounter(ctr)
+			c.d.state.ResetCounter(ctr)
 			continue
 		}
 		if !certNewerThan(disk, sock) {
-			h.state.ResetCounter(ctr)
+			c.d.state.ResetCounter(ctr)
 			continue
 		}
 		anyDrift = true
-		n := h.state.Incr(ctr)
-		if n < h.cfg.PKIDrift.Cycles {
+		n := c.d.state.Incr(ctr)
+		if n < c.d.cfg.PKIDrift.Cycles {
 			continue
 		}
-		h.state.Enter(statePKIReloadStale, fmt.Sprintf(
+		c.d.state.Enter(statePKIReloadStale, fmt.Sprintf(
 			"%s newer than %s (disk notAfter=%s socket=%s)",
 			pair.CertFile, pair.Addr,
 			disk.NotAfter.UTC().Format(time.RFC3339),
 			sock.NotAfter.UTC().Format(time.RFC3339)))
-		if !h.state.RateOK(fileRatePKIRestart,
-			h.cfg.PKIDrift.RestartInterval) {
-			h.state.SuspectLog(statePKIReloadStale, fmt.Sprintf(
+		if !c.d.state.RateOK(fileRatePKIRestart,
+			c.d.cfg.PKIDrift.RestartInterval) {
+			c.d.state.SuspectLog(statePKIReloadStale, fmt.Sprintf(
 				"suspect: cp-cert-reload-stale %s but in restart cooldown (<%dm), skip",
-				pair.CertFile, int(h.cfg.PKIDrift.RestartInterval.Minutes())),
-				h.cfg.SuspectLogCadence)
+				pair.CertFile, int(c.d.cfg.PKIDrift.RestartInterval.Minutes())),
+				c.d.cfg.SuspectLogCadence)
 			continue
 		}
-		switch h.cfg.Sig13.Mode {
+		switch c.d.cfg.Sig13.Mode {
 		case ModeEnforce:
-			h.state.AppendLog(fmt.Sprintf(
+			c.d.state.AppendLog(fmt.Sprintf(
 				"ACTION: restarting %s - cp-cert-reload-stale %s newer than %s",
 				pair.Unit, pair.CertFile, pair.Addr))
-			h.state.RateSpend(fileRatePKIRestart)
-			h.state.ResetCounter(ctr)
-			if err := h.cfg.restartFn(ctx, pair.Unit); err != nil {
-				h.state.AppendLogWarn(fmt.Sprintf(
+			c.d.state.RateSpend(fileRatePKIRestart)
+			c.d.state.ResetCounter(ctr)
+			if err := c.d.cfg.restartFn(ctx, pair.Unit); err != nil {
+				c.d.state.AppendLogWarn(fmt.Sprintf(
 					"suspect: restart %s failed: %v", pair.Unit, err))
 			}
-			h.actions.WithLabelValues(checkPKIDrift, "restart_unit").Inc()
+			c.d.actions.WithLabelValues(checkPKIDrift, "restart_unit").Inc()
 		case ModeDryRun:
-			h.state.AppendLog(fmt.Sprintf(
+			c.d.state.AppendLog(fmt.Sprintf(
 				"DRY-RUN: would restart %s - cp-cert-reload-stale %s",
 				pair.Unit, pair.CertFile))
-			h.actions.WithLabelValues(checkPKIDrift, "dryrun_restart").Inc()
+			c.d.actions.WithLabelValues(checkPKIDrift, "dryrun_restart").Inc()
 		}
 	}
 	if !anyDrift {
-		h.stateExit(statePKIReloadStale)
+		c.d.stateExit(statePKIReloadStale)
 	}
-	h.cycles.WithLabelValues(checkPKIDrift, "ok").Inc()
+	c.d.cycles.WithLabelValues(checkPKIDrift, "ok").Inc()
 }
 
 // certNewerThan reports whether disk is a rotated-newer cert the

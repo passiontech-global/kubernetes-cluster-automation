@@ -248,6 +248,10 @@ type HostConfig struct {
 // already-shared roots (ProcRoot for diskstats/PSI/sysctls,
 // WatchdogStateDir for markers, SysClassNet for the neb1 gate).
 type RuntimeConfig struct {
+	// Both paths default through ConfigFromEnv: hostPath-joined
+	// defaults behind NODE_HOST_AGENT_CGROUP_ROOT /
+	// NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR; a direct-New caller
+	// gets the unprefixed host paths from applyDefaults.
 	CgroupRoot  string // cgroup v2 root ("/host/sys/fs/cgroup" in-pod)
 	SessionsDir string // /run/systemd/sessions on the host
 }
@@ -607,6 +611,9 @@ func (hc *HostConfig) applyDefaults(stateDir string) {
 	}
 }
 
+// applyDefaults fills the unprefixed host paths for direct-New
+// callers — ConfigFromEnv already resolved both knobs through
+// hostPath, so a non-empty field is never touched.
 func (r *RuntimeConfig) applyDefaults() {
 	if r.CgroupRoot == "" {
 		r.CgroupRoot = defaultCgroupRoot

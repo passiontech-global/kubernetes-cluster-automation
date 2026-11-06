@@ -63,7 +63,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -274,17 +273,14 @@ var (
 )
 
 // Hygiene runs the controller guards on one ticker plus the feeder
-// loop.
+// loop. It is the orchestrator only: everything the checks consume
+// (config, procfs view, mTLS client, state store, journal tracker,
+// rate mutex, metric vecs/gauges, cross-check shared state) lives
+// on the embedded *deps — see deps.go. The embed keeps the
+// pre-Check test contract compiling: h.cfg, h.state, h.journalReads,
+// h.cycles etc. promote through it.
 type Hygiene struct {
-	cfg    Config
-	proc   procfs.FS    // /proc view bound to cfg.ProcRoot
-	client *http.Client // mTLS client for rv probes; nil when creds absent
-	credFP string       // credential-file fingerprint the client was built from
-
-	// state is the shared hoststate Store — every state-*/last-*/
-	// consecutive-*/last-suspect-* file and the watchdog log append
-	// goes through it (the single lib.sh-parity implementation).
-	state *hoststate.Store
+	*deps
 
 	// feederOnce keeps the feeder single-flight: the agent
 	// supervisor re-invokes Run on the same ctx after a Cycle
@@ -292,28 +288,6 @@ type Hygiene struct {
 	// duplicate sd_notify plus duplicate runRemediate passes
 	// (routeGuardOnce parity, nethealth.go).
 	feederOnce sync.Once
-	// rateMu serialises the remediate G5 check + G6 budget spend:
-	// the last-restart epoch file stays the cross-process contract,
-	// but the in-process read-compare-write still needs a mutex or
-	// two overlapping remediate passes can both see "allowed" in
-	// the same window (TOCTOU double-restart). Held only around
-	// the file check+mkdir+write, never across systemctl —
-	// workerhygiene rateTrySpend parity.
-	rateMu sync.Mutex
-
-	// journalReads is the journal-unreadable accounting — every
-	// journalText result is classified into it; the tracker fires the
-	// state-journal-unreadable latch on persistent blindness.
-	journalReads journalwatch.Tracker
-
-	// wdApplied records the watchdogconf parse the conf-derived knobs
-	// were last refreshed from — BUG-H9's "only move fields that still
-	// carry the previous conf value" rule needs the previous parse.
-	wdApplied *watchdogconf.Config
-	// kcmQuietSince is the first cycle the KCM read leader+idle —
-	// leader-without-workers only counts as frozen after
-	// CPFreezeQuietFor (W8-CP3).
-	kcmQuietSince time.Time
 
 	// groups is the ordered per-Cycle dispatch table — initChecks
 	// fills it; the ungated-then-uptime-gated grouping preserves
@@ -321,17 +295,18 @@ type Hygiene struct {
 	// WD_REQUIRES:uptime).
 	groups []checks.Group
 
-	cycles    *prometheus.CounterVec // check, result
-	actions   *prometheus.CounterVec // check, action
-	rvGap     prometheus.Gauge
-	kineConns prometheus.Gauge
-	oomWindow prometheus.Gauge
-	feeding   prometheus.Gauge
-	// etcdguard gauges — only set when <K0sDir>/bin/etcdctl +
-	// pki/etcd/ca.crt exist (embedded-etcd controllers).
-	etcdDBSize  prometheus.Gauge
-	etcdDBUse   prometheus.Gauge
-	etcdNospace prometheus.Gauge
+	// The checks are also named fields so tests and the old-shape
+	// forwarders can reach them (workerhygiene parity). The
+	// dispatch-table order — not field order — is load-bearing.
+	kinePool    *kinePoolCheck
+	oomLoop     *oomLoopCheck
+	etcd        *etcdGuardCheck
+	cpFreeze    *cpFreezeCheck
+	pkiDrift    *pkiDriftCheck
+	hub         *apiserverHubCheck
+	kineTTL     *kineTTLCheck
+	kineStorage *kineStorageCheck
+	kubeCert    *kubeCertCheck
 }
 
 // ShouldRun reports whether hostRoot looks like a k0s controller
@@ -349,65 +324,66 @@ func ShouldRun(hostRoot string) bool {
 // New returns a Hygiene and registers its metrics on reg.
 func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	cfg.applyDefaults()
-	h := &Hygiene{cfg: cfg, proc: procfs.New(cfg.ProcRoot)}
-	// The Now closure must read h.cfg.nowFn at call time — tests
+	d := &deps{cfg: cfg, proc: procfs.New(cfg.ProcRoot)}
+	// The Now closure must read d.cfg.nowFn at call time — tests
 	// re-stub the clock after New() and the store has to observe it
 	// (hoststate.Store.Now contract).
-	h.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
-		func() time.Time { return h.cfg.nowFn() }, logger)
-	h.journalReads = journalwatch.Tracker{
+	d.state = hoststate.New(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
+		func() time.Time { return d.cfg.nowFn() }, logger)
+	d.journalReads = journalwatch.Tracker{
 		Needed: cfg.JournalUnreadableNeeded,
 		Dirs:   cfg.JournalDirs,
 	}
 	if cfg.HTTPClient != nil {
-		h.client = cfg.HTTPClient
+		d.client = cfg.HTTPClient
 	}
 
-	h.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
+	d.cycles = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_controllerhygiene_cycles_total",
 		Help: "Controller-hygiene cycles by check and result (ok|abort|gated).",
 	}, []string{"check", "result"})
-	h.actions = prometheus.NewCounterVec(prometheus.CounterOpts{
+	d.actions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_host_agent_controllerhygiene_actions_total",
 		Help: "Remediation actions by check and action " +
 			"(restart_controller|dryrun|kill_kine|shield|unshield|remediate).",
 	}, []string{"check", "action"})
-	h.rvGap = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.rvGap = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_rv_gap",
 		Help: "Last observed rv_now - rv_cache on the local apiserver.",
 	})
-	h.kineConns = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.kineConns = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_kine_db_conns",
 		Help: "Kine process TCP connections to the datastore port.",
 	})
-	h.oomWindow = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.oomWindow = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_oom_kills_window",
 		Help: "memcg OOM kills inside the sliding window.",
 	})
-	h.feeding = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.feeding = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_feeder_feeding",
 		Help: "1 while the feeder sends WATCHDOG=1 to systemd.",
 	})
-	h.etcdDBSize = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.etcdDBSize = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_etcd_db_size_bytes",
 		Help: "Embedded-etcd DB file size from the last etcdctl " +
 			"endpoint status probe (embedded-etcd controllers only).",
 	})
-	h.etcdDBUse = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.etcdDBUse = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_etcd_db_in_use_bytes",
 		Help: "Embedded-etcd DB size in use from the last etcdctl " +
 			"endpoint status probe (embedded-etcd controllers only).",
 	})
-	h.etcdNospace = prometheus.NewGauge(prometheus.GaugeOpts{
+	d.etcdNospace = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_host_agent_controllerhygiene_etcd_nospace_alarm",
 		Help: "1 while the embedded etcd carries a NOSPACE alarm " +
 			"(embedded-etcd controllers only).",
 	})
 
+	h := &Hygiene{deps: d}
 	if reg != nil {
 		for _, c := range []prometheus.Collector{
-			h.cycles, h.actions, h.rvGap, h.kineConns, h.oomWindow, h.feeding,
-			h.etcdDBSize, h.etcdDBUse, h.etcdNospace,
+			d.cycles, d.actions, d.rvGap, d.kineConns, d.oomWindow, d.feeding,
+			d.etcdDBSize, d.etcdDBUse, d.etcdNospace,
 		} {
 			if err := reg.Register(c); err != nil {
 				return nil, fmt.Errorf("register controllerhygiene metrics: %w", err)
@@ -475,49 +451,6 @@ func (h *Hygiene) runCycle(ctx context.Context) {
 		h.state.AppendLogWarn(fmt.Sprintf(
 			"controllerhygiene: cycle deadline %s exceeded — "+
 				"stalled check(s) aborted", h.cfg.CycleTimeout))
-	}
-}
-
-// initChecks builds the ordered dispatch table Cycle drives — the
-// workerhygiene initChecks pattern. Order + grouping are
-// load-bearing: the 60s-timer guards (kine pool, OOM loop) had no
-// uptime gate in shell and run first; only the module-22 checks
-// carried WD_REQUIRES: uptime. The controllerhygiene checks carry
-// no WD_SIG kill switch (the shell timers had none) — Dispatch gets
-// a nil sigOn and every entry runs.
-func (h *Hygiene) initChecks() {
-	h.groups = []checks.Group{
-		{
-			Entries: []checks.Entry{
-				{Name: checkKinePool, Run: h.checkKinePool},
-				{Name: checkOOMLoop, Run: h.checkOOMLoop},
-				// etcdguard is in the ungated group like
-				// kine-pool/oomloop — an embedded etcd that hit
-				// quota during boot needs the guard BEFORE the
-				// 20min wedge grace, and hosts without etcdctl
-				// no-op.
-				{Name: checkEtcd, Run: h.checkEtcdQuota},
-				// W8-CP3/CP4 are ungated like the 60s-timer
-				// guards: a frozen KCM/scheduler or a stale PKI
-				// reload must not wait out the module-22 boot
-				// grace — both probes are read-only until their
-				// own consecutive-cycle + rate budgets pass.
-				{Name: checkCPFreeze, Run: h.checkCPFreeze},
-				{Name: checkPKIDrift, Run: h.checkPKIReloadDrift},
-			},
-		},
-		{
-			// WD_REQUIRES: uptime unit:k0scontroller — 20min
-			// grace after boot before the destructive wedge/TTL
-			// checks. The skip counts ONCE under checkHub —
-			// the label the gated cycle always reported.
-			GateOK:    h.uptimeOK,
-			GateLabel: checkHub,
-			Entries: []checks.Entry{
-				{Name: checkHub, Run: h.checkApiserverHub},
-				{Name: checkKineTTL, Run: h.checkKineTTL},
-			},
-		},
 	}
 }
 

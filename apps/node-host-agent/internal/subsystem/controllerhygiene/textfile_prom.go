@@ -26,11 +26,11 @@ var textfileDirOverride = ""
 // <hostRoot>/var/lib/node-exporter/textfile (DaemonSet:
 // /host/var/lib/..., standalone: /var/lib/...). The override wins
 // for tests.
-func (h *Hygiene) textfilePromDir() string {
+func (d *deps) textfilePromDir() string {
 	if textfileDirOverride != "" {
 		return textfileDirOverride
 	}
-	return filepath.Join(filepath.Dir(h.cfg.K0sDir),
+	return filepath.Join(filepath.Dir(d.cfg.K0sDir),
 		"node-exporter", "textfile")
 }
 
@@ -38,11 +38,11 @@ func (h *Hygiene) textfilePromDir() string {
 // (promfile.Write: tmp+rename — node_exporter only reads complete
 // .prom files). Failures go through suspectLog — a broken/missing
 // mount must not spam the watchdog tail every cycle.
-func (h *Hygiene) writeTextfileProm(name, content string) {
-	dir := h.textfilePromDir()
+func (d *deps) writeTextfileProm(name, content string) {
+	dir := d.textfilePromDir()
 	if err := promfile.Write(dir, name, []byte(content)); err != nil {
-		h.state.SuspectLog("textfile-prom", fmt.Sprintf(
+		d.state.SuspectLog("textfile-prom", fmt.Sprintf(
 			"textfile prom %s unwritable (dir=%s): %v", name, dir, err),
-			h.cfg.SuspectLogCadence)
+			d.cfg.SuspectLogCadence)
 	}
 }

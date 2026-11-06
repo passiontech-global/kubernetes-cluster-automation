@@ -173,10 +173,11 @@ type Config struct {
 	// exec-storm cap for sustained DEL-event floods.
 	routeMinRestore time.Duration
 	// openRouteSocket overrides the route guard's NETLINK_ROUTE
-	// socket factory — default binds RTMGRP_IPV4_ROUTE|RTMGRP_IPV4_RULE
-	// in the host netns: directly when the pod netns IS the host's
-	// (hostNetwork, same inode as /proc/1/ns/net), else setns into
-	// pid-1's netns (hostPID — no /host/proc mount needed).
+	// socket factory — default is platform/routewatch.Bind: binds
+	// RTMGRP_IPV4_ROUTE|RTMGRP_IPV4_RULE in the host netns, directly
+	// when the pod netns IS the host's (hostNetwork, same inode as
+	// /proc/1/ns/net), else setns into pid-1's netns (hostPID — no
+	// /host/proc mount needed).
 	openRouteSocket func() (int, error)
 	// sysClassNet is the sysfs net-device dir the route guard
 	// resolves the nebula dev's ifindex from — the netns the bound
