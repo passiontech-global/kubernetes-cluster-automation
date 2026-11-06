@@ -187,3 +187,34 @@ func MaintenanceActive(ctx context.Context, cs kubernetes.Interface, dyn dynamic
 	}
 	return false, "", nil
 }
+
+// VerdictTTL is how long a Verdict reuses one MaintenanceActive
+// evaluation — sized to cover a sweep's per-target heal preambles
+// without letting a drain that starts mid-incident go unseen past
+// the next cycle.
+const VerdictTTL = time.Minute
+
+// Verdict memoizes one MaintenanceActive evaluation for VerdictTTL —
+// heal loops that run the mutex once per target would otherwise pay
+// three API reads (node list, kured DS get, autopilot plan list) per
+// pod. Zero value is ready (expired — evaluates on first call); an
+// error verdict is sticky for the window too, matching the
+// fail-closed contract of a fresh check.
+type Verdict struct {
+	at   time.Time
+	held bool
+	why  string
+	err  error
+}
+
+// Active returns the maintenance verdict, evaluating
+// MaintenanceActive only when the memo is older than VerdictTTL.
+func (v *Verdict) Active(ctx context.Context, cs kubernetes.Interface,
+	dyn dynamic.Interface, now time.Time) (bool, string, error) {
+	if now.Sub(v.at) < VerdictTTL {
+		return v.held, v.why, v.err
+	}
+	v.held, v.why, v.err = MaintenanceActive(ctx, cs, dyn)
+	v.at = now
+	return v.held, v.why, v.err
+}
