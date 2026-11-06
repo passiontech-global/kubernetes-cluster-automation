@@ -19,6 +19,14 @@
 // is legitimately absent — every read failing is configuration, not
 // a fault.
 //
+// The streak is RAM by default; callers that wire Counter +
+// CounterName persist it as a consecutive-* file in the watchdog
+// state dir (and bind LatchedSeed to their latch file's existence)
+// so an agent restart mid-episode resumes the count instead of
+// re-arming at zero — a restart during a broken-journald episode
+// used to silently reset the budget and delay the latch by another
+// full Needed streak.
+//
 // json.go holds the package's second piece: the `journalctl -o
 // json` line decode + since-cursor fetch shared by the NPD
 // journald-plugin ports (nodereporter's kubelet-stale monitor and
@@ -28,6 +36,8 @@ package journalwatch
 import (
 	"os"
 	"strings"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
 
 // DefaultNeeded is the consecutive-failed-read budget before the
@@ -54,8 +64,24 @@ type Tracker struct {
 	// Stat probes dir existence; nil → os.Stat (test seam).
 	Stat func(string) (os.FileInfo, error)
 
+	// Counter, when non-nil (and its Dir non-empty), persists the
+	// consecutive-failure streak to <dir>/<CounterName> — a
+	// consecutive-* file in the watchdog state dir — so an agent
+	// restart mid-episode resumes the count instead of re-arming at
+	// zero. RAM stays the fallback when a write fails (Incr's 0
+	// return): the file is the restart witness, RAM the fast path.
+	Counter     *hoststate.Store
+	CounterName string
+	// LatchedSeed, when non-nil, is consulted ONCE before the first
+	// NoteRead — callers bind it to their latch file's existence so
+	// a restart while latched resumes latched: the first healthy
+	// read then exits and clears the stale state-* file instead of
+	// it lingering to the janitor's 24h reap.
+	LatchedSeed func() bool
+
 	fails   int
 	latched bool
+	seeded  bool
 }
 
 func (t *Tracker) needed() int {
@@ -63,6 +89,35 @@ func (t *Tracker) needed() int {
 		return DefaultNeeded
 	}
 	return t.Needed
+}
+
+// counterWired reports whether the persistence pair is usable: a
+// "" Counter.Dir would write bare filenames into the process CWD
+// (never do that) and a "" name has no file to write, so either
+// disables the file half entirely — RAM-only tracking, the
+// pre-persistence behavior.
+func (t *Tracker) counterWired() bool {
+	return t.Counter != nil && t.Counter.Dir != "" && t.CounterName != ""
+}
+
+// seed loads the persisted state once, lazily on the first NoteRead:
+// the streak resumes from <dir>/<CounterName> and the latch from
+// LatchedSeed (bound by the caller to its state-* file's existence)
+// so an agent restart mid-episode continues where the previous
+// process left off. Fails()/Latched() deliberately do NOT seed —
+// they are pure accessors, and seeding-on-read would let a debug
+// peek consume the one-shot restore before the first real verdict.
+func (t *Tracker) seed() {
+	if t.seeded {
+		return
+	}
+	t.seeded = true
+	if t.counterWired() {
+		t.fails = t.Counter.Counter(t.CounterName)
+	}
+	if t.LatchedSeed != nil {
+		t.latched = t.LatchedSeed()
+	}
 }
 
 // Present reports whether any configured journal storage dir
@@ -97,8 +152,12 @@ func (t *Tracker) Present() bool {
 //     journal storage vanished while latched — the config changed,
 //     not the blindness) — the caller clears the latch (STATE-EXIT).
 func (t *Tracker) NoteRead(ok bool) (enter, exit bool) {
+	t.seed()
 	if ok {
 		t.fails = 0
+		if t.counterWired() {
+			t.Counter.ResetCounter(t.CounterName)
+		}
 		if t.latched {
 			t.latched = false
 			return false, true
@@ -106,6 +165,16 @@ func (t *Tracker) NoteRead(ok bool) (enter, exit bool) {
 		return false, false
 	}
 	t.fails++
+	if t.counterWired() {
+		// The file is authoritative — Incr returns the new on-disk
+		// value, so a sibling tracker sharing this counter moves
+		// this streak too. A 0 return means the write failed (dir
+		// gone, disk full): keep the RAM count, never invent a
+		// streak.
+		if n := t.Counter.Incr(t.CounterName); n > 0 {
+			t.fails = n
+		}
+	}
 	if t.latched {
 		if !t.Present() {
 			t.latched = false

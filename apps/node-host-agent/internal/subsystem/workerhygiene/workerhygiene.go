@@ -162,6 +162,17 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	d.JournalReads = journalwatch.Tracker{
 		Needed: cfg.Journal.UnreadableNeeded,
 		Dirs:   cfg.Journal.Dirs,
+		// The streak survives an agent restart: consecutive-
+		// journal-unreadable in the state dir is the restart witness,
+		// LatchedSeed re-reads the latch file so a restart while
+		// latched resumes latched. The counter name is shared with
+		// controllerhygiene ON PURPOSE — both own the same
+		// state-journal-unreadable latch file, so the streak that
+		// arms it is shared too (either subsystem's failed reads
+		// count toward the one episode).
+		Counter:     d.State,
+		CounterName: "consecutive-journal-unreadable",
+		LatchedSeed: func() bool { return d.State.Exists(wdeps.StateJournalUnreadable) },
 	}
 
 	d.Cycles = prometheus.NewCounterVec(prometheus.CounterOpts{

@@ -82,6 +82,16 @@ func (p *Prober) Cycle(ctx context.Context) {
 
 	// Resolved once per cycle: "" disables every watchdog file op.
 	wdir := p.watchdogDir()
+	// Persist every backend state at cycle end — deferred so the
+	// mid-loop ctx.Err() return and every other early path still
+	// flush the partial round's counters: a shutdown must not drop
+	// a wedge streak that was one cycle from firing (the files are
+	// the restart witness, see loadState).
+	defer func() {
+		if wdir != "" {
+			p.flushStates(wdir)
+		}
+	}()
 
 	fresh := 0                 // direct backends fresh AND usable this cycle (drain fence)
 	stale := map[string]bool{} // name → wedged/dead this cycle
@@ -94,6 +104,13 @@ func (p *Prober) Cycle(ctx context.Context) {
 		}
 		statusByName[b.Name] = b
 		st := p.stateFor(b.Name)
+		if wdir != "" && !st.loaded {
+			// Restart witness: fold the persisted apibe-* counters
+			// in once per backend per process lifetime — BEFORE the
+			// vip() continue so a *_lb entry's drained marker
+			// restores too.
+			p.loadState(wdir, b.Name, st)
+		}
 		if b.vip() {
 			vips = append(vips, b)
 			continue
@@ -480,7 +497,7 @@ func (p *Prober) Cycle(ctx context.Context) {
 	// or empty scan must not wipe latches/counters/metric series the
 	// next good scan still needs).
 	if len(backends) > 0 {
-		p.pruneStaleBackends(backends)
+		p.pruneStaleBackends(wdir, backends)
 		if wdir != "" {
 			p.pruneWatchdogFiles(wdir, backends)
 		}
