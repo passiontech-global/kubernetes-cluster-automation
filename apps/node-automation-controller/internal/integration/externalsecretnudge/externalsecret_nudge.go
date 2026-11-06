@@ -19,10 +19,10 @@
 // `force-sync=<unix>` — the literal annotation key ESO watches; a
 // changed value forces an immediate reconcile that skips the
 // remaining backoff. Rate-limited to one nudge per ES per hour by
-// BOTH the in-memory ledger and the persisted stamp itself — an ES
-// whose force-sync (or passiontech.dev/last-es-nudge) is younger than an
-// hour is already poked, so a flapping store cannot stampede the API
-// even across controller restarts.
+// the persisted stamp itself — an ES whose force-sync (or
+// passiontech.dev/last-es-nudge) is younger than an hour is already
+// poked, so a flapping store cannot stampede the API even across
+// controller restarts.
 package externalsecretnudge
 
 import (
@@ -93,11 +93,6 @@ type externalSecretNudge struct {
 	// storeReady: clustersecretstore name → last observed Ready state.
 	// Seeded on first sight; the False→True edge is what fires nudges.
 	storeReady map[string]bool
-	// nudged: ns/name → last force-sync stamp — the 1/hour rate
-	// limit. CooldownSet is zero-value ready and deliberately
-	// unbounded: stamps for vanished ESs are dead weight that age
-	// out of the window on their own.
-	nudged state.CooldownSet
 	// storeDownSince: store key → first sweep that observed
 	// Ready=False — the persistence clock for the connect auto-heal
 	// (a transient first False must not bounce the pod).
@@ -107,9 +102,9 @@ type externalSecretNudge struct {
 	stormSince time.Time
 	// connectHeals: last delivered connect-pod bounce — the 1/hour
 	// cooldown keyed on the heal target (esConnectPodPrefix).
-	// In-memory only, like nudged: a restart re-arms it, which is
-	// safe because the heal still needs 15m of fresh down/storm
-	// observations first.
+	// In-memory only: a restart re-arms it, which is safe because
+	// the heal still needs 15m of fresh down/storm observations
+	// first.
 	connectHeals state.CooldownSet
 }
 

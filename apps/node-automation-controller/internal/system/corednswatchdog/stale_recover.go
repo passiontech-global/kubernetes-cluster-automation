@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,15 +29,15 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 		return fmt.Errorf("get deployment %s/coredns: %w", corednsNS, err)
 	}
 	// Cooldown lives on Deployment metadata — patching it does not
-	// roll the pods (unlike a pod-template annotation).
-	if last, ok := deploy.Annotations[corednsTSAnno]; ok {
-		if ts, err := strconv.ParseInt(last, 10, 64); err == nil {
-			if ago := w.now.Now().Unix() - ts; ago < corednsCooldownS {
-				metrics.IncError(w.queue)
-				log.Info("SKIP recovery: inside cooldown",
-					"pods", suspects, "agoS", ago, "cooldownS", corednsCooldownS)
-				return nil
-			}
+	// roll the pods (unlike a pod-template annotation). AnnoTime
+	// accepts the new RFC3339 stamps AND the legacy unix ones still
+	// live on older objects.
+	if last, ok := kube.AnnoTime(deploy, corednsTSAnno); ok {
+		if ago := w.now.Now().Sub(last); ago < corednsCooldownS*time.Second {
+			metrics.IncError(w.queue)
+			log.Info("SKIP recovery: inside cooldown",
+				"pods", suspects, "agoS", int64(ago.Seconds()), "cooldownS", corednsCooldownS)
+			return nil
 		}
 	}
 	// Storm-gate: never evict while nodes are NotReady — eviction
@@ -62,17 +61,27 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 		return nil
 	}
 
+	// New stamps are always RFC3339 — the unix branch of
+	// ParseAnnoTime is read-compat only.
+	stamp := w.now.Now().UTC().Format(time.RFC3339)
 	if nPods == 0 || len(suspects) >= nPods {
 		// Whole fleet stale (or empty pod list) — restart the
-		// Deployment once; a short outage beats stale answers.
+		// Deployment once; a short outage beats stale answers. Both
+		// stamps land in ONE merge doc on the same object: the
+		// pod-template restartedAt triggers the rollout while the
+		// Deployment-level cooldown stays metadata-only (it does
+		// not roll pods).
 		log.Info("ACTION: rollout restart deploy/coredns",
 			"suspects", len(suspects), "total", nPods)
 		patch, err := json.Marshal(map[string]any{
+			"metadata": map[string]any{
+				"annotations": map[string]string{corednsTSAnno: stamp},
+			},
 			"spec": map[string]any{
 				"template": map[string]any{
 					"metadata": map[string]any{
 						"annotations": map[string]string{
-							"kubectl.kubernetes.io/restartedAt": w.now.Now().UTC().Format(time.RFC3339),
+							"kubectl.kubernetes.io/restartedAt": stamp,
 						},
 					},
 				},
@@ -82,7 +91,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 			return err
 		}
 		if _, err := w.cs.AppsV1().Deployments(corednsNS).Patch(ctx, "coredns",
-			types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil {
+			types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 			return fmt.Errorf("rollout-restart patch deployment %s/coredns: %w", corednsNS, err)
 		}
 	} else {
@@ -94,21 +103,14 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string, nPods 
 				return fmt.Errorf("delete stale pod %s/%s: %w", corednsNS, name, err)
 			}
 		}
-	}
-	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{
-			"annotations": map[string]string{
-				corednsTSAnno: strconv.FormatInt(w.now.Now().Unix(), 10),
-			},
-		},
-	})
-	if err != nil {
-		return err
-	}
-	_, err = w.cs.AppsV1().Deployments(corednsNS).Patch(ctx, "coredns",
-		types.MergePatchType, patch, metav1.PatchOptions{})
-	if err != nil {
-		return fmt.Errorf("stamp cooldown annotation on deployment %s/coredns: %w", corednsNS, err)
+		patch, err := kube.MergePatchAnnos(map[string]any{corednsTSAnno: stamp})
+		if err != nil {
+			return err
+		}
+		if _, err := w.cs.AppsV1().Deployments(corednsNS).Patch(ctx, "coredns",
+			types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf("stamp cooldown annotation on deployment %s/coredns: %w", corednsNS, err)
+		}
 	}
 	log.Info("sweep done: stale coredns recovery issued", "pods", suspects)
 	return nil
