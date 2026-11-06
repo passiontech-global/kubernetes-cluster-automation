@@ -241,6 +241,14 @@ func TestDuration(t *testing.T) {
 		{"bad unit", true, "5x", def},
 		{"leading space", true, " 5s", def},
 		{"fractional", true, "1.5h", 90 * time.Minute},
+		// Bare-integer seconds past the int64-ns ceiling must not
+		// wrap — 18446744074s overflows into a POSITIVE ~0.29s that
+		// the <=0 check alone would let through.
+		{"bare int wraps positive", true, "18446744074", def},
+		{"bare int over max seconds", true, "9223372037", def},
+		{"bare int under min seconds", true, "-9223372037", def},
+		{"bare int at max seconds", true, "9223372036",
+			time.Duration(9223372036) * time.Second},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -284,6 +292,11 @@ func TestDurOr(t *testing.T) {
 	}
 	if got := DurOr(key, -5, def); got != def {
 		t.Fatalf("conf negative: got %v want def", got)
+	}
+	// confSeconds past the int64-ns ceiling must not wrap to a bogus
+	// interval — 18446744074s overflows into a positive ~0.29s.
+	if got := DurOr(key, 18446744074, def); got != def {
+		t.Fatalf("conf overflow: got %v want def", got)
 	}
 	// Fully unset env.
 	t.Setenv(key, "")

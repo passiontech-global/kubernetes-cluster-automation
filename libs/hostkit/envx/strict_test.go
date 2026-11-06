@@ -139,6 +139,16 @@ func TestGetenvFloat(t *testing.T) {
 			t.Fatalf("GetenvFloat=%v, want 0.5", got)
 		}
 	})
+	// ParseFloat accepts non-finite literals — they must take the
+	// warn-and-default path or threshold comparisons silently corrupt.
+	t.Run("non-finite falls back to default", func(t *testing.T) {
+		for _, v := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "inf", "Infinity"} {
+			t.Setenv(key, v)
+			if got := GetenvFloat(key, 0.5); got != 0.5 {
+				t.Fatalf("GetenvFloat(%q)=%v, want 0.5", v, got)
+			}
+		}
+	})
 }
 
 func TestGetenvIntMin(t *testing.T) {
